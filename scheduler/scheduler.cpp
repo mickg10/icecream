@@ -1934,6 +1934,10 @@ static bool handle_activity(CompileServer *cs)
     case Msg::BLACKLIST_HOST_ENV:
         ret = handle_blacklist_host_env(cs, m);
         break;
+    case M_STATUS_TEXT:
+        log_info() << "StatusTextMsg from " << cs->nodeName() << ": " << static_cast<StatusTextMsg*>(m)->text << endl;
+        ret = true;
+        break;
     default:
         log_info() << "Invalid message type arrived " << m->to_string() << endl;
         handle_end(cs, m);
