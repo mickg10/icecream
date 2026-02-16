@@ -182,11 +182,13 @@ public:
                   LASTSTATE = WAITCREATEENV
                 } status;
     Client() {
+        created_ts = time(nullptr);
         created_msec = monotonic_msec();
         status_since_msec = created_msec;
         last_waitforcs_msec = 0;
         env_bytes_received = 0;
         job_id = 0;
+        last_known_job_id = 0;
         channel = nullptr;
         job = nullptr;
         usecsmsg = nullptr;
@@ -271,9 +273,11 @@ public:
     pid_t child_pid;
     string pending_create_env; // only for WAITCREATEENV
     uint64_t created_msec;
+    time_t created_ts;
     uint64_t status_since_msec;
     uint64_t last_waitforcs_msec;
     uint64_t env_bytes_received;
+    uint32_t last_known_job_id;
     string status_why;
 
     string dump() const {
@@ -497,7 +501,8 @@ void usage(const char *reason = nullptr)
 
     cerr << "usage: iceccd [-n <netname>] [-m <max_processes>] [--no-remote] [-d|--daemonize] [-l logfile] [-s <schedulerhost[:port]>]"
         " [-v[v[v]]] [-u|--user-uid <user_uid>] [-b <env-basedir>] [--cache-limit <MB>] [-N <node_name>] [-i|--interface <net_interface>] [-p|--port <port>]"
-        " [--state-jsonl <path>] [--state-interval <sec>] [--state-log]" << endl;
+        " [--state-jsonl <path>] [--state-interval <sec>] [--state-log]"
+        " [--webgui] [--webgui-port <port>]" << endl;
     exit(1);
 }
 
@@ -529,6 +534,37 @@ struct ReceivedEnvironment {
     ReceivedEnvironment() : last_use( 0 ), size( 0 ) {}
     time_t last_use;
     size_t size; // directory size
+};
+
+struct JobHistoryEntry {
+    uint64_t seq;
+    time_t start_ts;
+    time_t end_ts;
+    uint64_t start_msec;
+    uint64_t end_msec;
+    uint64_t duration_msec;
+    int client_id;
+    int exitcode;
+    uint32_t scheduler_job_id;
+    uint32_t compile_job_id;
+    string final_status;
+    string final_why;
+    string target;
+    string environment;
+    string usecs_host;
+    uint16_t usecs_port;
+    bool usecs_got_env;
+    string outfile;
+    string channel;
+};
+
+struct WebConnection {
+    int fd;
+    string inbuf;
+    string outbuf;
+    bool close_after_write;
+    uint64_t created_msec;
+    WebConnection() : fd(-1), close_after_write(true), created_msec(0) {}
 };
 
 struct Daemon {
@@ -581,6 +617,14 @@ struct Daemon {
     uint64_t next_state_dump_msec;
     size_t state_dump_worst_clients;
 
+    bool webgui_enabled;
+    int webgui_port;
+    int web_listen_fd;
+    map<int, WebConnection> web_connections;
+    size_t job_history_capacity;
+    uint64_t next_job_history_seq;
+    deque<JobHistoryEntry> job_history;
+
     Daemon() {
         warn_icecc_user_errno = 0;
         if (getuid() == 0) {
@@ -624,6 +668,11 @@ struct Daemon {
         state_dump_log = false;
         next_state_dump_msec = 0;
         state_dump_worst_clients = 10;
+        webgui_enabled = false;
+        webgui_port = 8768;
+        web_listen_fd = -1;
+        job_history_capacity = 20000;
+        next_job_history_seq = 1;
     }
 
     ~Daemon() {
@@ -665,6 +714,20 @@ struct Daemon {
     bool setup_listen_fds();
     bool setup_listen_tcp_fd( int& fd, const string& interface );
     bool setup_listen_unix_fd();
+    bool setup_web_listen_fd();
+    void close_web();
+    void handle_web_accept();
+    void handle_web_connection(int fd, short revents);
+    void drop_web_connection(int fd);
+    string webgui_html() const;
+    string dump_clients_json() const;
+    string dump_job_history_json(size_t limit) const;
+    void remember_finished_job(const Client *client, int exitcode);
+    static bool should_track_client_job(const Client *client);
+    static bool parse_http_request(const string &request, string &method, string &path);
+    static size_t parse_jobs_limit(const string &path);
+    void queue_web_response(int fd, int status_code, const char *status_text,
+                            const char *content_type, const string &body);
     void check_cache_size(const string &new_env);
     void remove_native_environment(const string& env_key);
     void remove_environment(const string& env_key);
@@ -692,6 +755,8 @@ bool Daemon::setup_listen_fds()
         }
     }
     if( !setup_listen_unix_fd())
+        return false;
+    if (!setup_web_listen_fd())
         return false;
     return true;
 }
@@ -829,6 +894,626 @@ bool Daemon::setup_listen_unix_fd()
     fcntl(unix_listen_fd, F_SETFD, FD_CLOEXEC);
 
     return true;
+}
+
+bool Daemon::setup_web_listen_fd()
+{
+    if (!webgui_enabled) {
+        return true;
+    }
+
+    if (web_listen_fd != -1) {
+        return true;
+    }
+
+    web_listen_fd = socket(PF_INET, SOCK_STREAM, 0);
+    if (web_listen_fd < 0) {
+        log_perror("Failed to create localhost web gui socket");
+        return false;
+    }
+
+    int optval = 1;
+    if (setsockopt(web_listen_fd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0) {
+        log_perror("Failed to set SO_REUSEADDR on web gui socket");
+        if (-1 == close(web_listen_fd) && (errno != EBADF)) {
+            log_perror("Failed to close web gui socket");
+        }
+        web_listen_fd = -1;
+        return false;
+    }
+
+    sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(webgui_port);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    if (::bind(web_listen_fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
+        log_error() << "Failed to bind localhost web gui on 127.0.0.1:" << webgui_port
+                    << ": " << strerror(errno) << endl;
+        if (-1 == close(web_listen_fd) && (errno != EBADF)) {
+            log_perror("Failed to close web gui socket");
+        }
+        web_listen_fd = -1;
+        return false;
+    }
+
+    if (listen(web_listen_fd, 128) < 0) {
+        log_perror("Failed to listen on localhost web gui socket");
+        if (-1 == close(web_listen_fd) && (errno != EBADF)) {
+            log_perror("Failed to close web gui socket");
+        }
+        web_listen_fd = -1;
+        return false;
+    }
+
+    fcntl(web_listen_fd, F_SETFD, FD_CLOEXEC);
+    int flags = fcntl(web_listen_fd, F_GETFL, 0);
+    if (flags >= 0) {
+        fcntl(web_listen_fd, F_SETFL, flags | O_NONBLOCK);
+    }
+
+    log_info() << "web gui listening on http://127.0.0.1:" << webgui_port << endl;
+    return true;
+}
+
+void Daemon::close_web()
+{
+    for (auto it = web_connections.begin(); it != web_connections.end(); ++it) {
+        if (-1 == close(it->first) && (errno != EBADF)) {
+            log_perror("Failed to close web gui client socket");
+        }
+    }
+    web_connections.clear();
+
+    if (web_listen_fd != -1) {
+        if (-1 == close(web_listen_fd) && (errno != EBADF)) {
+            log_perror("Failed to close web gui listen socket");
+        }
+        web_listen_fd = -1;
+    }
+}
+
+void Daemon::drop_web_connection(int fd)
+{
+    if (-1 == close(fd) && (errno != EBADF)) {
+        log_perror("Failed to close web gui connection");
+    }
+    web_connections.erase(fd);
+}
+
+void Daemon::queue_web_response(int fd, int status_code, const char *status_text,
+                                const char *content_type, const string &body)
+{
+    auto it = web_connections.find(fd);
+    if (it == web_connections.end()) {
+        return;
+    }
+
+    ostringstream out;
+    out << "HTTP/1.1 " << status_code << " " << status_text << "\r\n";
+    out << "Content-Type: " << content_type << "\r\n";
+    out << "Cache-Control: no-store\r\n";
+    out << "Connection: close\r\n";
+    out << "Content-Length: " << body.size() << "\r\n";
+    out << "\r\n";
+    out << body;
+
+    it->second.outbuf = out.str();
+    it->second.close_after_write = true;
+}
+
+bool Daemon::parse_http_request(const string &request, string &method, string &path)
+{
+    size_t line_end = request.find("\r\n");
+    if (line_end == string::npos) {
+        line_end = request.find('\n');
+    }
+    if (line_end == string::npos) {
+        return false;
+    }
+
+    string line = request.substr(0, line_end);
+    istringstream in(line);
+    string version;
+    if (!(in >> method >> path >> version)) {
+        return false;
+    }
+    return true;
+}
+
+size_t Daemon::parse_jobs_limit(const string &path)
+{
+    static const size_t kDefaultLimit = 200;
+    static const size_t kMaxLimit = 20000;
+
+    size_t query_pos = path.find('?');
+    if (query_pos == string::npos) {
+        return kDefaultLimit;
+    }
+    string query = path.substr(query_pos + 1);
+
+    size_t limit_pos = query.find("limit=");
+    if (limit_pos == string::npos) {
+        return kDefaultLimit;
+    }
+
+    const char *limit_text = query.c_str() + limit_pos + strlen("limit=");
+    char *end = nullptr;
+    unsigned long limit = strtoul(limit_text, &end, 10);
+    if (end == limit_text) {
+        return kDefaultLimit;
+    }
+
+    if (limit == 0) {
+        return kDefaultLimit;
+    }
+
+    if (limit > kMaxLimit) {
+        limit = kMaxLimit;
+    }
+    return size_t(limit);
+}
+
+string Daemon::webgui_html() const
+{
+    return R"HTML(<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>iceccd web gui</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --bg-card: #111827;
+      --fg: #e5e7eb;
+      --fg-dim: #94a3b8;
+      --ok: #10b981;
+      --warn: #f59e0b;
+      --err: #ef4444;
+      --border: #334155;
+      --accent: #38bdf8;
+    }
+    body { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: radial-gradient(circle at 20% 0%, #1e293b, var(--bg)); color: var(--fg); }
+    .wrap { max-width: 1600px; margin: 0 auto; padding: 16px; }
+    .header { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+    .title { font-size: 22px; font-weight: 700; }
+    .sub { color: var(--fg-dim); font-size: 12px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px; margin-top: 12px; }
+    .card { background: color-mix(in oklab, var(--bg-card), black 18%); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; }
+    .k { color: var(--fg-dim); font-size: 12px; text-transform: uppercase; }
+    .v { font-size: 20px; font-weight: 700; margin-top: 2px; }
+    .ok { color: var(--ok); } .warn { color: var(--warn); } .err { color: var(--err); } .accent { color: var(--accent); }
+    .section { margin-top: 14px; }
+    .section h2 { margin: 0 0 8px 0; font-size: 14px; color: var(--fg-dim); text-transform: uppercase; }
+    table { width: 100%; border-collapse: collapse; background: #0b1220; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; font-size: 12px; }
+    th, td { border-bottom: 1px solid #1f2937; padding: 6px 8px; text-align: left; vertical-align: top; }
+    th { color: #cbd5e1; background: #0f172a; position: sticky; top: 0; z-index: 1; }
+    td.dim { color: var(--fg-dim); }
+    .scroll { max-height: 360px; overflow: auto; border-radius: 10px; }
+    .status { font-weight: 700; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="header">
+      <div>
+        <div class="title">iceccd web gui</div>
+        <div class="sub" id="meta">connecting...</div>
+      </div>
+      <div class="sub">updates every 2s</div>
+    </div>
+
+    <div class="grid">
+      <div class="card"><div class="k">Scheduler</div><div class="v" id="scheduler">-</div></div>
+      <div class="card"><div class="k">Slots Used</div><div class="v" id="slots">-</div></div>
+      <div class="card"><div class="k">Client Count</div><div class="v" id="clients-total">-</div></div>
+      <div class="card"><div class="k">waitforcs</div><div class="v warn" id="waitforcs">-</div></div>
+      <div class="card"><div class="k">waitcompile</div><div class="v accent" id="waitcompile">-</div></div>
+      <div class="card"><div class="k">current load</div><div class="v" id="load">-</div></div>
+    </div>
+
+    <div class="section">
+      <h2>Running and Pending Clients</h2>
+      <div class="scroll">
+        <table>
+          <thead>
+            <tr><th>client</th><th>status</th><th>age(ms)</th><th>scheduler job</th><th>target/env</th><th>host</th><th>why</th></tr>
+          </thead>
+          <tbody id="clients-body"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="section">
+      <h2>Recent Jobs (ring buffer in daemon memory)</h2>
+      <div class="scroll">
+        <table>
+          <thead>
+            <tr><th>seq</th><th>client</th><th>duration(ms)</th><th>exit</th><th>final status</th><th>scheduler/compile job</th><th>target/env</th><th>remote host</th></tr>
+          </thead>
+          <tbody id="jobs-body"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  <script>
+    function fmt(value) { return value === null || value === undefined ? "-" : String(value); }
+    function statusClass(status) {
+      if (status === "waitforcs") return "warn";
+      if (status === "waitcompile" || status === "clientwork" || status === "waitforchild") return "accent";
+      if (status === "jobdone") return "ok";
+      return "";
+    }
+    function renderClients(rows) {
+      const body = document.getElementById("clients-body");
+      body.innerHTML = "";
+      for (const row of rows) {
+        const tr = document.createElement("tr");
+        const job = row.job || {};
+        const usecs = row.usecs || {};
+        tr.innerHTML =
+          `<td>${fmt(row.client_id)}</td>` +
+          `<td class="status ${statusClass(row.status)}">${fmt(row.status)}</td>` +
+          `<td>${fmt(row.age_msec)}</td>` +
+          `<td>${fmt(row.scheduler_job_id)}</td>` +
+          `<td>${fmt(job.target)} / ${fmt(job.env)}</td>` +
+          `<td>${fmt(usecs.hostname)}:${fmt(usecs.port)}</td>` +
+          `<td class="dim">${fmt(row.why)}</td>`;
+        body.appendChild(tr);
+      }
+    }
+    function renderJobs(rows) {
+      const body = document.getElementById("jobs-body");
+      body.innerHTML = "";
+      for (const row of rows) {
+        tr = document.createElement("tr");
+        tr.innerHTML =
+          `<td>${fmt(row.seq)}</td>` +
+          `<td>${fmt(row.client_id)}</td>` +
+          `<td>${fmt(row.duration_msec)}</td>` +
+          `<td>${fmt(row.exitcode)}</td>` +
+          `<td class="status ${statusClass(row.final_status)}">${fmt(row.final_status)}</td>` +
+          `<td>${fmt(row.scheduler_job_id)} / ${fmt(row.compile_job_id)}</td>` +
+          `<td>${fmt(row.target)} / ${fmt(row.environment)}</td>` +
+          `<td>${fmt(row.usecs_host)}:${fmt(row.usecs_port)}</td>`;
+        body.appendChild(tr);
+      }
+    }
+    async function refresh() {
+      try {
+        const [stateRes, clientsRes, jobsRes] = await Promise.all([
+          fetch("/api/state", { cache: "no-store" }),
+          fetch("/api/clients", { cache: "no-store" }),
+          fetch("/api/jobs?limit=500", { cache: "no-store" })
+        ]);
+        const state = await stateRes.json();
+        const clients = await clientsRes.json();
+        const jobs = await jobsRes.json();
+
+        const by = state.clients.by_status;
+        document.getElementById("meta").textContent = `${state.node} | ts=${state.ts} | scheduler=${state.scheduler.connected ? "connected" : "disconnected"}`;
+        document.getElementById("scheduler").textContent = state.scheduler.connected ? state.scheduler.name : "disconnected";
+        document.getElementById("slots").textContent = `${state.slots.used} / ${state.slots.max_kids}`;
+        document.getElementById("clients-total").textContent = state.clients.total;
+        document.getElementById("waitforcs").textContent = by.waitforcs.count;
+        document.getElementById("waitcompile").textContent = by.waitcompile.count;
+        document.getElementById("load").textContent = state.stats.current_load;
+
+        renderClients(clients.clients || []);
+        renderJobs(jobs.jobs || []);
+      } catch (error) {
+        document.getElementById("meta").textContent = "error: " + error;
+      }
+    }
+    setInterval(refresh, 2000);
+    refresh();
+  </script>
+</body>
+</html>)HTML";
+}
+
+string Daemon::dump_clients_json() const
+{
+    const uint64_t now_msec = monotonic_msec();
+    vector<pair<uint64_t, const Client *>> ordered;
+    ordered.reserve(clients.size());
+
+    for (const auto &it : clients) {
+        const Client *client = it.second;
+        ordered.push_back(make_pair(now_msec - client->status_since_msec, client));
+    }
+
+    sort(ordered.begin(), ordered.end(),
+         [](const pair<uint64_t, const Client *> &a, const pair<uint64_t, const Client *> &b) {
+             return a.first > b.first;
+         });
+
+    ostringstream o;
+    o << "{";
+    o << "\"type\":\"iceccd_clients\",";
+    o << "\"ts\":" << (long long)time(nullptr) << ",";
+    o << "\"mono_msec\":" << (unsigned long long)now_msec << ",";
+    o << "\"total\":" << ordered.size() << ",";
+    o << "\"clients\":[";
+
+    for (size_t i = 0; i < ordered.size(); ++i) {
+        const uint64_t age_msec = ordered[i].first;
+        const Client *client = ordered[i].second;
+        if (i) {
+            o << ",";
+        }
+
+        o << "{";
+        o << "\"client_id\":" << client->client_id << ",";
+        o << "\"status\":\"" << Client::status_str(client->status) << "\",";
+        o << "\"age_msec\":" << (unsigned long long)age_msec << ",";
+        o << "\"why\":\"" << json_escape(client->status_why) << "\",";
+        o << "\"scheduler_job_id\":" << client->last_known_job_id << ",";
+        o << "\"last_waitforcs_msec\":" << (unsigned long long)client->last_waitforcs_msec << ",";
+        o << "\"env_bytes_received\":" << (unsigned long long)client->env_bytes_received << ",";
+        o << "\"job\":";
+        if (client->job) {
+            o << "{";
+            o << "\"job_id\":" << client->job->jobID() << ",";
+            o << "\"target\":\"" << json_escape(client->job->targetPlatform()) << "\",";
+            o << "\"env\":\"" << json_escape(client->job->environmentVersion()) << "\"";
+            o << "}";
+        } else {
+            o << "null";
+        }
+        o << ",";
+        o << "\"usecs\":";
+        if (client->usecsmsg) {
+            o << "{";
+            o << "\"hostname\":\"" << json_escape(client->usecsmsg->hostname) << "\",";
+            o << "\"port\":" << client->usecsmsg->port << ",";
+            o << "\"got_env\":" << (client->usecsmsg->got_env ? "true" : "false") << ",";
+            o << "\"host_platform\":\"" << json_escape(client->usecsmsg->host_platform) << "\",";
+            o << "\"matched_job_id\":" << client->usecsmsg->matched_job_id;
+            o << "}";
+        } else {
+            o << "null";
+        }
+        o << ",";
+        o << "\"outfile\":\"" << json_escape(client->outfile) << "\",";
+        o << "\"channel\":\"" << json_escape(client->channel ? client->channel->dump() : string()) << "\"";
+        o << "}";
+    }
+
+    o << "]";
+    o << "}";
+    return o.str();
+}
+
+bool Daemon::should_track_client_job(const Client *client)
+{
+    if (!client) {
+        return false;
+    }
+
+    if (client->job || client->job_id || client->last_known_job_id || client->usecsmsg || !client->outfile.empty()) {
+        return true;
+    }
+
+    switch (client->status) {
+    case Client::PENDING_USE_CS:
+    case Client::JOBDONE:
+    case Client::LINKJOB:
+    case Client::TOCOMPILE:
+    case Client::WAITFORCS:
+    case Client::WAITCOMPILE:
+    case Client::CLIENTWORK:
+    case Client::WAITFORCHILD:
+        return true;
+    default:
+        return false;
+    }
+}
+
+void Daemon::remember_finished_job(const Client *client, int exitcode)
+{
+    if (!should_track_client_job(client)) {
+        return;
+    }
+
+    JobHistoryEntry entry;
+    entry.seq = next_job_history_seq++;
+    entry.start_ts = client->created_ts;
+    entry.end_ts = time(nullptr);
+    entry.start_msec = client->created_msec;
+    entry.end_msec = monotonic_msec();
+    entry.duration_msec = entry.end_msec >= entry.start_msec ? (entry.end_msec - entry.start_msec) : 0;
+    entry.client_id = client->client_id;
+    entry.exitcode = exitcode;
+    entry.scheduler_job_id = client->last_known_job_id;
+    entry.compile_job_id = client->job ? client->job->jobID() : 0;
+    entry.final_status = Client::status_str(client->status);
+    entry.final_why = client->status_why;
+    entry.target = client->job ? client->job->targetPlatform() : string();
+    entry.environment = client->job ? client->job->environmentVersion() : string();
+    entry.usecs_host = client->usecsmsg ? client->usecsmsg->hostname : string();
+    entry.usecs_port = client->usecsmsg ? client->usecsmsg->port : 0;
+    entry.usecs_got_env = client->usecsmsg ? client->usecsmsg->got_env : false;
+    entry.outfile = client->outfile;
+    entry.channel = client->channel ? client->channel->dump() : string();
+
+    if (job_history.size() >= job_history_capacity) {
+        job_history.pop_front();
+    }
+    job_history.push_back(entry);
+}
+
+string Daemon::dump_job_history_json(size_t limit) const
+{
+    if (limit == 0 || limit > job_history.size()) {
+        limit = job_history.size();
+    }
+
+    ostringstream o;
+    o << "{";
+    o << "\"type\":\"iceccd_job_history\",";
+    o << "\"ts\":" << (long long)time(nullptr) << ",";
+    o << "\"capacity\":" << job_history_capacity << ",";
+    o << "\"size\":" << job_history.size() << ",";
+    o << "\"returned\":" << limit << ",";
+    o << "\"jobs\":[";
+
+    for (size_t i = 0; i < limit; ++i) {
+        const JobHistoryEntry &entry = job_history[job_history.size() - 1 - i];
+        if (i) {
+            o << ",";
+        }
+
+        o << "{";
+        o << "\"seq\":" << (unsigned long long)entry.seq << ",";
+        o << "\"client_id\":" << entry.client_id << ",";
+        o << "\"start_ts\":" << (long long)entry.start_ts << ",";
+        o << "\"end_ts\":" << (long long)entry.end_ts << ",";
+        o << "\"start_msec\":" << (unsigned long long)entry.start_msec << ",";
+        o << "\"end_msec\":" << (unsigned long long)entry.end_msec << ",";
+        o << "\"duration_msec\":" << (unsigned long long)entry.duration_msec << ",";
+        o << "\"exitcode\":" << entry.exitcode << ",";
+        o << "\"scheduler_job_id\":" << entry.scheduler_job_id << ",";
+        o << "\"compile_job_id\":" << entry.compile_job_id << ",";
+        o << "\"final_status\":\"" << json_escape(entry.final_status) << "\",";
+        o << "\"final_why\":\"" << json_escape(entry.final_why) << "\",";
+        o << "\"target\":\"" << json_escape(entry.target) << "\",";
+        o << "\"environment\":\"" << json_escape(entry.environment) << "\",";
+        o << "\"usecs_host\":\"" << json_escape(entry.usecs_host) << "\",";
+        o << "\"usecs_port\":" << entry.usecs_port << ",";
+        o << "\"usecs_got_env\":" << (entry.usecs_got_env ? "true" : "false") << ",";
+        o << "\"outfile\":\"" << json_escape(entry.outfile) << "\",";
+        o << "\"channel\":\"" << json_escape(entry.channel) << "\"";
+        o << "}";
+    }
+
+    o << "]";
+    o << "}";
+    return o.str();
+}
+
+void Daemon::handle_web_accept()
+{
+    if (web_listen_fd < 0) {
+        return;
+    }
+
+    for (;;) {
+        sockaddr_storage addr;
+        socklen_t addr_len = sizeof(addr);
+        int fd = accept(web_listen_fd, reinterpret_cast<sockaddr *>(&addr), &addr_len);
+        if (fd < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                return;
+            }
+            log_perror("Failed to accept web gui connection");
+            return;
+        }
+
+        int flags = fcntl(fd, F_GETFL, 0);
+        if (flags >= 0) {
+            fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        }
+        fcntl(fd, F_SETFD, FD_CLOEXEC);
+
+        WebConnection conn;
+        conn.fd = fd;
+        conn.created_msec = monotonic_msec();
+        web_connections[fd] = conn;
+    }
+}
+
+void Daemon::handle_web_connection(int fd, short revents)
+{
+    auto it = web_connections.find(fd);
+    if (it == web_connections.end()) {
+        return;
+    }
+
+    if (revents & (POLLERR | POLLHUP | POLLNVAL)) {
+        drop_web_connection(fd);
+        return;
+    }
+
+    WebConnection &conn = it->second;
+
+    if (revents & POLLIN) {
+        for (;;) {
+            char buf[4096];
+            ssize_t n = read(fd, buf, sizeof(buf));
+            if (n > 0) {
+                conn.inbuf.append(buf, n);
+                if (conn.inbuf.size() > 64 * 1024) {
+                    queue_web_response(fd, 413, "Payload Too Large", "text/plain; charset=utf-8",
+                                       "request too large\n");
+                    break;
+                }
+                continue;
+            }
+            if (n == 0) {
+                drop_web_connection(fd);
+                return;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                break;
+            }
+            drop_web_connection(fd);
+            return;
+        }
+
+        if (conn.outbuf.empty() && conn.inbuf.find("\r\n\r\n") != string::npos) {
+            string method;
+            string path;
+            if (!parse_http_request(conn.inbuf, method, path)) {
+                queue_web_response(fd, 400, "Bad Request", "text/plain; charset=utf-8", "bad request\n");
+            } else if (method != "GET") {
+                queue_web_response(fd, 405, "Method Not Allowed", "text/plain; charset=utf-8", "only GET supported\n");
+            } else {
+                string route = path;
+                const size_t query_pos = route.find('?');
+                if (query_pos != string::npos) {
+                    route.erase(query_pos);
+                }
+
+                if (route == "/" || route == "/index.html") {
+                    queue_web_response(fd, 200, "OK", "text/html; charset=utf-8", webgui_html());
+                } else if (route == "/api/state") {
+                    queue_web_response(fd, 200, "OK", "application/json; charset=utf-8", dump_state_json());
+                } else if (route == "/api/clients") {
+                    queue_web_response(fd, 200, "OK", "application/json; charset=utf-8", dump_clients_json());
+                } else if (route == "/api/jobs") {
+                    const size_t limit = parse_jobs_limit(path);
+                    queue_web_response(fd, 200, "OK", "application/json; charset=utf-8", dump_job_history_json(limit));
+                } else if (route == "/api/internals") {
+                    queue_web_response(fd, 200, "OK", "text/plain; charset=utf-8", dump_internals());
+                } else {
+                    queue_web_response(fd, 404, "Not Found", "text/plain; charset=utf-8", "not found\n");
+                }
+            }
+        }
+    }
+
+    if ((revents & POLLOUT) && !conn.outbuf.empty()) {
+        while (!conn.outbuf.empty()) {
+            ssize_t n = write(fd, conn.outbuf.data(), conn.outbuf.size());
+            if (n > 0) {
+                conn.outbuf.erase(0, n);
+                continue;
+            }
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+                break;
+            }
+            drop_web_connection(fd);
+            return;
+        }
+
+        if (conn.outbuf.empty() && conn.close_after_write) {
+            drop_web_connection(fd);
+            return;
+        }
+    }
 }
 
 void Daemon::determine_system()
@@ -1436,6 +2121,7 @@ int Daemon::scheduler_use_cs(UseCSMsg *msg)
     }
 
     c->job_id = msg->job_id;
+    c->last_known_job_id = msg->job_id;
 
     return 0;
 }
@@ -1462,6 +2148,7 @@ int Daemon::scheduler_no_cs(NoCSMsg *msg)
     c->set_status(Client::PENDING_USE_CS, "scheduler_no_cs: local compile");
 
     c->job_id = msg->job_id;
+    c->last_known_job_id = msg->job_id;
 
     return 0;
 
@@ -2088,6 +2775,7 @@ bool Daemon::handle_compile_file(Client *client, Msg *msg)
     assert(client);
     assert(job);
     client->job = job;
+    client->last_known_job_id = job->jobID();
 
     if (client->status == Client::CLIENTWORK) {
         assert(job->environmentVersion() == "__client");
@@ -2143,6 +2831,7 @@ void Daemon::handle_end(Client *client, int exitcode)
     trace() << "handle_end " << client->dump() << endl;
     trace() << dump_internals() << endl;
 #endif
+    remember_finished_job(client, exitcode);
     fd2chan.erase(client->channel->fd);
 
     if (client->status == Client::TOINSTALL || client->status == Client::WAITINSTALL) {
@@ -2272,6 +2961,7 @@ bool Daemon::handle_get_cs(Client *client, Msg *msg)
                                         umsg->client_id, true, 1, 0);
         client->set_status(Client::PENDING_USE_CS, "handle_get_cs: scheduler missing, local compile");
         client->job_id = umsg->client_id;
+        client->last_known_job_id = umsg->client_id;
         return true;
     }
 
@@ -2400,6 +3090,21 @@ void Daemon::answer_client_requests()
     pfd.fd = unix_listen_fd;
     pfd.events = POLLIN;
     pollfds.push_back(pfd);
+
+    if (web_listen_fd != -1) {
+        pfd.fd = web_listen_fd;
+        pfd.events = POLLIN;
+        pollfds.push_back(pfd);
+    }
+
+    for (const auto &it : web_connections) {
+        pfd.fd = it.first;
+        pfd.events = POLLIN;
+        if (!it.second.outbuf.empty()) {
+            pfd.events |= POLLOUT;
+        }
+        pollfds.push_back(pfd);
+    }
 
     for (map<int, MsgChannel *>::const_iterator it = fd2chan.begin();
             it != fd2chan.end();) {
@@ -2534,6 +3239,26 @@ void Daemon::answer_client_requests()
                     close_scheduler();
                     return;
                 }
+            }
+        }
+
+        if (web_listen_fd != -1 && pollfd_is_set(pollfds, web_listen_fd, POLLIN)) {
+            handle_web_accept();
+        }
+
+        for (auto it = web_connections.begin(); it != web_connections.end();) {
+            const int fd = it->first;
+            ++it;
+
+            short revents = 0;
+            for (const auto &pollfd : pollfds) {
+                if (pollfd.fd == fd) {
+                    revents = pollfd.revents;
+                    break;
+                }
+            }
+            if (revents) {
+                handle_web_connection(fd, revents);
             }
         }
 
@@ -2719,6 +3444,7 @@ int Daemon::working_loop()
         if (exit_main_loop) {
             close_scheduler();
             clear_children();
+            close_web();
             break;
         }
     }
@@ -2757,6 +3483,8 @@ int main(int argc, char **argv)
             { "state-jsonl", 1, nullptr, 0},
             { "state-interval", 1, nullptr, 0},
             { "state-log", 0, nullptr, 0},
+            { "webgui", 0, nullptr, 0},
+            { "webgui-port", 1, nullptr, 0},
             { nullptr, 0, nullptr, 0 }
         };
 
@@ -2824,6 +3552,20 @@ int main(int argc, char **argv)
                 d.state_dump_log = true;
                 if (!d.state_dump_interval_s) {
                     d.state_dump_interval_s = 30;
+                }
+            } else if (optname == "webgui") {
+                d.webgui_enabled = true;
+            } else if (optname == "webgui-port") {
+                if (optarg && *optarg) {
+                    errno = 0;
+                    int port = atoi(optarg);
+                    if (errno || port <= 0 || port > 65535) {
+                        usage("Error: --webgui-port requires a valid TCP port");
+                    }
+                    d.webgui_port = port;
+                    d.webgui_enabled = true;
+                } else {
+                    usage("Error: --webgui-port requires argument");
                 }
             }
 
@@ -3003,6 +3745,9 @@ int main(int argc, char **argv)
         log_info() << "state dumps enabled: interval " << d.state_dump_interval_s << "s"
                    << ", jsonl=" << (d.state_jsonl_path.empty() ? "<disabled>" : d.state_jsonl_path)
                    << ", log=" << (d.state_dump_log ? "true" : "false") << endl;
+    }
+    if (d.webgui_enabled) {
+        log_info() << "web gui requested on 127.0.0.1:" << d.webgui_port << endl;
     }
     if (remote_disabled)
         log_warning() << "Cannot use chroot, no remote jobs accepted." << endl;
