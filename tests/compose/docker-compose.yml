@@ -1,0 +1,141 @@
+services:
+  scheduler:
+    build:
+      context: ../..
+      dockerfile: tests/compose/Dockerfile
+    command:
+      - bash
+      - -lc
+      - |
+        set -euo pipefail
+        mkdir -p /out/scheduler
+        chmod a+rwx /out /out/scheduler || true
+        exec /usr/local/sbin/icecc-scheduler -n "${ICECC_NETNAME}" -p 8765 -v -v
+    environment:
+      ICECC_NETNAME: ${ICECC_NETNAME:-composebench}
+    volumes:
+      - ${ICECC_OUT_DIR}:/out
+
+  build1:
+    build:
+      context: ../..
+      dockerfile: tests/compose/Dockerfile
+    depends_on:
+      - scheduler
+    command:
+      - bash
+      - -lc
+      - |
+        set -euo pipefail
+        mkdir -p /out/build1
+        chmod a+rwx /out /out/build1 || true
+        exec /usr/local/sbin/iceccd -n "${ICECC_NETNAME}" -s scheduler -N build1 -m 4 -v -v \
+          --state-jsonl /out/build1/iceccd.state.jsonl --state-interval "${ICECC_STATE_INTERVAL}" --state-log
+    environment:
+      ICECC_NETNAME: ${ICECC_NETNAME:-composebench}
+      ICECC_STATE_INTERVAL: ${ICECC_STATE_INTERVAL:-1}
+    volumes:
+      - ${ICECC_OUT_DIR}:/out
+
+  build2:
+    build:
+      context: ../..
+      dockerfile: tests/compose/Dockerfile
+    depends_on:
+      - scheduler
+    command:
+      - bash
+      - -lc
+      - |
+        set -euo pipefail
+        mkdir -p /out/build2
+        chmod a+rwx /out /out/build2 || true
+        exec /usr/local/sbin/iceccd -n "${ICECC_NETNAME}" -s scheduler -N build2 -m 4 -v -v \
+          --state-jsonl /out/build2/iceccd.state.jsonl --state-interval "${ICECC_STATE_INTERVAL}" --state-log
+    environment:
+      ICECC_NETNAME: ${ICECC_NETNAME:-composebench}
+      ICECC_STATE_INTERVAL: ${ICECC_STATE_INTERVAL:-1}
+    volumes:
+      - ${ICECC_OUT_DIR}:/out
+
+  build3:
+    build:
+      context: ../..
+      dockerfile: tests/compose/Dockerfile
+    depends_on:
+      - scheduler
+    command:
+      - bash
+      - -lc
+      - |
+        set -euo pipefail
+        mkdir -p /out/build3
+        chmod a+rwx /out /out/build3 || true
+        exec /usr/local/sbin/iceccd -n "${ICECC_NETNAME}" -s scheduler -N build3 -m 4 -v -v \
+          --state-jsonl /out/build3/iceccd.state.jsonl --state-interval "${ICECC_STATE_INTERVAL}" --state-log
+    environment:
+      ICECC_NETNAME: ${ICECC_NETNAME:-composebench}
+      ICECC_STATE_INTERVAL: ${ICECC_STATE_INTERVAL:-1}
+    volumes:
+      - ${ICECC_OUT_DIR}:/out
+
+  build4:
+    build:
+      context: ../..
+      dockerfile: tests/compose/Dockerfile
+    depends_on:
+      - scheduler
+    command:
+      - bash
+      - -lc
+      - |
+        set -euo pipefail
+        mkdir -p /out/build4
+        chmod a+rwx /out /out/build4 || true
+        exec /usr/local/sbin/iceccd -n "${ICECC_NETNAME}" -s scheduler -N build4 -m 4 -v -v \
+          --state-jsonl /out/build4/iceccd.state.jsonl --state-interval "${ICECC_STATE_INTERVAL}" --state-log
+    environment:
+      ICECC_NETNAME: ${ICECC_NETNAME:-composebench}
+      ICECC_STATE_INTERVAL: ${ICECC_STATE_INTERVAL:-1}
+    volumes:
+      - ${ICECC_OUT_DIR}:/out
+
+  worker1:
+    build:
+      context: ../..
+      dockerfile: tests/compose/Dockerfile
+    depends_on:
+      - scheduler
+      - build1
+      - build2
+      - build3
+      - build4
+    command: ["/usr/local/bin/icecc-compose-worker"]
+    environment:
+      WORKER_NAME: worker1
+      ICECC_NETNAME: ${ICECC_NETNAME:-composebench}
+      ICECC_WORKER_NFILES: ${ICECC_WORKER_NFILES:-200}
+      ICECC_WORKER_JOBS: ${ICECC_WORKER_JOBS:-64}
+      ICECC_STATE_INTERVAL: ${ICECC_STATE_INTERVAL:-1}
+    volumes:
+      - ${ICECC_OUT_DIR}:/out
+
+  worker2:
+    build:
+      context: ../..
+      dockerfile: tests/compose/Dockerfile
+    depends_on:
+      - scheduler
+      - build1
+      - build2
+      - build3
+      - build4
+    command: ["/usr/local/bin/icecc-compose-worker"]
+    environment:
+      WORKER_NAME: worker2
+      ICECC_NETNAME: ${ICECC_NETNAME:-composebench}
+      ICECC_WORKER_NFILES: ${ICECC_WORKER_NFILES:-200}
+      ICECC_WORKER_JOBS: ${ICECC_WORKER_JOBS:-64}
+      ICECC_STATE_INTERVAL: ${ICECC_STATE_INTERVAL:-1}
+    volumes:
+      - ${ICECC_OUT_DIR}:/out

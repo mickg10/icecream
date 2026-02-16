@@ -81,11 +81,13 @@
 
 #include <archive.h>
 
+#include <chrono>
 #include <deque>
 #include <map>
 #include <algorithm>
 #include <set>
 #include <fstream>
+#include <sstream>
 #include <string>
 
 #include "ncpus.h"
@@ -108,6 +110,54 @@ static volatile sig_atomic_t exit_main_loop = 0;
 #endif
 
 using namespace std;
+
+static uint64_t monotonic_msec()
+{
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+static string json_escape(const string &s)
+{
+    string out;
+    out.reserve(s.size() + 16);
+
+    for (unsigned char c : s) {
+        switch (c) {
+        case '"':
+            out += "\\\"";
+            break;
+        case '\\':
+            out += "\\\\";
+            break;
+        case '\b':
+            out += "\\b";
+            break;
+        case '\f':
+            out += "\\f";
+            break;
+        case '\n':
+            out += "\\n";
+            break;
+        case '\r':
+            out += "\\r";
+            break;
+        case '\t':
+            out += "\\t";
+            break;
+        default:
+            if (c < 0x20) {
+                char buf[7];
+                snprintf(buf, sizeof(buf), "\\u%04x", int(c));
+                out += buf;
+            } else {
+                out += char(c);
+            }
+        }
+    }
+
+    return out;
+}
 
 struct Client {
 public:
@@ -133,6 +183,10 @@ public:
                   LASTSTATE = WAITCREATEENV
                 } status;
     Client() {
+        created_msec = monotonic_msec();
+        status_since_msec = created_msec;
+        last_waitforcs_msec = 0;
+        env_bytes_received = 0;
         job_id = 0;
         channel = nullptr;
         job = nullptr;
@@ -144,6 +198,12 @@ public:
         pipe_to_child = -1;
         child_pid = -1;
         fulljob = false;
+    }
+
+    void set_status(Status new_status, const char* why = nullptr) {
+        status = new_status;
+        status_since_msec = monotonic_msec();
+        status_why = why ? why : "";
     }
 
     static string status_str(Status status) {
@@ -215,9 +275,22 @@ public:
     pid_t child_pid;
     bool fulljob; // during LINKJOB and CLIENTWORK, reserve all slots if set
     string pending_create_env; // only for WAITCREATEENV
+    uint64_t created_msec;
+    uint64_t status_since_msec;
+    uint64_t last_waitforcs_msec;
+    uint64_t env_bytes_received;
+    string status_why;
 
     string dump() const {
-        string ret = status_str(status) + " " + channel->dump();
+        uint64_t age_msec = monotonic_msec() - status_since_msec;
+        string ret = status_str(status) + " age_msec=" + toString(age_msec);
+        if (last_waitforcs_msec) {
+            ret += " last_waitforcs_msec=" + toString(last_waitforcs_msec);
+        }
+        if (!status_why.empty()) {
+            ret += " why=" + status_why;
+        }
+        ret += " " + channel->dump();
 
         switch (status) {
         case LINKJOB:
@@ -225,7 +298,8 @@ public:
                 + " PID: " + toString(child_pid);
         case TOINSTALL:
         case WAITINSTALL:
-            return ret + " ClientID: " + toString(client_id) + " " + outfile + " PID: " + toString(child_pid);
+            return ret + " ClientID: " + toString(client_id) + " " + outfile + " PID: " + toString(child_pid)
+                + " env_bytes_received=" + toString(env_bytes_received);
         case WAITFORCHILD:
             return ret + " ClientID: " + toString(client_id) + " PID: " + toString(child_pid) + " PFD: " + toString(pipe_from_child);
         case WAITCREATEENV:
@@ -416,7 +490,8 @@ void usage(const char *reason = nullptr)
     }
 
     cerr << "usage: iceccd [-n <netname>] [-m <max_processes>] [--no-remote] [-d|--daemonize] [-l logfile] [-s <schedulerhost[:port]>]"
-        " [-v[v[v]]] [-u|--user-uid <user_uid>] [-b <env-basedir>] [--cache-limit <MB>] [-N <node_name>] [-i|--interface <net_interface>] [-p|--port <port>]" << endl;
+        " [-v[v[v]]] [-u|--user-uid <user_uid>] [-b <env-basedir>] [--cache-limit <MB>] [-N <node_name>] [-i|--interface <net_interface>] [-p|--port <port>]"
+        " [--state-jsonl <path>] [--state-interval <sec>] [--state-log]" << endl;
     exit(1);
 }
 
@@ -493,6 +568,13 @@ struct Daemon {
     int max_scheduler_ping;
     unsigned int current_kids;
 
+    // Optional periodic dumps for production debugging.
+    std::string state_jsonl_path;
+    unsigned int state_dump_interval_s;
+    bool state_dump_log;
+    uint64_t next_state_dump_msec;
+    size_t state_dump_worst_clients;
+
     Daemon() {
         warn_icecc_user_errno = 0;
         if (getuid() == 0) {
@@ -532,6 +614,10 @@ struct Daemon {
         max_scheduler_pong = MAX_SCHEDULER_PONG;
         max_scheduler_ping = MAX_SCHEDULER_PING;
         current_kids = 0;
+        state_dump_interval_s = 0;
+        state_dump_log = false;
+        next_state_dump_msec = 0;
+        state_dump_worst_clients = 10;
     }
 
     ~Daemon() {
@@ -577,6 +663,10 @@ struct Daemon {
     void remove_native_environment(const string& env_key);
     void remove_environment(const string& env_key);
     bool create_env_finished(string env_key);
+
+    void maybe_dump_state();
+    std::string dump_state_json() const;
+    bool append_state_jsonl_line(const std::string &line) const;
 };
 
 bool Daemon::setup_listen_fds()
@@ -918,11 +1008,79 @@ bool Daemon::maybe_stats(bool force_check)
 string Daemon::dump_internals() const
 {
     string result;
+    const uint64_t now_msec = monotonic_msec();
 
     result += "Node Name: " + nodename + "\n";
     result += "  Remote name: " + remote_name + "\n";
 
-    for (const auto& it : fd2client)  {
+    struct StatusAgg {
+        uint32_t count = 0;
+        uint64_t total_age_msec = 0;
+        uint64_t max_age_msec = 0;
+    };
+    vector<StatusAgg> status_aggs(Client::LASTSTATE + 1);
+    for (const auto &it : clients) {
+        const Client *client = it.second;
+        StatusAgg &agg = status_aggs[int(client->status)];
+        ++agg.count;
+        const uint64_t age_msec = now_msec - client->status_since_msec;
+        agg.total_age_msec += age_msec;
+        agg.max_age_msec = std::max(agg.max_age_msec, age_msec);
+    }
+
+    result += "  Clients: " + toString(clients.size()) + " (" + clients.dump_per_status() + ")\n";
+    result += "  Slots: active_processes=" + toString(clients.active_processes)
+        + ", current_kids=" + toString(current_kids)
+        + ", used=" + toString(current_kids + clients.active_processes)
+        + ", max_kids=" + toString(max_kids) + "\n";
+
+    if (scheduler) {
+        time_t scheduler_last_talk_age_s = time(nullptr) - scheduler->last_talk;
+        if (scheduler_last_talk_age_s < 0) {
+            scheduler_last_talk_age_s = 0;
+        }
+        result += "  Scheduler: connected name=" + scheduler->name
+            + " proto=" + toString(scheduler->protocol)
+            + " last_talk_age_s=" + toString(scheduler_last_talk_age_s) + "\n";
+    } else {
+        time_t retry_in_s = next_scheduler_connect - time(nullptr);
+        if (retry_in_s < 0) {
+            retry_in_s = 0;
+        }
+        result += "  Scheduler: disconnected next_retry_in_s=" + toString(retry_in_s) + "\n";
+    }
+
+    auto append_status_wait = [&](Client::Status status, const string &label) {
+        const StatusAgg &agg = status_aggs[int(status)];
+        if (!agg.count) {
+            return;
+        }
+        result += "  Wait " + label
+            + ": count=" + toString(agg.count)
+            + " avg_age_msec=" + toString(agg.total_age_msec / agg.count)
+            + " max_age_msec=" + toString(agg.max_age_msec) + "\n";
+    };
+    append_status_wait(Client::WAITFORCS, "scheduler(waitforcs)");
+    append_status_wait(Client::WAITCOMPILE, "remote(waitcompile)");
+    append_status_wait(Client::PENDING_USE_CS, "local_slot(pending_use_cs)");
+    append_status_wait(Client::TOCOMPILE, "local_queue(tocompile)");
+    append_status_wait(Client::WAITFORCHILD, "local_child(waitforchild)");
+    append_status_wait(Client::WAITCREATEENV, "create_env(waitcreateenv)");
+
+    {
+        const StatusAgg &toinstall = status_aggs[int(Client::TOINSTALL)];
+        const StatusAgg &waitinstall = status_aggs[int(Client::WAITINSTALL)];
+        const uint32_t count = toinstall.count + waitinstall.count;
+        if (count) {
+            const uint64_t total_age_msec = toinstall.total_age_msec + waitinstall.total_age_msec;
+            const uint64_t max_age_msec = std::max(toinstall.max_age_msec, waitinstall.max_age_msec);
+            result += "  Wait env_install(toinstall+waitinstall): count=" + toString(count)
+                + " avg_age_msec=" + toString(total_age_msec / count)
+                + " max_age_msec=" + toString(max_age_msec) + "\n";
+        }
+    }
+
+    for (const auto &it : fd2client)  {
         result += "  fd2client[" + toString(it.first) + "] = " + it.second->dump() + "\n";
     }
 
@@ -972,6 +1130,265 @@ string Daemon::dump_internals() const
     return result;
 }
 
+bool Daemon::append_state_jsonl_line(const std::string &line) const
+{
+    if (state_jsonl_path.empty()) {
+        return true;
+    }
+
+    const string data = line + "\n";
+    int fd = ::open(state_jsonl_path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) {
+        log_error() << "failed to open state jsonl file " << state_jsonl_path
+                    << ": " << strerror(errno) << endl;
+        return false;
+    }
+
+    const char *buf = data.data();
+    size_t to_write = data.size();
+    while (to_write) {
+        ssize_t n = ::write(fd, buf, to_write);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0) {
+            log_error() << "failed to write state jsonl file " << state_jsonl_path
+                        << ": " << strerror(errno) << endl;
+            if (-1 == close(fd) && (errno != EBADF)){
+                log_perror("Failed to close state jsonl file");
+            }
+            return false;
+        }
+        buf += n;
+        to_write -= n;
+    }
+
+    if (-1 == close(fd) && (errno != EBADF)){
+        log_perror("Failed to close state jsonl file");
+    }
+    return true;
+}
+
+std::string Daemon::dump_state_json() const
+{
+    const time_t now_s = time(nullptr);
+    const uint64_t now_msec = monotonic_msec();
+
+    StatsMsg msg;
+    unsigned int memory_fillgrade = 0;
+    unsigned long idleLoad = 0;
+    unsigned long niceLoad = 0;
+    fill_stats(idleLoad, niceLoad, memory_fillgrade, &msg, clients.active_processes);
+
+    struct StatusAgg {
+        uint32_t count = 0;
+        uint64_t total_age_msec = 0;
+        uint64_t max_age_msec = 0;
+    };
+    vector<StatusAgg> status_aggs(Client::LASTSTATE + 1);
+
+    auto is_worst_candidate = [](Client::Status s) -> bool {
+        switch (s) {
+        case Client::WAITFORCS:
+        case Client::PENDING_USE_CS:
+        case Client::WAITCOMPILE:
+        case Client::CLIENTWORK:
+        case Client::TOCOMPILE:
+        case Client::WAITFORCHILD:
+        case Client::TOINSTALL:
+        case Client::WAITINSTALL:
+        case Client::WAITCREATEENV:
+            return true;
+        default:
+            return false;
+        }
+    };
+
+    vector<pair<uint64_t, const Client *>> worst_clients;
+    worst_clients.reserve(clients.size());
+
+    for (const auto &it : clients) {
+        const Client *client = it.second;
+        StatusAgg &agg = status_aggs[int(client->status)];
+        ++agg.count;
+        const uint64_t age_msec = now_msec - client->status_since_msec;
+        agg.total_age_msec += age_msec;
+        agg.max_age_msec = std::max(agg.max_age_msec, age_msec);
+        if (is_worst_candidate(client->status)) {
+            worst_clients.push_back(make_pair(age_msec, client));
+        }
+    }
+
+    std::sort(worst_clients.begin(), worst_clients.end(),
+        [](const pair<uint64_t, const Client *> &a, const pair<uint64_t, const Client *> &b) {
+            return a.first > b.first;
+        });
+
+    ostringstream o;
+    o << "{";
+    o << "\"type\":\"iceccd_state\",";
+    o << "\"ts\":" << (long long)now_s << ",";
+    o << "\"mono_msec\":" << (unsigned long long)now_msec << ",";
+    o << "\"pid\":" << (long)getpid() << ",";
+    o << "\"node\":\"" << json_escape(nodename) << "\",";
+    o << "\"remote_name\":\"" << json_escape(remote_name) << "\",";
+    o << "\"daemon_port\":" << daemon_port << ",";
+    o << "\"netname\":\"" << json_escape(netname) << "\",";
+    o << "\"noremote\":" << (noremote ? "true" : "false") << ",";
+
+    o << "\"scheduler\":{";
+    if (scheduler) {
+        time_t scheduler_last_talk_age_s = time(nullptr) - scheduler->last_talk;
+        if (scheduler_last_talk_age_s < 0) {
+            scheduler_last_talk_age_s = 0;
+        }
+        o << "\"connected\":true,";
+        o << "\"name\":\"" << json_escape(scheduler->name) << "\",";
+        o << "\"protocol\":" << scheduler->protocol << ",";
+        o << "\"last_talk_age_s\":" << (long long)scheduler_last_talk_age_s;
+    } else {
+        time_t retry_in_s = next_scheduler_connect - time(nullptr);
+        if (retry_in_s < 0) {
+            retry_in_s = 0;
+        }
+        o << "\"connected\":false,";
+        o << "\"next_retry_in_s\":" << (long long)retry_in_s;
+    }
+    o << "},";
+
+    o << "\"slots\":{";
+    o << "\"max_kids\":" << max_kids << ",";
+    o << "\"current_kids\":" << current_kids << ",";
+    o << "\"active_processes\":" << clients.active_processes << ",";
+    o << "\"used\":" << (current_kids + clients.active_processes);
+    o << "},";
+
+    o << "\"stats\":{";
+    o << "\"current_load\":" << current_load << ",";
+    o << "\"loadAvg1\":" << msg.loadAvg1 << ",";
+    o << "\"loadAvg5\":" << msg.loadAvg5 << ",";
+    o << "\"loadAvg10\":" << msg.loadAvg10 << ",";
+    o << "\"cpu_idle\":" << idleLoad << ",";
+    o << "\"cpu_nice\":" << niceLoad << ",";
+    o << "\"memory_fillgrade\":" << memory_fillgrade << ",";
+    o << "\"freeMemMB\":" << msg.freeMem;
+    o << "},";
+
+    o << "\"cache\":{";
+    o << "\"cache_size\":" << (unsigned long long)cache_size << ",";
+    o << "\"cache_size_limit\":" << (unsigned long long)cache_size_limit << ",";
+    o << "\"native_envs\":" << native_environments.size() << ",";
+    o << "\"received_envs\":" << received_environments.size();
+    o << "},";
+
+    o << "\"clients\":{";
+    o << "\"total\":" << clients.size() << ",";
+    o << "\"by_status\":{";
+    bool first = true;
+    for (Client::Status s = Client::UNKNOWN; s <= Client::LASTSTATE;
+            s = Client::Status(int(s) + 1)) {
+        const StatusAgg &agg = status_aggs[int(s)];
+        const uint64_t avg_age_msec = agg.count ? (agg.total_age_msec / agg.count) : 0;
+        if (!first) {
+            o << ",";
+        }
+        first = false;
+        o << "\"" << Client::status_str(s) << "\":{";
+        o << "\"count\":" << agg.count << ",";
+        o << "\"avg_age_msec\":" << (unsigned long long)avg_age_msec << ",";
+        o << "\"max_age_msec\":" << (unsigned long long)agg.max_age_msec;
+        o << "}";
+    }
+    o << "},";
+
+    const size_t worst_limit = std::min(state_dump_worst_clients, worst_clients.size());
+    o << "\"worst_limit\":" << worst_limit << ",";
+    o << "\"worst\":[";
+    for (size_t i = 0; i < worst_limit; ++i) {
+        const uint64_t age_msec = worst_clients[i].first;
+        const Client *client = worst_clients[i].second;
+        if (i) {
+            o << ",";
+        }
+        o << "{";
+        o << "\"client_id\":" << client->client_id << ",";
+        o << "\"status\":\"" << Client::status_str(client->status) << "\",";
+        o << "\"age_msec\":" << (unsigned long long)age_msec << ",";
+        o << "\"why\":\"" << json_escape(client->status_why) << "\",";
+        o << "\"last_waitforcs_msec\":" << (unsigned long long)client->last_waitforcs_msec << ",";
+        o << "\"scheduler_job_id\":" << client->job_id << ",";
+        o << "\"job\":";
+        if (client->job) {
+            o << "{";
+            o << "\"job_id\":" << client->job->jobID() << ",";
+            o << "\"target\":\"" << json_escape(client->job->targetPlatform()) << "\",";
+            o << "\"env\":\"" << json_escape(client->job->environmentVersion()) << "\"";
+            o << "}";
+        } else {
+            o << "null";
+        }
+        o << ",";
+        o << "\"usecs\":";
+        if (client->usecsmsg) {
+            o << "{";
+            o << "\"hostname\":\"" << json_escape(client->usecsmsg->hostname) << "\",";
+            o << "\"port\":" << client->usecsmsg->port << ",";
+            o << "\"got_env\":" << (client->usecsmsg->got_env ? "true" : "false") << ",";
+            o << "\"host_platform\":\"" << json_escape(client->usecsmsg->host_platform) << "\",";
+            o << "\"matched_job_id\":" << client->usecsmsg->matched_job_id;
+            o << "}";
+        } else {
+            o << "null";
+        }
+        o << ",";
+        o << "\"outfile\":\"" << json_escape(client->outfile) << "\",";
+        o << "\"pending_create_env\":\"" << json_escape(client->pending_create_env) << "\",";
+        o << "\"env_bytes_received\":" << (unsigned long long)client->env_bytes_received << ",";
+        o << "\"channel\":\"" << json_escape(client->channel ? client->channel->dump() : string()) << "\"";
+        o << "}";
+    }
+    o << "]";
+
+    o << "}";
+    o << "}";
+
+    return o.str();
+}
+
+void Daemon::maybe_dump_state()
+{
+    if (state_dump_interval_s == 0 || (state_jsonl_path.empty() && !state_dump_log)) {
+        return;
+    }
+
+    const uint64_t now = monotonic_msec();
+    if (!next_state_dump_msec) {
+        next_state_dump_msec = now;
+    }
+
+    if (now < next_state_dump_msec) {
+        return;
+    }
+
+    const string line = dump_state_json();
+
+    if (state_dump_log) {
+        // Write raw JSON to the same output as error logs, regardless of verbosity.
+        // This keeps the line machine-parsable and avoids requiring `-vv`.
+        if (logfile_error) {
+            (*logfile_error) << line << "\n";
+            logfile_error->flush();
+        }
+    }
+
+    append_state_jsonl_line(line);
+
+    const uint64_t interval_msec = uint64_t(state_dump_interval_s) * 1000;
+    do {
+        next_state_dump_msec += interval_msec;
+    } while (next_state_dump_msec <= now);
+}
+
 int Daemon::scheduler_get_internals()
 {
     trace() << "handle_get_internals " << dump_internals() << endl;
@@ -992,10 +1409,14 @@ int Daemon::scheduler_use_cs(UseCSMsg *msg)
         return 1;
     }
 
+    if (c->status == Client::WAITFORCS) {
+        c->last_waitforcs_msec = monotonic_msec() - c->status_since_msec;
+    }
+
     if (msg->hostname == remote_name && int(msg->port) == daemon_port) {
         c->usecsmsg = new UseCSMsg(msg->host_platform, "127.0.0.1", daemon_port, msg->job_id, true, 1,
                                    msg->matched_job_id);
-        c->status = Client::PENDING_USE_CS;
+        c->set_status(Client::PENDING_USE_CS, "scheduler_use_cs: local compile");
     } else {
         c->usecsmsg = new UseCSMsg(msg->host_platform, msg->hostname, msg->port,
                                    msg->job_id, true, 1, msg->matched_job_id);
@@ -1005,7 +1426,7 @@ int Daemon::scheduler_use_cs(UseCSMsg *msg)
             return 0;
         }
 
-        c->status = Client::WAITCOMPILE;
+        c->set_status(Client::WAITCOMPILE, "scheduler_use_cs: remote compile");
     }
 
     c->job_id = msg->job_id;
@@ -1027,8 +1448,12 @@ int Daemon::scheduler_no_cs(NoCSMsg *msg)
         return 1;
     }
 
+    if (c->status == Client::WAITFORCS) {
+        c->last_waitforcs_msec = monotonic_msec() - c->status_since_msec;
+    }
+
     c->usecsmsg = new UseCSMsg(string(), "127.0.0.1", daemon_port, msg->job_id, true, 1, 0);
-    c->status = Client::PENDING_USE_CS;
+    c->set_status(Client::PENDING_USE_CS, "scheduler_no_cs: local compile");
 
     c->job_id = msg->job_id;
 
@@ -1067,7 +1492,8 @@ bool Daemon::handle_transfer_env(Client *client, EnvTransferMsg *emsg)
         return false;
     }
 
-    client->status = Client::TOINSTALL;
+    client->set_status(Client::TOINSTALL, "handle_transfer_env: receiving environment");
+    client->env_bytes_received = 0;
     client->outfile = target + "/" + emsg->name;
     current_kids++;
 
@@ -1099,6 +1525,7 @@ bool Daemon::handle_file_chunk_env(Client *client, Msg *msg)
 
     if (*msg == Msg::FILE_CHUNK) {
         FileChunkMsg *fcmsg = static_cast<FileChunkMsg *>(msg);
+        client->env_bytes_received += fcmsg->len;
         ssize_t len = fcmsg->len;
         off_t off = 0;
 
@@ -1135,7 +1562,7 @@ bool Daemon::handle_file_chunk_env(Client *client, Msg *msg)
         client->pipe_to_child = -1;
         if( client->child_pid >= 0 ) {
             // Transfer done, wait for handle_transfer_env_child_done() to finish the handling.
-            client->status = Client::WAITINSTALL; // Ignore further messages until child finishes.
+            client->set_status(Client::WAITINSTALL, "handle_file_chunk_env: waiting for env install child"); // Ignore further messages until child finishes.
             return true;
         }
         // Transfer done, child done, finish.
@@ -1223,7 +1650,7 @@ bool Daemon::finish_transfer_env(Client *client, bool cancel)
     if( installed_size == 0 )
         remove_environment_files(envbasedir, client->outfile);
 
-    client->status = Client::UNKNOWN;
+    client->set_status(Client::UNKNOWN, cancel ? "finish_transfer_env: canceled" : "finish_transfer_env: done");
     string current = client->outfile;
     client->outfile.clear();
 
@@ -1422,7 +1849,7 @@ bool Daemon::handle_get_native_env(Client *client, GetNativeEnvMsg *msg)
     trace() << "get_native_env " << native_environments[env_key].name
             << " (" << env_key << ")" << endl;
 
-    client->status = Client::WAITCREATEENV;
+    client->set_status(Client::WAITCREATEENV, "handle_get_native_env: waiting for icecc-create-env");
     client->pending_create_env = env_key;
 
     if (native_environments[env_key].name.length()) { // already available
@@ -1453,7 +1880,7 @@ bool Daemon::finish_get_native_env(Client *client, string env_key)
     }
 
     native_environments[env_key].last_use = time(nullptr);
-    client->status = Client::GOTNATIVE;
+    client->set_status(Client::GOTNATIVE, "finish_get_native_env: sent native env");
     client->pending_create_env.clear();
     return true;
 }
@@ -1510,7 +1937,7 @@ bool Daemon::handle_job_done(Client *cl, JobDoneMsg *m)
             clients.active_processes--;
     }
 
-    cl->status = Client::JOBDONE;
+    cl->set_status(Client::JOBDONE, "handle_job_done: reported to scheduler");
     JobDoneMsg *msg = static_cast<JobDoneMsg *>(m);
     trace() << "handle_job_done " << msg->job_id << " " << (cl->fulljob ? "(full) " : "")
         << msg->exitcode << endl;
@@ -1542,8 +1969,8 @@ void Daemon::handle_old_request()
                 log_warning() << "can't send start message to client" << endl;
                 handle_end(client, 112);
             } else {
-                client->status = Client::CLIENTWORK;
-                if(client->fulljob) { // reserve the entire node
+                client->set_status(Client::CLIENTWORK, "handle_old_request: local job started");
+                if (client->fulljob) { // reserve the entire node
                     clients.active_processes += std::max((unsigned int)1, max_kids);
                     trace() << "pushed full local job " << client->client_id << endl;
                 } else {
@@ -1565,7 +1992,7 @@ void Daemon::handle_old_request()
             trace() << "pending " << client->dump() << endl;
 
             if (client->channel->send_msg(*client->usecsmsg)) {
-                client->status = Client::CLIENTWORK;
+                client->set_status(Client::CLIENTWORK, "handle_old_request: usecs delivered");
                 /* we make sure we reserve a spot and the rest is done if the
                  * client contacts as back with a Compile request */
                 clients.active_processes++;
@@ -1599,7 +2026,7 @@ void Daemon::handle_old_request()
 
             if (pid > 0) {
                 current_kids++;
-                client->status = Client::WAITFORCHILD;
+                client->set_status(Client::WAITFORCHILD, "handle_old_request: compiling locally (child running)");
                 client->pipe_from_child = sock;
                 client->child_pid = pid;
 
@@ -1677,7 +2104,7 @@ bool Daemon::handle_compile_file(Client *client, Msg *msg)
 
         // no scheduler is not an error case!
     } else {
-        client->status = Client::TOCOMPILE;
+        client->set_status(Client::TOCOMPILE, "handle_compile_file: queued for local compile");
     }
 
     return true;
@@ -1840,8 +2267,9 @@ bool Daemon::handle_get_cs(Client *client, Msg *msg)
 {
     GetCSMsg *umsg = dynamic_cast<GetCSMsg *>(msg);
     assert(client);
-    client->status = Client::WAITFORCS;
     client->niceness = umsg->niceness;
+    client->last_waitforcs_msec = 0;
+    client->set_status(Client::WAITFORCS, scheduler ? "handle_get_cs: sent GetCS to scheduler" : "handle_get_cs: scheduler missing");
     umsg->client_id = client->client_id;
     trace() << "handle_get_cs " << umsg->client_id << endl;
 
@@ -1851,7 +2279,7 @@ bool Daemon::handle_get_cs(Client *client, Msg *msg)
            redefine this as local job */
         client->usecsmsg = new UseCSMsg(umsg->target, "127.0.0.1", daemon_port,
                                         umsg->client_id, true, 1, 0);
-        client->status = Client::PENDING_USE_CS;
+        client->set_status(Client::PENDING_USE_CS, "handle_get_cs: scheduler missing, local compile");
         client->job_id = umsg->client_id;
         return true;
     }
@@ -1871,7 +2299,7 @@ int Daemon::handle_cs_conf(ConfCSMsg *msg)
 bool Daemon::handle_local_job(Client *client, Msg *msg)
 {
     JobLocalBeginMsg* m = dynamic_cast<JobLocalBeginMsg *>(msg);
-    client->status = Client::LINKJOB;
+    client->set_status(Client::LINKJOB, "handle_local_job: link job");
     client->outfile = m->outfile;
     client->fulljob = m->fulljob;
     return true;
@@ -1908,6 +2336,9 @@ bool Daemon::handle_activity(Client *client)
         break;
     case Msg::GET_CS:
         ret = handle_get_cs(client, msg);
+        break;
+    case Msg::GET_INTERNALS:
+        ret = client->channel->send_msg(StatusTextMsg(dump_internals()));
         break;
     case Msg::END:
         handle_end(client, 119);
@@ -2035,7 +2466,24 @@ void Daemon::answer_client_requests()
         }
     }
 
-    int ret = poll(pollfds.data(), pollfds.size(), max_scheduler_pong * 1000);
+    int poll_timeout_msec = max_scheduler_pong * 1000;
+    if (state_dump_interval_s && (!state_jsonl_path.empty() || state_dump_log)) {
+        const uint64_t now = monotonic_msec();
+        if (!next_state_dump_msec) {
+            // Schedule the first dump immediately.
+            next_state_dump_msec = now;
+        }
+        if (now >= next_state_dump_msec) {
+            poll_timeout_msec = 0;
+        } else {
+            const uint64_t to_dump_msec = next_state_dump_msec - now;
+            if (to_dump_msec < uint64_t(poll_timeout_msec)) {
+                poll_timeout_msec = int(to_dump_msec);
+            }
+        }
+    }
+
+    int ret = poll(pollfds.data(), pollfds.size(), poll_timeout_msec);
 
     if (ret < 0 && errno != EINTR) {
         log_perror("poll");
@@ -2274,6 +2722,7 @@ int Daemon::working_loop()
     for (;;) {
         reconnect();
         answer_client_requests();
+        maybe_dump_state();
 
         if (exit_main_loop) {
             close_scheduler();
@@ -2313,6 +2762,9 @@ int main(int argc, char **argv)
             { "no-remote", 0, nullptr, 0},
             { "interface", 1, nullptr, 'i'},
             { "port", 1, nullptr, 'p'},
+            { "state-jsonl", 1, nullptr, 0},
+            { "state-interval", 1, nullptr, 0},
+            { "state-log", 0, nullptr, 0},
             { nullptr, 0, nullptr, 0 }
         };
 
@@ -2356,6 +2808,31 @@ int main(int argc, char **argv)
                 }
             } else if (optname == "no-remote") {
                 d.noremote = true;
+            } else if (optname == "state-jsonl") {
+                if (optarg && *optarg) {
+                    d.state_jsonl_path = optarg;
+                    if (!d.state_dump_interval_s) {
+                        d.state_dump_interval_s = 30;
+                    }
+                } else {
+                    usage("Error: --state-jsonl requires argument");
+                }
+            } else if (optname == "state-interval") {
+                if (optarg && *optarg) {
+                    errno = 0;
+                    int interval = atoi(optarg);
+                    if (errno || interval <= 0) {
+                        usage("Error: --state-interval requires a positive integer");
+                    }
+                    d.state_dump_interval_s = interval;
+                } else {
+                    usage("Error: --state-interval requires argument");
+                }
+            } else if (optname == "state-log") {
+                d.state_dump_log = true;
+                if (!d.state_dump_interval_s) {
+                    d.state_dump_interval_s = 30;
+                }
             }
 
         }
@@ -2530,6 +3007,11 @@ int main(int argc, char **argv)
 
     log_info() << "ICECREAM daemon " VERSION " starting up (nice level "
                << nice_level << ") " << endl;
+    if (d.state_dump_interval_s && (!d.state_jsonl_path.empty() || d.state_dump_log)) {
+        log_info() << "state dumps enabled: interval " << d.state_dump_interval_s << "s"
+                   << ", jsonl=" << (d.state_jsonl_path.empty() ? "<disabled>" : d.state_jsonl_path)
+                   << ", log=" << (d.state_dump_log ? "true" : "false") << endl;
+    }
     if (remote_disabled)
         log_warning() << "Cannot use chroot, no remote jobs accepted." << endl;
     if (d.noremote)

@@ -483,7 +483,7 @@ static void remove_job_request(const JobRequestPosition& pos)
     }
 }
 
-static string dump_job(Job *job);
+static string dump_job(Job *job, bool verbose);
 
 static bool handle_cs_request(MsgChannel *cs, Msg *_m)
 {
@@ -1530,7 +1530,7 @@ static bool handle_blacklist_host_env(CompileServer *cs, Msg *_m)
     return true;
 }
 
-static string dump_job(Job *job)
+static string dump_job(Job *job, bool verbose)
 {
     char buffer[1000];
     string line;
@@ -1549,11 +1549,30 @@ static string dump_job(Job *job)
     default:
         jobState = "Huh?";
     }
-    snprintf(buffer, sizeof(buffer), "%u %s sub:%s on:%s ",
-             job->id(),
-             jobState.c_str(),
-             job->submitter() ? job->submitter()->nodeName().c_str() : "<>",
-             job->server() ? job->server()->nodeName().c_str() : "<unknown>");
+    if (verbose) {
+        time_t now = time(nullptr);
+        time_t queue_age_s = now - job->enqueueTime();
+        if (queue_age_s < 0) {
+            queue_age_s = 0;
+        }
+        time_t state_age_s = now - job->stateChangeTime();
+        if (state_age_s < 0) {
+            state_age_s = 0;
+        }
+        snprintf(buffer, sizeof(buffer), "%u %s q:%lds st:%lds sub:%s on:%s ",
+                 job->id(),
+                 jobState.c_str(),
+                 (long)queue_age_s,
+                 (long)state_age_s,
+                 job->submitter() ? job->submitter()->nodeName().c_str() : "<>",
+                 job->server() ? job->server()->nodeName().c_str() : "<unknown>");
+    } else {
+        snprintf(buffer, sizeof(buffer), "%u %s sub:%s on:%s ",
+                 job->id(),
+                 jobState.c_str(),
+                 job->submitter() ? job->submitter()->nodeName().c_str() : "<>",
+                 job->server() ? job->server()->nodeName().c_str() : "<unknown>");
+    }
     buffer[sizeof(buffer) - 1] = 0;
     line = buffer;
     line = line + job->fileName();
@@ -1648,7 +1667,7 @@ static bool handle_line(CompileServer *cs, Msg *_m)
 
             const list<Job *>& jobList = it->jobList();
             for (list<Job *>::const_iterator it2 = jobList.begin(); it2 != jobList.end(); ++it2) {
-                if (!cs->send_msg(TextMsg("   " + dump_job(*it2)))) {
+                if (!cs->send_msg(TextMsg("   " + dump_job(*it2, false)))) {
                     return false;
                 }
             }
@@ -1660,11 +1679,31 @@ static bool handle_line(CompileServer *cs, Msg *_m)
             }
         }
     } else if (cmd == "listjobs") {
+        const bool verbose = !l.empty() && (l.front() == "v" || l.front() == "verbose");
         for (map<unsigned int, Job *>::const_iterator it = jobs.begin();
                 it != jobs.end(); ++it)
-            if (!cs->send_msg(TextMsg(" " + dump_job(it->second)))) {
+            if (!cs->send_msg(TextMsg(" " + dump_job(it->second, verbose)))) {
                 return false;
             }
+    } else if (cmd == "listrequests") {
+        time_t now = time(nullptr);
+        for (JobRequestsGroup * const group : job_requests) {
+            if (group->l.empty()) {
+                continue;
+            }
+            Job *oldest = group->l.front();
+            time_t oldest_age_s = now - oldest->enqueueTime();
+            if (oldest_age_s < 0) {
+                oldest_age_s = 0;
+            }
+            const string msg = " submitter=" + group->submitter->nodeName()
+                + " niceness=" + toString(group->niceness)
+                + " count=" + toString(group->l.size())
+                + " oldest_queue_age_s=" + toString((long)oldest_age_s);
+            if (!cs->send_msg(TextMsg(msg))) {
+                return false;
+            }
+        }
     } else if (cmd == "quit" || cmd == "exit") {
         handle_end(cs, nullptr);
         return false;
@@ -1737,7 +1776,7 @@ static bool handle_line(CompileServer *cs, Msg *_m)
         }
     } else if (cmd == "help") {
         if (!cs->send_msg(TextMsg(
-                             "listcs\nlistblocks\nlistjobs\nremovecs\nblockcs\nunblockcs\ninternals\nhelp\nquit"))) {
+                             "listcs\nlistblocks\nlistjobs [v|verbose]\nlistrequests\nremovecs\nblockcs\nunblockcs\ninternals\nhelp\nquit"))) {
             return false;
         }
     } else {
