@@ -78,6 +78,7 @@ static void dcc_show_usage()
         "   --help                     explain usage and exit\n"
         "   --version                  show version and exit\n"
         "   --build-native             create icecc environment\n"
+        "   --dump-daemon              print local iceccd internals and exit\n"
         "Environment Variables:\n"
         "   ICECC                      If set to \"no\", just exec the real compiler.\n"
         "                              If set to \"disable\", just exec the real compiler, but without\n"
@@ -341,6 +342,43 @@ int main(int argc, char **argv)
 
             if (arg == "--build-native") {
                 return create_native(argv + 2);
+            }
+
+            if (arg == "--dump-daemon" || arg == "--daemon-internals") {
+                MsgChannel *daemon = get_local_daemon();
+                if (!daemon) {
+                    fprintf(stderr, "icecc: unable to connect to local daemon\n");
+                    return 1;
+                }
+
+                if (!daemon->send_msg(GetInternalStatus())) {
+                    fprintf(stderr, "icecc: failed to request daemon internals\n");
+                    delete daemon;
+                    return 1;
+                }
+
+                Msg *msg = daemon->get_msg(10);
+                if (!msg) {
+                    fprintf(stderr, "icecc: daemon did not respond\n");
+                    delete daemon;
+                    return 1;
+                }
+
+                if (msg->type != M_STATUS_TEXT) {
+                    fprintf(stderr, "icecc: unexpected reply type '%c'\n", msg->type);
+                    delete msg;
+                    delete daemon;
+                    return 1;
+                }
+
+                StatusTextMsg *status_msg = dynamic_cast<StatusTextMsg *>(msg);
+                if (status_msg) {
+                    fwrite(status_msg->text.data(), 1, status_msg->text.size(), stdout);
+                }
+
+                delete msg;
+                delete daemon;
+                return 0;
             }
 
             if (arg.size() > 0) {

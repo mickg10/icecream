@@ -34,6 +34,8 @@ Job::Job(const unsigned int _id, CompileServer *subm)
     , m_startTime(0)
     , m_startOnScheduler(0)
     , m_doneTime(0)
+    , m_enqueueTime(0)
+    , m_stateChangeTime(0)
     , m_targetPlatform()
     , m_fileName()
     , m_masterJobFor()
@@ -44,6 +46,9 @@ Job::Job(const unsigned int _id, CompileServer *subm)
     , m_requiredFeatures(0)
     , m_niceness(0)
 {
+    const time_t now = time(nullptr);
+    m_enqueueTime = now;
+    m_stateChangeTime = now;
     m_submitter->submittedJobsIncrement();
 }
 
@@ -78,6 +83,7 @@ Job::State Job::state() const
 void Job::setState(const Job::State state)
 {
     m_state = state;
+    m_stateChangeTime = time(nullptr);
 }
 
 CompileServer *Job::server() const
@@ -148,6 +154,16 @@ time_t Job::doneTime() const
 void Job::setDoneTime(const time_t time)
 {
     m_doneTime = time;
+}
+
+time_t Job::enqueueTime() const
+{
+    return m_enqueueTime;
+}
+
+time_t Job::stateChangeTime() const
+{
+    return m_stateChangeTime;
 }
 
 std::string Job::targetPlatform() const

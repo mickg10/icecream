@@ -72,6 +72,9 @@ public:
     time_t doneTime() const;
     void setDoneTime(const time_t time);
 
+    time_t enqueueTime() const;
+    time_t stateChangeTime() const;
+
     std::string targetPlatform() const;
     void setTargetPlatform(const std::string &platform);
 
@@ -115,6 +118,8 @@ private:
      * So the solution is to track done jobs (client exited, daemon didn't signal)
      * and after 10s no signal, kill the daemon (and let it rehup) **/
     time_t m_doneTime;
+    time_t m_enqueueTime;  // when the job was enqueued (scheduler-local)
+    time_t m_stateChangeTime;  // last state transition time (scheduler-local)
 
     std::string m_targetPlatform;
     std::string m_fileName;
