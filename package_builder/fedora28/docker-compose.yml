@@ -1,0 +1,10 @@
+services:
+  rpm:
+    build:
+      context: .
+    volumes:
+      - ../..:/src:ro
+      - ./out:/out
+    working_dir: /work
+    command: ["/usr/local/bin/build_rpm.sh"]
+
