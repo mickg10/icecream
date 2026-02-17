@@ -79,7 +79,7 @@ test.beforeAll(async () => {
     const logFd = fs.openSync(daemonLogPath, "w");
     daemonProcess = spawn(
         daemonBin,
-        ["--no-remote", "-m", "0", "--webgui", "--webgui-port", String(webPort), "-n", "playwright-webgui", "-v"],
+        ["--no-remote", "-m", "0", "--webgui", "--webgui-port", String(webPort), "--webgui-addr", "127.0.0.1", "-n", "playwright-webgui", "-v"],
         {
             cwd: repoRoot,
             env: { ...process.env, ICECC_TEST_SOCKET: socketPath },

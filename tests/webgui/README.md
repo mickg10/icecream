@@ -4,6 +4,7 @@ This test boots a real local `iceccd` process with:
 
 - `--webgui`
 - `--webgui-port <ephemeral>`
+- `--webgui-addr 127.0.0.1`
 - `--no-remote -m 0`
 
 Then it uses Playwright to verify:
