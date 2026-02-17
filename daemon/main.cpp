@@ -1519,7 +1519,10 @@ string Daemon::webgui_html() const
     }
     function statusLabel(status, row) {
       if (status === "linkjob") return "localjob(queue)";
-      if (status === "clientwork" && row && row.local_job) return "localjob(running)";
+      const why = row ? (row.why || row.final_why || "") : "";
+      if (status === "clientwork" && row && (row.local_job || why === "handle_old_request: local job started")) {
+        return "localjob(running)";
+      }
       return status;
     }
     function makeCell(tr, text, className) {
@@ -1596,7 +1599,7 @@ string Daemon::webgui_html() const
         makeCell(tr, row.client_id);
         makeCell(tr, row.duration_msec);
         makeCell(tr, row.exitcode);
-        makeCell(tr, row.final_status, `status ${statusClass(row.final_status)}`);
+        makeCell(tr, statusLabel(row.final_status, row), `status ${statusClass(row.final_status)}`);
         makeCell(tr, `${fmt(row.scheduler_job_id)} / ${fmt(row.compile_job_id)}`);
         makeCell(tr, `${fmt(row.target)} / ${fmt(row.environment)}`);
         makeCell(tr, `${fmt(row.usecs_host)}:${fmt(row.usecs_port)}`);
