@@ -3959,6 +3959,7 @@ std::string Daemon::dump_state_json() const
 
     auto is_worst_candidate = [](Client::Status s) -> bool {
         switch (s) {
+        case Client::LINKJOB:
         case Client::WAITFORCS:
         case Client::PENDING_USE_CS:
         case Client::WAITCOMPILE:
