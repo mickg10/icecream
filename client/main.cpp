@@ -364,8 +364,8 @@ int main(int argc, char **argv)
                     return 1;
                 }
 
-                if (msg->type != M_STATUS_TEXT) {
-                    fprintf(stderr, "icecc: unexpected reply type '%c'\n", msg->type);
+                if (*msg != Msg::STATUS_TEXT) {
+                    fprintf(stderr, "icecc: unexpected reply type '%s'\n", msg->to_string().c_str());
                     delete msg;
                     delete daemon;
                     return 1;
