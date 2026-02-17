@@ -260,6 +260,90 @@ static string shell_quote_arg(const string &arg)
     return quoted;
 }
 
+static string command_line_from_args(const vector<string> &args)
+{
+    string out;
+    out.reserve(512);
+    for (size_t i = 0; i < args.size(); ++i) {
+        if (i) {
+            out += ' ';
+        }
+        out += shell_quote_arg(args[i]);
+    }
+    return out;
+}
+
+static string command_line_from_proc_pid(pid_t pid)
+{
+    if (pid <= 0) {
+        return string();
+    }
+
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%ld/cmdline", (long)pid);
+    int fd = ::open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return string();
+    }
+
+    string raw;
+    char buf[4096];
+    for (;;) {
+        const ssize_t n = ::read(fd, buf, sizeof(buf));
+        if (n <= 0) {
+            break;
+        }
+        raw.append(buf, size_t(n));
+        if (raw.size() > 65536) {
+            break;
+        }
+    }
+    close(fd);
+
+    if (raw.empty()) {
+        return string();
+    }
+
+    vector<string> args;
+    size_t start = 0;
+    while (start < raw.size()) {
+        size_t end = raw.find('\0', start);
+        if (end == string::npos) {
+            end = raw.size();
+        }
+        if (end > start) {
+            args.push_back(raw.substr(start, end - start));
+        }
+        if (end == raw.size()) {
+            break;
+        }
+        start = end + 1;
+    }
+
+    if (args.empty()) {
+        return string();
+    }
+    return command_line_from_args(args);
+}
+
+static string command_line_from_peer_socket(int fd)
+{
+#if defined(__linux__) && defined(SO_PEERCRED)
+    if (fd < 0) {
+        return string();
+    }
+    struct ucred peer;
+    socklen_t peer_len = sizeof(peer);
+    if (::getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &peer, &peer_len) != 0) {
+        return string();
+    }
+    return command_line_from_proc_pid(peer.pid);
+#else
+    (void)fd;
+    return string();
+#endif
+}
+
 static string command_line_from_compile_job(const CompileJob *job)
 {
     if (!job) {
@@ -286,15 +370,7 @@ static string command_line_from_compile_job(const CompileJob *job)
         args.push_back(job->outputFile());
     }
 
-    string out;
-    out.reserve(512);
-    for (size_t i = 0; i < args.size(); ++i) {
-        if (i) {
-            out += ' ';
-        }
-        out += shell_quote_arg(args[i]);
-    }
-    return out;
+    return command_line_from_args(args);
 }
 
 static const uint64_t waitforcs_latency_bucket_upper_bounds_msec[] = {
@@ -3963,6 +4039,8 @@ bool Daemon::handle_get_cs(Client *client, Msg *msg)
     assert(client);
     if (!umsg->command_summary.empty()) {
         client->command_line = umsg->command_summary;
+    } else if (client->command_line.empty() && client->channel) {
+        client->command_line = command_line_from_peer_socket(client->channel->fd);
     }
     client->niceness = umsg->niceness;
     client->last_waitforcs_msec = 0;
@@ -4003,6 +4081,9 @@ bool Daemon::handle_local_job(Client *client, Msg *msg)
     client->fulljob = m->fulljob;
     client->local_reason = m->local_reason.empty() ? "unknown" : m->local_reason;
     client->command_line = m->cmdline;
+    if (client->command_line.empty() && client->channel) {
+        client->command_line = command_line_from_peer_socket(client->channel->fd);
+    }
     return true;
 }
 
