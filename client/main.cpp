@@ -441,10 +441,17 @@ int main(int argc, char **argv)
     }
 
     list<string> extrafiles;
+    string local_reason;
+    auto set_local_reason = [&](const string &reason) {
+        if (local_reason.empty()) {
+            local_reason = reason;
+        }
+    };
     bool fulljob = false;
     int argv_result = analyse_argv(argv, job, icerun, &extrafiles);
     if( argv_result & AlwaysLocal ) {
         local = true;
+        set_local_reason("argv_always_local");
         fulljob = argv_result & FullJob;
     }
 
@@ -461,6 +468,7 @@ int main(int argc, char **argv)
 
     if (icecc && !strcasecmp(icecc, "no")) {
         local = true;
+        set_local_reason("icecc_env_no");
     }
 
     if (!local_daemon) {
@@ -487,6 +495,7 @@ int main(int argc, char **argv)
             } else {
                 log_warning() << "File in ICECC_EXTRAFILES not found: " << file << endl;
                 local = true;
+                set_local_reason("extrafile_missing");
                 break;
             }
 
@@ -508,10 +517,13 @@ int main(int argc, char **argv)
                 // we just build locally
                 log_error() <<  "An exception was handled parsing the icecc version.   "
                     "Will build locally.  Exception text was:\n" << e.what() << "\n";
+                local = true;
+                set_local_reason("icecc_version_parse_failed");
             }
         } else if (!extrafiles.empty() && !IS_PROTOCOL_VERSION(32, local_daemon)) {
             log_warning() << "Local daemon is too old to handle extra files." << endl;
             local = true;
+            set_local_reason("daemon_too_old_for_extrafiles");
         } else {
             Msg *umsg = nullptr;
             string compiler;
@@ -527,6 +539,7 @@ int main(int argc, char **argv)
                 env_compression))) {
                 log_warning() << "failed to write get native environment" << endl;
                 local = true;
+                set_local_reason("get_native_env_send_failed");
             } else {
                 // the timeout is high because it creates the native version
                 umsg = local_daemon->get_msg(4 * 60);
@@ -552,6 +565,7 @@ int main(int argc, char **argv)
         // we set it to local so we tell the local daemon about it - avoiding file locking
         if (envs.size() == 0) {
             local = true;
+            set_local_reason("no_usable_environment");
         }
 
         for (Environments::const_iterator it = envs.begin(); it != envs.end(); ++it) {
@@ -560,6 +574,7 @@ int main(int argc, char **argv)
             if (::access(it->second.c_str(), R_OK) < 0) {
                 log_error() << "can't read environment " << it->second << endl;
                 local = true;
+                set_local_reason("environment_unreadable");
             }
         }
     }
@@ -591,6 +606,7 @@ int main(int argc, char **argv)
             else
                 log_warning() << "local build forced by remote exception: " << error.what() << endl;
             local = true;
+            set_local_reason("remote_exception_" + std::to_string(error.errorCode));
         }
         catch (client_error& error) {
             if (remote_daemon.size()) {
@@ -609,6 +625,7 @@ int main(int argc, char **argv)
 #endif
 
             local = true;
+            set_local_reason("client_exception_" + std::to_string(error.errorCode));
         }
         if (local) {
             // TODO It'd be better to reuse the connection, but the daemon
@@ -629,7 +646,8 @@ int main(int argc, char **argv)
         Msg *startme = nullptr;
 
         /* Inform the daemon that we like to start a job.  */
-        if (local_daemon->send_msg(JobLocalBeginMsg(0, get_absfilename(job.outputFile()),fulljob))) {
+        if (local_daemon->send_msg(JobLocalBeginMsg(0, get_absfilename(job.outputFile()), fulljob,
+                                                    local_reason.empty() ? "unknown" : local_reason))) {
             /* Now wait until the daemon gives us the start signal.  40 minutes
                should be enough for all normal compile or link jobs, but with expensive jobs
                (which fulljobs may likely be, e.g. LTO linking) use an even larger timeout.  */

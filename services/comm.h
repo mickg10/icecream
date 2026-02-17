@@ -36,7 +36,7 @@
 #include "job.h"
 
 // if you increase the PROTOCOL_VERSION, add a macro below and use that
-#define PROTOCOL_VERSION 44
+#define PROTOCOL_VERSION 45
 // if you increase the MIN_PROTOCOL_VERSION, comment out macros below and clean up the code
 #define MIN_PROTOCOL_VERSION 21
 
@@ -740,12 +740,14 @@ public:
 class JobLocalBeginMsg : public Msg
 {
 public:
-    JobLocalBeginMsg(int job_id = 0, const std::string &file = "", bool full = false)
+    JobLocalBeginMsg(int job_id = 0, const std::string &file = "", bool full = false,
+                     const std::string &reason = "")
         : Msg(Msg::JOB_LOCAL_BEGIN)
         , outfile(file)
         , stime(time(0))
         , id(job_id)
-        , fulljob(full) {}
+        , fulljob(full)
+        , local_reason(reason) {}
 
     virtual void fill_from_channel(MsgChannel *c);
     virtual void send_to_channel(MsgChannel *c) const;
@@ -754,6 +756,7 @@ public:
     uint32_t stime;
     uint32_t id;
     bool fulljob;
+    std::string local_reason;
 };
 
 class JobLocalDoneMsg : public Msg

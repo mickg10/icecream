@@ -2285,6 +2285,13 @@ void JobLocalBeginMsg::fill_from_channel(MsgChannel *c)
         uint32_t full;
         *c >> full;
         fulljob = full;
+    } else {
+        fulljob = false;
+    }
+    if (IS_PROTOCOL_VERSION(45, c)) {
+        *c >> local_reason;
+    } else {
+        local_reason.clear();
     }
 }
 
@@ -2296,6 +2303,9 @@ void JobLocalBeginMsg::send_to_channel(MsgChannel *c) const
     *c << id;
     if (IS_PROTOCOL_VERSION(44, c)) {
         *c << (uint32_t) fulljob;
+    }
+    if (IS_PROTOCOL_VERSION(45, c)) {
+        *c << local_reason;
     }
 }
 

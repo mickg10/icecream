@@ -363,6 +363,7 @@ public:
     uint64_t env_bytes_received;
     uint32_t last_known_job_id;
     string status_why;
+    string local_reason;
 
     string dump() const {
         uint64_t age_msec = monotonic_msec() - status_since_msec;
@@ -378,6 +379,7 @@ public:
         switch (status) {
         case LINKJOB:
             return ret + " ClientID: " + toString(client_id) + " " + outfile + (fulljob ? " (full)" : "")
+                + " local_reason=" + (local_reason.empty() ? string("unknown") : local_reason)
                 + " PID: " + toString(child_pid);
         case TOINSTALL:
         case WAITINSTALL:
@@ -1474,7 +1476,7 @@ string Daemon::webgui_html() const
         <div class="scroll">
           <table>
             <thead>
-              <tr><th>client</th><th>status</th><th>age(ms)</th><th>job</th><th>target/env</th><th>host</th><th>why</th></tr>
+              <tr><th>client</th><th>status</th><th>age(ms)</th><th>job</th><th>target/env</th><th>host</th><th>why/local_reason</th></tr>
             </thead>
             <tbody id="clients-body"></tbody>
           </table>
@@ -1524,6 +1526,15 @@ string Daemon::webgui_html() const
         return "localjob(running)";
       }
       return status;
+    }
+    function whyLabel(row) {
+      if (!row) return "-";
+      const why = row.why || row.final_why || "";
+      const localReason = row.local_reason || "";
+      if (row.local_job) {
+        return localReason ? `${why} [${localReason}]` : why;
+      }
+      return why;
     }
     function makeCell(tr, text, className) {
       const td = document.createElement("td");
@@ -1585,7 +1596,7 @@ string Daemon::webgui_html() const
         makeCell(tr, row.scheduler_job_id);
         makeCell(tr, `${fmt(job.target)} / ${fmt(job.env)}`);
         makeCell(tr, `${fmt(usecs.hostname)}:${fmt(usecs.port)}`);
-        makeCell(tr, row.why, "dim");
+        makeCell(tr, whyLabel(row), "dim");
         body.appendChild(tr);
       }
       setText("clients-sub", `${rows.length} rows`);
@@ -1693,6 +1704,9 @@ string Daemon::dump_clients_json() const
         const string local_job_kind = local_job
                                       ? local_job_kind_from_outfile(client->outfile, client->fulljob)
                                       : string();
+        const string local_reason = local_job
+                                    ? (client->local_reason.empty() ? string("unknown") : client->local_reason)
+                                    : string();
         if (i) {
             o << ",";
         }
@@ -1704,6 +1718,7 @@ string Daemon::dump_clients_json() const
         o << "\"why\":\"" << json_escape(client->status_why) << "\",";
         o << "\"local_job\":" << (local_job ? "true" : "false") << ",";
         o << "\"local_job_kind\":\"" << json_escape(local_job_kind) << "\",";
+        o << "\"local_reason\":\"" << json_escape(local_reason) << "\",";
         o << "\"scheduler_job_id\":" << client->last_known_job_id << ",";
         o << "\"last_waitforcs_msec\":" << (unsigned long long)client->last_waitforcs_msec << ",";
         o << "\"env_bytes_received\":" << (unsigned long long)client->env_bytes_received << ",";
@@ -2231,6 +2246,7 @@ string Daemon::dump_internals() const
     uint32_t local_jobs_queued = status_aggs[int(Client::LINKJOB)].count;
     uint32_t local_jobs_running = 0;
     map<string, uint32_t> local_jobs_by_kind;
+    map<string, uint32_t> local_jobs_by_reason;
     for (const auto &it : clients) {
         const Client *client = it.second;
         if (client->status == Client::LINKJOB
@@ -2240,6 +2256,8 @@ string Daemon::dump_internals() const
                 ++local_jobs_running;
             }
             ++local_jobs_by_kind[local_job_kind_from_outfile(client->outfile, client->fulljob)];
+            const string reason = client->local_reason.empty() ? string("unknown") : client->local_reason;
+            ++local_jobs_by_reason[reason];
         }
     }
     const uint32_t local_jobs_total = local_jobs_queued + local_jobs_running;
@@ -2256,6 +2274,16 @@ string Daemon::dump_internals() const
         }
         if (!local_jobs_kind_line.empty()) {
             result += "  Local jobs by output kind: " + local_jobs_kind_line + "\n";
+        }
+        string local_jobs_reason_line;
+        for (const auto &it : local_jobs_by_reason) {
+            if (!local_jobs_reason_line.empty()) {
+                local_jobs_reason_line += ", ";
+            }
+            local_jobs_reason_line += it.first + "=" + toString(it.second);
+        }
+        if (!local_jobs_reason_line.empty()) {
+            result += "  Local jobs by reason: " + local_jobs_reason_line + "\n";
         }
     }
 
@@ -2382,6 +2410,7 @@ std::string Daemon::dump_state_json() const
     uint32_t local_jobs_queued = 0;
     uint32_t local_jobs_running = 0;
     map<string, uint32_t> local_jobs_by_kind;
+    map<string, uint32_t> local_jobs_by_reason;
 
     auto is_worst_candidate = [](Client::Status s) -> bool {
         switch (s) {
@@ -2420,6 +2449,8 @@ std::string Daemon::dump_state_json() const
                 ++local_jobs_running;
             }
             ++local_jobs_by_kind[local_job_kind_from_outfile(client->outfile, client->fulljob)];
+            const string reason = client->local_reason.empty() ? string("unknown") : client->local_reason;
+            ++local_jobs_by_reason[reason];
         }
         if (is_worst_candidate(client->status)) {
             worst_clients.push_back(make_pair(age_msec, client));
@@ -2553,6 +2584,16 @@ std::string Daemon::dump_state_json() const
         first_local_kind = false;
         o << "\"" << json_escape(it.first) << "\":" << it.second;
     }
+    o << "},";
+    o << "\"by_reason\":{";
+    bool first_local_reason = true;
+    for (const auto &it : local_jobs_by_reason) {
+        if (!first_local_reason) {
+            o << ",";
+        }
+        first_local_reason = false;
+        o << "\"" << json_escape(it.first) << "\":" << it.second;
+    }
     o << "}";
     o << "},";
 
@@ -2568,6 +2609,9 @@ std::string Daemon::dump_state_json() const
         const string local_job_kind = local_job
                                       ? local_job_kind_from_outfile(client->outfile, client->fulljob)
                                       : string();
+        const string local_reason = local_job
+                                    ? (client->local_reason.empty() ? string("unknown") : client->local_reason)
+                                    : string();
         if (i) {
             o << ",";
         }
@@ -2576,6 +2620,7 @@ std::string Daemon::dump_state_json() const
         o << "\"status\":\"" << Client::status_str(client->status) << "\",";
         o << "\"local_job\":" << (local_job ? "true" : "false") << ",";
         o << "\"local_job_kind\":\"" << json_escape(local_job_kind) << "\",";
+        o << "\"local_reason\":\"" << json_escape(local_reason) << "\",";
         o << "\"age_msec\":" << (unsigned long long)age_msec << ",";
         o << "\"why\":\"" << json_escape(client->status_why) << "\",";
         o << "\"last_waitforcs_msec\":" << (unsigned long long)client->last_waitforcs_msec << ",";
@@ -3243,7 +3288,7 @@ void Daemon::handle_old_request()
                     trace() << "pushed local job " << client->client_id << endl;
                 }
                 if (!send_scheduler(JobLocalBeginMsg(client->client_id, client->outfile,
-                        client->fulljob))) {
+                        client->fulljob, client->local_reason))) {
                     return;
                 }
             }
@@ -3570,6 +3615,7 @@ bool Daemon::handle_local_job(Client *client, Msg *msg)
     client->set_status(Client::LINKJOB, "handle_local_job: local-only job (legacy status=linkjob)");
     client->outfile = m->outfile;
     client->fulljob = m->fulljob;
+    client->local_reason = m->local_reason.empty() ? "unknown" : m->local_reason;
     return true;
 }
 
