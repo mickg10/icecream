@@ -1,0 +1,12 @@
+{
+  "name": "iceccd-webgui-tests",
+  "private": true,
+  "version": "0.0.1",
+  "description": "Playwright tests for iceccd localhost webgui",
+  "devDependencies": {
+    "@playwright/test": "^1.58.2"
+  },
+  "scripts": {
+    "test": "playwright test --config ./playwright.config.cjs ./webgui.spec.cjs"
+  }
+}
