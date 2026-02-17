@@ -117,6 +117,7 @@ test("web gui renders dashboard and styles", async ({ page }, testInfo) => {
     await expect(page.locator("h1.title")).toContainText("iceccd live dashboard");
     await expect(page.locator("#scheduler")).not.toHaveText("-");
     await expect(page.locator("#slots")).toContainText("/");
+    await expect(page.locator("#preprocess-slots")).toContainText("/");
     await expect(page.locator("#clients-total")).not.toHaveText("-");
     await expect(page.locator("#job-limit")).toBeVisible();
 
@@ -161,4 +162,9 @@ test("web gui api endpoints return structured data", async ({ request }) => {
     if (jobsJson.jobs.length > 0) {
         expect(typeof jobsJson.jobs[0].cmdline).toBe("string");
     }
+
+    const insights = await request.get(`${baseUrl}/insights`);
+    expect(insights.ok()).toBeTruthy();
+    const insightsHtml = await insights.text();
+    expect(insightsHtml.includes("iceccd insights")).toBeTruthy();
 });

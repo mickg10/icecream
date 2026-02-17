@@ -2312,6 +2312,11 @@ void JobLocalBeginMsg::fill_from_channel(MsgChannel *c)
     } else {
         cmdline.clear();
     }
+    if (IS_PROTOCOL_VERSION(PROTOCOL_VERSION_JOB_LOCAL_FLAGS, c)) {
+        *c >> local_flags;
+    } else {
+        local_flags = JobLocalBeginMsg::LocalFlagNone;
+    }
 }
 
 void JobLocalBeginMsg::send_to_channel(MsgChannel *c) const
@@ -2328,6 +2333,9 @@ void JobLocalBeginMsg::send_to_channel(MsgChannel *c) const
     }
     if (IS_PROTOCOL_VERSION(46, c)) {
         *c << cmdline;
+    }
+    if (IS_PROTOCOL_VERSION(PROTOCOL_VERSION_JOB_LOCAL_FLAGS, c)) {
+        *c << local_flags;
     }
 }
 

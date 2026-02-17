@@ -801,6 +801,10 @@ int main(int argc, char **argv)
         log_block b("building_local");
         struct rusage ru;
         Msg *startme = nullptr;
+        uint32_t local_job_flags = JobLocalBeginMsg::LocalFlagNone;
+        if (argv_result & PreprocessOnly) {
+            local_job_flags |= JobLocalBeginMsg::LocalFlagPreprocessOnly;
+        }
 
         /* Inform the daemon that we like to start a job.  */
         if (invocation_timing.mode.find("remote") != std::string::npos) {
@@ -810,7 +814,7 @@ int main(int argc, char **argv)
         }
         if (local_daemon->send_msg(JobLocalBeginMsg(0, get_absfilename(job.outputFile()), fulljob,
                                                     local_reason.empty() ? "unknown" : local_reason,
-                                                    invocation_cmdline))) {
+                                                    invocation_cmdline, local_job_flags))) {
             /* Now wait until the daemon gives us the start signal.  40 minutes
                should be enough for all normal compile or link jobs, but with expensive jobs
                (which fulljobs may likely be, e.g. LTO linking) use an even larger timeout.  */

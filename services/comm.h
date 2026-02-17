@@ -36,10 +36,11 @@
 #include "job.h"
 
 // if you increase the PROTOCOL_VERSION, add a macro below and use that
-#define PROTOCOL_VERSION 47
+#define PROTOCOL_VERSION 48
 // if you increase the MIN_PROTOCOL_VERSION, comment out macros below and clean up the code
 #define MIN_PROTOCOL_VERSION 21
 #define PROTOCOL_VERSION_JOB_TIMING 47
+#define PROTOCOL_VERSION_JOB_LOCAL_FLAGS 48
 
 #define MAX_SCHEDULER_PONG 3
 // MAX_SCHEDULER_PING must be multiple of MAX_SCHEDULER_PONG
@@ -747,15 +748,22 @@ public:
 class JobLocalBeginMsg : public Msg
 {
 public:
+    enum LocalFlags {
+        LocalFlagNone = 0,
+        LocalFlagPreprocessOnly = 1 << 0
+    };
+
     JobLocalBeginMsg(int job_id = 0, const std::string &file = "", bool full = false,
-                     const std::string &reason = "", const std::string &_cmdline = "")
+                     const std::string &reason = "", const std::string &_cmdline = "",
+                     uint32_t _local_flags = LocalFlagNone)
         : Msg(Msg::JOB_LOCAL_BEGIN)
         , outfile(file)
         , stime(time(0))
         , id(job_id)
         , fulljob(full)
         , local_reason(reason)
-        , cmdline(_cmdline) {}
+        , cmdline(_cmdline)
+        , local_flags(_local_flags) {}
 
     virtual void fill_from_channel(MsgChannel *c);
     virtual void send_to_channel(MsgChannel *c) const;
@@ -766,6 +774,7 @@ public:
     bool fulljob;
     std::string local_reason;
     std::string cmdline;
+    uint32_t local_flags;
 };
 
 class JobLocalDoneMsg : public Msg

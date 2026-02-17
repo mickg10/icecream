@@ -238,6 +238,49 @@ static string local_job_kind_from_outfile(const string &outfile, bool fulljob)
     return "other";
 }
 
+static bool cmdline_is_preprocess_only(const string &cmdline)
+{
+    if (cmdline.empty()) {
+        return false;
+    }
+
+    istringstream in(cmdline);
+    string token;
+    while (in >> token) {
+        if (token == "-E") {
+            return true;
+        }
+        if (token.size() >= 2 && token[0] == '-' && token[1] == 'M'
+                && token != "-MD" && token != "-MMD"
+                && token != "-MF" && token != "-MT"
+                && token != "-MQ" && token != "-MG"
+                && token != "-MP") {
+            return true;
+        }
+        if (token.rfind("-Wp,-M", 0) == 0
+                && token.rfind("-Wp,-MD", 0) != 0
+                && token.rfind("-Wp,-MMD", 0) != 0
+                && token.rfind("-Wp,-MF", 0) != 0
+                && token.rfind("-Wp,-MT", 0) != 0
+                && token.rfind("-Wp,-MQ", 0) != 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool classify_local_preprocess_job(uint32_t local_flags, const string &cmdline, bool fulljob)
+{
+    if (fulljob) {
+        return false;
+    }
+    if (local_flags & JobLocalBeginMsg::LocalFlagPreprocessOnly) {
+        return true;
+    }
+    return cmdline_is_preprocess_only(cmdline);
+}
+
 static string shell_quote_arg(const string &arg)
 {
     if (arg.empty()) {
@@ -419,6 +462,8 @@ public:
         timing_scheduler_job_id = 0;
         timing_compile_job_id = 0;
         has_timing = false;
+        local_preprocess = false;
+        running_preprocess = false;
         job_id = 0;
         last_known_job_id = 0;
         channel = nullptr;
@@ -528,6 +573,8 @@ public:
     uint32_t timing_compile_job_id;
     bool has_timing;
     string timing_mode;
+    bool local_preprocess;
+    bool running_preprocess;
 
     string dump() const {
         uint64_t age_msec = monotonic_msec() - status_since_msec;
@@ -758,7 +805,7 @@ void usage(const char *reason = nullptr)
         cerr << reason << endl;
     }
 
-    cerr << "usage: iceccd [-n <netname>] [-m <max_processes>] [--no-remote] [-d|--daemonize] [-l logfile] [-s <schedulerhost[:port]>]"
+    cerr << "usage: iceccd [-n <netname>] [-m <max_processes>] [--max-preprocess <max_preprocesses>] [--no-remote] [-d|--daemonize] [-l logfile] [-s <schedulerhost[:port]>]"
         " [-v[v[v]]] [-u|--user-uid <user_uid>] [-b <env-basedir>] [--cache-limit <MB>] [-N <node_name>] [-i|--interface <net_interface>] [-p|--port <port>]"
         " [--state-jsonl <path>] [--state-interval <sec>] [--state-log]"
         " [--webgui] [--webgui-port <port>] [--webgui-addr <addr>]" << endl;
@@ -775,6 +822,8 @@ int mem_limit = 100;
 const int min_mem_limit = 100;
 
 unsigned int max_kids = 0;
+unsigned int max_preprocess_kids = 0;
+unsigned int preprocess_active_processes = 0;
 
 size_t cache_size_limit = 256 * 1024 * 1024;
 
@@ -1017,6 +1066,7 @@ struct Daemon {
     void handle_web_connection(int fd, short revents);
     void drop_web_connection(int fd);
     string webgui_html() const;
+    string webgui_insights_html() const;
     string dump_clients_json() const;
     string dump_job_history_json(size_t limit) const;
     void remember_finished_job(const Client *client, int exitcode);
@@ -1721,15 +1771,19 @@ string Daemon::webgui_html() const
         <h1 class="title">iceccd live dashboard</h1>
         <div class="meta-line" id="meta">connecting...</div>
       </div>
-      <div class="chip">
-        <span class="dot" id="scheduler-dot"></span>
-        <span id="scheduler-chip">scheduler: unknown</span>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <a href="/insights" class="chip" style="text-decoration:none; color:#dbeafe;">insights</a>
+        <div class="chip">
+          <span class="dot" id="scheduler-dot"></span>
+          <span id="scheduler-chip">scheduler: unknown</span>
+        </div>
       </div>
     </div>
 
     <div class="metrics">
       <div class="card"><div class="label">Scheduler</div><div class="value small" id="scheduler">-</div></div>
-      <div class="card"><div class="label">Slot usage</div><div class="value" id="slots">-</div></div>
+      <div class="card"><div class="label">Compile slots</div><div class="value" id="slots">-</div></div>
+      <div class="card"><div class="label">Preprocess slots</div><div class="value" id="preprocess-slots">-</div></div>
       <div class="card"><div class="label">Connected clients</div><div class="value info" id="clients-total">-</div></div>
       <div class="card"><div class="label">FD usage</div><div class="value" style="color:#fbbf24" id="fds">-</div></div>
       <div class="card"><div class="label">Waiting for scheduler</div><div class="value warn" id="waitforcs">-</div></div>
@@ -1999,7 +2053,12 @@ string Daemon::webgui_html() const
         }
         setText("meta", metaText);
         setText("scheduler", schedulerConnected ? state.scheduler.name : "disconnected");
-        setText("slots", `${state.slots.used} / ${state.slots.max_kids}`);
+        const compileUsed = Number((state.slots || {}).used || 0);
+        const compileMax = Number((state.slots || {}).max_kids || 0);
+        const preprocessUsed = Number((state.slots || {}).active_preprocesses || 0);
+        const preprocessMax = Number((state.slots || {}).max_preprocess_kids || 0);
+        setText("slots", `${compileUsed} / ${compileMax}`);
+        setText("preprocess-slots", `${preprocessUsed} / ${preprocessMax}`);
         setText("clients-total", state.clients.total);
         if (state.fds && state.fds.soft_limit > 0) {
           setText("fds", `${state.fds.open} / ${state.fds.soft_limit} (${state.fds.util_pct}%)`);
@@ -2103,6 +2162,373 @@ string Daemon::webgui_html() const
   </script>
 </body>
 </html>)HTML";
+}
+
+string Daemon::webgui_insights_html() const
+{
+    return string(R"HTML(<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>iceccd insights</title>
+  <style>
+    :root {
+      --bg: #050b15;
+      --panel: rgba(13, 22, 36, 0.94);
+      --border: #2a3f5e;
+      --text: #dbeafe;
+      --dim: #91a7c6;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: radial-gradient(1300px 700px at 0% 0%, #111f37 0%, var(--bg) 58%);
+      color: var(--text);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      padding: 16px;
+    }
+    .top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 12px;
+      gap: 10px;
+    }
+    .title {
+      margin: 0;
+      font-size: 20px;
+      letter-spacing: 0.25px;
+      text-transform: uppercase;
+    }
+    .meta {
+      color: var(--dim);
+      font-size: 12px;
+    }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      text-decoration: none;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      background: rgba(12, 22, 38, 0.95);
+      padding: 6px 10px;
+      font-size: 12px;
+    }
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+    .card {
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: var(--panel);
+      padding: 8px 10px;
+      min-height: 60px;
+    }
+    .label {
+      color: var(--dim);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.35px;
+    }
+    .value {
+      margin-top: 5px;
+      font-size: 15px;
+      color: #f8fbff;
+    }
+    .grid {
+      display: grid;
+      gap: 10px;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    .panel {
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: var(--panel);
+      padding: 8px 10px 10px;
+    }
+    .panel h2 {
+      margin: 0 0 6px;
+      font-size: 12px;
+      letter-spacing: 0.35px;
+      color: #c7d7ef;
+      text-transform: uppercase;
+    }
+    canvas {
+      width: 100%;
+      height: 170px;
+      display: block;
+      border: 1px solid rgba(47, 70, 102, 0.65);
+      border-radius: 8px;
+      background: rgba(6, 12, 22, 0.8);
+    }
+    @media (max-width: 1100px) {
+      .grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="top">
+    <div>
+      <h1 class="title">iceccd insights</h1>
+      <div class="meta" id="meta">connecting...</div>
+    </div>
+    <a class="btn" href="/">back to dashboard</a>
+  </div>
+
+  <div class="cards">
+    <div class="card"><div class="label">Compile Slots</div><div class="value" id="compile-slots">-</div></div>
+    <div class="card"><div class="label">Preprocess Slots</div><div class="value" id="preprocess-slots">-</div></div>
+    <div class="card"><div class="label">Wait Compile</div><div class="value" id="waitcompile">-</div></div>
+    <div class="card"><div class="label">Pending UseCS</div><div class="value" id="pending-usecs">-</div></div>
+    <div class="card"><div class="label">Local Queue</div><div class="value" id="local-queue">-</div></div>
+    <div class="card"><div class="label">WaitforCS avg (ms)</div><div class="value" id="waitforcs-avg">-</div></div>
+    <div class="card"><div class="label">Queue p95 / Exec p95</div><div class="value" id="queue-exec-p95">-</div></div>
+    <div class="card"><div class="label">Timing coverage / rate</div><div class="value" id="coverage-rate">-</div></div>
+  </div>
+
+  <div class="grid">
+    <div class="panel">
+      <h2>Slot utilization (%)</h2>
+      <canvas id="chart-slots"></canvas>
+    </div>
+    <div class="panel">
+      <h2>Queue depths (clients)</h2>
+      <canvas id="chart-queue"></canvas>
+    </div>
+    <div class="panel">
+      <h2>Latency trend (ms)</h2>
+      <canvas id="chart-latency"></canvas>
+    </div>
+    <div class="panel">
+      <h2>Throughput + timing coverage</h2>
+      <canvas id="chart-rate"></canvas>
+    </div>
+  </div>
+
+  <script>
+    const historyPoints = [];
+    const historyMax = 240;
+
+    function fmt(v) {
+      return v === null || v === undefined || Number.isNaN(v) ? "-" : String(v);
+    }
+
+    function setText(id, value) {
+      document.getElementById(id).textContent = fmt(value);
+    }
+
+    function quantile(values, p) {
+      if (!values.length) return null;
+      const sorted = [...values].sort((a, b) => a - b);
+      const idx = Math.min(sorted.length - 1, Math.max(0, Math.floor((sorted.length - 1) * p)));
+      return sorted[idx];
+    }
+
+    function drawChart(canvasId, lines, yMin, yMax, suffix) {
+      const canvas = document.getElementById(canvasId);
+      const rect = canvas.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      const width = Math.max(320, Math.floor(rect.width * dpr));
+      const height = Math.max(160, Math.floor(rect.height * dpr));
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext("2d");
+
+      ctx.clearRect(0, 0, width, height);
+      ctx.fillStyle = "rgba(6,12,22,0.95)";
+      ctx.fillRect(0, 0, width, height);
+
+      const padLeft = 44;
+      const padRight = 8;
+      const padTop = 10;
+      const padBottom = 18;
+      const plotW = Math.max(20, width - padLeft - padRight);
+      const plotH = Math.max(20, height - padTop - padBottom);
+
+      ctx.strokeStyle = "rgba(54,74,104,0.65)";
+      ctx.lineWidth = 1;
+      for (let i = 0; i <= 4; ++i) {
+        const y = padTop + (plotH * i / 4);
+        ctx.beginPath();
+        ctx.moveTo(padLeft, y);
+        ctx.lineTo(width - padRight, y);
+        ctx.stroke();
+      }
+
+      const range = Math.max(1, yMax - yMin);
+      const count = historyPoints.length;
+      const xFor = (idx) => count <= 1 ? padLeft : padLeft + (plotW * idx / (count - 1));
+      const yFor = (value) => padTop + plotH - (plotH * (value - yMin) / range);
+
+      lines.forEach((line) => {
+        ctx.strokeStyle = line.color;
+        ctx.lineWidth = 1.8 * dpr;
+        ctx.beginPath();
+        for (let i = 0; i < count; ++i) {
+          const point = historyPoints[i];
+          const v = Number(point[line.key] || 0);
+          const x = xFor(i);
+          const y = yFor(v);
+          if (i === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+      });
+
+      ctx.fillStyle = "#95a8c4";
+      ctx.font = `${11 * dpr}px ui-monospace,monospace`;
+      ctx.fillText(`${Math.round(yMax)}${suffix}`, 4 * dpr, (padTop + 8 * dpr));
+      ctx.fillText(`${Math.round(yMin)}${suffix}`, 4 * dpr, (padTop + plotH));
+
+      let legendX = padLeft;
+      const legendY = height - 5 * dpr;
+      lines.forEach((line) => {
+        ctx.fillStyle = line.color;
+        ctx.fillRect(legendX, legendY - 8 * dpr, 10 * dpr, 2.5 * dpr);
+        legendX += 14 * dpr;
+        ctx.fillStyle = "#cbdaf0";
+        ctx.fillText(line.label, legendX, legendY - 6 * dpr);
+        legendX += (line.label.length * 7 + 14) * dpr;
+      });
+    }
+
+    function seriesMax(keys, fallback) {
+      let max = fallback;
+      for (const row of historyPoints) {
+        for (const key of keys) {
+          const v = Number(row[key] || 0);
+          if (v > max) max = v;
+        }
+      }
+      return max;
+    }
+
+    function summarizeFromJobs(jobs) {
+      const queue = [];
+      const exec = [];
+      let timedByClient = 0;
+      let newestEndTs = 0;
+      for (const row of jobs) {
+        const endTs = Number(row.end_ts || 0);
+        if (endTs > newestEndTs) newestEndTs = endTs;
+      }
+      let jobsLastMin = 0;
+      for (const row of jobs) {
+        const waitforcs = Number(row.waitforcs_msec || 0);
+        const localQueue = Number(row.local_queue_msec || 0);
+        const queueValue = localQueue > 0 ? localQueue : waitforcs;
+        if (queueValue > 0) queue.push(queueValue);
+        const execValue = Number(row.exec_msec || 0);
+        if (execValue > 0) exec.push(execValue);
+        if (String(row.timing_source || "") === "client") {
+          ++timedByClient;
+        }
+        const endTs = Number(row.end_ts || 0);
+        if (newestEndTs > 0 && endTs >= newestEndTs - 60) {
+          ++jobsLastMin;
+        }
+      }
+      return {
+        queueP95: quantile(queue, 0.95) || 0,
+        execP95: quantile(exec, 0.95) || 0,
+        coveragePct: jobs.length ? Math.round(100 * timedByClient / jobs.length) : 0,
+        jobsPerMin: jobsLastMin
+      };
+    }
+
+    async function refresh() {
+      try {
+        const [stateRes, jobsRes] = await Promise.all([
+          fetch("/api/state", { cache: "no-store" }),
+          fetch("/api/jobs?limit=1000", { cache: "no-store" })
+        ]);
+        if (!stateRes.ok || !jobsRes.ok) {
+          throw new Error(`HTTP ${stateRes.status}/${jobsRes.status}`);
+        }
+        const state = await stateRes.json();
+        const jobsJson = await jobsRes.json();
+        const jobs = jobsJson.jobs || [];
+        const slots = state.slots || {};
+        const by = ((state.clients || {}).by_status || {});
+        const waitforcsCombined = ((state.waitforcs_latency_msec || {}).combined || {});
+        const jobsSummary = summarizeFromJobs(jobs);
+
+        const compileUsed = Number(slots.used || 0);
+        const compileMax = Math.max(1, Number(slots.max_kids || 1));
+        const preprocessUsed = Number(slots.active_preprocesses || 0);
+        const preprocessMax = Math.max(1, Number(slots.max_preprocess_kids || 1));
+        const waitCompile = Number(((by.waitcompile || {}).count) || 0);
+        const pendingUseCs = Number(((by.pending_use_cs || {}).count) || 0);
+        const localQueue = Number((((state.clients || {}).local_jobs || {}).queued) || 0);
+        const waitforcsAvg = Number(waitforcsCombined.avg_msec || 0);
+
+        setText("meta", `${state.node} | ts=${state.ts} | refreshed=${new Date().toLocaleTimeString()}`);
+        setText("compile-slots", `${compileUsed} / ${compileMax} (${Math.round(100 * compileUsed / compileMax)}%)`);
+        setText("preprocess-slots", `${preprocessUsed} / ${preprocessMax} (${Math.round(100 * preprocessUsed / preprocessMax)}%)`);
+        setText("waitcompile", waitCompile);
+        setText("pending-usecs", pendingUseCs);
+        setText("local-queue", localQueue);
+        setText("waitforcs-avg", waitforcsAvg);
+        setText("queue-exec-p95", `q ${jobsSummary.queueP95} | e ${jobsSummary.execP95}`);
+        setText("coverage-rate", `${jobsSummary.coveragePct}% | ${jobsSummary.jobsPerMin}/min`);
+
+        historyPoints.push({
+          compile_pct: (100 * compileUsed / compileMax),
+          preprocess_pct: (100 * preprocessUsed / preprocessMax),
+          waitcompile: waitCompile,
+          pending_usecs: pendingUseCs,
+          local_queue: localQueue,
+          waitforcs_avg: waitforcsAvg,
+          queue_p95: jobsSummary.queueP95,
+          exec_p95: jobsSummary.execP95,
+          coverage_pct: jobsSummary.coveragePct,
+          jobs_per_min: jobsSummary.jobsPerMin
+        });
+        if (historyPoints.length > historyMax) {
+          historyPoints.splice(0, historyPoints.length - historyMax);
+        }
+
+        drawChart("chart-slots", [
+          { key: "compile_pct", color: "#60a5fa", label: "compile" },
+          { key: "preprocess_pct", color: "#fbbf24", label: "preprocess" }
+        ], 0, 100, "%");
+
+        const queueMax = Math.max(10, seriesMax(["waitcompile", "pending_usecs", "local_queue"], 0));
+        drawChart("chart-queue", [
+          { key: "waitcompile", color: "#a78bfa", label: "waitcompile" },
+          { key: "pending_usecs", color: "#f97316", label: "pending_usecs" },
+          { key: "local_queue", color: "#38bdf8", label: "local_queue" }
+        ], 0, queueMax, "");
+
+        const latencyMax = Math.max(20, seriesMax(["waitforcs_avg", "queue_p95", "exec_p95"], 0));
+        drawChart("chart-latency", [
+          { key: "waitforcs_avg", color: "#f59e0b", label: "waitforcs_avg" },
+          { key: "queue_p95", color: "#22d3ee", label: "queue_p95" },
+          { key: "exec_p95", color: "#34d399", label: "exec_p95" }
+        ], 0, latencyMax, "ms");
+
+        const rateMax = Math.max(10, seriesMax(["jobs_per_min", "coverage_pct"], 0));
+        drawChart("chart-rate", [
+          { key: "jobs_per_min", color: "#4ade80", label: "jobs_per_min" },
+          { key: "coverage_pct", color: "#60a5fa", label: "coverage_pct" }
+        ], 0, rateMax, "");
+      } catch (error) {
+        setText("meta", "error: " + error);
+      }
+    }
+
+    setInterval(refresh, 2000);
+    refresh();
+  </script>
+</body>
+</html>)HTML");
 }
 
 string Daemon::dump_clients_json() const
@@ -2500,6 +2926,8 @@ void Daemon::handle_web_connection(int fd, short revents)
 
                 if (route == "/" || route == "/index.html") {
                     queue_web_response(fd, 200, "OK", "text/html; charset=utf-8", webgui_html());
+                } else if (route == "/insights" || route == "/insights.html") {
+                    queue_web_response(fd, 200, "OK", "text/html; charset=utf-8", webgui_insights_html());
                 } else if (route == "/api/state") {
                     queue_web_response(fd, 200, "OK", "application/json; charset=utf-8", dump_state_json());
                 } else if (route == "/api/clients") {
@@ -2760,7 +3188,8 @@ string Daemon::dump_internals() const
     result += "  Slots: active_processes=" + toString(clients.active_processes)
         + ", current_kids=" + toString(current_kids)
         + ", used=" + toString(current_kids + clients.active_processes)
-        + ", max_kids=" + toString(max_kids) + "\n";
+        + ", max_kids=" + toString(max_kids)
+        + ", max_preprocess_kids=" + toString(max_preprocess_kids) + "\n";
 
     const FdSnapshot fd_snapshot = collect_fd_snapshot();
     result += "  FDs: open=" + toString(fd_snapshot.open_count);
@@ -2924,6 +3353,8 @@ string Daemon::dump_internals() const
     }
 
     result += "  Current kids: " + toString(current_kids) + " (max: " + toString(max_kids) + ")\n";
+    result += "  Active preprocess jobs: " + toString(preprocess_active_processes)
+              + " (max: " + toString(max_preprocess_kids) + ")\n";
 
     result += "  Supported features: " + supported_features_to_string(supported_features) + "\n";
 
@@ -3109,8 +3540,10 @@ std::string Daemon::dump_state_json() const
 
     o << "\"slots\":{";
     o << "\"max_kids\":" << max_kids << ",";
+    o << "\"max_preprocess_kids\":" << max_preprocess_kids << ",";
     o << "\"current_kids\":" << current_kids << ",";
     o << "\"active_processes\":" << clients.active_processes << ",";
+    o << "\"active_preprocesses\":" << preprocess_active_processes << ",";
     o << "\"used\":" << (current_kids + clients.active_processes);
     o << "},";
 
@@ -3940,10 +4373,16 @@ bool Daemon::create_env_finished(string env_key)
 bool Daemon::handle_job_done(Client *cl, JobDoneMsg *m)
 {
     if (cl->status == Client::CLIENTWORK) {
-        if(cl->fulljob)
+        if (cl->running_preprocess) {
+            if (preprocess_active_processes > 0) {
+                --preprocess_active_processes;
+            }
+            cl->running_preprocess = false;
+        } else if(cl->fulljob) {
             clients.active_processes -= std::max((unsigned int)1, max_kids);
-        else
+        } else {
             clients.active_processes--;
+        }
     }
 
     cl->set_status(Client::JOBDONE, "handle_job_done: reported to scheduler");
@@ -3967,32 +4406,71 @@ bool Daemon::handle_job_done(Client *cl, JobDoneMsg *m)
 
 void Daemon::handle_old_request()
 {
-    while ((current_kids + clients.active_processes) < std::max((unsigned int)1, max_kids)) {
+    const unsigned int compile_limit = std::max((unsigned int)1, max_kids);
+    const unsigned int preprocess_limit = std::max((unsigned int)1, max_preprocess_kids);
 
-        Client *client = clients.get_earliest_client(Client::LINKJOB);
+    while (true) {
+        const bool compile_capacity = (current_kids + clients.active_processes) < compile_limit;
+        const bool preprocess_capacity = (preprocess_active_processes < preprocess_limit);
+        if (!compile_capacity && !preprocess_capacity) {
+            break;
+        }
+
+        Client *client = nullptr;
+        int min_client_id = 0;
+        uint32_t min_niceness = std::numeric_limits<uint32_t>::max();
+        for (const auto &it : clients) {
+            Client *candidate = it.second;
+            if (candidate->status != Client::LINKJOB) {
+                continue;
+            }
+            const bool preprocess_job = candidate->local_preprocess && !candidate->fulljob;
+            if ((preprocess_job && !preprocess_capacity) || (!preprocess_job && !compile_capacity)) {
+                continue;
+            }
+            if ((!min_client_id || min_client_id > candidate->client_id)
+                && candidate->niceness < min_niceness) {
+                client = candidate;
+                min_client_id = candidate->client_id;
+                min_niceness = candidate->niceness;
+            }
+        }
 
         if (client) {
             trace() << "send JobLocalBeginMsg to client" << endl;
+            const bool preprocess_job = client->local_preprocess && !client->fulljob;
 
             if (!client->channel->send_msg(JobLocalBeginMsg())) {
                 log_warning() << "can't send start message to client" << endl;
                 handle_end(client, 112);
             } else {
                 client->set_status(Client::CLIENTWORK, "handle_old_request: local job started");
-                if (client->fulljob) { // reserve the entire node
-                    clients.active_processes += std::max((unsigned int)1, max_kids);
+                if (preprocess_job) {
+                    client->running_preprocess = true;
+                    ++preprocess_active_processes;
+                    trace() << "pushed local preprocess job " << client->client_id << endl;
+                } else if (client->fulljob) { // reserve the entire node
+                    client->running_preprocess = false;
+                    clients.active_processes += compile_limit;
                     trace() << "pushed full local job " << client->client_id << endl;
                 } else {
+                    client->running_preprocess = false;
                     clients.active_processes++;
                     trace() << "pushed local job " << client->client_id << endl;
                 }
                 if (!send_scheduler(JobLocalBeginMsg(client->client_id, client->outfile,
-                        client->fulljob, client->local_reason))) {
+                        client->fulljob, client->local_reason, client->command_line,
+                        preprocess_job ? JobLocalBeginMsg::LocalFlagPreprocessOnly
+                                       : JobLocalBeginMsg::LocalFlagNone))) {
                     return;
                 }
             }
 
             continue;
+        }
+
+        if (!compile_capacity) {
+            break;
         }
 
         client = clients.get_earliest_client(Client::PENDING_USE_CS);
@@ -4168,10 +4646,16 @@ void Daemon::handle_end(Client *client, int exitcode)
     }
 
     if (client->status == Client::CLIENTWORK) {
-        if(client->fulljob)
+        if (client->running_preprocess) {
+            if (preprocess_active_processes > 0) {
+                --preprocess_active_processes;
+            }
+            client->running_preprocess = false;
+        } else if(client->fulljob) {
             clients.active_processes -= std::max((unsigned int)1, max_kids);
-        else
+        } else {
             clients.active_processes--;
+        }
     }
     client->fulljob = false;
 
@@ -4325,8 +4809,11 @@ bool Daemon::handle_local_job(Client *client, Msg *msg)
     client->fulljob = m->fulljob;
     client->local_reason = m->local_reason.empty() ? "unknown" : m->local_reason;
     client->command_line = m->cmdline;
+    client->local_preprocess = classify_local_preprocess_job(m->local_flags, m->cmdline, m->fulljob);
+    client->running_preprocess = false;
     if (client->command_line.empty() && client->channel) {
         client->command_line = command_line_from_peer_socket(client->channel->fd);
+        client->local_preprocess = classify_local_preprocess_job(m->local_flags, client->command_line, m->fulljob);
     }
     return true;
 }
@@ -4820,6 +5307,7 @@ int Daemon::working_loop()
 int main(int argc, char **argv)
 {
     int max_processes = -1;
+    int max_preprocess_processes = -1;
     srand(time(nullptr) + getpid());
 
     Daemon d;
@@ -4834,6 +5322,7 @@ int main(int argc, char **argv)
         static const struct option long_options[] = {
             { "netname", 1, nullptr, 'n' },
             { "max-processes", 1, nullptr, 'm' },
+            { "max-preprocess", 1, nullptr, 0 },
             { "help", 0, nullptr, 'h' },
             { "daemonize", 0, nullptr, 'd'},
             { "log-file", 1, nullptr, 'l'},
@@ -4895,6 +5384,15 @@ int main(int argc, char **argv)
                 }
             } else if (optname == "no-remote") {
                 d.noremote = true;
+            } else if (optname == "max-preprocess") {
+                if (optarg && *optarg) {
+                    max_preprocess_processes = atoi(optarg);
+                    if (max_preprocess_processes <= 0) {
+                        usage("Error: --max-preprocess requires positive integer argument");
+                    }
+                } else {
+                    usage("Error: --max-preprocess requires argument");
+                }
             } else if (optname == "state-jsonl") {
                 if (optarg && *optarg) {
                     d.state_jsonl_path = optarg;
@@ -5156,7 +5654,17 @@ int main(int argc, char **argv)
         max_kids = max_processes;
     }
 
-    log_info() << "allowing up to " << max_kids << " active jobs" << endl;
+    if (max_preprocess_processes > 0) {
+        max_preprocess_kids = (unsigned int)max_preprocess_processes;
+    } else {
+        const uint64_t default_preprocess = uint64_t(std::max((unsigned int)1, max_kids)) * 8ULL;
+        max_preprocess_kids = (default_preprocess > uint64_t(std::numeric_limits<unsigned int>::max()))
+                              ? std::numeric_limits<unsigned int>::max()
+                              : (unsigned int)default_preprocess;
+    }
+
+    log_info() << "allowing up to " << max_kids << " active compile jobs and "
+               << max_preprocess_kids << " active preprocess jobs" << endl;
 
     d.determine_supported_features();
     log_info() << "supported features: " << supported_features_to_string(d.supported_features) << endl;

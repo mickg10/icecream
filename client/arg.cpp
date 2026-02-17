@@ -315,6 +315,7 @@ int analyse_argv(const char * const *argv, CompileJob &job, bool icerun, list<st
     bool seen_march_native = false;
     bool seen_mcpu_native = false;
     bool seen_mtune_native = false;
+    bool preprocess_only = false;
     std::string seen_parallel_flto;
     const char *standard = nullptr;
     // if rewriting includes and precompiling on remote machine, then cpp args are not local
@@ -331,6 +332,7 @@ int analyse_argv(const char * const *argv, CompileJob &job, bool icerun, list<st
         } else if (a[0] == '-') {
             if (!strcmp(a, "-E")) {
                 always_local = true;
+                preprocess_only = true;
                 args.append(a, Arg_Local);
                 log_warning() << "preprocessing, building locally" << endl;
             } else if (!strncmp(a, "-fdump", 6)
@@ -371,6 +373,7 @@ int analyse_argv(const char * const *argv, CompileJob &job, bool icerun, list<st
                    not the compiler.  There would be no point trying
                    to distribute it even if we could. */
                 always_local = true;
+                preprocess_only = true;
                 args.append(a, Arg_Local);
                 log_warning() << "argument " << a << ", building locally" << endl;
             } else if (str_equal("--param", a)) {
@@ -961,6 +964,9 @@ int analyse_argv(const char * const *argv, CompileJob &job, bool icerun, list<st
     int ret = 0;
     if( always_local ) {
         ret |= AlwaysLocal;
+        if (preprocess_only) {
+            ret |= PreprocessOnly;
+        }
         if( !seen_parallel_flto.empty() && !seen_c ) {
             ret |= FullJob;
             trace() << seen_parallel_flto << " and no -c, building with all local slots" << endl;

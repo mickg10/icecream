@@ -74,9 +74,10 @@ extern std::string get_absfilename(const std::string &_file);
 
 enum RunFlags
 {
-    None        = 0,
-    AlwaysLocal = 1 << 0,  // The job should be built locally.
-    FullJob      = 1 << 1   // The job should reserve all slots (if AlwaysLocal).
+    None           = 0,
+    AlwaysLocal    = 1 << 0,  // The job should be built locally.
+    FullJob        = 1 << 1,  // The job should reserve all slots (if AlwaysLocal).
+    PreprocessOnly = 1 << 2   // Preprocessor-only invocation (-E / -M*).
 };
 /* In arg.cpp.  */
 // Returns RunFlags or-ed.
