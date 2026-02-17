@@ -95,22 +95,26 @@ sed -i -E \
     -e "s/^(Release:\\s*).*/\\11.obs1%{?dist}/" \
     "$SPEC_PATH"
 
-SOURCE0_LINE="$(grep -E '^Source0:' "$SPEC_PATH" | head -n1 | awk '{print $2}')"
-SOURCE0_NAME="${SOURCE0_LINE:-%{name}-%{version}.tar.xz}"
-SOURCE0_NAME="${SOURCE0_NAME//%\\{name\\}/icecream}"
-SOURCE0_NAME="${SOURCE0_NAME//%\\{version\\}/${UPSTREAM_VERSION}}"
+sed -i -E "s@^Source0:.*@Source0: %{name}-%{version}.tar.xz@" "$SPEC_PATH"
+SOURCE0_NAME="icecream-${UPSTREAM_VERSION}.tar.xz"
 
 SOURCE0_PATH="${HOME}/rpmbuild/SOURCES/${SOURCE0_NAME}"
 rm -f "${HOME}/rpmbuild/SOURCES/"icecream-*.tar.*
 
-case "$SOURCE0_NAME" in
-    *.tar.xz) tar -C "$SRC_DIR" -cJf "$SOURCE0_PATH" --exclude .git --exclude package_builder . ;;
-    *.tar.gz) tar -C "$SRC_DIR" -czf "$SOURCE0_PATH" --exclude .git --exclude package_builder . ;;
-    *.tar.bz2) tar -C "$SRC_DIR" -cjf "$SOURCE0_PATH" --exclude .git --exclude package_builder . ;;
-    *) tar -C "$SRC_DIR" -cJf "$SOURCE0_PATH.tar.xz" --exclude .git --exclude package_builder .; sed -i -E "s@^Source0:.*@Source0: %{name}-%{version}.tar.xz@" "$SPEC_PATH" ;;
-esac
+STAGE="$(mktemp -d)"
+trap 'rm -rf "$STAGE"' EXIT
 
-dnf -y builddep "$SPEC_PATH" || true
+mkdir -p "$STAGE/icecream-${UPSTREAM_VERSION}"
+rsync -a --delete \
+    --exclude ".git" \
+    --exclude "package_builder" \
+    "$SRC_DIR"/ "$STAGE/icecream-${UPSTREAM_VERSION}"/
+
+tar -C "$STAGE" -cJf "$SOURCE0_PATH" "icecream-${UPSTREAM_VERSION}"
+
+if ! dnf -y builddep "$SPEC_PATH"; then
+    echo "WARN: dnf builddep failed; continuing anyway" >&2
+fi
 
 rpmbuild -ba "$SPEC_PATH"
 
@@ -118,4 +122,3 @@ find "${HOME}/rpmbuild/RPMS" "${HOME}/rpmbuild/SRPMS" -type f -name '*.rpm' -pri
 
 echo "OK"
 ls -lh "$OUT_DIR" || true
-
