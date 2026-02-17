@@ -202,6 +202,42 @@ static string json_escape(const string &s)
     return out;
 }
 
+static bool string_ends_with(const string &value, const char *suffix)
+{
+    const size_t suffix_len = strlen(suffix);
+    return value.size() >= suffix_len
+           && value.compare(value.size() - suffix_len, suffix_len, suffix) == 0;
+}
+
+static string local_job_kind_from_outfile(const string &outfile, bool fulljob)
+{
+    if (fulljob) {
+        return "fulljob";
+    }
+
+    if (outfile.empty()) {
+        return "unknown";
+    }
+
+    const string::size_type slash = outfile.find_last_of('/');
+    const string base = (slash == string::npos) ? outfile : outfile.substr(slash + 1);
+
+    if (string_ends_with(base, ".o") || string_ends_with(base, ".obj")) {
+        return "object";
+    }
+    if (string_ends_with(base, ".a") || string_ends_with(base, ".lib")) {
+        return "archive";
+    }
+    if (string_ends_with(base, ".so") || base.find(".so.") != string::npos || string_ends_with(base, ".dylib")) {
+        return "sharedlib";
+    }
+    if (string_ends_with(base, ".exe")) {
+        return "executable";
+    }
+
+    return "other";
+}
+
 struct Client {
 public:
     /*
@@ -210,7 +246,7 @@ public:
      * PENDING_USE_CS: We have a CS from scheduler and need to tell the client
      *          as soon as there is a spot available on the local machine
      * JOBDONE: This was compiled by a local client and we got a jobdone - awaiting END
-     * LINKJOB: This is a local job (aka link job) by a local client we told the scheduler about
+     * LINKJOB: This is a local-only job by a local client we told the scheduler about
      *          and await the finish of it
      * TOINSTALL: We're receiving an environment transfer and wait for it to complete.
      * WAITINSTALL: Client is waiting for the environment transfer unpacking child to finish.
@@ -1481,6 +1517,11 @@ string Daemon::webgui_html() const
       if (status === "unknown") return "bad";
       return "";
     }
+    function statusLabel(status, row) {
+      if (status === "linkjob") return "localjob(queue)";
+      if (status === "clientwork" && row && row.local_job) return "localjob(running)";
+      return status;
+    }
     function makeCell(tr, text, className) {
       const td = document.createElement("td");
       td.textContent = fmt(text);
@@ -1510,7 +1551,7 @@ string Daemon::webgui_html() const
         root.className = "bar-row";
         const name = document.createElement("div");
         name.className = "bar-name";
-        name.textContent = row.name;
+        name.textContent = statusLabel(row.name);
         const wrap = document.createElement("div");
         wrap.className = "bar-wrap";
         const fill = document.createElement("div");
@@ -1536,7 +1577,7 @@ string Daemon::webgui_html() const
         const job = row.job || {};
         const usecs = row.usecs || {};
         makeCell(tr, row.client_id);
-        makeCell(tr, row.status, `status ${statusClass(row.status)}`);
+        makeCell(tr, statusLabel(row.status, row), `status ${statusClass(row.status)}`);
         makeCell(tr, row.age_msec);
         makeCell(tr, row.scheduler_job_id);
         makeCell(tr, `${fmt(job.target)} / ${fmt(job.env)}`);
@@ -1643,6 +1684,12 @@ string Daemon::dump_clients_json() const
     for (size_t i = 0; i < ordered.size(); ++i) {
         const uint64_t age_msec = ordered[i].first;
         const Client *client = ordered[i].second;
+        const bool local_job = (client->status == Client::LINKJOB)
+                               || (client->status == Client::CLIENTWORK
+                                   && client->status_why == "handle_old_request: local job started");
+        const string local_job_kind = local_job
+                                      ? local_job_kind_from_outfile(client->outfile, client->fulljob)
+                                      : string();
         if (i) {
             o << ",";
         }
@@ -1652,6 +1699,8 @@ string Daemon::dump_clients_json() const
         o << "\"status\":\"" << Client::status_str(client->status) << "\",";
         o << "\"age_msec\":" << (unsigned long long)age_msec << ",";
         o << "\"why\":\"" << json_escape(client->status_why) << "\",";
+        o << "\"local_job\":" << (local_job ? "true" : "false") << ",";
+        o << "\"local_job_kind\":\"" << json_escape(local_job_kind) << "\",";
         o << "\"scheduler_job_id\":" << client->last_known_job_id << ",";
         o << "\"last_waitforcs_msec\":" << (unsigned long long)client->last_waitforcs_msec << ",";
         o << "\"env_bytes_received\":" << (unsigned long long)client->env_bytes_received << ",";
@@ -2176,6 +2225,37 @@ string Daemon::dump_internals() const
     append_status_wait(Client::WAITFORCHILD, "local_child(waitforchild)");
     append_status_wait(Client::WAITCREATEENV, "create_env(waitcreateenv)");
 
+    uint32_t local_jobs_queued = status_aggs[int(Client::LINKJOB)].count;
+    uint32_t local_jobs_running = 0;
+    map<string, uint32_t> local_jobs_by_kind;
+    for (const auto &it : clients) {
+        const Client *client = it.second;
+        if (client->status == Client::LINKJOB
+                || (client->status == Client::CLIENTWORK
+                    && client->status_why == "handle_old_request: local job started")) {
+            if (client->status == Client::CLIENTWORK) {
+                ++local_jobs_running;
+            }
+            ++local_jobs_by_kind[local_job_kind_from_outfile(client->outfile, client->fulljob)];
+        }
+    }
+    const uint32_t local_jobs_total = local_jobs_queued + local_jobs_running;
+    if (local_jobs_total) {
+        result += "  Local jobs (legacy status linkjob): queued=" + toString(local_jobs_queued)
+            + " running=" + toString(local_jobs_running)
+            + " total=" + toString(local_jobs_total) + "\n";
+        string local_jobs_kind_line;
+        for (const auto &it : local_jobs_by_kind) {
+            if (!local_jobs_kind_line.empty()) {
+                local_jobs_kind_line += ", ";
+            }
+            local_jobs_kind_line += it.first + "=" + toString(it.second);
+        }
+        if (!local_jobs_kind_line.empty()) {
+            result += "  Local jobs by output kind: " + local_jobs_kind_line + "\n";
+        }
+    }
+
     {
         const StatusAgg &toinstall = status_aggs[int(Client::TOINSTALL)];
         const StatusAgg &waitinstall = status_aggs[int(Client::WAITINSTALL)];
@@ -2296,6 +2376,9 @@ std::string Daemon::dump_state_json() const
         uint64_t max_age_msec = 0;
     };
     vector<StatusAgg> status_aggs(Client::LASTSTATE + 1);
+    uint32_t local_jobs_queued = 0;
+    uint32_t local_jobs_running = 0;
+    map<string, uint32_t> local_jobs_by_kind;
 
     auto is_worst_candidate = [](Client::Status s) -> bool {
         switch (s) {
@@ -2324,6 +2407,17 @@ std::string Daemon::dump_state_json() const
         const uint64_t age_msec = now_msec - client->status_since_msec;
         agg.total_age_msec += age_msec;
         agg.max_age_msec = std::max(agg.max_age_msec, age_msec);
+        const bool is_local_queued = (client->status == Client::LINKJOB);
+        const bool is_local_running = (client->status == Client::CLIENTWORK
+                                       && client->status_why == "handle_old_request: local job started");
+        if (is_local_queued || is_local_running) {
+            if (is_local_queued) {
+                ++local_jobs_queued;
+            } else {
+                ++local_jobs_running;
+            }
+            ++local_jobs_by_kind[local_job_kind_from_outfile(client->outfile, client->fulljob)];
+        }
         if (is_worst_candidate(client->status)) {
             worst_clients.push_back(make_pair(age_msec, client));
         }
@@ -2442,18 +2536,43 @@ std::string Daemon::dump_state_json() const
     }
     o << "},";
 
+    o << "\"local_jobs\":{";
+    o << "\"legacy_status_name\":\"linkjob\",";
+    o << "\"queued\":" << local_jobs_queued << ",";
+    o << "\"running\":" << local_jobs_running << ",";
+    o << "\"total\":" << (local_jobs_queued + local_jobs_running) << ",";
+    o << "\"by_kind\":{";
+    bool first_local_kind = true;
+    for (const auto &it : local_jobs_by_kind) {
+        if (!first_local_kind) {
+            o << ",";
+        }
+        first_local_kind = false;
+        o << "\"" << json_escape(it.first) << "\":" << it.second;
+    }
+    o << "}";
+    o << "},";
+
     const size_t worst_limit = std::min(state_dump_worst_clients, worst_clients.size());
     o << "\"worst_limit\":" << worst_limit << ",";
     o << "\"worst\":[";
     for (size_t i = 0; i < worst_limit; ++i) {
         const uint64_t age_msec = worst_clients[i].first;
         const Client *client = worst_clients[i].second;
+        const bool local_job = (client->status == Client::LINKJOB)
+                               || (client->status == Client::CLIENTWORK
+                                   && client->status_why == "handle_old_request: local job started");
+        const string local_job_kind = local_job
+                                      ? local_job_kind_from_outfile(client->outfile, client->fulljob)
+                                      : string();
         if (i) {
             o << ",";
         }
         o << "{";
         o << "\"client_id\":" << client->client_id << ",";
         o << "\"status\":\"" << Client::status_str(client->status) << "\",";
+        o << "\"local_job\":" << (local_job ? "true" : "false") << ",";
+        o << "\"local_job_kind\":\"" << json_escape(local_job_kind) << "\",";
         o << "\"age_msec\":" << (unsigned long long)age_msec << ",";
         o << "\"why\":\"" << json_escape(client->status_why) << "\",";
         o << "\"last_waitforcs_msec\":" << (unsigned long long)client->last_waitforcs_msec << ",";
@@ -3445,7 +3564,7 @@ int Daemon::handle_cs_conf(ConfCSMsg *msg)
 bool Daemon::handle_local_job(Client *client, Msg *msg)
 {
     JobLocalBeginMsg* m = dynamic_cast<JobLocalBeginMsg *>(msg);
-    client->set_status(Client::LINKJOB, "handle_local_job: link job");
+    client->set_status(Client::LINKJOB, "handle_local_job: local-only job (legacy status=linkjob)");
     client->outfile = m->outfile;
     client->fulljob = m->fulljob;
     return true;
