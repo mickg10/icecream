@@ -502,7 +502,7 @@ void usage(const char *reason = nullptr)
     cerr << "usage: iceccd [-n <netname>] [-m <max_processes>] [--no-remote] [-d|--daemonize] [-l logfile] [-s <schedulerhost[:port]>]"
         " [-v[v[v]]] [-u|--user-uid <user_uid>] [-b <env-basedir>] [--cache-limit <MB>] [-N <node_name>] [-i|--interface <net_interface>] [-p|--port <port>]"
         " [--state-jsonl <path>] [--state-interval <sec>] [--state-log]"
-        " [--webgui] [--webgui-port <port>]" << endl;
+        " [--webgui] [--webgui-port <port>] [--webgui-addr <addr>]" << endl;
     exit(1);
 }
 
@@ -619,6 +619,7 @@ struct Daemon {
 
     bool webgui_enabled;
     int webgui_port;
+    string webgui_addr;
     int web_listen_fd;
     map<int, WebConnection> web_connections;
     size_t job_history_capacity;
@@ -670,6 +671,7 @@ struct Daemon {
         state_dump_worst_clients = 10;
         webgui_enabled = false;
         webgui_port = 8768;
+        webgui_addr = "127.0.0.1";
         web_listen_fd = -1;
         job_history_capacity = 20000;
         next_job_history_seq = 1;
@@ -906,9 +908,21 @@ bool Daemon::setup_web_listen_fd()
         return true;
     }
 
+    auto parse_webgui_bind_addr = [](const string &input, in_addr &out_addr, string &normalized) {
+        string candidate = input;
+        if (candidate.empty() || candidate == "localhost") {
+            candidate = "127.0.0.1";
+        }
+        if (inet_pton(AF_INET, candidate.c_str(), &out_addr) != 1) {
+            return false;
+        }
+        normalized = candidate;
+        return true;
+    };
+
     web_listen_fd = socket(PF_INET, SOCK_STREAM, 0);
     if (web_listen_fd < 0) {
-        log_perror("Failed to create localhost web gui socket");
+        log_perror("Failed to create web gui socket");
         return false;
     }
 
@@ -926,10 +940,20 @@ bool Daemon::setup_web_listen_fd()
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(webgui_port);
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    string normalized_addr;
+    if (!parse_webgui_bind_addr(webgui_addr, addr.sin_addr, normalized_addr)) {
+        log_error() << "Invalid web gui bind address '" << webgui_addr
+                    << "'. Use an IPv4 address or 'localhost'." << endl;
+        if (-1 == close(web_listen_fd) && (errno != EBADF)) {
+            log_perror("Failed to close web gui socket");
+        }
+        web_listen_fd = -1;
+        return false;
+    }
+    webgui_addr = normalized_addr;
 
     if (::bind(web_listen_fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
-        log_error() << "Failed to bind localhost web gui on 127.0.0.1:" << webgui_port
+        log_error() << "Failed to bind web gui on " << webgui_addr << ":" << webgui_port
                     << ": " << strerror(errno) << endl;
         if (-1 == close(web_listen_fd) && (errno != EBADF)) {
             log_perror("Failed to close web gui socket");
@@ -939,7 +963,7 @@ bool Daemon::setup_web_listen_fd()
     }
 
     if (listen(web_listen_fd, 128) < 0) {
-        log_perror("Failed to listen on localhost web gui socket");
+        log_perror("Failed to listen on web gui socket");
         if (-1 == close(web_listen_fd) && (errno != EBADF)) {
             log_perror("Failed to close web gui socket");
         }
@@ -953,7 +977,7 @@ bool Daemon::setup_web_listen_fd()
         fcntl(web_listen_fd, F_SETFL, flags | O_NONBLOCK);
     }
 
-    log_info() << "web gui listening on http://127.0.0.1:" << webgui_port << endl;
+    log_info() << "web gui listening on http://" << webgui_addr << ":" << webgui_port << endl;
     return true;
 }
 
@@ -3780,6 +3804,7 @@ int main(int argc, char **argv)
             { "state-log", 0, nullptr, 0},
             { "webgui", 0, nullptr, 0},
             { "webgui-port", 1, nullptr, 0},
+            { "webgui-addr", 1, nullptr, 0},
             { nullptr, 0, nullptr, 0 }
         };
 
@@ -3861,6 +3886,17 @@ int main(int argc, char **argv)
                     d.webgui_enabled = true;
                 } else {
                     usage("Error: --webgui-port requires argument");
+                }
+            } else if (optname == "webgui-addr") {
+                if (optarg && *optarg) {
+                    string addr = optarg;
+                    if (addr.empty()) {
+                        usage("Error: --webgui-addr requires argument");
+                    }
+                    d.webgui_addr = addr;
+                    d.webgui_enabled = true;
+                } else {
+                    usage("Error: --webgui-addr requires argument");
                 }
             }
 
@@ -4042,7 +4078,7 @@ int main(int argc, char **argv)
                    << ", log=" << (d.state_dump_log ? "true" : "false") << endl;
     }
     if (d.webgui_enabled) {
-        log_info() << "web gui requested on 127.0.0.1:" << d.webgui_port << endl;
+        log_info() << "web gui requested on " << d.webgui_addr << ":" << d.webgui_port << endl;
     }
     if (remote_disabled)
         log_warning() << "Cannot use chroot, no remote jobs accepted." << endl;
