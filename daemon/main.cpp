@@ -32,6 +32,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <netdb.h>
@@ -114,6 +115,48 @@ static uint64_t monotonic_msec()
 {
     using namespace std::chrono;
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+struct FdSnapshot {
+    long open_count;
+    rlim_t soft_limit;
+    rlim_t hard_limit;
+    FdSnapshot()
+        : open_count(-1)
+        , soft_limit(RLIM_INFINITY)
+        , hard_limit(RLIM_INFINITY) {}
+};
+
+static FdSnapshot collect_fd_snapshot()
+{
+    FdSnapshot snapshot;
+
+    struct rlimit lim;
+    if (getrlimit(RLIMIT_NOFILE, &lim) == 0) {
+        snapshot.soft_limit = lim.rlim_cur;
+        snapshot.hard_limit = lim.rlim_max;
+    }
+
+    DIR *dir = opendir("/proc/self/fd");
+    if (!dir) {
+        return snapshot;
+    }
+
+    long count = 0;
+    while (readdir(dir) != nullptr) {
+        ++count;
+    }
+    closedir(dir);
+
+    // ".", "..", and the descriptor used by opendir() itself.
+    if (count >= 3) {
+        count -= 3;
+    } else {
+        count = 0;
+    }
+
+    snapshot.open_count = count;
+    return snapshot;
 }
 
 static string json_escape(const string &s)
@@ -609,6 +652,10 @@ struct Daemon {
     int max_scheduler_pong;
     int max_scheduler_ping;
     unsigned int current_kids;
+    uint64_t accept_errors_total;
+    uint64_t accept_emfile_errors;
+    int last_accept_errno;
+    time_t last_accept_errno_ts;
 
     // Optional periodic dumps for production debugging.
     std::string state_jsonl_path;
@@ -665,6 +712,10 @@ struct Daemon {
         max_scheduler_pong = MAX_SCHEDULER_PONG;
         max_scheduler_ping = MAX_SCHEDULER_PING;
         current_kids = 0;
+        accept_errors_total = 0;
+        accept_emfile_errors = 0;
+        last_accept_errno = 0;
+        last_accept_errno_ts = 0;
         state_dump_interval_s = 0;
         state_dump_log = false;
         next_state_dump_msec = 0;
@@ -730,6 +781,7 @@ struct Daemon {
     static size_t parse_jobs_limit(const string &path);
     void queue_web_response(int fd, int status_code, const char *status_text,
                             const char *content_type, const string &body);
+    void note_accept_error(const char *where, int err);
     void check_cache_size(const string &new_env);
     void remove_native_environment(const string& env_key);
     void remove_environment(const string& env_key);
@@ -1004,6 +1056,35 @@ void Daemon::drop_web_connection(int fd)
         log_perror("Failed to close web gui connection");
     }
     web_connections.erase(fd);
+}
+
+void Daemon::note_accept_error(const char *where, int err)
+{
+    ++accept_errors_total;
+    if (err == EMFILE || err == ENFILE) {
+        ++accept_emfile_errors;
+    }
+    last_accept_errno = err;
+    last_accept_errno_ts = time(nullptr);
+
+    static uint64_t last_log_msec = 0;
+    const uint64_t now_msec = monotonic_msec();
+    const bool force_log = (err == EMFILE || err == ENFILE);
+    if (!force_log && now_msec - last_log_msec < 5000) {
+        return;
+    }
+    last_log_msec = now_msec;
+
+    const FdSnapshot fd = collect_fd_snapshot();
+    ostringstream msg;
+    msg << "accept failed (" << where << "): " << strerror(err) << " (errno " << err << ")";
+    if (fd.open_count >= 0) {
+        msg << ", open_fds=" << fd.open_count;
+        if (fd.soft_limit != RLIM_INFINITY) {
+            msg << ", nofile_soft_limit=" << (unsigned long long)fd.soft_limit;
+        }
+    }
+    log_error() << msg.str() << endl;
 }
 
 void Daemon::queue_web_response(int fd, int status_code, const char *status_text,
@@ -1337,6 +1418,7 @@ string Daemon::webgui_html() const
       <div class="card"><div class="label">Scheduler</div><div class="value small" id="scheduler">-</div></div>
       <div class="card"><div class="label">Slot usage</div><div class="value" id="slots">-</div></div>
       <div class="card"><div class="label">Connected clients</div><div class="value info" id="clients-total">-</div></div>
+      <div class="card"><div class="label">FD usage</div><div class="value" style="color:#fbbf24" id="fds">-</div></div>
       <div class="card"><div class="label">Waiting for scheduler</div><div class="value warn" id="waitforcs">-</div></div>
       <div class="card"><div class="label">Waiting remote compile</div><div class="value" style="color:#a78bfa" id="waitcompile">-</div></div>
       <div class="card"><div class="label">Local queue</div><div class="value" style="color:#60a5fa" id="tocompile">-</div></div>
@@ -1509,6 +1591,13 @@ string Daemon::webgui_html() const
         setText("scheduler", schedulerConnected ? state.scheduler.name : "disconnected");
         setText("slots", `${state.slots.used} / ${state.slots.max_kids}`);
         setText("clients-total", state.clients.total);
+        if (state.fds && state.fds.soft_limit > 0) {
+          setText("fds", `${state.fds.open} / ${state.fds.soft_limit} (${state.fds.util_pct}%)`);
+        } else if (state.fds) {
+          setText("fds", state.fds.open);
+        } else {
+          setText("fds", "-");
+        }
         setText("waitforcs", by.waitforcs.count);
         setText("waitcompile", by.waitcompile.count);
         setText("tocompile", by.tocompile.count);
@@ -1727,7 +1816,7 @@ void Daemon::handle_web_accept()
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
                 return;
             }
-            log_perror("Failed to accept web gui connection");
+            note_accept_error("webgui", errno);
             return;
         }
 
@@ -2044,6 +2133,22 @@ string Daemon::dump_internals() const
         + ", used=" + toString(current_kids + clients.active_processes)
         + ", max_kids=" + toString(max_kids) + "\n";
 
+    const FdSnapshot fd_snapshot = collect_fd_snapshot();
+    result += "  FDs: open=" + toString(fd_snapshot.open_count);
+    if (fd_snapshot.soft_limit != RLIM_INFINITY) {
+        result += ", soft_limit=" + toString((unsigned long long)fd_snapshot.soft_limit);
+    } else {
+        result += ", soft_limit=unlimited";
+    }
+    if (fd_snapshot.hard_limit != RLIM_INFINITY) {
+        result += ", hard_limit=" + toString((unsigned long long)fd_snapshot.hard_limit);
+    } else {
+        result += ", hard_limit=unlimited";
+    }
+    result += ", accept_errors_total=" + toString((unsigned long long)accept_errors_total)
+        + ", accept_emfile_errors=" + toString((unsigned long long)accept_emfile_errors)
+        + "\n";
+
     if (scheduler) {
         time_t scheduler_last_talk_age_s = time(nullptr) - scheduler->last_talk;
         if (scheduler_last_talk_age_s < 0) {
@@ -2183,6 +2288,7 @@ std::string Daemon::dump_state_json() const
 {
     const time_t now_s = time(nullptr);
     const uint64_t now_msec = monotonic_msec();
+    const FdSnapshot fd_snapshot = collect_fd_snapshot();
 
     StatsMsg msg;
     unsigned int memory_fillgrade = 0;
@@ -2271,6 +2377,37 @@ std::string Daemon::dump_state_json() const
     o << "\"current_kids\":" << current_kids << ",";
     o << "\"active_processes\":" << clients.active_processes << ",";
     o << "\"used\":" << (current_kids + clients.active_processes);
+    o << "},";
+
+    o << "\"fds\":{";
+    o << "\"open\":" << fd_snapshot.open_count << ",";
+    if (fd_snapshot.soft_limit == RLIM_INFINITY) {
+        o << "\"soft_limit\":-1,";
+    } else {
+        o << "\"soft_limit\":" << (unsigned long long)fd_snapshot.soft_limit << ",";
+    }
+    if (fd_snapshot.hard_limit == RLIM_INFINITY) {
+        o << "\"hard_limit\":-1,";
+    } else {
+        o << "\"hard_limit\":" << (unsigned long long)fd_snapshot.hard_limit << ",";
+    }
+    long long headroom = -1;
+    long long util_pct = -1;
+    if (fd_snapshot.open_count >= 0 && fd_snapshot.soft_limit != RLIM_INFINITY) {
+        headroom = (long long)fd_snapshot.soft_limit - (long long)fd_snapshot.open_count;
+        if (headroom < 0) {
+            headroom = 0;
+        }
+        if (fd_snapshot.soft_limit > 0) {
+            util_pct = ((long long)fd_snapshot.open_count * 100) / (long long)fd_snapshot.soft_limit;
+        }
+    }
+    o << "\"headroom\":" << headroom << ",";
+    o << "\"util_pct\":" << util_pct << ",";
+    o << "\"accept_errors_total\":" << (unsigned long long)accept_errors_total << ",";
+    o << "\"accept_emfile_errors\":" << (unsigned long long)accept_emfile_errors << ",";
+    o << "\"last_accept_errno\":" << last_accept_errno << ",";
+    o << "\"last_accept_errno_ts\":" << (long long)last_accept_errno_ts;
     o << "},";
 
     o << "\"stats\":{";
@@ -3599,101 +3736,95 @@ void Daemon::answer_client_requests()
             int acc_fd = accept(listen_fd, &cli_addr, &cli_len);
 
             if (acc_fd < 0) {
-                log_perror("accept error");
-            }
-
-            if (acc_fd == -1 && errno != EINTR) {
-                log_perror("accept failed:");
-                return;
-            }
-
-            MsgChannel *c = Service::createChannel(acc_fd, &cli_addr, cli_len);
-
-            if (!c) {
-                return;
-            }
-
-            Client *client = new Client;
-            client->client_id = ++new_client_id;
-            client->channel = c;
-            clients[c] = client;
-
-            fd2chan[c->fd] = c;
-
-            trace() << "accepted " << c->fd << " " << c->name << " as " << client->client_id << endl;
-
-            while (!c->read_a_bit() || c->has_msg()) {
-                if (!handle_activity(client)) {
-                    break;
+                if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+                    note_accept_error("client", errno);
                 }
+            } else {
+                MsgChannel *c = Service::createChannel(acc_fd, &cli_addr, cli_len);
+                if (c) {
+                    Client *client = new Client;
+                    client->client_id = ++new_client_id;
+                    client->channel = c;
+                    clients[c] = client;
 
-                if (client->status == Client::TOCOMPILE
-                        || client->status == Client::WAITFORCHILD
-                        || client->status == Client::WAITINSTALL) {
-                    break;
-                }
-            }
-        } else {
-            for (map<int, MsgChannel *>::const_iterator it = fd2chan.begin();
-                    it != fd2chan.end();)  {
-                int i = it->first;
-                MsgChannel *c = it->second;
-                Client *client = clients.find_by_channel(c);
-                assert(client);
-                ++it;
+                    fd2chan[c->fd] = c;
 
-                if (client->status == Client::WAITFORCHILD
-                        && client->pipe_from_child >= 0
-                        && pollfd_is_set(pollfds, client->pipe_from_child, POLLIN)) {
-                    if (!handle_compile_done(client)) {
-                        return;
-                    }
-                }
-                if ((client->status == Client::TOINSTALL || client->status == Client::WAITINSTALL)
-                        && client->pipe_from_child >= 0
-                        && pollfd_is_set(pollfds, client->pipe_from_child, POLLIN)) {
-                    if (!handle_env_install_child_done(client)) {
-                        return;
-                    }
-                }
+                    trace() << "accepted " << c->fd << " " << c->name << " as " << client->client_id << endl;
 
-                if (pollfd_is_set(pollfds, i, POLLIN)) {
-                    if( client->status == Client::TOCOMPILE )
-                    {
-                        /* read as the preprocessed input is ready but don't process it and leave it to the child
-                           if we didn't read it now, the client would be blocked and timed out */
-                        c->read_a_bit();
-                    }
-                    else
-                    {
-                        assert(client->status != Client::TOCOMPILE && client->status != Client::WAITINSTALL);
+                    while (!c->read_a_bit() || c->has_msg()) {
+                        if (!handle_activity(client)) {
+                            break;
+                        }
 
-                        while (!c->read_a_bit() || c->has_msg()) {
-                            if (!handle_activity(client)) {
-                                break;
-                            }
-
-                            if (client->status == Client::TOCOMPILE
+                        if (client->status == Client::TOCOMPILE
                                 || client->status == Client::WAITFORCHILD
                                 || client->status == Client::WAITINSTALL) {
-                                break;
-                            }
+                            break;
                         }
                     }
                 }
             }
+        }
 
-            for (map<string, NativeEnvironment>::iterator it = native_environments.begin();
-                 it != native_environments.end(); ) {
-                if (it->second.create_env_pipe && pollfd_is_set(pollfds, it->second.create_env_pipe, POLLIN)) {
-                    if(!create_env_finished(it->first))
-                    {
-                        native_environments.erase(it++);
-                        continue;
+        for (map<int, MsgChannel *>::const_iterator it = fd2chan.begin();
+                it != fd2chan.end();)  {
+            int i = it->first;
+            MsgChannel *c = it->second;
+            Client *client = clients.find_by_channel(c);
+            assert(client);
+            ++it;
+
+            if (client->status == Client::WAITFORCHILD
+                    && client->pipe_from_child >= 0
+                    && pollfd_is_set(pollfds, client->pipe_from_child, POLLIN)) {
+                if (!handle_compile_done(client)) {
+                    return;
+                }
+            }
+            if ((client->status == Client::TOINSTALL || client->status == Client::WAITINSTALL)
+                    && client->pipe_from_child >= 0
+                    && pollfd_is_set(pollfds, client->pipe_from_child, POLLIN)) {
+                if (!handle_env_install_child_done(client)) {
+                    return;
+                }
+            }
+
+            if (pollfd_is_set(pollfds, i, POLLIN)) {
+                if( client->status == Client::TOCOMPILE )
+                {
+                    /* read as the preprocessed input is ready but don't process it and leave it to the child
+                       if we didn't read it now, the client would be blocked and timed out */
+                    c->read_a_bit();
+                }
+                else
+                {
+                    assert(client->status != Client::TOCOMPILE && client->status != Client::WAITINSTALL);
+
+                    while (!c->read_a_bit() || c->has_msg()) {
+                        if (!handle_activity(client)) {
+                            break;
+                        }
+
+                        if (client->status == Client::TOCOMPILE
+                            || client->status == Client::WAITFORCHILD
+                            || client->status == Client::WAITINSTALL) {
+                            break;
+                        }
                     }
                 }
-                ++it;
             }
+        }
+
+        for (map<string, NativeEnvironment>::iterator it = native_environments.begin();
+             it != native_environments.end(); ) {
+            if (it->second.create_env_pipe && pollfd_is_set(pollfds, it->second.create_env_pipe, POLLIN)) {
+                if(!create_env_finished(it->first))
+                {
+                    native_environments.erase(it++);
+                    continue;
+                }
+            }
+            ++it;
         }
 
         if (had_scheduler && !scheduler) {
