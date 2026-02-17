@@ -51,6 +51,7 @@
 #include <cassert>
 #include <limits.h>
 #include <sys/time.h>
+#include <sys/resource.h>
 #include <comm.h>
 #include <vector>
 #include <sys/types.h>
@@ -90,6 +91,30 @@ static uint32_t invocation_elapsed_msec()
         return 0;
     }
     return clamp_u32(now - invocation_timing.submit_msec);
+}
+
+static void maybe_nice_preprocess_only(int argv_result)
+{
+    if (!(argv_result & PreprocessOnly)) {
+        return;
+    }
+
+    errno = 0;
+    int current_nice = getpriority(PRIO_PROCESS, 0);
+    if (current_nice == -1 && errno != 0) {
+        current_nice = 0;
+    }
+
+    // "nice 20" for preprocess-only jobs: lowest scheduling priority.
+    // Note: Linux nice range is [-20, 19].
+    if (current_nice >= 19) {
+        return;
+    }
+
+    if (setpriority(PRIO_PROCESS, 0, 19) != 0) {
+        log_warning() << "failed to set nice(19) for preprocess-only job: "
+                      << strerror(errno) << endl;
+    }
 }
 
 void invocation_timing_reset()
@@ -608,6 +633,7 @@ int main(int argc, char **argv)
         set_local_reason("argv_always_local");
         fulljob = argv_result & FullJob;
     }
+    maybe_nice_preprocess_only(argv_result);
 
     /* If ICECC is set to disable, then run job locally, without contacting
        the daemon at all. File-based locking will still ensure that all
