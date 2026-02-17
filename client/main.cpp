@@ -65,6 +65,45 @@
 using namespace std;
 
 extern const char *rs_program_name;
+std::string invocation_cmdline;
+
+static std::string shell_quote_arg(const std::string &arg)
+{
+    if (arg.empty()) {
+        return "''";
+    }
+
+    if (arg.find_first_of(" \t\r\n'\"`$\\|&;<>()[\\]{}*?!") == std::string::npos) {
+        return arg;
+    }
+
+    std::string quoted = "'";
+    for (char c : arg) {
+        if (c == '\'') {
+            quoted += "'\"'\"'";
+        } else {
+            quoted += c;
+        }
+    }
+    quoted += "'";
+    return quoted;
+}
+
+static std::string format_command_line(int argc, char **argv)
+{
+    if (!argv || argc <= 0) {
+        return std::string();
+    }
+
+    std::string out;
+    for (int i = 0; i < argc; ++i) {
+        if (i) {
+            out += ' ';
+        }
+        out += shell_quote_arg(argv[i] ? std::string(argv[i]) : std::string());
+    }
+    return out;
+}
 
 static void dcc_show_usage()
 {
@@ -230,11 +269,7 @@ static MsgChannel* get_local_daemon()
 
 static void debug_arguments(int argc, char** argv, bool original)
 {
-    string argstxt = argv[ 0 ];
-    for( int i = 1; i < argc; ++i ) {
-        argstxt += ' ';
-        argstxt += argv[ i ];
-    }
+    const string argstxt = format_command_line(argc, argv);
     if( original ) {
         trace() << "invoked as: " << argstxt << endl;
     } else {
@@ -315,6 +350,7 @@ int main(int argc, char **argv)
     if( expand.changed()) {
         debug_arguments(argc, argv, false);
     }
+    invocation_cmdline = format_command_line(argc, argv);
 
     CompileJob job;
     bool icerun = false;
@@ -647,7 +683,8 @@ int main(int argc, char **argv)
 
         /* Inform the daemon that we like to start a job.  */
         if (local_daemon->send_msg(JobLocalBeginMsg(0, get_absfilename(job.outputFile()), fulljob,
-                                                    local_reason.empty() ? "unknown" : local_reason))) {
+                                                    local_reason.empty() ? "unknown" : local_reason,
+                                                    invocation_cmdline))) {
             /* Now wait until the daemon gives us the start signal.  40 minutes
                should be enough for all normal compile or link jobs, but with expensive jobs
                (which fulljobs may likely be, e.g. LTO linking) use an even larger timeout.  */

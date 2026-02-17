@@ -36,7 +36,7 @@
 #include "job.h"
 
 // if you increase the PROTOCOL_VERSION, add a macro below and use that
-#define PROTOCOL_VERSION 45
+#define PROTOCOL_VERSION 46
 // if you increase the MIN_PROTOCOL_VERSION, comment out macros below and clean up the code
 #define MIN_PROTOCOL_VERSION 21
 
@@ -484,7 +484,8 @@ public:
              const std::string &host, int _minimal_host_version,
              unsigned int _required_features,
              int _niceness,
-             unsigned int _client_count = 0);
+             unsigned int _client_count = 0,
+             const std::string &_command_summary = "");
 
     virtual void fill_from_channel(MsgChannel *c);
     virtual void send_to_channel(MsgChannel *c) const;
@@ -501,6 +502,7 @@ public:
     uint32_t required_features;
     uint32_t client_count; // number of CS -> C connections at the moment
     uint32_t niceness; // nice priority (0-20)
+    std::string command_summary;
 };
 
 class UseCSMsg : public Msg
@@ -741,13 +743,14 @@ class JobLocalBeginMsg : public Msg
 {
 public:
     JobLocalBeginMsg(int job_id = 0, const std::string &file = "", bool full = false,
-                     const std::string &reason = "")
+                     const std::string &reason = "", const std::string &_cmdline = "")
         : Msg(Msg::JOB_LOCAL_BEGIN)
         , outfile(file)
         , stime(time(0))
         , id(job_id)
         , fulljob(full)
-        , local_reason(reason) {}
+        , local_reason(reason)
+        , cmdline(_cmdline) {}
 
     virtual void fill_from_channel(MsgChannel *c);
     virtual void send_to_channel(MsgChannel *c) const;
@@ -757,6 +760,7 @@ public:
     uint32_t id;
     bool fulljob;
     std::string local_reason;
+    std::string cmdline;
 };
 
 class JobLocalDoneMsg : public Msg

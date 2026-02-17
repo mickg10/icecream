@@ -1929,7 +1929,8 @@ GetCSMsg::GetCSMsg(const Environments &envs, const std::string &f,
      const std::string &host, int _minimal_host_version,
      unsigned int _required_features,
      int _niceness,
-     unsigned int _client_count)
+     unsigned int _client_count,
+     const std::string &_command_summary)
     : Msg(Msg::GET_CS)
     , versions(envs)
     , filename(f)
@@ -1943,6 +1944,7 @@ GetCSMsg::GetCSMsg(const Environments &envs, const std::string &f,
     , required_features(_required_features)
     , client_count(_client_count)
     , niceness(_niceness)
+    , command_summary(_command_summary)
 {
     // These have been introduced in protocol version 42.
     if( required_features & ( NODE_FEATURE_ENV_XZ | NODE_FEATURE_ENV_ZSTD ))
@@ -1996,6 +1998,12 @@ void GetCSMsg::fill_from_channel(MsgChannel *c)
     if (IS_PROTOCOL_VERSION(43, c)) {
         *c >> niceness;
     }
+
+    if (IS_PROTOCOL_VERSION(46, c)) {
+        *c >> command_summary;
+    } else {
+        command_summary.clear();
+    }
 }
 
 void GetCSMsg::send_to_channel(MsgChannel *c) const
@@ -2028,6 +2036,9 @@ void GetCSMsg::send_to_channel(MsgChannel *c) const
     }
     if (IS_PROTOCOL_VERSION(43, c)) {
         *c << niceness;
+    }
+    if (IS_PROTOCOL_VERSION(46, c)) {
+        *c << command_summary;
     }
 }
 
@@ -2293,6 +2304,11 @@ void JobLocalBeginMsg::fill_from_channel(MsgChannel *c)
     } else {
         local_reason.clear();
     }
+    if (IS_PROTOCOL_VERSION(46, c)) {
+        *c >> cmdline;
+    } else {
+        cmdline.clear();
+    }
 }
 
 void JobLocalBeginMsg::send_to_channel(MsgChannel *c) const
@@ -2306,6 +2322,9 @@ void JobLocalBeginMsg::send_to_channel(MsgChannel *c) const
     }
     if (IS_PROTOCOL_VERSION(45, c)) {
         *c << local_reason;
+    }
+    if (IS_PROTOCOL_VERSION(46, c)) {
+        *c << cmdline;
     }
 }
 

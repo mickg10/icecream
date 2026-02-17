@@ -147,6 +147,9 @@ test("web gui api endpoints return structured data", async ({ request }) => {
     const clientsJson = await clients.json();
     expect(clientsJson.type).toBe("iceccd_clients");
     expect(Array.isArray(clientsJson.clients)).toBeTruthy();
+    if (clientsJson.clients.length > 0) {
+        expect(typeof clientsJson.clients[0].cmdline).toBe("string");
+    }
 
     const jobs = await request.get(`${baseUrl}/api/jobs?limit=5`);
     expect(jobs.ok()).toBeTruthy();
@@ -155,4 +158,7 @@ test("web gui api endpoints return structured data", async ({ request }) => {
     expect(jobsJson.capacity).toBe(20000);
     expect(jobsJson.returned).toBeLessThanOrEqual(5);
     expect(Array.isArray(jobsJson.jobs)).toBeTruthy();
+    if (jobsJson.jobs.length > 0) {
+        expect(typeof jobsJson.jobs[0].cmdline).toBe("string");
+    }
 });

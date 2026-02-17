@@ -238,6 +238,65 @@ static string local_job_kind_from_outfile(const string &outfile, bool fulljob)
     return "other";
 }
 
+static string shell_quote_arg(const string &arg)
+{
+    if (arg.empty()) {
+        return "''";
+    }
+
+    if (arg.find_first_of(" \t\r\n'\"`$\\|&;<>()[\\]{}*?!") == string::npos) {
+        return arg;
+    }
+
+    string quoted = "'";
+    for (char c : arg) {
+        if (c == '\'') {
+            quoted += "'\"'\"'";
+        } else {
+            quoted += c;
+        }
+    }
+    quoted += "'";
+    return quoted;
+}
+
+static string command_line_from_compile_job(const CompileJob *job)
+{
+    if (!job) {
+        return string();
+    }
+
+    vector<string> args;
+    if (!job->compilerName().empty()) {
+        args.push_back(job->compilerName());
+    } else {
+        args.push_back("<compiler>");
+    }
+
+    for (const string &flag : job->allFlags()) {
+        args.push_back(flag);
+    }
+
+    if (!job->inputFile().empty()) {
+        args.push_back(job->inputFile());
+    }
+
+    if (!job->outputFile().empty()) {
+        args.push_back("-o");
+        args.push_back(job->outputFile());
+    }
+
+    string out;
+    out.reserve(512);
+    for (size_t i = 0; i < args.size(); ++i) {
+        if (i) {
+            out += ' ';
+        }
+        out += shell_quote_arg(args[i]);
+    }
+    return out;
+}
+
 static const uint64_t waitforcs_latency_bucket_upper_bounds_msec[] = {
     1, 2, 5, 10, 20, 50, 100, 250, 500, 1000, 2000, 5000, 10000
 };
@@ -371,6 +430,7 @@ public:
     uint32_t last_known_job_id;
     string status_why;
     string local_reason;
+    string command_line;
 
     string dump() const {
         uint64_t age_msec = monotonic_msec() - status_since_msec;
@@ -409,6 +469,26 @@ public:
         }
     }
 };
+
+static string client_command_line_for_display(const Client *client)
+{
+    if (!client) {
+        return string();
+    }
+
+    string cmdline = client->command_line;
+    if (cmdline.empty()) {
+        cmdline = command_line_from_compile_job(client->job);
+    }
+
+    const size_t kMaxLen = 4096;
+    if (cmdline.size() > kMaxLen) {
+        cmdline.resize(kMaxLen);
+        cmdline += " ...[truncated]";
+    }
+
+    return cmdline;
+}
 
 class Clients : public map<MsgChannel*, Client*>
 {
@@ -637,6 +717,7 @@ struct JobHistoryEntry {
     uint16_t usecs_port;
     bool usecs_got_env;
     string outfile;
+    string cmdline;
     string channel;
 };
 
@@ -1423,6 +1504,12 @@ string Daemon::webgui_html() const
     tbody tr:nth-child(even) {
       background: rgba(10, 16, 30, 0.42);
     }
+    tbody tr.clickable-row {
+      cursor: pointer;
+    }
+    tbody tr.clickable-row:hover {
+      background: rgba(33, 53, 82, 0.66);
+    }
     td.dim {
       color: var(--fg-dim);
     }
@@ -1449,6 +1536,69 @@ string Daemon::webgui_html() const
       padding: 2px 5px;
       font-family: inherit;
       font-size: 11px;
+    }
+    .modal {
+      position: fixed;
+      inset: 0;
+      background: rgba(2, 6, 14, 0.72);
+      display: grid;
+      place-items: center;
+      z-index: 1000;
+      padding: 16px;
+    }
+    .modal.hidden {
+      display: none;
+    }
+    .modal-card {
+      width: min(1100px, 100%);
+      max-height: min(82vh, 720px);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: rgba(10, 17, 29, 0.98);
+      box-shadow: 0 20px 46px rgba(2, 8, 23, 0.72);
+      display: grid;
+      grid-template-rows: auto auto 1fr;
+      overflow: hidden;
+    }
+    .modal-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 10px 12px;
+      border-bottom: 1px solid rgba(44, 61, 84, 0.7);
+      background: linear-gradient(180deg, rgba(18, 31, 50, 0.8), rgba(9, 17, 29, 0.8));
+      color: #c4d5eb;
+      text-transform: uppercase;
+      letter-spacing: 0.3px;
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .modal-close {
+      border: 1px solid #3b5273;
+      background: rgba(9, 15, 26, 0.96);
+      color: #dbeafe;
+      border-radius: 7px;
+      cursor: pointer;
+      padding: 2px 9px;
+      font-family: inherit;
+      font-size: 16px;
+      line-height: 1.1;
+    }
+    .modal-sub {
+      padding: 8px 12px;
+      color: var(--fg-dim);
+      border-bottom: 1px solid rgba(36, 53, 77, 0.72);
+      font-size: 11px;
+    }
+    .modal-body {
+      margin: 0;
+      padding: 10px 12px 12px;
+      overflow: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      color: #e5eefc;
+      font-size: 12px;
+      line-height: 1.4;
     }
     @media (max-width: 1180px) {
       .layout {
@@ -1533,6 +1683,16 @@ string Daemon::webgui_html() const
       </div>
     </div>
   </div>
+  <div class="modal hidden" id="cmdline-modal" role="dialog" aria-modal="true" aria-label="job command line">
+    <div class="modal-card">
+      <div class="modal-head">
+        <span>Job command line</span>
+        <button type="button" class="modal-close" id="cmdline-close" aria-label="Close">×</button>
+      </div>
+      <div class="modal-sub" id="cmdline-sub">-</div>
+      <pre class="modal-body" id="cmdline-body"></pre>
+    </div>
+  </div>
   <script>
     function fmt(value) { return value === null || value === undefined || value === "" ? "-" : String(value); }
     function setText(id, value) { document.getElementById(id).textContent = fmt(value); }
@@ -1565,6 +1725,19 @@ string Daemon::webgui_html() const
       td.textContent = fmt(text);
       if (className) td.className = className;
       tr.appendChild(td);
+    }
+    function showCmdline(row) {
+      const modal = document.getElementById("cmdline-modal");
+      const cmd = (row && row.cmdline) ? String(row.cmdline) : "";
+      const fallback = (row && row.outfile) ? `outfile=${row.outfile}` : "";
+      document.getElementById("cmdline-sub").textContent =
+        `client=${fmt(row && row.client_id)} status=${fmt(row && row.status)} scheduler_job=${fmt(row && row.scheduler_job_id)}`;
+      document.getElementById("cmdline-body").textContent =
+        cmd || fallback || "Command line not available for this row.";
+      modal.classList.remove("hidden");
+    }
+    function hideCmdline() {
+      document.getElementById("cmdline-modal").classList.add("hidden");
     }
     function renderStatusBars(byStatus, total) {
       const bars = document.getElementById("status-bars");
@@ -1612,6 +1785,9 @@ string Daemon::webgui_html() const
       const clipped = rows.slice(0, limit);
       for (const row of clipped) {
         const tr = document.createElement("tr");
+        tr.className = "clickable-row";
+        tr.title = "Click to view command line";
+        tr.addEventListener("click", () => showCmdline(row));
         const job = row.job || {};
         const usecs = row.usecs || {};
         makeCell(tr, row.client_id);
@@ -1704,6 +1880,17 @@ string Daemon::webgui_html() const
         setText("meta", "error: " + error);
       }
     }
+    document.getElementById("cmdline-close").addEventListener("click", hideCmdline);
+    document.getElementById("cmdline-modal").addEventListener("click", (event) => {
+      if (event.target === event.currentTarget) {
+        hideCmdline();
+      }
+    });
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        hideCmdline();
+      }
+    });
     document.getElementById("job-limit").addEventListener("change", refresh);
     setInterval(refresh, 2000);
     refresh();
@@ -1748,6 +1935,7 @@ string Daemon::dump_clients_json() const
         const string local_reason = local_job
                                     ? (client->local_reason.empty() ? string("unknown") : client->local_reason)
                                     : string();
+        const string cmdline = client_command_line_for_display(client);
         if (i) {
             o << ",";
         }
@@ -1760,6 +1948,7 @@ string Daemon::dump_clients_json() const
         o << "\"local_job\":" << (local_job ? "true" : "false") << ",";
         o << "\"local_job_kind\":\"" << json_escape(local_job_kind) << "\",";
         o << "\"local_reason\":\"" << json_escape(local_reason) << "\",";
+        o << "\"cmdline\":\"" << json_escape(cmdline) << "\",";
         o << "\"scheduler_job_id\":" << client->last_known_job_id << ",";
         o << "\"last_waitforcs_msec\":" << (unsigned long long)client->last_waitforcs_msec << ",";
         o << "\"env_bytes_received\":" << (unsigned long long)client->env_bytes_received << ",";
@@ -1847,6 +2036,7 @@ void Daemon::remember_finished_job(const Client *client, int exitcode)
     entry.usecs_port = client->usecsmsg ? client->usecsmsg->port : 0;
     entry.usecs_got_env = client->usecsmsg ? client->usecsmsg->got_env : false;
     entry.outfile = client->outfile;
+    entry.cmdline = client_command_line_for_display(client);
     entry.channel = client->channel ? client->channel->dump() : string();
 
     if (job_history.size() >= job_history_capacity) {
@@ -1895,6 +2085,7 @@ string Daemon::dump_job_history_json(size_t limit) const
         o << "\"usecs_port\":" << entry.usecs_port << ",";
         o << "\"usecs_got_env\":" << (entry.usecs_got_env ? "true" : "false") << ",";
         o << "\"outfile\":\"" << json_escape(entry.outfile) << "\",";
+        o << "\"cmdline\":\"" << json_escape(entry.cmdline) << "\",";
         o << "\"channel\":\"" << json_escape(entry.channel) << "\"";
         o << "}";
     }
@@ -2730,6 +2921,7 @@ std::string Daemon::dump_state_json() const
         const string local_reason = local_job
                                     ? (client->local_reason.empty() ? string("unknown") : client->local_reason)
                                     : string();
+        const string cmdline = client_command_line_for_display(client);
         if (i) {
             o << ",";
         }
@@ -2739,6 +2931,7 @@ std::string Daemon::dump_state_json() const
         o << "\"local_job\":" << (local_job ? "true" : "false") << ",";
         o << "\"local_job_kind\":\"" << json_escape(local_job_kind) << "\",";
         o << "\"local_reason\":\"" << json_escape(local_reason) << "\",";
+        o << "\"cmdline\":\"" << json_escape(cmdline) << "\",";
         o << "\"age_msec\":" << (unsigned long long)age_msec << ",";
         o << "\"why\":\"" << json_escape(client->status_why) << "\",";
         o << "\"last_waitforcs_msec\":" << (unsigned long long)client->last_waitforcs_msec << ",";
@@ -3588,6 +3781,9 @@ bool Daemon::handle_compile_file(Client *client, Msg *msg)
     assert(client);
     assert(job);
     client->job = job;
+    if (client->command_line.empty()) {
+        client->command_line = command_line_from_compile_job(job);
+    }
     client->last_known_job_id = job->jobID();
 
     if (client->status == Client::CLIENTWORK) {
@@ -3765,6 +3961,9 @@ bool Daemon::handle_get_cs(Client *client, Msg *msg)
 {
     GetCSMsg *umsg = dynamic_cast<GetCSMsg *>(msg);
     assert(client);
+    if (!umsg->command_summary.empty()) {
+        client->command_line = umsg->command_summary;
+    }
     client->niceness = umsg->niceness;
     client->last_waitforcs_msec = 0;
     client->set_status(Client::WAITFORCS, scheduler ? "handle_get_cs: sent GetCS to scheduler" : "handle_get_cs: scheduler missing");
@@ -3784,6 +3983,7 @@ bool Daemon::handle_get_cs(Client *client, Msg *msg)
     }
 
     umsg->client_count = clients.size();
+    umsg->command_summary.clear();
 
     return send_scheduler(*umsg);
 }
@@ -3802,6 +4002,7 @@ bool Daemon::handle_local_job(Client *client, Msg *msg)
     client->outfile = m->outfile;
     client->fulljob = m->fulljob;
     client->local_reason = m->local_reason.empty() ? "unknown" : m->local_reason;
+    client->command_line = m->cmdline;
     return true;
 }
 

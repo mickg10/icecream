@@ -39,6 +39,7 @@
 class MsgChannel;
 
 extern std::string remote_daemon;
+extern std::string invocation_cmdline;
 
 /* in remote.cpp */
 extern std::string get_absfilename(const std::string &_file);
