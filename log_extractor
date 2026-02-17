@@ -32,6 +32,16 @@ def _ts_iso_utc(ts: Optional[int]) -> str:
         return ""
 
 
+def _ts_iso_utc_ms(epoch_msec: Optional[int]) -> str:
+    if epoch_msec is None:
+        return ""
+    try:
+        sec = int(epoch_msec) / 1000.0
+        return _dt.datetime.fromtimestamp(sec, tz=_dt.timezone.utc).isoformat()
+    except Exception:
+        return ""
+
+
 def _safe_get(d: Any, *path: str, default: Any = None) -> Any:
     cur = d
     for key in path:
@@ -110,7 +120,7 @@ def _tar_outputs(outdir: Path, tar_path: Path) -> None:
 def main(argv: List[str]) -> int:
     ap = argparse.ArgumentParser(
         prog="log_extractor",
-        description="Extract icecream diagnostics from daemon JSONL state logs and ICECC exception logs.",
+        description="Extract icecream diagnostics from daemon JSONL state/job timing logs and ICECC exception logs.",
     )
     ap.add_argument("logfile", help="Input logfile path. Use '-' to read from stdin.")
     ap.add_argument(
@@ -132,6 +142,7 @@ def main(argv: List[str]) -> int:
     bad_json_lines = 0
     state_rows: List[Dict[str, Any]] = []
     worst_rows: List[Dict[str, Any]] = []
+    job_rows: List[Dict[str, Any]] = []
     exceptions: List[IceccException] = []
 
     statuses_seen: Counter[str] = Counter()
@@ -160,7 +171,67 @@ def main(argv: List[str]) -> int:
             if not isinstance(obj, dict):
                 continue
 
-            if obj.get("type") != "iceccd_state":
+            typ = obj.get("type")
+
+            if typ == "iceccd_job_timing":
+                ts = _safe_get(obj, "ts", default=None)
+                mono_msec = _safe_get(obj, "mono_msec", default=None)
+                submit_ts_raw = _safe_get(obj, "submit_ts", default=None)
+                try:
+                    submit_ts = int(submit_ts_raw) if submit_ts_raw is not None else None
+                except Exception:
+                    submit_ts = None
+
+                enqueue_msec = _safe_get(obj, "enqueue_msec", default=None)
+                start_msec = _safe_get(obj, "start_msec", default=None)
+                finish_msec = _safe_get(obj, "finish_msec", default=None)
+
+                def _epoch_ms(offset_msec: Any) -> Optional[int]:
+                    if submit_ts is None or offset_msec is None:
+                        return None
+                    try:
+                        return submit_ts * 1000 + int(offset_msec)
+                    except Exception:
+                        return None
+
+                enqueue_ts_ms = _epoch_ms(enqueue_msec)
+                start_ts_ms = _epoch_ms(start_msec)
+                finish_ts_ms = _epoch_ms(finish_msec)
+
+                job_rows.append(
+                    {
+                        "ts": ts,
+                        "ts_iso_utc": _ts_iso_utc(ts),
+                        "mono_msec": mono_msec,
+                        "node": _safe_get(obj, "node", default=""),
+                        "client_id": _safe_get(obj, "client_id", default=None),
+                        "scheduler_job_id": _safe_get(obj, "scheduler_job_id", default=None),
+                        "compile_job_id": _safe_get(obj, "compile_job_id", default=None),
+                        "exitcode": _safe_get(obj, "exitcode", default=None),
+                        "final_status": _safe_get(obj, "final_status", default=""),
+                        "final_why": _safe_get(obj, "final_why", default=""),
+                        "mode": _safe_get(obj, "mode", default=""),
+                        "timing_source": _safe_get(obj, "timing_source", default=""),
+                        "submit_ts": submit_ts,
+                        "submit_iso_utc": _ts_iso_utc(submit_ts),
+                        "enqueue_msec": enqueue_msec,
+                        "start_msec": start_msec,
+                        "finish_msec": finish_msec,
+                        "waitforcs_msec": _safe_get(obj, "waitforcs_msec", default=None),
+                        "local_queue_msec": _safe_get(obj, "local_queue_msec", default=None),
+                        "exec_msec": _safe_get(obj, "exec_msec", default=None),
+                        "enqueue_ts_ms": enqueue_ts_ms,
+                        "enqueue_iso_utc": _ts_iso_utc_ms(enqueue_ts_ms),
+                        "start_ts_ms": start_ts_ms,
+                        "start_iso_utc": _ts_iso_utc_ms(start_ts_ms),
+                        "finish_ts_ms": finish_ts_ms,
+                        "finish_iso_utc": _ts_iso_utc_ms(finish_ts_ms),
+                        "cmdline": _safe_get(obj, "cmdline", default=""),
+                    }
+                )
+                continue
+
+            if typ != "iceccd_state":
                 continue
 
             ts = _safe_get(obj, "ts", default=None)
@@ -329,6 +400,36 @@ def main(argv: List[str]) -> int:
         "channel",
     ]
 
+    job_fieldnames = [
+        "ts",
+        "ts_iso_utc",
+        "mono_msec",
+        "node",
+        "client_id",
+        "scheduler_job_id",
+        "compile_job_id",
+        "exitcode",
+        "final_status",
+        "final_why",
+        "mode",
+        "timing_source",
+        "submit_ts",
+        "submit_iso_utc",
+        "enqueue_msec",
+        "start_msec",
+        "finish_msec",
+        "waitforcs_msec",
+        "local_queue_msec",
+        "exec_msec",
+        "enqueue_ts_ms",
+        "enqueue_iso_utc",
+        "start_ts_ms",
+        "start_iso_utc",
+        "finish_ts_ms",
+        "finish_iso_utc",
+        "cmdline",
+    ]
+
     exc_rows = [
         {
             "dt": e.dt,
@@ -354,6 +455,11 @@ def main(argv: List[str]) -> int:
         _write_csv(p, worst_fieldnames, worst_rows)
         produced.append(p)
 
+    if job_rows:
+        p = outdir / f"{prefix}.job_timing.csv"
+        _write_csv(p, job_fieldnames, job_rows)
+        produced.append(p)
+
     if exc_rows:
         p = outdir / f"{prefix}.icecc_exceptions.csv"
         _write_csv(p, exc_fieldnames, exc_rows)
@@ -368,6 +474,7 @@ def main(argv: List[str]) -> int:
     summary_lines.append(f"json_lines: {json_lines}")
     summary_lines.append(f"bad_json_lines: {bad_json_lines}")
     summary_lines.append(f"iceccd_state_entries: {len(state_rows)}")
+    summary_lines.append(f"iceccd_job_timing_entries: {len(job_rows)}")
     summary_lines.append(f"icecc_exception_lines: {len(exceptions)}")
 
     if state_rows:
@@ -404,6 +511,63 @@ def main(argv: List[str]) -> int:
             for host, count in by_host.most_common(20):
                 summary_lines.append(f"  - {host}: {count}")
 
+    if job_rows:
+        def _to_int(value: Any) -> Optional[int]:
+            if value is None or value == "":
+                return None
+            try:
+                return int(value)
+            except Exception:
+                return None
+
+        def _pct(values: List[int], p: float) -> Optional[int]:
+            if not values:
+                return None
+            values = sorted(values)
+            idx = int(round((len(values) - 1) * p))
+            if idx < 0:
+                idx = 0
+            if idx >= len(values):
+                idx = len(values) - 1
+            return values[idx]
+
+        exitcodes = [_to_int(r.get("exitcode")) for r in job_rows]
+        exitcodes = [v for v in exitcodes if v is not None]
+        ok = sum(1 for v in exitcodes if v == 0)
+        modes = Counter((r.get("mode") or "") for r in job_rows)
+        sources = Counter((r.get("timing_source") or "") for r in job_rows)
+
+        queue_ms = [_to_int(r.get("local_queue_msec")) for r in job_rows]
+        queue_ms = [v for v in queue_ms if v is not None]
+        exec_ms = [_to_int(r.get("exec_msec")) for r in job_rows]
+        exec_ms = [v for v in exec_ms if v is not None]
+        waitforcs_ms = [_to_int(r.get("waitforcs_msec")) for r in job_rows]
+        waitforcs_ms = [v for v in waitforcs_ms if v is not None]
+
+        summary_lines.append("")
+        summary_lines.append("job_timing:")
+        if exitcodes:
+            summary_lines.append(f"  - success: {ok}/{len(exitcodes)} ({(100.0 * ok / len(exitcodes)):.1f}%)")
+        if modes:
+            summary_lines.append("  - modes:")
+            for k, v in modes.most_common():
+                summary_lines.append(f"      - {k or '<empty>'}: {v}")
+        if sources:
+            summary_lines.append("  - timing_source:")
+            for k, v in sources.most_common():
+                summary_lines.append(f"      - {k or '<empty>'}: {v}")
+
+        def _emit_pct(label: str, values: List[int]) -> None:
+            if not values:
+                return
+            summary_lines.append(
+                f"  - {label}: p50={_pct(values, 0.50)} p90={_pct(values, 0.90)} p99={_pct(values, 0.99)} max={max(values)}"
+            )
+
+        _emit_pct("local_queue_msec", queue_ms)
+        _emit_pct("exec_msec", exec_ms)
+        _emit_pct("waitforcs_msec", waitforcs_ms)
+
     p = outdir / f"{prefix}.summary.txt"
     _write_text(p, "\n".join(summary_lines) + "\n")
     produced.append(p)
@@ -422,4 +586,3 @@ def main(argv: List[str]) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv[1:]))
-
