@@ -238,6 +238,13 @@ static string local_job_kind_from_outfile(const string &outfile, bool fulljob)
     return "other";
 }
 
+static const uint64_t waitforcs_latency_bucket_upper_bounds_msec[] = {
+    1, 2, 5, 10, 20, 50, 100, 250, 500, 1000, 2000, 5000, 10000
+};
+
+static const size_t waitforcs_latency_bucket_count =
+    sizeof(waitforcs_latency_bucket_upper_bounds_msec) / sizeof(waitforcs_latency_bucket_upper_bounds_msec[0]);
+
 struct Client {
 public:
     /*
@@ -695,6 +702,14 @@ struct Daemon {
     bool state_dump_log;
     uint64_t next_state_dump_msec;
     size_t state_dump_worst_clients;
+    vector<uint64_t> waitforcs_use_cs_hist;
+    vector<uint64_t> waitforcs_no_cs_hist;
+    uint64_t waitforcs_use_cs_samples;
+    uint64_t waitforcs_no_cs_samples;
+    uint64_t waitforcs_use_cs_sum_msec;
+    uint64_t waitforcs_no_cs_sum_msec;
+    uint64_t waitforcs_use_cs_max_msec;
+    uint64_t waitforcs_no_cs_max_msec;
 
     bool webgui_enabled;
     int webgui_port;
@@ -752,6 +767,14 @@ struct Daemon {
         state_dump_log = false;
         next_state_dump_msec = 0;
         state_dump_worst_clients = 10;
+        waitforcs_use_cs_hist.assign(waitforcs_latency_bucket_count + 1, 0);
+        waitforcs_no_cs_hist.assign(waitforcs_latency_bucket_count + 1, 0);
+        waitforcs_use_cs_samples = 0;
+        waitforcs_no_cs_samples = 0;
+        waitforcs_use_cs_sum_msec = 0;
+        waitforcs_no_cs_sum_msec = 0;
+        waitforcs_use_cs_max_msec = 0;
+        waitforcs_no_cs_max_msec = 0;
         webgui_enabled = false;
         webgui_port = 8768;
         webgui_addr = "127.0.0.1";
@@ -793,6 +816,7 @@ struct Daemon {
     void determine_supported_features();
     bool maybe_stats(bool force_check = false);
     bool send_scheduler(const Msg &msg) __attribute_warn_unused_result__;
+    void record_waitforcs_latency(bool use_cs, uint64_t latency_msec);
     void close_scheduler();
     bool reconnect();
     int working_loop();
@@ -1636,7 +1660,24 @@ string Daemon::webgui_html() const
 
         const by = state.clients.by_status;
         const schedulerConnected = !!state.scheduler.connected;
-        setText("meta", `${state.node} | ts=${state.ts} | refreshed=${new Date().toLocaleTimeString()}`);
+        const topLocalReasons = Object.entries(((state.clients || {}).local_jobs || {}).by_reason || {})
+          .sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0))
+          .slice(0, 3)
+          .map(([name, count]) => `${name}:${count}`)
+          .join(", ");
+        const topWaitHosts = Object.entries((state.clients || {}).waitcompile_by_host || {})
+          .sort((a, b) => Number((b[1] || {}).count || 0) - Number((a[1] || {}).count || 0))
+          .slice(0, 3)
+          .map(([host, meta]) => `${host}:${meta.count}`)
+          .join(", ");
+        const waitforcsCombined = ((state.waitforcs_latency_msec || {}).combined || {});
+        let metaText = `${state.node} | ts=${state.ts} | refreshed=${new Date().toLocaleTimeString()}`;
+        if (topLocalReasons) metaText += ` | local_reasons=${topLocalReasons}`;
+        if (topWaitHosts) metaText += ` | waitcompile_hosts=${topWaitHosts}`;
+        if (waitforcsCombined.samples) {
+          metaText += ` | waitforcs_avg=${waitforcsCombined.avg_msec}ms`;
+        }
+        setText("meta", metaText);
         setText("scheduler", schedulerConnected ? state.scheduler.name : "disconnected");
         setText("slots", `${state.slots.used} / ${state.slots.max_kids}`);
         setText("clients-total", state.clients.total);
@@ -2178,7 +2219,13 @@ string Daemon::dump_internals() const
         uint64_t total_age_msec = 0;
         uint64_t max_age_msec = 0;
     };
+    struct HostStatusAgg {
+        uint32_t count = 0;
+        uint64_t total_age_msec = 0;
+        uint64_t max_age_msec = 0;
+    };
     vector<StatusAgg> status_aggs(Client::LASTSTATE + 1);
+    map<string, HostStatusAgg> waitcompile_by_host;
     for (const auto &it : clients) {
         const Client *client = it.second;
         StatusAgg &agg = status_aggs[int(client->status)];
@@ -2186,6 +2233,16 @@ string Daemon::dump_internals() const
         const uint64_t age_msec = now_msec - client->status_since_msec;
         agg.total_age_msec += age_msec;
         agg.max_age_msec = std::max(agg.max_age_msec, age_msec);
+        if (client->status == Client::WAITCOMPILE) {
+            string host = "unknown";
+            if (client->usecsmsg && !client->usecsmsg->hostname.empty()) {
+                host = client->usecsmsg->hostname;
+            }
+            HostStatusAgg &host_agg = waitcompile_by_host[host];
+            ++host_agg.count;
+            host_agg.total_age_msec += age_msec;
+            host_agg.max_age_msec = std::max(host_agg.max_age_msec, age_msec);
+        }
     }
 
     result += "  Clients: " + toString(clients.size()) + " (" + clients.dump_per_status() + ")\n";
@@ -2242,6 +2299,35 @@ string Daemon::dump_internals() const
     append_status_wait(Client::TOCOMPILE, "local_queue(tocompile)");
     append_status_wait(Client::WAITFORCHILD, "local_child(waitforchild)");
     append_status_wait(Client::WAITCREATEENV, "create_env(waitcreateenv)");
+    if (!waitcompile_by_host.empty()) {
+        string waitcompile_host_line;
+        for (const auto &it : waitcompile_by_host) {
+            if (!waitcompile_host_line.empty()) {
+                waitcompile_host_line += ", ";
+            }
+            const HostStatusAgg &host_agg = it.second;
+            const uint64_t avg_age_msec = host_agg.count ? (host_agg.total_age_msec / host_agg.count) : 0;
+            waitcompile_host_line += it.first + "=" + toString(host_agg.count)
+                + "(avg=" + toString(avg_age_msec)
+                + " max=" + toString(host_agg.max_age_msec) + ")";
+        }
+        result += "  Wait remote(waitcompile) by host: " + waitcompile_host_line + "\n";
+    }
+
+    const uint64_t waitforcs_samples = waitforcs_use_cs_samples + waitforcs_no_cs_samples;
+    if (waitforcs_samples) {
+        const uint64_t waitforcs_sum_msec = waitforcs_use_cs_sum_msec + waitforcs_no_cs_sum_msec;
+        const uint64_t waitforcs_max_msec = std::max(waitforcs_use_cs_max_msec, waitforcs_no_cs_max_msec);
+        result += "  Scheduler decision latency (msec): all samples=" + toString(waitforcs_samples)
+            + " avg=" + toString(waitforcs_sum_msec / waitforcs_samples)
+            + " max=" + toString(waitforcs_max_msec)
+            + ", use_cs samples=" + toString(waitforcs_use_cs_samples)
+            + " avg=" + toString(waitforcs_use_cs_samples ? (waitforcs_use_cs_sum_msec / waitforcs_use_cs_samples) : 0)
+            + " max=" + toString(waitforcs_use_cs_max_msec)
+            + ", no_cs samples=" + toString(waitforcs_no_cs_samples)
+            + " avg=" + toString(waitforcs_no_cs_samples ? (waitforcs_no_cs_sum_msec / waitforcs_no_cs_samples) : 0)
+            + " max=" + toString(waitforcs_no_cs_max_msec) + "\n";
+    }
 
     uint32_t local_jobs_queued = status_aggs[int(Client::LINKJOB)].count;
     uint32_t local_jobs_running = 0;
@@ -2406,11 +2492,17 @@ std::string Daemon::dump_state_json() const
         uint64_t total_age_msec = 0;
         uint64_t max_age_msec = 0;
     };
+    struct HostStatusAgg {
+        uint32_t count = 0;
+        uint64_t total_age_msec = 0;
+        uint64_t max_age_msec = 0;
+    };
     vector<StatusAgg> status_aggs(Client::LASTSTATE + 1);
     uint32_t local_jobs_queued = 0;
     uint32_t local_jobs_running = 0;
     map<string, uint32_t> local_jobs_by_kind;
     map<string, uint32_t> local_jobs_by_reason;
+    map<string, HostStatusAgg> waitcompile_by_host;
 
     auto is_worst_candidate = [](Client::Status s) -> bool {
         switch (s) {
@@ -2439,6 +2531,16 @@ std::string Daemon::dump_state_json() const
         const uint64_t age_msec = now_msec - client->status_since_msec;
         agg.total_age_msec += age_msec;
         agg.max_age_msec = std::max(agg.max_age_msec, age_msec);
+        if (client->status == Client::WAITCOMPILE) {
+            string host = "unknown";
+            if (client->usecsmsg && !client->usecsmsg->hostname.empty()) {
+                host = client->usecsmsg->hostname;
+            }
+            HostStatusAgg &host_agg = waitcompile_by_host[host];
+            ++host_agg.count;
+            host_agg.total_age_msec += age_msec;
+            host_agg.max_age_msec = std::max(host_agg.max_age_msec, age_msec);
+        }
         const bool is_local_queued = (client->status == Client::LINKJOB);
         const bool is_local_running = (client->status == Client::CLIENTWORK
                                        && client->status_why == "handle_old_request: local job started");
@@ -2569,6 +2671,22 @@ std::string Daemon::dump_state_json() const
         o << "}";
     }
     o << "},";
+    o << "\"waitcompile_by_host\":{";
+    bool first_waitcompile_host = true;
+    for (const auto &it : waitcompile_by_host) {
+        if (!first_waitcompile_host) {
+            o << ",";
+        }
+        first_waitcompile_host = false;
+        const HostStatusAgg &host_agg = it.second;
+        const uint64_t avg_age_msec = host_agg.count ? (host_agg.total_age_msec / host_agg.count) : 0;
+        o << "\"" << json_escape(it.first) << "\":{";
+        o << "\"count\":" << host_agg.count << ",";
+        o << "\"avg_age_msec\":" << (unsigned long long)avg_age_msec << ",";
+        o << "\"max_age_msec\":" << (unsigned long long)host_agg.max_age_msec;
+        o << "}";
+    }
+    o << "},";
 
     o << "\"local_jobs\":{";
     o << "\"legacy_status_name\":\"linkjob\",";
@@ -2658,6 +2776,49 @@ std::string Daemon::dump_state_json() const
     o << "]";
 
     o << "}";
+
+    const uint64_t combined_samples = waitforcs_use_cs_samples + waitforcs_no_cs_samples;
+    const uint64_t combined_sum_msec = waitforcs_use_cs_sum_msec + waitforcs_no_cs_sum_msec;
+    const uint64_t combined_max_msec = std::max(waitforcs_use_cs_max_msec, waitforcs_no_cs_max_msec);
+    vector<uint64_t> waitforcs_combined_hist(waitforcs_latency_bucket_count + 1, 0);
+    for (size_t i = 0; i < waitforcs_combined_hist.size(); ++i) {
+        waitforcs_combined_hist[i] = waitforcs_use_cs_hist[i] + waitforcs_no_cs_hist[i];
+    }
+
+    o << ",\"waitforcs_latency_msec\":{";
+    o << "\"bucket_upper_bounds\":[";
+    for (size_t i = 0; i < waitforcs_latency_bucket_count; ++i) {
+        if (i) {
+            o << ",";
+        }
+        o << (unsigned long long)waitforcs_latency_bucket_upper_bounds_msec[i];
+    }
+    o << "],";
+    auto emit_waitforcs_section = [&](const char *name, uint64_t samples, uint64_t sum_msec, uint64_t max_msec,
+                                      const vector<uint64_t> &hist) {
+        o << "\"" << name << "\":{";
+        o << "\"samples\":" << (unsigned long long)samples << ",";
+        o << "\"avg_msec\":" << (unsigned long long)(samples ? (sum_msec / samples) : 0) << ",";
+        o << "\"max_msec\":" << (unsigned long long)max_msec << ",";
+        o << "\"hist\":[";
+        for (size_t i = 0; i < hist.size(); ++i) {
+            if (i) {
+                o << ",";
+            }
+            o << (unsigned long long)hist[i];
+        }
+        o << "]";
+        o << "}";
+    };
+    emit_waitforcs_section("use_cs", waitforcs_use_cs_samples, waitforcs_use_cs_sum_msec,
+                           waitforcs_use_cs_max_msec, waitforcs_use_cs_hist);
+    o << ",";
+    emit_waitforcs_section("no_cs", waitforcs_no_cs_samples, waitforcs_no_cs_sum_msec,
+                           waitforcs_no_cs_max_msec, waitforcs_no_cs_hist);
+    o << ",";
+    emit_waitforcs_section("combined", combined_samples, combined_sum_msec,
+                           combined_max_msec, waitforcs_combined_hist);
+    o << "}";
     o << "}";
 
     return o.str();
@@ -2697,6 +2858,29 @@ void Daemon::maybe_dump_state()
     } while (next_state_dump_msec <= now);
 }
 
+void Daemon::record_waitforcs_latency(bool use_cs, uint64_t latency_msec)
+{
+    size_t bucket = waitforcs_latency_bucket_count;
+    for (size_t i = 0; i < waitforcs_latency_bucket_count; ++i) {
+        if (latency_msec <= waitforcs_latency_bucket_upper_bounds_msec[i]) {
+            bucket = i;
+            break;
+        }
+    }
+
+    if (use_cs) {
+        ++waitforcs_use_cs_samples;
+        waitforcs_use_cs_sum_msec += latency_msec;
+        waitforcs_use_cs_max_msec = std::max(waitforcs_use_cs_max_msec, latency_msec);
+        ++waitforcs_use_cs_hist[bucket];
+    } else {
+        ++waitforcs_no_cs_samples;
+        waitforcs_no_cs_sum_msec += latency_msec;
+        waitforcs_no_cs_max_msec = std::max(waitforcs_no_cs_max_msec, latency_msec);
+        ++waitforcs_no_cs_hist[bucket];
+    }
+}
+
 int Daemon::scheduler_get_internals()
 {
     trace() << "handle_get_internals " << dump_internals() << endl;
@@ -2719,6 +2903,7 @@ int Daemon::scheduler_use_cs(UseCSMsg *msg)
 
     if (c->status == Client::WAITFORCS) {
         c->last_waitforcs_msec = monotonic_msec() - c->status_since_msec;
+        record_waitforcs_latency(true, c->last_waitforcs_msec);
     }
 
     if (msg->hostname == remote_name && int(msg->port) == daemon_port) {
@@ -2759,6 +2944,7 @@ int Daemon::scheduler_no_cs(NoCSMsg *msg)
 
     if (c->status == Client::WAITFORCS) {
         c->last_waitforcs_msec = monotonic_msec() - c->status_since_msec;
+        record_waitforcs_latency(false, c->last_waitforcs_msec);
     }
 
     c->usecsmsg = new UseCSMsg(string(), "127.0.0.1", daemon_port, msg->job_id, true, 1, 0);
