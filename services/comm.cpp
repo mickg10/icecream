@@ -83,6 +83,47 @@ static int zstd_compression()
     return n;
 }
 
+static void maybe_set_tcp_congestion_control(int fd)
+{
+#ifndef TCP_CONGESTION
+    (void)fd;
+#else
+    const char *configured = getenv("ICECC_TCP_CONGESTION");
+    const char *requested = (configured && *configured) ? configured : "bbr";
+    if (!strcmp(requested, "off") || !strcmp(requested, "none") || !strcmp(requested, "disable")) {
+        return;
+    }
+
+    static bool logged_success = false;
+    static bool logged_failure = false;
+
+    if (setsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, requested, strlen(requested)) == 0) {
+        if (!logged_success) {
+            log_info() << "using TCP congestion control " << requested
+                       << " (set ICECC_TCP_CONGESTION to override)" << endl;
+            logged_success = true;
+        }
+        return;
+    }
+
+    const int err = errno;
+    const bool configured_explicitly = (configured && *configured);
+    const bool common_not_supported = (err == ENOPROTOOPT || err == EOPNOTSUPP
+                                       || err == EPROTONOSUPPORT || err == ENOENT
+                                       || err == EINVAL);
+
+    if (!configured_explicitly && !strcmp(requested, "bbr") && common_not_supported) {
+        return;
+    }
+
+    if (!logged_failure) {
+        log_warning() << "failed to set TCP congestion control to " << requested
+                      << ": " << strerror(err) << " (errno " << err << ")" << endl;
+        logged_failure = true;
+    }
+#endif
+}
+
 /*
  * A generic DoS protection. The biggest messages are of type FileChunk
  * which shouldn't be larger than 100kb. so anything bigger than 10 times
@@ -980,6 +1021,8 @@ MsgChannel::MsgChannel(int _fd, struct sockaddr *_a, socklen_t _l, bool text)
     int timeout = 3 * 3 * 1000; // matches the timeout part of keepalive above, in milliseconds
     setsockopt(_fd, IPPROTO_TCP, TCP_USER_TIMEOUT, (char *) &timeout, sizeof(timeout));
 #endif
+
+    maybe_set_tcp_congestion_control(_fd);
 
     if (fcntl(fd, F_SETFL, O_NONBLOCK) < 0) {
         log_perror("MsgChannel fcntl()");

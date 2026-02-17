@@ -167,4 +167,24 @@ test("web gui api endpoints return structured data", async ({ request }) => {
     expect(insights.ok()).toBeTruthy();
     const insightsHtml = await insights.text();
     expect(insightsHtml.includes("iceccd insights")).toBeTruthy();
+
+    const insightsSeries = await request.get(`${baseUrl}/api/insights-series?minutes=10`);
+    expect(insightsSeries.ok()).toBeTruthy();
+    const insightsSeriesJson = await insightsSeries.json();
+    expect(insightsSeriesJson.type).toBe("iceccd_insights_series");
+    expect(Array.isArray(insightsSeriesJson.buckets)).toBeTruthy();
+    expect(insightsSeriesJson.buckets.length).toBe(10);
+
+    const minuteTs = Number(((insightsSeriesJson.buckets || [])[9] || {}).minute_ts || 0);
+    expect(minuteTs).toBeGreaterThan(0);
+    const insightsJobs = await request.get(`${baseUrl}/api/insights-jobs?minute=${minuteTs}&limit=10`);
+    expect(insightsJobs.ok()).toBeTruthy();
+    const insightsJobsJson = await insightsJobs.json();
+    expect(insightsJobsJson.type).toBe("iceccd_insights_jobs");
+    expect(Array.isArray(insightsJobsJson.jobs)).toBeTruthy();
+
+    const insightsJobsPage = await request.get(`${baseUrl}/insights-jobs?minute=${minuteTs}`);
+    expect(insightsJobsPage.ok()).toBeTruthy();
+    const insightsJobsHtml = await insightsJobsPage.text();
+    expect(insightsJobsHtml.includes("insights jobs")).toBeTruthy();
 });

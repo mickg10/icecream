@@ -129,6 +129,17 @@ static list<JobRequestsGroup *> job_requests;
 
 static list<JobStat> all_job_stats;
 static JobStat cum_job_stats;
+struct RuntimeEstimate {
+    uint64_t ewma_real_msec;
+    uint32_t samples;
+    time_t last_update;
+    RuntimeEstimate()
+        : ewma_real_msec(0)
+        , samples(0)
+        , last_update(0) {}
+};
+static map<string, RuntimeEstimate> file_runtime_estimates;
+static const size_t max_file_runtime_estimates = 50000;
 
 static float server_speed(CompileServer *cs, Job *job = nullptr, bool blockDebug = false);
 
@@ -145,8 +156,105 @@ bool JobRequestsGroup::remove_job(Job *job)
     return false;
 }
 
+static uint64_t default_estimated_real_msec(const Job *job)
+{
+    uint64_t estimate_msec = 1000;
+    if (!all_job_stats.empty()) {
+        estimate_msec = std::max<uint64_t>(1, uint64_t(cum_job_stats.compileTimeReal() / all_job_stats.size()));
+    }
+
+    if (job) {
+        const unsigned int flags = job->argFlags();
+        if (flags & CompileJob::Flag_O2 || flags & CompileJob::Flag_Ol2) {
+            estimate_msec = estimate_msec * 7 / 4;
+        } else if (flags & CompileJob::Flag_O) {
+            estimate_msec = estimate_msec * 6 / 4;
+        }
+        if (flags & CompileJob::Flag_g3) {
+            estimate_msec = estimate_msec * 13 / 10;
+        } else if (flags & CompileJob::Flag_g) {
+            estimate_msec = estimate_msec * 11 / 10;
+        }
+    }
+
+    return std::max<uint64_t>(1, estimate_msec);
+}
+
+static uint64_t estimate_job_real_msec(const Job *job)
+{
+    const uint64_t fallback = default_estimated_real_msec(job);
+    if (!job || job->fileName().empty()) {
+        return fallback;
+    }
+
+    const auto it = file_runtime_estimates.find(job->fileName());
+    if (it == file_runtime_estimates.end() || !it->second.ewma_real_msec) {
+        return fallback;
+    }
+
+    const RuntimeEstimate &estimate = it->second;
+    if (estimate.samples >= 3) {
+        return std::max<uint64_t>(1, estimate.ewma_real_msec);
+    }
+
+    const uint64_t mixed = (estimate.ewma_real_msec * estimate.samples
+                            + fallback * (4 - estimate.samples)) / 4;
+    return std::max<uint64_t>(1, mixed);
+}
+
+static uint64_t estimate_job_queue_score(const Job *job)
+{
+    if (!job) {
+        return 0;
+    }
+
+    const uint64_t estimate_msec = estimate_job_real_msec(job);
+    time_t queue_age_s = time(nullptr) - job->enqueueTime();
+    if (queue_age_s < 0) {
+        queue_age_s = 0;
+    }
+
+    const uint64_t queue_age_msec = uint64_t(queue_age_s) * 1000ULL;
+    const uint64_t age_bonus = std::min<uint64_t>(estimate_msec, queue_age_msec / 2);
+    return estimate_msec + age_bonus;
+}
+
+static void add_runtime_estimate(const Job *job, unsigned long real_msec)
+{
+    if (!job || !real_msec || job->fileName().empty()) {
+        return;
+    }
+
+    RuntimeEstimate &estimate = file_runtime_estimates[job->fileName()];
+    if (!estimate.ewma_real_msec) {
+        estimate.ewma_real_msec = real_msec;
+    } else {
+        estimate.ewma_real_msec = (estimate.ewma_real_msec * 7 + real_msec) / 8;
+    }
+    if (estimate.samples < std::numeric_limits<uint32_t>::max()) {
+        ++estimate.samples;
+    }
+    estimate.last_update = time(nullptr);
+
+    if (file_runtime_estimates.size() <= max_file_runtime_estimates) {
+        return;
+    }
+
+    auto oldest_it = file_runtime_estimates.begin();
+    for (auto it = file_runtime_estimates.begin(); it != file_runtime_estimates.end(); ++it) {
+        if (it->second.last_update < oldest_it->second.last_update) {
+            oldest_it = it;
+        }
+    }
+    file_runtime_estimates.erase(oldest_it);
+}
+
 static void add_job_stats(Job *job, JobDoneMsg *msg)
 {
+    if (msg && msg->exitcode == 0 && msg->real_msec > 0) {
+        add_runtime_estimate(job, msg->real_msec);
+    }
+
     JobStat st;
 
     /* We don't want to base our timings on failed or too small jobs.  */
@@ -431,9 +539,31 @@ static JobRequestPosition get_first_job_request()
         return JobRequestPosition();
     }
 
+    const int best_niceness = job_requests.front()->niceness;
+    JobRequestPosition best;
+    uint64_t best_score = 0;
+
+    for (JobRequestsGroup *group : job_requests) {
+        if (group->niceness != best_niceness) {
+            break;
+        }
+        for (Job *job : group->l) {
+            const uint64_t score = estimate_job_queue_score(job);
+            if (!best.isValid() || score > best_score
+                    || (score == best_score && job->id() < best.job->id())) {
+                best = JobRequestPosition(group, job);
+                best_score = score;
+            }
+        }
+    }
+
+    if (best.isValid()) {
+        return best;
+    }
+
     JobRequestsGroup *first = job_requests.front();
     assert(!first->l.empty());
-    return JobRequestPosition( first, first->l.front());
+    return JobRequestPosition(first, first->l.front());
 }
 
 static JobRequestPosition get_next_job_request(const JobRequestPosition& pos)

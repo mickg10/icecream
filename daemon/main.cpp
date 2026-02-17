@@ -824,6 +824,8 @@ const int min_mem_limit = 100;
 unsigned int max_kids = 0;
 unsigned int max_preprocess_kids = 0;
 unsigned int preprocess_active_processes = 0;
+const size_t insights_graph_minutes = 100;
+const size_t insights_retention_minutes = 120;
 
 size_t cache_size_limit = 256 * 1024 * 1024;
 
@@ -874,6 +876,37 @@ struct JobHistoryEntry {
     uint32_t client_local_queue_msec;
     uint32_t client_exec_msec;
     string client_mode;
+};
+
+struct InsightsMinuteEntry {
+    time_t minute_ts;
+    uint32_t jobs_total;
+    uint32_t jobs_remote;
+    uint32_t jobs_local;
+    uint32_t jobs_preprocess;
+    uint32_t jobs_failed;
+    uint32_t jobs_timed;
+    uint64_t queue_sum_msec;
+    uint64_t exec_sum_msec;
+    uint64_t waitforcs_sum_msec;
+    uint32_t queue_samples;
+    uint32_t exec_samples;
+    uint32_t waitforcs_samples;
+
+    InsightsMinuteEntry()
+        : minute_ts(0)
+        , jobs_total(0)
+        , jobs_remote(0)
+        , jobs_local(0)
+        , jobs_preprocess(0)
+        , jobs_failed(0)
+        , jobs_timed(0)
+        , queue_sum_msec(0)
+        , exec_sum_msec(0)
+        , waitforcs_sum_msec(0)
+        , queue_samples(0)
+        , exec_samples(0)
+        , waitforcs_samples(0) {}
 };
 
 struct WebConnection {
@@ -955,6 +988,7 @@ struct Daemon {
     size_t job_history_capacity;
     uint64_t next_job_history_seq;
     deque<JobHistoryEntry> job_history;
+    deque<InsightsMinuteEntry> insights_history;
 
     Daemon() {
         warn_icecc_user_errno = 0;
@@ -1067,12 +1101,18 @@ struct Daemon {
     void drop_web_connection(int fd);
     string webgui_html() const;
     string webgui_insights_html() const;
+    string webgui_insights_jobs_html() const;
     string dump_clients_json() const;
     string dump_job_history_json(size_t limit) const;
+    string dump_insights_series_json(size_t minutes);
+    string dump_insights_jobs_json(time_t minute_ts, size_t limit);
     void remember_finished_job(const Client *client, int exitcode);
+    void update_insights_history(const JobHistoryEntry &entry);
+    void prune_insights_history(time_t now_ts);
     static bool should_track_client_job(const Client *client);
     static bool parse_http_request(const string &request, string &method, string &path);
     static size_t parse_jobs_limit(const string &path);
+    static bool parse_query_u64(const string &path, const char *key, uint64_t *value);
     void queue_web_response(int fd, int status_code, const char *status_text,
                             const char *content_type, const string &body);
     void note_accept_error(const char *where, int err);
@@ -1452,6 +1492,39 @@ size_t Daemon::parse_jobs_limit(const string &path)
         limit = kMaxLimit;
     }
     return size_t(limit);
+}
+
+bool Daemon::parse_query_u64(const string &path, const char *key, uint64_t *value)
+{
+    if (!key || !*key || !value) {
+        return false;
+    }
+
+    const size_t query_pos = path.find('?');
+    if (query_pos == string::npos) {
+        return false;
+    }
+    const string query = path.substr(query_pos + 1);
+    const string needle = string(key) + "=";
+    size_t pos = 0;
+    while (pos < query.size()) {
+        const size_t amp = query.find('&', pos);
+        if (query.compare(pos, needle.size(), needle) == 0) {
+            const char *begin = query.c_str() + pos + needle.size();
+            char *parse_end = nullptr;
+            const unsigned long long parsed = strtoull(begin, &parse_end, 10);
+            if (parse_end == begin) {
+                return false;
+            }
+            *value = parsed;
+            return true;
+        }
+        if (amp == string::npos) {
+            break;
+        }
+        pos = amp + 1;
+    }
+    return false;
 }
 
 string Daemon::webgui_html() const
@@ -2258,9 +2331,14 @@ string Daemon::webgui_insights_html() const
       color: #c7d7ef;
       text-transform: uppercase;
     }
+    .panel .sub {
+      color: var(--dim);
+      font-size: 11px;
+      margin-bottom: 6px;
+    }
     canvas {
       width: 100%;
-      height: 170px;
+      height: 180px;
       display: block;
       border: 1px solid rgba(47, 70, 102, 0.65);
       border-radius: 8px;
@@ -2288,33 +2366,39 @@ string Daemon::webgui_insights_html() const
     <div class="card"><div class="label">Wait Compile</div><div class="value" id="waitcompile">-</div></div>
     <div class="card"><div class="label">Pending UseCS</div><div class="value" id="pending-usecs">-</div></div>
     <div class="card"><div class="label">Local Queue</div><div class="value" id="local-queue">-</div></div>
-    <div class="card"><div class="label">WaitforCS avg (ms)</div><div class="value" id="waitforcs-avg">-</div></div>
-    <div class="card"><div class="label">Queue p95 / Exec p95</div><div class="value" id="queue-exec-p95">-</div></div>
-    <div class="card"><div class="label">Timing coverage / rate</div><div class="value" id="coverage-rate">-</div></div>
+    <div class="card"><div class="label">Latest jobs/min</div><div class="value" id="jobs-per-minute">-</div></div>
+    <div class="card"><div class="label">Queue avg / Exec avg</div><div class="value" id="queue-exec-avg">-</div></div>
+    <div class="card"><div class="label">Timing coverage</div><div class="value" id="timing-coverage">-</div></div>
   </div>
 
   <div class="grid">
     <div class="panel">
-      <h2>Slot utilization (%)</h2>
-      <canvas id="chart-slots"></canvas>
+      <h2>Jobs per minute</h2>
+      <div class="sub">click a point to open jobs for that minute</div>
+      <canvas id="chart-jobs"></canvas>
     </div>
     <div class="panel">
-      <h2>Queue depths (clients)</h2>
-      <canvas id="chart-queue"></canvas>
-    </div>
-    <div class="panel">
-      <h2>Latency trend (ms)</h2>
+      <h2>Queue / exec avg (ms)</h2>
+      <div class="sub">per-minute averages from in-memory history</div>
       <canvas id="chart-latency"></canvas>
     </div>
     <div class="panel">
-      <h2>Throughput + timing coverage</h2>
-      <canvas id="chart-rate"></canvas>
+      <h2>Mode split and failures</h2>
+      <div class="sub">remote/local/preprocess/fail jobs per minute</div>
+      <canvas id="chart-modes"></canvas>
+    </div>
+    <div class="panel">
+      <h2>Slot utilization (%)</h2>
+      <div class="sub">live rolling trend</div>
+      <canvas id="chart-slots"></canvas>
     </div>
   </div>
 
   <script>
-    const historyPoints = [];
-    const historyMax = 240;
+    const slotHistory = [];
+    const slotHistoryMax = 180;
+    let jobsBuckets = [];
+    let jobsPointMap = [];
 
     function fmt(v) {
       return v === null || v === undefined || Number.isNaN(v) ? "-" : String(v);
@@ -2324,27 +2408,23 @@ string Daemon::webgui_insights_html() const
       document.getElementById(id).textContent = fmt(value);
     }
 
-    function quantile(values, p) {
-      if (!values.length) return null;
-      const sorted = [...values].sort((a, b) => a - b);
-      const idx = Math.min(sorted.length - 1, Math.max(0, Math.floor((sorted.length - 1) * p)));
-      return sorted[idx];
-    }
-
-    function drawChart(canvasId, lines, yMin, yMax, suffix) {
+    function getCanvasContext(canvasId) {
       const canvas = document.getElementById(canvasId);
       const rect = canvas.getBoundingClientRect();
       const dpr = window.devicePixelRatio || 1;
-      const width = Math.max(320, Math.floor(rect.width * dpr));
-      const height = Math.max(160, Math.floor(rect.height * dpr));
+      const width = Math.max(360, Math.floor(rect.width * dpr));
+      const height = Math.max(180, Math.floor(rect.height * dpr));
       canvas.width = width;
       canvas.height = height;
       const ctx = canvas.getContext("2d");
-
       ctx.clearRect(0, 0, width, height);
       ctx.fillStyle = "rgba(6,12,22,0.95)";
       ctx.fillRect(0, 0, width, height);
+      return { canvas, ctx, dpr, width, height };
+    }
 
+    function drawLineChart(canvasId, data, lines, yMin, yMax, suffix, pointMap) {
+      const { ctx, dpr, width, height } = getCanvasContext(canvasId);
       const padLeft = 44;
       const padRight = 8;
       const padTop = 10;
@@ -2363,21 +2443,28 @@ string Daemon::webgui_insights_html() const
       }
 
       const range = Math.max(1, yMax - yMin);
-      const count = historyPoints.length;
+      const count = data.length;
       const xFor = (idx) => count <= 1 ? padLeft : padLeft + (plotW * idx / (count - 1));
       const yFor = (value) => padTop + plotH - (plotH * (value - yMin) / range);
 
-      lines.forEach((line) => {
+      if (pointMap) {
+        pointMap.length = 0;
+      }
+
+      lines.forEach((line, lineIndex) => {
         ctx.strokeStyle = line.color;
         ctx.lineWidth = 1.8 * dpr;
         ctx.beginPath();
         for (let i = 0; i < count; ++i) {
-          const point = historyPoints[i];
+          const point = data[i];
           const v = Number(point[line.key] || 0);
           const x = xFor(i);
           const y = yFor(v);
           if (i === 0) ctx.moveTo(x, y);
           else ctx.lineTo(x, y);
+          if (lineIndex === 0 && pointMap) {
+            pointMap.push({ x, y, minute_ts: point.minute_ts, value: v });
+          }
         }
         ctx.stroke();
       });
@@ -2399,9 +2486,9 @@ string Daemon::webgui_insights_html() const
       });
     }
 
-    function seriesMax(keys, fallback) {
+    function seriesMax(data, keys, fallback) {
       let max = fallback;
-      for (const row of historyPoints) {
+      for (const row of data) {
         for (const key of keys) {
           const v = Number(row[key] || 0);
           if (v > max) max = v;
@@ -2410,56 +2497,76 @@ string Daemon::webgui_insights_html() const
       return max;
     }
 
-    function summarizeFromJobs(jobs) {
-      const queue = [];
-      const exec = [];
-      let timedByClient = 0;
-      let newestEndTs = 0;
-      for (const row of jobs) {
-        const endTs = Number(row.end_ts || 0);
-        if (endTs > newestEndTs) newestEndTs = endTs;
-      }
-      let jobsLastMin = 0;
-      for (const row of jobs) {
-        const waitforcs = Number(row.waitforcs_msec || 0);
-        const localQueue = Number(row.local_queue_msec || 0);
-        const queueValue = localQueue > 0 ? localQueue : waitforcs;
-        if (queueValue > 0) queue.push(queueValue);
-        const execValue = Number(row.exec_msec || 0);
-        if (execValue > 0) exec.push(execValue);
-        if (String(row.timing_source || "") === "client") {
-          ++timedByClient;
+    function drawJobsChart() {
+      const jobsMax = Math.max(5, seriesMax(jobsBuckets, ["jobs_total", "jobs_remote", "jobs_local"], 0));
+      drawLineChart("chart-jobs", jobsBuckets, [
+        { key: "jobs_total", color: "#4ade80", label: "total" },
+        { key: "jobs_remote", color: "#60a5fa", label: "remote" },
+        { key: "jobs_local", color: "#f59e0b", label: "local" }
+      ], 0, jobsMax, "", jobsPointMap);
+    }
+
+    function drawLatencyChart() {
+      const max = Math.max(10, seriesMax(jobsBuckets, ["queue_avg_msec", "exec_avg_msec", "waitforcs_avg_msec"], 0));
+      drawLineChart("chart-latency", jobsBuckets, [
+        { key: "queue_avg_msec", color: "#22d3ee", label: "queue_avg" },
+        { key: "exec_avg_msec", color: "#34d399", label: "exec_avg" },
+        { key: "waitforcs_avg_msec", color: "#f97316", label: "waitforcs_avg" }
+      ], 0, max, "ms");
+    }
+
+    function drawModesChart() {
+      const max = Math.max(5, seriesMax(jobsBuckets, ["jobs_preprocess", "jobs_failed"], 0));
+      drawLineChart("chart-modes", jobsBuckets, [
+        { key: "jobs_preprocess", color: "#fbbf24", label: "preprocess" },
+        { key: "jobs_failed", color: "#ef4444", label: "failed" }
+      ], 0, max, "");
+    }
+
+    function drawSlotsChart() {
+      drawLineChart("chart-slots", slotHistory, [
+        { key: "compile_pct", color: "#60a5fa", label: "compile" },
+        { key: "preprocess_pct", color: "#fbbf24", label: "preprocess" }
+      ], 0, 100, "%");
+    }
+
+    function bindJobsPointClick() {
+      const canvas = document.getElementById("chart-jobs");
+      canvas.addEventListener("click", (event) => {
+        if (!jobsPointMap.length) return;
+        const rect = canvas.getBoundingClientRect();
+        const dpr = window.devicePixelRatio || 1;
+        const x = (event.clientX - rect.left) * dpr;
+        let best = null;
+        let bestDist = Number.MAX_SAFE_INTEGER;
+        for (const point of jobsPointMap) {
+          const dist = Math.abs(point.x - x);
+          if (dist < bestDist) {
+            bestDist = dist;
+            best = point;
+          }
         }
-        const endTs = Number(row.end_ts || 0);
-        if (newestEndTs > 0 && endTs >= newestEndTs - 60) {
-          ++jobsLastMin;
+        if (best && bestDist <= 12 * dpr) {
+          window.location.href = `/insights-jobs?minute=${best.minute_ts}`;
         }
-      }
-      return {
-        queueP95: quantile(queue, 0.95) || 0,
-        execP95: quantile(exec, 0.95) || 0,
-        coveragePct: jobs.length ? Math.round(100 * timedByClient / jobs.length) : 0,
-        jobsPerMin: jobsLastMin
-      };
+      });
     }
 
     async function refresh() {
       try {
-        const [stateRes, jobsRes] = await Promise.all([
+        const [stateRes, seriesRes] = await Promise.all([
           fetch("/api/state", { cache: "no-store" }),
-          fetch("/api/jobs?limit=1000", { cache: "no-store" })
+          fetch("/api/insights-series?minutes=100", { cache: "no-store" })
         ]);
-        if (!stateRes.ok || !jobsRes.ok) {
-          throw new Error(`HTTP ${stateRes.status}/${jobsRes.status}`);
+        if (!stateRes.ok || !seriesRes.ok) {
+          throw new Error(`HTTP ${stateRes.status}/${seriesRes.status}`);
         }
         const state = await stateRes.json();
-        const jobsJson = await jobsRes.json();
-        const jobs = jobsJson.jobs || [];
+        const series = await seriesRes.json();
+        jobsBuckets = Array.isArray(series.buckets) ? series.buckets : [];
+
         const slots = state.slots || {};
         const by = ((state.clients || {}).by_status || {});
-        const waitforcsCombined = ((state.waitforcs_latency_msec || {}).combined || {});
-        const jobsSummary = summarizeFromJobs(jobs);
-
         const compileUsed = Number(slots.used || 0);
         const compileMax = Math.max(1, Number(slots.max_kids || 1));
         const preprocessUsed = Number(slots.active_preprocesses || 0);
@@ -2467,64 +2574,209 @@ string Daemon::webgui_insights_html() const
         const waitCompile = Number(((by.waitcompile || {}).count) || 0);
         const pendingUseCs = Number(((by.pending_use_cs || {}).count) || 0);
         const localQueue = Number((((state.clients || {}).local_jobs || {}).queued) || 0);
-        const waitforcsAvg = Number(waitforcsCombined.avg_msec || 0);
 
-        setText("meta", `${state.node} | ts=${state.ts} | refreshed=${new Date().toLocaleTimeString()}`);
+        const latest = jobsBuckets.length ? jobsBuckets[jobsBuckets.length - 1] : {};
+        setText("meta", `${state.node} | refreshed=${new Date().toLocaleTimeString()} | retention=${series.retention_minutes}m | graph=${series.graph_minutes}m`);
         setText("compile-slots", `${compileUsed} / ${compileMax} (${Math.round(100 * compileUsed / compileMax)}%)`);
         setText("preprocess-slots", `${preprocessUsed} / ${preprocessMax} (${Math.round(100 * preprocessUsed / preprocessMax)}%)`);
         setText("waitcompile", waitCompile);
         setText("pending-usecs", pendingUseCs);
         setText("local-queue", localQueue);
-        setText("waitforcs-avg", waitforcsAvg);
-        setText("queue-exec-p95", `q ${jobsSummary.queueP95} | e ${jobsSummary.execP95}`);
-        setText("coverage-rate", `${jobsSummary.coveragePct}% | ${jobsSummary.jobsPerMin}/min`);
+        setText("jobs-per-minute", latest.jobs_total || 0);
+        setText("queue-exec-avg", `${latest.queue_avg_msec || 0} / ${latest.exec_avg_msec || 0} ms`);
+        setText("timing-coverage", `${latest.timing_coverage_pct || 0}%`);
 
-        historyPoints.push({
+        slotHistory.push({
+          minute_ts: Number(state.ts || 0),
           compile_pct: (100 * compileUsed / compileMax),
-          preprocess_pct: (100 * preprocessUsed / preprocessMax),
-          waitcompile: waitCompile,
-          pending_usecs: pendingUseCs,
-          local_queue: localQueue,
-          waitforcs_avg: waitforcsAvg,
-          queue_p95: jobsSummary.queueP95,
-          exec_p95: jobsSummary.execP95,
-          coverage_pct: jobsSummary.coveragePct,
-          jobs_per_min: jobsSummary.jobsPerMin
+          preprocess_pct: (100 * preprocessUsed / preprocessMax)
         });
-        if (historyPoints.length > historyMax) {
-          historyPoints.splice(0, historyPoints.length - historyMax);
+        if (slotHistory.length > slotHistoryMax) {
+          slotHistory.splice(0, slotHistory.length - slotHistoryMax);
         }
 
-        drawChart("chart-slots", [
-          { key: "compile_pct", color: "#60a5fa", label: "compile" },
-          { key: "preprocess_pct", color: "#fbbf24", label: "preprocess" }
-        ], 0, 100, "%");
-
-        const queueMax = Math.max(10, seriesMax(["waitcompile", "pending_usecs", "local_queue"], 0));
-        drawChart("chart-queue", [
-          { key: "waitcompile", color: "#a78bfa", label: "waitcompile" },
-          { key: "pending_usecs", color: "#f97316", label: "pending_usecs" },
-          { key: "local_queue", color: "#38bdf8", label: "local_queue" }
-        ], 0, queueMax, "");
-
-        const latencyMax = Math.max(20, seriesMax(["waitforcs_avg", "queue_p95", "exec_p95"], 0));
-        drawChart("chart-latency", [
-          { key: "waitforcs_avg", color: "#f59e0b", label: "waitforcs_avg" },
-          { key: "queue_p95", color: "#22d3ee", label: "queue_p95" },
-          { key: "exec_p95", color: "#34d399", label: "exec_p95" }
-        ], 0, latencyMax, "ms");
-
-        const rateMax = Math.max(10, seriesMax(["jobs_per_min", "coverage_pct"], 0));
-        drawChart("chart-rate", [
-          { key: "jobs_per_min", color: "#4ade80", label: "jobs_per_min" },
-          { key: "coverage_pct", color: "#60a5fa", label: "coverage_pct" }
-        ], 0, rateMax, "");
+        drawJobsChart();
+        drawLatencyChart();
+        drawModesChart();
+        drawSlotsChart();
       } catch (error) {
         setText("meta", "error: " + error);
       }
     }
 
+    bindJobsPointClick();
     setInterval(refresh, 2000);
+    refresh();
+  </script>
+</body>
+</html>)HTML");
+}
+
+string Daemon::webgui_insights_jobs_html() const
+{
+    return string(R"HTML(<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>iceccd insights jobs</title>
+  <style>
+    :root {
+      --bg: #050b15;
+      --panel: rgba(13, 22, 36, 0.94);
+      --border: #2a3f5e;
+      --text: #dbeafe;
+      --dim: #91a7c6;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: radial-gradient(1200px 650px at 0% 0%, #111f37 0%, var(--bg) 58%);
+      color: var(--text);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      padding: 14px;
+    }
+    .top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 10px;
+      gap: 10px;
+    }
+    .title { margin: 0; font-size: 18px; text-transform: uppercase; letter-spacing: 0.25px; }
+    .meta { color: var(--dim); font-size: 12px; }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      text-decoration: none;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      background: rgba(12, 22, 38, 0.95);
+      padding: 6px 10px;
+      font-size: 12px;
+    }
+    .panel {
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: var(--panel);
+      overflow: hidden;
+    }
+    .scroll {
+      overflow: auto;
+      max-height: calc(100vh - 120px);
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+    th, td {
+      padding: 6px 8px;
+      border-bottom: 1px solid rgba(39, 56, 80, 0.7);
+      vertical-align: top;
+      text-align: left;
+      white-space: nowrap;
+    }
+    th {
+      position: sticky;
+      top: 0;
+      background: rgba(17, 29, 47, 0.96);
+      color: #bfd0e8;
+      text-transform: uppercase;
+      letter-spacing: 0.25px;
+      font-size: 11px;
+      z-index: 2;
+    }
+    td.cmdline {
+      max-width: 760px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      color: #dce8f9;
+    }
+  </style>
+</head>
+<body>
+  <div class="top">
+    <div>
+      <h1 class="title">insights jobs</h1>
+      <div class="meta" id="meta">loading...</div>
+    </div>
+    <a class="btn" href="/insights">back to insights</a>
+  </div>
+  <div class="panel">
+    <div class="scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>seq</th><th>client</th><th>end</th><th>dur(ms)</th><th>mode</th><th>q/w/e(ms)</th><th>exit</th><th>status</th><th>scheduler/compile</th><th>host</th><th>target/env</th><th>cmdline</th>
+          </tr>
+        </thead>
+        <tbody id="jobs-body"></tbody>
+      </table>
+    </div>
+  </div>
+  <script>
+    function fmt(v) { return v === null || v === undefined || v === "" ? "-" : String(v); }
+    function parseMinute() {
+      const params = new URLSearchParams(window.location.search);
+      const minute = Number(params.get("minute") || 0);
+      return Number.isFinite(minute) && minute > 0 ? minute : 0;
+    }
+    function toTime(ts) {
+      if (!ts) return "-";
+      const d = new Date(ts * 1000);
+      return d.toISOString().replace("T", " ").replace(".000Z", "Z");
+    }
+    async function refresh() {
+      const minute = parseMinute();
+      if (!minute) {
+        document.getElementById("meta").textContent = "missing minute query parameter";
+        return;
+      }
+      try {
+        const res = await fetch(`/api/insights-jobs?minute=${minute}&limit=5000`, { cache: "no-store" });
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status}`);
+        }
+        const payload = await res.json();
+        document.getElementById("meta").textContent =
+          `minute=${toTime(payload.minute_ts)} | returned=${fmt(payload.returned)} | retention=${fmt(payload.retention_minutes)}m`;
+        const body = document.getElementById("jobs-body");
+        body.innerHTML = "";
+        for (const row of (payload.jobs || [])) {
+          const tr = document.createElement("tr");
+          const q = Number(row.queue_msec || 0);
+          const w = Number(row.waitforcs_msec || 0);
+          const e = Number(row.exec_msec || 0);
+          const cells = [
+            row.seq,
+            row.client_id,
+            toTime(row.end_ts),
+            row.duration_msec,
+            row.mode,
+            `${q}/${w}/${e}`,
+            row.exitcode,
+            row.final_status,
+            `${fmt(row.scheduler_job_id)}/${fmt(row.compile_job_id)}`,
+            `${fmt(row.usecs_host)}:${fmt(row.usecs_port)}`,
+            `${fmt(row.target)}/${fmt(row.environment)}`
+          ];
+          for (const value of cells) {
+            const td = document.createElement("td");
+            td.textContent = fmt(value);
+            tr.appendChild(td);
+          }
+          const cmdTd = document.createElement("td");
+          cmdTd.className = "cmdline";
+          cmdTd.textContent = fmt(row.cmdline);
+          tr.appendChild(cmdTd);
+          body.appendChild(tr);
+        }
+      } catch (error) {
+        document.getElementById("meta").textContent = "error: " + error;
+      }
+    }
     refresh();
   </script>
 </body>
@@ -2748,6 +3000,7 @@ void Daemon::remember_finished_job(const Client *client, int exitcode)
         job_history.pop_front();
     }
     job_history.push_back(entry);
+    update_insights_history(entry);
 
     if (state_dump_log || !state_jsonl_path.empty()) {
         ostringstream o;
@@ -2841,6 +3094,246 @@ string Daemon::dump_job_history_json(size_t limit) const
     return o.str();
 }
 
+void Daemon::prune_insights_history(time_t now_ts)
+{
+    if (now_ts <= 0) {
+        now_ts = time(nullptr);
+    }
+    const time_t cutoff = now_ts - time_t(insights_retention_minutes * 60);
+    while (!insights_history.empty() && (insights_history.front().minute_ts + 60) <= cutoff) {
+        insights_history.pop_front();
+    }
+}
+
+void Daemon::update_insights_history(const JobHistoryEntry &entry)
+{
+    if (entry.end_ts <= 0) {
+        return;
+    }
+    const time_t minute_ts = entry.end_ts - (entry.end_ts % 60);
+    if (insights_history.empty() || insights_history.back().minute_ts < minute_ts) {
+        time_t next_minute = insights_history.empty()
+                             ? minute_ts
+                             : (insights_history.back().minute_ts + 60);
+        while (next_minute <= minute_ts) {
+            InsightsMinuteEntry bucket;
+            bucket.minute_ts = next_minute;
+            insights_history.push_back(bucket);
+            next_minute += 60;
+        }
+    } else if (insights_history.back().minute_ts > minute_ts) {
+        for (auto rit = insights_history.rbegin(); rit != insights_history.rend(); ++rit) {
+            if (rit->minute_ts == minute_ts) {
+                break;
+            }
+            if (rit + 1 == insights_history.rend()) {
+                return;
+            }
+        }
+    }
+
+    InsightsMinuteEntry *bucket = nullptr;
+    for (auto rit = insights_history.rbegin(); rit != insights_history.rend(); ++rit) {
+        if (rit->minute_ts == minute_ts) {
+            bucket = &(*rit);
+            break;
+        }
+        if (rit->minute_ts < minute_ts) {
+            break;
+        }
+    }
+    if (!bucket) {
+        return;
+    }
+
+    ++bucket->jobs_total;
+    if (entry.exitcode != 0) {
+        ++bucket->jobs_failed;
+    }
+    const bool remote_job = !entry.client_mode.empty() && entry.client_mode.find("remote") == 0;
+    if (remote_job) {
+        ++bucket->jobs_remote;
+    } else {
+        ++bucket->jobs_local;
+    }
+    if (cmdline_is_preprocess_only(entry.cmdline)) {
+        ++bucket->jobs_preprocess;
+    }
+    if (entry.client_timing) {
+        ++bucket->jobs_timed;
+    }
+
+    uint32_t queue_msec = entry.client_local_queue_msec;
+    if (!queue_msec) {
+        queue_msec = entry.client_waitforcs_msec;
+    }
+    if (queue_msec) {
+        bucket->queue_sum_msec += queue_msec;
+        ++bucket->queue_samples;
+    }
+    if (entry.client_exec_msec) {
+        bucket->exec_sum_msec += entry.client_exec_msec;
+        ++bucket->exec_samples;
+    }
+    if (entry.client_waitforcs_msec) {
+        bucket->waitforcs_sum_msec += entry.client_waitforcs_msec;
+        ++bucket->waitforcs_samples;
+    }
+
+    prune_insights_history(entry.end_ts);
+}
+
+string Daemon::dump_insights_series_json(size_t minutes)
+{
+    if (minutes == 0) {
+        minutes = insights_graph_minutes;
+    }
+    if (minutes > insights_retention_minutes) {
+        minutes = insights_retention_minutes;
+    }
+
+    const time_t now = time(nullptr);
+    prune_insights_history(now);
+    const time_t current_minute = now - (now % 60);
+    const time_t start_minute = current_minute - time_t((minutes - 1) * 60);
+
+    map<time_t, const InsightsMinuteEntry *> by_minute;
+    for (const auto &bucket : insights_history) {
+        by_minute[bucket.minute_ts] = &bucket;
+    }
+
+    ostringstream o;
+    o << "{";
+    o << "\"type\":\"iceccd_insights_series\",";
+    o << "\"ts\":" << (long long)now << ",";
+    o << "\"retention_minutes\":" << insights_retention_minutes << ",";
+    o << "\"graph_minutes\":" << minutes << ",";
+    o << "\"buckets\":[";
+
+    for (size_t index = 0; index < minutes; ++index) {
+        const time_t minute_ts = start_minute + time_t(index * 60);
+        const InsightsMinuteEntry *bucket = nullptr;
+        auto it = by_minute.find(minute_ts);
+        if (it != by_minute.end()) {
+            bucket = it->second;
+        }
+        if (index) {
+            o << ",";
+        }
+
+        const uint32_t jobs_total = bucket ? bucket->jobs_total : 0;
+        const uint32_t jobs_remote = bucket ? bucket->jobs_remote : 0;
+        const uint32_t jobs_local = bucket ? bucket->jobs_local : 0;
+        const uint32_t jobs_preprocess = bucket ? bucket->jobs_preprocess : 0;
+        const uint32_t jobs_failed = bucket ? bucket->jobs_failed : 0;
+        const uint32_t jobs_timed = bucket ? bucket->jobs_timed : 0;
+        const uint32_t queue_avg = (bucket && bucket->queue_samples)
+                                   ? uint32_t(bucket->queue_sum_msec / bucket->queue_samples)
+                                   : 0;
+        const uint32_t exec_avg = (bucket && bucket->exec_samples)
+                                  ? uint32_t(bucket->exec_sum_msec / bucket->exec_samples)
+                                  : 0;
+        const uint32_t waitforcs_avg = (bucket && bucket->waitforcs_samples)
+                                       ? uint32_t(bucket->waitforcs_sum_msec / bucket->waitforcs_samples)
+                                       : 0;
+        const uint32_t timing_coverage_pct = jobs_total
+                                             ? uint32_t((100ULL * jobs_timed) / jobs_total)
+                                             : 0;
+
+        o << "{";
+        o << "\"minute_ts\":" << (long long)minute_ts << ",";
+        o << "\"jobs_total\":" << jobs_total << ",";
+        o << "\"jobs_remote\":" << jobs_remote << ",";
+        o << "\"jobs_local\":" << jobs_local << ",";
+        o << "\"jobs_preprocess\":" << jobs_preprocess << ",";
+        o << "\"jobs_failed\":" << jobs_failed << ",";
+        o << "\"queue_avg_msec\":" << queue_avg << ",";
+        o << "\"exec_avg_msec\":" << exec_avg << ",";
+        o << "\"waitforcs_avg_msec\":" << waitforcs_avg << ",";
+        o << "\"timing_coverage_pct\":" << timing_coverage_pct;
+        o << "}";
+    }
+
+    o << "]";
+    o << "}";
+    return o.str();
+}
+
+string Daemon::dump_insights_jobs_json(time_t minute_ts, size_t limit)
+{
+    if (limit == 0) {
+        limit = 500;
+    }
+    if (limit > 5000) {
+        limit = 5000;
+    }
+
+    const time_t now = time(nullptr);
+    prune_insights_history(now);
+    const time_t minute_start = minute_ts - (minute_ts % 60);
+    const time_t minute_end = minute_start + 60;
+    const time_t cutoff = now - time_t(insights_retention_minutes * 60);
+
+    ostringstream o;
+    o << "{";
+    o << "\"type\":\"iceccd_insights_jobs\",";
+    o << "\"ts\":" << (long long)now << ",";
+    o << "\"minute_ts\":" << (long long)minute_start << ",";
+    o << "\"retention_minutes\":" << insights_retention_minutes << ",";
+    o << "\"limit\":" << limit << ",";
+    o << "\"jobs\":[";
+
+    size_t returned = 0;
+    if (minute_start >= cutoff) {
+        for (auto it = job_history.rbegin(); it != job_history.rend(); ++it) {
+            const JobHistoryEntry &entry = *it;
+            if (entry.end_ts < minute_start) {
+                break;
+            }
+            if (entry.end_ts >= minute_end) {
+                continue;
+            }
+            if (entry.end_ts < cutoff) {
+                continue;
+            }
+            if (returned) {
+                o << ",";
+            }
+            ++returned;
+
+            o << "{";
+            o << "\"seq\":" << (unsigned long long)entry.seq << ",";
+            o << "\"client_id\":" << entry.client_id << ",";
+            o << "\"end_ts\":" << (long long)entry.end_ts << ",";
+            o << "\"duration_msec\":" << (unsigned long long)entry.duration_msec << ",";
+            o << "\"exitcode\":" << entry.exitcode << ",";
+            o << "\"final_status\":\"" << json_escape(entry.final_status) << "\",";
+            o << "\"final_why\":\"" << json_escape(entry.final_why) << "\",";
+            o << "\"scheduler_job_id\":" << entry.scheduler_job_id << ",";
+            o << "\"compile_job_id\":" << entry.compile_job_id << ",";
+            o << "\"mode\":\"" << json_escape(entry.client_mode) << "\",";
+            o << "\"target\":\"" << json_escape(entry.target) << "\",";
+            o << "\"environment\":\"" << json_escape(entry.environment) << "\",";
+            o << "\"usecs_host\":\"" << json_escape(entry.usecs_host) << "\",";
+            o << "\"usecs_port\":" << entry.usecs_port << ",";
+            o << "\"waitforcs_msec\":" << entry.client_waitforcs_msec << ",";
+            o << "\"queue_msec\":" << (entry.client_local_queue_msec ? entry.client_local_queue_msec : entry.client_waitforcs_msec) << ",";
+            o << "\"exec_msec\":" << entry.client_exec_msec << ",";
+            o << "\"cmdline\":\"" << json_escape(entry.cmdline) << "\"";
+            o << "}";
+
+            if (returned >= limit) {
+                break;
+            }
+        }
+    }
+
+    o << "],";
+    o << "\"returned\":" << returned;
+    o << "}";
+    return o.str();
+}
+
 void Daemon::handle_web_accept()
 {
     if (web_listen_fd < 0) {
@@ -2928,6 +3421,8 @@ void Daemon::handle_web_connection(int fd, short revents)
                     queue_web_response(fd, 200, "OK", "text/html; charset=utf-8", webgui_html());
                 } else if (route == "/insights" || route == "/insights.html") {
                     queue_web_response(fd, 200, "OK", "text/html; charset=utf-8", webgui_insights_html());
+                } else if (route == "/insights-jobs" || route == "/insights-jobs.html") {
+                    queue_web_response(fd, 200, "OK", "text/html; charset=utf-8", webgui_insights_jobs_html());
                 } else if (route == "/api/state") {
                     queue_web_response(fd, 200, "OK", "application/json; charset=utf-8", dump_state_json());
                 } else if (route == "/api/clients") {
@@ -2935,6 +3430,22 @@ void Daemon::handle_web_connection(int fd, short revents)
                 } else if (route == "/api/jobs") {
                     const size_t limit = parse_jobs_limit(path);
                     queue_web_response(fd, 200, "OK", "application/json; charset=utf-8", dump_job_history_json(limit));
+                } else if (route == "/api/insights-series") {
+                    uint64_t minutes = insights_graph_minutes;
+                    parse_query_u64(path, "minutes", &minutes);
+                    queue_web_response(fd, 200, "OK", "application/json; charset=utf-8",
+                                       dump_insights_series_json(size_t(minutes)));
+                } else if (route == "/api/insights-jobs") {
+                    uint64_t minute_ts = 0;
+                    if (!parse_query_u64(path, "minute", &minute_ts)) {
+                        queue_web_response(fd, 400, "Bad Request", "text/plain; charset=utf-8",
+                                           "missing minute query parameter\n");
+                    } else {
+                        uint64_t limit = 500;
+                        parse_query_u64(path, "limit", &limit);
+                        queue_web_response(fd, 200, "OK", "application/json; charset=utf-8",
+                                           dump_insights_jobs_json((time_t)minute_ts, (size_t)limit));
+                    }
                 } else if (route == "/api/internals") {
                     queue_web_response(fd, 200, "OK", "text/plain; charset=utf-8", dump_internals());
                 } else {
