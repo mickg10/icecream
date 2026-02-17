@@ -1059,73 +1059,306 @@ string Daemon::webgui_html() const
   <title>iceccd web gui</title>
   <style>
     :root {
-      --bg: #0f172a;
-      --bg-card: #111827;
-      --fg: #e5e7eb;
-      --fg-dim: #94a3b8;
-      --ok: #10b981;
+      --bg-0: #06090f;
+      --bg-1: #11192a;
+      --bg-card: rgba(12, 21, 37, 0.86);
+      --fg: #eff6ff;
+      --fg-dim: #96acc7;
+      --border: #2a3a53;
+      --good: #22c55e;
       --warn: #f59e0b;
-      --err: #ef4444;
-      --border: #334155;
-      --accent: #38bdf8;
+      --bad: #ef4444;
+      --info: #3b82f6;
+      --violet: #8b5cf6;
+      --teal: #14b8a6;
+      --shadow: 0 14px 36px rgba(2, 8, 23, 0.55);
     }
-    body { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: radial-gradient(circle at 20% 0%, #1e293b, var(--bg)); color: var(--fg); }
-    .wrap { max-width: 1600px; margin: 0 auto; padding: 16px; }
-    .header { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
-    .title { font-size: 22px; font-weight: 700; }
-    .sub { color: var(--fg-dim); font-size: 12px; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px; margin-top: 12px; }
-    .card { background: color-mix(in oklab, var(--bg-card), black 18%); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; }
-    .k { color: var(--fg-dim); font-size: 12px; text-transform: uppercase; }
-    .v { font-size: 20px; font-weight: 700; margin-top: 2px; }
-    .ok { color: var(--ok); } .warn { color: var(--warn); } .err { color: var(--err); } .accent { color: var(--accent); }
-    .section { margin-top: 14px; }
-    .section h2 { margin: 0 0 8px 0; font-size: 14px; color: var(--fg-dim); text-transform: uppercase; }
-    table { width: 100%; border-collapse: collapse; background: #0b1220; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; font-size: 12px; }
-    th, td { border-bottom: 1px solid #1f2937; padding: 6px 8px; text-align: left; vertical-align: top; }
-    th { color: #cbd5e1; background: #0f172a; position: sticky; top: 0; z-index: 1; }
-    td.dim { color: var(--fg-dim); }
-    .scroll { max-height: 360px; overflow: auto; border-radius: 10px; }
-    .status { font-weight: 700; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      color: var(--fg);
+      font-family: "JetBrains Mono", "IBM Plex Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+      background:
+        radial-gradient(1400px 680px at 8% -20%, rgba(20, 184, 166, 0.22), transparent 65%),
+        radial-gradient(1200px 640px at 88% -25%, rgba(139, 92, 246, 0.24), transparent 68%),
+        linear-gradient(160deg, var(--bg-1), var(--bg-0));
+      min-height: 100vh;
+    }
+    .shell {
+      max-width: 1700px;
+      margin: 0 auto;
+      padding: 18px 16px 22px;
+    }
+    .header {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: baseline;
+      flex-wrap: wrap;
+      margin-bottom: 10px;
+    }
+    .title {
+      margin: 0;
+      font-size: 24px;
+      letter-spacing: 0.4px;
+      color: #f8fbff;
+      text-shadow: 0 3px 12px rgba(0, 0, 0, 0.33);
+    }
+    .meta-line {
+      margin-top: 3px;
+      color: var(--fg-dim);
+      font-size: 12px;
+    }
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 6px 12px;
+      font-size: 12px;
+      color: var(--fg-dim);
+      background: rgba(9, 15, 28, 0.65);
+    }
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--warn);
+      box-shadow: 0 0 8px rgba(245, 158, 11, 0.6);
+    }
+    .dot.good {
+      background: var(--good);
+      box-shadow: 0 0 9px rgba(34, 197, 94, 0.7);
+    }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(205px, 1fr));
+      gap: 10px;
+    }
+    .card {
+      border: 1px solid var(--border);
+      border-radius: 13px;
+      padding: 12px 12px 10px;
+      background: var(--bg-card);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(3px);
+    }
+    .label {
+      color: var(--fg-dim);
+      text-transform: uppercase;
+      font-size: 11px;
+      letter-spacing: 0.4px;
+    }
+    .value {
+      margin-top: 4px;
+      font-size: 22px;
+      font-weight: 700;
+      line-height: 1.1;
+      color: #f8fbff;
+    }
+    .value.small {
+      font-size: 17px;
+    }
+    .good { color: var(--good); }
+    .warn { color: var(--warn); }
+    .bad { color: var(--bad); }
+    .info { color: #8db8ff; }
+    .layout {
+      display: grid;
+      grid-template-columns: 0.95fr 1.05fr;
+      gap: 12px;
+      margin-top: 12px;
+    }
+    .panel {
+      border: 1px solid var(--border);
+      border-radius: 13px;
+      background: rgba(8, 14, 24, 0.82);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+    .panel-head {
+      padding: 10px 12px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      border-bottom: 1px solid rgba(44, 61, 84, 0.68);
+      background: linear-gradient(180deg, rgba(18, 31, 50, 0.75), rgba(9, 17, 29, 0.75));
+    }
+    .panel-title {
+      margin: 0;
+      font-size: 13px;
+      letter-spacing: 0.3px;
+      text-transform: uppercase;
+      color: #b8c8dc;
+    }
+    .panel-sub {
+      font-size: 11px;
+      color: var(--fg-dim);
+    }
+    .content {
+      padding: 10px 12px 12px;
+    }
+    .bars {
+      display: grid;
+      gap: 6px;
+    }
+    .bar-row {
+      display: grid;
+      grid-template-columns: 140px 1fr 44px;
+      gap: 8px;
+      align-items: center;
+      font-size: 11px;
+    }
+    .bar-name {
+      color: #bdd0ea;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .bar-wrap {
+      height: 9px;
+      border-radius: 999px;
+      background: rgba(42, 58, 83, 0.65);
+      border: 1px solid rgba(53, 74, 103, 0.75);
+      overflow: hidden;
+    }
+    .bar-fill {
+      height: 100%;
+      background: linear-gradient(90deg, var(--teal), var(--violet));
+      box-shadow: 0 0 8px rgba(20, 184, 166, 0.32);
+    }
+    .bar-val {
+      text-align: right;
+      color: #a8bfd8;
+      font-size: 10px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 11px;
+    }
+    th, td {
+      text-align: left;
+      padding: 7px 8px;
+      border-bottom: 1px solid rgba(41, 58, 81, 0.72);
+      vertical-align: top;
+    }
+    th {
+      position: sticky;
+      top: 0;
+      background: #111e31;
+      color: #cbdaec;
+      z-index: 1;
+      font-weight: 700;
+    }
+    tbody tr:nth-child(even) {
+      background: rgba(10, 16, 30, 0.42);
+    }
+    td.dim {
+      color: var(--fg-dim);
+    }
+    .status {
+      font-weight: 700;
+      text-transform: lowercase;
+    }
+    .scroll {
+      max-height: 355px;
+      overflow: auto;
+    }
+    .control {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      color: var(--fg-dim);
+      font-size: 11px;
+    }
+    select {
+      background: rgba(9, 15, 26, 0.96);
+      color: #dbeafe;
+      border: 1px solid #3b5273;
+      border-radius: 7px;
+      padding: 2px 5px;
+      font-family: inherit;
+      font-size: 11px;
+    }
+    @media (max-width: 1180px) {
+      .layout {
+        grid-template-columns: 1fr;
+      }
+    }
   </style>
 </head>
 <body>
-  <div class="wrap">
+  <div class="shell">
     <div class="header">
       <div>
-        <div class="title">iceccd web gui</div>
-        <div class="sub" id="meta">connecting...</div>
+        <h1 class="title">iceccd live dashboard</h1>
+        <div class="meta-line" id="meta">connecting...</div>
       </div>
-      <div class="sub">updates every 2s</div>
-    </div>
-
-    <div class="grid">
-      <div class="card"><div class="k">Scheduler</div><div class="v" id="scheduler">-</div></div>
-      <div class="card"><div class="k">Slots Used</div><div class="v" id="slots">-</div></div>
-      <div class="card"><div class="k">Client Count</div><div class="v" id="clients-total">-</div></div>
-      <div class="card"><div class="k">waitforcs</div><div class="v warn" id="waitforcs">-</div></div>
-      <div class="card"><div class="k">waitcompile</div><div class="v accent" id="waitcompile">-</div></div>
-      <div class="card"><div class="k">current load</div><div class="v" id="load">-</div></div>
-    </div>
-
-    <div class="section">
-      <h2>Running and Pending Clients</h2>
-      <div class="scroll">
-        <table>
-          <thead>
-            <tr><th>client</th><th>status</th><th>age(ms)</th><th>scheduler job</th><th>target/env</th><th>host</th><th>why</th></tr>
-          </thead>
-          <tbody id="clients-body"></tbody>
-        </table>
+      <div class="chip">
+        <span class="dot" id="scheduler-dot"></span>
+        <span id="scheduler-chip">scheduler: unknown</span>
       </div>
     </div>
 
-    <div class="section">
-      <h2>Recent Jobs (ring buffer in daemon memory)</h2>
-      <div class="scroll">
+    <div class="metrics">
+      <div class="card"><div class="label">Scheduler</div><div class="value small" id="scheduler">-</div></div>
+      <div class="card"><div class="label">Slot usage</div><div class="value" id="slots">-</div></div>
+      <div class="card"><div class="label">Connected clients</div><div class="value info" id="clients-total">-</div></div>
+      <div class="card"><div class="label">Waiting for scheduler</div><div class="value warn" id="waitforcs">-</div></div>
+      <div class="card"><div class="label">Waiting remote compile</div><div class="value" style="color:#a78bfa" id="waitcompile">-</div></div>
+      <div class="card"><div class="label">Local queue</div><div class="value" style="color:#60a5fa" id="tocompile">-</div></div>
+      <div class="card"><div class="label">Local child running</div><div class="value good" id="waitforchild">-</div></div>
+      <div class="card"><div class="label">Current load</div><div class="value" id="load">-</div></div>
+    </div>
+
+    <div class="layout">
+      <div class="panel">
+        <div class="panel-head">
+          <h2 class="panel-title">Status Distribution</h2>
+          <div class="panel-sub">share of live clients</div>
+        </div>
+        <div class="content">
+          <div class="bars" id="status-bars"></div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-head">
+          <h2 class="panel-title">Running / Pending Clients</h2>
+          <div class="panel-sub" id="clients-sub">0 rows</div>
+        </div>
+        <div class="scroll">
+          <table>
+            <thead>
+              <tr><th>client</th><th>status</th><th>age(ms)</th><th>job</th><th>target/env</th><th>host</th><th>why</th></tr>
+            </thead>
+            <tbody id="clients-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel" style="margin-top:12px;">
+      <div class="panel-head">
+        <h2 class="panel-title">Recent Jobs (in-memory ring buffer)</h2>
+        <div class="control">
+          <label for="job-limit">rows</label>
+          <select id="job-limit">
+            <option value="200">200</option>
+            <option value="500" selected>500</option>
+            <option value="1000">1000</option>
+            <option value="5000">5000</option>
+            <option value="20000">20000</option>
+          </select>
+          <span id="jobs-sub">0 rows</span>
+        </div>
+      </div>
+      <div class="scroll" style="max-height:460px;">
         <table>
           <thead>
-            <tr><th>seq</th><th>client</th><th>duration(ms)</th><th>exit</th><th>final status</th><th>scheduler/compile job</th><th>target/env</th><th>remote host</th></tr>
+            <tr><th>seq</th><th>client</th><th>duration(ms)</th><th>exit</th><th>final</th><th>scheduler/compile job</th><th>target/env</th><th>remote host</th><th>why</th></tr>
           </thead>
           <tbody id="jobs-body"></tbody>
         </table>
@@ -1133,74 +1366,136 @@ string Daemon::webgui_html() const
     </div>
   </div>
   <script>
-    function fmt(value) { return value === null || value === undefined ? "-" : String(value); }
+    function fmt(value) { return value === null || value === undefined || value === "" ? "-" : String(value); }
+    function setText(id, value) { document.getElementById(id).textContent = fmt(value); }
     function statusClass(status) {
       if (status === "waitforcs") return "warn";
-      if (status === "waitcompile" || status === "clientwork" || status === "waitforchild") return "accent";
-      if (status === "jobdone") return "ok";
+      if (status === "waitcompile" || status === "clientwork" || status === "waitforchild") return "info";
+      if (status === "jobdone") return "good";
+      if (status === "unknown") return "bad";
       return "";
+    }
+    function makeCell(tr, text, className) {
+      const td = document.createElement("td");
+      td.textContent = fmt(text);
+      if (className) td.className = className;
+      tr.appendChild(td);
+    }
+    function renderStatusBars(byStatus, total) {
+      const bars = document.getElementById("status-bars");
+      bars.innerHTML = "";
+      const rows = [];
+      for (const [name, meta] of Object.entries(byStatus)) {
+        const count = Number(meta && meta.count || 0);
+        if (!count) continue;
+        rows.push({ name, count });
+      }
+      rows.sort((a, b) => b.count - a.count);
+      if (!rows.length) {
+        const empty = document.createElement("div");
+        empty.className = "panel-sub";
+        empty.textContent = "No active clients";
+        bars.appendChild(empty);
+        return;
+      }
+      for (const row of rows) {
+        const pct = total > 0 ? (100 * row.count / total) : 0;
+        const root = document.createElement("div");
+        root.className = "bar-row";
+        const name = document.createElement("div");
+        name.className = "bar-name";
+        name.textContent = row.name;
+        const wrap = document.createElement("div");
+        wrap.className = "bar-wrap";
+        const fill = document.createElement("div");
+        fill.className = "bar-fill";
+        fill.style.width = `${Math.max(2, pct)}%`;
+        wrap.appendChild(fill);
+        const val = document.createElement("div");
+        val.className = "bar-val";
+        val.textContent = `${row.count} (${pct.toFixed(1)}%)`;
+        root.appendChild(name);
+        root.appendChild(wrap);
+        root.appendChild(val);
+        bars.appendChild(root);
+      }
     }
     function renderClients(rows) {
       const body = document.getElementById("clients-body");
       body.innerHTML = "";
-      for (const row of rows) {
+      const limit = 600;
+      const clipped = rows.slice(0, limit);
+      for (const row of clipped) {
         const tr = document.createElement("tr");
         const job = row.job || {};
         const usecs = row.usecs || {};
-        tr.innerHTML =
-          `<td>${fmt(row.client_id)}</td>` +
-          `<td class="status ${statusClass(row.status)}">${fmt(row.status)}</td>` +
-          `<td>${fmt(row.age_msec)}</td>` +
-          `<td>${fmt(row.scheduler_job_id)}</td>` +
-          `<td>${fmt(job.target)} / ${fmt(job.env)}</td>` +
-          `<td>${fmt(usecs.hostname)}:${fmt(usecs.port)}</td>` +
-          `<td class="dim">${fmt(row.why)}</td>`;
+        makeCell(tr, row.client_id);
+        makeCell(tr, row.status, `status ${statusClass(row.status)}`);
+        makeCell(tr, row.age_msec);
+        makeCell(tr, row.scheduler_job_id);
+        makeCell(tr, `${fmt(job.target)} / ${fmt(job.env)}`);
+        makeCell(tr, `${fmt(usecs.hostname)}:${fmt(usecs.port)}`);
+        makeCell(tr, row.why, "dim");
         body.appendChild(tr);
       }
+      setText("clients-sub", `${rows.length} rows`);
     }
     function renderJobs(rows) {
       const body = document.getElementById("jobs-body");
       body.innerHTML = "";
       for (const row of rows) {
-        tr = document.createElement("tr");
-        tr.innerHTML =
-          `<td>${fmt(row.seq)}</td>` +
-          `<td>${fmt(row.client_id)}</td>` +
-          `<td>${fmt(row.duration_msec)}</td>` +
-          `<td>${fmt(row.exitcode)}</td>` +
-          `<td class="status ${statusClass(row.final_status)}">${fmt(row.final_status)}</td>` +
-          `<td>${fmt(row.scheduler_job_id)} / ${fmt(row.compile_job_id)}</td>` +
-          `<td>${fmt(row.target)} / ${fmt(row.environment)}</td>` +
-          `<td>${fmt(row.usecs_host)}:${fmt(row.usecs_port)}</td>`;
+        const tr = document.createElement("tr");
+        makeCell(tr, row.seq);
+        makeCell(tr, row.client_id);
+        makeCell(tr, row.duration_msec);
+        makeCell(tr, row.exitcode);
+        makeCell(tr, row.final_status, `status ${statusClass(row.final_status)}`);
+        makeCell(tr, `${fmt(row.scheduler_job_id)} / ${fmt(row.compile_job_id)}`);
+        makeCell(tr, `${fmt(row.target)} / ${fmt(row.environment)}`);
+        makeCell(tr, `${fmt(row.usecs_host)}:${fmt(row.usecs_port)}`);
+        makeCell(tr, row.final_why, "dim");
         body.appendChild(tr);
       }
+      setText("jobs-sub", `${rows.length} rows`);
     }
     async function refresh() {
       try {
+        const limit = Number(document.getElementById("job-limit").value || "500");
         const [stateRes, clientsRes, jobsRes] = await Promise.all([
           fetch("/api/state", { cache: "no-store" }),
           fetch("/api/clients", { cache: "no-store" }),
-          fetch("/api/jobs?limit=500", { cache: "no-store" })
+          fetch(`/api/jobs?limit=${limit}`, { cache: "no-store" })
         ]);
+        if (!stateRes.ok || !clientsRes.ok || !jobsRes.ok) {
+          throw new Error(`HTTP ${stateRes.status}/${clientsRes.status}/${jobsRes.status}`);
+        }
         const state = await stateRes.json();
         const clients = await clientsRes.json();
         const jobs = await jobsRes.json();
 
         const by = state.clients.by_status;
-        document.getElementById("meta").textContent = `${state.node} | ts=${state.ts} | scheduler=${state.scheduler.connected ? "connected" : "disconnected"}`;
-        document.getElementById("scheduler").textContent = state.scheduler.connected ? state.scheduler.name : "disconnected";
-        document.getElementById("slots").textContent = `${state.slots.used} / ${state.slots.max_kids}`;
-        document.getElementById("clients-total").textContent = state.clients.total;
-        document.getElementById("waitforcs").textContent = by.waitforcs.count;
-        document.getElementById("waitcompile").textContent = by.waitcompile.count;
-        document.getElementById("load").textContent = state.stats.current_load;
+        const schedulerConnected = !!state.scheduler.connected;
+        setText("meta", `${state.node} | ts=${state.ts} | refreshed=${new Date().toLocaleTimeString()}`);
+        setText("scheduler", schedulerConnected ? state.scheduler.name : "disconnected");
+        setText("slots", `${state.slots.used} / ${state.slots.max_kids}`);
+        setText("clients-total", state.clients.total);
+        setText("waitforcs", by.waitforcs.count);
+        setText("waitcompile", by.waitcompile.count);
+        setText("tocompile", by.tocompile.count);
+        setText("waitforchild", by.waitforchild.count);
+        setText("load", state.stats.current_load);
+        setText("scheduler-chip", schedulerConnected ? `scheduler: ${state.scheduler.name}` : "scheduler: disconnected");
+        document.getElementById("scheduler-dot").className = schedulerConnected ? "dot good" : "dot";
+
+        renderStatusBars(by, Number(state.clients.total || 0));
 
         renderClients(clients.clients || []);
         renderJobs(jobs.jobs || []);
       } catch (error) {
-        document.getElementById("meta").textContent = "error: " + error;
+        setText("meta", "error: " + error);
       }
     }
+    document.getElementById("job-limit").addEventListener("change", refresh);
     setInterval(refresh, 2000);
     refresh();
   </script>
