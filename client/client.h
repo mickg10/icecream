@@ -29,6 +29,7 @@
 #include <sys/types.h>
 #include <sys/time.h>
 #include <sys/resource.h>
+#include <stdint.h>
 
 #include <stdexcept>
 
@@ -40,6 +41,33 @@ class MsgChannel;
 
 extern std::string remote_daemon;
 extern std::string invocation_cmdline;
+
+struct InvocationTiming
+{
+    uint32_t submit_ts;
+    uint64_t submit_msec;
+    uint32_t enqueue_msec;
+    uint32_t start_msec;
+    uint32_t finish_msec;
+    uint32_t waitforcs_msec;
+    uint32_t local_queue_msec;
+    uint32_t exec_msec;
+    uint32_t scheduler_job_id;
+    uint32_t compile_job_id;
+    int exitcode;
+    std::string mode;
+    bool sent;
+};
+
+extern InvocationTiming invocation_timing;
+extern uint64_t invocation_now_msec();
+extern void invocation_timing_reset();
+extern void invocation_timing_mark_enqueue(const std::string &mode = std::string());
+extern void invocation_timing_mark_start(const std::string &mode = std::string());
+extern void invocation_timing_mark_finish(int exitcode);
+extern void invocation_timing_set_scheduler_job_id(uint32_t job_id);
+extern void invocation_timing_set_compile_job_id(uint32_t job_id);
+extern bool invocation_timing_send(MsgChannel *local_daemon);
 
 /* in remote.cpp */
 extern std::string get_absfilename(const std::string &_file);

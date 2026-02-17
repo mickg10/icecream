@@ -416,6 +416,7 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
     unsigned int port = usecs->port;
     int job_id = usecs->job_id;
     bool got_env = usecs->got_env;
+    invocation_timing_set_compile_job_id(job_id);
     job.setJobID(job_id);
     job.setEnvironmentVersion(environment);   // hoping on the scheduler's wisdom
     trace() << "Have to use host " << hostname << ":" << port << " - Job ID: "
@@ -740,6 +741,8 @@ maybe_build_local(MsgChannel *local_daemon, UseCSMsg *usecs, CompileJob &job,
             return false;
         trace() << "building myself, but telling localhost\n";
         int job_id = usecs->job_id;
+        invocation_timing_set_scheduler_job_id(job_id);
+        invocation_timing_set_compile_job_id(job_id);
         job.setJobID(job_id);
         job.setEnvironmentVersion("__client");
         CompileFileMsg compile_file(&job);
@@ -876,6 +879,11 @@ int build_remote(CompileJob &job, MsgChannel *local_daemon, const Environments &
         }
 
         UseCSMsg *usecs = get_server(local_daemon);
+        invocation_timing_set_scheduler_job_id(usecs->job_id);
+        invocation_timing_set_compile_job_id(usecs->job_id);
+        invocation_timing_mark_start(usecs->hostname == "127.0.0.1"
+                                     ? string("local_via_scheduler")
+                                     : string("remote"));
         int ret;
 
         try {
@@ -964,6 +972,13 @@ int build_remote(CompileJob &job, MsgChannel *local_daemon, const Environments &
             const CharBufferDeleter buffer_holder(buffer);
 
             umsgs[i] = get_server(local_daemon);
+            if (i == 0) {
+                invocation_timing_set_scheduler_job_id(umsgs[i]->job_id);
+                invocation_timing_set_compile_job_id(umsgs[i]->job_id);
+                invocation_timing_mark_start(umsgs[i]->hostname == "127.0.0.1"
+                                             ? string("local_via_scheduler")
+                                             : string("remote"));
+            }
 
             remote_daemon = umsgs[i]->hostname;
 

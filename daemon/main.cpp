@@ -409,6 +409,16 @@ public:
         status_since_msec = created_msec;
         last_waitforcs_msec = 0;
         env_bytes_received = 0;
+        timing_submit_ts = 0;
+        timing_enqueue_msec = 0;
+        timing_start_msec = 0;
+        timing_finish_msec = 0;
+        timing_waitforcs_msec = 0;
+        timing_local_queue_msec = 0;
+        timing_exec_msec = 0;
+        timing_scheduler_job_id = 0;
+        timing_compile_job_id = 0;
+        has_timing = false;
         job_id = 0;
         last_known_job_id = 0;
         channel = nullptr;
@@ -507,6 +517,17 @@ public:
     string status_why;
     string local_reason;
     string command_line;
+    uint32_t timing_submit_ts;
+    uint32_t timing_enqueue_msec;
+    uint32_t timing_start_msec;
+    uint32_t timing_finish_msec;
+    uint32_t timing_waitforcs_msec;
+    uint32_t timing_local_queue_msec;
+    uint32_t timing_exec_msec;
+    uint32_t timing_scheduler_job_id;
+    uint32_t timing_compile_job_id;
+    bool has_timing;
+    string timing_mode;
 
     string dump() const {
         uint64_t age_msec = monotonic_msec() - status_since_msec;
@@ -795,6 +816,15 @@ struct JobHistoryEntry {
     string outfile;
     string cmdline;
     string channel;
+    bool client_timing;
+    uint32_t client_submit_ts;
+    uint32_t client_enqueue_msec;
+    uint32_t client_start_msec;
+    uint32_t client_finish_msec;
+    uint32_t client_waitforcs_msec;
+    uint32_t client_local_queue_msec;
+    uint32_t client_exec_msec;
+    string client_mode;
 };
 
 struct WebConnection {
@@ -963,6 +993,7 @@ struct Daemon {
     bool handle_get_cs(Client *client, Msg *msg) __attribute_warn_unused_result__;
     bool handle_local_job(Client *client, Msg *msg) __attribute_warn_unused_result__;
     bool handle_job_done(Client *cl, JobDoneMsg *m) __attribute_warn_unused_result__;
+    bool handle_job_timing(Client *client, JobTimingMsg *m) __attribute_warn_unused_result__;
     bool handle_compile_done(Client *client) __attribute_warn_unused_result__;
     bool handle_verify_env(Client *client, VerifyEnvMsg *msg) __attribute_warn_unused_result__;
     bool handle_blacklist_host_env(Client *client, Msg *msg) __attribute_warn_unused_result__;
@@ -1706,6 +1737,9 @@ string Daemon::webgui_html() const
       <div class="card"><div class="label">Local queue</div><div class="value" style="color:#60a5fa" id="tocompile">-</div></div>
       <div class="card"><div class="label">Local child running</div><div class="value good" id="waitforchild">-</div></div>
       <div class="card"><div class="label">Current load</div><div class="value" id="load">-</div></div>
+      <div class="card"><div class="label">Queue delay (ms)</div><div class="value small" id="queue-delay">-</div></div>
+      <div class="card"><div class="label">Wait-for-CS (ms)</div><div class="value small" id="waitforcs-ms">-</div></div>
+      <div class="card"><div class="label">Compile exec (ms)</div><div class="value small" id="exec-ms">-</div></div>
     </div>
 
     <div class="layout">
@@ -1752,7 +1786,7 @@ string Daemon::webgui_html() const
       <div class="scroll" style="max-height:460px;">
         <table>
           <thead>
-            <tr><th>seq</th><th>client</th><th>duration(ms)</th><th>exit</th><th>final</th><th>scheduler/compile job</th><th>target/env</th><th>remote host</th><th>why</th></tr>
+            <tr><th>seq</th><th>client</th><th>duration(ms)</th><th>timing src/mode</th><th>timing ms (q/s/f/w/e)</th><th>exit</th><th>final</th><th>scheduler/compile job</th><th>target/env</th><th>remote host</th><th>why</th></tr>
           </thead>
           <tbody id="jobs-body"></tbody>
         </table>
@@ -1796,6 +1830,22 @@ string Daemon::webgui_html() const
       }
       return why;
     }
+    function timingSummary(row) {
+      if (!row) return "-";
+      return `q:${fmt(row.enqueue_msec)} s:${fmt(row.start_compile_msec)} f:${fmt(row.finish_msec)} w:${fmt(row.waitforcs_msec)} e:${fmt(row.exec_msec)}`;
+    }
+    function quantile(values, p) {
+      if (!values.length) return null;
+      const sorted = [...values].sort((a, b) => a - b);
+      const idx = Math.min(sorted.length - 1, Math.max(0, Math.floor((sorted.length - 1) * p)));
+      return sorted[idx];
+    }
+    function summarizeMetric(values) {
+      if (!values.length) return "-";
+      const p50 = quantile(values, 0.50);
+      const p95 = quantile(values, 0.95);
+      return `p50 ${p50} | p95 ${p95} | n=${values.length}`;
+    }
     function makeCell(tr, text, className) {
       const td = document.createElement("td");
       td.textContent = fmt(text);
@@ -1806,8 +1856,12 @@ string Daemon::webgui_html() const
       const modal = document.getElementById("cmdline-modal");
       const cmd = (row && row.cmdline) ? String(row.cmdline) : "";
       const fallback = (row && row.outfile) ? `outfile=${row.outfile}` : "";
+      const status = row ? (row.status || row.final_status) : "";
+      const timing = (row && row.timing_source)
+        ? ` source=${fmt(row.timing_source)} mode=${fmt(row.mode)} timing=${timingSummary(row)}`
+        : "";
       document.getElementById("cmdline-sub").textContent =
-        `client=${fmt(row && row.client_id)} status=${fmt(row && row.status)} scheduler_job=${fmt(row && row.scheduler_job_id)}`;
+        `client=${fmt(row && row.client_id)} status=${fmt(status)} scheduler_job=${fmt(row && row.scheduler_job_id)}${timing}`;
       document.getElementById("cmdline-body").textContent =
         cmd || fallback || "Command line not available for this row.";
       modal.classList.remove("hidden");
@@ -1882,9 +1936,14 @@ string Daemon::webgui_html() const
       body.innerHTML = "";
       for (const row of rows) {
         const tr = document.createElement("tr");
+        tr.className = "clickable-row";
+        tr.title = "Click to view command line";
+        tr.addEventListener("click", () => showCmdline(row));
         makeCell(tr, row.seq);
         makeCell(tr, row.client_id);
         makeCell(tr, row.duration_msec);
+        makeCell(tr, `${fmt(row.timing_source)} / ${fmt(row.mode)}`);
+        makeCell(tr, timingSummary(row), "dim");
         makeCell(tr, row.exitcode);
         makeCell(tr, statusLabel(row.final_status, row), `status ${statusClass(row.final_status)}`);
         makeCell(tr, `${fmt(row.scheduler_job_id)} / ${fmt(row.compile_job_id)}`);
@@ -1947,6 +2006,24 @@ string Daemon::webgui_html() const
         setText("load", state.stats.current_load);
         setText("scheduler-chip", schedulerConnected ? `scheduler: ${state.scheduler.name}` : "scheduler: disconnected");
         document.getElementById("scheduler-dot").className = schedulerConnected ? "dot good" : "dot";
+
+        const queueDelay = [];
+        const waitforcsTimes = [];
+        const execTimes = [];
+        for (const row of (jobs.jobs || [])) {
+          const waitforcs = Number(row.waitforcs_msec);
+          const localQueue = Number(row.local_queue_msec);
+          const exec = Number(row.exec_msec);
+          if (Number.isFinite(waitforcs) && waitforcs > 0) waitforcsTimes.push(waitforcs);
+          if (Number.isFinite(localQueue) && localQueue > 0) queueDelay.push(localQueue);
+          if (!Number.isFinite(localQueue) || localQueue <= 0) {
+            if (Number.isFinite(waitforcs) && waitforcs > 0) queueDelay.push(waitforcs);
+          }
+          if (Number.isFinite(exec) && exec > 0) execTimes.push(exec);
+        }
+        setText("queue-delay", summarizeMetric(queueDelay));
+        setText("waitforcs-ms", summarizeMetric(waitforcsTimes));
+        setText("exec-ms", summarizeMetric(execTimes));
 
         renderStatusBars(by, Number(state.clients.total || 0));
 
@@ -2087,6 +2164,63 @@ bool Daemon::should_track_client_job(const Client *client)
     }
 }
 
+static uint32_t clamp_u32(uint64_t value)
+{
+    return value > 0xffffffffULL ? 0xffffffffU : uint32_t(value);
+}
+
+static void finalize_job_timing(JobHistoryEntry *entry, const Client *client)
+{
+    if (!entry || !client) {
+        return;
+    }
+
+    if (!entry->client_timing) {
+        entry->client_submit_ts = client->created_ts;
+        entry->client_enqueue_msec = 0;
+        entry->client_start_msec = clamp_u32(client->last_waitforcs_msec);
+        entry->client_finish_msec = clamp_u32(entry->duration_msec);
+        entry->client_waitforcs_msec = clamp_u32(client->last_waitforcs_msec);
+        entry->client_local_queue_msec = entry->client_start_msec;
+        if (entry->client_finish_msec < entry->client_start_msec) {
+            entry->client_finish_msec = entry->client_start_msec;
+        }
+        entry->client_exec_msec = entry->client_finish_msec - entry->client_start_msec;
+    }
+
+    if (!entry->client_submit_ts) {
+        entry->client_submit_ts = client->created_ts;
+    }
+    if (!entry->client_finish_msec) {
+        entry->client_finish_msec = clamp_u32(entry->duration_msec);
+    }
+    if (entry->client_start_msec < entry->client_enqueue_msec) {
+        entry->client_start_msec = entry->client_enqueue_msec;
+    }
+    if (entry->client_finish_msec < entry->client_start_msec) {
+        entry->client_finish_msec = entry->client_start_msec;
+    }
+    if (entry->client_waitforcs_msec > entry->client_finish_msec) {
+        entry->client_waitforcs_msec = entry->client_finish_msec;
+    }
+    if (!entry->client_local_queue_msec && entry->client_start_msec >= entry->client_enqueue_msec) {
+        entry->client_local_queue_msec = entry->client_start_msec - entry->client_enqueue_msec;
+    }
+    if (!entry->client_exec_msec && entry->client_finish_msec >= entry->client_start_msec) {
+        entry->client_exec_msec = entry->client_finish_msec - entry->client_start_msec;
+    }
+    if (!entry->client_mode.empty()) {
+        return;
+    }
+    if (!entry->usecs_host.empty() && entry->usecs_host != "127.0.0.1") {
+        entry->client_mode = "remote";
+    } else if (entry->usecs_host == "127.0.0.1") {
+        entry->client_mode = "local_via_scheduler";
+    } else {
+        entry->client_mode = "local";
+    }
+}
+
 void Daemon::remember_finished_job(const Client *client, int exitcode)
 {
     if (!should_track_client_job(client)) {
@@ -2114,11 +2248,59 @@ void Daemon::remember_finished_job(const Client *client, int exitcode)
     entry.outfile = client->outfile;
     entry.cmdline = client_command_line_for_display(client);
     entry.channel = client->channel ? client->channel->dump() : string();
+    entry.client_timing = client->has_timing;
+    entry.client_submit_ts = client->timing_submit_ts;
+    entry.client_enqueue_msec = client->timing_enqueue_msec;
+    entry.client_start_msec = client->timing_start_msec;
+    entry.client_finish_msec = client->timing_finish_msec;
+    entry.client_waitforcs_msec = client->timing_waitforcs_msec;
+    entry.client_local_queue_msec = client->timing_local_queue_msec;
+    entry.client_exec_msec = client->timing_exec_msec;
+    entry.client_mode = client->timing_mode;
+    finalize_job_timing(&entry, client);
+    if (entry.client_timing && client->timing_scheduler_job_id) {
+        entry.scheduler_job_id = client->timing_scheduler_job_id;
+    }
+    if (entry.client_timing && client->timing_compile_job_id) {
+        entry.compile_job_id = client->timing_compile_job_id;
+    }
 
     if (job_history.size() >= job_history_capacity) {
         job_history.pop_front();
     }
     job_history.push_back(entry);
+
+    if (state_dump_log || !state_jsonl_path.empty()) {
+        ostringstream o;
+        o << "{";
+        o << "\"type\":\"iceccd_job_timing\",";
+        o << "\"ts\":" << (long long)time(nullptr) << ",";
+        o << "\"mono_msec\":" << (unsigned long long)monotonic_msec() << ",";
+        o << "\"node\":\"" << json_escape(nodename) << "\",";
+        o << "\"client_id\":" << entry.client_id << ",";
+        o << "\"scheduler_job_id\":" << entry.scheduler_job_id << ",";
+        o << "\"compile_job_id\":" << entry.compile_job_id << ",";
+        o << "\"exitcode\":" << entry.exitcode << ",";
+        o << "\"final_status\":\"" << json_escape(entry.final_status) << "\",";
+        o << "\"final_why\":\"" << json_escape(entry.final_why) << "\",";
+        o << "\"mode\":\"" << json_escape(entry.client_mode) << "\",";
+        o << "\"timing_source\":\"" << (entry.client_timing ? "client" : "daemon") << "\",";
+        o << "\"submit_ts\":" << (long long)entry.client_submit_ts << ",";
+        o << "\"enqueue_msec\":" << entry.client_enqueue_msec << ",";
+        o << "\"start_msec\":" << entry.client_start_msec << ",";
+        o << "\"finish_msec\":" << entry.client_finish_msec << ",";
+        o << "\"waitforcs_msec\":" << entry.client_waitforcs_msec << ",";
+        o << "\"local_queue_msec\":" << entry.client_local_queue_msec << ",";
+        o << "\"exec_msec\":" << entry.client_exec_msec << ",";
+        o << "\"cmdline\":\"" << json_escape(entry.cmdline) << "\"";
+        o << "}";
+        const string line = o.str();
+        if (state_dump_log && logfile_error) {
+            (*logfile_error) << line << "\n";
+            logfile_error->flush();
+        }
+        append_state_jsonl_line(line);
+    }
 }
 
 string Daemon::dump_job_history_json(size_t limit) const
@@ -2162,7 +2344,16 @@ string Daemon::dump_job_history_json(size_t limit) const
         o << "\"usecs_got_env\":" << (entry.usecs_got_env ? "true" : "false") << ",";
         o << "\"outfile\":\"" << json_escape(entry.outfile) << "\",";
         o << "\"cmdline\":\"" << json_escape(entry.cmdline) << "\",";
-        o << "\"channel\":\"" << json_escape(entry.channel) << "\"";
+        o << "\"channel\":\"" << json_escape(entry.channel) << "\",";
+        o << "\"timing_source\":\"" << (entry.client_timing ? "client" : "daemon") << "\",";
+        o << "\"mode\":\"" << json_escape(entry.client_mode) << "\",";
+        o << "\"submit_ts\":" << (long long)entry.client_submit_ts << ",";
+        o << "\"enqueue_msec\":" << entry.client_enqueue_msec << ",";
+        o << "\"start_compile_msec\":" << entry.client_start_msec << ",";
+        o << "\"finish_msec\":" << entry.client_finish_msec << ",";
+        o << "\"waitforcs_msec\":" << entry.client_waitforcs_msec << ",";
+        o << "\"local_queue_msec\":" << entry.client_local_queue_msec << ",";
+        o << "\"exec_msec\":" << entry.client_exec_msec;
         o << "}";
     }
 
@@ -4087,6 +4278,30 @@ bool Daemon::handle_local_job(Client *client, Msg *msg)
     return true;
 }
 
+bool Daemon::handle_job_timing(Client *client, JobTimingMsg *m)
+{
+    if (!client || !m) {
+        return false;
+    }
+
+    client->timing_submit_ts = m->submit_ts;
+    client->timing_enqueue_msec = m->enqueue_msec;
+    client->timing_start_msec = m->start_msec;
+    client->timing_finish_msec = m->finish_msec;
+    client->timing_waitforcs_msec = m->waitforcs_msec;
+    client->timing_local_queue_msec = m->local_queue_msec;
+    client->timing_exec_msec = m->exec_msec;
+    client->timing_scheduler_job_id = m->scheduler_job_id;
+    client->timing_compile_job_id = m->compile_job_id;
+    client->timing_mode = m->mode;
+    client->has_timing = true;
+    if (m->scheduler_job_id) {
+        client->last_known_job_id = m->scheduler_job_id;
+    }
+
+    return true;
+}
+
 bool Daemon::handle_activity(Client *client)
 {
     assert(client->status != Client::TOCOMPILE && client->status != Client::WAITINSTALL);
@@ -4131,6 +4346,9 @@ bool Daemon::handle_activity(Client *client)
         break;
     case Msg::JOB_DONE:
         ret = handle_job_done(client, dynamic_cast<JobDoneMsg *>(msg));
+        break;
+    case Msg::JOB_TIMING:
+        ret = handle_job_timing(client, dynamic_cast<JobTimingMsg *>(msg));
         break;
     case Msg::VERIFY_ENV:
         ret = handle_verify_env(client, dynamic_cast<VerifyEnvMsg *>(msg));

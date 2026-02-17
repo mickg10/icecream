@@ -1197,6 +1197,9 @@ Msg *MsgChannel::get_msg(int timeout, bool eofAllowed)
     case Msg::NO_CS:
         m = new NoCSMsg;
         break;
+    case Msg::JOB_TIMING:
+        m = new JobTimingMsg;
+        break;
     case Msg::COMPILE_FILE:
         m = new CompileFileMsg(new CompileJob, true);
         break;
@@ -2338,6 +2341,40 @@ void JobLocalDoneMsg::send_to_channel(MsgChannel *c) const
 {
     Msg::send_to_channel(c);
     *c << job_id;
+}
+
+void JobTimingMsg::fill_from_channel(MsgChannel *c)
+{
+    Msg::fill_from_channel(c);
+    *c >> submit_ts;
+    *c >> enqueue_msec;
+    *c >> start_msec;
+    *c >> finish_msec;
+    *c >> waitforcs_msec;
+    *c >> local_queue_msec;
+    *c >> exec_msec;
+    *c >> scheduler_job_id;
+    *c >> compile_job_id;
+    uint32_t _exitcode = 0;
+    *c >> _exitcode;
+    exitcode = int(_exitcode);
+    *c >> mode;
+}
+
+void JobTimingMsg::send_to_channel(MsgChannel *c) const
+{
+    Msg::send_to_channel(c);
+    *c << submit_ts;
+    *c << enqueue_msec;
+    *c << start_msec;
+    *c << finish_msec;
+    *c << waitforcs_msec;
+    *c << local_queue_msec;
+    *c << exec_msec;
+    *c << scheduler_job_id;
+    *c << compile_job_id;
+    *c << uint32_t(exitcode);
+    *c << mode;
 }
 
 JobDoneMsg::JobDoneMsg(int id, int exit, unsigned int _flags, unsigned int _client_count)

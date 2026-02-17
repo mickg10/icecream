@@ -36,9 +36,10 @@
 #include "job.h"
 
 // if you increase the PROTOCOL_VERSION, add a macro below and use that
-#define PROTOCOL_VERSION 46
+#define PROTOCOL_VERSION 47
 // if you increase the MIN_PROTOCOL_VERSION, comment out macros below and clean up the code
 #define MIN_PROTOCOL_VERSION 21
+#define PROTOCOL_VERSION_JOB_TIMING 47
 
 #define MAX_SCHEDULER_PONG 3
 // MAX_SCHEDULER_PING must be multiple of MAX_SCHEDULER_PONG
@@ -125,7 +126,9 @@ public:
         // C --> CS, CS --> S (forwarded from C), to not use given host for given environment
         BLACKLIST_HOST_ENV,
         // S --> CS
-        NO_CS
+        NO_CS,
+        // C --> CS
+        JOB_TIMING
     };
 
     Msg() = default;
@@ -202,6 +205,8 @@ public:
                 return "BLACKLIST_HOST_ENV";
             case NO_CS:
                 return "NO_CS";
+            case JOB_TIMING:
+                return "JOB_TIMING";
         }
         return nullptr;
     }
@@ -774,6 +779,55 @@ public:
     virtual void send_to_channel(MsgChannel *c) const;
 
     uint32_t job_id;
+};
+
+class JobTimingMsg : public Msg
+{
+public:
+    JobTimingMsg()
+        : Msg(Msg::JOB_TIMING)
+        , submit_ts(0)
+        , enqueue_msec(0)
+        , start_msec(0)
+        , finish_msec(0)
+        , waitforcs_msec(0)
+        , local_queue_msec(0)
+        , exec_msec(0)
+        , scheduler_job_id(0)
+        , compile_job_id(0)
+        , exitcode(0) {}
+
+    JobTimingMsg(uint32_t _submit_ts, uint32_t _enqueue_msec, uint32_t _start_msec, uint32_t _finish_msec,
+                 uint32_t _waitforcs_msec, uint32_t _local_queue_msec, uint32_t _exec_msec,
+                 uint32_t _scheduler_job_id, uint32_t _compile_job_id, int _exitcode,
+                 const std::string &_mode)
+        : Msg(Msg::JOB_TIMING)
+        , submit_ts(_submit_ts)
+        , enqueue_msec(_enqueue_msec)
+        , start_msec(_start_msec)
+        , finish_msec(_finish_msec)
+        , waitforcs_msec(_waitforcs_msec)
+        , local_queue_msec(_local_queue_msec)
+        , exec_msec(_exec_msec)
+        , scheduler_job_id(_scheduler_job_id)
+        , compile_job_id(_compile_job_id)
+        , exitcode(_exitcode)
+        , mode(_mode) {}
+
+    virtual void fill_from_channel(MsgChannel *c);
+    virtual void send_to_channel(MsgChannel *c) const;
+
+    uint32_t submit_ts;
+    uint32_t enqueue_msec;
+    uint32_t start_msec;
+    uint32_t finish_msec;
+    uint32_t waitforcs_msec;
+    uint32_t local_queue_msec;
+    uint32_t exec_msec;
+    uint32_t scheduler_job_id;
+    uint32_t compile_job_id;
+    int exitcode;
+    std::string mode;
 };
 
 class LoginMsg : public Msg
