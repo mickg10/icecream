@@ -1740,6 +1740,9 @@ string Daemon::webgui_html() const
       <div class="card"><div class="label">Queue delay (ms)</div><div class="value small" id="queue-delay">-</div></div>
       <div class="card"><div class="label">Wait-for-CS (ms)</div><div class="value small" id="waitforcs-ms">-</div></div>
       <div class="card"><div class="label">Compile exec (ms)</div><div class="value small" id="exec-ms">-</div></div>
+      <div class="card"><div class="label">Queue by mode p95</div><div class="value small" id="queue-mode">-</div></div>
+      <div class="card"><div class="label">Exec by mode p95</div><div class="value small" id="exec-mode">-</div></div>
+      <div class="card"><div class="label">Timing coverage / rate</div><div class="value small" id="timing-coverage">-</div></div>
     </div>
 
     <div class="layout">
@@ -1842,9 +1845,15 @@ string Daemon::webgui_html() const
     }
     function summarizeMetric(values) {
       if (!values.length) return "-";
+      const max = Math.max(...values);
       const p50 = quantile(values, 0.50);
       const p95 = quantile(values, 0.95);
-      return `p50 ${p50} | p95 ${p95} | n=${values.length}`;
+      return `p50 ${p50} | p95 ${p95} | max ${max} | n=${values.length}`;
+    }
+    function summarizeModeP95(remoteValues, localValues) {
+      const remoteP95 = remoteValues.length ? quantile(remoteValues, 0.95) : "-";
+      const localP95 = localValues.length ? quantile(localValues, 0.95) : "-";
+      return `r ${remoteP95} (${remoteValues.length}) | l ${localP95} (${localValues.length})`;
     }
     function makeCell(tr, text, className) {
       const td = document.createElement("td");
@@ -2008,22 +2017,66 @@ string Daemon::webgui_html() const
         document.getElementById("scheduler-dot").className = schedulerConnected ? "dot good" : "dot";
 
         const queueDelay = [];
+        const queueDelayRemote = [];
+        const queueDelayLocal = [];
         const waitforcsTimes = [];
         const execTimes = [];
+        const execTimesRemote = [];
+        const execTimesLocal = [];
+        const allJobs = jobs.jobs || [];
+        let timedByClient = 0;
+        let newestEndTs = 0;
+        for (const row of allJobs) {
+          const endTs = Number(row.end_ts);
+          if (Number.isFinite(endTs) && endTs > newestEndTs) {
+            newestEndTs = endTs;
+          }
+        }
+        let jobsLastMin = 0;
         for (const row of (jobs.jobs || [])) {
+          const mode = String(row.mode || "").toLowerCase();
+          const isRemoteMode = mode.startsWith("remote");
           const waitforcs = Number(row.waitforcs_msec);
           const localQueue = Number(row.local_queue_msec);
           const exec = Number(row.exec_msec);
-          if (Number.isFinite(waitforcs) && waitforcs > 0) waitforcsTimes.push(waitforcs);
-          if (Number.isFinite(localQueue) && localQueue > 0) queueDelay.push(localQueue);
-          if (!Number.isFinite(localQueue) || localQueue <= 0) {
-            if (Number.isFinite(waitforcs) && waitforcs > 0) queueDelay.push(waitforcs);
+          let queueValue = 0;
+          if (Number.isFinite(localQueue) && localQueue > 0) {
+            queueValue = localQueue;
+          } else if (Number.isFinite(waitforcs) && waitforcs > 0) {
+            queueValue = waitforcs;
           }
-          if (Number.isFinite(exec) && exec > 0) execTimes.push(exec);
+          if (queueValue > 0) {
+            queueDelay.push(queueValue);
+            if (isRemoteMode) {
+              queueDelayRemote.push(queueValue);
+            } else {
+              queueDelayLocal.push(queueValue);
+            }
+          }
+          if (Number.isFinite(waitforcs) && waitforcs > 0) waitforcsTimes.push(waitforcs);
+          if (Number.isFinite(exec) && exec > 0) {
+            execTimes.push(exec);
+            if (isRemoteMode) {
+              execTimesRemote.push(exec);
+            } else {
+              execTimesLocal.push(exec);
+            }
+          }
+          if (String(row.timing_source || "") === "client") {
+            ++timedByClient;
+          }
+          const endTs = Number(row.end_ts);
+          if (newestEndTs > 0 && Number.isFinite(endTs) && endTs >= newestEndTs - 60) {
+            ++jobsLastMin;
+          }
         }
         setText("queue-delay", summarizeMetric(queueDelay));
         setText("waitforcs-ms", summarizeMetric(waitforcsTimes));
         setText("exec-ms", summarizeMetric(execTimes));
+        setText("queue-mode", summarizeModeP95(queueDelayRemote, queueDelayLocal));
+        setText("exec-mode", summarizeModeP95(execTimesRemote, execTimesLocal));
+        const coverage = allJobs.length ? Math.round(100 * timedByClient / allJobs.length) : 0;
+        setText("timing-coverage", `${coverage}% client | ${jobsLastMin}/min`);
 
         renderStatusBars(by, Number(state.clients.total || 0));
 
