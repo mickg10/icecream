@@ -983,6 +983,7 @@ struct Daemon {
     bool webgui_enabled;
     int webgui_port;
     string webgui_addr;
+    bool webgui_best_effort;
     int web_listen_fd;
     map<int, WebConnection> web_connections;
     size_t job_history_capacity;
@@ -1048,6 +1049,7 @@ struct Daemon {
         webgui_enabled = false;
         webgui_port = 8768;
         webgui_addr = "127.0.0.1";
+        webgui_best_effort = false;
         web_listen_fd = -1;
         job_history_capacity = 20000;
         next_job_history_seq = 1;
@@ -1308,17 +1310,30 @@ bool Daemon::setup_web_listen_fd()
 
     web_listen_fd = socket(PF_INET, SOCK_STREAM, 0);
     if (web_listen_fd < 0) {
+        if (webgui_best_effort) {
+            log_warning() << "Failed to create web gui socket: " << strerror(errno) << endl;
+            webgui_enabled = false;
+            return true;
+        }
         log_perror("Failed to create web gui socket");
         return false;
     }
 
     int optval = 1;
     if (setsockopt(web_listen_fd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0) {
-        log_perror("Failed to set SO_REUSEADDR on web gui socket");
+        if (webgui_best_effort) {
+            log_warning() << "Failed to set SO_REUSEADDR on web gui socket: " << strerror(errno) << endl;
+        } else {
+            log_perror("Failed to set SO_REUSEADDR on web gui socket");
+        }
         if (-1 == close(web_listen_fd) && (errno != EBADF)) {
             log_perror("Failed to close web gui socket");
         }
         web_listen_fd = -1;
+        if (webgui_best_effort) {
+            webgui_enabled = false;
+            return true;
+        }
         return false;
     }
 
@@ -1328,32 +1343,58 @@ bool Daemon::setup_web_listen_fd()
     addr.sin_port = htons(webgui_port);
     string normalized_addr;
     if (!parse_webgui_bind_addr(webgui_addr, addr.sin_addr, normalized_addr)) {
-        log_error() << "Invalid web gui bind address '" << webgui_addr
-                    << "'. Use an IPv4 address or 'localhost'." << endl;
+        if (webgui_best_effort) {
+            log_warning() << "Invalid web gui bind address '" << webgui_addr
+                          << "'. Use an IPv4 address or 'localhost'." << endl;
+        } else {
+            log_error() << "Invalid web gui bind address '" << webgui_addr
+                        << "'. Use an IPv4 address or 'localhost'." << endl;
+        }
         if (-1 == close(web_listen_fd) && (errno != EBADF)) {
             log_perror("Failed to close web gui socket");
         }
         web_listen_fd = -1;
+        if (webgui_best_effort) {
+            webgui_enabled = false;
+            return true;
+        }
         return false;
     }
     webgui_addr = normalized_addr;
 
     if (::bind(web_listen_fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
-        log_error() << "Failed to bind web gui on " << webgui_addr << ":" << webgui_port
-                    << ": " << strerror(errno) << endl;
+        if (webgui_best_effort) {
+            log_warning() << "Failed to bind web gui on " << webgui_addr << ":" << webgui_port
+                          << ": " << strerror(errno) << endl;
+        } else {
+            log_error() << "Failed to bind web gui on " << webgui_addr << ":" << webgui_port
+                        << ": " << strerror(errno) << endl;
+        }
         if (-1 == close(web_listen_fd) && (errno != EBADF)) {
             log_perror("Failed to close web gui socket");
         }
         web_listen_fd = -1;
+        if (webgui_best_effort) {
+            webgui_enabled = false;
+            return true;
+        }
         return false;
     }
 
     if (listen(web_listen_fd, 128) < 0) {
-        log_perror("Failed to listen on web gui socket");
+        if (webgui_best_effort) {
+            log_warning() << "Failed to listen on web gui socket: " << strerror(errno) << endl;
+        } else {
+            log_perror("Failed to listen on web gui socket");
+        }
         if (-1 == close(web_listen_fd) && (errno != EBADF)) {
             log_perror("Failed to close web gui socket");
         }
         web_listen_fd = -1;
+        if (webgui_best_effort) {
+            webgui_enabled = false;
+            return true;
+        }
         return false;
     }
 
@@ -6126,6 +6167,42 @@ int main(int argc, char **argv)
     }
 
     setup_debug(debug_level, logfile);
+
+    const char *web_hostport_env = getenv("ICECC_WEB_HOSTPORT");
+    if (web_hostport_env && *web_hostport_env) {
+        d.webgui_best_effort = true;
+
+        const string web_hostport(web_hostport_env);
+        const size_t colon = web_hostport.rfind(':');
+        string web_host;
+        string web_port_str;
+
+        if (colon == string::npos) {
+            web_host = d.webgui_addr;
+            web_port_str = web_hostport;
+        } else {
+            web_host = web_hostport.substr(0, colon);
+            web_port_str = web_hostport.substr(colon + 1);
+        }
+
+        if (web_host.empty()) {
+            web_host = "0.0.0.0";
+        } else if (web_host == "localhost") {
+            web_host = "127.0.0.1";
+        }
+
+        errno = 0;
+        char *end = nullptr;
+        const long web_port_long = strtol(web_port_str.c_str(), &end, 10);
+        if (errno != 0 || end == web_port_str.c_str() || (end && *end) || web_port_long <= 0 || web_port_long > 65535) {
+            log_warning() << "Ignoring ICECC_WEB_HOSTPORT='" << web_hostport
+                          << "' (expected <addr>:<port> or <port>)" << endl;
+        } else {
+            d.webgui_enabled = true;
+            d.webgui_addr = web_host;
+            d.webgui_port = int(web_port_long);
+        }
+    }
 
     log_info() << "ICECREAM daemon " VERSION " starting up (nice level "
                << nice_level << ") " << endl;
