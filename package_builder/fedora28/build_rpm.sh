@@ -43,10 +43,16 @@ configure_dnf() {
 }
 
 dnf_cmd() {
+    local proxy_opt=()
+    local proxy="${https_proxy:-${http_proxy:-}}"
+    if [ -n "${proxy:-}" ]; then
+        proxy_opt+=(--setopt=proxy="${proxy}")
+    fi
+
     if [ "${ICECREAM_BUILDER_INSECURE:-}" = "1" ] || [ "${ICECREAM_BUILDER_INSECURE:-}" = "true" ]; then
-        dnf --setopt=sslverify=0 "$@"
+        dnf --setopt=sslverify=0 "${proxy_opt[@]}" "$@"
     else
-        dnf "$@"
+        dnf "${proxy_opt[@]}" "$@"
     fi
 }
 
