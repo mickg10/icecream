@@ -16,6 +16,28 @@ normalize_proxy_env() {
     fi
 }
 
+configure_dnf() {
+    local conf proxy
+    conf="/etc/dnf/dnf.conf"
+    proxy="${https_proxy:-${http_proxy:-}}"
+
+    if [ -n "${proxy:-}" ]; then
+        if grep -q '^proxy=' "$conf" 2>/dev/null; then
+            sed -i -E "s|^proxy=.*|proxy=${proxy}|" "$conf"
+        else
+            printf '\nproxy=%s\n' "$proxy" >> "$conf"
+        fi
+    fi
+
+    if [ "${ICECREAM_BUILDER_INSECURE:-}" = "1" ] || [ "${ICECREAM_BUILDER_INSECURE:-}" = "true" ]; then
+        if grep -q '^sslverify=' "$conf" 2>/dev/null; then
+            sed -i -E 's/^sslverify=.*/sslverify=0/' "$conf"
+        else
+            printf '\nsslverify=0\n' >> "$conf"
+        fi
+    fi
+}
+
 dnf_cmd() {
     if [ "${ICECREAM_BUILDER_INSECURE:-}" = "1" ] || [ "${ICECREAM_BUILDER_INSECURE:-}" = "true" ]; then
         dnf --setopt=sslverify=0 "$@"
@@ -46,6 +68,7 @@ if ! ls -1 "$OUT_DIR"/*.rpm >/dev/null 2>&1; then
 fi
 
 normalize_proxy_env
+configure_dnf
 dnf_cmd -y clean all
 dnf_cmd -y makecache
 
