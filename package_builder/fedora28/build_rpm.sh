@@ -81,7 +81,7 @@ EOF
 [fedora-source]
 name=Fedora 28 - Source
 baseurl=https://archives.fedoraproject.org/pub/archive/fedora/linux/releases/28/Everything/source/tree/
-enabled=1
+enabled=0
 gpgcheck=0
 metadata_expire=7d
 skip_if_unavailable=0
@@ -91,7 +91,7 @@ EOF
 [updates-source]
 name=Fedora 28 - Source - Updates
 baseurl=https://archives.fedoraproject.org/pub/archive/fedora/linux/updates/28/Everything/source/tree/
-enabled=1
+enabled=0
 gpgcheck=0
 metadata_expire=7d
 skip_if_unavailable=0
@@ -116,10 +116,14 @@ parse_upstream_version() {
 
 normalize_proxy_env
 configure_dnf
-write_archive_repos
 
 dnf_cmd -y clean all
-dnf_cmd -y makecache
+if ! dnf_cmd -y makecache; then
+    echo "WARN: dnf makecache failed; retrying with Fedora archives repos" >&2
+    write_archive_repos
+    dnf_cmd -y clean all
+    dnf_cmd -y makecache
+fi
 
 dnf_cmd -y install \
     asciidoc \
@@ -148,7 +152,11 @@ UPSTREAM_VERSION="$(parse_upstream_version "$SRC_DIR/configure.ac")"
 rpmdev-setuptree
 
 cd "$WORK_DIR"
-dnf_cmd -y download --source icecream
+dnf_cmd -y download --source \
+    --disablerepo="*" \
+    --enablerepo=fedora-source \
+    --enablerepo=updates-source \
+    icecream
 
 SRPM="$(ls -1 icecream-*.src.rpm | head -n1 || true)"
 if [ -z "${SRPM:-}" ]; then
