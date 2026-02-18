@@ -1,12 +1,12 @@
 services:
-  deb:
+  rpm:
     build:
       context: .
     volumes:
       - ../..:/src:ro
       - ./out:/out
     working_dir: /work
-    command: ["/usr/local/bin/build_deb.sh"]
+    command: ["/usr/local/bin/build_rpm.sh"]
   verify:
     build:
       context: .
@@ -14,4 +14,5 @@ services:
       - ../..:/src:ro
       - ./out:/out
     working_dir: /work
-    command: ["/usr/local/bin/verify_deb.sh"]
+    command: ["/usr/local/bin/verify_rpm.sh"]
+

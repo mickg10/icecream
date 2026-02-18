@@ -15,3 +15,4 @@ services:
       - ./out:/out
     working_dir: /work
     command: ["/usr/local/bin/verify_deb.sh"]
+

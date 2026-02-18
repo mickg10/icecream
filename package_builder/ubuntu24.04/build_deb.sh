@@ -4,7 +4,7 @@ set -euo pipefail
 SRC_DIR="${SRC_DIR:-/src}"
 OUT_DIR="${OUT_DIR:-/out}"
 WORK_DIR="${WORK_DIR:-/work}"
-DEB_DIST="${DEB_DIST:-jammy}"
+DEB_DIST="${DEB_DIST:-noble}"
 DEB_EMAIL="${DEB_EMAIL:-icecream-builder@example.invalid}"
 DEB_NAME="${DEB_NAME:-icecream builder}"
 
@@ -108,6 +108,15 @@ rsync -a --delete \
     "$SRC_DIR"/ "$NEW_DIR"/
 
 cd "$NEW_DIR"
+
+# Ubuntu 24.04's icecc packaging includes a patch (libtool-verbose.diff) that
+# does not apply cleanly to this tree. Drop it so dpkg-source can proceed.
+if [ -f debian/patches/series ]; then
+    if grep -q '^libtool-verbose\.diff$' debian/patches/series; then
+        sed -i '/^libtool-verbose\.diff$/d' debian/patches/series
+        rm -f debian/patches/libtool-verbose.diff
+    fi
+fi
 
 dch --newversion "$DEB_VERSION" --distribution "$DEB_DIST" "Local build from git checkout."
 

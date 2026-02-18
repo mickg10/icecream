@@ -6,6 +6,7 @@ libclient_a_SOURCES = \
         arg.cpp \
         argv.c \
         cpp.cpp \
+        invocation_timing.cpp \
         local.cpp \
         remote.cpp \
         util.cpp \

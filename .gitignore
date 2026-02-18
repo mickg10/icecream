@@ -55,3 +55,4 @@ unittests/testargs.trs
 # others
 compile_commands.json
 .vs*
+package_builder/**/out/

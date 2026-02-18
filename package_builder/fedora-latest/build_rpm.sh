@@ -8,48 +8,6 @@ WORK_DIR="${WORK_DIR:-/work}"
 mkdir -p "$WORK_DIR" "$OUT_DIR"
 cd "$WORK_DIR"
 
-write_archive_repos() {
-    cat > /etc/yum.repos.d/fedora.repo <<'EOF'
-[fedora]
-name=Fedora 28 - $basearch
-baseurl=https://archives.fedoraproject.org/pub/archive/fedora/linux/releases/28/Everything/$basearch/os/
-enabled=1
-gpgcheck=0
-metadata_expire=7d
-skip_if_unavailable=0
-EOF
-
-    cat > /etc/yum.repos.d/fedora-updates.repo <<'EOF'
-[updates]
-name=Fedora 28 - $basearch - Updates
-baseurl=https://archives.fedoraproject.org/pub/archive/fedora/linux/updates/28/Everything/$basearch/
-enabled=1
-gpgcheck=0
-metadata_expire=7d
-skip_if_unavailable=0
-EOF
-
-    cat > /etc/yum.repos.d/fedora-source.repo <<'EOF'
-[fedora-source]
-name=Fedora 28 - Source
-baseurl=https://archives.fedoraproject.org/pub/archive/fedora/linux/releases/28/Everything/source/tree/
-enabled=1
-gpgcheck=0
-metadata_expire=7d
-skip_if_unavailable=0
-EOF
-
-    cat > /etc/yum.repos.d/fedora-updates-source.repo <<'EOF'
-[updates-source]
-name=Fedora 28 - Source - Updates
-baseurl=https://archives.fedoraproject.org/pub/archive/fedora/linux/updates/28/Everything/source/tree/
-enabled=1
-gpgcheck=0
-metadata_expire=7d
-skip_if_unavailable=0
-EOF
-}
-
 parse_upstream_version() {
     local major minor micro
     major="$(awk -F'[][]' '$2 == "icecream_version_major" {print $4; exit}' "$1")"
@@ -65,8 +23,6 @@ parse_upstream_version() {
         echo "${major}.${minor}"
     fi
 }
-
-write_archive_repos
 
 dnf -y clean all
 dnf -y makecache
@@ -98,6 +54,7 @@ UPSTREAM_VERSION="$(parse_upstream_version "$SRC_DIR/configure.ac")"
 rpmdev-setuptree
 
 cd "$WORK_DIR"
+dnf config-manager --set-enabled fedora-source updates-source >/dev/null 2>&1 || true
 dnf -y download --source icecream
 
 SRPM="$(ls -1 icecream-*.src.rpm | head -n1 || true)"
@@ -121,12 +78,19 @@ sed -i -E \
 
 sed -i -E "s@^Source0:.*@Source0: %{name}-%{version}.tar.xz@" "$SPEC_PATH"
 
+# Fedora packaging for RC snapshots may use a different topdir (e.g. appending
+# "rc1") in %prep via %autosetup/%setup -n. We generate Source0 with the
+# standard "%{name}-%{version}" directory name, so force %prep to match.
+sed -i -E 's/^(%autosetup.*-n[[:space:]]+)[^[:space:]]+(.*)$/\1%{name}-%{version}\2/' "$SPEC_PATH"
+sed -i -E 's/^(%setup.*-n[[:space:]]+)[^[:space:]]+(.*)$/\1%{name}-%{version}\2/' "$SPEC_PATH"
+
 # The Fedora SRPM often carries patch hunks that don't apply cleanly to a newer
 # upstream checkout. Keep the packaging bits, but disable patch application.
 sed -i -E '/^%patch[0-9]*/d' "$SPEC_PATH"
 sed -i -E '/^%autosetup/ {/ -N/! s/^%autosetup/%autosetup -N/}' "$SPEC_PATH"
 
-# Fedora 28 ships an older Autoconf; don't regenerate build system files.
+# Don't regenerate build system files; the git checkout ships a working
+# configure script.
 sed -i -E '/^[[:space:]]*\\.\\/autogen\\.sh/d' "$SPEC_PATH"
 
 # Newer upstream versions install additional helper tools.
@@ -164,9 +128,7 @@ rsync -a --delete \
 
 tar -C "$STAGE" -cJf "$SOURCE0_PATH" "icecream-${UPSTREAM_VERSION}"
 
-if ! dnf -y builddep "$SPEC_PATH"; then
-    echo "WARN: dnf builddep failed; continuing anyway" >&2
-fi
+dnf -y builddep "$SPEC_PATH"
 
 rpmbuild -ba "$SPEC_PATH"
 
