@@ -152,11 +152,16 @@ UPSTREAM_VERSION="$(parse_upstream_version "$SRC_DIR/configure.ac")"
 rpmdev-setuptree
 
 cd "$WORK_DIR"
-dnf_cmd -y download --source \
+if ! dnf_cmd -y download --source \
     --disablerepo="*" \
     --enablerepo=fedora-source \
-    --enablerepo=updates-source \
-    icecream
+    icecream; then
+    dnf_cmd -y download --source \
+        --disablerepo="*" \
+        --enablerepo=fedora-source \
+        --enablerepo=updates-source \
+        icecream
+fi
 
 SRPM="$(ls -1 icecream-*.src.rpm | head -n1 || true)"
 if [ -z "${SRPM:-}" ]; then
