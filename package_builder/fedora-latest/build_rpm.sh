@@ -8,6 +8,14 @@ WORK_DIR="${WORK_DIR:-/work}"
 mkdir -p "$WORK_DIR" "$OUT_DIR"
 cd "$WORK_DIR"
 
+dnf_cmd() {
+    if [ "${ICECREAM_BUILDER_INSECURE:-}" = "1" ] || [ "${ICECREAM_BUILDER_INSECURE:-}" = "true" ]; then
+        dnf --setopt=sslverify=0 "$@"
+    else
+        dnf "$@"
+    fi
+}
+
 parse_upstream_version() {
     local major minor micro
     major="$(awk -F'[][]' '$2 == "icecream_version_major" {print $4; exit}' "$1")"
@@ -24,10 +32,10 @@ parse_upstream_version() {
     fi
 }
 
-dnf -y clean all
-dnf -y makecache
+dnf_cmd -y clean all
+dnf_cmd -y makecache
 
-dnf -y install \
+dnf_cmd -y install \
     asciidoc \
     ca-certificates \
     dnf-plugins-core \
@@ -54,8 +62,8 @@ UPSTREAM_VERSION="$(parse_upstream_version "$SRC_DIR/configure.ac")"
 rpmdev-setuptree
 
 cd "$WORK_DIR"
-dnf config-manager --set-enabled fedora-source updates-source >/dev/null 2>&1 || true
-dnf -y download --source icecream
+dnf_cmd config-manager --set-enabled fedora-source updates-source >/dev/null 2>&1 || true
+dnf_cmd -y download --source icecream
 
 SRPM="$(ls -1 icecream-*.src.rpm | head -n1 || true)"
 if [ -z "${SRPM:-}" ]; then
@@ -128,7 +136,7 @@ rsync -a --delete \
 
 tar -C "$STAGE" -cJf "$SOURCE0_PATH" "icecream-${UPSTREAM_VERSION}"
 
-dnf -y builddep "$SPEC_PATH"
+dnf_cmd -y builddep "$SPEC_PATH"
 
 rpmbuild -ba "$SPEC_PATH"
 

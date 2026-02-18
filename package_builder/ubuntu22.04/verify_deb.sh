@@ -6,6 +6,15 @@ OUT_DIR="${OUT_DIR:-/out}"
 
 export DEBIAN_FRONTEND=noninteractive
 
+configure_apt_insecure() {
+    if [ "${ICECREAM_BUILDER_INSECURE:-}" = "1" ] || [ "${ICECREAM_BUILDER_INSECURE:-}" = "true" ]; then
+        printf '%s\n' \
+            'Acquire::https::Verify-Peer "false";' \
+            'Acquire::https::Verify-Host "false";' \
+            > /etc/apt/apt.conf.d/99icecream-builder-insecure
+    fi
+}
+
 parse_upstream_version() {
     local major minor micro
     major="$(awk -F'[][]' '$2 == "icecream_version_major" {print $4; exit}' "$1")"
@@ -27,6 +36,7 @@ if ! ls -1 "$OUT_DIR"/*.deb >/dev/null 2>&1; then
     exit 1
 fi
 
+configure_apt_insecure
 apt-get update
 apt-get install -y --no-install-recommends \
     ca-certificates \

@@ -2,6 +2,22 @@ services:
   rpm:
     build:
       context: .
+      args:
+        http_proxy: ${http_proxy:-}
+        https_proxy: ${https_proxy:-}
+        no_proxy: ${no_proxy:-}
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-}
+        ICECREAM_BUILDER_INSECURE: ${ICECREAM_BUILDER_INSECURE:-}
+    environment:
+      - http_proxy
+      - https_proxy
+      - no_proxy
+      - HTTP_PROXY
+      - HTTPS_PROXY
+      - NO_PROXY
+      - ICECREAM_BUILDER_INSECURE
     volumes:
       - ../..:/src:ro
       - ./out:/out
@@ -10,9 +26,24 @@ services:
   verify:
     build:
       context: .
+      args:
+        http_proxy: ${http_proxy:-}
+        https_proxy: ${https_proxy:-}
+        no_proxy: ${no_proxy:-}
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-}
+        ICECREAM_BUILDER_INSECURE: ${ICECREAM_BUILDER_INSECURE:-}
+    environment:
+      - http_proxy
+      - https_proxy
+      - no_proxy
+      - HTTP_PROXY
+      - HTTPS_PROXY
+      - NO_PROXY
+      - ICECREAM_BUILDER_INSECURE
     volumes:
       - ../..:/src:ro
       - ./out:/out
     working_dir: /work
     command: ["/usr/local/bin/verify_rpm.sh"]
-

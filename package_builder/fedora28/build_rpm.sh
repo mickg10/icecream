@@ -8,6 +8,14 @@ WORK_DIR="${WORK_DIR:-/work}"
 mkdir -p "$WORK_DIR" "$OUT_DIR"
 cd "$WORK_DIR"
 
+dnf_cmd() {
+    if [ "${ICECREAM_BUILDER_INSECURE:-}" = "1" ] || [ "${ICECREAM_BUILDER_INSECURE:-}" = "true" ]; then
+        dnf --setopt=sslverify=0 "$@"
+    else
+        dnf "$@"
+    fi
+}
+
 write_archive_repos() {
     cat > /etc/yum.repos.d/fedora.repo <<'EOF'
 [fedora]
@@ -68,10 +76,10 @@ parse_upstream_version() {
 
 write_archive_repos
 
-dnf -y clean all
-dnf -y makecache
+dnf_cmd -y clean all
+dnf_cmd -y makecache
 
-dnf -y install \
+dnf_cmd -y install \
     asciidoc \
     ca-certificates \
     dnf-plugins-core \
@@ -98,7 +106,7 @@ UPSTREAM_VERSION="$(parse_upstream_version "$SRC_DIR/configure.ac")"
 rpmdev-setuptree
 
 cd "$WORK_DIR"
-dnf -y download --source icecream
+dnf_cmd -y download --source icecream
 
 SRPM="$(ls -1 icecream-*.src.rpm | head -n1 || true)"
 if [ -z "${SRPM:-}" ]; then
@@ -164,7 +172,7 @@ rsync -a --delete \
 
 tar -C "$STAGE" -cJf "$SOURCE0_PATH" "icecream-${UPSTREAM_VERSION}"
 
-if ! dnf -y builddep "$SPEC_PATH"; then
+if ! dnf_cmd -y builddep "$SPEC_PATH"; then
     echo "WARN: dnf builddep failed; continuing anyway" >&2
 fi
 

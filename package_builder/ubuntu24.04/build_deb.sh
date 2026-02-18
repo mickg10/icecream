@@ -15,6 +15,15 @@ export DEBFULLNAME="$DEB_NAME"
 mkdir -p "$WORK_DIR" "$OUT_DIR"
 cd "$WORK_DIR"
 
+configure_apt_insecure() {
+    if [ "${ICECREAM_BUILDER_INSECURE:-}" = "1" ] || [ "${ICECREAM_BUILDER_INSECURE:-}" = "true" ]; then
+        printf '%s\n' \
+            'Acquire::https::Verify-Peer "false";' \
+            'Acquire::https::Verify-Host "false";' \
+            > /etc/apt/apt.conf.d/99icecream-builder-insecure
+    fi
+}
+
 enable_deb_src() {
     if ls /etc/apt/sources.list.d/*.sources >/dev/null 2>&1; then
         sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/*.sources || true
@@ -43,6 +52,7 @@ parse_upstream_version() {
     fi
 }
 
+configure_apt_insecure
 apt-get update
 enable_deb_src
 apt-get update

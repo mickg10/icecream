@@ -4,6 +4,14 @@ set -euo pipefail
 SRC_DIR="${SRC_DIR:-/src}"
 OUT_DIR="${OUT_DIR:-/out}"
 
+dnf_cmd() {
+    if [ "${ICECREAM_BUILDER_INSECURE:-}" = "1" ] || [ "${ICECREAM_BUILDER_INSECURE:-}" = "true" ]; then
+        dnf --setopt=sslverify=0 "$@"
+    else
+        dnf "$@"
+    fi
+}
+
 parse_upstream_version() {
     local major minor micro
     major="$(awk -F'[][]' '$2 == "icecream_version_major" {print $4; exit}' "$1")"
@@ -25,10 +33,10 @@ if ! ls -1 "$OUT_DIR"/*.rpm >/dev/null 2>&1; then
     exit 1
 fi
 
-dnf -y clean all
-dnf -y makecache
+dnf_cmd -y clean all
+dnf_cmd -y makecache
 
-dnf -y install \
+dnf_cmd -y install \
     ca-certificates \
     findutils \
     gcc \
@@ -42,7 +50,7 @@ if [ "${#RPMS[@]}" -eq 0 ]; then
     exit 1
 fi
 
-dnf -y install "${RPMS[@]}"
+dnf_cmd -y install "${RPMS[@]}"
 
 UPSTREAM_VERSION="$(parse_upstream_version "$SRC_DIR/configure.ac")"
 
