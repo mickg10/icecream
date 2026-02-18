@@ -12,6 +12,18 @@ export DEBIAN_FRONTEND=noninteractive
 export DEBEMAIL="$DEB_EMAIL"
 export DEBFULLNAME="$DEB_NAME"
 
+normalize_proxy_env() {
+    if [ -z "${http_proxy:-}" ] && [ -n "${HTTP_PROXY:-}" ]; then
+        export http_proxy="$HTTP_PROXY"
+    fi
+    if [ -z "${https_proxy:-}" ] && [ -n "${HTTPS_PROXY:-}" ]; then
+        export https_proxy="$HTTPS_PROXY"
+    fi
+    if [ -z "${no_proxy:-}" ] && [ -n "${NO_PROXY:-}" ]; then
+        export no_proxy="$NO_PROXY"
+    fi
+}
+
 mkdir -p "$WORK_DIR" "$OUT_DIR"
 cd "$WORK_DIR"
 
@@ -52,6 +64,7 @@ parse_upstream_version() {
     fi
 }
 
+normalize_proxy_env
 configure_apt_insecure
 apt-get update
 enable_deb_src

@@ -6,6 +6,18 @@ OUT_DIR="${OUT_DIR:-/out}"
 
 export DEBIAN_FRONTEND=noninteractive
 
+normalize_proxy_env() {
+    if [ -z "${http_proxy:-}" ] && [ -n "${HTTP_PROXY:-}" ]; then
+        export http_proxy="$HTTP_PROXY"
+    fi
+    if [ -z "${https_proxy:-}" ] && [ -n "${HTTPS_PROXY:-}" ]; then
+        export https_proxy="$HTTPS_PROXY"
+    fi
+    if [ -z "${no_proxy:-}" ] && [ -n "${NO_PROXY:-}" ]; then
+        export no_proxy="$NO_PROXY"
+    fi
+}
+
 configure_apt_insecure() {
     if [ "${ICECREAM_BUILDER_INSECURE:-}" = "1" ] || [ "${ICECREAM_BUILDER_INSECURE:-}" = "true" ]; then
         printf '%s\n' \
@@ -36,6 +48,7 @@ if ! ls -1 "$OUT_DIR"/*.deb >/dev/null 2>&1; then
     exit 1
 fi
 
+normalize_proxy_env
 configure_apt_insecure
 apt-get update
 apt-get install -y --no-install-recommends \

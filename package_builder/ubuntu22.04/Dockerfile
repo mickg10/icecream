@@ -17,7 +17,10 @@ ENV http_proxy="${http_proxy}" \
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN if [ "${ICECREAM_BUILDER_INSECURE:-}" = "1" ] || [ "${ICECREAM_BUILDER_INSECURE:-}" = "true" ]; then \
+RUN if [ -z "${http_proxy}" ] && [ -n "${HTTP_PROXY}" ]; then http_proxy="${HTTP_PROXY}"; fi \
+  && if [ -z "${https_proxy}" ] && [ -n "${HTTPS_PROXY}" ]; then https_proxy="${HTTPS_PROXY}"; fi \
+  && if [ -z "${no_proxy}" ] && [ -n "${NO_PROXY}" ]; then no_proxy="${NO_PROXY}"; fi \
+  && if [ "${ICECREAM_BUILDER_INSECURE:-}" = "1" ] || [ "${ICECREAM_BUILDER_INSECURE:-}" = "true" ]; then \
         printf '%s\n' \
             'Acquire::https::Verify-Peer "false";' \
             'Acquire::https::Verify-Host "false";' \

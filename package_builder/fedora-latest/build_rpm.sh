@@ -8,6 +8,18 @@ WORK_DIR="${WORK_DIR:-/work}"
 mkdir -p "$WORK_DIR" "$OUT_DIR"
 cd "$WORK_DIR"
 
+normalize_proxy_env() {
+    if [ -z "${http_proxy:-}" ] && [ -n "${HTTP_PROXY:-}" ]; then
+        export http_proxy="$HTTP_PROXY"
+    fi
+    if [ -z "${https_proxy:-}" ] && [ -n "${HTTPS_PROXY:-}" ]; then
+        export https_proxy="$HTTPS_PROXY"
+    fi
+    if [ -z "${no_proxy:-}" ] && [ -n "${NO_PROXY:-}" ]; then
+        export no_proxy="$NO_PROXY"
+    fi
+}
+
 dnf_cmd() {
     if [ "${ICECREAM_BUILDER_INSECURE:-}" = "1" ] || [ "${ICECREAM_BUILDER_INSECURE:-}" = "true" ]; then
         dnf --setopt=sslverify=0 "$@"
@@ -32,6 +44,7 @@ parse_upstream_version() {
     fi
 }
 
+normalize_proxy_env
 dnf_cmd -y clean all
 dnf_cmd -y makecache
 
