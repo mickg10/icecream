@@ -216,7 +216,7 @@ public:
     virtual void fill_from_channel(MsgChannel *c);
     virtual void send_to_channel(MsgChannel *c) const;
 
-private:
+protected:
     Value value_;
 };
 
@@ -949,6 +949,7 @@ public:
     MonGetCSMsg()
         : GetCSMsg()
     { // overwrite
+        value_ = MON_GET_CS;
         clientid = job_id = 0;
     }
 
@@ -956,7 +957,9 @@ public:
         : GetCSMsg(Environments(), m->filename, m->lang, 1, m->target, 0, std::string(), false, m->client_count, m->niceness)
         , job_id(jobid)
         , clientid(hostid)
-    {}
+    {
+        value_ = MON_GET_CS;
+    }
 
     virtual void fill_from_channel(MsgChannel *c);
     virtual void send_to_channel(MsgChannel *c) const;
@@ -993,11 +996,15 @@ class MonJobDoneMsg : public JobDoneMsg
 public:
     MonJobDoneMsg()
         : JobDoneMsg()
-    {}
+    {
+        value_ = MON_JOB_DONE;
+    }
 
     MonJobDoneMsg(const JobDoneMsg &o)
         : JobDoneMsg(o)
-    {}
+    {
+        value_ = MON_JOB_DONE;
+    }
 };
 
 class MonLocalJobBeginMsg : public Msg
