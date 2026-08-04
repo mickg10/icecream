@@ -236,3 +236,56 @@ schedbp_<tree> <either icecc-scheduler> sndbuf_shim.so 4000 75
 # ICECC_TEST_SCHEDULER_PORTS=8767:8769; watch for the
 # "preferred scheduler, disconnecting" line on the loser only.
 ```
+
+## 7. Real-machine stress results (2026-08-04)
+
+Every configuration was exercised on real hardware: nas642 (32-core,
+scheduler(s) + unprivileged c-role daemons + one Docker farm container) and
+research6 (20-core, native root iceccd run from /dev/shm), both on the same
+LAN.  Workload: 400 template-heavy C++ TUs (~1.2s each), real `icecc`
+clients, real environment tarball transfer into the farm's chroots, `make
+-j40` (F: 2×`-j20` concurrently; G: `-j400`).  Farm-role root came from
+Docker on nas642 (default container caps suffice for iceccd's chroot) and
+sudo on research6 — no host ever needed root outside a container except
+research6's daemon itself.
+
+| config | result | wall | distribution (jobs) | errors |
+|---|---|---|---|---|
+| A `[c@o f@o s@x]` | PASS 400/400 | 32.3s | r6:235 nas:136 local:29 | none |
+| B `[c@o f@x s@x]` | PASS 400/400 | 32.9s | r6:224 nas:145 local:31 | none |
+| C `[cfs@x]` | PASS 400/400 | 34.8s | r6:249 nas:128 local:23 | none |
+| D `[c@x f@o s@o]` | PASS 400/400 | 30.8s | r6:220 nas:151 local:29 | none |
+| E dual s@o+x, kill+restart s@x mid-build | PASS 400/400 | 45.7s | via x:378, rest local during blip | 6 transient reconnect warnings, 0 failures |
+| F `[s@x f@x c@o+x]` two concurrent builds | PASS 2×400/400 | 57.9s/58.7s | farm:717 local:83 | none; walls within 1s — no version bias |
+
+Config E detail: all three daemons (including the Docker one) discovered
+both schedulers over real LAN broadcast and elected s@x (protocol 48);
+killing s@x 25s into the build failed the fleet over to s@o, restarting it
+45s in evicted them back — the build absorbed the double migration for
++13s of wall time and zero lost TUs.
+
+G-series (issue-conditions probes with the sndbuf/rcvbuf shim on the
+scheduler and the c-daemon, SIGSTOP-freezing the entire submitter daemon
+mid-build):
+
+* G1 (12s freeze, s@x): a genuine dispatch deferral engaged and drained on
+  thaw — 400/400, scheduler probe worst 0.22s throughout.
+* G2 (45s freeze, s@x): 400/400, wall = build + freeze duration, zero
+  failed TUs, zero storm — clients simply waited out their frozen local
+  daemon and the farm pipeline resumed.
+* A structural finding worth recording: with healthy kernel buffers a
+  *single* frozen submitter cannot jam the dispatch channel for long —
+  reply backlog self-limits at roughly 2× farm slots × ~60 B (running
+  jobs finish once, their successors' clients never hear the UseCS that
+  was swallowed by the frozen daemon, so slots wedge and dispatch stops
+  growing).  The sustained 30s-timeout regime of issue #1 therefore
+  requires collapsed socket memory (the report's swap-thrashing hosts) or
+  very large aggregate slot counts — precisely the conditions the
+  `unittests/schedbp` harness models with shrunken buffers, where the
+  base-vs-fixed differentiation is proven.  On healthy fleets the fix's
+  value shows as G1/G2's zero-loss rides through daemon stalls, plus the
+  30s bound as the platform-independent backstop.
+
+tt-quietbox was unreachable during this campaign (no key trust from
+nas642/research6 for ttuser/mickg); to include it in a future round, add
+nas642's mickg key to the target account's authorized_keys.

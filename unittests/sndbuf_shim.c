@@ -9,6 +9,13 @@
         kernel buffering.  Setting SO_SNDBUF explicitly also disables the
         kernel's send-buffer autotuning, keeping the jam point deterministic.
 
+    ICECC_TEST_RCVBUF=<bytes>
+        Shrinks SO_RCVBUF on every socket the preloaded process creates,
+        BEFORE it connects (so the TCP window is negotiated small).  Preload
+        into a daemon to make its scheduler connection jam realistically:
+        dispatch replies are ~60 bytes, so with default receive buffers a
+        backlog of thousands still fits and backpressure never engages.
+
     ICECC_TEST_STRIP_USER_TIMEOUT=1
         Makes setsockopt(IPPROTO_TCP, TCP_USER_TIMEOUT) a no-op.  MsgChannel
         arms a 9s TCP_USER_TIMEOUT on every TCP channel (a no-op on AF_UNIX);
@@ -83,6 +90,22 @@ int accept4(int fd, struct sockaddr *addr, socklen_t *len, int flags)
     if (!real_accept4)
         real_accept4 = must_dlsym("accept4");
     return shrink(real_accept4(fd, addr, len, flags));
+}
+
+int socket(int domain, int type, int protocol)
+{
+    static int (*real_socket)(int, int, int);
+    if (!real_socket)
+        real_socket = must_dlsym("socket");
+    int fd = real_socket(domain, type, protocol);
+    int saved_errno = errno;
+    if (fd >= 0) {
+        int bytes = env_int("ICECC_TEST_RCVBUF");
+        if (bytes > 0)
+            setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bytes, sizeof(bytes));
+    }
+    errno = saved_errno;
+    return fd;
 }
 
 int setsockopt(int fd, int level, int optname, const void *optval, socklen_t optlen)
