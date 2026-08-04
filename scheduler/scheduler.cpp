@@ -1274,10 +1274,18 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
             break;
         }
     }
+    /* The dispatch reply is sent deferrable: if the submitter daemon is slow
+       to drain its socket (its receive buffer is full because the machine is
+       busy under a highly parallel build), the message stays queued in the
+       channel's write buffer and is flushed from the main loop once poll()
+       reports the socket writable again (see has_pending_write() there).
+       This must not block, and transient backpressure must not tear down the
+       submitter with all its in-flight jobs -- send_msg() only returns false
+       here if the connection is genuinely dead.  */
     if(IS_PROTOCOL_VERSION(37, job->submitter()) && use_cs == job->submitter())
     {
         NoCSMsg m2(job->id(), job->localClientId());
-        if (!job->submitter()->send_msg(m2)) {
+        if (!job->submitter()->send_msg(m2, MsgChannel::SendNonBlocking | MsgChannel::SendDeferrable)) {
             trace() << "failed to deliver job " << job->id() << endl;
             handle_end(job->submitter(), nullptr);   // will care for the rest
             return true;
@@ -1287,7 +1295,7 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
     {
         UseCSMsg m2(host_platform, use_cs->name, use_cs->remotePort(), job->id(),
                 gotit, job->localClientId(), matched_job_id);
-        if (!job->submitter()->send_msg(m2)) {
+        if (!job->submitter()->send_msg(m2, MsgChannel::SendNonBlocking | MsgChannel::SendDeferrable)) {
             trace() << "failed to deliver job " << job->id() << endl;
             handle_end(job->submitter(), nullptr);   // will care for the rest
             return true;
@@ -2579,6 +2587,14 @@ int main(int argc, char *argv[])
             if (ok) {
                 pfd.fd = i;
                 pfd.events = POLLIN;
+
+                /* Dispatch replies queued by a deferrable send while the
+                   daemon's receive buffer was full; ask poll() to tell us when
+                   they can be flushed.  */
+                if (cs->has_pending_write()) {
+                    pfd.events |= POLLOUT;
+                }
+
                 pollfds.push_back( pfd );
             }
         }
@@ -2735,14 +2751,32 @@ int main(int argc, char *argv[])
                invalid.  */
             ++it;
 
-            if (pollfd_is_set(pollfds, i, POLLIN)) {
+            const bool can_write = pollfd_is_set(pollfds, i, POLLOUT);
+            const bool can_read = pollfd_is_set(pollfds, i, POLLIN);
+
+            if (can_write || can_read) {
+                /* poll() counts a file descriptor once, however many of its
+                   events fired.  */
+                active_fds--;
+            }
+
+            if (can_write) {
+                /* Flush dispatch replies that were queued while the daemon's
+                   receive buffer was full.  If this fails the connection is
+                   genuinely dead, so tear the daemon down like any other dead
+                   channel.  */
+                if (!cs->flush_pending()) {
+                    handle_end(cs, nullptr);
+                    continue;    // cs is deleted now
+                }
+            }
+
+            if (can_read) {
                 while (!cs->read_a_bit() || cs->has_msg()) {
                     if (!handle_activity(cs)) {
                         break;
                     }
                 }
-
-                active_fds--;
             }
         }
 

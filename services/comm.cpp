@@ -251,7 +251,7 @@ bool MsgChannel::update_state()
 
                 writefull(vers, 4);
 
-                if (!flush_writebuf(true)) {
+                if (!flush_writebuf(SendBlocking)) {
                     set_error();
                     return false;
                 }
@@ -388,8 +388,10 @@ static size_t get_max_write_size()
     return MAX_MSG_SIZE;
 }
 
-bool MsgChannel::flush_writebuf(bool blocking)
+bool MsgChannel::flush_writebuf(int send_flags)
 {
+    const bool blocking = send_flags & SendBlocking;
+    const bool deferrable = send_flags & SendDeferrable;
     const char *buf = msgbuf + msgofs;
     bool error = false;
 
@@ -413,33 +415,45 @@ bool MsgChannel::flush_writebuf(bool blocking)
                 continue;
             }
 
-            /* If we want to write blocking, but couldn't write anything,
-               select on the fd.  */
-            if (blocking && ( send_errno == EAGAIN || send_errno == ENOTCONN || send_errno == EWOULDBLOCK )) {
-                int ready;
+            if (send_errno == EAGAIN || send_errno == ENOTCONN || send_errno == EWOULDBLOCK) {
+                /* The peer's receive buffer is full; that is backpressure, not
+                   a dead connection.  A deferrable non-blocking send keeps the
+                   remaining bytes queued for a later flush_pending().  */
+                if (!blocking) {
+                    if (deferrable) {
+                        break;
+                    }
+                } else {
+                    /* If we want to write blocking, but couldn't write anything,
+                       select on the fd.  */
+                    int ready;
 
-                for (;;) {
-                    pollfd pfd;
-                    pfd.fd = fd;
-                    pfd.events = POLLOUT;
-                    ready = poll(&pfd, 1, 30 * 1000);
+                    for (;;) {
+                        pollfd pfd;
+                        pfd.fd = fd;
+                        pfd.events = POLLOUT;
+                        ready = poll(&pfd, 1, 30 * 1000);
 
-                    if (ready < 0 && errno == EINTR) {
-                        continue;
+                        if (ready < 0 && errno == EINTR) {
+                            continue;
+                        }
+
+                        break;
                     }
 
-                    break;
-                }
+                    /* socket ready now for writing ? */
+                    if (ready > 0) {
+                        continue;
+                    }
+                    if (ready == 0) {
+                        if (deferrable) {
+                            break;
+                        }
+                        log_error() << "timed out while trying to send data" << endl;
+                    }
 
-                /* socket ready now for writing ? */
-                if (ready > 0) {
-                    continue;
+                    /* Timeout or real error --> error.  */
                 }
-                if (ready == 0) {
-                    log_error() << "timed out while trying to send data" << endl;
-                }
-
-                /* Timeout or real error --> error.  */
             }
 
             errno = send_errno;
@@ -456,13 +470,36 @@ bool MsgChannel::flush_writebuf(bool blocking)
         buf += ret;
     }
 
+    /* Compact the buffer unconditionally: writefull() and send_msg() append
+       new data at msgbuf + msgtogo and patch message length fields at the same
+       offset, which is only correct when the pending bytes start at the
+       beginning of the buffer.  With deferrable sends the channel stays alive
+       while bytes are still queued, so the invariant must be restored on every
+       exit, not only in the cases chop_output() covers.  */
     msgofs = buf - msgbuf;
-    chop_output();
+    if (msgtogo && msgofs) {
+        memmove(msgbuf, msgbuf + msgofs, msgtogo);
+    }
+    msgofs = 0;
+
     if(error) {
         set_error();
         return false;
     }
     return true;
+}
+
+bool MsgChannel::flush_pending(void)
+{
+    if (instate == ERROR) {
+        return false;
+    }
+
+    if (!msgtogo) {
+        return true;
+    }
+
+    return flush_writebuf(SendNonBlocking | SendDeferrable);
 }
 
 MsgChannel &MsgChannel::operator>>(uint32_t &buf)
@@ -1042,7 +1079,7 @@ MsgChannel::MsgChannel(int _fd, struct sockaddr *_a, socklen_t _l, bool text)
         //writeuint32 ((uint32_t) PROTOCOL_VERSION);
         writefull(vers, 4);
 
-        if (!flush_writebuf(true)) {
+        if (!flush_writebuf(SendBlocking)) {
             protocol = 0;    // unusable
             set_error();
         }
@@ -1377,7 +1414,7 @@ bool MsgChannel::send_msg(const Msg &m, int flags)
         return true;
     }
 
-    return flush_writebuf((flags & SendBlocking));
+    return flush_writebuf(flags);
 }
 
 static int get_second_port_for_debug( int port )
