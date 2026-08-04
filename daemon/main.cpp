@@ -461,7 +461,9 @@ public:
         timing_exec_msec = 0;
         timing_scheduler_job_id = 0;
         timing_compile_job_id = 0;
+        timing_exitcode = 0;
         has_timing = false;
+        has_timing_exitcode = false;
         local_preprocess = false;
         running_preprocess = false;
         job_id = 0;
@@ -571,7 +573,9 @@ public:
     uint32_t timing_exec_msec;
     uint32_t timing_scheduler_job_id;
     uint32_t timing_compile_job_id;
+    int timing_exitcode;
     bool has_timing;
+    bool has_timing_exitcode;
     string timing_mode;
     bool local_preprocess;
     bool running_preprocess;
@@ -824,6 +828,10 @@ const int min_mem_limit = 100;
 unsigned int max_kids = 0;
 unsigned int max_preprocess_kids = 0;
 unsigned int preprocess_active_processes = 0;
+// number of running whole-node (fulljob) local jobs; while nonzero the
+// preprocess lane is closed (the compile lane is closed by the fulljob's
+// full slot reservation)
+unsigned int fulljob_active = 0;
 const size_t insights_graph_minutes = 100;
 const size_t insights_retention_minutes = 120;
 
@@ -854,7 +862,12 @@ struct JobHistoryEntry {
     uint64_t end_msec;
     uint64_t duration_msec;
     int client_id;
+    // Compiler exit status when the client reported one via JobTimingMsg,
+    // otherwise the daemon teardown code (see end_code).
     int exitcode;
+    // Daemon-side teardown code (118 close / 119 EndMsg / ...), kept as a
+    // transport diagnostic distinct from the compiler result.
+    int end_code;
     uint32_t scheduler_job_id;
     uint32_t compile_job_id;
     string final_status;
@@ -913,10 +926,24 @@ struct WebConnection {
     int fd;
     string inbuf;
     string outbuf;
+    size_t outbuf_ofs;            // bytes of outbuf already written (offset drain)
     bool close_after_write;
+    bool response_started;        // first response byte hit the socket
+    bool reject_input;            // terminal condition (413): stop reading
     uint64_t created_msec;
-    WebConnection() : fd(-1), close_after_write(true), created_msec(0) {}
+    uint64_t last_activity_msec;  // last successful read/write progress
+    WebConnection() : fd(-1), outbuf_ofs(0), close_after_write(true),
+                      response_started(false), reject_input(false),
+                      created_msec(0), last_activity_msec(0) {}
 };
+
+// Availability limits for the trusted-network web GUI: a small connection
+// cap, an idle deadline, and a hard lifetime.  These bound the fd/memory
+// share one misbehaving or forgotten client can take from the single
+// event loop.
+static const size_t web_max_connections = 64;
+static const uint64_t web_idle_deadline_msec = 30 * 1000;
+static const uint64_t web_lifetime_deadline_msec = 300 * 1000;
 
 struct Daemon {
     Clients clients;
@@ -986,6 +1013,7 @@ struct Daemon {
     bool webgui_best_effort;
     int web_listen_fd;
     map<int, WebConnection> web_connections;
+    uint64_t web_accept_backoff_until_msec = 0;
     size_t job_history_capacity;
     uint64_t next_job_history_seq;
     deque<JobHistoryEntry> job_history;
@@ -1444,8 +1472,12 @@ void Daemon::note_accept_error(const char *where, int err)
 
     static uint64_t last_log_msec = 0;
     const uint64_t now_msec = monotonic_msec();
-    const bool force_log = (err == EMFILE || err == ENFILE);
-    if (!force_log && now_msec - last_log_msec < 5000) {
+    /* EMFILE/ENFILE get a tighter window rather than an exemption: under fd
+       exhaustion this path can run every loop iteration, and the fd
+       snapshot + log line below are exactly the kind of work a starved
+       daemon cannot afford at that rate.  Counters above stay exact.  */
+    const uint64_t window_msec = (err == EMFILE || err == ENFILE) ? 1000 : 5000;
+    if (now_msec - last_log_msec < window_msec) {
         return;
     }
     last_log_msec = now_msec;
@@ -1470,6 +1502,15 @@ void Daemon::queue_web_response(int fd, int status_code, const char *status_text
         return;
     }
 
+    if (it->second.response_started
+            && it->second.outbuf_ofs < it->second.outbuf.size()) {
+        /* Part of an earlier response is already on the wire; replacing the
+           rest would splice two HTTP responses into one stream.  The
+           connection is unrecoverable -- drop it.  */
+        drop_web_connection(fd);
+        return;
+    }
+
     ostringstream out;
     out << "HTTP/1.1 " << status_code << " " << status_text << "\r\n";
     out << "Content-Type: " << content_type << "\r\n";
@@ -1480,6 +1521,8 @@ void Daemon::queue_web_response(int fd, int status_code, const char *status_text
     out << body;
 
     it->second.outbuf = out.str();
+    it->second.outbuf_ofs = 0;
+    it->second.response_started = false;
     it->second.close_after_write = true;
 }
 
@@ -2995,6 +3038,13 @@ static void finalize_job_timing(JobHistoryEntry *entry, const Client *client)
 
 void Daemon::remember_finished_job(const Client *client, int exitcode)
 {
+    /* History and insight buckets exist to serve the web GUI, the JSONL
+       stream, and the periodic state dump.  A daemon with none of those
+       enabled must not pay their memory cost (the 20k-entry deque retains
+       command lines, channels and paths -- tens of MB on busy submitters).  */
+    if (!webgui_enabled && state_jsonl_path.empty() && !state_dump_log) {
+        return;
+    }
     if (!should_track_client_job(client)) {
         return;
     }
@@ -3007,7 +3057,12 @@ void Daemon::remember_finished_job(const Client *client, int exitcode)
     entry.end_msec = monotonic_msec();
     entry.duration_msec = entry.end_msec >= entry.start_msec ? (entry.end_msec - entry.start_msec) : 0;
     entry.client_id = client->client_id;
-    entry.exitcode = exitcode;
+    /* Prefer the compiler's real exit status reported via JobTimingMsg; the
+       daemon-side teardown code (118/119/...) is kept separately in
+       end_code as a transport diagnostic.  */
+    entry.exitcode = (client->has_timing && client->has_timing_exitcode)
+        ? client->timing_exitcode : exitcode;
+    entry.end_code = exitcode;
     entry.scheduler_job_id = client->last_known_job_id;
     entry.compile_job_id = client->job ? client->job->jobID() : 0;
     entry.final_status = Client::status_str(client->status);
@@ -3054,6 +3109,7 @@ void Daemon::remember_finished_job(const Client *client, int exitcode)
         o << "\"scheduler_job_id\":" << entry.scheduler_job_id << ",";
         o << "\"compile_job_id\":" << entry.compile_job_id << ",";
         o << "\"exitcode\":" << entry.exitcode << ",";
+        o << "\"end_code\":" << entry.end_code << ",";
         o << "\"final_status\":\"" << json_escape(entry.final_status) << "\",";
         o << "\"final_why\":\"" << json_escape(entry.final_why) << "\",";
         o << "\"mode\":\"" << json_escape(entry.client_mode) << "\",";
@@ -3106,6 +3162,7 @@ string Daemon::dump_job_history_json(size_t limit) const
         o << "\"end_msec\":" << (unsigned long long)entry.end_msec << ",";
         o << "\"duration_msec\":" << (unsigned long long)entry.duration_msec << ",";
         o << "\"exitcode\":" << entry.exitcode << ",";
+        o << "\"end_code\":" << entry.end_code << ",";
         o << "\"scheduler_job_id\":" << entry.scheduler_job_id << ",";
         o << "\"compile_job_id\":" << entry.compile_job_id << ",";
         o << "\"final_status\":\"" << json_escape(entry.final_status) << "\",";
@@ -3348,6 +3405,7 @@ string Daemon::dump_insights_jobs_json(time_t minute_ts, size_t limit)
             o << "\"end_ts\":" << (long long)entry.end_ts << ",";
             o << "\"duration_msec\":" << (unsigned long long)entry.duration_msec << ",";
             o << "\"exitcode\":" << entry.exitcode << ",";
+        o << "\"end_code\":" << entry.end_code << ",";
             o << "\"final_status\":\"" << json_escape(entry.final_status) << "\",";
             o << "\"final_why\":\"" << json_escape(entry.final_why) << "\",";
             o << "\"scheduler_job_id\":" << entry.scheduler_job_id << ",";
@@ -3389,8 +3447,25 @@ void Daemon::handle_web_accept()
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
                 return;
             }
+            if (errno == EMFILE || errno == ENFILE) {
+                /* A level-triggered listener with no fd available would spin
+                   the loop at 100% CPU; disarm accepting briefly.  */
+                web_accept_backoff_until_msec = monotonic_msec() + 1000;
+            }
             note_accept_error("webgui", errno);
             return;
+        }
+
+        if (web_connections.size() >= web_max_connections) {
+            /* Best-effort refusal; the GUI is a diagnostic tool, compile
+               traffic must keep the fd budget.  */
+            static const char refuse[] =
+                "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n"
+                "Content-Length: 0\r\n\r\n";
+            ssize_t unused = write(fd, refuse, sizeof(refuse) - 1);
+            (void)unused;
+            close(fd);
+            continue;
         }
 
         int flags = fcntl(fd, F_GETFL, 0);
@@ -3402,6 +3477,7 @@ void Daemon::handle_web_accept()
         WebConnection conn;
         conn.fd = fd;
         conn.created_msec = monotonic_msec();
+        conn.last_activity_msec = conn.created_msec;
         web_connections[fd] = conn;
     }
 }
@@ -3420,13 +3496,19 @@ void Daemon::handle_web_connection(int fd, short revents)
 
     WebConnection &conn = it->second;
 
-    if (revents & POLLIN) {
+    if ((revents & POLLIN) && !conn.reject_input) {
         for (;;) {
             char buf[4096];
             ssize_t n = read(fd, buf, sizeof(buf));
             if (n > 0) {
+                conn.last_activity_msec = monotonic_msec();
                 conn.inbuf.append(buf, n);
                 if (conn.inbuf.size() > 64 * 1024) {
+                    /* Terminal: stop reading for good and free the input;
+                       the connection only lives to drain the 413.  */
+                    conn.reject_input = true;
+                    conn.inbuf.clear();
+                    conn.inbuf.shrink_to_fit();
                     queue_web_response(fd, 413, "Payload Too Large", "text/plain; charset=utf-8",
                                        "request too large\n");
                     break;
@@ -3444,7 +3526,11 @@ void Daemon::handle_web_connection(int fd, short revents)
             return;
         }
 
-        if (conn.outbuf.empty() && conn.inbuf.find("\r\n\r\n") != string::npos) {
+        /* The request-line parser accepts bare-LF lines, so the terminator
+           check must too, or such a request idles until the deadline.  */
+        if (conn.outbuf.empty() && !conn.reject_input
+                && (conn.inbuf.find("\r\n\r\n") != string::npos
+                    || conn.inbuf.find("\n\n") != string::npos)) {
             string method;
             string path;
             if (!parse_http_request(conn.inbuf, method, path)) {
@@ -3496,11 +3582,16 @@ void Daemon::handle_web_connection(int fd, short revents)
         }
     }
 
-    if ((revents & POLLOUT) && !conn.outbuf.empty()) {
-        while (!conn.outbuf.empty()) {
-            ssize_t n = write(fd, conn.outbuf.data(), conn.outbuf.size());
+    if ((revents & POLLOUT) && conn.outbuf_ofs < conn.outbuf.size()) {
+        while (conn.outbuf_ofs < conn.outbuf.size()) {
+            ssize_t n = write(fd, conn.outbuf.data() + conn.outbuf_ofs,
+                              conn.outbuf.size() - conn.outbuf_ofs);
             if (n > 0) {
-                conn.outbuf.erase(0, n);
+                /* Offset drain: repeated front-erases made large responses
+                   quadratic in memory traffic.  */
+                conn.outbuf_ofs += n;
+                conn.response_started = true;
+                conn.last_activity_msec = monotonic_msec();
                 continue;
             }
             if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
@@ -3510,9 +3601,14 @@ void Daemon::handle_web_connection(int fd, short revents)
             return;
         }
 
-        if (conn.outbuf.empty() && conn.close_after_write) {
-            drop_web_connection(fd);
-            return;
+        if (conn.outbuf_ofs >= conn.outbuf.size()) {
+            conn.outbuf.clear();
+            conn.outbuf.shrink_to_fit();
+            conn.outbuf_ofs = 0;
+            if (conn.close_after_write) {
+                drop_web_connection(fd);
+                return;
+            }
         }
     }
 }
@@ -4933,6 +5029,9 @@ bool Daemon::handle_job_done(Client *cl, JobDoneMsg *m)
             cl->running_preprocess = false;
         } else if(cl->fulljob) {
             clients.active_processes -= std::max((unsigned int)1, max_kids);
+            if (fulljob_active > 0) {
+                --fulljob_active;
+            }
         } else {
             clients.active_processes--;
         }
@@ -4969,23 +5068,51 @@ void Daemon::handle_old_request()
             break;
         }
 
+        /* Select the next LINKJOB strictly by (niceness, client_id): the
+           previous conjunction required BOTH a lower id and strictly lower
+           niceness, so equal-priority jobs could never displace the first
+           map-iteration candidate (pointer order, not FIFO) and a
+           higher-priority later-id job was rejected outright.
+
+           fulljob semantics: a fulljob reserves the ENTIRE node.  It starts
+           only when both lanes are idle, and while one is waiting at the
+           head of the queue nothing else is admitted (a drain barrier --
+           otherwise a stream of small jobs would starve it forever, or
+           preprocess work would overlap the very link step whose isolation
+           fulljob promises).  While it runs, the compile lane is blocked by
+           its full reservation and the preprocess lane by fulljob_active.  */
         Client *client = nullptr;
-        int min_client_id = 0;
-        uint32_t min_niceness = std::numeric_limits<uint32_t>::max();
+        bool best_is_admissible = false;
         for (const auto &it : clients) {
             Client *candidate = it.second;
             if (candidate->status != Client::LINKJOB) {
                 continue;
             }
-            const bool preprocess_job = candidate->local_preprocess && !candidate->fulljob;
-            if ((preprocess_job && !preprocess_capacity) || (!preprocess_job && !compile_capacity)) {
-                continue;
-            }
-            if ((!min_client_id || min_client_id > candidate->client_id)
-                && candidate->niceness < min_niceness) {
+            if (client == nullptr
+                || candidate->niceness < client->niceness
+                || (candidate->niceness == client->niceness
+                    && candidate->client_id < client->client_id)) {
                 client = candidate;
-                min_client_id = candidate->client_id;
-                min_niceness = candidate->niceness;
+            }
+        }
+        if (client) {
+            const bool preprocess_job = client->local_preprocess && !client->fulljob;
+            if (client->fulljob) {
+                best_is_admissible = (current_kids + clients.active_processes) == 0
+                                     && preprocess_active_processes == 0
+                                     && fulljob_active == 0;
+                if (!best_is_admissible) {
+                    /* Drain barrier: hold every admission path until the
+                       node is empty for the waiting fulljob.  */
+                    break;
+                }
+            } else if (preprocess_job) {
+                best_is_admissible = preprocess_capacity && fulljob_active == 0;
+            } else {
+                best_is_admissible = compile_capacity && fulljob_active == 0;
+            }
+            if (!best_is_admissible) {
+                client = nullptr;
             }
         }
 
@@ -5005,6 +5132,7 @@ void Daemon::handle_old_request()
                 } else if (client->fulljob) { // reserve the entire node
                     client->running_preprocess = false;
                     clients.active_processes += compile_limit;
+                    ++fulljob_active;
                     trace() << "pushed full local job " << client->client_id << endl;
                 } else {
                     client->running_preprocess = false;
@@ -5206,6 +5334,9 @@ void Daemon::handle_end(Client *client, int exitcode)
             client->running_preprocess = false;
         } else if(client->fulljob) {
             clients.active_processes -= std::max((unsigned int)1, max_kids);
+            if (fulljob_active > 0) {
+                --fulljob_active;
+            }
         } else {
             clients.active_processes--;
         }
@@ -5387,7 +5518,12 @@ bool Daemon::handle_job_timing(Client *client, JobTimingMsg *m)
     client->timing_scheduler_job_id = m->scheduler_job_id;
     client->timing_compile_job_id = m->compile_job_id;
     client->timing_mode = m->mode;
+    /* The compiler's real exit status.  Without it, history records only
+       the daemon's teardown code (118 on close, 119 on EndMsg), which made
+       every submitter-side job look like a failure in the telemetry.  */
+    client->timing_exitcode = m->exitcode;
     client->has_timing = true;
+    client->has_timing_exitcode = true;
     if (m->scheduler_job_id) {
         client->last_known_job_id = m->scheduler_job_id;
     }
@@ -5505,17 +5641,37 @@ void Daemon::answer_client_requests()
     pfd.events = POLLIN;
     pollfds.push_back(pfd);
 
-    if (web_listen_fd != -1) {
+    if (web_listen_fd != -1
+            && monotonic_msec() >= web_accept_backoff_until_msec) {
         pfd.fd = web_listen_fd;
         pfd.events = POLLIN;
         pollfds.push_back(pfd);
     }
 
+    /* Reap web connections that exceeded their idle or lifetime deadline
+       BEFORE registering them; poll_timeout is capped below so a silent
+       socket cannot postpone this forever.  */
+    {
+        const uint64_t now_msec = monotonic_msec();
+        for (auto it = web_connections.begin(); it != web_connections.end();) {
+            const WebConnection &wc = it->second;
+            const int wfd = it->first;
+            ++it;
+            if (now_msec - wc.last_activity_msec > web_idle_deadline_msec
+                    || now_msec - wc.created_msec > web_lifetime_deadline_msec) {
+                drop_web_connection(wfd);
+            }
+        }
+    }
+
     for (const auto &it : web_connections) {
         pfd.fd = it.first;
-        pfd.events = POLLIN;
-        if (!it.second.outbuf.empty()) {
+        pfd.events = it.second.reject_input ? 0 : POLLIN;
+        if (it.second.outbuf_ofs < it.second.outbuf.size()) {
             pfd.events |= POLLOUT;
+        }
+        if (!pfd.events) {
+            pfd.events = POLLOUT;   // 413 drain in flight; wake on writable
         }
         pollfds.push_back(pfd);
     }
@@ -5588,6 +5744,14 @@ void Daemon::answer_client_requests()
             if (to_dump_msec < uint64_t(poll_timeout_msec)) {
                 poll_timeout_msec = int(to_dump_msec);
             }
+        }
+    }
+
+    if (!web_connections.empty() || web_accept_backoff_until_msec > monotonic_msec()) {
+        /* Deadline reaping and accept re-arming must run even if every web
+           socket stays silent.  */
+        if (poll_timeout_msec < 0 || poll_timeout_msec > 1000) {
+            poll_timeout_msec = 1000;
         }
     }
 
@@ -6169,7 +6333,12 @@ int main(int argc, char **argv)
     setup_debug(debug_level, logfile);
 
     const char *web_hostport_env = getenv("ICECC_WEB_HOSTPORT");
-    if (web_hostport_env && *web_hostport_env) {
+    if (web_hostport_env && *web_hostport_env && d.webgui_enabled) {
+        /* Explicit command-line configuration wins; the environment is a
+           deployment convenience, not an override.  */
+        log_info() << "ICECC_WEB_HOSTPORT ignored: web gui already configured "
+                   << "on the command line (" << d.webgui_addr << ":" << d.webgui_port << ")" << endl;
+    } else if (web_hostport_env && *web_hostport_env) {
         d.webgui_best_effort = true;
 
         const string web_hostport(web_hostport_env);
@@ -6186,7 +6355,10 @@ int main(int argc, char **argv)
         }
 
         if (web_host.empty()) {
-            web_host = "0.0.0.0";
+            /* Same meaning as everywhere else: an empty host inherits the
+               default bind address (loopback), it does not silently widen
+               to all interfaces.  */
+            web_host = d.webgui_addr;
         } else if (web_host == "localhost") {
             web_host = "127.0.0.1";
         }
@@ -6201,6 +6373,8 @@ int main(int argc, char **argv)
             d.webgui_enabled = true;
             d.webgui_addr = web_host;
             d.webgui_port = int(web_port_long);
+            log_info() << "web gui configured from ICECC_WEB_HOSTPORT ("
+                       << d.webgui_addr << ":" << d.webgui_port << ")" << endl;
         }
     }
 
@@ -6246,10 +6420,12 @@ int main(int argc, char **argv)
     if (max_preprocess_processes > 0) {
         max_preprocess_kids = (unsigned int)max_preprocess_processes;
     } else {
-        const uint64_t default_preprocess = uint64_t(std::max((unsigned int)1, max_kids)) * 8ULL;
-        max_preprocess_kids = (default_preprocess > uint64_t(std::numeric_limits<unsigned int>::max()))
-                              ? std::numeric_limits<unsigned int>::max()
-                              : (unsigned int)default_preprocess;
+        /* Default the preprocess lane to compile capacity.  The earlier
+           8x default allowed e.g. 512 concurrent cpp processes on a 64-core
+           host; niceness only shields CPU, not resident memory, page cache,
+           fds, or temp-file pressure.  Operators who profiled their
+           preprocess load can raise this explicitly via --max-preprocess.  */
+        max_preprocess_kids = std::max((unsigned int)1, max_kids);
     }
 
     log_info() << "allowing up to " << max_kids << " active compile jobs and "

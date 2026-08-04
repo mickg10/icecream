@@ -119,12 +119,24 @@ static std::string format_command_line(int argc, char **argv)
         return std::string();
     }
 
+    /* This string rides inside GetCSMsg/JobLocalBeginMsg as observability
+       payload.  MsgChannel rejects any message above 1 MiB and poisons the
+       channel, so an expanded @response-file command line must never be
+       allowed to make an otherwise valid compile undeliverable -- cap it
+       well below the wire limit (the daemon display path truncates to 4 KiB
+       anyway).  */
+    static const size_t max_summary_bytes = 8 * 1024;
     std::string out;
     for (int i = 0; i < argc; ++i) {
         if (i) {
             out += ' ';
         }
         out += shell_quote_arg(argv[i] ? std::string(argv[i]) : std::string());
+        if (out.size() > max_summary_bytes) {
+            out.resize(max_summary_bytes);
+            out += " ...[truncated]";
+            break;
+        }
     }
     return out;
 }
