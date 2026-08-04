@@ -12,10 +12,15 @@
       - ICECC_MSGCHANNEL_HAS_DEFERRED_SEND (defined by comm.h on the fixed
         branch): dispatch sends use SendNonBlocking|SendDeferrable and the
         pending buffer is drained with flush_pending().
-      - ICECC_TEST_FIXBRANCH (passed by the test driver when building against
-        fix/submitter-requeue-on-transient-timeout): dispatch sends use the
-        blocking path; on transient failure the branch's prescribed recovery
-        is clear_writebuf() + re-send of a fresh dispatch message.
+      - ICECC_TEST_FIXBRANCH: only meaningful when this source is compiled
+        against the fix/submitter-requeue-on-transient-timeout branch's
+        libicecc (whose MsgChannel has clear_writebuf()); it selects that
+        branch's prescribed recovery -- clear_writebuf() + re-send of a fresh
+        dispatch message after the blocking-send timeout.  Defining it while
+        building against any other branch is a compile error by design.
+        Cross-branch red run:
+          g++ -std=c++17 -DICECC_TEST_FIXBRANCH -I<thatbranch>/services \
+              backpressure.cpp <thatbranch>/services/.libs/libicecc.a ...
       - otherwise (base): plain blocking send, no recovery API.
 
     Every variant is checked against the same assertions.  Exit code 0 on
@@ -31,8 +36,11 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <string>
 #include <thread>
 #include <vector>
@@ -68,6 +76,21 @@ static ChannelPair make_channel_pair(int sndbuf_bytes)
     if (sndbuf_bytes > 0) {
         setsockopt(fds[0], SOL_SOCKET, SO_SNDBUF, &sndbuf_bytes, sizeof(sndbuf_bytes));
         setsockopt(fds[1], SOL_SOCKET, SO_RCVBUF, &sndbuf_bytes, sizeof(sndbuf_bytes));
+        // The clog scenarios need the kernel to actually honour small
+        // buffers; if it will not (non-Linux AF_UNIX accounting, clamping),
+        // a 64KiB send would complete and every jam-dependent assertion
+        // would be a false red.  Skip (automake exit 77) instead.
+        int eff_snd = 0, eff_rcv = 0;
+        socklen_t l = sizeof(eff_snd);
+        getsockopt(fds[0], SOL_SOCKET, SO_SNDBUF, &eff_snd, &l);
+        l = sizeof(eff_rcv);
+        getsockopt(fds[1], SOL_SOCKET, SO_RCVBUF, &eff_rcv, &l);
+        if (eff_snd + eff_rcv > 16 * sndbuf_bytes) {
+            fprintf(stderr, "SKIP     - cannot shrink socket buffers "
+                    "(effective %d+%d bytes); backpressure untestable here\n",
+                    eff_snd, eff_rcv);
+            exit(77);
+        }
     }
 
     struct sockaddr_un sa;
@@ -115,9 +138,6 @@ static DrainResult drain_receiver(MsgChannel *rcv, const std::string &big_payloa
             if (rcv->at_eof()) {
                 r.seen.push_back("<eof>");
                 break;
-            }
-            if (r.got_use_cs) {
-                break;    // everything we were waiting for arrived
             }
             continue;     // maybe just a timeout, keep waiting until deadline
         }
@@ -178,6 +198,8 @@ static void test_contract()
 
     if (p.snd->at_eof()) {
         fprintf(stderr, "# channel poisoned; skipping delivery phase (it cannot pass)\n");
+        delete p.snd;
+        delete p.rcv;
         return;
     }
 
@@ -187,24 +209,26 @@ static void test_contract()
     p.snd->clear_writebuf();
 #endif
 
-    // Peer starts draining now.
-    std::atomic<bool> sender_done{false};
+    // Peer starts draining now.  All flush loops are deadline-bounded so a
+    // wedged receiver turns into a failed assertion, not a hung make check.
     std::thread sender([&] {
 #if defined(ICECC_MSGCHANNEL_HAS_DEFERRED_SEND)
+        time_t deadline = time(nullptr) + 30;
         // finish the queued big message, then dispatch USE_CS the same way
-        while (p.snd->has_pending_write() && p.snd->flush_pending()) {
+        while (p.snd->has_pending_write() && p.snd->flush_pending()
+               && time(nullptr) < deadline) {
             usleep(2000);
         }
         bool ok = p.snd->send_msg(UseCSMsg("x86_64", kUseCsHost, kUseCsPort, kJobId, true, 1, 0),
                                   MsgChannel::SendNonBlocking | MsgChannel::SendDeferrable);
-        while (ok && p.snd->has_pending_write() && p.snd->flush_pending()) {
+        while (ok && p.snd->has_pending_write() && p.snd->flush_pending()
+               && time(nullptr) < deadline) {
             usleep(2000);
         }
 #else
         // blocking re-dispatch; completes as the peer drains
         p.snd->send_msg(UseCSMsg("x86_64", kUseCsHost, kUseCsPort, kJobId, true, 1, 0));
 #endif
-        sender_done = true;
     });
 
     DrainResult r = drain_receiver(p.rcv, big, 20);
@@ -232,6 +256,161 @@ static void test_contract()
     delete p.rcv;
 }
 
+#if defined(ICECC_MSGCHANNEL_HAS_DEFERRED_SEND)
+// The production pattern empty_queue() relies on: many messages appended to a
+// write buffer that already holds deferred bytes, then drained.  Ordering and
+// intactness after the drain are the observable proxy for the msgofs == 0
+// compaction invariant in flush_writebuf() and for send_msg()/flush_pending()
+// interleaving.
+static void test_multiqueue()
+{
+    ChannelPair p = make_channel_pair(8 * 1024);
+
+    REQUIRE(p.snd->send_msg(PingMsg()), "handshake ping sent");
+    Msg *m = p.rcv->get_msg(10);
+    REQUIRE(m && *m == Msg::PING, "handshake ping received");
+    delete m;
+
+    // Jam the channel with one message bigger than the socket buffers...
+    const std::string big(32 * 1024, 'a');
+    REQUIRE(p.snd->send_msg(StatusTextMsg(big),
+                            MsgChannel::SendNonBlocking | MsgChannel::SendDeferrable),
+            "initial big send accepted");
+    REQUIRE(p.snd->has_pending_write(), "big message left pending bytes");
+
+    // ...then append a stream of distinct messages behind it, the way the
+    // scheduler keeps dispatching UseCS replies to a clogged submitter.
+    const int kFollowers = 20;
+    bool all_queued = true;
+    for (int i = 0; i < kFollowers; ++i) {
+        std::string payload = "follower-" + std::to_string(i)
+                              + "-" + std::string(64 + i, 'b');
+        if (!p.snd->send_msg(StatusTextMsg(payload),
+                             MsgChannel::SendNonBlocking | MsgChannel::SendDeferrable)) {
+            all_queued = false;
+        }
+    }
+    REQUIRE(all_queued, "all follower sends accepted while clogged");
+    REQUIRE(!p.snd->at_eof(), "channel alive with a deep pending queue");
+
+    // Drain: flush pending from one side, read everything on the other.
+    std::atomic<bool> flush_ok{true};
+    std::thread sender([&] {
+        time_t deadline = time(nullptr) + 30;
+        while (p.snd->has_pending_write() && time(nullptr) < deadline) {
+            if (!p.snd->flush_pending()) {
+                flush_ok = false;
+                return;
+            }
+            usleep(2000);
+        }
+    });
+
+    int followers_in_order = 0;
+    bool big_intact = false;
+    int expected = 0;
+    time_t start = time(nullptr);
+    while (expected < kFollowers && time(nullptr) - start <= 20) {
+        Msg *got = p.rcv->get_msg(2, true);
+        if (!got) {
+            if (p.rcv->at_eof()) {
+                break;
+            }
+            continue;
+        }
+        StatusTextMsg *st = dynamic_cast<StatusTextMsg *>(got);
+        if (st) {
+            if (st->text == big) {
+                big_intact = true;
+            } else if (st->text.compare(0, 9, "follower-") == 0) {
+                std::string prefix = "follower-" + std::to_string(expected) + "-";
+                if (st->text.compare(0, prefix.size(), prefix) == 0
+                        && st->text.size() == prefix.size() + 64 + expected) {
+                    ++followers_in_order;
+                }
+                ++expected;
+            }
+        }
+        delete got;
+    }
+    sender.join();
+
+    REQUIRE(flush_ok.load(), "flush_pending never reported a dead connection");
+    REQUIRE(big_intact, "jammed first message delivered intact");
+    REQUIRE(followers_in_order == kFollowers,
+            "all queued messages arrived intact and in send order");
+    REQUIRE(!p.snd->has_pending_write(), "pending queue fully drained");
+
+    delete p.snd;
+    delete p.rcv;
+}
+
+// The teardown trigger the scheduler relies on: flush_pending() returns false
+// only when the connection actually died, and leaves the channel in the error
+// state.  Also pins the edge guards (empty buffer, already-errored channel).
+static void test_flush_pending_errors()
+{
+    // Empty buffer on a healthy channel: trivially true.
+    {
+        ChannelPair p = make_channel_pair(0);
+        REQUIRE(!p.snd->has_pending_write(), "fresh channel has nothing pending");
+        REQUIRE(p.snd->flush_pending(), "flush_pending on empty buffer succeeds");
+        delete p.snd;
+        delete p.rcv;
+    }
+
+    // Dead peer: jam bytes, close the receiver, flush must fail and poison.
+    {
+        ChannelPair p = make_channel_pair(8 * 1024);
+        REQUIRE(p.snd->send_msg(StatusTextMsg(std::string(64 * 1024, 'x')),
+                                MsgChannel::SendNonBlocking | MsgChannel::SendDeferrable),
+                "big deferrable send accepted");
+        REQUIRE(p.snd->has_pending_write(), "bytes pending before peer death");
+
+        delete p.rcv;    // closes the receiving end
+
+        bool flushed_false = false;
+        for (int i = 0; i < 100; ++i) {
+            if (!p.snd->flush_pending()) {
+                flushed_false = true;
+                break;
+            }
+            usleep(10 * 1000);
+        }
+        REQUIRE(flushed_false, "flush_pending reports the dead connection");
+        REQUIRE(p.snd->at_eof(), "channel is in the error state afterwards");
+        // Error state is sticky: no further pretence of usability.
+        REQUIRE(!p.snd->flush_pending(), "flush_pending on errored channel stays false");
+        REQUIRE(!p.snd->send_msg(PingMsg(),
+                                 MsgChannel::SendNonBlocking | MsgChannel::SendDeferrable),
+                "send_msg on errored channel fails");
+        delete p.snd;
+    }
+}
+#endif // ICECC_MSGCHANNEL_HAS_DEFERRED_SEND
+
+// Non-deferrable senders must keep the old fail-fast semantics: monitors are
+// dropped on backpressure (scheduler notify_monitors uses SendNonBlocking
+// alone), so a clogged non-deferrable send has to fail and poison the channel
+// rather than silently queue.
+static void test_nondeferrable_fail_fast()
+{
+    ChannelPair p = make_channel_pair(8 * 1024);
+
+    REQUIRE(p.snd->send_msg(PingMsg()), "handshake ping sent");
+    Msg *m = p.rcv->get_msg(10);
+    REQUIRE(m && *m == Msg::PING, "handshake ping received");
+    delete m;
+
+    const std::string big(64 * 1024, 'y');
+    bool sent = p.snd->send_msg(StatusTextMsg(big), MsgChannel::SendNonBlocking);
+    REQUIRE(!sent, "non-deferrable non-blocking send fails on backpressure");
+    REQUIRE(p.snd->at_eof(), "channel is poisoned, as monitors rely on");
+
+    delete p.snd;
+    delete p.rcv;
+}
+
 // Monitor messages must keep their MON_* wire tags (regression check for the
 // MonGetCSMsg/MonJobDoneMsg constructors).
 static void test_mon_tags()
@@ -239,7 +418,7 @@ static void test_mon_tags()
     ChannelPair p = make_channel_pair(0);
 
     GetCSMsg gcs(Environments(), "some/file.cpp", CompileJob::Lang_CXX, 1,
-                 "x86_64", 0, std::string(), false, 0, 0);
+                 "x86_64", 0, std::string(), 0, 0, 0);
     MonGetCSMsg mon(4242, 777, &gcs);
     REQUIRE(p.snd->send_msg(mon), "MonGetCSMsg sent");
 
@@ -274,6 +453,20 @@ int main(int argc, char **argv)
     if (which == "contract" || which == "all") {
         fprintf(stderr, "=== contract: dispatch send under backpressure ===\n");
         test_contract();
+    }
+#if defined(ICECC_MSGCHANNEL_HAS_DEFERRED_SEND)
+    if (which == "multiqueue" || which == "all") {
+        fprintf(stderr, "=== multiqueue: many messages behind a jammed one ===\n");
+        test_multiqueue();
+    }
+    if (which == "flusherrors" || which == "all") {
+        fprintf(stderr, "=== flusherrors: flush_pending dead-peer semantics ===\n");
+        test_flush_pending_errors();
+    }
+#endif
+    if (which == "nondeferrable" || which == "all") {
+        fprintf(stderr, "=== nondeferrable: fail-fast semantics preserved ===\n");
+        test_nondeferrable_fail_fast();
     }
     if (which == "montags" || which == "all") {
         fprintf(stderr, "=== montags: monitor message wire tags ===\n");

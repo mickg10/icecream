@@ -21,8 +21,10 @@
 
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <errno.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -35,17 +37,41 @@ static int env_int(const char *name)
 
 static int shrink(int fd)
 {
-    int bytes = env_int("ICECC_TEST_SNDBUF");
-    if (fd >= 0 && bytes > 0)
-        setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bytes, sizeof(bytes));
+    /* Preserve errno for the caller: accept() may have failed, and the
+       scheduler branches on EINTR/EAGAIN/EMFILE from the interposed call.
+       getenv/atoi/setsockopt must not be allowed to clobber it. */
+    int saved_errno = errno;
+    if (fd >= 0) {
+        int bytes = env_int("ICECC_TEST_SNDBUF");
+        if (bytes > 0 && setsockopt(fd, SOL_SOCKET, SO_SNDBUF,
+                                    &bytes, sizeof(bytes)) != 0) {
+            static int warned;
+            if (!warned) {
+                warned = 1;
+                fprintf(stderr, "sndbuf_shim: SO_SNDBUF shrink failed; "
+                        "backpressure scenario will not engage\n");
+            }
+        }
+    }
+    errno = saved_errno;
     return fd;
+}
+
+static void *must_dlsym(const char *name)
+{
+    void *sym = dlsym(RTLD_NEXT, name);
+    if (!sym) {
+        fprintf(stderr, "sndbuf_shim: dlsym(%s) failed: %s\n", name, dlerror());
+        abort();
+    }
+    return sym;
 }
 
 int accept(int fd, struct sockaddr *addr, socklen_t *len)
 {
     static int (*real_accept)(int, struct sockaddr *, socklen_t *);
     if (!real_accept)
-        real_accept = dlsym(RTLD_NEXT, "accept");
+        real_accept = must_dlsym("accept");
     return shrink(real_accept(fd, addr, len));
 }
 
@@ -53,7 +79,7 @@ int accept4(int fd, struct sockaddr *addr, socklen_t *len, int flags)
 {
     static int (*real_accept4)(int, struct sockaddr *, socklen_t *, int);
     if (!real_accept4)
-        real_accept4 = dlsym(RTLD_NEXT, "accept4");
+        real_accept4 = must_dlsym("accept4");
     return shrink(real_accept4(fd, addr, len, flags));
 }
 
@@ -61,7 +87,7 @@ int setsockopt(int fd, int level, int optname, const void *optval, socklen_t opt
 {
     static int (*real_setsockopt)(int, int, int, const void *, socklen_t);
     if (!real_setsockopt)
-        real_setsockopt = dlsym(RTLD_NEXT, "setsockopt");
+        real_setsockopt = must_dlsym("setsockopt");
 #ifdef TCP_USER_TIMEOUT
     if (level == IPPROTO_TCP && optname == TCP_USER_TIMEOUT
             && env_int("ICECC_TEST_STRIP_USER_TIMEOUT"))

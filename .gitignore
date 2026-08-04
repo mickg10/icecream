@@ -52,6 +52,11 @@ tests/test-setup.sh
 tests/listing.txt
 unittests/testargs
 unittests/testargs.trs
+unittests/backpressure
+unittests/backpressure.trs
+unittests/schedbp
+unittests/sndbuf_shim.so
+unittests/*.log
 # others
 compile_commands.json
 .vs*

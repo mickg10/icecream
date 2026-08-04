@@ -62,13 +62,26 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <map>
 #include <string>
 #include <thread>
 #include <vector>
 
 using Clock = std::chrono::steady_clock;
+
+// Compatibility with the pre-46 Msg API (icecream <= 1.4.x has
+// `enum MsgType Msg::type` with M_* constants; newer trees use the
+// Msg::Value comparison operators).  Lets this harness compile against a
+// 1.4-era libicecc so daemons of either protocol generation can be pointed
+// at any scheduler build for cross-version testing.
+#ifdef PROTOCOL_VERSION_JOB_TIMING
+#define MSG_IS(m, what) (*(m) == Msg::what)
+#else
+#define MSG_IS(m, what) ((m)->type == M_##what)
+#endif
 
 static double secs_since(Clock::time_point t0)
 {
@@ -96,10 +109,13 @@ static pid_t start_scheduler(const std::string &binary, const std::string &shim,
 {
     pid_t pid = fork();
     if (pid != 0) {
-        return pid;
+        return pid;    // -1 (fork failure) is handled by the caller
     }
 
-    // child: scheduler under issue-report conditions (see file comment)
+    // child: scheduler under issue-report conditions (see file comment).
+    // Undo the parent's SIGPIPE ignore first: SIG_IGN survives execl, and the
+    // scheduler must run with the disposition it would have in production.
+    signal(SIGPIPE, SIG_DFL);
     setenv("LD_PRELOAD", shim.c_str(), 1);
     setenv("ICECC_TEST_SNDBUF", "4096", 1);
     setenv("ICECC_TEST_STRIP_USER_TIMEOUT", "1", 1);
@@ -157,21 +173,56 @@ int main(int argc, char **argv)
     }
     const std::string scheduler_bin = argv[1];
     const std::string shim = argv[2];
-    const int njobs = argc > 3 ? atoi(argv[3]) : 4000;
-    const int clog_s = argc > 4 ? atoi(argv[4]) : 75;
+    int njobs = argc > 3 ? atoi(argv[3]) : 4000;
+    int clog_s = argc > 4 ? atoi(argv[4]) : 75;
+    if (njobs < 1 || njobs > 100000 || clog_s < 1 || clog_s > 600) {
+        fprintf(stderr, "implausible jobs/clog arguments\n");
+        return 2;
+    }
     const int port = 25000 + (getpid() % 1000);
 
     signal(SIGPIPE, SIG_IGN);
 
     fprintf(stderr, "# port=%d jobs=%d clog=%ds\n", port, njobs, clog_s);
     pid_t sched = start_scheduler(scheduler_bin, shim, port, "schedbp-scheduler.log");
-    sleep(1);
+    if (sched < 0) {
+        perror("fork");
+        return 2;
+    }
+
+    // Wait for the scheduler to accept connections instead of trusting a
+    // fixed sleep; also notice an exec failure (child exits 127) instead of
+    // reporting it as a connect failure.
+    {
+        bool up = false;
+        for (int i = 0; i < 100 && !up; ++i) {
+            int status = 0;
+            if (waitpid(sched, &status, WNOHANG) == sched) {
+                fprintf(stderr, "scheduler exited during startup (status %d)\n", status);
+                return 2;
+            }
+            int probe = tcp_connect(port, 0);
+            if (probe >= 0) {
+                close(probe);
+                up = true;
+                break;
+            }
+            usleep(100 * 1000);
+        }
+        if (!up) {
+            fprintf(stderr, "scheduler never started listening on port %d\n", port);
+            kill(sched, SIGTERM);
+            waitpid(sched, nullptr, 0);
+            return 2;
+        }
+    }
 
     // ---- fake compile server ----------------------------------------------
     MsgChannel *cs = connect_daemon(port, 0);
     if (!cs) {
         fprintf(stderr, "cannot connect CS to scheduler\n");
         kill(sched, SIGTERM);
+        waitpid(sched, nullptr, 0);
         return 2;
     }
     {
@@ -182,7 +233,9 @@ int main(int argc, char **argv)
         login.chroot_possible = true;
         if (!cs->send_msg(login)) {
             fprintf(stderr, "CS login failed\n");
+            delete cs;
             kill(sched, SIGTERM);
+            waitpid(sched, nullptr, 0);
             return 2;
         }
         StatsMsg stats;   // load == 0: fully available
@@ -210,9 +263,12 @@ int main(int argc, char **argv)
     });
 
     // ---- responsiveness probe: pre-established text-port control channel ---
-    // (Accepting new connections is throttled by the scheduler's next_listen
-    // logic and has ~10s latency even on a healthy idle scheduler; an
-    // established control connection measures true main-loop latency.)
+    // (Fresh accept()s are a poor liveness signal: the scheduler adds its
+    // listen fds to the poll set only when time() >= next_listen, so a new
+    // connection made right after an accept cycle can sit unaccepted for the
+    // remainder of a long poll() sleep -- multi-second latency on a perfectly
+    // healthy idle scheduler.  An established control connection measures
+    // true main-loop latency instead.)
     std::atomic<double> worst_reply{0.0};
     std::atomic<bool> probe_died{false};
     const Clock::time_point t_prog = Clock::now();
@@ -221,14 +277,18 @@ int main(int argc, char **argv)
     if (ctrl < 0) {
         fprintf(stderr, "cannot connect control channel\n");
         shutdown = true;
+        cs_thread.join();
+        delete cs;
         kill(sched, SIGTERM);
+        waitpid(sched, nullptr, 0);
         return 2;
     }
     std::thread probe_thread([&] {
         char buf[4096];
-        // Warm up: the first exchange includes the throttled accept and the
-        // control login, so it can take ~10s on a perfectly healthy
-        // scheduler.  Do one untimed round trip before measuring.
+        // Warm up: the first exchange includes the delayed accept (see
+        // above) and the control login, so it can take many seconds on a
+        // perfectly healthy scheduler.  Do one untimed round trip before
+        // measuring.
         if (write(ctrl, "listcs\n", 7) == 7) {
             struct pollfd pfd = { ctrl, POLLIN, 0 };
             if (poll(&pfd, 1, 30 * 1000) > 0) {
@@ -292,7 +352,12 @@ int main(int argc, char **argv)
     if (!sub) {
         fprintf(stderr, "cannot connect submitter to scheduler\n");
         shutdown = true;
+        probe_thread.join();
+        cs_thread.join();
+        close(ctrl);
+        delete cs;
         kill(sched, SIGTERM);
+        waitpid(sched, nullptr, 0);
         return 2;
     }
     {
@@ -304,7 +369,13 @@ int main(int argc, char **argv)
         if (!sub->send_msg(login)) {
             fprintf(stderr, "submitter login failed\n");
             shutdown = true;
+            probe_thread.join();
+            cs_thread.join();
+            close(ctrl);
+            delete sub;
+            delete cs;
             kill(sched, SIGTERM);
+            waitpid(sched, nullptr, 0);
             return 2;
         }
     }
@@ -344,15 +415,23 @@ int main(int argc, char **argv)
 
     fprintf(stderr, "# draining\n");
     Clock::time_point drain_start = Clock::now();
+    Clock::time_point last_progress = Clock::now();
     while (secs_since(drain_start) < 120) {
         Msg *m = sub->get_msg(3, true);
         if (!m) {
             if (sub->at_eof()) {
                 channel_error = true;
+                break;
             }
-            break;    // quiet for 3s or dead: done either way
+            // a lull is only conclusive after 15s without any progress --
+            // a busy scheduler can legitimately pause mid-drain
+            if (secs_since(last_progress) > 15) {
+                break;
+            }
+            continue;
         }
-        if (*m == Msg::USE_CS) {
+        last_progress = Clock::now();
+        if (MSG_IS(m, USE_CS)) {
             UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
             if (u && u->port == kCsPort && u->client_id >= 1
                     && u->client_id <= (unsigned)njobs) {
@@ -364,7 +443,7 @@ int main(int argc, char **argv)
                         u ? u->hostname.c_str() : "?");
                 channel_error = true;
             }
-        } else if (*m == Msg::NO_CS) {
+        } else if (MSG_IS(m, NO_CS)) {
             fprintf(stderr, "# unexpected NO_CS\n");
         }
         delete m;

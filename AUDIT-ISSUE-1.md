@@ -29,7 +29,7 @@ CONFIRMED, demonstrated by a failing/passing test in this repository.
 | `send_msg` failure to a submitter is answered only by `handle_end` (empty_queue, `scheduler.cpp` NoCS/UseCS branches) | CONFIRMED |
 | `handle_end` on a DAEMON deletes the submitter and **all** its queued + in-flight jobs (`JobDone 255`) | CONFIRMED (integration: 1172–1303 jobs destroyed per run) |
 | `flush_writebuf` polls 30s and calls `set_error()` on timeout, poisoning the channel (`instate=ERROR`, `eof=true`) | CONFIRMED (unit test `contract` on base: channel `at_eof()` after timeout) |
-| Client-side error strings and daemon `clear_children()` chain | CONFIRMED by reading `client/remote.cpp:242`, `client/main.cpp:676`, `daemon/main.cpp:5611` |
+| Client-side error strings and daemon `clear_children()` chain | CONFIRMED by reading `client/remote.cpp:242`, `client/main.cpp:676`, `daemon/main.cpp:5616` |
 | The 30s timeout is reachable in production | CONFIRMED **with caveats** — see §4: on current master the 9s `TCP_USER_TIMEOUT` usually pre-empts it on TCP channels; the issue's 1.4.90 build predates that option, and the farm's conditions (no user timeout + small effective buffers) are exactly what the integration harness recreates. |
 
 ## 2. Fix branch audit — three defects
@@ -151,7 +151,7 @@ up by the existing read-side paths.
 
 ## 4. Environment findings (matter for interpreting the issue)
 
-* **`TCP_USER_TIMEOUT` = 9s** (`MsgChannel` ctor, `services/comm.cpp:1020`)
+* **`TCP_USER_TIMEOUT` = 9s** (`MsgChannel` ctor, `services/comm.cpp:1059`)
   means that on current master a *fully* stalled (zero-window) TCP peer is
   killed by the kernel ~9s in — `send()` fails with `ETIMEDOUT` long before
   the 30s poll can expire, and the submitter is torn down on **every**
@@ -180,7 +180,14 @@ up by the existing read-side paths.
 ## 5. Red/green matrix
 
 Unit (`unittests/backpressure`, AF_UNIX socketpair, ~30s on old branches due
-to the hardcoded poll timeout):
+to the hardcoded poll timeout).  Beyond the two differentiating groups below,
+the suite also pins the new API's semantics on the fixed branch: `multiqueue`
+(many messages appended behind a jammed one arrive intact and in order --
+the observable form of the msgofs==0 compaction invariant), `flusherrors`
+(flush_pending() returns false only for a genuinely dead peer and leaves the
+channel errored; empty-buffer and already-errored edges), and
+`nondeferrable` (a SendNonBlocking send without SendDeferrable still fails
+fast and poisons the channel, which the monitor path relies on):
 
 | test | base | fix branch | corrected |
 |---|---|---|---|
