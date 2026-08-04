@@ -78,7 +78,7 @@ public:
     std::string targetPlatform() const;
     void setTargetPlatform(const std::string &platform);
 
-    std::string fileName() const;
+    const std::string &fileName() const;
     void setFileName(const std::string &fileName);
 
     std::list<Job *> masterJobFor() const;

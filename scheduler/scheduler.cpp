@@ -202,14 +202,14 @@ static uint64_t estimate_job_real_msec(const Job *job)
     return std::max<uint64_t>(1, mixed);
 }
 
-static uint64_t estimate_job_queue_score(const Job *job)
+static uint64_t estimate_job_queue_score(const Job *job, time_t now)
 {
     if (!job) {
         return 0;
     }
 
     const uint64_t estimate_msec = estimate_job_real_msec(job);
-    time_t queue_age_s = time(nullptr) - job->enqueueTime();
+    time_t queue_age_s = now - job->enqueueTime();
     if (queue_age_s < 0) {
         queue_age_s = 0;
     }
@@ -542,13 +542,14 @@ static JobRequestPosition get_first_job_request()
     const int best_niceness = job_requests.front()->niceness;
     JobRequestPosition best;
     uint64_t best_score = 0;
+    const time_t now = time(nullptr);
 
     for (JobRequestsGroup *group : job_requests) {
         if (group->niceness != best_niceness) {
             break;
         }
         for (Job *job : group->l) {
-            const uint64_t score = estimate_job_queue_score(job);
+            const uint64_t score = estimate_job_queue_score(job, now);
             if (!best.isValid() || score > best_score
                     || (score == best_score && job->id() < best.job->id())) {
                 best = JobRequestPosition(group, job);
@@ -1138,6 +1139,31 @@ static time_t prune_servers()
             continue;
         }
 
+        /* Deferred dispatch replies (SendDeferrable) must not linger without
+           bound if the daemon stays alive at the TCP level but never drains
+           its socket: TCP keepalive does not cover that case, and
+           TCP_USER_TIMEOUT is #ifdef'd and platform-dependent.  Give the
+           daemon the same 30 seconds the old blocking send used to allow,
+           then treat it as dead -- this is the application-level bound that
+           keeps a stalled submitter's WAITINGFORCS jobs from pinning remote
+           slots forever.  */
+        {
+            static const time_t max_deferred_send_age = 30;
+            const time_t deferred_age = (*it)->pending_write_age(now);
+
+            if (deferred_age >= max_deferred_send_age) {
+                log_warning() << (*it)->nodeName() << " has not accepted dispatch data for "
+                              << deferred_age << "s - removing" << endl;
+                CompileServer *old = *it;
+                ++it;
+                handle_end(old, nullptr);
+                continue;
+            }
+            if (deferred_age > 0) {
+                min_time = min(min_time, max_deferred_send_age - deferred_age);
+            }
+        }
+
         /* protocol version 27 and newer use TCP keepalive */
         if (IS_PROTOCOL_VERSION(27, *it)) {
             ++it;
@@ -1274,10 +1300,18 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
             break;
         }
     }
+    /* The dispatch reply is sent deferrable: if the submitter daemon is slow
+       to drain its socket (its receive buffer is full because the machine is
+       busy under a highly parallel build), the message stays queued in the
+       channel's write buffer and is flushed from the main loop once poll()
+       reports the socket writable again (see has_pending_write() there).
+       This must not block, and transient backpressure must not tear down the
+       submitter with all its in-flight jobs -- send_msg() only returns false
+       here if the connection is genuinely dead.  */
     if(IS_PROTOCOL_VERSION(37, job->submitter()) && use_cs == job->submitter())
     {
         NoCSMsg m2(job->id(), job->localClientId());
-        if (!job->submitter()->send_msg(m2)) {
+        if (!job->submitter()->send_msg(m2, MsgChannel::SendNonBlocking | MsgChannel::SendDeferrable)) {
             trace() << "failed to deliver job " << job->id() << endl;
             handle_end(job->submitter(), nullptr);   // will care for the rest
             return true;
@@ -1287,7 +1321,7 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
     {
         UseCSMsg m2(host_platform, use_cs->name, use_cs->remotePort(), job->id(),
                 gotit, job->localClientId(), matched_job_id);
-        if (!job->submitter()->send_msg(m2)) {
+        if (!job->submitter()->send_msg(m2, MsgChannel::SendNonBlocking | MsgChannel::SendDeferrable)) {
             trace() << "failed to deliver job " << job->id() << endl;
             handle_end(job->submitter(), nullptr);   // will care for the rest
             return true;
@@ -2579,6 +2613,14 @@ int main(int argc, char *argv[])
             if (ok) {
                 pfd.fd = i;
                 pfd.events = POLLIN;
+
+                /* Dispatch replies queued by a deferrable send while the
+                   daemon's receive buffer was full; ask poll() to tell us when
+                   they can be flushed.  */
+                if (cs->has_pending_write()) {
+                    pfd.events |= POLLOUT;
+                }
+
                 pollfds.push_back( pfd );
             }
         }
@@ -2735,14 +2777,37 @@ int main(int argc, char *argv[])
                invalid.  */
             ++it;
 
-            if (pollfd_is_set(pollfds, i, POLLIN)) {
+            /* pollfd_is_set() also reports POLLERR/POLLHUP as "set" (its
+               check_errors default) -- deliberate here: an errored channel
+               takes the flush_pending() path below even if it never asked
+               for POLLOUT, which converges to handle_end() without waiting
+               for the read side to notice the EOF.  */
+            const bool can_write = pollfd_is_set(pollfds, i, POLLOUT);
+            const bool can_read = pollfd_is_set(pollfds, i, POLLIN);
+
+            if (can_write || can_read) {
+                /* poll() counts a file descriptor once, however many of its
+                   events fired.  */
+                active_fds--;
+            }
+
+            if (can_write) {
+                /* Flush dispatch replies that were queued while the daemon's
+                   receive buffer was full.  If this fails the connection is
+                   genuinely dead, so tear the daemon down like any other dead
+                   channel.  */
+                if (!cs->flush_pending()) {
+                    handle_end(cs, nullptr);
+                    continue;    // cs is deleted now
+                }
+            }
+
+            if (can_read) {
                 while (!cs->read_a_bit() || cs->has_msg()) {
                     if (!handle_activity(cs)) {
                         break;
                     }
                 }
-
-                active_fds--;
             }
         }
 

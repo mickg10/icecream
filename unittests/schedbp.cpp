@@ -1,0 +1,604 @@
+/*
+    Integration red/green test for scheduler behaviour when a submitter
+    daemon stops draining its socket (issue #1: "Scheduler nukes entire
+    submitter on transient send timeout").
+
+    Starts a real icecc-scheduler, logs in a fake compile server and a fake
+    submitter daemon using the project's own MsgChannel protocol code, has
+    the submitter request a couple of thousand jobs and then stop reading
+    its socket for longer than the 30s send timeout -- exactly what a build
+    machine wedged under a highly parallel build does -- then drains
+    everything and checks the outcome.
+
+    The conditions of the issue report are recreated deliberately via the
+    preloaded sndbuf_shim.so:
+
+      - ICECC_TEST_SNDBUF shrinks the scheduler's per-connection send
+        buffer so a few thousand dispatch replies actually jam the
+        connection (with modern autotuned buffers, megabytes of kernel
+        buffering would otherwise absorb everything).
+
+      - ICECC_TEST_STRIP_USER_TIMEOUT disables the 9s TCP_USER_TIMEOUT that
+        MsgChannel arms on every TCP channel (present in every release since
+        2020, including the issue report's 1.4.90).  The production failure
+        involves a SLOWLY-DRAINING submitter: it keeps ACKing and freeing
+        dribbles of buffer, which resets the kernel timer (TCP_USER_TIMEOUT
+        requires zero forward progress) while never freeing enough space
+        within 30s -- so the application timeout governs even with the
+        option armed.  This harness uses a full stop as a deterministic
+        stand-in for that slow drain, and a full stop WOULD trip the kernel
+        timer at ~9s on every variant alike, masking the application-level
+        behaviour under test; stripping the option isolates that behaviour.
+
+    Note the submitter's SO_RCVBUF is set to 64KiB, not smaller: on Linux
+    loopback the MSS is ~64KiB, and a zero-window connection whose receive
+    buffer is below one MSS never reopens its window (silly window syndrome
+    avoidance), which would freeze the final drain for every variant alike.
+
+    The desired contract, identical for every scheduler variant under test:
+
+      1. every requested job gets exactly one dispatch reply (USE_CS),
+         parseable and intact, once the submitter drains;
+      2. the submitter connection survives the backpressure window;
+      3. the compile server connection survives;
+      4. the scheduler stays responsive throughout: a pre-established
+         control connection on the text port gets a reply to "listcs"
+         within a few seconds at all times.
+
+    Usage:
+      schedbp <icecc-scheduler> <sndbuf_shim.so> [jobs] [clog-seconds] [stall]
+
+    The optional "stall" mode inverts the scenario: the submitter never
+    drains at all, and the harness asserts the scheduler enforces its
+    application-level bound on deferred dispatch output (~30s) by tearing the
+    stalled submitter down -- neither instantly (which would mean a kernel
+    timeout leaked in) nor never (which would mean undelivered bytes and
+    WAITINGFORCS jobs can linger forever).  Because a run where the send
+    buffers were never really shrunk cannot jam and therefore cannot trigger
+    the teardown, stall mode also serves as the positive proof that the
+    backpressure scenario actually engages (the normal mode cannot assert
+    that from its side of the sockets).
+
+    Exit code 0 if the contract holds, 1 otherwise.
+*/
+
+#include "comm.h"
+#include "logging.h"
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <signal.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <map>
+#include <string>
+#include <thread>
+#include <vector>
+
+using Clock = std::chrono::steady_clock;
+
+// Compatibility with the 1.4-era Msg API (pre icecc/icecream#610:
+// `enum MsgType Msg::type` with M_* constants; this tree uses the Msg::Value
+// comparison operators).  Lets the harness compile against a 1.4-era
+// libicecc so daemons of either protocol generation can be pointed at any
+// scheduler build for cross-version testing.  The auto-detect keys on a
+// macro specific to this fork's lineage, so it only distinguishes these
+// trees from 1.4-era ones; compiling against a pristine upstream master
+// (new Msg API, no such macro) would need the first branch forced.
+#ifdef PROTOCOL_VERSION_JOB_TIMING
+#define MSG_IS(m, what) (*(m) == Msg::what)
+#else
+#define MSG_IS(m, what) ((m)->type == M_##what)
+#endif
+
+static double secs_since(Clock::time_point t0)
+{
+    return std::chrono::duration<double>(Clock::now() - t0).count();
+}
+
+static int failures = 0;
+
+#define REQUIRE(cond, what)                                             \
+    do {                                                                \
+        if (cond) {                                                     \
+            fprintf(stderr, "ok       - %s\n", what);                   \
+        } else {                                                        \
+            fprintf(stderr, "FAILED   - %s\n", what);                   \
+            ++failures;                                                 \
+        }                                                               \
+    } while (0)
+
+static const char *kPlatform = "x86_64";
+static const char *kEnv = "testenv";
+static const unsigned int kCsPort = 10245;
+
+static pid_t start_scheduler(const std::string &binary, const std::string &shim,
+                             int port, const std::string &logfile)
+{
+    pid_t pid = fork();
+    if (pid != 0) {
+        return pid;    // -1 (fork failure) is handled by the caller
+    }
+
+    // child: scheduler under issue-report conditions (see file comment).
+    // Undo the parent's SIGPIPE ignore first: SIG_IGN survives execl, and the
+    // scheduler must run with the disposition it would have in production.
+    signal(SIGPIPE, SIG_DFL);
+    setenv("LD_PRELOAD", shim.c_str(), 1);
+    setenv("ICECC_TEST_SNDBUF", "4096", 1);
+    setenv("ICECC_TEST_STRIP_USER_TIMEOUT", "1", 1);
+    FILE *lf = fopen(logfile.c_str(), "w");
+    if (lf) {
+        dup2(fileno(lf), 1);
+        dup2(fileno(lf), 2);
+    }
+    char portbuf[16];
+    snprintf(portbuf, sizeof(portbuf), "%d", port);
+    execl(binary.c_str(), binary.c_str(), "-p", portbuf, "-vvv", (char *)nullptr);
+    perror("execl icecc-scheduler");
+    _exit(127);
+}
+
+static int tcp_connect(int port, int rcvbuf)
+{
+    int fd = socket(PF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    if (rcvbuf > 0) {
+        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+    }
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(port);
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static MsgChannel *connect_daemon(int port, int rcvbuf)
+{
+    int fd = tcp_connect(port, rcvbuf);
+    if (fd < 0) {
+        return nullptr;
+    }
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    return Service::createChannel(fd, (struct sockaddr *)&sa, sizeof(sa));
+}
+
+int main(int argc, char **argv)
+{
+    if (argc < 3) {
+        fprintf(stderr, "usage: %s <icecc-scheduler> <sndbuf_shim.so> [jobs] [clog-seconds]\n",
+                argv[0]);
+        return 2;
+    }
+    const std::string scheduler_bin = argv[1];
+    const std::string shim = argv[2];
+    int njobs = argc > 3 ? atoi(argv[3]) : 4000;
+    const bool stall_mode = argc > 5 && strcmp(argv[5], "stall") == 0;
+    // Normal mode must stay under the scheduler's 30s deferred-send bound
+    // (measured from jam onset, ~1-2s into the clog): it asserts that a
+    // TRANSIENT stall loses nothing.  Stall mode goes well past the bound
+    // to assert the bound itself.
+    int clog_s = argc > 4 ? atoi(argv[4]) : (stall_mode ? 75 : 25);
+    if (njobs < 1 || njobs > 100000 || clog_s < 1 || clog_s > 600) {
+        fprintf(stderr, "implausible jobs/clog arguments\n");
+        return 2;
+    }
+    const int port = 25000 + (getpid() % 1000);
+
+    signal(SIGPIPE, SIG_IGN);
+
+    fprintf(stderr, "# port=%d jobs=%d clog=%ds\n", port, njobs, clog_s);
+    pid_t sched = start_scheduler(scheduler_bin, shim, port, "schedbp-scheduler.log");
+    if (sched < 0) {
+        perror("fork");
+        return 2;
+    }
+
+    // Wait for the scheduler to accept connections instead of trusting a
+    // fixed sleep; also notice an exec failure (child exits 127) instead of
+    // reporting it as a connect failure.
+    {
+        bool up = false;
+        for (int i = 0; i < 100 && !up; ++i) {
+            int status = 0;
+            if (waitpid(sched, &status, WNOHANG) == sched) {
+                if (WIFEXITED(status)) {
+                    fprintf(stderr, "scheduler exited during startup (exit code %d%s)\n",
+                            WEXITSTATUS(status),
+                            WEXITSTATUS(status) == 127 ? ", exec failed" : "");
+                } else {
+                    fprintf(stderr, "scheduler died during startup (signal %d)\n",
+                            WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+                }
+                return 2;
+            }
+            int probe = tcp_connect(port, 0);
+            if (probe >= 0) {
+                close(probe);
+                up = true;
+                break;
+            }
+            usleep(100 * 1000);
+        }
+        if (!up) {
+            fprintf(stderr, "scheduler never started listening on port %d\n", port);
+            kill(sched, SIGTERM);
+            waitpid(sched, nullptr, 0);
+            return 2;
+        }
+    }
+
+    // ---- fake compile server ----------------------------------------------
+    MsgChannel *cs = connect_daemon(port, 0);
+    if (!cs) {
+        fprintf(stderr, "cannot connect CS to scheduler\n");
+        kill(sched, SIGTERM);
+        waitpid(sched, nullptr, 0);
+        return 2;
+    }
+    {
+        LoginMsg login(kCsPort, "fakecs", kPlatform, 0);
+        login.envs.push_back(std::make_pair(kPlatform, kEnv));
+        login.max_kids = njobs + 16;
+        login.noremote = false;
+        login.chroot_possible = true;
+        if (!cs->send_msg(login)) {
+            fprintf(stderr, "CS login failed\n");
+            delete cs;
+            kill(sched, SIGTERM);
+            waitpid(sched, nullptr, 0);
+            return 2;
+        }
+        StatsMsg stats;   // load == 0: fully available
+        cs->send_msg(stats);
+    }
+
+    std::atomic<bool> shutdown{false};
+    std::atomic<bool> cs_alive{true};
+    std::thread cs_thread([&] {
+        // keep the CS side drained and periodically say we are idle
+        Clock::time_point last_stats = Clock::now();
+        while (!shutdown) {
+            Msg *m = cs->get_msg(1, true);
+            delete m;
+            if (cs->at_eof()) {
+                cs_alive = false;
+                return;
+            }
+            if (secs_since(last_stats) > 10) {
+                StatsMsg stats;
+                cs->send_msg(stats);
+                last_stats = Clock::now();
+            }
+        }
+    });
+
+    // ---- responsiveness probe: pre-established text-port control channel ---
+    // (Fresh accept()s are a poor liveness signal: the scheduler adds its
+    // listen fds to the poll set only when time() >= next_listen, so a new
+    // connection made right after an accept cycle can sit unaccepted for the
+    // remainder of a long poll() sleep -- multi-second latency on a perfectly
+    // healthy idle scheduler.  An established control connection measures
+    // true main-loop latency instead.)
+    std::atomic<double> worst_reply{0.0};
+    std::atomic<bool> probe_died{false};
+    const Clock::time_point t_prog = Clock::now();
+    std::atomic<double> probe_pending_since{-1.0};   // seconds since t_prog, -1 = idle
+    int ctrl = tcp_connect(port + 1, 0);
+    if (ctrl < 0) {
+        fprintf(stderr, "cannot connect control channel\n");
+        shutdown = true;
+        cs_thread.join();
+        delete cs;
+        kill(sched, SIGTERM);
+        waitpid(sched, nullptr, 0);
+        return 2;
+    }
+    std::thread probe_thread([&] {
+        char buf[4096];
+        // Warm up: the first exchange includes the delayed accept (see
+        // above) and the control login, so it can take many seconds on a
+        // perfectly healthy scheduler.  Do one untimed round trip before
+        // measuring.
+        if (write(ctrl, "listcs\n", 7) == 7) {
+            struct pollfd pfd = { ctrl, POLLIN, 0 };
+            if (poll(&pfd, 1, 30 * 1000) > 0) {
+                ssize_t n = read(ctrl, buf, sizeof(buf));
+                (void)n;
+            }
+        }
+        while (!shutdown) {
+            // discard any stale buffered reply fragments so the next read is
+            // guaranteed to be a response to the request sent below
+            for (;;) {
+                struct pollfd pfd = { ctrl, POLLIN, 0 };
+                if (poll(&pfd, 1, 0) <= 0) {
+                    break;
+                }
+                if (read(ctrl, buf, sizeof(buf)) <= 0) {
+                    probe_died = true;
+                    return;
+                }
+            }
+            Clock::time_point t0 = Clock::now();
+            probe_pending_since = secs_since(t_prog);
+            if (write(ctrl, "listcs\n", 7) != 7) {
+                probe_died = true;
+                return;
+            }
+            bool got_reply = false;
+            while (!got_reply && secs_since(t0) < 120 && !shutdown) {
+                struct pollfd pfd = { ctrl, POLLIN, 0 };
+                if (poll(&pfd, 1, 200) > 0) {
+                    ssize_t n = read(ctrl, buf, sizeof(buf));
+                    if (n <= 0) {
+                        probe_died = true;
+                        return;
+                    }
+                    got_reply = true;
+                }
+            }
+            // An unanswered round is an outage at least as long as the time
+            // waited -- count it, or a scheduler that never replies again
+            // would score better than a slow one.
+            double lat = secs_since(t0);
+            if (lat > 1.0) {
+                fprintf(stderr, "# control reply%s took %.1fs\n",
+                        got_reply ? "" : " (still unanswered)", lat);
+            }
+            double w = worst_reply.load();
+            while (lat > w && !worst_reply.compare_exchange_weak(w, lat)) {
+            }
+            probe_pending_since = -1.0;
+            for (int i = 0; i < 10 && !shutdown; ++i) {
+                usleep(100 * 1000);
+            }
+        }
+    });
+
+    // ---- fake submitter ----------------------------------------------------
+    // 64KiB rcvbuf: small enough that the dispatch replies jam, large enough
+    // (>= one loopback MSS) that the window reopens when we drain at the end.
+    MsgChannel *sub = connect_daemon(port, 64 * 1024);
+    if (!sub) {
+        fprintf(stderr, "cannot connect submitter to scheduler\n");
+        shutdown = true;
+        probe_thread.join();
+        cs_thread.join();
+        close(ctrl);
+        delete cs;
+        kill(sched, SIGTERM);
+        waitpid(sched, nullptr, 0);
+        return 2;
+    }
+    {
+        LoginMsg login(0, "fakesub", kPlatform, 0);
+        login.envs.push_back(std::make_pair(kPlatform, kEnv));
+        login.max_kids = 0;    // never eligible for local fallback
+        login.noremote = true;
+        login.chroot_possible = false;
+        if (!sub->send_msg(login)) {
+            fprintf(stderr, "submitter login failed\n");
+            shutdown = true;
+            probe_thread.join();
+            cs_thread.join();
+            close(ctrl);
+            delete sub;
+            delete cs;
+            kill(sched, SIGTERM);
+            waitpid(sched, nullptr, 0);
+            return 2;
+        }
+    }
+    // let any login-time chatter (CS_CONF, ...) arrive and be consumed
+    for (;;) {
+        Msg *m = sub->get_msg(2, true);
+        if (!m) {
+            break;
+        }
+        delete m;
+    }
+
+    fprintf(stderr, "# requesting %d jobs\n", njobs);
+    for (int i = 1; i <= njobs; ++i) {
+        char fname[64];
+        snprintf(fname, sizeof(fname), "file%04d.cpp", i);
+        GetCSMsg gcs(Environments{std::make_pair(std::string(kPlatform), std::string(kEnv))},
+                     fname, CompileJob::Lang_CXX, 1, kPlatform, 0, std::string(), 0, 0, 0);
+        gcs.client_id = i;
+        if (!sub->send_msg(gcs)) {
+            fprintf(stderr, "FAILED   - submitter died while requesting job %d\n", i);
+            ++failures;
+            break;
+        }
+    }
+
+    if (stall_mode) {
+        // ---- stall mode: never drain; the scheduler must cut us loose ------
+        fprintf(stderr, "# stall mode: submitter never reads; waiting for the "
+                "scheduler to enforce its deferred-send bound...\n");
+        // Passive fd-watching cannot detect the teardown here: the
+        // scheduler's FIN/RST cannot traverse our deliberately-zero receive
+        // window.  Probe actively instead -- a small send to a torn-down
+        // peer draws an RST and poisons the channel within a round trip.
+        int death_t = -1;
+        for (int i = 0; i < clog_s; ++i) {
+            sleep(1);
+#ifdef ICECC_MSGCHANNEL_HAS_DEFERRED_SEND
+            bool ping_ok = sub->send_msg(PingMsg(),
+                    MsgChannel::SendNonBlocking | MsgChannel::SendDeferrable);
+#else
+            // 1.4-era API: a plain send is fine here -- our own send
+            // direction is never backed up (the scheduler always reads).
+            bool ping_ok = sub->send_msg(PingMsg());
+#endif
+            if (!ping_ok || sub->at_eof()) {
+                death_t = i;
+                break;
+            }
+        }
+        fprintf(stderr, "# submitter connection torn down at t=%ds\n", death_t);
+        REQUIRE(death_t >= 0, "scheduler tore down the never-draining submitter");
+        // The bound is 30s of undelivered output.  Much earlier means some
+        // kernel-level timeout leaked into the test conditions; never (or
+        // only at the very end of the window) means deferred bytes and the
+        // submitter's WAITINGFORCS jobs can linger without bound.
+        REQUIRE(death_t >= 20 && death_t <= 50,
+                "teardown honoured the ~30s deferred-send age bound");
+        REQUIRE(cs_alive.load(), "compile server connection survived");
+        {
+            double pending = probe_pending_since.load();
+            if (pending >= 0) {
+                double outage = secs_since(t_prog) - pending;
+                double w = worst_reply.load();
+                while (outage > w && !worst_reply.compare_exchange_weak(w, outage)) {
+                }
+            }
+            fprintf(stderr, "# final worst control-reply latency %.1fs\n", worst_reply.load());
+        }
+        REQUIRE(worst_reply.load() < 5.0,
+                "scheduler stayed responsive (control replies < 5s)");
+        REQUIRE(!probe_died.load(), "control connection survived");
+
+        shutdown = true;
+        probe_thread.join();
+        cs_thread.join();
+        close(ctrl);
+        delete sub;
+        delete cs;
+        kill(sched, SIGTERM);
+        int status = 0;
+        waitpid(sched, &status, 0);
+
+        if (failures) {
+            fprintf(stderr, "RESULT: FAIL (%d)\n", failures);
+            return 1;
+        }
+        fprintf(stderr, "RESULT: PASS\n");
+        return 0;
+    }
+
+    // ---- the backpressure window: read nothing at all ----------------------
+    fprintf(stderr, "# submitter reads nothing for %ds...\n", clog_s);
+    for (int i = 0; i < clog_s; ++i) {
+        sleep(1);
+    }
+
+    // ---- drain and account -------------------------------------------------
+    std::map<unsigned int, int> replies;   // client_id -> count
+    int parsed = 0;
+    bool channel_error = false;
+
+    fprintf(stderr, "# draining\n");
+    Clock::time_point drain_start = Clock::now();
+    Clock::time_point last_progress = Clock::now();
+    while (secs_since(drain_start) < 120) {
+        Msg *m = sub->get_msg(3, true);
+        if (!m) {
+            if (sub->at_eof()) {
+                channel_error = true;
+                break;
+            }
+            // a lull is only conclusive after 15s without any progress --
+            // a busy scheduler can legitimately pause mid-drain
+            if (secs_since(last_progress) > 15) {
+                break;
+            }
+            continue;
+        }
+        last_progress = Clock::now();
+        if (MSG_IS(m, USE_CS)) {
+            UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+            if (u && u->port == kCsPort && u->client_id >= 1
+                    && u->client_id <= (unsigned)njobs) {
+                ++replies[u->client_id];
+                ++parsed;
+            } else {
+                fprintf(stderr, "# corrupt USE_CS: client_id=%u port=%u host=%s\n",
+                        u ? u->client_id : 0, u ? u->port : 0,
+                        u ? u->hostname.c_str() : "?");
+                channel_error = true;
+            }
+        } else if (MSG_IS(m, NO_CS)) {
+            fprintf(stderr, "# unexpected NO_CS\n");
+        }
+        delete m;
+        if (parsed == njobs) {
+            while ((m = sub->get_msg(1, true)) != nullptr) {
+                delete m;
+            }
+            break;
+        }
+    }
+
+    int exactly_once = 0;
+    for (const auto &kv : replies) {
+        if (kv.second == 1) {
+            ++exactly_once;
+        }
+    }
+
+    fprintf(stderr, "# %d parseable USE_CS replies, %d/%d jobs answered exactly once, "
+            "channel_error=%d, worst control-reply latency %.1fs\n",
+            parsed, exactly_once, njobs, (int)channel_error, worst_reply.load());
+
+    REQUIRE(!channel_error && !sub->at_eof(),
+            "submitter connection survived the backpressure window");
+    REQUIRE(exactly_once == njobs,
+            "every job got exactly one intact USE_CS reply after draining");
+    REQUIRE(cs_alive.load(), "compile server connection survived");
+    // include a probe round that is still waiting for its reply right now:
+    // that outage is already at least this long
+    {
+        double pending = probe_pending_since.load();
+        if (pending >= 0) {
+            double outage = secs_since(t_prog) - pending;
+            double w = worst_reply.load();
+            while (outage > w && !worst_reply.compare_exchange_weak(w, outage)) {
+            }
+        }
+        fprintf(stderr, "# final worst control-reply latency %.1fs\n", worst_reply.load());
+    }
+    REQUIRE(worst_reply.load() < 5.0,
+            "scheduler stayed responsive (control replies < 5s)");
+    // A scheduler wedged in blocking sends for > MAX_SCHEDULER_PING stops
+    // processing its control clients' commands, so prune_servers() kills
+    // them: losing the control connection is itself unresponsiveness.
+    REQUIRE(!probe_died.load(), "control connection survived (not pruned by a wedged scheduler)");
+
+    shutdown = true;
+    probe_thread.join();
+    cs_thread.join();
+    close(ctrl);
+    delete sub;
+    delete cs;
+    kill(sched, SIGTERM);
+    int status = 0;
+    waitpid(sched, &status, 0);
+
+    if (failures) {
+        fprintf(stderr, "RESULT: FAIL (%d)\n", failures);
+        return 1;
+    }
+    fprintf(stderr, "RESULT: PASS\n");
+    return 0;
+}

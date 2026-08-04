@@ -233,13 +233,26 @@ const int NODE_FEATURE_ENV_ZSTD = ( 1 << 1 );
 // a list of pairs of host platform, filename
 typedef std::list<std::pair<std::string, std::string> > Environments;
 
+// MsgChannel supports backpressure-tolerant sends (SendDeferrable,
+// has_pending_write(), flush_pending()).
+#define ICECC_MSGCHANNEL_HAS_DEFERRED_SEND 1
+
 class MsgChannel
 {
 public:
     enum SendFlags {
         SendBlocking = 1 << 0,
         SendNonBlocking = 1 << 1,
-        SendBulkOnly = 1 << 2
+        SendBulkOnly = 1 << 2,
+        // Tolerate backpressure instead of failing the channel: if the peer's
+        // receive buffer is full (EAGAIN, or the poll timeout expires when
+        // combined with SendBlocking), keep the unsent bytes queued in the
+        // write buffer and report success.  The caller must later call
+        // flush_pending() when the socket becomes writable again (e.g. from a
+        // POLLOUT event; see has_pending_write()).  Queued bytes are flushed
+        // in order, so the byte stream stays intact even if a message was
+        // partially transmitted when the buffer filled up.
+        SendDeferrable = 1 << 3
     };
 
     virtual ~MsgChannel();
@@ -253,6 +266,31 @@ public:
 
     // false <--> error (msg not send)
     bool send_msg(const Msg &, int SendFlags = SendBlocking);
+
+    // True if a previous send left bytes queued in the write buffer (a
+    // SendDeferrable send that ran into backpressure, or a message so far only
+    // collected by SendBulkOnly).
+    bool has_pending_write(void) const
+    {
+        return msgtogo > 0;
+    }
+
+    // Seconds for which deferred output has been waiting undelivered, or 0 if
+    // no deferrable send is currently backed up (bulk-only accumulation does
+    // not count).  Lets the owner enforce an application-level bound on a
+    // peer that stays writable-never: the kernel TCP_USER_TIMEOUT bound is
+    // #ifdef'd (absent on some platforms) and SO_KEEPALIVE does not cover a
+    // peer whose TCP stack keeps ACKing while the process never reads.
+    time_t pending_write_age(time_t now) const
+    {
+        return pending_write_since ? now - pending_write_since : 0;
+    }
+
+    // Try to write queued output without blocking.  A still-full peer buffer
+    // just leaves the remaining bytes queued and returns true; false is
+    // returned only if the connection hit a real error (the channel is in the
+    // error state / at_eof() afterwards).
+    bool flush_pending(void);
 
     bool has_msg(void) const
     {
@@ -305,8 +343,9 @@ protected:
     MsgChannel(int _fd, struct sockaddr *, socklen_t, bool text = false);
 
     bool wait_for_protocol();
-    // returns false if there was an error sending something
-    bool flush_writebuf(bool blocking);
+    // returns false if there was an error sending something; send_flags is a
+    // combination of SendFlags bits (SendBlocking / SendDeferrable matter here)
+    bool flush_writebuf(int send_flags);
     void writefull(const void *_buf, size_t count);
     // returns false if there was an error in the protocol setup
     bool update_state(void);
@@ -319,6 +358,9 @@ protected:
     size_t msgbuflen;
     size_t msgofs;
     size_t msgtogo;
+    // when the currently pending deferrable output first failed to send in
+    // full (0 = no deferred backlog); see pending_write_age()
+    time_t pending_write_since;
     char *inbuf;
     size_t inbuflen;
     size_t inofs;

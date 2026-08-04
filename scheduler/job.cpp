@@ -176,7 +176,7 @@ void Job::setTargetPlatform(const std::string &platform)
     m_targetPlatform = platform;
 }
 
-std::string Job::fileName() const
+const std::string &Job::fileName() const
 {
     return m_fileName;
 }
