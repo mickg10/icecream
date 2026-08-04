@@ -202,14 +202,14 @@ static uint64_t estimate_job_real_msec(const Job *job)
     return std::max<uint64_t>(1, mixed);
 }
 
-static uint64_t estimate_job_queue_score(const Job *job)
+static uint64_t estimate_job_queue_score(const Job *job, time_t now)
 {
     if (!job) {
         return 0;
     }
 
     const uint64_t estimate_msec = estimate_job_real_msec(job);
-    time_t queue_age_s = time(nullptr) - job->enqueueTime();
+    time_t queue_age_s = now - job->enqueueTime();
     if (queue_age_s < 0) {
         queue_age_s = 0;
     }
@@ -542,13 +542,14 @@ static JobRequestPosition get_first_job_request()
     const int best_niceness = job_requests.front()->niceness;
     JobRequestPosition best;
     uint64_t best_score = 0;
+    const time_t now = time(nullptr);
 
     for (JobRequestsGroup *group : job_requests) {
         if (group->niceness != best_niceness) {
             break;
         }
         for (Job *job : group->l) {
-            const uint64_t score = estimate_job_queue_score(job);
+            const uint64_t score = estimate_job_queue_score(job, now);
             if (!best.isValid() || score > best_score
                     || (score == best_score && job->id() < best.job->id())) {
                 best = JobRequestPosition(group, job);
