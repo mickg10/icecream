@@ -55,6 +55,8 @@ start_farm_r6() { # ver sched-spec extra-env-string
     timeout 25 ssh $R6 "sudo -n bash -c 'mkdir -p /dev/shm/icestress/envcache && rm -f /dev/shm/icestress/iceccd.log && $extra /dev/shm/icestress/docker/bin/$v/iceccd -d -N farm-r6-$v -p 10245 -s $sched -m 16 -u mickg -b /dev/shm/icestress/envcache -l /dev/shm/icestress/iceccd.log -vvv'"
 }
 
+FAILURES=0
+
 run_build() { # label client-ver sock jobs
     local label=$1 v=$2 sock=$3 jobs=$4
     local W=$RUN/work-$label
@@ -67,6 +69,14 @@ run_build() { # label client-ver sock jobs
     local rc=$?
     local objs=$(ls $W/src/*.o 2>/dev/null | wc -l)
     echo "$label rc=$rc objs=$objs/400 $(cat $RUN/time-$label.txt 2>/dev/null | tr '\n' ' ')" >> $RUN/SUMMARY
+    # Enforce, don't just record: a scenario passes only if make succeeded
+    # and every object was produced.
+    if [ "$rc" -ne 0 ] || [ "$objs" -ne 400 ]; then
+        log "FAIL: build $label rc=$rc objs=$objs/400"
+        FAILURES=$((FAILURES + 1))
+        return 1
+    fi
+    return 0
 }
 
 listcs() { # port label
@@ -176,3 +186,8 @@ F)  # s@x f@x c@o+x concurrently
 esac
 
 report
+if [ "${FAILURES:-0}" -ne 0 ]; then
+    echo "RESULT: FAIL ($FAILURES)"
+    exit 1
+fi
+echo "RESULT: PASS"

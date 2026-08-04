@@ -169,8 +169,11 @@ relevant decomposes per-host, so there is nothing emergent to fear:
   on a uniform client version.
 * Scheduling fairness is version-blind: the estimate-based queue scoring
   keys on file names and JobDone statistics, which both generations
-  supply identically; niceness (43) is supported by both.  No starvation
-  or priority skew between old and new client hosts.
+  supply identically; niceness (43) is supported by both, so there is no
+  skew between old and new client hosts.  (Job-size fairness is a
+  separate axis: the original capped age bonus could starve short jobs
+  under a sustained stream of long ones — fixed by making the age bonus
+  unbounded, so every queued request eventually outranks any newcomer.)
 * The Issue-1 fix protects **both** generations equally (it is
   scheduler-side, and R1 proves the o-daemon case), including the new 30s
   deferred-output cap (§4), which judges daemons by behaviour, not
@@ -215,15 +218,17 @@ outstanding jobs (~60–100 B per reply; 4000 jobs ≈ 300 KB) — the request
 count is client-driven and effectively bounded by the fleet's concurrent
 compile jobs.  Time-bounded twice over: kernel TCP_USER_TIMEOUT (9s, both
 candidates arm it, but `#ifdef`'d and platform-dependent) for truly dead
-peers, and — post-review — an **application-level 30-second cap**: a daemon
-whose deferred dispatch output goes unaccepted for 30s is removed by
-`prune_servers()` (the same time budget the old blocking send gave a
-submitter, enforced without wedging the scheduler and independent of
-platform).  A merely-slow peer that drains within 30s loses nothing;
-sustained total non-acceptance beyond it is judged exactly as upstream
-judged it — the connection is dead — minus the collateral wedge.  Verified
-by the harness's stall mode: teardown observed at t=31s with the scheduler
-responsive throughout.
+peers, and an **application-level 30-second cap** on deferred-output age,
+enforced by `prune_servers()` from a monotonic clock (wall-clock steps can
+neither disable nor mis-fire it) with the poll timeout re-capped after
+dispatch so the deadline cannot silently stretch to the loop's 36s
+ceiling.  Additionally, a submitter whose channel holds undelivered
+dispatch output receives **no further assignments** until it drains — so
+a stalled submitter's slot reservation is bounded by the kernel socket
+capacity between the two hosts (tens of KB, i.e. one to a few thousand
+replies), not by the depth of its request queue.  Verified by the
+harness's stall mode: assignments stop at ~2.6k of 4k queued requests and
+teardown lands at t≈31s with the scheduler responsive throughout.
 
 ## 5. Reproduction
 
@@ -272,7 +277,11 @@ mid-build):
   thaw — 400/400, scheduler probe worst 0.22s throughout.
 * G2 (45s freeze, s@x): 400/400, wall = build + freeze duration, zero
   failed TUs, zero storm — clients simply waited out their frozen local
-  daemon and the farm pipeline resumed.
+  daemon and the farm pipeline resumed.  (Note: G2 is *recovery* evidence,
+  not deadline evidence — healthy kernel buffers self-limited before
+  sustained dispatch backpressure could arm the 30s bound; the bound
+  itself is exercised by the schedbp stall mode, where buffers are
+  deliberately shrunk.)
 * A structural finding worth recording: with healthy kernel buffers a
   *single* frozen submitter cannot jam the dispatch channel for long —
   reply backlog self-limits at roughly 2× farm slots × ~60 B (running

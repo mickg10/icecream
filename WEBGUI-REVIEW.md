@@ -1,5 +1,12 @@
 # Review: iceccd web GUI / observability surface
 
+> **Correction (post-review):** the claim below that a stock, web-disabled
+> daemon is unaffected by everything in this report was too broad: job
+> history and insight accounting ran unconditionally (now gated behind an
+> enabled consumer), and the submitter-side exit-code defect (TEL-1 in the
+> overall divergence review) applied regardless of the web listener (now
+> fixed).  The listener-specific findings remain opt-in as described.
+
 **Scope.** The `webgui-observability` work as it exists in `daemon/main.cpp` (merge-base
 `37cb407940a18aee5b444cc6d9d75dd2aaccf86d`), plus `tests/webgui/`, the `--webgui` /
 `--webgui-port` / `--webgui-addr` flags, and the `ICECC_WEB_HOSTPORT` override. The entire

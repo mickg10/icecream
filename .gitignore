@@ -61,3 +61,6 @@ unittests/*.log
 compile_commands.json
 .vs*
 package_builder/**/out/
+aidocs/
+configure~
+unittests/schedbp-quick.sh.trs

@@ -1,5 +1,13 @@
 # Audit: Issue #1 and branch `fix/submitter-requeue-on-transient-timeout`
 
+> **Historical document.**  This audit describes the *original* competing
+> fix branch and the first iteration of the deferred-send implementation.
+> The defects it reports (F1-F3) are absent from the current code, and the
+> current implementation has since gained a dispatch gate for backed-up
+> submitters, a monotonic 30s deferred-output bound, and batch-limited
+> dispatch.  Read it as the review record that shaped the design, not as a
+> description of present behavior.
+
 Date: 2026-08-03.  Scope: issue #1 ("Scheduler nukes entire submitter on
 transient send timeout"), the proposed fix branch
 `fix/submitter-requeue-on-transient-timeout` (commit `ffa6ef9`), and a

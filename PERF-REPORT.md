@@ -73,14 +73,17 @@ itself 23.3% of a smaller total, then the estimates-map lookup and Job
 accessors).  The 4,000-job contract improved to 0.7 s worst latency; `make
 check` and both schedbp modes stay green.
 
-### Remaining recommendation (not implemented)
+### Follow-ups (updated after the divergence review)
 
-The scan is still O(depth) per dispatch.  If queues beyond ~10k
-outstanding requests are a real operating point, replace the linear rescan
-with an incremental structure (max-heap keyed on score with lazy aging, or
-a cached per-group maximum invalidated on enqueue), and/or bound the
-`while (empty_queue())` drain so `poll()` runs between batches.  For the
-fleet sizes exercised here (≤ 4k outstanding), current behavior is fine.
+The drain-before-poll half is now fixed: dispatch runs in batches of 128
+and re-polls with a zero timeout between batches, so control traffic is
+serviced throughout a flood instead of waiting for the full drain.  The
+scan itself is still O(depth) per dispatch; if queues beyond ~10k
+outstanding requests become a real operating point, replace the linear
+rescan with an incremental structure (max-heap keyed on score with lazy
+aging, or a cached per-group maximum invalidated on enqueue).  For the
+fleet sizes exercised here (≤ 4k outstanding) the batched behavior is
+fine.
 
 ## 3. Cost of the backpressure fix itself
 
@@ -90,8 +93,11 @@ Nothing from the fix appears in the profiles at any measurable level:
   executes only on the EAGAIN/timeout paths and on buffer-drain
   transitions — zero samples attributed.
 * The unconditional compaction adds a `memmove` only when a flush exits
-  with bytes still pending (i.e., only under backpressure, on at most
-  ~a few hundred bytes of dispatch replies).  The `__memmove` samples in
+  with bytes still pending (i.e., only under backpressure).  At the
+  measured operating point that was a few hundred bytes; it is now also
+  structurally bounded, because dispatch pauses for a submitter with
+  deferred output, capping any channel's backlog at roughly one kernel
+  socket capacity.  The `__memmove` samples in
   the flood profile (3.8%) are the pre-existing message-buffer management
   (`chop_input`/`writefull` on 20k inbound requests), present before the
   fix as well.

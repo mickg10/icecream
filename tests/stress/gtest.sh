@@ -83,17 +83,21 @@ BPID=$!
 # scheduler (farm has only ~30 slots, so ~270+ are queued and their dispatch
 # replies will trickle into the frozen daemon's socket at slot-free rate).
 for i in $(seq 1 300); do
-    n=$(grep -c "NEW " $RUN/sched.log 2>/dev/null || echo 0)
+    # NB: grep -c prints 0 itself when nothing matches; an || echo 0 here
+    # would emit a second line and break the -ge comparison.
+    n=$(grep -c "NEW " $RUN/sched.log 2>/dev/null)
+    n=${n:-0}
     [ "$n" -ge 300 ] && break
     sleep 0.1
 done
 log "freezing at $n forwarded requests"
 log "SIGSTOP c-daemon (all its processes)"
-pkill -STOP -f 'bundle/bin/./icecc[d]' 
+pkill -STOP -f 'bundle/bin/./icecc[d]'
 sleep $FREEZE
 log "SIGCONT c-daemon"
-pkill -CONT -f 'bundle/bin/./icecc[d]' 
+pkill -CONT -f 'bundle/bin/./icecc[d]'
 wait $BPID
+BUILD_RC=$?
 kill $PROBEPID 2>/dev/null
 
 OBJS=$(ls $W/src/*.o 2>/dev/null | wc -l)
@@ -103,3 +107,12 @@ echo "sched: deferrals=$(grep -c 'deferring' $RUN/sched.log) bound-teardowns=$(g
 echo "build: got-UNKNOWN=$(grep -c 'got UNKNOWN' $RUN/build.log) local-forced=$(grep -c 'local build forced' $RUN/build.log) failed-TUs=$(grep -cE '^make.*Error' $RUN/build.log)"
 echo "probe: worst-latency=$(awk '{if($2>m)m=$2} END{print m"s"}' $RUN/probe.txt 2>/dev/null) rounds=$(wc -l < $RUN/probe.txt)"
 grep -oE "put [0-9]+ in joblist of [a-zA-Z0-9_-]+" $RUN/sched.log | awk '{print $NF}' | sort | uniq -c
+# Enforced expectations per scenario: G1 must lose nothing; G2/G3 tolerate
+# in-flight casualties of the long freeze but the build run must complete.
+FAIL=0
+case $CFG in
+  G1) { [ "$BUILD_RC" -eq 0 ] && [ "$OBJS" -eq 400 ]; } || FAIL=1;;
+  G2|G3) [ "$BUILD_RC" -eq 0 ] || FAIL=1;;
+esac
+if [ "$FAIL" -ne 0 ]; then echo "RESULT: FAIL"; exit 1; fi
+echo "RESULT: PASS"
