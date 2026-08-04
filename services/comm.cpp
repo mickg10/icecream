@@ -394,6 +394,7 @@ bool MsgChannel::flush_writebuf(int send_flags)
     const bool deferrable = send_flags & SendDeferrable;
     const char *buf = msgbuf + msgofs;
     bool error = false;
+    bool deferred = false;
 
     while (msgtogo) {
         int send_errno;
@@ -418,9 +419,13 @@ bool MsgChannel::flush_writebuf(int send_flags)
             if (send_errno == EAGAIN || send_errno == ENOTCONN || send_errno == EWOULDBLOCK) {
                 /* The peer's receive buffer is full; that is backpressure, not
                    a dead connection.  A deferrable non-blocking send keeps the
-                   remaining bytes queued for a later flush_pending().  */
+                   remaining bytes queued for a later flush_pending().
+                   ENOTCONN is deliberately NOT deferrable: a never-connected
+                   socket reports POLLOUT, so deferring would queue bytes and
+                   spin a flush loop forever with no diagnostic.  */
                 if (!blocking) {
-                    if (deferrable) {
+                    if (deferrable && send_errno != ENOTCONN) {
+                        deferred = true;
                         break;
                     }
                 } else {
@@ -447,6 +452,7 @@ bool MsgChannel::flush_writebuf(int send_flags)
                     }
                     if (ready == 0) {
                         if (deferrable) {
+                            deferred = true;
                             break;
                         }
                         log_error() << "timed out while trying to send data" << endl;
@@ -481,6 +487,21 @@ bool MsgChannel::flush_writebuf(int send_flags)
         memmove(msgbuf, msgbuf + msgofs, msgtogo);
     }
     msgofs = 0;
+
+    /* Track how long deferred output has been waiting (pending_write_age());
+       the timestamp survives partial drains so it measures the OLDEST
+       undelivered byte, and clears only when the backlog is fully flushed.
+       Bulk-only accumulation (send_msg returning before any flush) never
+       arms it.  The trace fires once per backlog episode, not per retry.  */
+    if (msgtogo) {
+        if (deferred && !pending_write_since) {
+            pending_write_since = time(nullptr);
+            trace() << "peer not accepting data, deferring " << msgtogo
+                    << " bytes for " << dump() << endl;
+        }
+    } else {
+        pending_write_since = 0;
+    }
 
     if(error) {
         set_error();
@@ -1013,6 +1034,7 @@ MsgChannel::MsgChannel(int _fd, struct sockaddr *_a, socklen_t _l, bool text)
     msgbuflen = 128;
     msgofs = 0;
     msgtogo = 0;
+    pending_write_since = 0;
     inbuf = (char *) malloc(128);
     inbuflen = 128;
     inofs = 0;

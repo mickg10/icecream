@@ -1138,6 +1138,31 @@ static time_t prune_servers()
             continue;
         }
 
+        /* Deferred dispatch replies (SendDeferrable) must not linger without
+           bound if the daemon stays alive at the TCP level but never drains
+           its socket: TCP keepalive does not cover that case, and
+           TCP_USER_TIMEOUT is #ifdef'd and platform-dependent.  Give the
+           daemon the same 30 seconds the old blocking send used to allow,
+           then treat it as dead -- this is the application-level bound that
+           keeps a stalled submitter's WAITINGFORCS jobs from pinning remote
+           slots forever.  */
+        {
+            static const time_t max_deferred_send_age = 30;
+            const time_t deferred_age = (*it)->pending_write_age(now);
+
+            if (deferred_age >= max_deferred_send_age) {
+                log_warning() << (*it)->nodeName() << " has not accepted dispatch data for "
+                              << deferred_age << "s - removing" << endl;
+                CompileServer *old = *it;
+                ++it;
+                handle_end(old, nullptr);
+                continue;
+            }
+            if (deferred_age > 0) {
+                min_time = min(min_time, max_deferred_send_age - deferred_age);
+            }
+        }
+
         /* protocol version 27 and newer use TCP keepalive */
         if (IS_PROTOCOL_VERSION(27, *it)) {
             ++it;
@@ -2751,6 +2776,11 @@ int main(int argc, char *argv[])
                invalid.  */
             ++it;
 
+            /* pollfd_is_set() also reports POLLERR/POLLHUP as "set" (its
+               check_errors default) -- deliberate here: an errored channel
+               takes the flush_pending() path below even if it never asked
+               for POLLOUT, which converges to handle_end() without waiting
+               for the read side to notice the EOF.  */
             const bool can_write = pollfd_is_set(pollfds, i, POLLOUT);
             const bool can_read = pollfd_is_set(pollfds, i, POLLIN);
 

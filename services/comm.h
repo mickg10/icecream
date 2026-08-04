@@ -275,6 +275,17 @@ public:
         return msgtogo > 0;
     }
 
+    // Seconds for which deferred output has been waiting undelivered, or 0 if
+    // no deferrable send is currently backed up (bulk-only accumulation does
+    // not count).  Lets the owner enforce an application-level bound on a
+    // peer that stays writable-never: the kernel TCP_USER_TIMEOUT bound is
+    // #ifdef'd (absent on some platforms) and SO_KEEPALIVE does not cover a
+    // peer whose TCP stack keeps ACKing while the process never reads.
+    time_t pending_write_age(time_t now) const
+    {
+        return pending_write_since ? now - pending_write_since : 0;
+    }
+
     // Try to write queued output without blocking.  A still-full peer buffer
     // just leaves the remaining bytes queued and returns true; false is
     // returned only if the connection hit a real error (the channel is in the
@@ -347,6 +358,9 @@ protected:
     size_t msgbuflen;
     size_t msgofs;
     size_t msgtogo;
+    // when the currently pending deferrable output first failed to send in
+    // full (0 = no deferred backlog); see pending_write_age()
+    time_t pending_write_since;
     char *inbuf;
     size_t inbuflen;
     size_t inofs;

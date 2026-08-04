@@ -19,12 +19,16 @@
         buffering would otherwise absorb everything).
 
       - ICECC_TEST_STRIP_USER_TIMEOUT disables the 9s TCP_USER_TIMEOUT that
-        MsgChannel arms on every TCP channel.  With it armed, the kernel
-        declares a fully stalled (zero-window) peer dead after ~9s and every
-        scheduler variant correctly tears the connection down long before
-        the 30s application timeout matters; icecream 1.4.90 as deployed in
-        the issue report has no TCP_USER_TIMEOUT, and it is in that
-        configuration that the application-level behaviour differs.
+        MsgChannel arms on every TCP channel (present in every release since
+        2020, including the issue report's 1.4.90).  The production failure
+        involves a SLOWLY-DRAINING submitter: it keeps ACKing and freeing
+        dribbles of buffer, which resets the kernel timer (TCP_USER_TIMEOUT
+        requires zero forward progress) while never freeing enough space
+        within 30s -- so the application timeout governs even with the
+        option armed.  This harness uses a full stop as a deterministic
+        stand-in for that slow drain, and a full stop WOULD trip the kernel
+        timer at ~9s on every variant alike, masking the application-level
+        behaviour under test; stripping the option isolates that behaviour.
 
     Note the submitter's SO_RCVBUF is set to 64KiB, not smaller: on Linux
     loopback the MSS is ~64KiB, and a zero-window connection whose receive
@@ -42,7 +46,18 @@
          within a few seconds at all times.
 
     Usage:
-      schedbp <icecc-scheduler> <sndbuf_shim.so> [jobs] [clog-seconds]
+      schedbp <icecc-scheduler> <sndbuf_shim.so> [jobs] [clog-seconds] [stall]
+
+    The optional "stall" mode inverts the scenario: the submitter never
+    drains at all, and the harness asserts the scheduler enforces its
+    application-level bound on deferred dispatch output (~30s) by tearing the
+    stalled submitter down -- neither instantly (which would mean a kernel
+    timeout leaked in) nor never (which would mean undelivered bytes and
+    WAITINGFORCS jobs can linger forever).  Because a run where the send
+    buffers were never really shrunk cannot jam and therefore cannot trigger
+    the teardown, stall mode also serves as the positive proof that the
+    backpressure scenario actually engages (the normal mode cannot assert
+    that from its side of the sockets).
 
     Exit code 0 if the contract holds, 1 otherwise.
 */
@@ -72,11 +87,14 @@
 
 using Clock = std::chrono::steady_clock;
 
-// Compatibility with the pre-46 Msg API (icecream <= 1.4.x has
-// `enum MsgType Msg::type` with M_* constants; newer trees use the
-// Msg::Value comparison operators).  Lets this harness compile against a
-// 1.4-era libicecc so daemons of either protocol generation can be pointed
-// at any scheduler build for cross-version testing.
+// Compatibility with the 1.4-era Msg API (pre icecc/icecream#610:
+// `enum MsgType Msg::type` with M_* constants; this tree uses the Msg::Value
+// comparison operators).  Lets the harness compile against a 1.4-era
+// libicecc so daemons of either protocol generation can be pointed at any
+// scheduler build for cross-version testing.  The auto-detect keys on a
+// macro specific to this fork's lineage, so it only distinguishes these
+// trees from 1.4-era ones; compiling against a pristine upstream master
+// (new Msg API, no such macro) would need the first branch forced.
 #ifdef PROTOCOL_VERSION_JOB_TIMING
 #define MSG_IS(m, what) (*(m) == Msg::what)
 #else
@@ -174,7 +192,12 @@ int main(int argc, char **argv)
     const std::string scheduler_bin = argv[1];
     const std::string shim = argv[2];
     int njobs = argc > 3 ? atoi(argv[3]) : 4000;
-    int clog_s = argc > 4 ? atoi(argv[4]) : 75;
+    const bool stall_mode = argc > 5 && strcmp(argv[5], "stall") == 0;
+    // Normal mode must stay under the scheduler's 30s deferred-send bound
+    // (measured from jam onset, ~1-2s into the clog): it asserts that a
+    // TRANSIENT stall loses nothing.  Stall mode goes well past the bound
+    // to assert the bound itself.
+    int clog_s = argc > 4 ? atoi(argv[4]) : (stall_mode ? 75 : 25);
     if (njobs < 1 || njobs > 100000 || clog_s < 1 || clog_s > 600) {
         fprintf(stderr, "implausible jobs/clog arguments\n");
         return 2;
@@ -198,7 +221,14 @@ int main(int argc, char **argv)
         for (int i = 0; i < 100 && !up; ++i) {
             int status = 0;
             if (waitpid(sched, &status, WNOHANG) == sched) {
-                fprintf(stderr, "scheduler exited during startup (status %d)\n", status);
+                if (WIFEXITED(status)) {
+                    fprintf(stderr, "scheduler exited during startup (exit code %d%s)\n",
+                            WEXITSTATUS(status),
+                            WEXITSTATUS(status) == 127 ? ", exec failed" : "");
+                } else {
+                    fprintf(stderr, "scheduler died during startup (signal %d)\n",
+                            WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+                }
                 return 2;
             }
             int probe = tcp_connect(port, 0);
@@ -400,6 +430,71 @@ int main(int argc, char **argv)
             ++failures;
             break;
         }
+    }
+
+    if (stall_mode) {
+        // ---- stall mode: never drain; the scheduler must cut us loose ------
+        fprintf(stderr, "# stall mode: submitter never reads; waiting for the "
+                "scheduler to enforce its deferred-send bound...\n");
+        // Passive fd-watching cannot detect the teardown here: the
+        // scheduler's FIN/RST cannot traverse our deliberately-zero receive
+        // window.  Probe actively instead -- a small send to a torn-down
+        // peer draws an RST and poisons the channel within a round trip.
+        int death_t = -1;
+        for (int i = 0; i < clog_s; ++i) {
+            sleep(1);
+#ifdef ICECC_MSGCHANNEL_HAS_DEFERRED_SEND
+            bool ping_ok = sub->send_msg(PingMsg(),
+                    MsgChannel::SendNonBlocking | MsgChannel::SendDeferrable);
+#else
+            // 1.4-era API: a plain send is fine here -- our own send
+            // direction is never backed up (the scheduler always reads).
+            bool ping_ok = sub->send_msg(PingMsg());
+#endif
+            if (!ping_ok || sub->at_eof()) {
+                death_t = i;
+                break;
+            }
+        }
+        fprintf(stderr, "# submitter connection torn down at t=%ds\n", death_t);
+        REQUIRE(death_t >= 0, "scheduler tore down the never-draining submitter");
+        // The bound is 30s of undelivered output.  Much earlier means some
+        // kernel-level timeout leaked into the test conditions; never (or
+        // only at the very end of the window) means deferred bytes and the
+        // submitter's WAITINGFORCS jobs can linger without bound.
+        REQUIRE(death_t >= 20 && death_t <= 50,
+                "teardown honoured the ~30s deferred-send age bound");
+        REQUIRE(cs_alive.load(), "compile server connection survived");
+        {
+            double pending = probe_pending_since.load();
+            if (pending >= 0) {
+                double outage = secs_since(t_prog) - pending;
+                double w = worst_reply.load();
+                while (outage > w && !worst_reply.compare_exchange_weak(w, outage)) {
+                }
+            }
+            fprintf(stderr, "# final worst control-reply latency %.1fs\n", worst_reply.load());
+        }
+        REQUIRE(worst_reply.load() < 5.0,
+                "scheduler stayed responsive (control replies < 5s)");
+        REQUIRE(!probe_died.load(), "control connection survived");
+
+        shutdown = true;
+        probe_thread.join();
+        cs_thread.join();
+        close(ctrl);
+        delete sub;
+        delete cs;
+        kill(sched, SIGTERM);
+        int status = 0;
+        waitpid(sched, &status, 0);
+
+        if (failures) {
+            fprintf(stderr, "RESULT: FAIL (%d)\n", failures);
+            return 1;
+        }
+        fprintf(stderr, "RESULT: PASS\n");
+        return 0;
     }
 
     // ---- the backpressure window: read nothing at all ----------------------

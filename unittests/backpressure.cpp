@@ -85,7 +85,10 @@ static ChannelPair make_channel_pair(int sndbuf_bytes)
         getsockopt(fds[0], SOL_SOCKET, SO_SNDBUF, &eff_snd, &l);
         l = sizeof(eff_rcv);
         getsockopt(fds[1], SOL_SOCKET, SO_RCVBUF, &eff_rcv, &l);
-        if (eff_snd + eff_rcv > 16 * sndbuf_bytes) {
+        // 64KiB = the largest jam message the suite sends; if the kernel
+        // kept more combined buffering than that, the send would complete
+        // and every jam assertion would be a false red.
+        if (eff_snd + eff_rcv >= 64 * 1024) {
             fprintf(stderr, "SKIP     - cannot shrink socket buffers "
                     "(effective %d+%d bytes); backpressure untestable here\n",
                     eff_snd, eff_rcv);
@@ -262,9 +265,10 @@ static void test_contract()
 // intactness after the drain are the observable proxy for the msgofs == 0
 // compaction invariant in flush_writebuf() and for send_msg()/flush_pending()
 // interleaving.
-static void test_multiqueue()
+static void test_multiqueue(int bufsize)
 {
-    ChannelPair p = make_channel_pair(8 * 1024);
+    fprintf(stderr, "# multiqueue with %d-byte socket buffers\n", bufsize);
+    ChannelPair p = make_channel_pair(bufsize);
 
     REQUIRE(p.snd->send_msg(PingMsg()), "handshake ping sent");
     Msg *m = p.rcv->get_msg(10);
@@ -292,6 +296,8 @@ static void test_multiqueue()
     }
     REQUIRE(all_queued, "all follower sends accepted while clogged");
     REQUIRE(!p.snd->at_eof(), "channel alive with a deep pending queue");
+    REQUIRE(p.snd->pending_write_age(time(nullptr) + 1) >= 1,
+            "deferred-output age is armed while backed up");
 
     // Drain: flush pending from one side, read everything on the other.
     std::atomic<bool> flush_ok{true};
@@ -340,6 +346,8 @@ static void test_multiqueue()
     REQUIRE(followers_in_order == kFollowers,
             "all queued messages arrived intact and in send order");
     REQUIRE(!p.snd->has_pending_write(), "pending queue fully drained");
+    REQUIRE(p.snd->pending_write_age(time(nullptr)) == 0,
+            "deferred-output age cleared after full drain");
 
     delete p.snd;
     delete p.rcv;
@@ -457,7 +465,13 @@ int main(int argc, char **argv)
 #if defined(ICECC_MSGCHANNEL_HAS_DEFERRED_SEND)
     if (which == "multiqueue" || which == "all") {
         fprintf(stderr, "=== multiqueue: many messages behind a jammed one ===\n");
-        test_multiqueue();
+        // 8KiB: the production-sized case.  2KiB: forces the partial write
+        // into chop_output()'s no-compact window (msgofs <= 8192 with > 16
+        // bytes pending), the exact case where flush_writebuf()'s
+        // unconditional compaction is load-bearing -- with it reverted this
+        // variant corrupts the stream (verified during review).
+        test_multiqueue(8 * 1024);
+        test_multiqueue(2 * 1024);
     }
     if (which == "flusherrors" || which == "all") {
         fprintf(stderr, "=== flusherrors: flush_pending dead-peer semantics ===\n");
