@@ -30,7 +30,7 @@ CONFIRMED, demonstrated by a failing/passing test in this repository.
 | `handle_end` on a DAEMON deletes the submitter and **all** its queued + in-flight jobs (`JobDone 255`) | CONFIRMED (integration: 1172–1303 jobs destroyed per run) |
 | `flush_writebuf` polls 30s and calls `set_error()` on timeout, poisoning the channel (`instate=ERROR`, `eof=true`) | CONFIRMED (unit test `contract` on base: channel `at_eof()` after timeout) |
 | Client-side error strings and daemon `clear_children()` chain | CONFIRMED by reading `client/remote.cpp:242`, `client/main.cpp:676`, `daemon/main.cpp:5616` |
-| The 30s timeout is reachable in production | CONFIRMED **with caveats** — see §4: on current master the 9s `TCP_USER_TIMEOUT` usually pre-empts it on TCP channels; the issue's 1.4.90 build predates that option, and the farm's conditions (no user timeout + small effective buffers) are exactly what the integration harness recreates. |
+| The 30s timeout is reachable in production | CONFIRMED **with caveats** — see §4.  Note the option-history detail: `TCP_USER_TIMEOUT` (added 2020, commit 3528f52) is an ancestor of the 1.4 release, so the issue's 1.4.90 farm HAD the 9s kernel timeout armed.  The 30s application timeout is reached anyway because the wedged submitters were *slowly draining*, not stopped: a peer that keeps ACKing and freeing dribbles of buffer never trips `TCP_USER_TIMEOUT` (it requires zero forward progress), while still not freeing enough space within 30s for the blocking send to complete.  The harness's full-stop clog is an extreme stand-in for that, and strips the option so the kernel does not pre-empt the application path under test. |
 
 ## 2. Fix branch audit — three defects
 
@@ -143,6 +143,21 @@ the scheduler on one daemon's socket.**
     `flush_pending()`, and failure tears the daemon down exactly like a
     read-side EOF.
   - No requeue machinery, no blocking anywhere in the dispatch path.
+* Review-driven hardening (added after the adversarial review):
+  - `MsgChannel::pending_write_age()` tracks how long deferred output has
+    waited (armed on the deferral transition, cleared on full drain, with a
+    once-per-episode trace line), and `prune_servers()` removes a daemon
+    whose deferred output has gone unaccepted for **30s** — the same bound
+    the old blocking send enforced, now platform-independent (it no longer
+    relies on the `#ifdef`'d `TCP_USER_TIMEOUT`) and enforced without
+    wedging the scheduler.  This also caps the widened client-cancel race
+    (a job cancelled while its UseCS sits deferred stays matched to its
+    server until delivery or this bound; the daemon's JobDone(107) on late
+    delivery cleans up the short-lived phantom).
+  - `ENOTCONN` is fenced out of the deferrable classification: a
+    never-connected socket polls writable, so deferring on it would queue
+    bytes and spin silently.  Only genuine backpressure (EAGAIN/EWOULDBLOCK,
+    or the blocking-poll timeout) defers.
 
 Bounding: pending bytes per submitter are bounded by its own in-flight job
 requests (~60B per dispatch reply); a daemon that never drains keeps its
@@ -152,18 +167,20 @@ up by the existing read-side paths.
 ## 4. Environment findings (matter for interpreting the issue)
 
 * **`TCP_USER_TIMEOUT` = 9s** (`MsgChannel` ctor, `services/comm.cpp:1059`)
-  means that on current master a *fully* stalled (zero-window) TCP peer is
-  killed by the kernel ~9s in — `send()` fails with `ETIMEDOUT` long before
-  the 30s poll can expire, and the submitter is torn down on **every**
-  variant, including the corrected one (the kernel has genuinely declared
-  the connection dead).  The issue's 1.4.90 deployment predates this option;
-  that configuration (recreated in the harness by stripping the option) is
-  where the 30s application timeout governs.  Consequence worth its own
-  discussion: on current master the submitter-nuke blast radius can be
-  triggered by only ~9s of daemon unresponsiveness on TCP — arguably *more*
-  fragile than 1.4.90, and worth making tunable.  Note the AF_UNIX
-  client↔daemon channels have no user timeout, so the 30s path fully applies
-  there.
+  is present in every release since 2020 (commit 3528f52 predates the 1.4
+  tag — the issue's 1.4.90 farm had it armed).  On a modern Linux kernel it
+  kills a *fully* stalled (zero-window, zero-progress) TCP peer ~9s in, on
+  every variant.  It does NOT fire for the production failure mode: a
+  slowly-draining peer keeps ACKing and freeing dribbles of buffer, which
+  resets the kernel timer while still never freeing enough space within 30s
+  — that is how the farm reached the application-level timeout with the
+  option armed.  The harness's full-stop clog is an extreme stand-in for
+  that slow drain, so it strips the option to keep the kernel from
+  pre-empting the application path under test.  The option is also
+  `#ifdef`'d (absent on some platforms), inert on the AF_UNIX
+  client↔daemon channels, and on Linux < 5.11 did not abort ACKed
+  zero-window probing — which is why the corrected fix adds its own
+  application-level bound (§3) rather than relying on it.
 * **Kernel buffer autotuning**: with default (megabyte-scale) buffers,
   dispatch replies (~60B each) essentially never jam a connection; the
   pathology needs thousands of queued jobs and/or reduced buffers.  The
@@ -181,13 +198,22 @@ up by the existing read-side paths.
 
 Unit (`unittests/backpressure`, AF_UNIX socketpair, ~30s on old branches due
 to the hardcoded poll timeout).  Beyond the two differentiating groups below,
-the suite also pins the new API's semantics on the fixed branch: `multiqueue`
-(many messages appended behind a jammed one arrive intact and in order --
-the observable form of the msgofs==0 compaction invariant), `flusherrors`
-(flush_pending() returns false only for a genuinely dead peer and leaves the
-channel errored; empty-buffer and already-errored edges), and
-`nondeferrable` (a SendNonBlocking send without SendDeferrable still fails
-fast and poisons the channel, which the monitor path relies on):
+the suite also pins the new API's semantics: `multiqueue` (fixed branch
+only; many messages appended behind a jammed one arrive intact and in order
+-- the observable form of the msgofs==0 compaction invariant; run at both
+8KiB and 2KiB socket buffers, the latter landing the partial write inside
+chop_output()'s no-compact window where review proved the unconditional
+compaction is load-bearing), `flusherrors` (fixed branch only;
+flush_pending() returns false only for a genuinely dead peer and leaves the
+channel errored; empty-buffer, already-errored, and deferred-age edges), and
+`nondeferrable` (every variant; a SendNonBlocking send without
+SendDeferrable still fails fast and poisons the channel, which the monitor
+path relies on).  The integration harness gained a split contract to match
+the new 30s bound: normal mode (25s transient stall) asserts nothing is
+lost and nothing wedges; `stall` mode (75s, never drains) asserts the
+scheduler cuts the dead submitter loose at ~30s — measured 31s — without
+wedging, which doubles as the positive proof that the backpressure scenario
+really engaged:
 
 | test | base | fix branch | corrected |
 |---|---|---|---|
@@ -223,8 +249,10 @@ g++ -std=c++17 -g -O1 -Iservices -I. unittests/schedbp.cpp \
 2. Adopt `fix/scheduler-deferred-dispatch-send` (this branch) for the
    scheduler dispatch path.
 3. Separately consider making `TCP_USER_TIMEOUT` (currently hardcoded 9s)
-   configurable/raisable: on current master it reproduces the issue's blast
-   radius after only ~9s of daemon stall, independent of this fix.
+   configurable: it kills a fully-stalled TCP peer after ~9s on every
+   variant (a smaller, kernel-level cousin of the blast radius), and its
+   platform variance is why the corrected fix carries its own 30s
+   application-level bound.
 4. If other scheduler→daemon sends (rare: pings to old protocols, conf
    pushes) ever show the same pattern, they can adopt
    `SendNonBlocking|SendDeferrable` — the main-loop flush machinery is

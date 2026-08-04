@@ -148,6 +148,46 @@ The user-suggested `[c@x f@o s@o+x]` variant inherits E's scheduler dynamics
 unchanged; per §0/§2D the c@x part contributes local observability only, so
 sequence it after the farm rather than before.
 
+### F. `[s@x f@x c@o+x]` — scheduler + farm new, clients mixed
+**Viable: yes — and it is not so much a configuration as the *steady state
+of wave C*: config B with the client migration in flight.**  Everything
+relevant decomposes per-host, so there is nothing emergent to fear:
+
+* Each c host is an independent (client + local daemon) pair with its own
+  channels to s and to f nodes; old and new client hosts never interact
+  with each other.  The effective feature level of each host's path is
+  min-of-hops, and with s@x and f@x every hop except the c-host itself is
+  already 48 — so each host's capabilities are decided purely by its own
+  version.  c@o hosts behave exactly as they do in config B (empirical
+  basis: R1 — protocol-43 submitters against the x scheduler, PASS);
+  c@x hosts behave exactly as in config C (R4, PASS).  The mixed fleet is
+  the union of two proven pairings.
+* Feature heterogeneity during the wave is per-host and graceful: c@x
+  hosts get compile timing (47) into their local web GUIs, richer
+  local-build accounting (44–46), and command summaries in scheduler logs;
+  c@o hosts keep todays behaviour.  Nothing farm- or scheduler-side keys
+  on a uniform client version.
+* Scheduling fairness is version-blind: the estimate-based queue scoring
+  keys on file names and JobDone statistics, which both generations
+  supply identically; niceness (43) is supported by both.  No starvation
+  or priority skew between old and new client hosts.
+* The Issue-1 fix protects **both** generations equally (it is
+  scheduler-side, and R1 proves the o-daemon case), including the new 30s
+  deferred-output cap (§4), which judges daemons by behaviour, not
+  version.
+* Upgrade mechanics: move each c host's client and local daemon together
+  (one package); a transiently skewed host degrades gracefully (the
+  AF_UNIX channel negotiates down; timing simply stays off) but there is
+  no reason to run skewed on purpose.
+
+Operationally this is the configuration you will actually live in for
+however long the m-host wave takes — days or weeks — and it is safe to
+pause indefinitely at any mixture, including as a de-facto end state if
+some c hosts can never be upgraded (build appliances, pinned images).
+The only cost of lingering is heterogeneous observability: timing and
+local-reason data exist only for the upgraded subset, so fleet-wide
+dashboards undercount until the wave completes.
+
 ## 3. Recommended sequence
 
 1. **E now**: start s@x alongside s@o (same netname, no persistent-clients
@@ -173,11 +213,17 @@ With s@x, dispatch replies to a stalled c-host daemon queue in scheduler
 memory instead of wedging the loop: bounded in size by that submitter's
 outstanding jobs (~60–100 B per reply; 4000 jobs ≈ 300 KB) — the request
 count is client-driven and effectively bounded by the fleet's concurrent
-compile jobs.  Time-bounded by TCP_USER_TIMEOUT (9s) once the kernel buffer
-fills against a truly dead peer; a merely-slow peer drains and costs nothing.
-There is deliberately no scheduler-side cap: the old code had the identical
-exposure hidden in kernel socket buffers, and a cap would reintroduce a
-job-destruction path for slow-but-alive submitters.
+compile jobs.  Time-bounded twice over: kernel TCP_USER_TIMEOUT (9s, both
+candidates arm it, but `#ifdef`'d and platform-dependent) for truly dead
+peers, and — post-review — an **application-level 30-second cap**: a daemon
+whose deferred dispatch output goes unaccepted for 30s is removed by
+`prune_servers()` (the same time budget the old blocking send gave a
+submitter, enforced without wedging the scheduler and independent of
+platform).  A merely-slow peer that drains within 30s loses nothing;
+sustained total non-acceptance beyond it is judged exactly as upstream
+judged it — the connection is dead — minus the collateral wedge.  Verified
+by the harness's stall mode: teardown observed at t=31s with the scheduler
+responsive throughout.
 
 ## 5. Reproduction
 
