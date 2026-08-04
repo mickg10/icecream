@@ -233,6 +233,10 @@ const int NODE_FEATURE_ENV_ZSTD = ( 1 << 1 );
 // a list of pairs of host platform, filename
 typedef std::list<std::pair<std::string, std::string> > Environments;
 
+// CLOCK_MONOTONIC seconds; immune to wall-clock steps.  Used for deferred-
+// output age accounting (see MsgChannel::pending_write_age()).
+time_t icecream_monotonic_seconds();
+
 // MsgChannel supports backpressure-tolerant sends (SendDeferrable,
 // has_pending_write(), flush_pending()).
 #define ICECC_MSGCHANNEL_HAS_DEFERRED_SEND 1
@@ -281,6 +285,9 @@ public:
     // peer that stays writable-never: the kernel TCP_USER_TIMEOUT bound is
     // #ifdef'd (absent on some platforms) and SO_KEEPALIVE does not cover a
     // peer whose TCP stack keeps ACKing while the process never reads.
+    // `now` must come from icecream_monotonic_seconds(): the timestamp is
+    // monotonic so wall-clock steps can neither disable the bound nor fire
+    // it early.
     time_t pending_write_age(time_t now) const
     {
         return pending_write_since ? now - pending_write_since : 0;

@@ -214,9 +214,14 @@ static uint64_t estimate_job_queue_score(const Job *job, time_t now)
         queue_age_s = 0;
     }
 
+    /* The age bonus is deliberately UNBOUNDED: with a cap of one estimate a
+       short job (estimate S, max score 2S) is starved forever by a sustained
+       stream of jobs whose estimate exceeds 2S.  Unbounded aging guarantees
+       every queued request eventually outranks any fixed-estimate newcomer,
+       trading a little long-job throughput for a hard no-starvation
+       property.  Niceness remains the first-order key (group ordering). */
     const uint64_t queue_age_msec = uint64_t(queue_age_s) * 1000ULL;
-    const uint64_t age_bonus = std::min<uint64_t>(estimate_msec, queue_age_msec / 2);
-    return estimate_msec + age_bonus;
+    return estimate_msec + queue_age_msec / 2;
 }
 
 static void add_runtime_estimate(const Job *job, unsigned long real_msec)
@@ -341,6 +346,13 @@ static void add_job_stats(Job *job, JobDoneMsg *msg)
 }
 
 static bool handle_end(CompileServer *cs, Msg *);
+
+/* A daemon whose deferred dispatch output has gone unaccepted this long is
+   treated as dead -- the same 30s budget the old blocking send granted,
+   enforced from prune_servers() without wedging the loop.  Ages come from
+   icecream_monotonic_seconds() so wall-clock steps cannot disable or
+   mis-fire the bound.  */
+static const time_t max_deferred_send_age = 30;
 
 static void notify_monitors(Msg *m)
 {
@@ -548,6 +560,16 @@ static JobRequestPosition get_first_job_request()
         if (group->niceness != best_niceness) {
             break;
         }
+        /* A submitter whose channel still holds deferred (undelivered)
+           dispatch replies must not be granted further assignments: each
+           assignment reserves a remote slot the client cannot use until the
+           backlog drains, so one stalled submitter could otherwise reserve
+           every compatible slot on the farm.  Selection resumes automatically
+           once flush_pending() empties the channel (or the 30s deferred-send
+           bound tears the submitter down).  */
+        if (group->submitter->has_pending_write()) {
+            continue;
+        }
         for (Job *job : group->l) {
             const uint64_t score = estimate_job_queue_score(job, now);
             if (!best.isValid() || score > best_score
@@ -562,9 +584,13 @@ static JobRequestPosition get_first_job_request()
         return best;
     }
 
-    JobRequestsGroup *first = job_requests.front();
-    assert(!first->l.empty());
-    return JobRequestPosition(first, first->l.front());
+    for (JobRequestsGroup *group : job_requests) {
+        if (!group->submitter->has_pending_write()) {
+            assert(!group->l.empty());
+            return JobRequestPosition(group, group->l.front());
+        }
+    }
+    return JobRequestPosition();   // every submitter is backed up: dispatch pauses
 }
 
 static JobRequestPosition get_next_job_request(const JobRequestPosition& pos)
@@ -1148,8 +1174,7 @@ static time_t prune_servers()
            keeps a stalled submitter's WAITINGFORCS jobs from pinning remote
            slots forever.  */
         {
-            static const time_t max_deferred_send_age = 30;
-            const time_t deferred_age = (*it)->pending_write_age(now);
+            const time_t deferred_age = (*it)->pending_write_age(icecream_monotonic_seconds());
 
             if (deferred_age >= max_deferred_send_age) {
                 log_warning() << (*it)->nodeName() << " has not accepted dispatch data for "
@@ -1216,7 +1241,7 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
 {
     JobRequestPosition jobPosition = get_first_job_request();
     if (!jobPosition.isValid()) {
-        return false;
+        return false;   // empty, or all submitters have deferred backlogs
     }
 
     assert(!css.empty());
@@ -1242,9 +1267,26 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
         }
 
         jobPosition = get_next_job_request( jobPosition );
+        /* Skip positions whose submitter has deferred output (see the
+           selection-time check above) -- their assignments could not be
+           delivered anyway.  */
+        while (jobPosition.isValid()
+               && jobPosition.job->submitter()->has_pending_write()) {
+            jobPosition = get_next_job_request( jobPosition );
+        }
+        if (jobPosition.isValid()) {
+            /* Retarget the job under test.  Without this the loop kept
+               re-evaluating the ORIGINAL job at every later position, so a
+               temporarily unschedulable queue head hid every schedulable
+               request behind it (inherited defect, amplified by score-based
+               head selection).  */
+            job = jobPosition.job;
+        }
         if (!jobPosition.isValid()) { // no job found in the whole job_requests list
             jobPosition = get_first_job_request();
-            assert( jobPosition.isValid());
+            if (!jobPosition.isValid()) {
+                return false;   // only backed-up submitters remain
+            }
             job = jobPosition.job;
             for (CompileServer * const cs : css) {
                 if(!job->preferredHost().empty() && !cs->matches(job->preferredHost()))
@@ -2566,8 +2608,35 @@ int main(int argc, char *argv[])
     while (!exit_main_loop) {
         int timeout = prune_servers();
 
+        /* Dispatch in bounded batches: draining an arbitrarily deep request
+           queue before returning to poll() starves every other scheduler
+           duty (control connections, daemon traffic, monitor feeds) for the
+           whole drain -- measured at 10+ seconds for a 20k-request flood.
+           After a full batch, poll with a zero timeout so pending fds are
+           serviced and dispatching resumes immediately.  */
+        int dispatch_batch = 128;
+        bool more_dispatch = false;
         while (empty_queue(scheduler_algo)) {
-            continue;
+            if (--dispatch_batch <= 0) {
+                more_dispatch = true;
+                break;
+            }
+        }
+        if (more_dispatch) {
+            timeout = 0;
+        } else {
+            /* The deferred-send deadline must be able to shorten a poll
+               timeout computed BEFORE dispatch created new backlog, or the
+               30s bound can silently stretch to prune_servers()'s full
+               36s ceiling.  */
+            for (CompileServer * const cs : css) {
+                const time_t age = cs->pending_write_age(icecream_monotonic_seconds());
+                if (age > 0) {
+                    const time_t remaining = age >= max_deferred_send_age
+                        ? 1 : max_deferred_send_age - age;
+                    timeout = std::min(timeout, (int)remaining);
+                }
+            }
         }
 
         /* Announce ourselves from time to time, to make other possible schedulers disconnect

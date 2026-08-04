@@ -458,6 +458,38 @@ int main(int argc, char **argv)
         }
         fprintf(stderr, "# submitter connection torn down at t=%ds\n", death_t);
         REQUIRE(death_t >= 0, "scheduler tore down the never-draining submitter");
+        // BP-1 regression guard: a submitter with deferred (undelivered)
+        // dispatch output must stop receiving new assignments.  The gate is
+        // per-backlog-episode, so assignments continue while the kernel
+        // still accepts bytes (sndbuf + peer rcvbuf, ~72 KiB here, i.e.
+        // ~1-2.5k replies) and stop for good once that capacity is full --
+        // the same physical exposure the old blocking send had, without the
+        // wedge.  Pre-fix behaviour granted ALL requests; assert we stop
+        // well short of that.
+        {
+            FILE *lf = fopen("schedbp-scheduler.log", "r");
+            int puts_total = -1, puts_after_defer = -1;
+            if (lf) {
+                char line[4096];
+                bool deferred_seen = false;
+                puts_total = puts_after_defer = 0;
+                while (fgets(line, sizeof(line), lf)) {
+                    if (strstr(line, "deferring")) {
+                        deferred_seen = true;
+                    } else if (strstr(line, " in joblist of ")) {
+                        ++puts_total;
+                        if (deferred_seen) {
+                            ++puts_after_defer;
+                        }
+                    }
+                }
+                fclose(lf);
+            }
+            fprintf(stderr, "# assignments: total=%d after-first-deferral=%d (of %d requests)\n",
+                    puts_total, puts_after_defer, njobs);
+            REQUIRE(puts_total >= 0 && puts_total < (njobs * 3) / 4,
+                    "dispatch stopped for the backed-up submitter well before all requests (BP-1)");
+        }
         // The bound is 30s of undelivered output.  Much earlier means some
         // kernel-level timeout leaked into the test conditions; never (or
         // only at the very end of the window) means deferred bytes and the

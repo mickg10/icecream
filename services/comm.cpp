@@ -380,6 +380,15 @@ void MsgChannel::writefull(const void *_buf, size_t count)
     msgtogo += count;
 }
 
+time_t icecream_monotonic_seconds()
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return time(nullptr);   // last resort; only affects age accounting
+    }
+    return ts.tv_sec;
+}
+
 static size_t get_max_write_size()
 {
     if( const char* icecc_slow_network = getenv( "ICECC_SLOW_NETWORK" ))
@@ -495,7 +504,7 @@ bool MsgChannel::flush_writebuf(int send_flags)
        arms it.  The trace fires once per backlog episode, not per retry.  */
     if (msgtogo) {
         if (deferred && !pending_write_since) {
-            pending_write_since = time(nullptr);
+            pending_write_since = icecream_monotonic_seconds();
             trace() << "peer not accepting data, deferring " << msgtogo
                     << " bytes for " << dump() << endl;
         }
@@ -1044,9 +1053,15 @@ MsgChannel::MsgChannel(int _fd, struct sockaddr *_a, socklen_t _l, bool text)
     set_error_recursion = false;
     maximum_remote_protocol = -1;
 
+    /* TCP-only socket options are pointless on AF_UNIX channels and their
+       failures can consume one-shot diagnostics (e.g. the congestion-control
+       log-once) before a real TCP channel gets to report.  */
+    const bool is_tcp_channel = addr == nullptr || addr->sa_family == AF_INET
+                                || addr->sa_family == AF_INET6;
+
     int on = 1;
 
-    if (!setsockopt(_fd, SOL_SOCKET, SO_KEEPALIVE, (char *) &on, sizeof(on))) {
+    if (is_tcp_channel && !setsockopt(_fd, SOL_SOCKET, SO_KEEPALIVE, (char *) &on, sizeof(on))) {
 #if defined( TCP_KEEPIDLE ) || defined( TCPCTL_KEEPIDLE )
 #if defined( TCP_KEEPIDLE )
         int keepidle = TCP_KEEPIDLE;
@@ -1077,11 +1092,15 @@ MsgChannel::MsgChannel(int _fd, struct sockaddr *_a, socklen_t _l, bool text)
     }
 
 #ifdef TCP_USER_TIMEOUT
-    int timeout = 3 * 3 * 1000; // matches the timeout part of keepalive above, in milliseconds
-    setsockopt(_fd, IPPROTO_TCP, TCP_USER_TIMEOUT, (char *) &timeout, sizeof(timeout));
+    if (is_tcp_channel) {
+        int timeout = 3 * 3 * 1000; // matches the timeout part of keepalive above, in milliseconds
+        setsockopt(_fd, IPPROTO_TCP, TCP_USER_TIMEOUT, (char *) &timeout, sizeof(timeout));
+    }
 #endif
 
-    maybe_set_tcp_congestion_control(_fd);
+    if (is_tcp_channel) {
+        maybe_set_tcp_congestion_control(_fd);
+    }
 
     if (fcntl(fd, F_SETFL, O_NONBLOCK) < 0) {
         log_perror("MsgChannel fcntl()");
