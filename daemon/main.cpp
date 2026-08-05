@@ -160,12 +160,27 @@ static FdSnapshot collect_fd_snapshot()
     return snapshot;
 }
 
+/* Linux argv and file names are byte strings, not UTF-8, but the responses
+   and JSONL we emit declare UTF-8.  json_escape() validates as it escapes
+   and replaces any malformed sequence with U+FFFD, so a stray 0x80-0xff
+   byte in a path or command line cannot produce a document that a strict
+   parser rejects.  */
+static size_t utf8_sequence_length(unsigned char c)
+{
+    if (c < 0x80) return 1;
+    if ((c & 0xe0) == 0xc0) return 2;
+    if ((c & 0xf0) == 0xe0) return 3;
+    if ((c & 0xf8) == 0xf0) return 4;
+    return 0;   // continuation byte or invalid lead
+}
+
 static string json_escape(const string &s)
 {
     string out;
     out.reserve(s.size() + 16);
 
-    for (unsigned char c : s) {
+    for (size_t i = 0; i < s.size(); ++i) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
         switch (c) {
         case '"':
             out += "\\\"";
@@ -193,8 +208,28 @@ static string json_escape(const string &s)
                 char buf[7];
                 snprintf(buf, sizeof(buf), "\\u%04x", int(c));
                 out += buf;
-            } else {
+            } else if (c < 0x80) {
                 out += char(c);
+            } else {
+                /* Validate the multi-byte sequence before copying it; any
+                   malformed byte becomes U+FFFD so the output is always
+                   well-formed UTF-8 (see the note above this function).  */
+                const size_t len = utf8_sequence_length(c);
+                bool ok = len >= 2 && len <= 4 && i + len <= s.size();
+                if (ok) {
+                    for (size_t k = 1; k < len; ++k) {
+                        if ((static_cast<unsigned char>(s[i + k]) & 0xc0) != 0x80) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if (ok) {
+                    out.append(s, i, len);
+                    i += len - 1;
+                } else {
+                    out += "\xef\xbf\xbd";   // U+FFFD REPLACEMENT CHARACTER
+                }
             }
         }
     }
@@ -849,6 +884,9 @@ enum FulljobPolicy { FULLJOB_COMPILE_LANE, FULLJOB_EXCLUSIVE };
 FulljobPolicy fulljob_policy = FULLJOB_COMPILE_LANE;
 const size_t insights_graph_minutes = 100;
 const size_t insights_retention_minutes = 120;
+// visibility for the clock-correction paths above
+uint64_t insights_clock_resets = 0;
+uint64_t insights_dropped_jobs = 0;
 
 size_t cache_size_limit = 256 * 1024 * 1024;
 
@@ -3232,6 +3270,21 @@ void Daemon::update_insights_history(const JobHistoryEntry &entry)
     }
     const time_t minute_ts = entry.end_ts - (entry.end_ts % 60);
     if (insights_history.empty() || insights_history.back().minute_ts < minute_ts) {
+        /* Wall-clock steps must not drive allocation.  A forward jump (an
+           RTC correction, NTP catching up on a machine that booted with a
+           bad clock) could otherwise append one bucket per missing minute
+           in an unbounded loop -- millions of buckets, in the main loop,
+           before retention pruning ever runs.  Clamp the backfill to the
+           retention window, and treat anything larger as a discontinuity:
+           the old series describes a different timeline, so reset it.  */
+        const time_t gap_minutes = insights_history.empty()
+            ? 0 : (minute_ts - insights_history.back().minute_ts) / 60;
+        if (gap_minutes > time_t(insights_retention_minutes)) {
+            log_warning() << "insights: clock discontinuity of " << gap_minutes
+                          << " minutes - resetting the series" << endl;
+            insights_history.clear();
+            ++insights_clock_resets;
+        }
         time_t next_minute = insights_history.empty()
                              ? minute_ts
                              : (insights_history.back().minute_ts + 60);
@@ -3263,6 +3316,10 @@ void Daemon::update_insights_history(const JobHistoryEntry &entry)
         }
     }
     if (!bucket) {
+        /* The job's minute is older than anything retained (a backward clock
+           step, or a very late record).  Dropping it is correct -- but it
+           must be visible, not silent.  */
+        ++insights_dropped_jobs;
         return;
     }
 
@@ -4241,6 +4298,8 @@ std::string Daemon::dump_state_json() const
     o << "\"slots\":{";
     o << "\"max_kids\":" << max_kids << ",";
     o << "\"max_preprocess_kids\":" << max_preprocess_kids << ",";
+    o << "\"insights_clock_resets\":" << insights_clock_resets << ",";
+    o << "\"insights_dropped_jobs\":" << insights_dropped_jobs << ",";
     o << "\"fulljob_policy\":\""
       << (fulljob_policy == FULLJOB_EXCLUSIVE ? "exclusive" : "compile-lane") << "\",";
     o << "\"fulljob_active\":" << fulljob_active << ",";
