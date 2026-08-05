@@ -44,6 +44,7 @@
 #include <map>
 #include <queue>
 #include <algorithm>
+#include <tuple>
 #include <cassert>
 #include <fstream>
 #include <string>
@@ -114,6 +115,17 @@ static map<unsigned int, Job *> jobs;
 /* XXX Uah.  Don't use a queue for the job requests.  It's a hell
    to delete anything out of them (for clean up).  */
 // Job requests from one submitter.
+/* Static selection key.  score(t) = estimate + (t - enqueue)/2, and the
+   difference between any two jobs' scores has no time term, so the order is
+   fully decided by K = estimate - enqueue/2.  Signed 64-bit: the monotonic
+   clock and any plausible estimate are far below 2^62, so the subtraction
+   cannot wrap (the review's correction to an unsigned formulation).  */
+static int64_t job_static_score_key(const Job *job)
+{
+    return (int64_t)job->estimateSnapshotMsec()
+         - (int64_t)(job->enqueueMonoMsec() / 2);
+}
+
 struct JobRequestsGroup {
     list<Job *> l;
     CompileServer *submitter;
@@ -121,6 +133,13 @@ struct JobRequestsGroup {
     // Values <0 are mapped to 0 (otherwise somebody could use this to starve
     // the whole cluster).
     int niceness;
+    /* Score index over l: {static key, -(int64)id, job}, so *rbegin() is the
+       selection winner (max key, then smallest id) in O(1).  l keeps FIFO
+       order for the 60s promotion deadline -- its front is always the
+       group's oldest request.  Both structures hold exactly the same jobs;
+       all mutation goes through add_job()/remove_job().  */
+    std::multiset<std::tuple<int64_t, int64_t, Job *>> byScore;
+    void add_job(Job *);
     bool remove_job(Job *);
 };
 // All pending job requests, grouped by the same submitter and niceness value,
@@ -161,15 +180,29 @@ static float server_speed(CompileServer *cs, Job *job = nullptr, bool blockDebug
 
 /* Searches the queue for JOB and removes it.
    Returns true if something was deleted.  */
+void JobRequestsGroup::add_job(Job *job)
+{
+    l.push_back(job);
+    job->setQueueIt(--l.end());
+    job->setQueued(true);
+    byScore.insert(std::make_tuple(job_static_score_key(job),
+                                   -(int64_t)job->id(), job));
+}
+
 bool JobRequestsGroup::remove_job(Job *job)
 {
-    assert(niceness == job->niceness());
-    for (list<Job *>::iterator it = l.begin(); it != l.end(); ++it)
-        if (*it == job) {
-            l.erase(it);
-            return true;
-        }
-    return false;
+    /* Membership without scanning: a job lives in at most one group, and
+       (submitter, niceness) pairs are unique across groups, so the caller's
+       submitter check plus this niceness check plus the queued flag prove
+       the stored iterator belongs to this->l.  */
+    if (!job->queued() || niceness != job->niceness()) {
+        return false;
+    }
+    l.erase(job->queueIt());
+    byScore.erase(std::make_tuple(job_static_score_key(job),
+                                  -(int64_t)job->id(), job));
+    job->setQueued(false);
+    return true;
 }
 
 static uint64_t default_estimated_real_msec(const Job *job)
@@ -460,6 +493,11 @@ static uint64_t max_outstanding_stall_msec = 180 * 1000;   // --dispatch-stall-t
    The clamp always leaves one slot's worth of credit for someone else.  */
 static unsigned int cached_remote_farm_slots = 0;
 
+/* Ingress cap: messages handled per connection per main-loop iteration.
+   Keeps a flooding submitter from monopolizing the loop between polls; the
+   remainder is serviced on the next (zero-timeout) iteration.  */
+static const int max_inbound_msgs_per_conn_per_loop = 32;
+
 static unsigned int effective_dispatch_credit()
 {
     unsigned int credit = max_outstanding_dispatches;
@@ -625,14 +663,14 @@ static void enqueue_job_request(Job *job)
     }
     for( list<JobRequestsGroup*>::iterator it = job_requests.begin(); it != job_requests.end(); ++it ) {
         if( (*it)->submitter == job->submitter() && (*it)->niceness == job->niceness()) {
-            (*it)->l.push_back(job);
+            (*it)->add_job(job);
             return;
         }
         if( (*it)->niceness > job->niceness()) { // lower priority starts here, insert group
             JobRequestsGroup *newone = new JobRequestsGroup();
             newone->submitter = job->submitter();
             newone->niceness = job->niceness();
-            newone->l.push_back(job);
+            newone->add_job(job);
             job_requests.insert(it, newone);
             return;
         }
@@ -640,7 +678,7 @@ static void enqueue_job_request(Job *job)
     JobRequestsGroup *newone = new JobRequestsGroup();
     newone->submitter = job->submitter();
     newone->niceness = job->niceness();
-    newone->l.push_back(job);
+    newone->add_job(job);
     job_requests.push_back(newone);
 }
 
@@ -703,68 +741,74 @@ static JobRequestPosition get_first_job_request()
         return JobRequestPosition();
     }
 
-    const int best_niceness = job_requests.front()->niceness;
-    JobRequestPosition best;
-    uint64_t best_score = 0;
     const uint64_t now_mono_msec = icecream_monotonic_msec();
 
-    /* Deadline-first LPT within the active niceness: any request that has
-       waited longer than the promotion interval outranks all normal
-       scoring, oldest first (ties by enqueue order).  Below that interval
-       the estimate-weighted score chooses, which keeps the
-       longest-processing-time behaviour that shortens makespan.  */
+    /* Active band: the first niceness level that has a dispatchable
+       submitter.  Groups are sorted by niceness, so this also lets a lower
+       band be served with full scoring/promotion when every group above it
+       is gated -- previously a gated top band degraded selection to a bare
+       FIFO fallback with neither scores nor deadlines applied.  */
+    int best_niceness = -1;
+    for (JobRequestsGroup *group : job_requests) {
+        if (submitter_accepts_dispatch(group->submitter)) {
+            best_niceness = group->niceness;
+            break;
+        }
+    }
+    if (best_niceness < 0) {
+        return JobRequestPosition();   // every submitter is gated: dispatch pauses
+    }
+
+    /* Deadline-first LPT within the active band, O(groups) total: each
+       group's FIFO front is its oldest request (promotion candidate), and
+       *byScore.rbegin() is its score winner -- the static key means neither
+       needs a walk over the group's jobs.  */
     JobRequestPosition overdue;
     uint64_t overdue_enqueue_mono = 0;
+    JobRequestPosition best;
+    int64_t best_key = 0;
 
     for (JobRequestsGroup *group : job_requests) {
-        if (group->niceness != best_niceness) {
+        if (group->niceness < best_niceness) {
+            continue;
+        }
+        if (group->niceness > best_niceness) {
             break;
         }
         /* A submitter whose channel still holds deferred (undelivered)
-           dispatch replies must not be granted further assignments: each
-           assignment reserves a remote slot the client cannot use until the
-           backlog drains, so one stalled submitter could otherwise reserve
-           every compatible slot on the farm.  Selection resumes automatically
-           once flush_pending() empties the channel (or the 30s deferred-send
-           bound tears the submitter down).  */
+           dispatch replies -- or its full credit of unconfirmed dispatches --
+           must not be granted further assignments; see
+           submitter_accepts_dispatch().  Gated groups are skipped whole, so
+           an ineligible submitter's jobs are never popped and restored.  */
         if (!submitter_accepts_dispatch(group->submitter)) {
             continue;
         }
-        for (Job *job : group->l) {
-            if (now_mono_msec - job->enqueueMonoMsec()
-                    >= uint64_t(max_queue_wait_promotion_s) * 1000ULL) {
-                if (!overdue.isValid() || job->enqueueMonoMsec() < overdue_enqueue_mono
-                        || (job->enqueueMonoMsec() == overdue_enqueue_mono
-                            && job->id() < overdue.job->id())) {
-                    overdue = JobRequestPosition(group, job);
-                    overdue_enqueue_mono = job->enqueueMonoMsec();
-                }
-                continue;
+        assert(!group->l.empty());
+        Job *oldest = group->l.front();
+        if (now_mono_msec - oldest->enqueueMonoMsec()
+                >= uint64_t(max_queue_wait_promotion_s) * 1000ULL) {
+            if (!overdue.isValid() || oldest->enqueueMonoMsec() < overdue_enqueue_mono
+                    || (oldest->enqueueMonoMsec() == overdue_enqueue_mono
+                        && oldest->id() < overdue.job->id())) {
+                overdue = JobRequestPosition(group, oldest);
+                overdue_enqueue_mono = oldest->enqueueMonoMsec();
             }
-            const uint64_t score = estimate_job_queue_score(job, now_mono_msec);
-            if (!best.isValid() || score > best_score
-                    || (score == best_score && job->id() < best.job->id())) {
-                best = JobRequestPosition(group, job);
-                best_score = score;
-            }
+            continue;
+        }
+        auto top = group->byScore.rbegin();
+        Job *candidate = std::get<2>(*top);
+        const int64_t key = std::get<0>(*top);
+        if (!best.isValid() || key > best_key
+                || (key == best_key && candidate->id() < best.job->id())) {
+            best = JobRequestPosition(group, candidate);
+            best_key = key;
         }
     }
 
     if (overdue.isValid()) {
         return overdue;   // hard promotion wins over any score
     }
-
-    if (best.isValid()) {
-        return best;
-    }
-
-    for (JobRequestsGroup *group : job_requests) {
-        if (submitter_accepts_dispatch(group->submitter)) {
-            assert(!group->l.empty());
-            return JobRequestPosition(group, group->l.front());
-        }
-    }
-    return JobRequestPosition();   // every submitter is gated: dispatch pauses
+    return best;
 }
 
 /* Circular successor of `pos`, or an invalid position once the walk has
@@ -780,9 +824,9 @@ static JobRequestPosition get_next_job_request(const JobRequestPosition& pos,
 
     JobRequestsGroup* group = pos.group;
     JobRequestPosition next;
-    // Get next job in the same group.
-    list<Job*>::iterator jobIt = std::find(group->l.begin(), group->l.end(), pos.job);
-    assert(jobIt != group->l.end());
+    // Get next job in the same group -- O(1) via the job's stored position.
+    list<Job*>::iterator jobIt = pos.job->queueIt();
+    assert(*jobIt == pos.job);
     ++jobIt;
     if( jobIt != group->l.end()) {
         next = JobRequestPosition( group, *jobIt );
@@ -1824,21 +1868,12 @@ static bool handle_job_done(CompileServer *cs, Msg *_m)
                 list<JobRequestsGroup *>::iterator it;
 
                 for (it = job_requests.begin(); it != job_requests.end(); ++it)
-                    if ((*it)->submitter == cs) {
-                        JobRequestsGroup *l = *it;
-                        list<Job *>::iterator jit;
-
-                        for (jit = l->l.begin(); jit != l->l.end(); ++jit) {
-                            if (*jit == j) {
-                                l->l.erase(jit);
-                                break;
-                            }
+                    if ((*it)->submitter == cs && (*it)->remove_job(j)) {
+                        if ((*it)->l.empty()) {
+                            delete *it;
+                            job_requests.erase(it);
                         }
-
-                        if (l->l.empty()) {
-                            it = job_requests.erase(it);
-                            break;
-                        }
+                        break;
                     }
             }
         }
@@ -2971,6 +3006,7 @@ int main(int argc, char *argv[])
         pfd.events = POLLIN;
         pollfds.push_back( pfd );
 
+        bool has_buffered_inbound = false;
         for (map<int, CompileServer *>::const_iterator it = fd2cs.begin(); it != fd2cs.end();) {
             int i = it->first;
             CompileServer *cs = it->second;
@@ -2979,10 +3015,21 @@ int main(int argc, char *argv[])
 
             /* handle_activity() can delete c and make the iterator
                invalid.  */
-            while (ok && cs->has_msg()) {
+            /* Bounded ingress: one connection with a deep buffer of parsed
+               messages must not monopolize the loop -- an indexed queue
+               cannot meet the control-latency target if a flooding
+               submitter's requests are all admitted before poll() runs
+               again.  Leftovers are already in userspace, so poll() cannot
+               signal them: the flag below forces a zero-timeout poll and the
+               next iteration continues the drain.  */
+            int inbound_budget = max_inbound_msgs_per_conn_per_loop;
+            while (ok && cs->has_msg() && inbound_budget-- > 0) {
                 if (!handle_activity(cs)) {
                     ok = false;
                 }
+            }
+            if (ok && cs->has_msg()) {
+                has_buffered_inbound = true;
             }
 
             if (ok) {
@@ -3011,6 +3058,12 @@ int main(int argc, char *argv[])
                 pfd.events = POLLIN | POLLOUT;
                 pollfds.push_back( pfd );
             }
+        }
+
+        if (has_buffered_inbound) {
+            /* Parsed messages are waiting in userspace buffers; poll() knows
+               nothing about them.  Service fds without sleeping.  */
+            timeout = 0;
         }
 
         int active_fds = poll(pollfds.data(), pollfds.size(), timeout * 1000);

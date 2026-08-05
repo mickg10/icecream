@@ -85,6 +85,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <algorithm>
 
 using Clock = std::chrono::steady_clock;
 
@@ -124,7 +125,8 @@ static const char *kEnv = "testenv";
 static const unsigned int kCsPort = 10245;
 
 static pid_t start_scheduler(const std::string &binary, const std::string &shim,
-                             int port, const std::string &logfile)
+                             int port, const std::string &logfile,
+                             const char *verbosity)
 {
     pid_t pid = fork();
     if (pid != 0) {
@@ -145,7 +147,7 @@ static pid_t start_scheduler(const std::string &binary, const std::string &shim,
     }
     char portbuf[16];
     snprintf(portbuf, sizeof(portbuf), "%d", port);
-    execl(binary.c_str(), binary.c_str(), "-p", portbuf, "-vvv", (char *)nullptr);
+    execl(binary.c_str(), binary.c_str(), "-p", portbuf, verbosity, (char *)nullptr);
     perror("execl icecc-scheduler");
     _exit(127);
 }
@@ -203,6 +205,15 @@ int main(int argc, char **argv)
        credit) while other submitters keep being served.  It does not wait
        for any teardown deadline.  */
     const bool gate_mode = argc > 5 && strcmp(argv[5], "gate") == 0;
+    /* "perf": the measurement mode for perfgate.sh.  Identical workload, but
+       the scheduler runs at production verbosity -- at -vvv the trace stream
+       (a flushed write per line, several lines per job) dominates the
+       profile (~87%% of scheduler time at depth 20k) and its writeback
+       stalls produce multi-second latency spikes that say nothing about the
+       dispatch path being measured.  The log-parsing assertions are skipped;
+       reply integrity, responsiveness bounds and the phase distributions
+       remain.  */
+    const bool perf_mode = argc > 5 && strcmp(argv[5], "perf") == 0;
     /* Optional farm size (argv[6], gate mode): the fake compile server
        advertises exactly this many slots instead of "always enough".  The
        scheduler then clamps the per-submitter dispatch credit to slots-1,
@@ -227,7 +238,8 @@ int main(int argc, char **argv)
     signal(SIGPIPE, SIG_IGN);
 
     fprintf(stderr, "# port=%d jobs=%d clog=%ds\n", port, njobs, clog_s);
-    pid_t sched = start_scheduler(scheduler_bin, shim, port, "schedbp-scheduler.log");
+    pid_t sched = start_scheduler(scheduler_bin, shim, port, "schedbp-scheduler.log",
+                                  perf_mode ? "-v" : "-vvv");
     if (sched < 0) {
         perror("fork");
         return 2;
@@ -361,6 +373,39 @@ int main(int argc, char **argv)
     std::atomic<bool> probe_died{false};
     const Clock::time_point t_prog = Clock::now();
     std::atomic<double> probe_pending_since{-1.0};   // seconds since t_prog, -1 = idle
+    /* Phase-tagged latency samples: 0 = ingress (requests still being
+       submitted), 1 = drain (queue emptying after the flood).  The perf gate
+       needs both distributions -- a scheduler that answers promptly once all
+       requests have arrived but not while accepting them still misses the
+       operational target.  Every sample is retained; percentiles are
+       computed at the end.  */
+    std::atomic<int> probe_phase{0};
+    std::mutex sample_mutex;
+    std::vector<std::pair<int, double>> probe_samples;
+    auto print_phase_summary = [&]() {
+        /* Machine-readable per-phase distributions for the perf gate.  */
+        std::lock_guard<std::mutex> lock(sample_mutex);
+        for (int ph = 0; ph <= 1; ++ph) {
+            std::vector<double> v;
+            for (const auto &sample : probe_samples) {
+                if (sample.first == ph) {
+                    v.push_back(sample.second);
+                }
+            }
+            std::sort(v.begin(), v.end());
+            auto pctl = [&](double p) {
+                if (v.empty()) {
+                    return 0.0;
+                }
+                size_t idx = (size_t)(p * (v.size() - 1) + 0.5);
+                return v[idx];
+            };
+            fprintf(stderr,
+                    "# perf %s samples=%zu p95=%.3f p99=%.3f max=%.3f\n",
+                    ph == 0 ? "ingress" : "drain", v.size(),
+                    pctl(0.95), pctl(0.99), v.empty() ? 0.0 : v.back());
+        }
+    };
     int ctrl = tcp_connect(port + 1, 0);
     if (ctrl < 0) {
         fprintf(stderr, "cannot connect control channel\n");
@@ -398,6 +443,7 @@ int main(int argc, char **argv)
                 }
             }
             Clock::time_point t0 = Clock::now();
+            const int phase_at_send = probe_phase.load();
             probe_pending_since = secs_since(t_prog);
             if (write(ctrl, "listcs\n", 7) != 7) {
                 probe_died = true;
@@ -426,8 +472,12 @@ int main(int argc, char **argv)
             double w = worst_reply.load();
             while (lat > w && !worst_reply.compare_exchange_weak(w, lat)) {
             }
+            {
+                std::lock_guard<std::mutex> lock(sample_mutex);
+                probe_samples.emplace_back(phase_at_send, lat);
+            }
             probe_pending_since = -1.0;
-            for (int i = 0; i < 10 && !shutdown; ++i) {
+            for (int i = 0; i < 2 && !shutdown; ++i) {
                 usleep(100 * 1000);
             }
         }
@@ -526,6 +576,7 @@ int main(int argc, char **argv)
     }
 
     fprintf(stderr, "# requesting %d jobs\n", njobs);
+    probe_phase = 0;
     for (int i = 1; i <= njobs; ++i) {
         char fname[64];
         snprintf(fname, sizeof(fname), "file%04d.cpp", i);
@@ -538,6 +589,7 @@ int main(int argc, char **argv)
             break;
         }
     }
+    probe_phase = 1;   // ingress over: everything from here is drain
 
     if (gate_mode) {
         fprintf(stderr, "# gate mode: submitter stops reading for %ds\n", clog_s);
@@ -739,6 +791,7 @@ int main(int argc, char **argv)
             }
             fprintf(stderr, "# final worst control-reply latency %.1fs\n", worst_reply.load());
         }
+        print_phase_summary();
         REQUIRE(worst_reply.load() < 5.0,
                 "scheduler stayed responsive (control replies < 5s)");
         REQUIRE(!probe_died.load(), "control connection survived");
@@ -845,6 +898,7 @@ int main(int argc, char **argv)
         }
         fprintf(stderr, "# final worst control-reply latency %.1fs\n", worst_reply.load());
     }
+    print_phase_summary();
     REQUIRE(worst_reply.load() < 5.0,
             "scheduler stayed responsive (control replies < 5s)");
     // A scheduler wedged in blocking sends for > MAX_SCHEDULER_PING stops

@@ -76,6 +76,14 @@ public:
     // under whatever the client happened to list first.
     const std::string &selectedEnvironment() const { return m_selectedEnvironment; }
     void setSelectedEnvironment(const std::string &env) { m_selectedEnvironment = env; }
+    // Queue membership bookkeeping owned by JobRequestsGroup: the stored
+    // list position makes removal O(1), and the flag plus the
+    // (submitter, niceness) pair -- unique per group -- prove membership
+    // without scanning.
+    bool queued() const { return m_queued; }
+    void setQueued(bool value) { m_queued = value; }
+    std::list<Job *>::iterator queueIt() const { return m_queueIt; }
+    void setQueueIt(std::list<Job *>::iterator it) { m_queueIt = it; }
 
     CompileServer *server() const;
     void setServer(CompileServer *server);
@@ -151,6 +159,8 @@ private:
     bool m_dispatchOutstanding = false;
     uint64_t m_dispatchDebitMsec = 0;
     uint64_t m_enqueueMonoMsec = 0;
+    bool m_queued = false;
+    std::list<Job *>::iterator m_queueIt;
     uint64_t m_estimateSnapshotMsec = 0;
     std::string m_selectedEnvironment;
     std::list<Job *> m_masterJobFor;

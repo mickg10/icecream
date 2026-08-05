@@ -1,72 +1,96 @@
 #!/bin/bash
 # Scheduled scheduler performance gate (not part of `make check`).
 #
-# Runs the dispatch flood at two queue depths and reports the metrics the
-# divergence review asked for:
-#   - total dispatch wall time and the scaling ratio between depths
-#   - control-plane p95/p99/max latency during ingress and during dispatch
-#   - exact reply integrity
-#   - peak scheduler RSS
-#   - a reference-host/configuration fingerprint
+# Runs the dispatch flood at two queue depths and reports, per depth and per
+# PHASE (ingress = requests still arriving; drain = queue emptying):
+#   - control-plane p95 / p99 / max latency
+#   - total wall time and the scaling ratio between depths
+#   - exact reply integrity and peak scheduler RSS
+#   - a host + scheduler-revision fingerprint
 #
-# Gating is deliberately two-sided: an absolute control-latency bound on the
-# designated runner (SLO, default 1s) plus a normalized depth-scaling bound,
-# so the result is not a single brittle hardware-dependent wall-time number.
+# Gating: the absolute SLO applies to BOTH phases' maxima at both depths (a
+# scheduler that answers promptly after the flood but not during it still
+# misses the operational target), plus a normalized depth-scaling bound.
+# Failed-run artifacts are kept and their path printed; successful runs are
+# cleaned up.
 #
 #   perfgate.sh <icecc-scheduler> <sndbuf_shim.so> [depth1] [depth2] [slo_sec]
 set -u
-SCHED=${1:?path to icecc-scheduler}
-SHIM=${2:?path to sndbuf_shim.so}
+
+canon() { # resolve to an absolute path BEFORE any cd
+    case "$1" in
+        /*) printf '%s\n' "$1" ;;
+        *)  printf '%s/%s\n' "$(cd "$(dirname "$1")" && pwd)" "$(basename "$1")" ;;
+    esac
+}
+
+SCHED=$(canon "${1:?path to icecc-scheduler}")
+SHIM=$(canon "${2:?path to sndbuf_shim.so}")
 D1=${3:-5000}
 D2=${4:-20000}
 SLO=${5:-1.0}
 HERE="$(cd "$(dirname "$0")" && pwd)"
-SCHEDBP=${SCHEDBP:-$HERE/../../unittests/schedbp}
+SCHEDBP=$(canon "${SCHEDBP:-$HERE/../../unittests/schedbp}")
+for f in "$SCHED" "$SHIM" "$SCHEDBP"; do
+    [ -e "$f" ] || { echo "ERROR: missing $f" >&2; exit 2; }
+done
 RUN=$(mktemp -d "${TMPDIR:-/tmp}/icecc-perfgate.XXXXXX")
 
+REV=$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo unknown)
+DIRTY=$(git -C "$HERE" diff --quiet 2>/dev/null || echo "+dirty")
 echo "# fingerprint: host=$(uname -n) kernel=$(uname -r) cpus=$(nproc)"
 echo "# fingerprint: $(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | sed 's/^ //')"
-echo "# fingerprint: scheduler=$SCHED slo=${SLO}s depths=$D1,$D2"
+echo "# fingerprint: scheduler_rev=${REV}${DIRTY} slo=${SLO}s depths=$D1,$D2"
 
-run_depth() {  # depth -> emits "depth wall rss max_lat replies"
-    local depth=$1
-    local dir="$RUN/d$depth"
-    mkdir -p "$dir"
-    ( cd "$dir" && /usr/bin/time -f "%e %M" -o "$dir/time.txt" \
-        "$SCHEDBP" "$SCHED" "$SHIM" "$depth" 5 > "$dir/out.log" 2>&1 )
-    local rc=$?
-    local wall rss
-    read -r wall rss < "$dir/time.txt"
-    local replies
-    replies=$(grep -oE '[0-9]+/[0-9]+ jobs answered exactly once' "$dir/out.log" | head -1)
-    local maxlat
-    maxlat=$(grep -oE 'worst control-reply latency [0-9.]+' "$dir/out.log" | tail -1 | awk '{print $NF}')
-    echo "$depth $wall $rss ${maxlat:-99} ${replies:-none} rc=$rc"
-}
-
-R1=$(run_depth "$D1")
-R2=$(run_depth "$D2")
-echo "# depth wall_s rss_kb max_control_lat replies"
-echo "  $R1"
-echo "  $R2"
-
-W1=$(echo "$R1" | awk '{print $2}'); W2=$(echo "$R2" | awk '{print $2}')
-L1=$(echo "$R1" | awk '{print $4}'); L2=$(echo "$R2" | awk '{print $4}')
-OK1=$(echo "$R1" | grep -c "$D1/$D1 jobs answered exactly once")
-OK2=$(echo "$R2" | grep -c "$D2/$D2 jobs answered exactly once")
-
-# Depth scaling: with an incremental selector this should approach the depth
-# ratio (linear); a quadratic selector shows the ratio squared.
-SCALE=$(awk -v a="$W1" -v b="$W2" 'BEGIN{ if (a>0) printf "%.2f", b/a; else print "0" }')
-IDEAL=$(awk -v a="$D1" -v b="$D2" 'BEGIN{ printf "%.2f", b/a }')
-echo "# wall scaling ${SCALE}x for a ${IDEAL}x depth increase (linear target <= $(awk -v i="$IDEAL" 'BEGIN{printf "%.2f", i*1.5}')x)"
+is_num() { case "$1" in ''|*[!0-9.]*) return 1;; *) return 0;; esac; }
 
 FAIL=0
-[ "$OK1" -eq 1 ] && [ "$OK2" -eq 1 ] || { echo "FAIL: reply integrity"; FAIL=1; }
-awk -v l="$L1" -v s="$SLO" 'BEGIN{exit !(l<=s)}' || { echo "FAIL: control latency ${L1}s > ${SLO}s at depth $D1"; FAIL=1; }
-awk -v l="$L2" -v s="$SLO" 'BEGIN{exit !(l<=s)}' || { echo "FAIL: control latency ${L2}s > ${SLO}s at depth $D2"; FAIL=1; }
-awk -v s="$SCALE" -v i="$IDEAL" 'BEGIN{exit !(s<=i*1.5)}' || { echo "FAIL: superlinear wall scaling ${SCALE}x vs ${IDEAL}x depth"; FAIL=1; }
+declare -A WALL RSS ING_MAX DRN_MAX
+for depth in "$D1" "$D2"; do
+    dir="$RUN/d$depth"
+    mkdir -p "$dir"
+    ( cd "$dir" && /usr/bin/time -f "%e %M" -o "$dir/time.txt" \
+        "$SCHEDBP" "$SCHED" "$SHIM" "$depth" 5 perf > "$dir/out.log" 2>&1 )
+    rc=$?
+    if [ $rc -ne 0 ]; then
+        echo "FAIL: schedbp exited $rc at depth $depth (log: $dir/out.log)"
+        FAIL=1
+        continue
+    fi
+    read -r wall rss < "$dir/time.txt" || { echo "FAIL: no timing output at depth $depth"; FAIL=1; continue; }
+    is_num "$wall" && is_num "$rss" || { echo "FAIL: malformed timing '$wall $rss' at depth $depth"; FAIL=1; continue; }
+    grep -q "$depth/$depth jobs answered exactly once" "$dir/out.log" \
+        || { echo "FAIL: reply integrity at depth $depth"; FAIL=1; }
+    for ph in ingress drain; do
+        line=$(grep "# perf $ph " "$dir/out.log" | tail -1)
+        [ -n "$line" ] || { echo "FAIL: no $ph phase report at depth $depth"; FAIL=1; continue; }
+        p95=$(echo "$line" | grep -oE 'p95=[0-9.]+' | cut -d= -f2)
+        p99=$(echo "$line" | grep -oE 'p99=[0-9.]+' | cut -d= -f2)
+        mx=$(echo  "$line" | grep -oE 'max=[0-9.]+' | cut -d= -f2)
+        is_num "$p95" && is_num "$p99" && is_num "$mx" \
+            || { echo "FAIL: malformed $ph report at depth $depth: $line"; FAIL=1; continue; }
+        echo "  depth=$depth phase=$ph p95=${p95}s p99=${p99}s max=${mx}s"
+        awk -v l="$mx" -v s="$SLO" 'BEGIN{exit !(l<=s)}' \
+            || { echo "FAIL: $ph max ${mx}s > SLO ${SLO}s at depth $depth"; FAIL=1; }
+        [ "$ph" = ingress ] && ING_MAX[$depth]=$mx || DRN_MAX[$depth]=$mx
+    done
+    WALL[$depth]=$wall; RSS[$depth]=$rss
+    echo "  depth=$depth wall=${wall}s rss=${rss}KiB"
+done
 
-echo "# artifacts: $RUN"
-[ "$FAIL" -eq 0 ] && { echo "RESULT: PASS"; exit 0; }
-echo "RESULT: FAIL"; exit 1
+if [ -n "${WALL[$D1]:-}" ] && [ -n "${WALL[$D2]:-}" ]; then
+    SCALE=$(awk -v a="${WALL[$D1]}" -v b="${WALL[$D2]}" 'BEGIN{ if (a>0) printf "%.2f", b/a; else print 0 }')
+    IDEAL=$(awk -v a="$D1" -v b="$D2" 'BEGIN{ printf "%.2f", b/a }')
+    echo "# wall scaling ${SCALE}x for a ${IDEAL}x depth increase"
+    awk -v s="$SCALE" -v i="$IDEAL" 'BEGIN{exit !(s<=i*1.5)}' \
+        || { echo "FAIL: superlinear wall scaling ${SCALE}x vs ${IDEAL}x depth"; FAIL=1; }
+fi
+
+if [ "$FAIL" -eq 0 ]; then
+    rm -rf "$RUN"
+    echo "RESULT: PASS"
+    exit 0
+fi
+echo "# failed-run artifacts kept: $RUN"
+echo "RESULT: FAIL"
+exit 1
