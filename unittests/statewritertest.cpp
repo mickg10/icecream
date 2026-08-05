@@ -139,22 +139,22 @@ static void test_delivery_and_partial_writes(const std::string &dir)
 
 static void test_open_failure_recovery(const std::string &dir)
 {
-    const std::string sub = dir + "/denied";
-    mkdir(sub.c_str(), 0755);
+    /* A MISSING parent directory denies open() for every uid -- a chmod-000
+       denial does not exist for root, and rpm %check runs as root.  */
+    const std::string sub = dir + "/not-yet-created";
     const std::string jsonl = sub + "/out.jsonl";
     StateWriter w;
-    REQUIRE(w.start(jsonl, ""), "writer starts against a to-be-denied path");
-    chmod(sub.c_str(), 0000);
+    REQUIRE(w.start(jsonl, ""), "writer starts against a missing directory");
 
     w.enqueue(StateWriter::SINK_JSONL, "{\"blocked\":1}");
     w.pump();
     usleep(300 * 1000);
-    REQUIRE(read_lines(jsonl).empty(), "nothing written while the directory is denied");
+    REQUIRE(read_lines(jsonl).empty(), "nothing written while the directory is missing");
 
-    chmod(sub.c_str(), 0755);
+    mkdir(sub.c_str(), 0755);
     // The writer backs off five seconds between open attempts.
     REQUIRE(wait_for_lines(jsonl, 1, 12),
-            "record arrives after permissions return (bounded backoff, nothing lost)");
+            "record arrives once the directory exists (bounded backoff, nothing lost)");
     w.shutdown(3000);
 }
 
