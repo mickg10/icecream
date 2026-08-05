@@ -208,6 +208,7 @@ def main(argv: List[str]) -> int:
                         "scheduler_job_id": _safe_get(obj, "scheduler_job_id", default=None),
                         "compile_job_id": _safe_get(obj, "compile_job_id", default=None),
                         "exitcode": _safe_get(obj, "exitcode", default=None),
+                        "end_code": _safe_get(obj, "end_code", default=None),
                         "final_status": _safe_get(obj, "final_status", default=""),
                         "final_why": _safe_get(obj, "final_why", default=""),
                         "mode": _safe_get(obj, "mode", default=""),
@@ -409,6 +410,7 @@ def main(argv: List[str]) -> int:
         "scheduler_job_id",
         "compile_job_id",
         "exitcode",
+        "end_code",
         "final_status",
         "final_why",
         "mode",
@@ -531,9 +533,15 @@ def main(argv: List[str]) -> int:
                 idx = len(values) - 1
             return values[idx]
 
+        # Exit codes: since the daemon now records the compiler's real status
+        # in "exitcode" and its own teardown code separately in "end_code",
+        # the success rate below finally reflects compilations rather than
+        # transport teardown (118/119).  Older logs without end_code are
+        # still summarised, with a note.
         exitcodes = [_to_int(r.get("exitcode")) for r in job_rows]
         exitcodes = [v for v in exitcodes if v is not None]
         ok = sum(1 for v in exitcodes if v == 0)
+        has_end_code = any(r.get("end_code") not in (None, "") for r in job_rows)
         modes = Counter((r.get("mode") or "") for r in job_rows)
         sources = Counter((r.get("timing_source") or "") for r in job_rows)
 
@@ -548,6 +556,9 @@ def main(argv: List[str]) -> int:
         summary_lines.append("job_timing:")
         if exitcodes:
             summary_lines.append(f"  - success: {ok}/{len(exitcodes)} ({(100.0 * ok / len(exitcodes)):.1f}%)")
+            if not has_end_code:
+                summary_lines.append("  - note: log predates the exitcode/end_code split;"
+                                     " success may reflect daemon teardown codes, not compiler results")
         if modes:
             summary_lines.append("  - modes:")
             for k, v in modes.most_common():
