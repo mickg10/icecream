@@ -18,6 +18,7 @@ services:
       - HTTPS_PROXY
       - NO_PROXY
       - ICECREAM_BUILDER_INSECURE
+      - RELEASE_TARBALL
     volumes:
       - ../..:/src:ro
       - ./out:/out
@@ -42,6 +43,7 @@ services:
       - HTTPS_PROXY
       - NO_PROXY
       - ICECREAM_BUILDER_INSECURE
+      - RELEASE_TARBALL
     volumes:
       - ../..:/src:ro
       - ./out:/out

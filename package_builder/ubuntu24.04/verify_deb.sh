@@ -44,12 +44,25 @@ parse_upstream_version() {
 }
 
 [ -s "$OUT_DIR/manifest.txt" ] || { echo "ERROR: no manifest.txt in $OUT_DIR (run the build first)" >&2; exit 1; }
+# Digest verification: every manifest entry must match manifest.meta before
+# anything is installed.
+[ -s "$OUT_DIR/manifest.meta" ] || { echo "ERROR: no manifest.meta in $OUT_DIR" >&2; exit 1; }
+echo "verifying against $(grep '^revision=' "$OUT_DIR/manifest.meta")"
+while IFS= read -r name; do
+    want=$(grep -F "sha256 $name=" "$OUT_DIR/manifest.meta" | cut -d= -f2)
+    [ -n "$want" ] || { echo "ERROR: no digest for $name in manifest.meta" >&2; exit 1; }
+    got=$(sha256sum "$OUT_DIR/$name" | cut -d" " -f1)
+    [ "$want" = "$got" ] || { echo "ERROR: digest mismatch for $name" >&2; exit 1; }
+done < "$OUT_DIR/manifest.txt"
+
 
 normalize_proxy_env
 configure_apt_insecure
 apt-get update
 apt-get install -y --no-install-recommends \
     ca-certificates \
+    file \
+    xz-utils \
     build-essential
 
 # Install EXACTLY the manifest's packages (PKG-2); unexpected package
@@ -117,6 +130,7 @@ SCHED_PID=$!
 cleanup() {
     kill "$SCHED_PID" >/dev/null 2>&1 || true
     kill "$ICECCD_PID" >/dev/null 2>&1 || true
+    kill "${WORKER_PID:-0}" >/dev/null 2>&1 || true
 }
 
 iceccd --no-remote -m 1 --max-preprocess 8 -s "$ICECC_SCHEDULER" -vv >/tmp/iceccd.log 2>&1 &
@@ -164,6 +178,55 @@ if ! grep -qE "NEW [0-9]+ client=" /tmp/icecc-scheduler.log 2>/dev/null; then
     tail -30 /tmp/iceccd.log >&2
     exit 1
 fi
+
+
+# --- installed remote-worker path -------------------------------------------
+# The scheduler-request check above proves coordination, not execution: a
+# broken worker package still passes it.  Run a second INSTALLED daemon as a
+# remote-capable worker, force a compile onto it, and require worker-side
+# begin/done plus returned-object evidence, all time-bounded.
+WORKER_BASE=/var/cache/icecream-worker
+mkdir -p "$WORKER_BASE"
+WORKER_USER=nobody
+id -u icecc >/dev/null 2>&1 && WORKER_USER=icecc
+chown "$WORKER_USER" "$WORKER_BASE" 2>/dev/null || true
+
+iceccd -p 10262 -m 2 -s "$ICECC_SCHEDULER" -N pkgworker -b "$WORKER_BASE" \
+    -l /tmp/icecc-worker.log -vvv &
+WORKER_PID=$!
+
+for _ in $(seq 1 30); do
+    grep -q "login pkgworker" /tmp/icecc-scheduler.log 2>/dev/null && break
+    kill -0 "$WORKER_PID" 2>/dev/null || { echo "ERROR: worker daemon died during startup" >&2; tail -20 /tmp/icecc-worker.log >&2; exit 1; }
+    sleep 1
+done
+grep -q "login pkgworker" /tmp/icecc-scheduler.log \
+    || { echo "ERROR: worker daemon never registered" >&2; tail -20 /tmp/icecc-worker.log >&2; exit 1; }
+
+ENVDIR=$(mktemp -d)
+( cd "$ENVDIR" && timeout 180 icecc-create-env "$(command -v gcc)" >create-env.log 2>&1 ) \
+    || { echo "ERROR: icecc-create-env failed" >&2; tail -20 "$ENVDIR/create-env.log" >&2; exit 1; }
+ENVTAR=$(ls "$ENVDIR"/*.tar.gz | head -1)
+
+cat >/tmp/icecc_remote_verify.c <<'EOF'
+int icecc_remote_verify_marker(int x) { return x * 43 + 7; }
+EOF
+timeout 120 env ICECC_TEST_REMOTEBUILD=1 ICECC_PREFERRED_HOST=pkgworker \
+    ICECC_VERSION="$ENVTAR" ICECC_DEBUG=debug ICECC_LOGFILE=/tmp/icecc-client.log \
+    "$WRAPDIR/gcc" -c /tmp/icecc_remote_verify.c -o /tmp/icecc_remote_verify.o
+rc=$?
+[ $rc -eq 124 ] && { echo "ERROR: remote compile TIMED OUT (installed worker path hangs)" >&2; exit 1; }
+[ $rc -eq 0 ] || { echo "ERROR: remote compile failed with $rc" >&2; tail -30 /tmp/icecc-client.log >&2; tail -30 /tmp/icecc-worker.log >&2; exit 1; }
+test -s /tmp/icecc_remote_verify.o || { echo "ERROR: remote object missing/empty" >&2; exit 1; }
+
+grep -qE "building myself|local build forced" /tmp/icecc-client.log \
+    && { echo "ERROR: client fell back to a local build on the worker path" >&2; exit 1; }
+grep -q "Remote compilation completed with exit code 0" /tmp/icecc-worker.log \
+    || { echo "ERROR: worker never logged a completed remote compilation" >&2; tail -30 /tmp/icecc-worker.log >&2; exit 1; }
+sleep 1
+grep -qE "END [0-9]+ status=0 .*out=[1-9].* server=pkgworker" /tmp/icecc-scheduler.log \
+    || { echo "ERROR: scheduler recorded no successful JobDone from the installed worker" >&2; tail -30 /tmp/icecc-scheduler.log >&2; exit 1; }
+echo "installed worker path: OK"
 
 kill -0 "$SCHED_PID" 2>/dev/null || { echo "ERROR: scheduler died during the compile" >&2; exit 1; }
 kill -0 "$ICECCD_PID" 2>/dev/null || { echo "ERROR: daemon died during the compile" >&2; exit 1; }

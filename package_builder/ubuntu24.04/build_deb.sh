@@ -89,7 +89,11 @@ apt-get install -y --no-install-recommends \
 
 apt-get build-dep -y icecc
 
-UPSTREAM_VERSION="$(parse_upstream_version "$SRC_DIR/configure.ac")"
+# Version metadata comes from the COMMITTED revision -- a local
+# configure.ac edit must not relabel committed source.
+SRC_REV=$(git -c "safe.directory=$SRC_DIR" -C "$SRC_DIR" rev-parse HEAD)
+git -c "safe.directory=$SRC_DIR" -C "$SRC_DIR" show "$SRC_REV:configure.ac" > ./configure.ac.committed
+UPSTREAM_VERSION="$(parse_upstream_version ./configure.ac.committed)"
 DEB_VERSION="${UPSTREAM_VERSION}-0obs1~${DEB_DIST}1"
 
 rm -rf "$WORK_DIR/srcpkg"
@@ -121,7 +125,23 @@ fi
 rm -rf ./debian-packaging
 mv "$NEW_DIR/debian" ./debian-packaging
 rm -rf "$NEW_DIR"
-bash "$SRC_DIR/package_builder/make_source_tree.sh" "$SRC_DIR" "$NEW_DIR" --bootstrap
+if [ -n "${RELEASE_TARBALL:-}" ]; then
+    # THE release artifact: every distribution builds from this exact
+    # bootstrapped tree (single Source0; see make_release_tarball.sh).
+    sha256sum -c "${RELEASE_TARBALL}.sha256" --status \
+        || { echo "ERROR: release tarball digest mismatch" >&2; exit 1; }
+    mkdir extract-src
+    tar -C extract-src -xf "$RELEASE_TARBALL"
+    mv extract-src/icecream-* "$NEW_DIR"
+    rmdir extract-src
+else
+    echo "WARNING: no RELEASE_TARBALL; bootstrapping per-distro (single-Source0 flow: package_builder/make_release_tarball.sh)" >&2
+    # Execute the COMMITTED copy of the staging tool, not the workspace's: a
+    # local edit to the helper must not be able to change what gets exported.
+    git -c "safe.directory=$SRC_DIR" -C "$SRC_DIR" show \
+        "$SRC_REV:package_builder/make_source_tree.sh" > ./make_source_tree.committed.sh
+    bash ./make_source_tree.committed.sh "$SRC_DIR" "$NEW_DIR" --bootstrap
+fi
 mv ./debian-packaging "$NEW_DIR/debian"
 
 cd "$NEW_DIR"
@@ -148,6 +168,14 @@ rm -f "$OUT_DIR"/*.deb "$OUT_DIR"/*.ddeb "$OUT_DIR"/*.changes "$OUT_DIR"/*.build
 cp -av ./*.deb ./*.ddeb ./*.changes ./*.buildinfo "$OUT_DIR"/ 2>/dev/null || true
 ( cd "$OUT_DIR" && ls -1 *.deb 2>/dev/null > manifest.txt )
 [ -s "$OUT_DIR/manifest.txt" ] || { echo "ERROR: build produced no .deb packages" >&2; exit 1; }
+{
+    echo "revision=$SRC_REV"
+    echo "version=$UPSTREAM_VERSION"
+    echo "builder=$(basename "$(cd "$(dirname "$0")" && pwd)")-$(. /etc/os-release; echo "$ID-$VERSION_ID")"
+    while IFS= read -r f; do
+        echo "sha256 $f=$(sha256sum "$OUT_DIR/$f" | cut -d" " -f1)"
+    done < "$OUT_DIR/manifest.txt"
+} > "$OUT_DIR/manifest.meta"
 
 echo "OK"
 ls -lh "$OUT_DIR" || true

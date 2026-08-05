@@ -23,17 +23,26 @@ BOOTSTRAP=${3:-}
 
 command -v git >/dev/null || { echo "ERROR: git is required for a clean export" >&2; exit 2; }
 
-# Bind-mounted checkouts are typically owned by another uid; without this
-# git refuses to read them inside the container.
-git config --global --add safe.directory "$SRC_GIT" 2>/dev/null || true
+# Per-command config only: appending to the global git configuration on
+# every run leaks state between builds.  Bind-mounted checkouts are
+# typically owned by another uid, hence safe.directory.
+GIT=(git -c "safe.directory=$SRC_GIT" -C "$SRC_GIT")
 
-REV=$(git -C "$SRC_GIT" rev-parse HEAD)
-if ! git -C "$SRC_GIT" diff --quiet || ! git -C "$SRC_GIT" diff --cached --quiet; then
-    echo "WARNING: checkout has uncommitted changes; the package is built from HEAD ($REV) WITHOUT them" >&2
+# Resolve ONCE, then archive that exact object id: archiving HEAD after
+# recording the revision races with concurrent commits, producing content
+# and .source-revision that disagree.
+REV=$("${GIT[@]}" rev-parse HEAD)
+if ! "${GIT[@]}" diff --quiet || ! "${GIT[@]}" diff --cached --quiet; then
+    echo "WARNING: checkout has uncommitted changes; the package is built from $REV WITHOUT them" >&2
 fi
 
+# A pre-existing destination could mix stale files into the export.
+if [ -e "$DEST" ] && [ -n "$(ls -A "$DEST" 2>/dev/null)" ]; then
+    echo "ERROR: destination $DEST exists and is not empty" >&2
+    exit 2
+fi
 mkdir -p "$DEST"
-git -C "$SRC_GIT" archive --format=tar HEAD | tar -x -C "$DEST"
+"${GIT[@]}" archive --format=tar "$REV" | tar -x -C "$DEST"
 echo "$REV" > "$DEST/.source-revision"
 
 if [ "$BOOTSTRAP" = "--bootstrap" ]; then

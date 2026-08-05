@@ -104,7 +104,11 @@ dnf_cmd -y install \
     findutils \
     which
 
-UPSTREAM_VERSION="$(parse_upstream_version "$SRC_DIR/configure.ac")"
+# Version metadata comes from the COMMITTED revision -- a local
+# configure.ac edit must not relabel committed source.
+SRC_REV=$(git -c "safe.directory=$SRC_DIR" -C "$SRC_DIR" rev-parse HEAD)
+git -c "safe.directory=$SRC_DIR" -C "$SRC_DIR" show "$SRC_REV:configure.ac" > ./configure.ac.committed
+UPSTREAM_VERSION="$(parse_upstream_version ./configure.ac.committed)"
 
 rpmdev-setuptree
 
@@ -183,10 +187,23 @@ trap 'rm -rf "$STAGE"' EXIT
 # tree could ship stale generated files and host-built executables.
 # Bootstrapping at staging time also serves build roots whose own
 # Autotools are too old to bootstrap (Fedora 28).
-bash "$SRC_DIR/package_builder/make_source_tree.sh" \
-    "$SRC_DIR" "$STAGE/icecream-${UPSTREAM_VERSION}" --bootstrap
-
-tar -C "$STAGE" -cJf "$SOURCE0_PATH" "icecream-${UPSTREAM_VERSION}"
+if [ -n "${RELEASE_TARBALL:-}" ]; then
+    # THE release artifact (single Source0 across all distributions).
+    sha256sum -c "${RELEASE_TARBALL}.sha256" --status \
+        || { echo "ERROR: release tarball digest mismatch" >&2; exit 1; }
+    mkdir "$STAGE/extract-src"
+    tar -C "$STAGE/extract-src" -xf "$RELEASE_TARBALL"
+    mv "$STAGE"/extract-src/icecream-* "$STAGE/icecream-${UPSTREAM_VERSION}"
+    tar -C "$STAGE" -cJf "$SOURCE0_PATH" "icecream-${UPSTREAM_VERSION}"
+else
+    echo "WARNING: no RELEASE_TARBALL; bootstrapping per-distro (single-Source0 flow: package_builder/make_release_tarball.sh)" >&2
+    # Execute the COMMITTED copy of the staging tool, not the workspace's.
+    git -c "safe.directory=$SRC_DIR" -C "$SRC_DIR" show \
+        "$SRC_REV:package_builder/make_source_tree.sh" > "$STAGE/make_source_tree.committed.sh"
+    bash "$STAGE/make_source_tree.committed.sh" \
+        "$SRC_DIR" "$STAGE/icecream-${UPSTREAM_VERSION}" --bootstrap
+    tar -C "$STAGE" -cJf "$SOURCE0_PATH" "icecream-${UPSTREAM_VERSION}"
+fi
 
 dnf_cmd -y builddep "$SPEC_PATH"
 
@@ -199,6 +216,15 @@ rm -f "$OUT_DIR"/*.rpm "$OUT_DIR"/manifest.txt
 find "${HOME}/rpmbuild/RPMS" "${HOME}/rpmbuild/SRPMS" -type f -name '*.rpm' -print -exec cp -av {} "$OUT_DIR"/ \;
 ( cd "$OUT_DIR" && ls -1 *.rpm 2>/dev/null > manifest.txt )
 [ -s "$OUT_DIR/manifest.txt" ] || { echo "ERROR: build produced no .rpm packages" >&2; exit 1; }
+{
+    echo "revision=$SRC_REV"
+    echo "version=$UPSTREAM_VERSION"
+    echo "builder=$(basename "$(cd "$(dirname "$0")" && pwd)")-$(. /etc/os-release; echo "$ID-$VERSION_ID")"
+    echo "source0_sha256=$(sha256sum "$SOURCE0_PATH" | cut -d" " -f1)"
+    while IFS= read -r f; do
+        echo "sha256 $f=$(sha256sum "$OUT_DIR/$f" | cut -d" " -f1)"
+    done < "$OUT_DIR/manifest.txt"
+} > "$OUT_DIR/manifest.meta"
 
 echo "OK"
 ls -lh "$OUT_DIR" || true
