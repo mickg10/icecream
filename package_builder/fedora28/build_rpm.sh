@@ -138,6 +138,9 @@ dnf_cmd -y install \
     automake \
     libtool \
     libtool-ltdl-devel \
+    curl \
+    m4 \
+    perl \
     rsync \
     tar \
     xz \
@@ -216,6 +219,22 @@ trap 'rm -rf "$STAGE"' EXIT
 # tree could ship stale generated files and host-built executables.
 # Bootstrapping at staging time also serves build roots whose own
 # Autotools are too old to bootstrap (Fedora 28).
+# Fedora 28's Autoconf (2.69) cannot bootstrap this tree (configure.ac
+# requires >= 2.71) -- the exact PKG-1 constraint.  Build a pinned modern
+# Autoconf into /usr/local first, so the clean export is bootstrapped by a
+# controlled tool instead of depending on workspace-generated files.
+if ! autoconf --version 2>/dev/null | head -1 | grep -qE ' 2\.(7[1-9]|[89][0-9])'; then
+    AC_VER=2.71
+    AC_SHA256=f14c83cfebcc9427f2c3cea7258bd90df972d92eb26752da4ddad81c87a0faa4
+    curl -fL "https://ftp.gnu.org/gnu/autoconf/autoconf-${AC_VER}.tar.xz" \
+        -o "/tmp/autoconf-${AC_VER}.tar.xz"
+    echo "${AC_SHA256}  /tmp/autoconf-${AC_VER}.tar.xz" | sha256sum -c -
+    tar -C /tmp -xf "/tmp/autoconf-${AC_VER}.tar.xz"
+    ( cd "/tmp/autoconf-${AC_VER}" && ./configure --prefix=/usr/local >/dev/null && make -s install )
+    hash -r
+    autoconf --version | head -1
+fi
+
 bash "$SRC_DIR/package_builder/make_source_tree.sh" \
     "$SRC_DIR" "$STAGE/icecream-${UPSTREAM_VERSION}" --bootstrap
 
