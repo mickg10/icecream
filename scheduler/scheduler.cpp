@@ -354,6 +354,13 @@ static bool handle_end(CompileServer *cs, Msg *);
    mis-fire the bound.  */
 static const time_t max_deferred_send_age = 30;
 
+/* Byte high-water mark per submitter channel: selection also pauses when
+   this much output is queued, independent of the deferral flag.  With the
+   deferral gate active the backlog normally stays a fraction of this; the
+   mark is defense in depth against any future path that queues without
+   deferring.  */
+static const size_t max_deferred_send_bytes = 64 * 1024;
+
 static void notify_monitors(Msg *m)
 {
     list<CompileServer *>::iterator it;
@@ -567,7 +574,8 @@ static JobRequestPosition get_first_job_request()
            every compatible slot on the farm.  Selection resumes automatically
            once flush_pending() empties the channel (or the 30s deferred-send
            bound tears the submitter down).  */
-        if (group->submitter->has_pending_write()) {
+        if (group->submitter->has_pending_write()
+                || group->submitter->pending_bytes() > max_deferred_send_bytes) {
             continue;
         }
         for (Job *job : group->l) {
@@ -1271,7 +1279,8 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
            selection-time check above) -- their assignments could not be
            delivered anyway.  */
         while (jobPosition.isValid()
-               && jobPosition.job->submitter()->has_pending_write()) {
+               && (jobPosition.job->submitter()->has_pending_write()
+                   || jobPosition.job->submitter()->pending_bytes() > max_deferred_send_bytes)) {
             jobPosition = get_next_job_request( jobPosition );
         }
         if (jobPosition.isValid()) {

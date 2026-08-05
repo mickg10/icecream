@@ -279,6 +279,12 @@ public:
         return msgtogo > 0;
     }
 
+    // Bytes currently queued for the peer (deferred + bulk-collected).
+    size_t pending_bytes(void) const
+    {
+        return msgtogo;
+    }
+
     // Seconds for which deferred output has been waiting undelivered, or 0 if
     // no deferrable send is currently backed up (bulk-only accumulation does
     // not count).  Lets the owner enforce an application-level bound on a

@@ -230,6 +230,17 @@ replies), not by the depth of its request queue.  Verified by the
 harness's stall mode: assignments stop at ~2.6k of 4k queued requests and
 teardown lands at t≈31s with the scheduler responsive throughout.
 
+## 4b. fulljob policy knob
+
+`iceccd --fulljob-policy=compile-lane|exclusive` (default `compile-lane`)
+chooses what a fulljob's reservation means: all compile slots with the
+bounded preprocess lane still running (historical behavior, best
+throughput), or whole-node isolation (both local lanes drained before
+start, both closed while running; local admissions pause while one waits,
+remote service never does).  Use `exclusive` on submitter daemons where
+large links are memory-critical.  The active policy is logged at startup
+and visible as `fulljob_policy` in `/api/state`.
+
 ## 5. Reproduction
 
 ```

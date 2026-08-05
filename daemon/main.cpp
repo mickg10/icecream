@@ -832,6 +832,21 @@ unsigned int preprocess_active_processes = 0;
 // preprocess lane is closed (the compile lane is closed by the fulljob's
 // full slot reservation)
 unsigned int fulljob_active = 0;
+
+/* What a fulljob's reservation means is a resource-policy choice, not a
+   fixed truth (see aidocs divergence review, section 3):
+   - compile-lane (default): reserve every compile slot -- the historical
+     observable behavior -- while the bounded preprocess lane keeps
+     running.  Best aggregate throughput; link steps share the node with
+     lightweight preprocessing.
+   - exclusive: whole-node isolation.  The fulljob starts only when both
+     local lanes are idle and closes both while it runs; local admission
+     of other jobs pauses while one waits (remote TOCOMPILE service for
+     other submitters is deliberately NOT paused -- a local link must not
+     head-of-line-block the cluster).  Meaningful mainly on --no-remote
+     submitter daemons, where big local links live.  */
+enum FulljobPolicy { FULLJOB_COMPILE_LANE, FULLJOB_EXCLUSIVE };
+FulljobPolicy fulljob_policy = FULLJOB_COMPILE_LANE;
 const size_t insights_graph_minutes = 100;
 const size_t insights_retention_minutes = 120;
 
@@ -4190,6 +4205,9 @@ std::string Daemon::dump_state_json() const
     o << "\"slots\":{";
     o << "\"max_kids\":" << max_kids << ",";
     o << "\"max_preprocess_kids\":" << max_preprocess_kids << ",";
+    o << "\"fulljob_policy\":\""
+      << (fulljob_policy == FULLJOB_EXCLUSIVE ? "exclusive" : "compile-lane") << "\",";
+    o << "\"fulljob_active\":" << fulljob_active << ",";
     o << "\"current_kids\":" << current_kids << ",";
     o << "\"active_processes\":" << clients.active_processes << ",";
     o << "\"active_preprocesses\":" << preprocess_active_processes << ",";
@@ -5098,16 +5116,28 @@ void Daemon::handle_old_request()
         if (client) {
             const bool preprocess_job = client->local_preprocess && !client->fulljob;
             if (client->fulljob) {
-                best_is_admissible = (current_kids + clients.active_processes) == 0
-                                     && preprocess_active_processes == 0
-                                     && fulljob_active == 0;
+                if (fulljob_policy == FULLJOB_EXCLUSIVE) {
+                    best_is_admissible = (current_kids + clients.active_processes) == 0
+                                         && preprocess_active_processes == 0
+                                         && fulljob_active == 0;
+                } else {
+                    /* compile-lane: historical semantics -- start when any
+                       compile slot is free, then reserve them all.  The
+                       preprocess lane is unaffected.  */
+                    best_is_admissible = compile_capacity && fulljob_active == 0;
+                }
                 if (!best_is_admissible) {
-                    /* Drain barrier: hold every admission path until the
-                       node is empty for the waiting fulljob.  */
-                    break;
+                    /* The highest-priority local job is a fulljob that
+                       cannot start yet: pause LOCAL admissions so a stream
+                       of smaller local jobs cannot starve it.  Remote
+                       service (PENDING_USE_CS / TOCOMPILE below) continues
+                       -- a local link step must not stall the cluster.  */
+                    client = nullptr;
+                    best_is_admissible = false;
                 }
             } else if (preprocess_job) {
-                best_is_admissible = preprocess_capacity && fulljob_active == 0;
+                best_is_admissible = preprocess_capacity
+                    && (fulljob_policy == FULLJOB_COMPILE_LANE || fulljob_active == 0);
             } else {
                 best_is_admissible = compile_capacity && fulljob_active == 0;
             }
@@ -6040,6 +6070,7 @@ int main(int argc, char **argv)
             { "netname", 1, nullptr, 'n' },
             { "max-processes", 1, nullptr, 'm' },
             { "max-preprocess", 1, nullptr, 0 },
+            { "fulljob-policy", 1, nullptr, 0 },
             { "help", 0, nullptr, 'h' },
             { "daemonize", 0, nullptr, 'd'},
             { "log-file", 1, nullptr, 'l'},
@@ -6101,6 +6132,16 @@ int main(int argc, char **argv)
                 }
             } else if (optname == "no-remote") {
                 d.noremote = true;
+            } else if (optname == "fulljob-policy") {
+                if (optarg && strcmp(optarg, "exclusive") == 0) {
+                    fulljob_policy = FULLJOB_EXCLUSIVE;
+                } else if (optarg && strcmp(optarg, "compile-lane") == 0) {
+                    fulljob_policy = FULLJOB_COMPILE_LANE;
+                } else {
+                    log_warning() << "ignoring --fulljob-policy='"
+                                  << (optarg ? optarg : "")
+                                  << "' (expected compile-lane or exclusive)" << endl;
+                }
             } else if (optname == "max-preprocess") {
                 if (optarg && *optarg) {
                     max_preprocess_processes = atoi(optarg);
@@ -6420,14 +6461,18 @@ int main(int argc, char **argv)
     if (max_preprocess_processes > 0) {
         max_preprocess_kids = (unsigned int)max_preprocess_processes;
     } else {
-        /* Default the preprocess lane to compile capacity.  The earlier
-           8x default allowed e.g. 512 concurrent cpp processes on a 64-core
-           host; niceness only shields CPU, not resident memory, page cache,
-           fds, or temp-file pressure.  Operators who profiled their
-           preprocess load can raise this explicitly via --max-preprocess.  */
-        max_preprocess_kids = std::max((unsigned int)1, max_kids);
+        /* Conservative capped default (min(2*compile capacity, 32)): the
+           earlier 8x default allowed e.g. 512 concurrent cpp processes on a
+           64-core host; niceness only shields CPU, not resident memory,
+           page cache, fds, or temp-file pressure.  Operators who profiled
+           their preprocess load can raise this explicitly via
+           --max-preprocess.  */
+        max_preprocess_kids = std::min(2u * std::max(1u, max_kids), 32u);
     }
 
+    log_info() << "fulljob policy: "
+               << (fulljob_policy == FULLJOB_EXCLUSIVE ? "exclusive (whole node)"
+                                                       : "compile-lane reservation") << endl;
     log_info() << "allowing up to " << max_kids << " active compile jobs and "
                << max_preprocess_kids << " active preprocess jobs" << endl;
 
