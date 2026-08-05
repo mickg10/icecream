@@ -35,4 +35,8 @@ int handle_connection(const std::string &basedir, CompileJob *job,
                       MsgChannel *serv, int & out_fd,
                       unsigned int mem_limit, uid_t user_uid, gid_t user_gid);
 
+/* Close all descriptors above stderr except `keep_fd` (used by forked
+   compile workers; see the call site in serve.cpp).  */
+extern void close_unneeded_fds_in_child(int keep_fd);
+
 #endif

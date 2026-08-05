@@ -34,6 +34,7 @@
 #include <cassert>
 
 #include <sys/stat.h>
+#include <dirent.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #ifdef HAVE_SIGNAL_H
@@ -134,6 +135,31 @@ static void write_output_file( const string& file, MsgChannel* client )
 /**
  * Read a request, run the compiler, and send a response.
  **/
+void close_unneeded_fds_in_child(int keep_fd)
+{
+    DIR *dir = opendir("/proc/self/fd");
+    if (!dir) {
+        return;   // best effort; nothing to do if /proc is unavailable
+    }
+    const int dir_fd = dirfd(dir);
+    std::vector<int> to_close;
+    while (struct dirent *e = readdir(dir)) {
+        char *end = nullptr;
+        const long fd = strtol(e->d_name, &end, 10);
+        if (!end || *end || fd <= STDERR_FILENO) {
+            continue;
+        }
+        if (int(fd) == keep_fd || int(fd) == dir_fd) {
+            continue;
+        }
+        to_close.push_back(int(fd));
+    }
+    closedir(dir);
+    for (int fd : to_close) {
+        close(fd);
+    }
+}
+
 int handle_connection(const string &basedir, CompileJob *job,
                       MsgChannel *client, int &out_fd,
                       unsigned int mem_limit, uid_t user_uid, gid_t user_gid)
@@ -163,6 +189,14 @@ int handle_connection(const string &basedir, CompileJob *job,
         log_perror("close failed");
     }
     out_fd = socket[1];
+
+    /* Close every descriptor this long-lived compile worker does not need.
+       FD_CLOEXEC only takes effect at exec(), and this child runs for the
+       whole compile before (and sometimes without) exec'ing -- so it would
+       otherwise pin every web connection and listener that existed at fork
+       time, delaying peer FIN and multiplying system-wide fd references.
+       Keep std{in,out,err} and the freshly created channel.  */
+    close_unneeded_fds_in_child(out_fd);
 
     /* internal communication channel, don't inherit to gcc */
     fcntl(out_fd, F_SETFD, FD_CLOEXEC);

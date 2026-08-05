@@ -1186,7 +1186,7 @@ struct Daemon {
     string webgui_insights_html() const;
     string webgui_insights_jobs_html() const;
     string dump_clients_json() const;
-    string dump_job_history_json(size_t limit) const;
+    string dump_job_history_json(size_t limit, uint64_t before_seq = 0) const;
     string dump_insights_series_json(size_t minutes);
     string dump_insights_jobs_json(time_t minute_ts, size_t limit);
     void remember_finished_job(const Client *client, int exitcode);
@@ -1623,8 +1623,12 @@ bool Daemon::parse_http_request(const string &request, string &method, string &p
 
 size_t Daemon::parse_jobs_limit(const string &path)
 {
+    /* A page is bounded independently of retention: at the 4 KiB display cap
+       a full 20,000-entry dump reached ~91 MB and hundreds of milliseconds
+       of synchronous work in the daemon's only loop.  Deeper history is
+       reachable by paging with ?before=<seq>.  */
     static const size_t kDefaultLimit = 200;
-    static const size_t kMaxLimit = 20000;
+    static const size_t kMaxLimit = 1000;
 
     size_t query_pos = path.find('?');
     if (query_pos == string::npos) {
@@ -2067,9 +2071,7 @@ string Daemon::webgui_html() const
             <option value="200">200</option>
             <option value="500" selected>500</option>
             <option value="1000">1000</option>
-            <option value="5000">5000</option>
-            <option value="20000">20000</option>
-          </select>
+                      </select>
           <span id="jobs-sub">0 rows</span>
         </div>
       </div>
@@ -3208,10 +3210,21 @@ void Daemon::remember_finished_job(const Client *client, int exitcode)
     }
 }
 
-string Daemon::dump_job_history_json(size_t limit) const
+string Daemon::dump_job_history_json(size_t limit, uint64_t before_seq) const
 {
-    if (limit == 0 || limit > job_history.size()) {
-        limit = job_history.size();
+    /* Newest first.  `before_seq` is a cursor: only entries with a smaller
+       sequence number are returned, so a client can page through history
+       without the daemon ever building an unbounded response.  */
+    size_t start = 0;
+    if (before_seq) {
+        while (start < job_history.size()
+               && job_history[job_history.size() - 1 - start].seq >= before_seq) {
+            ++start;
+        }
+    }
+    const size_t available = job_history.size() - start;
+    if (limit == 0 || limit > available) {
+        limit = available;
     }
 
     ostringstream o;
@@ -3221,10 +3234,17 @@ string Daemon::dump_job_history_json(size_t limit) const
     o << "\"capacity\":" << job_history_capacity << ",";
     o << "\"size\":" << job_history.size() << ",";
     o << "\"returned\":" << limit << ",";
+    /* Honest truncation metadata: the UI can say "N of M" and page instead
+       of silently implying it showed everything.  */
+    o << "\"truncated\":" << ((start + limit < job_history.size()) ? "true" : "false") << ",";
+    o << "\"next_before_seq\":"
+      << ((limit && start + limit < job_history.size())
+          ? (unsigned long long)job_history[job_history.size() - 1 - (start + limit - 1)].seq
+          : 0ULL) << ",";
     o << "\"jobs\":[";
 
     for (size_t i = 0; i < limit; ++i) {
-        const JobHistoryEntry &entry = job_history[job_history.size() - 1 - i];
+        const JobHistoryEntry &entry = job_history[job_history.size() - 1 - (start + i)];
         if (i) {
             o << ",";
         }
@@ -3668,7 +3688,10 @@ void Daemon::handle_web_connection(int fd, short revents)
                     }
                 } else if (route == "/api/jobs") {
                     const size_t limit = parse_jobs_limit(path);
-                    if (!queue_web_response(fd, 200, "OK", "application/json; charset=utf-8", dump_job_history_json(limit))) {
+                    uint64_t before_seq = 0;
+                    parse_query_u64(path, "before", &before_seq);
+                    if (!queue_web_response(fd, 200, "OK", "application/json; charset=utf-8",
+                                            dump_job_history_json(limit, before_seq))) {
                         return;
                     }
                 } else if (route == "/api/insights-series") {
