@@ -43,10 +43,7 @@ parse_upstream_version() {
     fi
 }
 
-if ! ls -1 "$OUT_DIR"/*.deb >/dev/null 2>&1; then
-    echo "ERROR: no .deb files found in $OUT_DIR (run the build first)" >&2
-    exit 1
-fi
+[ -s "$OUT_DIR/manifest.txt" ] || { echo "ERROR: no manifest.txt in $OUT_DIR (run the build first)" >&2; exit 1; }
 
 normalize_proxy_env
 configure_apt_insecure
@@ -55,7 +52,19 @@ apt-get install -y --no-install-recommends \
     ca-certificates \
     build-essential
 
-dpkg -i "$OUT_DIR"/*.deb || apt-get -f install -y
+# Install EXACTLY the manifest's packages (PKG-2); unexpected package
+# files in the output directory fail the run.
+DEBS=()
+while IFS= read -r name; do
+    [ -f "$OUT_DIR/$name" ] || { echo "ERROR: manifest names missing file $name" >&2; exit 1; }
+    DEBS+=("$OUT_DIR/$name")
+done < "$OUT_DIR/manifest.txt"
+while IFS= read -r -d "" f; do
+    grep -qxF "$(basename "$f")" "$OUT_DIR/manifest.txt" \
+        || { echo "ERROR: unexpected package file not in manifest: $f" >&2; exit 1; }
+done < <(find "$OUT_DIR" -maxdepth 1 -type f -name '*.deb' -print0)
+[ "${#DEBS[@]}" -gt 0 ] || { echo "ERROR: manifest lists no .deb packages" >&2; exit 1; }
+dpkg -i "${DEBS[@]}" || apt-get -f install -y
 
 UPSTREAM_VERSION="$(parse_upstream_version "$SRC_DIR/configure.ac")"
 

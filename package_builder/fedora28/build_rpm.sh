@@ -133,6 +133,11 @@ dnf_cmd -y install \
     libzstd-devel \
     rpm-build \
     rpmdevtools \
+    git \
+    autoconf \
+    automake \
+    libtool \
+    libtool-ltdl-devel \
     rsync \
     tar \
     xz \
@@ -204,26 +209,15 @@ rm -f "${HOME}/rpmbuild/SOURCES/"icecream-*.tar.*
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 
-mkdir -p "$STAGE/icecream-${UPSTREAM_VERSION}"
-rsync -a --delete \
-    --exclude ".git" \
-    --exclude ".deps" \
-    --exclude ".libs" \
-    --exclude "autom4te.cache" \
-    --exclude "config.h" \
-    --exclude "config.log" \
-    --exclude "config.status" \
-    --exclude "GNUmakefile" \
-    --exclude "Makefile" \
-    --exclude "package_builder" \
-    --exclude "tests/compose/out" \
-    --exclude "tests/webgui/node_modules" \
-    --exclude "stamp-h1" \
-    --exclude "*.a" \
-    --exclude "*.la" \
-    --exclude "*.lo" \
-    --exclude "*.o" \
-    "$SRC_DIR"/ "$STAGE/icecream-${UPSTREAM_VERSION}"/
+# Clean export of the committed revision, bootstrapped so Source0 carries
+# generated configure/Makefile.in (PKG-1): the previous rsync staging made
+# the build depend on untracked developer-tree state -- a clean clone had
+# no configure at all (the modified spec skips autogen.sh), while a dirty
+# tree could ship stale generated files and host-built executables.
+# Bootstrapping at staging time also serves build roots whose own
+# Autotools are too old to bootstrap (Fedora 28).
+bash "$SRC_DIR/package_builder/make_source_tree.sh" \
+    "$SRC_DIR" "$STAGE/icecream-${UPSTREAM_VERSION}" --bootstrap
 
 tar -C "$STAGE" -cJf "$SOURCE0_PATH" "icecream-${UPSTREAM_VERSION}"
 
@@ -233,7 +227,13 @@ fi
 
 rpmbuild -ba "$SPEC_PATH"
 
+# Empty per-run output directory + manifest (PKG-2): repeated runs used to
+# accumulate packages, so the verifier could install stale artifacts beside
+# the new ones.  The manifest names exactly what this run produced.
+rm -f "$OUT_DIR"/*.rpm "$OUT_DIR"/manifest.txt
 find "${HOME}/rpmbuild/RPMS" "${HOME}/rpmbuild/SRPMS" -type f -name '*.rpm' -print -exec cp -av {} "$OUT_DIR"/ \;
+( cd "$OUT_DIR" && ls -1 *.rpm 2>/dev/null > manifest.txt )
+[ -s "$OUT_DIR/manifest.txt" ] || { echo "ERROR: build produced no .rpm packages" >&2; exit 1; }
 
 echo "OK"
 ls -lh "$OUT_DIR" || true

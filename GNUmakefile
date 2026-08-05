@@ -14,10 +14,18 @@ docker_test: docker_build
 	@cd package_builder/fedora-latest && docker compose run --rm --build verify
 
 # Forward any other targets to the existing autotools Makefile.
+# Clean targets in an UNCONFIGURED tree are a successful no-op: package
+# builds (dh_auto_clean, %autosetup) run `make distclean` before configuring,
+# and an error here breaks every packager that sees this wrapper.
 %:
 	@if [ -f Makefile ]; then \
 		$(MAKE) -f Makefile $@; \
 	else \
-		echo "ERROR: Makefile not found. Run ./configure (or ./autogen.sh && ./configure) first." >&2; \
-		exit 1; \
+		case "$@" in \
+		clean|distclean|maintainer-clean|mostlyclean) \
+			echo "nothing to $@: tree is not configured";; \
+		*) \
+			echo "ERROR: Makefile not found. Run ./configure (or ./autogen.sh && ./configure) first." >&2; \
+			exit 1;; \
+		esac; \
 	fi

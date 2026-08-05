@@ -86,9 +86,23 @@ dnf_cmd -y install \
     make \
     which
 
-mapfile -t RPMS < <(find "$OUT_DIR" -maxdepth 1 -type f -name '*.rpm' ! -name '*.src.rpm' | sort)
+# Install EXACTLY the packages the build's manifest names (PKG-2): the
+# output directory used to accumulate across runs, so a glob could install
+# a stale artifact beside -- or instead of -- the one under test.  Any
+# package file not in the manifest fails the run outright.
+[ -s "$OUT_DIR/manifest.txt" ] || { echo "ERROR: no manifest.txt in $OUT_DIR (run the build first)" >&2; exit 1; }
+RPMS=()
+while IFS= read -r name; do
+    case "$name" in *.src.rpm) continue ;; esac
+    [ -f "$OUT_DIR/$name" ] || { echo "ERROR: manifest names missing file $name" >&2; exit 1; }
+    RPMS+=("$OUT_DIR/$name")
+done < "$OUT_DIR/manifest.txt"
+while IFS= read -r -d "" f; do
+    grep -qxF "$(basename "$f")" "$OUT_DIR/manifest.txt" \
+        || { echo "ERROR: unexpected package file not in manifest: $f" >&2; exit 1; }
+done < <(find "$OUT_DIR" -maxdepth 1 -type f -name '*.rpm' -print0)
 if [ "${#RPMS[@]}" -eq 0 ]; then
-    echo "ERROR: no binary RPMs found in $OUT_DIR" >&2
+    echo "ERROR: manifest lists no binary RPMs" >&2
     exit 1
 fi
 

@@ -79,6 +79,10 @@ apt-get install -y --no-install-recommends \
     equivs \
     fakeroot \
     pkg-config \
+    git \
+    autoconf \
+    automake \
+    libtool \
     rsync \
     xmlto \
     build-essential
@@ -109,26 +113,16 @@ if [ ! -d "$NEW_DIR/debian" ]; then
     exit 1
 fi
 
-rsync -a --delete \
-    --exclude ".git" \
-    --exclude ".deps" \
-    --exclude ".libs" \
-    --exclude "autom4te.cache" \
-    --exclude "config.h" \
-    --exclude "config.log" \
-    --exclude "config.status" \
-    --exclude "GNUmakefile" \
-    --exclude "Makefile" \
-    --exclude "debian" \
-    --exclude "package_builder" \
-    --exclude "tests/compose/out" \
-    --exclude "tests/webgui/node_modules" \
-    --exclude "stamp-h1" \
-    --exclude "*.a" \
-    --exclude "*.la" \
-    --exclude "*.lo" \
-    --exclude "*.o" \
-    "$SRC_DIR"/ "$NEW_DIR"/
+# Clean export of the committed revision (PKG-1/PKG-2): staging from the
+# workspace made the package depend on untracked local state -- stale
+# generated Autotools files decided whether the build worked at all, and
+# host-built executables could ride into Source0.  The debian/ directory
+# from the downloaded source package is preserved.
+rm -rf ./debian-packaging
+mv "$NEW_DIR/debian" ./debian-packaging
+rm -rf "$NEW_DIR"
+bash "$SRC_DIR/package_builder/make_source_tree.sh" "$SRC_DIR" "$NEW_DIR" --bootstrap
+mv ./debian-packaging "$NEW_DIR/debian"
 
 cd "$NEW_DIR"
 
@@ -137,7 +131,14 @@ dch --newversion "$DEB_VERSION" --distribution "$DEB_DIST" "Local build from git
 dpkg-buildpackage -us -uc -b
 
 cd ..
+# Empty per-run output directory + manifest (PKG-2): repeated runs used to
+# accumulate packages, so a verifier could install stale artifacts beside
+# the new ones.  The manifest names exactly what this run produced; the
+# verifier installs that and nothing else.
+rm -f "$OUT_DIR"/*.deb "$OUT_DIR"/*.ddeb "$OUT_DIR"/*.changes "$OUT_DIR"/*.buildinfo "$OUT_DIR"/manifest.txt
 cp -av ./*.deb ./*.ddeb ./*.changes ./*.buildinfo "$OUT_DIR"/ 2>/dev/null || true
+( cd "$OUT_DIR" && ls -1 *.deb 2>/dev/null > manifest.txt )
+[ -s "$OUT_DIR/manifest.txt" ] || { echo "ERROR: build produced no .deb packages" >&2; exit 1; }
 
 echo "OK"
 ls -lh "$OUT_DIR" || true

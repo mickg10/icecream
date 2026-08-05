@@ -5,6 +5,22 @@ from the current git checkout, using the target distro's packaging as a base.
 
 Outputs are written to each builder directory's `out/` folder.
 
+## Reproducibility contract
+
+- Source0 is a **clean `git archive HEAD` export** (`make_source_tree.sh`),
+  bootstrapped with `autoreconf -fi` at staging time so it carries generated
+  `configure`/`Makefile.in` even for build roots whose own Autotools are too
+  old to bootstrap (Fedora 28).  Nothing untracked -- stale generated files,
+  host-built executables, local edits -- can reach the package.  Uncommitted
+  changes produce a loud warning and are NOT built.
+- The staged tree records its revision in `.source-revision`.
+- Each build **empties its per-run output** and writes `manifest.txt` naming
+  exactly the packages it produced; the verifiers install exactly that list
+  and fail on any unexpected package file in `out/`.
+- The verifiers prove the *services*, not just an object file: process
+  liveness, scheduler registration, and the compile reaching the scheduler
+  (`NEW <id> client=`), with logs dumped on failure.
+
 ## Proxies / TLS
 
 The builders pass through `http_proxy`, `https_proxy`, and `no_proxy` (and their
