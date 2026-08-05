@@ -50,7 +50,7 @@ struct Req {
     time_t enqueue;       // seconds on the test's abstract monotonic clock
 };
 
-static uint64_t score(const Req &r, time_t now)
+static int64_t score(const Req &r, time_t now)
 {
     return selection_score(r.estimate_msec, uint64_t(r.enqueue) * 1000ULL,
                            uint64_t(now) * 1000ULL);
@@ -95,6 +95,46 @@ static const Req *select(const std::vector<Req> &reqs, time_t now)
     return overdue ? overdue : best;
 }
 
+// Millisecond-precision agreement, directly on the primitives: the review's
+// counterexample against the floored msec formulation (est=1/enq=1001 vs
+// est=1/enq=1000 at now=1002 tied on keys but not on scores), plus odd/even
+// enqueue and probe values, near ties, exact ties and large monotonic
+// values.  In half-millisecond units score(t) = key + t exactly, so the
+// orders must agree at every probe.
+static void test_msec_precision_agreement()
+{
+    struct C { uint64_t est, enq; unsigned id; };
+    const C cands[] = {
+        {1, 1001, 1}, {1, 1000, 2},          // the review's counterexample
+        {2, 1003, 3}, {2, 1002, 4},          // odd/even mirrored
+        {1000, 999, 5}, {999, 997, 6},       // near tie (keys differ by 1)
+        {500, 1000, 7}, {250, 500, 8},       // exact key tie -> id order
+        {40000, (1ULL << 40) + 1, 9},        // large odd monotonic value
+        {40000, (1ULL << 40), 10},
+    };
+    const uint64_t probes[] = { 1002, 1003, (1ULL << 40) + 59000 };
+    for (uint64_t now : probes) {
+        const C *by_key = nullptr;
+        const C *by_score = nullptr;
+        int64_t bk = 0, bs = 0;
+        for (const C &c : cands) {
+            if (now < c.enq) {
+                continue;   // not enqueued yet at this probe
+            }
+            const int64_t k = selection_static_key(c.est, c.enq);
+            if (!by_key || selection_prefers(k, c.id, bk, by_key->id)) {
+                by_key = &c; bk = k;
+            }
+            const int64_t sc = selection_score(c.est, c.enq, now);
+            if (!by_score || sc > bs || (sc == bs && c.id < by_score->id)) {
+                by_score = &c; bs = sc;
+            }
+        }
+        REQUIRE(by_key && by_score && by_key->id == by_score->id,
+                "static-key winner equals score winner at millisecond precision");
+    }
+}
+
 // The indexed selector rests on this: the static key must pick the same
 // winner as the time-dependent score, whatever the probe time.
 static void test_time_invariance()
@@ -110,9 +150,9 @@ static void test_time_invariance()
     for (time_t now : { time_t(1001), time_t(1020), time_t(1050) }) {
         const Req *by_key = select(reqs, now);
         const Req *by_score = nullptr;
-        uint64_t best_s = 0;
+        int64_t best_s = 0;
         for (const Req &r : reqs) {
-            const uint64_t s = score(r, now);
+            const int64_t s = score(r, now);
             if (!by_score || s > best_s || (s == best_s && r.id < by_score->id)) {
                 by_score = &r;
                 best_s = s;
@@ -191,6 +231,7 @@ int main()
     fprintf(stderr, "=== scheduler policy rules ===\n");
     test_no_starvation();
     test_time_invariance();
+    test_msec_precision_agreement();
     test_promotion_is_fifo();
     test_niceness_first();
     test_lpt_below_promotion();

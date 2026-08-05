@@ -299,7 +299,7 @@ static uint64_t estimate_job_real_msec(const Job *job)
 }
 
 
-static uint64_t estimate_job_queue_score(const Job *job, uint64_t now_mono_msec)
+static int64_t estimate_job_queue_score(const Job *job, uint64_t now_mono_msec)
 {
     if (!job) {
         return 0;
@@ -703,7 +703,13 @@ static void credit_dispatch_credit(Job *job)
 {
     if (job && job->dispatchOutstanding()) {
         job->setDispatchOutstanding(false);
-        job->submitter()->removeOutstandingDispatch(job->dispatchDebitMsec());
+        if (!job->submitter()->removeOutstandingDispatch(job->dispatchDebitMsec())) {
+            log_error() << "dispatch-credit invariant failure: job " << job->id()
+                        << " debit " << job->dispatchDebitMsec()
+                        << " not found on " << job->submitter()->nodeName()
+                        << " (outstanding=" << job->submitter()->outstandingDispatches()
+                        << ")" << endl;
+        }
     }
 }
 
@@ -841,9 +847,11 @@ static void remove_job_request(const JobRequestPosition& pos)
     assert(pos.group != nullptr && pos.job != nullptr);
 
     JobRequestsGroup* group = pos.group;
-    assert(std::find(job_requests.begin(), job_requests.end(), group) != job_requests.end());
+    /* No membership asserts here: they were linear scans, which turned
+       assertion-enabled builds back into the quadratic selector and made
+       them useless as performance diagnostics.  remove_job() itself
+       verifies membership through the queued flag.  */
     job_requests.remove(group);
-    assert(std::find(group->l.begin(), group->l.end(), pos.job) != group->l.end());
     group->remove_job(pos.job);
 
     if (group->l.empty()) {
@@ -2799,28 +2807,34 @@ int main(int argc, char *argv[])
             break;
 
         case 1001:
-            if (optarg && *optarg) {
-                const long v = strtol(optarg, nullptr, 10);
+        case 1002: {
+            /* Strict integer parsing: '32junk' must be rejected, not read
+               as 32.  errno, at-least-one-digit and full consumption are
+               all checked.  */
+            const char *name = (c == 1001) ? "--max-outstanding-dispatches"
+                                           : "--dispatch-stall-timeout";
+            if (!optarg || !*optarg) {
+                usage(string("Error: ") + name + " requires argument");
+            }
+            errno = 0;
+            char *end = nullptr;
+            const long v = strtol(optarg, &end, 10);
+            if (errno != 0 || end == optarg || *end != '\0') {
+                usage(string("Error: ") + name + " requires a plain integer");
+            }
+            if (c == 1001) {
                 if (v < 1 || v > 1024) {
                     usage("Error: --max-outstanding-dispatches must be 1..1024");
                 }
                 max_outstanding_dispatches = (unsigned int)v;
             } else {
-                usage("Error: --max-outstanding-dispatches requires argument");
-            }
-            break;
-
-        case 1002:
-            if (optarg && *optarg) {
-                const long v = strtol(optarg, nullptr, 10);
                 if (v < 10 || v > 3600) {
                     usage("Error: --dispatch-stall-timeout must be 10..3600 seconds");
                 }
                 max_outstanding_stall_msec = (uint64_t)v * 1000;
-            } else {
-                usage("Error: --dispatch-stall-timeout requires argument");
             }
             break;
+        }
 
         default:
             usage();

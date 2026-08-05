@@ -55,16 +55,18 @@ public:
     {
         m_outstandingDebits.insert(debit_msec);
     }
-    void removeOutstandingDispatch(uint64_t debit_msec)
+    // Returns false when the exact debit is unknown -- an accounting
+    // invariant failure the CALLER must log loudly.  Silently charging the
+    // oldest entry instead would hide the defect and repeatedly postpone
+    // the true oldest job's age bound.
+    bool removeOutstandingDispatch(uint64_t debit_msec)
     {
         auto it = m_outstandingDebits.find(debit_msec);
-        if (it != m_outstandingDebits.end()) {
-            m_outstandingDebits.erase(it);
-        } else if (!m_outstandingDebits.empty()) {
-            // defensive: a job whose debit time we no longer know still
-            // releases exactly one credit
-            m_outstandingDebits.erase(m_outstandingDebits.begin());
+        if (it == m_outstandingDebits.end()) {
+            return false;
         }
+        m_outstandingDebits.erase(it);
+        return true;
     }
     // Age of the oldest unconfirmed dispatch, or 0 if none is outstanding.
     uint64_t oldestOutstandingDispatchMsec(uint64_t now_msec) const

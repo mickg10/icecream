@@ -26,29 +26,36 @@
    about.  */
 static const int64_t selection_max_queue_wait_promotion_msec = 60 * 1000;
 
-/* Time-dependent score: estimate + age/2, in msec.  The age bonus is
-   deliberately UNBOUNDED: with a cap of one estimate a short job (estimate
-   S, max score 2S) is starved forever by a sustained stream of jobs whose
-   estimate exceeds 2S.  Unbounded aging guarantees every queued request
-   eventually outranks any fixed-estimate newcomer.  Niceness remains the
-   first-order key (group ordering, outside these primitives).  */
-static inline uint64_t selection_score(uint64_t estimate_snapshot_msec,
-                                       uint64_t enqueue_mono_msec,
-                                       uint64_t now_mono_msec)
+/* Time-dependent score in HALF-MILLISECOND units: 2*estimate + age.  The
+   old msec formulation (estimate + age/2) floored the age, and floor makes
+   the score and the static key order DIFFERENTLY for odd/even enqueue
+   values -- the review's counterexample: est=1/enq=1001 vs est=1/enq=1000
+   at now=1002 tie on keys but not on scores.  Scaling by two removes the
+   division entirely, so score and key induce the identical exact order.
+
+   The age bonus is deliberately UNBOUNDED: with a cap of one estimate a
+   short job (estimate S, max score 2S) is starved forever by a sustained
+   stream of jobs whose estimate exceeds 2S.  Unbounded aging guarantees
+   every queued request eventually outranks any fixed-estimate newcomer.
+   Niceness remains the first-order key (group ordering, outside these
+   primitives).  */
+static inline int64_t selection_score(uint64_t estimate_snapshot_msec,
+                                      uint64_t enqueue_mono_msec,
+                                      uint64_t now_mono_msec)
 {
-    const uint64_t age_msec = now_mono_msec > enqueue_mono_msec
-                              ? now_mono_msec - enqueue_mono_msec : 0;
-    return estimate_snapshot_msec + age_msec / 2;
+    const int64_t age_msec = now_mono_msec > enqueue_mono_msec
+                             ? (int64_t)(now_mono_msec - enqueue_mono_msec) : 0;
+    return 2 * (int64_t)estimate_snapshot_msec + age_msec;
 }
 
-/* Static selection key: score(t) differences carry no time term, so the
-   order at ANY t is fully decided by K = estimate - enqueue/2.  Signed
-   64-bit: the monotonic clock and any plausible estimate are far below
-   2^62, so the subtraction cannot wrap.  */
+/* Static selection key, same half-millisecond units: score(t) = key + t,
+   exactly -- no floor anywhere -- so the order at ANY t is fully decided by
+   K = 2*estimate - enqueue.  Signed 64-bit: the monotonic clock and any
+   plausible estimate are far below 2^62, so nothing can wrap.  */
 static inline int64_t selection_static_key(uint64_t estimate_snapshot_msec,
                                            uint64_t enqueue_mono_msec)
 {
-    return (int64_t)estimate_snapshot_msec - (int64_t)(enqueue_mono_msec / 2);
+    return 2 * (int64_t)estimate_snapshot_msec - (int64_t)enqueue_mono_msec;
 }
 
 /* Deadline rule: overdue requests outrank all normal scoring.  */

@@ -9,4 +9,5 @@ noinst_HEADERS = \
     compileserver.h \
     job.h \
     jobstat.h \
-    scheduler.h
+    scheduler.h \
+    selection.h

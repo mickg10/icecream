@@ -23,6 +23,7 @@ noinst_HEADERS = \
 	pipes.h \
 	tempfile.h \
 	platform.h \
+	utf8.h \
 	util.h
 
 pkgconfigdir = $(libdir)/pkgconfig
