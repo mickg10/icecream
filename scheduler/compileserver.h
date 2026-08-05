@@ -39,6 +39,33 @@ using namespace std;
 class CompileServer : public MsgChannel
 {
 public:
+    // Assignments dispatched to this submitter that have not yet been
+    // confirmed by observable client progress (JobBeginMsg).  Bounds how
+    // many farm slots one unresponsive submitter can hold.
+    unsigned int outstandingDispatches() const { return m_outstandingDispatches; }
+    void addOutstandingDispatch()
+    {
+        if (m_outstandingDispatches == 0) {
+            m_outstandingSinceMsec = icecream_monotonic_msec();
+        }
+        ++m_outstandingDispatches;
+    }
+    void removeOutstandingDispatch()
+    {
+        if (m_outstandingDispatches > 0) {
+            --m_outstandingDispatches;
+        }
+        // any confirmation is progress: restart the stall clock
+        m_outstandingSinceMsec = m_outstandingDispatches
+            ? icecream_monotonic_msec() : 0;
+    }
+    // How long this submitter has held unconfirmed dispatches without any
+    // progress, or 0 if it holds none.
+    uint64_t outstandingStallMsec(uint64_t now_msec) const
+    {
+        return m_outstandingSinceMsec ? now_msec - m_outstandingSinceMsec : 0;
+    }
+
     enum State {
         CONNECTED,
         LOGGEDIN
@@ -151,6 +178,9 @@ public:
     bool getConnectionInProgress();
     bool isConnected();
     void updateInConnectivity(bool acceptingIn);
+
+    unsigned int m_outstandingDispatches = 0;
+    uint64_t m_outstandingSinceMsec = 0;
 
 private:
     bool blacklisted(const Job *job, const pair<string, string> &environment) const;

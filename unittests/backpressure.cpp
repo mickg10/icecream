@@ -296,8 +296,10 @@ static void test_multiqueue(int bufsize)
     }
     REQUIRE(all_queued, "all follower sends accepted while clogged");
     REQUIRE(!p.snd->at_eof(), "channel alive with a deep pending queue");
-    REQUIRE(p.snd->pending_write_age(icecream_monotonic_seconds() + 1) >= 1,
-            "deferred-output age is armed while backed up");
+    REQUIRE(p.snd->deferred_output_armed(),
+            "deferred-output deadline is armed while backed up");
+    REQUIRE(p.snd->deferred_output_deadline_msec() > icecream_monotonic_msec(),
+            "armed deadline lies in the future");
 
     // Drain: flush pending from one side, read everything on the other.
     std::atomic<bool> flush_ok{true};
@@ -346,8 +348,8 @@ static void test_multiqueue(int bufsize)
     REQUIRE(followers_in_order == kFollowers,
             "all queued messages arrived intact and in send order");
     REQUIRE(!p.snd->has_pending_write(), "pending queue fully drained");
-    REQUIRE(p.snd->pending_write_age(icecream_monotonic_seconds()) == 0,
-            "deferred-output age cleared after full drain");
+    REQUIRE(!p.snd->deferred_output_armed(),
+            "deferred-output deadline disarmed after full drain");
 
     delete p.snd;
     delete p.rcv;

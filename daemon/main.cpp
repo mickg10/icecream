@@ -809,7 +809,7 @@ void usage(const char *reason = nullptr)
         cerr << reason << endl;
     }
 
-    cerr << "usage: iceccd [-n <netname>] [-m <max_processes>] [--max-preprocess <max_preprocesses>] [--no-remote] [-d|--daemonize] [-l logfile] [-s <schedulerhost[:port]>]"
+    cerr << "usage: iceccd [-n <netname>] [-m <max_processes>] [--max-preprocess <max_preprocesses>] [--fulljob-policy <compile-lane|exclusive>] [--no-remote] [-d|--daemonize] [-l logfile] [-s <schedulerhost[:port]>]"
         " [-v[v[v]]] [-u|--user-uid <user_uid>] [-b <env-basedir>] [--cache-limit <MB>] [-N <node_name>] [-i|--interface <net_interface>] [-p|--port <port>]"
         " [--state-jsonl <path>] [--state-interval <sec>] [--state-log]"
         " [--webgui] [--webgui-port <port>] [--webgui-addr <addr>]" << endl;
@@ -1158,8 +1158,8 @@ struct Daemon {
     static bool parse_http_request(const string &request, string &method, string &path);
     static size_t parse_jobs_limit(const string &path);
     static bool parse_query_u64(const string &path, const char *key, uint64_t *value);
-    void queue_web_response(int fd, int status_code, const char *status_text,
-                            const char *content_type, const string &body);
+    bool queue_web_response(int fd, int status_code, const char *status_text,
+                            const char *content_type, const string &body) __attribute_warn_unused_result__;
     void note_accept_error(const char *where, int err);
     void check_cache_size(const string &new_env);
     void remove_native_environment(const string& env_key);
@@ -1509,12 +1509,15 @@ void Daemon::note_accept_error(const char *where, int err)
     log_error() << msg.str() << endl;
 }
 
-void Daemon::queue_web_response(int fd, int status_code, const char *status_text,
+/* Returns false if the connection was dropped (erased) -- callers hold a
+   reference into web_connections and MUST return immediately, or they use
+   a destroyed object.  */
+bool Daemon::queue_web_response(int fd, int status_code, const char *status_text,
                                 const char *content_type, const string &body)
 {
     auto it = web_connections.find(fd);
     if (it == web_connections.end()) {
-        return;
+        return false;
     }
 
     if (it->second.response_started
@@ -1523,7 +1526,7 @@ void Daemon::queue_web_response(int fd, int status_code, const char *status_text
            rest would splice two HTTP responses into one stream.  The
            connection is unrecoverable -- drop it.  */
         drop_web_connection(fd);
-        return;
+        return false;
     }
 
     ostringstream out;
@@ -1539,6 +1542,10 @@ void Daemon::queue_web_response(int fd, int status_code, const char *status_text
     it->second.outbuf_ofs = 0;
     it->second.response_started = false;
     it->second.close_after_write = true;
+    /* One request per connection: stop reading as soon as a response is
+       queued, so no further input can grow or race the write path.  */
+    it->second.reject_input = true;
+    return true;
 }
 
 bool Daemon::parse_http_request(const string &request, string &method, string &path)
@@ -3524,8 +3531,11 @@ void Daemon::handle_web_connection(int fd, short revents)
                     conn.reject_input = true;
                     conn.inbuf.clear();
                     conn.inbuf.shrink_to_fit();
-                    queue_web_response(fd, 413, "Payload Too Large", "text/plain; charset=utf-8",
-                                       "request too large\n");
+                    if (!queue_web_response(fd, 413, "Payload Too Large",
+                                            "text/plain; charset=utf-8",
+                                            "request too large\n")) {
+                        return;   // connection erased; `conn` is dangling
+                    }
                     break;
                 }
                 continue;
@@ -3549,9 +3559,13 @@ void Daemon::handle_web_connection(int fd, short revents)
             string method;
             string path;
             if (!parse_http_request(conn.inbuf, method, path)) {
-                queue_web_response(fd, 400, "Bad Request", "text/plain; charset=utf-8", "bad request\n");
+                if (!queue_web_response(fd, 400, "Bad Request", "text/plain; charset=utf-8", "bad request\n")) {
+                    return;
+                }
             } else if (method != "GET") {
-                queue_web_response(fd, 405, "Method Not Allowed", "text/plain; charset=utf-8", "only GET supported\n");
+                if (!queue_web_response(fd, 405, "Method Not Allowed", "text/plain; charset=utf-8", "only GET supported\n")) {
+                    return;
+                }
             } else {
                 string route = path;
                 const size_t query_pos = route.find('?');
@@ -3560,38 +3574,60 @@ void Daemon::handle_web_connection(int fd, short revents)
                 }
 
                 if (route == "/" || route == "/index.html") {
-                    queue_web_response(fd, 200, "OK", "text/html; charset=utf-8", webgui_html());
+                    if (!queue_web_response(fd, 200, "OK", "text/html; charset=utf-8", webgui_html())) {
+                        return;
+                    }
                 } else if (route == "/insights" || route == "/insights.html") {
-                    queue_web_response(fd, 200, "OK", "text/html; charset=utf-8", webgui_insights_html());
+                    if (!queue_web_response(fd, 200, "OK", "text/html; charset=utf-8", webgui_insights_html())) {
+                        return;
+                    }
                 } else if (route == "/insights-jobs" || route == "/insights-jobs.html") {
-                    queue_web_response(fd, 200, "OK", "text/html; charset=utf-8", webgui_insights_jobs_html());
+                    if (!queue_web_response(fd, 200, "OK", "text/html; charset=utf-8", webgui_insights_jobs_html())) {
+                        return;
+                    }
                 } else if (route == "/api/state") {
-                    queue_web_response(fd, 200, "OK", "application/json; charset=utf-8", dump_state_json());
+                    if (!queue_web_response(fd, 200, "OK", "application/json; charset=utf-8", dump_state_json())) {
+                        return;
+                    }
                 } else if (route == "/api/clients") {
-                    queue_web_response(fd, 200, "OK", "application/json; charset=utf-8", dump_clients_json());
+                    if (!queue_web_response(fd, 200, "OK", "application/json; charset=utf-8", dump_clients_json())) {
+                        return;
+                    }
                 } else if (route == "/api/jobs") {
                     const size_t limit = parse_jobs_limit(path);
-                    queue_web_response(fd, 200, "OK", "application/json; charset=utf-8", dump_job_history_json(limit));
+                    if (!queue_web_response(fd, 200, "OK", "application/json; charset=utf-8", dump_job_history_json(limit))) {
+                        return;
+                    }
                 } else if (route == "/api/insights-series") {
                     uint64_t minutes = insights_graph_minutes;
                     parse_query_u64(path, "minutes", &minutes);
-                    queue_web_response(fd, 200, "OK", "application/json; charset=utf-8",
-                                       dump_insights_series_json(size_t(minutes)));
+                    if (!queue_web_response(fd, 200, "OK", "application/json; charset=utf-8",
+                                       dump_insights_series_json(size_t(minutes)))) {
+                        return;
+                    }
                 } else if (route == "/api/insights-jobs") {
                     uint64_t minute_ts = 0;
                     if (!parse_query_u64(path, "minute", &minute_ts)) {
-                        queue_web_response(fd, 400, "Bad Request", "text/plain; charset=utf-8",
-                                           "missing minute query parameter\n");
+                        if (!queue_web_response(fd, 400, "Bad Request", "text/plain; charset=utf-8",
+                                           "missing minute query parameter\n")) {
+                            return;
+                        }
                     } else {
                         uint64_t limit = 500;
                         parse_query_u64(path, "limit", &limit);
-                        queue_web_response(fd, 200, "OK", "application/json; charset=utf-8",
-                                           dump_insights_jobs_json((time_t)minute_ts, (size_t)limit));
+                        if (!queue_web_response(fd, 200, "OK", "application/json; charset=utf-8",
+                                           dump_insights_jobs_json((time_t)minute_ts, (size_t)limit))) {
+                            return;
+                        }
                     }
                 } else if (route == "/api/internals") {
-                    queue_web_response(fd, 200, "OK", "text/plain; charset=utf-8", dump_internals());
+                    if (!queue_web_response(fd, 200, "OK", "text/plain; charset=utf-8", dump_internals())) {
+                        return;
+                    }
                 } else {
-                    queue_web_response(fd, 404, "Not Found", "text/plain; charset=utf-8", "not found\n");
+                    if (!queue_web_response(fd, 404, "Not Found", "text/plain; charset=utf-8", "not found\n")) {
+                        return;
+                    }
                 }
             }
         }
@@ -5099,13 +5135,48 @@ void Daemon::handle_old_request()
            preprocess work would overlap the very link step whose isolation
            fulljob promises).  While it runs, the compile lane is blocked by
            its full reservation and the preprocess lane by fulljob_active.  */
+        /* Select the best ADMISSIBLE LINKJOB by (niceness, client_id).
+           Admissibility must be part of the comparison, not a test applied
+           to the global best: otherwise a blocked compile job hides an
+           admissible preprocess job (and vice versa), leaving a whole lane
+           idle.  The one intentional exception is an exclusive-policy
+           fulljob at the head, which arms a drain barrier -- see below.  */
         Client *client = nullptr;
-        bool best_is_admissible = false;
+        Client *blocked_fulljob = nullptr;
         for (const auto &it : clients) {
             Client *candidate = it.second;
             if (candidate->status != Client::LINKJOB) {
                 continue;
             }
+
+            const bool preprocess_job = candidate->local_preprocess && !candidate->fulljob;
+            bool admissible;
+            if (candidate->fulljob) {
+                admissible = (fulljob_policy == FULLJOB_EXCLUSIVE)
+                    ? ((current_kids + clients.active_processes) == 0
+                       && preprocess_active_processes == 0 && fulljob_active == 0)
+                    /* compile-lane: historical semantics -- start when any
+                       compile slot is free, then reserve them all; the
+                       preprocess lane is unaffected.  */
+                    : (compile_capacity && fulljob_active == 0);
+            } else if (preprocess_job) {
+                admissible = preprocess_capacity
+                    && (fulljob_policy == FULLJOB_COMPILE_LANE || fulljob_active == 0);
+            } else {
+                admissible = compile_capacity && fulljob_active == 0;
+            }
+
+            if (!admissible) {
+                if (candidate->fulljob && fulljob_policy == FULLJOB_EXCLUSIVE
+                        && (blocked_fulljob == nullptr
+                            || candidate->niceness < blocked_fulljob->niceness
+                            || (candidate->niceness == blocked_fulljob->niceness
+                                && candidate->client_id < blocked_fulljob->client_id))) {
+                    blocked_fulljob = candidate;
+                }
+                continue;
+            }
+
             if (client == nullptr
                 || candidate->niceness < client->niceness
                 || (candidate->niceness == client->niceness
@@ -5113,37 +5184,18 @@ void Daemon::handle_old_request()
                 client = candidate;
             }
         }
-        if (client) {
-            const bool preprocess_job = client->local_preprocess && !client->fulljob;
-            if (client->fulljob) {
-                if (fulljob_policy == FULLJOB_EXCLUSIVE) {
-                    best_is_admissible = (current_kids + clients.active_processes) == 0
-                                         && preprocess_active_processes == 0
-                                         && fulljob_active == 0;
-                } else {
-                    /* compile-lane: historical semantics -- start when any
-                       compile slot is free, then reserve them all.  The
-                       preprocess lane is unaffected.  */
-                    best_is_admissible = compile_capacity && fulljob_active == 0;
-                }
-                if (!best_is_admissible) {
-                    /* The highest-priority local job is a fulljob that
-                       cannot start yet: pause LOCAL admissions so a stream
-                       of smaller local jobs cannot starve it.  Remote
-                       service (PENDING_USE_CS / TOCOMPILE below) continues
-                       -- a local link step must not stall the cluster.  */
-                    client = nullptr;
-                    best_is_admissible = false;
-                }
-            } else if (preprocess_job) {
-                best_is_admissible = preprocess_capacity
-                    && (fulljob_policy == FULLJOB_COMPILE_LANE || fulljob_active == 0);
-            } else {
-                best_is_admissible = compile_capacity && fulljob_active == 0;
-            }
-            if (!best_is_admissible) {
-                client = nullptr;
-            }
+
+        /* Exclusive-policy drain barrier: if a waiting fulljob outranks every
+           admissible local candidate, hold LOCAL admissions so a stream of
+           smaller local jobs cannot starve it.  Remote service
+           (PENDING_USE_CS / TOCOMPILE below) always continues -- a local link
+           must never head-of-line-block the cluster.  */
+        if (blocked_fulljob
+                && (client == nullptr
+                    || blocked_fulljob->niceness < client->niceness
+                    || (blocked_fulljob->niceness == client->niceness
+                        && blocked_fulljob->client_id < client->client_id))) {
+            client = nullptr;
         }
 
         if (client) {
@@ -6138,9 +6190,10 @@ int main(int argc, char **argv)
                 } else if (optarg && strcmp(optarg, "compile-lane") == 0) {
                     fulljob_policy = FULLJOB_COMPILE_LANE;
                 } else {
-                    log_warning() << "ignoring --fulljob-policy='"
-                                  << (optarg ? optarg : "")
-                                  << "' (expected compile-lane or exclusive)" << endl;
+                    log_error() << "invalid --fulljob-policy='"
+                                << (optarg ? optarg : "")
+                                << "' (expected compile-lane or exclusive)" << endl;
+                    usage();
                 }
             } else if (optname == "max-preprocess") {
                 if (optarg && *optarg) {
@@ -6470,6 +6523,19 @@ int main(int argc, char **argv)
         max_preprocess_kids = std::min(2u * std::max(1u, max_kids), 32u);
     }
 
+    if (fulljob_policy == FULLJOB_EXCLUSIVE && !d.noremote) {
+        /* On a remote-capable daemon the barrier cannot be honoured: the
+           scheduler keeps assigning remote jobs, which refill the compile
+           lane, so the waiting fulljob may never see an idle node.  Honest
+           refusal beats a silently ineffective policy; whole-node isolation
+           belongs on --no-remote submitter daemons (where big local links
+           run).  A future version can announce the reservation to the
+           scheduler and support this everywhere.  */
+        log_error() << "--fulljob-policy=exclusive requires --no-remote "
+                    << "(a remote-capable daemon cannot drain its compile lane; "
+                    << "the scheduler keeps assigning jobs to it)" << endl;
+        usage();
+    }
     log_info() << "fulljob policy: "
                << (fulljob_policy == FULLJOB_EXCLUSIVE ? "exclusive (whole node)"
                                                        : "compile-lane reservation") << endl;

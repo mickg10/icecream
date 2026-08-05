@@ -347,19 +347,27 @@ static void add_job_stats(Job *job, JobDoneMsg *msg)
 
 static bool handle_end(CompileServer *cs, Msg *);
 
-/* A daemon whose deferred dispatch output has gone unaccepted this long is
-   treated as dead -- the same 30s budget the old blocking send granted,
-   enforced from prune_servers() without wedging the loop.  Ages come from
-   icecream_monotonic_seconds() so wall-clock steps cannot disable or
-   mis-fire the bound.  */
-static const time_t max_deferred_send_age = 30;
+/* Semantic per-submitter dispatch credit.
+   A successful send() means "accepted by the local kernel", NOT "consumed by
+   the submitter daemon" -- so counting bytes cannot bound how many farm
+   slots one unresponsive submitter reserves.  Instead bound the assignments
+   that have been dispatched but not yet confirmed by observable progress
+   (JobBeginMsg from the compile server, i.e. the client really did receive
+   its UseCS and contacted that server).  A submitter at its limit is passed
+   over for selection until its clients make progress; healthy submitters
+   are unaffected because JobBegin normally follows dispatch within
+   milliseconds.  */
+static const unsigned int max_outstanding_dispatches = 32;
 
-/* Byte high-water mark per submitter channel: selection also pauses when
-   this much output is queued, independent of the deferral flag.  With the
-   deferral gate active the backlog normally stays a fraction of this; the
-   mark is defense in depth against any future path that queues without
-   deferring.  */
-static const size_t max_deferred_send_bytes = 64 * 1024;
+/* Liveness bound for a submitter that holds dispatch credits without ever
+   confirming them.  Deliberately generous: a legitimate client can wait for
+   an environment install on the chosen compile server (MAX_BUSY_INSTALLING,
+   120s) before its JobBegin appears, so anything tighter would evict
+   healthy submitters on a cold farm.  The tight 30s bound still applies to
+   the precise case -- a peer that is not draining its socket (deferred
+   output armed).  Together: unread socket -> 30s, silent-but-reading
+   submitter -> this bound.  */
+static const uint64_t max_outstanding_stall_msec = 180 * 1000;
 
 static void notify_monitors(Msg *m)
 {
@@ -552,6 +560,37 @@ struct JobRequestPosition
     Job* job;
 };
 
+/* Debit/credit helpers.  Job::dispatchOutstanding() makes every release
+   path idempotent, so a job that is confirmed AND later erased releases
+   exactly one credit.  */
+static void debit_dispatch_credit(Job *job)
+{
+    if (job && !job->dispatchOutstanding()) {
+        job->setDispatchOutstanding(true);
+        job->submitter()->addOutstandingDispatch();
+    }
+}
+
+static void credit_dispatch_credit(Job *job)
+{
+    if (job && job->dispatchOutstanding()) {
+        job->setDispatchOutstanding(false);
+        job->submitter()->removeOutstandingDispatch();
+    }
+}
+
+/* A submitter is eligible for new assignments only when it is neither
+   mid-backlog nor holding its full quota of unconfirmed dispatches.  The
+   deferral half is episode-scoped on purpose: it stays closed until the
+   backlog fully drains, rather than reopening because userspace bytes moved
+   into the kernel.  */
+static bool submitter_accepts_dispatch(CompileServer *submitter)
+{
+    return submitter
+        && !submitter->has_pending_write()
+        && submitter->outstandingDispatches() < max_outstanding_dispatches;
+}
+
 static JobRequestPosition get_first_job_request()
 {
     if (job_requests.empty()) {
@@ -574,8 +613,7 @@ static JobRequestPosition get_first_job_request()
            every compatible slot on the farm.  Selection resumes automatically
            once flush_pending() empties the channel (or the 30s deferred-send
            bound tears the submitter down).  */
-        if (group->submitter->has_pending_write()
-                || group->submitter->pending_bytes() > max_deferred_send_bytes) {
+        if (!submitter_accepts_dispatch(group->submitter)) {
             continue;
         }
         for (Job *job : group->l) {
@@ -593,38 +631,50 @@ static JobRequestPosition get_first_job_request()
     }
 
     for (JobRequestsGroup *group : job_requests) {
-        if (!group->submitter->has_pending_write()) {
+        if (submitter_accepts_dispatch(group->submitter)) {
             assert(!group->l.empty());
             return JobRequestPosition(group, group->l.front());
         }
     }
-    return JobRequestPosition();   // every submitter is backed up: dispatch pauses
+    return JobRequestPosition();   // every submitter is gated: dispatch pauses
 }
 
-static JobRequestPosition get_next_job_request(const JobRequestPosition& pos)
+/* Circular successor of `pos`, or an invalid position once the walk has
+   returned to `start`.  The walk must be circular: the scored head can sit
+   in a later group, and a forward-only walk would never test the groups and
+   jobs BEFORE it -- compatible work would be skipped and the caller would
+   report "no suitable host" while schedulable requests were queued.  */
+static JobRequestPosition get_next_job_request(const JobRequestPosition& pos,
+                                               const JobRequestPosition& start)
 {
     assert(!job_requests.empty());
     assert(pos.group != nullptr && pos.job != nullptr);
 
     JobRequestsGroup* group = pos.group;
+    JobRequestPosition next;
     // Get next job in the same group.
     list<Job*>::iterator jobIt = std::find(group->l.begin(), group->l.end(), pos.job);
     assert(jobIt != group->l.end());
     ++jobIt;
-    if( jobIt != group->l.end())
-        return JobRequestPosition( group, *jobIt );
-    // Get next group.
-    list<JobRequestsGroup*>::iterator groupIt = std::find(job_requests.begin(), job_requests.end(), group);
-    assert(groupIt != job_requests.end());
-    ++groupIt;
-    if( groupIt != job_requests.end())
-    {
+    if( jobIt != group->l.end()) {
+        next = JobRequestPosition( group, *jobIt );
+    } else {
+        // Get next group, wrapping to the first.
+        list<JobRequestsGroup*>::iterator groupIt = std::find(job_requests.begin(), job_requests.end(), group);
+        assert(groupIt != job_requests.end());
+        ++groupIt;
+        if( groupIt == job_requests.end()) {
+            groupIt = job_requests.begin();
+        }
         group = *groupIt;
         assert(!group->l.empty());
-        return JobRequestPosition( group, group->l.front());
+        next = JobRequestPosition( group, group->l.front());
     }
-    // end
-    return JobRequestPosition();
+
+    if (start.isValid() && next.group == start.group && next.job == start.job) {
+        return JobRequestPosition();   // full circle: every candidate seen
+    }
+    return next;
 }
 
 // Removes the given job request.
@@ -1181,20 +1231,42 @@ static time_t prune_servers()
            then treat it as dead -- this is the application-level bound that
            keeps a stalled submitter's WAITINGFORCS jobs from pinning remote
            slots forever.  */
-        {
-            const time_t deferred_age = (*it)->pending_write_age(icecream_monotonic_seconds());
-
-            if (deferred_age >= max_deferred_send_age) {
-                log_warning() << (*it)->nodeName() << " has not accepted dispatch data for "
-                              << deferred_age << "s - removing" << endl;
+        if ((*it)->outstandingDispatches() > 0 && !(*it)->deferred_output_armed()) {
+            const uint64_t stall_msec =
+                (*it)->outstandingStallMsec(icecream_monotonic_msec());
+            if (stall_msec >= max_outstanding_stall_msec) {
+                log_warning() << (*it)->nodeName() << " holds "
+                              << (*it)->outstandingDispatches()
+                              << " unconfirmed dispatches for "
+                              << (stall_msec / 1000) << "s - removing" << endl;
                 CompileServer *old = *it;
                 ++it;
                 handle_end(old, nullptr);
                 continue;
             }
-            if (deferred_age > 0) {
-                min_time = min(min_time, max_deferred_send_age - deferred_age);
+            const uint64_t remaining = max_outstanding_stall_msec - stall_msec;
+            min_time = min(min_time, (time_t)((remaining + 999) / 1000));
+        }
+
+        if ((*it)->deferred_output_armed()) {
+            const uint64_t now_msec = icecream_monotonic_msec();
+            const uint64_t deadline = (*it)->deferred_output_deadline_msec();
+
+            if (now_msec >= deadline) {
+                log_warning() << (*it)->nodeName()
+                              << " has not accepted dispatch data within "
+                              << (ICECC_DEFERRED_SEND_TIMEOUT_MSEC / 1000)
+                              << "s - removing" << endl;
+                CompileServer *old = *it;
+                ++it;
+                handle_end(old, nullptr);
+                continue;
             }
+            /* Cap the poll timeout by the remaining budget (rounded up, at
+               least one second granularity) so a peer that never produces
+               an event is still reaped on time.  */
+            const uint64_t remaining_msec = deadline - now_msec;
+            min_time = min(min_time, (time_t)((remaining_msec + 999) / 1000));
         }
 
         /* protocol version 27 and newer use TCP keepalive */
@@ -1249,8 +1321,9 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
 {
     JobRequestPosition jobPosition = get_first_job_request();
     if (!jobPosition.isValid()) {
-        return false;   // empty, or all submitters have deferred backlogs
+        return false;   // empty, or every submitter is gated (backlog/credit)
     }
+    const JobRequestPosition walkStart = jobPosition;
 
     assert(!css.empty());
 
@@ -1274,14 +1347,12 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
             break;
         }
 
-        jobPosition = get_next_job_request( jobPosition );
-        /* Skip positions whose submitter has deferred output (see the
-           selection-time check above) -- their assignments could not be
-           delivered anyway.  */
+        jobPosition = get_next_job_request( jobPosition, walkStart );
+        /* Skip positions whose submitter is gated (backlog or credit limit)
+           -- their assignments could not be delivered/confirmed anyway.  */
         while (jobPosition.isValid()
-               && (jobPosition.job->submitter()->has_pending_write()
-                   || jobPosition.job->submitter()->pending_bytes() > max_deferred_send_bytes)) {
-            jobPosition = get_next_job_request( jobPosition );
+               && !submitter_accepts_dispatch(jobPosition.job->submitter())) {
+            jobPosition = get_next_job_request( jobPosition, walkStart );
         }
         if (jobPosition.isValid()) {
             /* Retarget the job under test.  Without this the loop kept
@@ -1291,11 +1362,8 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
                head selection).  */
             job = jobPosition.job;
         }
-        if (!jobPosition.isValid()) { // no job found in the whole job_requests list
-            jobPosition = get_first_job_request();
-            if (!jobPosition.isValid()) {
-                return false;   // only backed-up submitters remain
-            }
+        if (!jobPosition.isValid()) { // every live candidate was tested once
+            jobPosition = walkStart;
             job = jobPosition.job;
             for (CompileServer * const cs : css) {
                 if(!job->preferredHost().empty() && !cs->matches(job->preferredHost()))
@@ -1367,6 +1435,7 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
             handle_end(job->submitter(), nullptr);   // will care for the rest
             return true;
         }
+        debit_dispatch_credit(job);
     }
     else
     {
@@ -1377,6 +1446,7 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
             handle_end(job->submitter(), nullptr);   // will care for the rest
             return true;
         }
+        debit_dispatch_credit(job);
     }
 
 
@@ -1552,6 +1622,11 @@ static bool handle_job_begin(CompileServer *cs, Msg *_m)
 
     cs->setClientCount(m->client_count);
 
+    /* Observable progress: the client received its UseCS and reached the
+       compile server, so this assignment no longer occupies a dispatch
+       credit on its submitter.  */
+    credit_dispatch_credit(job);
+
     job->setState(Job::COMPILING);
     job->setStartTime(m->stime);
     job->setStartOnScheduler(time(nullptr));
@@ -1681,6 +1756,7 @@ static bool handle_job_done(CompileServer *cs, Msg *_m)
 
     add_job_stats(j, m);
     notify_monitors(new MonJobDoneMsg(*m));
+    credit_dispatch_credit(j);
     jobs.erase(m->job_id);
     delete j;
 
@@ -2081,6 +2157,7 @@ static bool handle_end(CompileServer *toremove, Msg *m)
                         (*jit)->server()->setBusyInstalling(0);
                     }
 
+                    credit_dispatch_credit(*jit);
                     jobs.erase((*jit)->id());
                     delete(*jit);
                 }
@@ -2109,6 +2186,7 @@ static bool handle_end(CompileServer *toremove, Msg *m)
                     job->server()->setBusyInstalling(0);
                 }
 
+                credit_dispatch_credit(job);
                 jobs.erase(mit++);
                 delete job;
             } else {
@@ -2637,14 +2715,18 @@ int main(int argc, char *argv[])
             /* The deferred-send deadline must be able to shorten a poll
                timeout computed BEFORE dispatch created new backlog, or the
                30s bound can silently stretch to prune_servers()'s full
-               36s ceiling.  */
+               36s ceiling.  Keyed on the armed FLAG, not on an age value:
+               an age of zero is ambiguous during the deadline's first
+               second and would leave the stale timeout in place.  */
+            const uint64_t now_msec = icecream_monotonic_msec();
             for (CompileServer * const cs : css) {
-                const time_t age = cs->pending_write_age(icecream_monotonic_seconds());
-                if (age > 0) {
-                    const time_t remaining = age >= max_deferred_send_age
-                        ? 1 : max_deferred_send_age - age;
-                    timeout = std::min(timeout, (int)remaining);
+                if (!cs->deferred_output_armed()) {
+                    continue;
                 }
+                const uint64_t deadline = cs->deferred_output_deadline_msec();
+                const int remaining = deadline <= now_msec
+                    ? 0 : (int)((deadline - now_msec + 999) / 1000);
+                timeout = std::min(timeout, remaining);
             }
         }
 

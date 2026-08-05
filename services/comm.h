@@ -233,9 +233,14 @@ const int NODE_FEATURE_ENV_ZSTD = ( 1 << 1 );
 // a list of pairs of host platform, filename
 typedef std::list<std::pair<std::string, std::string> > Environments;
 
-// CLOCK_MONOTONIC seconds; immune to wall-clock steps.  Used for deferred-
-// output age accounting (see MsgChannel::pending_write_age()).
+// CLOCK_MONOTONIC seconds/milliseconds; immune to wall-clock steps.  Used
+// for deferred-output deadline accounting (see MsgChannel::deferred_*).
 time_t icecream_monotonic_seconds();
+uint64_t icecream_monotonic_msec();
+
+// How long undelivered deferred output may wait before its peer is treated
+// as dead.  The same budget the historical blocking send granted.
+#define ICECC_DEFERRED_SEND_TIMEOUT_MSEC 30000
 
 // MsgChannel supports backpressure-tolerant sends (SendDeferrable,
 // has_pending_write(), flush_pending()).
@@ -285,18 +290,22 @@ public:
         return msgtogo;
     }
 
-    // Seconds for which deferred output has been waiting undelivered, or 0 if
-    // no deferrable send is currently backed up (bulk-only accumulation does
-    // not count).  Lets the owner enforce an application-level bound on a
-    // peer that stays writable-never: the kernel TCP_USER_TIMEOUT bound is
-    // #ifdef'd (absent on some platforms) and SO_KEEPALIVE does not cover a
-    // peer whose TCP stack keeps ACKing while the process never reads.
-    // `now` must come from icecream_monotonic_seconds(): the timestamp is
-    // monotonic so wall-clock steps can neither disable the bound nor fire
-    // it early.
-    time_t pending_write_age(time_t now) const
+    // True while a deferrable send has left output undelivered.  An explicit
+    // flag rather than a timestamp test: an age of zero is ambiguous during
+    // the first second of a backlog, and owners must distinguish "not armed"
+    // from "armed, just now".
+    bool deferred_output_armed(void) const
     {
-        return pending_write_since ? now - pending_write_since : 0;
+        return pending_write_armed;
+    }
+
+    // Absolute CLOCK_MONOTONIC millisecond deadline for the current backlog
+    // (meaningful only while deferred_output_armed()).  Owners enforce it:
+    // the kernel TCP_USER_TIMEOUT bound is #ifdef'd and SO_KEEPALIVE does
+    // not cover a peer whose TCP keeps ACKing while the process never reads.
+    uint64_t deferred_output_deadline_msec(void) const
+    {
+        return pending_write_deadline_msec;
     }
 
     // Try to write queued output without blocking.  A still-full peer buffer
@@ -371,9 +380,9 @@ protected:
     size_t msgbuflen;
     size_t msgofs;
     size_t msgtogo;
-    // when the currently pending deferrable output first failed to send in
-    // full (0 = no deferred backlog); see pending_write_age()
-    time_t pending_write_since;
+    // deferred-output deadline state; see deferred_output_armed()
+    bool pending_write_armed;
+    uint64_t pending_write_deadline_msec;
     char *inbuf;
     size_t inbuflen;
     size_t inofs;

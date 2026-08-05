@@ -110,9 +110,17 @@ grep -oE "put [0-9]+ in joblist of [a-zA-Z0-9_-]+" $RUN/sched.log | awk '{print 
 # Enforced expectations per scenario: G1 must lose nothing; G2/G3 tolerate
 # in-flight casualties of the long freeze but the build run must complete.
 FAIL=0
+DEFERRALS=$(grep -c 'deferring' $RUN/sched.log 2>/dev/null); DEFERRALS=${DEFERRALS:-0}
+TEARDOWNS=$(grep -c 'has not accepted dispatch data' $RUN/sched.log 2>/dev/null); TEARDOWNS=${TEARDOWNS:-0}
+WORST=$(awk '{if($2>m)m=$2} END{printf "%.0f", m}' $RUN/probe.txt 2>/dev/null); WORST=${WORST:-0}
 case $CFG in
-  G1) { [ "$BUILD_RC" -eq 0 ] && [ "$OBJS" -eq 400 ]; } || FAIL=1;;
-  G2|G3) [ "$BUILD_RC" -eq 0 ] || FAIL=1;;
+  G1) # transient freeze: nothing lost, scheduler responsive
+      { [ "$BUILD_RC" -eq 0 ] && [ "$OBJS" -eq 400 ] && [ "$WORST" -lt 5 ]; } || FAIL=1;;
+  G2) # long freeze on the fixed scheduler: build completes, stays responsive
+      { [ "$BUILD_RC" -eq 0 ] && [ "$WORST" -lt 5 ]; } || FAIL=1;;
+  G3) # baseline: only completion is required (it is expected to wedge)
+      [ "$BUILD_RC" -eq 0 ] || FAIL=1;;
 esac
+echo "asserted: rc=$BUILD_RC objs=$OBJS deferrals=$DEFERRALS teardowns=$TEARDOWNS worst_probe=${WORST}s"
 if [ "$FAIL" -ne 0 ]; then echo "RESULT: FAIL"; exit 1; fi
 echo "RESULT: PASS"

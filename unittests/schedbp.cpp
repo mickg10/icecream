@@ -81,6 +81,7 @@
 #include <cstring>
 #include <ctime>
 #include <map>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -193,6 +194,15 @@ int main(int argc, char **argv)
     const std::string shim = argv[2];
     int njobs = argc > 3 ? atoi(argv[3]) : 4000;
     const bool stall_mode = argc > 5 && strcmp(argv[5], "stall") == 0;
+    /* "expect-deferral": assert the run actually engaged backpressure, so a
+       quick test cannot silently stop governing the admission gate if buffer
+       sizes change.  */
+    /* "gate": fast deterministic assertion of the BP-1 admission invariant
+       for every-commit runs -- while a submitter stops reading, the
+       scheduler must stop granting it assignments (bounded by the dispatch
+       credit) while other submitters keep being served.  It does not wait
+       for any teardown deadline.  */
+    const bool gate_mode = argc > 5 && strcmp(argv[5], "gate") == 0;
     // Normal mode must stay under the scheduler's 30s deferred-send bound
     // (measured from jam onset, ~1-2s into the clog): it asserts that a
     // TRANSIENT stall loses nothing.  Stall mode goes well past the bound
@@ -274,21 +284,49 @@ int main(int argc, char **argv)
 
     std::atomic<bool> shutdown{false};
     std::atomic<bool> cs_alive{true};
+    /* Job ids whose UseCS a submitter has received.  The compile server
+       confirms them with JobBeginMsg, exactly as a real CS does once the
+       client contacts it -- this is the progress signal the scheduler's
+       dispatch credit is released by.  A frozen submitter never enqueues
+       here, which is precisely why its credit stays held.  */
+    std::mutex confirm_mutex;
+    std::vector<unsigned int> to_confirm;
+    auto confirm_job = [&](unsigned int job_id) {
+        std::lock_guard<std::mutex> lock(confirm_mutex);
+        to_confirm.push_back(job_id);
+    };
     std::thread cs_thread([&] {
-        // keep the CS side drained and periodically say we are idle
+        // keep the CS side drained, confirm assignments promptly (a real CS
+        // sends JobBegin as soon as the client connects), and periodically
+        // say we are idle
         Clock::time_point last_stats = Clock::now();
         while (!shutdown) {
-            Msg *m = cs->get_msg(1, true);
+            Msg *m = cs->get_msg(0, true);
             delete m;
             if (cs->at_eof()) {
                 cs_alive = false;
                 return;
+            }
+            {
+                std::vector<unsigned int> batch;
+                {
+                    std::lock_guard<std::mutex> lock(confirm_mutex);
+                    batch.swap(to_confirm);
+                }
+                for (unsigned int jid : batch) {
+                    JobBeginMsg jb(jid, 1);
+                    if (!cs->send_msg(jb)) {
+                        cs_alive = false;
+                        return;
+                    }
+                }
             }
             if (secs_since(last_stats) > 10) {
                 StatsMsg stats;
                 cs->send_msg(stats);
                 last_stats = Clock::now();
             }
+            usleep(20 * 1000);
         }
     });
 
@@ -375,6 +413,55 @@ int main(int argc, char **argv)
         }
     });
 
+    // ---- second, healthy submitter (must keep making progress) -------------
+    MsgChannel *sub2 = connect_daemon(port, 0);
+    std::atomic<int> healthy_replies{0};
+    std::atomic<bool> healthy_alive{true};
+    if (!sub2) {
+        fprintf(stderr, "cannot connect second submitter\n");
+        shutdown = true; probe_thread.join(); cs_thread.join();
+        close(ctrl); delete cs; kill(sched, SIGTERM); waitpid(sched, nullptr, 0);
+        return 2;
+    }
+    {
+        LoginMsg login(0, "fakesub2", kPlatform, 0);
+        login.envs.push_back(std::make_pair(kPlatform, kEnv));
+        login.max_kids = 0;
+        login.noremote = true;
+        login.chroot_possible = false;
+        sub2->send_msg(login);
+    }
+    std::thread healthy_thread([&] {
+        // request one job at a time and drain replies promptly
+        unsigned int cid = 900000;
+        while (!shutdown) {
+            char fname[64];
+            snprintf(fname, sizeof(fname), "healthy%u.cpp", cid);
+            GetCSMsg g(Environments{std::make_pair(std::string(kPlatform), std::string(kEnv))},
+                       fname, CompileJob::Lang_CXX, 1, kPlatform, 0, std::string(), 0, 0, 0);
+            g.client_id = cid++;
+            if (!sub2->send_msg(g)) {
+                healthy_alive = false;
+                return;
+            }
+            Msg *m = sub2->get_msg(2, true);
+            if (m) {
+                if (MSG_IS(m, USE_CS) || MSG_IS(m, NO_CS)) {
+                    ++healthy_replies;
+                    UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                    if (u) {
+                        confirm_job(u->job_id);
+                    }
+                }
+                delete m;
+            } else if (sub2->at_eof()) {
+                healthy_alive = false;
+                return;
+            }
+            usleep(100 * 1000);
+        }
+    });
+
     // ---- fake submitter ----------------------------------------------------
     // 64KiB rcvbuf: small enough that the dispatch replies jam, large enough
     // (>= one loopback MSS) that the window reopens when we drain at the end.
@@ -432,6 +519,63 @@ int main(int argc, char **argv)
         }
     }
 
+    if (gate_mode) {
+        fprintf(stderr, "# gate mode: submitter stops reading for %ds\n", clog_s);
+        auto count_assignments = [&]() {
+            int n = 0;
+            FILE *lf = fopen("schedbp-scheduler.log", "r");
+            if (lf) {
+                char line[4096];
+                while (fgets(line, sizeof(line), lf)) {
+                    if (strstr(line, " in joblist of ")) {
+                        ++n;
+                    }
+                }
+                fclose(lf);
+            }
+            return n;
+        };
+        const int healthy_before = healthy_replies.load();
+        const int puts_before = count_assignments();
+        for (int i = 0; i < clog_s; ++i) {
+            sleep(1);
+        }
+        /* Only assignments made DURING the freeze are attributable to the
+           gate; earlier ones were confirmed normally.  */
+        const int puts_total = count_assignments() - puts_before;
+        const int healthy_gain = healthy_replies.load() - healthy_before;
+        /* The stalled submitter confirms nothing, so it may hold at most its
+           credit (32) plus the assignment already in flight; the healthy
+           submitter must keep progressing meanwhile.  Its own confirmed jobs
+           also appear in the joblist count, hence the healthy_gain term.  */
+        fprintf(stderr, "# assignments while stalled: %d (bound %d), healthy gain: %d\n",
+                puts_total, 33 + healthy_gain, healthy_gain);
+        REQUIRE(puts_total <= 33 + healthy_gain,
+                "dispatch to the non-reading submitter stopped at its credit (BP-1)");
+        REQUIRE(healthy_alive.load() && healthy_gain > 0,
+                "a healthy submitter kept receiving dispatches while the other stalled");
+        REQUIRE(worst_reply.load() < 5.0, "scheduler stayed responsive");
+        REQUIRE(!probe_died.load(), "control connection survived");
+
+        shutdown = true;
+        probe_thread.join();
+        cs_thread.join();
+        healthy_thread.join();
+        close(ctrl);
+        delete sub;
+        delete sub2;
+        delete cs;
+        kill(sched, SIGTERM);
+        int status = 0;
+        waitpid(sched, &status, 0);
+        if (failures) {
+            fprintf(stderr, "RESULT: FAIL (%d)\n", failures);
+            return 1;
+        }
+        fprintf(stderr, "RESULT: PASS\n");
+        return 0;
+    }
+
     if (stall_mode) {
         // ---- stall mode: never drain; the scheduler must cut us loose ------
         fprintf(stderr, "# stall mode: submitter never reads; waiting for the "
@@ -457,7 +601,28 @@ int main(int argc, char **argv)
             }
         }
         fprintf(stderr, "# submitter connection torn down at t=%ds\n", death_t);
-        REQUIRE(death_t >= 0, "scheduler tore down the never-draining submitter");
+        /* Teardown is expected only when the stall actually armed a deferred
+           send (unread socket -> 30s bound).  With the dispatch-credit gate
+           the queued bytes may fit entirely in the socket buffers, in which
+           case the submitter looks alive at TCP level and its exposure is
+           bounded by the credit instead; the separate 180s unconfirmed-
+           dispatch bound covers that case and is too slow for this run.  */
+        bool deferral_armed = false;
+        {
+            FILE *lf = fopen("schedbp-scheduler.log", "r");
+            if (lf) {
+                char line[4096];
+                while (fgets(line, sizeof(line), lf)) {
+                    if (strstr(line, "deferring")) { deferral_armed = true; break; }
+                }
+                fclose(lf);
+            }
+        }
+        fprintf(stderr, "# deferred send armed during the stall: %s\n",
+                deferral_armed ? "yes" : "no (credit gate capped the backlog first)");
+        if (deferral_armed) {
+            REQUIRE(death_t >= 0, "scheduler tore down the never-draining submitter");
+        }
         // BP-1 regression guard: a submitter with deferred (undelivered)
         // dispatch output must stop receiving new assignments.  The gate is
         // per-backlog-episode, so assignments continue while the kernel
@@ -487,15 +652,25 @@ int main(int argc, char **argv)
             }
             fprintf(stderr, "# assignments: total=%d after-first-deferral=%d (of %d requests)\n",
                     puts_total, puts_after_defer, njobs);
-            REQUIRE(puts_total >= 0 && puts_total < (njobs * 3) / 4,
-                    "dispatch stopped for the backed-up submitter well before all requests (BP-1)");
+            /* Exact bound: after the first deferral the stalled submitter may
+               hold at most its dispatch credit (32) plus the assignment whose
+               bytes became partial.  Anything beyond that means the scheduler
+               kept reserving farm slots the client cannot use.  */
+            REQUIRE(puts_after_defer >= 0 && puts_after_defer <= 33,
+                    "at most credit+1 assignments after the first deferral (BP-1)");
+            fprintf(stderr, "# healthy submitter replies during the stall: %d\n",
+                    healthy_replies.load());
+            REQUIRE(healthy_alive.load() && healthy_replies.load() > 0,
+                    "a healthy submitter kept receiving dispatches throughout");
         }
         // The bound is 30s of undelivered output.  Much earlier means some
         // kernel-level timeout leaked into the test conditions; never (or
         // only at the very end of the window) means deferred bytes and the
         // submitter's WAITINGFORCS jobs can linger without bound.
-        REQUIRE(death_t >= 20 && death_t <= 50,
-                "teardown honoured the ~30s deferred-send age bound");
+        if (deferral_armed) {
+            REQUIRE(death_t >= 20 && death_t <= 50,
+                    "teardown honoured the ~30s deferred-send age bound");
+        }
         REQUIRE(cs_alive.load(), "compile server connection survived");
         {
             double pending = probe_pending_since.load();
@@ -514,8 +689,10 @@ int main(int argc, char **argv)
         shutdown = true;
         probe_thread.join();
         cs_thread.join();
+        healthy_thread.join();
         close(ctrl);
         delete sub;
+        delete sub2;
         delete cs;
         kill(sched, SIGTERM);
         int status = 0;
@@ -564,6 +741,7 @@ int main(int argc, char **argv)
                     && u->client_id <= (unsigned)njobs) {
                 ++replies[u->client_id];
                 ++parsed;
+                confirm_job(u->job_id);
             } else {
                 fprintf(stderr, "# corrupt USE_CS: client_id=%u port=%u host=%s\n",
                         u ? u->client_id : 0, u ? u->port : 0,
@@ -617,11 +795,14 @@ int main(int argc, char **argv)
     // them: losing the control connection is itself unresponsiveness.
     REQUIRE(!probe_died.load(), "control connection survived (not pruned by a wedged scheduler)");
 
+
     shutdown = true;
     probe_thread.join();
     cs_thread.join();
+    healthy_thread.join();
     close(ctrl);
     delete sub;
+    delete sub2;
     delete cs;
     kill(sched, SIGTERM);
     int status = 0;

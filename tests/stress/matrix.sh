@@ -164,7 +164,7 @@ E)  # dual schedulers + discovery/election + LIVE failover mid-build
     sleep 30
     log "RESTARTING s@x (daemons should be evicted from s@o and rehome)"
     start_sched x $PX $EP
-    wait $BPID
+    wait $BPID || FAILURES=$((FAILURES + 1))
     listcs $((PX+1)) sx-after
     ;;
 F)  # s@x f@x c@o+x concurrently
@@ -175,11 +175,14 @@ F)  # s@x f@x c@o+x concurrently
     start_cdaemon o co.sock $MYIP:$PX
     start_cdaemon x cx.sock $MYIP:$PX
     sleep 4
+    # Background subshells cannot increment the parent's FAILURES; capture
+    # each exit status explicitly or a failed build prints RESULT: PASS.
     run_build old o co.sock 20 &
     P1=$!
     run_build new x cx.sock 20 &
     P2=$!
-    wait $P1 $P2
+    wait $P1 || FAILURES=$((FAILURES + 1))
+    wait $P2 || FAILURES=$((FAILURES + 1))
     listcs $((PX+1)) sx
     ;;
 *) echo "unknown config $CFG"; exit 2;;

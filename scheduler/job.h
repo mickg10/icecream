@@ -52,6 +52,11 @@ public:
     State state() const;
     void setState(const State state);
 
+    // True while this job holds one of its submitter's dispatch credits
+    // (dispatched, not yet confirmed by JobBegin or released on teardown).
+    bool dispatchOutstanding() const { return m_dispatchOutstanding; }
+    void setDispatchOutstanding(bool value) { m_dispatchOutstanding = value; }
+
     CompileServer *server() const;
     void setServer(CompileServer *server);
 
@@ -123,6 +128,7 @@ private:
 
     std::string m_targetPlatform;
     std::string m_fileName;
+    bool m_dispatchOutstanding = false;
     std::list<Job *> m_masterJobFor;
     unsigned int m_argFlags;
     std::string m_language; // for debugging
