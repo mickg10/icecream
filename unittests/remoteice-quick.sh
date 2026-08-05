@@ -68,6 +68,13 @@ fi
 
 # Compiler environment for the worker, generated the way a client would.
 mkdir -p "$work/env" "$work/envs-remote" "$work/envs-local"
+
+# As root the services drop to their own unprivileged user BEFORE opening
+# logs or installing environments; mktemp's 0700 root-owned directories
+# would silently eat both.  /tmp semantics for the private dirs fix it.
+if [ "$(id -u)" = 0 ]; then
+    chmod 1777 "$work" "$sockdir" "$work/envs-remote" "$work/envs-local"
+fi
 ( cd "$work/env" && bash "$top/client/icecc-create-env" "$(command -v gcc)" \
       >"$work/create-env.log" 2>&1 )
 ENVTAR=$(ls "$work"/env/*.tar.gz 2>/dev/null | head -1)
