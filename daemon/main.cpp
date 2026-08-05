@@ -84,6 +84,10 @@
 
 #include <chrono>
 #include <deque>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
 #include <map>
 #include <algorithm>
 #include <set>
@@ -96,6 +100,7 @@
 #include "serve.h"
 #include "workit.h"
 #include "logging.h"
+#include "utf8.h"
 #include <comm.h>
 #include "load.h"
 #include "environment.h"
@@ -164,15 +169,156 @@ static FdSnapshot collect_fd_snapshot()
    and JSONL we emit declare UTF-8.  json_escape() validates as it escapes
    and replaces any malformed sequence with U+FFFD, so a stray 0x80-0xff
    byte in a path or command line cannot produce a document that a strict
-   parser rejects.  */
-static size_t utf8_sequence_length(unsigned char c)
-{
-    if (c < 0x80) return 1;
-    if ((c & 0xe0) == 0xc0) return 2;
-    if ((c & 0xf0) == 0xe0) return 3;
-    if ((c & 0xf8) == 0xf0) return 4;
-    return 0;   // continuation byte or invalid lead
-}
+   parser rejects.  Validation is full scalar-value checking (utf8.h) --
+   overlongs, surrogates, values above U+10FFFF and C0/C1/F5-FF leads are
+   all replaced, not just malformed continuation shapes.  */
+
+/* Storage sink for state JSONL records with its own thread: open() and
+   write() on a regular file can block for as long as the storage stack
+   wants regardless of O_NONBLOCK, so no storage call may run on the
+   daemon's control loop.  The loop only appends to a bounded in-memory
+   queue (drop-oldest, per-record cap); this thread does all I/O and simply
+   sleeps through backoff.
+
+   The thread starts lazily on the first enqueue -- which happens in the
+   running main loop, safely after daemonize()'s forks.  Compile children
+   forked later never touch the writer, and the sweep in serve.cpp closes
+   its descriptor in the child.  */
+class AsyncJsonlWriter {
+public:
+    ~AsyncJsonlWriter() { stop(); }
+
+    void set_path(const std::string &path) { path_ = path; }
+    const std::string &path() const { return path_; }
+
+    void enqueue(const std::string &line)
+    {
+        if (path_.empty()) {
+            return;
+        }
+        if (line.size() > max_record_bytes) {
+            /* One pathological record must not displace the whole queue's
+               worth of history (the queue bound alone would let a single
+               record approach 4 MiB).  */
+            ++oversized_;
+            return;
+        }
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (!started_) {
+            started_ = true;
+            thread_ = std::thread(&AsyncJsonlWriter::run, this);
+        }
+        queue_.push_back(line);
+        queue_.back() += '\n';
+        queued_bytes_ += queue_.back().size();
+        while (queued_bytes_ > max_queued_bytes && queue_.size() > 1) {
+            /* Drop the oldest record: recent telemetry is the useful kind
+               when storage is misbehaving.  */
+            queued_bytes_ -= queue_.front().size();
+            queue_.pop_front();
+            ++dropped_;
+        }
+        queued_snapshot_ = queued_bytes_;
+        cond_.notify_one();
+    }
+
+    void stop()
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!started_) {
+                return;
+            }
+            stopping_ = true;
+        }
+        cond_.notify_one();
+        thread_.join();
+        started_ = false;
+        stopping_ = false;
+    }
+
+    uint64_t dropped() const { return dropped_.load(); }
+    uint64_t oversized() const { return oversized_.load(); }
+    uint64_t open_failures() const { return open_failures_.load(); }
+    uint64_t write_failures() const { return write_failures_.load(); }
+    size_t queued_bytes() const { return queued_snapshot_.load(); }
+
+private:
+    void run()
+    {
+        int fd = -1;
+        std::unique_lock<std::mutex> lock(mutex_);
+        for (;;) {
+            cond_.wait(lock, [&] { return stopping_ || !queue_.empty(); });
+            if (queue_.empty()) {
+                break;   // stopping, and everything already flushed
+            }
+            std::string rec = std::move(queue_.front());
+            queue_.pop_front();
+            queued_bytes_ -= rec.size();
+            queued_snapshot_ = queued_bytes_;
+            lock.unlock();
+
+            bool ok = true;
+            if (fd < 0) {
+                fd = ::open(path_.c_str(),
+                            O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+                if (fd < 0) {
+                    ++open_failures_;
+                    ok = false;
+                }
+            }
+            if (ok) {
+                size_t done = 0;
+                while (done < rec.size()) {
+                    ssize_t n = ::write(fd, rec.data() + done, rec.size() - done);
+                    if (n < 0 && errno == EINTR) {
+                        continue;
+                    }
+                    if (n <= 0) {
+                        ++write_failures_;
+                        close(fd);
+                        fd = -1;
+                        ok = false;
+                        break;
+                    }
+                    done += size_t(n);
+                }
+            }
+
+            lock.lock();
+            if (!ok && !stopping_) {
+                /* Requeue the record at the front (bounded by the normal
+                   drop-oldest policy) and back off five seconds before the
+                   next attempt -- in this thread, sleeping is free.  */
+                queue_.push_front(std::move(rec));
+                queued_bytes_ += queue_.front().size();
+                queued_snapshot_ = queued_bytes_;
+                cond_.wait_for(lock, std::chrono::seconds(5),
+                               [&] { return stopping_; });
+            }
+        }
+        if (fd >= 0) {
+            close(fd);
+        }
+    }
+
+    static const size_t max_queued_bytes = 4 * 1024 * 1024;
+    static const size_t max_record_bytes = 256 * 1024;
+    std::string path_;
+    std::mutex mutex_;
+    std::condition_variable cond_;
+    std::deque<std::string> queue_;
+    size_t queued_bytes_ = 0;
+    bool started_ = false;
+    bool stopping_ = false;
+    std::thread thread_;
+    std::atomic<uint64_t> dropped_{0};
+    std::atomic<uint64_t> oversized_{0};
+    std::atomic<uint64_t> open_failures_{0};
+    std::atomic<uint64_t> write_failures_{0};
+    std::atomic<size_t> queued_snapshot_{0};
+};
 
 static string json_escape(const string &s)
 {
@@ -214,17 +360,10 @@ static string json_escape(const string &s)
                 /* Validate the multi-byte sequence before copying it; any
                    malformed byte becomes U+FFFD so the output is always
                    well-formed UTF-8 (see the note above this function).  */
-                const size_t len = utf8_sequence_length(c);
-                bool ok = len >= 2 && len <= 4 && i + len <= s.size();
-                if (ok) {
-                    for (size_t k = 1; k < len; ++k) {
-                        if ((static_cast<unsigned char>(s[i + k]) & 0xc0) != 0x80) {
-                            ok = false;
-                            break;
-                        }
-                    }
-                }
-                if (ok) {
+                const size_t len = utf8_scalar_sequence_length(
+                    reinterpret_cast<const unsigned char *>(s.data()) + i,
+                    s.size() - i);
+                if (len >= 2) {
                     out.append(s, i, len);
                     i += len - 1;
                 } else {
@@ -1215,14 +1354,7 @@ struct Daemon {
        dropped and counted, because compile scheduling is the higher-
        priority correctness path.  */
     bool append_state_jsonl_line(const std::string &line);
-    void flush_state_jsonl(size_t max_bytes);
-    std::deque<std::string> state_jsonl_queue;
-    size_t state_jsonl_queued_bytes = 0;
-    size_t state_jsonl_write_ofs = 0;
-    int state_jsonl_fd = -1;
-    uint64_t state_jsonl_retry_after_msec = 0;
-    uint64_t state_jsonl_dropped = 0;
-    uint64_t state_jsonl_open_failures = 0;
+    AsyncJsonlWriter state_writer;
 };
 
 bool Daemon::setup_listen_fds()
@@ -3238,8 +3370,10 @@ void Daemon::remember_finished_job(const Client *client, int exitcode)
         o << "}";
         const string line = o.str();
         if (state_dump_log && logfile_error) {
+            /* No explicit flush: forcing a storage write per record from the
+               control loop is exactly the latency coupling OBS-2 removes.
+               The stream's own buffering (and SIGHUP log reopen) flushes.  */
             (*logfile_error) << line << "\n";
-            logfile_error->flush();
         }
         append_state_jsonl_line(line);
     }
@@ -4230,79 +4364,10 @@ string Daemon::dump_internals() const
 
 bool Daemon::append_state_jsonl_line(const std::string &line)
 {
-    if (state_jsonl_path.empty()) {
-        return true;
-    }
-
-    static const size_t max_queued_bytes = 4 * 1024 * 1024;
-
-    state_jsonl_queue.push_back(line + "\n");
-    state_jsonl_queued_bytes += state_jsonl_queue.back().size();
-
-    while (state_jsonl_queued_bytes > max_queued_bytes && state_jsonl_queue.size() > 1) {
-        /* Drop the oldest record rather than the newest: recent telemetry is
-           the useful kind when storage is misbehaving.  Never drop the entry
-           currently being written (index 0 while write_ofs > 0).  */
-        const size_t victim = state_jsonl_write_ofs ? 1 : 0;
-        state_jsonl_queued_bytes -= state_jsonl_queue[victim].size();
-        state_jsonl_queue.erase(state_jsonl_queue.begin() + victim);
-        ++state_jsonl_dropped;
-    }
+    /* All bounding, dropping and I/O live in the writer's own thread; this
+       is a cheap in-memory append from the control loop's perspective.  */
+    state_writer.enqueue(line);
     return true;
-}
-
-void Daemon::flush_state_jsonl(size_t max_bytes)
-{
-    if (state_jsonl_path.empty() || state_jsonl_queue.empty()) {
-        return;
-    }
-    if (state_jsonl_retry_after_msec && monotonic_msec() < state_jsonl_retry_after_msec) {
-        return;   // backoff after an error; do not retry (or log) every job
-    }
-
-    if (state_jsonl_fd < 0) {
-        state_jsonl_fd = ::open(state_jsonl_path.c_str(),
-                                O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | O_NONBLOCK, 0644);
-        if (state_jsonl_fd < 0) {
-            ++state_jsonl_open_failures;
-            state_jsonl_retry_after_msec = monotonic_msec() + 5000;
-            if (state_jsonl_open_failures == 1 || state_jsonl_open_failures % 100 == 0) {
-                log_error() << "failed to open state jsonl file " << state_jsonl_path
-                            << ": " << strerror(errno) << " (failures: "
-                            << state_jsonl_open_failures << ")" << endl;
-            }
-            return;
-        }
-    }
-
-    size_t written_total = 0;
-    while (!state_jsonl_queue.empty() && written_total < max_bytes) {
-        const string &front = state_jsonl_queue.front();
-        const size_t remaining = front.size() - state_jsonl_write_ofs;
-        const size_t chunk = std::min(remaining, max_bytes - written_total);
-        ssize_t n = ::write(state_jsonl_fd, front.data() + state_jsonl_write_ofs, chunk);
-        if (n < 0 && errno == EINTR) {
-            continue;
-        }
-        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            return;   // storage busy; try again next iteration
-        }
-        if (n <= 0) {
-            log_error() << "failed to write state jsonl file " << state_jsonl_path
-                        << ": " << strerror(errno) << endl;
-            close(state_jsonl_fd);
-            state_jsonl_fd = -1;
-            state_jsonl_retry_after_msec = monotonic_msec() + 5000;
-            return;
-        }
-        written_total += size_t(n);
-        state_jsonl_write_ofs += size_t(n);
-        if (state_jsonl_write_ofs >= front.size()) {
-            state_jsonl_queued_bytes -= front.size();
-            state_jsonl_queue.pop_front();
-            state_jsonl_write_ofs = 0;
-        }
-    }
 }
 
 std::string Daemon::dump_state_json() const
@@ -4485,9 +4550,11 @@ std::string Daemon::dump_state_json() const
     o << "\"telemetry\":{"
       << "\"insights_clock_resets\":" << insights_clock_resets << ","
       << "\"insights_dropped_jobs\":" << insights_dropped_jobs << ","
-      << "\"jsonl_dropped_records\":" << state_jsonl_dropped << ","
-      << "\"jsonl_queued_bytes\":" << state_jsonl_queued_bytes << ","
-      << "\"jsonl_open_failures\":" << state_jsonl_open_failures
+      << "\"jsonl_dropped_records\":" << state_writer.dropped() << ","
+      << "\"jsonl_oversized_records\":" << state_writer.oversized() << ","
+      << "\"jsonl_queued_bytes\":" << state_writer.queued_bytes() << ","
+      << "\"jsonl_open_failures\":" << state_writer.open_failures() << ","
+      << "\"jsonl_write_failures\":" << state_writer.write_failures()
       << "},";
     o << "\"cache\":{";
     o << "\"cache_size\":" << (unsigned long long)cache_size << ",";
@@ -4690,9 +4757,10 @@ void Daemon::maybe_dump_state()
     if (state_dump_log) {
         // Write raw JSON to the same output as error logs, regardless of verbosity.
         // This keeps the line machine-parsable and avoids requiring `-vv`.
+        // No explicit flush: a forced storage write per interval from the
+        // control loop is the latency coupling OBS-2 removes.
         if (logfile_error) {
             (*logfile_error) << line << "\n";
-            logfile_error->flush();
         }
     }
 
@@ -6034,12 +6102,9 @@ void Daemon::answer_client_requests()
         }
     }
 
-    /* Drain queued telemetry before sleeping, under a strict byte budget so
-       one slow filesystem cannot stretch a loop iteration.  */
-    flush_state_jsonl(64 * 1024);
-    if (!state_jsonl_queue.empty() && (poll_timeout_msec < 0 || poll_timeout_msec > 200)) {
-        poll_timeout_msec = 200;   // come back soon to finish draining
-    }
+    /* Telemetry draining no longer involves this loop at all: records go to
+       AsyncJsonlWriter's own thread, so a slow filesystem cannot stretch a
+       loop iteration and no early wakeup is needed.  */
 
     int ret = poll(pollfds.data(), pollfds.size(), poll_timeout_msec);
 
@@ -6411,6 +6476,7 @@ int main(int argc, char **argv)
             } else if (optname == "state-jsonl") {
                 if (optarg && *optarg) {
                     d.state_jsonl_path = optarg;
+                    d.state_writer.set_path(optarg);
                     if (!d.state_dump_interval_s) {
                         d.state_dump_interval_s = 30;
                     }
