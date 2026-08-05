@@ -1206,7 +1206,23 @@ struct Daemon {
 
     void maybe_dump_state();
     std::string dump_state_json() const;
-    bool append_state_jsonl_line(const std::string &line) const;
+    /* Telemetry output must never gate job control: a slow, full or
+       transiently unavailable filesystem would otherwise delay client
+       handling, child reaping and scheduler traffic on every completed job.
+       Lines are queued in bounded memory and drained from the main loop
+       under a strict per-iteration budget through one persistent
+       descriptor; when storage cannot keep up the OLDEST records are
+       dropped and counted, because compile scheduling is the higher-
+       priority correctness path.  */
+    bool append_state_jsonl_line(const std::string &line);
+    void flush_state_jsonl(size_t max_bytes);
+    std::deque<std::string> state_jsonl_queue;
+    size_t state_jsonl_queued_bytes = 0;
+    size_t state_jsonl_write_ofs = 0;
+    int state_jsonl_fd = -1;
+    uint64_t state_jsonl_retry_after_msec = 0;
+    uint64_t state_jsonl_dropped = 0;
+    uint64_t state_jsonl_open_failures = 0;
 };
 
 bool Daemon::setup_listen_fds()
@@ -4134,43 +4150,81 @@ string Daemon::dump_internals() const
     return result;
 }
 
-bool Daemon::append_state_jsonl_line(const std::string &line) const
+bool Daemon::append_state_jsonl_line(const std::string &line)
 {
     if (state_jsonl_path.empty()) {
         return true;
     }
 
-    const string data = line + "\n";
-    int fd = ::open(state_jsonl_path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
-    if (fd < 0) {
-        log_error() << "failed to open state jsonl file " << state_jsonl_path
-                    << ": " << strerror(errno) << endl;
-        return false;
+    static const size_t max_queued_bytes = 4 * 1024 * 1024;
+
+    state_jsonl_queue.push_back(line + "\n");
+    state_jsonl_queued_bytes += state_jsonl_queue.back().size();
+
+    while (state_jsonl_queued_bytes > max_queued_bytes && state_jsonl_queue.size() > 1) {
+        /* Drop the oldest record rather than the newest: recent telemetry is
+           the useful kind when storage is misbehaving.  Never drop the entry
+           currently being written (index 0 while write_ofs > 0).  */
+        const size_t victim = state_jsonl_write_ofs ? 1 : 0;
+        state_jsonl_queued_bytes -= state_jsonl_queue[victim].size();
+        state_jsonl_queue.erase(state_jsonl_queue.begin() + victim);
+        ++state_jsonl_dropped;
+    }
+    return true;
+}
+
+void Daemon::flush_state_jsonl(size_t max_bytes)
+{
+    if (state_jsonl_path.empty() || state_jsonl_queue.empty()) {
+        return;
+    }
+    if (state_jsonl_retry_after_msec && monotonic_msec() < state_jsonl_retry_after_msec) {
+        return;   // backoff after an error; do not retry (or log) every job
     }
 
-    const char *buf = data.data();
-    size_t to_write = data.size();
-    while (to_write) {
-        ssize_t n = ::write(fd, buf, to_write);
+    if (state_jsonl_fd < 0) {
+        state_jsonl_fd = ::open(state_jsonl_path.c_str(),
+                                O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | O_NONBLOCK, 0644);
+        if (state_jsonl_fd < 0) {
+            ++state_jsonl_open_failures;
+            state_jsonl_retry_after_msec = monotonic_msec() + 5000;
+            if (state_jsonl_open_failures == 1 || state_jsonl_open_failures % 100 == 0) {
+                log_error() << "failed to open state jsonl file " << state_jsonl_path
+                            << ": " << strerror(errno) << " (failures: "
+                            << state_jsonl_open_failures << ")" << endl;
+            }
+            return;
+        }
+    }
+
+    size_t written_total = 0;
+    while (!state_jsonl_queue.empty() && written_total < max_bytes) {
+        const string &front = state_jsonl_queue.front();
+        const size_t remaining = front.size() - state_jsonl_write_ofs;
+        const size_t chunk = std::min(remaining, max_bytes - written_total);
+        ssize_t n = ::write(state_jsonl_fd, front.data() + state_jsonl_write_ofs, chunk);
         if (n < 0 && errno == EINTR) {
             continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return;   // storage busy; try again next iteration
         }
         if (n <= 0) {
             log_error() << "failed to write state jsonl file " << state_jsonl_path
                         << ": " << strerror(errno) << endl;
-            if (-1 == close(fd) && (errno != EBADF)){
-                log_perror("Failed to close state jsonl file");
-            }
-            return false;
+            close(state_jsonl_fd);
+            state_jsonl_fd = -1;
+            state_jsonl_retry_after_msec = monotonic_msec() + 5000;
+            return;
         }
-        buf += n;
-        to_write -= n;
+        written_total += size_t(n);
+        state_jsonl_write_ofs += size_t(n);
+        if (state_jsonl_write_ofs >= front.size()) {
+            state_jsonl_queued_bytes -= front.size();
+            state_jsonl_queue.pop_front();
+            state_jsonl_write_ofs = 0;
+        }
     }
-
-    if (-1 == close(fd) && (errno != EBADF)){
-        log_perror("Failed to close state jsonl file");
-    }
-    return true;
 }
 
 std::string Daemon::dump_state_json() const
@@ -4298,11 +4352,10 @@ std::string Daemon::dump_state_json() const
     o << "\"slots\":{";
     o << "\"max_kids\":" << max_kids << ",";
     o << "\"max_preprocess_kids\":" << max_preprocess_kids << ",";
-    o << "\"insights_clock_resets\":" << insights_clock_resets << ",";
-    o << "\"insights_dropped_jobs\":" << insights_dropped_jobs << ",";
     o << "\"fulljob_policy\":\""
       << (fulljob_policy == FULLJOB_EXCLUSIVE ? "exclusive" : "compile-lane") << "\",";
     o << "\"fulljob_active\":" << fulljob_active << ",";
+    // (telemetry health is emitted separately below, see "telemetry")
     o << "\"current_kids\":" << current_kids << ",";
     o << "\"active_processes\":" << clients.active_processes << ",";
     o << "\"active_preprocesses\":" << preprocess_active_processes << ",";
@@ -4351,6 +4404,13 @@ std::string Daemon::dump_state_json() const
     o << "\"freeMemMB\":" << msg.freeMem;
     o << "},";
 
+    o << "\"telemetry\":{"
+      << "\"insights_clock_resets\":" << insights_clock_resets << ","
+      << "\"insights_dropped_jobs\":" << insights_dropped_jobs << ","
+      << "\"jsonl_dropped_records\":" << state_jsonl_dropped << ","
+      << "\"jsonl_queued_bytes\":" << state_jsonl_queued_bytes << ","
+      << "\"jsonl_open_failures\":" << state_jsonl_open_failures
+      << "},";
     o << "\"cache\":{";
     o << "\"cache_size\":" << (unsigned long long)cache_size << ",";
     o << "\"cache_size_limit\":" << (unsigned long long)cache_size_limit << ",";
@@ -5894,6 +5954,13 @@ void Daemon::answer_client_requests()
         if (poll_timeout_msec < 0 || poll_timeout_msec > 1000) {
             poll_timeout_msec = 1000;
         }
+    }
+
+    /* Drain queued telemetry before sleeping, under a strict byte budget so
+       one slow filesystem cannot stretch a loop iteration.  */
+    flush_state_jsonl(64 * 1024);
+    if (!state_jsonl_queue.empty() && (poll_timeout_msec < 0 || poll_timeout_msec > 200)) {
+        poll_timeout_msec = 200;   // come back soon to finish draining
     }
 
     int ret = poll(pollfds.data(), pollfds.size(), poll_timeout_msec);
