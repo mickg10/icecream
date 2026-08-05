@@ -58,6 +58,14 @@ trap cleanup EXIT
 
 command -v gcc >/dev/null || { echo "SKIP: gcc not available"; exit 77; }
 
+# As root (containers, rpm %check) iceccd refuses -u root and instead picks
+# its own unprivileged compile user (icecc, else nobody) -- the production
+# path.  Unprivileged runs keep -u so the daemon accepts the invoking user.
+USERFLAG=""
+if [ "$(id -u)" != 0 ]; then
+    USERFLAG="-u $(whoami)"
+fi
+
 # Compiler environment for the worker, generated the way a client would.
 mkdir -p "$work/env" "$work/envs-remote" "$work/envs-local"
 ( cd "$work/env" && bash "$top/client/icecc-create-env" "$(command -v gcc)" \
@@ -71,13 +79,13 @@ SCHED_PID=$!
 
 ICECC_TEST_SOCKET="$sockdir/remote" \
 "$top/daemon/iceccd" -p "$REMOTE_PORT" -m 2 -s "127.0.0.1:$SCHED_PORT" \
-    -n "$NETNAME" -N remoteq -b "$work/envs-remote" -u "$(whoami)" \
+    -n "$NETNAME" -N remoteq -b "$work/envs-remote" $USERFLAG \
     -l "$work/remote.log" -vvv &
 REMOTE_PID=$!
 
 ICECC_TEST_SOCKET="$sockdir/local" \
 "$top/daemon/iceccd" --no-remote -m 0 -s "127.0.0.1:$SCHED_PORT" \
-    -n "$NETNAME" -N localq -b "$work/envs-local" -u "$(whoami)" \
+    -n "$NETNAME" -N localq -b "$work/envs-local" $USERFLAG \
     -l "$work/local.log" -vvv &
 LOCAL_PID=$!
 
