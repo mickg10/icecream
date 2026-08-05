@@ -873,6 +873,11 @@ enum FulljobPolicy { FULLJOB_COMPILE_LANE, FULLJOB_EXCLUSIVE };
 FulljobPolicy fulljob_policy = FULLJOB_COMPILE_LANE;
 const size_t insights_graph_minutes = 100;
 const size_t insights_retention_minutes = 120;
+/* Wall time the daemon started: the complete-minute rate divides by the
+   number of ELAPSED complete minute slots (zero-job minutes included), not
+   by the number of stored nonempty buckets -- an idle daemon must show a
+   falling rate, not its last active minute forever.  */
+static const time_t daemon_start_ts = time(nullptr);
 // visibility for the clock-correction paths above
 uint64_t insights_clock_resets = 0;
 uint64_t insights_dropped_jobs = 0;
@@ -1177,6 +1182,9 @@ struct Daemon {
     string dump_clients_json() const;
     string dump_job_history_json(size_t limit, uint64_t before_seq = 0) const;
     string dump_insights_series_json(size_t minutes);
+    void complete_minute_rate(time_t now, size_t window_minutes,
+                              double *rate, uint64_t *last_complete_jobs,
+                              size_t *complete_slots) const;
     string dump_insights_jobs_json(time_t minute_ts, size_t limit, uint64_t before_seq);
     void remember_finished_job(const Client *client, int exitcode);
     void update_insights_history(const JobHistoryEntry &entry);
@@ -2342,7 +2350,6 @@ string Daemon::webgui_html() const
             newestEndTs = endTs;
           }
         }
-        let jobsLastMin = 0;
         for (const row of (jobs.jobs || [])) {
           const mode = String(row.mode || "").toLowerCase();
           const isRemoteMode = mode.startsWith("remote");
@@ -2375,10 +2382,6 @@ string Daemon::webgui_html() const
           if (String(row.timing_source || "") === "client") {
             ++timedByClient;
           }
-          const endTs = Number(row.end_ts);
-          if (newestEndTs > 0 && Number.isFinite(endTs) && endTs >= newestEndTs - 60) {
-            ++jobsLastMin;
-          }
         }
         setText("queue-delay", summarizeMetric(queueDelay));
         setText("waitforcs-ms", summarizeMetric(waitforcsTimes));
@@ -2386,7 +2389,14 @@ string Daemon::webgui_html() const
         setText("queue-mode", summarizeModeP95(queueDelayRemote, queueDelayLocal));
         setText("exec-mode", summarizeModeP95(execTimesRemote, execTimesLocal));
         const coverage = allJobs.length ? Math.round(100 * timedByClient / allJobs.length) : 0;
-        setText("timing-coverage", `${coverage}% client | ${jobsLastMin}/min`);
+        /* Server-computed rate over complete minutes (idle minutes in the
+           denominator): the page-derived count both went stale on an idle
+           node and saturated at the page size.  */
+        const rates = state.rates || {};
+        const completeRate = Number(rates.jobs_per_minute_complete_10m || 0);
+        const lastMin = Number(rates.last_complete_minute_jobs || 0);
+        setText("timing-coverage",
+          `${coverage}% client | ${completeRate.toFixed(1)}/min (last complete: ${lastMin})`);
 
         renderStatusBars(by, Number(state.clients.total || 0));
 
@@ -2740,11 +2750,26 @@ string Daemon::webgui_insights_html() const
       });
     }
 
+    /* Same lifecycle as the main dashboard: a deadline on every fetch and
+       an in-flight guard, released only after settlement -- without the
+       guard, setInterval starts a fresh refresh every two seconds while a
+       stalled one is still pending.  */
+    let insightsRefreshInFlight = false;
+    function fetchWithDeadline(url, timeoutMs) {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+      return fetch(url, { cache: "no-store", signal: ctrl.signal })
+        .finally(() => clearTimeout(timer));
+    }
     async function refresh() {
+      if (insightsRefreshInFlight) {
+        return;
+      }
+      insightsRefreshInFlight = true;
       try {
         const settledRes = await Promise.allSettled([
-          fetch("/api/state", { cache: "no-store" }),
-          fetch("/api/insights-series?minutes=100", { cache: "no-store" })
+          fetchWithDeadline("/api/state", 5000),
+          fetchWithDeadline("/api/insights-series?minutes=100", 8000)
         ]);
         const failedRes = settledRes.find((r) => r.status === "rejected");
         if (failedRes) {
@@ -2799,6 +2824,8 @@ string Daemon::webgui_insights_html() const
         drawSlotsChart();
       } catch (error) {
         setText("meta", "error: " + error);
+      } finally {
+        insightsRefreshInFlight = false;
       }
     }
 
@@ -2929,11 +2956,20 @@ string Daemon::webgui_insights_jobs_html() const
     }
     let nextBefore = 0;      // cursor: 0 = start from the newest row
     let totalShown = 0;
+    let pageInFlight = false;
     async function refresh(loadMore) {
       const minute = parseMinute();
       if (!minute) {
         document.getElementById("meta").textContent = "missing minute query parameter";
         return;
+      }
+      if (pageInFlight) {
+        return;   // double-click on Load older must not append a page twice
+      }
+      pageInFlight = true;
+      const moreBtnGuard = document.getElementById("load-more");
+      if (moreBtnGuard) {
+        moreBtnGuard.disabled = true;
       }
       try {
         const before = loadMore && nextBefore ? `&before=${nextBefore}` : "";
@@ -2988,6 +3024,12 @@ string Daemon::webgui_insights_jobs_html() const
         }
       } catch (error) {
         document.getElementById("meta").textContent = "error: " + error;
+      } finally {
+        pageInFlight = false;
+        const btn = document.getElementById("load-more");
+        if (btn) {
+          btn.disabled = false;
+        }
       }
     }
     document.getElementById("load-more").addEventListener("click", () => refresh(true));
@@ -3452,6 +3494,38 @@ void Daemon::update_insights_history(const JobHistoryEntry &entry)
     prune_insights_history(entry.end_ts);
 }
 
+void Daemon::complete_minute_rate(time_t now, size_t window_minutes,
+                                  double *rate, uint64_t *last_complete_jobs,
+                                  size_t *complete_slots) const
+{
+    const time_t current_minute = now - (now % 60);
+    /* First slot that is BOTH fully after daemon start and inside the
+       requested window; every elapsed slot since then counts in the
+       denominator, including idle ones.  */
+    time_t window_start = current_minute - time_t(window_minutes) * 60;
+    const time_t first_full_minute = (daemon_start_ts - (daemon_start_ts % 60)) + 60;
+    if (window_start < first_full_minute) {
+        window_start = first_full_minute;
+    }
+    size_t slots = 0;
+    if (current_minute > window_start) {
+        slots = size_t((current_minute - window_start) / 60);
+    }
+    uint64_t jobs_sum = 0;
+    uint64_t last_jobs = 0;
+    for (const auto &bucket : insights_history) {
+        if (bucket.minute_ts >= window_start && bucket.minute_ts < current_minute) {
+            jobs_sum += bucket.jobs_total;
+        }
+        if (bucket.minute_ts == current_minute - 60) {
+            last_jobs = bucket.jobs_total;
+        }
+    }
+    *rate = slots ? double(jobs_sum) / double(slots) : 0.0;
+    *last_complete_jobs = last_jobs;
+    *complete_slots = slots;
+}
+
 string Daemon::dump_insights_series_json(size_t minutes)
 {
     if (minutes == 0) {
@@ -3483,18 +3557,17 @@ string Daemon::dump_insights_series_json(size_t minutes)
        only from complete minutes, so the client does not have to guess.  */
     o << "\"current_minute_ts\":" << (long long)current_minute << ",";
     {
-        uint64_t complete_jobs = 0;
-        size_t complete_minutes = 0;
-        for (const auto &b : insights_history) {
-            if (b.minute_ts >= current_minute || b.minute_ts < start_minute) {
-                continue;
-            }
-            complete_jobs += b.jobs_total;
-            ++complete_minutes;
-        }
-        o << "\"complete_minutes\":" << complete_minutes << ",";
-        o << "\"jobs_per_minute_complete\":"
-          << (complete_minutes ? double(complete_jobs) / double(complete_minutes) : 0.0) << ",";
+        /* Denominator = elapsed complete minute SLOTS in the window (idle
+           minutes included; they are absent from insights_history but very
+           much part of the rate) -- an idle daemon shows a falling rate,
+           not its last active minute forever.  */
+        double rate = 0.0;
+        uint64_t last_jobs = 0;
+        size_t slots = 0;
+        complete_minute_rate(now, minutes, &rate, &last_jobs, &slots);
+        o << "\"complete_minutes\":" << slots << ",";
+        o << "\"jobs_per_minute_complete\":" << rate << ",";
+        o << "\"last_complete_minute_jobs\":" << last_jobs << ",";
     }
     o << "\"buckets\":[";
 
@@ -4448,6 +4521,17 @@ std::string Daemon::dump_state_json() const
     o << "\"freeMemMB\":" << msg.freeMem;
     o << "},";
 
+    {
+        double rate = 0.0;
+        uint64_t last_jobs = 0;
+        size_t slots = 0;
+        complete_minute_rate(now_s, 10, &rate, &last_jobs, &slots);
+        o << "\"rates\":{"
+          << "\"jobs_per_minute_complete_10m\":" << rate << ","
+          << "\"last_complete_minute_jobs\":" << last_jobs << ","
+          << "\"complete_minute_slots\":" << slots
+          << "},";
+    }
     o << "\"telemetry\":{"
       << "\"insights_clock_resets\":" << insights_clock_resets << ","
       << "\"insights_dropped_jobs\":" << insights_dropped_jobs << ","
