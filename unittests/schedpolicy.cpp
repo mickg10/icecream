@@ -1,22 +1,23 @@
 /*
     Deterministic scheduler-policy tests (no scheduler process required).
 
-    These exercise the selection rules directly through a small replica of
-    the production ordering logic, so the every-commit tier covers fairness
-    and traversal semantics that the integration harness can only observe
-    indirectly:
+    The scoring, static-key, promotion and tie-break rules are the
+    PRODUCTION functions from scheduler/selection.h, compiled into this
+    test -- production cannot regress while this stays green, because
+    there is exactly one statement of the rules.  Only the loop shape
+    (walk groups, promotion first) is restated here, in the minimal form
+    get_first_job_request() uses:
 
       - aging: a short job eventually outranks a stream of long ones;
       - hard promotion: a job past the promotion interval wins outright,
         oldest first, regardless of estimates;
-      - priority: niceness dominates both of the above.
-
-    The replica is intentionally tiny and mirrors
-    scheduler/scheduler.cpp's estimate_job_queue_score() and the promotion
-    rule in get_first_job_request(); if those change, this file must change
-    with them, which is the point -- the rules are then stated twice, in
-    executable form.
+      - priority: niceness dominates both of the above;
+      - time invariance: the static key selects the same winner as the
+        time-dependent score at any probe time (the property the indexed
+        selector rests on).
 */
+
+#include "../scheduler/selection.h"
 
 #include <cstdio>
 #include <cstdint>
@@ -37,28 +38,26 @@ static int failures = 0;
         }                                                               \
     } while (0)
 
-// --- replica of the production rules -------------------------------------
+// --- production rules from scheduler/selection.h, loop shape restated ----
 
-static const time_t max_queue_wait_promotion_s = 60;
+static const time_t max_queue_wait_promotion_s =
+    selection_max_queue_wait_promotion_msec / 1000;
 
 struct Req {
     unsigned int id;
     int niceness;
     uint64_t estimate_msec;
-    time_t enqueue;
+    time_t enqueue;       // seconds on the test's abstract monotonic clock
 };
 
 static uint64_t score(const Req &r, time_t now)
 {
-    time_t age = now - r.enqueue;
-    if (age < 0) {
-        age = 0;
-    }
-    return r.estimate_msec + uint64_t(age) * 1000ULL / 2;
+    return selection_score(r.estimate_msec, uint64_t(r.enqueue) * 1000ULL,
+                           uint64_t(now) * 1000ULL);
 }
 
-// Mirrors get_first_job_request(): niceness first, then hard promotion by
-// oldest enqueue, then estimate-weighted score.
+// The loop shape of get_first_job_request(): niceness first, then hard
+// promotion by oldest enqueue, then the static-key comparator.
 static const Req *select(const std::vector<Req> &reqs, time_t now)
 {
     if (reqs.empty()) {
@@ -73,25 +72,55 @@ static const Req *select(const std::vector<Req> &reqs, time_t now)
 
     const Req *overdue = nullptr;
     const Req *best = nullptr;
-    uint64_t best_score = 0;
+    int64_t best_key = 0;
     for (const Req &r : reqs) {
         if (r.niceness != best_niceness) {
             continue;
         }
-        if (now - r.enqueue >= max_queue_wait_promotion_s) {
+        if (selection_overdue(uint64_t(r.enqueue) * 1000ULL,
+                              uint64_t(now) * 1000ULL)) {
             if (!overdue || r.enqueue < overdue->enqueue
                     || (r.enqueue == overdue->enqueue && r.id < overdue->id)) {
                 overdue = &r;
             }
             continue;
         }
-        const uint64_t s = score(r, now);
-        if (!best || s > best_score || (s == best_score && r.id < best->id)) {
+        const int64_t key = selection_static_key(r.estimate_msec,
+                                                 uint64_t(r.enqueue) * 1000ULL);
+        if (!best || selection_prefers(key, r.id, best_key, best->id)) {
             best = &r;
-            best_score = s;
+            best_key = key;
         }
     }
     return overdue ? overdue : best;
+}
+
+// The indexed selector rests on this: the static key must pick the same
+// winner as the time-dependent score, whatever the probe time.
+static void test_time_invariance()
+{
+    /* All ages stay below the promotion window at every probe: promotion
+       is deliberately out of scope here (it has its own tests) -- this
+       property is about score-vs-key agreement.  */
+    std::vector<Req> reqs;
+    reqs.push_back({1, 0, 40000, 1000});
+    reqs.push_back({2, 0, 10000, 995});
+    reqs.push_back({3, 0, 25000, 998});
+    reqs.push_back({4, 0, 25000, 998});   // exact tie with 3 -> id order
+    for (time_t now : { time_t(1001), time_t(1020), time_t(1050) }) {
+        const Req *by_key = select(reqs, now);
+        const Req *by_score = nullptr;
+        uint64_t best_s = 0;
+        for (const Req &r : reqs) {
+            const uint64_t s = score(r, now);
+            if (!by_score || s > best_s || (s == best_s && r.id < by_score->id)) {
+                by_score = &r;
+                best_s = s;
+            }
+        }
+        REQUIRE(by_key && by_score && by_key->id == by_score->id,
+                "static-key winner equals score winner at every probe time");
+    }
 }
 
 // --- tests ---------------------------------------------------------------
@@ -161,6 +190,7 @@ int main()
 {
     fprintf(stderr, "=== scheduler policy rules ===\n");
     test_no_starvation();
+    test_time_invariance();
     test_promotion_is_fifo();
     test_niceness_first();
     test_lpt_below_promotion();

@@ -1327,7 +1327,7 @@ struct Daemon {
     string dump_clients_json() const;
     string dump_job_history_json(size_t limit, uint64_t before_seq = 0) const;
     string dump_insights_series_json(size_t minutes);
-    string dump_insights_jobs_json(time_t minute_ts, size_t limit);
+    string dump_insights_jobs_json(time_t minute_ts, size_t limit, uint64_t before_seq);
     void remember_finished_job(const Client *client, int exitcode);
     void update_insights_history(const JobHistoryEntry &entry);
     void prune_insights_history(time_t now_ts);
@@ -2417,11 +2417,20 @@ string Daemon::webgui_html() const
       refreshInFlight = true;
       try {
         const limit = Number(document.getElementById("job-limit").value || "500");
-        const [state, clients, jobs] = await Promise.all([
+        /* allSettled, not all: with Promise.all a fast failure resolves the
+           await while the other requests are still in flight, so the finally
+           below would clear refreshInFlight and let a new refresh race the
+           stragglers.  Settlement first, then propagate any failure.  */
+        const settled = await Promise.allSettled([
           fetchJson("/api/state", 5000),
           fetchJson("/api/clients", 5000),
           fetchJson(`/api/jobs?limit=${limit}`, 8000)
         ]);
+        const failed = settled.find((r) => r.status === "rejected");
+        if (failed) {
+          throw failed.reason;
+        }
+        const [state, clients, jobs] = settled.map((r) => r.value);
         lastSuccessMs = Date.now();
 
         const by = state.clients.by_status;
@@ -2695,7 +2704,7 @@ string Daemon::webgui_insights_html() const
     <div class="card"><div class="label">Wait Compile</div><div class="value" id="waitcompile">-</div></div>
     <div class="card"><div class="label">Pending UseCS</div><div class="value" id="pending-usecs">-</div></div>
     <div class="card"><div class="label">Local Queue</div><div class="value" id="local-queue">-</div></div>
-    <div class="card"><div class="label">Latest jobs/min</div><div class="value" id="jobs-per-minute">-</div></div>
+    <div class="card"><div class="label">Jobs/min (complete minutes)</div><div class="value" id="jobs-per-minute">-</div></div>
     <div class="card"><div class="label">Queue avg / Exec avg</div><div class="value" id="queue-exec-avg">-</div></div>
     <div class="card"><div class="label">Timing coverage</div><div class="value" id="timing-coverage">-</div></div>
   </div>
@@ -2883,10 +2892,15 @@ string Daemon::webgui_insights_html() const
 
     async function refresh() {
       try {
-        const [stateRes, seriesRes] = await Promise.all([
+        const settledRes = await Promise.allSettled([
           fetch("/api/state", { cache: "no-store" }),
           fetch("/api/insights-series?minutes=100", { cache: "no-store" })
         ]);
+        const failedRes = settledRes.find((r) => r.status === "rejected");
+        if (failedRes) {
+          throw failedRes.reason;
+        }
+        const [stateRes, seriesRes] = settledRes.map((r) => r.value);
         if (!stateRes.ok || !seriesRes.ok) {
           throw new Error(`HTTP ${stateRes.status}/${seriesRes.status}`);
         }
@@ -2911,7 +2925,12 @@ string Daemon::webgui_insights_html() const
         setText("waitcompile", waitCompile);
         setText("pending-usecs", pendingUseCs);
         setText("local-queue", localQueue);
-        setText("jobs-per-minute", latest.jobs_total || 0);
+        /* Rate from COMPLETE minutes only (server-computed): the newest
+           bucket covers a minute still in progress, so using it as the rate
+           dips after every rollover and saturates while filling.  */
+        const completeRate = Number(series.jobs_per_minute_complete || 0);
+        setText("jobs-per-minute",
+          `${completeRate.toFixed(1)} (current min so far: ${latest.partial ? (latest.jobs_total || 0) : "-"})`);
         setText("queue-exec-avg", `${latest.queue_avg_msec || 0} / ${latest.exec_avg_msec || 0} ms`);
         setText("timing-coverage", `${latest.timing_coverage_pct || 0}%`);
 
@@ -3044,6 +3063,7 @@ string Daemon::webgui_insights_jobs_html() const
         <tbody id="jobs-body"></tbody>
       </table>
     </div>
+    <button id="load-more" style="display:none; margin:8px">Load older rows</button>
   </div>
   <script>
     function fmt(v) { return v === null || v === undefined || v === "" ? "-" : String(v); }
@@ -3057,22 +3077,36 @@ string Daemon::webgui_insights_jobs_html() const
       const d = new Date(ts * 1000);
       return d.toISOString().replace("T", " ").replace(".000Z", "Z");
     }
-    async function refresh() {
+    let nextBefore = 0;      // cursor: 0 = start from the newest row
+    let totalShown = 0;
+    async function refresh(loadMore) {
       const minute = parseMinute();
       if (!minute) {
         document.getElementById("meta").textContent = "missing minute query parameter";
         return;
       }
       try {
-        const res = await fetch(`/api/insights-jobs?minute=${minute}&limit=5000`, { cache: "no-store" });
+        const before = loadMore && nextBefore ? `&before=${nextBefore}` : "";
+        const res = await fetch(`/api/insights-jobs?minute=${minute}&limit=500${before}`, { cache: "no-store" });
         if (!res.ok) {
           throw new Error(`HTTP ${res.status}`);
         }
         const payload = await res.json();
+        nextBefore = Number(payload.next_before_seq || 0);
+        totalShown = loadMore ? totalShown + Number(payload.returned || 0)
+                              : Number(payload.returned || 0);
+        const moreText = payload.truncated
+          ? ` | more available (showing ${totalShown} so far)` : "";
         document.getElementById("meta").textContent =
-          `minute=${toTime(payload.minute_ts)} | returned=${fmt(payload.returned)} | retention=${fmt(payload.retention_minutes)}m`;
+          `minute=${toTime(payload.minute_ts)} | returned=${fmt(totalShown)}${moreText} | retention=${fmt(payload.retention_minutes)}m`;
+        const moreBtn = document.getElementById("load-more");
+        if (moreBtn) {
+          moreBtn.style.display = payload.truncated ? "" : "none";
+        }
         const body = document.getElementById("jobs-body");
-        body.innerHTML = "";
+        if (!loadMore) {
+          body.innerHTML = "";
+        }
         for (const row of (payload.jobs || [])) {
           const tr = document.createElement("tr");
           const q = Number(row.queue_msec || 0);
@@ -3106,7 +3140,8 @@ string Daemon::webgui_insights_jobs_html() const
         document.getElementById("meta").textContent = "error: " + error;
       }
     }
-    refresh();
+    document.getElementById("load-more").addEventListener("click", () => refresh(true));
+    refresh(false);
   </script>
 </body>
 </html>)HTML");
@@ -3661,13 +3696,17 @@ string Daemon::dump_insights_series_json(size_t minutes)
     return o.str();
 }
 
-string Daemon::dump_insights_jobs_json(time_t minute_ts, size_t limit)
+string Daemon::dump_insights_jobs_json(time_t minute_ts, size_t limit, uint64_t before_seq)
 {
+    /* Same cursor model as /api/jobs: bounded page (rows here carry full
+       command lines, so the bound is lower), newest first, deeper history
+       via ?before=<seq>, and honest truncation metadata.  */
+    static const size_t kMaxLimit = 1000;
     if (limit == 0) {
-        limit = 500;
+        limit = 200;
     }
-    if (limit > 5000) {
-        limit = 5000;
+    if (limit > kMaxLimit) {
+        limit = kMaxLimit;
     }
 
     const time_t now = time(nullptr);
@@ -3686,6 +3725,8 @@ string Daemon::dump_insights_jobs_json(time_t minute_ts, size_t limit)
     o << "\"jobs\":[";
 
     size_t returned = 0;
+    bool truncated = false;
+    uint64_t last_seq = 0;
     if (minute_start >= cutoff) {
         for (auto it = job_history.rbegin(); it != job_history.rend(); ++it) {
             const JobHistoryEntry &entry = *it;
@@ -3697,6 +3738,13 @@ string Daemon::dump_insights_jobs_json(time_t minute_ts, size_t limit)
             }
             if (entry.end_ts < cutoff) {
                 continue;
+            }
+            if (before_seq && entry.seq >= before_seq) {
+                continue;
+            }
+            if (returned >= limit) {
+                truncated = true;   // at least one more matching row exists
+                break;
             }
             if (returned) {
                 o << ",";
@@ -3724,15 +3772,14 @@ string Daemon::dump_insights_jobs_json(time_t minute_ts, size_t limit)
             o << "\"exec_msec\":" << entry.client_exec_msec << ",";
             o << "\"cmdline\":\"" << json_escape(entry.cmdline) << "\"";
             o << "}";
-
-            if (returned >= limit) {
-                break;
-            }
+            last_seq = entry.seq;
         }
     }
 
     o << "],";
-    o << "\"returned\":" << returned;
+    o << "\"returned\":" << returned << ",";
+    o << "\"truncated\":" << (truncated ? "true" : "false") << ",";
+    o << "\"next_before_seq\":" << (unsigned long long)(truncated ? last_seq : 0);
     o << "}";
     return o.str();
 }
@@ -3898,10 +3945,12 @@ void Daemon::handle_web_connection(int fd, short revents)
                             return;
                         }
                     } else {
-                        uint64_t limit = 500;
+                        uint64_t limit = 200;
                         parse_query_u64(path, "limit", &limit);
+                        uint64_t before_seq = 0;
+                        parse_query_u64(path, "before", &before_seq);
                         if (!queue_web_response(fd, 200, "OK", "application/json; charset=utf-8",
-                                           dump_insights_jobs_json((time_t)minute_ts, (size_t)limit))) {
+                                           dump_insights_jobs_json((time_t)minute_ts, (size_t)limit, before_seq))) {
                             return;
                         }
                     }

@@ -59,6 +59,7 @@
 #include "config.h"
 
 #include "compileserver.h"
+#include "selection.h"
 #include "job.h"
 #include "scheduler.h"
 
@@ -122,8 +123,8 @@ static map<unsigned int, Job *> jobs;
    cannot wrap (the review's correction to an unsigned formulation).  */
 static int64_t job_static_score_key(const Job *job)
 {
-    return (int64_t)job->estimateSnapshotMsec()
-         - (int64_t)(job->enqueueMonoMsec() / 2);
+    return selection_static_key(job->estimateSnapshotMsec(),
+                                job->enqueueMonoMsec());
 }
 
 struct JobRequestsGroup {
@@ -297,12 +298,6 @@ static uint64_t estimate_job_real_msec(const Job *job)
     return std::max<uint64_t>(1, mixed);
 }
 
-/* Maximum time a request may wait behind higher-scoring work at the same
-   niceness before it is promoted unconditionally.  Aging as a numeric bonus
-   (however large) only guarantees eventual promotion; a hard rule makes the
-   worst case explicit and testable, which is what an operator can reason
-   about.  */
-static const time_t max_queue_wait_promotion_s = 60;
 
 static uint64_t estimate_job_queue_score(const Job *job, uint64_t now_mono_msec)
 {
@@ -317,18 +312,7 @@ static uint64_t estimate_job_queue_score(const Job *job, uint64_t now_mono_msec)
     if (!estimate_msec) {
         estimate_msec = estimate_job_real_msec(job);
     }
-    uint64_t queue_age_msec = 0;
-    if (now_mono_msec > job->enqueueMonoMsec()) {
-        queue_age_msec = now_mono_msec - job->enqueueMonoMsec();
-    }
-
-    /* The age bonus is deliberately UNBOUNDED: with a cap of one estimate a
-       short job (estimate S, max score 2S) is starved forever by a sustained
-       stream of jobs whose estimate exceeds 2S.  Unbounded aging guarantees
-       every queued request eventually outranks any fixed-estimate newcomer,
-       trading a little long-job throughput for a hard no-starvation
-       property.  Niceness remains the first-order key (group ordering). */
-    return estimate_msec + queue_age_msec / 2;
+    return selection_score(estimate_msec, job->enqueueMonoMsec(), now_mono_msec);
 }
 
 static void add_runtime_estimate(const Job *job, unsigned long real_msec)
@@ -785,8 +769,7 @@ static JobRequestPosition get_first_job_request()
         }
         assert(!group->l.empty());
         Job *oldest = group->l.front();
-        if (now_mono_msec - oldest->enqueueMonoMsec()
-                >= uint64_t(max_queue_wait_promotion_s) * 1000ULL) {
+        if (selection_overdue(oldest->enqueueMonoMsec(), now_mono_msec)) {
             if (!overdue.isValid() || oldest->enqueueMonoMsec() < overdue_enqueue_mono
                     || (oldest->enqueueMonoMsec() == overdue_enqueue_mono
                         && oldest->id() < overdue.job->id())) {
@@ -798,8 +781,8 @@ static JobRequestPosition get_first_job_request()
         auto top = group->byScore.rbegin();
         Job *candidate = std::get<2>(*top);
         const int64_t key = std::get<0>(*top);
-        if (!best.isValid() || key > best_key
-                || (key == best_key && candidate->id() < best.job->id())) {
+        if (!best.isValid()
+                || selection_prefers(key, candidate->id(), best_key, best.job->id())) {
             best = JobRequestPosition(group, candidate);
             best_key = key;
         }
