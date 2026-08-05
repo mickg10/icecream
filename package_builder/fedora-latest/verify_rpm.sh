@@ -80,11 +80,14 @@ dnf_cmd -y makecache
 
 dnf_cmd -y install \
     ca-certificates \
+    file \
     findutils \
     gcc \
     gcc-c++ \
     make \
-    which
+    tar \
+    which \
+    xz
 
 # The Fedora icecream %post scripts source /etc/selinux/config. Minimal images
 # may not ship it, which can make the RPM transaction fail.

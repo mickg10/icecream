@@ -80,11 +80,14 @@ dnf_cmd -y makecache
 
 dnf_cmd -y install \
     ca-certificates \
+    file \
     findutils \
     gcc \
     gcc-c++ \
     make \
-    which
+    tar \
+    which \
+    xz
 
 # Install EXACTLY the packages the build's manifest names (PKG-2): the
 # output directory used to accumulate across runs, so a glob could install
