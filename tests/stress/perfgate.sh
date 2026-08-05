@@ -38,9 +38,15 @@ RUN=$(mktemp -d "${TMPDIR:-/tmp}/icecc-perfgate.XXXXXX")
 
 REV=$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo unknown)
 DIRTY=$(git -C "$HERE" diff --quiet 2>/dev/null || echo "+dirty")
+# The digest names the EXECUTABLE that ran, not the repository state -- a
+# stale binary against a clean tree would otherwise fingerprint as current.
+SCHED_SHA=$(sha256sum "$SCHED" | cut -c1-16)
+DRIVER_SHA=$(sha256sum "$SCHEDBP" | cut -c1-16)
+CXXF=$(grep -m1 '^CXXFLAGS' "$HERE/../../Makefile" 2>/dev/null | cut -d= -f2- | tr -s ' ')
 echo "# fingerprint: host=$(uname -n) kernel=$(uname -r) cpus=$(nproc)"
 echo "# fingerprint: $(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | sed 's/^ //')"
-echo "# fingerprint: scheduler_rev=${REV}${DIRTY} slo=${SLO}s depths=$D1,$D2"
+echo "# fingerprint: repo_rev=${REV}${DIRTY} scheduler_sha256=${SCHED_SHA} driver_sha256=${DRIVER_SHA}"
+echo "# fingerprint: cxxflags=${CXXF:-unknown} slo=${SLO}s depths=$D1,$D2"
 
 is_num() { case "$1" in ''|*[!0-9.]*) return 1;; *) return 0;; esac; }
 
@@ -67,9 +73,19 @@ for depth in "$D1" "$D2"; do
         p95=$(echo "$line" | grep -oE 'p95=[0-9.]+' | cut -d= -f2)
         p99=$(echo "$line" | grep -oE 'p99=[0-9.]+' | cut -d= -f2)
         mx=$(echo  "$line" | grep -oE 'max=[0-9.]+' | cut -d= -f2)
-        is_num "$p95" && is_num "$p99" && is_num "$mx" \
+        ns=$(echo  "$line" | grep -oE 'samples=[0-9]+' | cut -d= -f2)
+        dur=$(echo "$line" | grep -oE 'duration=[0-9.]+' | cut -d= -f2)
+        is_num "$p95" && is_num "$p99" && is_num "$mx" && is_num "${ns:-x}" && is_num "${dur:-x}" \
             || { echo "FAIL: malformed $ph report at depth $depth: $line"; FAIL=1; continue; }
-        echo "  depth=$depth phase=$ph p95=${p95}s p99=${p99}s max=${mx}s"
+        # Minimum coverage scales with the phase's real duration: a phase
+        # with zero or too-few samples for its length proves nothing (an
+        # empty phase would otherwise pass as zeros), while a sub-second
+        # phase measured back-to-back is legitimately small.
+        need=3
+        awk -v d="$dur" 'BEGIN{exit !(d<1.0)}' && need=1
+        [ "$ns" -ge "$need" ] \
+            || { echo "FAIL: only $ns $ph samples over ${dur}s at depth $depth (need >= $need)"; FAIL=1; }
+        echo "  depth=$depth phase=$ph samples=$ns duration=${dur}s p95=${p95}s p99=${p99}s max=${mx}s"
         awk -v l="$mx" -v s="$SLO" 'BEGIN{exit !(l<=s)}' \
             || { echo "FAIL: $ph max ${mx}s > SLO ${SLO}s at depth $depth"; FAIL=1; }
         [ "$ph" = ingress ] && ING_MAX[$depth]=$mx || DRN_MAX[$depth]=$mx

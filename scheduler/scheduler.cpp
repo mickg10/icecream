@@ -477,10 +477,17 @@ static uint64_t max_outstanding_stall_msec = 180 * 1000;   // --dispatch-stall-t
    The clamp always leaves one slot's worth of credit for someone else.  */
 static unsigned int cached_remote_farm_slots = 0;
 
-/* Ingress cap: messages handled per connection per main-loop iteration.
-   Keeps a flooding submitter from monopolizing the loop between polls; the
-   remainder is serviced on the next (zero-timeout) iteration.  */
-static const int max_inbound_msgs_per_conn_per_loop = 32;
+/* Ingress cap: a GLOBAL work budget per main-loop iteration, spent across
+   connections from a rotating cursor.  A per-connection cap alone still
+   lets N connections do N*cap units of work before poll() runs again, and
+   one GetCS message can create m->count jobs in a single handler call --
+   so the budget is charged in JOBS ADMITTED (minimum one unit per
+   message), and the cursor rotates so the same early connections cannot
+   monopolize successive loops.  Leftovers are already parsed in userspace
+   where poll() cannot see them; the caller re-polls with a zero timeout.  */
+static const int max_inbound_units_per_loop = 128;
+static uint64_t jobs_admitted_total = 0;   // lifetime; exposed via 'estimates'
+static int inbound_last_units = 0;         // units charged by the last handler call
 
 static unsigned int effective_dispatch_credit()
 {
@@ -878,6 +885,8 @@ static bool handle_cs_request(MsgChannel *cs, Msg *_m)
     Job *master_job = nullptr;
 
     for (unsigned int i = 0; i < m->count; ++i) {
+        ++jobs_admitted_total;
+        ++inbound_last_units;
         Job *job = create_new_job(submitter);
         job->setEnvironments(m->versions);
         job->setTargetPlatform(m->target);
@@ -2223,10 +2232,12 @@ static bool handle_line(CompileServer *cs, Msg *_m)
             return false;
         }
         snprintf(buf, sizeof(buf),
-                 "dispatch_credit=%u effective=%u farm_slots=%u stall_timeout=%llus",
+                 "dispatch_credit=%u effective=%u farm_slots=%u stall_timeout=%llus"
+                 " jobs_admitted=%llu",
                  max_outstanding_dispatches, effective_dispatch_credit(),
                  cached_remote_farm_slots,
-                 (unsigned long long)(max_outstanding_stall_msec / 1000));
+                 (unsigned long long)(max_outstanding_stall_msec / 1000),
+                 (unsigned long long)jobs_admitted_total);
         if (!cs->send_msg(TextMsg(buf))) {
             return false;
         }
@@ -3004,28 +3015,52 @@ int main(int argc, char *argv[])
         pollfds.push_back( pfd );
 
         bool has_buffered_inbound = false;
+        /* Bounded ingress, one GLOBAL budget spent from a rotating cursor:
+           iterate the connection map starting after where the previous loop
+           iteration stopped, charging each handled message at least one
+           unit and each admitted job one unit (a single GetCS can create
+           m->count jobs).  handle_activity() can delete the connection, so
+           the fd (not the pointer) is the cursor.  */
+        static int inbound_cursor_fd = -1;
+        {
+            int budget = max_inbound_units_per_loop;
+            map<int, CompileServer *>::const_iterator start =
+                fd2cs.upper_bound(inbound_cursor_fd);
+            const size_t nconns = fd2cs.size();
+            size_t visited = 0;
+            map<int, CompileServer *>::const_iterator it = start;
+            while (budget > 0 && visited < nconns && !fd2cs.empty()) {
+                if (it == fd2cs.end()) {
+                    it = fd2cs.begin();
+                }
+                const int fd = it->first;
+                CompileServer *cs = it->second;
+                ++it;
+                ++visited;
+                bool ok = true;
+                while (ok && budget > 0 && cs->has_msg()) {
+                    inbound_last_units = 0;
+                    if (!handle_activity(cs)) {
+                        ok = false;
+                        break;
+                    }
+                    budget -= inbound_last_units > 0 ? inbound_last_units : 1;
+                }
+                inbound_cursor_fd = fd;
+                if (!ok) {
+                    /* the connection may be gone; the iterator was already
+                       advanced past it */
+                    continue;
+                }
+            }
+        }
         for (map<int, CompileServer *>::const_iterator it = fd2cs.begin(); it != fd2cs.end();) {
             int i = it->first;
             CompileServer *cs = it->second;
             bool ok = true;
             ++it;
 
-            /* handle_activity() can delete c and make the iterator
-               invalid.  */
-            /* Bounded ingress: one connection with a deep buffer of parsed
-               messages must not monopolize the loop -- an indexed queue
-               cannot meet the control-latency target if a flooding
-               submitter's requests are all admitted before poll() runs
-               again.  Leftovers are already in userspace, so poll() cannot
-               signal them: the flag below forces a zero-timeout poll and the
-               next iteration continues the drain.  */
-            int inbound_budget = max_inbound_msgs_per_conn_per_loop;
-            while (ok && cs->has_msg() && inbound_budget-- > 0) {
-                if (!handle_activity(cs)) {
-                    ok = false;
-                }
-            }
-            if (ok && cs->has_msg()) {
+            if (cs->has_msg()) {
                 has_buffered_inbound = true;
             }
 

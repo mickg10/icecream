@@ -382,6 +382,9 @@ int main(int argc, char **argv)
     std::atomic<int> probe_phase{0};
     std::mutex sample_mutex;
     std::vector<std::pair<int, double>> probe_samples;
+    std::atomic<double> phase_start_s{0.0};
+    std::atomic<double> ingress_duration_s{0.0};
+    std::atomic<double> drain_end_s{0.0};
     auto print_phase_summary = [&]() {
         /* Machine-readable per-phase distributions for the perf gate.  */
         std::lock_guard<std::mutex> lock(sample_mutex);
@@ -400,9 +403,15 @@ int main(int argc, char **argv)
                 size_t idx = (size_t)(p * (v.size() - 1) + 0.5);
                 return v[idx];
             };
+            const double dur = ph == 0
+                ? ingress_duration_s.load()
+                : (drain_end_s.load() > 0
+                       ? drain_end_s.load()
+                             - (phase_start_s.load() + ingress_duration_s.load())
+                       : 0.0);
             fprintf(stderr,
-                    "# perf %s samples=%zu p95=%.3f p99=%.3f max=%.3f\n",
-                    ph == 0 ? "ingress" : "drain", v.size(),
+                    "# perf %s samples=%zu duration=%.2f p95=%.3f p99=%.3f max=%.3f\n",
+                    ph == 0 ? "ingress" : "drain", v.size(), dur,
                     pctl(0.95), pctl(0.99), v.empty() ? 0.0 : v.back());
         }
     };
@@ -477,8 +486,9 @@ int main(int argc, char **argv)
                 probe_samples.emplace_back(phase_at_send, lat);
             }
             probe_pending_since = -1.0;
-            for (int i = 0; i < 2 && !shutdown; ++i) {
-                usleep(100 * 1000);
+            if (!shutdown && probe_phase.load() != 0) {
+                usleep(100 * 1000);   // drain cadence; ingress probes run
+                                      // back-to-back (the phase is short)
             }
         }
     });
@@ -576,6 +586,13 @@ int main(int argc, char **argv)
     }
 
     fprintf(stderr, "# requesting %d jobs\n", njobs);
+    /* Phase discipline (perf gate): everything before this point was setup
+       -- discard those samples so 'ingress' means the flood, nothing else.  */
+    {
+        std::lock_guard<std::mutex> lock(sample_mutex);
+        probe_samples.clear();
+    }
+    phase_start_s = secs_since(t_prog);
     probe_phase = 0;
     for (int i = 1; i <= njobs; ++i) {
         char fname[64];
@@ -589,7 +606,60 @@ int main(int argc, char **argv)
             break;
         }
     }
-    probe_phase = 1;   // ingress over: everything from here is drain
+    /* Server-observed barrier: the sender finishing send_msg() proves
+       nothing about admission -- requests can still be buffered ahead of
+       the scheduler.  Poll the control channel until the scheduler itself
+       reports jobs_admitted >= njobs, and only then call the phase
+       'drain'.  A second control connection is used; the probe thread owns
+       the first.  */
+    {
+        int barrier = tcp_connect(port + 1, 0);
+        if (barrier >= 0) {
+            char bbuf[8192];
+            // absorb the greeting/login exchange
+            struct pollfd bp = { barrier, POLLIN, 0 };
+            if (poll(&bp, 1, 5000) > 0) {
+                ssize_t r = read(barrier, bbuf, sizeof(bbuf));
+                (void)r;
+            }
+            const Clock::time_point tb = Clock::now();
+            long long admitted = -1;
+            while (secs_since(tb) < 120 && admitted < (long long)njobs) {
+                if (write(barrier, "estimates\n", 10) != 10) {
+                    break;
+                }
+                std::string reply;
+                const Clock::time_point tr = Clock::now();
+                while (secs_since(tr) < 5) {
+                    struct pollfd pfd2 = { barrier, POLLIN, 0 };
+                    if (poll(&pfd2, 1, 200) <= 0) {
+                        break;
+                    }
+                    ssize_t n = read(barrier, bbuf, sizeof(bbuf) - 1);
+                    if (n <= 0) {
+                        break;
+                    }
+                    bbuf[n] = 0;
+                    reply += bbuf;
+                    if (reply.find("jobs_admitted=") != std::string::npos) {
+                        break;
+                    }
+                }
+                const size_t pos = reply.find("jobs_admitted=");
+                if (pos != std::string::npos) {
+                    admitted = atoll(reply.c_str() + pos + strlen("jobs_admitted="));
+                }
+                if (admitted < (long long)njobs) {
+                    usleep(100 * 1000);
+                }
+            }
+            fprintf(stderr, "# scheduler admitted %lld/%d at ingress barrier\n",
+                    admitted, njobs);
+            close(barrier);
+        }
+    }
+    ingress_duration_s = secs_since(t_prog) - phase_start_s.load();
+    probe_phase = 1;   // scheduler has admitted the flood: drain begins
 
     if (gate_mode) {
         fprintf(stderr, "# gate mode: submitter stops reading for %ds\n", clog_s);
@@ -791,6 +861,7 @@ int main(int argc, char **argv)
             }
             fprintf(stderr, "# final worst control-reply latency %.1fs\n", worst_reply.load());
         }
+        drain_end_s = secs_since(t_prog);
         print_phase_summary();
         REQUIRE(worst_reply.load() < 5.0,
                 "scheduler stayed responsive (control replies < 5s)");
@@ -898,6 +969,7 @@ int main(int argc, char **argv)
         }
         fprintf(stderr, "# final worst control-reply latency %.1fs\n", worst_reply.load());
     }
+    drain_end_s = secs_since(t_prog);
     print_phase_summary();
     REQUIRE(worst_reply.load() < 5.0,
             "scheduler stayed responsive (control replies < 5s)");
