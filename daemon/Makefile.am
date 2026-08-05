@@ -6,14 +6,10 @@ iceccd_SOURCES = \
 	workit.cpp \
 	environment.cpp \
 	load.cpp \
-	file_util.cpp
+	file_util.cpp \
+	statewriter.cpp
 
-# -pthread at compile AND link: the state-JSONL writer runs on a
-# std::thread, and glibc before 2.34 keeps pthread_create in libpthread --
-# without the flag the daemon links on modern glibc but not on older build
-# roots (Fedora 28).
-iceccd_CXXFLAGS = $(AM_CXXFLAGS) -pthread
-iceccd_LDFLAGS = -pthread
+noinst_HEADERS = statewriter.h
 
 iceccd_LDADD = \
 	../services/libicecc.la \

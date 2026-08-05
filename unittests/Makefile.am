@@ -1,9 +1,9 @@
-TESTS = testargs backpressure schedpolicy utf8test schedbp-quick.sh remoteice-quick.sh
+TESTS = testargs backpressure schedpolicy utf8test statewritertest schedbp-quick.sh remoteice-quick.sh
 
 AM_CPPFLAGS = -I$(top_srcdir)/client -I$(top_srcdir)/services -I$(top_srcdir)/
 testargs_LDADD = ../client/libclient.a ../services/libicecc.la
 
-check_PROGRAMS = testargs backpressure schedpolicy utf8test schedbp
+check_PROGRAMS = testargs backpressure schedpolicy utf8test statewritertest schedbp
 testargs_SOURCES = args.cpp
 
 schedpolicy_SOURCES = schedpolicy.cpp
@@ -11,6 +11,9 @@ schedpolicy_SOURCES = schedpolicy.cpp
 backpressure_SOURCES = backpressure.cpp
 
 utf8test_SOURCES = utf8test.cpp
+
+statewritertest_SOURCES = statewritertest.cpp ../daemon/statewriter.cpp
+statewritertest_CPPFLAGS = $(AM_CPPFLAGS) -I$(top_srcdir)/daemon
 backpressure_CXXFLAGS = -pthread
 backpressure_LDFLAGS = -pthread
 backpressure_LDADD = ../services/libicecc.la

@@ -84,10 +84,6 @@
 
 #include <chrono>
 #include <deque>
-#include <thread>
-#include <mutex>
-#include <condition_variable>
-#include <atomic>
 #include <map>
 #include <algorithm>
 #include <set>
@@ -101,6 +97,7 @@
 #include "workit.h"
 #include "logging.h"
 #include "utf8.h"
+#include "statewriter.h"
 #include <comm.h>
 #include "load.h"
 #include "environment.h"
@@ -172,153 +169,6 @@ static FdSnapshot collect_fd_snapshot()
    parser rejects.  Validation is full scalar-value checking (utf8.h) --
    overlongs, surrogates, values above U+10FFFF and C0/C1/F5-FF leads are
    all replaced, not just malformed continuation shapes.  */
-
-/* Storage sink for state JSONL records with its own thread: open() and
-   write() on a regular file can block for as long as the storage stack
-   wants regardless of O_NONBLOCK, so no storage call may run on the
-   daemon's control loop.  The loop only appends to a bounded in-memory
-   queue (drop-oldest, per-record cap); this thread does all I/O and simply
-   sleeps through backoff.
-
-   The thread starts lazily on the first enqueue -- which happens in the
-   running main loop, safely after daemonize()'s forks.  Compile children
-   forked later never touch the writer, and the sweep in serve.cpp closes
-   its descriptor in the child.  */
-class AsyncJsonlWriter {
-public:
-    ~AsyncJsonlWriter() { stop(); }
-
-    void set_path(const std::string &path) { path_ = path; }
-    const std::string &path() const { return path_; }
-
-    void enqueue(const std::string &line)
-    {
-        if (path_.empty()) {
-            return;
-        }
-        if (line.size() > max_record_bytes) {
-            /* One pathological record must not displace the whole queue's
-               worth of history (the queue bound alone would let a single
-               record approach 4 MiB).  */
-            ++oversized_;
-            return;
-        }
-        std::unique_lock<std::mutex> lock(mutex_);
-        if (!started_) {
-            started_ = true;
-            thread_ = std::thread(&AsyncJsonlWriter::run, this);
-        }
-        queue_.push_back(line);
-        queue_.back() += '\n';
-        queued_bytes_ += queue_.back().size();
-        while (queued_bytes_ > max_queued_bytes && queue_.size() > 1) {
-            /* Drop the oldest record: recent telemetry is the useful kind
-               when storage is misbehaving.  */
-            queued_bytes_ -= queue_.front().size();
-            queue_.pop_front();
-            ++dropped_;
-        }
-        queued_snapshot_ = queued_bytes_;
-        cond_.notify_one();
-    }
-
-    void stop()
-    {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (!started_) {
-                return;
-            }
-            stopping_ = true;
-        }
-        cond_.notify_one();
-        thread_.join();
-        started_ = false;
-        stopping_ = false;
-    }
-
-    uint64_t dropped() const { return dropped_.load(); }
-    uint64_t oversized() const { return oversized_.load(); }
-    uint64_t open_failures() const { return open_failures_.load(); }
-    uint64_t write_failures() const { return write_failures_.load(); }
-    size_t queued_bytes() const { return queued_snapshot_.load(); }
-
-private:
-    void run()
-    {
-        int fd = -1;
-        std::unique_lock<std::mutex> lock(mutex_);
-        for (;;) {
-            cond_.wait(lock, [&] { return stopping_ || !queue_.empty(); });
-            if (queue_.empty()) {
-                break;   // stopping, and everything already flushed
-            }
-            std::string rec = std::move(queue_.front());
-            queue_.pop_front();
-            queued_bytes_ -= rec.size();
-            queued_snapshot_ = queued_bytes_;
-            lock.unlock();
-
-            bool ok = true;
-            if (fd < 0) {
-                fd = ::open(path_.c_str(),
-                            O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
-                if (fd < 0) {
-                    ++open_failures_;
-                    ok = false;
-                }
-            }
-            if (ok) {
-                size_t done = 0;
-                while (done < rec.size()) {
-                    ssize_t n = ::write(fd, rec.data() + done, rec.size() - done);
-                    if (n < 0 && errno == EINTR) {
-                        continue;
-                    }
-                    if (n <= 0) {
-                        ++write_failures_;
-                        close(fd);
-                        fd = -1;
-                        ok = false;
-                        break;
-                    }
-                    done += size_t(n);
-                }
-            }
-
-            lock.lock();
-            if (!ok && !stopping_) {
-                /* Requeue the record at the front (bounded by the normal
-                   drop-oldest policy) and back off five seconds before the
-                   next attempt -- in this thread, sleeping is free.  */
-                queue_.push_front(std::move(rec));
-                queued_bytes_ += queue_.front().size();
-                queued_snapshot_ = queued_bytes_;
-                cond_.wait_for(lock, std::chrono::seconds(5),
-                               [&] { return stopping_; });
-            }
-        }
-        if (fd >= 0) {
-            close(fd);
-        }
-    }
-
-    static const size_t max_queued_bytes = 4 * 1024 * 1024;
-    static const size_t max_record_bytes = 256 * 1024;
-    std::string path_;
-    std::mutex mutex_;
-    std::condition_variable cond_;
-    std::deque<std::string> queue_;
-    size_t queued_bytes_ = 0;
-    bool started_ = false;
-    bool stopping_ = false;
-    std::thread thread_;
-    std::atomic<uint64_t> dropped_{0};
-    std::atomic<uint64_t> oversized_{0};
-    std::atomic<uint64_t> open_failures_{0};
-    std::atomic<uint64_t> write_failures_{0};
-    std::atomic<size_t> queued_snapshot_{0};
-};
 
 static string json_escape(const string &s)
 {
@@ -1354,7 +1204,7 @@ struct Daemon {
        dropped and counted, because compile scheduling is the higher-
        priority correctness path.  */
     bool append_state_jsonl_line(const std::string &line);
-    AsyncJsonlWriter state_writer;
+    StateWriter state_writer;
 };
 
 bool Daemon::setup_listen_fds()
@@ -3404,11 +3254,13 @@ void Daemon::remember_finished_job(const Client *client, int exitcode)
         o << "\"cmdline\":\"" << json_escape(entry.cmdline) << "\"";
         o << "}";
         const string line = o.str();
-        if (state_dump_log && logfile_error) {
-            /* No explicit flush: forcing a storage write per record from the
-               control loop is exactly the latency coupling OBS-2 removes.
-               The stream's own buffering (and SIGHUP log reopen) flushes.  */
-            (*logfile_error) << line << "\n";
+        if (state_dump_log) {
+            if (state_writer.started()) {
+                /* File I/O belongs to the writer process, not this loop.  */
+                state_writer.enqueue(StateWriter::SINK_STATELOG, line);
+            } else if (logfile_error) {
+                (*logfile_error) << line << "\n";   // stderr configuration
+            }
         }
         append_state_jsonl_line(line);
     }
@@ -4413,9 +4265,9 @@ string Daemon::dump_internals() const
 
 bool Daemon::append_state_jsonl_line(const std::string &line)
 {
-    /* All bounding, dropping and I/O live in the writer's own thread; this
-       is a cheap in-memory append from the control loop's perspective.  */
-    state_writer.enqueue(line);
+    /* Framing, bounding and the nonblocking pipe write are all that happens
+       here; every file operation lives in the writer PROCESS.  */
+    state_writer.enqueue(StateWriter::SINK_JSONL, line);
     return true;
 }
 
@@ -4602,8 +4454,7 @@ std::string Daemon::dump_state_json() const
       << "\"jsonl_dropped_records\":" << state_writer.dropped() << ","
       << "\"jsonl_oversized_records\":" << state_writer.oversized() << ","
       << "\"jsonl_queued_bytes\":" << state_writer.queued_bytes() << ","
-      << "\"jsonl_open_failures\":" << state_writer.open_failures() << ","
-      << "\"jsonl_write_failures\":" << state_writer.write_failures()
+      << "\"writer_alive\":" << (state_writer.started() ? "true" : "false")
       << "},";
     o << "\"cache\":{";
     o << "\"cache_size\":" << (unsigned long long)cache_size << ",";
@@ -4804,11 +4655,12 @@ void Daemon::maybe_dump_state()
     const string line = dump_state_json();
 
     if (state_dump_log) {
-        // Write raw JSON to the same output as error logs, regardless of verbosity.
-        // This keeps the line machine-parsable and avoids requiring `-vv`.
-        // No explicit flush: a forced storage write per interval from the
-        // control loop is the latency coupling OBS-2 removes.
-        if (logfile_error) {
+        // Machine-parsable regardless of verbosity.  File I/O belongs to the
+        // writer process; the direct stream write remains only for the
+        // stderr (no -l) configuration, where the target is a tty/pipe.
+        if (state_writer.started()) {
+            state_writer.enqueue(StateWriter::SINK_STATELOG, line);
+        } else if (logfile_error) {
             (*logfile_error) << line << "\n";
         }
     }
@@ -6011,6 +5863,10 @@ void Daemon::answer_client_requests()
 
     while (waitpid(-1, &status, WNOHANG) < 0 && errno == EINTR) {}
 
+    /* Push queued state records into the writer pipe (nonblocking; no-op
+       when nothing is queued or the pipe is full).  */
+    state_writer.pump();
+
     handle_old_request();
 
     /* collect the stats after the children exited icecream_load */
@@ -6525,7 +6381,6 @@ int main(int argc, char **argv)
             } else if (optname == "state-jsonl") {
                 if (optarg && *optarg) {
                     d.state_jsonl_path = optarg;
-                    d.state_writer.set_path(optarg);
                     if (!d.state_dump_interval_s) {
                         d.state_dump_interval_s = 30;
                     }
@@ -6889,6 +6744,18 @@ int main(int argc, char **argv)
     /* This is called in the master daemon, whether that is detached or
      * not.  */
     dcc_master_pid = getpid();
+
+    /* Start the state-writer PROCESS now: after daemonize()'s forks, before
+       any job handling, while the daemon is still single-threaded.  The
+       state-log sink needs a file path; when the daemon logs to stderr (no
+       -l), state-log records keep the historical direct stream write, which
+       is a tty/pipe in that configuration, not storage.  */
+    if (!d.state_jsonl_path.empty() || (d.state_dump_log && !logfile.empty())) {
+        if (!d.state_writer.start(d.state_jsonl_path,
+                                  d.state_dump_log ? logfile : std::string())) {
+            log_error() << "failed to start state writer process; state output disabled" << endl;
+        }
+    }
 
     ofstream pidFile;
     string progName = argv[0];
