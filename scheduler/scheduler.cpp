@@ -129,6 +129,10 @@ static list<JobRequestsGroup *> job_requests;
 
 static list<JobStat> all_job_stats;
 static JobStat cum_job_stats;
+/* Estimate identity: a filename suffix alone collides across repositories
+   and build modes ("src/foo.cpp" is not unique), and it ignores what makes
+   compile time differ -- target, environment/toolchain, language and the
+   material optimization/debug flags.  Key on all of them.  */
 struct RuntimeEstimate {
     uint64_t ewma_real_msec;
     uint32_t samples;
@@ -140,6 +144,16 @@ struct RuntimeEstimate {
 };
 static map<string, RuntimeEstimate> file_runtime_estimates;
 static const size_t max_file_runtime_estimates = 50000;
+/* Estimates older than this are treated as unusable (see the expiry note in
+   estimate_job_real_msec).  */
+static const time_t max_runtime_estimate_age_s = 24 * 60 * 60;
+/* LRU recency list + index into it, so eviction does not scan the map.  */
+static list<string> runtime_estimate_lru;
+static map<string, list<string>::iterator> runtime_estimate_lru_pos;
+static uint64_t runtime_estimate_hits = 0;
+static uint64_t runtime_estimate_misses = 0;
+static uint64_t runtime_estimate_stale = 0;
+static uint64_t runtime_estimate_evictions = 0;
 
 static float server_speed(CompileServer *cs, Job *job = nullptr, bool blockDebug = false);
 
@@ -180,17 +194,52 @@ static uint64_t default_estimated_real_msec(const Job *job)
     return std::max<uint64_t>(1, estimate_msec);
 }
 
+static string runtime_estimate_key(const Job *job)
+{
+    if (!job || job->fileName().empty()) {
+        return string();
+    }
+    /* arg_flags carries the material optimization/debug/language bits the
+       client negotiated, so the key separates -O0 from -O2 -g builds of the
+       same path, and one toolchain/target from another.  */
+    /* environments() is the list the client offered; its first entry is the
+       toolchain identity actually in play for this target.  */
+    string env;
+    for (const auto &e : job->environments()) {
+        if (e.first == job->targetPlatform()) {
+            env = e.second;
+            break;
+        }
+    }
+    return job->fileName() + "\x1f" + job->targetPlatform()
+         + "\x1f" + env
+         + "\x1f" + job->language()
+         + "\x1f" + toString(job->argFlags());
+}
+
 static uint64_t estimate_job_real_msec(const Job *job)
 {
     const uint64_t fallback = default_estimated_real_msec(job);
-    if (!job || job->fileName().empty()) {
+    const string key = runtime_estimate_key(job);
+    if (key.empty()) {
         return fallback;
     }
 
-    const auto it = file_runtime_estimates.find(job->fileName());
+    const auto it = file_runtime_estimates.find(key);
     if (it == file_runtime_estimates.end() || !it->second.ewma_real_msec) {
+        ++runtime_estimate_misses;
         return fallback;
     }
+
+    /* Semantic expiry: an estimate that has not been refreshed within the
+       retention window describes a build configuration that may no longer
+       exist (toolchain change, different branch).  Fall back rather than
+       let stale data order today's queue indefinitely.  */
+    if (time(nullptr) - it->second.last_update > max_runtime_estimate_age_s) {
+        ++runtime_estimate_stale;
+        return fallback;
+    }
+    ++runtime_estimate_hits;
 
     const RuntimeEstimate &estimate = it->second;
     if (estimate.samples >= 3) {
@@ -201,6 +250,13 @@ static uint64_t estimate_job_real_msec(const Job *job)
                             + fallback * (4 - estimate.samples)) / 4;
     return std::max<uint64_t>(1, mixed);
 }
+
+/* Maximum time a request may wait behind higher-scoring work at the same
+   niceness before it is promoted unconditionally.  Aging as a numeric bonus
+   (however large) only guarantees eventual promotion; a hard rule makes the
+   worst case explicit and testable, which is what an operator can reason
+   about.  */
+static const time_t max_queue_wait_promotion_s = 60;
 
 static uint64_t estimate_job_queue_score(const Job *job, time_t now)
 {
@@ -226,11 +282,12 @@ static uint64_t estimate_job_queue_score(const Job *job, time_t now)
 
 static void add_runtime_estimate(const Job *job, unsigned long real_msec)
 {
-    if (!job || !real_msec || job->fileName().empty()) {
+    const string key = runtime_estimate_key(job);
+    if (key.empty() || !real_msec) {
         return;
     }
 
-    RuntimeEstimate &estimate = file_runtime_estimates[job->fileName()];
+    RuntimeEstimate &estimate = file_runtime_estimates[key];
     if (!estimate.ewma_real_msec) {
         estimate.ewma_real_msec = real_msec;
     } else {
@@ -241,17 +298,26 @@ static void add_runtime_estimate(const Job *job, unsigned long real_msec)
     }
     estimate.last_update = time(nullptr);
 
-    if (file_runtime_estimates.size() <= max_file_runtime_estimates) {
-        return;
+    /* Touch: move (or insert) this key at the back of the recency list and
+       remember where it sits, so eviction is O(1) instead of a linear scan
+       of all 50,000 entries on every completed job.  */
+    auto pos_it = runtime_estimate_lru_pos.find(key);
+    if (pos_it != runtime_estimate_lru_pos.end()) {
+        runtime_estimate_lru.erase(pos_it->second);
+        pos_it->second = runtime_estimate_lru.insert(runtime_estimate_lru.end(), key);
+    } else {
+        runtime_estimate_lru_pos[key] =
+            runtime_estimate_lru.insert(runtime_estimate_lru.end(), key);
     }
 
-    auto oldest_it = file_runtime_estimates.begin();
-    for (auto it = file_runtime_estimates.begin(); it != file_runtime_estimates.end(); ++it) {
-        if (it->second.last_update < oldest_it->second.last_update) {
-            oldest_it = it;
-        }
+    while (file_runtime_estimates.size() > max_file_runtime_estimates
+           && !runtime_estimate_lru.empty()) {
+        const string victim = runtime_estimate_lru.front();
+        runtime_estimate_lru.pop_front();
+        runtime_estimate_lru_pos.erase(victim);
+        file_runtime_estimates.erase(victim);
+        ++runtime_estimate_evictions;
     }
-    file_runtime_estimates.erase(oldest_it);
 }
 
 static void add_job_stats(Job *job, JobDoneMsg *msg)
@@ -602,6 +668,14 @@ static JobRequestPosition get_first_job_request()
     uint64_t best_score = 0;
     const time_t now = time(nullptr);
 
+    /* Deadline-first LPT within the active niceness: any request that has
+       waited longer than the promotion interval outranks all normal
+       scoring, oldest first (ties by enqueue order).  Below that interval
+       the estimate-weighted score chooses, which keeps the
+       longest-processing-time behaviour that shortens makespan.  */
+    JobRequestPosition overdue;
+    time_t overdue_enqueue = 0;
+
     for (JobRequestsGroup *group : job_requests) {
         if (group->niceness != best_niceness) {
             break;
@@ -617,6 +691,15 @@ static JobRequestPosition get_first_job_request()
             continue;
         }
         for (Job *job : group->l) {
+            if (now - job->enqueueTime() >= max_queue_wait_promotion_s) {
+                if (!overdue.isValid() || job->enqueueTime() < overdue_enqueue
+                        || (job->enqueueTime() == overdue_enqueue
+                            && job->id() < overdue.job->id())) {
+                    overdue = JobRequestPosition(group, job);
+                    overdue_enqueue = job->enqueueTime();
+                }
+                continue;
+            }
             const uint64_t score = estimate_job_queue_score(job, now);
             if (!best.isValid() || score > best_score
                     || (score == best_score && job->id() < best.job->id())) {
@@ -624,6 +707,10 @@ static JobRequestPosition get_first_job_request()
                 best_score = score;
             }
         }
+    }
+
+    if (overdue.isValid()) {
+        return overdue;   // hard promotion wins over any score
     }
 
     if (best.isValid()) {
@@ -2031,6 +2118,31 @@ static bool handle_line(CompileServer *cs, Msg *_m)
                 }
             }
         }
+    } else if (cmd == "estimates") {
+        /* Visibility for the estimate cache and the dispatch credit, so the
+           cliffs these guard against are observable in production.  */
+        char buf[512];
+        snprintf(buf, sizeof(buf),
+                 "estimates: entries=%zu/%zu hits=%llu misses=%llu stale=%llu evictions=%llu",
+                 file_runtime_estimates.size(), max_file_runtime_estimates,
+                 (unsigned long long)runtime_estimate_hits,
+                 (unsigned long long)runtime_estimate_misses,
+                 (unsigned long long)runtime_estimate_stale,
+                 (unsigned long long)runtime_estimate_evictions);
+        if (!cs->send_msg(TextMsg(buf))) {
+            return false;
+        }
+        for (CompileServer * const it : css) {
+            if (it->outstandingDispatches() == 0) {
+                continue;
+            }
+            snprintf(buf, sizeof(buf), " %s: outstanding_dispatches=%u stalled_for=%llus",
+                     it->nodeName().c_str(), it->outstandingDispatches(),
+                     (unsigned long long)(it->outstandingStallMsec(icecream_monotonic_msec()) / 1000));
+            if (!cs->send_msg(TextMsg(buf))) {
+                return false;
+            }
+        }
     } else if (cmd == "internals") {
         for (CompileServer * const it : css) {
             Msg *msg = nullptr;
@@ -2067,7 +2179,7 @@ static bool handle_line(CompileServer *cs, Msg *_m)
         }
     } else if (cmd == "help") {
         if (!cs->send_msg(TextMsg(
-                             "listcs\nlistblocks\nlistjobs [v|verbose]\nlistrequests\nremovecs\nblockcs\nunblockcs\ninternals\nhelp\nquit"))) {
+                             "listcs\nlistblocks\nlistjobs [v|verbose]\nlistrequests\nestimates\nremovecs\nblockcs\nunblockcs\ninternals\nhelp\nquit"))) {
             return false;
         }
     } else {
