@@ -51,6 +51,7 @@
 #include "tempfile.h"
 #include "workit.h"
 #include "logging.h"
+#include <vector>
 #include "serve.h"
 #include "util.h"
 #include "file_util.h"
@@ -135,7 +136,7 @@ static void write_output_file( const string& file, MsgChannel* client )
 /**
  * Read a request, run the compiler, and send a response.
  **/
-void close_unneeded_fds_in_child(int keep_fd)
+void close_unneeded_fds_in_child(std::initializer_list<int> keep_fds)
 {
     DIR *dir = opendir("/proc/self/fd");
     if (!dir) {
@@ -149,10 +150,19 @@ void close_unneeded_fds_in_child(int keep_fd)
         if (!end || *end || fd <= STDERR_FILENO) {
             continue;
         }
-        if (int(fd) == keep_fd || int(fd) == dir_fd) {
+        if (int(fd) == dir_fd) {
             continue;
         }
-        to_close.push_back(int(fd));
+        bool keep = false;
+        for (int k : keep_fds) {
+            if (int(fd) == k) {
+                keep = true;
+                break;
+            }
+        }
+        if (!keep) {
+            to_close.push_back(int(fd));
+        }
     }
     closedir(dir);
     for (int fd : to_close) {
@@ -184,19 +194,28 @@ int handle_connection(const string &basedir, CompileJob *job,
         return pid;
     }
 
-    reset_debug();
-    if ((-1 == close(socket[0])) && (errno != EBADF)){
-        log_perror("close failed");
-    }
-    out_fd = socket[1];
-
     /* Close every descriptor this long-lived compile worker does not need.
        FD_CLOEXEC only takes effect at exec(), and this child runs for the
        whole compile before (and sometimes without) exec'ing -- so it would
        otherwise pin every web connection and listener that existed at fork
        time, delaying peer FIN and multiplying system-wide fd references.
-       Keep std{in,out,err} and the freshly created channel.  */
-    close_unneeded_fds_in_child(out_fd);
+
+       The keep-set must contain the client channel: the child reads the
+       compile request from client->fd and streams CompileResultMsg plus the
+       object file back over it.  Sweeping it away leaves the client waiting
+       forever, because the parent still holds its own reference to that
+       socket and no FIN is ever sent.
+
+       The sweep also runs BEFORE reset_debug(): it necessarily closes the
+       inherited log descriptor, and reset_debug() reopens the log file
+       afterwards so the child keeps logging on a descriptor it owns.  */
+    close_unneeded_fds_in_child({socket[1], client->fd});
+
+    reset_debug();
+    if ((-1 == close(socket[0])) && (errno != EBADF)){
+        log_perror("close failed");
+    }
+    out_fd = socket[1];
 
     /* internal communication channel, don't inherit to gcc */
     fcntl(out_fd, F_SETFD, FD_CLOEXEC);

@@ -25,6 +25,7 @@
 #define ICECREAM_SERVE_H
 
 #include <string>
+#include <initializer_list>
 
 class CompileJob;
 class MsgChannel;
@@ -37,6 +38,6 @@ int handle_connection(const std::string &basedir, CompileJob *job,
 
 /* Close all descriptors above stderr except `keep_fd` (used by forked
    compile workers; see the call site in serve.cpp).  */
-extern void close_unneeded_fds_in_child(int keep_fd);
+extern void close_unneeded_fds_in_child(std::initializer_list<int> keep_fds);
 
 #endif
