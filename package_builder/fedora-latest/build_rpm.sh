@@ -156,6 +156,14 @@ sed -i -E '/^%autosetup/ {/ -N/! s/^%autosetup/%autosetup -N/}' "$SPEC_PATH"
 # configure script.
 sed -i -E '/^[[:space:]]*\\.\\/autogen\\.sh/d' "$SPEC_PATH"
 
+# The remote-worker regression gate must RUN here, not skip: %check executes
+# as root in this container, where the gate always can run.  Required mode
+# turns any skip into a failure.
+sed -i -E 's/^%make_build check|^make check/ICECC_TEST_REQUIRE_REMOTE=1 &/' "$SPEC_PATH"
+if grep -qE '^%check' "$SPEC_PATH" && ! grep -q 'ICECC_TEST_REQUIRE_REMOTE' "$SPEC_PATH"; then
+    sed -i -E '/^%check/a export ICECC_TEST_REQUIRE_REMOTE=1' "$SPEC_PATH"
+fi
+
 # Newer upstream versions install additional helper tools.
 if ! grep -q 'icecc-test-env' "$SPEC_PATH"; then
     sed -i -E '/^%files[[:space:]]*$/a %{_bindir}/icecc-test-env' "$SPEC_PATH"

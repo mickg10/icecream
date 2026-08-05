@@ -21,8 +21,27 @@
 # This is the regression gate for the compile child's descriptor sweep: a
 # sweep that closes the client channel fd makes the compile hang at the
 # client's result wait (no FIN is ever sent, because the parent daemon still
-# holds its own reference to the socket), which kills checks 1-3.
+# holds its own reference to the socket), which kills checks 1-3.  Because
+# the historical failure mode is an INDEFINITE WAIT, every step that could
+# hang runs under an explicit timeout: a reintroduced defect produces a
+# bounded FAIL with logs, never a wedged test job.
+#
+# ICECC_TEST_REQUIRE_REMOTE=1 turns every skip condition into a failure --
+# the required-CI mode: a suite that is green because this gate silently
+# skipped has not tested the remote path at all.  Containerized package
+# builds set it (they run as root, where the gate always can run).
 set -u
+
+REQUIRE_REMOTE=${ICECC_TEST_REQUIRE_REMOTE:-0}
+
+skip() {
+    if [ "$REQUIRE_REMOTE" = 1 ]; then
+        echo "FAIL (required mode): $1" >&2
+        exit 1
+    fi
+    echo "SKIP: $1"
+    exit 77
+}
 
 dir=$(cd "$(dirname "$0")" && pwd)
 top=$(cd "$dir/.." && pwd)
@@ -56,7 +75,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-command -v gcc >/dev/null || { echo "SKIP: gcc not available"; exit 77; }
+command -v gcc >/dev/null || skip "gcc not available"
 
 # As root (containers, rpm %check) iceccd refuses -u root and instead picks
 # its own unprivileged compile user (icecc, else nobody) -- the production
@@ -83,10 +102,10 @@ if [ "$(id -u)" = 0 ]; then
     id -u icecc >/dev/null 2>&1 && ICEUSER=icecc
     chown "$ICEUSER" "$work/envs-remote" "$work/envs-local"
 fi
-( cd "$work/env" && bash "$top/client/icecc-create-env" "$(command -v gcc)" \
+( cd "$work/env" && timeout 120 bash "$top/client/icecc-create-env" "$(command -v gcc)" \
       >"$work/create-env.log" 2>&1 )
 ENVTAR=$(ls "$work"/env/*.tar.gz 2>/dev/null | head -1)
-[ -n "$ENVTAR" ] || { echo "SKIP: icecc-create-env produced no tarball (see $work/create-env.log)"; exit 77; }
+[ -n "$ENVTAR" ] || skip "icecc-create-env produced no tarball (see $work/create-env.log)"
 
 "$top/scheduler/icecc-scheduler" -p "$SCHED_PORT" -n "$NETNAME" \
     -l "$work/sched.log" -vvv &
@@ -117,8 +136,7 @@ done
 # grants it with setcap; containers running as root have it).  Without it the
 # worker downgrades itself to --no-remote and this test cannot run.
 if grep -q "Cannot use chroot, no remote jobs accepted." "$work/remote.log"; then
-    echo "SKIP: daemon lacks CAP_SYS_CHROOT (run 'make test-prepare' in tests/, or run in a container)"
-    exit 77
+    skip "daemon lacks CAP_SYS_CHROOT (sudo setcap cap_sys_chroot+ep $top/daemon/iceccd, or run in a container as root)"
 fi
 
 cat >"$work/tu.c" <<'EOF'
@@ -131,10 +149,11 @@ ICECC_PREFERRED_HOST=remoteq \
 ICECC_VERSION="$ENVTAR" \
 ICECC_DEBUG=debug \
 ICECC_LOGFILE="$work/icecc.log" \
-"$top/client/icecc" gcc -c "$work/tu.c" -o "$work/tu.o" \
+timeout 120 "$top/client/icecc" gcc -c "$work/tu.c" -o "$work/tu.o" \
     >"$work/compile.out" 2>&1
 rc=$?
 
+[ $rc -eq 124 ] && fail "compile TIMED OUT after 120s -- the remote result path is hanging again"
 [ $rc -eq 0 ] || fail "compile exited with $rc"
 [ -s "$work/tu.o" ] || fail "object file missing or empty"
 nm "$work/tu.o" 2>/dev/null | grep -q remote_ice_quick_marker \
