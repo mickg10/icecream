@@ -128,7 +128,8 @@ rm -rf "$NEW_DIR"
 if [ -n "${RELEASE_TARBALL:-}" ]; then
     # THE release artifact: every distribution builds from this exact
     # bootstrapped tree (single Source0; see make_release_tarball.sh).
-    sha256sum -c "${RELEASE_TARBALL}.sha256" --status \
+    ( cd "$(dirname "$RELEASE_TARBALL")" \
+        && sha256sum -c --status "$(basename "$RELEASE_TARBALL").sha256" ) \
         || { echo "ERROR: release tarball digest mismatch" >&2; exit 1; }
     mkdir extract-src
     tar -C extract-src -xf "$RELEASE_TARBALL"

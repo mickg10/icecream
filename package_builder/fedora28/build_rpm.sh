@@ -241,7 +241,8 @@ fi
 
 if [ -n "${RELEASE_TARBALL:-}" ]; then
     # THE release artifact (single Source0 across all distributions).
-    sha256sum -c "${RELEASE_TARBALL}.sha256" --status \
+    ( cd "$(dirname "$RELEASE_TARBALL")" \
+        && sha256sum -c --status "$(basename "$RELEASE_TARBALL").sha256" ) \
         || { echo "ERROR: release tarball digest mismatch" >&2; exit 1; }
     mkdir "$STAGE/extract-src"
     tar -C "$STAGE/extract-src" -xf "$RELEASE_TARBALL"
