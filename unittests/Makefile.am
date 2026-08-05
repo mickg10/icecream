@@ -1,10 +1,12 @@
-TESTS = testargs backpressure schedbp-quick.sh
+TESTS = testargs backpressure schedpolicy schedbp-quick.sh
 
 AM_CPPFLAGS = -I$(top_srcdir)/client -I$(top_srcdir)/services -I$(top_srcdir)/
 testargs_LDADD = ../client/libclient.a ../services/libicecc.la
 
-check_PROGRAMS = testargs backpressure schedbp
+check_PROGRAMS = testargs backpressure schedpolicy schedbp
 testargs_SOURCES = args.cpp
+
+schedpolicy_SOURCES = schedpolicy.cpp
 
 backpressure_SOURCES = backpressure.cpp
 backpressure_CXXFLAGS = -pthread

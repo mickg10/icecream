@@ -64,3 +64,5 @@ package_builder/**/out/
 aidocs/
 configure~
 unittests/schedbp-quick.sh.trs
+unittests/schedpolicy
+unittests/schedpolicy.trs
