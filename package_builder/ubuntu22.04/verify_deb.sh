@@ -102,7 +102,7 @@ fi
 SCHED_PORT="${SCHED_PORT:-8765}"
 export ICECC_SCHEDULER="127.0.0.1:${SCHED_PORT}"
 
-icecc-scheduler -p "$SCHED_PORT" -vv >/tmp/icecc-scheduler.log 2>&1 &
+icecc-scheduler -p "$SCHED_PORT" -vvv >/tmp/icecc-scheduler.log 2>&1 &
 SCHED_PID=$!
 
 cleanup() {
@@ -114,7 +114,30 @@ iceccd --no-remote -m 1 --max-preprocess 8 -s "$ICECC_SCHEDULER" -vv >/tmp/icecc
 ICECCD_PID=$!
 trap cleanup EXIT
 
-sleep 1
+# A produced object file proves nothing on its own: the wrapper compiles
+# locally by design when no daemon is reachable, so a broken scheduler or
+# daemon package still yields /tmp/icecc_verify.o.  Assert the services are
+# alive, that the daemon actually registered with the scheduler, and that
+# the scheduler recorded the job.
+# NB: "login <node>" is a trace-level line, hence the -vvv above; "NEW <id>
+# client=" is info-level.  Both must be greppable or these assertions would
+# fail on a healthy system.
+for _ in $(seq 1 30); do
+    if grep -q "login" /tmp/icecc-scheduler.log 2>/dev/null; then
+        break
+    fi
+    sleep 1
+done
+
+kill -0 "$SCHED_PID" 2>/dev/null || { echo "ERROR: scheduler died during startup" >&2; tail -20 /tmp/icecc-scheduler.log >&2; exit 1; }
+kill -0 "$ICECCD_PID" 2>/dev/null || { echo "ERROR: daemon died during startup" >&2; tail -20 /tmp/iceccd.log >&2; exit 1; }
+
+if ! grep -q "login" /tmp/icecc-scheduler.log 2>/dev/null; then
+    echo "ERROR: daemon never registered with the scheduler" >&2
+    tail -20 /tmp/icecc-scheduler.log >&2
+    tail -20 /tmp/iceccd.log >&2
+    exit 1
+fi
 
 cat >/tmp/icecc_verify.c <<'EOF'
 int main(void) { return 0; }
@@ -123,5 +146,17 @@ EOF
 "$WRAPDIR/gcc" -c /tmp/icecc_verify.c -o /tmp/icecc_verify.o
 
 test -s /tmp/icecc_verify.o
+
+# The scheduler must have seen this compile, otherwise the wrapper silently
+# fell back to a plain local build and the packages were never exercised.
+if ! grep -qE "NEW [0-9]+ client=" /tmp/icecc-scheduler.log 2>/dev/null; then
+    echo "ERROR: the compile never reached the scheduler (silent local fallback)" >&2
+    tail -30 /tmp/icecc-scheduler.log >&2
+    tail -30 /tmp/iceccd.log >&2
+    exit 1
+fi
+
+kill -0 "$SCHED_PID" 2>/dev/null || { echo "ERROR: scheduler died during the compile" >&2; exit 1; }
+kill -0 "$ICECCD_PID" 2>/dev/null || { echo "ERROR: daemon died during the compile" >&2; exit 1; }
 
 echo "OK"
