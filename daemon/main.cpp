@@ -2252,20 +2252,45 @@ string Daemon::webgui_html() const
       }
       setText("jobs-sub", `${rows.length} rows`);
     }
+    /* Fetches must not pile up or hang: a refresh runs every two seconds,
+       so without a deadline and an in-flight guard a stalled daemon leaves
+       the page silently showing old numbers while requests accumulate.  */
+    let refreshInFlight = false;
+    let lastSuccessMs = 0;
+    async function fetchJson(url, timeoutMs) {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), timeoutMs || 5000);
+      try {
+        const res = await fetch(url, { cache: "no-store", signal: ctrl.signal });
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status} for ${url}`);
+        }
+        return await res.json();
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    function freshnessText() {
+      if (!lastSuccessMs) {
+        return "no successful refresh yet";
+      }
+      const age = Math.round((Date.now() - lastSuccessMs) / 1000);
+      return age <= 5 ? `updated ${age}s ago` : `STALE: last update ${age}s ago`;
+    }
+
     async function refresh() {
+      if (refreshInFlight) {
+        return;   // a previous refresh is still outstanding
+      }
+      refreshInFlight = true;
       try {
         const limit = Number(document.getElementById("job-limit").value || "500");
-        const [stateRes, clientsRes, jobsRes] = await Promise.all([
-          fetch("/api/state", { cache: "no-store" }),
-          fetch("/api/clients", { cache: "no-store" }),
-          fetch(`/api/jobs?limit=${limit}`, { cache: "no-store" })
+        const [state, clients, jobs] = await Promise.all([
+          fetchJson("/api/state", 5000),
+          fetchJson("/api/clients", 5000),
+          fetchJson(`/api/jobs?limit=${limit}`, 8000)
         ]);
-        if (!stateRes.ok || !clientsRes.ok || !jobsRes.ok) {
-          throw new Error(`HTTP ${stateRes.status}/${clientsRes.status}/${jobsRes.status}`);
-        }
-        const state = await stateRes.json();
-        const clients = await clientsRes.json();
-        const jobs = await jobsRes.json();
+        lastSuccessMs = Date.now();
 
         const by = state.clients.by_status;
         const schedulerConnected = !!state.scheduler.connected;
@@ -2280,7 +2305,7 @@ string Daemon::webgui_html() const
           .map(([host, meta]) => `${host}:${meta.count}`)
           .join(", ");
         const waitforcsCombined = ((state.waitforcs_latency_msec || {}).combined || {});
-        let metaText = `${state.node} | ts=${state.ts} | refreshed=${new Date().toLocaleTimeString()}`;
+        let metaText = `${state.node} | ts=${state.ts} | ${freshnessText()}`;
         if (topLocalReasons) metaText += ` | local_reasons=${topLocalReasons}`;
         if (topWaitHosts) metaText += ` | waitcompile_hosts=${topWaitHosts}`;
         if (waitforcsCombined.samples) {
@@ -2376,8 +2401,18 @@ string Daemon::webgui_html() const
 
         renderClients(clients.clients || []);
         renderJobs(jobs.jobs || []);
+        if (jobs.truncated) {
+          /* Say so rather than implying the table is the whole history.  */
+          setText("meta", document.getElementById("meta").textContent
+            + ` | showing ${jobs.returned} of ${jobs.size}`);
+        }
       } catch (error) {
-        setText("meta", "error: " + error);
+        /* Keep the failure and the age of the last good data both visible:
+           previously only a metadata line changed while every card kept its
+           stale numbers.  */
+        setText("meta", `error: ${error} | ${freshnessText()}`);
+      } finally {
+        refreshInFlight = false;
       }
     }
     document.getElementById("cmdline-close").addEventListener("click", hideCmdline);
@@ -3421,6 +3456,25 @@ string Daemon::dump_insights_series_json(size_t minutes)
     o << "\"ts\":" << (long long)now << ",";
     o << "\"retention_minutes\":" << insights_retention_minutes << ",";
     o << "\"graph_minutes\":" << minutes << ",";
+    /* The newest bucket covers a minute still in progress, so its counts are
+       partial by construction: a UI that plots it as a completed rate shows
+       a dip after every rollover.  Publish the boundary and a rate computed
+       only from complete minutes, so the client does not have to guess.  */
+    o << "\"current_minute_ts\":" << (long long)current_minute << ",";
+    {
+        uint64_t complete_jobs = 0;
+        size_t complete_minutes = 0;
+        for (const auto &b : insights_history) {
+            if (b.minute_ts >= current_minute || b.minute_ts < start_minute) {
+                continue;
+            }
+            complete_jobs += b.jobs_total;
+            ++complete_minutes;
+        }
+        o << "\"complete_minutes\":" << complete_minutes << ",";
+        o << "\"jobs_per_minute_complete\":"
+          << (complete_minutes ? double(complete_jobs) / double(complete_minutes) : 0.0) << ",";
+    }
     o << "\"buckets\":[";
 
     for (size_t index = 0; index < minutes; ++index) {
@@ -3455,6 +3509,7 @@ string Daemon::dump_insights_series_json(size_t minutes)
 
         o << "{";
         o << "\"minute_ts\":" << (long long)minute_ts << ",";
+        o << "\"partial\":" << (minute_ts >= current_minute ? "true" : "false") << ",";
         o << "\"jobs_total\":" << jobs_total << ",";
         o << "\"jobs_remote\":" << jobs_remote << ",";
         o << "\"jobs_local\":" << jobs_local << ",";
