@@ -26,6 +26,7 @@
 
 #include <string>
 #include <list>
+#include <set>
 #include <map>
 
 #include "../services/comm.h"
@@ -41,29 +42,38 @@ class CompileServer : public MsgChannel
 public:
     // Assignments dispatched to this submitter that have not yet been
     // confirmed by observable client progress (JobBeginMsg).  Bounds how
-    // many farm slots one unresponsive submitter can hold.
-    unsigned int outstandingDispatches() const { return m_outstandingDispatches; }
-    void addOutstandingDispatch()
+    // many farm slots one unresponsive submitter can hold.  Each entry is
+    // the monotonic debit time of one unconfirmed dispatch: the liveness
+    // bound is a MAXIMUM ASSIGNMENT AGE, enforced against the oldest entry,
+    // so one lost assignment cannot hold its slot indefinitely just because
+    // later assignments keep confirming.
+    unsigned int outstandingDispatches() const
     {
-        if (m_outstandingDispatches == 0) {
-            m_outstandingSinceMsec = icecream_monotonic_msec();
-        }
-        ++m_outstandingDispatches;
+        return (unsigned int)m_outstandingDebits.size();
     }
-    void removeOutstandingDispatch()
+    void addOutstandingDispatch(uint64_t debit_msec)
     {
-        if (m_outstandingDispatches > 0) {
-            --m_outstandingDispatches;
-        }
-        // any confirmation is progress: restart the stall clock
-        m_outstandingSinceMsec = m_outstandingDispatches
-            ? icecream_monotonic_msec() : 0;
+        m_outstandingDebits.insert(debit_msec);
     }
-    // How long this submitter has held unconfirmed dispatches without any
-    // progress, or 0 if it holds none.
-    uint64_t outstandingStallMsec(uint64_t now_msec) const
+    void removeOutstandingDispatch(uint64_t debit_msec)
     {
-        return m_outstandingSinceMsec ? now_msec - m_outstandingSinceMsec : 0;
+        auto it = m_outstandingDebits.find(debit_msec);
+        if (it != m_outstandingDebits.end()) {
+            m_outstandingDebits.erase(it);
+        } else if (!m_outstandingDebits.empty()) {
+            // defensive: a job whose debit time we no longer know still
+            // releases exactly one credit
+            m_outstandingDebits.erase(m_outstandingDebits.begin());
+        }
+    }
+    // Age of the oldest unconfirmed dispatch, or 0 if none is outstanding.
+    uint64_t oldestOutstandingDispatchMsec(uint64_t now_msec) const
+    {
+        if (m_outstandingDebits.empty()) {
+            return 0;
+        }
+        const uint64_t oldest = *m_outstandingDebits.begin();
+        return now_msec > oldest ? now_msec - oldest : 0;
     }
 
     enum State {
@@ -179,8 +189,7 @@ public:
     bool isConnected();
     void updateInConnectivity(bool acceptingIn);
 
-    unsigned int m_outstandingDispatches = 0;
-    uint64_t m_outstandingSinceMsec = 0;
+    std::multiset<uint64_t> m_outstandingDebits;
 
 private:
     bool blacklisted(const Job *job, const pair<string, string> &environment) const;

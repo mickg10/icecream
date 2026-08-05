@@ -230,6 +230,20 @@ replies), not by the depth of its request queue.  Verified by the
 harness's stall mode: assignments stop at ~2.6k of 4k queued requests and
 teardown lands at t≈31s with the scheduler responsive throughout.
 
+On top of the byte-level bound, a **semantic dispatch credit** caps how
+many *unconfirmed* assignments (dispatched, no JobBegin yet) one submitter
+may hold: `--max-outstanding-dispatches` (default 32, range 1-1024),
+clamped at runtime to `farm_slots - 1` so a single submitter can never
+reserve an entire small farm before a second submitter is served.  A
+submitter whose **oldest** unconfirmed assignment exceeds
+`--dispatch-stall-timeout` (default 180s, range 10-3600) is evicted — the
+bound is per-assignment age, so one lost assignment cannot hide behind
+later ones that confirm.  Both values and the live clamp are shown in the
+scheduler's `estimates` control command.  Verified by the every-commit
+gate at three farm sizes (large, 8-slot, 16-slot): the non-reading
+submitter's per-submitter assignment count stops at the (clamped) credit
+while a healthy submitter keeps receiving assignments and replies.
+
 ## 4b. fulljob policy knob
 
 `iceccd --fulljob-policy=compile-lane|exclusive` (default `compile-lane`)

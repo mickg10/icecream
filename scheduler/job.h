@@ -56,6 +56,11 @@ public:
     // (dispatched, not yet confirmed by JobBegin or released on teardown).
     bool dispatchOutstanding() const { return m_dispatchOutstanding; }
     void setDispatchOutstanding(bool value) { m_dispatchOutstanding = value; }
+    // Monotonic time this job's dispatch credit was debited; the submitter's
+    // stall bound is enforced against its OLDEST unconfirmed dispatch, so a
+    // single lost assignment cannot hide behind later ones that confirm.
+    uint64_t dispatchDebitMsec() const { return m_dispatchDebitMsec; }
+    void setDispatchDebitMsec(uint64_t msec) { m_dispatchDebitMsec = msec; }
 
     CompileServer *server() const;
     void setServer(CompileServer *server);
@@ -129,6 +134,7 @@ private:
     std::string m_targetPlatform;
     std::string m_fileName;
     bool m_dispatchOutstanding = false;
+    uint64_t m_dispatchDebitMsec = 0;
     std::list<Job *> m_masterJobFor;
     unsigned int m_argFlags;
     std::string m_language; // for debugging

@@ -186,7 +186,7 @@ static MsgChannel *connect_daemon(int port, int rcvbuf)
 int main(int argc, char **argv)
 {
     if (argc < 3) {
-        fprintf(stderr, "usage: %s <icecc-scheduler> <sndbuf_shim.so> [jobs] [clog-seconds]\n",
+        fprintf(stderr, "usage: %s <icecc-scheduler> <sndbuf_shim.so> [jobs] [clog-seconds] [mode] [farm-slots]\n",
                 argv[0]);
         return 2;
     }
@@ -203,6 +203,16 @@ int main(int argc, char **argv)
        credit) while other submitters keep being served.  It does not wait
        for any teardown deadline.  */
     const bool gate_mode = argc > 5 && strcmp(argv[5], "gate") == 0;
+    /* Optional farm size (argv[6], gate mode): the fake compile server
+       advertises exactly this many slots instead of "always enough".  The
+       scheduler then clamps the per-submitter dispatch credit to slots-1,
+       and the gate asserts THAT bound -- the small-farm case where a full
+       credit of 32 could otherwise reserve the whole farm.  */
+    const int farm_slots = argc > 6 ? atoi(argv[6]) : 0;
+    if (farm_slots < 0 || farm_slots > 100000) {
+        fprintf(stderr, "implausible farm_slots argument\n");
+        return 2;
+    }
     // Normal mode must stay under the scheduler's 30s deferred-send bound
     // (measured from jam onset, ~1-2s into the clog): it asserts that a
     // TRANSIENT stall loses nothing.  Stall mode goes well past the bound
@@ -268,7 +278,7 @@ int main(int argc, char **argv)
     {
         LoginMsg login(kCsPort, "fakecs", kPlatform, 0);
         login.envs.push_back(std::make_pair(kPlatform, kEnv));
-        login.max_kids = njobs + 16;
+        login.max_kids = farm_slots > 0 ? farm_slots : njobs + 16;
         login.noremote = false;
         login.chroot_possible = true;
         if (!cs->send_msg(login)) {
@@ -316,6 +326,16 @@ int main(int argc, char **argv)
                 for (unsigned int jid : batch) {
                     JobBeginMsg jb(jid, 1);
                     if (!cs->send_msg(jb)) {
+                        cs_alive = false;
+                        return;
+                    }
+                    /* Complete the job immediately so the slot recycles.
+                       On a small farm this is what lets a healthy submitter
+                       keep flowing through the capacity the clamp reserves
+                       for it; unconfirmed (never-read) assignments keep
+                       holding their slots, exactly like a real dead client.  */
+                    JobDoneMsg jd(jid, 0, JobDoneMsg::FROM_SERVER);
+                    if (!cs->send_msg(jd)) {
                         cs_alive = false;
                         return;
                     }
@@ -521,14 +541,41 @@ int main(int argc, char **argv)
 
     if (gate_mode) {
         fprintf(stderr, "# gate mode: submitter stops reading for %ds\n", clog_s);
-        auto count_assignments = [&]() {
+        /* Count assignments PER SUBMITTER from the scheduler's own log.
+           "put <id> in joblist of <cs>" names the COMPILE SERVER, so the
+           submitter is recovered through the job id: "NEW <id>
+           client=<submitter>" at creation, then each "put <id>" attributed
+           through that map.  The name comparison is delimiter-aware --
+           "fakesub" is a prefix of "fakesub2".  */
+        auto count_assignments_to = [&](const char *name) {
+            std::map<int, std::string> owner;
             int n = 0;
+            const size_t name_len = strlen(name);
             FILE *lf = fopen("schedbp-scheduler.log", "r");
             if (lf) {
                 char line[4096];
                 while (fgets(line, sizeof(line), lf)) {
-                    if (strstr(line, " in joblist of ")) {
-                        ++n;
+                    const char *nw = strstr(line, "NEW ");
+                    const char *cl = nw ? strstr(nw, " client=") : nullptr;
+                    if (nw && cl) {
+                        const int id = atoi(nw + 4);
+                        const char *cname = cl + strlen(" client=");
+                        const char *cend = cname;
+                        while (*cend && !isspace((unsigned char)*cend)) {
+                            ++cend;
+                        }
+                        owner[id] = std::string(cname, cend - cname);
+                        continue;
+                    }
+                    const char *put = strstr(line, "put ");
+                    if (put && strstr(put, " in joblist of ")) {
+                        const int id = atoi(put + 4);
+                        auto it = owner.find(id);
+                        if (it != owner.end()
+                            && it->second.size() == name_len
+                            && it->second.compare(name) == 0) {
+                            ++n;
+                        }
                     }
                 }
                 fclose(lf);
@@ -536,24 +583,34 @@ int main(int argc, char **argv)
             return n;
         };
         const int healthy_before = healthy_replies.load();
-        const int puts_before = count_assignments();
+        const int paused_before = count_assignments_to("fakesub");
+        const int healthy_puts_before = count_assignments_to("fakesub2");
         for (int i = 0; i < clog_s; ++i) {
             sleep(1);
         }
         /* Only assignments made DURING the freeze are attributable to the
-           gate; earlier ones were confirmed normally.  */
-        const int puts_total = count_assignments() - puts_before;
+           gate; earlier ones were confirmed normally.  Attribution is per
+           submitter, so the healthy submitter's traffic can no longer mask
+           an over-grant to the paused one.  */
+        const int paused_puts = count_assignments_to("fakesub") - paused_before;
+        const int healthy_puts = count_assignments_to("fakesub2") - healthy_puts_before;
         const int healthy_gain = healthy_replies.load() - healthy_before;
-        /* The stalled submitter confirms nothing, so it may hold at most its
-           credit (32) plus the assignment already in flight; the healthy
-           submitter must keep progressing meanwhile.  Its own confirmed jobs
-           also appear in the joblist count, hence the healthy_gain term.  */
-        fprintf(stderr, "# assignments while stalled: %d (bound %d), healthy gain: %d\n",
-                puts_total, 33 + healthy_gain, healthy_gain);
-        REQUIRE(puts_total <= 33 + healthy_gain,
+        /* The scheduler clamps the credit to farm slots - 1 on small farms;
+           mirror that here.  +1 allows the assignment already in flight when
+           the freeze began.  */
+        int credit = 32;
+        if (farm_slots > 0 && credit >= farm_slots) {
+            credit = farm_slots > 1 ? farm_slots - 1 : 1;
+        }
+        fprintf(stderr, "# paused-submitter assignments while stalled: %d (credit %d),"
+                        " healthy assignments: %d, healthy replies: %d\n",
+                paused_puts, credit, healthy_puts, healthy_gain);
+        REQUIRE(paused_puts <= credit + 1,
                 "dispatch to the non-reading submitter stopped at its credit (BP-1)");
         REQUIRE(healthy_alive.load() && healthy_gain > 0,
-                "a healthy submitter kept receiving dispatches while the other stalled");
+                "a healthy submitter kept receiving replies while the other stalled");
+        REQUIRE(healthy_puts > 0,
+                "the healthy submitter kept receiving assignments while the other stalled");
         REQUIRE(worst_reply.load() < 5.0, "scheduler stayed responsive");
         REQUIRE(!probe_died.load(), "control connection survived");
 

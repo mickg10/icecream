@@ -423,7 +423,7 @@ static bool handle_end(CompileServer *cs, Msg *);
    over for selection until its clients make progress; healthy submitters
    are unaffected because JobBegin normally follows dispatch within
    milliseconds.  */
-static const unsigned int max_outstanding_dispatches = 32;
+static unsigned int max_outstanding_dispatches = 32;   // --max-outstanding-dispatches
 
 /* Liveness bound for a submitter that holds dispatch credits without ever
    confirming them.  Deliberately generous: a legitimate client can wait for
@@ -433,7 +433,24 @@ static const unsigned int max_outstanding_dispatches = 32;
    the precise case -- a peer that is not draining its socket (deferred
    output armed).  Together: unread socket -> 30s, silent-but-reading
    submitter -> this bound.  */
-static const uint64_t max_outstanding_stall_msec = 180 * 1000;
+static uint64_t max_outstanding_stall_msec = 180 * 1000;   // --dispatch-stall-timeout (seconds)
+
+/* Remote-capable compile slots across the farm, recomputed once per main
+   loop (prune_servers).  Used to clamp the per-submitter dispatch credit:
+   on a farm with fewer slots than the configured credit, one submitter
+   could otherwise reserve every slot before a second submitter is served.
+   The clamp always leaves one slot's worth of credit for someone else.  */
+static unsigned int cached_remote_farm_slots = 0;
+
+static unsigned int effective_dispatch_credit()
+{
+    unsigned int credit = max_outstanding_dispatches;
+    const unsigned int slots = cached_remote_farm_slots;
+    if (slots > 0 && credit >= slots) {
+        credit = slots > 1 ? slots - 1 : 1;
+    }
+    return credit;
+}
 
 static void notify_monitors(Msg *m)
 {
@@ -633,7 +650,9 @@ static void debit_dispatch_credit(Job *job)
 {
     if (job && !job->dispatchOutstanding()) {
         job->setDispatchOutstanding(true);
-        job->submitter()->addOutstandingDispatch();
+        const uint64_t now_msec = icecream_monotonic_msec();
+        job->setDispatchDebitMsec(now_msec);
+        job->submitter()->addOutstandingDispatch(now_msec);
     }
 }
 
@@ -641,7 +660,7 @@ static void credit_dispatch_credit(Job *job)
 {
     if (job && job->dispatchOutstanding()) {
         job->setDispatchOutstanding(false);
-        job->submitter()->removeOutstandingDispatch();
+        job->submitter()->removeOutstandingDispatch(job->dispatchDebitMsec());
     }
 }
 
@@ -654,7 +673,7 @@ static bool submitter_accepts_dispatch(CompileServer *submitter)
 {
     return submitter
         && !submitter->has_pending_write()
-        && submitter->outstandingDispatches() < max_outstanding_dispatches;
+        && submitter->outstandingDispatches() < effective_dispatch_credit();
 }
 
 static JobRequestPosition get_first_job_request()
@@ -1282,6 +1301,20 @@ static time_t prune_servers()
     time_t now = time(nullptr);
     time_t min_time = MAX_SCHEDULER_PING;
 
+    /* Refresh the farm-slot aggregate for the dispatch-credit clamp.  Once
+       per loop over all daemons is cheap and cannot go stale across the
+       login/logout/relogin paths that change it.  */
+    {
+        unsigned int slots = 0;
+        for (CompileServer * const cs : css) {
+            if (cs->state() == CompileServer::LOGGEDIN && !cs->noRemote()
+                && cs->maxJobs() > 0) {
+                slots += (unsigned int)cs->maxJobs();
+            }
+        }
+        cached_remote_farm_slots = slots;
+    }
+
     for (it = controls.begin(); it != controls.end();) {
         if ((now - (*it)->last_talk) >= MAX_SCHEDULER_PING) {
             CompileServer *old = *it;
@@ -1320,11 +1353,11 @@ static time_t prune_servers()
            slots forever.  */
         if ((*it)->outstandingDispatches() > 0 && !(*it)->deferred_output_armed()) {
             const uint64_t stall_msec =
-                (*it)->outstandingStallMsec(icecream_monotonic_msec());
+                (*it)->oldestOutstandingDispatchMsec(icecream_monotonic_msec());
             if (stall_msec >= max_outstanding_stall_msec) {
                 log_warning() << (*it)->nodeName() << " holds "
                               << (*it)->outstandingDispatches()
-                              << " unconfirmed dispatches for "
+                              << " unconfirmed dispatches, oldest for "
                               << (stall_msec / 1000) << "s - removing" << endl;
                 CompileServer *old = *it;
                 ++it;
@@ -2132,13 +2165,21 @@ static bool handle_line(CompileServer *cs, Msg *_m)
         if (!cs->send_msg(TextMsg(buf))) {
             return false;
         }
+        snprintf(buf, sizeof(buf),
+                 "dispatch_credit=%u effective=%u farm_slots=%u stall_timeout=%llus",
+                 max_outstanding_dispatches, effective_dispatch_credit(),
+                 cached_remote_farm_slots,
+                 (unsigned long long)(max_outstanding_stall_msec / 1000));
+        if (!cs->send_msg(TextMsg(buf))) {
+            return false;
+        }
         for (CompileServer * const it : css) {
             if (it->outstandingDispatches() == 0) {
                 continue;
             }
-            snprintf(buf, sizeof(buf), " %s: outstanding_dispatches=%u stalled_for=%llus",
+            snprintf(buf, sizeof(buf), " %s: outstanding_dispatches=%u oldest_unconfirmed=%llus",
                      it->nodeName().c_str(), it->outstandingDispatches(),
-                     (unsigned long long)(it->outstandingStallMsec(icecream_monotonic_msec()) / 1000));
+                     (unsigned long long)(it->oldestOutstandingDispatchMsec(icecream_monotonic_msec()) / 1000));
             if (!cs->send_msg(TextMsg(buf))) {
                 return false;
             }
@@ -2483,6 +2524,8 @@ static void usage(const std::string reason = "")
          << "  -v[v[v]]]\n"
          << "  -r, --persistent-client-connection\n"
          << "  -a, --algorithm <name>\n"
+         << "  --max-outstanding-dispatches <n>   per-submitter unconfirmed dispatch credit (1-1024, default 32)\n"
+         << "  --dispatch-stall-timeout <sec>     evict a submitter whose oldest unconfirmed dispatch exceeds this (10-3600, default 180)\n"
          << endl;
 
     exit(1);
@@ -2585,6 +2628,8 @@ int main(int argc, char *argv[])
             { "log-file", 1, nullptr, 'l'},
             { "user-uid", 1, nullptr, 'u'},
             { "algorithm", 1, nullptr, 'a' },
+            { "max-outstanding-dispatches", 1, nullptr, 1001 },
+            { "dispatch-stall-timeout", 1, nullptr, 1002 },
             { nullptr, 0, nullptr, 0 }
         };
 
@@ -2704,6 +2749,30 @@ int main(int argc, char *argv[])
 
             break;
 
+        case 1001:
+            if (optarg && *optarg) {
+                const long v = strtol(optarg, nullptr, 10);
+                if (v < 1 || v > 1024) {
+                    usage("Error: --max-outstanding-dispatches must be 1..1024");
+                }
+                max_outstanding_dispatches = (unsigned int)v;
+            } else {
+                usage("Error: --max-outstanding-dispatches requires argument");
+            }
+            break;
+
+        case 1002:
+            if (optarg && *optarg) {
+                const long v = strtol(optarg, nullptr, 10);
+                if (v < 10 || v > 3600) {
+                    usage("Error: --dispatch-stall-timeout must be 10..3600 seconds");
+                }
+                max_outstanding_stall_msec = (uint64_t)v * 1000;
+            } else {
+                usage("Error: --dispatch-stall-timeout requires argument");
+            }
+            break;
+
         default:
             usage();
         }
@@ -2749,6 +2818,9 @@ int main(int argc, char *argv[])
     setup_debug(debug_level, logfile);
 
     log_info() << "ICECREAM scheduler " VERSION " starting up, port " << scheduler_port << endl;
+    log_info() << "dispatch credit: " << max_outstanding_dispatches
+               << " unconfirmed per submitter (farm-clamped at runtime), stall timeout "
+               << (max_outstanding_stall_msec / 1000) << "s" << endl;
     log_info() << "Debug level: " << debug_level << endl;
 
     if (detach) {
