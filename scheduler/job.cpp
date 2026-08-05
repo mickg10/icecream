@@ -48,6 +48,7 @@ Job::Job(const unsigned int _id, CompileServer *subm)
 {
     const time_t now = time(nullptr);
     m_enqueueTime = now;
+    m_enqueueMonoMsec = icecream_monotonic_msec();
     m_stateChangeTime = now;
     m_submitter->submittedJobsIncrement();
 }

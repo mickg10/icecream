@@ -2147,7 +2147,15 @@ void GetCSMsg::send_to_channel(MsgChannel *c) const
 {
     Msg::send_to_channel(c);
     c->write_environments(versions);
-    *c << shorten_filename(filename);
+    /* Protocol 48 carries the full path: the scheduler's runtime-estimate
+       identity must distinguish equal suffixes in different build trees,
+       which the historical 3-component shortening collapses.  Older peers
+       keep the shortened form.  */
+    if (IS_PROTOCOL_VERSION(48, c)) {
+        *c << filename;
+    } else {
+        *c << shorten_filename(filename);
+    }
     *c << (uint32_t) lang;
     *c << count;
     *c << target;

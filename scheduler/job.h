@@ -61,6 +61,21 @@ public:
     // single lost assignment cannot hide behind later ones that confirm.
     uint64_t dispatchDebitMsec() const { return m_dispatchDebitMsec; }
     void setDispatchDebitMsec(uint64_t msec) { m_dispatchDebitMsec = msec; }
+    // Monotonic enqueue time: ordering, aging and promotion deadlines are
+    // computed from this so a wall-clock step can neither postpone nor
+    // fast-forward them.  enqueueTime() (wall) remains display-only.
+    uint64_t enqueueMonoMsec() const { return m_enqueueMonoMsec; }
+    // Scheduling estimate frozen at enqueue: a queued job's rank cannot
+    // drift as EWMA updates, the global average, or the 24h expiry change
+    // underneath it, which makes each dispatch decision reproducible and
+    // is what lets an index treat the score key as static.
+    uint64_t estimateSnapshotMsec() const { return m_estimateSnapshotMsec; }
+    void setEstimateSnapshotMsec(uint64_t msec) { m_estimateSnapshotMsec = msec; }
+    // Toolchain identity actually chosen at dispatch (the offer matching
+    // the host platform); runtime estimates are recorded under this, not
+    // under whatever the client happened to list first.
+    const std::string &selectedEnvironment() const { return m_selectedEnvironment; }
+    void setSelectedEnvironment(const std::string &env) { m_selectedEnvironment = env; }
 
     CompileServer *server() const;
     void setServer(CompileServer *server);
@@ -135,6 +150,9 @@ private:
     std::string m_fileName;
     bool m_dispatchOutstanding = false;
     uint64_t m_dispatchDebitMsec = 0;
+    uint64_t m_enqueueMonoMsec = 0;
+    uint64_t m_estimateSnapshotMsec = 0;
+    std::string m_selectedEnvironment;
     std::list<Job *> m_masterJobFor;
     unsigned int m_argFlags;
     std::string m_language; // for debugging

@@ -136,6 +136,8 @@ static JobStat cum_job_stats;
 struct RuntimeEstimate {
     uint64_t ewma_real_msec;
     uint32_t samples;
+    /* icecream_monotonic_seconds(): freshness must not move with wall-clock
+       steps.  */
     time_t last_update;
     RuntimeEstimate()
         : ewma_real_msec(0)
@@ -202,19 +204,30 @@ static string runtime_estimate_key(const Job *job)
     /* arg_flags carries the material optimization/debug/language bits the
        client negotiated, so the key separates -O0 from -O2 -g builds of the
        same path, and one toolchain/target from another.  */
-    /* environments() is the list the client offered; its first entry is the
-       toolchain identity actually in play for this target.  */
-    string env;
-    for (const auto &e : job->environments()) {
-        if (e.first == job->targetPlatform()) {
-            env = e.second;
-            break;
+    /* Prefer the toolchain identity persisted at dispatch; before dispatch
+       (scoring time) fall back to the offer matching the target platform.
+       When the two differ the estimate is recorded under the environment
+       that actually ran, and scoring for such jobs falls back to the
+       default estimate -- a different toolchain's runtime is not evidence
+       about this one.  */
+    string env = job->selectedEnvironment();
+    if (env.empty()) {
+        for (const auto &e : job->environments()) {
+            if (e.first == job->targetPlatform()) {
+                env = e.second;
+                break;
+            }
         }
     }
-    return job->fileName() + "\x1f" + job->targetPlatform()
-         + "\x1f" + env
-         + "\x1f" + job->language()
-         + "\x1f" + toString(job->argFlags());
+    /* Length-prefixed components: no in-band separator can be forged by a
+       component that happens to contain the separator byte.  */
+    ostringstream key;
+    const string parts[] = { job->fileName(), job->targetPlatform(), env,
+                             job->language(), toString(job->argFlags()) };
+    for (const string &part : parts) {
+        key << part.size() << ':' << part;
+    }
+    return key.str();
 }
 
 static uint64_t estimate_job_real_msec(const Job *job)
@@ -235,7 +248,7 @@ static uint64_t estimate_job_real_msec(const Job *job)
        retention window describes a build configuration that may no longer
        exist (toolchain change, different branch).  Fall back rather than
        let stale data order today's queue indefinitely.  */
-    if (time(nullptr) - it->second.last_update > max_runtime_estimate_age_s) {
+    if (icecream_monotonic_seconds() - it->second.last_update > max_runtime_estimate_age_s) {
         ++runtime_estimate_stale;
         return fallback;
     }
@@ -258,16 +271,22 @@ static uint64_t estimate_job_real_msec(const Job *job)
    about.  */
 static const time_t max_queue_wait_promotion_s = 60;
 
-static uint64_t estimate_job_queue_score(const Job *job, time_t now)
+static uint64_t estimate_job_queue_score(const Job *job, uint64_t now_mono_msec)
 {
     if (!job) {
         return 0;
     }
 
-    const uint64_t estimate_msec = estimate_job_real_msec(job);
-    time_t queue_age_s = now - job->enqueueTime();
-    if (queue_age_s < 0) {
-        queue_age_s = 0;
+    /* The estimate was frozen at enqueue (see Job::estimateSnapshotMsec):
+       the rank of a queued job never drifts, each decision is reproducible,
+       and the scan does not touch the estimates map at all.  */
+    uint64_t estimate_msec = job->estimateSnapshotMsec();
+    if (!estimate_msec) {
+        estimate_msec = estimate_job_real_msec(job);
+    }
+    uint64_t queue_age_msec = 0;
+    if (now_mono_msec > job->enqueueMonoMsec()) {
+        queue_age_msec = now_mono_msec - job->enqueueMonoMsec();
     }
 
     /* The age bonus is deliberately UNBOUNDED: with a cap of one estimate a
@@ -276,7 +295,6 @@ static uint64_t estimate_job_queue_score(const Job *job, time_t now)
        every queued request eventually outranks any fixed-estimate newcomer,
        trading a little long-job throughput for a hard no-starvation
        property.  Niceness remains the first-order key (group ordering). */
-    const uint64_t queue_age_msec = uint64_t(queue_age_s) * 1000ULL;
     return estimate_msec + queue_age_msec / 2;
 }
 
@@ -296,7 +314,7 @@ static void add_runtime_estimate(const Job *job, unsigned long real_msec)
     if (estimate.samples < std::numeric_limits<uint32_t>::max()) {
         ++estimate.samples;
     }
-    estimate.last_update = time(nullptr);
+    estimate.last_update = icecream_monotonic_seconds();
 
     /* Touch: move (or insert) this key at the back of the recency list and
        remember where it sits, so eviction is O(1) instead of a linear scan
@@ -602,6 +620,9 @@ static Job *create_new_job(CompileServer *submitter)
 
 static void enqueue_job_request(Job *job)
 {
+    if (!job->estimateSnapshotMsec()) {
+        job->setEstimateSnapshotMsec(estimate_job_real_msec(job));
+    }
     for( list<JobRequestsGroup*>::iterator it = job_requests.begin(); it != job_requests.end(); ++it ) {
         if( (*it)->submitter == job->submitter() && (*it)->niceness == job->niceness()) {
             (*it)->l.push_back(job);
@@ -685,7 +706,7 @@ static JobRequestPosition get_first_job_request()
     const int best_niceness = job_requests.front()->niceness;
     JobRequestPosition best;
     uint64_t best_score = 0;
-    const time_t now = time(nullptr);
+    const uint64_t now_mono_msec = icecream_monotonic_msec();
 
     /* Deadline-first LPT within the active niceness: any request that has
        waited longer than the promotion interval outranks all normal
@@ -693,7 +714,7 @@ static JobRequestPosition get_first_job_request()
        the estimate-weighted score chooses, which keeps the
        longest-processing-time behaviour that shortens makespan.  */
     JobRequestPosition overdue;
-    time_t overdue_enqueue = 0;
+    uint64_t overdue_enqueue_mono = 0;
 
     for (JobRequestsGroup *group : job_requests) {
         if (group->niceness != best_niceness) {
@@ -710,16 +731,17 @@ static JobRequestPosition get_first_job_request()
             continue;
         }
         for (Job *job : group->l) {
-            if (now - job->enqueueTime() >= max_queue_wait_promotion_s) {
-                if (!overdue.isValid() || job->enqueueTime() < overdue_enqueue
-                        || (job->enqueueTime() == overdue_enqueue
+            if (now_mono_msec - job->enqueueMonoMsec()
+                    >= uint64_t(max_queue_wait_promotion_s) * 1000ULL) {
+                if (!overdue.isValid() || job->enqueueMonoMsec() < overdue_enqueue_mono
+                        || (job->enqueueMonoMsec() == overdue_enqueue_mono
                             && job->id() < overdue.job->id())) {
                     overdue = JobRequestPosition(group, job);
-                    overdue_enqueue = job->enqueueTime();
+                    overdue_enqueue_mono = job->enqueueMonoMsec();
                 }
                 continue;
             }
-            const uint64_t score = estimate_job_queue_score(job, now);
+            const uint64_t score = estimate_job_queue_score(job, now_mono_msec);
             if (!best.isValid() || score > best_score
                     || (score == best_score && job->id() < best.job->id())) {
                 best = JobRequestPosition(group, job);
@@ -1512,6 +1534,15 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
     if (host_platform.empty()) {
         gotit = false;
         host_platform = use_cs->can_install(job);
+    }
+
+    /* Record which toolchain actually runs this job: the offer matching the
+       chosen host platform.  Runtime estimates are keyed on it.  */
+    for (const auto &e : job->environments()) {
+        if (e.first == host_platform) {
+            job->setSelectedEnvironment(e.second);
+            break;
+        }
     }
 
     // mix and match between job ids
