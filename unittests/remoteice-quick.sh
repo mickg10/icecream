@@ -71,9 +71,17 @@ mkdir -p "$work/env" "$work/envs-remote" "$work/envs-local"
 
 # As root the services drop to their own unprivileged user BEFORE opening
 # logs or installing environments; mktemp's 0700 root-owned directories
-# would silently eat both.  /tmp semantics for the private dirs fix it.
+# would silently eat both.  /tmp semantics for the shared dirs fix that.
+# The env basedirs additionally need to be OWNED by the daemon's compile
+# user: with libcap-ng the daemon keeps only CAP_SYS_CHROOT after the
+# drop, so cleanup_cache()'s chown on a root-owned basedir is EPERM and
+# fatal -- production works because /var/cache/icecream is owned by that
+# user, and the test mirrors it.
 if [ "$(id -u)" = 0 ]; then
-    chmod 1777 "$work" "$sockdir" "$work/envs-remote" "$work/envs-local"
+    chmod 1777 "$work" "$sockdir"
+    ICEUSER=nobody
+    id -u icecc >/dev/null 2>&1 && ICEUSER=icecc
+    chown "$ICEUSER" "$work/envs-remote" "$work/envs-local"
 fi
 ( cd "$work/env" && bash "$top/client/icecc-create-env" "$(command -v gcc)" \
       >"$work/create-env.log" 2>&1 )
