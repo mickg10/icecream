@@ -42,20 +42,52 @@ class MsgChannel;
 extern std::string remote_daemon;
 extern std::string invocation_cmdline;
 
+/* Explicit phase records replace zero-sentinel timestamps: zero is both a
+   valid sub-millisecond offset and "unset", which made a fast invocation
+   indistinguishable from an unfinished one and let a remote-then-local
+   fallback overwrite its own history.  Each phase carries a validity flag,
+   and the fallback path records its own boundaries instead of mutating the
+   remote ones.  */
+struct InvocationPhase
+{
+    uint32_t msec = 0;
+    bool valid = false;
+
+    void mark(uint32_t at)
+    {
+        if (!valid) {
+            msec = at;
+            valid = true;
+        }
+    }
+};
+
+/* How the invocation actually ended, kept separate from timing so failure
+   accounting cannot be inferred from durations.  */
+enum InvocationOutcome
+{
+    InvocationCompilerCompleted = 0,   // a compiler ran and returned a status
+    InvocationTransportLost = 1,       // remote attempt lost before a result
+    InvocationCancelled = 2
+};
+
 struct InvocationTiming
 {
     uint32_t submit_ts;
     uint64_t submit_msec;
-    uint32_t enqueue_msec;
-    uint32_t start_msec;
-    uint32_t finish_msec;
-    uint32_t waitforcs_msec;
-    uint32_t local_queue_msec;
-    uint32_t exec_msec;
+    // phase boundaries, all relative to submit
+    InvocationPhase remote_enqueue;      // GetCS sent to the local daemon
+    InvocationPhase assignment;          // UseCS received
+    InvocationPhase remote_attempt_end;  // remote path gave up (fallback only)
+    InvocationPhase fallback_enqueue;    // local fallback queued
+    InvocationPhase local_start;         // local compiler started
+    InvocationPhase finish;              // invocation finished
     uint32_t scheduler_job_id;
     uint32_t compile_job_id;
     int exitcode;
-    std::string mode;
+    InvocationOutcome outcome;
+    std::string mode;       // first mode entered, never overwritten
+    bool fell_back;         // remote attempted, then local
     bool sent;
 };
 
@@ -64,7 +96,9 @@ extern uint64_t invocation_now_msec();
 extern void invocation_timing_reset();
 extern void invocation_timing_mark_enqueue(const std::string &mode = std::string());
 extern void invocation_timing_mark_start(const std::string &mode = std::string());
-extern void invocation_timing_mark_finish(int exitcode);
+extern void invocation_timing_mark_fallback();
+extern void invocation_timing_mark_finish(int exitcode,
+        InvocationOutcome outcome = InvocationCompilerCompleted);
 extern void invocation_timing_set_scheduler_job_id(uint32_t job_id);
 extern void invocation_timing_set_compile_job_id(uint32_t job_id);
 extern bool invocation_timing_send(MsgChannel *local_daemon);

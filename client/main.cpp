@@ -728,6 +728,9 @@ int main(int argc, char **argv)
 
         /* Inform the daemon that we like to start a job.  */
         if (invocation_timing.mode.find("remote") != std::string::npos) {
+            /* Close the remote attempt explicitly, then record the local
+               fallback's own phases -- the remote timestamps stay intact.  */
+            invocation_timing_mark_fallback();
             invocation_timing_mark_enqueue("fallback_local");
         } else {
             invocation_timing_mark_enqueue("local");
