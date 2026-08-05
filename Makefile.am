@@ -1,4 +1,18 @@
-EXTRA_DIST = README.md
+# Ship the branch's documentation, tooling, packaging and integration
+# suites: none of these live under a SUBDIRS Makefile.am, so without
+# explicit entries `make dist` silently produced a tarball missing the very
+# tests and tools the reports describe.
+EXTRA_DIST = README.md \
+	AUDIT-ISSUE-1.md \
+	DEPLOYMENT-MATRIX.md \
+	PERF-REPORT.md \
+	WEBGUI-REVIEW.md \
+	GNUmakefile \
+	log_extractor \
+	package_builder \
+	tests/compose \
+	tests/stress \
+	tests/webgui
 
 ACLOCAL_AMFLAGS = -I m4
 AM_LIBTOOLFLAGS = --silent
