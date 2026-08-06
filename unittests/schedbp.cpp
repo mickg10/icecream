@@ -255,6 +255,12 @@ int main(int argc, char **argv)
        reply integrity, responsiveness bounds and the phase distributions
        remain.  */
     const bool perf_mode = argc > 5 && strcmp(argv[5], "perf") == 0;
+    /* "multicount": one GetCS asking for N jobs must yield exactly N
+       replies.  The scheduler materialises at most a bounded number per
+       main-loop iteration and resumes the remainder on later iterations;
+       dropping the tail would silently break the wire contract (count is
+       the number of replies the caller waits for).  njobs is the count.  */
+    const bool multicount_mode = argc > 5 && strcmp(argv[5], "multicount") == 0;
     /* Optional farm size (argv[6], gate mode): the fake compile server
        advertises exactly this many slots instead of "always enough".  The
        scheduler then clamps the per-submitter dispatch credit to slots-1,
@@ -624,6 +630,59 @@ int main(int argc, char **argv)
             break;
         }
         delete m;
+    }
+
+    if (multicount_mode) {
+        fprintf(stderr, "# requesting ONE message with count=%d\n", njobs);
+        GetCSMsg gcs(Environments{std::make_pair(std::string(kPlatform), std::string(kEnv))},
+                     "multicount.cpp", CompileJob::Lang_CXX, (unsigned)njobs,
+                     kPlatform, 0, std::string(), 0, 0, 0);
+        gcs.client_id = 1;
+        if (!sub->send_msg(gcs)) {
+            fprintf(stderr, "FAILED   - submitter died sending the multi-count request\n");
+            ++failures;
+        }
+        /* Collect replies until the count is satisfied or we give up.  */
+        int replies = 0;
+        const Clock::time_point t0 = Clock::now();
+        while (replies < njobs && secs_since(t0) < 60) {
+            Msg *m = sub->get_msg(2);
+            if (!m) {
+                continue;
+            }
+            if (MSG_IS(m, USE_CS)) {
+                UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                if (u) {
+                    confirm_job(u->job_id);   // release the dispatch credit
+                }
+                ++replies;
+            } else if (MSG_IS(m, NO_CS)) {
+                NoCSMsg *n = dynamic_cast<NoCSMsg *>(m);
+                if (n) {
+                    confirm_job(n->job_id);
+                }
+                ++replies;
+            }
+            delete m;
+        }
+        fprintf(stderr, "# replies for count=%d: %d\n", njobs, replies);
+        REQUIRE(replies == njobs,
+                "a count=N request yields exactly N replies (resumable expansion)");
+        REQUIRE(worst_reply.load() < 5.0, "scheduler stayed responsive");
+        shutdown = true;
+        probe_thread.join();
+        cs_thread.join();
+        healthy_thread.join();
+        close(ctrl);
+        delete sub; delete sub2; delete cs;
+        kill(sched, SIGTERM);
+        waitpid(sched, nullptr, 0);
+        if (failures) {
+            fprintf(stderr, "RESULT: FAIL (%d)\n", failures);
+            return 1;
+        }
+        fprintf(stderr, "RESULT: PASS\n");
+        return 0;
     }
 
     fprintf(stderr, "# requesting %d jobs\n", njobs);

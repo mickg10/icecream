@@ -493,7 +493,21 @@ static int inbound_budget_remaining = max_inbound_units_per_loop;
 /* Set when a read path stops with data still buffered in userspace, where
    poll() cannot see it; consumed by the next iteration's timeout choice.  */
 static bool has_buffered_inbound = false;
-static const unsigned int max_jobs_per_request = 64;
+/* Jobs materialised from one GetCS message per loop iteration.  The rest of
+   the request is NOT discarded -- discarding would silently break the wire
+   contract (count is the number of UseCS replies the caller waits for).  A
+   pending-expansion record carries the decoded request and a cursor, and the
+   remainder is materialised on later iterations until the original count is
+   fulfilled.  */
+static const unsigned int max_jobs_per_expansion_step = 64;
+
+struct PendingExpansion {
+    GetCSMsg msg;                 // decoded request, retained verbatim
+    unsigned int next_index;      // how many jobs have been created so far
+    PendingExpansion(const GetCSMsg &m) : msg(m), next_index(0) {}
+};
+/* Keyed by the submitter's channel fd; erased on teardown (handle_end).  */
+static map<int, PendingExpansion *> pending_expansions;
 static uint64_t jobs_admitted_total = 0;   // lifetime; exposed via 'estimates'
 
 static bool handle_activity(CompileServer *cs);
@@ -765,6 +779,43 @@ static bool submitter_accepts_dispatch(CompileServer *submitter)
         && submitter->outstandingDispatches() < effective_dispatch_credit();
 }
 
+static bool handle_cs_request(MsgChannel *cs, Msg *_m);
+
+/* Resume any request whose expansion was cut short by the loop budget.  A
+   caller that asked for N replies still gets N; the work is merely spread
+   across iterations.  Returns true if anything remains for a later turn.  */
+static bool expand_pending_requests()
+{
+    bool more = false;
+    for (map<int, PendingExpansion *>::iterator it = pending_expansions.begin();
+            it != pending_expansions.end();) {
+        const int fd = it->first;
+        PendingExpansion *pe = it->second;
+        map<int, CompileServer *>::const_iterator cit = fd2cs.find(fd);
+        if (cit == fd2cs.end()) {
+            delete pe;                      // submitter gone; drop the record
+            pending_expansions.erase(it++);
+            continue;
+        }
+        ++it;
+        if (inbound_budget_remaining <= 0) {
+            more = true;
+            continue;
+        }
+        /* handle_cs_request() picks up at next_index and rewrites the record
+           (or erases it when the count is fulfilled).  */
+        GetCSMsg resume(pe->msg);
+        resume.count = pe->msg.count - pe->next_index;
+        pending_expansions.erase(fd);
+        delete pe;
+        handle_cs_request(cit->second, &resume);
+        if (pending_expansions.find(fd) != pending_expansions.end()) {
+            more = true;
+        }
+    }
+    return more;
+}
+
 static JobRequestPosition get_first_job_request()
 {
     if (job_requests.empty()) {
@@ -917,17 +968,27 @@ static bool handle_cs_request(MsgChannel *cs, Msg *_m)
 
     Job *master_job = nullptr;
 
-    /* Multi-job requests are charged per job (see drain_connection) and
-       capped: one message must not be able to enqueue an unbounded batch
-       between two poll() calls.  */
+    /* Materialise as many jobs as the loop budget allows; any remainder is
+       retained and resumed (see expand_pending_requests), so the caller
+       still receives exactly m->count replies.  */
     unsigned int count = m->count;
-    if (count > max_jobs_per_request) {
-        log_warning() << "capping " << count << "-job request from "
-                      << submitter->nodeName() << " at " << max_jobs_per_request
-                      << endl;
-        count = max_jobs_per_request;
+    if (count == 0) {
+        count = 1;
     }
+    unsigned int made = 0;
     for (unsigned int i = 0; i < count; ++i) {
+        if (made >= max_jobs_per_expansion_step
+                || (made > 0 && inbound_budget_remaining - int(made) <= 0)) {
+            /* Stop here and remember the rest.  At least one job is always
+               made so a request cannot starve.  */
+            PendingExpansion *&slot = pending_expansions[submitter->fd];
+            if (!slot) {
+                slot = new PendingExpansion(*m);
+            }
+            slot->next_index = i;
+            break;
+        }
+        ++made;
         ++jobs_admitted_total;
         Job *job = create_new_job(submitter);
         job->setEnvironments(m->versions);
@@ -3256,13 +3317,22 @@ int main(int argc, char *argv[])
            which poll() cannot report, so a zero-timeout poll returns 0 and
            those messages would never be serviced.  */
         for (size_t ri = 0; ri < ready_fds.size() && (active_fds > 0 || service_buffered); ++ri) {
+            if (inbound_budget_remaining <= 0 && service_buffered) {
+                /* Budget spent: stop walking.  Continuing would assign the
+                   cursor for every remaining fd and land it back where it
+                   started, so a persistently buffered early connection would
+                   spend the whole budget again next iteration while later
+                   ones never got a turn.  */
+                has_buffered_inbound = true;
+                break;
+            }
             const int i = ready_fds[ri];
             map<int, CompileServer *>::const_iterator live = fd2cs.find(i);
             if (live == fd2cs.end()) {
                 continue;    // erased since the snapshot
             }
             CompileServer *cs = live->second;
-            inbound_cursor_fd = i;
+            const int budget_before_fd = inbound_budget_remaining;
 
             /* pollfd_is_set() also reports POLLERR/POLLHUP as "set" (its
                check_errors default) -- deliberate here: an errored channel
@@ -3289,9 +3359,23 @@ int main(int argc, char *argv[])
                 }
             }
 
-            if (can_read && !drain_connection(cs, &has_buffered_inbound)) {
+            const bool alive_after = !can_read
+                                     || drain_connection(cs, &has_buffered_inbound);
+            if (inbound_budget_remaining < budget_before_fd) {
+                /* Only a connection that actually consumed work advances the
+                   cursor, so the next iteration resumes after it rather than
+                   restarting the same cycle.  */
+                inbound_cursor_fd = i;
+            }
+            if (!alive_after) {
                 continue;    // connection deleted by a handler
             }
+        }
+
+        /* Finish any request whose expansion the budget cut short, so the
+           caller receives its full reply count.  */
+        if (expand_pending_requests()) {
+            has_buffered_inbound = true;   // keep the loop awake for the rest
         }
 
         for (list<CompileServer *>::const_iterator it = cs_in_tsts.begin();
