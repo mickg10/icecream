@@ -81,6 +81,7 @@
 #include <cstring>
 #include <ctime>
 #include <map>
+#include <set>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -185,6 +186,10 @@ static int tcp_connect(int port, int rcvbuf)
    what makes it honest: the global counter includes the healthy
    submitter's concurrent traffic, which inflated every delta by ~4.  */
 static long long query_submitter_field(int port, const char *name, const char *field);
+/* Same round trip for an arbitrary control command: returns the numeric
+   value of `field` on the first reply line containing `needle`.  */
+static long long query_control_field(int port, const char *command,
+                                     const char *needle, const char *field);
 
 static long long query_submitter_admitted(int port, const char *name)
 {
@@ -202,6 +207,54 @@ static long long query_submitter_generation(int port, const char *name)
 static long long query_submitter_outstanding(int port, const char *name)
 {
     return query_submitter_field(port, name, "outstanding=");
+}
+
+static long long query_control_field(int port, const char *command,
+                                     const char *needle_str, const char *field)
+{
+    const int fd = tcp_connect(port + 1, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    char buf[16384];
+    struct pollfd pfd = { fd, POLLIN, 0 };
+    if (poll(&pfd, 1, 5000) > 0) {
+        ssize_t n = read(fd, buf, sizeof(buf));
+        (void)n;
+    }
+    long long value = -1;
+    std::string cmdline = std::string(command) + "\n";
+    if (write(fd, cmdline.c_str(), cmdline.size()) == (ssize_t)cmdline.size()) {
+        std::string reply;
+        const Clock::time_point t0 = Clock::now();
+        while (secs_since(t0) < 5) {
+            struct pollfd rp = { fd, POLLIN, 0 };
+            if (poll(&rp, 1, 200) <= 0) {
+                continue;
+            }
+            const ssize_t n = read(fd, buf, sizeof(buf) - 1);
+            if (n <= 0) {
+                break;
+            }
+            buf[n] = 0;
+            reply += buf;
+            if (reply.find("200 done") != std::string::npos) {
+                break;
+            }
+        }
+        size_t pos = reply.find(needle_str);
+        if (pos != std::string::npos) {
+            const size_t eol = reply.find('\n', pos);
+            const std::string line = reply.substr(pos, eol == std::string::npos
+                                                       ? std::string::npos : eol - pos);
+            const size_t sp = line.find(field);
+            if (sp != std::string::npos) {
+                value = atoll(line.c_str() + sp + strlen(field));
+            }
+        }
+    }
+    close(fd);
+    return value;
 }
 
 static long long query_submitter_field(int port, const char *name, const char *field)
@@ -1039,47 +1092,96 @@ int main(int argc, char **argv)
                     "admitted counter moved by exactly the two real counts (count=0 admitted nothing)");
         }
 
-        // ---- case 5: sibling chain identical across resume steps
+        // ---- case 5: request-lifetime environment pinning at count=2000
+        // The request offers TWO environments; dispatching the master pins
+        // every sibling to the master's choice.  The observable is the
+        // scheduler's own queue: after the first reply, listrequests must
+        // show ZERO queued siblings still carrying several environments.
+        // The id-based anchor reproducibly failed here (255 chained / 1744
+        // broken): the master dispatched and completed between admission
+        // steps and every later sibling escaped the pinning.  master= log
+        // lines stay as a diagnostic; the queue census is the semantic
+        // oracle.
         {
-            std::map<unsigned, unsigned> master_of;   // job id -> logged master id
+            const unsigned big = 2000;
+            GetCSMsg g(Environments{
+                           std::make_pair(std::string(kPlatform), std::string(kEnv)),
+                           std::make_pair(std::string(kPlatform), std::string("testenv2"))},
+                       "pinning.cpp", CompileJob::Lang_CXX, big, kPlatform, 0,
+                       std::string(), 0, 0, 0);
+            g.client_id = 501;
+            REQUIRE(sub->send_msg(g), "count=2000 dual-environment request sent");
+
+            std::vector<unsigned> big_ids;
+            unsigned first_id = 0;
+            bool census_taken = false;
+            long long census_multi = -1, census_count = -1;
+            const Clock::time_point t0 = Clock::now();
+            while (big_ids.size() < big && secs_since(t0) < 240) {
+                Msg *m = sub->get_msg(2);
+                if (!m) { continue; }
+                unsigned jid = 0;
+                if (MSG_IS(m, USE_CS)) {
+                    UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                    if (u && u->client_id == 501) { jid = u->job_id; }
+                } else if (MSG_IS(m, NO_CS)) {
+                    NoCSMsg *n = dynamic_cast<NoCSMsg *>(m);
+                    if (n && n->client_id == 501) { jid = n->job_id; }
+                }
+                if (jid) {
+                    big_ids.push_back(jid);
+                    confirm_job(jid);
+                    if (!first_id || jid < first_id) { first_id = jid; }
+                    if (!census_taken) {
+                        /* First reply: the master has been dispatched, so
+                           the narrowing has run.  Census the queue NOW,
+                           while ~1900+ siblings are still queued.  */
+                        census_taken = true;
+                        census_multi = query_control_field(port, "listrequests",
+                                                           "submitter=fakesub ", "multi_env=");
+                        census_count = query_control_field(port, "listrequests",
+                                                           "submitter=fakesub ", "count=");
+                    }
+                }
+                delete m;
+            }
+            fprintf(stderr, "# contract: pinning replies=%zu/%u census count=%lld multi_env=%lld\n",
+                    big_ids.size(), big, census_count, census_multi);
+            REQUIRE(big_ids.size() == big, "count=2000 yields exactly 2000 replies");
+            REQUIRE(census_taken && census_count >= 1000,
+                    "the census sampled a still-loaded queue (test precondition)");
+            REQUIRE(census_multi == 0,
+                    "no queued sibling still carries several environments (request-lifetime pinning)");
+
+            std::map<unsigned, unsigned> master_of;
             FILE *lf = fopen(sched_log.c_str(), "r");
             if (lf) {
                 char line[4096];
                 while (fgets(line, sizeof(line), lf)) {
                     const char *nw = strstr(line, "NEW ");
-                    if (!nw) {
-                        continue;
+                    const char *ms = nw ? strstr(nw, " master=") : nullptr;
+                    if (nw && ms) {
+                        master_of[(unsigned)atoi(nw + 4)] = (unsigned)atoi(ms + 8);
                     }
-                    const char *ms = strstr(nw, " master=");
-                    if (!ms) {
-                        continue;
-                    }
-                    master_of[(unsigned)atoi(nw + 4)] = (unsigned)atoi(ms + 8);
                 }
                 fclose(lf);
             }
-            unsigned min1 = ~0u;
-            for (unsigned id : ids1) { if (id < min1) { min1 = id; } }
             int chained = 0, broken = 0;
-            for (unsigned id : ids1) {
-                if (id == min1) {
-                    continue;             // the master itself carries no tag
-                }
+            for (unsigned id : big_ids) {
+                if (id == first_id) { continue; }
                 std::map<unsigned, unsigned>::const_iterator mit = master_of.find(id);
-                if (mit != master_of.end() && mit->second == min1) {
-                    ++chained;
-                } else {
-                    ++broken;
-                }
+                if (mit != master_of.end() && mit->second == first_id) { ++chained; }
+                else { ++broken; }
             }
-            fprintf(stderr, "# contract: master chain %d chained / %d broken (master=%u)\n",
-                    chained, broken, min1);
-            REQUIRE(broken == 0 && chained == (int)c1 - 1,
-                    "every resumed job of request A logs the ORIGINAL master id");
+            fprintf(stderr, "# contract: master chain %d chained / %d broken (diagnostic)\n",
+                    chained, broken);
+            REQUIRE(broken == 0 && chained == (int)big - 1,
+                    "every sibling logs the ORIGINAL master id (diagnostic)");
         }
 
         // ---- case 4: disconnect mid-expansion, then a fresh connection
         {
+            long long doomed_generation = -1;
             MsgChannel *subC = connect_daemon(port, 0);
             REQUIRE(subC != nullptr, "doomed daemon connected");
             if (subC) {
@@ -1088,22 +1190,49 @@ int main(int argc, char **argv)
                 login.max_kids = 0;
                 login.noremote = true;
                 REQUIRE(subC->send_msg(login), "doomed daemon logged in");
-                REQUIRE(send_count(subC, 200, 301, "contractD.cpp"),
-                        "doomed daemon requested count=200");
-                int seen = 0;
-                const Clock::time_point t0 = Clock::now();
-                while (seen < 10 && secs_since(t0) < 30) {
-                    Msg *m = subC->get_msg(2);
-                    if (!m) {
-                        continue;
+                /* The precondition must be OBSERVED, not assumed: the first
+                   version of this case waited for ten replies, and the log
+                   showed all 200 admissions had completed long before the
+                   close.  Even counter polling loses the race -- a 2000-job
+                   admission finishes in tens of milliseconds.  Deterministic
+                   variant: close IMMEDIATELY after sending, so the FIN is
+                   read in the same drain as the first 64-job quantum and
+                   teardown provably interrupts the expansion; the scheduler
+                   log then shows how many NEW records the request got, and
+                   the assertion holds that number strictly inside
+                   (0, requested).  The generation stamps are the connection
+                   identities: the successor must carry a LATER one.  */
+                {
+                    const Clock::time_point tg = Clock::now();
+                    while (secs_since(tg) < 10
+                           && (doomed_generation =
+                               query_submitter_generation(port, "fakesub4")) < 0) {
+                        usleep(50 * 1000);
                     }
-                    if (MSG_IS(m, USE_CS) || MSG_IS(m, NO_CS)) {
-                        ++seen;   // deliberately NOT confirmed: it is about to die
-                    }
-                    delete m;
+                    REQUIRE(doomed_generation > 0, "doomed daemon registered (generation read)");
                 }
-                REQUIRE(seen == 10, "doomed daemon saw the first ten replies");
-                delete subC;      // abrupt close, ~190 jobs still expanding
+                REQUIRE(send_count(subC, 2000, 301, "contractD.cpp"),
+                        "doomed daemon requested count=2000");
+                delete subC;      // abrupt close: FIN races the expansion
+                subC = nullptr;
+                usleep(500 * 1000);   // let teardown finish server-side
+                int admitted_doomed = 0;
+                {
+                    FILE *lf = fopen(sched_log.c_str(), "r");
+                    if (lf) {
+                        char line[4096];
+                        while (fgets(line, sizeof(line), lf)) {
+                            if (strstr(line, "NEW ") && strstr(line, "contractD.cpp")) {
+                                ++admitted_doomed;
+                            }
+                        }
+                        fclose(lf);
+                    }
+                }
+                fprintf(stderr, "# contract: teardown with admitted=%d/2000 (gen=%lld)\n",
+                        admitted_doomed, doomed_generation);
+                REQUIRE(admitted_doomed >= 64 && admitted_doomed <= 1900,
+                        "teardown demonstrably interrupted the expansion (0 < admitted < requested)");
             }
 
             /* The very next accept() is the natural fd-reuse candidate.  */
@@ -1115,6 +1244,17 @@ int main(int argc, char **argv)
                 login.max_kids = 0;
                 login.noremote = true;
                 REQUIRE(subD->send_msg(login), "successor logged in");
+                {
+                    long long g5 = -1;
+                    const Clock::time_point tg = Clock::now();
+                    while (secs_since(tg) < 10
+                           && (g5 = query_submitter_generation(port, "fakesub5")) < 0) {
+                        usleep(100 * 1000);
+                    }
+                    fprintf(stderr, "# contract: successor gen=%lld (doomed gen was earlier)\n", g5);
+                    REQUIRE(g5 > doomed_generation && doomed_generation > 0,
+                            "the successor carries a LATER connection generation (distinct identity)");
+                }
                 int unsolicited = 0;
                 const Clock::time_point t0 = Clock::now();
                 while (secs_since(t0) < 4) {
@@ -1150,6 +1290,90 @@ int main(int argc, char **argv)
                 REQUIRE(got == 5, "successor's own request works normally");
                 delete subD;
             }
+        }
+
+        // ---- case 6: pending-vs-ingress fairness under two LONG expansions
+        // Two daemons expand count=4000 each while the main connection
+        // submits thirty count=1 requests.  Each small request must
+        // complete within a bounded interval WHILE the large expansions are
+        // in flight -- eventual completion (case 3) is not fairness.  The
+        // explicit service bound: a pending-first turn spends at most one
+        // 64-job quantum, so ingress and the control plane always get the
+        // rest of the budget.
+        {
+            const unsigned bigN = 4000;
+            std::atomic<int> repliesF1{0}, repliesF2{0};
+            auto big_daemon = [&](const char *name, unsigned cid,
+                                  std::atomic<int> *counter) {
+                MsgChannel *ch = connect_daemon(port, 0);
+                if (!ch) { return; }
+                LoginMsg login(0, name, kPlatform, 0);
+                login.envs.push_back(std::make_pair(kPlatform, kEnv));
+                login.max_kids = 0;
+                login.noremote = true;
+                if (!ch->send_msg(login)) { delete ch; return; }
+                GetCSMsg g(Environments{std::make_pair(std::string(kPlatform), std::string(kEnv))},
+                           "fair.cpp", CompileJob::Lang_CXX, bigN, kPlatform, 0,
+                           std::string(), 0, 0, 0);
+                g.client_id = cid;
+                if (!ch->send_msg(g)) { delete ch; return; }
+                const Clock::time_point t0 = Clock::now();
+                while (*counter < (int)bigN && secs_since(t0) < 240) {
+                    Msg *m = ch->get_msg(2);
+                    if (!m) { continue; }
+                    if (MSG_IS(m, USE_CS)) {
+                        UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                        if (u && u->client_id == cid) {
+                            confirm_job(u->job_id);
+                            ++*counter;
+                        }
+                    }
+                    delete m;
+                }
+                delete ch;
+            };
+            std::thread f1([&] { big_daemon("fakesub7", 701, &repliesF1); });
+            std::thread f2([&] { big_daemon("fakesub8", 801, &repliesF2); });
+
+            usleep(200 * 1000);   // both expansions demonstrably in flight
+            int slow = 0;
+            double worst_small = 0;
+            for (int i = 0; i < 30; ++i) {
+                char fname[32];
+                snprintf(fname, sizeof(fname), "small%d.cpp", i);
+                REQUIRE(send_count(sub, 1, 9500 + i, fname), "small request sent");
+                const Clock::time_point ts = Clock::now();
+                unsigned jid = 0;
+                while (jid == 0 && secs_since(ts) < 10) {
+                    Msg *m = sub->get_msg(1);
+                    if (!m) { continue; }
+                    unsigned cid = 0;
+                    if (MSG_IS(m, USE_CS)) {
+                        UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                        if (u) { cid = u->client_id; if (cid == 9500u + i) { jid = u->job_id; } }
+                        if (u && cid != 9500u + i) { confirm_job(u->job_id); }
+                    } else if (MSG_IS(m, NO_CS)) {
+                        NoCSMsg *n = dynamic_cast<NoCSMsg *>(m);
+                        if (n) { cid = n->client_id; if (cid == 9500u + i) { jid = n->job_id; } }
+                    }
+                    delete m;
+                }
+                const double took = secs_since(ts);
+                if (took > worst_small) { worst_small = took; }
+                if (jid) { confirm_job(jid); } else { ++slow; }
+                if (took > 3.0) { ++slow; }
+                usleep(100 * 1000);
+            }
+            f1.join();
+            f2.join();
+            fprintf(stderr, "# contract: fairness big=%d+%d/%u small worst=%.2fs slow=%d\n",
+                    repliesF1.load(), repliesF2.load(), bigN, worst_small, slow);
+            REQUIRE(repliesF1 == (int)bigN && repliesF2 == (int)bigN,
+                    "both long expansions completed exactly");
+            REQUIRE(slow == 0,
+                    "every small request completed within its bounded interval during the expansions");
+            REQUIRE(worst_reply.load() < 5.0,
+                    "control latency stayed bounded while the large requests were incomplete");
         }
 
         REQUIRE(worst_reply.load() < 5.0, "scheduler stayed responsive throughout");

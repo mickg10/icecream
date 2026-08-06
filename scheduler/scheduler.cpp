@@ -504,10 +504,19 @@ static const unsigned int max_jobs_per_expansion_step = 64;
 struct PendingExpansion {
     GetCSMsg msg;                 // decoded request, retained verbatim
     unsigned int next_index;      // how many jobs have been created so far
-    unsigned int master_job_id;   // sibling-chain anchor; 0 until the first
-                                  // job exists (or after the master ended)
+    /* Jobs created so far, in order, NOT yet eligible for dispatch.  The
+       whole sibling set is enqueued at once when the request completes: the
+       master's environment narrowing at dispatch covers exactly its
+       then-current sibling list, so a member admitted after the master
+       dispatched -- or worse, after it completed -- would never be pinned.
+       Staging recreates the released scheduler's ordering, where all N jobs
+       exist before any can be selected.  Front is the master; it cannot be
+       dispatched (or freed) while the record lives, so the anchor needs no
+       id-based re-lookup.  On teardown the submitter sweep in handle_end
+       frees these via the jobs map; the record is erased in the same call.  */
+    list<Job *> staged;
     PendingExpansion(const GetCSMsg &m)
-        : msg(m), next_index(0), master_job_id(0) {}
+        : msg(m), next_index(0) {}
 };
 /* Per-connection FIFO of unfinished requests, keyed by the submitter's
    channel fd; erased on teardown (handle_end).  A deque, not a single slot:
@@ -808,7 +817,7 @@ static bool admit_request_jobs(CompileServer *submitter, PendingExpansion &req);
    monopolise whatever budget is left -- and each serviced connection
    advances only the FRONT of its FIFO, preserving per-connection request
    order.  Returns true if anything remains for a later turn.  */
-static bool expand_pending_requests()
+static bool expand_pending_requests(bool single_quantum = false)
 {
     if (pending_expansions.empty()) {
         return false;
@@ -816,7 +825,7 @@ static bool expand_pending_requests()
 
     map<int, deque<PendingExpansion> >::iterator it =
         pending_expansions.upper_bound(pending_service_cursor);
-    const size_t rounds = pending_expansions.size();
+    const size_t rounds = single_quantum ? 1 : pending_expansions.size();
     bool more = false;
     for (size_t k = 0; k < rounds; ++k) {
         if (it == pending_expansions.end()) {
@@ -846,6 +855,9 @@ static bool expand_pending_requests()
             more = true;
             ++it;
         }
+    }
+    if (single_quantum && !pending_expansions.empty()) {
+        more = true;
     }
     return more;
 }
@@ -1000,19 +1012,13 @@ static bool admit_request_jobs(CompileServer *submitter, PendingExpansion &req)
 {
     const GetCSMsg &m = req.msg;
 
-    /* Re-anchor the sibling chain.  The master may have been dispatched and
-       finished (or its submitter's earlier jobs discarded) between steps; in
-       that case the chain degrades exactly as the released scheduler's
-       best-effort chain does when the master is dispatched first.  */
-    Job *master_job = nullptr;
-    if (req.master_job_id) {
-        map<unsigned int, Job *>::const_iterator mit = jobs.find(req.master_job_id);
-        if (mit != jobs.end()) {
-            master_job = mit->second;
-        } else {
-            req.master_job_id = 0;
-        }
-    }
+    /* The chain anchor is the front of the staged list: staged jobs are not
+       dispatchable, so the master cannot run -- let alone complete -- before
+       the last sibling is chained onto it.  (An id-based re-lookup was tried
+       first and reproducibly lost the chain for count=2000: the master
+       dispatched and finished between admission steps, and every later
+       sibling escaped its environment pinning.)  */
+    Job *master_job = req.staged.empty() ? nullptr : req.staged.front();
 
     unsigned int made = 0;
     for (unsigned int i = req.next_index; i < m.count; ++i) {
@@ -1056,7 +1062,7 @@ static bool admit_request_jobs(CompileServer *submitter, PendingExpansion &req)
         job->setMinimalHostVersion(m.minimal_host_version);
         job->setRequiredFeatures(m.required_features);
         job->setNiceness(max(0, min(20,int(m.niceness))));
-        enqueue_job_request(job);
+        req.staged.push_back(job);
         std::ostream &dbg = log_info();
         dbg << "NEW " << job->id() << " client="
             << submitter->nodeName() << " versions=[";
@@ -1076,7 +1082,6 @@ static bool admit_request_jobs(CompileServer *submitter, PendingExpansion &req)
 
         if (!master_job) {
             master_job = job;
-            req.master_job_id = job->id();
         } else {
             master_job->appendJob(job);
             /* Chain membership in the admission record: multi-count siblings
@@ -1090,6 +1095,12 @@ static bool admit_request_jobs(CompileServer *submitter, PendingExpansion &req)
     }
 
     req.next_index = m.count;
+    /* Complete: the sibling set exists in full.  Only now do the jobs become
+       eligible for dispatch, in creation order.  */
+    for (Job * const j : req.staged) {
+        enqueue_job_request(j);
+    }
+    req.staged.clear();
     return true;
 }
 
@@ -2382,9 +2393,25 @@ static bool handle_line(CompileServer *cs, Msg *_m)
             if (oldest_age_s < 0) {
                 oldest_age_s = 0;
             }
+            /* Environment-narrowing observable: a multi-count request's
+               siblings are pinned to the master's environment when the
+               master is dispatched, so a queued sibling still carrying
+               SEVERAL environment choices after that is a job the pinning
+               missed.  multi_env exposes exactly that.  */
+            size_t single_env = 0;
+            size_t multi_env = 0;
+            for (Job * const j : group->l) {
+                if (j->environments().size() > 1) {
+                    ++multi_env;
+                } else {
+                    ++single_env;
+                }
+            }
             const string msg = " submitter=" + group->submitter->nodeName()
                 + " niceness=" + toString(group->niceness)
                 + " count=" + toString(group->l.size())
+                + " single_env=" + toString(single_env)
+                + " multi_env=" + toString(multi_env)
                 + " oldest_queue_age_s=" + toString((long)oldest_age_s);
             if (!cs->send_msg(TextMsg(msg))) {
                 return false;
@@ -3245,7 +3272,14 @@ int main(int argc, char *argv[])
            strict alternation, so neither side can starve the other.  */
         if (pending_expansions_starved) {
             pending_expansions_starved = false;
-            if (expand_pending_requests()) {
+            /* ONE quantum only (<= max_jobs_per_expansion_step of the fresh
+               max_inbound_units_per_loop budget): guaranteed pending
+               progress, with at least half the budget left for ingress and
+               the control plane.  Serving every pending connection here let
+               two long expansions consume the entire budget turn after
+               turn -- rotation among pending fds is not alternation between
+               pending and fresh work.  */
+            if (expand_pending_requests(true)) {
                 has_buffered_inbound = true;
             }
         }
