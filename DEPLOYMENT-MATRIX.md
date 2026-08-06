@@ -244,16 +244,13 @@ gate at three farm sizes (large, 8-slot, 16-slot): the non-reading
 submitter's per-submitter assignment count stops at the (clamped) credit
 while a healthy submitter keeps receiving assignments and replies.
 
-## 4b. fulljob policy knob
+## 4b. fulljob semantics
 
-`iceccd --fulljob-policy=compile-lane|exclusive` (default `compile-lane`)
-chooses what a fulljob's reservation means: all compile slots with the
-bounded preprocess lane still running (historical behavior, best
-throughput), or whole-node isolation (both local lanes drained before
-start, both closed while running; local admissions pause while one waits,
-remote service never does).  Use `exclusive` on submitter daemons where
-large links are memory-critical.  The active policy is logged at startup
-and visible as `fulljob_policy` in `/api/state`.
+A fulljob (e.g. a link step) starts when any compile slot is free and then
+reserves them all, while the bounded preprocess lane keeps running -- the
+historical observable behavior.  An optional whole-node "exclusive" policy
+existed briefly on this branch and was removed: extra policy surface with a
+known liveness gap, and no workload here needed it.
 
 ## 5. Reproduction
 

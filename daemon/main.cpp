@@ -833,7 +833,7 @@ void usage(const char *reason = nullptr)
         cerr << reason << endl;
     }
 
-    cerr << "usage: iceccd [-n <netname>] [-m <max_processes>] [--max-preprocess <max_preprocesses>] [--fulljob-policy <compile-lane|exclusive>] [--no-remote] [-d|--daemonize] [-l logfile] [-s <schedulerhost[:port]>]"
+    cerr << "usage: iceccd [-n <netname>] [-m <max_processes>] [--max-preprocess <max_preprocesses>] [--no-remote] [-d|--daemonize] [-l logfile] [-s <schedulerhost[:port]>]"
         " [-v[v[v]]] [-u|--user-uid <user_uid>] [-b <env-basedir>] [--cache-limit <MB>] [-N <node_name>] [-i|--interface <net_interface>] [-p|--port <port>]"
         " [--state-jsonl <path>] [--state-interval <sec>] [--state-log]"
         " [--webgui] [--webgui-port <port>] [--webgui-addr <addr>]" << endl;
@@ -857,20 +857,11 @@ unsigned int preprocess_active_processes = 0;
 // full slot reservation)
 unsigned int fulljob_active = 0;
 
-/* What a fulljob's reservation means is a resource-policy choice, not a
-   fixed truth (see aidocs divergence review, section 3):
-   - compile-lane (default): reserve every compile slot -- the historical
-     observable behavior -- while the bounded preprocess lane keeps
-     running.  Best aggregate throughput; link steps share the node with
-     lightweight preprocessing.
-   - exclusive: whole-node isolation.  The fulljob starts only when both
-     local lanes are idle and closes both while it runs; local admission
-     of other jobs pauses while one waits (remote TOCOMPILE service for
-     other submitters is deliberately NOT paused -- a local link must not
-     head-of-line-block the cluster).  Meaningful mainly on --no-remote
-     submitter daemons, where big local links live.  */
-enum FulljobPolicy { FULLJOB_COMPILE_LANE, FULLJOB_EXCLUSIVE };
-FulljobPolicy fulljob_policy = FULLJOB_COMPILE_LANE;
+/* A fulljob (e.g. a link step) reserves every compile slot -- the
+   historical observable behavior -- while the bounded preprocess lane
+   keeps running.  An optional whole-node "exclusive" policy existed
+   briefly on this branch and was removed: it was extra policy surface
+   with a known liveness gap, and nothing needed it.  */
 const size_t insights_graph_minutes = 100;
 const size_t insights_retention_minutes = 120;
 /* Wall time the daemon started: the complete-minute rate divides by the
@@ -4469,8 +4460,6 @@ std::string Daemon::dump_state_json() const
     o << "\"slots\":{";
     o << "\"max_kids\":" << max_kids << ",";
     o << "\"max_preprocess_kids\":" << max_preprocess_kids << ",";
-    o << "\"fulljob_policy\":\""
-      << (fulljob_policy == FULLJOB_EXCLUSIVE ? "exclusive" : "compile-lane") << "\",";
     o << "\"fulljob_active\":" << fulljob_active << ",";
     // (telemetry health is emitted separately below, see "telemetry")
     o << "\"current_kids\":" << current_kids << ",";
@@ -5378,21 +5367,15 @@ void Daemon::handle_old_request()
            map-iteration candidate (pointer order, not FIFO) and a
            higher-priority later-id job was rejected outright.
 
-           fulljob semantics: a fulljob reserves the ENTIRE node.  It starts
-           only when both lanes are idle, and while one is waiting at the
-           head of the queue nothing else is admitted (a drain barrier --
-           otherwise a stream of small jobs would starve it forever, or
-           preprocess work would overlap the very link step whose isolation
-           fulljob promises).  While it runs, the compile lane is blocked by
-           its full reservation and the preprocess lane by fulljob_active.  */
+           fulljob semantics: start when any compile slot is free, then
+           reserve them all (clients.active_processes += compile_limit);
+           the bounded preprocess lane keeps running alongside.  */
         /* Select the best ADMISSIBLE LINKJOB by (niceness, client_id).
            Admissibility must be part of the comparison, not a test applied
            to the global best: otherwise a blocked compile job hides an
            admissible preprocess job (and vice versa), leaving a whole lane
-           idle.  The one intentional exception is an exclusive-policy
-           fulljob at the head, which arms a drain barrier -- see below.  */
+           idle.  */
         Client *client = nullptr;
-        Client *blocked_fulljob = nullptr;
         for (const auto &it : clients) {
             Client *candidate = it.second;
             if (candidate->status != Client::LINKJOB) {
@@ -5402,28 +5385,14 @@ void Daemon::handle_old_request()
             const bool preprocess_job = candidate->local_preprocess && !candidate->fulljob;
             bool admissible;
             if (candidate->fulljob) {
-                admissible = (fulljob_policy == FULLJOB_EXCLUSIVE)
-                    ? ((current_kids + clients.active_processes) == 0
-                       && preprocess_active_processes == 0 && fulljob_active == 0)
-                    /* compile-lane: historical semantics -- start when any
-                       compile slot is free, then reserve them all; the
-                       preprocess lane is unaffected.  */
-                    : (compile_capacity && fulljob_active == 0);
+                admissible = compile_capacity && fulljob_active == 0;
             } else if (preprocess_job) {
-                admissible = preprocess_capacity
-                    && (fulljob_policy == FULLJOB_COMPILE_LANE || fulljob_active == 0);
+                admissible = preprocess_capacity;
             } else {
                 admissible = compile_capacity && fulljob_active == 0;
             }
 
             if (!admissible) {
-                if (candidate->fulljob && fulljob_policy == FULLJOB_EXCLUSIVE
-                        && (blocked_fulljob == nullptr
-                            || candidate->niceness < blocked_fulljob->niceness
-                            || (candidate->niceness == blocked_fulljob->niceness
-                                && candidate->client_id < blocked_fulljob->client_id))) {
-                    blocked_fulljob = candidate;
-                }
                 continue;
             }
 
@@ -5433,19 +5402,6 @@ void Daemon::handle_old_request()
                     && candidate->client_id < client->client_id)) {
                 client = candidate;
             }
-        }
-
-        /* Exclusive-policy drain barrier: if a waiting fulljob outranks every
-           admissible local candidate, hold LOCAL admissions so a stream of
-           smaller local jobs cannot starve it.  Remote service
-           (PENDING_USE_CS / TOCOMPILE below) always continues -- a local link
-           must never head-of-line-block the cluster.  */
-        if (blocked_fulljob
-                && (client == nullptr
-                    || blocked_fulljob->niceness < client->niceness
-                    || (blocked_fulljob->niceness == client->niceness
-                        && blocked_fulljob->client_id < client->client_id))) {
-            client = nullptr;
         }
 
         if (client) {
@@ -6380,7 +6336,6 @@ int main(int argc, char **argv)
             { "netname", 1, nullptr, 'n' },
             { "max-processes", 1, nullptr, 'm' },
             { "max-preprocess", 1, nullptr, 0 },
-            { "fulljob-policy", 1, nullptr, 0 },
             { "help", 0, nullptr, 'h' },
             { "daemonize", 0, nullptr, 'd'},
             { "log-file", 1, nullptr, 'l'},
@@ -6442,17 +6397,6 @@ int main(int argc, char **argv)
                 }
             } else if (optname == "no-remote") {
                 d.noremote = true;
-            } else if (optname == "fulljob-policy") {
-                if (optarg && strcmp(optarg, "exclusive") == 0) {
-                    fulljob_policy = FULLJOB_EXCLUSIVE;
-                } else if (optarg && strcmp(optarg, "compile-lane") == 0) {
-                    fulljob_policy = FULLJOB_COMPILE_LANE;
-                } else {
-                    log_error() << "invalid --fulljob-policy='"
-                                << (optarg ? optarg : "")
-                                << "' (expected compile-lane or exclusive)" << endl;
-                    usage();
-                }
             } else if (optname == "max-preprocess") {
                 if (optarg && *optarg) {
                     max_preprocess_processes = atoi(optarg);
@@ -6781,22 +6725,6 @@ int main(int argc, char **argv)
         max_preprocess_kids = std::min(2u * std::max(1u, max_kids), 32u);
     }
 
-    if (fulljob_policy == FULLJOB_EXCLUSIVE && !d.noremote) {
-        /* On a remote-capable daemon the barrier cannot be honoured: the
-           scheduler keeps assigning remote jobs, which refill the compile
-           lane, so the waiting fulljob may never see an idle node.  Honest
-           refusal beats a silently ineffective policy; whole-node isolation
-           belongs on --no-remote submitter daemons (where big local links
-           run).  A future version can announce the reservation to the
-           scheduler and support this everywhere.  */
-        log_error() << "--fulljob-policy=exclusive requires --no-remote "
-                    << "(a remote-capable daemon cannot drain its compile lane; "
-                    << "the scheduler keeps assigning jobs to it)" << endl;
-        usage();
-    }
-    log_info() << "fulljob policy: "
-               << (fulljob_policy == FULLJOB_EXCLUSIVE ? "exclusive (whole node)"
-                                                       : "compile-lane reservation") << endl;
     log_info() << "allowing up to " << max_kids << " active compile jobs and "
                << max_preprocess_kids << " active preprocess jobs" << endl;
 
