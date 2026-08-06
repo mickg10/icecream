@@ -990,6 +990,7 @@ static bool handle_cs_request(MsgChannel *cs, Msg *_m)
         }
         ++made;
         ++jobs_admitted_total;
+        submitter->admittedJobsIncrement();
         Job *job = create_new_job(submitter);
         job->setEnvironments(m->versions);
         job->setTargetPlatform(m->target);
@@ -2232,8 +2233,9 @@ static bool handle_line(CompileServer *cs, Msg *_m)
             sprintf(buffer, " (%s:%u) ", it->name.c_str(), it->remotePort());
             line = " " + it->nodeName() + buffer;
             line += "[" + it->hostPlatform() + "] speed=";
-            sprintf(buffer, "%.2f jobs=%d/%d load=%u", server_speed(it),
-                    it->currentJobCount(), it->maxJobs(), it->load());
+            sprintf(buffer, "%.2f jobs=%d/%d load=%u submitted=%llu", server_speed(it),
+                    it->currentJobCount(), it->maxJobs(), it->load(),
+                    (unsigned long long)it->admittedJobsTotal());
             line += buffer;
 
             if (it->busyInstalling()) {

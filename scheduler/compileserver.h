@@ -153,6 +153,11 @@ public:
     int submittedJobsCount() const;
     void submittedJobsIncrement();
     void submittedJobsDecrement();
+    /* Lifetime count of requests this submitter has had ADMITTED (jobs
+       created), as opposed to the live count above.  Monotonic, so an
+       observer can take a baseline and a delta over any window.  */
+    uint64_t admittedJobsTotal() const { return m_admittedJobsTotal; }
+    void admittedJobsIncrement() { ++m_admittedJobsTotal; }
 
     Environments compilerVersions() const;
     void setCompilerVersions(const Environments &environments);
@@ -214,6 +219,7 @@ private:
     unsigned int m_featuresSupported;
     int m_clientCount; // number of client connections the daemon has
     int m_submittedJobsCount;
+    uint64_t m_admittedJobsTotal = 0;
     unsigned int m_lastPickId;
 
     Environments m_compilerVersions;  // Available compilers

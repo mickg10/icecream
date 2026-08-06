@@ -176,6 +176,64 @@ static int tcp_connect(int port, int rcvbuf)
 /* One control-port round trip returning the scheduler's lifetime
    jobs_admitted counter, or -1 if it cannot be read.  Used to baseline and
    then observe the flood's admission from the server's own accounting.  */
+/* Per-submitter admitted total from listcs ("submitted=N" on the line
+   whose node name matches).  Scoping the barrier to the FLOOD submitter is
+   what makes it honest: the global counter includes the healthy
+   submitter's concurrent traffic, which inflated every delta by ~4.  */
+static long long query_submitter_admitted(int port, const char *name)
+{
+    const int fd = tcp_connect(port + 1, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    char buf[16384];
+    struct pollfd pfd = { fd, POLLIN, 0 };
+    if (poll(&pfd, 1, 5000) > 0) {
+        ssize_t n = read(fd, buf, sizeof(buf));
+        (void)n;
+    }
+    long long admitted = -1;
+    if (write(fd, "listcs\n", 7) == 7) {
+        std::string reply;
+        const Clock::time_point t0 = Clock::now();
+        while (secs_since(t0) < 5) {
+            struct pollfd rp = { fd, POLLIN, 0 };
+            if (poll(&rp, 1, 200) <= 0) {
+                continue;
+            }
+            const ssize_t n = read(fd, buf, sizeof(buf) - 1);
+            if (n <= 0) {
+                break;
+            }
+            buf[n] = 0;
+            reply += buf;
+            if (reply.find("200 done") != std::string::npos) {
+                break;
+            }
+        }
+        /* Find the line for THIS node.  The match must be delimiter-aware:
+           listcs prints " <node> (<ip>:<port>) ...", and "fakesub" is a
+           prefix of "fakesub2", so a bare substring search reads the wrong
+           submitter's counter -- which is exactly the mistake that made the
+           global barrier dishonest in the first place.  */
+        const std::string needle = std::string(" ") + name + " (";
+        size_t pos = 0;
+        while ((pos = reply.find(needle, pos)) != std::string::npos) {
+            const size_t eol = reply.find('\n', pos);
+            const std::string line = reply.substr(pos, eol == std::string::npos
+                                                       ? std::string::npos : eol - pos);
+            const size_t sp = line.find("submitted=");
+            if (sp != std::string::npos) {
+                admitted = atoll(line.c_str() + sp + strlen("submitted="));
+                break;
+            }
+            pos = (eol == std::string::npos) ? reply.size() : eol;
+        }
+    }
+    close(fd);
+    return admitted;
+}
+
 static long long query_jobs_admitted(int port)
 {
     const int fd = tcp_connect(port + 1, 0);
@@ -693,7 +751,9 @@ int main(int argc, char **argv)
        directly against njobs declares ingress over early -- observed as
        627/600 and 325/300 in review.  The barrier below requires the
        DELTA.  */
-    const long long admitted_baseline = query_jobs_admitted(port);
+    const long long admitted_baseline = query_submitter_admitted(port, "fakesub");
+    REQUIRE(admitted_baseline >= 0,
+            "flood-submitter admission baseline was read before the flood");
     {
         std::lock_guard<std::mutex> lock(sample_mutex);
         probe_samples.clear();
@@ -721,7 +781,7 @@ int main(int argc, char **argv)
         long long admitted_delta = -1;
         const Clock::time_point tb = Clock::now();
         while (secs_since(tb) < 120) {
-            const long long now_admitted = query_jobs_admitted(port);
+            const long long now_admitted = query_submitter_admitted(port, "fakesub");
             if (now_admitted < 0) {
                 usleep(200 * 1000);          // transient; retry within the 120s
                 continue;
