@@ -55,6 +55,14 @@ CompileServer::CompileServer(const int fd, struct sockaddr *_addr, const socklen
     , m_featuresSupported(0)
     , m_clientCount(0)
     , m_submittedJobsCount(0)
+    , m_connectionGeneration([] {
+          /* Process-wide monotonic connection stamp.  admittedJobsTotal()
+             restarts with each connection object; the generation lets an
+             observer detect the restart instead of silently undercounting
+             across a reconnect.  */
+          static unsigned int next_generation = 0;
+          return ++next_generation;
+      }())
     , m_lastPickId(0)
     , m_compilerVersions()
     , m_lastCompiledJobs()

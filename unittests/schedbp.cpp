@@ -176,7 +176,7 @@ static int tcp_connect(int port, int rcvbuf)
 /* One control-port round trip returning the scheduler's lifetime
    jobs_admitted counter, or -1 if it cannot be read.  Used to baseline and
    then observe the flood's admission from the server's own accounting.  */
-/* Per-submitter admitted total from listcs ("submitted=N" on the line
+/* Per-submitter admitted total from listcs ("admitted_total=N" on the line
    whose node name matches).  Scoping the barrier to the FLOOD submitter is
    what makes it honest: the global counter includes the healthy
    submitter's concurrent traffic, which inflated every delta by ~4.  */
@@ -184,7 +184,15 @@ static long long query_submitter_field(int port, const char *name, const char *f
 
 static long long query_submitter_admitted(int port, const char *name)
 {
-    return query_submitter_field(port, name, "submitted=");
+    return query_submitter_field(port, name, "admitted_total=");
+}
+
+/* Connection stamp for the same line: admitted_total restarts with each
+   connection object, so a baseline/delta pair is only meaningful while the
+   generation is unchanged.  Every baseline below pairs with one of these.  */
+static long long query_submitter_generation(int port, const char *name)
+{
+    return query_submitter_field(port, name, "gen=");
 }
 
 static long long query_submitter_outstanding(int port, const char *name)
@@ -851,6 +859,7 @@ int main(int argc, char **argv)
         const unsigned c1 = (unsigned)njobs;          // large: forces resume steps
         const unsigned c2 = (unsigned)(njobs * 4 / 5);
         const long long admitted0 = query_submitter_admitted(port, "fakesub");
+        const long long generation0 = query_submitter_generation(port, "fakesub");
 
         auto send_count = [&](MsgChannel *ch, unsigned count, unsigned client_id,
                               const char *fname) {
@@ -957,6 +966,9 @@ int main(int argc, char **argv)
         }
         {
             const long long admitted1 = query_submitter_admitted(port, "fakesub");
+            const long long generation1 = query_submitter_generation(port, "fakesub");
+            REQUIRE(generation1 == generation0 && generation0 > 0,
+                    "connection generation unchanged, so the baseline/delta window is valid");
             REQUIRE(admitted1 - admitted0 == (long long)(c1 + c2),
                     "admitted counter moved by exactly the two real counts (count=0 admitted nothing)");
         }
@@ -1103,6 +1115,7 @@ int main(int argc, char **argv)
        627/600 and 325/300 in review.  The barrier below requires the
        DELTA.  */
     const long long admitted_baseline = query_submitter_admitted(port, "fakesub");
+    const long long generation_baseline = query_submitter_generation(port, "fakesub");
     REQUIRE(admitted_baseline >= 0,
             "flood-submitter admission baseline was read before the flood");
     {
@@ -1145,6 +1158,8 @@ int main(int argc, char **argv)
         }
         fprintf(stderr, "# scheduler admitted %lld/%d (delta over baseline %lld)\n",
                 admitted_delta, njobs, admitted_baseline);
+        REQUIRE(query_submitter_generation(port, "fakesub") == generation_baseline,
+                "connection generation unchanged across the barrier window");
         REQUIRE(admitted_delta >= (long long)njobs,
                 "scheduler admitted the whole flood before the drain phase");
         if (admitted_delta < (long long)njobs) {

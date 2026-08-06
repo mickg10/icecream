@@ -2328,10 +2328,16 @@ static bool handle_line(CompileServer *cs, Msg *_m)
             sprintf(buffer, " (%s:%u) ", it->name.c_str(), it->remotePort());
             line = " " + it->nodeName() + buffer;
             line += "[" + it->hostPlatform() + "] speed=";
-            sprintf(buffer, "%.2f jobs=%d/%d load=%u submitted=%llu outstanding=%u",
+            /* admitted_total, NOT "submitted": the object also carries a
+               live submittedJobsCount, and this is the cumulative admission
+               count.  gen stamps the connection: the counter restarts with
+               each connection object, so a baseline/delta pair is only
+               valid while gen is unchanged.  */
+            sprintf(buffer, "%.2f jobs=%d/%d load=%u admitted_total=%llu gen=%u outstanding=%u",
                     server_speed(it),
                     it->currentJobCount(), it->maxJobs(), it->load(),
                     (unsigned long long)it->admittedJobsTotal(),
+                    it->connectionGeneration(),
                     it->outstandingDispatches());
             line += buffer;
 

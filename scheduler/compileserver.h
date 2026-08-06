@@ -153,11 +153,16 @@ public:
     int submittedJobsCount() const;
     void submittedJobsIncrement();
     void submittedJobsDecrement();
-    /* Lifetime count of requests this submitter has had ADMITTED (jobs
-       created), as opposed to the live count above.  Monotonic, so an
-       observer can take a baseline and a delta over any window.  */
+    /* Count of requests this submitter has had ADMITTED (jobs created), as
+       opposed to the live count above.  Monotonic for the lifetime of ONE
+       connection object -- the object dies with its connection, so across a
+       reconnect the count restarts.  connectionGeneration() disambiguates:
+       a baseline/delta pair taken under the same generation is a valid
+       window; a generation change means the counter was reset in between
+       and the observer must resample or sum per generation.  */
     uint64_t admittedJobsTotal() const { return m_admittedJobsTotal; }
     void admittedJobsIncrement() { ++m_admittedJobsTotal; }
+    unsigned int connectionGeneration() const { return m_connectionGeneration; }
 
     Environments compilerVersions() const;
     void setCompilerVersions(const Environments &environments);
@@ -220,6 +225,7 @@ private:
     int m_clientCount; // number of client connections the daemon has
     int m_submittedJobsCount;
     uint64_t m_admittedJobsTotal = 0;
+    unsigned int m_connectionGeneration = 0;   // set once in the ctor
     unsigned int m_lastPickId;
 
     Environments m_compilerVersions;  // Available compilers
