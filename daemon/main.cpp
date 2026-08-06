@@ -852,9 +852,9 @@ const int min_mem_limit = 100;
 unsigned int max_kids = 0;
 unsigned int max_preprocess_kids = 0;
 unsigned int preprocess_active_processes = 0;
-// number of running whole-node (fulljob) local jobs; while nonzero the
-// preprocess lane is closed (the compile lane is closed by the fulljob's
-// full slot reservation)
+// number of running fulljob (compile-lane reservation) local jobs; while
+// nonzero the compile lane is closed by the fulljob's full slot
+// reservation, and the bounded preprocess lane keeps running independently
 unsigned int fulljob_active = 0;
 
 /* A fulljob (e.g. a link step) reserves every compile slot -- the
@@ -5417,7 +5417,7 @@ void Daemon::handle_old_request()
                     client->running_preprocess = true;
                     ++preprocess_active_processes;
                     trace() << "pushed local preprocess job " << client->client_id << endl;
-                } else if (client->fulljob) { // reserve the entire node
+                } else if (client->fulljob) { // reserve every compile slot
                     client->running_preprocess = false;
                     clients.active_processes += compile_limit;
                     ++fulljob_active;

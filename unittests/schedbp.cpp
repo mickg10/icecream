@@ -1389,13 +1389,18 @@ int main(int argc, char **argv)
                reply.  Then every small in between demonstrably ran inside
                the contended admission window -- reply counters lag
                admission by whole turns, so they cannot establish this.  */
-            auto both_incomplete = [&]() {
+            long long bracket_vals[4] = { -1, -1, -1, -1 };
+            auto both_active = [&](int slot) {
                 const long long a7 = query_submitter_field(port, "fakesub7", "admitted_total=");
                 const long long a8 = query_submitter_field(port, "fakesub8", "admitted_total=");
-                return a7 >= 0 && a7 < (long long)bigN
-                    && a8 >= 0 && a8 < (long long)bigN;
+                bracket_vals[slot] = a7;
+                bracket_vals[slot + 1] = a8;
+                /* STRICTLY positive: admitted == 0 would prove only that the
+                   expansion had not finished, not that it had BEGUN.  */
+                return a7 > 0 && a7 < (long long)bigN
+                    && a8 > 0 && a8 < (long long)bigN;
             };
-            const bool contended_before = both_incomplete();
+            const bool contended_before = both_active(0);
             int slow = 0;
             int measured = 0;
             double worst_small = 0;
@@ -1425,13 +1430,16 @@ int main(int argc, char **argv)
                 if (jid) { confirm_job(jid); }
                 if (!jid || took > 3.0) { ++slow; }
             }
-            const bool contended_after = both_incomplete();
+            const bool contended_after = both_active(2);
             f1.join();
             f2.join();
-            fprintf(stderr, "# contract: fairness big=%d+%d/%u bracket=%d/%d measured=%d"
+            fprintf(stderr, "# contract: fairness big=%d+%d/%u bracket=%d/%d"
+                    " admitted(before=%lld,%lld after=%lld,%lld) measured=%d"
                     " small worst=%.2fs slow=%d\n",
                     repliesF1.load(), repliesF2.load(), bigN,
-                    contended_before, contended_after, measured, worst_small, slow);
+                    contended_before, contended_after,
+                    bracket_vals[0], bracket_vals[1], bracket_vals[2], bracket_vals[3],
+                    measured, worst_small, slow);
             REQUIRE(repliesF1 == (int)bigN && repliesF2 == (int)bigN,
                     "both long expansions completed exactly");
             REQUIRE(contended_before && contended_after,
@@ -2003,15 +2011,19 @@ int main(int argc, char **argv)
                 /* PRECONDITION, queried not assumed: both requests are
                    queued (two groups), nothing dispatchable.  */
                 {
-                    long long qcount = -1;
+                    /* The EXACT two groups -- the healthy stream also keeps
+                       a queued group, so counting any two submitter= lines
+                       could pass without the winner ever being processed.  */
+                    long long tgt = -1, win = -1;
                     const Clock::time_point t0 = Clock::now();
                     while (secs_since(t0) < 10) {
-                        qcount = query_control_count(port, "listrequests", " submitter=");
-                        if (qcount >= 2) { break; }
+                        tgt = query_control_count(port, "listrequests", " submitter=fakesub ");
+                        win = query_control_count(port, "listrequests", " submitter=fakesub6 ");
+                        if (tgt >= 1 && win >= 1) { break; }
                         usleep(100 * 1000);
                     }
-                    REQUIRE(qcount >= 2,
-                            "both target and winner are QUEUED before any capacity frees (wrap precondition)");
+                    REQUIRE(tgt >= 1 && win >= 1,
+                            "the target group AND the winner group are QUEUED before any capacity frees");
                 }
 
                 /* Free ONE aarch64 assignment while x86 stays full: the
@@ -2311,31 +2323,40 @@ int main(int argc, char **argv)
            because after the first lands the fractions diverge again in the
            other host's favor.  */
         {
+            /* Probe 1 lands at the tie, then COMPLETES, restoring the exact
+               1/2 == 4/8 state before probe 2 -- otherwise probe 2's choice
+               is ordinary least-occupancy, not tie handling.  Round-robin
+               must then pick the OTHER host at the identical tie.  */
             unsigned j1 = 0, p1 = 0, j2 = 0, p2 = 0;
             REQUIRE(send_one(9160, "tie1.cpp"), "tie probe 1 submitted");
             REQUIRE(await_use(9160, 15, &j1, &p1), "tie probe 1 assigned");
             begin_on(j1, p1);
-            held.push_back(Held{j1, p1});
+            done_on(j1, p1);
+            usleep(500 * 1000);   // the completion restores the exact tie
             REQUIRE(send_one(9161, "tie2.cpp"), "tie probe 2 submitted");
             REQUIRE(await_use(9161, 15, &j2, &p2), "tie probe 2 assigned");
             begin_on(j2, p2);
             held.push_back(Held{j2, p2});
             fprintf(stderr, "# leastbusy: tie probes went to ports %u and %u\n", p1, p2);
             REQUIRE(p1 != p2,
-                    "an exact normalized tie (1/2 == 4/8) round-robins across both hosts");
+                    "round-robin picks the OTHER host at an identical exact tie (1/2 == 4/8)");
         }
 
         /* Phase 4 -- fill to maxJobs everywhere, then the preload-zone
            probe: the picker must still assign (the bucketed form selected
            an EMPTY set here and stalled).  State: A 2/2; C needs 8/8.  */
         {
-            int need_c = 0;
-            {
-                int cur_c = 0;
-                for (const Held &h : held) { if (h.port == 10262) { ++cur_c; } }
-                need_c = 8 - cur_c;
+            /* Fill exactly the remaining capacity of BOTH hosts: the tie
+               phase's outcome decides which host probe 2 occupies, so the
+               remaining free-slot count is computed, not assumed.  After
+               these tops both hosts sit AT maxJobs regardless of the path
+               the earlier probes took.  */
+            int cur_a = 0, cur_c = 0;
+            for (const Held &h : held) {
+                if (h.port == 10262) { ++cur_c; } else { ++cur_a; }
             }
-            for (int i = 0; i < need_c; ++i) {
+            const int need_total = (2 - cur_a) + (8 - cur_c);
+            for (int i = 0; i < need_total; ++i) {
                 unsigned jid = 0, csport = 0;
                 char fname[32];
                 snprintf(fname, sizeof(fname), "top%d.cpp", i);

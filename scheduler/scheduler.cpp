@@ -1102,7 +1102,15 @@ static bool admit_request_jobs(CompileServer *submitter, PendingExpansion &req)
        N in one synchronous call, so this is no worse than the baseline --
        but charging it stops the same turn from doing another full quantum
        of anything else on top of it.  */
-    inbound_budget_remaining -= int(req.staged.size());
+    /* Saturating debit: a well-defined "budget exhausted", not amortisation
+       -- the enqueue burst itself is still atomic (equal to the released
+       scheduler's synchronous behavior for the same request).  A plain
+       subtraction narrows size_t to int and can wrap for absurd counts.  */
+    if (req.staged.size() >= (size_t)inbound_budget_remaining) {
+        inbound_budget_remaining = 0;
+    } else {
+        inbound_budget_remaining -= (int)req.staged.size();
+    }
     for (Job * const j : req.staged) {
         enqueue_job_request(j);
     }
