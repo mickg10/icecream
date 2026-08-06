@@ -1275,47 +1275,48 @@ static CompileServer *pick_server_round_robin(list<CompileServer *> &eligible)
 
 static CompileServer *pick_server_least_busy(list<CompileServer *> &eligible)
 {
-    unsigned long min_load = 0;
-    list<CompileServer *> selected_list;
-
-    // We want to pick the server with the fewest run jobs, but in a round-robin
-    // fashion if multiple happen to be the least-busy so we can distribute the
-    // load out better.
-    for (CompileServer * const cs: eligible) {
+    /* Pick the lowest OCCUPANCY (currentJobCount / maxJobs), comparing the
+       fractions exactly by 64-bit cross-multiplication -- one pass, no
+       division, no bucketing.  The previous two-pass form initialised its
+       minimum to zero (unsigned, so it could never rise), used a different
+       formula in each pass (ceiling vs floor), and bucketed occupancy into
+       integer quotients; consequences: once every eligible host sat in its
+       preload zone (count >= maxJobs) the filter selected an EMPTY set and
+       the scheduler answered "no suitable host" while capacity existed, and
+       below that a 75%-full host tied a 3%-full one.  Exact ties fall
+       through to round-robin, which is the distribution property this mode
+       exists for.  */
+    list<CompileServer *> selected;
+    uint64_t best_num = 0;
+    uint64_t best_den = 1;
+    for (CompileServer * const cs : eligible) {
 #if DEBUG_SCHEDULER > 1
         trace()
             << "considering server " << cs->nodeName() << " with "
             << cs->currentJobCount() << " of " << cs->maxJobs() << " maximum jobs"
             << endl;
 #endif
-        if (cs->maxJobs()) {
-            unsigned long cs_load = 0;
-
-            // Calculate the ceiling of the current job load ratio
-            if (cs->currentJobCount()) {
-                cs_load = 1 + ((cs->currentJobCount() - 1) / cs->maxJobs());
-            }
-
-            if (cs_load < min_load) {
-                min_load = cs_load;
-            }
+        if (!cs->maxJobs()) {
+            continue;
+        }
+        const uint64_t num = cs->currentJobCount();
+        const uint64_t den = cs->maxJobs();
+        if (selected.empty() || num * best_den < best_num * den) {
+            selected.clear();
+            selected.push_back(cs);
+            best_num = num;
+            best_den = den;
+        } else if (num * best_den == best_num * den) {
+            selected.push_back(cs);
         }
     }
 
-    std::copy_if(
-        eligible.begin(),
-        eligible.end(),
-        std::back_inserter(selected_list),
-        [=](CompileServer* cs) {
-            return cs->maxJobs() && size_t(cs->currentJobCount()) / cs->maxJobs() == min_load;
-        });
-
 #if DEBUG_SCHEDULER > 1
     trace()
-        << "servers to consider further: " << selected_list.size()
+        << "servers to consider further: " << selected.size()
         << ", using ROUND_ROBIN for final selection" << endl;
 #endif
-    return pick_server_round_robin(selected_list);
+    return pick_server_round_robin(selected);
 }
 
 static CompileServer *pick_server_new(Job *job, list<CompileServer *> &eligible)

@@ -20,7 +20,13 @@
 # submitter whose dispatched jobs never reach JobBegin is evicted AT the
 # bound -- not before it, and not never -- while the healthy submitter is
 # served straight through the eviction.
+#
+# Run 4 -- leastbusy (SCH-6): with -a least_busy and every host at maxJobs,
+# work must still be assigned (the bucketed picker selected an empty set and
+# stalled); with unequal occupancies the emptier host must win the exact
+# fraction comparison; an even fill spreads evenly.
 dir=$(dirname "$0")
 "$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 promotion 1 || exit 1
 "$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 heterogeneous 1 || exit 1
-exec "$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 50 5 stallevict
+"$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 50 5 stallevict || exit 1
+exec "$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 leastbusy 2

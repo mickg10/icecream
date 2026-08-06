@@ -364,6 +364,12 @@ int main(int argc, char **argv)
        JobBegin is evicted at the bound -- not before it, and not never --
        while a healthy submitter keeps being served throughout.  */
     const bool stallevict_mode = argc > 5 && strcmp(argv[5], "stallevict") == 0;
+    /* "leastbusy": the SCH-6 selection gate, run with -a least_busy.  With
+       every host in its preload zone (count == maxJobs) the picker must
+       still assign work -- the two-pass bucketed form selected an empty set
+       and answered "no suitable host" while preload capacity existed -- and
+       with unequal occupancies the emptier host must win.  */
+    const bool leastbusy_mode = argc > 5 && strcmp(argv[5], "leastbusy") == 0;
     /* "mixedrole": the realistic topology.  The submitter also has compile
        capacity, so the scheduler can place work back on it (NoCS / local
        UseCS).  Local decisions reserve no farm slot and must NOT consume
@@ -403,7 +409,8 @@ int main(int argc, char **argv)
         + (argc > 5 ? argv[5] : "default") + ".log";
     pid_t sched = start_scheduler(scheduler_bin, shim, port, sched_log,
                                   perf_mode ? "-v" : "-vvv",
-                                  stallevict_mode ? "--dispatch-stall-timeout=10" : nullptr);
+                                  stallevict_mode ? "--dispatch-stall-timeout=10"
+                                  : (leastbusy_mode ? "--algorithm=least_busy" : nullptr));
     if (sched < 0) {
         perror("fork");
         return 2;
@@ -702,6 +709,16 @@ int main(int argc, char **argv)
         sub2->send_msg(login);
     }
     std::thread healthy_thread([&] {
+        /* leastbusy asserts exact occupancy counts; a concurrent stream
+           holding 0-1 slots at random moments would make them flake.  The
+           connection stays (the scheduler keeps a second submitter), the
+           traffic parks.  */
+        if (leastbusy_mode) {
+            while (!shutdown) {
+                usleep(100 * 1000);
+            }
+            return;
+        }
         // request one job at a time and drain replies promptly
         unsigned int cid = 900000;
         while (!shutdown) {
@@ -1510,6 +1527,171 @@ int main(int argc, char **argv)
         probe_thread.join(); cs_thread.join(); healthy_thread.join();
         close(ctrl);
         delete sub; delete sub2; delete cs;
+        kill(sched, SIGTERM);
+        waitpid(sched, nullptr, 0);
+        if (failures) { fprintf(stderr, "RESULT: FAIL (%d)\n", failures); return 1; }
+        fprintf(stderr, "RESULT: PASS\n");
+        return 0;
+    }
+
+    if (leastbusy_mode) {
+        /* Second x86_64 host so occupancy comparison has two operands.  */
+        MsgChannel *csC = connect_daemon(port, 0);
+        REQUIRE(csC != nullptr, "second farm host connected");
+        std::mutex cconfirm_mutex;
+        std::vector<std::pair<unsigned, bool> > c_to_confirm;   // jid, done?
+        std::atomic<bool> csC_alive{true};
+        std::thread csC_thread([&] {
+            if (!csC) { return; }
+            LoginMsg login(10262, "fakecsC", kPlatform, 0);
+            login.envs.push_back(std::make_pair(std::string(kPlatform), std::string(kEnv)));
+            login.max_kids = 2;
+            login.noremote = false;
+            login.chroot_possible = true;
+            if (!csC->send_msg(login)) { csC_alive = false; return; }
+            StatsMsg st0;
+            csC->send_msg(st0);
+            Clock::time_point last_stats = Clock::now();
+            while (!shutdown) {
+                Msg *m = csC->get_msg(0, true);
+                delete m;
+                if (csC->at_eof()) { csC_alive = false; return; }
+                std::vector<std::pair<unsigned, bool> > batch;
+                {
+                    std::lock_guard<std::mutex> lock(cconfirm_mutex);
+                    batch.swap(c_to_confirm);
+                }
+                for (const auto &e : batch) {
+                    if (!e.second) {
+                        JobBeginMsg jb(e.first, 1);
+                        if (!csC->send_msg(jb)) { csC_alive = false; return; }
+                    } else {
+                        JobDoneMsg jd(e.first, 0, JobDoneMsg::FROM_SERVER);
+                        if (!csC->send_msg(jd)) { csC_alive = false; return; }
+                    }
+                }
+                if (secs_since(last_stats) > 10) {
+                    StatsMsg st;
+                    csC->send_msg(st);
+                    last_stats = Clock::now();
+                }
+                usleep(20 * 1000);
+            }
+        });
+        auto beginC = [&](unsigned jid) {
+            std::lock_guard<std::mutex> lock(cconfirm_mutex);
+            c_to_confirm.push_back(std::make_pair(jid, false));
+        };
+        auto doneC = [&](unsigned jid) {
+            std::lock_guard<std::mutex> lock(cconfirm_mutex);
+            c_to_confirm.push_back(std::make_pair(jid, true));
+        };
+
+        auto send_one = [&](unsigned cid, const char *fname) {
+            GetCSMsg g(Environments{std::make_pair(std::string(kPlatform), std::string(kEnv))},
+                       fname, CompileJob::Lang_CXX, 1, kPlatform, 0,
+                       std::string(), 0, 0, 0);
+            g.client_id = cid;
+            return sub->send_msg(g);
+        };
+        /* Reply for a specific client id; returns job id and the host's
+           advertised port through out-params.  */
+        auto await_use = [&](unsigned cid, double timeout_s,
+                             unsigned *jid_out, unsigned *port_out) {
+            const Clock::time_point t0 = Clock::now();
+            while (secs_since(t0) < timeout_s) {
+                Msg *m = sub->get_msg(2);
+                if (!m) { continue; }
+                if (MSG_IS(m, USE_CS)) {
+                    UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                    if (u && u->client_id == cid) {
+                        *jid_out = u->job_id;
+                        *port_out = u->port;
+                        delete m;
+                        return true;
+                    }
+                }
+                delete m;
+            }
+            return false;
+        };
+        auto begin_on = [&](unsigned jid, unsigned csport) {
+            if (csport == 10262) { beginC(jid); } else { begin_job(jid); }
+        };
+        auto done_on = [&](unsigned jid, unsigned csport) {
+            if (csport == 10262) { doneC(jid); } else { finish_job(jid, 100); }
+        };
+
+        /* The second host must be REGISTERED before any fill is submitted,
+           or the early fills see a one-host farm and the spread assertion
+           measures a registration race instead of the picker.  */
+        {
+            const Clock::time_point t0 = Clock::now();
+            while (secs_since(t0) < 30
+                   && query_submitter_field(port, "fakecsC", "jobs=") < 0) {
+                usleep(100 * 1000);
+            }
+            REQUIRE(query_submitter_field(port, "fakecsC", "jobs=") >= 0,
+                    "second host registered before the fill");
+        }
+
+        /* Phase 1 -- fill every compile slot on both hosts (2+2), begun so
+           the occupancy is real.  */
+        struct Held { unsigned jid, port; };
+        std::vector<Held> held;
+        for (int i = 0; i < 4; ++i) {
+            unsigned jid = 0, csport = 0;
+            char fname[32];
+            snprintf(fname, sizeof(fname), "fill%d.cpp", i);
+            REQUIRE(send_one(9100 + i, fname), "fill job submitted");
+            REQUIRE(await_use(9100 + i, 30, &jid, &csport), "fill job assigned");
+            begin_on(jid, csport);
+            held.push_back(Held{jid, csport});
+        }
+        int on_a = 0, on_c = 0;
+        for (const Held &h : held) {
+            if (h.port == 10262) { ++on_c; } else { ++on_a; }
+        }
+        fprintf(stderr, "# leastbusy: filled slots a=%d c=%d\n", on_a, on_c);
+        REQUIRE(on_a == 2 && on_c == 2,
+                "least_busy spread the fill evenly across equal hosts");
+
+        /* Phase 2 -- every host now sits AT maxJobs (the preload zone).
+           The picker must still assign: the bucketed form selected an empty
+           set here and stalled until something completed.  */
+        unsigned pjid = 0, pport = 0;
+        REQUIRE(send_one(9200, "preload.cpp"), "preload-zone probe submitted");
+        const bool assigned = await_use(9200, 10, &pjid, &pport);
+        fprintf(stderr, "# leastbusy: preload-zone probe assigned=%s port=%u\n",
+                assigned ? "yes" : "NO", pport);
+        REQUIRE(assigned,
+                "work is still assigned when every host is in its preload zone (SCH-6)");
+        if (assigned) {
+            begin_on(pjid, pport);
+            done_on(pjid, pport);
+        }
+
+        /* Phase 3 -- unequal occupancy: empty host C completely, leave host
+           A full.  The next job must land on C (0/2 beats 2/2 exactly).  */
+        for (const Held &h : held) {
+            if (h.port == 10262) { done_on(h.jid, h.port); }
+        }
+        usleep(500 * 1000);   // let the ENDs land
+        unsigned qjid = 0, qport = 0;
+        REQUIRE(send_one(9300, "emptier.cpp"), "occupancy probe submitted");
+        REQUIRE(await_use(9300, 15, &qjid, &qport), "occupancy probe assigned");
+        fprintf(stderr, "# leastbusy: occupancy probe went to port=%u (want 10262)\n", qport);
+        REQUIRE(qport == 10262, "the emptier host wins the occupancy comparison");
+        if (qjid) { begin_on(qjid, qport); done_on(qjid, qport); }
+        for (const Held &h : held) {
+            if (h.port != 10262) { done_on(h.jid, h.port); }
+        }
+        REQUIRE(worst_reply.load() < 5.0, "scheduler stayed responsive");
+
+        shutdown = true;
+        probe_thread.join(); cs_thread.join(); healthy_thread.join(); csC_thread.join();
+        close(ctrl);
+        delete sub; delete sub2; delete cs; delete csC;
         kill(sched, SIGTERM);
         waitpid(sched, nullptr, 0);
         if (failures) { fprintf(stderr, "RESULT: FAIL (%d)\n", failures); return 1; }
