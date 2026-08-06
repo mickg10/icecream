@@ -190,6 +190,8 @@ static long long query_submitter_field(int port, const char *name, const char *f
    value of `field` on the first reply line containing `needle`.  */
 static long long query_control_field(int port, const char *command,
                                      const char *needle, const char *field);
+/* Occurrences of `needle` in the full reply of `command`.  */
+static long long query_control_count(int port, const char *command, const char *needle);
 
 static long long query_submitter_admitted(int port, const char *name)
 {
@@ -255,6 +257,49 @@ static long long query_control_field(int port, const char *command,
     }
     close(fd);
     return value;
+}
+
+static long long query_control_count(int port, const char *command, const char *needle_str)
+{
+    const int fd = tcp_connect(port + 1, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    char buf[16384];
+    struct pollfd pfd = { fd, POLLIN, 0 };
+    if (poll(&pfd, 1, 5000) > 0) {
+        ssize_t n = read(fd, buf, sizeof(buf));
+        (void)n;
+    }
+    long long count = -1;
+    std::string cmdline = std::string(command) + "\n";
+    if (write(fd, cmdline.c_str(), cmdline.size()) == (ssize_t)cmdline.size()) {
+        std::string reply;
+        const Clock::time_point t0 = Clock::now();
+        while (secs_since(t0) < 5) {
+            struct pollfd rp = { fd, POLLIN, 0 };
+            if (poll(&rp, 1, 200) <= 0) {
+                continue;
+            }
+            const ssize_t n = read(fd, buf, sizeof(buf) - 1);
+            if (n <= 0) {
+                break;
+            }
+            buf[n] = 0;
+            reply += buf;
+            if (reply.find("200 done") != std::string::npos) {
+                break;
+            }
+        }
+        count = 0;
+        size_t pos = 0;
+        while ((pos = reply.find(needle_str, pos)) != std::string::npos) {
+            ++count;
+            pos += strlen(needle_str);
+        }
+    }
+    close(fd);
+    return count;
 }
 
 static long long query_submitter_field(int port, const char *name, const char *field)
@@ -1374,6 +1419,132 @@ int main(int argc, char **argv)
                     "every small request completed within its bounded interval during the expansions");
             REQUIRE(worst_reply.load() < 5.0,
                     "control latency stayed bounded while the large requests were incomplete");
+        }
+
+        // ---- case 7: pre-reply cancellation owns the whole batch
+        // A client that dies in WAITFORCS is cancelled by (submitter,
+        // client_id) -- and count>1 gives every sibling that one id, so the
+        // cancellation names the batch.  7a cancels while the batch is
+        // STAGED (the FIN-style same-drain trick: the cancel is processed
+        // with the expansion record live), which was a use-after-free
+        // before batch ownership; 7b cancels an ACTIVATED batch whose tail
+        // is still queued, which used to delete only the LAST match and
+        // leave the rest as undispatchable ghosts in the jobs map.
+        {
+            MsgChannel *subF = connect_daemon(port, 0);
+            REQUIRE(subF != nullptr, "cancel-test daemon connected");
+            if (subF) {
+                LoginMsg login(0, "fakesub9", kPlatform, 0);
+                login.envs.push_back(std::make_pair(kPlatform, kEnv));
+                login.max_kids = 0;
+                login.noremote = true;
+                REQUIRE(subF->send_msg(login), "cancel-test daemon logged in");
+                usleep(300 * 1000);
+
+                // 7a: cancel while staged
+                REQUIRE(send_count(subF, 2000, 601, "cancelA.cpp"),
+                        "count=2000 sent (to be cancelled while staged)");
+                {
+                    JobDoneMsg d(0, 255, JobDoneMsg::FROM_SUBMITTER);
+                    d.set_unknown_job_client_id(601);
+                    REQUIRE(subF->send_msg(d), "staged-batch cancellation sent in the same drain");
+                }
+                int stray601 = 0;
+                {
+                    const Clock::time_point t0 = Clock::now();
+                    while (secs_since(t0) < 3) {
+                        Msg *m = subF->get_msg(1);
+                        if (!m) { continue; }
+                        if (MSG_IS(m, USE_CS)) {
+                            UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                            if (u && u->client_id == 601) { ++stray601; }
+                        }
+                        delete m;
+                    }
+                }
+                REQUIRE(stray601 == 0, "a batch cancelled while staged produces no replies");
+                {
+                    int got = 0;
+                    REQUIRE(send_count(subF, 50, 602, "cancelB.cpp"),
+                            "fresh request after the staged cancel");
+                    const Clock::time_point t0 = Clock::now();
+                    while (got < 50 && secs_since(t0) < 60) {
+                        Msg *m = subF->get_msg(2);
+                        if (!m) { continue; }
+                        if (MSG_IS(m, USE_CS)) {
+                            UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                            if (u && u->client_id == 602) { confirm_job(u->job_id); ++got; }
+                        }
+                        delete m;
+                    }
+                    REQUIRE(got == 50, "the daemon completes a fresh request after the staged cancel");
+                }
+
+                // 7b: cancel an activated batch with a queued tail
+                REQUIRE(send_count(subF, 100, 603, "cancelC.cpp"),
+                        "count=100 sent (tail to be cancelled while queued)");
+                std::vector<unsigned> dispatched;
+                {
+                    /* The dispatch credit (32) bounds unconfirmed
+                       assignments, so exactly 32 dispatch and 68 stay
+                       queued with no server -- the cancellation's target.  */
+                    const Clock::time_point t0 = Clock::now();
+                    while (dispatched.size() < 32 && secs_since(t0) < 30) {
+                        Msg *m = subF->get_msg(2);
+                        if (!m) { continue; }
+                        if (MSG_IS(m, USE_CS)) {
+                            UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                            if (u && u->client_id == 603) { dispatched.push_back(u->job_id); }
+                        }
+                        delete m;
+                    }
+                }
+                REQUIRE(dispatched.size() == 32,
+                        "exactly the credit-many members dispatched before the cancel");
+                {
+                    JobDoneMsg d(0, 255, JobDoneMsg::FROM_SUBMITTER);
+                    d.set_unknown_job_client_id(603);
+                    REQUIRE(subF->send_msg(d), "activated-batch cancellation sent");
+                }
+                usleep(500 * 1000);
+                for (unsigned jid : dispatched) {
+                    confirm_job(jid);   // the in-flight members finish normally
+                }
+                {
+                    /* Ghost census: after the queued tail is cancelled and
+                       the in-flight members complete, NOTHING of this
+                       daemon may remain in the scheduler's jobs map.  The
+                       one-at-a-time cancellation left 67 dequeued-but-live
+                       ghosts here.  */
+                    long long ghosts = -1;
+                    const Clock::time_point t0 = Clock::now();
+                    while (secs_since(t0) < 20) {
+                        ghosts = query_control_count(port, "listjobs", "sub:fakesub9");
+                        if (ghosts == 0) { break; }
+                        usleep(200 * 1000);
+                    }
+                    fprintf(stderr, "# contract: cancel ghosts remaining=%lld\n", ghosts);
+                    REQUIRE(ghosts == 0,
+                            "no undispatchable ghost jobs survive a batch cancellation");
+                }
+                {
+                    int got = 0;
+                    REQUIRE(send_count(subF, 5, 604, "cancelD.cpp"),
+                            "final request after the activated cancel");
+                    const Clock::time_point t0 = Clock::now();
+                    while (got < 5 && secs_since(t0) < 30) {
+                        Msg *m = subF->get_msg(2);
+                        if (!m) { continue; }
+                        if (MSG_IS(m, USE_CS)) {
+                            UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                            if (u && u->client_id == 604) { confirm_job(u->job_id); ++got; }
+                        }
+                        delete m;
+                    }
+                    REQUIRE(got == 5, "the daemon still works after both cancellations");
+                }
+                delete subF;
+            }
         }
 
         REQUIRE(worst_reply.load() < 5.0, "scheduler stayed responsive throughout");

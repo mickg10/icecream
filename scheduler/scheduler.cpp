@@ -1096,7 +1096,13 @@ static bool admit_request_jobs(CompileServer *submitter, PendingExpansion &req)
 
     req.next_index = m.count;
     /* Complete: the sibling set exists in full.  Only now do the jobs become
-       eligible for dispatch, in creation order.  */
+       eligible for dispatch, in creation order.  Activation is charged to
+       the loop budget (one unit per job, like admission): the enqueue burst
+       itself is atomic -- the released scheduler admitted AND enqueued all
+       N in one synchronous call, so this is no worse than the baseline --
+       but charging it stops the same turn from doing another full quantum
+       of anything else on top of it.  */
+    inbound_budget_remaining -= int(req.staged.size());
     for (Job * const j : req.staged) {
         enqueue_job_request(j);
     }
@@ -2059,35 +2065,81 @@ static bool handle_job_done(CompileServer *cs, Msg *_m)
     Job *j = nullptr;
 
     if (uint32_t clientId = m->unknown_job_client_id()) {
-        // The daemon has sent a done message for a job for which it doesn't know the job id (happens
-        // if the job is cancelled before we send back the job id). Find the job using the client id.
-        map<unsigned int, Job *>::iterator mit;
+        /* Pre-reply cancellation: the client exited while its request was
+           still waiting for a host, so the daemon can name it only by its
+           local client id.  A count>1 request gives every sibling that ONE
+           client id, so the cancellation names the whole batch and must
+           remove every member atomically.  The previous one-at-a-time form
+           had two failure modes: it deleted only the LAST match while
+           dequeuing all of them (the rest lived on in the jobs map as
+           undispatchable ghosts), and a STAGED job -- published in the jobs
+           map but owned by its expansion record -- could be deleted out
+           from under the record, leaving dangling pointers in the staged
+           list and in the master's sibling list (use-after-free on the
+           next admission step).  */
+        cs->setClientCount(m->client_count);
 
-        for (mit = jobs.begin(); mit != jobs.end(); ++mit) {
-            Job *job = mit->second;
-            trace() << "looking for waitcs " << job->server() << " " << job->submitter()  << " " << cs
-                    << " " << job->state() << " " << job->localClientId() << " " << clientId
-                    << endl;
-
-            if (job->server() == nullptr && job->submitter() == cs && job->localClientId() == clientId) {
-                trace() << "STOP (WAITFORCS) FOR " << mit->first << endl;
-                j = job;
-                m->set_job_id( j->id()); // Now we know the job's id.
-
-                /* Unfortunately the job_requests queues are also tagged based on the daemon,
-                so we need to clean them up also.  */
-                list<JobRequestsGroup *>::iterator it;
-
-                for (it = job_requests.begin(); it != job_requests.end(); ++it)
-                    if ((*it)->submitter == cs && (*it)->remove_job(j)) {
-                        if ((*it)->l.empty()) {
-                            delete *it;
-                            job_requests.erase(it);
-                        }
-                        break;
-                    }
+        /* 1. Batch still expanding: the record owns its jobs; destroy the
+           record and every staged member together.  */
+        map<int, deque<PendingExpansion> >::iterator pit =
+            pending_expansions.find(cs->fd);
+        if (pit != pending_expansions.end()) {
+            deque<PendingExpansion> &q = pit->second;
+            for (deque<PendingExpansion>::iterator rit = q.begin();
+                    rit != q.end(); ++rit) {
+                if (rit->msg.client_id != clientId) {
+                    continue;
+                }
+                trace() << "STOP (STAGED) FOR client " << clientId << ": "
+                        << rit->staged.size() << " of " << rit->msg.count
+                        << " staged jobs cancelled before activation" << endl;
+                for (Job * const sj : rit->staged) {
+                    notify_monitors(new MonJobDoneMsg(JobDoneMsg(sj->id(), 255)));
+                    jobs.erase(sj->id());
+                    delete sj;
+                }
+                q.erase(rit);
+                if (q.empty()) {
+                    pending_expansions.erase(pit);
+                }
+                return true;
             }
         }
+
+        /* 2. Activated batch: cancel EVERY queued sibling.  Members already
+           dispatched (server set) are the compile daemon's to finish and
+           report; they are deliberately left alone.  */
+        unsigned int cancelled = 0;
+        for (map<unsigned int, Job *>::iterator mit = jobs.begin();
+                mit != jobs.end();) {
+            Job *job = mit->second;
+            if (!(job->server() == nullptr && job->submitter() == cs
+                  && job->localClientId() == clientId)) {
+                ++mit;
+                continue;
+            }
+            trace() << "STOP (WAITFORCS) FOR " << mit->first << endl;
+            for (list<JobRequestsGroup *>::iterator it = job_requests.begin();
+                    it != job_requests.end(); ++it) {
+                if ((*it)->submitter == cs && (*it)->remove_job(job)) {
+                    if ((*it)->l.empty()) {
+                        delete *it;
+                        job_requests.erase(it);
+                    }
+                    break;
+                }
+            }
+            notify_monitors(new MonJobDoneMsg(JobDoneMsg(job->id(), 255)));
+            credit_dispatch_credit(job);
+            mit = jobs.erase(mit);
+            delete job;
+            ++cancelled;
+        }
+        if (cancelled == 0) {
+            trace() << "job ID not present " << m->job_id << endl;
+            return false;
+        }
+        return true;
     } else if (jobs.find(m->job_id) != jobs.end()) {
         j = jobs[m->job_id];
     }
