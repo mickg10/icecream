@@ -1674,6 +1674,131 @@ int main(int argc, char **argv)
         if (head_jid) {
             confirm_job(head_jid);
         }
+
+        /* Phase 2 -- TRUE circular wrap.  The forward case above catches a
+           walk that advances its position but keeps testing the old job;
+           it cannot catch a walk that lost its wrap, because the servable
+           job sits AFTER the scored head.  Here the scored winner sits in
+           the LAST request group and the servable job in an EARLIER one:
+           reaching it requires wrapping past the end back to the origin.
+
+           Estimates make the ordering deterministic: warm bigx2.cpp to
+           ~90s and wraparm.cpp to ~100ms through real completion reports,
+           so the fresh bigx2 outranks the older wraparm on score.  */
+        {
+            auto warm_named = [&](const char *fname, unsigned cid,
+                                  unsigned real_msec, const char *pref) -> bool {
+                GetCSMsg g(Environments{std::make_pair(
+                               std::string(strcmp(pref, "fakecsB") == 0 ? "aarch64" : kPlatform),
+                               std::string(kEnv))},
+                           fname, CompileJob::Lang_CXX, 1,
+                           strcmp(pref, "fakecsB") == 0 ? "aarch64" : kPlatform,
+                           0, std::string(pref), 0, 0, 0);
+                g.client_id = cid;
+                if (!sub->send_msg(g)) { return false; }
+                const Clock::time_point t0 = Clock::now();
+                while (secs_since(t0) < 30) {
+                    Msg *m = sub->get_msg(2);
+                    if (!m) { continue; }
+                    UseCSMsg *u = MSG_IS(m, USE_CS) ? dynamic_cast<UseCSMsg *>(m) : nullptr;
+                    if (u && u->client_id == cid) {
+                        const unsigned jid = u->job_id;
+                        const unsigned cport = u->port;
+                        delete m;
+                        if (cport == 10261) {
+                            std::lock_guard<std::mutex> lock(bconfirm_mutex);
+                            b_to_confirm.push_back(jid);   // begins+dones with real=0
+                        } else {
+                            begin_job(jid);
+                            finish_job(jid, real_msec);
+                        }
+                        return true;
+                    }
+                    delete m;
+                }
+                return false;
+            };
+            /* x86 capacity: occ2 still holds one window; one is free for
+               the warms.  Warm the big key on the x86 host with 90s
+               reports; the arm job's key stays cold (fallback), which is
+               fine -- 2*90000 dominates any fallback plus seconds of age.  */
+            for (int r = 0; r < 3; ++r) {
+                REQUIRE(warm_named("bigx2.cpp", 8100 + r, 90000, ""),
+                        "wrap warm round dispatched");
+            }
+            /* Refill the x86 host completely (occ2 + one more).  */
+            unsigned occ3 = 0, occ3port = 0;
+            REQUIRE(send_platform("occupier3.cpp", 8200, kPlatform), "occupier 3 submitted");
+            {
+                const Clock::time_point t0 = Clock::now();
+                while (occ3 == 0 && secs_since(t0) < 30) {
+                    Msg *m = sub->get_msg(2);
+                    if (!m) { continue; }
+                    UseCSMsg *u = MSG_IS(m, USE_CS) ? dynamic_cast<UseCSMsg *>(m) : nullptr;
+                    if (u && u->client_id == 8200) { occ3 = u->job_id; occ3port = u->port; }
+                    delete m;
+                }
+            }
+            REQUIRE(occ3 != 0 && occ3port != 10261, "occupier 3 parked on the x86 host");
+            begin_job(occ3);
+
+            /* Order of groups: wraparm first (EARLIER group), then the
+               winner from a separate daemon (LAST group).  */
+            REQUIRE(send_platform("wraparm.cpp", 8300, "aarch64"), "wrap target submitted");
+            MsgChannel *subE = connect_daemon(port, 0);
+            REQUIRE(subE != nullptr, "wrap-winner daemon connected");
+            unsigned arm2_jid = 0, arm2_port = 0;
+            if (subE) {
+                LoginMsg login(0, "fakesub6", kPlatform, 0);
+                login.envs.push_back(std::make_pair(kPlatform, kEnv));
+                login.max_kids = 0;
+                login.noremote = true;
+                REQUIRE(subE->send_msg(login), "wrap-winner daemon logged in");
+                usleep(300 * 1000);
+                GetCSMsg g(Environments{std::make_pair(std::string(kPlatform), std::string(kEnv))},
+                           "bigx2.cpp", CompileJob::Lang_CXX, 1, kPlatform, 0,
+                           std::string(), 0, 0, 0);
+                g.client_id = 8400;
+                REQUIRE(subE->send_msg(g), "high-score winner submitted from the LAST group");
+
+                /* The winner's host is full; the servable aarch64 job sits
+                   in an EARLIER group.  Only a wrapping walk reaches it.  */
+                const Clock::time_point t0 = Clock::now();
+                while (arm2_jid == 0 && secs_since(t0) < 20) {
+                    Msg *m = sub->get_msg(2);
+                    if (!m) { continue; }
+                    UseCSMsg *u = MSG_IS(m, USE_CS) ? dynamic_cast<UseCSMsg *>(m) : nullptr;
+                    if (u && u->client_id == 8300) { arm2_jid = u->job_id; arm2_port = u->port; }
+                    delete m;
+                }
+            }
+            fprintf(stderr, "# heterogeneous: wrap target dispatched=%s port=%u\n",
+                    arm2_jid ? "yes" : "NO", arm2_port);
+            REQUIRE(arm2_jid != 0,
+                    "a servable job BEFORE the scored winner is reached (true circular wrap)");
+            REQUIRE(arm2_port == 10261, "it went to the aarch64 host");
+            if (arm2_jid) {
+                std::lock_guard<std::mutex> lock(bconfirm_mutex);
+                b_to_confirm.push_back(arm2_jid);
+            }
+            /* Liveness: free the x86 host; the winner must dispatch.  */
+            finish_job(occ3, 1000);
+            unsigned win_jid = 0;
+            if (subE) {
+                const Clock::time_point t0 = Clock::now();
+                while (win_jid == 0 && secs_since(t0) < 30) {
+                    Msg *m = subE->get_msg(2);
+                    if (!m) { continue; }
+                    UseCSMsg *u = MSG_IS(m, USE_CS) ? dynamic_cast<UseCSMsg *>(m) : nullptr;
+                    if (u && u->client_id == 8400) { win_jid = u->job_id; }
+                    delete m;
+                }
+            }
+            REQUIRE(win_jid != 0, "the blocked winner runs once its host returns");
+            if (win_jid) { confirm_job(win_jid); }
+            if (subE) { delete subE; }
+        }
+
         REQUIRE(worst_reply.load() < 5.0, "scheduler stayed responsive");
 
         shutdown = true;
@@ -1707,32 +1832,57 @@ int main(int argc, char **argv)
             }
         }
         /* Read the assignments (delivery is not the stall condition --
-           JobBegin is) but confirm NOTHING.  */
+           JobBegin is) but confirm NOTHING.  The deadline is measured from
+           the FIRST unconfirmed assignment: that is when the oldest debit's
+           stall clock starts.  */
         int delivered = 0;
         const Clock::time_point t0 = Clock::now();
+        Clock::time_point t_first = t0;
+        const int healthy_at_flood = healthy_replies.load();
+        int healthy_mid = -1;
         bool evicted = false;
-        double evict_s = -1;
+        double evict_after_first_s = -1;
         while (secs_since(t0) < 40) {
             Msg *m = sub->get_msg(1);
             if (m) {
                 if (MSG_IS(m, USE_CS) || MSG_IS(m, NO_CS)) {
+                    if (delivered == 0) {
+                        t_first = Clock::now();
+                    }
                     ++delivered;
                 }
                 delete m;
             }
+            if (healthy_mid < 0 && delivered > 0
+                    && Clock::now() - t_first > std::chrono::seconds(6)) {
+                healthy_mid = healthy_replies.load();
+            }
             if (sub->at_eof()) {
                 evicted = true;
-                evict_s = secs_since(t0);
+                evict_after_first_s = std::chrono::duration<double>(
+                    Clock::now() - t_first).count();
                 break;
             }
         }
         const int healthy_at_evict = healthy_replies.load();
-        fprintf(stderr, "# stallevict: delivered=%d evicted=%s at %.1fs (bound 10s), healthy so far=%d\n",
-                delivered, evicted ? "yes" : "NO", evict_s, healthy_at_evict);
-        REQUIRE(delivered > 0, "assignments were delivered before the stall");
+        fprintf(stderr, "# stallevict: delivered=%d evicted=%s at %.1fs after first delivery"
+                " (bound 10s), healthy flood=%d mid=%d evict=%d\n",
+                delivered, evicted ? "yes" : "NO", evict_after_first_s,
+                healthy_at_flood, healthy_mid, healthy_at_evict);
+        /* The dispatch credit is exact: 32 unconfirmed assignments (the
+           configured default; the farm is large enough that no clamp
+           applies), then nothing more until the eviction.  */
+        REQUIRE(delivered == 32, "exactly the effective dispatch credit was delivered");
         REQUIRE(evicted, "the stalled submitter was evicted");
-        REQUIRE(evict_s >= 9.0, "eviction respected the bound (not premature)");
-        REQUIRE(evict_s <= 25.0, "eviction happened promptly after the bound");
+        REQUIRE(evict_after_first_s >= 9.5, "eviction respected the bound (not premature)");
+        /* Upper tolerance: the bound plus poll granularity (prune caps the
+           poll timeout by the remaining stall budget) plus scheduling
+           slack -- NOT a 2.5x overshoot allowance.  */
+        REQUIRE(evict_after_first_s <= 13.0, "eviction landed AT the bound, not merely eventually");
+        /* Progress DURING the stall window, before the eviction: the frozen
+           peer must not drag anyone else down while its clock runs.  */
+        REQUIRE(healthy_mid > healthy_at_flood,
+                "the healthy submitter progressed during the stall window (pre-eviction)");
         /* The healthy submitter must keep completing work after the event.  */
         {
             const Clock::time_point th = Clock::now();
