@@ -173,6 +173,47 @@ static int tcp_connect(int port, int rcvbuf)
     return fd;
 }
 
+/* One control-port round trip returning the scheduler's lifetime
+   jobs_admitted counter, or -1 if it cannot be read.  Used to baseline and
+   then observe the flood's admission from the server's own accounting.  */
+static long long query_jobs_admitted(int port)
+{
+    const int fd = tcp_connect(port + 1, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    char buf[8192];
+    struct pollfd pfd = { fd, POLLIN, 0 };
+    if (poll(&pfd, 1, 5000) > 0) {          // absorb the greeting
+        ssize_t n = read(fd, buf, sizeof(buf));
+        (void)n;
+    }
+    long long admitted = -1;
+    if (write(fd, "estimates\n", 10) == 10) {
+        std::string reply;
+        const Clock::time_point t0 = Clock::now();
+        while (secs_since(t0) < 5) {
+            struct pollfd rp = { fd, POLLIN, 0 };
+            if (poll(&rp, 1, 200) <= 0) {
+                continue;      // scheduler busy; keep waiting within the 5s
+            }
+            const ssize_t n = read(fd, buf, sizeof(buf) - 1);
+            if (n <= 0) {
+                break;
+            }
+            buf[n] = 0;
+            reply += buf;
+            const size_t pos = reply.find("jobs_admitted=");
+            if (pos != std::string::npos) {
+                admitted = atoll(reply.c_str() + pos + strlen("jobs_admitted="));
+                break;
+            }
+        }
+    }
+    close(fd);
+    return admitted;
+}
+
 static MsgChannel *connect_daemon(int port, int rcvbuf)
 {
     int fd = tcp_connect(port, rcvbuf);
@@ -588,6 +629,12 @@ int main(int argc, char **argv)
     fprintf(stderr, "# requesting %d jobs\n", njobs);
     /* Phase discipline (perf gate): everything before this point was setup
        -- discard those samples so 'ingress' means the flood, nothing else.  */
+    /* Baseline the scheduler's lifetime admitted counter BEFORE the flood:
+       it counts every submitter (the healthy one included), so comparing it
+       directly against njobs declares ingress over early -- observed as
+       627/600 and 325/300 in review.  The barrier below requires the
+       DELTA.  */
+    const long long admitted_baseline = query_jobs_admitted(port);
     {
         std::lock_guard<std::mutex> lock(sample_mutex);
         probe_samples.clear();
@@ -606,56 +653,42 @@ int main(int argc, char **argv)
             break;
         }
     }
-    /* Server-observed barrier: the sender finishing send_msg() proves
-       nothing about admission -- requests can still be buffered ahead of
-       the scheduler.  Poll the control channel until the scheduler itself
-       reports jobs_admitted >= njobs, and only then call the phase
-       'drain'.  A second control connection is used; the probe thread owns
-       the first.  */
+    /* Server-observed barrier, on the DELTA over the baseline: the sender
+       finishing send_msg() proves nothing about admission -- requests can
+       still be buffered ahead of the scheduler.  Not reaching the barrier
+       is a hard failure: a silently sender-observed boundary would make
+       every ingress measurement below meaningless.  */
     {
-        int barrier = tcp_connect(port + 1, 0);
-        if (barrier >= 0) {
-            char bbuf[8192];
-            // absorb the greeting/login exchange
-            struct pollfd bp = { barrier, POLLIN, 0 };
-            if (poll(&bp, 1, 5000) > 0) {
-                ssize_t r = read(barrier, bbuf, sizeof(bbuf));
-                (void)r;
+        long long admitted_delta = -1;
+        const Clock::time_point tb = Clock::now();
+        while (secs_since(tb) < 120) {
+            const long long now_admitted = query_jobs_admitted(port);
+            if (now_admitted < 0) {
+                usleep(200 * 1000);          // transient; retry within the 120s
+                continue;
             }
-            const Clock::time_point tb = Clock::now();
-            long long admitted = -1;
-            while (secs_since(tb) < 120 && admitted < (long long)njobs) {
-                if (write(barrier, "estimates\n", 10) != 10) {
-                    break;
-                }
-                std::string reply;
-                const Clock::time_point tr = Clock::now();
-                while (secs_since(tr) < 5) {
-                    struct pollfd pfd2 = { barrier, POLLIN, 0 };
-                    if (poll(&pfd2, 1, 200) <= 0) {
-                        break;
-                    }
-                    ssize_t n = read(barrier, bbuf, sizeof(bbuf) - 1);
-                    if (n <= 0) {
-                        break;
-                    }
-                    bbuf[n] = 0;
-                    reply += bbuf;
-                    if (reply.find("jobs_admitted=") != std::string::npos) {
-                        break;
-                    }
-                }
-                const size_t pos = reply.find("jobs_admitted=");
-                if (pos != std::string::npos) {
-                    admitted = atoll(reply.c_str() + pos + strlen("jobs_admitted="));
-                }
-                if (admitted < (long long)njobs) {
-                    usleep(100 * 1000);
-                }
+            admitted_delta = now_admitted - admitted_baseline;
+            if (admitted_delta >= (long long)njobs) {
+                break;
             }
-            fprintf(stderr, "# scheduler admitted %lld/%d at ingress barrier\n",
-                    admitted, njobs);
-            close(barrier);
+            usleep(100 * 1000);
+        }
+        fprintf(stderr, "# scheduler admitted %lld/%d (delta over baseline %lld)\n",
+                admitted_delta, njobs, admitted_baseline);
+        REQUIRE(admitted_delta >= (long long)njobs,
+                "scheduler admitted the whole flood before the drain phase");
+        if (admitted_delta < (long long)njobs) {
+            /* Phase labels would be fiction from here on.  */
+            fprintf(stderr, "RESULT: FAIL (ingress barrier not reached)\n");
+            shutdown = true;
+            probe_thread.join();
+            cs_thread.join();
+            healthy_thread.join();
+            close(ctrl);
+            delete sub; delete sub2; delete cs;
+            kill(sched, SIGTERM);
+            waitpid(sched, nullptr, 0);
+            return 1;
         }
     }
     ingress_duration_s = secs_since(t_prog) - phase_start_s.load();

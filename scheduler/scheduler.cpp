@@ -486,8 +486,41 @@ static unsigned int cached_remote_farm_slots = 0;
    monopolize successive loops.  Leftovers are already parsed in userspace
    where poll() cannot see them; the caller re-polls with a zero timeout.  */
 static const int max_inbound_units_per_loop = 128;
+/* Per-loop-iteration ingress budget, spent at the post-poll read paths.
+   Charged one unit per handled message and one per admitted job, so a
+   multi-job GetCS cannot buy an unbounded amount of work for one unit.  */
+static int inbound_budget_remaining = max_inbound_units_per_loop;
+/* Set when a read path stops with data still buffered in userspace, where
+   poll() cannot see it; consumed by the next iteration's timeout choice.  */
+static bool has_buffered_inbound = false;
+static const unsigned int max_jobs_per_request = 64;
 static uint64_t jobs_admitted_total = 0;   // lifetime; exposed via 'estimates'
-static int inbound_last_units = 0;         // units charged by the last handler call
+
+static bool handle_activity(CompileServer *cs);
+
+/* Read and dispatch from one connection until it is quiet or the budget is
+   spent.  Returns false when the connection is gone (caller must not touch
+   it again); sets *more when work remains for the next iteration.  */
+static bool drain_connection(CompileServer *cs, bool *more)
+{
+    while (inbound_budget_remaining > 0) {
+        const uint64_t before = jobs_admitted_total;
+        const bool quiet = cs->read_a_bit() && !cs->has_msg();
+        if (quiet) {
+            return true;
+        }
+        if (!handle_activity(cs)) {
+            return false;          // connection deleted by the handler
+        }
+        const uint64_t admitted = jobs_admitted_total - before;
+        inbound_budget_remaining -= admitted > 0 ? int(admitted) : 1;
+    }
+    /* Budget exhausted with data still pending: poll() cannot report bytes
+       already sitting in userspace, so the caller re-polls with a zero
+       timeout and this connection is served again next iteration.  */
+    *more = true;
+    return true;
+}
 
 static unsigned int effective_dispatch_credit()
 {
@@ -884,9 +917,18 @@ static bool handle_cs_request(MsgChannel *cs, Msg *_m)
 
     Job *master_job = nullptr;
 
-    for (unsigned int i = 0; i < m->count; ++i) {
+    /* Multi-job requests are charged per job (see drain_connection) and
+       capped: one message must not be able to enqueue an unbounded batch
+       between two poll() calls.  */
+    unsigned int count = m->count;
+    if (count > max_jobs_per_request) {
+        log_warning() << "capping " << count << "-job request from "
+                      << submitter->nodeName() << " at " << max_jobs_per_request
+                      << endl;
+        count = max_jobs_per_request;
+    }
+    for (unsigned int i = 0; i < count; ++i) {
         ++jobs_admitted_total;
-        ++inbound_last_units;
         Job *job = create_new_job(submitter);
         job->setEnvironments(m->versions);
         job->setTargetPlatform(m->target);
@@ -3014,46 +3056,16 @@ int main(int argc, char *argv[])
         pfd.events = POLLIN;
         pollfds.push_back( pfd );
 
-        bool has_buffered_inbound = false;
-        /* Bounded ingress, one GLOBAL budget spent from a rotating cursor:
-           iterate the connection map starting after where the previous loop
-           iteration stopped, charging each handled message at least one
-           unit and each admitted job one unit (a single GetCS can create
-           m->count jobs).  handle_activity() can delete the connection, so
-           the fd (not the pointer) is the cursor.  */
-        static int inbound_cursor_fd = -1;
-        {
-            int budget = max_inbound_units_per_loop;
-            map<int, CompileServer *>::const_iterator start =
-                fd2cs.upper_bound(inbound_cursor_fd);
-            const size_t nconns = fd2cs.size();
-            size_t visited = 0;
-            map<int, CompileServer *>::const_iterator it = start;
-            while (budget > 0 && visited < nconns && !fd2cs.empty()) {
-                if (it == fd2cs.end()) {
-                    it = fd2cs.begin();
-                }
-                const int fd = it->first;
-                CompileServer *cs = it->second;
-                ++it;
-                ++visited;
-                bool ok = true;
-                while (ok && budget > 0 && cs->has_msg()) {
-                    inbound_last_units = 0;
-                    if (!handle_activity(cs)) {
-                        ok = false;
-                        break;
-                    }
-                    budget -= inbound_last_units > 0 ? inbound_last_units : 1;
-                }
-                inbound_cursor_fd = fd;
-                if (!ok) {
-                    /* the connection may be gone; the iterator was already
-                       advanced past it */
-                    continue;
-                }
-            }
-        }
+        /* Ingress budget for THIS loop iteration.  It is spent where reads
+           actually happen -- the post-poll read_a_bit() paths below -- not
+           before poll(), where has_msg() only sees userspace buffers and a
+           budget governs nothing.  */
+        inbound_budget_remaining = max_inbound_units_per_loop;
+        /* NOT a per-iteration local: the post-poll reads below set it, while
+           the timeout decision that consumes it runs BEFORE poll() -- so it
+           must carry across the iteration boundary or the zero-timeout
+           re-poll never happens and each iteration stalls in poll() after
+           spending its budget.  */
         for (map<int, CompileServer *>::const_iterator it = fd2cs.begin(); it != fd2cs.end();) {
             int i = it->first;
             CompileServer *cs = it->second;
@@ -3097,6 +3109,8 @@ int main(int argc, char *argv[])
                nothing about them.  Service fds without sleeping.  */
             timeout = 0;
         }
+        const bool service_buffered = has_buffered_inbound;
+        has_buffered_inbound = false;   // the post-poll reads below re-arm it
 
         int active_fds = poll(pollfds.data(), pollfds.size(), timeout * 1000);
         int poll_errno = errno;
@@ -3146,11 +3160,7 @@ int main(int argc, char *argv[])
 
                     fd2cs[cs->fd] = cs;
 
-                    while (!cs->read_a_bit() || cs->has_msg()) {
-                        if (! handle_activity(cs)) {
-                            break;
-                        }
-                    }
+                    drain_connection(cs, &has_buffered_inbound);
                 }
             }
 
@@ -3179,10 +3189,7 @@ int main(int argc, char *argv[])
                     continue;
                 }
 
-                while (!cs->read_a_bit() || cs->has_msg())
-                    if (!handle_activity(cs)) {
-                        break;
-                    }
+                drain_connection(cs, &has_buffered_inbound);
             }
         }
 
@@ -3228,14 +3235,34 @@ int main(int argc, char *argv[])
             }
         }
 
-        for (map<int, CompileServer *>::const_iterator it = fd2cs.begin();
-                active_fds > 0 && it != fd2cs.end();) {
-            int i = it->first;
-            CompileServer *cs = it->second;
-            /* handle_activity can delete the channel from the fd2cs list,
-               hence advance the iterator right now, so it doesn't become
-               invalid.  */
-            ++it;
+        /* Snapshot the fds and re-look-up each one: a handler can erase ANY
+           entry (duplicate-login eviction, removecs, monitor teardown), not
+           just the one being served, so a retained iterator -- even an
+           already-advanced one -- can be invalidated under us.  The rotating
+           start keeps low fds from spending the whole budget every time.  */
+        static int inbound_cursor_fd = -1;
+        std::vector<int> ready_fds;
+        ready_fds.reserve(fd2cs.size());
+        for (map<int, CompileServer *>::const_iterator sit = fd2cs.upper_bound(inbound_cursor_fd);
+                sit != fd2cs.end(); ++sit) {
+            ready_fds.push_back(sit->first);
+        }
+        for (map<int, CompileServer *>::const_iterator sit = fd2cs.begin();
+                sit != fd2cs.end() && sit->first <= inbound_cursor_fd; ++sit) {
+            ready_fds.push_back(sit->first);
+        }
+        /* active_fds alone is not a sufficient guard once ingress is
+           budgeted: a budget-stopped drain leaves messages in USERSPACE,
+           which poll() cannot report, so a zero-timeout poll returns 0 and
+           those messages would never be serviced.  */
+        for (size_t ri = 0; ri < ready_fds.size() && (active_fds > 0 || service_buffered); ++ri) {
+            const int i = ready_fds[ri];
+            map<int, CompileServer *>::const_iterator live = fd2cs.find(i);
+            if (live == fd2cs.end()) {
+                continue;    // erased since the snapshot
+            }
+            CompileServer *cs = live->second;
+            inbound_cursor_fd = i;
 
             /* pollfd_is_set() also reports POLLERR/POLLHUP as "set" (its
                check_errors default) -- deliberate here: an errored channel
@@ -3243,7 +3270,7 @@ int main(int argc, char *argv[])
                for POLLOUT, which converges to handle_end() without waiting
                for the read side to notice the EOF.  */
             const bool can_write = pollfd_is_set(pollfds, i, POLLOUT);
-            const bool can_read = pollfd_is_set(pollfds, i, POLLIN);
+            const bool can_read = pollfd_is_set(pollfds, i, POLLIN) || cs->has_msg();
 
             if (can_write || can_read) {
                 /* poll() counts a file descriptor once, however many of its
@@ -3262,12 +3289,8 @@ int main(int argc, char *argv[])
                 }
             }
 
-            if (can_read) {
-                while (!cs->read_a_bit() || cs->has_msg()) {
-                    if (!handle_activity(cs)) {
-                        break;
-                    }
-                }
+            if (can_read && !drain_connection(cs, &has_buffered_inbound)) {
+                continue;    // connection deleted by a handler
             }
         }
 
