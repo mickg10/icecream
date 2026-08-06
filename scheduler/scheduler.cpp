@@ -2551,6 +2551,23 @@ static bool handle_end(CompileServer *toremove, Msg *m)
         break;
     }
 
+    /* Drop any half-finished multi-job expansion belonging to this peer.
+       The map is keyed by the channel fd, and the kernel reuses a closed fd
+       for the next accept(): without this erase a record outlives its owner
+       and the next connection to land on the same number inherits it, so a
+       request nobody made is expanded against an unrelated -- possibly still
+       mid-handshake -- peer.  The lazy sweep in expand_pending_requests()
+       cannot cover that case: it only drops records whose fd is ABSENT from
+       fd2cs, and a reused fd is present again.  */
+    {
+        map<int, PendingExpansion *>::iterator pit =
+            pending_expansions.find(toremove->fd);
+        if (pit != pending_expansions.end()) {
+            delete pit->second;
+            pending_expansions.erase(pit);
+        }
+    }
+
     fd2cs.erase(toremove->fd);
     delete toremove;
     return true;
