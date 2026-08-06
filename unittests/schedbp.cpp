@@ -180,7 +180,19 @@ static int tcp_connect(int port, int rcvbuf)
    whose node name matches).  Scoping the barrier to the FLOOD submitter is
    what makes it honest: the global counter includes the healthy
    submitter's concurrent traffic, which inflated every delta by ~4.  */
+static long long query_submitter_field(int port, const char *name, const char *field);
+
 static long long query_submitter_admitted(int port, const char *name)
+{
+    return query_submitter_field(port, name, "submitted=");
+}
+
+static long long query_submitter_outstanding(int port, const char *name)
+{
+    return query_submitter_field(port, name, "outstanding=");
+}
+
+static long long query_submitter_field(int port, const char *name, const char *field)
 {
     const int fd = tcp_connect(port + 1, 0);
     if (fd < 0) {
@@ -222,9 +234,9 @@ static long long query_submitter_admitted(int port, const char *name)
             const size_t eol = reply.find('\n', pos);
             const std::string line = reply.substr(pos, eol == std::string::npos
                                                        ? std::string::npos : eol - pos);
-            const size_t sp = line.find("submitted=");
+            const size_t sp = line.find(field);
             if (sp != std::string::npos) {
-                admitted = atoll(line.c_str() + sp + strlen("submitted="));
+                admitted = atoll(line.c_str() + sp + strlen(field));
                 break;
             }
             pos = (eol == std::string::npos) ? reply.size() : eol;
@@ -319,6 +331,14 @@ int main(int argc, char **argv)
        dropping the tail would silently break the wire contract (count is
        the number of replies the caller waits for).  njobs is the count.  */
     const bool multicount_mode = argc > 5 && strcmp(argv[5], "multicount") == 0;
+    /* "mixedrole": the realistic topology.  The submitter also has compile
+       capacity, so the scheduler can place work back on it (NoCS / local
+       UseCS).  Local decisions reserve no farm slot and must NOT consume
+       remote dispatch credit -- charging them let an ordinary developer
+       machine gate itself out of a live farm.  With no remote capacity
+       available, every decision is local, and outstanding_dispatches must
+       stay 0 however many are made.  */
+    const bool mixedrole_mode = argc > 5 && strcmp(argv[5], "mixedrole") == 0;
     /* Optional farm size (argv[6], gate mode): the fake compile server
        advertises exactly this many slots instead of "always enough".  The
        scheduler then clamps the per-submitter dispatch credit to slots-1,
@@ -395,7 +415,9 @@ int main(int argc, char **argv)
     {
         LoginMsg login(kCsPort, "fakecs", kPlatform, 0);
         login.envs.push_back(std::make_pair(kPlatform, kEnv));
-        login.max_kids = farm_slots > 0 ? farm_slots : njobs + 16;
+        /* mixedrole withdraws remote capacity so every decision is local. */
+        login.max_kids = mixedrole_mode ? 0
+                                        : (farm_slots > 0 ? farm_slots : njobs + 16);
         login.noremote = false;
         login.chroot_possible = true;
         if (!cs->send_msg(login)) {
@@ -663,11 +685,15 @@ int main(int argc, char **argv)
         return 2;
     }
     {
-        LoginMsg login(0, "fakesub", kPlatform, 0);
+        LoginMsg login(mixedrole_mode ? 10246 : 0, "fakesub", kPlatform, 0);
         login.envs.push_back(std::make_pair(kPlatform, kEnv));
-        login.max_kids = 0;    // never eligible for local fallback
-        login.noremote = true;
-        login.chroot_possible = false;
+        /* Pure-submitter topology by default (max_kids=0 keeps the local
+           arm unreachable, which is why five review rounds never saw the
+           local-credit defect).  mixedrole gives it real capacity, which is
+           what every developer machine actually looks like.  */
+        login.max_kids = mixedrole_mode ? 60 : 0;
+        login.noremote = mixedrole_mode ? false : true;
+        login.chroot_possible = mixedrole_mode ? true : false;
         if (!sub->send_msg(login)) {
             fprintf(stderr, "submitter login failed\n");
             shutdown = true;
@@ -688,6 +714,65 @@ int main(int argc, char **argv)
             break;
         }
         delete m;
+    }
+
+    if (mixedrole_mode) {
+        /* Take the fake compile server out of service so the ONLY placement
+           available is local.  Every reply is then a local decision.  */
+        fprintf(stderr, "# mixed-role: submitter has capacity; remote CS has no free slots\n");
+        for (int i = 1; i <= njobs; ++i) {
+            char fname[64];
+            snprintf(fname, sizeof(fname), "local%04d.cpp", i);
+            GetCSMsg g(Environments{std::make_pair(std::string(kPlatform), std::string(kEnv))},
+                       fname, CompileJob::Lang_CXX, 1, kPlatform, 0, std::string(), 0, 0, 0);
+            g.client_id = (unsigned)i;
+            if (!sub->send_msg(g)) {
+                fprintf(stderr, "FAILED   - submitter died requesting local job %d\n", i);
+                ++failures;
+                break;
+            }
+        }
+        /* The submitter has finite local capacity, so the scheduler will
+           place up to that many and queue the rest -- correct behaviour.
+           What matters is that placement does NOT stop at the old credit
+           ceiling of 32 and that outstanding stays 0 throughout.  */
+        int local_replies = 0, remote_replies = 0;
+        const Clock::time_point t0 = Clock::now();
+        while (local_replies + remote_replies < njobs && secs_since(t0) < 25) {
+            Msg *m = sub->get_msg(2);
+            if (!m) {
+                continue;
+            }
+            if (MSG_IS(m, NO_CS)) {
+                ++local_replies;        // placed back on this host
+            } else if (MSG_IS(m, USE_CS)) {
+                ++remote_replies;
+            }
+            delete m;
+        }
+        const long long outstanding = query_submitter_outstanding(port, "fakesub");
+        fprintf(stderr, "# local replies=%d remote=%d outstanding_dispatches=%lld\n",
+                local_replies, remote_replies, outstanding);
+        REQUIRE(local_replies > 32,
+                "local placement continued past the old credit ceiling of 32");
+        REQUIRE(remote_replies == 0,
+                "no remote decision was made (remote capacity was withdrawn)");
+        REQUIRE(outstanding == 0,
+                "local decisions consume no remote dispatch credit (BP-1)");
+        shutdown = true;
+        probe_thread.join();
+        cs_thread.join();
+        healthy_thread.join();
+        close(ctrl);
+        delete sub; delete sub2; delete cs;
+        kill(sched, SIGTERM);
+        waitpid(sched, nullptr, 0);
+        if (failures) {
+            fprintf(stderr, "RESULT: FAIL (%d)\n", failures);
+            return 1;
+        }
+        fprintf(stderr, "RESULT: PASS\n");
+        return 0;
     }
 
     if (multicount_mode) {

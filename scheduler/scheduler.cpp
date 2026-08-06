@@ -1726,7 +1726,13 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
        This must not block, and transient backpressure must not tear down the
        submitter with all its in-flight jobs -- send_msg() only returns false
        here if the connection is genuinely dead.  */
-    if(IS_PROTOCOL_VERSION(37, job->submitter()) && use_cs == job->submitter())
+    /* Is this a LOCAL decision -- the job placed back on the host that asked
+       for it?  Semantic test, deliberately not keyed on the message class:
+       protocol 37+ encodes it as NoCS, older peers as a UseCS naming the
+       submitter itself, and both reserve zero remote farm capacity.  */
+    const bool local_decision = (use_cs == job->submitter());
+
+    if (IS_PROTOCOL_VERSION(37, job->submitter()) && local_decision)
     {
         NoCSMsg m2(job->id(), job->localClientId());
         if (!job->submitter()->send_msg(m2, MsgChannel::SendNonBlocking | MsgChannel::SendDeferrable)) {
@@ -1734,7 +1740,6 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
             handle_end(job->submitter(), nullptr);   // will care for the rest
             return true;
         }
-        debit_dispatch_credit(job);
     }
     else
     {
@@ -1745,6 +1750,15 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
             handle_end(job->submitter(), nullptr);   // will care for the rest
             return true;
         }
+    }
+
+    /* Charge remote-dispatch credit ONLY for work that actually reserves a
+       farm slot.  Charging local decisions let a busy mixed-role daemon --
+       i.e. any ordinary developer machine, which both submits and compiles --
+       gate itself out of a live farm and then lose its queued and in-flight
+       jobs to the liveness bound.  Reproduced: 0 of 3000 jobs served while
+       the farm served 189 to another submitter.  */
+    if (!local_decision) {
         debit_dispatch_credit(job);
     }
 
@@ -2233,9 +2247,11 @@ static bool handle_line(CompileServer *cs, Msg *_m)
             sprintf(buffer, " (%s:%u) ", it->name.c_str(), it->remotePort());
             line = " " + it->nodeName() + buffer;
             line += "[" + it->hostPlatform() + "] speed=";
-            sprintf(buffer, "%.2f jobs=%d/%d load=%u submitted=%llu", server_speed(it),
+            sprintf(buffer, "%.2f jobs=%d/%d load=%u submitted=%llu outstanding=%u",
+                    server_speed(it),
                     it->currentJobCount(), it->maxJobs(), it->load(),
-                    (unsigned long long)it->admittedJobsTotal());
+                    (unsigned long long)it->admittedJobsTotal(),
+                    it->outstandingDispatches());
             line += buffer;
 
             if (it->busyInstalling()) {
