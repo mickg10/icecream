@@ -9,8 +9,6 @@ iceccd_SOURCES = \
 	file_util.cpp \
 	statewriter.cpp
 
-noinst_HEADERS = statewriter.h
-
 iceccd_LDADD = \
 	../services/libicecc.la \
 	$(LIB_KINFO) \
@@ -24,6 +22,7 @@ AM_CPPFLAGS = \
 AM_LIBTOOLFLAGS = --silent
 
 noinst_HEADERS = \
+	statewriter.h \
 	environment.h \
 	load.h \
 	serve.h \

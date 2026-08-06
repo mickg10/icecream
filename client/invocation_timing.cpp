@@ -181,4 +181,3 @@ bool invocation_timing_send(MsgChannel *local_daemon)
     }
     return ok;
 }
-

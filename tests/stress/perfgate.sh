@@ -51,7 +51,7 @@ echo "# fingerprint: cxxflags=${CXXF:-unknown} slo=${SLO}s depths=$D1,$D2"
 is_num() { case "$1" in ''|*[!0-9.]*) return 1;; *) return 0;; esac; }
 
 FAIL=0
-declare -A WALL RSS ING_MAX DRN_MAX
+declare -A WALL
 for depth in "$D1" "$D2"; do
     dir="$RUN/d$depth"
     mkdir -p "$dir"
@@ -88,9 +88,8 @@ for depth in "$D1" "$D2"; do
         echo "  depth=$depth phase=$ph samples=$ns duration=${dur}s p95=${p95}s p99=${p99}s max=${mx}s"
         awk -v l="$mx" -v s="$SLO" 'BEGIN{exit !(l<=s)}' \
             || { echo "FAIL: $ph max ${mx}s > SLO ${SLO}s at depth $depth"; FAIL=1; }
-        [ "$ph" = ingress ] && ING_MAX[$depth]=$mx || DRN_MAX[$depth]=$mx
     done
-    WALL[$depth]=$wall; RSS[$depth]=$rss
+    WALL[$depth]=$wall
     echo "  depth=$depth wall=${wall}s rss=${rss}KiB"
 done
 
