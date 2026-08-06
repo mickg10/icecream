@@ -504,10 +504,24 @@ static const unsigned int max_jobs_per_expansion_step = 64;
 struct PendingExpansion {
     GetCSMsg msg;                 // decoded request, retained verbatim
     unsigned int next_index;      // how many jobs have been created so far
-    PendingExpansion(const GetCSMsg &m) : msg(m), next_index(0) {}
+    unsigned int master_job_id;   // sibling-chain anchor; 0 until the first
+                                  // job exists (or after the master ended)
+    PendingExpansion(const GetCSMsg &m)
+        : msg(m), next_index(0), master_job_id(0) {}
 };
-/* Keyed by the submitter's channel fd; erased on teardown (handle_end).  */
-static map<int, PendingExpansion *> pending_expansions;
+/* Per-connection FIFO of unfinished requests, keyed by the submitter's
+   channel fd; erased on teardown (handle_end).  A deque, not a single slot:
+   a daemon may send another request while one is still expanding, and each
+   must be admitted in arrival order with its own full count.  */
+static map<int, deque<PendingExpansion> > pending_expansions;
+/* Round-robin position for resuming pending requests, so the lowest fd does
+   not monopolise every leftover budget.  */
+static int pending_service_cursor = -1;
+/* Set when pending work found the loop budget already spent; the next
+   iteration then serves pending requests FIRST, before new ingress.  Strict
+   alternation under contention: new traffic cannot starve half-finished
+   requests, and pending backlogs cannot starve new traffic.  */
+static bool pending_expansions_starved = false;
 static uint64_t jobs_admitted_total = 0;   // lifetime; exposed via 'estimates'
 
 static bool handle_activity(CompileServer *cs);
@@ -518,7 +532,7 @@ static bool handle_activity(CompileServer *cs);
 static bool drain_connection(CompileServer *cs, bool *more)
 {
     while (inbound_budget_remaining > 0) {
-        const uint64_t before = jobs_admitted_total;
+        const int budget_before = inbound_budget_remaining;
         const bool quiet = cs->read_a_bit() && !cs->has_msg();
         if (quiet) {
             return true;
@@ -526,8 +540,14 @@ static bool drain_connection(CompileServer *cs, bool *more)
         if (!handle_activity(cs)) {
             return false;          // connection deleted by the handler
         }
-        const uint64_t admitted = jobs_admitted_total - before;
-        inbound_budget_remaining -= admitted > 0 ? int(admitted) : 1;
+        /* Job admission charges the budget at the admission site itself
+           (admit_request_jobs), which the resume path shares.  A message
+           that admitted nothing still costs one unit -- the budget bounds
+           work per loop iteration, and zero-cost messages would let a chatty
+           peer hold the loop indefinitely.  */
+        if (inbound_budget_remaining == budget_before) {
+            --inbound_budget_remaining;
+        }
     }
     /* Budget exhausted with data still pending: poll() cannot report bytes
        already sitting in userspace, so the caller re-polls with a zero
@@ -779,38 +799,52 @@ static bool submitter_accepts_dispatch(CompileServer *submitter)
         && submitter->outstandingDispatches() < effective_dispatch_credit();
 }
 
-static bool handle_cs_request(MsgChannel *cs, Msg *_m);
+static bool admit_request_jobs(CompileServer *submitter, PendingExpansion &req);
 
-/* Resume any request whose expansion was cut short by the loop budget.  A
+/* Resume requests whose expansion was cut short by the loop budget.  A
    caller that asked for N replies still gets N; the work is merely spread
-   across iterations.  Returns true if anything remains for a later turn.  */
+   across iterations.  Connections are served round-robin from a persistent
+   cursor -- restarting from begin() every turn would let the lowest fd
+   monopolise whatever budget is left -- and each serviced connection
+   advances only the FRONT of its FIFO, preserving per-connection request
+   order.  Returns true if anything remains for a later turn.  */
 static bool expand_pending_requests()
 {
+    if (pending_expansions.empty()) {
+        return false;
+    }
+
+    map<int, deque<PendingExpansion> >::iterator it =
+        pending_expansions.upper_bound(pending_service_cursor);
+    const size_t rounds = pending_expansions.size();
     bool more = false;
-    for (map<int, PendingExpansion *>::iterator it = pending_expansions.begin();
-            it != pending_expansions.end();) {
+    for (size_t k = 0; k < rounds; ++k) {
+        if (it == pending_expansions.end()) {
+            it = pending_expansions.begin();
+        }
         const int fd = it->first;
-        PendingExpansion *pe = it->second;
         map<int, CompileServer *>::const_iterator cit = fd2cs.find(fd);
         if (cit == fd2cs.end()) {
-            delete pe;                      // submitter gone; drop the record
-            pending_expansions.erase(it++);
+            it = pending_expansions.erase(it);   // submitter gone
             continue;
         }
-        ++it;
         if (inbound_budget_remaining <= 0) {
-            more = true;
-            continue;
+            /* Ask for the pending-first turn: without it, iterations whose
+               budget is always spent by new ingress would never get here
+               with anything left.  */
+            pending_expansions_starved = true;
+            return true;
         }
-        /* handle_cs_request() picks up at next_index and rewrites the record
-           (or erases it when the count is fulfilled).  */
-        GetCSMsg resume(pe->msg);
-        resume.count = pe->msg.count - pe->next_index;
-        pending_expansions.erase(fd);
-        delete pe;
-        handle_cs_request(cit->second, &resume);
-        if (pending_expansions.find(fd) != pending_expansions.end()) {
+        deque<PendingExpansion> &q = it->second;
+        if (!q.empty() && admit_request_jobs(cit->second, q.front())) {
+            q.pop_front();
+        }
+        pending_service_cursor = fd;
+        if (q.empty()) {
+            it = pending_expansions.erase(it);
+        } else {
             more = true;
+            ++it;
         }
     }
     return more;
@@ -954,48 +988,49 @@ static void remove_job_request(const JobRequestPosition& pos)
 
 static string dump_job(Job *job, bool verbose);
 
-static bool handle_cs_request(MsgChannel *cs, Msg *_m)
+/* Materialise jobs for one request, resuming at req.next_index, until the
+   request is complete or the per-step / per-loop budget stops it.  Shared by
+   direct ingress (handle_cs_request) and the pending-expansion resume path,
+   so both charge the same budget and build the same sibling chain.  Advances
+   req in place; returns true when the request is fully admitted.
+
+   At least one job is always made per call: a request must progress every
+   time it is serviced, or an exhausted budget could park it forever.  */
+static bool admit_request_jobs(CompileServer *submitter, PendingExpansion &req)
 {
-    GetCSMsg *m = dynamic_cast<GetCSMsg *>(_m);
+    const GetCSMsg &m = req.msg;
 
-    if (!m) {
-        return false;
-    }
-
-    CompileServer *submitter = static_cast<CompileServer *>(cs);
-
-    submitter->setClientCount(m->client_count);
-
+    /* Re-anchor the sibling chain.  The master may have been dispatched and
+       finished (or its submitter's earlier jobs discarded) between steps; in
+       that case the chain degrades exactly as the released scheduler's
+       best-effort chain does when the master is dispatched first.  */
     Job *master_job = nullptr;
-
-    /* Materialise as many jobs as the loop budget allows; any remainder is
-       retained and resumed (see expand_pending_requests), so the caller
-       still receives exactly m->count replies.  */
-    unsigned int count = m->count;
-    if (count == 0) {
-        count = 1;
+    if (req.master_job_id) {
+        map<unsigned int, Job *>::const_iterator mit = jobs.find(req.master_job_id);
+        if (mit != jobs.end()) {
+            master_job = mit->second;
+        } else {
+            req.master_job_id = 0;
+        }
     }
+
     unsigned int made = 0;
-    for (unsigned int i = 0; i < count; ++i) {
-        if (made >= max_jobs_per_expansion_step
-                || (made > 0 && inbound_budget_remaining - int(made) <= 0)) {
-            /* Stop here and remember the rest.  At least one job is always
-               made so a request cannot starve.  */
-            PendingExpansion *&slot = pending_expansions[submitter->fd];
-            if (!slot) {
-                slot = new PendingExpansion(*m);
-            }
-            slot->next_index = i;
-            break;
+    for (unsigned int i = req.next_index; i < m.count; ++i) {
+        if (made > 0
+                && (made >= max_jobs_per_expansion_step
+                    || inbound_budget_remaining <= 0)) {
+            req.next_index = i;
+            return false;
         }
         ++made;
+        --inbound_budget_remaining;
         ++jobs_admitted_total;
         submitter->admittedJobsIncrement();
         Job *job = create_new_job(submitter);
-        job->setEnvironments(m->versions);
-        job->setTargetPlatform(m->target);
-        job->setArgFlags(m->arg_flags);
-        switch(m->lang) {
+        job->setEnvironments(m.versions);
+        job->setTargetPlatform(m.target);
+        job->setArgFlags(m.arg_flags);
+        switch(m.lang) {
             case CompileJob::Lang_C:
                 job->setLanguage("C");
                 break;
@@ -1015,12 +1050,12 @@ static bool handle_cs_request(MsgChannel *cs, Msg *_m)
                 job->setLanguage("???"); // presumably newer client?
                 break;
         }
-        job->setFileName(m->filename);
-        job->setLocalClientId(m->client_id);
-        job->setPreferredHost(m->preferred_host);
-        job->setMinimalHostVersion(m->minimal_host_version);
-        job->setRequiredFeatures(m->required_features);
-        job->setNiceness(max(0, min(20,int(m->niceness))));
+        job->setFileName(m.filename);
+        job->setLocalClientId(m.client_id);
+        job->setPreferredHost(m.preferred_host);
+        job->setMinimalHostVersion(m.minimal_host_version);
+        job->setRequiredFeatures(m.required_features);
+        job->setNiceness(max(0, min(20,int(m.niceness))));
         enqueue_job_request(job);
         std::ostream &dbg = log_info();
         dbg << "NEW " << job->id() << " client="
@@ -1037,14 +1072,60 @@ static bool handle_cs_request(MsgChannel *cs, Msg *_m)
             }
         }
 
-        dbg << "] " << m->filename << " " << job->language() << " " << job->niceness() << endl;
-        notify_monitors(new MonGetCSMsg(job->id(), submitter->hostId(), m));
+        dbg << "] " << m.filename << " " << job->language() << " " << job->niceness();
 
         if (!master_job) {
             master_job = job;
+            req.master_job_id = job->id();
         } else {
             master_job->appendJob(job);
+            /* Chain membership in the admission record: multi-count siblings
+               share the master's environment pinning, and a resumed request
+               must land on the SAME master -- this line is what a test can
+               hold against that.  */
+            dbg << " master=" << master_job->id();
         }
+        dbg << endl;
+        notify_monitors(new MonGetCSMsg(job->id(), submitter->hostId(), &m));
+    }
+
+    req.next_index = m.count;
+    return true;
+}
+
+static bool handle_cs_request(MsgChannel *cs, Msg *_m)
+{
+    GetCSMsg *m = dynamic_cast<GetCSMsg *>(_m);
+
+    if (!m) {
+        return false;
+    }
+
+    CompileServer *submitter = static_cast<CompileServer *>(cs);
+
+    submitter->setClientCount(m->client_count);
+
+    /* A count of zero asks for zero replies: admit nothing, exactly as the
+       released scheduler's `for (i < count)` loop did.  Coercing it to one
+       would manufacture a reply the caller never waits for.  */
+    if (m->count == 0) {
+        return true;
+    }
+
+    map<int, deque<PendingExpansion> >::iterator pit =
+        pending_expansions.find(submitter->fd);
+    if (pit != pending_expansions.end() && !pit->second.empty()) {
+        /* An earlier request from this daemon is still expanding.  Queue
+           this one behind it whole: requests are admitted in arrival order,
+           so a newcomer can neither displace the older request's remaining
+           jobs nor have its own admitted ahead of them.  */
+        pit->second.push_back(PendingExpansion(*m));
+        return true;
+    }
+
+    PendingExpansion req(*m);
+    if (!admit_request_jobs(submitter, req)) {
+        pending_expansions[submitter->fd].push_back(req);
     }
 
     return true;
@@ -2551,7 +2632,7 @@ static bool handle_end(CompileServer *toremove, Msg *m)
         break;
     }
 
-    /* Drop any half-finished multi-job expansion belonging to this peer.
+    /* Drop any half-finished multi-job expansions belonging to this peer.
        The map is keyed by the channel fd, and the kernel reuses a closed fd
        for the next accept(): without this erase a record outlives its owner
        and the next connection to land on the same number inherits it, so a
@@ -2559,14 +2640,7 @@ static bool handle_end(CompileServer *toremove, Msg *m)
        mid-handshake -- peer.  The lazy sweep in expand_pending_requests()
        cannot cover that case: it only drops records whose fd is ABSENT from
        fd2cs, and a reused fd is present again.  */
-    {
-        map<int, PendingExpansion *>::iterator pit =
-            pending_expansions.find(toremove->fd);
-        if (pit != pending_expansions.end()) {
-            delete pit->second;
-            pending_expansions.erase(pit);
-        }
-    }
+    pending_expansions.erase(toremove->fd);
 
     fd2cs.erase(toremove->fd);
     delete toremove;
@@ -3157,6 +3231,17 @@ int main(int argc, char *argv[])
            before poll(), where has_msg() only sees userspace buffers and a
            budget governs nothing.  */
         inbound_budget_remaining = max_inbound_units_per_loop;
+
+        /* Pending-first turn: last iteration's new traffic spent the whole
+           budget before half-finished requests could resume.  Serve them
+           now, from the fresh budget, before this iteration's ingress --
+           strict alternation, so neither side can starve the other.  */
+        if (pending_expansions_starved) {
+            pending_expansions_starved = false;
+            if (expand_pending_requests()) {
+                has_buffered_inbound = true;
+            }
+        }
         /* NOT a per-iteration local: the post-poll reads below set it, while
            the timeout decision that consumes it runs BEFORE poll() -- so it
            must carry across the iteration boundary or the zero-timeout

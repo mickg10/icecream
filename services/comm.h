@@ -1017,7 +1017,7 @@ public:
         clientid = job_id = 0;
     }
 
-    MonGetCSMsg(int jobid, int hostid, GetCSMsg *m)
+    MonGetCSMsg(int jobid, int hostid, const GetCSMsg *m)
         : GetCSMsg(Environments(), m->filename, m->lang, 1, m->target, 0, std::string(), false, m->client_count, m->niceness)
         , job_id(jobid)
         , clientid(hostid)

@@ -331,6 +331,12 @@ int main(int argc, char **argv)
        dropping the tail would silently break the wire contract (count is
        the number of replies the caller waits for).  njobs is the count.  */
     const bool multicount_mode = argc > 5 && strcmp(argv[5], "multicount") == 0;
+    /* "contract": the general request contract beyond single count=N --
+       per-connection FIFO of queued requests, count=0 semantics, concurrent
+       multi-daemon expansion, disconnect/fd-reuse hygiene, and sibling-chain
+       stability across resume steps.  njobs is the primary count and should
+       exceed the per-step bound (64) so expansion actually resumes.  */
+    const bool contract_mode = argc > 5 && strcmp(argv[5], "contract") == 0;
     /* "mixedrole": the realistic topology.  The submitter also has compile
        capacity, so the scheduler can place work back on it (NoCS / local
        UseCS).  Local decisions reserve no farm slot and must NOT consume
@@ -812,6 +818,266 @@ int main(int argc, char **argv)
         REQUIRE(replies == njobs,
                 "a count=N request yields exactly N replies (resumable expansion)");
         REQUIRE(worst_reply.load() < 5.0, "scheduler stayed responsive");
+        shutdown = true;
+        probe_thread.join();
+        cs_thread.join();
+        healthy_thread.join();
+        close(ctrl);
+        delete sub; delete sub2; delete cs;
+        kill(sched, SIGTERM);
+        waitpid(sched, nullptr, 0);
+        if (failures) {
+            fprintf(stderr, "RESULT: FAIL (%d)\n", failures);
+            return 1;
+        }
+        fprintf(stderr, "RESULT: PASS\n");
+        return 0;
+    }
+
+    if (contract_mode) {
+        /* The general request contract, beyond the single count=N case:
+
+             1. two queued requests on ONE connection are admitted whole and
+                in arrival order (per-connection FIFO, not a one-slot record
+                that loses the second request's tail);
+             2. count=0 asks for zero replies and admits nothing;
+             3. a second daemon expanding a large count concurrently gets its
+                exact count too (rotation, no lowest-fd monopoly);
+             4. a daemon that disconnects mid-expansion leaves nothing behind:
+                a fresh connection (likely reusing the fd) receives no
+                unsolicited replies and its own request works;
+             5. every job of a resumed request carries the SAME master id in
+                the scheduler log (sibling chain survives resume steps).  */
+        const unsigned c1 = (unsigned)njobs;          // large: forces resume steps
+        const unsigned c2 = (unsigned)(njobs * 4 / 5);
+        const long long admitted0 = query_submitter_admitted(port, "fakesub");
+
+        auto send_count = [&](MsgChannel *ch, unsigned count, unsigned client_id,
+                              const char *fname) {
+            GetCSMsg g(Environments{std::make_pair(std::string(kPlatform), std::string(kEnv))},
+                       fname, CompileJob::Lang_CXX, count, kPlatform, 0,
+                       std::string(), 0, 0, 0);
+            g.client_id = client_id;
+            return ch->send_msg(g);
+        };
+
+        // ---- case 1+2: back-to-back requests plus a count=0 on one channel
+        fprintf(stderr, "# contract: count=%u then count=%u then count=0 on one connection\n", c1, c2);
+        REQUIRE(send_count(sub, c1, 101, "contractA.cpp"), "request A sent");
+        REQUIRE(send_count(sub, c2, 102, "contractB.cpp"), "request B sent");
+        REQUIRE(send_count(sub, 0,  103, "contractZ.cpp"), "count=0 request sent");
+
+        // ---- case 3: a second daemon expands a large count concurrently
+        MsgChannel *subB = connect_daemon(port, 0);
+        REQUIRE(subB != nullptr, "concurrent daemon connected");
+        std::atomic<int> repliesB{0};
+        std::thread subB_thread([&] {
+            if (!subB) {
+                return;
+            }
+            LoginMsg login(0, "fakesub3", kPlatform, 0);
+            login.envs.push_back(std::make_pair(kPlatform, kEnv));
+            login.max_kids = 0;
+            login.noremote = true;
+            if (!subB->send_msg(login)) {
+                return;
+            }
+            if (!send_count(subB, c1, 201, "contractC.cpp")) {
+                return;
+            }
+            const Clock::time_point t0 = Clock::now();
+            while (repliesB < (int)c1 && secs_since(t0) < 120) {
+                Msg *m = subB->get_msg(2);
+                if (!m) {
+                    continue;
+                }
+                if (MSG_IS(m, USE_CS)) {
+                    UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                    if (u && u->client_id == 201) {
+                        confirm_job(u->job_id);
+                        ++repliesB;
+                    }
+                } else if (MSG_IS(m, NO_CS)) {
+                    NoCSMsg *n = dynamic_cast<NoCSMsg *>(m);
+                    if (n && n->client_id == 201) {
+                        confirm_job(n->job_id);
+                        ++repliesB;
+                    }
+                }
+                delete m;
+            }
+        });
+
+        // ---- collect replies for A/B/zero on the main channel
+        std::vector<unsigned> ids1, ids2;
+        int replies_zero = 0;
+        {
+            const Clock::time_point t0 = Clock::now();
+            while ((ids1.size() < c1 || ids2.size() < c2) && secs_since(t0) < 120) {
+                Msg *m = sub->get_msg(2);
+                if (!m) {
+                    continue;
+                }
+                unsigned jid = 0, cid = 0;
+                if (MSG_IS(m, USE_CS)) {
+                    UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                    if (u) { jid = u->job_id; cid = u->client_id; }
+                } else if (MSG_IS(m, NO_CS)) {
+                    NoCSMsg *n = dynamic_cast<NoCSMsg *>(m);
+                    if (n) { jid = n->job_id; cid = n->client_id; }
+                }
+                if (jid) {
+                    confirm_job(jid);
+                    if (cid == 101) {
+                        ids1.push_back(jid);
+                    } else if (cid == 102) {
+                        ids2.push_back(jid);
+                    } else if (cid == 103) {
+                        ++replies_zero;
+                    }
+                }
+                delete m;
+            }
+        }
+        subB_thread.join();
+        fprintf(stderr, "# contract: A=%zu/%u B=%zu/%u zero=%d concurrent=%d/%u\n",
+                ids1.size(), c1, ids2.size(), c2, replies_zero, repliesB.load(), c1);
+        REQUIRE(ids1.size() == c1, "first queued request yields exactly its count");
+        REQUIRE(ids2.size() == c2, "second queued request yields exactly its count");
+        REQUIRE(replies_zero == 0, "count=0 yields zero replies");
+        REQUIRE(repliesB == (int)c1, "a concurrently expanding daemon gets its exact count");
+        {
+            /* Admission order: job ids are globally monotonic, so FIFO per
+               connection means every id of A precedes every id of B.  */
+            unsigned max1 = 0, min2 = ~0u;
+            for (unsigned id : ids1) { if (id > max1) { max1 = id; } }
+            for (unsigned id : ids2) { if (id < min2) { min2 = id; } }
+            REQUIRE(!ids1.empty() && !ids2.empty() && max1 < min2,
+                    "requests on one connection are admitted in arrival order");
+        }
+        {
+            const long long admitted1 = query_submitter_admitted(port, "fakesub");
+            REQUIRE(admitted1 - admitted0 == (long long)(c1 + c2),
+                    "admitted counter moved by exactly the two real counts (count=0 admitted nothing)");
+        }
+
+        // ---- case 5: sibling chain identical across resume steps
+        {
+            std::map<unsigned, unsigned> master_of;   // job id -> logged master id
+            FILE *lf = fopen("schedbp-scheduler.log", "r");
+            if (lf) {
+                char line[4096];
+                while (fgets(line, sizeof(line), lf)) {
+                    const char *nw = strstr(line, "NEW ");
+                    if (!nw) {
+                        continue;
+                    }
+                    const char *ms = strstr(nw, " master=");
+                    if (!ms) {
+                        continue;
+                    }
+                    master_of[(unsigned)atoi(nw + 4)] = (unsigned)atoi(ms + 8);
+                }
+                fclose(lf);
+            }
+            unsigned min1 = ~0u;
+            for (unsigned id : ids1) { if (id < min1) { min1 = id; } }
+            int chained = 0, broken = 0;
+            for (unsigned id : ids1) {
+                if (id == min1) {
+                    continue;             // the master itself carries no tag
+                }
+                std::map<unsigned, unsigned>::const_iterator mit = master_of.find(id);
+                if (mit != master_of.end() && mit->second == min1) {
+                    ++chained;
+                } else {
+                    ++broken;
+                }
+            }
+            fprintf(stderr, "# contract: master chain %d chained / %d broken (master=%u)\n",
+                    chained, broken, min1);
+            REQUIRE(broken == 0 && chained == (int)c1 - 1,
+                    "every resumed job of request A logs the ORIGINAL master id");
+        }
+
+        // ---- case 4: disconnect mid-expansion, then a fresh connection
+        {
+            MsgChannel *subC = connect_daemon(port, 0);
+            REQUIRE(subC != nullptr, "doomed daemon connected");
+            if (subC) {
+                LoginMsg login(0, "fakesub4", kPlatform, 0);
+                login.envs.push_back(std::make_pair(kPlatform, kEnv));
+                login.max_kids = 0;
+                login.noremote = true;
+                REQUIRE(subC->send_msg(login), "doomed daemon logged in");
+                REQUIRE(send_count(subC, 200, 301, "contractD.cpp"),
+                        "doomed daemon requested count=200");
+                int seen = 0;
+                const Clock::time_point t0 = Clock::now();
+                while (seen < 10 && secs_since(t0) < 30) {
+                    Msg *m = subC->get_msg(2);
+                    if (!m) {
+                        continue;
+                    }
+                    if (MSG_IS(m, USE_CS) || MSG_IS(m, NO_CS)) {
+                        ++seen;   // deliberately NOT confirmed: it is about to die
+                    }
+                    delete m;
+                }
+                REQUIRE(seen == 10, "doomed daemon saw the first ten replies");
+                delete subC;      // abrupt close, ~190 jobs still expanding
+            }
+
+            /* The very next accept() is the natural fd-reuse candidate.  */
+            MsgChannel *subD = connect_daemon(port, 0);
+            REQUIRE(subD != nullptr, "successor daemon connected");
+            if (subD) {
+                LoginMsg login(0, "fakesub5", kPlatform, 0);
+                login.envs.push_back(std::make_pair(kPlatform, kEnv));
+                login.max_kids = 0;
+                login.noremote = true;
+                REQUIRE(subD->send_msg(login), "successor logged in");
+                int unsolicited = 0;
+                const Clock::time_point t0 = Clock::now();
+                while (secs_since(t0) < 4) {
+                    Msg *m = subD->get_msg(1);
+                    if (!m) {
+                        continue;
+                    }
+                    if (MSG_IS(m, USE_CS) || MSG_IS(m, NO_CS)) {
+                        ++unsolicited;
+                    }
+                    delete m;
+                }
+                REQUIRE(unsolicited == 0,
+                        "a connection reusing the fd inherits NO replies from the dead request");
+                REQUIRE(send_count(subD, 5, 401, "contractE.cpp"),
+                        "successor sent its own count=5");
+                int got = 0;
+                const Clock::time_point t1 = Clock::now();
+                while (got < 5 && secs_since(t1) < 30) {
+                    Msg *m = subD->get_msg(2);
+                    if (!m) {
+                        continue;
+                    }
+                    if (MSG_IS(m, USE_CS)) {
+                        UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                        if (u && u->client_id == 401) { confirm_job(u->job_id); ++got; }
+                    } else if (MSG_IS(m, NO_CS)) {
+                        NoCSMsg *n = dynamic_cast<NoCSMsg *>(m);
+                        if (n && n->client_id == 401) { confirm_job(n->job_id); ++got; }
+                    }
+                    delete m;
+                }
+                REQUIRE(got == 5, "successor's own request works normally");
+                delete subD;
+            }
+        }
+
+        REQUIRE(worst_reply.load() < 5.0, "scheduler stayed responsive throughout");
+        if (subB) {
+            delete subB;
+        }
         shutdown = true;
         probe_thread.join();
         cs_thread.join();

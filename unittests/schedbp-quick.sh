@@ -24,4 +24,11 @@ dir=$(dirname "$0")
 # gate itself out of a live farm (BP-1).
 "$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 200 5 mixedrole || exit 1
 # Run 5 -- multi-count: one GetCS asking for N replies must yield exactly N.
-exec "$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 65 5 multicount
+"$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 65 5 multicount || exit 1
+# Run 6 -- the general request contract: two queued requests on one
+# connection admitted whole and in order, count=0 admits nothing, a second
+# daemon expanding concurrently gets its exact count, disconnect/fd-reuse
+# leaves nothing behind, and the sibling chain survives resume steps
+# (asserted from the NEW ... master= log lines).  100 > the 64-per-step
+# bound, so expansion genuinely resumes.
+exec "$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 100 5 contract
