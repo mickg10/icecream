@@ -126,7 +126,7 @@ static const unsigned int kCsPort = 10245;
 
 static pid_t start_scheduler(const std::string &binary, const std::string &shim,
                              int port, const std::string &logfile,
-                             const char *verbosity)
+                             const char *verbosity, const char *extra_arg = nullptr)
 {
     pid_t pid = fork();
     if (pid != 0) {
@@ -147,7 +147,11 @@ static pid_t start_scheduler(const std::string &binary, const std::string &shim,
     }
     char portbuf[16];
     snprintf(portbuf, sizeof(portbuf), "%d", port);
-    execl(binary.c_str(), binary.c_str(), "-p", portbuf, verbosity, (char *)nullptr);
+    if (extra_arg) {
+        execl(binary.c_str(), binary.c_str(), "-p", portbuf, verbosity, extra_arg, (char *)nullptr);
+    } else {
+        execl(binary.c_str(), binary.c_str(), "-p", portbuf, verbosity, (char *)nullptr);
+    }
     perror("execl icecc-scheduler");
     _exit(127);
 }
@@ -345,6 +349,21 @@ int main(int argc, char **argv)
        stability across resume steps.  njobs is the primary count and should
        exceed the per-step bound (64) so expansion actually resumes.  */
     const bool contract_mode = argc > 5 && strcmp(argv[5], "contract") == 0;
+    /* "promotion": the SCH-1 hard-promotion gate.  A queued request older
+       than the 60s bound must be dispatched ahead of a fresh request whose
+       score is numerically far superior.  Runs at the PRODUCTION bound (no
+       test-only knob), so the mode takes ~70s of wall time by design.  */
+    const bool promotion_mode = argc > 5 && strcmp(argv[5], "promotion") == 0;
+    /* "heterogeneous": the SCH-3 circular-traversal gate.  With the scored
+       head unservable NOW (its only capable farm host is at capacity), a
+       compatible job for a DIFFERENT platform must still be dispatched --
+       the selection walk has to continue past the head, circularly.  */
+    const bool heterogeneous_mode = argc > 5 && strcmp(argv[5], "heterogeneous") == 0;
+    /* "stallevict": the BP-1 liveness bound.  With --dispatch-stall-timeout
+       at its 10s floor, a submitter whose dispatched jobs never reach
+       JobBegin is evicted at the bound -- not before it, and not never --
+       while a healthy submitter keeps being served throughout.  */
+    const bool stallevict_mode = argc > 5 && strcmp(argv[5], "stallevict") == 0;
     /* "mixedrole": the realistic topology.  The submitter also has compile
        capacity, so the scheduler can place work back on it (NoCS / local
        UseCS).  Local decisions reserve no farm slot and must NOT consume
@@ -377,8 +396,14 @@ int main(int argc, char **argv)
     signal(SIGPIPE, SIG_IGN);
 
     fprintf(stderr, "# port=%d jobs=%d clog=%ds\n", port, njobs, clog_s);
-    pid_t sched = start_scheduler(scheduler_bin, shim, port, "schedbp-scheduler.log",
-                                  perf_mode ? "-v" : "-vvv");
+    /* Per-mode log name: `make -j check` may run the quick and stress
+       scripts concurrently from the same directory, and a shared log file
+       once turned a real FAIL into a recorded PASS.  */
+    const std::string sched_log = std::string("schedbp-scheduler-")
+        + (argc > 5 ? argv[5] : "default") + ".log";
+    pid_t sched = start_scheduler(scheduler_bin, shim, port, sched_log,
+                                  perf_mode ? "-v" : "-vvv",
+                                  stallevict_mode ? "--dispatch-stall-timeout=10" : nullptr);
     if (sched < 0) {
         perror("fork");
         return 2;
@@ -453,10 +478,28 @@ int main(int argc, char **argv)
        dispatch credit is released by.  A frozen submitter never enqueues
        here, which is precisely why its credit stays held.  */
     std::mutex confirm_mutex;
-    std::vector<unsigned int> to_confirm;
-    auto confirm_job = [&](unsigned int job_id) {
+    struct Confirm {
+        unsigned int job_id;
+        bool begin;
+        bool done;
+        unsigned int real_msec;   // reported compile time when done
+    };
+    std::vector<Confirm> to_confirm;
+    auto enqueue_confirm = [&](unsigned int job_id, bool begin, bool done,
+                               unsigned int real_msec) {
         std::lock_guard<std::mutex> lock(confirm_mutex);
-        to_confirm.push_back(job_id);
+        to_confirm.push_back(Confirm{job_id, begin, done, real_msec});
+    };
+    auto confirm_job = [&](unsigned int job_id) {
+        enqueue_confirm(job_id, true, true, 0);
+    };
+    /* Split halves, for modes that must hold a slot busy (begin without
+       done) or report a chosen runtime (feeds the estimate cache).  */
+    auto begin_job = [&](unsigned int job_id) {
+        enqueue_confirm(job_id, true, false, 0);
+    };
+    auto finish_job = [&](unsigned int job_id, unsigned int real_msec) {
+        enqueue_confirm(job_id, false, true, real_msec);
     };
     std::thread cs_thread([&] {
         // keep the CS side drained, confirm assignments promptly (a real CS
@@ -471,26 +514,32 @@ int main(int argc, char **argv)
                 return;
             }
             {
-                std::vector<unsigned int> batch;
+                std::vector<Confirm> batch;
                 {
                     std::lock_guard<std::mutex> lock(confirm_mutex);
                     batch.swap(to_confirm);
                 }
-                for (unsigned int jid : batch) {
-                    JobBeginMsg jb(jid, 1);
-                    if (!cs->send_msg(jb)) {
-                        cs_alive = false;
-                        return;
+                for (const Confirm &c : batch) {
+                    if (c.begin) {
+                        JobBeginMsg jb(c.job_id, 1);
+                        if (!cs->send_msg(jb)) {
+                            cs_alive = false;
+                            return;
+                        }
                     }
-                    /* Complete the job immediately so the slot recycles.
-                       On a small farm this is what lets a healthy submitter
-                       keep flowing through the capacity the clamp reserves
-                       for it; unconfirmed (never-read) assignments keep
-                       holding their slots, exactly like a real dead client.  */
-                    JobDoneMsg jd(jid, 0, JobDoneMsg::FROM_SERVER);
-                    if (!cs->send_msg(jd)) {
-                        cs_alive = false;
-                        return;
+                    /* Completing promptly is what recycles the slot.  On a
+                       small farm this lets a healthy submitter keep flowing
+                       through the capacity the clamp reserves for it;
+                       unconfirmed (never-read) assignments keep holding
+                       their slots, exactly like a real dead client.  Modes
+                       that hold a slot busy enqueue the begin half only.  */
+                    if (c.done) {
+                        JobDoneMsg jd(c.job_id, 0, JobDoneMsg::FROM_SERVER);
+                        jd.real_msec = c.real_msec;
+                        if (!cs->send_msg(jd)) {
+                            cs_alive = false;
+                            return;
+                        }
                     }
                 }
             }
@@ -976,7 +1025,7 @@ int main(int argc, char **argv)
         // ---- case 5: sibling chain identical across resume steps
         {
             std::map<unsigned, unsigned> master_of;   // job id -> logged master id
-            FILE *lf = fopen("schedbp-scheduler.log", "r");
+            FILE *lf = fopen(sched_log.c_str(), "r");
             if (lf) {
                 char line[4096];
                 while (fgets(line, sizeof(line), lf)) {
@@ -1106,6 +1155,368 @@ int main(int argc, char **argv)
         return 0;
     }
 
+    if (promotion_mode) {
+        /* SCH-1: the 60s hard-promotion rule, at the production bound.
+
+           One farm slot.  Warm two estimate-cache keys through real
+           JobDone reports: quickjob.cpp ~100ms, bigjob.cpp ~90000ms.  Hold
+           the slot busy and let a quickjob request age past the bound;
+           then submit a fresh bigjob whose score (2*estimate) outranks the
+           old request's age-score for another ~120s.  When the slot frees,
+           numeric selection would pick the bigjob -- ONLY the hard rule
+           dispatches the old request first.  The healthy submitter's
+           continuous stream runs throughout, so the promoted request also
+           beats a live population of younger competitors.  */
+        auto send_named = [&](const char *fname, unsigned cid) {
+            GetCSMsg g(Environments{std::make_pair(std::string(kPlatform), std::string(kEnv))},
+                       fname, CompileJob::Lang_CXX, 1, kPlatform, 0,
+                       std::string(), 0, 0, 0);
+            g.client_id = cid;
+            return sub->send_msg(g);
+        };
+        /* One reply for a specific client id; confirms/finishes others'
+           replies as they pass so the farm keeps recycling.  */
+        auto await_reply = [&](unsigned cid, double timeout_s) -> unsigned {
+            const Clock::time_point t0 = Clock::now();
+            while (secs_since(t0) < timeout_s) {
+                Msg *m = sub->get_msg(2);
+                if (!m) {
+                    continue;
+                }
+                unsigned jid = 0, got_cid = 0;
+                if (MSG_IS(m, USE_CS)) {
+                    UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                    if (u) { jid = u->job_id; got_cid = u->client_id; }
+                } else if (MSG_IS(m, NO_CS)) {
+                    NoCSMsg *n = dynamic_cast<NoCSMsg *>(m);
+                    if (n) { jid = n->job_id; got_cid = n->client_id; }
+                }
+                if (jid && got_cid == cid) {
+                    delete m;
+                    return jid;
+                }
+                if (jid) {
+                    confirm_job(jid);   // someone else's; keep the farm alive
+                }
+                delete m;
+            }
+            return 0;
+        };
+
+        fprintf(stderr, "# promotion: warming estimates (3x quick@100ms, 3x big@90000ms)\n");
+        for (int round = 0; round < 3; ++round) {
+            unsigned jid = 0;
+            REQUIRE(send_named("quickjob.cpp", 6001) && (jid = await_reply(6001, 30)) != 0,
+                    "quick warm round dispatched");
+            begin_job(jid); finish_job(jid, 100);
+            REQUIRE(send_named("bigjob.cpp", 6002) && (jid = await_reply(6002, 30)) != 0,
+                    "big warm round dispatched");
+            begin_job(jid); finish_job(jid, 90000);
+        }
+
+        /* Hold the host COMPLETELY: the slot and the preload window (a
+           one-slot host accepts maxJobs + 1 + maxJobs/4 = 2 assignments).
+           With only the slot held, the aged request below would simply be
+           preloaded during the wait and the promotion decision would never
+           run.  */
+        fprintf(stderr, "# promotion: occupying the slot and the preload window\n");
+        unsigned occ1 = 0, occ2 = 0;
+        REQUIRE(send_named("occupier.cpp", 6003) && (occ1 = await_reply(6003, 30)) != 0,
+                "occupier 1 dispatched");
+        /* Begin IMMEDIATELY: on a one-slot farm the dispatch credit clamps
+           to one, so an assigned-but-unbegun job gates its submitter and
+           nothing else of ours -- occupier 2 included -- can dispatch.
+           Begin (without done) holds the assignment while releasing the
+           credit.  */
+        begin_job(occ1);
+        REQUIRE(send_named("occupier2.cpp", 6004) && (occ2 = await_reply(6004, 60)) != 0,
+                "occupier 2 assigned (preload window)");
+        begin_job(occ2);
+
+        REQUIRE(send_named("quickjob.cpp", 7001), "old request submitted");
+        const Clock::time_point t_old = Clock::now();
+        fprintf(stderr, "# promotion: aging the request past the 60s bound (production constant)\n");
+        int premature = 0;
+        while (secs_since(t_old) < 61.5) {
+            Msg *m = sub->get_msg(2);
+            if (!m) {
+                continue;
+            }
+            if (MSG_IS(m, USE_CS) || MSG_IS(m, NO_CS)) {
+                ++premature;   // nothing may dispatch while the slot is held
+            }
+            delete m;
+        }
+        REQUIRE(premature == 0, "no dispatch while the only slot was held");
+
+        REQUIRE(send_named("bigjob.cpp", 7002), "fresh high-score request submitted");
+        usleep(500 * 1000);
+        finish_job(occ1, 30000);   // free ONE window: the next choice is the test
+
+        /* The FIRST dispatch to this submitter after the release must be the
+           overdue quickjob, although the fresh bigjob outscores it by ~2x.  */
+        unsigned first_cid = 0, first_jid = 0;
+        {
+            const Clock::time_point t0 = Clock::now();
+            while (secs_since(t0) < 30 && first_jid == 0) {
+                Msg *m = sub->get_msg(2);
+                if (!m) {
+                    continue;
+                }
+                if (MSG_IS(m, USE_CS)) {
+                    UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                    if (u) { first_jid = u->job_id; first_cid = u->client_id; }
+                } else if (MSG_IS(m, NO_CS)) {
+                    NoCSMsg *n = dynamic_cast<NoCSMsg *>(m);
+                    if (n) { first_jid = n->job_id; first_cid = n->client_id; }
+                }
+                delete m;
+            }
+        }
+        fprintf(stderr, "# promotion: first dispatch after release went to client_id=%u\n", first_cid);
+        REQUIRE(first_jid != 0, "a dispatch followed the slot release");
+        REQUIRE(first_cid == 7001,
+                "the overdue request was promoted over the numerically superior one (SCH-1)");
+        if (first_jid) {
+            confirm_job(first_jid);
+        }
+        REQUIRE(await_reply(7002, 60) != 0, "the high-score request follows (liveness)");
+        begin_job(occ2); finish_job(occ2, 1000);   // leave a clean farm
+        REQUIRE(worst_reply.load() < 5.0, "scheduler stayed responsive");
+
+        shutdown = true;
+        probe_thread.join(); cs_thread.join(); healthy_thread.join();
+        close(ctrl);
+        delete sub; delete sub2; delete cs;
+        kill(sched, SIGTERM);
+        waitpid(sched, nullptr, 0);
+        if (failures) { fprintf(stderr, "RESULT: FAIL (%d)\n", failures); return 1; }
+        fprintf(stderr, "RESULT: PASS\n");
+        return 0;
+    }
+
+    if (heterogeneous_mode) {
+        /* SCH-3: the circular selection walk.  The scored head (an old
+           x86_64 request) is unservable NOW -- its only capable host holds
+           its single slot -- while a younger aarch64 request is servable on
+           a second host.  A forward-only walk from the head reports "no
+           suitable host" and the aarch64 request starves; the circular
+           repair must dispatch it immediately.  */
+        MsgChannel *csB = connect_daemon(port, 0);
+        REQUIRE(csB != nullptr, "second farm host connected");
+        std::mutex bconfirm_mutex;
+        std::vector<unsigned> b_to_confirm;
+        std::atomic<bool> csB_alive{true};
+        std::thread csB_thread([&] {
+            if (!csB) { return; }
+            LoginMsg login(10261, "fakecsB", "aarch64", 0);
+            login.envs.push_back(std::make_pair(std::string("aarch64"), std::string(kEnv)));
+            login.max_kids = 4;
+            login.noremote = false;
+            login.chroot_possible = true;
+            if (!csB->send_msg(login)) { csB_alive = false; return; }
+            StatsMsg stats;
+            csB->send_msg(stats);
+            Clock::time_point last_stats = Clock::now();
+            while (!shutdown) {
+                Msg *m = csB->get_msg(0, true);
+                delete m;
+                if (csB->at_eof()) { csB_alive = false; return; }
+                std::vector<unsigned> batch;
+                {
+                    std::lock_guard<std::mutex> lock(bconfirm_mutex);
+                    batch.swap(b_to_confirm);
+                }
+                for (unsigned jid : batch) {
+                    JobBeginMsg jb(jid, 1);
+                    JobDoneMsg jd(jid, 0, JobDoneMsg::FROM_SERVER);
+                    if (!csB->send_msg(jb) || !csB->send_msg(jd)) {
+                        csB_alive = false;
+                        return;
+                    }
+                }
+                if (secs_since(last_stats) > 10) {
+                    StatsMsg st;
+                    csB->send_msg(st);
+                    last_stats = Clock::now();
+                }
+                usleep(20 * 1000);
+            }
+        });
+
+        auto send_platform = [&](const char *fname, unsigned cid, const char *platform) {
+            GetCSMsg g(Environments{std::make_pair(std::string(platform), std::string(kEnv))},
+                       fname, CompileJob::Lang_CXX, 1, platform, 0,
+                       std::string(), 0, 0, 0);
+            g.client_id = cid;
+            return sub->send_msg(g);
+        };
+
+        /* Hold the x86_64 host COMPLETELY: its single compile slot and its
+           preload window (maxJobs + 1 + maxJobs/4 = 2 assignments for a
+           one-slot host).  One occupier holds the slot; the second parks in
+           the preload window.  Otherwise the head below would simply be
+           preloaded and the walk under test never runs.  */
+        unsigned occ1 = 0, occ2 = 0;
+        REQUIRE(send_platform("occupier.cpp", 8000, kPlatform), "occupier 1 submitted");
+        REQUIRE(send_platform("occupier2.cpp", 8005, kPlatform), "occupier 2 submitted");
+        {
+            const Clock::time_point t0 = Clock::now();
+            while ((occ1 == 0 || occ2 == 0) && secs_since(t0) < 30) {
+                Msg *m = sub->get_msg(2);
+                if (!m) { continue; }
+                UseCSMsg *u = MSG_IS(m, USE_CS) ? dynamic_cast<UseCSMsg *>(m) : nullptr;
+                if (u && u->client_id == 8000) { occ1 = u->job_id; }
+                if (u && u->client_id == 8005) { occ2 = u->job_id; }
+                delete m;
+            }
+        }
+        REQUIRE(occ1 != 0 && occ2 != 0,
+                "both occupiers assigned to the x86_64 host (slot + preload window)");
+        begin_job(occ1);
+
+        /* Old head: x86_64, currently unservable.  Age it a moment so it
+           outranks the aarch64 request on every numeric ordering.  */
+        REQUIRE(send_platform("headx86.cpp", 8001, kPlatform), "x86 head submitted");
+        sleep(3);
+        REQUIRE(send_platform("armjob.cpp", 8002, "aarch64"), "aarch64 request submitted");
+
+        /* The aarch64 request must dispatch promptly to fakecsB while the
+           head stays queued.  */
+        unsigned arm_jid = 0, arm_port = 0; int head_replies = 0;
+        {
+            const Clock::time_point t0 = Clock::now();
+            while (arm_jid == 0 && secs_since(t0) < 20) {
+                Msg *m = sub->get_msg(2);
+                if (!m) { continue; }
+                if (MSG_IS(m, USE_CS)) {
+                    UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                    if (u && u->client_id == 8002) { arm_jid = u->job_id; arm_port = u->port; }
+                    else if (u && u->client_id == 8001) { ++head_replies; }
+                } else if (MSG_IS(m, NO_CS)) {
+                    NoCSMsg *n = dynamic_cast<NoCSMsg *>(m);
+                    if (n && n->client_id == 8001) { ++head_replies; }
+                }
+                delete m;
+            }
+        }
+        fprintf(stderr, "# heterogeneous: aarch64 dispatched=%s port=%u, head replies meanwhile=%d\n",
+                arm_jid ? "yes" : "NO", arm_port, head_replies);
+        REQUIRE(arm_jid != 0,
+                "a compatible request behind an unservable head is dispatched (SCH-3 circular walk)");
+        /* The hostname field carries the address; the advertised remote
+           port is what distinguishes the two local fake hosts.  */
+        REQUIRE(arm_port == 10261, "it went to the aarch64 host");
+        REQUIRE(head_replies == 0, "the unservable head stayed queued, not bounced");
+        if (arm_jid) {
+            std::lock_guard<std::mutex> lock(bconfirm_mutex);
+            b_to_confirm.push_back(arm_jid);
+        }
+
+        /* Liveness: free one x86_64 assignment; the head must now dispatch
+           (into the freed preload window).  */
+        finish_job(occ1, 1000);
+        unsigned head_jid = 0;
+        {
+            const Clock::time_point t0 = Clock::now();
+            while (head_jid == 0 && secs_since(t0) < 30) {
+                Msg *m = sub->get_msg(2);
+                if (!m) { continue; }
+                if (MSG_IS(m, USE_CS)) {
+                    UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                    if (u && u->client_id == 8001) { head_jid = u->job_id; }
+                }
+                delete m;
+            }
+        }
+        REQUIRE(head_jid != 0, "the head dispatches once its host has capacity");
+        if (head_jid) {
+            confirm_job(head_jid);
+        }
+        REQUIRE(worst_reply.load() < 5.0, "scheduler stayed responsive");
+
+        shutdown = true;
+        probe_thread.join(); cs_thread.join(); healthy_thread.join(); csB_thread.join();
+        close(ctrl);
+        delete sub; delete sub2; delete cs; delete csB;
+        kill(sched, SIGTERM);
+        waitpid(sched, nullptr, 0);
+        if (failures) { fprintf(stderr, "RESULT: FAIL (%d)\n", failures); return 1; }
+        fprintf(stderr, "RESULT: PASS\n");
+        return 0;
+    }
+
+    if (stallevict_mode) {
+        /* BP-1's liveness bound, at the 10s CLI floor: a submitter whose
+           dispatched jobs never reach JobBegin is evicted AT the bound --
+           demonstrably not before it, and not never -- and the healthy
+           submitter is served straight through the event.  */
+        fprintf(stderr, "# stallevict: flooding %d jobs, never confirming\n", njobs);
+        for (int i = 1; i <= njobs; ++i) {
+            char fname[64];
+            snprintf(fname, sizeof(fname), "stall%04d.cpp", i);
+            GetCSMsg g(Environments{std::make_pair(std::string(kPlatform), std::string(kEnv))},
+                       fname, CompileJob::Lang_CXX, 1, kPlatform, 0,
+                       std::string(), 0, 0, 0);
+            g.client_id = i;
+            if (!sub->send_msg(g)) {
+                fprintf(stderr, "FAILED   - submitter died while flooding\n");
+                ++failures;
+                break;
+            }
+        }
+        /* Read the assignments (delivery is not the stall condition --
+           JobBegin is) but confirm NOTHING.  */
+        int delivered = 0;
+        const Clock::time_point t0 = Clock::now();
+        bool evicted = false;
+        double evict_s = -1;
+        while (secs_since(t0) < 40) {
+            Msg *m = sub->get_msg(1);
+            if (m) {
+                if (MSG_IS(m, USE_CS) || MSG_IS(m, NO_CS)) {
+                    ++delivered;
+                }
+                delete m;
+            }
+            if (sub->at_eof()) {
+                evicted = true;
+                evict_s = secs_since(t0);
+                break;
+            }
+        }
+        const int healthy_at_evict = healthy_replies.load();
+        fprintf(stderr, "# stallevict: delivered=%d evicted=%s at %.1fs (bound 10s), healthy so far=%d\n",
+                delivered, evicted ? "yes" : "NO", evict_s, healthy_at_evict);
+        REQUIRE(delivered > 0, "assignments were delivered before the stall");
+        REQUIRE(evicted, "the stalled submitter was evicted");
+        REQUIRE(evict_s >= 9.0, "eviction respected the bound (not premature)");
+        REQUIRE(evict_s <= 25.0, "eviction happened promptly after the bound");
+        /* The healthy submitter must keep completing work after the event.  */
+        {
+            const Clock::time_point th = Clock::now();
+            while (healthy_replies.load() < healthy_at_evict + 5 && secs_since(th) < 30) {
+                usleep(100 * 1000);
+            }
+        }
+        fprintf(stderr, "# stallevict: healthy now=%d (was %d)\n",
+                healthy_replies.load(), healthy_at_evict);
+        REQUIRE(healthy_replies.load() >= healthy_at_evict + 5,
+                "the healthy submitter kept being served through the eviction");
+        REQUIRE(healthy_alive.load(), "the healthy submitter connection survived");
+        REQUIRE(worst_reply.load() < 5.0, "scheduler stayed responsive");
+
+        shutdown = true;
+        probe_thread.join(); cs_thread.join(); healthy_thread.join();
+        close(ctrl);
+        delete sub; delete sub2; delete cs;
+        kill(sched, SIGTERM);
+        waitpid(sched, nullptr, 0);
+        if (failures) { fprintf(stderr, "RESULT: FAIL (%d)\n", failures); return 1; }
+        fprintf(stderr, "RESULT: PASS\n");
+        return 0;
+    }
+
     fprintf(stderr, "# requesting %d jobs\n", njobs);
     /* Phase discipline (perf gate): everything before this point was setup
        -- discard those samples so 'ingress' means the flood, nothing else.  */
@@ -1191,7 +1602,7 @@ int main(int argc, char **argv)
             std::map<int, std::string> owner;
             int n = 0;
             const size_t name_len = strlen(name);
-            FILE *lf = fopen("schedbp-scheduler.log", "r");
+            FILE *lf = fopen(sched_log.c_str(), "r");
             if (lf) {
                 char line[4096];
                 while (fgets(line, sizeof(line), lf)) {
@@ -1306,7 +1717,7 @@ int main(int argc, char **argv)
            dispatch bound covers that case and is too slow for this run.  */
         bool deferral_armed = false;
         {
-            FILE *lf = fopen("schedbp-scheduler.log", "r");
+            FILE *lf = fopen(sched_log.c_str(), "r");
             if (lf) {
                 char line[4096];
                 while (fgets(line, sizeof(line), lf)) {
@@ -1329,7 +1740,7 @@ int main(int argc, char **argv)
         // wedge.  Pre-fix behaviour granted ALL requests; assert we stop
         // well short of that.
         {
-            FILE *lf = fopen("schedbp-scheduler.log", "r");
+            FILE *lf = fopen(sched_log.c_str(), "r");
             int puts_total = -1, puts_after_defer = -1;
             if (lf) {
                 char line[4096];

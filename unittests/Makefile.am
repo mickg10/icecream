@@ -1,4 +1,4 @@
-TESTS = testargs backpressure schedpolicy utf8test statewritertest schedbp-quick.sh remoteice-quick.sh
+TESTS = testargs backpressure schedpolicy utf8test statewritertest schedbp-quick.sh schedstress-quick.sh remoteice-quick.sh
 
 AM_CPPFLAGS = -I$(top_srcdir)/client -I$(top_srcdir)/services -I$(top_srcdir)/
 testargs_LDADD = ../client/libclient.a ../services/libicecc.la
@@ -31,7 +31,7 @@ sndbuf_shim.so: $(srcdir)/sndbuf_shim.c
 	$(CC) -shared -fPIC $(srcdir)/sndbuf_shim.c -ldl -o $@
 
 CLEANFILES = sndbuf_shim.so
-EXTRA_DIST = sndbuf_shim.c schedbp-quick.sh remoteice-quick.sh
+EXTRA_DIST = sndbuf_shim.c schedbp-quick.sh schedstress-quick.sh remoteice-quick.sh
 
 # Make the tests also print the test log if they fail.
 check: export VERBOSE=1

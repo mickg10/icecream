@@ -25,7 +25,9 @@
 #define SCHEDULER_H
 
 // Values 0 to 3.
+#ifndef DEBUG_SCHEDULER
 #define DEBUG_SCHEDULER 0
+#endif
 
 // The weight the "fastest" scheduler places on using a
 // server with recent statistics over one that has not
