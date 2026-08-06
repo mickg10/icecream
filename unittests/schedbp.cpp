@@ -1346,7 +1346,9 @@ int main(int argc, char **argv)
         // 64-job quantum, so ingress and the control plane always get the
         // rest of the budget.
         {
-            const unsigned bigN = 4000;
+            /* Large enough that the contended admission window comfortably
+               spans a rapid burst of ten small requests.  */
+            const unsigned bigN = 24000;
             std::atomic<int> repliesF1{0}, repliesF2{0};
             auto big_daemon = [&](const char *name, unsigned cid,
                                   std::atomic<int> *counter) {
@@ -1380,10 +1382,25 @@ int main(int argc, char **argv)
             std::thread f1([&] { big_daemon("fakesub7", 701, &repliesF1); });
             std::thread f2([&] { big_daemon("fakesub8", 801, &repliesF2); });
 
-            usleep(200 * 1000);   // both expansions demonstrably in flight
+            usleep(200 * 1000);
+            /* The contended window is bracketed, queried not assumed: the
+               scheduler's own admitted counters must show BOTH expansions
+               incomplete before the first small request AND after the last
+               reply.  Then every small in between demonstrably ran inside
+               the contended admission window -- reply counters lag
+               admission by whole turns, so they cannot establish this.  */
+            auto both_incomplete = [&]() {
+                const long long a7 = query_submitter_field(port, "fakesub7", "admitted_total=");
+                const long long a8 = query_submitter_field(port, "fakesub8", "admitted_total=");
+                return a7 >= 0 && a7 < (long long)bigN
+                    && a8 >= 0 && a8 < (long long)bigN;
+            };
+            const bool contended_before = both_incomplete();
             int slow = 0;
+            int measured = 0;
             double worst_small = 0;
-            for (int i = 0; i < 30; ++i) {
+            for (int i = 0; i < 10; ++i) {
+                ++measured;
                 char fname[32];
                 snprintf(fname, sizeof(fname), "small%d.cpp", i);
                 REQUIRE(send_count(sub, 1, 9500 + i, fname), "small request sent");
@@ -1405,18 +1422,22 @@ int main(int argc, char **argv)
                 }
                 const double took = secs_since(ts);
                 if (took > worst_small) { worst_small = took; }
-                if (jid) { confirm_job(jid); } else { ++slow; }
-                if (took > 3.0) { ++slow; }
-                usleep(100 * 1000);
+                if (jid) { confirm_job(jid); }
+                if (!jid || took > 3.0) { ++slow; }
             }
+            const bool contended_after = both_incomplete();
             f1.join();
             f2.join();
-            fprintf(stderr, "# contract: fairness big=%d+%d/%u small worst=%.2fs slow=%d\n",
-                    repliesF1.load(), repliesF2.load(), bigN, worst_small, slow);
+            fprintf(stderr, "# contract: fairness big=%d+%d/%u bracket=%d/%d measured=%d"
+                    " small worst=%.2fs slow=%d\n",
+                    repliesF1.load(), repliesF2.load(), bigN,
+                    contended_before, contended_after, measured, worst_small, slow);
             REQUIRE(repliesF1 == (int)bigN && repliesF2 == (int)bigN,
                     "both long expansions completed exactly");
+            REQUIRE(contended_before && contended_after,
+                    "the ten small requests ran demonstrably inside the contended window (bracketed)");
             REQUIRE(slow == 0,
-                    "every small request completed within its bounded interval during the expansions");
+                    "every measured small request completed within its bounded interval");
             REQUIRE(worst_reply.load() < 5.0,
                     "control latency stayed bounded while the large requests were incomplete");
         }
@@ -1717,7 +1738,9 @@ int main(int argc, char **argv)
         MsgChannel *csB = connect_daemon(port, 0);
         REQUIRE(csB != nullptr, "second farm host connected");
         std::mutex bconfirm_mutex;
-        std::vector<unsigned> b_to_confirm;
+        std::vector<unsigned> b_to_confirm;    // begin + done
+        std::vector<unsigned> bbegin_only;     // hold a slot busy
+        std::vector<unsigned> bdone_only;      // release a held slot
         std::atomic<bool> csB_alive{true};
         std::thread csB_thread([&] {
             if (!csB) { return; }
@@ -1734,10 +1757,20 @@ int main(int argc, char **argv)
                 Msg *m = csB->get_msg(0, true);
                 delete m;
                 if (csB->at_eof()) { csB_alive = false; return; }
-                std::vector<unsigned> batch;
+                std::vector<unsigned> batch, beg, don;
                 {
                     std::lock_guard<std::mutex> lock(bconfirm_mutex);
                     batch.swap(b_to_confirm);
+                    beg.swap(bbegin_only);
+                    don.swap(bdone_only);
+                }
+                for (unsigned jid : beg) {
+                    JobBeginMsg jb(jid, 1);
+                    if (!csB->send_msg(jb)) { csB_alive = false; return; }
+                }
+                for (unsigned jid : don) {
+                    JobDoneMsg jd(jid, 0, JobDoneMsg::FROM_SERVER);
+                    if (!csB->send_msg(jd)) { csB_alive = false; return; }
                 }
                 for (unsigned jid : batch) {
                     JobBeginMsg jb(jid, 1);
@@ -1913,8 +1946,43 @@ int main(int argc, char **argv)
             REQUIRE(occ3 != 0 && occ3port != 10261, "occupier 3 parked on the x86 host");
             begin_job(occ3);
 
-            /* Order of groups: wraparm first (EARLIER group), then the
-               winner from a separate daemon (LAST group).  */
+            /* BOTH hosts must be fully held while both jobs enqueue, or
+               the target simply dispatches the moment it arrives and the
+               later "success" reads a buffered reply -- the first version
+               of this phase did exactly that (the trace showed the target
+               put BEFORE the winner even existed).  Hold the aarch64 host
+               too, enqueue target then winner, prove both are queued, and
+               only then free aarch64 capacity.  */
+            unsigned occB1 = 0, occB2 = 0;
+            REQUIRE(send_platform("occupierB1.cpp", 8500, "aarch64"), "aarch64 occupier 1 submitted");
+            REQUIRE(send_platform("occupierB2.cpp", 8501, "aarch64"), "aarch64 occupier 2 submitted");
+            {
+                /* csB has max_kids=4: window = 4 + preload 2 = 6.  Two
+                   long-running occupiers are not enough; fill it with 6.  */
+                REQUIRE(send_platform("occupierB3.cpp", 8502, "aarch64"), "aarch64 occupier 3 submitted");
+                REQUIRE(send_platform("occupierB4.cpp", 8503, "aarch64"), "aarch64 occupier 4 submitted");
+                REQUIRE(send_platform("occupierB5.cpp", 8504, "aarch64"), "aarch64 occupier 5 submitted");
+                REQUIRE(send_platform("occupierB6.cpp", 8505, "aarch64"), "aarch64 occupier 6 submitted");
+                int held = 0;
+                const Clock::time_point t0 = Clock::now();
+                while (held < 6 && secs_since(t0) < 30) {
+                    Msg *m = sub->get_msg(2);
+                    if (!m) { continue; }
+                    UseCSMsg *u = MSG_IS(m, USE_CS) ? dynamic_cast<UseCSMsg *>(m) : nullptr;
+                    if (u && u->client_id >= 8500 && u->client_id <= 8505) {
+                        if (u->client_id == 8500) { occB1 = u->job_id; }
+                        if (u->client_id == 8501) { occB2 = u->job_id; }
+                        /* begin WITHOUT done on the csB side so the whole
+                           window stays busy */
+                        std::lock_guard<std::mutex> lock(bconfirm_mutex);
+                        bbegin_only.push_back(u->job_id);
+                        ++held;
+                    }
+                    delete m;
+                }
+                REQUIRE(held == 6, "the aarch64 host is completely held (slots + preload)");
+            }
+
             REQUIRE(send_platform("wraparm.cpp", 8300, "aarch64"), "wrap target submitted");
             MsgChannel *subE = connect_daemon(port, 0);
             REQUIRE(subE != nullptr, "wrap-winner daemon connected");
@@ -1932,8 +2000,27 @@ int main(int argc, char **argv)
                 g.client_id = 8400;
                 REQUIRE(subE->send_msg(g), "high-score winner submitted from the LAST group");
 
-                /* The winner's host is full; the servable aarch64 job sits
-                   in an EARLIER group.  Only a wrapping walk reaches it.  */
+                /* PRECONDITION, queried not assumed: both requests are
+                   queued (two groups), nothing dispatchable.  */
+                {
+                    long long qcount = -1;
+                    const Clock::time_point t0 = Clock::now();
+                    while (secs_since(t0) < 10) {
+                        qcount = query_control_count(port, "listrequests", " submitter=");
+                        if (qcount >= 2) { break; }
+                        usleep(100 * 1000);
+                    }
+                    REQUIRE(qcount >= 2,
+                            "both target and winner are QUEUED before any capacity frees (wrap precondition)");
+                }
+
+                /* Free ONE aarch64 assignment while x86 stays full: the
+                   walk starts at the winner (last group) and only a wrap
+                   reaches the earlier target.  */
+                {
+                    std::lock_guard<std::mutex> lock(bconfirm_mutex);
+                    bdone_only.push_back(occB1);   // already begun; done frees the slot
+                }
                 const Clock::time_point t0 = Clock::now();
                 while (arm2_jid == 0 && secs_since(t0) < 20) {
                     Msg *m = sub->get_msg(2);
@@ -2090,7 +2177,7 @@ int main(int argc, char **argv)
             if (!csC) { return; }
             LoginMsg login(10262, "fakecsC", kPlatform, 0);
             login.envs.push_back(std::make_pair(std::string(kPlatform), std::string(kEnv)));
-            login.max_kids = 2;
+            login.max_kids = 8;
             login.noremote = false;
             login.chroot_possible = true;
             if (!csC->send_msg(login)) { csC_alive = false; return; }
@@ -2180,8 +2267,12 @@ int main(int argc, char **argv)
                     "second host registered before the fill");
         }
 
-        /* Phase 1 -- fill every compile slot on both hosts (2+2), begun so
-           the occupancy is real.  */
+        /* Phase 1 -- four held jobs against a 2-slot host A and an 8-slot
+           host C.  The exact-fraction comparison makes the sequence
+           deterministic REGARDLESS of the first (tied 0/2 vs 0/8) pick:
+           whoever wins job 1, jobs 2-4 must land so the result is one on A
+           and three on C -- floor-bucketing would call 1/2 and 1/8 equal
+           and round-robin them 2/2.  */
         struct Held { unsigned jid, port; };
         std::vector<Held> held;
         for (int i = 0; i < 4; ++i) {
@@ -2197,13 +2288,63 @@ int main(int argc, char **argv)
         for (const Held &h : held) {
             if (h.port == 10262) { ++on_c; } else { ++on_a; }
         }
-        fprintf(stderr, "# leastbusy: filled slots a=%d c=%d\n", on_a, on_c);
-        REQUIRE(on_a == 2 && on_c == 2,
-                "least_busy spread the fill evenly across equal hosts");
+        fprintf(stderr, "# leastbusy: fill spread a=%d c=%d (2-slot vs 8-slot)\n", on_a, on_c);
+        REQUIRE(on_a == 1 && on_c == 3,
+                "exact fractions place the fill 1:3 across unequal hosts");
 
-        /* Phase 2 -- every host now sits AT maxJobs (the preload zone).
-           The picker must still assign: the bucketed form selected an empty
-           set here and stalled until something completed.  */
+        /* Phase 2 -- unequal-denominator decision: A at 1/2, C at 3/8.
+           3*2 < 1*8, so the probe must go to C although C holds MORE
+           jobs.  */
+        {
+            unsigned jid = 0, csport = 0;
+            REQUIRE(send_one(9150, "unequal.cpp"), "unequal-denominator probe submitted");
+            REQUIRE(await_use(9150, 15, &jid, &csport), "unequal probe assigned");
+            fprintf(stderr, "# leastbusy: 3/8-vs-1/2 probe went to port=%u (want 10262)\n", csport);
+            REQUIRE(csport == 10262,
+                    "the lower FRACTION wins although it holds more jobs (cross multiplication)");
+            begin_on(jid, csport);
+            held.push_back(Held{jid, csport});
+        }
+
+        /* Phase 3 -- exact normalized tie: A at 1/2, C at 4/8; 1*8 == 4*2.
+           Two successive probes must round-robin -- one to EACH host --
+           because after the first lands the fractions diverge again in the
+           other host's favor.  */
+        {
+            unsigned j1 = 0, p1 = 0, j2 = 0, p2 = 0;
+            REQUIRE(send_one(9160, "tie1.cpp"), "tie probe 1 submitted");
+            REQUIRE(await_use(9160, 15, &j1, &p1), "tie probe 1 assigned");
+            begin_on(j1, p1);
+            held.push_back(Held{j1, p1});
+            REQUIRE(send_one(9161, "tie2.cpp"), "tie probe 2 submitted");
+            REQUIRE(await_use(9161, 15, &j2, &p2), "tie probe 2 assigned");
+            begin_on(j2, p2);
+            held.push_back(Held{j2, p2});
+            fprintf(stderr, "# leastbusy: tie probes went to ports %u and %u\n", p1, p2);
+            REQUIRE(p1 != p2,
+                    "an exact normalized tie (1/2 == 4/8) round-robins across both hosts");
+        }
+
+        /* Phase 4 -- fill to maxJobs everywhere, then the preload-zone
+           probe: the picker must still assign (the bucketed form selected
+           an EMPTY set here and stalled).  State: A 2/2; C needs 8/8.  */
+        {
+            int need_c = 0;
+            {
+                int cur_c = 0;
+                for (const Held &h : held) { if (h.port == 10262) { ++cur_c; } }
+                need_c = 8 - cur_c;
+            }
+            for (int i = 0; i < need_c; ++i) {
+                unsigned jid = 0, csport = 0;
+                char fname[32];
+                snprintf(fname, sizeof(fname), "top%d.cpp", i);
+                REQUIRE(send_one(9170 + i, fname), "top-up job submitted");
+                REQUIRE(await_use(9170 + i, 15, &jid, &csport), "top-up job assigned");
+                begin_on(jid, csport);
+                held.push_back(Held{jid, csport});
+            }
+        }
         unsigned pjid = 0, pport = 0;
         REQUIRE(send_one(9200, "preload.cpp"), "preload-zone probe submitted");
         const bool assigned = await_use(9200, 10, &pjid, &pport);
@@ -2216,8 +2357,8 @@ int main(int argc, char **argv)
             done_on(pjid, pport);
         }
 
-        /* Phase 3 -- unequal occupancy: empty host C completely, leave host
-           A full.  The next job must land on C (0/2 beats 2/2 exactly).  */
+        /* Phase 5 -- empty host C completely, leave host A full.  The next
+           job must land on C (0/8 beats 2/2 exactly).  */
         for (const Held &h : held) {
             if (h.port == 10262) { done_on(h.jid, h.port); }
         }
@@ -2231,7 +2372,7 @@ int main(int argc, char **argv)
         for (const Held &h : held) {
             if (h.port != 10262) { done_on(h.jid, h.port); }
         }
-        REQUIRE(worst_reply.load() < 5.0, "scheduler stayed responsive");
+                REQUIRE(worst_reply.load() < 5.0, "scheduler stayed responsive");
 
         shutdown = true;
         probe_thread.join(); cs_thread.join(); healthy_thread.join(); csC_thread.join();
