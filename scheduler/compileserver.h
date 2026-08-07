@@ -163,15 +163,21 @@ public:
     uint64_t admittedJobsTotal() const { return m_admittedJobsTotal; }
     void admittedJobsIncrement() { ++m_admittedJobsTotal; }
     unsigned int connectionGeneration() const { return m_connectionGeneration; }
-    /* When this submitter last PROVED it is alive by confirming a dispatch
-       (JobBegin/JobDone).  It distinguishes the two stall causes that look
-       identical from the oldest-debit age alone: one frozen wrapper behind
-       a healthy daemon (other wrappers keep confirming) versus a daemon
-       that has itself stopped functioning (nothing confirms).  Seeded at
-       login so a daemon that never confirms anything is measured from
-       when it appeared.  */
-    uint64_t lastDispatchConfirmMsec() const { return m_lastDispatchConfirmMsec; }
-    void noteDispatchConfirmed(uint64_t now_msec) { m_lastDispatchConfirmMsec = now_msec; }
+    /* DISPATCH QUARANTINE.  Set when one of this submitter's assignments
+       has gone unconfirmed past the liveness bound: something behind this
+       daemon is not progressing (typically one frozen compiler wrapper),
+       so it stops receiving NEW assignments -- but the daemon keeps
+       running and its healthy clients keep their work.
+
+       The quarantine is what makes it safe to stop dispatching without
+       destroying anything: the stale assignment and the worker's
+       reservation are RETAINED, because the UseCS already delivered can
+       still become real work.  Releasing them here would let the worker be
+       overcommitted and a late CompileFile execute against a job the
+       scheduler had already declared finished.  Cleared as soon as any of
+       this submitter's work confirms progress again.  */
+    bool dispatchQuarantined() const { return m_dispatchQuarantined; }
+    void setDispatchQuarantined(bool value) { m_dispatchQuarantined = value; }
 
     Environments compilerVersions() const;
     void setCompilerVersions(const Environments &environments);
@@ -235,7 +241,7 @@ private:
     int m_submittedJobsCount;
     uint64_t m_admittedJobsTotal = 0;
     unsigned int m_connectionGeneration = 0;   // set once in the ctor
-    uint64_t m_lastDispatchConfirmMsec = 0;    // seeded at login
+    bool m_dispatchQuarantined = false;
     unsigned int m_lastPickId;
 
     Environments m_compilerVersions;  // Available compilers

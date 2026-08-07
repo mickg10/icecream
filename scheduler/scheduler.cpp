@@ -805,6 +805,7 @@ static bool submitter_accepts_dispatch(CompileServer *submitter)
 {
     return submitter
         && !submitter->has_pending_write()
+        && !submitter->dispatchQuarantined()
         && submitter->outstandingDispatches() < effective_dispatch_credit();
 }
 
@@ -1632,86 +1633,44 @@ static time_t prune_servers()
             const uint64_t stall_msec =
                 (*it)->oldestOutstandingDispatchMsec(icecream_monotonic_msec());
             if (stall_msec >= max_outstanding_stall_msec) {
-                /* Expire the STALE ASSIGNMENTS, not the daemon.  A daemon
-                   proxies every compiler wrapper on its host, so one frozen
-                   wrapper -- stopped after its UseCS but before the worker
-                   sees CompileFile -- holds one debit that JobBegin never
-                   credits.  Tearing down the daemon for that took every
-                   healthy sibling's queued and in-flight work with it: one
-                   stuck process could void an entire machine's build.
+                /* QUARANTINE the submitter; do not destroy anything.
 
-                   The daemon-wide bounds still exist for genuine daemon
-                   failure: the 30s deferred-output deadline above covers a
-                   daemon that stops draining, and a dead connection is
-                   detected by the channel itself.  This bound is about a
-                   single assignment that never started, so it cancels
-                   exactly that assignment: the farm slot and the dispatch
-                   credit are returned, the submitter keeps running, and its
-                   other clients are untouched.  */
-                CompileServer *submitter = *it;
-                const uint64_t now_msec = icecream_monotonic_msec();
-                /* Two causes look identical from the oldest debit alone:
-                   (a) one frozen wrapper behind a working daemon, and
-                   (b) a daemon that has itself stopped functioning.  The
-                   discriminator is whether ANYTHING of this submitter's
-                   work has confirmed inside the same window.  A daemon
-                   confirming other clients' work is alive: expire only the
-                   stale assignment.  A daemon that has confirmed nothing
-                   for the whole bound is the zombie the daemon-wide rule
-                   was written for -- remove it, or a dead submitter would
-                   cycle dispatch/expire forever, holding farm slots.  */
-                const uint64_t since_confirm =
-                    now_msec > submitter->lastDispatchConfirmMsec()
-                        ? now_msec - submitter->lastDispatchConfirmMsec() : 0;
-                if (since_confirm >= max_outstanding_stall_msec) {
-                    log_warning() << submitter->nodeName() << " holds "
-                                  << submitter->outstandingDispatches()
+                   A submitting daemon proxies every compiler wrapper on its
+                   host.  One wrapper frozen after its UseCS but before the
+                   worker sees CompileFile holds a dispatch debit that
+                   JobBegin never credits.  Tearing down the daemon for that
+                   took every healthy sibling's work with it -- one stuck
+                   process could void an entire machine's build.
+
+                   But the opposite mistake is just as real: the scheduler
+                   must NOT release the assignment either.  The UseCS is
+                   already in the wrapper's hands, so a late thaw can still
+                   connect to the worker and compile.  Deleting the job here
+                   would leave the worker's slot apparently free (inviting
+                   overcommit above its real maxJobs), strand the later
+                   JobBegin/JobDone as unknown ids, and announce a terminal
+                   result for work that may still run.
+
+                   So: stop sending this submitter NEW assignments, and keep
+                   the job, the worker reservation and the debit exactly as
+                   they are.  That bounds the damage to the frozen wrapper's
+                   own host without inventing a cancellation nobody
+                   performed.  The quarantine also stops the
+                   dispatch->expire->redispatch cycling that releasing would
+                   cause.  It lifts as soon as any of this submitter's work
+                   confirms progress (handle_job_begin/handle_job_done), and
+                   the connection-level bounds -- deferred-output expiry and
+                   ordinary connection failure -- remain the paths that
+                   remove a genuinely dead daemon.  */
+                if (!(*it)->dispatchQuarantined()) {
+                    (*it)->setDispatchQuarantined(true);
+                    log_warning() << (*it)->nodeName() << " holds "
+                                  << (*it)->outstandingDispatches()
                                   << " unconfirmed dispatches, oldest for "
-                                  << (stall_msec / 1000) << "s, and has confirmed"
-                                     " nothing for " << (since_confirm / 1000)
-                                  << "s - removing" << endl;
-                    ++it;
-                    handle_end(submitter, nullptr);
-                    continue;
-                }
-                unsigned int expired = 0;
-                for (map<unsigned int, Job *>::iterator jit = jobs.begin();
-                        jit != jobs.end();) {
-                    Job *job = jit->second;
-                    if (job->submitter() != submitter
-                            || !job->dispatchOutstanding()
-                            || job->state() != Job::WAITINGFORCS
-                            || now_msec < job->dispatchDebitMsec()
-                            || (now_msec - job->dispatchDebitMsec()) < max_outstanding_stall_msec) {
-                        ++jit;
-                        continue;
-                    }
-                    log_warning() << "expiring assignment " << job->id()
-                                  << " for " << submitter->nodeName()
-                                  << ": unconfirmed for "
-                                  << ((now_msec - job->dispatchDebitMsec()) / 1000)
-                                  << "s (its client never started; the daemon"
-                                     " and its other clients are unaffected)" << endl;
-                    notify_monitors(new MonJobDoneMsg(JobDoneMsg(job->id(), 255)));
-                    credit_dispatch_credit(job);
-                    if (job->server()) {
-                        job->server()->removeJob(job);
-                    }
-                    jit = jobs.erase(jit);
-                    delete job;
-                    ++expired;
-                }
-                if (expired == 0) {
-                    /* Nothing matched the per-assignment rule although the
-                       submitter's oldest debit is over the bound: the debit
-                       multiset and the job set disagree.  That is an
-                       accounting defect, not a stalled client -- say so
-                       rather than silently looping on it every poll.  */
-                    log_error() << "dispatch-stall accounting mismatch on "
-                                << submitter->nodeName() << ": oldest debit "
-                                << (stall_msec / 1000) << "s but no expirable "
-                                << "assignment found (outstanding="
-                                << submitter->outstandingDispatches() << ")" << endl;
+                                  << (stall_msec / 1000) << "s - quarantining it"
+                                     " from new assignments (its jobs and worker"
+                                     " reservations are retained; its healthy"
+                                     " clients are unaffected)" << endl;
                 }
                 ++it;
                 continue;
@@ -2119,12 +2078,12 @@ static bool handle_job_begin(CompileServer *cs, Msg *_m)
 
     /* Observable progress: the client received its UseCS and reached the
        compile server, so this assignment no longer occupies a dispatch
-       credit on its submitter.  This is also the submitter's liveness
-       evidence -- releasing a credit for any other reason (teardown, or
-       expiring a stale assignment) proves nothing about the daemon, and
-       counting it would let a dead submitter refresh its own liveness by
-       having its assignments expired.  */
-    job->submitter()->noteDispatchConfirmed(icecream_monotonic_msec());
+       credit on its submitter, and whatever was stuck is moving again.  */
+    if (job->submitter() && job->submitter()->dispatchQuarantined()) {
+        log_info() << job->submitter()->nodeName()
+                   << " progressed again - lifting dispatch quarantine" << endl;
+        job->submitter()->setDispatchQuarantined(false);
+    }
     credit_dispatch_credit(job);
 
     job->setState(Job::COMPILING);
@@ -2293,8 +2252,10 @@ static bool handle_job_done(CompileServer *cs, Msg *_m)
 
     add_job_stats(j, m);
     notify_monitors(new MonJobDoneMsg(*m));
-    if (j->submitter()) {
-        j->submitter()->noteDispatchConfirmed(icecream_monotonic_msec());
+    if (j->submitter() && j->submitter()->dispatchQuarantined()) {
+        log_info() << j->submitter()->nodeName()
+                   << " progressed again - lifting dispatch quarantine" << endl;
+        j->submitter()->setDispatchQuarantined(false);
     }
     credit_dispatch_credit(j);
     jobs.erase(m->job_id);
@@ -2441,9 +2402,6 @@ static bool handle_control_login(CompileServer *cs)
     cs->last_talk = time(nullptr);
     cs->setBulkTransfer();
     cs->setState(CompileServer::LOGGEDIN);
-    /* Seed the liveness clock: a daemon that never confirms anything is
-       measured from when it appeared, not from epoch zero.  */
-    cs->noteDispatchConfirmed(icecream_monotonic_msec());
     assert(find(controls.begin(), controls.end(), cs) == controls.end());
     controls.push_back(cs);
 

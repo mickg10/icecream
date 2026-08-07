@@ -503,7 +503,39 @@ int main(int argc, char **argv)
         fprintf(stderr, "implausible jobs/clog arguments\n");
         return 2;
     }
-    const int port = 25000 + (getpid() % 1000);
+    /* Pick a port pair that is ACTUALLY free.  A pid-derived guess collides
+       between sequential runs (the previous scheduler's listener can still
+       hold the number, or two runs' pids can agree mod 1000) and the whole
+       leg then dies with "cannot connect CS to scheduler" -- an
+       intermittent suite failure that looks like a product defect.  The
+       scheduler needs both `port` (daemons) and `port + 1` (text control),
+       so both are probed.  */
+    int port = 0;
+    {
+        for (int cand = 25000 + (getpid() % 1000); cand < 25000 + 4000; cand += 2) {
+            bool both_free = true;
+            for (int off = 0; off < 2 && both_free; ++off) {
+                const int fd = socket(PF_INET, SOCK_STREAM, 0);
+                if (fd < 0) { both_free = false; break; }
+                int on = 1;
+                setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+                struct sockaddr_in sa;
+                memset(&sa, 0, sizeof(sa));
+                sa.sin_family = AF_INET;
+                sa.sin_port = htons(cand + off);
+                sa.sin_addr.s_addr = htonl(INADDR_ANY);
+                if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+                    both_free = false;
+                }
+                close(fd);
+            }
+            if (both_free) { port = cand; break; }
+        }
+        if (port == 0) {
+            fprintf(stderr, "no free scheduler port pair found\n");
+            return 2;
+        }
+    }
 
     signal(SIGPIPE, SIG_IGN);
 
@@ -2150,18 +2182,35 @@ int main(int argc, char **argv)
                 healthy_at_flood, healthy_mid, healthy_at_evict);
         /* The dispatch credit is exact: 32 unconfirmed assignments (the
            configured default; the farm is large enough that no clamp
-           applies), then nothing more until the eviction.  */
+           applies), and nothing more afterwards.
+
+           This submitter READS its replies -- it is a connection whose
+           simulated wrappers never reach the worker, not a dead daemon.
+           The scheduler must therefore quarantine it from new assignments
+           and keep everything else intact.  Removing a responsive daemon on
+           the strength of "no JobBegin" cannot distinguish 32 frozen
+           wrappers from one dead host, so that is no longer the rule;
+           connection failure and the deferred-output deadline remain the
+           paths that remove a genuinely dead daemon.  */
         REQUIRE(delivered == 32, "exactly the effective dispatch credit was delivered");
-        REQUIRE(evicted, "the stalled submitter was evicted");
-        REQUIRE(evict_after_first_s >= 9.5, "eviction respected the bound (not premature)");
-        /* Upper tolerance: the bound plus poll granularity (prune caps the
-           poll timeout by the remaining stall budget) plus scheduling
-           slack -- NOT a 2.5x overshoot allowance.  */
-        REQUIRE(evict_after_first_s <= 13.0, "eviction landed AT the bound, not merely eventually");
-        /* Progress DURING the stall window, before the eviction: the frozen
-           peer must not drag anyone else down while its clock runs.  */
+        REQUIRE(!evicted,
+                "a READING submitter is quarantined, not removed (its wrappers stalled, not it)");
+        {
+            bool quarantined = false;
+            FILE *lf = fopen(sched_log.c_str(), "r");
+            if (lf) {
+                char line[4096];
+                while (fgets(line, sizeof(line), lf)) {
+                    if (strstr(line, "quarantining it")) { quarantined = true; }
+                }
+                fclose(lf);
+            }
+            REQUIRE(quarantined, "the scheduler quarantined it at the bound");
+        }
+        /* Progress DURING the stall window: the frozen peer must not drag
+           anyone else down while its clock runs.  */
         REQUIRE(healthy_mid > healthy_at_flood,
-                "the healthy submitter progressed during the stall window (pre-eviction)");
+                "the healthy submitter progressed during the stall window");
         /* The healthy submitter must keep completing work after the event.  */
         {
             const Clock::time_point th = Clock::now();
@@ -2172,8 +2221,9 @@ int main(int argc, char **argv)
         fprintf(stderr, "# stallevict: healthy now=%d (was %d)\n",
                 healthy_replies.load(), healthy_at_evict);
         REQUIRE(healthy_replies.load() >= healthy_at_evict + 5,
-                "the healthy submitter kept being served through the eviction");
+                "the healthy submitter kept being served through the quarantine");
         REQUIRE(healthy_alive.load(), "the healthy submitter connection survived");
+        REQUIRE(!sub->at_eof(), "the quarantined submitter's own connection survived");
         REQUIRE(worst_reply.load() < 5.0, "scheduler stayed responsive");
 
         shutdown = true;
@@ -2252,27 +2302,30 @@ int main(int argc, char **argv)
         REQUIRE(healthy_done >= 10,
                 "healthy wrappers on the same daemon kept being served across the bound");
 
-        /* The stale assignment itself must be gone: its credit returned, so
-           the submitter is not permanently gated by a frozen client.  */
+        /* The stale assignment must be RETAINED, not released: its UseCS is
+           already in the frozen wrapper's hands, so the worker reservation
+           has to stand until something actually cancels or completes it.
+           Releasing it would let the worker be overcommitted and a late
+           thaw execute against a job the scheduler had written off.  */
         const long long outstanding = query_submitter_outstanding(port, "fakesub");
         fprintf(stderr, "# clientstall: outstanding dispatches after the bound: %lld\n", outstanding);
-        REQUIRE(outstanding == 0,
-                "the stale assignment was expired and its dispatch credit returned");
+        REQUIRE(outstanding >= 1,
+                "the stale assignment and its worker reservation are RETAINED, not released");
         {
-            /* And the scheduler said so explicitly, naming the assignment
-               rather than the daemon.  */
-            bool expired_logged = false, daemon_removed = false;
+            bool quarantined = false, daemon_removed = false, expired = false;
             FILE *lf = fopen(sched_log.c_str(), "r");
             if (lf) {
                 char line[4096];
                 while (fgets(line, sizeof(line), lf)) {
-                    if (strstr(line, "expiring assignment")) { expired_logged = true; }
+                    if (strstr(line, "quarantining it")) { quarantined = true; }
                     if (strstr(line, "remove daemon fakesub")) { daemon_removed = true; }
+                    if (strstr(line, "expiring assignment")) { expired = true; }
                 }
                 fclose(lf);
             }
-            REQUIRE(expired_logged, "the scheduler logged a per-assignment expiry");
+            REQUIRE(quarantined, "the scheduler quarantined the submitter from NEW assignments");
             REQUIRE(!daemon_removed, "the scheduler did NOT remove the submitting daemon");
+            REQUIRE(!expired, "the scheduler did NOT delete an assignment nobody cancelled");
         }
         REQUIRE(worst_reply.load() < 5.0, "scheduler stayed responsive");
 
