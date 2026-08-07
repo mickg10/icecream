@@ -67,6 +67,20 @@ using namespace std;
 
 extern const char *rs_program_name;
 
+/* REQUIREMENT, not a discretionary optimisation: preprocess-only (-E)
+   invocations run at the lowest scheduling priority.
+
+   Rationale from operations, recorded here because the code alone cannot
+   show it: without this, a highly parallel build's preprocessing storm
+   starves the machine -- the operator's report is that hosts were driven
+   into unusability ("blew up machines") before this was added.  The
+   daemon's bounded preprocess lane limits how many preprocess jobs the
+   DAEMON admits; it does not bound the priority of the client-side -E
+   processes a build spawns directly, which is what this covers.
+
+   Do not remove without an explicit operational decision: a review that
+   sees no measurement in the repository will otherwise read this as
+   unmotivated policy and recommend deleting it (one did).  */
 static void maybe_nice_preprocess_only(int argv_result)
 {
     if (!(argv_result & PreprocessOnly)) {

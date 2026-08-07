@@ -83,6 +83,19 @@ static int zstd_compression()
     return n;
 }
 
+/* KEPT BY OPERATIONAL DECISION: default to BBR on TCP channels, with
+   ICECC_TCP_CONGESTION as the override ("off"/"none"/"disable" opts out).
+
+   Recorded here because the repository holds no benchmark and a review
+   that sees none will read this as unmotivated machine-wide policy and
+   recommend deleting it (one did).  The operator's position is that BBR
+   is the right default for this fleet's compile traffic -- bulk object
+   and preprocessed-source transfers over links where loss-based control
+   underperforms.  Failure to set it is non-fatal and silent for the
+   common unsupported cases, so a host without BBR simply keeps its own
+   default.
+
+   Do not remove without an explicit operational decision.  */
 static void maybe_set_tcp_congestion_control(int fd)
 {
 #ifndef TCP_CONGESTION
