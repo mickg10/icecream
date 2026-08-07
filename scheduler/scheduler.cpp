@@ -1632,13 +1632,88 @@ static time_t prune_servers()
             const uint64_t stall_msec =
                 (*it)->oldestOutstandingDispatchMsec(icecream_monotonic_msec());
             if (stall_msec >= max_outstanding_stall_msec) {
-                log_warning() << (*it)->nodeName() << " holds "
-                              << (*it)->outstandingDispatches()
-                              << " unconfirmed dispatches, oldest for "
-                              << (stall_msec / 1000) << "s - removing" << endl;
-                CompileServer *old = *it;
+                /* Expire the STALE ASSIGNMENTS, not the daemon.  A daemon
+                   proxies every compiler wrapper on its host, so one frozen
+                   wrapper -- stopped after its UseCS but before the worker
+                   sees CompileFile -- holds one debit that JobBegin never
+                   credits.  Tearing down the daemon for that took every
+                   healthy sibling's queued and in-flight work with it: one
+                   stuck process could void an entire machine's build.
+
+                   The daemon-wide bounds still exist for genuine daemon
+                   failure: the 30s deferred-output deadline above covers a
+                   daemon that stops draining, and a dead connection is
+                   detected by the channel itself.  This bound is about a
+                   single assignment that never started, so it cancels
+                   exactly that assignment: the farm slot and the dispatch
+                   credit are returned, the submitter keeps running, and its
+                   other clients are untouched.  */
+                CompileServer *submitter = *it;
+                const uint64_t now_msec = icecream_monotonic_msec();
+                /* Two causes look identical from the oldest debit alone:
+                   (a) one frozen wrapper behind a working daemon, and
+                   (b) a daemon that has itself stopped functioning.  The
+                   discriminator is whether ANYTHING of this submitter's
+                   work has confirmed inside the same window.  A daemon
+                   confirming other clients' work is alive: expire only the
+                   stale assignment.  A daemon that has confirmed nothing
+                   for the whole bound is the zombie the daemon-wide rule
+                   was written for -- remove it, or a dead submitter would
+                   cycle dispatch/expire forever, holding farm slots.  */
+                const uint64_t since_confirm =
+                    now_msec > submitter->lastDispatchConfirmMsec()
+                        ? now_msec - submitter->lastDispatchConfirmMsec() : 0;
+                if (since_confirm >= max_outstanding_stall_msec) {
+                    log_warning() << submitter->nodeName() << " holds "
+                                  << submitter->outstandingDispatches()
+                                  << " unconfirmed dispatches, oldest for "
+                                  << (stall_msec / 1000) << "s, and has confirmed"
+                                     " nothing for " << (since_confirm / 1000)
+                                  << "s - removing" << endl;
+                    ++it;
+                    handle_end(submitter, nullptr);
+                    continue;
+                }
+                unsigned int expired = 0;
+                for (map<unsigned int, Job *>::iterator jit = jobs.begin();
+                        jit != jobs.end();) {
+                    Job *job = jit->second;
+                    if (job->submitter() != submitter
+                            || !job->dispatchOutstanding()
+                            || job->state() != Job::WAITINGFORCS
+                            || now_msec < job->dispatchDebitMsec()
+                            || (now_msec - job->dispatchDebitMsec()) < max_outstanding_stall_msec) {
+                        ++jit;
+                        continue;
+                    }
+                    log_warning() << "expiring assignment " << job->id()
+                                  << " for " << submitter->nodeName()
+                                  << ": unconfirmed for "
+                                  << ((now_msec - job->dispatchDebitMsec()) / 1000)
+                                  << "s (its client never started; the daemon"
+                                     " and its other clients are unaffected)" << endl;
+                    notify_monitors(new MonJobDoneMsg(JobDoneMsg(job->id(), 255)));
+                    credit_dispatch_credit(job);
+                    if (job->server()) {
+                        job->server()->removeJob(job);
+                    }
+                    jit = jobs.erase(jit);
+                    delete job;
+                    ++expired;
+                }
+                if (expired == 0) {
+                    /* Nothing matched the per-assignment rule although the
+                       submitter's oldest debit is over the bound: the debit
+                       multiset and the job set disagree.  That is an
+                       accounting defect, not a stalled client -- say so
+                       rather than silently looping on it every poll.  */
+                    log_error() << "dispatch-stall accounting mismatch on "
+                                << submitter->nodeName() << ": oldest debit "
+                                << (stall_msec / 1000) << "s but no expirable "
+                                << "assignment found (outstanding="
+                                << submitter->outstandingDispatches() << ")" << endl;
+                }
                 ++it;
-                handle_end(old, nullptr);
                 continue;
             }
             const uint64_t remaining = max_outstanding_stall_msec - stall_msec;
@@ -2044,7 +2119,12 @@ static bool handle_job_begin(CompileServer *cs, Msg *_m)
 
     /* Observable progress: the client received its UseCS and reached the
        compile server, so this assignment no longer occupies a dispatch
-       credit on its submitter.  */
+       credit on its submitter.  This is also the submitter's liveness
+       evidence -- releasing a credit for any other reason (teardown, or
+       expiring a stale assignment) proves nothing about the daemon, and
+       counting it would let a dead submitter refresh its own liveness by
+       having its assignments expired.  */
+    job->submitter()->noteDispatchConfirmed(icecream_monotonic_msec());
     credit_dispatch_credit(job);
 
     job->setState(Job::COMPILING);
@@ -2213,6 +2293,9 @@ static bool handle_job_done(CompileServer *cs, Msg *_m)
 
     add_job_stats(j, m);
     notify_monitors(new MonJobDoneMsg(*m));
+    if (j->submitter()) {
+        j->submitter()->noteDispatchConfirmed(icecream_monotonic_msec());
+    }
     credit_dispatch_credit(j);
     jobs.erase(m->job_id);
     delete j;
@@ -2358,6 +2441,9 @@ static bool handle_control_login(CompileServer *cs)
     cs->last_talk = time(nullptr);
     cs->setBulkTransfer();
     cs->setState(CompileServer::LOGGEDIN);
+    /* Seed the liveness clock: a daemon that never confirms anything is
+       measured from when it appeared, not from epoch zero.  */
+    cs->noteDispatchConfirmed(icecream_monotonic_msec());
     assert(find(controls.begin(), controls.end(), cs) == controls.end());
     controls.push_back(cs);
 

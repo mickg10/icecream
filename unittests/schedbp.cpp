@@ -468,6 +468,14 @@ int main(int argc, char **argv)
        and answered "no suitable host" while preload capacity existed -- and
        with unequal occupancies the emptier host must win.  */
     const bool leastbusy_mode = argc > 5 && strcmp(argv[5], "leastbusy") == 0;
+    /* "clientstall": the blast-radius gate.  A submitting daemon proxies
+       EVERY compiler wrapper on its host.  One wrapper frozen after its
+       assignment holds a dispatch debit that JobBegin never credits; the
+       scheduler used to answer that by removing the whole daemon, voiding
+       every healthy sibling's work.  Only the stale assignment may be
+       expired: the daemon stays registered and its other clients keep
+       being served across the bound.  */
+    const bool clientstall_mode = argc > 5 && strcmp(argv[5], "clientstall") == 0;
     /* "mixedrole": the realistic topology.  The submitter also has compile
        capacity, so the scheduler can place work back on it (NoCS / local
        UseCS).  Local decisions reserve no farm slot and must NOT consume
@@ -507,7 +515,8 @@ int main(int argc, char **argv)
         + (argc > 5 ? argv[5] : "default") + ".log";
     pid_t sched = start_scheduler(scheduler_bin, shim, port, sched_log,
                                   perf_mode ? "-v" : "-vvv",
-                                  stallevict_mode ? "--dispatch-stall-timeout=10"
+                                  (stallevict_mode || clientstall_mode)
+                                      ? "--dispatch-stall-timeout=10"
                                   : (leastbusy_mode ? "--algorithm=least_busy" : nullptr));
     if (sched < 0) {
         perror("fork");
@@ -2165,6 +2174,106 @@ int main(int argc, char **argv)
         REQUIRE(healthy_replies.load() >= healthy_at_evict + 5,
                 "the healthy submitter kept being served through the eviction");
         REQUIRE(healthy_alive.load(), "the healthy submitter connection survived");
+        REQUIRE(worst_reply.load() < 5.0, "scheduler stayed responsive");
+
+        shutdown = true;
+        probe_thread.join(); cs_thread.join(); healthy_thread.join();
+        close(ctrl);
+        delete sub; delete sub2; delete cs;
+        kill(sched, SIGTERM);
+        waitpid(sched, nullptr, 0);
+        if (failures) { fprintf(stderr, "RESULT: FAIL (%d)\n", failures); return 1; }
+        fprintf(stderr, "RESULT: PASS\n");
+        return 0;
+    }
+
+    if (clientstall_mode) {
+        /* One connection (the daemon) carrying several client ids (the
+           wrappers).  One id is deliberately never confirmed -- that is the
+           frozen wrapper -- while the others behave normally throughout.  */
+        const unsigned frozen_cid = 4242;
+        auto send_for = [&](unsigned cid, const char *fname) {
+            GetCSMsg g(Environments{std::make_pair(std::string(kPlatform), std::string(kEnv))},
+                       fname, CompileJob::Lang_CXX, 1, kPlatform, 0, std::string(), 0, 0, 0);
+            g.client_id = cid;
+            return sub->send_msg(g);
+        };
+
+        fprintf(stderr, "# clientstall: one wrapper (client_id %u) freezes after its assignment\n",
+                frozen_cid);
+        REQUIRE(send_for(frozen_cid, "frozen.cpp"), "frozen wrapper's request sent");
+        unsigned frozen_job = 0;
+        {
+            const Clock::time_point t0 = Clock::now();
+            while (frozen_job == 0 && secs_since(t0) < 30) {
+                Msg *m = sub->get_msg(2);
+                if (!m) { continue; }
+                UseCSMsg *u = MSG_IS(m, USE_CS) ? dynamic_cast<UseCSMsg *>(m) : nullptr;
+                if (u && u->client_id == frozen_cid) { frozen_job = u->job_id; }
+                delete m;   /* deliberately NOT confirmed: the wrapper is frozen */
+            }
+        }
+        REQUIRE(frozen_job != 0, "the frozen wrapper received its assignment");
+
+        /* Healthy siblings on the SAME daemon connection, running across
+           the whole stall bound.  */
+        int healthy_done = 0;
+        const Clock::time_point t_start = Clock::now();
+        unsigned cid = 5000;
+        while (secs_since(t_start) < 22) {          // > the 10s configured bound
+            char fname[32];
+            snprintf(fname, sizeof(fname), "healthy%u.cpp", cid);
+            if (!send_for(cid, fname)) {
+                break;                               // connection died: caught below
+            }
+            const Clock::time_point tj = Clock::now();
+            bool got = false;
+            while (!got && secs_since(tj) < 5) {
+                Msg *m = sub->get_msg(1);
+                if (!m) { continue; }
+                unsigned jid = 0, got_cid = 0;
+                if (MSG_IS(m, USE_CS)) {
+                    UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                    if (u) { jid = u->job_id; got_cid = u->client_id; }
+                } else if (MSG_IS(m, NO_CS)) {
+                    NoCSMsg *n = dynamic_cast<NoCSMsg *>(m);
+                    if (n) { jid = n->job_id; got_cid = n->client_id; }
+                }
+                if (jid && got_cid == cid) { confirm_job(jid); ++healthy_done; got = true; }
+                delete m;
+            }
+            ++cid;
+            usleep(200 * 1000);
+        }
+        fprintf(stderr, "# clientstall: healthy siblings served across the bound: %d\n", healthy_done);
+
+        REQUIRE(!sub->at_eof(),
+                "the daemon was NOT removed because one of its wrappers stalled");
+        REQUIRE(healthy_done >= 10,
+                "healthy wrappers on the same daemon kept being served across the bound");
+
+        /* The stale assignment itself must be gone: its credit returned, so
+           the submitter is not permanently gated by a frozen client.  */
+        const long long outstanding = query_submitter_outstanding(port, "fakesub");
+        fprintf(stderr, "# clientstall: outstanding dispatches after the bound: %lld\n", outstanding);
+        REQUIRE(outstanding == 0,
+                "the stale assignment was expired and its dispatch credit returned");
+        {
+            /* And the scheduler said so explicitly, naming the assignment
+               rather than the daemon.  */
+            bool expired_logged = false, daemon_removed = false;
+            FILE *lf = fopen(sched_log.c_str(), "r");
+            if (lf) {
+                char line[4096];
+                while (fgets(line, sizeof(line), lf)) {
+                    if (strstr(line, "expiring assignment")) { expired_logged = true; }
+                    if (strstr(line, "remove daemon fakesub")) { daemon_removed = true; }
+                }
+                fclose(lf);
+            }
+            REQUIRE(expired_logged, "the scheduler logged a per-assignment expiry");
+            REQUIRE(!daemon_removed, "the scheduler did NOT remove the submitting daemon");
+        }
         REQUIRE(worst_reply.load() < 5.0, "scheduler stayed responsive");
 
         shutdown = true;
