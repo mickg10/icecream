@@ -2319,9 +2319,10 @@ int main(int argc, char **argv)
         }
 
         /* Phase 3 -- exact normalized tie: A at 1/2, C at 4/8; 1*8 == 4*2.
-           Two successive probes must round-robin -- one to EACH host --
-           because after the first lands the fractions diverge again in the
-           other host's favor.  */
+           Probe 1 lands at the tie and then COMPLETES, restoring the exact
+           equality before probe 2 is submitted; round-robin must then pick
+           the OTHER host at the identical tie.  (Without the restore, probe
+           2's choice would be ordinary least-occupancy, not tie handling.)  */
         {
             /* Probe 1 lands at the tie, then COMPLETES, restoring the exact
                1/2 == 4/8 state before probe 2 -- otherwise probe 2's choice
