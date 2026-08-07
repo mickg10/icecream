@@ -460,15 +460,17 @@ static bool handle_end(CompileServer *cs, Msg *);
    milliseconds.  */
 static unsigned int max_outstanding_dispatches = 32;   // --max-outstanding-dispatches
 
-/* Liveness bound for a submitter that holds dispatch credits without ever
-   confirming them.  Deliberately generous: a legitimate client can wait for
-   an environment install on the chosen compile server (MAX_BUSY_INSTALLING,
-   120s) before its JobBegin appears, so anything tighter would evict
-   healthy submitters on a cold farm.  The tight 30s bound still applies to
-   the precise case -- a peer that is not draining its socket (deferred
-   output armed).  Together: unread socket -> 30s, silent-but-reading
-   submitter -> this bound.  */
-static uint64_t max_outstanding_stall_msec = 180 * 1000;   // --dispatch-stall-timeout (seconds)
+/* How long an assignment may go unconfirmed before the scheduler REPORTS
+   that one of this submitter's clients is not progressing.  Reporting is
+   all it does: the assignment and its worker reservation are retained,
+   because only that client or its worker can truthfully end them.
+
+   Deliberately generous: a legitimate client can wait for an environment
+   install on the chosen compile server (MAX_BUSY_INSTALLING, 120s) before
+   its JobBegin appears, so anything tighter would report healthy
+   submitters on a cold farm.  A peer that is not draining its socket is a
+   different, sharper case and keeps the 30s deferred-output bound.  */
+static uint64_t max_outstanding_stall_msec = 180 * 1000;   // --dispatch-stall-report-after (seconds)
 
 /* Remote-capable compile slots across the farm, recomputed once per main
    loop (prune_servers).  Used to clamp the per-submitter dispatch credit:
@@ -1628,63 +1630,73 @@ static time_t prune_servers()
            then treat it as dead -- this is the application-level bound that
            keeps a stalled submitter's WAITINGFORCS jobs from pinning remote
            slots forever.  */
+        if ((*it)->outstandingDispatches() == 0) {
+            (*it)->setStallReported(false);
+        }
         if ((*it)->outstandingDispatches() > 0 && !(*it)->deferred_output_armed()) {
             const uint64_t stall_msec =
                 (*it)->oldestOutstandingDispatchMsec(icecream_monotonic_msec());
             if (stall_msec >= max_outstanding_stall_msec) {
-                /* RETAIN everything and report it.  Nothing else is safe or
-                   necessary here.
+                /* RETAIN everything and report it.  Nothing else here is
+                   safe.
 
                    A submitting daemon proxies every compiler wrapper on its
                    host.  One wrapper frozen after its UseCS but before the
                    worker sees CompileFile holds a dispatch debit that
-                   JobBegin never credits.  Two tempting reactions are both
-                   wrong:
+                   JobBegin never credits.  Three reactions were tried and
+                   rejected: removing the daemon takes every healthy
+                   sibling's work with it; deleting the assignment releases
+                   a reservation NOBODY cancelled, so a late thaw can still
+                   compile against a job the scheduler wrote off; and
+                   quarantining the submitter from new work is re-armed by
+                   the same stale debit on the next poll, cutting the host
+                   off from remote builds entirely.
 
-                   - removing the daemon takes every healthy sibling's work
-                     with it: one stuck process could void a machine's whole
-                     build;
-                   - deleting the assignment releases a reservation NOBODY
-                     cancelled: the UseCS is already in the wrapper's hands,
-                     so a late thaw can still compile, the worker looks a
-                     slot emptier than it is, and the late Begin/Done arrive
-                     as unknown ids.
+                   What bounds this is the per-submitter dispatch credit.
+                   Be precise about what that does and does not provide:
 
-                   Quarantining the submitter from new work was tried too and
-                   is also wrong: unrelated progress lifts it, the still-stuck
-                   assignment re-arms it on the next poll, and the host is
-                   permanently cut off from remote builds (its own regression
-                   test demonstrated exactly that).
+                   - it caps how many UNCONFIRMED assignments ONE submitter
+                     may hold, so a submitter whose wrappers freeze stops
+                     receiving work once its credit is consumed;
+                   - it is NOT a farm-progress guarantee.  The clamp is
+                     computed from aggregate advertised slots, so it knows
+                     nothing about platform, environment or eligibility;
+                     several stalled submitters can between them retain
+                     every slot; a one-slot farm gives credit 1, so a single
+                     stalled submitter can hold that slot; and healthy
+                     wrappers behind the same daemon are unaffected only
+                     while that submitter has credit left.
 
-                   The bound that actually matters is already enforced: the
-                   per-submitter dispatch credit, clamped to farm_slots - 1,
-                   caps how many farm slots one submitter can hold and
-                   guarantees a slot remains for everyone else.  A submitter
-                   whose wrappers all freeze simply runs out of credit and
-                   stops receiving work, while its healthy wrappers keep
-                   using the rest.  A daemon that is genuinely gone is
-                   removed by connection failure or the deferred-output
-                   deadline, which are direct evidence about the daemon
-                   rather than inferences from a worker's silence.
-
-                   So this bound is an OBSERVABILITY point: say clearly that
-                   an assignment has gone unconfirmed, once per submitter,
-                   so an operator can find the stuck wrapper.  */
+                   Reclaiming a retained reservation in bounded time needs
+                   either targeted cancellation with the daemon or
+                   eligibility-aware global fairness; neither exists yet, so
+                   the honest contract here is bounded admission with
+                   retained ownership, and this bound is an OBSERVABILITY
+                   point that names the stuck submitter for an operator.  */
                 if (!(*it)->stallReported()) {
                     (*it)->setStallReported(true);
                     log_warning() << (*it)->nodeName() << " holds "
                                   << (*it)->outstandingDispatches()
                                   << " unconfirmed dispatches, oldest for "
                                   << (stall_msec / 1000) << "s - a client of"
-                                     " this daemon is not progressing; its"
+                                     " this daemon is not progressing.  Its"
                                      " assignment and worker reservation are"
-                                     " retained and its healthy clients are"
-                                     " unaffected (dispatch credit bounds the"
-                                     " farm slots it can hold)" << endl;
+                                     " retained (only that client or its"
+                                     " worker can end them); this submitter"
+                                     " may hold up to its dispatch credit of "
+                                  << effective_dispatch_credit()
+                                  << " unconfirmed assignments" << endl;
                 }
                 ++it;
                 continue;
             }
+            /* Below the threshold: the reported episode is over, so a
+               LATER stall on this submitter is reported as a new incident.
+               Deliberately not cleared from the Begin/Done handlers --
+               unrelated sibling progress does not resolve the stale
+               assignment, and clearing there turned one frozen job into 61
+               warnings in twelve seconds.  */
+            (*it)->setStallReported(false);
             const uint64_t remaining = max_outstanding_stall_msec - stall_msec;
             min_time = min(min_time, (time_t)((remaining + 999) / 1000));
         }
@@ -2089,9 +2101,6 @@ static bool handle_job_begin(CompileServer *cs, Msg *_m)
     /* Observable progress: the client received its UseCS and reached the
        compile server, so this assignment no longer occupies a dispatch
        credit on its submitter, and whatever was stuck is moving again.  */
-    if (job->submitter()) {
-        job->submitter()->setStallReported(false);
-    }
     credit_dispatch_credit(job);
 
     job->setState(Job::COMPILING);
@@ -2260,9 +2269,6 @@ static bool handle_job_done(CompileServer *cs, Msg *_m)
 
     add_job_stats(j, m);
     notify_monitors(new MonJobDoneMsg(*m));
-    if (j->submitter()) {
-        j->submitter()->setStallReported(false);
-    }
     credit_dispatch_credit(j);
     jobs.erase(m->job_id);
     delete j;
@@ -2949,7 +2955,7 @@ static void usage(const std::string reason = "")
          << "  -r, --persistent-client-connection\n"
          << "  -a, --algorithm <name>\n"
          << "  --max-outstanding-dispatches <n>   per-submitter unconfirmed dispatch credit (1-1024, default 32)\n"
-         << "  --dispatch-stall-timeout <sec>     evict a submitter whose oldest unconfirmed dispatch exceeds this (10-3600, default 180)\n"
+         << "  --dispatch-stall-report-after <sec>  report (do not remove) a submitter whose oldest unconfirmed dispatch exceeds this; its assignment and worker reservation are retained (10-3600, default 180)\n"
          << endl;
 
     exit(1);
@@ -3053,6 +3059,9 @@ int main(int argc, char *argv[])
             { "user-uid", 1, nullptr, 'u'},
             { "algorithm", 1, nullptr, 'a' },
             { "max-outstanding-dispatches", 1, nullptr, 1001 },
+            { "dispatch-stall-report-after", 1, nullptr, 1002 },
+            /* Compatibility alias for the previous spelling, from when this
+               bound removed the submitter instead of reporting it.  */
             { "dispatch-stall-timeout", 1, nullptr, 1002 },
             { nullptr, 0, nullptr, 0 }
         };
@@ -3179,7 +3188,7 @@ int main(int argc, char *argv[])
                as 32.  errno, at-least-one-digit and full consumption are
                all checked.  */
             const char *name = (c == 1001) ? "--max-outstanding-dispatches"
-                                           : "--dispatch-stall-timeout";
+                                           : "--dispatch-stall-report-after";
             if (!optarg || !*optarg) {
                 usage(string("Error: ") + name + " requires argument");
             }
@@ -3196,7 +3205,7 @@ int main(int argc, char *argv[])
                 max_outstanding_dispatches = (unsigned int)v;
             } else {
                 if (v < 10 || v > 3600) {
-                    usage("Error: --dispatch-stall-timeout must be 10..3600 seconds");
+                    usage("Error: --dispatch-stall-report-after must be 10..3600 seconds");
                 }
                 max_outstanding_stall_msec = (uint64_t)v * 1000;
             }

@@ -16,10 +16,11 @@
 # request must still dispatch to the second host, the head must neither
 # bounce nor block, and it must dispatch once its host has capacity.
 #
-# Run 3 -- stallevict (BP-1): at the --dispatch-stall-timeout floor (10s), a
-# submitter whose dispatched jobs never reach JobBegin is evicted AT the
-# bound -- not before it, and not never -- while the healthy submitter is
-# served straight through the eviction.
+# Run 3 -- stallcredit (BP-1): at the --dispatch-stall-report-after floor
+# (10s), a submitter whose dispatched jobs never reach JobBegin is bounded
+# by its dispatch CREDIT and reported -- not removed: it drains its replies,
+# so it is a responsive connection whose wrappers stalled, not a dead
+# daemon.  Its healthy peer is served throughout.
 #
 # Run 4 -- clientstall (blast radius): a submitting daemon proxies every
 # compiler wrapper on its host.  One wrapper frozen after its assignment
@@ -27,10 +28,12 @@
 # answer that by removing the whole daemon, voiding every healthy sibling's
 # work.  Only the stale assignment may be expired.
 #
-# Run 5 -- quarantine: the cases that distinguish the stall MODELS -- a
-# quiet-but-healthy daemon crossing the bound, a sibling legitimately
-# running across it, and the rule that a stuck wrapper never blocks its
-# host's other work.
+# Run 5 -- retention: the proof that Stage-A retention is correct.  A
+# quiet healthy daemon crossing the report threshold is not removed, a
+# long-running sibling survives it and its completion is consumed, dispatch
+# continues while a wrapper is stuck, the stall is reported exactly once,
+# and a LATE THAW's Begin/Done still reconcile the retained assignment
+# exactly once with no accounting failure.
 #
 # Run 6 -- leastbusy (SCH-6): with -a least_busy and every host at maxJobs,
 # work must still be assigned (the bucketed picker selected an empty set and
@@ -39,7 +42,7 @@
 dir=$(dirname "$0")
 "$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 promotion 1 || exit 1
 "$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 heterogeneous 1 || exit 1
-"$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 50 5 stallevict || exit 1
+"$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 50 5 stallcredit || exit 1
 "$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 clientstall || exit 1
-"$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 quarantine || exit 1
+"$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 retention || exit 1
 exec "$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 leastbusy 2
