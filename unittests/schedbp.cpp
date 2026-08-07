@@ -476,6 +476,12 @@ int main(int argc, char **argv)
        expired: the daemon stays registered and its other clients keep
        being served across the bound.  */
     const bool clientstall_mode = argc > 5 && strcmp(argv[5], "clientstall") == 0;
+    /* "quarantine": the cases that distinguish the stall MODELS, which
+       clientstall alone does not.  A quiet-but-healthy daemon, a sibling
+       that is legitimately long-running across the bound, and the rule that
+       only genuine client progress -- not the mere passage of time -- lifts
+       a quarantine.  */
+    const bool quarantine_mode = argc > 5 && strcmp(argv[5], "quarantine") == 0;
     /* "mixedrole": the realistic topology.  The submitter also has compile
        capacity, so the scheduler can place work back on it (NoCS / local
        UseCS).  Local decisions reserve no farm slot and must NOT consume
@@ -547,7 +553,7 @@ int main(int argc, char **argv)
         + (argc > 5 ? argv[5] : "default") + ".log";
     pid_t sched = start_scheduler(scheduler_bin, shim, port, sched_log,
                                   perf_mode ? "-v" : "-vvv",
-                                  (stallevict_mode || clientstall_mode)
+                                  (stallevict_mode || clientstall_mode || quarantine_mode)
                                       ? "--dispatch-stall-timeout=10"
                                   : (leastbusy_mode ? "--algorithm=least_busy" : nullptr));
     if (sched < 0) {
@@ -852,7 +858,7 @@ int main(int argc, char **argv)
            holding 0-1 slots at random moments would make them flake.  The
            connection stays (the scheduler keeps a second submitter), the
            traffic parks.  */
-        if (leastbusy_mode) {
+        if (leastbusy_mode || quarantine_mode) {
             while (!shutdown) {
                 usleep(100 * 1000);
             }
@@ -2194,18 +2200,19 @@ int main(int argc, char **argv)
            paths that remove a genuinely dead daemon.  */
         REQUIRE(delivered == 32, "exactly the effective dispatch credit was delivered");
         REQUIRE(!evicted,
-                "a READING submitter is quarantined, not removed (its wrappers stalled, not it)");
+                "a READING submitter is NOT removed (its wrappers stalled, not it); the"
+                " dispatch credit is what bounds the farm slots it can hold");
         {
-            bool quarantined = false;
+            bool reported = false;
             FILE *lf = fopen(sched_log.c_str(), "r");
             if (lf) {
                 char line[4096];
                 while (fgets(line, sizeof(line), lf)) {
-                    if (strstr(line, "quarantining it")) { quarantined = true; }
+                    if (strstr(line, "is not progressing")) { reported = true; }
                 }
                 fclose(lf);
             }
-            REQUIRE(quarantined, "the scheduler quarantined it at the bound");
+            REQUIRE(reported, "the scheduler reported the stalled assignments at the bound");
         }
         /* Progress DURING the stall window: the frozen peer must not drag
            anyone else down while its clock runs.  */
@@ -2221,9 +2228,113 @@ int main(int argc, char **argv)
         fprintf(stderr, "# stallevict: healthy now=%d (was %d)\n",
                 healthy_replies.load(), healthy_at_evict);
         REQUIRE(healthy_replies.load() >= healthy_at_evict + 5,
-                "the healthy submitter kept being served through the quarantine");
+                "the healthy submitter kept being served throughout");
         REQUIRE(healthy_alive.load(), "the healthy submitter connection survived");
-        REQUIRE(!sub->at_eof(), "the quarantined submitter's own connection survived");
+        REQUIRE(!sub->at_eof(), "the stalled submitter's own connection survived");
+        REQUIRE(worst_reply.load() < 5.0, "scheduler stayed responsive");
+
+        shutdown = true;
+        probe_thread.join(); cs_thread.join(); healthy_thread.join();
+        close(ctrl);
+        delete sub; delete sub2; delete cs;
+        kill(sched, SIGTERM);
+        waitpid(sched, nullptr, 0);
+        if (failures) { fprintf(stderr, "RESULT: FAIL (%d)\n", failures); return 1; }
+        fprintf(stderr, "RESULT: PASS\n");
+        return 0;
+    }
+
+    if (quarantine_mode) {
+        /* The healthy_thread would supply unrelated confirmations and mask
+           exactly what these cases test; it parks itself for this mode.  */
+        auto send_for = [&](unsigned cid, const char *fname) {
+            GetCSMsg g(Environments{std::make_pair(std::string(kPlatform), std::string(kEnv))},
+                       fname, CompileJob::Lang_CXX, 1, kPlatform, 0, std::string(), 0, 0, 0);
+            g.client_id = cid;
+            return sub->send_msg(g);
+        };
+        auto await_for = [&](unsigned cid, double secs) -> unsigned {
+            const Clock::time_point t0 = Clock::now();
+            while (secs_since(t0) < secs) {
+                Msg *m = sub->get_msg(1);
+                if (!m) { continue; }
+                unsigned jid = 0, got = 0;
+                if (MSG_IS(m, USE_CS)) {
+                    UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                    if (u) { jid = u->job_id; got = u->client_id; }
+                } else if (MSG_IS(m, NO_CS)) {
+                    NoCSMsg *n = dynamic_cast<NoCSMsg *>(m);
+                    if (n) { jid = n->job_id; got = n->client_id; }
+                }
+                delete m;
+                if (jid && got == cid) { return jid; }
+            }
+            return 0;
+        };
+
+        /* CASE 2 first: a sibling that legitimately RUNS across the bound.
+           It confirms with JobBegin (it reached the worker) and only
+           completes much later -- the pattern of a long compile.  It must
+           survive the frozen peer's bound untouched.  */
+        unsigned long_job = 0;
+        REQUIRE(send_for(7100, "longsibling.cpp"), "long sibling requested");
+        REQUIRE((long_job = await_for(7100, 30)) != 0, "long sibling assigned");
+        begin_job(long_job);          // reached the worker; no done for a long time
+
+        /* CASE 1: a wrapper freezes after its assignment, on a daemon that
+           is otherwise QUIET -- no other completions at all.  */
+        unsigned frozen_job = 0;
+        REQUIRE(send_for(7200, "frozen.cpp"), "frozen wrapper requested");
+        REQUIRE((frozen_job = await_for(7200, 30)) != 0, "frozen wrapper assigned");
+        /* deliberately never confirmed */
+
+        fprintf(stderr, "# quarantine: waiting out the bound with a QUIET healthy daemon\n");
+        const Clock::time_point t_bound = Clock::now();
+        while (secs_since(t_bound) < 16) {
+            Msg *m = sub->get_msg(1);      // stay responsive: we are NOT dead
+            delete m;
+        }
+
+        REQUIRE(!sub->at_eof(),
+                "a quiet but responsive daemon is NOT removed when one wrapper stalls");
+        {
+            bool quarantined = false, removed = false;
+            FILE *lf = fopen(sched_log.c_str(), "r");
+            if (lf) {
+                char line[4096];
+                while (fgets(line, sizeof(line), lf)) {
+                    if (strstr(line, "is not progressing")) { quarantined = true; }
+                    if (strstr(line, "remove daemon fakesub")) { removed = true; }
+                }
+                fclose(lf);
+            }
+            REQUIRE(quarantined, "the scheduler reported the unconfirmed assignment");
+            REQUIRE(!removed, "the quiet healthy daemon was NOT removed");
+        }
+        /* The long sibling must still be alive and completable.  */
+        {
+            JobDoneMsg jd(long_job, 0, JobDoneMsg::FROM_SERVER);
+            REQUIRE(cs->send_msg(jd), "long sibling completes after the bound");
+        }
+
+        /* CASE 4: after that completion -- genuine client progress -- the
+           quarantine must LIFT and dispatch resume.  Progress is the only
+           thing that lifts it; the bound elapsing again with the frozen
+           wrapper still stuck must re-arm it.  */
+        unsigned resumed = 0;
+        {
+            const Clock::time_point t0 = Clock::now();
+            while (resumed == 0 && secs_since(t0) < 20) {
+                if (!send_for(7300, "afterprogress.cpp")) { break; }
+                resumed = await_for(7300, 3);
+            }
+        }
+        fprintf(stderr, "# quarantine: dispatch with a stuck wrapper present: %s\n",
+                resumed ? "continues" : "BLOCKED");
+        REQUIRE(resumed != 0,
+                "a stuck wrapper never blocks its host's other work: dispatch continues"
+                " using the remaining credit");
+        confirm_job(resumed);
         REQUIRE(worst_reply.load() < 5.0, "scheduler stayed responsive");
 
         shutdown = true;
@@ -2317,13 +2428,13 @@ int main(int argc, char **argv)
             if (lf) {
                 char line[4096];
                 while (fgets(line, sizeof(line), lf)) {
-                    if (strstr(line, "quarantining it")) { quarantined = true; }
+                    if (strstr(line, "is not progressing")) { quarantined = true; }
                     if (strstr(line, "remove daemon fakesub")) { daemon_removed = true; }
                     if (strstr(line, "expiring assignment")) { expired = true; }
                 }
                 fclose(lf);
             }
-            REQUIRE(quarantined, "the scheduler quarantined the submitter from NEW assignments");
+            REQUIRE(quarantined, "the scheduler reported the unconfirmed assignment");
             REQUIRE(!daemon_removed, "the scheduler did NOT remove the submitting daemon");
             REQUIRE(!expired, "the scheduler did NOT delete an assignment nobody cancelled");
         }

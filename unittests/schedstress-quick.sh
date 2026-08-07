@@ -27,7 +27,12 @@
 # answer that by removing the whole daemon, voiding every healthy sibling's
 # work.  Only the stale assignment may be expired.
 #
-# Run 5 -- leastbusy (SCH-6): with -a least_busy and every host at maxJobs,
+# Run 5 -- quarantine: the cases that distinguish the stall MODELS -- a
+# quiet-but-healthy daemon crossing the bound, a sibling legitimately
+# running across it, and the rule that a stuck wrapper never blocks its
+# host's other work.
+#
+# Run 6 -- leastbusy (SCH-6): with -a least_busy and every host at maxJobs,
 # work must still be assigned (the bucketed picker selected an empty set and
 # stalled); with unequal occupancies the emptier host must win the exact
 # fraction comparison; an even fill spreads evenly.
@@ -36,4 +41,5 @@ dir=$(dirname "$0")
 "$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 heterogeneous 1 || exit 1
 "$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 50 5 stallevict || exit 1
 "$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 clientstall || exit 1
+"$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 quarantine || exit 1
 exec "$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 leastbusy 2

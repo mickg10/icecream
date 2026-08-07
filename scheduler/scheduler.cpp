@@ -805,7 +805,6 @@ static bool submitter_accepts_dispatch(CompileServer *submitter)
 {
     return submitter
         && !submitter->has_pending_write()
-        && !submitter->dispatchQuarantined()
         && submitter->outstandingDispatches() < effective_dispatch_credit();
 }
 
@@ -1633,44 +1632,55 @@ static time_t prune_servers()
             const uint64_t stall_msec =
                 (*it)->oldestOutstandingDispatchMsec(icecream_monotonic_msec());
             if (stall_msec >= max_outstanding_stall_msec) {
-                /* QUARANTINE the submitter; do not destroy anything.
+                /* RETAIN everything and report it.  Nothing else is safe or
+                   necessary here.
 
                    A submitting daemon proxies every compiler wrapper on its
                    host.  One wrapper frozen after its UseCS but before the
                    worker sees CompileFile holds a dispatch debit that
-                   JobBegin never credits.  Tearing down the daemon for that
-                   took every healthy sibling's work with it -- one stuck
-                   process could void an entire machine's build.
+                   JobBegin never credits.  Two tempting reactions are both
+                   wrong:
 
-                   But the opposite mistake is just as real: the scheduler
-                   must NOT release the assignment either.  The UseCS is
-                   already in the wrapper's hands, so a late thaw can still
-                   connect to the worker and compile.  Deleting the job here
-                   would leave the worker's slot apparently free (inviting
-                   overcommit above its real maxJobs), strand the later
-                   JobBegin/JobDone as unknown ids, and announce a terminal
-                   result for work that may still run.
+                   - removing the daemon takes every healthy sibling's work
+                     with it: one stuck process could void a machine's whole
+                     build;
+                   - deleting the assignment releases a reservation NOBODY
+                     cancelled: the UseCS is already in the wrapper's hands,
+                     so a late thaw can still compile, the worker looks a
+                     slot emptier than it is, and the late Begin/Done arrive
+                     as unknown ids.
 
-                   So: stop sending this submitter NEW assignments, and keep
-                   the job, the worker reservation and the debit exactly as
-                   they are.  That bounds the damage to the frozen wrapper's
-                   own host without inventing a cancellation nobody
-                   performed.  The quarantine also stops the
-                   dispatch->expire->redispatch cycling that releasing would
-                   cause.  It lifts as soon as any of this submitter's work
-                   confirms progress (handle_job_begin/handle_job_done), and
-                   the connection-level bounds -- deferred-output expiry and
-                   ordinary connection failure -- remain the paths that
-                   remove a genuinely dead daemon.  */
-                if (!(*it)->dispatchQuarantined()) {
-                    (*it)->setDispatchQuarantined(true);
+                   Quarantining the submitter from new work was tried too and
+                   is also wrong: unrelated progress lifts it, the still-stuck
+                   assignment re-arms it on the next poll, and the host is
+                   permanently cut off from remote builds (its own regression
+                   test demonstrated exactly that).
+
+                   The bound that actually matters is already enforced: the
+                   per-submitter dispatch credit, clamped to farm_slots - 1,
+                   caps how many farm slots one submitter can hold and
+                   guarantees a slot remains for everyone else.  A submitter
+                   whose wrappers all freeze simply runs out of credit and
+                   stops receiving work, while its healthy wrappers keep
+                   using the rest.  A daemon that is genuinely gone is
+                   removed by connection failure or the deferred-output
+                   deadline, which are direct evidence about the daemon
+                   rather than inferences from a worker's silence.
+
+                   So this bound is an OBSERVABILITY point: say clearly that
+                   an assignment has gone unconfirmed, once per submitter,
+                   so an operator can find the stuck wrapper.  */
+                if (!(*it)->stallReported()) {
+                    (*it)->setStallReported(true);
                     log_warning() << (*it)->nodeName() << " holds "
                                   << (*it)->outstandingDispatches()
                                   << " unconfirmed dispatches, oldest for "
-                                  << (stall_msec / 1000) << "s - quarantining it"
-                                     " from new assignments (its jobs and worker"
-                                     " reservations are retained; its healthy"
-                                     " clients are unaffected)" << endl;
+                                  << (stall_msec / 1000) << "s - a client of"
+                                     " this daemon is not progressing; its"
+                                     " assignment and worker reservation are"
+                                     " retained and its healthy clients are"
+                                     " unaffected (dispatch credit bounds the"
+                                     " farm slots it can hold)" << endl;
                 }
                 ++it;
                 continue;
@@ -2079,10 +2089,8 @@ static bool handle_job_begin(CompileServer *cs, Msg *_m)
     /* Observable progress: the client received its UseCS and reached the
        compile server, so this assignment no longer occupies a dispatch
        credit on its submitter, and whatever was stuck is moving again.  */
-    if (job->submitter() && job->submitter()->dispatchQuarantined()) {
-        log_info() << job->submitter()->nodeName()
-                   << " progressed again - lifting dispatch quarantine" << endl;
-        job->submitter()->setDispatchQuarantined(false);
+    if (job->submitter()) {
+        job->submitter()->setStallReported(false);
     }
     credit_dispatch_credit(job);
 
@@ -2252,10 +2260,8 @@ static bool handle_job_done(CompileServer *cs, Msg *_m)
 
     add_job_stats(j, m);
     notify_monitors(new MonJobDoneMsg(*m));
-    if (j->submitter() && j->submitter()->dispatchQuarantined()) {
-        log_info() << j->submitter()->nodeName()
-                   << " progressed again - lifting dispatch quarantine" << endl;
-        j->submitter()->setDispatchQuarantined(false);
+    if (j->submitter()) {
+        j->submitter()->setStallReported(false);
     }
     credit_dispatch_credit(j);
     jobs.erase(m->job_id);

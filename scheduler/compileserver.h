@@ -163,21 +163,11 @@ public:
     uint64_t admittedJobsTotal() const { return m_admittedJobsTotal; }
     void admittedJobsIncrement() { ++m_admittedJobsTotal; }
     unsigned int connectionGeneration() const { return m_connectionGeneration; }
-    /* DISPATCH QUARANTINE.  Set when one of this submitter's assignments
-       has gone unconfirmed past the liveness bound: something behind this
-       daemon is not progressing (typically one frozen compiler wrapper),
-       so it stops receiving NEW assignments -- but the daemon keeps
-       running and its healthy clients keep their work.
-
-       The quarantine is what makes it safe to stop dispatching without
-       destroying anything: the stale assignment and the worker's
-       reservation are RETAINED, because the UseCS already delivered can
-       still become real work.  Releasing them here would let the worker be
-       overcommitted and a late CompileFile execute against a job the
-       scheduler had already declared finished.  Cleared as soon as any of
-       this submitter's work confirms progress again.  */
-    bool dispatchQuarantined() const { return m_dispatchQuarantined; }
-    void setDispatchQuarantined(bool value) { m_dispatchQuarantined = value; }
+    /* One-shot latch so an unconfirmed assignment is reported once per
+       stall episode instead of every poll.  Cleared when any of this
+       submitter's work confirms progress.  */
+    bool stallReported() const { return m_stallReported; }
+    void setStallReported(bool value) { m_stallReported = value; }
 
     Environments compilerVersions() const;
     void setCompilerVersions(const Environments &environments);
@@ -241,7 +231,7 @@ private:
     int m_submittedJobsCount;
     uint64_t m_admittedJobsTotal = 0;
     unsigned int m_connectionGeneration = 0;   // set once in the ctor
-    bool m_dispatchQuarantined = false;
+    bool m_stallReported = false;
     unsigned int m_lastPickId;
 
     Environments m_compilerVersions;  // Available compilers
