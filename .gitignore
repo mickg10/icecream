@@ -67,3 +67,11 @@ unittests/schedbp-quick.sh.trs
 unittests/schedpolicy
 unittests/schedpolicy.trs
 package_builder/dist/
+*.trs
+*.log
+/unittests/statewritertest
+/unittests/utf8test
+/unittests/schedpolicy
+/unittests/schedbp
+/unittests/backpressure
+/unittests/testargs
