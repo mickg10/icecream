@@ -210,7 +210,7 @@ bool MsgChannel::update_state()
 
                 writefull(vers, 4);
 
-                if (!flush_writebuf(true)) {
+                if (!flush_writebuf(SendBlocking)) {
                     set_error();
                     return false;
                 }
@@ -339,6 +339,16 @@ void MsgChannel::writefull(const void *_buf, size_t count)
     msgtogo += count;
 }
 
+
+uint64_t icecream_monotonic_msec()
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return uint64_t(time(nullptr)) * 1000ULL;
+    }
+    return uint64_t(ts.tv_sec) * 1000ULL + uint64_t(ts.tv_nsec) / 1000000ULL;
+}
+
 static size_t get_max_write_size()
 {
     if( const char* icecc_slow_network = getenv( "ICECC_SLOW_NETWORK" ))
@@ -347,10 +357,13 @@ static size_t get_max_write_size()
     return MAX_MSG_SIZE;
 }
 
-bool MsgChannel::flush_writebuf(bool blocking)
+bool MsgChannel::flush_writebuf(int send_flags)
 {
+    const bool blocking = send_flags & SendBlocking;
+    const bool deferrable = send_flags & SendDeferrable;
     const char *buf = msgbuf + msgofs;
     bool error = false;
+    bool deferred = false;
 
     while (msgtogo) {
         int send_errno;
@@ -372,33 +385,50 @@ bool MsgChannel::flush_writebuf(bool blocking)
                 continue;
             }
 
-            /* If we want to write blocking, but couldn't write anything,
-               select on the fd.  */
-            if (blocking && ( send_errno == EAGAIN || send_errno == ENOTCONN || send_errno == EWOULDBLOCK )) {
-                int ready;
+            if (send_errno == EAGAIN || send_errno == ENOTCONN || send_errno == EWOULDBLOCK) {
+                /* The peer's receive buffer is full; that is backpressure, not
+                   a dead connection.  A deferrable non-blocking send keeps the
+                   remaining bytes queued for a later flush_pending().
+                   ENOTCONN is deliberately NOT deferrable: a never-connected
+                   socket reports POLLOUT, so deferring would queue bytes and
+                   spin a flush loop forever with no diagnostic.  */
+                if (!blocking) {
+                    if (deferrable && send_errno != ENOTCONN) {
+                        deferred = true;
+                        break;
+                    }
+                } else {
+                    /* If we want to write blocking, but couldn't write anything,
+                       select on the fd.  */
+                    int ready;
 
-                for (;;) {
-                    pollfd pfd;
-                    pfd.fd = fd;
-                    pfd.events = POLLOUT;
-                    ready = poll(&pfd, 1, 30 * 1000);
+                    for (;;) {
+                        pollfd pfd;
+                        pfd.fd = fd;
+                        pfd.events = POLLOUT;
+                        ready = poll(&pfd, 1, 30 * 1000);
 
-                    if (ready < 0 && errno == EINTR) {
-                        continue;
+                        if (ready < 0 && errno == EINTR) {
+                            continue;
+                        }
+
+                        break;
                     }
 
-                    break;
-                }
+                    /* socket ready now for writing ? */
+                    if (ready > 0) {
+                        continue;
+                    }
+                    if (ready == 0) {
+                        if (deferrable) {
+                            deferred = true;
+                            break;
+                        }
+                        log_error() << "timed out while trying to send data" << endl;
+                    }
 
-                /* socket ready now for writing ? */
-                if (ready > 0) {
-                    continue;
+                    /* Timeout or real error --> error.  */
                 }
-                if (ready == 0) {
-                    log_error() << "timed out while trying to send data" << endl;
-                }
-
-                /* Timeout or real error --> error.  */
             }
 
             errno = send_errno;
@@ -415,13 +445,54 @@ bool MsgChannel::flush_writebuf(bool blocking)
         buf += ret;
     }
 
+    /* Compact the buffer unconditionally: writefull() and send_msg() append
+       new data at msgbuf + msgtogo and patch message length fields at the same
+       offset, which is only correct when the pending bytes start at the
+       beginning of the buffer.  With deferrable sends the channel stays alive
+       while bytes are still queued, so the invariant must be restored on every
+       exit, not only in the cases chop_output() covers.  */
     msgofs = buf - msgbuf;
-    chop_output();
+    if (msgtogo && msgofs) {
+        memmove(msgbuf, msgbuf + msgofs, msgtogo);
+    }
+    msgofs = 0;
+
+    /* Arm an absolute monotonic deadline for the backlog.  It survives
+       partial drains (it measures the OLDEST undelivered byte) and clears
+       only when the backlog is fully flushed.  Bulk-only accumulation
+       (send_msg returning before any flush) never arms it.  The trace fires
+       once per backlog episode, not per retry.  */
+    if (msgtogo) {
+        if (deferred && !pending_write_armed) {
+            pending_write_armed = true;
+            pending_write_deadline_msec =
+                icecream_monotonic_msec() + ICECC_DEFERRED_SEND_TIMEOUT_MSEC;
+            trace() << "peer not accepting data, deferring " << msgtogo
+                    << " bytes for " << dump() << endl;
+        }
+    } else {
+        pending_write_armed = false;
+        pending_write_deadline_msec = 0;
+    }
+
     if(error) {
         set_error();
         return false;
     }
     return true;
+}
+
+bool MsgChannel::flush_pending(void)
+{
+    if (instate == ERROR) {
+        return false;
+    }
+
+    if (!msgtogo) {
+        return true;
+    }
+
+    return flush_writebuf(SendNonBlocking | SendDeferrable);
 }
 
 MsgChannel &MsgChannel::operator>>(uint32_t &buf)
@@ -935,6 +1006,8 @@ MsgChannel::MsgChannel(int _fd, struct sockaddr *_a, socklen_t _l, bool text)
     msgbuflen = 128;
     msgofs = 0;
     msgtogo = 0;
+    pending_write_armed = false;
+    pending_write_deadline_msec = 0;
     inbuf = (char *) malloc(128);
     inbuflen = 128;
     inofs = 0;
@@ -944,9 +1017,13 @@ MsgChannel::MsgChannel(int _fd, struct sockaddr *_a, socklen_t _l, bool text)
     set_error_recursion = false;
     maximum_remote_protocol = -1;
 
+    /* TCP-only socket options are pointless on AF_UNIX channels.  */
+    const bool is_tcp_channel = addr == nullptr || addr->sa_family == AF_INET
+                                || addr->sa_family == AF_INET6;
+
     int on = 1;
 
-    if (!setsockopt(_fd, SOL_SOCKET, SO_KEEPALIVE, (char *) &on, sizeof(on))) {
+    if (is_tcp_channel && !setsockopt(_fd, SOL_SOCKET, SO_KEEPALIVE, (char *) &on, sizeof(on))) {
 #if defined( TCP_KEEPIDLE ) || defined( TCPCTL_KEEPIDLE )
 #if defined( TCP_KEEPIDLE )
         int keepidle = TCP_KEEPIDLE;
@@ -977,9 +1054,12 @@ MsgChannel::MsgChannel(int _fd, struct sockaddr *_a, socklen_t _l, bool text)
     }
 
 #ifdef TCP_USER_TIMEOUT
-    int timeout = 3 * 3 * 1000; // matches the timeout part of keepalive above, in milliseconds
-    setsockopt(_fd, IPPROTO_TCP, TCP_USER_TIMEOUT, (char *) &timeout, sizeof(timeout));
+    if (is_tcp_channel) {
+        int timeout = 3 * 3 * 1000; // matches the timeout part of keepalive above, in milliseconds
+        setsockopt(_fd, IPPROTO_TCP, TCP_USER_TIMEOUT, (char *) &timeout, sizeof(timeout));
+    }
 #endif
+
 
     if (fcntl(fd, F_SETFL, O_NONBLOCK) < 0) {
         log_perror("MsgChannel fcntl()");
@@ -999,7 +1079,7 @@ MsgChannel::MsgChannel(int _fd, struct sockaddr *_a, socklen_t _l, bool text)
         //writeuint32 ((uint32_t) PROTOCOL_VERSION);
         writefull(vers, 4);
 
-        if (!flush_writebuf(true)) {
+        if (!flush_writebuf(SendBlocking)) {
             protocol = 0;    // unusable
             set_error();
         }
@@ -1331,7 +1411,7 @@ bool MsgChannel::send_msg(const Msg &m, int flags)
         return true;
     }
 
-    return flush_writebuf((flags & SendBlocking));
+    return flush_writebuf(flags);
 }
 
 static int get_second_port_for_debug( int port )
@@ -2310,6 +2390,8 @@ void JobLocalDoneMsg::send_to_channel(MsgChannel *c) const
     Msg::send_to_channel(c);
     *c << job_id;
 }
+
+
 
 JobDoneMsg::JobDoneMsg(int id, int exit, unsigned int _flags, unsigned int _client_count)
     : Msg(Msg::JOB_DONE)

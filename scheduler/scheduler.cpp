@@ -416,13 +416,22 @@ static void enqueue_job_requests_group(JobRequestsGroup* group) {
     job_requests.push_back(group);
 }
 
-// Gives a position in job_requests, used to iterate items.
+// Gives a position in job_requests, used to iterate items.  The position
+// CARRIES its group iterator: the request list is not mutated while a
+// dispatch candidate is being searched for, so the iterator stays valid,
+// and advancing to the next group is ++it rather than a fresh linear
+// search from the list head (which made a walk across G consecutive
+// pending-output groups cost G(G+1)/2 comparisons).
 struct JobRequestPosition
 {
     JobRequestPosition() : group( nullptr ), job( nullptr ) {}
-    JobRequestPosition(JobRequestsGroup* g, Job* j) : group( g ), job( j ) {}
+    JobRequestPosition(list<JobRequestsGroup*>::iterator git,
+                       list<Job*>::iterator jit)
+        : groupIt( git ), group( *git ), jobIt( jit ), job( *jit ) {}
     bool isValid() const { return group != nullptr; }
+    list<JobRequestsGroup*>::iterator groupIt;
     JobRequestsGroup* group;
+    list<Job*>::iterator jobIt;
     Job* job;
 };
 
@@ -432,9 +441,26 @@ static JobRequestPosition get_first_job_request()
         return JobRequestPosition();
     }
 
-    JobRequestsGroup *first = job_requests.front();
-    assert(!first->l.empty());
-    return JobRequestPosition( first, first->l.front());
+    list<JobRequestsGroup*>::iterator first = job_requests.begin();
+    assert(!(*first)->l.empty());
+    return JobRequestPosition( first, (*first)->l.begin());
+}
+
+/* Advance to the NEXT GROUP's front, in O(1): a group holds one
+   submitter's requests at one niceness, so when that submitter cannot be
+   dispatched to at all (undelivered output), its members need not be
+   examined one at a time -- and a whole RUN of pending-output groups is
+   crossed in O(number of groups) total.  */
+static JobRequestPosition get_next_group_front(const JobRequestPosition &pos)
+{
+    assert(pos.group != nullptr);
+    list<JobRequestsGroup *>::iterator groupIt = pos.groupIt;
+    ++groupIt;
+    if (groupIt == job_requests.end()) {
+        return JobRequestPosition();
+    }
+    assert(!(*groupIt)->l.empty());
+    return JobRequestPosition(groupIt, (*groupIt)->l.begin());
 }
 
 static JobRequestPosition get_next_job_request(const JobRequestPosition& pos)
@@ -442,25 +468,20 @@ static JobRequestPosition get_next_job_request(const JobRequestPosition& pos)
     assert(!job_requests.empty());
     assert(pos.group != nullptr && pos.job != nullptr);
 
-    JobRequestsGroup* group = pos.group;
-    // Get next job in the same group.
-    list<Job*>::iterator jobIt = std::find(group->l.begin(), group->l.end(), pos.job);
-    assert(jobIt != group->l.end());
+    // Get next job in the same group: the position carries its iterator,
+    // so this is ++it rather than a linear re-find of the current node
+    // (which made a long same-group walk quadratic).
+    list<Job*>::iterator jobIt = pos.jobIt;
     ++jobIt;
-    if( jobIt != group->l.end())
-        return JobRequestPosition( group, *jobIt );
-    // Get next group.
-    list<JobRequestsGroup*>::iterator groupIt = std::find(job_requests.begin(), job_requests.end(), group);
-    assert(groupIt != job_requests.end());
-    ++groupIt;
-    if( groupIt != job_requests.end())
+    if( jobIt != pos.group->l.end())
     {
-        group = *groupIt;
-        assert(!group->l.empty());
-        return JobRequestPosition( group, group->l.front());
+        JobRequestPosition next = pos;
+        next.jobIt = jobIt;
+        next.job = *jobIt;
+        return next;
     }
-    // end
-    return JobRequestPosition();
+    // Get next group.
+    return get_next_group_front(pos);
 }
 
 // Removes the given job request.
@@ -472,10 +493,10 @@ static void remove_job_request(const JobRequestPosition& pos)
     assert(pos.group != nullptr && pos.job != nullptr);
 
     JobRequestsGroup* group = pos.group;
-    assert(std::find(job_requests.begin(), job_requests.end(), group) != job_requests.end());
-    job_requests.remove(group);
-    assert(std::find(group->l.begin(), group->l.end(), pos.job) != group->l.end());
-    group->remove_job(pos.job);
+    /* Both containing nodes are known by iterator: erase directly instead
+       of searching for them again.  */
+    job_requests.erase(pos.groupIt);
+    group->l.erase(pos.jobIt);
 
     if (group->l.empty()) {
         delete group;
@@ -983,6 +1004,30 @@ static time_t prune_servers()
     }
 
     for (it = css.begin(); it != css.end();) {
+        /* A deferrable dispatch reply must not linger without bound if the
+           daemon stays alive at the TCP level but never drains its socket:
+           keepalive does not cover that case and TCP_USER_TIMEOUT is
+           platform-dependent.  Grant it the same 30 seconds the historical
+           blocking send allowed, then treat it as dead -- this is the
+           application-level bound that keeps a stalled submitter's replies
+           from being queued forever.  */
+        if ((*it)->deferred_output_armed()) {
+            const uint64_t now_msec = icecream_monotonic_msec();
+            const uint64_t deadline = (*it)->deferred_output_deadline_msec();
+            if (now_msec >= deadline) {
+                log_warning() << (*it)->nodeName()
+                              << " did not drain its socket within "
+                              << (ICECC_DEFERRED_SEND_TIMEOUT_MSEC / 1000)
+                              << "s - removing" << endl;
+                CompileServer *old = *it;
+                ++it;
+                handle_end(old, nullptr);
+                continue;
+            }
+            const uint64_t remaining = deadline - now_msec;
+            min_time = min(min_time, (time_t)((remaining + 999) / 1000));
+        }
+
         (*it)->startInConnectionTest();
         time_t cs_in_conn_timeout = (*it)->getNextTimeout();
         if(cs_in_conn_timeout != -1)
@@ -1059,6 +1104,28 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
     Job* job = jobPosition.job;
 
     while (true) {
+        /* A submitter with undelivered output is not a dispatch candidate:
+           its reply would only be queued behind output the peer is not
+           draining, deepening the backlog and adding a worker reservation
+           the daemon cannot yet act on.  Skip to another submitter's
+           request; the deferred-output deadline in prune_servers() bounds
+           how long the skipped one can stay in this state.  */
+        if (job->submitter()->has_pending_write()) {
+            /* Skip the WHOLE group: every member shares this submitter by
+               construction, and stepping through a large clogged backlog
+               one job at a time is quadratic in its length.  */
+            trace() << "pending output on " << job->submitter()->nodeName()
+                    << ", skipping its request group" << endl;
+            jobPosition = get_next_group_front(jobPosition);
+            if (!jobPosition.isValid()) {
+                trace() << "every dispatchable request's submitter has pending"
+                           " output, delaying" << endl;
+                return false;
+            }
+            job = jobPosition.job;
+            continue;
+        }
+
         use_cs = pick_server(job, schedulerAlgorithm);
 
         if (use_cs) {
@@ -1088,12 +1155,24 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
                     return false;
                 }
             }
-            // This means that there's nobody who could possibly handle the job,
-            // so there's no point in delaying.
+            /* Nobody can ever handle it, so assign it back to its own
+               submitter -- but not through a channel that is already
+               backed up.  */
+            if (job->submitter()->has_pending_write()) {
+                trace() << "no suitable host and the submitter has pending"
+                           " output, delaying" << endl;
+                return false;
+            }
             log_info() << "No suitable host found, assigning submitter" << endl;
             use_cs = job->submitter();
             break;
         }
+        /* The advance above moved the POSITION but the previous iteration
+           of this loop kept using the old JOB: pick_server() then examined
+           one request while remove_job_request() below removed another --
+           dispatching a message for job A while dequeuing job B.  Keep the
+           two in lockstep on every valid advance.  */
+        job = jobPosition.job;
     }
 
     remove_job_request( jobPosition );
@@ -1137,7 +1216,16 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
     if(IS_PROTOCOL_VERSION(37, job->submitter()) && use_cs == job->submitter())
     {
         NoCSMsg m2(job->id(), job->localClientId());
-        if (!job->submitter()->send_msg(m2)) {
+        /* Deferrable: if the submitting daemon is slow to drain its socket
+           (its machine is busy under a highly parallel build), the reply
+           stays queued in the channel's write buffer and is flushed from
+           the main loop when poll() reports the socket writable again.
+           Blocking here stalled every other scheduler duty behind one busy
+           submitter; failing here tore that submitter down with all of its
+           in-flight jobs.  send_msg() now returns false only if the
+           connection is genuinely dead.  */
+        if (!job->submitter()->send_msg(m2, MsgChannel::SendNonBlocking
+                                            | MsgChannel::SendDeferrable)) {
             trace() << "failed to deliver job " << job->id() << endl;
             handle_end(job->submitter(), nullptr);   // will care for the rest
             return true;
@@ -1147,7 +1235,16 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
     {
         UseCSMsg m2(host_platform, use_cs->name, use_cs->remotePort(), job->id(),
                 gotit, job->localClientId(), matched_job_id);
-        if (!job->submitter()->send_msg(m2)) {
+        /* Deferrable: if the submitting daemon is slow to drain its socket
+           (its machine is busy under a highly parallel build), the reply
+           stays queued in the channel's write buffer and is flushed from
+           the main loop when poll() reports the socket writable again.
+           Blocking here stalled every other scheduler duty behind one busy
+           submitter; failing here tore that submitter down with all of its
+           in-flight jobs.  send_msg() now returns false only if the
+           connection is genuinely dead.  */
+        if (!job->submitter()->send_msg(m2, MsgChannel::SendNonBlocking
+                                            | MsgChannel::SendDeferrable)) {
             trace() << "failed to deliver job " << job->id() << endl;
             handle_end(job->submitter(), nullptr);   // will care for the rest
             return true;
@@ -2349,8 +2446,37 @@ int main(int argc, char *argv[])
     while (!exit_main_loop) {
         int timeout = prune_servers();
 
+        /* Dispatch in bounded batches: draining an arbitrarily deep request
+           queue before returning to poll() starves every other scheduler
+           duty (control connections, daemon traffic, monitor feeds) for the
+           whole drain.  After a full batch, poll with a zero timeout so
+           pending fds are serviced and dispatching resumes immediately.  */
+        int dispatch_batch = 128;
+        bool more_dispatch = false;
         while (empty_queue(scheduler_algo)) {
-            continue;
+            if (--dispatch_batch <= 0) {
+                more_dispatch = true;
+                break;
+            }
+        }
+        if (more_dispatch) {
+            timeout = 0;
+        } else {
+            /* Dispatch can have armed a deferred-output deadline AFTER
+               prune_servers() computed the timeout above, so recompute the
+               bound rather than sleeping past it.  */
+            for (CompileServer * const cs : css) {
+                if (!cs->deferred_output_armed()) {
+                    continue;
+                }
+                const uint64_t now_msec = icecream_monotonic_msec();
+                const uint64_t deadline = cs->deferred_output_deadline_msec();
+                const uint64_t remaining = deadline > now_msec ? deadline - now_msec : 0;
+                const time_t secs = (time_t)((remaining + 999) / 1000);
+                if (timeout < 0 || secs < timeout) {
+                    timeout = secs;
+                }
+            }
         }
 
         /* Announce ourselves from time to time, to make other possible schedulers disconnect
@@ -2393,9 +2519,23 @@ int main(int argc, char *argv[])
                 }
             }
 
+            /* Flush anything a deferrable send left queued once the peer is
+               reading again.  */
+            if (ok && cs->has_pending_write() && !cs->flush_pending()) {
+                handle_end(cs, nullptr);
+                ok = false;
+            }
+
             if (ok) {
                 pfd.fd = i;
                 pfd.events = POLLIN;
+
+                /* Ask poll() to tell us when queued dispatch replies can be
+                   flushed.  */
+                if (cs->has_pending_write()) {
+                    pfd.events |= POLLOUT;
+                }
+
                 pollfds.push_back( pfd );
             }
         }

@@ -59,3 +59,6 @@ compile_commands.json
 *.log
 *.trs
 /unittests/occupancy
+/unittests/backpressure
+/unittests/schedgate
+/unittests/sndbuf_shim.so

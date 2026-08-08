@@ -247,6 +247,15 @@ case $host_os in
 esac
 AC_SUBST(LIB_KINFO)
 
+# The scheduler backpressure integration gate manufactures its clog with an
+# LD_PRELOAD shim; build that instrument (and the gate that needs it) only
+# where the mechanism exists.  The product code stays portable.
+case $host_os in
+  linux*) is_linux=yes ;;
+  *) is_linux=no ;;
+esac
+AM_CONDITIONAL([IS_LINUX], [test "x$is_linux" = xyes])
+
 AC_CHECK_PROG(CLANG,clang,clang)
 
 AC_ARG_ENABLE(clang-rewrite-includes,

@@ -224,6 +224,21 @@ const int NODE_FEATURE_ENV_XZ = ( 1 << 0 );
 // The remote node is capable of unpacking environment compressed as .tar.zst .
 const int NODE_FEATURE_ENV_ZSTD = ( 1 << 1 );
 
+
+
+// Monotonic clock: deadlines must not move when the wall clock is stepped
+// (NTP, manual set), so deferred-output accounting uses this rather than
+// time(nullptr).
+uint64_t icecream_monotonic_msec();
+
+// How long undelivered deferred output may wait before its peer is treated
+// as dead.  The same budget the historical blocking send granted.
+#define ICECC_DEFERRED_SEND_TIMEOUT_MSEC 30000
+
+// MsgChannel supports backpressure-tolerant sends (SendDeferrable,
+// has_pending_write(), flush_pending()).
+#define ICECC_MSGCHANNEL_HAS_DEFERRED_SEND 1
+
 // a list of pairs of host platform, filename
 typedef std::list<std::pair<std::string, std::string> > Environments;
 
@@ -233,7 +248,16 @@ public:
     enum SendFlags {
         SendBlocking = 1 << 0,
         SendNonBlocking = 1 << 1,
-        SendBulkOnly = 1 << 2
+        SendBulkOnly = 1 << 2,
+        // Tolerate backpressure instead of failing the channel: if the peer's
+        // receive buffer is full (EAGAIN, or the poll timeout expires when
+        // combined with SendBlocking), keep the unsent bytes queued in the
+        // write buffer and report success.  The caller must later call
+        // flush_pending() when the socket becomes writable again (e.g. from a
+        // POLLOUT event; see has_pending_write()).  Queued bytes are flushed
+        // in order, so the byte stream stays intact even if a message was
+        // partially transmitted when the buffer filled up.
+        SendDeferrable = 1 << 3
     };
 
     virtual ~MsgChannel();
@@ -252,6 +276,43 @@ public:
     {
         return eof || instate == HAS_MSG;
     }
+
+        // SendDeferrable send that ran into backpressure, or a message so far only
+    // collected by SendBulkOnly).
+    bool has_pending_write(void) const
+    {
+        return msgtogo > 0;
+    }
+
+    // Bytes currently queued for the peer (deferred + bulk-collected).
+    size_t pending_bytes(void) const
+    {
+        return msgtogo;
+    }
+
+    // True while a deferrable send has left output undelivered.  An explicit
+    // flag rather than a timestamp test: an age of zero is ambiguous during
+    // the first second of a backlog, and owners must distinguish "not armed"
+    // from "armed, just now".
+    bool deferred_output_armed(void) const
+    {
+        return pending_write_armed;
+    }
+
+    // Absolute CLOCK_MONOTONIC millisecond deadline for the current backlog
+    // (meaningful only while deferred_output_armed()).  Owners enforce it:
+    // the kernel TCP_USER_TIMEOUT bound is #ifdef'd and SO_KEEPALIVE does
+    // not cover a peer whose TCP keeps ACKing while the process never reads.
+    uint64_t deferred_output_deadline_msec(void) const
+    {
+        return pending_write_deadline_msec;
+    }
+
+    // Try to write queued output without blocking.  A still-full peer buffer
+    // just leaves the remaining bytes queued and returns true; false is
+    // returned only if the connection hit a real error (the channel is in the
+    // error state / at_eof() afterwards).
+    bool flush_pending(void);
 
     // Returns ture if there were no errors filling inbuf.
     bool read_a_bit(void);
@@ -299,8 +360,9 @@ protected:
     MsgChannel(int _fd, struct sockaddr *, socklen_t, bool text = false);
 
     bool wait_for_protocol();
-    // returns false if there was an error sending something
-    bool flush_writebuf(bool blocking);
+    // returns false if there was an error sending something; send_flags is a
+    // combination of SendFlags bits (SendBlocking / SendDeferrable matter here)
+    bool flush_writebuf(int send_flags);
     void writefull(const void *_buf, size_t count);
     // returns false if there was an error in the protocol setup
     bool update_state(void);
@@ -313,6 +375,9 @@ protected:
     size_t msgbuflen;
     size_t msgofs;
     size_t msgtogo;
+    // deferred-output deadline state; see deferred_output_armed()
+    bool pending_write_armed;
+    uint64_t pending_write_deadline_msec;
     char *inbuf;
     size_t inbuflen;
     size_t inofs;
