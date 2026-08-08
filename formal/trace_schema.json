@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Icecream temporal counterexample trace",
+  "type": "object",
+  "required": ["scenario", "events", "states", "conclusion", "expected_counterexample"],
+  "properties": {
+    "scenario": {"type": "string"},
+    "expected_counterexample": {"type": "boolean"},
+    "conclusion": {"type": "string"},
+    "events": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "detail"],
+        "properties": {
+          "name": {"type": "string"},
+          "detail": {"type": "object"}
+        }
+      }
+    },
+    "states": {"type": "array", "items": {"type": "object"}}
+  }
+}
