@@ -75,3 +75,4 @@ package_builder/dist/
 /unittests/schedbp
 /unittests/backpressure
 /unittests/testargs
+/unittests/occupancy
