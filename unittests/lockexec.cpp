@@ -145,16 +145,27 @@ int main()
           "with every slot held by an exec'd process, the next acquisition BLOCKS"
           " (a byte here means a lock died at exec)");
 
-    /* Free one slot by killing one stub; the waiter must now complete.
-       Kill the fd-0 holder specifically: its slot must have been genuinely
-       HELD all along, not silently free.  */
-    kill(holders[0], SIGKILL);
-    waitpid(holders[0], nullptr, 0);
-    check(wait_bytes(pipefd[0], 1, 30),
-          "killing one exec'd holder unblocks the waiter (the pool, not less, is the bound)");
+    /* Free slots until the waiter completes.  dcc_lock_host blocks on ONE
+       pid-derived slot, and there is no way to know from outside which
+       holder owns it -- killing a single fixed holder unblocked the waiter
+       only when the pids happened to line up (a 1-in-ncpus flake in the
+       first version of this gate).  Killing holders one at a time still
+       proves the property that matters: an exec'd holder's exit -- and
+       nothing less -- is what releases its slot.  The fd-0 holder dies
+       first, so ITS slot is demonstrably released by ITS exit like any
+       other.  */
+    bool unblocked = false;
+    for (int i = 0; i < nheld && !unblocked; ++i) {
+        kill(holders[i], SIGKILL);
+        waitpid(holders[i], nullptr, 0);
+        unblocked = wait_bytes(pipefd[0], 1, 2);
+    }
+    check(unblocked,
+          "killing exec'd holders unblocks the waiter (exit, and nothing less,"
+          " releases a slot)");
     waitpid(waiter, nullptr, 0);
 
-    for (int i = 1; i < nheld; ++i) {
+    for (int i = 0; i < nheld; ++i) {
         kill(holders[i], SIGKILL);
         waitpid(holders[i], nullptr, 0);
     }
