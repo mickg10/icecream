@@ -2584,7 +2584,7 @@ static bool handle_line(CompileServer *cs, Msg *_m)
             return false;
         }
         snprintf(buf, sizeof(buf),
-                 "dispatch_credit=%u effective=%u farm_slots=%u stall_timeout=%llus"
+                 "dispatch_credit=%u effective=%u farm_slots=%u stall_report_after=%llus"
                  " jobs_admitted=%llu",
                  max_outstanding_dispatches, effective_dispatch_credit(),
                  cached_remote_farm_slots,
@@ -3258,7 +3258,7 @@ int main(int argc, char *argv[])
 
     log_info() << "ICECREAM scheduler " VERSION " starting up, port " << scheduler_port << endl;
     log_info() << "dispatch credit: " << max_outstanding_dispatches
-               << " unconfirmed per submitter (farm-clamped at runtime), stall timeout "
+               << " unconfirmed per submitter (farm-clamped at runtime), stall reported after "
                << (max_outstanding_stall_msec / 1000) << "s" << endl;
     log_info() << "Debug level: " << debug_level << endl;
 

@@ -192,6 +192,13 @@ static long long query_control_field(int port, const char *command,
                                      const char *needle, const char *field);
 /* Occurrences of `needle` in the full reply of `command`.  */
 static long long query_control_count(int port, const char *command, const char *needle);
+/* Exact scheduler state, not a diagnostic counter: is this job id still in
+   the scheduler's job map, and how many jobs does this worker hold?  The
+   dispatch-credit counter cannot answer either question -- it counts only
+   assignments that have not yet reached JobBegin, so after a Begin it reads
+   zero whether or not the later Done was ever consumed.  */
+static bool job_in_scheduler(int port, unsigned job_id);
+static long long worker_job_count(int port, const char *worker);
 
 static long long query_submitter_admitted(int port, const char *name)
 {
@@ -300,6 +307,23 @@ static long long query_control_count(int port, const char *command, const char *
     }
     close(fd);
     return count;
+}
+
+static bool job_in_scheduler(int port, unsigned job_id)
+{
+    char needle[64];
+    snprintf(needle, sizeof(needle), " %u ", job_id);
+    /* dump_job() prints "<id> <STATE> ... " so the id is the first field of
+       a line that begins with a space.  */
+    return query_control_count(port, "listjobs", needle) > 0;
+}
+
+static long long worker_job_count(int port, const char *worker)
+{
+    /* listcs prints "... jobs=<current>/<max> ..." for each host.  */
+    char needle[64];
+    snprintf(needle, sizeof(needle), " %s (", worker);
+    return query_control_field(port, "listcs", needle, "jobs=");
 }
 
 static long long query_submitter_field(int port, const char *name, const char *field)
@@ -464,7 +488,7 @@ int main(int argc, char **argv)
        report the stall, retain everything, and keep serving its healthy
        peer.  Removing a genuinely absent daemon is the deferred-output
        deadline's job (see the stall/transient modes), not this bound's.  */
-    const bool stallevict_mode = argc > 5 && strcmp(argv[5], "stallcredit") == 0;
+    const bool stallcredit_mode = argc > 5 && strcmp(argv[5], "stallcredit") == 0;
     /* "leastbusy": the SCH-6 selection gate, run with -a least_busy.  With
        every host in its preload zone (count == maxJobs) the picker must
        still assign work -- the two-pass bucketed form selected an empty set
@@ -485,7 +509,7 @@ int main(int argc, char **argv)
        continuing while a wrapper is stuck, exactly-once reporting, and --
        the central property -- a LATE THAW whose Begin/Done still reconcile
        the retained assignment exactly once.  */
-    const bool quarantine_mode = argc > 5 && strcmp(argv[5], "retention") == 0;
+    const bool retention_mode = argc > 5 && strcmp(argv[5], "retention") == 0;
     /* "mixedrole": the realistic topology.  The submitter also has compile
        capacity, so the scheduler can place work back on it (NoCS / local
        UseCS).  Local decisions reserve no farm slot and must NOT consume
@@ -565,7 +589,7 @@ int main(int argc, char **argv)
        spawn on a fresh pair rather than failing the leg.  */
     pid_t sched = start_scheduler(scheduler_bin, shim, port, sched_log,
                                   perf_mode ? "-v" : "-vvv",
-                                  (stallevict_mode || clientstall_mode || quarantine_mode)
+                                  (stallcredit_mode || clientstall_mode || retention_mode)
                                       ? "--dispatch-stall-report-after=10"
                                   : (leastbusy_mode ? "--algorithm=least_busy" : nullptr));
     if (sched < 0) {
@@ -607,7 +631,7 @@ int main(int argc, char **argv)
             port += 2;
             sched = start_scheduler(scheduler_bin, shim, port, sched_log,
                                     perf_mode ? "-v" : "-vvv",
-                                    (stallevict_mode || clientstall_mode || quarantine_mode)
+                                    (stallcredit_mode || clientstall_mode || retention_mode)
                                         ? "--dispatch-stall-report-after=10"
                                     : (leastbusy_mode ? "--algorithm=least_busy" : nullptr));
             if (sched < 0) {
@@ -891,7 +915,7 @@ int main(int argc, char **argv)
            holding 0-1 slots at random moments would make them flake.  The
            connection stays (the scheduler keeps a second submitter), the
            traffic parks.  */
-        if (leastbusy_mode || quarantine_mode) {
+        if (leastbusy_mode || retention_mode) {
             while (!shutdown) {
                 usleep(100 * 1000);
             }
@@ -2162,9 +2186,9 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    if (stallevict_mode) {
+    if (stallcredit_mode) {
         /* BP-1's liveness bound, at the 10s CLI floor: a submitter whose
-           dispatched jobs never reach JobBegin is evicted AT the bound --
+           dispatched jobs never reach JobBegin is reported AT the bound --
            demonstrably not before it, and not never -- and the healthy
            submitter is served straight through the event.  */
         fprintf(stderr, "# stallcredit: flooding %d jobs, never confirming\n", njobs);
@@ -2190,8 +2214,8 @@ int main(int argc, char **argv)
         Clock::time_point t_first = t0;
         const int healthy_at_flood = healthy_replies.load();
         int healthy_mid = -1;
-        bool evicted = false;
-        double evict_after_first_s = -1;
+        bool removed = false;
+        double report_after_first_s = -1;
         while (secs_since(t0) < 40) {
             Msg *m = sub->get_msg(1);
             if (m) {
@@ -2208,17 +2232,17 @@ int main(int argc, char **argv)
                 healthy_mid = healthy_replies.load();
             }
             if (sub->at_eof()) {
-                evicted = true;
-                evict_after_first_s = std::chrono::duration<double>(
+                removed = true;
+                report_after_first_s = std::chrono::duration<double>(
                     Clock::now() - t_first).count();
                 break;
             }
         }
-        const int healthy_at_evict = healthy_replies.load();
-        fprintf(stderr, "# stallcredit: delivered=%d evicted=%s at %.1fs after first delivery"
-                " (bound 10s), healthy flood=%d mid=%d evict=%d\n",
-                delivered, evicted ? "yes" : "NO", evict_after_first_s,
-                healthy_at_flood, healthy_mid, healthy_at_evict);
+        const int healthy_at_report = healthy_replies.load();
+        fprintf(stderr, "# stallcredit: delivered=%d removed=%s at %.1fs after first delivery"
+                " (bound 10s), healthy flood=%d mid=%d report=%d\n",
+                delivered, removed ? "yes" : "NO", report_after_first_s,
+                healthy_at_flood, healthy_mid, healthy_at_report);
         /* The dispatch credit is exact: 32 unconfirmed assignments (the
            configured default; the farm is large enough that no clamp
            applies), and nothing more afterwards.
@@ -2232,7 +2256,7 @@ int main(int argc, char **argv)
            connection failure and the deferred-output deadline remain the
            paths that remove a genuinely dead daemon.  */
         REQUIRE(delivered == 32, "exactly the effective dispatch credit was delivered");
-        REQUIRE(!evicted,
+        REQUIRE(!removed,
                 "a READING submitter is NOT removed (its wrappers stalled, not it); the"
                 " dispatch credit is what bounds the farm slots it can hold");
         {
@@ -2254,13 +2278,13 @@ int main(int argc, char **argv)
         /* The healthy submitter must keep completing work after the event.  */
         {
             const Clock::time_point th = Clock::now();
-            while (healthy_replies.load() < healthy_at_evict + 5 && secs_since(th) < 30) {
+            while (healthy_replies.load() < healthy_at_report + 5 && secs_since(th) < 30) {
                 usleep(100 * 1000);
             }
         }
         fprintf(stderr, "# stallcredit: healthy now=%d (was %d)\n",
-                healthy_replies.load(), healthy_at_evict);
-        REQUIRE(healthy_replies.load() >= healthy_at_evict + 5,
+                healthy_replies.load(), healthy_at_report);
+        REQUIRE(healthy_replies.load() >= healthy_at_report + 5,
                 "the healthy submitter kept being served throughout");
         REQUIRE(healthy_alive.load(), "the healthy submitter connection survived");
         REQUIRE(!sub->at_eof(), "the stalled submitter's own connection survived");
@@ -2277,7 +2301,7 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    if (quarantine_mode) {
+    if (retention_mode) {
         /* The healthy_thread would supply unrelated confirmations and mask
            exactly what these cases test; it parks itself for this mode.  */
         auto send_for = [&](unsigned cid, const char *fname) {
@@ -2344,25 +2368,34 @@ int main(int argc, char **argv)
             REQUIRE(quarantined, "the scheduler reported the unconfirmed assignment");
             REQUIRE(!removed, "the quiet healthy daemon was NOT removed");
         }
-        /* The long sibling must still be alive and completable.  */
+        /* The long sibling's completion must be CONSUMED by the scheduler.
+           The dispatch-credit counter cannot show that: the sibling's Begin
+           already credited its debit, so `outstanding` reads 1 (the frozen
+           job) both before and after the Done is processed.  Observe the
+           scheduler's own job map and the worker's job count instead.  */
         {
-            JobDoneMsg jd(long_job, 0, JobDoneMsg::FROM_SERVER);
-            REQUIRE(cs->send_msg(jd), "long sibling completes after the bound");
-        }
+            REQUIRE(job_in_scheduler(port, long_job),
+                    "the long sibling is in the scheduler's job map before its Done");
+            const long long jobs_before = worker_job_count(port, "fakecs");
+            REQUIRE(jobs_before >= 1, "the worker holds the sibling's reservation");
 
-        /* The long sibling's completion must actually be CONSUMED by the
-           scheduler, not merely accepted by the local socket.  */
-        {
-            bool converged = false;
+            JobDoneMsg jd(long_job, 0, JobDoneMsg::FROM_SERVER);
+            REQUIRE(cs->send_msg(jd), "long sibling's completion sent");
+
+            bool gone = false;
             const Clock::time_point t0 = Clock::now();
-            while (!converged && secs_since(t0) < 15) {
-                const long long out = query_submitter_outstanding(port, "fakesub");
-                if (out == 1) { converged = true; break; }   // only the frozen one left
+            while (!gone && secs_since(t0) < 15) {
+                if (!job_in_scheduler(port, long_job)) { gone = true; break; }
                 usleep(200 * 1000);
             }
-            REQUIRE(converged,
-                    "the scheduler consumed the long sibling's completion (only the"
-                    " frozen assignment remains outstanding)");
+            REQUIRE(gone, "the completion was consumed: the job left the scheduler's map");
+            const long long jobs_after = worker_job_count(port, "fakecs");
+            fprintf(stderr, "# retention: worker jobs %lld -> %lld after the sibling's Done\n",
+                    jobs_before, jobs_after);
+            REQUIRE(jobs_after == jobs_before - 1,
+                    "the worker reservation was released exactly once");
+            REQUIRE(job_in_scheduler(port, frozen_job),
+                    "the frozen assignment is still OWNED (retention)");
         }
 
         /* Dispatch continues while a wrapper is stuck: ONE request, waited
@@ -2415,11 +2448,35 @@ int main(int argc, char **argv)
             }
             REQUIRE(credited, "the late JobBegin credited the retained assignment exactly once");
 
+            /* Begin must NOT have ended the job: it is COMPILING now, and
+               the worker still holds its reservation.  */
+            REQUIRE(job_in_scheduler(port, frozen_job),
+                    "the thawed job is still owned after its late Begin (now compiling)");
+            const long long jobs_before_done = worker_job_count(port, "fakecs");
+
             JobDoneMsg jd(frozen_job, 0, JobDoneMsg::FROM_SERVER);
             REQUIRE(cs->send_msg(jd), "late JobDone for the thawed wrapper sent");
-            usleep(1500 * 1000);
+            bool ended = false;
+            const Clock::time_point t1 = Clock::now();
+            while (!ended && secs_since(t1) < 15) {
+                if (!job_in_scheduler(port, frozen_job)) { ended = true; break; }
+                usleep(200 * 1000);
+            }
+            REQUIRE(ended, "the late completion was consumed: the job left the scheduler's map");
+            const long long jobs_after_done = worker_job_count(port, "fakecs");
+            fprintf(stderr, "# retention: worker jobs %lld -> %lld after the late Done\n",
+                    jobs_before_done, jobs_after_done);
+            REQUIRE(jobs_after_done == jobs_before_done - 1,
+                    "the retained worker reservation was released exactly once");
             REQUIRE(query_submitter_outstanding(port, "fakesub") == 0,
                     "accounting stayed converged after the late completion");
+
+            /* And the freed capacity is really usable: a new assignment must
+               be able to consume it.  */
+            REQUIRE(send_for(7400, "afterreclaim.cpp"), "post-reclaim request sent");
+            const unsigned reclaimed = await_for(7400, 20);
+            REQUIRE(reclaimed != 0, "the reclaimed worker capacity accepts new work");
+            confirm_job(reclaimed);
             {
                 bool invariant_failure = false;
                 FILE *lf = fopen(sched_log.c_str(), "r");
@@ -2436,6 +2493,33 @@ int main(int argc, char **argv)
                 REQUIRE(!invariant_failure,
                         "no accounting invariant failure across the late reconciliation");
             }
+        }
+        /* A SECOND, independent stall episode must be reported once more:
+           the latch belongs to the episode, so resolving the first one must
+           re-arm it for the next.  */
+        {
+            unsigned frozen2 = 0;
+            REQUIRE(send_for(7500, "frozen2.cpp"), "second frozen wrapper requested");
+            REQUIRE((frozen2 = await_for(7500, 30)) != 0, "second frozen wrapper assigned");
+            const Clock::time_point t0 = Clock::now();
+            while (secs_since(t0) < 16) {
+                Msg *m = sub->get_msg(1);
+                delete m;
+            }
+            int warnings = 0;
+            FILE *lf = fopen(sched_log.c_str(), "r");
+            if (lf) {
+                char line[4096];
+                while (fgets(line, sizeof(line), lf)) {
+                    if (strstr(line, "is not progressing")) { ++warnings; }
+                }
+                fclose(lf);
+            }
+            fprintf(stderr, "# retention: warnings after a SECOND episode: %d\n", warnings);
+            REQUIRE(warnings == 2,
+                    "a new stall episode is reported exactly once more (the latch re-arms)");
+            REQUIRE(job_in_scheduler(port, frozen2),
+                    "the second frozen assignment is owned too");
         }
         REQUIRE(worst_reply.load() < 5.0, "scheduler stayed responsive");
 
