@@ -43,7 +43,7 @@ extern std::string get_cwd();
 
 extern bool dcc_lock_host();
 extern void dcc_unlock();
-extern void dcc_lock_keep_across_exec();
+extern bool dcc_lock_keep_across_exec();
 extern int dcc_locked_fd();
 
 class HostUnlock

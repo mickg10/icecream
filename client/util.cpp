@@ -170,12 +170,24 @@ static bool dcc_lock_host_slot(string fname, int lock, bool block);
    a farm-and-daemon outage put one compiler per submitted job on the
    machine, not one per CPU).  Clearing close-on-exec keeps the fd -- and
    with it the record lock -- alive for exactly the compiler's lifetime;
-   the kernel releases both when the compiler exits.  */
-void dcc_lock_keep_across_exec()
+   the kernel releases both when the compiler exits.
+
+   Returns false when the flag could not be cleared: the caller must then
+   NOT take the no-fork exec (it would run unbounded); forking instead
+   keeps the record lock in the parent, which holds it through the wait.
+   Descriptor 0 is a valid lock fd (stdin may be closed), so the test is
+   against the -1 sentinel, not positivity.  */
+bool dcc_lock_keep_across_exec()
 {
-    if (lock_fd > 0) {
-        set_cloexec_flag(lock_fd, false);
+    if (lock_fd == -1) {
+        return true;    // no lock held; nothing to preserve
     }
+    if (set_cloexec_flag(lock_fd, false) != 0) {
+        log_error() << "cannot clear close-on-exec on the local-build slot lock (fd "
+                    << lock_fd << "): " << strerror(errno) << endl;
+        return false;
+    }
+    return true;
 }
 
 bool dcc_lock_host()
@@ -199,7 +211,9 @@ bool dcc_lock_host()
     }
 
     fname += "/local_lock";
-    lock_fd = 0;
+    /* Deliberately NOT parked at 0 while probing: descriptor 0 is a valid
+       open() result when stdin is closed, so 0 must remain distinguishable
+       as "a real lock fd".  -1 is the only not-locked sentinel.  */
     int max_cpu = 1;
     dcc_ncpus(&max_cpu);
     // To ensure better distribution, select a "random" starting slot.

@@ -1867,6 +1867,75 @@ int main(int argc, char **argv)
                         REQUIRE(got == 5, "the daemon is not wedged after the both-domain cancel");
                     }
                 }
+                // 7d: cancel arriving after EVERY member dispatched.  The
+                // sweep finds nothing scheduler-owned; that is a SUCCESS,
+                // not an error -- the daemon's 107 bounces settle the
+                // dispatched members.  The old return value signalled
+                // "connection deleted" to the drain loop for a live
+                // connection.
+                {
+                    REQUIRE(send_count(subF, 20, 607, "cancelH.cpp"),
+                            "count=20 sent (small enough to dispatch fully)");
+                    std::vector<unsigned> dispatched607;
+                    const Clock::time_point t0 = Clock::now();
+                    Clock::time_point tp = t0;
+                    while (dispatched607.size() < 20
+                            && secs_since(tp) < 60 && secs_since(t0) < 300) {
+                        Msg *m = subF->get_msg(2);
+                        if (!m) { continue; }
+                        if (MSG_IS(m, USE_CS)) {
+                            UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                            if (u && u->client_id == 607) {
+                                dispatched607.push_back(u->job_id);
+                                tp = Clock::now();
+                            }
+                        }
+                        delete m;
+                    }
+                    REQUIRE(dispatched607.size() == 20, "every member dispatched before the cancel");
+                    {
+                        JobDoneMsg d(0, 255, JobDoneMsg::FROM_SUBMITTER);
+                        d.set_unknown_job_client_id(607);
+                        REQUIRE(subF->send_msg(d), "zero-match cancellation sent");
+                    }
+                    /* The daemon settles the dispatched members: 107 each,
+                       IMMEDIATELY behind the cancel on the same connection --
+                       if the cancel's return value stops the drain, these are
+                       exactly the messages that stall.  */
+                    for (unsigned jid : dispatched607) {
+                        JobDoneMsg bounce(jid, 107, JobDoneMsg::FROM_SUBMITTER);
+                        REQUIRE(subF->send_msg(bounce), "107 bounce sent");
+                    }
+                    {
+                        long long left = -1;
+                        const Clock::time_point tg = Clock::now();
+                        while (secs_since(tg) < 20) {
+                            left = query_control_count(port, "listjobs", "sub:fakesub9");
+                            if (left == 0) { break; }
+                            usleep(200 * 1000);
+                        }
+                        REQUIRE(left == 0,
+                                "all dispatched members settled via the 107 bounces");
+                    }
+                    REQUIRE(!subF->at_eof(),
+                            "the connection survived a cancellation that matched nothing");
+                    {
+                        int got = 0;
+                        REQUIRE(send_count(subF, 5, 608, "cancelI.cpp"),
+                                "request after the zero-match cancel");
+                        const Clock::time_point tf = Clock::now();
+                        while (got < 5 && secs_since(tf) < 120) {
+                            Msg *m = subF->get_msg(2);
+                            if (!m) { continue; }
+                            if (MSG_IS(m, USE_CS)) {
+                                UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                                if (u && u->client_id == 608) { confirm_job(u->job_id); ++got; }
+                            }
+                            delete m;
+                        }
+                        REQUIRE(got == 5, "the daemon still works after the zero-match cancel");
+                    }
+                }
                 delete subF;
             }
         }
@@ -2510,6 +2579,22 @@ int main(int argc, char **argv)
         REQUIRE(send_for(sub, 8102, "silent3.cpp"), "third request sent");
 
         fprintf(stderr, "# noreader: submitter goes silent across the 10s threshold\n");
+        /* Barrier first: sampling before the assignment exists would record
+           a legitimate pre-assignment zero and fail on machine speed.  The
+           retention window's minimum starts only once the state to retain
+           is actually there.  */
+        {
+            const Clock::time_point tb = Clock::now();
+            while (secs_since(tb) < 30) {
+                if (query_submitter_outstanding(port, "fakesub") == 1
+                        && worker_job_count(port, "fakecs") >= 1) {
+                    break;
+                }
+                usleep(200 * 1000);
+            }
+            REQUIRE(query_submitter_outstanding(port, "fakesub") == 1,
+                    "barrier: the credit-1 assignment was delivered before the window");
+        }
         long long min_worker_jobs = 1000000;
         const int healthy_before = healthy_replies.load();
         const Clock::time_point t0 = Clock::now();

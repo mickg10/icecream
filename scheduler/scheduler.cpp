@@ -2216,8 +2216,17 @@ static bool handle_job_done(CompileServer *cs, Msg *_m)
             ++cancelled;
         }
         if (cancelled == 0) {
-            trace() << "job ID not present " << m->job_id << endl;
-            return false;
+            /* Every member had already dispatched (or completed): nothing
+               is scheduler-owned any more, and the daemon's own
+               JobDone(107) bounces will settle the dispatched ones.  A
+               well-formed cancellation on the submitter's own connection
+               is idempotently successful -- returning false here signalled
+               "connection deleted" to the drain loop while the connection
+               was in fact alive, stopping the drain for one iteration at
+               exactly the moment the daemon may be sending those 107
+               completions.  */
+            trace() << "no scheduler-owned members remain for client "
+                    << clientId << endl;
         }
         return true;
     } else if (jobs.find(m->job_id) != jobs.end()) {

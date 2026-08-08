@@ -360,7 +360,20 @@ int build_local(CompileJob &job, MsgChannel *local_daemon, struct rusage *used)
         color_output = false;
     }
 
-    if (used || color_output) {
+    /* The no-fork exec is only safe while the slot lock survives it: the
+       lock fd is close-on-exec, and an fcntl record lock dies with its
+       descriptor, so exec-without-fork used to release the slot the
+       moment the compiler started -- the daemonless fallback then ran one
+       compiler per JOB instead of one per CPU.  Decide here: clear the
+       flag for the pure exec case, and if that fails, fork instead so the
+       record lock stays with the parent through the wait.  */
+    const bool will_fork = used || color_output;
+    bool exec_keeps_lock = true;
+    if (!local_daemon && !will_fork) {
+        exec_keeps_lock = dcc_lock_keep_across_exec();
+    }
+
+    if (will_fork || !exec_keeps_lock) {
         flush_debug();
         child_pid = fork();
     }
@@ -384,13 +397,6 @@ int build_local(CompileJob &job, MsgChannel *local_daemon, struct rusage *used)
             }
         }
 
-        /* If this process holds a local-build slot (daemonless fallback,
-           no fork), the lock must survive the exec or the concurrency
-           bound evaporates while the compiler runs.  In the forked-child
-           case this is a harmless no-op on an inherited fd: the record
-           lock belongs to the parent, which holds it until the child is
-           reaped.  */
-        dcc_lock_keep_across_exec();
         execv(argv[0], &argv[0]);
         int exitcode = ( errno == ENOENT ? 127 : 126 );
         ostringstream errmsg;
