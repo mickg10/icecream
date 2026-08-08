@@ -35,7 +35,13 @@
 # and a LATE THAW's Begin/Done still reconcile the retained assignment
 # exactly once with no accounting failure.
 #
-# Run 6 -- leastbusy (SCH-6): with -a least_busy and every host at maxJobs,
+# Run 6 -- noreader: the honest stopped-daemon model.  A submitter whose
+# process stops consuming its socket -- but whose single credit-1 reply fit
+# in the kernel buffers, so no deferred-output episode ever arms -- is
+# reported and capped, NOT removed; its assignment and worker reservation
+# persist (the documented Stage-A behaviour) and everyone else progresses.
+#
+# Run 7 -- leastbusy (SCH-6): with -a least_busy and every host at maxJobs,
 # work must still be assigned (the bucketed picker selected an empty set and
 # stalled); with unequal occupancies the emptier host must win the exact
 # fraction comparison; an even fill spreads evenly.
@@ -45,4 +51,5 @@ dir=$(dirname "$0")
 "$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 50 5 stallcredit || exit 1
 "$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 clientstall || exit 1
 "$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 retention || exit 1
+"$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 noreader || exit 1
 exec "$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 leastbusy 2

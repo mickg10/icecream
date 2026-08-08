@@ -127,7 +127,8 @@ static const unsigned int kCsPort = 10245;
 
 static pid_t start_scheduler(const std::string &binary, const std::string &shim,
                              int port, const std::string &logfile,
-                             const char *verbosity, const char *extra_arg = nullptr)
+                             const char *verbosity, const char *extra_arg = nullptr,
+                             const char *extra_arg2 = nullptr)
 {
     pid_t pid = fork();
     if (pid != 0) {
@@ -148,7 +149,10 @@ static pid_t start_scheduler(const std::string &binary, const std::string &shim,
     }
     char portbuf[16];
     snprintf(portbuf, sizeof(portbuf), "%d", port);
-    if (extra_arg) {
+    if (extra_arg && extra_arg2) {
+        execl(binary.c_str(), binary.c_str(), "-p", portbuf, verbosity, extra_arg, extra_arg2,
+              (char *)nullptr);
+    } else if (extra_arg) {
         execl(binary.c_str(), binary.c_str(), "-p", portbuf, verbosity, extra_arg, (char *)nullptr);
     } else {
         execl(binary.c_str(), binary.c_str(), "-p", portbuf, verbosity, (char *)nullptr);
@@ -510,6 +514,15 @@ int main(int argc, char **argv)
        the central property -- a LATE THAW whose Begin/Done still reconcile
        the retained assignment exactly once.  */
     const bool retention_mode = argc > 5 && strcmp(argv[5], "retention") == 0;
+    /* "noreader": the honest stopped-daemon model.  The submitter's process
+       stops consuming its socket entirely, but with a one-assignment credit
+       the single small reply fits in the kernel's buffers, so TCP keeps
+       ACKing and NO deferred-output episode ever arms.  Neither connection
+       failure nor the 30s drain deadline can fire; Stage A's documented
+       behaviour is that the assignment stays owned -- possibly until the
+       daemon resumes or the connection really ends -- while the submitter
+       is reported, is capped at its credit, and everyone else progresses.  */
+    const bool noreader_mode = argc > 5 && strcmp(argv[5], "noreader") == 0;
     /* "mixedrole": the realistic topology.  The submitter also has compile
        capacity, so the scheduler can place work back on it (NoCS / local
        UseCS).  Local decisions reserve no farm slot and must NOT consume
@@ -537,120 +550,106 @@ int main(int argc, char **argv)
         fprintf(stderr, "implausible jobs/clog arguments\n");
         return 2;
     }
-    /* Pick a port pair that is ACTUALLY free.  A pid-derived guess collides
-       between sequential runs (the previous scheduler's listener can still
-       hold the number, or two runs' pids can agree mod 1000) and the whole
-       leg then dies with "cannot connect CS to scheduler" -- an
-       intermittent suite failure that looks like a product defect.  The
-       scheduler needs both `port` (daemons) and `port + 1` (text control),
-       so both are probed.  */
+    signal(SIGPIPE, SIG_IGN);
+
+    /* Unique per RUN, not just per mode: two copies of one mode can run
+       concurrently, and a shared log file once turned a real FAIL into a
+       recorded PASS in this project.  */
+    char runtag[64];
+    snprintf(runtag, sizeof(runtag), "%s-%d", argc > 5 ? argv[5] : "default", (int)getpid());
+    const std::string sched_log = std::string("schedbp-scheduler-") + runtag + ".log";
+
+    const char *sched_extra =
+        (stallcredit_mode || clientstall_mode || retention_mode || noreader_mode)
+            ? "--dispatch-stall-report-after=10"
+        : (leastbusy_mode ? "--algorithm=least_busy" : nullptr);
+    const char *sched_extra2 = noreader_mode ? "--max-outstanding-dispatches=1" : nullptr;
+
+    /* Allocation and startup are ONE bounded attempt loop.  The probe below
+       closes its sockets before the child binds, so another process can
+       take the pair in that window; previously that surfaced as the child
+       exiting during startup, which returned immediately without ever
+       reaching the retry.  Each attempt probes a fresh pair, spawns, and
+       classifies the result: listener reachable is success; exit 127 is an
+       exec/configuration failure no retry can help; any other exit or ten
+       silent seconds is a lost race, so reap and try the next pair.  */
     int port = 0;
+    pid_t sched = -1;
     {
-        for (int cand = 25000 + (getpid() % 1000); cand < 25000 + 4000; cand += 2) {
-            bool both_free = true;
-            for (int off = 0; off < 2 && both_free; ++off) {
-                const int fd = socket(PF_INET, SOCK_STREAM, 0);
-                if (fd < 0) { both_free = false; break; }
-                int on = 1;
-                setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
-                struct sockaddr_in sa;
-                memset(&sa, 0, sizeof(sa));
-                sa.sin_family = AF_INET;
-                sa.sin_port = htons(cand + off);
-                sa.sin_addr.s_addr = htonl(INADDR_ANY);
-                if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
-                    both_free = false;
+        int cand = 25000 + (getpid() % 1000);
+        for (int attempt = 0; attempt < 5 && sched < 0; ++attempt) {
+            int chosen = 0;
+            for (; cand < 25000 + 4000; cand += 2) {
+                bool both_free = true;
+                for (int off = 0; off < 2 && both_free; ++off) {
+                    const int fd = socket(PF_INET, SOCK_STREAM, 0);
+                    if (fd < 0) { both_free = false; break; }
+                    int on = 1;
+                    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+                    struct sockaddr_in sa;
+                    memset(&sa, 0, sizeof(sa));
+                    sa.sin_family = AF_INET;
+                    sa.sin_port = htons(cand + off);
+                    sa.sin_addr.s_addr = htonl(INADDR_ANY);
+                    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+                        both_free = false;
+                    }
+                    close(fd);
                 }
-                close(fd);
+                if (both_free) { chosen = cand; cand += 2; break; }
             }
-            if (both_free) { port = cand; break; }
+            if (chosen == 0) {
+                fprintf(stderr, "no free scheduler port pair found\n");
+                return 2;
+            }
+            pid_t child = start_scheduler(scheduler_bin, shim, chosen, sched_log,
+                                          perf_mode ? "-v" : "-vvv", sched_extra, sched_extra2);
+            if (child < 0) {
+                perror("fork");
+                return 2;
+            }
+            bool up = false, exec_failed = false, exited = false;
+            for (int i = 0; i < 100 && !up; ++i) {
+                int status = 0;
+                if (waitpid(child, &status, WNOHANG) == child) {
+                    exited = true;
+                    exec_failed = WIFEXITED(status) && WEXITSTATUS(status) == 127;
+                    fprintf(stderr, "scheduler exited during startup (%s %d)\n",
+                            WIFEXITED(status) ? "exit code" : "signal",
+                            WIFEXITED(status) ? WEXITSTATUS(status)
+                                              : (WIFSIGNALED(status) ? WTERMSIG(status) : 0));
+                    break;
+                }
+                int probe = tcp_connect(chosen, 0);
+                if (probe >= 0) {
+                    close(probe);
+                    up = true;
+                    break;
+                }
+                usleep(100 * 1000);
+            }
+            if (exec_failed) {
+                return 2;
+            }
+            if (up) {
+                sched = child;
+                port = chosen;
+                break;
+            }
+            if (!exited) {
+                kill(child, SIGTERM);
+                waitpid(child, nullptr, 0);
+            }
+            fprintf(stderr, "startup attempt %d on port %d lost; retrying\n",
+                    attempt + 1, chosen);
         }
-        if (port == 0) {
-            fprintf(stderr, "no free scheduler port pair found\n");
+        if (sched < 0) {
+            fprintf(stderr, "scheduler could not be started after retries\n");
             return 2;
         }
     }
 
-    signal(SIGPIPE, SIG_IGN);
-
     fprintf(stderr, "# port=%d jobs=%d clog=%ds\n", port, njobs, clog_s);
-    /* Per-mode log name: `make -j check` may run the quick and stress
-       scripts concurrently from the same directory, and a shared log file
-       once turned a real FAIL into a recorded PASS.  */
-    /* Unique per RUN, not just per mode: two copies of the same mode can
-       run concurrently, and a shared log file has already turned a real
-       FAIL into a recorded PASS once in this project.  */
-    char runtag[64];
-    snprintf(runtag, sizeof(runtag), "%s-%d", argc > 5 ? argv[5] : "default", (int)getpid());
-    const std::string sched_log = std::string("schedbp-scheduler-") + runtag + ".log";
-    /* The port probe above closes its sockets before the child binds, so a
-       concurrent run can still take the pair in that window.  Treat a
-       scheduler that never listens as a lost race and retry the whole
-       spawn on a fresh pair rather than failing the leg.  */
-    pid_t sched = start_scheduler(scheduler_bin, shim, port, sched_log,
-                                  perf_mode ? "-v" : "-vvv",
-                                  (stallcredit_mode || clientstall_mode || retention_mode)
-                                      ? "--dispatch-stall-report-after=10"
-                                  : (leastbusy_mode ? "--algorithm=least_busy" : nullptr));
-    if (sched < 0) {
-        perror("fork");
-        return 2;
-    }
-
-    // Wait for the scheduler to accept connections instead of trusting a
-    // fixed sleep; also notice an exec failure (child exits 127) instead of
-    // reporting it as a connect failure.
-    {
-        bool up = false;
-        for (int i = 0; i < 100 && !up; ++i) {
-            int status = 0;
-            if (waitpid(sched, &status, WNOHANG) == sched) {
-                if (WIFEXITED(status)) {
-                    fprintf(stderr, "scheduler exited during startup (exit code %d%s)\n",
-                            WEXITSTATUS(status),
-                            WEXITSTATUS(status) == 127 ? ", exec failed" : "");
-                } else {
-                    fprintf(stderr, "scheduler died during startup (signal %d)\n",
-                            WIFSIGNALED(status) ? WTERMSIG(status) : 0);
-                }
-                return 2;
-            }
-            int probe = tcp_connect(port, 0);
-            if (probe >= 0) {
-                close(probe);
-                up = true;
-                break;
-            }
-            usleep(100 * 1000);
-        }
-        if (!up) {
-            fprintf(stderr, "scheduler never started listening on port %d;"
-                    " retrying on a different port pair\n", port);
-            kill(sched, SIGTERM);
-            waitpid(sched, nullptr, 0);
-            port += 2;
-            sched = start_scheduler(scheduler_bin, shim, port, sched_log,
-                                    perf_mode ? "-v" : "-vvv",
-                                    (stallcredit_mode || clientstall_mode || retention_mode)
-                                        ? "--dispatch-stall-report-after=10"
-                                    : (leastbusy_mode ? "--algorithm=least_busy" : nullptr));
-            if (sched < 0) {
-                return 2;
-            }
-            bool up2 = false;
-            for (int i = 0; i < 100 && !up2; ++i) {
-                int probe = tcp_connect(port, 0);
-                if (probe >= 0) { close(probe); up2 = true; break; }
-                usleep(100 * 1000);
-            }
-            if (!up2) {
-                fprintf(stderr, "scheduler never started listening after retry\n");
-                kill(sched, SIGTERM);
-                waitpid(sched, nullptr, 0);
-                return 2;
-            }
-        }
-    }
 
     // ---- fake compile server ----------------------------------------------
     MsgChannel *cs = connect_daemon(port, 0);
@@ -2288,6 +2287,79 @@ int main(int argc, char **argv)
                 "the healthy submitter kept being served throughout");
         REQUIRE(healthy_alive.load(), "the healthy submitter connection survived");
         REQUIRE(!sub->at_eof(), "the stalled submitter's own connection survived");
+        REQUIRE(worst_reply.load() < 5.0, "scheduler stayed responsive");
+
+        shutdown = true;
+        probe_thread.join(); cs_thread.join(); healthy_thread.join();
+        close(ctrl);
+        delete sub; delete sub2; delete cs;
+        kill(sched, SIGTERM);
+        waitpid(sched, nullptr, 0);
+        if (failures) { fprintf(stderr, "RESULT: FAIL (%d)\n", failures); return 1; }
+        fprintf(stderr, "RESULT: PASS\n");
+        return 0;
+    }
+
+    if (noreader_mode) {
+        auto send_for = [&](MsgChannel *ch, unsigned cid, const char *fname) {
+            GetCSMsg g(Environments{std::make_pair(std::string(kPlatform), std::string(kEnv))},
+                       fname, CompileJob::Lang_CXX, 1, kPlatform, 0, std::string(), 0, 0, 0);
+            g.client_id = cid;
+            return ch->send_msg(g);
+        };
+
+        /* Three requests, then the submitter's userspace goes silent: we
+           never call get_msg() on `sub` again until teardown.  The kernel
+           keeps ACKing, so with a one-assignment credit whose single small
+           reply fits in the socket buffers there is nothing for deferred
+           output to arm on.  */
+        REQUIRE(send_for(sub, 8100, "silent1.cpp"), "first request sent");
+        REQUIRE(send_for(sub, 8101, "silent2.cpp"), "second request sent");
+        REQUIRE(send_for(sub, 8102, "silent3.cpp"), "third request sent");
+
+        fprintf(stderr, "# noreader: submitter goes silent across the 10s threshold\n");
+        long long min_worker_jobs = 1000000;
+        const int healthy_before = healthy_replies.load();
+        const Clock::time_point t0 = Clock::now();
+        while (secs_since(t0) < 16) {
+            const long long wj = worker_job_count(port, "fakecs");
+            if (wj >= 0 && wj < min_worker_jobs) { min_worker_jobs = wj; }
+            usleep(500 * 1000);
+        }
+
+        /* Exactly the credit was assigned and it is still outstanding.  */
+        const long long outstanding = query_submitter_outstanding(port, "fakesub");
+        fprintf(stderr, "# noreader: outstanding=%lld min_worker_jobs=%lld\n",
+                outstanding, min_worker_jobs);
+        REQUIRE(outstanding == 1,
+                "exactly the one-assignment credit was delivered and remains outstanding");
+        REQUIRE(min_worker_jobs >= 1,
+                "the worker reservation stayed owned throughout the silent window");
+
+        {
+            bool deferring = false, reported = false, removed = false, drained = false;
+            FILE *lf = fopen(sched_log.c_str(), "r");
+            if (lf) {
+                char line[4096];
+                while (fgets(line, sizeof(line), lf)) {
+                    if (strstr(line, "deferring")) { deferring = true; }
+                    if (strstr(line, "is not progressing")) { reported = true; }
+                    if (strstr(line, "remove daemon fakesub")) { removed = true; }
+                    if (strstr(line, "did not drain its socket")) { drained = true; }
+                }
+                fclose(lf);
+            }
+            REQUIRE(!deferring,
+                    "no deferred-output episode armed (the kernel ACKed the tiny reply)");
+            REQUIRE(reported, "the silent submitter was reported at the threshold");
+            REQUIRE(!removed && !drained,
+                    "and NOT removed: with no pending userspace bytes neither connection"
+                    " failure nor the drain deadline can fire -- the documented Stage-A"
+                    " behaviour is that the reservation persists");
+        }
+
+        REQUIRE(healthy_replies.load() > healthy_before,
+                "another submitter kept progressing on the remaining capacity");
         REQUIRE(worst_reply.load() < 5.0, "scheduler stayed responsive");
 
         shutdown = true;
