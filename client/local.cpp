@@ -384,6 +384,13 @@ int build_local(CompileJob &job, MsgChannel *local_daemon, struct rusage *used)
             }
         }
 
+        /* If this process holds a local-build slot (daemonless fallback,
+           no fork), the lock must survive the exec or the concurrency
+           bound evaporates while the compiler runs.  In the forked-child
+           case this is a harmless no-op on an inherited fd: the record
+           lock belongs to the parent, which holds it until the child is
+           reaped.  */
+        dcc_lock_keep_across_exec();
         execv(argv[0], &argv[0]);
         int exitcode = ( errno == ENOENT ? 127 : 126 );
         ostringstream errmsg;

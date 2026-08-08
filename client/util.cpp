@@ -163,6 +163,21 @@ static bool dcc_open_lockfile(const string &fname, int &plockfd)
 
 static bool dcc_lock_host_slot(string fname, int lock, bool block);
 
+/* The no-fork local build execs the compiler in THIS process.  The slot
+   lock is an fcntl record lock on a close-on-exec fd, so exec would close
+   the fd and release the slot the moment the compiler starts -- leaving
+   daemonless local-fallback concurrency effectively unbounded (measured:
+   a farm-and-daemon outage put one compiler per submitted job on the
+   machine, not one per CPU).  Clearing close-on-exec keeps the fd -- and
+   with it the record lock -- alive for exactly the compiler's lifetime;
+   the kernel releases both when the compiler exits.  */
+void dcc_lock_keep_across_exec()
+{
+    if (lock_fd > 0) {
+        set_cloexec_flag(lock_fd, false);
+    }
+}
+
 bool dcc_lock_host()
 {
     assert(lock_fd == -1);
