@@ -1540,10 +1540,19 @@ int main(int argc, char **argv)
                 const long long a8 = query_submitter_field(port, "fakesub8", "admitted_total=");
                 bracket_vals[slot] = a7;
                 bracket_vals[slot + 1] = a8;
-                /* STRICTLY positive: admitted == 0 would prove only that the
-                   expansion had not finished, not that it had BEGUN.  */
-                return a7 > 0 && a7 < (long long)bigN
-                    && a8 > 0 && a8 < (long long)bigN;
+                /* The CONTENDED WINDOW is "both bigs still have unserved
+                   backlog": admission has BEGUN (strictly positive -- zero
+                   would prove only that it had not finished) and the reply
+                   stream has not caught up with everything admitted.  The
+                   original form required admission itself to be incomplete
+                   (a7 < bigN), which is a statement about the observing
+                   machine, not the property: a fast host admits all 24000
+                   before the first small can even be issued (reported:
+                   before=24000,24000 with replies at 4001+3265), and the
+                   bracket then failed for the window's existence while the
+                   queues were plainly still contended.  */
+                return a7 > 0 && repliesF1.load() < (int)bigN
+                    && a8 > 0 && repliesF2.load() < (int)bigN;
             };
             /* Progress-based bracket: the 200ms fixed snapshot assumed the
                scheduler had already begun admitting the big expansions --
