@@ -316,10 +316,14 @@ int main(int argc, char **argv)
                 kill(pid, SIGKILL);
                 while (waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {
                 }
-                unblock_handled(&old);
+                if (!unblock_handled(&old)) {
+                    mask_failure_abort("spawn/restore-unpublishable");
+                }
                 return -1;
             }
-            unblock_handled(&old);
+            if (!unblock_handled(&old)) {
+                mask_failure_abort("spawn/restore");
+            }
             return pid;
         }
         /* Child: a mask that cannot be restored must stop HERE -- exec'ing
