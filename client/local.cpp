@@ -360,13 +360,49 @@ int build_local(CompileJob &job, MsgChannel *local_daemon, struct rusage *used)
         color_output = false;
     }
 
-    if (used || color_output) {
+    /* The no-fork exec is only safe while the slot lock survives it: the
+       lock fd is close-on-exec, and an fcntl record lock dies with its
+       descriptor, so exec-without-fork used to release the slot the
+       moment the compiler started -- the daemonless fallback then ran one
+       compiler per JOB instead of one per CPU.  Decide here: clear the
+       flag for the pure exec case, and if that fails, fork instead so the
+       record lock stays with the parent through the wait.  */
+    const bool will_fork = used || color_output;
+    bool exec_keeps_lock = true;
+    if (!local_daemon && !will_fork) {
+        exec_keeps_lock = dcc_lock_keep_across_exec();
+    }
+
+    if (will_fork || !exec_keeps_lock) {
         flush_debug();
         child_pid = fork();
     }
 
-    if (child_pid == -1){
+    if (child_pid == -1) {
+        /* No child was created, so falling through would reach
+           wait4(-1, ...) -- "wait for ANY child" -- which converts an
+           untouched status word when there is none and can reap an
+           unrelated child when there is one.  This path matters more now
+           that a failed close-on-exec clear deliberately falls back to
+           forking: fail the local attempt cleanly instead of running
+           without the concurrency bound.  */
         log_perror("fork failed");
+        if (color_output) {
+            if ((-1 == close(pf[0])) && (errno != EBADF)) {
+                log_perror("close failed");
+            }
+            if ((-1 == close(pf[1])) && (errno != EBADF)) {
+                log_perror("close failed");
+            }
+        }
+        for (char *const arg : argv) {
+            free(arg);
+        }
+        if (!local_daemon) {
+            dcc_unlock();
+        }
+        child_pid = 0;   // never leave the global parked at the -1 sentinel
+        return EXIT_DISTCC_FAILED;
     }
 
     if (!child_pid) {

@@ -163,30 +163,60 @@ static bool dcc_open_lockfile(const string &fname, int &plockfd)
 
 static bool dcc_lock_host_slot(string fname, int lock, bool block);
 
-bool dcc_lock_host()
+/* The no-fork local build execs the compiler in THIS process.  The slot
+   lock is an fcntl record lock on a close-on-exec fd, so exec would close
+   the fd and release the slot the moment the compiler starts -- leaving
+   daemonless local-fallback concurrency effectively unbounded (measured:
+   a farm-and-daemon outage put one compiler per submitted job on the
+   machine, not one per CPU).  Clearing close-on-exec keeps the fd -- and
+   with it the record lock -- alive for exactly the compiler's lifetime;
+   the kernel releases both when the compiler exits.
+
+   Returns false when the flag could not be cleared: the caller must then
+   NOT take the no-fork exec (it would run unbounded); forking instead
+   keeps the record lock in the parent, which holds it through the wait.
+   Descriptor 0 is a valid lock fd (stdin may be closed), so the test is
+   against the -1 sentinel, not positivity.  */
+int dcc_locked_fd()
+{
+    return lock_fd;
+}
+
+bool dcc_lock_keep_across_exec()
+{
+    if (lock_fd == -1) {
+        return true;    // no lock held; nothing to preserve
+    }
+    if (set_cloexec_flag(lock_fd, false) != 0) {
+        log_error() << "cannot clear close-on-exec on the local-build slot lock (fd "
+                    << lock_fd << "): " << strerror(errno) << endl;
+        return false;
+    }
+    return true;
+}
+
+/* The slot pool, with the directory and size as explicit arguments: the
+   production wrapper supplies the shared per-user directory and one slot
+   per online CPU, and the lock-lifetime regression test supplies a private
+   directory and a fixed two-slot pool so it can never throttle -- or be
+   perturbed by -- real local builds.  */
+bool dcc_lock_host_at(const string &lockdir, int max_cpu)
 {
     assert(lock_fd == -1);
 
-    string fname = "/tmp/.icecream-";
-    struct passwd *pwd = getpwuid(getuid());
-
-    if (pwd) {
-        fname += pwd->pw_name;
-    } else {
-        char buffer[12];
-        sprintf(buffer, "%ld", (long)getuid());
-        fname += buffer;
-    }
-
-    if (mkdir(fname.c_str(), 0700) && errno != EEXIST) {
-        log_perror("mkdir") << "\t" << fname << endl;
+    if (mkdir(lockdir.c_str(), 0700) && errno != EEXIST) {
+        log_perror("mkdir") << "\t" << lockdir << endl;
         return false;
     }
 
-    fname += "/local_lock";
-    lock_fd = 0;
-    int max_cpu = 1;
-    dcc_ncpus(&max_cpu);
+    string fname = lockdir + "/local_lock";
+    /* lock_fd is deliberately NOT parked at 0 while probing: descriptor 0
+       is a valid open() result when stdin is closed, so 0 must remain
+       distinguishable as "a real lock fd".  -1 is the only not-locked
+       sentinel.  */
+    if (max_cpu < 1) {
+        max_cpu = 1;
+    }
     // To ensure better distribution, select a "random" starting slot.
     int lock_offset = getpid();
     // First try if any slot is free.
@@ -196,6 +226,24 @@ bool dcc_lock_host()
     }
     // If not, block on the first selected one.
     return dcc_lock_host_slot( fname, lock_offset % max_cpu, true );
+}
+
+bool dcc_lock_host()
+{
+    string dir = "/tmp/.icecream-";
+    struct passwd *pwd = getpwuid(getuid());
+
+    if (pwd) {
+        dir += pwd->pw_name;
+    } else {
+        char buffer[12];
+        sprintf(buffer, "%ld", (long)getuid());
+        dir += buffer;
+    }
+
+    int max_cpu = 1;
+    dcc_ncpus(&max_cpu);
+    return dcc_lock_host_at(dir, max_cpu);
 }
 
 bool dcc_lock_host_slot(string fname, int lock, bool block)

@@ -55,3 +55,6 @@ unittests/testargs.trs
 # others
 compile_commands.json
 .vs*
+/unittests/lockexec
+*.log
+*.trs
