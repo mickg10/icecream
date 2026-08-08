@@ -78,3 +78,4 @@ package_builder/dist/
 /unittests/occupancy
 /unittests/schedgate
 /unittests/sndbuf_shim.so
+/unittests/lockexec

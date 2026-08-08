@@ -401,6 +401,7 @@ int build_local(CompileJob &job, MsgChannel *local_daemon, struct rusage *used)
         if (!local_daemon) {
             dcc_unlock();
         }
+        child_pid = 0;   // never leave the global parked at the -1 sentinel
         return EXIT_DISTCC_FAILED;
     }
 

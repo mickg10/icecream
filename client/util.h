@@ -47,8 +47,8 @@ extern bool dcc_lock_host();
 extern bool dcc_lock_host_at(const std::string &lockdir, int max_cpu);
 extern void dcc_unlock();
 extern bool dcc_lock_keep_across_exec();
-/* The held slot descriptor (-1 when none); see the lock-lifetime test.  */
-extern int dcc_lock_fd();
+/* The held slot descriptor (-1 when none); the lock-lifetime test passes
+   its number across the exec so the post-exec image can report it.  */
 extern int dcc_locked_fd();
 
 class HostUnlock

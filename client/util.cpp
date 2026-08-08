@@ -163,7 +163,7 @@ static bool dcc_open_lockfile(const string &fname, int &plockfd)
 
 static bool dcc_lock_host_slot(string fname, int lock, bool block);
 
-int dcc_lock_fd()
+int dcc_locked_fd()
 {
     return lock_fd;
 }

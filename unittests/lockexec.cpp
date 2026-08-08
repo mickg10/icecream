@@ -91,7 +91,7 @@ static int holder_main(const char *self, int notify_fd, const char *dir,
     }
     char fdbuf[16], lockbuf[16];
     snprintf(fdbuf, sizeof(fdbuf), "%d", notify_fd);
-    snprintf(lockbuf, sizeof(lockbuf), "%d", dcc_lock_fd());
+    snprintf(lockbuf, sizeof(lockbuf), "%d", dcc_locked_fd());
     execl(self, self, "--held", fdbuf, lockbuf, (char *)nullptr);
     _exit(6);
 }
@@ -113,6 +113,28 @@ static int waiter_main(int notify_fd, const char *dir, int slots)
 static pid_t pids[3] = { -1, -1, -1 };
 static std::string tempdir;
 
+
+/* Reap one child, tolerating EINTR and reporting ECHILD honestly; only a
+   CONFIRMED reap (or the kernel saying the child does not exist) marks the
+   slot free.  */
+static bool reap(pid_t pid)
+{
+    for (;;) {
+        const pid_t r = waitpid(pid, nullptr, 0);
+        if (r == pid) {
+            return true;
+        }
+        if (r < 0 && errno == EINTR) {
+            continue;
+        }
+        if (r < 0 && errno == ECHILD) {
+            return true;    // not ours any more; nothing left to reap
+        }
+        perror("waitpid");
+        return false;
+    }
+}
+
 static void cleanup(void)
 {
     for (int i = 0; i < 3; ++i) {
@@ -120,8 +142,9 @@ static void cleanup(void)
             if (kill(pids[i], SIGKILL) != 0 && errno != ESRCH) {
                 perror("kill");
             }
-            waitpid(pids[i], nullptr, 0);
-            pids[i] = -1;
+            if (reap(pids[i])) {
+                pids[i] = -1;
+            }
         }
     }
     if (!tempdir.empty()) {
@@ -133,11 +156,20 @@ static void cleanup(void)
     }
 }
 
+/* Async-signal-safe by construction: kill(2) on known-positive pids and
+   _exit(2) only.  The full cleanup routine allocates and must never run
+   from a handler; the temporary directory is abandoned on this path (the
+   kernel reclaims the children, which is the part that must not leak).  */
 static void on_signal(int)
 {
-    cleanup();
+    for (int i = 0; i < 3; ++i) {
+        if (pids[i] > 0) {
+            kill(pids[i], SIGKILL);
+        }
+    }
     _exit(2);
 }
+
 
 /* One newline-terminated report, or empty on timeout.  */
 static std::string read_report(int fd, int timeout_sec)
@@ -254,15 +286,15 @@ int main(int argc, char **argv)
             if (kill(pids[i], SIGKILL) != 0 && errno != ESRCH) {
                 perror("kill");
             }
-            waitpid(pids[i], nullptr, 0);
-            pids[i] = -1;
+            if (reap(pids[i])) {
+                pids[i] = -1;
+            }
         }
         unblocked = read_report(pipefd[0], 5) == "W";
     }
     check(unblocked, "killing exec'd holders unblocks the waiter (exit, and"
                      " nothing less, releases a slot)");
-    if (pids[2] > 0) {
-        waitpid(pids[2], nullptr, 0);
+    if (pids[2] > 0 && reap(pids[2])) {
         pids[2] = -1;
     }
 
