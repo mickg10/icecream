@@ -1,0 +1,60 @@
+# Informal LTL/MTL catalogue for the Icecream temporal-ownership model.
+# Variables are parameterized by job j, batch b, cancellation key k,
+# connection generation g, submitter d, and fulfillment worker f.
+# G = always, F = eventually, X = next, U = until.
+# F_[a,b] is metric eventuality in the given time/turn interval.
+
+# --- Type/ownership safety -------------------------------------------------
+P1  G(live(j) -> exactly_one_primary_place(j))
+P2  G(debt(j) <-> dispatched_unconfirmed(j))
+P3  G(reserved(j,f) -> assigned(j,f))
+P4  G(queued(j) <-> exactly_one_request_group_index(j))
+P5  G(assigned(j,f) <-> exactly_one_worker_joblist_index(j,f))
+P6  G(outstanding(d) <= effective_credit(d))
+P7  G(reserved_count(f) <= advertised_capacity(f) + explicit_preload(f))
+
+# --- Cancellation ----------------------------------------------------------
+P8  G(cancel_linearized(b) -> G(!dispatch(member_of(b) & !assigned_before_cancel)))
+P9  G(cancel_linearized(b) -> no_sched_owned_unassigned_member(b))
+P10 G(cancel_linearized(b) -> F physical_indexes_reclaimed(b))
+P11 G(cancel_repeated(b) -> state_unchanged_or_more_terminal(b))
+P10m G(cancel_linearized(b) -> F_[0,cleanup_bound(b)] physical_indexes_reclaimed(b))
+
+# --- Connection/session lifetime ------------------------------------------
+P12 G(connection_dead(g) -> F no_reference_to_generation(g))
+P13 G(fd_reused(fd,g2) -> !reference_to_generation(fd,g1))  # g1 != g2
+P14 G(pending_batch(b) -> F(completed(b) | cancel_linearized(b) | owner_disconnected(b)))
+
+# --- Dispatch/progress -----------------------------------------------------
+# False without an assumption or a new-F revocation handshake:
+P15 G(debt(j) -> F settled(j))
+
+# Honest legacy property:
+P15a G(debt(j) -> F(settled(j) | owner_connection_failed(j) | forever_delayed_peer(j)))
+
+# New-F property under reliable S-F delivery and worker processing fairness:
+P15b G(cancel_before_start_sent(j) -> F(cancelled_ack(j) | already_started_ack(j)))
+P15c G(cancelled_ack(j) -> G(!compile_started(j)))
+
+# Persistent-enablement fairness, not a fixed sleep:
+P16 G(queued(j) & F G dispatch_enabled(j) -> F dispatched(j))
+P17 G(pending_ingress(c) & F G connection_alive(c) -> F message_processed(c))
+
+# --- Backpressure ----------------------------------------------------------
+P18 G(deferred_output(c) -> F_[0,30s](fully_flushed(c) | connection_removed(c)))
+P19 G(has_pending_write(c) -> !new_dispatch_to(c))
+
+# --- Batch pinning/count ---------------------------------------------------
+P20 G(batch_pin(b,e) -> G(!batch_pin(b,e2)))                    # e2 != e
+P21 G(dispatched(j) & member_of(j,b) -> selected_environment(j)=pinned_environment(b))
+P22 G(batch_terminal(b) -> replies_or_cancellations(b)=requested_count(b))
+
+# --- Observability/test witnesses -----------------------------------------
+P23 G(contention_started(w) -> F durable_contention_witness(w))
+P24 G(test_claims_inside_window(x,w) ->
+      event_seq(contention_started(w)) < event_seq(x) < event_seq(contention_ended(w)))
+
+# --- Compatibility ---------------------------------------------------------
+# Trace refinement is a language property rather than ordinary LTL:
+#   project_v(Traces(new-system)) subseteq Traces(protocol-v-system)
+# and decode_v(encode_v(m)) = project_v(m) on every independently negotiated link.
