@@ -2143,15 +2143,29 @@ static bool handle_job_done(CompileServer *cs, Msg *_m)
            next admission step).  */
         cs->setClientCount(m->client_count);
 
-        /* 1. Batch still expanding: the record owns its jobs; destroy the
-           record and every staged member together.  */
+        /* One unified sweep, in BOTH domains, never an early return.  A
+           client id can have members in the staging records AND in the live
+           jobs map at the same moment: an earlier request with the same id
+           may be fully admitted (its record gone, its jobs queued) while a
+           later one is still staged -- daemons reuse client ids -- and the
+           request and its cancel can be split across TCP segments, so
+           admission and even dispatch can run between them.  The previous
+           form returned as soon as it had destroyed a staged record,
+           leaving every queued member of the same client id behind as
+           undispatchable ghosts that pinned the submitter's dispatch credit
+           until the scheduler looked wedged (issue #2).  */
+        unsigned int cancelled = 0;
+
+        /* 1. Staging records: destroy EVERY matching record and its staged
+           members (a fd can hold several queued requests for one id).  */
         map<int, deque<PendingExpansion> >::iterator pit =
             pending_expansions.find(cs->fd);
         if (pit != pending_expansions.end()) {
             deque<PendingExpansion> &q = pit->second;
             for (deque<PendingExpansion>::iterator rit = q.begin();
-                    rit != q.end(); ++rit) {
+                    rit != q.end();) {
                 if (rit->msg.client_id != clientId) {
+                    ++rit;
                     continue;
                 }
                 trace() << "STOP (STAGED) FOR client " << clientId << ": "
@@ -2161,19 +2175,21 @@ static bool handle_job_done(CompileServer *cs, Msg *_m)
                     notify_monitors(new MonJobDoneMsg(JobDoneMsg(sj->id(), 255)));
                     jobs.erase(sj->id());
                     delete sj;
+                    ++cancelled;
                 }
-                q.erase(rit);
-                if (q.empty()) {
-                    pending_expansions.erase(pit);
-                }
-                return true;
+                rit = q.erase(rit);
+            }
+            if (q.empty()) {
+                pending_expansions.erase(pit);
             }
         }
 
-        /* 2. Activated batch: cancel EVERY queued sibling.  Members already
-           dispatched (server set) are the compile daemon's to finish and
-           report; they are deliberately left alone.  */
-        unsigned int cancelled = 0;
+        /* 2. Activated members: cancel EVERY queued sibling.  Members
+           already dispatched (server set) are left alone deliberately: the
+           submitting daemon receives their UseCS, finds the client gone,
+           and answers each with JobDone(107, FROM_SUBMITTER) -- that bounce
+           credits their dispatch debits and releases their worker
+           reservations, so cancelling them here would race it.  */
         for (map<unsigned int, Job *>::iterator mit = jobs.begin();
                 mit != jobs.end();) {
             Job *job = mit->second;

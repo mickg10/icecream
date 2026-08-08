@@ -1453,6 +1453,7 @@ int main(int argc, char **argv)
                spans a rapid burst of ten small requests.  */
             const unsigned bigN = 24000;
             std::atomic<int> repliesF1{0}, repliesF2{0};
+            std::atomic<bool> stop_bigs{false};
             auto big_daemon = [&](const char *name, unsigned cid,
                                   std::atomic<int> *counter) {
                 MsgChannel *ch = connect_daemon(port, 0);
@@ -1467,8 +1468,24 @@ int main(int argc, char **argv)
                            std::string(), 0, 0, 0);
                 g.client_id = cid;
                 if (!ch->send_msg(g)) { delete ch; return; }
+                /* Progress-based: the property here is STARVATION-freedom
+                   and bracketed small-request latency, not bulk throughput
+                   -- a loaded box legitimately runs at a fraction of idle
+                   speed, and exact-completion accounting is already proven
+                   by the multicount case at a size every box can finish.
+                   Drain while replies arrive; a 60s stall is a FAILURE (a
+                   starved queue, not a slow one); when the main flow has
+                   its brackets it raises stop_bigs and the remainder is
+                   ended with the batch cancel -- which is itself coverage:
+                   a many-thousand-member cancel must leave no ghosts.  */
                 const Clock::time_point t0 = Clock::now();
-                while (*counter < (int)bigN && secs_since(t0) < 240) {
+                Clock::time_point last_progress = t0;
+                bool stalled = false;
+                while (*counter < (int)bigN && !stop_bigs.load()) {
+                    if (secs_since(last_progress) >= 60) {
+                        stalled = true;
+                        break;
+                    }
                     Msg *m = ch->get_msg(2);
                     if (!m) { continue; }
                     if (MSG_IS(m, USE_CS)) {
@@ -1476,9 +1493,34 @@ int main(int argc, char **argv)
                         if (u && u->client_id == cid) {
                             confirm_job(u->job_id);
                             ++*counter;
+                            last_progress = Clock::now();
                         }
                     }
                     delete m;
+                }
+                if (stalled) {
+                    *counter = -1;   // starved: poison the count so the gate fails
+                } else if (*counter < (int)bigN) {
+                    /* Told to stop with a remainder queued: cancel the whole
+                       batch by client id and bounce any replies already in
+                       flight, exactly as a real daemon would for a client
+                       that is gone.  */
+                    JobDoneMsg d(0, 255, JobDoneMsg::FROM_SUBMITTER);
+                    d.set_unknown_job_client_id(cid);
+                    ch->send_msg(d);
+                    const Clock::time_point tb = Clock::now();
+                    while (secs_since(tb) < 3) {
+                        Msg *m = ch->get_msg(1);
+                        if (!m) { continue; }
+                        if (MSG_IS(m, USE_CS)) {
+                            UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                            if (u && u->client_id == cid) {
+                                JobDoneMsg bounce(u->job_id, 107, JobDoneMsg::FROM_SUBMITTER);
+                                ch->send_msg(bounce);
+                            }
+                        }
+                        delete m;
+                    }
                 }
                 delete ch;
             };
@@ -1534,6 +1576,26 @@ int main(int argc, char **argv)
                 if (!jid || took > 3.0) { ++slow; }
             }
             const bool contended_after = both_active(2);
+            /* Observe actual expansion progress before ending them: the
+               smalls take ~2s, and stopping there would prove nothing about
+               the bigs.  Progress-based: fail only if a big stops advancing
+               for 60s (starvation), not for being slow.  */
+            {
+                const Clock::time_point tw = Clock::now();
+                int last1 = repliesF1.load(), last2 = repliesF2.load();
+                Clock::time_point lastadv = tw;
+                while ((repliesF1.load() < 500 || repliesF2.load() < 500)
+                        && repliesF1.load() < (int)bigN && repliesF2.load() < (int)bigN
+                        && secs_since(lastadv) < 60) {
+                    usleep(200 * 1000);
+                    if (repliesF1.load() != last1 || repliesF2.load() != last2) {
+                        last1 = repliesF1.load();
+                        last2 = repliesF2.load();
+                        lastadv = Clock::now();
+                    }
+                }
+            }
+            stop_bigs = true;
             f1.join();
             f2.join();
             fprintf(stderr, "# contract: fairness big=%d+%d/%u bracket=%d/%d"
@@ -1543,8 +1605,24 @@ int main(int argc, char **argv)
                     contended_before, contended_after,
                     bracket_vals[0], bracket_vals[1], bracket_vals[2], bracket_vals[3],
                     measured, worst_small, slow);
-            REQUIRE(repliesF1 == (int)bigN && repliesF2 == (int)bigN,
-                    "both long expansions completed exactly");
+            REQUIRE(repliesF1.load() >= 500 && repliesF2.load() >= 500,
+                    "both long expansions progressed without a starvation stall");
+            {
+                /* The cancelled remainders may be many thousands of members:
+                   the batch cancel must leave NOTHING of either daemon in
+                   the scheduler's job map.  */
+                long long g7 = -1, g8 = -1;
+                const Clock::time_point tg = Clock::now();
+                while (secs_since(tg) < 30) {
+                    g7 = query_control_count(port, "listjobs", "sub:fakesub7");
+                    g8 = query_control_count(port, "listjobs", "sub:fakesub8");
+                    if (g7 == 0 && g8 == 0) { break; }
+                    usleep(300 * 1000);
+                }
+                fprintf(stderr, "# contract: fairness remainder ghosts=%lld+%lld\n", g7, g8);
+                REQUIRE(g7 == 0 && g8 == 0,
+                        "a many-thousand-member batch cancel leaves no ghosts");
+            }
             REQUIRE(contended_before && contended_after,
                     "the ten small requests ran demonstrably inside the contended window (bracketed)");
             REQUIRE(slow == 0,
@@ -1581,6 +1659,17 @@ int main(int argc, char **argv)
                     d.set_unknown_job_client_id(601);
                     REQUIRE(subF->send_msg(d), "staged-batch cancellation sent in the same drain");
                 }
+                /* Whether any replies arrive depends on TCP segmentation:
+                   if the request and the cancel coalesce into one drain the
+                   batch dies fully staged (zero replies); if the scheduler
+                   polls between the two segments, up to credit-many members
+                   dispatch first.  Both are legitimate schedules.  What a
+                   REAL daemon does with a reply for a vanished client is
+                   answer JobDone(107, FROM_SUBMITTER) -- that bounce is
+                   what credits the dispatch debit -- so this fake does the
+                   same; without it the leftover debits pin the submitter at
+                   its credit and every later assertion wedges (issue #2's
+                   third symptom was exactly that).  */
                 int stray601 = 0;
                 {
                     const Clock::time_point t0 = Clock::now();
@@ -1589,18 +1678,25 @@ int main(int argc, char **argv)
                         if (!m) { continue; }
                         if (MSG_IS(m, USE_CS)) {
                             UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
-                            if (u && u->client_id == 601) { ++stray601; }
+                            if (u && u->client_id == 601) {
+                                ++stray601;
+                                JobDoneMsg bounce(u->job_id, 107, JobDoneMsg::FROM_SUBMITTER);
+                                subF->send_msg(bounce);
+                            }
                         }
                         delete m;
                     }
                 }
-                REQUIRE(stray601 == 0, "a batch cancelled while staged produces no replies");
+                fprintf(stderr, "# contract: replies before the staged cancel landed: %d\n",
+                        stray601);
+                REQUIRE(stray601 <= 32,
+                        "replies for a cancelled batch are bounded by the dispatch credit");
                 {
                     int got = 0;
                     REQUIRE(send_count(subF, 50, 602, "cancelB.cpp"),
                             "fresh request after the staged cancel");
                     const Clock::time_point t0 = Clock::now();
-                    while (got < 50 && secs_since(t0) < 60) {
+                    while (got < 50 && secs_since(t0) < 300) {
                         Msg *m = subF->get_msg(2);
                         if (!m) { continue; }
                         if (MSG_IS(m, USE_CS)) {
@@ -1619,18 +1715,26 @@ int main(int argc, char **argv)
                 {
                     /* The dispatch credit (32) bounds unconfirmed
                        assignments, so exactly 32 dispatch and 68 stay
-                       queued with no server -- the cancellation's target.  */
+                       queued with no server -- the cancellation's target.
+                       Progress-based wait: a loaded box is slow, not
+                       broken.  */
                     const Clock::time_point t0 = Clock::now();
-                    while (dispatched.size() < 32 && secs_since(t0) < 30) {
+                    Clock::time_point tp = t0;
+                    while (dispatched.size() < 32
+                            && secs_since(tp) < 60 && secs_since(t0) < 300) {
                         Msg *m = subF->get_msg(2);
                         if (!m) { continue; }
                         if (MSG_IS(m, USE_CS)) {
                             UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
-                            if (u && u->client_id == 603) { dispatched.push_back(u->job_id); }
+                            if (u && u->client_id == 603) {
+                                dispatched.push_back(u->job_id);
+                                tp = Clock::now();
+                            }
                         }
                         delete m;
                     }
                 }
+                fprintf(stderr, "# contract: 7b dispatched=%zu (want 32)\n", dispatched.size());
                 REQUIRE(dispatched.size() == 32,
                         "exactly the credit-many members dispatched before the cancel");
                 {
@@ -1664,7 +1768,7 @@ int main(int argc, char **argv)
                     REQUIRE(send_count(subF, 5, 604, "cancelD.cpp"),
                             "final request after the activated cancel");
                     const Clock::time_point t0 = Clock::now();
-                    while (got < 5 && secs_since(t0) < 30) {
+                    while (got < 5 && secs_since(t0) < 120) {
                         Msg *m = subF->get_msg(2);
                         if (!m) { continue; }
                         if (MSG_IS(m, USE_CS)) {
@@ -1674,6 +1778,94 @@ int main(int argc, char **argv)
                         delete m;
                     }
                     REQUIRE(got == 5, "the daemon still works after both cancellations");
+                }
+                // 7c: same client id in BOTH domains at once.  Daemons
+                // reuse client ids, so a cancel can arrive while an EARLIER
+                // fully-admitted request's tail is queued and a LATER
+                // request with the same id is still staged.  The handler
+                // used to stop after destroying the staged record, leaving
+                // the queued tail as credit-pinning ghosts (issue #2).
+                {
+                    REQUIRE(send_count(subF, 100, 605, "cancelE.cpp"),
+                            "count=100 sent (the tail will be queued when the cancel lands)");
+                    std::vector<unsigned> dispatched605;
+                    const Clock::time_point t0 = Clock::now();
+                    Clock::time_point tp = t0;
+                    while (dispatched605.size() < 32
+                            && secs_since(tp) < 60 && secs_since(t0) < 300) {
+                        Msg *m = subF->get_msg(2);
+                        if (!m) { continue; }
+                        if (MSG_IS(m, USE_CS)) {
+                            UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                            if (u && u->client_id == 605) {
+                                dispatched605.push_back(u->job_id);
+                                tp = Clock::now();
+                            }
+                        }
+                        delete m;
+                    }
+                    fprintf(stderr, "# contract: 7c dispatched=%zu (want 32)\n", dispatched605.size());
+                    REQUIRE(dispatched605.size() == 32,
+                            "the earlier request is fully admitted with a queued tail");
+                    /* Same id again, big enough that it is still staged when
+                       the cancel is processed right behind it.  */
+                    REQUIRE(send_count(subF, 2000, 605, "cancelF.cpp"),
+                            "a second request REUSES the client id while staged");
+                    {
+                        JobDoneMsg d(0, 255, JobDoneMsg::FROM_SUBMITTER);
+                        d.set_unknown_job_client_id(605);
+                        REQUIRE(subF->send_msg(d), "cancel sent with members in both domains");
+                    }
+                    /* Real-daemon fidelity: bounce any replies that were in
+                       flight, then let the in-flight members finish.  */
+                    {
+                        const Clock::time_point tb = Clock::now();
+                        while (secs_since(tb) < 3) {
+                            Msg *m = subF->get_msg(1);
+                            if (!m) { continue; }
+                            if (MSG_IS(m, USE_CS)) {
+                                UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                                if (u && u->client_id == 605) {
+                                    JobDoneMsg bounce(u->job_id, 107, JobDoneMsg::FROM_SUBMITTER);
+                                    subF->send_msg(bounce);
+                                }
+                            }
+                            delete m;
+                        }
+                    }
+                    for (unsigned jid : dispatched605) {
+                        confirm_job(jid);
+                    }
+                    {
+                        long long ghosts = -1;
+                        const Clock::time_point tg = Clock::now();
+                        while (secs_since(tg) < 20) {
+                            ghosts = query_control_count(port, "listjobs", "sub:fakesub9");
+                            if (ghosts == 0) { break; }
+                            usleep(200 * 1000);
+                        }
+                        fprintf(stderr, "# contract: both-domain cancel ghosts remaining=%lld\n",
+                                ghosts);
+                        REQUIRE(ghosts == 0,
+                                "queued members of the SAME id do not survive a cancel that"
+                                " also destroys a staged record");
+                    }
+                    {
+                        int got = 0;
+                        REQUIRE(send_count(subF, 5, 606, "cancelG.cpp"),
+                                "request after the both-domain cancel");
+                        const Clock::time_point tf = Clock::now();
+                        while (got < 5 && secs_since(tf) < 120) {
+                            Msg *m = subF->get_msg(2);
+                            if (!m) { continue; }
+                            if (MSG_IS(m, USE_CS)) {
+                                UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                                if (u && u->client_id == 606) { confirm_job(u->job_id); ++got; }
+                            }
+                            delete m;
+                        }
+                        REQUIRE(got == 5, "the daemon is not wedged after the both-domain cancel");
+                    }
                 }
                 delete subF;
             }
@@ -2499,6 +2691,16 @@ int main(int argc, char **argv)
                     "the stall is reported exactly once per episode, not once per poll");
         }
 
+        /* A monitor watches the late thaw: the terminal transition must be
+           announced EXACTLY once -- the old expiry design told monitors the
+           job had finished while it could still run, which is the class of
+           lie this observer exists to catch.  */
+        MsgChannel *mon = connect_daemon(port, 0);
+        REQUIRE(mon != nullptr, "monitor connected");
+        if (mon) {
+            mon->send_msg(MonLoginMsg());
+        }
+
         /* THE STAGE-A OWNERSHIP PROOF: the frozen wrapper thaws long after
            the threshold.  Because the scheduler retained the job and the
            worker reservation, its late Begin/Done must still be recognized
@@ -2542,6 +2744,30 @@ int main(int argc, char **argv)
                     "the retained worker reservation was released exactly once");
             REQUIRE(query_submitter_outstanding(port, "fakesub") == 0,
                     "accounting stayed converged after the late completion");
+
+            /* The monitor saw the thaw exactly once in each direction.  */
+            if (mon) {
+                int mon_begins = 0, mon_dones = 0;
+                const Clock::time_point tm = Clock::now();
+                while (secs_since(tm) < 5) {
+                    Msg *m = mon->get_msg(1);
+                    if (!m) { continue; }
+                    if (MSG_IS(m, MON_JOB_BEGIN)) {
+                        MonJobBeginMsg *b = dynamic_cast<MonJobBeginMsg *>(m);
+                        if (b && b->job_id == frozen_job) { ++mon_begins; }
+                    } else if (MSG_IS(m, MON_JOB_DONE)) {
+                        MonJobDoneMsg *d = dynamic_cast<MonJobDoneMsg *>(m);
+                        if (d && d->job_id == frozen_job) { ++mon_dones; }
+                    }
+                    delete m;
+                }
+                fprintf(stderr, "# retention: monitor saw begin=%d done=%d for the thawed job\n",
+                        mon_begins, mon_dones);
+                REQUIRE(mon_begins == 1, "the monitor saw exactly one Begin for the thawed job");
+                REQUIRE(mon_dones == 1, "the monitor saw exactly one terminal Done for it");
+                delete mon;
+                mon = nullptr;
+            }
 
             /* And the freed capacity is really usable: a new assignment must
                be able to consume it.  */
