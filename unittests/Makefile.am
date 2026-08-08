@@ -16,6 +16,8 @@ utf8test_SOURCES = utf8test.cpp
 
 statewritertest_SOURCES = statewritertest.cpp ../daemon/statewriter.cpp
 statewritertest_CPPFLAGS = $(AM_CPPFLAGS) -I$(top_srcdir)/daemon
+# statewriter.cpp now logs its one-shot death notice via the shared logger
+statewritertest_LDADD = ../services/libicecc.la
 backpressure_CXXFLAGS = -pthread
 backpressure_LDFLAGS = -pthread
 backpressure_LDADD = ../services/libicecc.la

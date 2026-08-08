@@ -56,6 +56,10 @@ public:
 
     bool started() const { return m_pid > 0; }
     bool alive();   // reaps on demand; false once the writer has exited
+    /* Last OBSERVED liveness, without reaping -- for const contexts
+       (telemetry).  Fresh to within one main-loop iteration because the
+       loop polls alive() beside pump().  */
+    bool running() const { return m_pid > 0; }
 
     /* Queue one record (a full line, no trailing newline).  Never blocks;
        drops the oldest queued frames when the bound is exceeded.  */

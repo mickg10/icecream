@@ -3288,7 +3288,7 @@ void Daemon::remember_finished_job(const Client *client, int exitcode)
         o << "}";
         const string line = o.str();
         if (state_dump_log) {
-            if (state_writer.started()) {
+            if (state_writer.alive()) {
                 /* File I/O belongs to the writer process, not this loop.  */
                 state_writer.enqueue(StateWriter::SINK_STATELOG, line);
             } else if (logfile_error) {
@@ -4527,7 +4527,7 @@ std::string Daemon::dump_state_json() const
       << "\"jsonl_dropped_records\":" << state_writer.dropped() << ","
       << "\"jsonl_oversized_records\":" << state_writer.oversized() << ","
       << "\"jsonl_queued_bytes\":" << state_writer.queued_bytes() << ","
-      << "\"writer_alive\":" << (state_writer.started() ? "true" : "false")
+      << "\"writer_alive\":" << (state_writer.running() ? "true" : "false")
       << "},";
     o << "\"cache\":{";
     o << "\"cache_size\":" << (unsigned long long)cache_size << ",";
@@ -4731,7 +4731,7 @@ void Daemon::maybe_dump_state()
         // Machine-parsable regardless of verbosity.  File I/O belongs to the
         // writer process; the direct stream write remains only for the
         // stderr (no -l) configuration, where the target is a tty/pipe.
-        if (state_writer.started()) {
+        if (state_writer.alive()) {
             state_writer.enqueue(StateWriter::SINK_STATELOG, line);
         } else if (logfile_error) {
             (*logfile_error) << line << "\n";
@@ -5905,6 +5905,14 @@ void Daemon::answer_client_requests()
 
     /* Push queued state records into the writer pipe (nonblocking; no-op
        when nothing is queued or the pipe is full).  */
+    /* Poll the writer's liveness beside the pump: the generic waitpid(-1)
+       sweep above reaps a dead writer like any other child but cannot
+       reset the StateWriter's pid, so without this call started() stayed
+       true, telemetry reported writer_alive:true, and records were
+       accepted only to be dropped -- a silent telemetry blackout until
+       restart (issue #3).  alive() is one WNOHANG waitpid and tolerates
+       the sweep having reaped first (ECHILD).  */
+    state_writer.alive();
     state_writer.pump();
 
     handle_old_request();

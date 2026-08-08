@@ -199,6 +199,46 @@ static void test_bounded_shutdown(const std::string &dir)
     REQUIRE(!w.started(), "writer gone after bounded shutdown");
 }
 
+/* Issue #3: after the daemon's GENERIC waitpid(-1) sweep reaps a dead
+   writer, nothing reset the class state -- started() stayed true forever,
+   telemetry said writer_alive:true, and enqueued records were silently
+   dropped.  The class contract this locks in: alive() must transition to
+   false even when the reap was STOLEN by an external waitpid (the ECHILD
+   branch), and after that poll started() reports false too.  The daemon-
+   side half of the fix (actually CALLING alive() from the loop and gating
+   enqueue/telemetry on it) lives in daemon/main.cpp.  */
+static void test_death_after_external_reap(const std::string &dir)
+{
+    const std::string jsonl = dir + "/death.jsonl";
+    StateWriter w;
+    REQUIRE(w.start(jsonl, ""), "writer starts for death test");
+    const pid_t pid = writer_pid();
+    REQUIRE(pid > 0, "writer pid found");
+    REQUIRE(w.started() && w.alive(), "writer is up");
+
+    kill(pid, SIGKILL);
+    /* The daemon's generic zombie sweep gets there first.  */
+    {
+        int status = 0;
+        pid_t r;
+        for (int i = 0; i < 100; ++i) {
+            r = waitpid(-1, &status, WNOHANG);
+            if (r == pid) {
+                break;
+            }
+            usleep(50 * 1000);
+        }
+        REQUIRE(r == pid, "the external sweep reaped the writer");
+    }
+
+    REQUIRE(w.started(), "started() alone still claims the writer is up --"
+                         " the trap the daemon fell into");
+    REQUIRE(!w.alive(), "alive() detects the death despite the stolen reap"
+                        " (ECHILD branch)");
+    REQUIRE(!w.started(), "and after that poll, started() is honest too");
+    w.shutdown(500);
+}
+
 int main()
 {
     char tmpl[] = "/tmp/statewriterXXXXXX";
@@ -212,6 +252,7 @@ int main()
     test_delivery_and_partial_writes(dir);
     test_open_failure_recovery(dir);
     test_overflow_and_oversize(dir);
+    test_death_after_external_reap(dir);
     test_bounded_shutdown(dir);
 
     char cleanup[256];

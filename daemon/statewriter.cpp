@@ -11,6 +11,8 @@
 
 #include "statewriter.h"
 
+#include "../services/logging.h"
+
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -92,8 +94,13 @@ bool StateWriter::alive()
     if (r == m_pid || (r < 0 && errno == ECHILD)) {
         /* Exited -- possibly already reaped by the daemon's generic
            waitpid(-1) zombie sweep, which collects this pid like any other
-           child's.  */
+           child's.  Say so ONCE: without this line an operator has no
+           signal that the state stream is dead (records keep being
+           accepted and dropped, and telemetry would otherwise still say
+           writer_alive:true -- issue #3).  */
         m_pid = -1;
+        log_error() << "state writer process exited; state stream disabled"
+                    << " (records dropped so far: " << m_dropped << ")" << std::endl;
         return false;
     }
     return true;
