@@ -416,6 +416,82 @@ static void enqueue_job_requests_group(JobRequestsGroup* group) {
     job_requests.push_back(group);
 }
 
+/* BP-1: per-submitter dispatch credit.  Bounds the number of assignments
+   that have been dispatched but not yet confirmed by observable progress
+   (JobBeginMsg from the compile server, i.e. the client really did receive
+   its UseCS and contacted that server).  A submitter at its limit is passed
+   over for selection until its clients make progress; healthy submitters
+   are unaffected because JobBegin normally follows dispatch within
+   milliseconds.  */
+static unsigned int max_outstanding_dispatches = 32;   // --max-outstanding-dispatches
+
+/* How long an assignment may go unconfirmed before the scheduler REPORTS
+   that one of this submitter's clients is not progressing.  Reporting is
+   all it does: the assignment and its worker reservation are retained,
+   because only that client or its worker can truthfully end them.
+
+   Deliberately generous: a legitimate client can wait for an environment
+   install on the chosen compile server (MAX_BUSY_INSTALLING, 120s) before
+   its JobBegin appears, so anything tighter would report healthy
+   submitters on a cold farm.  A peer that is not draining its socket is a
+   different, sharper case and keeps the 30s deferred-output bound.  */
+static uint64_t max_outstanding_stall_msec = 180 * 1000;   // --dispatch-stall-report-after (seconds)
+
+/* Remote-capable compile slots across the farm, recomputed once per main
+   loop (prune_servers).  Used to clamp the per-submitter dispatch credit:
+   on a farm with fewer slots than the configured credit, one submitter
+   could otherwise reserve every slot before a second submitter is served.
+   The clamp always leaves one slot's worth of credit for someone else --
+   which is a PER-SUBMITTER admission bound, not a farm-progress
+   guarantee: it knows nothing of platform or environment eligibility, and
+   several stalled submitters can between them retain every slot.  */
+static unsigned int cached_remote_farm_slots = 0;
+/* Set whenever css membership or a daemon's advertised capacity changes;
+   the aggregate is recomputed before the next credit comparison, so a
+   dispatch batch that runs right after a removal cannot admit against the
+   old larger farm.  */
+static bool remote_farm_slots_dirty = true;
+
+
+/* The ONLY way scheduler code changes an advertised capacity: it also
+   invalidates the farm-slot aggregate, so no maxJobs mutation -- login,
+   the old-protocol ping-wait negation, or its restoration -- can leave the
+   credit clamp consulting a stale total, not even within the same
+   prune_servers() pass that made the change.  */
+static void set_cs_max_jobs(CompileServer *cs, int jobs)
+{
+    cs->setMaxJobs(jobs);
+    remote_farm_slots_dirty = true;
+}
+
+static void refresh_remote_farm_slots()
+{
+    unsigned int slots = 0;
+    for (CompileServer * const cs : css) {
+        if (cs->state() == CompileServer::LOGGEDIN && !cs->noRemote()
+            && cs->maxJobs() > 0) {
+            slots += (unsigned int)cs->maxJobs();
+        }
+    }
+    cached_remote_farm_slots = slots;
+    remote_farm_slots_dirty = false;
+}
+
+/* The current ADMISSION CEILING: already-retained debits can legitimately
+   exceed it after a farm shrink; only new admission is bounded by it.  */
+static unsigned int effective_dispatch_credit()
+{
+    if (remote_farm_slots_dirty) {
+        refresh_remote_farm_slots();
+    }
+    unsigned int credit = max_outstanding_dispatches;
+    const unsigned int slots = cached_remote_farm_slots;
+    if (slots > 0 && credit >= slots) {
+        credit = slots > 1 ? slots - 1 : 1;
+    }
+    return credit;
+}
+
 // Gives a position in job_requests, used to iterate items.  The position
 // CARRIES its group iterator: the request list is not mutated while a
 // dispatch candidate is being searched for, so the iterator stays valid,
@@ -434,6 +510,74 @@ struct JobRequestPosition
     list<Job*>::iterator jobIt;
     Job* job;
 };
+
+/* Debit/credit helpers.  Job::dispatchOutstanding() makes every release
+   path idempotent, so a job that is confirmed AND later erased releases
+   exactly one credit.  */
+static void debit_dispatch_credit(Job *job)
+{
+    if (job && !job->dispatchOutstanding()) {
+        job->setDispatchOutstanding(true);
+        const uint64_t now_msec = icecream_monotonic_msec();
+        job->setDispatchDebitMsec(now_msec);
+        job->submitter()->addOutstandingDispatch(now_msec);
+    }
+}
+
+static void rebuild_submitter_debits(CompileServer *submitter);
+
+static void credit_dispatch_credit(Job *job)
+{
+    if (job && job->dispatchOutstanding()) {
+        job->setDispatchOutstanding(false);
+        if (!job->submitter()->removeOutstandingDispatch(job->dispatchDebitMsec())) {
+            /* Never knowingly continue with corrupt credit accounting: an
+               orphan debit would gate this submitter forever, and deleting
+               the job removes the only direct repair handle.  Rebuild the
+               submitter's debit set from the live job map -- exceptional
+               path only, so the normal path pays nothing.  */
+            log_error() << "dispatch-credit invariant failure: job " << job->id()
+                        << " debit " << job->dispatchDebitMsec()
+                        << " not found on " << job->submitter()->nodeName()
+                        << " (outstanding=" << job->submitter()->outstandingDispatches()
+                        << ") - rebuilding this submitter's debit set" << endl;
+            rebuild_submitter_debits(job->submitter());
+        }
+    }
+}
+
+/* Reconstruct one submitter's debit multiset from the live job map --
+   called ONLY on a detected accounting invariant failure, so availability
+   is preserved without taxing the normal path.  */
+static void rebuild_submitter_debits(CompileServer *submitter)
+{
+    submitter->clearOutstandingDispatches();
+    for (map<unsigned int, Job *>::const_iterator it = jobs.begin();
+            it != jobs.end(); ++it) {
+        Job *job = it->second;
+        if (job->submitter() == submitter && job->dispatchOutstanding()) {
+            submitter->addOutstandingDispatch(job->dispatchDebitMsec());
+        }
+    }
+    log_warning() << submitter->nodeName() << " debit set rebuilt: outstanding="
+                  << submitter->outstandingDispatches() << endl;
+}
+
+/* The two dispatch gates are deliberately SEPARATE predicates:
+
+   - pending output blocks EVERY reply.  Any reply -- local or remote --
+     would only be queued behind output the peer is not draining.
+   - exhausted remote credit blocks only REMOTE selection.  A local
+     decision reserves no farm slot and is never debited, so a mixed-role
+     host whose wrappers hold unconfirmed remote assignments must still be
+     able to run work on its own free local slots; folding the two gates
+     together idled exactly the machines the no-self-gating rule exists
+     for.  */
+static bool submitter_has_remote_credit(CompileServer *submitter)
+{
+    return submitter
+        && submitter->outstandingDispatches() < effective_dispatch_credit();
+}
 
 static JobRequestPosition get_first_job_request()
 {
@@ -523,6 +667,7 @@ static bool handle_cs_request(MsgChannel *cs, Msg *_m)
 
     for (unsigned int i = 0; i < m->count; ++i) {
         Job *job = create_new_job(submitter);
+        submitter->admittedJobsIncrement();
         job->setEnvironments(m->versions);
         job->setTargetPlatform(m->target);
         job->setArgFlags(m->arg_flags);
@@ -950,6 +1095,7 @@ static CompileServer *pick_server(Job *job, SchedulerAlgorithmName schedulerAlgo
         case SchedulerAlgorithmName::NONE:
         case SchedulerAlgorithmName::UNDEFINED:
             [[fallthrough]];
+
         default:
             trace()
                 << "unknown scheduler algorithm " << schedulerAlgorithm
@@ -991,6 +1137,12 @@ static time_t prune_servers()
     time_t now = time(nullptr);
     time_t min_time = MAX_SCHEDULER_PING;
 
+    /* The farm-slot aggregate for the credit clamp is recomputed lazily on
+       a dirty flag (any handle_end/login marks it), so even a removal made
+       INSIDE a dispatch batch is seen by the very next credit comparison;
+       this refresh only keeps the steady state warm.  */
+    refresh_remote_farm_slots();
+
     for (it = controls.begin(); it != controls.end();) {
         if ((now - (*it)->last_talk) >= MAX_SCHEDULER_PING) {
             CompileServer *old = *it;
@@ -1028,6 +1180,51 @@ static time_t prune_servers()
             min_time = min(min_time, (time_t)((remaining + 999) / 1000));
         }
 
+        /* The dispatch-stall REPORT.  A submitting daemon proxies every
+           compiler wrapper on its host; one wrapper frozen after its UseCS
+           but before the worker sees CompileFile holds a dispatch debit
+           that JobBegin never credits.  Nothing is removed and nothing is
+           released here: the daemon may be healthy (its other wrappers keep
+           confirming), and the UseCS is already in the frozen wrapper's
+           hands, so only that client or its worker can truthfully end the
+           assignment.  The per-submitter credit is what bounds the damage;
+           this bound is an OBSERVABILITY point that names the stuck
+           submitter for an operator, once per continuous episode.  */
+        if ((*it)->outstandingDispatches() == 0) {
+            (*it)->setStallReported(false);
+        }
+        if ((*it)->outstandingDispatches() > 0 && !(*it)->deferred_output_armed()) {
+            const uint64_t stall_msec =
+                (*it)->oldestOutstandingDispatchMsec(icecream_monotonic_msec());
+            if (stall_msec >= max_outstanding_stall_msec) {
+                if (!(*it)->stallReported()) {
+                    (*it)->setStallReported(true);
+                    log_warning() << (*it)->nodeName() << " holds "
+                                  << (*it)->outstandingDispatches()
+                                  << " unconfirmed dispatches, oldest for "
+                                  << (stall_msec / 1000) << "s - a client of"
+                                     " this daemon is not progressing.  Its"
+                                     " assignment and worker reservation are"
+                                     " retained (only that client or its"
+                                     " worker can end them); this submitter"
+                                     " may hold up to the current admission"
+                                     " ceiling of "
+                                  << effective_dispatch_credit()
+                                  << " unconfirmed assignments (already-"
+                                     "retained debits may exceed a ceiling"
+                                     " lowered by a farm shrink)" << endl;
+                }
+            } else {
+                /* Below the threshold: the reported episode is over, so a
+                   LATER stall is reported as a new incident.  Deliberately
+                   not cleared from the Begin/Done handlers -- unrelated
+                   sibling progress does not resolve the stale assignment.  */
+                (*it)->setStallReported(false);
+                const uint64_t remaining = max_outstanding_stall_msec - stall_msec;
+                min_time = min(min_time, (time_t)((remaining + 999) / 1000));
+            }
+        }
+
         (*it)->startInConnectionTest();
         time_t cs_in_conn_timeout = (*it)->getNextTimeout();
         if(cs_in_conn_timeout != -1)
@@ -1052,7 +1249,7 @@ static time_t prune_servers()
         if ((now - (*it)->last_talk) >= MAX_SCHEDULER_PING) {
             if ((*it)->maxJobs() >= 0) {
                 trace() << "send ping " << (*it)->nodeName() << endl;
-                (*it)->setMaxJobs((*it)->maxJobs() * -1);   // better not give it away
+                set_cs_max_jobs(*it, (*it)->maxJobs() * -1);   // better not give it away
 
                 if ((*it)->send_msg(PingMsg())) {
                     // give it MAX_SCHEDULER_PONG to answer a ping
@@ -1126,7 +1323,19 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
             continue;
         }
 
-        use_cs = pick_server(job, schedulerAlgorithm);
+        /* Exhausted remote credit suppresses only the REMOTE selection: the
+           submitter-local fallback below still runs, so a mixed-role host
+           keeps using its own free slots (undebited) while its remote
+           assignments are unconfirmed.  If it has no usable local slot
+           either, the normal advance takes over.  */
+        const bool remote_allowed = submitter_has_remote_credit(job->submitter());
+        if (!remote_allowed) {
+            trace() << "dispatch credit exhausted on "
+                    << job->submitter()->nodeName()
+                    << ", remote selection suppressed" << endl;
+        }
+
+        use_cs = remote_allowed ? pick_server(job, schedulerAlgorithm) : nullptr;
 
         if (use_cs) {
             break;
@@ -1251,6 +1460,14 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
         }
     }
 
+    /* Charge remote-dispatch credit ONLY for work that actually reserves a
+       farm slot.  Charging local decisions would let a busy mixed-role
+       daemon -- any ordinary developer machine, which both submits and
+       compiles -- gate itself out of a live farm.  */
+    if (use_cs != job->submitter()) {
+        debit_dispatch_credit(job);
+    }
+
 
 #if DEBUG_SCHEDULER >= 0
     if (!gotit) {
@@ -1302,7 +1519,7 @@ static bool handle_login(CompileServer *cs, Msg *_m)
 
     cs->setRemotePort(m->port);
     cs->setCompilerVersions(m->envs);
-    cs->setMaxJobs(m->max_kids);
+    set_cs_max_jobs(cs, m->max_kids);
     cs->setNoRemote(m->noremote);
 
     if (m->nodename.length()) {
@@ -1343,7 +1560,9 @@ static bool handle_login(CompileServer *cs, Msg *_m)
         ++it;
     }
 
+    cs->assignConnectionGeneration();
     css.push_back(cs);
+    remote_farm_slots_dirty = true;
 
     /* Configure the daemon */
     if (IS_PROTOCOL_VERSION(24, cs)) {
@@ -1423,6 +1642,14 @@ static bool handle_job_begin(CompileServer *cs, Msg *_m)
     }
 
     cs->setClientCount(m->client_count);
+
+    /* Observable progress: the client received its UseCS and reached the
+       compile server, so this assignment no longer occupies a dispatch
+       credit on its submitter.  The stall-report latch is deliberately NOT
+       cleared here: it belongs to the episode (prune_servers), and clearing
+       on unrelated sibling progress re-armed it against an unchanged stale
+       debit -- one frozen job once produced 61 warnings that way.  */
+    credit_dispatch_credit(job);
 
     job->setState(Job::COMPILING);
     job->setStartTime(m->stime);
@@ -1553,6 +1780,7 @@ static bool handle_job_done(CompileServer *cs, Msg *_m)
 
     add_job_stats(j, m);
     notify_monitors(new MonJobDoneMsg(*m));
+    credit_dispatch_credit(j);
     jobs.erase(m->job_id);
     delete j;
 
@@ -1564,7 +1792,7 @@ static bool handle_ping(CompileServer *cs, Msg * /*_m*/)
     cs->last_talk = time(nullptr);
 
     if (cs->maxJobs() < 0) {
-        cs->setMaxJobs(cs->maxJobs() * -1);
+        set_cs_max_jobs(cs, cs->maxJobs() * -1);
     }
 
     return true;
@@ -1584,7 +1812,7 @@ static bool handle_stats(CompileServer *cs, Msg *_m)
         cs->last_talk = time(nullptr);
 
         if (cs->maxJobs() < 0) {
-            cs->setMaxJobs(cs->maxJobs() * -1);
+            set_cs_max_jobs(cs, cs->maxJobs() * -1);
         }
     }
 
@@ -1720,8 +1948,12 @@ static bool handle_line(CompileServer *cs, Msg *_m)
             sprintf(buffer, " (%s:%u) ", it->name.c_str(), it->remotePort());
             line = " " + it->nodeName() + buffer;
             line += "[" + it->hostPlatform() + "] speed=";
-            sprintf(buffer, "%.2f jobs=%d/%d load=%u", server_speed(it),
-                    it->currentJobCount(), it->maxJobs(), it->load());
+            sprintf(buffer, "%.2f jobs=%d/%d load=%u admitted_total=%llu gen=%llu outstanding=%u",
+                    server_speed(it),
+                    it->currentJobCount(), it->maxJobs(), it->load(),
+                    (unsigned long long)it->admittedJobsTotal(),
+                    (unsigned long long)it->connectionGeneration(),
+                    it->outstandingDispatches());
             line += buffer;
 
             if (it->busyInstalling()) {
@@ -1897,6 +2129,7 @@ static bool handle_end(CompileServer *toremove, Msg *m)
          the daemon died.  We expect that the daemon dying makes the client
          disconnect soon too.  */
         css.remove(toremove);
+        remote_farm_slots_dirty = true;
 
         /* Unfortunately the job_requests queues are also tagged based on the daemon,
            so we need to clean them up also.  */
@@ -1909,6 +2142,7 @@ static bool handle_end(CompileServer *toremove, Msg *m)
                 for (jit = l->l.begin(); jit != l->l.end(); ++jit) {
                     trace() << "STOP (DAEMON) FOR " << (*jit)->id() << endl;
                     notify_monitors(new MonJobDoneMsg(JobDoneMsg((*jit)->id(),  255)));
+                    credit_dispatch_credit(*jit);   // no-op for undispatched jobs
 
                     if ((*jit)->server()) {
                         (*jit)->server()->setBusyInstalling(0);
@@ -1931,6 +2165,7 @@ static bool handle_end(CompileServer *toremove, Msg *m)
             if (job->server() == toremove || job->submitter() == toremove) {
                 trace() << "STOP (DAEMON2) FOR " << mit->first << endl;
                 notify_monitors(new MonJobDoneMsg(JobDoneMsg(job->id(),  255)));
+                credit_dispatch_credit(job);
 
                 /* If this job is removed because the submitter is removed
                 also remove the job from the servers joblist.  */
@@ -2122,6 +2357,8 @@ static void usage(const std::string reason = "")
          << "  -v[v[v]]]\n"
          << "  -r, --persistent-client-connection\n"
          << "  -a, --algorithm <name>\n"
+         << "  --max-outstanding-dispatches <n>   per-submitter unconfirmed dispatch credit (1-1024, default 32)\n"
+         << "  --dispatch-stall-report-after <sec>  report (do not remove) a submitter whose oldest unconfirmed dispatch exceeds this; its assignment and worker reservation are retained (10-3600, default 180)\n"
          << endl;
 
     exit(1);
@@ -2224,6 +2461,11 @@ int main(int argc, char *argv[])
             { "log-file", 1, nullptr, 'l'},
             { "user-uid", 1, nullptr, 'u'},
             { "algorithm", 1, nullptr, 'a' },
+            { "max-outstanding-dispatches", 1, nullptr, 1001 },
+            { "dispatch-stall-report-after", 1, nullptr, 1002 },
+            /* Compatibility alias for the previous spelling, from when this
+               bound removed the submitter instead of reporting it.  */
+            { "dispatch-stall-timeout", 1, nullptr, 1002 },
             { nullptr, 0, nullptr, 0 }
         };
 
@@ -2343,6 +2585,36 @@ int main(int argc, char *argv[])
 
             break;
 
+        case 1001:
+        case 1002: {
+            /* Strict integer parsing: '32junk' must be rejected, not read
+               as 32.  errno, at-least-one-digit and full consumption are
+               all checked.  */
+            const char *name = (c == 1001) ? "--max-outstanding-dispatches"
+                                           : "--dispatch-stall-report-after";
+            if (!optarg || !*optarg) {
+                usage(string("Error: ") + name + " requires argument");
+            }
+            errno = 0;
+            char *end = nullptr;
+            const long v = strtol(optarg, &end, 10);
+            if (errno != 0 || end == optarg || *end != '\0') {
+                usage(string("Error: ") + name + " requires a plain integer");
+            }
+            if (c == 1001) {
+                if (v < 1 || v > 1024) {
+                    usage("Error: --max-outstanding-dispatches must be 1..1024");
+                }
+                max_outstanding_dispatches = (unsigned int)v;
+            } else {
+                if (v < 10 || v > 3600) {
+                    usage("Error: --dispatch-stall-report-after must be 10..3600 seconds");
+                }
+                max_outstanding_stall_msec = (uint64_t)v * 1000;
+            }
+            break;
+        }
+
         default:
             usage();
         }
@@ -2388,6 +2660,9 @@ int main(int argc, char *argv[])
     setup_debug(debug_level, logfile);
 
     log_info() << "ICECREAM scheduler " VERSION " starting up, port " << scheduler_port << endl;
+    log_info() << "dispatch credit: " << max_outstanding_dispatches
+               << " unconfirmed per submitter (farm-clamped at runtime), stall reported after "
+               << (max_outstanding_stall_msec / 1000) << "s" << endl;
     log_info() << "Debug level: " << debug_level << endl;
 
     if (detach) {
@@ -2444,6 +2719,7 @@ int main(int argc, char *argv[])
     last_announce = starttime;
 
     while (!exit_main_loop) {
+        const bool daemon_listener_armed = time(nullptr) >= next_listen;
         int timeout = prune_servers();
 
         /* Dispatch in bounded batches: draining an arbitrarily deep request
@@ -2479,6 +2755,18 @@ int main(int argc, char *argv[])
             }
         }
 
+        /* While the daemon listener is temporarily de-armed, do not sleep
+           past its re-arm deadline: without this the loop could block on
+           poll() for the full prune interval and accept no daemon for
+           seconds, even with a connection waiting.  */
+        if (!daemon_listener_armed) {
+            const time_t remaining = next_listen - time(nullptr);
+            const time_t secs = remaining > 0 ? remaining : 0;
+            if (timeout < 0 || secs < timeout) {
+                timeout = secs;
+            }
+        }
+
         /* Announce ourselves from time to time, to make other possible schedulers disconnect
            their daemons if we are the preferred scheduler (daemons with version new enough
            should automatically select the best scheduler, but old daemons connect randomly). */
@@ -2491,12 +2779,18 @@ int main(int argc, char *argv[])
         pollfds.reserve( fd2cs.size() + css.size() + 5 );
         pollfd pfd; // tmp variable
 
-        if (time(nullptr) >= next_listen) {
-            pfd.fd = listen_fd;
-            pfd.events = POLLIN;
-            pollfds.push_back( pfd );
+        /* The daemon listener is throttled to at most one accept per
+           second (next_listen); the CONTROL listener is not -- it must be
+           pollable continuously, or a control connection cannot even wake
+           the loop while listen_fd is de-armed (the bug the schedcredit
+           harness hit: a fresh daemon login could not proceed because
+           nothing woke poll during the re-arm interval).  */
+        pfd.fd = text_fd;
+        pfd.events = POLLIN;
+        pollfds.push_back( pfd );
 
-            pfd.fd = text_fd;
+        if (daemon_listener_armed) {
+            pfd.fd = listen_fd;
             pfd.events = POLLIN;
             pollfds.push_back( pfd );
         }

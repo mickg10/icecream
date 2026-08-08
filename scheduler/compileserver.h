@@ -26,6 +26,8 @@
 
 #include <string>
 #include <list>
+#include <set>
+#include <stdint.h>
 #include <map>
 
 #include "../services/comm.h"
@@ -39,6 +41,44 @@ using namespace std;
 class CompileServer : public MsgChannel
 {
 public:
+    // Assignments dispatched to this submitter that have not yet been
+    // confirmed by observable client progress (JobBeginMsg).  Bounds how
+    // many farm slots one unresponsive submitter can hold.  Each entry is
+    // the monotonic debit time of one unconfirmed dispatch: the liveness
+    // bound is a MAXIMUM ASSIGNMENT AGE, enforced against the oldest entry,
+    // so one lost assignment cannot hold its slot indefinitely just because
+    // later assignments keep confirming.
+    unsigned int outstandingDispatches() const
+    {
+        return (unsigned int)m_outstandingDebits.size();
+    }
+    void addOutstandingDispatch(uint64_t debit_msec)
+    {
+        m_outstandingDebits.insert(debit_msec);
+    }
+    // Returns false when the exact debit is unknown -- an accounting
+    // invariant failure the CALLER must log loudly.  Silently charging the
+    // oldest entry instead would hide the defect and repeatedly postpone
+    // the true oldest job's age bound.
+    bool removeOutstandingDispatch(uint64_t debit_msec)
+    {
+        auto it = m_outstandingDebits.find(debit_msec);
+        if (it == m_outstandingDebits.end()) {
+            return false;
+        }
+        m_outstandingDebits.erase(it);
+        return true;
+    }
+    // Age of the oldest unconfirmed dispatch, or 0 if none is outstanding.
+    uint64_t oldestOutstandingDispatchMsec(uint64_t now_msec) const
+    {
+        if (m_outstandingDebits.empty()) {
+            return 0;
+        }
+        const uint64_t oldest = *m_outstandingDebits.begin();
+        return now_msec > oldest ? now_msec - oldest : 0;
+    }
+
     enum State {
         CONNECTED,
         LOGGEDIN
@@ -115,6 +155,31 @@ public:
     void submittedJobsIncrement();
     void submittedJobsDecrement();
 
+    /* Count of requests this submitter has had ADMITTED (jobs created), as
+       opposed to the live count above.  Monotonic for the lifetime of ONE
+       connection object -- the object dies with its connection, so across a
+       reconnect the count restarts.  connectionGeneration() disambiguates:
+       a baseline/delta pair taken under the same generation is a valid
+       window; a generation change means the counter was reset in between
+       and the observer must resample or sum per generation.  */
+    uint64_t admittedJobsTotal() const { return m_admittedJobsTotal; }
+    void admittedJobsIncrement() { ++m_admittedJobsTotal; }
+    /* Assigned at daemon LOGIN (not construction): short-lived control and
+       monitor channels must not churn it, and 64 bits are practically nonwrapping (2^64 daemon logins).  */
+    uint64_t connectionGeneration() const { return m_connectionGeneration; }
+    void assignConnectionGeneration()
+    {
+        static uint64_t next_generation = 0;
+        m_connectionGeneration = ++next_generation;
+    }
+    /* One-shot latch so an unconfirmed assignment is reported once per
+       stall episode instead of every poll.  Owned by prune_servers(): set
+       when the oldest debit first exceeds the threshold, cleared only when
+       no debit exceeds it -- deliberately NOT cleared by sibling
+       Begin/Done, which would re-arm it against an unchanged stale debit.  */
+    bool stallReported() const { return m_stallReported; }
+    void setStallReported(bool value) { m_stallReported = value; }
+
     Environments compilerVersions() const;
     void setCompilerVersions(const Environments &environments);
 
@@ -152,7 +217,18 @@ public:
     bool isConnected();
     void updateInConnectivity(bool acceptingIn);
 
+    /* Reset the debit accounting to empty; the caller then re-adds each
+       live debit through addOutstandingDispatch().  Exists only for the
+       invariant-failure rebuild path -- normal mutation goes through the
+       add/remove pair.  */
+    void clearOutstandingDispatches()
+    {
+        m_outstandingDebits.clear();
+    }
+
 private:
+    std::multiset<uint64_t> m_outstandingDebits;
+
     bool blacklisted(const Job *job, const pair<string, string> &environment) const;
 
     /* The listener port, on which it takes compile requests.  */
@@ -181,6 +257,10 @@ private:
     list<JobStat> m_lastRequestedJobs;
     JobStat m_cumCompiled;  // cumulated
     JobStat m_cumRequested;
+
+    uint64_t m_admittedJobsTotal = 0;
+    uint64_t m_connectionGeneration = 0;       // assigned at daemon login
+    bool m_stallReported = false;
 
     static unsigned int s_hostIdCounter;
 

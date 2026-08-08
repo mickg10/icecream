@@ -1,19 +1,21 @@
-TESTS = testargs lockexec occupancy backpressure
+TESTS = testargs lockexec occupancy backpressure schedcredit-run.sh
 
 AM_CPPFLAGS = -I$(top_srcdir)/client -I$(top_srcdir)/services -I$(top_srcdir)/
 testargs_LDADD = ../client/libclient.a ../services/libicecc.la
 
-check_PROGRAMS = testargs lockexec occupancy backpressure
+check_PROGRAMS = testargs lockexec occupancy backpressure schedcredit
 testargs_SOURCES = args.cpp
 lockexec_SOURCES = lockexec.cpp
 lockexec_LDADD = ../client/libclient.a ../services/libicecc.la
 occupancy_SOURCES = occupancy.cpp
 backpressure_SOURCES = backpressure.cpp
 backpressure_LDADD = ../services/libicecc.la
+schedcredit_SOURCES = schedcredit.cpp
+schedcredit_LDADD = ../services/libicecc.la
 
 # Every source archive must carry the gate's inputs no matter where the
 # archive is produced; the built shim must not survive make clean.
-EXTRA_DIST = schedgate-run.sh sndbuf_shim.c
+EXTRA_DIST = schedgate-run.sh sndbuf_shim.c schedcredit-run.sh
 CLEANFILES = sndbuf_shim.so
 
 # The scheduler integration gate needs an LD_PRELOAD shim to manufacture

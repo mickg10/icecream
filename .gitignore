@@ -62,3 +62,4 @@ compile_commands.json
 /unittests/backpressure
 /unittests/schedgate
 /unittests/sndbuf_shim.so
+/unittests/schedcredit
