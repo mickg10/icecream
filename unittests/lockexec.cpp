@@ -113,6 +113,25 @@ static int waiter_main(int notify_fd, const char *dir, int slots)
 static pid_t pids[3] = { -1, -1, -1 };
 static std::string tempdir;
 
+/* The handler reads pids[]; normal code mutates it.  Every transition --
+   fork-to-publish and reap-to-clear -- happens with SIGINT/SIGTERM
+   blocked, so the handler can never observe a half-updated slot: no
+   missed child (signal between fork and store) and no stale kill (signal
+   between reap and clear).  */
+static void block_handled(sigset_t *old)
+{
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGINT);
+    sigaddset(&set, SIGTERM);
+    sigprocmask(SIG_BLOCK, &set, old);
+}
+
+static void unblock_handled(const sigset_t *old)
+{
+    sigprocmask(SIG_SETMASK, old, nullptr);
+}
+
 
 /* Reap one child, tolerating EINTR and reporting ECHILD honestly; only a
    CONFIRMED reap (or the kernel saying the child does not exist) marks the
@@ -137,6 +156,8 @@ static bool reap(pid_t pid)
 
 static void cleanup(void)
 {
+    sigset_t old;
+    block_handled(&old);
     for (int i = 0; i < 3; ++i) {
         if (pids[i] > 0) {
             if (kill(pids[i], SIGKILL) != 0 && errno != ESRCH) {
@@ -147,6 +168,7 @@ static void cleanup(void)
             }
         }
     }
+    unblock_handled(&old);
     if (!tempdir.empty()) {
         const std::string base = tempdir + "/local_lock";
         unlink(base.c_str());
@@ -229,11 +251,18 @@ int main(int argc, char **argv)
     snprintf(fdbuf, sizeof(fdbuf), "%d", pipefd[1]);
     snprintf(slotbuf, sizeof(slotbuf), "%d", SLOTS);
 
-    auto spawn = [&](const char *mode, const char *extra) -> pid_t {
+    auto spawn = [&](int slot, const char *mode, const char *extra) -> pid_t {
+        sigset_t old;
+        block_handled(&old);
         const pid_t pid = fork();
         if (pid != 0) {
+            if (pid > 0) {
+                pids[slot] = pid;    // published under the mask
+            }
+            unblock_handled(&old);
             return pid;
         }
+        unblock_handled(&old);
         if (extra) {
             execl(argv[0], argv[0], mode, fdbuf, tempdir.c_str(), slotbuf,
                   extra, (char *)nullptr);
@@ -246,8 +275,8 @@ int main(int argc, char **argv)
 
     /* 1. two holders; the first with stdin closed.  Reports arrive from
        the post-exec image and carry the lock fd.  */
-    pids[0] = spawn("--holder", "1");
-    pids[1] = spawn("--holder", "0");
+    spawn(0, "--holder", "1");
+    spawn(1, "--holder", "0");
     if (pids[0] < 0 || pids[1] < 0) {
         perror("fork");
         cleanup();
@@ -269,7 +298,7 @@ int main(int argc, char **argv)
 
     /* 2. both slots held by exec'd processes: a further acquisition must
        block.  */
-    pids[2] = spawn("--waiter", nullptr);
+    spawn(2, "--waiter", nullptr);
     if (pids[2] < 0) {
         perror("fork");
         cleanup();
@@ -283,19 +312,27 @@ int main(int argc, char **argv)
     bool unblocked = false;
     for (int i = 0; i < 2 && !unblocked; ++i) {
         if (pids[i] > 0) {
+            sigset_t old;
+            block_handled(&old);
             if (kill(pids[i], SIGKILL) != 0 && errno != ESRCH) {
                 perror("kill");
             }
             if (reap(pids[i])) {
                 pids[i] = -1;
             }
+            unblock_handled(&old);
         }
         unblocked = read_report(pipefd[0], 5) == "W";
     }
     check(unblocked, "killing exec'd holders unblocks the waiter (exit, and"
                      " nothing less, releases a slot)");
-    if (pids[2] > 0 && reap(pids[2])) {
-        pids[2] = -1;
+    {
+        sigset_t old;
+        block_handled(&old);
+        if (pids[2] > 0 && reap(pids[2])) {
+            pids[2] = -1;
+        }
+        unblock_handled(&old);
     }
 
     cleanup();
