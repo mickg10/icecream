@@ -163,6 +163,11 @@ static bool dcc_open_lockfile(const string &fname, int &plockfd)
 
 static bool dcc_lock_host_slot(string fname, int lock, bool block);
 
+int dcc_lock_fd()
+{
+    return lock_fd;
+}
+
 /* The no-fork local build execs the compiler in THIS process.  The slot
    lock is an fcntl record lock on a close-on-exec fd, so exec would close
    the fd and release the slot the moment the compiler starts -- leaving
@@ -190,32 +195,28 @@ bool dcc_lock_keep_across_exec()
     return true;
 }
 
-bool dcc_lock_host()
+/* The slot pool, with the directory and size as explicit arguments: the
+   production wrapper supplies the shared per-user directory and one slot
+   per online CPU, and the lock-lifetime regression test supplies a private
+   directory and a fixed two-slot pool so it can never throttle -- or be
+   perturbed by -- real local builds.  */
+bool dcc_lock_host_at(const string &lockdir, int max_cpu)
 {
     assert(lock_fd == -1);
 
-    string fname = "/tmp/.icecream-";
-    struct passwd *pwd = getpwuid(getuid());
-
-    if (pwd) {
-        fname += pwd->pw_name;
-    } else {
-        char buffer[12];
-        sprintf(buffer, "%ld", (long)getuid());
-        fname += buffer;
-    }
-
-    if (mkdir(fname.c_str(), 0700) && errno != EEXIST) {
-        log_perror("mkdir") << "\t" << fname << endl;
+    if (mkdir(lockdir.c_str(), 0700) && errno != EEXIST) {
+        log_perror("mkdir") << "\t" << lockdir << endl;
         return false;
     }
 
-    fname += "/local_lock";
-    /* Deliberately NOT parked at 0 while probing: descriptor 0 is a valid
-       open() result when stdin is closed, so 0 must remain distinguishable
-       as "a real lock fd".  -1 is the only not-locked sentinel.  */
-    int max_cpu = 1;
-    dcc_ncpus(&max_cpu);
+    string fname = lockdir + "/local_lock";
+    /* lock_fd is deliberately NOT parked at 0 while probing: descriptor 0
+       is a valid open() result when stdin is closed, so 0 must remain
+       distinguishable as "a real lock fd".  -1 is the only not-locked
+       sentinel.  */
+    if (max_cpu < 1) {
+        max_cpu = 1;
+    }
     // To ensure better distribution, select a "random" starting slot.
     int lock_offset = getpid();
     // First try if any slot is free.
@@ -225,6 +226,24 @@ bool dcc_lock_host()
     }
     // If not, block on the first selected one.
     return dcc_lock_host_slot( fname, lock_offset % max_cpu, true );
+}
+
+bool dcc_lock_host()
+{
+    string dir = "/tmp/.icecream-";
+    struct passwd *pwd = getpwuid(getuid());
+
+    if (pwd) {
+        dir += pwd->pw_name;
+    } else {
+        char buffer[12];
+        sprintf(buffer, "%ld", (long)getuid());
+        dir += buffer;
+    }
+
+    int max_cpu = 1;
+    dcc_ncpus(&max_cpu);
+    return dcc_lock_host_at(dir, max_cpu);
 }
 
 bool dcc_lock_host_slot(string fname, int lock, bool block)

@@ -2592,8 +2592,12 @@ int main(int argc, char **argv)
                 }
                 usleep(200 * 1000);
             }
-            REQUIRE(query_submitter_outstanding(port, "fakesub") == 1,
-                    "barrier: the credit-1 assignment was delivered before the window");
+            const bool barrier_ready =
+                query_submitter_outstanding(port, "fakesub") == 1
+                && worker_job_count(port, "fakecs") >= 1;
+            REQUIRE(barrier_ready,
+                    "barrier: the credit-1 assignment AND its worker reservation"
+                    " exist before the retention window");
         }
         long long min_worker_jobs = 1000000;
         const int healthy_before = healthy_replies.load();

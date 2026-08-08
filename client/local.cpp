@@ -378,8 +378,30 @@ int build_local(CompileJob &job, MsgChannel *local_daemon, struct rusage *used)
         child_pid = fork();
     }
 
-    if (child_pid == -1){
+    if (child_pid == -1) {
+        /* No child was created, so falling through would reach
+           wait4(-1, ...) -- "wait for ANY child" -- which converts an
+           untouched status word when there is none and can reap an
+           unrelated child when there is one.  This path matters more now
+           that a failed close-on-exec clear deliberately falls back to
+           forking: fail the local attempt cleanly instead of running
+           without the concurrency bound.  */
         log_perror("fork failed");
+        if (color_output) {
+            if ((-1 == close(pf[0])) && (errno != EBADF)) {
+                log_perror("close failed");
+            }
+            if ((-1 == close(pf[1])) && (errno != EBADF)) {
+                log_perror("close failed");
+            }
+        }
+        for (char *const arg : argv) {
+            free(arg);
+        }
+        if (!local_daemon) {
+            dcc_unlock();
+        }
+        return EXIT_DISTCC_FAILED;
     }
 
     if (!child_pid) {

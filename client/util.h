@@ -42,8 +42,13 @@ extern int resolve_link(const std::string &file, std::string &resolved);
 extern std::string get_cwd();
 
 extern bool dcc_lock_host();
+/* Same pool with explicit directory and size; the production path is
+   dcc_lock_host().  Exposed for the lock-lifetime regression test.  */
+extern bool dcc_lock_host_at(const std::string &lockdir, int max_cpu);
 extern void dcc_unlock();
 extern bool dcc_lock_keep_across_exec();
+/* The held slot descriptor (-1 when none); see the lock-lifetime test.  */
+extern int dcc_lock_fd();
 extern int dcc_locked_fd();
 
 class HostUnlock

@@ -2,174 +2,271 @@
     The daemonless local build bounds concurrency with one fcntl record
     lock per online CPU (dcc_lock_host), and execs the compiler WITHOUT
     forking.  An fcntl record lock survives exec only while its descriptor
-    stays open -- and the lock fd is opened close-on-exec, so until
+    stays open -- and the lock fd is opened close-on-exec, so before
     dcc_lock_keep_across_exec() the slot was released the moment the
     compiler started: a farm-and-daemon outage ran one compiler per JOB
     instead of one per CPU (measured 32 simultaneous compilers on a
     16-CPU host).
 
-    This gate tests the kernel lifetime invariant directly, without
-    compilers or process-name sampling (a sampler can miss a short peak;
-    the first version of the outage harness proved that the hard way):
+    This gate tests the kernel lifetime invariant directly, with no
+    compilers and no process-name sampling, against a PRIVATE two-slot
+    pool (dcc_lock_host_at) in a temporary directory -- it can neither
+    throttle nor be perturbed by real local builds in the shared per-user
+    pool, and it runs in constant time on any machine.
 
-      1. N helpers each take one of the N slots, clear close-on-exec the
-         way build_local now does, and exec a blocking stub.  One helper
-         runs with STDIN CLOSED so its lock lands on descriptor 0 -- the
-         valid fd the first fix skipped with its `> 0` test.
-      2. With all N slots held by EXEC'D processes, an N+1st acquisition
-         must block: if any slot lock died at exec, it completes and the
-         gate fails.
-      3. Killing one stub must unblock the waiter: the bound is the slot
-         pool, not something stricter.
+    Each holder mirrors the production sequence exactly: acquire a slot,
+    dcc_lock_keep_across_exec(), then EXEC -- a re-exec of this very
+    binary in --held mode, whose first act IN THE POST-EXEC IMAGE is to
+    report the inherited lock fd and block.  Readiness is therefore only
+    signalled after the exec the lock must survive.  One holder runs with
+    stdin closed, so its lock rides descriptor 0 -- the valid fd an
+    earlier version of the fix skipped -- and its report proves fd 0
+    really is the lock (asserted on the reported number, not inferred).
+
+      1. two holders take both slots and exec;
+      2. a third acquisition (--waiter) must BLOCK: if either slot's lock
+         died at exec, it completes and the gate fails;
+      3. killing the exec'd holders unblocks the waiter: exit, and
+         nothing less, releases a slot.  (The waiter blocks on a
+         pid-derived slot, so a single targeted kill cannot be asserted;
+         holders are released one at a time and the property claimed is
+         release-on-exit, nothing stronger.)
 */
 
 #include "../client/util.h"
-#include "../services/ncpus.h"
 
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/select.h>
 #include <signal.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <string>
 
 static int failures = 0;
 
 static void check(bool ok, const char *what)
 {
-    if (ok) {
-        printf("ok       - %s\n", what);
-    } else {
-        printf("FAILED   - %s\n", what);
+    printf(ok ? "ok       - %s\n" : "FAILED   - %s\n", what);
+    if (!ok) {
         ++failures;
     }
     fflush(stdout);
 }
 
-/* One byte on the pipe means "I hold my slot (and have exec'd or am about
-   to)".  The stub the holders exec must block forever and touch nothing.  */
-static pid_t spawn_holder(int notify_fd, bool close_stdin)
+/* ---- child modes (post-fork / post-exec images) ----------------------- */
+
+/* --held <notify_fd> <lock_fd>: we are PAST the exec.  Report the lock fd
+   the pre-exec code held and block forever.  */
+static int held_main(int notify_fd, int lock_fd)
 {
-    const pid_t pid = fork();
-    if (pid != 0) {
-        return pid;
+    char buf[16];
+    const int n = snprintf(buf, sizeof(buf), "H%d\n", lock_fd);
+    if (write(notify_fd, buf, n) != n) {
+        _exit(5);
     }
+    for (;;) {
+        pause();
+    }
+}
+
+/* --holder <notify_fd> <dir> <slots> <close_stdin>: acquire exactly as the
+   production wrapper does, then exec ourselves into --held.  */
+static int holder_main(const char *self, int notify_fd, const char *dir,
+                       int slots, bool close_stdin)
+{
     if (close_stdin) {
         close(0);   /* the next open() -- the lock file -- returns fd 0 */
     }
-    if (!dcc_lock_host()) {
+    if (!dcc_lock_host_at(dir, slots)) {
         _exit(3);
     }
     if (!dcc_lock_keep_across_exec()) {
         _exit(4);
     }
-    if (write(notify_fd, "L", 1) != 1) {
-        _exit(5);
-    }
-    /* Exec: the whole point.  If the lock dies here, the slot frees while
-       the "compiler" runs and the waiter below sails through.  */
-    execl("/bin/sleep", "sleep", "600", (char *)nullptr);
+    char fdbuf[16], lockbuf[16];
+    snprintf(fdbuf, sizeof(fdbuf), "%d", notify_fd);
+    snprintf(lockbuf, sizeof(lockbuf), "%d", dcc_lock_fd());
+    execl(self, self, "--held", fdbuf, lockbuf, (char *)nullptr);
     _exit(6);
 }
 
-static bool wait_bytes(int fd, int want, int timeout_sec)
+/* --waiter <notify_fd> <dir> <slots>: block acquiring, then report.  */
+static int waiter_main(int notify_fd, const char *dir, int slots)
 {
-    int got = 0;
-    char c;
-    while (got < want) {
+    if (!dcc_lock_host_at(dir, slots)) {
+        _exit(3);
+    }
+    if (write(notify_fd, "W\n", 2) != 2) {
+        _exit(5);
+    }
+    _exit(0);
+}
+
+/* ---- parent ------------------------------------------------------------ */
+
+static pid_t pids[3] = { -1, -1, -1 };
+static std::string tempdir;
+
+static void cleanup(void)
+{
+    for (int i = 0; i < 3; ++i) {
+        if (pids[i] > 0) {
+            if (kill(pids[i], SIGKILL) != 0 && errno != ESRCH) {
+                perror("kill");
+            }
+            waitpid(pids[i], nullptr, 0);
+            pids[i] = -1;
+        }
+    }
+    if (!tempdir.empty()) {
+        const std::string base = tempdir + "/local_lock";
+        unlink(base.c_str());
+        unlink((base + "1").c_str());
+        rmdir(tempdir.c_str());
+        tempdir.clear();
+    }
+}
+
+static void on_signal(int)
+{
+    cleanup();
+    _exit(2);
+}
+
+/* One newline-terminated report, or empty on timeout.  */
+static std::string read_report(int fd, int timeout_sec)
+{
+    std::string line;
+    for (;;) {
         fd_set rd;
         FD_ZERO(&rd);
         FD_SET(fd, &rd);
         struct timeval tv = { timeout_sec, 0 };
-        const int r = select(fd + 1, &rd, nullptr, nullptr, &tv);
-        if (r <= 0) {
-            return false;
+        if (select(fd + 1, &rd, nullptr, nullptr, &tv) <= 0) {
+            return std::string();
         }
+        char c;
         if (read(fd, &c, 1) != 1) {
-            return false;
+            return std::string();
         }
-        ++got;
+        if (c == '\n') {
+            return line;
+        }
+        line += c;
     }
-    return true;
 }
 
-int main()
+int main(int argc, char **argv)
 {
-    int ncpus = 1;
-    dcc_ncpus(&ncpus);
-    /* The pool size is the box's CPU count; the invariant is the same at
-       any size, and capping keeps the gate cheap on very wide machines.
-       Capping is safe because the surplus slots are NEVER taken: the
-       waiter can only be blocked by the N we hold if the pool arithmetic
-       and lock lifetimes are right for those N.  */
-    printf("# lockexec: slot pool = %d cpus\n", ncpus);
+    if (argc >= 4 && strcmp(argv[1], "--held") == 0) {
+        return held_main(atoi(argv[2]), atoi(argv[3]));
+    }
+    if (argc >= 6 && strcmp(argv[1], "--holder") == 0) {
+        return holder_main(argv[0], atoi(argv[2]), argv[3], atoi(argv[4]),
+                           atoi(argv[5]) != 0);
+    }
+    if (argc >= 5 && strcmp(argv[1], "--waiter") == 0) {
+        return waiter_main(atoi(argv[2]), argv[3], atoi(argv[4]));
+    }
+
+    signal(SIGINT, on_signal);
+    signal(SIGTERM, on_signal);
+
+    char tmpl[] = "/tmp/lockexecXXXXXX";
+    if (!mkdtemp(tmpl)) {
+        perror("mkdtemp");
+        return 2;
+    }
+    tempdir = tmpl;
+    const int SLOTS = 2;
 
     int pipefd[2];
     if (pipe(pipefd) != 0) {
         perror("pipe");
+        cleanup();
         return 2;
     }
 
-    pid_t holders[1024];
-    int nheld = 0;
-    for (int i = 0; i < ncpus && i < 1024; ++i) {
-        /* The FIRST holder runs with stdin closed: its lock fd is 0, the
-           descriptor the original fix's `> 0` guard would have skipped --
-           that regression frees this slot at exec and fails step 2.  */
-        holders[nheld] = spawn_holder(pipefd[1], i == 0);
-        if (holders[nheld] < 0) {
-            perror("fork");
-            return 2;
-        }
-        ++nheld;
-    }
-    check(wait_bytes(pipefd[0], nheld, 30), "every holder acquired a slot (incl. one on fd 0)");
+    char fdbuf[16], slotbuf[16];
+    snprintf(fdbuf, sizeof(fdbuf), "%d", pipefd[1]);
+    snprintf(slotbuf, sizeof(slotbuf), "%d", SLOTS);
 
-    /* All slots are now held by processes that have EXEC'D.  A further
-       acquisition must block.  Run it as a child so a hang cannot wedge
-       the suite: silence for the window IS the pass.  */
-    pid_t waiter = fork();
-    if (waiter == 0) {
-        if (!dcc_lock_host()) {
-            _exit(3);
+    auto spawn = [&](const char *mode, const char *extra) -> pid_t {
+        const pid_t pid = fork();
+        if (pid != 0) {
+            return pid;
         }
-        if (write(pipefd[1], "W", 1) != 1) {
-            _exit(5);
+        if (extra) {
+            execl(argv[0], argv[0], mode, fdbuf, tempdir.c_str(), slotbuf,
+                  extra, (char *)nullptr);
+        } else {
+            execl(argv[0], argv[0], mode, fdbuf, tempdir.c_str(), slotbuf,
+                  (char *)nullptr);
         }
-        _exit(0);
-    }
-    check(!wait_bytes(pipefd[0], 1, 3),
-          "with every slot held by an exec'd process, the next acquisition BLOCKS"
-          " (a byte here means a lock died at exec)");
+        _exit(7);
+    };
 
-    /* Free slots until the waiter completes.  dcc_lock_host blocks on ONE
-       pid-derived slot, and there is no way to know from outside which
-       holder owns it -- killing a single fixed holder unblocked the waiter
-       only when the pids happened to line up (a 1-in-ncpus flake in the
-       first version of this gate).  Killing holders one at a time still
-       proves the property that matters: an exec'd holder's exit -- and
-       nothing less -- is what releases its slot.  The fd-0 holder dies
-       first, so ITS slot is demonstrably released by ITS exit like any
-       other.  */
+    /* 1. two holders; the first with stdin closed.  Reports arrive from
+       the post-exec image and carry the lock fd.  */
+    pids[0] = spawn("--holder", "1");
+    pids[1] = spawn("--holder", "0");
+    if (pids[0] < 0 || pids[1] < 0) {
+        perror("fork");
+        cleanup();
+        return 2;
+    }
+    bool saw_fd0 = false;
+    int reports = 0;
+    for (int i = 0; i < 2; ++i) {
+        const std::string r = read_report(pipefd[0], 30);
+        if (r.size() >= 2 && r[0] == 'H') {
+            ++reports;
+            if (atoi(r.c_str() + 1) == 0) {
+                saw_fd0 = true;
+            }
+        }
+    }
+    check(reports == 2, "both holders reported from their post-exec image");
+    check(saw_fd0, "the stdin-closed holder's lock really rides descriptor 0");
+
+    /* 2. both slots held by exec'd processes: a further acquisition must
+       block.  */
+    pids[2] = spawn("--waiter", nullptr);
+    if (pids[2] < 0) {
+        perror("fork");
+        cleanup();
+        return 2;
+    }
+    check(read_report(pipefd[0], 3).empty(),
+          "with both slots held by exec'd processes, the next acquisition BLOCKS"
+          " (a report here means a lock died at exec)");
+
+    /* 3. release one holder at a time until the waiter frees.  */
     bool unblocked = false;
-    for (int i = 0; i < nheld && !unblocked; ++i) {
-        kill(holders[i], SIGKILL);
-        waitpid(holders[i], nullptr, 0);
-        unblocked = wait_bytes(pipefd[0], 1, 2);
+    for (int i = 0; i < 2 && !unblocked; ++i) {
+        if (pids[i] > 0) {
+            if (kill(pids[i], SIGKILL) != 0 && errno != ESRCH) {
+                perror("kill");
+            }
+            waitpid(pids[i], nullptr, 0);
+            pids[i] = -1;
+        }
+        unblocked = read_report(pipefd[0], 5) == "W";
     }
-    check(unblocked,
-          "killing exec'd holders unblocks the waiter (exit, and nothing less,"
-          " releases a slot)");
-    waitpid(waiter, nullptr, 0);
-
-    for (int i = 0; i < nheld; ++i) {
-        kill(holders[i], SIGKILL);
-        waitpid(holders[i], nullptr, 0);
+    check(unblocked, "killing exec'd holders unblocks the waiter (exit, and"
+                     " nothing less, releases a slot)");
+    if (pids[2] > 0) {
+        waitpid(pids[2], nullptr, 0);
+        pids[2] = -1;
     }
 
+    cleanup();
     if (failures) {
         printf("RESULT: FAIL (%d)\n", failures);
         return 1;

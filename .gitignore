@@ -76,3 +76,5 @@ package_builder/dist/
 /unittests/backpressure
 /unittests/testargs
 /unittests/occupancy
+/unittests/schedgate
+/unittests/sndbuf_shim.so
