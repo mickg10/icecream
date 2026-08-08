@@ -1545,7 +1545,22 @@ int main(int argc, char **argv)
                 return a7 > 0 && a7 < (long long)bigN
                     && a8 > 0 && a8 < (long long)bigN;
             };
-            const bool contended_before = both_active(0);
+            /* Progress-based bracket: the 200ms fixed snapshot assumed the
+               scheduler had already begun admitting the big expansions --
+               false on slower hosts (observed bracket=0/0 with the bigs at
+               3009+3010 by the end), which failed the assertion for the
+               window's EXISTENCE, not for the smalls' placement.  Poll
+               until both expansions have demonstrably begun, bounded.  */
+            bool contended_before = false;
+            {
+                const Clock::time_point tb = Clock::now();
+                while (!contended_before && secs_since(tb) < 30) {
+                    contended_before = both_active(0);
+                    if (!contended_before) {
+                        usleep(200 * 1000);
+                    }
+                }
+            }
             int slow = 0;
             int measured = 0;
             double worst_small = 0;
