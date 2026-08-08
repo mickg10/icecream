@@ -47,6 +47,7 @@
 #include <string.h>
 #include <errno.h>
 #include <string>
+#include <stdint.h>
 
 static int failures = 0;
 
@@ -117,7 +118,8 @@ static pid_t pids[3] = { -1, -1, -1 };
    two are kept synchronized ONLY inside masked transitions -- the mask
    prevents a half-done transition from being observed at all, and the
    sig_atomic_t mirror makes the read itself well-defined.  Zero means "no
-   child"; pids fit in sig_atomic_t (guaranteed >= int range on POSIX).  */
+   child"; publication CHECKS that the pid fits in sig_atomic_t (the
+   standard does not guarantee it, though common hosts satisfy it).  */
 static volatile sig_atomic_t sig_pids[3] = { 0, 0, 0 };
 static std::string tempdir;
 
@@ -139,17 +141,43 @@ static bool block_handled(sigset_t *old)
     return true;
 }
 
-static void unblock_handled(const sigset_t *old)
+static bool unblock_handled(const sigset_t *old)
 {
     if (sigprocmask(SIG_SETMASK, old, nullptr) != 0) {
         perror("sigprocmask");
+        return false;
     }
+    return true;
 }
 
-static void publish(int slot, pid_t pid)
+/* Direct, unmasked last resort: kill everything the handler could see and
+   exit.  Used when a mask transition FAILS -- proceeding would mutate
+   ownership state while claiming a protection that does not exist, so the
+   test refuses instead (and says so).  */
+static void mask_failure_abort(const char *where)
 {
+    fprintf(stderr, "lockexec: %s: mask transition failed; aborting\n", where);
+    for (int i = 0; i < 3; ++i) {
+        const sig_atomic_t p = sig_pids[i];
+        if (p > 0) {
+            kill((pid_t)p, SIGKILL);
+        }
+    }
+    _exit(2);
+}
+
+/* Publish both views.  The pid-to-sig_atomic_t conversion is CHECKED: the
+   standard does not guarantee every pid_t value fits (it happens to on
+   this host), and an unpublishable child must not be half-owned -- the
+   caller kills and reaps it instead.  */
+static bool publish(int slot, pid_t pid)
+{
+    if (pid > 0 && (uintmax_t)pid > (uintmax_t)SIG_ATOMIC_MAX) {
+        return false;
+    }
     pids[slot] = pid;
     sig_pids[slot] = pid > 0 ? (sig_atomic_t)pid : 0;
+    return true;
 }
 
 
@@ -177,7 +205,9 @@ static bool reap(pid_t pid)
 static void cleanup(void)
 {
     sigset_t old;
-    const bool masked = block_handled(&old);
+    if (!block_handled(&old)) {
+        mask_failure_abort("cleanup/block");
+    }
     for (int i = 0; i < 3; ++i) {
         if (pids[i] > 0) {
             if (kill(pids[i], SIGKILL) != 0 && errno != ESRCH) {
@@ -188,8 +218,8 @@ static void cleanup(void)
             }
         }
     }
-    if (masked) {
-        unblock_handled(&old);
+    if (!unblock_handled(&old)) {
+        mask_failure_abort("cleanup/restore");
     }
     if (!tempdir.empty()) {
         const std::string base = tempdir + "/local_lock";
@@ -277,17 +307,27 @@ int main(int argc, char **argv)
     auto spawn = [&](int slot, const char *mode, const char *extra) -> pid_t {
         sigset_t old;
         if (!block_handled(&old)) {
-            return -1;    // unprotected transition: refuse to fork at all
+            mask_failure_abort("spawn/block");
         }
         const pid_t pid = fork();
         if (pid != 0) {
-            if (pid > 0) {
-                publish(slot, pid);    // both views, under the mask
+            if (pid > 0 && !publish(slot, pid)) {
+                /* Out of sig_atomic_t range: refuse half-ownership.  */
+                kill(pid, SIGKILL);
+                while (waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {
+                }
+                unblock_handled(&old);
+                return -1;
             }
             unblock_handled(&old);
             return pid;
         }
-        unblock_handled(&old);
+        /* Child: a mask that cannot be restored must stop HERE -- exec'ing
+           with SIGINT/SIGTERM still blocked would break the very lifecycle
+           the parent relies on.  */
+        if (sigprocmask(SIG_SETMASK, &old, nullptr) != 0) {
+            _exit(8);
+        }
         if (extra) {
             execl(argv[0], argv[0], mode, fdbuf, tempdir.c_str(), slotbuf,
                   extra, (char *)nullptr);
@@ -338,15 +378,17 @@ int main(int argc, char **argv)
     for (int i = 0; i < 2 && !unblocked; ++i) {
         if (pids[i] > 0) {
             sigset_t old;
-            const bool masked = block_handled(&old);
+            if (!block_handled(&old)) {
+                mask_failure_abort("release/block");
+            }
             if (kill(pids[i], SIGKILL) != 0 && errno != ESRCH) {
                 perror("kill");
             }
             if (reap(pids[i])) {
                 publish(i, -1);
             }
-            if (masked) {
-                unblock_handled(&old);
+            if (!unblock_handled(&old)) {
+                mask_failure_abort("release/restore");
             }
         }
         unblocked = read_report(pipefd[0], 5) == "W";
@@ -355,12 +397,14 @@ int main(int argc, char **argv)
                      " nothing less, releases a slot)");
     {
         sigset_t old;
-        const bool masked = block_handled(&old);
+        if (!block_handled(&old)) {
+            mask_failure_abort("waiter-reap/block");
+        }
         if (pids[2] > 0 && reap(pids[2])) {
             publish(2, -1);
         }
-        if (masked) {
-            unblock_handled(&old);
+        if (!unblock_handled(&old)) {
+            mask_failure_abort("waiter-reap/restore");
         }
     }
 
