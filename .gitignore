@@ -58,3 +58,4 @@ compile_commands.json
 /unittests/lockexec
 *.log
 *.trs
+/unittests/occupancy
