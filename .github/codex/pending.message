@@ -1,0 +1,12 @@
+formal: import and exhaustively check assignment ownership cores
+
+Issue #4 formal baseline.
+
+Import only formal/ from bigoracle/assignment-fence-core-round2 at
+18e4c6a. No product, UI, packaging, or deployment history is merged.
+
+Run the official TLC v1.7.4 tool on eight fixed configurations and require
+twenty named mutant configurations to emit JSON counterexamples. Run five
+deterministic reference constructors against committed expected output.
+Retain tool hashes, Java version, commands, per-model logs, state counts,
+elapsed times, summaries, and traces under formal/gatelogs/.
