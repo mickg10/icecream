@@ -3081,8 +3081,13 @@ static bool handle_line(CompileServer *cs, Msg *_m)
     if (internals_txn.active
             && cs->fd == internals_txn.control_fd
             && cs->connectionGeneration() == internals_txn.control_generation) {
-        internals_snapshot("active-control-reissued");
+        /* Record the reason and clear the txn FIRST (so handle_end's own
+           internals settlement sees it inactive and does not overwrite the
+           reason), then fail the exact control channel: returning false to
+           the drain loop means "the handler already deleted it", so we must
+           actually delete it via handle_end.  */
         internals_txn_clear("active-control-reissued");
+        handle_end(cs, nullptr);
         return false;
     }
     TextMsg *m = dynamic_cast<TextMsg *>(_m);

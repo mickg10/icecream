@@ -345,6 +345,14 @@ static long long query_control_field(int port, const char *command,
     return parse_field_ll(line.c_str() + sp + strlen(field));
 }
 
+/* Full COMPLETE control reply text (or empty on failure) -- for reading
+   the internals snapshot fields.  */
+static std::string control_dump(int port, const char *command)
+{
+    const CtrlReply r = ctrl_exchange(port, command);
+    return r.status == CtrlReply::COMPLETE ? r.text : std::string();
+}
+
 static long long query_control_count(int port, const char *command, const char *needle_str)
 {
     const CtrlReply r = ctrl_exchange(port, command);
@@ -617,7 +625,16 @@ int main(int argc, char **argv)
        STATUS_TEXT handler's same-turn recheck -- so this deterministically
        isolates that fix.  */
     const bool internalsrace_mode = argc > 5 && strcmp(argv[5], "internalsrace") == 0;
+
     if (internalsrace_mode) {
+        setenv("ICECC_TEST_INTERNALS_NO_TICK_PROMOTE", "1", 1);
+    }
+    /* "internalsguard": the active control issues a SECOND command mid
+       fan-out; the same-control guard must fail its exact generation (its
+       reply would otherwise bypass the reserved-tail accounting).  Keep
+       the txn alive with the no-tick-promote knob + a silent worker.  */
+    const bool internalsguard_mode = argc > 5 && strcmp(argv[5], "internalsguard") == 0;
+    if (internalsguard_mode) {
         setenv("ICECC_TEST_INTERNALS_NO_TICK_PROMOTE", "1", 1);
     }
     /* "retention": the proof that Stage-A retention is CORRECT, not merely
@@ -1071,7 +1088,8 @@ int main(int argc, char **argv)
            connection stays (the scheduler keeps a second submitter), the
            traffic parks.  */
         if (leastbusy_mode || retention_mode || teardown_mode || internalsuaf_mode
-                || duplocal_mode || exhaust_mode || internalsrace_mode) {
+                || duplocal_mode || exhaust_mode || internalsrace_mode
+                || internalsguard_mode) {
             while (!shutdown) {
                 usleep(100 * 1000);
             }
@@ -3263,6 +3281,84 @@ int main(int argc, char **argv)
         delete sub; delete sub2; delete cs;
         kill(sched, SIGTERM);
         waitpid(sched, nullptr, 0);
+        if (failures) { fprintf(stderr, "RESULT: FAIL (%d)\n", failures); return 1; }
+        fprintf(stderr, "RESULT: PASS\n");
+        return 0;
+    }
+
+    if (internalsguard_mode) {
+        MsgChannel *w = connect_daemon(port, 0);
+        REQUIRE(w != nullptr, "guard worker connected");
+        if (w) {
+            LoginMsg login(10276, "fguard", kPlatform, 0);
+            login.envs.push_back(std::make_pair(kPlatform, kEnv));
+            login.max_kids = 4;
+            REQUIRE(w->send_msg(login), "guard worker logged in");
+            StatsMsg st; w->send_msg(st);
+        }
+        usleep(400 * 1000);
+        REQUIRE(query_submitter_field(port, "fguard", "jobs=") >= 0,
+                "guard worker logged in before the fan-out");
+
+        const int ictrl = tcp_connect(port + 1, 0);
+        REQUIRE(ictrl >= 0, "guard control connected");
+        { char g[256]; struct pollfd gp = { ictrl, POLLIN, 0 };
+          if (poll(&gp,1,3000)>0){ ssize_t z=read(ictrl,g,sizeof(g)); (void)z; } }
+        { const char *icmd = "internals fguard\n";
+          REQUIRE(write(ictrl, icmd, strlen(icmd)) == (ssize_t)strlen(icmd),
+                  "internals command sent"); }
+        usleep(400 * 1000);   /* txn active (no-tick-promote, silent worker) */
+
+        /* Re-issue a DIFFERENT command on the SAME control while its
+           transaction is live: the guard must fail this exact control.  */
+        { const char *c2 = "listcs\n";
+          (void)!write(ictrl, c2, strlen(c2)); }
+
+        /* The active control connection must be closed (EOF) by the guard.  */
+        bool closed = false;
+        {
+            const Clock::time_point t0 = Clock::now();
+            char b[4096];
+            while (!closed && secs_since(t0) < 8) {
+                struct pollfd rp = { ictrl, POLLIN, 0 };
+                if (poll(&rp,1,200) <= 0) { continue; }
+                const ssize_t n = read(ictrl, b, sizeof(b)-1);
+                if (n <= 0) { closed = true; }
+            }
+        }
+        REQUIRE(closed,
+                "the active control that re-issued a command mid-transaction"
+                " was failed (its reply would bypass the reserved-tail bound)");
+
+        /* A SEPARATE control confirms the settlement reason via the snapshot.  */
+        {
+            std::string reason;
+            const Clock::time_point t0 = Clock::now();
+            while (reason.empty() && secs_since(t0) < 8) {
+                const std::string dump = control_dump(port, "listjobs");
+                const size_t p2 = dump.find("internals_last_reason=");
+                if (p2 != std::string::npos) {
+                    const size_t st = p2 + strlen("internals_last_reason=");
+                    const size_t en = dump.find_first_of(" \n", st);
+                    reason = dump.substr(st, en == std::string::npos ? std::string::npos : en - st);
+                }
+                if (reason.empty() || reason == "") { usleep(200*1000); }
+            }
+            REQUIRE(reason == "active-control-reissued",
+                    "the settlement snapshot records the same-control violation");
+        }
+        REQUIRE(waitpid(sched, nullptr, WNOHANG) == 0, "scheduler alive");
+        REQUIRE(!probe_died.load(), "control probe never lost the scheduler");
+
+        close(ictrl);
+        shutdown = true;
+        probe_thread.join(); cs_thread.join(); healthy_thread.join();
+        close(ctrl);
+        delete w; delete sub; delete sub2; delete cs;
+        kill(sched, SIGTERM);
+        int st = -1;
+        REQUIRE(waitpid(sched, &st, 0) == sched, "scheduler reaped");
+        REQUIRE(WIFEXITED(st) && WEXITSTATUS(st) == 0, "clean shutdown");
         if (failures) { fprintf(stderr, "RESULT: FAIL (%d)\n", failures); return 1; }
         fprintf(stderr, "RESULT: PASS\n");
         return 0;
