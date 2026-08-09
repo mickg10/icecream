@@ -1,0 +1,79 @@
+{
+  "schema": 1,
+  "scenario": "AssignmentFenceNetworkF2SBypassMutant",
+  "property": "F2SStrictlyIncreasing",
+  "expected_result": "counterexample",
+  "min_states": 6,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "SPrepare.a0",
+      "all": [
+        {"path": "phase.a0", "from": "Absent", "to": "PrepareQueued"}
+      ]
+    },
+    {
+      "name": "FQueueReady.a0",
+      "all": [
+        {"path": "phase.a0", "from": "PrepareQueued", "to": "Prepared"},
+        {"path": "f2s", "len_delta": 1}
+      ]
+    },
+    {
+      "name": "SQueueRevokeBehindReady.a0",
+      "all": [
+        {"path": "phase.a0", "from": "Prepared", "to": "RevokeQueued"},
+        {"path": "s2f", "len_delta": 1}
+      ]
+    },
+    {
+      "name": "FQueueRevokedBehindReady.a0",
+      "all": [
+        {"path": "revokedEnqueued.a0", "from": false, "to": true},
+        {"path": "f2s", "len_delta": 1}
+      ]
+    },
+    {
+      "name": "SConsumeSecondF2SFrameFirst.a0",
+      "all": [
+        {"path": "lastF2SConsumed", "delta_gt": 1},
+        {"path": "released.a0", "from": false, "to": true},
+        {"path": "f2s", "len_delta": -1}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "SPrepare.a0",
+    "FQueueReady.a0",
+    "SQueueRevokeBehindReady.a0",
+    "FQueueRevokedBehindReady.a0",
+    "SConsumeSecondF2SFrameFirst.a0"
+  ],
+  "final_all": [
+    {"path": "lastF2SConsumed", "eq": 2},
+    {"path": "released.a0", "eq": true},
+    {"path": "f2s", "to_len": 1}
+  ],
+  "harness_steps": [
+    {
+      "after": "FQueueReady.a0",
+      "emit": "hold_ready_as_fifo_predecessor",
+      "actor": "transport"
+    },
+    {
+      "after": "FQueueRevokedBehindReady.a0",
+      "emit": "queue_revoked_behind_ready",
+      "actor": "worker"
+    },
+    {
+      "after": "SConsumeSecondF2SFrameFirst.a0",
+      "emit": "assert_scheduler_consumed_revoked_before_ready",
+      "actor": "scheduler"
+    }
+  ],
+  "metadata": {
+    "module": "AssignmentFenceNetwork",
+    "config": "AssignmentFenceNetworkF2SBypassMutant.cfg",
+    "mutant": "MutantF2SBypass = TRUE"
+  }
+}
