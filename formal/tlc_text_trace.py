@@ -9,8 +9,12 @@ sequences, sets, records/functions, and ``:>``/``@@`` function constructors.
 
 The converter is fail-closed: every state must contain assignments, delimiters
 must balance, input must be fully consumed, and duplicate variables are an
-error.  It does not infer actions; trace_to_harness.py classifies adjacent
-state records with a declarative manifest after conversion.
+error.  A continuation line is consumed only while the current TLA+ value is
+structurally incomplete.  Once a value parses completely, the first
+non-assignment top-level line ends the state block; TLC statistics and footer
+text therefore cannot be swallowed into the last variable.  The converter
+does not infer actions: trace_to_harness.py classifies adjacent state records
+with a declarative manifest after conversion.
 """
 
 from __future__ import annotations
@@ -26,6 +30,10 @@ from typing import Any, Sequence
 
 class TLCTextTraceError(RuntimeError):
     """The retained TLC text is not a complete parseable state trace."""
+
+
+class TLCTextTraceIncomplete(TLCTextTraceError):
+    """A syntactically valid TLA+ value prefix needs more input."""
 
 
 @dataclass(frozen=True)
@@ -54,6 +62,13 @@ class _ValueParser:
             f"{message} at offset {self.pos}: {self.text[left:right]!r}"
         )
 
+    def incomplete(self, message: str) -> TLCTextTraceIncomplete:
+        left = max(0, self.pos - 30)
+        right = min(len(self.text), self.pos + 50)
+        return TLCTextTraceIncomplete(
+            f"{message} at offset {self.pos}: {self.text[left:right]!r}"
+        )
+
     def skip_ws(self) -> None:
         while self.pos < len(self.text) and self.text[self.pos].isspace():
             self.pos += 1
@@ -64,6 +79,8 @@ class _ValueParser:
     def consume(self, token: str) -> None:
         self.skip_ws()
         if not self.starts(token):
+            if self.pos >= len(self.text):
+                raise self.incomplete(f"expected {token!r}")
             raise self.error(f"expected {token!r}")
         self.pos += len(token)
 
@@ -77,7 +94,7 @@ class _ValueParser:
     def parse_value(self) -> Any:
         self.skip_ws()
         if self.pos >= len(self.text):
-            raise self.error("expected a TLA+ value")
+            raise self.incomplete("expected a TLA+ value")
         if self.starts("<<"):
             return self.parse_sequence()
         char = self.text[self.pos]
@@ -110,7 +127,7 @@ class _ValueParser:
                     return json.loads(literal)
                 except json.JSONDecodeError as exc:
                     raise self.error(f"invalid TLC string literal: {exc}") from exc
-        raise self.error("unterminated string literal")
+        raise self.incomplete("unterminated string literal")
 
     def parse_number_or_bare(self) -> Any:
         start = self.pos
@@ -236,39 +253,84 @@ def parse_tla_value(text: str) -> Any:
     return _ValueParser(text).parse()
 
 
-def _flush_assignment(
-    state: dict[str, Any], variable: str | None, fragments: list[str], ordinal: int
-) -> None:
-    if variable is None:
-        return
-    if variable in state:
-        raise TLCTextTraceError(f"state {ordinal}: duplicate variable {variable!r}")
-    value_text = " ".join(fragment.strip() for fragment in fragments).strip()
-    if not value_text:
-        raise TLCTextTraceError(f"state {ordinal}: variable {variable!r} has no value")
-    try:
-        state[variable] = parse_tla_value(value_text)
-    except TLCTextTraceError as exc:
-        raise TLCTextTraceError(
-            f"state {ordinal}, variable {variable}: {exc}"
-        ) from exc
-
-
 def _parse_state_block(ordinal: int, lines: list[str]) -> dict[str, Any]:
     state: dict[str, Any] = {}
     variable: str | None = None
     fragments: list[str] = []
+    incomplete_error: TLCTextTraceIncomplete | None = None
+
+    def try_complete_assignment() -> bool:
+        nonlocal variable, fragments, incomplete_error
+        if variable is None:
+            return True
+        value_text = " ".join(fragment.strip() for fragment in fragments).strip()
+        if not value_text:
+            incomplete_error = TLCTextTraceIncomplete(
+                f"state {ordinal}: variable {variable!r} has no value"
+            )
+            return False
+        try:
+            value = parse_tla_value(value_text)
+        except TLCTextTraceIncomplete as exc:
+            incomplete_error = exc
+            return False
+        except TLCTextTraceError as exc:
+            raise TLCTextTraceError(
+                f"state {ordinal}, variable {variable}: {exc}"
+            ) from exc
+        if variable in state:
+            raise TLCTextTraceError(
+                f"state {ordinal}: duplicate variable {variable!r}"
+            )
+        state[variable] = value
+        variable = None
+        fragments = []
+        incomplete_error = None
+        return True
+
     for line in lines:
         match = _ASSIGN_RE.match(line)
         if match:
-            _flush_assignment(state, variable, fragments, ordinal)
+            if variable is not None:
+                raise TLCTextTraceError(
+                    f"state {ordinal}, variable {variable}: value is incomplete "
+                    f"before the next assignment: {incomplete_error}"
+                )
             variable = match.group(1)
             fragments = [match.group(2)]
-        elif variable is not None:
-            stripped = line.strip()
-            if stripped and not stripped.startswith("Error:"):
+            try_complete_assignment()
+            continue
+
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        if variable is not None:
+            if line[:1].isspace():
                 fragments.append(stripped)
-    _flush_assignment(state, variable, fragments, ordinal)
+                try_complete_assignment()
+                continue
+            raise TLCTextTraceError(
+                f"state {ordinal}, variable {variable}: value is incomplete "
+                f"before top-level line {stripped!r}: {incomplete_error}"
+            )
+
+        # A complete assignment has no reason to consume arbitrary indented
+        # text.  Top-level text is TLC's statistics/footer and ends this
+        # state block.  Unexpected indented text is rejected rather than
+        # silently changing the preceding value.
+        if not line[:1].isspace():
+            break
+        raise TLCTextTraceError(
+            f"state {ordinal}: unexpected continuation after a complete "
+            f"assignment: {stripped!r}"
+        )
+
+    if variable is not None:
+        raise TLCTextTraceError(
+            f"state {ordinal}, variable {variable}: incomplete value at end "
+            f"of state: {incomplete_error}"
+        )
     if not state:
         raise TLCTextTraceError(f"state {ordinal}: no /\\ variable assignments found")
     return state
