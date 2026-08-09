@@ -524,7 +524,8 @@ struct InternalsTxn {
     uint64_t deadline_mono = 0;          // reply-collection deadline
     uint64_t output_deadline_mono = 0;   // absolute control-output deadline
     uint64_t final_frame_seq = 0;
-    size_t retained_bytes = 0;
+    size_t retained_bytes = 0;   // whole-transaction wire bytes emitted
+    bool payload_omitted = false;   // any worker payload dropped/truncated
     std::vector<InternalsTarget> targets;
 };
 static InternalsTxn internals_txn;
@@ -563,7 +564,7 @@ static size_t internals_wire_len(const std::string &text)
 
 /* Reserve enough headroom under the control cap that the terminal frame
    and one omission marker can ALWAYS be queued after the data rows.  */
-static const size_t kInternalsTermReserve = 256;
+static const size_t kInternalsTermReserve = 128;   /* >= wire("[some worker output omitted...]\n") + wire("200 done") */
 
 static InternalsSend internals_emit(CompileServer *control, const std::string &text,
                                     size_t cap)
@@ -586,6 +587,7 @@ static void internals_txn_clear()
     internals_txn.control_fd = -1;
     internals_txn.targets.clear();
     internals_txn.retained_bytes = 0;
+    internals_txn.payload_omitted = false;
 }
 
 static bool internals_txn_all_terminal()
@@ -616,7 +618,6 @@ static void internals_txn_finalize()
        the terminal (and one omission marker) can always be queued.  */
     const size_t data_cap = kInternalsControlPendingCap > kInternalsTermReserve
         ? kInternalsControlPendingCap - kInternalsTermReserve : 0;
-    bool omitted = false;
     for (const InternalsTarget &t : txn.targets) {
         const char *why = nullptr;
         switch (t.state) {
@@ -631,33 +632,36 @@ static void internals_txn_finalize()
             why = " disconnected before reporting\n";
             break;
         }
-        switch (internals_emit(control, t.node_name + why, data_cap)) {
-        case ISEND_QUEUED:
-            break;
-        case ISEND_DROPPED:
-            omitted = true;
-            break;
-        case ISEND_ERROR:
-            handle_end(control, nullptr);   /* hard failure: settle control */
-            return;
-        }
-    }
-    if (omitted) {
-        /* One deterministic omission marker (the reserve guarantees room).  */
-        if (internals_emit(control, string("[rows omitted: control output bound]\n"),
-                           kInternalsControlPendingCap) == ISEND_ERROR) {
+        /* SEMANTIC result rows, not optional payload: a DROP means the
+           control cannot receive a complete response, so fail its exact
+           generation -- never silently omit a required row.  */
+        const std::string srow = t.node_name + why;
+        if (internals_emit(control, srow, data_cap) != ISEND_QUEUED) {
             handle_end(control, nullptr);
             return;
         }
+        txn.retained_bytes += internals_wire_len(srow);
     }
-    /* The terminal is NEVER a droppable row.  If it cannot be queued, the
+    /* Exactly ONE deterministic omission marker for the whole transaction
+       if any worker payload was dropped or truncated -- required (not
+       droppable), and the terminal reserve guarantees room.  */
+    if (txn.payload_omitted) {
+        const std::string mark = "[some worker output omitted: control output bound]\n";
+        if (internals_emit(control, mark, kInternalsControlPendingCap) != ISEND_QUEUED) {
+            handle_end(control, nullptr);
+            return;
+        }
+        txn.retained_bytes += internals_wire_len(mark);
+    }
+    /* The terminal is NEVER a droppable row.  If it cannot be queued the
        control cannot receive a complete response: fail its exact
        generation instead of clearing the transaction as if done.  */
-    if (internals_emit(control, string("200 done"),
-                       kInternalsControlPendingCap) != ISEND_QUEUED) {
+    const std::string term = "200 done";
+    if (internals_emit(control, term, kInternalsControlPendingCap) != ISEND_QUEUED) {
         handle_end(control, nullptr);
         return;
     }
+    txn.retained_bytes += internals_wire_len(term);
     txn.final_frame_seq = control->framesQueued();
     txn.final_pending = true;
 }
@@ -3211,11 +3215,20 @@ static bool handle_line(CompileServer *cs, Msg *_m)
                false so the drain loop deletes this channel -- the existing
                control contract; we must NOT delete it here and then return
                to a caller that still holds it.  */
-            if (internals_emit(cs, string("500 internals busy\n"),
-                               kInternalsControlPendingCap) == ISEND_ERROR
-                    || internals_emit(cs, string("200 done"),
-                                      kInternalsControlPendingCap) != ISEND_QUEUED) {
-                return false;   /* drain loop deletes this channel */
+            {
+                /* Atomic: reserve BOTH lines' exact wire bytes before
+                   emitting either, so the concurrent control never gets a
+                   busy row without its terminal.  */
+                const std::string busy = "500 internals busy\n";
+                const std::string term = "200 done";
+                const size_t need = internals_wire_len(busy) + internals_wire_len(term);
+                if (cs->pending_bytes() + need > kInternalsControlPendingCap) {
+                    return false;   /* cannot fit the whole response: drop the connection */
+                }
+                if (internals_emit(cs, busy, kInternalsControlPendingCap) != ISEND_QUEUED
+                        || internals_emit(cs, term, kInternalsControlPendingCap) != ISEND_QUEUED) {
+                    return false;
+                }
             }
             return true;
         }
@@ -3601,37 +3614,34 @@ static bool handle_activity(CompileServer *cs)
                    deterministic omission marker; a hard ERROR settles the
                    control's exact generation.  */
                 std::string text = static_cast<StatusTextMsg*>(m)->text;
-                bool truncated = false;
                 if (text.size() > kInternalsPerTargetCap) {
                     text.resize(kInternalsPerTargetCap);
-                    truncated = true;
-                }
-                const size_t retain_room = kInternalsRetainedCap > internals_txn.retained_bytes
-                    ? kInternalsRetainedCap - internals_txn.retained_bytes : 0;
-                if (internals_wire_len(text) > retain_room) {
-                    text.resize(text.size() < retain_room ? text.size() : retain_room);
-                    truncated = true;
+                    internals_txn.payload_omitted = true;   /* truncated payload */
                 }
                 const size_t data_cap = kInternalsControlPendingCap > kInternalsTermReserve
                     ? kInternalsControlPendingCap - kInternalsTermReserve : 0;
                 std::string row = hit->node_name + ": " + text;
                 if (row.empty() || row[row.size() - 1] != '\n') { row += '\n'; }
                 bool fail = false;
-                switch (internals_emit(control, row, data_cap)) {
-                case ISEND_QUEUED:
-                    internals_txn.retained_bytes += internals_wire_len(row);
-                    break;
-                case ISEND_DROPPED:
-                    truncated = true;
-                    break;
-                case ISEND_ERROR:
-                    fail = true;
-                    break;
-                }
-                if (!fail && truncated) {
-                    if (internals_emit(control, hit->node_name + " [output truncated]\n",
-                                       kInternalsControlPendingCap) == ISEND_ERROR) {
+                /* Optional worker PAYLOAD: bounded against BOTH the
+                   whole-transaction wire budget and the data cap.  A drop
+                   just sets the transaction-level omission flag -- ONE
+                   deterministic marker is emitted at finalize, never one
+                   per target -- and the retained counter accrues only what
+                   was actually queued.  */
+                if (internals_txn.retained_bytes + internals_wire_len(row) > kInternalsRetainedCap) {
+                    internals_txn.payload_omitted = true;   /* whole-txn budget */
+                } else {
+                    switch (internals_emit(control, row, data_cap)) {
+                    case ISEND_QUEUED:
+                        internals_txn.retained_bytes += internals_wire_len(row);
+                        break;
+                    case ISEND_DROPPED:
+                        internals_txn.payload_omitted = true;
+                        break;
+                    case ISEND_ERROR:
                         fail = true;
+                        break;
                     }
                 }
                 if (fail) {
