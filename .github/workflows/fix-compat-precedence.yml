@@ -1,5 +1,6 @@
 name: fix-compat-precedence-once
 
+# This file is removed immediately after its single count-checked model commit.
 on:
   push:
     branches:
@@ -18,7 +19,7 @@ jobs:
         with:
           ref: bigoracle/compatibility-formal
           fetch-depth: 0
-      - name: Parenthesize six intended boolean assignments
+      - name: Parenthesize intended boolean assignments
         run: |
           python3 - <<'PY'
           from pathlib import Path
@@ -41,8 +42,6 @@ jobs:
               "seenFenced /\\ seenToken":
                   "(seenFenced /\\ seenToken)",
           }
-          # The first five are assignments; the final two are explicit
-          # negated conjunction operands. Every source fragment must be unique.
           for old, new in replacements.items():
               count = text.count(old)
               if count != 1:
