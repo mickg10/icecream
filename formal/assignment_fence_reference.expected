@@ -1,0 +1,19 @@
+PASS                        AssignmentFenceCoreFixed (55 states)
+EXPECTED_COUNTEREXAMPLE     P50MixedFleetMutant (11 states)
+  trace: Prepare(0) -> ClaimLegacy(0,1)
+  property: TokenRequiredExactness[0]
+EXPECTED_COUNTEREXAMPLE     ReleaseClaimedMutant (21 states)
+  trace: Prepare(0) -> ClaimToken(0,0) -> ConsumeRevoke(0)
+  property: ReleaseSafety[0]
+PASS                        P49DefaultDenyAfterCompaction (5 states)
+EXPECTED_COUNTEREXAMPLE     P49FiniteTombstoneDefaultAllow (6 states)
+  trace: Prepare -> FenceAndRevoke -> ConsumeREVOKED -> ForgetTombstone -> DelayedLegacyClaim
+  property: ReleaseSafety
+PASS                        UseCSExactHandoff (4 states)
+EXPECTED_COUNTEREXAMPLE     UseCSExactHandoffMutant (4 states)
+  trace: ReceiveUseCS -> FailFrameAndSendAliasCancel
+  property: FailedFrameEventuallySettles
+PASS                        FSessionExactQuiescence (4 states)
+EXPECTED_COUNTEREXAMPLE     FSessionWrongChildReap (4 states)
+  trace: LoseSchedulerSession -> waitpid(-1)-reaps-writer -> AdvertiseNewSession
+  property: PriorSessionQuiescedBeforeAdvertise
