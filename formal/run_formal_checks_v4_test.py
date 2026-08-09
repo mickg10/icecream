@@ -280,6 +280,72 @@ G ==
             ),
         )
 
+    @staticmethod
+    def _differential_result(
+        toolchain: str,
+        event_sequence: list[str],
+        *,
+        emitted_step: str = "barrier_after_a",
+    ) -> dict[str, object]:
+        return {
+            "id": "mutant",
+            "toolchain": toolchain,
+            "expected": "counterexample",
+            "property": "SafetyProperty",
+            "stats": {
+                "generated_states": 40,
+                "distinct_states": 25,
+                "depth": 7,
+            },
+            "trace_adapter": {
+                "property": "SafetyProperty",
+                "expected_result": "counterexample",
+                "trace": {"state_count": len(event_sequence) + 1},
+                "event_sequence": event_sequence,
+                "required_subsequence": ["A", "B"],
+                "harness_steps": [
+                    {
+                        "after_event": "A",
+                        "event_transition_index": event_sequence.index("A") + 1,
+                        "emit": emitted_step,
+                        "actor": "scheduler",
+                    }
+                ],
+                "lasso": None,
+            },
+        }
+
+    def test_differential_compare_allows_nonessential_trace_prefix_differences(self) -> None:
+        stable = self._differential_result("stable", ["X", "A", "B"])
+        differential = self._differential_result(
+            "differential", ["A", "Y", "B"]
+        )
+        comparisons = module.differential_compare([stable, differential])
+        self.assertEqual(len(comparisons), 1)
+        self.assertEqual(comparisons[0]["status"], "MATCH")
+        self.assertEqual(comparisons[0]["essential_subsequence"], ["A", "B"])
+        self.assertFalse(comparisons[0]["full_event_sequences_match"])
+        self.assertEqual(
+            comparisons[0]["semantic_harness_steps"],
+            [
+                {
+                    "after_event": "A",
+                    "emit": "barrier_after_a",
+                    "actor": "scheduler",
+                }
+            ],
+        )
+
+    def test_differential_compare_rejects_semantic_harness_disagreement(self) -> None:
+        stable = self._differential_result("stable", ["A", "B"])
+        differential = self._differential_result(
+            "differential",
+            ["A", "B"],
+            emitted_step="different_barrier",
+        )
+        with self.assertRaisesRegex(v2.FormalRunError, "harness-step disagreement"):
+            module.differential_compare([stable, differential])
+
     def test_tlaps_generated_files_are_isolated_from_source_checkout(self) -> None:
         repo = self.root / "repo"
         formal = repo / "formal"
