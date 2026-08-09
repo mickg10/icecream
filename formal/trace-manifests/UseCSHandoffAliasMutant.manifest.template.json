@@ -18,7 +18,7 @@
       "name": "FailBeforeExactIdSnapshot",
       "all": [
         {"path": "phase", "from": "Forwarding", "to": "ExactAbortPending"},
-        {"path": "failureObservedAt", "from": "NO_FAILURE", "to": 0},
+        {"path": "failureObservedAt", "from": 4, "to": 0},
         {"path": "exactIdKnown", "to": false}
       ]
     },
@@ -65,6 +65,7 @@
     "mutants": [
       "MutantStoreIdAfterWrite = TRUE",
       "MutantUseLocalAliasOnFailure = TRUE"
-    ]
+    ],
+    "no_failure_sentinel": 4
   }
 }
