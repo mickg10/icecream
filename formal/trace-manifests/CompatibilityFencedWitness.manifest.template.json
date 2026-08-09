@@ -1,0 +1,40 @@
+{
+  "schema": 1,
+  "scenario": "CompatibilityFencedWitness",
+  "property": "NoFencedAssignmentSeen",
+  "expected_result": "counterexample",
+  "min_states": 3,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "ObserveFencedLegacyAssignment",
+      "all": [
+        {"path": "seenFenced", "from": false, "to": true},
+        {"path": "policy", "from": "None", "to": "FencedLegacy"},
+        {"path": "expectedPolicy", "from": "None", "to": "FencedLegacy"},
+        {"path": "guarantee", "from": "None", "to": "EpochScoped"},
+        {"path": "phase", "from": "Requested", "to": "Assigned"},
+        {"path": "projectedTrace", "len_delta": 1}
+      ]
+    }
+  ],
+  "required_subsequence": ["ObserveFencedLegacyAssignment"],
+  "final_all": [
+    {"path": "seenFenced", "eq": true},
+    {"path": "policy", "eq": "FencedLegacy"},
+    {"path": "guarantee", "eq": "EpochScoped"},
+    {"path": "oldClientSawToken", "eq": false}
+  ],
+  "harness_steps": [
+    {
+      "after": "ObserveFencedLegacyAssignment",
+      "emit": "assert_old_client_uses_epoch_scoped_worker_fence_without_token_field",
+      "actor": "scheduler"
+    }
+  ],
+  "metadata": {
+    "module": "MixedVersionCompatibilityChecked",
+    "configs": ["CompatibilityFencedNewFOldCWitness.cfg"],
+    "witness": "A new worker with an old client selects FencedLegacy, not Token."
+  }
+}
