@@ -525,6 +525,7 @@ struct InternalsTxn {
     uint64_t output_deadline_mono = 0;   // absolute control-output deadline
     uint64_t final_frame_seq = 0;
     size_t retained_bytes = 0;   // whole-transaction wire bytes emitted
+    size_t peak_pending = 0;        // max control pending bytes observed
     bool payload_omitted = false;   // any worker payload dropped/truncated
     std::vector<InternalsTarget> targets;
 };
@@ -574,6 +575,9 @@ static InternalsSend internals_emit(CompileServer *control, const std::string &t
                            MsgChannel::SendNonBlocking | MsgChannel::SendDeferrable)) {
         return ISEND_ERROR;
     }
+    if (control->pending_bytes() > internals_txn.peak_pending) {
+        internals_txn.peak_pending = control->pending_bytes();
+    }
     return ISEND_QUEUED;
 }
 
@@ -608,6 +612,7 @@ static void internals_txn_clear()
     internals_txn.control_fd = -1;
     internals_txn.targets.clear();
     internals_txn.retained_bytes = 0;
+    internals_txn.peak_pending = 0;
     internals_txn.payload_omitted = false;
 }
 
@@ -3094,7 +3099,7 @@ static bool handle_line(CompileServer *cs, Msg *_m)
     } else if (cmd == "listjobs") {
         const bool verbose = !l.empty() && (l.front() == "v" || l.front() == "verbose");
         {
-            char summary[512];
+            char summary[768];
             snprintf(summary, sizeof(summary),
                      " detached_terminal_rejects=%lu nonwaiting_begin_rejects=%lu"
                      " dup_local_begin=%lu id_release_violations=%lu"
@@ -3102,7 +3107,9 @@ static bool handle_line(CompileServer *cs, Msg *_m)
                      " prelogin_current=%u prelogin_max=%u prelogin_expired=%lu"
                      " prelogin_rejected=%lu prelogin_completed=%lu accepts_deferred=%lu"
                      " prelogin_underflow=%lu"
-                     " alloc_live=%llu alloc_issued=%llu",
+                     " alloc_live=%llu alloc_issued=%llu"
+                     " internals_active=%d internals_peak_pending=%llu"
+                     " internals_retained=%llu internals_omitted=%d internals_final_pending=%d",
                      detached_terminal_rejects, nonwaiting_begin_rejects,
                      duplicate_local_begin_ignored, id_release_violations,
                      internals_output_dropped,
@@ -3111,7 +3118,12 @@ static bool handle_line(CompileServer *cs, Msg *_m)
                      prelogin_completed_total, accepts_deferred_total,
                      prelogin_underflow_violations,
                      (unsigned long long)job_id_allocator().liveCount(),
-                     (unsigned long long)job_id_allocator().issuedTotal());
+                     (unsigned long long)job_id_allocator().issuedTotal(),
+                     internals_txn.active ? 1 : 0,
+                     (unsigned long long)internals_txn.peak_pending,
+                     (unsigned long long)internals_txn.retained_bytes,
+                     internals_txn.payload_omitted ? 1 : 0,
+                     internals_txn.final_pending ? 1 : 0);
             if (!cs->send_msg(TextMsg(summary))) {
                 return false;
             }
