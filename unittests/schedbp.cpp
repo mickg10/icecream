@@ -3469,7 +3469,7 @@ int main(int argc, char **argv)
         /* One pre-established, fully consumed observer avoids turning the
            deadline measurement into an accept/listener-churn test.  It is
            a distinct control generation from the stopped transaction owner. */
-        const int observer = tcp_connect_bounded(port + 1, 8000);
+        int observer = tcp_connect_bounded(port + 1, 8000);
         REQUIRE(observer >= 0, "A.3 persistent management observer connected");
         if (observer >= 0) {
             char greeting[1024];
@@ -3748,6 +3748,45 @@ int main(int argc, char **argv)
                         != std::string::npos
                     && dump_field(followup_settled, "internals_last_terminal=") == 1,
                 "follow-up transaction settled only after terminal delivery");
+
+        /* The forced stopped-reader path intentionally omits a farewell
+           when output is already pending.  Independently prove that the
+           ordinary empty/writable LINE close still emits its complete
+           farewell before EOF. */
+        const std::string quit_command = "quit\n";
+        REQUIRE(observer >= 0
+                    && write(observer, quit_command.data(), quit_command.size())
+                        == (ssize_t)quit_command.size(),
+                "reading control sent quit on an empty writable channel");
+        std::string farewell;
+        bool farewell_eof = false;
+        {
+            const Clock::time_point t0 = Clock::now();
+            char buf[256];
+            while (!farewell_eof && secs_since(t0) < 5.0) {
+                const int left = 5000 - (int)(secs_since(t0) * 1000.0);
+                struct pollfd pf = { observer, (short)(POLLIN | POLLHUP), 0 };
+                if (poll(&pf, 1, left > 0 ? left : 0) <= 0) {
+                    break;
+                }
+                const ssize_t n = read(observer, buf, sizeof(buf));
+                if (n == 0) {
+                    farewell_eof = true;
+                } else if (n > 0) {
+                    farewell.append(buf, (size_t)n);
+                } else if (errno != EINTR) {
+                    break;
+                }
+            }
+        }
+        REQUIRE(farewell == "200 Good Bye!\n",
+                "reading control received exactly one complete farewell frame");
+        REQUIRE(farewell_eof,
+                "reading control reached EOF only after the farewell frame");
+        if (observer >= 0) {
+            close(observer);
+            observer = -1;
+        }
 
         fprintf(stderr,
                 "# A.3 %s: peak=%lld/%lld retained=%lld/%lld"
