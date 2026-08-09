@@ -184,17 +184,17 @@ int main()
         delete cs;
     }
 
-    /* 4. resolver failure: must be a bounded failure transition, not a
-       null dereference.  */
+    /* 4. address-conversion failure: the probe uses the recorded numeric
+       peer address directly (inet_pton; no resolver), so a non-numeric
+       name must be a bounded failure transition -- the OLD code passed
+       such a name to gethostbyname and dereferenced a null result.  */
     {
-        CompileServer *cs = make_cs("127.0.0.1", live_port);
-        setenv("ICECC_CONN_FAIL_RESOLVE", "1", 1);
+        CompileServer *cs = make_cs("not-an-address", live_port);
         cs->startInConnectionTest();
-        unsetenv("ICECC_CONN_FAIL_RESOLVE");
         check(!cs->getConnectionInProgress(),
-              "resolver failure ends the attempt (no probe left open)");
+              "address-conversion failure ends the attempt (no probe left open)");
         check(cs->getNextTimeout() >= 1,
-              "resolver failure schedules a backoff (bounded failure)");
+              "address-conversion failure schedules a backoff (bounded failure)");
         delete cs;
     }
 

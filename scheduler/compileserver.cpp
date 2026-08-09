@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <fcntl.h>
 #include <netdb.h>
+#include <arpa/inet.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -524,6 +525,35 @@ int CompileServer::getInFd() const
     return m_inFd;
 }
 
+CompileServer::~CompileServer()
+{
+    /* A daemon deleted while its connectivity probe is pending must not
+       leak the probe descriptor.  */
+    closeProbeFd();
+}
+
+void CompileServer::closeProbeFd()
+{
+    if (m_inFd >= 0) {
+        close(m_inFd);
+        m_inFd = -1;
+    }
+}
+
+bool CompileServer::probeCompletionOk()
+{
+    int error = 0;
+    socklen_t err_len = sizeof(error);
+    return getsockopt(m_inFd, SOL_SOCKET, SO_ERROR, &error, &err_len) == 0
+           && error == 0;
+}
+
+bool CompileServer::probeDeadlineExpired() const
+{
+    const uint64_t now = icecream_monotonic_msec();
+    return now >= m_connStartMono + 5000;
+}
+
 void CompileServer::startInConnectionTest()
 {
     if (m_noRemote || getConnectionInProgress()
@@ -548,20 +578,18 @@ void CompileServer::startInConnectionTest()
         return;
     }
 
-    struct hostent *host = gethostbyname(name.c_str());
-    if (!host || !host->h_addr_list || !host->h_addr_list[0]
-            || host->h_addrtype != AF_INET
-            || host->h_length != (int)sizeof(struct in_addr))
+    /* The peer name the scheduler records is the connection's numeric
+       address: convert it directly.  A resolver lookup here could fail or
+       block independently of the socket it is supposed to describe.  */
+    struct sockaddr_in remote_addr;
+    memset(&remote_addr, 0, sizeof(remote_addr));
+    remote_addr.sin_family = AF_INET;
+    remote_addr.sin_port = htons(remotePort());
+    if (inet_pton(AF_INET, name.c_str(), &remote_addr.sin_addr) != 1)
     {
         updateInConnectivity(false);
         return;
     }
-
-    struct sockaddr_in remote_addr;
-    remote_addr.sin_family = AF_INET;
-    remote_addr.sin_port = htons(remotePort());
-    memcpy(&remote_addr.sin_addr.s_addr, host->h_addr_list[0], host->h_length);
-    memset(remote_addr.sin_zero, '\0', sizeof(remote_addr.sin_zero));
 
     /* The attempt clock starts BEFORE connect: a synchronous success must
        be judged against THIS attempt, not the previous attempt's start
@@ -571,11 +599,8 @@ void CompileServer::startInConnectionTest()
     int status = connect(m_inFd, (struct sockaddr *)&remote_addr, sizeof(remote_addr));
     if (status == 0)
     {
-        /* Synchronous completion: the verdict is SO_ERROR, directly.  */
-        int error = 0;
-        socklen_t err_len = sizeof(error);
-        updateInConnectivity(getsockopt(m_inFd, SOL_SOCKET, SO_ERROR,
-                                        &error, &err_len) == 0 && error == 0);
+        /* Synchronous completion IS the success verdict.  */
+        updateInConnectivity(true);
     }
     else if (!(errno == EINPROGRESS || errno == EAGAIN))
     {
@@ -614,10 +639,7 @@ void CompileServer::updateInConnectivity(bool acceptingIn)
         }
         m_nextConnMono = icecream_monotonic_msec()
                          + (uint64_t)check_back_time * 1000;
-        if (m_inFd >= 0) {
-            close(m_inFd);
-            m_inFd = -1;
-        }
+        closeProbeFd();
     }
     else
     {
@@ -638,26 +660,18 @@ void CompileServer::updateInConnectivity(bool acceptingIn)
         trace()  << nodeName() << " failed to accept an incoming connection on "
             << name << ":" << m_remotePort << " attempting again in "
             << (m_nextConnMono - icecream_monotonic_msec()) / 1000 << " seconds" << endl;
-        if (m_inFd >= 0) {
-            close(m_inFd);
-            m_inFd = -1;
-        }
+        closeProbeFd();
     }
 
 }
 
 bool CompileServer::isConnected()
 {
-    if (getConnectionTimeout() == 0)
+    if (probeDeadlineExpired())
     {
-        return false;   /* the attempt's monotonic deadline expired */
+        return false;
     }
-    /* The verdict is SO_ERROR on the probe fd; the resolver has nothing to
-       add here (the old code re-resolved the name and built an address it
-       never used).  */
-    int error = 0;
-    socklen_t err_len= sizeof(error);
-    return (getsockopt(m_inFd, SOL_SOCKET, SO_ERROR, &error, &err_len) == 0 && error == 0);
+    return probeCompletionOk();
 }
 
 time_t CompileServer::getConnectionTimeout()

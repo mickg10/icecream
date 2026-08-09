@@ -92,6 +92,7 @@ public:
     };
 
     CompileServer(const int fd, struct sockaddr *_addr, const socklen_t _len, const bool text_based);
+    ~CompileServer() override;
 
     void pick_new_id();
 
@@ -204,6 +205,14 @@ public:
     void eraseCSFromBlacklist(CompileServer *cs);
 
     int getInFd() const;
+    /* Split completion predicates: the SO_ERROR verdict is read exactly
+       once per wake and does NOT run deadline or resolver work; the
+       deadline is the probe's own monotonic fact.  A probe transition
+       depends only on these two -- never on unrelated ready fds.  */
+    bool probeCompletionOk();
+    bool probeDeadlineExpired() const;
+    /* Consume the probe fd exactly once; safe to call repeatedly.  */
+    void closeProbeFd();
     void startInConnectionTest();
     time_t getConnectionTimeout();
     time_t getNextTimeout();
