@@ -562,7 +562,7 @@ static uint64_t internals_deadline_msec = 10000;        // whole command
 static unsigned long internals_output_dropped = 0;      // rows dropped by the exact bound
 static const size_t kInternalsPerTargetCap = 64 * 1024;
 static const size_t kInternalsRetainedCap = 4 * 1024 * 1024;
-static const size_t kInternalsControlPendingCap = 1024 * 1024;
+static size_t kInternalsControlPendingCap = 1024 * 1024;   /* test-overridable */
 
 static CompileServer *internals_resolve(int fd, unsigned int generation)
 {
@@ -815,6 +815,16 @@ static void prelogin_read_overrides()
             log_error() << "prelogin peer-cap override " << v
                         << " clamped to 1" << endl;
         }
+    }
+    if ((e = getenv("ICECC_TEST_INTERNALS_PENDING_CAP"))) {
+        const long long v = atoll(e);
+        /* Floor at the required-tail minimum (terminal + marker) so a
+           zero-target fan-out can still complete; smaller values only
+           shrink the room for target rows -- exactly what the preflight
+           gate needs.  */
+        const size_t floor_bytes =
+            internals_wire_len(kInternalsTerm) + internals_wire_len(kInternalsMarker);
+        kInternalsControlPendingCap = (v > (long long)floor_bytes) ? (size_t)v : floor_bytes;
     }
     if ((e = getenv("ICECC_TEST_ACCEPT_QUANTUM"))) {
         const int v = atoi(e);
@@ -3383,9 +3393,12 @@ static bool handle_line(CompileServer *cs, Msg *_m)
             const size_t tail = internals_required_tail_wire();
             if (cs->pending_bytes() + tail > kInternalsControlPendingCap
                     || tail > kInternalsRetainedCap) {
-                internals_snapshot("preflight-overflow");
+                /* Clear (snapshots the reason) then actually delete the
+                   control: returning false means the handler already
+                   deleted it.  */
                 internals_txn_clear("preflight-overflow");
-                return false;   /* drain loop deletes this control */
+                handle_end(cs, nullptr);
+                return false;
             }
         }
         internals_txn_tick();

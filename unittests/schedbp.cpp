@@ -637,6 +637,15 @@ int main(int argc, char **argv)
     if (internalsguard_mode) {
         setenv("ICECC_TEST_INTERNALS_NO_TICK_PROMOTE", "1", 1);
     }
+    /* "internalspreflight": a shrunk control-output cap makes the whole
+       required tail (per-target rows + marker + terminal) not fit up
+       front; the initial preflight must fail the control with reason
+       "preflight-overflow" rather than discovering a squeezed-out row at
+       finalize.  */
+    const bool internalspreflight_mode = argc > 5 && strcmp(argv[5], "internalspreflight") == 0;
+    if (internalspreflight_mode) {
+        setenv("ICECC_TEST_INTERNALS_PENDING_CAP", "120", 1);
+    }
     /* "retention": the proof that Stage-A retention is CORRECT, not merely
        non-destructive.  A quiet-but-healthy daemon crossing the report
        threshold, a sibling legitimately running across it, dispatch
@@ -1089,7 +1098,7 @@ int main(int argc, char **argv)
            traffic parks.  */
         if (leastbusy_mode || retention_mode || teardown_mode || internalsuaf_mode
                 || duplocal_mode || exhaust_mode || internalsrace_mode
-                || internalsguard_mode) {
+                || internalsguard_mode || internalspreflight_mode) {
             while (!shutdown) {
                 usleep(100 * 1000);
             }
@@ -3281,6 +3290,81 @@ int main(int argc, char **argv)
         delete sub; delete sub2; delete cs;
         kill(sched, SIGTERM);
         waitpid(sched, nullptr, 0);
+        if (failures) { fprintf(stderr, "RESULT: FAIL (%d)\n", failures); return 1; }
+        fprintf(stderr, "RESULT: PASS\n");
+        return 0;
+    }
+
+    if (internalspreflight_mode) {
+        /* A few workers whose fallback rows + marker + terminal exceed the
+           120-byte control cap set for this mode.  */
+        std::vector<MsgChannel *> ws;
+        for (int i = 0; i < 6; ++i) {
+            MsgChannel *w = connect_daemon(port, 0);
+            REQUIRE(w != nullptr, "preflight worker connected");
+            char nm[16]; snprintf(nm, sizeof(nm), "fpf%d", i);
+            LoginMsg login(10280 + i, nm, kPlatform, 0);
+            login.envs.push_back(std::make_pair(kPlatform, kEnv));
+            login.max_kids = 4;
+            REQUIRE(w->send_msg(login), "preflight worker logged in");
+            StatsMsg st; w->send_msg(st);
+            ws.push_back(w);
+        }
+        usleep(500 * 1000);
+
+        const int ictrl = tcp_connect(port + 1, 0);
+        REQUIRE(ictrl >= 0, "preflight control connected");
+        { char g[256]; struct pollfd gp = { ictrl, POLLIN, 0 };
+          if (poll(&gp,1,3000)>0){ ssize_t z=read(ictrl,g,sizeof(g)); (void)z; } }
+        { const char *icmd = "internals\n";
+          REQUIRE(write(ictrl, icmd, strlen(icmd)) == (ssize_t)strlen(icmd),
+                  "internals command sent"); }
+
+        /* The preflight must fail this control up front (EOF), because the
+           required tail cannot fit the shrunk cap.  */
+        bool closed = false;
+        {
+            const Clock::time_point t0 = Clock::now();
+            char b[4096];
+            while (!closed && secs_since(t0) < 8) {
+                struct pollfd rp = { ictrl, POLLIN, 0 };
+                if (poll(&rp,1,200) <= 0) { continue; }
+                const ssize_t n = read(ictrl, b, sizeof(b)-1);
+                if (n <= 0) { closed = true; }
+            }
+        }
+        REQUIRE(closed,
+                "the control was failed up front by the required-tail"
+                " preflight (the complete response cannot fit the cap)");
+        {
+            std::string reason;
+            const Clock::time_point t0 = Clock::now();
+            while (reason.empty() && secs_since(t0) < 8) {
+                const std::string dump = control_dump(port, "listjobs");
+                const size_t p2 = dump.find("internals_last_reason=");
+                if (p2 != std::string::npos) {
+                    const size_t st = p2 + strlen("internals_last_reason=");
+                    const size_t en = dump.find_first_of(" \n", st);
+                    reason = dump.substr(st, en == std::string::npos ? std::string::npos : en - st);
+                }
+                if (reason.empty()) { usleep(200*1000); }
+            }
+            REQUIRE(reason == "preflight-overflow",
+                    "the settlement snapshot records the preflight overflow");
+        }
+        REQUIRE(waitpid(sched, nullptr, WNOHANG) == 0, "scheduler alive");
+        REQUIRE(!probe_died.load(), "control probe never lost the scheduler");
+
+        close(ictrl);
+        shutdown = true;
+        probe_thread.join(); cs_thread.join(); healthy_thread.join();
+        close(ctrl);
+        for (MsgChannel *w : ws) { delete w; }
+        delete sub; delete sub2; delete cs;
+        kill(sched, SIGTERM);
+        int st = -1;
+        REQUIRE(waitpid(sched, &st, 0) == sched, "scheduler reaped");
+        REQUIRE(WIFEXITED(st) && WEXITSTATUS(st) == 0, "clean shutdown");
         if (failures) { fprintf(stderr, "RESULT: FAIL (%d)\n", failures); return 1; }
         fprintf(stderr, "RESULT: PASS\n");
         return 0;
