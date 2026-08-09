@@ -4,6 +4,8 @@ on:
   pull_request:
     branches:
       - fix/stage3-scheduler-policy
+    paths:
+      - .github/codex/pending.ready
   workflow_dispatch:
 
 permissions:
