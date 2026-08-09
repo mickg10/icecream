@@ -3,17 +3,19 @@
 
 Version 2 owns tool hashes, TLC capability preflight, backend PATH pinning, and
 the differential matrix. Version 3 owns real TLC trace normalization and the
-expected-counterexample queue semantics. This overlay closes two preflight
-holes exposed by the first canonical rerun:
+expected-counterexample queue semantics. This overlay closes the remaining
+preflight and artifact-isolation holes exposed by real canonical runs:
 
 * backend version evidence must come from a successful backend-specific probe;
-  nonzero usage/error output is never accepted as a version; and
+  nonzero usage/error output is never accepted as a version;
 * LS4, which has no ordinary version flag, is identified by its pinned hash,
   embedded ``ls4-1.0`` package marker, and GNU ELF build ID parsed directly
-  from the binary.
+  from the binary; and
+* TLAPS runs from a byte-identical copy of every local TLA+ module under the
+  external artifact tree, so `.tlacache` and generated `*_TTrace_*` modules can
+  never dirty the exact source checkout.
 
-It also enforces that the immutable artifact directory is outside the source
-checkout before the v2 runner creates it.
+The immutable artifact directory is rejected if it is inside the checkout.
 """
 
 from __future__ import annotations
@@ -126,8 +128,7 @@ def _ls4_identity(path: Path) -> str:
         data = path.read_bytes()
     except OSError as exc:
         raise v2.FormalRunError(f"cannot read LS4 backend {path}: {exc}") from exc
-    marker = re.search(rb"ls4-1\.0", data, re.IGNORECASE)
-    if marker is None:
+    if re.search(rb"ls4-1\.0", data, re.IGNORECASE) is None:
         raise v2.FormalRunError(
             f"{path}: embedded ls4-1.0 package/build marker was not found"
         )
@@ -203,6 +204,120 @@ def pin_backends(
     return backends, environment
 
 
+def _require_clean_checkout(repo: Path, context: str) -> None:
+    result = v2.run_capture(
+        ["git", "status", "--porcelain", "--untracked-files=all"], repo
+    )
+    if result["returncode"] != 0:
+        raise v2.FormalRunError(
+            f"{context}: git status failed: {result['output']}"
+        )
+    if result["output"].strip():
+        raise v2.FormalRunError(
+            f"{context}: source checkout was modified:\n{result['output']}"
+        )
+
+
+def run_tlaps_proof(
+    *,
+    proof: Mapping[str, Any],
+    tlapm: Path,
+    formal_dir: Path,
+    artifacts: Path,
+    time_bin: Path,
+    proof_env: Mapping[str, str],
+) -> dict[str, Any]:
+    """Run TLAPS from an artifact-tree copy, never from the source tree."""
+    source_proof = formal_dir / proof["file"]
+    if not source_proof.is_file():
+        raise v2.FormalRunError(
+            f"{proof['id']}: missing proof file {source_proof}"
+        )
+
+    run_dir = artifacts / proof["id"] / "tlaps"
+    work_dir = run_dir / "work"
+    if work_dir.exists():
+        raise v2.FormalRunError(
+            f"{proof['id']}: isolated TLAPS work directory already exists: {work_dir}"
+        )
+    work_dir.mkdir(parents=True)
+
+    copied_inputs: dict[str, str] = {}
+    for source in sorted(formal_dir.glob("*.tla")):
+        destination = work_dir / source.name
+        shutil.copy2(source, destination)
+        copied_inputs[source.name] = v2.sha256_file(destination)
+    work_proof = work_dir / source_proof.name
+    if not work_proof.is_file():
+        raise v2.FormalRunError(
+            f"{proof['id']}: proof was not copied into isolated work directory"
+        )
+    if v2.sha256_file(source_proof) != v2.sha256_file(work_proof):
+        raise v2.FormalRunError(
+            f"{proof['id']}: isolated proof copy differs from source"
+        )
+
+    log_path = run_dir / "tlapm.log"
+    metrics_path = run_dir / "time.txt"
+    result = v2.run_logged(
+        [str(tlapm), str(work_proof)],
+        cwd=work_dir,
+        log_path=log_path,
+        metrics_path=metrics_path,
+        time_bin=time_bin,
+        timeout_seconds=int(proof.get("timeout_seconds", 1800)),
+        env=proof_env,
+    )
+
+    # This checks the entire preceding TLC + TLAPS execution, not merely the
+    # proof copy operation. Any unexpected repository artifact is red.
+    _require_clean_checkout(formal_dir.parent, proof["id"])
+
+    log = v2.read_text(log_path)
+    if result.timed_out or result.returncode != 0:
+        raise v2.FormalRunError(
+            f"{proof['id']}: tlapm failed/timeout, exit {result.returncode}"
+        )
+    if result.peak_rss_kib is None or result.peak_rss_kib <= 0:
+        raise v2.FormalRunError(
+            f"{proof['id']}: positive peak RSS evidence is missing"
+        )
+    if re.search(r"\b(?:unproved|omitted|sorry)\b", log, re.IGNORECASE):
+        raise v2.FormalRunError(
+            f"{proof['id']}: proof log contains an unproved marker"
+        )
+    if not re.search(
+        r"(?:All obligations proved|obligations? proved)",
+        log,
+        re.IGNORECASE,
+    ):
+        raise v2.FormalRunError(
+            f"{proof['id']}: tlapm did not report all obligations proved"
+        )
+
+    generated_files = sorted(
+        str(path.relative_to(work_dir))
+        for path in work_dir.rglob("*")
+        if path.is_file() and path.name not in copied_inputs
+    )
+    record = {
+        "id": proof["id"],
+        "file": proof["file"],
+        "source_file_sha256": v2.sha256_file(source_proof),
+        "isolated_work_dir": str(work_dir),
+        "isolated_tla_inputs": copied_inputs,
+        "isolated_generated_files": generated_files,
+        "command": result.command,
+        "returncode": result.returncode,
+        "elapsed_seconds": result.elapsed_seconds,
+        "peak_rss_kib": result.peak_rss_kib,
+        "log_sha256": v2.sha256_file(log_path),
+        "metrics_sha256": v2.sha256_file(metrics_path),
+    }
+    v2.write_json(run_dir / "result.json", record)
+    return record
+
+
 _base_self_tests = v3.run_python_self_tests
 
 
@@ -243,6 +358,7 @@ def run_python_self_tests(
 
 # v2.main resolves these names from its module globals at runtime.
 v2.pin_backends = pin_backends
+v2.run_tlaps_proof = run_tlaps_proof
 v2.run_python_self_tests = run_python_self_tests
 
 
