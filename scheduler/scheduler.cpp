@@ -525,11 +525,39 @@ struct InternalsTxn {
     uint64_t output_deadline_mono = 0;   // absolute control-output deadline
     uint64_t final_frame_seq = 0;
     size_t retained_bytes = 0;   // whole-transaction wire bytes emitted
-    size_t peak_pending = 0;        // max control pending bytes observed
+    size_t peak_pending = 0;        // max control pending bytes observed (active control only)
+    unsigned marker_queued = 0;     // omission markers actually QUEUED ({0,1})
+    unsigned terminal_queued = 0;   // terminals actually QUEUED ({0,1})
     bool payload_omitted = false;   // any worker payload dropped/truncated
     std::vector<InternalsTarget> targets;
 };
 static InternalsTxn internals_txn;
+
+/* Last-settled diagnostic snapshot: the active counters reset on clear, so
+   the A.3 gate can read the settled outcome here after the transaction
+   ends (peak pending, cumulative wire, {0,1} marker/terminal counts, the
+   control generation, and a settlement reason).  */
+struct InternalsSnapshot {
+    bool valid = false;
+    size_t peak_pending = 0;
+    size_t retained_bytes = 0;
+    unsigned marker_queued = 0;
+    unsigned terminal_queued = 0;
+    unsigned control_generation = 0;
+    const char *reason = "";
+};
+static InternalsSnapshot internals_last;
+
+static void internals_snapshot(const char *reason)
+{
+    internals_last.valid = true;
+    internals_last.peak_pending = internals_txn.peak_pending;
+    internals_last.retained_bytes = internals_txn.retained_bytes;
+    internals_last.marker_queued = internals_txn.marker_queued;
+    internals_last.terminal_queued = internals_txn.terminal_queued;
+    internals_last.control_generation = internals_txn.control_generation;
+    internals_last.reason = reason;
+}
 static uint64_t internals_deadline_msec = 10000;        // whole command
 static unsigned long internals_output_dropped = 0;      // rows dropped by the exact bound
 static const size_t kInternalsPerTargetCap = 64 * 1024;
@@ -575,7 +603,10 @@ static InternalsSend internals_emit(CompileServer *control, const std::string &t
                            MsgChannel::SendNonBlocking | MsgChannel::SendDeferrable)) {
         return ISEND_ERROR;
     }
-    if (control->pending_bytes() > internals_txn.peak_pending) {
+    if (internals_txn.active
+            && control->fd == internals_txn.control_fd
+            && control->connectionGeneration() == internals_txn.control_generation
+            && control->pending_bytes() > internals_txn.peak_pending) {
         internals_txn.peak_pending = control->pending_bytes();
     }
     return ISEND_QUEUED;
@@ -605,14 +636,19 @@ static size_t internals_required_tail_wire()
     return need;
 }
 
-static void internals_txn_clear()
+static void internals_txn_clear(const char *reason = "cleared")
 {
+    if (internals_txn.active) {
+        internals_snapshot(reason);
+    }
     internals_txn.active = false;
     internals_txn.final_pending = false;
     internals_txn.control_fd = -1;
     internals_txn.targets.clear();
     internals_txn.retained_bytes = 0;
     internals_txn.peak_pending = 0;
+    internals_txn.marker_queued = 0;
+    internals_txn.terminal_queued = 0;
     internals_txn.payload_omitted = false;
 }
 
@@ -637,7 +673,7 @@ static void internals_txn_finalize()
     }
     CompileServer *control = internals_resolve(txn.control_fd, txn.control_generation);
     if (!control) {
-        internals_txn_clear();
+        internals_txn_clear("control-lost");
         return;
     }
     /* Every required row here was reserved while optional payload was
@@ -678,6 +714,7 @@ static void internals_txn_finalize()
             return;
         }
         txn.retained_bytes += internals_wire_len(kInternalsMarker);
+        txn.marker_queued = 1;   /* emitted-marker count, not the condition flag */
     }
     /* The terminal is NEVER a droppable row.  If it cannot be queued the
        control cannot receive a complete response: fail its exact
@@ -688,6 +725,7 @@ static void internals_txn_finalize()
         return;
     }
     txn.retained_bytes += internals_wire_len(kInternalsTerm);
+    txn.terminal_queued = 1;   /* exactly-one-terminal evidence */
     txn.final_frame_seq = control->framesQueued();
     txn.final_pending = true;
 }
@@ -705,11 +743,11 @@ static void internals_txn_tick()
     if (txn.final_pending) {
         CompileServer *control = internals_resolve(txn.control_fd, txn.control_generation);
         if (!control) {
-            internals_txn_clear();
+            internals_txn_clear("control-lost");
             return;
         }
         if (control->framesFlushed() >= txn.final_frame_seq) {
-            internals_txn_clear();   /* final frame delivered: complete */
+            internals_txn_clear("complete");   /* final frame delivered */
             return;
         }
         if (now >= txn.output_deadline_mono) {
@@ -3034,6 +3072,19 @@ static bool handle_control_login(CompileServer *cs)
 
 static bool handle_line(CompileServer *cs, Msg *_m)
 {
+    /* The control that owns an active internals transaction is streaming
+       its response and must not issue another command on the same
+       channel: that reply would bypass internals_emit and the reserved
+       tail accounting.  Treat it as a protocol violation and fail the
+       exact control generation.  (Concurrent internals from a DIFFERENT
+       control still takes the bounded busy path below.)  */
+    if (internals_txn.active
+            && cs->fd == internals_txn.control_fd
+            && cs->connectionGeneration() == internals_txn.control_generation) {
+        internals_snapshot("active-control-reissued");
+        internals_txn_clear("active-control-reissued");
+        return false;
+    }
     TextMsg *m = dynamic_cast<TextMsg *>(_m);
 
     if (!m) {
@@ -3099,7 +3150,7 @@ static bool handle_line(CompileServer *cs, Msg *_m)
     } else if (cmd == "listjobs") {
         const bool verbose = !l.empty() && (l.front() == "v" || l.front() == "verbose");
         {
-            char summary[768];
+            char summary[1024];
             snprintf(summary, sizeof(summary),
                      " detached_terminal_rejects=%lu nonwaiting_begin_rejects=%lu"
                      " dup_local_begin=%lu id_release_violations=%lu"
@@ -3109,7 +3160,11 @@ static bool handle_line(CompileServer *cs, Msg *_m)
                      " prelogin_underflow=%lu"
                      " alloc_live=%llu alloc_issued=%llu"
                      " internals_active=%d internals_peak_pending=%llu"
-                     " internals_retained=%llu internals_omitted=%d internals_final_pending=%d",
+                     " internals_retained=%llu internals_omitted=%d internals_final_pending=%d"
+                     " internals_marker_queued=%u internals_terminal_queued=%u"
+                     " internals_last_valid=%d internals_last_peak=%llu"
+                     " internals_last_retained=%llu internals_last_marker=%u"
+                     " internals_last_terminal=%u internals_last_reason=%s",
                      detached_terminal_rejects, nonwaiting_begin_rejects,
                      duplicate_local_begin_ignored, id_release_violations,
                      internals_output_dropped,
@@ -3123,7 +3178,13 @@ static bool handle_line(CompileServer *cs, Msg *_m)
                      (unsigned long long)internals_txn.peak_pending,
                      (unsigned long long)internals_txn.retained_bytes,
                      internals_txn.payload_omitted ? 1 : 0,
-                     internals_txn.final_pending ? 1 : 0);
+                     internals_txn.final_pending ? 1 : 0,
+                     internals_txn.marker_queued, internals_txn.terminal_queued,
+                     internals_last.valid ? 1 : 0,
+                     (unsigned long long)internals_last.peak_pending,
+                     (unsigned long long)internals_last.retained_bytes,
+                     internals_last.marker_queued, internals_last.terminal_queued,
+                     internals_last.reason);
             if (!cs->send_msg(TextMsg(summary))) {
                 return false;
             }
@@ -3307,6 +3368,21 @@ static bool handle_line(CompileServer *cs, Msg *_m)
             }
             internals_txn.targets.push_back(t);
         }
+        /* GLOBAL INVARIANT preflight: the whole required tail (a semantic
+           fallback row for every target + one omission marker + terminal)
+           must fit under BOTH the control pending cap and the cumulative
+           transaction budget from the outset.  If a pre-filled control
+           cannot hold the complete response, fail its exact generation now
+           rather than discovering a squeezed-out required row at finalize.  */
+        {
+            const size_t tail = internals_required_tail_wire();
+            if (cs->pending_bytes() + tail > kInternalsControlPendingCap
+                    || tail > kInternalsRetainedCap) {
+                internals_snapshot("preflight-overflow");
+                internals_txn_clear("preflight-overflow");
+                return false;   /* drain loop deletes this control */
+            }
+        }
         internals_txn_tick();
         {
             /* Id-accounting conservation, checked once per turn: every
@@ -3389,7 +3465,7 @@ static bool handle_end(CompileServer *toremove, Msg *m)
     if (internals_txn.active) {
         if (toremove->fd == internals_txn.control_fd
                 && toremove->connectionGeneration() == internals_txn.control_generation) {
-            internals_txn_clear();
+            internals_txn_clear("control-disconnected");
         } else {
             for (InternalsTarget &t : internals_txn.targets) {
                 if (t.fd == toremove->fd
