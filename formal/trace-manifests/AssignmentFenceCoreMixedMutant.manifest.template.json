@@ -1,0 +1,52 @@
+{
+  "schema": 1,
+  "scenario": "AssignmentFenceCoreMixedMutant",
+  "property": "TokenRequiredExactness",
+  "expected_result": "counterexample",
+  "min_states": 3,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "Prepare.a0",
+      "all": [
+        {"path": "phase.a0", "from": "Absent", "to": "Prepared"},
+        {"path": "schedulerReservation.a0", "from": false, "to": true},
+        {"path": "workerSlot.a0", "from": false, "to": true}
+      ]
+    },
+    {
+      "name": "LegacyClaimTokenRequired.a0_by_a1",
+      "all": [
+        {"path": "phase.a0", "from": "Prepared", "to": "Claimed"},
+        {"path": "claimant.a0", "to": "a1"},
+        {"path": "exactClaim.a0", "to": false}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "Prepare.a0",
+    "LegacyClaimTokenRequired.a0_by_a1"
+  ],
+  "final_all": [
+    {"path": "phase.a0", "eq": "Claimed"},
+    {"path": "claimant.a0", "eq": "a1"},
+    {"path": "exactClaim.a0", "eq": false}
+  ],
+  "harness_steps": [
+    {
+      "after": "Prepare.a0",
+      "emit": "barrier_after_token_required_prepare",
+      "actor": "worker"
+    },
+    {
+      "after": "LegacyClaimTokenRequired.a0_by_a1",
+      "emit": "assert_legacy_claim_accepted_for_token_required_assignment",
+      "actor": "worker"
+    }
+  ],
+  "metadata": {
+    "module": "AssignmentFenceCore",
+    "config": "AssignmentFenceCoreMixedMutant.cfg",
+    "mutant": "MutantLegacyCanClaimToken = TRUE"
+  }
+}
