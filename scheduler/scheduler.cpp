@@ -412,12 +412,19 @@ static void add_job_stats(Job *job, JobDoneMsg *msg)
         job->server()->popCompiledJob();
     }
 
-    job->submitter()->appendRequestedJobs(st);
-    job->submitter()->setCumRequested(job->submitter()->cumRequested() + st);
+    /* The submitter can be gone when the worker reports: a client daemon
+       that disconnected mid-compile has its submitter pointer detached
+       (handle_end retains the started job for the worker to finish), so
+       there is nothing to attribute the request stats to.  The worker-side
+       stats above are what scheduling needs.  */
+    if (job->submitter()) {
+        job->submitter()->appendRequestedJobs(st);
+        job->submitter()->setCumRequested(job->submitter()->cumRequested() + st);
 
-    if (job->submitter()->lastRequestedJobs().size() > 200) {
-        job->submitter()->setCumRequested(job->submitter()->cumRequested() - *job->submitter()->lastRequestedJobs().begin());
-        job->submitter()->popRequestedJobs();
+        if (job->submitter()->lastRequestedJobs().size() > 200) {
+            job->submitter()->setCumRequested(job->submitter()->cumRequested() - *job->submitter()->lastRequestedJobs().begin());
+            job->submitter()->popRequestedJobs();
+        }
     }
 
     all_job_stats.push_back(st);
@@ -2771,6 +2778,30 @@ static bool handle_end(CompileServer *toremove, Msg *m)
             Job *job = mit->second;
 
             if (job->server() == toremove || job->submitter() == toremove) {
+                /* A job already COMPILING on a DIFFERENT, live worker when
+                   its submitter disconnects must NOT be deleted here: the
+                   worker is physically running the compiler and its real
+                   JobDone is still coming.  Deleting it frees the worker's
+                   slot while the compile runs on (S could overcommit that
+                   worker) and strands the eventual JobDone as an unknown
+                   id.  Detach the dead submitter and retain the job --
+                   add_job_stats and the FROM_SERVER JobDone path tolerate a
+                   null submitter -- so the worker's completion reconciles
+                   it exactly once.  (A dispatched-but-NOT-started job is a
+                   separate case a future worker-side cancel exchange will
+                   cover; for now it is left to the worker's own input-wait
+                   timeout.)  */
+                if (job->submitter() == toremove
+                        && job->server() && job->server() != toremove
+                        && job->state() == Job::COMPILING) {
+                    trace() << "submitter gone but job " << job->id()
+                            << " is COMPILING on " << job->server()->nodeName()
+                            << "; retaining until the worker completes it" << endl;
+                    job->setSubmitter(nullptr);
+                    ++mit;
+                    continue;
+                }
+
                 trace() << "STOP (DAEMON2) FOR " << mit->first << endl;
                 notify_monitors(new MonJobDoneMsg(JobDoneMsg(job->id(),  255)));
 
@@ -3390,12 +3421,18 @@ int main(int argc, char *argv[])
         pollfds.reserve( fd2cs.size() + css.size() + 5 );
         pollfd pfd; // tmp variable
 
-        if (time(nullptr) >= next_listen) {
-            pfd.fd = listen_fd;
-            pfd.events = POLLIN;
-            pollfds.push_back( pfd );
+        /* The control (text) listener is polled CONTINUOUSLY; only the
+           daemon listener is throttled to one accept per second.  Gating
+           text_fd behind next_listen made rapid control connections (the
+           test gates poll listcs/listjobs) unacceptable during the re-arm
+           interval, and nothing woke poll to re-arm on time.  */
+        pfd.fd = text_fd;
+        pfd.events = POLLIN;
+        pollfds.push_back( pfd );
 
-            pfd.fd = text_fd;
+        const bool daemon_listener_armed = time(nullptr) >= next_listen;
+        if (daemon_listener_armed) {
+            pfd.fd = listen_fd;
             pfd.events = POLLIN;
             pollfds.push_back( pfd );
         }
@@ -3478,6 +3515,13 @@ int main(int argc, char *argv[])
         const bool service_buffered = has_buffered_inbound;
         has_buffered_inbound = false;   // the post-poll reads below re-arm it
 
+        if (!daemon_listener_armed) {
+            const time_t remaining = next_listen - time(nullptr);
+            const time_t secs = remaining > 0 ? remaining : 0;
+            if (timeout < 0 || secs < timeout) {
+                timeout = secs;
+            }
+        }
         int active_fds = poll(pollfds.data(), pollfds.size(), timeout * 1000);
         int poll_errno = errno;
 

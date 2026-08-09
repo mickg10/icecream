@@ -544,6 +544,14 @@ int main(int argc, char **argv)
        expired: the daemon stays registered and its other clients keep
        being served across the bound.  */
     const bool clientstall_mode = argc > 5 && strcmp(argv[5], "clientstall") == 0;
+    /* "teardown": a job already COMPILING on a live worker must survive its
+       SUBMITTER disconnecting -- the worker is still running the compiler,
+       so the scheduler must retain the job and the worker reservation until
+       the worker's real JobDone, not delete it (which frees the slot under
+       a running compile and strands the real JobDone as an unknown id).
+       The counterexample this locks out is stock upstream behaviour that a
+       formal ownership model surfaced.  */
+    const bool teardown_mode = argc > 5 && strcmp(argv[5], "teardown") == 0;
     /* "retention": the proof that Stage-A retention is CORRECT, not merely
        non-destructive.  A quiet-but-healthy daemon crossing the report
        threshold, a sibling legitimately running across it, dispatch
@@ -951,7 +959,7 @@ int main(int argc, char **argv)
            holding 0-1 slots at random moments would make them flake.  The
            connection stays (the scheduler keeps a second submitter), the
            traffic parks.  */
-        if (leastbusy_mode || retention_mode) {
+        if (leastbusy_mode || retention_mode || teardown_mode) {
             while (!shutdown) {
                 usleep(100 * 1000);
             }
@@ -3010,6 +3018,135 @@ int main(int argc, char **argv)
         probe_thread.join(); cs_thread.join(); healthy_thread.join();
         close(ctrl);
         delete sub; delete sub2; delete cs;
+        kill(sched, SIGTERM);
+        waitpid(sched, nullptr, 0);
+        if (failures) { fprintf(stderr, "RESULT: FAIL (%d)\n", failures); return 1; }
+        fprintf(stderr, "RESULT: PASS\n");
+        return 0;
+    }
+
+    if (teardown_mode) {
+        MsgChannel *subT = connect_daemon(port, 0);
+        REQUIRE(subT != nullptr, "teardown submitter connected");
+        if (subT) {
+            LoginMsg login(0, "fakesubT", kPlatform, 0);
+            login.envs.push_back(std::make_pair(kPlatform, kEnv));
+            login.max_kids = 0;
+            login.noremote = true;
+            REQUIRE(subT->send_msg(login), "teardown submitter logged in");
+        }
+        MsgChannel *mon = connect_daemon(port, 0);
+        REQUIRE(mon != nullptr, "monitor connected");
+        if (mon) {
+            mon->send_msg(MonLoginMsg());
+        }
+        usleep(300 * 1000);
+
+        /* One request; drain its UseCS to learn the assigned job id (one
+           worker fakecs, so it lands there).  */
+        GetCSMsg g(Environments{std::make_pair(std::string(kPlatform), std::string(kEnv))},
+                   "teardown.cpp", CompileJob::Lang_CXX, 1, kPlatform, 0, std::string(), 0, 0, 0);
+        g.client_id = 7700;
+        REQUIRE(subT && subT->send_msg(g), "teardown request sent");
+        unsigned int jid = 0;
+        {
+            const Clock::time_point t0 = Clock::now();
+            while (jid == 0 && secs_since(t0) < 30) {
+                Msg *m = subT->get_msg(2);
+                if (!m) { continue; }
+                if (MSG_IS(m, USE_CS)) {
+                    UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                    if (u && u->client_id == 7700) { jid = u->job_id; }
+                }
+                delete m;
+            }
+        }
+        REQUIRE(jid != 0, "the job was assigned to a worker");
+
+        /* JobBegin, no Done: the job is now COMPILING on the worker.  */
+        begin_job(jid);
+        {
+            const Clock::time_point t0 = Clock::now();
+            while (secs_since(t0) < 15) {
+                if (job_in_scheduler(port, jid)
+                        && worker_job_count(port, "fakecs") >= 1) {
+                    break;
+                }
+                usleep(200 * 1000);
+            }
+        }
+        REQUIRE(job_in_scheduler(port, jid), "the job is COMPILING before the disconnect");
+        REQUIRE(worker_job_count(port, "fakecs") >= 1,
+                "the worker holds its reservation before the disconnect");
+
+        /* The submitter disconnects mid-compile.  */
+        delete subT;
+        subT = nullptr;
+
+        /* It must be RETAINED: give handle_end time to process the EOF,
+           then assert the job and reservation still stand and no premature
+           terminal event fired.  */
+        sleep(3);
+        REQUIRE(job_in_scheduler(port, jid),
+                "the COMPILING job is RETAINED after its submitter disconnects"
+                " (deleting it would free the worker under a running compile)");
+        REQUIRE(worker_job_count(port, "fakecs") >= 1,
+                "the worker reservation is retained across the disconnect");
+        int done_before = 0;
+        {
+            const Clock::time_point t0 = Clock::now();
+            while (secs_since(t0) < 2) {
+                Msg *m = mon->get_msg(1);
+                if (!m) { continue; }
+                if (MSG_IS(m, MON_JOB_DONE)) {
+                    MonJobDoneMsg *d = dynamic_cast<MonJobDoneMsg *>(m);
+                    if (d && d->job_id == jid) { ++done_before; }
+                }
+                delete m;
+            }
+        }
+        REQUIRE(done_before == 0,
+                "no premature terminal event fired for the retained job");
+
+        /* The worker's real completion reconciles it exactly once (a nonzero
+           runtime keeps add_job_stats on its normal path).  */
+        finish_job(jid, 100);
+        {
+            const Clock::time_point t0 = Clock::now();
+            while (job_in_scheduler(port, jid) && secs_since(t0) < 15) {
+                usleep(200 * 1000);
+            }
+        }
+        REQUIRE(!job_in_scheduler(port, jid),
+                "the worker's real JobDone reconciled the retained job");
+        /* The reservation release is witnessed authoritatively below: the
+           monitor's single terminal MON_JOB_DONE is emitted by
+           handle_job_done immediately after it calls the worker's
+           removeJob(), so exactly-one-terminal proves the reservation was
+           released exactly once.  (A separate listcs read of the worker's
+           job count is redundant with that and unreliable under this
+           mode's tight control-port polling.)  */
+        int done_after = 0;
+        {
+            const Clock::time_point t0 = Clock::now();
+            while (secs_since(t0) < 3) {
+                Msg *m = mon->get_msg(1);
+                if (!m) { continue; }
+                if (MSG_IS(m, MON_JOB_DONE)) {
+                    MonJobDoneMsg *d = dynamic_cast<MonJobDoneMsg *>(m);
+                    if (d && d->job_id == jid) { ++done_after; }
+                }
+                delete m;
+            }
+        }
+        REQUIRE(done_after == 1,
+                "the monitor saw exactly one terminal event, at the real completion");
+        REQUIRE(worst_reply.load() < 5.0, "scheduler stayed responsive");
+
+        shutdown = true;
+        probe_thread.join(); cs_thread.join(); healthy_thread.join();
+        close(ctrl);
+        delete mon; delete sub; delete sub2; delete cs;
         kill(sched, SIGTERM);
         waitpid(sched, nullptr, 0);
         if (failures) { fprintf(stderr, "RESULT: FAIL (%d)\n", failures); return 1; }
