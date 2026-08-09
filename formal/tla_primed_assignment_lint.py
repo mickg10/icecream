@@ -13,7 +13,8 @@ This linter examines primed-assignment conjuncts in every local ``*.tla``
 module. If an ordinary expression RHS contains a top-level ``/\\`` or ``\\/``,
 it must be parenthesized so the operator is below the assignment. Structured
 RHS forms beginning with IF, CASE, or LET are parsed by their own TLA+ grammar
-and are exempt from this deliberately narrow check.
+and are exempt from this deliberately narrow check. TLA+ line comments and
+nested block comments are removed before assignments are recognized.
 """
 
 from __future__ import annotations
@@ -42,6 +43,54 @@ _ASSIGNMENT_RE = re.compile(
     r"(?P<variable>[A-Za-z_][A-Za-z0-9_]*)'\s*=\s*(?P<rhs>.*)$"
 )
 _STRUCTURED_PREFIXES = ("IF ", "CASE ", "LET ")
+
+
+def _strip_block_comments(text: str) -> str:
+    """Blank nested ``(* ... *)`` comments while preserving line numbers."""
+    output: list[str] = []
+    index = 0
+    depth = 0
+    in_string = False
+    escaped = False
+    while index < len(text):
+        if depth > 0:
+            if text.startswith("(*", index):
+                depth += 1
+                output.extend("  ")
+                index += 2
+                continue
+            if text.startswith("*)", index):
+                depth -= 1
+                output.extend("  ")
+                index += 2
+                continue
+            char = text[index]
+            output.append("\n" if char == "\n" else " ")
+            index += 1
+            continue
+
+        if not in_string and text.startswith("(*", index):
+            depth = 1
+            output.extend("  ")
+            index += 2
+            continue
+
+        char = text[index]
+        output.append(char)
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+        index += 1
+
+    if depth != 0:
+        raise RuntimeError("unterminated TLA+ block comment")
+    return "".join(output)
 
 
 def _without_line_comments(text: str) -> str:
@@ -127,7 +176,7 @@ def _top_level_boolean_operator(rhs: str) -> str | None:
 
 
 def lint_text(path: Path, text: str) -> list[Violation]:
-    lines = text.splitlines()
+    lines = _strip_block_comments(text).splitlines()
     violations: list[Violation] = []
     index = 0
     while index < len(lines):
