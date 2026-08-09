@@ -1,0 +1,155 @@
+set -euo pipefail
+
+formal_ref='18e4c6ac4e83c6a3ff1095fe9f7a65e14b09cd36'
+git fetch --no-tags origin bigoracle/assignment-fence-core-round2
+actual_ref=$(git rev-parse FETCH_HEAD)
+if [[ "$actual_ref" != "$formal_ref" ]]; then
+  echo "formal source moved: expected $formal_ref, got $actual_ref" >&2
+  exit 1
+fi
+mapfile -t formal_paths < <(git ls-tree -r --name-only FETCH_HEAD formal)
+if (( ${#formal_paths[@]} == 0 )); then
+  echo 'formal source tree is empty' >&2
+  exit 1
+fi
+git checkout FETCH_HEAD -- "${formal_paths[@]}"
+git add formal
+git diff --cached --check
+
+mkdir -p formal/gatelogs
+curl --fail --location --retry 3 \
+  --output /tmp/tla2tools.jar \
+  https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+sha256sum /tmp/tla2tools.jar | tee formal/gatelogs/tla2tools.sha256
+java -version > formal/gatelogs/java-version.txt 2>&1
+java -cp /tmp/tla2tools.jar tlc2.TLC -help > formal/gatelogs/tlc-help.txt 2>&1
+head -n 8 formal/gatelogs/tlc-help.txt
+
+cd formal
+for stem in \
+  assignment_fence_reference \
+  compatibility_projection_reference \
+  job_id_allocator_reference \
+  lifecycle_authority_reference \
+  prelogin_lease_reference
+do
+  python3 "${stem}.py" > "gatelogs/${stem}.actual"
+  diff -u "${stem}.expected" "gatelogs/${stem}.actual" \
+    > "gatelogs/${stem}.diff"
+done
+
+module_for_cfg() {
+  case "$1" in
+    AssignmentFenceCore*) echo AssignmentFenceCore ;;
+    CompatibilityProjection*) echo CompatibilityProjection ;;
+    JobIdAllocator*) echo JobIdAllocator ;;
+    LifecycleAuthority*) echo LifecycleAuthority ;;
+    PreloginLease*) echo PreloginLease ;;
+    *) echo "unknown cfg: $1" >&2; return 1 ;;
+  esac
+}
+
+run_fixed() {
+  local cfg=$1 module log rc
+  module=$(module_for_cfg "$cfg")
+  log="gatelogs/${cfg%.cfg}.log"
+  set +e
+  java -XX:+UseParallelGC -jar /tmp/tla2tools.jar \
+    -workers auto -config "$cfg" "$module" > "$log" 2>&1
+  rc=$?
+  set -e
+  printf 'fixed\t%s\t%s\t%d\n' "$cfg" "$module" "$rc" \
+    >> gatelogs/manifest.tsv
+  if (( rc != 0 )); then
+    cat "$log" >&2
+    return 1
+  fi
+  grep -E 'TLC2 Version|states generated|distinct states found|Model checking completed|Finished in' \
+    "$log" > "gatelogs/${cfg%.cfg}.summary" || true
+}
+
+run_mutant() {
+  local cfg=$1 module log trace rc
+  module=$(module_for_cfg "$cfg")
+  log="gatelogs/${cfg%.cfg}.log"
+  trace="gatelogs/${cfg%.cfg}.trace.json"
+  set +e
+  java -XX:+UseParallelGC -jar /tmp/tla2tools.jar \
+    -workers auto -dumpTrace json "$trace" \
+    -config "$cfg" "$module" > "$log" 2>&1
+  rc=$?
+  set -e
+  printf 'mutant\t%s\t%s\t%d\n' "$cfg" "$module" "$rc" \
+    >> gatelogs/manifest.tsv
+  if (( rc == 0 )); then
+    echo "mutant unexpectedly passed: $cfg" >&2
+    cat "$log" >&2
+    return 1
+  fi
+  if [[ ! -s "$trace" ]]; then
+    echo "mutant produced no JSON counterexample: $cfg" >&2
+    cat "$log" >&2
+    return 1
+  fi
+  grep -E 'TLC2 Version|Error:|is violated|Temporal properties were violated|states generated|distinct states found|Finished in' \
+    "$log" > "gatelogs/${cfg%.cfg}.summary" || true
+}
+
+: > gatelogs/manifest.tsv
+for cfg in \
+  AssignmentFenceCore.cfg \
+  AssignmentFenceCoreFair.cfg \
+  CompatibilityProjection.cfg \
+  JobIdAllocator.cfg \
+  JobIdAllocatorReuse.cfg \
+  LifecycleAuthority.cfg \
+  LifecycleAuthorityFair.cfg \
+  PreloginLease.cfg
+do
+  run_fixed "$cfg"
+done
+
+for cfg in \
+  AssignmentFenceCoreMixedMutant.cfg \
+  AssignmentFenceCoreReleaseMutant.cfg \
+  CompatibilityProjectionCommandSummaryMutant.cfg \
+  CompatibilityProjectionLocalFieldsMutant.cfg \
+  CompatibilityProjectionStatsMutant.cfg \
+  CompatibilityProjectionTimingMutant.cfg \
+  JobIdAllocatorDisconnectLeakMutant.cfg \
+  JobIdAllocatorDuplicateBeginMutant.cfg \
+  JobIdAllocatorPartialBatchMutant.cfg \
+  JobIdAllocatorRemoteOnlyMutant.cfg \
+  JobIdAllocatorUnknownDoneMutant.cfg \
+  JobIdAllocatorZeroMutant.cfg \
+  LifecycleAuthorityDetachedSubmitterMutant.cfg \
+  LifecycleAuthorityDuplicateBeginMutant.cfg \
+  LifecycleAuthorityIdentityMutant.cfg \
+  PreloginLeaseNoCapMutant.cfg \
+  PreloginLeaseNoLeaseMutant.cfg \
+  PreloginLeaseNoQuantumLiveness.cfg \
+  PreloginLeaseNoQuantumMutant.cfg \
+  PreloginLeaseRefreshMutant.cfg
+do
+  run_mutant "$cfg"
+done
+
+{
+  echo '# TLC formal run summary'
+  echo
+  echo '- Imported ref: `18e4c6ac4e83c6a3ff1095fe9f7a65e14b09cd36`'
+  echo '- TLC: official `tla2tools.jar` v1.7.4'
+  echo '- Fixed configurations: 8'
+  echo '- Required counterexamples: 20'
+  echo '- Deterministic reference constructors: 5'
+  echo
+  echo '```text'
+  cat gatelogs/manifest.tsv
+  echo '```'
+  echo
+  echo 'Per-configuration state counts, elapsed time, and JSON counterexamples are retained in `formal/gatelogs/`.'
+} > FORMAL_RUNS.md
+
+cd ..
+git add formal
+git diff --cached --check
