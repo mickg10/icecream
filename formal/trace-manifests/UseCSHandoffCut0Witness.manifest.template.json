@@ -18,7 +18,7 @@
       "name": "FailBeforeByte1",
       "all": [
         {"path": "phase", "from": "Forwarding", "to": "ExactAbortPending"},
-        {"path": "failureObservedAt", "from": "NO_FAILURE", "to": 0},
+        {"path": "failureObservedAt", "from": 4, "to": 0},
         {"path": "bytesWritten", "to": 0},
         {"path": "frameCommitted", "to": false}
       ]
@@ -49,6 +49,7 @@
   "metadata": {
     "module": "UseCSHandoff",
     "config": "UseCSHandoffCut0Witness.cfg",
-    "cut": "before-byte-1"
+    "cut": "before-byte-1",
+    "no_failure_sentinel": 4
   }
 }
