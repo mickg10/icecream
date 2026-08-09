@@ -3,7 +3,7 @@
   "scenario": "AssignmentFenceNetworkDefaultAllowMutant",
   "property": "NoStartAfterRelease",
   "expected_result": "counterexample",
-  "min_states": 8,
+  "min_states": 11,
   "event_mode": "exclusive",
   "events": [
     {
@@ -16,21 +16,40 @@
       "name": "FReceivePrepare.a1",
       "all": [
         {"path": "phase.a1", "from": "PrepareQueued", "to": "Prepared"},
-        {"path": "workerSlot.a1", "from": false, "to": true}
+        {"path": "workerSlot.a1", "from": false, "to": true},
+        {"path": "f2s", "len_delta": 1}
       ]
     },
     {
       "name": "SReceiveReady.a1",
       "all": [
         {"path": "readySeen.a1", "from": false, "to": true},
-        {"path": "phase.a1", "from": "Prepared", "to": "Ready"}
+        {"path": "phase.a1", "from": "Prepared", "to": "Ready"},
+        {"path": "f2s", "len_delta": -1}
       ]
     },
     {
-      "name": "SQueueRevoke.a1",
+      "name": "SQueueUseCS.a1",
       "all": [
-        {"path": "phase.a1", "from": "Ready", "to": "RevokeQueued"},
-        {"path": "s2f", "len_delta": 1}
+        {"path": "phase.a1", "from": "Ready", "to": "UseCSQueued"},
+        {"path": "s2d", "len_delta": 1}
+      ]
+    },
+    {
+      "name": "DDeliverLegacyClaim.a1",
+      "all": [
+        {"path": "phase.a1", "from": "UseCSQueued", "to": "DeliveryUncertain"},
+        {"path": "usecsDelivered.a1", "from": false, "to": true},
+        {"path": "s2d", "len_delta": -1},
+        {"path": "c2f", "len_delta": 1}
+      ]
+    },
+    {
+      "name": "SQueueRevokeWhileLegacyClaimDelayed.a1",
+      "all": [
+        {"path": "phase.a1", "from": "DeliveryUncertain", "to": "RevokeQueued"},
+        {"path": "s2f", "len_delta": 1},
+        {"path": "c2f", "unchanged": true}
       ]
     },
     {
@@ -38,7 +57,10 @@
       "all": [
         {"path": "revokedEnqueued.a1", "from": false, "to": true},
         {"path": "workerSlot.a1", "from": true, "to": false},
-        {"path": "fState.a1", "to": "Revoked"}
+        {"path": "fState.a1", "from": "Reserved", "to": "Revoked"},
+        {"path": "s2f", "len_delta": -1},
+        {"path": "f2s", "len_delta": 1},
+        {"path": "c2f", "unchanged": true}
       ]
     },
     {
@@ -46,14 +68,17 @@
       "all": [
         {"path": "revokedConsumed.a1", "from": false, "to": true},
         {"path": "released.a1", "from": false, "to": true},
-        {"path": "phase.a1", "to": "Terminal"}
+        {"path": "phase.a1", "to": "Terminal"},
+        {"path": "f2s", "len_delta": -1},
+        {"path": "c2f", "unchanged": true}
       ]
     },
     {
       "name": "CompactRevoked.a1",
       "all": [
         {"path": "fState.a1", "from": "Revoked", "to": "None"},
-        {"path": "released.a1", "to": true}
+        {"path": "released.a1", "to": true},
+        {"path": "c2f", "unchanged": true}
       ]
     },
     {
@@ -61,7 +86,8 @@
       "all": [
         {"path": "startAfterRelease.a1", "from": 0, "to": 1},
         {"path": "workerSlot.a1", "from": false, "to": true},
-        {"path": "fState.a1", "from": "None", "to": "Started"}
+        {"path": "fState.a1", "from": "None", "to": "Started"},
+        {"path": "c2f", "len_delta": -1}
       ]
     }
   ],
@@ -69,7 +95,9 @@
     "SPrepare.a1",
     "FReceivePrepare.a1",
     "SReceiveReady.a1",
-    "SQueueRevoke.a1",
+    "SQueueUseCS.a1",
+    "DDeliverLegacyClaim.a1",
+    "SQueueRevokeWhileLegacyClaimDelayed.a1",
     "FInstallFenceAndQueueRevoked.a1",
     "SConsumeRevoked.a1",
     "CompactRevoked.a1",
@@ -78,28 +106,35 @@
   "final_all": [
     {"path": "released.a1", "eq": true},
     {"path": "startAfterRelease.a1", "eq": 1},
-    {"path": "workerSlot.a1", "eq": true}
+    {"path": "workerSlot.a1", "eq": true},
+    {"path": "c2f", "to_len": 0}
   ],
   "harness_steps": [
     {
+      "after": "DDeliverLegacyClaim.a1",
+      "emit": "hold_concrete_legacy_claim_before_worker_consumes_it",
+      "actor": "client-to-worker-transport"
+    },
+    {
       "after": "SConsumeRevoked.a1",
-      "emit": "barrier_after_scheduler_release",
+      "emit": "barrier_after_scheduler_release_with_claim_still_delayed",
       "actor": "scheduler"
     },
     {
       "after": "CompactRevoked.a1",
       "emit": "compact_terminal_assignment_record",
-      "actor": "worker"
+      "actor": "fulfillment-daemon"
     },
     {
       "after": "DelayedLegacyClaimStartsAfterRelease.a1",
-      "emit": "assert_delayed_legacy_claim_started_after_release",
-      "actor": "worker"
+      "emit": "assert_retained_legacy_claim_started_after_release",
+      "actor": "fulfillment-daemon"
     }
   ],
   "metadata": {
     "module": "AssignmentFenceNetworkCompaction",
     "config": "AssignmentFenceNetworkDefaultAllowMutant.cfg",
-    "mutant": "MutantDefaultAllowUnknown = TRUE"
+    "mutant": "MutantDefaultAllowUnknown = TRUE",
+    "load_bearing_fact": "The start consumes the concrete legacy claim queued by DReceiveUseCS; it is not spontaneous."
   }
 }
