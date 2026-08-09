@@ -1,20 +1,30 @@
 #!/usr/bin/env python3
-"""Reject ambiguous top-level Boolean operators in primed assignments.
+"""Reject ambiguous Boolean precedence in transition conjuncts.
 
 TLA+ equality binds more tightly than ``/\\`` and ``\\/``. Consequently:
 
     /\\ seen' = seen \\/ event
 
 is not one assignment with a Boolean RHS; it is a top-level disjunction whose
-right branch leaves ``seen'`` unconstrained. The same defect applies to an
-unparenthesized top-level conjunction.
+right branch leaves ``seen'`` unconstrained. Likewise, a guard written as:
 
-This linter examines primed-assignment conjuncts in every local ``*.tla``
-module. If an ordinary expression RHS contains a top-level ``/\\`` or ``\\/``,
-it must be parenthesized so the operator is below the assignment. Structured
-RHS forms beginning with IF, CASE, or LET are parsed by their own TLA+ grammar
-and are exempt from this deliberately narrow check. TLA+ line comments and
-nested block comments are removed before assignments are recognized.
+    /\\ claimMade \\/ alreadyStarted
+    /\\ phase' = ...
+
+can let the disjunct escape the surrounding conjunct list and bypass the state
+updates. Ordinary Boolean RHS expressions and guard disjunctions must therefore
+be parenthesized.
+
+This linter examines every root ``*.tla`` module. It rejects:
+
+* a primed assignment whose ordinary RHS contains a top-level ``/\\`` or
+  ``\\/``; and
+* a conjunction bullet whose ordinary guard contains a top-level ``\\/``.
+
+Structured RHS/guard forms beginning with IF, CASE, LET, quantifiers, or CHOOSE
+are parsed by their own TLA+ grammar and are exempt from this deliberately
+narrow check. TLA+ line comments and nested block comments are removed before
+conjuncts are recognized.
 """
 
 from __future__ import annotations
@@ -36,13 +46,22 @@ class Violation:
     variable: str
     operator: str
     rhs: str
+    kind: str = "assignment"
 
 
 _ASSIGNMENT_RE = re.compile(
     r"^(?P<indent>\s*)/\\\s+"
     r"(?P<variable>[A-Za-z_][A-Za-z0-9_]*)'\s*=\s*(?P<rhs>.*)$"
 )
-_STRUCTURED_PREFIXES = ("IF ", "CASE ", "LET ")
+_CONJUNCT_RE = re.compile(r"^(?P<indent>\s*)/\\\s+(?P<rhs>.*)$")
+_STRUCTURED_PREFIXES = (
+    "IF ",
+    "CASE ",
+    "LET ",
+    "\\A ",
+    "\\E ",
+    "CHOOSE ",
+)
 
 
 def _strip_block_comments(text: str) -> str:
@@ -175,44 +194,73 @@ def _top_level_boolean_operator(rhs: str) -> str | None:
     return None
 
 
+def _collect_rhs(
+    lines: list[str], index: int, indent: int, first_fragment: str
+) -> tuple[str, int]:
+    fragments = [first_fragment]
+    cursor = index + 1
+    while cursor < len(lines):
+        line = lines[cursor]
+        if not line.strip():
+            fragments.append(line)
+            cursor += 1
+            continue
+        indentation = len(line) - len(line.lstrip())
+        if indentation <= indent:
+            break
+        fragments.append(line.strip())
+        cursor += 1
+    return "\n".join(fragments).strip(), cursor
+
+
 def lint_text(path: Path, text: str) -> list[Violation]:
     lines = _strip_block_comments(text).splitlines()
     violations: list[Violation] = []
     index = 0
     while index < len(lines):
-        match = _ASSIGNMENT_RE.match(lines[index])
-        if match is None:
-            index += 1
+        assignment = _ASSIGNMENT_RE.match(lines[index])
+        if assignment is not None:
+            indent = len(assignment.group("indent"))
+            rhs, cursor = _collect_rhs(
+                lines, index, indent, assignment.group("rhs")
+            )
+            operator = _top_level_boolean_operator(rhs)
+            if operator is not None:
+                violations.append(
+                    Violation(
+                        path=path,
+                        line=index + 1,
+                        variable=assignment.group("variable"),
+                        operator=operator,
+                        rhs=rhs,
+                        kind="assignment",
+                    )
+                )
+            index = max(index + 1, cursor)
             continue
 
-        assignment_indent = len(match.group("indent"))
-        fragments = [match.group("rhs")]
-        cursor = index + 1
-        while cursor < len(lines):
-            line = lines[cursor]
-            if not line.strip():
-                fragments.append(line)
-                cursor += 1
-                continue
-            indentation = len(line) - len(line.lstrip())
-            if indentation <= assignment_indent:
-                break
-            fragments.append(line.strip())
-            cursor += 1
-
-        rhs = "\n".join(fragments).strip()
-        operator = _top_level_boolean_operator(rhs)
-        if operator is not None:
-            violations.append(
-                Violation(
-                    path=path,
-                    line=index + 1,
-                    variable=match.group("variable"),
-                    operator=operator,
-                    rhs=rhs,
-                )
+        conjunct = _CONJUNCT_RE.match(lines[index])
+        if conjunct is not None:
+            indent = len(conjunct.group("indent"))
+            rhs, cursor = _collect_rhs(
+                lines, index, indent, conjunct.group("rhs")
             )
-        index = max(index + 1, cursor)
+            operator = _top_level_boolean_operator(rhs)
+            if operator == "\\/":
+                violations.append(
+                    Violation(
+                        path=path,
+                        line=index + 1,
+                        variable="<guard>",
+                        operator=operator,
+                        rhs=rhs,
+                        kind="guard",
+                    )
+                )
+            index = max(index + 1, cursor)
+            continue
+
+        index += 1
     return violations
 
 
@@ -245,8 +293,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         for item in violations:
             compact = " ".join(item.rhs.split())
             print(
-                f"{item.path}:{item.line}: primed assignment {item.variable}' "
-                f"has top-level {item.operator}: {compact}",
+                f"{item.path}:{item.line}: {item.kind} conjunct "
+                f"{item.variable} has top-level {item.operator}: {compact}",
                 file=sys.stderr,
             )
         return 1
