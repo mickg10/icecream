@@ -135,6 +135,10 @@ public:
     void appendJob(Job *job);
     void removeJob(Job *job);
     unsigned int lastPickedId();
+    /* Monotonic per-process pick clock: incremented once per recorded
+       assignment; wire-id wrap cannot disturb it.  0 = never picked.  */
+    uint64_t lastPickSeq() const { return m_lastPickSeq; }
+    static uint64_t pickSequence() { return s_pickSequence; }
 
     State state() const;
     void setState(const State state);
@@ -234,6 +238,8 @@ private:
     unsigned int m_connectionGeneration = 0;   // set once in the ctor
     bool m_stallReported = false;
     unsigned int m_lastPickId;
+    uint64_t m_lastPickSeq = 0;
+    static uint64_t s_pickSequence;
 
     Environments m_compilerVersions;  // Available compilers
 

@@ -62,6 +62,7 @@
 #include "selection.h"
 #include "job.h"
 #include "scheduler.h"
+#include "fastest.h"
 
 /* TODO:
    * leak check
@@ -1361,23 +1362,22 @@ static CompileServer *pick_server_random(list<CompileServer *> &eligible)
 
 static CompileServer *pick_server_round_robin(list<CompileServer *> &eligible)
 {
-    unsigned int oldest_job = 0;
+    uint64_t oldest_pick = 0;
     CompileServer *selected = nullptr;
 
-    // The scheduler assigns each job a unique ID from a monotonically increasing
-    // integer sequence starting from 1. When a job is assigned to a compile
-    // server, the scheduler records the assigned job ID, which is then available
-    // from lastPickedId().
+    // Each recorded assignment stamps the server with a monotonic 64-bit
+    // pick sequence (wire job ids may wrap, so they are not a clock);
+    // round robin selects the server whose stamp is oldest.
     for (CompileServer * const cs: eligible) {
 #if DEBUG_SCHEDULER > 1
         trace()
-            << "considering server " << cs->nodeName() << " with last job ID "
-            << cs->lastPickedId() << " and oldest known job ID " << oldest_job
+            << "considering server " << cs->nodeName() << " with last pick seq "
+            << cs->lastPickSeq() << " and oldest known pick seq " << oldest_pick
             << endl;
 #endif
-        if (!selected || cs->lastPickedId() < oldest_job) {
+        if (!selected || cs->lastPickSeq() < oldest_pick) {
             selected = cs;
-            oldest_job = cs->lastPickedId();
+            oldest_pick = cs->lastPickSeq();
         }
     }
     return selected;
@@ -1484,18 +1484,17 @@ static CompileServer *pick_server_fastest(Job *job, list<CompileServer *> &eligi
                 " client count: " << cs->clientCount() << endl;
 #endif
 
-        // Some portion of the selection will go to a host that has not been selected
-        // in a while so we can maintain reasonably up-to-date statistics. The greater
-        // the weight, the less likely this is to happen.
-        uint8_t weight_limit = std::numeric_limits<uint8_t>::max() - STATS_UPDATE_WEIGHT;
-        uint8_t weight_factor = weight_limit / std::numeric_limits<uint8_t>::max();
-
-        // Job IDs are assigned from a monotonically increasing sequence by the
-        // scheduler, and each compile server records the ID of the last job it
-        // ran. We use that here to determine whether a job should simply run on
-        // the "next" host that hasn't seen a job for a long time.
-        if (weight_factor > 0 && (!cs->lastPickedId() ||
-            ((job->id() - cs->lastPickedId()) > (weight_factor * eligible.size())))) {
+        // Some portion of the selection goes to a host that has not been
+        // picked in a while, so its statistics stay reasonably current;
+        // the greater STATS_UPDATE_WEIGHT, the rarer that refresh.  The
+        // policy is the pure inequality in fastest.h (the previous
+        // expression computed its threshold fraction in integer uint8_t
+        // arithmetic, evaluated to zero, and never executed -- a cold or
+        // formerly slow host stayed under-sampled forever).  The distance
+        // clock is the dedicated 64-bit pick sequence, not the wire job
+        // id, which may wrap.
+        if (fastest_should_refresh(CompileServer::pickSequence() - cs->lastPickSeq(),
+                                   STATS_UPDATE_WEIGHT, eligible.size())) {
             best = cs;
             break;
         }

@@ -329,9 +329,12 @@ const list<Job *>& CompileServer::jobList() const
     return m_jobList;
 }
 
+uint64_t CompileServer::s_pickSequence = 0;
+
 void CompileServer::appendJob(Job *job)
 {
     m_lastPickId = job->id();
+    m_lastPickSeq = ++s_pickSequence;
     m_jobList.push_back(job);
 }
 
