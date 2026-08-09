@@ -1,0 +1,67 @@
+{
+  "schema": 1,
+  "scenario": "FSessionECHILDGroupMutant",
+  "property": "CompilerGroupAbsentBeforeQuiesce",
+  "expected_result": "counterexample",
+  "min_states": 5,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "LoseSchedulerSession",
+      "all": [
+        {"path": "phase", "from": "Connected", "to": "Lost"}
+      ]
+    },
+    {
+      "name": "StartCompilerCleanup",
+      "all": [
+        {"path": "phase", "from": "Lost", "to": "Cleaning"},
+        {"path": "compilerDirect", "from": "Alive", "to": "Waitable"}
+      ]
+    },
+    {
+      "name": "ReapDirectCompiler",
+      "all": [
+        {"path": "compilerDirect", "from": "Waitable", "to": "Reaped"},
+        {"path": "scalarKids", "from": 1, "to": 0},
+        {"path": "compilerGroupAlive", "to": true}
+      ]
+    },
+    {
+      "name": "ECHILDDeclaresQuiescenceWithLiveDescendant",
+      "all": [
+        {"path": "phase", "from": "Cleaning", "to": "Quiesced"},
+        {"path": "compilerDirect", "to": "Reaped"},
+        {"path": "compilerGroupAlive", "to": true}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "LoseSchedulerSession",
+    "StartCompilerCleanup",
+    "ReapDirectCompiler",
+    "ECHILDDeclaresQuiescenceWithLiveDescendant"
+  ],
+  "final_all": [
+    {"path": "phase", "eq": "Quiesced"},
+    {"path": "compilerDirect", "eq": "Reaped"},
+    {"path": "compilerGroupAlive", "eq": true}
+  ],
+  "harness_steps": [
+    {
+      "after": "ReapDirectCompiler",
+      "emit": "retain_compiler_descendant_after_direct_child_reap",
+      "actor": "compiler-process-group"
+    },
+    {
+      "after": "ECHILDDeclaresQuiescenceWithLiveDescendant",
+      "emit": "assert_echild_did_not_prove_process_group_absence",
+      "actor": "fulfillment-daemon"
+    }
+  ],
+  "metadata": {
+    "module": "FSessionQuiescenceAbsolute",
+    "config": "FSessionECHILDGroupMutant.cfg",
+    "mutant": "MutantECHILDQuiesces = TRUE"
+  }
+}
