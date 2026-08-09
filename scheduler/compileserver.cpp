@@ -73,8 +73,8 @@ CompileServer::CompileServer(const int fd, struct sockaddr *_addr, const socklen
     , m_blacklist()
     , m_inFd(-1)
     , m_inConnAttempt(0)
-    , m_nextConnTime(0)
-    , m_lastConnStartTime(0)
+    , m_nextConnMono(0)
+    , m_connStartMono(0)
     , m_acceptingInConnection(true)
 {
 }
@@ -523,15 +523,36 @@ int CompileServer::getInFd() const
 
 void CompileServer::startInConnectionTest()
 {
-    if (m_noRemote || getConnectionInProgress() || (m_nextConnTime > time(nullptr)))
+    if (m_noRemote || getConnectionInProgress()
+            || (m_nextConnMono > icecream_monotonic_msec()))
     {
         return;
     }
 
+    /* Every resource this attempt needs is VALIDATED before use, and every
+       terminal path below owns exactly one close/reset of the probe fd
+       (via updateInConnectivity).  */
     m_inFd = socket(PF_INET, SOCK_STREAM, 0);
-    fcntl(m_inFd, F_SETFL, O_NONBLOCK);
+    if (m_inFd < 0)
+    {
+        updateInConnectivity(false);
+        return;
+    }
+    const int flags = fcntl(m_inFd, F_GETFL, 0);
+    if (flags < 0 || fcntl(m_inFd, F_SETFL, flags | O_NONBLOCK) < 0)
+    {
+        updateInConnectivity(false);
+        return;
+    }
 
     struct hostent *host = gethostbyname(name.c_str());
+    if (!host || !host->h_addr_list || !host->h_addr_list[0]
+            || host->h_addrtype != AF_INET
+            || host->h_length != (int)sizeof(struct in_addr))
+    {
+        updateInConnectivity(false);
+        return;
+    }
 
     struct sockaddr_in remote_addr;
     remote_addr.sin_family = AF_INET;
@@ -539,16 +560,24 @@ void CompileServer::startInConnectionTest()
     memcpy(&remote_addr.sin_addr.s_addr, host->h_addr_list[0], host->h_length);
     memset(remote_addr.sin_zero, '\0', sizeof(remote_addr.sin_zero));
 
+    /* The attempt clock starts BEFORE connect: a synchronous success must
+       be judged against THIS attempt, not the previous attempt's start
+       time (which made getConnectionTimeout() read 0 and record an
+       immediate success as a failure).  */
+    m_connStartMono = icecream_monotonic_msec();
     int status = connect(m_inFd, (struct sockaddr *)&remote_addr, sizeof(remote_addr));
-    if(status == 0)
+    if (status == 0)
     {
-        updateInConnectivity(isConnected());
+        /* Synchronous completion: the verdict is SO_ERROR, directly.  */
+        int error = 0;
+        socklen_t err_len = sizeof(error);
+        updateInConnectivity(getsockopt(m_inFd, SOL_SOCKET, SO_ERROR,
+                                        &error, &err_len) == 0 && error == 0);
     }
     else if (!(errno == EINPROGRESS || errno == EAGAIN))
     {
         updateInConnectivity(false);
     }
-    m_lastConnStartTime=time(nullptr);
 }
 
 void CompileServer::updateInConnectivity(bool acceptingIn)
@@ -580,9 +609,12 @@ void CompileServer::updateInConnectivity(bool acceptingIn)
                 ":" << m_remotePort <<
                 ") is accepting incoming connections." << endl;
         }
-        m_nextConnTime = time(nullptr) + check_back_time;
-        close(m_inFd);
-        m_inFd = -1;
+        m_nextConnMono = icecream_monotonic_msec()
+                         + (uint64_t)check_back_time * 1000;
+        if (m_inFd >= 0) {
+            close(m_inFd);
+            m_inFd = -1;
+        }
     }
     else
     {
@@ -596,14 +628,17 @@ void CompileServer::updateInConnectivity(bool acceptingIn)
         }
         const unsigned int idx =
             m_inConnAttempt < table_size ? m_inConnAttempt : (unsigned int)(table_size - 1);
-        m_nextConnTime = time(nullptr) + time_offset_table[idx];
+        m_nextConnMono = icecream_monotonic_msec()
+                         + (uint64_t)time_offset_table[idx] * 1000;
         if(m_inConnAttempt < (table_size - 1))
             m_inConnAttempt++;
         trace()  << nodeName() << " failed to accept an incoming connection on "
             << name << ":" << m_remotePort << " attempting again in "
-            << m_nextConnTime - time(nullptr) << " seconds" << endl;
-        close(m_inFd);
-        m_inFd = -1;
+            << (m_nextConnMono - icecream_monotonic_msec()) / 1000 << " seconds" << endl;
+        if (m_inFd >= 0) {
+            close(m_inFd);
+            m_inFd = -1;
+        }
     }
 
 }
@@ -612,28 +647,24 @@ bool CompileServer::isConnected()
 {
     if (getConnectionTimeout() == 0)
     {
-        return false;
+        return false;   /* the attempt's monotonic deadline expired */
     }
-    struct hostent *host = gethostbyname(name.c_str());
-
-    struct sockaddr_in remote_addr;
-    remote_addr.sin_family = AF_INET;
-    remote_addr.sin_port = htons(remotePort());
-    memcpy(&remote_addr.sin_addr.s_addr, host->h_addr_list[0], host->h_length);
-    memset(remote_addr.sin_zero, '\0', sizeof(remote_addr.sin_zero));
-
+    /* The verdict is SO_ERROR on the probe fd; the resolver has nothing to
+       add here (the old code re-resolved the name and built an address it
+       never used).  */
     int error = 0;
     socklen_t err_len= sizeof(error);
     return (getsockopt(m_inFd, SOL_SOCKET, SO_ERROR, &error, &err_len) == 0 && error == 0);
-
 }
 
 time_t CompileServer::getConnectionTimeout()
 {
-    time_t now = time(nullptr);
-    time_t elapsed_time = now - m_lastConnStartTime;
-    time_t max_timeout = 5;
-    return (elapsed_time < max_timeout) ? max_timeout - elapsed_time : 0;
+    const uint64_t now = icecream_monotonic_msec();
+    const uint64_t elapsed = now >= m_connStartMono ? now - m_connStartMono : 0;
+    const uint64_t max_ms = 5000;
+    /* Whole seconds, rounded UP: a not-yet-expired attempt must never
+       report 0 (0 is the expired verdict).  */
+    return (elapsed < max_ms) ? (time_t)((max_ms - elapsed + 999) / 1000) : 0;
 }
 
 bool CompileServer::getConnectionInProgress()
@@ -651,6 +682,9 @@ time_t CompileServer::getNextTimeout()
     {
         return getConnectionTimeout();
     }
-    time_t until_connect = m_nextConnTime - time(nullptr);
-    return (until_connect > 0) ? until_connect : 0;
+    const uint64_t now = icecream_monotonic_msec();
+    if (m_nextConnMono <= now) {
+        return 0;
+    }
+    return (time_t)((m_nextConnMono - now + 999) / 1000);
 }

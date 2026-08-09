@@ -25,6 +25,7 @@
 #define COMPILESERVER_H
 
 #include <string>
+#include <stdint.h>
 #include <list>
 #include <set>
 #include <map>
@@ -255,8 +256,10 @@ private:
 
     int m_inFd;
     unsigned int m_inConnAttempt;
-    time_t m_nextConnTime;
-    time_t m_lastConnStartTime;
+    /* Monotonic milliseconds (icecream_monotonic_msec): retry and attempt
+       deadlines must not move when the wall clock steps.  */
+    uint64_t m_nextConnMono;
+    uint64_t m_connStartMono;
     bool m_acceptingInConnection;
 };
 

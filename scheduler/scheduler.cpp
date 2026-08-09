@@ -3806,14 +3806,22 @@ int main(int argc, char *argv[])
             }
             if((*it)->getConnectionInProgress())
             {
-                if(active_fds > 0 && pollfd_is_set(pollfds, (*it)->getInFd(), POLLIN | POLLOUT) && (*it)->isConnected())
-                {
-                    active_fds--;
-                    (*it)->updateInConnectivity(true);
-                }
-                else if((active_fds == 0 || pollfd_is_set(pollfds, (*it)->getInFd(), POLLIN | POLLOUT)) && !(*it)->isConnected())
-                {
-                    (*it)->updateInConnectivity(false);
+                const bool woke = active_fds > 0
+                    && pollfd_is_set(pollfds, (*it)->getInFd(), POLLIN | POLLOUT);
+                if (woke || active_fds == 0) {
+                    /* Read the completion verdict exactly ONCE per wake:
+                       SO_ERROR is clear-on-read, so the old double call
+                       (one per branch) consumed a refused connection's
+                       error in the first test and read 0 in the second --
+                       the probe then idled out its whole 5s deadline
+                       instead of failing fast.  */
+                    const bool up = (*it)->isConnected();
+                    if (woke && up) {
+                        active_fds--;
+                        (*it)->updateInConnectivity(true);
+                    } else if (!up) {
+                        (*it)->updateInConnectivity(false);
+                    }
                 }
             }
         }
