@@ -322,16 +322,28 @@ TypeOK ==
 
 EpochCoherence ==
     /\ workerEpoch = currentEpoch
-    /\ recordAssignment # NoAssignment
-       => EpochOf(recordAssignment) = currentEpoch
+    /\ (recordAssignment = NoAssignment
+        \/ EpochOf(recordAssignment) = currentEpoch)
 
 RecordCoherence ==
-    /\ (recordAssignment = NoAssignment) <=> (recordState = "NoRecord")
-    /\ recordAssignment # NoAssignment
-       => /\ recordState \in LiveRecordStates
-          /\ workerSlot[recordAssignment]
-          /\ phase[recordAssignment] \in
-                {"Prepared", "Ready", "Delivered", "Claimed", "Started"}
+    /\ ((recordAssignment = NoAssignment) <=> (recordState = "NoRecord"))
+    /\ (recordAssignment = NoAssignment
+        \/ /\ recordState \in LiveRecordStates
+           /\ workerSlot[recordAssignment]
+           /\ phase[recordAssignment] \in
+                 {"Prepared", "Ready", "Delivered", "Claimed", "Started"})
+
+ReadyCoherence ==
+    \A a \in Assignments :
+        readyPending[a]
+        => /\ phase[a] = "Prepared"
+           /\ recordAssignment = a
+           /\ recordState = "Reserved"
+
+RevokeResultCoherence ==
+    \A a \in Assignments :
+        /\ (revokeResult[a] = "Revoked" => phase[a] = "Revoked")
+        /\ (revokeResult[a] = "Started" => phase[a] = "Started")
 
 ReservationCoherence ==
     \A a \in Assignments :
@@ -362,19 +374,25 @@ NoUnauthorizedStart ==
 
 TokenRequiredExactness ==
     \A a \in Assignments :
-        PolicyOf(a) = TokenRequired /\ phase[a] \in ClaimEvidencePhases
+        PolicyOf(a) = TokenRequired
+        /\ phase[a] \in ClaimEvidencePhases
+        /\ claimSource[a] # NoAssignment
         => /\ claimHadToken[a]
            /\ claimSource[a] = a
 
 LegacyClaimPolicy ==
     \A a \in Assignments :
-        phase[a] \in ClaimEvidencePhases /\ ~claimHadToken[a]
+        phase[a] \in ClaimEvidencePhases
+        /\ claimSource[a] # NoAssignment
+        /\ ~claimHadToken[a]
         => PolicyOf(a) = LegacyId
 
 SafetyInvariant ==
     /\ TypeOK
     /\ EpochCoherence
     /\ RecordCoherence
+    /\ ReadyCoherence
+    /\ RevokeResultCoherence
     /\ ReservationCoherence
     /\ WorkerSlotCoherence
     /\ TerminalAtMostOnce
