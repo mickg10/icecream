@@ -4844,22 +4844,6 @@ int Daemon::scheduler_use_cs(UseCSMsg *msg)
         c->set_status(Client::FORWARDING_USE_CS, "scheduler_use_cs: forwarding UseCS");
         ++usecs_delivery_attempts;
 
-        /* Test-only injection seam (issue #4 P0-A traces): with
-           ICECC_TEST_USECS_FORWARD_FAIL=<n>, the nth forward attempt fails
-           deterministically before any frame byte reaches the client --
-           the socket is shut down so the framed write below reports the
-           failure through the normal path.  Unset in production.  */
-        {
-            static long test_fail_at = -2;
-            if (test_fail_at == -2) {
-                const char *e = getenv("ICECC_TEST_USECS_FORWARD_FAIL");
-                test_fail_at = e ? atol(e) : -1;
-            }
-            if (test_fail_at >= 0 && (long)usecs_delivery_attempts == test_fail_at) {
-                shutdown(c->channel->fd, SHUT_RDWR);
-            }
-        }
-
         if (!c->channel->send_msg(*msg)) {
             ++usecs_exact_aborts;
             handle_end(c, 143);
