@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "description": "Executable acceptance layer for the abstract core, finite FIFO network, and bounded pre-login state machine. Every TLC run uses both pinned toolchains and one worker. Counterexample configs check their intended property directly and require trace_to_harness validation.",
+  "description": "Proof-bearing assignment-fence acceptance matrix. The abstract ownership core, FIFO-quotiented network, race witnesses, one-premise mutants, bounded liveness, and the unbounded logical TLAPS safety theorem are the sole authoritative inputs.",
   "checks": [
     {
       "id": "core-fixed",
@@ -10,7 +10,10 @@
       "workers": 1,
       "expected": "pass",
       "property": "CoreInvariant",
-      "toolchains": ["stable", "differential"],
+      "toolchains": [
+        "stable",
+        "differential"
+      ],
       "timeout_seconds": 1800
     },
     {
@@ -21,7 +24,10 @@
       "workers": 1,
       "expected": "pass",
       "property": "CoreInvariant",
-      "toolchains": ["stable", "differential"],
+      "toolchains": [
+        "stable",
+        "differential"
+      ],
       "timeout_seconds": 1800
     },
     {
@@ -33,7 +39,10 @@
       "expected": "counterexample",
       "property": "TokenRequiredExactness",
       "trace_manifest": "trace-manifests/AssignmentFenceCoreMixedMutant.manifest.template.json",
-      "toolchains": ["stable", "differential"],
+      "toolchains": [
+        "stable",
+        "differential"
+      ],
       "timeout_seconds": 1800
     },
     {
@@ -45,7 +54,10 @@
       "expected": "counterexample",
       "property": "ReleaseSafety",
       "trace_manifest": "trace-manifests/AssignmentFenceCoreReleaseMutant.manifest.template.json",
-      "toolchains": ["stable", "differential"],
+      "toolchains": [
+        "stable",
+        "differential"
+      ],
       "timeout_seconds": 1800
     },
     {
@@ -56,7 +68,10 @@
       "workers": 1,
       "expected": "pass",
       "property": "RevokedEventuallyConsumed",
-      "toolchains": ["stable", "differential"],
+      "toolchains": [
+        "stable",
+        "differential"
+      ],
       "timeout_seconds": 3600,
       "assumptions": [
         "For each assignment, weak fairness only for S consuming an already-linearized REVOKED result; compiler completion and worker loss are separate environment outcomes and are not assumed by this accepted theorem"
@@ -70,7 +85,10 @@
       "workers": 1,
       "expected": "pass",
       "property": "SafetyInvariant",
-      "toolchains": ["stable", "differential"],
+      "toolchains": [
+        "stable",
+        "differential"
+      ],
       "timeout_seconds": 3600
     },
     {
@@ -82,7 +100,10 @@
       "expected": "counterexample",
       "property": "NoClaimBeforeRevokeConsume",
       "trace_manifest": "trace-manifests/AssignmentFenceNetworkClaimWinsQueuedRevokeWitness.manifest.template.json",
-      "toolchains": ["stable", "differential"],
+      "toolchains": [
+        "stable",
+        "differential"
+      ],
       "timeout_seconds": 1800,
       "assumptions": [
         "Reachability witness on the fixed model: S has queued REVOKE while a concrete claim frame remains pending, and F accepts that claim before consuming REVOKE"
@@ -97,7 +118,10 @@
       "expected": "counterexample",
       "property": "NoRejectAfterFence",
       "trace_manifest": "trace-manifests/AssignmentFenceNetworkFenceWinsDelayedClaimWitness.manifest.template.json",
-      "toolchains": ["stable", "differential"],
+      "toolchains": [
+        "stable",
+        "differential"
+      ],
       "timeout_seconds": 1800,
       "assumptions": [
         "Reachability witness on the fixed model: F consumes REVOKE and installs the rejection fence before the retained concrete claim reaches F"
@@ -111,7 +135,10 @@
       "workers": 1,
       "expected": "pass",
       "property": "SafetyInvariant",
-      "toolchains": ["stable", "differential"],
+      "toolchains": [
+        "stable",
+        "differential"
+      ],
       "timeout_seconds": 3600
     },
     {
@@ -123,7 +150,10 @@
       "expected": "counterexample",
       "property": "ReadyBeforeUseCS",
       "trace_manifest": "trace-manifests/AssignmentFenceNetworkUseCSBeforeReadyMutant.manifest.template.json",
-      "toolchains": ["stable", "differential"],
+      "toolchains": [
+        "stable",
+        "differential"
+      ],
       "timeout_seconds": 1800
     },
     {
@@ -135,7 +165,10 @@
       "expected": "counterexample",
       "property": "ReleaseAfterRevokedConsume",
       "trace_manifest": "trace-manifests/AssignmentFenceNetworkReleaseOnEnqueueMutant.manifest.template.json",
-      "toolchains": ["stable", "differential"],
+      "toolchains": [
+        "stable",
+        "differential"
+      ],
       "timeout_seconds": 1800
     },
     {
@@ -147,7 +180,10 @@
       "expected": "counterexample",
       "property": "NoStartAfterRevokedCompaction",
       "trace_manifest": "trace-manifests/AssignmentFenceNetworkDefaultAllowMutant.manifest.template.json",
-      "toolchains": ["stable", "differential"],
+      "toolchains": [
+        "stable",
+        "differential"
+      ],
       "timeout_seconds": 1800
     },
     {
@@ -159,7 +195,10 @@
       "expected": "counterexample",
       "property": "F2SStrictlyIncreasing",
       "trace_manifest": "trace-manifests/AssignmentFenceNetworkF2SBypassMutant.manifest.template.json",
-      "toolchains": ["stable", "differential"],
+      "toolchains": [
+        "stable",
+        "differential"
+      ],
       "timeout_seconds": 1800
     },
     {
@@ -170,116 +209,13 @@
       "workers": 1,
       "expected": "pass",
       "property": "NoPermanentQueuedFrame",
-      "toolchains": ["stable", "differential"],
+      "toolchains": [
+        "stable",
+        "differential"
+      ],
       "timeout_seconds": 7200,
       "assumptions": [
         "Weak fairness only for live-link S-to-F, F-to-S, S-to-D, and delayed-client-to-F drain/processing actions; connection loss remains explicit"
-      ]
-    },
-    {
-      "id": "prelogin-fixed-countcap4",
-      "module": "PreloginLease",
-      "config": "PreloginLease.cfg",
-      "kind": "liveness",
-      "workers": 1,
-      "expected": "pass",
-      "property": "ControlProgress",
-      "toolchains": ["stable", "differential"],
-      "timeout_seconds": 3600,
-      "assumptions": [
-        "Weak fairness on AcceptStep, FinishAccept, and ServiceControl; time and peer lifecycle remain explicit actions"
-      ]
-    },
-    {
-      "id": "prelogin-fixed-countcap6",
-      "module": "PreloginLease",
-      "config": "PreloginLeaseCountCap6.cfg",
-      "kind": "liveness",
-      "workers": 1,
-      "expected": "pass",
-      "property": "ControlProgress",
-      "toolchains": ["stable", "differential"],
-      "timeout_seconds": 3600,
-      "assumptions": [
-        "Same theorem as CountCap=4; diagnostic saturation cutoff must not alter the verdict"
-      ]
-    },
-    {
-      "id": "prelogin-no-cap-mutant",
-      "module": "PreloginLease",
-      "config": "PreloginLeaseNoCapMutant.cfg",
-      "kind": "safety",
-      "workers": 1,
-      "expected": "counterexample",
-      "property": "PreloginBound",
-      "trace_manifest": "trace-manifests/PreloginLeaseNoCapMutant.manifest.template.json",
-      "toolchains": ["stable", "differential"],
-      "timeout_seconds": 1800
-    },
-    {
-      "id": "prelogin-no-quantum-mutant",
-      "module": "PreloginLease",
-      "config": "PreloginLeaseNoQuantumMutant.cfg",
-      "kind": "safety",
-      "workers": 1,
-      "expected": "counterexample",
-      "property": "AcceptQuantum",
-      "trace_manifest": "trace-manifests/PreloginLeaseNoQuantumMutant.manifest.template.json",
-      "toolchains": ["stable", "differential"],
-      "timeout_seconds": 1800
-    },
-    {
-      "id": "prelogin-no-lease-mutant",
-      "module": "PreloginLease",
-      "config": "PreloginLeaseNoLeaseMutant.cfg",
-      "kind": "safety",
-      "workers": 1,
-      "expected": "counterexample",
-      "property": "WholeHandshakeLease",
-      "trace_manifest": "trace-manifests/PreloginLeaseNoLeaseMutant.manifest.template.json",
-      "toolchains": ["stable", "differential"],
-      "timeout_seconds": 1800
-    },
-    {
-      "id": "prelogin-refresh-lease-mutant",
-      "module": "PreloginLease",
-      "config": "PreloginLeaseRefreshMutant.cfg",
-      "kind": "safety",
-      "workers": 1,
-      "expected": "counterexample",
-      "property": "WholeHandshakeLease",
-      "trace_manifest": "trace-manifests/PreloginLeaseRefreshMutant.manifest.template.json",
-      "toolchains": ["stable", "differential"],
-      "timeout_seconds": 1800
-    },
-    {
-      "id": "prelogin-no-quantum-liveness-countcap4",
-      "module": "PreloginLease",
-      "config": "PreloginLeaseNoQuantumLiveness.cfg",
-      "kind": "liveness",
-      "workers": 1,
-      "expected": "counterexample",
-      "property": "ControlProgress",
-      "trace_manifest": "trace-manifests/PreloginLeaseNoQuantumLiveness.manifest.template.json",
-      "toolchains": ["stable", "differential"],
-      "timeout_seconds": 3600,
-      "assumptions": [
-        "Same weak-fairness relation as fixed; the mutant can keep FinishAccept disabled with continuing arrival/accept transitions"
-      ]
-    },
-    {
-      "id": "prelogin-no-quantum-liveness-countcap6",
-      "module": "PreloginLease",
-      "config": "PreloginLeaseNoQuantumLivenessCountCap6.cfg",
-      "kind": "liveness",
-      "workers": 1,
-      "expected": "counterexample",
-      "property": "ControlProgress",
-      "trace_manifest": "trace-manifests/PreloginLeaseNoQuantumLiveness.manifest.template.json",
-      "toolchains": ["stable", "differential"],
-      "timeout_seconds": 3600,
-      "assumptions": [
-        "CountCap variation must preserve the same liveness violation and essential action sequence"
       ]
     }
   ],

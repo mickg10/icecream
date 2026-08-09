@@ -58,6 +58,34 @@ class ProoflessRunnerContractTests(unittest.TestCase):
                 self.manifest(proofs=[{"id": "proof", "file": "P.tla"}])
             )
 
+    def test_exact_retained_proof_inventory_is_accepted_only_when_declared(self) -> None:
+        proof = {
+            "id": "proof",
+            "file": "P.tla",
+            "expected": "pass",
+            "timeout_seconds": 10,
+        }
+        checked = module._validate_proofless_manifest(
+            self.manifest(proofs=[proof]), allowed_proofs=[proof]
+        )
+        self.assertEqual(checked["proofs"], [proof])
+        with self.assertRaisesRegex(
+            module.TlcOnlyContractError, "proof inventory mismatch"
+        ):
+            module._validate_proofless_manifest(
+                self.manifest(proofs=[proof]), allowed_proofs=[]
+            )
+
+    def test_assignment_fence_tlc_wrapper_retains_exact_proof_row(self) -> None:
+        wrapper = Path(__file__).with_name("run_assignment_fence_tlc_checks_v4.py")
+        text = wrapper.read_text(encoding="utf-8")
+        self.assertIn(
+            'required_manifest_name="assignment-fence-formal-checks-v1.json"',
+            text,
+        )
+        self.assertIn('allowed_proofs=PROOFS', text)
+        self.assertIn('mode="assignment-fence-tlc-phase"', text)
+
     def test_toolchain_order_is_part_of_contract(self) -> None:
         document = self.manifest()
         document["checks"][0]["toolchains"] = ["differential", "stable"]
