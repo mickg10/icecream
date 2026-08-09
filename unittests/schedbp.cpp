@@ -792,6 +792,45 @@ int main(int argc, char **argv)
     auto finish_job = [&](unsigned int job_id, unsigned int real_msec) {
         enqueue_confirm(job_id, false, true, real_msec);
     };
+    /* The scheduler PROBES every remote-capable daemon's advertised port
+       and marks it not-accepting -- hence ineligible for dispatch -- when
+       the connect is refused.  The old probe misread a refused connect as
+       a success (SO_ERROR is clear-on-read, and the verdict was polled
+       twice per wake), which MASKED that this harness never listened on
+       the ports its fake workers advertise: the suite only stayed green
+       through that product bug.  With the probe honest, the fake workers
+       must be genuinely reachable -- accept and immediately close.  */
+    auto probe_acceptor = [&](int port) {
+        const int lfd = socket(AF_INET, SOCK_STREAM, 0);
+        if (lfd < 0) { return; }
+        int one = 1;
+        setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        struct sockaddr_in la;
+        memset(&la, 0, sizeof(la));
+        la.sin_family = AF_INET;
+        la.sin_addr.s_addr = htonl(INADDR_ANY);
+        la.sin_port = htons((uint16_t)port);
+        if (bind(lfd, (struct sockaddr *)&la, sizeof(la)) != 0
+                || listen(lfd, 16) != 0) {
+            close(lfd);
+            return;
+        }
+        while (!shutdown) {
+            struct pollfd pf = { lfd, POLLIN, 0 };
+            if (poll(&pf, 1, 200) > 0) {
+                const int c = accept(lfd, nullptr, nullptr);
+                if (c >= 0) { close(c); }
+            }
+        }
+        close(lfd);
+    };
+    /* One acceptor per port any fake worker in this harness advertises
+       (fakecs, the teardown alt worker, fakecsB/aarch64, fakecsC).  */
+    for (const int accept_port : { (int)kCsPort, 10250, 10261, 10262 }) {
+        std::thread t([&, accept_port] { probe_acceptor(accept_port); });
+        t.detach();
+    }
+
     std::thread cs_thread([&] {
         // keep the CS side drained, confirm assignments promptly (a real CS
         // sends JobBegin as soon as the client connects), and periodically
@@ -1540,6 +1579,8 @@ int main(int argc, char **argv)
             const unsigned bigN = 24000;
             std::atomic<int> repliesF1{0}, repliesF2{0};
             std::atomic<bool> stop_bigs{false};
+            
+            
             auto big_daemon = [&](const char *name, unsigned cid,
                                   std::atomic<int> *counter) {
                 MsgChannel *ch = connect_daemon(port, 0);
