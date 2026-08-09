@@ -1,0 +1,82 @@
+{
+  "schema": 1,
+  "scenario": "FSessionPerChildDeadlineMutant",
+  "property": "AbsoluteWholeSessionDeadline",
+  "expected_result": "counterexample",
+  "min_states": 7,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "LoseSchedulerSession",
+      "all": [
+        {"path": "phase", "from": "Connected", "to": "Lost"}
+      ]
+    },
+    {
+      "name": "StartCompilerCleanup",
+      "all": [
+        {"path": "phase", "from": "Lost", "to": "Cleaning"},
+        {"path": "compilerDirect", "from": "Alive", "to": "Waitable"}
+      ]
+    },
+    {
+      "name": "ReapDirectCompiler",
+      "all": [
+        {"path": "compilerDirect", "from": "Waitable", "to": "Reaped"},
+        {"path": "compilerGroupAlive", "to": true}
+      ]
+    },
+    {
+      "name": "ResetDeadlineForGroupCheck",
+      "all": [
+        {"path": "deadlineReset", "from": false, "to": true},
+        {"path": "localTicks", "to": 0},
+        {"path": "totalTicks", "unchanged": true},
+        {"path": "compilerGroupAlive", "to": true}
+      ]
+    },
+    {
+      "name": "TickPastAbsoluteDeadline",
+      "all": [
+        {"path": "totalTicks", "from": 2, "to": 3},
+        {"path": "deadlineReset", "to": true},
+        {"path": "compilerGroupAlive", "to": true}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "LoseSchedulerSession",
+    "StartCompilerCleanup",
+    "ReapDirectCompiler",
+    "ResetDeadlineForGroupCheck",
+    "TickPastAbsoluteDeadline"
+  ],
+  "final_all": [
+    {"path": "totalTicks", "eq": 3},
+    {"path": "deadlineReset", "eq": true},
+    {"path": "compilerGroupAlive", "eq": true}
+  ],
+  "harness_steps": [
+    {
+      "after": "ReapDirectCompiler",
+      "emit": "begin_process_group_absence_check_under_same_session_deadline",
+      "actor": "fulfillment-daemon"
+    },
+    {
+      "after": "ResetDeadlineForGroupCheck",
+      "emit": "assert_cleanup_deadline_was_incorrectly_restarted",
+      "actor": "fulfillment-daemon"
+    },
+    {
+      "after": "TickPastAbsoluteDeadline",
+      "emit": "assert_old_session_cleanup_exceeded_absolute_deadline",
+      "actor": "test-clock"
+    }
+  ],
+  "metadata": {
+    "module": "FSessionQuiescenceAbsolute",
+    "config": "FSessionPerChildDeadlineMutant.cfg",
+    "mutant": "MutantPerChildDeadline = TRUE",
+    "absolute_deadline": 2
+  }
+}
