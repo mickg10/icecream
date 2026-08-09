@@ -1,0 +1,59 @@
+{
+  "schema": 1,
+  "scenario": "PreloginLeaseNoQuantumMutant",
+  "property": "AcceptQuantum",
+  "expected_result": "counterexample",
+  "min_states": 7,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "AcceptOne",
+      "all": [
+        {"path": "acceptedThisTurn", "from": 0, "to": 1},
+        {"path": "socketAcceptedTotal", "delta": 1}
+      ]
+    },
+    {
+      "name": "AcceptTwo",
+      "all": [
+        {"path": "acceptedThisTurn", "from": 1, "to": 2},
+        {"path": "socketAcceptedTotal", "delta": 1}
+      ]
+    },
+    {
+      "name": "AcceptThreeBeyondQuantum",
+      "all": [
+        {"path": "acceptedThisTurn", "from": 2, "to": 3},
+        {"path": "socketAcceptedTotal", "delta": 1},
+        {"path": "loopPhase", "to": "Accept"}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "AcceptOne",
+    "AcceptTwo",
+    "AcceptThreeBeyondQuantum"
+  ],
+  "final_all": [
+    {"path": "acceptedThisTurn", "eq": 3},
+    {"path": "loopPhase", "eq": "Accept"}
+  ],
+  "harness_steps": [
+    {
+      "after": "AcceptTwo",
+      "emit": "barrier_accept_quantum_exhausted",
+      "actor": "scheduler"
+    },
+    {
+      "after": "AcceptThreeBeyondQuantum",
+      "emit": "assert_third_accept_occurred_in_same_turn",
+      "actor": "scheduler"
+    }
+  ],
+  "metadata": {
+    "module": "PreloginLease",
+    "config": "PreloginLeaseNoQuantumMutant.cfg",
+    "mutant": "MutantNoQuantum = TRUE",
+    "bound": "Q = 2"
+  }
+}
