@@ -1,0 +1,65 @@
+{
+  "schema": 1,
+  "scenario": "UseCSHandoffCut3Witness",
+  "property": "NoFailureAt3",
+  "expected_result": "counterexample",
+  "min_states": 6,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "BeginForwardWithExactId",
+      "all": [
+        {"path": "phase", "from": "Idle", "to": "Forwarding"},
+        {"path": "exactIdKnown", "from": false, "to": true}
+      ]
+    },
+    {
+      "name": "WriteClientFrameByte",
+      "all": [
+        {"path": "phase", "from": "Forwarding", "to": "Forwarding"},
+        {"path": "bytesWritten", "delta": 1},
+        {"path": "frameCommitted", "to": false}
+      ]
+    },
+    {
+      "name": "FailOneByteShort",
+      "all": [
+        {"path": "phase", "from": "Forwarding", "to": "ExactAbortPending"},
+        {"path": "failureObservedAt", "from": "NO_FAILURE", "to": 3},
+        {"path": "bytesWritten", "to": 3},
+        {"path": "frameCommitted", "to": false}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "BeginForwardWithExactId",
+    "WriteClientFrameByte",
+    "WriteClientFrameByte",
+    "WriteClientFrameByte",
+    "FailOneByteShort"
+  ],
+  "final_all": [
+    {"path": "phase", "eq": "ExactAbortPending"},
+    {"path": "failureObservedAt", "eq": 3},
+    {"path": "exactIdKnown", "eq": true},
+    {"path": "frameCommitted", "eq": false}
+  ],
+  "harness_steps": [
+    {
+      "after": "WriteClientFrameByte",
+      "occurrence": 3,
+      "emit": "cut_usecs_one_byte_short_of_commit",
+      "actor": "client-channel"
+    },
+    {
+      "after": "FailOneByteShort",
+      "emit": "assert_exact_abort_pending_before_frame_commit",
+      "actor": "submitter-daemon"
+    }
+  ],
+  "metadata": {
+    "module": "UseCSHandoff",
+    "config": "UseCSHandoffCut3Witness.cfg",
+    "cut": "final-byte-short"
+  }
+}
