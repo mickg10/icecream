@@ -1,0 +1,74 @@
+{
+  "schema": 1,
+  "scenario": "AssignmentFenceNetworkReleaseOnEnqueueMutant",
+  "property": "ReleaseAfterRevokedConsume",
+  "expected_result": "counterexample",
+  "min_states": 5,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "SPrepare.a0",
+      "all": [
+        {"path": "phase.a0", "from": "Absent", "to": "PrepareQueued"}
+      ]
+    },
+    {
+      "name": "FReceivePrepare.a0",
+      "all": [
+        {"path": "phase.a0", "from": "PrepareQueued", "to": "Prepared"},
+        {"path": "workerSlot.a0", "from": false, "to": true},
+        {"path": "f2s", "len_delta": 1}
+      ]
+    },
+    {
+      "name": "SQueueRevoke.a0",
+      "all": [
+        {"path": "phase.a0", "from_in": ["Prepared", "Ready", "UseCSQueued", "DeliveryUncertain", "Claimed"], "to": "RevokeQueued"},
+        {"path": "s2f", "len_delta": 1}
+      ]
+    },
+    {
+      "name": "FReleaseOnRevokedEnqueue.a0",
+      "all": [
+        {"path": "revokedEnqueued.a0", "from": false, "to": true},
+        {"path": "workerSlot.a0", "from": true, "to": false},
+        {"path": "released.a0", "from": false, "to": true},
+        {"path": "revokedConsumed.a0", "to": false}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "SPrepare.a0",
+    "FReceivePrepare.a0",
+    "SQueueRevoke.a0",
+    "FReleaseOnRevokedEnqueue.a0"
+  ],
+  "final_all": [
+    {"path": "released.a0", "eq": true},
+    {"path": "revokedEnqueued.a0", "eq": true},
+    {"path": "revokedConsumed.a0", "eq": false},
+    {"path": "schedulerReservation.a0", "eq": false}
+  ],
+  "harness_steps": [
+    {
+      "after": "FReceivePrepare.a0",
+      "emit": "barrier_after_worker_slot_reserved",
+      "actor": "worker"
+    },
+    {
+      "after": "SQueueRevoke.a0",
+      "emit": "barrier_revoke_queued_not_processed",
+      "actor": "scheduler"
+    },
+    {
+      "after": "FReleaseOnRevokedEnqueue.a0",
+      "emit": "assert_scheduler_released_before_consuming_revoked",
+      "actor": "scheduler"
+    }
+  ],
+  "metadata": {
+    "module": "AssignmentFenceNetwork",
+    "config": "AssignmentFenceNetworkReleaseOnEnqueueMutant.cfg",
+    "mutant": "MutantReleaseOnFEnqueue = TRUE"
+  }
+}
