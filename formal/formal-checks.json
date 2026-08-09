@@ -74,6 +74,36 @@
       "timeout_seconds": 3600
     },
     {
+      "id": "network-claim-wins-queued-revoke-witness",
+      "module": "AssignmentFenceNetwork",
+      "config": "AssignmentFenceNetworkClaimWinsQueuedRevokeWitness.cfg",
+      "kind": "safety",
+      "workers": 1,
+      "expected": "counterexample",
+      "property": "NoClaimBeforeRevokeConsume",
+      "trace_manifest": "trace-manifests/AssignmentFenceNetworkClaimWinsQueuedRevokeWitness.manifest.template.json",
+      "toolchains": ["stable", "differential"],
+      "timeout_seconds": 1800,
+      "assumptions": [
+        "Reachability witness on the fixed model: S has queued REVOKE while a concrete claim frame remains pending, and F accepts that claim before consuming REVOKE"
+      ]
+    },
+    {
+      "id": "network-fence-wins-delayed-claim-witness",
+      "module": "AssignmentFenceNetwork",
+      "config": "AssignmentFenceNetworkFenceWinsDelayedClaimWitness.cfg",
+      "kind": "safety",
+      "workers": 1,
+      "expected": "counterexample",
+      "property": "NoRejectAfterFence",
+      "trace_manifest": "trace-manifests/AssignmentFenceNetworkFenceWinsDelayedClaimWitness.manifest.template.json",
+      "toolchains": ["stable", "differential"],
+      "timeout_seconds": 1800,
+      "assumptions": [
+        "Reachability witness on the fixed model: F consumes REVOKE and installs the rejection fence before the retained concrete claim reaches F"
+      ]
+    },
+    {
       "id": "network-compaction-fixed",
       "module": "AssignmentFenceNetworkCompaction",
       "config": "AssignmentFenceNetworkCompaction.cfg",
