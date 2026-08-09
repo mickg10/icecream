@@ -11,7 +11,8 @@ scheduler id.
 
 FailureAt records a real deterministic byte cut. With FrameBytes = 4 the
 acceptance matrix reaches cuts before byte 1, after one header byte, in the
-body, and one byte short of completion.
+body, and one byte short of completion. NoFailure is the numeric boundary
+FrameBytes, keeping TLC's finite failure domain type-homogeneous.
 ***************************************************************************)
 EXTENDS Naturals, FiniteSets, TLC
 
@@ -21,7 +22,7 @@ CONSTANTS FrameBytes, NoFailure,
           MutantDropAbortOnTransportFailure
 
 ASSUME /\ FrameBytes \in Nat \ {0}
-       /\ NoFailure \notin Nat
+       /\ NoFailure = FrameBytes
        /\ MutantStoreIdAfterWrite \in BOOLEAN
        /\ MutantUseLocalAliasOnFailure \in BOOLEAN
        /\ MutantDropAbortOnTransportFailure \in BOOLEAN
@@ -31,7 +32,7 @@ Phases ==
      "ExactAbortPending", "Terminal"}
 TerminalCauses ==
     {"None", "ExactAbort", "AliasAbort", "SchedulerSessionLoss", "Dropped"}
-FailureValues == 0..(FrameBytes - 1) \cup {NoFailure}
+FailureValues == 0..FrameBytes
 
 VARIABLES phase,
           exactIdKnown,
