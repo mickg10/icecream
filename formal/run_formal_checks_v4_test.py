@@ -207,8 +207,21 @@ B ==
         violations = assignment_lint.lint_text(self.root / "bad.tla", bad)
         self.assertEqual([item.variable for item in violations], ["seen", "owned"])
         self.assertEqual([item.operator for item in violations], ["\\/", "/\\"])
+        self.assertEqual([item.kind for item in violations], ["assignment", "assignment"])
 
-    def test_primed_assignment_lint_accepts_parenthesized_and_structured_rhs(self) -> None:
+    def test_guard_lint_rejects_unparenthesized_disjunction(self) -> None:
+        bad = """
+A ==
+    /\\ claimed \\/ alreadyStarted
+    /\\ phase' = phase
+"""
+        violations = assignment_lint.lint_text(self.root / "bad-guard.tla", bad)
+        self.assertEqual(len(violations), 1)
+        self.assertEqual(violations[0].kind, "guard")
+        self.assertEqual(violations[0].variable, "<guard>")
+        self.assertEqual(violations[0].operator, "\\/")
+
+    def test_boolean_precedence_lint_accepts_parenthesized_and_structured_rhs(self) -> None:
         good = """
 A ==
     /\\ seen' = (seen \\/ event)
@@ -217,20 +230,28 @@ B ==
           (owned /\\ reserved)
 C ==
     /\\ value' = IF ready /\\ live THEN next ELSE value
+D ==
+    /\\ (claimed \\/ alreadyStarted)
+    /\\ phase' = phase
+E ==
+    /\\ LET allowed == claimed \\/ alreadyStarted
+       IN allowed
+    /\\ phase' = phase
 """
         self.assertEqual(
             assignment_lint.lint_text(self.root / "good.tla", good),
             [],
         )
 
-    def test_all_repository_primed_assignments_have_unambiguous_rhs(self) -> None:
+    def test_all_repository_boolean_conjuncts_have_unambiguous_precedence(self) -> None:
         formal_dir = Path(__file__).resolve().parent
         violations = assignment_lint.lint_directory(formal_dir)
         self.assertEqual(
             violations,
             [],
             "\n".join(
-                f"{item.path}:{item.line}: {item.variable}' {item.operator}"
+                f"{item.path}:{item.line}: {item.kind} "
+                f"{item.variable} {item.operator}"
                 for item in violations
             ),
         )
