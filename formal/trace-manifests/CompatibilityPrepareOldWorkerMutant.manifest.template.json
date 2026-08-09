@@ -1,0 +1,37 @@
+{
+  "schema": 1,
+  "scenario": "CompatibilityPrepareOldWorkerMutant",
+  "property": "OldWorkerSeesOnlyOldVocabulary",
+  "expected_result": "counterexample",
+  "min_states": 3,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "SendPrepareToOldWorker",
+      "all": [
+        {"path": "phase", "from": "Requested", "to": "Assigned"},
+        {"path": "policy", "from": "None", "to": "Legacy"},
+        {"path": "oldWorkerSawNewControl", "from": false, "to": true},
+        {"path": "oldClientSawToken", "to": false}
+      ]
+    }
+  ],
+  "required_subsequence": ["SendPrepareToOldWorker"],
+  "final_all": [
+    {"path": "oldWorkerSawNewControl", "eq": true},
+    {"path": "policy", "eq": "Legacy"},
+    {"path": "phase", "eq": "Assigned"}
+  ],
+  "harness_steps": [
+    {
+      "after": "SendPrepareToOldWorker",
+      "emit": "assert_old_worker_received_unnegotiated_prepare_control",
+      "actor": "scheduler-worker-codec"
+    }
+  ],
+  "metadata": {
+    "module": "MixedVersionCompatibilityChecked",
+    "configs": ["CompatibilityPrepareOldWorkerMutant.cfg"],
+    "mutant": "MutantPrepareOldWorker = TRUE"
+  }
+}
