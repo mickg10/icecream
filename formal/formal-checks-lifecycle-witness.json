@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "description": "Standalone nonvacuity witness for LifecycleAuthority.StartedEventuallyTerminal. Run on both pinned TLC toolchains before or alongside the lifecycle/allocator matrix.",
+  "checks": [
+    {
+      "id": "lifecycle-started-reachability-witness",
+      "module": "LifecycleAuthorityStartedWitness",
+      "config": "LifecycleAuthorityStartedWitness.cfg",
+      "kind": "safety",
+      "workers": 1,
+      "expected": "counterexample",
+      "property": "NoStartedState",
+      "trace_manifest": "trace-manifests/LifecycleAuthorityStartedWitness.manifest.template.json",
+      "toolchains": ["stable", "differential"],
+      "timeout_seconds": 1800,
+      "assumptions": [
+        "Reachability witness on the fixed lifecycle model; this is not a protocol mutant."
+      ]
+    }
+  ],
+  "proofs": []
+}
