@@ -1,0 +1,57 @@
+{
+  "schema": 1,
+  "scenario": "LifecycleAuthorityStartedWitness",
+  "property": "NoStartedState",
+  "expected_result": "counterexample",
+  "min_states": 3,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "AttachCurrentSubmitter",
+      "all": [
+        {"path": "attachedSubmitter", "from": "NoSubmitter", "to": "SubmitterA"},
+        {"path": "liveSubmitterGeneration", "from": 0, "to": 1},
+        {"path": "phase", "to": "Waiting"},
+        {"path": "detached", "to": false}
+      ]
+    },
+    {
+      "name": "BeginFromAssignedWorker",
+      "all": [
+        {"path": "phase", "from": "Waiting", "to": "Started"},
+        {"path": "beginCount", "from": 0, "to": 1},
+        {"path": "begunEver", "from": false, "to": true},
+        {"path": "beginElapsed", "from": 0, "to": 1},
+        {"path": "monitorBeginCount", "from": 0, "to": 1},
+        {"path": "monitorBeginWorker", "from": "NoWorker", "to": "WorkerA"}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "AttachCurrentSubmitter",
+    "BeginFromAssignedWorker"
+  ],
+  "final_all": [
+    {"path": "phase", "eq": "Started"},
+    {"path": "beginCount", "eq": 1},
+    {"path": "begunEver", "eq": true},
+    {"path": "terminalCount", "eq": 0}
+  ],
+  "harness_steps": [
+    {
+      "after": "AttachCurrentSubmitter",
+      "emit": "attach_live_submitter_generation",
+      "actor": "scheduler"
+    },
+    {
+      "after": "BeginFromAssignedWorker",
+      "emit": "assert_started_state_is_reachable",
+      "actor": "assigned-worker"
+    }
+  ],
+  "metadata": {
+    "module": "LifecycleAuthorityStartedWitness",
+    "config": "LifecycleAuthorityStartedWitness.cfg",
+    "witness": "The fixed lifecycle model reaches Started before the conditional termination liveness theorem is checked."
+  }
+}
