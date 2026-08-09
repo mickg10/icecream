@@ -1579,8 +1579,8 @@ int main(int argc, char **argv)
             const unsigned bigN = 24000;
             std::atomic<int> repliesF1{0}, repliesF2{0};
             std::atomic<bool> stop_bigs{false};
-            
-            
+            std::atomic<bool> reply_budget_armed{false};
+            std::atomic<int> reply_budget_remaining{0};
             auto big_daemon = [&](const char *name, unsigned cid,
                                   std::atomic<int> *counter) {
                 MsgChannel *ch = connect_daemon(port, 0);
@@ -1625,12 +1625,25 @@ int main(int argc, char **argv)
                                replies have arrived to open it, pace
                                consumption so a fast host cannot drain the
                                whole expansion before the ten small requests
-                               run.  Admitted keeps outrunning consumed, so
-                               admitted - consumed stays above farm capacity
-                               and the window is durably open until stop_bigs.
-                               Unpaced, a fast host finished 2x24000 before
-                               the first sample and the property went
-                               untested (the ephemeral-observer gap).  */
+                               run.  While the ARITHMETIC BUDGET is armed
+                               (during the small-request bracket), each
+                               further reply spends from a fixed shared
+                               budget and consumption PAUSES when it is
+                               exhausted: with admission nondecreasing, the
+                               pre-bracket margin minus this budget bounds
+                               the whole interval from below -- the durable
+                               proof the two endpoint samples alone cannot
+                               give.  */
+                            if (reply_budget_armed.load()) {
+                                int b = reply_budget_remaining.load();
+                                while (b > 0
+                                       && !reply_budget_remaining.compare_exchange_weak(b, b - 1)) {}
+                                while (b <= 0 && reply_budget_armed.load()
+                                       && !stop_bigs.load()) {
+                                    usleep(20 * 1000);
+                                    b = reply_budget_remaining.load();
+                                }
+                            }
                             if (*counter > 200) {
                                 usleep(3 * 1000);
                             }
@@ -1677,13 +1690,8 @@ int main(int argc, char **argv)
                The big daemons pace consumption so this holds throughout the
                small requests on every host.  */
             long long bracket_vals[4] = { -1, -1, -1, -1 };
-            /* Every slot the fake farm advertises, derived from the
-               topology itself: replies beyond admitted-minus-capacity
-               cannot merely be in flight.  */
-            const long long farm_capacity = total_farm_capacity(port);
-            REQUIRE(farm_capacity > 0,
-                    "farm capacity measured (a failed/incomplete listcs is"
-                    " rejected, never read as zero capacity)");
+            long long gen_before[2] = { -1, -1 };
+            long long farm_capacity = -1;
             auto both_active = [&](int slot) {
                 /* The CONTENDED WINDOW must be proven from SCHEDULER-side
                    state, conservatively: reader-side reply counters lag the
@@ -1701,8 +1709,50 @@ int main(int argc, char **argv)
                    to be incomplete, which a fast host finishes before the
                    first sample; a second form used reader counters alone,
                    which cannot see scheduler state.)  */
-                const long long a7 = query_submitter_field(port, "fakesub7", "admitted_total=");
-                const long long a8 = query_submitter_field(port, "fakesub8", "admitted_total=");
+                /* ONE complete, strictly parsed snapshot supplies the
+                   capacity, both admitted counters, and both connection
+                   generations -- no mixing of observations from different
+                   instants.  Any incomplete exchange fails the sample.  */
+                const CtrlReply snap = ctrl_exchange(port, "listcs");
+                if (snap.status != CtrlReply::COMPLETE) {
+                    return false;
+                }
+                long long cap = 0;
+                {
+                    size_t pos = 0;
+                    while ((pos = snap.text.find("jobs=", pos)) != std::string::npos) {
+                        const size_t slash = snap.text.find('/', pos);
+                        const size_t eol = snap.text.find('\n', pos);
+                        if (slash == std::string::npos
+                            || (eol != std::string::npos && slash > eol)) {
+                            return false;
+                        }
+                        const long long v = parse_field_ll(snap.text.c_str() + slash + 1);
+                        if (v < 0) {
+                            return false;
+                        }
+                        cap += v;
+                        pos = slash + 1;
+                    }
+                }
+                if (cap <= 0) {
+                    return false;
+                }
+                farm_capacity = cap;
+                const long long a7 = field_from_snapshot(snap.text, "fakesub7", "admitted_total=");
+                const long long a8 = field_from_snapshot(snap.text, "fakesub8", "admitted_total=");
+                const long long g7 = field_from_snapshot(snap.text, "fakesub7", "gen=");
+                const long long g8 = field_from_snapshot(snap.text, "fakesub8", "gen=");
+                if (slot == 0) {
+                    gen_before[0] = g7;
+                    gen_before[1] = g8;
+                } else {
+                    /* An admitted counter is only comparable within one
+                       connection generation.  */
+                    if (g7 != gen_before[0] || g8 != gen_before[1]) {
+                        return false;
+                    }
+                }
                 const long long r7 = repliesF1.load();
                 const long long r8 = repliesF2.load();
                 bracket_vals[slot] = a7;
@@ -1727,6 +1777,31 @@ int main(int argc, char **argv)
                     }
                 }
             }
+            /* ARITHMETIC INTERVAL PROOF.  Two endpoint samples cannot show
+               the backlog predicate held BETWEEN them.  Instead: capture
+               the pre-bracket margins, arm a fixed shared reply budget the
+               two big consumers may spend while the smalls run (they pause
+               when it is exhausted), and require
+
+                   margin_i > farm_capacity + BUDGET      (each big)
+
+               Admission is nondecreasing, so the margin can shrink only by
+               consumed replies <= BUDGET: the backlog stayed above
+               farm_capacity for the WHOLE interval, not just at the ends.  */
+            const int kReplyBudget = 400;
+            const long long replies_before7 = repliesF1.load();
+            const long long replies_before8 = repliesF2.load();
+            const long long margin7 = bracket_vals[0] - replies_before7;
+            const long long margin8 = bracket_vals[1] - replies_before8;
+            REQUIRE(margin7 > farm_capacity + kReplyBudget,
+                    "big submitter 1's pre-bracket margin covers capacity"
+                    " plus the whole reply budget");
+            REQUIRE(margin8 > farm_capacity + kReplyBudget,
+                    "big submitter 2's pre-bracket margin covers capacity"
+                    " plus the whole reply budget");
+            reply_budget_remaining = kReplyBudget;
+            reply_budget_armed = true;
+
             int slow = 0;
             int measured = 0;
             double worst_small = 0;
@@ -1755,6 +1830,20 @@ int main(int argc, char **argv)
                 if (took > worst_small) { worst_small = took; }
                 if (jid) { confirm_job(jid); }
                 if (!jid || took > 3.0) { ++slow; }
+            }
+            const long long spent7 = repliesF1.load() - replies_before7;
+            const long long spent8 = repliesF2.load() - replies_before8;
+            reply_budget_armed = false;
+            REQUIRE(spent7 + spent8 <= kReplyBudget,
+                    "the big consumers stayed within the armed reply budget"
+                    " (measured, not assumed)");
+            {
+                const long long proven7 = margin7 - kReplyBudget - farm_capacity;
+                const long long proven8 = margin8 - kReplyBudget - farm_capacity;
+                fprintf(stderr, "# contract: fairness interval margins:"
+                        " min proven above capacity = %lld (big1) / %lld (big2),"
+                        " budget spent %lld+%lld of %d\n",
+                        proven7, proven8, spent7, spent8, kReplyBudget);
             }
             const bool contended_after = both_active(2);
             /* Observe actual expansion progress before ending them: the
