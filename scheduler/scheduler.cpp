@@ -729,13 +729,68 @@ static void handle_monitor_stats(CompileServer *cs, StatsMsg *m = nullptr)
     notify_monitors(new MonStatsMsg(cs->hostId(), msg));
 }
 
+/* Checked wire-id allocation.  The remote jobs map and the local monitor
+   ids share one counter, so BOTH consume ids from this helper.  The old
+   form was ++counter + assert(not in map) + operator[]: under NDEBUG the
+   uniqueness check vanished, and on wrap (or injected reuse) operator[]
+   silently REPLACED a still-live job -- old worker/submitter messages then
+   mutated a different logical job by bare id (the ABA family).  Here:
+
+   - an id is nonzero and not currently live in the jobs map;
+   - increment-and-probe over the live set (live ids are bounded far below
+     the 32-bit space, so the probe terminates immediately in practice);
+   - exhaustion of the whole domain is detected and reported as failure
+     instead of spinning or corrupting state;
+   - a widening allocation sequence is kept for diagnostics.
+
+   The test domain seam (ICECC_TEST_JOB_ID_DOMAIN=<n>) shrinks the id
+   space to {1..n} so exhaustion and release-reuse are testable.  */
+static unsigned long long job_id_allocation_seq = 0;
+
+static unsigned int allocate_wire_id()
+{
+    static unsigned int domain = 0;   /* 0 = full 32-bit space */
+    if (job_id_allocation_seq == 0) {
+        const char *e = getenv("ICECC_TEST_JOB_ID_DOMAIN");
+        domain = e ? (unsigned int)atoi(e) : 0;
+    }
+    const unsigned int live = (unsigned int)jobs.size();
+    if (domain && live >= domain) {
+        return 0;   /* whole test domain occupied: explicit exhaustion */
+    }
+    for (;;) {
+        ++new_job_id;
+        if (domain && new_job_id > domain) {
+            new_job_id = 1;
+        }
+        if (new_job_id == 0) {
+            new_job_id = 1;   /* 0 is the sentinel; never allocate it */
+        }
+        ++job_id_allocation_seq;
+        if (jobs.find(new_job_id) == jobs.end()) {
+            return new_job_id;
+        }
+    }
+}
+
 static Job *create_new_job(CompileServer *submitter)
 {
-    ++new_job_id;
-    assert(jobs.find(new_job_id) == jobs.end());
-
-    Job *job = new Job(new_job_id, submitter);
-    jobs[new_job_id] = job;
+    const unsigned int id = allocate_wire_id();
+    if (id == 0) {
+        return nullptr;
+    }
+    Job *job = new Job(id, submitter);
+    const std::pair<map<unsigned int, Job *>::iterator, bool> ins =
+        jobs.insert(std::make_pair(id, job));
+    if (!ins.second) {
+        /* Insertion IS the uniqueness proof; a collision here means the
+           probe raced state it cannot see -- fail the request explicitly
+           rather than replace a live job.  */
+        log_error() << "job id " << id << " collided with a live job;"
+                    << " refusing the allocation" << endl;
+        delete job;
+        return nullptr;
+    }
     return job;
 }
 
@@ -1044,11 +1099,20 @@ static bool admit_request_jobs(CompileServer *submitter, PendingExpansion &req)
             req.next_index = i;
             return false;
         }
+        Job *job = create_new_job(submitter);
+        if (!job) {
+            /* Id domain exhausted: stop admitting this expansion here and
+               report the shortfall; nothing admitted past this point, so
+               the accounting stays exact.  */
+            log_error() << "job id domain exhausted at member " << i
+                        << " of " << m.count << "; expansion truncated" << endl;
+            req.next_index = i;
+            return false;
+        }
         ++made;
         --inbound_budget_remaining;
         ++jobs_admitted_total;
         submitter->admittedJobsIncrement();
-        Job *job = create_new_job(submitter);
         job->setEnvironments(m.versions);
         job->setTargetPlatform(m.target);
         job->setArgFlags(m.arg_flags);
@@ -1180,11 +1244,16 @@ static bool handle_local_job(CompileServer *cs, Msg *_m)
         return false;
     }
 
-    ++new_job_id;
+    const unsigned int local_id = allocate_wire_id();
+    if (local_id == 0) {
+        trace() << "handle_local_job: id domain exhausted; dropping monitor"
+                << " record for " << m->outfile << endl;
+        return true;   /* monitoring-only record; the local build proceeds */
+    }
     trace() << "handle_local_job " << (m->fulljob ? "(full) " : "") << m->outfile
         << " " << m->id << endl;
-    cs->insertClientLocalJobId(m->id, new_job_id, m->fulljob);
-    notify_monitors(new MonLocalJobBeginMsg(new_job_id, m->outfile, m->stime, cs->hostId()));
+    cs->insertClientLocalJobId(m->id, local_id, m->fulljob);
+    notify_monitors(new MonLocalJobBeginMsg(local_id, m->outfile, m->stime, cs->hostId()));
     return true;
 }
 
