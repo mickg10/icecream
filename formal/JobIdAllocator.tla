@@ -1,50 +1,59 @@
---------------------------- MODULE JobIdAllocator ---------------------------
+-------------------------- MODULE JobIdAllocator --------------------------
 (***************************************************************************
-Finite model of the scheduler's shared nonzero job-id allocator.
+A finite model of scheduler-visible job-ID allocation shared by remote Jobs
+and local monitor Jobs.
 
-The allocator owns one namespace used by remote jobs and local-monitor jobs.
-An id is reserved before publication and released exactly once at the terminal
-transition.  Allocation exhausts explicitly instead of spinning or publishing
-a partial batch.
+IDs are 1..MaxId.  Zero is a sentinel and is never a valid live/terminal ID.
+The model keeps a single allocator registry and explicit owner mappings so it
+can expose the existing failure classes:
 
-Counter switches remove one load-bearing rule each:
+  * zero on wrap;
+  * collision when only remote Jobs are checked;
+  * map::operator[] turning unknown local Done into terminal ID zero;
+  * duplicate local Begin overwriting one mapping and orphaning its old ID;
+  * daemon disconnect removing the mapping but not the allocator ownership;
+  * partial publication when a count-N request cannot reserve all remaining
+    IDs.
 
-  MutantRemoteOnlyScan       ignores local-monitor allocations;
-  MutantAllowZero            permits the reserved wire id zero;
-  MutantPartialBatch         publishes a proper prefix when the batch cannot
-                            reserve every requested id;
-  MutantDuplicateBeginsNew   treats a duplicate local begin as a fresh begin.
+Cumulative diagnostic counters saturate only to keep TLC's graph finite.  The
+product counters remain wide monotonic telemetry.
 ***************************************************************************)
 EXTENDS Naturals, FiniteSets, TLC
 
 CONSTANTS Owners, RemoteOwners, LocalOwners, NoOwner,
-          MaxId, InitialCursor, BatchOwners, CountCap,
-          MutantRemoteOnlyScan, MutantAllowZero,
-          MutantPartialBatch, MutantDuplicateBeginsNew
-
-ASSUME /\ IsFiniteSet(Owners)
-       /\ Owners # {}
-       /\ IsFiniteSet(RemoteOwners)
-       /\ IsFiniteSet(LocalOwners)
-       /\ RemoteOwners \subseteq Owners
-       /\ LocalOwners \subseteq Owners
-       /\ RemoteOwners \cap LocalOwners = {}
-       /\ RemoteOwners \cup LocalOwners = Owners
-       /\ NoOwner \notin Owners
-       /\ MaxId \in Nat \ {0}
-       /\ InitialCursor \in 0..MaxId
-       /\ IsFiniteSet(BatchOwners)
-       /\ BatchOwners \subseteq Owners
-       /\ BatchOwners # {}
-       /\ CountCap \in Nat \ {0}
-       /\ MutantRemoteOnlyScan \in BOOLEAN
-       /\ MutantAllowZero \in BOOLEAN
-       /\ MutantPartialBatch \in BOOLEAN
-       /\ MutantDuplicateBeginsNew \in BOOLEAN
+          MaxId, InitialCursor, BatchCount, CountCap,
+          OldOwner, NewOwner,
+          MutantAllowZero,
+          MutantCheckRemoteOnly,
+          MutantUnknownDoneZero,
+          MutantDuplicateOverwrite,
+          MutantDisconnectLeak,
+          MutantPartialBatch
 
 Ids == 1..MaxId
 OwnerPhases == {"Idle", "Live", "Terminal"}
-BatchPhases == {"Idle", "Published", "Failed"}
+BatchPhases == {"Idle", "Failed"}
+
+ASSUME /\ IsFiniteSet(Owners)
+       /\ Owners # {}
+       /\ RemoteOwners \cup LocalOwners = Owners
+       /\ RemoteOwners \cap LocalOwners = {}
+       /\ NoOwner \notin Owners
+       /\ MaxId \in Nat \ {0}
+       /\ InitialCursor \in 0..MaxId
+       /\ BatchCount \in 1..MaxId
+       /\ CountCap \in Nat \ {0}
+       /\ OldOwner \in Owners
+       /\ NewOwner \in Owners
+       /\ OldOwner # NewOwner
+       /\ MutantAllowZero \in BOOLEAN
+       /\ MutantCheckRemoteOnly \in BOOLEAN
+       /\ MutantUnknownDoneZero \in BOOLEAN
+       /\ MutantDuplicateOverwrite \in BOOLEAN
+       /\ MutantDisconnectLeak \in BOOLEAN
+       /\ MutantPartialBatch \in BOOLEAN
+
+CapInc(n) == IF n < CountCap THEN n + 1 ELSE n
 
 VARIABLES ownerPhase,
           ownerId,
@@ -70,11 +79,13 @@ vars ==
       exhaustionCount, unknownReleaseCount, unknownDoneCount,
       duplicateBeginCount, terminalZeroCount, batchPhase, batchPublished>>
 
-CapInc(n) == IF n < CountCap THEN n + 1 ELSE n
+LiveOwners == {o \in Owners : ownerPhase[o] = "Live"}
+LiveOwnerIds == {ownerId[o] : o \in LiveOwners}
+ActualFree == Ids \ allocated
 
 VisibleAllocated(o) ==
-    IF MutantRemoteOnlyScan /\ o \in RemoteOwners
-    THEN {ownerId[x] : x \in RemoteOwners /\ ownerPhase[x] = "Live"}
+    IF MutantCheckRemoteOnly /\ o \in RemoteOwners
+    THEN {ownerId[r] : r \in {x \in RemoteOwners : ownerPhase[x] = "Live"}}
     ELSE allocated
 
 CandidateFree(o) == Ids \ VisibleAllocated(o)
@@ -166,79 +177,65 @@ Exhaust(o) ==
                     duplicateBeginCount, terminalZeroCount,
                     batchPhase, batchPublished>>
 
-UnknownDone(o) ==
-    /\ o \in Owners
+UnknownLocalDone(o) ==
+    /\ o \in LocalOwners
     /\ ownerPhase[o] # "Live"
     /\ unknownDoneCount' = CapInc(unknownDoneCount)
+    /\ terminalZeroCount' =
+          IF MutantUnknownDoneZero THEN CapInc(terminalZeroCount)
+          ELSE terminalZeroCount
     /\ UNCHANGED <<ownerPhase, ownerId, allocated, cursor, issuedTotal,
                     releasedTotal, terminalCount, lastReleasedId,
                     reuseObserved, lastExhaustOwner, exhaustionCount,
                     unknownReleaseCount, duplicateBeginCount,
-                    terminalZeroCount, batchPhase, batchPublished>>
+                    batchPhase, batchPublished>>
 
 DuplicateLocalBegin(o) ==
     /\ o \in LocalOwners
     /\ ownerPhase[o] = "Live"
     /\ duplicateBeginCount' = CapInc(duplicateBeginCount)
-    /\ IF MutantDuplicateBeginsNew
-          THEN /\ CandidateFree(o) # {}
-               /\ LET id == SelectedId(o)
-                  IN /\ ownerId' = [ownerId EXCEPT ![o] = id]
-                     /\ allocated' = (allocated \ {ownerId[o]}) \cup {id}
-                     /\ cursor' = id
-                     /\ issuedTotal' = issuedTotal + 1
-          ELSE UNCHANGED <<ownerId, allocated, cursor, issuedTotal>>
-    /\ UNCHANGED <<ownerPhase, releasedTotal, terminalCount,
-                    lastReleasedId, reuseObserved, lastExhaustOwner,
-                    exhaustionCount, unknownReleaseCount, unknownDoneCount,
-                    terminalZeroCount, batchPhase, batchPublished>>
-
-RecordTerminalZero ==
-    /\ 0 \in allocated
-    /\ terminalZeroCount' = CapInc(terminalZeroCount)
-    /\ UNCHANGED <<ownerPhase, ownerId, allocated, cursor, issuedTotal,
-                    releasedTotal, terminalCount, lastReleasedId,
+    /\ LET overwrite == MutantDuplicateOverwrite /\ ActualFree # {}
+           id == IF overwrite THEN FirstCyclic(ActualFree) ELSE ownerId[o]
+       IN /\ ownerId' = IF overwrite THEN [ownerId EXCEPT ![o] = id] ELSE ownerId
+          /\ allocated' = IF overwrite THEN allocated \cup {id} ELSE allocated
+          /\ cursor' = IF overwrite THEN id ELSE cursor
+          /\ issuedTotal' = IF overwrite THEN issuedTotal + 1 ELSE issuedTotal
+    /\ UNCHANGED <<ownerPhase, releasedTotal, terminalCount, lastReleasedId,
                     reuseObserved, lastExhaustOwner, exhaustionCount,
-                    unknownReleaseCount, unknownDoneCount,
-                    duplicateBeginCount, batchPhase, batchPublished>>
+                    unknownReleaseCount, unknownDoneCount, terminalZeroCount,
+                    batchPhase, batchPublished>>
 
-StartBatch ==
+DisconnectLocal(o) ==
+    /\ o \in LocalOwners
+    /\ ownerPhase[o] = "Live"
+    /\ terminalCount[o] = 0
+    /\ LET id == ownerId[o]
+       IN /\ ownerPhase' = [ownerPhase EXCEPT ![o] = "Terminal"]
+          /\ allocated' =
+                IF MutantDisconnectLeak THEN allocated ELSE allocated \ {id}
+          /\ releasedTotal' =
+                IF MutantDisconnectLeak THEN releasedTotal ELSE releasedTotal + 1
+          /\ terminalCount' = [terminalCount EXCEPT ![o] = @ + 1]
+          /\ lastReleasedId' =
+                IF MutantDisconnectLeak THEN lastReleasedId ELSE id
+    /\ UNCHANGED <<ownerId, cursor, issuedTotal, reuseObserved,
+                    lastExhaustOwner, exhaustionCount, unknownReleaseCount,
+                    unknownDoneCount, duplicateBeginCount, terminalZeroCount,
+                    batchPhase, batchPublished>>
+
+FailInsufficientBatch ==
     /\ batchPhase = "Idle"
-    /\ \A o \in BatchOwners : ownerPhase[o] = "Idle"
-    /\ LET free == Ids \ allocated
-       IN /\ IF Cardinality(free) >= Cardinality(BatchOwners)
-                 THEN /\ batchPhase' = "Published"
-                      /\ batchPublished' = BatchOwners
-                      /\ ownerPhase' =
-                            [ownerPhase EXCEPT
-                               ![o \in BatchOwners] = "Live"]
-                      /\ ownerId' =
-                            [ownerId EXCEPT
-                               ![o \in BatchOwners] =
-                                  CHOOSE id \in free : TRUE]
-                      /\ allocated' =
-                            allocated \cup
-                            {ownerId'[o] : o \in BatchOwners}
-                      /\ issuedTotal' =
-                            issuedTotal + Cardinality(BatchOwners)
-                 ELSE IF MutantPartialBatch /\ free # {}
-                         THEN /\ LET chosenOwner == CHOOSE o \in BatchOwners : TRUE
-                                      chosenId == CHOOSE id \in free : TRUE
-                                  IN /\ batchPhase' = "Failed"
-                                     /\ batchPublished' = {chosenOwner}
-                                     /\ ownerPhase' =
-                                           [ownerPhase EXCEPT
-                                              ![chosenOwner] = "Live"]
-                                     /\ ownerId' =
-                                           [ownerId EXCEPT
-                                              ![chosenOwner] = chosenId]
-                                     /\ allocated' = allocated \cup {chosenId}
-                                     /\ issuedTotal' = issuedTotal + 1
-                         ELSE /\ batchPhase' = "Failed"
-                              /\ batchPublished' = {}
-                              /\ UNCHANGED <<ownerPhase, ownerId, allocated,
-                                              issuedTotal>>
-    /\ UNCHANGED <<cursor, releasedTotal, terminalCount,
+    /\ Cardinality(ActualFree) < BatchCount
+    /\ LET take ==
+             IF MutantPartialBatch /\ ActualFree # {}
+             THEN {FirstCyclic(ActualFree)}
+             ELSE {}
+       IN /\ batchPhase' = "Failed"
+          /\ batchPublished' = take
+          /\ allocated' = allocated \cup take
+          /\ issuedTotal' = issuedTotal + Cardinality(take)
+          /\ cursor' = IF take = {} THEN cursor ELSE CHOOSE id \in take : TRUE
+    /\ UNCHANGED <<ownerPhase, ownerId, releasedTotal, terminalCount,
                     lastReleasedId, reuseObserved, lastExhaustOwner,
                     exhaustionCount, unknownReleaseCount, unknownDoneCount,
                     duplicateBeginCount, terminalZeroCount>>
@@ -248,68 +245,107 @@ Next ==
     \/ \E o \in Owners : Release(o)
     \/ \E o \in Owners : UnknownRelease(o)
     \/ \E o \in Owners : Exhaust(o)
-    \/ \E o \in Owners : UnknownDone(o)
+    \/ \E o \in LocalOwners : UnknownLocalDone(o)
     \/ \E o \in LocalOwners : DuplicateLocalBegin(o)
-    \/ RecordTerminalZero
-    \/ StartBatch
+    \/ \E o \in LocalOwners : DisconnectLocal(o)
+    \/ FailInsufficientBatch
+
+Spec == Init /\ [][Next]_vars
 
 TypeOK ==
     /\ ownerPhase \in [Owners -> OwnerPhases]
     /\ ownerId \in [Owners -> 0..MaxId]
-    /\ allocated \subseteq 0..MaxId
+    /\ allocated \in SUBSET (0..MaxId)
     /\ cursor \in 0..MaxId
     /\ issuedTotal \in Nat
     /\ releasedTotal \in Nat
-    /\ terminalCount \in [Owners -> Nat]
+    /\ terminalCount \in [Owners -> 0..1]
     /\ lastReleasedId \in 0..MaxId
     /\ reuseObserved \in BOOLEAN
     /\ lastExhaustOwner \in Owners \cup {NoOwner}
-    /\ exhaustionCount \in Nat
-    /\ unknownReleaseCount \in Nat
-    /\ unknownDoneCount \in Nat
-    /\ duplicateBeginCount \in Nat
-    /\ terminalZeroCount \in Nat
+    /\ exhaustionCount \in 0..CountCap
+    /\ unknownReleaseCount \in 0..CountCap
+    /\ unknownDoneCount \in 0..CountCap
+    /\ duplicateBeginCount \in 0..CountCap
+    /\ terminalZeroCount \in 0..CountCap
     /\ batchPhase \in BatchPhases
-    /\ batchPublished \subseteq BatchOwners
+    /\ batchPublished \in SUBSET Ids
 
-NoZeroAllocated == 0 \notin allocated
-LiveIdsExactlyAllocated ==
-    allocated = {ownerId[o] : o \in Owners /\ ownerPhase[o] = "Live"}
-LiveIdsUnique ==
-    \A o1, o2 \in Owners :
-        o1 # o2 /\ ownerPhase[o1] = "Live" /\ ownerPhase[o2] = "Live"
-        => ownerId[o1] # ownerId[o2]
-TerminalAtMostOnce ==
+NoZero ==
+    /\ 0 \notin allocated
+    /\ \A o \in LiveOwners : ownerId[o] # 0
+    /\ terminalZeroCount = 0
+    /\ issuedTotal > 0 => cursor # 0
+
+GlobalLiveUniqueness ==
+    \A a, b \in LiveOwners : a # b => ownerId[a] # ownerId[b]
+
+AllocatorMapAgreement ==
+    allocated = LiveOwnerIds
+
+IssuedOnlyOnSuccess ==
+    issuedTotal = Cardinality(allocated) + releasedTotal
+
+ReleaseExactlyOnce ==
     \A o \in Owners : terminalCount[o] <= 1
-ReleaseConservation == releasedTotal <= issuedTotal
-NoPartialBatchPublication ==
-    batchPhase = "Failed" => batchPublished = {}
-DuplicateBeginIdempotent ==
-    duplicateBeginCount > 0 => issuedTotal = Cardinality(allocated) + releasedTotal
-UnknownReleaseRecorded == unknownReleaseCount <= CountCap
-UnknownDoneRecorded == unknownDoneCount <= CountCap
-TerminalZeroNeverEmitted == terminalZeroCount = 0
 
-AllocatorInvariant ==
+ExhaustionNoPublication ==
+    lastExhaustOwner = NoOwner
+    \/ /\ ownerPhase[lastExhaustOwner] = "Idle"
+       /\ ownerId[lastExhaustOwner] = 0
+
+UnknownDoneNoTerminalZero == terminalZeroCount = 0
+
+DuplicateBeginNoOrphan == allocated = LiveOwnerIds
+
+ExhaustionNoPartialPublication ==
+    batchPhase # "Failed" \/ batchPublished = {}
+
+SafetyInvariant ==
     /\ TypeOK
-    /\ NoZeroAllocated
-    /\ LiveIdsExactlyAllocated
-    /\ LiveIdsUnique
-    /\ TerminalAtMostOnce
-    /\ ReleaseConservation
-    /\ NoPartialBatchPublication
-    /\ DuplicateBeginIdempotent
-    /\ UnknownReleaseRecorded
-    /\ UnknownDoneRecorded
-    /\ TerminalZeroNeverEmitted
+    /\ NoZero
+    /\ GlobalLiveUniqueness
+    /\ AllocatorMapAgreement
+    /\ IssuedOnlyOnSuccess
+    /\ ReleaseExactlyOnce
+    /\ ExhaustionNoPublication
+    /\ UnknownDoneNoTerminalZero
+    /\ DuplicateBeginNoOrphan
+    /\ ExhaustionNoPartialPublication
 
-Spec == Init /\ [][Next]_vars
+(***************************************************************************
+Controlled reuse scenario: one-ID domain, old owner initially live, new owner
+waiting.  Exact release and fair allocation force reuse of ID 1 without ever
+publishing zero or two simultaneous owners.
+***************************************************************************)
+ReuseInit ==
+    /\ MaxId = 1
+    /\ ownerPhase = [o \in Owners |-> IF o = OldOwner THEN "Live" ELSE "Idle"]
+    /\ ownerId = [o \in Owners |-> IF o = OldOwner THEN 1 ELSE 0]
+    /\ allocated = {1}
+    /\ cursor = 1
+    /\ issuedTotal = 1
+    /\ releasedTotal = 0
+    /\ terminalCount = [o \in Owners |-> 0]
+    /\ lastReleasedId = 0
+    /\ reuseObserved = FALSE
+    /\ lastExhaustOwner = NoOwner
+    /\ exhaustionCount = 0
+    /\ unknownReleaseCount = 0
+    /\ unknownDoneCount = 0
+    /\ duplicateBeginCount = 0
+    /\ terminalZeroCount = 0
+    /\ batchPhase = "Idle"
+    /\ batchPublished = {}
 
-ReuseFairSpec ==
-    /\ Spec
-    /\ WF_vars(\E o \in Owners : Allocate(o))
-    /\ WF_vars(\E o \in Owners : Release(o))
+ReuseNext == Release(OldOwner) \/ Allocate(NewOwner)
 
-ReleasedIdEventuallyReusable == <>reuseObserved
+ReuseSpec ==
+    /\ ReuseInit
+    /\ [][ReuseNext]_vars
+    /\ WF_vars(Release(OldOwner))
+    /\ WF_vars(Allocate(NewOwner))
+
+ReleasedIdEventuallyReusable == <> reuseObserved
 
 =============================================================================
