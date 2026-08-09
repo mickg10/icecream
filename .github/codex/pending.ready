@@ -1,4 +1,4 @@
 patch_sha256=d8545bd2e696e7048650e34205da9f0896b3e8b3b26c231436442851982054b2
 base_head=f0125ec352ef9dcffab41cceb570c6fc68bfb66a
 formal_source=295a282ec044edc3eb0035ee6f64e968cf2a2a3c
-attempt=explicit-fair-actions-4
+attempt=persist-verified-formal-v1
