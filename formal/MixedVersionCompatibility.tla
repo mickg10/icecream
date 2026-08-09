@@ -279,9 +279,9 @@ ChoosePolicyLate ==
              /\ WorkerVersion[activeWorker] = OldVersion
           THEN "WaitingReady"
           ELSE "Assigned"
-    /\ seenLegacy' = seenLegacy \/ expectedPolicy = "Legacy"
-    /\ seenFenced' = seenFenced \/ expectedPolicy = "FencedLegacy"
-    /\ seenToken' = seenToken \/ expectedPolicy = "Token"
+    /\ seenLegacy' = (seenLegacy \/ expectedPolicy = "Legacy")
+    /\ seenFenced' = (seenFenced \/ expectedPolicy = "FencedLegacy")
+    /\ seenToken' = (seenToken \/ expectedPolicy = "Token")
     /\ oldPermanentWait' =
           oldPermanentWait
           \/ (MutantWaitReadyOldWorker
@@ -484,9 +484,9 @@ DelayedClaimAfterRestart ==
                /\ terminalCount' = terminalCount
                /\ released' = released
     /\ legacyRestartAmbiguous' =
-          legacyRestartAmbiguous \/ policy = "Legacy"
+          (legacyRestartAmbiguous \/ policy = "Legacy")
     /\ fencedRestartAmbiguous' =
-          fencedRestartAmbiguous \/ policy = "FencedLegacy"
+          (fencedRestartAmbiguous \/ policy = "FencedLegacy")
     /\ UNCHANGED <<activeClient, activeWorker, expectedPolicy, policy,
                     guarantee, claimIdentity, schedulerEpoch, compacted,
                     globalCapability, seenLegacy, seenFenced, seenToken,
@@ -782,8 +782,8 @@ NoTokenStaleReject == ~staleTokenRejected
 NoWorkerLossHandled == ~workerLossHandled
 NoSubmitterLossHandled == ~submitterLossHandled
 NoDetachedCompletion == ~detachedCompletionSeen
-NoMixedLegacyToken == ~(seenLegacy /\ seenToken)
-NoMixedFencedToken == ~(seenFenced /\ seenToken)
+NoMixedLegacyToken == ~((seenLegacy /\ seenToken))
+NoMixedFencedToken == ~((seenFenced /\ seenToken))
 NoOldProjectionCompletion == ~oldProjectionComplete
 
 FirstClient == CHOOSE c \in Clients : TRUE
