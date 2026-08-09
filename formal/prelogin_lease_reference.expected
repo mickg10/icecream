@@ -1,0 +1,17 @@
+PASS                        PreloginLeaseFixed
+  trace: Arrive(p0) -> Arrive(p1) -> Arrive(p2) -> Accept(p0):admit -> Accept(p1):reject-at-cap -> FinishAccept -> ServiceControl -> Login(p0)
+EXPECTED_COUNTEREXAMPLE     PreloginNoCapMutant
+  property: PreloginBound
+  trace: Arrive(p0) -> Arrive(p1) -> Accept(p0) -> Accept(p1)
+EXPECTED_COUNTEREXAMPLE     PreloginNoQuantumMutant
+  property: AcceptQuantum
+  trace: Arrive(p0) -> Arrive(p1) -> Arrive(p2) -> Accept(p0) -> Accept(p1) -> Accept(p2)
+EXPECTED_LASSO              PreloginNoQuantumControlLiveness
+  property: ControlProgress
+  trace: <loop> -> Arrive(p0) -> Accept(p0) -> PeerClose(p0) -> Arrive(p0) -> Accept(p0) -> PeerClose(p0) -> Arrive(p0) -> Accept(p0) -> PeerClose(p0) -> </loop>
+EXPECTED_COUNTEREXAMPLE     PreloginNoLeaseMutant
+  property: WholeHandshakeLease
+  trace: Arrive(p0) -> Accept(p0) -> Tick -> Tick
+EXPECTED_COUNTEREXAMPLE     PreloginRefreshLeaseMutant
+  property: WholeHandshakeLease
+  trace: Arrive(p0) -> Accept(p0) -> Tick -> FragmentRefresh(p0) -> Tick
