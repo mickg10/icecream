@@ -1,0 +1,58 @@
+{
+  "schema": 1,
+  "scenario": "PreloginLeaseNoLeaseMutant",
+  "property": "WholeHandshakeLease",
+  "expected_result": "counterexample",
+  "min_states": 5,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "PreloginAdmission",
+      "all": [
+        {"path": "preloginAdmittedTotal", "from": 0, "to": 1},
+        {"path": "acceptedAt", "changed": false},
+        {"path": "deadline", "changed": true}
+      ]
+    },
+    {
+      "name": "AdvanceTime",
+      "all": [
+        {"path": "now", "delta": 1},
+        {"path": "preloginExpiredTotal", "unchanged": true},
+        {"path": "preloginCompletedTotal", "unchanged": true},
+        {"path": "preloginPeerClosedTotal", "unchanged": true}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "PreloginAdmission",
+    "AdvanceTime",
+    "AdvanceTime"
+  ],
+  "final_all": [
+    {"path": "now", "eq": 2},
+    {"path": "preloginAdmittedTotal", "eq": 1},
+    {"path": "preloginExpiredTotal", "eq": 0},
+    {"path": "preloginCompletedTotal", "eq": 0},
+    {"path": "preloginPeerClosedTotal", "eq": 0}
+  ],
+  "harness_steps": [
+    {
+      "after": "PreloginAdmission",
+      "emit": "hold_incomplete_prelogin_connection",
+      "actor": "peer"
+    },
+    {
+      "after": "AdvanceTime",
+      "occurrence": 2,
+      "emit": "assert_peer_survived_whole_handshake_deadline",
+      "actor": "scheduler"
+    }
+  ],
+  "metadata": {
+    "module": "PreloginLease",
+    "config": "PreloginLeaseNoLeaseMutant.cfg",
+    "mutant": "MutantNoLease = TRUE",
+    "lease": "LeaseTicks = 2"
+  }
+}
