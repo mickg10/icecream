@@ -561,7 +561,7 @@ static void internals_snapshot(const char *reason)
 static uint64_t internals_deadline_msec = 10000;        // whole command
 static unsigned long internals_output_dropped = 0;      // rows dropped by the exact bound
 static const size_t kInternalsPerTargetCap = 64 * 1024;
-static const size_t kInternalsRetainedCap = 4 * 1024 * 1024;
+static size_t kInternalsRetainedCap = 4 * 1024 * 1024;   /* test-overridable */
 static size_t kInternalsControlPendingCap = 1024 * 1024;   /* test-overridable */
 
 static CompileServer *internals_resolve(int fd, unsigned int generation)
@@ -592,10 +592,29 @@ static size_t internals_wire_len(const std::string &text)
 }
 
 
+/* Overflow-safe cumulative bound: true iff have + sum(adds) would exceed
+   cap, computed by reducing the remaining room one addend at a time so no
+   intermediate sum can wrap.  Every internals output-bound check uses it.  */
+static bool internals_exceeds(size_t have, size_t cap,
+                              std::initializer_list<size_t> adds)
+{
+    if (have > cap) {
+        return true;
+    }
+    size_t room = cap - have;
+    for (const size_t a : adds) {
+        if (a > room) {
+            return true;
+        }
+        room -= a;
+    }
+    return false;
+}
+
 static InternalsSend internals_emit(CompileServer *control, const std::string &text,
                                     size_t cap)
 {
-    if (control->pending_bytes() + internals_wire_len(text) > cap) {
+    if (internals_exceeds(control->pending_bytes(), cap, { internals_wire_len(text) })) {
         ++internals_output_dropped;
         return ISEND_DROPPED;
     }
@@ -631,7 +650,10 @@ static size_t internals_required_tail_wire()
         if (t.state == InternalsTarget::REPLIED) {
             continue;
         }
-        need += internals_wire_len(t.node_name + " disconnected before reporting\n");
+        const size_t w = internals_wire_len(t.node_name + " disconnected before reporting\n");
+        /* Saturating: a required tail larger than any real cap is simply
+           "too big" and the caller rejects it; never wrap.  */
+        need = (need > (size_t)-1 - w) ? (size_t)-1 : need + w;
     }
     return need;
 }
@@ -831,6 +853,15 @@ static void prelogin_read_overrides()
         const size_t floor_bytes =
             internals_wire_len(kInternalsTerm) + internals_wire_len(kInternalsMarker);
         kInternalsControlPendingCap = (v > (long long)floor_bytes) ? (size_t)v : floor_bytes;
+    }
+    if ((e = getenv("ICECC_TEST_INTERNALS_RETAINED_CAP"))) {
+        /* Independent cumulative-cap override so the A.3 stopped-reader
+           gate can reach the retained bound without the lower pending cap
+           masking it.  */
+        const long long v = atoll(e);
+        const size_t floor_bytes =
+            internals_wire_len(kInternalsTerm) + internals_wire_len(kInternalsMarker);
+        kInternalsRetainedCap = (v > (long long)floor_bytes) ? (size_t)v : floor_bytes;
     }
     if ((e = getenv("ICECC_TEST_ACCEPT_QUANTUM"))) {
         const int v = atoi(e);
@@ -3171,7 +3202,7 @@ static bool handle_line(CompileServer *cs, Msg *_m)
     } else if (cmd == "listjobs") {
         const bool verbose = !l.empty() && (l.front() == "v" || l.front() == "verbose");
         {
-            char summary[1024];
+            char summary[1536];
             snprintf(summary, sizeof(summary),
                      " detached_terminal_rejects=%lu nonwaiting_begin_rejects=%lu"
                      " dup_local_begin=%lu id_release_violations=%lu"
@@ -3183,9 +3214,14 @@ static bool handle_line(CompileServer *cs, Msg *_m)
                      " internals_active=%d internals_peak_pending=%llu"
                      " internals_retained=%llu internals_omitted=%d internals_final_pending=%d"
                      " internals_marker_queued=%u internals_terminal_queued=%u"
+                     " internals_sendpending=%u internals_waiting=%u internals_replied=%u"
+                     " internals_t0_fd=%d internals_t0_gen=%u"
+                     " internals_control_generation=%u internals_final_pending_phase=%d"
+                     " internals_output_deadline=%llu"
                      " internals_last_valid=%d internals_last_peak=%llu"
                      " internals_last_retained=%llu internals_last_marker=%u"
-                     " internals_last_terminal=%u internals_last_reason=%s",
+                     " internals_last_terminal=%u internals_last_generation=%u"
+                     " internals_last_reason=%s",
                      detached_terminal_rejects, nonwaiting_begin_rejects,
                      duplicate_local_begin_ignored, id_release_violations,
                      internals_output_dropped,
@@ -3201,10 +3237,20 @@ static bool handle_line(CompileServer *cs, Msg *_m)
                      internals_txn.payload_omitted ? 1 : 0,
                      internals_txn.final_pending ? 1 : 0,
                      internals_txn.marker_queued, internals_txn.terminal_queued,
+                     [](){ unsigned c=0; for (const InternalsTarget &t : internals_txn.targets) if (t.state==InternalsTarget::SEND_PENDING) ++c; return c; }(),
+                     [](){ unsigned c=0; for (const InternalsTarget &t : internals_txn.targets) if (t.state==InternalsTarget::WAITING_REPLY) ++c; return c; }(),
+                     [](){ unsigned c=0; for (const InternalsTarget &t : internals_txn.targets) if (t.state==InternalsTarget::REPLIED) ++c; return c; }(),
+                     internals_txn.targets.empty() ? -1 : internals_txn.targets.front().fd,
+                     internals_txn.targets.empty() ? 0u : internals_txn.targets.front().generation,
+                     internals_txn.control_generation,
+                     internals_txn.final_pending ? 1 : 0,
+                     (unsigned long long)(internals_txn.final_pending
+                         ? internals_txn.output_deadline_mono : internals_txn.deadline_mono),
                      internals_last.valid ? 1 : 0,
                      (unsigned long long)internals_last.peak_pending,
                      (unsigned long long)internals_last.retained_bytes,
                      internals_last.marker_queued, internals_last.terminal_queued,
+                     internals_last.control_generation,
                      internals_last.reason);
             if (!cs->send_msg(TextMsg(summary))) {
                 return false;
@@ -3336,8 +3382,8 @@ static bool handle_line(CompileServer *cs, Msg *_m)
                    busy row without its terminal.  */
                 const std::string busy = "500 internals busy\n";
                 const std::string term = "200 done";
-                const size_t need = internals_wire_len(busy) + internals_wire_len(term);
-                if (cs->pending_bytes() + need > kInternalsControlPendingCap) {
+                if (internals_exceeds(cs->pending_bytes(), kInternalsControlPendingCap,
+                                      { internals_wire_len(busy), internals_wire_len(term) })) {
                     return false;   /* cannot fit the whole response: drop the connection */
                 }
                 if (internals_emit(cs, busy, kInternalsControlPendingCap) != ISEND_QUEUED
@@ -3356,6 +3402,7 @@ static bool handle_line(CompileServer *cs, Msg *_m)
         internals_txn.output_deadline_mono = internals_txn.deadline_mono
                                              + internals_deadline_msec;
         internals_txn.retained_bytes = 0;
+        internals_txn.peak_pending = cs->pending_bytes();   /* baseline, not 0 */
         internals_txn.targets.clear();
         /* PASS 1: build value-only target snapshots (fd, generation,
            node name, initial state) WITHOUT sending anything.  */
@@ -3388,7 +3435,7 @@ static bool handle_line(CompileServer *cs, Msg *_m)
            -- no GetInternalStatus has been queued to any worker yet.  */
         {
             const size_t tail = internals_required_tail_wire();
-            if (cs->pending_bytes() + tail > kInternalsControlPendingCap
+            if (internals_exceeds(cs->pending_bytes(), kInternalsControlPendingCap, { tail })
                     || tail > kInternalsRetainedCap) {
                 internals_txn_clear("preflight-overflow");
                 handle_end(cs, nullptr);
@@ -3407,7 +3454,13 @@ static bool handle_line(CompileServer *cs, Msg *_m)
             }
             if (target->send_msg(GetInternalStatus(),
                                  MsgChannel::SendNonBlocking | MsgChannel::SendDeferrable)) {
-                t.request_frame_seq = target->framesQueued();
+                static const bool hold_frame =
+                    getenv("ICECC_TEST_INTERNALS_HOLD_FRAME") != nullptr;
+                /* Test seam (A.2 pre-delivery): make the request frame
+                   appear perpetually undelivered by demanding one more
+                   flushed frame than was queued, so an early reply stays
+                   unsolicited until an explicit release.  */
+                t.request_frame_seq = target->framesQueued() + (hold_frame ? 1 : 0);
                 t.state = InternalsTarget::SEND_PENDING;
             } else {
                 t.state = InternalsTarget::DISCONNECTED;
@@ -3435,6 +3488,22 @@ static bool handle_line(CompileServer *cs, Msg *_m)
         /* No trailing 200 done here: the transaction emits it when every
            target is terminal or the whole-command deadline expires.  */
         return true;
+    } else if (cmd == "internals-release") {
+        /* Test-only (A.2): mark every held request delivered by setting its
+           recorded sequence to what has actually flushed, so a subsequent
+           reply transitions the target.  Only meaningful while the hold
+           seam is armed; harmless otherwise.  */
+        if (internals_txn.active) {
+            for (InternalsTarget &t : internals_txn.targets) {
+                if (t.state == InternalsTarget::SEND_PENDING) {
+                    CompileServer *tgt = internals_resolve(t.fd, t.generation);
+                    if (tgt) {
+                        t.request_frame_seq = tgt->framesFlushed();
+                    }
+                }
+            }
+        }
+        return cs->send_msg(TextMsg(string("200 done")));
     } else if (cmd == "help") {
         if (!cs->send_msg(TextMsg(
                              "listcs\nlistblocks\nlistjobs [v|verbose]\nlistrequests\nestimates\nremovecs\nblockcs\nunblockcs\ninternals\nhelp\nquit"))) {
@@ -3770,8 +3839,10 @@ static bool handle_activity(CompileServer *cs)
                    one transaction-level omission flag.  */
                 const size_t row_wire = internals_wire_len(row);
                 const size_t tail = internals_required_tail_wire();
-                if (control->pending_bytes() + row_wire + tail > kInternalsControlPendingCap
-                        || internals_txn.retained_bytes + row_wire + tail > kInternalsRetainedCap) {
+                if (internals_exceeds(control->pending_bytes(), kInternalsControlPendingCap,
+                                      { row_wire, tail })
+                        || internals_exceeds(internals_txn.retained_bytes, kInternalsRetainedCap,
+                                             { row_wire, tail })) {
                     internals_txn.payload_omitted = true;
                 } else {
                     switch (internals_emit(control, row, kInternalsControlPendingCap)) {
