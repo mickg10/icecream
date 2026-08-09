@@ -32,9 +32,9 @@ NEW_VERSION: Final[int] = 2
 MAX_FRAME: Final[int] = 4096
 _LENGTH = struct.Struct("!I")
 _OLD_ASSIGN = struct.Struct("!BII")
-_NEW_ASSIGN = struct.Struct("!BBIQQ")
+_NEW_ASSIGN = struct.Struct("!BBIIQQ")
 _OLD_TERMINAL = struct.Struct("!BII")
-_NEW_TERMINAL = struct.Struct("!BBIQQI")
+_NEW_TERMINAL = struct.Struct("!BBIIQQI")
 
 
 class CodecError(ValueError):
@@ -111,6 +111,7 @@ def encode_assignment(version: int, assignment: Assignment) -> bytes:
                 MessageType.ASSIGN,
                 int(assignment.policy),
                 wire_id,
+                worker_port,
                 full_id,
                 token,
             )
@@ -143,6 +144,7 @@ def encode_terminal(version: int, terminal: Terminal) -> bytes:
                 MessageType.TERMINAL,
                 int(terminal.policy),
                 wire_id,
+                status,
                 full_id,
                 token,
                 generation,
@@ -199,9 +201,14 @@ def _decode_assignment_payload(version: int, payload: bytes) -> Assignment:
                 f"NEW assignment payload length {len(payload)} != "
                 f"{_NEW_ASSIGN.size}"
             )
-        message_type, raw_policy, wire_id, full_id, token = _NEW_ASSIGN.unpack(
-            payload
-        )
+        (
+            message_type,
+            raw_policy,
+            wire_id,
+            worker_port,
+            full_id,
+            token,
+        ) = _NEW_ASSIGN.unpack(payload)
         if message_type != MessageType.ASSIGN:
             raise CodecError("wrong assignment message type")
         try:
@@ -210,7 +217,7 @@ def _decode_assignment_payload(version: int, payload: bytes) -> Assignment:
             raise CodecError(f"unknown assignment policy {raw_policy}") from exc
         assignment = Assignment(
             wire_id=wire_id,
-            worker_port=0,
+            worker_port=worker_port,
             policy=policy,
             full_id=full_id,
             token=token,
@@ -244,6 +251,7 @@ def _decode_terminal_payload(version: int, payload: bytes) -> Terminal:
             message_type,
             raw_policy,
             wire_id,
+            status,
             full_id,
             token,
             generation,
@@ -256,7 +264,7 @@ def _decode_terminal_payload(version: int, payload: bytes) -> Terminal:
             raise CodecError(f"unknown terminal policy {raw_policy}") from exc
         terminal = Terminal(
             wire_id=wire_id,
-            status=0,
+            status=status,
             policy=policy,
             full_id=full_id,
             token=token,
