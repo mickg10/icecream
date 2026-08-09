@@ -75,6 +75,11 @@ public:
         return m_live.size();
     }
 
+    size_t freeCount() const
+    {
+        return (size_t)m_maxId - m_live.size();
+    }
+
     /* Cumulative successful allocations: 64-bit, monotonic, and never
        itself used as an id -- the diagnostics counter the wrapping
        cursor can no longer provide.  */

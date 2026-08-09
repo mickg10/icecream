@@ -474,6 +474,8 @@ static unsigned long detached_terminal_rejects = 0;
 /* Begin messages ignored because the job was not awaiting one (duplicate
    or out-of-order JobBegin from the assigned worker).  */
 static unsigned long nonwaiting_begin_rejects = 0;
+static unsigned long duplicate_local_begin_ignored = 0;
+static unsigned long id_release_violations = 0;
 /* Pre-login lease, population bound, and accept quantum (issue #4 P1).
    Named conservative defaults; test overrides via environment.  */
 static uint64_t prelogin_lease_msec = 15000;        // T_login
@@ -950,6 +952,17 @@ static JobIdAllocator &job_id_allocator()
 
 /* Exact removal: erase from the jobs map and release the id exactly
    once, or report the accounting violation loudly.  */
+/* Checked release for LOCAL monitor ids: an ignored false return was
+   an uncounted invariant failure.  */
+static void release_local_id(uint32_t id)
+{
+    if (!job_id_allocator().release(id)) {
+        ++id_release_violations;
+        log_error() << "local id " << id << " released without a live"
+                    << " allocation -- id accounting violated" << endl;
+    }
+}
+
 static void remove_job_entry(map<unsigned int, Job *>::iterator it)
 {
     const unsigned int id = it->first;
@@ -1066,7 +1079,8 @@ static bool submitter_accepts_dispatch(CompileServer *submitter)
         && submitter->outstandingDispatches() < effective_dispatch_credit();
 }
 
-static bool admit_request_jobs(CompileServer *submitter, PendingExpansion &req);
+enum AdmitResult { ADMIT_COMPLETE, ADMIT_YIELDED, ADMIT_FATAL_EXHAUSTION };
+static AdmitResult admit_request_jobs(CompileServer *submitter, PendingExpansion &req);
 
 /* Resume requests whose expansion was cut short by the loop budget.  A
    caller that asked for N replies still gets N; the work is merely spread
@@ -1103,8 +1117,20 @@ static bool expand_pending_requests(bool single_quantum = false)
             return true;
         }
         deque<PendingExpansion> &q = it->second;
-        if (!q.empty() && admit_request_jobs(cit->second, q.front())) {
-            q.pop_front();
+        if (!q.empty()) {
+            const AdmitResult r = admit_request_jobs(cit->second, q.front());
+            if (r == ADMIT_COMPLETE) {
+                q.pop_front();
+            } else if (r == ADMIT_FATAL_EXHAUSTION) {
+                /* Close this submitter generation: its teardown sweep
+                   terminalizes and releases every staged member exactly
+                   once and erases its records; unrelated peers stay
+                   live.  The iterator over pending_expansions is
+                   invalidated by that teardown -- stop this pass.  */
+                pending_service_cursor = fd;
+                handle_end(cit->second, nullptr);
+                return true;
+            }
         }
         pending_service_cursor = fd;
         if (q.empty()) {
@@ -1266,9 +1292,23 @@ static string dump_job(Job *job, bool verbose);
 
    At least one job is always made per call: a request must progress every
    time it is serviced, or an exhausted budget could park it forever.  */
-static bool admit_request_jobs(CompileServer *submitter, PendingExpansion &req)
+static AdmitResult admit_request_jobs(CompileServer *submitter, PendingExpansion &req)
 {
     const GetCSMsg &m = req.msg;
+
+    /* Exhaustion preflight: an expansion whose remaining members exceed
+       the free id domain can NEVER complete -- parking it retried the
+       same member forever while its staged members sat published but
+       undispatchable.  Fail it fatally instead; the caller closes this
+       submitter generation, which terminalizes and releases every staged
+       member through the audited teardown sweep, exactly once.  */
+    if ((uint64_t)(m.count - req.next_index) > (uint64_t)job_id_allocator().freeCount()) {
+        log_error() << "expansion for client " << m.client_id << " needs "
+                    << (m.count - req.next_index) << " ids but only "
+                    << job_id_allocator().freeCount() << " remain;"
+                    << " failing the batch" << endl;
+        return ADMIT_FATAL_EXHAUSTION;
+    }
 
     /* The chain anchor is the front of the staged list: staged jobs are not
        dispatchable, so the master cannot run -- let alone complete -- before
@@ -1284,17 +1324,16 @@ static bool admit_request_jobs(CompileServer *submitter, PendingExpansion &req)
                 && (made >= max_jobs_per_expansion_step
                     || inbound_budget_remaining <= 0)) {
             req.next_index = i;
-            return false;
+            return ADMIT_YIELDED;
         }
         Job *job = create_new_job(submitter);
         if (!job) {
-            /* Id domain exhausted: stop admitting this expansion here and
-               report the shortfall; nothing admitted past this point, so
-               the accounting stays exact.  */
+            /* The preflight covers this, but a race with local-id
+               allocation is still possible: same fatal outcome.  */
             log_error() << "job id domain exhausted at member " << i
-                        << " of " << m.count << "; expansion truncated" << endl;
+                        << " of " << m.count << "; failing the batch" << endl;
             req.next_index = i;
-            return false;
+            return ADMIT_FATAL_EXHAUSTION;
         }
         ++made;
         --inbound_budget_remaining;
@@ -1382,7 +1421,7 @@ static bool admit_request_jobs(CompileServer *submitter, PendingExpansion &req)
         enqueue_job_request(j);
     }
     req.staged.clear();
-    return true;
+    return ADMIT_COMPLETE;
 }
 
 static bool handle_cs_request(MsgChannel *cs, Msg *_m)
@@ -1416,8 +1455,17 @@ static bool handle_cs_request(MsgChannel *cs, Msg *_m)
     }
 
     PendingExpansion req(*m);
-    if (!admit_request_jobs(submitter, req)) {
+    switch (admit_request_jobs(submitter, req)) {
+    case ADMIT_COMPLETE:
+        break;
+    case ADMIT_YIELDED:
         pending_expansions[submitter->fd].push_back(req);
+        break;
+    case ADMIT_FATAL_EXHAUSTION:
+        /* The teardown sweep owns the staged members' terminals and id
+           releases; the connection object is gone after this call.  */
+        handle_end(submitter, nullptr);
+        return false;
     }
 
     return true;
@@ -1431,6 +1479,17 @@ static bool handle_local_job(CompileServer *cs, Msg *_m)
         return false;
     }
 
+    /* Duplicate local Begin for an already-mapped client-local id is an
+       IDEMPOTENT no-op: counted, no allocation, no displaced terminal,
+       no second monitor Begin (the ruled trace: Begin,Begin,Done,Done =>
+       one allocation, one Begin, one terminal).  The mapping is checked
+       BEFORE any allocation.  */
+    if (cs->getClientLocalJobId(m->id) != 0) {
+        ++duplicate_local_begin_ignored;
+        trace() << "handle_local_job: duplicate local Begin for client id "
+                << m->id << " ignored" << endl;
+        return true;
+    }
     const unsigned int local_id = job_id_allocator().allocate();
     if (local_id == 0) {
         trace() << "handle_local_job: id domain exhausted; dropping monitor"
@@ -1439,14 +1498,7 @@ static bool handle_local_job(CompileServer *cs, Msg *_m)
     }
     trace() << "handle_local_job " << (m->fulljob ? "(full) " : "") << m->outfile
         << " " << m->id << endl;
-    const int displaced = cs->insertClientLocalJobId(m->id, local_id, m->fulljob);
-    if (displaced > 0) {
-        /* A duplicate local Begin for the same client id: the displaced
-           record gets its terminal and its id back -- it must not leak
-           silently.  */
-        notify_monitors(new JobLocalDoneMsg(displaced));
-        job_id_allocator().release((uint32_t)displaced);
-    }
+    cs->insertClientLocalJobId(m->id, local_id, m->fulljob);
     notify_monitors(new MonLocalJobBeginMsg(local_id, m->outfile, m->stime, cs->hostId()));
     return true;
 }
@@ -1470,7 +1522,7 @@ static bool handle_local_job_done(CompileServer *cs, Msg *_m)
     }
     notify_monitors(new JobLocalDoneMsg(global_id));
     cs->eraseClientLocalJobId(m->job_id);
-    job_id_allocator().release((uint32_t)global_id);
+    release_local_id((uint32_t)global_id);
     return true;
 }
 
@@ -2904,9 +2956,11 @@ static bool handle_line(CompileServer *cs, Msg *_m)
             char summary[320];
             snprintf(summary, sizeof(summary),
                      " detached_terminal_rejects=%lu nonwaiting_begin_rejects=%lu"
+                     " dup_local_begin=%lu id_release_violations=%lu"
                      " prelogin_current=%u prelogin_max=%u prelogin_expired=%lu"
                      " prelogin_rejected=%lu prelogin_completed=%lu accepts_deferred=%lu",
                      detached_terminal_rejects, nonwaiting_begin_rejects,
+                     duplicate_local_begin_ignored, id_release_violations,
                      prelogin_current, prelogin_max_observed,
                      prelogin_expired_total, prelogin_rejected_total,
                      prelogin_completed_total, accepts_deferred_total);
@@ -3077,7 +3131,23 @@ static bool handle_line(CompileServer *cs, Msg *_m)
             }
             internals_txn.targets.push_back(t);
         }
-        internals_txn_tick();   /* instant completion for an empty set or
+        internals_txn_tick();
+        {
+            /* Id-accounting conservation, checked once per turn: every
+               live id is either a remote job or a live local-monitor
+               mapping.  A divergence is counted and reported, never
+               silently tolerated.  */
+            size_t local_live = 0;
+            for (CompileServer * const c : css) {
+                local_live += c->liveClientLocalJobIds().size();
+            }
+            if (job_id_allocator().liveCount() != jobs.size() + local_live) {
+                ++id_release_violations;
+                log_error() << "id accounting divergence: live="
+                            << job_id_allocator().liveCount() << " jobs="
+                            << jobs.size() << " local=" << local_live << endl;
+            }
+        }   /* instant completion for an empty set or
                                    already-flushed requests */
 
         /* No trailing 200 done here: the transaction emits it when every
@@ -3182,7 +3252,7 @@ static bool handle_end(CompileServer *toremove, Msg *m)
            old teardown destroyed the map silently, leaking both.  */
         for (const int local_global_id : toremove->liveClientLocalJobIds()) {
             notify_monitors(new JobLocalDoneMsg(local_global_id));
-            job_id_allocator().release((uint32_t)local_global_id);
+            release_local_id((uint32_t)local_global_id);
         }
 
         notify_monitors(new MonStatsMsg(toremove->hostId(), "State:Offline\n"));
@@ -4039,6 +4109,22 @@ int main(int argc, char *argv[])
             }
         }
         internals_txn_tick();
+        {
+            /* Id-accounting conservation, checked once per turn: every
+               live id is either a remote job or a live local-monitor
+               mapping.  A divergence is counted and reported, never
+               silently tolerated.  */
+            size_t local_live = 0;
+            for (CompileServer * const c : css) {
+                local_live += c->liveClientLocalJobIds().size();
+            }
+            if (job_id_allocator().liveCount() != jobs.size() + local_live) {
+                ++id_release_violations;
+                log_error() << "id accounting divergence: live="
+                            << job_id_allocator().liveCount() << " jobs="
+                            << jobs.size() << " local=" << local_live << endl;
+            }
+        }
         if (internals_txn.active) {
             const uint64_t now_mono = icecream_monotonic_msec();
             const uint64_t left = internals_txn.deadline_mono > now_mono
