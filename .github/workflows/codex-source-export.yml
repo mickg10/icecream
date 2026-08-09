@@ -4,6 +4,7 @@ on:
   pull_request:
     branches:
       - fix/stage3-scheduler-policy
+      - codex/issue4-executor-base-f0125
     paths:
       - .github/codex/pending.ready
   workflow_dispatch:
@@ -13,7 +14,7 @@ permissions:
 
 concurrency:
   group: issue4-${{ github.head_ref || github.ref_name }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   apply-test-export:
