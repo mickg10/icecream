@@ -1,0 +1,51 @@
+{
+  "schema": 1,
+  "scenario": "LifecycleAuthorityIdentityMutant",
+  "property": "StableDetachedIdentity",
+  "expected_result": "counterexample",
+  "min_states": 3,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "AssignedWorkerBegin",
+      "all": [
+        {"path": "phase", "from": "Waiting", "to": "Started"},
+        {"path": "identityVisible", "to": true}
+      ]
+    },
+    {
+      "name": "DetachDropsStableIdentity",
+      "all": [
+        {"path": "detached", "from": false, "to": true},
+        {"path": "attachedSubmitter", "to": "NoSubmitter"},
+        {"path": "identityVisible", "from": true, "to": false}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "AssignedWorkerBegin",
+    "DetachDropsStableIdentity"
+  ],
+  "final_all": [
+    {"path": "phase", "eq": "Started"},
+    {"path": "detached", "eq": true},
+    {"path": "identityVisible", "eq": false}
+  ],
+  "harness_steps": [
+    {
+      "after": "AssignedWorkerBegin",
+      "emit": "disconnect_submitter_and_query_complete_listjobs",
+      "actor": "submitter-A"
+    },
+    {
+      "after": "DetachDropsStableIdentity",
+      "emit": "assert_detached_job_lost_submitter_name_generation_observability",
+      "actor": "scheduler"
+    }
+  ],
+  "metadata": {
+    "module": "LifecycleAuthority",
+    "config": "LifecycleAuthorityIdentityMutant.cfg",
+    "mutant": "MutantDropDetachedIdentity = TRUE"
+  }
+}
