@@ -41,8 +41,12 @@
   ],
   "metadata": {
     "module": "PreloginLease",
-    "config": "PreloginLeaseNoQuantumLiveness.cfg",
+    "configs": [
+      "PreloginLeaseNoQuantumLiveness.cfg",
+      "PreloginLeaseNoQuantumLivenessCountCap6.cfg"
+    ],
     "mutant": "MutantNoQuantum = TRUE",
-    "fairness": "WF AcceptStep, FinishAccept, ServiceControl; FinishAccept is kept disabled by the unbounded accept phase"
+    "fairness": "WF AcceptStep, FinishAccept, ServiceControl; FinishAccept is kept disabled by the unbounded accept phase",
+    "cutoff_contract": "The same essential lasso must survive CountCap 4 and 6."
   }
 }
