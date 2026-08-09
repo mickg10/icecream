@@ -17,7 +17,7 @@
       "name": "FailBeforeFrameCommit",
       "all": [
         {"path": "phase", "from": "Forwarding", "to": "ExactAbortPending"},
-        {"path": "failureObservedAt", "from": "NO_FAILURE", "to": 0},
+        {"path": "failureObservedAt", "from": 4, "to": 0},
         {"path": "frameCommitted", "to": false}
       ]
     },
@@ -58,6 +58,7 @@
   "metadata": {
     "module": "UseCSHandoff",
     "config": "UseCSHandoffAbortDropMutant.cfg",
-    "mutant": "MutantDropAbortOnTransportFailure = TRUE"
+    "mutant": "MutantDropAbortOnTransportFailure = TRUE",
+    "no_failure_sentinel": 4
   }
 }
