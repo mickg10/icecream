@@ -1,0 +1,61 @@
+name: fix-compat-precedence-once
+
+on:
+  push:
+    branches:
+      - bigoracle/compatibility-formal
+    paths:
+      - .github/workflows/fix-compat-precedence.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bigoracle/compatibility-formal
+          fetch-depth: 0
+      - name: Parenthesize six intended boolean assignments
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("formal/MixedVersionCompatibility.tla")
+          text = path.read_text(encoding="utf-8")
+          replacements = {
+              "seenLegacy' = seenLegacy \\/ expectedPolicy = \"Legacy\"":
+                  "seenLegacy' = (seenLegacy \\/ expectedPolicy = \"Legacy\")",
+              "seenFenced' = seenFenced \\/ expectedPolicy = \"FencedLegacy\"":
+                  "seenFenced' = (seenFenced \\/ expectedPolicy = \"FencedLegacy\")",
+              "seenToken' = seenToken \\/ expectedPolicy = \"Token\"":
+                  "seenToken' = (seenToken \\/ expectedPolicy = \"Token\")",
+              "legacyRestartAmbiguous \\/ policy = \"Legacy\"":
+                  "(legacyRestartAmbiguous \\/ policy = \"Legacy\")",
+              "fencedRestartAmbiguous \\/ policy = \"FencedLegacy\"":
+                  "(fencedRestartAmbiguous \\/ policy = \"FencedLegacy\")",
+              "seenLegacy /\\ seenToken":
+                  "(seenLegacy /\\ seenToken)",
+              "seenFenced /\\ seenToken":
+                  "(seenFenced /\\ seenToken)",
+          }
+          # The first five are assignments; the final two are explicit
+          # negated conjunction operands. Every source fragment must be unique.
+          for old, new in replacements.items():
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"expected one occurrence of {old!r}, got {count}")
+              text = text.replace(old, new)
+          path.write_text(text, encoding="utf-8")
+          PY
+          git diff --check
+          git diff -- formal/MixedVersionCompatibility.tla
+      - name: Commit exact model correction
+        run: |
+          git config user.name "mickg10 formal automation"
+          git config user.email "5094033+mickg10@users.noreply.github.com"
+          git add formal/MixedVersionCompatibility.tla
+          git commit -m "formal: parenthesize compatibility boolean assignments"
+          git push origin HEAD:bigoracle/compatibility-formal
