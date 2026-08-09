@@ -618,7 +618,7 @@ SReceiveOwned ==
     /\ Len(f2s) > 0
     /\ ChosenF2S.kind = "OWNED"
     /\ LET a == ChosenF2S.assignment
-       IN /\ claimMade[a] \/ startCount[a] > 0
+       IN /\ (claimMade[a] \/ startCount[a] > 0)
           /\ phase' =
                 IF released[a]
                 THEN phase
