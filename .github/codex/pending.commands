@@ -1,0 +1,10 @@
+set -euo pipefail
+./autogen.sh
+./configure --without-libcap_ng
+make -j2 -C services
+make -j2 -C scheduler icecc-scheduler
+make -j2 -C unittests relogin relogin_mutant
+make -C unittests check \
+  TESTS='relogin relogin-negative.sh' \
+  check_PROGRAMS='relogin relogin_mutant'
+git diff --check
