@@ -346,6 +346,19 @@ G ==
         with self.assertRaisesRegex(v2.FormalRunError, "harness-step disagreement"):
             module.differential_compare([stable, differential])
 
+    def test_acceptance_matrix_contract_suite(self) -> None:
+        script = Path(__file__).with_name("manifest_contract_test.py")
+        result = subprocess.run(
+            [sys.executable, str(script)],
+            cwd=str(script.parent),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+
     def test_tlaps_generated_files_are_isolated_from_source_checkout(self) -> None:
         repo = self.root / "repo"
         formal = repo / "formal"
