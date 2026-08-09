@@ -1,0 +1,32 @@
+name: Codex source export
+
+on:
+  pull_request:
+    branches:
+      - fix/stage3-scheduler-policy
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export-source:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out proposed revision
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Package repository source
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar --exclude=.git --exclude=icecream-source.tar.gz \
+              -czf icecream-source.tar.gz .
+      - name: Upload source archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: icecream-source
+          path: icecream-source.tar.gz
+          if-no-files-found: error
+          retention-days: 1
