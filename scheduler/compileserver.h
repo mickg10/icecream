@@ -213,6 +213,15 @@ public:
     bool probeDeadlineExpired() const;
     /* Consume the probe fd exactly once; safe to call repeatedly.  */
     void closeProbeFd();
+
+    /* Pre-login lease: one absolute monotonic deadline covering protocol
+       negotiation AND the first valid LOGIN/MON_LOGIN; never refreshed by
+       partial bytes.  The accounted flag makes the population counter's
+       increment/decrement exact-once across every teardown path.  */
+    void setPreloginDeadline(uint64_t deadline_mono) { m_preloginDeadlineMono = deadline_mono; }
+    uint64_t preloginDeadline() const { return m_preloginDeadlineMono; }
+    void setPreloginAccounted(bool a) { m_preloginAccounted = a; }
+    bool preloginAccounted() const { return m_preloginAccounted; }
     void startInConnectionTest();
     time_t getConnectionTimeout();
     time_t getNextTimeout();
@@ -248,6 +257,8 @@ private:
     bool m_stallReported = false;
     unsigned int m_lastPickId;
     uint64_t m_lastPickSeq = 0;
+    uint64_t m_preloginDeadlineMono = 0;
+    bool m_preloginAccounted = false;
     static uint64_t s_pickSequence;
 
     Environments m_compilerVersions;  // Available compilers

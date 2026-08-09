@@ -474,6 +474,46 @@ static unsigned long detached_terminal_rejects = 0;
 /* Begin messages ignored because the job was not awaiting one (duplicate
    or out-of-order JobBegin from the assigned worker).  */
 static unsigned long nonwaiting_begin_rejects = 0;
+/* Pre-login lease, population bound, and accept quantum (issue #4 P1).
+   Named conservative defaults; test overrides via environment.  */
+static uint64_t prelogin_lease_msec = 15000;        // T_login
+static unsigned int prelogin_max_peers = 256;       // L
+static unsigned int accept_quantum = 64;            // Q
+static unsigned int prelogin_current = 0;
+static unsigned int prelogin_max_observed = 0;
+static unsigned long prelogin_expired_total = 0;
+static unsigned long prelogin_rejected_total = 0;
+static unsigned long prelogin_completed_total = 0;
+static unsigned long accepts_deferred_total = 0;
+/* Set when an accept quantum was exhausted with connections still
+   pending: the next poll uses a zero timeout so the listener is
+   re-serviced after one full scheduler turn.  */
+static bool accept_repoll = false;
+
+static void prelogin_read_overrides()
+{
+    const char *e;
+    if ((e = getenv("ICECC_TEST_PRELOGIN_LEASE_MSEC"))) {
+        prelogin_lease_msec = (uint64_t)atoll(e);
+    }
+    if ((e = getenv("ICECC_TEST_PRELOGIN_MAX_PEERS"))) {
+        prelogin_max_peers = (unsigned int)atoi(e);
+    }
+    if ((e = getenv("ICECC_TEST_ACCEPT_QUANTUM"))) {
+        accept_quantum = (unsigned int)atoi(e);
+    }
+}
+
+/* Exact-once release of a pre-login accounting slot.  */
+static void prelogin_release(CompileServer *cs)
+{
+    if (cs->preloginAccounted()) {
+        cs->setPreloginAccounted(false);
+        if (prelogin_current > 0) {
+            --prelogin_current;
+        }
+    }
+}
 
 /* How long an assignment may go unconfirmed before the scheduler REPORTS
    that one of this submitter's clients is not progressing.  Reporting is
@@ -1662,6 +1702,25 @@ static time_t prune_servers()
     time_t now = time(nullptr);
     time_t min_time = MAX_SCHEDULER_PING;
 
+    /* Pre-login peers live only in fd2cs -- the old prune walked controls
+       and logged-in css, so a peer that never completed its handshake was
+       never visited and held its slot forever.  Expire every accounted
+       peer past its whole-handshake lease.  */
+    {
+        const uint64_t now_mono = icecream_monotonic_msec();
+        map<int, CompileServer *>::iterator fit = fd2cs.begin();
+        while (fit != fd2cs.end()) {
+            CompileServer *pcs = fit->second;
+            ++fit;   /* handle_end erases from fd2cs */
+            if (pcs->preloginAccounted()
+                    && now_mono >= pcs->preloginDeadline()) {
+                trace() << "pre-login lease expired for " << pcs->name << endl;
+                ++prelogin_expired_total;
+                handle_end(pcs, nullptr);
+            }
+        }
+    }
+
     /* Refresh the farm-slot aggregate for the dispatch-credit clamp.  Once
        per loop over all daemons is cheap and cannot go stale across the
        login/logout/relogin paths that change it.  */
@@ -2099,6 +2158,10 @@ static bool handle_login(CompileServer *cs, Msg *_m)
         ++it;
     }
 
+    if (cs->preloginAccounted()) {
+        ++prelogin_completed_total;
+    }
+    prelogin_release(cs);
     css.push_back(cs);
 
     /* Configure the daemon */
@@ -2140,6 +2203,11 @@ static bool handle_relogin(MsgChannel *mc, Msg *_m)
 
 static bool handle_mon_login(CompileServer *cs, Msg *_m)
 {
+    if (cs->preloginAccounted()) {
+        ++prelogin_completed_total;
+    }
+    prelogin_release(cs);
+
     MonLoginMsg *m = dynamic_cast<MonLoginMsg *>(_m);
 
     if (!m) {
@@ -2659,10 +2727,15 @@ static bool handle_line(CompileServer *cs, Msg *_m)
     } else if (cmd == "listjobs") {
         const bool verbose = !l.empty() && (l.front() == "v" || l.front() == "verbose");
         {
-            char summary[128];
+            char summary[320];
             snprintf(summary, sizeof(summary),
-                     " detached_terminal_rejects=%lu nonwaiting_begin_rejects=%lu",
-                     detached_terminal_rejects, nonwaiting_begin_rejects);
+                     " detached_terminal_rejects=%lu nonwaiting_begin_rejects=%lu"
+                     " prelogin_current=%u prelogin_max=%u prelogin_expired=%lu"
+                     " prelogin_rejected=%lu prelogin_completed=%lu accepts_deferred=%lu",
+                     detached_terminal_rejects, nonwaiting_begin_rejects,
+                     prelogin_current, prelogin_max_observed,
+                     prelogin_expired_total, prelogin_rejected_total,
+                     prelogin_completed_total, accepts_deferred_total);
             if (!cs->send_msg(TextMsg(summary))) {
                 return false;
             }
@@ -2862,6 +2935,8 @@ static bool try_login(CompileServer *cs, Msg *m)
 
 static bool handle_end(CompileServer *toremove, Msg *m)
 {
+    prelogin_release(toremove);
+
 #if DEBUG_SCHEDULER > 1
     trace() << "Handle_end " << toremove << " " << m << endl;
 #else
@@ -3513,6 +3588,7 @@ int main(int argc, char *argv[])
     log_info() << "scheduler ready, algorithm: " <<  scheduler_algo << endl;
 
     time_t next_listen = 0;
+    prelogin_read_overrides();
 
     Broadcasts::broadcastSchedulerVersion(scheduler_port, netname, starttime);
     last_announce = starttime;
@@ -3668,6 +3744,13 @@ int main(int argc, char *argv[])
                 timeout = secs;
             }
         }
+        if (accept_repoll) {
+            /* A quantum-limited accept pass left connections pending: run
+               exactly one full turn of other work, then re-poll without
+               sleeping.  */
+            accept_repoll = false;
+            timeout = 0;
+        }
         int active_fds = poll(pollfds.data(), pollfds.size(), timeout * 1000);
         int poll_errno = errno;
 
@@ -3686,8 +3769,22 @@ int main(int argc, char *argv[])
         if (pollfd_is_set(pollfds, listen_fd, POLLIN)) {
             active_fds--;
             bool pending_connections = true;
+            unsigned int accepted_this_turn = 0;
 
             while (pending_connections) {
+                /* Accept QUANTUM: the old loop drained the whole backlog
+                   in one scheduler turn -- accepts, channel construction,
+                   and per-connection bookkeeping unbounded by any turn
+                   budget, starving control queries and existing daemons
+                   under a connection flood.  After Q accepts the listener
+                   yields; the next poll runs with a zero timeout so one
+                   full turn of other work happens before it is serviced
+                   again.  */
+                if (accepted_this_turn >= accept_quantum) {
+                    ++accepts_deferred_total;
+                    accept_repoll = true;
+                    break;
+                }
                 remote_len = sizeof(remote_addr);
                 remote_fd = accept(listen_fd,
                                    (struct sockaddr *) &remote_addr,
@@ -3705,6 +3802,15 @@ int main(int argc, char *argv[])
                 }
 
                 if (remote_fd >= 0) {
+                    ++accepted_this_turn;
+                    /* Population bound: at the cap, the socket is refused
+                       outright -- no CompileServer, no protocol buffers,
+                       no map entry.  */
+                    if (prelogin_current >= prelogin_max_peers) {
+                        ++prelogin_rejected_total;
+                        close(remote_fd);
+                        continue;
+                    }
                     CompileServer *cs = new CompileServer(remote_fd, (struct sockaddr *) &remote_addr, remote_len, false);
                     trace() << "accepted " << cs->name << endl;
                     cs->last_talk = time(nullptr);
@@ -3712,6 +3818,18 @@ int main(int argc, char *argv[])
                     if (!cs->protocol) { // protocol mismatch
                         delete cs;
                         continue;
+                    }
+
+                    /* Whole-handshake lease: negotiation AND the first
+                       valid login must complete before this absolute
+                       monotonic deadline; partial bytes do not refresh
+                       it.  last_talk stays telemetry only.  */
+                    cs->setPreloginDeadline(icecream_monotonic_msec()
+                                            + prelogin_lease_msec);
+                    cs->setPreloginAccounted(true);
+                    ++prelogin_current;
+                    if (prelogin_current > prelogin_max_observed) {
+                        prelogin_max_observed = prelogin_current;
                     }
 
                     fd2cs[cs->fd] = cs;
