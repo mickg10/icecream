@@ -7,7 +7,7 @@ import sys
 
 sys.dont_write_bytecode = True
 
-from run_formal_checks_v3 import main
+from run_formal_checks_v4 import main
 
 
 if __name__ == "__main__":
