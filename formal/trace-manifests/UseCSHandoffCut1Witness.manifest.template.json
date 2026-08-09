@@ -25,7 +25,7 @@
       "name": "FailAfterOneHeaderByte",
       "all": [
         {"path": "phase", "from": "Forwarding", "to": "ExactAbortPending"},
-        {"path": "failureObservedAt", "from": "NO_FAILURE", "to": 1},
+        {"path": "failureObservedAt", "from": 4, "to": 1},
         {"path": "bytesWritten", "to": 1},
         {"path": "frameCommitted", "to": false}
       ]
@@ -57,6 +57,7 @@
   "metadata": {
     "module": "UseCSHandoff",
     "config": "UseCSHandoffCut1Witness.cfg",
-    "cut": "partial-header"
+    "cut": "partial-header",
+    "no_failure_sentinel": 4
   }
 }
