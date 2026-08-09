@@ -1021,6 +1021,7 @@ static void remove_job_entry(map<unsigned int, Job *>::iterator it)
     const unsigned int id = it->first;
     jobs.erase(it);
     if (!job_id_allocator().release(id)) {
+        ++id_release_violations;
         log_error() << "job id " << id << " released without a live"
                     << " allocation -- id accounting violated" << endl;
     }
@@ -3525,9 +3526,19 @@ static bool handle_activity(CompileServer *cs)
         InternalsTarget *hit = nullptr;
         if (internals_txn.active && !internals_txn.final_pending) {
             for (InternalsTarget &t : internals_txn.targets) {
-                if (t.fd == cs->fd
-                        && t.generation == cs->connectionGeneration()
-                        && t.state == InternalsTarget::WAITING_REPLY) {
+                if (t.fd != cs->fd || t.generation != cs->connectionGeneration()) {
+                    continue;
+                }
+                /* Same-turn flush/reply race: the ready-fd loop flushes this
+                   channel's queued request and then drains its inbound in the
+                   SAME turn, before internals_txn_tick() promotes the target
+                   next turn.  Recheck the exact frame delivery here, so a
+                   reply whose request frame has already left is accepted
+                   rather than mis-classified as unsolicited and timed out.  */
+                if (t.state == InternalsTarget::WAITING_REPLY
+                        || (t.state == InternalsTarget::SEND_PENDING
+                            && cs->framesFlushed() >= t.request_frame_seq)) {
+                    t.state = InternalsTarget::WAITING_REPLY;
                     hit = &t;
                     break;
                 }
