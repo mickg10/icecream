@@ -1,0 +1,53 @@
+{
+  "schema": 1,
+  "scenario": "JobIdAllocatorDisconnectLeakMutant",
+  "property": "AllocatorMapAgreement",
+  "expected_result": "counterexample",
+  "min_states": 3,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "LocalMonitorIdAllocated",
+      "all": [
+        {"path": "issuedTotal", "from": 0, "to": 1},
+        {"path": "allocated", "from_len": 0, "to_len": 1}
+      ]
+    },
+    {
+      "name": "DaemonDisconnectDropsMappingButLeaksAllocation",
+      "all": [
+        {"path": "ownerPhase", "changed": true},
+        {"path": "terminalCount", "changed": true},
+        {"path": "allocated", "from_len": 1, "to_len": 1},
+        {"path": "releasedTotal", "from": 0, "to": 0},
+        {"path": "lastReleasedId", "from": 0, "to": 0}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "LocalMonitorIdAllocated",
+    "DaemonDisconnectDropsMappingButLeaksAllocation"
+  ],
+  "final_all": [
+    {"path": "allocated", "to_len": 1},
+    {"path": "releasedTotal", "eq": 0},
+    {"path": "issuedTotal", "eq": 1}
+  ],
+  "harness_steps": [
+    {
+      "after": "LocalMonitorIdAllocated",
+      "emit": "disconnect_daemon_with_live_local_monitor_job",
+      "actor": "daemon"
+    },
+    {
+      "after": "DaemonDisconnectDropsMappingButLeaksAllocation",
+      "emit": "assert_allocator_id_remains_live_without_owner_mapping",
+      "actor": "scheduler"
+    }
+  ],
+  "metadata": {
+    "module": "JobIdAllocator",
+    "config": "JobIdAllocatorDisconnectLeakMutant.cfg",
+    "mutant": "MutantDisconnectLeak = TRUE"
+  }
+}
