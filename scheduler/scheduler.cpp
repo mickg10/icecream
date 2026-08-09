@@ -3752,7 +3752,19 @@ static bool handle_end(CompileServer *toremove, Msg *m)
 
         break;
     case CompileServer::LINE:
-        toremove->send_msg(TextMsg("200 Good Bye!"));
+        /* Forced control teardown MUST NOT block.  A stopped or slow reader
+           can already hold a large pending backlog -- e.g. an internals
+           response that hit its output deadline (~155 KiB in the A.3 gate) --
+           and the default send_msg flag is SendBlocking, whose flush_writebuf
+           waits in a 30s POLLOUT poll on the full channel.  That would let a
+           transaction the output deadline just cleared go on blocking the
+           whole scheduler well past its declared deadline.  So: skip the
+           farewell entirely when any output is still pending, and otherwise
+           attempt it strictly nonblocking.  Either way the exact control
+           channel is deleted in this same bounded turn (below). */
+        if (toremove->pending_bytes() == 0) {
+            toremove->send_msg(TextMsg("200 Good Bye!"), MsgChannel::SendNonBlocking);
+        }
         controls.remove(toremove);
 
         break;
