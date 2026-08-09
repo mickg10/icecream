@@ -67,6 +67,11 @@
 # the same turn is accepted (the handler's same-turn recheck), not timed
 # out (issue #4 round-3 internals gap #1; deterministic via a tick-promote
 # test knob; red/green).
+#
+# Run 13 -- internalspredelivery: the request is held before byte 1.  An
+# early STATUS_TEXT must remain unsolicited and leave target/accounting/
+# deadline state unchanged; release sends exactly one real request, and
+# only its subsequent reply may settle exactly one target (issue #4 A.2).
 dir=$(dirname "$0")
 "$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 promotion 1 || exit 1
 "$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 heterogeneous 1 || exit 1
@@ -77,6 +82,7 @@ dir=$(dirname "$0")
 "$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 duplocal || exit 1
 "$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 exhaust || exit 1
 "$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 internalsrace || exit 1
+"$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 internalspredelivery || exit 1
 "$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 internalsguard || exit 1
 "$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 internalspreflight || exit 1
 "$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 retention || exit 1
