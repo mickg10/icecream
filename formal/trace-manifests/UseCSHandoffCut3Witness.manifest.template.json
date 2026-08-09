@@ -25,7 +25,7 @@
       "name": "FailOneByteShort",
       "all": [
         {"path": "phase", "from": "Forwarding", "to": "ExactAbortPending"},
-        {"path": "failureObservedAt", "from": "NO_FAILURE", "to": 3},
+        {"path": "failureObservedAt", "from": 4, "to": 3},
         {"path": "bytesWritten", "to": 3},
         {"path": "frameCommitted", "to": false}
       ]
@@ -60,6 +60,7 @@
   "metadata": {
     "module": "UseCSHandoff",
     "config": "UseCSHandoffCut3Witness.cfg",
-    "cut": "final-byte-short"
+    "cut": "final-byte-short",
+    "no_failure_sentinel": 4
   }
 }
