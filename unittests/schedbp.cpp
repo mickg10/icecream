@@ -629,6 +629,15 @@ int main(int argc, char **argv)
     if (internalsrace_mode) {
         setenv("ICECC_TEST_INTERNALS_NO_TICK_PROMOTE", "1", 1);
     }
+    /* "internalspredelivery": hold the exact GET_INTERNALS request before
+       byte 1, inject an unsolicited STATUS_TEXT, then release the real
+       request and require only the post-delivery reply to settle the target.
+       Removing the handler's held-state check must make this gate red.  */
+    const bool internalspredelivery_mode =
+        argc > 5 && strcmp(argv[5], "internalspredelivery") == 0;
+    if (internalspredelivery_mode) {
+        setenv("ICECC_TEST_INTERNALS_HOLD_FRAME", "1", 1);
+    }
     /* "internalsguard": the active control issues a SECOND command mid
        fan-out; the same-control guard must fail its exact generation (its
        reply would otherwise bypass the reserved-tail accounting).  Keep
@@ -1098,7 +1107,8 @@ int main(int argc, char **argv)
            traffic parks.  */
         if (leastbusy_mode || retention_mode || teardown_mode || internalsuaf_mode
                 || duplocal_mode || exhaust_mode || internalsrace_mode
-                || internalsguard_mode || internalspreflight_mode) {
+                || internalspredelivery_mode || internalsguard_mode
+                || internalspreflight_mode) {
             while (!shutdown) {
                 usleep(100 * 1000);
             }
@@ -3291,6 +3301,278 @@ int main(int argc, char **argv)
         kill(sched, SIGTERM);
         waitpid(sched, nullptr, 0);
         if (failures) { fprintf(stderr, "RESULT: FAIL (%d)\n", failures); return 1; }
+        fprintf(stderr, "RESULT: PASS\n");
+        return 0;
+    }
+
+    if (internalspredelivery_mode) {
+        MsgChannel *w = connect_daemon(port, 0);
+        REQUIRE(w != nullptr, "pre-delivery worker connected");
+        if (w) {
+            LoginMsg login(10277, "fpredelivery", kPlatform, 0);
+            login.envs.push_back(std::make_pair(kPlatform, kEnv));
+            login.max_kids = 4;
+            REQUIRE(w->send_msg(login), "pre-delivery worker logged in");
+            StatsMsg st;
+            REQUIRE(w->send_msg(st), "pre-delivery worker sent initial stats");
+        }
+
+        {
+            const Clock::time_point t0 = Clock::now();
+            bool present = false;
+            while (!present && secs_since(t0) < 8) {
+                present = query_submitter_field(port, "fpredelivery", "jobs=") >= 0;
+                if (!present) {
+                    usleep(100 * 1000);
+                }
+            }
+            REQUIRE(present, "pre-delivery worker is logged in before fan-out");
+        }
+
+        /* Remove CS_CONF/login chatter before the causality trace begins.
+           A GET_INTERNALS observed after this barrier can only belong to
+           the command below.  */
+        if (w) {
+            const Clock::time_point t0 = Clock::now();
+            while (secs_since(t0) < 0.4) {
+                Msg *m = w->get_msg(0, true);
+                delete m;
+                usleep(10 * 1000);
+            }
+        }
+
+        const int ictrl = tcp_connect(port + 1, 0);
+        REQUIRE(ictrl >= 0, "pre-delivery owner control connected");
+        if (ictrl >= 0) {
+            char greeting[1024];
+            struct pollfd gp = { ictrl, POLLIN, 0 };
+            if (poll(&gp, 1, 3000) > 0) {
+                const ssize_t n = read(ictrl, greeting, sizeof(greeting));
+                REQUIRE(n > 0, "pre-delivery owner received greeting");
+            } else {
+                REQUIRE(false, "pre-delivery owner received greeting");
+            }
+            const char *icmd = "internals fpredelivery\n";
+            REQUIRE(write(ictrl, icmd, strlen(icmd)) == (ssize_t)strlen(icmd),
+                    "pre-delivery internals command sent");
+        }
+
+        auto dump_field = [](const std::string &dump, const char *field) -> long long {
+            const size_t p = dump.find(field);
+            if (p == std::string::npos) {
+                return -1;
+            }
+            return parse_field_ll(dump.c_str() + p + strlen(field));
+        };
+        auto read_available = [](int fd, int wait_ms) {
+            std::string out;
+            const Clock::time_point t0 = Clock::now();
+            while ((int)(secs_since(t0) * 1000.0) < wait_ms) {
+                struct pollfd rp = { fd, POLLIN, 0 };
+                if (poll(&rp, 1, 50) <= 0) {
+                    continue;
+                }
+                char b[4096];
+                const ssize_t n = read(fd, b, sizeof(b));
+                if (n <= 0) {
+                    break;
+                }
+                out.append(b, (size_t)n);
+            }
+            return out;
+        };
+        auto occurrences = [](const std::string &text, const char *needle) {
+            int count = 0;
+            size_t p = 0;
+            while ((p = text.find(needle, p)) != std::string::npos) {
+                ++count;
+                p += strlen(needle);
+            }
+            return count;
+        };
+
+        std::string before;
+        {
+            const Clock::time_point t0 = Clock::now();
+            while (secs_since(t0) < 5) {
+                before = control_dump(port, "listjobs");
+                if (dump_field(before, "internals_active=") == 1
+                        && dump_field(before, "internals_sendpending=") == 1) {
+                    break;
+                }
+                usleep(100 * 1000);
+            }
+        }
+        const long long before_active = dump_field(before, "internals_active=");
+        const long long before_pending = dump_field(before, "internals_sendpending=");
+        const long long before_waiting = dump_field(before, "internals_waiting=");
+        const long long before_replied = dump_field(before, "internals_replied=");
+        const long long before_retained = dump_field(before, "internals_retained=");
+        const long long before_peak = dump_field(before, "internals_peak_pending=");
+        const long long before_marker = dump_field(before, "internals_marker_queued=");
+        const long long before_terminal = dump_field(before, "internals_terminal_queued=");
+        const long long before_collection =
+            dump_field(before, "internals_collection_deadline=");
+        const long long before_output = dump_field(before, "internals_output_deadline=");
+        const long long before_fd = dump_field(before, "internals_t0_fd=");
+        const long long before_generation = dump_field(before, "internals_t0_gen=");
+        REQUIRE(before_active == 1 && before_pending == 1
+                    && before_waiting == 0 && before_replied == 0,
+                "held target begins active and SEND_PENDING only");
+        REQUIRE(before_collection > 0 && before_output > before_collection
+                    && before.find("internals_phase=collection") != std::string::npos,
+                "held transaction exposes distinct collection/output deadlines");
+        REQUIRE(before_fd >= 0 && before_generation > 0,
+                "held target exposes a concrete fd/generation snapshot");
+
+        int before_release_requests = 0;
+        if (w) {
+            const Clock::time_point t0 = Clock::now();
+            while (secs_since(t0) < 0.5) {
+                Msg *m = w->get_msg(0, true);
+                if (m) {
+                    if (MSG_IS(m, GET_INTERNALS)) {
+                        ++before_release_requests;
+                    }
+                    delete m;
+                }
+                usleep(10 * 1000);
+            }
+        }
+        REQUIRE(before_release_requests == 0,
+                "before-byte-1 barrier delivered no GET_INTERNALS request");
+
+        REQUIRE(w && w->send_msg(StatusTextMsg("before-delivery must stay unsolicited\n")),
+                "worker injected STATUS_TEXT before request delivery");
+        usleep(250 * 1000);
+
+        const std::string after_early = control_dump(port, "listjobs");
+        REQUIRE(dump_field(after_early, "internals_active=") == before_active
+                    && dump_field(after_early, "internals_sendpending=") == before_pending
+                    && dump_field(after_early, "internals_waiting=") == before_waiting
+                    && dump_field(after_early, "internals_replied=") == before_replied,
+                "pre-delivery STATUS_TEXT leaves the held target SEND_PENDING");
+        REQUIRE(dump_field(after_early, "internals_retained=") == before_retained
+                    && dump_field(after_early, "internals_peak_pending=") == before_peak
+                    && dump_field(after_early, "internals_marker_queued=") == before_marker
+                    && dump_field(after_early, "internals_terminal_queued=") == before_terminal,
+                "pre-delivery STATUS_TEXT leaves output accounting unchanged");
+        REQUIRE(dump_field(after_early, "internals_collection_deadline=")
+                    == before_collection
+                    && dump_field(after_early, "internals_output_deadline=") == before_output
+                    && after_early.find("internals_phase=collection") != std::string::npos,
+                "pre-delivery STATUS_TEXT leaves both deadlines and phase unchanged");
+        REQUIRE(dump_field(after_early, "internals_t0_fd=") == before_fd
+                    && dump_field(after_early, "internals_t0_gen=") == before_generation,
+                "pre-delivery STATUS_TEXT leaves target identity unchanged");
+
+        std::string owner_reply = ictrl >= 0 ? read_available(ictrl, 300) : std::string();
+        REQUIRE(owner_reply.find("before-delivery") == std::string::npos
+                    && owner_reply.find("200 done") == std::string::npos,
+                "pre-delivery STATUS_TEXT produces no owner row or terminal");
+
+        const CtrlReply release = ctrl_exchange(port, "internals-release");
+        REQUIRE(release.status == CtrlReply::COMPLETE,
+                "armed release command completed on a separate control");
+
+        int delivered_requests = 0;
+        bool late_sent = false;
+        if (w) {
+            const Clock::time_point t0 = Clock::now();
+            while (secs_since(t0) < 5) {
+                Msg *m = w->get_msg(1, true);
+                if (!m) {
+                    continue;
+                }
+                if (MSG_IS(m, GET_INTERNALS)) {
+                    ++delivered_requests;
+                    if (!late_sent) {
+                        late_sent = w->send_msg(
+                            StatusTextMsg("after-delivery accepted exactly once\n"));
+                    }
+                }
+                delete m;
+                if (delivered_requests > 0) {
+                    break;
+                }
+            }
+            const Clock::time_point extra = Clock::now();
+            while (secs_since(extra) < 0.4) {
+                Msg *m = w->get_msg(0, true);
+                if (m) {
+                    if (MSG_IS(m, GET_INTERNALS)) {
+                        ++delivered_requests;
+                    }
+                    delete m;
+                }
+                usleep(10 * 1000);
+            }
+        }
+        REQUIRE(delivered_requests == 1,
+                "release delivered exactly one real GET_INTERNALS request");
+        REQUIRE(late_sent, "worker replied only after decoding the released request");
+
+        if (ictrl >= 0) {
+            const Clock::time_point t0 = Clock::now();
+            while (owner_reply.find("200 done") == std::string::npos
+                    && secs_since(t0) < 8) {
+                owner_reply += read_available(ictrl, 200);
+            }
+        }
+        REQUIRE(occurrences(owner_reply, "after-delivery accepted exactly once") == 1,
+                "post-delivery STATUS_TEXT produced exactly one owner row");
+        REQUIRE(owner_reply.find("before-delivery") == std::string::npos,
+                "unsolicited pre-delivery payload never entered owner output");
+        REQUIRE(occurrences(owner_reply, "200 done") == 1,
+                "owner received exactly one terminal");
+        REQUIRE(owner_reply.find("not reporting") == std::string::npos
+                    && owner_reply.find("disconnected before reporting") == std::string::npos,
+                "delivered request settled by its correlated reply, not fallback");
+
+        std::string settled;
+        {
+            const Clock::time_point t0 = Clock::now();
+            while (secs_since(t0) < 5) {
+                settled = control_dump(port, "listjobs");
+                if (dump_field(settled, "internals_active=") == 0
+                        && settled.find("internals_last_reason=complete")
+                            != std::string::npos) {
+                    break;
+                }
+                usleep(100 * 1000);
+            }
+        }
+        REQUIRE(dump_field(settled, "internals_active=") == 0
+                    && dump_field(settled, "internals_last_terminal=") == 1
+                    && settled.find("internals_last_reason=complete") != std::string::npos,
+                "released transaction settled once with a complete terminal");
+        REQUIRE(dump_field(settled, "internals_last_output_deadline=") == before_output
+                    && dump_field(settled, "internals_last_entered_output_phase=") == 1,
+                "settled snapshot preserves its output deadline and output-phase entry");
+
+        REQUIRE(waitpid(sched, nullptr, WNOHANG) == 0, "scheduler alive");
+        REQUIRE(!probe_died.load(), "control probe never lost the scheduler");
+
+        if (ictrl >= 0) {
+            close(ictrl);
+        }
+        shutdown = true;
+        probe_thread.join();
+        cs_thread.join();
+        healthy_thread.join();
+        close(ctrl);
+        delete w;
+        delete sub;
+        delete sub2;
+        delete cs;
+        kill(sched, SIGTERM);
+        int st = -1;
+        REQUIRE(waitpid(sched, &st, 0) == sched, "scheduler reaped");
+        REQUIRE(WIFEXITED(st) && WEXITSTATUS(st) == 0, "clean shutdown");
+        if (failures) {
+            fprintf(stderr, "RESULT: FAIL (%d)\n", failures);
+            return 1;
+        }
         fprintf(stderr, "RESULT: PASS\n");
         return 0;
     }
