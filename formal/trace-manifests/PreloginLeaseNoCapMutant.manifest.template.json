@@ -1,0 +1,58 @@
+{
+  "schema": 1,
+  "scenario": "PreloginLeaseNoCapMutant",
+  "property": "PreloginBound",
+  "expected_result": "counterexample",
+  "min_states": 5,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "FirstPreloginAdmission",
+      "all": [
+        {"path": "preloginAdmittedTotal", "from": 0, "to": 1},
+        {"path": "acceptedThisTurn", "from": 0, "to": 1},
+        {"path": "preloginRejectedTotal", "to": 0}
+      ]
+    },
+    {
+      "name": "SecondPreloginAdmissionBeyondL",
+      "all": [
+        {"path": "preloginAdmittedTotal", "from": 1, "to": 2},
+        {"path": "acceptedThisTurn", "from": 1, "to": 2},
+        {"path": "preloginRejectedTotal", "to": 0},
+        {"path": "preloginCompletedTotal", "to": 0},
+        {"path": "preloginExpiredTotal", "to": 0},
+        {"path": "preloginPeerClosedTotal", "to": 0}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "FirstPreloginAdmission",
+    "SecondPreloginAdmissionBeyondL"
+  ],
+  "final_all": [
+    {"path": "preloginAdmittedTotal", "eq": 2},
+    {"path": "preloginRejectedTotal", "eq": 0},
+    {"path": "preloginCompletedTotal", "eq": 0},
+    {"path": "preloginExpiredTotal", "eq": 0},
+    {"path": "preloginPeerClosedTotal", "eq": 0}
+  ],
+  "harness_steps": [
+    {
+      "after": "FirstPreloginAdmission",
+      "emit": "hold_first_prelogin_peer",
+      "actor": "scheduler"
+    },
+    {
+      "after": "SecondPreloginAdmissionBeyondL",
+      "emit": "assert_prelogin_population_exceeded_cap",
+      "actor": "scheduler"
+    }
+  ],
+  "metadata": {
+    "module": "PreloginLease",
+    "config": "PreloginLeaseNoCapMutant.cfg",
+    "mutant": "MutantNoCap = TRUE",
+    "bound": "L = 1"
+  }
+}
