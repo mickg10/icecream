@@ -1,0 +1,22 @@
+PASS                        JobIdAllocatorFixed
+  trace: Allocate(r0)=1 -> Allocate(l0)=2 -> Allocate(r1)=3 -> Allocate(r2)=None -> Release(l0=2) -> Allocate(r2)=2
+EXPECTED_COUNTEREXAMPLE     JobIdZeroWrapMutant
+  property: NoZero
+  trace: Allocate(r0)=0
+EXPECTED_COUNTEREXAMPLE     JobIdRemoteOnlyCollisionMutant
+  property: GlobalLiveUniqueness
+  trace: Allocate(l0)=1 -> Allocate(r0)=1 using remote-only view
+EXPECTED_COUNTEREXAMPLE     JobIdUnknownLocalDoneMutant
+  property: UnknownDoneNoTerminalZero
+  trace: UnknownLocalDone(k) -> map::operator[] -> global_id=0 -> EmitTerminal(0)
+EXPECTED_COUNTEREXAMPLE     JobIdDuplicateLocalBeginMutant
+  property: AllocatorMapAgreement
+  trace: LocalBegin(k)=1 -> DuplicateLocalBegin(k)=2 -> old id orphaned
+EXPECTED_COUNTEREXAMPLE     JobIdDisconnectLeakMutant
+  property: AllocatorMapAgreement
+  trace: LocalBegin(l0)=1 -> DaemonDisconnect -> mapping destroyed without release
+EXPECTED_COUNTEREXAMPLE     JobIdPartialBatchMutant
+  property: ExhaustionNoPartialPublication
+  trace: Allocate(existing0)=1 -> Allocate(existing1)=2 -> BatchRequest(count=2) -> PartiallyPublish(3) -> Exhaust
+PASS                        JobIdReleasedReuse
+  trace: OldOwnerLive(1) -> Release(old=1) -> Allocate(new)=1
