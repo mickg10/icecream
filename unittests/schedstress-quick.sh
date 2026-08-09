@@ -1,5 +1,6 @@
 #!/bin/sh
-# Deterministic scheduler stress gates (~2min).  Split from schedbp-quick.sh
+# Deterministic scheduler stress gates (~8min on the reference host).  Split
+# from schedbp-quick.sh
 # because the promotion case runs at the PRODUCTION 60-second bound on
 # purpose -- a shortened test-only bound would gate a rule production does
 # not run.
