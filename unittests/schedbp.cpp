@@ -589,6 +589,13 @@ int main(int argc, char **argv)
        The counterexample this locks out is stock upstream behaviour that a
        formal ownership model surfaced.  */
     const bool teardown_mode = argc > 5 && strcmp(argv[5], "teardown") == 0;
+    /* "internalsuaf": fan out `internals` to two workers, then disconnect
+       them mid-transaction so the finalize path iterates a target whose
+       CompileServer was just freed -- the exact use-after-free the
+       round-2 re-review found in the pointer-keyed transaction.  Green
+       under ASan proves the value-record fix; the pointer-keyed variant
+       is the red control.  */
+    const bool internalsuaf_mode = argc > 5 && strcmp(argv[5], "internalsuaf") == 0;
     /* "retention": the proof that Stage-A retention is CORRECT, not merely
        non-destructive.  A quiet-but-healthy daemon crossing the report
        threshold, a sibling legitimately running across it, dispatch
@@ -1039,7 +1046,7 @@ int main(int argc, char **argv)
            holding 0-1 slots at random moments would make them flake.  The
            connection stays (the scheduler keeps a second submitter), the
            traffic parks.  */
-        if (leastbusy_mode || retention_mode || teardown_mode) {
+        if (leastbusy_mode || retention_mode || teardown_mode || internalsuaf_mode) {
             while (!shutdown) {
                 usleep(100 * 1000);
             }
@@ -3231,6 +3238,110 @@ int main(int argc, char **argv)
         delete sub; delete sub2; delete cs;
         kill(sched, SIGTERM);
         waitpid(sched, nullptr, 0);
+        if (failures) { fprintf(stderr, "RESULT: FAIL (%d)\n", failures); return 1; }
+        fprintf(stderr, "RESULT: PASS\n");
+        return 0;
+    }
+
+    if (internalsuaf_mode) {
+        /* Two extra workers become internals targets (fakecs is the
+           third).  They never reply, so at the command deadline -- or
+           immediately once all targets are terminal -- finalize()
+           iterates every target record; a disconnected target whose
+           CompileServer was freed is the UAF window.  */
+        MsgChannel *csA = connect_daemon(port, 0);
+        MsgChannel *csB = connect_daemon(port, 0);
+        REQUIRE(csA && csB, "two internals-target workers connected");
+        if (csA) {
+            LoginMsg la(10255, "fcsA", kPlatform, 0);
+            la.envs.push_back(std::make_pair(kPlatform, kEnv));
+            la.max_kids = 4;
+            REQUIRE(csA->send_msg(la), "worker A logged in");
+            StatsMsg st; csA->send_msg(st);
+        }
+        if (csB) {
+            LoginMsg lb(10256, "fcsB", kPlatform, 0);
+            lb.envs.push_back(std::make_pair(kPlatform, kEnv));
+            lb.max_kids = 4;
+            REQUIRE(csB->send_msg(lb), "worker B logged in");
+            StatsMsg st; csB->send_msg(st);
+        }
+        /* PRECONDITION: both workers must be logged in (present in
+           listcs) before the fan-out, or they would not be captured as
+           targets and the freed-target window would never be exercised.
+           Poll, bounded.  */
+        {
+            const Clock::time_point t0 = Clock::now();
+            bool both = false;
+            while (!both && secs_since(t0) < 15) {
+                const long long a = query_submitter_field(port, "fcsA", "jobs=");
+                const long long b = query_submitter_field(port, "fcsB", "jobs=");
+                both = (a >= 0 && b >= 0);
+                if (!both) { usleep(200 * 1000); }
+            }
+            REQUIRE(both, "both internals-target workers are logged in before the fan-out");
+        }
+
+        /* A dedicated control connection issues the fan-out, SCOPED to the
+           two disconnectable workers (so finalize runs over exactly them
+           -- not the always-live fakecs -- the moment both disconnect).  */
+        const int ictrl = tcp_connect(port + 1, 0);
+        REQUIRE(ictrl >= 0, "internals control connected");
+        {
+            char g[256]; struct pollfd gp = { ictrl, POLLIN, 0 };
+            if (poll(&gp, 1, 3000) > 0) { ssize_t z = read(ictrl, g, sizeof(g)); (void)z; }
+        }
+        { const char *icmd = "internals fcsA fcsB\n";
+          REQUIRE(write(ictrl, icmd, strlen(icmd)) == (ssize_t)strlen(icmd),
+                  "internals command sent"); }
+        /* Let both request frames flush (targets reach WAITING_REPLY),
+           then disconnect ONLY csA and keep csB connected-but-silent.
+           csB holds the transaction open, so finalize runs at the command
+           DEADLINE -- long after csA's CompileServer was freed -- and
+           iterates csA's freed record.  This maximizes and guarantees the
+           freed-before-finalize gap (the both-disconnect path reached
+           finalize too promptly for ASan to observe the free).  */
+        usleep(400 * 1000);
+        delete csA; csA = nullptr;
+
+        /* finalize() (immediate, all-terminal) or the deadline must
+           produce a complete 200 done without touching freed memory.  */
+        std::string reply;
+        {
+            const Clock::time_point t0 = Clock::now();
+            char b[4096];
+            while (reply.find("200 done") == std::string::npos
+                   && secs_since(t0) < 20) {
+                struct pollfd rp = { ictrl, POLLIN, 0 };
+                if (poll(&rp, 1, 200) <= 0) { continue; }
+                const ssize_t n = read(ictrl, b, sizeof(b) - 1);
+                if (n <= 0) { break; }
+                b[n] = 0; reply += b;
+            }
+        }
+        REQUIRE(reply.find("200 done") != std::string::npos,
+                "the fan-out completed with a terminal frame after both"
+                " targets disconnected mid-transaction");
+        REQUIRE(reply.find("fcsA") != std::string::npos
+                && reply.find("fcsB") != std::string::npos,
+                "the report names both targets (csA freed ~10s earlier,"
+                " csB timed out) -- finalize iterated csA's freed record");
+        if (csB) { delete csB; csB = nullptr; }
+        REQUIRE(waitpid(sched, nullptr, WNOHANG) == 0,
+                "the scheduler survived finalize over a freed target"
+                " (the pointer-keyed variant use-after-frees here)");
+        REQUIRE(!probe_died.load(), "the control probe never lost the scheduler");
+        REQUIRE(worst_reply.load() < 5.0, "scheduler stayed responsive");
+
+        close(ictrl);
+        shutdown = true;
+        probe_thread.join(); cs_thread.join(); healthy_thread.join();
+        close(ctrl);
+        delete sub; delete sub2; delete cs;
+        kill(sched, SIGTERM);
+        int st = -1;
+        REQUIRE(waitpid(sched, &st, 0) == sched, "scheduler reaped");
+        REQUIRE(WIFEXITED(st) && WEXITSTATUS(st) == 0, "clean shutdown");
         if (failures) { fprintf(stderr, "RESULT: FAIL (%d)\n", failures); return 1; }
         fprintf(stderr, "RESULT: PASS\n");
         return 0;
