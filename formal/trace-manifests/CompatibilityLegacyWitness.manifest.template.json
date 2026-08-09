@@ -1,0 +1,43 @@
+{
+  "schema": 1,
+  "scenario": "CompatibilityLegacyWitness",
+  "property": "NoLegacyAssignmentSeen",
+  "expected_result": "counterexample",
+  "min_states": 3,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "ObserveLegacyAssignment",
+      "all": [
+        {"path": "seenLegacy", "from": false, "to": true},
+        {"path": "policy", "from": "None", "to": "Legacy"},
+        {"path": "expectedPolicy", "from": "None", "to": "Legacy"},
+        {"path": "guarantee", "from": "None", "to": "LegacyOnly"},
+        {"path": "phase", "from": "Requested", "to": "Assigned"},
+        {"path": "projectedTrace", "len_delta": 1}
+      ]
+    }
+  ],
+  "required_subsequence": ["ObserveLegacyAssignment"],
+  "final_all": [
+    {"path": "seenLegacy", "eq": true},
+    {"path": "policy", "eq": "Legacy"},
+    {"path": "expectedPolicy", "eq": "Legacy"},
+    {"path": "guarantee", "eq": "LegacyOnly"}
+  ],
+  "harness_steps": [
+    {
+      "after": "ObserveLegacyAssignment",
+      "emit": "assert_assignment_uses_legacy_projection",
+      "actor": "scheduler"
+    }
+  ],
+  "metadata": {
+    "module": "MixedVersionCompatibilityChecked",
+    "configs": [
+      "CompatibilityLegacyOldFOldCWitness.cfg",
+      "CompatibilityLegacyOldFNewCWitness.cfg"
+    ],
+    "witness": "Old fulfillment capability selects Legacy per assignment even when the client link is new."
+  }
+}
