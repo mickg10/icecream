@@ -1,0 +1,37 @@
+{
+  "schema": 1,
+  "scenario": "CompatibilityPartialOldFrameMutant",
+  "property": "OldFrameFullyConsumed",
+  "expected_result": "counterexample",
+  "min_states": 5,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "ConsumeOnlyPrefixOfOldFrame",
+      "all": [
+        {"path": "phase", "from": "UseCSDelivered", "to": "UseCSDelivered"},
+        {"path": "policy", "to": "Legacy"},
+        {"path": "partialOldFrame", "from": false, "to": true},
+        {"path": "projectedTrace", "unchanged": true}
+      ]
+    }
+  ],
+  "required_subsequence": ["ConsumeOnlyPrefixOfOldFrame"],
+  "final_all": [
+    {"path": "phase", "eq": "UseCSDelivered"},
+    {"path": "policy", "eq": "Legacy"},
+    {"path": "partialOldFrame", "eq": true}
+  ],
+  "harness_steps": [
+    {
+      "after": "ConsumeOnlyPrefixOfOldFrame",
+      "emit": "assert_old_peer_left_bytes_from_current_frame_unconsumed",
+      "actor": "old-codec-fixture"
+    }
+  ],
+  "metadata": {
+    "module": "MixedVersionCompatibilityChecked",
+    "configs": ["CompatibilityPartialOldFrameMutant.cfg"],
+    "mutant": "MutantPartialOldFrame = TRUE"
+  }
+}
