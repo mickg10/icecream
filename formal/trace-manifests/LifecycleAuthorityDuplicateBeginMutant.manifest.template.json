@@ -1,0 +1,54 @@
+{
+  "schema": 1,
+  "scenario": "LifecycleAuthorityDuplicateBeginMutant",
+  "property": "BeginLinearizedOnce",
+  "expected_result": "counterexample",
+  "min_states": 3,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "AssignedWorkerBegin",
+      "all": [
+        {"path": "phase", "from": "Waiting", "to": "Started"},
+        {"path": "monitorBeginCount", "from": 0, "to": 1},
+        {"path": "startRevision", "from": 0, "to": 1}
+      ]
+    },
+    {
+      "name": "DuplicateBeginMutatesStart",
+      "all": [
+        {"path": "phase", "from": "Started", "to": "Started"},
+        {"path": "duplicateBeginCount", "from": 0, "to": 1},
+        {"path": "monitorBeginCount", "from": 1, "to": 2},
+        {"path": "startRevision", "from": 1, "to": 2}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "AssignedWorkerBegin",
+    "DuplicateBeginMutatesStart"
+  ],
+  "final_all": [
+    {"path": "phase", "eq": "Started"},
+    {"path": "duplicateBeginCount", "eq": 1},
+    {"path": "monitorBeginCount", "eq": 2},
+    {"path": "startRevision", "eq": 2}
+  ],
+  "harness_steps": [
+    {
+      "after": "AssignedWorkerBegin",
+      "emit": "sample_start_timestamp_and_monitor_begin_count",
+      "actor": "scheduler"
+    },
+    {
+      "after": "DuplicateBeginMutatesStart",
+      "emit": "assert_duplicate_begin_changed_timestamp_and_emitted_second_monitor_event",
+      "actor": "scheduler"
+    }
+  ],
+  "metadata": {
+    "module": "LifecycleAuthority",
+    "config": "LifecycleAuthorityDuplicateBeginMutant.cfg",
+    "mutant": "MutantDuplicateBeginMutates = TRUE"
+  }
+}
