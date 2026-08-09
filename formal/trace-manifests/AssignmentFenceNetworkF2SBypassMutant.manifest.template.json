@@ -7,73 +7,74 @@
   "event_mode": "exclusive",
   "events": [
     {
-      "name": "SPrepare.a0",
+      "name": "FQueueFirstReady",
       "all": [
-        {"path": "phase.a0", "from": "Absent", "to": "PrepareQueued"}
+        {"path": "f2s", "from_len": 0, "to_len": 1},
+        {"path": "nextF2SSeq", "delta": 1},
+        {"path": "workerSlot", "changed": true},
+        {"path": "phase", "changed": true}
       ]
     },
     {
-      "name": "FQueueReady.a0",
+      "name": "SQueueRevokeBehindReady",
       "all": [
-        {"path": "phase.a0", "from": "PrepareQueued", "to": "Prepared"},
-        {"path": "f2s", "len_delta": 1}
+        {"path": "s2f", "len_delta": 1},
+        {"path": "f2s", "unchanged": true}
+      ],
+      "any": [
+        {"path": "phase.a0", "to": "RevokeQueued"},
+        {"path": "phase.a1", "to": "RevokeQueued"}
       ]
     },
     {
-      "name": "SQueueRevokeBehindReady.a0",
+      "name": "FQueueSecondFrameBehindReady",
       "all": [
-        {"path": "phase.a0", "from": "Prepared", "to": "RevokeQueued"},
-        {"path": "s2f", "len_delta": 1}
+        {"path": "f2s", "from_len": 1, "to_len": 2},
+        {"path": "nextF2SSeq", "delta": 1},
+        {"path": "revokedEnqueued", "changed": true},
+        {"path": "s2f", "len_delta": -1}
       ]
     },
     {
-      "name": "FQueueRevokedBehindReady.a0",
+      "name": "SConsumeSecondF2SFrameFirst",
       "all": [
-        {"path": "revokedEnqueued.a0", "from": false, "to": true},
-        {"path": "f2s", "len_delta": 1}
-      ]
-    },
-    {
-      "name": "SConsumeSecondF2SFrameFirst.a0",
-      "all": [
-        {"path": "lastF2SConsumed", "delta_gt": 1},
-        {"path": "released.a0", "from": false, "to": true},
-        {"path": "f2s", "len_delta": -1}
+        {"path": "lastF2SConsumed", "from": 0, "to": 2},
+        {"path": "f2s", "from_len": 2, "to_len": 1},
+        {"path": "released", "changed": true}
       ]
     }
   ],
   "required_subsequence": [
-    "SPrepare.a0",
-    "FQueueReady.a0",
-    "SQueueRevokeBehindReady.a0",
-    "FQueueRevokedBehindReady.a0",
-    "SConsumeSecondF2SFrameFirst.a0"
+    "FQueueFirstReady",
+    "SQueueRevokeBehindReady",
+    "FQueueSecondFrameBehindReady",
+    "SConsumeSecondF2SFrameFirst"
   ],
   "final_all": [
     {"path": "lastF2SConsumed", "eq": 2},
-    {"path": "released.a0", "eq": true},
     {"path": "f2s", "to_len": 1}
   ],
   "harness_steps": [
     {
-      "after": "FQueueReady.a0",
+      "after": "FQueueFirstReady",
       "emit": "hold_ready_as_fifo_predecessor",
-      "actor": "transport"
+      "actor": "f-to-s-transport"
     },
     {
-      "after": "FQueueRevokedBehindReady.a0",
+      "after": "FQueueSecondFrameBehindReady",
       "emit": "queue_revoked_behind_ready",
-      "actor": "worker"
+      "actor": "fulfillment-daemon"
     },
     {
-      "after": "SConsumeSecondF2SFrameFirst.a0",
-      "emit": "assert_scheduler_consumed_revoked_before_ready",
+      "after": "SConsumeSecondF2SFrameFirst",
+      "emit": "assert_scheduler_consumed_sequence_two_while_sequence_one_remained",
       "actor": "scheduler"
     }
   ],
   "metadata": {
     "module": "AssignmentFenceNetwork",
     "config": "AssignmentFenceNetworkF2SBypassMutant.cfg",
-    "mutant": "MutantF2SBypass = TRUE"
+    "mutant": "MutantF2SBypass = TRUE",
+    "load_bearing_fact": "The remaining queued frame has sequence 1 while lastF2SConsumed is 2."
   }
 }
