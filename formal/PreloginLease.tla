@@ -133,7 +133,7 @@ ServiceControl ==
     /\ loopPhase = "Service"
     /\ loopPhase' = "Accept"
     /\ acceptedThisTurn' = 0
-    /\ controlDone' = controlDone \/ controlPending
+    /\ controlDone' = (controlDone \/ controlPending)
     /\ UNCHANGED <<connState, acceptedAt, deadline, now, controlPending,
                     socketAcceptedTotal, preloginAdmittedTotal,
                     preloginCompletedTotal, preloginExpiredTotal,
