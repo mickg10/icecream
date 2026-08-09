@@ -2459,7 +2459,13 @@ static bool handle_stats(CompileServer *cs, Msg *_m)
     for (CompileServer * const c : css)
         if (c == cs) {
             c->setLoad(m->load);
-            c->setClientCount(m->client_count);
+            /* StatsMsg never serializes client_count (the codec reads and
+               writes only load and memory fields), so the member here is
+               always its default zero.  Assigning it overwrote the fresher
+               counts learned from GetCS/JobBegin/JobDone -- which DO carry
+               the field on the wire -- and periodically zeroed a
+               mixed-role host's ranking input.  Those message handlers
+               keep updating it; the periodic stats must not.  */
             handle_monitor_stats(c, m);
             return true;
         }
@@ -3874,22 +3880,15 @@ int main(int argc, char *argv[])
             }
             if((*it)->getConnectionInProgress())
             {
-                const bool woke = active_fds > 0
-                    && pollfd_is_set(pollfds, (*it)->getInFd(), POLLIN | POLLOUT);
-                if (woke || active_fds == 0) {
-                    /* Read the completion verdict exactly ONCE per wake:
-                       SO_ERROR is clear-on-read, so the old double call
-                       (one per branch) consumed a refused connection's
-                       error in the first test and read 0 in the second --
-                       the probe then idled out its whole 5s deadline
-                       instead of failing fast.  */
-                    const bool up = (*it)->isConnected();
-                    if (woke && up) {
-                        active_fds--;
-                        (*it)->updateInConnectivity(true);
-                    } else if (!up) {
-                        (*it)->updateInConnectivity(false);
-                    }
+                /* A probe transitions on exactly two of ITS OWN facts: its
+                   fd became ready, or its own monotonic deadline expired.
+                   Unrelated ready descriptors (active_fds) must not gate
+                   it.  The SO_ERROR verdict is clear-on-read and is read
+                   exactly once, only on readiness.  */
+                if (pollfd_is_set(pollfds, (*it)->getInFd(), POLLIN | POLLOUT)) {
+                    (*it)->updateInConnectivity((*it)->probeCompletionOk());
+                } else if ((*it)->probeDeadlineExpired()) {
+                    (*it)->updateInConnectivity(false);
                 }
             }
         }
