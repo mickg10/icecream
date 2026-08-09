@@ -58,6 +58,7 @@
 #include "logging.h"
 #include "job.h"
 #include "comm.h"
+#include "legacyannouncement.h"
 
 using namespace std;
 
@@ -1511,24 +1512,15 @@ static int get_second_port_for_debug( int port )
 
 void Broadcasts::broadcastSchedulerVersion(int scheduler_port, const char* netname, time_t starttime)
 {
-    // Code for older schedulers than version 38. Has endianness problems, the message size
-    // is not BROAD_BUFLEN and the netname is possibly not null-terminated.
-    const char length_netname = strlen(netname);
-    const int schedbuflen = 5 + sizeof(uint64_t) + length_netname;
-    char *buf = new char[ schedbuflen ];
-    buf[0] = 'I';
-    buf[1] = 'C';
-    buf[2] = 'E';
-    buf[3] = PROTOCOL_VERSION;
-    uint64_t tmp_time = starttime;
-    memcpy(buf + 4, &tmp_time, sizeof(uint64_t));
-    buf[4 + sizeof(uint64_t)] = length_netname;
-    strncpy(buf + 5 + sizeof(uint64_t), netname, length_netname - 1);
-    buf[ schedbuflen - 1 ] = '\0';
-    broadcastData(scheduler_port, buf, schedbuflen);
-    delete[] buf;
+    /* Code for schedulers older than protocol 38.  Its one-byte name length
+       includes the terminating NUL; the pure encoder clamps to that exact
+       representable range and is round-trip tested independently. */
+    const std::vector<char> legacy = LegacySchedulerAnnouncement::encode(
+        PROTOCOL_VERSION, netname, starttime);
+    broadcastData(scheduler_port, legacy.data(), static_cast<int>(legacy.size()));
+
     // Latest version.
-    buf = new char[ BROAD_BUFLEN ];
+    char *buf = new char[ BROAD_BUFLEN ];
     memset(buf, 0, BROAD_BUFLEN );
     buf[0] = 'I';
     buf[1] = 'C';

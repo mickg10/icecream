@@ -1,9 +1,9 @@
-TESTS = testargs lockexec backpressure schedpolicy connectivityprobe connectivityprobe-negative.sh relisten-quick.sh relogin relogin-negative.sh siblingpin siblingpin-negative.sh statsapply statsapply-negative.sh utf8test statewritertest schedbp-quick.sh schedstress-quick.sh remoteice-quick.sh
+TESTS = testargs lockexec backpressure schedpolicy connectivityprobe connectivityprobe-negative.sh relisten-quick.sh relogin relogin-negative.sh legacyannouncement legacyannouncement-negative.sh siblingpin siblingpin-negative.sh statsapply statsapply-negative.sh utf8test statewritertest schedbp-quick.sh schedstress-quick.sh remoteice-quick.sh
 
 AM_CPPFLAGS = -I$(top_srcdir)/client -I$(top_srcdir)/services -I$(top_srcdir)/
 testargs_LDADD = ../client/libclient.a ../services/libicecc.la
 
-check_PROGRAMS = testargs lockexec backpressure schedpolicy connectivityprobe relisten relogin relogin_mutant siblingpin siblingpin_mutant statsapply statsapply_mutant utf8test statewritertest schedbp
+check_PROGRAMS = testargs lockexec backpressure schedpolicy connectivityprobe relisten relogin relogin_mutant legacyannouncement legacyannouncement_mutant siblingpin siblingpin_mutant statsapply statsapply_mutant utf8test statewritertest schedbp
 testargs_SOURCES = args.cpp
 lockexec_SOURCES = lockexec.cpp
 lockexec_LDADD = ../client/libclient.a ../services/libicecc.la
@@ -26,6 +26,13 @@ relogin_LDADD = ../services/libicecc.la
 relogin_mutant_SOURCES = $(relogin_SOURCES)
 relogin_mutant_CPPFLAGS = $(AM_CPPFLAGS) -DICECC_TEST_RELOGIN_MUTANT_FALSE_SUCCESS
 relogin_mutant_LDADD = ../services/libicecc.la
+
+legacyannouncement_SOURCES = legacyannouncementtest.cpp \
+    ../services/legacyannouncement.cpp
+
+legacyannouncement_mutant_SOURCES = $(legacyannouncement_SOURCES)
+legacyannouncement_mutant_CPPFLAGS = $(AM_CPPFLAGS) \
+    -DICECC_TEST_LEGACY_ANNOUNCEMENT_MUTANT_OFF_BY_ONE
 
 siblingpin_SOURCES = siblingpintest.cpp \
     ../scheduler/siblingpin.cpp \
@@ -75,7 +82,7 @@ sndbuf_shim.so: $(srcdir)/sndbuf_shim.c
 	$(CC) -shared -fPIC $(srcdir)/sndbuf_shim.c -ldl -o $@
 
 CLEANFILES = sndbuf_shim.so
-EXTRA_DIST = sndbuf_shim.c connectivityprobe-negative.sh relisten-quick.sh relogin-negative.sh siblingpin-negative.sh statsapply-negative.sh schedbp-quick.sh schedstress-quick.sh remoteice-quick.sh
+EXTRA_DIST = sndbuf_shim.c connectivityprobe-negative.sh relisten-quick.sh relogin-negative.sh legacyannouncement-negative.sh siblingpin-negative.sh statsapply-negative.sh schedbp-quick.sh schedstress-quick.sh remoteice-quick.sh
 
 # Make the tests also print the test log if they fail.
 check: export VERBOSE=1

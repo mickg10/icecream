@@ -1,5 +1,5 @@
 lib_LTLIBRARIES = libicecc.la
-libicecc_la_SOURCES = job.cpp comm.cpp exitcode.cpp getifaddrs.cpp logging.cpp ncpus.c pipes.cpp tempfile.c platform.cpp gcc.cpp util.cpp
+libicecc_la_SOURCES = job.cpp comm.cpp legacyannouncement.cpp exitcode.cpp getifaddrs.cpp logging.cpp ncpus.c pipes.cpp tempfile.c platform.cpp gcc.cpp util.cpp
 libicecc_la_LIBADD = \
 	$(LZO_LDADD) \
 	$(LIBZSTD_LIBS) \
@@ -18,6 +18,7 @@ ice_HEADERS = \
 noinst_HEADERS = \
 	exitcode.h \
 	getifaddrs.h \
+	legacyannouncement.h \
 	logging.h \
 	ncpus.h \
 	pipes.h \
