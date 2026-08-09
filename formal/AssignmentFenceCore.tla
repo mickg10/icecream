@@ -2,18 +2,18 @@
 (***************************************************************************
 Abstract worker-side assignment ownership for Icecream protocol 49/50.
 
-This core intentionally has no sockets. It separates two conserved tokens:
+This core intentionally has no sockets.  It separates two conserved tokens:
 
   schedulerReservation[a]  S still accounts for assignment a and may not
                            reuse its logical reservation;
   workerSlot[a]            F still consumes one physical compile slot for a.
 
 After F linearizes REVOKED, workerSlot is free but schedulerReservation remains
-until S consumes the REVOKED result. Collapsing those tokens makes the revoke
+until S consumes the REVOKED result.  Collapsing those tokens makes the revoke
 transition impossible to state accurately.
 
 MutantLegacyCanClaimToken and MutantReleaseClaimed are model switches used by
-negative configurations. They must be FALSE in the fixed specification.
+negative configurations.  They must be FALSE in the fixed specification.
 ***************************************************************************)
 EXTENDS Naturals, FiniteSets, TLC
 
@@ -126,6 +126,11 @@ Start(a) ==
     /\ UNCHANGED <<claimant, exactClaim, schedulerReservation, workerSlot,
                     released, terminalCount, preparedEver>>
 
+(***************************************************************************
+F-side revocation linearization.  F installs the rejection fence before this
+transition is acknowledged.  Its physical slot is now free; S still retains
+its reservation until ConsumeRevoked.
+***************************************************************************)
 Revoke(a) ==
     /\ a \in Assignments
     /\ phase[a] = "Prepared"
@@ -134,6 +139,11 @@ Revoke(a) ==
     /\ UNCHANGED <<claimant, exactClaim, schedulerReservation, released,
                     terminalCount, preparedEver>>
 
+(***************************************************************************
+S consumes REVOKED and may release its logical reservation.  The mutant also
+permits this transition from Claimed, reproducing release-before-worker-
+ownership-resolution.
+***************************************************************************)
 ConsumeRevoked(a) ==
     /\ a \in Assignments
     /\ (phase[a] = "Revoked"
@@ -158,7 +168,7 @@ Complete(a) ==
 
 WorkerLost(a) ==
     /\ a \in Assignments
-    /\ phase[a] \in ClaimedPhases
+    /\ phase[a] \in LiveWorkerPhases
     /\ phase' = [phase EXCEPT ![a] = "Terminal"]
     /\ schedulerReservation' = [schedulerReservation EXCEPT ![a] = FALSE]
     /\ workerSlot' = [workerSlot EXCEPT ![a] = FALSE]
@@ -237,6 +247,11 @@ EventualSettlement ==
     \A a \in Assignments :
         [](phase[a] \in LiveSchedulerPhases => <> (phase[a] = "Terminal"))
 
+(***************************************************************************
+Small operators for the checked two-assignment configurations.  The fixed
+configuration has one TOKEN_REQUIRED assignment and one legacy arrival sharing
+a wire id but carrying different full identities/tokens.
+***************************************************************************)
 MCCapacity == [w \in Workers |-> 1]
 MCPolicyOf == [a \in Assignments |-> IF a = "a0" THEN TokenRequired ELSE LegacyId]
 MCWorkerOf == [a \in Assignments |-> CHOOSE w \in Workers : TRUE]
