@@ -3336,6 +3336,27 @@ int main(int argc, char **argv)
         REQUIRE(closed,
                 "the control was failed up front by the required-tail"
                 " preflight (the complete response cannot fit the cap)");
+
+        /* Zero worker side effects: with the preflight BEFORE fan-out, no
+           GET_INTERNALS request reached any worker.  Drain each worker
+           channel briefly and require none.  (The placement mutant that
+           moves the preflight AFTER the send pass fails HERE.)  */
+        {
+            int got_requests = 0;
+            const Clock::time_point t0 = Clock::now();
+            while (secs_since(t0) < 3) {
+                for (MsgChannel *w : ws) {
+                    Msg *m = w->get_msg(0);
+                    if (!m) { continue; }
+                    if (MSG_IS(m, GET_INTERNALS)) { ++got_requests; }
+                    delete m;
+                }
+                usleep(50 * 1000);
+            }
+            REQUIRE(got_requests == 0,
+                    "NO worker received a GET_INTERNALS request -- the"
+                    " preflight failed the control BEFORE any fan-out");
+        }
         {
             std::string reason;
             const Clock::time_point t0 = Clock::now();

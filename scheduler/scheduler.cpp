@@ -699,6 +699,7 @@ static void internals_txn_finalize()
            generation -- never silently omit a required row.  */
         const std::string srow = t.node_name + why;
         if (internals_emit(control, srow, kInternalsControlPendingCap) != ISEND_QUEUED) {
+            internals_txn_clear("required-row-drop");
             handle_end(control, nullptr);
             return;
         }
@@ -710,6 +711,7 @@ static void internals_txn_finalize()
     if (txn.payload_omitted) {
         if (internals_emit(control, string(kInternalsMarker),
                            kInternalsControlPendingCap) != ISEND_QUEUED) {
+            internals_txn_clear("marker-drop");
             handle_end(control, nullptr);
             return;
         }
@@ -721,6 +723,7 @@ static void internals_txn_finalize()
        generation instead of clearing the transaction as if done.  */
     if (internals_emit(control, string(kInternalsTerm),
                        kInternalsControlPendingCap) != ISEND_QUEUED) {
+        internals_txn_clear("terminal-drop");
         handle_end(control, nullptr);
         return;
     }
@@ -751,9 +754,12 @@ static void internals_txn_tick()
             return;
         }
         if (now >= txn.output_deadline_mono) {
-            /* A control that will not read is explicitly failed; that
-               teardown clears the transaction.  */
+            /* A control that will not read is explicitly failed.  Record
+               the exact settling event (output-deadline) BEFORE handle_end
+               clears the txn as control-disconnected, so the last-settled
+               snapshot preserves why it ended.  */
             trace() << "internals: control output deadline expired" << endl;
+            internals_txn_clear("output-deadline");
             handle_end(control, nullptr);
             return;
         }
@@ -3351,6 +3357,8 @@ static bool handle_line(CompileServer *cs, Msg *_m)
                                              + internals_deadline_msec;
         internals_txn.retained_bytes = 0;
         internals_txn.targets.clear();
+        /* PASS 1: build value-only target snapshots (fd, generation,
+           node name, initial state) WITHOUT sending anything.  */
         for (CompileServer * const it : css) {
             if (!l.empty()) {
                 list<string>::const_iterator si;
@@ -3363,42 +3371,46 @@ static bool handle_line(CompileServer *cs, Msg *_m)
                     continue;
                 }
             }
-            /* Nonblocking, deferrable: backpressure parks the frame on
-               the channel's own output queue and the normal POLLOUT
-               flushing owns it; a hard send error settles the target
-               immediately.  */
             InternalsTarget t;
             t.fd = it->fd;
             t.generation = it->connectionGeneration();
             t.node_name = it->nodeName();
-            if (it->send_msg(GetInternalStatus(),
-                             MsgChannel::SendNonBlocking | MsgChannel::SendDeferrable)) {
-                /* Queued, not delivered: WAITING_REPLY only once the
-                   exact frame has flushed (tick promotes it).  */
-                t.request_frame_seq = it->framesQueued();
-                t.state = InternalsTarget::SEND_PENDING;
-            } else {
-                t.request_frame_seq = 0;
-                t.state = InternalsTarget::DISCONNECTED;
-            }
+            t.request_frame_seq = 0;
+            t.state = InternalsTarget::SEND_PENDING;
             internals_txn.targets.push_back(t);
         }
-        /* GLOBAL INVARIANT preflight: the whole required tail (a semantic
-           fallback row for every target + one omission marker + terminal)
-           must fit under BOTH the control pending cap and the cumulative
-           transaction budget from the outset.  If a pre-filled control
+        /* GLOBAL INVARIANT preflight, computed from the COMPLETE target
+           snapshot and BEFORE any worker side effect: the whole required
+           tail (a semantic fallback row for every target + one omission
+           marker + terminal) must fit under BOTH the control pending cap
+           and the cumulative transaction budget.  If a pre-filled control
            cannot hold the complete response, fail its exact generation now
-           rather than discovering a squeezed-out required row at finalize.  */
+           -- no GetInternalStatus has been queued to any worker yet.  */
         {
             const size_t tail = internals_required_tail_wire();
             if (cs->pending_bytes() + tail > kInternalsControlPendingCap
                     || tail > kInternalsRetainedCap) {
-                /* Clear (snapshots the reason) then actually delete the
-                   control: returning false means the handler already
-                   deleted it.  */
                 internals_txn_clear("preflight-overflow");
                 handle_end(cs, nullptr);
                 return false;
+            }
+        }
+        /* PASS 2: only now fan out.  Re-resolve each snapshot's exact
+           fd/generation (a target may have disappeared between passes ->
+           settle it disconnected); record the request frame sequence only
+           after a successful nonblocking deferrable queue.  */
+        for (InternalsTarget &t : internals_txn.targets) {
+            CompileServer *target = internals_resolve(t.fd, t.generation);
+            if (!target) {
+                t.state = InternalsTarget::DISCONNECTED;
+                continue;
+            }
+            if (target->send_msg(GetInternalStatus(),
+                                 MsgChannel::SendNonBlocking | MsgChannel::SendDeferrable)) {
+                t.request_frame_seq = target->framesQueued();
+                t.state = InternalsTarget::SEND_PENDING;
+            } else {
+                t.state = InternalsTarget::DISCONNECTED;
             }
         }
         internals_txn_tick();
