@@ -62,6 +62,11 @@
 # generation closed, no staged survivors, unrelated peers live -- instead
 # of parking and retrying forever (issue #4 correction B.2b; red/green,
 # tiny ICECC_TEST_JOB_ID_DOMAIN).
+#
+# Run 12 -- internalsrace: a STATUS_TEXT reply whose request frame flushed
+# the same turn is accepted (the handler's same-turn recheck), not timed
+# out (issue #4 round-3 internals gap #1; deterministic via a tick-promote
+# test knob; red/green).
 dir=$(dirname "$0")
 "$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 promotion 1 || exit 1
 "$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 heterogeneous 1 || exit 1
@@ -71,6 +76,7 @@ dir=$(dirname "$0")
 "$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 internalsuaf || exit 1
 "$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 duplocal || exit 1
 "$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 exhaust || exit 1
+"$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 internalsrace || exit 1
 "$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 retention || exit 1
 "$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 noreader || exit 1
 exec "$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 leastbusy 2

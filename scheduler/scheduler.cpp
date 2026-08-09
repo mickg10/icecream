@@ -665,7 +665,14 @@ static void internals_txn_tick()
             t.state = InternalsTarget::DISCONNECTED;
             continue;
         }
-        if (target->framesFlushed() >= t.request_frame_seq) {
+        static const bool no_tick_promote =
+            getenv("ICECC_TEST_INTERNALS_NO_TICK_PROMOTE") != nullptr;
+        if (!no_tick_promote && target->framesFlushed() >= t.request_frame_seq) {
+            /* The test knob suppresses this promotion to isolate the
+               STATUS_TEXT handler's same-turn recheck as the ONLY path
+               that can accept a reply -- a deterministic stand-in for the
+               ready-fd loop flushing the request and draining the reply in
+               one turn before this tick runs.  */
             t.state = InternalsTarget::WAITING_REPLY;
         }
     }

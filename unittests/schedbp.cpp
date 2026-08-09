@@ -612,6 +612,14 @@ int main(int argc, char **argv)
            count=20 batch un-completable.  */
         setenv("ICECC_TEST_JOB_ID_DOMAIN", "8", 1);
     }
+    /* "internalsrace": the same-turn flush/reply race.  With tick
+       promotion disabled (below), the ONLY way a reply is accepted is the
+       STATUS_TEXT handler's same-turn recheck -- so this deterministically
+       isolates that fix.  */
+    const bool internalsrace_mode = argc > 5 && strcmp(argv[5], "internalsrace") == 0;
+    if (internalsrace_mode) {
+        setenv("ICECC_TEST_INTERNALS_NO_TICK_PROMOTE", "1", 1);
+    }
     /* "retention": the proof that Stage-A retention is CORRECT, not merely
        non-destructive.  A quiet-but-healthy daemon crossing the report
        threshold, a sibling legitimately running across it, dispatch
@@ -1063,7 +1071,7 @@ int main(int argc, char **argv)
            connection stays (the scheduler keeps a second submitter), the
            traffic parks.  */
         if (leastbusy_mode || retention_mode || teardown_mode || internalsuaf_mode
-                || duplocal_mode || exhaust_mode) {
+                || duplocal_mode || exhaust_mode || internalsrace_mode) {
             while (!shutdown) {
                 usleep(100 * 1000);
             }
@@ -3255,6 +3263,71 @@ int main(int argc, char **argv)
         delete sub; delete sub2; delete cs;
         kill(sched, SIGTERM);
         waitpid(sched, nullptr, 0);
+        if (failures) { fprintf(stderr, "RESULT: FAIL (%d)\n", failures); return 1; }
+        fprintf(stderr, "RESULT: PASS\n");
+        return 0;
+    }
+
+    if (internalsrace_mode) {
+        MsgChannel *w = connect_daemon(port, 0);
+        REQUIRE(w != nullptr, "race worker connected");
+        if (w) {
+            LoginMsg login(10275, "frace", kPlatform, 0);
+            login.envs.push_back(std::make_pair(kPlatform, kEnv));
+            login.max_kids = 4;
+            REQUIRE(w->send_msg(login), "race worker logged in");
+            StatsMsg st; w->send_msg(st);
+        }
+        usleep(400 * 1000);
+        {
+            long long present = query_submitter_field(port, "frace", "jobs=");
+            REQUIRE(present >= 0, "race worker is logged in before the fan-out");
+        }
+        const int ictrl = tcp_connect(port + 1, 0);
+        REQUIRE(ictrl >= 0, "race control connected");
+        { char g[256]; struct pollfd gp = { ictrl, POLLIN, 0 };
+          if (poll(&gp,1,3000)>0){ ssize_t z=read(ictrl,g,sizeof(g)); (void)z; } }
+        { const char *icmd = "internals frace\n";
+          REQUIRE(write(ictrl, icmd, strlen(icmd)) == (ssize_t)strlen(icmd),
+                  "internals command sent"); }
+        /* Give the request time to flush (tick promotion is disabled), then
+           the worker replies: the ONLY acceptance path is the handler
+           recheck.  */
+        usleep(400 * 1000);
+        REQUIRE(w->send_msg(StatusTextMsg("frace internal status: ok\n")),
+                "worker replied after its request flushed");
+
+        std::string reply;
+        {
+            const Clock::time_point t0 = Clock::now();
+            char b[4096];
+            while (reply.find("200 done") == std::string::npos && secs_since(t0) < 20) {
+                struct pollfd rp = { ictrl, POLLIN, 0 };
+                if (poll(&rp,1,200) <= 0) { continue; }
+                const ssize_t n = read(ictrl, b, sizeof(b)-1);
+                if (n <= 0) { break; }
+                b[n]=0; reply += b;
+            }
+        }
+        REQUIRE(reply.find("200 done") != std::string::npos, "fan-out completed");
+        REQUIRE(reply.find("frace internal status: ok") != std::string::npos,
+                "the same-turn reply was ACCEPTED and forwarded (handler"
+                " recheck promoted SEND_PENDING; next-turn-only promotion"
+                " would time it out)");
+        REQUIRE(reply.find("frace not reporting") == std::string::npos,
+                "the target was not timed out");
+        REQUIRE(waitpid(sched, nullptr, WNOHANG) == 0, "scheduler alive");
+        REQUIRE(!probe_died.load(), "control probe never lost the scheduler");
+
+        close(ictrl);
+        shutdown = true;
+        probe_thread.join(); cs_thread.join(); healthy_thread.join();
+        close(ctrl);
+        delete w; delete sub; delete sub2; delete cs;
+        kill(sched, SIGTERM);
+        int st = -1;
+        REQUIRE(waitpid(sched, &st, 0) == sched, "scheduler reaped");
+        REQUIRE(WIFEXITED(st) && WEXITSTATUS(st) == 0, "clean shutdown");
         if (failures) { fprintf(stderr, "RESULT: FAIL (%d)\n", failures); return 1; }
         fprintf(stderr, "RESULT: PASS\n");
         return 0;
