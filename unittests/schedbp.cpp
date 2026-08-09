@@ -3437,6 +3437,13 @@ int main(int argc, char **argv)
         if (mon) { mon->send_msg(MonLoginMsg()); }
         usleep(400 * 1000);
 
+        /* Baseline allocator state before the trace.  */
+        const long long live0 = query_control_field(port, "listjobs", "alloc_live=", "alloc_live=");
+        const long long issued0 = query_control_field(port, "listjobs", "alloc_issued=", "alloc_issued=");
+        const long long viol0 = query_control_field(port, "listjobs", "id_release_violations=", "id_release_violations=");
+        REQUIRE(live0 >= 0 && issued0 >= 0 && viol0 >= 0,
+                "allocator baseline readable");
+
         /* The ruled trace: Begin(k), Begin(k), Done(k), Done(k) for one
            client-local id.  */
         const int k = 4242;
@@ -3453,7 +3460,7 @@ int main(int argc, char **argv)
 
         /* Count the monitor's local-job events.  */
         int begins = 0, dones = 0, done_id_zero = 0;
-        unsigned begin_global = 0;
+        unsigned begin_global = 0, done_global = 0;
         {
             const Clock::time_point t0 = Clock::now();
             while (secs_since(t0) < 3) {
@@ -3464,7 +3471,7 @@ int main(int argc, char **argv)
                     if (b2) { ++begins; begin_global = b2->job_id; }
                 } else if (MSG_IS(m, JOB_LOCAL_DONE)) {
                     JobLocalDoneMsg *d = dynamic_cast<JobLocalDoneMsg *>(m);
-                    if (d) { ++dones; if (d->job_id == 0) { ++done_id_zero; } }
+                    if (d) { ++dones; done_global = d->job_id; if (d->job_id == 0) { ++done_id_zero; } }
                 }
                 delete m;
             }
@@ -3479,6 +3486,19 @@ int main(int argc, char **argv)
                 " operator[] default-insert bug)");
         REQUIRE(begin_global != 0 && dones == 1,
                 "the terminal named the real global id, not 0");
+        REQUIRE(done_global == begin_global,
+                "the local Done named the SAME global id the Begin allocated");
+        {
+            const long long live1 = query_control_field(port, "listjobs", "alloc_live=", "alloc_live=");
+            const long long issued1 = query_control_field(port, "listjobs", "alloc_issued=", "alloc_issued=");
+            const long long viol1 = query_control_field(port, "listjobs", "id_release_violations=", "id_release_violations=");
+            REQUIRE(live1 == live0,
+                    "allocator live count returned to baseline (the id was released)");
+            REQUIRE(issued1 - issued0 == 1,
+                    "exactly ONE id was allocated across the whole trace");
+            REQUIRE(viol1 - viol0 == 0,
+                    "no id-release accounting violations during the trace");
+        }
         /* The scheduler's own duplicate counter must show exactly one.  */
         {
             long long dup = -1;

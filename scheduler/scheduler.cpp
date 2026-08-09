@@ -546,21 +546,37 @@ static CompileServer *internals_resolve(int fd, unsigned int generation)
     return it->second;
 }
 
-/* Exact bounded control output: every internals row/terminal goes through
-   here.  It refuses to queue a frame that would push the control channel's
-   ACTUAL pending bytes past the cap (payload + a fixed framing allowance),
-   counts what it drops, and reports a hard send failure to the caller so
-   finalize can settle the control instead of pretending success.  */
-static const size_t kInternalsFrameOverhead = 16;   // length prefix + slack
-static bool internals_send_bounded(CompileServer *control, const std::string &text,
+/* Exact bounded control output.  QUEUED / DROPPED / ERROR are DISTINCT:
+   the earlier boolean conflated "queued" with "dropped by the bound", so a
+   dropped terminal could be recorded as successfully queued.  Callers must
+   treat the terminal as never-droppable (fail the control if it cannot be
+   queued) and settle the control on ERROR.  Byte accounting is the EXACT
+   text-channel wire length: write_line() appends the payload plus a single
+   newline only if the text does not already end in one -- no length
+   prefix on a text channel.  */
+enum InternalsSend { ISEND_QUEUED, ISEND_DROPPED, ISEND_ERROR };
+
+static size_t internals_wire_len(const std::string &text)
+{
+    return text.size() + ((text.empty() || text[text.size() - 1] != '\n') ? 1 : 0);
+}
+
+/* Reserve enough headroom under the control cap that the terminal frame
+   and one omission marker can ALWAYS be queued after the data rows.  */
+static const size_t kInternalsTermReserve = 256;
+
+static InternalsSend internals_emit(CompileServer *control, const std::string &text,
                                     size_t cap)
 {
-    if (control->pending_bytes() + text.size() + kInternalsFrameOverhead > cap) {
+    if (control->pending_bytes() + internals_wire_len(text) > cap) {
         ++internals_output_dropped;
-        return true;   /* dropped by the exact bound; not a transport failure */
+        return ISEND_DROPPED;
     }
-    return control->send_msg(TextMsg(text),
-                             MsgChannel::SendNonBlocking | MsgChannel::SendDeferrable);
+    if (!control->send_msg(TextMsg(text),
+                           MsgChannel::SendNonBlocking | MsgChannel::SendDeferrable)) {
+        return ISEND_ERROR;
+    }
+    return ISEND_QUEUED;
 }
 
 static void internals_txn_clear()
@@ -596,6 +612,11 @@ static void internals_txn_finalize()
         internals_txn_clear();
         return;
     }
+    /* Data rows are bounded against the cap MINUS the terminal reserve, so
+       the terminal (and one omission marker) can always be queued.  */
+    const size_t data_cap = kInternalsControlPendingCap > kInternalsTermReserve
+        ? kInternalsControlPendingCap - kInternalsTermReserve : 0;
+    bool omitted = false;
     for (const InternalsTarget &t : txn.targets) {
         const char *why = nullptr;
         switch (t.state) {
@@ -610,16 +631,30 @@ static void internals_txn_finalize()
             why = " disconnected before reporting\n";
             break;
         }
-        if (!internals_send_bounded(control, t.node_name + why,
-                                    kInternalsControlPendingCap)) {
-            /* Hard transport failure: settle the control now, do NOT
-               enter FINAL_PENDING claiming a queued terminal.  */
+        switch (internals_emit(control, t.node_name + why, data_cap)) {
+        case ISEND_QUEUED:
+            break;
+        case ISEND_DROPPED:
+            omitted = true;
+            break;
+        case ISEND_ERROR:
+            handle_end(control, nullptr);   /* hard failure: settle control */
+            return;
+        }
+    }
+    if (omitted) {
+        /* One deterministic omission marker (the reserve guarantees room).  */
+        if (internals_emit(control, string("[rows omitted: control output bound]\n"),
+                           kInternalsControlPendingCap) == ISEND_ERROR) {
             handle_end(control, nullptr);
             return;
         }
     }
-    if (!internals_send_bounded(control, string("200 done"),
-                                kInternalsControlPendingCap)) {
+    /* The terminal is NEVER a droppable row.  If it cannot be queued, the
+       control cannot receive a complete response: fail its exact
+       generation instead of clearing the transaction as if done.  */
+    if (internals_emit(control, string("200 done"),
+                       kInternalsControlPendingCap) != ISEND_QUEUED) {
         handle_end(control, nullptr);
         return;
     }
@@ -3034,21 +3069,24 @@ static bool handle_line(CompileServer *cs, Msg *_m)
     } else if (cmd == "listjobs") {
         const bool verbose = !l.empty() && (l.front() == "v" || l.front() == "verbose");
         {
-            char summary[320];
+            char summary[512];
             snprintf(summary, sizeof(summary),
                      " detached_terminal_rejects=%lu nonwaiting_begin_rejects=%lu"
                      " dup_local_begin=%lu id_release_violations=%lu"
                      " internals_output_dropped=%lu"
                      " prelogin_current=%u prelogin_max=%u prelogin_expired=%lu"
                      " prelogin_rejected=%lu prelogin_completed=%lu accepts_deferred=%lu"
-                     " prelogin_underflow=%lu",
+                     " prelogin_underflow=%lu"
+                     " alloc_live=%llu alloc_issued=%llu",
                      detached_terminal_rejects, nonwaiting_begin_rejects,
                      duplicate_local_begin_ignored, id_release_violations,
                      internals_output_dropped,
                      prelogin_current, prelogin_max_observed,
                      prelogin_expired_total, prelogin_rejected_total,
                      prelogin_completed_total, accepts_deferred_total,
-                     prelogin_underflow_violations);
+                     prelogin_underflow_violations,
+                     (unsigned long long)job_id_allocator().liveCount(),
+                     (unsigned long long)job_id_allocator().issuedTotal());
             if (!cs->send_msg(TextMsg(summary))) {
                 return false;
             }
@@ -3173,11 +3211,11 @@ static bool handle_line(CompileServer *cs, Msg *_m)
                false so the drain loop deletes this channel -- the existing
                control contract; we must NOT delete it here and then return
                to a caller that still holds it.  */
-            if (!internals_send_bounded(cs, string("500 internals busy\n"),
-                                        kInternalsControlPendingCap)
-                    || !internals_send_bounded(cs, string("200 done"),
-                                               kInternalsControlPendingCap)) {
-                return false;
+            if (internals_emit(cs, string("500 internals busy\n"),
+                               kInternalsControlPendingCap) == ISEND_ERROR
+                    || internals_emit(cs, string("200 done"),
+                                      kInternalsControlPendingCap) != ISEND_QUEUED) {
+                return false;   /* drain loop deletes this channel */
             }
             return true;
         }
@@ -3556,36 +3594,52 @@ static bool handle_activity(CompileServer *cs)
             CompileServer *control = internals_resolve(internals_txn.control_fd,
                                                        internals_txn.control_generation);
             if (control) {
-                /* Bounded forward: per-target cap, whole-transaction
-                   retained cap, and a control pending-byte cap -- a
-                   non-reading control must not buffer unboundedly.  */
+                /* Forward the worker row through the SAME bounded, checked
+                   path as every other row: per-target cap, whole-txn
+                   retained cap (exact wire bytes), and the control cap
+                   minus the terminal reserve.  A DROP emits one
+                   deterministic omission marker; a hard ERROR settles the
+                   control's exact generation.  */
                 std::string text = static_cast<StatusTextMsg*>(m)->text;
                 bool truncated = false;
                 if (text.size() > kInternalsPerTargetCap) {
                     text.resize(kInternalsPerTargetCap);
                     truncated = true;
                 }
-                if (internals_txn.retained_bytes + text.size() > kInternalsRetainedCap) {
-                    const size_t room = kInternalsRetainedCap > internals_txn.retained_bytes
-                        ? kInternalsRetainedCap - internals_txn.retained_bytes : 0;
-                    text.resize(room);
+                const size_t retain_room = kInternalsRetainedCap > internals_txn.retained_bytes
+                    ? kInternalsRetainedCap - internals_txn.retained_bytes : 0;
+                if (internals_wire_len(text) > retain_room) {
+                    text.resize(text.size() < retain_room ? text.size() : retain_room);
                     truncated = true;
                 }
-                if (control->pending_bytes() + text.size() > kInternalsControlPendingCap) {
-                    text.clear();
+                const size_t data_cap = kInternalsControlPendingCap > kInternalsTermReserve
+                    ? kInternalsControlPendingCap - kInternalsTermReserve : 0;
+                std::string row = hit->node_name + ": " + text;
+                if (row.empty() || row[row.size() - 1] != '\n') { row += '\n'; }
+                bool fail = false;
+                switch (internals_emit(control, row, data_cap)) {
+                case ISEND_QUEUED:
+                    internals_txn.retained_bytes += internals_wire_len(row);
+                    break;
+                case ISEND_DROPPED:
                     truncated = true;
+                    break;
+                case ISEND_ERROR:
+                    fail = true;
+                    break;
                 }
-                internals_txn.retained_bytes += text.size();
-                if (!text.empty()) {
-                    control->send_msg(TextMsg(text),
-                                      MsgChannel::SendNonBlocking | MsgChannel::SendDeferrable);
+                if (!fail && truncated) {
+                    if (internals_emit(control, hit->node_name + " [output truncated]\n",
+                                       kInternalsControlPendingCap) == ISEND_ERROR) {
+                        fail = true;
+                    }
                 }
-                if (truncated) {
-                    control->send_msg(TextMsg(hit->node_name + " [output truncated]\n"),
-                                      MsgChannel::SendNonBlocking | MsgChannel::SendDeferrable);
+                if (fail) {
+                    handle_end(control, nullptr);
+                    break;   /* out of the STATUS_TEXT case */
                 }
             }
-            if (internals_txn_all_terminal()) {
+            if (internals_txn.active && internals_txn_all_terminal()) {
                 internals_txn_finalize();
             }
         } else {
