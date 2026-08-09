@@ -195,9 +195,16 @@ public:
 
     unsigned int hostidCounter() const;
 
+    /* Checked lookup: 0 = unknown local id (never a default-inserted
+       record -- the old operator[] lookup created one and emitted a
+       monitor completion for global id 0).  */
     int getClientLocalJobId(const int localJobId);
-    void insertClientLocalJobId(const int localJobId, const int newJobId, bool fulljob);
+    /* Returns the global id a duplicate Begin displaced (0 if none): the
+       caller must emit its terminal and release it exactly once.  */
+    int insertClientLocalJobId(const int localJobId, const int newJobId, bool fulljob);
     void eraseClientLocalJobId(const int localJobId);
+    /* Every live local-record global id, for disconnect reconciliation.  */
+    std::list<int> liveClientLocalJobIds() const;
 
     map<const CompileServer *, Environments> blacklist() const;
     Environments getEnvsForBlacklistedCS(const CompileServer *cs);

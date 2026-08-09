@@ -481,12 +481,28 @@ void CompileServer::setCumRequested(const JobStat &stats)
 
 int CompileServer::getClientLocalJobId(const int localJobId)
 {
-    return m_clientLocalMap[localJobId].id;
+    map<int, LocalJobInfo>::const_iterator it = m_clientLocalMap.find(localJobId);
+    return it == m_clientLocalMap.end() ? 0 : it->second.id;
 }
 
-void CompileServer::insertClientLocalJobId(const int localJobId, const int newJobId, bool fulljob)
+int CompileServer::insertClientLocalJobId(const int localJobId, const int newJobId, bool fulljob)
 {
+    int displaced = 0;
+    map<int, LocalJobInfo>::iterator it = m_clientLocalMap.find(localJobId);
+    if (it != m_clientLocalMap.end()) {
+        displaced = it->second.id;
+    }
     m_clientLocalMap[localJobId] = LocalJobInfo{newJobId, fulljob};
+    return displaced;
+}
+
+std::list<int> CompileServer::liveClientLocalJobIds() const
+{
+    std::list<int> ids;
+    for (const std::pair<const int, LocalJobInfo> &info : m_clientLocalMap) {
+        ids.push_back(info.second.id);
+    }
+    return ids;
 }
 
 void CompileServer::eraseClientLocalJobId(const int localJobId)

@@ -63,6 +63,7 @@
 #include "job.h"
 #include "scheduler.h"
 #include "fastest.h"
+#include "jobidallocator.h"
 
 /* TODO:
    * leak check
@@ -111,7 +112,6 @@ static list<CompileServer *> css;
 static list<CompileServer *> monitors;
 static list<CompileServer *> controls;
 static list<string> block_css;
-static unsigned int new_job_id;
 static map<unsigned int, Job *> jobs;
 
 /* XXX Uah.  Don't use a queue for the job requests.  It's a hell
@@ -770,65 +770,47 @@ static void handle_monitor_stats(CompileServer *cs, StatsMsg *m = nullptr)
     notify_monitors(new MonStatsMsg(cs->hostId(), msg));
 }
 
-/* Checked wire-id allocation.  The remote jobs map and the local monitor
-   ids share one counter, so BOTH consume ids from this helper.  The old
-   form was ++counter + assert(not in map) + operator[]: under NDEBUG the
-   uniqueness check vanished, and on wrap (or injected reuse) operator[]
-   silently REPLACED a still-live job -- old worker/submitter messages then
-   mutated a different logical job by bare id (the ABA family).  Here:
-
-   - an id is nonzero and not currently live in the jobs map;
-   - increment-and-probe over the live set (live ids are bounded far below
-     the 32-bit space, so the probe terminates immediately in practice);
-   - exhaustion of the whole domain is detected and reported as failure
-     instead of spinning or corrupting state;
-   - a widening allocation sequence is kept for diagnostics.
-
-   The test domain seam (ICECC_TEST_JOB_ID_DOMAIN=<n>) shrinks the id
-   space to {1..n} so exhaustion and release-reuse are testable.  */
-static unsigned long long job_id_allocation_seq = 0;
-
-static unsigned int allocate_wire_id()
+/* One JobIdAllocator instance serves every scheduler-visible id --
+   remote jobs AND local monitor records -- so neither class can be
+   issued an id the other still holds (the old probe checked only the
+   remote jobs map).  The test domain seam (ICECC_TEST_JOB_ID_DOMAIN=<n>)
+   shrinks the id space for the exhaustion/reuse gates.  */
+static JobIdAllocator &job_id_allocator()
 {
-    static unsigned int domain = 0;   /* 0 = full 32-bit space */
-    if (job_id_allocation_seq == 0) {
+    static JobIdAllocator alloc([]() -> uint32_t {
         const char *e = getenv("ICECC_TEST_JOB_ID_DOMAIN");
-        domain = e ? (unsigned int)atoi(e) : 0;
-    }
-    const unsigned int live = (unsigned int)jobs.size();
-    if (domain && live >= domain) {
-        return 0;   /* whole test domain occupied: explicit exhaustion */
-    }
-    for (;;) {
-        ++new_job_id;
-        if (domain && new_job_id > domain) {
-            new_job_id = 1;
-        }
-        if (new_job_id == 0) {
-            new_job_id = 1;   /* 0 is the sentinel; never allocate it */
-        }
-        ++job_id_allocation_seq;
-        if (jobs.find(new_job_id) == jobs.end()) {
-            return new_job_id;
-        }
+        return e ? (uint32_t)atoi(e) : 0xffffffffu;
+    }());
+    return alloc;
+}
+
+/* Exact removal: erase from the jobs map and release the id exactly
+   once, or report the accounting violation loudly.  */
+static void remove_job_entry(map<unsigned int, Job *>::iterator it)
+{
+    const unsigned int id = it->first;
+    jobs.erase(it);
+    if (!job_id_allocator().release(id)) {
+        log_error() << "job id " << id << " released without a live"
+                    << " allocation -- id accounting violated" << endl;
     }
 }
 
 static Job *create_new_job(CompileServer *submitter)
 {
-    const unsigned int id = allocate_wire_id();
+    const unsigned int id = job_id_allocator().allocate();
     if (id == 0) {
-        return nullptr;
+        return nullptr;   /* explicit domain exhaustion */
     }
     Job *job = new Job(id, submitter);
     const std::pair<map<unsigned int, Job *>::iterator, bool> ins =
         jobs.insert(std::make_pair(id, job));
     if (!ins.second) {
-        /* Insertion IS the uniqueness proof; a collision here means the
-           probe raced state it cannot see -- fail the request explicitly
-           rather than replace a live job.  */
+        /* The allocator reserved it, so the map cannot hold it -- a
+           collision here is an invariant failure, never an overwrite.  */
         log_error() << "job id " << id << " collided with a live job;"
                     << " refusing the allocation" << endl;
+        job_id_allocator().release(id);
         delete job;
         return nullptr;
     }
@@ -1285,7 +1267,7 @@ static bool handle_local_job(CompileServer *cs, Msg *_m)
         return false;
     }
 
-    const unsigned int local_id = allocate_wire_id();
+    const unsigned int local_id = job_id_allocator().allocate();
     if (local_id == 0) {
         trace() << "handle_local_job: id domain exhausted; dropping monitor"
                 << " record for " << m->outfile << endl;
@@ -1293,7 +1275,14 @@ static bool handle_local_job(CompileServer *cs, Msg *_m)
     }
     trace() << "handle_local_job " << (m->fulljob ? "(full) " : "") << m->outfile
         << " " << m->id << endl;
-    cs->insertClientLocalJobId(m->id, local_id, m->fulljob);
+    const int displaced = cs->insertClientLocalJobId(m->id, local_id, m->fulljob);
+    if (displaced > 0) {
+        /* A duplicate local Begin for the same client id: the displaced
+           record gets its terminal and its id back -- it must not leak
+           silently.  */
+        notify_monitors(new JobLocalDoneMsg(displaced));
+        job_id_allocator().release((uint32_t)displaced);
+    }
     notify_monitors(new MonLocalJobBeginMsg(local_id, m->outfile, m->stime, cs->hostId()));
     return true;
 }
@@ -1307,8 +1296,17 @@ static bool handle_local_job_done(CompileServer *cs, Msg *_m)
     }
 
     trace() << "handle_local_job_done " << m->job_id << endl;
-    notify_monitors(new JobLocalDoneMsg(cs->getClientLocalJobId(m->job_id)));
+    const int global_id = cs->getClientLocalJobId(m->job_id);
+    if (global_id == 0) {
+        /* Unknown or duplicate local Done: no record, no terminal for
+           global id 0 (the old lookup default-inserted one), nothing to
+           release.  */
+        trace() << "no local record for client-local id " << m->job_id << endl;
+        return true;
+    }
+    notify_monitors(new JobLocalDoneMsg(global_id));
     cs->eraseClientLocalJobId(m->job_id);
+    job_id_allocator().release((uint32_t)global_id);
     return true;
 }
 
@@ -2343,7 +2341,12 @@ static bool handle_job_done(CompileServer *cs, Msg *_m)
                         << " staged jobs cancelled before activation" << endl;
                 for (Job * const sj : rit->staged) {
                     notify_monitors(new MonJobDoneMsg(JobDoneMsg(sj->id(), 255)));
-                    jobs.erase(sj->id());
+                    {
+                        map<unsigned int, Job *>::iterator sit = jobs.find(sj->id());
+                        if (sit != jobs.end()) {
+                            remove_job_entry(sit);
+                        }
+                    }
                     delete sj;
                     ++cancelled;
                 }
@@ -2381,7 +2384,12 @@ static bool handle_job_done(CompileServer *cs, Msg *_m)
             }
             notify_monitors(new MonJobDoneMsg(JobDoneMsg(job->id(), 255)));
             credit_dispatch_credit(job);
-            mit = jobs.erase(mit);
+            {
+                map<unsigned int, Job *>::iterator next = mit;
+                ++next;
+                remove_job_entry(mit);
+                mit = next;
+            }
             delete job;
             ++cancelled;
         }
@@ -2486,7 +2494,12 @@ static bool handle_job_done(CompileServer *cs, Msg *_m)
     add_job_stats(j, m);
     notify_monitors(new MonJobDoneMsg(*m));
     credit_dispatch_credit(j);
-    jobs.erase(m->job_id);
+    {
+        map<unsigned int, Job *>::iterator dit = jobs.find(m->job_id);
+        if (dit != jobs.end()) {
+            remove_job_entry(dit);
+        }
+    }
     delete j;
 
     return true;
@@ -2652,7 +2665,7 @@ static bool handle_control_login(CompileServer *cs)
       << time(nullptr) - starttime << "s uptime, "
       << css.size() << " hosts, "
       << jobs.size() << " jobs in queue "
-      << "(" << new_job_id << " total)." << endl;
+      << "(" << job_id_allocator().issuedTotal() << " total)." << endl;
     o << "200 Use 'help' for help and 'quit' to quit." << endl;
     return cs->send_msg(TextMsg(o.str()));
 }
@@ -2951,6 +2964,14 @@ static bool handle_end(CompileServer *toremove, Msg *m)
     case CompileServer::DAEMON:
         log_info() << "remove daemon " << toremove->nodeName() << endl;
 
+        /* Reconcile the daemon's LOCAL monitor records: each live record
+           gets its terminal and releases its scheduler-visible id -- the
+           old teardown destroyed the map silently, leaking both.  */
+        for (const int local_global_id : toremove->liveClientLocalJobIds()) {
+            notify_monitors(new JobLocalDoneMsg(local_global_id));
+            job_id_allocator().release((uint32_t)local_global_id);
+        }
+
         notify_monitors(new MonStatsMsg(toremove->hostId(), "State:Offline\n"));
 
         /* A daemon disconnected.  We must remove it from the css list,
@@ -2977,7 +2998,12 @@ static bool handle_end(CompileServer *toremove, Msg *m)
                     }
 
                     credit_dispatch_credit(*jit);
-                    jobs.erase((*jit)->id());
+                    {
+                        map<unsigned int, Job *>::iterator qit = jobs.find((*jit)->id());
+                        if (qit != jobs.end()) {
+                            remove_job_entry(qit);
+                        }
+                    }
                     delete(*jit);
                 }
 
@@ -3034,7 +3060,12 @@ static bool handle_end(CompileServer *toremove, Msg *m)
                 }
 
                 credit_dispatch_credit(job);
-                jobs.erase(mit++);
+                {
+                    map<unsigned int, Job *>::iterator next = mit;
+                    ++next;
+                    remove_job_entry(mit);
+                    mit = next;
+                }
                 delete job;
             } else {
                 ++mit;
