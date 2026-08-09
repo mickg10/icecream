@@ -431,14 +431,29 @@ bool MsgChannel::flush_writebuf(int send_flags)
     while (msgtogo) {
         int send_errno;
         static size_t max_write_size = get_max_write_size();
+        size_t want = min( msgtogo, max_write_size );
+        if (test_cut_armed) {
+            /* Test-only one-shot mid-frame cut (see testCutNextFlushAfter):
+               deliver exactly test_cut_bytes more bytes, then fail as if the
+               peer vanished with the frame still incomplete.  A cap of 0 fails
+               before byte 1.  Pure no-op unless explicitly armed.  */
+            if (test_cut_bytes == 0) {
+                test_cut_armed = false;
+                errno = EPIPE;
+                log_error() << "flush_writebuf() test cut: peer gone mid-frame" << endl;
+                error = true;
+                break;
+            }
+            want = min( want, test_cut_bytes );
+        }
 #ifdef MSG_NOSIGNAL
-        ssize_t ret = send(fd, buf, min( msgtogo, max_write_size ), MSG_NOSIGNAL);
+        ssize_t ret = send(fd, buf, want, MSG_NOSIGNAL);
         send_errno = errno;
 #else
         void (*oldsigpipe)(int);
 
         oldsigpipe = signal(SIGPIPE, SIG_IGN);
-        ssize_t ret = send(fd, buf, min( msgtogo, max_write_size ), 0);
+        ssize_t ret = send(fd, buf, want, 0);
         send_errno = errno;
         signal(SIGPIPE, oldsigpipe);
 #endif
@@ -505,6 +520,9 @@ bool MsgChannel::flush_writebuf(int send_flags)
         }
 
         msgtogo -= ret;
+        if (test_cut_armed) {
+            test_cut_bytes -= (size_t)ret;   // next iteration fails at 0
+        }
         total_drained += (uint64_t)ret;
         while (!pending_frame_ends.empty()
                && pending_frame_ends.front() <= total_drained) {

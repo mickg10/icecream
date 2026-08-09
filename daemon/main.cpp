@@ -4978,6 +4978,18 @@ int Daemon::scheduler_use_cs(UseCSMsg *msg)
         c->set_status(Client::FORWARDING_USE_CS, "scheduler_use_cs: forwarding UseCS");
         ++usecs_delivery_attempts;
 
+        {
+            /* Test-only (ICECC_TEST_USECS_CUT_AT): arm a one-shot mid-frame cut
+               of THIS client UseCS frame at the configured byte offset, so the
+               prerequisite usecs-cut-{zero,header,body,final-short} witnesses
+               reproduce the exact injection position deterministically.  Never
+               armed on the production path.  */
+            static const char *const usecs_cut_env = getenv("ICECC_TEST_USECS_CUT_AT");
+            if (usecs_cut_env) {
+                c->channel->testCutNextFlushAfter((size_t)strtoul(usecs_cut_env, nullptr, 10));
+            }
+        }
+
         if (!c->channel->send_msg(*msg)) {
             ++usecs_exact_aborts;
             handle_end(c, 143);

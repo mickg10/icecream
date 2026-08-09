@@ -307,6 +307,19 @@ public:
         return frames_queued_seq - pending_frame_ends.size();
     }
 
+    // Test-only (armed by the daemon under ICECC_TEST_USECS_CUT_AT): force the
+    // next flush to send exactly `n` more bytes and then fail as if the peer
+    // vanished with the frame incomplete.  This makes the four exact UseCS
+    // injection positions -- before byte 1 (n == 0), partial header, partial
+    // body, final-byte-short -- deterministically reproducible without a
+    // sleep, for the prerequisite usecs-cut-* witnesses.  One-shot and a pure
+    // no-op unless explicitly armed; it never runs on the production path.
+    void testCutNextFlushAfter(size_t n)
+    {
+        test_cut_bytes = n;
+        test_cut_armed = true;
+    }
+
     // True while a deferrable send has left output undelivered.  An explicit
     // flag rather than a timestamp test: an age of zero is ambiguous during
     // the first second of a backlog, and owners must distinguish "not armed"
@@ -401,6 +414,9 @@ protected:
     uint64_t total_drained = 0;
     uint64_t frames_queued_seq = 0;
     std::deque<uint64_t> pending_frame_ends;   // append offsets of frame ends
+    // test-only one-shot mid-frame cut; see testCutNextFlushAfter()
+    size_t test_cut_bytes = 0;
+    bool test_cut_armed = false;
     // deferred-output deadline state; see deferred_output_armed()
     bool pending_write_armed;
     uint64_t pending_write_deadline_msec;
