@@ -1,0 +1,61 @@
+{
+  "schema": 1,
+  "scenario": "JobIdAllocatorCrossNamespaceMutant",
+  "property": "GlobalLiveUniqueness",
+  "expected_result": "counterexample",
+  "min_states": 3,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "AllocateLocalOnlyId",
+      "all": [
+        {"path": "ownerPhase.local", "from": "Idle", "to": "Live"},
+        {"path": "ownerId.local", "from": 0, "to": 1},
+        {"path": "allocated", "from_len": 0, "to_len": 1},
+        {"path": "cursor", "from": 0, "to": 1},
+        {"path": "issuedTotal", "delta": 1}
+      ]
+    },
+    {
+      "name": "RemoteAllocatorReissuesLocalId",
+      "all": [
+        {"path": "ownerPhase.remote", "from": "Idle", "to": "Live"},
+        {"path": "ownerId.remote", "from": 0, "to": 1},
+        {"path": "ownerId.local", "to": 1},
+        {"path": "allocated", "unchanged": true},
+        {"path": "cursor", "to": 1},
+        {"path": "issuedTotal", "delta": 1}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "AllocateLocalOnlyId",
+    "RemoteAllocatorReissuesLocalId"
+  ],
+  "final_all": [
+    {"path": "ownerPhase.local", "eq": "Live"},
+    {"path": "ownerPhase.remote", "eq": "Live"},
+    {"path": "ownerId.local", "eq": 1},
+    {"path": "ownerId.remote", "eq": 1},
+    {"path": "allocated", "to_len": 1},
+    {"path": "issuedTotal", "eq": 2}
+  ],
+  "harness_steps": [
+    {
+      "after": "AllocateLocalOnlyId",
+      "emit": "hold_local_monitor_id_one_live",
+      "actor": "scheduler-local-monitor"
+    },
+    {
+      "after": "RemoteAllocatorReissuesLocalId",
+      "emit": "assert_remote_and_local_owners_share_live_id_one",
+      "actor": "scheduler-allocator"
+    }
+  ],
+  "metadata": {
+    "module": "JobIdAllocator",
+    "config": "JobIdAllocatorCrossNamespaceMutant.cfg",
+    "mutant": "MutantCheckRemoteOnly = TRUE",
+    "load_bearing_fact": "The remote allocation ignores the already-live local-monitor ID in the one-ID domain."
+  }
+}
