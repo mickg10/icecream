@@ -46,12 +46,14 @@ int main()
 {
     const unsigned int kWeight = 120;   /* STATS_UPDATE_WEIGHT */
 
-    /* NEGATIVE CONTROL: the old expression never refreshes -- not for a
-       never-picked host, not at any distance, any eligible size, any
-       documented weight.  */
+    /* NEGATIVE CONTROL: for every weight >= 1 -- including the
+       production 120 -- the old expression never refreshes: its threshold
+       fraction (255-w)/255 is integer arithmetic and evaluates to zero
+       for all w >= 1.  (w == 0 is the single escape: 255/255 == 1; the
+       production configuration never used it.)  */
     {
         bool ever = false;
-        for (unsigned int w = 0; w <= 254 && !ever; ++w) {
+        for (unsigned int w = 1; w <= 254 && !ever; ++w) {
             for (unsigned long long d = 0; d <= 100000 && !ever; d += 997) {
                 for (size_t e = 1; e <= 800 && !ever; e = e * 2 + 1) {
                     if (old_expression_refreshes(1000000 + (unsigned int)d,
