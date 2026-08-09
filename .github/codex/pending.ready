@@ -1,3 +1,3 @@
 patch_sha256=b32cca521173e4376f94f29b87275cb9dd2b722e889f18e63acee578def229e7
 base_head=f0125ec352ef9dcffab41cceb570c6fc68bfb66a
-attempt=bounded-summary-v2
+attempt=bounded-summary-v2-exact-base
