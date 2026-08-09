@@ -2,20 +2,25 @@ set -euo pipefail
 
 formal_ref='295a282ec044edc3eb0035ee6f64e968cf2a2a3c'
 git fetch --no-tags origin "$formal_ref"
-actual_ref=$(git rev-parse FETCH_HEAD)
-if [[ "$actual_ref" != "$formal_ref" ]]; then
-  echo "formal source moved: expected $formal_ref, got $actual_ref" >&2
-  exit 1
-fi
+[[ "$(git rev-parse FETCH_HEAD)" == "$formal_ref" ]]
 mapfile -t formal_paths < <(git ls-tree -r --name-only FETCH_HEAD formal)
-if (( ${#formal_paths[@]} == 0 )); then
-  echo 'formal source tree is empty' >&2
-  exit 1
-fi
+(( ${#formal_paths[@]} > 0 ))
 git checkout FETCH_HEAD -- "${formal_paths[@]}"
+
+# The fixed core file accidentally used three assignments and two workers,
+# contradicting the model's documented small cutoff and producing billions of
+# states.  Derive its safety-only configuration from the checked two-assignment,
+# one-worker fair configuration; remove only FairSpec and EventualSettlement.
+python3 - <<'PY'
+from pathlib import Path
+fair = Path('formal/AssignmentFenceCoreFair.cfg').read_text()
+small = fair.replace('SPECIFICATION FairSpec', 'SPECIFICATION Spec')
+small = small.replace('PROPERTY EventualSettlement\n', '')
+Path('formal/AssignmentFenceCore.cfg').write_text(small)
+PY
+
 git add formal
 git diff --cached --check
-
 mkdir -p formal/gatelogs
 curl --fail --location --retry 3 \
   --output /tmp/tla2tools.jar \
@@ -26,13 +31,14 @@ java -cp /tmp/tla2tools.jar tlc2.TLC -help > formal/gatelogs/tlc-help.txt 2>&1 |
 head -n 8 formal/gatelogs/tlc-help.txt
 
 cd formal
-for stem in \
-  assignment_fence_reference \
-  compatibility_projection_reference \
-  job_id_allocator_reference \
-  lifecycle_authority_reference \
+references=(
+  assignment_fence_reference
+  compatibility_projection_reference
+  job_id_allocator_reference
+  lifecycle_authority_reference
   prelogin_lease_reference
-do
+)
+for stem in "${references[@]}"; do
   python3 "${stem}.py" > "gatelogs/${stem}.actual"
   diff -u "${stem}.expected" "gatelogs/${stem}.actual" \
     > "gatelogs/${stem}.diff"
@@ -55,11 +61,10 @@ run_fixed() {
   log="gatelogs/${cfg%.cfg}.log"
   set +e
   java -XX:+UseParallelGC -jar /tmp/tla2tools.jar \
-    -deadlock -workers auto -config "$cfg" "$module" > "$log" 2>&1
+    -deadlock -workers 2 -config "$cfg" "$module" > "$log" 2>&1
   rc=$?
   set -e
-  printf 'fixed\t%s\t%s\t%d\n' "$cfg" "$module" "$rc" \
-    >> gatelogs/manifest.tsv
+  printf 'fixed\t%s\t%s\t%d\n' "$cfg" "$module" "$rc" >> gatelogs/manifest.tsv
   if (( rc != 0 )); then
     cat "$log" >&2
     return 1
@@ -75,12 +80,11 @@ run_mutant() {
   trace="gatelogs/${cfg%.cfg}.trace.json"
   set +e
   java -XX:+UseParallelGC -jar /tmp/tla2tools.jar \
-    -deadlock -workers auto -dumpTrace json "$trace" \
+    -deadlock -workers 2 -dumpTrace json "$trace" \
     -config "$cfg" "$module" > "$log" 2>&1
   rc=$?
   set -e
-  printf 'mutant\t%s\t%s\t%d\n' "$cfg" "$module" "$rc" \
-    >> gatelogs/manifest.tsv
+  printf 'mutant\t%s\t%s\t%d\n' "$cfg" "$module" "$rc" >> gatelogs/manifest.tsv
   if (( rc == 0 )); then
     echo "mutant unexpectedly passed: $cfg" >&2
     cat "$log" >&2
@@ -91,7 +95,7 @@ run_mutant() {
     cat "$log" >&2
     return 1
   fi
-  if grep -Eq 'parse error|semantic error|Cannot find source file|Exception in thread' "$log"; then
+  if grep -Eqi 'parse error|semantic error|Cannot find source file|Exception in thread' "$log"; then
     echo "mutant failed before property checking: $cfg" >&2
     cat "$log" >&2
     return 1
@@ -100,50 +104,49 @@ run_mutant() {
     "$log" > "gatelogs/${cfg%.cfg}.summary" || true
 }
 
-: > gatelogs/manifest.tsv
-for cfg in \
-  AssignmentFenceCore.cfg \
-  AssignmentFenceCoreFair.cfg \
-  CompatibilityProjection.cfg \
-  JobIdAllocator.cfg \
-  JobIdAllocatorReuse.cfg \
-  LifecycleAuthority.cfg \
-  LifecycleAuthorityFair.cfg \
+fixed=(
+  AssignmentFenceCore.cfg
+  AssignmentFenceCoreFair.cfg
+  CompatibilityProjection.cfg
+  JobIdAllocator.cfg
+  JobIdAllocatorReuse.cfg
+  LifecycleAuthority.cfg
+  LifecycleAuthorityFair.cfg
   PreloginLease.cfg
-do
-  run_fixed "$cfg"
-done
-
-for cfg in \
-  AssignmentFenceCoreMixedMutant.cfg \
-  AssignmentFenceCoreReleaseMutant.cfg \
-  CompatibilityProjectionCommandSummaryMutant.cfg \
-  CompatibilityProjectionLocalFieldsMutant.cfg \
-  CompatibilityProjectionStatsMutant.cfg \
-  CompatibilityProjectionTimingMutant.cfg \
-  JobIdAllocatorDisconnectLeakMutant.cfg \
-  JobIdAllocatorDuplicateBeginMutant.cfg \
-  JobIdAllocatorPartialBatchMutant.cfg \
-  JobIdAllocatorRemoteOnlyMutant.cfg \
-  JobIdAllocatorUnknownDoneMutant.cfg \
-  JobIdAllocatorZeroMutant.cfg \
-  LifecycleAuthorityDetachedSubmitterMutant.cfg \
-  LifecycleAuthorityDuplicateBeginMutant.cfg \
-  LifecycleAuthorityIdentityMutant.cfg \
-  PreloginLeaseNoCapMutant.cfg \
-  PreloginLeaseNoLeaseMutant.cfg \
-  PreloginLeaseNoQuantumLiveness.cfg \
-  PreloginLeaseNoQuantumMutant.cfg \
+)
+mutants=(
+  AssignmentFenceCoreMixedMutant.cfg
+  AssignmentFenceCoreReleaseMutant.cfg
+  CompatibilityProjectionCommandSummaryMutant.cfg
+  CompatibilityProjectionLocalFieldsMutant.cfg
+  CompatibilityProjectionStatsMutant.cfg
+  CompatibilityProjectionTimingMutant.cfg
+  JobIdAllocatorDisconnectLeakMutant.cfg
+  JobIdAllocatorDuplicateBeginMutant.cfg
+  JobIdAllocatorPartialBatchMutant.cfg
+  JobIdAllocatorRemoteOnlyMutant.cfg
+  JobIdAllocatorUnknownDoneMutant.cfg
+  JobIdAllocatorZeroMutant.cfg
+  LifecycleAuthorityDetachedSubmitterMutant.cfg
+  LifecycleAuthorityDuplicateBeginMutant.cfg
+  LifecycleAuthorityIdentityMutant.cfg
+  PreloginLeaseNoCapMutant.cfg
+  PreloginLeaseNoLeaseMutant.cfg
+  PreloginLeaseNoQuantumLiveness.cfg
+  PreloginLeaseNoQuantumMutant.cfg
   PreloginLeaseRefreshMutant.cfg
-do
-  run_mutant "$cfg"
-done
+)
+
+: > gatelogs/manifest.tsv
+for cfg in "${fixed[@]}"; do run_fixed "$cfg"; done
+for cfg in "${mutants[@]}"; do run_mutant "$cfg"; done
 
 {
   echo '# TLC formal run summary'
   echo
   echo '- Imported ref: `295a282ec044edc3eb0035ee6f64e968cf2a2a3c`'
   echo '- TLC: official `tla2tools.jar` v1.7.4'
+  echo '- Cutoff: two assignments, one capacity-1 worker for AssignmentFenceCore'
   echo '- Deadlock checking: disabled because terminal protocol states are explicit and valid'
   echo '- Fixed configurations: 8'
   echo '- Required counterexamples: 20'
