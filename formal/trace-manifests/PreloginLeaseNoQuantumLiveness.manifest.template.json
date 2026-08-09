@@ -1,0 +1,48 @@
+{
+  "schema": 1,
+  "scenario": "PreloginLeaseNoQuantumControlLiveness",
+  "property": "ControlProgress",
+  "expected_result": "counterexample",
+  "min_states": 4,
+  "event_mode": "exclusive",
+  "require_lasso": true,
+  "events": [
+    {
+      "name": "AcceptBeyondQuantum",
+      "all": [
+        {"path": "acceptedThisTurn", "from": 2, "to": 3},
+        {"path": "socketAcceptedTotal", "delta": 1},
+        {"path": "controlDone", "to": false}
+      ]
+    },
+    {
+      "name": "ControlCompletes",
+      "all": [
+        {"path": "controlDone", "from": false, "to": true}
+      ]
+    }
+  ],
+  "required_subsequence": ["AcceptBeyondQuantum"],
+  "forbidden_events": ["ControlCompletes"],
+  "final_all": [
+    {"path": "controlDone", "eq": false}
+  ],
+  "harness_steps": [
+    {
+      "after": "AcceptBeyondQuantum",
+      "emit": "keep_binary_listener_continuously_readable",
+      "actor": "connection-generator"
+    },
+    {
+      "after": "AcceptBeyondQuantum",
+      "emit": "assert_control_request_never_received_a_service_turn",
+      "actor": "control-client"
+    }
+  ],
+  "metadata": {
+    "module": "PreloginLease",
+    "config": "PreloginLeaseNoQuantumLiveness.cfg",
+    "mutant": "MutantNoQuantum = TRUE",
+    "fairness": "WF AcceptStep, FinishAccept, ServiceControl; FinishAccept is kept disabled by the unbounded accept phase"
+  }
+}
