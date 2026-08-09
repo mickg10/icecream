@@ -221,6 +221,22 @@ A ==
         self.assertEqual(violations[0].variable, "<guard>")
         self.assertEqual(violations[0].operator, "\\/")
 
+    def test_inline_let_in_lint_rejects_guard_and_assignment_disjunctions(self) -> None:
+        bad = """
+A ==
+    LET x == TRUE
+    IN /\\ claimed \\/ alreadyStarted
+       /\\ phase' = phase
+B ==
+    LET x == TRUE
+    IN /\\ seen' = seen \\/ event
+       /\\ phase' = phase
+"""
+        violations = assignment_lint.lint_text(self.root / "bad-inline-in.tla", bad)
+        self.assertEqual([item.kind for item in violations], ["guard", "assignment"])
+        self.assertEqual([item.variable for item in violations], ["<guard>", "seen"])
+        self.assertEqual([item.operator for item in violations], ["\\/", "\\/"])
+
     def test_boolean_precedence_lint_accepts_parenthesized_and_structured_rhs(self) -> None:
         good = """
 A ==
@@ -237,6 +253,14 @@ E ==
     /\\ LET allowed == claimed \\/ alreadyStarted
        IN allowed
     /\\ phase' = phase
+F ==
+    LET x == TRUE
+    IN /\\ (claimed \\/ alreadyStarted)
+       /\\ phase' = phase
+G ==
+    LET x == TRUE
+    IN /\\ seen' = (seen \\/ event)
+       /\\ phase' = phase
 """
         self.assertEqual(
             assignment_lint.lint_text(self.root / "good.tla", good),
