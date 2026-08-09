@@ -25,7 +25,7 @@
       "name": "FailInFrameBody",
       "all": [
         {"path": "phase", "from": "Forwarding", "to": "ExactAbortPending"},
-        {"path": "failureObservedAt", "from": "NO_FAILURE", "to": 2},
+        {"path": "failureObservedAt", "from": 4, "to": 2},
         {"path": "bytesWritten", "to": 2},
         {"path": "frameCommitted", "to": false}
       ]
@@ -59,6 +59,7 @@
   "metadata": {
     "module": "UseCSHandoff",
     "config": "UseCSHandoffCut2Witness.cfg",
-    "cut": "partial-body"
+    "cut": "partial-body",
+    "no_failure_sentinel": 4
   }
 }
