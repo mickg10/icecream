@@ -328,35 +328,54 @@ static bool job_in_scheduler(int port, unsigned job_id)
    unexplained constant.  */
 static long long total_farm_capacity(int port)
 {
+    /* Sum the MAX half of every "jobs=cur/max" -- but only from a COMPLETE
+       reply.  Bounded end-to-end (poll deadlines on greeting and each
+       read, whole-exchange clock), requires the "200 done" terminator, and
+       returns -1 on any failure so the caller can reject it: a truncated
+       or failed measurement must NEVER become a small/zero capacity that
+       makes the backlog inequality trivially true.  */
     const int fd = tcp_connect(port + 1, 0);
     if (fd < 0) {
         return -1;
     }
     char buf[16384];
-    ssize_t n = read(fd, buf, sizeof(buf) - 1);   // greeting
-    dprintf(fd, "listcs\nquit\n");
-    std::string text;
     const Clock::time_point t0 = Clock::now();
-    while (secs_since(t0) < 10) {
-        n = read(fd, buf, sizeof(buf) - 1);
-        if (n <= 0) {
-            break;
-        }
+    auto remaining_ms = [&]() -> int {
+        const double left = 8.0 - secs_since(t0);
+        return left <= 0 ? 0 : (int)(left * 1000);
+    };
+    {
+        struct pollfd gp = { fd, POLLIN, 0 };
+        if (poll(&gp, 1, remaining_ms()) <= 0) { close(fd); return -1; }
+        ssize_t g = read(fd, buf, sizeof(buf) - 1); (void)g;   // greeting
+    }
+    if (write(fd, "listcs\nquit\n", 12) != 12) { close(fd); return -1; }
+    std::string text;
+    bool complete = false;
+    while (remaining_ms() > 0) {
+        struct pollfd rp = { fd, POLLIN, 0 };
+        if (poll(&rp, 1, remaining_ms()) <= 0) { break; }
+        const ssize_t n = read(fd, buf, sizeof(buf) - 1);
+        if (n <= 0) { break; }
         buf[n] = 0;
         text += buf;
+        if (text.find("200 done") != std::string::npos) { complete = true; break; }
     }
     close(fd);
+    if (!complete) {
+        return -1;   // incomplete reply: refuse to report a capacity
+    }
     long long total = 0;
     size_t pos = 0;
     while ((pos = text.find("jobs=", pos)) != std::string::npos) {
         const size_t slash = text.find('/', pos);
         if (slash == std::string::npos) {
-            break;
+            return -1;   // malformed row
         }
         total += atoll(text.c_str() + slash + 1);
         pos = slash + 1;
     }
-    return total;
+    return total > 0 ? total : -1;   // a real farm has capacity; 0 is a failure
 }
 
 static long long worker_job_count(int port, const char *worker)
@@ -1543,6 +1562,19 @@ int main(int argc, char **argv)
                             confirm_job(u->job_id);
                             ++*counter;
                             last_progress = Clock::now();
+                            /* CONSTRUCT the contended window: once enough
+                               replies have arrived to open it, pace
+                               consumption so a fast host cannot drain the
+                               whole expansion before the ten small requests
+                               run.  Admitted keeps outrunning consumed, so
+                               admitted - consumed stays above farm capacity
+                               and the window is durably open until stop_bigs.
+                               Unpaced, a fast host finished 2x24000 before
+                               the first sample and the property went
+                               untested (the ephemeral-observer gap).  */
+                            if (*counter > 200) {
+                                usleep(3 * 1000);
+                            }
                         }
                     }
                     delete m;
@@ -1577,17 +1609,22 @@ int main(int argc, char **argv)
             std::thread f2([&] { big_daemon("fakesub8", 801, &repliesF2); });
 
             usleep(200 * 1000);
-            /* The contended window is bracketed, queried not assumed: the
-               scheduler's own admitted counters must show BOTH expansions
-               incomplete before the first small request AND after the last
-               reply.  Then every small in between demonstrably ran inside
-               the contended admission window -- reply counters lag
-               admission by whole turns, so they cannot establish this.  */
+            /* The contended window is bracketed from SCHEDULER-side state
+               at both ends: admitted_total - replies_consumed > total farm
+               capacity for each big submitter proves the scheduler still
+               holds queued backlog (more admitted-but-unconsumed work than
+               could possibly be dispatched-or-in-flight).  admitted is read
+               before the reply counter, so the difference is a lower bound.
+               The big daemons pace consumption so this holds throughout the
+               small requests on every host.  */
             long long bracket_vals[4] = { -1, -1, -1, -1 };
             /* Every slot the fake farm advertises, derived from the
                topology itself: replies beyond admitted-minus-capacity
                cannot merely be in flight.  */
             const long long farm_capacity = total_farm_capacity(port);
+            REQUIRE(farm_capacity > 0,
+                    "farm capacity measured (a failed/incomplete listcs is"
+                    " rejected, never read as zero capacity)");
             auto both_active = [&](int slot) {
                 /* The CONTENDED WINDOW must be proven from SCHEDULER-side
                    state, conservatively: reader-side reply counters lag the
@@ -1615,34 +1652,18 @@ int main(int argc, char **argv)
                     && (a7 - r7) > farm_capacity
                     && (a8 - r8) > farm_capacity;
             };
-            /* Progress-based bracket: the 200ms fixed snapshot assumed the
-               scheduler had already begun admitting the big expansions --
-               false on slower hosts (observed bracket=0/0 with the bigs at
-               3009+3010 by the end), which failed the assertion for the
-               window's EXISTENCE, not for the smalls' placement.  Poll
-               until both expansions have demonstrably begun, bounded.  */
+            /* CONSTRUCTED contended window: the big daemons pace their
+               consumption (above), so admitted outruns consumed and the
+               backlog stays scheduler-queued on EVERY host.  Wait, bounded,
+               until both_active() proves the window is open by the
+               admitted-minus-consumed capacity inequality -- no fast-host
+               skip, because the window is built rather than hoped for.  */
             bool contended_before = false;
-            bool window_unobservable = false;
             {
                 const Clock::time_point tb = Clock::now();
                 while (!contended_before && secs_since(tb) < 30) {
                     contended_before = both_active(0);
                     if (!contended_before) {
-                        if (repliesF1.load() >= (int)bigN
-                            && repliesF2.load() >= (int)bigN) {
-                            /* Both expansions fully SERVED before the bracket
-                               could sample once: this host completes the
-                               whole 2x24000 workload faster than the
-                               observation granularity (reported: replies
-                               24000+24000 with the submitters already
-                               disconnected).  There is no contended window
-                               to place the smalls inside -- the property is
-                               VACUOUS here, not violated.  Skip the bracket
-                               assertions and say so, rather than failing
-                               for the window's existence.  */
-                            window_unobservable = true;
-                            break;
-                        }
                         usleep(200 * 1000);
                     }
                 }
@@ -1724,15 +1745,11 @@ int main(int argc, char **argv)
                 REQUIRE(g7 == 0 && g8 == 0,
                         "a many-thousand-member batch cancel leaves no ghosts");
             }
-            if (window_unobservable) {
-                fprintf(stderr, "# contract: fairness window unobservable on"
-                        " this host (both 24000-job expansions completed"
-                        " before the first bracket sample); bracket"
-                        " assertions skipped as vacuous\n");
-            } else {
-                REQUIRE(contended_before && contended_after,
-                        "the ten small requests ran demonstrably inside the contended window (bracketed)");
-            }
+            REQUIRE(contended_before && contended_after,
+                    "the ten small requests ran demonstrably inside a"
+                    " constructed contended window (scheduler-side backlog"
+                    " proven at both brackets by admitted-minus-consumed >"
+                    " farm capacity)");
             REQUIRE(slow == 0,
                     "every measured small request completed within its bounded interval");
             REQUIRE(worst_reply.load() < 5.0,
