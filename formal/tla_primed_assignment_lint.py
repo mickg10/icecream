@@ -21,6 +21,10 @@ This linter examines every root ``*.tla`` module. It rejects:
   ``\\/``; and
 * a conjunction bullet whose ordinary guard contains a top-level ``\\/``.
 
+The first bullet after a ``LET ... IN`` is also checked when written inline as
+``IN /\\ expression``. Only that same-line expression is inspected there, so
+later indented sibling bullets are not mistaken for continuations.
+
 Structured RHS/guard forms beginning with IF, CASE, LET, quantifiers, or CHOOSE
 are parsed by their own TLA+ grammar and are exempt from this deliberately
 narrow check. TLA+ line comments and nested block comments are removed before
@@ -54,6 +58,10 @@ _ASSIGNMENT_RE = re.compile(
     r"(?P<variable>[A-Za-z_][A-Za-z0-9_]*)'\s*=\s*(?P<rhs>.*)$"
 )
 _CONJUNCT_RE = re.compile(r"^(?P<indent>\s*)/\\\s+(?P<rhs>.*)$")
+_IN_CONJUNCT_RE = re.compile(r"^\s*IN\s+/\\\s+(?P<rhs>.*)$")
+_INLINE_PRIMED_RE = re.compile(
+    r"^(?P<variable>[A-Za-z_][A-Za-z0-9_]*)'\s*=\s*(?P<rhs>.*)$"
+)
 _STRUCTURED_PREFIXES = (
     "IF ",
     "CASE ",
@@ -213,11 +221,48 @@ def _collect_rhs(
     return "\n".join(fragments).strip(), cursor
 
 
+def _inline_in_violation(path: Path, line_number: int, rhs: str) -> Violation | None:
+    assignment = _INLINE_PRIMED_RE.match(rhs.strip())
+    if assignment is not None:
+        operator = _top_level_boolean_operator(assignment.group("rhs"))
+        if operator is not None:
+            return Violation(
+                path=path,
+                line=line_number,
+                variable=assignment.group("variable"),
+                operator=operator,
+                rhs=assignment.group("rhs"),
+                kind="assignment",
+            )
+        return None
+    operator = _top_level_boolean_operator(rhs)
+    if operator == "\\/":
+        return Violation(
+            path=path,
+            line=line_number,
+            variable="<guard>",
+            operator=operator,
+            rhs=rhs,
+            kind="guard",
+        )
+    return None
+
+
 def lint_text(path: Path, text: str) -> list[Violation]:
     lines = _strip_block_comments(text).splitlines()
     violations: list[Violation] = []
     index = 0
     while index < len(lines):
+        inline_in = _IN_CONJUNCT_RE.match(lines[index])
+        if inline_in is not None:
+            violation = _inline_in_violation(
+                path, index + 1, inline_in.group("rhs")
+            )
+            if violation is not None:
+                violations.append(violation)
+            index += 1
+            continue
+
         assignment = _ASSIGNMENT_RE.match(lines[index])
         if assignment is not None:
             indent = len(assignment.group("indent"))
