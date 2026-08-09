@@ -242,14 +242,14 @@ THEOREM FixedCoreOwnershipSafety ==
     PROVE  Spec => []ProofSafety
 <1>1. Init => OwnershipInvariant
   BY InitEstablishesOwnership
-<1>2. OwnershipInvariant /\ Next => OwnershipInvariant'
-  BY NextPreservesOwnership
-<1>3. OwnershipInvariant /\ UNCHANGED vars => OwnershipInvariant'
-  BY StutteringPreservesOwnership
-<1>4. Spec => []OwnershipInvariant
-  BY PTL, <1>1, <1>2, <1>3 DEF Spec
-<1>5. OwnershipInvariant => ProofSafety
+<1>2. OwnershipInvariant /\ [Next]_vars => OwnershipInvariant'
+  <2>1. CASE Next
+    BY NextPreservesOwnership
+  <2>2. CASE UNCHANGED vars
+    BY StutteringPreservesOwnership
+  <2>3. QED BY <2>1, <2>2
+<1>3. OwnershipInvariant => ProofSafety
   BY OwnershipImpliesSafety
-<1>6. QED BY PTL, <1>4, <1>5
+<1>4. QED BY <1>1, <1>2, <1>3, PTL DEF Spec
 
 =============================================================================
