@@ -1,9 +1,9 @@
-TESTS = testargs lockexec backpressure schedpolicy connectivityprobe connectivityprobe-negative.sh utf8test statewritertest schedbp-quick.sh schedstress-quick.sh remoteice-quick.sh
+TESTS = testargs lockexec backpressure schedpolicy connectivityprobe connectivityprobe-negative.sh relisten-quick.sh utf8test statewritertest schedbp-quick.sh schedstress-quick.sh remoteice-quick.sh
 
 AM_CPPFLAGS = -I$(top_srcdir)/client -I$(top_srcdir)/services -I$(top_srcdir)/
 testargs_LDADD = ../client/libclient.a ../services/libicecc.la
 
-check_PROGRAMS = testargs lockexec backpressure schedpolicy connectivityprobe utf8test statewritertest schedbp
+check_PROGRAMS = testargs lockexec backpressure schedpolicy connectivityprobe relisten utf8test statewritertest schedbp
 testargs_SOURCES = args.cpp
 lockexec_SOURCES = lockexec.cpp
 lockexec_LDADD = ../client/libclient.a ../services/libicecc.la
@@ -11,6 +11,9 @@ lockexec_LDADD = ../client/libclient.a ../services/libicecc.la
 schedpolicy_SOURCES = schedpolicy.cpp
 
 connectivityprobe_SOURCES = connectivityprobetest.cpp ../scheduler/connectivityprobe.cpp
+
+relisten_SOURCES = relisten.cpp
+relisten_LDADD = ../services/libicecc.la
 
 backpressure_SOURCES = backpressure.cpp
 
@@ -37,7 +40,7 @@ sndbuf_shim.so: $(srcdir)/sndbuf_shim.c
 	$(CC) -shared -fPIC $(srcdir)/sndbuf_shim.c -ldl -o $@
 
 CLEANFILES = sndbuf_shim.so
-EXTRA_DIST = sndbuf_shim.c connectivityprobe-negative.sh schedbp-quick.sh schedstress-quick.sh remoteice-quick.sh
+EXTRA_DIST = sndbuf_shim.c connectivityprobe-negative.sh relisten-quick.sh schedbp-quick.sh schedstress-quick.sh remoteice-quick.sh
 
 # Make the tests also print the test log if they fail.
 check: export VERBOSE=1

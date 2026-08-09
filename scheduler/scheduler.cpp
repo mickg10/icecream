@@ -3438,9 +3438,19 @@ int main(int argc, char *argv[])
 
     log_info() << "scheduler ready, algorithm: " <<  scheduler_algo << endl;
 
-    time_t next_listen = 0;
+    /* The daemon listener is deliberately re-armed one second after an
+       accept cycle.  Keep that deadline monotonic and sub-second precise;
+       wall-clock seconds made the nominal pause anywhere from almost zero
+       to one second and made its poll bound impossible to test exactly. */
+    uint64_t next_listen_msec = 0;
+    const bool test_disable_relisten_deadline_cap =
+        getenv("ICECC_TEST_RELISTEN_NO_DEADLINE_CAP") != nullptr;
+    const bool test_disable_broadcast =
+        getenv("ICECC_TEST_DISABLE_BROADCAST") != nullptr;
 
-    Broadcasts::broadcastSchedulerVersion(scheduler_port, netname, starttime);
+    if (!test_disable_broadcast) {
+        Broadcasts::broadcastSchedulerVersion(scheduler_port, netname, starttime);
+    }
     last_announce = starttime;
 
     while (!exit_main_loop) {
@@ -3484,7 +3494,7 @@ int main(int argc, char *argv[])
         /* Announce ourselves from time to time, to make other possible schedulers disconnect
            their daemons if we are the preferred scheduler (daemons with version new enough
            should automatically select the best scheduler, but old daemons connect randomly). */
-        if (last_announce + 120 < time(nullptr)) {
+        if (!test_disable_broadcast && last_announce + 120 < time(nullptr)) {
             Broadcasts::broadcastSchedulerVersion(scheduler_port, netname, starttime);
             last_announce = time(nullptr);
         }
@@ -3502,7 +3512,8 @@ int main(int argc, char *argv[])
         pfd.events = POLLIN;
         pollfds.push_back( pfd );
 
-        const bool daemon_listener_armed = time(nullptr) >= next_listen;
+        const uint64_t listen_now_msec = icecream_monotonic_msec();
+        const bool daemon_listener_armed = listen_now_msec >= next_listen_msec;
         if (daemon_listener_armed) {
             pfd.fd = listen_fd;
             pfd.events = POLLIN;
@@ -3587,11 +3598,14 @@ int main(int argc, char *argv[])
         const bool service_buffered = has_buffered_inbound;
         has_buffered_inbound = false;   // the post-poll reads below re-arm it
 
-        if (!daemon_listener_armed) {
-            const time_t remaining = next_listen - time(nullptr);
-            const time_t secs = remaining > 0 ? remaining : 0;
-            if (timeout < 0 || secs < timeout) {
-                timeout = secs;
+        if (!daemon_listener_armed && !test_disable_relisten_deadline_cap) {
+            const uint64_t now_msec = icecream_monotonic_msec();
+            const uint64_t remaining_msec = next_listen_msec > now_msec
+                ? next_listen_msec - now_msec : 0;
+            const int remaining_secs =
+                static_cast<int>((remaining_msec + 999) / 1000);
+            if (timeout < 0 || remaining_secs < timeout) {
+                timeout = remaining_secs;
             }
         }
         int active_fds = poll(pollfds.data(), pollfds.size(), timeout * 1000);
@@ -3646,7 +3660,9 @@ int main(int argc, char *argv[])
                 }
             }
 
-            next_listen = time(nullptr) + 1;
+            next_listen_msec = icecream_monotonic_msec() + 1000;
+            trace() << "daemon listener pause armed: deadline_msec="
+                    << (unsigned long long)next_listen_msec << endl;
         }
 
         if (active_fds && pollfd_is_set(pollfds, text_fd, POLLIN)) {
