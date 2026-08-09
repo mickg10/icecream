@@ -1,0 +1,57 @@
+{
+  "schema": 1,
+  "scenario": "JobIdAllocatorPartialBatchMutant",
+  "property": "ExhaustionNoPartialPublication",
+  "expected_result": "counterexample",
+  "min_states": 4,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "AllocateOne",
+      "all": [
+        {"path": "issuedTotal", "delta": 1},
+        {"path": "allocated", "len_delta": 1},
+        {"path": "batchPhase", "to": "Idle"}
+      ]
+    },
+    {
+      "name": "PartialBatchPublishedBeforeExhaustion",
+      "all": [
+        {"path": "batchPhase", "from": "Idle", "to": "Failed"},
+        {"path": "batchPublished", "from_len": 0, "to_len": 1},
+        {"path": "issuedTotal", "delta": 1},
+        {"path": "allocated", "len_delta": 1}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "AllocateOne",
+    "AllocateOne",
+    "PartialBatchPublishedBeforeExhaustion"
+  ],
+  "final_all": [
+    {"path": "batchPhase", "eq": "Failed"},
+    {"path": "batchPublished", "to_len": 1},
+    {"path": "issuedTotal", "eq": 3},
+    {"path": "allocated", "to_len": 3}
+  ],
+  "harness_steps": [
+    {
+      "after": "AllocateOne",
+      "occurrence": 2,
+      "emit": "request_batch_larger_than_remaining_id_capacity",
+      "actor": "submitter"
+    },
+    {
+      "after": "PartialBatchPublishedBeforeExhaustion",
+      "emit": "assert_one_batch_member_was_published_before_fatal_exhaustion",
+      "actor": "scheduler"
+    }
+  ],
+  "metadata": {
+    "module": "JobIdAllocator",
+    "config": "JobIdAllocatorPartialBatchMutant.cfg",
+    "mutant": "MutantPartialBatch = TRUE",
+    "domain": "MaxId = 3, BatchCount = 2"
+  }
+}
