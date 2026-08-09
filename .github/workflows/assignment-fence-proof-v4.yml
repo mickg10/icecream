@@ -1,0 +1,172 @@
+name: assignment-fence-proof-v4
+
+on:
+  pull_request:
+    paths:
+      - "formal/**"
+      - ".github/workflows/assignment-fence-proof-v4.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: assignment-fence-proof-v4-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+  TLC_174_SHA256: "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
+  TLC_180_SHA256: "e22f8ffb4bacdea0a871f444dd94fe5fb0d8013b3388ae39e82e26f852c735d5"
+  TLAPS_150_URL: "https://github.com/tlaplus/tlapm/releases/download/202210041448/tlaps-1.5.0-x86_64-linux-gnu-inst.bin"
+
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Exact proof-bearing static contract
+        run: |
+          set -euo pipefail
+          python3 formal/assignment_fence_static_check.py \
+            --manifest formal/assignment-fence-formal-checks-v1.json \
+            --repo . \
+            --formal-dir formal
+          python3 formal/assignment_fence_static_check_test.py
+          python3 formal/assignment_fence_fifo_quotient_test.py
+      - name: Generation-4 runner and trace self-tests
+        run: |
+          set -euo pipefail
+          python3 formal/trace_to_harness_test.py
+          python3 formal/tlc_text_trace_test.py
+          python3 formal/normalize_tlc_trace_test.py
+          python3 formal/run_formal_checks_v4_test.py
+          python3 formal/run_tlc_only_checks_v4_test.py
+          python3 formal/manifest_contract_test.py
+          git diff --check
+          test -z "$(git status --porcelain --untracked-files=all)"
+      - name: Archive exact formal source snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: assignment-fence-proof-source-${{ github.sha }}
+          path: formal
+          if-no-files-found: error
+          retention-days: 30
+
+  tlc:
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: core
+            only: "core-.*"
+          - group: network-safety
+            only: "network-(fixed|claim-wins-queued-revoke-witness|fence-wins-delayed-claim-witness|compaction-fixed|usecs-before-ready-mutant|release-on-enqueue-mutant|default-allow-after-compaction-mutant|f2s-bypass-mutant)"
+          - group: network-liveness
+            only: "network-fair-liveness"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install Java, GNU time, and curl
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openjdk-17-jre-headless time curl
+      - name: Download and verify pinned TLC distributions
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 4 --retry-all-errors \
+            -o /tmp/tla2tools-1.7.4.jar \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+          curl --fail --location --retry 4 --retry-all-errors \
+            -o /tmp/tla2tools-1.8.0.jar \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
+          printf '%s  %s\n' "$TLC_174_SHA256" /tmp/tla2tools-1.7.4.jar | sha256sum -c -
+          printf '%s  %s\n' "$TLC_180_SHA256" /tmp/tla2tools-1.8.0.jar | sha256sum -c -
+          java -version
+      - name: Run exact dual-TLC assignment-fence phase
+        env:
+          GROUP: ${{ matrix.group }}
+          ONLY: ${{ matrix.only }}
+        run: |
+          set -euo pipefail
+          artifacts="/tmp/assignment-fence-${GROUP}"
+          rm -rf "$artifacts"
+          python3 formal/run_assignment_fence_tlc_checks_v4.py \
+            --manifest formal/assignment-fence-formal-checks-v1.json \
+            --repo . \
+            --formal-dir formal \
+            --artifacts "$artifacts" \
+            --expected-git-sha "$(git rev-parse HEAD)" \
+            --stable-jar /tmp/tla2tools-1.7.4.jar \
+            --stable-sha256 "$TLC_174_SHA256" \
+            --differential-jar /tmp/tla2tools-1.8.0.jar \
+            --differential-sha256 "$TLC_180_SHA256" \
+            --only "$ONLY"
+      - name: Archive TLC evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: assignment-fence-${{ matrix.group }}-${{ github.sha }}
+          path: /tmp/assignment-fence-${{ matrix.group }}
+          if-no-files-found: warn
+          retention-days: 30
+
+  tlaps:
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Download and install official TLAPS 1.5.0 bundle
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y time curl
+          mkdir -p /tmp/tlaps-proof /tmp/tlaps-1.5.0
+          curl --fail --location --retry 4 --retry-all-errors \
+            -o /tmp/tlaps-1.5.0-inst.bin "$TLAPS_150_URL"
+          sha256sum /tmp/tlaps-1.5.0-inst.bin | tee /tmp/tlaps-proof/installer.sha256
+          chmod +x /tmp/tlaps-1.5.0-inst.bin
+          /tmp/tlaps-1.5.0-inst.bin -d /tmp/tlaps-1.5.0 \
+            > /tmp/tlaps-proof/install.log 2>&1
+          /tmp/tlaps-1.5.0/bin/tlapm --version \
+            > /tmp/tlaps-proof/tlapm-version.txt 2>&1
+          /tmp/tlaps-1.5.0/bin/tlapm --config \
+            > /tmp/tlaps-proof/tlapm-config.txt 2>&1
+          find /tmp/tlaps-1.5.0 -type f -perm /111 -print0 \
+            | sort -z \
+            | xargs -0 sha256sum \
+            > /tmp/tlaps-proof/executable-sha256.txt
+      - name: Run the unbounded ownership proof
+        id: prove
+        continue-on-error: true
+        run: |
+          set +e
+          export PATH="/tmp/tlaps-1.5.0/lib/tlaps/bin:$PATH"
+          cd formal
+          /usr/bin/time -v -o /tmp/tlaps-proof/time.txt \
+            /tmp/tlaps-1.5.0/bin/tlapm AssignmentFenceCoreProof.tla \
+            > /tmp/tlaps-proof/tlapm.log 2>&1
+          rc=$?
+          printf '%s\n' "$rc" > /tmp/tlaps-proof/returncode.txt
+          exit "$rc"
+      - name: Archive TLAPS evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: assignment-fence-tlaps-${{ github.sha }}
+          path: /tmp/tlaps-proof
+          if-no-files-found: error
+          retention-days: 30
+      - name: Require every TLAPS obligation proved
+        if: always()
+        run: test "$(cat /tmp/tlaps-proof/returncode.txt)" = 0

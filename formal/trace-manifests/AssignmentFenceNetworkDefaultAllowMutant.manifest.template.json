@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "scenario": "AssignmentFenceNetworkDefaultAllowMutant",
-  "property": "NoStartAfterRelease",
+  "property": "NoStartAfterRevokedCompaction",
   "expected_result": "counterexample",
   "min_states": 11,
   "event_mode": "exclusive",
@@ -135,6 +135,7 @@
     "module": "AssignmentFenceNetworkCompaction",
     "config": "AssignmentFenceNetworkDefaultAllowMutant.cfg",
     "mutant": "MutantDefaultAllowUnknown = TRUE",
+    "direct_property": "releaseCause[a1] = Revoked implies startAfterRelease[a1] = 0",
     "load_bearing_fact": "The start consumes the concrete legacy claim queued by DReceiveUseCS; it is not spontaneous."
   }
 }

@@ -116,12 +116,29 @@ def _run_static_check(
     }
 
 
-def _validate_proofless_manifest(document: Any) -> dict[str, Any]:
+def _validate_proofless_manifest(
+    document: Any,
+    *,
+    allowed_proofs: Sequence[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Validate a TLC phase without silently dropping a proof inventory.
+
+    Existing proofless domain wrappers pass ``allowed_proofs=None`` and still
+    require an explicit empty array.  A proof-bearing domain may pass one exact
+    frozen inventory for an earlier TLC-only phase; the proof is retained in
+    metadata but never represented as executed or accepted by this runner.
+    """
     manifest = v2.validate_manifest(document)
     proofs = manifest.get("proofs", [])
-    if proofs != []:
+    if allowed_proofs is None:
+        if proofs != []:
+            raise TlcOnlyContractError(
+                "TLC-only orchestration requires an explicit empty proofs array"
+            )
+    elif proofs != list(allowed_proofs):
         raise TlcOnlyContractError(
-            "TLC-only orchestration requires an explicit empty proofs array"
+            f"TLC phase proof inventory mismatch: expected {list(allowed_proofs)}, "
+            f"got {proofs}"
         )
     for check in manifest["checks"]:
         if check.get("toolchains", ["stable", "differential"]) != [
@@ -175,6 +192,8 @@ def run_manifest(
     required_manifest_name: str,
     static_check_name: str,
     description: str,
+    allowed_proofs: Sequence[Mapping[str, Any]] | None = None,
+    mode: str = "tlc-only",
 ) -> int:
     """Run one exact proofless manifest and reject manifest substitution."""
     args = _build_parser(description).parse_args(argv)
@@ -212,7 +231,9 @@ def run_manifest(
                 f"{args.time_bin}"
             )
 
-        manifest = _validate_proofless_manifest(v2.load_json(manifest_path))
+        manifest = _validate_proofless_manifest(
+            v2.load_json(manifest_path), allowed_proofs=allowed_proofs
+        )
         static_result = _run_static_check(
             script=static_check,
             manifest=manifest_path,
@@ -255,14 +276,15 @@ def run_manifest(
 
         run_metadata = {
             "schema": v2.SCHEMA_VERSION,
-            "mode": "tlc-only",
+            "mode": mode,
             "started_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
             "git": git_after_tests,
             "manifest": {
                 "path": str(manifest_path),
                 "sha256": v2.sha256_file(manifest_path),
                 "required_name": required_manifest_name,
-                "proof_count": 0,
+                "proof_count": len(manifest.get("proofs", [])),
+                "proof_inventory": manifest.get("proofs", []),
             },
             "static_preflight": static_result,
             "self_tests": self_tests,
@@ -288,8 +310,14 @@ def run_manifest(
                 },
             },
             "tlaps": {
-                "required": False,
-                "reason": "the exact manifest contains zero proof rows",
+                "required_for_final_gate": bool(manifest.get("proofs", [])),
+                "executed_in_this_phase": False,
+                "reason": (
+                    "the exact manifest contains zero proof rows"
+                    if not manifest.get("proofs", [])
+                    else "the frozen proof inventory is retained but this TLC phase "
+                         "does not execute or accept TLAPS"
+                ),
             },
         }
         v2.write_json(artifacts / "run-metadata.json", run_metadata)
@@ -314,7 +342,7 @@ def run_manifest(
         summary = {
             "schema": v2.SCHEMA_VERSION,
             "status": "PASS",
-            "mode": "tlc-only",
+            "mode": mode,
             "finished_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
             "git": git_after_tests,
             "selected_check_count": len(selected),
