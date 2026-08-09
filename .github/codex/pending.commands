@@ -1,7 +1,7 @@
 set -euo pipefail
 
-formal_ref='18e4c6ac4e83c6a3ff1095fe9f7a65e14b09cd36'
-git fetch --no-tags origin bigoracle/assignment-fence-core-round2
+formal_ref='295a282ec044edc3eb0035ee6f64e968cf2a2a3c'
+git fetch --no-tags origin "$formal_ref"
 actual_ref=$(git rev-parse FETCH_HEAD)
 if [[ "$actual_ref" != "$formal_ref" ]]; then
   echo "formal source moved: expected $formal_ref, got $actual_ref" >&2
@@ -137,7 +137,7 @@ done
 {
   echo '# TLC formal run summary'
   echo
-  echo '- Imported ref: `18e4c6ac4e83c6a3ff1095fe9f7a65e14b09cd36`'
+  echo '- Imported ref: `295a282ec044edc3eb0035ee6f64e968cf2a2a3c`'
   echo '- TLC: official `tla2tools.jar` v1.7.4'
   echo '- Fixed configurations: 8'
   echo '- Required counterexamples: 20'
