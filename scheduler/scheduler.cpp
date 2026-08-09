@@ -3508,19 +3508,33 @@ static bool handle_line(CompileServer *cs, Msg *_m)
         return true;
     } else if (internals_hold_armed && cmd == "internals-release") {
         /* Test-only (A.2), recognized ONLY when the hold seam was armed at
-           startup.  It performs the REAL deferred send and records the
-           actual queued frame sequence -- it never lowers the sequence to
-           the current flushed count (which would fabricate delivery).  The
-           ordinary framesFlushed() >= request_frame_seq rule then drives
-           the transition once the real frame flushes.  */
-        if (internals_txn.active) {
+           startup.  PHASE/DEADLINE gating (bigoracle 16:18, local-oracle
+           16:26): settle the deadline first, then perform the real deferred
+           send ONLY while the transaction is in its active COLLECTION phase
+           (not yet final-pending output) and strictly before the collection
+           deadline, and only for targets still genuinely held
+           (held && SEND_PENDING).  A held target that already TIMED_OUT, or a
+           transaction that has entered output, must never receive a late,
+           uncorrelated GetInternalStatus.
+
+           A SAME-owner release needs no explicit rejection here: the
+           universal active-owner guard at the top of handle_line() tears down
+           any command issued on the connection that owns the active response
+           (before dispatch), so a same (fd,generation) release never reaches
+           this branch and the A.2 gate necessarily drives release from a
+           separate control connection.  */
+        internals_txn_tick();   /* settle deadline / final-pending first */
+        if (internals_txn.active && !internals_txn.final_pending
+                && icecream_monotonic_msec() < internals_txn.deadline_mono) {
             for (InternalsTarget &t : internals_txn.targets) {
-                if (!t.held) {
+                if (!t.held || t.state != InternalsTarget::SEND_PENDING) {
                     continue;
                 }
                 CompileServer *tgt = internals_resolve(t.fd, t.generation);
                 if (tgt && tgt->send_msg(GetInternalStatus(),
                                          MsgChannel::SendNonBlocking | MsgChannel::SendDeferrable)) {
+                    /* real deferred send: record the actual queued sequence,
+                       never lower it to the current flushed count.  */
                     t.request_frame_seq = tgt->framesQueued();
                     t.held = false;
                 } else {
