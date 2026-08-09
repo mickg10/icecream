@@ -1,1 +1,15 @@
 scheduler: keep successful relogins in the drain loop
+
+Issue #4 relogin transition.
+
+A valid daemon Login received on an already logged-in connection now has an
+explicit result: KeepConnection after compiler-environment replacement,
+busy-install reset, and any required protocol-24 ConfCS delivery;
+CloseConnection on type or delivery failure.  The historical unconditional
+false return made the drain loop stop serving a live connection for one turn.
+
+The new focused fixture covers modern and legacy protocol paths, state update,
+required reply ordering, failed reply delivery, and a null connection.  The
+exact historical false-success mutant must fail at the drain-loop ownership
+assertion.  The executor also runs all existing protocol-neutral issue-4 gates
+and their negative controls before committing.
