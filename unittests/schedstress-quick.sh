@@ -73,7 +73,13 @@
 # deadline state unchanged; release sends exactly one real request, and
 # only its subsequent reply may settle exactly one target (issue #4 A.2).
 #
-# Runs 14/15 -- internalspending/internalsretained: a stopped management
+# Run 14 -- internalsguard: a second command on the active owner cannot
+# splice unaccounted output into that transaction.
+#
+# Run 15 -- internalspreflight: the complete required tail must fit before
+# any worker request is emitted.
+#
+# Runs 16/17 -- internalspending/internalsretained: a stopped management
 # reader drives a 50-target internals fan-out through FINAL_PENDING.  The
 # two cap orderings independently gate pending transport bytes and retained
 # reply state, bounded CPU and management responsiveness, exact output-
