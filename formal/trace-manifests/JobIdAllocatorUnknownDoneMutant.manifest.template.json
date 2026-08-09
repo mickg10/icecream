@@ -1,0 +1,37 @@
+{
+  "schema": 1,
+  "scenario": "JobIdAllocatorUnknownDoneMutant",
+  "property": "UnknownDoneNoTerminalZero",
+  "expected_result": "counterexample",
+  "min_states": 2,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "UnknownLocalDoneEmitsTerminalZero",
+      "all": [
+        {"path": "unknownDoneCount", "from": 0, "to": 1},
+        {"path": "terminalZeroCount", "from": 0, "to": 1},
+        {"path": "allocated", "unchanged": true},
+        {"path": "issuedTotal", "unchanged": true}
+      ]
+    }
+  ],
+  "required_subsequence": ["UnknownLocalDoneEmitsTerminalZero"],
+  "final_all": [
+    {"path": "unknownDoneCount", "eq": 1},
+    {"path": "terminalZeroCount", "eq": 1},
+    {"path": "issuedTotal", "eq": 0}
+  ],
+  "harness_steps": [
+    {
+      "after": "UnknownLocalDoneEmitsTerminalZero",
+      "emit": "send_unknown_or_duplicate_local_done_and_assert_terminal_id_zero",
+      "actor": "scheduler"
+    }
+  ],
+  "metadata": {
+    "module": "JobIdAllocator",
+    "config": "JobIdAllocatorUnknownDoneMutant.cfg",
+    "mutant": "MutantUnknownDoneZero = TRUE"
+  }
+}
