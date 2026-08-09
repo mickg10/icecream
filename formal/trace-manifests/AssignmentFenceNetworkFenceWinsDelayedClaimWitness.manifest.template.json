@@ -1,0 +1,73 @@
+{
+  "schema": 1,
+  "scenario": "AssignmentFenceNetworkFenceWinsDelayedClaimWitness",
+  "property": "NoRejectAfterFence",
+  "expected_result": "counterexample",
+  "min_states": 8,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "SQueueRevokeWithDelayedClaim",
+      "all": [
+        {"path": "s2f", "len_delta": 1},
+        {"path": "c2f", "unchanged": true},
+        {"path": "claimRejectedAfterFence", "unchanged": true}
+      ],
+      "any": [
+        {"path": "phase.a0", "to": "RevokeQueued"},
+        {"path": "phase.a1", "to": "RevokeQueued"}
+      ]
+    },
+    {
+      "name": "FInstallFenceBeforeClaim",
+      "all": [
+        {"path": "revokedEnqueued", "changed": true},
+        {"path": "workerSlot", "changed": true},
+        {"path": "s2f", "len_delta": -1},
+        {"path": "f2s", "len_delta": 1},
+        {"path": "c2f", "unchanged": true},
+        {"path": "claimRejectedAfterFence", "unchanged": true}
+      ]
+    },
+    {
+      "name": "FRejectDelayedClaimAfterFence",
+      "all": [
+        {"path": "claimRejectedAfterFence", "from": false, "to": true},
+        {"path": "c2f", "len_delta": -1},
+        {"path": "claimRejected", "changed": true},
+        {"path": "fState", "unchanged": true},
+        {"path": "s2f", "unchanged": true}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "SQueueRevokeWithDelayedClaim",
+    "FInstallFenceBeforeClaim",
+    "FRejectDelayedClaimAfterFence"
+  ],
+  "final_all": [
+    {"path": "claimRejectedAfterFence", "eq": true}
+  ],
+  "harness_steps": [
+    {
+      "after": "SQueueRevokeWithDelayedClaim",
+      "emit": "barrier_revoke_queued_while_claim_frame_is_delayed",
+      "actor": "scheduler"
+    },
+    {
+      "after": "FInstallFenceBeforeClaim",
+      "emit": "barrier_after_worker_installs_revocation_fence",
+      "actor": "fulfillment-daemon"
+    },
+    {
+      "after": "FRejectDelayedClaimAfterFence",
+      "emit": "assert_delayed_claim_rejected_after_fence",
+      "actor": "fulfillment-daemon"
+    }
+  ],
+  "metadata": {
+    "module": "AssignmentFenceNetwork",
+    "config": "AssignmentFenceNetworkFenceWinsDelayedClaimWitness.cfg",
+    "witness": "F consumes REVOKE and installs the fence before the retained concrete claim reaches F"
+  }
+}
