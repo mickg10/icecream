@@ -14,4 +14,10 @@ for mode in credit report retention noreader clientstall mixedrole clamp reliste
         exit 1
     }
 done
+# Meta-invariant: an unknown mode is itself a test -- it must exit nonzero
+# and say so, never fall through to a PASS path.
+if "$dir/schedcredit" "$dir/../scheduler/icecc-scheduler" no-such-mode >/dev/null 2>&1; then
+    echo "schedcredit-run: unknown mode exited zero" >&2
+    exit 1
+fi
 exit 0

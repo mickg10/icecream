@@ -148,23 +148,31 @@ static bool unblock_handled(const sigset_t *old)
 
 /* Terminal only on a confirmed reap or ECHILD; anything else aborts by
    name rather than pretending the child is gone.  */
-static void end_scheduler(pid_t pid)
+/* Requested shutdown returns a typed verdict and the harness asserts
+   the expected clean exit: an unexpected signal, nonzero status, or
+   kill escalation is a red result, not a discarded int.  */
+enum ShutdownResult { SHUTDOWN_CLEAN, SHUTDOWN_UNEXPECTED, SHUTDOWN_ESCALATED };
+static ShutdownResult end_scheduler_checked(pid_t pid)
 {
     if (pid <= 0) {
-        return;
+        return SHUTDOWN_UNEXPECTED;
     }
     kill(pid, SIGTERM);
     for (int i = 0; i < 20; ++i) {
-        const pid_t r = waitpid(pid, nullptr, WNOHANG);
+        int st = -1;
+        const pid_t r = waitpid(pid, &st, WNOHANG);
         if (r == pid) {
-            return;
+            return (WIFEXITED(st) && WEXITSTATUS(st) == 0)
+                ? SHUTDOWN_CLEAN : SHUTDOWN_UNEXPECTED;
         }
         if (r < 0) {
             if (errno == EINTR) {
                 continue;
             }
             if (errno == ECHILD) {
-                return;
+                /* reaped elsewhere: ownership was recorded, so this is an
+                   unexpected path, not a clean verdict */
+                return SHUTDOWN_UNEXPECTED;
             }
             mask_failure_abort("end_scheduler/waitpid");
         }
@@ -174,12 +182,18 @@ static void end_scheduler(pid_t pid)
     for (;;) {
         const pid_t r = waitpid(pid, nullptr, 0);
         if (r == pid || (r < 0 && errno == ECHILD)) {
-            return;
+            return SHUTDOWN_ESCALATED;
         }
         if (r < 0 && errno != EINTR) {
             mask_failure_abort("end_scheduler/waitpid2");
         }
     }
+}
+
+/* Signal-handler-safe legacy shape (cleanup paths that cannot assert).  */
+static void end_scheduler(pid_t pid)
+{
+    (void)end_scheduler_checked(pid);
 }
 
 static void cleanup(void)
@@ -359,13 +373,26 @@ static void heartbeat(void)
    never a suite hang.  */
 
 
-static std::string control(int port, const char *cmd)
+/* Typed management exchange: a reply is usable ONLY when its status is
+   COMPLETE (the "200 done" terminator arrived inside the whole-exchange
+   budget).  Every other status is an observation failure that the
+   caller must treat as such -- the old string-returning helper handed
+   back whatever partial bytes accumulated, so a dead scheduler or a
+   truncated reply could read as an empty-but-plausible result.  */
+struct ControlReply {
+    enum Status { CONNECT_FAILED, GREETING_FAILED, INCOMPLETE, COMPLETE };
+    Status status;
+    std::string text;
+};
+
+static ControlReply control_checked(int port, const char *cmd)
 {
+    ControlReply r;
+    r.status = ControlReply::CONNECT_FAILED;
     const int fd = tcp_connect(port + 1);
     if (fd < 0) {
-        return std::string();
+        return r;
     }
-    std::string out;
     char buf[4096];
     const Clock::time_point t0 = Clock::now();
     const double budget = 10.0;   // whole exchange, absolute
@@ -376,22 +403,34 @@ static std::string control(int port, const char *cmd)
     ssize_t n = read_deadline(fd, buf, sizeof(buf), remaining_ms());  // greeting
     if (n <= 0) {
         close(fd);
-        return std::string();
+        r.status = ControlReply::GREETING_FAILED;
+        return r;
     }
     dprintf(fd, "%s\nquit\n", cmd);
+    r.status = ControlReply::INCOMPLETE;
     while (remaining_ms() > 0) {
         n = read_deadline(fd, buf, sizeof(buf) - 1, remaining_ms());
         if (n <= 0) {
             break;
         }
         buf[n] = 0;
-        out += buf;
-        if (out.find("200 done") != std::string::npos) {
-            break;   // control protocol terminator observed
+        r.text += buf;
+        if (r.text.find("200 done") != std::string::npos) {
+            r.status = ControlReply::COMPLETE;
+            break;
         }
     }
     close(fd);
-    return out;
+    return r;
+}
+
+/* Legacy shape for existing call sites: COMPLETE text or EMPTY -- an
+   incomplete reply can no longer masquerade as content, because only a
+   terminator-bearing exchange returns any bytes at all.  */
+static std::string control(int port, const char *cmd)
+{
+    const ControlReply r = control_checked(port, cmd);
+    return r.status == ControlReply::COMPLETE ? r.text : std::string();
 }
 
 /* listcs field for a named submitter: "... name (...) ... field<value>" */
@@ -1151,6 +1190,24 @@ int main(int argc, char **argv)
         return die("unknown mode");
     }
 
+    /* Requested shutdown must be CLEAN: check liveness first (an
+       already-dead scheduler must fail here, not vanish into cleanup),
+       then require the expected exit.  */
+    if (sched_pid > 0) {
+        check(waitpid(sched_pid, nullptr, WNOHANG) == 0,
+              "the scheduler is alive before the requested shutdown");
+        sigset_t old;
+        if (!block_handled(&old)) {
+            mask_failure_abort("verdict/block");
+        }
+        const ShutdownResult sr = end_scheduler_checked(sched_pid);
+        publish_sched(-1);
+        if (!unblock_handled(&old)) {
+            mask_failure_abort("verdict/restore");
+        }
+        check(sr == SHUTDOWN_CLEAN,
+              "the requested shutdown exited cleanly (status 0, no escalation)");
+    }
     cleanup();
     /* A mode that reached here without executing a single assertion is a
        broken test, not a passing one -- an empty branch (or a splice error
