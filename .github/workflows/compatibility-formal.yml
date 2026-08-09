@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: compatibility-formal-${{ github.event.pull_request.number || github.ref }}
@@ -20,7 +20,69 @@ env:
   TLC_180_SHA256: "e22f8ffb4bacdea0a871f444dd94fe5fb0d8013b3388ae39e82e26f852c735d5"
 
 jobs:
+  precedence-repair:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
+          fetch-depth: 0
+      - name: Apply the seven count-checked parenthesizations once
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("formal/MixedVersionCompatibility.tla")
+          text = path.read_text(encoding="utf-8")
+          replacements = {
+              "seenLegacy' = seenLegacy \\/ expectedPolicy = \"Legacy\"":
+                  "seenLegacy' = (seenLegacy \\/ expectedPolicy = \"Legacy\")",
+              "seenFenced' = seenFenced \\/ expectedPolicy = \"FencedLegacy\"":
+                  "seenFenced' = (seenFenced \\/ expectedPolicy = \"FencedLegacy\")",
+              "seenToken' = seenToken \\/ expectedPolicy = \"Token\"":
+                  "seenToken' = (seenToken \\/ expectedPolicy = \"Token\")",
+              "legacyRestartAmbiguous \\/ policy = \"Legacy\"":
+                  "(legacyRestartAmbiguous \\/ policy = \"Legacy\")",
+              "fencedRestartAmbiguous \\/ policy = \"FencedLegacy\"":
+                  "(fencedRestartAmbiguous \\/ policy = \"FencedLegacy\")",
+              "seenLegacy /\\ seenToken":
+                  "(seenLegacy /\\ seenToken)",
+              "seenFenced /\\ seenToken":
+                  "(seenFenced /\\ seenToken)",
+          }
+          changed = False
+          for old, new in replacements.items():
+              old_count = text.count(old)
+              new_count = text.count(new)
+              if old_count == 1 and new_count == 0:
+                  text = text.replace(old, new)
+                  changed = True
+              elif old_count == 0 and new_count == 1:
+                  pass
+              else:
+                  raise SystemExit(
+                      f"unexpected replacement cardinality for {old!r}: "
+                      f"old={old_count}, new={new_count}"
+                  )
+          if changed:
+              path.write_text(text, encoding="utf-8")
+          PY
+          git diff --check
+          if git diff --quiet -- formal/MixedVersionCompatibility.tla; then
+            echo "precedence assignments already explicit"
+            exit 0
+          fi
+          git diff -- formal/MixedVersionCompatibility.tla
+          git config user.name "mickg10 formal automation"
+          git config user.email "5094033+mickg10@users.noreply.github.com"
+          git add formal/MixedVersionCompatibility.tla
+          git commit -m "formal: parenthesize compatibility boolean assignments"
+          git push origin HEAD:${{ github.head_ref || github.ref_name }}
+
   static:
+    needs: precedence-repair
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
