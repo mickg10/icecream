@@ -391,6 +391,7 @@ void MsgChannel::writefull(const void *_buf, size_t count)
 
     memcpy(msgbuf + msgtogo, _buf, count);
     msgtogo += count;
+    total_appended += count;
 }
 
 time_t icecream_monotonic_seconds()
@@ -504,6 +505,11 @@ bool MsgChannel::flush_writebuf(int send_flags)
         }
 
         msgtogo -= ret;
+        total_drained += (uint64_t)ret;
+        while (!pending_frame_ends.empty()
+               && pending_frame_ends.front() <= total_drained) {
+            pending_frame_ends.pop_front();
+        }
         buf += ret;
     }
 
@@ -1475,6 +1481,15 @@ bool MsgChannel::send_msg(const Msg &m, int flags)
         }
         uint32_t len = htonl(out_len);
         memcpy(msgbuf + msgtogo_old, &len, 4);
+    }
+
+    /* The frame is fully composed: record its boundary for delivery
+       tracking (framesFlushed advances when its last byte drains).  */
+    ++frames_queued_seq;
+    pending_frame_ends.push_back(total_appended);
+    while (!pending_frame_ends.empty()
+           && pending_frame_ends.front() <= total_drained) {
+        pending_frame_ends.pop_front();
     }
 
     if ((flags & SendBulkOnly) && msgtogo < 4096) {

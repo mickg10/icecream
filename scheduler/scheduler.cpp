@@ -490,92 +490,167 @@ static unsigned long accepts_deferred_total = 0;
    re-serviced after one full scheduler turn.  */
 static bool accept_repoll = false;
 
-/* ONE scheduler-wide legacy internals fan-out at a time (issue #4 P1):
-   the legacy STATUS_TEXT reply carries no request id, so concurrent
-   fan-outs are not correlatable.  The old command was a serial blocking
-   transaction on the scheduler thread -- one blocking send plus a
-   10-second receive allowance PER worker; at 50 workers, minutes with no
-   dispatch, completion, accept, or timer work.  The transaction below
-   queues every request nonblocking, consumes replies from the normal
-   event loop, and enforces ONE whole-command absolute monotonic
-   deadline.  Targets are keyed by pointer AND connection generation so a
-   reconnected daemon (or a reused allocation) can never satisfy an old
-   target.  */
+/* ONE scheduler-wide legacy internals fan-out at a time (issue #4 P1,
+   corrected per the round-2 re-review): the legacy STATUS_TEXT reply
+   carries no request id, so concurrent fan-outs are not correlatable.
+   The transaction retains ONLY stable values -- (fd, connection
+   generation) keys and node-name snapshots, never a CompileServer
+   pointer (a disconnected target's pointer is freed while the
+   transaction lives; the first version dereferenced it when reporting).
+   Every channel operation re-resolves fd2cs[fd] and requires generation
+   equality.  A request is WAITING_REPLY only after its exact frame has
+   FULLY FLUSHED (framesFlushed >= the recorded frame sequence) -- a
+   deferrable send returning true means queued, not delivered, and an
+   unsolicited status must not satisfy a request that never left the
+   scheduler.  Control output is nonblocking/deferrable and bounded
+   (per-target forward cap, whole-transaction retained cap, control
+   pending-byte cap), and the transaction completes only when the final
+   frame is known flushed (FINAL_PENDING) or the control is explicitly
+   failed at the output deadline.  */
+struct InternalsTarget {
+    int fd;
+    unsigned int generation;
+    std::string node_name;
+    uint64_t request_frame_seq;
+    enum State { SEND_PENDING, WAITING_REPLY, REPLIED, DISCONNECTED, TIMED_OUT } state;
+};
 struct InternalsTxn {
-    enum TargetState { WAITING_REPLY, REPLIED, DISCONNECTED, TIMED_OUT };
     bool active = false;
-    CompileServer *control = nullptr;
+    bool final_pending = false;
+    int control_fd = -1;
     unsigned int control_generation = 0;
-    uint64_t deadline_mono = 0;
-    std::map<CompileServer *, std::pair<unsigned int, TargetState> > targets;
+    uint64_t deadline_mono = 0;          // reply-collection deadline
+    uint64_t output_deadline_mono = 0;   // absolute control-output deadline
+    uint64_t final_frame_seq = 0;
+    size_t retained_bytes = 0;
+    std::vector<InternalsTarget> targets;
 };
 static InternalsTxn internals_txn;
-static uint64_t internals_deadline_msec = 10000;   // whole-command default
+static uint64_t internals_deadline_msec = 10000;        // whole command
+static const size_t kInternalsPerTargetCap = 64 * 1024;
+static const size_t kInternalsRetainedCap = 4 * 1024 * 1024;
+static const size_t kInternalsControlPendingCap = 1024 * 1024;
+
+static CompileServer *internals_resolve(int fd, unsigned int generation)
+{
+    map<int, CompileServer *>::iterator it = fd2cs.find(fd);
+    if (it == fd2cs.end()) {
+        return nullptr;
+    }
+    if (it->second->connectionGeneration() != generation) {
+        return nullptr;   /* fd reuse: not the recorded peer */
+    }
+    return it->second;
+}
+
+static void internals_txn_clear()
+{
+    internals_txn.active = false;
+    internals_txn.final_pending = false;
+    internals_txn.control_fd = -1;
+    internals_txn.targets.clear();
+    internals_txn.retained_bytes = 0;
+}
 
 static bool internals_txn_all_terminal()
 {
-    for (const std::pair<CompileServer * const,
-                         std::pair<unsigned int, InternalsTxn::TargetState> > &t
-             : internals_txn.targets) {
-        if (t.second.second == InternalsTxn::WAITING_REPLY) {
+    for (const InternalsTarget &t : internals_txn.targets) {
+        if (t.state == InternalsTarget::SEND_PENDING
+                || t.state == InternalsTarget::WAITING_REPLY) {
             return false;
         }
     }
     return true;
 }
 
-/* Emit one explicit result row per non-replied target, the terminal
-   frame, and clear the transaction.  Row content for REPLIED targets was
-   already streamed as the replies arrived.  */
-static void internals_txn_finish()
+/* Queue the per-target result rows and the terminal frame to the control
+   (nonblocking; bounded), then wait for the final frame to flush.  */
+static void internals_txn_finalize()
+{
+    InternalsTxn &txn = internals_txn;
+    if (!txn.active || txn.final_pending) {
+        return;
+    }
+    CompileServer *control = internals_resolve(txn.control_fd, txn.control_generation);
+    if (!control) {
+        internals_txn_clear();
+        return;
+    }
+    for (const InternalsTarget &t : txn.targets) {
+        const char *why = nullptr;
+        switch (t.state) {
+        case InternalsTarget::REPLIED:
+            continue;
+        case InternalsTarget::SEND_PENDING:
+        case InternalsTarget::WAITING_REPLY:
+        case InternalsTarget::TIMED_OUT:
+            why = " not reporting (timeout)\n";
+            break;
+        case InternalsTarget::DISCONNECTED:
+            why = " disconnected before reporting\n";
+            break;
+        }
+        control->send_msg(TextMsg(t.node_name + why),
+                          MsgChannel::SendNonBlocking | MsgChannel::SendDeferrable);
+    }
+    control->send_msg(TextMsg(string("200 done")),
+                      MsgChannel::SendNonBlocking | MsgChannel::SendDeferrable);
+    txn.final_frame_seq = control->framesQueued();
+    txn.final_pending = true;
+}
+
+/* Per-turn transaction service: promote flushed requests, enforce the
+   collection deadline, and complete once the final frame is flushed or
+   the control is failed at the output deadline.  */
+static void internals_txn_tick()
 {
     InternalsTxn &txn = internals_txn;
     if (!txn.active) {
         return;
     }
-    CompileServer *control = txn.control;
-    const bool control_live = control
-        && control->connectionGeneration() == txn.control_generation;
-    if (control_live) {
-        for (const std::pair<CompileServer * const,
-                             std::pair<unsigned int, InternalsTxn::TargetState> > &t
-                 : txn.targets) {
-            const char *why = nullptr;
-            switch (t.second.second) {
-            case InternalsTxn::REPLIED:
-                continue;
-            case InternalsTxn::WAITING_REPLY:
-            case InternalsTxn::TIMED_OUT:
-                why = " not reporting (timeout)\n";
-                break;
-            case InternalsTxn::DISCONNECTED:
-                why = " disconnected before reporting\n";
-                break;
-            }
-            control->send_msg(TextMsg(t.first->nodeName() + why));
+    const uint64_t now = icecream_monotonic_msec();
+    if (txn.final_pending) {
+        CompileServer *control = internals_resolve(txn.control_fd, txn.control_generation);
+        if (!control) {
+            internals_txn_clear();
+            return;
         }
-        control->send_msg(TextMsg(string("200 done")));
-    }
-    txn.active = false;
-    txn.control = nullptr;
-    txn.targets.clear();
-}
-
-/* Deadline tick, run once per scheduler turn.  */
-static void internals_txn_tick()
-{
-    if (!internals_txn.active) {
+        if (control->framesFlushed() >= txn.final_frame_seq) {
+            internals_txn_clear();   /* final frame delivered: complete */
+            return;
+        }
+        if (now >= txn.output_deadline_mono) {
+            /* A control that will not read is explicitly failed; that
+               teardown clears the transaction.  */
+            trace() << "internals: control output deadline expired" << endl;
+            handle_end(control, nullptr);
+            return;
+        }
         return;
     }
-    if (icecream_monotonic_msec() >= internals_txn.deadline_mono) {
-        for (std::pair<CompileServer * const,
-                       std::pair<unsigned int, InternalsTxn::TargetState> > &t
-                 : internals_txn.targets) {
-            if (t.second.second == InternalsTxn::WAITING_REPLY) {
-                t.second.second = InternalsTxn::TIMED_OUT;
+    for (InternalsTarget &t : txn.targets) {
+        if (t.state != InternalsTarget::SEND_PENDING) {
+            continue;
+        }
+        CompileServer *target = internals_resolve(t.fd, t.generation);
+        if (!target) {
+            t.state = InternalsTarget::DISCONNECTED;
+            continue;
+        }
+        if (target->framesFlushed() >= t.request_frame_seq) {
+            t.state = InternalsTarget::WAITING_REPLY;
+        }
+    }
+    if (now >= txn.deadline_mono) {
+        for (InternalsTarget &t : txn.targets) {
+            if (t.state == InternalsTarget::SEND_PENDING
+                    || t.state == InternalsTarget::WAITING_REPLY) {
+                t.state = InternalsTarget::TIMED_OUT;
             }
         }
-        internals_txn_finish();
+    }
+    if (internals_txn_all_terminal()) {
+        internals_txn_finalize();
     }
 }
 
@@ -2961,10 +3036,14 @@ static bool handle_line(CompileServer *cs, Msg *_m)
             return cs->send_msg(TextMsg(string("200 done")));
         }
         internals_txn.active = true;
-        internals_txn.control = cs;
+        internals_txn.final_pending = false;
+        internals_txn.control_fd = cs->fd;
         internals_txn.control_generation = cs->connectionGeneration();
         internals_txn.deadline_mono = icecream_monotonic_msec()
                                       + internals_deadline_msec;
+        internals_txn.output_deadline_mono = internals_txn.deadline_mono
+                                             + internals_deadline_msec;
+        internals_txn.retained_bytes = 0;
         internals_txn.targets.clear();
         for (CompileServer * const it : css) {
             if (!l.empty()) {
@@ -2982,20 +3061,25 @@ static bool handle_line(CompileServer *cs, Msg *_m)
                the channel's own output queue and the normal POLLOUT
                flushing owns it; a hard send error settles the target
                immediately.  */
+            InternalsTarget t;
+            t.fd = it->fd;
+            t.generation = it->connectionGeneration();
+            t.node_name = it->nodeName();
             if (it->send_msg(GetInternalStatus(),
                              MsgChannel::SendNonBlocking | MsgChannel::SendDeferrable)) {
-                internals_txn.targets[it] =
-                    std::make_pair(it->connectionGeneration(),
-                                   InternalsTxn::WAITING_REPLY);
+                /* Queued, not delivered: WAITING_REPLY only once the
+                   exact frame has flushed (tick promotes it).  */
+                t.request_frame_seq = it->framesQueued();
+                t.state = InternalsTarget::SEND_PENDING;
             } else {
-                internals_txn.targets[it] =
-                    std::make_pair(it->connectionGeneration(),
-                                   InternalsTxn::DISCONNECTED);
+                t.request_frame_seq = 0;
+                t.state = InternalsTarget::DISCONNECTED;
             }
+            internals_txn.targets.push_back(t);
         }
-        if (internals_txn.targets.empty() || internals_txn_all_terminal()) {
-            internals_txn_finish();
-        }
+        internals_txn_tick();   /* instant completion for an empty set or
+                                   already-flushed requests */
+
         /* No trailing 200 done here: the transaction emits it when every
            target is terminal or the whole-command deadline expires.  */
         return true;
@@ -3054,22 +3138,24 @@ static bool handle_end(CompileServer *toremove, Msg *m)
     /* Settle any internals-transaction involvement exactly once: a dead
        control cancels the whole fan-out (late replies revert to the
        unsolicited path); a dead target settles as DISCONNECTED for ITS
-       generation only.  */
+       exact generation -- the record is a value object and never holds
+       the pointer being destroyed here.  */
     if (internals_txn.active) {
-        if (toremove == internals_txn.control) {
-            internals_txn.active = false;
-            internals_txn.control = nullptr;
-            internals_txn.targets.clear();
+        if (toremove->fd == internals_txn.control_fd
+                && toremove->connectionGeneration() == internals_txn.control_generation) {
+            internals_txn_clear();
         } else {
-            std::map<CompileServer *, std::pair<unsigned int, InternalsTxn::TargetState> >::iterator
-                tit = internals_txn.targets.find(toremove);
-            if (tit != internals_txn.targets.end()
-                    && tit->second.first == toremove->connectionGeneration()
-                    && tit->second.second == InternalsTxn::WAITING_REPLY) {
-                tit->second.second = InternalsTxn::DISCONNECTED;
-                if (internals_txn_all_terminal()) {
-                    internals_txn_finish();
+            for (InternalsTarget &t : internals_txn.targets) {
+                if (t.fd == toremove->fd
+                        && t.generation == toremove->connectionGeneration()
+                        && (t.state == InternalsTarget::SEND_PENDING
+                            || t.state == InternalsTarget::WAITING_REPLY)) {
+                    t.state = InternalsTarget::DISCONNECTED;
+                    break;
                 }
+            }
+            if (internals_txn_all_terminal()) {
+                internals_txn_finalize();
             }
         }
     }
@@ -3282,24 +3368,57 @@ static bool handle_activity(CompileServer *cs)
         ret = handle_blacklist_host_env(cs, m);
         break;
     case Msg::STATUS_TEXT: {
-        std::map<CompileServer *, std::pair<unsigned int, InternalsTxn::TargetState> >::iterator
-            tit = internals_txn.active ? internals_txn.targets.find(cs)
-                                       : internals_txn.targets.end();
-        if (tit != internals_txn.targets.end()
-                && tit->second.first == cs->connectionGeneration()
-                && tit->second.second == InternalsTxn::WAITING_REPLY) {
-            tit->second.second = InternalsTxn::REPLIED;
-            CompileServer *control = internals_txn.control;
-            if (control && control->connectionGeneration()
-                               == internals_txn.control_generation) {
-                control->send_msg(TextMsg(static_cast<StatusTextMsg*>(m)->text));
+        InternalsTarget *hit = nullptr;
+        if (internals_txn.active && !internals_txn.final_pending) {
+            for (InternalsTarget &t : internals_txn.targets) {
+                if (t.fd == cs->fd
+                        && t.generation == cs->connectionGeneration()
+                        && t.state == InternalsTarget::WAITING_REPLY) {
+                    hit = &t;
+                    break;
+                }
+            }
+        }
+        if (hit) {
+            hit->state = InternalsTarget::REPLIED;
+            CompileServer *control = internals_resolve(internals_txn.control_fd,
+                                                       internals_txn.control_generation);
+            if (control) {
+                /* Bounded forward: per-target cap, whole-transaction
+                   retained cap, and a control pending-byte cap -- a
+                   non-reading control must not buffer unboundedly.  */
+                std::string text = static_cast<StatusTextMsg*>(m)->text;
+                bool truncated = false;
+                if (text.size() > kInternalsPerTargetCap) {
+                    text.resize(kInternalsPerTargetCap);
+                    truncated = true;
+                }
+                if (internals_txn.retained_bytes + text.size() > kInternalsRetainedCap) {
+                    const size_t room = kInternalsRetainedCap > internals_txn.retained_bytes
+                        ? kInternalsRetainedCap - internals_txn.retained_bytes : 0;
+                    text.resize(room);
+                    truncated = true;
+                }
+                if (control->pending_bytes() + text.size() > kInternalsControlPendingCap) {
+                    text.clear();
+                    truncated = true;
+                }
+                internals_txn.retained_bytes += text.size();
+                if (!text.empty()) {
+                    control->send_msg(TextMsg(text),
+                                      MsgChannel::SendNonBlocking | MsgChannel::SendDeferrable);
+                }
+                if (truncated) {
+                    control->send_msg(TextMsg(hit->node_name + " [output truncated]\n"),
+                                      MsgChannel::SendNonBlocking | MsgChannel::SendDeferrable);
+                }
             }
             if (internals_txn_all_terminal()) {
-                internals_txn_finish();
+                internals_txn_finalize();
             }
         } else {
-            /* Unsolicited (or duplicate) status: keep the legacy
-               logging; it does not touch transaction accounting.  */
+            /* Unsolicited, duplicate, or pre-delivery status: legacy
+               logging; transaction accounting untouched.  */
             log_info() << "StatusTextMsg from " << cs->nodeName() << ": " << static_cast<StatusTextMsg*>(m)->text << endl;
         }
         ret = true;

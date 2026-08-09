@@ -34,6 +34,8 @@
 #include <netinet/tcp.h>
 
 #include "job.h"
+#include <deque>
+#include <stdint.h>
 
 // if you increase the PROTOCOL_VERSION, add a macro below and use that
 #define PROTOCOL_VERSION 48
@@ -290,6 +292,21 @@ public:
         return msgtogo;
     }
 
+    // Message-boundary delivery tracking.  framesQueued() advances once per
+    // fully composed frame; framesFlushed() advances once the LAST byte of
+    // that frame has left the send buffer.  "send_msg returned true" means
+    // queued, not delivered -- callers that need delivery (e.g. a request
+    // whose reply must not be matched before the request was even on the
+    // wire) compare their recorded framesQueued() against framesFlushed().
+    uint64_t framesQueued(void) const
+    {
+        return frames_queued_seq;
+    }
+    uint64_t framesFlushed(void) const
+    {
+        return frames_queued_seq - pending_frame_ends.size();
+    }
+
     // True while a deferrable send has left output undelivered.  An explicit
     // flag rather than a timestamp test: an age of zero is ambiguous during
     // the first second of a backlog, and owners must distinguish "not armed"
@@ -380,6 +397,10 @@ protected:
     size_t msgbuflen;
     size_t msgofs;
     size_t msgtogo;
+    uint64_t total_appended = 0;
+    uint64_t total_drained = 0;
+    uint64_t frames_queued_seq = 0;
+    std::deque<uint64_t> pending_frame_ends;   // append offsets of frame ends
     // deferred-output deadline state; see deferred_output_armed()
     bool pending_write_armed;
     uint64_t pending_write_deadline_msec;
