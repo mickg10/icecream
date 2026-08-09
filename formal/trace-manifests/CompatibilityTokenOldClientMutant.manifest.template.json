@@ -1,0 +1,37 @@
+{
+  "schema": 1,
+  "scenario": "CompatibilityTokenOldClientMutant",
+  "property": "OldClientSeesNoTokenField",
+  "expected_result": "counterexample",
+  "min_states": 3,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "ExposeTokenFieldToOldClient",
+      "all": [
+        {"path": "phase", "from": "Requested", "to": "Assigned"},
+        {"path": "policy", "from": "None", "to": "FencedLegacy"},
+        {"path": "oldClientSawToken", "from": false, "to": true},
+        {"path": "oldWorkerSawNewControl", "to": false}
+      ]
+    }
+  ],
+  "required_subsequence": ["ExposeTokenFieldToOldClient"],
+  "final_all": [
+    {"path": "oldClientSawToken", "eq": true},
+    {"path": "policy", "eq": "FencedLegacy"},
+    {"path": "phase", "eq": "Assigned"}
+  ],
+  "harness_steps": [
+    {
+      "after": "ExposeTokenFieldToOldClient",
+      "emit": "assert_old_client_received_unnegotiated_full_id_or_token_field",
+      "actor": "scheduler-client-codec"
+    }
+  ],
+  "metadata": {
+    "module": "MixedVersionCompatibilityChecked",
+    "configs": ["CompatibilityTokenOldClientMutant.cfg"],
+    "mutant": "MutantTokenOldClient = TRUE"
+  }
+}
