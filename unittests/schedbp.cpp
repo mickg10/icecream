@@ -322,6 +322,43 @@ static bool job_in_scheduler(int port, unsigned job_id)
     return query_control_count(port, "listjobs", needle) > 0;
 }
 
+/* Total advertised compile slots across the whole fake farm: the sum of
+   the MAX half of every "jobs=cur/max" in listcs.  Derived from the live
+   topology so the capacity bound in the fairness bracket carries no
+   unexplained constant.  */
+static long long total_farm_capacity(int port)
+{
+    const int fd = tcp_connect(port + 1, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    char buf[16384];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);   // greeting
+    dprintf(fd, "listcs\nquit\n");
+    std::string text;
+    const Clock::time_point t0 = Clock::now();
+    while (secs_since(t0) < 10) {
+        n = read(fd, buf, sizeof(buf) - 1);
+        if (n <= 0) {
+            break;
+        }
+        buf[n] = 0;
+        text += buf;
+    }
+    close(fd);
+    long long total = 0;
+    size_t pos = 0;
+    while ((pos = text.find("jobs=", pos)) != std::string::npos) {
+        const size_t slash = text.find('/', pos);
+        if (slash == std::string::npos) {
+            break;
+        }
+        total += atoll(text.c_str() + slash + 1);
+        pos = slash + 1;
+    }
+    return total;
+}
+
 static long long worker_job_count(int port, const char *worker)
 {
     /* listcs prints "... jobs=<current>/<max> ..." for each host.  */
@@ -1535,24 +1572,36 @@ int main(int argc, char **argv)
                the contended admission window -- reply counters lag
                admission by whole turns, so they cannot establish this.  */
             long long bracket_vals[4] = { -1, -1, -1, -1 };
+            /* Every slot the fake farm advertises, derived from the
+               topology itself: replies beyond admitted-minus-capacity
+               cannot merely be in flight.  */
+            const long long farm_capacity = total_farm_capacity(port);
             auto both_active = [&](int slot) {
+                /* The CONTENDED WINDOW must be proven from SCHEDULER-side
+                   state, conservatively: reader-side reply counters lag the
+                   wire, so "replies < admitted" alone could hold while every
+                   remaining reply is already queued in socket buffers and
+                   the scheduler holds nothing.  The proof used here:
+
+                     admitted_total - replies_consumed > total farm capacity
+
+                   for EACH big submitter -- more admitted-but-unconsumed
+                   work than could possibly be dispatched-or-in-flight means
+                   some of it is still QUEUED in the scheduler.  admitted is
+                   read BEFORE the reply counter, so the difference is a
+                   lower bound.  (An earlier form required admission itself
+                   to be incomplete, which a fast host finishes before the
+                   first sample; a second form used reader counters alone,
+                   which cannot see scheduler state.)  */
                 const long long a7 = query_submitter_field(port, "fakesub7", "admitted_total=");
                 const long long a8 = query_submitter_field(port, "fakesub8", "admitted_total=");
+                const long long r7 = repliesF1.load();
+                const long long r8 = repliesF2.load();
                 bracket_vals[slot] = a7;
                 bracket_vals[slot + 1] = a8;
-                /* The CONTENDED WINDOW is "both bigs still have unserved
-                   backlog": admission has BEGUN (strictly positive -- zero
-                   would prove only that it had not finished) and the reply
-                   stream has not caught up with everything admitted.  The
-                   original form required admission itself to be incomplete
-                   (a7 < bigN), which is a statement about the observing
-                   machine, not the property: a fast host admits all 24000
-                   before the first small can even be issued (reported:
-                   before=24000,24000 with replies at 4001+3265), and the
-                   bracket then failed for the window's existence while the
-                   queues were plainly still contended.  */
-                return a7 > 0 && repliesF1.load() < (int)bigN
-                    && a8 > 0 && repliesF2.load() < (int)bigN;
+                return a7 > 0 && a8 > 0
+                    && (a7 - r7) > farm_capacity
+                    && (a8 - r8) > farm_capacity;
             };
             /* Progress-based bracket: the 200ms fixed snapshot assumed the
                scheduler had already begun admitting the big expansions --
