@@ -514,6 +514,7 @@ struct InternalsTarget {
     unsigned int generation;
     std::string node_name;
     uint64_t request_frame_seq;
+    bool held = false;   /* test seam: request genuinely deferred (not sent) */
     enum State { SEND_PENDING, WAITING_REPLY, REPLIED, DISCONNECTED, TIMED_OUT } state;
 };
 struct InternalsTxn {
@@ -544,6 +545,8 @@ struct InternalsSnapshot {
     unsigned marker_queued = 0;
     unsigned terminal_queued = 0;
     unsigned control_generation = 0;
+    uint64_t output_deadline = 0;
+    bool entered_output_phase = false;
     const char *reason = "";
 };
 static InternalsSnapshot internals_last;
@@ -556,9 +559,12 @@ static void internals_snapshot(const char *reason)
     internals_last.marker_queued = internals_txn.marker_queued;
     internals_last.terminal_queued = internals_txn.terminal_queued;
     internals_last.control_generation = internals_txn.control_generation;
+    internals_last.output_deadline = internals_txn.output_deadline_mono;
+    internals_last.entered_output_phase = internals_txn.final_pending;
     internals_last.reason = reason;
 }
 static uint64_t internals_deadline_msec = 10000;        // whole command
+static bool internals_hold_armed = false;               // test-only pre-delivery seam
 static unsigned long internals_output_dropped = 0;      // rows dropped by the exact bound
 static const size_t kInternalsPerTargetCap = 64 * 1024;
 static size_t kInternalsRetainedCap = 4 * 1024 * 1024;   /* test-overridable */
@@ -798,7 +804,7 @@ static void internals_txn_tick()
         }
         static const bool no_tick_promote =
             getenv("ICECC_TEST_INTERNALS_NO_TICK_PROMOTE") != nullptr;
-        if (!no_tick_promote && target->framesFlushed() >= t.request_frame_seq) {
+        if (!no_tick_promote && !t.held && target->framesFlushed() >= t.request_frame_seq) {
             /* The test knob suppresses this promotion to isolate the
                STATUS_TEXT handler's same-turn recheck as the ONLY path
                that can accept a reply -- a deterministic stand-in for the
@@ -853,6 +859,9 @@ static void prelogin_read_overrides()
         const size_t floor_bytes =
             internals_wire_len(kInternalsTerm) + internals_wire_len(kInternalsMarker);
         kInternalsControlPendingCap = (v > (long long)floor_bytes) ? (size_t)v : floor_bytes;
+    }
+    if (getenv("ICECC_TEST_INTERNALS_HOLD_FRAME")) {
+        internals_hold_armed = true;
     }
     if ((e = getenv("ICECC_TEST_INTERNALS_RETAINED_CAP"))) {
         /* Independent cumulative-cap override so the A.3 stopped-reader
@@ -3202,7 +3211,7 @@ static bool handle_line(CompileServer *cs, Msg *_m)
     } else if (cmd == "listjobs") {
         const bool verbose = !l.empty() && (l.front() == "v" || l.front() == "verbose");
         {
-            char summary[1536];
+            char summary[1792];
             snprintf(summary, sizeof(summary),
                      " detached_terminal_rejects=%lu nonwaiting_begin_rejects=%lu"
                      " dup_local_begin=%lu id_release_violations=%lu"
@@ -3216,11 +3225,12 @@ static bool handle_line(CompileServer *cs, Msg *_m)
                      " internals_marker_queued=%u internals_terminal_queued=%u"
                      " internals_sendpending=%u internals_waiting=%u internals_replied=%u"
                      " internals_t0_fd=%d internals_t0_gen=%u"
-                     " internals_control_generation=%u internals_final_pending_phase=%d"
-                     " internals_output_deadline=%llu"
+                     " internals_control_generation=%u internals_phase=%s"
+                     " internals_collection_deadline=%llu internals_output_deadline=%llu"
                      " internals_last_valid=%d internals_last_peak=%llu"
                      " internals_last_retained=%llu internals_last_marker=%u"
                      " internals_last_terminal=%u internals_last_generation=%u"
+                     " internals_last_output_deadline=%llu internals_last_entered_output_phase=%d"
                      " internals_last_reason=%s",
                      detached_terminal_rejects, nonwaiting_begin_rejects,
                      duplicate_local_begin_ignored, id_release_violations,
@@ -3243,14 +3253,16 @@ static bool handle_line(CompileServer *cs, Msg *_m)
                      internals_txn.targets.empty() ? -1 : internals_txn.targets.front().fd,
                      internals_txn.targets.empty() ? 0u : internals_txn.targets.front().generation,
                      internals_txn.control_generation,
-                     internals_txn.final_pending ? 1 : 0,
-                     (unsigned long long)(internals_txn.final_pending
-                         ? internals_txn.output_deadline_mono : internals_txn.deadline_mono),
+                     internals_txn.final_pending ? "output" : "collection",
+                     (unsigned long long)internals_txn.deadline_mono,
+                     (unsigned long long)internals_txn.output_deadline_mono,
                      internals_last.valid ? 1 : 0,
                      (unsigned long long)internals_last.peak_pending,
                      (unsigned long long)internals_last.retained_bytes,
                      internals_last.marker_queued, internals_last.terminal_queued,
                      internals_last.control_generation,
+                     (unsigned long long)internals_last.output_deadline,
+                     internals_last.entered_output_phase ? 1 : 0,
                      internals_last.reason);
             if (!cs->send_msg(TextMsg(summary))) {
                 return false;
@@ -3452,15 +3464,21 @@ static bool handle_line(CompileServer *cs, Msg *_m)
                 t.state = InternalsTarget::DISCONNECTED;
                 continue;
             }
+            if (internals_hold_armed) {
+                /* Test seam (A.2 pre-delivery): GENUINELY defer the
+                   request -- no send_msg, no queued frame.  The target is
+                   held SEND_PENDING with nothing on the wire; tick
+                   promotion and the STATUS_TEXT recheck both skip held
+                   targets, so an early reply stays unsolicited.  The gated
+                   internals-release later performs the real send.  */
+                t.held = true;
+                t.request_frame_seq = 0;
+                t.state = InternalsTarget::SEND_PENDING;
+                continue;
+            }
             if (target->send_msg(GetInternalStatus(),
                                  MsgChannel::SendNonBlocking | MsgChannel::SendDeferrable)) {
-                static const bool hold_frame =
-                    getenv("ICECC_TEST_INTERNALS_HOLD_FRAME") != nullptr;
-                /* Test seam (A.2 pre-delivery): make the request frame
-                   appear perpetually undelivered by demanding one more
-                   flushed frame than was queued, so an early reply stays
-                   unsolicited until an explicit release.  */
-                t.request_frame_seq = target->framesQueued() + (hold_frame ? 1 : 0);
+                t.request_frame_seq = target->framesQueued();
                 t.state = InternalsTarget::SEND_PENDING;
             } else {
                 t.state = InternalsTarget::DISCONNECTED;
@@ -3488,18 +3506,26 @@ static bool handle_line(CompileServer *cs, Msg *_m)
         /* No trailing 200 done here: the transaction emits it when every
            target is terminal or the whole-command deadline expires.  */
         return true;
-    } else if (cmd == "internals-release") {
-        /* Test-only (A.2): mark every held request delivered by setting its
-           recorded sequence to what has actually flushed, so a subsequent
-           reply transitions the target.  Only meaningful while the hold
-           seam is armed; harmless otherwise.  */
+    } else if (internals_hold_armed && cmd == "internals-release") {
+        /* Test-only (A.2), recognized ONLY when the hold seam was armed at
+           startup.  It performs the REAL deferred send and records the
+           actual queued frame sequence -- it never lowers the sequence to
+           the current flushed count (which would fabricate delivery).  The
+           ordinary framesFlushed() >= request_frame_seq rule then drives
+           the transition once the real frame flushes.  */
         if (internals_txn.active) {
             for (InternalsTarget &t : internals_txn.targets) {
-                if (t.state == InternalsTarget::SEND_PENDING) {
-                    CompileServer *tgt = internals_resolve(t.fd, t.generation);
-                    if (tgt) {
-                        t.request_frame_seq = tgt->framesFlushed();
-                    }
+                if (!t.held) {
+                    continue;
+                }
+                CompileServer *tgt = internals_resolve(t.fd, t.generation);
+                if (tgt && tgt->send_msg(GetInternalStatus(),
+                                         MsgChannel::SendNonBlocking | MsgChannel::SendDeferrable)) {
+                    t.request_frame_seq = tgt->framesQueued();
+                    t.held = false;
+                } else {
+                    t.held = false;
+                    t.state = InternalsTarget::DISCONNECTED;
                 }
             }
         }
@@ -3803,6 +3829,7 @@ static bool handle_activity(CompileServer *cs)
                    rather than mis-classified as unsolicited and timed out.  */
                 if (t.state == InternalsTarget::WAITING_REPLY
                         || (t.state == InternalsTarget::SEND_PENDING
+                            && !t.held
                             && cs->framesFlushed() >= t.request_frame_seq)) {
                     t.state = InternalsTarget::WAITING_REPLY;
                     hit = &t;
