@@ -186,6 +186,11 @@ int handle_connection(const string &basedir, CompileJob *job,
     assert(pid >= 0);
 
     if (pid > 0) {  // parent
+        /* The compile child leads its own process group (set on both
+           sides to close the race) so session teardown can terminate the
+           whole compile subtree -- the child forks the real compiler, and
+           killing only the direct child would strand it.  */
+        setpgid(pid, pid);
         if ((-1 == close(socket[1])) && (errno != EBADF)){
             log_perror("close failure");
         }
@@ -193,6 +198,8 @@ int handle_connection(const string &basedir, CompileJob *job,
         fcntl(out_fd, F_SETFD, FD_CLOEXEC);
         return pid;
     }
+
+    setpgid(0, 0);
 
     /* Close every descriptor this long-lived compile worker does not need.
        FD_CLOEXEC only takes effect at exec(), and this child runs for the

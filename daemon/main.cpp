@@ -4103,6 +4103,10 @@ static unsigned long usecs_delivery_attempts = 0;
 static unsigned long usecs_frames_committed = 0;
 static unsigned long usecs_exact_aborts = 0;
 static unsigned long duplicate_settlements_rejected = 0;
+/* Exact-quiescence observability (issue #4 P0-C).  */
+static unsigned long fsession_compilers_quiesced = 0;
+static unsigned long fsession_kill_escalations = 0;
+static unsigned long fsession_unowned_residue = 0;
 
 string Daemon::dump_internals() const
 {
@@ -4117,6 +4121,11 @@ string Daemon::dump_internals() const
                  "  UseCS handoff: attempts=%lu committed=%lu exact_aborts=%lu dup_settlements_rejected=%lu\n",
                  usecs_delivery_attempts, usecs_frames_committed,
                  usecs_exact_aborts, duplicate_settlements_rejected);
+        result += handoff;
+        snprintf(handoff, sizeof(handoff),
+                 "  Session quiescence: compilers_quiesced=%lu kill_escalations=%lu unowned_residue=%lu\n",
+                 fsession_compilers_quiesced, fsession_kill_escalations,
+                 fsession_unowned_residue);
         result += handoff;
     }
 
@@ -5775,18 +5784,77 @@ void Daemon::handle_end(Client *client, int exitcode)
 
 void Daemon::clear_children()
 {
+    /* EXACT child quiescence (issue #4 P0-C).  Snapshot the compiler pids
+       BEFORE the Client objects vanish: the barrier below must observe
+       THESE pids terminal -- never waitpid(-1), which consumes whichever
+       child is waitable first (e.g. an exited state writer) and can
+       return while a compiler still occupies the slot; the daemon then
+       reconnected and advertised capacity a live compiler was using.
+       Environment children are not snapshotted: handle_end() ->
+       finish_transfer_env(cancel) already kills and waits THOSE exact
+       pids and keeps their accounting independent.  */
+    std::vector<pid_t> compilers;
+    for (Clients::const_iterator it = clients.begin(); it != clients.end(); ++it) {
+        Client *cl = it->second;
+        if (cl->status == Client::WAITFORCHILD && cl->child_pid > 0) {
+            compilers.push_back(cl->child_pid);
+        }
+    }
+
     while (!clients.empty()) {
         Client *cl = clients.first();
         handle_end(cl, 116);
     }
 
-    while (current_kids > 0) {
+    /* Terminate each exact compile subtree (the child leads its own
+       process group) and observe it terminal, with bounded escalation to
+       SIGKILL so a wedged compiler cannot hang the daemon.  Capacity is
+       released per OBSERVED terminal child, and reconnection (the caller
+       resumes only after this returns) therefore cannot advertise slots
+       an old-session compiler still holds.  */
+    for (const pid_t pid : compilers) {
+        kill(-pid, SIGTERM);
+        kill(pid, SIGTERM);
         int status;
-        pid_t child;
+        bool reaped = false;
+        const uint64_t t0 = monotonic_msec();
+        for (;;) {
+            const pid_t r = waitpid(pid, &status, WNOHANG);
+            if (r == pid || (r < 0 && errno == ECHILD)) {
+                reaped = true;
+                break;
+            }
+            if (r < 0 && errno != EINTR) {
+                log_error() << "clear_children: waitpid(" << pid << "): "
+                            << strerror(errno) << endl;
+                break;
+            }
+            if (monotonic_msec() - t0 > 5000) {
+                trace() << "clear_children: escalating to SIGKILL for pgroup "
+                        << pid << endl;
+                ++fsession_kill_escalations;
+                kill(-pid, SIGKILL);
+                kill(pid, SIGKILL);
+                while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+                reaped = true;
+                break;
+            }
+            usleep(50 * 1000);
+        }
+        if (reaped && current_kids > 0) {
+            current_kids--;
+            ++fsession_compilers_quiesced;
+        }
+    }
 
-        while ((child = waitpid(-1, &status, 0)) < 0 && errno == EINTR) {}
-
-        current_kids--;
+    if (current_kids != 0) {
+        /* Every counted child must have been owned by a Client; a nonzero
+           residue is an accounting defect, not a reason to consume an
+           arbitrary child.  Reset loudly.  */
+        log_error() << "clear_children: " << current_kids
+                    << " counted children had no owning client; resetting" << endl;
+        fsession_unowned_residue += current_kids;
+        current_kids = 0;
     }
 
     // they should be all in clients too
