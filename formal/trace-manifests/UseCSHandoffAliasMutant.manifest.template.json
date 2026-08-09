@@ -1,0 +1,70 @@
+{
+  "schema": 1,
+  "scenario": "UseCSHandoffAliasMutant",
+  "property": "NoLocalAliasSettlement",
+  "expected_result": "counterexample",
+  "min_states": 4,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "BeginForwardWithoutPersistedExactId",
+      "all": [
+        {"path": "phase", "from": "Idle", "to": "Forwarding"},
+        {"path": "exactIdKnown", "from": false, "to": false},
+        {"path": "bytesWritten", "to": 0}
+      ]
+    },
+    {
+      "name": "FailBeforeExactIdSnapshot",
+      "all": [
+        {"path": "phase", "from": "Forwarding", "to": "ExactAbortPending"},
+        {"path": "failureObservedAt", "from": "NO_FAILURE", "to": 0},
+        {"path": "exactIdKnown", "to": false}
+      ]
+    },
+    {
+      "name": "QueueLocalAliasAbort",
+      "all": [
+        {"path": "localAliasUsed", "from": false, "to": true},
+        {"path": "abortQueued", "from": false, "to": true},
+        {"path": "exactIdKnown", "to": false},
+        {"path": "phase", "to": "ExactAbortPending"}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "BeginForwardWithoutPersistedExactId",
+    "FailBeforeExactIdSnapshot",
+    "QueueLocalAliasAbort"
+  ],
+  "final_all": [
+    {"path": "localAliasUsed", "eq": true},
+    {"path": "abortQueued", "eq": true},
+    {"path": "exactIdKnown", "eq": false}
+  ],
+  "harness_steps": [
+    {
+      "after": "BeginForwardWithoutPersistedExactId",
+      "emit": "delay_exact_assignment_snapshot_until_after_client_write",
+      "actor": "submitter-daemon"
+    },
+    {
+      "after": "FailBeforeExactIdSnapshot",
+      "emit": "fail_usecs_before_first_byte",
+      "actor": "client-channel"
+    },
+    {
+      "after": "QueueLocalAliasAbort",
+      "emit": "assert_local_client_id_was_used_for_scheduler_settlement",
+      "actor": "scheduler-channel"
+    }
+  ],
+  "metadata": {
+    "module": "UseCSHandoff",
+    "config": "UseCSHandoffAliasMutant.cfg",
+    "mutants": [
+      "MutantStoreIdAfterWrite = TRUE",
+      "MutantUseLocalAliasOnFailure = TRUE"
+    ]
+  }
+}
