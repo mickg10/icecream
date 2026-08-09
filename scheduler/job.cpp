@@ -51,6 +51,7 @@ Job::Job(const unsigned int _id, CompileServer *subm)
     m_enqueueMonoMsec = icecream_monotonic_msec();
     m_stateChangeTime = now;
     m_submitter->submittedJobsIncrement();
+    m_submitterName = m_submitter->nodeName();
 }
 
 Job::~Job()
@@ -58,7 +59,23 @@ Job::~Job()
     // XXX is this really deleted on all other paths?
     /*    fd2chan.erase (channel->fd);
         delete channel;*/
+    /* The live-job count is discharged exactly once: normally here, or in
+       detachSubmitter() when the submitter disconnected while this job was
+       still compiling -- the job then outlives its submitter, and this
+       destructor must not touch the dead pointer.  */
+    if (!m_submitterDetached) {
+        m_submitter->submittedJobsDecrement();
+    }
+}
+
+void Job::detachSubmitter()
+{
+    if (m_submitterDetached) {
+        return;
+    }
     m_submitter->submittedJobsDecrement();
+    m_submitter = nullptr;
+    m_submitterDetached = true;
 }
 
 unsigned int Job::id() const

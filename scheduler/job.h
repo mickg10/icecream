@@ -90,6 +90,15 @@ public:
 
     CompileServer *submitter() const;
     void setSubmitter(CompileServer *submitter);
+    /* Sever the submitter WITHOUT breaking the lifetime contract: the
+       live-job accounting this job holds on its submitter is discharged
+       exactly once, HERE, and the destructor knows it no longer owns it.
+       Used when a submitting daemon disconnects while this job is still
+       COMPILING on a live worker -- the job outlives its submitter.  The
+       node name is snapshotted for logs/diagnostics.  */
+    void detachSubmitter();
+    bool submitterDetached() const { return m_submitterDetached; }
+    const std::string &submitterName() const { return m_submitterName; }
 
     Environments environments() const;
     void setEnvironments(const Environments &environments);
@@ -140,7 +149,9 @@ private:
     unsigned int m_localClientId;
     State m_state;
     CompileServer *m_server;  // on which server we build
-    CompileServer *m_submitter;  // who submitted us
+    CompileServer *m_submitter;
+    bool m_submitterDetached = false;
+    std::string m_submitterName;  // who submitted us
     Environments m_environments;
     time_t m_startTime;  // _local_ to the compiler server
     time_t m_startOnScheduler;  // starttime local to scheduler

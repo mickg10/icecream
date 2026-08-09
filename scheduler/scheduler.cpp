@@ -412,12 +412,19 @@ static void add_job_stats(Job *job, JobDoneMsg *msg)
         job->server()->popCompiledJob();
     }
 
-    job->submitter()->appendRequestedJobs(st);
-    job->submitter()->setCumRequested(job->submitter()->cumRequested() + st);
+    /* The submitter can be gone when the worker reports: a client daemon
+       that disconnected mid-compile has its submitter pointer detached
+       (handle_end retains the started job for the worker to finish), so
+       there is nothing to attribute the request stats to.  The worker-side
+       stats above are what scheduling needs.  */
+    if (job->submitter()) {
+        job->submitter()->appendRequestedJobs(st);
+        job->submitter()->setCumRequested(job->submitter()->cumRequested() + st);
 
-    if (job->submitter()->lastRequestedJobs().size() > 200) {
-        job->submitter()->setCumRequested(job->submitter()->cumRequested() - *job->submitter()->lastRequestedJobs().begin());
-        job->submitter()->popRequestedJobs();
+        if (job->submitter()->lastRequestedJobs().size() > 200) {
+            job->submitter()->setCumRequested(job->submitter()->cumRequested() - *job->submitter()->lastRequestedJobs().begin());
+            job->submitter()->popRequestedJobs();
+        }
     }
 
     all_job_stats.push_back(st);
@@ -786,7 +793,7 @@ static void debit_dispatch_credit(Job *job)
 
 static void credit_dispatch_credit(Job *job)
 {
-    if (job && job->dispatchOutstanding()) {
+    if (job && job->dispatchOutstanding() && job->submitter()) {
         job->setDispatchOutstanding(false);
         if (!job->submitter()->removeOutstandingDispatch(job->dispatchDebitMsec())) {
             log_error() << "dispatch-credit invariant failure: job " << job->id()
@@ -2108,7 +2115,8 @@ static bool handle_job_begin(CompileServer *cs, Msg *_m)
     job->setStartOnScheduler(time(nullptr));
     notify_monitors(new MonJobBeginMsg(m->job_id, m->stime, cs->hostId()));
 #if DEBUG_SCHEDULER >= 0
-    trace() << "BEGIN: " << m->job_id << " client=" << job->submitter()->nodeName()
+    trace() << "BEGIN: " << m->job_id << " client="
+            << (job->submitter() ? job->submitter()->nodeName() : job->submitterName() + "<detached>")
             << "(" << job->targetPlatform() << ")" << " server="
             << job->server()->nodeName() << "(" << job->server()->hostPlatform()
             << ")" << endl;
@@ -2247,9 +2255,11 @@ static bool handle_job_done(CompileServer *cs, Msg *_m)
         return false;
     }
 
-    if (!m->is_from_server() && (j->submitter() != cs)) {
+    if (!m->is_from_server() && j->submitter() && (j->submitter() != cs)) {
         log_info() << "the submitter isn't the same for job " << m->job_id << endl;
-        log_info() << "submitter: " << j->submitter()->nodeName() << endl;
+        log_info() << "submitter: "
+                   << (j->submitter() ? j->submitter()->nodeName()
+                                      : j->submitterName() + "<detached>") << endl;
         log_info() << "msg came from: " << cs->nodeName() << endl;
         // the daemon is not following matz's rules: kick him
         handle_end(cs, nullptr);
@@ -2771,6 +2781,34 @@ static bool handle_end(CompileServer *toremove, Msg *m)
             Job *job = mit->second;
 
             if (job->server() == toremove || job->submitter() == toremove) {
+                /* A job already COMPILING on a DIFFERENT, live worker when
+                   its submitter disconnects must NOT be deleted here: the
+                   worker is physically running the compiler and its real
+                   JobDone is still coming.  Deleting it frees the worker's
+                   slot while the compile runs on (S could overcommit that
+                   worker) and strands the eventual JobDone as an unknown
+                   id.  Detach the dead submitter and retain the job --
+                   add_job_stats and the FROM_SERVER JobDone path tolerate a
+                   null submitter -- so the worker's completion reconciles
+                   it exactly once.  (A dispatched-but-NOT-started job is a
+                   separate case a future worker-side cancel exchange will
+                   cover; for now it is left to the worker's own input-wait
+                   timeout.)  */
+                if (job->submitter() == toremove
+                        && job->server() && job->server() != toremove
+                        && job->state() == Job::COMPILING) {
+                    /* COMPILING means JobBegin already credited the
+                       dispatch debit; a retained job must never carry one
+                       into detached life, where nothing could return it.  */
+                    assert(!job->dispatchOutstanding());
+                    trace() << "submitter gone but job " << job->id()
+                            << " is COMPILING on " << job->server()->nodeName()
+                            << "; retaining until the worker completes it" << endl;
+                    job->detachSubmitter();
+                    ++mit;
+                    continue;
+                }
+
                 trace() << "STOP (DAEMON2) FOR " << mit->first << endl;
                 notify_monitors(new MonJobDoneMsg(JobDoneMsg(job->id(),  255)));
 
@@ -3390,12 +3428,18 @@ int main(int argc, char *argv[])
         pollfds.reserve( fd2cs.size() + css.size() + 5 );
         pollfd pfd; // tmp variable
 
-        if (time(nullptr) >= next_listen) {
-            pfd.fd = listen_fd;
-            pfd.events = POLLIN;
-            pollfds.push_back( pfd );
+        /* The control (text) listener is polled CONTINUOUSLY; only the
+           daemon listener is throttled to one accept per second.  Gating
+           text_fd behind next_listen made rapid control connections (the
+           test gates poll listcs/listjobs) unacceptable during the re-arm
+           interval, and nothing woke poll to re-arm on time.  */
+        pfd.fd = text_fd;
+        pfd.events = POLLIN;
+        pollfds.push_back( pfd );
 
-            pfd.fd = text_fd;
+        const bool daemon_listener_armed = time(nullptr) >= next_listen;
+        if (daemon_listener_armed) {
+            pfd.fd = listen_fd;
             pfd.events = POLLIN;
             pollfds.push_back( pfd );
         }
@@ -3478,6 +3522,13 @@ int main(int argc, char *argv[])
         const bool service_buffered = has_buffered_inbound;
         has_buffered_inbound = false;   // the post-poll reads below re-arm it
 
+        if (!daemon_listener_armed) {
+            const time_t remaining = next_listen - time(nullptr);
+            const time_t secs = remaining > 0 ? remaining : 0;
+            if (timeout < 0 || secs < timeout) {
+                timeout = secs;
+            }
+        }
         int active_fds = poll(pollfds.data(), pollfds.size(), timeout * 1000);
         int poll_errno = errno;
 
