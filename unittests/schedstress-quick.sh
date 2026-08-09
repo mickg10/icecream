@@ -52,6 +52,11 @@
 # Run 9 -- internalsuaf: the bounded-async internals fan-out finalizes over
 # a target whose CompileServer was freed mid-transaction without a
 # use-after-free (issue #4 correction A.1; ASan red/green).
+#
+# Run 10 -- duplocal: a duplicate local-job Begin is idempotent (one
+# allocation, one monitor Begin, one terminal) and a duplicate/unknown
+# local Done never emits a terminal for global id 0 (issue #4 correction
+# B.2a; red/green).
 dir=$(dirname "$0")
 "$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 promotion 1 || exit 1
 "$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 heterogeneous 1 || exit 1
@@ -59,6 +64,7 @@ dir=$(dirname "$0")
 "$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 clientstall || exit 1
 "$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 teardown || exit 1
 "$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 internalsuaf || exit 1
+"$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 duplocal || exit 1
 "$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 retention || exit 1
 "$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 noreader || exit 1
 exec "$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 leastbusy 2

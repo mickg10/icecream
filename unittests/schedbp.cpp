@@ -596,6 +596,12 @@ int main(int argc, char **argv)
        under ASan proves the value-record fix; the pointer-keyed variant
        is the red control.  */
     const bool internalsuaf_mode = argc > 5 && strcmp(argv[5], "internalsuaf") == 0;
+    /* "duplocal": a duplicate local-job Begin for a client-local id that is
+       already mapped must be an idempotent no-op -- one allocation, one
+       monitor Begin, one terminal -- and a duplicate/unknown local Done
+       must not emit a terminal for global id 0.  Correction B.2a; the
+       oracle noted B had no discriminating trace.  */
+    const bool duplocal_mode = argc > 5 && strcmp(argv[5], "duplocal") == 0;
     /* "retention": the proof that Stage-A retention is CORRECT, not merely
        non-destructive.  A quiet-but-healthy daemon crossing the report
        threshold, a sibling legitimately running across it, dispatch
@@ -1046,7 +1052,8 @@ int main(int argc, char **argv)
            holding 0-1 slots at random moments would make them flake.  The
            connection stays (the scheduler keeps a second submitter), the
            traffic parks.  */
-        if (leastbusy_mode || retention_mode || teardown_mode || internalsuaf_mode) {
+        if (leastbusy_mode || retention_mode || teardown_mode || internalsuaf_mode
+                || duplocal_mode) {
             while (!shutdown) {
                 usleep(100 * 1000);
             }
@@ -3238,6 +3245,90 @@ int main(int argc, char **argv)
         delete sub; delete sub2; delete cs;
         kill(sched, SIGTERM);
         waitpid(sched, nullptr, 0);
+        if (failures) { fprintf(stderr, "RESULT: FAIL (%d)\n", failures); return 1; }
+        fprintf(stderr, "RESULT: PASS\n");
+        return 0;
+    }
+
+    if (duplocal_mode) {
+        /* A logged-in daemon (host running local jobs) and a monitor.  */
+        MsgChannel *dl = connect_daemon(port, 0);
+        REQUIRE(dl != nullptr, "duplocal daemon connected");
+        if (dl) {
+            LoginMsg login(10270, "fdup", kPlatform, 0);
+            login.envs.push_back(std::make_pair(kPlatform, kEnv));
+            login.max_kids = 4;
+            REQUIRE(dl->send_msg(login), "duplocal daemon logged in");
+            StatsMsg st; dl->send_msg(st);
+        }
+        MsgChannel *mon = connect_daemon(port, 0);
+        REQUIRE(mon != nullptr, "monitor connected");
+        if (mon) { mon->send_msg(MonLoginMsg()); }
+        usleep(400 * 1000);
+
+        /* The ruled trace: Begin(k), Begin(k), Done(k), Done(k) for one
+           client-local id.  */
+        const int k = 4242;
+        REQUIRE(dl->send_msg(JobLocalBeginMsg(k, "duplocal.cpp", true)),
+                "first local Begin sent");
+        usleep(150 * 1000);
+        REQUIRE(dl->send_msg(JobLocalBeginMsg(k, "duplocal.cpp", true)),
+                "duplicate local Begin sent");
+        usleep(150 * 1000);
+        REQUIRE(dl->send_msg(JobLocalDoneMsg(k)), "first local Done sent");
+        usleep(150 * 1000);
+        REQUIRE(dl->send_msg(JobLocalDoneMsg(k)), "duplicate local Done sent");
+        usleep(400 * 1000);
+
+        /* Count the monitor's local-job events.  */
+        int begins = 0, dones = 0, done_id_zero = 0;
+        unsigned begin_global = 0;
+        {
+            const Clock::time_point t0 = Clock::now();
+            while (secs_since(t0) < 3) {
+                Msg *m = mon->get_msg(1);
+                if (!m) { continue; }
+                if (MSG_IS(m, MON_LOCAL_JOB_BEGIN)) {
+                    MonLocalJobBeginMsg *b2 = dynamic_cast<MonLocalJobBeginMsg *>(m);
+                    if (b2) { ++begins; begin_global = b2->job_id; }
+                } else if (MSG_IS(m, JOB_LOCAL_DONE)) {
+                    JobLocalDoneMsg *d = dynamic_cast<JobLocalDoneMsg *>(m);
+                    if (d) { ++dones; if (d->job_id == 0) { ++done_id_zero; } }
+                }
+                delete m;
+            }
+        }
+        REQUIRE(begins == 1,
+                "the duplicate local Begin allocated nothing and emitted no"
+                " second monitor Begin (idempotent)");
+        REQUIRE(dones == 1,
+                "exactly one local terminal fired");
+        REQUIRE(done_id_zero == 0,
+                "no local terminal was emitted for global id 0 (the old"
+                " operator[] default-insert bug)");
+        REQUIRE(begin_global != 0 && dones == 1,
+                "the terminal named the real global id, not 0");
+        /* The scheduler's own duplicate counter must show exactly one.  */
+        {
+            long long dup = -1;
+            const Clock::time_point t0 = Clock::now();
+            while (dup < 1 && secs_since(t0) < 8) {
+                dup = query_control_field(port, "listjobs", "dup_local_begin=", "dup_local_begin=");
+                if (dup < 1) { usleep(200 * 1000); }
+            }
+            REQUIRE(dup == 1, "the scheduler counted exactly one duplicate local Begin");
+        }
+        REQUIRE(waitpid(sched, nullptr, WNOHANG) == 0, "scheduler alive");
+        REQUIRE(!probe_died.load(), "control probe never lost the scheduler");
+
+        shutdown = true;
+        probe_thread.join(); cs_thread.join(); healthy_thread.join();
+        close(ctrl);
+        delete dl; delete mon; delete sub; delete sub2; delete cs;
+        kill(sched, SIGTERM);
+        int st = -1;
+        REQUIRE(waitpid(sched, &st, 0) == sched, "scheduler reaped");
+        REQUIRE(WIFEXITED(st) && WEXITSTATUS(st) == 0, "clean shutdown");
         if (failures) { fprintf(stderr, "RESULT: FAIL (%d)\n", failures); return 1; }
         fprintf(stderr, "RESULT: PASS\n");
         return 0;
