@@ -1,0 +1,1 @@
+scheduler: keep successful relogins in the drain loop
