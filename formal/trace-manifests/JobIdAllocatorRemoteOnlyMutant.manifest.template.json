@@ -1,0 +1,53 @@
+{
+  "schema": 1,
+  "scenario": "JobIdAllocatorRemoteOnlyMutant",
+  "property": "GlobalLiveUniqueness",
+  "expected_result": "counterexample",
+  "min_states": 3,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "FirstOwnerAllocatedIdOne",
+      "all": [
+        {"path": "issuedTotal", "from": 0, "to": 1},
+        {"path": "allocated", "from_len": 0, "to_len": 1}
+      ]
+    },
+    {
+      "name": "SecondNamespaceReusesLiveIdOne",
+      "all": [
+        {"path": "issuedTotal", "from": 1, "to": 2},
+        {"path": "allocated", "from_len": 1, "to_len": 1},
+        {"path": "ownerPhase", "changed": true},
+        {"path": "ownerId", "changed": true}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "FirstOwnerAllocatedIdOne",
+    "SecondNamespaceReusesLiveIdOne"
+  ],
+  "final_all": [
+    {"path": "issuedTotal", "eq": 2},
+    {"path": "allocated", "to_len": 1},
+    {"path": "releasedTotal", "eq": 0}
+  ],
+  "harness_steps": [
+    {
+      "after": "FirstOwnerAllocatedIdOne",
+      "emit": "hold_live_local_monitor_id",
+      "actor": "scheduler"
+    },
+    {
+      "after": "SecondNamespaceReusesLiveIdOne",
+      "emit": "assert_remote_job_received_same_live_global_id",
+      "actor": "scheduler"
+    }
+  ],
+  "metadata": {
+    "module": "JobIdAllocator",
+    "config": "JobIdAllocatorRemoteOnlyMutant.cfg",
+    "mutant": "MutantCheckRemoteOnly = TRUE",
+    "domain": "MaxId = 1"
+  }
+}
