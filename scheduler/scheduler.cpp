@@ -59,6 +59,7 @@
 #include "config.h"
 
 #include "compileserver.h"
+#include "relogin.h"
 #include "selection.h"
 #include "siblingpin.h"
 #include "job.h"
@@ -2039,8 +2040,6 @@ static bool handle_relogin(MsgChannel *mc, Msg *_m)
     }
 
     CompileServer *cs = static_cast<CompileServer *>(mc);
-    cs->setCompilerVersions(m->envs);
-    cs->setBusyInstalling(0);
 
     std::ostream &dbg = trace();
     dbg << "RELOGIN " << cs->nodeName() << "(" << cs->hostPlatform() << "): [";
@@ -2051,12 +2050,7 @@ static bool handle_relogin(MsgChannel *mc, Msg *_m)
 
     dbg << "]" << endl;
 
-    /* Configure the daemon */
-    if (IS_PROTOCOL_VERSION(24, cs)) {
-        cs->send_msg(ConfCSMsg());
-    }
-
-    return false;
+    return apply_relogin(cs, *m) == ReloginResult::KeepConnection;
 }
 
 static bool handle_mon_login(CompileServer *cs, Msg *_m)
