@@ -64,7 +64,7 @@ class BackendProbeTests(unittest.TestCase):
         return path
 
     def write_ls4_elf(self, *, include_marker: bool = True) -> tuple[Path, str]:
-        build_id = "4be712aa86094ac6fa52cf659407485a31cbfbd7b"
+        build_id = "4be712aa86094ac6fa52cf659407485a31cbfbd7"
         descriptor = bytes.fromhex(build_id)
         note = struct.pack("<III", 4, len(descriptor), 3)
         note += b"GNU\0"
