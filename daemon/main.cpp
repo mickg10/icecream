@@ -4108,6 +4108,129 @@ static unsigned long fsession_compilers_quiesced = 0;
 static unsigned long fsession_kill_escalations = 0;
 static unsigned long fsession_unowned_residue = 0;
 
+/* Persistent exact child ownership (issue #4 correction D).  Every child
+   the daemon forks is registered by pid with its process group, kind,
+   the scheduler-session generation it belongs to, and its owning client;
+   ordinary zombie reaping dispatches BY REGISTERED PID, and the
+   session-loss barrier operates on exact records rather than a scalar.
+   Failure to establish or verify ownership FAILS CLOSED: the daemon does
+   not reconnect or advertise capacity while any old-generation compiler
+   record remains.  */
+struct ChildRecord {
+    pid_t pid;
+    pid_t pgid;
+    enum Kind { COMPILER, ENV_INSTALL, STATE_WRITER, OTHER } kind;
+    uint64_t session_generation;
+    unsigned int owning_client_id;
+    enum State { RUNNING, TERM_SENT, KILL_SENT, REAPED } state;
+};
+static std::map<pid_t, ChildRecord> child_registry;
+static uint64_t scheduler_session_generation = 0;
+static bool child_ownership_failed = false;
+
+static void register_child(pid_t pid, pid_t pgid, ChildRecord::Kind kind,
+                           unsigned int owning_client_id)
+{
+    ChildRecord rec;
+    rec.pid = pid;
+    rec.pgid = pgid;
+    rec.kind = kind;
+    rec.session_generation = scheduler_session_generation;
+    rec.owning_client_id = owning_client_id;
+    rec.state = ChildRecord::RUNNING;
+    child_registry[pid] = rec;
+}
+
+static void unregister_child(pid_t pid)
+{
+    child_registry.erase(pid);
+}
+
+/* The exact quiescence barrier for one lost scheduler session:
+   1. SIGTERM to ALL old-generation compiler groups first;
+   2. wait the exact leader pids CONCURRENTLY under ONE whole-session
+      grace deadline;
+   3. escalate ALL remaining groups once, under ONE kill deadline;
+   4. ECHILD proves quiescence only when kill(-pgid, 0) says the GROUP is
+      gone (ESRCH);
+   5. any residue fails CLOSED (child_ownership_failed blocks reconnect)
+      and the exact records stay exposed in dump_internals.  */
+static bool quiesce_session_compilers(uint64_t generation,
+                                      unsigned int *quiesced_out)
+{
+    unsigned int quiesced_now = 0;
+    std::vector<pid_t> pending;
+    for (std::map<pid_t, ChildRecord>::iterator it = child_registry.begin();
+            it != child_registry.end(); ++it) {
+        ChildRecord &rec = it->second;
+        if (rec.kind == ChildRecord::COMPILER
+                && rec.session_generation <= generation
+                && rec.state != ChildRecord::REAPED) {
+            kill(-rec.pgid, SIGTERM);
+            kill(rec.pid, SIGTERM);
+            rec.state = ChildRecord::TERM_SENT;
+            pending.push_back(rec.pid);
+        }
+    }
+    auto group_gone = [](const ChildRecord &rec) {
+        return kill(-rec.pgid, 0) < 0 && errno == ESRCH;
+    };
+    auto wait_round = [&](uint64_t deadline_ms) {
+        const uint64_t t0 = monotonic_msec();
+        while (!pending.empty() && monotonic_msec() - t0 < deadline_ms) {
+            for (std::vector<pid_t>::iterator pit = pending.begin();
+                    pit != pending.end();) {
+                ChildRecord &rec = child_registry[*pit];
+                int status;
+                const pid_t r = waitpid(*pit, &status, WNOHANG);
+                bool done = false;
+                if (r == *pit) {
+                    done = group_gone(rec);
+                } else if (r < 0 && errno == ECHILD) {
+                    /* already reaped elsewhere: only the GROUP's absence
+                       proves quiescence */
+                    done = group_gone(rec);
+                }
+                if (done) {
+                    rec.state = ChildRecord::REAPED;
+                    ++fsession_compilers_quiesced;
+                    ++quiesced_now;
+                    child_registry.erase(*pit);
+                    pit = pending.erase(pit);
+                } else {
+                    ++pit;
+                }
+            }
+            if (!pending.empty()) {
+                usleep(50 * 1000);
+            }
+        }
+    };
+    wait_round(5000);   /* ONE whole-session grace deadline */
+    if (!pending.empty()) {
+        for (const pid_t pid : pending) {
+            ChildRecord &rec = child_registry[pid];
+            ++fsession_kill_escalations;
+            kill(-rec.pgid, SIGKILL);
+            kill(rec.pid, SIGKILL);
+            rec.state = ChildRecord::KILL_SENT;
+        }
+        wait_round(5000);   /* ONE whole-session kill deadline */
+    }
+    if (quiesced_out) {
+        *quiesced_out = quiesced_now;
+    }
+    if (!pending.empty()) {
+        log_error() << "session quiescence FAILED: " << pending.size()
+                    << " compiler group(s) survive SIGKILL; failing closed"
+                    << " (no reconnect, no capacity)" << endl;
+        child_ownership_failed = true;
+        return false;
+    }
+    child_ownership_failed = false;
+    return true;
+}
+
 string Daemon::dump_internals() const
 {
     string result;
@@ -4123,10 +4246,21 @@ string Daemon::dump_internals() const
                  usecs_exact_aborts, duplicate_settlements_rejected);
         result += handoff;
         snprintf(handoff, sizeof(handoff),
-                 "  Session quiescence: compilers_quiesced=%lu kill_escalations=%lu unowned_residue=%lu\n",
+                 "  Session quiescence: compilers_quiesced=%lu kill_escalations=%lu unowned_residue=%lu ownership_failed=%d gen=%llu\n",
                  fsession_compilers_quiesced, fsession_kill_escalations,
-                 fsession_unowned_residue);
+                 fsession_unowned_residue, child_ownership_failed ? 1 : 0,
+                 (unsigned long long)scheduler_session_generation);
         result += handoff;
+        for (std::map<pid_t, ChildRecord>::const_iterator cit = child_registry.begin();
+                cit != child_registry.end(); ++cit) {
+            snprintf(handoff, sizeof(handoff),
+                     "  Child: pid=%d pgid=%d kind=%d gen=%llu client=%u state=%d\n",
+                     (int)cit->second.pid, (int)cit->second.pgid,
+                     (int)cit->second.kind,
+                     (unsigned long long)cit->second.session_generation,
+                     cit->second.owning_client_id, (int)cit->second.state);
+            result += handoff;
+        }
     }
 
     struct StatusAgg {
@@ -4926,6 +5060,8 @@ bool Daemon::handle_transfer_env(Client *client, EnvTransferMsg *emsg)
     client->set_status(Client::TOINSTALL, "handle_transfer_env: receiving environment");
     client->env_bytes_received = 0;
     client->outfile = target + "/" + emsg->name;
+    register_child(pid, getpgid(pid) > 0 ? getpgid(pid) : pid,
+                   ChildRecord::ENV_INSTALL, client->client_id);
     current_kids++;
 
     trace() << "PID of child thread running untaring environment: " << pid << endl;
@@ -5024,6 +5160,7 @@ bool Daemon::handle_env_install_child_done(Client *client)
     }
     log_info() << "handle_env_install_child_done PID " << client->child_pid << " for " << client->outfile
         << " status: " << ( success ? "success" : "failed" ) << endl;
+    unregister_child(client->child_pid);
     client->child_pid = -1;
     assert(current_kids > 0);
     current_kids--;
@@ -5067,6 +5204,7 @@ bool Daemon::finish_transfer_env(Client *client, bool cancel)
         trace() << "finish_transfer_env kill and waiting for child PID " << client->child_pid <<endl;
         while (waitpid(client->child_pid, &status, 0) < 0 && errno == EINTR)
             ;
+        unregister_child(client->child_pid);
         client->child_pid = -1;
         assert(current_kids > 0);
         current_kids--;
@@ -5528,6 +5666,24 @@ void Daemon::handle_old_request()
             trace() << "handle connection returned " << pid << endl;
 
             if (pid > 0) {
+                /* Ownership is verified and registered BEFORE the client
+                   is exposed as WAITFORCHILD.  The compile worker must
+                   lead its own process group (set on both fork sides);
+                   if neither side won the race, the subtree cannot be
+                   targeted for exact termination -- an explicit fatal
+                   ownership error, not a silent degradation.  */
+                if (getpgid(pid) != pid && setpgid(pid, pid) != 0
+                        && getpgid(pid) != pid) {
+                    log_error() << "cannot establish process group for"
+                                << " compile child " << pid
+                                << ": fatal child-ownership error" << endl;
+                    kill(pid, SIGKILL);
+                    while (waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {}
+                    handle_end(client, 144);
+                    continue;
+                }
+                register_child(pid, pid, ChildRecord::COMPILER,
+                               client->client_id);
                 current_kids++;
                 client->set_status(Client::WAITFORCHILD, "handle_old_request: compiling locally (child running)");
                 client->pipe_from_child = sock;
@@ -5555,6 +5711,7 @@ bool Daemon::handle_compile_done(Client *client)
 
     JobDoneMsg *msg = new JobDoneMsg(client->job->jobID(), -1, JobDoneMsg::FROM_SERVER, clients.size());
     assert(msg);
+    unregister_child(client->child_pid);
     assert(current_kids > 0);
     current_kids--;
 
@@ -5768,77 +5925,41 @@ void Daemon::handle_end(Client *client, int exitcode)
 
 void Daemon::clear_children()
 {
-    /* EXACT child quiescence (issue #4 P0-C).  Snapshot the compiler pids
-       BEFORE the Client objects vanish: the barrier below must observe
-       THESE pids terminal -- never waitpid(-1), which consumes whichever
-       child is waitable first (e.g. an exited state writer) and can
-       return while a compiler still occupies the slot; the daemon then
-       reconnected and advertised capacity a live compiler was using.
-       Environment children are not snapshotted: handle_end() ->
-       finish_transfer_env(cancel) already kills and waits THOSE exact
-       pids and keeps their accounting independent.  */
-    std::vector<pid_t> compilers;
-    for (Clients::const_iterator it = clients.begin(); it != clients.end(); ++it) {
-        Client *cl = it->second;
-        if (cl->status == Client::WAITFORCHILD && cl->child_pid > 0) {
-            compilers.push_back(cl->child_pid);
-        }
-    }
-
+    /* EXACT session quiescence (issue #4 corrections P0-C + D).  The
+       registry snapshot happens BEFORE the Client objects vanish;
+       environment children are exact-handled by handle_end ->
+       finish_transfer_env.  */
     while (!clients.empty()) {
         Client *cl = clients.first();
         handle_end(cl, 116);
     }
 
-    /* Terminate each exact compile subtree (the child leads its own
-       process group) and observe it terminal, with bounded escalation to
-       SIGKILL so a wedged compiler cannot hang the daemon.  Capacity is
-       released per OBSERVED terminal child, and reconnection (the caller
-       resumes only after this returns) therefore cannot advertise slots
-       an old-session compiler still holds.  */
-    for (const pid_t pid : compilers) {
-        kill(-pid, SIGTERM);
-        kill(pid, SIGTERM);
-        int status;
-        bool reaped = false;
-        const uint64_t t0 = monotonic_msec();
-        for (;;) {
-            const pid_t r = waitpid(pid, &status, WNOHANG);
-            if (r == pid || (r < 0 && errno == ECHILD)) {
-                reaped = true;
-                break;
-            }
-            if (r < 0 && errno != EINTR) {
-                log_error() << "clear_children: waitpid(" << pid << "): "
-                            << strerror(errno) << endl;
-                break;
-            }
-            if (monotonic_msec() - t0 > 5000) {
-                trace() << "clear_children: escalating to SIGKILL for pgroup "
-                        << pid << endl;
-                ++fsession_kill_escalations;
-                kill(-pid, SIGKILL);
-                kill(pid, SIGKILL);
-                while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
-                reaped = true;
-                break;
-            }
-            usleep(50 * 1000);
-        }
-        if (reaped && current_kids > 0) {
-            current_kids--;
-            ++fsession_compilers_quiesced;
-        }
+    unsigned int quiesced = 0;
+    const bool clean = quiesce_session_compilers(scheduler_session_generation,
+                                                 &quiesced);
+    if (quiesced > current_kids) {
+        current_kids = 0;
+    } else {
+        current_kids -= quiesced;
+    }
+
+    if (!clean) {
+        /* FAIL CLOSED: reconnect() refuses while child_ownership_failed
+           stands; the surviving records remain visible in
+           dump_internals.  Capacity is NOT re-advertised.  */
+        return;
     }
 
     if (current_kids != 0) {
         /* Every counted child must have been owned by a Client; a nonzero
-           residue is an accounting defect, not a reason to consume an
-           arbitrary child.  Reset loudly.  */
+           residue is an accounting defect.  Fail closed rather than
+           re-advertise capacity that unproven children may occupy.  */
         log_error() << "clear_children: " << current_kids
-                    << " counted children had no owning client; resetting" << endl;
+                    << " counted children had no owning record;"
+                    << " failing closed" << endl;
         fsession_unowned_residue += current_kids;
-        current_kids = 0;
+        child_ownership_failed = true;
+        return;
     }
 
     // they should be all in clients too
@@ -6014,10 +6135,24 @@ void Daemon::answer_client_requests()
 
 #endif
 
-    /* reap zombies */
-    int status;
-
-    while (waitpid(-1, &status, WNOHANG) < 0 && errno == EINTR) {}
+    /* Reap zombies BY REGISTERED PID: an anonymous waitpid(-1) consumed
+       whichever child was waitable -- including ones another lifecycle
+       still accounted for.  Unknown reaped pids are reported.  */
+    {
+        int status;
+        pid_t z;
+        while ((z = waitpid(-1, &status, WNOHANG)) > 0) {
+            std::map<pid_t, ChildRecord>::iterator zit = child_registry.find(z);
+            if (zit != child_registry.end()) {
+                zit->second.state = ChildRecord::REAPED;
+                /* Records are erased by their owning lifecycle (compile
+                   done / env done / session barrier); the sweep only
+                   marks the observation.  */
+            } else {
+                trace() << "reaped unregistered child " << z << endl;
+            }
+        }
+    }
 
     /* Push queued state records into the writer pipe (nonblocking; no-op
        when nothing is queued or the pipe is full).  */
@@ -6381,6 +6516,18 @@ bool Daemon::reconnect()
         return true;
     }
 
+    if (child_ownership_failed) {
+        /* The previous session's compilers are not provably quiescent:
+           retry the exact barrier and stay offline until it is clean.  */
+        unsigned int quiesced = 0;
+        if (!quiesce_session_compilers(scheduler_session_generation, &quiesced)
+                || child_ownership_failed) {
+            log_warning() << "reconnect blocked: prior-session compilers"
+                          << " not quiescent" << endl;
+            return false;
+        }
+    }
+
     if (!discover && next_scheduler_connect > time(nullptr)) {
         trace() << "Delaying reconnect." << endl;
         return false;
@@ -6402,6 +6549,7 @@ bool Daemon::reconnect()
 
     delete discover;
     discover = nullptr;
+    ++scheduler_session_generation;
     sockaddr_in name;
     socklen_t len = sizeof(name);
     int error = getsockname(scheduler->fd, (struct sockaddr*)&name, &len);
@@ -6890,6 +7038,9 @@ int main(int argc, char **argv)
         if (!d.state_writer.start(d.state_jsonl_path,
                                   d.state_dump_log ? logfile : std::string())) {
             log_error() << "failed to start state writer process; state output disabled" << endl;
+        } else {
+            register_child(d.state_writer.pid(), d.state_writer.pid(),
+                           ChildRecord::STATE_WRITER, 0);
         }
     }
 

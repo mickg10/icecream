@@ -55,6 +55,7 @@ public:
     bool start(const std::string &jsonl_path, const std::string &statelog_path);
 
     bool started() const { return m_pid > 0; }
+    pid_t pid() const { return m_pid; }
     bool alive();   // reaps on demand; false once the writer has exited
     /* Last OBSERVED liveness, without reaping -- for const contexts
        (telemetry).  Fresh to within one main-loop iteration because the
