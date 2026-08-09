@@ -70,6 +70,7 @@
 #include <poll.h>
 #include <signal.h>
 #include <sys/socket.h>
+#include <fcntl.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -182,6 +183,137 @@ static int tcp_connect(int port, int rcvbuf)
     return fd;
 }
 
+/* Bounded loopback connect: nonblocking connect completed with poll under
+   the caller's deadline, then restored to blocking.  A wedged listener can
+   otherwise park a blocking connect() outside every exchange clock.  */
+static int tcp_connect_bounded(int port, int timeout_ms)
+{
+    int fd = socket(PF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    const int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        close(fd);
+        return -1;
+    }
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(port);
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+        if (errno != EINPROGRESS) {
+            close(fd);
+            return -1;
+        }
+        struct pollfd pf = { fd, POLLOUT, 0 };
+        if (poll(&pf, 1, timeout_ms) <= 0) {
+            close(fd);
+            return -1;
+        }
+        int err = 0;
+        socklen_t elen = sizeof(err);
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &elen) != 0 || err != 0) {
+            close(fd);
+            return -1;
+        }
+    }
+    if (fcntl(fd, F_SETFL, flags) < 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+/* The one control-exchange primitive every observation helper uses.  A
+   reply is COMPLETE only when the "200 done" terminator arrived inside the
+   whole-exchange deadline; INCOMPLETE (timeout/EOF mid-reply) and FAILED
+   (no connection, no greeting, short write) are distinct, and callers must
+   treat both as observation failures -- NEVER as an empty reply.  This is
+   the repair for two helpers that fail-opened: one initialized its count
+   to zero after a successful command write even when the terminator never
+   came, so a dead scheduler read as "job absent"; the other accepted a
+   field parsed from a partial line.  */
+struct CtrlReply {
+    enum Status { FAILED, INCOMPLETE, COMPLETE };
+    Status status;
+    std::string text;
+};
+
+static CtrlReply ctrl_exchange(int port, const char *command,
+                               int deadline_ms = 8000)
+{
+    CtrlReply r;
+    r.status = CtrlReply::FAILED;
+    const Clock::time_point t0 = Clock::now();
+    auto left_ms = [&]() -> int {
+        const int ms = deadline_ms - (int)(secs_since(t0) * 1000.0);
+        return ms > 0 ? ms : 0;
+    };
+    const int fd = tcp_connect_bounded(port + 1, deadline_ms);
+    if (fd < 0) {
+        return r;
+    }
+    char buf[16384];
+    {
+        struct pollfd pf = { fd, POLLIN, 0 };
+        if (poll(&pf, 1, left_ms()) <= 0) {
+            close(fd);
+            return r;   /* FAILED: no greeting */
+        }
+        const ssize_t g = read(fd, buf, sizeof(buf) - 1);
+        if (g <= 0) {
+            close(fd);
+            return r;
+        }
+    }
+    std::string cmdline = std::string(command) + "\n";
+    if (write(fd, cmdline.c_str(), cmdline.size()) != (ssize_t)cmdline.size()) {
+        close(fd);
+        return r;
+    }
+    r.status = CtrlReply::INCOMPLETE;   /* command sent; reply not yet terminal */
+    while (left_ms() > 0) {
+        struct pollfd pf = { fd, POLLIN, 0 };
+        if (poll(&pf, 1, left_ms()) <= 0) {
+            break;
+        }
+        const ssize_t n = read(fd, buf, sizeof(buf) - 1);
+        if (n <= 0) {
+            break;
+        }
+        buf[n] = 0;
+        r.text += buf;
+        if (r.text.find("200 done") != std::string::npos) {
+            r.status = CtrlReply::COMPLETE;
+            break;
+        }
+    }
+    close(fd);
+    return r;
+}
+
+/* Strict nonnegative integer parse at `p`: digits, bounded, terminated by
+   a delimiter (space/newline/slash/end).  Returns -1 on anything else --
+   a malformed row must fail the observation, not contribute zero.  */
+static long long parse_field_ll(const char *p)
+{
+    if (!p || *p < '0' || *p > '9') {
+        return -1;
+    }
+    char *end = nullptr;
+    errno = 0;
+    const long long v = strtoll(p, &end, 10);
+    if (errno != 0 || v < 0 || end == p) {
+        return -1;
+    }
+    if (*end != 0 && *end != ' ' && *end != '\n' && *end != '\r' && *end != '/') {
+        return -1;
+    }
+    return v;
+}
+
 /* One control-port round trip returning the scheduler's lifetime
    jobs_admitted counter, or -1 if it cannot be read.  Used to baseline and
    then observe the flood's admission from the server's own accounting.  */
@@ -193,123 +325,38 @@ static long long query_submitter_field(int port, const char *name, const char *f
 /* Same round trip for an arbitrary control command: returns the numeric
    value of `field` on the first reply line containing `needle`.  */
 static long long query_control_field(int port, const char *command,
-                                     const char *needle, const char *field);
-/* Occurrences of `needle` in the full reply of `command`.  */
-static long long query_control_count(int port, const char *command, const char *needle);
-/* Exact scheduler state, not a diagnostic counter: is this job id still in
-   the scheduler's job map, and how many jobs does this worker hold?  The
-   dispatch-credit counter cannot answer either question -- it counts only
-   assignments that have not yet reached JobBegin, so after a Begin it reads
-   zero whether or not the later Done was ever consumed.  */
-static bool job_in_scheduler(int port, unsigned job_id);
-static long long worker_job_count(int port, const char *worker);
-
-static long long query_submitter_admitted(int port, const char *name)
-{
-    return query_submitter_field(port, name, "admitted_total=");
-}
-
-/* Connection stamp for the same line: admitted_total restarts with each
-   connection object, so a baseline/delta pair is only meaningful while the
-   generation is unchanged.  Every baseline below pairs with one of these.  */
-static long long query_submitter_generation(int port, const char *name)
-{
-    return query_submitter_field(port, name, "gen=");
-}
-
-static long long query_submitter_outstanding(int port, const char *name)
-{
-    return query_submitter_field(port, name, "outstanding=");
-}
-
-static long long query_control_field(int port, const char *command,
                                      const char *needle_str, const char *field)
 {
-    const int fd = tcp_connect(port + 1, 0);
-    if (fd < 0) {
+    const CtrlReply r = ctrl_exchange(port, command);
+    if (r.status != CtrlReply::COMPLETE) {
+        return -1;   /* observation failure: never a value */
+    }
+    const size_t pos = r.text.find(needle_str);
+    if (pos == std::string::npos) {
         return -1;
     }
-    char buf[16384];
-    struct pollfd pfd = { fd, POLLIN, 0 };
-    if (poll(&pfd, 1, 5000) > 0) {
-        ssize_t n = read(fd, buf, sizeof(buf));
-        (void)n;
+    const size_t eol = r.text.find('\n', pos);
+    const std::string line = r.text.substr(pos, eol == std::string::npos
+                                                ? std::string::npos : eol - pos);
+    const size_t sp = line.find(field);
+    if (sp == std::string::npos) {
+        return -1;
     }
-    long long value = -1;
-    std::string cmdline = std::string(command) + "\n";
-    if (write(fd, cmdline.c_str(), cmdline.size()) == (ssize_t)cmdline.size()) {
-        std::string reply;
-        const Clock::time_point t0 = Clock::now();
-        while (secs_since(t0) < 5) {
-            struct pollfd rp = { fd, POLLIN, 0 };
-            if (poll(&rp, 1, 200) <= 0) {
-                continue;
-            }
-            const ssize_t n = read(fd, buf, sizeof(buf) - 1);
-            if (n <= 0) {
-                break;
-            }
-            buf[n] = 0;
-            reply += buf;
-            if (reply.find("200 done") != std::string::npos) {
-                break;
-            }
-        }
-        size_t pos = reply.find(needle_str);
-        if (pos != std::string::npos) {
-            const size_t eol = reply.find('\n', pos);
-            const std::string line = reply.substr(pos, eol == std::string::npos
-                                                       ? std::string::npos : eol - pos);
-            const size_t sp = line.find(field);
-            if (sp != std::string::npos) {
-                value = atoll(line.c_str() + sp + strlen(field));
-            }
-        }
-    }
-    close(fd);
-    return value;
+    return parse_field_ll(line.c_str() + sp + strlen(field));
 }
 
 static long long query_control_count(int port, const char *command, const char *needle_str)
 {
-    const int fd = tcp_connect(port + 1, 0);
-    if (fd < 0) {
-        return -1;
+    const CtrlReply r = ctrl_exchange(port, command);
+    if (r.status != CtrlReply::COMPLETE) {
+        return -1;   /* observation failure: never "zero matches" */
     }
-    char buf[16384];
-    struct pollfd pfd = { fd, POLLIN, 0 };
-    if (poll(&pfd, 1, 5000) > 0) {
-        ssize_t n = read(fd, buf, sizeof(buf));
-        (void)n;
+    long long count = 0;
+    size_t pos = 0;
+    while ((pos = r.text.find(needle_str, pos)) != std::string::npos) {
+        ++count;
+        pos += strlen(needle_str);
     }
-    long long count = -1;
-    std::string cmdline = std::string(command) + "\n";
-    if (write(fd, cmdline.c_str(), cmdline.size()) == (ssize_t)cmdline.size()) {
-        std::string reply;
-        const Clock::time_point t0 = Clock::now();
-        while (secs_since(t0) < 5) {
-            struct pollfd rp = { fd, POLLIN, 0 };
-            if (poll(&rp, 1, 200) <= 0) {
-                continue;
-            }
-            const ssize_t n = read(fd, buf, sizeof(buf) - 1);
-            if (n <= 0) {
-                break;
-            }
-            buf[n] = 0;
-            reply += buf;
-            if (reply.find("200 done") != std::string::npos) {
-                break;
-            }
-        }
-        count = 0;
-        size_t pos = 0;
-        while ((pos = reply.find(needle_str, pos)) != std::string::npos) {
-            ++count;
-            pos += strlen(needle_str);
-        }
-    }
-    close(fd);
     return count;
 }
 
@@ -328,54 +375,32 @@ static bool job_in_scheduler(int port, unsigned job_id)
    unexplained constant.  */
 static long long total_farm_capacity(int port)
 {
-    /* Sum the MAX half of every "jobs=cur/max" -- but only from a COMPLETE
-       reply.  Bounded end-to-end (poll deadlines on greeting and each
-       read, whole-exchange clock), requires the "200 done" terminator, and
-       returns -1 on any failure so the caller can reject it: a truncated
-       or failed measurement must NEVER become a small/zero capacity that
-       makes the backlog inequality trivially true.  */
-    const int fd = tcp_connect(port + 1, 0);
-    if (fd < 0) {
+    /* Sum the MAX half of every "jobs=cur/max" from one COMPLETE listcs
+       snapshot.  Bounded end-to-end (nonblocking connect under the same
+       deadline as the reads), strict per-row parse, and -1 on ANY failure
+       so the caller rejects the observation: a truncated or malformed
+       measurement must never become a small capacity that makes the
+       backlog inequality trivially true.  */
+    const CtrlReply r = ctrl_exchange(port, "listcs");
+    if (r.status != CtrlReply::COMPLETE) {
         return -1;
-    }
-    char buf[16384];
-    const Clock::time_point t0 = Clock::now();
-    auto remaining_ms = [&]() -> int {
-        const double left = 8.0 - secs_since(t0);
-        return left <= 0 ? 0 : (int)(left * 1000);
-    };
-    {
-        struct pollfd gp = { fd, POLLIN, 0 };
-        if (poll(&gp, 1, remaining_ms()) <= 0) { close(fd); return -1; }
-        ssize_t g = read(fd, buf, sizeof(buf) - 1); (void)g;   // greeting
-    }
-    if (write(fd, "listcs\nquit\n", 12) != 12) { close(fd); return -1; }
-    std::string text;
-    bool complete = false;
-    while (remaining_ms() > 0) {
-        struct pollfd rp = { fd, POLLIN, 0 };
-        if (poll(&rp, 1, remaining_ms()) <= 0) { break; }
-        const ssize_t n = read(fd, buf, sizeof(buf) - 1);
-        if (n <= 0) { break; }
-        buf[n] = 0;
-        text += buf;
-        if (text.find("200 done") != std::string::npos) { complete = true; break; }
-    }
-    close(fd);
-    if (!complete) {
-        return -1;   // incomplete reply: refuse to report a capacity
     }
     long long total = 0;
     size_t pos = 0;
-    while ((pos = text.find("jobs=", pos)) != std::string::npos) {
-        const size_t slash = text.find('/', pos);
-        if (slash == std::string::npos) {
-            return -1;   // malformed row
+    while ((pos = r.text.find("jobs=", pos)) != std::string::npos) {
+        const size_t slash = r.text.find('/', pos);
+        const size_t eol = r.text.find('\n', pos);
+        if (slash == std::string::npos || (eol != std::string::npos && slash > eol)) {
+            return -1;   /* malformed row */
         }
-        total += atoll(text.c_str() + slash + 1);
+        const long long v = parse_field_ll(r.text.c_str() + slash + 1);
+        if (v < 0) {
+            return -1;   /* malformed max half */
+        }
+        total += v;
         pos = slash + 1;
     }
-    return total > 0 ? total : -1;   // a real farm has capacity; 0 is a failure
+    return total > 0 ? total : -1;   /* a real farm has capacity */
 }
 
 static long long worker_job_count(int port, const char *worker)
@@ -386,58 +411,51 @@ static long long worker_job_count(int port, const char *worker)
     return query_control_field(port, "listcs", needle, "jobs=");
 }
 
-static long long query_submitter_field(int port, const char *name, const char *field)
+/* Delimiter-aware per-node field from a COMPLETE listcs snapshot: the
+   node-name match requires " <name> (" so a prefix ("fakesub" inside
+   "fakesub2") can never select the wrong row, and the value parse is
+   strict (digits + delimiter) so a malformed row fails the observation
+   instead of contributing a number.  */
+static long long field_from_snapshot(const std::string &snapshot,
+                                     const char *name, const char *field)
 {
-    const int fd = tcp_connect(port + 1, 0);
-    if (fd < 0) {
+    const std::string needle = std::string(" ") + name + " (";
+    size_t pos = snapshot.find(needle);
+    if (pos == std::string::npos) {
         return -1;
     }
-    char buf[16384];
-    struct pollfd pfd = { fd, POLLIN, 0 };
-    if (poll(&pfd, 1, 5000) > 0) {
-        ssize_t n = read(fd, buf, sizeof(buf));
-        (void)n;
+    const size_t eol = snapshot.find('\n', pos);
+    const std::string line = snapshot.substr(pos, eol == std::string::npos
+                                                  ? std::string::npos : eol - pos);
+    const size_t sp = line.find(field);
+    if (sp == std::string::npos) {
+        return -1;
     }
-    long long admitted = -1;
-    if (write(fd, "listcs\n", 7) == 7) {
-        std::string reply;
-        const Clock::time_point t0 = Clock::now();
-        while (secs_since(t0) < 5) {
-            struct pollfd rp = { fd, POLLIN, 0 };
-            if (poll(&rp, 1, 200) <= 0) {
-                continue;
-            }
-            const ssize_t n = read(fd, buf, sizeof(buf) - 1);
-            if (n <= 0) {
-                break;
-            }
-            buf[n] = 0;
-            reply += buf;
-            if (reply.find("200 done") != std::string::npos) {
-                break;
-            }
-        }
-        /* Find the line for THIS node.  The match must be delimiter-aware:
-           listcs prints " <node> (<ip>:<port>) ...", and "fakesub" is a
-           prefix of "fakesub2", so a bare substring search reads the wrong
-           submitter's counter -- which is exactly the mistake that made the
-           global barrier dishonest in the first place.  */
-        const std::string needle = std::string(" ") + name + " (";
-        size_t pos = 0;
-        while ((pos = reply.find(needle, pos)) != std::string::npos) {
-            const size_t eol = reply.find('\n', pos);
-            const std::string line = reply.substr(pos, eol == std::string::npos
-                                                       ? std::string::npos : eol - pos);
-            const size_t sp = line.find(field);
-            if (sp != std::string::npos) {
-                admitted = atoll(line.c_str() + sp + strlen(field));
-                break;
-            }
-            pos = (eol == std::string::npos) ? reply.size() : eol;
-        }
+    return parse_field_ll(line.c_str() + sp + strlen(field));
+}
+
+static long long query_submitter_field(int port, const char *name, const char *field)
+{
+    const CtrlReply r = ctrl_exchange(port, "listcs");
+    if (r.status != CtrlReply::COMPLETE) {
+        return -1;
     }
-    close(fd);
-    return admitted;
+    return field_from_snapshot(r.text, name, field);
+}
+
+static long long query_submitter_admitted(int port, const char *name)
+{
+    return query_submitter_field(port, name, "admitted_total=");
+}
+
+static long long query_submitter_generation(int port, const char *name)
+{
+    return query_submitter_field(port, name, "gen=");
+}
+
+static long long query_submitter_outstanding(int port, const char *name)
+{
+    return query_submitter_field(port, name, "outstanding=");
 }
 
 static long long query_jobs_admitted(int port)
@@ -3100,6 +3118,25 @@ int main(int argc, char **argv)
         REQUIRE(worker_job_count(port, "fakecs") >= 1,
                 "the worker holds its reservation before the disconnect");
 
+        /* Duplicate begin from the assigned worker while ATTACHED: the
+           transition check must ignore it -- no timestamp reset, no second
+           monitor begin event -- and count it.  */
+        begin_job(jid);
+        {
+            long long rejects = -1;
+            const Clock::time_point t0 = Clock::now();
+            while (rejects < 1 && secs_since(t0) < 10) {
+                rejects = query_control_field(port, "listjobs",
+                                              "nonwaiting_begin_rejects=",
+                                              "nonwaiting_begin_rejects=");
+                if (rejects < 1) { usleep(200 * 1000); }
+            }
+            REQUIRE(rejects == 1,
+                    "the duplicate begin was counted and ignored (attached)");
+        }
+        REQUIRE(job_in_scheduler(port, jid),
+                "the job survived the duplicate begin");
+
         /* The submitter disconnects mid-compile.  */
         delete subT;
         subT = nullptr;
@@ -3128,6 +3165,63 @@ int main(int argc, char **argv)
         }
         REQUIRE(done_before == 0,
                 "no premature terminal event fired for the retained job");
+
+        /* The detached identity stays observable: listjobs must name the
+           gone submitter, never a bare "<>".  */
+        REQUIRE(query_control_count(port, "listjobs", "fakesubT<detached>") == 1,
+                "listjobs shows the detached job's submitter-name snapshot");
+
+        /* Duplicate begin while DETACHED: same rule, counted and ignored.  */
+        begin_job(jid);
+        {
+            long long rejects = -1;
+            const Clock::time_point t0 = Clock::now();
+            while (rejects < 2 && secs_since(t0) < 10) {
+                rejects = query_control_field(port, "listjobs",
+                                              "nonwaiting_begin_rejects=",
+                                              "nonwaiting_begin_rejects=");
+                if (rejects < 2) { usleep(200 * 1000); }
+            }
+            REQUIRE(rejects == 2,
+                    "the duplicate begin was counted and ignored (detached)");
+        }
+
+        /* TERMINAL AUTHORITY: a REPLACEMENT submitter connection (the
+           natural successor of the disconnected daemon -- same node name,
+           fresh connection) sends a non-worker JobDone for the retained
+           id.  A null submitter must not act as a wildcard: the completion
+           must be IGNORED and counted, the job and the worker reservation
+           must stand, and the sender must NOT be kicked (a stale id after
+           a vanished client is normal daemon behaviour).  */
+        MsgChannel *subT2 = connect_daemon(port, 0);
+        REQUIRE(subT2 != nullptr, "replacement submitter connected");
+        if (subT2) {
+            LoginMsg login(0, "fakesubT", kPlatform, 0);
+            login.envs.push_back(std::make_pair(kPlatform, kEnv));
+            login.max_kids = 0;
+            login.noremote = true;
+            REQUIRE(subT2->send_msg(login), "replacement submitter logged in");
+            usleep(300 * 1000);
+            JobDoneMsg stale(jid, 0, JobDoneMsg::FROM_SUBMITTER);
+            REQUIRE(subT2->send_msg(stale), "stale non-worker completion sent");
+        }
+        {
+            long long rejects = -1;
+            const Clock::time_point t0 = Clock::now();
+            while (rejects < 1 && secs_since(t0) < 10) {
+                rejects = query_control_field(port, "listjobs",
+                                              "detached_terminal_rejects=",
+                                              "detached_terminal_rejects=");
+                if (rejects < 1) { usleep(200 * 1000); }
+            }
+            REQUIRE(rejects == 1,
+                    "the stale completion was rejected and counted");
+        }
+        REQUIRE(job_in_scheduler(port, jid),
+                "the retained job survived the stale non-worker completion"
+                " (a null submitter is not a terminal wildcard)");
+        REQUIRE(worker_job_count(port, "fakecs") >= 1,
+                "the worker reservation survived the stale completion");
 
         /* The worker's real completion reconciles it exactly once (a nonzero
            runtime keeps add_job_stats on its normal path).  */
@@ -3185,14 +3279,150 @@ int main(int argc, char **argv)
         }
         REQUIRE(done_after == 1,
                 "the monitor saw exactly one terminal event, at the real completion");
+
+        /* The replacement submitter was not kicked: it can still submit
+           and be served.  */
+        {
+            GetCSMsg g2(Environments{std::make_pair(std::string(kPlatform), std::string(kEnv))},
+                        "afterward.cpp", CompileJob::Lang_CXX, 1, kPlatform, 0, std::string(), 0, 0, 0);
+            g2.client_id = 7701;
+            REQUIRE(subT2 && subT2->send_msg(g2), "replacement submitter still writable");
+            unsigned int jid3 = 0;
+            const Clock::time_point t0 = Clock::now();
+            while (jid3 == 0 && secs_since(t0) < 20) {
+                Msg *m = subT2->get_msg(2);
+                if (!m) { continue; }
+                if (MSG_IS(m, USE_CS)) {
+                    UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                    if (u && u->client_id == 7701) { jid3 = u->job_id; }
+                }
+                delete m;
+            }
+            REQUIRE(jid3 != 0,
+                    "the replacement submitter is still served after the"
+                    " stale completion (it was not kicked)");
+            if (jid3) {
+                confirm_job(jid3);
+                const Clock::time_point t1 = Clock::now();
+                while (job_in_scheduler(port, jid3) && secs_since(t1) < 15) {
+                    usleep(200 * 1000);
+                }
+            }
+        }
+
+        /* SIBLING TERMINAL: the worker itself disconnects while holding a
+           DETACHED job.  A second worker on a distinct platform makes the
+           placement deterministic; its disconnect must end the job exactly
+           once with no null dereference.  */
+        {
+            static const char *kAltPlat = "x86_64-alt";
+            static const char *kAltEnv = "altenv";
+            MsgChannel *cs2 = connect_daemon(port, 0);
+            REQUIRE(cs2 != nullptr, "second worker connected");
+            unsigned int jid2 = 0;
+            MsgChannel *subU = nullptr;
+            if (cs2) {
+                LoginMsg login(10250, kAltPlat, kAltPlat, 0);
+                login.envs.push_back(std::make_pair(kAltPlat, kAltEnv));
+                login.max_kids = 2;
+                login.chroot_possible = true;
+                REQUIRE(cs2->send_msg(login), "second worker logged in");
+                StatsMsg st;   /* fresh daemons report load=1000 until the
+                                  first stats: send one immediately */
+                cs2->send_msg(st);
+                usleep(300 * 1000);
+
+                subU = connect_daemon(port, 0);
+                REQUIRE(subU != nullptr, "sibling submitter connected");
+                if (subU) {
+                    LoginMsg slog(0, "fakesubU", kAltPlat, 0);
+                    slog.envs.push_back(std::make_pair(kAltPlat, kAltEnv));
+                    slog.max_kids = 0;
+                    slog.noremote = true;
+                    REQUIRE(subU->send_msg(slog), "sibling submitter logged in");
+                    usleep(300 * 1000);
+                    GetCSMsg g3(Environments{std::make_pair(std::string(kAltPlat), std::string(kAltEnv))},
+                                "sibling.cpp", CompileJob::Lang_CXX, 1, kAltPlat, 0, std::string(), 0, 0, 0);
+                    g3.client_id = 7800;
+                    REQUIRE(subU->send_msg(g3), "sibling request sent");
+                    const Clock::time_point t0 = Clock::now();
+                    while (jid2 == 0 && secs_since(t0) < 20) {
+                        Msg *m = subU->get_msg(2);
+                        if (!m) { continue; }
+                        if (MSG_IS(m, USE_CS)) {
+                            UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                            if (u && u->client_id == 7800) { jid2 = u->job_id; }
+                        }
+                        delete m;
+                    }
+                }
+            }
+            REQUIRE(jid2 != 0, "the sibling job was assigned (to the alt worker)");
+            if (jid2 && cs2) {
+                JobBeginMsg jb(jid2, 1);
+                REQUIRE(cs2->send_msg(jb), "alt worker began the sibling job");
+                const Clock::time_point t0 = Clock::now();
+                while (secs_since(t0) < 15 && !job_in_scheduler(port, jid2)) {
+                    usleep(200 * 1000);
+                }
+                REQUIRE(job_in_scheduler(port, jid2), "sibling job is COMPILING");
+
+                delete subU;   /* submitter disconnects -> job detaches */
+                subU = nullptr;
+                sleep(2);
+                REQUIRE(job_in_scheduler(port, jid2),
+                        "the sibling job is retained after ITS submitter left");
+
+                delete cs2;    /* now the WORKER disconnects */
+                cs2 = nullptr;
+                long long present = -1;
+                const Clock::time_point t1 = Clock::now();
+                while (secs_since(t1) < 15) {
+                    present = query_control_count(port, "listjobs", "sibling.cpp");
+                    if (present == 0) { break; }
+                    usleep(200 * 1000);
+                }
+                REQUIRE(present == 0,
+                        "the worker's disconnect ended the detached job"
+                        " (complete listjobs shows it gone; no crash)");
+                int done2 = 0;
+                const Clock::time_point t2 = Clock::now();
+                while (secs_since(t2) < 3) {
+                    Msg *m = mon->get_msg(1);
+                    if (!m) { continue; }
+                    if (MSG_IS(m, MON_JOB_DONE)) {
+                        MonJobDoneMsg *d = dynamic_cast<MonJobDoneMsg *>(m);
+                        if (d && d->job_id == jid2) { ++done2; }
+                    }
+                    delete m;
+                }
+                REQUIRE(done2 == 1,
+                        "the worker disconnect produced exactly one terminal"
+                        " event for the detached job");
+            } else {
+                delete subU;
+                delete cs2;
+            }
+        }
+
+        /* Final liveness, RE-CHECKED AFTER the last management queries so
+           an exit during them cannot escape, then the requested shutdown
+           must exit cleanly (SIGTERM -> exit_main_loop -> status 0).  */
         REQUIRE(worst_reply.load() < 5.0, "scheduler stayed responsive");
+        REQUIRE(!probe_died.load(), "the control probe never lost the scheduler");
+        REQUIRE(waitpid(sched, nullptr, WNOHANG) == 0,
+                "the scheduler is alive after every management query,"
+                " immediately before the requested shutdown");
 
         shutdown = true;
         probe_thread.join(); cs_thread.join(); healthy_thread.join();
         close(ctrl);
-        delete mon; delete sub; delete sub2; delete cs;
+        delete subT2; delete mon; delete sub; delete sub2; delete cs;
         kill(sched, SIGTERM);
-        waitpid(sched, nullptr, 0);
+        int st = -1;
+        REQUIRE(waitpid(sched, &st, 0) == sched, "the scheduler was reaped");
+        REQUIRE(WIFEXITED(st) && WEXITSTATUS(st) == 0,
+                "the requested shutdown exited cleanly (status 0)");
         if (failures) { fprintf(stderr, "RESULT: FAIL (%d)\n", failures); return 1; }
         fprintf(stderr, "RESULT: PASS\n");
         return 0;

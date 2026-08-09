@@ -466,6 +466,13 @@ static bool handle_end(CompileServer *cs, Msg *);
    are unaffected because JobBegin normally follows dispatch within
    milliseconds.  */
 static unsigned int max_outstanding_dispatches = 32;   // --max-outstanding-dispatches
+/* Stale non-worker completions ignored for detached jobs -- observable
+   via the internals text command so a lifecycle gate can assert the
+   rejection actually happened rather than inferring it from silence.  */
+static unsigned long detached_terminal_rejects = 0;
+/* Begin messages ignored because the job was not awaiting one (duplicate
+   or out-of-order JobBegin from the assigned worker).  */
+static unsigned long nonwaiting_begin_rejects = 0;
 
 /* How long an assignment may go unconfirmed before the scheduler REPORTS
    that one of this submitter's clients is not progressing.  Reporting is
@@ -2105,6 +2112,25 @@ static bool handle_job_begin(CompileServer *cs, Msg *_m)
 
     cs->setClientCount(m->client_count);
 
+    /* Explicit begin transition -- one linearization point per job.
+         WAITINGFORCS -> COMPILING   the valid begin;
+         COMPILING    -> COMPILING   a duplicate begin from the assigned
+                                     worker: counted and ignored, so it
+                                     cannot reset timestamps or emit a
+                                     second monitor begin event;
+         anything else               stale/invalid: counted and ignored
+                                     (the sender is the recorded worker --
+                                     already checked above -- so this is
+                                     not an authority violation, just an
+                                     out-of-order message).  */
+    if (job->state() != Job::WAITINGFORCS) {
+        trace() << "handle_job_begin: job " << m->job_id << " is not"
+                << " awaiting a begin (state " << (int)job->state()
+                << "); duplicate/stale begin ignored" << endl;
+        ++nonwaiting_begin_rejects;
+        return true;
+    }
+
     /* Observable progress: the client received its UseCS and reached the
        compile server, so this assignment no longer occupies a dispatch
        credit on its submitter, and whatever was stuck is moving again.  */
@@ -2255,7 +2281,29 @@ static bool handle_job_done(CompileServer *cs, Msg *_m)
         return false;
     }
 
-    if (!m->is_from_server() && j->submitter() && (j->submitter() != cs)) {
+    /* Terminal authority.  For an ATTACHED job a non-worker completion is
+       accepted only from the live recorded submitter (the legacy race
+       rules); a mismatch is a protocol violation and the sender is kicked.
+       For a DETACHED job (its submitter disconnected while the job kept
+       COMPILING on a live worker) there is NO valid non-worker terminal
+       any more: only the recorded worker's own JobDone, or that worker's
+       disconnect, may end it.  A null submitter must never act as a
+       wildcard -- otherwise any daemon that reuses or guesses the id
+       (e.g. the disconnected submitter's replacement connection) could
+       tear down work still running on the worker.  The stale message is
+       ignored and counted; the sender is NOT kicked, because a stale id
+       arriving after its client vanished is normal daemon behaviour, not
+       a protocol violation.  */
+    if (!m->is_from_server() && j->submitterDetached()) {
+        trace() << "ignoring non-worker completion for detached job "
+                << m->job_id << " from " << cs->nodeName()
+                << " (only worker " << (j->server() ? j->server()->nodeName()
+                                                    : string("<none>"))
+                << " may terminate it)" << endl;
+        ++detached_terminal_rejects;
+        return true;
+    }
+    if (!m->is_from_server() && (j->submitter() != cs)) {
         log_info() << "the submitter isn't the same for job " << m->job_id << endl;
         log_info() << "submitter: "
                    << (j->submitter() ? j->submitter()->nodeName()
@@ -2374,6 +2422,14 @@ static string dump_job(Job *job, bool verbose)
     char buffer[1000];
     string line;
 
+    /* A detached job keeps its submitter-name snapshot observable: the
+       lifecycle gates assert post-detach identity from this dump, and a
+       bare "<>" would erase exactly the information they check.  */
+    const string subName = job->submitter()
+        ? job->submitter()->nodeName()
+        : (job->submitterDetached() ? job->submitterName() + "<detached>"
+                                    : string("<>"));
+
     string jobState;
     switch(job->state()) {
     case Job::PENDING:
@@ -2403,13 +2459,13 @@ static string dump_job(Job *job, bool verbose)
                  jobState.c_str(),
                  (long)queue_age_s,
                  (long)state_age_s,
-                 job->submitter() ? job->submitter()->nodeName().c_str() : "<>",
+                 subName.c_str(),
                  job->server() ? job->server()->nodeName().c_str() : "<unknown>");
     } else {
         snprintf(buffer, sizeof(buffer), "%u %s sub:%s on:%s ",
                  job->id(),
                  jobState.c_str(),
-                 job->submitter() ? job->submitter()->nodeName().c_str() : "<>",
+                 subName.c_str(),
                  job->server() ? job->server()->nodeName().c_str() : "<unknown>");
     }
     buffer[sizeof(buffer) - 1] = 0;
@@ -2528,6 +2584,15 @@ static bool handle_line(CompileServer *cs, Msg *_m)
         }
     } else if (cmd == "listjobs") {
         const bool verbose = !l.empty() && (l.front() == "v" || l.front() == "verbose");
+        {
+            char summary[128];
+            snprintf(summary, sizeof(summary),
+                     " detached_terminal_rejects=%lu nonwaiting_begin_rejects=%lu",
+                     detached_terminal_rejects, nonwaiting_begin_rejects);
+            if (!cs->send_msg(TextMsg(summary))) {
+                return false;
+            }
+        }
         for (map<unsigned int, Job *>::const_iterator it = jobs.begin();
                 it != jobs.end(); ++it)
             if (!cs->send_msg(TextMsg(" " + dump_job(it->second, verbose)))) {
