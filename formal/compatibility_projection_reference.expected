@@ -1,0 +1,17 @@
+PASS                        CompatibilityProjectionFixed (8 messages)
+EXPECTED_COUNTEREXAMPLE     P43EmitJobTimingMutant (7 messages)
+  property: NoUnknownKind
+  candidate: {'kind': 'JOB_TIMING', 'job': 100, 'client': 11, 'command_summary': '', 'fulljob': False, 'local_reason': '', 'cmdline': '', 'local_flags': 0, 'client_count': None}
+  expected:  {'kind': 'STATS', 'job': 0, 'client': 0, 'command_summary': '', 'fulljob': False, 'local_reason': '', 'cmdline': '', 'local_flags': 0, 'client_count': None}
+EXPECTED_COUNTEREXAMPLE     P43CommandSummaryMutant (1 messages)
+  property: ProjectionPrefix
+  candidate: {'kind': 'GET_CS', 'job': 0, 'client': 11, 'command_summary': 'cc -c x.c', 'fulljob': False, 'local_reason': '', 'cmdline': '', 'local_flags': 0, 'client_count': None}
+  expected:  {'kind': 'GET_CS', 'job': 0, 'client': 11, 'command_summary': '', 'fulljob': False, 'local_reason': '', 'cmdline': '', 'local_flags': 0, 'client_count': None}
+EXPECTED_COUNTEREXAMPLE     P43LocalFieldsMutant (5 messages)
+  property: ProjectionPrefix
+  candidate: {'kind': 'JOB_LOCAL_BEGIN', 'job': 0, 'client': 12, 'command_summary': '', 'fulljob': True, 'local_reason': 'policy', 'cmdline': 'cc -E x.c', 'local_flags': 1, 'client_count': None}
+  expected:  {'kind': 'JOB_LOCAL_BEGIN', 'job': 0, 'client': 12, 'command_summary': '', 'fulljob': False, 'local_reason': '', 'cmdline': '', 'local_flags': 0, 'client_count': None}
+EXPECTED_COUNTEREXAMPLE     P43StatsClientCountMutant (7 messages)
+  property: ProjectionPrefix
+  candidate: {'kind': 'STATS', 'job': 0, 'client': 0, 'command_summary': '', 'fulljob': False, 'local_reason': '', 'cmdline': '', 'local_flags': 0, 'client_count': 9}
+  expected:  {'kind': 'STATS', 'job': 0, 'client': 0, 'command_summary': '', 'fulljob': False, 'local_reason': '', 'cmdline': '', 'local_flags': 0, 'client_count': None}
