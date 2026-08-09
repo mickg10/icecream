@@ -84,6 +84,7 @@
 #include <map>
 #include <set>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -108,6 +109,61 @@ using Clock = std::chrono::steady_clock;
 static double secs_since(Clock::time_point t0)
 {
     return std::chrono::duration<double>(Clock::now() - t0).count();
+}
+
+static uint64_t monotonic_msec()
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0;
+    }
+    return (uint64_t)ts.tv_sec * 1000U + (uint64_t)ts.tv_nsec / 1000000U;
+}
+
+/* Scheduler CPU consumed by a bounded observation window.  In the
+   FINAL_PENDING deadline mutant poll() spins at timeout zero, so elapsed
+   wall time alone cannot distinguish the defect from the correct sleeping
+   path.  Linux /proc field 14+15 gives an exact per-process negative
+   control without sampling the rest of the host.  */
+static long long process_cpu_ticks(pid_t pid)
+{
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/stat", (int)pid);
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        return -1;
+    }
+    char buf[8192];
+    if (!fgets(buf, sizeof(buf), f)) {
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+    const char *right_paren = strrchr(buf, ')');
+    if (!right_paren || right_paren[1] != ' ') {
+        return -1;
+    }
+    std::istringstream fields(right_paren + 2);
+    char state = 0;   // field 3
+    if (!(fields >> state)) {
+        return -1;
+    }
+    (void)state;
+    long long user_ticks = -1;
+    long long system_ticks = -1;
+    for (int field = 4; field <= 15; ++field) {
+        long long value = 0;
+        if (!(fields >> value)) {
+            return -1;
+        }
+        if (field == 14) {
+            user_ticks = value;
+        } else if (field == 15) {
+            system_ticks = value;
+        }
+    }
+    return user_ticks >= 0 && system_ticks >= 0
+        ? user_ticks + system_ticks : -1;
 }
 
 static int failures = 0;
@@ -635,8 +691,24 @@ int main(int argc, char **argv)
        Removing the handler's held-state check must make this gate red.  */
     const bool internalspredelivery_mode =
         argc > 5 && strcmp(argv[5], "internalspredelivery") == 0;
+
     if (internalspredelivery_mode) {
         setenv("ICECC_TEST_INTERNALS_HOLD_FRAME", "1", 1);
+    }
+    /* A.3 runs the same 50 maximum-reply/stopped-reader trace twice so the
+       live pending cap and the cumulative retained cap cannot mask one
+       another.  Each scheduler process reads one independent cap ordering
+       at startup.  */
+    const bool internalspending_mode =
+        argc > 5 && strcmp(argv[5], "internalspending") == 0;
+    const bool internalsretained_mode =
+        argc > 5 && strcmp(argv[5], "internalsretained") == 0;
+    if (internalspending_mode) {
+        setenv("ICECC_TEST_INTERNALS_PENDING_CAP", "196608", 1);
+        setenv("ICECC_TEST_INTERNALS_RETAINED_CAP", "4194304", 1);
+    } else if (internalsretained_mode) {
+        setenv("ICECC_TEST_INTERNALS_PENDING_CAP", "4194304", 1);
+        setenv("ICECC_TEST_INTERNALS_RETAINED_CAP", "393216", 1);
     }
     /* "internalsguard": the active control issues a SECOND command mid
        fan-out; the same-control guard must fail its exact generation (its
@@ -1026,6 +1098,17 @@ int main(int argc, char **argv)
                 ssize_t n = read(ctrl, buf, sizeof(buf));
                 (void)n;
             }
+        }
+        /* A.3 creates 50 workers, so listcs spans multiple reads.  This
+           legacy probe treats the first read as completion and would then
+           issue another command over the trailing rows, manufacturing an
+           unrelated control backlog.  A.3 uses complete control_dump()
+           exchanges below for its management-progress evidence instead. */
+        if (internalspending_mode || internalsretained_mode) {
+            while (!shutdown) {
+                usleep(100 * 1000);
+            }
+            return;
         }
         while (!shutdown) {
             // discard any stale buffered reply fragments so the next read is
@@ -3301,6 +3384,387 @@ int main(int argc, char **argv)
         kill(sched, SIGTERM);
         waitpid(sched, nullptr, 0);
         if (failures) { fprintf(stderr, "RESULT: FAIL (%d)\n", failures); return 1; }
+        fprintf(stderr, "RESULT: PASS\n");
+        return 0;
+    }
+
+    if (internalspending_mode || internalsretained_mode) {
+        const int target_count = 50;
+        const long long pending_cap =
+            internalspending_mode ? 196608LL : 4194304LL;
+        const long long retained_cap =
+            internalspending_mode ? 4194304LL : 393216LL;
+        const char *mode_label =
+            internalspending_mode ? "pending-bound" : "retained-bound";
+
+        std::vector<MsgChannel *> workers;
+        std::vector<std::string> worker_names;
+        workers.reserve(target_count);
+        worker_names.reserve(target_count);
+        for (int i = 0; i < target_count; ++i) {
+            MsgChannel *w = connect_daemon(port, 0);
+            REQUIRE(w != nullptr, "A.3 worker connected");
+            char name[32];
+            snprintf(name, sizeof(name), "fa3%c%02d",
+                     internalspending_mode ? 'p' : 'r', i);
+            worker_names.emplace_back(name);
+            if (w) {
+                LoginMsg login(10400 + i, name, kPlatform, 0);
+                login.envs.push_back(std::make_pair(kPlatform, kEnv));
+                login.max_kids = 4;
+                REQUIRE(w->send_msg(login), "A.3 worker logged in");
+                StatsMsg st;
+                REQUIRE(w->send_msg(st), "A.3 worker sent initial stats");
+            }
+            workers.push_back(w);
+        }
+
+        {
+            bool all_present = false;
+            const Clock::time_point t0 = Clock::now();
+            while (!all_present && secs_since(t0) < 10) {
+                const std::string snapshot = control_dump(port, "listcs");
+                all_present = !snapshot.empty();
+                for (const std::string &name : worker_names) {
+                    if (field_from_snapshot(snapshot, name.c_str(), "jobs=") < 0) {
+                        all_present = false;
+                        break;
+                    }
+                }
+                if (!all_present) {
+                    usleep(100 * 1000);
+                }
+            }
+            REQUIRE(all_present,
+                    "all 50 A.3 workers are logged in before fan-out");
+        }
+
+        /* Drain only login/configuration chatter.  The later count of
+           GET_INTERNALS frames therefore proves the exact 50-target fanout. */
+        for (MsgChannel *w : workers) {
+            if (!w) {
+                continue;
+            }
+            const Clock::time_point t0 = Clock::now();
+            while (secs_since(t0) < 0.05) {
+                Msg *m = w->get_msg(0, true);
+                delete m;
+                usleep(1000);
+            }
+        }
+
+        const int owner = tcp_connect(port + 1, 1024);
+        REQUIRE(owner >= 0, "A.3 stopped-reader owner connected");
+        if (owner >= 0) {
+            char greeting[1024];
+            struct pollfd gp = { owner, POLLIN, 0 };
+            if (poll(&gp, 1, 3000) > 0) {
+                const ssize_t n = read(owner, greeting, sizeof(greeting));
+                REQUIRE(n > 0, "A.3 owner received greeting before stopping");
+            } else {
+                REQUIRE(false, "A.3 owner received greeting before stopping");
+            }
+        }
+
+        /* One pre-established, fully consumed observer avoids turning the
+           deadline measurement into an accept/listener-churn test.  It is
+           a distinct control generation from the stopped transaction owner. */
+        const int observer = tcp_connect_bounded(port + 1, 8000);
+        REQUIRE(observer >= 0, "A.3 persistent management observer connected");
+        if (observer >= 0) {
+            char greeting[1024];
+            struct pollfd gp = { observer, POLLIN, 0 };
+            if (poll(&gp, 1, 8000) > 0) {
+                const ssize_t n = read(observer, greeting, sizeof(greeting));
+                REQUIRE(n > 0, "A.3 observer received greeting");
+            } else {
+                REQUIRE(false, "A.3 observer received greeting");
+            }
+        }
+        auto observer_read_reply = [&]() -> std::string {
+            if (observer < 0) {
+                return std::string();
+            }
+            std::string reply;
+            char buf[16384];
+            const Clock::time_point t0 = Clock::now();
+            while (secs_since(t0) < 8.0) {
+                const int left = 8000 - (int)(secs_since(t0) * 1000.0);
+                struct pollfd pf = { observer, POLLIN, 0 };
+                if (poll(&pf, 1, left > 0 ? left : 0) <= 0) {
+                    break;
+                }
+                const ssize_t n = read(observer, buf, sizeof(buf));
+                if (n <= 0) {
+                    break;
+                }
+                reply.append(buf, (size_t)n);
+                if (reply.find("200 done") != std::string::npos) {
+                    return reply;
+                }
+            }
+            return std::string();
+        };
+        auto observer_dump = [&](const char *command_text) -> std::string {
+            if (observer < 0) {
+                return std::string();
+            }
+            const std::string line = std::string(command_text) + "\n";
+            if (write(observer, line.data(), line.size()) != (ssize_t)line.size()) {
+                return std::string();
+            }
+            return observer_read_reply();
+        };
+
+        std::string command = "internals";
+        for (const std::string &name : worker_names) {
+            command += " ";
+            command += name;
+        }
+        command += "\n";
+        const Clock::time_point command_started = Clock::now();
+        REQUIRE(owner >= 0
+                    && write(owner, command.data(), command.size())
+                        == (ssize_t)command.size(),
+                "A.3 50-target command sent before owner stopped reading");
+
+        std::string payload(64 * 1024, 'x');
+        payload.replace(0, strlen("maximum-status:"), "maximum-status:");
+        int requests = 0;
+        int replies = 0;
+        const Clock::time_point fanout_deadline = Clock::now();
+        for (int i = 0; i < target_count; ++i) {
+            MsgChannel *w = workers[(size_t)i];
+            bool got_request = false;
+            while (w && !got_request && secs_since(fanout_deadline) < 10) {
+                Msg *m = w->get_msg(1, true);
+                if (!m) {
+                    continue;
+                }
+                if (MSG_IS(m, GET_INTERNALS)) {
+                    got_request = true;
+                    ++requests;
+                }
+                delete m;
+            }
+            if (got_request && w
+                    && w->send_msg(StatusTextMsg(payload))) {
+                ++replies;
+            }
+        }
+        REQUIRE(requests == target_count,
+                "A.3 fan-out delivered one request to every target");
+        REQUIRE(replies == target_count,
+                "all 50 targets sent a maximum-size status reply");
+
+        auto dump_field = [](const std::string &dump, const char *field) -> long long {
+            const size_t p = dump.find(field);
+            if (p == std::string::npos) {
+                return -1;
+            }
+            return parse_field_ll(dump.c_str() + p + strlen(field));
+        };
+
+        std::string output_phase;
+        {
+            const Clock::time_point t0 = Clock::now();
+            while (secs_since(t0) < 8) {
+                output_phase = observer_dump("listjobs");
+                if (dump_field(output_phase, "internals_active=") == 1
+                        && dump_field(output_phase, "internals_final_pending=") == 1) {
+                    break;
+                }
+                usleep(100 * 1000);
+            }
+        }
+        const long long live_peak =
+            dump_field(output_phase, "internals_peak_pending=");
+        const long long live_retained =
+            dump_field(output_phase, "internals_retained=");
+        const long long live_generation =
+            dump_field(output_phase, "internals_control_generation=");
+        const long long collection_deadline =
+            dump_field(output_phase, "internals_collection_deadline=");
+        const long long output_deadline =
+            dump_field(output_phase, "internals_output_deadline=");
+        REQUIRE(dump_field(output_phase, "internals_active=") == 1
+                    && dump_field(output_phase, "internals_final_pending=") == 1
+                    && output_phase.find("internals_phase=output") != std::string::npos,
+                "stopped reader keeps the transaction in output phase");
+        REQUIRE(dump_field(output_phase, "internals_replied=") == target_count
+                    && dump_field(output_phase, "internals_sendpending=") == 0
+                    && dump_field(output_phase, "internals_waiting=") == 0,
+                "all 50 target states reached exactly REPLIED");
+        REQUIRE(dump_field(output_phase, "internals_omitted=") == 1
+                    && dump_field(output_phase, "internals_marker_queued=") == 1
+                    && dump_field(output_phase, "internals_terminal_queued=") == 1,
+                "bounded output queued one omission marker and one terminal");
+        REQUIRE(live_peak > 64 * 1024 && live_peak <= pending_cap,
+                "live peak pending bytes stay positive and within the selected cap");
+        REQUIRE(live_retained > 64 * 1024 && live_retained <= retained_cap,
+                "live cumulative retained bytes stay within the independent cap");
+        REQUIRE(collection_deadline > 0 && output_deadline > collection_deadline
+                    && live_generation > 0,
+                "output phase preserves distinct deadlines and exact owner generation");
+
+        /* The corrected output-phase poll deadline sleeps.  Reusing the
+           expired collection deadline burns nearly one full CPU over this
+           wall interval and fails this process-local bound. */
+        const long long cpu_before = process_cpu_ticks(sched);
+        const int healthy_before = healthy_replies.load();
+        usleep(2000 * 1000);
+        const long long cpu_after = process_cpu_ticks(sched);
+        const long ticks_per_second = sysconf(_SC_CLK_TCK);
+        const Clock::time_point management_started = Clock::now();
+        const std::string still_output = observer_dump("listjobs");
+        const double management_elapsed = secs_since(management_started);
+        REQUIRE(dump_field(still_output, "internals_active=") == 1
+                    && dump_field(still_output, "internals_final_pending=") == 1,
+                "CPU observation window remained inside FINAL_PENDING");
+        REQUIRE(cpu_before >= 0 && cpu_after >= cpu_before
+                    && ticks_per_second > 0
+                    && cpu_after - cpu_before < (ticks_per_second * 3) / 4,
+                "FINAL_PENDING consumed less than 0.75 CPU seconds per two wall seconds");
+        REQUIRE(healthy_replies.load() > healthy_before,
+                "unrelated job lifecycle traffic progressed under stopped output");
+        REQUIRE(!still_output.empty() && management_elapsed < 5.0,
+                "a separate complete management exchange remained live and bounded");
+
+        std::string settled;
+        /* Creating and fully reading the two independent control exchanges
+           above can itself carry this observer beyond the deadline.  Always
+           perform at least one post-deadline observation: that fresh control
+           event must service/observe the expired transaction, not let the
+           harness skip the settlement check merely because observation was
+           late. */
+        const uint64_t settlement_started_mono = monotonic_msec();
+        const uint64_t settlement_limit = std::max(
+            (uint64_t)output_deadline + 5000U,
+            settlement_started_mono + 10000U);
+        do {
+            settled = observer_dump("listjobs");
+            if (dump_field(settled, "internals_active=") == 0
+                    && settled.find("internals_last_reason=output-deadline")
+                        != std::string::npos) {
+                break;
+            }
+            usleep(100 * 1000);
+        } while (monotonic_msec() < settlement_limit);
+        const double settled_after = secs_since(command_started);
+        const uint64_t settled_mono = monotonic_msec();
+        REQUIRE(dump_field(settled, "internals_active=") == 0
+                    && settled.find("internals_last_reason=output-deadline")
+                        != std::string::npos,
+                "stopped owner settled exactly at the output-deadline path");
+        REQUIRE(settled_mono >= (uint64_t)output_deadline
+                    && settled_mono < settlement_limit,
+                "output settlement used the reported later absolute deadline");
+        REQUIRE(dump_field(settled, "internals_retained=") == 0,
+                "active retained state returned to zero after exact teardown");
+        REQUIRE(dump_field(settled, "internals_last_peak=") == live_peak
+                    && dump_field(settled, "internals_last_peak=") <= pending_cap,
+                "settled snapshot preserves the bounded peak pending bytes");
+        REQUIRE(dump_field(settled, "internals_last_retained=") == live_retained
+                    && dump_field(settled, "internals_last_retained=") <= retained_cap,
+                "settled snapshot preserves the bounded cumulative bytes");
+        REQUIRE(dump_field(settled, "internals_last_marker=") == 1
+                    && dump_field(settled, "internals_last_terminal=") == 1,
+                "settled snapshot proves one marker and terminal-or-teardown uniqueness");
+        REQUIRE(dump_field(settled, "internals_last_generation=") == live_generation
+                    && dump_field(settled, "internals_last_output_deadline=")
+                        == output_deadline
+                    && dump_field(settled, "internals_last_entered_output_phase=") == 1,
+                "settlement is correlated to the exact owner and output deadline");
+        REQUIRE(waitpid(sched, nullptr, WNOHANG) == 0, "scheduler alive");
+        REQUIRE(!probe_died.load(), "control probe never lost the scheduler");
+
+        /* A dropped terminal cannot be distinguished by a stopped owner
+           merely from a claimed frame counter.  Reuse the live observer as
+           a reading owner for one follow-up transaction and require the
+           actual terminal bytes exactly once.  The terminal-DROPPED mutant
+           can then neither lie with terminal_queued nor clear on an earlier
+           frame without this subtrace turning red. */
+        const std::string followup_command =
+            std::string("internals ") + worker_names.front() + "\n";
+        REQUIRE(observer >= 0
+                    && write(observer, followup_command.data(), followup_command.size())
+                        == (ssize_t)followup_command.size(),
+                "reading owner sent the follow-up terminal-delivery command");
+        bool followup_request = false;
+        {
+            const Clock::time_point t0 = Clock::now();
+            while (!followup_request && secs_since(t0) < 5.0) {
+                Msg *m = workers.front()->get_msg(1, true);
+                if (!m) {
+                    continue;
+                }
+                followup_request = MSG_IS(m, GET_INTERNALS);
+                delete m;
+            }
+        }
+        REQUIRE(followup_request,
+                "follow-up worker received a real request");
+        const std::string followup_payload = "terminal-delivery-check";
+        REQUIRE(followup_request
+                    && workers.front()->send_msg(StatusTextMsg(followup_payload)),
+                "follow-up worker sent its result row");
+        const std::string followup_reply = observer_read_reply();
+        auto count_text = [](const std::string &haystack,
+                             const std::string &needle) -> unsigned int {
+            unsigned int count = 0;
+            size_t pos = 0;
+            while ((pos = haystack.find(needle, pos)) != std::string::npos) {
+                ++count;
+                pos += needle.size();
+            }
+            return count;
+        };
+        REQUIRE(count_text(followup_reply,
+                           worker_names.front() + ": " + followup_payload) == 1,
+                "reading owner received exactly one follow-up result row");
+        REQUIRE(count_text(followup_reply, "200 done") == 1,
+                "reading owner received the actual terminal exactly once");
+        usleep(100 * 1000);
+        const std::string followup_settled = control_dump(port, "listjobs");
+        REQUIRE(dump_field(followup_settled, "internals_active=") == 0
+                    && followup_settled.find("internals_last_reason=complete")
+                        != std::string::npos
+                    && dump_field(followup_settled, "internals_last_terminal=") == 1,
+                "follow-up transaction settled only after terminal delivery");
+
+        fprintf(stderr,
+                "# A.3 %s: peak=%lld/%lld retained=%lld/%lld"
+                " generation=%lld settle=%.3fs cpu_ticks=%lld/%ld\n",
+                mode_label, live_peak, pending_cap, live_retained, retained_cap,
+                live_generation, settled_after,
+                cpu_after >= cpu_before ? cpu_after - cpu_before : -1,
+                ticks_per_second);
+
+        if (owner >= 0) {
+            close(owner);
+        }
+        if (observer >= 0) {
+            close(observer);
+        }
+        shutdown = true;
+        probe_thread.join();
+        cs_thread.join();
+        healthy_thread.join();
+        close(ctrl);
+        for (MsgChannel *w : workers) {
+            delete w;
+        }
+        delete sub;
+        delete sub2;
+        delete cs;
+        kill(sched, SIGTERM);
+        int st = -1;
+        REQUIRE(waitpid(sched, &st, 0) == sched, "scheduler reaped");
+        REQUIRE(WIFEXITED(st) && WEXITSTATUS(st) == 0, "clean shutdown");
+        if (failures) {
+            fprintf(stderr, "RESULT: FAIL (%d)\n", failures);
+            return 1;
+        }
         fprintf(stderr, "RESULT: PASS\n");
         return 0;
     }
