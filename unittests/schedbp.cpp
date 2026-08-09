@@ -536,7 +536,7 @@ int main(int argc, char **argv)
        and answered "no suitable host" while preload capacity existed -- and
        with unequal occupancies the emptier host must win.  */
     const bool leastbusy_mode = argc > 5 && strcmp(argv[5], "leastbusy") == 0;
-    /* "clientstall": the blast-radius gate.  A submitting daemon proxies
+    /* "clientstall": the client-isolation gate.  A submitting daemon proxies
        EVERY compiler wrapper on its host.  One wrapper frozen after its
        assignment holds a dispatch debit that JobBegin never credits; the
        scheduler used to answer that by removing the whole daemon, voiding

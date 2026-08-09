@@ -112,9 +112,9 @@ void StateWriter::drop_from_front_until_bounded()
         /* Never drop the frame currently in flight (front while
            m_front_ofs > 0): a torn frame would desynchronise the stream.
            Drop the oldest COMPLETE frame instead.  */
-        const size_t victim = m_front_ofs ? 1 : 0;
-        m_queued_bytes -= m_queue[victim].size();
-        m_queue.erase(m_queue.begin() + victim);
+        const size_t drop_idx = m_front_ofs ? 1 : 0;
+        m_queued_bytes -= m_queue[drop_idx].size();
+        m_queue.erase(m_queue.begin() + drop_idx);
         ++m_dropped;
     }
 }

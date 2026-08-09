@@ -71,7 +71,7 @@ extern const char *rs_program_name;
    invocations run at the lowest scheduling priority.
 
    Rationale from operations, recorded here because the code alone cannot
-   show it: without this, a highly parallel build's preprocessing storm
+   show it: without this, a highly parallel build's preprocessing load
    starves the machine -- the operator's report is that hosts were driven
    into unusability ("blew up machines") before this was added.  The
    daemon's bounded preprocess lane limits how many preprocess jobs the

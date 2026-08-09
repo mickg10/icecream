@@ -22,7 +22,7 @@
 # so it is a responsive connection whose wrappers stalled, not a dead
 # daemon.  Its healthy peer is served throughout.
 #
-# Run 4 -- clientstall (blast radius): a submitting daemon proxies every
+# Run 4 -- clientstall (client isolation): a submitting daemon proxies every
 # compiler wrapper on its host.  One wrapper frozen after its assignment
 # holds a dispatch debit that JobBegin never credits; the scheduler used to
 # answer that by removing the whole daemon, voiding every healthy sibling's

@@ -347,10 +347,10 @@ static void add_runtime_estimate(const Job *job, unsigned long real_msec)
 
     while (file_runtime_estimates.size() > max_file_runtime_estimates
            && !runtime_estimate_lru.empty()) {
-        const string victim = runtime_estimate_lru.front();
+        const string evicted = runtime_estimate_lru.front();
         runtime_estimate_lru.pop_front();
-        runtime_estimate_lru_pos.erase(victim);
-        file_runtime_estimates.erase(victim);
+        runtime_estimate_lru_pos.erase(evicted);
+        file_runtime_estimates.erase(evicted);
         ++runtime_estimate_evictions;
     }
 }
