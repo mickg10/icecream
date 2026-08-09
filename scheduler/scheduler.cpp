@@ -2379,8 +2379,7 @@ static bool handle_stats(CompileServer *cs, Msg *_m)
 
     for (CompileServer * const c : css)
         if (c == cs) {
-            c->setLoad(m->load);
-            c->setClientCount(m->client_count);
+            c->applyStats(*m);
             handle_monitor_stats(c, m);
             return true;
         }

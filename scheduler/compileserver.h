@@ -120,6 +120,9 @@ public:
 
     unsigned int load() const;
     void setLoad(const unsigned int load);
+    /* Apply the fields that StatsMsg actually serializes.  client_count is
+       deliberately excluded until a negotiated wire format carries it. */
+    void applyStats(const StatsMsg &stats);
 
     int maxJobs() const;
     void setMaxJobs(const int jobs);

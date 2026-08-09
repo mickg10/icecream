@@ -282,6 +282,17 @@ void CompileServer::setLoad(unsigned int load)
     m_load = load;
 }
 
+void CompileServer::applyStats(const StatsMsg &stats)
+{
+    m_load = stats.load;
+#ifdef ICECC_TEST_STATS_MUTANT_CLIENT_COUNT
+    /* Exact historical defect: StatsMsg::fill_from_channel() never reads this
+       field, so every ordinary heartbeat overwrote the last authoritative
+       lifecycle count with the constructor default zero. */
+    m_clientCount = stats.client_count;
+#endif
+}
+
 int CompileServer::maxJobs() const
 {
     return m_maxJobs;
