@@ -3801,18 +3801,24 @@ int main(int argc, char *argv[])
 
         for (list<CompileServer *>::const_iterator it = cs_in_tsts.begin();
                 it != cs_in_tsts.end(); ++it) {
-            if(find(css.begin(), css.end(), *it) == css.end()) {
+            if (find(css.begin(), css.end(), *it) == css.end()) {
                 continue; // deleted meanwhile
             }
-            if((*it)->getConnectionInProgress())
-            {
-                if(active_fds > 0 && pollfd_is_set(pollfds, (*it)->getInFd(), POLLIN | POLLOUT) && (*it)->isConnected())
-                {
-                    active_fds--;
-                    (*it)->updateInConnectivity(true);
-                }
-                else if((active_fds == 0 || pollfd_is_set(pollfds, (*it)->getInFd(), POLLIN | POLLOUT)) && !(*it)->isConnected())
-                {
+            if ((*it)->getConnectionInProgress()) {
+                const bool ready = pollfd_is_set(pollfds, (*it)->getInFd(),
+                                                 POLLIN | POLLOUT);
+                if (ready) {
+                    /* One readiness event has exactly one completion read.
+                       The old code called isConnected() twice and could turn
+                       an immediate success into a timeout/failure after the
+                       first branch changed the timing state. */
+                    if (active_fds > 0) {
+                        --active_fds;
+                    }
+                    (*it)->updateInConnectivity((*it)->isConnected());
+                } else if ((*it)->getConnectionTimeout() == 0) {
+                    /* A monotonic absolute probe deadline must fire even when
+                       no descriptor event arrives. */
                     (*it)->updateInConnectivity(false);
                 }
             }

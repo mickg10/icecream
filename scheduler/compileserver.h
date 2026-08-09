@@ -31,6 +31,7 @@
 
 #include "../services/comm.h"
 #include "jobstat.h"
+#include "connectivityprobe.h"
 
 class Job;
 
@@ -253,11 +254,7 @@ private:
 
     map<const CompileServer *, Environments> m_blacklist;
 
-    int m_inFd;
-    unsigned int m_inConnAttempt;
-    time_t m_nextConnTime;
-    time_t m_lastConnStartTime;
-    bool m_acceptingInConnection;
+    ConnectivityProbe m_inProbe;
 };
 
 #endif

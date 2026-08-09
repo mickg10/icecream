@@ -71,11 +71,7 @@ CompileServer::CompileServer(const int fd, struct sockaddr *_addr, const socklen
     , m_cumRequested()
     , m_clientLocalMap()
     , m_blacklist()
-    , m_inFd(-1)
-    , m_inConnAttempt(0)
-    , m_nextConnTime(0)
-    , m_lastConnStartTime(0)
-    , m_acceptingInConnection(true)
+    , m_inProbe()
 {
 }
 
@@ -185,14 +181,14 @@ bool CompileServer::is_eligible_ever(const Job *job) const
                     && (m_chrootPossible || job->submitter() == this)
                     && version_okay
                     && features_okay
-                    && m_acceptingInConnection
+                    && m_inProbe.accepting()
                     && can_install(job, true).size()
                     && check_remote(job);
 #if DEBUG_SCHEDULER > 2
     trace() << nodeName() << " is_eligible_ever: " << eligible << " (jobs_okay " << jobs_okay
         << ", version_okay " << version_okay << ", features_okay " << features_okay
         << ", chroot_or_local " << (m_chrootPossible || job->submitter() == this)
-        << ", accepting " << m_acceptingInConnection << ", can_install " << (can_install(job).size() != 0)
+        << ", accepting " << m_inProbe.accepting() << ", can_install " << (can_install(job).size() != 0)
         << ", check_remote " << check_remote(job) << ")" << endl;
 #endif
     return eligible;
@@ -322,6 +318,9 @@ bool CompileServer::noRemote() const
 void CompileServer::setNoRemote(bool value)
 {
     m_noRemote = value;
+    if (value) {
+        m_inProbe.cancel();
+    }
 }
 
 const list<Job *>& CompileServer::jobList() const
@@ -518,139 +517,64 @@ bool CompileServer::blacklisted(const Job *job, const pair<string, string> &envi
 
 int CompileServer::getInFd() const
 {
-    return m_inFd;
+    return m_inProbe.fd();
 }
 
 void CompileServer::startInConnectionTest()
 {
-    if (m_noRemote || getConnectionInProgress() || (m_nextConnTime > time(nullptr)))
-    {
+    if (m_noRemote) {
         return;
     }
 
-    m_inFd = socket(PF_INET, SOCK_STREAM, 0);
-    fcntl(m_inFd, F_SETFL, O_NONBLOCK);
-
-    struct hostent *host = gethostbyname(name.c_str());
-
-    struct sockaddr_in remote_addr;
-    remote_addr.sin_family = AF_INET;
-    remote_addr.sin_port = htons(remotePort());
-    memcpy(&remote_addr.sin_addr.s_addr, host->h_addr_list[0], host->h_length);
-    memset(remote_addr.sin_zero, '\0', sizeof(remote_addr.sin_zero));
-
-    int status = connect(m_inFd, (struct sockaddr *)&remote_addr, sizeof(remote_addr));
-    if(status == 0)
-    {
-        updateInConnectivity(isConnected());
-    }
-    else if (!(errno == EINPROGRESS || errno == EAGAIN))
-    {
+    const ConnectivityProbe::StartResult result = m_inProbe.start(name, remotePort());
+    if (result == ConnectivityProbe::ImmediateSuccess) {
+        updateInConnectivity(true);
+    } else if (result == ConnectivityProbe::ImmediateFailure) {
         updateInConnectivity(false);
     }
-    m_lastConnStartTime=time(nullptr);
 }
 
 void CompileServer::updateInConnectivity(bool acceptingIn)
 {
-    static const time_t time_offset_table[] = {
-        2,    4,    8,    16,    32,
-        64,  128,  256,   512,  1024,
-        2048, 4096
-    };
-    /* Element count, NOT byte count: sizeof(table) is 96 on this build, so
-       the old value let m_inConnAttempt climb to 95 and index the table 84
-       slots out of bounds after enough consecutive failures -- a
-       long-unreachable daemon could read garbage delays or crash the
-       scheduler.  */
-    static const size_t table_size =
-        sizeof(time_offset_table) / sizeof(time_offset_table[0]);
+    const bool was_accepting = m_inProbe.accepting();
+    m_inProbe.recordResult(acceptingIn);
 
-    //On a successful connection, we should still check back every 1min
-    static const time_t check_back_time = 60;
-
-    if(acceptingIn)
-    {
-        if(!m_acceptingInConnection)
-        {
-            m_acceptingInConnection = true;
-            m_inConnAttempt = 0;
-            trace() << "Client (" << m_nodeName <<
-                " " << name <<
-                ":" << m_remotePort <<
-                ") is accepting incoming connections." << endl;
+    if (acceptingIn) {
+        if (!was_accepting) {
+            trace() << "Client (" << m_nodeName << " " << name << ":" << m_remotePort
+                    << ") is accepting incoming connections." << endl;
         }
-        m_nextConnTime = time(nullptr) + check_back_time;
-        close(m_inFd);
-        m_inFd = -1;
+        return;
     }
-    else
-    {
-        if(m_acceptingInConnection)
-        {
-            m_acceptingInConnection = false;
-            trace() << "Client (" << m_nodeName <<
-                " " << name <<
-                ":" << m_remotePort <<
-                ") connected but is not able to accept incoming connections." << endl;
-        }
-        const unsigned int idx =
-            m_inConnAttempt < table_size ? m_inConnAttempt : (unsigned int)(table_size - 1);
-        m_nextConnTime = time(nullptr) + time_offset_table[idx];
-        if(m_inConnAttempt < (table_size - 1))
-            m_inConnAttempt++;
-        trace()  << nodeName() << " failed to accept an incoming connection on "
+
+    if (was_accepting) {
+        trace() << "Client (" << m_nodeName << " " << name << ":" << m_remotePort
+                << ") connected but is not able to accept incoming connections." << endl;
+    }
+    trace() << nodeName() << " failed to accept an incoming connection on "
             << name << ":" << m_remotePort << " attempting again in "
-            << m_nextConnTime - time(nullptr) << " seconds" << endl;
-        close(m_inFd);
-        m_inFd = -1;
-    }
-
+            << m_inProbe.nextTimeoutSeconds() << " seconds" << endl;
 }
 
 bool CompileServer::isConnected()
 {
-    if (getConnectionTimeout() == 0)
-    {
-        return false;
-    }
-    struct hostent *host = gethostbyname(name.c_str());
-
-    struct sockaddr_in remote_addr;
-    remote_addr.sin_family = AF_INET;
-    remote_addr.sin_port = htons(remotePort());
-    memcpy(&remote_addr.sin_addr.s_addr, host->h_addr_list[0], host->h_length);
-    memset(remote_addr.sin_zero, '\0', sizeof(remote_addr.sin_zero));
-
-    int error = 0;
-    socklen_t err_len= sizeof(error);
-    return (getsockopt(m_inFd, SOL_SOCKET, SO_ERROR, &error, &err_len) == 0 && error == 0);
-
+    return m_inProbe.connected();
 }
 
 time_t CompileServer::getConnectionTimeout()
 {
-    time_t now = time(nullptr);
-    time_t elapsed_time = now - m_lastConnStartTime;
-    time_t max_timeout = 5;
-    return (elapsed_time < max_timeout) ? max_timeout - elapsed_time : 0;
+    return static_cast<time_t>(m_inProbe.connectionTimeoutSeconds());
 }
 
 bool CompileServer::getConnectionInProgress()
 {
-    return (m_inFd != -1);
+    return m_inProbe.inProgress();
 }
 
 time_t CompileServer::getNextTimeout()
 {
-    if (m_noRemote)
-    {
+    if (m_noRemote) {
         return -1;
     }
-    if (m_inFd != -1)
-    {
-        return getConnectionTimeout();
-    }
-    time_t until_connect = m_nextConnTime - time(nullptr);
-    return (until_connect > 0) ? until_connect : 0;
+    return static_cast<time_t>(m_inProbe.nextTimeoutSeconds());
 }
