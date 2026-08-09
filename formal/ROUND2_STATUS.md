@@ -1,47 +1,146 @@
-# Round 2 formal checkpoint status
+# Assignment-fence formal checkpoint status
 
-Base: `c0e0406896f6cd7a487d885b58d3837a088393ba`
 Working branch: `bigoracle/assignment-fence-core-round2`
 
-This is a review candidate for `mickg10/local-oracle`, not accepted formal evidence. No TLC or TLAPS result is claimed here.
+This branch is a **construction and execution handoff** for
+`mickg10/local-oracle`. It is not accepted formal evidence. No TLC, TLAPS,
+compatibility, implementation-refinement, or performance result is claimed by
+this document.
 
-## Conserved-token correction
+## Conserved ownership tokens
 
-The core separates:
+The core and network models separate:
 
 ```text
-schedulerReservation[a]  -- S still accounts for a
-workerSlot[a]             -- F still consumes a physical slot for a
+schedulerReservation[a]  -- S still accounts for assignment a
+workerSlot[a]             -- F still consumes physical capacity for a
 ```
 
-After F linearizes `REVOKED`, `workerSlot[a]` is false while `schedulerReservation[a]` remains true until S consumes the result. A one-token model cannot represent the safe interval between those two linearization points.
+After F linearizes `REVOKED`, `workerSlot[a]` is false while
+`schedulerReservation[a]` remains true until S consumes the complete result.
+A one-token model cannot represent the safe interval between those two
+linearization points.
 
-## Deterministic executable reference
+## Current formal artifacts
+
+### Abstract core
+
+- `AssignmentFenceCore.tla`
+- fixed, mixed-fleet, premature-release, fair-liveness, and two-worker
+  heterogeneous configurations
+- `AssignmentFenceCoreProof.tla`: strengthened inductive TLAPS proof candidate
+  with named per-action preservation lemmas and no omitted obligations
+
+### Finite FIFO network
+
+- `AssignmentFenceNetwork.tla`
+- bounded S→F, F→S, and S→D FIFO streams
+- queueing, frame flushing, and protocol consumption are distinct transitions
+- strict READY-before-UseCS
+- exact/legacy claim policy
+- REVOKED enqueue distinct from S consumption/release
+- stale READY, UseCS, STARTED, BEGIN, DONE, and late-REVOKE races consumed
+  without state resurrection
+- explicit S–F and S–D session loss
+- fixed safety/liveness configs and direct-property mutants for:
+  - UseCS before READY;
+  - release when F queues rather than S consumes REVOKED;
+  - F→S FIFO bypass; and
+  - default-allow late legacy start after bounded record compaction
+
+`AssignmentFenceNetworkCompaction.tla` extends the canonical network state with
+terminal-record compaction. This closes a prior model-vacuity gap: without
+compaction, an F record remained `Revoked`, so a delayed claim could never
+become an unknown claim and the finite-tombstone/default-allow mutant was
+unreachable.
+
+### Trace discrimination
+
+- `trace_to_harness.py`
+- `trace_to_harness_test.py`
+- `TRACE_ADAPTER.md`
+- declarative templates under `trace-manifests/`
+
+TLC JSON traces contain state records but not action labels or the lasso edge.
+The adapter classifies adjacent state deltas, requires the intended essential
+event subsequence and final property violation, reads the retained TLC text log
+when a lasso is required, and emits deterministic C++ barrier instructions. It
+rejects empty, zero-state, malformed, ambiguous, wrong-order, wrong-property,
+and path-invalid traces. Manifests execute no Python expressions.
+
+### Pinned acceptance runner
+
+- `formal-checks.json`
+- `run_formal_checks.py`
+
+The first matrix contains fixed and mutant abstract-core checks, one-worker
+liveness, a two-worker heterogeneous cutoff, fixed and compacting finite-network
+checks, four load-bearing network mutants, finite-network liveness, and the
+TLAPS core proof.
+
+The runner downloads nothing and requires:
+
+```text
+clean exact git revision
+stable TLC jar path + expected SHA-256
+differential TLC jar path + expected SHA-256
+tlapm path + expected SHA-256
+full Java and tlapm version output
+GNU time peak-RSS evidence
+one worker for every authoritative liveness run
+explicit CHECK_DEADLOCK in every config
+no unapproved state/action constraints
+no symmetry in authoritative runs
+nonzero generated/distinct state counts
+complete state-space result
+intended property named directly by each mutant config
+retained JSON trace + trace-to-harness validation for every counterexample
+actual all-obligations-proved TLAPS result
+```
+
+## Required execution
+
+From a clean checkout at the exact branch revision:
 
 ```sh
-python3 formal/assignment_fence_reference.py
-python3 formal/assignment_fence_reference.py --json
+python3 formal/trace_to_harness_test.py
+
+python3 formal/run_formal_checks.py \
+  --manifest formal/formal-checks.json \
+  --repo . \
+  --artifacts /absolute/path/to/immutable-run-dir \
+  --expected-git-sha <FULL_GIT_SHA> \
+  --stable-jar /cache/tla2tools-1.7.4.jar \
+  --stable-sha256 <LOCALLY_VERIFIED_64_HEX_SHA256> \
+  --differential-jar /cache/tla2tools-differential.jar \
+  --differential-sha256 <LOCALLY_VERIFIED_64_HEX_SHA256> \
+  --tlapm /absolute/path/to/tlapm \
+  --tlapm-sha256 <LOCALLY_VERIFIED_64_HEX_SHA256>
 ```
 
-Local construction run used Python 3.13 and produced:
+Retain the entire artifact directory. The issue reply must include the exact
+revision, commands, jar/binary hashes, Java/tlapm/backend versions, generated
+and distinct state counts, depth, elapsed time, peak RSS, process exits, the
+named property/result for every run, JSON trace paths, harness-adapter results,
+and the TLAPS obligation summary.
 
-```text
-PASS                        AssignmentFenceCoreFixed (55 states)
-EXPECTED_COUNTEREXAMPLE     P50MixedFleetMutant (11 states)
-EXPECTED_COUNTEREXAMPLE     ReleaseClaimedMutant (21 states)
-PASS                        P49DefaultDenyAfterCompaction (5 states)
-EXPECTED_COUNTEREXAMPLE     P49FiniteTombstoneDefaultAllow (6 states)
-PASS                        UseCSExactHandoff (4 states)
-EXPECTED_COUNTEREXAMPLE     UseCSExactHandoffMutant (4 states)
-PASS                        FSessionExactQuiescence (4 states)
-EXPECTED_COUNTEREXAMPLE     FSessionWrongChildReap (4 states)
-```
+## Deterministic reference constructors
 
-Source SHA-256 from that run:
+The Python reference constructors remain useful for expected trace names and
+cross-checking model intent. They are not TLC or TLAPS evidence and cannot be
+used as acceptance substitutes.
 
-```text
-assignment_fence_reference.py  fec6759dd726e2bcfdc36633335abc26092699858822a1de10234f704eccd899
-AssignmentFenceCore.tla        6eaf32e92fee37de9d82c5989e8b0f1a887ec9b272ef5de3f620ab5463c523bb
-```
+## Still required beyond this first matrix
 
-The reference checker is deliberately independent and finite. It is useful for trace names, mutation discrimination and C++ harness generation, but it does not satisfy issue #4's TLC/TLAPS requirement. `mickg10/local-oracle` must syntax-check the TLA+ module, run the fixed and mutant configurations on the required toolchains, and replace this status with retained tool output before the protocol design is accepted.
+The first executable layer does not by itself close issue #4. The canonical
+acceptance branch must still incorporate and execute:
+
+- protocol-43 frozen-client/restart counterexamples;
+- exact compatibility projection plus OLD/NEW socketpair codec fixtures;
+- lifecycle-authority, pre-login, allocator, handoff, and F-session-quiescence
+  TLC configs with direct-property mutants and trace manifests;
+- exact model-to-message/handler/test mapping;
+- mickg10 cluster mixed-version, fault, scale, latency, throughput, memory,
+  descriptor, and scheduler-turn evidence; and
+- final independent `mickgvirtu/implementer` review only after the mickg10
+  evidence is complete.
