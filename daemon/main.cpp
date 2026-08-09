@@ -467,7 +467,7 @@ public:
      * WAITCREATEENV: We're waiting for icecc-create-env to finish.
      */
     enum Status { UNKNOWN, GOTNATIVE, PENDING_USE_CS, JOBDONE, LINKJOB, TOINSTALL, WAITINSTALL, TOCOMPILE,
-                  WAITFORCS, WAITCOMPILE, CLIENTWORK, WAITFORCHILD, WAITCREATEENV,
+                  WAITFORCS, FORWARDING_USE_CS, WAITCOMPILE, CLIENTWORK, WAITFORCHILD, WAITCREATEENV,
                   LASTSTATE = WAITCREATEENV
                 } status;
     Client() {
@@ -530,6 +530,8 @@ public:
             return "tocompile";
         case WAITFORCS:
             return "waitforcs";
+        case FORWARDING_USE_CS:
+            return "forwarding_use_cs";
         case CLIENTWORK:
             return "clientwork";
         case WAITCOMPILE:
@@ -3133,6 +3135,7 @@ bool Daemon::should_track_client_job(const Client *client)
     case Client::LINKJOB:
     case Client::TOCOMPILE:
     case Client::WAITFORCS:
+    case Client::FORWARDING_USE_CS:
     case Client::WAITCOMPILE:
     case Client::CLIENTWORK:
     case Client::WAITFORCHILD:
@@ -4094,6 +4097,13 @@ bool Daemon::maybe_stats(bool force_check)
     return true;
 }
 
+/* Exact-identity handoff observability (issue #4 P0-A): the lifecycle
+   gate reads these from dump_internals().  */
+static unsigned long usecs_delivery_attempts = 0;
+static unsigned long usecs_frames_committed = 0;
+static unsigned long usecs_exact_aborts = 0;
+static unsigned long duplicate_settlements_rejected = 0;
+
 string Daemon::dump_internals() const
 {
     string result;
@@ -4101,6 +4111,14 @@ string Daemon::dump_internals() const
 
     result += "Node Name: " + nodename + "\n";
     result += "  Remote name: " + remote_name + "\n";
+    {
+        char handoff[160];
+        snprintf(handoff, sizeof(handoff),
+                 "  UseCS handoff: attempts=%lu committed=%lu exact_aborts=%lu dup_settlements_rejected=%lu\n",
+                 usecs_delivery_attempts, usecs_frames_committed,
+                 usecs_exact_aborts, duplicate_settlements_rejected);
+        result += handoff;
+    }
 
     struct StatusAgg {
         uint32_t count = 0;
@@ -4368,6 +4386,7 @@ std::string Daemon::dump_state_json() const
         switch (s) {
         case Client::LINKJOB:
         case Client::WAITFORCS:
+        case Client::FORWARDING_USE_CS:
         case Client::PENDING_USE_CS:
         case Client::WAITCOMPILE:
         case Client::CLIENTWORK:
@@ -4802,11 +4821,46 @@ int Daemon::scheduler_use_cs(UseCSMsg *msg)
         c->usecsmsg = new UseCSMsg(msg->host_platform, msg->hostname, msg->port,
                                    msg->job_id, true, 1, msg->matched_job_id);
 
+        /* EXACT identity is persisted BEFORE the framed write starts, and
+           the client is moved to an explicit handoff phase.  If the write
+           fails partway, handle_end() then settles with the exact
+           scheduler job id (a plain FROM_SUBMITTER JobDone) -- the old
+           order assigned job_id only after a successful send, so the
+           teardown settled with unknown_job_client_id, which the
+           scheduler's cancellation sweep deliberately does not apply to a
+           DISPATCHED job: the assignment, its dispatch debit, and the
+           worker reservation all stayed live (release blocker A).  */
+        c->job_id = msg->job_id;
+        c->last_known_job_id = msg->job_id;
+        c->set_status(Client::FORWARDING_USE_CS, "scheduler_use_cs: forwarding UseCS");
+        ++usecs_delivery_attempts;
+
+        /* Test-only injection seam (issue #4 P0-A traces): with
+           ICECC_TEST_USECS_FORWARD_FAIL=<n>, the nth forward attempt fails
+           deterministically before any frame byte reaches the client --
+           the socket is shut down so the framed write below reports the
+           failure through the normal path.  Unset in production.  */
+        {
+            static long test_fail_at = -2;
+            if (test_fail_at == -2) {
+                const char *e = getenv("ICECC_TEST_USECS_FORWARD_FAIL");
+                test_fail_at = e ? atol(e) : -1;
+            }
+            if (test_fail_at >= 0 && (long)usecs_delivery_attempts == test_fail_at) {
+                shutdown(c->channel->fd, SHUT_RDWR);
+            }
+        }
+
         if (!c->channel->send_msg(*msg)) {
+            ++usecs_exact_aborts;
             handle_end(c, 143);
             return 0;
         }
 
+        ++usecs_frames_committed;
+        /* Complete framed delivery: the assignment is now DELIVERY
+           UNCERTAIN until the client claims it at the worker (JobBegin
+           reaches the scheduler) or this connection ends.  */
         c->set_status(Client::WAITCOMPILE, "scheduler_use_cs: remote compile");
     }
 
@@ -5662,6 +5716,12 @@ void Daemon::handle_end(Client *client, int exitcode)
             assert( client->client_id > 0 );
         }
 
+        if (job_id == 0 && !use_client_id && client->last_known_job_id > 0) {
+            /* A settlement for this client's job was already issued (the
+               id is zeroed at issue time): reject the duplicate instead of
+               re-settling.  */
+            ++duplicate_settlements_rejected;
+        }
         if (job_id > 0 || use_client_id) {
             JobDoneMsg::from_type flag = JobDoneMsg::FROM_SUBMITTER;
 
@@ -5683,6 +5743,7 @@ void Daemon::handle_end(Client *client, int exitcode)
             case Client::PENDING_USE_CS:
             case Client::CLIENTWORK:
             case Client::WAITFORCS:
+            case Client::FORWARDING_USE_CS:
                 flag = JobDoneMsg::FROM_SUBMITTER;
                 break;
             }
@@ -5696,6 +5757,9 @@ void Daemon::handle_end(Client *client, int exitcode)
             if (!send_scheduler(msg)) {
                 trace() << "failed to reach scheduler for remote job done msg!" << endl;
             }
+            /* The settlement for this job id has been issued exactly once;
+               a repeated teardown path must not settle it again.  */
+            client->job_id = 0;
         } else if (client->status == Client::CLIENTWORK) {
             // Clientwork && !job_id == LINK
             trace() << "scheduler->send_msg( JobLocalDoneMsg( " << client->client_id << ") );\n";
