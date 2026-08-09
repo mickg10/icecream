@@ -1,0 +1,36 @@
+{
+  "schema": 1,
+  "scenario": "JobIdAllocatorZeroMutant",
+  "property": "NoZero",
+  "expected_result": "counterexample",
+  "min_states": 2,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "AllocateZeroOnWrap",
+      "all": [
+        {"path": "cursor", "from": 3, "to": 0},
+        {"path": "issuedTotal", "from": 0, "to": 1},
+        {"path": "allocated", "from_len": 0, "to_len": 1}
+      ]
+    }
+  ],
+  "required_subsequence": ["AllocateZeroOnWrap"],
+  "final_all": [
+    {"path": "cursor", "eq": 0},
+    {"path": "issuedTotal", "eq": 1},
+    {"path": "allocated", "to_len": 1}
+  ],
+  "harness_steps": [
+    {
+      "after": "AllocateZeroOnWrap",
+      "emit": "assert_allocator_returned_protocol_sentinel_zero",
+      "actor": "scheduler"
+    }
+  ],
+  "metadata": {
+    "module": "JobIdAllocator",
+    "config": "JobIdAllocatorZeroMutant.cfg",
+    "mutant": "MutantAllowZero = TRUE"
+  }
+}
