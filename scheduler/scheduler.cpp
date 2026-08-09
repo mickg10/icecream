@@ -490,6 +490,95 @@ static unsigned long accepts_deferred_total = 0;
    re-serviced after one full scheduler turn.  */
 static bool accept_repoll = false;
 
+/* ONE scheduler-wide legacy internals fan-out at a time (issue #4 P1):
+   the legacy STATUS_TEXT reply carries no request id, so concurrent
+   fan-outs are not correlatable.  The old command was a serial blocking
+   transaction on the scheduler thread -- one blocking send plus a
+   10-second receive allowance PER worker; at 50 workers, minutes with no
+   dispatch, completion, accept, or timer work.  The transaction below
+   queues every request nonblocking, consumes replies from the normal
+   event loop, and enforces ONE whole-command absolute monotonic
+   deadline.  Targets are keyed by pointer AND connection generation so a
+   reconnected daemon (or a reused allocation) can never satisfy an old
+   target.  */
+struct InternalsTxn {
+    enum TargetState { WAITING_REPLY, REPLIED, DISCONNECTED, TIMED_OUT };
+    bool active = false;
+    CompileServer *control = nullptr;
+    unsigned int control_generation = 0;
+    uint64_t deadline_mono = 0;
+    std::map<CompileServer *, std::pair<unsigned int, TargetState> > targets;
+};
+static InternalsTxn internals_txn;
+static uint64_t internals_deadline_msec = 10000;   // whole-command default
+
+static bool internals_txn_all_terminal()
+{
+    for (const std::pair<CompileServer * const,
+                         std::pair<unsigned int, InternalsTxn::TargetState> > &t
+             : internals_txn.targets) {
+        if (t.second.second == InternalsTxn::WAITING_REPLY) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Emit one explicit result row per non-replied target, the terminal
+   frame, and clear the transaction.  Row content for REPLIED targets was
+   already streamed as the replies arrived.  */
+static void internals_txn_finish()
+{
+    InternalsTxn &txn = internals_txn;
+    if (!txn.active) {
+        return;
+    }
+    CompileServer *control = txn.control;
+    const bool control_live = control
+        && control->connectionGeneration() == txn.control_generation;
+    if (control_live) {
+        for (const std::pair<CompileServer * const,
+                             std::pair<unsigned int, InternalsTxn::TargetState> > &t
+                 : txn.targets) {
+            const char *why = nullptr;
+            switch (t.second.second) {
+            case InternalsTxn::REPLIED:
+                continue;
+            case InternalsTxn::WAITING_REPLY:
+            case InternalsTxn::TIMED_OUT:
+                why = " not reporting (timeout)\n";
+                break;
+            case InternalsTxn::DISCONNECTED:
+                why = " disconnected before reporting\n";
+                break;
+            }
+            control->send_msg(TextMsg(t.first->nodeName() + why));
+        }
+        control->send_msg(TextMsg(string("200 done")));
+    }
+    txn.active = false;
+    txn.control = nullptr;
+    txn.targets.clear();
+}
+
+/* Deadline tick, run once per scheduler turn.  */
+static void internals_txn_tick()
+{
+    if (!internals_txn.active) {
+        return;
+    }
+    if (icecream_monotonic_msec() >= internals_txn.deadline_mono) {
+        for (std::pair<CompileServer * const,
+                       std::pair<unsigned int, InternalsTxn::TargetState> > &t
+                 : internals_txn.targets) {
+            if (t.second.second == InternalsTxn::WAITING_REPLY) {
+                t.second.second = InternalsTxn::TIMED_OUT;
+            }
+        }
+        internals_txn_finish();
+    }
+}
+
 static void prelogin_read_overrides()
 {
     const char *e;
@@ -2862,39 +2951,54 @@ static bool handle_line(CompileServer *cs, Msg *_m)
             }
         }
     } else if (cmd == "internals") {
+        if (internals_txn.active) {
+            /* The legacy STATUS_TEXT reply has no request id: one
+               fan-out at a time, and a concurrent request is told so
+               explicitly with complete terminal framing.  */
+            if (!cs->send_msg(TextMsg(string("500 internals busy\n")))) {
+                return false;
+            }
+            return cs->send_msg(TextMsg(string("200 done")));
+        }
+        internals_txn.active = true;
+        internals_txn.control = cs;
+        internals_txn.control_generation = cs->connectionGeneration();
+        internals_txn.deadline_mono = icecream_monotonic_msec()
+                                      + internals_deadline_msec;
+        internals_txn.targets.clear();
         for (CompileServer * const it : css) {
-            Msg *msg = nullptr;
-
             if (!l.empty()) {
                 list<string>::const_iterator si;
-
                 for (si = l.begin(); si != l.end(); ++si) {
                     if (it->matches(*si)) {
                         break;
                     }
                 }
-
                 if (si == l.end()) {
                     continue;
                 }
             }
-
-            if (it->send_msg(GetInternalStatus())) {
-                msg = it->get_msg();
-            }
-
-            if (msg && *msg == Msg::STATUS_TEXT) {
-                if (!cs->send_msg(TextMsg(dynamic_cast<StatusTextMsg *>(msg)->text))) {
-                    return false;
-                }
+            /* Nonblocking, deferrable: backpressure parks the frame on
+               the channel's own output queue and the normal POLLOUT
+               flushing owns it; a hard send error settles the target
+               immediately.  */
+            if (it->send_msg(GetInternalStatus(),
+                             MsgChannel::SendNonBlocking | MsgChannel::SendDeferrable)) {
+                internals_txn.targets[it] =
+                    std::make_pair(it->connectionGeneration(),
+                                   InternalsTxn::WAITING_REPLY);
             } else {
-                if (!cs->send_msg(TextMsg(it->nodeName() + " not reporting\n"))) {
-                    return false;
-                }
+                internals_txn.targets[it] =
+                    std::make_pair(it->connectionGeneration(),
+                                   InternalsTxn::DISCONNECTED);
             }
-
-            delete msg;
         }
+        if (internals_txn.targets.empty() || internals_txn_all_terminal()) {
+            internals_txn_finish();
+        }
+        /* No trailing 200 done here: the transaction emits it when every
+           target is terminal or the whole-command deadline expires.  */
+        return true;
     } else if (cmd == "help") {
         if (!cs->send_msg(TextMsg(
                              "listcs\nlistblocks\nlistjobs [v|verbose]\nlistrequests\nestimates\nremovecs\nblockcs\nunblockcs\ninternals\nhelp\nquit"))) {
@@ -2946,6 +3050,29 @@ static bool try_login(CompileServer *cs, Msg *m)
 static bool handle_end(CompileServer *toremove, Msg *m)
 {
     prelogin_release(toremove);
+
+    /* Settle any internals-transaction involvement exactly once: a dead
+       control cancels the whole fan-out (late replies revert to the
+       unsolicited path); a dead target settles as DISCONNECTED for ITS
+       generation only.  */
+    if (internals_txn.active) {
+        if (toremove == internals_txn.control) {
+            internals_txn.active = false;
+            internals_txn.control = nullptr;
+            internals_txn.targets.clear();
+        } else {
+            std::map<CompileServer *, std::pair<unsigned int, InternalsTxn::TargetState> >::iterator
+                tit = internals_txn.targets.find(toremove);
+            if (tit != internals_txn.targets.end()
+                    && tit->second.first == toremove->connectionGeneration()
+                    && tit->second.second == InternalsTxn::WAITING_REPLY) {
+                tit->second.second = InternalsTxn::DISCONNECTED;
+                if (internals_txn_all_terminal()) {
+                    internals_txn_finish();
+                }
+            }
+        }
+    }
 
 #if DEBUG_SCHEDULER > 1
     trace() << "Handle_end " << toremove << " " << m << endl;
@@ -3154,10 +3281,30 @@ static bool handle_activity(CompileServer *cs)
     case Msg::BLACKLIST_HOST_ENV:
         ret = handle_blacklist_host_env(cs, m);
         break;
-    case Msg::STATUS_TEXT:
-        log_info() << "StatusTextMsg from " << cs->nodeName() << ": " << static_cast<StatusTextMsg*>(m)->text << endl;
+    case Msg::STATUS_TEXT: {
+        std::map<CompileServer *, std::pair<unsigned int, InternalsTxn::TargetState> >::iterator
+            tit = internals_txn.active ? internals_txn.targets.find(cs)
+                                       : internals_txn.targets.end();
+        if (tit != internals_txn.targets.end()
+                && tit->second.first == cs->connectionGeneration()
+                && tit->second.second == InternalsTxn::WAITING_REPLY) {
+            tit->second.second = InternalsTxn::REPLIED;
+            CompileServer *control = internals_txn.control;
+            if (control && control->connectionGeneration()
+                               == internals_txn.control_generation) {
+                control->send_msg(TextMsg(static_cast<StatusTextMsg*>(m)->text));
+            }
+            if (internals_txn_all_terminal()) {
+                internals_txn_finish();
+            }
+        } else {
+            /* Unsolicited (or duplicate) status: keep the legacy
+               logging; it does not touch transaction accounting.  */
+            log_info() << "StatusTextMsg from " << cs->nodeName() << ": " << static_cast<StatusTextMsg*>(m)->text << endl;
+        }
         ret = true;
         break;
+    }
     default:
         log_info() << "Invalid message type arrived " << m->to_string() << endl;
         handle_end(cs, m);
@@ -3768,6 +3915,16 @@ int main(int argc, char *argv[])
         if (!daemon_listener_armed) {
             const time_t remaining = next_listen - time(nullptr);
             const time_t secs = remaining > 0 ? remaining : 0;
+            if (timeout < 0 || secs < timeout) {
+                timeout = secs;
+            }
+        }
+        internals_txn_tick();
+        if (internals_txn.active) {
+            const uint64_t now_mono = icecream_monotonic_msec();
+            const uint64_t left = internals_txn.deadline_mono > now_mono
+                ? internals_txn.deadline_mono - now_mono : 0;
+            const time_t secs = (time_t)((left + 999) / 1000);
             if (timeout < 0 || secs < timeout) {
                 timeout = secs;
             }
