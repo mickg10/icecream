@@ -602,6 +602,16 @@ int main(int argc, char **argv)
        must not emit a terminal for global id 0.  Correction B.2a; the
        oracle noted B had no discriminating trace.  */
     const bool duplocal_mode = argc > 5 && strcmp(argv[5], "duplocal") == 0;
+    /* "exhaust": a batch whose remaining members exceed the wire-id domain
+       must fail FATALLY -- the submitter generation closed, no staged
+       survivors, unrelated peers live -- not park and retry the same
+       member forever.  Correction B.2b; driven by a tiny id domain.  */
+    const bool exhaust_mode = argc > 5 && strcmp(argv[5], "exhaust") == 0;
+    if (exhaust_mode) {
+        /* The forked scheduler inherits this: a domain of 8 makes a
+           count=20 batch un-completable.  */
+        setenv("ICECC_TEST_JOB_ID_DOMAIN", "8", 1);
+    }
     /* "retention": the proof that Stage-A retention is CORRECT, not merely
        non-destructive.  A quiet-but-healthy daemon crossing the report
        threshold, a sibling legitimately running across it, dispatch
@@ -1053,7 +1063,7 @@ int main(int argc, char **argv)
            connection stays (the scheduler keeps a second submitter), the
            traffic parks.  */
         if (leastbusy_mode || retention_mode || teardown_mode || internalsuaf_mode
-                || duplocal_mode) {
+                || duplocal_mode || exhaust_mode) {
             while (!shutdown) {
                 usleep(100 * 1000);
             }
@@ -3245,6 +3255,94 @@ int main(int argc, char **argv)
         delete sub; delete sub2; delete cs;
         kill(sched, SIGTERM);
         waitpid(sched, nullptr, 0);
+        if (failures) { fprintf(stderr, "RESULT: FAIL (%d)\n", failures); return 1; }
+        fprintf(stderr, "RESULT: PASS\n");
+        return 0;
+    }
+
+    if (exhaust_mode) {
+        auto login_submitter = [&](MsgChannel *ch, const char *name) {
+            LoginMsg login(0, name, kPlatform, 0);
+            login.envs.push_back(std::make_pair(kPlatform, kEnv));
+            login.max_kids = 0;
+            login.noremote = true;
+            return ch && ch->send_msg(login);
+        };
+        auto get_cs = [&](MsgChannel *ch, unsigned count, unsigned cid, const char *f) {
+            GetCSMsg g(Environments{std::make_pair(std::string(kPlatform), std::string(kEnv))},
+                       f, CompileJob::Lang_CXX, count, kPlatform, 0, std::string(), 0, 0, 0);
+            g.client_id = cid;
+            return ch->send_msg(g);
+        };
+        MsgChannel *subX = connect_daemon(port, 0);
+        MsgChannel *subP = connect_daemon(port, 0);
+        REQUIRE(subX && subP, "exhaust submitter + peer connected");
+        REQUIRE(login_submitter(subX, "fexX"), "exhaust submitter logged in");
+        REQUIRE(login_submitter(subP, "fexP"), "peer submitter logged in");
+        usleep(400 * 1000);
+
+        /* A batch of 20 into an 8-id domain: the preflight must fail it
+           fatally.  */
+        REQUIRE(get_cs(subX, 20, 8801, "exhaust.cpp"), "count=20 batch sent");
+        usleep(600 * 1000);
+
+        /* No staged survivors: listjobs shows no member of this batch.  */
+        long long survivors = -1;
+        {
+            const Clock::time_point t0 = Clock::now();
+            while (secs_since(t0) < 8) {
+                survivors = query_control_count(port, "listjobs", "exhaust.cpp");
+                if (survivors == 0) { break; }
+                usleep(200 * 1000);
+            }
+        }
+        REQUIRE(survivors == 0,
+                "the un-completable batch left NO staged survivors (fatal"
+                " exhaustion closed the generation; the pre-fix park-and-retry"
+                " leaves the domain-full staged members behind)");
+
+        /* The submitter generation was closed: subX sees EOF.  */
+        {
+            bool closed = false;
+            const Clock::time_point t0 = Clock::now();
+            while (!closed && secs_since(t0) < 5) {
+                Msg *m = subX->get_msg(1);
+                if (m) { delete m; }
+                if (subX->at_eof()) { closed = true; }
+                else if (!m) { usleep(100 * 1000); }
+            }
+            REQUIRE(closed, "the exhausted submitter's connection was closed");
+        }
+
+        /* An unrelated peer stays live and is served.  */
+        REQUIRE(get_cs(subP, 1, 8802, "peer.cpp"), "peer request sent");
+        unsigned pjid = 0;
+        {
+            const Clock::time_point t0 = Clock::now();
+            while (pjid == 0 && secs_since(t0) < 20) {
+                Msg *m = subP->get_msg(2);
+                if (!m) { continue; }
+                if (MSG_IS(m, USE_CS)) {
+                    UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                    if (u && u->client_id == 8802) { pjid = u->job_id; }
+                }
+                delete m;
+            }
+        }
+        REQUIRE(pjid != 0, "an unrelated peer is still served after the fatal batch");
+        if (pjid) { confirm_job(pjid); }
+
+        REQUIRE(waitpid(sched, nullptr, WNOHANG) == 0, "scheduler alive");
+        REQUIRE(!probe_died.load(), "control probe never lost the scheduler");
+
+        shutdown = true;
+        probe_thread.join(); cs_thread.join(); healthy_thread.join();
+        close(ctrl);
+        delete subX; delete subP; delete sub; delete sub2; delete cs;
+        kill(sched, SIGTERM);
+        int st = -1;
+        REQUIRE(waitpid(sched, &st, 0) == sched, "scheduler reaped");
+        REQUIRE(WIFEXITED(st) && WEXITSTATUS(st) == 0, "clean shutdown");
         if (failures) { fprintf(stderr, "RESULT: FAIL (%d)\n", failures); return 1; }
         fprintf(stderr, "RESULT: PASS\n");
         return 0;
