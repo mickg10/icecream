@@ -3607,13 +3607,26 @@ int main(int argc, char **argv)
                     && live_generation > 0,
                 "output phase preserves distinct deadlines and exact owner generation");
 
-        /* The corrected output-phase poll deadline sleeps.  Reusing the
-           expired collection deadline burns nearly one full CPU over this
-           wall interval and fails this process-local bound. */
+        /* Place the sample AFTER the collection deadline has expired but
+           BEFORE the output deadline.  Sampling immediately on entry to
+           FINAL_PENDING is vacuous: both deadline choices are still in the
+           future then.  In this interval the corrected output-phase poll
+           deadline sleeps, while reusing the expired collection deadline
+           burns nearly one full CPU over the two wall seconds. */
+        const uint64_t cpu_window_target = collection_deadline > 0
+            ? (uint64_t)collection_deadline + 250U : monotonic_msec();
+        if (output_deadline > 0
+                && (uint64_t)output_deadline > cpu_window_target + 2500U) {
+            while (monotonic_msec() < cpu_window_target) {
+                usleep(50 * 1000);
+            }
+        }
+        const uint64_t cpu_window_started = monotonic_msec();
         const long long cpu_before = process_cpu_ticks(sched);
         const int healthy_before = healthy_replies.load();
         usleep(2000 * 1000);
         const long long cpu_after = process_cpu_ticks(sched);
+        const uint64_t cpu_window_ended = monotonic_msec();
         const long ticks_per_second = sysconf(_SC_CLK_TCK);
         const Clock::time_point management_started = Clock::now();
         const std::string still_output = observer_dump("listjobs");
@@ -3621,6 +3634,10 @@ int main(int argc, char **argv)
         REQUIRE(dump_field(still_output, "internals_active=") == 1
                     && dump_field(still_output, "internals_final_pending=") == 1,
                 "CPU observation window remained inside FINAL_PENDING");
+        REQUIRE(collection_deadline > 0 && output_deadline > 0
+                    && cpu_window_started > (uint64_t)collection_deadline
+                    && cpu_window_ended < (uint64_t)output_deadline,
+                "CPU observation window is after collection expiry and before output expiry");
         REQUIRE(cpu_before >= 0 && cpu_after >= cpu_before
                     && ticks_per_second > 0
                     && cpu_after - cpu_before < (ticks_per_second * 3) / 4,
