@@ -4,16 +4,21 @@
 Version 2 owns tool hashes, TLC capability preflight, backend PATH pinning, and
 the differential matrix. Version 3 owns real TLC trace normalization and the
 expected-counterexample queue semantics. This overlay closes the remaining
-preflight and artifact-isolation holes exposed by real canonical runs:
+preflight, artifact-isolation, and cross-toolchain comparison holes exposed by
+real canonical runs:
 
 * backend version evidence must come from a successful backend-specific probe;
   nonzero usage/error output is never accepted as a version;
 * LS4, which has no ordinary version flag, is identified by its pinned hash,
   embedded ``ls4-1.0`` package marker, and GNU ELF build ID parsed directly
-  from the binary; and
+  from the binary;
 * TLAPS runs from a byte-identical copy of every local TLA+ module under the
   external artifact tree, so `.tlacache` and generated `*_TTrace_*` modules can
-  never dirty the exact source checkout.
+  never dirty the exact source checkout; and
+* stable/differential TLC must agree on generated/distinct counts, depth, named
+  property, essential event subsequence, lasso kind, and semantic harness
+  steps. Nonessential counterexample prefixes/interleavings are retained as
+  evidence but do not create a false disagreement after both manifests pass.
 
 The immutable artifact directory is rejected if it is inside the checkout.
 """
@@ -318,6 +323,147 @@ def run_tlaps_proof(
     return record
 
 
+def _semantic_harness_steps(adapter: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Discard only trace-position metadata from validated harness steps."""
+    result: list[dict[str, Any]] = []
+    for raw in adapter.get("harness_steps", []):
+        if not isinstance(raw, Mapping):
+            raise v2.FormalRunError("trace adapter emitted a non-object harness step")
+        result.append(
+            {
+                key: raw[key]
+                for key in (
+                    "after_event",
+                    "emit",
+                    "actor",
+                    "action",
+                    "notes",
+                    "arguments",
+                )
+                if key in raw
+            }
+        )
+    return result
+
+
+def _lasso_kind(adapter: Mapping[str, Any]) -> str | None:
+    lasso = adapter.get("lasso")
+    if lasso is None:
+        return None
+    if not isinstance(lasso, Mapping) or not isinstance(lasso.get("kind"), str):
+        raise v2.FormalRunError("trace adapter emitted malformed lasso metadata")
+    return str(lasso["kind"])
+
+
+def differential_compare(results: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Compare theorem-relevant results, not arbitrary trace prefixes."""
+    grouped: dict[str, dict[str, Mapping[str, Any]]] = {}
+    for result in results:
+        grouped.setdefault(str(result["id"]), {})[str(result["toolchain"])] = result
+
+    comparisons: list[dict[str, Any]] = []
+    for check_id, pair in sorted(grouped.items()):
+        if set(pair) != {"stable", "differential"}:
+            raise v2.FormalRunError(
+                f"{check_id}: acceptance requires stable and differential results"
+            )
+        stable = pair["stable"]
+        differential = pair["differential"]
+
+        if stable.get("expected") != differential.get("expected"):
+            raise v2.FormalRunError(
+                f"{check_id}: expected-result disagreement: "
+                f"stable={stable.get('expected')!r}, "
+                f"differential={differential.get('expected')!r}"
+            )
+        if stable.get("property") != differential.get("property"):
+            raise v2.FormalRunError(
+                f"{check_id}: named-property disagreement: "
+                f"stable={stable.get('property')!r}, "
+                f"differential={differential.get('property')!r}"
+            )
+
+        for key in ("generated_states", "distinct_states", "depth"):
+            left = stable["stats"][key]
+            right = differential["stats"][key]
+            if left != right:
+                raise v2.FormalRunError(
+                    f"{check_id}: toolchain disagreement for {key}: "
+                    f"stable={left}, differential={right}"
+                )
+
+        stable_adapter = stable.get("trace_adapter")
+        differential_adapter = differential.get("trace_adapter")
+        if (stable_adapter is None) != (differential_adapter is None):
+            raise v2.FormalRunError(
+                f"{check_id}: only one toolchain produced a validated trace"
+            )
+
+        essential_subsequence = None
+        semantic_steps = None
+        lasso_kind = None
+        stable_full_sequence = None
+        differential_full_sequence = None
+        if stable_adapter is not None:
+            if not isinstance(stable_adapter, Mapping) or not isinstance(
+                differential_adapter, Mapping
+            ):
+                raise v2.FormalRunError(
+                    f"{check_id}: malformed trace-adapter result"
+                )
+            stable_required = stable_adapter.get("required_subsequence")
+            differential_required = differential_adapter.get(
+                "required_subsequence"
+            )
+            if stable_required != differential_required:
+                raise v2.FormalRunError(
+                    f"{check_id}: essential-subsequence disagreement: "
+                    f"stable={stable_required!r}, "
+                    f"differential={differential_required!r}"
+                )
+            stable_steps = _semantic_harness_steps(stable_adapter)
+            differential_steps = _semantic_harness_steps(differential_adapter)
+            if stable_steps != differential_steps:
+                raise v2.FormalRunError(
+                    f"{check_id}: semantic harness-step disagreement: "
+                    f"stable={stable_steps!r}, differential={differential_steps!r}"
+                )
+            stable_lasso = _lasso_kind(stable_adapter)
+            differential_lasso = _lasso_kind(differential_adapter)
+            if stable_lasso != differential_lasso:
+                raise v2.FormalRunError(
+                    f"{check_id}: lasso-kind disagreement: "
+                    f"stable={stable_lasso!r}, differential={differential_lasso!r}"
+                )
+            essential_subsequence = stable_required
+            semantic_steps = stable_steps
+            lasso_kind = stable_lasso
+            stable_full_sequence = stable_adapter.get("event_sequence")
+            differential_full_sequence = differential_adapter.get(
+                "event_sequence"
+            )
+
+        comparisons.append(
+            {
+                "id": check_id,
+                "generated_states": stable["stats"]["generated_states"],
+                "distinct_states": stable["stats"]["distinct_states"],
+                "depth": stable["stats"]["depth"],
+                "property": stable.get("property"),
+                "essential_subsequence": essential_subsequence,
+                "semantic_harness_steps": semantic_steps,
+                "lasso_kind": lasso_kind,
+                "stable_full_event_sequence": stable_full_sequence,
+                "differential_full_event_sequence": differential_full_sequence,
+                "full_event_sequences_match": (
+                    stable_full_sequence == differential_full_sequence
+                ),
+                "status": "MATCH",
+            }
+        )
+    return comparisons
+
+
 _base_self_tests = v3.run_python_self_tests
 
 
@@ -359,6 +505,7 @@ def run_python_self_tests(
 # v2.main resolves these names from its module globals at runtime.
 v2.pin_backends = pin_backends
 v2.run_tlaps_proof = run_tlaps_proof
+v2.differential_compare = differential_compare
 v2.run_python_self_tests = run_python_self_tests
 
 
