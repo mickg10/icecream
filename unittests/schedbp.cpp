@@ -1691,6 +1691,7 @@ int main(int argc, char **argv)
                small requests on every host.  */
             long long bracket_vals[4] = { -1, -1, -1, -1 };
             long long gen_before[2] = { -1, -1 };
+            std::string topo_before;
             long long farm_capacity = -1;
             auto both_active = [&](int slot) {
                 /* The CONTENDED WINDOW must be proven from SCHEDULER-side
@@ -1743,13 +1744,54 @@ int main(int argc, char **argv)
                 const long long a8 = field_from_snapshot(snap.text, "fakesub8", "admitted_total=");
                 const long long g7 = field_from_snapshot(snap.text, "fakesub7", "gen=");
                 const long long g8 = field_from_snapshot(snap.text, "fakesub8", "gen=");
+                /* Worker-topology stability: capacity must be an UPPER
+                   bound for the whole interval, so the post bracket
+                   requires the identical worker set (names+capacities,
+                   captured as the sorted jobs= rows) -- a worker joining
+                   mid-bracket would raise capacity and invalidate the
+                   margin arithmetic.  */
+                std::string topo;
+                {
+                    /* Identity + MAX capacity only: the cur half of
+                       jobs=cur/max is live occupancy and changes with
+                       every dispatch -- it is not topology.  */
+                    std::vector<std::string> rows;
+                    size_t tpos = 0;
+                    while ((tpos = snap.text.find(" jobs=", tpos)) != std::string::npos) {
+                        const size_t bol = snap.text.rfind('\n', tpos);
+                        const size_t slash = snap.text.find('/', tpos);
+                        const size_t eol = snap.text.find('\n', tpos);
+                        if (slash == std::string::npos
+                            || (eol != std::string::npos && slash > eol)) {
+                            tpos += 6;
+                            continue;
+                        }
+                        const size_t name_start = bol == std::string::npos ? 0 : bol;
+                        std::string row = snap.text.substr(name_start, tpos - name_start);
+                        const size_t cap_end = snap.text.find(' ', slash);
+                        row += snap.text.substr(slash,
+                                                cap_end == std::string::npos ? std::string::npos
+                                                                             : cap_end - slash);
+                        rows.push_back(row);
+                        tpos += 6;
+                    }
+                    std::sort(rows.begin(), rows.end());
+                    for (const std::string &r : rows) { topo += r; }
+                }
                 if (slot == 0) {
                     gen_before[0] = g7;
                     gen_before[1] = g8;
+                    topo_before = topo;
                 } else {
                     /* An admitted counter is only comparable within one
-                       connection generation.  */
+                       connection generation, and the margin arithmetic
+                       only holds under an unchanged worker topology.  */
                     if (g7 != gen_before[0] || g8 != gen_before[1]) {
+                        return false;
+                    }
+                    if (topo != topo_before) {
+                        fprintf(stderr, "# contract: worker topology changed"
+                                " across the bracket; sample rejected\n");
                         return false;
                     }
                 }
