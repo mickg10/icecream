@@ -1,0 +1,68 @@
+{
+  "schema": 1,
+  "scenario": "LifecycleAuthorityDetachedSubmitterMutant",
+  "property": "DetachedTerminalAuthority",
+  "expected_result": "counterexample",
+  "min_states": 4,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "AssignedWorkerBegin",
+      "all": [
+        {"path": "phase", "from": "Waiting", "to": "Started"},
+        {"path": "monitorBeginCount", "from": 0, "to": 1},
+        {"path": "dispatchDebit", "from": true, "to": false}
+      ]
+    },
+    {
+      "name": "DetachStartedSubmitter",
+      "all": [
+        {"path": "detached", "from": false, "to": true},
+        {"path": "attachedSubmitter", "to": "NoSubmitter"},
+        {"path": "liveSubmitterGeneration", "to": 0}
+      ]
+    },
+    {
+      "name": "DetachedSubmitterFalseTerminalAccepted",
+      "all": [
+        {"path": "phase", "from": "Started", "to": "Terminal"},
+        {"path": "terminalOrigin", "from": "None", "to": "SubmitterDone"},
+        {"path": "terminalSubmitterGeneration", "from": 0, "to": 202},
+        {"path": "rejectedDetachedSubmitter", "to": 0}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "AssignedWorkerBegin",
+    "DetachStartedSubmitter",
+    "DetachedSubmitterFalseTerminalAccepted"
+  ],
+  "final_all": [
+    {"path": "detached", "eq": true},
+    {"path": "phase", "eq": "Terminal"},
+    {"path": "terminalOrigin", "eq": "SubmitterDone"},
+    {"path": "terminalSubmitterGeneration", "eq": 202}
+  ],
+  "harness_steps": [
+    {
+      "after": "AssignedWorkerBegin",
+      "emit": "disconnect_original_submitter_after_job_begin",
+      "actor": "submitter-A"
+    },
+    {
+      "after": "DetachStartedSubmitter",
+      "emit": "replacement_submitter_sends_exact_from_submitter_done",
+      "actor": "submitter-B"
+    },
+    {
+      "after": "DetachedSubmitterFalseTerminalAccepted",
+      "emit": "assert_running_worker_job_was_terminalized_by_detached_submitter",
+      "actor": "scheduler"
+    }
+  ],
+  "metadata": {
+    "module": "LifecycleAuthority",
+    "config": "LifecycleAuthorityDetachedSubmitterMutant.cfg",
+    "mutant": "MutantDetachedSubmitterTerminates = TRUE"
+  }
+}
