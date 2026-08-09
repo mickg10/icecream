@@ -22,7 +22,7 @@ curl --fail --location --retry 3 \
   https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
 sha256sum /tmp/tla2tools.jar | tee formal/gatelogs/tla2tools.sha256
 java -version > formal/gatelogs/java-version.txt 2>&1
-java -cp /tmp/tla2tools.jar tlc2.TLC -help > formal/gatelogs/tlc-help.txt 2>&1
+java -cp /tmp/tla2tools.jar tlc2.TLC -help > formal/gatelogs/tlc-help.txt 2>&1 || true
 head -n 8 formal/gatelogs/tlc-help.txt
 
 cd formal
