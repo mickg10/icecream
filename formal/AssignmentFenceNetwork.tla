@@ -2,28 +2,34 @@
 (***************************************************************************
 Finite network model for the strict enforcing assignment-fence protocol.
 
-The abstract core proves assignment ownership without transport.  This module
-adds bounded FIFO streams and distinguishes:
+The abstract core has no transport.  This module adds bounded FIFO streams and
+separates three events that product code must not conflate:
 
   queued frame     -- accepted into a channel output buffer;
   flushed frame    -- consumed from that FIFO by the peer;
   protocol result  -- consumed and applied by the receiving state machine.
 
-Two ownership tokens remain separate:
+Two ownership tokens remain distinct:
 
   schedulerReservation[a]  S still owns logical assignment a;
   workerSlot[a]            F still consumes physical capacity for a.
 
 F may free workerSlot when REVOKE linearizes, but S may clear
-schedulerReservation only after consuming the complete REVOKED result.  A
-live-session FIFO may stop draining forever; safety has no drain-fairness
-assumption.  Liveness configurations may add weak fairness for the exact drain
-and processing actions, or take the explicit session-loss transition.
+schedulerReservation only after consuming the complete REVOKED result.  Safety
+has no drain-fairness assumption.  The liveness configuration adds weak
+fairness only for live-link FIFO drain actions; connection loss remains an
+explicit alternative terminal transition.
 
-The four mutant switches remove one load-bearing premise each:
+The model also consumes stale but well-formed frames.  Examples are READY that
+was already in F->S when S queued REVOKE, a complete UseCS frame that reaches D
+after F has fenced the assignment, and STARTED that trails BEGIN/DONE after a
+late REVOKE.  Ignoring these cases deadlocks a FIFO and is not a valid network
+model.
+
+Mutants remove one load-bearing premise each:
 
   MutantUseCSBeforeReady       expose UseCS before READY is consumed;
-  MutantReleaseOnFEnqueue      S releases when F queues REVOKED;
+  MutantReleaseOnFEnqueue      S releases when F merely queues REVOKED;
   MutantDefaultAllowUnknown    a compacted legacy id can start after release;
   MutantF2SBypass              S consumes a later F->S frame before its FIFO
                               predecessor.
@@ -176,13 +182,20 @@ FReceivePrepare ==
                     revokedEnqueued, revokedConsumed, beginConsumed,
                     s2d, lastF2SConsumed, sfLive, sdLive>>
 
+(***************************************************************************
+READY can already be in F->S when S decides to revoke.  Consume it in FIFO
+order.  It advances Prepared->Ready only when still current; in RevokeQueued
+or another later phase it is a stale observation and must not resurrect state.
+***************************************************************************)
 SReceiveReady ==
     /\ sfLive
     /\ Len(f2s) > 0
     /\ ChosenF2S.kind = "READY"
     /\ LET a == ChosenF2S.assignment
-       IN /\ phase[a] = "Prepared"
-          /\ phase' = [phase EXCEPT ![a] = "Ready"]
+       IN /\ phase' =
+                IF phase[a] = "Prepared"
+                THEN [phase EXCEPT ![a] = "Ready"]
+                ELSE phase
           /\ readySeen' = [readySeen EXCEPT ![a] = TRUE]
     /\ lastF2SConsumed' = ChosenF2S.seq
     /\ f2s' = RemoveAt(f2s, ChosenF2SIndex)
@@ -207,13 +220,21 @@ SQueueUseCS(a) ==
                     revokedEnqueued, revokedConsumed, beginConsumed,
                     s2f, f2s, nextF2SSeq, lastF2SConsumed, sfLive, sdLive>>
 
+(***************************************************************************
+A complete UseCS frame cannot be retracted from an independent stream.  If it
+arrives after S queued REVOKE or after F fenced the assignment, consume it and
+record delivery without moving the scheduler phase backward.  F's record/fence
+still decides whether a later claim can start.
+***************************************************************************)
 DReceiveUseCS ==
     /\ sdLive
     /\ Len(s2d) > 0
     /\ s2d[1].kind = "USECS"
     /\ LET a == s2d[1].assignment
-       IN /\ phase[a] = "UseCSQueued"
-          /\ phase' = [phase EXCEPT ![a] = "DeliveryUncertain"]
+       IN /\ phase' =
+                IF phase[a] = "UseCSQueued"
+                THEN [phase EXCEPT ![a] = "DeliveryUncertain"]
+                ELSE phase
           /\ usecsDelivered' = [usecsDelivered EXCEPT ![a] = TRUE]
     /\ s2d' = Tail(s2d)
     /\ UNCHANGED <<fState, schedulerReservation, workerSlot, released,
@@ -271,8 +292,11 @@ SReceiveBegin ==
     /\ Len(f2s) > 0
     /\ ChosenF2S.kind = "BEGIN"
     /\ LET a == ChosenF2S.assignment
-       IN /\ fState[a] = "Started"
-          /\ phase' = [phase EXCEPT ![a] = "Started"]
+       IN /\ startCount[a] > 0
+          /\ phase' =
+                IF released[a]
+                THEN phase
+                ELSE [phase EXCEPT ![a] = "Started"]
           /\ beginConsumed' = [beginConsumed EXCEPT ![a] = TRUE]
     /\ lastF2SConsumed' = ChosenF2S.seq
     /\ f2s' = RemoveAt(f2s, ChosenF2SIndex)
@@ -349,19 +373,55 @@ FReceiveRevokeStarted ==
                     startAfterRelease, revokedEnqueued, revokedConsumed,
                     beginConsumed, s2d, lastF2SConsumed, sfLive, sdLive>>
 
+(***************************************************************************
+The process may finish and queue DONE before a previously queued REVOKE reaches
+F.  F must still consume the request and return STARTED/already-started; the
+result trails BEGIN/DONE in the same FIFO and S treats it as stale if DONE has
+already terminalized the assignment.
+***************************************************************************)
+FReceiveRevokeAfterDone ==
+    /\ sfLive
+    /\ Len(s2f) > 0
+    /\ s2f[1].kind = "REVOKE"
+    /\ LET a == s2f[1].assignment
+       IN /\ fState[a] = "None"
+          /\ startCount[a] > 0
+          /\ Len(f2s) < MaxF2S
+          /\ f2s' = Append(f2s, Msg("STARTED", a, nextF2SSeq))
+    /\ s2f' = Tail(s2f)
+    /\ nextF2SSeq' = nextF2SSeq + 1
+    /\ UNCHANGED <<phase, fState, schedulerReservation, workerSlot,
+                    released, releaseCause, terminalCount, readySeen,
+                    usecsDelivered, claimMade, claimExact, startCount,
+                    startAfterRelease, revokedEnqueued, revokedConsumed,
+                    beginConsumed, s2d, lastF2SConsumed, sfLive, sdLive>>
+
 SReceiveRevoked ==
     /\ sfLive
     /\ Len(f2s) > 0
     /\ ChosenF2S.kind = "REVOKED"
     /\ LET a == ChosenF2S.assignment
-       IN /\ ~released[a]
-          /\ revokedEnqueued[a]
-          /\ phase' = [phase EXCEPT ![a] = "Terminal"]
+       IN /\ revokedEnqueued[a]
+          /\ phase' =
+                IF released[a]
+                THEN phase
+                ELSE [phase EXCEPT ![a] = "Terminal"]
           /\ schedulerReservation' =
-                 [schedulerReservation EXCEPT ![a] = FALSE]
-          /\ released' = [released EXCEPT ![a] = TRUE]
-          /\ releaseCause' = [releaseCause EXCEPT ![a] = "Revoked"]
-          /\ terminalCount' = [terminalCount EXCEPT ![a] = @ + 1]
+                IF released[a]
+                THEN schedulerReservation
+                ELSE [schedulerReservation EXCEPT ![a] = FALSE]
+          /\ released' =
+                IF released[a]
+                THEN released
+                ELSE [released EXCEPT ![a] = TRUE]
+          /\ releaseCause' =
+                IF released[a]
+                THEN releaseCause
+                ELSE [releaseCause EXCEPT ![a] = "Revoked"]
+          /\ terminalCount' =
+                IF released[a]
+                THEN terminalCount
+                ELSE [terminalCount EXCEPT ![a] = @ + 1]
           /\ revokedConsumed' = [revokedConsumed EXCEPT ![a] = TRUE]
     /\ lastF2SConsumed' = ChosenF2S.seq
     /\ f2s' = RemoveAt(f2s, ChosenF2SIndex)
@@ -375,8 +435,11 @@ SReceiveStarted ==
     /\ Len(f2s) > 0
     /\ ChosenF2S.kind = "STARTED"
     /\ LET a == ChosenF2S.assignment
-       IN /\ fState[a] = "Started"
-          /\ phase' = [phase EXCEPT ![a] = "Started"]
+       IN /\ startCount[a] > 0
+          /\ phase' =
+                IF released[a]
+                THEN phase
+                ELSE [phase EXCEPT ![a] = "Started"]
     /\ lastF2SConsumed' = ChosenF2S.seq
     /\ f2s' = RemoveAt(f2s, ChosenF2SIndex)
     /\ UNCHANGED <<fState, schedulerReservation, workerSlot, released,
@@ -404,14 +467,26 @@ SReceiveDone ==
     /\ Len(f2s) > 0
     /\ ChosenF2S.kind = "DONE"
     /\ LET a == ChosenF2S.assignment
-       IN /\ schedulerReservation[a]
-          /\ ~released[a]
-          /\ phase' = [phase EXCEPT ![a] = "Terminal"]
+       IN /\ phase' =
+                IF released[a]
+                THEN phase
+                ELSE [phase EXCEPT ![a] = "Terminal"]
           /\ schedulerReservation' =
-                 [schedulerReservation EXCEPT ![a] = FALSE]
-          /\ released' = [released EXCEPT ![a] = TRUE]
-          /\ releaseCause' = [releaseCause EXCEPT ![a] = "Done"]
-          /\ terminalCount' = [terminalCount EXCEPT ![a] = @ + 1]
+                IF released[a]
+                THEN schedulerReservation
+                ELSE [schedulerReservation EXCEPT ![a] = FALSE]
+          /\ released' =
+                IF released[a]
+                THEN released
+                ELSE [released EXCEPT ![a] = TRUE]
+          /\ releaseCause' =
+                IF released[a]
+                THEN releaseCause
+                ELSE [releaseCause EXCEPT ![a] = "Done"]
+          /\ terminalCount' =
+                IF released[a]
+                THEN terminalCount
+                ELSE [terminalCount EXCEPT ![a] = @ + 1]
     /\ lastF2SConsumed' = ChosenF2S.seq
     /\ f2s' = RemoveAt(f2s, ChosenF2SIndex)
     /\ UNCHANGED <<fState, workerSlot, readySeen, usecsDelivered,
@@ -516,6 +591,7 @@ Next ==
     \/ \E a \in Assignments : SQueueRevoke(a)
     \/ FReceiveRevokeNotStarted
     \/ FReceiveRevokeStarted
+    \/ FReceiveRevokeAfterDone
     \/ SReceiveRevoked
     \/ SReceiveStarted
     \/ \E a \in Assignments : FComplete(a)
@@ -583,6 +659,13 @@ ReservationReleaseCoherence ==
 ReadyBeforeUseCS ==
     \A a \in Assignments : usecsDelivered[a] => readySeen[a]
 
+StartHasCausalChain ==
+    \A a \in Assignments :
+        startCount[a] > 0
+        => /\ readySeen[a]
+           /\ usecsDelivered[a]
+           /\ claimMade[a]
+
 ReleaseAfterRevokedConsume ==
     \A a \in Assignments :
         releaseCause[a] = "Revoked" => revokedConsumed[a]
@@ -590,6 +673,9 @@ ReleaseAfterRevokedConsume ==
 TokenRequiredExactness ==
     \A a \in Assignments :
         PolicyOf[a] = TokenRequired /\ claimMade[a] => claimExact[a]
+
+RevokedFenceHasNoStart ==
+    \A a \in Assignments : fState[a] = "Revoked" => startCount[a] = 0
 
 NoStartAfterRelease ==
     \A a \in Assignments : startAfterRelease[a] = 0
@@ -610,19 +696,30 @@ SafetyInvariant ==
     /\ CapacityBound
     /\ ReservationReleaseCoherence
     /\ ReadyBeforeUseCS
+    /\ StartHasCausalChain
     /\ ReleaseAfterRevokedConsume
     /\ TokenRequiredExactness
+    /\ RevokedFenceHasNoStart
     /\ NoStartAfterRelease
     /\ TerminalAtMostOnce
     /\ TerminalCoherence
 
 (***************************************************************************
-Weak fairness below is intentionally limited to live-link FIFO drains and
-peer processing.  SafetyInvariant is checked against Spec without fairness.
-Connection loss remains an explicit alternative transition.
+Weak fairness is intentionally limited to live-link FIFO drain/processing.
+SafetyInvariant is checked against Spec without fairness.  Connection loss is
+an explicit alternative transition.
 ***************************************************************************)
-DrainS2F == FReceivePrepare \/ FReceiveRevokeNotStarted \/ FReceiveRevokeStarted
-DrainF2S == SReceiveReady \/ SReceiveBegin \/ SReceiveRevoked \/ SReceiveStarted \/ SReceiveDone
+DrainS2F ==
+    FReceivePrepare
+    \/ FReceiveRevokeNotStarted
+    \/ FReceiveRevokeStarted
+    \/ FReceiveRevokeAfterDone
+DrainF2S ==
+    SReceiveReady
+    \/ SReceiveBegin
+    \/ SReceiveRevoked
+    \/ SReceiveStarted
+    \/ SReceiveDone
 DrainS2D == DReceiveUseCS
 
 FencedLivenessSpec ==
@@ -636,11 +733,12 @@ NoPermanentQueuedFrame ==
     /\ [](Len(f2s) > 0 /\ sfLive => <> (Len(f2s) = 0 \/ ~sfLive))
     /\ [](Len(s2d) > 0 /\ sdLive => <> (Len(s2d) = 0 \/ ~sdLive))
 
-MCCapacity == [w \in Workers |-> 1]
+FirstWorker == CHOOSE w \in Workers : TRUE
+OtherWorker == CHOOSE w \in Workers : w # FirstWorker
+MCCapacity ==
+    [w \in Workers |-> IF w = FirstWorker THEN 1 ELSE 2]
 MCWorkerOf ==
-    [a \in Assignments |->
-       IF a = "a0" THEN CHOOSE w \in Workers : TRUE
-       ELSE CHOOSE w \in Workers : w # CHOOSE x \in Workers : TRUE]
+    [a \in Assignments |-> IF a = "a0" THEN FirstWorker ELSE OtherWorker]
 MCPolicyOf ==
     [a \in Assignments |-> IF a = "a0" THEN TokenRequired ELSE LegacyId]
 
