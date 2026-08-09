@@ -1,0 +1,116 @@
+name: compatibility-formal
+
+on:
+  pull_request:
+    paths:
+      - "formal/**"
+      - ".github/workflows/compatibility-formal.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compatibility-formal-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+  TLC_174_SHA256: "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
+  TLC_180_SHA256: "e22f8ffb4bacdea0a871f444dd94fe5fb0d8013b3388ae39e82e26f852c735d5"
+
+jobs:
+  static:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Byte-level codec fixture
+        run: python3 formal/compatibility_codec_fixture_test.py
+      - name: Exact 31-row static contract
+        run: >-
+          python3 formal/compatibility_static_check.py
+          --manifest formal/compatibility-formal-checks-v1.json
+          --repo .
+          --formal-dir formal
+      - name: Static checker self-test
+        run: python3 formal/compatibility_static_check_test.py
+      - name: Shared runner and trace self-tests
+        run: |
+          python3 formal/trace_to_harness_test.py
+          python3 formal/tlc_text_trace_test.py
+          python3 formal/normalize_tlc_trace_test.py
+          python3 formal/run_formal_checks_v4_test.py
+          python3 formal/run_tlc_only_checks_v4_test.py
+      - name: Checkout remains clean
+        run: test -z "$(git status --porcelain --untracked-files=all)"
+
+  tlc:
+    needs: static
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: fixed
+            only: "compat-(old-f-old-c|new-f-old-c|new-f-new-c|old-f-new-c|mixed-f-mixed-c|new-f-mixed-c)"
+          - group: witness-a
+            only: "compat-(legacy-oldf-oldc-witness|fenced-newf-oldc-witness|token-newf-newc-witness|legacy-oldf-newc-witness|cancel-before-delivery-witness|fenced-revoke-witness|token-revoke-witness|legacy-restart-limitation-witness)"
+          - group: witness-b
+            only: "compat-(fenced-restart-limitation-witness|token-restart-reject-witness|worker-loss-witness|submitter-loss-witness|detached-completion-witness|mixed-legacy-token-witness|mixed-fenced-token-witness|old-projection-completion-witness)"
+          - group: mutants
+            only: "compat-.*-mutant"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install Java and GNU time
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openjdk-17-jre-headless time curl
+      - name: Download and verify pinned TLC jars
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 4 --retry-all-errors \
+            -o /tmp/tla2tools-1.7.4.jar \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+          curl --fail --location --retry 4 --retry-all-errors \
+            -o /tmp/tla2tools-1.8.0.jar \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
+          printf '%s  %s\n' "$TLC_174_SHA256" /tmp/tla2tools-1.7.4.jar | sha256sum -c -
+          printf '%s  %s\n' "$TLC_180_SHA256" /tmp/tla2tools-1.8.0.jar | sha256sum -c -
+          java -version
+          java -jar /tmp/tla2tools-1.7.4.jar -help > /tmp/tlc-174-help.txt 2>&1 || true
+          java -jar /tmp/tla2tools-1.8.0.jar -help > /tmp/tlc-180-help.txt 2>&1 || true
+      - name: Run pinned dual-TLC compatibility group
+        env:
+          GROUP: ${{ matrix.group }}
+          ONLY: ${{ matrix.only }}
+        run: |
+          set -euo pipefail
+          artifacts="/tmp/compatibility-${GROUP}"
+          rm -rf "$artifacts"
+          python3 formal/run_compatibility_checks.py \
+            --manifest formal/compatibility-formal-checks-v1.json \
+            --repo . \
+            --artifacts "$artifacts" \
+            --expected-git-sha "$(git rev-parse HEAD)" \
+            --stable-jar /tmp/tla2tools-1.7.4.jar \
+            --stable-sha256 "$TLC_174_SHA256" \
+            --differential-jar /tmp/tla2tools-1.8.0.jar \
+            --differential-sha256 "$TLC_180_SHA256" \
+            --only "$ONLY"
+      - name: Archive formal evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compatibility-${{ matrix.group }}-${{ github.sha }}
+          path: |
+            /tmp/compatibility-${{ matrix.group }}
+            /tmp/tlc-174-help.txt
+            /tmp/tlc-180-help.txt
+          if-no-files-found: warn
+          retention-days: 30
