@@ -32,7 +32,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tar --exclude=.git --exclude=applied-fairness-source.tar.gz -czf applied-fairness-source.tar.gz .
+          tar --exclude=.git -czf /tmp/applied-fairness-source.tar.gz .
+          cp /tmp/applied-fairness-source.tar.gz applied-fairness-source.tar.gz
           cp /tmp/pending.patch applied-fairness.patch
       - uses: actions/upload-artifact@v4
         with:
