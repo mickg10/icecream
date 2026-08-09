@@ -60,6 +60,7 @@
 
 #include "compileserver.h"
 #include "selection.h"
+#include "siblingpin.h"
 #include "job.h"
 #include "scheduler.h"
 
@@ -1954,26 +1955,14 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
         use_cs->setBusyInstalling(time(nullptr));
     }
 
-    string env;
-
-    if (!job->masterJobFor().empty()) {
-        Environments environments = job->environments();
-        for (Environments::const_iterator it = environments.begin(); it != environments.end(); ++it) {
-            if (it->first == use_cs->hostPlatform()) {
-                env = it->second;
-                break;
-            }
-        }
-    }
-
-    if (!env.empty()) {
-        list<Job *> masterJobFor = job->masterJobFor();
-        for (Job * const jobTmp : masterJobFor) {
-            // remove all other environments
-            jobTmp->clearEnvironments();
-            jobTmp->appendEnvironment(make_pair(use_cs->hostPlatform(), env));
-        }
-    }
+    /* Pin every sibling to the EXACT compatible environment already selected
+       for the master.  host_platform is the client environment platform
+       returned by envs_match()/can_install(); it may intentionally differ
+       from use_cs->hostPlatform() (for example i686 on an x86_64 worker). */
+    pin_sibling_environments(job,
+                             SiblingPinSelection{host_platform,
+                                                 job->selectedEnvironment(),
+                                                 use_cs->hostPlatform()});
 
     return true;
 }
