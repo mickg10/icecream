@@ -1,0 +1,62 @@
+{
+  "schema": 1,
+  "scenario": "AssignmentFenceNetworkUseCSBeforeReadyMutant",
+  "property": "ReadyBeforeUseCS",
+  "expected_result": "counterexample",
+  "min_states": 4,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "SPrepare.a0",
+      "all": [
+        {"path": "phase.a0", "from": "Absent", "to": "PrepareQueued"}
+      ]
+    },
+    {
+      "name": "SQueueUseCSBeforeReady.a0",
+      "all": [
+        {"path": "phase.a0", "from_in": ["PrepareQueued", "Prepared"], "to": "UseCSQueued"},
+        {"path": "s2d", "len_delta": 1},
+        {"path": "readySeen.a0", "to": false}
+      ]
+    },
+    {
+      "name": "DReceiveUseCSBeforeReady.a0",
+      "all": [
+        {"path": "usecsDelivered.a0", "from": false, "to": true},
+        {"path": "readySeen.a0", "to": false}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "SPrepare.a0",
+    "SQueueUseCSBeforeReady.a0",
+    "DReceiveUseCSBeforeReady.a0"
+  ],
+  "final_all": [
+    {"path": "usecsDelivered.a0", "eq": true},
+    {"path": "readySeen.a0", "eq": false}
+  ],
+  "harness_steps": [
+    {
+      "after": "SPrepare.a0",
+      "emit": "barrier_after_scheduler_reservation",
+      "actor": "scheduler"
+    },
+    {
+      "after": "SQueueUseCSBeforeReady.a0",
+      "emit": "expose_usecs_before_ready",
+      "actor": "scheduler"
+    },
+    {
+      "after": "DReceiveUseCSBeforeReady.a0",
+      "emit": "assert_client_observed_usecs_without_ready",
+      "actor": "submitter-daemon"
+    }
+  ],
+  "metadata": {
+    "module": "AssignmentFenceNetwork",
+    "config": "AssignmentFenceNetworkUseCSBeforeReadyMutant.cfg",
+    "mutant": "MutantUseCSBeforeReady = TRUE"
+  }
+}
