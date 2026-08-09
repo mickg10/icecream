@@ -1,0 +1,53 @@
+{
+  "schema": 1,
+  "scenario": "JobIdAllocatorDuplicateBeginMutant",
+  "property": "DuplicateBeginNoOrphan",
+  "expected_result": "counterexample",
+  "min_states": 3,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "LocalMonitorIdAllocated",
+      "all": [
+        {"path": "issuedTotal", "from": 0, "to": 1},
+        {"path": "allocated", "from_len": 0, "to_len": 1}
+      ]
+    },
+    {
+      "name": "DuplicateLocalBeginOverwritesMapping",
+      "all": [
+        {"path": "duplicateBeginCount", "from": 0, "to": 1},
+        {"path": "issuedTotal", "from": 1, "to": 2},
+        {"path": "allocated", "from_len": 1, "to_len": 2},
+        {"path": "ownerId", "changed": true}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "LocalMonitorIdAllocated",
+    "DuplicateLocalBeginOverwritesMapping"
+  ],
+  "final_all": [
+    {"path": "duplicateBeginCount", "eq": 1},
+    {"path": "issuedTotal", "eq": 2},
+    {"path": "allocated", "to_len": 2},
+    {"path": "releasedTotal", "eq": 0}
+  ],
+  "harness_steps": [
+    {
+      "after": "LocalMonitorIdAllocated",
+      "emit": "send_duplicate_job_local_begin_for_same_client_id",
+      "actor": "daemon"
+    },
+    {
+      "after": "DuplicateLocalBeginOverwritesMapping",
+      "emit": "assert_displaced_global_id_is_orphaned",
+      "actor": "scheduler"
+    }
+  ],
+  "metadata": {
+    "module": "JobIdAllocator",
+    "config": "JobIdAllocatorDuplicateBeginMutant.cfg",
+    "mutant": "MutantDuplicateOverwrite = TRUE"
+  }
+}
