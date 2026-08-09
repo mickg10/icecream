@@ -49,17 +49,17 @@
       "timeout_seconds": 1800
     },
     {
-      "id": "core-fair-liveness",
-      "module": "AssignmentFenceCore",
+      "id": "core-revoked-result-liveness",
+      "module": "AssignmentFenceCoreProgress",
       "config": "AssignmentFenceCoreFair.cfg",
       "kind": "liveness",
       "workers": 1,
       "expected": "pass",
-      "property": "EventualSettlement",
+      "property": "RevokedEventuallyConsumed",
       "toolchains": ["stable", "differential"],
       "timeout_seconds": 3600,
       "assumptions": [
-        "WF_vars(SettlementStep(a)) for each assignment; review against product progress before acceptance"
+        "For each assignment, weak fairness only for S consuming an already-linearized REVOKED result; compiler completion and worker loss are separate environment outcomes and are not assumed by this accepted theorem"
       ]
     },
     {
@@ -143,7 +143,7 @@
       "toolchains": ["stable", "differential"],
       "timeout_seconds": 7200,
       "assumptions": [
-        "Weak fairness only for live-link S-to-F, F-to-S, and S-to-D drain/processing actions; connection loss remains explicit"
+        "Weak fairness only for live-link S-to-F, F-to-S, S-to-D, and delayed-client-to-F drain/processing actions; connection loss remains explicit"
       ]
     },
     {
