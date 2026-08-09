@@ -1,0 +1,62 @@
+{
+  "schema": 1,
+  "scenario": "AssignmentFenceCoreReleaseMutant",
+  "property": "ReleaseSafety",
+  "expected_result": "counterexample",
+  "min_states": 4,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "Prepare.a0",
+      "all": [
+        {"path": "phase.a0", "from": "Absent", "to": "Prepared"},
+        {"path": "workerSlot.a0", "from": false, "to": true}
+      ]
+    },
+    {
+      "name": "ClaimToken.a0",
+      "all": [
+        {"path": "phase.a0", "from": "Prepared", "to": "Claimed"},
+        {"path": "claimant.a0", "to": "a0"},
+        {"path": "exactClaim.a0", "from": false, "to": true}
+      ]
+    },
+    {
+      "name": "MutantConsumeRevokedWhileClaimed.a0",
+      "all": [
+        {"path": "phase.a0", "from": "Claimed", "to": "Claimed"},
+        {"path": "released.a0", "from": false, "to": true},
+        {"path": "schedulerReservation.a0", "from": true, "to": false},
+        {"path": "terminalCount.a0", "from": 0, "to": 1}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "Prepare.a0",
+    "ClaimToken.a0",
+    "MutantConsumeRevokedWhileClaimed.a0"
+  ],
+  "final_all": [
+    {"path": "phase.a0", "eq": "Claimed"},
+    {"path": "released.a0", "eq": true},
+    {"path": "schedulerReservation.a0", "eq": false},
+    {"path": "terminalCount.a0", "eq": 1}
+  ],
+  "harness_steps": [
+    {
+      "after": "ClaimToken.a0",
+      "emit": "barrier_after_worker_claim",
+      "actor": "worker"
+    },
+    {
+      "after": "MutantConsumeRevokedWhileClaimed.a0",
+      "emit": "assert_scheduler_released_worker_owned_assignment",
+      "actor": "scheduler"
+    }
+  ],
+  "metadata": {
+    "module": "AssignmentFenceCore",
+    "config": "AssignmentFenceCoreReleaseMutant.cfg",
+    "mutant": "MutantReleaseClaimed = TRUE"
+  }
+}
