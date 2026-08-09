@@ -325,7 +325,7 @@ FClaimExact ==
           /\ claimedFull' = [claimedFull EXCEPT ![a] = m.full]
           /\ claimedToken' = [claimedToken EXCEPT ![a] = m.token]
           /\ claimAfterRevokeQueued' =
-                claimAfterRevokeQueued \/ phase[a] = "RevokeQueued"
+                (claimAfterRevokeQueued \/ phase[a] = "RevokeQueued")
     /\ c2f' = Tail(c2f)
     /\ UNCHANGED <<schedulerReservation, workerSlot, released, releaseCause,
                     terminalCount, readySeen, usecsDelivered, claimRejected,
@@ -354,7 +354,7 @@ FClaimLegacy ==
           /\ claimedFull' = [claimedFull EXCEPT ![a] = m.full]
           /\ claimedToken' = [claimedToken EXCEPT ![a] = m.token]
           /\ claimAfterRevokeQueued' =
-                claimAfterRevokeQueued \/ phase[a] = "RevokeQueued"
+                (claimAfterRevokeQueued \/ phase[a] = "RevokeQueued")
     /\ c2f' = Tail(c2f)
     /\ UNCHANGED <<schedulerReservation, workerSlot, released, releaseCause,
                     terminalCount, readySeen, usecsDelivered, claimRejected,
