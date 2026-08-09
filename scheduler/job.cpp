@@ -52,6 +52,7 @@ Job::Job(const unsigned int _id, CompileServer *subm)
     m_stateChangeTime = now;
     m_submitter->submittedJobsIncrement();
     m_submitterName = m_submitter->nodeName();
+    m_submitterGeneration = m_submitter->connectionGeneration();
 }
 
 Job::~Job()
@@ -66,6 +67,26 @@ Job::~Job()
     if (!m_submitterDetached) {
         m_submitter->submittedJobsDecrement();
     }
+}
+
+Job::TerminalDecision Job::authorizeTerminal(const CompileServer *sender,
+                                             uint64_t sender_generation,
+                                             bool from_server) const
+{
+    if (from_server) {
+        if (m_server && sender == m_server) {
+            return ACCEPT_WORKER;
+        }
+        return REJECT_WRONG_WORKER;
+    }
+    if (m_submitterDetached) {
+        return REJECT_DETACHED_SUBMITTER;
+    }
+    if (m_submitter && sender == m_submitter
+            && sender_generation == m_submitterGeneration) {
+        return ACCEPT_SUBMITTER;
+    }
+    return REJECT_WRONG_SUBMITTER;
 }
 
 void Job::detachSubmitter()

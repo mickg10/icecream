@@ -2408,29 +2408,25 @@ static bool handle_job_done(CompileServer *cs, Msg *_m)
         return false;
     }
 
-    if (m->is_from_server() && (j->server() != cs)) {
+    /* Centralized, phase- and origin-sensitive terminal authority.  The
+       decision comes from the job (pointer AND generation must match; a
+       detached job accepts no submitter-origin terminal at all); this
+       handler only maps the decision to the wire policy.  All mismatch
+       diagnostics are null-safe.  */
+    switch (j->authorizeTerminal(cs, cs->connectionGeneration(), m->is_from_server())) {
+    case Job::ACCEPT_WORKER:
+    case Job::ACCEPT_SUBMITTER:
+        break;
+    case Job::REJECT_WRONG_WORKER:
         log_info() << "the server isn't the same for job " << m->job_id << endl;
-        log_info() << "server: " << j->server()->nodeName() << endl;
+        log_info() << "server: "
+                   << (j->server() ? j->server()->nodeName() : string("<none>"))
+                   << endl;
         log_info() << "msg came from: " << cs->nodeName() << endl;
         // the daemon is not following matz's rules: kick him
         handle_end(cs, nullptr);
         return false;
-    }
-
-    /* Terminal authority.  For an ATTACHED job a non-worker completion is
-       accepted only from the live recorded submitter (the legacy race
-       rules); a mismatch is a protocol violation and the sender is kicked.
-       For a DETACHED job (its submitter disconnected while the job kept
-       COMPILING on a live worker) there is NO valid non-worker terminal
-       any more: only the recorded worker's own JobDone, or that worker's
-       disconnect, may end it.  A null submitter must never act as a
-       wildcard -- otherwise any daemon that reuses or guesses the id
-       (e.g. the disconnected submitter's replacement connection) could
-       tear down work still running on the worker.  The stale message is
-       ignored and counted; the sender is NOT kicked, because a stale id
-       arriving after its client vanished is normal daemon behaviour, not
-       a protocol violation.  */
-    if (!m->is_from_server() && j->submitterDetached()) {
+    case Job::REJECT_DETACHED_SUBMITTER:
         trace() << "ignoring non-worker completion for detached job "
                 << m->job_id << " from " << cs->nodeName()
                 << " (only worker " << (j->server() ? j->server()->nodeName()
@@ -2438,8 +2434,7 @@ static bool handle_job_done(CompileServer *cs, Msg *_m)
                 << " may terminate it)" << endl;
         ++detached_terminal_rejects;
         return true;
-    }
-    if (!m->is_from_server() && (j->submitter() != cs)) {
+    case Job::REJECT_WRONG_SUBMITTER:
         log_info() << "the submitter isn't the same for job " << m->job_id << endl;
         log_info() << "submitter: "
                    << (j->submitter() ? j->submitter()->nodeName()
@@ -2449,6 +2444,8 @@ static bool handle_job_done(CompileServer *cs, Msg *_m)
         handle_end(cs, nullptr);
         return false;
     }
+
+
 
     cs->setClientCount(m->client_count);
 

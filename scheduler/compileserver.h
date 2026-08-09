@@ -222,6 +222,7 @@ public:
     uint64_t preloginDeadline() const { return m_preloginDeadlineMono; }
     void setPreloginAccounted(bool a) { m_preloginAccounted = a; }
     bool preloginAccounted() const { return m_preloginAccounted; }
+
     void startInConnectionTest();
     time_t getConnectionTimeout();
     time_t getNextTimeout();

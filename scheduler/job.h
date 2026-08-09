@@ -26,6 +26,7 @@
 
 #include <list>
 #include <string>
+#include <stdint.h>
 #include <time.h>
 
 #include "../services/comm.h"
@@ -99,6 +100,22 @@ public:
     void detachSubmitter();
     bool submitterDetached() const { return m_submitterDetached; }
     const std::string &submitterName() const { return m_submitterName; }
+    uint64_t submitterGeneration() const { return m_submitterGeneration; }
+
+    /* Centralized exact terminal authority (phase- and origin-sensitive).
+       Pointer AND generation must both match: node-name equality never
+       grants authority, and a detached job accepts no submitter-origin
+       terminal at all.  */
+    enum TerminalDecision {
+        ACCEPT_WORKER,
+        ACCEPT_SUBMITTER,
+        REJECT_WRONG_WORKER,
+        REJECT_WRONG_SUBMITTER,
+        REJECT_DETACHED_SUBMITTER
+    };
+    TerminalDecision authorizeTerminal(const CompileServer *sender,
+                                       uint64_t sender_generation,
+                                       bool from_server) const;
 
     Environments environments() const;
     void setEnvironments(const Environments &environments);
@@ -151,7 +168,8 @@ private:
     CompileServer *m_server;  // on which server we build
     CompileServer *m_submitter;
     bool m_submitterDetached = false;
-    std::string m_submitterName;  // who submitted us
+    std::string m_submitterName;
+    uint64_t m_submitterGeneration = 0;  // who submitted us
     Environments m_environments;
     time_t m_startTime;  // _local_ to the compiler server
     time_t m_startOnScheduler;  // starttime local to scheduler
