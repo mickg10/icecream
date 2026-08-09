@@ -1,10 +1,12 @@
 set -euo pipefail
 ./autogen.sh
-./configure --without-libcap_ng
+./configure --without-libcap-ng
 make -j2 -C services
 make -j2 -C scheduler icecc-scheduler
-make -j2 -C unittests relogin relogin_mutant
+make -j2 -C unittests \
+  connectivityprobe relisten relogin relogin_mutant \
+  siblingpin siblingpin_mutant statsapply statsapply_mutant
 make -C unittests check \
-  TESTS='relogin relogin-negative.sh' \
-  check_PROGRAMS='relogin relogin_mutant'
+  TESTS='connectivityprobe connectivityprobe-negative.sh relisten-quick.sh relogin relogin-negative.sh siblingpin siblingpin-negative.sh statsapply statsapply-negative.sh' \
+  check_PROGRAMS='connectivityprobe relisten relogin relogin_mutant siblingpin siblingpin_mutant statsapply statsapply_mutant'
 git diff --check
