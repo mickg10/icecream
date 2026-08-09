@@ -1,0 +1,165 @@
+{
+  "schema": 1,
+  "description": "Pinned allocator and STARTED-lifecycle authority acceptance matrix. All runs use one worker on both TLC toolchains; every mutant names and validates its intended property directly.",
+  "checks": [
+    {
+      "id": "allocator-fixed",
+      "module": "JobIdAllocator",
+      "config": "JobIdAllocator.cfg",
+      "kind": "safety",
+      "workers": 1,
+      "expected": "pass",
+      "property": "SafetyInvariant",
+      "toolchains": ["stable", "differential"],
+      "timeout_seconds": 3600
+    },
+    {
+      "id": "allocator-zero-mutant",
+      "module": "JobIdAllocator",
+      "config": "JobIdAllocatorZeroMutant.cfg",
+      "kind": "safety",
+      "workers": 1,
+      "expected": "counterexample",
+      "property": "NoZero",
+      "trace_manifest": "trace-manifests/JobIdAllocatorZeroMutant.manifest.template.json",
+      "toolchains": ["stable", "differential"],
+      "timeout_seconds": 1800
+    },
+    {
+      "id": "allocator-cross-namespace-collision-mutant",
+      "module": "JobIdAllocator",
+      "config": "JobIdAllocatorRemoteOnlyMutant.cfg",
+      "kind": "safety",
+      "workers": 1,
+      "expected": "counterexample",
+      "property": "GlobalLiveUniqueness",
+      "trace_manifest": "trace-manifests/JobIdAllocatorRemoteOnlyMutant.manifest.template.json",
+      "toolchains": ["stable", "differential"],
+      "timeout_seconds": 1800
+    },
+    {
+      "id": "allocator-unknown-done-zero-mutant",
+      "module": "JobIdAllocator",
+      "config": "JobIdAllocatorUnknownDoneMutant.cfg",
+      "kind": "safety",
+      "workers": 1,
+      "expected": "counterexample",
+      "property": "UnknownDoneNoTerminalZero",
+      "trace_manifest": "trace-manifests/JobIdAllocatorUnknownDoneMutant.manifest.template.json",
+      "toolchains": ["stable", "differential"],
+      "timeout_seconds": 1800
+    },
+    {
+      "id": "allocator-duplicate-begin-orphan-mutant",
+      "module": "JobIdAllocator",
+      "config": "JobIdAllocatorDuplicateBeginMutant.cfg",
+      "kind": "safety",
+      "workers": 1,
+      "expected": "counterexample",
+      "property": "DuplicateBeginNoOrphan",
+      "trace_manifest": "trace-manifests/JobIdAllocatorDuplicateBeginMutant.manifest.template.json",
+      "toolchains": ["stable", "differential"],
+      "timeout_seconds": 1800
+    },
+    {
+      "id": "allocator-disconnect-leak-mutant",
+      "module": "JobIdAllocator",
+      "config": "JobIdAllocatorDisconnectLeakMutant.cfg",
+      "kind": "safety",
+      "workers": 1,
+      "expected": "counterexample",
+      "property": "AllocatorMapAgreement",
+      "trace_manifest": "trace-manifests/JobIdAllocatorDisconnectLeakMutant.manifest.template.json",
+      "toolchains": ["stable", "differential"],
+      "timeout_seconds": 1800
+    },
+    {
+      "id": "allocator-partial-batch-mutant",
+      "module": "JobIdAllocator",
+      "config": "JobIdAllocatorPartialBatchMutant.cfg",
+      "kind": "safety",
+      "workers": 1,
+      "expected": "counterexample",
+      "property": "ExhaustionNoPartialPublication",
+      "trace_manifest": "trace-manifests/JobIdAllocatorPartialBatchMutant.manifest.template.json",
+      "toolchains": ["stable", "differential"],
+      "timeout_seconds": 1800
+    },
+    {
+      "id": "allocator-reuse-liveness",
+      "module": "JobIdAllocator",
+      "config": "JobIdAllocatorReuse.cfg",
+      "kind": "liveness",
+      "workers": 1,
+      "expected": "pass",
+      "property": "ReleasedIdEventuallyReusable",
+      "toolchains": ["stable", "differential"],
+      "timeout_seconds": 3600,
+      "assumptions": [
+        "Weak fairness only on release of OldOwner and allocation by NewOwner in the controlled one-ID reuse scenario"
+      ]
+    },
+    {
+      "id": "lifecycle-authority-fixed",
+      "module": "LifecycleAuthority",
+      "config": "LifecycleAuthority.cfg",
+      "kind": "safety",
+      "workers": 1,
+      "expected": "pass",
+      "property": "SafetyInvariant",
+      "toolchains": ["stable", "differential"],
+      "timeout_seconds": 1800
+    },
+    {
+      "id": "lifecycle-detached-false-terminal-mutant",
+      "module": "LifecycleAuthority",
+      "config": "LifecycleAuthorityDetachedSubmitterMutant.cfg",
+      "kind": "safety",
+      "workers": 1,
+      "expected": "counterexample",
+      "property": "DetachedTerminalAuthority",
+      "trace_manifest": "trace-manifests/LifecycleAuthorityDetachedSubmitterMutant.manifest.template.json",
+      "toolchains": ["stable", "differential"],
+      "timeout_seconds": 1800
+    },
+    {
+      "id": "lifecycle-duplicate-begin-mutant",
+      "module": "LifecycleAuthority",
+      "config": "LifecycleAuthorityDuplicateBeginMutant.cfg",
+      "kind": "safety",
+      "workers": 1,
+      "expected": "counterexample",
+      "property": "BeginLinearizedOnce",
+      "trace_manifest": "trace-manifests/LifecycleAuthorityDuplicateBeginMutant.manifest.template.json",
+      "toolchains": ["stable", "differential"],
+      "timeout_seconds": 1800
+    },
+    {
+      "id": "lifecycle-detached-identity-mutant",
+      "module": "LifecycleAuthority",
+      "config": "LifecycleAuthorityIdentityMutant.cfg",
+      "kind": "safety",
+      "workers": 1,
+      "expected": "counterexample",
+      "property": "StableDetachedIdentity",
+      "trace_manifest": "trace-manifests/LifecycleAuthorityIdentityMutant.manifest.template.json",
+      "toolchains": ["stable", "differential"],
+      "timeout_seconds": 1800
+    },
+    {
+      "id": "lifecycle-started-termination-liveness",
+      "module": "LifecycleAuthority",
+      "config": "LifecycleAuthorityFair.cfg",
+      "kind": "liveness",
+      "workers": 1,
+      "expected": "pass",
+      "property": "StartedEventuallyTerminates",
+      "toolchains": ["stable", "differential"],
+      "timeout_seconds": 3600,
+      "assumptions": [
+        "Weak fairness on the assigned-worker Done-or-session-loss transition only"
+      ]
+    }
+  ],
+  "proofs": []
+}
