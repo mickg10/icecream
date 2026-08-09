@@ -658,25 +658,52 @@ static void internals_txn_tick()
 
 static void prelogin_read_overrides()
 {
+    /* Overrides are STRICTLY validated and clamped by explicit rule: a
+       zero accept quantum would spin the loop at zero timeout forever, a
+       zero peer cap would refuse every daemon, and a zero lease would
+       expire handshakes instantly.  Out-of-range values are clamped to
+       the nearest legal bound and reported.  */
     const char *e;
     if ((e = getenv("ICECC_TEST_PRELOGIN_LEASE_MSEC"))) {
-        prelogin_lease_msec = (uint64_t)atoll(e);
+        const long long v = atoll(e);
+        prelogin_lease_msec = v < 100 ? 100 : (uint64_t)v;
+        if (v < 100) {
+            log_error() << "prelogin lease override " << v
+                        << " clamped to 100 ms" << endl;
+        }
     }
     if ((e = getenv("ICECC_TEST_PRELOGIN_MAX_PEERS"))) {
-        prelogin_max_peers = (unsigned int)atoi(e);
+        const int v = atoi(e);
+        prelogin_max_peers = v < 1 ? 1 : (unsigned int)v;
+        if (v < 1) {
+            log_error() << "prelogin peer-cap override " << v
+                        << " clamped to 1" << endl;
+        }
     }
     if ((e = getenv("ICECC_TEST_ACCEPT_QUANTUM"))) {
-        accept_quantum = (unsigned int)atoi(e);
+        const int v = atoi(e);
+        accept_quantum = v < 1 ? 1 : (unsigned int)v;
+        if (v < 1) {
+            log_error() << "accept quantum override " << v
+                        << " clamped to 1 (zero would spin the loop)" << endl;
+        }
     }
 }
 
 /* Exact-once release of a pre-login accounting slot.  */
+static unsigned long prelogin_underflow_violations = 0;
+
 static void prelogin_release(CompileServer *cs)
 {
     if (cs->preloginAccounted()) {
         cs->setPreloginAccounted(false);
         if (prelogin_current > 0) {
             --prelogin_current;
+        } else {
+            /* An accounted flag with a zero population is a conservation
+               violation: counted and reported, never silently floored.  */
+            ++prelogin_underflow_violations;
+            log_error() << "prelogin accounting underflow" << endl;
         }
     }
 }
@@ -1922,15 +1949,35 @@ static time_t prune_servers()
        peer past its whole-handshake lease.  */
     {
         const uint64_t now_mono = icecream_monotonic_msec();
+        uint64_t earliest_budget_ms = 0;
+        bool have_budget = false;
         map<int, CompileServer *>::iterator fit = fd2cs.begin();
         while (fit != fd2cs.end()) {
             CompileServer *pcs = fit->second;
             ++fit;   /* handle_end erases from fd2cs */
-            if (pcs->preloginAccounted()
-                    && now_mono >= pcs->preloginDeadline()) {
+            if (!pcs->preloginAccounted()) {
+                continue;
+            }
+            if (now_mono >= pcs->preloginDeadline()) {
                 trace() << "pre-login lease expired for " << pcs->name << endl;
                 ++prelogin_expired_total;
                 handle_end(pcs, nullptr);
+                continue;
+            }
+            const uint64_t left = pcs->preloginDeadline() - now_mono;
+            if (!have_budget || left < earliest_budget_ms) {
+                earliest_budget_ms = left;
+                have_budget = true;
+            }
+        }
+        /* The earliest live lease must GOVERN the poll sleep: an idle
+           scheduler otherwise dozes past the nominal expiry until an
+           unrelated timer wakes it.  Rounded UP, never to zero before
+           expiry.  */
+        if (have_budget) {
+            const time_t secs = (time_t)((earliest_budget_ms + 999) / 1000);
+            if (secs < min_time) {
+                min_time = secs > 0 ? secs : 1;
             }
         }
     }
@@ -2958,12 +3005,14 @@ static bool handle_line(CompileServer *cs, Msg *_m)
                      " detached_terminal_rejects=%lu nonwaiting_begin_rejects=%lu"
                      " dup_local_begin=%lu id_release_violations=%lu"
                      " prelogin_current=%u prelogin_max=%u prelogin_expired=%lu"
-                     " prelogin_rejected=%lu prelogin_completed=%lu accepts_deferred=%lu",
+                     " prelogin_rejected=%lu prelogin_completed=%lu accepts_deferred=%lu"
+                     " prelogin_underflow=%lu",
                      detached_terminal_rejects, nonwaiting_begin_rejects,
                      duplicate_local_begin_ignored, id_release_violations,
                      prelogin_current, prelogin_max_observed,
                      prelogin_expired_total, prelogin_rejected_total,
-                     prelogin_completed_total, accepts_deferred_total);
+                     prelogin_completed_total, accepts_deferred_total,
+                     prelogin_underflow_violations);
             if (!cs->send_msg(TextMsg(summary))) {
                 return false;
             }
