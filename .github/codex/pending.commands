@@ -55,7 +55,7 @@ run_fixed() {
   log="gatelogs/${cfg%.cfg}.log"
   set +e
   java -XX:+UseParallelGC -jar /tmp/tla2tools.jar \
-    -workers auto -config "$cfg" "$module" > "$log" 2>&1
+    -deadlock -workers auto -config "$cfg" "$module" > "$log" 2>&1
   rc=$?
   set -e
   printf 'fixed\t%s\t%s\t%d\n' "$cfg" "$module" "$rc" \
@@ -75,7 +75,7 @@ run_mutant() {
   trace="gatelogs/${cfg%.cfg}.trace.json"
   set +e
   java -XX:+UseParallelGC -jar /tmp/tla2tools.jar \
-    -workers auto -dumpTrace json "$trace" \
+    -deadlock -workers auto -dumpTrace json "$trace" \
     -config "$cfg" "$module" > "$log" 2>&1
   rc=$?
   set -e
@@ -88,6 +88,11 @@ run_mutant() {
   fi
   if [[ ! -s "$trace" ]]; then
     echo "mutant produced no JSON counterexample: $cfg" >&2
+    cat "$log" >&2
+    return 1
+  fi
+  if grep -Eq 'parse error|semantic error|Cannot find source file|Exception in thread' "$log"; then
+    echo "mutant failed before property checking: $cfg" >&2
     cat "$log" >&2
     return 1
   fi
@@ -139,6 +144,7 @@ done
   echo
   echo '- Imported ref: `295a282ec044edc3eb0035ee6f64e968cf2a2a3c`'
   echo '- TLC: official `tla2tools.jar` v1.7.4'
+  echo '- Deadlock checking: disabled because terminal protocol states are explicit and valid'
   echo '- Fixed configurations: 8'
   echo '- Required counterexamples: 20'
   echo '- Deterministic reference constructors: 5'
