@@ -3,9 +3,20 @@
   "scenario": "LifecycleAuthorityStartedWitness",
   "property": "NoStartedState",
   "expected_result": "counterexample",
-  "min_states": 2,
+  "min_states": 3,
   "event_mode": "exclusive",
   "events": [
+    {
+      "name": "RejectWrongWorkerBegin",
+      "all": [
+        {"path": "phase", "from": "Waiting", "to": "Waiting"},
+        {"path": "invalidBeginCount", "from": 0, "to": 1},
+        {"path": "rejectedWrongWorker", "from": 0, "to": 1},
+        {"path": "begunEver", "to": false},
+        {"path": "dispatchDebit", "to": true},
+        {"path": "terminalCount", "to": 0}
+      ]
+    },
     {
       "name": "BeginFromAssignedWorker",
       "all": [
@@ -15,20 +26,31 @@
         {"path": "creditCount", "from": 0, "to": 1},
         {"path": "monitorBeginCount", "from": 0, "to": 1},
         {"path": "startRevision", "from": 0, "to": 1},
+        {"path": "invalidBeginCount", "to": 1},
         {"path": "terminalCount", "to": 0}
       ]
     }
   ],
-  "required_subsequence": ["BeginFromAssignedWorker"],
+  "required_subsequence": [
+    "RejectWrongWorkerBegin",
+    "BeginFromAssignedWorker"
+  ],
   "final_all": [
     {"path": "phase", "eq": "Started"},
     {"path": "begunEver", "eq": true},
     {"path": "dispatchDebit", "eq": false},
     {"path": "creditCount", "eq": 1},
     {"path": "monitorBeginCount", "eq": 1},
+    {"path": "invalidBeginCount", "eq": 1},
+    {"path": "rejectedWrongWorker", "eq": 1},
     {"path": "terminalCount", "eq": 0}
   ],
   "harness_steps": [
+    {
+      "after": "RejectWrongWorkerBegin",
+      "emit": "reject_wrong_worker_begin_without_mutating_waiting_assignment",
+      "actor": "wrong-worker"
+    },
     {
       "after": "BeginFromAssignedWorker",
       "emit": "assert_started_state_is_reachable_from_assigned_worker_begin",
@@ -38,6 +60,6 @@
   "metadata": {
     "module": "LifecycleAuthorityStartedWitness",
     "config": "LifecycleAuthorityStartedWitness.cfg",
-    "witness": "The fixed lifecycle model reaches Started before the conditional worker-terminal liveness theorem is checked."
+    "witness": "After an observable rejected wrong-worker Begin, the fixed lifecycle model reaches Started from the assigned worker before the conditional terminal liveness theorem is checked."
   }
 }
