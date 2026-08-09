@@ -1,0 +1,56 @@
+{
+  "schema": 1,
+  "scenario": "AssignmentFenceNetworkClaimWinsQueuedRevokeWitness",
+  "property": "NoClaimBeforeRevokeConsume",
+  "expected_result": "counterexample",
+  "min_states": 7,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "SQueueRevokeWithDelayedClaim",
+      "all": [
+        {"path": "s2f", "len_delta": 1},
+        {"path": "c2f", "unchanged": true},
+        {"path": "claimAfterRevokeQueued", "unchanged": true}
+      ],
+      "any": [
+        {"path": "phase.a0", "to": "RevokeQueued"},
+        {"path": "phase.a1", "to": "RevokeQueued"}
+      ]
+    },
+    {
+      "name": "FClaimBeforeRevokeConsume",
+      "all": [
+        {"path": "claimAfterRevokeQueued", "from": false, "to": true},
+        {"path": "c2f", "len_delta": -1},
+        {"path": "claimMade", "changed": true},
+        {"path": "fState", "changed": true},
+        {"path": "s2f", "unchanged": true}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "SQueueRevokeWithDelayedClaim",
+    "FClaimBeforeRevokeConsume"
+  ],
+  "final_all": [
+    {"path": "claimAfterRevokeQueued", "eq": true}
+  ],
+  "harness_steps": [
+    {
+      "after": "SQueueRevokeWithDelayedClaim",
+      "emit": "barrier_revoke_queued_while_claim_frame_is_delayed",
+      "actor": "scheduler"
+    },
+    {
+      "after": "FClaimBeforeRevokeConsume",
+      "emit": "assert_claim_accepted_before_worker_consumes_revoke",
+      "actor": "fulfillment-daemon"
+    }
+  ],
+  "metadata": {
+    "module": "AssignmentFenceNetwork",
+    "config": "AssignmentFenceNetworkClaimWinsQueuedRevokeWitness.cfg",
+    "witness": "S queues REVOKE; F consumes the already-delivered concrete claim before the REVOKE frame"
+  }
+}
