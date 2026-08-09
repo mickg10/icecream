@@ -1,0 +1,39 @@
+{
+  "schema": 1,
+  "scenario": "CompatibilityNewTerminalOldPeerMutant",
+  "property": "OldPeerSeesNoNewTerminalField",
+  "expected_result": "counterexample",
+  "min_states": 5,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "AppendUnnegotiatedTerminalFieldForOldPeer",
+      "all": [
+        {"path": "phase", "from": "Terminal", "to": "Terminal"},
+        {"path": "newTerminalToOld", "from": false, "to": true},
+        {"path": "terminalCount", "to": 1},
+        {"path": "released", "to": true},
+        {"path": "projectedTrace", "unchanged": true}
+      ]
+    }
+  ],
+  "required_subsequence": ["AppendUnnegotiatedTerminalFieldForOldPeer"],
+  "final_all": [
+    {"path": "phase", "eq": "Terminal"},
+    {"path": "newTerminalToOld", "eq": true},
+    {"path": "terminalCount", "eq": 1},
+    {"path": "released", "eq": true}
+  ],
+  "harness_steps": [
+    {
+      "after": "AppendUnnegotiatedTerminalFieldForOldPeer",
+      "emit": "assert_old_peer_received_new_terminal_identity_field",
+      "actor": "terminal-codec-fixture"
+    }
+  ],
+  "metadata": {
+    "module": "MixedVersionCompatibilityChecked",
+    "configs": ["CompatibilityNewTerminalOldPeerMutant.cfg"],
+    "mutant": "MutantNewTerminalOldPeer = TRUE"
+  }
+}
