@@ -3,7 +3,7 @@ name: Fairness diagnostic export
 on:
   pull_request:
     branches:
-      - fix/stage3-scheduler-policy
+      - codex/issue4-fairness-diagnostic-base
   workflow_dispatch:
 
 permissions:
