@@ -558,7 +558,13 @@ void CompileServer::updateInConnectivity(bool acceptingIn)
         64,  128,  256,   512,  1024,
         2048, 4096
     };
-    static const size_t table_size = sizeof(time_offset_table);
+    /* Element count, NOT byte count: sizeof(table) is 96 on this build, so
+       the old value let m_inConnAttempt climb to 95 and index the table 84
+       slots out of bounds after enough consecutive failures -- a
+       long-unreachable daemon could read garbage delays or crash the
+       scheduler.  */
+    static const size_t table_size =
+        sizeof(time_offset_table) / sizeof(time_offset_table[0]);
 
     //On a successful connection, we should still check back every 1min
     static const time_t check_back_time = 60;
@@ -588,7 +594,9 @@ void CompileServer::updateInConnectivity(bool acceptingIn)
                 ":" << m_remotePort <<
                 ") connected but is not able to accept incoming connections." << endl;
         }
-        m_nextConnTime = time(nullptr) + time_offset_table[m_inConnAttempt];
+        const unsigned int idx =
+            m_inConnAttempt < table_size ? m_inConnAttempt : (unsigned int)(table_size - 1);
+        m_nextConnTime = time(nullptr) + time_offset_table[idx];
         if(m_inConnAttempt < (table_size - 1))
             m_inConnAttempt++;
         trace()  << nodeName() << " failed to accept an incoming connection on "
