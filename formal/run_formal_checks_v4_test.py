@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -68,8 +69,8 @@ class BackendProbeTests(unittest.TestCase):
         ident = b"\x7fELF" + bytes([2, 1, 1, 0, 0]) + b"\0" * 7
         header = struct.pack(
             "<HHIQQQIHHHHHH",
-            2,       # ET_EXEC
-            62,      # x86-64
+            2,
+            62,
             1,
             0,
             elf_header_size,
@@ -84,7 +85,7 @@ class BackendProbeTests(unittest.TestCase):
         )
         program = struct.pack(
             "<IIQQQQQQ",
-            4,       # PT_NOTE
+            4,
             4,
             note_offset,
             0,
@@ -185,6 +186,77 @@ class BackendProbeTests(unittest.TestCase):
         repo.mkdir()
         self.assertTrue(module._is_inside(repo / "artifacts", repo))
         self.assertFalse(module._is_inside(self.root / "outside", repo))
+
+    def test_tlaps_generated_files_are_isolated_from_source_checkout(self) -> None:
+        repo = self.root / "repo"
+        formal = repo / "formal"
+        formal.mkdir(parents=True)
+        (formal / "AssignmentFenceCore.tla").write_text(
+            "---- MODULE AssignmentFenceCore ----\nX == TRUE\n====\n",
+            encoding="utf-8",
+        )
+        (formal / "AssignmentFenceCoreProof.tla").write_text(
+            "---- MODULE AssignmentFenceCoreProof ----\n"
+            "EXTENDS AssignmentFenceCore\n"
+            "THEOREM T == X\nBY DEF X\n"
+            "====\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "config", "user.email", "formal-test@example.invalid"],
+            cwd=repo,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Formal Test"],
+            cwd=repo,
+            check=True,
+        )
+        subprocess.run(["git", "add", "formal"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "fixture"],
+            cwd=repo,
+            check=True,
+        )
+
+        fake_tlapm = self.root / "fake-tlapm"
+        fake_tlapm.write_text(
+            "#!/bin/sh\n"
+            "mkdir -p .tlacache\n"
+            "echo cache > .tlacache/cache\n"
+            "echo trace > AssignmentFenceCore_TTrace_1.tla\n"
+            "echo 'All obligations proved'\n",
+            encoding="utf-8",
+        )
+        fake_tlapm.chmod(0o755)
+        artifacts = self.root / "artifacts"
+        record = module.run_tlaps_proof(
+            proof={
+                "id": "core-tlaps-proof",
+                "file": "AssignmentFenceCoreProof.tla",
+                "timeout_seconds": 30,
+            },
+            tlapm=fake_tlapm,
+            formal_dir=formal,
+            artifacts=artifacts,
+            time_bin=Path("/usr/bin/time"),
+            proof_env=dict(os.environ),
+        )
+
+        self.assertFalse((formal / ".tlacache").exists())
+        self.assertFalse((formal / "AssignmentFenceCore_TTrace_1.tla").exists())
+        work = Path(record["isolated_work_dir"])
+        self.assertTrue((work / ".tlacache" / "cache").is_file())
+        self.assertTrue((work / "AssignmentFenceCore_TTrace_1.tla").is_file())
+        status = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            cwd=repo,
+            text=True,
+            stdout=subprocess.PIPE,
+            check=True,
+        )
+        self.assertEqual(status.stdout, "")
 
 
 if __name__ == "__main__":
