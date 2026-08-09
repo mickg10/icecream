@@ -3324,8 +3324,9 @@ int main(int argc, char **argv)
                 " targets disconnected mid-transaction");
         REQUIRE(reply.find("fcsA") != std::string::npos
                 && reply.find("fcsB") != std::string::npos,
-                "the report names both targets (csA freed ~10s earlier,"
-                " csB timed out) -- finalize iterated csA's freed record");
+                "finalize iterated BOTH targets: fcsA (disconnected, its"
+                " CompileServer freed ~10s before finalize) and fcsB"
+                " (timed out) -- the freed-record iteration is the UAF window");
         if (csB) { delete csB; csB = nullptr; }
         REQUIRE(waitpid(sched, nullptr, WNOHANG) == 0,
                 "the scheduler survived finalize over a freed target"

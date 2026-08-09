@@ -45,6 +45,13 @@
 # work must still be assigned (the bucketed picker selected an empty set and
 # stalled); with unequal occupancies the emptier host must win the exact
 # fraction comparison; an even fill spreads evenly.
+#
+# Run 8 -- teardown: a started job survives its submitter's disconnect
+# (detach/terminal-authority; issue #4 item 1).
+#
+# Run 9 -- internalsuaf: the bounded-async internals fan-out finalizes over
+# a target whose CompileServer was freed mid-transaction without a
+# use-after-free (issue #4 correction A.1; ASan red/green).
 dir=$(dirname "$0")
 "$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 promotion 1 || exit 1
 "$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 heterogeneous 1 || exit 1

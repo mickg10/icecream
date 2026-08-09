@@ -529,6 +529,7 @@ struct InternalsTxn {
 };
 static InternalsTxn internals_txn;
 static uint64_t internals_deadline_msec = 10000;        // whole command
+static unsigned long internals_output_dropped = 0;      // rows dropped by the exact bound
 static const size_t kInternalsPerTargetCap = 64 * 1024;
 static const size_t kInternalsRetainedCap = 4 * 1024 * 1024;
 static const size_t kInternalsControlPendingCap = 1024 * 1024;
@@ -543,6 +544,23 @@ static CompileServer *internals_resolve(int fd, unsigned int generation)
         return nullptr;   /* fd reuse: not the recorded peer */
     }
     return it->second;
+}
+
+/* Exact bounded control output: every internals row/terminal goes through
+   here.  It refuses to queue a frame that would push the control channel's
+   ACTUAL pending bytes past the cap (payload + a fixed framing allowance),
+   counts what it drops, and reports a hard send failure to the caller so
+   finalize can settle the control instead of pretending success.  */
+static const size_t kInternalsFrameOverhead = 16;   // length prefix + slack
+static bool internals_send_bounded(CompileServer *control, const std::string &text,
+                                    size_t cap)
+{
+    if (control->pending_bytes() + text.size() + kInternalsFrameOverhead > cap) {
+        ++internals_output_dropped;
+        return true;   /* dropped by the exact bound; not a transport failure */
+    }
+    return control->send_msg(TextMsg(text),
+                             MsgChannel::SendNonBlocking | MsgChannel::SendDeferrable);
 }
 
 static void internals_txn_clear()
@@ -592,11 +610,19 @@ static void internals_txn_finalize()
             why = " disconnected before reporting\n";
             break;
         }
-        control->send_msg(TextMsg(t.node_name + why),
-                          MsgChannel::SendNonBlocking | MsgChannel::SendDeferrable);
+        if (!internals_send_bounded(control, t.node_name + why,
+                                    kInternalsControlPendingCap)) {
+            /* Hard transport failure: settle the control now, do NOT
+               enter FINAL_PENDING claiming a queued terminal.  */
+            handle_end(control, nullptr);
+            return;
+        }
     }
-    control->send_msg(TextMsg(string("200 done")),
-                      MsgChannel::SendNonBlocking | MsgChannel::SendDeferrable);
+    if (!internals_send_bounded(control, string("200 done"),
+                                kInternalsControlPendingCap)) {
+        handle_end(control, nullptr);
+        return;
+    }
     txn.final_frame_seq = control->framesQueued();
     txn.final_pending = true;
 }
@@ -3004,11 +3030,13 @@ static bool handle_line(CompileServer *cs, Msg *_m)
             snprintf(summary, sizeof(summary),
                      " detached_terminal_rejects=%lu nonwaiting_begin_rejects=%lu"
                      " dup_local_begin=%lu id_release_violations=%lu"
+                     " internals_output_dropped=%lu"
                      " prelogin_current=%u prelogin_max=%u prelogin_expired=%lu"
                      " prelogin_rejected=%lu prelogin_completed=%lu accepts_deferred=%lu"
                      " prelogin_underflow=%lu",
                      detached_terminal_rejects, nonwaiting_begin_rejects,
                      duplicate_local_begin_ignored, id_release_violations,
+                     internals_output_dropped,
                      prelogin_current, prelogin_max_observed,
                      prelogin_expired_total, prelogin_rejected_total,
                      prelogin_completed_total, accepts_deferred_total,
@@ -3130,13 +3158,20 @@ static bool handle_line(CompileServer *cs, Msg *_m)
         }
     } else if (cmd == "internals") {
         if (internals_txn.active) {
-            /* The legacy STATUS_TEXT reply has no request id: one
-               fan-out at a time, and a concurrent request is told so
-               explicitly with complete terminal framing.  */
-            if (!cs->send_msg(TextMsg(string("500 internals busy\n")))) {
+            /* The legacy STATUS_TEXT reply has no request id: one fan-out
+               at a time, and a concurrent request is told so with bounded
+               deferrable output (a non-reading concurrent control must not
+               block the loop either).  A hard transport failure returns
+               false so the drain loop deletes this channel -- the existing
+               control contract; we must NOT delete it here and then return
+               to a caller that still holds it.  */
+            if (!internals_send_bounded(cs, string("500 internals busy\n"),
+                                        kInternalsControlPendingCap)
+                    || !internals_send_bounded(cs, string("200 done"),
+                                               kInternalsControlPendingCap)) {
                 return false;
             }
-            return cs->send_msg(TextMsg(string("200 done")));
+            return true;
         }
         internals_txn.active = true;
         internals_txn.final_pending = false;
@@ -4176,8 +4211,17 @@ int main(int argc, char *argv[])
         }
         if (internals_txn.active) {
             const uint64_t now_mono = icecream_monotonic_msec();
-            const uint64_t left = internals_txn.deadline_mono > now_mono
-                ? internals_txn.deadline_mono - now_mono : 0;
+            /* Phase-relevant deadline: the collection deadline governs
+               while waiting for replies, the OUTPUT deadline once the
+               terminal frame is queued.  Capping by the (already-elapsed)
+               collection deadline in FINAL_PENDING selected a zero timeout
+               and spun the loop until the output drained -- exactly the
+               stalled-control case.  */
+            const uint64_t phase_deadline = internals_txn.final_pending
+                ? internals_txn.output_deadline_mono
+                : internals_txn.deadline_mono;
+            const uint64_t left = phase_deadline > now_mono
+                ? phase_deadline - now_mono : 0;
             const time_t secs = (time_t)((left + 999) / 1000);
             if (timeout < 0 || secs < timeout) {
                 timeout = secs;
