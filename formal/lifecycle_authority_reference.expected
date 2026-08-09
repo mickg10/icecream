@@ -1,0 +1,15 @@
+PASS                        LifecycleAuthorityFixed
+  trace: Begin -> DuplicateBegin(no-op) -> Detach -> FalseSubmitterDone(reject) -> WorkerDone
+EXPECTED_COUNTEREXAMPLE     DetachedSubmitterTerminalMutant
+  property: DetachedTerminalAuthority
+  trace: Begin -> Detach -> FalseSubmitterDone(accept)
+EXPECTED_COUNTEREXAMPLE     DuplicateBeginMutationMutant
+  property: BeginLinearizedOnce
+  trace: Begin -> DuplicateBegin(mutates)
+EXPECTED_COUNTEREXAMPLE     DetachedIdentityDropMutant
+  property: StableDetachedIdentity
+  trace: Begin -> Detach(drop identity)
+PASS                        AttachedSubmitterExactAbort
+  trace: SubmitterDoneWhileWaiting
+PASS                        DetachedWorkerLoss
+  trace: Begin -> Detach -> WorkerLost
