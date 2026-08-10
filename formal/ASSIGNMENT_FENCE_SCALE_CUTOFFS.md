@@ -2,18 +2,21 @@
 
 This branch is a scale campaign layered on the exact accepted formal source
 `aaeea937a31c444ad53dba348007d205c44c0d27`. It does not change the accepted
-transition relation. It adds only mapping operators and three configurations.
+fixed transition relation. It adds mapping operators, three fixed configs, and
+one one-premise capacity mutant.
 
 It is **not** a raw 4F/8C acceptance claim. The useful additional finite
 coverage comes from shared capacity and queue contention:
 
-| Row | Assignments | Workers | New witness support |
+| Row | Assignments | Workers | Purpose |
 |---|---:|---:|---|
-| `ScaleCapacity` | 3 | 2 (one idle) | capacity-two off-by-one (`k+1`) |
+| `ScaleCapacity` | 3 | 2 (one idle) | capacity-two cutoff (`k+1`) |
+| `ScaleCapacityMutant` | 3 | 2 (one idle) | change `< Capacity` to `<= Capacity`; must violate `CapacityBound` |
 | `ScaleMixed` | 4 | 2 | two capacity-two workers plus mixed policies |
 | `ScaleLiveness` | 3 | 2 | shared-worker contention under existing live-link fairness |
 
-No row uses `SYMMETRY`, `VIEW`, a state constraint, or an action constraint.
+No fixed row uses `SYMMETRY`, `VIEW`, a state constraint, or an action
+constraint. The mutant changes exactly one guard in a separate specification.
 
 ## Safety cutoff argument
 
@@ -65,6 +68,19 @@ timeout 1800 /usr/bin/time -v -o "$out/S1.time.txt" \
   AssignmentFenceNetworkScale \
   >"$out/S1.tlc.log" 2>&1
 
+set +e
+timeout 1800 /usr/bin/time -v -o "$out/S1-mutant.time.txt" \
+  java -jar "$jar" -workers 1 \
+  -metadir "$out/S1-mutant.states" \
+  -config AssignmentFenceNetworkScaleCapacityMutant.cfg \
+  AssignmentFenceNetworkScale \
+  >"$out/S1-mutant.tlc.log" 2>&1
+mutant_rc=$?
+set -e
+test "$mutant_rc" -ne 0
+grep -Eq 'Invariant[[:space:]]+CapacityBound[[:space:]]+is violated' \
+  "$out/S1-mutant.tlc.log"
+
 timeout 1800 /usr/bin/time -v -o "$out/S2.time.txt" \
   java -jar "$jar" -workers 1 \
   -metadir "$out/S2.states" \
@@ -80,8 +96,8 @@ timeout 1800 /usr/bin/time -v -o "$out/L1.time.txt" \
   >"$out/L1.tlc.log" 2>&1
 ```
 
-Run S1 first. Start S2 only after S1's result and resource figures are retained.
-L1 may run independently after S1 parses successfully.
+Run S1 and its mutant first. Start S2 only after both S1 outcomes and resource
+figures are retained. L1 may run independently after S1 parses successfully.
 
 Initial per-row resource budget:
 
@@ -94,14 +110,9 @@ state files: 50 GiB
 A budget stop is `RESOURCE_BOUND`, not a model failure. Retain the checkpoint,
 state counts reached, depth, RSS, wall time, and disk use.
 
-If a row completes with fewer than ten million distinct states and under 8 GiB
-RSS, replay the same row with the exact pinned TLC 1.7.4 jar and compare:
-
-- generated and distinct states;
-- complete-search depth;
-- zero states left on queue;
-- named invariant/property result;
-- absence of parser/runtime failures.
+If a fixed row completes with fewer than ten million distinct states and under
+8 GiB RSS, replay that fixed row and its applicable mutant with the exact pinned
+TLC 1.7.4 jar and compare semantics.
 
 ## Acceptance parsing
 
@@ -124,6 +135,10 @@ SANY Error
 Exception in thread
 TLC threw an unexpected exception
 ```
+
+The capacity mutant is green only as a **negative control** when it exits
+nonzero with the named `CapacityBound` violation, nonzero state counts, and no
+parser/runtime failure.
 
 The liveness row must run exactly `FencedLivenessSpec` and
 `NoPermanentQueuedFrame`; do not add fairness for compiler completion,
