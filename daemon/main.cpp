@@ -6235,6 +6235,14 @@ bool Daemon::handle_get_cs(Client *client, Msg *msg)
 {
     GetCSMsg *umsg = dynamic_cast<GetCSMsg *>(msg);
     assert(client);
+    if (umsg->count == 0) {
+        /* G4 (local-oracle 21:19): a zero-count GetCS is a no-op -- no UseCS
+           reply, no scheduler frame, and NO request state (getcs_outstanding is
+           left untouched), so the connection stays usable for a later ordinary
+           request. */
+        trace() << "handle_get_cs count=0 no-op for client " << client->client_id << endl;
+        return true;
+    }
     /* G4 (17:20#2 / bigoracle 18:45 P0): exactly one outstanding GetCS per
        client.  getcs_outstanding is set at accept and cleared only when the
        client is destroyed, so a second GetCS is rejected in EVERY non-terminal
