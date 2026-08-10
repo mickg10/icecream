@@ -1,0 +1,300 @@
+name: assignment-fence-proof-search-v2-once
+
+on:
+  push:
+    branches:
+      - bigoracle/assignment-fence-proof-v4
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: assignment-fence-proof-search-v2
+  cancel-in-progress: true
+
+jobs:
+  search:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      GH_TOKEN: ${{ github.token }}
+      BRANCH: bigoracle/assignment-fence-proof-v4
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bigoracle/assignment-fence-proof-v4
+          fetch-depth: 0
+      - name: Defer until deterministic reconciliation is frozen
+        id: readiness
+        run: |
+          if test -e .github/workflows/assignment-fence-reconcile-v2-once.yml; then
+            echo 'ready=false' >> "$GITHUB_OUTPUT"
+            echo 'reconciler still present; a later converged push will rerun this search'
+          else
+            echo 'ready=true' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install official TLAPS and proof backends
+        if: steps.readiness.outputs.ready == 'true'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y curl jq time libgmp10 z3
+          mkdir -p /tmp/tlaps /tmp/assignment-fence-proof-search-v2 /tmp/proof-src
+          cp -a formal /tmp/proof-src/formal
+          release=''
+          for tag in v1.5.0 1.5.0; do
+            if curl --fail --location --retry 3 --retry-all-errors \
+              -o /tmp/tlapm-release.json \
+              "https://api.github.com/repos/tlaplus/tlapm/releases/tags/${tag}"; then
+              release=$tag
+              break
+            fi
+          done
+          test -n "$release"
+          python3 - <<'PY' >/tmp/tlapm-asset.env
+          import json
+          from pathlib import Path
+          release = json.loads(Path('/tmp/tlapm-release.json').read_text())
+          assets = [
+              item for item in release.get('assets', [])
+              if item.get('name', '').lower().endswith('x86_64-linux-gnu-inst.bin')
+          ]
+          if len(assets) != 1:
+              raise SystemExit([item.get('name') for item in release.get('assets', [])])
+          asset = assets[0]
+          print(f"TLAPS_ASSET_URL={asset['browser_download_url']}")
+          print(f"TLAPS_ASSET_NAME={asset['name']}")
+          print(f"TLAPS_ASSET_DIGEST={asset.get('digest') or ''}")
+          PY
+          source /tmp/tlapm-asset.env
+          curl --fail --location --retry 4 --retry-all-errors \
+            -o /tmp/tlaps-installer.bin "$TLAPS_ASSET_URL"
+          actual="sha256:$(sha256sum /tmp/tlaps-installer.bin | awk '{print $1}')"
+          printf '%s\n' "$release" > /tmp/assignment-fence-proof-search-v2/release-tag.txt
+          printf '%s\n' "$TLAPS_ASSET_NAME" > /tmp/assignment-fence-proof-search-v2/asset-name.txt
+          printf '%s\n' "$TLAPS_ASSET_DIGEST" > /tmp/assignment-fence-proof-search-v2/release-digest.txt
+          printf '%s\n' "$actual" > /tmp/assignment-fence-proof-search-v2/installer-digest.txt
+          if test -n "$TLAPS_ASSET_DIGEST"; then
+            test "$actual" = "$TLAPS_ASSET_DIGEST"
+          fi
+          chmod +x /tmp/tlaps-installer.bin
+          /tmp/tlaps-installer.bin -d /tmp/tlaps \
+            > /tmp/assignment-fence-proof-search-v2/install.log 2>&1
+          TLAPM=$(find /tmp/tlaps -type f -name tlapm -perm -111 | head -n 1)
+          test -n "$TLAPM"
+          backend_dir=$(find /tmp/tlaps -type f \( -name zenon -o -name z3 -o -name cvc4 -o -name cvc5 \) -printf '%h\n' | head -n 1)
+          if test -z "$backend_dir"; then
+            backend_dir=$(dirname "$(command -v z3)")
+          fi
+          printf '%s\n' "$TLAPM" > /tmp/assignment-fence-proof-search-v2/tlapm-path.txt
+          printf '%s\n' "$backend_dir" > /tmp/assignment-fence-proof-search-v2/backend-dir.txt
+          "$TLAPM" --version > /tmp/assignment-fence-proof-search-v2/tlapm-version.txt 2>&1 || \
+          "$TLAPM" -v > /tmp/assignment-fence-proof-search-v2/tlapm-version.txt 2>&1 || true
+      - name: Generate and evaluate exact proof decompositions
+        if: steps.readiness.outputs.ready == 'true'
+        id: candidates
+        run: |
+          set -euo pipefail
+          TLAPM=$(cat /tmp/assignment-fence-proof-search-v2/tlapm-path.txt)
+          backend_dir=$(cat /tmp/assignment-fence-proof-search-v2/backend-dir.txt)
+          export PATH="$backend_dir:$PATH"
+          cd /tmp/proof-src/formal
+
+          python3 generate_assignment_fence_core_proof_v2.py
+          python3 generate_assignment_fence_core_proof_candidates.py \
+            --mode conjunct-smt \
+            --output AssignmentFenceCoreProofConjunctSmt.tla
+          python3 generate_assignment_fence_core_proof_candidates.py \
+            --mode conjunct-zenon \
+            --output AssignmentFenceCoreProofConjunctZenon.tla
+          python3 generate_assignment_fence_core_proof_candidates.py \
+            --mode conjunct-smt-zenon \
+            --output AssignmentFenceCoreProofConjunctSmtZenon.tla
+
+          candidates=(
+            AssignmentFenceCoreProof.tla
+            AssignmentFenceCoreProofConjunctSmt.tla
+            AssignmentFenceCoreProofConjunctZenon.tla
+            AssignmentFenceCoreProofConjunctSmtZenon.tla
+          )
+          : > /tmp/assignment-fence-proof-search-v2/candidates.tsv
+          winner=''
+          for candidate in "${candidates[@]}"; do
+            stem=${candidate%.tla}
+            log="/tmp/assignment-fence-proof-search-v2/${stem}.log"
+            timing="/tmp/assignment-fence-proof-search-v2/${stem}.time"
+            set +e
+            /usr/bin/time -v -o "$timing" \
+              timeout --signal=TERM --kill-after=10s 20m \
+              "$TLAPM" "$candidate" > "$log" 2>&1
+            rc=$?
+            set -e
+            failed=$(grep -Eio '[0-9]+ (failed|unproved)' "$log" | tail -n 1 || true)
+            printf '%s\t%s\t%s\n' "$candidate" "$rc" "${failed:-none}" \
+              >> /tmp/assignment-fence-proof-search-v2/candidates.tsv
+            if test "$rc" -eq 0 \
+              && ! grep -Eqi '[1-9][0-9]* (failed|unproved)|obligation[^[:cntrl:]]*(failed|unproved)' "$log"; then
+              winner=$candidate
+              break
+            fi
+          done
+          cat /tmp/assignment-fence-proof-search-v2/candidates.tsv
+          if test -z "$winner"; then
+            echo 'winner=' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "winner=$winner" >> "$GITHUB_OUTPUT"
+          cp "$winner" /tmp/assignment-fence-proof-search-v2/winner-original.tla
+          python3 - "$winner" <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          path = Path(sys.argv[1])
+          text = path.read_text(encoding='utf-8')
+          text, count = re.subn(
+              r'(?m)^-+ MODULE [A-Za-z_][A-Za-z0-9_]* -+$',
+              '-------------------- MODULE AssignmentFenceCoreProof --------------------',
+              text,
+              count=1,
+          )
+          if count != 1:
+              raise SystemExit('candidate module header was not canonicalized')
+          Path('/tmp/assignment-fence-proof-search-v2/AssignmentFenceCoreProof.tla').write_text(
+              text, encoding='utf-8'
+          )
+          PY
+          cp /tmp/assignment-fence-proof-search-v2/AssignmentFenceCoreProof.tla \
+            AssignmentFenceCoreProof.tla
+          set +e
+          /usr/bin/time -v \
+            -o /tmp/assignment-fence-proof-search-v2/canonical.time \
+            timeout --signal=TERM --kill-after=10s 20m \
+            "$TLAPM" AssignmentFenceCoreProof.tla \
+            > /tmp/assignment-fence-proof-search-v2/canonical.log 2>&1
+          canonical_rc=$?
+          set -e
+          printf '%s\n' "$canonical_rc" \
+            > /tmp/assignment-fence-proof-search-v2/canonical.exit
+          cat /tmp/assignment-fence-proof-search-v2/canonical.log
+          test "$canonical_rc" -eq 0
+          ! grep -Eqi '[1-9][0-9]* (failed|unproved)|obligation[^[:cntrl:]]*(failed|unproved)' \
+            /tmp/assignment-fence-proof-search-v2/canonical.log
+      - name: Commit only a canonically re-proved winner
+        if: steps.readiness.outputs.ready == 'true' && steps.candidates.outputs.winner != ''
+        run: |
+          set -euo pipefail
+          cp /tmp/assignment-fence-proof-search-v2/AssignmentFenceCoreProof.tla \
+            formal/AssignmentFenceCoreProof.tla
+          rm .github/workflows/assignment-fence-proof-search-v2-once.yml
+          rm -f formal/PROOF_SEARCH_LAST_RED.md
+          git config user.name "mickg10 formal automation"
+          git config user.email "5094033+mickg10@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "formal: prove action-split ownership invariant with TLAPS"
+          if ! git push origin "HEAD:$BRANCH"; then
+            git fetch origin "$BRANCH"
+            git rebase "origin/$BRANCH"
+            git push origin "HEAD:$BRANCH"
+          fi
+      - name: Retain exact red proof-search report and remove search workflow
+        if: steps.readiness.outputs.ready == 'true' && steps.candidates.outputs.winner == ''
+        run: |
+          set -euo pipefail
+          {
+            echo '# Exact TLAPS proof-search result: RED'
+            echo
+            echo "Source workflow revision: \`${GITHUB_SHA}\`"
+            echo
+            echo 'No theorem, invariant, action, or assumption was changed. Four'
+            echo 'proof decompositions for the existing theorem were executed.'
+            echo
+            echo '```text'
+            cat /tmp/assignment-fence-proof-search-v2/candidates.tsv
+            echo '```'
+            echo
+            echo 'Complete logs, installer identity, exit statuses, and GNU time'
+            echo 'records are retained in the workflow artifact.'
+          } > formal/PROOF_SEARCH_LAST_RED.md
+          rm .github/workflows/assignment-fence-proof-search-v2-once.yml
+          git config user.name "mickg10 formal automation"
+          git config user.email "5094033+mickg10@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "formal: retain exact red TLAPS decomposition inventory"
+          if ! git push origin "HEAD:$BRANCH"; then
+            git fetch origin "$BRANCH"
+            git rebase "origin/$BRANCH"
+            git push origin "HEAD:$BRANCH"
+          fi
+      - name: Archive all proof candidates and logs
+        if: always() && steps.readiness.outputs.ready == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: assignment-fence-proof-search-v2-${{ github.sha }}
+          path: |
+            /tmp/assignment-fence-proof-search-v2
+            /tmp/proof-src/formal/AssignmentFenceCoreProof*.tla
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Publish proof-search status
+        if: always() && steps.readiness.outputs.ready == 'true'
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from __future__ import annotations
+          import json, os, subprocess
+          from pathlib import Path
+
+          marker = '<!-- assignment-fence-proof-search-v2-status -->'
+          table = Path('/tmp/assignment-fence-proof-search-v2/candidates.tsv')
+          candidate_text = table.read_text() if table.exists() else 'candidate execution did not begin'
+          canonical = Path('/tmp/assignment-fence-proof-search-v2/canonical.log')
+          if canonical.exists():
+              lines = canonical.read_text(encoding='utf-8', errors='replace').splitlines()
+              diagnostic = '\n'.join([
+                  line for line in lines
+                  if any(token in line.lower() for token in ('proved', 'failed', 'unproved', 'error', 'obligation'))
+              ][-120:])
+          else:
+              logs = sorted(Path('/tmp/assignment-fence-proof-search-v2').glob('AssignmentFenceCoreProof*.log'))
+              diagnostic = ''
+              if logs:
+                  lines = logs[-1].read_text(encoding='utf-8', errors='replace').splitlines()
+                  diagnostic = '\n'.join([
+                      line for line in lines
+                      if any(token in line.lower() for token in ('proved', 'failed', 'unproved', 'error', 'obligation'))
+                  ][-120:])
+          winner = os.environ.get('WINNER', '')
+          body = '\n'.join([
+              marker,
+              'From: mickg10/bigoracle',
+              'To: mickg10/local-oracle, mickg10/implementer',
+              '',
+              '## Exact TLAPS decomposition search',
+              '',
+              f"- source head: `{os.environ['GITHUB_SHA']}`",
+              f"- workflow run: `{os.environ['GITHUB_RUN_ID']}`",
+              '',
+              '```text', candidate_text[:3000], '```',
+              '',
+              '```text', (diagnostic or 'No TLAPM diagnostic summary was retained.')[:8000], '```',
+              '',
+              'A proof is accepted here only if the winning candidate is rewritten to the canonical module name and TLAPM proves that canonical file again with zero failed obligations. Full protocol acceptance still requires the focused dual-TLC and trace matrix.'
+          ])
+          repo = os.environ['GITHUB_REPOSITORY']
+          def gh(arguments, payload=None):
+              return subprocess.run(['gh','api',*arguments], input=payload, text=True, stdout=subprocess.PIPE, check=True, env=os.environ).stdout
+          comments = json.loads(gh([f'repos/{repo}/issues/4/comments?per_page=100']))
+          old = next((item for item in comments if marker in item.get('body','')), None)
+          payload = json.dumps({'body': body})
+          if old:
+              gh(['--method','PATCH',f"repos/{repo}/issues/comments/{old['id']}",'--input','-'], payload)
+          else:
+              gh(['--method','POST',f'repos/{repo}/issues/4/comments','--input','-'], payload)
+          PY
