@@ -1,0 +1,61 @@
+name: assignment-fence-refinement-premise-wire-once
+
+on:
+  push:
+    branches:
+      - bigoracle/assignment-fence-proof-v4
+    paths:
+      - ".github/workflows/assignment-fence-refinement-premise-wire-once.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bigoracle/assignment-fence-proof-v4
+          fetch-depth: 0
+      - name: Add premise coverage to refinement, sweep, and complete preflights
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          line = '          python3 formal/mode_refinement_premise_coverage_test.py\n'
+          for name, anchor in (
+              (
+                  '.github/workflows/mode-refinement-formal.yml',
+                  '          python3 formal/mode_refinement_fairness_contract_test.py\n',
+              ),
+              (
+                  '.github/workflows/assignment-fence-complete-formal-gate.yml',
+                  '          python3 formal/mode_refinement_fairness_contract_test.py\n',
+              ),
+              (
+                  '.github/workflows/assignment-fence-final-sweep-once.yml',
+                  '          python3 formal/mode_refinement_fairness_contract_test.py\n',
+              ),
+          ):
+              path = Path(name)
+              text = path.read_text(encoding='utf-8')
+              if line not in text:
+                  if text.count(anchor) != 1:
+                      raise SystemExit(f'{name}: refinement premise anchor changed')
+                  text = text.replace(anchor, anchor + line)
+              path.write_text(text, encoding='utf-8')
+          PY
+          git diff --check
+      - name: Commit wiring and remove one-shot workflow
+        run: |
+          set -euo pipefail
+          rm .github/workflows/assignment-fence-refinement-premise-wire-once.yml
+          git config user.name "mickg10 formal automation"
+          git config user.email "5094033+mickg10@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "ci: classify every refinement premise in final closure"
+          git push origin HEAD:bigoracle/assignment-fence-proof-v4
