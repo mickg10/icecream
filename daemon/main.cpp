@@ -496,6 +496,7 @@ public:
         job = nullptr;
         usecsmsg = nullptr;
         deferred_getcs = nullptr;
+        getcs_published = false;
         client_id = 0;
         niceness = 0;
         status = UNKNOWN;
@@ -575,6 +576,7 @@ public:
     MsgChannel *channel;
     UseCSMsg *usecsmsg;
     GetCSMsg *deferred_getcs;   // G4: GetCS held during LOGIN_ATTEMPT, re-driven on ConfCS
+    bool getcs_published;       // G4 (17:20#1): true only once a GetCS for this client has been sent to S (which then owns it by client_id); a held request is PRIVATE until then
     CompileJob *job;
     int client_id;
     uint32_t niceness; // nice priority (0-20), for PENDING_USE_CS
@@ -1162,8 +1164,8 @@ struct Daemon {
     bool maybe_stats(bool force_check = false);
     bool send_scheduler(const Msg &msg) __attribute_warn_unused_result__;
     void record_waitforcs_latency(bool use_cs, uint64_t latency_msec);
-    void close_scheduler();
-    bool finish_scheduler_loss_if_needed(bool had_scheduler, uint64_t turn_generation);
+    void close_scheduler(bool orderly_shutdown = false);
+    bool finish_scheduler_loss_if_needed();
     bool reconnect();
     int working_loop();
     bool setup_listen_fds();
@@ -4011,19 +4013,44 @@ bool Daemon::reannounce_environments()
    only a LOGIN_ATTEMPT.  The session is ACTIVE -- owned, generation committed --
    only after the first ConfCS is consumed (handle_cs_conf).  A channel loss
    before ConfCS is NOT an established-session loss. */
+static uint64_t scheduler_session_generation = 0;
 static bool scheduler_session_active = false;
 static bool scheduler_login_pending = false;
+/* G4 (bigoracle 16:45): absolute monotonic deadline for the current
+   LOGIN_ATTEMPT to receive ConfCS; 0 when not in a pending attempt. */
+static const uint64_t kLoginActivationDeadlineMsec = 30 * 1000;
+static uint64_t scheduler_login_deadline_msec = 0;
+/* G4 (bigoracle 16:40): a pending-loss token recorded by a non-orderly
+   close_scheduler() when an ACTIVE session's channel closes -- captured at
+   CLOSE time (not snapshotted at turn start), so a session that activated and
+   was then lost within a single turn is still cleaned up exactly once.
+   finish_scheduler_loss_if_needed() consumes it; the counter is test-visible. */
+static bool scheduler_loss_pending = false;
+static uint64_t scheduler_loss_pending_generation = 0;
+static unsigned int scheduler_loss_cleanup_attempts = 0;
+/* G4 (17:20#3): set once the 64-bit session-generation space is exhausted
+   (2^64 activations -- unreachable in practice).  Makes exhaustion TERMINAL:
+   reconnect() then refuses further sessions rather than reuse a generation. */
+static bool scheduler_generation_exhausted = false;
 
-void Daemon::close_scheduler()
+void Daemon::close_scheduler(bool orderly_shutdown)
 {
     if (!scheduler) {
         return;
     }
 
+    /* Record the pending-loss token from the ACTIVE state before it is cleared,
+       unless this is an orderly shutdown or the session never activated (a
+       failed LOGIN_ATTEMPT closes with no token). */
+    if (!orderly_shutdown && scheduler_session_active) {
+        scheduler_loss_pending = true;
+        scheduler_loss_pending_generation = scheduler_session_generation;
+    }
     delete scheduler;
     scheduler = nullptr;
     scheduler_session_active = false;
     scheduler_login_pending = false;
+    scheduler_login_deadline_msec = 0;
     delete discover;
     discover = nullptr;
     next_scheduler_connect = time(nullptr) + 20 + (rand() & 31);
@@ -4032,38 +4059,22 @@ void Daemon::close_scheduler()
         next_scheduler_connect = time(nullptr) + 3;
 }
 
-/* G4: whether a session generation's loss has already been settled this run
-   (an explicit validity bit -- a uint64 generation can legitimately equal any
-   value, including ~0ULL after wrap, so no numeric sentinel is safe), the
-   generation it was settled for, and a test-visible count of settle attempts. */
-static bool scheduler_loss_settled_valid = false;
-static uint64_t scheduler_loss_settled_generation = 0;
-static unsigned int scheduler_loss_cleanup_attempts = 0;
-
-/* G4: the single, exactly-once cleanup for the loss of an ESTABLISHED
-   scheduler session.  Every answer_client_requests() boundary that may have
-   nulled `scheduler` mid-turn (pre-poll handle_old_request/maybe_stats, the
-   drain, the readiness handlers, poll error, EOF) calls this immediately
-   after; a true result means "the session is gone, leave the turn now" so no
-   further same-poll work proceeds against a dead session.
-
-   Non-reentrant per session generation: the generation is marked settled
-   BEFORE clear_children() and the test-visible counter increments, so repeated
-   boundary calls within the same lost turn clean up exactly once.  A failed
-   initial login (scheduler already null at turn start -> had_scheduler false)
-   and an orderly shutdown never reach the cleanup. */
-bool Daemon::finish_scheduler_loss_if_needed(bool had_scheduler, uint64_t turn_generation)
+/* G4: the single, exactly-once cleanup for the loss of an ESTABLISHED scheduler
+   session.  It consumes the pending-loss token recorded by close_scheduler() at
+   the moment an active session's channel closed, so it is correct even when the
+   session activated and was then lost within one turn.  Every
+   answer_client_requests() boundary that may have closed the channel calls this
+   immediately after; a true result means "the session is gone, leave the turn
+   now" so no further same-poll work proceeds against a dead session.  A failed
+   LOGIN_ATTEMPT and an orderly shutdown record no token, so neither is treated
+   as an established-session loss. */
+bool Daemon::finish_scheduler_loss_if_needed()
 {
-    if (!had_scheduler || scheduler) {
-        return false;                    /* no established-session loss */
+    if (!scheduler_loss_pending) {
+        return false;                    /* no pending established-session loss */
     }
-    if (scheduler_loss_settled_valid
-            && scheduler_loss_settled_generation == turn_generation) {
-        return true;                     /* already settled this generation */
-    }
-    scheduler_loss_settled_valid = true;                   /* settle BEFORE cleanup */
-    scheduler_loss_settled_generation = turn_generation;
-    ++scheduler_loss_cleanup_attempts;                     /* exactly-once, test-visible */
+    scheduler_loss_pending = false;                        /* consume the token, once */
+    ++scheduler_loss_cleanup_attempts;                     /* test-visible */
     clear_children();
     return true;
 }
@@ -4175,7 +4186,6 @@ struct ChildRecord {
     enum State { RUNNING, TERM_SENT, KILL_SENT, REAPED } state;
 };
 static std::map<pid_t, ChildRecord> child_registry;
-static uint64_t scheduler_session_generation = 0;
 static bool child_ownership_failed = false;
 
 static void register_child(pid_t pid, pid_t pgid, ChildRecord::Kind kind,
@@ -4310,10 +4320,11 @@ string Daemon::dump_internals() const
                  (unsigned long long)scheduler_session_generation);
         result += handoff;
         snprintf(handoff, sizeof(handoff),
-                 "  Scheduler loss: settled_valid=%d settled_gen=%llu cleanup_attempts=%u\n",
-                 scheduler_loss_settled_valid ? 1 : 0,
-                 (unsigned long long)scheduler_loss_settled_generation,
-                 scheduler_loss_cleanup_attempts);
+                 "  Scheduler loss: pending=%d pending_gen=%llu cleanup_attempts=%u exhausted=%d\n",
+                 scheduler_loss_pending ? 1 : 0,
+                 (unsigned long long)scheduler_loss_pending_generation,
+                 scheduler_loss_cleanup_attempts,
+                 scheduler_generation_exhausted ? 1 : 0);
         result += handoff;
         for (std::map<pid_t, ChildRecord>::const_iterator cit = child_registry.begin();
                 cit != child_registry.end(); ++cit) {
@@ -5638,6 +5649,7 @@ void Daemon::handle_old_request()
             if (!sent) {
                 return;   /* session lost; answer_client_requests runs the cleanup */
             }
+            c->getcs_published = true;   /* G4 (17:20#1): re-driven held GetCS is now published to S */
             c->set_status(Client::WAITFORCS, "handle_old_request: re-driven held GetCS");
         }
     }
@@ -5967,10 +5979,13 @@ void Daemon::handle_end(Client *client, int exitcode)
             job_id = client->job->jobID();
         }
 
-        if (client->status == Client::WAITFORCS) {
-            // We don't know the job id, because we haven't received a reply
-            // from the scheduler yet. Use client_id to identify the job,
-            // the scheduler will use it for matching.
+        if (client->status == Client::WAITFORCS && client->getcs_published) {
+            // Published request: S accepted a GetCS for this client but has not
+            // replied with a job id yet, so settle by client_id -- the scheduler
+            // matches it.  A PRIVATE held request (getcs_published false: deferred
+            // during LOGIN_ATTEMPT, never sent) is NOT settled here -- S has no
+            // knowledge of it, so we publish no JobDone; the client is simply
+            // destroyed with its held request (G4 17:20#1).
             use_client_id = true;
             assert( client->client_id > 0 );
         }
@@ -6083,6 +6098,23 @@ bool Daemon::handle_get_cs(Client *client, Msg *msg)
 {
     GetCSMsg *umsg = dynamic_cast<GetCSMsg *>(msg);
     assert(client);
+    /* G4 (17:20#2): exactly one outstanding GetCS per client.  A second GetCS
+       arriving while a private held (deferred_getcs) or published (WAITFORCS +
+       getcs_published) request is still outstanding is a client protocol
+       violation.  Reject that client generation rather than overwrite the first
+       request -- overwriting would strand the first with no result.  handle_end()
+       settles the outstanding request correctly (published -> JobDone by client
+       id; private -> destroyed silently).  Return FALSE so handle_activity()'s
+       caller treats the client as gone -- this mirrors the END/default
+       protocol-error cases; returning true would dereference a freed client. */
+    if (client->deferred_getcs
+            || (client->status == Client::WAITFORCS && client->getcs_published)) {
+        log_error() << "client " << client->client_id
+                    << " sent a second GetCS while one is outstanding; closing"
+                    << endl;
+        handle_end(client, 120);
+        return false;
+    }
     if (!umsg->command_summary.empty()) {
         client->command_line = umsg->command_summary;
     } else if (client->command_line.empty() && client->channel) {
@@ -6092,15 +6124,18 @@ bool Daemon::handle_get_cs(Client *client, Msg *msg)
     client->last_waitforcs_msec = 0;
     client->set_status(Client::WAITFORCS, scheduler ? "handle_get_cs: sent GetCS to scheduler" : "handle_get_cs: scheduler missing");
     umsg->client_id = client->client_id;
+    client->getcs_published = false;   /* G4 (17:20#1): unpublished until an active-session send succeeds */
     trace() << "handle_get_cs " << umsg->client_id << endl;
 
     if (scheduler && !scheduler_session_active) {
         /* G4 LOGIN_ATTEMPT: the channel is up but the session is not committed
            (no ConfCS yet).  Hold this request -- do NOT forward it on the
            pending channel, and do NOT convert it to local work merely because
-           activation is pending.  handle_old_request re-drives it once the
-           session becomes active. */
-        delete client->deferred_getcs;
+           activation is pending.  It stays PRIVATE (getcs_published false), so a
+           disconnect before ConfCS publishes no JobDone.  handle_old_request
+           re-drives it once the session becomes active.  (deferred_getcs is
+           guaranteed null here: a client that still had one was rejected by the
+           single-outstanding check above.) */
         client->deferred_getcs = new GetCSMsg(*umsg);
         client->set_status(Client::WAITFORCS, "handle_get_cs: holding for session activation");
         return true;
@@ -6121,7 +6156,13 @@ bool Daemon::handle_get_cs(Client *client, Msg *msg)
     umsg->client_count = clients.size();
     umsg->command_summary.clear();
 
-    return send_scheduler(*umsg);
+    if (!send_scheduler(*umsg)) {
+        return false;
+    }
+    /* G4 (17:20#1): the GetCS reached S, which now owns this request by client
+       id, so a teardown before UseCS must settle it with a JobDone. */
+    client->getcs_published = true;
+    return true;
 }
 
 int Daemon::handle_cs_conf(ConfCSMsg *msg)
@@ -6135,13 +6176,16 @@ int Daemon::handle_cs_conf(ConfCSMsg *msg)
     if (scheduler_login_pending && !scheduler_session_active) {
         if (scheduler_session_generation == ~(uint64_t)0) {
             /* Generation space exhausted: refuse activation rather than wrap to
-               a reused generation.  Stay in LOGIN_ATTEMPT (the bounded
-               handshake deadline drops the channel). */
+               a reused generation, and make exhaustion TERMINAL so reconnect()
+               stops re-attempting the same impossible activation forever
+               (17:20#3). */
             log_error() << "scheduler session generation exhausted; refusing activation" << endl;
+            scheduler_generation_exhausted = true;
         } else {
             ++scheduler_session_generation;
             scheduler_session_active = true;
             scheduler_login_pending = false;
+            scheduler_login_deadline_msec = 0;
         }
     }
     return 0;
@@ -6303,14 +6347,11 @@ void Daemon::answer_client_requests()
     state_writer.alive();
     state_writer.pump();
 
-    /* G4: capture established-session liveness and its generation once; any
-       boundary in this turn that loses the session funnels through the single
-       exactly-once finish_scheduler_loss_if_needed(). */
-    const bool had_active_session = scheduler_session_active;
-    const uint64_t turn_generation = scheduler_session_generation;
-
+    /* G4: any boundary this turn that loses the session funnels through the
+       single exactly-once finish_scheduler_loss_if_needed(), which consumes the
+       pending-loss token close_scheduler() records at loss time. */
     handle_old_request();
-    if (finish_scheduler_loss_if_needed(had_active_session, turn_generation)) {
+    if (finish_scheduler_loss_if_needed()) {
         return;
     }
 
@@ -6319,7 +6360,7 @@ void Daemon::answer_client_requests()
     if (scheduler_session_active) {
         maybe_stats();
     }
-    if (finish_scheduler_loss_if_needed(had_active_session, turn_generation)) {
+    if (finish_scheduler_loss_if_needed()) {
         return;    /* a STATS send can close the established session */
     }
 
@@ -6377,6 +6418,11 @@ void Daemon::answer_client_requests()
         pollfds.push_back(pfd);
     }
 
+    /* G4 (16:47#1): set when a client had more than one complete message already
+       parsed into its channel's userspace buffer; fd readiness will not re-fire
+       for bytes drained out of the kernel, so we force a zero-timeout poll below
+       to process the remainder promptly. */
+    bool buffered_client_pending = false;
     for (auto it = fd2client.begin(); it != fd2client.end();) {
         int i = it->first;
         Client *client = it->second;
@@ -6402,14 +6448,25 @@ void Daemon::answer_client_requests()
                    client or poll-set work, and never dereference a client the
                    handler deleted. */
                 const bool alive = handle_activity(client);
-                if (finish_scheduler_loss_if_needed(had_active_session, turn_generation)) {
+                if (finish_scheduler_loss_if_needed()) {
                     return;
                 }
                 if (!alive) {
                     continue;   /* client was deleted by the handler */
                 }
-                current_status = client->status;   /* survived: recompute eligibility */
-                select_channel = true;
+                /* G4 (16:47#1): recompute eligibility from the NEW state.  The
+                   handler may have moved the client to WAITFORCHILD/WAITINSTALL
+                   -- the two states this loop deliberately ignores -- and a
+                   readable WAITINSTALL client whose fd we register can reach the
+                   post-poll assertion that forbids it.  A blind
+                   select_channel = true is wrong. */
+                current_status = client->status;
+                const bool now_ignore = current_status == Client::WAITFORCHILD
+                                        || current_status == Client::WAITINSTALL;
+                select_channel = (current_status == Client::TOCOMPILE) || !now_ignore;
+                if (c->has_msg()) {
+                    buffered_client_pending = true;   /* more parsed bytes remain */
+                }
             }
         }
 
@@ -6480,12 +6537,34 @@ void Daemon::answer_client_requests()
        AsyncJsonlWriter's own thread, so a slow filesystem cannot stretch a
        loop iteration and no early wakeup is needed.  */
 
+    /* G4 (17:20#3): while a LOGIN_ATTEMPT is pending on a modern (>=24) channel,
+       never sleep past its activation deadline; otherwise a scheduler that
+       accepts Login and then goes silent (no ConfCS, no other daemon activity)
+       would block poll for up to max_scheduler_pong seconds and reconnect()
+       could never enforce the deadline.  Cap at the time remaining (>= 0). */
+    if (scheduler_login_pending && !scheduler_session_active
+            && scheduler_login_deadline_msec != 0
+            && scheduler && scheduler->protocol >= 24) {
+        const uint64_t now = monotonic_msec();
+        const int to_deadline = (scheduler_login_deadline_msec > now)
+                                ? int(scheduler_login_deadline_msec - now) : 0;
+        if (poll_timeout_msec < 0 || to_deadline < poll_timeout_msec) {
+            poll_timeout_msec = to_deadline;
+        }
+    }
+
+    /* G4 (16:47#1): bytes already parsed into a channel buffer won't re-trigger
+       fd readiness -- process the remainder on a zero-timeout pass. */
+    if (buffered_client_pending) {
+        poll_timeout_msec = 0;
+    }
+
     int ret = poll(pollfds.data(), pollfds.size(), poll_timeout_msec);
 
     if (ret < 0 && errno != EINTR) {
         log_perror("poll");
         close_scheduler();
-        finish_scheduler_loss_if_needed(had_active_session, turn_generation);
+        finish_scheduler_loss_if_needed();
         return;
     }
     // Reset debug if needed, but only if we aren't waiting for any child processes to finish,
@@ -6510,7 +6589,7 @@ void Daemon::answer_client_requests()
                 if (!msg) {
                     log_warning() << "scheduler closed connection" << endl;
                     close_scheduler();
-                    finish_scheduler_loss_if_needed(had_active_session, turn_generation);
+                    finish_scheduler_loss_if_needed();
                     return;
                 }
 
@@ -6545,7 +6624,7 @@ void Daemon::answer_client_requests()
 
                 if (ret) {
                     close_scheduler();
-                    finish_scheduler_loss_if_needed(had_active_session, turn_generation);
+                    finish_scheduler_loss_if_needed();
                     return;
                 }
             }
@@ -6555,7 +6634,7 @@ void Daemon::answer_client_requests()
            may have lost the session.  Do not process web/listener/client/
            child/env readiness from this same poll snapshot against a dead
            session -- funnel to the single cleanup and leave the turn. */
-        if (finish_scheduler_loss_if_needed(had_active_session, turn_generation)) {
+        if (finish_scheduler_loss_if_needed()) {
             return;
         }
 
@@ -6613,7 +6692,17 @@ void Daemon::answer_client_requests()
                     trace() << "accepted " << c->fd << " " << c->name << " as " << client->client_id << endl;
 
                     while (!c->read_a_bit() || c->has_msg()) {
-                        if (!handle_activity(client)) {
+                        const bool alive = handle_activity(client);
+                        /* G4 (16:47#2): a scheduler-bound message from this
+                           freshly-accepted client can close S.  Check the loss
+                           token before draining a second already-buffered
+                           message against a dead session; on loss, leave the
+                           turn (clear_children() tears down every client,
+                           including this one). */
+                        if (finish_scheduler_loss_if_needed()) {
+                            return;
+                        }
+                        if (!alive) {
                             break;
                         }
 
@@ -6637,7 +6726,7 @@ void Daemon::answer_client_requests()
                         && client->pipe_from_child >= 0
                         && pollfd_is_set(pollfds, client->pipe_from_child, POLLIN)) {
                     if (!handle_compile_done(client)) {
-                        finish_scheduler_loss_if_needed(had_active_session, turn_generation);
+                        finish_scheduler_loss_if_needed();
                         return;
                     }
                 }
@@ -6645,7 +6734,7 @@ void Daemon::answer_client_requests()
                         && client->pipe_from_child >= 0
                         && pollfd_is_set(pollfds, client->pipe_from_child, POLLIN)) {
                     if (!handle_env_install_child_done(client)) {
-                        finish_scheduler_loss_if_needed(had_active_session, turn_generation);
+                        finish_scheduler_loss_if_needed();
                         return;
                     }
                 }
@@ -6662,7 +6751,16 @@ void Daemon::answer_client_requests()
                         assert(client->status != Client::TOCOMPILE && client->status != Client::WAITINSTALL);
 
                         while (!c->read_a_bit() || c->has_msg()) {
-                            if (!handle_activity(client)) {
+                            const bool alive = handle_activity(client);
+                            /* G4 (16:47#2): a scheduler-bound message can close S
+                               mid-drain; funnel to the single cleanup before
+                               draining the next already-buffered message against
+                               a dead session -- the per-client check below is
+                               too coarse for a multi-message drain. */
+                            if (finish_scheduler_loss_if_needed()) {
+                                return;
+                            }
+                            if (!alive) {
                                 break;
                             }
 
@@ -6674,7 +6772,7 @@ void Daemon::answer_client_requests()
                         }
                     }
                 }
-                if (finish_scheduler_loss_if_needed(had_active_session, turn_generation)) {
+                if (finish_scheduler_loss_if_needed()) {
                     return;    /* a per-client handler closed the established session */
                 }
             }
@@ -6692,7 +6790,7 @@ void Daemon::answer_client_requests()
             }
         }
 
-        if (finish_scheduler_loss_if_needed(had_active_session, turn_generation)) {
+        if (finish_scheduler_loss_if_needed()) {
             return;
         }
 
@@ -6701,7 +6799,34 @@ void Daemon::answer_client_requests()
 
 bool Daemon::reconnect()
 {
+    if (scheduler_generation_exhausted) {
+        /* G4 (17:20#3): the 64-bit session-generation space is exhausted.
+           Refuse to (re)establish any session rather than reuse a generation;
+           close any pending attempt.  Terminal by design. */
+        if (scheduler) {
+            close_scheduler();
+        }
+        return false;
+    }
     if (scheduler) {
+        if (scheduler_login_pending && !scheduler_session_active
+                && scheduler_login_deadline_msec != 0
+                && scheduler->protocol >= 24
+                && monotonic_msec() >= scheduler_login_deadline_msec) {
+            /* G4 (16:45/17:20#3): the LOGIN_ATTEMPT activation lease expired --
+               Login was accepted but no ConfCS committed the session.  Gated on
+               protocol >= 24, where ConfCS is the activation signal; legacy
+               schedulers (< 24) send no ConfCS, so the deadline never fires
+               against them (no wrongful drop -- `protocol` is only >= 24 once
+               the version handshake has finalized, which is well within the
+               lease).  Drop only the attempt (not an established-session loss)
+               and reschedule on a later loop; schedulerless local work is
+               preserved. */
+            log_warning() << "scheduler login activation deadline expired;"
+                          << " dropping attempt" << endl;
+            close_scheduler();
+            return false;
+        }
         return true;
     }
 
@@ -6742,6 +6867,7 @@ bool Daemon::reconnect()
        generation or ownership here; that happens on the first ConfCS. */
     scheduler_login_pending = true;
     scheduler_session_active = false;
+    scheduler_login_deadline_msec = monotonic_msec() + kLoginActivationDeadlineMsec;
     sockaddr_in name;
     socklen_t len = sizeof(name);
     int error = getsockname(scheduler->fd, (struct sockaddr*)&name, &len);
@@ -6772,7 +6898,7 @@ int Daemon::working_loop()
         maybe_dump_state();
 
         if (exit_main_loop) {
-            close_scheduler();
+            close_scheduler(true);   /* orderly shutdown: no established-loss token */
             clear_children();
             close_web();
             break;
