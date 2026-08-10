@@ -1,0 +1,56 @@
+name: assignment-fence-comment-pagination-fix-once
+
+on:
+  push:
+    branches:
+      - bigoracle/assignment-fence-proof-v4
+    paths:
+      - ".github/workflows/assignment-fence-comment-pagination-fix-once.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bigoracle/assignment-fence-proof-v4
+          fetch-depth: 0
+      - name: Paginate complete and cross-branch issue comment lookups
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          files = (
+              Path('.github/workflows/assignment-fence-complete-formal-gate.yml'),
+              Path('.github/workflows/cross-branch-formal-evidence.yml'),
+          )
+          old_forms = (
+              '''          comments = json.loads(gh([f'repos/{repo}/issues/4/comments?per_page=100']))\n''',
+              '''          comments = json.loads(gh(['--method','GET',f'repos/{repo}/issues/4/comments','-f','per_page=100']))\n''',
+          )
+          replacement = '''          pages = json.loads(gh(['--paginate','--slurp','--method','GET',f'repos/{repo}/issues/4/comments','-f','per_page=100']))\n          comments = [item for page in pages for item in page]\n'''
+          for path in files:
+              text = path.read_text(encoding='utf-8')
+              if replacement not in text:
+                  matches = [old for old in old_forms if old in text]
+                  if len(matches) != 1:
+                      raise SystemExit(f'{path}: expected one nonpaginated comment lookup, found {len(matches)}')
+                  text = text.replace(matches[0], replacement)
+              path.write_text(text, encoding='utf-8')
+          PY
+          git diff --check
+      - name: Commit pagination and remove one-shot workflow
+        run: |
+          set -euo pipefail
+          rm .github/workflows/assignment-fence-comment-pagination-fix-once.yml
+          git config user.name "mickg10 formal automation"
+          git config user.email "5094033+mickg10@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "ci: paginate canonical formal verdict comments"
+          git push origin HEAD:bigoracle/assignment-fence-proof-v4
