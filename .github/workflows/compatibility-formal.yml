@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: compatibility-formal-${{ github.event.pull_request.number || github.ref }}
@@ -20,38 +20,18 @@ env:
   TLC_180_SHA256: "e22f8ffb4bacdea0a871f444dd94fe5fb0d8013b3388ae39e82e26f852c735d5"
 
 jobs:
-  precedence-repair:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.head_ref || github.ref_name }}
-          fetch-depth: 0
-      - name: Apply the seven exact parenthesizations once
-        run: |
-          set -euo pipefail
-          python3 formal/fix_compatibility_precedence_once.py
-          git diff --check
-          if git diff --quiet -- formal/MixedVersionCompatibility.tla; then
-            echo "precedence assignments already explicit"
-            exit 0
-          fi
-          git diff -- formal/MixedVersionCompatibility.tla
-          git config user.name "mickg10 formal automation"
-          git config user.email "5094033+mickg10@users.noreply.github.com"
-          git add formal/MixedVersionCompatibility.tla
-          git commit -m "formal: parenthesize compatibility boolean assignments"
-          git push origin HEAD:${{ github.head_ref || github.ref_name }}
-
   static:
-    needs: precedence-repair
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Verify exact checked-out revision
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${{ github.event.pull_request.head.sha || github.sha }}"
+          test -z "$(git status --porcelain --untracked-files=all)"
       - name: Byte-level codec fixture
         run: python3 formal/compatibility_codec_fixture_test.py
       - name: Exact 31-row static contract
@@ -92,6 +72,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Verify exact checked-out revision
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${{ github.event.pull_request.head.sha || github.sha }}"
+          test -z "$(git status --porcelain --untracked-files=all)"
       - name: Install Java and GNU time
         run: |
           sudo apt-get update
@@ -128,6 +113,9 @@ jobs:
             --differential-jar /tmp/tla2tools-1.8.0.jar \
             --differential-sha256 "$TLC_180_SHA256" \
             --only "$ONLY"
+      - name: Checkout remains clean
+        if: always()
+        run: test -z "$(git status --porcelain --untracked-files=all)"
       - name: Archive formal evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -137,5 +125,5 @@ jobs:
             /tmp/compatibility-${{ matrix.group }}
             /tmp/tlc-174-help.txt
             /tmp/tlc-180-help.txt
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 30
