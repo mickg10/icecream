@@ -8,7 +8,7 @@ the fulfillment daemon before PREPARE occupies only a bounded pending
 record.  It cannot start a compiler or create an environment side effect
 until the matching PREPARE is consumed.  PREPARE and REVOKE share one
 ordered scheduler-to-daemon queue.
-***************************************************************************
+***************************************************************************)
 EXTENDS Naturals, Sequences, TLC
 
 CONSTANTS StrictEnforcing, PipelinedEnforcing,

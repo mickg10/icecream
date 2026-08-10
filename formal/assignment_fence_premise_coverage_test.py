@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Require an executable row for every named assignment-fence premise."""
+"""Require fixed, witness, and mutant coverage for every fence premise."""
 
 from __future__ import annotations
 
@@ -17,12 +17,15 @@ PREMISES = {
         "core-mixed-token-mutant",
     },
     "release follows a consumed terminal token": {
+        "core-fixed",
         "core-release-claimed-mutant",
         "network-release-on-enqueue-mutant",
     },
-    "claim and revoke are exclusive at their linearization point": {
+    "claim and revoke have one ordered linearization outcome": {
         "network-claim-wins-queued-revoke-witness",
         "network-fence-wins-delayed-claim-witness",
+        "p49-pipelined-revoke-race",
+        "p49-pipelined-revoke-race-witness",
     },
     "F-to-S relative order is FIFO": {
         "network-fixed",
@@ -45,13 +48,14 @@ PREMISES = {
         "p49-pipelined-unbounded-pending-mutant",
     },
     "unknown compacted identities are not default-allowed": {
+        "network-compaction-fixed",
         "network-default-allow-after-compaction-mutant",
         "p49-pipelined-default-allow-mutant",
     },
     "an already pending exact claim resolves under stated fairness": {
         "p49-pipelined-pending-liveness",
     },
-    "the finite FIFO quotient preserves the fixed network result": {
+    "the finite FIFO quotient preserves fixed and fair network results": {
         "network-fixed",
         "network-compaction-fixed",
         "network-fair-liveness",
@@ -68,6 +72,7 @@ EXPECTED_COUNTEREXAMPLES = {
     "network-default-allow-after-compaction-mutant",
     "network-f2s-bypass-mutant",
     "p49-pipelined-claim-before-prepare-witness",
+    "p49-pipelined-revoke-race-witness",
     "p49-pipelined-side-effect-before-prepare-mutant",
     "p49-pipelined-unbounded-pending-mutant",
     "p49-pipelined-default-allow-mutant",
@@ -83,8 +88,7 @@ class PremiseCoverageTests(unittest.TestCase):
     def test_every_premise_row_exists(self) -> None:
         for premise, check_ids in PREMISES.items():
             with self.subTest(premise=premise):
-                missing = sorted(check_ids - self.rows.keys())
-                self.assertEqual(missing, [])
+                self.assertEqual(sorted(check_ids - self.rows.keys()), [])
 
     def test_mutants_and_witnesses_remain_counterexamples(self) -> None:
         for check_id in sorted(EXPECTED_COUNTEREXAMPLES):
@@ -102,31 +106,34 @@ class PremiseCoverageTests(unittest.TestCase):
                     for check_id in check_ids
                     if self.rows[check_id]["expected"] == "pass"
                 ]
-                # Race reachability premises are intentionally represented by
-                # two opposite fixed-model witnesses rather than a passing
-                # universal row.
-                witness_only = premise == (
-                    "claim and revoke are exclusive at their linearization point"
+                self.assertTrue(
+                    passing,
+                    f"{premise}: at least one accepted fixed/progress row required",
                 )
-                self.assertTrue(passing or witness_only)
 
-    def test_no_row_is_silently_unclassified(self) -> None:
+    def test_every_focused_network_or_p49_row_is_classified(self) -> None:
         covered = set().union(*PREMISES.values())
         focused_ids = {
             row_id
             for row_id in self.rows
             if row_id.startswith("p49-") or row_id.startswith("network-")
         }
-        allowed_support_rows = {
-            "network-fence-wins-delayed-claim-witness",
-            "network-claim-wins-queued-revoke-witness",
-        }
-        uncovered = sorted(focused_ids - covered - allowed_support_rows)
         self.assertEqual(
-            uncovered,
+            sorted(focused_ids - covered),
             [],
             "new focused rows require an explicit named premise",
         )
+
+    def test_coverage_is_not_only_mutants(self) -> None:
+        for premise, check_ids in PREMISES.items():
+            with self.subTest(premise=premise):
+                expectations = {self.rows[check_id]["expected"] for check_id in check_ids}
+                self.assertIn("pass", expectations)
+                if len(check_ids) > 1:
+                    self.assertTrue(
+                        "counterexample" in expectations
+                        or premise.endswith("fixed and fair network results")
+                    )
 
 
 if __name__ == "__main__":
