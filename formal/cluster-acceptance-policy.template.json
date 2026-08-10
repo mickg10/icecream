@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "repetitions_per_case": "<integer-at-least-3>",
+  "warmup_seconds": "<integer-at-least-60>",
+  "measurement_seconds": "<integer-at-least-300>",
+  "strict": {
+    "minimum_throughput_ratio": "<0-to-1-relative-to-baseline>",
+    "maximum_usecs_p99_ratio": "<at-least-1-relative-to-baseline>",
+    "maximum_begin_p99_ratio": "<at-least-1-relative-to-baseline>",
+    "maximum_cpu_ratio": "<at-least-1-relative-to-baseline>",
+    "maximum_rss_ratio": "<at-least-1-relative-to-baseline>",
+    "maximum_management_p99_ms": "<positive-absolute-bound>"
+  },
+  "pipelined": {
+    "minimum_throughput_ratio": "<0-to-1-relative-to-baseline>",
+    "maximum_usecs_p99_ratio": "<at-least-1-relative-to-baseline>",
+    "maximum_begin_p99_ratio": "<at-least-1-relative-to-baseline>",
+    "maximum_cpu_ratio": "<at-least-1-relative-to-baseline>",
+    "maximum_rss_ratio": "<at-least-1-relative-to-baseline>",
+    "maximum_management_p99_ms": "<positive-absolute-bound>"
+  },
+  "allow_pipelined_only_when_strict_misses_performance": true,
+  "require_zero_correctness_failures": true
+}
