@@ -226,11 +226,11 @@ StartCompile ==
     /\ ~started
     /\ ~terminal
     /\ ~released
-    /\ (matched /\ ~revoked)
+    /\ ((matched /\ ~revoked)
         \/ (MutantStartBeforeGrant
             /\ claimArrived
             /\ pendingCount > 0
-            /\ ~authorizationSeen)
+            /\ ~authorizationSeen))
     /\ started' = TRUE
     /\ abstractState' =
           IF matched /\ authorizationSeen
