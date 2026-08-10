@@ -24,6 +24,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -135,6 +137,47 @@ static Msg *wait_for_type(MsgChannel *channel, Msg::Value wanted,
         }
     }
     return nullptr;
+}
+
+/* G4 (bigoracle 21:51): a strict "no complete application frame" assertion for
+   the pre-activation window.  Unlike wait_for_type() -- which deletes non-matching
+   frames and would silently pass a leaked JobBegin/JobDone/Stats/re-Login -- this
+   fails on the FIRST complete frame of ANY type.  Partial frames are tolerated
+   until the absolute deadline. */
+static bool expect_no_complete_frame(MsgChannel *channel, int timeout_msec,
+                                     std::string *seen)
+{
+    const Clock::time_point deadline = Clock::now()
+        + std::chrono::milliseconds(timeout_msec);
+    while (channel && Clock::now() < deadline) {
+        const int remaining = std::max<int>(1,
+            static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - Clock::now()).count()));
+        struct pollfd pfd = { channel->fd, POLLIN, 0 };
+        const int rc = poll(&pfd, 1, remaining);
+        if (rc == 0) {
+            return true;
+        }
+        if (rc < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        Msg *msg = channel->get_msg(0, true);
+        if (msg) {
+            if (seen) {
+                *seen = msg->to_string();
+            }
+            delete msg;
+            return false;
+        }
+        if (channel->at_eof()) {
+            return false;
+        }
+        /* Partial frame only: keep reading until it completes or the deadline. */
+    }
+    return true;
 }
 
 static MsgChannel *accept_login_channel(int listener, int timeout_msec,
@@ -265,7 +308,40 @@ int main(int argc, char **argv)
     Msg *local_reply = wait_for_type(client_a, Msg::USE_CS, 5000);
     REQUIRE(local_reply != nullptr,
             "local client A entered the existing local fallback path");
+    UseCSMsg *local_use = dynamic_cast<UseCSMsg *>(local_reply);
+    REQUIRE(local_use != nullptr, "local reply decoded as UseCS");
+    const uint32_t local_job_id = local_use ? local_use->job_id : 0;
     delete local_reply;
+
+    /* G4 (local-oracle 21:57 #5): zero-count request in the DISCONNECTED state.
+       count=0 must yield zero UseCS replies and leave the connection usable for a
+       later ordinary count=1.  (At this head the schedulerless fallback still
+       synthesizes one UseCS for count=0 -> RED until the zero-count product
+       correction.) */
+    {
+        MsgChannel *client_z = connect_unix_bounded(socket_path, 5000);
+        REQUIRE(client_z != nullptr, "zero-count client connected (disconnected)");
+        GetCSMsg zero_request(Environments(), "zero.cpp", CompileJob::Lang_CXX,
+                              0, "x86_64", 0, std::string(), 0, 0, 0);
+        REQUIRE(client_z && client_z->send_msg(zero_request),
+                "zero-count client sent GetCS(count=0)");
+        std::string zseen;
+        REQUIRE(expect_no_complete_frame(client_z, 2000, &zseen),
+                "zero-count produced no UseCS reply (disconnected)");
+        GetCSMsg one_after_zero(Environments(), "zero-then-one.cpp",
+                                CompileJob::Lang_CXX, 1, "x86_64", 0,
+                                std::string(), 0, 0, 0);
+        REQUIRE(client_z && client_z->send_msg(one_after_zero),
+                "zero-count connection still usable: sent count=1");
+        /* count=0 must NOT have occupied the client: had it set getcs_outstanding,
+           the count=1 would hit the single-outstanding guard and handle_end would
+           close this client (EOF).  Assert the connection is ACCEPTED (not
+           closed); actual UseCS delivery is capacity-gated by the -m1 slot that
+           client A already holds, so it is not required here. */
+        REQUIRE(!wait_eof(client_z, 1500),
+                "zero-count connection accepted the later count=1 (not closed)");
+        delete client_z;
+    }
 
     int bound_port = 0;
     const int listener = listen_on_port(scheduler_port, &bound_port);
@@ -283,10 +359,39 @@ int main(int argc, char **argv)
                              1, "x86_64", 0, std::string(), 0, 0, 0);
     REQUIRE(client_b && client_b->send_msg(pending_request),
             "client B queued GetCS before ConfCS");
-    Msg *early_getcs = wait_for_type(attempt, Msg::GET_CS, 4000);
-    REQUIRE(early_getcs == nullptr,
-            "candidate scheduler received no GetCS before ConfCS");
-    delete early_getcs;
+
+    /* G4 (bigoracle 21:51 / local-oracle 21:57): while ConfCS is withheld, drive
+       the real schedulerless GetCS-derived lifecycle on client A -- a production
+       CompileFile then JobDone using the captured synthetic job id.  This
+       traverses handle_compile_file() and handle_job_done() (the D1 owner gates)
+       without an external compiler.  Then the pending channel must observe ZERO
+       complete application frames of ANY type before ConfCS (the old
+       wait_for_type(GET_CS) negative silently deleted a leaked non-GET_CS frame
+       and falsely passed). */
+    CompileJob local_job;
+    local_job.setLanguage(CompileJob::Lang_CXX);
+    local_job.setCompilerName("g++");
+    local_job.setJobID(local_job_id);
+    local_job.setEnvironmentVersion("__client");
+    local_job.setTargetPlatform("x86_64");
+    local_job.setInputFile(work + "/local-a.cpp");
+    local_job.setOutputFile(work + "/local-a.o");
+    local_job.setWorkingDirectory(work);
+    CompileFileMsg compile(&local_job);
+    REQUIRE(client_a->send_msg(compile),
+            "schedulerless fallback sent production CompileFile");
+    JobDoneMsg fallback_done(local_job_id, 0, JobDoneMsg::FROM_SUBMITTER);
+    fallback_done.real_msec = 1;
+    fallback_done.user_msec = 1;
+    REQUIRE(client_a->send_msg(fallback_done),
+            "schedulerless fallback sent production JobDone");
+
+    std::string leaked;
+    REQUIRE(expect_no_complete_frame(attempt, 4000, &leaked),
+            "no pre-active application frame on the Login attempt channel");
+    if (!leaked.empty()) {
+        fprintf(stderr, "         (leaked pre-active frame: %s)\n", leaked.c_str());
+    }
 
     delete attempt;
     attempt = nullptr;
