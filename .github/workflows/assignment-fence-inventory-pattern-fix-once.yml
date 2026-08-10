@@ -1,0 +1,53 @@
+name: assignment-fence-inventory-pattern-fix-once
+
+on:
+  push:
+    branches:
+      - bigoracle/assignment-fence-proof-v4
+    paths:
+      - ".github/workflows/assignment-fence-inventory-pattern-fix-once.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bigoracle/assignment-fence-proof-v4
+          fetch-depth: 0
+      - name: Restrict pending scan to assignment-fence product symbols
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('formal/generate_assignment_fence_code_inventory.py')
+          text = path.read_text(encoding='utf-8')
+          old = 'r"pending.?claim|PendingClaim|pending_assignments"'
+          new = 'r"AssignmentPendingClaim|PendingAssignmentClaim|pending_assignment_claims|m_pendingAssignmentClaims"'
+          if old in text:
+              if text.count(old) != 1:
+                  raise SystemExit('unexpected broad pending-pattern cardinality')
+              text = text.replace(old, new)
+          elif new not in text:
+              raise SystemExit('neither old nor new pending pattern is present')
+          path.write_text(text, encoding='utf-8')
+          PY
+          python3 formal/assignment_fence_code_inventory_test.py
+          git diff --check
+      - name: Commit exact inventory correction and remove one-shot workflow
+        run: |
+          set -euo pipefail
+          rm .github/workflows/assignment-fence-inventory-pattern-fix-once.yml
+          git config user.name "mickg10 formal automation"
+          git config user.email "5094033+mickg10@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "formal: narrow pending-claim product isolation scan"
+          git push origin HEAD:bigoracle/assignment-fence-proof-v4
