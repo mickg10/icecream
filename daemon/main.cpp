@@ -1159,7 +1159,7 @@ struct Daemon {
     bool send_scheduler(const Msg &msg) __attribute_warn_unused_result__;
     void record_waitforcs_latency(bool use_cs, uint64_t latency_msec);
     void close_scheduler();
-    void finish_scheduler_loss();
+    bool finish_scheduler_loss_if_needed(bool had_scheduler, uint64_t turn_generation);
     bool reconnect();
     int working_loop();
     bool setup_listen_fds();
@@ -4019,18 +4019,36 @@ void Daemon::close_scheduler()
         next_scheduler_connect = time(nullptr) + 3;
 }
 
-/* G4: the single cleanup for the loss of an ESTABLISHED scheduler session.
-   Every answer_client_requests() boundary that may have nulled `scheduler`
-   mid-turn (pre-poll handle_old_request, the drain, later readiness handlers)
-   funnels here gated on had_scheduler && !scheduler, then returns from the
-   turn -- so it runs exactly once per lost generation, before any reconnect,
-   and a failed initial login (scheduler already null at turn start) or an
-   orderly shutdown never reaches it.  close_scheduler() has already dropped
-   the channel; this retires the session's children so no further same-poll
-   work proceeds against a dead session. */
-void Daemon::finish_scheduler_loss()
+/* G4: which session generation's loss has already been settled, and a
+   test-visible count of exactly-once cleanups.  Sentinel ~0ULL never matches a
+   real generation, so the first loss of each session settles exactly once. */
+static uint64_t scheduler_loss_settled_generation = ~0ULL;
+static unsigned int scheduler_loss_cleanups = 0;
+
+/* G4: the single, exactly-once cleanup for the loss of an ESTABLISHED
+   scheduler session.  Every answer_client_requests() boundary that may have
+   nulled `scheduler` mid-turn (pre-poll handle_old_request/maybe_stats, the
+   drain, the readiness handlers, poll error, EOF) calls this immediately
+   after; a true result means "the session is gone, leave the turn now" so no
+   further same-poll work proceeds against a dead session.
+
+   Non-reentrant per session generation: the generation is marked settled
+   BEFORE clear_children() and the test-visible counter increments, so repeated
+   boundary calls within the same lost turn clean up exactly once.  A failed
+   initial login (scheduler already null at turn start -> had_scheduler false)
+   and an orderly shutdown never reach the cleanup. */
+bool Daemon::finish_scheduler_loss_if_needed(bool had_scheduler, uint64_t turn_generation)
 {
+    if (!had_scheduler || scheduler) {
+        return false;                    /* no established-session loss */
+    }
+    if (scheduler_loss_settled_generation == turn_generation) {
+        return true;                     /* already settled this generation */
+    }
+    scheduler_loss_settled_generation = turn_generation;   /* settle BEFORE cleanup */
+    ++scheduler_loss_cleanups;                             /* exactly-once, test-visible */
     clear_children();
+    return true;
 }
 
 bool Daemon::maybe_stats(bool force_check)
@@ -6207,19 +6225,23 @@ void Daemon::answer_client_requests()
     state_writer.alive();
     state_writer.pump();
 
-    /* G4: capture established-session liveness once; any boundary in this turn
-       that loses it funnels through the single finish_scheduler_loss(). */
+    /* G4: capture established-session liveness and its generation once; any
+       boundary in this turn that loses the session funnels through the single
+       exactly-once finish_scheduler_loss_if_needed(). */
     const bool had_scheduler = (scheduler != nullptr);
+    const uint64_t turn_generation = scheduler_session_generation;
 
     handle_old_request();
-    if (had_scheduler && !scheduler) {
-        finish_scheduler_loss();
+    if (finish_scheduler_loss_if_needed(had_scheduler, turn_generation)) {
         return;
     }
 
     /* collect the stats after the children exited icecream_load */
     if (scheduler) {
         maybe_stats();
+    }
+    if (finish_scheduler_loss_if_needed(had_scheduler, turn_generation)) {
+        return;    /* a STATS send can close the established session */
     }
 
     vector< pollfd > pollfds;
@@ -6364,6 +6386,7 @@ void Daemon::answer_client_requests()
     if (ret < 0 && errno != EINTR) {
         log_perror("poll");
         close_scheduler();
+        finish_scheduler_loss_if_needed(had_scheduler, turn_generation);
         return;
     }
     // Reset debug if needed, but only if we aren't waiting for any child processes to finish,
@@ -6388,7 +6411,7 @@ void Daemon::answer_client_requests()
                 if (!msg) {
                     log_warning() << "scheduler closed connection" << endl;
                     close_scheduler();
-                    clear_children();
+                    finish_scheduler_loss_if_needed(had_scheduler, turn_generation);
                     return;
                 }
 
@@ -6423,6 +6446,7 @@ void Daemon::answer_client_requests()
 
                 if (ret) {
                     close_scheduler();
+                    finish_scheduler_loss_if_needed(had_scheduler, turn_generation);
                     return;
                 }
             }
@@ -6432,8 +6456,7 @@ void Daemon::answer_client_requests()
            may have lost the session.  Do not process web/listener/client/
            child/env readiness from this same poll snapshot against a dead
            session -- funnel to the single cleanup and leave the turn. */
-        if (had_scheduler && !scheduler) {
-            finish_scheduler_loss();
+        if (finish_scheduler_loss_if_needed(had_scheduler, turn_generation)) {
             return;
         }
 
@@ -6515,6 +6538,7 @@ void Daemon::answer_client_requests()
                         && client->pipe_from_child >= 0
                         && pollfd_is_set(pollfds, client->pipe_from_child, POLLIN)) {
                     if (!handle_compile_done(client)) {
+                        finish_scheduler_loss_if_needed(had_scheduler, turn_generation);
                         return;
                     }
                 }
@@ -6522,6 +6546,7 @@ void Daemon::answer_client_requests()
                         && client->pipe_from_child >= 0
                         && pollfd_is_set(pollfds, client->pipe_from_child, POLLIN)) {
                     if (!handle_env_install_child_done(client)) {
+                        finish_scheduler_loss_if_needed(had_scheduler, turn_generation);
                         return;
                     }
                 }
@@ -6550,6 +6575,9 @@ void Daemon::answer_client_requests()
                         }
                     }
                 }
+                if (finish_scheduler_loss_if_needed(had_scheduler, turn_generation)) {
+                    return;    /* a per-client handler closed the established session */
+                }
             }
 
             for (map<string, NativeEnvironment>::iterator it = native_environments.begin();
@@ -6565,8 +6593,7 @@ void Daemon::answer_client_requests()
             }
         }
 
-        if (had_scheduler && !scheduler) {
-            finish_scheduler_loss();
+        if (finish_scheduler_loss_if_needed(had_scheduler, turn_generation)) {
             return;
         }
 
