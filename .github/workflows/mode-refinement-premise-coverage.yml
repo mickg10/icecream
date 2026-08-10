@@ -1,0 +1,34 @@
+name: mode-refinement-premise-coverage
+
+on:
+  pull_request:
+    paths:
+      - "formal/mode-refinement-checks-v1.json"
+      - "formal/mode_refinement_premise_coverage_test.py"
+      - "formal/ModeRefinement*.cfg"
+      - "formal/trace-manifests/ModeRefinement*.json"
+      - ".github/workflows/mode-refinement-premise-coverage.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  coverage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Require fixed and discriminating coverage per premise
+        run: |
+          set -euo pipefail
+          python3 formal/mode_refinement_static_check.py \
+            --manifest formal/mode-refinement-checks-v1.json \
+            --repo . \
+            --formal-dir formal
+          python3 formal/mode_refinement_premise_coverage_test.py
+          test -z "$(git status --porcelain --untracked-files=all)"
