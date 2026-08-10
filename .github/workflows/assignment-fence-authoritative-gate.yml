@@ -1,0 +1,234 @@
+name: assignment-fence-authoritative-gate
+
+on:
+  pull_request:
+    paths:
+      - "formal/**"
+      - ".github/workflows/assignment-fence-proof-freeze-once.yml"
+      - ".github/workflows/assignment-fence-authoritative-gate.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  issues: write
+
+concurrency:
+  group: assignment-fence-authoritative-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+  TLC_174_SHA256: "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
+  TLC_180_SHA256: "e22f8ffb4bacdea0a871f444dd94fe5fb0d8013b3388ae39e82e26f852c735d5"
+
+jobs:
+  authoritative:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Require frozen read-only branch and reproducible generators
+        run: |
+          set -euo pipefail
+          for path in \
+            .github/workflows/assignment-fence-reconcile-v2-once.yml \
+            .github/workflows/assignment-fence-proof-search-v2-once.yml \
+            .github/workflows/assignment-fence-proof-freeze-once.yml
+          do
+            test ! -e "$path"
+          done
+          if grep -R -l -E '^\s*contents:\s*write\s*$' \
+            .github/workflows/assignment-fence*.yml; then
+            echo 'write-enabled assignment-fence workflow remains on final head' >&2
+            exit 1
+          fi
+          test -f formal/assignment-fence-proof-strategy.json
+          python3 formal/apply_assignment_fence_network_quotient.py
+          python3 formal/generate_assignment_fence_admission_modes.py
+          python3 formal/reproduce_assignment_fence_core_proof.py --check
+          test -z "$(git status --porcelain --untracked-files=all)"
+          python3 formal/assignment_fence_network_quotient_test.py
+          python3 formal/assignment_fence_proof_manifest_contract_test.py
+          python3 formal/trace_to_harness_test.py
+          python3 formal/tlc_text_trace_test.py
+          python3 formal/normalize_tlc_trace_test.py
+          python3 formal/run_formal_checks_v4_test.py
+          python3 formal/run_tlc_only_checks_v4_test.py
+          if test -f formal/tla_primed_assignment_lint_test.py; then
+            python3 formal/tla_primed_assignment_lint_test.py
+          fi
+          git status --porcelain --untracked-files=all
+      - name: Install execution prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openjdk-17-jre-headless time curl jq libgmp10 z3
+      - name: Resolve and verify pinned TLC and official TLAPS distributions
+        run: |
+          set -euo pipefail
+          root=/tmp/assignment-fence-authoritative
+          mkdir -p "$root" /tmp/tlaps
+          curl --fail --location --retry 4 --retry-all-errors \
+            -o /tmp/tla2tools-1.7.4.jar \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+          curl --fail --location --retry 4 --retry-all-errors \
+            -o /tmp/tla2tools-1.8.0.jar \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
+          printf '%s  %s\n' "$TLC_174_SHA256" /tmp/tla2tools-1.7.4.jar | sha256sum -c -
+          printf '%s  %s\n' "$TLC_180_SHA256" /tmp/tla2tools-1.8.0.jar | sha256sum -c -
+          sha256sum /tmp/tla2tools-1.7.4.jar /tmp/tla2tools-1.8.0.jar > "$root/tlc-digests.txt"
+          java -version > "$root/java-version.txt" 2>&1
+
+          release=''
+          for tag in v1.5.0 1.5.0; do
+            if curl --fail --location --retry 3 --retry-all-errors \
+              -o /tmp/tlapm-release.json \
+              "https://api.github.com/repos/tlaplus/tlapm/releases/tags/${tag}"; then
+              release=$tag
+              break
+            fi
+          done
+          test -n "$release"
+          python3 - <<'PY' >/tmp/tlapm-asset.env
+          import json
+          from pathlib import Path
+          release = json.loads(Path('/tmp/tlapm-release.json').read_text())
+          assets = [
+              asset for asset in release.get('assets', [])
+              if asset.get('name', '').lower().endswith('x86_64-linux-gnu-inst.bin')
+          ]
+          if len(assets) != 1:
+              raise SystemExit([asset.get('name') for asset in release.get('assets', [])])
+          asset = assets[0]
+          print(f"TLAPS_ASSET_URL={asset['browser_download_url']}")
+          print(f"TLAPS_ASSET_NAME={asset['name']}")
+          print(f"TLAPS_ASSET_DIGEST={asset.get('digest') or ''}")
+          PY
+          source /tmp/tlapm-asset.env
+          curl --fail --location --retry 4 --retry-all-errors \
+            -o /tmp/tlaps-installer.bin "$TLAPS_ASSET_URL"
+          actual="sha256:$(sha256sum /tmp/tlaps-installer.bin | awk '{print $1}')"
+          printf '%s\n' "$release" > "$root/tlaps-release-tag.txt"
+          printf '%s\n' "$TLAPS_ASSET_NAME" > "$root/tlaps-asset-name.txt"
+          printf '%s\n' "$TLAPS_ASSET_DIGEST" > "$root/tlaps-release-digest.txt"
+          printf '%s\n' "$actual" > "$root/tlaps-installer-digest.txt"
+          if test -n "$TLAPS_ASSET_DIGEST"; then
+            test "$actual" = "$TLAPS_ASSET_DIGEST"
+          fi
+          chmod +x /tmp/tlaps-installer.bin
+          /tmp/tlaps-installer.bin -d /tmp/tlaps > "$root/tlaps-install.log" 2>&1
+          TLAPM=$(find /tmp/tlaps -type f -name tlapm -perm -111 | head -n 1)
+          test -n "$TLAPM"
+          backend_dir=$(find /tmp/tlaps -type f \( -name zenon -o -name z3 -o -name cvc4 -o -name cvc5 \) -printf '%h\n' | head -n 1)
+          if test -z "$backend_dir"; then
+            backend_dir=$(dirname "$(command -v z3)")
+          fi
+          printf '%s\n' "$TLAPM" > "$root/tlapm-path.txt"
+          printf '%s\n' "$backend_dir" > "$root/backend-dir.txt"
+          "$TLAPM" --version > "$root/tlapm-version.txt" 2>&1 || \
+          "$TLAPM" -v > "$root/tlapm-version.txt" 2>&1 || true
+          cp formal/assignment-fence-proof-strategy.json "$root/proof-strategy.json"
+      - name: Execute authoritative generation-4 matrix
+        run: |
+          set -euo pipefail
+          root=/tmp/assignment-fence-authoritative
+          TLAPM=$(cat "$root/tlapm-path.txt")
+          backend_dir=$(cat "$root/backend-dir.txt")
+          export PATH="$backend_dir:$PATH"
+          artifacts="$root/artifacts"
+          command=(
+            python3 formal/run_assignment_fence_focused_gate.py
+            --repo .
+            --manifest formal/assignment-fence-proof-checks-v1.json
+            --artifacts "$artifacts"
+            --expected-git-sha "$(git rev-parse HEAD)"
+            --stable-jar /tmp/tla2tools-1.7.4.jar
+            --stable-sha256 "$TLC_174_SHA256"
+            --differential-jar /tmp/tla2tools-1.8.0.jar
+            --differential-sha256 "$TLC_180_SHA256"
+            --tlapm "$TLAPM"
+            --backend-dir "$backend_dir"
+          )
+          printf '%q ' "${command[@]}" > "$root/command.txt"
+          printf '\n' >> "$root/command.txt"
+          set +e
+          /usr/bin/time -v -o "$root/time.txt" \
+            "${command[@]}" > "$root/runner.log" 2>&1
+          rc=$?
+          set -e
+          printf '%s\n' "$rc" > "$root/exit.txt"
+          cat "$root/runner.log"
+          cat "$root/time.txt"
+          test "$rc" -eq 0
+      - name: Archive authoritative evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: assignment-fence-authoritative-${{ github.sha }}
+          path: /tmp/assignment-fence-authoritative
+          if-no-files-found: error
+          retention-days: 30
+      - name: Publish authoritative verdict
+        if: always()
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from __future__ import annotations
+          import json, os, subprocess
+          from pathlib import Path
+
+          marker = '<!-- assignment-fence-authoritative-status -->'
+          root = Path('/tmp/assignment-fence-authoritative')
+          exit_path = root / 'exit.txt'
+          rc = exit_path.read_text().strip() if exit_path.exists() else 'not-started'
+          strategy_path = root / 'proof-strategy.json'
+          strategy = 'unavailable'
+          if strategy_path.exists():
+              strategy = json.loads(strategy_path.read_text()).get('strategy', 'unavailable')
+          log = root / 'runner.log'
+          if log.exists():
+              lines = log.read_text(encoding='utf-8', errors='replace').splitlines()
+              selected = [
+                  line for line in lines
+                  if any(token in line.lower() for token in (
+                      'formal acceptance failed', 'failed', 'unproved', 'error:',
+                      'states generated', 'distinct states', 'comparison', 'proof',
+                      'peak', 'focused runner command'
+                  ))
+              ]
+              excerpt = '\n'.join(selected[:200]) or '\n'.join(lines[-150:])
+          else:
+              excerpt = 'The authoritative runner did not start.'
+          verdict = 'GREEN' if rc == '0' else 'RED'
+          body = '\n'.join([
+              marker,
+              'From: mickg10/bigoracle',
+              'To: all',
+              '',
+              '## Authoritative assignment-fence formal verdict',
+              '',
+              f"- exact frozen head: `{os.environ['GITHUB_SHA']}`",
+              f"- workflow run: `{os.environ['GITHUB_RUN_ID']}`",
+              f"- reproducible proof strategy: `{strategy}`",
+              f"- generation-4 runner exit: `{rc}`",
+              f"- verdict: **{verdict}**",
+              '',
+              '```text', excerpt[:12000], '```',
+              '',
+              'GREEN means this exact read-only SHA reproduced its selected proof and passed both pinned TLC distributions, every fixed/witness/mutant trace contract, semantic differential comparison, positive peak RSS checks, and TLAPS with zero failed obligations. Product code, real mixed binaries, cluster performance, and rollout remain separate gates.'
+          ])
+          repo = os.environ['GITHUB_REPOSITORY']
+          def gh(arguments, payload=None):
+              return subprocess.run(['gh','api',*arguments], input=payload, text=True, stdout=subprocess.PIPE, check=True, env=os.environ).stdout
+          comments = json.loads(gh([f'repos/{repo}/issues/4/comments?per_page=100']))
+          old = next((item for item in comments if marker in item.get('body','')), None)
+          payload = json.dumps({'body': body})
+          if old:
+              gh(['--method','PATCH',f"repos/{repo}/issues/comments/{old['id']}",'--input','-'], payload)
+          else:
+              gh(['--method','POST',f'repos/{repo}/issues/4/comments','--input','-'], payload)
+          PY
