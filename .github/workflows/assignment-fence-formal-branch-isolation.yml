@@ -1,0 +1,38 @@
+name: assignment-fence-formal-branch-isolation
+
+on:
+  pull_request:
+    paths:
+      - "formal/generate_assignment_fence_code_inventory.py"
+      - "formal/assignment_fence_code_inventory_test.py"
+      - "scheduler/**"
+      - "daemon/**"
+      - "services/**"
+      - "client/**"
+      - "unittests/**"
+      - ".github/workflows/assignment-fence-formal-branch-isolation.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  isolation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Require real existing seams and absent product protocol delta
+        run: |
+          set -euo pipefail
+          python3 formal/assignment_fence_code_inventory_test.py
+          mkdir -p /tmp/assignment-fence-code-inventory
+          python3 formal/generate_assignment_fence_code_inventory.py \
+            --repo . \
+            --output /tmp/assignment-fence-code-inventory/ASSIGNMENT_FENCE_MODEL_TO_CODE.md \
+            --json-output /tmp/assignment-fence-code-inventory/inventory.json
+          test -z "$(git status --porcelain --untracked-files=all)"
