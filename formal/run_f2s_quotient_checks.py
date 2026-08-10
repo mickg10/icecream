@@ -178,6 +178,35 @@ def main() -> int:
         if chosen:
             supplied.add(chosen)
 
+    # F2S_RUNNER_V4_DOMAIN_ARGS: supply domain metadata and repeated
+    # static-checker argv only when the generation-4 runner exposes them.
+    checker_arguments = [
+        "--manifest",
+        str(manifest),
+        "--repo",
+        str(repo),
+        "--formal-dir",
+        "formal",
+    ]
+    for option in (
+        "--static-checker-arg",
+        "--checker-arg",
+        "--static-arg",
+    ):
+        if option in options:
+            for argument in checker_arguments:
+                command.extend([option, argument])
+            supplied.add(option)
+            break
+
+    for candidates, value in (
+        (("--domain", "--domain-name", "--suite-name"), "f2s-quotient"),
+        (("--expected-check-count", "--check-count"), "3"),
+    ):
+        chosen = add_supported(command, options, candidates, value)
+        if chosen:
+            supplied.add(chosen)
+
     only = os.environ.get("F2S_QUOTIENT_ONLY")
     if only and "--only" in options:
         command.extend(["--only", only])
