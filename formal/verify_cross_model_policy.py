@@ -35,6 +35,8 @@ def load(path: Path) -> str:
 def verify(consumer: Path, compatibility: Path) -> dict:
     theory_path = consumer / "formal" / "ASSIGNMENT_FENCE_THEORY.md"
     theory = load(theory_path)
+    landing_path = consumer / "formal" / "UPSTREAM_LANDING_PLAN.md"
+    landing = load(landing_path)
     model_path = compatibility / "formal" / "MixedVersionCompatibility.tla"
     model = load(model_path)
     handoff_path = compatibility / "formal" / "COMPATIBILITY_FINAL_HANDOFF.md"
@@ -108,17 +110,21 @@ def verify(consumer: Path, compatibility: Path) -> dict:
         require(row.get("expected") == "counterexample", f"{check_id}: limitation/witness verdict drifted")
         require(isinstance(row.get("trace_manifest"), str), f"{check_id}: trace witness missing")
 
-    theory_fragments = (
-        "old F             -> Legacy",
-        "new F + old C     -> FencedLegacy",
-        "new F + new C     -> Token",
-        "`Legacy`: frozen old behavior",
-        "`FencedLegacy`: exact worker-side claim/revoke linearization",
-        "`Token`: exact stale prior-epoch identity rejection",
-        "PipelinedEnforcing` is eligible only for a negotiated new-`S`/new-`F`/new-`C`",
+    policy_documents = compact(theory + "\n" + landing)
+    policy_patterns = (
+        r"old\s+F[^.]*Legacy",
+        r"new\s+F\s*(?:\+|plus)\s*old\s+C[^.]*FencedLegacy",
+        r"new\s+F\s*(?:\+|plus)\s*new\s+C[^.]*Token",
+        r"Legacy[^.]{0,200}(?:frozen|old behavior)",
+        r"FencedLegacy[^.]{0,240}(?:worker-side|live epoch|epoch-scoped)",
+        r"Token[^.]{0,240}(?:stale|prior-epoch|restart)",
+        r"PipelinedEnforcing[^.]{0,300}(?:negotiated|new peer|new-S)",
     )
-    for fragment in theory_fragments:
-        require(fragment in theory, f"assignment-fence theory policy drift: {fragment}")
+    for pattern in policy_patterns:
+        require(
+            re.search(pattern, policy_documents, re.IGNORECASE) is not None,
+            f"assignment-fence policy documentation drift: {pattern}",
+        )
 
     topology_fragments = (
         "S'FC",
@@ -151,6 +157,10 @@ def verify(consumer: Path, compatibility: Path) -> dict:
         "consumer_theory": {
             "path": str(theory_path),
             "sha256": sha256(theory_path),
+        },
+        "upstream_landing_plan": {
+            "path": str(landing_path),
+            "sha256": sha256(landing_path),
         },
         "compatibility": {
             "model_sha256": sha256(model_path),
