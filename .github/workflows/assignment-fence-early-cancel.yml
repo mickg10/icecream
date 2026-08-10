@@ -1,0 +1,241 @@
+name: assignment-fence-early-cancel
+
+on:
+  pull_request:
+    paths:
+      - "formal/AssignmentFenceEarlyCancel*"
+      - "formal/trace-manifests/AssignmentFenceEarlyCancel*"
+      - ".github/workflows/assignment-fence-early-cancel.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: assignment-fence-early-cancel-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+  TLC_174_SHA256: "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
+  TLC_180_SHA256: "e22f8ffb4bacdea0a871f444dd94fe5fb0d8013b3388ae39e82e26f852c735d5"
+
+jobs:
+  early-cancel:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Java and evidence tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openjdk-17-jre-headless time curl
+
+      - name: Download and verify pinned TLC jars
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 4 --retry-all-errors \
+            -o /tmp/tla2tools-1.7.4.jar \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+          curl --fail --location --retry 4 --retry-all-errors \
+            -o /tmp/tla2tools-1.8.0.jar \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
+          printf '%s  %s\n' "$TLC_174_SHA256" /tmp/tla2tools-1.7.4.jar | sha256sum -c -
+          printf '%s  %s\n' "$TLC_180_SHA256" /tmp/tla2tools-1.8.0.jar | sha256sum -c -
+          java -version 2>&1 | tee /tmp/java-version.txt
+          java -jar /tmp/tla2tools-1.7.4.jar -help > /tmp/tlc-174-help.txt 2>&1 || true
+          java -jar /tmp/tla2tools-1.8.0.jar -help > /tmp/tlc-180-help.txt 2>&1 || true
+
+      - name: Run fixed safety and product-controlled liveness
+        working-directory: formal
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/early-cancel/fixed
+
+          run_fixed() {
+            local id=$1 module=$2 cfg=$3 version=$4
+            local dir="/tmp/early-cancel/fixed/${id}/${version}"
+            mkdir -p "$dir"
+            /usr/bin/time -v -o "$dir/time.txt" \
+              java -jar "/tmp/tla2tools-${version}.jar" \
+              -workers 1 \
+              -metadir "$dir/states" \
+              -config "$cfg" \
+              "$module" \
+              > "$dir/tlc.log" 2>&1
+            grep -q "No error has been found" "$dir/tlc.log"
+            grep -Eq "[1-9][0-9,]* states generated" "$dir/tlc.log"
+            grep -Eq "[1-9][0-9,]* distinct states found" "$dir/tlc.log"
+            grep -Eq "0 states left on queue" "$dir/tlc.log"
+            ! grep -Eqi "Invariant .* is violated|Temporal properties were violated|Parsing or semantic analysis failed|SANY Error|Exception in thread" "$dir/tlc.log"
+            grep -Eq "Maximum resident set size .*: [1-9][0-9]*" "$dir/time.txt"
+          }
+
+          for version in 1.7.4 1.8.0; do
+            run_fixed safety AssignmentFenceEarlyCancel \
+              AssignmentFenceEarlyCancel.cfg "$version"
+            run_fixed liveness AssignmentFenceEarlyCancelProgress \
+              AssignmentFenceEarlyCancelFair.cfg "$version"
+          done
+
+      - name: Run, normalize, and validate witness and mutants
+        working-directory: formal
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/early-cancel/counterexamples
+
+          run_case() {
+            local id=$1 module=$2 cfg=$3 result_kind=$4 property=$5 manifest=$6 version=$7
+            local dir="/tmp/early-cancel/counterexamples/${id}/${version}"
+            mkdir -p "$dir"
+            local log="$dir/tlc.log"
+            local metrics="$dir/time.txt"
+            local raw="$dir/trace.raw.json"
+            local normalized="$dir/trace.normalized.json"
+            local harness="$dir/harness.json"
+            local rc=0
+
+            if [[ "$version" == "1.8.0" ]]; then
+              set +e
+              /usr/bin/time -v -o "$metrics" \
+                java -jar "/tmp/tla2tools-${version}.jar" \
+                -workers 1 \
+                -metadir "$dir/states" \
+                -config "$cfg" \
+                -dumpTrace json "$raw" \
+                "$module" \
+                > "$log" 2>&1
+              rc=$?
+              set -e
+              [[ -s "$raw" ]]
+              python3 normalize_tlc_trace.py \
+                --input "$raw" --output "$normalized"
+            else
+              set +e
+              /usr/bin/time -v -o "$metrics" \
+                java -jar "/tmp/tla2tools-${version}.jar" \
+                -workers 1 \
+                -metadir "$dir/states" \
+                -config "$cfg" \
+                "$module" \
+                > "$log" 2>&1
+              rc=$?
+              set -e
+              python3 normalize_tlc_trace.py \
+                --input "$log" --output "$normalized"
+            fi
+
+            [[ "$rc" -ne 0 ]]
+            if [[ "$result_kind" == "invariant" ]]; then
+              grep -Eqi "Invariant[[:space:]]+${property}[[:space:]]+is violated" "$log"
+            else
+              grep -Eqi "Temporal properties were violated" "$log"
+              grep -Eq "^PROPERTY[[:space:]]+${property}$" "$cfg"
+              [[ "$(grep -Ec '^PROPERTY[[:space:]]+' "$cfg")" -eq 1 ]]
+            fi
+            grep -Eq "[1-9][0-9,]* states generated" "$log"
+            grep -Eq "[1-9][0-9,]* distinct states found" "$log"
+            ! grep -Eqi "Parsing or semantic analysis failed|SANY Error|Exception in thread|TLC threw an unexpected exception" "$log"
+            grep -Eq "Maximum resident set size .*: [1-9][0-9]*" "$metrics"
+            python3 trace_to_harness.py \
+              --trace "$normalized" \
+              --manifest "$manifest" \
+              --tlc-log "$log" \
+              --output "$harness"
+          }
+
+          for version in 1.7.4 1.8.0; do
+            run_case witness AssignmentFenceEarlyCancel \
+              AssignmentFenceEarlyCancelWitness.cfg invariant \
+              NoEarlyCancelCompleted \
+              trace-manifests/AssignmentFenceEarlyCancelWitness.manifest.template.json \
+              "$version"
+            run_case phase-oracle AssignmentFenceEarlyCancelProgress \
+              AssignmentFenceEarlyCancelPhaseOracleMutantFair.cfg temporal \
+              CancelEventuallySettles \
+              trace-manifests/AssignmentFenceEarlyCancelPhaseOracleMutant.manifest.template.json \
+              "$version"
+            run_case stale-ready AssignmentFenceEarlyCancel \
+              AssignmentFenceEarlyCancelStaleReadyMutant.cfg invariant \
+              NoUseCSAfterCancel \
+              trace-manifests/AssignmentFenceEarlyCancelStaleReadyMutant.manifest.template.json \
+              "$version"
+            run_case release-on-enqueue AssignmentFenceEarlyCancel \
+              AssignmentFenceEarlyCancelReleaseMutant.cfg invariant \
+              ReleaseAfterRevokedConsumption \
+              trace-manifests/AssignmentFenceEarlyCancelReleaseMutant.manifest.template.json \
+              "$version"
+          done
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          root = Path('/tmp/early-cancel/counterexamples')
+          for case in ('witness', 'phase-oracle', 'stale-ready', 'release-on-enqueue'):
+              stable = json.loads((root/case/'1.7.4'/'harness.json').read_text())
+              differential = json.loads((root/case/'1.8.0'/'harness.json').read_text())
+              for key in ('event_sequence', 'required_subsequence', 'harness_steps'):
+                  if stable.get(key) != differential.get(key):
+                      raise SystemExit(
+                          f'{case}: TLC semantic disagreement in {key}: '
+                          f'{stable.get(key)!r} != {differential.get(key)!r}'
+                      )
+          PY
+
+      - name: Write compact result inventory
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import re
+          from pathlib import Path
+
+          root = Path('/tmp/early-cancel')
+          rows = []
+          for log in sorted(root.glob('**/tlc.log')):
+              text = log.read_text(errors='replace')
+              stats = list(re.finditer(
+                  r'([0-9][0-9,]*) states generated,\s*'
+                  r'([0-9][0-9,]*) distinct states found'
+                  r'(?:,\s*([0-9][0-9,]*) states left on queue)?',
+                  text,
+                  re.I,
+              ))
+              depth = list(re.finditer(
+                  r'depth of the complete state graph search is\s+([0-9][0-9,]*)',
+                  text,
+                  re.I,
+              ))
+              last = stats[-1] if stats else None
+              rows.append({
+                  'row': str(log.parent.relative_to(root)),
+                  'log_sha256': hashlib.sha256(log.read_bytes()).hexdigest(),
+                  'generated': int(last.group(1).replace(',', '')) if last else None,
+                  'distinct': int(last.group(2).replace(',', '')) if last else None,
+                  'queued': int(last.group(3).replace(',', '')) if last and last.group(3) else None,
+                  'depth': int(depth[-1].group(1).replace(',', '')) if depth else None,
+                  'no_error': 'No error has been found' in text,
+                  'temporal_violation': 'Temporal properties were violated' in text,
+                  'invariant_violation': bool(re.search(r'Invariant\s+\S+\s+is violated', text)),
+              })
+          root.mkdir(parents=True, exist_ok=True)
+          (root/'results.json').write_text(json.dumps(rows, indent=2, sort_keys=True) + '\n')
+          PY
+
+      - name: Archive exact evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: assignment-fence-early-cancel-${{ github.sha }}
+          path: |
+            /tmp/early-cancel
+            /tmp/java-version.txt
+            /tmp/tlc-174-help.txt
+            /tmp/tlc-180-help.txt
+          if-no-files-found: error
+          retention-days: 30
