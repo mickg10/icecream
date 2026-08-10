@@ -18,6 +18,9 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 RUNNER = HERE / "run_formal_checks_v4.py"
+CHECKER = HERE / "assignment_fence_static_check.py"
+AUTHORITATIVE_MANIFEST = HERE / "assignment-fence-proof-checks-v1.json"
+# ASSIGNMENT_FENCE_DOMAIN_STATIC_V1
 
 
 def sha256(path: Path) -> str:
@@ -88,6 +91,38 @@ def add_first_supported(
 def main() -> int:
     args = parser().parse_args()
     repo = args.repo.resolve()
+    manifest = args.manifest.resolve()
+    artifacts = args.artifacts.resolve()
+    if manifest != AUTHORITATIVE_MANIFEST.resolve():
+        raise SystemExit(
+            f"only {AUTHORITATIVE_MANIFEST.resolve()} is authoritative"
+        )
+    try:
+        artifacts.relative_to(repo)
+    except ValueError:
+        pass
+    else:
+        raise SystemExit("artifact directory must be outside the checkout")
+    static = subprocess.run(
+        [
+            sys.executable,
+            str(CHECKER),
+            "--manifest",
+            str(manifest),
+            "--repo",
+            str(repo),
+            "--formal-dir",
+            "formal",
+        ],
+        cwd=repo,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    print(static.stdout, end="")
+    if static.returncode != 0:
+        return static.returncode
+
     help_process = subprocess.run(
         [sys.executable, str(RUNNER), "--help"],
         cwd=repo,
@@ -103,11 +138,11 @@ def main() -> int:
         sys.executable,
         str(RUNNER),
         "--manifest",
-        str(args.manifest),
+        str(manifest),
         "--repo",
         str(repo),
         "--artifacts",
-        str(args.artifacts),
+        str(artifacts),
         "--expected-git-sha",
         args.expected_git_sha,
         "--stable-jar",
@@ -195,6 +230,67 @@ def main() -> int:
         if chosen:
             supplied.add(chosen)
 
+    checker_option = add_first_supported(
+        command,
+        available,
+        (
+            "--static-checker",
+            "--static-checker-path",
+            "--checker",
+            "--checker-path",
+            "--static-checker-script",
+        ),
+        str(CHECKER.resolve()),
+    )
+    if checker_option:
+        supplied.add(checker_option)
+    chosen = add_first_supported(
+        command,
+        available,
+        ("--static-checker-sha256", "--checker-sha256", "--static-checker-hash"),
+        sha256(CHECKER.resolve()),
+    )
+    if chosen:
+        supplied.add(chosen)
+    chosen = add_first_supported(
+        command,
+        available,
+        ("--manifest-sha256", "--manifest-hash"),
+        sha256(manifest),
+    )
+    if chosen:
+        supplied.add(chosen)
+    for checker_argument_option in (
+        "--static-checker-arg",
+        "--checker-arg",
+        "--static-arg",
+    ):
+        if checker_argument_option in available:
+            for argument in (
+                "--manifest", str(manifest),
+                "--repo", str(repo),
+                "--formal-dir", "formal",
+            ):
+                command.extend([checker_argument_option, argument])
+            supplied.add(checker_argument_option)
+            break
+    chosen = add_first_supported(
+        command,
+        available,
+        ("--domain", "--domain-name", "--suite-name"),
+        "assignment-fence",
+    )
+    if chosen:
+        supplied.add(chosen)
+    chosen = add_first_supported(
+        command,
+        available,
+        ("--expected-check-count", "--check-count"),
+        "24",
+    )
+    if chosen:
+        supplied.add(chosen)
+
     if "--only" in available and os.environ.get("ASSIGNMENT_FENCE_ONLY"):
         command.extend(["--only", os.environ["ASSIGNMENT_FENCE_ONLY"]])
         supplied.add("--only")
@@ -210,7 +306,13 @@ def main() -> int:
     unmapped_proof = [
         option
         for option in unmapped_required
-        if any(token in option for token in ("tlapm", "tlaps", "backend", "proof"))
+        if any(
+            token in option
+            for token in (
+                "tlapm", "tlaps", "backend", "proof",
+                "static", "checker", "manifest", "domain",
+            )
+        )
     ]
     if unmapped_proof:
         raise SystemExit(
