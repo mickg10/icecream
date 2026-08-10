@@ -1,0 +1,29 @@
+name: cross-model-policy-contract
+
+on:
+  pull_request:
+    paths:
+      - "formal/verify_cross_model_policy.py"
+      - "formal/verify_cross_model_policy_test.py"
+      - "formal/ASSIGNMENT_FENCE_THEORY.md"
+      - "formal/UPSTREAM_LANDING_PLAN.md"
+      - ".github/workflows/cross-model-policy-contract.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run policy consistency mutation tests
+        run: |
+          set -euo pipefail
+          python3 formal/verify_cross_model_policy_test.py
+          python3 formal/verify_cross_model_policy.py --help
+          test -z "$(git status --porcelain --untracked-files=all)"
