@@ -495,6 +495,7 @@ public:
         channel = nullptr;
         job = nullptr;
         usecsmsg = nullptr;
+        deferred_getcs = nullptr;
         client_id = 0;
         niceness = 0;
         status = UNKNOWN;
@@ -552,6 +553,8 @@ public:
         channel = nullptr;
         delete usecsmsg;
         usecsmsg = nullptr;
+        delete deferred_getcs;
+        deferred_getcs = nullptr;
         delete job;
         job = nullptr;
 
@@ -571,6 +574,7 @@ public:
     string outfile; // only useful for LINKJOB or TOINSTALL/WAITINSTALL
     MsgChannel *channel;
     UseCSMsg *usecsmsg;
+    GetCSMsg *deferred_getcs;   // G4: GetCS held during LOGIN_ATTEMPT, re-driven on ConfCS
     CompileJob *job;
     int client_id;
     uint32_t niceness; // nice priority (0-20), for PENDING_USE_CS
@@ -5611,6 +5615,33 @@ void Daemon::handle_old_request()
     const unsigned int compile_limit = std::max((unsigned int)1, max_kids);
     const unsigned int preprocess_limit = std::max((unsigned int)1, max_preprocess_kids);
 
+    /* G4: during LOGIN_ATTEMPT the session is not committed -- hold
+       scheduler-bound client work until ConfCS.  (When there is no scheduler
+       at all, this is false and offline local scheduling proceeds normally.) */
+    if (scheduler_login_pending && !scheduler_session_active) {
+        return;
+    }
+    /* Re-drive any GetCS held during a prior LOGIN_ATTEMPT now that the session
+       is active. */
+    if (scheduler_session_active) {
+        for (const auto &kv : clients) {
+            Client *c = kv.second;
+            if (!c->deferred_getcs) {
+                continue;
+            }
+            GetCSMsg *g = c->deferred_getcs;
+            c->deferred_getcs = nullptr;
+            g->client_count = clients.size();
+            g->command_summary.clear();
+            const bool sent = send_scheduler(*g);
+            delete g;
+            if (!sent) {
+                return;   /* session lost; answer_client_requests runs the cleanup */
+            }
+            c->set_status(Client::WAITFORCS, "handle_old_request: re-driven held GetCS");
+        }
+    }
+
     while (true) {
         const bool compile_capacity = (current_kids + clients.active_processes) < compile_limit;
         const bool preprocess_capacity = (preprocess_active_processes < preprocess_limit);
@@ -6063,6 +6094,18 @@ bool Daemon::handle_get_cs(Client *client, Msg *msg)
     umsg->client_id = client->client_id;
     trace() << "handle_get_cs " << umsg->client_id << endl;
 
+    if (scheduler && !scheduler_session_active) {
+        /* G4 LOGIN_ATTEMPT: the channel is up but the session is not committed
+           (no ConfCS yet).  Hold this request -- do NOT forward it on the
+           pending channel, and do NOT convert it to local work merely because
+           activation is pending.  handle_old_request re-drives it once the
+           session becomes active. */
+        delete client->deferred_getcs;
+        client->deferred_getcs = new GetCSMsg(*umsg);
+        client->set_status(Client::WAITFORCS, "handle_get_cs: holding for session activation");
+        return true;
+    }
+
     if (!scheduler) {
         /* now the thing is this: if there is no scheduler
            there is no point in trying to ask him. So we just
@@ -6090,9 +6133,16 @@ int Daemon::handle_cs_conf(ConfCSMsg *msg)
        unsolicited ConfCS (no pending Login, or already active) is ignored and
        creates no second generation. */
     if (scheduler_login_pending && !scheduler_session_active) {
-        ++scheduler_session_generation;
-        scheduler_session_active = true;
-        scheduler_login_pending = false;
+        if (scheduler_session_generation == ~(uint64_t)0) {
+            /* Generation space exhausted: refuse activation rather than wrap to
+               a reused generation.  Stay in LOGIN_ATTEMPT (the bounded
+               handshake deadline drops the channel). */
+            log_error() << "scheduler session generation exhausted; refusing activation" << endl;
+        } else {
+            ++scheduler_session_generation;
+            scheduler_session_active = true;
+            scheduler_login_pending = false;
+        }
     }
     return 0;
 }
@@ -6264,8 +6314,9 @@ void Daemon::answer_client_requests()
         return;
     }
 
-    /* collect the stats after the children exited icecream_load */
-    if (scheduler) {
+    /* collect the stats after the children exited icecream_load; only on an
+       ACTIVE session -- do not send stats on a pending (LOGIN_ATTEMPT) channel. */
+    if (scheduler_session_active) {
         maybe_stats();
     }
     if (finish_scheduler_loss_if_needed(had_active_session, turn_generation)) {
