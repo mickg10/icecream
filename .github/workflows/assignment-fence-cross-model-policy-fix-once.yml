@@ -1,0 +1,64 @@
+name: assignment-fence-cross-model-policy-fix-once
+
+on:
+  push:
+    branches:
+      - bigoracle/assignment-fence-proof-v4
+    paths:
+      - ".github/workflows/assignment-fence-cross-model-policy-fix-once.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bigoracle/assignment-fence-proof-v4
+          fetch-depth: 0
+      - name: Compare semantic policy statements across both design documents
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('formal/verify_cross_model_policy.py')
+          text = path.read_text(encoding='utf-8')
+          load_anchor = '''    theory_path = consumer / "formal" / "ASSIGNMENT_FENCE_THEORY.md"\n    theory = load(theory_path)\n'''
+          load_replacement = '''    theory_path = consumer / "formal" / "ASSIGNMENT_FENCE_THEORY.md"\n    theory = load(theory_path)\n    landing_path = consumer / "formal" / "UPSTREAM_LANDING_PLAN.md"\n    landing = load(landing_path)\n'''
+          if load_anchor in text:
+              text = text.replace(load_anchor, load_replacement)
+          elif load_replacement not in text:
+              raise SystemExit('cross-model document load anchor changed')
+
+          start = text.find('    theory_fragments = (\n')
+          end = text.find('\n\n    topology_fragments = (\n', start)
+          if start < 0 or end < 0:
+              raise SystemExit('cross-model theory-fragment block changed')
+          replacement = '''    policy_documents = compact(theory + "\\n" + landing)\n    policy_patterns = (\n        r"old\\s+F[^.]*Legacy",\n        r"new\\s+F\\s*(?:\\+|plus)\\s*old\\s+C[^.]*FencedLegacy",\n        r"new\\s+F\\s*(?:\\+|plus)\\s*new\\s+C[^.]*Token",\n        r"Legacy[^.]{0,200}(?:frozen|old behavior)",\n        r"FencedLegacy[^.]{0,240}(?:worker-side|live epoch|epoch-scoped)",\n        r"Token[^.]{0,240}(?:stale|prior-epoch|restart)",\n        r"PipelinedEnforcing[^.]{0,300}(?:negotiated|new peer|new-S)",\n    )\n    for pattern in policy_patterns:\n        require(\n            re.search(pattern, policy_documents, re.IGNORECASE) is not None,\n            f"assignment-fence policy documentation drift: {pattern}",\n        )'''
+          text = text[:start] + replacement + text[end:]
+
+          report_anchor = '''        "consumer_theory": {\n            "path": str(theory_path),\n            "sha256": sha256(theory_path),\n        },\n'''
+          report_replacement = '''        "consumer_theory": {\n            "path": str(theory_path),\n            "sha256": sha256(theory_path),\n        },\n        "upstream_landing_plan": {\n            "path": str(landing_path),\n            "sha256": sha256(landing_path),\n        },\n'''
+          if report_anchor in text:
+              text = text.replace(report_anchor, report_replacement)
+          elif report_replacement not in text:
+              raise SystemExit('cross-model report anchor changed')
+
+          path.write_text(text, encoding='utf-8')
+          PY
+          python3 formal/verify_cross_model_policy.py --help
+          git diff --check
+      - name: Commit semantic check and remove one-shot workflow
+        run: |
+          set -euo pipefail
+          rm .github/workflows/assignment-fence-cross-model-policy-fix-once.yml
+          git config user.name "mickg10 formal automation"
+          git config user.email "5094033+mickg10@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "formal: compare cross-model policy semantics robustly"
+          git push origin HEAD:bigoracle/assignment-fence-proof-v4
