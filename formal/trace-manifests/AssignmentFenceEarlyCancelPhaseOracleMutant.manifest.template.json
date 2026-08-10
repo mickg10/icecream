@@ -1,0 +1,65 @@
+{
+  "schema": 1,
+  "scenario": "AssignmentFenceEarlyCancelPhaseOracleMutant",
+  "property": "EarlyCancelEventuallySettles",
+  "expected_result": "counterexample",
+  "min_states": 3,
+  "event_mode": "exclusive",
+  "require_lasso": true,
+  "events": [
+    {
+      "name": "SQueuePrepare",
+      "all": [
+        {"path": "sPhase", "from": "Absent", "to": "PrepareQueued"},
+        {"path": "s2f", "len_delta": 1}
+      ]
+    },
+    {
+      "name": "SQueueEarlyCancel",
+      "all": [
+        {"path": "sPhase", "from": "PrepareQueued", "to": "RevokeQueued"},
+        {"path": "cancelRequested", "from": false, "to": true},
+        {"path": "earlyCancel", "from": false, "to": true},
+        {"path": "s2f", "from_len": 1, "to_len": 2}
+      ]
+    },
+    {
+      "name": "CancelSettles",
+      "all": [
+        {"path": "revokedReplyConsumed", "from": false, "to": true},
+        {"path": "released", "from": false, "to": true}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "SQueuePrepare",
+    "SQueueEarlyCancel"
+  ],
+  "forbidden_events": ["CancelSettles"],
+  "final_all": [
+    {"path": "earlyCancel", "eq": true},
+    {"path": "sPhase", "eq": "RevokeQueued"},
+    {"path": "fPhase", "eq": "None"},
+    {"path": "schedulerReservation", "eq": true},
+    {"path": "released", "eq": false},
+    {"path": "s2f", "to_len": 2}
+  ],
+  "harness_steps": [
+    {
+      "after": "SQueueEarlyCancel",
+      "emit": "barrier_prepare_then_revoke_queued_before_worker_receive",
+      "actor": "scheduler"
+    },
+    {
+      "after": "SQueueEarlyCancel",
+      "emit": "assert_worker_refuses_fifo_prepare_when_reading_scheduler_phase",
+      "actor": "fulfillment-daemon"
+    }
+  ],
+  "metadata": {
+    "module": "AssignmentFenceEarlyCancelProgress",
+    "config": "AssignmentFenceEarlyCancelPhaseOracleMutantFair.cfg",
+    "mutant": "MutantFReadsSchedulerPhase = TRUE",
+    "fairness": "weak fairness only for enabled FIFO-head consumption"
+  }
+}
