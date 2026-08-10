@@ -1,0 +1,29 @@
+name: assignment-fence-premise-coverage
+
+on:
+  pull_request:
+    paths:
+      - "formal/assignment-fence-proof-checks-v1.json"
+      - "formal/assignment_fence_premise_coverage_test.py"
+      - "formal/assignment_fence_premise_coverage_test_v2.py"
+      - ".github/workflows/assignment-fence-premise-coverage.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  coverage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Regenerate focused manifest and require complete premise coverage
+        run: |
+          set -euo pipefail
+          python3 formal/generate_assignment_fence_admission_modes.py
+          test -z "$(git status --porcelain --untracked-files=all)"
+          python3 formal/assignment_fence_premise_coverage_test.py
+          python3 formal/assignment_fence_premise_coverage_test_v2.py
