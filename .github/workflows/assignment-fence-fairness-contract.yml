@@ -1,0 +1,32 @@
+name: assignment-fence-fairness-contract
+
+on:
+  pull_request:
+    paths:
+      - "formal/assignment-fence-proof-checks-v1.json"
+      - "formal/assignment_fence_fairness_contract_test.py"
+      - "formal/AssignmentFenceCore*.tla"
+      - "formal/AssignmentFenceNetwork*.tla"
+      - "formal/AssignmentFenceAdmissionModes.tla"
+      - "formal/*.cfg"
+      - "formal/trace-manifests/*.json"
+      - ".github/workflows/assignment-fence-fairness-contract.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fairness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reproduce manifest and enforce weak-fairness boundary
+        run: |
+          set -euo pipefail
+          python3 formal/generate_assignment_fence_admission_modes.py
+          test -z "$(git status --porcelain --untracked-files=all)"
+          python3 formal/assignment_fence_fairness_contract_test.py
