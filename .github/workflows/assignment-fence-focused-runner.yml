@@ -1,0 +1,220 @@
+name: assignment-fence-focused-runner
+
+on:
+  pull_request:
+    paths:
+      - "formal/**"
+      - ".github/workflows/assignment-fence-focused-runner.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  issues: write
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+  TLC_174_SHA256: "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
+  TLC_180_SHA256: "e22f8ffb4bacdea0a871f444dd94fe5fb0d8013b3388ae39e82e26f852c735d5"
+
+jobs:
+  focused-matrix:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Require focused formal closure
+        run: |
+          set -euo pipefail
+          test -f formal/assignment-fence-proof-checks-v1.json
+          test -f formal/AssignmentFenceAdmissionModes.tla
+          test -f formal/assignment_fence_network_quotient_test.py
+          python3 formal/assignment_fence_network_quotient_test.py
+          python3 formal/assignment_fence_proof_manifest_test.py
+          python3 formal/run_formal_checks_v4_test.py
+          test -z "$(git status --porcelain --untracked-files=all)"
+      - name: Install runtime prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openjdk-17-jre-headless time curl jq libgmp10
+      - name: Download and verify pinned TLC distributions
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/assignment-fence-focused
+          curl --fail --location --retry 4 --retry-all-errors \
+            -o /tmp/tla2tools-1.7.4.jar \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+          curl --fail --location --retry 4 --retry-all-errors \
+            -o /tmp/tla2tools-1.8.0.jar \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
+          printf '%s  %s\n' "$TLC_174_SHA256" /tmp/tla2tools-1.7.4.jar | sha256sum -c -
+          printf '%s  %s\n' "$TLC_180_SHA256" /tmp/tla2tools-1.8.0.jar | sha256sum -c -
+          java -version > /tmp/assignment-fence-focused/java-version.txt 2>&1
+          sha256sum /tmp/tla2tools-1.7.4.jar /tmp/tla2tools-1.8.0.jar \
+            > /tmp/assignment-fence-focused/tlc-digests.txt
+      - name: Resolve, verify, and install official TLAPS 1.5.0
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/tlaps
+          release=''
+          for tag in v1.5.0 1.5.0; do
+            if curl --fail --location --retry 3 --retry-all-errors \
+              -o /tmp/tlapm-release.json \
+              "https://api.github.com/repos/tlaplus/tlapm/releases/tags/${tag}"; then
+              release=$tag
+              break
+            fi
+          done
+          test -n "$release"
+          python3 - <<'PY' >/tmp/tlapm-asset.env
+          import json
+          from pathlib import Path
+          release = json.loads(Path('/tmp/tlapm-release.json').read_text())
+          assets = [
+              asset for asset in release.get('assets', [])
+              if asset.get('name', '').lower().endswith('x86_64-linux-gnu-inst.bin')
+          ]
+          if len(assets) != 1:
+              raise SystemExit([asset.get('name') for asset in release.get('assets', [])])
+          asset = assets[0]
+          print(f"TLAPS_ASSET_URL={asset['browser_download_url']}")
+          print(f"TLAPS_ASSET_NAME={asset['name']}")
+          print(f"TLAPS_ASSET_DIGEST={asset.get('digest') or ''}")
+          PY
+          source /tmp/tlapm-asset.env
+          curl --fail --location --retry 4 --retry-all-errors \
+            -o /tmp/tlaps-installer.bin "$TLAPS_ASSET_URL"
+          actual="sha256:$(sha256sum /tmp/tlaps-installer.bin | awk '{print $1}')"
+          printf '%s\n' "$release" > /tmp/assignment-fence-focused/tlaps-release-tag.txt
+          printf '%s\n' "$TLAPS_ASSET_NAME" > /tmp/assignment-fence-focused/tlaps-asset-name.txt
+          printf '%s\n' "$TLAPS_ASSET_DIGEST" > /tmp/assignment-fence-focused/tlaps-release-digest.txt
+          printf '%s\n' "$actual" > /tmp/assignment-fence-focused/tlaps-installer-digest.txt
+          if test -n "$TLAPS_ASSET_DIGEST"; then
+            test "$actual" = "$TLAPS_ASSET_DIGEST"
+          fi
+          chmod +x /tmp/tlaps-installer.bin
+          /tmp/tlaps-installer.bin -d /tmp/tlaps \
+            > /tmp/assignment-fence-focused/tlaps-install.log 2>&1
+          TLAPM=$(find /tmp/tlaps -type f -name tlapm -perm -111 | head -n 1)
+          test -n "$TLAPM"
+          backend_bin=$(find /tmp/tlaps -type f \( -name zenon -o -name z3 -o -name cvc4 -o -name cvc5 \) -printf '%h\n' | head -n 1)
+          printf '%s\n' "$TLAPM" > /tmp/assignment-fence-focused/tlapm-path.txt
+          printf '%s\n' "$backend_bin" > /tmp/assignment-fence-focused/backend-bin.txt
+          "$TLAPM" --version > /tmp/assignment-fence-focused/tlapm-version.txt 2>&1 || \
+          "$TLAPM" -v > /tmp/assignment-fence-focused/tlapm-version.txt 2>&1 || true
+      - name: Execute exact proof-bearing matrix
+        run: |
+          set -euo pipefail
+          TLAPM=$(cat /tmp/assignment-fence-focused/tlapm-path.txt)
+          backend_bin=$(cat /tmp/assignment-fence-focused/backend-bin.txt)
+          if test -n "$backend_bin"; then
+            export PATH="$backend_bin:$PATH"
+          fi
+          python3 formal/run_formal_checks_v4.py --help \
+            > /tmp/assignment-fence-focused/runner-help.txt
+
+          artifacts=/tmp/assignment-fence-focused/artifacts
+          rm -rf "$artifacts"
+          cmd=(
+            python3 formal/run_formal_checks_v4.py
+            --manifest formal/assignment-fence-proof-checks-v1.json
+            --repo .
+            --artifacts "$artifacts"
+            --expected-git-sha "$(git rev-parse HEAD)"
+            --stable-jar /tmp/tla2tools-1.7.4.jar
+            --stable-sha256 "$TLC_174_SHA256"
+            --differential-jar /tmp/tla2tools-1.8.0.jar
+            --differential-sha256 "$TLC_180_SHA256"
+          )
+          help=/tmp/assignment-fence-focused/runner-help.txt
+          if grep -q -- '--tlapm ' "$help"; then
+            cmd+=(--tlapm "$TLAPM")
+          elif grep -q -- '--tlapm-path ' "$help"; then
+            cmd+=(--tlapm-path "$TLAPM")
+          else
+            echo 'proof-bearing runner exposes no TLAPM option' >&2
+            exit 2
+          fi
+          if grep -q -- '--backend-dir ' "$help"; then
+            cmd+=(--backend-dir "$backend_bin")
+          elif grep -q -- '--tlaps-backend-dir ' "$help"; then
+            cmd+=(--tlaps-backend-dir "$backend_bin")
+          elif grep -q -- '--backend-bin-dir ' "$help"; then
+            cmd+=(--backend-bin-dir "$backend_bin")
+          fi
+          printf '%q ' "${cmd[@]}" > /tmp/assignment-fence-focused/command.txt
+          printf '\n' >> /tmp/assignment-fence-focused/command.txt
+          set +e
+          /usr/bin/time -v -o /tmp/assignment-fence-focused/runner-time.txt \
+            "${cmd[@]}" \
+            > /tmp/assignment-fence-focused/runner.log 2>&1
+          rc=$?
+          set -e
+          printf '%s\n' "$rc" > /tmp/assignment-fence-focused/runner-exit.txt
+          cat /tmp/assignment-fence-focused/runner.log
+          cat /tmp/assignment-fence-focused/runner-time.txt
+          test "$rc" -eq 0
+      - name: Archive complete focused evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: assignment-fence-focused-${{ github.sha }}
+          path: /tmp/assignment-fence-focused
+          if-no-files-found: error
+          retention-days: 30
+      - name: Publish focused-gate status
+        if: always()
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from __future__ import annotations
+          import json, os, subprocess
+          from pathlib import Path
+
+          marker = '<!-- assignment-fence-focused-status -->'
+          log = Path('/tmp/assignment-fence-focused/runner.log')
+          if log.exists():
+              lines = log.read_text(encoding='utf-8', errors='replace').splitlines()
+              selected = [
+                  line for line in lines
+                  if any(token in line.lower() for token in (
+                      'formal acceptance failed', 'failed', 'unproved', 'error:',
+                      'states generated', 'distinct states', 'comparison', 'proof'
+                  ))
+              ]
+              excerpt = '\n'.join(selected[:120]) or '\n'.join(lines[-100:])
+          else:
+              excerpt = 'The focused runner did not start; inspect the retained setup evidence.'
+          excerpt = excerpt[:9000]
+          rc_path = Path('/tmp/assignment-fence-focused/runner-exit.txt')
+          rc = rc_path.read_text().strip() if rc_path.exists() else 'not-started'
+          body = '\n'.join([
+              marker,
+              'From: mickg10/bigoracle',
+              'To: mickg10/local-oracle, mickg10/implementer',
+              '',
+              '## Focused proof-bearing assignment-fence gate',
+              '',
+              f"- exact head: `{os.environ['GITHUB_SHA']}`",
+              f"- workflow run: `{os.environ['GITHUB_RUN_ID']}`",
+              f"- runner exit: `{rc}`",
+              '',
+              '```text', excerpt, '```',
+              '',
+              'The gate is accepted only when every fixed row exhausts nonzero state space on TLC 1.7.4 and 1.8.0, every named witness/mutant validates its essential trace on both, stable/differential comparisons agree, and the TLAPS proof row reports zero failed obligations.'
+          ])
+          repo = os.environ['GITHUB_REPOSITORY']
+          def gh(args, payload=None):
+              return subprocess.run(['gh','api',*args], input=payload, text=True, stdout=subprocess.PIPE, check=True, env=os.environ).stdout
+          comments = json.loads(gh([f'repos/{repo}/issues/4/comments?per_page=100']))
+          existing = next((c for c in comments if marker in c.get('body','')), None)
+          payload = json.dumps({'body': body})
+          if existing:
+              gh(['--method','PATCH',f"repos/{repo}/issues/comments/{existing['id']}",'--input','-'], payload)
+          else:
+              gh(['--method','POST',f'repos/{repo}/issues/4/comments','--input','-'], payload)
+          PY
