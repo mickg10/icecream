@@ -1,0 +1,70 @@
+{
+  "schema": 1,
+  "scenario": "ModeRefinementPendingAuthorizesMutant",
+  "property": "PendingDoesNotAuthorize",
+  "expected_result": "counterexample",
+  "min_states": 4,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "QueuePrepareAbstractAwaiting",
+      "all": [
+        {"path": "prepareQueued", "from": false, "to": true},
+        {"path": "abstractState", "from": "Idle", "to": "Awaiting"},
+        {"path": "prepared", "to": false},
+        {"path": "authorizationSeen", "to": false}
+      ]
+    },
+    {
+      "name": "ExposeUseCSBeforePrepareConsumption",
+      "all": [
+        {"path": "usecsExposed", "from": false, "to": true},
+        {"path": "prepared", "to": false},
+        {"path": "abstractState", "to": "Awaiting"},
+        {"path": "authorizationSeen", "to": false}
+      ]
+    },
+    {
+      "name": "PendingClaimPrematurelyAuthorizes",
+      "all": [
+        {"path": "claimArrived", "from": false, "to": true},
+        {"path": "pendingCount", "from": 0, "to": 1},
+        {"path": "pendingStutterSeen", "from": false, "to": true},
+        {"path": "matched", "to": false},
+        {"path": "authorizationSeen", "to": false},
+        {"path": "abstractState", "from": "Awaiting", "to": "Authorized"}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "QueuePrepareAbstractAwaiting",
+    "ExposeUseCSBeforePrepareConsumption",
+    "PendingClaimPrematurelyAuthorizes"
+  ],
+  "final_all": [
+    {"path": "prepareQueued", "eq": true},
+    {"path": "prepared", "eq": false},
+    {"path": "pendingCount", "eq": 1},
+    {"path": "matched", "eq": false},
+    {"path": "authorizationSeen", "eq": false},
+    {"path": "abstractState", "eq": "Authorized"}
+  ],
+  "harness_steps": [
+    {
+      "after": "ExposeUseCSBeforePrepareConsumption",
+      "emit": "deliver_client_claim_before_prepare_consumption",
+      "actor": "client-channel"
+    },
+    {
+      "after": "PendingClaimPrematurelyAuthorizes",
+      "emit": "assert_pending_record_changed_abstract_authority_without_exact_match",
+      "actor": "fulfillment-daemon"
+    }
+  ],
+  "metadata": {
+    "module": "AssignmentFenceModeRefinement",
+    "config": "ModeRefinementPendingAuthorizesMutant.cfg",
+    "mode": "PipelinedEnforcing",
+    "mutant": "MutantPendingAuthorizes = TRUE"
+  }
+}
