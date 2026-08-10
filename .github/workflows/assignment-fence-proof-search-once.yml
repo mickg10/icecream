@@ -1,0 +1,329 @@
+name: assignment-fence-proof-search-once
+
+on:
+  push:
+    branches:
+      - bigoracle/assignment-fence-proof-v4
+    paths:
+      - .github/workflows/assignment-fence-proof-search-once.yml
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  prove:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bigoracle/assignment-fence-proof-v4
+          fetch-depth: 0
+      - name: Generate action-split invariant proof
+        run: |
+          set -euo pipefail
+          cat > formal/generate_assignment_fence_core_proof.py <<'PY'
+          #!/usr/bin/env python3
+          """Generate a deterministic TLAPS induction proof from the core action graph."""
+
+          from __future__ import annotations
+
+          import re
+          from pathlib import Path
+
+          HERE = Path(__file__).resolve().parent
+          MODEL = HERE / "AssignmentFenceCore.tla"
+          PROOF = HERE / "AssignmentFenceCoreProof.tla"
+
+          HEADER_RE = re.compile(
+              r"(?m)^([A-Za-z_][A-Za-z0-9_]*)"
+              r"(?:\(([^=\n]*)\))?\s*=="
+          )
+          IDENT_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
+
+
+          def parse_definitions(text: str) -> tuple[dict[str, str], dict[str, tuple[str, ...]]]:
+              matches = list(HEADER_RE.finditer(text))
+              definitions: dict[str, str] = {}
+              parameters: dict[str, tuple[str, ...]] = {}
+              for index, match in enumerate(matches):
+                  end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+                  name = match.group(1)
+                  raw_parameters = match.group(2) or ""
+                  parameters[name] = tuple(
+                      item.strip()
+                      for item in raw_parameters.split(",")
+                      if item.strip()
+                  )
+                  definitions[name] = text[match.end():end]
+              return definitions, parameters
+
+
+          def closure(targets: list[str], definitions: dict[str, str]) -> list[str]:
+              seen: set[str] = set()
+              pending = list(targets)
+              while pending:
+                  name = pending.pop()
+                  if name in seen or name not in definitions:
+                      continue
+                  seen.add(name)
+                  for dependency in IDENT_RE.findall(definitions[name]):
+                      if dependency in definitions and dependency not in seen:
+                          pending.append(dependency)
+              return sorted(seen)
+
+
+          def theorem_name(action: str) -> str:
+              return f"{action}PreservesCoreInvariant"
+
+
+          def quantified_action(action: str, parameters: tuple[str, ...]) -> str:
+              if not parameters:
+                  return action
+              application = f"{action}({', '.join(parameters)})"
+              return f"\\A {', '.join(parameters)} : {application}"
+
+
+          def generate() -> str:
+              text = MODEL.read_text(encoding="utf-8")
+              definitions, parameters = parse_definitions(text)
+              required = {"Init", "Next", "Spec", "vars", "CoreInvariant"}
+              missing = required - definitions.keys()
+              if missing:
+                  raise SystemExit(f"core proof generator missing definitions: {sorted(missing)}")
+
+              next_dependencies = [
+                  name
+                  for name in IDENT_RE.findall(definitions["Next"])
+                  if name in definitions and "'" in definitions[name]
+              ]
+              actions = sorted(dict.fromkeys(next_dependencies))
+              if not actions:
+                  raise SystemExit("no primed actions found in Next")
+
+              invariant_defs = closure(["CoreInvariant"], definitions)
+              init_defs = closure(["Init", "CoreInvariant"], definitions)
+
+              lines: list[str] = [
+                  "-------------------- MODULE AssignmentFenceCoreProof --------------------",
+                  "(***************************************************************************",
+                  "Generated action-split TLAPS proof for the unbounded logical ownership core.",
+                  "The generator derives the Next action set and each definition closure from",
+                  "AssignmentFenceCore.tla; the committed proof is reproducible and reviewable.",
+                  "***************************************************************************)",
+                  "EXTENDS AssignmentFenceCore",
+                  "",
+                  "THEOREM InitImpliesCoreInvariant ==",
+                  "    Init => CoreInvariant",
+                  "BY SMT DEF " + ", ".join(init_defs),
+                  "",
+              ]
+
+              action_lemmas: list[str] = []
+              for action in actions:
+                  lemma = theorem_name(action)
+                  action_lemmas.append(lemma)
+                  params = parameters.get(action, ())
+                  action_expression = (
+                      action
+                      if not params
+                      else f"{action}({', '.join(params)})"
+                  )
+                  proposition = f"CoreInvariant /\\ {action_expression} => CoreInvariant'"
+                  if params:
+                      proposition = f"\\A {', '.join(params)} : ({proposition})"
+                  defs = closure([action, "CoreInvariant"], definitions)
+                  lines.extend(
+                      [
+                          f"THEOREM {lemma} ==",
+                          f"    {proposition}",
+                          "BY SMT DEF " + ", ".join(defs),
+                          "",
+                      ]
+                  )
+
+              stutter_defs = sorted(set(invariant_defs + ["vars"]))
+              lines.extend(
+                  [
+                      "THEOREM StutterPreservesCoreInvariant ==",
+                      "    CoreInvariant /\\ UNCHANGED vars => CoreInvariant'",
+                      "BY SMT DEF " + ", ".join(stutter_defs),
+                      "",
+                      "THEOREM NextPreservesCoreInvariant ==",
+                      "    CoreInvariant /\\ [Next]_vars => CoreInvariant'",
+                      "BY SMT, "
+                      + ", ".join(action_lemmas + ["StutterPreservesCoreInvariant"])
+                      + " DEF Next, vars",
+                      "",
+                      "THEOREM SpecImpliesCoreInvariant ==",
+                      "    Spec => []CoreInvariant",
+                      "<1>1. Init => CoreInvariant",
+                      "      BY InitImpliesCoreInvariant",
+                      "<1>2. CoreInvariant /\\ [Next]_vars => CoreInvariant'",
+                      "      BY NextPreservesCoreInvariant",
+                      "<1> QED",
+                      "      BY <1>1, <1>2, PTL DEF Spec",
+                      "",
+                      "=============================================================================",
+                      "",
+                  ]
+              )
+              return "\n".join(lines)
+
+
+          def main() -> None:
+              generated = generate()
+              if "THEOREM SpecImpliesCoreInvariant" not in generated:
+                  raise SystemExit("generated proof lacks final induction theorem")
+              PROOF.write_text(generated, encoding="utf-8")
+
+
+          if __name__ == "__main__":
+              main()
+          PY
+          chmod +x formal/generate_assignment_fence_core_proof.py
+          python3 formal/generate_assignment_fence_core_proof.py
+          cp formal/AssignmentFenceCoreProof.tla /tmp/generated-proof-first.tla
+          python3 formal/generate_assignment_fence_core_proof.py
+          cmp /tmp/generated-proof-first.tla formal/AssignmentFenceCoreProof.tla
+          git diff --check
+      - name: Install and identify official TLAPS 1.5.0
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y curl jq time libgmp10
+          mkdir -p /tmp/tlaps /tmp/proof-search
+          release=''
+          for tag in v1.5.0 1.5.0; do
+            if curl --fail --location --retry 3 --retry-all-errors \
+              -o /tmp/tlapm-release.json \
+              "https://api.github.com/repos/tlaplus/tlapm/releases/tags/${tag}"; then
+              release=$tag
+              break
+            fi
+          done
+          test -n "$release"
+          python3 - <<'PY' >/tmp/tlapm-asset.env
+          import json
+          from pathlib import Path
+          release = json.loads(Path('/tmp/tlapm-release.json').read_text())
+          assets = [
+              a for a in release.get('assets', [])
+              if a.get('name', '').lower().endswith('x86_64-linux-gnu-inst.bin')
+          ]
+          if len(assets) != 1:
+              raise SystemExit([a.get('name') for a in release.get('assets', [])])
+          asset = assets[0]
+          print(f"TLAPS_ASSET_URL={asset['browser_download_url']}")
+          print(f"TLAPS_ASSET_DIGEST={asset.get('digest') or ''}")
+          print(f"TLAPS_ASSET_NAME={asset['name']}")
+          PY
+          source /tmp/tlapm-asset.env
+          curl --fail --location --retry 4 --retry-all-errors \
+            -o /tmp/tlaps-installer.bin "$TLAPS_ASSET_URL"
+          actual="sha256:$(sha256sum /tmp/tlaps-installer.bin | awk '{print $1}')"
+          printf '%s\n' "$TLAPS_ASSET_NAME" > /tmp/proof-search/asset-name.txt
+          printf '%s\n' "$actual" > /tmp/proof-search/installer-digest.txt
+          printf '%s\n' "$TLAPS_ASSET_DIGEST" > /tmp/proof-search/release-digest.txt
+          if test -n "$TLAPS_ASSET_DIGEST"; then
+            test "$actual" = "$TLAPS_ASSET_DIGEST"
+          fi
+          chmod +x /tmp/tlaps-installer.bin
+          /tmp/tlaps-installer.bin -d /tmp/tlaps \
+            > /tmp/proof-search/install.log 2>&1
+          TLAPM=$(find /tmp/tlaps -type f -name tlapm -perm -111 | head -n 1)
+          test -n "$TLAPM"
+          printf '%s\n' "$TLAPM" > /tmp/proof-search/tlapm-path.txt
+      - name: Require every generated obligation proved
+        run: |
+          set -euo pipefail
+          TLAPM=$(cat /tmp/proof-search/tlapm-path.txt)
+          backend_bin=$(find /tmp/tlaps -type f \( -name zenon -o -name z3 -o -name cvc4 -o -name cvc5 \) -printf '%h\n' | head -n 1)
+          if test -n "$backend_bin"; then
+            export PATH="$backend_bin:$PATH"
+          fi
+          set +e
+          /usr/bin/time -v -o /tmp/proof-search/time.txt \
+            "$TLAPM" formal/AssignmentFenceCoreProof.tla \
+            > /tmp/proof-search/tlapm.log 2>&1
+          rc=$?
+          set -e
+          printf '%s\n' "$rc" > /tmp/proof-search/exit.txt
+          cat /tmp/proof-search/tlapm.log
+          cat /tmp/proof-search/time.txt
+          test "$rc" -eq 0
+          ! grep -Eqi '[1-9][0-9]* (failed|unproved)|obligation[^\n]*(failed|unproved)' \
+            /tmp/proof-search/tlapm.log
+      - name: Commit generated proof only after TLAPS success
+        run: |
+          set -euo pipefail
+          rm .github/workflows/assignment-fence-proof-search-once.yml
+          git config user.name "mickg10 formal automation"
+          git config user.email "5094033+mickg10@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "formal: generate and prove action-split ownership induction"
+          git push origin HEAD:bigoracle/assignment-fence-proof-v4
+      - name: Archive proof-search evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: assignment-fence-proof-search-${{ github.sha }}
+          path: |
+            /tmp/proof-search
+            formal/AssignmentFenceCoreProof.tla
+            formal/generate_assignment_fence_core_proof.py
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Publish first proof-search blocker
+        if: failure()
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from __future__ import annotations
+          import json, os, subprocess
+          from pathlib import Path
+
+          marker = '<!-- assignment-fence-proof-search -->'
+          log = Path('/tmp/proof-search/tlapm.log')
+          if log.exists():
+              lines = log.read_text(encoding='utf-8', errors='replace').splitlines()
+              selected = [
+                  line for line in lines
+                  if any(word in line.lower() for word in ('failed', 'unproved', 'error', 'obligation', 'line '))
+              ]
+              excerpt = '\n'.join(selected[:100]) or '\n'.join(lines[-80:])
+          else:
+              excerpt = 'TLAPS did not produce a proof log; inspect installer/preflight artifact.'
+          excerpt = excerpt[:7500]
+          body = '\n'.join([
+              marker,
+              'From: mickg10/bigoracle',
+              'To: mickg10/local-oracle, mickg10/implementer',
+              '',
+              '## Generated action-split TLAPS proof remains RED',
+              '',
+              f"- exact workflow head: `{os.environ['GITHUB_SHA']}`",
+              f"- run: `{os.environ['GITHUB_RUN_ID']}`",
+              '',
+              '```text', excerpt, '```',
+              '',
+              'No theorem was weakened and no generated proof was committed. The retained artifact contains the exact candidate, installer identity, process exit, timing, and complete TLAPM log.'
+          ])
+          repo = os.environ['GITHUB_REPOSITORY']
+          token = os.environ['GH_TOKEN']
+          env = {**os.environ, 'GH_TOKEN': token}
+          def gh(args, payload=None):
+              return subprocess.run(['gh','api',*args], input=payload, text=True, stdout=subprocess.PIPE, check=True, env=env).stdout
+          comments = json.loads(gh([f'repos/{repo}/issues/4/comments?per_page=100']))
+          existing = next((c for c in comments if marker in c.get('body','')), None)
+          payload = json.dumps({'body': body})
+          if existing:
+              gh(['--method','PATCH',f"repos/{repo}/issues/comments/{existing['id']}",'--input','-'], payload)
+          else:
+              gh(['--method','POST',f'repos/{repo}/issues/4/comments','--input','-'], payload)
+          PY
