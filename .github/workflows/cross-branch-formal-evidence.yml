@@ -1,0 +1,227 @@
+name: cross-branch-formal-evidence
+
+on:
+  pull_request:
+    paths:
+      - "formal/collect_cross_branch_formal_evidence.py"
+      - ".github/workflows/cross-branch-formal-evidence.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  issues: write
+
+concurrency:
+  group: cross-branch-formal-evidence-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  closure:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Resolve exact SHAs and validate same-SHA retained workflow evidence
+        run: |
+          set -euo pipefail
+          root=/tmp/cross-branch-formal-evidence
+          mkdir -p "$root"
+          set +e
+          python3 formal/collect_cross_branch_formal_evidence.py \
+            --repo . \
+            --repository "$GITHUB_REPOSITORY" \
+            --output "$root/evidence.json" \
+            > "$root/collector.log" 2>&1
+          rc=$?
+          set -e
+          printf '%s\n' "$rc" > "$root/collector.exit"
+          cat "$root/collector.log"
+          test "$rc" -eq 0
+      - name: Re-run no-tool prerequisite and compatibility preflights
+        run: |
+          set -euo pipefail
+          root=/tmp/cross-branch-formal-evidence
+          prerequisite=$(jq -r '.domains[] | select(.domain == "prerequisite") | .revision' "$root/evidence.json")
+          compatibility=$(jq -r '.domains[] | select(.domain == "compatibility") | .revision' "$root/evidence.json")
+          test ${#prerequisite} -eq 40
+          test ${#compatibility} -eq 40
+
+          rm -rf /tmp/prerequisite-evidence-worktree /tmp/compatibility-evidence-worktree
+          git worktree add --detach /tmp/prerequisite-evidence-worktree "$prerequisite"
+          git worktree add --detach /tmp/compatibility-evidence-worktree "$compatibility"
+
+          set +e
+          (
+            set -euo pipefail
+            cd /tmp/prerequisite-evidence-worktree
+            python3 formal/prerequisite_static_check_v2.py \
+              --manifest formal/prerequisite-formal-checks-v4.json \
+              --repo . \
+              --formal-dir formal
+            python3 formal/prerequisite_static_check_v2_test.py
+            python3 formal/trace_to_harness_test.py
+            python3 formal/tlc_text_trace_test.py
+            python3 formal/normalize_tlc_trace_test.py
+            python3 formal/run_formal_checks_v4_test.py
+            python3 formal/run_tlc_only_checks_v4_test.py
+            test -z "$(git status --porcelain --untracked-files=all)"
+          ) > "$root/prerequisite-preflight.log" 2>&1
+          prerequisite_rc=$?
+
+          (
+            set -euo pipefail
+            cd /tmp/compatibility-evidence-worktree
+            python3 formal/compatibility_codec_fixture_test.py
+            python3 formal/compatibility_static_check.py \
+              --manifest formal/compatibility-formal-checks-v1.json \
+              --repo . \
+              --formal-dir formal
+            python3 formal/compatibility_static_check_test.py
+            python3 formal/trace_to_harness_test.py
+            python3 formal/tlc_text_trace_test.py
+            python3 formal/normalize_tlc_trace_test.py
+            python3 formal/run_formal_checks_v4_test.py
+            python3 formal/run_tlc_only_checks_v4_test.py
+            test -z "$(git status --porcelain --untracked-files=all)"
+          ) > "$root/compatibility-preflight.log" 2>&1
+          compatibility_rc=$?
+          set -e
+
+          printf '%s\n' "$prerequisite_rc" > "$root/prerequisite-preflight.exit"
+          printf '%s\n' "$compatibility_rc" > "$root/compatibility-preflight.exit"
+          cat "$root/prerequisite-preflight.log"
+          cat "$root/compatibility-preflight.log"
+          test "$prerequisite_rc" -eq 0
+          test "$compatibility_rc" -eq 0
+      - name: Write machine-readable closure result
+        if: always()
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from __future__ import annotations
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path('/tmp/cross-branch-formal-evidence')
+          def exit_value(name: str) -> str:
+              path = root / name
+              return path.read_text().strip() if path.exists() else 'not-started'
+          def sha(path: Path) -> str | None:
+              return hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
+          result = {
+              'schema': 1,
+              'consumer_revision': os.environ['GITHUB_SHA'],
+              'workflow_run': os.environ['GITHUB_RUN_ID'],
+              'collector_exit': exit_value('collector.exit'),
+              'prerequisite_preflight_exit': exit_value('prerequisite-preflight.exit'),
+              'compatibility_preflight_exit': exit_value('compatibility-preflight.exit'),
+              'evidence_sha256': sha(root / 'evidence.json'),
+          }
+          result['verdict'] = (
+              'GREEN'
+              if result['collector_exit'] == '0'
+              and result['prerequisite_preflight_exit'] == '0'
+              and result['compatibility_preflight_exit'] == '0'
+              else 'RED'
+          )
+          (root / 'result.json').write_text(
+              json.dumps(result, indent=2, sort_keys=True) + '\n',
+              encoding='utf-8',
+          )
+          print(json.dumps(result, indent=2, sort_keys=True))
+          PY
+      - name: Archive complete cross-branch evidence closure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cross-branch-formal-evidence-${{ github.sha }}
+          path: /tmp/cross-branch-formal-evidence
+          if-no-files-found: error
+          retention-days: 30
+      - name: Publish cross-branch closure verdict
+        if: always()
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from __future__ import annotations
+          import json, os, subprocess
+          from pathlib import Path
+
+          marker = '<!-- cross-branch-formal-evidence-status -->'
+          root = Path('/tmp/cross-branch-formal-evidence')
+          result = json.loads((root / 'result.json').read_text()) if (root / 'result.json').exists() else {'verdict':'RED'}
+          evidence = json.loads((root / 'evidence.json').read_text()) if (root / 'evidence.json').exists() else {'domains':[]}
+          domain_lines = []
+          for domain in evidence.get('domains', []):
+              artifact_text = ', '.join(
+                  f"{item['name']}={item['digest']}"
+                  for item in domain.get('artifacts', [])
+              )
+              domain_lines.extend([
+                  f"- **{domain['domain']}** SHA `{domain['revision']}`, run `{domain['workflow']['run_id']}`",
+                  f"  - manifest `{domain['manifest']['sha256']}`, {domain['manifest']['check_count']} rows",
+                  f"  - artifacts: {artifact_text}",
+              ])
+          if not domain_lines:
+              domain_lines = ['- No valid domain evidence was resolved.']
+
+          excerpts = []
+          for name in ('collector', 'prerequisite-preflight', 'compatibility-preflight'):
+              path = root / f'{name}.log'
+              if path.exists():
+                  lines = path.read_text(encoding='utf-8', errors='replace').splitlines()
+                  excerpts.append(f"{name}:\n" + '\n'.join(lines[-80:]))
+          excerpt = '\n\n'.join(excerpts)[:9000]
+
+          repo = os.environ['GITHUB_REPOSITORY']
+          run_id = os.environ['GITHUB_RUN_ID']
+          def gh(args, payload=None):
+              return subprocess.run(['gh','api',*args], input=payload, text=True, stdout=subprocess.PIPE, check=True, env=os.environ).stdout
+          artifacts = json.loads(gh(['--method','GET',f'repos/{repo}/actions/runs/{run_id}/artifacts','-f','per_page=100'])).get('artifacts', [])
+          artifact_lines = [
+              f"- `{item['name']}` — id `{item['id']}`, digest `{item.get('digest') or 'unavailable'}`"
+              for item in artifacts
+              if item.get('name','').startswith('cross-branch-formal-evidence-')
+          ] or ['- NONE']
+
+          body = '\n'.join([
+              marker,
+              'From: mickg10/bigoracle',
+              'To: all',
+              '',
+              '## Immutable prerequisite and compatibility formal closure',
+              '',
+              f"- consuming assignment-fence head: `{os.environ['GITHUB_SHA']}`",
+              f"- workflow run: `{run_id}`",
+              f"- verdict: **{result.get('verdict','RED')}**",
+              '',
+              '### Exact accepted domain inputs',
+              '',
+              *domain_lines,
+              '',
+              '### Closure artifact',
+              '',
+              *artifact_lines,
+              '',
+              '```text', excerpt, '```',
+              '',
+              'GREEN means each moving branch was resolved to an exact SHA, its ordinary workflow was read-only and successful at that SHA, every job succeeded, all expected retained artifacts were live and SHA-256 identified, and the exact source closure passed a fresh clean no-tool preflight. The retained artifacts—not this summary—remain the TLC evidence.'
+          ])
+          comments = json.loads(gh(['--method','GET',f'repos/{repo}/issues/4/comments','-f','per_page=100']))
+          old = next((item for item in comments if marker in item.get('body','')), None)
+          payload = json.dumps({'body': body})
+          if old:
+              gh(['--method','PATCH',f"repos/{repo}/issues/comments/{old['id']}",'--input','-'], payload)
+          else:
+              gh(['--method','POST',f'repos/{repo}/issues/4/comments','--input','-'], payload)
+          PY
