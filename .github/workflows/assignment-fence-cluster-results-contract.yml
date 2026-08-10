@@ -1,0 +1,51 @@
+name: assignment-fence-cluster-results-contract
+
+on:
+  pull_request:
+    paths:
+      - "formal/validate_cluster_results.py"
+      - "formal/validate_cluster_results_test.py"
+      - "formal/cluster-acceptance-policy.template.json"
+      - "formal/validate_cluster_run_plan.py"
+      - "formal/validate_cluster_run_plan_test.py"
+      - ".github/workflows/assignment-fence-cluster-results-contract.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run complete cluster evidence mutation suite
+        run: |
+          set -euo pipefail
+          python3 formal/validate_cluster_run_plan_test.py
+          python3 formal/validate_cluster_results_test.py
+          set +e
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+          sys.path.insert(0, 'formal')
+          import validate_cluster_results as validator
+
+          template = json.loads(
+              Path('formal/cluster-acceptance-policy.template.json').read_text()
+          )
+          try:
+              validator.validate_policy(template)
+          except validator.ResultError as error:
+              print(f'expected template rejection: {error}')
+              raise SystemExit(0)
+          raise SystemExit('policy template unexpectedly validated')
+          PY
+          rc=$?
+          set -e
+          test "$rc" -eq 0
+          test -z "$(git status --porcelain --untracked-files=all)"
