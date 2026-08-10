@@ -83,6 +83,7 @@
 #include <archive.h>
 
 #include <chrono>
+#include <climits>
 #include <deque>
 #include <map>
 #include <algorithm>
@@ -107,6 +108,8 @@
 
 static std::string pidFilePath;
 static volatile sig_atomic_t exit_main_loop = 0;
+/* Test-only one-shot state for the G4 same-poll scheduler-loss gate. */
+static bool test_usecs_abort_send_fail_armed = false;
 
 #ifndef __attribute_warn_unused_result__
 #define __attribute_warn_unused_result__
@@ -3986,6 +3989,18 @@ bool Daemon::send_scheduler(const Msg& msg)
         return false;
     }
 
+    /* The G4 gate must close the scheduler at the exact nested boundary:
+       scheduler_use_cs() failed to deliver UseCS to its client and
+       handle_end() is issuing the compensating submitter JobDone.  The arm
+       is set only around that handle_end() call, so Login, Stats and every
+       unrelated JobDone retain their ordinary behavior. */
+    if (test_usecs_abort_send_fail_armed && msg == Msg::JOB_DONE) {
+        test_usecs_abort_send_fail_armed = false;
+        log_info() << "G4 test hook: failing compensating JobDone send" << endl;
+        close_scheduler();
+        return false;
+    }
+
     if (!scheduler->send_msg(msg)) {
         log_error() << "sending message to scheduler failed.." << endl;
         close_scheduler();
@@ -5052,7 +5067,12 @@ int Daemon::scheduler_use_cs(UseCSMsg *msg)
 
         if (!c->channel->send_msg(*msg)) {
             ++usecs_exact_aborts;
+            if (getenv("ICECC_TESTS")
+                    && getenv("ICECC_TEST_USECS_ABORT_SEND_FAIL")) {
+                test_usecs_abort_send_fail_armed = true;
+            }
             handle_end(c, 143);
+            test_usecs_abort_send_fail_armed = false;
             return 0;
         }
 
@@ -6428,6 +6448,61 @@ void Daemon::answer_client_requests()
     /* Telemetry draining no longer involves this loop at all: records go to
        AsyncJsonlWriter's own thread, so a slow filesystem cannot stretch a
        loop iteration and no early wakeup is needed.  */
+
+    /* Deterministic G4 gate barrier.  It remains dormant unless all three
+       test environment variables are present.  Waiting until two clients
+       exist and one is WAITFORCS gives the harness a precise one-shot arm:
+       client A has already entered scheduler ownership and client B is
+       connected but has not sent its discriminator request. */
+    static bool test_pre_poll_barrier_done = false;
+    if (!test_pre_poll_barrier_done && getenv("ICECC_TESTS")) {
+        const char *ready_text = getenv("ICECC_TEST_PRE_POLL_READY_FD");
+        const char *release_text = getenv("ICECC_TEST_PRE_POLL_RELEASE_FD");
+        bool has_waitforcs = false;
+        for (const auto &it : clients) {
+            if (it.second->status == Client::WAITFORCS) {
+                has_waitforcs = true;
+                break;
+            }
+        }
+        if (ready_text && release_text && clients.size() >= 2 && has_waitforcs) {
+            char *ready_end = nullptr;
+            char *release_end = nullptr;
+            errno = 0;
+            const long ready_long = strtol(ready_text, &ready_end, 10);
+            const bool ready_valid = errno == 0 && ready_end != ready_text
+                                     && *ready_end == '\0' && ready_long >= 0
+                                     && ready_long <= INT_MAX;
+            errno = 0;
+            const long release_long = strtol(release_text, &release_end, 10);
+            const bool release_valid = errno == 0 && release_end != release_text
+                                       && *release_end == '\0' && release_long >= 0
+                                       && release_long <= INT_MAX;
+            test_pre_poll_barrier_done = true;
+            if (!ready_valid || !release_valid) {
+                log_error() << "G4 test barrier: invalid inherited fd" << endl;
+                exit_main_loop = 1;
+                return;
+            }
+
+            const char marker = 'R';
+            ssize_t wrote;
+            do {
+                wrote = write((int)ready_long, &marker, 1);
+            } while (wrote < 0 && errno == EINTR);
+            char release = 0;
+            ssize_t read_count;
+            do {
+                read_count = read((int)release_long, &release, 1);
+            } while (read_count < 0 && errno == EINTR);
+            if (wrote != 1 || read_count != 1) {
+                log_error() << "G4 test barrier: inherited-fd exchange failed" << endl;
+                exit_main_loop = 1;
+                return;
+            }
+            log_info() << "G4 test barrier: released" << endl;
+        }
+    }
 
     int ret = poll(pollfds.data(), pollfds.size(), poll_timeout_msec);
 
