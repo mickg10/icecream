@@ -1,0 +1,97 @@
+{
+  "schema": 1,
+  "scenario": "P49PipelinedRevokeRaceWitness",
+  "property": "NoRevokeRaceWitness",
+  "expected_result": "counterexample",
+  "min_states": 7,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "QueueRevokeBehindPrepare",
+      "all": [
+        {
+          "path": "s2f",
+          "to": [
+            "REVOKE"
+          ]
+        },
+        {
+          "path": "prepared",
+          "to": true
+        },
+        {
+          "path": "matchedClaim",
+          "to": false
+        }
+      ]
+    },
+    {
+      "name": "ClaimWinsBeforeRevokeConsume",
+      "all": [
+        {
+          "path": "claimArrived",
+          "from": false,
+          "to": true
+        },
+        {
+          "path": "matchedClaim",
+          "from": false,
+          "to": true
+        },
+        {
+          "path": "revoked",
+          "to": false
+        }
+      ]
+    },
+    {
+      "name": "StartClaimWinner",
+      "all": [
+        {
+          "path": "started",
+          "from": false,
+          "to": true
+        },
+        {
+          "path": "revoked",
+          "to": false
+        }
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "QueueRevokeBehindPrepare",
+    "ClaimWinsBeforeRevokeConsume",
+    "StartClaimWinner"
+  ],
+  "final_all": [
+    {
+      "path": "started",
+      "eq": true
+    },
+    {
+      "path": "matchedClaim",
+      "eq": true
+    },
+    {
+      "path": "revoked",
+      "eq": false
+    }
+  ],
+  "harness_steps": [
+    {
+      "after": "QueueRevokeBehindPrepare",
+      "emit": "hold_revoke_in_ordered_control_queue",
+      "actor": "scheduler-channel"
+    },
+    {
+      "after": "ClaimWinsBeforeRevokeConsume",
+      "emit": "linearize_claim_before_queued_revoke",
+      "actor": "fulfillment-daemon"
+    }
+  ],
+  "metadata": {
+    "module": "AssignmentFenceAdmissionModes",
+    "config": "P49PipelinedRevokeRaceWitness.cfg"
+  }
+}
