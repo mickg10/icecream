@@ -1,0 +1,70 @@
+name: assignment-fence-readonly-scope-fix-once
+
+on:
+  push:
+    branches:
+      - bigoracle/assignment-fence-proof-v4
+    paths:
+      - ".github/workflows/assignment-fence-readonly-scope-fix-once.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bigoracle/assignment-fence-proof-v4
+          fetch-depth: 0
+      - name: Expand task-workflow read-only scope
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          sweep = Path('.github/workflows/assignment-fence-final-sweep-once.yml')
+          text = sweep.read_text(encoding='utf-8')
+          text = text.replace(
+              'assignment-fence*.yml|f2s*.yml)',
+              'assignment-fence*.yml|f2s*.yml|cross-branch*.yml)',
+          )
+          text = text.replace(
+              '            .github/workflows/f2s*.yml 2>/dev/null; then',
+              '            .github/workflows/f2s*.yml \\\n            .github/workflows/cross-branch*.yml 2>/dev/null; then',
+          )
+          if 'cross-branch*.yml)' not in text:
+              raise SystemExit('final sweep task pattern was not expanded')
+          if '.github/workflows/cross-branch*.yml' not in text:
+              raise SystemExit('final sweep grep scope was not expanded')
+          sweep.write_text(text, encoding='utf-8')
+
+          for name in (
+              'assignment-fence-complete-formal-gate.yml',
+              'assignment-fence-authoritative-gate.yml',
+          ):
+              path = Path('.github/workflows') / name
+              text = path.read_text(encoding='utf-8')
+              old = '''          if grep -R -l -E '^\\s*contents:\\s*write\\s*$' \\\n            .github/workflows/assignment-fence*.yml; then\n'''
+              new = '''          if grep -R -l -E '^\\s*contents:\\s*write\\s*$' \\\n            .github/workflows/assignment-fence*.yml \\\n            .github/workflows/f2s*.yml \\\n            .github/workflows/cross-branch*.yml 2>/dev/null; then\n'''
+              if old in text:
+                  if text.count(old) != 1:
+                      raise SystemExit(f'{name}: unexpected guard cardinality')
+                  text = text.replace(old, new)
+              elif new not in text:
+                  raise SystemExit(f'{name}: neither old nor expanded guard is present')
+              path.write_text(text, encoding='utf-8')
+          PY
+          git diff --check
+      - name: Commit scope correction and remove one-shot workflow
+        run: |
+          set -euo pipefail
+          rm .github/workflows/assignment-fence-readonly-scope-fix-once.yml
+          git config user.name "mickg10 formal automation"
+          git config user.email "5094033+mickg10@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "ci: enforce read-only closure across all formal-task workflows"
+          git push origin HEAD:bigoracle/assignment-fence-proof-v4
