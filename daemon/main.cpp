@@ -497,6 +497,8 @@ public:
         usecsmsg = nullptr;
         deferred_getcs = nullptr;
         getcs_published = false;
+        getcs_outstanding = false;
+        getcs_generation = 0;
         client_id = 0;
         niceness = 0;
         status = UNKNOWN;
@@ -577,6 +579,8 @@ public:
     UseCSMsg *usecsmsg;
     GetCSMsg *deferred_getcs;   // G4: GetCS held during LOGIN_ATTEMPT, re-driven on ConfCS
     bool getcs_published;       // G4 (17:20#1): true only once a GetCS for this client has been sent to S (which then owns it by client_id); a held request is PRIVATE until then
+    bool getcs_outstanding;     // G4 (bigoracle 18:45 P0): a GetCS occupies this client from accept until client destruction; a second GetCS in ANY non-terminal state is rejected (not just while WAITFORCS)
+    uint64_t getcs_generation;  // G4 (bigoracle 18:45 P0): the session generation the request was published under (0 = unpublished); a scheduler reply is honored only when it matches the current ACTIVE generation
     CompileJob *job;
     int client_id;
     uint32_t niceness; // nice priority (0-20), for PENDING_USE_CS
@@ -5026,6 +5030,31 @@ int Daemon::scheduler_use_cs(UseCSMsg *msg)
         return 1;
     }
 
+    /* G4 (bigoracle 18:45 P0): authorize a scheduler reply only for a request
+       this daemon actually PUBLISHED under the CURRENT active generation and
+       that is still awaiting a decision (WAITFORCS).  An unsolicited/pre-active
+       reply, or a stale reply carrying a superseded generation, must never
+       authorize client work. */
+    if (!(scheduler_session_active
+            && c->getcs_published
+            && c->getcs_generation == scheduler_session_generation
+            && c->status == Client::WAITFORCS)) {
+        if (!scheduler_session_active) {
+            /* A reply during a LOGIN_ATTEMPT (nothing was published): drop the
+               attempt.  Not active -> close_scheduler() records no loss token,
+               so there is no established-session cleanup. */
+            log_warning() << "scheduler_use_cs before session active for client "
+                          << msg->client_id << "; dropping attempt" << endl;
+            return 1;    /* caller closes the pending channel */
+        }
+        /* ACTIVE but unmatched (superseded generation, unpublished/private, or
+           wrong phase): terminalize the scheduler's assignment by its EXACT job
+           id and never deliver UseCS to the client. */
+        log_warning() << "scheduler_use_cs unmatched job " << msg->job_id
+                      << " client " << msg->client_id << "; terminalizing" << endl;
+        return send_scheduler(JobDoneMsg(msg->job_id, 107, JobDoneMsg::FROM_SUBMITTER, clients.size())) ? 0 : 1;
+    }
+
     if (c->status == Client::WAITFORCS) {
         c->last_waitforcs_msec = monotonic_msec() - c->status_since_msec;
         record_waitforcs_latency(true, c->last_waitforcs_msec);
@@ -5096,6 +5125,23 @@ int Daemon::scheduler_no_cs(NoCSMsg *msg)
         }
 
         return 1;
+    }
+
+    /* G4 (bigoracle 18:45 P0): same reply-authorization gate as
+       scheduler_use_cs -- a NoCS decision must apply only to a request
+       published under the current ACTIVE generation and still awaiting one. */
+    if (!(scheduler_session_active
+            && c->getcs_published
+            && c->getcs_generation == scheduler_session_generation
+            && c->status == Client::WAITFORCS)) {
+        if (!scheduler_session_active) {
+            log_warning() << "scheduler_no_cs before session active for client "
+                          << msg->client_id << "; dropping attempt" << endl;
+            return 1;
+        }
+        log_warning() << "scheduler_no_cs unmatched job " << msg->job_id
+                      << " client " << msg->client_id << "; terminalizing" << endl;
+        return send_scheduler(JobDoneMsg(msg->job_id, 107, JobDoneMsg::FROM_SUBMITTER, clients.size())) ? 0 : 1;
     }
 
     if (c->status == Client::WAITFORCS) {
@@ -5650,7 +5696,40 @@ void Daemon::handle_old_request()
                 return;   /* session lost; answer_client_requests runs the cleanup */
             }
             c->getcs_published = true;   /* G4 (17:20#1): re-driven held GetCS is now published to S */
+            c->getcs_generation = scheduler_session_generation;   /* G4 (18:45 P0): under the current ACTIVE generation */
             c->set_status(Client::WAITFORCS, "handle_old_request: re-driven held GetCS");
+        }
+    }
+
+    /* G4 (18:19#3): a LOGIN_ATTEMPT that failed/expired leaves requests held for
+       it stranded (deferred_getcs set, but now no active session and no pending
+       attempt).  Resolve them instead of waiting forever: a single-reply request
+       takes the existing schedulerless local fallback; a multi-reply request
+       (which one local UseCS cannot satisfy) closes only that client so its own
+       local fallback runs.  Snapshot first -- handle_end() erases from clients. */
+    if (!scheduler_session_active && !scheduler_login_pending) {
+        std::vector<Client *> stranded;
+        for (const auto &kv : clients) {
+            if (kv.second->deferred_getcs) {
+                stranded.push_back(kv.second);
+            }
+        }
+        for (Client *c : stranded) {
+            GetCSMsg *g = c->deferred_getcs;
+            if (g->count <= 1) {
+                c->usecsmsg = new UseCSMsg(g->target, "127.0.0.1", daemon_port,
+                                           c->client_id, true, 1, 0);
+                c->job_id = c->client_id;
+                c->last_known_job_id = c->client_id;
+                delete c->deferred_getcs;
+                c->deferred_getcs = nullptr;
+                c->set_status(Client::PENDING_USE_CS,
+                              "handle_old_request: held GetCS -> local fallback (attempt failed)");
+            } else {
+                delete c->deferred_getcs;
+                c->deferred_getcs = nullptr;
+                handle_end(c, 111);   /* multi-reply: close this client so its own local fallback runs */
+            }
         }
     }
 
@@ -6098,17 +6177,18 @@ bool Daemon::handle_get_cs(Client *client, Msg *msg)
 {
     GetCSMsg *umsg = dynamic_cast<GetCSMsg *>(msg);
     assert(client);
-    /* G4 (17:20#2): exactly one outstanding GetCS per client.  A second GetCS
-       arriving while a private held (deferred_getcs) or published (WAITFORCS +
-       getcs_published) request is still outstanding is a client protocol
-       violation.  Reject that client generation rather than overwrite the first
-       request -- overwriting would strand the first with no result.  handle_end()
-       settles the outstanding request correctly (published -> JobDone by client
-       id; private -> destroyed silently).  Return FALSE so handle_activity()'s
-       caller treats the client as gone -- this mirrors the END/default
-       protocol-error cases; returning true would dereference a freed client. */
-    if (client->deferred_getcs
-            || (client->status == Client::WAITFORCS && client->getcs_published)) {
+    /* G4 (17:20#2 / bigoracle 18:45 P0): exactly one outstanding GetCS per
+       client.  getcs_outstanding is set at accept and cleared only when the
+       client is destroyed, so a second GetCS is rejected in EVERY non-terminal
+       state -- not merely while WAITFORCS.  This closes the loophole where a
+       request that had already advanced to PENDING_USE_CS/FORWARDING_USE_CS/
+       WAITCOMPILE/CLIENTWORK (after UseCS/NoCS) could be silently overwritten,
+       stranding the first scheduler job.  Reject rather than overwrite;
+       handle_end() settles the outstanding request correctly.  Return FALSE so
+       handle_activity()'s caller treats the client as gone (mirrors the END/
+       default protocol-error cases); returning true would dereference a freed
+       client. */
+    if (client->getcs_outstanding) {
         log_error() << "client " << client->client_id
                     << " sent a second GetCS while one is outstanding; closing"
                     << endl;
@@ -6124,7 +6204,9 @@ bool Daemon::handle_get_cs(Client *client, Msg *msg)
     client->last_waitforcs_msec = 0;
     client->set_status(Client::WAITFORCS, scheduler ? "handle_get_cs: sent GetCS to scheduler" : "handle_get_cs: scheduler missing");
     umsg->client_id = client->client_id;
-    client->getcs_published = false;   /* G4 (17:20#1): unpublished until an active-session send succeeds */
+    client->getcs_published = false;    /* G4 (17:20#1): unpublished until an active-session send succeeds */
+    client->getcs_outstanding = true;   /* G4 (18:45 P0): request now occupies the client until destruction */
+    client->getcs_generation = 0;
     trace() << "handle_get_cs " << umsg->client_id << endl;
 
     if (scheduler && !scheduler_session_active) {
@@ -6159,9 +6241,12 @@ bool Daemon::handle_get_cs(Client *client, Msg *msg)
     if (!send_scheduler(*umsg)) {
         return false;
     }
-    /* G4 (17:20#1): the GetCS reached S, which now owns this request by client
-       id, so a teardown before UseCS must settle it with a JobDone. */
+    /* G4 (17:20#1 / 18:45 P0): the GetCS reached S under the current ACTIVE
+       generation, which now owns this request by client id.  A teardown before
+       UseCS must settle it with a JobDone; and only a reply carrying this
+       generation may later authorize the client (see scheduler_use_cs). */
     client->getcs_published = true;
+    client->getcs_generation = scheduler_session_generation;
     return true;
 }
 
