@@ -6340,7 +6340,14 @@ void Daemon::answer_client_requests()
         bool had_scheduler = scheduler;
 
         if (scheduler && pollfd_is_set(pollfds, scheduler->fd, POLLIN)) {
-            while (!scheduler->read_a_bit() || scheduler->has_msg()) {
+            /* A handler in this loop (e.g. scheduler_use_cs -> handle_end ->
+               a failed compensating send_scheduler) can call close_scheduler()
+               and null `scheduler` mid-iteration while still returning 0.  The
+               loop condition must therefore re-check liveness, or the next
+               `scheduler->read_a_bit()` dereferences a freed channel.  When it
+               is lost, fall through to the single had_scheduler && !scheduler
+               cleanup below (exactly once for the lost generation). */
+            while (scheduler && (!scheduler->read_a_bit() || scheduler->has_msg())) {
                 Msg *msg = scheduler->get_msg(0, true);
 
                 if (!msg) {
