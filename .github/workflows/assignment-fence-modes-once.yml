@@ -1,0 +1,825 @@
+name: assignment-fence-modes-once
+
+on:
+  push:
+    branches:
+      - bigoracle/assignment-fence-proof-v4
+    paths:
+      - .github/workflows/assignment-fence-modes-once.yml
+
+permissions:
+  contents: write
+
+jobs:
+  generate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bigoracle/assignment-fence-proof-v4
+          fetch-depth: 0
+      - name: Write finite strict/pipelined admission model and configs
+        run: |
+          set -euo pipefail
+          cat > formal/AssignmentFenceAdmissionModes.tla <<'TLA'
+          ---------------- MODULE AssignmentFenceAdmissionModes ----------------
+          (***************************************************************************
+          Finite comparison of strict READY-before-UseCS and zero-extra-RTT
+          pipelined enforcing admission.
+
+          Pipelining never means default allow.  An assignment claim that reaches
+          the fulfillment daemon before PREPARE occupies only a bounded pending
+          record.  It cannot start a compiler or create an environment side effect
+          until the matching PREPARE is consumed.  PREPARE and REVOKE share one
+          ordered scheduler-to-daemon queue.
+          ***************************************************************************
+          EXTENDS Naturals, Sequences, TLC
+
+          CONSTANTS StrictEnforcing, PipelinedEnforcing,
+                    GeneralScenario, ClaimBeforePrepareScenario, RevokeRaceScenario,
+                    Mode, Scenario, MaxPending,
+                    MutantDefaultAllowUnknown,
+                    MutantSideEffectBeforePrepare,
+                    MutantUnboundedPending
+
+          ASSUME /\ StrictEnforcing # PipelinedEnforcing
+                 /\ Mode \in {StrictEnforcing, PipelinedEnforcing}
+                 /\ GeneralScenario # ClaimBeforePrepareScenario
+                 /\ GeneralScenario # RevokeRaceScenario
+                 /\ ClaimBeforePrepareScenario # RevokeRaceScenario
+                 /\ Scenario \in {GeneralScenario,
+                                   ClaimBeforePrepareScenario,
+                                   RevokeRaceScenario}
+                 /\ MaxPending \in Nat \ {0}
+                 /\ MutantDefaultAllowUnknown \in BOOLEAN
+                 /\ MutantSideEffectBeforePrepare \in BOOLEAN
+                 /\ MutantUnboundedPending \in BOOLEAN
+
+          ControlKinds == {"PREPARE", "REVOKE"}
+
+          ScenarioSequence ==
+              CASE Scenario = ClaimBeforePrepareScenario ->
+                       <<"QueuePrepare", "ExposeUseCS", "ClientClaim",
+                         "ConsumePrepare", "Start">>
+                [] Scenario = RevokeRaceScenario ->
+                       <<"QueuePrepare", "ExposeUseCS", "ConsumePrepare",
+                         "QueueRevoke", "ClientClaim", "Start">>
+                [] OTHER -> <<>>
+
+          ScenarioLength == Len(ScenarioSequence)
+
+          Allowed(label) ==
+              Scenario = GeneralScenario
+              \/ (scenarioStep < ScenarioLength
+                  /\ ScenarioSequence[scenarioStep + 1] = label)
+
+          AdvanceStep ==
+              IF Scenario = GeneralScenario THEN scenarioStep ELSE scenarioStep + 1
+
+          CapInc(n) == IF n < 2 THEN n + 1 ELSE n
+
+          VARIABLES s2f,
+                    prepareQueuedEver,
+                    prepared,
+                    readyQueued,
+                    readySeen,
+                    usecsExposed,
+                    claimArrived,
+                    pendingCount,
+                    matchedClaim,
+                    revoked,
+                    started,
+                    sideEffect,
+                    terminalQueued,
+                    terminalConsumed,
+                    released,
+                    compacted,
+                    startAfterRelease,
+                    rejectedUnknown,
+                    scenarioStep
+
+          vars ==
+              <<s2f, prepareQueuedEver, prepared, readyQueued, readySeen,
+                usecsExposed, claimArrived, pendingCount, matchedClaim, revoked,
+                started, sideEffect, terminalQueued, terminalConsumed, released,
+                compacted, startAfterRelease, rejectedUnknown, scenarioStep>>
+
+          Init ==
+              /\ s2f = <<>>
+              /\ prepareQueuedEver = FALSE
+              /\ prepared = FALSE
+              /\ readyQueued = FALSE
+              /\ readySeen = FALSE
+              /\ usecsExposed = FALSE
+              /\ claimArrived = FALSE
+              /\ pendingCount = 0
+              /\ matchedClaim = FALSE
+              /\ revoked = FALSE
+              /\ started = FALSE
+              /\ sideEffect = FALSE
+              /\ terminalQueued = FALSE
+              /\ terminalConsumed = FALSE
+              /\ released = FALSE
+              /\ compacted = FALSE
+              /\ startAfterRelease = FALSE
+              /\ rejectedUnknown = 0
+              /\ scenarioStep = 0
+
+          QueuePrepare ==
+              /\ Allowed("QueuePrepare")
+              /\ ~prepareQueuedEver
+              /\ Len(s2f) < 2
+              /\ s2f' = Append(s2f, "PREPARE")
+              /\ prepareQueuedEver' = TRUE
+              /\ scenarioStep' = AdvanceStep
+              /\ UNCHANGED <<prepared, readyQueued, readySeen, usecsExposed,
+                              claimArrived, pendingCount, matchedClaim, revoked,
+                              started, sideEffect, terminalQueued, terminalConsumed,
+                              released, compacted, startAfterRelease,
+                              rejectedUnknown>>
+
+          ExposeUseCS ==
+              /\ Allowed("ExposeUseCS")
+              /\ ~usecsExposed
+              /\ IF Mode = StrictEnforcing THEN readySeen ELSE prepareQueuedEver
+              /\ usecsExposed' = TRUE
+              /\ scenarioStep' = AdvanceStep
+              /\ UNCHANGED <<s2f, prepareQueuedEver, prepared, readyQueued,
+                              readySeen, claimArrived, pendingCount, matchedClaim,
+                              revoked, started, sideEffect, terminalQueued,
+                              terminalConsumed, released, compacted,
+                              startAfterRelease, rejectedUnknown>>
+
+          ClientClaim ==
+              /\ Allowed("ClientClaim")
+              /\ usecsExposed
+              /\ ~claimArrived
+              /\ LET immediatelyMatched == prepared /\ ~revoked
+                     mayPend == pendingCount < MaxPending \/ MutantUnboundedPending
+                 IN /\ claimArrived' = TRUE
+                    /\ matchedClaim' =
+                          IF immediatelyMatched THEN TRUE ELSE matchedClaim
+                    /\ pendingCount' =
+                          IF immediatelyMatched
+                          THEN pendingCount
+                          ELSE IF mayPend THEN pendingCount + 1 ELSE pendingCount
+                    /\ rejectedUnknown' =
+                          IF immediatelyMatched \/ mayPend
+                          THEN rejectedUnknown
+                          ELSE CapInc(rejectedUnknown)
+                    /\ sideEffect' =
+                          sideEffect
+                          \/ (MutantSideEffectBeforePrepare /\ ~prepared)
+              /\ scenarioStep' = AdvanceStep
+              /\ UNCHANGED <<s2f, prepareQueuedEver, prepared, readyQueued,
+                              readySeen, usecsExposed, revoked, started,
+                              terminalQueued, terminalConsumed, released,
+                              compacted, startAfterRelease>>
+
+          UnknownClaim ==
+              /\ Allowed("UnknownClaim")
+              /\ Mode = PipelinedEnforcing
+              /\ usecsExposed
+              /\ ~prepared
+              /\ pendingCount <= MaxPending
+              /\ LET accepted == pendingCount < MaxPending \/ MutantUnboundedPending
+                 IN /\ pendingCount' =
+                          IF accepted THEN pendingCount + 1 ELSE pendingCount
+                    /\ rejectedUnknown' =
+                          IF accepted THEN rejectedUnknown
+                          ELSE CapInc(rejectedUnknown)
+              /\ scenarioStep' = AdvanceStep
+              /\ UNCHANGED <<s2f, prepareQueuedEver, prepared, readyQueued,
+                              readySeen, usecsExposed, claimArrived, matchedClaim,
+                              revoked, started, sideEffect, terminalQueued,
+                              terminalConsumed, released, compacted,
+                              startAfterRelease>>
+
+          ConsumePrepare ==
+              /\ Allowed("ConsumePrepare")
+              /\ Len(s2f) > 0
+              /\ s2f[1] = "PREPARE"
+              /\ LET matchPending == claimArrived /\ pendingCount > 0
+                 IN /\ s2f' = Tail(s2f)
+                    /\ prepared' = TRUE
+                    /\ readyQueued' = TRUE
+                    /\ matchedClaim' = matchedClaim \/ matchPending
+                    /\ pendingCount' =
+                          IF matchPending THEN pendingCount - 1 ELSE pendingCount
+              /\ scenarioStep' = AdvanceStep
+              /\ UNCHANGED <<prepareQueuedEver, readySeen, usecsExposed,
+                              claimArrived, revoked, started, sideEffect,
+                              terminalQueued, terminalConsumed, released,
+                              compacted, startAfterRelease, rejectedUnknown>>
+
+          ConsumeReady ==
+              /\ Allowed("ConsumeReady")
+              /\ readyQueued
+              /\ ~readySeen
+              /\ readySeen' = TRUE
+              /\ scenarioStep' = AdvanceStep
+              /\ UNCHANGED <<s2f, prepareQueuedEver, prepared, readyQueued,
+                              usecsExposed, claimArrived, pendingCount,
+                              matchedClaim, revoked, started, sideEffect,
+                              terminalQueued, terminalConsumed, released,
+                              compacted, startAfterRelease, rejectedUnknown>>
+
+          QueueRevoke ==
+              /\ Allowed("QueueRevoke")
+              /\ prepareQueuedEver
+              /\ ~released
+              /\ "REVOKE" \notin {s2f[i] : i \in 1..Len(s2f)}
+              /\ Len(s2f) < 2
+              /\ s2f' = Append(s2f, "REVOKE")
+              /\ scenarioStep' = AdvanceStep
+              /\ UNCHANGED <<prepareQueuedEver, prepared, readyQueued,
+                              readySeen, usecsExposed, claimArrived,
+                              pendingCount, matchedClaim, revoked, started,
+                              sideEffect, terminalQueued, terminalConsumed,
+                              released, compacted, startAfterRelease,
+                              rejectedUnknown>>
+
+          ConsumeRevoke ==
+              /\ Allowed("ConsumeRevoke")
+              /\ Len(s2f) > 0
+              /\ s2f[1] = "REVOKE"
+              /\ prepared
+              /\ LET fenceWins == ~matchedClaim /\ ~started
+                 IN /\ s2f' = Tail(s2f)
+                    /\ revoked' = revoked \/ fenceWins
+                    /\ terminalQueued' = terminalQueued \/ fenceWins
+              /\ scenarioStep' = AdvanceStep
+              /\ UNCHANGED <<prepareQueuedEver, prepared, readyQueued,
+                              readySeen, usecsExposed, claimArrived,
+                              pendingCount, matchedClaim, started, sideEffect,
+                              terminalConsumed, released, compacted,
+                              startAfterRelease, rejectedUnknown>>
+
+          Start ==
+              /\ Allowed("Start")
+              /\ prepared
+              /\ matchedClaim
+              /\ ~revoked
+              /\ ~released
+              /\ ~started
+              /\ started' = TRUE
+              /\ sideEffect' = TRUE
+              /\ scenarioStep' = AdvanceStep
+              /\ UNCHANGED <<s2f, prepareQueuedEver, prepared, readyQueued,
+                              readySeen, usecsExposed, claimArrived,
+                              pendingCount, matchedClaim, revoked,
+                              terminalQueued, terminalConsumed, released,
+                              compacted, startAfterRelease, rejectedUnknown>>
+
+          ConsumeTerminal ==
+              /\ Allowed("ConsumeTerminal")
+              /\ terminalQueued
+              /\ ~terminalConsumed
+              /\ terminalConsumed' = TRUE
+              /\ released' = TRUE
+              /\ scenarioStep' = AdvanceStep
+              /\ UNCHANGED <<s2f, prepareQueuedEver, prepared, readyQueued,
+                              readySeen, usecsExposed, claimArrived,
+                              pendingCount, matchedClaim, revoked, started,
+                              sideEffect, terminalQueued, compacted,
+                              startAfterRelease, rejectedUnknown>>
+
+          Compact ==
+              /\ Allowed("Compact")
+              /\ released
+              /\ ~compacted
+              /\ compacted' = TRUE
+              /\ scenarioStep' = AdvanceStep
+              /\ UNCHANGED <<s2f, prepareQueuedEver, prepared, readyQueued,
+                              readySeen, usecsExposed, claimArrived,
+                              pendingCount, matchedClaim, revoked, started,
+                              sideEffect, terminalQueued, terminalConsumed,
+                              released, startAfterRelease, rejectedUnknown>>
+
+          DefaultAllowUnknown ==
+              /\ Allowed("DefaultAllowUnknown")
+              /\ MutantDefaultAllowUnknown
+              /\ compacted
+              /\ usecsExposed
+              /\ ~matchedClaim
+              /\ started' = TRUE
+              /\ sideEffect' = TRUE
+              /\ startAfterRelease' = TRUE
+              /\ scenarioStep' = AdvanceStep
+              /\ UNCHANGED <<s2f, prepareQueuedEver, prepared, readyQueued,
+                              readySeen, usecsExposed, claimArrived,
+                              pendingCount, matchedClaim, revoked,
+                              terminalQueued, terminalConsumed, released,
+                              compacted, rejectedUnknown>>
+
+          Next ==
+              \/ QueuePrepare
+              \/ ExposeUseCS
+              \/ ClientClaim
+              \/ UnknownClaim
+              \/ ConsumePrepare
+              \/ ConsumeReady
+              \/ QueueRevoke
+              \/ ConsumeRevoke
+              \/ Start
+              \/ ConsumeTerminal
+              \/ Compact
+              \/ DefaultAllowUnknown
+
+          Spec == Init /\ [][Next]_vars
+
+          FairSpec ==
+              Spec
+              /\ WF_vars(ConsumePrepare)
+              /\ WF_vars(ConsumeRevoke)
+              /\ WF_vars(ConsumeTerminal)
+
+          TypeOK ==
+              /\ s2f \in Seq(ControlKinds)
+              /\ Len(s2f) <= 2
+              /\ prepareQueuedEver \in BOOLEAN
+              /\ prepared \in BOOLEAN
+              /\ readyQueued \in BOOLEAN
+              /\ readySeen \in BOOLEAN
+              /\ usecsExposed \in BOOLEAN
+              /\ claimArrived \in BOOLEAN
+              /\ pendingCount \in 0..(MaxPending + 1)
+              /\ matchedClaim \in BOOLEAN
+              /\ revoked \in BOOLEAN
+              /\ started \in BOOLEAN
+              /\ sideEffect \in BOOLEAN
+              /\ terminalQueued \in BOOLEAN
+              /\ terminalConsumed \in BOOLEAN
+              /\ released \in BOOLEAN
+              /\ compacted \in BOOLEAN
+              /\ startAfterRelease \in BOOLEAN
+              /\ rejectedUnknown \in 0..2
+              /\ scenarioStep \in 0..ScenarioLength
+
+          StrictReadyBeforeUseCS ==
+              Mode = StrictEnforcing => (usecsExposed => readySeen)
+
+          PrepareQueuedBeforeUseCS == usecsExposed => prepareQueuedEver
+
+          MatchedClaimAuthorized ==
+              matchedClaim => claimArrived /\ prepared /\ ~revoked
+
+          StartAuthorized ==
+              started /\ ~startAfterRelease
+              => prepared /\ matchedClaim /\ ~revoked /\ ~released
+
+          SideEffectAuthorized ==
+              sideEffect /\ ~startAfterRelease
+              => prepared /\ matchedClaim /\ ~revoked
+
+          NoSideEffectBeforePrepare == sideEffect => prepared
+          PendingBound == pendingCount <= MaxPending
+          ReleaseAfterTerminalConsume == released => terminalConsumed
+          RevokedExcludesClaim == revoked => ~matchedClaim /\ ~started
+          TerminalRequiresFence == terminalQueued => revoked
+          NoStartAfterRelease == ~startAfterRelease
+
+          SafetyInvariant ==
+              /\ TypeOK
+              /\ StrictReadyBeforeUseCS
+              /\ PrepareQueuedBeforeUseCS
+              /\ MatchedClaimAuthorized
+              /\ StartAuthorized
+              /\ SideEffectAuthorized
+              /\ NoSideEffectBeforePrepare
+              /\ PendingBound
+              /\ ReleaseAfterTerminalConsume
+              /\ RevokedExcludesClaim
+              /\ TerminalRequiresFence
+              /\ NoStartAfterRelease
+
+          PendingEventuallyResolved ==
+              []((claimArrived /\ pendingCount > 0)
+                 => <>(matchedClaim \/ revoked \/ released))
+
+          ScenarioComplete == scenarioStep = ScenarioLength
+
+          NoClaimBeforePrepareWitness ==
+              ~(Scenario = ClaimBeforePrepareScenario
+                /\ ScenarioComplete
+                /\ started)
+
+          NoRevokeRaceWitness ==
+              ~(Scenario = RevokeRaceScenario
+                /\ ScenarioComplete
+                /\ started)
+
+          =============================================================================
+          TLA
+
+          write_cfg() {
+            local path=$1 mode=$2 scenario=$3 spec=$4 check_kind=$5 property=$6
+            local default_allow=$7 side_effect=$8 unbounded=$9
+            cat > "formal/$path" <<CFG
+          SPECIFICATION $spec
+
+          CONSTANTS
+              StrictEnforcing = "StrictEnforcing"
+              PipelinedEnforcing = "PipelinedEnforcing"
+              GeneralScenario = "General"
+              ClaimBeforePrepareScenario = "ClaimBeforePrepare"
+              RevokeRaceScenario = "RevokeRace"
+              Mode = "$mode"
+              Scenario = "$scenario"
+              MaxPending = 2
+              MutantDefaultAllowUnknown = $default_allow
+              MutantSideEffectBeforePrepare = $side_effect
+              MutantUnboundedPending = $unbounded
+
+          $check_kind $property
+          CHECK_DEADLOCK FALSE
+          CFG
+          }
+
+          write_cfg P49StrictWithinEpoch.cfg StrictEnforcing General Spec INVARIANT SafetyInvariant FALSE FALSE FALSE
+          write_cfg P49PipelinedWithinEpoch.cfg PipelinedEnforcing General Spec INVARIANT SafetyInvariant FALSE FALSE FALSE
+          write_cfg P49PipelinedClaimBeforePrepare.cfg PipelinedEnforcing ClaimBeforePrepare Spec INVARIANT SafetyInvariant FALSE FALSE FALSE
+          write_cfg P49PipelinedRevokeRace.cfg PipelinedEnforcing RevokeRace Spec INVARIANT SafetyInvariant FALSE FALSE FALSE
+          write_cfg P49PipelinedClaimBeforePrepareWitness.cfg PipelinedEnforcing ClaimBeforePrepare Spec INVARIANT NoClaimBeforePrepareWitness FALSE FALSE FALSE
+          write_cfg P49PipelinedRevokeRaceWitness.cfg PipelinedEnforcing RevokeRace Spec INVARIANT NoRevokeRaceWitness FALSE FALSE FALSE
+          write_cfg P49PipelinedDefaultAllowMutant.cfg PipelinedEnforcing General Spec INVARIANT NoStartAfterRelease TRUE FALSE FALSE
+          write_cfg P49PipelinedSideEffectBeforePrepare.cfg PipelinedEnforcing General Spec INVARIANT NoSideEffectBeforePrepare FALSE TRUE FALSE
+          write_cfg P49PipelinedUnboundedPending.cfg PipelinedEnforcing General Spec INVARIANT PendingBound FALSE FALSE TRUE
+          write_cfg P49PipelinedPendingLiveness.cfg PipelinedEnforcing ClaimBeforePrepare FairSpec PROPERTY PendingEventuallyResolved FALSE FALSE FALSE
+
+      - name: Write trace manifests and focused acceptance manifest
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import json
+          from pathlib import Path
+
+          formal = Path('formal')
+          traces = formal / 'trace-manifests'
+          traces.mkdir(exist_ok=True)
+
+          def write(name: str, document: dict) -> str:
+              path = traces / name
+              path.write_text(json.dumps(document, indent=2) + '\n', encoding='utf-8')
+              return f'trace-manifests/{name}'
+
+          common_meta = {'module': 'AssignmentFenceAdmissionModes'}
+
+          claim_witness = write('P49PipelinedClaimBeforePrepareWitness.manifest.template.json', {
+              'schema': 1,
+              'scenario': 'P49PipelinedClaimBeforePrepareWitness',
+              'property': 'NoClaimBeforePrepareWitness',
+              'expected_result': 'counterexample',
+              'min_states': 6,
+              'event_mode': 'exclusive',
+              'events': [
+                  {'name': 'ExposeUseCSBeforePrepareConsumed', 'all': [
+                      {'path': 'usecsExposed', 'from': False, 'to': True},
+                      {'path': 'prepared', 'to': False},
+                      {'path': 'prepareQueuedEver', 'to': True},
+                  ]},
+                  {'name': 'ParkClaimPending', 'all': [
+                      {'path': 'claimArrived', 'from': False, 'to': True},
+                      {'path': 'pendingCount', 'from': 0, 'to': 1},
+                      {'path': 'matchedClaim', 'to': False},
+                      {'path': 'sideEffect', 'to': False},
+                  ]},
+                  {'name': 'ConsumePrepareAndMatch', 'all': [
+                      {'path': 'prepared', 'from': False, 'to': True},
+                      {'path': 'pendingCount', 'from': 1, 'to': 0},
+                      {'path': 'matchedClaim', 'from': False, 'to': True},
+                  ]},
+                  {'name': 'StartAfterAuthorization', 'all': [
+                      {'path': 'started', 'from': False, 'to': True},
+                      {'path': 'sideEffect', 'from': False, 'to': True},
+                      {'path': 'revoked', 'to': False},
+                  ]},
+              ],
+              'required_subsequence': [
+                  'ExposeUseCSBeforePrepareConsumed', 'ParkClaimPending',
+                  'ConsumePrepareAndMatch', 'StartAfterAuthorization'
+              ],
+              'final_all': [
+                  {'path': 'started', 'eq': True},
+                  {'path': 'prepared', 'eq': True},
+                  {'path': 'matchedClaim', 'eq': True},
+                  {'path': 'pendingCount', 'eq': 0},
+              ],
+              'harness_steps': [
+                  {'after': 'ExposeUseCSBeforePrepareConsumed', 'emit': 'expose_usecs_after_prepare_enqueue_without_ready', 'actor': 'scheduler'},
+                  {'after': 'ParkClaimPending', 'emit': 'assert_claim_parked_without_side_effect', 'actor': 'fulfillment-daemon'},
+                  {'after': 'ConsumePrepareAndMatch', 'emit': 'authorize_exact_pending_claim', 'actor': 'fulfillment-daemon'},
+              ],
+              'metadata': {**common_meta, 'config': 'P49PipelinedClaimBeforePrepareWitness.cfg'},
+          })
+
+          revoke_witness = write('P49PipelinedRevokeRaceWitness.manifest.template.json', {
+              'schema': 1,
+              'scenario': 'P49PipelinedRevokeRaceWitness',
+              'property': 'NoRevokeRaceWitness',
+              'expected_result': 'counterexample',
+              'min_states': 7,
+              'event_mode': 'exclusive',
+              'events': [
+                  {'name': 'QueueRevokeBehindPrepare', 'all': [
+                      {'path': 's2f', 'to': ['REVOKE']},
+                      {'path': 'prepared', 'to': True},
+                      {'path': 'matchedClaim', 'to': False},
+                  ]},
+                  {'name': 'ClaimWinsBeforeRevokeConsume', 'all': [
+                      {'path': 'claimArrived', 'from': False, 'to': True},
+                      {'path': 'matchedClaim', 'from': False, 'to': True},
+                      {'path': 'revoked', 'to': False},
+                  ]},
+                  {'name': 'StartClaimWinner', 'all': [
+                      {'path': 'started', 'from': False, 'to': True},
+                      {'path': 'revoked', 'to': False},
+                  ]},
+              ],
+              'required_subsequence': [
+                  'QueueRevokeBehindPrepare', 'ClaimWinsBeforeRevokeConsume',
+                  'StartClaimWinner'
+              ],
+              'final_all': [
+                  {'path': 'started', 'eq': True},
+                  {'path': 'matchedClaim', 'eq': True},
+                  {'path': 'revoked', 'eq': False},
+              ],
+              'harness_steps': [
+                  {'after': 'QueueRevokeBehindPrepare', 'emit': 'hold_revoke_in_ordered_control_queue', 'actor': 'scheduler-channel'},
+                  {'after': 'ClaimWinsBeforeRevokeConsume', 'emit': 'linearize_claim_before_queued_revoke', 'actor': 'fulfillment-daemon'},
+              ],
+              'metadata': {**common_meta, 'config': 'P49PipelinedRevokeRaceWitness.cfg'},
+          })
+
+          default_allow = write('P49PipelinedDefaultAllowMutant.manifest.template.json', {
+              'schema': 1,
+              'scenario': 'P49PipelinedDefaultAllowMutant',
+              'property': 'NoStartAfterRelease',
+              'expected_result': 'counterexample',
+              'min_states': 8,
+              'event_mode': 'exclusive',
+              'events': [
+                  {'name': 'FenceBeforeClaim', 'all': [
+                      {'path': 'revoked', 'from': False, 'to': True},
+                      {'path': 'terminalQueued', 'from': False, 'to': True},
+                      {'path': 'matchedClaim', 'to': False},
+                  ]},
+                  {'name': 'ConsumeTerminalRelease', 'all': [
+                      {'path': 'terminalConsumed', 'from': False, 'to': True},
+                      {'path': 'released', 'from': False, 'to': True},
+                  ]},
+                  {'name': 'CompactFenceRecord', 'all': [
+                      {'path': 'compacted', 'from': False, 'to': True},
+                      {'path': 'released', 'to': True},
+                  ]},
+                  {'name': 'DefaultAllowLateUnknown', 'all': [
+                      {'path': 'startAfterRelease', 'from': False, 'to': True},
+                      {'path': 'started', 'from': False, 'to': True},
+                      {'path': 'sideEffect', 'from': False, 'to': True},
+                  ]},
+              ],
+              'required_subsequence': [
+                  'FenceBeforeClaim', 'ConsumeTerminalRelease',
+                  'CompactFenceRecord', 'DefaultAllowLateUnknown'
+              ],
+              'final_all': [
+                  {'path': 'released', 'eq': True},
+                  {'path': 'compacted', 'eq': True},
+                  {'path': 'startAfterRelease', 'eq': True},
+              ],
+              'harness_steps': [
+                  {'after': 'CompactFenceRecord', 'emit': 'compact_terminal_assignment_record', 'actor': 'fulfillment-daemon'},
+                  {'after': 'DefaultAllowLateUnknown', 'emit': 'assert_late_unknown_claim_started_after_release', 'actor': 'fulfillment-daemon'},
+              ],
+              'metadata': {**common_meta, 'config': 'P49PipelinedDefaultAllowMutant.cfg'},
+          })
+
+          side_effect = write('P49PipelinedSideEffectBeforePrepare.manifest.template.json', {
+              'schema': 1,
+              'scenario': 'P49PipelinedSideEffectBeforePrepare',
+              'property': 'NoSideEffectBeforePrepare',
+              'expected_result': 'counterexample',
+              'min_states': 4,
+              'event_mode': 'exclusive',
+              'events': [
+                  {'name': 'ExposePipelinedUseCS', 'all': [
+                      {'path': 'usecsExposed', 'from': False, 'to': True},
+                      {'path': 'prepared', 'to': False},
+                  ]},
+                  {'name': 'PrematureClaimSideEffect', 'all': [
+                      {'path': 'claimArrived', 'from': False, 'to': True},
+                      {'path': 'sideEffect', 'from': False, 'to': True},
+                      {'path': 'prepared', 'to': False},
+                      {'path': 'matchedClaim', 'to': False},
+                  ]},
+              ],
+              'required_subsequence': ['ExposePipelinedUseCS', 'PrematureClaimSideEffect'],
+              'final_all': [
+                  {'path': 'sideEffect', 'eq': True},
+                  {'path': 'prepared', 'eq': False},
+                  {'path': 'matchedClaim', 'eq': False},
+              ],
+              'harness_steps': [
+                  {'after': 'ExposePipelinedUseCS', 'emit': 'deliver_claim_before_prepare_consume', 'actor': 'client-channel'},
+                  {'after': 'PrematureClaimSideEffect', 'emit': 'assert_environment_side_effect_preceded_authorization', 'actor': 'fulfillment-daemon'},
+              ],
+              'metadata': {**common_meta, 'config': 'P49PipelinedSideEffectBeforePrepare.cfg'},
+          })
+
+          unbounded = write('P49PipelinedUnboundedPending.manifest.template.json', {
+              'schema': 1,
+              'scenario': 'P49PipelinedUnboundedPending',
+              'property': 'PendingBound',
+              'expected_result': 'counterexample',
+              'min_states': 6,
+              'event_mode': 'exclusive',
+              'events': [
+                  {'name': 'GrowPendingTable', 'all': [
+                      {'path': 'pendingCount', 'delta': 1},
+                      {'path': 'prepared', 'to': False},
+                  ]},
+                  {'name': 'ExceedPendingLimit', 'all': [
+                      {'path': 'pendingCount', 'from': 2, 'to': 3},
+                      {'path': 'prepared', 'to': False},
+                  ]},
+              ],
+              'required_subsequence': [
+                  'GrowPendingTable', 'GrowPendingTable', 'ExceedPendingLimit'
+              ],
+              'final_all': [{'path': 'pendingCount', 'eq': 3}],
+              'harness_steps': [
+                  {'after': 'ExceedPendingLimit', 'emit': 'assert_pending_claim_table_exceeded_negotiated_bound', 'actor': 'fulfillment-daemon'},
+              ],
+              'metadata': {**common_meta, 'config': 'P49PipelinedUnboundedPending.cfg', 'max_pending': 2},
+          })
+
+          base = json.loads((formal / 'formal-checks.json').read_text(encoding='utf-8'))
+          selected_ids = [
+              'core-fixed',
+              'core-heterogeneous',
+              'core-mixed-token-mutant',
+              'core-release-claimed-mutant',
+              'core-revoked-result-liveness',
+              'network-fixed',
+              'network-claim-wins-queued-revoke-witness',
+              'network-fence-wins-delayed-claim-witness',
+              'network-compaction-fixed',
+              'network-usecs-before-ready-mutant',
+              'network-release-on-enqueue-mutant',
+              'network-default-allow-after-compaction-mutant',
+              'network-f2s-bypass-mutant',
+              'network-fair-liveness',
+          ]
+          by_id = {row['id']: row for row in base['checks']}
+          missing = [check_id for check_id in selected_ids if check_id not in by_id]
+          if missing:
+              raise SystemExit(f'missing inherited assignment-fence rows: {missing}')
+          rows = [by_id[check_id] for check_id in selected_ids]
+
+          def row(check_id, config, expected, property_name, kind='safety', trace=None):
+              result = {
+                  'id': check_id,
+                  'module': 'AssignmentFenceAdmissionModes',
+                  'config': config,
+                  'kind': kind,
+                  'workers': 1,
+                  'expected': expected,
+                  'property': property_name,
+                  'toolchains': ['stable', 'differential'],
+                  'timeout_seconds': 1800 if kind == 'safety' else 3600,
+              }
+              if trace:
+                  result['trace_manifest'] = trace
+              return result
+
+          rows.extend([
+              row('p49-strict-within-epoch', 'P49StrictWithinEpoch.cfg', 'pass', 'SafetyInvariant'),
+              row('p49-pipelined-within-epoch', 'P49PipelinedWithinEpoch.cfg', 'pass', 'SafetyInvariant'),
+              row('p49-pipelined-claim-before-prepare', 'P49PipelinedClaimBeforePrepare.cfg', 'pass', 'SafetyInvariant'),
+              row('p49-pipelined-revoke-race', 'P49PipelinedRevokeRace.cfg', 'pass', 'SafetyInvariant'),
+              row('p49-pipelined-claim-before-prepare-witness', 'P49PipelinedClaimBeforePrepareWitness.cfg', 'counterexample', 'NoClaimBeforePrepareWitness', trace=claim_witness),
+              row('p49-pipelined-revoke-race-witness', 'P49PipelinedRevokeRaceWitness.cfg', 'counterexample', 'NoRevokeRaceWitness', trace=revoke_witness),
+              row('p49-pipelined-default-allow-mutant', 'P49PipelinedDefaultAllowMutant.cfg', 'counterexample', 'NoStartAfterRelease', trace=default_allow),
+              row('p49-pipelined-side-effect-before-prepare-mutant', 'P49PipelinedSideEffectBeforePrepare.cfg', 'counterexample', 'NoSideEffectBeforePrepare', trace=side_effect),
+              row('p49-pipelined-unbounded-pending-mutant', 'P49PipelinedUnboundedPending.cfg', 'counterexample', 'PendingBound', trace=unbounded),
+              row('p49-pipelined-pending-liveness', 'P49PipelinedPendingLiveness.cfg', 'pass', 'PendingEventuallyResolved', kind='liveness'),
+          ])
+
+          manifest = {
+              'schema': 1,
+              'description': 'Proof-bearing assignment-fence gate: unbounded ownership core, finite FIFO network quotient, strict enforcing baseline, and separately negotiated pipelined-enforcing contingency.',
+              'checks': rows,
+              'proofs': base.get('proofs', []),
+          }
+          (formal / 'assignment-fence-proof-checks-v1.json').write_text(
+              json.dumps(manifest, indent=2) + '\n', encoding='utf-8'
+          )
+          PY
+
+      - name: Add focused static contract regression
+        run: |
+          set -euo pipefail
+          cat > formal/assignment_fence_proof_manifest_test.py <<'PY'
+          #!/usr/bin/env python3
+          """Static contract for the focused proof-bearing assignment-fence matrix."""
+
+          from __future__ import annotations
+
+          import json
+          import re
+          import unittest
+          from pathlib import Path
+
+          HERE = Path(__file__).resolve().parent
+          MANIFEST = HERE / 'assignment-fence-proof-checks-v1.json'
+
+          NEW_IDS = [
+              'p49-strict-within-epoch',
+              'p49-pipelined-within-epoch',
+              'p49-pipelined-claim-before-prepare',
+              'p49-pipelined-revoke-race',
+              'p49-pipelined-claim-before-prepare-witness',
+              'p49-pipelined-revoke-race-witness',
+              'p49-pipelined-default-allow-mutant',
+              'p49-pipelined-side-effect-before-prepare-mutant',
+              'p49-pipelined-unbounded-pending-mutant',
+              'p49-pipelined-pending-liveness',
+          ]
+
+
+          class AssignmentFenceProofManifestTests(unittest.TestCase):
+              @classmethod
+              def setUpClass(cls) -> None:
+                  cls.document = json.loads(MANIFEST.read_text(encoding='utf-8'))
+                  cls.rows = cls.document['checks']
+                  cls.by_id = {row['id']: row for row in cls.rows}
+
+              def test_new_rows_are_complete_and_ordered(self) -> None:
+                  actual = [row['id'] for row in self.rows if row['id'].startswith('p49-')]
+                  self.assertEqual(actual, NEW_IDS)
+                  for check_id in NEW_IDS:
+                      row = self.by_id[check_id]
+                      self.assertEqual(row['module'], 'AssignmentFenceAdmissionModes')
+                      self.assertEqual(row['workers'], 1)
+                      self.assertEqual(row['toolchains'], ['stable', 'differential'])
+                      self.assertTrue((HERE / row['config']).is_file())
+
+              def test_counterexamples_have_exact_trace_contracts(self) -> None:
+                  for row in self.rows:
+                      if not row['id'].startswith('p49-') or row['expected'] == 'pass':
+                          continue
+                      trace_path = HERE / row['trace_manifest']
+                      trace = json.loads(trace_path.read_text(encoding='utf-8'))
+                      self.assertEqual(trace['property'], row['property'])
+                      self.assertEqual(trace['expected_result'], 'counterexample')
+                      self.assertEqual(trace['metadata']['module'], row['module'])
+                      self.assertEqual(trace['metadata']['config'], row['config'])
+                      self.assertTrue(trace['required_subsequence'])
+                      self.assertTrue(trace['final_all'])
+
+              def test_configs_are_direct_and_reduction_free(self) -> None:
+                  for check_id in NEW_IDS:
+                      row = self.by_id[check_id]
+                      text = (HERE / row['config']).read_text(encoding='utf-8')
+                      self.assertEqual(len(re.findall(r'^SPECIFICATION\s+', text, re.M)), 1)
+                      direct = re.findall(r'^(INVARIANT|PROPERTY)\s+(\w+)\s*$', text, re.M)
+                      self.assertIn((
+                          'PROPERTY' if row['kind'] == 'liveness' else 'INVARIANT',
+                          row['property'],
+                      ), direct)
+                      self.assertEqual(len(re.findall(r'^CHECK_DEADLOCK\s+', text, re.M)), 1)
+                      self.assertNotRegex(text, re.compile(r'^(CONSTRAINT|ACTION_CONSTRAINT|SYMMETRY|VIEW)\b', re.M))
+
+              def test_proof_row_is_real_and_unique(self) -> None:
+                  proofs = self.document.get('proofs', [])
+                  self.assertEqual(len(proofs), 1)
+                  self.assertEqual(proofs[0]['file'], 'AssignmentFenceCoreProof.tla')
+                  self.assertEqual(proofs[0]['expected'], 'pass')
+
+
+          if __name__ == '__main__':
+              unittest.main()
+          PY
+          chmod +x formal/assignment_fence_proof_manifest_test.py
+          python3 formal/assignment_fence_proof_manifest_test.py
+          if test -f formal/tla_primed_assignment_lint.py; then
+            python3 formal/tla_primed_assignment_lint.py formal/AssignmentFenceAdmissionModes.tla
+          fi
+          git diff --check
+
+      - name: Commit modes and remove one-shot workflow
+        run: |
+          set -euo pipefail
+          rm .github/workflows/assignment-fence-modes-once.yml
+          git config user.name "mickg10 formal automation"
+          git config user.email "5094033+mickg10@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "formal: model strict and pipelined enforcing admission"
+          git push origin HEAD:bigoracle/assignment-fence-proof-v4
