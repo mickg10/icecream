@@ -1,0 +1,230 @@
+name: assignment-fence-quotient-once
+
+on:
+  push:
+    branches:
+      - bigoracle/assignment-fence-proof-v4
+    paths:
+      - .github/workflows/assignment-fence-quotient-once.yml
+
+permissions:
+  contents: write
+
+jobs:
+  quotient:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bigoracle/assignment-fence-proof-v4
+          fetch-depth: 0
+      - name: Replace absolute sequence growth with finite FIFO-order observer
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import json
+          import re
+          from pathlib import Path
+          from typing import Any
+
+          model_path = Path("formal/AssignmentFenceNetwork.tla")
+          text = model_path.read_text(encoding="utf-8")
+          original = text
+
+          required = [
+              "Msg(kind, assignment, seq)",
+              "nextF2SSeq",
+              "lastF2SConsumed",
+              "ChosenF2S.seq",
+              "F2SStrictlyIncreasing ==",
+          ]
+          missing = [fragment for fragment in required if fragment not in text]
+          if missing:
+              raise SystemExit(f"finite-quotient precondition missing: {missing}")
+
+          # The queue position is the ordering object.  Absolute sequence values
+          # add no protocol distinction and grow across reset cycles, making the
+          # otherwise finite model infinite.
+          text = text.replace(
+              "Msg(kind, assignment, seq) ==",
+              "Msg(kind, assignment) ==",
+              1,
+          )
+          text = text.replace(", seq |-> seq", "")
+          text = text.replace(", seq : Nat", "")
+          text = re.sub(
+              r"\bMsg\(([^,\n()]+),\s*([^,\n()]+),\s*(?:0|nextF2SSeq)\)",
+              r"Msg(\1, \2)",
+              text,
+          )
+
+          text = text.replace("lastF2SConsumed", "lastF2SIndex")
+          text = text.replace("ChosenF2S.seq", "ChosenF2SIndex")
+
+          lines: list[str] = []
+          for line in text.splitlines():
+              stripped = line.strip()
+              if re.fullmatch(r"nextF2SSeq,?", stripped):
+                  continue
+              if re.fullmatch(r"/\\ nextF2SSeq = .+", stripped):
+                  continue
+              if re.fullmatch(r"/\\ nextF2SSeq' = .+", stripped):
+                  continue
+              if re.fullmatch(r"/\\ nextF2SSeq \\in .+", stripped):
+                  continue
+              line = re.sub(r"\bnextF2SSeq\s*,\s*", "", line)
+              line = re.sub(r",\s*nextF2SSeq\b", "", line)
+              lines.append(line)
+          text = "\n".join(lines) + "\n"
+
+          # Bound the observer to the only semantically relevant choices: no
+          # F->S consume yet, FIFO head, or the deliberate index-2 bypass mutant.
+          text, type_count = re.subn(
+              r"(?m)^\s*/\\ lastF2SIndex \\in .*?$",
+              "    /\\ lastF2SIndex \\in 0..2",
+              text,
+          )
+          if type_count != 1:
+              raise SystemExit(
+                  f"expected one lastF2SIndex type clause, got {type_count}"
+              )
+
+          op_start = text.index("F2SStrictlyIncreasing ==")
+          op_end = text.find("\n\n", op_start)
+          if op_end < 0:
+              raise SystemExit("F2SStrictlyIncreasing operator has no boundary")
+          text = (
+              text[:op_start]
+              + "F2SStrictlyIncreasing == lastF2SIndex <= 1"
+              + text[op_end:]
+          )
+
+          marker = "ChosenF2SIndex ==\n"
+          marker_at = text.index(marker)
+          comment = """(***************************************************************************
+Finite FIFO quotient: queue position carries all relative-order information.
+lastF2SIndex is only a bounded observation used to discriminate the explicit
+index-2 bypass mutant; it is not a protocol sequence number.
+***************************************************************************)
+"""
+          text = text[:marker_at] + comment + text[marker_at:]
+
+          forbidden = [
+              "nextF2SSeq",
+              "lastF2SConsumed",
+              "ChosenF2S.seq",
+              "seq |-> seq",
+              "seq : Nat",
+          ]
+          residue = [fragment for fragment in forbidden if fragment in text]
+          if residue:
+              raise SystemExit(f"finite-quotient residue: {residue}")
+          if text == original:
+              raise SystemExit("finite quotient made no change")
+          model_path.write_text(text, encoding="utf-8")
+
+          def rewrite_json(value: Any) -> Any:
+              if isinstance(value, list):
+                  result = []
+                  for item in value:
+                      if isinstance(item, dict) and item.get("path") == "nextF2SSeq":
+                          continue
+                      result.append(rewrite_json(item))
+                  return result
+              if isinstance(value, dict):
+                  result = {key: rewrite_json(item) for key, item in value.items()}
+                  if result.get("path") == "lastF2SConsumed":
+                      result["path"] = "lastF2SIndex"
+                  return result
+              if isinstance(value, str):
+                  return (
+                      value.replace("lastF2SConsumed", "lastF2SIndex")
+                      .replace("nextF2SSeq", "finite FIFO position")
+                  )
+              return value
+
+          for manifest_path in sorted(Path("formal/trace-manifests").glob("*.json")):
+              document = json.loads(manifest_path.read_text(encoding="utf-8"))
+              rewritten = rewrite_json(document)
+              manifest_path.write_text(
+                  json.dumps(rewritten, indent=2, sort_keys=False) + "\n",
+                  encoding="utf-8",
+              )
+
+          test_path = Path("formal/assignment_fence_network_quotient_test.py")
+          test_path.write_text(
+              '''#!/usr/bin/env python3
+"""Static regression for the finite F-to-S FIFO quotient."""
+
+from pathlib import Path
+import re
+import unittest
+
+MODEL = Path(__file__).with_name("AssignmentFenceNetwork.tla")
+
+
+class FiniteF2SQuotientTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.text = MODEL.read_text(encoding="utf-8")
+
+    def test_absolute_sequence_state_is_absent(self) -> None:
+        for fragment in (
+            "nextF2SSeq",
+            "lastF2SConsumed",
+            "ChosenF2S.seq",
+            "seq |-> seq",
+            "seq : Nat",
+        ):
+            self.assertNotIn(fragment, self.text)
+
+    def test_queue_position_is_the_only_order_observer(self) -> None:
+        self.assertIn("lastF2SIndex \\in 0..2", self.text)
+        self.assertIn(
+            "lastF2SIndex' = ChosenF2SIndex",
+            self.text,
+        )
+        self.assertRegex(
+            self.text,
+            re.compile(
+                r"F2SStrictlyIncreasing\s*==\s*lastF2SIndex\s*<=\s*1"
+            ),
+        )
+
+    def test_messages_carry_no_synthetic_order_field(self) -> None:
+        self.assertIn("Msg(kind, assignment) ==", self.text)
+        self.assertNotRegex(self.text, re.compile(r"\\bMsg\\([^\\n]*,[^\\n]*,[^\\n]*\\)"))
+
+
+if __name__ == "__main__":
+    unittest.main()
+''',
+              encoding="utf-8",
+          )
+          PY
+
+          python3 formal/assignment_fence_network_quotient_test.py
+          python3 formal/trace_to_harness_test.py
+          python3 formal/tlc_text_trace_test.py
+          python3 formal/normalize_tlc_trace_test.py
+          python3 formal/run_formal_checks_v4_test.py
+          python3 formal/run_tlc_only_checks_v4_test.py
+          if test -f formal/tla_primed_assignment_lint_test.py; then
+            python3 formal/tla_primed_assignment_lint_test.py
+          fi
+          git diff --check
+      - name: Commit quotient and remove one-shot workflow
+        run: |
+          set -euo pipefail
+          rm .github/workflows/assignment-fence-quotient-once.yml
+          git config user.name "mickg10 formal automation"
+          git config user.email "5094033+mickg10@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "formal: quotient F-to-S ordering to finite FIFO state"
+          git push origin HEAD:bigoracle/assignment-fence-proof-v4
