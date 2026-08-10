@@ -1,0 +1,84 @@
+{
+  "schema": 1,
+  "scenario": "AssignmentFenceEarlyCancelStaleReadyMutant",
+  "property": "NoUseCSAfterCancel",
+  "expected_result": "counterexample",
+  "min_states": 6,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "SQueuePrepare",
+      "all": [
+        {"path": "sPhase", "from": "Absent", "to": "PrepareQueued"},
+        {"path": "s2f", "len_delta": 1}
+      ]
+    },
+    {
+      "name": "SQueueEarlyCancel",
+      "all": [
+        {"path": "sPhase", "from": "PrepareQueued", "to": "RevokeQueued"},
+        {"path": "cancelRequested", "from": false, "to": true},
+        {"path": "earlyCancel", "from": false, "to": true}
+      ]
+    },
+    {
+      "name": "FQueueReadyAfterCancel",
+      "all": [
+        {"path": "fPhase", "from": "None", "to": "Prepared"},
+        {"path": "workerSlot", "from": false, "to": true},
+        {"path": "f2s", "len_delta": 1}
+      ]
+    },
+    {
+      "name": "SResurrectOnStaleReady",
+      "all": [
+        {"path": "sPhase", "from": "RevokeQueued", "to": "Ready"},
+        {"path": "readySeen", "from": false, "to": true},
+        {"path": "cancelRequested", "to": true},
+        {"path": "f2s", "len_delta": -1}
+      ]
+    },
+    {
+      "name": "SExposeUseCSAfterCancel",
+      "all": [
+        {"path": "sPhase", "from": "Ready", "to": "UseCSQueued"},
+        {"path": "usecsExposed", "from": false, "to": true},
+        {"path": "cancelRequested", "to": true}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "SQueuePrepare",
+    "SQueueEarlyCancel",
+    "FQueueReadyAfterCancel",
+    "SResurrectOnStaleReady",
+    "SExposeUseCSAfterCancel"
+  ],
+  "final_all": [
+    {"path": "cancelRequested", "eq": true},
+    {"path": "usecsExposed", "eq": true},
+    {"path": "sPhase", "eq": "UseCSQueued"}
+  ],
+  "harness_steps": [
+    {
+      "after": "SQueueEarlyCancel",
+      "emit": "hold_ready_until_cancel_is_scheduler_visible",
+      "actor": "f-to-s-transport"
+    },
+    {
+      "after": "SResurrectOnStaleReady",
+      "emit": "assert_stale_ready_resurrected_canceled_assignment",
+      "actor": "scheduler"
+    },
+    {
+      "after": "SExposeUseCSAfterCancel",
+      "emit": "assert_usecs_exposed_after_cancel",
+      "actor": "scheduler"
+    }
+  ],
+  "metadata": {
+    "module": "AssignmentFenceEarlyCancel",
+    "config": "AssignmentFenceEarlyCancelStaleReadyMutant.cfg",
+    "mutant": "MutantStaleReadyResurrects = TRUE"
+  }
+}
