@@ -31,6 +31,8 @@ AbstractStates ==
     {"Idle", "Awaiting", "Authorized", "Revoked",
      "Started", "Terminal", "Released"}
 
+CapInc(n) == IF n < MaxPending THEN n + 1 ELSE n
+
 VARIABLES prepareQueued,
           prepared,
           readyObserved,
@@ -157,13 +159,13 @@ ClientClaim ==
                /\ rejectedClaims' =
                      IF pendingCount < MaxPending
                      THEN rejectedClaims
-                     ELSE rejectedClaims + 1
+                     ELSE CapInc(rejectedClaims)
           ELSE /\ matched' = matched
                /\ authorizationSeen' = authorizationSeen
                /\ pendingCount' = pendingCount
                /\ abstractState' = abstractState
                /\ pendingStutterSeen' = pendingStutterSeen
-               /\ rejectedClaims' = rejectedClaims + 1
+               /\ rejectedClaims' = CapInc(rejectedClaims)
     /\ UNCHANGED <<prepareQueued, prepared, readyObserved,
                     usecsExposed, revokeQueued, revoked,
                     started, terminal, released>>
@@ -188,7 +190,7 @@ UnknownClaim ==
           THEN /\ pendingCount' = pendingCount + 1
                /\ rejectedClaims' = rejectedClaims
           ELSE /\ pendingCount' = pendingCount
-               /\ rejectedClaims' = rejectedClaims + 1
+               /\ rejectedClaims' = CapInc(rejectedClaims)
     /\ UNCHANGED <<prepareQueued, prepared, readyObserved,
                     usecsExposed, revokeQueued, revoked,
                     started, terminal, released>>
@@ -294,7 +296,7 @@ TypeOK ==
     /\ released \in BOOLEAN
     /\ abstractState \in AbstractStates
     /\ pendingStutterSeen \in BOOLEAN
-    /\ rejectedClaims \in Nat
+    /\ rejectedClaims \in 0..MaxPending
 
 AbstractionRelation == abstractState = AbsOf
 StartRequiresAuthorization == started => authorizationSeen
