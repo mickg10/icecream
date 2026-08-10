@@ -1,0 +1,99 @@
+{
+  "schema": 1,
+  "scenario": "AssignmentFenceEarlyCancelWitness",
+  "property": "NoEarlyCancelCompleted",
+  "expected_result": "counterexample",
+  "min_states": 7,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "SQueuePrepare",
+      "all": [
+        {"path": "sPhase", "from": "Absent", "to": "PrepareQueued"},
+        {"path": "schedulerReservation", "from": false, "to": true},
+        {"path": "s2f", "len_delta": 1}
+      ]
+    },
+    {
+      "name": "SQueueEarlyCancel",
+      "all": [
+        {"path": "sPhase", "from": "PrepareQueued", "to": "RevokeQueued"},
+        {"path": "cancelRequested", "from": false, "to": true},
+        {"path": "earlyCancel", "from": false, "to": true},
+        {"path": "s2f", "len_delta": 1}
+      ]
+    },
+    {
+      "name": "FConsumePrepareAfterCancel",
+      "all": [
+        {"path": "sPhase", "unchanged": true},
+        {"path": "fPhase", "from": "None", "to": "Prepared"},
+        {"path": "workerSlot", "from": false, "to": true},
+        {"path": "s2f", "len_delta": -1},
+        {"path": "f2s", "len_delta": 1}
+      ]
+    },
+    {
+      "name": "FConsumeRevoke",
+      "all": [
+        {"path": "fPhase", "from": "Prepared", "to": "Revoked"},
+        {"path": "workerSlot", "from": true, "to": false},
+        {"path": "revokedReplyQueued", "from": false, "to": true},
+        {"path": "s2f", "len_delta": -1},
+        {"path": "f2s", "len_delta": 1}
+      ]
+    },
+    {
+      "name": "SConsumeRevoked",
+      "all": [
+        {"path": "revokedReplyConsumed", "from": false, "to": true},
+        {"path": "released", "from": false, "to": true},
+        {"path": "schedulerReservation", "from": true, "to": false},
+        {"path": "sPhase", "from": "RevokeQueued", "to": "Terminal"},
+        {"path": "f2s", "len_delta": -1}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "SQueuePrepare",
+    "SQueueEarlyCancel",
+    "FConsumePrepareAfterCancel",
+    "FConsumeRevoke",
+    "SConsumeRevoked"
+  ],
+  "final_all": [
+    {"path": "earlyCancel", "eq": true},
+    {"path": "revokedReplyConsumed", "eq": true},
+    {"path": "released", "eq": true},
+    {"path": "schedulerReservation", "eq": false},
+    {"path": "workerSlot", "eq": false},
+    {"path": "sPhase", "eq": "Terminal"}
+  ],
+  "harness_steps": [
+    {
+      "after": "SQueueEarlyCancel",
+      "emit": "barrier_cancel_queued_before_worker_consumes_prepare",
+      "actor": "scheduler"
+    },
+    {
+      "after": "FConsumePrepareAfterCancel",
+      "emit": "assert_worker_consumed_received_prepare_without_scheduler_phase_oracle",
+      "actor": "fulfillment-daemon"
+    },
+    {
+      "after": "FConsumeRevoke",
+      "emit": "barrier_worker_slot_free_scheduler_reservation_retained",
+      "actor": "fulfillment-daemon"
+    },
+    {
+      "after": "SConsumeRevoked",
+      "emit": "assert_scheduler_releases_only_after_complete_revoked_result",
+      "actor": "scheduler"
+    }
+  ],
+  "metadata": {
+    "module": "AssignmentFenceEarlyCancel",
+    "config": "AssignmentFenceEarlyCancelWitness.cfg",
+    "scope": "strict READY-before-UseCS early cancel"
+  }
+}
