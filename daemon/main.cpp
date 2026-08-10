@@ -4164,11 +4164,19 @@ static bool quiesce_session_compilers(uint64_t generation,
             it != child_registry.end(); ++it) {
         ChildRecord &rec = it->second;
         if (rec.kind == ChildRecord::COMPILER
-                && rec.session_generation <= generation
-                && rec.state != ChildRecord::REAPED) {
+                && rec.session_generation <= generation) {
+            /* G3: terminate the process GROUP unconditionally -- old-session
+               descendants can outlive a leader the generic waitpid(-1) sweep
+               already reaped, and a REAPED leader is only a pid observation,
+               not proof the group is gone.  Previously REAPED records were
+               excluded here, so a stolen reap left the group's absence never
+               verified.  A REAPED leader is still queued for the group-absence
+               check below; only do NOT re-signal its pid (it may be recycled). */
             kill(-rec.pgid, SIGTERM);
-            kill(rec.pid, SIGTERM);
-            rec.state = ChildRecord::TERM_SENT;
+            if (rec.state != ChildRecord::REAPED) {
+                kill(rec.pid, SIGTERM);
+                rec.state = ChildRecord::TERM_SENT;
+            }
             pending.push_back(rec.pid);
         }
     }
