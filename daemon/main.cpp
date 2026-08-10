@@ -1159,6 +1159,7 @@ struct Daemon {
     bool send_scheduler(const Msg &msg) __attribute_warn_unused_result__;
     void record_waitforcs_latency(bool use_cs, uint64_t latency_msec);
     void close_scheduler();
+    void finish_scheduler_loss();
     bool reconnect();
     int working_loop();
     bool setup_listen_fds();
@@ -4018,6 +4019,20 @@ void Daemon::close_scheduler()
         next_scheduler_connect = time(nullptr) + 3;
 }
 
+/* G4: the single cleanup for the loss of an ESTABLISHED scheduler session.
+   Every answer_client_requests() boundary that may have nulled `scheduler`
+   mid-turn (pre-poll handle_old_request, the drain, later readiness handlers)
+   funnels here gated on had_scheduler && !scheduler, then returns from the
+   turn -- so it runs exactly once per lost generation, before any reconnect,
+   and a failed initial login (scheduler already null at turn start) or an
+   orderly shutdown never reaches it.  close_scheduler() has already dropped
+   the channel; this retires the session's children so no further same-poll
+   work proceeds against a dead session. */
+void Daemon::finish_scheduler_loss()
+{
+    clear_children();
+}
+
 bool Daemon::maybe_stats(bool force_check)
 {
     struct timeval now;
@@ -5710,7 +5725,13 @@ void Daemon::handle_old_request()
                 client->child_pid = pid;
 
                 if (!send_scheduler(JobBeginMsg(job->jobID(), clients.size()))) {
+                    /* G4: the compensating send failed and closed the scheduler
+                       session.  Bail immediately -- do NOT continue this loop
+                       and start further clients against a dead session; the
+                       caller (answer_client_requests) runs the single
+                       finish_scheduler_loss() and leaves the turn. */
                     log_info() << "failed sending scheduler about " << job->jobID() << endl;
+                    return;
                 }
             } else {
                 handle_end(client, 117);
@@ -6186,7 +6207,15 @@ void Daemon::answer_client_requests()
     state_writer.alive();
     state_writer.pump();
 
+    /* G4: capture established-session liveness once; any boundary in this turn
+       that loses it funnels through the single finish_scheduler_loss(). */
+    const bool had_scheduler = (scheduler != nullptr);
+
     handle_old_request();
+    if (had_scheduler && !scheduler) {
+        finish_scheduler_loss();
+        return;
+    }
 
     /* collect the stats after the children exited icecream_load */
     if (scheduler) {
@@ -6345,8 +6374,6 @@ void Daemon::answer_client_requests()
     }
 
     if (ret > 0) {
-        bool had_scheduler = scheduler;
-
         if (scheduler && pollfd_is_set(pollfds, scheduler->fd, POLLIN)) {
             /* A handler in this loop (e.g. scheduler_use_cs -> handle_end ->
                a failed compensating send_scheduler) can call close_scheduler()
@@ -6399,6 +6426,15 @@ void Daemon::answer_client_requests()
                     return;
                 }
             }
+        }
+
+        /* G4: the drain (a failed compensating send inside scheduler_use_cs)
+           may have lost the session.  Do not process web/listener/client/
+           child/env readiness from this same poll snapshot against a dead
+           session -- funnel to the single cleanup and leave the turn. */
+        if (had_scheduler && !scheduler) {
+            finish_scheduler_loss();
+            return;
         }
 
         if (web_listen_fd != -1 && pollfd_is_set(pollfds, web_listen_fd, POLLIN)) {
@@ -6530,7 +6566,7 @@ void Daemon::answer_client_requests()
         }
 
         if (had_scheduler && !scheduler) {
-            clear_children();
+            finish_scheduler_loss();
             return;
         }
 
