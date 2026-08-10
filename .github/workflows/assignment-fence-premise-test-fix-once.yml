@@ -1,0 +1,38 @@
+name: assignment-fence-premise-test-fix-once
+
+on:
+  push:
+    branches:
+      - bigoracle/assignment-fence-proof-v4
+    paths:
+      - ".github/workflows/assignment-fence-premise-test-fix-once.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bigoracle/assignment-fence-proof-v4
+          fetch-depth: 0
+      - name: Replace the superseded draft with the v2 contract
+        run: |
+          set -euo pipefail
+          cp formal/assignment_fence_premise_coverage_test_v2.py \
+            formal/assignment_fence_premise_coverage_test.py
+          python3 formal/generate_assignment_fence_admission_modes.py
+          python3 formal/assignment_fence_premise_coverage_test.py
+          python3 formal/assignment_fence_premise_coverage_test_v2.py
+          rm .github/workflows/assignment-fence-premise-test-fix-once.yml
+          git config user.name "mickg10 formal automation"
+          git config user.email "5094033+mickg10@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "formal: replace superseded premise-coverage draft"
+          git push origin HEAD:bigoracle/assignment-fence-proof-v4
