@@ -218,6 +218,8 @@ def validate_manifest(document: Any, domain: Domain) -> dict[str, Any]:
 def successful_run(repository: str, revision: str, domain: Domain) -> dict[str, Any]:
     document = gh(
         [
+            "--method",
+            "GET",
             f"repos/{repository}/actions/runs",
             "-f",
             f"head_sha={revision}",
@@ -242,7 +244,7 @@ def successful_run(repository: str, revision: str, domain: Domain) -> dict[str, 
 
 def validate_jobs(repository: str, run_id: int, domain: Domain) -> list[dict[str, Any]]:
     document = gh(
-        [f"repos/{repository}/actions/runs/{run_id}/jobs", "-f", "per_page=100"]
+        ["--method", "GET", f"repos/{repository}/actions/runs/{run_id}/jobs", "-f", "per_page=100"]
     )
     jobs = document.get("jobs", [])
     require(jobs, f"{domain.name}: successful run has no jobs")
@@ -268,7 +270,7 @@ def validate_artifacts(
     domain: Domain,
 ) -> list[dict[str, Any]]:
     document = gh(
-        [f"repos/{repository}/actions/runs/{run_id}/artifacts", "-f", "per_page=100"]
+        ["--method", "GET", f"repos/{repository}/actions/runs/{run_id}/artifacts", "-f", "per_page=100"]
     )
     artifacts = document.get("artifacts", [])
     selected: list[dict[str, Any]] = []
