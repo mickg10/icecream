@@ -3,7 +3,7 @@ TESTS = testargs lockexec backpressure schedpolicy utf8test statewritertest fast
 AM_CPPFLAGS = -I$(top_srcdir)/client -I$(top_srcdir)/services -I$(top_srcdir)/
 testargs_LDADD = ../client/libclient.a ../services/libicecc.la
 
-check_PROGRAMS = testargs lockexec backpressure schedpolicy utf8test statewritertest schedbp connectivity fastesttest hallflowtest jobidalloctest
+check_PROGRAMS = testargs lockexec backpressure schedpolicy utf8test statewritertest schedbp daemonlogin connectivity fastesttest hallflowtest jobidalloctest
 testargs_SOURCES = args.cpp
 lockexec_SOURCES = lockexec.cpp
 lockexec_LDADD = ../client/libclient.a ../services/libicecc.la
@@ -26,6 +26,10 @@ backpressure_LDADD = ../services/libicecc.la
 # `make check` so it cannot bit-rot; execution is manual because it starts a
 # real scheduler and takes minutes -- see the header of schedbp.cpp.
 schedbp_SOURCES = schedbp.cpp
+
+# Login-attempt/ConfCS activation lifecycle gate (issue #4 G4).
+daemonlogin_SOURCES = daemonlogin.cpp
+daemonlogin_LDADD = ../services/libicecc.la
 
 # Connectivity-probe state machine regression (issue #4 item 4): drives
 # CompileServer directly, with failure injection from conn_shim.so.
