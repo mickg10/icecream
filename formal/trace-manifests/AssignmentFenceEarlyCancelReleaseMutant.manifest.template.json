@@ -1,0 +1,82 @@
+{
+  "schema": 1,
+  "scenario": "AssignmentFenceEarlyCancelReleaseMutant",
+  "property": "ReleaseAfterRevokedConsumption",
+  "expected_result": "counterexample",
+  "min_states": 6,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "SQueuePrepare",
+      "all": [
+        {"path": "sPhase", "from": "Absent", "to": "PrepareQueued"},
+        {"path": "schedulerReservation", "from": false, "to": true}
+      ]
+    },
+    {
+      "name": "SQueueEarlyCancel",
+      "all": [
+        {"path": "sPhase", "from": "PrepareQueued", "to": "RevokeQueued"},
+        {"path": "earlyCancel", "from": false, "to": true}
+      ]
+    },
+    {
+      "name": "FConsumePrepareAfterCancel",
+      "all": [
+        {"path": "fPhase", "from": "None", "to": "Prepared"},
+        {"path": "workerSlot", "from": false, "to": true}
+      ]
+    },
+    {
+      "name": "FQueueRevoked",
+      "all": [
+        {"path": "fPhase", "from": "Prepared", "to": "Revoked"},
+        {"path": "workerSlot", "from": true, "to": false},
+        {"path": "revokedReplyQueued", "from": false, "to": true},
+        {"path": "revokedReplyConsumed", "to": false},
+        {"path": "f2s", "len_delta": 1}
+      ]
+    },
+    {
+      "name": "SPrematureRelease",
+      "all": [
+        {"path": "released", "from": false, "to": true},
+        {"path": "schedulerReservation", "from": true, "to": false},
+        {"path": "sPhase", "from": "RevokeQueued", "to": "Terminal"},
+        {"path": "revokedReplyQueued", "to": true},
+        {"path": "revokedReplyConsumed", "to": false},
+        {"path": "f2s", "unchanged": true}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "SQueuePrepare",
+    "SQueueEarlyCancel",
+    "FConsumePrepareAfterCancel",
+    "FQueueRevoked",
+    "SPrematureRelease"
+  ],
+  "final_all": [
+    {"path": "released", "eq": true},
+    {"path": "schedulerReservation", "eq": false},
+    {"path": "revokedReplyQueued", "eq": true},
+    {"path": "revokedReplyConsumed", "eq": false}
+  ],
+  "harness_steps": [
+    {
+      "after": "FQueueRevoked",
+      "emit": "barrier_revoked_queued_but_not_consumed",
+      "actor": "f-to-s-transport"
+    },
+    {
+      "after": "SPrematureRelease",
+      "emit": "assert_scheduler_released_before_consuming_complete_result",
+      "actor": "scheduler"
+    }
+  ],
+  "metadata": {
+    "module": "AssignmentFenceEarlyCancel",
+    "config": "AssignmentFenceEarlyCancelReleaseMutant.cfg",
+    "mutant": "MutantReleaseOnEnqueue = TRUE"
+  }
+}
