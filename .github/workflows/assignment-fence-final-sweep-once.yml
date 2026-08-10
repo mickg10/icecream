@@ -1,0 +1,209 @@
+name: assignment-fence-final-sweep-once
+
+on:
+  push:
+    branches:
+      - bigoracle/assignment-fence-proof-v4
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: assignment-fence-final-sweep
+  cancel-in-progress: true
+
+jobs:
+  sweep:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      GH_TOKEN: ${{ github.token }}
+      BRANCH: bigoracle/assignment-fence-proof-v4
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bigoracle/assignment-fence-proof-v4
+          fetch-depth: 0
+      - name: Defer until reconciliation, proof search, and proof freeze finish
+        id: readiness
+        run: |
+          blockers=()
+          for path in \
+            .github/workflows/assignment-fence-reconcile-v2-once.yml \
+            .github/workflows/assignment-fence-proof-search-v2-once.yml \
+            .github/workflows/assignment-fence-proof-freeze-once.yml
+          do
+            if test -e "$path"; then blockers+=("$path"); fi
+          done
+          if ! test -f formal/assignment-fence-proof-strategy.json; then
+            blockers+=("formal/assignment-fence-proof-strategy.json")
+          fi
+          if (( ${#blockers[@]} > 0 )); then
+            echo 'ready=false' >> "$GITHUB_OUTPUT"
+            printf 'deferring final sweep; present/missing blockers: %s\n' "${blockers[*]}"
+          else
+            echo 'ready=true' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Remove every remaining write-enabled fence workflow dynamically
+        if: steps.readiness.outputs.ready == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/assignment-fence-final-sweep
+          : > /tmp/assignment-fence-final-sweep/removed-workflows.txt
+
+          while IFS= read -r path; do
+            case "$(basename "$path")" in
+              assignment-fence*.yml|f2s*.yml)
+                if grep -Eq '^\s*contents:\s*write\s*$' "$path"; then
+                  printf '%s\n' "$path" \
+                    >> /tmp/assignment-fence-final-sweep/removed-workflows.txt
+                  rm "$path"
+                fi
+                ;;
+            esac
+          done < <(find .github/workflows -maxdepth 1 -type f -name '*.yml' | sort)
+
+          # The sweep is itself write-enabled and therefore must be in the
+          # removed set. Refuse a no-op or partial sweep.
+          grep -qx '.github/workflows/assignment-fence-final-sweep-once.yml' \
+            /tmp/assignment-fence-final-sweep/removed-workflows.txt
+
+          if grep -R -l -E '^\s*contents:\s*write\s*$' \
+            .github/workflows/assignment-fence*.yml \
+            .github/workflows/f2s*.yml 2>/dev/null; then
+            echo 'write-enabled fence workflow remains after dynamic sweep' >&2
+            exit 1
+          fi
+      - name: Reproduce all formal source inputs after the sweep
+        if: steps.readiness.outputs.ready == 'true'
+        run: |
+          set -euo pipefail
+          python3 formal/apply_assignment_fence_network_quotient.py
+          python3 formal/generate_assignment_fence_admission_modes.py
+          python3 formal/reproduce_assignment_fence_core_proof.py --check
+          python3 formal/assignment_fence_network_quotient_test.py
+          python3 formal/assignment_fence_static_check.py \
+            --manifest formal/assignment-fence-proof-checks-v1.json \
+            --repo . \
+            --formal-dir formal
+          python3 formal/assignment_fence_static_check_test.py
+          python3 formal/f2s_quotient_static_check.py \
+            --manifest formal/f2s-quotient-checks-v1.json \
+            --repo . \
+            --formal-dir formal
+          python3 formal/f2s_quotient_static_check_test.py
+          python3 formal/assignment_fence_premise_coverage_test.py
+          python3 formal/assignment_fence_premise_coverage_test_v2.py
+          python3 formal/assignment_fence_code_inventory_test.py
+          python3 formal/validate_cluster_run_plan_test.py
+          python3 formal/validate_cluster_results_test.py
+          git diff --check
+      - name: Record deterministic final source closure
+        if: steps.readiness.outputs.ready == 'true'
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from __future__ import annotations
+          import hashlib
+          import json
+          import subprocess
+          from pathlib import Path
+
+          def sha(path: Path) -> str:
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          removed = Path('/tmp/assignment-fence-final-sweep/removed-workflows.txt')
+          paths = [
+              Path('formal/AssignmentFenceCore.tla'),
+              Path('formal/AssignmentFenceCoreProof.tla'),
+              Path('formal/AssignmentFenceNetwork.tla'),
+              Path('formal/AssignmentFenceAdmissionModes.tla'),
+              Path('formal/F2SQuotientSimulation.tla'),
+              Path('formal/assignment-fence-proof-checks-v1.json'),
+              Path('formal/f2s-quotient-checks-v1.json'),
+              Path('formal/assignment-fence-proof-strategy.json'),
+              Path('formal/ASSIGNMENT_FENCE_THEORY.md'),
+              Path('formal/REAL_CODEC_AND_MIXED_BINARY_GATE.md'),
+              Path('formal/UPSTREAM_LANDING_PLAN.md'),
+          ]
+          missing = [str(path) for path in paths if not path.is_file()]
+          if missing:
+              raise SystemExit(f'missing final closure files: {missing}')
+          parent = subprocess.run(
+              ['git', 'rev-parse', 'HEAD'],
+              text=True,
+              stdout=subprocess.PIPE,
+              check=True,
+          ).stdout.strip()
+          document = {
+              'schema': 1,
+              'source_parent': parent,
+              'removed_write_workflows': removed.read_text().splitlines(),
+              'files': {str(path): sha(path) for path in paths},
+          }
+          Path('formal/FINAL_FORMAL_SOURCE_FREEZE.json').write_text(
+              json.dumps(document, indent=2, sort_keys=True) + '\n',
+              encoding='utf-8',
+          )
+          Path('/tmp/assignment-fence-final-sweep/source-freeze.json').write_text(
+              json.dumps(document, indent=2, sort_keys=True) + '\n',
+              encoding='utf-8',
+          )
+          PY
+          git diff --check
+      - name: Commit the final read-only source head
+        if: steps.readiness.outputs.ready == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name "mickg10 formal automation"
+          git config user.email "5094033+mickg10@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "formal: freeze read-only assignment-fence source closure"
+          if ! git push origin "HEAD:$BRANCH"; then
+            git fetch origin "$BRANCH"
+            git rebase "origin/$BRANCH"
+            git push origin "HEAD:$BRANCH"
+          fi
+      - name: Archive sweep evidence
+        if: always() && steps.readiness.outputs.ready == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: assignment-fence-final-sweep-${{ github.sha }}
+          path: /tmp/assignment-fence-final-sweep
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Publish sweep blocker
+        if: failure() && steps.readiness.outputs.ready == 'true'
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from __future__ import annotations
+          import json, os, subprocess
+          marker = '<!-- assignment-fence-final-sweep-status -->'
+          body = '\n'.join([
+              marker,
+              'From: mickg10/bigoracle',
+              'To: mickg10/local-oracle, mickg10/implementer',
+              '',
+              '## Final read-only source sweep is RED',
+              '',
+              f"- source head: `{os.environ['GITHUB_SHA']}`",
+              f"- workflow run: `{os.environ['GITHUB_RUN_ID']}`",
+              '',
+              'A write-enabled workflow remained, a generated source failed to reproduce, a static/mutation contract failed, or the freeze commit could not be published. No complete formal result is accepted until a later exact read-only head passes the same-SHA complete gate.'
+          ])
+          repo = os.environ['GITHUB_REPOSITORY']
+          def gh(args, payload=None):
+              return subprocess.run(['gh','api',*args], input=payload, text=True, stdout=subprocess.PIPE, check=True, env=os.environ).stdout
+          comments = json.loads(gh([f'repos/{repo}/issues/4/comments?per_page=100']))
+          old = next((item for item in comments if marker in item.get('body','')), None)
+          payload = json.dumps({'body': body})
+          if old:
+              gh(['--method','PATCH',f"repos/{repo}/issues/comments/{old['id']}",'--input','-'], payload)
+          else:
+              gh(['--method','POST',f'repos/{repo}/issues/4/comments','--input','-'], payload)
+          PY
