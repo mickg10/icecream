@@ -4039,6 +4039,24 @@ static unsigned int scheduler_loss_cleanup_attempts = 0;
    reconnect() then refuses further sessions rather than reuse a generation. */
 static bool scheduler_generation_exhausted = false;
 
+/* G4 (bigoracle 20:13:59/20:32:36): the authority for whether a GetCS-derived
+   (submitter-side) assignment may emit scheduler lifecycle frames -- JobBegin
+   (handle_compile_file), the forwarded JobDone (handle_job_done), and teardown
+   settlement (handle_end).  Ownership is the request's OWN facts: published to S
+   under the CURRENT active generation.  Never inferred from the scheduler
+   pointer, a synthetic client-id job_id, or the connection status.  An
+   unpublished schedulerless fallback compiles locally but emits no scheduler
+   frame for its lifetime; a superseded-generation request is not announced on a
+   reconnected session.  (Worker-side handle_compile_done is NOT governed by
+   this -- it uses worker-assignment ownership.) */
+static bool scheduler_owns_getcs_assignment(const Client *c)
+{
+    return scheduler_session_active
+        && c->getcs_outstanding
+        && c->getcs_published
+        && c->getcs_generation == scheduler_session_generation;
+}
+
 void Daemon::close_scheduler(bool orderly_shutdown)
 {
     if (!scheduler) {
@@ -5020,6 +5038,16 @@ int Daemon::scheduler_get_internals()
 
 int Daemon::scheduler_use_cs(UseCSMsg *msg)
 {
+    /* G4 (bigoracle 20:13:59): a reply during a LOGIN_ATTEMPT is authorized
+       against nothing -- drop the attempt BEFORE any client lookup or
+       terminalization, so no JobDone application frame is emitted on the pending
+       channel.  Not active -> close_scheduler() records no loss token, so there
+       is no established-session cleanup. */
+    if (!scheduler_session_active) {
+        log_warning() << "scheduler_use_cs before session active for client "
+                      << msg->client_id << "; dropping attempt" << endl;
+        return 1;    /* caller closes the pending channel */
+    }
     Client *c = clients.find_by_client_id(msg->client_id);
     trace() << "scheduler_use_cs " << msg->job_id << " " << msg->client_id
             << " " << c << " " << msg->hostname << " " << remote_name <<  endl;
@@ -5032,26 +5060,14 @@ int Daemon::scheduler_use_cs(UseCSMsg *msg)
         return 1;
     }
 
-    /* G4 (bigoracle 18:45 P0): authorize a scheduler reply only for a request
-       this daemon actually PUBLISHED under the CURRENT active generation and
-       that is still awaiting a decision (WAITFORCS).  An unsolicited/pre-active
-       reply, or a stale reply carrying a superseded generation, must never
-       authorize client work. */
-    if (!(scheduler_session_active
-            && c->getcs_published
+    /* G4 (bigoracle 18:45 P0): the session is ACTIVE (checked above); authorize
+       a reply only for a request PUBLISHED under the CURRENT active generation
+       and still awaiting a decision (WAITFORCS).  A stale reply carrying a
+       superseded generation, or one for an unpublished/wrong-phase client, is
+       terminalized by its EXACT job id and never delivered. */
+    if (!(c->getcs_published
             && c->getcs_generation == scheduler_session_generation
             && c->status == Client::WAITFORCS)) {
-        if (!scheduler_session_active) {
-            /* A reply during a LOGIN_ATTEMPT (nothing was published): drop the
-               attempt.  Not active -> close_scheduler() records no loss token,
-               so there is no established-session cleanup. */
-            log_warning() << "scheduler_use_cs before session active for client "
-                          << msg->client_id << "; dropping attempt" << endl;
-            return 1;    /* caller closes the pending channel */
-        }
-        /* ACTIVE but unmatched (superseded generation, unpublished/private, or
-           wrong phase): terminalize the scheduler's assignment by its EXACT job
-           id and never deliver UseCS to the client. */
         log_warning() << "scheduler_use_cs unmatched job " << msg->job_id
                       << " client " << msg->client_id << "; terminalizing" << endl;
         return send_scheduler(JobDoneMsg(msg->job_id, 107, JobDoneMsg::FROM_SUBMITTER, clients.size())) ? 0 : 1;
@@ -5117,6 +5133,13 @@ int Daemon::scheduler_use_cs(UseCSMsg *msg)
 
 int Daemon::scheduler_no_cs(NoCSMsg *msg)
 {
+    /* G4 (bigoracle 20:13:59): drop a pre-active reply before any lookup or
+       terminalization (see scheduler_use_cs). */
+    if (!scheduler_session_active) {
+        log_warning() << "scheduler_no_cs before session active for client "
+                      << msg->client_id << "; dropping attempt" << endl;
+        return 1;
+    }
     Client *c = clients.find_by_client_id(msg->client_id);
     trace() << "scheduler_no_cs " << msg->job_id << " " << msg->client_id
             << " " << c << " " <<  endl;
@@ -5129,18 +5152,12 @@ int Daemon::scheduler_no_cs(NoCSMsg *msg)
         return 1;
     }
 
-    /* G4 (bigoracle 18:45 P0): same reply-authorization gate as
-       scheduler_use_cs -- a NoCS decision must apply only to a request
-       published under the current ACTIVE generation and still awaiting one. */
-    if (!(scheduler_session_active
-            && c->getcs_published
+    /* G4 (bigoracle 18:45 P0): session ACTIVE (above); a NoCS decision applies
+       only to a request published under the CURRENT active generation and still
+       awaiting one; otherwise terminalize by exact job id. */
+    if (!(c->getcs_published
             && c->getcs_generation == scheduler_session_generation
             && c->status == Client::WAITFORCS)) {
-        if (!scheduler_session_active) {
-            log_warning() << "scheduler_no_cs before session active for client "
-                          << msg->client_id << "; dropping attempt" << endl;
-            return 1;
-        }
         log_warning() << "scheduler_no_cs unmatched job " << msg->job_id
                       << " client " << msg->client_id << "; terminalizing" << endl;
         return send_scheduler(JobDoneMsg(msg->job_id, 107, JobDoneMsg::FROM_SUBMITTER, clients.size())) ? 0 : 1;
@@ -5666,6 +5683,13 @@ bool Daemon::handle_job_done(Client *cl, JobDoneMsg *m)
 
     msg->client_count = clients.size();
 
+    /* G4 (20:13:59/20:32:36): the local daemon accounting above always runs;
+       forward the JobDone to S only for a GetCS request owned by the current
+       active session.  An unpublished schedulerless fallback settles locally
+       and emits no scheduler frame. */
+    if (!scheduler_owns_getcs_assignment(cl)) {
+        return true;
+    }
     return send_scheduler(*msg);
 }
 
@@ -5972,10 +5996,15 @@ bool Daemon::handle_compile_file(Client *client, Msg *msg)
     if (client->status == Client::CLIENTWORK) {
         assert(job->environmentVersion() == "__client");
 
-        if (!send_scheduler(JobBeginMsg(job->jobID(), clients.size()))) {
-            trace() << "can't reach scheduler to tell him about compile file job "
-                    << job->jobID() << endl;
-            return false;
+        /* G4 (20:13:59/20:32:36): announce JobBegin to S only for a GetCS request
+           owned by the current active session.  An unpublished schedulerless
+           fallback compiles locally but emits no scheduler frame. */
+        if (scheduler_owns_getcs_assignment(client)) {
+            if (!send_scheduler(JobBeginMsg(job->jobID(), clients.size()))) {
+                trace() << "can't reach scheduler to tell him about compile file job "
+                        << job->jobID() << endl;
+                return false;
+            }
         }
 
         // no scheduler is not an error case!
@@ -6119,8 +6148,19 @@ void Daemon::handle_end(Client *client, int exitcode)
             if( use_client_id ) {
                 msg.set_unknown_job_client_id( client->client_id );
             }
-            if (!send_scheduler(msg)) {
-                trace() << "failed to reach scheduler for remote job done msg!" << endl;
+            /* G4 (20:13:59/20:32:36): a FROM_SUBMITTER settlement is GetCS-derived
+               -- emit it to S only for an assignment owned by the current active
+               session (an unpublished schedulerless fallback or a superseded
+               generation emits nothing).  A FROM_SERVER settlement (TOCOMPILE,
+               worker-side) is governed by worker-assignment ownership, not this
+               predicate, so it is left unchanged. */
+            const bool emit_settlement = (flag == JobDoneMsg::FROM_SUBMITTER)
+                                         ? scheduler_owns_getcs_assignment(client)
+                                         : true;
+            if (emit_settlement) {
+                if (!send_scheduler(msg)) {
+                    trace() << "failed to reach scheduler for remote job done msg!" << endl;
+                }
             }
             /* The settlement for this job id has been issued exactly once;
                a repeated teardown path must not settle it again.  */
@@ -6242,9 +6282,17 @@ bool Daemon::handle_get_cs(Client *client, Msg *msg)
     }
 
     if (!scheduler) {
-        /* now the thing is this: if there is no scheduler
-           there is no point in trying to ask him. So we just
-           redefine this as local job */
+        /* No scheduler -> resolve locally, preserving reply cardinality
+           (G4 20:13:59): count<=1 gets the one synthetic local UseCS; count>1
+           (which one local UseCS cannot satisfy) closes only this client so its
+           own local fallback runs.  Neither emits a scheduler frame. */
+        if (umsg->count > 1) {
+            log_warning() << "client " << client->client_id
+                          << " GetCS count>1 with no scheduler; closing for local fallback"
+                          << endl;
+            handle_end(client, 111);
+            return false;
+        }
         client->usecsmsg = new UseCSMsg(umsg->target, "127.0.0.1", daemon_port,
                                         umsg->client_id, true, 1, 0);
         client->set_status(Client::PENDING_USE_CS, "handle_get_cs: scheduler missing, local compile");
