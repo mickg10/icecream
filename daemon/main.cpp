@@ -4019,11 +4019,13 @@ void Daemon::close_scheduler()
         next_scheduler_connect = time(nullptr) + 3;
 }
 
-/* G4: which session generation's loss has already been settled, and a
-   test-visible count of exactly-once cleanups.  Sentinel ~0ULL never matches a
-   real generation, so the first loss of each session settles exactly once. */
-static uint64_t scheduler_loss_settled_generation = ~0ULL;
-static unsigned int scheduler_loss_cleanups = 0;
+/* G4: whether a session generation's loss has already been settled this run
+   (an explicit validity bit -- a uint64 generation can legitimately equal any
+   value, including ~0ULL after wrap, so no numeric sentinel is safe), the
+   generation it was settled for, and a test-visible count of settle attempts. */
+static bool scheduler_loss_settled_valid = false;
+static uint64_t scheduler_loss_settled_generation = 0;
+static unsigned int scheduler_loss_cleanup_attempts = 0;
 
 /* G4: the single, exactly-once cleanup for the loss of an ESTABLISHED
    scheduler session.  Every answer_client_requests() boundary that may have
@@ -4042,11 +4044,13 @@ bool Daemon::finish_scheduler_loss_if_needed(bool had_scheduler, uint64_t turn_g
     if (!had_scheduler || scheduler) {
         return false;                    /* no established-session loss */
     }
-    if (scheduler_loss_settled_generation == turn_generation) {
+    if (scheduler_loss_settled_valid
+            && scheduler_loss_settled_generation == turn_generation) {
         return true;                     /* already settled this generation */
     }
-    scheduler_loss_settled_generation = turn_generation;   /* settle BEFORE cleanup */
-    ++scheduler_loss_cleanups;                             /* exactly-once, test-visible */
+    scheduler_loss_settled_valid = true;                   /* settle BEFORE cleanup */
+    scheduler_loss_settled_generation = turn_generation;
+    ++scheduler_loss_cleanup_attempts;                     /* exactly-once, test-visible */
     clear_children();
     return true;
 }
@@ -4291,6 +4295,12 @@ string Daemon::dump_internals() const
                  fsession_compilers_quiesced, fsession_kill_escalations,
                  fsession_unowned_residue, child_ownership_failed ? 1 : 0,
                  (unsigned long long)scheduler_session_generation);
+        result += handoff;
+        snprintf(handoff, sizeof(handoff),
+                 "  Scheduler loss: settled_valid=%d settled_gen=%llu cleanup_attempts=%u\n",
+                 scheduler_loss_settled_valid ? 1 : 0,
+                 (unsigned long long)scheduler_loss_settled_generation,
+                 scheduler_loss_cleanup_attempts);
         result += handoff;
         for (std::map<pid_t, ChildRecord>::const_iterator cit = child_registry.begin();
                 cit != child_registry.end(); ++cit) {
@@ -6313,8 +6323,28 @@ void Daemon::answer_client_requests()
         /* when the remote host is full with work, the wait time for it to free up and
            fork a child to compile could be long. If the input is ready to read, we will read
            them and save it for the child; otherwise the write on the client side would be blocked */
-        if ( current_status == Client::TOCOMPILE ||
-             (!ignore_channel && (!c->has_msg() || handle_activity(client)))) {
+        bool select_channel = (current_status == Client::TOCOMPILE);
+        if (!select_channel && !ignore_channel) {
+            if (!c->has_msg()) {
+                select_channel = true;
+            } else {
+                /* Process the buffered message now.  G4: that handler can send
+                   to S and close the session -- check loss before any later
+                   client or poll-set work, and never dereference a client the
+                   handler deleted. */
+                const bool alive = handle_activity(client);
+                if (finish_scheduler_loss_if_needed(had_scheduler, turn_generation)) {
+                    return;
+                }
+                if (!alive) {
+                    continue;   /* client was deleted by the handler */
+                }
+                current_status = client->status;   /* survived: recompute eligibility */
+                select_channel = true;
+            }
+        }
+
+        if (select_channel) {
             pfd.fd = i;
             pfd.events = POLLIN;
             pollfds.push_back(pfd);
