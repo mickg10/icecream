@@ -499,6 +499,7 @@ public:
         getcs_published = false;
         getcs_outstanding = false;
         getcs_generation = 0;
+        local_owner_generation = 0;
         client_id = 0;
         niceness = 0;
         status = UNKNOWN;
@@ -581,6 +582,7 @@ public:
     bool getcs_published;       // G4 (17:20#1): true only once a GetCS for this client has been sent to S (which then owns it by client_id); a held request is PRIVATE until then
     bool getcs_outstanding;     // G4 (bigoracle 18:45 P0): a GetCS occupies this client from accept until client destruction; a second GetCS in ANY non-terminal state is rejected (not just while WAITFORCS)
     uint64_t getcs_generation;  // G4 (bigoracle 18:45 P0): the session generation the request was published under (0 = unpublished); a scheduler reply is honored only when it matches the current ACTIVE generation
+    uint64_t local_owner_generation;  // G4 (18:21): session generation that owns a started LOCAL assignment (0 = UNOWNED_LOCAL, started during LOGIN_ATTEMPT/offline); only an ACTIVE_SESSION(g)-owned job emits JobLocalBegin/JobLocalDone to S
     CompileJob *job;
     int client_id;
     uint32_t niceness; // nice priority (0-20), for PENDING_USE_CS
@@ -5672,12 +5674,12 @@ void Daemon::handle_old_request()
     const unsigned int compile_limit = std::max((unsigned int)1, max_kids);
     const unsigned int preprocess_limit = std::max((unsigned int)1, max_preprocess_kids);
 
-    /* G4: during LOGIN_ATTEMPT the session is not committed -- hold
-       scheduler-bound client work until ConfCS.  (When there is no scheduler
-       at all, this is false and offline local scheduling proceeds normally.) */
-    if (scheduler_login_pending && !scheduler_session_active) {
-        return;
-    }
+    /* G4 (18:21): a LOGIN_ATTEMPT no longer freezes the local lane.  The
+       schedulerless local lanes (LINKJOB / PENDING_USE_CS below) run during the
+       attempt; only SCHEDULER-owned emission is gated -- a held GetCS is
+       re-driven only once ACTIVE (below), and a local job started before the
+       session activates is tagged UNOWNED_LOCAL so it never emits JobLocalBegin/
+       JobLocalDone to S (a later ConfCS must not retroactively announce it). */
     /* Re-drive any GetCS held during a prior LOGIN_ATTEMPT now that the session
        is active. */
     if (scheduler_session_active) {
@@ -5792,6 +5794,11 @@ void Daemon::handle_old_request()
                 handle_end(client, 112);
             } else {
                 client->set_status(Client::CLIENTWORK, "handle_old_request: local job started");
+                /* G4 (18:21): tag ownership at start -- ACTIVE -> owned by the
+                   current generation (announced to S below); LOGIN_ATTEMPT or
+                   offline -> UNOWNED_LOCAL (0), never announced to S. */
+                client->local_owner_generation =
+                    scheduler_session_active ? scheduler_session_generation : 0;
                 if (preprocess_job) {
                     client->running_preprocess = true;
                     ++preprocess_active_processes;
@@ -5806,11 +5813,16 @@ void Daemon::handle_old_request()
                     clients.active_processes++;
                     trace() << "pushed local job " << client->client_id << endl;
                 }
-                if (!send_scheduler(JobLocalBeginMsg(client->client_id, client->outfile,
-                        client->fulljob, client->local_reason, client->command_line,
-                        preprocess_job ? JobLocalBeginMsg::LocalFlagPreprocessOnly
-                                       : JobLocalBeginMsg::LocalFlagNone))) {
-                    return;
+                /* G4 (18:21): announce to S only for an ACTIVE-owned local job;
+                   an UNOWNED_LOCAL job runs locally but emits no scheduler frame. */
+                if (scheduler_session_active
+                        && client->local_owner_generation == scheduler_session_generation) {
+                    if (!send_scheduler(JobLocalBeginMsg(client->client_id, client->outfile,
+                            client->fulljob, client->local_reason, client->command_line,
+                            preprocess_job ? JobLocalBeginMsg::LocalFlagPreprocessOnly
+                                           : JobLocalBeginMsg::LocalFlagNone))) {
+                        return;
+                    }
                 }
             }
 
@@ -6115,10 +6127,16 @@ void Daemon::handle_end(Client *client, int exitcode)
             client->job_id = 0;
         } else if (client->status == Client::CLIENTWORK) {
             // Clientwork && !job_id == LINK
-            trace() << "scheduler->send_msg( JobLocalDoneMsg( " << client->client_id << ") );\n";
-
-            if (!send_scheduler(JobLocalDoneMsg(client->client_id))) {
-                trace() << "failed to reach scheduler for local job done msg!" << endl;
+            /* G4 (18:21): announce completion to S only if this local job was
+               owned by the CURRENT active session.  An UNOWNED_LOCAL job (started
+               during a LOGIN_ATTEMPT/offline) or one owned by a superseded
+               generation emits no JobLocalDone -- S was never told it began. */
+            if (scheduler_session_active
+                    && client->local_owner_generation == scheduler_session_generation) {
+                trace() << "scheduler->send_msg( JobLocalDoneMsg( " << client->client_id << ") );\n";
+                if (!send_scheduler(JobLocalDoneMsg(client->client_id))) {
+                    trace() << "failed to reach scheduler for local job done msg!" << endl;
+                }
             }
         }
     }
