@@ -4003,6 +4003,13 @@ bool Daemon::reannounce_environments()
     return send_scheduler(lmsg);
 }
 
+/* G4 session activation (bigoracle 15:07): a non-null `scheduler` channel is
+   only a LOGIN_ATTEMPT.  The session is ACTIVE -- owned, generation committed --
+   only after the first ConfCS is consumed (handle_cs_conf).  A channel loss
+   before ConfCS is NOT an established-session loss. */
+static bool scheduler_session_active = false;
+static bool scheduler_login_pending = false;
+
 void Daemon::close_scheduler()
 {
     if (!scheduler) {
@@ -4011,6 +4018,8 @@ void Daemon::close_scheduler()
 
     delete scheduler;
     scheduler = nullptr;
+    scheduler_session_active = false;
+    scheduler_login_pending = false;
     delete discover;
     discover = nullptr;
     next_scheduler_connect = time(nullptr) + 20 + (rand() & 31);
@@ -6076,6 +6085,15 @@ int Daemon::handle_cs_conf(ConfCSMsg *msg)
 {
     max_scheduler_pong = msg->max_scheduler_pong;
     max_scheduler_ping = msg->max_scheduler_ping;
+    /* G4 activation point: the first ConfCS for the pending Login commits the
+       session generation and marks it ACTIVE -- exactly once.  A duplicate or
+       unsolicited ConfCS (no pending Login, or already active) is ignored and
+       creates no second generation. */
+    if (scheduler_login_pending && !scheduler_session_active) {
+        ++scheduler_session_generation;
+        scheduler_session_active = true;
+        scheduler_login_pending = false;
+    }
     return 0;
 }
 
@@ -6238,11 +6256,11 @@ void Daemon::answer_client_requests()
     /* G4: capture established-session liveness and its generation once; any
        boundary in this turn that loses the session funnels through the single
        exactly-once finish_scheduler_loss_if_needed(). */
-    const bool had_scheduler = (scheduler != nullptr);
+    const bool had_active_session = scheduler_session_active;
     const uint64_t turn_generation = scheduler_session_generation;
 
     handle_old_request();
-    if (finish_scheduler_loss_if_needed(had_scheduler, turn_generation)) {
+    if (finish_scheduler_loss_if_needed(had_active_session, turn_generation)) {
         return;
     }
 
@@ -6250,7 +6268,7 @@ void Daemon::answer_client_requests()
     if (scheduler) {
         maybe_stats();
     }
-    if (finish_scheduler_loss_if_needed(had_scheduler, turn_generation)) {
+    if (finish_scheduler_loss_if_needed(had_active_session, turn_generation)) {
         return;    /* a STATS send can close the established session */
     }
 
@@ -6333,7 +6351,7 @@ void Daemon::answer_client_requests()
                    client or poll-set work, and never dereference a client the
                    handler deleted. */
                 const bool alive = handle_activity(client);
-                if (finish_scheduler_loss_if_needed(had_scheduler, turn_generation)) {
+                if (finish_scheduler_loss_if_needed(had_active_session, turn_generation)) {
                     return;
                 }
                 if (!alive) {
@@ -6416,7 +6434,7 @@ void Daemon::answer_client_requests()
     if (ret < 0 && errno != EINTR) {
         log_perror("poll");
         close_scheduler();
-        finish_scheduler_loss_if_needed(had_scheduler, turn_generation);
+        finish_scheduler_loss_if_needed(had_active_session, turn_generation);
         return;
     }
     // Reset debug if needed, but only if we aren't waiting for any child processes to finish,
@@ -6441,7 +6459,7 @@ void Daemon::answer_client_requests()
                 if (!msg) {
                     log_warning() << "scheduler closed connection" << endl;
                     close_scheduler();
-                    finish_scheduler_loss_if_needed(had_scheduler, turn_generation);
+                    finish_scheduler_loss_if_needed(had_active_session, turn_generation);
                     return;
                 }
 
@@ -6476,7 +6494,7 @@ void Daemon::answer_client_requests()
 
                 if (ret) {
                     close_scheduler();
-                    finish_scheduler_loss_if_needed(had_scheduler, turn_generation);
+                    finish_scheduler_loss_if_needed(had_active_session, turn_generation);
                     return;
                 }
             }
@@ -6486,7 +6504,7 @@ void Daemon::answer_client_requests()
            may have lost the session.  Do not process web/listener/client/
            child/env readiness from this same poll snapshot against a dead
            session -- funnel to the single cleanup and leave the turn. */
-        if (finish_scheduler_loss_if_needed(had_scheduler, turn_generation)) {
+        if (finish_scheduler_loss_if_needed(had_active_session, turn_generation)) {
             return;
         }
 
@@ -6568,7 +6586,7 @@ void Daemon::answer_client_requests()
                         && client->pipe_from_child >= 0
                         && pollfd_is_set(pollfds, client->pipe_from_child, POLLIN)) {
                     if (!handle_compile_done(client)) {
-                        finish_scheduler_loss_if_needed(had_scheduler, turn_generation);
+                        finish_scheduler_loss_if_needed(had_active_session, turn_generation);
                         return;
                     }
                 }
@@ -6576,7 +6594,7 @@ void Daemon::answer_client_requests()
                         && client->pipe_from_child >= 0
                         && pollfd_is_set(pollfds, client->pipe_from_child, POLLIN)) {
                     if (!handle_env_install_child_done(client)) {
-                        finish_scheduler_loss_if_needed(had_scheduler, turn_generation);
+                        finish_scheduler_loss_if_needed(had_active_session, turn_generation);
                         return;
                     }
                 }
@@ -6605,7 +6623,7 @@ void Daemon::answer_client_requests()
                         }
                     }
                 }
-                if (finish_scheduler_loss_if_needed(had_scheduler, turn_generation)) {
+                if (finish_scheduler_loss_if_needed(had_active_session, turn_generation)) {
                     return;    /* a per-client handler closed the established session */
                 }
             }
@@ -6623,7 +6641,7 @@ void Daemon::answer_client_requests()
             }
         }
 
-        if (finish_scheduler_loss_if_needed(had_scheduler, turn_generation)) {
+        if (finish_scheduler_loss_if_needed(had_active_session, turn_generation)) {
             return;
         }
 
@@ -6669,7 +6687,10 @@ bool Daemon::reconnect()
 
     delete discover;
     discover = nullptr;
-    ++scheduler_session_generation;
+    /* G4: channel acquired -> LOGIN_ATTEMPT.  Do NOT commit the session
+       generation or ownership here; that happens on the first ConfCS. */
+    scheduler_login_pending = true;
+    scheduler_session_active = false;
     sockaddr_in name;
     socklen_t len = sizeof(name);
     int error = getsockname(scheduler->fd, (struct sockaddr*)&name, &len);
