@@ -1,0 +1,178 @@
+name: assignment-fence-proof-freeze-once
+
+on:
+  push:
+    branches:
+      - bigoracle/assignment-fence-proof-v4
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: assignment-fence-proof-freeze
+  cancel-in-progress: true
+
+jobs:
+  freeze:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      GH_TOKEN: ${{ github.token }}
+      BRANCH: bigoracle/assignment-fence-proof-v4
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bigoracle/assignment-fence-proof-v4
+          fetch-depth: 0
+      - name: Defer until reconciliation and proof search have completed
+        id: readiness
+        run: |
+          blockers=()
+          for path in \
+            .github/workflows/assignment-fence-reconcile-v2-once.yml \
+            .github/workflows/assignment-fence-proof-search-v2-once.yml
+          do
+            if test -e "$path"; then blockers+=("$path"); fi
+          done
+          if (( ${#blockers[@]} > 0 )); then
+            echo 'ready=false' >> "$GITHUB_OUTPUT"
+            printf 'deferring proof freeze; present: %s\n' "${blockers[*]}"
+          else
+            echo 'ready=true' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Identify the exact reproducible proof decomposition
+        if: steps.readiness.outputs.ready == 'true'
+        id: strategy
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/assignment-fence-proof-freeze
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          from pathlib import Path
+
+          import sys
+          sys.path.insert(0, 'formal')
+          import generate_assignment_fence_core_proof_v2 as action
+          import generate_assignment_fence_core_proof_candidates as candidates
+
+          canonical_path = Path('formal/AssignmentFenceCoreProof.tla')
+          canonical = canonical_path.read_text(encoding='utf-8')
+
+          def normalized(text: str) -> str:
+              result, count = re.subn(
+                  r'(?m)^-+ MODULE [A-Za-z_][A-Za-z0-9_]* -+$',
+                  '-------------------- MODULE AssignmentFenceCoreProof --------------------',
+                  text,
+                  count=1,
+              )
+              if count != 1:
+                  raise SystemExit('candidate has no module header')
+              return result
+
+          generated = {
+              'action': action.generated_text(),
+              'conjunct-smt': normalized(candidates.generate_conjunct_candidate('conjunct-smt')),
+              'conjunct-zenon': normalized(candidates.generate_conjunct_candidate('conjunct-zenon')),
+              'conjunct-smt-zenon': normalized(candidates.generate_conjunct_candidate('conjunct-smt-zenon')),
+          }
+          matches = [name for name, text in generated.items() if text == canonical]
+          if len(matches) != 1:
+              raise SystemExit(f'canonical proof matches {matches}; expected exactly one strategy')
+          strategy = matches[0]
+
+          def sha(path: Path) -> str:
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          document = {
+              'schema': 1,
+              'strategy': strategy,
+              'theorem': 'SpecImpliesCoreInvariant',
+              'model': 'AssignmentFenceCore.tla',
+              'model_sha256': sha(Path('formal/AssignmentFenceCore.tla')),
+              'proof': 'AssignmentFenceCoreProof.tla',
+              'proof_sha256': sha(canonical_path),
+              'generators': {
+                  'action': sha(Path('formal/generate_assignment_fence_core_proof_v2.py')),
+                  'conjunct': sha(Path('formal/generate_assignment_fence_core_proof_candidates.py')),
+                  'reproducer': sha(Path('formal/reproduce_assignment_fence_core_proof.py')),
+              },
+          }
+          Path('formal/assignment-fence-proof-strategy.json').write_text(
+              json.dumps(document, indent=2) + '\n', encoding='utf-8'
+          )
+          Path('/tmp/assignment-fence-proof-freeze/strategy.json').write_text(
+              json.dumps(document, indent=2) + '\n', encoding='utf-8'
+          )
+          print(strategy)
+          PY
+          python3 formal/reproduce_assignment_fence_core_proof.py --check
+          strategy=$(python3 -c 'import json; print(json.load(open("formal/assignment-fence-proof-strategy.json"))["strategy"])')
+          echo "strategy=$strategy" >> "$GITHUB_OUTPUT"
+      - name: Remove superseded formal executors and freeze strategy
+        if: steps.readiness.outputs.ready == 'true'
+        run: |
+          set -euo pipefail
+          rm -f \
+            .github/workflows/assignment-fence-final-head-gate.yml \
+            .github/workflows/assignment-fence-focused-runner.yml \
+            .github/workflows/assignment-fence-focused-runner-v2.yml \
+            .github/workflows/assignment-fence-proof-gate.yml \
+            .github/workflows/assignment-fence-proof-execute.yml \
+            .github/workflows/assignment-fence-proof-v4.yml \
+            .github/workflows/assignment-fence-proof-freeze-once.yml
+          git config user.name "mickg10 formal automation"
+          git config user.email "5094033+mickg10@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "formal: freeze reproducible TLAPS proof strategy ${{ steps.strategy.outputs.strategy }}"
+          if ! git push origin "HEAD:$BRANCH"; then
+            git fetch origin "$BRANCH"
+            git rebase "origin/$BRANCH"
+            git push origin "HEAD:$BRANCH"
+          fi
+      - name: Archive strategy evidence
+        if: always() && steps.readiness.outputs.ready == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: assignment-fence-proof-freeze-${{ github.sha }}
+          path: /tmp/assignment-fence-proof-freeze
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Publish proof-freeze blocker
+        if: failure() && steps.readiness.outputs.ready == 'true'
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from __future__ import annotations
+          import json, os, subprocess
+          marker = '<!-- assignment-fence-proof-freeze-status -->'
+          body = '\n'.join([
+              marker,
+              'From: mickg10/bigoracle',
+              'To: mickg10/local-oracle, mickg10/implementer',
+              '',
+              '## Reproducible proof-strategy freeze is RED',
+              '',
+              f"- exact head: `{os.environ['GITHUB_SHA']}`",
+              f"- workflow run: `{os.environ['GITHUB_RUN_ID']}`",
+              '',
+              'The canonical proof did not match exactly one committed generator strategy, or branch cleanup could not be committed. No proof result is accepted until this identity check is green.'
+          ])
+          repo = os.environ['GITHUB_REPOSITORY']
+          def gh(args, payload=None):
+              return subprocess.run(['gh','api',*args], input=payload, text=True, stdout=subprocess.PIPE, check=True, env=os.environ).stdout
+          comments = json.loads(gh([f'repos/{repo}/issues/4/comments?per_page=100']))
+          old = next((item for item in comments if marker in item.get('body','')), None)
+          payload = json.dumps({'body': body})
+          if old:
+              gh(['--method','PATCH',f"repos/{repo}/issues/comments/{old['id']}",'--input','-'], payload)
+          else:
+              gh(['--method','POST',f'repos/{repo}/issues/4/comments','--input','-'], payload)
+          PY
