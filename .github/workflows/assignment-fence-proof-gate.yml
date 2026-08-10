@@ -1,0 +1,344 @@
+name: assignment-fence-proof-gate
+
+on:
+  pull_request:
+    paths:
+      - "formal/**"
+      - ".github/workflows/assignment-fence-proof-gate.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  issues: write
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+  TLC_174_SHA256: "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
+  TLC_180_SHA256: "e22f8ffb4bacdea0a871f444dd94fe5fb0d8013b3388ae39e82e26f852c735d5"
+
+jobs:
+  static:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Finite quotient and generation-4 runner preflight
+        run: |
+          set -euo pipefail
+          test ! -e .github/workflows/assignment-fence-quotient-once.yml
+          python3 formal/assignment_fence_network_quotient_test.py
+          python3 formal/trace_to_harness_test.py
+          python3 formal/tlc_text_trace_test.py
+          python3 formal/normalize_tlc_trace_test.py
+          python3 formal/run_formal_checks_v4_test.py
+          python3 formal/run_tlc_only_checks_v4_test.py
+          if test -f formal/tla_primed_assignment_lint_test.py; then
+            python3 formal/tla_primed_assignment_lint_test.py
+          fi
+          test -z "$(git status --porcelain --untracked-files=all)"
+
+  finite-network:
+    needs: static
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install Java and execution tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openjdk-17-jre-headless time curl
+      - name: Download and verify both pinned TLC distributions
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 4 --retry-all-errors \
+            -o /tmp/tla2tools-1.7.4.jar \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+          curl --fail --location --retry 4 --retry-all-errors \
+            -o /tmp/tla2tools-1.8.0.jar \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
+          printf '%s  %s\n' "$TLC_174_SHA256" /tmp/tla2tools-1.7.4.jar | sha256sum -c -
+          printf '%s  %s\n' "$TLC_180_SHA256" /tmp/tla2tools-1.8.0.jar | sha256sum -c -
+          java -version 2>&1 | tee /tmp/java-version.txt
+      - name: Exhaust fixed network on both TLC distributions
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/assignment-fence-network
+          cd formal
+          for entry in \
+            stable:/tmp/tla2tools-1.7.4.jar \
+            differential:/tmp/tla2tools-1.8.0.jar
+          do
+            name=${entry%%:*}
+            jar=${entry#*:}
+            log="/tmp/assignment-fence-network/${name}.log"
+            timing="/tmp/assignment-fence-network/${name}.time"
+            command="/tmp/assignment-fence-network/${name}.command"
+            printf '%q ' \
+              java -XX:+UseParallelGC -jar "$jar" -workers 1 \
+              -config AssignmentFenceNetwork.cfg AssignmentFenceNetwork \
+              > "$command"
+            printf '\n' >> "$command"
+            set +e
+            /usr/bin/time -v -o "$timing" \
+              timeout --signal=TERM --kill-after=15s 75m \
+              java -XX:+UseParallelGC -jar "$jar" \
+                -workers 1 \
+                -config AssignmentFenceNetwork.cfg \
+                AssignmentFenceNetwork \
+              >"$log" 2>&1
+            rc=$?
+            set -e
+            printf '%s\n' "$rc" > "/tmp/assignment-fence-network/${name}.exit"
+            cat "$log"
+            cat "$timing"
+            test "$rc" -eq 0
+            grep -Eq 'Model checking completed|No error has been found' "$log"
+            grep -Eq '[1-9][0-9,]* states generated' "$log"
+            grep -Eq '[1-9][0-9,]* distinct states found' "$log"
+          done
+      - name: Archive finite-network evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: assignment-fence-finite-network-${{ github.sha }}
+          path: |
+            /tmp/assignment-fence-network
+            /tmp/java-version.txt
+          if-no-files-found: error
+          retention-days: 30
+
+  tlaps-core:
+    needs: static
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install TLAPS runtime prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl jq time libgmp10
+      - name: Resolve, verify, and install official TLAPS 1.5.0 asset
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/assignment-fence-tlaps /tmp/tlaps
+          curl --fail --location --retry 4 --retry-all-errors \
+            -o /tmp/tlapm-release.json \
+            https://api.github.com/repos/tlaplus/tlapm/releases/tags/v1.5.0
+          python3 - <<'PY' >/tmp/tlapm-asset.env
+          import json
+          from pathlib import Path
+
+          release = json.loads(Path('/tmp/tlapm-release.json').read_text())
+          assets = [
+              asset for asset in release.get('assets', [])
+              if asset.get('name', '').lower().endswith('x86_64-linux-gnu-inst.bin')
+          ]
+          if len(assets) != 1:
+              raise SystemExit(
+                  f"expected one x86_64 Linux installer, found "
+                  f"{[asset.get('name') for asset in assets]}"
+              )
+          asset = assets[0]
+          print(f"TLAPS_ASSET_URL={asset['browser_download_url']}")
+          print(f"TLAPS_ASSET_NAME={asset['name']}")
+          print(f"TLAPS_ASSET_DIGEST={asset.get('digest') or ''}")
+          PY
+          source /tmp/tlapm-asset.env
+          printf '%s\n' "$TLAPS_ASSET_NAME" | tee /tmp/assignment-fence-tlaps/asset-name.txt
+          printf '%s\n' "$TLAPS_ASSET_DIGEST" | tee /tmp/assignment-fence-tlaps/asset-digest.txt
+          curl --fail --location --retry 4 --retry-all-errors \
+            -o /tmp/tlaps-installer.bin "$TLAPS_ASSET_URL"
+          actual="sha256:$(sha256sum /tmp/tlaps-installer.bin | awk '{print $1}')"
+          printf '%s\n' "$actual" | tee /tmp/assignment-fence-tlaps/installer-digest.txt
+          if test -n "$TLAPS_ASSET_DIGEST"; then
+            test "$actual" = "$TLAPS_ASSET_DIGEST"
+          fi
+          chmod +x /tmp/tlaps-installer.bin
+          /tmp/tlaps-installer.bin -d /tmp/tlaps \
+            > /tmp/assignment-fence-tlaps/install.log 2>&1
+          TLAPM=$(find /tmp/tlaps -type f -name tlapm -perm -111 | head -n 1)
+          test -n "$TLAPM"
+          printf '%s\n' "$TLAPM" > /tmp/assignment-fence-tlaps/tlapm-path.txt
+          "$TLAPM" --version \
+            > /tmp/assignment-fence-tlaps/version.txt 2>&1 || \
+          "$TLAPM" -v \
+            > /tmp/assignment-fence-tlaps/version.txt 2>&1 || true
+          cat /tmp/assignment-fence-tlaps/version.txt
+      - name: Prove unbounded ownership and identity core
+        run: |
+          set -euo pipefail
+          TLAPM=$(cat /tmp/assignment-fence-tlaps/tlapm-path.txt)
+          backend_bin=$(find /tmp/tlaps -type f \( -name zenon -o -name z3 -o -name cvc4 -o -name cvc5 \) -printf '%h\n' | head -n 1)
+          if test -n "$backend_bin"; then
+            export PATH="$backend_bin:$PATH"
+          fi
+          set +e
+          /usr/bin/time -v -o /tmp/assignment-fence-tlaps/time.txt \
+            "$TLAPM" formal/AssignmentFenceCoreProof.tla \
+            > /tmp/assignment-fence-tlaps/tlapm.log 2>&1
+          rc=$?
+          set -e
+          cat /tmp/assignment-fence-tlaps/tlapm.log
+          cat /tmp/assignment-fence-tlaps/time.txt
+          printf '%s\n' "$rc" > /tmp/assignment-fence-tlaps/exit.txt
+          test "$rc" -eq 0
+          if grep -Eqi 'failed|unproved|error' /tmp/assignment-fence-tlaps/tlapm.log; then
+            grep -Eqi '0 (failed|unproved)|All obligations proved|success' \
+              /tmp/assignment-fence-tlaps/tlapm.log
+          fi
+      - name: Archive TLAPS evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: assignment-fence-tlaps-${{ github.sha }}
+          path: /tmp/assignment-fence-tlaps
+          if-no-files-found: error
+          retention-days: 30
+
+  publish-status:
+    if: always()
+    needs: [static, finite-network, tlaps-core]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      STATIC_RESULT: ${{ needs.static.result }}
+      NETWORK_RESULT: ${{ needs.finite-network.result }}
+      TLAPS_RESULT: ${{ needs.tlaps-core.result }}
+    steps:
+      - name: Download retained evidence for first-failure excerpt
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          path: /tmp/proof-evidence
+      - name: Publish exact process status to issue 4
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          run_id = os.environ["GITHUB_RUN_ID"]
+          sha = os.environ["GITHUB_SHA"]
+          marker = "<!-- assignment-fence-proof-status -->"
+
+          def gh(*args: str, input_text: str | None = None) -> str:
+              completed = subprocess.run(
+                  ["gh", "api", *args],
+                  input=input_text,
+                  text=True,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  check=True,
+              )
+              return completed.stdout
+
+          artifacts = json.loads(
+              gh(f"repos/{repo}/actions/runs/{run_id}/artifacts?per_page=100")
+          ).get("artifacts", [])
+
+          evidence_root = Path("/tmp/proof-evidence")
+          candidates = sorted(evidence_root.rglob("tlapm.log"))
+          candidates += sorted(evidence_root.rglob("stable.log"))
+          candidates += sorted(evidence_root.rglob("differential.log"))
+          excerpt = ""
+          for path in candidates:
+              lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+              selected = [
+                  line for line in lines
+                  if any(
+                      token in line.lower()
+                      for token in (
+                          "failed",
+                          "unproved",
+                          "error",
+                          "successor state",
+                          "timeout",
+                          "states generated",
+                          "distinct states",
+                      )
+                  )
+              ]
+              if selected:
+                  excerpt = f"{path.name}:\n" + "\n".join(selected[:80])
+                  break
+          if len(excerpt) > 7000:
+              excerpt = excerpt[:7000] + "\n[excerpt truncated]"
+
+          artifact_lines = []
+          for artifact in artifacts:
+              artifact_lines.append(
+                  f"- `{artifact.get('name')}` — id `{artifact.get('id')}`, "
+                  f"digest `{artifact.get('digest') or 'unavailable'}`"
+              )
+          if not artifact_lines:
+              artifact_lines = ["- NONE"]
+
+          body = "\n".join(
+              [
+                  marker,
+                  "From: mickg10/bigoracle",
+                  "To: mickg10/local-oracle, mickg10/implementer",
+                  "",
+                  "## Automated assignment-fence proof-gate status",
+                  "",
+                  f"- exact head: `{sha}`",
+                  f"- workflow run: `{run_id}`",
+                  f"- static/preflight: **{os.environ['STATIC_RESULT']}**",
+                  f"- finite dual-TLC network: **{os.environ['NETWORK_RESULT']}**",
+                  f"- TLAPS ownership core: **{os.environ['TLAPS_RESULT']}**",
+                  "",
+                  "### Retained artifacts",
+                  "",
+                  *artifact_lines,
+                  "",
+                  "### First diagnostic excerpt",
+                  "",
+                  "```text",
+                  excerpt or "No retained failure excerpt was available.",
+                  "```",
+                  "",
+                  "This is process and artifact status only. Acceptance still requires "
+                  "exhaustive nonzero TLC state counts on both pinned distributions, "
+                  "all TLAPS obligations proved, clean exact-SHA execution, and the "
+                  "named witness/mutant trace contracts.",
+              ]
+          )
+
+          comments = json.loads(gh(f"repos/{repo}/issues/4/comments?per_page=100"))
+          existing = next(
+              (comment for comment in comments if marker in comment.get("body", "")),
+              None,
+          )
+          payload = json.dumps({"body": body})
+          if existing is None:
+              gh(
+                  "--method",
+                  "POST",
+                  f"repos/{repo}/issues/4/comments",
+                  "--input",
+                  "-",
+                  input_text=payload,
+              )
+          else:
+              gh(
+                  "--method",
+                  "PATCH",
+                  f"repos/{repo}/issues/comments/{existing['id']}",
+                  "--input",
+                  "-",
+                  input_text=payload,
+              )
+          PY
