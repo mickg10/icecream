@@ -487,6 +487,12 @@ static unsigned long prelogin_expired_total = 0;
 static unsigned long prelogin_rejected_total = 0;
 static unsigned long prelogin_completed_total = 0;
 static unsigned long accepts_deferred_total = 0;
+/* G4 teardown race (bigoracle 21:47 / local-oracle 21:50): exact JobDones that
+   arrive after the job was already removed by the winning side of a worker/
+   submitter completion race.  Counted and ignored (return true) so the drain
+   keeps consuming buffered frames; an absent job's state cannot change. */
+static unsigned long late_submitter_terminal_ignores = 0;
+static unsigned long late_worker_terminal_ignores = 0;
 /* Set when an accept quantum was exhausted with connections still
    pending: the next poll uses a zero timeout so the listener is
    re-serviced after one full scheduler turn.  */
@@ -2868,8 +2874,24 @@ static bool handle_job_done(CompileServer *cs, Msg *_m)
     }
 
     if (!j) {
-        trace() << "job ID not present " << m->job_id << endl;
-        return false;
+        /* G4 teardown race (bigoracle 21:47 / local-oracle 21:50): an exact
+           JobDone can arrive after the job was already removed by the winning
+           side of a worker/submitter completion race.  drain_connection()
+           treats a false return as "connection deleted" and stops draining,
+           stranding later frames already buffered on a live channel with no new
+           readiness edge.  The job is absent, so neither late origin can change
+           job state -- count it and return true so the drain continues.
+           (Unknown-client cancellation kept its own separate sweep above; a
+           delayed 32-bit terminal after id reuse is a p50 assignment-key
+           concern, orthogonal to absent-job idempotence.) */
+        if (m->is_from_server()) {
+            ++late_worker_terminal_ignores;
+        } else {
+            ++late_submitter_terminal_ignores;
+        }
+        trace() << "late terminal for absent job " << m->job_id
+                << " ignored (from_server=" << (m->is_from_server() ? 1 : 0) << ")" << endl;
+        return true;
     }
 
     /* Centralized, phase- and origin-sensitive terminal authority.  The
@@ -3214,6 +3236,7 @@ static bool handle_line(CompileServer *cs, Msg *_m)
             char summary[1792];
             snprintf(summary, sizeof(summary),
                      " detached_terminal_rejects=%lu nonwaiting_begin_rejects=%lu"
+                     " late_submitter_terminal_ignores=%lu late_worker_terminal_ignores=%lu"
                      " dup_local_begin=%lu id_release_violations=%lu"
                      " internals_output_dropped=%lu"
                      " prelogin_current=%u prelogin_max=%u prelogin_expired=%lu"
@@ -3233,6 +3256,7 @@ static bool handle_line(CompileServer *cs, Msg *_m)
                      " internals_last_output_deadline=%llu internals_last_entered_output_phase=%d"
                      " internals_last_reason=%s",
                      detached_terminal_rejects, nonwaiting_begin_rejects,
+                     late_submitter_terminal_ignores, late_worker_terminal_ignores,
                      duplicate_local_begin_ignored, id_release_violations,
                      internals_output_dropped,
                      prelogin_current, prelogin_max_observed,
