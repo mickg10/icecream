@@ -1,0 +1,47 @@
+name: assignment-fence-workflow-cleanup-once
+
+on:
+  push:
+    branches:
+      - bigoracle/assignment-fence-proof-v4
+    paths:
+      - .github/workflows/assignment-fence-workflow-cleanup-once.yml
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bigoracle/assignment-fence-proof-v4
+          fetch-depth: 0
+      - name: Require completed finite quotient
+        run: |
+          set -euo pipefail
+          test -f formal/assignment_fence_network_quotient_test.py
+          ! grep -R --line-number --fixed-strings nextF2SSeq formal/AssignmentFenceNetwork.tla
+          python3 formal/assignment_fence_network_quotient_test.py
+      - name: Remove superseded and one-shot workflows
+        run: |
+          set -euo pipefail
+          rm -f \
+            .github/workflows/assignment-fence-proof-v4.yml \
+            .github/workflows/assignment-fence-proof-execute.yml \
+            .github/workflows/assignment-fence-quotient-once.yml \
+            .github/workflows/assignment-fence-workflow-cleanup-once.yml
+          git config user.name "mickg10 formal automation"
+          git config user.email "5094033+mickg10@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          if git diff --cached --quiet; then
+            echo "no superseded workflows remain"
+            exit 0
+          fi
+          git commit -m "ci: leave one read-only assignment-fence proof gate"
+          git push origin HEAD:bigoracle/assignment-fence-proof-v4
