@@ -1,0 +1,35 @@
+name: mode-refinement-fairness-contract
+
+on:
+  pull_request:
+    paths:
+      - "formal/AssignmentFenceModeRefinement.tla"
+      - "formal/ModeRefinement*.cfg"
+      - "formal/mode-refinement-checks-v1.json"
+      - "formal/mode_refinement_fairness_contract_test.py"
+      - "formal/trace-manifests/ModeRefinement*.json"
+      - ".github/workflows/mode-refinement-fairness-contract.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fairness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Require weakly fair PREPARE consumption and direct nonvacuity
+        run: |
+          set -euo pipefail
+          python3 formal/mode_refinement_static_check.py \
+            --manifest formal/mode-refinement-checks-v1.json \
+            --repo . \
+            --formal-dir formal
+          python3 formal/mode_refinement_fairness_contract_test.py
+          test -z "$(git status --porcelain --untracked-files=all)"
