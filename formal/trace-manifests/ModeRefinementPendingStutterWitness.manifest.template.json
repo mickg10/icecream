@@ -1,0 +1,77 @@
+{
+  "schema": 1,
+  "scenario": "ModeRefinementPendingStutterWitness",
+  "property": "NoPendingStutterSeen",
+  "expected_result": "counterexample",
+  "min_states": 4,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "QueuePrepareAbstractAwaiting",
+      "all": [
+        {"path": "prepareQueued", "from": false, "to": true},
+        {"path": "abstractState", "from": "Idle", "to": "Awaiting"},
+        {"path": "pendingCount", "to": 0},
+        {"path": "authorizationSeen", "to": false}
+      ]
+    },
+    {
+      "name": "ExposeUseCSBeforePrepareConsumption",
+      "all": [
+        {"path": "usecsExposed", "from": false, "to": true},
+        {"path": "prepared", "to": false},
+        {"path": "abstractState", "to": "Awaiting"},
+        {"path": "authorizationSeen", "to": false}
+      ]
+    },
+    {
+      "name": "PendingClaimIsAbstractStutter",
+      "all": [
+        {"path": "claimArrived", "from": false, "to": true},
+        {"path": "pendingCount", "from": 0, "to": 1},
+        {"path": "pendingStutterSeen", "from": false, "to": true},
+        {"path": "matched", "to": false},
+        {"path": "authorizationSeen", "to": false},
+        {"path": "abstractState", "from": "Awaiting", "to": "Awaiting"}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "QueuePrepareAbstractAwaiting",
+    "ExposeUseCSBeforePrepareConsumption",
+    "PendingClaimIsAbstractStutter"
+  ],
+  "final_all": [
+    {"path": "prepareQueued", "eq": true},
+    {"path": "prepared", "eq": false},
+    {"path": "usecsExposed", "eq": true},
+    {"path": "pendingCount", "eq": 1},
+    {"path": "matched", "eq": false},
+    {"path": "authorizationSeen", "eq": false},
+    {"path": "abstractState", "eq": "Awaiting"},
+    {"path": "pendingStutterSeen", "eq": true}
+  ],
+  "harness_steps": [
+    {
+      "after": "QueuePrepareAbstractAwaiting",
+      "emit": "enqueue_prepare_without_granting_abstract_authority",
+      "actor": "scheduler"
+    },
+    {
+      "after": "ExposeUseCSBeforePrepareConsumption",
+      "emit": "expose_usecs_only_in_pipelined_mode",
+      "actor": "scheduler"
+    },
+    {
+      "after": "PendingClaimIsAbstractStutter",
+      "emit": "assert_pending_claim_changes_no_abstract_authorization_or_side_effect",
+      "actor": "fulfillment-daemon"
+    }
+  ],
+  "metadata": {
+    "module": "AssignmentFenceModeRefinement",
+    "config": "ModeRefinementPendingStutterWitness.cfg",
+    "mode": "PipelinedEnforcing",
+    "purpose": "Direct nonvacuity witness for the stuttering refinement step."
+  }
+}
