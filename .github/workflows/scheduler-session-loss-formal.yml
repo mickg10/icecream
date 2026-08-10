@@ -1,0 +1,286 @@
+name: scheduler-session-loss-formal
+
+on:
+  pull_request:
+    paths:
+      - "formal/SchedulerSessionLoss*"
+      - "formal/trace-manifests/SchedulerSessionLoss*"
+      - "formal/SCHEDULER_SESSION_LOSS.md"
+      - ".github/workflows/scheduler-session-loss-formal.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scheduler-session-loss-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+  TLC_174_SHA256: "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
+  TLC_180_SHA256: "e22f8ffb4bacdea0a871f444dd94fe5fb0d8013b3388ae39e82e26f852c735d5"
+  PRODUCT_SHA: "b393e9d83db5b367a89cdef2d23c2d04d5576f19"
+
+jobs:
+  scheduler-session-loss:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Java and evidence tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openjdk-17-jre-headless time curl
+
+      - name: Verify exact product source anchors
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin fix/stage3-scheduler-policy
+          git cat-file -e "${PRODUCT_SHA}^{commit}"
+          git show "${PRODUCT_SHA}:daemon/main.cpp" > /tmp/g4-product-main.cpp
+          grep -q 'finish_scheduler_loss_if_needed' /tmp/g4-product-main.cpp
+          grep -q 'scheduler_loss_settled_valid' /tmp/g4-product-main.cpp
+          grep -q 'scheduler_loss_cleanup_attempts' /tmp/g4-product-main.cpp
+          grep -q 'handle_cs_conf' /tmp/g4-product-main.cpp
+          grep -q 'scheduler_session_generation' /tmp/g4-product-main.cpp
+          sha256sum /tmp/g4-product-main.cpp > /tmp/g4-product-main.sha256
+          git rev-parse HEAD > /tmp/formal-source-sha.txt
+          printf '%s\n' "$PRODUCT_SHA" > /tmp/product-source-sha.txt
+
+      - name: Static model and adapter checks
+        run: |
+          set -euo pipefail
+          python3 formal/tla_primed_assignment_lint.py formal
+          python3 formal/trace_to_harness_test.py
+          python3 formal/normalize_tlc_trace_test.py
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          model = Path('formal/SchedulerSessionLoss.tla').read_text()
+          required = {
+              'BeginLogin', 'ReceiveConf', 'FailLoginAttempt',
+              'ActiveChannelLoss', 'SameTurnWork', 'FinishLoss',
+              'OrderlyShutdown', 'SafetyInvariant', 'LossEventuallySettled'
+          }
+          missing = sorted(name for name in required if name not in model)
+          if missing:
+              raise SystemExit(f'model is missing required operators: {missing}')
+          manifests = sorted(Path('formal/trace-manifests').glob(
+              'SchedulerSessionLoss*.manifest.template.json'))
+          if len(manifests) != 9:
+              raise SystemExit(f'expected 9 trace manifests, found {len(manifests)}')
+          for path in manifests:
+              doc = json.loads(path.read_text())
+              if doc.get('schema') != 1 or not doc.get('required_subsequence'):
+                  raise SystemExit(f'invalid manifest contract: {path}')
+          code_map = json.loads(Path('formal/SchedulerSessionLoss.code-map.json').read_text())
+          if code_map.get('product_source_sha') != os.environ['PRODUCT_SHA']:
+              raise SystemExit('code map product SHA does not match workflow pin')
+          PY
+
+      - name: Download and verify pinned TLC jars
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 4 --retry-all-errors \
+            -o /tmp/tla2tools-1.7.4.jar \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+          curl --fail --location --retry 4 --retry-all-errors \
+            -o /tmp/tla2tools-1.8.0.jar \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
+          printf '%s  %s\n' "$TLC_174_SHA256" /tmp/tla2tools-1.7.4.jar | sha256sum -c -
+          printf '%s  %s\n' "$TLC_180_SHA256" /tmp/tla2tools-1.8.0.jar | sha256sum -c -
+          java -version 2>&1 | tee /tmp/java-version.txt
+          java -jar /tmp/tla2tools-1.7.4.jar -help > /tmp/tlc-174-help.txt 2>&1 || true
+          java -jar /tmp/tla2tools-1.8.0.jar -help > /tmp/tlc-180-help.txt 2>&1 || true
+
+      - name: Run fixed safety and product-controlled liveness
+        working-directory: formal
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/session-loss/fixed
+
+          run_fixed() {
+            local id=$1 cfg=$2 version=$3
+            local dir="/tmp/session-loss/fixed/${id}/${version}"
+            mkdir -p "$dir"
+            /usr/bin/time -v -o "$dir/time.txt" \
+              java -jar "/tmp/tla2tools-${version}.jar" \
+              -workers 1 \
+              -metadir "$dir/states" \
+              -config "$cfg" \
+              SchedulerSessionLoss \
+              > "$dir/tlc.log" 2>&1
+            grep -q "No error has been found" "$dir/tlc.log"
+            grep -Eq "[1-9][0-9,]* states generated" "$dir/tlc.log"
+            grep -Eq "[1-9][0-9,]* distinct states found" "$dir/tlc.log"
+            grep -Eq "0 states left on queue" "$dir/tlc.log"
+            grep -Eq "depth of the complete state graph search is [1-9][0-9,]*" "$dir/tlc.log"
+            ! grep -Eqi "Invariant .* is violated|Temporal properties were violated|Parsing or semantic analysis failed|SANY Error|Exception in thread" "$dir/tlc.log"
+            grep -Eq "Maximum resident set size .*: [1-9][0-9]*" "$dir/time.txt"
+          }
+
+          for version in 1.7.4 1.8.0; do
+            run_fixed safety SchedulerSessionLoss.cfg "$version"
+            run_fixed liveness SchedulerSessionLossFair.cfg "$version"
+          done
+
+      - name: Run, normalize, and validate witnesses and mutants
+        working-directory: formal
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/session-loss/counterexamples
+
+          run_case() {
+            local id=$1 cfg=$2 property=$3 manifest=$4 version=$5
+            local dir="/tmp/session-loss/counterexamples/${id}/${version}"
+            mkdir -p "$dir"
+            local log="$dir/tlc.log"
+            local metrics="$dir/time.txt"
+            local raw="$dir/trace.raw.json"
+            local normalized="$dir/trace.normalized.json"
+            local harness="$dir/harness.json"
+            local rc=0
+
+            if [[ "$version" == "1.8.0" ]]; then
+              set +e
+              /usr/bin/time -v -o "$metrics" \
+                java -jar "/tmp/tla2tools-${version}.jar" \
+                -workers 1 \
+                -metadir "$dir/states" \
+                -config "$cfg" \
+                -dumpTrace json "$raw" \
+                SchedulerSessionLoss \
+                > "$log" 2>&1
+              rc=$?
+              set -e
+              [[ -s "$raw" ]]
+              python3 normalize_tlc_trace.py --input "$raw" --output "$normalized"
+            else
+              set +e
+              /usr/bin/time -v -o "$metrics" \
+                java -jar "/tmp/tla2tools-${version}.jar" \
+                -workers 1 \
+                -metadir "$dir/states" \
+                -config "$cfg" \
+                SchedulerSessionLoss \
+                > "$log" 2>&1
+              rc=$?
+              set -e
+              python3 normalize_tlc_trace.py --input "$log" --output "$normalized"
+            fi
+
+            [[ "$rc" -ne 0 ]]
+            grep -Eqi "Invariant[[:space:]]+${property}[[:space:]]+is violated" "$log"
+            [[ "$(grep -Ec '^INVARIANT[[:space:]]+' "$cfg")" -eq 1 ]]
+            grep -Eq "^INVARIANT[[:space:]]+${property}$" "$cfg"
+            grep -Eq "[1-9][0-9,]* states generated" "$log"
+            grep -Eq "[1-9][0-9,]* distinct states found" "$log"
+            grep -Eq "depth of the complete state graph search is [1-9][0-9,]*" "$log"
+            ! grep -Eqi "Parsing or semantic analysis failed|SANY Error|Exception in thread|TLC threw an unexpected exception" "$log"
+            grep -Eq "Maximum resident set size .*: [1-9][0-9]*" "$metrics"
+            python3 trace_to_harness.py \
+              --trace "$normalized" \
+              --manifest "$manifest" \
+              --tlc-log "$log" \
+              --output "$harness"
+          }
+
+          for version in 1.7.4 1.8.0; do
+            run_case active-witness SchedulerSessionLossActiveWitness.cfg NeverActive \
+              trace-manifests/SchedulerSessionLossActiveWitness.manifest.template.json "$version"
+            run_case login-failure-witness SchedulerSessionLossLoginFailureWitness.cfg NoLoginFailureSeen \
+              trace-manifests/SchedulerSessionLossLoginFailureWitness.manifest.template.json "$version"
+            run_case cleanup-witness SchedulerSessionLossCleanupWitness.cfg NeverRetiredLoss \
+              trace-manifests/SchedulerSessionLossCleanupWitness.manifest.template.json "$version"
+            run_case pointer-mutant SchedulerSessionLossPointerMutant.cfg AttemptFailurePreserved \
+              trace-manifests/SchedulerSessionLossPointerMutant.manifest.template.json "$version"
+            run_case post-loss-mutant SchedulerSessionLossPostLossMutant.cfg NoPostLossWork \
+              trace-manifests/SchedulerSessionLossPostLossMutant.manifest.template.json "$version"
+            run_case duplicate-cleanup-mutant SchedulerSessionLossDuplicateCleanupMutant.cfg CleanupCountCoherent \
+              trace-manifests/SchedulerSessionLossDuplicateCleanupMutant.manifest.template.json "$version"
+            run_case sentinel-mutant SchedulerSessionLossSentinelMutant.cfg RetiredOnlyIfCleaned \
+              trace-manifests/SchedulerSessionLossSentinelMutant.manifest.template.json "$version"
+            run_case shutdown-mutant SchedulerSessionLossShutdownMutant.cfg NoUnexpectedShutdownCleanup \
+              trace-manifests/SchedulerSessionLossShutdownMutant.manifest.template.json "$version"
+            run_case wrap-mutant SchedulerSessionLossWrapMutant.cfg NoGenerationReuse \
+              trace-manifests/SchedulerSessionLossWrapMutant.manifest.template.json "$version"
+          done
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          root = Path('/tmp/session-loss/counterexamples')
+          cases = (
+              'active-witness', 'login-failure-witness', 'cleanup-witness',
+              'pointer-mutant', 'post-loss-mutant', 'duplicate-cleanup-mutant',
+              'sentinel-mutant', 'shutdown-mutant', 'wrap-mutant'
+          )
+          for case in cases:
+              stable = json.loads((root/case/'1.7.4'/'harness.json').read_text())
+              differential = json.loads((root/case/'1.8.0'/'harness.json').read_text())
+              for key in ('event_sequence', 'required_subsequence', 'harness_steps'):
+                  if stable.get(key) != differential.get(key):
+                      raise SystemExit(
+                          f'{case}: TLC semantic disagreement in {key}: '
+                          f'{stable.get(key)!r} != {differential.get(key)!r}'
+                      )
+          PY
+
+      - name: Write compact result inventory
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import re
+          from pathlib import Path
+          root = Path('/tmp/session-loss')
+          rows = []
+          for log in sorted(root.glob('**/tlc.log')):
+              text = log.read_text(errors='replace')
+              stats = list(re.finditer(
+                  r'([0-9][0-9,]*) states generated,\s*'
+                  r'([0-9][0-9,]*) distinct states found'
+                  r'(?:,\s*([0-9][0-9,]*) states left on queue)?',
+                  text, re.I,
+              ))
+              depth = list(re.finditer(
+                  r'depth of the complete state graph search is\s+([0-9][0-9,]*)',
+                  text, re.I,
+              ))
+              last = stats[-1] if stats else None
+              rows.append({
+                  'row': str(log.parent.relative_to(root)),
+                  'log_sha256': hashlib.sha256(log.read_bytes()).hexdigest(),
+                  'generated': int(last.group(1).replace(',', '')) if last else None,
+                  'distinct': int(last.group(2).replace(',', '')) if last else None,
+                  'queued': int(last.group(3).replace(',', '')) if last and last.group(3) else None,
+                  'depth': int(depth[-1].group(1).replace(',', '')) if depth else None,
+                  'no_error': 'No error has been found' in text,
+                  'invariant_violation': bool(re.search(r'Invariant\s+\S+\s+is violated', text)),
+              })
+          root.mkdir(parents=True, exist_ok=True)
+          (root/'results.json').write_text(json.dumps(rows, indent=2, sort_keys=True) + '\n')
+          PY
+
+      - name: Archive exact evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scheduler-session-loss-${{ github.sha }}
+          path: |
+            /tmp/session-loss
+            /tmp/java-version.txt
+            /tmp/tlc-174-help.txt
+            /tmp/tlc-180-help.txt
+            /tmp/g4-product-main.cpp
+            /tmp/g4-product-main.sha256
+            /tmp/formal-source-sha.txt
+            /tmp/product-source-sha.txt
+          if-no-files-found: error
+          retention-days: 30

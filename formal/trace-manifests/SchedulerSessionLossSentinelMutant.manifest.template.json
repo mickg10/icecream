@@ -1,0 +1,66 @@
+{
+  "schema": 1,
+  "scenario": "SchedulerSessionLossSentinelMutant",
+  "property": "RetiredOnlyIfCleaned",
+  "expected_result": "counterexample",
+  "min_states": 5,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "ConfCSActivatesSession",
+      "all": [
+        {"path": "phase", "from": "LoginAttempt", "to": "Active"},
+        {"path": "confReceived", "from": false, "to": true},
+        {"path": "generationValid", "from": false, "to": true}
+      ]
+    },
+    {
+      "name": "ActiveSessionChannelLoss",
+      "all": [
+        {"path": "phase", "from": "Active", "to": "LossPending"},
+        {"path": "lossThisTurn", "from": false, "to": true},
+        {"path": "lostGenerations", "len_delta": 1}
+      ]
+    },
+    {
+      "name": "NumericSentinelSkipsFirstCleanup",
+      "all": [
+        {"path": "phase", "from": "LossPending", "to": "Disconnected"},
+        {"path": "helperCalls", "from": 0, "to": 1},
+        {"path": "cleanupAttempts", "unchanged": true},
+        {"path": "retiredGenerations", "len_delta": 1},
+        {"path": "cleanedGenerations", "unchanged": true},
+        {"path": "localWork", "unchanged": true}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "ConfCSActivatesSession",
+    "ActiveSessionChannelLoss",
+    "NumericSentinelSkipsFirstCleanup"
+  ],
+  "final_all": [
+    {"path": "cleanupAttempts", "eq": 0},
+    {"path": "retiredGenerations", "to_len": 1},
+    {"path": "cleanedGenerations", "to_len": 0},
+    {"path": "localWork", "eq": true}
+  ],
+  "harness_steps": [
+    {
+      "after": "ConfCSActivatesSession",
+      "emit": "force_active_generation_equal_to_old_numeric_sentinel",
+      "actor": "test-harness"
+    },
+    {
+      "after": "NumericSentinelSkipsFirstCleanup",
+      "emit": "assert_session_retired_without_clear_children_attempt",
+      "actor": "test-harness"
+    }
+  ],
+  "metadata": {
+    "module": "SchedulerSessionLoss",
+    "config": "SchedulerSessionLossSentinelMutant.cfg",
+    "mutant": "MutantNumericSentinel = TRUE",
+    "cutoff": "InitialGeneration = MaxGeneration = 2"
+  }
+}

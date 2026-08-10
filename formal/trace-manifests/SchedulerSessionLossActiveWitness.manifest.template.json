@@ -1,0 +1,53 @@
+{
+  "schema": 1,
+  "scenario": "SchedulerSessionLossActiveWitness",
+  "property": "NeverActive",
+  "expected_result": "counterexample",
+  "min_states": 3,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "BeginLoginAttempt",
+      "all": [
+        {"path": "phase", "from": "Disconnected", "to": "LoginAttempt"},
+        {"path": "channelUp", "from": false, "to": true},
+        {"path": "confReceived", "to": false}
+      ]
+    },
+    {
+      "name": "ConfCSActivatesSession",
+      "all": [
+        {"path": "phase", "from": "LoginAttempt", "to": "Active"},
+        {"path": "confReceived", "from": false, "to": true},
+        {"path": "generationValid", "from": false, "to": true},
+        {"path": "channelUp", "to": true}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "BeginLoginAttempt",
+    "ConfCSActivatesSession"
+  ],
+  "final_all": [
+    {"path": "phase", "eq": "Active"},
+    {"path": "confReceived", "eq": true},
+    {"path": "generationValid", "eq": true}
+  ],
+  "harness_steps": [
+    {
+      "after": "BeginLoginAttempt",
+      "emit": "accept_scheduler_channel_and_send_login",
+      "actor": "iceccd"
+    },
+    {
+      "after": "ConfCSActivatesSession",
+      "emit": "consume_confcs_and_mark_scheduler_session_active",
+      "actor": "iceccd"
+    }
+  ],
+  "metadata": {
+    "module": "SchedulerSessionLoss",
+    "config": "SchedulerSessionLossActiveWitness.cfg",
+    "witness": "ConfCS is the activation linearization point."
+  }
+}

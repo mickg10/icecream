@@ -1,0 +1,61 @@
+{
+  "schema": 1,
+  "scenario": "SchedulerSessionLossPostLossMutant",
+  "property": "NoPostLossWork",
+  "expected_result": "counterexample",
+  "min_states": 5,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "ConfCSActivatesSession",
+      "all": [
+        {"path": "phase", "from": "LoginAttempt", "to": "Active"},
+        {"path": "confReceived", "from": false, "to": true},
+        {"path": "generationValid", "from": false, "to": true}
+      ]
+    },
+    {
+      "name": "ActiveSessionChannelLoss",
+      "all": [
+        {"path": "phase", "from": "Active", "to": "LossPending"},
+        {"path": "channelUp", "from": true, "to": false},
+        {"path": "lossThisTurn", "from": false, "to": true},
+        {"path": "lostGenerations", "len_delta": 1}
+      ]
+    },
+    {
+      "name": "LaterSamePollEventExecutes",
+      "all": [
+        {"path": "phase", "from": "LossPending", "to": "LossPending"},
+        {"path": "postLossEvents", "from": 0, "to": 1},
+        {"path": "lossThisTurn", "to": true}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "ConfCSActivatesSession",
+    "ActiveSessionChannelLoss",
+    "LaterSamePollEventExecutes"
+  ],
+  "final_all": [
+    {"path": "phase", "eq": "LossPending"},
+    {"path": "postLossEvents", "eq": 1}
+  ],
+  "harness_steps": [
+    {
+      "after": "ActiveSessionChannelLoss",
+      "emit": "keep_second_client_ready_in_the_same_poll_snapshot",
+      "actor": "test-harness"
+    },
+    {
+      "after": "LaterSamePollEventExecutes",
+      "emit": "assert_second_client_handler_executed_before_loss_cleanup",
+      "actor": "test-harness"
+    }
+  ],
+  "metadata": {
+    "module": "SchedulerSessionLoss",
+    "config": "SchedulerSessionLossPostLossMutant.cfg",
+    "mutant": "MutantAllowPostLossWork = TRUE"
+  }
+}

@@ -1,0 +1,58 @@
+{
+  "schema": 1,
+  "model": "SchedulerSessionLoss.tla",
+  "product_repository": "mickg10/icecream",
+  "product_source_sha": "b393e9d83db5b367a89cdef2d23c2d04d5576f19",
+  "scope": "protocol-neutral G4 scheduler-session lifecycle",
+  "actions": [
+    {
+      "action": "BeginLogin",
+      "file": "daemon/main.cpp",
+      "symbol": "Daemon::reconnect",
+      "status_at_source_sha": "partial",
+      "note": "Channel acquisition and Login send exist; activation must not be inferred from the pointer."
+    },
+    {
+      "action": "ReceiveConf",
+      "file": "daemon/main.cpp",
+      "symbol": "Daemon::handle_cs_conf",
+      "status_at_source_sha": "missing-linearization",
+      "note": "ConfCS currently updates timeouts only; it must commit ACTIVE and generation."
+    },
+    {
+      "action": "FailLoginAttempt",
+      "file": "daemon/main.cpp",
+      "symbol": "Daemon::reconnect",
+      "status_at_source_sha": "needs-explicit-attempt-state",
+      "note": "A pre-ConfCS failure must preserve schedulerless local work and charge no loss cleanup."
+    },
+    {
+      "action": "ActiveChannelLoss",
+      "file": "daemon/main.cpp",
+      "symbol": "Daemon::answer_client_requests",
+      "status_at_source_sha": "present-boundaries",
+      "note": "Loss-capable send/read/poll/client/child boundaries route to the helper."
+    },
+    {
+      "action": "SameTurnWork",
+      "file": "daemon/main.cpp",
+      "symbol": "Daemon::answer_client_requests",
+      "status_at_source_sha": "guarded",
+      "note": "The pre-poll buffered-client and post-drain boundaries return immediately on loss."
+    },
+    {
+      "action": "FinishLoss",
+      "file": "daemon/main.cpp",
+      "symbol": "Daemon::finish_scheduler_loss_if_needed",
+      "status_at_source_sha": "present",
+      "note": "Settled-valid/generation and cleanup-attempt diagnostics exist."
+    },
+    {
+      "action": "OrderlyShutdown",
+      "file": "daemon/main.cpp",
+      "symbol": "Daemon::working_loop",
+      "status_at_source_sha": "separate-path",
+      "note": "Orderly shutdown closes S and clears clients without invoking the unexpected-loss helper."
+    }
+  ]
+}

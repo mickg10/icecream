@@ -1,0 +1,83 @@
+{
+  "schema": 1,
+  "scenario": "SchedulerSessionLossWrapMutant",
+  "property": "NoGenerationReuse",
+  "expected_result": "counterexample",
+  "min_states": 15,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "ActivateGenerationZero",
+      "all": [
+        {"path": "phase", "from": "LoginAttempt", "to": "Active"},
+        {"path": "generationValid", "from": false, "to": true},
+        {"path": "generation", "to": 0},
+        {"path": "confReceived", "from": false, "to": true}
+      ]
+    },
+    {
+      "name": "RetireGenerationZero",
+      "all": [
+        {"path": "phase", "from": "LossPending", "to": "Disconnected"},
+        {"path": "cleanupAttempts", "from": 0, "to": 1},
+        {"path": "settledValid", "from": false, "to": true},
+        {"path": "settledGeneration", "to": 0}
+      ]
+    },
+    {
+      "name": "ActivateGenerationOne",
+      "all": [
+        {"path": "phase", "from": "LoginAttempt", "to": "Active"},
+        {"path": "generation", "from": 0, "to": 1},
+        {"path": "confReceived", "from": false, "to": true}
+      ]
+    },
+    {
+      "name": "RetireGenerationOne",
+      "all": [
+        {"path": "phase", "from": "LossPending", "to": "Disconnected"},
+        {"path": "cleanupAttempts", "from": 1, "to": 2},
+        {"path": "settledGeneration", "from": 0, "to": 1}
+      ]
+    },
+    {
+      "name": "WrapAndReuseGenerationZero",
+      "all": [
+        {"path": "phase", "from": "LoginAttempt", "to": "Active"},
+        {"path": "generation", "from": 1, "to": 0},
+        {"path": "generationReused", "from": false, "to": true},
+        {"path": "confReceived", "from": false, "to": true}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "ActivateGenerationZero",
+    "RetireGenerationZero",
+    "ActivateGenerationOne",
+    "RetireGenerationOne",
+    "WrapAndReuseGenerationZero"
+  ],
+  "final_all": [
+    {"path": "phase", "eq": "Active"},
+    {"path": "generation", "eq": 0},
+    {"path": "generationReused", "eq": true}
+  ],
+  "harness_steps": [
+    {
+      "after": "RetireGenerationOne",
+      "emit": "set_generation_counter_at_maximum_and_start_another_login",
+      "actor": "test-harness"
+    },
+    {
+      "after": "WrapAndReuseGenerationZero",
+      "emit": "assert_generation_zero_was_reused_instead_of_failing_closed",
+      "actor": "test-harness"
+    }
+  ],
+  "metadata": {
+    "module": "SchedulerSessionLoss",
+    "config": "SchedulerSessionLossWrapMutant.cfg",
+    "mutant": "MutantWrapGeneration = TRUE",
+    "cutoff": "Generations = 0..1"
+  }
+}

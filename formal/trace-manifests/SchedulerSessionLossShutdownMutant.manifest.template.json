@@ -1,0 +1,39 @@
+{
+  "schema": 1,
+  "scenario": "SchedulerSessionLossShutdownMutant",
+  "property": "NoUnexpectedShutdownCleanup",
+  "expected_result": "counterexample",
+  "min_states": 2,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "OrderlyShutdownMisclassifiedAsLoss",
+      "all": [
+        {"path": "phase", "from": "Disconnected", "to": "Shutdown"},
+        {"path": "unexpectedShutdownCleanups", "from": 0, "to": 1},
+        {"path": "cleanupAttempts", "from": 0, "to": 1},
+        {"path": "localWork", "from": true, "to": false}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "OrderlyShutdownMisclassifiedAsLoss"
+  ],
+  "final_all": [
+    {"path": "phase", "eq": "Shutdown"},
+    {"path": "unexpectedShutdownCleanups", "eq": 1},
+    {"path": "cleanupAttempts", "eq": 1}
+  ],
+  "harness_steps": [
+    {
+      "after": "OrderlyShutdownMisclassifiedAsLoss",
+      "emit": "assert_orderly_shutdown_incremented_unexpected_loss_cleanup_counter",
+      "actor": "test-harness"
+    }
+  ],
+  "metadata": {
+    "module": "SchedulerSessionLoss",
+    "config": "SchedulerSessionLossShutdownMutant.cfg",
+    "mutant": "MutantShutdownAsLoss = TRUE"
+  }
+}

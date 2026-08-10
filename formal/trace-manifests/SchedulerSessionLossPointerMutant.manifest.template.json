@@ -1,0 +1,55 @@
+{
+  "schema": 1,
+  "scenario": "SchedulerSessionLossPointerMutant",
+  "property": "AttemptFailurePreserved",
+  "expected_result": "counterexample",
+  "min_states": 3,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "ChannelPointerMisclassifiedAsActive",
+      "all": [
+        {"path": "phase", "from": "Disconnected", "to": "Active"},
+        {"path": "channelUp", "from": false, "to": true},
+        {"path": "confReceived", "to": false},
+        {"path": "generationValid", "from": false, "to": true}
+      ]
+    },
+    {
+      "name": "FailedAttemptClearsLocalWork",
+      "all": [
+        {"path": "phase", "from": "Active", "to": "Disconnected"},
+        {"path": "loginFailureSeen", "from": false, "to": true},
+        {"path": "localWork", "from": true, "to": false},
+        {"path": "attemptFailureCleanups", "from": 0, "to": 1},
+        {"path": "cleanupAttempts", "from": 0, "to": 1}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "ChannelPointerMisclassifiedAsActive",
+    "FailedAttemptClearsLocalWork"
+  ],
+  "final_all": [
+    {"path": "loginFailureSeen", "eq": true},
+    {"path": "localWork", "eq": false},
+    {"path": "attemptFailureCleanups", "eq": 1}
+  ],
+  "harness_steps": [
+    {
+      "after": "ChannelPointerMisclassifiedAsActive",
+      "emit": "accept_scheduler_channel_but_withhold_confcs",
+      "actor": "fake-scheduler"
+    },
+    {
+      "after": "FailedAttemptClearsLocalWork",
+      "emit": "assert_failed_login_was_wrongly_charged_as_established_loss",
+      "actor": "test-harness"
+    }
+  ],
+  "metadata": {
+    "module": "SchedulerSessionLoss",
+    "config": "SchedulerSessionLossPointerMutant.cfg",
+    "mutant": "MutantActivateBeforeConf = TRUE"
+  }
+}

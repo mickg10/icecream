@@ -1,0 +1,71 @@
+{
+  "schema": 1,
+  "scenario": "SchedulerSessionLossDuplicateCleanupMutant",
+  "property": "CleanupCountCoherent",
+  "expected_result": "counterexample",
+  "min_states": 6,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "ConfCSActivatesSession",
+      "all": [
+        {"path": "phase", "from": "LoginAttempt", "to": "Active"},
+        {"path": "confReceived", "from": false, "to": true},
+        {"path": "generationValid", "from": false, "to": true}
+      ]
+    },
+    {
+      "name": "ActiveSessionChannelLoss",
+      "all": [
+        {"path": "phase", "from": "Active", "to": "LossPending"},
+        {"path": "lossThisTurn", "from": false, "to": true},
+        {"path": "lostGenerations", "len_delta": 1}
+      ]
+    },
+    {
+      "name": "FirstLossCleanup",
+      "all": [
+        {"path": "phase", "from": "LossPending", "to": "Disconnected"},
+        {"path": "cleanupAttempts", "from": 0, "to": 1},
+        {"path": "helperCalls", "from": 0, "to": 1},
+        {"path": "cleanedGenerations", "len_delta": 1}
+      ]
+    },
+    {
+      "name": "DuplicateLossCleanup",
+      "all": [
+        {"path": "phase", "from": "Disconnected", "to": "Disconnected"},
+        {"path": "cleanupAttempts", "from": 1, "to": 2},
+        {"path": "helperCalls", "from": 1, "to": 2},
+        {"path": "cleanedGenerations", "unchanged": true}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "ActiveSessionChannelLoss",
+    "FirstLossCleanup",
+    "DuplicateLossCleanup"
+  ],
+  "final_all": [
+    {"path": "cleanupAttempts", "eq": 2},
+    {"path": "cleanedGenerations", "to_len": 1},
+    {"path": "helperCalls", "eq": 2}
+  ],
+  "harness_steps": [
+    {
+      "after": "FirstLossCleanup",
+      "emit": "invoke_first_loss_boundary_and_sample_cleanup_attempts",
+      "actor": "iceccd"
+    },
+    {
+      "after": "DuplicateLossCleanup",
+      "emit": "invoke_second_boundary_for_same_generation_and_assert_counter_changed_twice",
+      "actor": "test-harness"
+    }
+  ],
+  "metadata": {
+    "module": "SchedulerSessionLoss",
+    "config": "SchedulerSessionLossDuplicateCleanupMutant.cfg",
+    "mutant": "MutantDuplicateCleanup = TRUE"
+  }
+}

@@ -1,0 +1,80 @@
+{
+  "schema": 1,
+  "scenario": "SchedulerSessionLossCleanupWitness",
+  "property": "NeverRetiredLoss",
+  "expected_result": "counterexample",
+  "min_states": 5,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "BeginLoginAttempt",
+      "all": [
+        {"path": "phase", "from": "Disconnected", "to": "LoginAttempt"},
+        {"path": "channelUp", "from": false, "to": true},
+        {"path": "confReceived", "to": false}
+      ]
+    },
+    {
+      "name": "ConfCSActivatesSession",
+      "all": [
+        {"path": "phase", "from": "LoginAttempt", "to": "Active"},
+        {"path": "confReceived", "from": false, "to": true},
+        {"path": "generationValid", "from": false, "to": true},
+        {"path": "channelUp", "to": true}
+      ]
+    },
+    {
+      "name": "ActiveSessionChannelLoss",
+      "all": [
+        {"path": "phase", "from": "Active", "to": "LossPending"},
+        {"path": "channelUp", "from": true, "to": false},
+        {"path": "lossThisTurn", "from": false, "to": true},
+        {"path": "lostGenerations", "len_delta": 1}
+      ]
+    },
+    {
+      "name": "FinishEstablishedSessionLoss",
+      "all": [
+        {"path": "phase", "from": "LossPending", "to": "Disconnected"},
+        {"path": "cleanupAttempts", "from": 0, "to": 1},
+        {"path": "helperCalls", "from": 0, "to": 1},
+        {"path": "cleanedGenerations", "len_delta": 1},
+        {"path": "retiredGenerations", "len_delta": 1},
+        {"path": "localWork", "from": true, "to": false}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "ConfCSActivatesSession",
+    "ActiveSessionChannelLoss",
+    "FinishEstablishedSessionLoss"
+  ],
+  "final_all": [
+    {"path": "phase", "eq": "Disconnected"},
+    {"path": "cleanupAttempts", "eq": 1},
+    {"path": "retiredGenerations", "to_len": 1},
+    {"path": "cleanedGenerations", "to_len": 1}
+  ],
+  "harness_steps": [
+    {
+      "after": "ConfCSActivatesSession",
+      "emit": "barrier_after_confcs_activation",
+      "actor": "iceccd"
+    },
+    {
+      "after": "ActiveSessionChannelLoss",
+      "emit": "close_active_scheduler_channel_with_later_same_poll_readiness_armed",
+      "actor": "fake-scheduler"
+    },
+    {
+      "after": "FinishEstablishedSessionLoss",
+      "emit": "assert_exactly_one_generation_scoped_cleanup_before_turn_exit",
+      "actor": "test-harness"
+    }
+  ],
+  "metadata": {
+    "module": "SchedulerSessionLoss",
+    "config": "SchedulerSessionLossCleanupWitness.cfg",
+    "witness": "Established-session loss reaches the exactly-once cleanup transition."
+  }
+}

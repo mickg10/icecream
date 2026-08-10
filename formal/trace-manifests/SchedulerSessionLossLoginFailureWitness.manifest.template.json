@@ -1,0 +1,55 @@
+{
+  "schema": 1,
+  "scenario": "SchedulerSessionLossLoginFailureWitness",
+  "property": "NoLoginFailureSeen",
+  "expected_result": "counterexample",
+  "min_states": 3,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "BeginLoginAttempt",
+      "all": [
+        {"path": "phase", "from": "Disconnected", "to": "LoginAttempt"},
+        {"path": "channelUp", "from": false, "to": true},
+        {"path": "confReceived", "to": false}
+      ]
+    },
+    {
+      "name": "LoginAttemptFailsWithoutCleanup",
+      "all": [
+        {"path": "phase", "from": "LoginAttempt", "to": "Disconnected"},
+        {"path": "channelUp", "from": true, "to": false},
+        {"path": "loginFailureSeen", "from": false, "to": true},
+        {"path": "localWork", "unchanged": true},
+        {"path": "attemptFailureCleanups", "unchanged": true}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "BeginLoginAttempt",
+    "LoginAttemptFailsWithoutCleanup"
+  ],
+  "final_all": [
+    {"path": "phase", "eq": "Disconnected"},
+    {"path": "loginFailureSeen", "eq": true},
+    {"path": "localWork", "eq": true},
+    {"path": "attemptFailureCleanups", "eq": 0}
+  ],
+  "harness_steps": [
+    {
+      "after": "BeginLoginAttempt",
+      "emit": "hold_existing_schedulerless_local_client_and_start_login_attempt",
+      "actor": "iceccd"
+    },
+    {
+      "after": "LoginAttemptFailsWithoutCleanup",
+      "emit": "assert_local_client_survives_and_scheduler_loss_cleanup_count_is_unchanged",
+      "actor": "test-harness"
+    }
+  ],
+  "metadata": {
+    "module": "SchedulerSessionLoss",
+    "config": "SchedulerSessionLossLoginFailureWitness.cfg",
+    "witness": "A pre-ConfCS channel failure is an attempt failure, not an established-session loss."
+  }
+}
