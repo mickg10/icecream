@@ -16,6 +16,7 @@ concurrency:
 
 env:
   PYTHONDONTWRITEBYTECODE: "1"
+  EXACT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
   TLC_174_SHA256: "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
   TLC_180_SHA256: "e22f8ffb4bacdea0a871f444dd94fe5fb0d8013b3388ae39e82e26f852c735d5"
 
@@ -26,11 +27,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ env.EXACT_SHA }}
           fetch-depth: 0
       - name: Verify exact checked-out revision
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "${{ github.event.pull_request.head.sha || github.sha }}"
+          test "$(git rev-parse HEAD)" = "$EXACT_SHA"
           test -z "$(git status --porcelain --untracked-files=all)"
       - name: Byte-level codec fixture
         run: python3 formal/compatibility_codec_fixture_test.py
@@ -71,11 +73,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ env.EXACT_SHA }}
           fetch-depth: 0
       - name: Verify exact checked-out revision
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "${{ github.event.pull_request.head.sha || github.sha }}"
+          test "$(git rev-parse HEAD)" = "$EXACT_SHA"
           test -z "$(git status --porcelain --untracked-files=all)"
       - name: Install Java and GNU time
         run: |
@@ -107,7 +110,7 @@ jobs:
             --manifest formal/compatibility-formal-checks-v1.json \
             --repo . \
             --artifacts "$artifacts" \
-            --expected-git-sha "$(git rev-parse HEAD)" \
+            --expected-git-sha "$EXACT_SHA" \
             --stable-jar /tmp/tla2tools-1.7.4.jar \
             --stable-sha256 "$TLC_174_SHA256" \
             --differential-jar /tmp/tla2tools-1.8.0.jar \
@@ -120,7 +123,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: compatibility-${{ matrix.group }}-${{ github.sha }}
+          name: compatibility-${{ matrix.group }}-${{ env.EXACT_SHA }}
           path: |
             /tmp/compatibility-${{ matrix.group }}
             /tmp/tlc-174-help.txt
