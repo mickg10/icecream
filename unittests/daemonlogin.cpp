@@ -250,11 +250,19 @@ static bool expect_no_complete_frame(MsgChannel *channel, int timeout_msec,
             }
             return false;
         }
-        if (pfd.revents & POLLNVAL) {
+        if (pfd.revents & (POLLERR | POLLNVAL)) {
+            if (seen) {
+                *seen = "<poll error>";
+            }
             return false;
         }
         if (pfd.revents & (POLLIN | POLLHUP)) {
-            channel->read_a_bit();
+            if (!channel->read_a_bit()) {
+                if (seen) {
+                    *seen = "<read error>";
+                }
+                return false;
+            }
             if (channel->has_msg()) {
                 Msg *msg = channel->get_msg(0, true);
                 if (msg) {
