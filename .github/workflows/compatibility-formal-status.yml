@@ -26,24 +26,37 @@ jobs:
         uses: actions/github-script@v7
         env:
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number || 0 }}
           TRACKER: "4"
         with:
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const headSha = process.env.HEAD_SHA;
+            const prNumber = Number(process.env.PR_NUMBER || '0');
             const tracker = Number(process.env.TRACKER);
             const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
             const deadline = Date.now() + 120 * 60 * 1000;
             let selected = null;
 
+            const matchesExactSource = run => {
+              if (run.name !== 'compatibility-formal') return false;
+              if (prNumber > 0) {
+                return (run.pull_requests || []).some(pr =>
+                  Number(pr.number) === prNumber
+                  && (!pr.head || !pr.head.sha || pr.head.sha === headSha)
+                );
+              }
+              return run.head_sha === headSha;
+            };
+
             while (Date.now() < deadline) {
               const runs = await github.paginate(
                 github.rest.actions.listWorkflowRunsForRepo,
-                { owner, repo, head_sha: headSha, per_page: 100 }
+                { owner, repo, per_page: 100 }
               );
               const candidates = runs
-                .filter(run => run.name === 'compatibility-formal')
+                .filter(matchesExactSource)
                 .sort((a, b) => b.id - a.id);
               if (candidates.length > 0) {
                 selected = candidates[0];
@@ -53,7 +66,9 @@ jobs:
             }
 
             if (!selected) {
-              core.setFailed(`No compatibility-formal run appeared for ${headSha}`);
+              core.setFailed(
+                `No compatibility-formal run appeared for exact source ${headSha}`
+              );
               return;
             }
             if (selected.status !== 'completed') {
@@ -72,13 +87,27 @@ jobs:
               { owner, repo, run_id: selected.id, per_page: 100 }
             );
 
+            const expectedArtifacts = [
+              `compatibility-fixed-${headSha}`,
+              `compatibility-witness-a-${headSha}`,
+              `compatibility-witness-b-${headSha}`,
+              `compatibility-mutants-${headSha}`,
+            ];
+            const byName = new Map(artifacts.map(a => [a.name, a]));
+            const missingArtifacts = expectedArtifacts.filter(name => {
+              const artifact = byName.get(name);
+              return !artifact || artifact.expired;
+            });
+
             const jobLines = jobs
               .sort((a, b) => a.id - b.id)
               .map(job => `- ${job.name}: ${job.conclusion || job.status}`);
             const artifactLines = artifacts.length
               ? artifacts
                   .sort((a, b) => a.id - b.id)
-                  .map(a => `- ${a.name} (artifact id ${a.id}, expired=${a.expired})`)
+                  .map(a =>
+                    `- ${a.name} (artifact id ${a.id}, expired=${a.expired}, digest=${a.digest || 'unavailable'})`
+                  )
               : ['- NONE'];
 
             const marker = '<!-- compatibility-formal-status -->';
@@ -89,8 +118,9 @@ jobs:
               '',
               '## Automated compatibility-formal status',
               '',
-              `Exact head: \`${headSha}\``,
+              `Exact source head: \`${headSha}\``,
               `Workflow run: \`${selected.id}\``,
+              `Workflow metadata head: \`${selected.head_sha}\``,
               `Workflow conclusion: **${selected.conclusion || selected.status}**`,
               '',
               '### Jobs',
@@ -99,7 +129,9 @@ jobs:
               '### Retained artifacts',
               ...artifactLines,
               '',
-              'This comment reports process/job conclusions and artifact identity only. It does not turn a missing artifact, skipped job, or failed matrix row into acceptance.'
+              `Expected exact-head artifacts missing/expired: ${missingArtifacts.length ? missingArtifacts.join(', ') : 'NONE'}`,
+              '',
+              'This comment reports process/job conclusions and exact-source artifact identity only. It does not turn a missing artifact, skipped job, or failed matrix row into acceptance.'
             ].join('\n');
 
             const comments = await github.paginate(
@@ -128,5 +160,10 @@ jobs:
             if (selected.conclusion !== 'success') {
               core.setFailed(
                 `compatibility-formal run ${selected.id} concluded ${selected.conclusion}`
+              );
+            }
+            if (missingArtifacts.length) {
+              core.setFailed(
+                `compatibility-formal run ${selected.id} lacks exact-source artifacts: ${missingArtifacts.join(', ')}`
               );
             }
