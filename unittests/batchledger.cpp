@@ -148,18 +148,27 @@ static bool wait_child(pid_t pid, int timeout_msec, int *status)
 }
 
 /* ------------------------------------------------ exact frame collector --- */
+/* Every field that distinguishes a correct terminal from a resurrected/reordered/
+   field-altered one (local-oracle item 1): exact id, SIGNED exit code, origin,
+   flags, unknown-client id, and the completion sentinels. */
 struct DoneFrame {
     uint32_t job_id;
-    uint32_t exitcode;
-    bool from_server;   /* origin: JobDone from a compile server vs a submitter */
+    int      exitcode;      /* signed */
+    bool     from_server;
+    uint32_t flags;
+    uint32_t unknown_client;
+    uint32_t real_msec;
+    uint32_t user_msec;
 };
 
-/* Collect ALL JobDone frames the scheduler receives over `window_msec`, in exact
-   arrival order, recording id/exit/origin.  Ordered multiset: three JobDone of
-   one id are three entries, never satisfying a three-distinct-id expectation. */
-static std::vector<DoneFrame> collect_job_done(MsgChannel *sched, int window_msec)
+/* Collect ALL JobDone frames over `window_msec` in EXACT ARRIVAL ORDER.  An
+   ordered multiset -- three JobDone of one id are three ordered entries and never
+   satisfy a three-distinct-id expectation.  Returns whether the channel errored
+   (EOF/read) so absence/quiet-window checks can fail closed. */
+static std::vector<DoneFrame> collect_job_done(MsgChannel *sched, int window_msec, bool *errored = nullptr)
 {
     std::vector<DoneFrame> frames;
+    if (errored) *errored = false;
     const Clock::time_point deadline = Clock::now() + std::chrono::milliseconds(window_msec);
     while (sched && Clock::now() < deadline) {
         Msg *msg = sched->get_msg(1, true);
@@ -171,12 +180,16 @@ static std::vector<DoneFrame> collect_job_done(MsgChannel *sched, int window_mse
                     f.job_id = d->job_id;
                     f.exitcode = d->exitcode;
                     f.from_server = d->is_from_server();
+                    f.flags = d->flags;
+                    f.unknown_client = d->unknown_job_client_id();
+                    f.real_msec = d->real_msec;
+                    f.user_msec = d->user_msec;
                     frames.push_back(f);
                 }
             }
             delete msg;
         }
-        if (sched->at_eof()) break;
+        if (sched->at_eof()) { if (errored) *errored = true; break; }
     }
     return frames;
 }
@@ -188,22 +201,66 @@ static int count_id(const std::vector<DoneFrame> &f, uint32_t id)
     return n;
 }
 
-/* Capture up to `want` USE_CS frames delivered to a client, exact fields. */
-struct SeenUseCS { uint32_t job_id; bool got_env; std::string host; };
-static std::vector<SeenUseCS> capture_use_cs(MsgChannel *client, int want, int timeout_msec)
+/* A client-id cancellation is a JobDone whose unknown_job_client_id() is non-zero
+   (set_unknown_job_client_id stores the client id in job_id, comm.cpp). */
+static int count_cancellations(const std::vector<DoneFrame> &f, uint32_t client_id)
+{
+    int n = 0;
+    for (const DoneFrame &d : f) if (d.unknown_client != 0 && d.unknown_client == client_id) ++n;
+    return n;
+}
+
+/* The exact ordered sequence of SETTLEMENT job-ids (real terminals, excluding
+   client-id cancellations), for order asserts. */
+static std::vector<uint32_t> done_order(const std::vector<DoneFrame> &f)
+{
+    std::vector<uint32_t> ids;
+    for (const DoneFrame &d : f) if (d.unknown_client == 0 && d.job_id != 0) ids.push_back(d.job_id);
+    return ids;
+}
+
+static std::string ids_to_string(const std::vector<uint32_t> &v)
+{
+    std::string s = "[";
+    for (size_t i = 0; i < v.size(); ++i) { if (i) s += ","; s += std::to_string(v[i]); }
+    return s + "]";
+}
+
+/* Capture up to `want` USE_CS frames, EVERY serialized field (local-oracle item 1). */
+struct SeenUseCS {
+    uint32_t job_id;
+    std::string host;
+    uint32_t port;
+    std::string platform;
+    bool got_env;
+    uint32_t client_id;
+    uint32_t matched_job_id;
+};
+static std::vector<SeenUseCS> capture_use_cs(MsgChannel *client, int want, int timeout_msec, bool *errored = nullptr)
 {
     std::vector<SeenUseCS> seen;
+    if (errored) *errored = false;
     const Clock::time_point deadline = Clock::now() + std::chrono::milliseconds(timeout_msec);
     while (client && static_cast<int>(seen.size()) < want && Clock::now() < deadline) {
         Msg *msg = client->get_msg(1, true);
         if (msg) {
             if (*msg == Msg::USE_CS) {
                 UseCSMsg *u = dynamic_cast<UseCSMsg *>(msg);
-                if (u) { SeenUseCS s; s.job_id = u->job_id; s.got_env = u->got_env != 0; s.host = u->hostname; seen.push_back(s); }
+                if (u) {
+                    SeenUseCS s;
+                    s.job_id = u->job_id;
+                    s.host = u->hostname;
+                    s.port = u->port;
+                    s.platform = u->host_platform;
+                    s.got_env = u->got_env != 0;
+                    s.client_id = u->client_id;
+                    s.matched_job_id = u->matched_job_id;
+                    seen.push_back(s);
+                }
             }
             delete msg;
         }
-        if (client->at_eof()) break;
+        if (client->at_eof()) { if (errored) *errored = true; break; }
     }
     return seen;
 }
@@ -654,6 +711,173 @@ done:
     return failures;
 }
 
+/* Teardown matrix -- remote rows.  A batch of 3 remote decisions; `deliver` of
+   them are delivered, then the client ends by raw EOF (use_endmsg=false) or a
+   clean EndMsg (use_endmsg=true).  NORMAL end (clean EndMsg with all expected
+   delivered and no unfinished local) settles nothing; every other end settles
+   the delivered-but-unfinished entries by exact id in order plus one client-id
+   cancellation for the undelivered tail. */
+static int run_teardown_remote(const char *iceccd, int deliver, bool use_endmsg)
+{
+    Farm f;
+    MsgChannel *client = nullptr;
+    bool clean = false;
+    REQUIRE_OR_ABORT(setup_farm(iceccd, 1, f), "fresh farm activated");
+    client = connect_unix_bounded(f.socket_path, 5000);
+    REQUIRE_OR_ABORT(client != nullptr, "batch client connected");
+    {
+        unsigned int fcount = 0;
+        const uint32_t cid = publish_batch(client, f.sched, "td.cpp", 3, &fcount);
+        REQUIRE_OR_ABORT(cid != 0, "forwarded GetCS carried a client id");
+        const uint32_t J[3] = { 7000, 7001, 7002 };
+        for (int i = 0; i < deliver; ++i)
+            f.sched->send_msg(UseCSMsg("x86_64", "10.0.0.9", 3632u, J[i], true, cid, 0));
+        if (deliver > 0) {
+            std::vector<SeenUseCS> got = capture_use_cs(client, deliver, 5000);
+            REQUIRE_OR_ABORT((int)got.size() == deliver, "the delivered remote decisions reached the client");
+        }
+        /* end the client */
+        if (use_endmsg) {
+            REQUIRE(client->send_msg(EndMsg()), "client sent a clean EndMsg");
+        } else {
+            delete client; client = nullptr;   /* raw EOF */
+        }
+        std::vector<DoneFrame> term = collect_job_done(f.sched, 4000);
+
+        const bool normal = use_endmsg && deliver == 3;   /* all expected delivered, no local */
+        std::vector<uint32_t> expect;
+        if (!normal) for (int i = 0; i < deliver; ++i) expect.push_back(J[i]);
+        const int expect_cancel = (!normal && deliver < 3) ? 1 : 0;
+
+        std::vector<uint32_t> seq = done_order(term);
+        fprintf(stderr, "         (end=%s deliver=%d -> terminals %s cancels=%d)\n",
+                use_endmsg ? "EndMsg" : "EOF", deliver, ids_to_string(seq).c_str(),
+                count_cancellations(term, cid));
+        REQUIRE(seq == expect, "exact ordered settlement matches the plan");
+        REQUIRE(count_cancellations(term, cid) == expect_cancel, "exact client-id cancellation count");
+        /* no terminal for a not-yet-delivered id ever */
+        for (int i = deliver; i < 3; ++i)
+            REQUIRE(count_id(term, J[i]) == 0, "no terminal for an undelivered decision");
+
+        /* trailing liveness: a fresh scalar client completes a real GetCS->S->
+           UseCS->client exchange (a live scheduler forwards, so we must answer). */
+        MsgChannel *live = connect_unix_bounded(f.socket_path, 3000);
+        REQUIRE(live != nullptr, "daemon accepts a new client after teardown");
+        if (live) {
+            live->send_msg(make_getcs("post.cpp", 1));
+            Msg *lfwd = wait_for_type(f.sched, Msg::GET_CS, 4000);
+            REQUIRE(lfwd != nullptr, "post-teardown scalar GetCS reached the scheduler");
+            uint32_t lc = 0;
+            { GetCSMsg *g = dynamic_cast<GetCSMsg *>(lfwd); if (g) lc = g->client_id; }
+            delete lfwd;
+            f.sched->send_msg(UseCSMsg("x86_64", "10.0.0.9", 3632u, 7500, true, lc, 0));
+            std::vector<SeenUseCS> pv = capture_use_cs(live, 1, 4000);
+            REQUIRE(pv.size() == 1 && (pv.empty() || pv[0].job_id == 7500),
+                    "post-teardown scalar exchange completed exactly once");
+            delete live;
+        }
+    }
+done:
+    delete client;
+    teardown_farm(f, &clean);
+    REQUIRE(clean, "iceccd exited cleanly");
+    return failures;
+}
+
+/* Teardown matrix -- local rows.  Three LOCAL decisions behind a capacity blocker
+   (JobLocalBegin held), ended early in a queued/active state, or normally after
+   all local entries complete.  A local unfinished entry is always settled by
+   exact id; capacity returns to baseline; a normal End settles nothing. */
+static int run_teardown_local(const char *iceccd, const std::string &scenario)
+{
+    Farm f;
+    MsgChannel *blocker = nullptr, *client = nullptr;
+    bool clean = false;
+    REQUIRE_OR_ABORT(setup_farm(iceccd, 1, f), "fresh farm activated (-m1)");
+    blocker = connect_unix_bounded(f.socket_path, 5000);
+    REQUIRE_OR_ABORT(blocker != nullptr, "blocker connected");
+    {
+        JobLocalBeginMsg jlb(0, "blk.o", false, "td-blocker", "g++ -c blk.cpp -o blk.o",
+                             JobLocalBeginMsg::LocalFlagNone);
+        REQUIRE_OR_ABORT(blocker->send_msg(jlb), "blocker sent JobLocalBegin");
+        Msg *ack = wait_for_type(blocker, Msg::JOB_LOCAL_BEGIN, 5000);
+        REQUIRE_OR_ABORT(ack != nullptr, "daemon granted the blocker the slot");
+        delete ack;
+    }
+    { Msg *m = wait_for_type(f.sched, Msg::JOB_LOCAL_BEGIN, 1500); delete m; }
+
+    client = connect_unix_bounded(f.socket_path, 5000);
+    REQUIRE_OR_ABORT(client != nullptr, "batch client connected");
+    {
+        unsigned int fcount = 0;
+        const uint32_t cid = publish_batch(client, f.sched, "tdl.cpp", 3, &fcount);
+        REQUIRE_OR_ABORT(cid != 0, "forwarded GetCS carried a client id");
+        const uint32_t L1 = 7100, L2 = 7101, L3 = 7102;
+        for (uint32_t j : { L1, L2, L3 })   /* LOCAL decisions: queued behind blocker */
+            f.sched->send_msg(UseCSMsg("x86_64", "127.0.0.1", 0, j, true, cid, 0));
+        usleep(300 * 1000);   /* let the daemon record + queue them */
+
+        if (scenario == "queued") {
+            /* end early while all three are queued (blocker still holds) */
+            REQUIRE(client->send_msg(EndMsg()), "client sent EndMsg with local entries queued");
+            std::vector<DoneFrame> term = collect_job_done(f.sched, 4000);
+            std::vector<uint32_t> seq = done_order(term);
+            fprintf(stderr, "         (queued -> terminals %s cancels=%d)\n",
+                    ids_to_string(seq).c_str(), count_cancellations(term, cid));
+            /* all three recorded local entries are unfinished -> settled once each */
+            REQUIRE(seq == (std::vector<uint32_t>{L1, L2, L3}),
+                    "queued local entries settled once each by exact id");
+            REQUIRE(count_cancellations(term, cid) == 0,
+                    "no cancellation when all expected decisions were recorded");
+        } else if (scenario == "active") {
+            /* release the blocker -> L1 becomes active; end while L1 is active */
+            { JobDoneMsg d(0, 0, JobDoneMsg::FROM_SUBMITTER); d.real_msec = 1; d.user_msec = 1; blocker->send_msg(d); }
+            std::vector<SeenUseCS> a = capture_use_cs(client, 1, 4000);
+            REQUIRE_OR_ABORT(a.size() == 1 && a[0].job_id == L1, "L1 delivered active after release");
+            REQUIRE(client->send_msg(EndMsg()), "client sent EndMsg with L1 active");
+            std::vector<DoneFrame> term = collect_job_done(f.sched, 4000);
+            std::vector<uint32_t> seq = done_order(term);
+            fprintf(stderr, "         (active -> terminals %s cancels=%d)\n",
+                    ids_to_string(seq).c_str(), count_cancellations(term, cid));
+            REQUIRE(seq == (std::vector<uint32_t>{L1, L2, L3}),
+                    "active + queued local entries settled once each");
+            REQUIRE(count_cancellations(term, cid) == 0, "no cancellation (all recorded)");
+            /* capacity restored: a fresh blocker can take the slot again */
+            MsgChannel *b2 = connect_unix_bounded(f.socket_path, 3000);
+            REQUIRE(b2 != nullptr, "second blocker connected");
+            if (b2) {
+                JobLocalBeginMsg j2(0, "b2.o", false, "cap-check", "g++ -c b2.cpp -o b2.o", JobLocalBeginMsg::LocalFlagNone);
+                b2->send_msg(j2);
+                Msg *ack2 = wait_for_type(b2, Msg::JOB_LOCAL_BEGIN, 4000);
+                REQUIRE(ack2 != nullptr, "capacity returned to baseline (slot re-granted)");
+                delete ack2; delete b2;
+            }
+        } else { /* normal: deliver + complete all three, then End */
+            { JobDoneMsg d(0, 0, JobDoneMsg::FROM_SUBMITTER); d.real_msec = 1; d.user_msec = 1; blocker->send_msg(d); }
+            uint32_t exp[3] = { L1, L2, L3 };
+            for (int i = 0; i < 3; ++i) {
+                std::vector<SeenUseCS> v = capture_use_cs(client, 1, 4000);
+                REQUIRE_OR_ABORT(v.size() == 1 && v[0].job_id == exp[i], "next local decision delivered in order");
+                JobDoneMsg d(exp[i], 0, JobDoneMsg::FROM_SUBMITTER); d.real_msec = 1; d.user_msec = 1; client->send_msg(d);
+            }
+            std::vector<DoneFrame> after = collect_job_done(f.sched, 2500);   /* drain the 3 forwarded completions */
+            REQUIRE(done_order(after) == (std::vector<uint32_t>{L1, L2, L3}), "the 3 local completions forwarded once each");
+            REQUIRE(client->send_msg(EndMsg()), "client sent a normal EndMsg after all local done");
+            std::vector<DoneFrame> term = collect_job_done(f.sched, 3000);
+            fprintf(stderr, "         (normal -> extra terminals %s cancels=%d)\n",
+                    ids_to_string(done_order(term)).c_str(), count_cancellations(term, cid));
+            REQUIRE(done_order(term).empty(), "normal End emits no extra terminal");
+            REQUIRE(count_cancellations(term, cid) == 0, "normal End emits no cancellation");
+        }
+    }
+done:
+    delete blocker;
+    delete client;
+    teardown_farm(f, &clean);
+    REQUIRE(clean, "iceccd exited cleanly");
+    return failures;
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 3) {
@@ -669,6 +893,14 @@ int main(int argc, char **argv)
     else if (c == "teardown-clean")     rc = case_teardown_clean(argv[1]);
     else if (c == "local-capacity")     rc = case_local_capacity(argv[1]);
     else if (c == "batch-nocs")         rc = case_batch_nocs(argv[1]);
+    else if (c == "teardown-eof-0")     rc = run_teardown_remote(argv[1], 0, false);
+    else if (c == "teardown-eof-1")     rc = run_teardown_remote(argv[1], 1, false);
+    else if (c == "teardown-eof-2")     rc = run_teardown_remote(argv[1], 2, false);
+    else if (c == "teardown-eof-3")     rc = run_teardown_remote(argv[1], 3, false);
+    else if (c == "teardown-early-1")   rc = run_teardown_remote(argv[1], 1, true);
+    else if (c == "teardown-local-queued") rc = run_teardown_local(argv[1], "queued");
+    else if (c == "teardown-local-active") rc = run_teardown_local(argv[1], "active");
+    else if (c == "teardown-normal-local") rc = run_teardown_local(argv[1], "normal");
     else { fprintf(stderr, "unknown case: %s\n", c.c_str()); return 2; }
 
     fprintf(stderr, "%s [%s] (%d failure%s)\n",

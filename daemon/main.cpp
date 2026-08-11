@@ -6310,19 +6310,29 @@ void Daemon::handle_end(Client *client, int exitcode)
                assignment owned by the current active generation (an unpublished/
                superseded batch emits nothing).  job_id is then cleared so the
                scalar settlement below is a no-op for this client. */
-            const bool clean = (exitcode == 119);
+            /* NORMAL End = a clean EndMsg (119) with EVERY expected decision
+               received and NO unfinished local entry.  End alone is not proof of
+               completion, so an early End (missing decisions) or an unfinished
+               local entry falls back to the conservative abnormal-end plan. */
+            bool normal = (exitcode == 119)
+                && (client->getcs_delivered >= client->getcs_expected);
+            if (normal) {
+                for (const Client::BatchEntry &e : client->getcs_batch) {
+                    if (e.local && !e.completed) { normal = false; break; }
+                }
+            }
             if (scheduler_owns_getcs_assignment(client)) {
-                /* Settlement plan.  Clean End (exitcode 119): a delivered REMOTE
-                   entry is CLIENT_RELEASED -- its worker reports completion to S
-                   directly, so the submitter emits no terminal.  Any other end,
-                   or any unfinished LOCAL entry (it ran here), is settled by exact
-                   id.  Completed entries never re-settle.  One client-id
-                   cancellation covers the undelivered tail. */
+                /* Settlement plan.  In a NORMAL End a delivered REMOTE entry is
+                   CLIENT_RELEASED -- its worker reports completion to S directly,
+                   so the submitter emits no terminal.  Any other end, or any
+                   unfinished LOCAL entry (it ran here), is settled by exact id.
+                   Completed entries never re-settle.  One client-id cancellation
+                   covers the undelivered tail. */
                 for (const Client::BatchEntry &e : client->getcs_batch) {
                     if (e.completed) {
                         continue;
                     }
-                    if (clean && !e.local) {
+                    if (normal && !e.local) {
                         continue;   /* CLIENT_RELEASED */
                     }
                     send_scheduler(JobDoneMsg(e.job_id, exitcode, JobDoneMsg::FROM_SUBMITTER, clients.size()));
@@ -6347,6 +6357,9 @@ void Daemon::handle_end(Client *client, int exitcode)
             client->job_id = 0;
             client->last_known_job_id = 0;
             client->getcs_batch.clear();
+            /* the batch block fully settled this client; stop the scalar
+               settlement below from re-issuing a client-id cancellation. */
+            client->getcs_published = false;
         }
         int job_id = client->job_id;
         bool use_client_id = false;
