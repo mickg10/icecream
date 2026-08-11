@@ -29,6 +29,8 @@ schedbp_SOURCES = schedbp.cpp
 
 # Login-attempt/ConfCS activation lifecycle gate (issue #4 G4).
 daemonlogin_SOURCES = daemonlogin.cpp
+daemonlogin_CXXFLAGS = -pthread
+daemonlogin_LDFLAGS = -pthread
 daemonlogin_LDADD = ../services/libicecc.la
 
 # Connectivity-probe state machine regression (issue #4 item 4): drives
