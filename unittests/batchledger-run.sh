@@ -12,6 +12,8 @@ for c in self-control \
          teardown-local-queued teardown-local-active teardown-normal-local \
          scalar-count0 scalar-count1-remote scalar-count1-local \
          mixed-LRR mixed-RLR mixed-RNR nocs-dedup-excess \
+         transition-1 transition-2 transition-3 \
+         invalid-jobdone local-lifetime compile-started \
          audit-jobbegin audit-delivery-fail audit-sched-loss; do
     if ! "$dir/batchledger" "$iceccd" "$c"; then
         echo "batchledger case FAILED: $c" >&2

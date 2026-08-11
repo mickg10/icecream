@@ -226,6 +226,31 @@ static std::string ids_to_string(const std::vector<uint32_t> &v)
     return s + "]";
 }
 
+/* Exact ordered-frame comparator (local-oracle 5256331302 #1): the collected
+   JobDone stream must equal the expected ordered list over EVERY discriminating
+   field -- job id, signed exit, origin, and client-id-cancellation identity.  Any
+   extra/missing/reordered/field-altered frame fails. */
+struct ExpectDone { uint32_t job_id; int exitcode; bool from_server; uint32_t unknown_client; };
+static bool done_frames_exact(const std::vector<DoneFrame> &got,
+                              const std::vector<ExpectDone> &want, std::string *why)
+{
+    if (got.size() != want.size()) {
+        if (why) *why = "frame count " + std::to_string(got.size()) + " != expected " + std::to_string(want.size());
+        return false;
+    }
+    for (size_t i = 0; i < got.size(); ++i) {
+        if (got[i].job_id != want[i].job_id || got[i].exitcode != want[i].exitcode
+                || got[i].from_server != want[i].from_server
+                || got[i].unknown_client != want[i].unknown_client) {
+            if (why) *why = "frame[" + std::to_string(i) + "] mismatch: got id=" + std::to_string(got[i].job_id)
+                          + " exit=" + std::to_string(got[i].exitcode) + " fromS=" + std::to_string(got[i].from_server)
+                          + " unk=" + std::to_string(got[i].unknown_client);
+            return false;
+        }
+    }
+    return true;
+}
+
 /* Capture up to `want` USE_CS frames, EVERY serialized field (local-oracle item 1). */
 struct SeenUseCS {
     uint32_t job_id;
@@ -460,19 +485,29 @@ static int case_client_done_filter(const char *iceccd)
     REQUIRE_OR_ABORT(cid != 0, "forwarded GetCS carried a client id");
     REQUIRE(fcount == 3, "forwarded GetCS preserved count=3");
 
+    /* three remote decisions with visibly DISTINCT full field tuples */
     const uint32_t J1 = 6100, J2 = 6101, J3 = 6102, U = 6199;
+    struct { uint32_t id; const char *host; unsigned port; unsigned matched; } R[3] = {
+        { J1, "10.0.0.1", 3001, 1 }, { J2, "10.0.0.2", 3002, 2 }, { J3, "10.0.0.3", 3003, 3 } };
     bool sent = true;
-    for (uint32_t j : { J1, J2, J3 })
-        sent = sent && f.sched->send_msg(UseCSMsg("x86_64", "10.0.0.9", 3632u, j, true, cid, 0));
+    for (int i = 0; i < 3; ++i)
+        sent = sent && f.sched->send_msg(UseCSMsg("x86_64", R[i].host, R[i].port, R[i].id, true, cid, R[i].matched));
     REQUIRE_OR_ABORT(sent, "scheduler delivered three remote decisions");
     std::vector<SeenUseCS> got = capture_use_cs(client, 3, 6000);
     REQUIRE_OR_ABORT(got.size() == 3, "client received all three remote UseCS");
+    bool tuples_ok = true;
+    for (int i = 0; i < 3; ++i)
+        tuples_ok = tuples_ok && got[i].job_id == R[i].id && got[i].host == R[i].host
+                 && got[i].port == R[i].port && got[i].matched_job_id == R[i].matched
+                 && got[i].got_env && got[i].platform == "x86_64";
+    REQUIRE(tuples_ok, "each remote UseCS delivered in exact FIFO order with its full field tuple");
 
-    /* unmatched U, then a duplicate J1 in the same burst as valid J2/J3 */
-    JobDoneMsg dU(U, 0, JobDoneMsg::FROM_SUBMITTER); dU.real_msec = 1; dU.user_msec = 1;
-    JobDoneMsg d1(J1, 0, JobDoneMsg::FROM_SUBMITTER); d1.real_msec = 1; d1.user_msec = 1;
-    JobDoneMsg d2(J2, 0, JobDoneMsg::FROM_SUBMITTER); d2.real_msec = 1; d2.user_msec = 1;
-    JobDoneMsg d3(J3, 0, JobDoneMsg::FROM_SUBMITTER); d3.real_msec = 1; d3.user_msec = 1;
+    /* unmatched U (exit 91), then a duplicate J1 in one burst with valid J2/J3;
+       distinct exit sentinels so a reorder or field swap fails. */
+    JobDoneMsg dU(U, 91, JobDoneMsg::FROM_SUBMITTER); dU.real_msec = 5; dU.user_msec = 5;
+    JobDoneMsg d1(J1, 11, JobDoneMsg::FROM_SUBMITTER); d1.real_msec = 1; d1.user_msec = 1;
+    JobDoneMsg d2(J2, 12, JobDoneMsg::FROM_SUBMITTER); d2.real_msec = 2; d2.user_msec = 2;
+    JobDoneMsg d3(J3, 13, JobDoneMsg::FROM_SUBMITTER); d3.real_msec = 3; d3.user_msec = 3;
     client->send_msg(dU);
     client->send_msg(d1);
     client->send_msg(d1);   /* duplicate of J1 */
@@ -480,20 +515,24 @@ static int case_client_done_filter(const char *iceccd)
     client->send_msg(d3);
 
     std::vector<DoneFrame> f_done = collect_job_done(f.sched, 5000);
-    fprintf(stderr, "         (scheduler saw %zu JobDone: U=%d J1=%d J2=%d J3=%d)\n",
-            f_done.size(), count_id(f_done, U), count_id(f_done, J1),
-            count_id(f_done, J2), count_id(f_done, J3));
-    REQUIRE(count_id(f_done, U) == 0, "unmatched JobDone(U) is not forwarded to S");
-    REQUIRE(count_id(f_done, J1) == 1, "duplicate JobDone(J1) forwarded exactly once");
-    REQUIRE(count_id(f_done, J2) == 1, "JobDone(J2) forwarded exactly once");
-    REQUIRE(count_id(f_done, J3) == 1, "JobDone(J3) forwarded exactly once");
+    std::string why;
+    std::vector<ExpectDone> want = { { J1, 11, false, 0 }, { J2, 12, false, 0 }, { J3, 13, false, 0 } };
+    const bool exact = done_frames_exact(f_done, want, &why);
+    fprintf(stderr, "         (scheduler saw %zu JobDone; exact=%d %s)\n", f_done.size(), exact, why.c_str());
+    REQUIRE(exact, "scheduler observed exactly [J1/11, J2/12, J3/13] in order -- U + duplicate J1 filtered, no extra frame");
 
-    /* trailing liveness: a fresh scalar client still gets a local decision */
-    {
-        MsgChannel *live = connect_unix_bounded(f.socket_path, 3000);
-        REQUIRE(live != nullptr, "daemon still accepts a new client after the filtered dones");
-        delete live;
-    }
+    /* trailing real scalar exchange (not merely a UNIX connection) */
+    MsgChannel *live = connect_unix_bounded(f.socket_path, 3000);
+    REQUIRE_OR_ABORT(live != nullptr, "daemon accepts a new client after the filtered dones");
+    live->send_msg(make_getcs("post.cpp", 1));
+    Msg *lf = wait_for_type(f.sched, Msg::GET_CS, 4000);
+    REQUIRE(lf != nullptr, "trailing scalar GetCS reached S");
+    uint32_t lc = 0; { GetCSMsg *g = dynamic_cast<GetCSMsg *>(lf); if (g) lc = g->client_id; }
+    delete lf;
+    f.sched->send_msg(UseCSMsg("x86_64", "10.9.9.9", 5000, 6150, true, lc, 0));
+    std::vector<SeenUseCS> pv = capture_use_cs(live, 1, 4000);
+    REQUIRE(pv.size() == 1 && (pv.empty() || pv[0].job_id == 6150), "trailing scalar exchange delivered exactly one decision");
+    delete live;
     }  /* nested scope */
 
 done:
@@ -1239,6 +1278,201 @@ done:
     return failures;
 }
 
+/* Item 6 -- count 1..3 transition/reference enumeration: for N in {1,2,3} the
+   entry lifecycle refines the same abstract sequence -- RECORDED -> REMOTE_
+   DELIVERED (exact field tuple, FIFO) -> COMPLETED (exact ordered terminal by
+   distinct exit) -> a NORMAL End settles nothing.  N==1 is the allocation-free
+   SCALAR_ONE path; N=2,3 the ledger; identical observable transition. */
+static int case_transition_enum(const char *iceccd, int N)
+{
+    Farm f;
+    MsgChannel *client = nullptr;
+    bool clean = false;
+    REQUIRE_OR_ABORT(setup_farm(iceccd, 1, f), "fresh farm activated");
+    client = connect_unix_bounded(f.socket_path, 5000);
+    REQUIRE_OR_ABORT(client != nullptr, "client connected");
+    {
+        unsigned int fc = 0;
+        const uint32_t cid = publish_batch(client, f.sched, "tr.cpp", (unsigned)N, &fc);
+        REQUIRE_OR_ABORT(cid != 0, "forwarded GetCS carried a client id");
+        REQUIRE(fc == (unsigned)N, "forwarded GetCS preserved the requested count");
+        const uint32_t base = 9000 + N * 10;
+        /* deliver: distinct field tuple per entry */
+        for (int i = 0; i < N; ++i) {
+            char host[32]; snprintf(host, sizeof host, "10.1.%d.%d", N & 255, (i + 1) & 255);
+            f.sched->send_msg(UseCSMsg("x86_64", host, 4000u + i, base + i, true, cid, 10 + i));
+        }
+        std::vector<SeenUseCS> got = capture_use_cs(client, N, 6000);
+        REQUIRE_OR_ABORT((int)got.size() == N, "all N remote decisions delivered");
+        bool tup = true;
+        for (int i = 0; i < N; ++i) tup = tup && got[i].job_id == base + i && got[i].port == 4000u + i && got[i].matched_job_id == (uint32_t)(10 + i);
+        REQUIRE(tup, "delivered decisions in FIFO order with exact per-entry tuples");
+        /* complete: distinct exit sentinel per entry -> exact ordered terminals */
+        for (int i = 0; i < N; ++i) { JobDoneMsg d(base + i, 30 + i, JobDoneMsg::FROM_SUBMITTER); d.real_msec = i + 1; d.user_msec = i + 1; client->send_msg(d); }
+        std::vector<DoneFrame> term = collect_job_done(f.sched, 4000);
+        std::vector<ExpectDone> want;
+        for (int i = 0; i < N; ++i) want.push_back({ base + i, 30 + i, false, 0 });
+        std::string why;
+        REQUIRE(done_frames_exact(term, want, &why), "exact ordered terminals by distinct exit (why: " + why + ")");
+        /* NORMAL End (all delivered+completed) settles nothing */
+        REQUIRE(client->send_msg(EndMsg()), "client sent a normal EndMsg");
+        std::vector<DoneFrame> after = collect_job_done(f.sched, 2500);
+        REQUIRE(after.empty(), "normal End emits no extra terminal or cancellation");
+    }
+done:
+    delete client;
+    teardown_farm(f, &clean);
+    REQUIRE(clean, "iceccd exited cleanly");
+    return failures;
+}
+
+/* Product correction #2 (local-oracle 17:34): a JobDone for a decision the client
+   was never actually handed -- a still-queued LOCAL_WAIT_CAPACITY entry -- must be
+   REJECTED (not forwarded to S) and must NOT mark the entry completed.  The former
+   boolean ledger accepted any exact unfinished id, so it forwarded the premature
+   JobDone and marked L2 completed -> L2 then never delivered (RED).  Under the
+   tagged state only REMOTE_DELIVERED / LOCAL_DELIVERED_SLOT_CHARGED accept a
+   JobDone, so the premature frame is dropped and L2 delivers normally after L1. */
+static int case_invalid_jobdone(const char *iceccd)
+{
+    Farm f; MsgChannel *blocker = nullptr, *client = nullptr; bool clean = false;
+    const uint32_t ids[2] = { 8800, 8801 };   /* L1 active, L2 queued */
+    const uint32_t cid = audit_setup(iceccd, f, blocker, client, 2, ids);
+    REQUIRE_OR_ABORT(cid != 0, "audit farm + two local decisions set up");
+    {
+        /* release the blocker -> L1 delivers and holds the one slot; L2 stays a
+           queued LOCAL_WAIT_CAPACITY entry (the lane is occupied by L1). */
+        { JobDoneMsg d(0, 0, JobDoneMsg::FROM_SUBMITTER); d.real_msec = 1; d.user_msec = 1; blocker->send_msg(d); }
+        std::vector<SeenUseCS> a = capture_use_cs(client, 1, 4000);
+        REQUIRE_OR_ABORT(a.size() == 1 && a[0].job_id == ids[0], "L1 delivered and active; L2 queued");
+
+        /* premature JobDone for the still-queued L2: rejected, never forwarded. */
+        { JobDoneMsg d(ids[1], 55, JobDoneMsg::FROM_SUBMITTER); d.real_msec = 1; d.user_msec = 1; client->send_msg(d); }
+        std::vector<DoneFrame> premature = collect_job_done(f.sched, 1500);
+        REQUIRE(count_id(premature, ids[1]) == 0, "premature JobDone for the queued L2 is NOT forwarded to S");
+
+        /* complete L1 for real -> forwarded once; the lane frees and L2 (still
+           recorded, NOT completed by the premature frame) auto-binds. */
+        CompileJob j1; j1.setLanguage(CompileJob::Lang_CXX); j1.setCompilerName("g++");
+        j1.setJobID(ids[0]); j1.setEnvironmentVersion("__client"); j1.setTargetPlatform("x86_64");
+        j1.setInputFile(f.work + "/a.cpp"); j1.setOutputFile(f.work + "/a.o"); j1.setWorkingDirectory(f.work);
+        REQUIRE(client->send_msg(CompileFileMsg(&j1)), "L1 CompileFile(__client)");
+        { Msg *jb = wait_for_type(f.sched, Msg::JOB_BEGIN, 4000); REQUIRE(jb != nullptr, "L1 JobBegin via ordinary local path"); delete jb; }
+        { JobDoneMsg d(ids[0], 11, JobDoneMsg::FROM_SUBMITTER); d.real_msec = 1; d.user_msec = 1; client->send_msg(d); }
+        std::vector<DoneFrame> t1 = collect_job_done(f.sched, 3000);
+        REQUIRE(count_id(t1, ids[0]) == 1, "L1 completion forwarded exactly once");
+
+        /* L2 must now deliver -- proof the premature JobDone did not complete it. */
+        std::vector<SeenUseCS> b = capture_use_cs(client, 1, 4000);
+        REQUIRE(b.size() == 1 && b[0].job_id == ids[1], "queued L2 delivered after L1 (premature JobDone did not complete it)");
+    }
+done:
+    delete blocker; delete client; teardown_farm(f, &clean);
+    REQUIRE(clean, "iceccd exited cleanly");
+    return failures;
+}
+
+/* Product correction #1 (local-oracle 17:34): two local entries on ONE batch
+   client, each performing the real sequence UseCS -> CompileFile(distinct id) ->
+   exact JobBegin -> JobDone.  This is the repeated-CompileFile path that made
+   handle_compile_file's `client->job = job` overwrite (and leak) the prior entry's
+   CompileJob; the fix releases/nulls cl->job on the local-completion transition
+   before binding the successor.  Behaviourally this asserts each entry's JobBegin
+   carries its OWN distinct id and each JobDone is forwarded exactly once (the
+   successor never inherits stale job state); the retained CompileJob itself is a
+   pure memory leak, verified separately by an ASan/LSan build of this same case
+   (a leak makes iceccd exit non-zero -> the clean-exit assertion below fails). */
+static int case_local_lifetime(const char *iceccd)
+{
+    Farm f; MsgChannel *blocker = nullptr, *client = nullptr; bool clean = false;
+    const uint32_t ids[2] = { 8810, 8811 };
+    const uint32_t cid = audit_setup(iceccd, f, blocker, client, 2, ids);
+    REQUIRE_OR_ABORT(cid != 0, "audit farm + two local decisions set up");
+    {
+        { JobDoneMsg d(0, 0, JobDoneMsg::FROM_SUBMITTER); d.real_msec = 1; d.user_msec = 1; blocker->send_msg(d); }
+        for (int i = 0; i < 2; ++i) {
+            /* deliver entry i */
+            std::vector<SeenUseCS> a = capture_use_cs(client, 1, 4000);
+            REQUIRE_OR_ABORT(a.size() == 1 && a[0].job_id == ids[i], "entry delivered in order");
+            /* real production CompileFile(__client) for THIS entry's distinct id */
+            CompileJob job; job.setLanguage(CompileJob::Lang_CXX); job.setCompilerName("g++");
+            job.setJobID(ids[i]); job.setEnvironmentVersion("__client"); job.setTargetPlatform("x86_64");
+            char in[64], out[64]; snprintf(in, sizeof in, "%s/e%d.cpp", f.work.c_str(), i); snprintf(out, sizeof out, "%s/e%d.o", f.work.c_str(), i);
+            job.setInputFile(in); job.setOutputFile(out); job.setWorkingDirectory(f.work);
+            REQUIRE(client->send_msg(CompileFileMsg(&job)), "entry CompileFile(__client) sent");
+            /* JobBegin must carry THIS entry's id -- never the prior (stale) job */
+            Msg *jb = wait_for_type(f.sched, Msg::JOB_BEGIN, 4000);
+            REQUIRE_OR_ABORT(jb != nullptr, "entry emitted JobBegin");
+            { JobBeginMsg *b = dynamic_cast<JobBeginMsg *>(jb); REQUIRE(b && b->job_id == ids[i], "JobBegin carries THIS entry's distinct job id (no stale carry-over)"); }
+            delete jb;
+            /* complete this entry -> forwarded once; releases the compile job and
+               binds the successor (i==0) */
+            { JobDoneMsg d(ids[i], 20 + i, JobDoneMsg::FROM_SUBMITTER); d.real_msec = i + 1; d.user_msec = i + 1; client->send_msg(d); }
+            std::vector<DoneFrame> t = collect_job_done(f.sched, 3000);
+            REQUIRE(count_id(t, ids[i]) == 1, "entry completion forwarded exactly once");
+        }
+    }
+done:
+    delete blocker; delete client; teardown_farm(f, &clean);
+    REQUIRE(clean, "iceccd exited cleanly");
+    return failures;
+}
+
+/* Refinement (local-oracle 17:58): LOCAL_COMPILE_STARTED.  A delivered-but-not-yet-
+   compiled local entry (LOCAL_DELIVERED_SLOT_CHARGED) does NOT accept a JobDone, and
+   handle_compile_file() validates the exact bound id before adopting the CompileJob.
+   (a) a CompileFile with an unmatched id emits no JobBegin and adopts no job;
+   (b) a JobDone for the delivered-not-started entry is rejected;
+   then the real CompileFile starts it (JobBegin) and its JobDone is accepted.
+   RED@boolean-55cbd1a: (a) the wrong id was adopted and announced (JobBegin), and
+   (b) the delivered entry's `active` flag accepted+forwarded the early JobDone. */
+static int case_compile_started(const char *iceccd)
+{
+    Farm f; MsgChannel *blocker = nullptr, *client = nullptr; bool clean = false;
+    const uint32_t L1 = 8900;
+    const uint32_t cid = audit_setup(iceccd, f, blocker, client, 1, &L1);
+    REQUIRE_OR_ABORT(cid != 0, "audit farm + one local decision set up");
+    {
+        { JobDoneMsg d(0, 0, JobDoneMsg::FROM_SUBMITTER); d.real_msec = 1; d.user_msec = 1; blocker->send_msg(d); }
+        std::vector<SeenUseCS> a = capture_use_cs(client, 1, 4000);
+        REQUIRE_OR_ABORT(a.size() == 1 && a[0].job_id == L1, "L1 delivered and slot-charged (not yet compiling)");
+
+        /* (a) CompileFile with an UNMATCHED id: rejected -> no JobBegin, no adopt. */
+        {
+            CompileJob bad; bad.setLanguage(CompileJob::Lang_CXX); bad.setCompilerName("g++");
+            bad.setJobID(9999); bad.setEnvironmentVersion("__client"); bad.setTargetPlatform("x86_64");
+            bad.setInputFile(f.work + "/x.cpp"); bad.setOutputFile(f.work + "/x.o"); bad.setWorkingDirectory(f.work);
+            REQUIRE(client->send_msg(CompileFileMsg(&bad)), "client sent CompileFile with an unmatched id");
+            Msg *jb = wait_for_type(f.sched, Msg::JOB_BEGIN, 1500);
+            REQUIRE(jb == nullptr, "unmatched CompileFile emits NO JobBegin (id not adopted)");
+            delete jb;
+        }
+
+        /* (b) JobDone for the delivered-but-not-started L1: rejected, not forwarded. */
+        { JobDoneMsg d(L1, 44, JobDoneMsg::FROM_SUBMITTER); d.real_msec = 1; d.user_msec = 1; client->send_msg(d); }
+        std::vector<DoneFrame> early = collect_job_done(f.sched, 1500);
+        REQUIRE(count_id(early, L1) == 0, "JobDone for a delivered-but-not-started entry is NOT forwarded");
+
+        /* real CompileFile(L1) -> JobBegin(L1) -> LOCAL_COMPILE_STARTED */
+        CompileJob job; job.setLanguage(CompileJob::Lang_CXX); job.setCompilerName("g++");
+        job.setJobID(L1); job.setEnvironmentVersion("__client"); job.setTargetPlatform("x86_64");
+        job.setInputFile(f.work + "/a.cpp"); job.setOutputFile(f.work + "/a.o"); job.setWorkingDirectory(f.work);
+        REQUIRE(client->send_msg(CompileFileMsg(&job)), "client sent the real CompileFile(L1)");
+        { Msg *jb = wait_for_type(f.sched, Msg::JOB_BEGIN, 4000);
+          REQUIRE_OR_ABORT(jb != nullptr, "real CompileFile(L1) emitted JobBegin");
+          JobBeginMsg *b = dynamic_cast<JobBeginMsg *>(jb); REQUIRE(b && b->job_id == L1, "JobBegin carries L1"); delete jb; }
+
+        /* JobDone(L1) now accepted (STARTED) -> forwarded exactly once */
+        { JobDoneMsg d(L1, 11, JobDoneMsg::FROM_SUBMITTER); d.real_msec = 1; d.user_msec = 1; client->send_msg(d); }
+        std::vector<DoneFrame> t = collect_job_done(f.sched, 3000);
+        REQUIRE(count_id(t, L1) == 1, "JobDone for the STARTED entry forwarded exactly once");
+    }
+done:
+    delete blocker; delete client; teardown_farm(f, &clean);
+    REQUIRE(clean, "iceccd exited cleanly");
+    return failures;
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 3) {
@@ -1272,6 +1506,12 @@ int main(int argc, char **argv)
     else if (c == "audit-jobbegin")     rc = case_audit_jobbegin(argv[1]);
     else if (c == "audit-delivery-fail") rc = case_audit_delivery_fail(argv[1]);
     else if (c == "audit-sched-loss")   rc = case_audit_sched_loss(argv[1]);
+    else if (c == "transition-1")       rc = case_transition_enum(argv[1], 1);
+    else if (c == "transition-2")       rc = case_transition_enum(argv[1], 2);
+    else if (c == "transition-3")       rc = case_transition_enum(argv[1], 3);
+    else if (c == "invalid-jobdone")    rc = case_invalid_jobdone(argv[1]);
+    else if (c == "local-lifetime")     rc = case_local_lifetime(argv[1]);
+    else if (c == "compile-started")    rc = case_compile_started(argv[1]);
     else { fprintf(stderr, "unknown case: %s\n", c.c_str()); return 2; }
 
     fprintf(stderr, "%s [%s] (%d failure%s)\n",
