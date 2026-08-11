@@ -500,6 +500,8 @@ public:
         getcs_outstanding = false;
         getcs_generation = 0;
         local_owner_generation = 0;
+        getcs_expected = 0;
+        getcs_delivered = 0;
         client_id = 0;
         niceness = 0;
         status = UNKNOWN;
@@ -583,6 +585,12 @@ public:
     bool getcs_outstanding;     // G4 (bigoracle 18:45 P0): a GetCS occupies this client from accept until client destruction; a second GetCS in ANY non-terminal state is rejected (not just while WAITFORCS)
     uint64_t getcs_generation;  // G4 (bigoracle 18:45 P0): the session generation the request was published under (0 = unpublished); a scheduler reply is honored only when it matches the current ACTIVE generation
     uint64_t local_owner_generation;  // G4 (18:21): session generation that owns a started LOCAL assignment (0 = UNOWNED_LOCAL, started during LOGIN_ATTEMPT/offline); only an ACTIVE_SESSION(g)-owned job emits JobLocalBegin/JobLocalDone to S
+    // G4 (local-oracle 21:19): count>1 -> BATCH_LEDGER mode.  count<=1 keeps the
+    // scalar SCALAR_ONE path untouched.  A request selects one immutable mode at
+    // accept and never crosses.
+    uint32_t getcs_expected;   // GetCSMsg::count captured at accept (0 for the SCALAR_ONE path)
+    uint32_t getcs_delivered;  // UseCS decisions delivered to the client for a batch request
+    std::vector<uint32_t> getcs_batch_jobids;  // exact job ids recorded for a batch request (dedup + teardown settlement)
     CompileJob *job;
     int client_id;
     uint32_t niceness; // nice priority (0-20), for PENDING_USE_CS
@@ -5060,11 +5068,51 @@ int Daemon::scheduler_use_cs(UseCSMsg *msg)
         return 1;
     }
 
-    /* G4 (bigoracle 18:45 P0): the session is ACTIVE (checked above); authorize
-       a reply only for a request PUBLISHED under the CURRENT active generation
-       and still awaiting a decision (WAITFORCS).  A stale reply carrying a
-       superseded generation, or one for an unpublished/wrong-phase client, is
-       terminalized by its EXACT job id and never delivered. */
+    if (c->getcs_expected > 1) {
+        /* G4 BATCH_LEDGER (local-oracle 21:19/21:42): a count>1 request receives
+           up to `expected` distinct decisions.  Authorize by (published, current
+           generation, not-yet-complete) -- NOT by WAITFORCS, which only the
+           first reply satisfies.  Dedup exact job ids (ignore, never terminalize
+           the original); terminalize a stale/excess reply by its exact job id.
+           Each accepted decision is relayed to the client and recorded for exact
+           teardown settlement; the request completes at delivered == expected. */
+        if (!(c->getcs_published
+                && c->getcs_generation == scheduler_session_generation
+                && c->getcs_delivered < c->getcs_expected)) {
+            log_warning() << "scheduler_use_cs batch excess/stale job " << msg->job_id
+                          << " client " << msg->client_id << "; terminalizing" << endl;
+            return send_scheduler(JobDoneMsg(msg->job_id, 107, JobDoneMsg::FROM_SUBMITTER, clients.size())) ? 0 : 1;
+        }
+        for (uint32_t seen : c->getcs_batch_jobids) {
+            if (seen == msg->job_id) {
+                log_warning() << "scheduler_use_cs batch duplicate job " << msg->job_id
+                              << "; ignoring" << endl;
+                return 0;   /* never deliver or count a duplicate twice */
+            }
+        }
+        c->getcs_batch_jobids.push_back(msg->job_id);   /* record BEFORE the write */
+        UseCSMsg fwd(msg->host_platform, msg->hostname, msg->port, msg->job_id,
+                     true, 1, msg->matched_job_id);
+        if (!c->channel->send_msg(fwd)) {
+            ++usecs_exact_aborts;
+            handle_end(c, 143);
+            return 0;
+        }
+        ++c->getcs_delivered;
+        c->job_id = msg->job_id;
+        c->last_known_job_id = msg->job_id;
+        if (c->status == Client::WAITFORCS) {
+            c->set_status(Client::WAITCOMPILE, "scheduler_use_cs: batch decisions delivering");
+        }
+        return 0;
+    }
+
+    /* G4 (bigoracle 18:45 P0): SCALAR_ONE (count<=1).  The session is ACTIVE
+       (checked above); authorize a reply only for a request PUBLISHED under the
+       CURRENT active generation and still awaiting a decision (WAITFORCS).  A
+       stale reply carrying a superseded generation, or one for an unpublished/
+       wrong-phase client, is terminalized by its EXACT job id and never
+       delivered. */
     if (!(c->getcs_published
             && c->getcs_generation == scheduler_session_generation
             && c->status == Client::WAITFORCS)) {
@@ -6092,6 +6140,27 @@ void Daemon::handle_end(Client *client, int exitcode)
     }
 
     if (scheduler && client->status != Client::WAITFORCHILD) {
+        if (client->getcs_expected > 1) {
+            /* G4 BATCH teardown (local-oracle 21:19): settle each recorded
+               decision by its EXACT job id, plus one client-id cancellation for
+               the undelivered tail (delivered < expected).  Only for an
+               assignment owned by the current active generation (an unpublished/
+               superseded batch emits nothing).  job_id is then cleared so the
+               scalar settlement below is a no-op for this client. */
+            if (scheduler_owns_getcs_assignment(client)) {
+                for (uint32_t jid : client->getcs_batch_jobids) {
+                    send_scheduler(JobDoneMsg(jid, exitcode, JobDoneMsg::FROM_SUBMITTER, clients.size()));
+                }
+                if (client->getcs_delivered < client->getcs_expected) {
+                    JobDoneMsg cancel(0, exitcode, JobDoneMsg::FROM_SUBMITTER, clients.size());
+                    cancel.set_unknown_job_client_id(client->client_id);
+                    send_scheduler(cancel);
+                }
+            }
+            client->job_id = 0;
+            client->last_known_job_id = 0;
+            client->getcs_batch_jobids.clear();
+        }
         int job_id = client->job_id;
         bool use_client_id = false;
 
@@ -6273,6 +6342,9 @@ bool Daemon::handle_get_cs(Client *client, Msg *msg)
     client->getcs_published = false;    /* G4 (17:20#1): unpublished until an active-session send succeeds */
     client->getcs_outstanding = true;   /* G4 (18:45 P0): request now occupies the client until destruction */
     client->getcs_generation = 0;
+    client->getcs_expected = umsg->count;   /* G4 (local-oracle 21:19): >1 -> BATCH_LEDGER mode */
+    client->getcs_delivered = 0;
+    client->getcs_batch_jobids.clear();
     trace() << "handle_get_cs " << umsg->client_id << endl;
 
     if (scheduler && !scheduler_session_active) {
