@@ -6312,14 +6312,10 @@ bool Daemon::handle_compile_file(Client *client, Msg *msg)
            start path (unlike the scalar fallback below); reject rather than start
            one silently. */
         if (!scheduler_owns_getcs_assignment(client)) {
-            /* The invariant should hold for every live batch; if it is ever violated
-               do NOT keep a half-started, slot-charged entry alive on a client that
-               owns no session -- return false so the caller tears the client down and
-               the CLIENTWORK block restores its charged slot (bounded cleanup). */
-            log_error() << "handle_compile_file batch: CompileFile job " << job->jobID()
-                        << " on a non-scheduler-owned batch; tearing the client down" << endl;
+            log_warning() << "handle_compile_file batch: CompileFile job " << job->jobID()
+                          << " on a non-scheduler-owned batch; rejecting" << endl;
             delete job;
-            return false;
+            return true;
         }
         delete client->job;              /* the started entry owns exactly one job */
         client->job = job;
