@@ -5076,24 +5076,36 @@ int Daemon::scheduler_use_cs(UseCSMsg *msg)
            the original); terminalize a stale/excess reply by its exact job id.
            Each accepted decision is relayed to the client and recorded for exact
            teardown settlement; the request completes at delivered == expected. */
+        /* Authorize: published under the current active generation. */
         if (!(c->getcs_published
-                && c->getcs_generation == scheduler_session_generation
-                && c->getcs_delivered < c->getcs_expected)) {
-            log_warning() << "scheduler_use_cs batch excess/stale job " << msg->job_id
+                && c->getcs_generation == scheduler_session_generation)) {
+            log_warning() << "scheduler_use_cs batch stale/unpublished job " << msg->job_id
                           << " client " << msg->client_id << "; terminalizing" << endl;
             return send_scheduler(JobDoneMsg(msg->job_id, 107, JobDoneMsg::FROM_SUBMITTER, clients.size())) ? 0 : 1;
         }
+        /* Dedup BEFORE the excess check (bigoracle 00:35 #3): a duplicate exact
+           job id -- even one arriving after completion -- is ignored, never
+           terminalized as excess and never counted twice. */
         for (uint32_t seen : c->getcs_batch_jobids) {
             if (seen == msg->job_id) {
                 log_warning() << "scheduler_use_cs batch duplicate job " << msg->job_id
                               << "; ignoring" << endl;
-                return 0;   /* never deliver or count a duplicate twice */
+                return 0;
             }
         }
+        /* A genuinely new exact job id beyond the requested count is excess. */
+        if (c->getcs_delivered >= c->getcs_expected) {
+            log_warning() << "scheduler_use_cs batch excess job " << msg->job_id
+                          << " client " << msg->client_id << "; terminalizing" << endl;
+            return send_scheduler(JobDoneMsg(msg->job_id, 107, JobDoneMsg::FROM_SUBMITTER, clients.size())) ? 0 : 1;
+        }
         c->getcs_batch_jobids.push_back(msg->job_id);   /* record BEFORE the write */
-        UseCSMsg fwd(msg->host_platform, msg->hostname, msg->port, msg->job_id,
-                     true, 1, msg->matched_job_id);
-        if (!c->channel->send_msg(fwd)) {
+        /* Relay the ORIGINAL scheduler frame (bigoracle 00:35 #1): preserve
+           got_env, client_id and every other field exactly, as the scalar remote
+           path does via send_msg(*msg).  Rebuilding with hardcoded got_env=true/
+           client_id=1 could tell a real client to skip a required environment
+           transfer and fail the build. */
+        if (!c->channel->send_msg(*msg)) {
             ++usecs_exact_aborts;
             handle_end(c, 143);
             return 0;
@@ -5699,6 +5711,30 @@ bool Daemon::create_env_finished(string env_key)
 
 bool Daemon::handle_job_done(Client *cl, JobDoneMsg *m)
 {
+    if (cl->getcs_expected > 1) {
+        /* G4 BATCH: the client reports one of its N decisions done.  Match by
+           the EXACT job id and drop that entry -- do NOT assert against the
+           scalar cl->job_id (a batch request holds many).  Forward the exact
+           JobDone to S only for an assignment owned by the current active
+           session; the request is complete once every recorded entry settles.
+           (Remote batch decisions hold no local compile slot, so the scalar
+           CLIENTWORK capacity accounting below does not apply.) */
+        for (std::vector<uint32_t>::iterator it = cl->getcs_batch_jobids.begin();
+                it != cl->getcs_batch_jobids.end(); ++it) {
+            if (*it == m->job_id) {
+                cl->getcs_batch_jobids.erase(it);
+                break;
+            }
+        }
+        if (cl->getcs_batch_jobids.empty() && cl->getcs_delivered >= cl->getcs_expected) {
+            cl->set_status(Client::JOBDONE, "handle_job_done: batch complete");
+        }
+        m->client_count = clients.size();
+        if (!scheduler_owns_getcs_assignment(cl)) {
+            return true;
+        }
+        return send_scheduler(*m);
+    }
     if (cl->status == Client::CLIENTWORK) {
         if (cl->running_preprocess) {
             if (preprocess_active_processes > 0) {

@@ -30,6 +30,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 using Clock = std::chrono::steady_clock;
 
@@ -160,22 +161,59 @@ static MsgChannel *accept_login_channel(int listener, int timeout_msec, Msg **lo
     return nullptr;
 }
 
-/* Count complete USE_CS frames delivered to the client within the window (up to
-   `want`).  Other frame types are consumed and ignored. */
-static int count_use_cs(MsgChannel *client, int want, int timeout_msec)
+struct SeenUseCS { uint32_t job_id; bool got_env; std::string host; };
+
+/* Capture complete USE_CS frames delivered to the client (up to `want`),
+   recording the exact fields so the test can assert field fidelity and order,
+   not merely the message type. */
+static std::vector<SeenUseCS> capture_use_cs(MsgChannel *client, int want, int timeout_msec)
 {
-    int seen = 0;
+    std::vector<SeenUseCS> seen;
     const Clock::time_point deadline = Clock::now()
         + std::chrono::milliseconds(timeout_msec);
-    while (client && seen < want && Clock::now() < deadline) {
+    while (client && static_cast<int>(seen.size()) < want && Clock::now() < deadline) {
         Msg *msg = client->get_msg(1, true);
         if (msg) {
             if (*msg == Msg::USE_CS) {
-                ++seen;
+                UseCSMsg *u = dynamic_cast<UseCSMsg *>(msg);
+                if (u) {
+                    SeenUseCS s;
+                    s.job_id = u->job_id;
+                    s.got_env = u->got_env != 0;
+                    s.host = u->hostname;
+                    seen.push_back(s);
+                }
             }
             delete msg;
         }
         if (client->at_eof()) {
+            break;
+        }
+    }
+    return seen;
+}
+
+/* Count JOB_DONE frames the scheduler receives whose job id is in `wanted`. */
+static int count_job_done(MsgChannel *sched, const std::vector<uint32_t> &wanted,
+                          int timeout_msec)
+{
+    int seen = 0;
+    const Clock::time_point deadline = Clock::now()
+        + std::chrono::milliseconds(timeout_msec);
+    while (sched && seen < static_cast<int>(wanted.size()) && Clock::now() < deadline) {
+        Msg *msg = sched->get_msg(1, true);
+        if (msg) {
+            if (*msg == Msg::JOB_DONE) {
+                JobDoneMsg *d = dynamic_cast<JobDoneMsg *>(msg);
+                if (d) {
+                    for (uint32_t w : wanted) {
+                        if (w == d->job_id) { ++seen; break; }
+                    }
+                }
+            }
+            delete msg;
+        }
+        if (sched->at_eof()) {
             break;
         }
     }
@@ -278,17 +316,46 @@ int main(int argc, char **argv)
     REQUIRE(fwd_count == 3, "forwarded GetCS preserved count=3");
     delete fwd;
 
+    /* Three distinct decisions with VARYING got_env, so a hardcoded
+       got_env=true relay (bigoracle 00:35 #1) is caught. */
+    struct { uint32_t jid; bool env; } dec[3] = { {5000u, true}, {5001u, false}, {5002u, true} };
     bool sent_all = client_id != 0;
     for (int i = 0; i < 3 && sent_all; ++i) {
-        UseCSMsg use("x86_64", "10.11.12.13", 3632u, 5000u + i, true, client_id, 0);
+        UseCSMsg use("x86_64", "10.11.12.13", 3632u, dec[i].jid, dec[i].env, client_id, 0);
         sent_all = sched->send_msg(use);
     }
-    REQUIRE(sent_all, "scheduler sent three remote UseCS for the client");
+    REQUIRE(sent_all, "scheduler sent three distinct remote UseCS");
 
-    /* The daemon must relay exactly three UseCS to the client, in order. */
-    const int got = count_use_cs(client, 3, 6000);
-    fprintf(stderr, "         (client received %d of 3 UseCS)\n", got);
-    REQUIRE(got == 3, "client received exactly three UseCS for the count=3 request");
+    std::vector<SeenUseCS> got = capture_use_cs(client, 3, 6000);
+    fprintf(stderr, "         (client received %zu of 3 UseCS)\n", got.size());
+    REQUIRE(got.size() == 3, "client received exactly three UseCS for the count=3 request");
+    const bool order_ok = got.size() == 3
+        && got[0].job_id == 5000u && got[1].job_id == 5001u && got[2].job_id == 5002u;
+    REQUIRE(order_ok, "batch UseCS delivered in exact FIFO job-id order");
+    const bool env_ok = got.size() == 3
+        && got[0].got_env && !got[1].got_env && got[2].got_env;
+    REQUIRE(env_ok, "batch relay preserved got_env exactly (not hardcoded true)");
+    const bool host_ok = got.size() == 3 && got[0].host == "10.11.12.13";
+    REQUIRE(host_ok, "batch relay preserved the remote host exactly");
+
+    /* Duplicate of decision 2 and a fourth distinct decision: neither may reach
+       the client (dedup + excess), and the excess is terminalized to S. */
+    sched->send_msg(UseCSMsg("x86_64", "10.11.12.13", 3632u, 5001u, true, client_id, 0)); // duplicate
+    sched->send_msg(UseCSMsg("x86_64", "10.11.12.13", 3632u, 5003u, true, client_id, 0)); // excess
+    std::vector<SeenUseCS> extra = capture_use_cs(client, 1, 2000);
+    REQUIRE(extra.empty(), "duplicate and excess UseCS are not relayed (no fourth reply)");
+    const int excess_term = count_job_done(sched, std::vector<uint32_t>{5003u}, 3000);
+    REQUIRE(excess_term == 1, "excess job terminalized to the scheduler by exact job id");
+
+    /* Client completes all three: exactly three JobDones must reach S. */
+    for (uint32_t jid : { 5000u, 5001u, 5002u }) {
+        JobDoneMsg d(jid, 0, JobDoneMsg::FROM_SUBMITTER);
+        d.real_msec = 1;
+        d.user_msec = 1;
+        client->send_msg(d);
+    }
+    const int fwd_done = count_job_done(sched, std::vector<uint32_t>{5000u, 5001u, 5002u}, 5000);
+    REQUIRE(fwd_done == 3, "all three batch JobDones were forwarded to the scheduler");
 
     int status = 0;
     kill(daemon_pid, SIGTERM);
