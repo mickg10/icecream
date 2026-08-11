@@ -44,17 +44,22 @@ using Clock = std::chrono::steady_clock;
 
 static int failures = 0;
 
+/* `what` may be a const char* OR a std::string: bind it to a std::string and
+   always print via .c_str().  Passing a std::string straight into
+   fprintf("%s", ...) is undefined behaviour (varargs mismatch). */
 #define REQUIRE(cond, what)                                             \
     do {                                                                \
-        if (cond) { fprintf(stderr, "ok       - %s\n", what); }         \
-        else { fprintf(stderr, "FAILED   - %s\n", what); ++failures; }  \
+        const std::string _rq_msg = (what);                             \
+        if (cond) { fprintf(stderr, "ok       - %s\n", _rq_msg.c_str()); } \
+        else { fprintf(stderr, "FAILED   - %s\n", _rq_msg.c_str()); ++failures; } \
     } while (0)
 
 #define REQUIRE_OR_ABORT(cond, what)                                    \
     do {                                                                \
-        if (cond) { fprintf(stderr, "ok       - %s\n", what); }         \
+        const std::string _rq_msg = (what);                             \
+        if (cond) { fprintf(stderr, "ok       - %s\n", _rq_msg.c_str()); } \
         else {                                                          \
-            fprintf(stderr, "FAILED   - %s\n", what); ++failures;       \
+            fprintf(stderr, "FAILED   - %s\n", _rq_msg.c_str()); ++failures; \
             fprintf(stderr, "ABORT    - precondition failed\n");        \
             goto done;                                                  \
         }                                                               \
@@ -159,16 +164,28 @@ struct DoneFrame {
     uint32_t unknown_client;
     uint32_t real_msec;
     uint32_t user_msec;
+    uint32_t sys_msec;
+    uint32_t pfaults;
+    uint32_t in_compressed;
+    uint32_t in_uncompressed;
+    uint32_t out_compressed;
+    uint32_t out_uncompressed;
+    uint32_t client_count;
 };
 
 /* Collect ALL JobDone frames over `window_msec` in EXACT ARRIVAL ORDER.  An
    ordered multiset -- three JobDone of one id are three ordered entries and never
    satisfy a three-distinct-id expectation.  Returns whether the channel errored
    (EOF/read) so absence/quiet-window checks can fail closed. */
-static std::vector<DoneFrame> collect_job_done(MsgChannel *sched, int window_msec, bool *errored = nullptr)
+/* Collect JOB_DONE frames in a window.  `unrelated` (out) counts any non-JOB_DONE
+   frame seen in the same window so an exact check can reject extra/unrelated frames
+   rather than silently discarding them (local-oracle 19:02 #4). */
+static std::vector<DoneFrame> collect_job_done(MsgChannel *sched, int window_msec,
+                                               bool *errored = nullptr, int *unrelated = nullptr)
 {
     std::vector<DoneFrame> frames;
     if (errored) *errored = false;
+    if (unrelated) *unrelated = 0;
     const Clock::time_point deadline = Clock::now() + std::chrono::milliseconds(window_msec);
     while (sched && Clock::now() < deadline) {
         Msg *msg = sched->get_msg(1, true);
@@ -184,8 +201,24 @@ static std::vector<DoneFrame> collect_job_done(MsgChannel *sched, int window_mse
                     f.unknown_client = d->unknown_job_client_id();
                     f.real_msec = d->real_msec;
                     f.user_msec = d->user_msec;
+                    f.sys_msec = d->sys_msec;
+                    f.pfaults = d->pfaults;
+                    f.in_compressed = d->in_compressed;
+                    f.in_uncompressed = d->in_uncompressed;
+                    f.out_compressed = d->out_compressed;
+                    f.out_uncompressed = d->out_uncompressed;
+                    f.client_count = d->client_count;
                     frames.push_back(f);
                 }
+            } else if (*msg == Msg::STATS || *msg == Msg::MON_STATS) {
+                /* benign periodic load/monitoring report on the scheduler channel --
+                   background traffic, not a protocol frame; do not count it. */
+            } else if (*msg == Msg::STATUS_TEXT) {
+                /* the GetInternalStatus barrier reply (local-oracle 19:13): classify
+                   it explicitly here rather than treating it as an unexpected frame. */
+            } else {
+                if (unrelated) ++*unrelated;   /* unexpected protocol frame in the window */
+                fprintf(stderr, "         (collect_job_done: unexpected frame %s)\n", msg->to_string().c_str());
             }
             delete msg;
         }
@@ -230,21 +263,57 @@ static std::string ids_to_string(const std::vector<uint32_t> &v)
    JobDone stream must equal the expected ordered list over EVERY discriminating
    field -- job id, signed exit, origin, and client-id-cancellation identity.  Any
    extra/missing/reordered/field-altered frame fails. */
-struct ExpectDone { uint32_t job_id; int exitcode; bool from_server; uint32_t unknown_client; };
+/* EVERY serialized JobDone field the sender controls (local-oracle 19:02 #4): id,
+   signed exit, origin (from_server) + raw flags, cancellation identity
+   (unknown_client), real/user/sys time, page faults, all four byte counters, and
+   the daemon-set client count. */
+struct ExpectDone {
+    uint32_t job_id;
+    int      exitcode;
+    bool     from_server;
+    uint32_t unknown_client;
+    uint32_t real_msec;
+    uint32_t user_msec;
+    uint32_t sys_msec;
+    uint32_t pfaults;
+    uint32_t in_compressed;
+    uint32_t in_uncompressed;
+    uint32_t out_compressed;
+    uint32_t out_uncompressed;
+    uint32_t flags;
+    uint32_t client_count;
+};
+/* Exact ordered comparison of every field, and rejection of any unrelated frame
+   seen in the same window (`unrelated`). */
 static bool done_frames_exact(const std::vector<DoneFrame> &got,
-                              const std::vector<ExpectDone> &want, std::string *why)
+                              const std::vector<ExpectDone> &want, std::string *why,
+                              int unrelated = 0)
 {
+    if (unrelated != 0) {
+        if (why) *why = std::to_string(unrelated) + " unrelated frame(s) in the exact window";
+        return false;
+    }
     if (got.size() != want.size()) {
         if (why) *why = "frame count " + std::to_string(got.size()) + " != expected " + std::to_string(want.size());
         return false;
     }
     for (size_t i = 0; i < got.size(); ++i) {
-        if (got[i].job_id != want[i].job_id || got[i].exitcode != want[i].exitcode
-                || got[i].from_server != want[i].from_server
-                || got[i].unknown_client != want[i].unknown_client) {
-            if (why) *why = "frame[" + std::to_string(i) + "] mismatch: got id=" + std::to_string(got[i].job_id)
-                          + " exit=" + std::to_string(got[i].exitcode) + " fromS=" + std::to_string(got[i].from_server)
-                          + " unk=" + std::to_string(got[i].unknown_client);
+        const DoneFrame &g = got[i];
+        const ExpectDone &w = want[i];
+        if (g.job_id != w.job_id || g.exitcode != w.exitcode || g.from_server != w.from_server
+                || g.unknown_client != w.unknown_client || g.real_msec != w.real_msec
+                || g.user_msec != w.user_msec || g.sys_msec != w.sys_msec || g.pfaults != w.pfaults
+                || g.in_compressed != w.in_compressed || g.in_uncompressed != w.in_uncompressed
+                || g.out_compressed != w.out_compressed || g.out_uncompressed != w.out_uncompressed
+                || g.flags != w.flags || g.client_count != w.client_count) {
+            if (why) *why = "frame[" + std::to_string(i) + "] mismatch: got id=" + std::to_string(g.job_id)
+                          + " exit=" + std::to_string(g.exitcode) + " fromS=" + std::to_string(g.from_server)
+                          + " unk=" + std::to_string(g.unknown_client) + " real=" + std::to_string(g.real_msec)
+                          + " user=" + std::to_string(g.user_msec) + " sys=" + std::to_string(g.sys_msec)
+                          + " pf=" + std::to_string(g.pfaults) + " inC=" + std::to_string(g.in_compressed)
+                          + " inU=" + std::to_string(g.in_uncompressed) + " outC=" + std::to_string(g.out_compressed)
+                          + " outU=" + std::to_string(g.out_uncompressed) + " flags=" + std::to_string(g.flags)
+                          + " cc=" + std::to_string(g.client_count);
             return false;
         }
     }
@@ -423,6 +492,55 @@ static uint32_t publish_batch(MsgChannel *client, MsgChannel *sched,
     return cid;
 }
 
+/* Observable same-stream barrier: a GetInternalStatus on the scheduler channel is
+   answered unconditionally by a StatusText (scheduler_get_internals), and the
+   daemon processes scheduler messages in FIFO order, so receiving the StatusText
+   reply proves every decision sent before it on the SAME channel has been
+   recorded.  Replaces timing sleeps used as ordering evidence.  Only use where no
+   other daemon->scheduler frame is expected between the burst and the reply
+   (wait_for_type would otherwise drain it). */
+static bool sched_barrier(MsgChannel *sched, int window_msec)
+{
+    if (!sched || !sched->send_msg(GetInternalStatus())) return false;
+    Msg *r = wait_for_type(sched, Msg::STATUS_TEXT, window_msec);
+    const bool ok = (r != nullptr);
+    delete r;
+    return ok;
+}
+
+/* Drive a delivered local batch entry through its REAL lifecycle so it is
+   legitimately completable: CompileFile(__client, exact id) -> observe exact
+   JobBegin(exact id) on the scheduler channel -> JobDone(exact id).  The tightened
+   product accepts a local JobDone only after CompileFile -> JobBegin ->
+   LOCAL_COMPILE_STARTED; a bare UseCS -> JobDone is not a legal completion. */
+static bool complete_local_entry(MsgChannel *client, MsgChannel *sched,
+                                 const std::string &work, uint32_t id, int exitcode)
+{
+    CompileJob job;
+    job.setLanguage(CompileJob::Lang_CXX);
+    job.setCompilerName("g++");
+    job.setJobID(id);
+    job.setEnvironmentVersion("__client");
+    job.setTargetPlatform("x86_64");
+    char in[512], out[512];
+    snprintf(in, sizeof in, "%s/e%u.cpp", work.c_str(), id);
+    snprintf(out, sizeof out, "%s/e%u.o", work.c_str(), id);
+    job.setInputFile(in);
+    job.setOutputFile(out);
+    job.setWorkingDirectory(work);
+    if (!client->send_msg(CompileFileMsg(&job))) return false;
+    Msg *jb = wait_for_type(sched, Msg::JOB_BEGIN, 4000);
+    if (!jb) return false;
+    JobBeginMsg *b = dynamic_cast<JobBeginMsg *>(jb);
+    const bool started = (b && b->job_id == id);
+    delete jb;
+    if (!started) return false;
+    JobDoneMsg d(id, exitcode, JobDoneMsg::FROM_SUBMITTER);
+    d.real_msec = 1;
+    d.user_msec = 1;
+    return client->send_msg(d);
+}
+
 /* ================================================================ CASES === */
 
 /* Connected MsgChannel pair; createChannel() handshakes synchronously so both
@@ -514,12 +632,18 @@ static int case_client_done_filter(const char *iceccd)
     client->send_msg(d2);
     client->send_msg(d3);
 
-    std::vector<DoneFrame> f_done = collect_job_done(f.sched, 5000);
+    int unrel = 0;
+    std::vector<DoneFrame> f_done = collect_job_done(f.sched, 5000, nullptr, &unrel);
     std::string why;
-    std::vector<ExpectDone> want = { { J1, 11, false, 0 }, { J2, 12, false, 0 }, { J3, 13, false, 0 } };
-    const bool exact = done_frames_exact(f_done, want, &why);
+    /* forwarded unchanged except client_count (=1, only the batch client is connected) */
+    const uint32_t FS = (uint32_t)JobDoneMsg::FROM_SUBMITTER;
+    std::vector<ExpectDone> want = {
+        { J1, 11, false, 0, 1, 1, 0, 0, 0, 0, 0, 0, FS, 1 },
+        { J2, 12, false, 0, 2, 2, 0, 0, 0, 0, 0, 0, FS, 1 },
+        { J3, 13, false, 0, 3, 3, 0, 0, 0, 0, 0, 0, FS, 1 } };
+    const bool exact = done_frames_exact(f_done, want, &why, unrel);
     fprintf(stderr, "         (scheduler saw %zu JobDone; exact=%d %s)\n", f_done.size(), exact, why.c_str());
-    REQUIRE(exact, "scheduler observed exactly [J1/11, J2/12, J3/13] in order -- U + duplicate J1 filtered, no extra frame");
+    REQUIRE(exact, "scheduler observed exactly [J1/11, J2/12, J3/13] over every field -- U + duplicate J1 filtered, no extra/unrelated frame");
 
     /* trailing real scalar exchange (not merely a UNIX connection) */
     MsgChannel *live = connect_unix_bounded(f.socket_path, 3000);
@@ -678,13 +802,17 @@ static int case_local_capacity(const char *iceccd)
         std::vector<SeenUseCS> a = capture_use_cs(client, 1, 4000);
         REQUIRE(a.size() == 1 && a[0].job_id == L1, "after release exactly L1 is delivered");
         REQUIRE(no_use_cs(client, 1200), "L2 withheld until L1 completes");
-        { JobDoneMsg d(L1, 0, JobDoneMsg::FROM_SUBMITTER); d.real_msec = 1; d.user_msec = 1; client->send_msg(d); }
+        REQUIRE(complete_local_entry(client, f.sched, f.work, L1, 0),
+                "L1 completed via real lifecycle (CompileFile -> JobBegin -> JobDone)");
         std::vector<SeenUseCS> b = capture_use_cs(client, 1, 4000);
-        REQUIRE(b.size() == 1 && b[0].job_id == L2, "L2 delivered after JobDone(L1)");
-        { JobDoneMsg d(L2, 0, JobDoneMsg::FROM_SUBMITTER); d.real_msec = 1; d.user_msec = 1; client->send_msg(d); }
+        REQUIRE(b.size() == 1 && b[0].job_id == L2, "L2 delivered after L1 completes");
+        REQUIRE(no_use_cs(client, 1200), "L3 withheld until L2 completes");
+        REQUIRE(complete_local_entry(client, f.sched, f.work, L2, 0),
+                "L2 completed via real lifecycle");
         std::vector<SeenUseCS> cc = capture_use_cs(client, 1, 4000);
-        REQUIRE(cc.size() == 1 && cc[0].job_id == L3, "L3 delivered after JobDone(L2)");
-        { JobDoneMsg d(L3, 0, JobDoneMsg::FROM_SUBMITTER); d.real_msec = 1; d.user_msec = 1; client->send_msg(d); }
+        REQUIRE(cc.size() == 1 && cc[0].job_id == L3, "L3 delivered after L2 completes");
+        REQUIRE(complete_local_entry(client, f.sched, f.work, L3, 0),
+                "L3 completed via real lifecycle");
     }
 done:
     delete blocker;
@@ -740,13 +868,13 @@ static int case_batch_nocs(const char *iceccd)
         { JobDoneMsg d(0, 0, JobDoneMsg::FROM_SUBMITTER); d.real_msec = 1; d.user_msec = 1; blocker->send_msg(d); }
         std::vector<SeenUseCS> a = capture_use_cs(client, 1, 4000);
         REQUIRE(a.size() == 1 && a[0].job_id == N1, "after release exactly N1 local decision delivered");
-        { JobDoneMsg d(N1, 0, JobDoneMsg::FROM_SUBMITTER); d.real_msec = 1; d.user_msec = 1; client->send_msg(d); }
+        REQUIRE(complete_local_entry(client, f.sched, f.work, N1, 0), "N1 completed via real lifecycle");
         std::vector<SeenUseCS> b = capture_use_cs(client, 1, 4000);
-        REQUIRE(b.size() == 1 && b[0].job_id == N2, "N2 delivered after JobDone(N1)");
-        { JobDoneMsg d(N2, 0, JobDoneMsg::FROM_SUBMITTER); d.real_msec = 1; d.user_msec = 1; client->send_msg(d); }
+        REQUIRE(b.size() == 1 && b[0].job_id == N2, "N2 delivered after N1 completes");
+        REQUIRE(complete_local_entry(client, f.sched, f.work, N2, 0), "N2 completed via real lifecycle");
         std::vector<SeenUseCS> cc = capture_use_cs(client, 1, 4000);
-        REQUIRE(cc.size() == 1 && cc[0].job_id == N3, "N3 delivered after JobDone(N2)");
-        { JobDoneMsg d(N3, 0, JobDoneMsg::FROM_SUBMITTER); d.real_msec = 1; d.user_msec = 1; client->send_msg(d); }
+        REQUIRE(cc.size() == 1 && cc[0].job_id == N3, "N3 delivered after N2 completes");
+        REQUIRE(complete_local_entry(client, f.sched, f.work, N3, 0), "N3 completed via real lifecycle");
     }
 done:
     delete blocker;
@@ -860,7 +988,8 @@ static int run_teardown_local(const char *iceccd, const std::string &scenario)
         const uint32_t L1 = 7100, L2 = 7101, L3 = 7102;
         for (uint32_t j : { L1, L2, L3 })   /* LOCAL decisions: queued behind blocker */
             f.sched->send_msg(UseCSMsg("x86_64", "127.0.0.1", 0, j, true, cid, 0));
-        usleep(300 * 1000);   /* let the daemon record + queue them */
+        REQUIRE_OR_ABORT(sched_barrier(f.sched, 3000),
+                         "daemon recorded + queued the three local decisions (Ping barrier, not a sleep)");
 
         if (scenario == "queued") {
             /* end early while all three are queued (blocker still holds) */
@@ -897,16 +1026,20 @@ static int run_teardown_local(const char *iceccd, const std::string &scenario)
                 REQUIRE(ack2 != nullptr, "capacity returned to baseline (slot re-granted)");
                 delete ack2; delete b2;
             }
-        } else { /* normal: deliver + complete all three, then End */
+        } else { /* normal: deliver + complete all three via the real lifecycle, then End */
             { JobDoneMsg d(0, 0, JobDoneMsg::FROM_SUBMITTER); d.real_msec = 1; d.user_msec = 1; blocker->send_msg(d); }
             uint32_t exp[3] = { L1, L2, L3 };
             for (int i = 0; i < 3; ++i) {
                 std::vector<SeenUseCS> v = capture_use_cs(client, 1, 4000);
                 REQUIRE_OR_ABORT(v.size() == 1 && v[0].job_id == exp[i], "next local decision delivered in order");
-                JobDoneMsg d(exp[i], 0, JobDoneMsg::FROM_SUBMITTER); d.real_msec = 1; d.user_msec = 1; client->send_msg(d);
+                REQUIRE(complete_local_entry(client, f.sched, f.work, exp[i], 0),
+                        "local entry completed via real lifecycle (CompileFile -> JobBegin -> JobDone)");
+                /* collect THIS entry's forwarded completion before the next entry's
+                   CompileFile, so the JobBegin wait never drains a pending JobDone */
+                std::vector<DoneFrame> one = collect_job_done(f.sched, 1500);
+                REQUIRE(done_order(one) == (std::vector<uint32_t>{ exp[i] }),
+                        "the local completion forwarded exactly once, by exact id");
             }
-            std::vector<DoneFrame> after = collect_job_done(f.sched, 2500);   /* drain the 3 forwarded completions */
-            REQUIRE(done_order(after) == (std::vector<uint32_t>{L1, L2, L3}), "the 3 local completions forwarded once each");
             REQUIRE(client->send_msg(EndMsg()), "client sent a normal EndMsg after all local done");
             std::vector<DoneFrame> term = collect_job_done(f.sched, 3000);
             fprintf(stderr, "         (normal -> extra terminals %s cancels=%d)\n",
@@ -1102,7 +1235,10 @@ static int case_nocs_dedup_excess(const char *iceccd)
         f.sched->send_msg(NoCSMsg(N1, cid));   /* repeated -> ignored */
         f.sched->send_msg(NoCSMsg(N2, cid));
         f.sched->send_msg(NoCSMsg(N3, cid));
-        usleep(300 * 1000);
+        /* barrier (not a sleep): prove N1(x2)/N2/N3 are recorded before N4 arrives,
+           so N4 is genuinely the 4th DISTINCT decision (-> excess), not a race. */
+        REQUIRE_OR_ABORT(sched_barrier(f.sched, 3000),
+                         "daemon recorded the first three distinct NoCS before N4 (Ping barrier)");
         f.sched->send_msg(NoCSMsg(N4, cid));   /* 4th distinct -> excess */
         std::vector<DoneFrame> term = collect_job_done(f.sched, 3000);
         fprintf(stderr, "         (N1=%d N4=%d)\n", count_id(term, N1), count_id(term, N4));
@@ -1115,7 +1251,11 @@ static int case_nocs_dedup_excess(const char *iceccd)
         for (int i = 0; i < 3; ++i) {
             std::vector<SeenUseCS> one = capture_use_cs(client, 1, 4000);
             REQUIRE(one.size() == 1 && one[0].job_id == acc[i], "accepted NoCS decision delivered in order");
-            JobDoneMsg d(acc[i], 0, JobDoneMsg::FROM_SUBMITTER); d.real_msec = 1; d.user_msec = 1; client->send_msg(d);
+            REQUIRE(complete_local_entry(client, f.sched, f.work, acc[i], 0),
+                    "accepted NoCS entry completed via real lifecycle");
+            std::vector<DoneFrame> one_done = collect_job_done(f.sched, 1500);
+            REQUIRE(done_order(one_done) == (std::vector<uint32_t>{ acc[i] }),
+                    "the NoCS completion forwarded exactly once, by exact id");
         }
         REQUIRE(no_use_cs(client, 1500), "the excess N4 was never delivered to the client");
     }
@@ -1147,7 +1287,9 @@ static uint32_t audit_setup(const char *iceccd, Farm &f, MsgChannel *&blocker,
     if (!cid) return 0;
     for (int i = 0; i < nlocal; ++i)
         f.sched->send_msg(UseCSMsg("x86_64", "127.0.0.1", 0, ids[i], true, cid, 0));
-    usleep(200 * 1000);
+    /* barrier (not a sleep): the Ping reply proves the daemon recorded all N local
+       decisions before the caller applies the next stimulus. */
+    if (!sched_barrier(f.sched, 3000)) return 0;
     return cid;
 }
 
@@ -1278,11 +1420,13 @@ done:
     return failures;
 }
 
-/* Item 6 -- count 1..3 transition/reference enumeration: for N in {1,2,3} the
-   entry lifecycle refines the same abstract sequence -- RECORDED -> REMOTE_
-   DELIVERED (exact field tuple, FIFO) -> COMPLETED (exact ordered terminal by
-   distinct exit) -> a NORMAL End settles nothing.  N==1 is the allocation-free
-   SCALAR_ONE path; N=2,3 the ledger; identical observable transition. */
+/* count 1..3 REMOTE integration smoke (narrowed per local-oracle 19:02: this is
+   NOT the full local/NoCS/duplicate/teardown reference enumeration -- those
+   transitions are covered by local-capacity, batch-nocs, nocs-dedup-excess,
+   teardown-*, invalid-jobdone and compile-started).  For N in {1,2,3} a batch of N
+   REMOTE decisions is delivered FIFO with exact per-entry tuples, completed in
+   exact order by distinct exit, and a NORMAL End settles nothing.  N==1 is the
+   allocation-free SCALAR_ONE path; N=2,3 the ledger. */
 static int case_transition_enum(const char *iceccd, int N)
 {
     Farm f;
@@ -1307,13 +1451,21 @@ static int case_transition_enum(const char *iceccd, int N)
         bool tup = true;
         for (int i = 0; i < N; ++i) tup = tup && got[i].job_id == base + i && got[i].port == 4000u + i && got[i].matched_job_id == (uint32_t)(10 + i);
         REQUIRE(tup, "delivered decisions in FIFO order with exact per-entry tuples");
-        /* complete: distinct exit sentinel per entry -> exact ordered terminals */
+        /* complete: distinct exit + distinct real/user per entry -> exact ordered
+           terminals; the daemon forwards *m unchanged except client_count (=1, only
+           the batch client is connected). */
         for (int i = 0; i < N; ++i) { JobDoneMsg d(base + i, 30 + i, JobDoneMsg::FROM_SUBMITTER); d.real_msec = i + 1; d.user_msec = i + 1; client->send_msg(d); }
-        std::vector<DoneFrame> term = collect_job_done(f.sched, 4000);
+        int unrel = 0;
+        std::vector<DoneFrame> term = collect_job_done(f.sched, 4000, nullptr, &unrel);
         std::vector<ExpectDone> want;
-        for (int i = 0; i < N; ++i) want.push_back({ base + i, 30 + i, false, 0 });
+        for (int i = 0; i < N; ++i)
+            want.push_back({ base + i, 30 + i, false, 0,
+                             (uint32_t)(i + 1), (uint32_t)(i + 1), 0, 0, 0, 0, 0, 0,
+                             (uint32_t)JobDoneMsg::FROM_SUBMITTER, 1 });
         std::string why;
-        REQUIRE(done_frames_exact(term, want, &why), "exact ordered terminals by distinct exit (why: " + why + ")");
+        const bool exact = done_frames_exact(term, want, &why, unrel);
+        fprintf(stderr, "         (transition N=%d saw %zu JobDone; exact=%d %s)\n", N, term.size(), exact, why.c_str());
+        REQUIRE(exact, "exact ordered terminals over every field");
         /* NORMAL End (all delivered+completed) settles nothing */
         REQUIRE(client->send_msg(EndMsg()), "client sent a normal EndMsg");
         std::vector<DoneFrame> after = collect_job_done(f.sched, 2500);
