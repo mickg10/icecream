@@ -85,6 +85,7 @@
 #include <chrono>
 #include <deque>
 #include <map>
+#include <memory>
 #include <algorithm>
 #include <set>
 #include <fstream>
@@ -559,12 +560,10 @@ public:
         channel = nullptr;
         delete usecsmsg;
         usecsmsg = nullptr;
-        /* G4 P_batch (defect #4): the client owns every queued local decision;
-           destruction must free them so no scheduler-loss path can leak. */
-        for (BatchEntry &e : getcs_batch) {
-            delete e.pending;
-            e.pending = nullptr;
-        }
+        /* G4 P_batch (defect #4 / local-oracle 17:34): each entry's queued local
+           decision is a unique_ptr, so clearing the ledger frees every undelivered
+           UseCS with value ownership -- no scheduler-loss path can leak, and no
+           manual per-entry delete is needed. */
         getcs_batch.clear();
         delete deferred_getcs;
         deferred_getcs = nullptr;
@@ -597,16 +596,58 @@ public:
     // accept and never crosses.
     uint32_t getcs_expected;   // GetCSMsg::count captured at accept (0 for the SCALAR_ONE path)
     uint32_t getcs_delivered;  // UseCS decisions delivered to the client for a batch request
-    /* G4 P_batch (local-oracle 13:43): per-entry ledger.  Entries PERSIST until
-       teardown so a completed id stays in dedup memory (a late UseCS for it is
-       ignored, never resurrected as excess).  `local` marks a same-daemon/NoCS
-       decision (capacity-serialized) vs a remote decision (delivered at once). */
+    /* G4 P_batch (local-oracle 17:34): per-entry ledger with ONE tagged state
+       replacing the former completed/local/active/pending booleans, which admitted
+       combinations outside the intended transition system (a queued or bound-but-
+       undelivered id could be marked completed).  Entries PERSIST until teardown so
+       a completed id stays in dedup memory (a late UseCS for it is ignored, never
+       resurrected as excess).  The state alone authorizes each transition:
+
+         REMOTE_DELIVERED             a remote decision, relayed to the client at once;
+                                      holds no local compile slot.
+         LOCAL_WAIT_CAPACITY          a same-daemon/NoCS decision recorded and queued
+                                      on the one capacity-serialized local lane; its
+                                      synthetic UseCS is owned here (`pending`).
+         LOCAL_BOUND                  bound to the scalar lane (its `pending` moved to
+                                      client->usecsmsg, client PENDING_USE_CS); not yet
+                                      delivered, no slot charged.
+         LOCAL_DELIVERED_SLOT_CHARGED handle_old_request delivered the UseCS -> the
+                                      client is CLIENTWORK and one compile slot is
+                                      charged; the client has not yet sent its
+                                      CompileFile, so no compile job is owned and a
+                                      JobDone is NOT yet accepted.
+         LOCAL_COMPILE_STARTED        the client sent CompileFile(exact entry id);
+                                      handle_compile_file validated the id, adopted
+                                      the CompileJob (this entry owns client->job),
+                                      and committed the scheduler JobBegin.
+         COMPLETED                    terminal; retained only as dedup memory.
+
+       Only REMOTE_DELIVERED and LOCAL_COMPILE_STARTED may accept a matching JobDone
+       -- a remote worker reports its own completion, and a local entry can only be
+       done once its compile has actually started; a delivered-but-not-yet-compiled
+       local entry (local-oracle 17:58) cannot be reported done. */
+    enum class BatchState {
+        REMOTE_DELIVERED,
+        LOCAL_WAIT_CAPACITY,
+        LOCAL_BOUND,
+        LOCAL_DELIVERED_SLOT_CHARGED,
+        LOCAL_COMPILE_STARTED,
+        COMPLETED,
+    };
     struct BatchEntry {
         uint32_t job_id;
-        bool completed;
-        bool local;         // same-daemon/NoCS decision -> one capacity-serialized lane
-        bool active;        // a local entry currently occupying the compile slot
-        UseCSMsg *pending;  // a queued local decision awaiting capacity (owned); null once delivered
+        BatchState state;
+        std::unique_ptr<UseCSMsg> pending;  // owned queued local UseCS; moved out at LOCAL_BOUND
+        static bool is_local(BatchState s) {
+            return s == BatchState::LOCAL_WAIT_CAPACITY
+                || s == BatchState::LOCAL_BOUND
+                || s == BatchState::LOCAL_DELIVERED_SLOT_CHARGED
+                || s == BatchState::LOCAL_COMPILE_STARTED;
+        }
+        bool acceptsJobDone() const {
+            return state == BatchState::REMOTE_DELIVERED
+                || state == BatchState::LOCAL_COMPILE_STARTED;
+        }
     };
     std::vector<BatchEntry> getcs_batch;
     CompileJob *job;
@@ -5126,20 +5167,20 @@ int Daemon::scheduler_use_cs(UseCSMsg *msg)
            synthetic local UseCS delivered by advance_batch_local() only when the
            compile slot is free and no local entry of this client is active. */
         const bool is_local = (msg->hostname == remote_name && int(msg->port) == daemon_port);
-        Client::BatchEntry be;
-        be.job_id = msg->job_id;
-        be.completed = false;
-        be.local = is_local;
-        be.active = false;
-        be.pending = nullptr;
         if (is_local) {
-            be.pending = new UseCSMsg(msg->host_platform, "127.0.0.1", daemon_port,
-                                      msg->job_id, true, 1, msg->matched_job_id);
-            c->getcs_batch.push_back(be);
+            Client::BatchEntry be;
+            be.job_id = msg->job_id;
+            be.state = Client::BatchState::LOCAL_WAIT_CAPACITY;
+            be.pending.reset(new UseCSMsg(msg->host_platform, "127.0.0.1", daemon_port,
+                                          msg->job_id, true, 1, msg->matched_job_id));
+            c->getcs_batch.push_back(std::move(be));
             ++c->getcs_delivered;
             advance_batch_local(c);
         } else {
-            c->getcs_batch.push_back(be);   /* record BEFORE the write */
+            Client::BatchEntry be;
+            be.job_id = msg->job_id;
+            be.state = Client::BatchState::REMOTE_DELIVERED;
+            c->getcs_batch.push_back(std::move(be));   /* record BEFORE the write */
             /* Relay the ORIGINAL scheduler frame (bigoracle 00:35 #1): preserve
                got_env, client_id and every other field exactly, as the scalar
                remote path does via send_msg(*msg). */
@@ -5235,22 +5276,26 @@ void Daemon::advance_batch_local(Client *client)
     if (!client || client->getcs_expected <= 1) {
         return;
     }
+    /* One local entry occupies the scalar lane at a time: a bound (not yet
+       delivered) entry and a delivered-and-charged entry both hold it. */
     for (const Client::BatchEntry &e : client->getcs_batch) {
-        if (e.local && e.active) {
-            return;   /* one local lane active at a time */
+        if (e.state == Client::BatchState::LOCAL_BOUND
+                || e.state == Client::BatchState::LOCAL_DELIVERED_SLOT_CHARGED
+                || e.state == Client::BatchState::LOCAL_COMPILE_STARTED) {
+            return;
         }
     }
     /* Bind the next queued local entry to the EXISTING scalar lane and let
-       handle_old_request() do capacity selection, delivery, the CLIENTWORK
-       transition, the active_processes debit, and the ordinary local JobBegin.
-       No direct send and no handle_end() here -- delivery failure and capacity
-       accounting are the scalar lane's responsibility (defects #2/#3). */
+       handle_old_request() do capacity selection, delivery (-> LOCAL_DELIVERED_
+       SLOT_CHARGED), the CLIENTWORK transition, the active_processes charge, and
+       the ordinary local JobBegin.  No direct send and no handle_end() here --
+       delivery failure and capacity accounting are the scalar lane's responsibility
+       (defects #2/#3). */
     for (Client::BatchEntry &e : client->getcs_batch) {
-        if (e.local && !e.active && !e.completed && e.pending) {
+        if (e.state == Client::BatchState::LOCAL_WAIT_CAPACITY && e.pending) {
             delete client->usecsmsg;
-            client->usecsmsg = e.pending;    /* transfer ownership to the lane */
-            e.pending = nullptr;
-            e.active = true;                 /* bound to the scalar lane */
+            client->usecsmsg = e.pending.release();  /* transfer ownership to the lane */
+            e.state = Client::BatchState::LOCAL_BOUND;
             client->job_id = e.job_id;
             client->last_known_job_id = e.job_id;
             client->set_status(Client::PENDING_USE_CS,
@@ -5304,11 +5349,9 @@ int Daemon::scheduler_no_cs(NoCSMsg *msg)
         }
         Client::BatchEntry be;
         be.job_id = msg->job_id;
-        be.completed = false;
-        be.local = true;
-        be.active = false;
-        be.pending = new UseCSMsg(string(), "127.0.0.1", daemon_port, msg->job_id, true, 1, 0);
-        c->getcs_batch.push_back(be);
+        be.state = Client::BatchState::LOCAL_WAIT_CAPACITY;
+        be.pending.reset(new UseCSMsg(string(), "127.0.0.1", daemon_port, msg->job_id, true, 1, 0));
+        c->getcs_batch.push_back(std::move(be));
         ++c->getcs_delivered;
         advance_batch_local(c);
         return 0;
@@ -5825,31 +5868,45 @@ bool Daemon::handle_job_done(Client *cl, JobDoneMsg *m)
         for (Client::BatchEntry &e : cl->getcs_batch) {
             if (e.job_id == m->job_id) { found = &e; break; }
         }
-        if (!found || found->completed) {
-            /* client-done filter: an unmatched id (never recorded) or a duplicate
-               of an already-completed id is NOT forwarded and changes no state. */
-            log_warning() << "handle_job_done batch " << (found ? "duplicate" : "unmatched")
+        if (!found || !found->acceptsJobDone()) {
+            /* client-done filter: an unmatched id (never recorded), a duplicate of
+               an already-COMPLETED id, or a decision the client was never actually
+               handed (a queued LOCAL_WAIT_CAPACITY or bound-but-undelivered
+               LOCAL_BOUND) is NOT forwarded and changes no state. */
+            const char *why = !found ? "unmatched"
+                : found->state == Client::BatchState::COMPLETED ? "duplicate"
+                : "undelivered";
+            log_warning() << "handle_job_done batch " << why
                           << " job " << m->job_id << "; not forwarding" << endl;
             return true;
         }
-        found->completed = true;   /* keep the entry as dedup memory (not erased) */
-        if (found->local && found->active) {
-            /* the entry bound to the scalar lane completed: release the debited
-               slot (only if it had actually been delivered -> CLIENTWORK), unbind
-               the lane, and let the next queued local bind. */
-            found->active = false;
+        /* Only a STARTED local entry (its compile actually began) reaches here for a
+           local decision -- acceptsJobDone() rejects a delivered-but-not-compiled
+           one -- so this is the entry that owns cl->job. */
+        const bool was_local_started =
+            (found->state == Client::BatchState::LOCAL_COMPILE_STARTED);
+        found->state = Client::BatchState::COMPLETED;   /* keep as dedup memory */
+        if (was_local_started) {
+            /* the entry that owned the scalar lane completed: release its charged
+               compile slot AND its compile job (repeated local entries would else
+               overwrite/leak cl->job on the next CompileFile), unbind the lane, and
+               let the next queued local bind.  A REMOTE completion never runs this
+               block, so it never touches cl->job -- that pointer belongs to whatever
+               local currently owns the lane. */
             if (cl->status == Client::CLIENTWORK && clients.active_processes > 0) {
                 --clients.active_processes;
             }
             delete cl->usecsmsg;
             cl->usecsmsg = nullptr;
+            delete cl->job;
+            cl->job = nullptr;
             cl->job_id = 0;
             cl->set_status(Client::WAITCOMPILE, "handle_job_done: batch local entry done");
         }
         advance_batch_local(cl);   /* bind the next queued local decision, if any */
         bool all_done = cl->getcs_delivered >= cl->getcs_expected;
         for (const Client::BatchEntry &e : cl->getcs_batch) {
-            if (!e.completed) { all_done = false; break; }
+            if (e.state != Client::BatchState::COMPLETED) { all_done = false; break; }
         }
         if (all_done) {
             cl->set_status(Client::JOBDONE, "handle_job_done: batch complete");
@@ -5874,19 +5931,13 @@ bool Daemon::handle_job_done(Client *cl, JobDoneMsg *m)
         } else {
             clients.active_processes--;
         }
-        /* G4 P_batch: freeing this compile slot may let a queued batch-local
-           decision on some other client run now.  Collect first: advance_batch_local
-           can handle_end() a client on a broken channel, which would invalidate a
-           live map iterator. */
-        std::vector<Client *> batch_clients;
-        for (const auto &kv : clients) {
-            if (kv.second->getcs_expected > 1) {
-                batch_clients.push_back(kv.second);
-            }
-        }
-        for (Client *bc : batch_clients) {
-            advance_batch_local(bc);
-        }
+        /* G4 P_batch (local-oracle 17:34, perf): freeing this compile slot needs no
+           batch rescan here.  Invariant: every queued batch-local is bound to the
+           scalar lane at decision-accept and its successor is bound at the matching
+           completion, so a batch-local awaiting capacity is already PENDING_USE_CS
+           and is served by the ordinary PENDING_USE_CS delivery in
+           handle_old_request() (run after every message).  There is never an unbound
+           LOCAL_WAIT_CAPACITY behind a free lane for a per-turn scan to discover. */
     }
 
     cl->set_status(Client::JOBDONE, "handle_job_done: reported to scheduler");
@@ -5920,17 +5971,14 @@ void Daemon::handle_old_request()
     const unsigned int compile_limit = std::max((unsigned int)1, max_kids);
     const unsigned int preprocess_limit = std::max((unsigned int)1, max_preprocess_kids);
 
-    /* G4 P_batch: bind the next queued local batch decision to the scalar lane
-       (if this client has none bound), so a capacity release from ANY path -- a
-       finishing compile, a scalar-client End/disconnect -- lets it run through the
-       ordinary PENDING_USE_CS delivery below.  Collect first: advance_batch_local
-       never deletes a client, but stay defensive against map mutation. */
-    {
-        std::vector<Client *> batch_clients;
-        for (const auto &kv : clients)
-            if (kv.second->getcs_expected > 1) batch_clients.push_back(kv.second);
-        for (Client *bc : batch_clients) advance_batch_local(bc);
-    }
+    /* G4 P_batch (local-oracle 17:34, perf): no per-turn global batch rescan here.
+       Binding is event-driven -- a local decision binds to the scalar lane at
+       accept (scheduler_use_cs/scheduler_no_cs -> advance_batch_local) and its
+       successor binds at the matching completion (handle_job_done -> advance_batch_
+       local).  A bound entry is PENDING_USE_CS and is delivered by the capacity lane
+       below when a slot frees; there is never an unbound LOCAL_WAIT_CAPACITY behind
+       a free lane, so scanning every batch client on every message turn is pure
+       overhead. */
 
     /* G4 (18:21): a LOGIN_ATTEMPT no longer freezes the local lane.  The
        schedulerless local lanes (LINKJOB / PENDING_USE_CS below) run during the
@@ -6101,6 +6149,19 @@ void Daemon::handle_old_request()
                 /* we make sure we reserve a spot and the rest is done if the
                  * client contacts as back with a Compile request */
                 clients.active_processes++;
+                /* G4 P_batch: for a batch client the usecs just delivered belongs to
+                   its one LOCAL_BOUND entry.  Now that the client is CLIENTWORK and a
+                   slot is charged, advance that entry to LOCAL_DELIVERED_SLOT_CHARGED
+                   so only it -- not a still-queued or merely-bound id -- can accept a
+                   JobDone. */
+                if (client->getcs_expected > 1) {
+                    for (Client::BatchEntry &e : client->getcs_batch) {
+                        if (e.state == Client::BatchState::LOCAL_BOUND) {
+                            e.state = Client::BatchState::LOCAL_DELIVERED_SLOT_CHARGED;
+                            break;
+                        }
+                    }
+                }
             } else {
                 handle_end(client, 129);
             }
@@ -6221,6 +6282,47 @@ bool Daemon::handle_compile_file(Client *client, Msg *msg)
     CompileJob *job = dynamic_cast<CompileFileMsg *>(msg)->takeJob();
     assert(client);
     assert(job);
+
+    /* G4 P_batch (local-oracle 17:58): a batch client's CompileFile must match the
+       one local entry that was delivered and slot-charged on the scalar lane.
+       Validate the exact job id BEFORE adopting the CompileJob, then advance that
+       entry to LOCAL_COMPILE_STARTED -- the only local state that accepts a JobDone
+       -- and commit its scheduler JobBegin.  A CompileFile matching no delivered
+       entry (an unknown id, or a duplicate for an already-started/completed one) is
+       rejected and its job is not adopted: it never overwrites a started entry's
+       CompileJob and never emits a stray JobBegin. */
+    if (client->getcs_expected > 1) {
+        Client::BatchEntry *bound = nullptr;
+        for (Client::BatchEntry &e : client->getcs_batch) {
+            if (e.state == Client::BatchState::LOCAL_DELIVERED_SLOT_CHARGED
+                    && e.job_id == job->jobID()) {
+                bound = &e; break;
+            }
+        }
+        if (!bound) {
+            log_warning() << "handle_compile_file batch: CompileFile job " << job->jobID()
+                          << " matches no delivered local entry; rejecting" << endl;
+            delete job;
+            return true;   /* ignore -- not a daemon-fatal condition */
+        }
+        assert(job->environmentVersion() == "__client");
+        delete client->job;              /* the started entry owns exactly one job */
+        client->job = job;
+        if (client->command_line.empty()) {
+            client->command_line = command_line_from_compile_job(job);
+        }
+        client->last_known_job_id = job->jobID();
+        bound->state = Client::BatchState::LOCAL_COMPILE_STARTED;
+        if (scheduler_owns_getcs_assignment(client)) {
+            if (!send_scheduler(JobBeginMsg(job->jobID(), clients.size()))) {
+                trace() << "can't reach scheduler to tell him about compile file job "
+                        << job->jobID() << endl;
+                return false;
+            }
+        }
+        return true;
+    }
+
     client->job = job;
     if (client->command_line.empty()) {
         client->command_line = command_line_from_compile_job(job);
@@ -6341,7 +6443,9 @@ void Daemon::handle_end(Client *client, int exitcode)
                 && (client->getcs_delivered >= client->getcs_expected);
             if (normal) {
                 for (const Client::BatchEntry &e : client->getcs_batch) {
-                    if (e.local && !e.completed) { normal = false; break; }
+                    /* any unfinished LOCAL entry (queued/bound/delivered, never
+                       COMPLETED) ran or was queued here -> not a NORMAL End. */
+                    if (Client::BatchEntry::is_local(e.state)) { normal = false; break; }
                 }
             }
             if (scheduler_owns_getcs_assignment(client)) {
@@ -6352,11 +6456,11 @@ void Daemon::handle_end(Client *client, int exitcode)
                    Completed entries never re-settle.  One client-id cancellation
                    covers the undelivered tail. */
                 for (const Client::BatchEntry &e : client->getcs_batch) {
-                    if (e.completed) {
-                        continue;
+                    if (e.state == Client::BatchState::COMPLETED) {
+                        continue;   /* already settled; never re-settle */
                     }
-                    if (normal && !e.local) {
-                        continue;   /* CLIENT_RELEASED */
+                    if (normal && e.state == Client::BatchState::REMOTE_DELIVERED) {
+                        continue;   /* CLIENT_RELEASED -- its worker reports to S */
                     }
                     send_scheduler(JobDoneMsg(e.job_id, exitcode, JobDoneMsg::FROM_SUBMITTER, clients.size()));
                 }
@@ -6366,17 +6470,11 @@ void Daemon::handle_end(Client *client, int exitcode)
                     send_scheduler(cancel);
                 }
             }
-            /* Free queued-but-undelivered local decisions.  A bound/active local's
-               slot is restored by the CLIENTWORK block above (unconditional, so it
-               survives scheduler loss), and its UseCS lives in client->usecsmsg,
-               freed by ~Client.  On scheduler loss this whole block is skipped, but
-               ~Client also frees every BatchEntry::pending (defect #4). */
-            for (Client::BatchEntry &e : client->getcs_batch) {
-                if (e.pending) {
-                    delete e.pending;
-                    e.pending = nullptr;
-                }
-            }
+            /* A bound/delivered local's slot is restored by the CLIENTWORK block
+               above (unconditional, so it survives scheduler loss), and its UseCS
+               lives in client->usecsmsg, freed by ~Client.  Every queued LOCAL_WAIT_
+               CAPACITY entry still owns its UseCS in a unique_ptr, so the clear()
+               below frees them with value ownership -- no manual per-entry delete. */
             client->job_id = 0;
             client->last_known_job_id = 0;
             client->getcs_batch.clear();
