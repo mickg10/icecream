@@ -1154,14 +1154,42 @@ static int case_audit_delivery_fail(const char *iceccd)
     {
         { JobDoneMsg d(0, 0, JobDoneMsg::FROM_SUBMITTER); d.real_msec = 1; d.user_msec = 1; blocker->send_msg(d); }
         std::vector<SeenUseCS> a = capture_use_cs(client, 1, 4000);
-        REQUIRE_OR_ABORT(a.size() == 1 && a[0].job_id == ids[0], "L1 delivered");
-        /* complete L1 then vanish -> the daemon binds L2 and its delivery fails */
+        REQUIRE_OR_ABORT(a.size() == 1 && a[0].job_id == ids[0], "L1 delivered active");
+        /* Deterministic next-local delivery failure (local-oracle 17:16 #1):
+           freeze the daemon, put L1's completion AHEAD of the client EOF in one
+           stream, close the peer, then resume.  On resume the daemon processes
+           L1's completion (binds L2) and then finds the peer gone when it tries to
+           deliver L2 -- exercising exactly the failed-next-local path. */
+        REQUIRE_OR_ABORT(kill(f.pid, SIGSTOP) == 0, "daemon frozen (SIGSTOP)");
+        usleep(80 * 1000);
         { JobDoneMsg d(ids[0], 0, JobDoneMsg::FROM_SUBMITTER); d.real_msec = 1; d.user_msec = 1; client->send_msg(d); }
-        delete client; client = nullptr;
-        usleep(500 * 1000);
-        /* the daemon must still be alive and accept a fresh client */
+        client->flush_pending();
+        delete client; client = nullptr;      /* EOF, ordered AFTER the completion */
+        usleep(80 * 1000);
+        REQUIRE(kill(f.pid, SIGCONT) == 0, "daemon resumed (SIGCONT)");
+
+        /* exact settlement: L1's completion forwarded once; L2 (delivered-but-
+           unfinished on the abnormal end) settled once; no cancellation since all
+           expected decisions were recorded (delivered==expected). */
+        std::vector<DoneFrame> term = collect_job_done(f.sched, 4000);
+        fprintf(stderr, "         (delivery-fail settlement %s cancels=%d)\n",
+                ids_to_string(done_order(term)).c_str(), count_cancellations(term, cid));
+        REQUIRE(count_id(term, ids[0]) == 1, "L1 completion forwarded exactly once");
+        REQUIRE(count_id(term, ids[1]) == 1, "L2 settled exactly once on the abnormal end");
+        REQUIRE(count_cancellations(term, cid) == 1, "one cancellation for the undelivered 3rd decision (2 of 3 recorded)");
+
+        /* capacity restored + real trailing exchange: a fresh scalar-local client
+           gets a decision (proves the daemon is live and the slot is free). */
         MsgChannel *live = connect_unix_bounded(f.socket_path, 3000);
-        REQUIRE(live != nullptr, "daemon survived the failed next-local delivery (no use-after-delete)");
+        REQUIRE_OR_ABORT(live != nullptr, "daemon survived the failed next-local delivery");
+        live->send_msg(make_getcs("post.cpp", 1));
+        Msg *lf = wait_for_type(f.sched, Msg::GET_CS, 4000);
+        REQUIRE(lf != nullptr, "trailing scalar GetCS reached S");
+        uint32_t lc = 0; { GetCSMsg *g = dynamic_cast<GetCSMsg *>(lf); if (g) lc = g->client_id; }
+        delete lf;
+        f.sched->send_msg(UseCSMsg("x86_64", "127.0.0.1", 0, 8650, true, lc, 0));
+        std::vector<SeenUseCS> pv = capture_use_cs(live, 1, 4000);
+        REQUIRE(pv.size() == 1 && (pv.empty() || pv[0].job_id == 8650), "trailing scalar-local exchange completed");
         delete live;
     }
 done:
