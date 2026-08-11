@@ -26,6 +26,7 @@ jobs:
         uses: actions/github-script@v7
         env:
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          EVENT_SHA: ${{ github.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number || 0 }}
           TRACKER: "4"
         with:
@@ -33,19 +34,20 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const headSha = process.env.HEAD_SHA;
+            const eventSha = process.env.EVENT_SHA;
             const prNumber = Number(process.env.PR_NUMBER || '0');
             const tracker = Number(process.env.TRACKER);
             const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
             const deadline = Date.now() + 120 * 60 * 1000;
             let selected = null;
 
-            const matchesExactSource = run => {
+            const matchesSameEvent = run => {
               if (run.name !== 'compatibility-formal') return false;
               if (prNumber > 0) {
-                return (run.pull_requests || []).some(pr =>
-                  Number(pr.number) === prNumber
-                  && (!pr.head || !pr.head.sha || pr.head.sha === headSha)
-                );
+                if (run.head_sha !== eventSha) return false;
+                const prs = run.pull_requests || [];
+                return prs.length === 0
+                  || prs.some(pr => Number(pr.number) === prNumber);
               }
               return run.head_sha === headSha;
             };
@@ -56,7 +58,7 @@ jobs:
                 { owner, repo, per_page: 100 }
               );
               const candidates = runs
-                .filter(matchesExactSource)
+                .filter(matchesSameEvent)
                 .sort((a, b) => b.id - a.id);
               if (candidates.length > 0) {
                 selected = candidates[0];
@@ -67,7 +69,7 @@ jobs:
 
             if (!selected) {
               core.setFailed(
-                `No compatibility-formal run appeared for exact source ${headSha}`
+                `No compatibility-formal run appeared for event ${eventSha} / source ${headSha}`
               );
               return;
             }
@@ -119,6 +121,7 @@ jobs:
               '## Automated compatibility-formal status',
               '',
               `Exact source head: \`${headSha}\``,
+              `Trigger/event head: \`${eventSha}\``,
               `Workflow run: \`${selected.id}\``,
               `Workflow metadata head: \`${selected.head_sha}\``,
               `Workflow conclusion: **${selected.conclusion || selected.status}**`,
