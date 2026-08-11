@@ -1,0 +1,144 @@
+name: g4-minimal-formal
+
+"on":
+  push:
+    branches: [bigoracle/g4-minimal-formal]
+    paths:
+      - formal/G4Lifecycle.tla
+      - formal/G4_MINIMAL_MODEL.md
+      - .github/workflows/g4-minimal-formal.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tlc:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run pinned exhaustive TLC matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          logs="$GITHUB_WORKSPACE/g4-formal-logs"
+          cfgs=/tmp/g4-configs
+          tools=/tmp/g4-tools
+          mkdir -p "$logs/configs" "$cfgs" "$tools"
+
+          curl --fail --location --retry 4 --retry-all-errors \
+            -o "$tools/tla2tools-1.7.4.jar" \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+          curl --fail --location --retry 4 --retry-all-errors \
+            -o "$tools/tla2tools-1.8.0.jar" \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
+          printf '%s  %s\n' \
+            936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88 \
+            "$tools/tla2tools-1.7.4.jar" | sha256sum -c -
+          printf '%s  %s\n' \
+            ab323b79802aedc3203b3f9af37c6aca3ed43f4e0225b36f2aa77b26de46c05f \
+            "$tools/tla2tools-1.8.0.jar" | sha256sum -c -
+          sha256sum "$tools"/*.jar > "$logs/tool-digests.txt"
+          java -version > "$logs/java-version.txt" 2>&1
+
+          write_cfg() {
+            local name="$1" spec="$2" protocol="$3" legacy="$4" start="$5"
+            local keep="$6" unbounded="$7" priority="$8"
+            shift 8
+            {
+              echo "SPECIFICATION $spec"
+              echo 'CONSTANTS'
+              echo "    Protocol = $protocol"
+              echo '    MaxBatch = 3'
+              echo '    Capacity = 1'
+              echo "    MutantLegacyNeedsConf = $legacy"
+              echo "    MutantStartBeforeBegin = $start"
+              echo "    MutantKeepRejectedSlot = $keep"
+              echo "    MutantUnboundedBatch = $unbounded"
+              echo "    MutantConjPriority = $priority"
+              echo 'CHECK_DEADLOCK FALSE'
+              printf '%s\n' "$@"
+            } > "$cfgs/$name.cfg"
+          }
+
+          write_cfg FixedLegacy FairSpec 23 FALSE FALSE FALSE FALSE FALSE \
+            'INVARIANT CoreSafety' \
+            'PROPERTY ActivationProgress' \
+            'PROPERTY LossCleanupProgress'
+          write_cfg FixedModern FairSpec 48 FALSE FALSE FALSE FALSE FALSE \
+            'INVARIANT CoreSafety' \
+            'PROPERTY ActivationProgress' \
+            'PROPERTY LossCleanupProgress'
+          write_cfg LegacyActivationMutant FairSpec 23 TRUE FALSE FALSE FALSE FALSE \
+            'INVARIANT CoreSafety' 'PROPERTY ActivationProgress'
+          write_cfg StartBeforeBeginMutant Spec 48 FALSE TRUE FALSE FALSE FALSE \
+            'INVARIANT StartedAfterBegin'
+          write_cfg RejectedSlotMutant Spec 48 FALSE FALSE TRUE FALSE FALSE \
+            'INVARIANT RejectedCleanup'
+          write_cfg UnboundedBatchMutant Spec 48 FALSE FALSE FALSE TRUE FALSE \
+            'INVARIANT BatchBound'
+          write_cfg ConjPriorityMutant Spec 48 FALSE FALSE FALSE FALSE TRUE \
+            'INVARIANT PriorityMinimal'
+          cp "$cfgs"/*.cfg "$logs/configs/"
+
+          for version in 1.7.4 1.8.0; do
+            jar="$tools/tla2tools-$version.jar"
+            java -cp "$jar" tla2sany.SANY formal/G4Lifecycle.tla \
+              > "$logs/sany-$version.log" 2>&1
+          done
+
+          run_fixed() {
+            local version="$1" row="$2"
+            local log="$logs/$row-$version.log"
+            (cd formal && java -jar "$tools/tla2tools-$version.jar" \
+              -workers 1 -metadir "/tmp/$row-$version.states" \
+              -config "$cfgs/$row.cfg" G4Lifecycle) > "$log" 2>&1
+            grep -F 'Model checking completed. No error has been found.' "$log"
+            grep -E '[1-9][0-9,]* states generated' "$log"
+          }
+
+          run_mutant() {
+            local version="$1" row="$2" pattern="$3"
+            local log="$logs/$row-$version.log"
+            set +e
+            (cd formal && java -jar "$tools/tla2tools-$version.jar" \
+              -workers 1 -metadir "/tmp/$row-$version.states" \
+              -config "$cfgs/$row.cfg" G4Lifecycle) > "$log" 2>&1
+            rc=$?
+            set -e
+            test "$rc" -ne 0
+            grep -E "$pattern" "$log"
+            grep -E '[1-9][0-9,]* states generated' "$log"
+          }
+
+          for version in 1.7.4 1.8.0; do
+            run_fixed "$version" FixedLegacy
+            run_fixed "$version" FixedModern
+            run_mutant "$version" LegacyActivationMutant \
+              'Temporal properties were violated|ActivationProgress'
+            run_mutant "$version" StartBeforeBeginMutant \
+              'Invariant StartedAfterBegin is violated|StartedAfterBegin'
+            run_mutant "$version" RejectedSlotMutant \
+              'Invariant RejectedCleanup is violated|RejectedCleanup'
+            run_mutant "$version" UnboundedBatchMutant \
+              'Invariant BatchBound is violated|BatchBound'
+            run_mutant "$version" ConjPriorityMutant \
+              'Invariant PriorityMinimal is violated|PriorityMinimal'
+          done
+
+          git rev-parse HEAD > "$logs/revision.txt"
+          {
+            echo "fixed_logs=$(find "$logs" -name 'Fixed*.log' | wc -l)"
+            echo "mutant_logs=$(find "$logs" -name '*Mutant-*.log' | wc -l)"
+          } > "$logs/summary.txt"
+
+      - name: Retain TLC evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g4-minimal-formal-${{ github.sha }}
+          path: g4-formal-logs
+          if-no-files-found: error
+          retention-days: 30
