@@ -6306,20 +6306,34 @@ bool Daemon::handle_compile_file(Client *client, Msg *msg)
             return true;   /* ignore -- not a daemon-fatal condition */
         }
         assert(job->environmentVersion() == "__client");
+        /* Invariant: a live batch published its GetCS under the current active
+           session and is torn down on session loss, so a batch-local CompileFile is
+           always scheduler-owned.  There is no legitimate schedulerless batch-local
+           start path (unlike the scalar fallback below); reject rather than start
+           one silently. */
+        if (!scheduler_owns_getcs_assignment(client)) {
+            log_warning() << "handle_compile_file batch: CompileFile job " << job->jobID()
+                          << " on a non-scheduler-owned batch; rejecting" << endl;
+            delete job;
+            return true;
+        }
         delete client->job;              /* the started entry owns exactly one job */
         client->job = job;
         if (client->command_line.empty()) {
             client->command_line = command_line_from_compile_job(job);
         }
         client->last_known_job_id = job->jobID();
-        bound->state = Client::BatchState::LOCAL_COMPILE_STARTED;
-        if (scheduler_owns_getcs_assignment(client)) {
-            if (!send_scheduler(JobBeginMsg(job->jobID(), clients.size()))) {
-                trace() << "can't reach scheduler to tell him about compile file job "
-                        << job->jobID() << endl;
-                return false;
-            }
+        /* Commit JobBegin FIRST; only mark the entry STARTED once the send succeeds
+           -- the LOCAL_COMPILE_STARTED name means JobBegin has been committed, and
+           it is the only local state that accepts a JobDone.  On send failure the
+           entry stays LOCAL_DELIVERED_SLOT_CHARGED and the caller tears the session
+           down. */
+        if (!send_scheduler(JobBeginMsg(job->jobID(), clients.size()))) {
+            trace() << "can't reach scheduler to tell him about compile file job "
+                    << job->jobID() << endl;
+            return false;
         }
+        bound->state = Client::BatchState::LOCAL_COMPILE_STARTED;
         return true;
     }
 
