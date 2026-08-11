@@ -3,7 +3,7 @@ TESTS = testargs lockexec backpressure schedpolicy utf8test statewritertest fast
 AM_CPPFLAGS = -I$(top_srcdir)/client -I$(top_srcdir)/services -I$(top_srcdir)/
 testargs_LDADD = ../client/libclient.a ../services/libicecc.la
 
-check_PROGRAMS = testargs lockexec backpressure schedpolicy utf8test statewritertest schedbp daemonlogin daemonbatch connectivity fastesttest hallflowtest jobidalloctest
+check_PROGRAMS = testargs lockexec backpressure schedpolicy utf8test statewritertest schedbp daemonlogin daemonbatch batchledger connectivity fastesttest hallflowtest jobidalloctest
 testargs_SOURCES = args.cpp
 lockexec_SOURCES = lockexec.cpp
 lockexec_LDADD = ../client/libclient.a ../services/libicecc.la
@@ -32,6 +32,11 @@ daemonlogin_SOURCES = daemonlogin.cpp
 daemonlogin_LDADD = ../services/libicecc.la
 daemonbatch_SOURCES = daemonbatch.cpp
 daemonbatch_LDADD = ../services/libicecc.la
+
+batchledger_SOURCES = batchledger.cpp
+batchledger_CXXFLAGS = -pthread
+batchledger_LDFLAGS = -pthread
+batchledger_LDADD = ../services/libicecc.la
 
 # Connectivity-probe state machine regression (issue #4 item 4): drives
 # CompileServer directly, with failure injection from conn_shim.so.
