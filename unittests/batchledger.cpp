@@ -559,8 +559,11 @@ static int case_local_capacity(const char *iceccd)
         REQUIRE_OR_ABORT(cid != 0, "forwarded GetCS carried a client id");
         const uint32_t L1 = 6300, L2 = 6301, L3 = 6302;
         bool sent = true;
-        for (uint32_t j : { L1, L2, L3 })   /* LOCAL decisions: host==remote_name, port==daemon_port */
-            sent = sent && f.sched->send_msg(UseCSMsg("x86_64", "127.0.0.1", 10245, j, true, cid, 0));
+        /* LOCAL decisions: host==remote_name (127.0.0.1) && port==daemon_port.
+           A --no-remote submitter has daemon_port==0, so a same-daemon UseCS uses
+           port 0 (matches the scalar local-detect at scheduler_use_cs). */
+        for (uint32_t j : { L1, L2, L3 })
+            sent = sent && f.sched->send_msg(UseCSMsg("x86_64", "127.0.0.1", 0, j, true, cid, 0));
         REQUIRE_OR_ABORT(sent, "scheduler delivered three LOCAL batch decisions");
 
         std::vector<SeenUseCS> during = capture_use_cs(client, 3, 2500);
