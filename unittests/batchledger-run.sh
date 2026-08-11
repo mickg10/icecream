@@ -13,7 +13,8 @@ for c in self-control \
          scalar-count0 scalar-count1-remote scalar-count1-local \
          mixed-LRR mixed-RLR mixed-RNR nocs-dedup-excess \
          transition-1 transition-2 transition-3 \
-         invalid-jobdone local-lifetime compile-started \
+         invalid-jobdone local-lifetime compile-started jobbegin-send-fail \
+         usecs-fields helper-controls \
          audit-jobbegin audit-delivery-fail audit-sched-loss; do
     if ! "$dir/batchledger" "$iceccd" "$c"; then
         echo "batchledger case FAILED: $c" >&2
