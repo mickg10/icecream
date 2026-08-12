@@ -47,9 +47,20 @@ dir=$(cd "$(dirname "$0")" && pwd)
 top=$(cd "$dir/.." && pwd)
 
 # Short socket dir: sun_path is limited to ~107 bytes and distcheck build
-# trees exceed it.
+# trees exceed it -- keep it under the dedicated (short) XDG_RUNTIME_DIR.
 sockdir=$(mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/iceq.XXXXXX") || exit 99
-work=$(mktemp -d "${TMPDIR:-/tmp}/iceremote.XXXXXX") || exit 99
+# Retained-root interface (local-oracle 5263490925 D): when the integration launcher
+# sets ICECC_REMOTE_ARTIFACT_ROOT, put the work/output tree there and retain it on exit;
+# otherwise use scratch TMPDIR and clean up normally.
+RETAIN_WORK=0
+if [ -n "${ICECC_REMOTE_ARTIFACT_ROOT:-}" ]; then
+    mkdir -p "$ICECC_REMOTE_ARTIFACT_ROOT" || exit 99
+    work="$ICECC_REMOTE_ARTIFACT_ROOT/work"
+    mkdir -p "$work" || exit 99
+    RETAIN_WORK=1
+else
+    work=$(mktemp -d "${TMPDIR:-/tmp}/iceremote.XXXXXX") || exit 99
+fi
 
 # PID-derived defaults so concurrent runs (or a developer's own scheduler)
 # cannot collide on a fixed port.
@@ -71,9 +82,19 @@ cleanup() {
     [ -n "${REMOTE_PID:-}" ] && kill "$REMOTE_PID" 2>/dev/null
     [ -n "${SCHED_PID:-}" ] && kill "$SCHED_PID" 2>/dev/null
     wait 2>/dev/null
-    rm -rf "$sockdir" "$work"
+    rm -rf "$sockdir"
+    # D.3: never delete a retained artifact root; only the transient scratch work dir
+    [ "$RETAIN_WORK" = 1 ] || rm -rf "$work"
 }
 trap cleanup EXIT
+
+# D.5: every unix socket path must fit sun_path (<=107 bytes) before we launch.
+for s in "$sockdir/remote" "$sockdir/local"; do
+    if [ "${#s}" -gt 107 ]; then
+        echo "FAIL: socket path exceeds 107 bytes ($s)" >&2
+        exit 1
+    fi
+done
 
 command -v gcc >/dev/null || skip "gcc not available"
 

@@ -447,7 +447,7 @@ if test -n "$compress_program"; then
     fi
 fi
 
-tempdir=$(mktemp -d /tmp/iceccenvXXXXXX)
+tempdir=$(mktemp -d "${TMPDIR:-/tmp}/iceccenvXXXXXX")
 
 # for testing the environment is usable at all
 bintrue=/bin/true
@@ -545,7 +545,7 @@ fi
 # for ldconfig -r to work, ld.so.conf must not contain relative paths
 # in include directives. Make them absolute.
 if test -f /etc/ld.so.conf; then
-  tmp_ld_so_conf=$(mktemp /tmp/icecc_ld_so_confXXXXXX)
+  tmp_ld_so_conf=$(mktemp "${TMPDIR:-/tmp}/icecc_ld_so_confXXXXXX")
   while read directive path; do
     if [ "$directive" = "include" -a "${path:0:1}" != "/" ]; then
       path="/etc/$path"
