@@ -20,11 +20,14 @@ TIMEOUT="${BATCHLEDGER_CASE_TIMEOUT:-90}"
 # #8: never overwrite prior evidence -- always a unique run directory.  If the caller
 # names a root, nest a unique child under it; otherwise use a pid-stamped path.
 if [ -n "${BATCHLEDGER_ARTIFACT_ROOT:-}" ]; then
+    mkdir -p "$BATCHLEDGER_ARTIFACT_ROOT" 2>/dev/null \
+        || { echo "cannot create artifact root $BATCHLEDGER_ARTIFACT_ROOT" >&2; exit 2; }
     ART="$BATCHLEDGER_ARTIFACT_ROOT/run-$$"
 else
     ART="/tmp/batchledger-$$"
 fi
-mkdir "$ART" 2>/dev/null || { echo "artifact root $ART exists/uncreatable; refusing to overwrite" >&2; exit 2; }
+# the unique per-run child is created non-recursively so a repeated run token is refused
+mkdir "$ART" 2>/dev/null || { echo "artifact run dir $ART exists/uncreatable; refusing to overwrite" >&2; exit 2; }
 
 CASES="self-control \
  client-done-filter late-usecs teardown-clean local-capacity batch-nocs \

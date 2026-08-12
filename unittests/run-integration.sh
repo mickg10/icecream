@@ -21,11 +21,14 @@ export COMPOSE_PROJECT_NAME="$proj"
 # Unique artifact root: never overwrite prior evidence (nest a unique child if the caller
 # names an existing root).
 if [ -n "${INTEGRATION_ARTIFACT_ROOT:-}" ]; then
+    mkdir -p "$INTEGRATION_ARTIFACT_ROOT" 2>/dev/null \
+        || { echo "cannot create artifact root $INTEGRATION_ARTIFACT_ROOT" >&2; exit 2; }
     ART="$INTEGRATION_ARTIFACT_ROOT/run-$$"
 else
     ART="/tmp/icecc-integration-$$"
 fi
-mkdir "$ART" 2>/dev/null || { echo "artifact root $ART exists/uncreatable; refusing to overwrite" >&2; exit 2; }
+# the unique per-run child is created non-recursively so a repeated run token is refused
+mkdir "$ART" 2>/dev/null || { echo "artifact run dir $ART exists/uncreatable; refusing to overwrite" >&2; exit 2; }
 
 # scenario NAME REQUIRED|OPTIONAL PATH -- a REQUIRED non-PASS forces a nonzero exit.
 SCENARIOS="

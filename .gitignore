@@ -89,3 +89,4 @@ package_builder/dist/
 /unittests/fastesttest
 /unittests/hallflowtest
 /unittests/jobidalloctest
+/unittests/clientselect
