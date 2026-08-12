@@ -24,6 +24,10 @@ The model covers the daemon-global scheduler session and the per-client GetCS le
 
 It deliberately does **not** model compiler-child ownership, compiler termination, or raw byte-prefix transport. The corresponding claims are outside `CoreSafety`. A product trace may classify a send as `Committed`, `NoCommit`, or `Ambiguous`, but the model does not infer that classification from a boolean write return.
 
+### Finite batch bound and product-trace scope
+
+`MaxBatch` is a finite-model parameter used to exhaust a bounded request shape and later to state an induction over arbitrary finite batch sizes. The accepted product does not currently expose a hard `MaxBatch` rejection transition. Accordingly, the fixed `Next` relation contains no `RejectBatchOverflow` product action. `AdmitOverflowMutant` is enabled only by `MutantUnboundedBatch` to prove that `ModeShape` catches a ledger exceeding the selected finite bound. Product traces are checked under a configuration whose `MaxBatch` is at least the actual observed request count.
+
 ## State-machine facts being tested
 
 ### NoCS is local-lane work
@@ -126,7 +130,7 @@ TLC's built-in deadlock check is disabled in the generated config only because t
 
 ## Falsification plan
 
-The model is treated as a theory to attack. One-premise mutants separately alter:
+The model is treated as a theory to attack. One-premise mutant rows separately alter:
 
 - legacy activation;
 - batch bound enforcement;
@@ -145,21 +149,20 @@ The model is treated as a theory to attack. One-premise mutants separately alter
 - whole-daemon loss cleanup;
 - Begin output multiplicity.
 
-A mutant is useful only when TLC reaches a nonzero state space and reports the intended named invariant, not a parser error, unrelated type error, or generic process failure.
+A mutant row is useful only when TLC reaches a nonzero state space and reports the intended named invariant, not a parser error, unrelated type error, or generic process failure.
 
 ## Verification ladder
 
 1. Exactly 16 trace-checker controls pass locally.
 2. SANY succeeds with the pinned 1.7.4 jar.
 3. `fixed-modern-c1d1-cap1` exhausts a nonzero state space with queue-at-end zero and `CoreSafety` intact.
-4. The remaining small fixed rows and each one-premise mutant run on 1.7.4.
+4. The remaining small fixed rows and each one-premise mutant row run on 1.7.4.
 5. Accepted rows are repeated with the pinned `2026.07.31` prerelease jar and compared.
 6. Larger symmetry-reduced rows and seeded simulations cover more clients and decisions.
 7. A separate inductive/TLAPS argument generalizes safety beyond the finite cutoffs.
 8. Product transition logs from every deterministic integration scenario replay through the same action registry.
 9. The seeded `1 scheduler / 6 fulfillment daemons / 31 clients` exercise remains a large execution gate, not a substitute for the inductive proof.
 
-
 ## Adversarial local printouts
 
-`make formal_falsify` constructs deliberately invalid projected transitions and must reject all of them with named diagnostics. The current set attacks start-before-Begin, immediate-terminal NoCS, a second local lane, FIFO and priority inversion, stale mutation, duplicate terminal, double release, duplicate tail cancellation, cleanup order, missing remote UseCS, completed-token resurrection, output metadata mismatch, and ambiguous Begin misclassified as no-commit. These are conformance-level falsification controls; the corresponding TLA mutants are run only after SANY and the first fixed TLC row pass.
+`make formal_falsify` constructs deliberately invalid projected transitions and must reject all of them with named diagnostics. The current set attacks start-before-Begin, immediate-terminal NoCS, a second local lane, FIFO and priority inversion, stale mutation, duplicate terminal, double release, duplicate tail cancellation, cleanup order, missing remote UseCS, completed-token resurrection, output metadata mismatch, and ambiguous Begin misclassified as no-commit. These are conformance-level falsification controls; the corresponding TLA mutant rows are run only after SANY and the first fixed TLC row pass.
