@@ -69,20 +69,34 @@ trap 'cleanup; exit 143' TERM
 
 echo "=== batchledger-run  artifact-root=$ART  per-case-timeout=${TIMEOUT}s ==="
 
+# Reject any tagged test process that already exists at launcher start.
+pre_existing=$(survivors)
+if [ "$pre_existing" -ne 0 ]; then
+    echo "RESULT: FAIL (pre-existing tagged test process(es) at start: $pre_existing)" >&2
+    exit 3
+fi
+
+# The executed inputs/binaries, hashed identically at start and end so a change
+# during the run is detectable (a normal build must not be able to invalidate the
+# evidence mid-run).
+hash_inputs() {
+    for b in "$bl" "$iceccd" "$dir/batchledger.cpp" "$dir/batchledger-run.sh"; do
+        [ -f "$b" ] && sha256sum "$b"
+    done
+}
 # #6: fingerprint porcelain status, tracked-vs-HEAD, and the executed inputs/binaries.
-fp="$ART/fingerprints.txt"
+fp="$ART/fingerprints-start.txt"
 {
     echo "commit          $(cd "$top" && git rev-parse HEAD 2>/dev/null || echo unknown)"
     echo "-- git status --porcelain --"
     (cd "$top" && git status --porcelain 2>/dev/null) || true
     echo "-- tracked diff vs HEAD (sha256) --"
     echo "  $(cd "$top" && git diff HEAD -- . 2>/dev/null | sha256sum | cut -d' ' -f1)"
-    echo "-- inputs / binaries --"
-    for b in "$bl" "$iceccd" "$dir/batchledger.cpp" "$dir/batchledger-run.sh"; do
-        [ -f "$b" ] && sha256sum "$b"
-    done
+    echo "-- inputs / binaries (start) --"
+    hash_inputs
 } > "$fp"
 echo "--- fingerprints ($fp) ---"; cat "$fp"
+start_inputs=$(hash_inputs)
 
 rc=0
 summary="$ART/summary.txt"
@@ -90,7 +104,7 @@ printf '%-22s %-13s %8s  %s\n' CASE RESULT DUR_S LOG > "$summary"
 for c in $CASES; do
     [ -z "$c" ] && continue
     log="$ART/$c.log"
-    cleanup                                     # BEFORE
+    cleanup                                     # BEFORE (defensive)
     if [ ! -x "$bl" ]; then
         printf '%-22s %-13s %8s  %s\n' "$c" MISSING 0 "(absent: $bl)" >> "$summary"; rc=1; continue
     fi
@@ -98,7 +112,10 @@ for c in $CASES; do
     timeout "$TIMEOUT" "$bl" "$iceccd" "$c" > "$log" 2>&1
     code=$?
     t1=$(date +%s); dur=$((t1 - t0))
-    cleanup                                     # AFTER
+    # Detect + RECORD leftovers BEFORE terminating them: survivors() applies a bounded
+    # normal-exit grace, so a nonzero count here is a genuine cleanup miss by the case,
+    # not a just-signalled child.  Classification uses this count; cleanup() then
+    # terminates the leftovers so the next case starts clean.
     left=$(survivors)
     # #5: cleanup status takes precedence over case status.
     if   [ "$left" -ne 0 ];   then res=CLEANUP-MISS; rc=1
@@ -106,12 +123,20 @@ for c in $CASES; do
     elif [ "$code" -eq 124 ]; then res=TIMEOUT; rc=1
     else res=FAIL; rc=1
     fi
+    cleanup                                     # AFTER (terminate any recorded leftovers)
     printf '%-22s %-13s %8s  %s\n' "$c" "$res" "$dur" "$log" >> "$summary"
     [ "$res" = PASS ] || echo "batchledger case $res: $c (log $log)" >&2
 done
 
+# End fingerprints + reject any input/binary change during the run.
+efp="$ART/fingerprints-end.txt"; hash_inputs > "$efp"
+if [ "$start_inputs" != "$(cat "$efp")" ]; then
+    echo "RESULT: FAIL (input/binary changed during the run -- start vs end hashes differ)" >&2
+    rc=1
+fi
+
 echo; echo "=== batchledger SUMMARY ==="; cat "$summary"
-echo "artifact-root: $ART"; echo "fingerprints:  $fp"
-[ "$rc" -eq 0 ] && echo "RESULT: PASS (all cases passed, no cleanup miss)" \
-                || echo "RESULT: FAIL (a case did not pass, or a cleanup miss)"
+echo "artifact-root: $ART"; echo "fingerprints:  $fp  +  $efp"
+[ "$rc" -eq 0 ] && echo "RESULT: PASS (all cases passed, no cleanup miss, stable inputs)" \
+                || echo "RESULT: FAIL (a case did not pass, a cleanup miss, or inputs changed)"
 exit $rc

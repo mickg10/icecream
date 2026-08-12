@@ -40,12 +40,11 @@ integration_tests:
 	$(MAKE) -C unittests integration_tests
 .PHONY: integration_tests
 
-# Farm / formal / performance are SEPARATE stages with distinct environments and
-# evidence (real cluster; TLA/TLAPS toolchain; perf harness).  They are named here so
-# the tester knows they exist, but are intentionally not wired into integration_tests.
-farm_stage formal_stage performance_stage:
-	@echo "$@: separate stage with its own environment/evidence; run explicitly (not part of integration_tests)."
-.PHONY: farm_stage formal_stage performance_stage
+# Farm / formal / performance validation are SEPARATE manual stages with distinct
+# environments and evidence (real cluster; TLA/TLAPS toolchain; perf harness).  They are
+# intentionally NOT part of integration_tests and this Makefile provides no entry point
+# for them -- they are run by hand from their own trees so no target here can imply they
+# are exercised by a plain `make integration_tests` (local-oracle 5260775013 B.5).
 
 test: install
 # 'make test' also depends on 'make check', but using plain 'test: check' dependency breaks with recursive make

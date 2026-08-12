@@ -1,21 +1,33 @@
 #!/bin/sh
-# Hardened serial integration/scenario launcher (local-oracle 5258904367 #7 / 21:30 /
-# 22:28).  Runs each DETERMINISTIC scenario sequentially, each with a hard per-scenario
-# timeout, a retained per-scenario log + duration, cleanup + verification BEFORE and
-# AFTER every scenario, and a final PASS/FAIL/SKIP table with full fingerprints and an
-# artifact root.  Continues through failures; exits nonzero if any REQUIRED scenario
-# did not pass OR a cleanup miss was observed.  Real-farm, formal (TLA/TLAPS), and
-# performance gates are SEPARATE named stages (see run-farm-stage / run-formal-stage /
-# run-perf-stage below) with distinct environments -- deliberately not run here.
+# Hardened serial integration/scenario launcher (local-oracle 5258904367 / 5259702949 /
+# 5260775013).  Runs each DETERMINISTIC scenario sequentially, each with a hard timeout,
+# a retained per-scenario log + duration, this-run-only cleanup + verification before and
+# after every scenario, and a final PASS/FAIL/SKIP/CLEANUP-MISS table with start+end
+# fingerprints and a unique artifact root.  Continues through failures; exits nonzero if
+# any REQUIRED scenario did not pass, a cleanup miss was observed, or inputs changed
+# during the run.  Real-farm, formal (TLA/TLAPS), and performance gates are SEPARATE
+# manual stages with their own environments and evidence; they are intentionally NOT run
+# here and this launcher claims no entry point for them.
 set -u
 
 dir=$(cd "$(dirname "$0")" && pwd)
 top=$(cd "$dir/.." && pwd)
-ART="${INTEGRATION_ARTIFACT_ROOT:-/tmp/icecc-integration-$$}"
 TIMEOUT="${INTEGRATION_TIMEOUT:-600}"
-mkdir -p "$ART" || { echo "cannot create artifact root $ART" >&2; exit 2; }
 
-# scenario NAME REQUIRED|OPTIONAL PATH -- REQUIRED non-PASS forces a nonzero exit.
+# A known, per-run compose project id, shared by the scenario and every cleanup/verify.
+proj="${INTEGRATION_COMPOSE_PROJECT:-icecc-integ-$$}"
+export COMPOSE_PROJECT_NAME="$proj"
+
+# Unique artifact root: never overwrite prior evidence (nest a unique child if the caller
+# names an existing root).
+if [ -n "${INTEGRATION_ARTIFACT_ROOT:-}" ]; then
+    ART="$INTEGRATION_ARTIFACT_ROOT/run-$$"
+else
+    ART="/tmp/icecc-integration-$$"
+fi
+mkdir "$ART" 2>/dev/null || { echo "artifact root $ART exists/uncreatable; refusing to overwrite" >&2; exit 2; }
+
+# scenario NAME REQUIRED|OPTIONAL PATH -- a REQUIRED non-PASS forces a nonzero exit.
 SCENARIOS="
 batchledger-run.sh    REQUIRED $dir/batchledger-run.sh
 daemonlogin-run.sh    REQUIRED $dir/daemonlogin-run.sh
@@ -27,81 +39,116 @@ remoteice-quick.sh    OPTIONAL $dir/remoteice-quick.sh
 compose-run.sh        REQUIRED $top/tests/compose/run.sh
 "
 
-# --- cleanup: no test daemon/scheduler/compose resource may survive a scenario ---
-cleanup() {
-    for pat in 'icecc-scheduler .*-n (g4-|cmxb|conn|schedbp|schedstress|remoteice)' \
-               'iceccd .*-n (g4-|cmxb|conn|schedbp|schedstress|remoteice)' \
-               'iceccd .*-N g4-daemon'; do
-        pkill -f "$pat" 2>/dev/null || true
-    done
+# --- this-run daemons/schedulers by test-tagged FULL command lines (#2: ps -eo comm
+# truncates 'icecc-scheduler' and would also match unrelated system icecream). ---
+RUN_PATS="iceccd .*-n (g4-|cmxb|conn|schedbp|schedstress|remoteice)|iceccd .*-N g4-daemon|icecc-scheduler .*-n (g4-|cmxb|conn|schedbp|schedstress|remoteice)"
+
+compose_down() {
     if command -v docker >/dev/null 2>&1 && [ -f "$top/tests/compose/docker-compose.yml" ]; then
-        ( cd "$top/tests/compose" && docker compose down -v --remove-orphans >/dev/null 2>&1 ) || true
+        ( cd "$top/tests/compose" && docker compose -p "$proj" down -v --remove-orphans >/dev/null 2>&1 ) || true
     fi
 }
-# verify cleanup left nothing; echo the count of survivors.
+cleanup() { pkill -f "$RUN_PATS" 2>/dev/null || true; compose_down; }
+
+# #1: exactly one integer.  #2: bounded wait so a just-signalled child is not miscounted.
 survivors() {
-    ps -eo comm 2>/dev/null | grep -cE '^(iceccd|icecc-scheduler)$' || echo 0
+    i=0
+    while [ "$i" -lt 20 ]; do
+        n=$(pgrep -fc "$RUN_PATS" 2>/dev/null); [ -n "$n" ] || n=0
+        [ "$n" -eq 0 ] && break
+        i=$((i + 1)); sleep 0.1
+    done
+    echo "$n"
 }
-trap 'cleanup' EXIT HUP INT TERM
+# Separate compose-resource count for this run's project.
+compose_survivors() {
+    if command -v docker >/dev/null 2>&1; then
+        docker ps -q --filter "label=com.docker.compose.project=$proj" 2>/dev/null | grep -c . || echo 0
+    else
+        echo 0
+    fi
+}
 
-echo "=== integration_tests  artifact-root=$ART  per-scenario-timeout=${TIMEOUT}s ==="
+# #4: signal handlers that clean up and exit nonzero; EXIT stays as a backstop.
+trap 'cleanup' EXIT
+trap 'cleanup; exit 129' HUP
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
 
-# --- full fingerprints (local-oracle 22:28): commit, dirty tree, inputs, binaries ---
-fp="$ART/fingerprints.txt"
-{
-    echo "commit          $(cd "$top" && git rev-parse HEAD 2>/dev/null || echo unknown)"
-    if (cd "$top" && git diff --quiet 2>/dev/null); then echo "worktree        clean";
-    else echo "worktree        DIRTY  diff-sha256=$(cd "$top" && git diff | sha256sum | cut -d' ' -f1)"; fi
-    echo "-- make/runner inputs --"
-    for f in "$top/Makefile.am" "$dir/Makefile.am" "$dir/run-integration.sh" \
-             "$dir/batchledger-run.sh" "$dir/batchledger.cpp"; do
+echo "=== integration_tests  artifact-root=$ART  per-scenario-timeout=${TIMEOUT}s  compose-project=$proj ==="
+
+# Reject pre-existing tagged test processes at start.
+pre=$(survivors)
+if [ "$pre" -ne 0 ]; then echo "RESULT: FAIL (pre-existing tagged test process(es): $pre)" >&2; exit 3; fi
+
+# --- #6: start fingerprints (porcelain, tracked diff, untracked inputs, runners, image) ---
+hash_inputs() {
+    for f in "$dir/batchledger" "$dir/daemonlogin" "$dir/daemonbatch" "$dir/schedbp" \
+             "$dir/connectivity" "$dir/fastesttest" "$dir/sndbuf_shim.so" "$dir/conn_shim.so" \
+             "$top/daemon/iceccd" "$top/scheduler/icecc-scheduler" "$top/client/icecc" \
+             "$dir/run-integration.sh" "$dir/batchledger-run.sh" "$top/tests/compose/run.sh" \
+             "$top/tests/compose/docker-compose.yml"; do
         [ -f "$f" ] && sha256sum "$f"
     done
-    echo "-- executed binaries --"
-    for b in "$dir/batchledger" "$dir/daemonlogin" "$dir/daemonbatch" "$dir/schedbp" \
-             "$dir/connectivity" "$dir/fastesttest" "$dir/sndbuf_shim.so" "$dir/conn_shim.so" \
-             "$top/daemon/iceccd" "$top/scheduler/icecc-scheduler" "$top/client/icecc"; do
-        [ -f "$b" ] && sha256sum "$b"
-    done
+}
+fp="$ART/fingerprints-start.txt"
+{
+    echo "top             $top"
+    echo "commit          $(cd "$top" && git rev-parse HEAD 2>/dev/null || echo unknown)"
+    echo "-- git status --porcelain --"
+    (cd "$top" && git status --porcelain 2>/dev/null) || true
+    echo "-- tracked diff vs HEAD (sha256) --"
+    echo "  $(cd "$top" && git diff HEAD -- . 2>/dev/null | sha256sum | cut -d' ' -f1)"
+    echo "-- inputs / binaries / compose (start) --"
+    hash_inputs
 } > "$fp"
 echo "--- fingerprints ($fp) ---"; cat "$fp"
+start_inputs=$(hash_inputs)
 
 rc=0
 summary="$ART/summary.txt"
-printf '%-22s %-8s %-7s %8s  %s\n' SCENARIO CLASS RESULT DUR_S LOG > "$summary"
+printf '%-22s %-8s %-12s %8s  %s\n' SCENARIO CLASS RESULT DUR_S LOG > "$summary"
 echo "$SCENARIOS" | while read -r name klass path; do
     [ -z "$name" ] && continue
     log="$ART/$name.log"
-    cleanup                                   # BEFORE
+    cleanup                                     # BEFORE (defensive)
     if [ ! -x "$path" ]; then
         res=SKIP; [ "$klass" = REQUIRED ] && res=MISSING
-        printf '%-22s %-8s %-7s %8s  %s\n' "$name" "$klass" "$res" 0 "(absent: $path)" >> "$summary"
+        printf '%-22s %-8s %-12s %8s  %s\n' "$name" "$klass" "$res" 0 "(absent: $path)" >> "$summary"
         continue
     fi
     t0=$(date +%s)
     timeout "$TIMEOUT" "$path" > "$log" 2>&1
     code=$?
     t1=$(date +%s); dur=$((t1 - t0))
-    cleanup                                   # AFTER
-    left=$(survivors)
-    if   [ "$code" -eq 0 ] && [ "$left" -eq 0 ]; then res=PASS
-    elif [ "$code" -eq 77 ]; then res=SKIP
-    elif [ "$code" -eq 124 ]; then res=TIMEOUT
-    elif [ "$left" -ne 0 ]; then res=CLEANUP-MISS
-    else res=FAIL
-    fi
-    printf '%-22s %-8s %-7s %8s  %s\n' "$name" "$klass" "$res" "$dur" "$log" >> "$summary"
+    # #5: record cleanup state BEFORE terminating; cleanup outranks scenario status.
+    left=$(survivors); cleft=$(compose_survivors)
+    scen=FAIL
+    [ "$code" -eq 0 ] && scen=PASS
+    [ "$code" -eq 77 ] && scen=SKIP
+    [ "$code" -eq 124 ] && scen=TIMEOUT
+    if [ "$left" -ne 0 ] || [ "$cleft" -ne 0 ]; then res=CLEANUP-MISS; else res=$scen; fi
+    cleanup                                     # AFTER (terminate any recorded leftovers)
+    printf '%-22s %-8s %-12s %8s  %s\n' "$name" "$klass" "$res" "$dur" "$log" >> "$summary"
 done
 
-# Determine exit: any REQUIRED row not PASS/SKIP (skip only allowed for OPTIONAL) fails.
+# End fingerprints + reject any input/binary change during the run.
+efp="$ART/fingerprints-end.txt"; hash_inputs > "$efp"
+inputs_changed=0
+[ "$start_inputs" != "$(cat "$efp")" ] && inputs_changed=1
+
+# Exit: any REQUIRED row not PASS (SKIP only for OPTIONAL) fails; any CLEANUP-MISS fails;
+# inputs changing mid-run fails.
 awk 'NR>1 {
         klass=$2; res=$3;
         if (klass=="REQUIRED" && res!="PASS") bad=1;
         if (res=="CLEANUP-MISS") bad=1;
      } END { exit bad?1:0 }' "$summary" || rc=1
+[ "$inputs_changed" -eq 1 ] && rc=1
 
 echo; echo "=== integration_tests SUMMARY ==="; cat "$summary"
-echo "artifact-root: $ART"; echo "fingerprints:  $fp"
-[ "$rc" -eq 0 ] && echo "RESULT: PASS (all required scenarios passed, no cleanup miss)" \
-                || echo "RESULT: FAIL (a required scenario did not pass, or a cleanup miss)"
+echo "artifact-root: $ART"; echo "fingerprints:  $fp  +  $efp"
+[ "$inputs_changed" -eq 1 ] && echo "NOTE: inputs/binaries changed during the run (start vs end differ)"
+[ "$rc" -eq 0 ] && echo "RESULT: PASS (all required scenarios passed, no cleanup miss, stable inputs)" \
+                || echo "RESULT: FAIL (a required scenario did not pass, a cleanup miss, or inputs changed)"
 exit $rc

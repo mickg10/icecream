@@ -79,3 +79,13 @@ package_builder/dist/
 /unittests/schedgate
 /unittests/sndbuf_shim.so
 /unittests/lockexec
+# G4 batch-ledger gate generated test products (local-oracle: a normal build must
+# leave an interpretable tree state; these are compiled artifacts, never sources).
+/unittests/batchledger
+/unittests/daemonlogin
+/unittests/daemonbatch
+/unittests/connectivity
+/unittests/conn_shim.so
+/unittests/fastesttest
+/unittests/hallflowtest
+/unittests/jobidalloctest
