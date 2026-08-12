@@ -30,8 +30,27 @@ mkdir -p "$BATCHLEDGER_ARTIFACT_ROOT" 2>/dev/null \
 ART="$BATCHLEDGER_ARTIFACT_ROOT/run-$$"
 mkdir "$ART" 2>/dev/null || { echo "run dir $ART exists/uncreatable; refusing to overwrite" >&2; exit 2; }
 mkdir -p "$ART/cases" "$ART/tmp"
-# scenario scratch under the artifact tree (inherit an outer TMPDIR only if already scratch)
-export TMPDIR="$ART/tmp"
+# TMPDIR must be a SHORT path so farm UNIX sockets fit sun_path (<=107).  Honor an
+# inherited TMPDIR only if it already resolves BENEATH our artifact root; otherwise create
+# our own short symlink alias -> $ART/tmp.  Cleaned (alias only) at exit; target retained.
+OUR_ALIAS=""
+_use_inherited=0
+if [ -n "${TMPDIR:-}" ]; then
+    _it=$(readlink -f "$TMPDIR" 2>/dev/null)
+    _br=$(readlink -f "$BATCHLEDGER_ARTIFACT_ROOT" 2>/dev/null)
+    case "$_it/" in "$_br"/*) _use_inherited=1;; esac
+fi
+if [ "$_use_inherited" = 0 ]; then
+    OUR_ALIAS="/tanksmall/scratch/ictmp/icecc-tmp-bl-$$"
+    ln -s "$ART/tmp" "$OUR_ALIAS" || { echo "cannot create short tmp alias $OUR_ALIAS" >&2; exit 2; }
+    [ "$(readlink -f "$OUR_ALIAS")" = "$(readlink -f "$ART/tmp")" ] \
+        || { echo "tmp alias does not resolve to \$ART/tmp" >&2; exit 2; }
+    export TMPDIR="$OUR_ALIAS"
+    printf 'alias\t%s\ntarget\t%s\n' "$OUR_ALIAS" "$(readlink -f "$ART/tmp")" > "$ART/tmp-alias.txt"
+fi
+# assert the batchledger farm socket shape fits sun_path under the (short) TMPDIR
+_len=$(printf '%s' "$TMPDIR/icecream-g4-batch.XXXXXX/iceccd.sock" | wc -c)
+[ "$_len" -le 107 ] || { echo "RESULT: FAIL (INFRA-FAIL: farm socket shape $_len > 107)" >&2; exit 2; }
 
 # ownership markers: inherit owner/run/scenario from the integration launcher if present,
 # else generate them (standalone).  Markers are injected only on each CASE root (B.3).
@@ -74,31 +93,114 @@ proc_tsv() {
         printf '%s\t%s\t%s\t%s\t%s\n' "$p" "$ppid" "$pgid" "$state" "$cmd"
     done
 }
+pgid_of() { st=$(cat "/proc/$1/stat" 2>/dev/null) || { printf ''; return; }; rest=${st#*") "}; printf '%s' "$rest" | cut -d' ' -f3; }
+MY_PGID=$(pgid_of $$)
+group_alive() { pgrep -g "$1" >/dev/null 2>&1; }   # exact process-group id, not a name
+# TERM/KILL exact owned PIDs AND their exact marked groups; never our own group.  The
+# bounded TERM grace waits for BOTH the captured PIDs and the captured GROUPS to
+# disappear (a same-group descendant created after the snapshot keeps the group alive);
+# then KILL only the PIDs/groups STILL present, so a reused group is not signalled.
 terminate_owned() {
     [ "$#" -eq 0 ] && return 0
+    _pgids=""
+    for _p in "$@"; do _g=$(pgid_of "$_p"); [ -n "$_g" ] && [ "$_g" != "$MY_PGID" ] && _pgids="$_pgids $_g"; done
+    _pgids=$(printf '%s\n' $_pgids | sort -u)
     kill -TERM "$@" 2>/dev/null || true
+    for _g in $_pgids; do kill -TERM "-$_g" 2>/dev/null || true; done
     i=0; while [ "$i" -lt 30 ]; do
-        alive=0; for p in "$@"; do [ -d "/proc/$p" ] && alive=1; done
-        [ "$alive" = 0 ] && return 0
+        alive=0
+        for _p in "$@"; do [ -d "/proc/$_p" ] && alive=1; done
+        for _g in $_pgids; do group_alive "$_g" && alive=1; done
+        [ "$alive" = 0 ] && break
         i=$((i+1)); sleep 0.1
     done
-    kill -KILL "$@" 2>/dev/null || true
+    for _p in "$@"; do [ -d "/proc/$_p" ] && kill -KILL "$_p" 2>/dev/null || true; done
+    for _g in $_pgids; do group_alive "$_g" && kill -KILL "-$_g" 2>/dev/null || true; done
+}
+# retain supervisor pid, leader pid/pgid, raw wait status (gap 1)
+record_root_meta() {
+    lrec=$(tail -1 "$1" 2>/dev/null); lpid=$(printf '%s' "$lrec" | cut -f2); lpg=$(printf '%s' "$lrec" | cut -f3)
+    base=${1%.root.tsv}
+    { printf 'supervisor_pid\t%s\nleader_pid\t%s\nleader_pgid\t%s\nwait_status\t%s\n' "$2" "$lpid" "$lpg" "$3"; } > "$base.rootmeta.tsv"
+    printf '%s\n' "$3" > "$base.exit-status"
+}
+# Self-recording root wrapper (local-oracle 10:07/10:14): each case runs under a FORCED
+# `setsid -f -w` supervisor; the inner session leader writes its OWN pid+pgid to
+# $ROOTFILE before exec'ing the program (race-free).  A proper leader has pid==pgid,
+# intentionally != the supervisor ($!); -w preserves the command status.
+ROOT_WRAPPER='
+  st=$(cat /proc/self/stat) || exit 125
+  rest=${st#*") "}
+  pgid=$(printf "%s" "$rest" | cut -d" " -f3)
+  { printf "role\tpid\tpgid\n"; printf "%s\t%s\t%s\n" "$0" "$$" "$pgid"; } > "$ROOTFILE" || exit 125
+  exec timeout --kill-after=10s "$@"
+'
+root_leader_ok() {
+    rec=$(tail -1 "$1" 2>/dev/null)
+    rpid=$(printf '%s' "$rec" | cut -f2); rpg=$(printf '%s' "$rec" | cut -f3)
+    { [ -n "$rpid" ] && [ "$rpid" = "$rpg" ]; } && echo PASS || echo FAIL
 }
 sev() { case "$1" in CLEANUP-MISS) echo 6;; TIMEOUT) echo 5;; MISSING) echo 4;; FAIL) echo 3;; SKIP) echo 2;; PASS) echo 1;; *) echo 0;; esac; }
 worse() { if [ "$(sev "$1")" -ge "$(sev "$2")" ]; then echo "$1"; else echo "$2"; fi; }
 
-# reject a pre-existing tagged process for THIS run before starting any case
-pre=$(owned_pids "ICECC_IT_OWNER=$IT_OWNER" "ICECC_IT_RUN=$IT_RUN" "ICECC_IT_SCENARIO=$IT_SCEN")
-if [ -n "$pre" ]; then
-    # shellcheck disable=SC2086
-    proc_tsv $pre > "$ART/preexisting.tsv"
-    echo "RESULT: FAIL (PREEXISTING owned process; see $ART/preexisting.tsv)" >&2; exit 3
-fi
+# gap 3 / critical (local-oracle 10:20): standalone HUP/INT/TERM cleanup that remediates
+# ONLY the currently-active case, scanned by the EXACT four tokens
+# OWNER+RUN+SCENARIO+CASE=$ACTIVE_CASE.  It must NEVER scan only inherited
+# OWNER+RUN+SCENARIO -- in a nested run those also match the outer timeout, the batch
+# runner, and its parent chain, so a normal EXIT could terminate its own parent.  When no
+# case is active (normal EXIT after all cases), bl_cleanup terminates nothing.  One-shot
+# so a signal handler's records are not overwritten by the EXIT trap.
+ACTIVE_CASE=""
+BL_CLEANED=0
+bl_cleanup() {
+    [ "$BL_CLEANED" = 1 ] && return 0
+    BL_CLEANED=1
+    if [ -n "$ACTIVE_CASE" ]; then     # a case was interrupted mid-flight -> remediate it
+        mkdir -p "$ART/interrupt" 2>/dev/null || true
+        own=$(owned_pids "ICECC_IT_OWNER=$IT_OWNER" "ICECC_IT_RUN=$IT_RUN" "ICECC_IT_SCENARIO=$IT_SCEN" "ICECC_IT_CASE=$ACTIVE_CASE")
+        if [ -n "$own" ]; then
+            # shellcheck disable=SC2086
+            proc_tsv $own > "$ART/interrupt/owned.pre.tsv" 2>/dev/null || true
+            # shellcheck disable=SC2086
+            terminate_owned $own
+        else
+            : > "$ART/interrupt/owned.pre.tsv"
+        fi
+        post=$(owned_pids "ICECC_IT_OWNER=$IT_OWNER" "ICECC_IT_RUN=$IT_RUN" "ICECC_IT_SCENARIO=$IT_SCEN" "ICECC_IT_CASE=$ACTIVE_CASE")
+        # shellcheck disable=SC2086
+        { [ -n "$post" ] && proc_tsv $post || :; } > "$ART/interrupt/owned.post.tsv" 2>/dev/null || true
+    fi
+    # remove only our own short alias (symlink), never the target -- after process cleanup
+    [ -n "$OUR_ALIAS" ] && rm -f "$OUR_ALIAS" 2>/dev/null || true
+}
+trap 'bl_cleanup' EXIT
+trap 'bl_cleanup; exit 129' HUP
+trap 'bl_cleanup; exit 130' INT
+trap 'bl_cleanup; exit 143' TERM
+
+# NOTE: there is deliberately no run/scenario-marker preflight here -- a nested invocation
+# legitimately runs inside processes that already carry the inherited OWNER+RUN+SCENARIO
+# (this runner and the outer timeout).  The only invariant checked is the exact FOUR-token
+# per-case one (OWNER+RUN+SCENARIO+CASE=case_id), done in the loop below with a fresh id.
 
 # start/end input fingerprints (reject a change mid-run)
-hash_inputs() { for b in "$bl" "$iceccd" "$dir/batchledger.cpp" "$dir/batchledger-run.sh"; do [ -f "$b" ] && sha256sum "$b"; done; }
-hash_inputs > "$ART/fingerprints-start.txt"
-start_inputs=$(hash_inputs)
+# STRICT: every listed input is required and every hash must succeed (a missing file
+# makes sha256sum fail -> the function returns nonzero; no partial fingerprint).
+hash_inputs() { sha256sum "$bl" "$iceccd" "$dir/batchledger.cpp" "$dir/batchledger-run.sh" || return 1; }
+# Write a fingerprint to a SIBLING temp, retain stderr, fsync, then atomically rename --
+# a direct `hash_inputs > final` would truncate the final name and leave a partial file
+# on a mid-list sha256sum failure.  The final path exists only on full success.
+write_fingerprint() {  # $1 = final path
+    _t="$1.tmp"; _e="$1.err"
+    if ! hash_inputs > "$_t" 2> "$_e"; then rm -f "$_t"; return 1; fi
+    python3 -c 'import os,sys; fd=os.open(sys.argv[1], os.O_RDONLY); os.fsync(fd); os.close(fd)' "$_t" \
+        || { rm -f "$_t"; return 1; }
+    mv "$_t" "$1" || return 1
+    return 0
+}
+if ! write_fingerprint "$ART/fingerprints-start.txt"; then
+    echo "RESULT: FAIL (fingerprint(start) generation failed; see $ART/fingerprints-start.txt.err)" >&2; exit 2
+fi
 
 echo "=== batchledger-run  artifact-root=$ART  per-case-timeout=${TIMEOUT}s  run=$IT_RUN ==="
 
@@ -114,19 +216,36 @@ for c in $CASES; do
     [ -x "$bl" ] || break
     log="$ART/cases/$c.log"
     case_id="case-$c-$$"
+    # per-case preflight: the exact four-token invariant -- no process may already carry
+    # OWNER+RUN+SCENARIO+CASE=case_id (the fresh id).  Empty record on PASS; a collision
+    # (never expected with a fresh id) is recorded and exits 3.
+    pcase=$(owned_pids "ICECC_IT_OWNER=$IT_OWNER" "ICECC_IT_RUN=$IT_RUN" "ICECC_IT_SCENARIO=$IT_SCEN" "ICECC_IT_CASE=$case_id")
+    if [ -n "$pcase" ]; then
+        # shellcheck disable=SC2086
+        proc_tsv $pcase > "$ART/cases/$c.preexisting.tsv"
+        echo "batchledger PREEXISTING case marker: $c" >&2; exit 3
+    fi
+    : > "$ART/cases/$c.preexisting.tsv"
     t0=$(date +%s)
-    # per-case root: distinct ICECC_IT_CASE marker + setsid + timeout
-    env ICECC_IT_OWNER="$IT_OWNER" ICECC_IT_RUN="$IT_RUN" ICECC_IT_SCENARIO="$IT_SCEN" ICECC_IT_CASE="$case_id" \
-        setsid -w timeout --kill-after=10s "$TIMEOUT" "$bl" "$iceccd" "$c" > "$log" 2>&1 &
-    root=$!; wait "$root"; code=$?
+    # per-case root: distinct ICECC_IT_CASE marker + forced-supervisor setsid + timeout
+    rootf="$ART/cases/$c.root.tsv"
+    ACTIVE_CASE="$case_id"   # arm the signal trap for THIS case only
+    env ICECC_IT_OWNER="$IT_OWNER" ICECC_IT_RUN="$IT_RUN" ICECC_IT_SCENARIO="$IT_SCEN" ICECC_IT_CASE="$case_id" ROOTFILE="$rootf" \
+        setsid -f -w sh -c "$ROOT_WRAPPER" case-root "$TIMEOUT" "$bl" "$iceccd" "$c" > "$log" 2>&1 &
+    supervisor_pid=$!
+    j=0; while [ "$j" -lt 100 ] && [ ! -s "$rootf" ]; do j=$((j+1)); sleep 0.02; done
+    wait "$supervisor_pid"; code=$?
+    root_ok=$(root_leader_ok "$rootf")
+    record_root_meta "$rootf" "$supervisor_pid" "$code"
     t1=$(date +%s); dur=$((t1 - t0))
 
     scen=FAIL
     [ "$code" -eq 0 ]   && scen=PASS
     [ "$code" -eq 124 ] && scen=TIMEOUT
+    scen=$(worse "$scen" "$root_ok")   # leader pid != pgid -> at least FAIL
 
     sleep 1
-    left=$(owned_pids "ICECC_IT_RUN=$IT_RUN" "ICECC_IT_SCENARIO=$IT_SCEN" "ICECC_IT_CASE=$case_id")
+    left=$(owned_pids "ICECC_IT_OWNER=$IT_OWNER" "ICECC_IT_RUN=$IT_RUN" "ICECC_IT_SCENARIO=$IT_SCEN" "ICECC_IT_CASE=$case_id")
     if [ -n "$left" ]; then
         # shellcheck disable=SC2086
         proc_tsv $left > "$ART/cases/$c.precleanup.tsv"
@@ -136,17 +255,21 @@ for c in $CASES; do
     else
         : > "$ART/cases/$c.precleanup.tsv"; res="$scen"
     fi
-    post=$(owned_pids "ICECC_IT_RUN=$IT_RUN" "ICECC_IT_SCENARIO=$IT_SCEN" "ICECC_IT_CASE=$case_id")
+    post=$(owned_pids "ICECC_IT_OWNER=$IT_OWNER" "ICECC_IT_RUN=$IT_RUN" "ICECC_IT_SCENARIO=$IT_SCEN" "ICECC_IT_CASE=$case_id")
     # shellcheck disable=SC2086
     proc_tsv $post > "$ART/cases/$c.postcleanup.tsv"
     [ -s "$ART/cases/$c.postcleanup.tsv" ] && res=$(worse "$res" CLEANUP-MISS)
+    ACTIVE_CASE=""   # this case's scan + remediation is complete; disarm the trap
 
     printf '%-22s %-13s %8s  %s\n' "$c" "$res" "$dur" "$log" >> "$summary"
     [ "$res" = PASS ] || { rc=1; echo "batchledger case $res: $c (log $log)" >&2; }
 done
 
-hash_inputs > "$ART/fingerprints-end.txt"
-[ "$start_inputs" != "$(cat "$ART/fingerprints-end.txt")" ] && { echo "input/binary changed during the run" >&2; rc=1; }
+if ! write_fingerprint "$ART/fingerprints-end.txt"; then
+    echo "fingerprint(end) generation failed (see $ART/fingerprints-end.txt.err)" >&2; rc=1
+elif ! cmp -s "$ART/fingerprints-start.txt" "$ART/fingerprints-end.txt"; then
+    echo "input/binary changed during the run" >&2; rc=1
+fi
 
 echo; echo "=== batchledger SUMMARY ==="; cat "$summary"
 echo "artifact-root: $ART"

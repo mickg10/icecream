@@ -30,8 +30,22 @@ for d in start end scenarios batchledger tmp compose-out; do
     mkdir -p "$ART/$d" || { echo "cannot create $ART/$d" >&2; exit 2; }
 done
 
-# --- A.4: scenario scratch under the artifact tree ---------------------------------
-export TMPDIR="$ART/tmp"
+# --- A.4: scenario scratch under the artifact tree, exposed through a SHORT symlink ---
+# The canonical $ART/tmp is too deep for a farm UNIX socket (sun_path <= 107 bytes), so
+# expose it through one unique short symlink alias and use THAT as TMPDIR.  All bytes stay
+# under the canonical artifact; the alias only shortens the path.  Cleaned (alias only) at
+# the end, target retained.
+TMP_ALIAS="/tanksmall/scratch/ictmp/icecc-tmp-$$"
+ln -s "$ART/tmp" "$TMP_ALIAS" || { echo "cannot create short tmp alias $TMP_ALIAS" >&2; exit 2; }
+[ "$(readlink -f "$TMP_ALIAS")" = "$(readlink -f "$ART/tmp")" ] \
+    || { echo "tmp alias does not resolve to \$ART/tmp" >&2; exit 2; }
+export TMPDIR="$TMP_ALIAS"
+printf 'alias\t%s\ntarget\t%s\n' "$TMP_ALIAS" "$(readlink -f "$ART/tmp")" > "$ART/tmp-alias.txt"
+# assert each farm socket shape fits sun_path under the short alias
+for _pref in icecream-g4-batch icecream-g4-login; do
+    _len=$(printf '%s' "$TMPDIR/$_pref.XXXXXX/iceccd.sock" | wc -c)
+    [ "$_len" -le 107 ] || { echo "RESULT: FAIL (INFRA-FAIL: farm socket shape $_len > 107: $TMPDIR/$_pref.XXXXXX/iceccd.sock)" >&2; exit 2; }
+done
 
 # --- A.5: short dedicated runtime root on the scratch fs; clean only this path ------
 rt_id=$$
@@ -44,13 +58,8 @@ printf '%s\n' "$XDG_RUNTIME_DIR" > "$ART/xdg_runtime_dir.txt"
 # --- exact-ownership marker scheme (B) ---------------------------------------------
 IT_OWNER=icecc-it-v1
 IT_RUN="itrun-$$-$(date -u +%s 2>/dev/null || echo 0)"
-
-# --- signal handlers: clean only OUR runtime dir + exit nonzero (B/EXIT backstop) ---
-final_cleanup() { rm -rf "$XDG_RUNTIME_DIR" 2>/dev/null || true; }
-trap 'final_cleanup' EXIT
-trap 'final_cleanup; exit 129' HUP
-trap 'final_cleanup; exit 130' INT
-trap 'final_cleanup; exit 143' TERM
+# active scenario/project identifiers the signal trap remediates mid-flight (item 8)
+ACTIVE_COMPOSE_PROJ=""
 
 echo "=== integration_tests  artifact-root=$ART  timeout=${INTEGRATION_TIMEOUT:-600}s  run=$IT_RUN ==="
 TIMEOUT="${INTEGRATION_TIMEOUT:-600}"
@@ -82,17 +91,116 @@ proc_tsv() {
         printf '%s\t%s\t%s\t%s\t%s\n' "$p" "$ppid" "$pgid" "$state" "$cmd"
     done
 }
-# TERM then KILL only the given owned PIDs (bounded wait); never name-based
+pgid_of() { st=$(cat "/proc/$1/stat" 2>/dev/null) || { printf ''; return; }; rest=${st#*") "}; printf '%s' "$rest" | cut -d' ' -f3; }
+MY_PGID=$(pgid_of $$)   # the launcher's own group -- NEVER a remediation target
+group_alive() { pgrep -g "$1" >/dev/null 2>&1; }   # exact process-group id, not a name
+# TERM then KILL only the exact owned PIDs AND their exact marked process groups (a
+# descendant created after the PID snapshot is caught by the group).  The bounded TERM
+# grace waits for BOTH the captured PIDs and the captured GROUPS to disappear; then KILL
+# only those still present, so a reused group is not signalled.  Never the launcher's own
+# PGID; never name-based.
 terminate_owned() {
     [ "$#" -eq 0 ] && return 0
+    _pgids=""
+    for _p in "$@"; do _g=$(pgid_of "$_p"); [ -n "$_g" ] && [ "$_g" != "$MY_PGID" ] && _pgids="$_pgids $_g"; done
+    _pgids=$(printf '%s\n' $_pgids | sort -u)
     kill -TERM "$@" 2>/dev/null || true
+    for _g in $_pgids; do kill -TERM "-$_g" 2>/dev/null || true; done
     i=0; while [ "$i" -lt 30 ]; do
-        alive=0; for p in "$@"; do [ -d "/proc/$p" ] && alive=1; done
-        [ "$alive" = 0 ] && return 0
+        alive=0
+        for _p in "$@"; do [ -d "/proc/$_p" ] && alive=1; done
+        for _g in $_pgids; do group_alive "$_g" && alive=1; done
+        [ "$alive" = 0 ] && break
         i=$((i+1)); sleep 0.1
     done
-    kill -KILL "$@" 2>/dev/null || true
+    for _p in "$@"; do [ -d "/proc/$_p" ] && kill -KILL "$_p" 2>/dev/null || true; done
+    for _g in $_pgids; do group_alive "$_g" && kill -KILL "-$_g" 2>/dev/null || true; done
 }
+# Self-recording root wrapper (local-oracle 10:07/10:14): launched under a FORCED
+# `setsid -f -w` supervisor so the arrangement is caller-independent -- -f always forks,
+# so $! is the supervisor/waiter and the inner sh is the new-session LEADER.  The inner
+# sh writes its OWN pid+pgid to $ROOTFILE BEFORE exec'ing the program (race-free, no
+# parent /proc poll).  A proper leader has pid==pgid, intentionally != the supervisor;
+# -w preserves the timeout/command status through the supervisor's wait.
+ROOT_WRAPPER='
+  st=$(cat /proc/self/stat) || exit 125
+  rest=${st#*") "}
+  pgid=$(printf "%s" "$rest" | cut -d" " -f3)
+  { printf "role\tpid\tpgid\n"; printf "%s\t%s\t%s\n" "$0" "$$" "$pgid"; } > "$ROOTFILE" || exit 125
+  exec timeout --kill-after=10s "$@"
+'
+# PASS iff a *.root.tsv self-record is present and its leader pid == pgid (a proper
+# session leader).  The leader is intentionally NOT the supervisor ($!) under setsid -f.
+root_leader_ok() {
+    rec=$(tail -1 "$1" 2>/dev/null)
+    rpid=$(printf '%s' "$rec" | cut -f2); rpg=$(printf '%s' "$rec" | cut -f3)
+    { [ -n "$rpid" ] && [ "$rpid" = "$rpg" ]; } && echo PASS || echo FAIL
+}
+# Retain supervisor pid, leader pid/pgid, and the RAW wait status (gap 1: classification
+# alone loses 125/126/127 and signal-derived values).  $1=rootf $2=supervisor $3=code
+record_root_meta() {
+    lrec=$(tail -1 "$1" 2>/dev/null); lpid=$(printf '%s' "$lrec" | cut -f2); lpg=$(printf '%s' "$lrec" | cut -f3)
+    base=${1%.root.tsv}
+    { printf 'supervisor_pid\t%s\nleader_pid\t%s\nleader_pgid\t%s\nwait_status\t%s\n' "$2" "$lpid" "$lpg" "$3"; } > "$base.rootmeta.tsv"
+    printf '%s\n' "$3" > "$base.exit-status"
+}
+
+# --- signal / early-exit cleanup uses the ownership data (item 8) --------------------
+# Records the exact marked processes + the active project's labeled resources, remediates
+# ONLY those (TERM->wait->KILL; exact-project compose down), writes post records, removes
+# only this run's XDG runtime dir, and preserves the signal-derived nonzero exit.
+CLEANED=0
+NORMAL_DONE=0
+final_cleanup() {
+    # gap 4: one-shot -- a signal handler runs this, then the EXIT trap must NOT run a
+    # second empty pass that overwrites the nonempty interrupt records.
+    [ "$CLEANED" = 1 ] && return 0
+    CLEANED=1
+    # local-oracle 10:20: reserve interrupt/ for actual HUP/INT/TERM/early-failure paths.
+    # A NORMAL completion already did per-scenario scan/remediation + wrote remaining-owned;
+    # here it must only drop this run's runtime dir, with no interrupt evidence.
+    if [ "$NORMAL_DONE" = 1 ]; then
+        rm -rf "$XDG_RUNTIME_DIR" 2>/dev/null || true
+        [ -n "${TMP_ALIAS:-}" ] && rm -f "$TMP_ALIAS" 2>/dev/null || true   # alias only; target retained
+        return 0
+    fi
+    _cdir="$ART/interrupt"; mkdir -p "$_cdir" 2>/dev/null || true
+    if [ -n "${IT_RUN:-}" ]; then
+        intr=$(owned_pids "ICECC_IT_OWNER=$IT_OWNER" "ICECC_IT_RUN=$IT_RUN")
+        if [ -n "$intr" ]; then
+            # shellcheck disable=SC2086
+            proc_tsv $intr > "$_cdir/owned.pre.tsv" 2>/dev/null || true
+            # shellcheck disable=SC2086
+            terminate_owned $intr
+        else
+            : > "$_cdir/owned.pre.tsv"
+        fi
+    fi
+    if [ -n "${ACTIVE_COMPOSE_PROJ:-}" ] && command -v docker >/dev/null 2>&1; then
+        for _k in containers networks volumes; do
+            case "$_k" in containers) _q="ps -a";; networks) _q="network ls";; volumes) _q="volume ls";; esac
+            # shellcheck disable=SC2086
+            docker $_q --filter "label=com.docker.compose.project=$ACTIVE_COMPOSE_PROJ" -q 2>/dev/null > "$_cdir/compose.pre.$_k" || true
+        done
+        ( cd "$top/tests/compose" && docker compose -p "$ACTIVE_COMPOSE_PROJ" down -v --remove-orphans >/dev/null 2>&1 ) || true
+        for _k in containers networks volumes; do
+            case "$_k" in containers) _q="ps -a";; networks) _q="network ls";; volumes) _q="volume ls";; esac
+            # shellcheck disable=SC2086
+            docker $_q --filter "label=com.docker.compose.project=$ACTIVE_COMPOSE_PROJ" -q 2>/dev/null > "$_cdir/compose.post.$_k" || true
+        done
+    fi
+    if [ -n "${IT_RUN:-}" ]; then
+        post=$(owned_pids "ICECC_IT_OWNER=$IT_OWNER" "ICECC_IT_RUN=$IT_RUN")
+        # shellcheck disable=SC2086
+        { [ -n "$post" ] && proc_tsv $post || :; } > "$_cdir/owned.post.tsv" 2>/dev/null || true
+    fi
+    rm -rf "$XDG_RUNTIME_DIR" 2>/dev/null || true
+    [ -n "${TMP_ALIAS:-}" ] && rm -f "$TMP_ALIAS" 2>/dev/null || true   # alias only; target retained
+}
+trap 'final_cleanup' EXIT
+trap 'final_cleanup; exit 129' HUP
+trap 'final_cleanup; exit 130' INT
+trap 'final_cleanup; exit 143' TERM
 
 # --- B.2: reject a pre-existing tagged test process BEFORE injecting any marker -----
 pre=$(owned_pids "ICECC_IT_OWNER=$IT_OWNER")
@@ -130,37 +238,44 @@ if ! infra_probe; then
 fi
 
 # --- E: one canonical snapshot() used for both start/ and end/ ----------------------
+# STRICT: `set -e` inside a subshell is SUPPRESSED when the subshell is itself tested by
+# `if`/`!` (dash and bash both), so errexit cannot be relied on here.  Instead EVERY
+# git/hash operation carries an explicit `|| return 1`; a missing required input makes
+# sha256sum fail -> the body returns nonzero -> EVIDENCE-FAIL.  The completed temp file is
+# fsync'd, then atomically renamed.
+snapshot_body() {
+    _commit=$(cd "$top" && git rev-parse HEAD) || return 1
+    printf 'commit %s\n' "$_commit"
+    printf -- '-- git status --porcelain=v1 --untracked-files=all --\n'
+    ( cd "$top" && git status --porcelain=v1 --untracked-files=all ) || return 1
+    printf -- '-- sha256: runner + scenario scripts --\n'
+    sha256sum "$dir/run-integration.sh" "$dir/batchledger-run.sh" "$dir/remoteice-quick.sh" \
+              "$dir/connectivity-run.sh" "$dir/schedbp-quick.sh" "$dir/schedstress-quick.sh" \
+              "$dir/daemonlogin-run.sh" "$dir/daemonbatch-run.sh" || return 1
+    printf -- '-- sha256: comparator + client env-generator --\n'
+    sha256sum "$dir/clientselect.cpp" "$top/daemon/clientselect.h" \
+              "$top/client/icecc-create-env" "$top/client/icecc-create-env.in" || return 1
+    printf -- '-- sha256: compose inputs (image build + verifier + worker) --\n'
+    sha256sum "$top/tests/compose/run.sh" "$top/tests/compose/docker-compose.yml" \
+              "$top/tests/compose/Dockerfile" "$top/tests/compose/verify.py" \
+              "$top/tests/compose/worker.sh" || return 1
+    printf -- '-- sha256: executed binaries / libraries --\n'
+    sha256sum "$dir/clientselect" "$dir/batchledger" "$dir/daemonlogin" "$dir/daemonbatch" \
+              "$dir/connectivity" "$dir/schedbp" "$dir/fastesttest" \
+              "$dir/sndbuf_shim.so" "$dir/conn_shim.so" \
+              "$top/daemon/iceccd" "$top/scheduler/icecc-scheduler" "$top/client/icecc" || return 1
+    return 0
+}
 snapshot() {  # $1 = dest dir (start|end)
-    d="$1"; tmpf="$ART/.snap.$$"
-    {
-        echo "commit $(cd "$top" && git rev-parse HEAD 2>/dev/null || echo unknown)"
-        echo "-- git status --porcelain=v1 --untracked-files=all --"
-        (cd "$top" && git status --porcelain=v1 --untracked-files=all 2>/dev/null) || true
-        echo "-- sha256: runner + scenario inputs --"
-        for f in "$dir/run-integration.sh" "$dir/batchledger-run.sh" "$dir/remoteice-quick.sh" \
-                 "$dir/connectivity-run.sh" "$dir/schedbp-quick.sh" "$dir/schedstress-quick.sh" \
-                 "$dir/daemonlogin-run.sh" "$dir/daemonbatch-run.sh" "$dir/clientselect.cpp" \
-                 "$top/daemon/clientselect.h"; do
-            [ -f "$f" ] && sha256sum "$f"
-        done
-        echo "-- sha256: executed binaries / libraries --"
-        for b in "$dir/clientselect" "$dir/batchledger" "$dir/daemonlogin" "$dir/daemonbatch" \
-                 "$dir/connectivity" "$dir/schedbp" "$dir/fastesttest" \
-                 "$dir/sndbuf_shim.so" "$dir/conn_shim.so" \
-                 "$top/daemon/iceccd" "$top/scheduler/icecc-scheduler" "$top/client/icecc"; do
-            [ -f "$b" ] && sha256sum "$b"
-        done
-        echo "-- sha256: compose inputs / worker script --"
-        for c in "$top/tests/compose/run.sh" "$top/tests/compose/docker-compose.yml" \
-                 "$top/tests/compose/Dockerfile"; do
-            [ -f "$c" ] && sha256sum "$c"
-        done
-    } > "$tmpf" 2>/dev/null
-    if [ ! -s "$tmpf" ]; then
-        echo "EVIDENCE-FAIL: empty snapshot for $d" >&2; rm -f "$tmpf"; return 1
+    d="$1"; tmpf="$d/.evidence.tmp"
+    if ! snapshot_body > "$tmpf" 2> "$d/evidence.err"; then
+        echo "EVIDENCE-FAIL: snapshot command failed for $d (see $d/evidence.err)" >&2
+        rm -f "$tmpf"; return 1
     fi
-    sync
-    mv "$tmpf" "$d/evidence.txt" || { echo "EVIDENCE-FAIL: cannot place $d/evidence.txt" >&2; return 1; }
+    if [ ! -s "$tmpf" ]; then echo "EVIDENCE-FAIL: empty snapshot for $d" >&2; rm -f "$tmpf"; return 1; fi
+    python3 -c 'import os,sys; fd=os.open(sys.argv[1], os.O_RDONLY); os.fsync(fd); os.close(fd)' "$tmpf" \
+        || { echo "EVIDENCE-FAIL: fsync failed for $d" >&2; rm -f "$tmpf"; return 1; }
+    mv "$tmpf" "$d/evidence.txt" || { echo "EVIDENCE-FAIL: rename failed for $d" >&2; return 1; }
     return 0
 }
 if ! snapshot "$ART/start"; then echo "RESULT: FAIL (EVIDENCE-FAIL at start)" >&2; exit 2; fi
@@ -210,12 +325,17 @@ run_one() {  # $1 name  $2 class  $3 path
     fi
 
     t0=$(date +%s)
-    # B.5: scenario root = env markers + setsid -w + timeout; tracked as the root PGID
+    # B.5: scenario root = env markers + a self-recording FORCED setsid supervisor whose
+    # inner session leader writes its own pid/pgid before exec'ing timeout.
+    rootf="$ART/scenarios/$name.root.tsv"
     # shellcheck disable=SC2086
-    env ICECC_IT_OWNER="$IT_OWNER" ICECC_IT_RUN="$IT_RUN" ICECC_IT_SCENARIO="$scn_id" $extra \
-        setsid -w timeout --kill-after=10s "$TIMEOUT" "$path" > "$log" 2>&1 &
-    root=$!
-    wait "$root"; code=$?
+    env ICECC_IT_OWNER="$IT_OWNER" ICECC_IT_RUN="$IT_RUN" ICECC_IT_SCENARIO="$scn_id" ROOTFILE="$rootf" $extra \
+        setsid -f -w sh -c "$ROOT_WRAPPER" scenario-root "$TIMEOUT" "$path" > "$log" 2>&1 &
+    supervisor_pid=$!
+    j=0; while [ "$j" -lt 100 ] && [ ! -s "$rootf" ]; do j=$((j+1)); sleep 0.02; done
+    wait "$supervisor_pid"; code=$?
+    root_ok=$(root_leader_ok "$rootf")
+    record_root_meta "$rootf" "$supervisor_pid" "$code"
     t1=$(date +%s); dur=$((t1 - t0))
 
     # scenario status from the tracked root exit
@@ -223,6 +343,7 @@ run_one() {  # $1 name  $2 class  $3 path
     [ "$code" -eq 0 ]   && scen=PASS
     [ "$code" -eq 77 ]  && scen=SKIP
     [ "$code" -eq 124 ] && scen=TIMEOUT
+    scen=$(worse "$scen" "$root_ok")   # PGID != root PID -> at least FAIL
 
     # B.5 grace, B.6 record owned leftovers BEFORE terminating
     sleep 2
@@ -249,19 +370,49 @@ run_compose() {  # $1 path
     path="$1"; name=compose-run.sh; log="$ART/scenarios/$name.log"
     scn_id="scn-compose-$$"
     proj=$(printf 'icecc_%s' "$scn_id" | tr -c 'a-zA-Z0-9' '_' | tr 'A-Z' 'a-z')
-    # C.1: refuse pre-existing resources for this exact project label
+    # C.1: refuse pre-existing containers, networks, OR volumes for this exact project
     if command -v docker >/dev/null 2>&1; then
-        exist=$(docker ps -aq --filter "label=com.docker.compose.project=$proj" 2>/dev/null | awk 'END {print NR}')
-        [ "${exist:-0}" -ne 0 ] && { printf '%-22s %-8s %-12s %8s  %s\n' "$name" REQUIRED CLEANUP-MISS 0 "(preexisting project $proj)" >> "$summary"; return; }
+        ec=$(docker ps -aq --filter "label=com.docker.compose.project=$proj" 2>/dev/null | awk 'END {print NR}')
+        en=$(docker network ls -q --filter "label=com.docker.compose.project=$proj" 2>/dev/null | awk 'END {print NR}')
+        ev=$(docker volume ls -q --filter "label=com.docker.compose.project=$proj" 2>/dev/null | awk 'END {print NR}')
+        if [ "${ec:-0}" -ne 0 ] || [ "${en:-0}" -ne 0 ] || [ "${ev:-0}" -ne 0 ]; then
+            printf '%-22s %-8s %-12s %8s  %s\n' "$name" REQUIRED CLEANUP-MISS 0 "(preexisting project $proj c=$ec n=$en v=$ev)" >> "$summary"; return
+        fi
     fi
     t0=$(date +%s)
-    # shellcheck disable=SC2086
-    env ICECC_IT_OWNER="$IT_OWNER" ICECC_IT_RUN="$IT_RUN" ICECC_IT_SCENARIO="$scn_id" \
+    ACTIVE_COMPOSE_PROJ="$proj"   # let the signal trap remediate this exact project
+    rootf="$ART/scenarios/compose-run.sh.root.tsv"
+    env ICECC_IT_OWNER="$IT_OWNER" ICECC_IT_RUN="$IT_RUN" ICECC_IT_SCENARIO="$scn_id" ROOTFILE="$rootf" \
         COMPOSE_PROJECT_NAME="$proj" ICECC_RUN_ID="$scn_id" ICECC_OUT_DIR="$ART/compose-out" \
-        setsid -w timeout --kill-after=10s "$TIMEOUT" "$path" > "$log" 2>&1 &
-    root=$!; wait "$root"; code=$?
+        setsid -f -w sh -c "$ROOT_WRAPPER" compose-root "$TIMEOUT" "$path" > "$log" 2>&1 &
+    supervisor_pid=$!
+    j=0; while [ "$j" -lt 100 ] && [ ! -s "$rootf" ]; do j=$((j+1)); sleep 0.02; done
+    wait "$supervisor_pid"; code=$?
+    root_ok=$(root_leader_ok "$rootf")
+    record_root_meta "$rootf" "$supervisor_pid" "$code"
     t1=$(date +%s); dur=$((t1 - t0))
     scen=FAIL; [ "$code" -eq 0 ] && scen=PASS; [ "$code" -eq 124 ] && scen=TIMEOUT
+    scen=$(worse "$scen" "$root_ok")
+
+    # item 7: HOST-process accounting -- same 2s grace + exact RUN+SCENARIO scan +
+    # pre/post TSVs + exact remedial termination as every other scenario, kept SEPARATE
+    # from the container/network/volume records below.
+    sleep 2
+    hleft=$(owned_pids "ICECC_IT_RUN=$IT_RUN" "ICECC_IT_SCENARIO=$scn_id")
+    if [ -n "$hleft" ]; then
+        # shellcheck disable=SC2086
+        proc_tsv $hleft > "$ART/scenarios/compose.precleanup.tsv"
+        scen=$(worse "$scen" CLEANUP-MISS)
+        # shellcheck disable=SC2086
+        terminate_owned $hleft
+    else
+        : > "$ART/scenarios/compose.precleanup.tsv"
+    fi
+    hpost=$(owned_pids "ICECC_IT_RUN=$IT_RUN" "ICECC_IT_SCENARIO=$scn_id")
+    # shellcheck disable=SC2086
+    proc_tsv $hpost > "$ART/scenarios/compose.postcleanup.tsv"
+    [ -s "$ART/scenarios/compose.postcleanup.tsv" ] && scen=$(worse "$scen" CLEANUP-MISS)
+
     # C.2/3: record labeled resources AFTER the script's own shutdown, BEFORE remedial
     if command -v docker >/dev/null 2>&1; then
         docker ps -a  --filter "label=com.docker.compose.project=$proj" --format '{{.ID}} {{.Names}} {{.Status}}' 2>/dev/null > "$ART/scenarios/compose.pre.containers"
@@ -287,17 +438,21 @@ run_compose() {  # $1 path
         res=$(worse "$scen" MISSING)
     fi
     printf '%-22s %-8s %-12s %8s  %s\n' "$name" REQUIRED "$res" "$dur" "$log" >> "$summary"
+    ACTIVE_COMPOSE_PROJ=""
 }
 
-# --- run every scenario in order ---------------------------------------------------
-echo "$SCENARIOS" | while read -r name klass path; do
+# --- run every scenario in order (main shell -- NOT a pipe subshell -- so the signal
+#     trap sees the active compose project / run markers) ------------------------------
+while read -r name klass path; do
     [ -z "$name" ] && continue
     # D: hand the remote row a retained root under the artifact tree
     if [ "$name" = "remoteice-quick.sh" ]; then
-        ICECC_REMOTE_ARTIFACT_ROOT="$ART/scenarios/remoteice" export ICECC_REMOTE_ARTIFACT_ROOT
+        ICECC_REMOTE_ARTIFACT_ROOT="$ART/scenarios/remoteice"; export ICECC_REMOTE_ARTIFACT_ROOT
     fi
     run_one "$name" "$klass" "$path"
-done
+done <<SCENARIO_LIST
+$SCENARIOS
+SCENARIO_LIST
 
 # --- end snapshot + compare ---------------------------------------------------------
 snap_ok=1
@@ -309,17 +464,35 @@ fi
 
 # --- final exit: any required non-PASS / cleanup-miss / evidence / snapshot change --
 rc=0
-awk 'NR>1 { if ($2=="REQUIRED" && $3!="PASS") bad=1; if ($3=="CLEANUP-MISS") bad=1 } END { exit bad?1:0 }' "$summary" || rc=1
+# a REQUIRED row must PASS; an OPTIONAL row may only PASS or SKIP (gap 5); any
+# CLEANUP-MISS fails.
+awk 'NR>1 {
+        if ($2=="REQUIRED" && $3!="PASS") bad=1;
+        if ($2=="OPTIONAL" && $3!="PASS" && $3!="SKIP") bad=1;
+        if ($3=="CLEANUP-MISS") bad=1;
+     } END { exit bad?1:0 }' "$summary" || rc=1
 [ "$snap_ok" = 0 ] && rc=1
 [ "$snap_changed" = 1 ] && rc=1
-# a remaining owned process across the whole run is a failure
-remain=$(owned_pids "ICECC_IT_RUN=$IT_RUN")
-[ -n "$remain" ] && { proc_tsv $remain > "$ART/remaining-owned.tsv"; rc=1; }
+# a remaining owned process across the whole run is a failure.  Item 6/8: always write
+# remaining-owned.tsv (even empty) so the final evidence is inspectable on PASS too, and
+# remediate any remaining exact-run processes AFTER recording them.
+remain=$(owned_pids "ICECC_IT_OWNER=$IT_OWNER" "ICECC_IT_RUN=$IT_RUN")
+if [ -n "$remain" ]; then
+    # shellcheck disable=SC2086
+    proc_tsv $remain > "$ART/remaining-owned.tsv"; rc=1
+    # shellcheck disable=SC2086
+    terminate_owned $remain
+else
+    : > "$ART/remaining-owned.tsv"
+fi
 
 echo; echo "=== integration_tests SUMMARY ==="; cat "$summary"
 echo "artifact-root: $ART"
+echo "tmp-alias:     $TMP_ALIAS -> $(readlink -f "$TMP_ALIAS" 2>/dev/null || echo '(removed)')"
 [ "$snap_changed" = 1 ] && echo "NOTE: start/end evidence snapshots differ"
 [ -n "${remain:-}" ] && echo "NOTE: owned processes remained at end (see remaining-owned.tsv)"
 [ "$rc" -eq 0 ] && echo "RESULT: PASS (all required scenarios passed, no cleanup miss, stable evidence)" \
                 || echo "RESULT: FAIL (a required scenario did not pass, a cleanup miss, evidence failure, or snapshot change)"
+# reached the normal end: the EXIT trap must not synthesize interrupt evidence
+NORMAL_DONE=1
 exit $rc
