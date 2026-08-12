@@ -629,7 +629,7 @@ struct Farm {
 
 /* Start a fresh iceccd with `slots` local slots against a fake scheduler and
    activate the session with ConfCS.  Returns false on any setup failure. */
-static bool setup_farm(const char *iceccd, int slots, Farm &f)
+static bool setup_farm_once(const char *iceccd, int slots, Farm &f)
 {
     char tmpl[] = "/tmp/icecream-g4-batch.XXXXXX";
     char *t = mkdtemp(tmpl);
@@ -672,6 +672,26 @@ static bool setup_farm(const char *iceccd, int slots, Farm &f)
     /* activation barrier (not a sleep): ConfCS -> GET_INTERNALS -> STATUS_TEXT proves
        the daemon processed ConfCS (session active) before any case proceeds. */
     return sched_barrier(f.sched, 4000);
+}
+
+/* Retry the fresh-farm bring-up once: forking a daemon under heavy back-to-back load
+   (e.g. inside the top-level integration run, right after a full build) can lose the
+   startup race and miss the login window.  Each attempt uses a fresh ephemeral
+   scheduler port and a fresh work dir, so a second try recovers from a transient
+   bind/startup race without masking a genuinely broken daemon (both attempts fail). */
+static bool setup_farm(const char *iceccd, int slots, Farm &f)
+{
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        if (setup_farm_once(iceccd, slots, f)) {
+            return true;
+        }
+        if (f.pid > 0) { kill(f.pid, SIGKILL); int st = 0; waitpid(f.pid, &st, 0); f.pid = 0; }
+        delete f.sched; f.sched = nullptr;
+        if (f.listener >= 0) { close(f.listener); f.listener = -1; }
+        fprintf(stderr, "setup_farm attempt %d failed; %s\n",
+                attempt + 1, attempt == 0 ? "retrying once" : "giving up");
+    }
+    return false;
 }
 
 static void teardown_farm(Farm &f, bool *clean_exit)
