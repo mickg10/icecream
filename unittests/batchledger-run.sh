@@ -30,27 +30,11 @@ mkdir -p "$BATCHLEDGER_ARTIFACT_ROOT" 2>/dev/null \
 ART="$BATCHLEDGER_ARTIFACT_ROOT/run-$$"
 mkdir "$ART" 2>/dev/null || { echo "run dir $ART exists/uncreatable; refusing to overwrite" >&2; exit 2; }
 mkdir -p "$ART/cases" "$ART/tmp"
-# TMPDIR must be a SHORT path so farm UNIX sockets fit sun_path (<=107).  Honor an
-# inherited TMPDIR only if it already resolves BENEATH our artifact root; otherwise create
-# our own short symlink alias -> $ART/tmp.  Cleaned (alias only) at exit; target retained.
+# The short-tmp alias is created AFTER the cleanup traps (below) so a failure between its
+# creation and the trap install cannot leak an owned alias.  OUR_ALIAS is the alias WE
+# create (bl_cleanup removes only this); ACTIVE_ALIAS is whichever alias is in use.
 OUR_ALIAS=""
-_use_inherited=0
-if [ -n "${TMPDIR:-}" ]; then
-    _it=$(readlink -f "$TMPDIR" 2>/dev/null)
-    _br=$(readlink -f "$BATCHLEDGER_ARTIFACT_ROOT" 2>/dev/null)
-    case "$_it/" in "$_br"/*) _use_inherited=1;; esac
-fi
-if [ "$_use_inherited" = 0 ]; then
-    OUR_ALIAS="/tanksmall/scratch/ictmp/icecc-tmp-bl-$$"
-    ln -s "$ART/tmp" "$OUR_ALIAS" || { echo "cannot create short tmp alias $OUR_ALIAS" >&2; exit 2; }
-    [ "$(readlink -f "$OUR_ALIAS")" = "$(readlink -f "$ART/tmp")" ] \
-        || { echo "tmp alias does not resolve to \$ART/tmp" >&2; exit 2; }
-    export TMPDIR="$OUR_ALIAS"
-    printf 'alias\t%s\ntarget\t%s\n' "$OUR_ALIAS" "$(readlink -f "$ART/tmp")" > "$ART/tmp-alias.txt"
-fi
-# assert the batchledger farm socket shape fits sun_path under the (short) TMPDIR
-_len=$(printf '%s' "$TMPDIR/icecream-g4-batch.XXXXXX/iceccd.sock" | wc -c)
-[ "$_len" -le 107 ] || { echo "RESULT: FAIL (INFRA-FAIL: farm socket shape $_len > 107)" >&2; exit 2; }
+ACTIVE_ALIAS=""
 
 # ownership markers: inherit owner/run/scenario from the integration launcher if present,
 # else generate them (standalone).  Markers are injected only on each CASE root (B.3).
@@ -178,6 +162,31 @@ trap 'bl_cleanup; exit 129' HUP
 trap 'bl_cleanup; exit 130' INT
 trap 'bl_cleanup; exit 143' TERM
 
+# Now that bl_cleanup owns OUR_ALIAS, choose/create the short-tmp alias.  Honor an inherited
+# TMPDIR only when it resolves BENEATH our artifact root (then it is NOT ours to remove);
+# else create our own short alias -> $ART/tmp, assigned to OUR_ALIAS only after `ln -s`
+# succeeds.  BOTH paths record the active alias + physical target; only OUR_ALIAS is removed.
+_use_inherited=0
+if [ -n "${TMPDIR:-}" ]; then
+    _it=$(readlink -f "$TMPDIR" 2>/dev/null)
+    _br=$(readlink -f "$BATCHLEDGER_ARTIFACT_ROOT" 2>/dev/null)
+    case "$_it/" in "$_br"/*) _use_inherited=1;; esac
+fi
+if [ "$_use_inherited" = 1 ]; then
+    ACTIVE_ALIAS="$TMPDIR"                       # inherited -> not owned; keep as-is
+else
+    _cand="/tanksmall/scratch/ictmp/icecc-tmp-bl-$$"
+    ln -s "$ART/tmp" "$_cand" || { echo "cannot create short tmp alias $_cand" >&2; exit 2; }
+    OUR_ALIAS="$_cand"
+    [ "$(readlink -f "$OUR_ALIAS")" = "$(readlink -f "$ART/tmp")" ] \
+        || { echo "tmp alias does not resolve to \$ART/tmp" >&2; exit 2; }
+    export TMPDIR="$OUR_ALIAS"
+    ACTIVE_ALIAS="$OUR_ALIAS"
+fi
+printf 'alias\t%s\ntarget\t%s\n' "$ACTIVE_ALIAS" "$(readlink -f "$TMPDIR")" > "$ART/tmp-alias.txt"
+_len=$(printf '%s' "$TMPDIR/icecream-g4-batch.XXXXXX/iceccd.sock" | wc -c)
+[ "$_len" -le 107 ] || { echo "RESULT: FAIL (INFRA-FAIL: farm socket shape $_len > 107)" >&2; exit 2; }
+
 # NOTE: there is deliberately no run/scenario-marker preflight here -- a nested invocation
 # legitimately runs inside processes that already carry the inherited OWNER+RUN+SCENARIO
 # (this runner and the outer timeout).  The only invariant checked is the exact FOUR-token
@@ -273,6 +282,8 @@ fi
 
 echo; echo "=== batchledger SUMMARY ==="; cat "$summary"
 echo "artifact-root: $ART"
+# print the active alias + physical target BEFORE the EXIT trap removes an owned alias
+echo "tmp-alias:     $ACTIVE_ALIAS -> $(readlink -f "$TMPDIR" 2>/dev/null)"
 [ "$rc" -eq 0 ] && echo "RESULT: PASS (all cases passed, no cleanup miss, stable inputs)" \
                 || echo "RESULT: FAIL (a case did not pass, a cleanup miss, or inputs changed)"
 exit $rc

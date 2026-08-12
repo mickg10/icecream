@@ -30,22 +30,9 @@ for d in start end scenarios batchledger tmp compose-out; do
     mkdir -p "$ART/$d" || { echo "cannot create $ART/$d" >&2; exit 2; }
 done
 
-# --- A.4: scenario scratch under the artifact tree, exposed through a SHORT symlink ---
-# The canonical $ART/tmp is too deep for a farm UNIX socket (sun_path <= 107 bytes), so
-# expose it through one unique short symlink alias and use THAT as TMPDIR.  All bytes stay
-# under the canonical artifact; the alias only shortens the path.  Cleaned (alias only) at
-# the end, target retained.
-TMP_ALIAS="/tanksmall/scratch/ictmp/icecc-tmp-$$"
-ln -s "$ART/tmp" "$TMP_ALIAS" || { echo "cannot create short tmp alias $TMP_ALIAS" >&2; exit 2; }
-[ "$(readlink -f "$TMP_ALIAS")" = "$(readlink -f "$ART/tmp")" ] \
-    || { echo "tmp alias does not resolve to \$ART/tmp" >&2; exit 2; }
-export TMPDIR="$TMP_ALIAS"
-printf 'alias\t%s\ntarget\t%s\n' "$TMP_ALIAS" "$(readlink -f "$ART/tmp")" > "$ART/tmp-alias.txt"
-# assert each farm socket shape fits sun_path under the short alias
-for _pref in icecream-g4-batch icecream-g4-login; do
-    _len=$(printf '%s' "$TMPDIR/$_pref.XXXXXX/iceccd.sock" | wc -c)
-    [ "$_len" -le 107 ] || { echo "RESULT: FAIL (INFRA-FAIL: farm socket shape $_len > 107: $TMPDIR/$_pref.XXXXXX/iceccd.sock)" >&2; exit 2; }
-done
+# --- A.4: scenario scratch alias is created AFTER the cleanup traps (below) so a failure
+# between its creation and the trap install cannot leak it.  Initialize empty here. ------
+TMP_ALIAS=""
 
 # --- A.5: short dedicated runtime root on the scratch fs; clean only this path ------
 rt_id=$$
@@ -201,6 +188,22 @@ trap 'final_cleanup' EXIT
 trap 'final_cleanup; exit 129' HUP
 trap 'final_cleanup; exit 130' INT
 trap 'final_cleanup; exit 143' TERM
+
+# --- A.4 (continued): now that final_cleanup owns TMP_ALIAS, create the short symlink
+# alias so a failure past this point is always cleaned.  $ART/tmp is too deep for a farm
+# UNIX socket (sun_path <= 107); the alias only shortens the path, all bytes stay under the
+# canonical artifact.  Assign TMP_ALIAS only AFTER `ln -s` succeeds. ------------------
+_cand="/tanksmall/scratch/ictmp/icecc-tmp-$$"
+ln -s "$ART/tmp" "$_cand" || { echo "cannot create short tmp alias $_cand" >&2; exit 2; }
+TMP_ALIAS="$_cand"
+[ "$(readlink -f "$TMP_ALIAS")" = "$(readlink -f "$ART/tmp")" ] \
+    || { echo "tmp alias does not resolve to \$ART/tmp" >&2; exit 2; }
+export TMPDIR="$TMP_ALIAS"
+printf 'alias\t%s\ntarget\t%s\n' "$TMP_ALIAS" "$(readlink -f "$ART/tmp")" > "$ART/tmp-alias.txt"
+for _pref in icecream-g4-batch icecream-g4-login; do
+    _len=$(printf '%s' "$TMPDIR/$_pref.XXXXXX/iceccd.sock" | wc -c)
+    [ "$_len" -le 107 ] || { echo "RESULT: FAIL (INFRA-FAIL: farm socket shape $_len > 107: $TMPDIR/$_pref.XXXXXX/iceccd.sock)" >&2; exit 2; }
+done
 
 # --- B.2: reject a pre-existing tagged test process BEFORE injecting any marker -----
 pre=$(owned_pids "ICECC_IT_OWNER=$IT_OWNER")
