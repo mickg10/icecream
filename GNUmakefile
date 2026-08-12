@@ -1,6 +1,7 @@
 .DEFAULT_GOAL := all
 
-.PHONY: docker_build docker_test
+.PHONY: docker_build docker_test formal_stage formal_trace_tests
+
 docker_build:
 	@cd package_builder/ubuntu22.04 && docker compose run --rm --build deb
 	@cd package_builder/ubuntu24.04 && docker compose run --rm --build deb
@@ -12,6 +13,12 @@ docker_test: docker_build
 	@cd package_builder/ubuntu24.04 && docker compose run --rm --build verify
 	@cd package_builder/fedora28 && docker compose run --rm --build verify
 	@cd package_builder/fedora-latest && docker compose run --rm --build verify
+
+formal_trace_tests:
+	@PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=formal python3 -m unittest -v formal/test_check_g4_trace.py
+
+formal_stage: formal_trace_tests
+	@PYTHONDONTWRITEBYTECODE=1 python3 formal/run_g4_formal.py
 
 # Forward any other targets to the existing autotools Makefile.
 # Clean targets in an UNCONFIGURED tree are a successful no-op: package

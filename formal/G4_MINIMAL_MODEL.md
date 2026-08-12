@@ -1,124 +1,180 @@
-# G4 minimal formal audit
+# G4 lifecycle formal stage
 
-Base product revision: `a34e825b2081122f2900fc0efaa3cb71f8f9d204`  
-Formal-only branch: `bigoracle/g4-minimal-formal`
+Formal branch: `bigoracle/g4-minimal-formal`
 
-This branch adds one composed TLA+ model and one TLC workflow. It does not add
-protocol 49/50, a new wire token, a generator framework, or product code.
+This branch is formal-only. It adds no hosted workflow and changes no product
+or integration fixture. The model must be rebased and rerun on the exact final
+product/fixture head before any closure claim.
 
-## Current audit verdict
+## Corrections over `c02399d`
 
-The focused gate is open. The broad suite and farm replay are useful regression
-evidence, but the batch fixture has demonstrated paths that report PASS after
-the daemon rejected the modeled lifecycle transition. The repaired lossless
-fixture must become the concrete trace oracle before model traces can certify
-product behavior.
+The rewritten model addresses the local-oracle review in issue comment
+`5260295110`:
 
-Concrete findings at the base revision:
+1. reconnect is reachable through cleanup, client reset, reconnect, and a
+   second scheduler generation;
+2. ConfCS arrival (`ConfArrives`) is external and has no fairness assumption;
+   daemon handling (`HandleConf`) is separate and weakly fair once enabled;
+3. at most one local decision is `LocalBound` globally;
+4. bind, delivery, begin, and normal completion require the active current
+   session/request generation;
+5. non-owned and send-failure paths initiate whole-session cleanup; the fixed
+   cleanup terminalizes every live entry and releases every charged slot;
+6. priority selection is over the actual eligible-client set and supports one
+   to three clients; the wrong id-first policy is a one-premise mutant;
+7. client/decision cardinalities and local capacity are configuration
+   constants supporting 1--3 clients, 1--3 decisions, and 1--2 slots;
+8. `check_g4_trace.py` is an executable model-to-product transition checker,
+   not a prose-only map.
 
-1. `a34e825` correctly sends `JobBegin` before committing
-   `LOCAL_COMPILE_STARTED`; the deterministic failed-send witness is still
-   required.
-2. The non-owned batch-local branch deletes the incoming `CompileJob` and
-   returns success while retaining `LOCAL_DELIVERED_SLOT_CHARGED`, its slot, and
-   the live client. It needs a named rejection followed by bounded teardown.
-3. Protocol 21--23 can remain in `LOGIN_ATTEMPT`: the daemon activates only in
-   `handle_cs_conf()`, while the scheduler emits `ConfCSMsg` only for protocol
-   24 and newer and the minimum supported protocol remains 21.
-4. `Clients::get_earliest_client()` uses “lower id AND lower niceness,” not the
-   intended lexicographic `(niceness, client_id)` order.
-5. Batch expansion has no explicit product `MaxBatch`; `GetCSMsg::count` is
-   copied to `getcs_expected`, and the ledger grows until that count settles.
-6. `find_by_client_id()` scans every client for each UseCS/NoCS reply. Normal
-   reply dispatch therefore scales linearly with connected clients.
-7. Local admission repeatedly scans clients while filling capacity, giving an
-   `O(capacity * clients)` turn in the worst case.
-8. Client UseCS delivery uses a blocking send in the daemon’s event loop.
-   Preserve exact lifecycle accounting, but measure and bound management and
-   scheduler latency under a slow reader.
-9. The older assignment-fence branch is design material, not an accepted
-   result: its final exact head has no successful complete same-SHA formal run
-   and accumulated overlapping models and workflows.
+## Formal boundary
 
-## Model-to-code map
+The model covers:
 
-| Model action/state | Product seam | Required deterministic evidence |
-|---|---|---|
-| `Connect` / `LoginAttempt` | `Daemon::reconnect`, `scheduler_login_pending` | no application traffic before activation |
-| `ActivateLegacy` | missing protocol-21--23 transition | protocol 23 activates without ConfCS; mutant waits forever |
-| `ReceiveConf` | `Daemon::handle_cs_conf` | first pending ConfCS commits one generation |
-| `SubmitZero` | `handle_get_cs(count == 0)` | no request state or scheduler frame; later count 1 succeeds |
-| `SubmitValid` / `SubmitOverflow` | `getcs_expected`, scheduler publication | exact `MaxBatch` boundary; overflow rejects before growth |
-| `AcceptLocal` / `AcceptRemote` | `scheduler_use_cs`, `scheduler_no_cs`, `getcs_batch` | exact full UseCS tuple and one entry per accepted id |
-| `BindLocal` | `advance_batch_local` | at most one bound local entry per client |
-| `DeliverLocal` | `handle_old_request` PENDING_USE_CS lane | delivery observed and exactly one slot charged |
-| `CommitBegin` | batch branch of `handle_compile_file` | exact JobBegin observed before STARTED |
-| `FailBegin` | failed `send_scheduler(JobBeginMsg)` | STARTED absent; client/session cleanup; capacity restored |
-| `RejectNonOwned` | non-owned batch branch in `handle_compile_file` | named rejection and bounded teardown, no retained slot |
-| `WrongDone` | rejected phases in `handle_job_done` | named rejection/no-model-change; fixture cannot discard it |
-| `CompleteDecision` | accepted remote/local JobDone | exact forwarded JobDone; one terminal result |
-| `DuplicateDone` | COMPLETED dedup path | named duplicate rejection; no second terminal |
-| `LoseSession` / `CleanupLoss` | `close_scheduler`, `finish_scheduler_loss_if_needed`, `clear_children` | exactly-once cleanup before reconnect/capacity |
-| `SelectClient` | `Clients::get_earliest_client` | lexicographic winner and conjunction mutation control |
+```text
+scheduler login and activation
+scheduler generation and reconnect
+per-client request generation
+count 0, accepted batch, and overflow rejection
+remote, local, and NoCS decisions
+stale-decision rejection
+one bound local lane
+local slot charge and release
+JobBegin-before-LocalStarted
+wrong/duplicate JobDone rejection
+normal completion
+session loss and whole-request cleanup
+request close/reset
+eligible-client priority selection
+```
 
-## Checked properties
+It deliberately does not assume compiler completion, network repair, ConfCS
+arrival, or a permanently live client. The fixed liveness properties are only:
 
-`CoreSafety` checks:
+```text
+legacy LoginAttempt eventually activates, because that transition is daemon-owned
+arrived modern ConfCS is eventually handled, because handling is daemon-owned
+pending session cleanup eventually releases all live entries and slots
+```
+
+`ConfArrives` and `Connect` have no fairness assumption.
+
+## Invariants
+
+`CoreSafety` contains:
 
 ```text
 TypeOK
-ProtocolActivation
+correct legacy/Conf activation evidence
 expected <= MaxBatch
 accepted <= expected
-accepted = Cardinality(non-ABSENT decisions)
+accepted equals the number of non-Absent entries
 slot occupancy <= Capacity
-slotCharged(d) <=> phase(d) in {LOCAL_DELIVERED, LOCAL_STARTED}
-LOCAL_STARTED(d) => JobBeginCommitted(d)
-TERMINAL(d) <=> terminalCount(d) = 1
-TERMINAL(d) => not slotCharged(d)
-non-ABSENT(d) => ownerGeneration(d) > 0
-live LOCAL_STARTED(d) => active matching generation
-RejectNonOwned => terminal and uncharged
-count 0 => no request state
-selected = min_(niceness, client_id)(clients)
+at most one LocalBound entry
+slot charge exactly matches LocalDelivered/LocalStarted
+LocalStarted => BeginCommitted
+BeginCommitted has Started/Terminal shape
+Terminal iff terminal_count >= 1
+terminal_count <= 1
+accepted entries carry nonzero owner generation and request generation
+live entries under an active session match both current generations
+completed full token is never live
+Idle requests own no counts or decisions
+Closed requests own no live decisions or slots
+clean Disconnected state owns no live decision or slot
+selected local client is lexicographic min `(niceness, client_id)` of eligible clients
+count 0 leaves request state empty
+completion occurs only under active matching authority
 ```
 
-The LTL rows use weak fairness only for actions the daemon owns:
+## Local runner
+
+No tool download occurs inside the runner.
+
+```bash
+export TLA2TOOLS_174=/absolute/path/tla2tools-1.7.4.jar
+export TLA2TOOLS_180=/absolute/path/pinned-tla2tools-1.8.0.jar
+make formal_stage
+```
+
+Equivalent direct invocation:
+
+```bash
+python3 formal/run_g4_formal.py \
+  --jar 1.7.4="$TLA2TOOLS_174" \
+  --jar 1.8.0="$TLA2TOOLS_180"
+```
+
+The runner verifies pinned SHA-256 digests, requires a clean exact Git commit,
+runs SANY, writes every generated config, uses one TLC worker, retains complete
+logs/time output/result JSON, requires nonzero state counts, and distinguishes
+fixed passes from named mutant/witness violations.
+
+Useful preflight commands that need no TLA jar:
+
+```bash
+python3 formal/run_g4_formal.py --check-only
+python3 formal/run_g4_formal.py --list
+python3 -m unittest -v formal/test_check_g4_trace.py
+```
+
+## Matrix
+
+Default fixed rows:
 
 ```text
-[] (LOGIN_ATTEMPT => <> ACTIVE)
-[] (lossPending => <> (~lossPending /\ slotOccupancy = 0))
+legacy: 1 client, 1 decision, 1 slot
+modern: 1 client, 1 decision, 1 slot
+modern: 2 clients, 2 decisions, 1 slot
 ```
 
-They do not assume compiler completion, network repair, or an immortal client.
+An explicit larger row covers 3 clients, 3 decisions, and 2 slots and is
+selected with `--include-large` after the small rows are stable.
 
-## TLC matrix
+Named negative/witness rows:
 
-Every row runs with one worker on pinned TLC 1.7.4 and the exact v1.8.0
-pre-release asset published on 2026-08-11; both downloads are digest-checked.
+```text
+second scheduler generation is reachable
+legacy waits incorrectly for ConfCS
+LocalStarted occurs before BeginCommitted
+cleanup settles only the selected decision
+batch accepts MaxBatch + 1
+id-first selection replaces lexicographic selection
+more than one local decision becomes bound
+a stale generation mutates the ledger
+completion occurs while disconnected
+capacity guard uses <= rather than <
+a duplicate terminal increments terminal_count
+```
 
-| Row | Required result |
-|---|---|
-| fixed protocol 23 | exhaustive safety, activation, and cleanup green |
-| fixed protocol 48 | exhaustive safety, activation, and cleanup green |
-| legacy-needs-Conf mutant | `ActivationProgress` violation |
-| STARTED-before-JobBegin mutant | `StartedAfterBegin` violation |
-| rejected-slot-retained mutant | `RejectedCleanup` violation |
-| unbounded-batch mutant | `BatchBound` violation |
-| conjunction-priority mutant | `PriorityMinimal` violation |
+Small TLC completion is counterexample-search evidence. Topology-general safety
+still needs the later inductive/TLAPS argument and the final model-to-code map.
 
-The workflow retains exact configs, tool digests, complete TLC output, state
-counts, and revision. A green model run is not a product close verdict. Product
-closure additionally requires the repaired focused fixture, broad suite, farm,
-and measured performance/management-latency gates on one exact final head.
+## Transition-log conformance
 
-## Landing order
+`G4_TRACE_SCHEMA.md` defines a no-wire-change JSONL format.
+`check_g4_trace.py` replays exact projected pre/action/post records and rejects
+unknown actions/states, impossible edges, generation regressions, ledger
+regressions, slot mismatch, second bound entry, capacity overflow, duplicate
+terminal, partial cleanup, sequence gaps, dropped records, and digest failure.
 
-1. Finish the tests-only lossless reader/comparator/lifecycle fixture.
-2. Land the smallest product-only fail-closed non-owned cleanup correction.
-3. Land protocol-21--23 activation and the lexicographic selector as separate
-   small corrections with deterministic witnesses.
-4. Add a bounded `MaxBatch` and O(1) client-id lookup before calling the batch
-   design scalable.
-5. Re-run this model on the final product head, then the focused fixture, broad
-   suite, farm, and performance gates.
+The current checker has synthetic unit controls. Product trace emission and
+replay of every deterministic integration scenario remain open until the
+fixture is frozen and the exact final head is named.
+
+## Evidence status
+
+The model and runner are source-complete for review, but this environment does
+not contain either pinned tla2tools jar and has no outbound DNS for downloading
+them. Therefore no TLC/SANY result is claimed by this commit. The locally
+executed evidence is limited to:
+
+```text
+runner static check / matrix generation
+Python compilation
+transition-checker unit controls
+```
+
+The next accepted formal evidence must come from the local runner with exact
+jar digests and retained logs, followed by a rebase/rerun on the final product
+head.
