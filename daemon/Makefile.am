@@ -23,6 +23,7 @@ AM_LIBTOOLFLAGS = --silent
 
 noinst_HEADERS = \
 	statewriter.h \
+	clientselect.h \
 	environment.h \
 	load.h \
 	serve.h \

@@ -22,6 +22,19 @@
 
 namespace {
 
+/* Historical (buggy) conjunction rule -- test-local, reproduced only for the negative
+   control (it no longer ships in the product header): the former code replaced the best
+   only when the candidate improved on BOTH id AND niceness. */
+bool client_outranks_conjunction(uint32_t cand_niceness, int cand_id,
+                                 bool have_best,
+                                 uint32_t best_niceness, int best_id)
+{
+    if (!have_best) {
+        return true;
+    }
+    return cand_id < best_id && cand_niceness < best_niceness;
+}
+
 struct Cand { uint32_t niceness; int id; };
 
 /* Pick the winning client id from candidates in the given order, mirroring

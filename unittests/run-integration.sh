@@ -32,6 +32,7 @@ mkdir "$ART" 2>/dev/null || { echo "artifact run dir $ART exists/uncreatable; re
 
 # scenario NAME REQUIRED|OPTIONAL PATH -- a REQUIRED non-PASS forces a nonzero exit.
 SCENARIOS="
+clientselect          REQUIRED $dir/clientselect
 batchledger-run.sh    REQUIRED $dir/batchledger-run.sh
 daemonlogin-run.sh    REQUIRED $dir/daemonlogin-run.sh
 daemonbatch-run.sh    REQUIRED $dir/daemonbatch-run.sh
@@ -86,10 +87,11 @@ if [ "$pre" -ne 0 ]; then echo "RESULT: FAIL (pre-existing tagged test process(e
 
 # --- #6: start fingerprints (porcelain, tracked diff, untracked inputs, runners, image) ---
 hash_inputs() {
-    for f in "$dir/batchledger" "$dir/daemonlogin" "$dir/daemonbatch" "$dir/schedbp" \
+    for f in "$dir/batchledger" "$dir/clientselect" "$dir/daemonlogin" "$dir/daemonbatch" "$dir/schedbp" \
              "$dir/connectivity" "$dir/fastesttest" "$dir/sndbuf_shim.so" "$dir/conn_shim.so" \
              "$top/daemon/iceccd" "$top/scheduler/icecc-scheduler" "$top/client/icecc" \
-             "$dir/run-integration.sh" "$dir/batchledger-run.sh" "$top/tests/compose/run.sh" \
+             "$dir/run-integration.sh" "$dir/batchledger-run.sh" "$dir/clientselect.cpp" \
+             "$top/daemon/clientselect.h" "$top/tests/compose/run.sh" \
              "$top/tests/compose/docker-compose.yml"; do
         [ -f "$f" ] && sha256sum "$f"
     done
