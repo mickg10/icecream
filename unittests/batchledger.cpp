@@ -627,13 +627,21 @@ struct Farm {
     std::string socket_path;
 };
 
-/* Start a fresh iceccd with `slots` local slots against a fake scheduler and
-   activate the session with ConfCS.  Returns false on any setup failure. */
-static bool setup_farm_once(const char *iceccd, int slots, Farm &f)
+/* Start a fresh iceccd with `slots` local slots against a fake scheduler and activate
+   the session with ConfCS.  Returns false on any setup failure -- with a typed failed
+   stage plus the retained work dir and iceccd.log path, and NO retry: a genuine
+   failure must surface, not be masked.  The retained work template honors a nonempty
+   TMPDIR (default /tmp) so an integration run can direct scratch off a full root fs. */
+static bool setup_farm(const char *iceccd, int slots, Farm &f)
 {
-    char tmpl[] = "/tmp/icecream-g4-batch.XXXXXX";
-    char *t = mkdtemp(tmpl);
-    if (!t) { perror("mkdtemp"); return false; }
+    const char *tmproot = getenv("TMPDIR");
+    if (!tmproot || !*tmproot) {
+        tmproot = "/tmp";
+    }
+    std::string tmpl = std::string(tmproot) + "/icecream-g4-batch.XXXXXX";
+    std::vector<char> tbuf(tmpl.c_str(), tmpl.c_str() + tmpl.size() + 1);
+    char *t = mkdtemp(tbuf.data());
+    if (!t) { perror("mkdtemp"); return false; }   /* work dir not yet created */
     f.work = t;
     const std::string envdir = f.work + "/envs";
     f.socket_path = f.work + "/iceccd.sock";
@@ -641,12 +649,21 @@ static bool setup_farm_once(const char *iceccd, int slots, Farm &f)
     mkdir(envdir.c_str(), 0700);
     fprintf(stderr, "retained work directory: %s\n", f.work.c_str());
 
+    /* typed failed-stage diagnostic once the work dir exists; never retries. */
+    auto fail = [&](const char *stage) -> bool {
+        fprintf(stderr, "setup_farm FAILED stage=%s work=%s log=%s\n",
+                stage, f.work.c_str(), log.c_str());
+        return false;
+    };
+
+    /* Bind ONE ephemeral scheduler listener and keep it open through Login acceptance.
+       The former probe-close-rebind reopened the same port, and another process could
+       grab it in the close/rebind window -- the demonstrated fresh-farm race. */
     int port = 0;
-    { int probe = listen_on_port(0, &port); if (probe >= 0) close(probe); }
-    if (port <= 0) return false;
-    int bound = 0;
-    f.listener = listen_on_port(port, &bound);
-    if (f.listener < 0 || bound != port) return false;
+    f.listener = listen_on_port(0, &port);
+    if (f.listener < 0 || port <= 0) {
+        return fail("listen_on_port");
+    }
 
     f.pid = fork();
     if (f.pid == 0) {
@@ -662,36 +679,17 @@ static bool setup_farm_once(const char *iceccd, int slots, Farm &f)
         perror("execl iceccd");
         _exit(127);
     }
-    if (f.pid < 0) return false;
+    if (f.pid < 0) return fail("fork");
 
     Msg *login = nullptr;
     f.sched = accept_login_channel(f.listener, 20000, &login);
-    if (!f.sched || !login) { delete login; return false; }
+    if (!f.sched || !login) { delete login; return fail("accept_login"); }
     delete login;
-    if (!f.sched->send_msg(ConfCSMsg())) return false;
+    if (!f.sched->send_msg(ConfCSMsg())) return fail("send_confcs");
     /* activation barrier (not a sleep): ConfCS -> GET_INTERNALS -> STATUS_TEXT proves
        the daemon processed ConfCS (session active) before any case proceeds. */
-    return sched_barrier(f.sched, 4000);
-}
-
-/* Retry the fresh-farm bring-up once: forking a daemon under heavy back-to-back load
-   (e.g. inside the top-level integration run, right after a full build) can lose the
-   startup race and miss the login window.  Each attempt uses a fresh ephemeral
-   scheduler port and a fresh work dir, so a second try recovers from a transient
-   bind/startup race without masking a genuinely broken daemon (both attempts fail). */
-static bool setup_farm(const char *iceccd, int slots, Farm &f)
-{
-    for (int attempt = 0; attempt < 2; ++attempt) {
-        if (setup_farm_once(iceccd, slots, f)) {
-            return true;
-        }
-        if (f.pid > 0) { kill(f.pid, SIGKILL); int st = 0; waitpid(f.pid, &st, 0); f.pid = 0; }
-        delete f.sched; f.sched = nullptr;
-        if (f.listener >= 0) { close(f.listener); f.listener = -1; }
-        fprintf(stderr, "setup_farm attempt %d failed; %s\n",
-                attempt + 1, attempt == 0 ? "retrying once" : "giving up");
-    }
-    return false;
+    if (!sched_barrier(f.sched, 4000)) return fail("activation_barrier");
+    return true;
 }
 
 static void teardown_farm(Farm &f, bool *clean_exit)

@@ -245,7 +245,12 @@ int main(int argc, char **argv)
     }
     signal(SIGPIPE, SIG_IGN);
 
-    char temp_template[] = "/tmp/icecream-g4-batch.XXXXXX";
+    const char *tmproot = getenv("TMPDIR");
+    if (!tmproot || !*tmproot) {
+        tmproot = "/tmp";
+    }
+    char temp_template[4096];
+    snprintf(temp_template, sizeof(temp_template), "%s/icecream-g4-batch.XXXXXX", tmproot);
     char *temp = mkdtemp(temp_template);
     if (!temp) {
         perror("mkdtemp");
