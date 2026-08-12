@@ -1,9 +1,9 @@
-TESTS = testargs lockexec backpressure schedpolicy utf8test statewritertest fastesttest hallflowtest jobidalloctest connectivity-run.sh schedbp-quick.sh schedstress-quick.sh remoteice-quick.sh daemonlogin-run.sh daemonbatch-run.sh batchledger-run.sh
+TESTS = testargs lockexec backpressure schedpolicy utf8test statewritertest fastesttest hallflowtest jobidalloctest clientselect connectivity-run.sh schedbp-quick.sh schedstress-quick.sh remoteice-quick.sh daemonlogin-run.sh daemonbatch-run.sh batchledger-run.sh
 
 AM_CPPFLAGS = -I$(top_srcdir)/client -I$(top_srcdir)/services -I$(top_srcdir)/
 testargs_LDADD = ../client/libclient.a ../services/libicecc.la
 
-check_PROGRAMS = testargs lockexec backpressure schedpolicy utf8test statewritertest schedbp daemonlogin daemonbatch batchledger connectivity fastesttest hallflowtest jobidalloctest
+check_PROGRAMS = testargs lockexec backpressure schedpolicy utf8test statewritertest schedbp daemonlogin daemonbatch batchledger connectivity fastesttest hallflowtest jobidalloctest clientselect
 testargs_SOURCES = args.cpp
 lockexec_SOURCES = lockexec.cpp
 lockexec_LDADD = ../client/libclient.a ../services/libicecc.la
@@ -49,6 +49,11 @@ fastesttest_SOURCES = fastesttest.cpp
 hallflowtest_SOURCES = hallflowtest.cpp
 
 jobidalloctest_SOURCES = jobidalloctest.cpp
+
+# Direct test of the shared local-client selection comparator (issue #4 fairness);
+# includes daemon/clientselect.h so product and test share the exact function.
+clientselect_SOURCES = clientselect.cpp
+clientselect_CPPFLAGS = $(AM_CPPFLAGS) -I$(top_srcdir)/daemon
 schedbp_CXXFLAGS = -pthread
 schedbp_LDFLAGS = -pthread
 schedbp_LDADD = ../services/libicecc.la

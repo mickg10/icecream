@@ -99,6 +99,7 @@
 #include "logging.h"
 #include "utf8.h"
 #include "statewriter.h"
+#include "clientselect.h"
 #include <comm.h>
 #include "load.h"
 #include "environment.h"
@@ -808,16 +809,22 @@ public:
     }
     Client *get_earliest_client(Client::Status s) const {
         // TODO: possibly speed this up in adding some sorted lists
+        // Lexicographic priority (issue #4 fairness): strictly lower niceness wins,
+        // ties broken by the lower client id -- the SAME rule the scheduler/LINKJOB
+        // path uses, via the shared pure comparator.  The former conjunction
+        // (lower id AND lower niceness) dropped a higher-priority client with a higher
+        // id and let crossed priorities depend on hash-map iteration order.
         Client *client = nullptr;
-        int min_client_id = 0;
-        uint32_t min_niceness = std::numeric_limits<uint32_t>::max();
-
         for (auto it : *this) {
-            if (it.second->status == s && (!min_client_id || min_client_id > it.second->client_id)
-                && it.second->niceness < min_niceness ) {
-                client = it.second;
-                min_client_id = client->client_id;
-                min_niceness = client->niceness;
+            Client *cand = it.second;
+            if (cand->status != s) {
+                continue;
+            }
+            if (client_outranks(cand->niceness, cand->client_id,
+                                client != nullptr,
+                                client ? client->niceness : 0,
+                                client ? client->client_id : 0)) {
+                client = cand;
             }
         }
 
