@@ -62,7 +62,16 @@ conn_shim.so: $(srcdir)/conn_shim.c
 connectivity_DEPENDENCIES = conn_shim.so
 
 CLEANFILES = sndbuf_shim.so conn_shim.so
-EXTRA_DIST = sndbuf_shim.c conn_shim.c connectivity-run.sh schedbp-quick.sh schedstress-quick.sh remoteice-quick.sh daemonlogin-run.sh daemonbatch-run.sh batchledger-run.sh
+EXTRA_DIST = sndbuf_shim.c conn_shim.c connectivity-run.sh schedbp-quick.sh schedstress-quick.sh remoteice-quick.sh daemonlogin-run.sh daemonbatch-run.sh batchledger-run.sh run-integration.sh
+
+# Hardened serial integration launcher (local-oracle 5258904367 #7): build the test
+# binaries, then run the deterministic scenarios via run-integration.sh (hard
+# per-scenario timeout, retained per-scenario log + duration, final PASS/FAIL/SKIP
+# table + fingerprints + artifact root, nonzero exit on any required miss, no leftover
+# processes).  The real-farm / formal / performance gates are SEPARATE stages.
+integration_tests: $(check_PROGRAMS) sndbuf_shim.so conn_shim.so
+	$(srcdir)/run-integration.sh
+.PHONY: integration_tests
 
 # Make the tests also print the test log if they fail.
 check: export VERBOSE=1
