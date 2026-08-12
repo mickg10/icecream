@@ -93,7 +93,6 @@ ActivateConf
 AcceptCount0
 AcceptScalar1
 AcceptBatchN
-RejectBatchOverflow
 AcceptRemote
 AcceptLocal
 AcceptNoCS
@@ -115,6 +114,8 @@ LoseSession
 FinishLossCleanup
 ResetClient
 ```
+
+The fixed product action registry deliberately contains no batch-overflow rejection action. `max_batch` is the selected finite verification bound and must be at least the largest count in a replayed product trace. The TLA-only `AdmitOverflowMutant` action is a falsification control for `ModeShape`, not a product event.
 
 For every transition, `check_g4_trace.py`:
 
