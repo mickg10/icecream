@@ -19,6 +19,7 @@
 #include <unordered_map>
 #include <chrono>
 #include <algorithm>
+#include <string_view>
 #include <zstd.h>
 
 using clk = std::chrono::steady_clock;
@@ -27,16 +28,20 @@ static double us_since(clk::time_point t0){
 }
 
 // ---- atomization: each atom ends at (and includes) its '\n'; last may not ----
-static std::vector<std::string> atomize(const std::string& s){
-    std::vector<std::string> out;
+// Returns views into `s` (no per-line allocation) — the dominant CPU win.
+static std::vector<std::string_view> atomize(const std::string& s){
+    std::vector<std::string_view> out;
     size_t i = 0, n = s.size();
     while (i < n){
         size_t j = s.find('\n', i);
-        if (j == std::string::npos){ out.emplace_back(s.substr(i)); break; }
-        out.emplace_back(s.substr(i, j - i + 1));
+        if (j == std::string::npos){ out.emplace_back(s.data()+i, n-i); break; }
+        out.emplace_back(s.data()+i, j-i+1);
         i = j + 1;
     }
     return out;
+}
+static inline bool sveq(const std::string& a, std::string_view b){
+    return a.size()==b.size() && memcmp(a.data(), b.data(), b.size())==0;
 }
 
 // ---- varints ----
@@ -104,8 +109,8 @@ static size_t zc(const std::string& in, int level){
 
 // ---- the warm C->F pair (in-process) ----
 struct Pair {
-    std::unordered_map<Md5Key, uint64_t, Md5Hash> c_key; // md5(atom) -> key (C dict)
-    std::unordered_map<uint64_t, std::string> c_atom;    // key -> atom (C, exact verify)
+    std::unordered_map<uint64_t, uint64_t> c_key;        // fasthash(atom) -> key (C dict; verify via c_atom)
+    std::unordered_map<uint64_t, std::string> c_atom;    // key -> atom (C arena + exact verify)
     uint64_t next_key = 1;                               // 0 = inline sentinel
     std::unordered_map<uint64_t, std::string> f_mirror;  // key -> atom (F cache)
     size_t c_bytes = 0, f_bytes = 0;                     // resident content bytes
@@ -132,27 +137,28 @@ struct Row {
 // Encode one TU; returns the raw (uncompressed) packet, fills byte breakdown.
 static std::string encode(Pair& P, const std::string& src, Row& row, const uint8_t guid[16]){
     auto t0 = clk::now();
-    std::vector<std::string> atoms = atomize(src);
-    std::unordered_map<std::string, uint32_t> local;   // atom -> local id
+    std::vector<std::string_view> atoms = atomize(src);
+    std::unordered_map<std::string_view, uint32_t> local;   // atom -> local id
     std::vector<uint32_t> body;                        body.reserve(atoms.size());
     std::vector<uint64_t> mapper;                      // local id -> key (first-appearance order)
     std::vector<uint32_t> new_ids;                     // local ids new to C this TU (INLINE)
-    for (auto& a : atoms){
+    std::hash<std::string_view> H;
+    for (auto a : atoms){
         auto it = local.find(a);
         uint32_t lid;
         if (it == local.end()){
             lid = uint32_t(local.size());
             local.emplace(a, lid);
-            Md5Key h = md5key(a);                      // MD5 content index (the real lookup cost)
+            uint64_t h = H(a);                         // fast local index (per-line lookup cost)
             auto ck = P.c_key.find(h);
-            bool hit = (ck != P.c_key.end() && P.c_atom[ck->second] == a); // exact-byte verify
+            bool hit = (ck != P.c_key.end() && sveq(P.c_atom[ck->second], a)); // exact-byte verify
             uint64_t key;
             if (hit){
                 key = ck->second;                      // known -> REF
-            } else {                                   // new (or md5 collision) -> assign key, INLINE
+            } else {                                   // new (or hash collision) -> assign key, INLINE
                 key = P.next_key++;
                 if (ck == P.c_key.end()) P.c_key[h] = key;
-                P.c_atom[key] = a;
+                P.c_atom[key].assign(a.data(), a.size());  // arena copy (new lines only, ~1% warm)
                 P.c_bytes += a.size();
                 new_ids.push_back(lid);
             }
@@ -162,10 +168,9 @@ static std::string encode(Pair& P, const std::string& src, Row& row, const uint8
         }
         body.push_back(lid);
     }
-    // resolve new_atom pointers to the distinct atom bytes (by local id)
-    // build local id -> atom bytes
-    std::vector<const std::string*> id_atom(local.size(), nullptr);
-    for (auto& kv : local) id_atom[kv.second] = &kv.first;
+    // local id -> atom view
+    std::vector<std::string_view> id_atom(local.size());
+    for (auto& kv : local) id_atom[kv.second] = kv.first;
     uint64_t key_limit = P.next_key;
 
     // --- serialize packet: header | mapper | inline | body ---
@@ -182,7 +187,7 @@ static std::string encode(Pair& P, const std::string& src, Row& row, const uint8
     uv(pkt, mp.size()); pkt += mp;
     // inline: count, then (local_id, len, bytes)
     std::string in; uv(in, new_ids.size());
-    for (uint32_t lid : new_ids){ const std::string* a = id_atom[lid]; uv(in, lid); uv(in, a->size()); in += *a; }
+    for (uint32_t lid : new_ids){ std::string_view a = id_atom[lid]; uv(in, lid); uv(in, a.size()); in.append(a.data(), a.size()); }
     uv(pkt, in.size()); pkt += in;
     // body: count + delta-zigzag-varint of local ids
     std::string bd; uv(bd, body.size()); { int64_t prev = 0; for (uint32_t id : body){ uv(bd, zz(int64_t(id) - prev)); prev = id; } }
@@ -199,7 +204,7 @@ static std::string encode(Pair& P, const std::string& src, Row& row, const uint8
     row.peak = pkt.size() + src.size();
 
     // F learns the INLINE bindings for future TUs (warm-pair mirror)
-    for (uint32_t lid : new_ids){ const std::string* a = id_atom[lid]; uint64_t k = mapper[lid]; P.f_mirror[k] = *a; P.f_bytes += a->size(); }
+    for (uint32_t lid : new_ids){ std::string_view a = id_atom[lid]; uint64_t k = mapper[lid]; P.f_mirror[k].assign(a.data(), a.size()); P.f_bytes += a.size(); }
     return pkt;
 }
 
