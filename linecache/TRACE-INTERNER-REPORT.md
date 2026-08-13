@@ -50,7 +50,7 @@ taskset -c 8 ./trace-interner-bench --manifest MANIFEST --validate
 g++ -O3 -DNDEBUG -std=c++17 -march=native -DLINE_ONLY \
   linecache/trace-interner-bench.cpp -o trace-interner-line
 
-# Make every inexpensive selector equal; exact comparisons must still decide.
+# Make the sampled span and long-line selectors equal; exact comparisons decide.
 g++ -O3 -DNDEBUG -std=c++17 -march=native \
   -DFORCE_SELECTOR_COLLISIONS \
   linecache/trace-interner-bench.cpp -o trace-interner-alias-check
@@ -101,10 +101,11 @@ resynchronization check: the inserted bytes are identical in every TU, so it
 does not replace a corpus produced by actually rebuilding after varied header
 edits.
 
-The selector-alias check completed exact reconstruction and the edit case for
-one TU.  The address/undefined-operation instrumented build completed the
-20-TU trace and edit cases with exact reconstruction.  Forcing equal selectors
-over a large corpus intentionally exposes linear probing in this prototype;
+The span/long-line-selector alias check completed exact reconstruction and the
+edit case for one TU.  The exact packed <=16-byte tiers were not altered.  The
+address/undefined-operation instrumented build completed the 20-TU trace and
+edit cases with exact reconstruction.  Forcing those selectors equal over a
+large corpus intentionally exposes linear probing in this prototype;
 production code needs a probe-depth threshold that promotes such buckets to a
 stronger discriminator.
 
