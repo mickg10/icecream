@@ -18,6 +18,7 @@
 #include <vector>
 #include <unordered_map>
 #include <chrono>
+#include <algorithm>
 #include <zstd.h>
 
 using clk = std::chrono::steady_clock;
@@ -50,12 +51,49 @@ static uint64_t rv(const uint8_t*& p){
 static inline uint64_t zz(int64_t n){ return (uint64_t(n) << 1) ^ uint64_t(n >> 63); }
 static inline int64_t unzz(uint64_t n){ return int64_t(n >> 1) ^ -int64_t(n & 1); }
 
-// ---- FNV-1a 64 digest over the raw source ----
+// ---- FNV-1a 64 digest over the raw source (whole-TU digest) ----
 static uint64_t fnv1a(const std::string& s){
     uint64_t h = 1469598103934665603ULL;
     for (unsigned char c : s){ h ^= c; h *= 1099511628211ULL; }
     return h;
 }
+
+// ---- MD5 (public-domain style, compact) — the content-index key the design uses ----
+struct MD5 {
+    uint32_t a,b,c,d; uint64_t len; uint8_t buf[64]; size_t bl;
+    MD5():a(0x67452301),b(0xefcdab89),c(0x98badcfe),d(0x10325476),len(0),bl(0){}
+    static uint32_t rol(uint32_t x,int s){ return (x<<s)|(x>>(32-s)); }
+    void block(const uint8_t* p){
+        static const uint32_t K[64]={
+        0xd76aa478,0xe8c7b756,0x242070db,0xc1bdceee,0xf57c0faf,0x4787c62a,0xa8304613,0xfd469501,
+        0x698098d8,0x8b44f7af,0xffff5bb1,0x895cd7be,0x6b901122,0xfd987193,0xa679438e,0x49b40821,
+        0xf61e2562,0xc040b340,0x265e5a51,0xe9b6c7aa,0xd62f105d,0x02441453,0xd8a1e681,0xe7d3fbc8,
+        0x21e1cde6,0xc33707d6,0xf4d50d87,0x455a14ed,0xa9e3e905,0xfcefa3f8,0x676f02d9,0x8d2a4c8a,
+        0xfffa3942,0x8771f681,0x6d9d6122,0xfde5380c,0xa4beea44,0x4bdecfa9,0xf6bb4b60,0xbebfbc70,
+        0x289b7ec6,0xeaa127fa,0xd4ef3085,0x04881d05,0xd9d4d039,0xe6db99e5,0x1fa27cf8,0xc4ac5665,
+        0xf4292244,0x432aff97,0xab9423a7,0xfc93a039,0x655b59c3,0x8f0ccc92,0xffeff47d,0x85845dd1,
+        0x6fa87e4f,0xfe2ce6e0,0xa3014314,0x4e0811a1,0xf7537e82,0xbd3af235,0x2ad7d2bb,0xeb86d391};
+        static const int S[64]={7,12,17,22,7,12,17,22,7,12,17,22,7,12,17,22,
+        5,9,14,20,5,9,14,20,5,9,14,20,5,9,14,20,4,11,16,23,4,11,16,23,4,11,16,23,4,11,16,23,
+        6,10,15,21,6,10,15,21,6,10,15,21,6,10,15,21};
+        uint32_t M[16]; for(int i=0;i<16;i++) M[i]=p[i*4]|p[i*4+1]<<8|p[i*4+2]<<16|(uint32_t)p[i*4+3]<<24;
+        uint32_t A=a,B=b,C=c,D=d;
+        for(int i=0;i<64;i++){ uint32_t F; int g;
+            if(i<16){F=(B&C)|(~B&D);g=i;} else if(i<32){F=(D&B)|(~D&C);g=(5*i+1)&15;}
+            else if(i<48){F=B^C^D;g=(3*i+5)&15;} else {F=C^(B|~D);g=(7*i)&15;}
+            F=F+A+K[i]+M[g]; A=D;D=C;C=B;B=B+rol(F,S[i]); }
+        a+=A;b+=B;c+=C;d+=D;
+    }
+    void update(const uint8_t* p,size_t n){ len+=n;
+        while(n){ size_t t=64-bl; if(t>n)t=n; memcpy(buf+bl,p,t); bl+=t;p+=t;n-=t; if(bl==64){block(buf);bl=0;} } }
+    void finish(uint8_t out[16]){ uint64_t bits=len*8; uint8_t pad=0x80; update(&pad,1);
+        uint8_t z=0; while(bl!=56) update(&z,1); for(int i=0;i<8;i++){uint8_t b8=bits>>(8*i);update(&b8,1);}
+        uint32_t v[4]={a,b,c,d}; for(int i=0;i<4;i++) for(int j=0;j<4;j++) out[i*4+j]=v[i]>>(8*j); }
+};
+struct Md5Key { uint64_t hi, lo; bool operator==(const Md5Key&o)const{return hi==o.hi&&lo==o.lo;} };
+struct Md5Hash { size_t operator()(const Md5Key&k)const{ return k.hi ^ (k.lo*1099511628211ULL); } };
+static Md5Key md5key(const std::string& s){ MD5 m; m.update((const uint8_t*)s.data(),s.size()); uint8_t o[16]; m.finish(o);
+    Md5Key k; memcpy(&k.hi,o,8); memcpy(&k.lo,o+8,8); return k; }
 
 static size_t zc(const std::string& in, int level){
     size_t bound = ZSTD_compressBound(in.size());
@@ -66,11 +104,22 @@ static size_t zc(const std::string& in, int level){
 
 // ---- the warm C->F pair (in-process) ----
 struct Pair {
-    std::unordered_map<std::string, uint64_t> c_key;   // atom -> key (C dict)
-    uint64_t next_key = 1;                              // 0 = inline sentinel
-    std::unordered_map<uint64_t, std::string> f_mirror; // key -> atom (F cache)
-    size_t c_bytes = 0, f_bytes = 0;                    // resident content bytes
+    std::unordered_map<Md5Key, uint64_t, Md5Hash> c_key; // md5(atom) -> key (C dict)
+    std::unordered_map<uint64_t, std::string> c_atom;    // key -> atom (C, exact verify)
+    uint64_t next_key = 1;                               // 0 = inline sentinel
+    std::unordered_map<uint64_t, std::string> f_mirror;  // key -> atom (F cache)
+    size_t c_bytes = 0, f_bytes = 0;                     // resident content bytes
 };
+
+// current-transport baseline: 100 KB FileChunkMsg payloads, zstd-1 each, summed
+static size_t chunked_zstd1(const std::string& src){
+    size_t total = 0;
+    for (size_t off = 0; off < src.size(); off += 100000){
+        size_t len = std::min<size_t>(100000, src.size() - off);
+        total += zc(src.substr(off, len), 1);
+    }
+    return total;
+}
 
 struct Row {
     size_t raw, cur_z1, whole1, whole3, whole6, packed1, packed3, packed6;
@@ -94,15 +143,18 @@ static std::string encode(Pair& P, const std::string& src, Row& row, const uint8
         if (it == local.end()){
             lid = uint32_t(local.size());
             local.emplace(a, lid);
-            auto ck = P.c_key.find(a);
+            Md5Key h = md5key(a);                      // MD5 content index (the real lookup cost)
+            auto ck = P.c_key.find(h);
+            bool hit = (ck != P.c_key.end() && P.c_atom[ck->second] == a); // exact-byte verify
             uint64_t key;
-            if (ck == P.c_key.end()){                  // new to C -> assign key, INLINE
+            if (hit){
+                key = ck->second;                      // known -> REF
+            } else {                                   // new (or md5 collision) -> assign key, INLINE
                 key = P.next_key++;
-                P.c_key.emplace(a, key);
+                if (ck == P.c_key.end()) P.c_key[h] = key;
+                P.c_atom[key] = a;
                 P.c_bytes += a.size();
                 new_ids.push_back(lid);
-            } else {
-                key = ck->second;                      // known -> REF
             }
             mapper.push_back(key);
         } else {
@@ -147,7 +199,7 @@ static std::string encode(Pair& P, const std::string& src, Row& row, const uint8
     row.peak = pkt.size() + src.size();
 
     // F learns the INLINE bindings for future TUs (warm-pair mirror)
-    for (uint32_t lid : new_ids){ const std::string* a = id_atom[lid]; uint64_t k = P.c_key[*a]; P.f_mirror[k] = *a; P.f_bytes += a->size(); }
+    for (uint32_t lid : new_ids){ const std::string* a = id_atom[lid]; uint64_t k = mapper[lid]; P.f_mirror[k] = *a; P.f_bytes += a->size(); }
     return pkt;
 }
 
@@ -221,7 +273,7 @@ int main(int argc, char** argv){
         std::string pkt = encode(P, src, r, guid);
         auto tz = clk::now(); r.packed3 = zc(pkt, 3); r.zstd3_us = us_since(tz);
         r.packed1 = zc(pkt, 1); r.packed6 = zc(pkt, 6);
-        r.cur_z1 = zc(src, 1);
+        r.cur_z1 = chunked_zstd1(src);   // real current transport: 100KB chunks, zstd-1 each, summed
         r.whole1 = zc(src, 1); r.whole3 = zc(src, 3); r.whole6 = zc(src, 6);
         r.ok = decode_verify(P, pkt, src, r.decode_us);
         if (r.ok != 1) fails++;
