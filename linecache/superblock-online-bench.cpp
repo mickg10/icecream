@@ -272,6 +272,14 @@ struct OnlineEngine {
             for(;;){ size_t m=toks.size(); if(m<2) break; uint64_t key=(uint64_t(toks[m-2])<<32)|toks[m-1]; uint32_t p=merge.get(key); if(p==UINT32_MAX) break; toks[m-2]=p; toks.pop_back(); }
         }
     }
+    // alternative covering: stack-greedy merging RIGHT-to-left (a different valid parse of the same
+    // sequence). Used as a candidate for the min-wire covering control (pick the smaller real zstd).
+    void encode_rl(const uint32_t* rids, size_t n, std::vector<uint32_t>& toks) const {
+        toks.clear(); toks.reserve(n);
+        for(size_t ii=0;ii<n;++ii){ size_t i=n-1-ii; toks.push_back(REGION_BASE+rids[i]);
+            for(;;){ size_t m=toks.size(); if(m<2) break; uint64_t key=(uint64_t(toks[m-1])<<32)|toks[m-2]; uint32_t p=merge.get(key); if(p==UINT32_MAX) break; toks[m-2]=p; toks.pop_back(); } }
+        std::reverse(toks.begin(),toks.end());
+    }
     // learn from a TU's root tokens: count adjacent pairs, promote those crossing the gate.
     // gate 0 = raw count (c >= promote_count).
     // gate 1 = full-cost rent-or-buy: publish only once the pair's accrued foregone root-token
@@ -308,6 +316,11 @@ struct OnlineEngine {
         if(o<REGION_BASE){ out.push_back(o); return; }
         if(o<BLOCK_BASE){ const uint32_t* ids=dict->region_ids_ptr(o-REGION_BASE); uint32_t c=dict->region_ids_count(o-REGION_BASE); out.insert(out.end(),ids,ids+c); return; }
         uint32_t k=o-BLOCK_BASE; expand(blkL[k],out); expand(blkR[k],out);
+    }
+    // expand an object to its REGION-object leaves (base alphabet of the block grammar).
+    void expand_regions(uint32_t o, std::vector<uint32_t>& out) const {
+        if(o<BLOCK_BASE){ out.push_back(o); return; }
+        uint32_t k=o-BLOCK_BASE; expand_regions(blkL[k],out); expand_regions(blkR[k],out);
     }
 };
 
@@ -378,7 +391,7 @@ static void charge_tu(std::vector<uint8_t>& kb, const std::vector<uint32_t>& tok
 
 int main(int argc,char**argv){
     const char* manifest=nullptr; size_t max_files=SIZE_MAX; uint32_t promote=4; const char* trace_path=nullptr; const char* curves_prefix=nullptr; int max_loops=16;
-    bool do_sweep=false; int gate_mode=0; double fanout=1.0; double saved_per_merge=1.5; bool root_memo=false;
+    bool do_sweep=false; int gate_mode=0; double fanout=1.0; double saved_per_merge=1.5; bool root_memo=false; int dp_sample=0;
     for(int i=1;i<argc;++i){
         if(!strcmp(argv[i],"--manifest")&&i+1<argc) manifest=argv[++i];
         else if(!strcmp(argv[i],"--promote")&&i+1<argc) promote=uint32_t(atoi(argv[++i]));
@@ -386,6 +399,7 @@ int main(int argc,char**argv){
         else if(!strcmp(argv[i],"--fanout")&&i+1<argc) fanout=atof(argv[++i]);
         else if(!strcmp(argv[i],"--saved")&&i+1<argc) saved_per_merge=atof(argv[++i]);
         else if(!strcmp(argv[i],"--root-memo")) root_memo=true;
+        else if(!strcmp(argv[i],"--dp-sample")&&i+1<argc) dp_sample=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--trace")&&i+1<argc) trace_path=argv[++i];
         else if(!strcmp(argv[i],"--curves")&&i+1<argc) curves_prefix=argv[++i];
         else if(!strcmp(argv[i],"--max-loops")&&i+1<argc) max_loops=atoi(argv[++i]);
@@ -782,6 +796,28 @@ int main(int argc,char**argv){
             run_loop("frozen_warm",2,capA,A,false);   // fully memoized: unchanged rebuild -> ~1 ROOT_REF/TU
             run_loop("frozen_edit",1,capC,C,false);   // edited TUs are new roots -> define-and-use
             run_loop("frozen_revert",1,capA,A,false); // old roots immediately reusable on revert
+            // ===== MIN-WIRE COVERING CONTROL vs stack-greedy (bigoracle's k-best + real-zstd pick) =====
+            // For each sample TU (frozen predictor) produce candidate parses — stack-greedy LEFT-to-right
+            // (the encoder used everywhere) and RIGHT-to-left — actually zstd-compress each root stream and
+            // pick the real smallest. Reports how far the deployed longest-merge is from best-of-candidates.
+            // (An exact-DP min-token optimum over the full recursive block grammar is intractable at scale —
+            // deep whole-TU blocks make the CYK/trie blow up — so k-best-with-real-zstd is the practical control.)
+            if(dp_sample>0){
+                auto tb=Clock::now();
+                size_t TUsA=capA.region_off.size()-1; uint32_t step=std::max<uint32_t>(1,uint32_t(TUsA/dp_sample));
+                uint64_t lr_tok=0,rl_tok=0; double lr_z=0,rl_z=0,best_z=0; uint32_t nsamp=0; bool exact=true;
+                std::vector<uint32_t> lr, rl, e1, e2; std::vector<uint8_t> mb;
+                for(size_t t=0;t<TUsA;t+=step){
+                    const uint32_t* rids=capA.region_ids.data()+capA.region_off[t]; size_t n=capA.region_off[t+1]-capA.region_off[t]; if(!n) continue; ++nsamp;
+                    E.encode(rids,n,lr);    lr_tok+=lr.size(); mb.clear(); for(uint32_t o:lr) put_varint(mb,o); double zl=zstd_size(z,mb.data(),mb.size(),3,dst); lr_z+=zl;
+                    E.encode_rl(rids,n,rl); rl_tok+=rl.size(); mb.clear(); for(uint32_t o:rl) put_varint(mb,o); double zr=zstd_size(z,mb.data(),mb.size(),3,dst); rl_z+=zr;
+                    best_z += std::min(zl,zr);
+                    e1.clear(); for(uint32_t o:lr) E.expand(o,e1); e2.clear(); for(uint32_t o:rl) E.expand(o,e2); if(e1!=e2) exact=false;
+                }
+                fprintf(stderr,"COVER-CONTROL: sample=%u %.1fs both-parses-byte-exact=%s\n  stack-greedy(LR): tok=%llu zstd=%.0f | right-to-left: tok=%llu zstd=%.0f | best-of-2 zstd=%.0f (%.2f%% under LR)\n",
+                    nsamp,secs(tb),exact?"OK":"FAIL",
+                    (unsigned long long)lr_tok,lr_z,(unsigned long long)rl_tok,rl_z,best_z, lr_z>0?100.0*(lr_z-best_z)/lr_z:0);
+            }
             ZSTD_freeCCtx(z); fclose(ptu); fclose(plp);
             fprintf(stderr,"  wrote %s-{pertu,perloop}.tsv ; total TUs observed=%llu final blocks=%u\n",pfx.c_str(),(unsigned long long)x,E.nblocks());
             (void)plat;
