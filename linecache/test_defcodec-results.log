@@ -117,3 +117,44 @@ corpus: OpenCV  (/tanksmall/scratch/ictmp/corpus5/manifest.txt)
     streams: lcp raw=0.572 suf raw=32.745 MiB   ->  z3 lcp=0.355 + suf=5.435 = 5.791 MiB
     REDUCTION vs plain-z3 = 1.097x     dict-only ceiling ratio raw/z3: plain=695.2x  front=762.7x
     throughput:  encode=0.145 GB/s  decode=0.625 GB/s   roundtrip=OK   (lines without trailing '\n': 0)
+
+================================================================================
+ SKELETON-GROUPED COLUMNAR coding (bigoracle §4.2) -- the last untested structural axis.
+ Conservatively tokenize each distinct line into a SKELETON (punct/keyword/whitespace literal
+ fragments) + SLOTS ([A-Za-z0-9_] runs); group by identical skeleton; ship skeleton once + slot
+ tokens interned + token-placement stream (columnar or row-wise). Reproduce: --skeleton.
+
+ VERDICT: does NOT break the entropy floor. It TIES front-code at z3 and LOSES to it at z19,
+ because the decomposition discards the cross-line byte-LZ structure front-code+z19 exploits.
+ The token-PLACEMENT stream (which of N tokens fills each slot) is the irreducible core (~4-5 MiB,
+ ~68% of the total) -- genuine content entropy, not hidden structure. So DuckDB's distinct-line
+ content is entropy-capped at ~260x (z3) / ~375x (z19, offline). 400x is NOT reachable on the
+ DuckDB dict by ANY measured method: z3..z19, LDM, lexical front-coding, or skeleton-columnar.
+
+ corpus   z3-plain  front-code_z3  skel-col-int_z3  skel-row-int_z3 | front-code_z19  skel-col-int_z19  skel-row-int_z19
+ DuckDB    7.875      7.293          7.275            7.028         |   5.054           6.017             5.669
+ LLVM      7.322      6.647          7.439            7.267         |   4.849           6.171             5.866
+ (front-code is the best z3-speed dict transform on both; skeleton-columnar never wins.)
+================================================================================
+
+########## DuckDB --skeleton ##########
+  ---- SKELETON-GROUPED COLUMNAR coding (bigoracle 4.2) [tokenize=0.54s] ----
+    distinct skeletons=121418 (5.3 lines/skel)  slot occurrences=7202235 (11.30/line)  distinct slot tokens=136135
+    raw bytes: skeleton-keys(deduped)=9.757  all-slot-occurrences=35.572  distinct-slot-tokens=1.658 MiB
+    z3 components (MiB): skel_dict=0.805  id=0.786  tok_dict=0.653 | val_col=6.476 len_col=1.280 tid_col=5.030
+    TOTAL columnar   raw-slots = 9.347 MiB   (0.843x vs z3-plain, 0.780x vs front-code)  raw/comp 202.6x
+    TOTAL columnar   interned  = 7.275 MiB   (1.083x vs z3-plain, 1.003x vs front-code)  raw/comp 260.3x
+    TOTAL row-wise   raw/int   = 9.031 / 7.028 MiB  (causal ref; 0.872x / 1.120x vs z3-plain)
+    z19 ceiling: columnar interned=6.017  row-wise interned=5.669 MiB  (1.309x / 1.389x vs z3-plain; front-code+z19 was ~5.05 on DuckDB)
+    baseline z3-plain=7.875  front-code=7.293 MiB
+
+########## LLVM --skeleton ##########
+  ---- SKELETON-GROUPED COLUMNAR coding (bigoracle 4.2) [tokenize=0.43s] ----
+    distinct skeletons=153514 (5.0 lines/skel)  slot occurrences=4151710 (5.38/line)  distinct slot tokens=229314
+    raw bytes: skeleton-keys(deduped)=4.199  all-slot-occurrences=26.481  distinct-slot-tokens=2.739 MiB
+    z3 components (MiB): skel_dict=0.995  id=1.055  tok_dict=1.068 | val_col=5.924 len_col=1.235 tid_col=4.322
+    TOTAL columnar   raw-slots = 9.209 MiB   (0.795x vs z3-plain, 0.722x vs front-code)  raw/comp 374.9x
+    TOTAL columnar   interned  = 7.439 MiB   (0.984x vs z3-plain, 0.894x vs front-code)  raw/comp 464.1x
+    TOTAL row-wise   raw/int   = 8.948 / 7.267 MiB  (causal ref; 0.818x / 1.008x vs z3-plain)
+    z19 ceiling: columnar interned=6.171  row-wise interned=5.866 MiB  (1.186x / 1.248x vs z3-plain; front-code+z19 was ~5.05 on DuckDB)
+    baseline z3-plain=7.322  front-code=6.647 MiB

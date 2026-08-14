@@ -126,6 +126,37 @@ static Distinct extract_distinct(const Corpus& c) {
     return d;
 }
 
+// ---------------- generic string interner (returns first-appearance id) ----------------
+struct StringInterner {
+    std::vector<uint8_t> blob; std::vector<uint32_t> off, len;
+    struct Slot { uint64_t h; uint32_t id; };
+    std::vector<Slot> tab; uint32_t mask; size_t count = 0;
+    StringInterner() { tab.assign(size_t(1) << 16, {0, 0}); mask = (uint32_t(1) << 16) - 1; }
+    void rehash(size_t n) {
+        std::vector<Slot> t(n, {0, 0}); uint32_t m = uint32_t(n - 1);
+        for (auto& s : tab) if (s.h) { uint32_t i = uint32_t(s.h) & m; while (t[i].h) i = (i + 1) & m; t[i] = s; }
+        tab.swap(t); mask = m;
+    }
+    uint32_t intern(const uint8_t* p, uint32_t n) {
+        uint64_t h = fast_hash(p, n) | 1; uint32_t i = uint32_t(h) & mask;
+        for (;;) {
+            Slot& s = tab[i];
+            if (!s.h) {
+                uint32_t id = uint32_t(off.size()), o = uint32_t(blob.size());
+                blob.insert(blob.end(), p, p + n); off.push_back(o); len.push_back(n);
+                s = {h, id}; ++count;
+                if (count * 10 > size_t(mask + 1) * 7) rehash(size_t(mask + 1) * 2);
+                return id;
+            }
+            if (s.h == h && len[s.id] == n && memcmp(blob.data() + off[s.id], p, n) == 0) return s.id;
+            i = (i + 1) & mask;
+        }
+    }
+};
+static inline bool is_slot_char(uint8_t c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_';
+}
+
 // ---------------- zstd ----------------
 static size_t zstd_size(ZSTD_CCtx* c, const uint8_t* data, size_t n, int level, std::vector<uint8_t>& dst) {
     ZSTD_CCtx_reset(c, ZSTD_reset_session_and_parameters);
@@ -148,6 +179,123 @@ static size_t zstd_size_adv(ZSTD_CCtx* c, const uint8_t* data, size_t n, int lev
     return r;
 }
 static inline double MB(uint64_t b) { return double(b) / (1024.0 * 1024.0); }
+static inline void bput_varint(std::vector<uint8_t>& o, uint64_t v) {
+    while (v >= 0x80) { o.push_back(uint8_t(v) | 0x80); v >>= 7; } o.push_back(uint8_t(v));
+}
+
+// ---------------- skeleton-grouped columnar coding (bigoracle §4.2) ----------------
+// Conservatively tokenize each distinct line into a SKELETON (punctuation/keyword/whitespace
+// literal fragments) and SLOTS (maximal [A-Za-z0-9_] runs = identifiers/numbers/paths). Group
+// lines by identical skeleton, ship each skeleton once, and code the slots columnar (all values
+// of one skeleton-column together) so template/generated lines -- globally unique but sharing a
+// skeleton and differing only in low-entropy slots -- dedup structurally, which byte-LZ/entropy
+// (z3..z19, LDM) cannot capture. Measures the CEILING (whole-corpus grouping = hindsight); a
+// causal streaming/TU-local variant would follow only if this clears.
+static void run_skeleton(const Distinct& d, uint64_t base_z3, uint64_t front_z3, uint64_t raw, ZSTD_CCtx* cc) {
+    const size_t N = d.off.size();
+    StringInterner skel, slottok;
+    std::vector<uint32_t> line_skel(N), skel_nslots;
+    std::vector<uint32_t> slot_goff, slot_glen, slot_tok;   // all slots, line order
+    std::vector<uint32_t> line_slot_start; line_slot_start.reserve(N + 1); line_slot_start.push_back(0);
+    std::vector<uint8_t> key;
+
+    Clock::time_point t0 = Clock::now();
+    for (size_t i = 0; i < N; ++i) {
+        const uint8_t* p = d.blob.data() + d.off[i]; uint32_t L = d.len[i];
+        key.clear();
+        uint32_t k = 0; bool first = true;
+        for (;;) {
+            uint32_t ls = k; while (k < L && !is_slot_char(p[k])) ++k;
+            if (!first) key.push_back(0x00);                 // separator before every lit but lit0
+            first = false;
+            key.insert(key.end(), p + ls, p + k);
+            if (k >= L) break;
+            uint32_t ss = k; while (k < L && is_slot_char(p[k])) ++k;
+            slot_goff.push_back(d.off[i] + ss); slot_glen.push_back(k - ss);
+            slot_tok.push_back(slottok.intern(p + ss, k - ss));
+        }
+        uint32_t sid = skel.intern(key.data(), uint32_t(key.size()));
+        line_skel[i] = sid;
+        line_slot_start.push_back(uint32_t(slot_goff.size()));
+        uint32_t ns = line_slot_start[i + 1] - line_slot_start[i];
+        if (sid >= skel_nslots.size()) skel_nslots.resize(sid + 1, 0);
+        skel_nslots[sid] = ns;
+    }
+    double tok_t = secs(t0);
+    const size_t num_skel = skel.off.size(), num_tok = slottok.off.size(), num_slot = slot_goff.size();
+
+    // skeleton dict + id stream (first-appearance ids)
+    std::vector<uint8_t> skel_len, id_s, tok_len;
+    for (size_t s = 0; s < num_skel; ++s) bput_varint(skel_len, skel.len[s]);
+    for (size_t i = 0; i < N; ++i) bput_varint(id_s, line_skel[i]);
+    for (size_t t = 0; t < num_tok; ++t) bput_varint(tok_len, slottok.len[t]);
+
+    // columnar order: stable counting-sort of lines by skeleton (first-appearance within a skel)
+    std::vector<uint32_t> gstart(num_skel + 1, 0), order(N);
+    for (size_t i = 0; i < N; ++i) ++gstart[line_skel[i] + 1];
+    for (size_t s = 0; s < num_skel; ++s) gstart[s + 1] += gstart[s];
+    { std::vector<uint32_t> cur(gstart.begin(), gstart.end());
+      for (size_t i = 0; i < N; ++i) order[cur[line_skel[i]]++] = uint32_t(i); }
+
+    std::vector<uint8_t> val_col, len_col, tid_col, val_row, len_row, tid_row;
+    // columnar
+    for (size_t s = 0; s < num_skel; ++s) {
+        uint32_t ns = skel_nslots[s];
+        for (uint32_t j = 0; j < ns; ++j)
+            for (uint32_t idx = gstart[s]; idx < gstart[s + 1]; ++idx) {
+                uint32_t line = order[idx], si = line_slot_start[line] + j;
+                val_col.insert(val_col.end(), d.blob.data() + slot_goff[si], d.blob.data() + slot_goff[si] + slot_glen[si]);
+                bput_varint(len_col, slot_glen[si]); bput_varint(tid_col, slot_tok[si]);
+            }
+    }
+    // row-wise (causal reference)
+    for (size_t i = 0; i < N; ++i)
+        for (uint32_t si = line_slot_start[i]; si < line_slot_start[i + 1]; ++si) {
+            val_row.insert(val_row.end(), d.blob.data() + slot_goff[si], d.blob.data() + slot_goff[si] + slot_glen[si]);
+            bput_varint(len_row, slot_glen[si]); bput_varint(tid_row, slot_tok[si]);
+        }
+
+    std::vector<uint8_t> z;
+    auto Z = [&](const std::vector<uint8_t>& v) { return zstd_size(cc, v.data(), v.size(), 3, z); };
+    uint64_t skeldict = Z(skel.blob) + Z(skel_len);
+    uint64_t idz = Z(id_s);
+    uint64_t tokdict = Z(slottok.blob) + Z(tok_len);
+    uint64_t vc = Z(val_col), lc = Z(len_col), tc = Z(tid_col);
+    uint64_t vr = Z(val_row), lr = Z(len_row), tr = Z(tid_row);
+    uint64_t col_raw = skeldict + idz + vc + lc;
+    uint64_t col_int = skeldict + idz + tokdict + tc;
+    uint64_t row_raw = skeldict + idz + vr + lr;
+    uint64_t row_int = skeldict + idz + tokdict + tr;
+
+    // z19 ceiling of the interned decomposition (does deeper modeling of the token-placement
+    // stream break the floor?) -- level 19 + ldm + full window on each interned stream.
+    auto Z19 = [&](const std::vector<uint8_t>& v) { return zstd_size_adv(cc, v.data(), v.size(), 19, 1, 27, z); };
+    uint64_t skeldict19 = Z19(skel.blob) + Z19(skel_len);
+    uint64_t idz19 = Z19(id_s);
+    uint64_t tokdict19 = Z19(slottok.blob) + Z19(tok_len);
+    uint64_t col_int19 = skeldict19 + idz19 + tokdict19 + Z19(tid_col);
+    uint64_t row_int19 = skeldict19 + idz19 + tokdict19 + Z19(tid_row);
+
+    uint64_t skel_raw_bytes = skel.blob.size(), slot_raw_bytes = 0, tok_raw_bytes = slottok.blob.size();
+    for (size_t si = 0; si < num_slot; ++si) slot_raw_bytes += slot_glen[si];
+
+    printf("  ---- SKELETON-GROUPED COLUMNAR coding (bigoracle 4.2) [tokenize=%.2fs] ----\n", tok_t);
+    printf("    distinct skeletons=%zu (%.1f lines/skel)  slot occurrences=%zu (%.2f/line)  distinct slot tokens=%zu\n",
+           num_skel, double(N) / double(num_skel ? num_skel : 1), num_slot, double(num_slot) / double(N), num_tok);
+    printf("    raw bytes: skeleton-keys(deduped)=%.3f  all-slot-occurrences=%.3f  distinct-slot-tokens=%.3f MiB\n",
+           MB(skel_raw_bytes), MB(slot_raw_bytes), MB(tok_raw_bytes));
+    printf("    z3 components (MiB): skel_dict=%.3f  id=%.3f  tok_dict=%.3f | val_col=%.3f len_col=%.3f tid_col=%.3f\n",
+           MB(skeldict), MB(idz), MB(tokdict), MB(vc), MB(lc), MB(tc));
+    printf("    TOTAL columnar   raw-slots = %.3f MiB   (%.3fx vs z3-plain, %.3fx vs front-code)  raw/comp %.1fx\n",
+           MB(col_raw), double(base_z3) / double(col_raw), double(front_z3) / double(col_raw), double(raw) / double(col_raw));
+    printf("    TOTAL columnar   interned  = %.3f MiB   (%.3fx vs z3-plain, %.3fx vs front-code)  raw/comp %.1fx\n",
+           MB(col_int), double(base_z3) / double(col_int), double(front_z3) / double(col_int), double(raw) / double(col_int));
+    printf("    TOTAL row-wise   raw/int   = %.3f / %.3f MiB  (causal ref; %.3fx / %.3fx vs z3-plain)\n",
+           MB(row_raw), MB(row_int), double(base_z3) / double(row_raw), double(base_z3) / double(row_int));
+    printf("    z19 ceiling: columnar interned=%.3f  row-wise interned=%.3f MiB  (%.3fx / %.3fx vs z3-plain; front-code+z19 was ~5.05 on DuckDB)\n",
+           MB(col_int19), MB(row_int19), double(base_z3) / double(col_int19), double(base_z3) / double(row_int19));
+    printf("    baseline z3-plain=%.3f  front-code=%.3f MiB\n", MB(base_z3), MB(front_z3));
+}
 
 // ---------------- one codec configuration ----------------
 struct Metrics {
@@ -256,6 +404,7 @@ int main(int argc, char** argv) {
     bool sweep = false;
     bool ceiling = false;
     bool reorder = false;
+    bool skeleton = false;
     DefCodec::Params P;
     for (int i = 1; i < argc; ++i) {
         auto eat = [&](const char* f) { return !strcmp(argv[i], f) && i + 1 < argc; };
@@ -265,6 +414,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--sweep")) sweep = true;
         else if (!strcmp(argv[i], "--ceiling")) ceiling = true;
         else if (!strcmp(argv[i], "--reorder")) reorder = true;
+        else if (!strcmp(argv[i], "--skeleton")) skeleton = true;
         else if (eat("--stride")) P.stride = uint32_t(atoi(argv[++i]));
         else if (eat("--min-match")) P.min_match = uint32_t(atoi(argv[++i]));
         else if (eat("--table-bits")) P.table_bits = uint32_t(atoi(argv[++i]));
@@ -320,6 +470,16 @@ int main(int argc, char** argv) {
                    g.tag, MB(s), double(dbytes) / double(s), double(c.raw) / double(s),
                    double(dbytes) / dt / 1e9);
         }
+        ZSTD_freeCCtx(cc);
+        return 0;
+    }
+
+    if (skeleton) {
+        FrontCodec::Encoded e = FrontCodec::encode_set(d.blob.data(), d.off.data(), d.len.data(), d.off.size());
+        std::vector<uint8_t> zz;
+        uint64_t front_z3 = zstd_size(cc, e.lcp.data(), e.lcp.size(), 3, zz)
+                          + zstd_size(cc, e.suf.data(), e.suf.size(), 3, zz);
+        run_skeleton(d, base_z3, front_z3, c.raw, cc);
         ZSTD_freeCCtx(cc);
         return 0;
     }
