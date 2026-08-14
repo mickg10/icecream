@@ -1,0 +1,116 @@
+loaded+interned 17.4s: TUs=1506 rawA=4630994774 | A: lines=586099 regions=94534  | +edit: lines=586100 regions=94535 (modified TUs=1506)
+byte-exactness anchor OK (A line stream == raw source)
+OFFLINE ceiling (batch region-BPE over A): blocks=139591  A root tokens=83938  root raw=251814 B(0.24 MiB)
+online run OK (promote=4): blocks after A=45947 B=63654 C=68837 D=143638  encode=1.25s learn=0.07s  (all TUs byte-exact)
+def compressibility (L3): line=0.124 region=0.496 block=0.292
+
+==== ONLINE SUPERBLOCK REPORT ====
+corpus: /tanksmall/scratch/ictmp/corpus5/manifest.txt
+TUs(build)=1506 rawA=4416.5 MiB  distinct_lines(A/final)=586099/586100  distinct_regions(A/final)=94534/94535  promote_count=4
+OFFLINE region-BPE ceiling: blocks=139591  A-root-tokens=83938  root-raw=0.240 MiB
+ONLINE blocks after A=45947 B=63654 C=68837 D=143638   encode=1.25s learn=0.07s
+
+-- per-pass root stream (online, 1 persistent F) --
+pass                TUs    regions   roottoks   tok/reg  blkcov% |      root_z3      linedef  reg+blk_def    total_raw
+A COLD_FIRST       1506    6131525     312056     0.051     94.9 |       703784     53562985      4125072     59031922
+B WARM_SAME        1506    6131525     148167     0.024     97.6 |       356756            0        71706       581232
+C HEADER_EDIT      1506    6131525     115855     0.019     98.1 |       285062           40        59375       464784
+D CHANGED_STEADY   1506    6131525     110738     0.018     98.2 |       273244            0        17700       385584
+(blkcov% = 1 - roottoks/regions = fraction of region tokens absorbed into block refs.)
+ceiling tok/reg (offline, A) = 0.014  -> online A ends at ~0.051; B (fully warm) at 0.024
+
+-- CONVERGENCE curve (pass A): tok/region by build progress --
+   cum = cumulative tokens/regions over TUs 1..k (running wire efficiency);
+   inst = instantaneous, moving-avg over last 32 TUs (approaches the ceiling asymptote).
+progress     TU_ord        cum  inst_ma32 gap_to_ceil
+      1%         16      0.605      0.629      0.615
+      2%         31      0.402      0.426      0.412
+      5%         76      0.240      0.086      0.072
+     10%        151      0.212      0.131      0.117
+     25%        377      0.108      0.017      0.003
+     50%        754      0.084      0.020      0.007
+     75%       1130      0.066      0.007     -0.007
+    100%       1506      0.051      0.025      0.011
+ceiling tok/reg = 0.014 (offline batch region-BPE over A)
+
+-- RECOVERY curve (pass C header edit): pure edit damage (delta vs same-predictor UNCHANGED) --
+modified TUs in C=1506 of 1506; new blocks created during C=5183
+ chg_ord       TU   act_toks  base_toks     dTok   new_blk
+       1        0        183        181       +2        19
+       2        1        204        202       +2        11
+       3        2         43         41       +2         2
+       4        3         43         41       +2         2
+       5        4        286        285       +1         5
+       6        5        131        130       +1        11
+       7        6        103        102       +1        12
+       8        7         45         44       +1         7
+       9        8         88         88       +0        10
+      10        9         45         45       +0         9
+      11       10         35         35       +0         3
+      12       11         47         47       +0         7
+      13       12         53         53       +0         9
+      14       13         48         48       +0         4
+C pure edit damage: first-changed dTok=+2  worst=+2  total=+12 (0.0080/changed-TU)  recovered@changed-ord=9
+D pure edit damage (after one changed loop): total=+0 (0.0000/changed-TU) -> new steady state
+
+-- block lifetime -- total=143638 used>=1=54113 used>=2=53043 never=89525 (never-def-bytes=537150) mean_leaf=1043.2 max_depth=30
+
+-- PER-F full-wire (raw bytes, def sent once per F that needs it) --
+pass                  F   policy |       root_raw        def_raw        missing        framing      TOTAL_raw
+A COLD_FIRST          1       rr |         936168       57688057         371553          36144       59031922
+B WARM_SAME           1       rr |         444501          71706          35853          29172         581232
+C HEADER_EDIT         1       rr |         347565          59415          29688          28116         464784
+D CHANGED_STEADY      1       rr |         332214          17700           8850          26820         385584
+A COLD_FIRST          1   sticky |         936168       57688057         371553          36144       59031922
+B WARM_SAME           1   sticky |         444501          71706          35853          29172         581232
+C HEADER_EDIT         1   sticky |         347565          59415          29688          28116         464784
+D CHANGED_STEADY      1   sticky |         332214          17700           8850          26820         385584
+A COLD_FIRST          4       rr |         936168       94166662         739890          36144       95878864
+B WARM_SAME           4       rr |         444501       48416882         332778          36144       49230305
+C HEADER_EDIT         4       rr |         347565         193326          73521          33216         647628
+D CHANGED_STEADY      4       rr |         332214         139164          66378          33060         570816
+A COLD_FIRST          4   sticky |         936168       57688057         371553          36144       59031922
+B WARM_SAME           4   sticky |         444501          71706          35853          29172         581232
+C HEADER_EDIT         4   sticky |         347565          59415          29688          28116         464784
+D CHANGED_STEADY      4   sticky |         332214          17700           8850          26820         385584
+A COLD_FIRST          8       rr |         936168      129620598         824298          36144      131417208
+B WARM_SAME           8       rr |         444501       56824852         370668          36144       57676165
+C HEADER_EDIT         8       rr |         347565       51380589         295218          36144       52059516
+D CHANGED_STEADY      8       rr |         332214       47759381         283626          36144       48411365
+A COLD_FIRST          8   sticky |         936168       57688057         371553          36144       59031922
+B WARM_SAME           8   sticky |         444501          71706          35853          29172         581232
+C HEADER_EDIT         8   sticky |         347565          59415          29688          28116         464784
+D CHANGED_STEADY      8   sticky |         332214          17700           8850          26820         385584
+A COLD_FIRST         16       rr |         936168      187551289         849003          36144      189372604
+B WARM_SAME          16       rr |         444501       64860040         380361          36144       65721046
+C HEADER_EDIT        16       rr |         347565       58372728         301506          36144       59057943
+D CHANGED_STEADY     16       rr |         332214       56713109         289362          36144       57370829
+A COLD_FIRST         16   sticky |         936168       57688057         371553          36144       59031922
+B WARM_SAME          16   sticky |         444501          71706          35853          29172         581232
+C HEADER_EDIT        16   sticky |         347565          59415          29688          28116         464784
+D CHANGED_STEADY     16   sticky |         332214          17700           8850          26820         385584
+A COLD_FIRST         32       rr |         936168      285395166         865530          36144      287233008
+B WARM_SAME          32       rr |         444501       76541061         387729          36144       77409435
+C HEADER_EDIT        32       rr |         347565       69045738         306693          36144       69736140
+D CHANGED_STEADY     32       rr |         332214       65016802         293802          36144       65678962
+A COLD_FIRST         32   sticky |         936168       57688057         371553          36144       59031922
+B WARM_SAME          32   sticky |         444501          71706          35853          29172         581232
+C HEADER_EDIT        32   sticky |         347565          59415          29688          28116         464784
+D CHANGED_STEADY     32   sticky |         332214          17700           8850          26820         385584
+(sticky=all TUs of the single build-C to one F => equals 1 warm F regardless of F count.)
+
+-- promote-threshold sweep (B tok/reg = warm steady state; lower=better, ceiling=0.014) --
+   promote    blocksB    B_tok/reg    B_root_z3
+         2     154685        0.01
+== CURVE DRIVER (hot-plateau prequential) promote=4 gate=count max_loops=20 ==
+  warm plateau at loop 20 (root-tok=4699, blocks=237848)
+  edit plateau at loop 19 (root-tok=1627, blocks=251821)
+  wrote /tanksmall/scratch/claude-tmp/claude-4103/-tanksmall-MICKG2-mickg-src/a39fdb74-75de-4406-a55d-a11442769f8a/scratchpad/sb/curve-opencv-{pertu,perloop}.tsv ; total TUs observed=67770 final blocks=251922
+peak RSS=10726.10 MiB  total=63.1s
+9       286726
+         3      70142        0.022       323740
+         4      63654        0.024       356756
+         8      44511        0.032       468386
+        16      26984        0.042       606844
+        32      20900        0.053       752770
+EXIT=0

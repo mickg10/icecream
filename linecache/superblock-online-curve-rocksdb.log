@@ -1,14 +1,14 @@
-loaded+interned 9.5s: TUs=622 rawA=3114320596 | A: lines=587613 regions=641506  | +edit: lines=587614 regions=641507 (modified TUs=622)
+loaded+interned 10.0s: TUs=622 rawA=3114320596 | A: lines=587613 regions=641506  | +edit: lines=587614 regions=641507 (modified TUs=622)
 byte-exactness anchor OK (A line stream == raw source)
 OFFLINE ceiling (batch region-BPE over A): blocks=127899  A root tokens=754373  root raw=2263119 B(2.16 MiB)
-online run OK (promote=4): blocks after A=35974 B=46567 C=51054 D=789647  encode=0.86s learn=0.35s  (all TUs byte-exact)
+online run OK (promote=4): blocks after A=35974 B=46567 C=51054 D=789647  encode=0.91s learn=0.48s  (all TUs byte-exact)
 def compressibility (L3): line=0.106 region=0.482 block=0.253
 
 ==== ONLINE SUPERBLOCK REPORT ====
 corpus: /tanksmall/scratch/ictmp/corpus2/manifest.txt
 TUs(build)=622 rawA=2970.0 MiB  distinct_lines(A/final)=587613/587614  distinct_regions(A/final)=641506/641507  promote_count=4
 OFFLINE region-BPE ceiling: blocks=127899  A-root-tokens=754373  root-raw=2.158 MiB
-ONLINE blocks after A=35974 B=46567 C=51054 D=789647   encode=0.86s learn=0.35s
+ONLINE blocks after A=35974 B=46567 C=51054 D=789647   encode=0.91s learn=0.48s
 
 -- per-pass root stream (online, 1 persistent F) --
 pass                TUs    regions   roottoks   tok/reg  blkcov% |      root_z3      linedef  reg+blk_def    total_raw
@@ -102,38 +102,15 @@ D CHANGED_STEADY     32   sticky |        2307558          17880           8940 
 -- promote-threshold sweep (B tok/reg = warm steady state; lower=better, ceiling=0.173) --
    promote    blocksB    B_tok/reg    B_root_z3
          2     805028      
-== CURVE DRIVER (hot-plateau prequential) promote=4 max_loops=20 ==
+== CURVE DRIVER (hot-plateau prequential) promote=4 gate=count max_loops=20 ==
   warm plateau at loop 7 (root-tok=383026, blocks=1169637)
   edit plateau at loop 3 (root-tok=194228, blocks=1174777)
-  wrote /tanksmall/scratch/claude-tmp/claude-4103/-tanksmall-MICKG2-mickg-src/a39fdb74-75de-4406-a55d-a11442769f8a/scratchpad/sb/curve-rocksdb-{pertu,perloop}.tsv ; total TUs observed=7464 final blocks=1358369
-peak RSS=7291.90 MiB  total=41.6s
+  wrote /tanksmall/scratch/claude-tmp/claude-4103/-tanksmall-MICKG2-mickg-src/a39fdb74-75de-4406-a55d-a11442769f8a/scratchpad/sb/curve-rocksdb-{pertu,perloop}.tsv ; total TUs observed=9952 final blocks=1358369
+peak RSS=7302.37 MiB  total=44.1s
   0.178      1449455
          3      52990        0.180      1472937
          4      46567        0.182      1494793
          8      32600        0.189      1588544
         16      24432        0.197      1714094
         32      20000        0.208      1863976
-	Command being timed: "taskset -c 4 ./superblock-online-bench --manifest /tanksmall/scratch/ictmp/corpus2/manifest.txt --promote 4 --sweep --curves /tanksmall/scratch/claude-tmp/claude-4103/-tanksmall-MICKG2-mickg-src/a39fdb74-75de-4406-a55d-a11442769f8a/scratchpad/sb/curve-rocksdb --max-loops 20"
-	User time (seconds): 34.43
-	System time (seconds): 7.46
-	Percent of CPU this job got: 99%
-	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:42.06
-	Average shared text size (kbytes): 0
-	Average unshared data size (kbytes): 0
-	Average stack size (kbytes): 0
-	Average total size (kbytes): 0
-	Maximum resident set size (kbytes): 7466904
-	Average resident set size (kbytes): 0
-	Major (requiring I/O) page faults: 0
-	Minor (reclaiming a frame) page faults: 2345564
-	Voluntary context switches: 33
-	Involuntary context switches: 1988
-	Swaps: 0
-	File system inputs: 6082812
-	File system outputs: 1447
-	Socket messages sent: 0
-	Socket messages received: 0
-	Signals delivered: 0
-	Page size (bytes): 4096
-	Exit status: 0
 EXIT=0

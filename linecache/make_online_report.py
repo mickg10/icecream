@@ -167,10 +167,10 @@ def render_corpus(corpus, prefix, log):
     xmax = max(num(r["x_end"]) for r in perloop) if perloop else None
     # cold/warm/edit/revert phase boundaries only (fewer labels)
     phase_bounds = []; last = None
-    acc = 0
     for r in perloop:
-        if r["phase"] != last:
-            phase_bounds.append((num(r["x_end"]) - num(r["TUs"]), r["phase"])); last = r["phase"]
+        ph = "frozen" if r["phase"].startswith("frozen") else r["phase"]
+        if ph != last:
+            phase_bounds.append((num(r["x_end"]) - num(r["TUs"]), ph)); last = ph
 
     # per-loop series
     def loop_pts(col): return [(num(r["x_end"]), num(r[col])) for r in perloop]
@@ -180,6 +180,27 @@ def render_corpus(corpus, prefix, log):
     tu_tr = [(num(r["x_obs"]), num(r["root_tok"]) / max(num(r["region_count"]), 1)) for r in pertu]
     tu_tr_ma = downsample(moving_avg(tu_tr, 128))
 
+    # prequential Q_W(t) rolling windows: Q_W = sum_W(B_i-O_i) / sum_W(B_i-A_i), x = TUs observed.
+    xs = [num(r["x_obs"]) for r in pertu]
+    BmO = [num(r["B_root_z3"]) - num(r["O_root_z3"]) for r in pertu]
+    BmA = [num(r["B_root_z3"]) - num(r["A_root_z3"]) for r in pertu]
+    def rolling_Q(W):
+        from collections import deque
+        qn = deque(); qd = deque(); sn = 0.0; sd = 0.0; out = []
+        for i in range(len(xs)):
+            qn.append(BmO[i]); sn += BmO[i]; qd.append(BmA[i]); sd += BmA[i]
+            if len(qn) > W: sn -= qn.popleft(); sd -= qd.popleft()
+            out.append((xs[i], sn / sd if abs(sd) > 1e-9 else 0.0))
+        return out
+    qw128 = downsample(rolling_Q(128)); qw32 = downsample(rolling_Q(32)); qw8 = downsample(rolling_Q(8))
+
+    # define-and-use root memoization: per-loop full wire vs memoized wire, as bits/input-byte.
+    # per-loop raw bytes = sum_full_wire_z / bits_per_byte * 8 (invert the stored bits/byte).
+    has_memo = bool(perloop) and "sum_full_wire_memo_z" in perloop[0]
+    def loop_raw(r):
+        bpb = num(r["bits_per_byte"]); fw = num(r["sum_full_wire_z"])
+        return (8.0 * fw / bpb) if bpb > 1e-12 else 0.0
+
     # ---- charts ----
     # 1. effective compression (bits/input-byte), log y
     c1 = line_chart(
@@ -188,12 +209,14 @@ def render_corpus(corpus, prefix, log):
         "TUs observed (across loops)", "bits / input byte  (log, lower=better)",
         ylog=True, xmax=xmax, vlines=phase_bounds, yfmt=lambda v: (f"{v:g}"),
         title="Effective end-to-end compression learning curve")
-    # 2. predictor quality Q (linear)
+    # 2. prequential Q_W(t) rolling windows (128 = readable headline; 8/32 fainter). UNCLAMPED.
     c2 = line_chart(
-        [ {"name":"Q per-loop","color_idx":1,"pts":loop_pts("Q_loop"),"markers":True} ],
-        "TUs observed (across loops)", "predictor quality Q = (B-O)/(B-A)",
+        [ {"name":"W=128","color_idx":1,"pts":qw128,"markers":False},
+          {"name":"W=32","color_idx":3,"pts":qw32,"faint":True},
+          {"name":"W=8","color_idx":2,"pts":qw8,"faint":True} ],
+        "TUs observed (prequential)", "Q_W = Σ(B−O)/Σ(B−A)  (1.0 = batch ref)",
         ylog=False, xmax=xmax, vlines=phase_bounds, yfmt=lambda v: f"{v:.2f}",
-        title="Prequential predictor-quality curve (1.0 = batch region-BPE reference)")
+        title="Prequential predictor-quality learning curve Q_W(t) — rolling windows")
     # 3. root tokens / region (log)
     c3 = line_chart(
         [ {"name":"per-loop","color_idx":0,"pts":loop_pts("tok_per_reg"),"markers":True},
@@ -222,6 +245,39 @@ def render_corpus(corpus, prefix, log):
         "promote threshold", "warm-B tok/region",
         ylog=False, xmax=(max(int(p) for p,_,_,_ in thr) if thr else None), yfmt=lambda v:f"{v:.3f}",
         title="Promotion-gate sweep: covering vs threshold") if thr else "<p>(no sweep)</p>"
+
+    # 7. define-and-use root memoization: full wire vs memoized wire (bits/input-byte), log.
+    memo_series = []
+    if has_memo:
+        pts_full = []; pts_memo = []
+        for r in perloop:
+            raw = loop_raw(r); x = num(r["x_end"])
+            if raw > 0:
+                pts_full.append((x, 8.0*num(r["sum_full_wire_z"])/raw))
+                pts_memo.append((x, 8.0*num(r["sum_full_wire_memo_z"])/raw))
+        memo_series = [ {"name":"stack-greedy","color_idx":0,"pts":pts_full,"markers":True},
+                        {"name":"+root memo","color_idx":1,"pts":pts_memo,"markers":True} ]
+    c7 = line_chart(memo_series, "TUs observed (across loops)", "bits / input byte (log)",
+                    ylog=True, xmax=xmax, vlines=phase_bounds, yfmt=lambda v:f"{v:g}",
+                    title="Define-and-use whole-TU root memoization") if memo_series else "<p>(no memo data)</p>"
+
+    # 8. promotion-gate comparison — count sweep vs full-cost points, BOTH from the same curve-driver
+    # warm-last metric (gate-summary.tsv). Plotted as (blocks, tok/region): down-left is better.
+    c8 = ""
+    try:
+        gs = read_tsv("gate-summary.tsv")
+        cn = sorted([(int(r["blocks"]), float(r["tok_per_reg"])) for r in gs if r["corpus"]==corpus.lower() and r["gate"]=="count" and r["blocks"]])
+        fc = sorted([(int(r["blocks"]), float(r["tok_per_reg"])) for r in gs if r["corpus"]==corpus.lower() and r["gate"]=="fullcost" and r["blocks"]])
+        ser = []
+        if len(cn)>=2: ser.append({"name":"count gate (promote 2..32)","color_idx":0,"pts":cn,"markers":True})
+        elif cn: ser.append({"name":"count gate","color_idx":0,"pts":cn,"markers":True})
+        if fc: ser.append({"name":"full-cost (fanout 1..8)","color_idx":1,"pts":fc,"markers":True})
+        if ser:
+            c8 = line_chart(ser, "published blocks", "warm tok/region",
+                            ylog=False, xmax=max(b for b,_ in (cn+fc)), yfmt=lambda v:f"{v:.3f}",
+                            title="Promotion gate: blocks vs covering (count vs full-cost, same metric)")
+    except Exception:
+        c8 = ""
 
     # ---- metadata ----
     hdr = L.get("hdr"); ceil = L.get("ceiling"); life = L.get("life")
@@ -258,6 +314,15 @@ def render_corpus(corpus, prefix, log):
         return f'<div class="fig"><h4>{html.escape(t)}</h4><div style="overflow-x:auto">{svg}</div>{f"<p class=small>{note}</p>" if note else ""}</div>'
 
     cid = re.sub(r"[^A-Za-z0-9]", "", corpus)
+    # frozen-phase define-and-use win: unchanged rebuild collapses to ~1 ROOT_REF/TU
+    memo_stat = ""
+    fz = next((r for r in perloop if r["phase"]=="frozen_warm" and r["loop"]=="2"), None)
+    fzr = next((r for r in perloop if r["phase"]=="frozen_revert"), None)
+    if fz and has_memo:
+        full = num(fz["sum_full_wire_z"]); memo = num(fz["sum_full_wire_memo_z"]); tus = num(fz["TUs"])
+        rtok = num(fz["sum_root_tok"]); mtok = num(fz["sum_root_tok_memo"])
+        rev = (f" On post-edit REVERT the old roots are instantly reusable ({num(fzr['sum_full_wire_z'])/max(num(fzr['sum_full_wire_memo_z']),1e-9):.1f}× smaller with memo)." if fzr else "")
+        memo_stat = (f"<strong>Frozen deployed-dictionary result:</strong> an unchanged rebuild goes from {rtok/max(tus,1):.0f} to {mtok/max(tus,1):.1f} root tokens/TU (≈1 ROOT_REF), cutting full wire {full/max(memo,1e-9):.1f}× ({memo/max(tus,1):.0f} B/TU).{rev}")
     final_blocks = int(num(perloop[-1]["blocks_pub"])) if perloop else 0
     life_note = (f"Published blocks grow to {final_blocks} across all loops. Under the raw count-gate most late promotions are never reused (C-side predictor memory only — never sent to any F); a full-cost gate bounds this. In a separate 4-pass run the used set held ~{life[1]} of {life[0]} — see §4." if life else f"Grows to {final_blocks} published blocks; count-gate over-promotes the Zipfian tail (§4).")
     section = f"""
@@ -265,17 +330,21 @@ def render_corpus(corpus, prefix, log):
 <h2>{html.escape(corpus)}</h2>
 <div class="stats">{stats}</div>
 <h3>1 · Cold → hot learning</h3>
-<p class="lead">x-axis = <strong>TUs observed</strong> (prequential), continuing across repeated build loops; dashed verticals mark phase boundaries (cold → warm → header-edit → revert). Warm loops replay the <em>identical</em> tree, so a pure count-gate keeps promoting deeper blocks toward a degenerate ~1-token/TU floor — the informative signal is the <em>slope</em> and the crossing of the single-build batch reference (Q&gt;1) as cross-build structure accumulates.</p>
+<p class="lead">x-axis = <strong>TUs observed</strong> (prequential), continuing across repeated build loops; dashed verticals mark phase boundaries (cold → warm → header-edit → revert → frozen). Warm loops replay the <em>identical</em> tree, so a pure count-gate keeps promoting deeper blocks toward a degenerate ~1-token/TU floor — the informative signal is the <em>slope</em> and the crossing of the single-build batch reference (Q&gt;1) as cross-build structure accumulates.</p>
 {fig("Effective compression: bits per input byte (full charged wire)", c1, "Cold loop pays first-time Line-text closure transfer; warm loops drop toward the steady floor. Per-TU MA128 faint.")}
-{fig("Prequential predictor quality Q = (B−O)/(B−A)", c2, "B = marker-region baseline (no blocks); O = online root code length using blocks published before the TU; A = single-build batch region-BPE reference. Unclamped: Q>1 = online surpasses that batch reference.")}
+{fig("Prequential predictor quality Q_W(t) = Σ(B−O)/Σ(B−A), rolling windows", c2, "B = marker-region baseline (no blocks); O = online root code length using blocks published before the TU; A = single-build batch region-BPE reference. W=128 is the readable headline (8/32 faint). Unclamped: Q>1 = online surpasses that single-build batch reference by accumulating cross-build structure.")}
 {fig("Structure learning: root tokens per input region", c3, "Top-level tokens the current predictor needs to cover one input region. Lower = more structure absorbed into blocks.")}
 <h3>2 · Learner-state growth</h3>
 {fig("Published immutable blocks vs TUs observed", c4, life_note)}
 <h3>3 · Per-F definition multiplication</h3>
 {fig("Cold-build definition transfer vs F count", c5, "Charged once per F that receives it (closure-only). Round-robin multiplies ~×F (no single F is warm); sticky/affinity stays 1×.")}
-<h3>4 · Promotion-gate sweep</h3>
-{fig("Warm covering vs promote threshold", c6, "Lower gate = closer covering but more blocks (and, on high-diversity corpora, more never-reused Zipfian-tail blocks). A full-cost gate replaces the raw count gate in the product design.")}
-<h3>5 · Per-loop data (every plotted point)</h3>
+<h3>4 · Define-and-use whole-TU root memoization</h3>
+<p class="lead">On first sight of a TU, its whole root-token vector is labelled a root object (the child vector already crosses the wire, so the definition costs only a header); an identical later TU collapses to ONE <code>ROOT_REF</code>. It authorizes reuse only on exact object-sequence equality. {memo_stat}</p>
+{fig("Full charged wire: stack-greedy vs +root-memo", c7, "During active learning the predictor churns the tokenization, so identical TUs rarely repeat their exact root vector and memo barely helps. In the FROZEN phase (deployed steady dictionary, learning off) an unchanged rebuild collapses to ~1 ROOT_REF/TU, and the post-edit REVERT is instantly reusable — the big memo/​no-memo gaps at the right.")}
+<h3>5 · Promotion gate: count vs full-cost</h3>
+{fig("Warm covering vs promote threshold (count gate)", c6, "Count-gate sweep: lower gate = closer covering but more blocks, and on high-diversity corpora a large never-reused Zipfian tail.")}
+{fig("Blocks vs covering: count sweep vs full-cost rent-or-buy", c8, "Full-cost gate (publish a pair only when accrued foregone root-token savings ≥ def-bytes × per-F fan-out) BOUNDS the block count sharply, but on this data it does NOT dominate the count-gate frontier — a tuned count threshold reaches similar covering at similar block counts. Honest read: the per-pair gate shifts the operating point; the decisive memory bounds are generation pruning + the root-memo above, not a cleverer per-pair rule.") if c8 else ""}
+<h3>6 · Per-loop data (every plotted point)</h3>
 <div class="tblwrap">{loop_table()}</div>
 <p class="small">Machine-readable inputs on the branch: <code>{html.escape(prefix)}-pertu.tsv</code>, <code>{html.escape(prefix)}-perloop.tsv</code>.</p>
 </section>
