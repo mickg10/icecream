@@ -135,6 +135,41 @@ static Corpus load_corpus(const char*manifest,size_t max_files){
     for(auto&p:paths){ FILE*f=fopen(p.c_str(),"rb"); if(!f){perror(p.c_str());exit(2);} struct stat st{}; fstat(fileno(f),&st); size_t n=size_t(st.st_size); if(n&&fread(c.bytes.data()+off,1,n,f)!=n){fprintf(stderr,"short read\n");exit(2);} fclose(f); c.files.push_back({off,uint32_t(n)}); off+=n; }
     c.raw=off; return c;
 }
+
+// Append a controlled one-line common-header edit for each TU containing the
+// stdc-predef marker.  Offsets, rather than pointers, keep the original spans valid
+// if the backing vector moves.  The original Corpus::raw remains the cold-build size.
+static std::vector<FileSpan> append_header_edit(Corpus& corpus, uint64_t& modified) {
+    static constexpr char marker[] = "# 1 \"/usr/include/stdc-predef.h\" 1 3 4\n";
+    static constexpr char inserted[] = "typedef int icecream_semantic_root_edit;\n";
+    std::vector<FileSpan> edited;
+    edited.reserve(corpus.files.size());
+    corpus.bytes.resize(size_t(corpus.raw));
+    corpus.bytes.reserve(size_t(corpus.raw) * 2 + corpus.files.size() * sizeof(inserted) + 64);
+    modified = 0;
+    for (const FileSpan& span : corpus.files) {
+        std::string source(corpus.bytes.data() + span.off, span.len);
+        size_t at = source.find(marker);
+        uint64_t out_off = corpus.bytes.size();
+        if (at == std::string::npos) {
+            corpus.bytes.insert(corpus.bytes.end(), source.begin(), source.end());
+        } else {
+            at += sizeof(marker) - 1;
+            corpus.bytes.insert(corpus.bytes.end(), source.begin(), source.begin() + at);
+            corpus.bytes.insert(corpus.bytes.end(), inserted, inserted + sizeof(inserted) - 1);
+            corpus.bytes.insert(corpus.bytes.end(), source.begin() + at, source.end());
+            ++modified;
+        }
+        uint64_t out_len = corpus.bytes.size() - out_off;
+        if (out_len > UINT32_MAX) {
+            fprintf(stderr, "edited TU exceeds u32 length\n");
+            exit(2);
+        }
+        edited.push_back({out_off, uint32_t(out_len)});
+    }
+    corpus.bytes.resize(corpus.bytes.size() + 64);
+    return edited;
+}
 static inline void put_varint(std::vector<uint8_t>&o,uint64_t v){ while(v>=0x80){o.push_back(uint8_t(v)|0x80);v>>=7;} o.push_back(uint8_t(v)); }
 static inline uint64_t get_varint(const uint8_t*&p){ uint64_t v=0; int s=0; for(;;){ uint8_t b=*p++; v|=uint64_t(b&0x7f)<<s; if(!(b&0x80))break; s+=7; } return v; }
 static size_t zstd_size(ZSTD_CCtx*c,const uint8_t*data,size_t n,int level,std::vector<uint8_t>&dst){ ZSTD_CCtx_reset(c,ZSTD_reset_session_and_parameters); ZSTD_CCtx_setParameter(c,ZSTD_c_compressionLevel,level);
@@ -313,6 +348,7 @@ enum class Msg : uint8_t {
     FillLines = 10,
     MissingRegions = 11,
     FillRegions = 12,
+    RootRef = 13,
 };
 
 static const char* msg_name(Msg m) {
@@ -329,6 +365,7 @@ static const char* msg_name(Msg m) {
     case Msg::FillLines: return "FILL_LINES";
     case Msg::MissingRegions: return "MISSING_REGIONS";
     case Msg::FillRegions: return "FILL_REGIONS";
+    case Msg::RootRef: return "ROOT_REF";
     }
     return "UNKNOWN";
 }
@@ -585,6 +622,10 @@ public:
         return key < blocks_.size() && blocks_[size_t(key)].present;
     }
 
+    bool has_root(uint64_t key) const {
+        return key < roots_.size() && roots_[size_t(key)].present;
+    }
+
     bool install_line(uint64_t key, const uint8_t* bytes, size_t len) {
         if (key > UINT32_MAX || len > UINT32_MAX) return false;
         ensure(lines_, key);
@@ -631,6 +672,22 @@ public:
         return true;
     }
 
+    bool install_root(uint64_t key, const std::vector<uint64_t>& regions) {
+        if (!key || key > UINT32_MAX || regions.size() > UINT32_MAX) return false;
+        ensure(roots_, key);
+        ByteSpan& s = roots_[size_t(key)];
+        if (s.present) {
+            if (s.len != regions.size()) return false;
+            return memcmp(root_children_.data() + s.off, regions.data(),
+                          regions.size() * sizeof(uint64_t)) == 0;
+        }
+        s.off = root_children_.size();
+        s.len = uint32_t(regions.size());
+        s.present = true;
+        root_children_.insert(root_children_.end(), regions.begin(), regions.end());
+        return true;
+    }
+
     const ByteSpan* line(uint64_t key) const {
         return has_line(key) ? &lines_[size_t(key)] : nullptr;
     }
@@ -643,12 +700,19 @@ public:
         return has_block(key) ? &blocks_[size_t(key)] : nullptr;
     }
 
+    const ByteSpan* root(uint64_t key) const {
+        return has_root(key) ? &roots_[size_t(key)] : nullptr;
+    }
+
     const char* line_bytes(const ByteSpan& s) const { return line_bytes_.data() + s.off; }
     const uint64_t* region_children(const ByteSpan& s) const {
         return region_children_.data() + s.off;
     }
     const uint64_t* block_children(const ByteSpan& s) const {
         return block_children_.data() + s.off;
+    }
+    const uint64_t* root_children(const ByteSpan& s) const {
+        return root_children_.data() + s.off;
     }
 
     bool materialize_region(uint64_t key) {
@@ -685,9 +749,11 @@ public:
 
     uint64_t retained_bytes() const {
         return line_bytes_.capacity() + region_children_.capacity() * sizeof(uint64_t) +
-               block_children_.capacity() * sizeof(uint64_t) + region_bytes_.capacity() +
+               block_children_.capacity() * sizeof(uint64_t) +
+               root_children_.capacity() * sizeof(uint64_t) + region_bytes_.capacity() +
                lines_.capacity() * sizeof(ByteSpan) + regions_.capacity() * sizeof(ByteSpan) +
-               blocks_.capacity() * sizeof(ByteSpan) + region_raw_.capacity() * sizeof(ByteSpan);
+               blocks_.capacity() * sizeof(ByteSpan) + roots_.capacity() * sizeof(ByteSpan) +
+               region_raw_.capacity() * sizeof(ByteSpan);
     }
 
 private:
@@ -699,9 +765,11 @@ private:
     std::vector<char> region_bytes_;
     std::vector<uint64_t> region_children_;
     std::vector<uint64_t> block_children_;
+    std::vector<uint64_t> root_children_;
     std::vector<ByteSpan> lines_{1};
     std::vector<ByteSpan> regions_{1};
     std::vector<ByteSpan> blocks_{1};
+    std::vector<ByteSpan> roots_{1};
     std::vector<ByteSpan> region_raw_{1};
 };
 
@@ -713,6 +781,8 @@ struct RootToken {
 struct Transaction {
     uint32_t id = 0;
     uint64_t raw_len = 0;
+    uint64_t root_key = 0;
+    bool root_ref = false;
     std::vector<uint64_t> line_keys;
     std::vector<uint64_t> region_keys;
     std::vector<uint64_t> block_keys;
@@ -739,7 +809,9 @@ static bool decode_root(const std::vector<uint8_t>& payload, Transaction& tx) {
     Cursor c(payload);
     uint32_t id = 0;
     uint64_t count = 0;
-    if (!c.u32(id) || id != tx.id || !c.uvar(count) || count > UINT32_MAX) return false;
+    uint8_t mode = 0;
+    if (!c.u32(id) || id != tx.id || !c.u8(mode) || mode != 0 ||
+        !c.u64(tx.root_key) || !c.uvar(count) || count > UINT32_MAX) return false;
     tx.root.resize(size_t(count));
     for (RootToken& token : tx.root) {
         uint64_t v = 0;
@@ -854,6 +926,7 @@ static bool emit_transaction(const Transaction& tx, ReceiverStore& store, int ou
                              uint64_t& emitted) {
     std::vector<ByteSpan> ordered;
     ordered.reserve(tx.root.size() * 4);
+    std::vector<uint64_t> semantic_root;
     uint64_t total = 0;
 
     auto append_region = [&](uint64_t region_key) -> bool {
@@ -865,16 +938,29 @@ static bool emit_transaction(const Transaction& tx, ReceiverStore& store, int ou
         return true;
     };
 
-    for (const RootToken& token : tx.root) {
-        if (!token.block) {
-            if (!append_region(tx.region_keys[token.local])) return false;
-            continue;
+    if (tx.root_ref) {
+        const ByteSpan* root = store.root(tx.root_key);
+        if (!root) return false;
+        const uint64_t* children = store.root_children(*root);
+        semantic_root.assign(children, children + root->len);
+        for (uint64_t region_key : semantic_root)
+            if (!append_region(region_key)) return false;
+    } else {
+        for (const RootToken& token : tx.root) {
+            if (!token.block) {
+                uint64_t region_key = tx.region_keys[token.local];
+                semantic_root.push_back(region_key);
+                if (!append_region(region_key)) return false;
+                continue;
+            }
+            const ByteSpan* block = store.block(tx.block_keys[token.local]);
+            if (!block) return false;
+            const uint64_t* children = store.block_children(*block);
+            semantic_root.insert(semantic_root.end(), children, children + block->len);
+            for (uint32_t i = 0; i < block->len; ++i)
+                if (!append_region(children[i])) return false;
         }
-        const ByteSpan* block = store.block(tx.block_keys[token.local]);
-        if (!block) return false;
-        const uint64_t* children = store.block_children(*block);
-        for (uint32_t i = 0; i < block->len; ++i)
-            if (!append_region(children[i])) return false;
+        if (tx.root_key && !store.install_root(tx.root_key, semantic_root)) return false;
     }
     if (total != tx.raw_len) return false;
 
@@ -938,6 +1024,25 @@ static int receiver_main(int fd, int out_fd, int zlevel) {
     for (;;) {
         if (!channel.recv(frame)) return 23;
         if (frame.type == Msg::Done) break;
+        if (frame.type == Msg::RootRef) {
+            auto d0 = Clock::now();
+            Transaction tx;
+            tx.root_ref = true;
+            Cursor ref(frame.payload);
+            if (!ref.u32(tx.id) || !ref.u64(tx.raw_len) || !ref.u64(tx.root_key) ||
+                !tx.root_key || !ref.done() || !store.has_root(tx.root_key)) return 24;
+            decode_ns += elapsed_ns(d0);
+
+            auto e0 = Clock::now();
+            if (!emit_transaction(tx, store, out_fd, emitted)) return 30;
+            expand_ns += elapsed_ns(e0);
+
+            std::vector<uint8_t> ack;
+            put_u32(ack, tx.id);
+            put_u64(ack, tx.raw_len);
+            if (!channel.send(Msg::Ack, ack, false)) return 31;
+            continue;
+        }
         if (frame.type != Msg::Dict) return 24;
 
         auto d0 = Clock::now();
@@ -1371,10 +1476,69 @@ private:
     std::unordered_multimap<uint64_t, uint32_t> blocks_by_hash_;
 };
 
-static void verify_output(int fd, const Corpus* corpus, unsigned passes, VerifyResult* result) {
+// Semantic roots are keyed by their complete Region sequence, not by the current
+// Block covering.  A root published after TU t can therefore be reused by any
+// later identical TU even if the online Block learner has since changed its parse.
+class SemanticRoots {
+public:
+    uint32_t find(const std::vector<uint32_t>& regions) const {
+        uint64_t hash = span_hash(regions.data(), regions.size());
+        auto range = by_hash_.equal_range(hash);
+        for (auto it = range.first; it != range.second; ++it) {
+            uint32_t id = it->second;
+            if (size(id) == regions.size() &&
+                (!regions.size() || memcmp(children(id), regions.data(),
+                                            regions.size() * sizeof(uint32_t)) == 0)) return id;
+        }
+        return 0;
+    }
+
+    uint32_t publish(const std::vector<uint32_t>& regions) {
+        uint32_t existing = find(regions);
+        if (existing) return existing;
+        if (offsets_.size() > UINT32_MAX) {
+            fprintf(stderr, "semantic root id space exhausted\n");
+            exit(2);
+        }
+        uint32_t id = uint32_t(offsets_.size()); // one-based: offsets_[id-1..id]
+        data_.insert(data_.end(), regions.begin(), regions.end());
+        offsets_.push_back(data_.size());
+        by_hash_.emplace(span_hash(regions.data(), regions.size()), id);
+        return id;
+    }
+
+    size_t count() const { return offsets_.size() - 1; }
+    size_t retained_bytes() const {
+        return data_.capacity() * sizeof(uint32_t) + offsets_.capacity() * sizeof(size_t) +
+               by_hash_.size() * (sizeof(uint64_t) + sizeof(uint32_t) + 2 * sizeof(void*));
+    }
+
+private:
+    static uint64_t span_hash(const uint32_t* p, size_t n) {
+        uint64_t h = 1469598103934665603ULL ^ (uint64_t(n) * 0x9e3779b97f4a7c15ULL);
+        for (size_t i = 0; i < n; ++i) {
+            h ^= p[i];
+            h *= 1099511628211ULL;
+        }
+        return mix64(h);
+    }
+
+    size_t size(uint32_t id) const { return offsets_[id] - offsets_[id - 1]; }
+    const uint32_t* children(uint32_t id) const { return data_.data() + offsets_[id - 1]; }
+
+    std::vector<uint32_t> data_;
+    std::vector<size_t> offsets_{0};
+    std::unordered_multimap<uint64_t, uint32_t> by_hash_;
+};
+
+static void verify_output(int fd, const Corpus* corpus, const std::vector<FileSpan>* schedule,
+                          VerifyResult* result) {
     std::vector<char> buffer(1u << 20);
-    uint64_t total_expected = corpus->raw * uint64_t(passes);
+    uint64_t total_expected = 0;
+    for (const FileSpan& span : *schedule) total_expected += span.len;
     uint64_t offset = 0;
+    size_t span_index = 0;
+    size_t span_offset = 0;
     for (;;) {
         ssize_t n = ::read(fd, buffer.data(), buffer.size());
         if (n < 0 && errno == EINTR) continue;
@@ -1382,12 +1546,22 @@ static void verify_output(int fd, const Corpus* corpus, unsigned passes, VerifyR
         if (n == 0) break;
         size_t consumed = 0;
         while (consumed < size_t(n)) {
-            if (!corpus->raw || offset >= total_expected) { result->exact = false; consumed = size_t(n); break; }
-            uint64_t in_pass = offset % corpus->raw;
-            size_t chunk = std::min<size_t>(size_t(n) - consumed, size_t(corpus->raw - in_pass));
-            if (memcmp(buffer.data() + consumed, corpus->bytes.data() + in_pass, chunk) != 0)
+            while (span_index < schedule->size() && span_offset == (*schedule)[span_index].len) {
+                ++span_index;
+                span_offset = 0;
+            }
+            if (span_index == schedule->size()) {
+                result->exact = false;
+                consumed = size_t(n);
+                break;
+            }
+            const FileSpan& span = (*schedule)[span_index];
+            size_t chunk = std::min<size_t>(size_t(n) - consumed, size_t(span.len) - span_offset);
+            if (memcmp(buffer.data() + consumed,
+                       corpus->bytes.data() + span.off + span_offset, chunk) != 0)
                 result->exact = false;
             consumed += chunk;
+            span_offset += chunk;
             offset += chunk;
         }
     }
@@ -1403,6 +1577,9 @@ struct Options {
     unsigned passes = 1;
     bool delta = false;
     bool blocks = true;
+    bool root_memo = true;
+    bool edit_cycle = false;
+    int order_mode = 0; // 0=original, 1=reverse after cold, 2=seeded shuffles, 3=mixed
     bool pipeline = true;
     uint32_t pipeline_window = 8;
     bool receiver = false;
@@ -1419,6 +1596,16 @@ static bool parse_options(int argc, char** argv, Options& o) {
         else if (!strcmp(argv[i], "--delta")) o.delta = true;
         else if (!strcmp(argv[i], "--no-delta")) o.delta = false;
         else if (!strcmp(argv[i], "--no-blocks")) o.blocks = false;
+        else if (!strcmp(argv[i], "--no-root-memo")) o.root_memo = false;
+        else if (!strcmp(argv[i], "--edit-cycle")) o.edit_cycle = true;
+        else if (!strcmp(argv[i], "--order") && i + 1 < argc) {
+            const char* mode = argv[++i];
+            if (!strcmp(mode, "original")) o.order_mode = 0;
+            else if (!strcmp(mode, "reverse")) o.order_mode = 1;
+            else if (!strcmp(mode, "shuffle")) o.order_mode = 2;
+            else if (!strcmp(mode, "mixed")) o.order_mode = 3;
+            else return false;
+        }
         else if (!strcmp(argv[i], "--sync")) o.pipeline = false;
         else if (!strcmp(argv[i], "--window") && i + 1 < argc)
             o.pipeline_window = uint32_t(strtoul(argv[++i], nullptr, 10));
@@ -1432,6 +1619,22 @@ static bool parse_options(int argc, char** argv, Options& o) {
     return o.receiver ? o.fd >= 0 && o.out_fd >= 0 : o.manifest != nullptr;
 }
 
+static std::vector<FileSpan> ordered_files(const std::vector<FileSpan>& input,
+                                           unsigned pass, int mode) {
+    std::vector<FileSpan> files = input;
+    if (pass == 0 || mode == 0) return files;
+    if (mode == 1 || (mode == 3 && pass == 1)) {
+        std::reverse(files.begin(), files.end());
+        return files;
+    }
+    uint64_t state = mix64(0x243f6a8885a308d3ULL ^ uint64_t(pass) * 0x9e3779b97f4a7c15ULL);
+    for (size_t i = files.size(); i > 1; --i) {
+        state = mix64(state + i * 0x100000001b3ULL);
+        std::swap(files[i - 1], files[size_t(state % i)]);
+    }
+    return files;
+}
+
 static bool drain_pipeline_reply(FramedChannel& channel, uint32_t expected_id,
                                  uint64_t expected_len) {
     Frame frame;
@@ -1441,6 +1644,18 @@ static bool drain_pipeline_reply(FramedChannel& channel, uint32_t expected_id,
     uint64_t count = 0;
     if (!ready.u32(ready_id) || ready_id != expected_id || !ready.uvar(count) ||
         count != 0 || !ready.done()) return false;
+    if (!channel.recv(frame) || frame.type != Msg::Ack) return false;
+    Cursor ack(frame.payload);
+    uint32_t ack_id = 0;
+    uint64_t ack_len = 0;
+    return ack.u32(ack_id) && ack_id == expected_id && ack.u64(ack_len) &&
+           ack_len == expected_len && ack.done();
+}
+
+static bool drain_transaction_reply(FramedChannel& channel, uint32_t expected_id,
+                                    uint64_t expected_len, bool root_ref) {
+    if (!root_ref) return drain_pipeline_reply(channel, expected_id, expected_len);
+    Frame frame;
     if (!channel.recv(frame) || frame.type != Msg::Ack) return false;
     Cursor ack(frame.payload);
     uint32_t ack_id = 0;
@@ -1487,8 +1702,30 @@ static int sender_main(const Options& options) {
     Corpus corpus = load_corpus(options.manifest, options.max_files);
     uint64_t load_ns = elapsed_ns(load_start);
 
+    uint64_t edited_tus = 0;
+    uint64_t edit_fixture_ns = 0;
+    std::vector<FileSpan> edited_files;
+    if (options.edit_cycle) {
+        auto e0 = Clock::now();
+        edited_files = append_header_edit(corpus, edited_tus);
+        edit_fixture_ns = elapsed_ns(e0);
+    }
+
+    std::vector<FileSpan> schedule;
+    std::vector<uint64_t> pass_raw;
+    schedule.reserve(corpus.files.size() * size_t(options.passes));
+    for (unsigned pass = 0; pass < options.passes; ++pass) {
+        bool edited = options.edit_cycle && (pass == 2 || pass == 3);
+        const std::vector<FileSpan>& source = edited ? edited_files : corpus.files;
+        std::vector<FileSpan> ordered = ordered_files(source, pass, options.order_mode);
+        uint64_t raw_bytes = 0;
+        for (const FileSpan& span : ordered) raw_bytes += span.len;
+        pass_raw.push_back(raw_bytes);
+        schedule.insert(schedule.end(), ordered.begin(), ordered.end());
+    }
+
     VerifyResult verification;
-    std::thread verifier(verify_output, output[0], &corpus, options.passes, &verification);
+    std::thread verifier(verify_output, output[0], &corpus, &schedule, &verification);
     FramedChannel channel(sockets[0], options.zlevel);
 
     uint64_t guid = mix64(uint64_t(getpid()) ^ uint64_t(total_start.time_since_epoch().count()));
@@ -1499,6 +1736,7 @@ static int sender_main(const Options& options) {
 
     Interner dict;
     OnlineBlocks blocks(options.blocks);
+    SemanticRoots semantic_roots;
     DefinitionPredictor predictor;
     DefinitionStats definition_stats;
     DenseIndex region_index, block_index, eager_index;
@@ -1506,12 +1744,13 @@ static int sender_main(const Options& options) {
     std::vector<uint8_t> receiver_known_regions(1, 0);
     std::vector<uint8_t> receiver_known_blocks(1, 0);
     uint32_t max_len = 0;
-    for (const FileSpan& f : corpus.files) max_len = std::max(max_len, f.len);
+    for (const FileSpan& f : schedule) max_len = std::max(max_len, f.len);
     std::vector<uint32_t> line_occurrences(size_t(max_len) + 1);
     std::vector<uint32_t> regions;
     std::vector<uint64_t> region_keys, block_keys, missing_lines, missing_regions, missing_blocks,
                           closure_regions, eager_regions, eager_lines;
     std::vector<uint64_t> transaction_lengths;
+    std::vector<uint8_t> transaction_root_refs;
     std::vector<EncodedToken> root_tokens;
     std::vector<CandidateInfo> candidates;
     uint64_t intern_ns = 0, plan_ns = 0, fill_ns = 0, wait_ns = 0;
@@ -1520,12 +1759,28 @@ static int sender_main(const Options& options) {
     uint32_t replies_drained = 0;
     uint32_t pending_ack = 0;
     uint64_t pending_ack_len = 0;
+    uint64_t root_defs = 0;
+    uint64_t root_refs = 0;
+    struct PassRow {
+        uint64_t raw = 0;
+        uint64_t wire = 0;
+        uint64_t defs = 0;
+        uint64_t refs = 0;
+    };
+    std::vector<PassRow> pass_rows;
     bool ok = true;
 
     for (unsigned pass = 0; pass < options.passes && ok; ++pass) {
-        for (const FileSpan& file : corpus.files) {
+        uint64_t pass_wire_before = channel.sent() + channel.received();
+        uint64_t pass_defs_before = root_defs;
+        uint64_t pass_refs_before = root_refs;
+        size_t pass_begin = size_t(pass) * corpus.files.size();
+        size_t pass_end = pass_begin + corpus.files.size();
+        for (size_t scheduled = pass_begin; scheduled < pass_end; ++scheduled) {
+            const FileSpan& file = schedule[scheduled];
             ++txid;
             transaction_lengths.push_back(file.len);
+            transaction_root_refs.push_back(0);
             const char* begin = corpus.bytes.data() + file.off;
             const char* end = begin + file.len;
             uint32_t before_lines = dict.distinct();
@@ -1541,7 +1796,59 @@ static int sender_main(const Options& options) {
                 receiver_known_regions.resize(size_t(dict.region_count()) + 1, 0);
 
             auto p0 = Clock::now();
+            // Score the current TU against roots published by prior TUs only.  Publication
+            // happens below, after this choice, so a TU can never memoize itself.
+            uint32_t root_key = options.root_memo ? semantic_roots.find(regions) : 0;
+            bool root_ref = root_key != 0;
             root_tokens = blocks.encode(regions);
+            if (options.root_memo && !root_ref) {
+                root_key = semantic_roots.publish(regions);
+                ++root_defs;
+            }
+
+            if (root_ref) {
+                transaction_root_refs.back() = 1;
+                payload.clear();
+                put_u32(payload, txid);
+                put_u64(payload, file.len);
+                put_u64(payload, root_key);
+                if (!channel.send(Msg::RootRef, payload)) { ok = false; break; }
+                ++root_refs;
+                plan_ns += elapsed_ns(p0);
+
+                if (options.pipeline) {
+                    if (txid - replies_drained >= options.pipeline_window) {
+                        auto w0 = Clock::now();
+                        uint32_t expected_id = replies_drained + 1;
+                        ok = drain_transaction_reply(channel, expected_id,
+                                                     transaction_lengths[size_t(expected_id - 1)],
+                                                     transaction_root_refs[size_t(expected_id - 1)] != 0);
+                        wait_ns += elapsed_ns(w0);
+                        if (!ok) break;
+                        ++replies_drained;
+                    }
+                } else {
+                    // A full-root transaction leaves its final ACK pending to overlap the next
+                    // encode.  Consume it before the standalone RootRef exchange.
+                    if (pending_ack) {
+                        Frame prior;
+                        auto w0 = Clock::now();
+                        if (!channel.recv(prior) || prior.type != Msg::Ack) { ok = false; break; }
+                        wait_ns += elapsed_ns(w0);
+                        Cursor ack(prior.payload);
+                        uint32_t ack_id = 0;
+                        uint64_t ack_len = 0;
+                        if (!ack.u32(ack_id) || ack_id != pending_ack || !ack.u64(ack_len) ||
+                            ack_len != pending_ack_len || !ack.done()) { ok = false; break; }
+                        pending_ack = 0;
+                    }
+                    auto w0 = Clock::now();
+                    ok = drain_transaction_reply(channel, txid, file.len, true);
+                    wait_ns += elapsed_ns(w0);
+                    if (!ok) break;
+                }
+                continue;
+            }
             if (after_lines + 1 > receiver_known.size()) receiver_known.resize(size_t(after_lines) + 1, 0);
             if (blocks.block_count() + 1 > receiver_known_blocks.size())
                 receiver_known_blocks.resize(blocks.block_count() + 1, 0);
@@ -1583,6 +1890,8 @@ static int sender_main(const Options& options) {
 
             payload.clear();
             put_u32(payload, txid);
+            payload.push_back(0); // full semantic-root definition, not a RootRef
+            put_u64(payload, root_key);
             put_uvar(payload, root_tokens.size());
             for (const EncodedToken& token : root_tokens) {
                 uint32_t local = token.block ? block_index.get(token.id) : region_index.get(token.id);
@@ -1784,12 +2093,48 @@ static int sender_main(const Options& options) {
             if (options.pipeline && txid - replies_drained >= options.pipeline_window) {
                 auto w0 = Clock::now();
                 uint32_t expected_id = replies_drained + 1;
-                ok = drain_pipeline_reply(channel, expected_id,
-                                            transaction_lengths[size_t(expected_id - 1)]);
+                ok = drain_transaction_reply(channel, expected_id,
+                                             transaction_lengths[size_t(expected_id - 1)],
+                                             transaction_root_refs[size_t(expected_id - 1)] != 0);
                 wait_ns += elapsed_ns(w0);
                 if (!ok) break;
                 ++replies_drained;
             }
+        }
+
+        // Put every pass boundary on a complete-wire boundary.  This makes the learning
+        // curve an exact per-build measurement rather than assigning delayed replies to
+        // whichever build happened to follow them.
+        if (ok && options.pipeline) {
+            while (replies_drained < txid) {
+                uint32_t expected_id = replies_drained + 1;
+                auto w0 = Clock::now();
+                ok = drain_transaction_reply(channel, expected_id,
+                                             transaction_lengths[size_t(expected_id - 1)],
+                                             transaction_root_refs[size_t(expected_id - 1)] != 0);
+                wait_ns += elapsed_ns(w0);
+                if (!ok) break;
+                ++replies_drained;
+            }
+        } else if (ok && pending_ack) {
+            Frame ack_frame;
+            auto w0 = Clock::now();
+            if (!channel.recv(ack_frame) || ack_frame.type != Msg::Ack) ok = false;
+            wait_ns += elapsed_ns(w0);
+            if (ok) {
+                Cursor ack(ack_frame.payload);
+                uint32_t ack_id = 0;
+                uint64_t ack_len = 0;
+                ok = ack.u32(ack_id) && ack_id == pending_ack && ack.u64(ack_len) &&
+                     ack_len == pending_ack_len && ack.done();
+            }
+            pending_ack = 0;
+        }
+        if (ok) {
+            uint64_t now_wire = channel.sent() + channel.received();
+            pass_rows.push_back({pass_raw[pass], now_wire - pass_wire_before,
+                                 root_defs - pass_defs_before,
+                                 root_refs - pass_refs_before});
         }
     }
 
@@ -1798,8 +2143,9 @@ static int sender_main(const Options& options) {
         while (replies_drained < txid) {
             uint32_t expected_id = replies_drained + 1;
             auto w0 = Clock::now();
-            ok = drain_pipeline_reply(channel, expected_id,
-                                      transaction_lengths[size_t(expected_id - 1)]);
+            ok = drain_transaction_reply(channel, expected_id,
+                                         transaction_lengths[size_t(expected_id - 1)],
+                                         transaction_root_refs[size_t(expected_id - 1)] != 0);
             wait_ns += elapsed_ns(w0);
             if (!ok) break;
             ++replies_drained;
@@ -1842,8 +2188,10 @@ static int sender_main(const Options& options) {
     }
 
     uint64_t total_ns = elapsed_ns(total_start);
-    uint64_t codec_ns = total_ns > load_ns ? total_ns - load_ns : 0;
-    uint64_t raw = corpus.raw * uint64_t(options.passes);
+    uint64_t fixture_ns = load_ns + edit_fixture_ns;
+    uint64_t codec_ns = total_ns > fixture_ns ? total_ns - fixture_ns : 0;
+    uint64_t raw = 0;
+    for (uint64_t bytes : pass_raw) raw += bytes;
     uint64_t wire = channel.sent() + channel.received();
     bool exact = ok && child_ok && verification.exact && verification.bytes == raw &&
                  receiver_emitted == raw;
@@ -1852,8 +2200,12 @@ static int sender_main(const Options& options) {
            options.zlevel, options.delta ? "pre-TU" : "off",
            options.pipeline ? (std::string("window=") + std::to_string(options.pipeline_window)).c_str()
                             : "lockstep");
-    printf("manifest=%s TUs=%zu passes=%u raw=%llu byte-exact=%s child=%s\n",
-           options.manifest, corpus.files.size(), options.passes,
+    const char* order_name = options.order_mode == 0 ? "original" :
+                             options.order_mode == 1 ? "reverse-after-cold" :
+                             options.order_mode == 2 ? "shuffled-after-cold" : "mixed-after-cold";
+    printf("manifest=%s TUs=%zu passes=%u order=%s edit_cycle=%s modified_TUs=%llu raw=%llu byte-exact=%s child=%s\n",
+           options.manifest, corpus.files.size(), options.passes, order_name,
+           options.edit_cycle ? "yes" : "no", (unsigned long long)edited_tus,
            (unsigned long long)raw, exact ? "PASS" : "FAIL", child_ok ? "PASS" : "FAIL");
     printf("full wall=%.6f s throughput=%.3f GB/s (%.3f GiB/s) wire=%llu ratio=%.2fx\n",
            total_ns / 1e9, total_ns ? double(raw) / double(total_ns) : 0.0,
@@ -1861,9 +2213,10 @@ static int sender_main(const Options& options) {
            (unsigned long long)wire, wire ? double(raw) / double(wire) : 0.0);
     printf("codec wall=%.6f s throughput=%.3f GB/s (fixture load reported separately)\n",
            codec_ns / 1e9, codec_ns ? double(raw) / double(codec_ns) : 0.0);
-    printf("C->F=%llu F->C=%llu load=%.3fs intern=%.3fs plan=%.3fs fill=%.3fs wait=%.3fs\n",
+    printf("C->F=%llu F->C=%llu load=%.3fs edit_fixture=%.3fs intern=%.3fs plan=%.3fs fill=%.3fs wait=%.3fs\n",
            (unsigned long long)channel.sent(), (unsigned long long)channel.received(),
-           load_ns / 1e9, intern_ns / 1e9, plan_ns / 1e9, fill_ns / 1e9, wait_ns / 1e9);
+           load_ns / 1e9, edit_fixture_ns / 1e9, intern_ns / 1e9, plan_ns / 1e9,
+           fill_ns / 1e9, wait_ns / 1e9);
     printf("C zstd=%.3fs C write=%.3fs C read+decompress=%.3fs F decode=%.3fs F expand+emit=%.3fs\n",
            channel.compress_ns() / 1e9, channel.write_ns() / 1e9,
            (channel.read_ns() + channel.decompress_ns()) / 1e9,
@@ -1874,10 +2227,26 @@ static int sender_main(const Options& options) {
            (unsigned long long)definition_stats.literal_bytes,
            (unsigned long long)definition_stats.delta_middle_bytes,
            (unsigned long long)definition_stats.copied_bytes);
+    printf("semantic roots: enabled=%s definitions=%llu references=%llu retained=%.1f MiB\n",
+           options.root_memo ? "yes" : "no", (unsigned long long)root_defs,
+           (unsigned long long)root_refs, semantic_roots.retained_bytes() / 1048576.0);
+    uint64_t curve_wire = 0;
+    uint64_t curve_raw = 0;
+    printf("learning curve (completed build -> pass wire, pass ratio, cumulative ratio, root defs/refs):\n");
+    for (size_t i = 0; i < pass_rows.size(); ++i) {
+        curve_wire += pass_rows[i].wire;
+        curve_raw += pass_rows[i].raw;
+        double pass_ratio = pass_rows[i].wire ? double(pass_rows[i].raw) / pass_rows[i].wire : 0.0;
+        double cumulative_ratio = curve_wire ? double(curve_raw) / double(curve_wire) : 0.0;
+        printf("  pass=%zu observed_TUs=%zu wire=%llu pass_ratio=%.1fx cumulative_ratio=%.1fx roots=%llu/%llu\n",
+               i + 1, i * corpus.files.size(), (unsigned long long)pass_rows[i].wire,
+               pass_ratio, cumulative_ratio, (unsigned long long)pass_rows[i].defs,
+               (unsigned long long)pass_rows[i].refs);
+    }
     printf("receiver retained=%.1f MiB peak=%.1f MiB\n",
            receiver_retained / 1048576.0, receiver_peak / 1048576.0);
     printf("wire by message:");
-    for (unsigned i = 1; i <= unsigned(Msg::FillRegions); ++i) {
+    for (unsigned i = 1; i <= unsigned(Msg::RootRef); ++i) {
         uint64_t bytes = channel.sent_by_type()[i] + channel.received_by_type()[i];
         if (bytes) printf(" %s=%llu", msg_name(Msg(i)), (unsigned long long)bytes);
     }
@@ -1890,7 +2259,7 @@ static int sender_main(const Options& options) {
 int main(int argc, char** argv) {
     local_codec50::Options options;
     if (!local_codec50::parse_options(argc, argv, options)) {
-        fprintf(stderr, "usage: %s --manifest FILE [--max-files N] [--z 0|1|3] [--passes N] [--delta] [--no-blocks] [--window N|--sync]\n", argv[0]);
+        fprintf(stderr, "usage: %s --manifest FILE [--max-files N] [--z 0|1|3] [--passes N] [--order original|reverse|shuffle|mixed] [--edit-cycle] [--delta] [--no-blocks] [--no-root-memo] [--window N|--sync]\n", argv[0]);
         return 2;
     }
     if (options.receiver) return local_codec50::receiver_main(options.fd, options.out_fd, options.zlevel);

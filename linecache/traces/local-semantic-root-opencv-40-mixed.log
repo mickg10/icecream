@@ -1,0 +1,52 @@
+
+==== LOCAL-ORACLE CODEC50 (actual C/F frames, zstd-1, delta=off, window=8) ====
+manifest=/tanksmall/scratch/ictmp/corpus5/manifest.txt TUs=1506 passes=40 order=mixed-after-cold edit_cycle=no modified_TUs=0 raw=185239790960 byte-exact=PASS child=PASS
+full wall=119.549235 s throughput=1.549 GB/s (1.443 GiB/s) wire=19289687 ratio=9603.05x
+codec wall=111.173764 s throughput=1.666 GB/s (fixture load reported separately)
+C->F=17818273 F->C=1471414 load=8.375s edit_fixture=0.000s intern=46.099s plan=12.095s fill=0.372s wait=52.549s
+C zstd=0.275s C write=0.412s C read+decompress=52.509s F decode=0.263s F expand+emit=105.542s
+definitions: literal=586099 delta=0 literal_bytes=53562985 middle_bytes=0 copied_bytes=0
+semantic roots: enabled=yes definitions=1506 references=58734 retained=24.0 MiB
+learning curve (completed build -> pass wire, pass ratio, cumulative ratio, root defs/refs):
+  pass=1 observed_TUs=0 wire=16000495 pass_ratio=289.4x cumulative_ratio=289.4x roots=1506/0
+  pass=2 observed_TUs=1506 wire=84336 pass_ratio=54911.2x cumulative_ratio=575.8x roots=0/1506
+  pass=3 observed_TUs=3012 wire=84336 pass_ratio=54911.2x cumulative_ratio=859.2x roots=0/1506
+  pass=4 observed_TUs=4518 wire=84336 pass_ratio=54911.2x cumulative_ratio=1139.7x roots=0/1506
+  pass=5 observed_TUs=6024 wire=84336 pass_ratio=54911.2x cumulative_ratio=1417.3x roots=0/1506
+  pass=6 observed_TUs=7530 wire=84336 pass_ratio=54911.2x cumulative_ratio=1692.0x roots=0/1506
+  pass=7 observed_TUs=9036 wire=84336 pass_ratio=54911.2x cumulative_ratio=1963.9x roots=0/1506
+  pass=8 observed_TUs=10542 wire=84336 pass_ratio=54911.2x cumulative_ratio=2233.0x roots=0/1506
+  pass=9 observed_TUs=12048 wire=84336 pass_ratio=54911.2x cumulative_ratio=2499.5x roots=0/1506
+  pass=10 observed_TUs=13554 wire=84336 pass_ratio=54911.2x cumulative_ratio=2763.2x roots=0/1506
+  pass=11 observed_TUs=15060 wire=84336 pass_ratio=54911.2x cumulative_ratio=3024.3x roots=0/1506
+  pass=12 observed_TUs=16566 wire=84336 pass_ratio=54911.2x cumulative_ratio=3282.8x roots=0/1506
+  pass=13 observed_TUs=18072 wire=84336 pass_ratio=54911.2x cumulative_ratio=3538.7x roots=0/1506
+  pass=14 observed_TUs=19578 wire=84336 pass_ratio=54911.2x cumulative_ratio=3792.2x roots=0/1506
+  pass=15 observed_TUs=21084 wire=84336 pass_ratio=54911.2x cumulative_ratio=4043.1x roots=0/1506
+  pass=16 observed_TUs=22590 wire=84336 pass_ratio=54911.2x cumulative_ratio=4291.6x roots=0/1506
+  pass=17 observed_TUs=24096 wire=84336 pass_ratio=54911.2x cumulative_ratio=4537.6x roots=0/1506
+  pass=18 observed_TUs=25602 wire=84336 pass_ratio=54911.2x cumulative_ratio=4781.3x roots=0/1506
+  pass=19 observed_TUs=27108 wire=84336 pass_ratio=54911.2x cumulative_ratio=5022.6x roots=0/1506
+  pass=20 observed_TUs=28614 wire=84336 pass_ratio=54911.2x cumulative_ratio=5261.6x roots=0/1506
+  pass=21 observed_TUs=30120 wire=84336 pass_ratio=54911.2x cumulative_ratio=5498.4x roots=0/1506
+  pass=22 observed_TUs=31626 wire=84336 pass_ratio=54911.2x cumulative_ratio=5732.9x roots=0/1506
+  pass=23 observed_TUs=33132 wire=84336 pass_ratio=54911.2x cumulative_ratio=5965.1x roots=0/1506
+  pass=24 observed_TUs=34638 wire=84336 pass_ratio=54911.2x cumulative_ratio=6195.2x roots=0/1506
+  pass=25 observed_TUs=36144 wire=84336 pass_ratio=54911.2x cumulative_ratio=6423.2x roots=0/1506
+  pass=26 observed_TUs=37650 wire=84336 pass_ratio=54911.2x cumulative_ratio=6649.0x roots=0/1506
+  pass=27 observed_TUs=39156 wire=84336 pass_ratio=54911.2x cumulative_ratio=6872.7x roots=0/1506
+  pass=28 observed_TUs=40662 wire=84336 pass_ratio=54911.2x cumulative_ratio=7094.4x roots=0/1506
+  pass=29 observed_TUs=42168 wire=84336 pass_ratio=54911.2x cumulative_ratio=7314.0x roots=0/1506
+  pass=30 observed_TUs=43674 wire=84336 pass_ratio=54911.2x cumulative_ratio=7531.6x roots=0/1506
+  pass=31 observed_TUs=45180 wire=84336 pass_ratio=54911.2x cumulative_ratio=7747.2x roots=0/1506
+  pass=32 observed_TUs=46686 wire=84336 pass_ratio=54911.2x cumulative_ratio=7960.9x roots=0/1506
+  pass=33 observed_TUs=48192 wire=84336 pass_ratio=54911.2x cumulative_ratio=8172.7x roots=0/1506
+  pass=34 observed_TUs=49698 wire=84336 pass_ratio=54911.2x cumulative_ratio=8382.5x roots=0/1506
+  pass=35 observed_TUs=51204 wire=84336 pass_ratio=54911.2x cumulative_ratio=8590.5x roots=0/1506
+  pass=36 observed_TUs=52710 wire=84336 pass_ratio=54911.2x cumulative_ratio=8796.6x roots=0/1506
+  pass=37 observed_TUs=54216 wire=84336 pass_ratio=54911.2x cumulative_ratio=9000.9x roots=0/1506
+  pass=38 observed_TUs=55722 wire=84336 pass_ratio=54911.2x cumulative_ratio=9203.4x roots=0/1506
+  pass=39 observed_TUs=57228 wire=84336 pass_ratio=54911.2x cumulative_ratio=9404.1x roots=0/1506
+  pass=40 observed_TUs=58734 wire=84336 pass_ratio=54911.2x cumulative_ratio=9603.1x roots=0/1506
+receiver retained=270.1 MiB peak=245.5 MiB
+wire by message: HELLO=24 DICT=249879 ROOT=218036 FILL=15470834 ACK=1445760 DONE=12 FINAL=52 MISSING_LINES=25602 ROOT_REF=1879488

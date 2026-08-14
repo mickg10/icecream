@@ -1,0 +1,17 @@
+
+==== LOCAL-ORACLE CODEC50 (actual C/F frames, zstd-1, delta=off, window=8) ====
+manifest=/tanksmall/scratch/ictmp/corpus3/manifest.txt TUs=689 passes=5 order=mixed-after-cold edit_cycle=yes modified_TUs=689 raw=9928632523 byte-exact=PASS child=PASS
+full wall=14.790389 s throughput=0.671 GB/s (0.625 GiB/s) wire=20229710 ratio=490.79x
+codec wall=8.243465 s throughput=1.204 GB/s (fixture load reported separately)
+C->F=20127938 F->C=101772 load=3.044s edit_fixture=3.503s intern=4.800s plan=0.826s fill=0.565s wait=1.987s
+C zstd=0.362s C write=0.103s C read+decompress=1.984s F decode=0.362s F expand+emit=7.065s
+definitions: literal=637611 delta=0 literal_bytes=54733468 middle_bytes=0 copied_bytes=0
+semantic roots: enabled=yes definitions=1120 references=2325 retained=17.4 MiB
+learning curve (completed build -> pass wire, pass ratio, cumulative ratio, root defs/refs):
+  pass=1 observed_TUs=0 wire=17347279 pass_ratio=114.5x cumulative_ratio=114.5x roots=560/129
+  pass=2 observed_TUs=689 wire=38584 pass_ratio=51464.7x cumulative_ratio=228.4x roots=0/689
+  pass=3 observed_TUs=1378 wire=2766591 pass_ratio=717.8x cumulative_ratio=295.6x roots=560/129
+  pass=4 observed_TUs=2067 wire=38584 pass_ratio=51465.5x cumulative_ratio=393.4x roots=0/689
+  pass=5 observed_TUs=2756 wire=38584 pass_ratio=51464.7x cumulative_ratio=490.8x roots=0/689
+receiver retained=344.7 MiB peak=293.1 MiB
+wire by message: HELLO=24 DICT=334352 ROOT=488718 FILL=19230432 ACK=82680 DONE=12 FINAL=52 MISSING_LINES=19040 ROOT_REF=74400
