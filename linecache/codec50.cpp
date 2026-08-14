@@ -365,6 +365,12 @@ int main(int argc,char**argv){
       printf("DIAG batched-z%d floor: line_def %.0f->%.0f  root %.0f->%.0f  => streamed TOTAL=%.0f ratio=%.0fx\n",zlevel,w_linedef,bl,w_root,br,alt,corpus.raw/alt);
       printf("DIAG FULL streamed floor (all cats batched z%d): line=%.2f reg=%.2f blk=%.2f path=%.2f miss=%.2f root=%.2f => %.2f MiB ratio=%.0fx\n",
         zlevel,fl_line/MiB,fl_reg/MiB,fl_blk/MiB,fl_path/MiB,fl_miss/MiB,fl_root/MiB,fullfloor/MiB,corpus.raw/fullfloor);
+      // region-def relative-LZ headroom: raw, batched z3, and z3+LDM+win27 (unbounded-window ceiling).
+      { ZSTD_CCtx* zr=ZSTD_createCCtx(); std::vector<uint8_t> rb(ZSTD_compressBound(allRegions.size())+64);
+        ZSTD_CCtx_setParameter(zr,ZSTD_c_compressionLevel,zlevel); ZSTD_CCtx_setParameter(zr,ZSTD_c_enableLongDistanceMatching,1); ZSTD_CCtx_setParameter(zr,ZSTD_c_windowLog,27);
+        size_t rl=allRegions.empty()?0:ZSTD_compress2(zr,rb.data(),rb.size(),allRegions.data(),allRegions.size()); ZSTD_freeCCtx(zr);
+        printf("DIAG region_def headroom: raw=%.2f MiB  batched-z%d=%.2f  z%d+LDM+win27=%.2f MiB (unbounded relative-LZ ceiling)\n",
+          allRegions.size()/MiB,zlevel,fl_reg/MiB,zlevel,rl/MiB); }
       printf("DIAG long-distance ceiling: line_def z%d+LDM+win27 = %.0f (%.2f MiB) => TOTAL=%.0f ratio=%.0fx  [what a perfect relative-LZ OBJECT could reach]\n",zlevel,bl_ldm,bl_ldm/MiB,altldm,corpus.raw/altldm);
       // entropy ladder on the distinct-line dictionary leg: is 8.47MB a z3-level wall or an information floor?
       if(!allLineDefs.empty()){ printf("DIAG line_def entropy ladder (%.2f MiB raw, %.0f distinct literal lines):\n",allLineDefs.size()/MiB,double(n_literal));
