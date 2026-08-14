@@ -29,7 +29,7 @@
 #include <vector>
 #include <immintrin.h>
 #include <zstd.h>
-#if __has_include("definition_codec.h")
+#if defined(WITH_D2) && __has_include("definition_codec.h")
   #include "definition_codec.h"
   #define HAVE_DEFCODEC 1
 #endif
@@ -146,10 +146,11 @@ static bool parse_marker(const char* s, uint32_t len, Marker& m){
 static void emit_marker(const Marker& m, std::vector<uint8_t>& out){ char buf[32]; int l=snprintf(buf,sizeof buf,"# %llu \"",(unsigned long long)m.lineno); out.insert(out.end(),buf,buf+l); out.insert(out.end(),m.path.begin(),m.path.end()); out.push_back('"'); for(uint8_t f:m.flags){ out.push_back(' '); l=snprintf(buf,sizeof buf,"%u",f); out.insert(out.end(),buf,buf+l);} out.push_back('\n'); }
 
 int main(int argc,char**argv){
-    const char* manifest=nullptr; size_t max_files=SIZE_MAX; int zlevel=3; bool useD1=true, useD2=false;
+    const char* manifest=nullptr; size_t max_files=SIZE_MAX; int zlevel=3; bool useD1=true, useD2=false, useS1=true;
     for(int i=1;i<argc;++i){ if(!strcmp(argv[i],"--manifest")&&i+1<argc)manifest=argv[++i];
         else if(!strcmp(argv[i],"--z")&&i+1<argc)zlevel=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--no-d1"))useD1=false;
+        else if(!strcmp(argv[i],"--v1"))useS1=false;   // V1 baseline: raw region-id root, no S1 blocks
         else if(!strcmp(argv[i],"--d2"))useD2=true;
         else if(!strcmp(argv[i],"--max-files")&&i+1<argc){ char*t=nullptr; unsigned long long v=strtoull(argv[++i],&t,10); if(!t||*t||!v){fprintf(stderr,"bad max-files\n");return 2;} max_files=size_t(v); }
         else { fprintf(stderr,"unknown %s\n",argv[i]); return 2; } }
@@ -165,6 +166,34 @@ int main(int argc,char**argv){
     uint32_t NREG=uint32_t(dict.region_count()); size_t TUs=corpus.files.size();
     fprintf(stderr,"loaded+interned %.1fs TUs=%zu raw=%llu regions=%u region_occ=%zu distinct_lines=%u\n",secs(t0),TUs,(unsigned long long)corpus.raw,NREG,allreg.size(),dict.distinct());
 
+    // ===== S1: LZ longest-previous-factor over region-id stream -> per-TU token streams + flat Blocks =====
+    // token < NREG = region id ; token >= NREG = block id (flat span of region ids). Causal/prequential.
+    std::vector<uint32_t> bchild; std::vector<size_t> boff2; boff2.push_back(0);
+    std::unordered_map<uint64_t,uint32_t> bdict;
+    std::vector<uint32_t> tokstream; std::vector<size_t> tokoff; tokoff.push_back(0);
+    if(useS1){
+        size_t NS=allreg.size(); uint32_t MINMATCH=3, MAXCHAIN=64, hbits=22;
+        std::vector<uint32_t> head(size_t(1)<<hbits, UINT32_MAX), prevp(NS, UINT32_MAX);
+        auto kgram=[&](size_t i)->uint64_t{ uint64_t h=1469598103934665603ULL; for(uint32_t j=0;j<MINMATCH;++j){ h^=allreg[i+j]; h*=1099511628211ULL; } return (h*0x9E3779B97F4A7C15ULL)>>(64-hbits); };
+        auto block_get=[&](const uint32_t*p,size_t L)->uint32_t{ uint64_t h=1469598103934665603ULL^(L*0x100000001b3ULL); for(size_t j=0;j<L;++j){h^=p[j];h*=1099511628211ULL;}
+            auto it=bdict.find(h); if(it!=bdict.end()){ uint32_t k=it->second; if(boff2[k+1]-boff2[k]==L && memcmp(&bchild[boff2[k]],p,L*4)==0) return NREG+k; }
+            uint32_t k=uint32_t(boff2.size()-1); bchild.insert(bchild.end(),p,p+L); boff2.push_back(bchild.size()); if(it==bdict.end()) bdict.emplace(h,k); return NREG+k; };
+        auto tb=Clock::now();
+        for(size_t t=0;t<TUs;++t){ size_t a=roff[t],b=roff[t+1]; size_t i=a;
+            while(i<b){ size_t bestL=0,bestP=0;
+                if(i+MINMATCH<=b && i+MINMATCH<=NS){ uint32_t cand=head[kgram(i)],chain=0;
+                    while(cand!=UINT32_MAX&&chain<MAXCHAIN){ if(cand<i){ size_t L=0,mx=b-i; while(L<mx&&allreg[cand+L]==allreg[i+L])++L; if(L>=MINMATCH&&L>bestL){bestL=L;bestP=cand;if(L==mx)break;} } cand=prevp[cand]; ++chain; } }
+                size_t step; (void)bestP;
+                if(bestL>=MINMATCH){ tokstream.push_back(block_get(&allreg[i],bestL)); step=bestL; }
+                else { tokstream.push_back(allreg[i]); step=1; }
+                for(size_t j=i;j<i+step;++j){ if(j+MINMATCH<=NS){ uint64_t g=kgram(j); prevp[j]=head[g]; head[g]=uint32_t(j); } }
+                i+=step; }
+            tokoff.push_back(tokstream.size()); }
+        fprintf(stderr,"S1 LZ: %.1fs tokens=%zu blocks=%zu (%.4f tok/region)\n",secs(tb),tokstream.size(),boff2.size()-1,double(tokstream.size())/NS);
+    } else { // V1: root = raw region-id sequence
+        for(size_t t=0;t<TUs;++t){ for(size_t i=roff[t];i<roff[t+1];++i) tokstream.push_back(allreg[i]); tokoff.push_back(tokstream.size()); }
+    }
+
     // ===== ENCODER (C) + DECODER (F): one cold chronological pass, PULL protocol (root -> MISSING -> FILL) =====
     // C tracks F's known sets (single F) so it computes exactly the missing closure. Every wire byte is
     // charged by category, compressed at z<=zlevel per message. F reconstructs .ii bytes byte-exact.
@@ -176,6 +205,9 @@ int main(int argc,char**argv){
     Fline_data.reserve(64u<<20);
     std::vector<uint32_t> Freg_child; std::vector<size_t> Freg_off; Freg_off.push_back(0);     // region id k (0-based) -> [off[k],off[k+1])
     std::vector<std::string> Fpaths;
+    std::vector<uint8_t> fknownBlk(useS1?boff2.size():1,0);   // C's model of F's known blocks
+    std::vector<uint32_t> Fblk_child; std::vector<size_t> Fblk_off; Fblk_off.push_back(0);      // F block k -> region ids
+    double w_blockdef=0;
     // wire byte accumulators (post-z, per category) + f-checkpoint tracking
     double w_root=0, w_linedef=0, w_regiondef=0, w_pathdef=0, w_missing=0, w_framing=0;
     const double FRAME=4;   // 4-byte length prefix per framed message
@@ -192,47 +224,46 @@ int main(int argc,char**argv){
     bool byteexact=true; uint64_t n_marker=0,n_literal=0;
 
     for(size_t t=0; t<TUs; ++t){
-        const uint32_t* rg=&allreg[roff[t]]; size_t rn=roff[t+1]-roff[t];
-        // --- MISSING: region ids in this root that F does not know (first occurrence order) ---
-        std::vector<uint32_t> missReg; msg.clear();
-        for(size_t i=0;i<rn;++i){ uint32_t r=rg[i]; if(!fknownReg[r]){ // will be filled; mark provisionally after building fill
-                bool already=false; for(uint32_t mr:missReg) if(mr==r){already=true;break;} if(!already) missReg.push_back(r); } }
-        // MISSING message = varint(count)+region ids (charged; real round-trip in the 2-proc version)
-        { std::vector<uint8_t> mm; put_varint(mm,missReg.size()); for(uint32_t r:missReg) put_varint(mm,r);
-          if(!mm.empty()){ w_missing += (missReg.empty()?0:zstd_size(z,mm.data(),mm.size(),zlevel,dst)) + (missReg.empty()?0:FRAME); } }
-        // --- FILL: topologically ordered closure of missReg: new paths, new lines, new region defs ---
-        std::vector<uint8_t> fill_paths, fill_lines, fill_regions; uint32_t np=0,nl=0,nr=0;
+        const uint32_t* tk=&tokstream[tokoff[t]]; size_t tn=tokoff[t+1]-tokoff[t];
+        // --- collect NEW regions (incl. new blocks' child regions) + NEW blocks, topological order ---
+        std::vector<uint32_t> missReg, missBlk;
+        auto addRegion=[&](uint32_t r){ if(fknownReg[r])return; for(uint32_t x:missReg) if(x==r) return; missReg.push_back(r); };
+        for(size_t i=0;i<tn;++i){ uint32_t tok=tk[i];
+            if(tok<NREG) addRegion(tok);
+            else { uint32_t k=tok-NREG; if(!fknownBlk[k]){ bool dup=false; for(uint32_t x:missBlk) if(x==k){dup=true;break;} if(!dup){ for(size_t j=boff2[k];j<boff2[k+1];++j) addRegion(bchild[j]); missBlk.push_back(k); } } } }
+        // MISSING = unknown region ids + unknown block ids (F requests; real round-trip in 2-proc)
+        { std::vector<uint8_t> mm; put_varint(mm,missReg.size()); for(uint32_t r:missReg) put_varint(mm,r); put_varint(mm,missBlk.size()); for(uint32_t k:missBlk) put_varint(mm,NREG+k);
+          if(!missReg.empty()||!missBlk.empty()){ w_missing += zstd_size(z,mm.data(),mm.size(),zlevel,dst) + FRAME; } }
+        // --- FILL: new paths, new lines, new region defs, new block defs (topological) ---
+        std::vector<uint8_t> fill_paths, fill_lines, fill_regions, fill_blocks; uint32_t np=0,nl=0,nr=0,nb=0;
         for(uint32_t r:missReg){ const uint32_t* lids=dict.region_ids_ptr(r); uint32_t c=dict.region_ids_count(r);
-            // new lines in this region
             for(uint32_t j=0;j<c;++j){ uint32_t ln=lids[j]; if(fknownLine[ln]) continue; fknownLine[ln]=1; ++nl;
                 const LineRef& lr=dict.ref(ln); const char* txt=dict.line_data(lr.off);
-                if(useD1 && parse_marker(txt,lr.len,mk)){ // D1 MARKER kind
-                    uint32_t pid; auto it=pathid.find(mk.path); if(it==pathid.end()){ pid=uint32_t(paths.size()); pathid.emplace(mk.path,pid); paths.push_back(mk.path);
+                if(useD1 && parse_marker(txt,lr.len,mk)){ uint32_t pid; auto it=pathid.find(mk.path); if(it==pathid.end()){ pid=uint32_t(paths.size()); pathid.emplace(mk.path,pid); paths.push_back(mk.path);
                         put_varint(fill_paths,mk.path.size()); fill_paths.insert(fill_paths.end(),mk.path.begin(),mk.path.end()); ++np; } else pid=it->second;
                     fill_lines.push_back(1); put_varint(fill_lines,pid); put_varint(fill_lines,mk.lineno); fill_lines.push_back(uint8_t(mk.flags.size())); for(uint8_t f:mk.flags) fill_lines.push_back(f); ++n_marker;
-                } else { // LITERAL kind (0). D2 relative-LZ optionally encodes the bytes.
-                    fill_lines.push_back(0);
+                } else { fill_lines.push_back(0);
 #ifdef HAVE_DEFCODEC
                     if(useD2){ segbuf.clear(); encC.encode((const uint8_t*)txt,lr.len,segbuf); put_varint(fill_lines,lr.len); put_varint(fill_lines,segbuf.size()); fill_lines.insert(fill_lines.end(),segbuf.begin(),segbuf.end()); }
                     else { put_varint(fill_lines,lr.len); fill_lines.insert(fill_lines.end(),txt,txt+lr.len); }
 #else
                     put_varint(fill_lines,lr.len); fill_lines.insert(fill_lines.end(),txt,txt+lr.len);
 #endif
-                    ++n_literal;
-                }
+                    ++n_literal; }
             }
-            // region def = varint(count)+line ids
             put_varint(fill_regions,c); for(uint32_t j=0;j<c;++j) put_varint(fill_regions,lids[j]); fknownReg[r]=1; ++nr;
         }
-        if(np){ w_pathdef += zstd_size(z,fill_paths.data(),fill_paths.size(),zlevel,dst); }
-        if(nl){ w_linedef += zstd_size(z,fill_lines.data(),fill_lines.size(),zlevel,dst); }
-        if(nr){ w_regiondef += zstd_size(z,fill_regions.data(),fill_regions.size(),zlevel,dst); }
-        if(np||nl||nr) w_framing += FRAME;   // one FILL frame
-        // --- ROOT: region-id sequence ---
-        std::vector<uint8_t> rootb; for(size_t i=0;i<rn;++i) put_varint(rootb,rg[i]);
+        for(uint32_t k:missBlk){ put_varint(fill_blocks, boff2[k+1]-boff2[k]); for(size_t j=boff2[k];j<boff2[k+1];++j) put_varint(fill_blocks, bchild[j]); fknownBlk[k]=1; ++nb; }
+        if(np) w_pathdef += zstd_size(z,fill_paths.data(),fill_paths.size(),zlevel,dst);
+        if(nl) w_linedef += zstd_size(z,fill_lines.data(),fill_lines.size(),zlevel,dst);
+        if(nr) w_regiondef += zstd_size(z,fill_regions.data(),fill_regions.size(),zlevel,dst);
+        if(nb) w_blockdef += zstd_size(z,fill_blocks.data(),fill_blocks.size(),zlevel,dst);
+        if(np||nl||nr||nb) w_framing += FRAME;
+        // --- ROOT: token stream (region + block ids) ---
+        std::vector<uint8_t> rootb; for(size_t i=0;i<tn;++i) put_varint(rootb,tk[i]);
         w_root += zstd_size(z,rootb.data(),rootb.size(),zlevel,dst); w_framing += FRAME;
 
-        // --- DECODER (F): install FILL from wire bytes into F's OWN store, then expand ROOT ---
+        // --- DECODER (F): install FILL from wire into F's OWN store, then expand ROOT tokens ---
         { const uint8_t* pp=fill_paths.data(); for(uint32_t k=0;k<np;++k){ uint64_t L=get_varint(pp); Fpaths.emplace_back((const char*)pp,(size_t)L); pp+=L; } }
         { const uint8_t* pp=fill_lines.data(), *pe=fill_lines.data()+fill_lines.size();
           while(pp<pe){ uint8_t kind=*pp++;
@@ -248,30 +279,31 @@ int main(int argc,char**argv){
             } } }
         { const uint8_t* pp=fill_regions.data(), *pe=fill_regions.data()+fill_regions.size();
           while(pp<pe){ uint64_t c=get_varint(pp); for(uint64_t j=0;j<c;++j) Freg_child.push_back(uint32_t(get_varint(pp))); Freg_off.push_back(Freg_child.size()); } }
-        // expand ROOT (region ids -> F line ids -> F line bytes) entirely from F's decoded store
+        { const uint8_t* pp=fill_blocks.data(), *pe=fill_blocks.data()+fill_blocks.size();
+          while(pp<pe){ uint64_t c=get_varint(pp); for(uint64_t j=0;j<c;++j) Fblk_child.push_back(uint32_t(get_varint(pp))); Fblk_off.push_back(Fblk_child.size()); } }
         recon.clear();
+        auto emitRegionF=[&](uint32_t r){ for(size_t j=Freg_off[r];j<Freg_off[r+1];++j){ uint32_t ln=Freg_child[j]; recon.insert(recon.end(), Fline_data.begin()+Fline_off[ln-1], Fline_data.begin()+Fline_off[ln]); } };
         { const uint8_t* pp=rootb.data(), *pe=rootb.data()+rootb.size();
-          while(pp<pe){ uint32_t r=uint32_t(get_varint(pp)); for(size_t j=Freg_off[r];j<Freg_off[r+1];++j){ uint32_t ln=Freg_child[j]; recon.insert(recon.end(), Fline_data.begin()+Fline_off[ln-1], Fline_data.begin()+Fline_off[ln]); } } }
+          while(pp<pe){ uint32_t tok=uint32_t(get_varint(pp));
+            if(tok<NREG) emitRegionF(tok);
+            else { uint32_t k=tok-NREG; for(size_t j=Fblk_off[k];j<Fblk_off[k+1];++j) emitRegionF(Fblk_child[j]); } } }
         const char* orig=corpus.bytes.data()+corpus.files[t].off; uint32_t olen=corpus.files[t].len;
         if(recon.size()!=olen || memcmp(recon.data(),orig,olen)!=0){ byteexact=false; if(t<5||TUs<10) fprintf(stderr,"BYTE-EXACT FAIL TU %zu (%zu vs %u)\n",t,recon.size(),olen); }
-        // --- accounting checkpoints ---
-        double tu_wire = 0; // recompute this TU's wire from the deltas we just added is awkward; track cumulative
-        (void)tu_wire;
         cum_raw += olen;
-        double cur_wire = w_root+w_linedef+w_regiondef+w_pathdef+w_missing+w_framing;
+        double cur_wire = w_root+w_linedef+w_regiondef+w_pathdef+w_blockdef+w_missing+w_framing;
         perTU_raw[t]=olen; perTU_wire[t]=cur_wire - cum_wire; cum_wire=cur_wire;
         while(ckidx<ck_f.size() && double(cum_raw)>=ck_f[ckidx]*corpus.raw){ ck.push_back({ck_f[ckidx], double(cum_raw)/cum_wire}); ++ckidx; }
     }
     while(ck.size()<ck_f.size()) ck.push_back({ck_f[ck.size()], double(cum_raw)/cum_wire});
     ZSTD_freeCCtx(z);
 
-    double totalwire = w_root+w_linedef+w_regiondef+w_pathdef+w_missing+w_framing;
+    double totalwire = w_root+w_linedef+w_regiondef+w_pathdef+w_blockdef+w_missing+w_framing;
     double MiB=1048576.0;
-    printf("\n==== CODEC-50 (V1 Lines+Regions%s%s, z%d) — %s ====\n", useD1?"+D1":"", useD2?"+D2":"", zlevel, manifest);
-    printf("byte-exact=%s  TUs=%zu raw=%.1f MiB regions=%u distinct_lines=%u paths=%zu (marker_lines=%llu literal_lines=%llu)\n",
-        byteexact?"OK":"FAIL",TUs,corpus.raw/MiB,NREG,dict.distinct(),paths.size(),(unsigned long long)n_marker,(unsigned long long)n_literal);
-    printf("wire by category (post-z%d, bytes): root=%.0f line_def=%.0f region_def=%.0f path_def=%.0f missing=%.0f framing=%.0f  TOTAL=%.0f (%.2f MiB)\n",
-        zlevel,w_root,w_linedef,w_regiondef,w_pathdef,w_missing,w_framing,totalwire,totalwire/MiB);
+    printf("\n==== CODEC-50 (%s%s%s, z%d) — %s ====\n", useS1?"V1+S1(LZ blocks)":"V1", useD1?"+D1":"", useD2?"+D2":"", zlevel, manifest);
+    printf("byte-exact=%s  TUs=%zu raw=%.1f MiB regions=%u distinct_lines=%u paths=%zu blocks=%zu (marker_lines=%llu literal_lines=%llu)\n",
+        byteexact?"OK":"FAIL",TUs,corpus.raw/MiB,NREG,dict.distinct(),paths.size(),boff2.size()-1,(unsigned long long)n_marker,(unsigned long long)n_literal);
+    printf("wire by category (post-z%d, bytes): root=%.0f line_def=%.0f region_def=%.0f block_def=%.0f path_def=%.0f missing=%.0f framing=%.0f  TOTAL=%.0f (%.2f MiB)\n",
+        zlevel,w_root,w_linedef,w_regiondef,w_blockdef,w_pathdef,w_missing,w_framing,totalwire,totalwire/MiB);
     printf("FinalRatio (raw / total wire, one cold pass) = %.1fx\n", corpus.raw/totalwire);
     printf("H200 f-checkpoints (cum raw fraction -> cumulative ratio):\n");
     for(auto&c:ck) printf("  f=%.2f  ratio=%.0fx\n",c.first,c.second);
