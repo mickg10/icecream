@@ -258,7 +258,7 @@ int main(int argc,char**argv){
 #endif
     RelLZ relC, relF; if(useD2mine){ relC.reset(); relF.reset(); }   // inline relative-LZ line codec
     bool byteexact=true; uint64_t n_marker=0,n_literal=0;
-    std::vector<uint8_t> allLineDefs, allRoots;   // diagnostic: batched-z3 floor (cross-message headroom)
+    std::vector<uint8_t> allLineDefs, allRoots, allRegions, allBlocks, allPaths, allMiss;   // diagnostic: batched-z3 floor (cross-message headroom)
 
     for(size_t t=0; t<TUs; ++t){
         const uint32_t* tk=&tokstream[tokoff[t]]; size_t tn=tokoff[t+1]-tokoff[t];
@@ -270,7 +270,7 @@ int main(int argc,char**argv){
             else { uint32_t k=tok-NREG; if(!fknownBlk[k]){ bool dup=false; for(uint32_t x:missBlk) if(x==k){dup=true;break;} if(!dup){ for(size_t j=boff2[k];j<boff2[k+1];++j) addRegion(bchild[j]); missBlk.push_back(k); } } } }
         // MISSING = unknown region ids + unknown block ids (F requests; real round-trip in 2-proc)
         { std::vector<uint8_t> mm; put_varint(mm,missReg.size()); for(uint32_t r:missReg) put_varint(mm,r); put_varint(mm,missBlk.size()); for(uint32_t k:missBlk) put_varint(mm,NREG+k);
-          if(!missReg.empty()||!missBlk.empty()){ w_missing += zstd_size(z,mm.data(),mm.size(),zlevel,dst) + FRAME; } }
+          if(!missReg.empty()||!missBlk.empty()){ w_missing += zstd_size(z,mm.data(),mm.size(),zlevel,dst) + FRAME; allMiss.insert(allMiss.end(),mm.begin(),mm.end()); } }
         // --- FILL: new paths, new lines, new region defs, new block defs (topological) ---
         std::vector<uint8_t> fill_paths, fill_lines, fill_regions, fill_blocks; uint32_t np=0,nl=0,nr=0,nb=0;
         for(uint32_t r:missReg){ const uint32_t* lids=dict.region_ids_ptr(r); uint32_t c=dict.region_ids_count(r);
@@ -293,10 +293,10 @@ int main(int argc,char**argv){
             if(bcopy_ok[k]){ fill_blocks.push_back(1); put_varint(fill_blocks,bcopy_src[k]); put_varint(fill_blocks,L); }   // COPY(region-stream src,len)
             else { fill_blocks.push_back(0); put_varint(fill_blocks,L); for(size_t j=boff2[k];j<boff2[k+1];++j) put_varint(fill_blocks,bchild[j]); }
             fknownBlk[k]=1; ++nb; }
-        if(np) w_pathdef += zstd_size(z,fill_paths.data(),fill_paths.size(),zlevel,dst);
+        if(np){ w_pathdef += zstd_size(z,fill_paths.data(),fill_paths.size(),zlevel,dst); allPaths.insert(allPaths.end(),fill_paths.begin(),fill_paths.end()); }
         if(nl){ w_linedef += zstd_size(z,fill_lines.data(),fill_lines.size(),zlevel,dst); allLineDefs.insert(allLineDefs.end(),fill_lines.begin(),fill_lines.end()); }
-        if(nr) w_regiondef += zstd_size(z,fill_regions.data(),fill_regions.size(),zlevel,dst);
-        if(nb) w_blockdef += zstd_size(z,fill_blocks.data(),fill_blocks.size(),zlevel,dst);
+        if(nr){ w_regiondef += zstd_size(z,fill_regions.data(),fill_regions.size(),zlevel,dst); allRegions.insert(allRegions.end(),fill_regions.begin(),fill_regions.end()); }
+        if(nb){ w_blockdef += zstd_size(z,fill_blocks.data(),fill_blocks.size(),zlevel,dst); allBlocks.insert(allBlocks.end(),fill_blocks.begin(),fill_blocks.end()); }
         if(np||nl||nr||nb) w_framing += FRAME;
         // --- ROOT: token stream (region + block ids) ---
         std::vector<uint8_t> rootb; for(size_t i=0;i<tn;++i) put_varint(rootb,tk[i]);
@@ -347,9 +347,56 @@ int main(int argc,char**argv){
     printf("FinalRatio (raw / total wire, one cold pass) = %.1fx\n", corpus.raw/totalwire);
     { ZSTD_CCtx* z2=ZSTD_createCCtx(); std::vector<uint8_t> d2b;
       double bl=allLineDefs.empty()?0:zstd_size(z2,allLineDefs.data(),allLineDefs.size(),zlevel,d2b);
-      double br=allRoots.empty()?0:zstd_size(z2,allRoots.data(),allRoots.size(),zlevel,d2b); ZSTD_freeCCtx(z2);
+      double br=allRoots.empty()?0:zstd_size(z2,allRoots.data(),allRoots.size(),zlevel,d2b);
+      // long-distance structure ceiling for line_def: z3 with unbounded window + LDM (what a perfect
+      // relative-LZ OBJECT achieves — diagnostic only; the wire uses default-window per-message z3).
+      double bl_ldm=0;
+      if(!allLineDefs.empty()){ ZSTD_CCtx_reset(z2,ZSTD_reset_session_and_parameters); ZSTD_CCtx_setParameter(z2,ZSTD_c_compressionLevel,zlevel);
+        ZSTD_CCtx_setParameter(z2,ZSTD_c_enableLongDistanceMatching,1); ZSTD_CCtx_setParameter(z2,ZSTD_c_windowLog,27);
+        size_t bnd=ZSTD_compressBound(allLineDefs.size()); if(d2b.size()<bnd)d2b.resize(bnd); bl_ldm=double(ZSTD_compress2(z2,d2b.data(),d2b.size(),allLineDefs.data(),allLineDefs.size())); }
+      // FULL streamed floor: batch-compress EVERY category (what a persistent shared-window streaming
+      // codec reaches by capturing cross-message redundancy) — the real z3 ceiling for this structure.
+      auto batch=[&](std::vector<uint8_t>&v){ return v.empty()?0.0:zstd_size(z2,v.data(),v.size(),zlevel,d2b); };
+      double fl_line=bl, fl_root=br, fl_reg=batch(allRegions), fl_blk=batch(allBlocks), fl_path=batch(allPaths), fl_miss=batch(allMiss);
+      ZSTD_freeCCtx(z2);
+      double fullfloor=fl_line+fl_root+fl_reg+fl_blk+fl_path+fl_miss+w_framing;
       double alt=totalwire - w_linedef - w_root + bl + br;
-      printf("DIAG batched-z%d floor: line_def %.0f->%.0f  root %.0f->%.0f  => if streamed: TOTAL=%.0f ratio=%.0fx (cross-message headroom)\n",zlevel,w_linedef,bl,w_root,br,alt,corpus.raw/alt); }
+      double altldm=totalwire - w_linedef + bl_ldm;
+      printf("DIAG batched-z%d floor: line_def %.0f->%.0f  root %.0f->%.0f  => streamed TOTAL=%.0f ratio=%.0fx\n",zlevel,w_linedef,bl,w_root,br,alt,corpus.raw/alt);
+      printf("DIAG FULL streamed floor (all cats batched z%d): line=%.2f reg=%.2f blk=%.2f path=%.2f miss=%.2f root=%.2f => %.2f MiB ratio=%.0fx\n",
+        zlevel,fl_line/MiB,fl_reg/MiB,fl_blk/MiB,fl_path/MiB,fl_miss/MiB,fl_root/MiB,fullfloor/MiB,corpus.raw/fullfloor);
+      printf("DIAG long-distance ceiling: line_def z%d+LDM+win27 = %.0f (%.2f MiB) => TOTAL=%.0f ratio=%.0fx  [what a perfect relative-LZ OBJECT could reach]\n",zlevel,bl_ldm,bl_ldm/MiB,altldm,corpus.raw/altldm);
+      // entropy ladder on the distinct-line dictionary leg: is 8.47MB a z3-level wall or an information floor?
+      if(!allLineDefs.empty()){ printf("DIAG line_def entropy ladder (%.2f MiB raw, %.0f distinct literal lines):\n",allLineDefs.size()/MiB,double(n_literal));
+        for(int lv:{3,9,19,22}){ ZSTD_CCtx* zc=ZSTD_createCCtx(); ZSTD_CCtx_setParameter(zc,ZSTD_c_compressionLevel,lv);
+          ZSTD_CCtx_setParameter(zc,ZSTD_c_enableLongDistanceMatching,1); ZSTD_CCtx_setParameter(zc,ZSTD_c_windowLog,27);
+          size_t bnd=ZSTD_compressBound(allLineDefs.size()); std::vector<uint8_t> ob(bnd);
+          size_t r=ZSTD_compress2(zc,ob.data(),bnd,allLineDefs.data(),allLineDefs.size()); ZSTD_freeCCtx(zc);
+          double t=totalwire - w_linedef + double(r);
+          printf("    z%-2d = %.2f MiB (%.1f B/line)  => TOTAL ratio=%.0fx\n",lv,r/MiB,double(r)/double(n_literal),corpus.raw/t); }
+        // Is z19's win reachable at z3 by a REORDER? Cluster similar distinct lines adjacent so z3's
+        // greedy matcher finds what z19 finds by deep search. Sort lexicographically + front-code
+        // (shared-prefix-len + suffix) — a fully z3-legal structural transform, not a level bump.
+        uint32_t D=dict.distinct(); std::vector<uint32_t> ids; ids.reserve(D);
+        for(uint32_t id=1;id<=D;++id) ids.push_back(id);
+        auto txt=[&](uint32_t id,uint32_t&len){ const LineRef&r=dict.ref(id); len=r.len; return dict.line_data(r.off); };
+        std::sort(ids.begin(),ids.end(),[&](uint32_t a,uint32_t b){ uint32_t la,lb; const char*pa=txt(a,la),*pb=txt(b,lb);
+          int c=memcmp(pa,pb,la<lb?la:lb); return c!=0? c<0 : la<lb; });
+        std::vector<uint8_t> sorted_cat, frontcoded; sorted_cat.reserve(dict.distinct_line_bytes());
+        const char* prevp=nullptr; uint32_t prevl=0;
+        for(uint32_t id:ids){ uint32_t l; const char*p=txt(id,l);
+          sorted_cat.insert(sorted_cat.end(),p,p+l);
+          uint32_t cp=0, m=l<prevl?l:prevl; while(cp<m && p[cp]==prevp[cp]) ++cp;
+          put_varint(frontcoded,cp); put_varint(frontcoded,l-cp); frontcoded.insert(frontcoded.end(),p+cp,p+l);
+          prevp=p; prevl=l; }
+        ZSTD_CCtx* zs=ZSTD_createCCtx(); std::vector<uint8_t> sb(ZSTD_compressBound(std::max(sorted_cat.size(),frontcoded.size())));
+        ZSTD_CCtx_setParameter(zs,ZSTD_c_compressionLevel,zlevel);
+        size_t rs=ZSTD_compress2(zs,sb.data(),sb.size(),sorted_cat.data(),sorted_cat.size());
+        ZSTD_CCtx_reset(zs,ZSTD_reset_session_and_parameters); ZSTD_CCtx_setParameter(zs,ZSTD_c_compressionLevel,zlevel);
+        size_t rf=ZSTD_compress2(zs,sb.data(),sb.size(),frontcoded.data(),frontcoded.size()); ZSTD_freeCCtx(zs);
+        printf("DIAG reorder test (z%d-legal structure vs z19's 5.96MiB):\n",zlevel);
+        printf("    sorted-concat z%d       = %.2f MiB (%.1f B/line)\n",zlevel,rs/MiB,double(rs)/double(n_literal));
+        printf("    sorted+front-coded z%d  = %.2f MiB (%.1f B/line)  [+perm cost ~%.2f MiB to send ids]\n",zlevel,rf/MiB,double(rf)/double(n_literal),double(D)*2.2/MiB); } }
     printf("H200 f-checkpoints (cum raw fraction -> cumulative ratio):\n");
     for(auto&c:ck) printf("  f=%.2f  ratio=%.0fx\n",c.first,c.second);
     // trailing-window (5% raw) ratio near the end
