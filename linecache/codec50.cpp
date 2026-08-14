@@ -129,6 +129,8 @@ static Corpus load_corpus(const char*manifest,size_t max_files){
 }
 static inline void put_varint(std::vector<uint8_t>&o,uint64_t v){ while(v>=0x80){o.push_back(uint8_t(v)|0x80);v>>=7;} o.push_back(uint8_t(v)); }
 static inline uint64_t get_varint(const uint8_t*&p){ uint64_t v=0; int s=0; for(;;){ uint8_t b=*p++; v|=uint64_t(b&0x7f)<<s; if(!(b&0x80))break; s+=7; } return v; }
+static inline void put_zigzag(std::vector<uint8_t>&o,int64_t v){ put_varint(o,(uint64_t(v)<<1)^uint64_t(v>>63)); }
+static inline int64_t get_zigzag(const uint8_t*&p){ uint64_t u=get_varint(p); return int64_t(u>>1)^-int64_t(u&1); }
 static size_t zstd_size(ZSTD_CCtx*c,const uint8_t*data,size_t n,int level,std::vector<uint8_t>&dst){ ZSTD_CCtx_reset(c,ZSTD_reset_session_and_parameters); ZSTD_CCtx_setParameter(c,ZSTD_c_compressionLevel,level);
     size_t bound=ZSTD_compressBound(n); if(dst.size()<bound)dst.resize(bound); size_t r=ZSTD_compress2(c,dst.data(),dst.size(),data?data:(const uint8_t*)"",n); if(ZSTD_isError(r)){fprintf(stderr,"zstd %s\n",ZSTD_getErrorName(r));exit(2);} return r; }
 
@@ -202,20 +204,21 @@ int main(int argc,char**argv){
     std::vector<uint32_t> bchild; std::vector<size_t> boff2; boff2.push_back(0);
     std::unordered_map<uint64_t,uint32_t> bdict;
     std::vector<uint32_t> tokstream; std::vector<size_t> tokoff; tokoff.push_back(0);
+    std::vector<uint32_t> bcopy_src; std::vector<uint8_t> bcopy_ok;   // block k: def as COPY(src,len) if ok (source in prior TUs)
     if(useS1){
         size_t NS=allreg.size(); uint32_t MINMATCH=3, MAXCHAIN=64, hbits=22;
         std::vector<uint32_t> head(size_t(1)<<hbits, UINT32_MAX), prevp(NS, UINT32_MAX);
         auto kgram=[&](size_t i)->uint64_t{ uint64_t h=1469598103934665603ULL; for(uint32_t j=0;j<MINMATCH;++j){ h^=allreg[i+j]; h*=1099511628211ULL; } return (h*0x9E3779B97F4A7C15ULL)>>(64-hbits); };
-        auto block_get=[&](const uint32_t*p,size_t L)->uint32_t{ uint64_t h=1469598103934665603ULL^(L*0x100000001b3ULL); for(size_t j=0;j<L;++j){h^=p[j];h*=1099511628211ULL;}
+        auto block_get=[&](const uint32_t*p,size_t L,uint32_t srcpos,uint8_t copyok)->uint32_t{ uint64_t h=1469598103934665603ULL^(L*0x100000001b3ULL); for(size_t j=0;j<L;++j){h^=p[j];h*=1099511628211ULL;}
             auto it=bdict.find(h); if(it!=bdict.end()){ uint32_t k=it->second; if(boff2[k+1]-boff2[k]==L && memcmp(&bchild[boff2[k]],p,L*4)==0) return NREG+k; }
-            uint32_t k=uint32_t(boff2.size()-1); bchild.insert(bchild.end(),p,p+L); boff2.push_back(bchild.size()); if(it==bdict.end()) bdict.emplace(h,k); return NREG+k; };
+            uint32_t k=uint32_t(boff2.size()-1); bchild.insert(bchild.end(),p,p+L); boff2.push_back(bchild.size()); bcopy_src.push_back(srcpos); bcopy_ok.push_back(copyok); if(it==bdict.end()) bdict.emplace(h,k); return NREG+k; };
         auto tb=Clock::now();
         for(size_t t=0;t<TUs;++t){ size_t a=roff[t],b=roff[t+1]; size_t i=a;
             while(i<b){ size_t bestL=0,bestP=0;
                 if(i+MINMATCH<=b && i+MINMATCH<=NS){ uint32_t cand=head[kgram(i)],chain=0;
                     while(cand!=UINT32_MAX&&chain<MAXCHAIN){ if(cand<i){ size_t L=0,mx=b-i; while(L<mx&&allreg[cand+L]==allreg[i+L])++L; if(L>=MINMATCH&&L>bestL){bestL=L;bestP=cand;if(L==mx)break;} } cand=prevp[cand]; ++chain; } }
                 size_t step; (void)bestP;
-                if(bestL>=MINMATCH){ tokstream.push_back(block_get(&allreg[i],bestL)); step=bestL; }
+                if(bestL>=MINMATCH){ tokstream.push_back(block_get(&allreg[i],bestL,uint32_t(bestP),(bestP+bestL<=roff[t])?1:0)); step=bestL; }
                 else { tokstream.push_back(allreg[i]); step=1; }
                 for(size_t j=i;j<i+step;++j){ if(j+MINMATCH<=NS){ uint64_t g=kgram(j); prevp[j]=head[g]; head[g]=uint32_t(j); } }
                 i+=step; }
@@ -238,6 +241,7 @@ int main(int argc,char**argv){
     std::vector<std::string> Fpaths;
     std::vector<uint8_t> fknownBlk(useS1?boff2.size():1,0);   // C's model of F's known blocks
     std::vector<uint32_t> Fblk_child; std::vector<size_t> Fblk_off; Fblk_off.push_back(0);      // F block k -> region ids
+    std::vector<uint32_t> Freg_stream; Freg_stream.reserve(allreg.size());   // F's reconstructed region occurrence stream (for block COPY defs)
     double w_blockdef=0;
     // wire byte accumulators (post-z, per category) + f-checkpoint tracking
     double w_root=0, w_linedef=0, w_regiondef=0, w_pathdef=0, w_missing=0, w_framing=0;
@@ -283,9 +287,12 @@ int main(int argc,char**argv){
                     else { put_varint(fill_lines,lr.len); fill_lines.insert(fill_lines.end(),txt,txt+lr.len); }
                     ++n_literal; }
             }
-            put_varint(fill_regions,c); for(uint32_t j=0;j<c;++j) put_varint(fill_regions,lids[j]); fknownReg[r]=1; ++nr;
+            put_varint(fill_regions,c); { int64_t prev=0; for(uint32_t j=0;j<c;++j){ put_zigzag(fill_regions,int64_t(lids[j])-prev); prev=int64_t(lids[j]); } } fknownReg[r]=1; ++nr;
         }
-        for(uint32_t k:missBlk){ put_varint(fill_blocks, boff2[k+1]-boff2[k]); for(size_t j=boff2[k];j<boff2[k+1];++j) put_varint(fill_blocks, bchild[j]); fknownBlk[k]=1; ++nb; }
+        for(uint32_t k:missBlk){ size_t L=boff2[k+1]-boff2[k];
+            if(bcopy_ok[k]){ fill_blocks.push_back(1); put_varint(fill_blocks,bcopy_src[k]); put_varint(fill_blocks,L); }   // COPY(region-stream src,len)
+            else { fill_blocks.push_back(0); put_varint(fill_blocks,L); for(size_t j=boff2[k];j<boff2[k+1];++j) put_varint(fill_blocks,bchild[j]); }
+            fknownBlk[k]=1; ++nb; }
         if(np) w_pathdef += zstd_size(z,fill_paths.data(),fill_paths.size(),zlevel,dst);
         if(nl){ w_linedef += zstd_size(z,fill_lines.data(),fill_lines.size(),zlevel,dst); allLineDefs.insert(allLineDefs.end(),fill_lines.begin(),fill_lines.end()); }
         if(nr) w_regiondef += zstd_size(z,fill_regions.data(),fill_regions.size(),zlevel,dst);
@@ -309,11 +316,13 @@ int main(int argc,char**argv){
               else { uint64_t len=get_varint(pp); Fline_data.insert(Fline_data.end(),pp,pp+len); pp+=len; Fline_off.push_back(Fline_data.size()); }
             } } }
         { const uint8_t* pp=fill_regions.data(), *pe=fill_regions.data()+fill_regions.size();
-          while(pp<pe){ uint64_t c=get_varint(pp); for(uint64_t j=0;j<c;++j) Freg_child.push_back(uint32_t(get_varint(pp))); Freg_off.push_back(Freg_child.size()); } }
+          while(pp<pe){ uint64_t c=get_varint(pp); int64_t prev=0; for(uint64_t j=0;j<c;++j){ prev+=get_zigzag(pp); Freg_child.push_back(uint32_t(prev)); } Freg_off.push_back(Freg_child.size()); } }
         { const uint8_t* pp=fill_blocks.data(), *pe=fill_blocks.data()+fill_blocks.size();
-          while(pp<pe){ uint64_t c=get_varint(pp); for(uint64_t j=0;j<c;++j) Fblk_child.push_back(uint32_t(get_varint(pp))); Fblk_off.push_back(Fblk_child.size()); } }
+          while(pp<pe){ uint8_t kind=*pp++;
+            if(kind==1){ uint64_t src=get_varint(pp); uint64_t L=get_varint(pp); for(uint64_t j=0;j<L;++j) Fblk_child.push_back(Freg_stream[src+j]); Fblk_off.push_back(Fblk_child.size()); }
+            else { uint64_t L=get_varint(pp); for(uint64_t j=0;j<L;++j) Fblk_child.push_back(uint32_t(get_varint(pp))); Fblk_off.push_back(Fblk_child.size()); } } }
         recon.clear();
-        auto emitRegionF=[&](uint32_t r){ for(size_t j=Freg_off[r];j<Freg_off[r+1];++j){ uint32_t ln=Freg_child[j]; recon.insert(recon.end(), Fline_data.begin()+Fline_off[ln-1], Fline_data.begin()+Fline_off[ln]); } };
+        auto emitRegionF=[&](uint32_t r){ Freg_stream.push_back(r); for(size_t j=Freg_off[r];j<Freg_off[r+1];++j){ uint32_t ln=Freg_child[j]; recon.insert(recon.end(), Fline_data.begin()+Fline_off[ln-1], Fline_data.begin()+Fline_off[ln]); } };
         { const uint8_t* pp=rootb.data(), *pe=rootb.data()+rootb.size();
           while(pp<pe){ uint32_t tok=uint32_t(get_varint(pp));
             if(tok<NREG) emitRegionF(tok);
