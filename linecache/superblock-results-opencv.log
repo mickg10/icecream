@@ -1,0 +1,2 @@
+loaded+interned in 9.1s: TUs=1506 raw=4630994774 distinct_lines=586099 line_occ=159014620 region_occ=6131525 distinct_regions=94534
+byte-exactness anchors OK (raw == line-id stream == region-id expansion)

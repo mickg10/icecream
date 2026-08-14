@@ -1,0 +1,102 @@
+loaded+interned in 7.8s: TUs=622 raw=3114320596 distinct_lines=587613 line_occ=110485751 region_occ=4358454 distinct_regions=641506
+byte-exactness anchors OK (raw == line-id stream == region-id expansion)
+S_bpe_line BPE:
+    round 0: cands=154673 tok 110486373 -> 56227650 (rules=154673)
+    round 1: cands=211361 tok 56227650 -> 29156728 (rules=366034)
+    round 2: cands=240820 tok 29156728 -> 15671996 (rules=606854)
+    round 3: cands=234913 tok 15671996 -> 8999283 (rules=841767)
+    round 4: cands=184344 tok 8999283 -> 5859098 (rules=1026111)
+    round 5: cands=101491 tok 5859098 -> 4484222 (rules=1127602)
+    round 6: cands=51191 tok 4484222 -> 3860690 (rules=1178793)
+    round 7: cands=25669 tok 3860690 -> 3573824 (rules=1204462)
+    round 8: cands=12466 tok 3573824 -> 3436165 (rules=1216928)
+    round 9: cands=6066 tok 3436165 -> 3368635 (rules=1222994)
+    round 10: cands=2832 tok 3368635 -> 3335781 (rules=1225826)
+    round 11: cands=1223 tok 3335781 -> 3321711 (rules=1227049)
+    round 12: cands=511 tok 3321711 -> 3315785 (rules=1227560)
+    round 13: cands=206 tok 3315785 -> 3313509 (rules=1227766)
+    round 14: cands=85 tok 3313509 -> 3312453 (rules=1227851)
+    round 15: cands=28 tok 3312453 -> 3312010 (rules=1227879)
+    round 16: cands=3 tok 3312010 -> 3311976 (rules=1227882)
+    round 17: cands=1 tok 3311976 -> 3311960 (rules=1227883)
+    round 18: no pair >= 16, stop
+  built in 24.6s rules=1227883 coverage=98.2% verify=OK
+S_bpe_region BPE:
+    round 0: cands=11472 tok 4359076 -> 2569539 (rules=11472)
+    round 1: cands=11506 tok 2569539 -> 1680091 (rules=22978)
+    round 2: cands=11097 tok 1680091 -> 1243074 (rules=34075)
+    round 3: cands=9189 tok 1243074 -> 1037335 (rules=43264)
+    round 4: cands=5417 tok 1037335 -> 949029 (rules=48681)
+    round 5: cands=2567 tok 949029 -> 911452 (rules=51248)
+    round 6: cands=1162 tok 911452 -> 894779 (rules=52410)
+    round 7: cands=467 tok 894779 -> 888047 (rules=52877)
+    round 8: cands=179 tok 888047 -> 885273 (rules=53056)
+    round 9: cands=62 tok 885273 -> 884277 (rules=53118)
+    round 10: cands=23 tok 884277 -> 883773 (rules=53141)
+    round 11: cands=5 tok 883773 -> 883712 (rules=53146)
+    round 12: cands=2 tok 883712 -> 883690 (rules=53148)
+    round 13: cands=1 tok 883690 -> 883668 (rules=53149)
+    round 14: no pair >= 16, stop
+  built in 1.3s rules=53149 verify=OK
+
+==== SUPERBLOCK COMPRESSION REPORT ====
+corpus: /tanksmall/scratch/ictmp/corpus2/manifest.txt
+TUs=622  raw_source=2970.0 MiB  distinct_lines=587613  line_occ=110485751  region_occ=4358454  distinct_regions=641506
+shared line-text dictionary (amortized) = 42.63 MiB
+
+RECURRING per-TU wire cost (dictionaries amortized; each TU zstd'd independently):
+  perTU-L3      = each TU's occurrence body, zstd-L3, no dictionary (summed)
+  perTU+zdict   = same, but WITH a trained cross-TU zstd dictionary (fair control)
+  whole-L3/L19  = whole corpus batched into one zstd stream (theoretical floor)
+
+encoding                                      perTU-L3    KB/TU perTU+zdict |   whole-L3   wholeL19  cover% verify
+B_global (line-id stream)                    131462582    206.4    51251604 |   17996982    2372970    0.0 OK
+B_local (line-id stream, per-TU local remap + keyset)   131750690    206.9   124337849 |  123613833   61334303    0.0 OK
+S_region (marker regions)                      8517291     13.4     2252344 |    1567377    1443143   98.0 OK
+S_bpe_line (general line-runs)                 6611110     10.4     4215644 |    3947050    2447834   98.2 OK
+S_bpe_region ((a)+(b) super-regions)           1766622      2.8     1351461 |    1588479    1510727   98.0 OK
+
+AMORTIZED artifacts (sent once over all jobs): superblock dict = composition table/grammar;
+zdict = the trained zstd dictionary used by the perTU+zdict column.
+encoding                                       dict_raw     dict-L3    zdict_sz     blocks
+B_global (line-id stream)                             0           0      262144     587613
+B_local (line-id stream, per-TU local remap + keyset)            0           0      262144     587613
+S_region (marker regions)                       6433524     3098068       64556     641506
+S_bpe_line (general line-runs)                  7199158     4817998      262144    1227883
+S_bpe_region ((a)+(b) super-regions)            6732065     3300502      262144      53149
+
+---- DECISIVE: does an explicit superblock layer beat zstd on the line-id stream? ----
+baseline B_global line-id stream:  per-TU-L3=131462582 (206.4 KB/TU)  whole-L3=17996982  whole-L19=2372970
+  S_region (marker regions)                per-TU-L3  +93.5%   whole-L3  +91.3%   whole-L19  +39.2%
+  S_bpe_line (general line-runs)           per-TU-L3  +95.0%   whole-L3  +78.1%   whole-L19   -3.2%
+  S_bpe_region ((a)+(b) super-regions)     per-TU-L3  +98.7%   whole-L3  +91.2%   whole-L19  +36.3%
+(positive % = superblock body is SMALLER than the line-id body at that setting.)
+
+---- POISON sensitivity (one line inserted after a common header marker) ----
+modified TUs=622  new distinct lines=+1  new distinct regions=+1 (of 641507)  region_occ(poison)=4358454
+hierarchical superblocks localize the edit: only the poisoned region (and any super-region
+containing it) is new; every other region/superblock is reused unchanged.
+	Command being timed: "taskset -c 4 ./superblock-bench --manifest /tanksmall/scratch/ictmp/corpus2/manifest.txt --zstd19 --bpe-min 16 --poison"
+	User time (seconds): 142.71
+	System time (seconds): 18.58
+	Percent of CPU this job got: 99%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 2:42.12
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 8615512
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 5930169
+	Voluntary context switches: 603
+	Involuntary context switches: 11098
+	Swaps: 0
+	File system inputs: 6085950
+	File system outputs: 10
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+EXIT=0
