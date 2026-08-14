@@ -282,7 +282,7 @@ int main(int argc,char**argv){
         { std::vector<uint8_t> mm; put_varint(mm,missReg.size()); for(uint32_t r:missReg) put_varint(mm,r); put_varint(mm,missBlk.size()); for(uint32_t k:missBlk) put_varint(mm,NREG+k);
           if(!missReg.empty()||!missBlk.empty()){ w_missing += zstd_size(z,mm.data(),mm.size(),zlevel,dst) + FRAME; allMiss.insert(allMiss.end(),mm.begin(),mm.end()); } }
         // --- FILL: new paths, new lines, new region defs, new block defs (topological) ---
-        std::vector<uint8_t> fill_paths, fill_lines, fill_regions, fill_blocks; uint32_t np=0,nl=0,nr=0,nb=0;
+        std::vector<uint8_t> fill_paths, fill_lines, fill_regions, fill_regions_raw, fill_blocks; uint32_t np=0,nl=0,nr=0,nb=0;
         for(uint32_t r:missReg){ const uint32_t* lids=dict.region_ids_ptr(r); uint32_t c=dict.region_ids_count(r);
             for(uint32_t j=0;j<c;++j){ uint32_t ln=lids[j]; if(fknownLine[ln]) continue; fknownLine[ln]=1; ++nl;
                 const LineRef& lr=dict.ref(ln); const char* txt=dict.line_data(lr.off);
@@ -298,7 +298,8 @@ int main(int argc,char**argv){
                     ++n_literal; }
             }
             put_varint(fill_regions,c); { int64_t prev=0; for(uint32_t j=0;j<c;++j){ put_zigzag(fill_regions,int64_t(lids[j])-prev); prev=int64_t(lids[j]); } } fknownReg[r]=1; ++nr;
-            { put_varint(allRegionsRaw,c); for(uint32_t j=0;j<c;++j) put_varint(allRegionsRaw,lids[j]); }   // diag: raw line-ids (cross-region subsequence-preserving)
+            put_varint(fill_regions_raw,c); for(uint32_t j=0;j<c;++j) put_varint(fill_regions_raw,lids[j]);   // adaptive alt: raw line-ids (cross-region subsequence-preserving; z3 picks the smaller)
+            { put_varint(allRegionsRaw,c); for(uint32_t j=0;j<c;++j) put_varint(allRegionsRaw,lids[j]); }   // diag
         }
         for(uint32_t k:missBlk){ size_t L=boff2[k+1]-boff2[k];
             if(bcopy_ok[k]){ fill_blocks.push_back(1); put_varint(fill_blocks,bcopy_src[k]); put_varint(fill_blocks,L); }   // COPY(region-stream src,len)
@@ -306,7 +307,11 @@ int main(int argc,char**argv){
             fknownBlk[k]=1; ++nb; }
         if(np){ w_pathdef += zstd_size(z,fill_paths.data(),fill_paths.size(),zlevel,dst); allPaths.insert(allPaths.end(),fill_paths.begin(),fill_paths.end()); }
         if(nl){ w_linedef += zstd_size(z,fill_lines.data(),fill_lines.size(),zlevel,dst); allLineDefs.insert(allLineDefs.end(),fill_lines.begin(),fill_lines.end()); }
-        if(nr){ w_regiondef += zstd_size(z,fill_regions.data(),fill_regions.size(),zlevel,dst); allRegions.insert(allRegions.end(),fill_regions.begin(),fill_regions.end()); }
+        bool reg_raw=false;
+        if(nr){ double dz=zstd_size(z,fill_regions.data(),fill_regions.size(),zlevel,dst);
+                double rz=zstd_size(z,fill_regions_raw.data(),fill_regions_raw.size(),zlevel,dst);
+                reg_raw = rz<dz; w_regiondef += (reg_raw?rz:dz) + 1;   // +1 byte serialization flag (delta vs raw line-ids)
+                allRegions.insert(allRegions.end(),fill_regions.begin(),fill_regions.end()); }
         if(nb){ w_blockdef += zstd_size(z,fill_blocks.data(),fill_blocks.size(),zlevel,dst); allBlocks.insert(allBlocks.end(),fill_blocks.begin(),fill_blocks.end()); }
         if(np||nl||nr||nb) w_framing += FRAME;
         // --- ROOT: token stream (region + block ids) ---
@@ -326,7 +331,9 @@ int main(int argc,char**argv){
 #endif
               else { uint64_t len=get_varint(pp); Fline_data.insert(Fline_data.end(),pp,pp+len); pp+=len; Fline_off.push_back(Fline_data.size()); }
             } } }
-        { const uint8_t* pp=fill_regions.data(), *pe=fill_regions.data()+fill_regions.size();
+        if(reg_raw){ const uint8_t* pp=fill_regions_raw.data(), *pe=fill_regions_raw.data()+fill_regions_raw.size();
+          while(pp<pe){ uint64_t c=get_varint(pp); for(uint64_t j=0;j<c;++j) Freg_child.push_back(uint32_t(get_varint(pp))); Freg_off.push_back(Freg_child.size()); } }
+        else { const uint8_t* pp=fill_regions.data(), *pe=fill_regions.data()+fill_regions.size();
           while(pp<pe){ uint64_t c=get_varint(pp); int64_t prev=0; for(uint64_t j=0;j<c;++j){ prev+=get_zigzag(pp); Freg_child.push_back(uint32_t(prev)); } Freg_off.push_back(Freg_child.size()); } }
         { const uint8_t* pp=fill_blocks.data(), *pe=fill_blocks.data()+fill_blocks.size();
           while(pp<pe){ uint8_t kind=*pp++;
