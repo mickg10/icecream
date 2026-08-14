@@ -1,0 +1,24 @@
+== LLVM ==
+byte-exact: OK (line-occ=137913644)
+LZ: min_match=3 max_chain=64  root_tok=87353 (0.0181/region) blocks=11158 matched_regions=98.6%
+BASIS A (cold, EVERYTHING counted): total=10805094  ratio=335x   [line-dict ceiling=472x -> line-text bound]
+BASIS C (warm: Line+Region dicts amortized; block-defs+root+framing counted): total=608834  ratio=5946x
+BASIS B (warm: ALL dicts amortized; recurring root stream only): total=240848  ratio=15031x
+== RocksDB ==
+byte-exact: OK (line-occ=110485751)
+LZ: min_match=3 max_chain=64  root_tok=767853 (0.1762/region) blocks=7422 matched_regions=82.6%
+BASIS A (cold, EVERYTHING counted): total=11304392  ratio=275x   [line-dict ceiling=658x -> line-text bound]
+BASIS C (warm: Line+Region dicts amortized; block-defs+root+framing counted): total=3475109  ratio=896x
+BASIS B (warm: ALL dicts amortized; recurring root stream only): total=1404880  ratio=2217x
+== DuckDB ==
+byte-exact: OK (line-occ=69094918)
+LZ: min_match=3 max_chain=64  root_tok=236898 (0.0940/region) blocks=8081 matched_regions=91.1%
+BASIS A (cold, EVERYTHING counted): total=11892809  ratio=167x   [line-dict ceiling=240x -> line-text bound]
+BASIS C (warm: Line+Region dicts amortized; block-defs+root+framing counted): total=1273067  ratio=1560x
+BASIS B (warm: ALL dicts amortized; recurring root stream only): total=521246  ratio=3810x
+== OpenCV ==
+byte-exact: OK (line-occ=159014620)
+LZ: min_match=3 max_chain=64  root_tok=111888 (0.0182/region) blocks=4730 matched_regions=98.3%
+BASIS A (cold, EVERYTHING counted): total=9300834  ratio=498x   [line-dict ceiling=695x -> line-text bound]
+BASIS C (warm: Line+Region dicts amortized; block-defs+root+framing counted): total=681055  ratio=6800x
+BASIS B (warm: ALL dicts amortized; recurring root stream only): total=291225  ratio=15902x
