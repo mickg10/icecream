@@ -23,10 +23,12 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <string>
 #include <sys/stat.h>
 #include <vector>
@@ -182,6 +184,16 @@ static inline double MB(uint64_t b) { return double(b) / (1024.0 * 1024.0); }
 static inline void bput_varint(std::vector<uint8_t>& o, uint64_t v) {
     while (v >= 0x80) { o.push_back(uint8_t(v) | 0x80); v >>= 7; } o.push_back(uint8_t(v));
 }
+static bool bget_varint(const uint8_t*& p, const uint8_t* end, uint32_t& out) {
+    uint64_t v = 0; unsigned shift = 0;
+    while (p != end && shift <= 28) {
+        uint8_t b = *p++;
+        v |= uint64_t(b & 0x7f) << shift;
+        if (!(b & 0x80)) { if (v > UINT32_MAX) return false; out = uint32_t(v); return true; }
+        shift += 7;
+    }
+    return false;
+}
 
 // ---------------- skeleton-grouped columnar coding (bigoracle §4.2) ----------------
 // Conservatively tokenize each distinct line into a SKELETON (punctuation/keyword/whitespace
@@ -237,17 +249,109 @@ static void run_skeleton(const Distinct& d, uint64_t base_z3, uint64_t front_z3,
     { std::vector<uint32_t> cur(gstart.begin(), gstart.end());
       for (size_t i = 0; i < N; ++i) order[cur[line_skel[i]]++] = uint32_t(i); }
 
+    // Conditional-placement oracle. The existing tid_col stream uses one global first-seen
+    // token ordinal. Before calling that stream irreducible, measure how predictable the token
+    // is from the exact (skeleton, slot-column) context. This is a diagnostic ceiling only:
+    // empirical frequencies know the complete target set and model bytes are not charged.
+    uint64_t context_count = 0, repeated_contexts = 0, repeated_occ = 0;
+    uint64_t top1 = 0, top2 = 0, top4 = 0, top8 = 0, previous_hits = 0;
+    long double entropy_bits = 0.0;
+    std::vector<uint32_t> values, frequencies;
+    for (size_t s = 0; s < num_skel; ++s) {
+        uint32_t begin = gstart[s], end = gstart[s + 1], lines = end - begin;
+        for (uint32_t j = 0; j < skel_nslots[s]; ++j) {
+            ++context_count;
+            if (lines < 2) continue;
+            ++repeated_contexts;
+            repeated_occ += lines;
+            values.clear(); values.reserve(lines);
+            uint32_t previous = UINT32_MAX;
+            for (uint32_t idx = begin; idx < end; ++idx) {
+                uint32_t line = order[idx];
+                uint32_t token = slot_tok[line_slot_start[line] + j];
+                values.push_back(token);
+                if (token == previous) ++previous_hits;
+                previous = token;
+            }
+            std::sort(values.begin(), values.end());
+            frequencies.clear();
+            for (size_t i = 0; i < values.size();) {
+                size_t k = i + 1;
+                while (k < values.size() && values[k] == values[i]) ++k;
+                frequencies.push_back(uint32_t(k - i));
+                i = k;
+            }
+            std::sort(frequencies.begin(), frequencies.end(), std::greater<uint32_t>());
+            long double n = lines;
+            entropy_bits += n * std::log2(n);
+            for (uint32_t f : frequencies) {
+                long double count = static_cast<long double>(f);
+                entropy_bits -= count * std::log2(count);
+            }
+            if (!frequencies.empty()) top1 += frequencies[0];
+            if (frequencies.size() > 1) top2 += frequencies[1];
+            if (frequencies.size() > 2) top4 += frequencies[2];
+            if (frequencies.size() > 3) top4 += frequencies[3];
+            for (size_t i = 4; i < std::min<size_t>(8, frequencies.size()); ++i) top8 += frequencies[i];
+        }
+    }
+    top2 += top1;
+    top4 += top2;
+    top8 += top4;
+
     std::vector<uint8_t> val_col, len_col, tid_col, val_row, len_row, tid_row;
+    std::vector<uint8_t> previous_bits, previous_ids;
+    uint8_t bit_byte = 0, bit_count = 0;
+    auto put_same_bit = [&](bool same) {
+        bit_byte |= uint8_t(same) << bit_count;
+        if (++bit_count == 8) { previous_bits.push_back(bit_byte); bit_byte = bit_count = 0; }
+    };
     // columnar
     for (size_t s = 0; s < num_skel; ++s) {
         uint32_t ns = skel_nslots[s];
-        for (uint32_t j = 0; j < ns; ++j)
+        for (uint32_t j = 0; j < ns; ++j) {
+            uint32_t previous = UINT32_MAX;
             for (uint32_t idx = gstart[s]; idx < gstart[s + 1]; ++idx) {
                 uint32_t line = order[idx], si = line_slot_start[line] + j;
                 val_col.insert(val_col.end(), d.blob.data() + slot_goff[si], d.blob.data() + slot_goff[si] + slot_glen[si]);
                 bput_varint(len_col, slot_glen[si]); bput_varint(tid_col, slot_tok[si]);
+                uint32_t token = slot_tok[si];
+                if (previous == UINT32_MAX) bput_varint(previous_ids, token);
+                else {
+                    bool same = token == previous;
+                    put_same_bit(same);
+                    if (!same) bput_varint(previous_ids, token);
+                }
+                previous = token;
             }
+        }
     }
+    if (bit_count) previous_bits.push_back(bit_byte);
+
+    // Independent decode of the previous-value placement representation.
+    const uint8_t* idp = previous_ids.data();
+    const uint8_t* ide = idp + previous_ids.size();
+    size_t decoded_bit = 0;
+    bool previous_exact = true;
+    for (size_t s = 0; s < num_skel && previous_exact; ++s) {
+        for (uint32_t j = 0; j < skel_nslots[s] && previous_exact; ++j) {
+            uint32_t previous = 0;
+            for (uint32_t idx = gstart[s]; idx < gstart[s + 1]; ++idx) {
+                uint32_t line = order[idx], expected = slot_tok[line_slot_start[line] + j];
+                uint32_t token = previous;
+                if (idx == gstart[s]) {
+                    if (!bget_varint(idp, ide, token)) { previous_exact = false; break; }
+                } else {
+                    bool same = (previous_bits[decoded_bit >> 3] >> (decoded_bit & 7)) & 1;
+                    ++decoded_bit;
+                    if (!same && !bget_varint(idp, ide, token)) { previous_exact = false; break; }
+                }
+                if (token != expected) { previous_exact = false; break; }
+                previous = token;
+            }
+        }
+    }
+    if (idp != ide) previous_exact = false;
     // row-wise (causal reference)
     for (size_t i = 0; i < N; ++i)
         for (uint32_t si = line_slot_start[i]; si < line_slot_start[i + 1]; ++si) {
@@ -262,6 +366,8 @@ static void run_skeleton(const Distinct& d, uint64_t base_z3, uint64_t front_z3,
     uint64_t tokdict = Z(slottok.blob) + Z(tok_len);
     uint64_t vc = Z(val_col), lc = Z(len_col), tc = Z(tid_col);
     uint64_t vr = Z(val_row), lr = Z(len_row), tr = Z(tid_row);
+    uint64_t previous_bits_z = Z(previous_bits), previous_ids_z = Z(previous_ids);
+    uint64_t previous_z = previous_bits_z + previous_ids_z;
     uint64_t col_raw = skeldict + idz + vc + lc;
     uint64_t col_int = skeldict + idz + tokdict + tc;
     uint64_t row_raw = skeldict + idz + vr + lr;
@@ -282,10 +388,24 @@ static void run_skeleton(const Distinct& d, uint64_t base_z3, uint64_t front_z3,
     printf("  ---- SKELETON-GROUPED COLUMNAR coding (bigoracle 4.2) [tokenize=%.2fs] ----\n", tok_t);
     printf("    distinct skeletons=%zu (%.1f lines/skel)  slot occurrences=%zu (%.2f/line)  distinct slot tokens=%zu\n",
            num_skel, double(N) / double(num_skel ? num_skel : 1), num_slot, double(num_slot) / double(N), num_tok);
+    printf("    conditional placement ORACLE (model uncharged): contexts=%llu repeated=%llu repeated-occ=%llu (%.1f%% of slots)\n",
+           (unsigned long long)context_count, (unsigned long long)repeated_contexts,
+           (unsigned long long)repeated_occ, 100.0 * double(repeated_occ) / double(num_slot ? num_slot : 1));
+    printf("      empirical H=%.3f bits/repeated-slot (%.3f MiB ideal); top1/2/4/8 coverage=%.1f/%.1f/%.1f/%.1f%%; previous=%.1f%%\n",
+           repeated_occ ? double(entropy_bits / repeated_occ) : 0.0,
+           double(entropy_bits / 8.0 / 1048576.0),
+           repeated_occ ? 100.0 * double(top1) / double(repeated_occ) : 0.0,
+           repeated_occ ? 100.0 * double(top2) / double(repeated_occ) : 0.0,
+           repeated_occ ? 100.0 * double(top4) / double(repeated_occ) : 0.0,
+           repeated_occ ? 100.0 * double(top8) / double(repeated_occ) : 0.0,
+           repeated_occ ? 100.0 * double(previous_hits) / double(repeated_occ) : 0.0);
     printf("    raw bytes: skeleton-keys(deduped)=%.3f  all-slot-occurrences=%.3f  distinct-slot-tokens=%.3f MiB\n",
            MB(skel_raw_bytes), MB(slot_raw_bytes), MB(tok_raw_bytes));
     printf("    z3 components (MiB): skel_dict=%.3f  id=%.3f  tok_dict=%.3f | val_col=%.3f len_col=%.3f tid_col=%.3f\n",
            MB(skeldict), MB(idz), MB(tokdict), MB(vc), MB(lc), MB(tc));
+    printf("    previous-value placement: bits=%.3f + escaped-ids=%.3f => %.3f MiB z3 (vs tid_col %.3f), token-roundtrip=%s\n",
+           MB(previous_bits_z), MB(previous_ids_z), MB(previous_z), MB(tc),
+           previous_exact ? "PASS" : "FAIL");
     printf("    TOTAL columnar   raw-slots = %.3f MiB   (%.3fx vs z3-plain, %.3fx vs front-code)  raw/comp %.1fx\n",
            MB(col_raw), double(base_z3) / double(col_raw), double(front_z3) / double(col_raw), double(raw) / double(col_raw));
     printf("    TOTAL columnar   interned  = %.3f MiB   (%.3fx vs z3-plain, %.3fx vs front-code)  raw/comp %.1fx\n",
