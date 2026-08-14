@@ -145,13 +145,44 @@ static bool parse_marker(const char* s, uint32_t len, Marker& m){
 }
 static void emit_marker(const Marker& m, std::vector<uint8_t>& out){ char buf[32]; int l=snprintf(buf,sizeof buf,"# %llu \"",(unsigned long long)m.lineno); out.insert(out.end(),buf,buf+l); out.insert(out.end(),m.path.begin(),m.path.end()); out.push_back('"'); for(uint8_t f:m.flags){ out.push_back(' '); l=snprintf(buf,sizeof buf,"%u",f); out.insert(out.end(),buf,buf+l);} out.push_back('\n'); }
 
+// ---- inline relative-LZ definition codec (D2): LZ77 over a growing byte store of ALL prior line
+// bytes; a new line is COPY(dist,len)/LITERAL segments against that store. Deterministic + byte-exact
+// (encoder and decoder feed the identical line sequence, so their stores stay identical). This is my
+// own version to unblock the D2 measurement; the helper's definition_codec is a drop-in replacement. ----
+struct RelLZ {
+    std::vector<uint8_t> store; std::vector<uint32_t> head, chain; static const uint32_t HB=23, MINM=4, MAXC=64;
+    void reset(){ store.clear(); store.reserve(64u<<20); head.assign(size_t(1)<<HB,UINT32_MAX); chain.clear(); }
+    inline uint32_t h4(uint32_t pos) const { uint32_t v; memcpy(&v,&store[pos],4); return (v*2654435761u)>>(32-HB); }
+    inline void ins(uint32_t pos){ chain[pos]=head[h4(pos)]; head[h4(pos)]=pos; }
+    // encode line[0..len) as segments; append to store. seg = repeated: varint(litlen) lit-bytes varint(matchlen) [varint(dist) if matchlen>0].
+    void encode(const uint8_t* line, uint32_t len, std::vector<uint8_t>& seg){
+        uint32_t base=uint32_t(store.size()); store.insert(store.end(),line,line+len); uint32_t end=uint32_t(store.size());
+        chain.resize(store.size(),UINT32_MAX);
+        uint32_t i=base;
+        while(i<end){ uint32_t litstart=i, ml=0, md=0;
+            while(i<end){ uint32_t bl=0,bp=0; if(i+MINM<=end){ uint32_t c=head[h4(i)],ch=0; while(c!=UINT32_MAX&&ch<MAXC){ if(c<i){ uint32_t L=0,mx=end-i; while(L<mx&&store[c+L]==store[i+L])++L; if(L>=MINM&&L>bl){bl=L;bp=c;} } c=chain[c]; ++ch; } }
+                if(bl>=MINM){ ml=bl; md=i-bp; break; } ins(i); ++i; }
+            put_varint(seg, i-litstart); seg.insert(seg.end(), &store[litstart], &store[litstart]+(i-litstart));
+            put_varint(seg, ml); if(ml){ put_varint(seg, md); for(uint32_t j=0;j<ml;++j){ ins(i); ++i; } }
+        }
+    }
+    bool decode(const uint8_t* seg, size_t n, std::vector<uint8_t>& out){
+        uint32_t base=uint32_t(store.size()); const uint8_t* p=seg; const uint8_t* e=seg+n;
+        while(p<e){ uint64_t litlen=get_varint(p); for(uint64_t j=0;j<litlen;++j) store.push_back(*p++);
+            uint64_t ml=get_varint(p); if(ml){ uint64_t md=get_varint(p); uint32_t src=uint32_t(store.size()-md); for(uint64_t j=0;j<ml;++j) store.push_back(store[src+j]); } }
+        out.assign(store.begin()+base, store.end()); return true;
+    }
+    uint64_t store_bytes() const { return store.size(); }
+};
+
 int main(int argc,char**argv){
-    const char* manifest=nullptr; size_t max_files=SIZE_MAX; int zlevel=3; bool useD1=true, useD2=false, useS1=true;
+    const char* manifest=nullptr; size_t max_files=SIZE_MAX; int zlevel=3; bool useD1=true, useD2=false, useS1=true, useD2mine=false;
     for(int i=1;i<argc;++i){ if(!strcmp(argv[i],"--manifest")&&i+1<argc)manifest=argv[++i];
         else if(!strcmp(argv[i],"--z")&&i+1<argc)zlevel=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--no-d1"))useD1=false;
         else if(!strcmp(argv[i],"--v1"))useS1=false;   // V1 baseline: raw region-id root, no S1 blocks
-        else if(!strcmp(argv[i],"--d2"))useD2=true;
+        else if(!strcmp(argv[i],"--d2"))useD2mine=true;      // inline relative-LZ line codec
+        else if(!strcmp(argv[i],"--d2helper"))useD2=true;    // helper's definition_codec (needs -DWITH_D2)
         else if(!strcmp(argv[i],"--max-files")&&i+1<argc){ char*t=nullptr; unsigned long long v=strtoull(argv[++i],&t,10); if(!t||*t||!v){fprintf(stderr,"bad max-files\n");return 2;} max_files=size_t(v); }
         else { fprintf(stderr,"unknown %s\n",argv[i]); return 2; } }
     if(!manifest){ fprintf(stderr,"usage: %s --manifest F [--z 0|1|3] [--no-d1] [--d2] [--max-files N]\n",argv[0]); return 2; }
@@ -219,8 +250,9 @@ int main(int argc,char**argv){
     // F re-derives line bytes from the defs it receives; we verify against the interner's truth.
     Marker mk; std::vector<uint8_t> segbuf, msg, recon, tmp, expectbuf;
 #ifdef HAVE_DEFCODEC
-    DefCodec encC, decF;  // C-side and F-side relative-LZ line codecs (identical growing stores)
+    DefCodec encC, decF;  // helper's relative-LZ line codecs (C + F, identical growing stores)
 #endif
+    RelLZ relC, relF; if(useD2mine){ relC.reset(); relF.reset(); }   // inline relative-LZ line codec
     bool byteexact=true; uint64_t n_marker=0,n_literal=0;
 
     for(size_t t=0; t<TUs; ++t){
@@ -243,12 +275,11 @@ int main(int argc,char**argv){
                         put_varint(fill_paths,mk.path.size()); fill_paths.insert(fill_paths.end(),mk.path.begin(),mk.path.end()); ++np; } else pid=it->second;
                     fill_lines.push_back(1); put_varint(fill_lines,pid); put_varint(fill_lines,mk.lineno); fill_lines.push_back(uint8_t(mk.flags.size())); for(uint8_t f:mk.flags) fill_lines.push_back(f); ++n_marker;
                 } else { fill_lines.push_back(0);
+                    if(useD2mine){ segbuf.clear(); relC.encode((const uint8_t*)txt,lr.len,segbuf); put_varint(fill_lines,segbuf.size()); fill_lines.insert(fill_lines.end(),segbuf.begin(),segbuf.end()); }
 #ifdef HAVE_DEFCODEC
-                    if(useD2){ segbuf.clear(); encC.encode((const uint8_t*)txt,lr.len,segbuf); put_varint(fill_lines,lr.len); put_varint(fill_lines,segbuf.size()); fill_lines.insert(fill_lines.end(),segbuf.begin(),segbuf.end()); }
-                    else { put_varint(fill_lines,lr.len); fill_lines.insert(fill_lines.end(),txt,txt+lr.len); }
-#else
-                    put_varint(fill_lines,lr.len); fill_lines.insert(fill_lines.end(),txt,txt+lr.len);
+                    else if(useD2){ segbuf.clear(); encC.encode((const uint8_t*)txt,lr.len,segbuf); put_varint(fill_lines,lr.len); put_varint(fill_lines,segbuf.size()); fill_lines.insert(fill_lines.end(),segbuf.begin(),segbuf.end()); }
 #endif
+                    else { put_varint(fill_lines,lr.len); fill_lines.insert(fill_lines.end(),txt,txt+lr.len); }
                     ++n_literal; }
             }
             put_varint(fill_regions,c); for(uint32_t j=0;j<c;++j) put_varint(fill_regions,lids[j]); fknownReg[r]=1; ++nr;
@@ -269,13 +300,12 @@ int main(int argc,char**argv){
           while(pp<pe){ uint8_t kind=*pp++;
             if(kind==1){ uint64_t pid=get_varint(pp); uint64_t lineno=get_varint(pp); uint8_t nf=*pp++; Marker dm; dm.path=Fpaths[pid]; dm.lineno=lineno; for(uint8_t f=0;f<nf;++f) dm.flags.push_back(*pp++);
                 tmp.clear(); emit_marker(dm,tmp); Fline_data.insert(Fline_data.end(),tmp.begin(),tmp.end()); Fline_off.push_back(Fline_data.size()); }
-            else { uint64_t len=get_varint(pp);
+            else {
+              if(useD2mine){ uint64_t sl=get_varint(pp); std::vector<uint8_t> lo; relF.decode(pp,sl,lo); pp+=sl; Fline_data.insert(Fline_data.end(),lo.begin(),lo.end()); Fline_off.push_back(Fline_data.size()); }
 #ifdef HAVE_DEFCODEC
-              if(useD2){ uint64_t sl=get_varint(pp); std::vector<uint8_t> lo; decF.decode(pp,sl,lo); pp+=sl; (void)len; Fline_data.insert(Fline_data.end(),lo.begin(),lo.end()); Fline_off.push_back(Fline_data.size()); }
-              else { Fline_data.insert(Fline_data.end(),pp,pp+len); pp+=len; Fline_off.push_back(Fline_data.size()); }
-#else
-              Fline_data.insert(Fline_data.end(),pp,pp+len); pp+=len; Fline_off.push_back(Fline_data.size());
+              else if(useD2){ uint64_t len=get_varint(pp); uint64_t sl=get_varint(pp); std::vector<uint8_t> lo; decF.decode(pp,sl,lo); pp+=sl; (void)len; Fline_data.insert(Fline_data.end(),lo.begin(),lo.end()); Fline_off.push_back(Fline_data.size()); }
 #endif
+              else { uint64_t len=get_varint(pp); Fline_data.insert(Fline_data.end(),pp,pp+len); pp+=len; Fline_off.push_back(Fline_data.size()); }
             } } }
         { const uint8_t* pp=fill_regions.data(), *pe=fill_regions.data()+fill_regions.size();
           while(pp<pe){ uint64_t c=get_varint(pp); for(uint64_t j=0;j<c;++j) Freg_child.push_back(uint32_t(get_varint(pp))); Freg_off.push_back(Freg_child.size()); } }
@@ -299,7 +329,7 @@ int main(int argc,char**argv){
 
     double totalwire = w_root+w_linedef+w_regiondef+w_pathdef+w_blockdef+w_missing+w_framing;
     double MiB=1048576.0;
-    printf("\n==== CODEC-50 (%s%s%s, z%d) — %s ====\n", useS1?"V1+S1(LZ blocks)":"V1", useD1?"+D1":"", useD2?"+D2":"", zlevel, manifest);
+    printf("\n==== CODEC-50 (%s%s%s, z%d) — %s ====\n", useS1?"V1+S1(LZ blocks)":"V1", useD1?"+D1":"", (useD2mine?"+D2(inline)":(useD2?"+D2(helper)":"")), zlevel, manifest);
     printf("byte-exact=%s  TUs=%zu raw=%.1f MiB regions=%u distinct_lines=%u paths=%zu blocks=%zu (marker_lines=%llu literal_lines=%llu)\n",
         byteexact?"OK":"FAIL",TUs,corpus.raw/MiB,NREG,dict.distinct(),paths.size(),boff2.size()-1,(unsigned long long)n_marker,(unsigned long long)n_literal);
     printf("wire by category (post-z%d, bytes): root=%.0f line_def=%.0f region_def=%.0f block_def=%.0f path_def=%.0f missing=%.0f framing=%.0f  TOTAL=%.0f (%.2f MiB)\n",
