@@ -254,6 +254,7 @@ int main(int argc,char**argv){
 #endif
     RelLZ relC, relF; if(useD2mine){ relC.reset(); relF.reset(); }   // inline relative-LZ line codec
     bool byteexact=true; uint64_t n_marker=0,n_literal=0;
+    std::vector<uint8_t> allLineDefs, allRoots;   // diagnostic: batched-z3 floor (cross-message headroom)
 
     for(size_t t=0; t<TUs; ++t){
         const uint32_t* tk=&tokstream[tokoff[t]]; size_t tn=tokoff[t+1]-tokoff[t];
@@ -286,13 +287,13 @@ int main(int argc,char**argv){
         }
         for(uint32_t k:missBlk){ put_varint(fill_blocks, boff2[k+1]-boff2[k]); for(size_t j=boff2[k];j<boff2[k+1];++j) put_varint(fill_blocks, bchild[j]); fknownBlk[k]=1; ++nb; }
         if(np) w_pathdef += zstd_size(z,fill_paths.data(),fill_paths.size(),zlevel,dst);
-        if(nl) w_linedef += zstd_size(z,fill_lines.data(),fill_lines.size(),zlevel,dst);
+        if(nl){ w_linedef += zstd_size(z,fill_lines.data(),fill_lines.size(),zlevel,dst); allLineDefs.insert(allLineDefs.end(),fill_lines.begin(),fill_lines.end()); }
         if(nr) w_regiondef += zstd_size(z,fill_regions.data(),fill_regions.size(),zlevel,dst);
         if(nb) w_blockdef += zstd_size(z,fill_blocks.data(),fill_blocks.size(),zlevel,dst);
         if(np||nl||nr||nb) w_framing += FRAME;
         // --- ROOT: token stream (region + block ids) ---
         std::vector<uint8_t> rootb; for(size_t i=0;i<tn;++i) put_varint(rootb,tk[i]);
-        w_root += zstd_size(z,rootb.data(),rootb.size(),zlevel,dst); w_framing += FRAME;
+        w_root += zstd_size(z,rootb.data(),rootb.size(),zlevel,dst); w_framing += FRAME; allRoots.insert(allRoots.end(),rootb.begin(),rootb.end());
 
         // --- DECODER (F): install FILL from wire into F's OWN store, then expand ROOT tokens ---
         { const uint8_t* pp=fill_paths.data(); for(uint32_t k=0;k<np;++k){ uint64_t L=get_varint(pp); Fpaths.emplace_back((const char*)pp,(size_t)L); pp+=L; } }
@@ -335,6 +336,11 @@ int main(int argc,char**argv){
     printf("wire by category (post-z%d, bytes): root=%.0f line_def=%.0f region_def=%.0f block_def=%.0f path_def=%.0f missing=%.0f framing=%.0f  TOTAL=%.0f (%.2f MiB)\n",
         zlevel,w_root,w_linedef,w_regiondef,w_blockdef,w_pathdef,w_missing,w_framing,totalwire,totalwire/MiB);
     printf("FinalRatio (raw / total wire, one cold pass) = %.1fx\n", corpus.raw/totalwire);
+    { ZSTD_CCtx* z2=ZSTD_createCCtx(); std::vector<uint8_t> d2b;
+      double bl=allLineDefs.empty()?0:zstd_size(z2,allLineDefs.data(),allLineDefs.size(),zlevel,d2b);
+      double br=allRoots.empty()?0:zstd_size(z2,allRoots.data(),allRoots.size(),zlevel,d2b); ZSTD_freeCCtx(z2);
+      double alt=totalwire - w_linedef - w_root + bl + br;
+      printf("DIAG batched-z%d floor: line_def %.0f->%.0f  root %.0f->%.0f  => if streamed: TOTAL=%.0f ratio=%.0fx (cross-message headroom)\n",zlevel,w_linedef,bl,w_root,br,alt,corpus.raw/alt); }
     printf("H200 f-checkpoints (cum raw fraction -> cumulative ratio):\n");
     for(auto&c:ck) printf("  f=%.2f  ratio=%.0fx\n",c.first,c.second);
     // trailing-window (5% raw) ratio near the end
