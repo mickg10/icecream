@@ -269,8 +269,9 @@ int main(int argc,char**argv){
         w_root=w_linedef=w_regiondef=w_pathdef=w_blockdef=w_missing=w_framing=0; cum_raw=0; cum_wire=0; n_marker=n_literal=0; byteexact=true;
         ck.clear(); ckidx=0; allLineDefs.clear(); allRoots.clear(); allRegions.clear(); allRegionsRaw.clear(); allBlocks.clear(); allPaths.clear(); allMiss.clear();
       }
-      auto tpass=Clock::now();
+      auto tpass=Clock::now(); double enc_s=0, dec_s=0;   // split C-encode vs F-decode wall (2-proc per-stream proxy)
       for(size_t t=0; t<TUs; ++t){
+        auto _te=Clock::now();
         const uint32_t* tk=&tokstream[tokoff[t]]; size_t tn=tokoff[t+1]-tokoff[t];
         // --- collect NEW regions (incl. new blocks' child regions) + NEW blocks, topological order ---
         std::vector<uint32_t> missReg, missBlk;
@@ -318,6 +319,7 @@ int main(int argc,char**argv){
         std::vector<uint8_t> rootb; for(size_t i=0;i<tn;++i) put_varint(rootb,tk[i]);
         w_root += zstd_size(z,rootb.data(),rootb.size(),zlevel,dst); w_framing += FRAME; allRoots.insert(allRoots.end(),rootb.begin(),rootb.end());
 
+        enc_s += std::chrono::duration<double>(Clock::now()-_te).count(); auto _td=Clock::now();
         // --- DECODER (F): install FILL from wire into F's OWN store, then expand ROOT tokens ---
         { const uint8_t* pp=fill_paths.data(); for(uint32_t k=0;k<np;++k){ uint64_t L=get_varint(pp); Fpaths.emplace_back((const char*)pp,(size_t)L); pp+=L; } }
         { const uint8_t* pp=fill_lines.data(), *pe=fill_lines.data()+fill_lines.size();
@@ -345,6 +347,7 @@ int main(int argc,char**argv){
           while(pp<pe){ uint32_t tok=uint32_t(get_varint(pp));
             if(tok<NREG) emitRegionF(tok);
             else { uint32_t k=tok-NREG; for(size_t j=Fblk_off[k];j<Fblk_off[k+1];++j) emitRegionF(Fblk_child[j]); } } }
+        dec_s += std::chrono::duration<double>(Clock::now()-_td).count();   // F-decode ends here; the verify below is harness-only (F doesn't have the original)
         const char* orig=corpus.bytes.data()+corpus.files[t].off; uint32_t olen=corpus.files[t].len;
         if(recon.size()!=olen || memcmp(recon.data(),orig,olen)!=0){ byteexact=false; if(t<5||TUs<10) fprintf(stderr,"BYTE-EXACT FAIL TU %zu (%zu vs %u)\n",t,recon.size(),olen); }
         cum_raw += olen;
@@ -353,6 +356,8 @@ int main(int argc,char**argv){
         while(ckidx<ck_f.size() && double(cum_raw)>=ck_f[ckidx]*corpus.raw){ ck.push_back({ck_f[ckidx], double(cum_raw)/cum_wire}); ++ckidx; }
       }
       fprintf(stderr,"pass %d (%s) single-core encode+decode+verify: %.2fs = %.2f GB/s raw\n", pass, (pass+1==npass&&npass>1)?"WARM":"cold", secs(tpass), corpus.raw/1e9/secs(tpass));
+      fprintf(stderr,"  split (2-proc per-stream proxy): C-encode %.2f GB/s | F-decode %.2f GB/s => pipelined min = %.2f GB/s\n",
+              corpus.raw/1e9/enc_s, corpus.raw/1e9/dec_s, corpus.raw/1e9/std::max(enc_s,dec_s));
     }
     while(ck.size()<ck_f.size()) ck.push_back({ck_f[ck.size()], double(cum_raw)/cum_wire});
     ZSTD_freeCCtx(z);
