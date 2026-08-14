@@ -1,0 +1,11 @@
+[duckdb] loaded 689 TUs raw=1893.7 MiB in 2.9s
+[duckdb] pass A done: root_tok=462244 total_z=12.610 MiB blocks=20536 encode=1.1s learn=0.0s
+[duckdb] batch ceiling: 37125 rules in 0.31s, ceiling tokens=325737
+[duckdb] batch ceiling wire=12.515 MiB (root_z3=755499 block_def=166639 region_def=4439252 line_def=54733427)
+[duckdb] pass B (warm, learning) total_z=0.665 MiB new_blocks=5328
+[duckdb] pass B frozen-after-A control total_z=0.671 MiB root_tok=305134
+[duckdb] pass C edited byte-exact: OK (modified TUs=689 new_lines=1 new_regions=1 new_blocks=3961)
+[duckdb] pass D changed-steady total_z=0.576 MiB new_blocks=6442
+[duckdb] edit(ii): target region 1 fanout=689 TUs raw_len=17
+[duckdb] edit(ii) byte-exact: OK (modified TUs=689 new_regions=1 new_blocks=1927)
+[duckdb] ALL DONE in 70.5s (ref_hash=bc36d5803402cf81)

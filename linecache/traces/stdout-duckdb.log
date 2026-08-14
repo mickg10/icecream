@@ -1,0 +1,114 @@
+
+== CONVERGENCE (pass A COLD_FIRST) duckdb ==
+online cumulative WIRE vs batch-region-BPE-ceiling cumulative WIRE (regret), sampled by TU ordinal
+      TU   cum_onl_wire  cum_ceil_wire   wire_reg% |  cum_onl_tok cum_ceil_tok    tok_reg%
+      43        2548225        2531249        0.7% |        79182         5492     1341.8%
+      86        2661214        2640290        0.8% |        91507         9212      893.3%
+     129        2940228        2901286        1.3% |       117231        15199      671.3%
+     172        3219406        3167191        1.6% |       137061        24131      468.0%
+     215        3911864        3848196        1.7% |       150006        30560      390.9%
+     258        3947057        3873650        1.9% |       161602        39193      312.3%
+     301        5341950        5267333        1.4% |       171456        46504      268.7%
+     345        5716003        5638332        1.4% |       177836        51693      244.0%
+     388        6903563        6818561        1.2% |       196945        67800      190.5%
+     431        7750429        7659348        1.2% |       214275        83215      157.5%
+     474        9175210        9081465        1.0% |       236020       104561      125.7%
+     517       10698218       10608152        0.8% |       313166       179459       74.5%
+     560       11301718       11207844        0.8% |       351264       216818       62.0%
+     603       11670398       11575374        0.8% |       369391       234246       57.7%
+     646       12780927       12684173        0.8% |       452554       316376       43.0%
+     689       13222150       13122562        0.8% |       462244       325737       41.9%
+FINAL online wire=12.610 MiB  ceiling wire=12.515 MiB  WIRE REGRET=0.8%   (tokens: online=462244 ceiling=325737)
+
+== PASS B WARM_SAME duckdb ==
+online(learning):  total_z=697374  root_tok=283420  new_blocks=5328
+frozen-after-A ctl: total_z=703537  root_tok=305134 (blocks frozen=20536)
+
+== PER-F CHARGING (pass-B records; each F starts COLD; total wire bytes) duckdb ==
+Total wire under 3 assignment strategies (charge each artifact once per F that needs it):
+  F |     round-robin         shuffle   sticky-contig
+  1 |        12894819        12894819        12894819
+  4 |        21106479        20744411        17043836
+  8 |        28266919        27887809        21858191
+ 16 |        40568070        39797053        31526650
+ 32 |        60449751        58941005        43744091
+
+DEF-MULTIPLICATION breakdown (round-robin; root is F-independent, defs multiply with F):
+  F |       root_z3      line_def    region_def     block_def       fill_z3
+  1 |        639892      54733427       4439252         89227      11563276
+  4 |        639892      83973800       7177096        323367      19542722
+  8 |        639892     108906983       9771349        590088      26460686
+ 16 |        639892     151928841      14218829       1029044      38365619
+ 32 |        639892     223364667      21803083       1725798      57611556
+(sticky keeps a C's jobs on one F -> less def multiplication; round-robin re-sends defs to every F.)
+
+== RECOVERY (edit i-stdc-predef) duckdb ==
+affected TUs=550 (of 689). first-10 by affected ordinal (edit-pass wire vs warm baseline):
+  aff#       TU       C_wire       B_wire      extra    C_tok
+     1        1          183          165         18       36
+     2        2          603          698          0      188
+     3        3          535          642          0      183
+     4        4          508          608          0      133
+     5        6          235          405          0       96
+     6        7          423          621          0      161
+     7        8         1154         1313          0      609
+     8        9          364          484          0      117
+     9       10          276          429          0      105
+    10       12          209          244          0       85
+first-affected extra=18  p50=0  p95=44  max=3037  CUM edit penalty=9869 (9.6 KiB) over 550 TUs
+
+== PASS D CHANGED_STEADY duckdb ==
+re-run edited tree (steady):    total_z=603746  new_blocks=6442
+revert to original (recovery):  total_z=599503  new_blocks=1843 (old blocks immediately reusable => low wire)
+
+== RECOVERY (edit ii-region-fanout) duckdb ==
+affected TUs=689 (of 689). first-10 by affected ordinal (edit-pass wire vs warm baseline):
+  aff#       TU       C_wire       B_wire      extra    C_tok
+     1        1          152          165          0       24
+     2        2          376          698          0       93
+     3        3          300          642          0       91
+     4        4          325          608          0       91
+     5        5           60          174          0       14
+     6        6          202          405          0       53
+     7        7          336          621          0      118
+     8        8          952         1313          0      427
+     9        9          280          484          0       84
+    10       10          262          429          0       65
+first-affected extra=0  p50=0  p95=0  max=25  CUM edit penalty=137 (0.1 KiB) over 689 TUs
+
+== PROMOTION THRESHOLD SWEEP (fresh cold pass A per K) duckdb ==
+     K       blocks     root_tok     total_z(A)       ceil_tok  tok_regret%
+     2        47471       323518       13064721         325737        -0.7%
+     4        28895       378542       13110139         325737        16.2%
+     8        20536       462244       13222150         325737        41.9%
+    16        15586       601669       13476866         325737        84.7%
+    32        12258       818832       13879161         325737       151.4%
+    64         9802      1148551       14497601         325737       252.6%
+
+== ALGORITHM COMPARISON (warm single-F recurring wire, corpus duckdb) ==
+algo1 lines-only (floor)  : root_tok=69094918 total_z=87943438 (line-id stream, warm; no blocks)
+algo2 marker-regions-only : root_tok=2521258 total_z=4752101 (root_z3=4741077 block_def=0)
+algo3 regions+online-block: root_tok=232722 total_z=545494 (root_z3=523137 block_def=3581)
+regions cut the lines floor by 94.6%; online-blocks cut regions-only by 88.5% (warm, single F).
+
+== BLOCK-LIFETIME QUALITY (duckdb) ==
+blocks=40037  never-referenced=10623 (26.5%, def bytes wasted=56549)
+use_count  p50=16 p95=2488 max=4118
+depth      p50=2 p95=9 max=19
+create->first-use gap (TUs) p50=1 p95=249 max=664
+predictor memory: pair_count~4.8 MiB + blocks~1.1 MiB = 5.9 MiB for 2756 learned TUs
+
+== LEARNER COMPARISON: pair-promotion vs phrase-trie (fresh cold pass A) duckdb ==
+learner                        blocks     root_tok     total_z(A)     tok_reg%
+pair-promotion(K)               40037       462244       13222150        41.9%
+phrase-trie/LZ(K)              546819       399581       14835251        22.7%
+(both cold pass A, same K=8; batch-ceiling tokens=325737)
+
+== ORDER SENSITIVITY (fresh cold pass A; final wire under different TU orders) duckdb ==
+order                final_wire       blocks     root_tok
+original               13222150        20536       462244
+reverse                13227844        20782       463897
+shuffle-s1             13224043        18842       454979
+shuffle-s2             13213804        18991       455964
+sched-proxy-s3         13230812        18736       454160
+order band: min=13213804 median=13224043 max=13230812 (spread=0.1%)

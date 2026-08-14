@@ -1,0 +1,114 @@
+
+== CONVERGENCE (pass A COLD_FIRST) llvm ==
+online cumulative WIRE vs batch-region-BPE-ceiling cumulative WIRE (regret), sampled by TU ordinal
+      TU   cum_onl_wire  cum_ceil_wire   wire_reg% |  cum_onl_tok cum_ceil_tok    tok_reg%
+      77        2176890        2179494       -0.1% |       116664        14215      720.7%
+     155        3400800        3403699       -0.1% |       150226        29310      412.5%
+     232        4478040        4453903        0.5% |       202010        55307      265.3%
+     310        4917548        4883077        0.7% |       218774        64668      238.3%
+     387        5234986        5195416        0.8% |       234150        75804      208.9%
+     464        5807589        5763371        0.8% |       245172        84569      189.9%
+     542        6860591        6814796        0.7% |       259626        97178      167.2%
+     619        7359554        7308826        0.7% |       272866       108853      150.7%
+     696        7977978        7920942        0.7% |       291107       125924      131.2%
+     774        8680686        8622634        0.7% |       307352       142433      115.8%
+     851        8921082        8862959        0.7% |       316660       152252      108.0%
+     929        9824291        9769100        0.6% |       325636       162315      100.6%
+    1006       10730517       10670495        0.6% |       339967       175354       93.9%
+    1083       11413328       11354253        0.5% |       352997       189787       86.0%
+    1161       11996909       11945189        0.4% |       364425       202973       79.5%
+    1238       12645523       12592266        0.4% |       379727       217468       74.6%
+FINAL online wire=12.060 MiB  ceiling wire=12.009 MiB  WIRE REGRET=0.4%   (tokens: online=379727 ceiling=217468)
+
+== PASS B WARM_SAME llvm ==
+online(learning):  total_z=448315  root_tok=138543  new_blocks=6587
+frozen-after-A ctl: total_z=443099  root_tok=163636 (blocks frozen=27431)
+
+== PER-F CHARGING (pass-B records; each F starts COLD; total wire bytes) llvm ==
+Total wire under 3 assignment strategies (charge each artifact once per F that needs it):
+  F |     round-robin         shuffle   sticky-contig
+  1 |        12190088        12190088        12190088
+  4 |        20664088        20522290        17577927
+  8 |        30065575        29819406        23162818
+ 16 |        46147934        45471119        30727531
+ 32 |        72548422        70308964        45946243
+
+DEF-MULTIPLICATION breakdown (round-robin; root is F-independent, defs multiply with F):
+  F |       root_z3      line_def    region_def     block_def       fill_z3
+  1 |        363819      40025224       4181240        112714      11547708
+  4 |        363819      69901344       7260999        414509      19735740
+  8 |        363819     103200867      10704989        764752      28818518
+ 16 |        363819     160446150      16645897       1350634      44369699
+ 32 |        363819     255242984      26473292       2295649      69914208
+(sticky keeps a C's jobs on one F -> less def multiplication; round-robin re-sends defs to every F.)
+
+== RECOVERY (edit i-stdc-predef) llvm ==
+affected TUs=989 (of 1238). first-10 by affected ordinal (edit-pass wire vs warm baseline):
+  aff#       TU       C_wire       B_wire      extra    C_tok
+     1        1          110           34         76       10
+     2        2          244          293          0       67
+     3        4          290          302          0       85
+     4        5          258          347          0       72
+     5        8          425          547          0      141
+     6        9          460          453          7      158
+     7       10          504          607          0      216
+     8       11          363          406          0      127
+     9       12          346          416          0       88
+    10       13          427          553          0      147
+first-affected extra=76  p50=0  p95=21  max=313  CUM edit penalty=2724 (2.7 KiB) over 989 TUs
+
+== PASS D CHANGED_STEADY llvm ==
+re-run edited tree (steady):    total_z=322733  new_blocks=4336
+revert to original (recovery):  total_z=308215  new_blocks=1857 (old blocks immediately reusable => low wire)
+
+== RECOVERY (edit ii-region-fanout) llvm ==
+affected TUs=1238 (of 1238). first-10 by affected ordinal (edit-pass wire vs warm baseline):
+  aff#       TU       C_wire       B_wire      extra    C_tok
+     1        1           97           34         63       10
+     2        2          119          293          0       42
+     3        3           83          165          0       25
+     4        4          207          302          0       74
+     5        5          239          347          0       62
+     6        6          148          240          0       35
+     7        7          194          277          0       58
+     8        8          332          547          0      103
+     9        9          353          453          0       97
+    10       10          507          607          0      140
+first-affected extra=63  p50=0  p95=0  max=71  CUM edit penalty=538 (0.5 KiB) over 1238 TUs
+
+== PROMOTION THRESHOLD SWEEP (fresh cold pass A per K) llvm ==
+     K       blocks     root_tok     total_z(A)       ceil_tok  tok_regret%
+     2        52964       187989       12380728         217468       -13.6%
+     4        36381       261032       12449766         217468        20.0%
+     8        27431       379727       12645523         217468        74.6%
+    16        20804       561534       12971021         217468       158.2%
+    32        15205       837772       13475875         217468       285.2%
+    64        11642      1262692       14263305         217468       480.6%
+
+== ALGORITHM COMPARISON (warm single-F recurring wire, corpus llvm) ==
+algo1 lines-only (floor)  : root_tok=137913644 total_z=165226858 (line-id stream, warm; no blocks)
+algo2 marker-regions-only : root_tok=4829113 total_z=8507267 (root_z3=8487459 block_def=0)
+algo3 regions+online-block: root_tok=81437 total_z=257859 (root_z3=224737 block_def=3248)
+regions cut the lines floor by 94.9%; online-blocks cut regions-only by 97.0% (warm, single F).
+
+== BLOCK-LIFETIME QUALITY (llvm) ==
+blocks=45845  never-referenced=13155 (28.7%, def bytes wasted=70080)
+use_count  p50=21 p95=4428 max=7364
+depth      p50=2 p95=11 max=20
+create->first-use gap (TUs) p50=2 p95=368 max=1199
+predictor memory: pair_count~3.0 MiB + blocks~1.2 MiB = 4.2 MiB for 4952 learned TUs
+
+== LEARNER COMPARISON: pair-promotion vs phrase-trie (fresh cold pass A) llvm ==
+learner                        blocks     root_tok     total_z(A)     tok_reg%
+pair-promotion(K)               45845       379727       12645523        74.6%
+phrase-trie/LZ(K)              914012       347922       15436074        60.0%
+(both cold pass A, same K=8; batch-ceiling tokens=217468)
+
+== ORDER SENSITIVITY (fresh cold pass A; final wire under different TU orders) llvm ==
+order                final_wire       blocks     root_tok
+original               12645523        27431       379727
+reverse                12629517        26514       371952
+shuffle-s1             12641020        25933       373987
+shuffle-s2             12634361        25807       373005
+sched-proxy-s3         12637777        25590       373415
+order band: min=12629517 median=12637777 max=12645523 (spread=0.1%)

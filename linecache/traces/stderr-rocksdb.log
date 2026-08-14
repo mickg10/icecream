@@ -1,0 +1,11 @@
+[rocksdb] loaded 622 TUs raw=2970.0 MiB in 4.3s
+[rocksdb] pass A done: root_tok=1029744 total_z=12.474 MiB blocks=24338 encode=1.6s learn=0.1s
+[rocksdb] batch ceiling: 53149 rules in 1.40s, ceiling tokens=883046
+[rocksdb] batch ceiling wire=12.365 MiB (root_z3=1761073 block_def=253768 region_def=6433521 line_def=44701802)
+[rocksdb] pass B (warm, learning) total_z=1.520 MiB new_blocks=6016
+[rocksdb] pass B frozen-after-A control total_z=1.542 MiB root_tok=826916
+[rocksdb] pass C edited byte-exact: OK (modified TUs=622 new_lines=1 new_regions=1 new_blocks=3060)
+[rocksdb] pass D changed-steady total_z=1.412 MiB new_blocks=5268
+[rocksdb] edit(ii): target region 1 fanout=622 TUs raw_len=54
+[rocksdb] edit(ii) byte-exact: OK (modified TUs=622 new_regions=1 new_blocks=1576)
+[rocksdb] ALL DONE in 108.5s (ref_hash=d6faab03a8de9706)

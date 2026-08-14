@@ -1,0 +1,11 @@
+[llvm] loaded 1238 TUs raw=3452.6 MiB in 5.2s
+[llvm] pass A done: root_tok=379727 total_z=12.060 MiB blocks=27431 encode=1.4s learn=0.0s
+[llvm] batch ceiling: 52611 rules in 0.31s, ceiling tokens=217468
+[llvm] batch ceiling wire=12.009 MiB (root_z3=572576 block_def=238771 region_def=4181240 line_def=40025224)
+[llvm] pass B (warm, learning) total_z=0.428 MiB new_blocks=6587
+[llvm] pass B frozen-after-A control total_z=0.423 MiB root_tok=163636
+[llvm] pass C edited byte-exact: OK (modified TUs=1238 new_lines=1 new_regions=1 new_blocks=3668)
+[llvm] pass D changed-steady total_z=0.308 MiB new_blocks=4336
+[llvm] edit(ii): target region 1 fanout=1238 TUs raw_len=17
+[llvm] edit(ii) byte-exact: OK (modified TUs=1238 new_regions=1 new_blocks=1966)
+[llvm] ALL DONE in 105.5s (ref_hash=59eb34d54dff048)

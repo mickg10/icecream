@@ -1,0 +1,114 @@
+
+== CONVERGENCE (pass A COLD_FIRST) rocksdb ==
+online cumulative WIRE vs batch-region-BPE-ceiling cumulative WIRE (regret), sampled by TU ordinal
+      TU   cum_onl_wire  cum_ceil_wire   wire_reg% |  cum_onl_tok cum_ceil_tok    tok_reg%
+      39        2625145        2597468        1.1% |       210204        85554      145.7%
+      78        4938171        4848797        1.8% |       432916       281917       53.6%
+     117        6831858        6720057        1.7% |       604004       448426       34.7%
+     156        7875605        7746314        1.7% |       699098       540845       29.3%
+     194        8393254        8258579        1.6% |       739486       579493       27.6%
+     233        8933529        8795971        1.6% |       755995       595076       27.0%
+     272        9310693        9173483        1.5% |       770101       609032       26.4%
+     311        9655852        9519952        1.4% |       783350       623359       25.7%
+     350        9841884        9708517        1.4% |       794071       634456       25.2%
+     389       10146259       10013875        1.3% |       808800       650072       24.4%
+     428       10396565       10268084        1.3% |       817092       660491       23.7%
+     467       10593448       10470642        1.2% |       824863       670657       23.0%
+     505       10792141       10670485        1.1% |       838066       684706       22.4%
+     544       11124996       11005394        1.1% |       860424       708600       21.4%
+     583       12512077       12394687        0.9% |       984103       835374       17.8%
+     622       13080053       12965782        0.9% |      1029744       883046       16.6%
+FINAL online wire=12.474 MiB  ceiling wire=12.365 MiB  WIRE REGRET=0.9%   (tokens: online=1029744 ceiling=883046)
+
+== PASS B WARM_SAME rocksdb ==
+online(learning):  total_z=1594232  root_tok=808056  new_blocks=6016
+frozen-after-A ctl: total_z=1616536  root_tok=826916 (blocks frozen=24338)
+
+== PER-F CHARGING (pass-B records; each F starts COLD; total wire bytes) rocksdb ==
+Total wire under 3 assignment strategies (charge each artifact once per F that needs it):
+  F |     round-robin         shuffle   sticky-contig
+  1 |        12516958        12516958        12516958
+  4 |        17683899        17630423        17149302
+  8 |        23686502        23627993        22549312
+ 16 |        34842543        34793594        32712571
+ 32 |        55913229        55683781        51339790
+
+DEF-MULTIPLICATION breakdown (round-robin; root is F-independent, defs multiply with F):
+  F |       root_z3      line_def    region_def     block_def       fill_z3
+  1 |       1539676      44701802       6433521         99891       8987330
+  4 |       1539676      61784993       8586884        362443      13900504
+  8 |       1539676      81829430      11145374        658586      19632775
+ 16 |       1539676     119536814      16008207       1177209      30315971
+ 32 |       1539676     191591383      25328660       2070519      50556921
+(sticky keeps a C's jobs on one F -> less def multiplication; round-robin re-sends defs to every F.)
+
+== RECOVERY (edit i-stdc-predef) rocksdb ==
+affected TUs=528 (of 622). first-10 by affected ordinal (edit-pass wire vs warm baseline):
+  aff#       TU       C_wire       B_wire      extra    C_tok
+     1        1         1309         1307          2      575
+     2        2         1181         1317          0      671
+     3        3         2562         2811          0     1330
+     4        4         1201         1275          0      646
+     5        5        13350        13491          0     7124
+     6        6         2344         2507          0     1279
+     7        7         6969         7403          0     4078
+     8        8          987         1048          0      516
+     9        9         2142         2203          0     1205
+    10       10         1374         1484          0      736
+first-affected extra=2  p50=0  p95=10  max=7735  CUM edit penalty=17456 (17.0 KiB) over 528 TUs
+
+== PASS D CHANGED_STEADY rocksdb ==
+re-run edited tree (steady):    total_z=1480217  new_blocks=5268
+revert to original (recovery):  total_z=1471079  new_blocks=1594 (old blocks immediately reusable => low wire)
+
+== RECOVERY (edit ii-region-fanout) rocksdb ==
+affected TUs=622 (of 622). first-10 by affected ordinal (edit-pass wire vs warm baseline):
+  aff#       TU       C_wire       B_wire      extra    C_tok
+     1        1         1167         1307          0      540
+     2        2         1066         1317          0      620
+     3        3         2242         2811          0     1258
+     4        4         1074         1275          0      616
+     5        5        13107        13491          0     7030
+     6        6         2144         2507          0     1182
+     7        7         6730         7403          0     4004
+     8        8          907         1048          0      489
+     9        9         2068         2203          0     1170
+    10       10         1295         1484          0      701
+first-affected extra=0  p50=0  p95=0  max=7  CUM edit penalty=7 (0.0 KiB) over 622 TUs
+
+== PROMOTION THRESHOLD SWEEP (fresh cold pass A per K) rocksdb ==
+     K       blocks     root_tok     total_z(A)       ceil_tok  tok_regret%
+     2        49995       863450       12752925         883046        -2.2%
+     4        32740       924270       12821419         883046         4.7%
+     8        24338      1029744       13080053         883046        16.6%
+    16        20258      1210986       13511281         883046        37.1%
+    32        17454      1523466       14231957         883046        72.5%
+    64        14971      2057378       15335847         883046       133.0%
+
+== ALGORITHM COMPARISON (warm single-F recurring wire, corpus rocksdb) ==
+algo1 lines-only (floor)  : root_tok=110485751 total_z=131472534 (line-id stream, warm; no blocks)
+algo2 marker-regions-only : root_tok=4358454 total_z=8583252 (root_z3=8573300 block_def=0)
+algo3 regions+online-block: root_tok=760917 total_z=1415401 (root_z3=1396643 block_def=2488)
+regions cut the lines floor by 93.5%; online-blocks cut regions-only by 83.5% (warm, single F).
+
+== BLOCK-LIFETIME QUALITY (rocksdb) ==
+blocks=41852  never-referenced=12942 (30.9%, def bytes wasted=69105)
+use_count  p50=16 p95=2956 max=3626
+depth      p50=2 p95=10 max=18
+create->first-use gap (TUs) p50=2 p95=209 max=601
+predictor memory: pair_count~12.9 MiB + blocks~1.1 MiB = 14.0 MiB for 2488 learned TUs
+
+== LEARNER COMPARISON: pair-promotion vs phrase-trie (fresh cold pass A) rocksdb ==
+learner                        blocks     root_tok     total_z(A)     tok_reg%
+pair-promotion(K)               41852      1029744       13080053        16.6%
+phrase-trie/LZ(K)              704133       980615       15995817        11.0%
+(both cold pass A, same K=8; batch-ceiling tokens=883046)
+
+== ORDER SENSITIVITY (fresh cold pass A; final wire under different TU orders) rocksdb ==
+order                final_wire       blocks     root_tok
+original               13080053        24338      1029744
+reverse                13056049        24640      1031459
+shuffle-s1             13022003        24611      1032525
+shuffle-s2             13020668        24065      1027423
+sched-proxy-s3         13039458        24572      1031173
+order band: min=13020668 median=13039458 max=13080053 (spread=0.5%)

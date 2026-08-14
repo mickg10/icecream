@@ -1,0 +1,7 @@
+START llvm 15:11:59
+END llvm exit=0 15:13:45
+START rocksdb 15:13:45
+END rocksdb exit=0 15:15:34
+START duckdb 15:15:34
+END duckdb exit=0 15:16:45
+ALLDONE 15:16:45
