@@ -1,30 +1,38 @@
-// codec50.cpp — real byte-exact "Protocol-50" codec for the icecream line-dedup bake-off (issue #16).
+// codec50.cpp — local-oracle's real Protocol-50 bake-off contender (issue #16).
 //
-// This is the honest measurement harness the FINAL spec requires: a real encoder (C) that turns
-// interned .ii structure into a self-describing, length-framed, z3-compressed wire byte stream, and a
-// real decoder (F) that consumes ONLY those bytes, installs immutable objects, expands the root, and
-// reconstructs the exact .ii bytes. Every wire byte is charged by category. FinalRatio = raw / wire,
-// ONE cold chronological pass, reported per corpus at f = 0.10/0.25/0.50/0.75/1.00 with the H200
-// trailing-window ratio. z <= 3 only. No corpus-name branches; no free dictionaries.
+// The authoritative path is local_codec50::sender_main/receiver_main below. C and an exec'd F
+// exchange actual four-byte-length-prefixed frames over a socketpair. F starts empty, receives no
+// manifest, installs immutable Line/Region/Block objects, reconstructs every TU, and writes it through
+// a pipe to an independent byte comparator. The cold chronological stream uses zstd 0/1/3, explicit
+// charged wire bytes, proactive sticky-F fills, and a bounded in-flight TU window. Fixture loading is
+// timed and printed separately from the first codec-consumed input byte through the final F output.
 //
-// Milestone-1 variants (this file): V1 = stable Lines + marker Regions; D1 = preprocessor-marker/path
-// factoring of "# N \"path\" flags" lines into (path-object, lineno, flags). D2 (relative-LZ line
-// codec, definition_codec.h) plugs into the line-definition leg when available. The real two-process
-// socketpair + throughput and the S0/S1/S3 structure planes build on this same serializer/decoder.
+// The older model_main remains in this research file only as a non-authoritative comparison harness.
 //
-// build: g++ -O3 -march=native -std=c++17 codec50.cpp -o codec50 -lzstd
+// build: g++ -O3 -march=native -std=c++17 codec50.cpp -o codec50 -lzstd -pthread
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cerrno>
+#include <csignal>
+#include <fcntl.h>
+#include <limits>
 #include <string>
+#include <thread>
 #include <unordered_map>
+#include <sys/socket.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/uio.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
 #include <immintrin.h>
@@ -145,7 +153,7 @@ static bool parse_marker(const char* s, uint32_t len, Marker& m){
 }
 static void emit_marker(const Marker& m, std::vector<uint8_t>& out){ char buf[32]; int l=snprintf(buf,sizeof buf,"# %llu \"",(unsigned long long)m.lineno); out.insert(out.end(),buf,buf+l); out.insert(out.end(),m.path.begin(),m.path.end()); out.push_back('"'); for(uint8_t f:m.flags){ out.push_back(' '); l=snprintf(buf,sizeof buf,"%u",f); out.insert(out.end(),buf,buf+l);} out.push_back('\n'); }
 
-int main(int argc,char**argv){
+[[maybe_unused]] static int model_main(int argc,char**argv){
     const char* manifest=nullptr; size_t max_files=SIZE_MAX; int zlevel=3; bool useD1=true, useD2=false;
     for(int i=1;i<argc;++i){ if(!strcmp(argv[i],"--manifest")&&i+1<argc)manifest=argv[++i];
         else if(!strcmp(argv[i],"--z")&&i+1<argc)zlevel=atoi(argv[++i]);
@@ -279,4 +287,1612 @@ int main(int argc,char**argv){
     { double win=0.05*corpus.raw, r=0,wsum=0; for(size_t t=TUs;t-->0;){ r+=perTU_raw[t]; wsum+=perTU_wire[t]; if(r>=win) break; } printf("trailing 5%%-raw window ratio (steady) = %.0fx\n", wsum>0?r/wsum:0); }
     struct rusage ru{}; getrusage(RUSAGE_SELF,&ru); fprintf(stderr,"peak RSS=%.1f MiB total=%.1fs\n",ru.ru_maxrss/1024.0,secs(t0));
     return byteexact?0:1;
+}
+
+// -----------------------------------------------------------------------------
+// local-oracle contender
+//
+// Unlike model_main(), this path moves the compressed bytes through a real
+// full-duplex socket to an exec'd receiver.  The receiver has no manifest and
+// begins with an empty store.  Reconstructed bytes leave through a pipe and are
+// compared byte-for-byte by an independent consumer.
+// -----------------------------------------------------------------------------
+
+namespace local_codec50 {
+
+enum class Msg : uint8_t {
+    Hello = 1,
+    Dict = 2,
+    Root = 3,
+    Missing = 4,
+    Fill = 5,
+    Ack = 6,
+    Done = 7,
+    Final = 8,
+    MissingLines = 9,
+    FillLines = 10,
+    MissingRegions = 11,
+    FillRegions = 12,
+};
+
+static const char* msg_name(Msg m) {
+    switch (m) {
+    case Msg::Hello: return "HELLO";
+    case Msg::Dict: return "DICT";
+    case Msg::Root: return "ROOT";
+    case Msg::Missing: return "MISSING";
+    case Msg::Fill: return "FILL";
+    case Msg::Ack: return "ACK";
+    case Msg::Done: return "DONE";
+    case Msg::Final: return "FINAL";
+    case Msg::MissingLines: return "MISSING_LINES";
+    case Msg::FillLines: return "FILL_LINES";
+    case Msg::MissingRegions: return "MISSING_REGIONS";
+    case Msg::FillRegions: return "FILL_REGIONS";
+    }
+    return "UNKNOWN";
+}
+
+static uint64_t elapsed_ns(Clock::time_point b) {
+    return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - b).count());
+}
+
+static bool write_all(int fd, const void* data, size_t size) {
+    const uint8_t* p = static_cast<const uint8_t*>(data);
+    while (size) {
+        ssize_t n = ::write(fd, p, size);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return false;
+        p += size_t(n);
+        size -= size_t(n);
+    }
+    return true;
+}
+
+static bool read_all(int fd, void* data, size_t size) {
+    uint8_t* p = static_cast<uint8_t*>(data);
+    while (size) {
+        ssize_t n = ::read(fd, p, size);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return false;
+        p += size_t(n);
+        size -= size_t(n);
+    }
+    return true;
+}
+
+static void put_u32(std::vector<uint8_t>& out, uint32_t v) {
+    size_t at = out.size();
+    out.resize(at + sizeof(v));
+    memcpy(out.data() + at, &v, sizeof(v));
+}
+
+static void put_u64(std::vector<uint8_t>& out, uint64_t v) {
+    size_t at = out.size();
+    out.resize(at + sizeof(v));
+    memcpy(out.data() + at, &v, sizeof(v));
+}
+
+static void put_uvar(std::vector<uint8_t>& out, uint64_t v) {
+    while (v >= 0x80) {
+        out.push_back(uint8_t(v) | 0x80);
+        v >>= 7;
+    }
+    out.push_back(uint8_t(v));
+}
+
+static size_t uvar_size(uint64_t v) {
+    size_t n = 1;
+    while (v >= 0x80) { v >>= 7; ++n; }
+    return n;
+}
+
+class Cursor {
+public:
+    explicit Cursor(const std::vector<uint8_t>& bytes)
+        : p_(bytes.data()), end_(bytes.data() + bytes.size()) {}
+
+    bool u8(uint8_t& v) {
+        if (p_ == end_) return false;
+        v = *p_++;
+        return true;
+    }
+
+    bool u32(uint32_t& v) {
+        if (size_t(end_ - p_) < sizeof(v)) return false;
+        memcpy(&v, p_, sizeof(v));
+        p_ += sizeof(v);
+        return true;
+    }
+
+    bool u64(uint64_t& v) {
+        if (size_t(end_ - p_) < sizeof(v)) return false;
+        memcpy(&v, p_, sizeof(v));
+        p_ += sizeof(v);
+        return true;
+    }
+
+    bool uvar(uint64_t& v) {
+        v = 0;
+        unsigned shift = 0;
+        while (p_ != end_ && shift <= 63) {
+            uint8_t b = *p_++;
+            v |= uint64_t(b & 0x7f) << shift;
+            if (!(b & 0x80)) return true;
+            shift += 7;
+        }
+        return false;
+    }
+
+    bool bytes(size_t n, const uint8_t*& p) {
+        if (size_t(end_ - p_) < n) return false;
+        p = p_;
+        p_ += n;
+        return true;
+    }
+
+    bool done() const { return p_ == end_; }
+
+private:
+    const uint8_t* p_;
+    const uint8_t* end_;
+};
+
+struct Frame {
+    Msg type = Msg::Hello;
+    std::vector<uint8_t> payload;
+    uint64_t wire_bytes = 0;
+};
+
+class FramedChannel {
+public:
+    FramedChannel(int fd, int level) : fd_(fd), level_(level) {
+        cctx_ = ZSTD_createCCtx();
+        dctx_ = ZSTD_createDCtx();
+        if (!cctx_ || !dctx_) { fprintf(stderr, "zstd context allocation failed\n"); exit(2); }
+    }
+
+    ~FramedChannel() {
+        ZSTD_freeCCtx(cctx_);
+        ZSTD_freeDCtx(dctx_);
+    }
+
+    bool send(Msg type, const std::vector<uint8_t>& payload, bool may_compress = true) {
+        uint8_t codec = 0;
+        const uint8_t* encoded = payload.data();
+        size_t encoded_size = payload.size();
+
+        if (may_compress && level_ > 0 && payload.size() >= 96) {
+            size_t bound = ZSTD_compressBound(payload.size());
+            compressed_.resize(bound);
+            auto z0 = Clock::now();
+            ZSTD_CCtx_reset(cctx_, ZSTD_reset_session_only);
+            ZSTD_CCtx_setParameter(cctx_, ZSTD_c_compressionLevel, level_);
+            size_t n = ZSTD_compress2(cctx_, compressed_.data(), compressed_.size(),
+                                      payload.data(), payload.size());
+            compress_ns_ += elapsed_ns(z0);
+            if (ZSTD_isError(n)) {
+                fprintf(stderr, "zstd encode: %s\n", ZSTD_getErrorName(n));
+                return false;
+            }
+            if (n + 8 < payload.size()) {
+                codec = 1;
+                encoded = compressed_.data();
+                encoded_size = n;
+            }
+        }
+
+        if (encoded_size > UINT32_MAX - 8 || payload.size() > UINT32_MAX) return false;
+        uint32_t body_size = uint32_t(encoded_size + 8);
+        wirebuf_.resize(size_t(body_size) + 4);
+        memcpy(wirebuf_.data(), &body_size, 4);
+        wirebuf_[4] = uint8_t(type);
+        wirebuf_[5] = codec;
+        wirebuf_[6] = wirebuf_[7] = 0;
+        uint32_t raw_size = uint32_t(payload.size());
+        memcpy(wirebuf_.data() + 8, &raw_size, 4);
+        if (encoded_size) memcpy(wirebuf_.data() + 12, encoded, encoded_size);
+
+        auto io0 = Clock::now();
+        bool ok = write_all(fd_, wirebuf_.data(), wirebuf_.size());
+        write_ns_ += elapsed_ns(io0);
+        if (!ok) return false;
+        sent_ += wirebuf_.size();
+        sent_by_type_[uint8_t(type)] += wirebuf_.size();
+        return true;
+    }
+
+    bool recv(Frame& frame) {
+        uint32_t body_size = 0;
+        auto io0 = Clock::now();
+        if (!read_all(fd_, &body_size, sizeof(body_size))) return false;
+        if (body_size < 8 || body_size > (1u << 30)) return false;
+        incoming_.resize(body_size);
+        if (!read_all(fd_, incoming_.data(), incoming_.size())) return false;
+        read_ns_ += elapsed_ns(io0);
+
+        frame.type = Msg(incoming_[0]);
+        uint8_t codec = incoming_[1];
+        uint32_t raw_size = 0;
+        memcpy(&raw_size, incoming_.data() + 4, sizeof(raw_size));
+        const uint8_t* encoded = incoming_.data() + 8;
+        size_t encoded_size = incoming_.size() - 8;
+
+        if (codec == 0) {
+            if (encoded_size != raw_size) return false;
+            frame.payload.assign(encoded, encoded + encoded_size);
+        } else if (codec == 1) {
+            frame.payload.resize(raw_size);
+            auto z0 = Clock::now();
+            size_t n = ZSTD_decompressDCtx(dctx_, frame.payload.data(), frame.payload.size(),
+                                           encoded, encoded_size);
+            decompress_ns_ += elapsed_ns(z0);
+            if (ZSTD_isError(n) || n != raw_size) return false;
+        } else {
+            return false;
+        }
+
+        frame.wire_bytes = uint64_t(body_size) + 4;
+        received_ += frame.wire_bytes;
+        received_by_type_[uint8_t(frame.type)] += frame.wire_bytes;
+        return true;
+    }
+
+    uint64_t sent() const { return sent_; }
+    uint64_t received() const { return received_; }
+    uint64_t compress_ns() const { return compress_ns_; }
+    uint64_t decompress_ns() const { return decompress_ns_; }
+    uint64_t write_ns() const { return write_ns_; }
+    uint64_t read_ns() const { return read_ns_; }
+    const std::array<uint64_t, 256>& sent_by_type() const { return sent_by_type_; }
+    const std::array<uint64_t, 256>& received_by_type() const { return received_by_type_; }
+
+private:
+    int fd_;
+    int level_;
+    ZSTD_CCtx* cctx_ = nullptr;
+    ZSTD_DCtx* dctx_ = nullptr;
+    std::vector<uint8_t> compressed_;
+    std::vector<uint8_t> wirebuf_;
+    std::vector<uint8_t> incoming_;
+    uint64_t sent_ = 0;
+    uint64_t received_ = 0;
+    uint64_t compress_ns_ = 0;
+    uint64_t decompress_ns_ = 0;
+    uint64_t write_ns_ = 0;
+    uint64_t read_ns_ = 0;
+    std::array<uint64_t, 256> sent_by_type_{};
+    std::array<uint64_t, 256> received_by_type_{};
+};
+
+struct ByteSpan {
+    uint64_t off = 0;
+    uint32_t len = 0;
+    bool present = false;
+};
+
+class ReceiverStore {
+public:
+    bool has_line(uint64_t key) const {
+        return key < lines_.size() && lines_[size_t(key)].present;
+    }
+
+    bool has_region(uint64_t key) const {
+        return key < regions_.size() && regions_[size_t(key)].present;
+    }
+
+    bool has_block(uint64_t key) const {
+        return key < blocks_.size() && blocks_[size_t(key)].present;
+    }
+
+    bool install_line(uint64_t key, const uint8_t* bytes, size_t len) {
+        if (key > UINT32_MAX || len > UINT32_MAX) return false;
+        ensure(lines_, key);
+        ByteSpan& s = lines_[size_t(key)];
+        if (s.present) {
+            return s.len == len && memcmp(line_bytes_.data() + s.off, bytes, len) == 0;
+        }
+        s.off = line_bytes_.size();
+        s.len = uint32_t(len);
+        s.present = true;
+        line_bytes_.insert(line_bytes_.end(), bytes, bytes + len);
+        return true;
+    }
+
+    bool install_region(uint64_t key, const std::vector<uint64_t>& children) {
+        if (key > UINT32_MAX || children.size() > UINT32_MAX) return false;
+        ensure(regions_, key);
+        ByteSpan& s = regions_[size_t(key)];
+        if (s.present) {
+            if (s.len != children.size()) return false;
+            return memcmp(region_children_.data() + s.off, children.data(),
+                          children.size() * sizeof(uint64_t)) == 0;
+        }
+        s.off = region_children_.size();
+        s.len = uint32_t(children.size());
+        s.present = true;
+        region_children_.insert(region_children_.end(), children.begin(), children.end());
+        return true;
+    }
+
+    bool install_block(uint64_t key, const std::vector<uint64_t>& children) {
+        if (key > UINT32_MAX || children.size() > UINT32_MAX) return false;
+        ensure(blocks_, key);
+        ByteSpan& s = blocks_[size_t(key)];
+        if (s.present) {
+            if (s.len != children.size()) return false;
+            return memcmp(block_children_.data() + s.off, children.data(),
+                          children.size() * sizeof(uint64_t)) == 0;
+        }
+        s.off = block_children_.size();
+        s.len = uint32_t(children.size());
+        s.present = true;
+        block_children_.insert(block_children_.end(), children.begin(), children.end());
+        return true;
+    }
+
+    const ByteSpan* line(uint64_t key) const {
+        return has_line(key) ? &lines_[size_t(key)] : nullptr;
+    }
+
+    const ByteSpan* region(uint64_t key) const {
+        return has_region(key) ? &regions_[size_t(key)] : nullptr;
+    }
+
+    const ByteSpan* block(uint64_t key) const {
+        return has_block(key) ? &blocks_[size_t(key)] : nullptr;
+    }
+
+    const char* line_bytes(const ByteSpan& s) const { return line_bytes_.data() + s.off; }
+    const uint64_t* region_children(const ByteSpan& s) const {
+        return region_children_.data() + s.off;
+    }
+    const uint64_t* block_children(const ByteSpan& s) const {
+        return block_children_.data() + s.off;
+    }
+
+    bool materialize_region(uint64_t key) {
+        if (!has_region(key)) return false;
+        ensure(region_raw_, key);
+        ByteSpan& raw = region_raw_[size_t(key)];
+        if (raw.present) return true;
+        const ByteSpan& region_span = regions_[size_t(key)];
+        const uint64_t* children = region_children_.data() + region_span.off;
+        uint64_t total = 0;
+        for (uint32_t i = 0; i < region_span.len; ++i) {
+            const ByteSpan* line_span = line(children[i]);
+            if (!line_span) return false;
+            total += line_span->len;
+        }
+        if (total > UINT32_MAX) return false;
+        raw.off = region_bytes_.size();
+        raw.len = uint32_t(total);
+        raw.present = true;
+        for (uint32_t i = 0; i < region_span.len; ++i) {
+            const ByteSpan& line_span = lines_[size_t(children[i])];
+            const char* bytes = line_bytes_.data() + line_span.off;
+            region_bytes_.insert(region_bytes_.end(), bytes, bytes + line_span.len);
+        }
+        return true;
+    }
+
+    const ByteSpan* region_raw(uint64_t key) const {
+        return key < region_raw_.size() && region_raw_[size_t(key)].present
+            ? &region_raw_[size_t(key)] : nullptr;
+    }
+
+    const char* region_bytes(const ByteSpan& s) const { return region_bytes_.data() + s.off; }
+
+    uint64_t retained_bytes() const {
+        return line_bytes_.capacity() + region_children_.capacity() * sizeof(uint64_t) +
+               block_children_.capacity() * sizeof(uint64_t) + region_bytes_.capacity() +
+               lines_.capacity() * sizeof(ByteSpan) + regions_.capacity() * sizeof(ByteSpan) +
+               blocks_.capacity() * sizeof(ByteSpan) + region_raw_.capacity() * sizeof(ByteSpan);
+    }
+
+private:
+    static void ensure(std::vector<ByteSpan>& v, uint64_t key) {
+        if (key >= v.size()) v.resize(size_t(key) + 1);
+    }
+
+    std::vector<char> line_bytes_;
+    std::vector<char> region_bytes_;
+    std::vector<uint64_t> region_children_;
+    std::vector<uint64_t> block_children_;
+    std::vector<ByteSpan> lines_{1};
+    std::vector<ByteSpan> regions_{1};
+    std::vector<ByteSpan> blocks_{1};
+    std::vector<ByteSpan> region_raw_{1};
+};
+
+struct RootToken {
+    bool block = false;
+    uint32_t local = 0;
+};
+
+struct Transaction {
+    uint32_t id = 0;
+    uint64_t raw_len = 0;
+    std::vector<uint64_t> line_keys;
+    std::vector<uint64_t> region_keys;
+    std::vector<uint64_t> block_keys;
+    std::vector<uint64_t> missing_lines;
+    std::vector<uint64_t> missing_regions;
+    std::vector<uint64_t> missing_blocks;
+    std::vector<uint64_t> closure_regions;
+    std::vector<RootToken> root;
+};
+
+static bool decode_dict(const std::vector<uint8_t>& payload, Transaction& tx) {
+    Cursor c(payload);
+    uint64_t count = 0;
+    if (!c.u32(tx.id) || !c.u64(tx.raw_len) || !c.uvar(count) || count > UINT32_MAX) return false;
+    tx.region_keys.resize(size_t(count));
+    for (uint64_t& key : tx.region_keys) if (!c.u64(key)) return false;
+    if (!c.uvar(count) || count > UINT32_MAX) return false;
+    tx.block_keys.resize(size_t(count));
+    for (uint64_t& key : tx.block_keys) if (!c.u64(key)) return false;
+    return c.done();
+}
+
+static bool decode_root(const std::vector<uint8_t>& payload, Transaction& tx) {
+    Cursor c(payload);
+    uint32_t id = 0;
+    uint64_t count = 0;
+    if (!c.u32(id) || id != tx.id || !c.uvar(count) || count > UINT32_MAX) return false;
+    tx.root.resize(size_t(count));
+    for (RootToken& token : tx.root) {
+        uint64_t v = 0;
+        if (!c.uvar(v)) return false;
+        token.block = (v & 1) != 0;
+        v >>= 1;
+        if (v > UINT32_MAX || (!token.block && v >= tx.region_keys.size()) ||
+            (token.block && v >= tx.block_keys.size())) return false;
+        token.local = uint32_t(v);
+    }
+    return c.done();
+}
+
+static bool install_definition(Cursor& c, uint64_t key, ReceiverStore& store) {
+    uint8_t kind = 0;
+    if (!key || !c.u8(kind)) return false;
+    if (kind == 0) {
+        uint64_t len = 0;
+        const uint8_t* bytes = nullptr;
+        return c.uvar(len) && len <= UINT32_MAX && c.bytes(size_t(len), bytes) &&
+               store.install_line(key, bytes, size_t(len));
+    }
+    if (kind != 1) return false;
+
+    uint64_t base_key = 0, out_len = 0, prefix = 0, suffix = 0, middle_len = 0;
+    const uint8_t* middle = nullptr;
+    if (!c.u64(base_key) || !c.uvar(out_len) || !c.uvar(prefix) || !c.uvar(suffix) ||
+        !c.uvar(middle_len) || !c.bytes(size_t(middle_len), middle)) return false;
+    const ByteSpan* base = store.line(base_key);
+    if (!base || prefix + suffix > base->len || prefix + suffix + middle_len != out_len ||
+        out_len > UINT32_MAX) return false;
+    std::vector<uint8_t> expanded;
+    expanded.reserve(size_t(out_len));
+    const char* b = store.line_bytes(*base);
+    expanded.insert(expanded.end(), b, b + prefix);
+    expanded.insert(expanded.end(), middle, middle + middle_len);
+    expanded.insert(expanded.end(), b + base->len - suffix, b + base->len);
+    return store.install_line(key, expanded.data(), expanded.size());
+}
+
+static bool install_region_fill(const std::vector<uint8_t>& payload, const Transaction& tx,
+                                ReceiverStore& store) {
+    Cursor c(payload);
+    uint32_t id = 0;
+    uint64_t count = 0;
+    if (!c.u32(id) || id != tx.id || !c.uvar(count) || count > UINT32_MAX) return false;
+    std::vector<uint64_t> children;
+    for (uint64_t i = 0; i < count; ++i) {
+        uint64_t key = 0, n = 0;
+        if (!c.u64(key) || !key || !c.uvar(n) || n > UINT32_MAX) return false;
+        children.resize(size_t(n));
+        for (uint64_t& key : children) if (!c.u64(key) || !key) return false;
+        if (!store.install_region(key, children)) return false;
+    }
+    if (!c.uvar(count) || count > UINT32_MAX) return false;
+    for (uint64_t i = 0; i < count; ++i) {
+        uint64_t key = 0, n = 0;
+        if (!c.u64(key) || !key || !c.uvar(n) || n > UINT32_MAX) return false;
+        children.resize(size_t(n));
+        for (uint64_t& key : children) if (!c.u64(key) || !key) return false;
+        if (!store.install_block(key, children)) return false;
+    }
+    if (!c.uvar(count) || count > UINT32_MAX) return false;
+    for (uint64_t i = 0; i < count; ++i) {
+        uint64_t key = 0, n = 0;
+        if (!c.u64(key) || !key || !c.uvar(n) || n > UINT32_MAX) return false;
+        children.resize(size_t(n));
+        for (uint64_t& child : children) if (!c.u64(child) || !child) return false;
+        if (!store.install_region(key, children)) return false;
+    }
+    // Normal cold path: C's sticky view of F is exact, so definitions needed by the
+    // regions above ride in the same compressed FILL. MissingLines remains a fallback.
+    if (!c.uvar(count) || count > UINT32_MAX) return false;
+    for (uint64_t i = 0; i < count; ++i) {
+        uint64_t key = 0;
+        if (!c.u64(key) || !install_definition(c, key, store)) return false;
+    }
+    return c.done();
+}
+
+static bool install_line_fill(const std::vector<uint8_t>& payload, const Transaction& tx,
+                              ReceiverStore& store) {
+    Cursor c(payload);
+    uint32_t id = 0;
+    uint64_t count = 0;
+    if (!c.u32(id) || id != tx.id || !c.uvar(count) || count != tx.missing_lines.size()) return false;
+    for (size_t i = 0; i < tx.missing_lines.size(); ++i) {
+        if (!install_definition(c, tx.missing_lines[i], store)) return false;
+    }
+    return c.done();
+}
+
+static bool install_closure_region_fill(const std::vector<uint8_t>& payload,
+                                        const Transaction& tx, ReceiverStore& store) {
+    Cursor c(payload);
+    uint32_t id = 0;
+    uint64_t count = 0;
+    if (!c.u32(id) || id != tx.id || !c.uvar(count) || count != tx.closure_regions.size())
+        return false;
+    std::vector<uint64_t> children;
+    for (size_t i = 0; i < tx.closure_regions.size(); ++i) {
+        uint64_t n = 0;
+        if (!c.uvar(n) || n > UINT32_MAX) return false;
+        children.resize(size_t(n));
+        for (uint64_t& key : children) if (!c.u64(key) || !key) return false;
+        if (!store.install_region(tx.closure_regions[i], children)) return false;
+    }
+    return c.done();
+}
+
+static bool emit_transaction(const Transaction& tx, ReceiverStore& store, int out_fd,
+                             uint64_t& emitted) {
+    std::vector<ByteSpan> ordered;
+    ordered.reserve(tx.root.size() * 4);
+    uint64_t total = 0;
+
+    auto append_region = [&](uint64_t region_key) -> bool {
+        if (!store.materialize_region(region_key)) return false;
+        const ByteSpan* raw = store.region_raw(region_key);
+        if (!raw) return false;
+        ordered.push_back(*raw);
+        total += raw->len;
+        return true;
+    };
+
+    for (const RootToken& token : tx.root) {
+        if (!token.block) {
+            if (!append_region(tx.region_keys[token.local])) return false;
+            continue;
+        }
+        const ByteSpan* block = store.block(tx.block_keys[token.local]);
+        if (!block) return false;
+        const uint64_t* children = store.block_children(*block);
+        for (uint32_t i = 0; i < block->len; ++i)
+            if (!append_region(children[i])) return false;
+    }
+    if (total != tx.raw_len) return false;
+
+    // All region materialization is complete, so region_bytes_ can no longer move.
+    // Scatter-gather directly into the compiler/verifier pipe and avoid copying the
+    // reconstructed TU through a second one-megabyte staging buffer.
+    size_t index = 0;
+    size_t skip = 0;
+    while (index < ordered.size()) {
+        while (index < ordered.size() && skip == ordered[index].len) {
+            ++index;
+            skip = 0;
+        }
+        if (index == ordered.size()) break;
+        std::array<struct iovec, 512> iov{};
+        size_t count = 0;
+        for (size_t j = index; j < ordered.size() && count < iov.size(); ++j) {
+            size_t local_skip = (j == index) ? skip : 0;
+            if (local_skip == ordered[j].len) continue;
+            iov[count].iov_base = const_cast<char*>(store.region_bytes(ordered[j]) + local_skip);
+            iov[count].iov_len = ordered[j].len - local_skip;
+            ++count;
+        }
+        if (!count) break;
+        ssize_t n = ::writev(out_fd, iov.data(), int(count));
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return false;
+        size_t consumed = size_t(n);
+        while (index < ordered.size() && consumed) {
+            size_t available = ordered[index].len - skip;
+            if (consumed < available) {
+                skip += consumed;
+                consumed = 0;
+            } else {
+                consumed -= available;
+                ++index;
+                skip = 0;
+            }
+        }
+    }
+    if (index != ordered.size()) return false;
+    emitted += total;
+    return true;
+}
+
+static int receiver_main(int fd, int out_fd, int zlevel) {
+    FramedChannel channel(fd, zlevel);
+    Frame frame;
+    if (!channel.recv(frame) || frame.type != Msg::Hello) return 21;
+    Cursor hello(frame.payload);
+    uint32_t protocol = 0;
+    uint64_t guid = 0;
+    if (!hello.u32(protocol) || protocol != 50 || !hello.u64(guid) || !hello.done()) return 22;
+    (void)guid;
+
+    ReceiverStore store;
+    uint64_t emitted = 0;
+    uint64_t decode_ns = 0;
+    uint64_t expand_ns = 0;
+
+    for (;;) {
+        if (!channel.recv(frame)) return 23;
+        if (frame.type == Msg::Done) break;
+        if (frame.type != Msg::Dict) return 24;
+
+        auto d0 = Clock::now();
+        Transaction tx;
+        if (!decode_dict(frame.payload, tx)) return 25;
+        for (uint64_t key : tx.region_keys) if (!store.has_region(key)) tx.missing_regions.push_back(key);
+        for (uint64_t key : tx.block_keys) if (!store.has_block(key)) tx.missing_blocks.push_back(key);
+
+        decode_ns += elapsed_ns(d0);
+
+        if (!channel.recv(frame) || frame.type != Msg::Root || !decode_root(frame.payload, tx)) return 27;
+        // C's per-conversation sticky-F view drives the normal proactive FILL. The FILL
+        // carries explicit object keys, so F installs what actually arrived and validates
+        // the complete closure below.
+        if (!channel.recv(frame) || frame.type != Msg::Fill) return 28;
+        d0 = Clock::now();
+        if (!install_region_fill(frame.payload, tx, store)) return 29;
+
+        std::vector<uint8_t> missing;
+        if (!tx.missing_blocks.empty()) {
+                for (uint64_t block_key : tx.block_keys) {
+                    const ByteSpan* block = store.block(block_key);
+                    if (!block) return 29;
+                    const uint64_t* children = store.block_children(*block);
+                    for (uint32_t i = 0; i < block->len; ++i)
+                        if (!store.has_region(children[i])) tx.closure_regions.push_back(children[i]);
+                }
+                std::sort(tx.closure_regions.begin(), tx.closure_regions.end());
+                tx.closure_regions.erase(std::unique(tx.closure_regions.begin(), tx.closure_regions.end()),
+                                         tx.closure_regions.end());
+                if (!tx.closure_regions.empty()) {
+                    missing.clear();
+                    put_u32(missing, tx.id);
+                    put_uvar(missing, tx.closure_regions.size());
+                    for (uint64_t key : tx.closure_regions) put_u64(missing, key);
+                    if (!channel.send(Msg::MissingRegions, missing)) return 29;
+                    if (!channel.recv(frame) || frame.type != Msg::FillRegions ||
+                        !install_closure_region_fill(frame.payload, tx, store)) return 29;
+                }
+            }
+
+        auto gather_missing_lines = [&](uint64_t region_key) -> bool {
+                const ByteSpan* region = store.region(region_key);
+                if (!region) return false;
+                const uint64_t* children = store.region_children(*region);
+                for (uint32_t i = 0; i < region->len; ++i)
+                    if (!store.has_line(children[i])) tx.missing_lines.push_back(children[i]);
+                return true;
+            };
+        for (uint64_t region_key : tx.missing_regions)
+            if (!gather_missing_lines(region_key)) return 29;
+        for (uint64_t region_key : tx.closure_regions)
+            if (!gather_missing_lines(region_key)) return 29;
+        std::sort(tx.missing_lines.begin(), tx.missing_lines.end());
+        tx.missing_lines.erase(std::unique(tx.missing_lines.begin(), tx.missing_lines.end()),
+                               tx.missing_lines.end());
+        decode_ns += elapsed_ns(d0);
+
+        // This frame is also the early READY signal when the count is zero. It lets C
+        // start the next TU while F expands and emits this one; the later ACK verifies it.
+        put_u32(missing, tx.id);
+        put_uvar(missing, tx.missing_lines.size());
+        for (uint64_t key : tx.missing_lines) put_u64(missing, key);
+        if (!channel.send(Msg::MissingLines, missing)) return 29;
+        if (!tx.missing_lines.empty()) {
+            if (!channel.recv(frame) || frame.type != Msg::FillLines) return 29;
+            d0 = Clock::now();
+            if (!install_line_fill(frame.payload, tx, store)) return 29;
+            decode_ns += elapsed_ns(d0);
+        }
+
+        auto e0 = Clock::now();
+        if (!emit_transaction(tx, store, out_fd, emitted)) return 30;
+        expand_ns += elapsed_ns(e0);
+
+        std::vector<uint8_t> ack;
+        put_u32(ack, tx.id);
+        put_u64(ack, tx.raw_len);
+        if (!channel.send(Msg::Ack, ack, false)) return 31;
+    }
+
+    struct rusage ru {};
+    getrusage(RUSAGE_SELF, &ru);
+    std::vector<uint8_t> final;
+    put_u64(final, emitted);
+    put_u64(final, decode_ns + channel.decompress_ns());
+    put_u64(final, expand_ns);
+    put_u64(final, store.retained_bytes());
+    put_u64(final, uint64_t(ru.ru_maxrss) * 1024);
+    if (!channel.send(Msg::Final, final, false)) return 32;
+    ::close(out_fd);
+    return 0;
+}
+
+class DenseIndex {
+public:
+    void begin(size_t size) {
+        if (stamp_.size() < size) {
+            stamp_.resize(size);
+            value_.resize(size);
+        }
+        if (++epoch_ == 0) {
+            std::fill(stamp_.begin(), stamp_.end(), 0);
+            epoch_ = 1;
+        }
+    }
+
+    bool add(uint32_t key, uint32_t local) {
+        if (key >= stamp_.size()) return false;
+        if (stamp_[key] == epoch_) return false;
+        stamp_[key] = epoch_;
+        value_[key] = local;
+        return true;
+    }
+
+    uint32_t get(uint32_t key) const {
+        return key < stamp_.size() && stamp_[key] == epoch_ ? value_[key] : UINT32_MAX;
+    }
+
+private:
+    std::vector<uint32_t> stamp_;
+    std::vector<uint32_t> value_;
+    uint32_t epoch_ = 0;
+};
+
+static uint64_t bytes_hash(const char* p, size_t n) {
+    uint64_t h = 1469598103934665603ULL;
+    while (n >= 8) {
+        uint64_t v = 0;
+        memcpy(&v, p, 8);
+        h = mix64(h ^ v);
+        p += 8;
+        n -= 8;
+    }
+    uint64_t tail = 0;
+    if (n) memcpy(&tail, p, n);
+    return mix64(h ^ tail ^ uint64_t(n));
+}
+
+static uint64_t skeleton_hash(const char* p, size_t n) {
+    uint64_t h = 1469598103934665603ULL;
+    uint8_t previous_class = 255;
+    for (size_t i = 0; i < n; ++i) {
+        unsigned char c = static_cast<unsigned char>(p[i]);
+        uint8_t cls;
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_') cls = 1;
+        else if (c >= '0' && c <= '9') cls = 2;
+        else if (c == ' ' || c == '\t') cls = 3;
+        else cls = 4;
+        if (cls != previous_class || cls == 4) {
+            h ^= cls == 4 ? uint64_t(c) + 256 : cls;
+            h *= 1099511628211ULL;
+            previous_class = cls;
+        }
+    }
+    return mix64(h ^ n);
+}
+
+static uint64_t edge_hash(const char* p, size_t n) {
+    size_t a = std::min<size_t>(8, n);
+    size_t b = std::min<size_t>(8, n - a);
+    uint64_t lo = 0, hi = 0;
+    if (a) memcpy(&lo, p, a);
+    if (b) memcpy(&hi, p + n - b, b);
+    return mix64(lo ^ (hi << 1) ^ (uint64_t(n / 16) << 48));
+}
+
+struct CandidateInfo {
+    std::array<uint32_t, 4> ids{};
+    uint8_t count = 0;
+    uint64_t location = 0;
+    uint64_t skeleton = 0;
+    uint64_t edge = 0;
+    bool seen = false;
+
+    void add(uint32_t id) {
+        if (!id) return;
+        for (uint8_t i = 0; i < count; ++i) if (ids[i] == id) return;
+        if (count < ids.size()) ids[count++] = id;
+    }
+};
+
+class DefinitionPredictor {
+public:
+    std::vector<CandidateInfo> analyze(const char* begin, const char* end,
+                                       const uint32_t* line_ids, size_t count,
+                                       uint32_t first_new, uint32_t last_new) const {
+        size_t new_count = last_new >= first_new ? size_t(last_new - first_new + 1) : 0;
+        std::vector<CandidateInfo> result(new_count);
+        const char* p = begin;
+        size_t occurrence = 0;
+        uint64_t path_hash = 0;
+        uint64_t logical_line = 0;
+        Marker marker;
+
+        while (p < end && occurrence < count) {
+            const void* hit = memchr(p, '\n', size_t(end - p));
+            const char* q = hit ? static_cast<const char*>(hit) + 1 : end;
+            uint32_t id = line_ids[occurrence++];
+            bool is_new = new_count && id >= first_new && id <= last_new;
+            if (is_new) {
+                CandidateInfo& info = result[size_t(id - first_new)];
+                if (!info.seen) {
+                    info.seen = true;
+                    info.location = mix64(path_hash ^ (logical_line * 0x9e3779b97f4a7c15ULL));
+                    info.skeleton = skeleton_hash(p, size_t(q - p));
+                    info.edge = edge_hash(p, size_t(q - p));
+                    auto add_from = [&](const std::unordered_map<uint64_t, uint32_t>& map, uint64_t key) {
+                        auto it = map.find(key);
+                        if (it != map.end()) info.add(it->second);
+                    };
+                    add_from(by_location_, info.location);
+                    add_from(by_skeleton_, info.skeleton);
+                    add_from(by_edge_, info.edge);
+                    info.add(recent_);
+                }
+            }
+
+            if (parse_marker(p, uint32_t(q - p), marker)) {
+                path_hash = bytes_hash(marker.path.data(), marker.path.size());
+                logical_line = marker.lineno;
+            } else {
+                ++logical_line;
+            }
+            p = q;
+        }
+        if (occurrence != count || p != end) result.clear();
+        return result;
+    }
+
+    void commit(uint32_t first_new, const std::vector<CandidateInfo>& infos) {
+        for (size_t i = 0; i < infos.size(); ++i) {
+            const CandidateInfo& info = infos[i];
+            if (!info.seen) continue;
+            uint32_t id = first_new + uint32_t(i);
+            by_location_[info.location] = id;
+            by_skeleton_[info.skeleton] = id;
+            by_edge_[info.edge] = id;
+            recent_ = id;
+        }
+    }
+
+private:
+    std::unordered_map<uint64_t, uint32_t> by_location_;
+    std::unordered_map<uint64_t, uint32_t> by_skeleton_;
+    std::unordered_map<uint64_t, uint32_t> by_edge_;
+    uint32_t recent_ = 0;
+};
+
+struct DefinitionStats {
+    uint64_t literals = 0;
+    uint64_t deltas = 0;
+    uint64_t literal_bytes = 0;
+    uint64_t delta_middle_bytes = 0;
+    uint64_t copied_bytes = 0;
+};
+
+static void encode_definition(std::vector<uint8_t>& out, uint32_t line_id,
+                              const Interner& dict, const CandidateInfo* candidates,
+                              const std::vector<uint8_t>& receiver_known, bool use_delta,
+                              DefinitionStats& stats) {
+    const LineRef& ref = dict.ref(line_id);
+    const char* text = dict.line_data(ref.off);
+    size_t literal_size = 1 + uvar_size(ref.len) + ref.len;
+    uint32_t best_base = 0;
+    uint32_t best_prefix = 0;
+    uint32_t best_suffix = 0;
+    size_t best_size = literal_size;
+
+    if (use_delta && candidates) {
+        for (uint8_t ci = 0; ci < candidates->count; ++ci) {
+            uint32_t base_id = candidates->ids[ci];
+            if (!base_id || base_id >= receiver_known.size() || !receiver_known[base_id]) continue;
+            const LineRef& base = dict.ref(base_id);
+            const char* b = dict.line_data(base.off);
+            uint32_t prefix = 0;
+            uint32_t max_common = std::min(ref.len, base.len);
+            while (prefix < max_common && text[prefix] == b[prefix]) ++prefix;
+            uint32_t suffix = 0;
+            while (suffix < max_common - prefix &&
+                   text[ref.len - suffix - 1] == b[base.len - suffix - 1]) ++suffix;
+            uint32_t middle = ref.len - prefix - suffix;
+            size_t candidate_size = 1 + sizeof(uint64_t) + uvar_size(ref.len) +
+                                    uvar_size(prefix) + uvar_size(suffix) +
+                                    uvar_size(middle) + middle;
+            if (candidate_size < best_size) {
+                best_size = candidate_size;
+                best_base = base_id;
+                best_prefix = prefix;
+                best_suffix = suffix;
+            }
+        }
+    }
+
+    if (!best_base) {
+        out.push_back(0);
+        put_uvar(out, ref.len);
+        out.insert(out.end(), text, text + ref.len);
+        ++stats.literals;
+        stats.literal_bytes += ref.len;
+        return;
+    }
+
+    uint32_t middle = ref.len - best_prefix - best_suffix;
+    out.push_back(1);
+    put_u64(out, best_base);
+    put_uvar(out, ref.len);
+    put_uvar(out, best_prefix);
+    put_uvar(out, best_suffix);
+    put_uvar(out, middle);
+    out.insert(out.end(), text + best_prefix, text + best_prefix + middle);
+    ++stats.deltas;
+    stats.delta_middle_bytes += middle;
+    stats.copied_bytes += best_prefix + best_suffix;
+}
+
+struct VerifyResult {
+    bool exact = true;
+    uint64_t bytes = 0;
+};
+
+struct EncodedToken {
+    bool block = false;
+    uint32_t id = 0;
+};
+
+class OnlineBlocks {
+public:
+    explicit OnlineBlocks(bool enabled) : enabled_(enabled), head_(size_t(1) << HASH_BITS, UINT32_MAX) {
+        block_off_.push_back(0);
+    }
+
+    std::vector<EncodedToken> encode(const std::vector<uint32_t>& regions) {
+        std::vector<EncodedToken> root;
+        root.reserve(regions.size());
+        if (!enabled_) {
+            for (uint32_t region : regions) root.push_back({false, region});
+            learn(regions);
+            return root;
+        }
+
+        size_t i = 0;
+        while (i < regions.size()) {
+            size_t best = 0;
+            if (i + MIN_MATCH <= regions.size() && history_.size() >= MIN_MATCH) {
+                uint32_t candidate = head_[kgram(regions.data() + i)];
+                unsigned chain = 0;
+                while (candidate != UINT32_MAX && chain++ < MAX_CHAIN) {
+                    size_t limit = std::min(regions.size() - i, history_.size() - candidate);
+                    size_t length = 0;
+                    while (length < limit && history_[candidate + length] == regions[i + length]) ++length;
+                    if (length > best) best = length;
+                    if (best == regions.size() - i) break;
+                    candidate = previous_[candidate];
+                }
+            }
+
+            if (best >= MIN_MATCH) {
+                root.push_back({true, get_block(regions.data() + i, best)});
+                i += best;
+            } else {
+                root.push_back({false, regions[i++]});
+            }
+        }
+        learn(regions);
+        return root;
+    }
+
+    size_t block_count() const { return block_off_.size() - 1; }
+    const uint32_t* block_children(uint32_t id) const { return block_children_.data() + block_off_[id]; }
+    uint32_t block_size(uint32_t id) const { return uint32_t(block_off_[id + 1] - block_off_[id]); }
+
+private:
+    static constexpr unsigned HASH_BITS = 20;
+    static constexpr unsigned MIN_MATCH = 3;
+    static constexpr unsigned MAX_CHAIN = 16;
+
+    static uint32_t kgram(const uint32_t* p) {
+        uint64_t h = uint64_t(p[0]) * 0x9e3779b185ebca87ULL;
+        h ^= uint64_t(p[1]) * 0xc2b2ae3d27d4eb4fULL;
+        h ^= uint64_t(p[2]) * 0x165667b19e3779f9ULL;
+        return uint32_t(mix64(h) >> (64 - HASH_BITS));
+    }
+
+    static uint64_t span_hash(const uint32_t* p, size_t n) {
+        uint64_t h = 1469598103934665603ULL ^ (uint64_t(n) * 0x9e3779b97f4a7c15ULL);
+        for (size_t i = 0; i < n; ++i) {
+            h ^= p[i];
+            h *= 1099511628211ULL;
+        }
+        return h;
+    }
+
+    uint32_t get_block(const uint32_t* p, size_t n) {
+        uint64_t hash = span_hash(p, n);
+        auto range = blocks_by_hash_.equal_range(hash);
+        for (auto it = range.first; it != range.second; ++it) {
+            uint32_t id = it->second;
+            if (block_size(id) == n &&
+                memcmp(block_children(id), p, n * sizeof(uint32_t)) == 0) return id;
+        }
+        uint32_t id = uint32_t(block_count());
+        block_children_.insert(block_children_.end(), p, p + n);
+        block_off_.push_back(block_children_.size());
+        blocks_by_hash_.emplace(hash, id);
+        return id;
+    }
+
+    void learn(const std::vector<uint32_t>& regions) {
+        if (regions.empty()) return;
+        if (history_.size() + regions.size() > UINT32_MAX) {
+            fprintf(stderr, "region history exceeds u32 position space\n");
+            exit(2);
+        }
+        size_t base = history_.size();
+        history_.insert(history_.end(), regions.begin(), regions.end());
+        previous_.resize(history_.size(), UINT32_MAX);
+        for (size_t i = base; i + MIN_MATCH <= history_.size(); ++i) {
+            uint32_t bucket = kgram(history_.data() + i);
+            previous_[i] = head_[bucket];
+            head_[bucket] = uint32_t(i);
+        }
+    }
+
+    bool enabled_;
+    std::vector<uint32_t> head_;
+    std::vector<uint32_t> previous_;
+    std::vector<uint32_t> history_;
+    std::vector<uint32_t> block_children_;
+    std::vector<size_t> block_off_;
+    std::unordered_multimap<uint64_t, uint32_t> blocks_by_hash_;
+};
+
+static void verify_output(int fd, const Corpus* corpus, unsigned passes, VerifyResult* result) {
+    std::vector<char> buffer(1u << 20);
+    uint64_t total_expected = corpus->raw * uint64_t(passes);
+    uint64_t offset = 0;
+    for (;;) {
+        ssize_t n = ::read(fd, buffer.data(), buffer.size());
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) { result->exact = false; break; }
+        if (n == 0) break;
+        size_t consumed = 0;
+        while (consumed < size_t(n)) {
+            if (!corpus->raw || offset >= total_expected) { result->exact = false; consumed = size_t(n); break; }
+            uint64_t in_pass = offset % corpus->raw;
+            size_t chunk = std::min<size_t>(size_t(n) - consumed, size_t(corpus->raw - in_pass));
+            if (memcmp(buffer.data() + consumed, corpus->bytes.data() + in_pass, chunk) != 0)
+                result->exact = false;
+            consumed += chunk;
+            offset += chunk;
+        }
+    }
+    result->bytes = offset;
+    if (offset != total_expected) result->exact = false;
+    ::close(fd);
+}
+
+struct Options {
+    const char* manifest = nullptr;
+    size_t max_files = SIZE_MAX;
+    int zlevel = 1;
+    unsigned passes = 1;
+    bool delta = false;
+    bool blocks = true;
+    bool pipeline = true;
+    uint32_t pipeline_window = 8;
+    bool receiver = false;
+    int fd = -1;
+    int out_fd = -1;
+};
+
+static bool parse_options(int argc, char** argv, Options& o) {
+    for (int i = 1; i < argc; ++i) {
+        if (!strcmp(argv[i], "--manifest") && i + 1 < argc) o.manifest = argv[++i];
+        else if (!strcmp(argv[i], "--max-files") && i + 1 < argc) o.max_files = strtoull(argv[++i], nullptr, 10);
+        else if (!strcmp(argv[i], "--z") && i + 1 < argc) o.zlevel = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--passes") && i + 1 < argc) o.passes = unsigned(atoi(argv[++i]));
+        else if (!strcmp(argv[i], "--delta")) o.delta = true;
+        else if (!strcmp(argv[i], "--no-delta")) o.delta = false;
+        else if (!strcmp(argv[i], "--no-blocks")) o.blocks = false;
+        else if (!strcmp(argv[i], "--sync")) o.pipeline = false;
+        else if (!strcmp(argv[i], "--window") && i + 1 < argc)
+            o.pipeline_window = uint32_t(strtoul(argv[++i], nullptr, 10));
+        else if (!strcmp(argv[i], "--receiver")) o.receiver = true;
+        else if (!strcmp(argv[i], "--fd") && i + 1 < argc) o.fd = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--out-fd") && i + 1 < argc) o.out_fd = atoi(argv[++i]);
+        else return false;
+    }
+    if (o.zlevel != 0 && o.zlevel != 1 && o.zlevel != 3) return false;
+    if (!o.passes || !o.pipeline_window) return false;
+    return o.receiver ? o.fd >= 0 && o.out_fd >= 0 : o.manifest != nullptr;
+}
+
+static bool drain_pipeline_reply(FramedChannel& channel, uint32_t expected_id,
+                                 uint64_t expected_len) {
+    Frame frame;
+    if (!channel.recv(frame) || frame.type != Msg::MissingLines) return false;
+    Cursor ready(frame.payload);
+    uint32_t ready_id = 0;
+    uint64_t count = 0;
+    if (!ready.u32(ready_id) || ready_id != expected_id || !ready.uvar(count) ||
+        count != 0 || !ready.done()) return false;
+    if (!channel.recv(frame) || frame.type != Msg::Ack) return false;
+    Cursor ack(frame.payload);
+    uint32_t ack_id = 0;
+    uint64_t ack_len = 0;
+    return ack.u32(ack_id) && ack_id == expected_id && ack.u64(ack_len) &&
+           ack_len == expected_len && ack.done();
+}
+
+static int sender_main(const Options& options) {
+    signal(SIGPIPE, SIG_IGN);
+    int sockets[2] = {-1, -1};
+    int output[2] = {-1, -1};
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0 || pipe(output) != 0) {
+        perror("socketpair/pipe");
+        return 2;
+    }
+#ifdef F_SETPIPE_SZ
+    (void)fcntl(output[0], F_SETPIPE_SZ, 1 << 20);
+#endif
+
+    pid_t child = fork();
+    if (child < 0) { perror("fork"); return 2; }
+    if (child == 0) {
+        ::close(sockets[0]);
+        ::close(output[0]);
+        char fd_arg[32], out_arg[32], z_arg[16];
+        snprintf(fd_arg, sizeof(fd_arg), "%d", sockets[1]);
+        snprintf(out_arg, sizeof(out_arg), "%d", output[1]);
+        snprintf(z_arg, sizeof(z_arg), "%d", options.zlevel);
+        char* const args[] = {
+            const_cast<char*>("codec50"), const_cast<char*>("--receiver"),
+            const_cast<char*>("--fd"), fd_arg,
+            const_cast<char*>("--out-fd"), out_arg,
+            const_cast<char*>("--z"), z_arg, nullptr
+        };
+        execv("/proc/self/exe", args);
+        _exit(127);
+    }
+    ::close(sockets[1]);
+    ::close(output[1]);
+
+    auto total_start = Clock::now();
+    auto load_start = Clock::now();
+    Corpus corpus = load_corpus(options.manifest, options.max_files);
+    uint64_t load_ns = elapsed_ns(load_start);
+
+    VerifyResult verification;
+    std::thread verifier(verify_output, output[0], &corpus, options.passes, &verification);
+    FramedChannel channel(sockets[0], options.zlevel);
+
+    uint64_t guid = mix64(uint64_t(getpid()) ^ uint64_t(total_start.time_since_epoch().count()));
+    std::vector<uint8_t> payload;
+    put_u32(payload, 50);
+    put_u64(payload, guid);
+    if (!channel.send(Msg::Hello, payload, false)) return 3;
+
+    Interner dict;
+    OnlineBlocks blocks(options.blocks);
+    DefinitionPredictor predictor;
+    DefinitionStats definition_stats;
+    DenseIndex region_index, block_index, eager_index;
+    std::vector<uint8_t> receiver_known(1, 0);
+    std::vector<uint8_t> receiver_known_regions(1, 0);
+    std::vector<uint8_t> receiver_known_blocks(1, 0);
+    uint32_t max_len = 0;
+    for (const FileSpan& f : corpus.files) max_len = std::max(max_len, f.len);
+    std::vector<uint32_t> line_occurrences(size_t(max_len) + 1);
+    std::vector<uint32_t> regions;
+    std::vector<uint64_t> region_keys, block_keys, missing_lines, missing_regions, missing_blocks,
+                          closure_regions, eager_regions, eager_lines;
+    std::vector<uint64_t> transaction_lengths;
+    std::vector<EncodedToken> root_tokens;
+    std::vector<CandidateInfo> candidates;
+    uint64_t intern_ns = 0, plan_ns = 0, fill_ns = 0, wait_ns = 0;
+    uint64_t region_hits = 0;
+    uint32_t txid = 0;
+    uint32_t replies_drained = 0;
+    uint32_t pending_ack = 0;
+    uint64_t pending_ack_len = 0;
+    bool ok = true;
+
+    for (unsigned pass = 0; pass < options.passes && ok; ++pass) {
+        for (const FileSpan& file : corpus.files) {
+            ++txid;
+            transaction_lengths.push_back(file.len);
+            const char* begin = corpus.bytes.data() + file.off;
+            const char* end = begin + file.len;
+            uint32_t before_lines = dict.distinct();
+
+            auto i0 = Clock::now();
+            size_t occurrence_count = 0;
+            regions.clear();
+            dict.process(begin, end, line_occurrences.data(), occurrence_count,
+                         region_hits, pass == 0, &regions);
+            intern_ns += elapsed_ns(i0);
+            uint32_t after_lines = dict.distinct();
+            if (dict.region_count() + 1 > receiver_known_regions.size())
+                receiver_known_regions.resize(size_t(dict.region_count()) + 1, 0);
+
+            auto p0 = Clock::now();
+            root_tokens = blocks.encode(regions);
+            if (after_lines + 1 > receiver_known.size()) receiver_known.resize(size_t(after_lines) + 1, 0);
+            if (blocks.block_count() + 1 > receiver_known_blocks.size())
+                receiver_known_blocks.resize(blocks.block_count() + 1, 0);
+            uint32_t first_new = before_lines + 1;
+            if (options.delta)
+                candidates = predictor.analyze(begin, end, line_occurrences.data(), occurrence_count,
+                                               first_new, after_lines);
+            else
+                candidates.clear();
+
+            region_index.begin(size_t(dict.region_count()));
+            region_keys.clear();
+            for (const EncodedToken& token : root_tokens) {
+                if (!token.block && region_index.add(token.id, uint32_t(region_keys.size())))
+                    region_keys.push_back(uint64_t(token.id) + 1);
+            }
+            block_index.begin(blocks.block_count());
+            block_keys.clear();
+            for (const EncodedToken& token : root_tokens) {
+                if (token.block && block_index.add(token.id, uint32_t(block_keys.size())))
+                    block_keys.push_back(uint64_t(token.id) + 1);
+            }
+
+            missing_regions.clear();
+            for (uint64_t key : region_keys)
+                if (!receiver_known_regions[size_t(key)]) missing_regions.push_back(key);
+            missing_blocks.clear();
+            for (uint64_t key : block_keys)
+                if (!receiver_known_blocks[size_t(key)]) missing_blocks.push_back(key);
+
+            payload.clear();
+            put_u32(payload, txid);
+            put_u64(payload, file.len);
+            put_uvar(payload, region_keys.size());
+            for (uint64_t key : region_keys) put_u64(payload, key);
+            put_uvar(payload, block_keys.size());
+            for (uint64_t key : block_keys) put_u64(payload, key);
+            if (!channel.send(Msg::Dict, payload)) { ok = false; break; }
+
+            payload.clear();
+            put_u32(payload, txid);
+            put_uvar(payload, root_tokens.size());
+            for (const EncodedToken& token : root_tokens) {
+                uint32_t local = token.block ? block_index.get(token.id) : region_index.get(token.id);
+                put_uvar(payload, (uint64_t(local) << 1) | (token.block ? 1 : 0));
+            }
+            if (!channel.send(Msg::Root, payload)) { ok = false; break; }
+            plan_ns += elapsed_ns(p0);
+
+            Frame frame;
+            uint32_t reply_id = 0;
+            uint64_t count = 0;
+            auto w0 = Clock::now();
+
+            missing_lines.clear();
+            bool current_acked = false;
+            {
+                auto f0 = Clock::now();
+                eager_index.begin(size_t(dict.region_count()) + 1);
+                eager_regions.clear();
+                for (uint64_t key : missing_regions) eager_index.add(uint32_t(key), 0);
+                for (uint64_t block_key : missing_blocks) {
+                    if (!block_key || block_key - 1 >= blocks.block_count()) { ok = false; break; }
+                    uint32_t block_id = uint32_t(block_key - 1);
+                    const uint32_t* children = blocks.block_children(block_id);
+                    uint32_t child_count = blocks.block_size(block_id);
+                    for (uint32_t j = 0; j < child_count; ++j) {
+                        uint64_t key = uint64_t(children[j]) + 1;
+                        if (!receiver_known_regions[size_t(key)] &&
+                            eager_index.add(uint32_t(key), uint32_t(eager_regions.size())))
+                            eager_regions.push_back(key);
+                    }
+                }
+                if (!ok) break;
+
+                eager_lines.clear();
+                auto gather_eager_lines = [&](uint64_t region_key) -> bool {
+                    if (!region_key || region_key - 1 >= dict.region_count()) return false;
+                    uint32_t region_id = uint32_t(region_key - 1);
+                    uint32_t child_count = dict.region_ids_count(region_id);
+                    const uint32_t* children = dict.region_ids_ptr(region_id);
+                    for (uint32_t j = 0; j < child_count; ++j) {
+                        uint64_t line_key = children[j];
+                        if (!line_key || line_key >= receiver_known.size()) return false;
+                        if (!receiver_known[size_t(line_key)]) eager_lines.push_back(line_key);
+                    }
+                    return true;
+                };
+                for (uint64_t key : missing_regions)
+                    if (!gather_eager_lines(key)) { ok = false; break; }
+                for (uint64_t key : eager_regions)
+                    if (!gather_eager_lines(key)) { ok = false; break; }
+                if (!ok) break;
+                std::sort(eager_lines.begin(), eager_lines.end());
+                eager_lines.erase(std::unique(eager_lines.begin(), eager_lines.end()), eager_lines.end());
+
+                payload.clear();
+                put_u32(payload, txid);
+                put_uvar(payload, missing_regions.size());
+                for (uint64_t key : missing_regions) {
+                    if (!key || key - 1 >= dict.region_count()) { ok = false; break; }
+                    uint32_t region_id = uint32_t(key - 1);
+                    uint32_t child_count = dict.region_ids_count(region_id);
+                    const uint32_t* children = dict.region_ids_ptr(region_id);
+                    put_u64(payload, key);
+                    put_uvar(payload, child_count);
+                    for (uint32_t j = 0; j < child_count; ++j) put_u64(payload, children[j]);
+                    if (!ok) break;
+                }
+                put_uvar(payload, missing_blocks.size());
+                for (uint64_t key : missing_blocks) {
+                    if (!key || key - 1 >= blocks.block_count()) { ok = false; break; }
+                    uint32_t block_id = uint32_t(key - 1);
+                    uint32_t child_count = blocks.block_size(block_id);
+                    const uint32_t* children = blocks.block_children(block_id);
+                    put_u64(payload, key);
+                    put_uvar(payload, child_count);
+                    for (uint32_t j = 0; j < child_count; ++j) put_u64(payload, uint64_t(children[j]) + 1);
+                }
+                put_uvar(payload, eager_regions.size());
+                for (uint64_t key : eager_regions) {
+                    put_u64(payload, key);
+                    uint32_t region_id = uint32_t(key - 1);
+                    uint32_t child_count = dict.region_ids_count(region_id);
+                    const uint32_t* children = dict.region_ids_ptr(region_id);
+                    put_uvar(payload, child_count);
+                    for (uint32_t j = 0; j < child_count; ++j) put_u64(payload, children[j]);
+                }
+                put_uvar(payload, eager_lines.size());
+                for (uint64_t key : eager_lines) {
+                    put_u64(payload, key);
+                    const CandidateInfo* info = nullptr;
+                    if (key >= first_new && key <= after_lines && !candidates.empty())
+                        info = &candidates[size_t(uint32_t(key) - first_new)];
+                    encode_definition(payload, uint32_t(key), dict, info, receiver_known,
+                                      options.delta, definition_stats);
+                }
+                if (!ok || !channel.send(Msg::Fill, payload)) { ok = false; break; }
+                fill_ns += elapsed_ns(f0);
+
+                for (uint64_t key : missing_regions) receiver_known_regions[size_t(key)] = 1;
+                for (uint64_t key : eager_regions) receiver_known_regions[size_t(key)] = 1;
+                for (uint64_t key : missing_blocks) receiver_known_blocks[size_t(key)] = 1;
+                for (uint64_t key : eager_lines) receiver_known[size_t(key)] = 1;
+
+                if (!options.pipeline) {
+                w0 = Clock::now();
+                for (;;) {
+                    if (!channel.recv(frame)) { ok = false; break; }
+                    if (frame.type != Msg::Ack) break;
+                    Cursor ack(frame.payload);
+                    uint32_t ack_id = 0;
+                    uint64_t ack_len = 0;
+                    if (!pending_ack || !ack.u32(ack_id) || ack_id != pending_ack ||
+                        !ack.u64(ack_len) || ack_len != pending_ack_len || !ack.done()) {
+                        ok = false;
+                        break;
+                    }
+                    pending_ack = 0;
+                }
+                wait_ns += elapsed_ns(w0);
+                if (!ok) break;
+                if (frame.type == Msg::MissingRegions) {
+                    Cursor region_missing(frame.payload);
+                    if (!region_missing.u32(reply_id) || reply_id != txid ||
+                        !region_missing.uvar(count) || count > UINT32_MAX) { ok = false; break; }
+                    closure_regions.resize(size_t(count));
+                    for (uint64_t& key : closure_regions)
+                        if (!region_missing.u64(key)) { ok = false; break; }
+                    if (!ok || !region_missing.done()) { ok = false; break; }
+                    if (!closure_regions.empty()) {
+                        f0 = Clock::now();
+                        payload.clear();
+                        put_u32(payload, txid);
+                        put_uvar(payload, closure_regions.size());
+                        for (uint64_t key : closure_regions) {
+                            if (!key || key - 1 >= dict.region_count()) { ok = false; break; }
+                            uint32_t region_id = uint32_t(key - 1);
+                            uint32_t child_count = dict.region_ids_count(region_id);
+                            const uint32_t* children = dict.region_ids_ptr(region_id);
+                            put_uvar(payload, child_count);
+                            for (uint32_t j = 0; j < child_count; ++j) put_u64(payload, children[j]);
+                        }
+                        if (!ok || !channel.send(Msg::FillRegions, payload)) { ok = false; break; }
+                        fill_ns += elapsed_ns(f0);
+                        for (uint64_t key : closure_regions)
+                            receiver_known_regions[size_t(key)] = 1;
+                    }
+                    w0 = Clock::now();
+                    if (!channel.recv(frame)) { ok = false; break; }
+                    wait_ns += elapsed_ns(w0);
+                }
+
+                if (frame.type == Msg::Ack) {
+                    Cursor ack(frame.payload);
+                    uint32_t ack_id = 0;
+                    uint64_t ack_len = 0;
+                    current_acked = ack.u32(ack_id) && ack_id == txid &&
+                                    ack.u64(ack_len) && ack_len == file.len && ack.done();
+                    if (!current_acked) { ok = false; break; }
+                } else if (frame.type == Msg::MissingLines) {
+                    Cursor line_missing(frame.payload);
+                    if (!line_missing.u32(reply_id) || reply_id != txid ||
+                        !line_missing.uvar(count) || count > UINT32_MAX) { ok = false; break; }
+                    missing_lines.resize(size_t(count));
+                    for (uint64_t& key : missing_lines)
+                        if (!line_missing.u64(key)) { ok = false; break; }
+                    if (!ok || !line_missing.done()) { ok = false; break; }
+
+                    if (!missing_lines.empty()) {
+                        f0 = Clock::now();
+                        payload.clear();
+                        put_u32(payload, txid);
+                        put_uvar(payload, missing_lines.size());
+                        for (uint64_t key : missing_lines) {
+                            if (!key || key > dict.distinct()) { ok = false; break; }
+                            const CandidateInfo* info = nullptr;
+                            if (key >= first_new && key <= after_lines && !candidates.empty())
+                                info = &candidates[size_t(uint32_t(key) - first_new)];
+                            encode_definition(payload, uint32_t(key), dict, info, receiver_known,
+                                              options.delta, definition_stats);
+                        }
+                        if (!ok || !channel.send(Msg::FillLines, payload)) { ok = false; break; }
+                        fill_ns += elapsed_ns(f0);
+                    }
+                } else {
+                    ok = false;
+                    break;
+                }
+                }
+            }
+
+            for (uint64_t key : missing_lines) receiver_known[size_t(key)] = 1;
+            if (options.delta && pass == 0 && after_lines >= first_new && !candidates.empty())
+                predictor.commit(first_new, candidates);
+            if (!options.pipeline && !current_acked) {
+                pending_ack = txid;
+                pending_ack_len = file.len;
+            }
+            if (options.pipeline && txid - replies_drained >= options.pipeline_window) {
+                auto w0 = Clock::now();
+                uint32_t expected_id = replies_drained + 1;
+                ok = drain_pipeline_reply(channel, expected_id,
+                                            transaction_lengths[size_t(expected_id - 1)]);
+                wait_ns += elapsed_ns(w0);
+                if (!ok) break;
+                ++replies_drained;
+            }
+        }
+    }
+
+    Frame final_frame;
+    if (ok && options.pipeline) {
+        while (replies_drained < txid) {
+            uint32_t expected_id = replies_drained + 1;
+            auto w0 = Clock::now();
+            ok = drain_pipeline_reply(channel, expected_id,
+                                      transaction_lengths[size_t(expected_id - 1)]);
+            wait_ns += elapsed_ns(w0);
+            if (!ok) break;
+            ++replies_drained;
+        }
+    } else if (ok) {
+        if (pending_ack) {
+            auto w0 = Clock::now();
+            if (!channel.recv(final_frame) || final_frame.type != Msg::Ack) ok = false;
+            wait_ns += elapsed_ns(w0);
+            if (ok) {
+                Cursor ack(final_frame.payload);
+                uint32_t ack_id = 0;
+                uint64_t ack_len = 0;
+                ok = ack.u32(ack_id) && ack_id == pending_ack && ack.u64(ack_len) &&
+                     ack_len == pending_ack_len && ack.done();
+                pending_ack = 0;
+            }
+        }
+    }
+    if (ok) {
+        payload.clear();
+        ok = channel.send(Msg::Done, payload, false) && channel.recv(final_frame) &&
+             final_frame.type == Msg::Final;
+    }
+    ::shutdown(sockets[0], SHUT_RDWR);
+    ::close(sockets[0]);
+    verifier.join();
+
+    int child_status = 0;
+    waitpid(child, &child_status, 0);
+    bool child_ok = WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0;
+
+    uint64_t receiver_emitted = 0, receiver_decode_ns = 0, receiver_expand_ns = 0;
+    uint64_t receiver_retained = 0, receiver_peak = 0;
+    if (ok) {
+        Cursor final(final_frame.payload);
+        ok = final.u64(receiver_emitted) && final.u64(receiver_decode_ns) &&
+             final.u64(receiver_expand_ns) && final.u64(receiver_retained) &&
+             final.u64(receiver_peak) && final.done();
+    }
+
+    uint64_t total_ns = elapsed_ns(total_start);
+    uint64_t codec_ns = total_ns > load_ns ? total_ns - load_ns : 0;
+    uint64_t raw = corpus.raw * uint64_t(options.passes);
+    uint64_t wire = channel.sent() + channel.received();
+    bool exact = ok && child_ok && verification.exact && verification.bytes == raw &&
+                 receiver_emitted == raw;
+
+    printf("\n==== LOCAL-ORACLE CODEC50 (actual C/F frames, zstd-%d, delta=%s, %s) ====\n",
+           options.zlevel, options.delta ? "pre-TU" : "off",
+           options.pipeline ? (std::string("window=") + std::to_string(options.pipeline_window)).c_str()
+                            : "lockstep");
+    printf("manifest=%s TUs=%zu passes=%u raw=%llu byte-exact=%s child=%s\n",
+           options.manifest, corpus.files.size(), options.passes,
+           (unsigned long long)raw, exact ? "PASS" : "FAIL", child_ok ? "PASS" : "FAIL");
+    printf("full wall=%.6f s throughput=%.3f GB/s (%.3f GiB/s) wire=%llu ratio=%.2fx\n",
+           total_ns / 1e9, total_ns ? double(raw) / double(total_ns) : 0.0,
+           total_ns ? double(raw) / double(total_ns) * 1e9 / double(1ull << 30) : 0.0,
+           (unsigned long long)wire, wire ? double(raw) / double(wire) : 0.0);
+    printf("codec wall=%.6f s throughput=%.3f GB/s (fixture load reported separately)\n",
+           codec_ns / 1e9, codec_ns ? double(raw) / double(codec_ns) : 0.0);
+    printf("C->F=%llu F->C=%llu load=%.3fs intern=%.3fs plan=%.3fs fill=%.3fs wait=%.3fs\n",
+           (unsigned long long)channel.sent(), (unsigned long long)channel.received(),
+           load_ns / 1e9, intern_ns / 1e9, plan_ns / 1e9, fill_ns / 1e9, wait_ns / 1e9);
+    printf("C zstd=%.3fs C write=%.3fs C read+decompress=%.3fs F decode=%.3fs F expand+emit=%.3fs\n",
+           channel.compress_ns() / 1e9, channel.write_ns() / 1e9,
+           (channel.read_ns() + channel.decompress_ns()) / 1e9,
+           receiver_decode_ns / 1e9, receiver_expand_ns / 1e9);
+    printf("definitions: literal=%llu delta=%llu literal_bytes=%llu middle_bytes=%llu copied_bytes=%llu\n",
+           (unsigned long long)definition_stats.literals,
+           (unsigned long long)definition_stats.deltas,
+           (unsigned long long)definition_stats.literal_bytes,
+           (unsigned long long)definition_stats.delta_middle_bytes,
+           (unsigned long long)definition_stats.copied_bytes);
+    printf("receiver retained=%.1f MiB peak=%.1f MiB\n",
+           receiver_retained / 1048576.0, receiver_peak / 1048576.0);
+    printf("wire by message:");
+    for (unsigned i = 1; i <= unsigned(Msg::FillRegions); ++i) {
+        uint64_t bytes = channel.sent_by_type()[i] + channel.received_by_type()[i];
+        if (bytes) printf(" %s=%llu", msg_name(Msg(i)), (unsigned long long)bytes);
+    }
+    printf("\n");
+    return exact ? 0 : 1;
+}
+
+} // namespace local_codec50
+
+int main(int argc, char** argv) {
+    local_codec50::Options options;
+    if (!local_codec50::parse_options(argc, argv, options)) {
+        fprintf(stderr, "usage: %s --manifest FILE [--max-files N] [--z 0|1|3] [--passes N] [--delta] [--no-blocks] [--window N|--sync]\n", argv[0]);
+        return 2;
+    }
+    if (options.receiver) return local_codec50::receiver_main(options.fd, options.out_fd, options.zlevel);
+    return local_codec50::sender_main(options);
 }

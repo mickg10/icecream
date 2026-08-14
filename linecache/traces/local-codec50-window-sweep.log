@@ -1,0 +1,40 @@
+
+==== LOCAL-ORACLE CODEC50 (actual C/F frames, zstd-1, delta=off, window=2) ====
+manifest=/home/ttuser/local-oracle-bakeoff/corpus3/manifest.remote.txt TUs=689 passes=1 raw=1985715205 byte-exact=PASS child=PASS
+full wall=3.496601 s throughput=0.568 GB/s (0.529 GiB/s) wire=17912393 ratio=110.86x
+codec wall=2.180523 s throughput=0.911 GB/s (fixture load reported separately)
+C->F=17884092 F->C=28301 load=1.316s intern=0.654s plan=0.143s fill=0.392s wait=0.938s
+C zstd=0.280s C write=0.019s C read+decompress=0.938s F decode=0.264s F expand+emit=1.276s
+definitions: literal=637610 delta=0 literal_bytes=54733427 middle_bytes=0 copied_bytes=0
+receiver retained=284.5 MiB peak=256.0 MiB
+wire by message: HELLO=24 DICT=310706 ROOT=469666 FILL=17103684 ACK=16536 DONE=12 FINAL=52 MISSING_LINES=11713
+
+==== LOCAL-ORACLE CODEC50 (actual C/F frames, zstd-1, delta=off, window=4) ====
+manifest=/home/ttuser/local-oracle-bakeoff/corpus3/manifest.remote.txt TUs=689 passes=1 raw=1985715205 byte-exact=PASS child=PASS
+full wall=3.090923 s throughput=0.642 GB/s (0.598 GiB/s) wire=17912393 ratio=110.86x
+codec wall=1.765879 s throughput=1.124 GB/s (fixture load reported separately)
+C->F=17884092 F->C=28301 load=1.325s intern=0.556s plan=0.126s fill=0.376s wait=0.655s
+C zstd=0.254s C write=0.035s C read+decompress=0.655s F decode=0.241s F expand+emit=1.077s
+definitions: literal=637610 delta=0 literal_bytes=54733427 middle_bytes=0 copied_bytes=0
+receiver retained=284.5 MiB peak=256.0 MiB
+wire by message: HELLO=24 DICT=310706 ROOT=469666 FILL=17103684 ACK=16536 DONE=12 FINAL=52 MISSING_LINES=11713
+
+==== LOCAL-ORACLE CODEC50 (actual C/F frames, zstd-1, delta=off, window=8) ====
+manifest=/home/ttuser/local-oracle-bakeoff/corpus3/manifest.remote.txt TUs=689 passes=1 raw=1985715205 byte-exact=PASS child=PASS
+full wall=3.069845 s throughput=0.647 GB/s (0.602 GiB/s) wire=17912393 ratio=110.86x
+codec wall=1.757769 s throughput=1.130 GB/s (fixture load reported separately)
+C->F=17884092 F->C=28301 load=1.312s intern=0.589s plan=0.169s fill=0.457s wait=0.490s
+C zstd=0.249s C write=0.152s C read+decompress=0.489s F decode=0.258s F expand+emit=1.158s
+definitions: literal=637610 delta=0 literal_bytes=54733427 middle_bytes=0 copied_bytes=0
+receiver retained=284.5 MiB peak=256.2 MiB
+wire by message: HELLO=24 DICT=310706 ROOT=469666 FILL=17103684 ACK=16536 DONE=12 FINAL=52 MISSING_LINES=11713
+
+==== LOCAL-ORACLE CODEC50 (actual C/F frames, zstd-1, delta=off, window=16) ====
+manifest=/home/ttuser/local-oracle-bakeoff/corpus3/manifest.remote.txt TUs=689 passes=1 raw=1985715205 byte-exact=PASS child=PASS
+full wall=3.019106 s throughput=0.658 GB/s (0.613 GiB/s) wire=17912393 ratio=110.86x
+codec wall=1.740553 s throughput=1.141 GB/s (fixture load reported separately)
+C->F=17884092 F->C=28301 load=1.279s intern=0.593s plan=0.286s fill=0.543s wait=0.264s
+C zstd=0.253s C write=0.348s C read+decompress=0.263s F decode=0.274s F expand+emit=1.109s
+definitions: literal=637610 delta=0 literal_bytes=54733427 middle_bytes=0 copied_bytes=0
+receiver retained=284.5 MiB peak=256.1 MiB
+wire by message: HELLO=24 DICT=310706 ROOT=469666 FILL=17103684 ACK=16536 DONE=12 FINAL=52 MISSING_LINES=11713
