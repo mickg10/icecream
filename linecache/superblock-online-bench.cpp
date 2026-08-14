@@ -340,13 +340,35 @@ struct ObjDefs {
 static const double FRAME_ROOT = 12.0;   // per-TU root frame
 static const double FRAME_FILL = 12.0;   // per-TU FILL frame (only if any missing objects)
 
+// per-TU full charged wire to ONE warm F (known-set kb, grown by side effect). def zstd via kind ratios.
+struct TuWire { double root_raw=0, root_z3=0, def_raw=0, def_z=0, missing=0, framing=0; uint32_t new_objs=0, block_refs=0;
+    double total_z() const { return root_z3+def_z+missing+framing; }
+    double total_raw() const { return root_raw+def_raw+missing+framing; } };
+static void charge_tu(std::vector<uint8_t>& kb, const std::vector<uint32_t>& toks, uint32_t root_raw, uint32_t root_z3,
+                      const OnlineEngine& E, const ObjDefs& defs, double lr, double rr, double br, TuWire& w){
+    w=TuWire{}; w.root_raw=root_raw; w.root_z3=root_z3; w.framing=FRAME_ROOT; bool any=false;
+    std::function<void(uint32_t)> emit=[&](uint32_t x){
+        if(kb[x]) return;
+        if(x>=E.BLOCK_BASE){ uint32_t k=x-E.BLOCK_BASE; emit(E.blkL[k]); emit(E.blkR[k]); if(kb[x])return; double b=defs.block_def_bytes(x); w.def_raw+=b; w.def_z+=b*br; }
+        else if(x>=E.REGION_BASE){ uint32_t r=x-E.REGION_BASE; const uint32_t*ids=E.dict->region_ids_ptr(r); uint32_t c=E.dict->region_ids_count(r);
+            for(uint32_t j=0;j<c;++j){ uint32_t ln=ids[j]; if(!kb[ln]){ double b=defs.line_def_bytes(ln); w.def_raw+=b; w.def_z+=b*lr; kb[ln]=1; ++w.new_objs; } }
+            double b=defs.region_def_bytes(x); w.def_raw+=b; w.def_z+=b*rr; }
+        else { double b=defs.line_def_bytes(x); w.def_raw+=b; w.def_z+=b*lr; }
+        kb[x]=1; ++w.new_objs;
+    };
+    for(uint32_t o:toks){ if(E.is_block(o)) ++w.block_refs; if(!kb[o]){ any=true; w.missing+=varint_len(o); emit(o); } }
+    if(any) w.framing+=FRAME_FILL;
+}
+
 int main(int argc,char**argv){
-    const char* manifest=nullptr; size_t max_files=SIZE_MAX; uint32_t promote=4; const char* trace_path=nullptr;
+    const char* manifest=nullptr; size_t max_files=SIZE_MAX; uint32_t promote=4; const char* trace_path=nullptr; const char* curves_prefix=nullptr; int max_loops=16;
     bool do_sweep=false;
     for(int i=1;i<argc;++i){
         if(!strcmp(argv[i],"--manifest")&&i+1<argc) manifest=argv[++i];
         else if(!strcmp(argv[i],"--promote")&&i+1<argc) promote=uint32_t(atoi(argv[++i]));
         else if(!strcmp(argv[i],"--trace")&&i+1<argc) trace_path=argv[++i];
+        else if(!strcmp(argv[i],"--curves")&&i+1<argc) curves_prefix=argv[++i];
+        else if(!strcmp(argv[i],"--max-loops")&&i+1<argc) max_loops=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--sweep")) do_sweep=true;
         else if(!strcmp(argv[i],"--max-files")&&i+1<argc){ char*t=nullptr; unsigned long long v=strtoull(argv[++i],&t,10); if(!t||*t||!v){fprintf(stderr,"bad --max-files\n");return 2;} max_files=size_t(v); }
         else { fprintf(stderr,"unknown %s\n",argv[i]); return 2; }
@@ -376,32 +398,39 @@ int main(int argc,char**argv){
     fprintf(stderr,"byte-exactness anchor OK (A line stream == raw source)\n");
 
     // ================= OFFLINE CEILING: batch region-BPE over A region streams =================
-    // (the target the online learner should approach; recomputed here in the same object accounting.)
-    // Reuse the online engine's pair-promotion but train in retrospective batched rounds over ALL of A.
+    // (the retrospective target the online learner should approach; same object accounting.)
+    // batchE persists so the curve driver can compute the per-TU batch ceiling A_i.
     uint64_t ceil_tokens=0, ceil_root_raw=0; uint32_t ceil_blocks=0;
+    OnlineEngine batchE; batchE.init(&dict,Nlines,Nregions); batchE.promote_count=2;
+    // per-TU prequential references over capA: A_i = batch ceiling root bytes; B_i = no-block region root bytes.
+    size_t TUsA=capA.region_off.size()-1;
+    std::vector<uint32_t> A_root_z3(TUsA,0), B_root_z3(TUsA,0); std::vector<uint32_t> raw_ii(TUsA,0);
     {
-        OnlineEngine B; B.init(&dict,Nlines,Nregions); B.promote_count=2; // batch: promote any pair seen >=2 globally, iterated
-        // iterate rounds: build token streams for all A TUs, count global pairs, promote top, repeat
-        size_t TUs=capA.region_off.size()-1;
-        // work streams (SENT-separated not needed; encode per TU each round using current merge map)
         std::vector<uint32_t> toks;
         for(int round=0;round<24;++round){
-            U64Map pc(1<<20); size_t total_tok=0;
-            for(size_t t=0;t<TUs;++t){ B.encode(capA.region_ids.data()+capA.region_off[t], capA.region_off[t+1]-capA.region_off[t], toks); total_tok+=toks.size();
+            U64Map pc(1<<20);
+            for(size_t t=0;t<TUsA;++t){ batchE.encode(capA.region_ids.data()+capA.region_off[t], capA.region_off[t+1]-capA.region_off[t], toks);
                 for(size_t i=0;i+1<toks.size();++i){ uint64_t key=(uint64_t(toks[i])<<32)|toks[i+1]; pc.inc(key); } }
-            // collect pairs >= threshold (2), sort desc, promote (batched, non-overlap not enforced -> fine for ceiling)
             std::vector<std::pair<uint32_t,uint64_t>> cand;
             for(size_t i=0;i<pc.k.size();++i) if(pc.k[i]!=UINT64_MAX && pc.v[i]>=2) cand.push_back({pc.v[i],pc.k[i]});
             if(cand.empty()) break;
             std::sort(cand.begin(),cand.end(),std::greater<>());
-            for(auto&c:cand){ uint32_t L=uint32_t(c.second>>32),R=uint32_t(c.second); uint64_t key=c.second; if(B.merge.get(key)!=UINT32_MAX) continue;
-                uint32_t id=B.BLOCK_BASE+uint32_t(B.blkL.size()); B.blkL.push_back(L);B.blkR.push_back(R);B.blkLeaf.push_back(B.leafcount(L)+B.leafcount(R));B.blkDepth.push_back(uint16_t(1+std::max(B.depthof(L),B.depthof(R))));B.blkCreatedTU.push_back(0);B.blkUses.push_back(0);B.blkFirstUseTU.push_back(0); B.merge.put(key,id); }
+            for(auto&c:cand){ uint32_t L=uint32_t(c.second>>32),R=uint32_t(c.second); uint64_t key=c.second; if(batchE.merge.get(key)!=UINT32_MAX) continue;
+                uint32_t id=batchE.BLOCK_BASE+uint32_t(batchE.blkL.size()); batchE.blkL.push_back(L);batchE.blkR.push_back(R);batchE.blkLeaf.push_back(batchE.leafcount(L)+batchE.leafcount(R));batchE.blkDepth.push_back(uint16_t(1+std::max(batchE.depthof(L),batchE.depthof(R))));batchE.blkCreatedTU.push_back(0);batchE.blkUses.push_back(0);batchE.blkFirstUseTU.push_back(0); batchE.merge.put(key,id); }
         }
-        // final encode of A
-        ZSTD_CCtx* z=ZSTD_createCCtx(); std::vector<uint8_t> dst,msg;
-        for(size_t t=0;t<TUs;++t){ B.encode(capA.region_ids.data()+capA.region_off[t], capA.region_off[t+1]-capA.region_off[t], toks); ceil_tokens+=toks.size(); msg.clear(); for(uint32_t o:toks) put_varint(msg,o); ceil_root_raw+=msg.size(); }
-        (void)dst; ZSTD_freeCCtx(z);
-        ceil_blocks=B.nblocks();
+        // final per-TU encode: capture A_i (batch) and B_i (no blocks) root zstd-L3 bytes.
+        ZSTD_CCtx* z=ZSTD_createCCtx(); std::vector<uint8_t> dst,msg; std::vector<uint32_t> btoks;
+        OnlineEngine noblk; noblk.init(&dict,Nlines,Nregions);   // no merges -> root = region stream
+        for(size_t t=0;t<TUsA;++t){
+            raw_ii[t]=A.files[t].len;
+            batchE.encode(capA.region_ids.data()+capA.region_off[t], capA.region_off[t+1]-capA.region_off[t], toks);
+            ceil_tokens+=toks.size(); msg.clear(); for(uint32_t o:toks) put_varint(msg,o); ceil_root_raw+=msg.size();
+            A_root_z3[t]=uint32_t(zstd_size(z,msg.data(),msg.size(),3,dst));
+            noblk.encode(capA.region_ids.data()+capA.region_off[t], capA.region_off[t+1]-capA.region_off[t], btoks);
+            msg.clear(); for(uint32_t o:btoks) put_varint(msg,o); B_root_z3[t]=uint32_t(zstd_size(z,msg.data(),msg.size(),3,dst));
+        }
+        ZSTD_freeCCtx(z);
+        ceil_blocks=batchE.nblocks();
         fprintf(stderr,"OFFLINE ceiling (batch region-BPE over A): blocks=%u  A root tokens=%llu  root raw=%llu B(%.2f MiB)\n",
             ceil_blocks,(unsigned long long)ceil_tokens,(unsigned long long)ceil_root_raw, ceil_root_raw/1048576.0);
     }
@@ -636,6 +665,65 @@ int main(int argc,char**argv){
             uint32_t ord=0; for(auto&r:recs){ fprintf(tf,"%u\t%u\t%u\t%zu\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%d\t%.4f\n",
                 r.pass,ord,r.region_count,r.toks.size(),r.blocks_after,r.new_blocks,r.max_depth,r.deep_refs,r.root_raw,r.root_z1,r.root_z3,r.root_z6,r.changed?1:0, r.region_count?double(r.toks.size())/r.region_count:0); ++ord; }
             fclose(tf); fprintf(stderr,"wrote per-TU trace: %s (%zu rows)\n",trace_path,recs.size());
+        }
+    }
+
+    // ================= CURVE DRIVER: hot-plateau prequential learning curves =================
+    // COLD(1) + WARM loops (repeat unchanged capA until root-token improvement <1% for 2 loops or
+    // --max-loops) + EDIT loops (repeat capC until plateau) + REVERT(1). Predictor CONTINUOUS.
+    // Prequential: encode TU t with predictor state from all previously-observed TUs, record, THEN
+    // learn. x-axis = cumulative TUs observed across loops. Q = (B-O)/(B-A) per TU (B=no-block region
+    // root z3, O=online root z3, A=batch-ceiling root z3). Full charged wire to ONE persistent warm F.
+    if(curves_prefix){
+        fprintf(stderr,"\n== CURVE DRIVER (hot-plateau prequential) promote=%u max_loops=%d ==\n",promote,max_loops);
+        OnlineEngine E; E.init(&dict,Nlines,Nregions); E.promote_count=promote;
+        ObjDefs cdefs; cdefs.E=&E;
+        double lr=line_ratio, rr=region_ratio, br=block_ratio;
+        std::vector<uint8_t> kb;
+        auto ensure_kb=[&](){ size_t need=size_t(E.BLOCK_BASE)+E.nblocks()+1; if(kb.size()<need) kb.resize(need,0); };
+        std::string pfx=curves_prefix;
+        FILE* ptu=fopen((pfx+"-pertu.tsv").c_str(),"w");
+        FILE* plp=fopen((pfx+"-perloop.tsv").c_str(),"w");
+        if(!ptu||!plp){ perror("curve tsv"); }
+        else {
+            fprintf(ptu,"phase\tloop\tx_obs\ttu\tregion_count\traw_ii\troot_tok\tO_root_z3\tB_root_z3\tA_root_z3\tfull_wire_z\tfull_wire_raw\tcum_wire_z\tblocks_pub\tnew_blocks\tblock_refs\tQ_inst\tbits_per_byte\n");
+            fprintf(plp,"phase\tloop\tx_end\tTUs\tsum_root_tok\tsum_O_z3\tsum_B_z3\tsum_A_z3\tsum_full_wire_z\tblocks_pub\tnew_blk_loop\tQ_loop\ttok_per_reg\tbits_per_byte\tplateau\n");
+            ZSTD_CCtx* z=ZSTD_createCCtx(); std::vector<uint8_t> dst,msg; std::vector<uint32_t> toks;
+            uint64_t x=0; double cum_z=0;
+            auto run_loop=[&](const char* phase,int loopno,const Captured& cap,const Corpus& rawc,bool plateau_flag)->uint64_t{
+                size_t TUs=cap.region_off.size()-1; uint64_t sroot=0,sreg=0,srawii=0; double sOz=0,sBz=0,sAz=0,sfull=0; uint32_t nb0=E.nblocks();
+                for(size_t t=0;t<TUs;++t){
+                    E.encode(cap.region_ids.data()+cap.region_off[t], cap.region_off[t+1]-cap.region_off[t], toks);
+                    msg.clear(); for(uint32_t o:toks) put_varint(msg,o); uint32_t rraw=uint32_t(msg.size()); uint32_t rz3=uint32_t(zstd_size(z,msg.data(),msg.size(),3,dst));
+                    ensure_kb(); TuWire w; charge_tu(kb,toks,rraw,rz3,E,cdefs,lr,rr,br,w); cum_z+=w.total_z();
+                    uint32_t regc=uint32_t(cap.region_off[t+1]-cap.region_off[t]); uint32_t rawii=rawc.files[t].len;
+                    uint32_t Bi=B_root_z3[t], Ai=A_root_z3[t];
+                    double Q = (double(Bi)-double(Ai))>1e-9 ? (double(Bi)-double(rz3))/(double(Bi)-double(Ai)) : 0.0;
+                    double bpb = rawii? 8.0*w.total_z()/rawii : 0.0;
+                    uint32_t nb_pre=E.nblocks(); E.learn(toks,uint32_t(x)); uint32_t newb=E.nblocks()-nb_pre;
+                    fprintf(ptu,"%s\t%d\t%llu\t%zu\t%u\t%u\t%zu\t%u\t%u\t%u\t%.1f\t%.1f\t%.1f\t%u\t%u\t%u\t%.4f\t%.5f\n",
+                        phase,loopno,(unsigned long long)x,t,regc,rawii,toks.size(),rz3,Bi,Ai,w.total_z(),w.total_raw(),cum_z,E.nblocks(),newb,w.block_refs,Q,bpb);
+                    sroot+=toks.size(); sreg+=regc; srawii+=rawii; sOz+=rz3; sBz+=Bi; sAz+=Ai; sfull+=w.total_z(); ++x;
+                }
+                double Ql=(sBz-sAz)>1e-9?(sBz-sOz)/(sBz-sAz):0.0;
+                fprintf(plp,"%s\t%d\t%llu\t%zu\t%llu\t%.0f\t%.0f\t%.0f\t%.0f\t%u\t%u\t%.4f\t%.5f\t%.5f\t%d\n",
+                    phase,loopno,(unsigned long long)x,TUs,(unsigned long long)sroot,sOz,sBz,sAz,sfull,E.nblocks(),E.nblocks()-nb0,Ql, sreg?double(sroot)/sreg:0, srawii?8.0*sfull/srawii:0, plateau_flag?1:0);
+                return sroot;
+            };
+            // COLD
+            uint64_t prev=run_loop("cold",0,capA,A,false); double prev_d=double(prev); int stable=0; int lp=1; bool plat=false;
+            // WARM until plateau
+            for(; lp<=max_loops; ++lp){ uint64_t cur=run_loop("warm",lp,capA,A,false); double impr=prev_d>0?(prev_d-double(cur))/prev_d:0; if(impr<0.01) ++stable; else stable=0; prev_d=double(cur); if(stable>=2){ plat=true; ++lp; break; } }
+            fprintf(stderr,"  warm plateau at loop %d (root-tok=%.0f, blocks=%u)\n",lp-1,prev_d,E.nblocks());
+            // EDIT until plateau
+            uint64_t pe=run_loop("edit",1,capC,C,false); double pe_d=double(pe); int es=0; int elp=2;
+            for(; elp<=max_loops; ++elp){ uint64_t cur=run_loop("edit",elp,capC,C,false); double impr=pe_d>0?(pe_d-double(cur))/pe_d:0; if(impr<0.01) ++es; else es=0; pe_d=double(cur); if(es>=2){ ++elp; break; } }
+            fprintf(stderr,"  edit plateau at loop %d (root-tok=%.0f, blocks=%u)\n",elp-1,pe_d,E.nblocks());
+            // REVERT (unchanged tree once more)
+            run_loop("revert",1,capA,A,true);
+            ZSTD_freeCCtx(z); fclose(ptu); fclose(plp);
+            fprintf(stderr,"  wrote %s-{pertu,perloop}.tsv ; total TUs observed=%llu final blocks=%u\n",pfx.c_str(),(unsigned long long)x,E.nblocks());
+            (void)plat;
         }
     }
 
