@@ -1,0 +1,10 @@
+== LLVM ==
+COVER-CONTROL: sample=310 0.2s both-parses-byte-exact=OK
+  stack-greedy(LR): tok=2462 zstd=10147 | right-to-left: tok=270442 zstd=577404 | best-of-2 zstd=10144 (0.03% under LR)
+== RocksDB ==
+COVER-CONTROL: sample=311 0.6s both-parses-byte-exact=OK
+  stack-greedy(LR): tok=52985 zstd=133888 | right-to-left: tok=455336 zstd=1079002 | best-of-2 zstd=133888 (0.00% under LR)
+== DuckDB ==
+COVER-CONTROL: sample=345 0.3s both-parses-byte-exact=OK
+  stack-greedy(LR): tok=14114 zstd=36074 | right-to-left: tok=249674 zstd=607860 | best-of-2 zstd=36074 (0.00% under LR)
+== OpenCV ==

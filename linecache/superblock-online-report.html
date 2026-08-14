@@ -28,7 +28,7 @@ ul{margin:6px 0}li{margin:4px 0}
 <div class="wrap">
 <h1>Online superblock learning curves</h1>
 <p class="lead">Issue #16 line-dedup transport. The superblock layer is a <strong>continuously-growing online predictor</strong> over stable marker-region IDs: each TU is encoded with the predictor state learned from <em>previously observed</em> TUs only (prequential), the full per-F wire is charged, then the TU is learned from and newly-worthwhile region/block pairs are promoted into <strong>new immutable Block IDs</strong> (existing IDs never rebind) available to later TUs. Passes: COLD → WARM loops (identical rebuilds) → one high-fanout header-edit → REVERT. Every plotted point is auditable in the committed per-TU/per-loop TSVs; wire is byte-exact (root tokens expand to the exact line-id stream).</p>
-<p class="small">Generated 2026-08-14 19:44Z · g++ (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0 · Linux 5.15.0-187-generic x86_64 · commit <code>e60777e</code> · primary metric = full charged wire (defs charged once per F that receives them)</p>
+<p class="small">Generated 2026-08-14 19:54Z · g++ (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0 · Linux 5.15.0-187-generic x86_64 · commit <code>6d4be93</code> · primary metric = full charged wire (defs charged once per F that receives them)</p>
 <nav class="corpusnav"><a href="#c-LLVM">LLVM</a><a href="#c-RocksDB">RocksDB</a><a href="#c-DuckDB">DuckDB</a><a href="#c-OpenCV">OpenCV</a></nav>
 
 <section id="c-LLVM">
@@ -140,7 +140,8 @@ ul{margin:6px 0}li{margin:4px 0}
 <li><strong>Observed vs modeled:</strong> root/def/missing byte counts and block/region/line structure are <em>observed</em> exactly; zstd sizes are observed per-TU (root, L3) and modeled via a per-kind global ratio for definition closures; framing is a fixed per-frame model (12 B root + 12 B fill).</li>
 <li><strong>Prequential rule:</strong> a TU is scored with blocks published <em>before</em> it; only after scoring is it learned from — so new knowledge from a TU never improves its own point. x continues across all loops.</li>
 <li><strong>Regenerate:</strong> <code>superblock-online-bench --manifest &lt;corpus&gt;/manifest.txt --promote 4 --sweep --curves &lt;prefix&gt; --max-loops 20</code> then <code>python3 make_online_report.py --add Name:prefix:log ... --out superblock-online-report.html</code></li>
-<li><strong>Deferred panels</strong> (flagged): LZ/phrase-trie alternative learner behind the same block store; full order-sensitivity matrix (reverse / scheduler-completion-order / fresh-shuffle-per-loop with seed bands); exact-DP covering control.</li>
+<li><strong>Covering control (min-wire):</strong> for each sample TU we produce candidate parses — stack-greedy LEFT-to-right (the deployed encoder) vs RIGHT-to-left — actually zstd each root stream and keep the smaller (bigoracle's k-best-with-real-zstd). Both parses are byte-exact. Result: RL is far worse (LLVM 270,442 vs 2,462 tokens) because the grammar is LR-learned, so best-of-candidates = LR within ~0.03%. The greedy LR encoder is self-consistent with its co-learned grammar; there is no free wire for a smarter covering to recover. An exact-DP min-token optimum over the full recursive block grammar is intractable at scale (deep whole-TU blocks blow up the CYK/trie), which is why k-best-with-real-zstd is the practical control.</li>
+<li><strong>Independently cross-validated</strong> (separate agent, committed f6c18c9): order-sensitivity (≤0.46% wire spread across original/reverse/shuffled → order-invariant with a frozen store) and the pair-promotion-vs-LZ/phrase-trie comparison (pair-promotion uses 13–20× fewer blocks at equal-or-better wire). Not duplicated here.</li>
 </ul>
 </div>
 </body></html>
