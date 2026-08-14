@@ -1,0 +1,139 @@
+loaded+interned 6.3s: TUs=689 rawA=1985715205 | A: lines=637610 regions=210074  | +edit: lines=637611 regions=210075 (modified TUs=689)
+byte-exactness anchor OK (A line stream == raw source)
+OFFLINE ceiling (batch region-BPE over A): blocks=114687  A root tokens=218789  root raw=656367 B(0.63 MiB)
+online run OK (promote=4): blocks after A=30758 B=43541 C=48486 D=251223  encode=0.53s learn=0.12s  (all TUs byte-exact)
+def compressibility (L3): line=0.151 region=0.532 block=0.279
+
+==== ONLINE SUPERBLOCK REPORT ====
+corpus: /tanksmall/scratch/ictmp/corpus3/manifest.txt
+TUs(build)=689 rawA=1893.7 MiB  distinct_lines(A/final)=637610/637611  distinct_regions(A/final)=210074/210075  promote_count=4
+OFFLINE region-BPE ceiling: blocks=114687  A-root-tokens=218789  root-raw=0.626 MiB
+ONLINE blocks after A=30758 B=43541 C=48486 D=251223   encode=0.53s learn=0.12s
+
+-- per-pass root stream (online, 1 persistent F) --
+pass                TUs    regions   roottoks   tok/reg  blkcov% |      root_z3      linedef  reg+blk_def    total_raw
+A COLD_FIRST        689    2521258     390784     0.155     84.5 |       873018     54733427      4578878     61201144
+B WARM_SAME         689    2521258     266596     0.106     89.4 |       611579            0        41094       877113
+C HEADER_EDIT       689    2521258     243865     0.097     90.3 |       554952           40        38513       805149
+D CHANGED_STEADY    689    2521258     237678     0.094     90.6 |       532905            0        19704       757566
+(blkcov% = 1 - roottoks/regions = fraction of region tokens absorbed into block refs.)
+ceiling tok/reg (offline, A) = 0.087  -> online A ends at ~0.155; B (fully warm) at 0.106
+
+-- CONVERGENCE curve (pass A): tok/region by build progress --
+   cum = cumulative tokens/regions over TUs 1..k (running wire efficiency);
+   inst = instantaneous, moving-avg over last 32 TUs (approaches the ceiling asymptote).
+progress     TU_ord        cum  inst_ma32 gap_to_ceil
+      1%          7      0.858      0.851      0.765
+      2%         14      0.625      0.624      0.537
+      5%         35      0.360      0.274      0.187
+     10%         69      0.231      0.059     -0.028
+     25%        173      0.123      0.069     -0.018
+     50%        345      0.118      0.155      0.068
+     75%        517      0.131      0.145      0.058
+    100%        689      0.155      0.138      0.051
+ceiling tok/reg = 0.087 (offline batch region-BPE over A)
+
+-- RECOVERY curve (pass C header edit): pure edit damage (delta vs same-predictor UNCHANGED) --
+modified TUs in C=689 of 689; new blocks created during C=4945
+ chg_ord       TU   act_toks  base_toks     dTok   new_blk
+       1        0         29         27       +2         3
+       2        1        132        130       +2        11
+       3        2        122        120       +2        26
+       4        3        114        112       +2        11
+       5        4         35         34       +1         7
+       6        5         75         74       +1         1
+       7        6        151        150       +1        12
+       8        7        445        444       +1         4
+       9        8        103        103       +0         9
+      10        9         87         87       +0        23
+      11       10         29         28       +1         5
+      12       11         59         58       +1         1
+      13       12         73         72       +1        15
+      14       13         25         24       +1         8
+C pure edit damage: first-changed dTok=+2  worst=+2  total=+270 (0.3919/changed-TU)  recovered@changed-ord=9
+D pure edit damage (after one changed loop): total=+258 (0.3745/changed-TU) -> new steady state
+
+-- block lifetime -- total=251223 used>=1=39822 used>=2=38232 never=211401 (never-def-bytes=1268406) mean_leaf=256.4 max_depth=24
+
+-- PER-F full-wire (raw bytes, def sent once per F that needs it) --
+pass                  F   policy |       root_raw        def_raw        missing        framing      TOTAL_raw
+A COLD_FIRST          1       rr |        1172352       59312305         700035          16452       61201144
+B WARM_SAME           1       rr |         799788          41094          20547          15684         877113
+C HEADER_EDIT         1       rr |         731595          38553          19257          15744         805149
+D CHANGED_STEADY      1       rr |         713034          19704           9852          14976         757566
+A COLD_FIRST          1   sticky |        1172352       59312305         700035          16452       61201144
+B WARM_SAME           1   sticky |         799788          41094          20547          15684         877113
+C HEADER_EDIT         1   sticky |         731595          38553          19257          15744         805149
+D CHANGED_STEADY      1   sticky |         713034          19704           9852          14976         757566
+A COLD_FIRST          4       rr |        1172352       91639062         957240          16536       93785190
+B WARM_SAME           4       rr |         799788       56412819         661917          16488       57891012
+C HEADER_EDIT         4       rr |         731595       46243897         629067          16524       47621083
+D CHANGED_STEADY      4       rr |         713034       43260996         615675          16392       44606097
+A COLD_FIRST          4   sticky |        1172352       59312305         700035          16452       61201144
+B WARM_SAME           4   sticky |         799788          41094          20547          15684         877113
+C HEADER_EDIT         4   sticky |         731595          38553          19257          15744         805149
+D CHANGED_STEADY      4   sticky |         713034          19704           9852          14976         757566
+A COLD_FIRST          8       rr |        1172352      119557788        1025388          16536      121772064
+B WARM_SAME           8       rr |         799788       60783891         687024          16512       62287215
+C HEADER_EDIT         8       rr |         731595       53534991         645537          16536       54928659
+D CHANGED_STEADY      8       rr |         713034       51754805         629763          16440       53114042
+A COLD_FIRST          8   sticky |        1172352       59312305         700035          16452       61201144
+B WARM_SAME           8   sticky |         799788          41094          20547          15684         877113
+C HEADER_EDIT         8   sticky |         731595          38553          19257          15744         805149
+D CHANGED_STEADY      8   sticky |         713034          19704           9852          14976         757566
+A COLD_FIRST         16       rr |        1172352      167685758        1061889          16536      169936535
+B WARM_SAME          16       rr |         799788       68512990         714306          16536       70043620
+C HEADER_EDIT        16       rr |         731595       59641388         660159          16536       61049678
+D CHANGED_STEADY     16       rr |         713034       57453019         645408          16536       58827997
+A COLD_FIRST         16   sticky |        1172352       59312305         700035          16452       61201144
+B WARM_SAME          16   sticky |         799788          41094          20547          15684         877113
+C HEADER_EDIT        16   sticky |         731595          38553          19257          15744         805149
+D CHANGED_STEADY     16   sticky |         713034          19704           9852          14976         757566
+A COLD_FIRST         32       rr |        1172352      247769848        1085403          16536      250044139
+B WARM_SAME          32       rr |         799788       86339051         731406          16536       87886781
+C HEADER_EDIT        32       rr |         731595       66819745         671922          16536       68239798
+D CHANGED_STEADY     32       rr |         713034       63238963         655635          16536       64624168
+A COLD_FIRST         32   sticky |        1172352       59312305         700035          16452       61201144
+B WARM_SAME          32   sticky |         799788          41094          20547          15684         877113
+C HEADER_EDIT        32   sticky |         731595          38553          19257          15744         805149
+D CHANGED_STEADY     32   sticky |         713034          19704           9852          14976         757566
+(sticky=all TUs of the single build-C to one F => equals 1 warm F regardless of F count.)
+
+-- promote-threshold sweep (B tok/reg = warm steady state; lower=better, ceiling=0.087) --
+   promote    blocksB    B_tok/reg    B_root_z3
+         2     265068        
+== CURVE DRIVER (hot-plateau prequential) promote=4 max_loops=20 ==
+  warm plateau at loop 20 (root-tok=8809, blocks=466415)
+  edit plateau at loop 20 (root-tok=1122, blocks=488800)
+  wrote /tanksmall/scratch/claude-tmp/claude-4103/-tanksmall-MICKG2-mickg-src/a39fdb74-75de-4406-a55d-a11442769f8a/scratchpad/sb/curve-duckdb-{pertu,perloop}.tsv ; total TUs observed=28938 final blocks=488849
+peak RSS=4736.09 MiB  total=28.5s
+0.097       553920
+         3      48856        0.101       577415
+         4      43541        0.106       611579
+         8      27802        0.118       681199
+        16      20671        0.133       756307
+        32      15635        0.158       905872
+	Command being timed: "taskset -c 5 ./superblock-online-bench --manifest /tanksmall/scratch/ictmp/corpus3/manifest.txt --promote 4 --sweep --curves /tanksmall/scratch/claude-tmp/claude-4103/-tanksmall-MICKG2-mickg-src/a39fdb74-75de-4406-a55d-a11442769f8a/scratchpad/sb/curve-duckdb --max-loops 20"
+	User time (seconds): 23.35
+	System time (seconds): 5.10
+	Percent of CPU this job got: 98%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:28.75
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 4849760
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 3
+	Minor (reclaiming a frame) page faults: 1425603
+	Voluntary context switches: 39
+	Involuntary context switches: 1822
+	Swaps: 0
+	File system inputs: 3878554
+	File system outputs: 5232
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+EXIT=0

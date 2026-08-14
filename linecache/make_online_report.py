@@ -153,19 +153,11 @@ def parse_log(logtext):
     d["thr"] = thr
     return d
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--prefix", required=True)
-    ap.add_argument("--log", required=True)
-    ap.add_argument("--corpus", default="LLVM")
-    ap.add_argument("--commit", default="")
-    ap.add_argument("--cmd", default="")
-    ap.add_argument("--out", required=True)
-    a = ap.parse_args()
-
-    pertu = read_tsv(a.prefix + "-pertu.tsv")
-    perloop = read_tsv(a.prefix + "-perloop.tsv")
-    logtext = open(a.log).read() if a.log else ""
+def render_corpus(corpus, prefix, log):
+    """Return (nav_label, section_html) for one corpus."""
+    pertu = read_tsv(prefix + "-pertu.tsv")
+    perloop = read_tsv(prefix + "-perloop.tsv")
+    logtext = open(log).read() if log else ""
     L = parse_log(logtext)
 
     # loop boundaries (x at each loop end) + labels
@@ -233,11 +225,6 @@ def main():
 
     # ---- metadata ----
     hdr = L.get("hdr"); ceil = L.get("ceiling"); life = L.get("life")
-    try: gcc = subprocess.check_output(["g++","--version"]).decode().splitlines()[0]
-    except Exception: gcc = "g++ (unknown)"
-    try: host = subprocess.check_output(["uname","-srm"]).decode().strip()
-    except Exception: host = "linux"
-    now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%MZ")
 
     # per-loop table (headline loops + all)
     def loop_table():
@@ -260,78 +247,120 @@ def main():
     if hdr and warm1 and cold and warm_final:
         bpb1 = num(warm1["bits_per_byte"])
         stats = "".join([
-            stat("corpus", a.corpus, f'{hdr[0]} TUs · {hdr[1]} MiB source'),
+            stat("corpus", corpus, f'{hdr[0]} TUs · {hdr[1]} MiB source'),
             stat("cold → 1st rebuild tok/region", f'{num(cold["tok_per_reg"]):.3f} → {num(warm1["tok_per_reg"]):.3f}', 'keeps halving per identical rebuild'),
             stat("1st-rebuild bits/input-byte", f'{bpb1:.5f}', f'≈ {1/max(bpb1/8,1e-12):.0f}× effective compression'),
             stat("wire vs cold", f'{num(cold["bits_per_byte"])/max(bpb1,1e-12):.0f}×', 'smaller after one warm rebuild'),
-            stat("published blocks (final)", warm_final["blocks_pub"], f'{life[1]}/{life[0]} ever used' if life else ''),
+            stat("published blocks (final)", str(int(num(perloop[-1]["blocks_pub"]))) if perloop else "?", 'count-gate; Zipfian tail mostly unused — see §4'),
         ])
 
-    css = """
+    def fig(t, svg, note=""):
+        return f'<div class="fig"><h4>{html.escape(t)}</h4><div style="overflow-x:auto">{svg}</div>{f"<p class=small>{note}</p>" if note else ""}</div>'
+
+    cid = re.sub(r"[^A-Za-z0-9]", "", corpus)
+    final_blocks = int(num(perloop[-1]["blocks_pub"])) if perloop else 0
+    life_note = (f"Published blocks grow to {final_blocks} across all loops. Under the raw count-gate most late promotions are never reused (C-side predictor memory only — never sent to any F); a full-cost gate bounds this. In a separate 4-pass run the used set held ~{life[1]} of {life[0]} — see §4." if life else f"Grows to {final_blocks} published blocks; count-gate over-promotes the Zipfian tail (§4).")
+    section = f"""
+<section id="c-{cid}">
+<h2>{html.escape(corpus)}</h2>
+<div class="stats">{stats}</div>
+<h3>1 · Cold → hot learning</h3>
+<p class="lead">x-axis = <strong>TUs observed</strong> (prequential), continuing across repeated build loops; dashed verticals mark phase boundaries (cold → warm → header-edit → revert). Warm loops replay the <em>identical</em> tree, so a pure count-gate keeps promoting deeper blocks toward a degenerate ~1-token/TU floor — the informative signal is the <em>slope</em> and the crossing of the single-build batch reference (Q&gt;1) as cross-build structure accumulates.</p>
+{fig("Effective compression: bits per input byte (full charged wire)", c1, "Cold loop pays first-time Line-text closure transfer; warm loops drop toward the steady floor. Per-TU MA128 faint.")}
+{fig("Prequential predictor quality Q = (B−O)/(B−A)", c2, "B = marker-region baseline (no blocks); O = online root code length using blocks published before the TU; A = single-build batch region-BPE reference. Unclamped: Q>1 = online surpasses that batch reference.")}
+{fig("Structure learning: root tokens per input region", c3, "Top-level tokens the current predictor needs to cover one input region. Lower = more structure absorbed into blocks.")}
+<h3>2 · Learner-state growth</h3>
+{fig("Published immutable blocks vs TUs observed", c4, life_note)}
+<h3>3 · Per-F definition multiplication</h3>
+{fig("Cold-build definition transfer vs F count", c5, "Charged once per F that receives it (closure-only). Round-robin multiplies ~×F (no single F is warm); sticky/affinity stays 1×.")}
+<h3>4 · Promotion-gate sweep</h3>
+{fig("Warm covering vs promote threshold", c6, "Lower gate = closer covering but more blocks (and, on high-diversity corpora, more never-reused Zipfian-tail blocks). A full-cost gate replaces the raw count gate in the product design.")}
+<h3>5 · Per-loop data (every plotted point)</h3>
+<div class="tblwrap">{loop_table()}</div>
+<p class="small">Machine-readable inputs on the branch: <code>{html.escape(prefix)}-pertu.tsv</code>, <code>{html.escape(prefix)}-perloop.tsv</code>.</p>
+</section>
+"""
+    return corpus, section
+
+CSS = """
 :root{--surface-1:#fcfcfb;--plane:#f9f9f7;--text-primary:#0b0b0b;--text-secondary:#52514e;--muted:#898781;--grid:#e1e0d9;--axis:#c3c2b7;--border:rgba(11,11,11,.10);--s0:#2a78d6;--s1:#eb6834;--s2:#1baf7a;--s3:#eda100;}
 @media (prefers-color-scheme:dark){:root:not([data-theme=light]){--surface-1:#1a1a19;--plane:#0d0d0d;--text-primary:#fff;--text-secondary:#c3c2b7;--muted:#898781;--grid:#2c2c2a;--axis:#383835;--border:rgba(255,255,255,.10);--s0:#3987e5;--s1:#d95926;--s2:#199e70;--s3:#c98500;}}
 :root[data-theme=dark]{--surface-1:#1a1a19;--plane:#0d0d0d;--text-primary:#fff;--text-secondary:#c3c2b7;--muted:#898781;--grid:#2c2c2a;--axis:#383835;--border:rgba(255,255,255,.10);--s0:#3987e5;--s1:#d95926;--s2:#199e70;--s3:#c98500;}
 *{box-sizing:border-box}body{margin:0;background:var(--plane);color:var(--text-primary);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
-.wrap{max-width:1000px;margin:0 auto;padding:32px 20px 80px}
-h1{font-size:26px;margin:0 0 4px}h2{font-size:19px;margin:36px 0 6px;border-top:1px solid var(--border);padding-top:20px}
+.wrap{max-width:1000px;margin:0 auto;padding:28px 20px 80px}
+h1{font-size:27px;margin:0 0 4px;text-wrap:balance}
+h2{font-size:22px;margin:14px 0 8px;padding:16px 0 6px;border-top:2px solid var(--border)}
+h3{font-size:17px;margin:26px 0 4px}h4{font-size:14px;margin:2px 6px 8px}
 p.lead{color:var(--text-secondary);margin:4px 0 8px}.small{color:var(--muted);font-size:13px}
+nav.corpusnav{position:sticky;top:0;background:var(--plane);z-index:5;display:flex;gap:8px;flex-wrap:wrap;padding:10px 0;margin:6px 0 4px;border-bottom:1px solid var(--border)}
+nav.corpusnav a{text-decoration:none;color:var(--text-secondary);border:1px solid var(--border);border-radius:999px;padding:3px 12px;font-size:13px}
+nav.corpusnav a:hover{color:var(--text-primary);border-color:var(--axis)}
 .fig{background:var(--surface-1);border:1px solid var(--border);border-radius:12px;padding:14px 12px 8px;margin:14px 0}
-.fig h3{font-size:15px;margin:2px 6px 8px}.chart{width:100%;height:auto;display:block;overflow:visible}
+.chart{width:100%;height:auto;display:block;overflow:visible}
 .chart .grid{stroke:var(--grid);stroke-width:1}.chart .vmark{stroke:var(--axis);stroke-width:1;stroke-dasharray:3 3;opacity:.7}
 .chart .tick{fill:var(--muted);font-size:11px;font-variant-numeric:tabular-nums}.chart .vlab{fill:var(--muted);font-size:10px}
 .chart .axlab{fill:var(--text-secondary);font-size:12px}.chart .slab{fill:var(--text-secondary);font-size:12px;font-weight:600}
 .stats{display:flex;flex-wrap:wrap;gap:12px;margin:14px 0}
 .stat{background:var(--surface-1);border:1px solid var(--border);border-radius:12px;padding:12px 16px;min-width:150px;flex:1}
-.stat .sv{font-size:24px;font-weight:700;font-variant-numeric:tabular-nums}.stat .sl{color:var(--text-secondary);font-size:13px;margin-top:2px}.stat .sub{color:var(--muted);font-size:12px;margin-top:2px}
+.stat .sv{font-size:23px;font-weight:700;font-variant-numeric:tabular-nums}.stat .sl{color:var(--text-secondary);font-size:13px;margin-top:2px}.stat .sub{color:var(--muted);font-size:12px;margin-top:2px}
 table.data{border-collapse:collapse;width:100%;font-size:12px;font-variant-numeric:tabular-nums;margin-top:8px}
 table.data th,table.data td{border:1px solid var(--border);padding:3px 7px;text-align:right}table.data th{background:var(--surface-1);position:sticky;top:0}
-details{margin-top:8px}summary{cursor:pointer;color:var(--text-secondary)}
 code{background:var(--surface-1);border:1px solid var(--border);border-radius:5px;padding:1px 5px;font-size:12px}
 .tblwrap{max-height:420px;overflow:auto;border:1px solid var(--border);border-radius:8px}
-ul{margin:6px 0}li{margin:3px 0}
+ul{margin:6px 0}li{margin:4px 0}
 """
-    def fig(t, svg, note=""):
-        return f'<div class="fig"><h3>{html.escape(t)}</h3><div style="overflow-x:auto">{svg}</div>{f"<p class=small>{note}</p>" if note else ""}</div>'
 
-    body = f"""
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--add", action="append", default=[], help="Name:prefix:log (repeatable)")
+    # single-corpus back-compat
+    ap.add_argument("--prefix"); ap.add_argument("--log"); ap.add_argument("--corpus")
+    ap.add_argument("--commit", default=""); ap.add_argument("--cmd", default="")
+    ap.add_argument("--out", required=True)
+    a = ap.parse_args()
+
+    triples = []
+    for s in a.add:
+        name, prefix, log = s.split(":", 2)
+        triples.append((name, prefix, log))
+    if a.prefix and a.log and a.corpus:
+        triples.append((a.corpus, a.prefix, a.log))
+    if not triples:
+        sys.exit("need --add Name:prefix:log (repeatable) or --corpus/--prefix/--log")
+
+    try: gcc = subprocess.check_output(["g++","--version"]).decode().splitlines()[0]
+    except Exception: gcc = "g++ (unknown)"
+    try: host = subprocess.check_output(["uname","-srm"]).decode().strip()
+    except Exception: host = "linux"
+    now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%MZ")
+
+    sections = []; navs = []
+    for (name, prefix, log) in triples:
+        label, sec = render_corpus(name, prefix, log)
+        cid = re.sub(r"[^A-Za-z0-9]", "", name)
+        navs.append(f'<a href="#c-{cid}">{html.escape(label)}</a>')
+        sections.append(sec)
+
+    intro = f"""
 <div class="wrap">
-<h1>Online superblock learning curves — {html.escape(a.corpus)}</h1>
-<p class="lead">Issue #16 line-dedup transport. A continuously-growing online predictor over stable marker-region IDs: each TU is encoded with the predictor state learned from <em>previously observed</em> TUs only (prequential), the full per-F wire is charged, then the TU is learned from. Immutable object IDs never rebind. Every point below is auditable in the committed TSVs.</p>
-<p class="small">Generated {now} · {html.escape(gcc)} · {html.escape(host)} · commit <code>{html.escape(a.commit or 'see branch')}</code></p>
-<div class="stats">{stats}</div>
-
-<h2>1 · Cold → hot learning</h2>
-<p class="lead">x-axis is <strong>TUs observed</strong> (prequential), continuing across repeated build loops. Dashed verticals mark phase boundaries (cold → warm loops → header-edit loops → revert). Primary metric is full charged wire (roots + newly-required Line/Block definitions + fills + framing, charged to the F that receives them). The warm loops replay the <em>identical</em> tree, so with a pure count-gate the learner keeps promoting deeper blocks each rebuild toward a degenerate ~1-token-per-TU floor; the informative signal is the <em>slope</em> (each identical rebuild roughly halves the root tokens) and the fact that it surpasses the single-build batch reference by loop ~2 (Q&gt;1) by accumulating cross-build structure a one-shot batch never sees.</p>
-{fig("Effective compression: bits per input byte (full charged wire)", c1, "Cold loop pays first-time Line-text closure transfer; warm loops drop toward the steady floor. Per-TU MA128 shown faint.")}
-{fig("Prequential predictor quality Q = (B−O)/(B−A)", c2, "B = marker-region baseline root code length (no blocks); O = online root code length using blocks published before the TU; A = retrospective batch region-BPE ceiling. 0 = no superblock benefit yet; 1 = batch reference. Unclamped: Q>1 means repeated online learning surpasses this batch reference.")}
-{fig("Structure learning: root tokens per input region", c3, "How many top-level tokens the current predictor needs to cover one input region. Lower = more structure absorbed into blocks.")}
-
-<h2>2 · Learner-state growth</h2>
-{fig("Published immutable blocks vs TUs observed", c4, (f"Final: {life[0]} published, {life[1]} ever used, {life[3]} never used (max depth {life[4]}). Never-used blocks cost C-side predictor memory only — they are never sent to any F." if life else ""))}
-
-<h2>3 · Per-F definition multiplication</h2>
-<p class="lead">Definitions are charged once per F that actually receives them (closure-only, no global pre-send). Scattering one build across F caches (round-robin) means no single F is warm, so the cold Line-text closure is re-sent per F; sticky/affinity (return a build's TUs to the F holding its C_GUID) keeps it 1×.</p>
-{fig("Cold-build definition transfer vs F count", c5, "round-robin multiplies ~×F; sticky stays at the single-F cost.")}
-
-<h2>4 · Promotion-gate sweep</h2>
-{fig("Warm covering vs promote threshold", c6, "Lower promote gate = closer to the batch covering but more blocks (and, on high-diversity corpora, more never-reused Zipfian-tail blocks). A full-cost gate replaces the raw count gate in the product design.")}
-
-<h2>5 · Per-loop data (every plotted point)</h2>
-<div class="tblwrap">{loop_table()}</div>
-<p class="small">Raw machine-readable inputs on the branch: <code>{html.escape(a.prefix)}-pertu.tsv</code> (per-TU), <code>{html.escape(a.prefix)}-perloop.tsv</code> (per-loop). Regenerate: <code>python3 make_online_report.py --prefix {html.escape(a.prefix)} --log {html.escape(a.log)} --corpus {html.escape(a.corpus)} --out {html.escape(a.out)}</code></p>
-
+<h1>Online superblock learning curves</h1>
+<p class="lead">Issue #16 line-dedup transport. The superblock layer is a <strong>continuously-growing online predictor</strong> over stable marker-region IDs: each TU is encoded with the predictor state learned from <em>previously observed</em> TUs only (prequential), the full per-F wire is charged, then the TU is learned from and newly-worthwhile region/block pairs are promoted into <strong>new immutable Block IDs</strong> (existing IDs never rebind) available to later TUs. Passes: COLD → WARM loops (identical rebuilds) → one high-fanout header-edit → REVERT. Every plotted point is auditable in the committed per-TU/per-loop TSVs; wire is byte-exact (root tokens expand to the exact line-id stream).</p>
+<p class="small">Generated {now} · {html.escape(gcc)} · {html.escape(host)} · commit <code>{html.escape(a.commit or 'see branch')}</code> · primary metric = full charged wire (defs charged once per F that receives them)</p>
+<nav class="corpusnav">{''.join(navs)}</nav>
+{''.join(sections)}
 <h2>Method &amp; provenance</h2>
 <ul>
-<li><strong>Observed vs modeled:</strong> root/def/missing byte counts and block/region/line structure are <em>observed</em> exactly (byte-exact: every TU's root tokens expand to its exact line-id stream, FNV-1a anchored to raw source). zstd sizes are observed per-TU (root, L3) and via a per-kind global ratio for definition closures (<em>modeled</em>). Framing is a fixed per-frame model ({int(12)} B root + {int(12)} B fill).</li>
-<li><strong>Command:</strong> <code>{html.escape(a.cmd or 'superblock-online-bench --manifest … --promote 4 --sweep --curves '+a.prefix+' --max-loops 20')}</code></li>
-<li><strong>Deferred panels</strong> (flagged, not yet plotted): LZ/phrase-trie alternative learner behind the same block store; full order-sensitivity matrix (reverse / scheduler-completion-order / fresh-shuffle-per-loop with seed bands); exact-DP covering control.</li>
+<li><strong>Observed vs modeled:</strong> root/def/missing byte counts and block/region/line structure are <em>observed</em> exactly; zstd sizes are observed per-TU (root, L3) and modeled via a per-kind global ratio for definition closures; framing is a fixed per-frame model (12 B root + 12 B fill).</li>
+<li><strong>Prequential rule:</strong> a TU is scored with blocks published <em>before</em> it; only after scoring is it learned from — so new knowledge from a TU never improves its own point. x continues across all loops.</li>
+<li><strong>Regenerate:</strong> <code>{html.escape(a.cmd or 'superblock-online-bench --manifest <corpus>/manifest.txt --promote 4 --sweep --curves <prefix> --max-loops 20')}</code> then <code>python3 make_online_report.py --add Name:prefix:log ... --out superblock-online-report.html</code></li>
+<li><strong>Deferred panels</strong> (flagged): LZ/phrase-trie alternative learner behind the same block store; full order-sensitivity matrix (reverse / scheduler-completion-order / fresh-shuffle-per-loop with seed bands); exact-DP covering control.</li>
 </ul>
 </div>
 """
-    doc = f'<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Superblock Learning Curves</title><style>{css}</style></head><body>{body}</body></html>'
+    doc = f'<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Superblock Learning Curves</title><style>{CSS}</style></head><body>{intro}</body></html>'
     with open(a.out, "w") as f:
         f.write(doc)
-    print(f"wrote {a.out} ({len(doc)} bytes) from {len(perloop)} loops / {len(pertu)} per-TU rows")
+    print(f"wrote {a.out} ({len(doc)} bytes) · {len(triples)} corpora: {', '.join(t[0] for t in triples)}")
 
 if __name__ == "__main__":
     main()
