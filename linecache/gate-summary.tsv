@@ -11,3 +11,7 @@ rocksdb	count	2	1475963	0.01153	NA
 rocksdb	count	8	47336	0.17580	NA
 rocksdb	count	16	39648	0.18071	NA
 rocksdb	count	32	29650	0.18546	NA
+llvm	count	2	193705	0.00182	NA
+llvm	count	8	97244	0.01351	NA
+llvm	count	16	43443	0.02006	NA
+llvm	count	32	32856	0.02527	NA
