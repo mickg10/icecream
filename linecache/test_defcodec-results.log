@@ -1,0 +1,119 @@
+================================================================================
+ D2 definition-codec bake-off results  (icecream #16 distinct-line dictionary)
+ owner: implementer   files: definition_codec.{h,cpp} + test_defcodec.cpp
+ host: Intel Xeon Gold 6136 @3.0GHz, g++ 11.4, zstd 1.4.8, -O3 -march=native
+ build: g++ -O3 -march=native -std=c++17 definition_codec.cpp test_defcodec.cpp -o test_defcodec -lzstd
+ reproduce diagnostics: test_defcodec --manifest M [--ceiling] [--reorder] [--sweep] [--skip-log N]
+================================================================================
+
+HEADLINE VERDICT
+- DefCodec (assigned relative-LZ): LOSES to plain z3 on every corpus (best seg reduction 0.88x).
+  Proven cause: z3 + FULL 128MB window + LDM beats plain z3 by only +0.4..1.6% (table below) =>
+  the dict is entropy/effort-bound, NOT window-bound. Explicit long-range LZ has no headroom and
+  its offset stream costs more than it saves. (This verdict is implementation-independent: it
+  follows from the compressibility ceiling, not from DefCodec's own speed/quality.)
+- The task's 1.7x-beyond-z3 DuckDB target (= 4.63 MiB) is BELOW the z19 entropy floor
+  (plain z19 5.405 MiB = 1.47x; best transform front-code+z19 5.054 MiB = 1.56x). Not reachable
+  at ANY speed, let alone z<=3.
+- FrontCodec (RECOMMENDED, offset-free: sort -> line-id:=rank -> front-code LCP+suffix): the only
+  z3-speed win. DuckDB 1.08x, RocksDB 1.27x, OpenCV 1.10x, LLVM 1.10x. Byte-exact. Cold batch op
+  (needs whole set; fits a 2-pass cold encoder; id:=rank is permutation-free but relocates id
+  space temporal->lexical, which the transport owner must co-measure against per-TU id streams).
+- DuckDB is the ONLY sub-400x dict (240x). RocksDB/OpenCV/LLVM already exceed 400x dict-only at
+  plain z3 (658x / 695x / 472x). Holistic-400x is bottlenecked entirely by DuckDB, whose dict
+  cannot reach 400x by any dict codec => 400x must come from the structure side, not the dict.
+
+COMPRESSIBILITY CEILING of the distinct-line blob (MiB) -- from --ceiling:
+  corpus    z1     z3    z3+ldm+w27  z6     z9    z19    z19+ldm    (z3->z3+ldm gain)
+  DuckDB   8.100  7.875   7.751     7.212  6.487 5.405   5.373        +1.6%
+  RocksDB  4.702  4.512   4.478     4.034  3.693 3.198   3.167        +0.75%
+  OpenCV   6.707  6.353   6.274     5.768  5.321 4.612   4.577        +1.2%
+  LLVM     7.811  7.322   7.295     6.686  6.169 5.303   5.269        +0.37%
+
+FRONT-CODE transform (MiB) -- from --reorder (offset-free; sort key = raw line, lexicographic):
+  corpus   base_z3  sorted_z3  frontcode_z3 (lcp+suf)   reduction_z3   frontcode_z19  reduction_z19
+  DuckDB    7.875    8.102     7.293 (0.391+6.901)         1.080x         5.054          1.558x
+  RocksDB   4.512    4.507     3.553 (0.362+3.191)         1.270x         2.466          1.829x
+  OpenCV    6.353    6.528     5.791 (0.355+5.435)         1.097x         4.225          1.504x
+  LLVM      7.322    7.643     6.647 (0.455+6.193)         1.101x         4.849          1.510x
+  (sorting the blob ALONE barely moves z3, and can hurt; the LCP factoring is what helps.)
+
+dict-only ratio (raw corpus bytes / dict z3): DuckDB 240x  RocksDB 658x  OpenCV 695x  LLVM 472x
+
+NOTE on speed: encode/decode GB/s are single-thread on the Xeon (a Zen4 host would be ~1.5-2x
+higher). DefCodec is memory-bound here (unbounded-window LZ over a tens-of-MB store => cache-missing
+table+store access); LZ4-style skip accel (--skip-log) does not rescue it because the cost is in the
+match/index path, not literals. Speed is not optimized further because the ratio can never win.
+FrontCodec speed is sort-bound and is a COLD once-per-build op, not the streaming hot path.
+
+--------------------------------------------------------------------------------
+ LIVE default runs (DefCodec relative-LZ + FrontCodec), byte-exact round-trip both:
+--------------------------------------------------------------------------------
+
+########## DuckDB ##########
+================================================================
+corpus: DuckDB  (/tanksmall/scratch/ictmp/corpus3/manifest.txt)
+  TUs=689  raw=1893.7 MiB  total_lines=69094918  distinct_lines=637610  distinct_bytes=52.198 MiB
+  load=3.65s  extract=3.63s
+  [baseline] distinct blob -> none=52.198 MiB  z1=8.100 MiB  z3=7.875 MiB   (raw/z3 = 6.6x)
+  ---- cfg stride=8 min_match=16 table_bits=22 chain=1 skip_log=31 cross_rep=1 ----
+    [defcodec] seg concat -> none=19.333  z1=10.939  z3=10.043 MiB   store=52.198 MiB
+    [defcodec] split z3   -> lit=4.049  ctrl=1.712  off=3.270  total=9.031 MiB (raw lit=12.372 ctrl=3.416 off=3.545)
+    REDUCTION vs plain-z3:  seg-concat=0.784x   split=0.872x
+    dict-only ceiling ratio (raw/dict-z3):  plain=240.5x  seg=188.6x  split=209.7x
+    throughput:  encode=0.066 GB/s  decode=0.366 GB/s   roundtrip=OK
+  ---- FrontCodec (RECOMMENDED: sort->rank-id + front-code, offset-free) ----
+    streams: lcp raw=0.620 suf raw=33.088 MiB   ->  z3 lcp=0.391 + suf=6.901 = 7.293 MiB
+    REDUCTION vs plain-z3 = 1.080x     dict-only ceiling ratio raw/z3: plain=240.5x  front=259.7x
+    throughput:  encode=0.127 GB/s  decode=0.546 GB/s   roundtrip=OK   (lines without trailing '\n': 0)
+
+########## RocksDB ##########
+================================================================
+corpus: RocksDB  (/tanksmall/scratch/ictmp/corpus2/manifest.txt)
+  TUs=622  raw=2970.0 MiB  total_lines=110485751  distinct_lines=587613  distinct_bytes=42.631 MiB
+  load=6.70s  extract=8.02s
+  [baseline] distinct blob -> none=42.631 MiB  z1=4.702 MiB  z3=4.512 MiB   (raw/z3 = 9.4x)
+  ---- cfg stride=8 min_match=16 table_bits=22 chain=1 skip_log=31 cross_rep=1 ----
+    [defcodec] seg concat -> none=10.197  z1=6.486  z3=5.917 MiB   store=42.631 MiB
+    [defcodec] split z3   -> lit=1.905  ctrl=1.119  off=2.155  total=5.178 MiB (raw lit=5.493 ctrl=2.405 off=2.299)
+    REDUCTION vs plain-z3:  seg-concat=0.763x   split=0.871x
+    dict-only ceiling ratio (raw/dict-z3):  plain=658.3x  seg=502.0x  split=573.6x
+    throughput:  encode=0.100 GB/s  decode=0.479 GB/s   roundtrip=OK
+  ---- FrontCodec (RECOMMENDED: sort->rank-id + front-code, offset-free) ----
+    streams: lcp raw=0.615 suf raw=15.810 MiB   ->  z3 lcp=0.362 + suf=3.191 = 3.553 MiB
+    REDUCTION vs plain-z3 = 1.270x     dict-only ceiling ratio raw/z3: plain=658.3x  front=836.0x
+    throughput:  encode=0.123 GB/s  decode=0.936 GB/s   roundtrip=OK   (lines without trailing '\n': 0)
+
+########## LLVM ##########
+================================================================
+corpus: LLVM  (/tanksmall/scratch/ictmp/corpus/manifest.txt)
+  TUs=1238  raw=3452.6 MiB  total_lines=137913644  distinct_lines=771055  distinct_bytes=38.171 MiB
+  load=6.48s  extract=7.98s
+  [baseline] distinct blob -> none=38.171 MiB  z1=7.811 MiB  z3=7.322 MiB   (raw/z3 = 5.2x)
+  ---- cfg stride=8 min_match=16 table_bits=22 chain=1 skip_log=31 cross_rep=1 ----
+    [defcodec] seg concat -> none=17.379  z1=10.026  z3=9.019 MiB   store=38.171 MiB
+    [defcodec] split z3   -> lit=4.316  ctrl=1.568  off=2.215  total=8.100 MiB (raw lit=12.210 ctrl=2.777 off=2.393)
+    REDUCTION vs plain-z3:  seg-concat=0.812x   split=0.904x
+    dict-only ceiling ratio (raw/dict-z3):  plain=471.6x  seg=382.8x  split=426.3x
+    throughput:  encode=0.064 GB/s  decode=0.365 GB/s   roundtrip=OK
+  ---- FrontCodec (RECOMMENDED: sort->rank-id + front-code, offset-free) ----
+    streams: lcp raw=0.735 suf raw=20.374 MiB   ->  z3 lcp=0.455 + suf=6.193 = 6.647 MiB
+    REDUCTION vs plain-z3 = 1.101x     dict-only ceiling ratio raw/z3: plain=471.6x  front=519.4x
+    throughput:  encode=0.089 GB/s  decode=0.576 GB/s   roundtrip=OK   (lines without trailing '\n': 0)
+
+########## OpenCV ##########
+================================================================
+corpus: OpenCV  (/tanksmall/scratch/ictmp/corpus5/manifest.txt)
+  TUs=1506  raw=4416.5 MiB  total_lines=159014620  distinct_lines=586099  distinct_bytes=51.082 MiB
+  load=7.29s  extract=6.81s
+  [baseline] distinct blob -> none=51.082 MiB  z1=6.707 MiB  z3=6.353 MiB   (raw/z3 = 8.0x)
+  ---- cfg stride=8 min_match=16 table_bits=22 chain=1 skip_log=31 cross_rep=1 ----
+    [defcodec] seg concat -> none=16.324  z1=8.876  z3=8.107 MiB   store=51.082 MiB
+    [defcodec] split z3   -> lit=3.517  ctrl=1.489  off=2.315  total=7.321 MiB (raw lit=11.184 ctrl=2.684 off=2.456)
+    REDUCTION vs plain-z3:  seg-concat=0.784x   split=0.868x
+    dict-only ceiling ratio (raw/dict-z3):  plain=695.2x  seg=544.8x  split=603.3x
+    throughput:  encode=0.085 GB/s  decode=0.512 GB/s   roundtrip=OK
+  ---- FrontCodec (RECOMMENDED: sort->rank-id + front-code, offset-free) ----
+    streams: lcp raw=0.572 suf raw=32.745 MiB   ->  z3 lcp=0.355 + suf=5.435 = 5.791 MiB
+    REDUCTION vs plain-z3 = 1.097x     dict-only ceiling ratio raw/z3: plain=695.2x  front=762.7x
+    throughput:  encode=0.145 GB/s  decode=0.625 GB/s   roundtrip=OK   (lines without trailing '\n': 0)
