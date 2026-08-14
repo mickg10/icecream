@@ -236,6 +236,7 @@ struct OnlineEngine {
     std::vector<uint32_t> blkCreatedTU;    // global TU ordinal at creation
     std::vector<uint32_t> blkUses;         // times referenced as a root token
     std::vector<uint32_t> blkFirstUseTU;   // global TU ordinal of 2nd appearance (first use after creation)
+    std::vector<uint32_t> blkLastUseTU;    // global TU ordinal of most recent reference (for generation pruning)
     U64Map merge;                          // pair(L,R) -> block obj id (published)
     U64Map paircount;                      // pair(L,R) -> accumulated adjacency count (unpromoted)
     uint32_t promote_count=4;              // occurrence gate (swept)
@@ -247,7 +248,7 @@ struct OnlineEngine {
 
     void init(const Interner* d, uint32_t nlines, uint32_t nregions){
         dict=d; Nlines=nlines; Nregions=nregions; REGION_BASE=Nlines+1; BLOCK_BASE=REGION_BASE+Nregions;
-        blkL.clear(); blkR.clear(); blkLeaf.clear(); blkDepth.clear(); blkCreatedTU.clear(); blkUses.clear(); blkFirstUseTU.clear();
+        blkL.clear(); blkR.clear(); blkLeaf.clear(); blkDepth.clear(); blkCreatedTU.clear(); blkUses.clear(); blkFirstUseTU.clear(); blkLastUseTU.clear();
         merge=U64Map(1<<16); paircount=U64Map(1<<16); learning=true;
         blkL.reserve(1<<20); blkR.reserve(1<<20); blkLeaf.reserve(1<<20); blkDepth.reserve(1<<20);
         blkCreatedTU.reserve(1<<20); blkUses.reserve(1<<20); blkFirstUseTU.reserve(1<<20);
@@ -295,7 +296,7 @@ struct OnlineEngine {
                 blkL.push_back(L); blkR.push_back(R);
                 blkLeaf.push_back(leafcount(L)+leafcount(R));
                 blkDepth.push_back(uint16_t(1+std::max(depthof(L),depthof(R))));
-                blkCreatedTU.push_back(tu_ord); blkUses.push_back(0); blkFirstUseTU.push_back(0);
+                blkCreatedTU.push_back(tu_ord); blkUses.push_back(0); blkFirstUseTU.push_back(0); blkLastUseTU.push_back(0);
                 merge.put(key,id);
                 ++created;
             }
@@ -435,7 +436,7 @@ int main(int argc,char**argv){
             if(cand.empty()) break;
             std::sort(cand.begin(),cand.end(),std::greater<>());
             for(auto&c:cand){ uint32_t L=uint32_t(c.second>>32),R=uint32_t(c.second); uint64_t key=c.second; if(batchE.merge.get(key)!=UINT32_MAX) continue;
-                uint32_t id=batchE.BLOCK_BASE+uint32_t(batchE.blkL.size()); batchE.blkL.push_back(L);batchE.blkR.push_back(R);batchE.blkLeaf.push_back(batchE.leafcount(L)+batchE.leafcount(R));batchE.blkDepth.push_back(uint16_t(1+std::max(batchE.depthof(L),batchE.depthof(R))));batchE.blkCreatedTU.push_back(0);batchE.blkUses.push_back(0);batchE.blkFirstUseTU.push_back(0); batchE.merge.put(key,id); }
+                uint32_t id=batchE.BLOCK_BASE+uint32_t(batchE.blkL.size()); batchE.blkL.push_back(L);batchE.blkR.push_back(R);batchE.blkLeaf.push_back(batchE.leafcount(L)+batchE.leafcount(R));batchE.blkDepth.push_back(uint16_t(1+std::max(batchE.depthof(L),batchE.depthof(R))));batchE.blkCreatedTU.push_back(0);batchE.blkUses.push_back(0);batchE.blkFirstUseTU.push_back(0);batchE.blkLastUseTU.push_back(0); batchE.merge.put(key,id); }
         }
         // final per-TU encode: capture A_i (batch) and B_i (no blocks) root zstd-L3 bytes.
         ZSTD_CCtx* z=ZSTD_createCCtx(); std::vector<uint8_t> dst,msg; std::vector<uint32_t> btoks;
@@ -721,7 +722,7 @@ int main(int argc,char**argv){
         if(!ptu||!plp){ perror("curve tsv"); }
         else {
             fprintf(ptu,"phase\tloop\tx_obs\ttu\tregion_count\traw_ii\troot_tok\tO_root_z3\tB_root_z3\tA_root_z3\tfull_wire_z\tfull_wire_raw\tcum_wire_z\tblocks_pub\tnew_blocks\tblock_refs\tQ_inst\tbits_per_byte\troot_tok_memo\tfull_wire_memo_z\n");
-            fprintf(plp,"phase\tloop\tx_end\tTUs\tsum_root_tok\tsum_O_z3\tsum_B_z3\tsum_A_z3\tsum_full_wire_z\tblocks_pub\tnew_blk_loop\tQ_loop\ttok_per_reg\tbits_per_byte\tplateau\tsum_root_tok_memo\tsum_full_wire_memo_z\n");
+            fprintf(plp,"phase\tloop\tx_end\tTUs\tsum_root_tok\tsum_O_z3\tsum_B_z3\tsum_A_z3\tsum_full_wire_z\tblocks_pub\tnew_blk_loop\tQ_loop\ttok_per_reg\tbits_per_byte\tplateau\tsum_root_tok_memo\tsum_full_wire_memo_z\tresident_blk\tnever_blk\treclaim_def_bytes\n");
             ZSTD_CCtx* z=ZSTD_createCCtx(); std::vector<uint8_t> dst,msg; std::vector<uint32_t> toks;
             uint64_t x=0; double cum_z=0;
             auto run_loop=[&](const char* phase,int loopno,const Captured& cap,const Corpus& rawc,bool plateau_flag)->uint64_t{
@@ -730,6 +731,8 @@ int main(int argc,char**argv){
                     E.encode(cap.region_ids.data()+cap.region_off[t], cap.region_off[t+1]-cap.region_off[t], toks);
                     msg.clear(); for(uint32_t o:toks) put_varint(msg,o); uint32_t rraw=uint32_t(msg.size()); uint32_t rz3=uint32_t(zstd_size(z,msg.data(),msg.size(),3,dst));
                     ensure_kb(); TuWire w; charge_tu(kb,toks,rraw,rz3,E,cdefs,lr,rr,br,w); cum_z+=w.total_z();
+                    // block-use tracking for generation pruning: record recency of each referenced block
+                    for(uint32_t o:toks){ if(E.is_block(o)){ uint32_t k=o-E.BLOCK_BASE; E.blkUses[k]++; E.blkLastUseTU[k]=uint32_t(x); } }
                     // root-memo accounting: known root -> a single ROOT_REF; else define-and-use (vector crosses anyway + header)
                     uint32_t rid=root_lookup(toks);
                     if(rid>=known_root.size()) known_root.resize(rid+1,0);
@@ -746,8 +749,17 @@ int main(int argc,char**argv){
                     sroot+=toks.size(); sreg+=regc; srawii+=rawii; sOz+=rz3; sBz+=Bi; sAz+=Ai; sfull+=w.total_z(); smemo+=memo_z; smemotok+=memo_tok; ++x;
                 }
                 double Ql=(sBz-sAz)>1e-9?(sBz-sOz)/(sBz-sAz):0.0;
-                fprintf(plp,"%s\t%d\t%llu\t%zu\t%llu\t%.0f\t%.0f\t%.0f\t%.0f\t%u\t%u\t%.4f\t%.5f\t%.5f\t%d\t%llu\t%.0f\n",
-                    phase,loopno,(unsigned long long)x,TUs,(unsigned long long)sroot,sOz,sBz,sAz,sfull,E.nblocks(),E.nblocks()-nb0,Ql, sreg?double(sroot)/sreg:0, srawii?8.0*sfull/srawii:0, plateau_flag?1:0, (unsigned long long)smemotok, smemo);
+                // generation pruning: resident set = blocks referenced within the last W=one-build TUs
+                // (stale/never-reused blocks are dropped at generation rotation, reclaiming C-side memory).
+                uint64_t Wwin = TUs; uint64_t xend=x;
+                uint64_t resident=0, never=0; double reclaim_bytes=0;
+                for(uint32_t k=0;k<E.nblocks();++k){
+                    if(E.blkUses[k]==0){ ++never; reclaim_bytes += varint_len(E.blkL[k])+varint_len(E.blkR[k]); }
+                    else if(uint64_t(E.blkLastUseTU[k])+Wwin >= xend) ++resident;
+                }
+                fprintf(plp,"%s\t%d\t%llu\t%zu\t%llu\t%.0f\t%.0f\t%.0f\t%.0f\t%u\t%u\t%.4f\t%.5f\t%.5f\t%d\t%llu\t%.0f\t%llu\t%llu\t%.0f\n",
+                    phase,loopno,(unsigned long long)x,TUs,(unsigned long long)sroot,sOz,sBz,sAz,sfull,E.nblocks(),E.nblocks()-nb0,Ql, sreg?double(sroot)/sreg:0, srawii?8.0*sfull/srawii:0, plateau_flag?1:0, (unsigned long long)smemotok, smemo,
+                    (unsigned long long)resident,(unsigned long long)never,reclaim_bytes);
                 return sroot;
             };
             // COLD

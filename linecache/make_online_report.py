@@ -279,6 +279,18 @@ def render_corpus(corpus, prefix, log):
     except Exception:
         c8 = ""
 
+    # 9. generation pruning: published (cumulative) vs resident (used within one build window) blocks.
+    has_res = bool(perloop) and "resident_blk" in perloop[0]
+    c9 = ""
+    if has_res:
+        c9 = line_chart(
+            [ {"name":"published (cumulative)","color_idx":3,"pts":loop_pts("blocks_pub"),"markers":True},
+              {"name":"resident after pruning","color_idx":0,"pts":loop_pts("resident_blk"),"markers":True},
+              {"name":"never-reused","color_idx":1,"pts":loop_pts("never_blk"),"faint":True} ],
+            "TUs observed (across loops)", "immutable blocks",
+            ylog=False, xmax=xmax, vlines=phase_bounds, yfmt=lambda v: f"{int(v)}",
+            title="Generation pruning: published vs resident block set")
+
     # ---- metadata ----
     hdr = L.get("hdr"); ceil = L.get("ceiling"); life = L.get("life")
 
@@ -323,6 +335,15 @@ def render_corpus(corpus, prefix, log):
         rtok = num(fz["sum_root_tok"]); mtok = num(fz["sum_root_tok_memo"])
         rev = (f" On post-edit REVERT the old roots are instantly reusable ({num(fzr['sum_full_wire_z'])/max(num(fzr['sum_full_wire_memo_z']),1e-9):.1f}× smaller with memo)." if fzr else "")
         memo_stat = (f"<strong>Frozen deployed-dictionary result:</strong> an unchanged rebuild goes from {rtok/max(tus,1):.0f} to {mtok/max(tus,1):.1f} root tokens/TU (≈1 ROOT_REF), cutting full wire {full/max(memo,1e-9):.1f}× ({memo/max(tus,1):.0f} B/TU).{rev}")
+    # generation-pruning memory stat: at the last WARM loop, resident vs published + reclaimable memory.
+    prune_stat = ""
+    if has_res:
+        wl = next((r for r in reversed(perloop) if r["phase"]=="warm"), None)
+        if wl:
+            pub = num(wl["blocks_pub"]); res = num(wl["resident_blk"]); nev = num(wl["never_blk"]); rec = num(wl["reclaim_def_bytes"])
+            # reclaimable predictor memory ≈ per-block slot (~40 B for {L,R,leaf,depth,created,uses,first,last}) × never-reused
+            slot = 40.0
+            prune_stat = (f"<strong>Generation pruning:</strong> at the warm plateau {int(pub)} blocks are published but only {int(res)} are resident (referenced within the last build); {int(nev)} ({100*nev/max(pub,1):.0f}%) were never reused — dropping those reclaims ~{nev*slot/1048576:.1f} MiB of C-side predictor memory (def bytes {rec/1024:.0f} KiB) at zero wire cost. Generation rotation bounds the resident set to the actively-used blocks instead of the unbounded published total.")
     final_blocks = int(num(perloop[-1]["blocks_pub"])) if perloop else 0
     life_note = (f"Published blocks grow to {final_blocks} across all loops. Under the raw count-gate most late promotions are never reused (C-side predictor memory only — never sent to any F); a full-cost gate bounds this. In a separate 4-pass run the used set held ~{life[1]} of {life[0]} — see §4." if life else f"Grows to {final_blocks} published blocks; count-gate over-promotes the Zipfian tail (§4).")
     section = f"""
@@ -334,8 +355,11 @@ def render_corpus(corpus, prefix, log):
 {fig("Effective compression: bits per input byte (full charged wire)", c1, "Cold loop pays first-time Line-text closure transfer; warm loops drop toward the steady floor. Per-TU MA128 faint.")}
 {fig("Prequential predictor quality Q_W(t) = Σ(B−O)/Σ(B−A), rolling windows", c2, "B = marker-region baseline (no blocks); O = online root code length using blocks published before the TU; A = single-build batch region-BPE reference. W=128 is the readable headline (8/32 faint). Unclamped: Q>1 = online surpasses that single-build batch reference by accumulating cross-build structure.")}
 {fig("Structure learning: root tokens per input region", c3, "Top-level tokens the current predictor needs to cover one input region. Lower = more structure absorbed into blocks.")}
-<h3>2 · Learner-state growth</h3>
+<p class="small"><strong>Read the cold-build numbers carefully:</strong> cold cumulative <em>wire</em> regret vs the batch ceiling is tiny (≈+0.4% on LLVM) — but only because cold wire is dominated by one-time Line-text definitions that BOTH the online learner and the ceiling must pay. The real structure-learning gap lives in ROOT TOKENS (roughly +75% LLVM / +17% RocksDB / +42% DuckDB early), and the blocks' payoff is the WARM steady state, not the cold build. The bits/byte panel above is full charged wire; the tok/region panel is the structure signal.</p>
+<h3>2 · Learner-state growth &amp; generation pruning</h3>
 {fig("Published immutable blocks vs TUs observed", c4, life_note)}
+<p class="lead">{prune_stat}</p>
+{fig("Generation pruning: published vs resident block set", c9, "Published grows unbounded on identical rebuilds; the resident set (blocks referenced within the last build window) and the never-reused count show what generation rotation reclaims. This — with the root-memo in §4 — is one of the two real memory bounds (the per-pair gate in §5 is not).") if c9 else ""}
 <h3>3 · Per-F definition multiplication</h3>
 {fig("Cold-build definition transfer vs F count", c5, "Charged once per F that receives it (closure-only). Round-robin multiplies ~×F (no single F is warm); sticky/affinity stays 1×.")}
 <h3>4 · Define-and-use whole-TU root memoization</h3>

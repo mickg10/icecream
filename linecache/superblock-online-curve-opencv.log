@@ -1,14 +1,14 @@
-loaded+interned 17.4s: TUs=1506 rawA=4630994774 | A: lines=586099 regions=94534  | +edit: lines=586100 regions=94535 (modified TUs=1506)
+loaded+interned 16.2s: TUs=1506 rawA=4630994774 | A: lines=586099 regions=94534  | +edit: lines=586100 regions=94535 (modified TUs=1506)
 byte-exactness anchor OK (A line stream == raw source)
 OFFLINE ceiling (batch region-BPE over A): blocks=139591  A root tokens=83938  root raw=251814 B(0.24 MiB)
-online run OK (promote=4): blocks after A=45947 B=63654 C=68837 D=143638  encode=1.25s learn=0.07s  (all TUs byte-exact)
+online run OK (promote=4): blocks after A=45947 B=63654 C=68837 D=143638  encode=1.16s learn=0.06s  (all TUs byte-exact)
 def compressibility (L3): line=0.124 region=0.496 block=0.292
 
 ==== ONLINE SUPERBLOCK REPORT ====
 corpus: /tanksmall/scratch/ictmp/corpus5/manifest.txt
 TUs(build)=1506 rawA=4416.5 MiB  distinct_lines(A/final)=586099/586100  distinct_regions(A/final)=94534/94535  promote_count=4
 OFFLINE region-BPE ceiling: blocks=139591  A-root-tokens=83938  root-raw=0.240 MiB
-ONLINE blocks after A=45947 B=63654 C=68837 D=143638   encode=1.25s learn=0.07s
+ONLINE blocks after A=45947 B=63654 C=68837 D=143638   encode=1.16s learn=0.06s
 
 -- per-pass root stream (online, 1 persistent F) --
 pass                TUs    regions   roottoks   tok/reg  blkcov% |      root_z3      linedef  reg+blk_def    total_raw
@@ -106,7 +106,7 @@ D CHANGED_STEADY     32   sticky |         332214          17700           8850 
   warm plateau at loop 20 (root-tok=4699, blocks=237848)
   edit plateau at loop 19 (root-tok=1627, blocks=251821)
   wrote /tanksmall/scratch/claude-tmp/claude-4103/-tanksmall-MICKG2-mickg-src/a39fdb74-75de-4406-a55d-a11442769f8a/scratchpad/sb/curve-opencv-{pertu,perloop}.tsv ; total TUs observed=67770 final blocks=251922
-peak RSS=10726.10 MiB  total=63.1s
+peak RSS=10725.87 MiB  total=61.5s
 9       286726
          3      70142        0.022       323740
          4      63654        0.024       356756
