@@ -268,6 +268,7 @@ int main(int argc,char**argv){
         w_root=w_linedef=w_regiondef=w_pathdef=w_blockdef=w_missing=w_framing=0; cum_raw=0; cum_wire=0; n_marker=n_literal=0; byteexact=true;
         ck.clear(); ckidx=0; allLineDefs.clear(); allRoots.clear(); allRegions.clear(); allBlocks.clear(); allPaths.clear(); allMiss.clear();
       }
+      auto tpass=Clock::now();
       for(size_t t=0; t<TUs; ++t){
         const uint32_t* tk=&tokstream[tokoff[t]]; size_t tn=tokoff[t+1]-tokoff[t];
         // --- collect NEW regions (incl. new blocks' child regions) + NEW blocks, topological order ---
@@ -342,6 +343,7 @@ int main(int argc,char**argv){
         perTU_raw[t]=olen; perTU_wire[t]=cur_wire - cum_wire; cum_wire=cur_wire;
         while(ckidx<ck_f.size() && double(cum_raw)>=ck_f[ckidx]*corpus.raw){ ck.push_back({ck_f[ckidx], double(cum_raw)/cum_wire}); ++ckidx; }
       }
+      fprintf(stderr,"pass %d (%s) single-core encode+decode+verify: %.2fs = %.2f GB/s raw\n", pass, (pass+1==npass&&npass>1)?"WARM":"cold", secs(tpass), corpus.raw/1e9/secs(tpass));
     }
     while(ck.size()<ck_f.size()) ck.push_back({ck_f[ck.size()], double(cum_raw)/cum_wire});
     ZSTD_freeCCtx(z);
