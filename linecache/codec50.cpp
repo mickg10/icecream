@@ -261,12 +261,13 @@ int main(int argc,char**argv){
     RelLZ relC, relF; if(useD2mine){ relC.reset(); relF.reset(); }   // inline relative-LZ line codec
     bool byteexact=true; uint64_t n_marker=0,n_literal=0;
     std::vector<uint8_t> allLineDefs, allRoots, allRegions, allBlocks, allPaths, allMiss;   // diagnostic: batched-z3 floor (cross-message headroom)
+    std::vector<uint8_t> allRegionsRaw;   // diagnostic: region-defs as RAW line-ids (no per-region delta) -> preserves cross-region subsequence matches for z3-LDM
 
     int npass = warm?2:1;   // --warm: pass 0 primes dict+F-stores (uncounted); final pass measures warm steady-state.
     for(int pass=0; pass<npass; ++pass){
       if(pass+1==npass && npass>1){   // reset all measurement state before the warm pass; keep fknown* flags + F-stores
         w_root=w_linedef=w_regiondef=w_pathdef=w_blockdef=w_missing=w_framing=0; cum_raw=0; cum_wire=0; n_marker=n_literal=0; byteexact=true;
-        ck.clear(); ckidx=0; allLineDefs.clear(); allRoots.clear(); allRegions.clear(); allBlocks.clear(); allPaths.clear(); allMiss.clear();
+        ck.clear(); ckidx=0; allLineDefs.clear(); allRoots.clear(); allRegions.clear(); allRegionsRaw.clear(); allBlocks.clear(); allPaths.clear(); allMiss.clear();
       }
       auto tpass=Clock::now();
       for(size_t t=0; t<TUs; ++t){
@@ -297,6 +298,7 @@ int main(int argc,char**argv){
                     ++n_literal; }
             }
             put_varint(fill_regions,c); { int64_t prev=0; for(uint32_t j=0;j<c;++j){ put_zigzag(fill_regions,int64_t(lids[j])-prev); prev=int64_t(lids[j]); } } fknownReg[r]=1; ++nr;
+            { put_varint(allRegionsRaw,c); for(uint32_t j=0;j<c;++j) put_varint(allRegionsRaw,lids[j]); }   // diag: raw line-ids (cross-region subsequence-preserving)
         }
         for(uint32_t k:missBlk){ size_t L=boff2[k+1]-boff2[k];
             if(bcopy_ok[k]){ fill_blocks.push_back(1); put_varint(fill_blocks,bcopy_src[k]); put_varint(fill_blocks,L); }   // COPY(region-stream src,len)
@@ -376,12 +378,16 @@ int main(int argc,char**argv){
       printf("DIAG batched-z%d floor: line_def %.0f->%.0f  root %.0f->%.0f  => streamed TOTAL=%.0f ratio=%.0fx\n",zlevel,w_linedef,bl,w_root,br,alt,corpus.raw/alt);
       printf("DIAG FULL streamed floor (all cats batched z%d): line=%.2f reg=%.2f blk=%.2f path=%.2f miss=%.2f root=%.2f => %.2f MiB ratio=%.0fx\n",
         zlevel,fl_line/MiB,fl_reg/MiB,fl_blk/MiB,fl_path/MiB,fl_miss/MiB,fl_root/MiB,fullfloor/MiB,corpus.raw/fullfloor);
-      // region-def relative-LZ headroom: raw, batched z3, and z3+LDM+win27 (unbounded-window ceiling).
-      { ZSTD_CCtx* zr=ZSTD_createCCtx(); std::vector<uint8_t> rb(ZSTD_compressBound(allRegions.size())+64);
-        ZSTD_CCtx_setParameter(zr,ZSTD_c_compressionLevel,zlevel); ZSTD_CCtx_setParameter(zr,ZSTD_c_enableLongDistanceMatching,1); ZSTD_CCtx_setParameter(zr,ZSTD_c_windowLog,27);
-        size_t rl=allRegions.empty()?0:ZSTD_compress2(zr,rb.data(),rb.size(),allRegions.data(),allRegions.size()); ZSTD_freeCCtx(zr);
-        printf("DIAG region_def headroom: raw=%.2f MiB  batched-z%d=%.2f  z%d+LDM+win27=%.2f MiB (unbounded relative-LZ ceiling)\n",
-          allRegions.size()/MiB,zlevel,fl_reg/MiB,zlevel,rl/MiB); }
+      // region_def headroom, delta-serialized (current wire) AND raw-line-id serialized (cross-region
+      // subsequence-preserving -- per-region delta breaks shared-run matching at each run's first id).
+      { auto zldm=[&](std::vector<uint8_t>&v){ if(v.empty())return 0.0; ZSTD_CCtx* zr=ZSTD_createCCtx(); std::vector<uint8_t> rb(ZSTD_compressBound(v.size())+64);
+          ZSTD_CCtx_setParameter(zr,ZSTD_c_compressionLevel,zlevel); ZSTD_CCtx_setParameter(zr,ZSTD_c_enableLongDistanceMatching,1); ZSTD_CCtx_setParameter(zr,ZSTD_c_windowLog,27);
+          double r=double(ZSTD_compress2(zr,rb.data(),rb.size(),v.data(),v.size())); ZSTD_freeCCtx(zr); return r; };
+        double rl_delta=zldm(allRegions), rl_raw_z3=0, rl_raw_ldm=zldm(allRegionsRaw);
+        { ZSTD_CCtx* zr=ZSTD_createCCtx(); std::vector<uint8_t> rb(ZSTD_compressBound(allRegionsRaw.size())+64); ZSTD_CCtx_setParameter(zr,ZSTD_c_compressionLevel,zlevel);
+          rl_raw_z3=allRegionsRaw.empty()?0:double(ZSTD_compress2(zr,rb.data(),rb.size(),allRegionsRaw.data(),allRegionsRaw.size())); ZSTD_freeCCtx(zr); }
+        printf("DIAG region_def headroom: delta-stream raw=%.2f batched-z%d=%.2f +LDM=%.2f | RAW-line-id z%d=%.2f +LDM+win27=%.2f MiB (cross-region SLICE ceiling)\n",
+          allRegions.size()/MiB,zlevel,fl_reg/MiB,rl_delta/MiB,zlevel,rl_raw_z3/MiB,rl_raw_ldm/MiB); }
       printf("DIAG long-distance ceiling: line_def z%d+LDM+win27 = %.0f (%.2f MiB) => TOTAL=%.0f ratio=%.0fx  [what a perfect relative-LZ OBJECT could reach]\n",zlevel,bl_ldm,bl_ldm/MiB,altldm,corpus.raw/altldm);
       // entropy ladder on the distinct-line dictionary leg: is 8.47MB a z3-level wall or an information floor?
       if(deep && !allLineDefs.empty()){ printf("DIAG line_def entropy ladder (%.2f MiB raw, %.0f distinct literal lines):\n",allLineDefs.size()/MiB,double(n_literal));
