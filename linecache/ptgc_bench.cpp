@@ -22,11 +22,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <numeric>
 #include <string>
 #include <string_view>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1093,6 +1095,298 @@ static void decode_forest(const std::vector<uint8_t>&raw,DecoderStore&store){
     if(p!=end)die_msg("trailing forest bytes");
 }
 
+// P7s: source-location variants plus same-TU siblings.  Candidate selection is encoder-only;
+// F receives an explicit already-installed base ID and an exact correction program.  The learner
+// is observed only after the current TU has been encoded and checked.
+enum SourceCategory : uint8_t { kMarkerCategory=0,kToolchainCategory=1,kProjectCategory=2,kSourceCategoryCount=3 };
+
+struct SourceLocation {
+    uint64_t path_hash=0;
+    uint64_t basename_hash=0;
+    uint32_t logical_line=0;
+    bool valid() const { return path_hash!=0&&logical_line!=0; }
+};
+
+struct LineSourceMeta {
+    SourceLocation location;
+    uint8_t category=kProjectCategory;
+    bool marker=false;
+};
+
+struct ParsedMarker {
+    std::string path;
+    uint32_t logical_line=0;
+    uint32_t flags=0;
+};
+
+static bool parse_source_marker(const uint8_t*p,uint32_t n,ParsedMarker&out){
+    if(n<5||p[0]!='#'||p[1]!=' ')return false;
+    const uint8_t*cur=p+2,*end=p+n;
+    if(cur==end||*cur<'0'||*cur>'9')return false;
+    uint64_t line=0;
+    while(cur<end&&*cur>='0'&&*cur<='9'){line=line*10+uint64_t(*cur-'0');if(line>UINT32_MAX)return false;++cur;}
+    if(cur+2>end||cur[0]!=' '||cur[1]!='"')return false;
+    cur+=2;const uint8_t*begin=cur;while(cur<end&&*cur!='"')++cur;if(cur==end)return false;
+    out.path.assign(reinterpret_cast<const char*>(begin),size_t(cur-begin));++cur;out.logical_line=uint32_t(line);out.flags=0;
+    while(cur<end&&*cur==' '){++cur;if(cur==end||*cur<'0'||*cur>'9')return false;uint32_t flag=0;
+        while(cur<end&&*cur>='0'&&*cur<='9'){flag=flag*10+uint32_t(*cur-'0');++cur;}
+        if(flag>=1&&flag<=4)out.flags|=uint32_t(1)<<(flag-1);}
+    if(cur<end&&*cur=='\n')++cur;
+    return cur==end;
+}
+
+static SourceLocation make_source_location(const std::string&path,uint32_t line){
+    SourceLocation result;result.logical_line=line;
+    if(path.empty())return result;
+    result.path_hash=hash_bytes(reinterpret_cast<const uint8_t*>(path.data()),uint32_t(path.size()));
+    const size_t slash=path.find_last_of("/\\");const std::string_view base(path.data()+(slash==std::string::npos?0:slash+1),path.size()-(slash==std::string::npos?0:slash+1));
+    result.basename_hash=hash_bytes(reinterpret_cast<const uint8_t*>(base.data()),uint32_t(base.size()));
+    return result;
+}
+
+static uint8_t classify_source_path(const std::string&path){
+    return path.rfind("/usr",0)==0||path.rfind("/lib",0)==0?kToolchainCategory:kProjectCategory;
+}
+
+struct LocationKey {
+    uint64_t path=0;
+    uint32_t line=0;
+    bool operator==(const LocationKey&o)const{return path==o.path&&line==o.line;}
+};
+
+struct LocationKeyHash {
+    size_t operator()(const LocationKey&key)const{return size_t(mix64(key.path^(uint64_t(key.line)*0x9e3779b97f4a7c15ULL)));}
+};
+
+static bool line_less(uint32_t a,uint32_t b,const LineStore&store){
+    const uint32_t al=store.len(a),bl=store.len(b);const int cmp=std::memcmp(store.data(a),store.data(b),std::min(al,bl));
+    return cmp!=0?cmp<0:al<bl;
+}
+
+struct VariantHistory {
+    struct Item {uint32_t id=0,count=0;};
+    std::vector<Item> items;
+    void observe(uint32_t id){for(Item&item:items)if(item.id==id){++item.count;return;}items.push_back({id,1});}
+    std::vector<uint32_t> top(const LineStore&store,size_t limit)const{
+        std::vector<Item> ranked=items;std::sort(ranked.begin(),ranked.end(),[&](const Item&a,const Item&b){
+            if(a.count!=b.count)return a.count>b.count;
+            return line_less(a.id,b.id,store);});
+        if(ranked.size()>limit)ranked.resize(limit);
+        std::vector<uint32_t>ids;ids.reserve(ranked.size());for(const Item&item:ranked)ids.push_back(item.id);return ids;
+    }
+};
+
+static void common_prefix_suffix(const uint8_t*a,uint32_t an,const uint8_t*b,uint32_t bn,uint32_t&prefix,uint32_t&suffix){
+    const uint32_t common=std::min(an,bn);prefix=0;while(prefix<common&&a[prefix]==b[prefix])++prefix;
+    suffix=0;while(suffix<common-prefix&&a[an-1-suffix]==b[bn-1-suffix])++suffix;
+}
+
+static uint64_t medoid_distance(uint32_t a,uint32_t b,const LineStore&store){
+    uint32_t prefix=0,suffix=0;common_prefix_suffix(store.data(a),store.len(a),store.data(b),store.len(b),prefix,suffix);
+    return uint64_t(store.len(a)-prefix-suffix)+uint64_t(store.len(b)-prefix-suffix);
+}
+
+static uint32_t history_medoid(const VariantHistory&history,const LineStore&store){
+    const std::vector<uint32_t>ids=history.top(store,8);if(ids.empty())return 0;
+    uint32_t best=ids.front();uint64_t best_cost=UINT64_MAX;
+    for(uint32_t candidate:ids){uint64_t cost=0;for(uint32_t other:ids)cost+=medoid_distance(candidate,other,store);
+        if(cost<best_cost||(cost==best_cost&&line_less(candidate,best,store))){best=candidate;best_cost=cost;}}
+    return best;
+}
+
+enum CandidateSource : uint32_t {
+    kExactLocationCandidate=1u<<0,
+    kMedoidCandidate=1u<<1,
+    kBasenameCandidate=1u<<2,
+    kSkeletonCandidate=1u<<3,
+    kSameTuCandidate=1u<<4
+};
+
+struct SourceCandidate {uint32_t id=0,sources=0;};
+
+struct SourceObservation {
+    SourceLocation location;
+    uint32_t id=0;
+    bool operator==(const SourceObservation&o)const{return location.path_hash==o.location.path_hash&&location.logical_line==o.location.logical_line&&id==o.id;}
+};
+
+struct SourceObservationHash {
+    size_t operator()(const SourceObservation&o)const{return size_t(mix64(o.location.path_hash^(uint64_t(o.location.logical_line)<<32)^o.id));}
+};
+
+class SourceLearner {
+public:
+    void candidates(const std::vector<SourceLocation>&locations,const ParsedLine&parsed,const LineStore&store,std::vector<SourceCandidate>&out)const{
+        auto add=[&](uint32_t id,uint32_t source){if(!id)return;for(SourceCandidate&candidate:out)if(candidate.id==id){candidate.sources|=source;return;}out.push_back({id,source});};
+        for(const SourceLocation&location:locations){if(!location.valid())continue;
+            auto exact=by_location_.find({location.path_hash,location.logical_line});if(exact!=by_location_.end()){
+                for(uint32_t id:exact->second.top(store,4))add(id,kExactLocationCandidate);
+                add(history_medoid(exact->second,store),kMedoidCandidate);}
+            auto backed=by_basename_.find({location.basename_hash,location.logical_line});if(backed!=by_basename_.end())for(uint32_t id:backed->second.top(store,2))add(id,kBasenameCandidate);
+        }
+        auto skeleton=by_skeleton_.find(parsed.coarse_key);if(skeleton!=by_skeleton_.end())for(uint32_t id:skeleton->second.top(store,4))add(id,kSkeletonCandidate);
+    }
+    bool has_prior(const std::vector<SourceLocation>&locations)const{
+        for(const SourceLocation&location:locations)if(location.valid()&&by_location_.find({location.path_hash,location.logical_line})!=by_location_.end())return true;
+        return false;
+    }
+    void observe_tu(const std::vector<SourceObservation>&observations,const std::vector<uint32_t>&new_ids,const LineStore&store){
+        for(const SourceObservation&observation:observations){if(!observation.location.valid())continue;
+            by_location_[{observation.location.path_hash,observation.location.logical_line}].observe(observation.id);
+            by_basename_[{observation.location.basename_hash,observation.location.logical_line}].observe(observation.id);}
+        for(uint32_t id:new_ids){ParsedLine parsed=parse_line(store.data(id),store.len(id));by_skeleton_[parsed.coarse_key].observe(id);}
+    }
+    size_t locations()const{return by_location_.size();}
+    std::array<uint64_t,6> variant_histogram()const{
+        std::array<uint64_t,6>hist{};for(const auto&entry:by_location_){const size_t n=entry.second.items.size();++hist[std::min<size_t>(n,5)];}return hist;
+    }
+private:
+    std::unordered_map<LocationKey,VariantHistory,LocationKeyHash>by_location_;
+    std::unordered_map<LocationKey,VariantHistory,LocationKeyHash>by_basename_;
+    std::unordered_map<std::string,VariantHistory>by_skeleton_;
+};
+
+struct SourceStats {
+    uint64_t records=0,literal_records=0,prefix_records=0,program_records=0;
+    uint64_t candidates=0,program_comparisons=0,copy_bytes=0,add_bytes=0,raw_fallback_bytes=0;
+    uint64_t first_variant_bytes=0,later_variant_bytes=0,union_raw_saving=0;
+    std::array<uint64_t,5>exclusive_raw_saving{};
+    std::array<uint64_t,kSourceCategoryCount>raw_bytes{},selected_wire{},literal_wire{},mixed_wire{};
+};
+
+struct SourceRecord {
+    uint8_t mode=0;
+    uint32_t id=0,base_id=0,prefix=0,suffix=0;
+    DeltaProgram program;
+    size_t cost=SIZE_MAX;
+    uint32_t sources=0;
+};
+
+static size_t literal_source_cost(uint32_t id,uint32_t len){return 1+varint_size(id)+varint_size(len)+len;}
+
+static size_t prefix_source_cost(uint32_t id,uint32_t len,uint32_t base_id,uint32_t prefix,uint32_t suffix){
+    return 1+varint_size(id)+varint_size(len)+varint_size(base_id)+varint_size(prefix)+varint_size(suffix)+(len-prefix-suffix);
+}
+
+static size_t program_source_cost(uint32_t id,uint32_t len,const DeltaProgram&program){
+    size_t cost=1+varint_size(id)+varint_size(len)+varint_size(program.base_id)+varint_size(program.ops.size());
+    for(const DeltaOp&op:program.ops){cost+=1+varint_size(op.len);if(op.copy)cost+=varint_size(op.off);else cost+=op.len;}return cost;
+}
+
+static SourceRecord choose_source_record(uint32_t id,const ParsedLine&parsed,const std::vector<SourceLocation>&locations,
+                                         const std::vector<uint32_t>&same_tu,const LineStore&store,const SourceLearner&learner,
+                                         unsigned program_k,bool force_literal,SourceStats*stats){
+    const uint8_t*target=store.data(id);const uint32_t target_len=store.len(id);SourceRecord best;best.id=id;best.cost=literal_source_cost(id,target_len);
+    if(force_literal)return best;
+    std::vector<SourceCandidate>candidates;learner.candidates(locations,parsed,store,candidates);
+    auto add=[&](uint32_t base){if(base==id)return;for(SourceCandidate&candidate:candidates)if(candidate.id==base){candidate.sources|=kSameTuCandidate;return;}candidates.push_back({base,kSameTuCandidate});};
+    for(uint32_t base:same_tu)add(base);
+    if(stats)stats->candidates+=candidates.size();
+    struct Ranked {SourceCandidate candidate;uint32_t prefix=0,suffix=0;size_t cost=SIZE_MAX;};
+    std::vector<Ranked>ranked;ranked.reserve(candidates.size());std::array<size_t,5>source_best;source_best.fill(best.cost);
+    static constexpr uint32_t source_bits[5]={kExactLocationCandidate,kMedoidCandidate,kBasenameCandidate,kSkeletonCandidate,kSameTuCandidate};
+    for(const SourceCandidate&candidate:candidates){uint32_t prefix=0,suffix=0;common_prefix_suffix(store.data(candidate.id),store.len(candidate.id),target,target_len,prefix,suffix);
+        const size_t cost=prefix_source_cost(id,target_len,candidate.id,prefix,suffix);ranked.push_back({candidate,prefix,suffix,cost});
+        for(size_t s=0;s<5;++s)if(candidate.sources&source_bits[s])source_best[s]=std::min(source_best[s],cost);
+        if(cost<best.cost){best.mode=1;best.base_id=candidate.id;best.prefix=prefix;best.suffix=suffix;best.cost=cost;best.sources=candidate.sources;}}
+    std::sort(ranked.begin(),ranked.end(),[&](const Ranked&a,const Ranked&b){if(a.cost!=b.cost)return a.cost<b.cost;return line_less(a.candidate.id,b.candidate.id,store);});
+    const size_t limit=std::min<size_t>(program_k?program_k:ranked.size(),ranked.size());
+    for(size_t i=0;i<limit;++i){if(stats)++stats->program_comparisons;DeltaProgram program=token_delta(ranked[i].candidate.id,store.data(ranked[i].candidate.id),store.len(ranked[i].candidate.id),target,target_len);
+        if(program.encoded_size==SIZE_MAX)continue;
+        const size_t cost=program_source_cost(id,target_len,program);
+        for(size_t s=0;s<5;++s)if(ranked[i].candidate.sources&source_bits[s])source_best[s]=std::min(source_best[s],cost);
+        if(cost<best.cost){best.mode=2;best.base_id=ranked[i].candidate.id;best.program=std::move(program);best.cost=cost;best.sources=ranked[i].candidate.sources;}}
+    if(stats){const size_t literal=literal_source_cost(id,target_len);stats->union_raw_saving+=literal-best.cost;
+        for(size_t s=0;s<5;++s)stats->exclusive_raw_saving[s]+=literal-source_best[s];}
+    return best;
+}
+
+struct SourceCategoryRaw {std::vector<uint8_t>control,data;uint64_t records=0;};
+struct SourceRaw {std::array<SourceCategoryRaw,kSourceCategoryCount>category;};
+
+static SourceRaw encode_source_variants(const std::vector<uint32_t>&ids,const LineStore&store,const std::vector<LineSourceMeta>&meta,
+                                        const std::unordered_map<uint32_t,std::vector<SourceLocation>>&locations,const SourceLearner&learner,
+                                        unsigned program_k,bool force_literal,SourceStats*stats){
+    SourceRaw raw;std::array<std::vector<uint32_t>,kSourceCategoryCount>category_ids;
+    std::unordered_map<uint32_t,ParsedLine>parsed;parsed.reserve(ids.size()*2+1);
+    for(uint32_t id:ids){ParsedLine value=parse_line(store.data(id),store.len(id));category_ids[meta[id].category].push_back(id);parsed.emplace(id,std::move(value));
+        ++raw.category[meta[id].category].records;if(stats)stats->raw_bytes[meta[id].category]+=store.len(id);}
+    auto primary_location=[&](uint32_t id){
+        SourceLocation result;
+        auto found=locations.find(id);
+        if(found==locations.end())return result;
+        for(const SourceLocation&location:found->second){
+            if(location.valid()&&(!result.valid()||location.path_hash<result.path_hash||
+                                 (location.path_hash==result.path_hash&&location.logical_line<result.logical_line))){
+                result=location;
+            }
+        }
+        return result;
+    };
+    for(size_t category=0;category<kSourceCategoryCount;++category){SourceCategoryRaw&out=raw.category[category];put_varint(out.control,out.records);
+        std::vector<uint32_t>&ordered=category_ids[category];
+        std::sort(ordered.begin(),ordered.end(),[&](uint32_t a,uint32_t b){
+            const SourceLocation al=primary_location(a),bl=primary_location(b);
+            if(al.valid()!=bl.valid())return al.valid()>bl.valid();
+            if(al.path_hash!=bl.path_hash)return al.path_hash<bl.path_hash;
+            if(al.logical_line!=bl.logical_line)return al.logical_line<bl.logical_line;
+            const std::string&ak=parsed.at(a).coarse_key,&bk=parsed.at(b).coarse_key;
+            if(ak!=bk)return ak<bk;
+            return line_less(a,b,store);
+        });
+        std::unordered_map<LocationKey,std::vector<uint32_t>,LocationKeyHash>location_done;std::unordered_map<std::string,std::vector<uint32_t>>skeleton_done;
+        for(uint32_t id:ordered){auto found=locations.find(id);static const std::vector<SourceLocation>empty;const std::vector<SourceLocation>&line_locations=found==locations.end()?empty:found->second;std::vector<uint32_t>same_tu;
+                auto append_recent=[&](const std::vector<uint32_t>&done){const size_t begin=done.size()>4?done.size()-4:0;for(size_t i=begin;i<done.size();++i)if(std::find(same_tu.begin(),same_tu.end(),done[i])==same_tu.end())same_tu.push_back(done[i]);};
+                for(const SourceLocation&location:line_locations)if(location.valid()){auto old=location_done.find({location.path_hash,location.logical_line});if(old!=location_done.end())append_recent(old->second);}
+                auto same_shape=skeleton_done.find(parsed.at(id).coarse_key);if(same_shape!=skeleton_done.end())append_recent(same_shape->second);
+                SourceRecord record=choose_source_record(id,parsed.at(id),line_locations,same_tu,store,learner,program_k,force_literal,stats);const uint32_t len=store.len(id);out.control.push_back(record.mode);put_varint(out.control,id);put_varint(out.control,len);
+                if(stats){++stats->records;if(record.mode==0){++stats->literal_records;stats->raw_fallback_bytes+=len;}else if(record.mode==1)++stats->prefix_records;else ++stats->program_records;}
+                if(record.mode==0){out.data.insert(out.data.end(),store.data(id),store.data(id)+len);}
+                else if(record.mode==1){put_varint(out.control,record.base_id);put_varint(out.control,record.prefix);put_varint(out.control,record.suffix);out.data.insert(out.data.end(),store.data(id)+record.prefix,store.data(id)+len-record.suffix);}
+                else {put_varint(out.control,record.base_id);put_varint(out.control,record.program.ops.size());for(const DeltaOp&op:record.program.ops){out.control.push_back(op.copy?1:0);put_varint(out.control,op.len);
+                        if(op.copy){put_varint(out.control,op.off);if(stats)stats->copy_bytes+=op.len;}else{out.data.insert(out.data.end(),store.data(id)+op.off,store.data(id)+op.off+op.len);if(stats)stats->add_bytes+=op.len;}}}
+                for(const SourceLocation&location:line_locations){
+                    if(location.valid())location_done[{location.path_hash,location.logical_line}].push_back(id);
+                }
+                skeleton_done[parsed.at(id).coarse_key].push_back(id);
+            }
+    }
+    return raw;
+}
+
+struct SourceCategoryFrames {bool present=false,use_mixed=false;std::vector<uint8_t>control,data;uint64_t selected_wire=0,literal_wire=0,mixed_wire=0;};
+struct SourceFrames {std::array<SourceCategoryFrames,kSourceCategoryCount>category;uint64_t wire=0;};
+
+static SourceFrames compress_source_variants(const SourceRaw&mixed,const SourceRaw&literal,FrameCodec&codec,int level){
+    SourceFrames frames;
+    for(size_t category=0;category<kSourceCategoryCount;++category){if(!mixed.category[category].records)continue;SourceCategoryFrames&out=frames.category[category];out.present=true;
+        std::vector<uint8_t>mc=codec.compress(mixed.category[category].control,level),md=codec.compress(mixed.category[category].data,level),lc=codec.compress(literal.category[category].control,level),ld=codec.compress(literal.category[category].data,level);
+        const uint64_t mw=mc.size()+md.size()+8,lw=lc.size()+ld.size()+8;out.mixed_wire=mw;out.literal_wire=lw;out.use_mixed=mw<lw;out.selected_wire=std::min(mw,lw)+1;
+        if(out.use_mixed){out.control=std::move(mc);out.data=std::move(md);}else{out.control=std::move(lc);out.data=std::move(ld);}frames.wire+=out.selected_wire;}
+    return frames;
+}
+
+static SourceRaw decompress_source_variants(const SourceFrames&frames,FrameCodec&codec){
+    SourceRaw raw;for(size_t category=0;category<kSourceCategoryCount;++category){const SourceCategoryFrames&in=frames.category[category];if(!in.present)continue;
+        raw.category[category].control=codec.decompress(in.control);raw.category[category].data=codec.decompress(in.data);}return raw;
+}
+
+static void decode_source_variants(const SourceRaw&raw,DecoderStore&store){
+    for(size_t category=0;category<kSourceCategoryCount;++category){const SourceCategoryRaw&in=raw.category[category];if(in.control.empty())continue;const uint8_t*p=in.control.data(),*end=p+in.control.size(),*data=in.data.data(),*data_end=data+in.data.size();const uint64_t count=get_varint(p,end);
+        for(uint64_t record=0;record<count;++record){if(p==end)die_msg("missing source mode");const uint8_t mode=*p++;const uint32_t id=uint32_t(get_varint(p,end));const uint64_t output_len=get_varint(p,end);std::vector<uint8_t>result;result.reserve(size_t(output_len));
+            if(mode==0){if(output_len>uint64_t(data_end-data))die_msg("source literal exceeds data");result.insert(result.end(),data,data+output_len);data+=output_len;}
+            else {const uint32_t base_id=uint32_t(get_varint(p,end));if(base_id>=store.lines.size()||store.lines[base_id].empty())die_msg("source base unavailable");const std::vector<uint8_t>&base=store.lines[base_id];
+                if(mode==1){const uint64_t prefix=get_varint(p,end),suffix=get_varint(p,end);if(prefix>base.size()||suffix>base.size()-prefix||prefix+suffix>output_len)die_msg("source prefix/suffix range");const uint64_t middle=output_len-prefix-suffix;if(middle>uint64_t(data_end-data))die_msg("source middle exceeds data");result.insert(result.end(),base.begin(),base.begin()+prefix);result.insert(result.end(),data,data+middle);data+=middle;result.insert(result.end(),base.end()-suffix,base.end());}
+                else if(mode==2){const uint64_t ops=get_varint(p,end);for(uint64_t op_index=0;op_index<ops;++op_index){if(p==end)die_msg("missing source op");const uint8_t op=*p++;const uint64_t len=get_varint(p,end);
+                        if(op==0){if(len>uint64_t(data_end-data))die_msg("source add exceeds data");result.insert(result.end(),data,data+len);data+=len;}
+                        else if(op==1){const uint64_t off=get_varint(p,end);if(off>base.size()||len>base.size()-off)die_msg("source copy range");result.insert(result.end(),base.begin()+off,base.begin()+off+len);}
+                        else die_msg("unknown source op");}}
+                else die_msg("unknown source mode");}
+            if(result.size()!=output_len)die_msg("source output length mismatch");
+            store.install(id,std::move(result));}
+        if(p!=end||data!=data_end)die_msg("trailing source frame bytes");}
+}
+
 struct Row {
     const char* name = nullptr;
     uint64_t wire = 0;
@@ -1125,6 +1419,7 @@ int main(int argc, char** argv) {
     size_t pretrain_max_files = SIZE_MAX;
     size_t model_kib = 0;
     unsigned model_min_corpora = 1;
+    unsigned source_program_k = 4;
     bool pretrain_all_identifiers = false;
     std::vector<std::string> pretrain_manifests;
     std::string semantic_export_prefix;
@@ -1137,6 +1432,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--pretrain-max-files") && i + 1 < argc) pretrain_max_files = std::strtoull(argv[++i], nullptr, 10);
         else if (!std::strcmp(argv[i], "--model-kib") && i + 1 < argc) model_kib = std::strtoull(argv[++i], nullptr, 10);
         else if (!std::strcmp(argv[i], "--model-min-corpora") && i + 1 < argc) model_min_corpora = unsigned(std::strtoul(argv[++i], nullptr, 10));
+        else if (!std::strcmp(argv[i], "--source-k") && i + 1 < argc) source_program_k = unsigned(std::strtoul(argv[++i], nullptr, 10));
         else if (!std::strcmp(argv[i], "--pretrain-all-identifiers")) pretrain_all_identifiers = true;
         else if (!std::strcmp(argv[i], "--semantic-export-prefix") && i + 1 < argc) semantic_export_prefix = argv[++i];
         else if (!std::strcmp(argv[i], "--semantic-export-only")) semantic_export_only = true;
@@ -1146,8 +1442,8 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
-    if (!manifest || zlevel < 0 || zlevel > 3 || (model_kib && pretrain_manifests.empty()) || (!model_kib && !pretrain_manifests.empty()) || (semantic_export_only&&semantic_export_prefix.empty())) {
-        std::fprintf(stderr, "usage: %s --manifest FILE [--max-files N] [--z 0..3] [--semantic-export-prefix PATH [--semantic-export-only]] [--pretrain-manifest FILE ... --model-kib N] [--pretrain-max-files N] [--model-min-corpora N] [--pretrain-all-identifiers]\n", argv[0]);
+    if (!manifest || zlevel < 0 || zlevel > 3 || source_program_k > 32 || (model_kib && pretrain_manifests.empty()) || (!model_kib && !pretrain_manifests.empty()) || (semantic_export_only&&semantic_export_prefix.empty())) {
+        std::fprintf(stderr, "usage: %s --manifest FILE [--max-files N] [--z 0..3] [--source-k 0..32] [--semantic-export-prefix PATH [--semantic-export-only]] [--pretrain-manifest FILE ... --model-kib N] [--pretrain-max-files N] [--model-min-corpora N] [--pretrain-all-identifiers]\n", argv[0]);
         return 2;
     }
     for(const std::string&training:pretrain_manifests)if(training==manifest)die_msg("pretraining and target manifests must be disjoint");
@@ -1166,8 +1462,8 @@ int main(int argc, char** argv) {
     FrameCodec frames;
     ModelFrameCodec model_frames(pretrained.raw,zlevel);
     ModelFrameCodec model_p4_frames(pretrained.raw,zlevel);
-    Row p0("P0-appearance"), p1("P1-lexicographic"), p4("P4-alpha-template"),p5("P5-multiline"),p6("P6-token-forest"),p7("P7-online-template"),p7b("P7b-local-rule-online-token"),p9("P9-semantic-split-zstd"),p8("P8-pretrained-superblock"),p8d("P8-pretrained-dict-P4"), p10("P10-best-local-frame"),p10p("P10+P8-charged-union");
-    std::vector<Row*> rows{&p0, &p1, &p4,&p5,&p6,&p7,&p7b,&p9};if(use_pretrained){rows.push_back(&p8);rows.push_back(&p8d);}rows.push_back(&p10);if(use_pretrained)rows.push_back(&p10p);
+    Row p0("P0-appearance"), p1("P1-lexicographic"), p4("P4-alpha-template"),p5("P5-multiline"),p6("P6-token-forest"),p7s("P7-source-location"),p7("P7-online-template"),p7b("P7b-local-rule-online-token"),p9("P9-semantic-split-zstd"),p8("P8-pretrained-superblock"),p8d("P8-pretrained-dict-P4"), p10("P10-best-local-frame"),p10p("P10+P8-charged-union");
+    std::vector<Row*> rows{&p0, &p1, &p4,&p5,&p6,&p7s,&p7,&p7b,&p9};if(use_pretrained){rows.push_back(&p8);rows.push_back(&p8d);}rows.push_back(&p10);if(use_pretrained)rows.push_back(&p10p);
     if(use_pretrained){p8.wire=pretrained.frame.size()+4;p8d.wire=pretrained.frame.size()+4;p10p.wire=pretrained.frame.size()+4;}
     std::unique_ptr<SemanticFrameWriter>semantic_writer;if(!semantic_export_prefix.empty())semantic_writer=std::make_unique<SemanticFrameWriter>(semantic_export_prefix);
     for (Row* row : rows) row->tu_wire.reserve(corpus.files.size());
@@ -1178,6 +1474,8 @@ int main(int argc, char** argv) {
     PersistentStats hybrid_stats;PersistentEncoder hybrid_encoder;PersistentDecoder hybrid_decoder;
     PersistentStats pretrained_stats;
     MultiStats multi_stats;
+    SourceLearner source_learner;SourceStats source_stats;std::vector<LineSourceMeta>source_meta(1);
+    std::array<std::vector<uint8_t>,kSourceCategoryCount>attributed_bytes;
     uint64_t cumulative_raw = 0;
     const double fractions[] = {0.10, 0.25, 0.50, 0.75, 1.00};
     size_t checkpoint = 0;
@@ -1190,18 +1488,35 @@ int main(int argc, char** argv) {
         const uint8_t* p = corpus.bytes.data() + file.off;
         const uint8_t* end = p + file.len;
         std::vector<uint32_t> new_ids;
+        std::unordered_set<uint32_t>current_new_ids;
+        std::unordered_map<uint32_t,std::vector<SourceLocation>>current_locations;
+        std::unordered_set<SourceObservation,SourceObservationHash>observation_seen;
+        std::vector<SourceObservation>observations;
+        std::string current_path;SourceLocation current_location;uint8_t current_category=kProjectCategory;
         while (p < end) {
             const void* hit = std::memchr(p, '\n', size_t(end - p));
             const uint8_t* line_end = hit ? static_cast<const uint8_t*>(hit) + 1 : end;
             const uint32_t len = uint32_t(line_end - p);
+            ParsedMarker marker;const bool marker_line=parse_source_marker(p,len,marker);LineSourceMeta line_meta;
+            if(marker_line){line_meta.marker=true;line_meta.category=kMarkerCategory;line_meta.location=make_source_location(marker.path,marker.logical_line);}
+            else {line_meta.location=current_location;line_meta.category=current_category;}
             const LineStore::Result result = truth.intern(p, len);
             if (result.first) {
                 new_ids.push_back(result.id);
-                if (len >= 2 && p[0] == '#' && p[1] == ' ') marker_definition_bytes += len;
+                current_new_ids.insert(result.id);if(source_meta.size()<=result.id)source_meta.resize(size_t(result.id)+1);source_meta[result.id]=line_meta;
+                attributed_bytes[line_meta.category].insert(attributed_bytes[line_meta.category].end(),p,line_end);
+                if (marker_line) marker_definition_bytes += len;
             }
+            if(!marker_line&&line_meta.location.valid()){
+                SourceObservation observation{line_meta.location,result.id};if(observation_seen.insert(observation).second)observations.push_back(observation);
+                if(current_new_ids.find(result.id)!=current_new_ids.end()){std::vector<SourceLocation>&locations=current_locations[result.id];bool duplicate=false;for(const SourceLocation&old:locations)if(old.path_hash==line_meta.location.path_hash&&old.logical_line==line_meta.location.logical_line){duplicate=true;break;}if(!duplicate&&locations.size()<8)locations.push_back(line_meta.location);}}
             ++total_occurrences;
+            if(marker_line){current_path=marker.path;current_location=make_source_location(current_path,marker.logical_line);current_category=classify_source_path(current_path);}
+            else if(current_location.logical_line!=UINT32_MAX)++current_location.logical_line;
             p = line_end;
         }
+        for(uint32_t id:new_ids)if(!source_meta[id].marker){auto found=current_locations.find(id);static const std::vector<SourceLocation>empty;const std::vector<SourceLocation>&locations=found==current_locations.end()?empty:found->second;
+            if(source_learner.has_prior(locations))source_stats.later_variant_bytes+=truth.len(id);else source_stats.first_variant_bytes+=truth.len(id);}
 
         std::vector<uint32_t> sorted_ids = new_ids;
         std::sort(sorted_ids.begin(), sorted_ids.end(), [&](uint32_t a, uint32_t b) {
@@ -1259,6 +1574,12 @@ int main(int argc, char** argv) {
         const auto e6=Clock::now();const std::vector<uint8_t>p6_raw=encode_forest(new_ids,truth,forest_stats);const std::vector<uint8_t>p6_frame=frames.compress(p6_raw,zlevel);p6.encode_seconds+=elapsed(e6);
         const auto d6=Clock::now();decode_forest(frames.decompress(p6_frame),p6.decoder);p6.decode_seconds+=elapsed(d6);verify_definitions(new_ids,truth,p6.decoder);
 
+        const auto e7s=Clock::now();const SourceRaw p7s_mixed=encode_source_variants(new_ids,truth,source_meta,current_locations,source_learner,source_program_k,false,&source_stats);
+        const SourceRaw p7s_literal=encode_source_variants(new_ids,truth,source_meta,current_locations,source_learner,source_program_k,true,nullptr);
+        const SourceFrames p7s_frames=compress_source_variants(p7s_mixed,p7s_literal,frames,zlevel);const uint64_t w7s=p7s_frames.wire;p7s.encode_seconds+=elapsed(e7s);
+        for(size_t category=0;category<kSourceCategoryCount;++category){source_stats.selected_wire[category]+=p7s_frames.category[category].selected_wire;source_stats.literal_wire[category]+=p7s_frames.category[category].literal_wire;source_stats.mixed_wire[category]+=p7s_frames.category[category].mixed_wire;}
+        const auto d7s=Clock::now();const SourceRaw p7s_decoded=decompress_source_variants(p7s_frames,frames);decode_source_variants(p7s_decoded,p7s.decoder);p7s.decode_seconds+=elapsed(d7s);verify_definitions(new_ids,truth,p7s.decoder);
+
         const auto e7=Clock::now();const SplitBuffer p7_raw=encode_persistent_templates(new_ids,truth,persistent_encoder,persistent_stats);const std::vector<uint8_t>p7_control_frame=frames.compress(p7_raw.control,zlevel);const std::vector<uint8_t>p7_data_frame=frames.compress(p7_raw.data,zlevel);const uint64_t w7=p7_control_frame.size()+p7_data_frame.size()+8;p7.encode_seconds+=elapsed(e7);
         p7_control_wire+=p7_control_frame.size()+4;p7_data_wire+=p7_data_frame.size()+4;
         const auto d7=Clock::now();const std::vector<uint8_t>p7_control_decoded=frames.decompress(p7_control_frame);const std::vector<uint8_t>p7_data_decoded=frames.decompress(p7_data_frame);decode_persistent_templates(p7_control_decoded,p7_data_decoded,persistent_decoder);p7.decode_seconds+=elapsed(d7);verify_definitions(new_ids,truth,persistent_decoder.lines);
@@ -1271,27 +1592,29 @@ int main(int argc, char** argv) {
             const auto d8=Clock::now();const std::vector<uint8_t>p8_control_decoded=model_frames.decompress(p8_control_frame),p8_data_decoded=model_frames.decompress(p8_data_frame);decode_persistent_templates(p8_control_decoded,p8_data_decoded,pretrained.decoder);p8.decode_seconds+=elapsed(d8);verify_definitions(new_ids,truth,pretrained.decoder.lines);}
 
         const uint64_t w1=p1_frame.size()+4,w5=p5_size,w6=p6_frame.size()+4;
-        const size_t best_size=std::min({size_t(w1),p4_size,size_t(w5),size_t(w6),size_t(p9_frames.wire)});
+        const size_t best_size=std::min({size_t(w1),p4_size,size_t(w5),size_t(w6),size_t(w7s),size_t(p9_frames.wire)});
         const auto d10 = Clock::now();
         if(best_size==p4_size)decode_templates(p4_control_decoded,p4_data_decoded,p10.decoder);
         else if(best_size==p9_frames.wire)decode_semantic_templates(p9_decoded,p10.decoder);
         else if(best_size==p5_size)decode_multiline(p5_control_decoded,p5_data_decoded,p10.decoder);
         else if(best_size==p6_frame.size()+4)decode_forest(frames.decompress(p6_frame),p10.decoder);
+        else if(best_size==w7s)decode_source_variants(p7s_decoded,p10.decoder);
         else decode_literals(frames.decompress(p1_frame), p10.decoder);
         p10.decode_seconds += elapsed(d10);
         verify_definitions(new_ids, truth, p10.decoder);
 
         uint64_t w10p=0;
-        if(use_pretrained){const size_t best_pretrained=std::min({size_t(w1),size_t(w8d),size_t(w5),size_t(w6),size_t(p9_frames.wire)});const auto d10p=Clock::now();if(best_pretrained==w8d)decode_templates(p8d_control_decoded,p8d_data_decoded,p10p.decoder);else if(best_pretrained==p9_frames.wire)decode_semantic_templates(p9_decoded,p10p.decoder);else if(best_pretrained==w5)decode_multiline(p5_control_decoded,p5_data_decoded,p10p.decoder);else if(best_pretrained==w6)decode_forest(frames.decompress(p6_frame),p10p.decoder);else decode_literals(frames.decompress(p1_frame),p10p.decoder);p10p.decode_seconds+=elapsed(d10p);verify_definitions(new_ids,truth,p10p.decoder);w10p=best_pretrained+1;}
+        if(use_pretrained){const size_t best_pretrained=std::min({size_t(w1),size_t(w8d),size_t(w5),size_t(w6),size_t(w7s),size_t(p9_frames.wire)});const auto d10p=Clock::now();if(best_pretrained==w8d)decode_templates(p8d_control_decoded,p8d_data_decoded,p10p.decoder);else if(best_pretrained==p9_frames.wire)decode_semantic_templates(p9_decoded,p10p.decoder);else if(best_pretrained==w5)decode_multiline(p5_control_decoded,p5_data_decoded,p10p.decoder);else if(best_pretrained==w6)decode_forest(frames.decompress(p6_frame),p10p.decoder);else if(best_pretrained==w7s)decode_source_variants(p7s_decoded,p10p.decoder);else decode_literals(frames.decompress(p1_frame),p10p.decoder);p10p.decode_seconds+=elapsed(d10p);verify_definitions(new_ids,truth,p10p.decoder);w10p=best_pretrained+1;}
 
         const uint64_t w0 = p0_frame.size() + 4;
         const uint64_t w4 = p4_size;
         const uint64_t w9=p9_frames.wire;
-        const uint64_t w10 = std::min({w1,w4,w5,w6,w9}) + 1;
-        std::vector<uint64_t>current{w0,w1,w4,w5,w6,w7,w7b,w9};if(use_pretrained){current.push_back(w8);current.push_back(w8d);}current.push_back(w10);if(use_pretrained)current.push_back(w10p);
+        const uint64_t w10 = std::min({w1,w4,w5,w6,w7s,w9}) + 1;
+        std::vector<uint64_t>current{w0,w1,w4,w5,w6,w7s,w7,w7b,w9};if(use_pretrained){current.push_back(w8);current.push_back(w8d);}current.push_back(w10);if(use_pretrained)current.push_back(w10p);
         for (size_t r = 0; r < rows.size(); ++r) {rows[r]->wire += current[r];rows[r]->tu_wire.push_back(current[r]);}
-        p10.encode_seconds = p1.encode_seconds + p4.encode_seconds+p5.encode_seconds+p6.encode_seconds+p9.encode_seconds;
-        if(use_pretrained)p10p.encode_seconds=p1.encode_seconds+p8d.encode_seconds+p5.encode_seconds+p6.encode_seconds+p9.encode_seconds;
+        p10.encode_seconds = p1.encode_seconds + p4.encode_seconds+p5.encode_seconds+p6.encode_seconds+p7s.encode_seconds+p9.encode_seconds;
+        if(use_pretrained)p10p.encode_seconds=p1.encode_seconds+p8d.encode_seconds+p5.encode_seconds+p6.encode_seconds+p7s.encode_seconds+p9.encode_seconds;
+        source_learner.observe_tu(observations,new_ids,truth);
         cumulative_raw += file.len;
         while (checkpoint < std::size(fractions) &&
                double(cumulative_raw) >= fractions[checkpoint] * double(corpus.raw)) {
@@ -1307,8 +1630,11 @@ int main(int argc, char** argv) {
 
     // P8d reuses the P4 transform output in this all-row harness.  Charge the transform work as
     // well as its additional dictionary/plain actual-frame comparison before reporting throughput.
-    if(use_pretrained){p8d.encode_seconds+=p4.encode_seconds;p10p.encode_seconds=p1.encode_seconds+p8d.encode_seconds+p5.encode_seconds+p6.encode_seconds+p9.encode_seconds;}
+    if(use_pretrained){p8d.encode_seconds+=p4.encode_seconds;p10p.encode_seconds=p1.encode_seconds+p8d.encode_seconds+p5.encode_seconds+p6.encode_seconds+p7s.encode_seconds+p9.encode_seconds;}
 
+    std::array<uint64_t,kSourceCategoryCount>attributed_zstd{};
+    for(size_t category=0;category<kSourceCategoryCount;++category)attributed_zstd[category]=frames.compress(attributed_bytes[category],zlevel).size();
+    const std::array<uint64_t,6>source_variant_hist=source_learner.variant_histogram();
     const double total_seconds = elapsed(begin);
     std::printf("PTGC exact definition capability: %s\n", manifest);
     std::printf("TUs=%zu raw=%.2f MiB line_occurrences=%llu distinct_lines=%zu distinct_bytes=%.2f MiB marker_def_bytes=%.2f MiB\n",
@@ -1338,6 +1664,24 @@ int main(int argc, char** argv) {
     std::printf("P6 deltas=%llu comparisons=%llu copied=%.2f MiB added=%.2f MiB\n",
                 static_cast<unsigned long long>(forest_stats.delta_records),static_cast<unsigned long long>(forest_stats.comparisons),
                 forest_stats.copy_bytes/1048576.0,forest_stats.add_bytes/1048576.0);
+    std::printf("P7-source k=%u candidate-plan records=%llu literal=%llu prefix=%llu program=%llu candidates=%llu program-comparisons=%llu copied=%.2f MiB added=%.2f MiB raw-fallback=%.2f MiB raw-saving=%.2f MiB\n",
+                source_program_k,static_cast<unsigned long long>(source_stats.records),static_cast<unsigned long long>(source_stats.literal_records),
+                static_cast<unsigned long long>(source_stats.prefix_records),static_cast<unsigned long long>(source_stats.program_records),
+                static_cast<unsigned long long>(source_stats.candidates),static_cast<unsigned long long>(source_stats.program_comparisons),
+                source_stats.copy_bytes/1048576.0,source_stats.add_bytes/1048576.0,source_stats.raw_fallback_bytes/1048576.0,source_stats.union_raw_saving/1048576.0);
+    std::printf("P7-source attributed raw/z%d: marker=%.3f/%.3f toolchain=%.3f/%.3f project=%.3f/%.3f MiB; actual literal wire marker/tool/project=%.3f/%.3f/%.3f; mixed=%.3f/%.3f/%.3f; selected=%.3f/%.3f/%.3f MiB\n",zlevel,
+                attributed_bytes[kMarkerCategory].size()/1048576.0,attributed_zstd[kMarkerCategory]/1048576.0,
+                attributed_bytes[kToolchainCategory].size()/1048576.0,attributed_zstd[kToolchainCategory]/1048576.0,
+                attributed_bytes[kProjectCategory].size()/1048576.0,attributed_zstd[kProjectCategory]/1048576.0,
+                source_stats.literal_wire[kMarkerCategory]/1048576.0,source_stats.literal_wire[kToolchainCategory]/1048576.0,source_stats.literal_wire[kProjectCategory]/1048576.0,
+                source_stats.mixed_wire[kMarkerCategory]/1048576.0,source_stats.mixed_wire[kToolchainCategory]/1048576.0,source_stats.mixed_wire[kProjectCategory]/1048576.0,
+                source_stats.selected_wire[kMarkerCategory]/1048576.0,source_stats.selected_wire[kToolchainCategory]/1048576.0,source_stats.selected_wire[kProjectCategory]/1048576.0);
+    std::printf("P7-source online locations=%zu variant-hist 1/2/3/4/5+=%llu/%llu/%llu/%llu/%llu first-variant=%.2f MiB later-variant=%.2f MiB exclusive raw savings exact/medoid/basename/skeleton/sameTU=%.2f/%.2f/%.2f/%.2f/%.2f MiB\n",
+                source_learner.locations(),static_cast<unsigned long long>(source_variant_hist[1]),static_cast<unsigned long long>(source_variant_hist[2]),
+                static_cast<unsigned long long>(source_variant_hist[3]),static_cast<unsigned long long>(source_variant_hist[4]),static_cast<unsigned long long>(source_variant_hist[5]),
+                source_stats.first_variant_bytes/1048576.0,source_stats.later_variant_bytes/1048576.0,
+                source_stats.exclusive_raw_saving[0]/1048576.0,source_stats.exclusive_raw_saving[1]/1048576.0,source_stats.exclusive_raw_saving[2]/1048576.0,
+                source_stats.exclusive_raw_saving[3]/1048576.0,source_stats.exclusive_raw_saving[4]/1048576.0);
     std::printf("P5 selected rules=%llu instances=%llu raw-units=%llu lines=%llu\n",static_cast<unsigned long long>(multi_stats.rules),static_cast<unsigned long long>(multi_stats.instances),static_cast<unsigned long long>(multi_stats.raw_units),static_cast<unsigned long long>(multi_stats.lines));
     std::printf("P7 new-rules=%llu refs=%llu new-tokens=%llu token-refs=%llu inline-values=%llu raw-records=%llu\n",
                 static_cast<unsigned long long>(persistent_stats.new_rules),static_cast<unsigned long long>(persistent_stats.rule_refs),

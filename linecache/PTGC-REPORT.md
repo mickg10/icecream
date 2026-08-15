@@ -251,18 +251,78 @@ The model should remain a set of independent blocks: templates/tokens, optional 
 encoder-only ranker, and optional control table. A losing block can be omitted without changing the
 wire language or decoder identity.
 
+## Source attribution and source-location P7
+
+The marker-derived source row now reproduces the implementer's independent attribution exactly:
+
+| first-use definition category | raw bytes | independent zstd-3 |
+|---|---:|---:|
+| marker | 7.564 MiB | 0.327 MiB |
+| toolchain | 1.902 MiB | 0.362 MiB |
+| project | 42.732 MiB | 7.042 MiB |
+
+P7 retrieves prior exact/medoid/basename/skeleton candidates and current-TU same-location or
+same-skeleton candidates, evaluates exact PrefixSuffix and bounded token COPY/ADD programs, emits
+real frames, and reconstructs every definition in an independent decoder. The learner observes a TU
+only after it has been scored.
+
+Full held-out DuckDB at zstd-3:
+
+| row | wire bytes | raw/wire | result |
+|---|---:|---:|---|
+| P7 source-location | 10,444,367 | 190.1x | exact |
+| P10 actual per-TU union with P7 | 9,154,792 | 216.9x | exact |
+
+P7's candidate programs remove 17.90 MiB before the outer coder, but the mixed frames are larger
+than literal frames for nearly every category/TU. Location-first ordering improves P7 by 131,363
+bytes over the first implementation, yet improves P10 by only 128 bytes.
+
+The decisive chronology result is that all 44.63 MiB of non-marker variant content is first-variant
+content; later-TU variant bytes are zero. The 1,177,265 observed locations have the following final
+variant histogram:
+
+```text
+one variant      1,150,999
+two variants           606
+three variants       7,708
+four variants          379
+five or more        17,573
+```
+
+Prior-location history therefore cannot solve the cold definition plane. Same-TU candidates account
+for 16.66 MiB of raw candidate saving, but record-at-a-time corrections disrupt outer-frame locality
+and lose to grouped literals.
+
+## Next capability: contributing-source superblocks
+
+A 20-TU direct source-basis probe gives a stronger continuation:
+
+```text
+first-use definition bytes                         4,386,735
+bytes with an accessible project source line       2,761,414
+exact source-line matches                            532,091
+PrefixSuffix residual against the source line        190,395
+unique contributing source-line bytes              2,729,728
+```
+
+The source basis is almost one source location per definition, so sending uncompressed source lines
+would not help. The useful unit is instead a compressed contributing-source superblock: collect only
+source lines used by the current TU, order them by file and logical line, transmit them once as a
+compact basis block, and encode emitted definitions as source-base IDs plus exact corrections. The
+four separable streams are source-basis control, source-basis bytes, definition control, and exact
+residual bytes. An actual whole-frame literal fallback remains mandatory.
+
+The pretrained artifact should likewise be a superblock basis rather than a broad raw-line model:
+parameterized source templates/phrases are primary, and the same serialized package may optionally
+seed a trained zstd dictionary. Both package bytes and dictionary bytes remain charged. Existing
+measurements say the representation supplies nearly all value and the extra dictionary is only a
+small finishing effect.
+
 ## What remains before the PTGC ruling is final
 
-The current harness is missing three important parts of BigOracle's ladder:
-
-1. **Project/toolchain attribution.** Parse marker Regions into `(path, logical_line, flags)` Line
-   events, report the approximately 7.04 MiB project-attributed reference, and keep the toolchain
-   residual separate.
-2. **Source-location variants.** For every location, measure exact prior variant, medoid, token-edit,
-   and same-TU sibling candidates with exclusive and union savings.
-3. **Minimal contributing-source token pack.** If the source-location P10 remains above the line,
-   encode only source tokens that contribute to emitted output, then represent output as source spans
-   plus exact macro/configuration patches.
+The remaining ladder item is the exact contributing-source superblock codec described above,
+followed by the same chronological, reorder, edit/revert, throughput, and independent reconstruction
+gates. Its actual project-attributed wire result decides whether to integrate:
 
 The next decision should be data-driven:
 
@@ -302,6 +362,9 @@ Primary logs:
 /tmp/ptgc-final-64k-full.log
 /tmp/ptgc-semantic-export-{llvm,rocksdb,opencv,duckdb}.log
 /tmp/ptgc-sanitize.log
+/tmp/ptgc-source-p7-v2-full-k4.log
+/tmp/ptgc-source-p7-strict-smoke.log
+/tmp/ptgc-source-p7-sanitize.log
 /tmp/codec50-current-baseline.log
 /tmp/codec50-pretrain-duckdb-independent.log
 ```
