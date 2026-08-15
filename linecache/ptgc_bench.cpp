@@ -25,6 +25,7 @@
 #include <numeric>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <unordered_map>
@@ -167,6 +168,13 @@ static Corpus load_corpus(const char* manifest, size_t max_files) {
     }
     c.raw = off;
     return c;
+}
+
+static std::vector<uint8_t>load_file_bytes(const std::string&path){
+    FILE*file=std::fopen(path.c_str(),"rb");if(!file)die(path.c_str());struct stat st{};
+    if(::fstat(::fileno(file),&st)!=0||st.st_size<0||uint64_t(st.st_size)>SIZE_MAX)die_msg("unsupported model file size");
+    std::vector<uint8_t>bytes(size_t(st.st_size));if(st.st_size&&std::fread(bytes.data(),1,bytes.size(),file)!=bytes.size())die_msg("short model read");
+    std::fclose(file);return bytes;
 }
 
 class LineStore {
@@ -731,7 +739,7 @@ static void decode_templates(const std::vector<uint8_t>& control,const std::vect
 }
 
 enum SemanticChannel : size_t {kRuleLiteral=0,kRawDefinition=1,kIdentifierValue=2,kNumberValue=3,kStringValue=4,kSemanticChannels=5};
-struct SemanticBuffer {std::vector<uint8_t>control;std::array<std::vector<uint8_t>,kSemanticChannels>payload;};
+struct SemanticBuffer {std::vector<uint8_t>control;std::array<std::vector<uint8_t>,kSemanticChannels>payload;std::vector<uint32_t>raw_ids;};
 struct TypedLexiconEntry {uint8_t type=0;std::string value;uint32_t count=0;};
 
 static size_t semantic_slot_channel(uint8_t type){
@@ -758,7 +766,7 @@ static SemanticBuffer encode_semantic_templates(const std::vector<uint32_t>&ids,
     uint64_t blocks=0;for(const TemplateGroup&group:groups)blocks+=group.wire_id==UINT32_MAX?group.members.size():1;put_varint(out.control,blocks);int64_t previous_line_id=0;
     auto emit_value=[&](uint8_t type,const std::vector<uint8_t>&value){std::string key;key.reserve(value.size()+1);key.push_back(char(type));key.append(reinterpret_cast<const char*>(value.data()),value.size());auto it=lexicon_id.find(key);if(it!=lexicon_id.end()){put_varint(out.control,uint64_t(it->second)<<1);++stats.lexicon_references;}else{put_varint(out.control,(uint64_t(value.size())<<1)|1);auto&channel=out.payload[semantic_slot_channel(type)];channel.insert(channel.end(),value.begin(),value.end());}};
     for(const TemplateGroup&group:groups){if(group.wire_id!=UINT32_MAX){std::vector<size_t>order=group.members;std::sort(order.begin(),order.end(),[&](size_t a,size_t b){return ids[a]<ids[b];});out.control.push_back(2);put_varint(out.control,group.wire_id);put_varint(out.control,order.size());for(size_t index:order){const uint32_t id=ids[index];put_zigzag(out.control,int64_t(id)-previous_line_id);previous_line_id=id;put_varint(out.control,store.len(id));}for(size_t slot=0;slot<group.shape.values.size();++slot)for(size_t index:order)emit_value(group.shape.slot_type[slot],parsed[index].values[slot]);stats.instances+=order.size();for(size_t index:order)stats.template_input_bytes+=store.len(ids[index]);}
-        else for(size_t index:group.members){const uint32_t id=ids[index];out.control.push_back(0);put_zigzag(out.control,int64_t(id)-previous_line_id);previous_line_id=id;put_varint(out.control,store.len(id));const uint8_t*p=store.data(id);out.payload[kRawDefinition].insert(out.payload[kRawDefinition].end(),p,p+store.len(id));++stats.literal_fallbacks;}}
+        else for(size_t index:group.members){const uint32_t id=ids[index];out.control.push_back(0);put_zigzag(out.control,int64_t(id)-previous_line_id);previous_line_id=id;put_varint(out.control,store.len(id));const uint8_t*p=store.data(id);out.payload[kRawDefinition].insert(out.payload[kRawDefinition].end(),p,p+store.len(id));out.raw_ids.push_back(id);++stats.literal_fallbacks;}}
     return out;
 }
 
@@ -1103,6 +1111,7 @@ enum SourceCategory : uint8_t { kMarkerCategory=0,kToolchainCategory=1,kProjectC
 struct SourceLocation {
     uint64_t path_hash=0;
     uint64_t basename_hash=0;
+    uint32_t path_id=0;
     uint32_t logical_line=0;
     bool valid() const { return path_hash!=0&&logical_line!=0; }
 };
@@ -1135,14 +1144,70 @@ static bool parse_source_marker(const uint8_t*p,uint32_t n,ParsedMarker&out){
     return cur==end;
 }
 
-static SourceLocation make_source_location(const std::string&path,uint32_t line){
-    SourceLocation result;result.logical_line=line;
+static SourceLocation make_source_location(const std::string&path,uint32_t line,uint32_t path_id){
+    SourceLocation result;result.logical_line=line;result.path_id=path_id;
     if(path.empty())return result;
     result.path_hash=hash_bytes(reinterpret_cast<const uint8_t*>(path.data()),uint32_t(path.size()));
     const size_t slash=path.find_last_of("/\\");const std::string_view base(path.data()+(slash==std::string::npos?0:slash+1),path.size()-(slash==std::string::npos?0:slash+1));
     result.basename_hash=hash_bytes(reinterpret_cast<const uint8_t*>(base.data()),uint32_t(base.size()));
     return result;
 }
+
+class SourceCatalog {
+public:
+    uint32_t intern(const std::string&path){
+        auto found=by_path_.find(path);
+        if(found!=by_path_.end())return found->second;
+        if(files_.size()>=UINT32_MAX)die_msg("too many source paths");
+        const uint32_t id=uint32_t(files_.size());
+        File file;file.path=path;files_.push_back(std::move(file));
+        by_path_.emplace(path,id);
+        return id;
+    }
+
+    bool line(uint32_t path_id,uint32_t logical_line,const uint8_t*&data,uint32_t&len){
+        if(path_id==0||path_id>=files_.size()||logical_line==0)return false;
+        File&file=files_[path_id];
+        load(file);
+        if(!file.available||logical_line>file.lines.size())return false;
+        const Span span=file.lines[logical_line-1];
+        data=file.bytes.data()+span.off;len=span.len;
+        return true;
+    }
+
+private:
+    struct Span {uint32_t off=0,len=0;};
+    struct File {
+        std::string path;
+        bool loaded=false,available=false;
+        std::vector<uint8_t>bytes;
+        std::vector<Span>lines;
+    };
+
+    static void load(File&file){
+        if(file.loaded)return;
+        file.loaded=true;
+        if(file.path.empty()||file.path.front()=='<')return;
+        FILE*input=std::fopen(file.path.c_str(),"rb");
+        if(!input)return;
+        struct stat st{};
+        if(::fstat(::fileno(input),&st)!=0||st.st_size<0||uint64_t(st.st_size)>UINT32_MAX){std::fclose(input);return;}
+        file.bytes.resize(size_t(st.st_size));
+        if(st.st_size&&std::fread(file.bytes.data(),1,file.bytes.size(),input)!=file.bytes.size()){
+            std::fclose(input);file.bytes.clear();return;
+        }
+        std::fclose(input);
+        uint32_t begin=0;
+        for(uint32_t i=0;i<file.bytes.size();++i){
+            if(file.bytes[i]=='\n'){file.lines.push_back({begin,i+1-begin});begin=i+1;}
+        }
+        if(begin<file.bytes.size())file.lines.push_back({begin,uint32_t(file.bytes.size()-begin)});
+        file.available=true;
+    }
+
+    std::vector<File>files_{File{}};
+    std::unordered_map<std::string,uint32_t>by_path_;
+};
 
 static uint8_t classify_source_path(const std::string&path){
     return path.rfind("/usr",0)==0||path.rfind("/lib",0)==0?kToolchainCategory:kProjectCategory;
@@ -1387,6 +1452,249 @@ static void decode_source_variants(const SourceRaw&raw,DecoderStore&store){
         if(p!=end||data!=data_end)die_msg("trailing source frame bytes");}
 }
 
+// P7p: transmit only source lines that materially contribute to current-TU definitions.  Source
+// bases are local to the frame, sorted in source-file order, and reconstructed before any definition
+// refers to them.  This keeps the first capability row independent of persistent cache assumptions.
+struct SourcePackPlanStats {
+    uint64_t available_records=0,available_bytes=0,source_records=0,literal_records=0;
+    uint64_t basis_records=0,basis_bytes=0,residual_bytes=0,target_bytes=0;
+};
+
+struct SourcePackRaw {
+    std::vector<uint8_t>basis_control,basis_data,definition_control,definition_data;
+    SourcePackPlanStats stats;
+    bool implicit_order=false;
+    bool valid=false;
+};
+
+struct SourcePackFrames {
+    std::vector<uint8_t>basis_control,basis_data,definition_control,definition_data;
+    std::array<bool,4>dictionary{};
+    SourcePackPlanStats stats;
+    uint64_t wire=UINT64_MAX;
+    unsigned residual_percent=0;
+    bool implicit_order=false;
+    bool valid=false;
+};
+
+struct SourcePackStats {
+    SourcePackPlanStats selected;
+    std::array<uint64_t,6>threshold_wins{};
+    std::array<uint64_t,6>threshold_tus{},threshold_wire{},threshold_basis_bytes{},threshold_residual_bytes{};
+    uint64_t candidate_tus=0,frame_wins=0,literal_wire=0,source_wire=0,selected_wire=0;
+    std::array<uint64_t,4>frame_wire{};
+};
+
+static constexpr std::array<unsigned,6>kSourcePackThresholds={0,6,12,25,50,100};
+
+struct SourcePackBase {
+    std::string bytes;
+    uint32_t path_id=0,logical_line=0,old_id=0;
+};
+
+struct SourcePackRecord {
+    uint32_t id=0,base_old_id=0,prefix=0,suffix=0;
+    uint32_t path_id=0,logical_line=0;
+    bool source=false;
+};
+
+static SourcePackRaw encode_source_pack(const std::vector<uint32_t>&ids,const LineStore&store,
+                                        const std::vector<LineSourceMeta>&meta,
+                                        const std::unordered_map<uint32_t,std::vector<SourceLocation>>&locations,
+                                        SourceCatalog&catalog,unsigned residual_percent,bool implicit_order=false){
+    SourcePackRaw raw;raw.implicit_order=implicit_order;
+    std::vector<SourcePackRecord>records;records.reserve(ids.size());
+    std::vector<SourcePackBase>bases;
+    std::unordered_map<std::string,uint32_t>base_ids;
+    base_ids.reserve(ids.size()/2+1);
+
+    for(uint32_t id:ids){
+        SourcePackRecord record;record.id=id;
+        const uint32_t target_len=store.len(id);raw.stats.target_bytes+=target_len;
+        bool available=false;uint32_t best_prefix=0,best_suffix=0,best_path=0,best_line=0;
+        const uint8_t*best_base=nullptr;uint32_t best_base_len=0;uint32_t best_residual=UINT32_MAX;
+        auto consider=[&](const SourceLocation&location){
+            if(!location.valid()||location.path_id==0)return;
+            const uint8_t*base=nullptr;uint32_t base_len=0;
+            if(!catalog.line(location.path_id,location.logical_line,base,base_len))return;
+            available=true;uint32_t prefix=0,suffix=0;
+            common_prefix_suffix(base,base_len,store.data(id),target_len,prefix,suffix);
+            const uint32_t residual=target_len-prefix-suffix;
+            if(residual<best_residual||
+               (residual==best_residual&&std::tie(location.path_id,location.logical_line)<std::tie(best_path,best_line))){
+                best_prefix=prefix;best_suffix=suffix;best_path=location.path_id;best_line=location.logical_line;
+                best_base=base;best_base_len=base_len;best_residual=residual;
+            }
+        };
+        if(!meta[id].marker&&meta[id].category==kProjectCategory){
+            auto found=locations.find(id);
+            if(found!=locations.end())for(const SourceLocation&location:found->second)consider(location);
+            if(found==locations.end()||found->second.empty())consider(meta[id].location);
+        }
+        if(available){++raw.stats.available_records;raw.stats.available_bytes+=target_len;}
+        const size_t literal_cost=literal_source_cost(id,target_len);
+        const size_t source_cost=best_base?prefix_source_cost(id,target_len,1,best_prefix,best_suffix):SIZE_MAX;
+        const bool ratio_ok=best_base&&uint64_t(best_residual)*100<=uint64_t(target_len)*residual_percent;
+        if(ratio_ok&&source_cost<literal_cost){
+            std::string key(reinterpret_cast<const char*>(best_base),best_base_len);
+            auto inserted=base_ids.emplace(key,uint32_t(bases.size()));
+            uint32_t old_id=inserted.first->second;
+            if(inserted.second){bases.push_back({std::move(key),best_path,best_line,old_id});}
+            record.source=true;record.base_old_id=old_id;record.prefix=best_prefix;record.suffix=best_suffix;
+            record.path_id=best_path;record.logical_line=best_line;
+            ++raw.stats.source_records;raw.stats.residual_bytes+=best_residual;
+        }else ++raw.stats.literal_records;
+        records.push_back(record);
+    }
+    if(bases.empty())return raw;
+    raw.valid=true;raw.stats.basis_records=bases.size();
+    std::vector<uint32_t>basis_order(bases.size()),basis_remap(bases.size());
+    std::iota(basis_order.begin(),basis_order.end(),0);
+    std::sort(basis_order.begin(),basis_order.end(),[&](uint32_t a,uint32_t b){
+        const SourcePackBase&x=bases[a],&y=bases[b];
+        if(x.path_id!=y.path_id)return x.path_id<y.path_id;
+        if(x.logical_line!=y.logical_line)return x.logical_line<y.logical_line;
+        return x.bytes<y.bytes;
+    });
+    put_varint(raw.basis_control,bases.size());
+    for(uint32_t new_id=0;new_id<basis_order.size();++new_id){
+        const SourcePackBase&base=bases[basis_order[new_id]];basis_remap[base.old_id]=new_id;
+        put_varint(raw.basis_control,base.bytes.size());
+        raw.basis_data.insert(raw.basis_data.end(),base.bytes.begin(),base.bytes.end());
+        raw.stats.basis_bytes+=base.bytes.size();
+    }
+
+    if(implicit_order){
+        put_varint(raw.definition_control,records.size());
+        const size_t bitmap_bytes=(records.size()+7)/8,bitmap_offset=raw.definition_control.size();
+        raw.definition_control.resize(bitmap_offset+bitmap_bytes);
+        for(size_t index=0;index<records.size();++index)if(records[index].source)raw.definition_control[bitmap_offset+index/8]|=uint8_t(1u<<(index%8));
+        for(const SourcePackRecord&record:records)if(record.source){
+            put_varint(raw.definition_control,basis_remap[record.base_old_id]);put_varint(raw.definition_control,record.prefix);put_varint(raw.definition_control,record.suffix);
+        }
+        for(const SourcePackRecord&record:records){const uint32_t len=store.len(record.id);
+            if(record.source)raw.definition_data.insert(raw.definition_data.end(),store.data(record.id)+record.prefix,store.data(record.id)+len-record.suffix);
+            else raw.definition_data.insert(raw.definition_data.end(),store.data(record.id),store.data(record.id)+len);
+        }
+        return raw;
+    }
+
+    std::vector<uint32_t>record_order(records.size());std::iota(record_order.begin(),record_order.end(),0);
+    std::sort(record_order.begin(),record_order.end(),[&](uint32_t a,uint32_t b){
+        const SourcePackRecord&x=records[a],&y=records[b];
+        if(x.source!=y.source)return x.source>y.source;
+        if(x.source){
+            if(x.path_id!=y.path_id)return x.path_id<y.path_id;
+            if(x.logical_line!=y.logical_line)return x.logical_line<y.logical_line;
+        }
+        return line_less(x.id,y.id,store);
+    });
+    put_varint(raw.definition_control,records.size());
+    for(uint32_t index:record_order){
+        const SourcePackRecord&record=records[index];const uint32_t len=store.len(record.id);
+        raw.definition_control.push_back(record.source?1:0);put_varint(raw.definition_control,record.id);put_varint(raw.definition_control,len);
+        if(record.source){
+            put_varint(raw.definition_control,basis_remap[record.base_old_id]);put_varint(raw.definition_control,record.prefix);put_varint(raw.definition_control,record.suffix);
+            raw.definition_data.insert(raw.definition_data.end(),store.data(record.id)+record.prefix,store.data(record.id)+len-record.suffix);
+        }else raw.definition_data.insert(raw.definition_data.end(),store.data(record.id),store.data(record.id)+len);
+    }
+    return raw;
+}
+
+static SourcePackFrames compress_source_pack(const SourcePackRaw&raw,FrameCodec&codec,int level,unsigned residual_percent,
+                                             ModelFrameCodec*model=nullptr){
+    SourcePackFrames frames;if(!raw.valid)return frames;
+    frames.valid=true;frames.residual_percent=residual_percent;frames.stats=raw.stats;frames.implicit_order=raw.implicit_order;
+    auto compress=[&](const std::vector<uint8_t>&input,std::vector<uint8_t>&output,size_t index){
+        if(model){PackedFrame packed=model->compress_best(input,level);output=std::move(packed.bytes);frames.dictionary[index]=packed.dictionary;}
+        else output=codec.compress(input,level);
+    };
+    compress(raw.basis_control,frames.basis_control,0);compress(raw.basis_data,frames.basis_data,1);
+    compress(raw.definition_control,frames.definition_control,2);compress(raw.definition_data,frames.definition_data,3);
+    frames.wire=frames.basis_control.size()+frames.basis_data.size()+frames.definition_control.size()+frames.definition_data.size()+16;
+    if(model)frames.wire+=4; // one explicit plain/dictionary selector per frame
+    return frames;
+}
+
+static std::vector<uint8_t>decompress_source_pack_frame(const std::vector<uint8_t>&frame,bool dictionary,
+                                                        FrameCodec&codec,ModelFrameCodec*model){
+    if(dictionary){if(!model)die_msg("source-pack dictionary unavailable");PackedFrame packed;packed.bytes=frame;packed.dictionary=true;return model->decompress(packed);}
+    return codec.decompress(frame);
+}
+
+static void decode_source_pack(const SourcePackFrames&frames,FrameCodec&codec,DecoderStore&store,ModelFrameCodec*model=nullptr){
+    if(!frames.valid)die_msg("missing source-pack frame");
+    if(frames.implicit_order)die_msg("implicit source-pack requires semantic lengths");
+    const std::vector<uint8_t>basis_control=decompress_source_pack_frame(frames.basis_control,frames.dictionary[0],codec,model),basis_data=decompress_source_pack_frame(frames.basis_data,frames.dictionary[1],codec,model);
+    const std::vector<uint8_t>definition_control=decompress_source_pack_frame(frames.definition_control,frames.dictionary[2],codec,model),definition_data=decompress_source_pack_frame(frames.definition_data,frames.dictionary[3],codec,model);
+    const uint8_t*p=basis_control.data(),*end=p+basis_control.size(),*data=basis_data.data(),*data_end=data+basis_data.size();
+    const uint64_t base_count=get_varint(p,end);std::vector<std::vector<uint8_t>>bases;bases.reserve(size_t(base_count));
+    for(uint64_t i=0;i<base_count;++i){const uint64_t len=get_varint(p,end);if(len>uint64_t(data_end-data))die_msg("source-pack basis exceeds frame");bases.emplace_back(data,data+len);data+=len;}
+    if(p!=end||data!=data_end)die_msg("trailing source-pack basis bytes");
+    p=definition_control.data();end=p+definition_control.size();data=definition_data.data();data_end=data+definition_data.size();
+    const uint64_t record_count=get_varint(p,end);
+    for(uint64_t i=0;i<record_count;++i){
+        if(p==end)die_msg("missing source-pack mode");
+        const uint8_t mode=*p++;const uint32_t id=uint32_t(get_varint(p,end));const uint64_t output_len=get_varint(p,end);
+        std::vector<uint8_t>result;result.reserve(size_t(output_len));
+        if(mode==0){if(output_len>uint64_t(data_end-data))die_msg("source-pack literal exceeds frame");result.insert(result.end(),data,data+output_len);data+=output_len;}
+        else if(mode==1){
+            const uint64_t base_id=get_varint(p,end),prefix=get_varint(p,end),suffix=get_varint(p,end);
+            if(base_id>=bases.size())die_msg("source-pack base missing");
+            const std::vector<uint8_t>&base=bases[size_t(base_id)];
+            if(prefix>base.size()||suffix>base.size()-prefix||prefix+suffix>output_len)die_msg("source-pack prefix/suffix range");
+            const uint64_t middle=output_len-prefix-suffix;if(middle>uint64_t(data_end-data))die_msg("source-pack residual exceeds frame");
+            result.insert(result.end(),base.begin(),base.begin()+prefix);result.insert(result.end(),data,data+middle);data+=middle;result.insert(result.end(),base.end()-suffix,base.end());
+        }else die_msg("unknown source-pack mode");
+        if(result.size()!=output_len)die_msg("source-pack output length mismatch");
+        store.install(id,std::move(result));
+    }
+    if(p!=end||data!=data_end)die_msg("trailing source-pack definition bytes");
+}
+
+static std::vector<uint64_t>semantic_raw_lengths(const std::vector<uint8_t>&control){
+    const uint8_t*p=control.data(),*end=p+control.size();const uint64_t rule_count=get_varint(p,end);
+    std::vector<uint64_t>rule_slots;rule_slots.reserve(size_t(rule_count));
+    for(uint64_t r=0;r<rule_count;++r){const uint64_t slots=get_varint(p,end);if(slots>uint64_t(end-p))die_msg("semantic source rule slots exceed control");p+=slots;rule_slots.push_back(slots);
+        const uint64_t occurrences=get_varint(p,end);for(uint64_t i=0;i<occurrences;++i){(void)get_varint(p,end);const uint64_t slot=get_varint(p,end);if(slot>=slots)die_msg("semantic source rule slot out of range");}(void)get_varint(p,end);}
+    const uint64_t lexicon_count=get_varint(p,end);for(uint64_t i=0;i<lexicon_count;++i){if(p==end)die_msg("semantic source lexicon type missing");++p;(void)get_varint(p,end);}
+    const uint64_t blocks=get_varint(p,end);std::vector<uint64_t>lengths;
+    for(uint64_t b=0;b<blocks;++b){if(p==end)die_msg("semantic source record mode missing");const uint8_t mode=*p++;
+        if(mode==0){(void)get_zigzag(p,end);lengths.push_back(get_varint(p,end));continue;}
+        if(mode!=2)die_msg("unknown semantic source record mode");
+        const uint64_t rule_id=get_varint(p,end);if(rule_id>=rule_slots.size())die_msg("semantic source rule missing");const uint64_t rows=get_varint(p,end);
+        for(uint64_t row=0;row<rows;++row){(void)get_zigzag(p,end);(void)get_varint(p,end);}
+        for(uint64_t slot=0;slot<rule_slots[size_t(rule_id)];++slot)for(uint64_t row=0;row<rows;++row)(void)get_varint(p,end);
+    }
+    if(p!=end)die_msg("trailing semantic source control bytes");
+    return lengths;
+}
+
+static std::vector<uint8_t>decode_implicit_source_pack(const SourcePackFrames&frames,FrameCodec&codec,
+                                                       const std::vector<uint64_t>&lengths,ModelFrameCodec*model=nullptr){
+    if(!frames.valid||!frames.implicit_order)die_msg("missing implicit source-pack frame");
+    const std::vector<uint8_t>basis_control=decompress_source_pack_frame(frames.basis_control,frames.dictionary[0],codec,model),basis_data=decompress_source_pack_frame(frames.basis_data,frames.dictionary[1],codec,model);
+    const std::vector<uint8_t>definition_control=decompress_source_pack_frame(frames.definition_control,frames.dictionary[2],codec,model),definition_data=decompress_source_pack_frame(frames.definition_data,frames.dictionary[3],codec,model);
+    const uint8_t*p=basis_control.data(),*end=p+basis_control.size(),*data=basis_data.data(),*data_end=data+basis_data.size();
+    const uint64_t base_count=get_varint(p,end);std::vector<std::vector<uint8_t>>bases;bases.reserve(size_t(base_count));
+    for(uint64_t i=0;i<base_count;++i){const uint64_t len=get_varint(p,end);if(len>uint64_t(data_end-data))die_msg("implicit source basis exceeds frame");bases.emplace_back(data,data+len);data+=len;}
+    if(p!=end||data!=data_end)die_msg("trailing implicit source basis bytes");
+    p=definition_control.data();end=p+definition_control.size();const uint64_t count=get_varint(p,end);if(count!=lengths.size())die_msg("implicit source record count mismatch");
+    const size_t bitmap_bytes=(lengths.size()+7)/8;if(bitmap_bytes>size_t(end-p))die_msg("implicit source bitmap exceeds control");const uint8_t*bitmap=p;p+=bitmap_bytes;
+    data=definition_data.data();data_end=data+definition_data.size();std::vector<uint8_t>payload;
+    uint64_t total=0;for(uint64_t len:lengths){if(len>SIZE_MAX-total)die_msg("implicit source payload too large");total+=len;}payload.reserve(size_t(total));
+    for(size_t i=0;i<lengths.size();++i){const uint64_t output_len=lengths[i];const bool source=(bitmap[i/8]>>(i%8))&1u;
+        if(!source){if(output_len>uint64_t(data_end-data))die_msg("implicit source literal exceeds frame");payload.insert(payload.end(),data,data+output_len);data+=output_len;continue;}
+        const uint64_t base_id=get_varint(p,end),prefix=get_varint(p,end),suffix=get_varint(p,end);if(base_id>=bases.size())die_msg("implicit source base missing");const std::vector<uint8_t>&base=bases[size_t(base_id)];
+        if(prefix>base.size()||suffix>base.size()-prefix||prefix+suffix>output_len)die_msg("implicit source prefix/suffix range");
+        const uint64_t middle=output_len-prefix-suffix;
+        if(middle>uint64_t(data_end-data))die_msg("implicit source residual exceeds frame");
+        payload.insert(payload.end(),base.begin(),base.begin()+prefix);payload.insert(payload.end(),data,data+middle);data+=middle;payload.insert(payload.end(),base.end()-suffix,base.end());
+    }
+    if(p!=end||data!=data_end)die_msg("trailing implicit source definition bytes");
+    return payload;
+}
+
 struct Row {
     const char* name = nullptr;
     uint64_t wire = 0;
@@ -1423,6 +1731,7 @@ int main(int argc, char** argv) {
     bool pretrain_all_identifiers = false;
     std::vector<std::string> pretrain_manifests;
     std::string semantic_export_prefix;
+    std::string source_dictionary_path;
     bool semantic_export_only = false;
     int zlevel = 3;
     for (int i = 1; i < argc; ++i) {
@@ -1436,6 +1745,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--pretrain-all-identifiers")) pretrain_all_identifiers = true;
         else if (!std::strcmp(argv[i], "--semantic-export-prefix") && i + 1 < argc) semantic_export_prefix = argv[++i];
         else if (!std::strcmp(argv[i], "--semantic-export-only")) semantic_export_only = true;
+        else if (!std::strcmp(argv[i], "--source-dict") && i + 1 < argc) source_dictionary_path = argv[++i];
         else if (!std::strcmp(argv[i], "--z") && i + 1 < argc) zlevel = std::atoi(argv[++i]);
         else {
             std::fprintf(stderr, "unknown argument: %s\n", argv[i]);
@@ -1443,7 +1753,7 @@ int main(int argc, char** argv) {
         }
     }
     if (!manifest || zlevel < 0 || zlevel > 3 || source_program_k > 32 || (model_kib && pretrain_manifests.empty()) || (!model_kib && !pretrain_manifests.empty()) || (semantic_export_only&&semantic_export_prefix.empty())) {
-        std::fprintf(stderr, "usage: %s --manifest FILE [--max-files N] [--z 0..3] [--source-k 0..32] [--semantic-export-prefix PATH [--semantic-export-only]] [--pretrain-manifest FILE ... --model-kib N] [--pretrain-max-files N] [--model-min-corpora N] [--pretrain-all-identifiers]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s --manifest FILE [--max-files N] [--z 0..3] [--source-k 0..32] [--source-dict FILE] [--semantic-export-prefix PATH [--semantic-export-only]] [--pretrain-manifest FILE ... --model-kib N] [--pretrain-max-files N] [--model-min-corpora N] [--pretrain-all-identifiers]\n", argv[0]);
         return 2;
     }
     for(const std::string&training:pretrain_manifests)if(training==manifest)die_msg("pretraining and target manifests must be disjoint");
@@ -1451,6 +1761,13 @@ int main(int argc, char** argv) {
     const bool use_pretrained=model_kib!=0;
     PretrainedPackage pretrained;
     if(use_pretrained){const auto training_begin=Clock::now();PretrainedBuilder builder(pretrain_all_identifiers);for(size_t i=0;i<pretrain_manifests.size();++i)builder.scan_manifest(pretrain_manifests[i],pretrain_max_files,i);const double training_seconds=elapsed(training_begin);pretrained=builder.compile(model_kib*1024,zlevel,training_seconds,model_min_corpora);}
+    const bool use_source_dictionary=!source_dictionary_path.empty();
+    const std::vector<uint8_t>source_dictionary=use_source_dictionary?load_file_bytes(source_dictionary_path):std::vector<uint8_t>{};
+    if(use_source_dictionary&&(source_dictionary.empty()||source_dictionary.size()>UINT32_MAX))die_msg("source dictionary size out of range");
+    FrameCodec source_dictionary_package_codec;
+    const std::vector<uint8_t>source_dictionary_package=use_source_dictionary?source_dictionary_package_codec.compress(source_dictionary,zlevel):std::vector<uint8_t>{};
+    const std::vector<uint8_t>source_dictionary_decoded=use_source_dictionary?source_dictionary_package_codec.decompress(source_dictionary_package):std::vector<uint8_t>{};
+    if(source_dictionary_decoded!=source_dictionary)die_msg("source dictionary package mismatch");
 
     const auto begin = Clock::now();
     Corpus corpus = load_corpus(manifest, max_files);
@@ -1462,9 +1779,11 @@ int main(int argc, char** argv) {
     FrameCodec frames;
     ModelFrameCodec model_frames(pretrained.raw,zlevel);
     ModelFrameCodec model_p4_frames(pretrained.raw,zlevel);
-    Row p0("P0-appearance"), p1("P1-lexicographic"), p4("P4-alpha-template"),p5("P5-multiline"),p6("P6-token-forest"),p7s("P7-source-location"),p7("P7-online-template"),p7b("P7b-local-rule-online-token"),p9("P9-semantic-split-zstd"),p8("P8-pretrained-superblock"),p8d("P8-pretrained-dict-P4"), p10("P10-best-local-frame"),p10p("P10+P8-charged-union");
-    std::vector<Row*> rows{&p0, &p1, &p4,&p5,&p6,&p7s,&p7,&p7b,&p9};if(use_pretrained){rows.push_back(&p8);rows.push_back(&p8d);}rows.push_back(&p10);if(use_pretrained)rows.push_back(&p10p);
+    ModelFrameCodec source_dictionary_encoder_frames(source_dictionary,zlevel),source_dictionary_decoder_frames(source_dictionary_decoded,zlevel);
+    Row p0("P0-appearance"), p1("P1-lexicographic"), p4("P4-alpha-template"),p5("P5-multiline"),p6("P6-token-forest"),p7s("P7-source-location"),p7p("P7p-source-superblock"),p7("P7-online-template"),p7b("P7b-local-rule-online-token"),p9("P9-semantic-split-zstd"),p9s("P9s-semantic+source"),p9sd("P9s+trained-source-dict"),p8("P8-pretrained-superblock"),p8d("P8-pretrained-dict-P4"), p10("P10-best-local-frame"),p10sd("P10+source-dict"),p10p("P10+P8-charged-union");
+    std::vector<Row*> rows{&p0, &p1, &p4,&p5,&p6,&p7s,&p7p,&p7,&p7b,&p9,&p9s};if(use_source_dictionary)rows.push_back(&p9sd);if(use_pretrained){rows.push_back(&p8);rows.push_back(&p8d);}rows.push_back(&p10);if(use_source_dictionary)rows.push_back(&p10sd);if(use_pretrained)rows.push_back(&p10p);
     if(use_pretrained){p8.wire=pretrained.frame.size()+4;p8d.wire=pretrained.frame.size()+4;p10p.wire=pretrained.frame.size()+4;}
+    if(use_source_dictionary){const uint64_t package_wire=source_dictionary_package.size()+4;p9sd.wire=package_wire;p10sd.wire=package_wire;}
     std::unique_ptr<SemanticFrameWriter>semantic_writer;if(!semantic_export_prefix.empty())semantic_writer=std::make_unique<SemanticFrameWriter>(semantic_export_prefix);
     for (Row* row : rows) row->tu_wire.reserve(corpus.files.size());
     TemplateStats template_stats;
@@ -1474,7 +1793,7 @@ int main(int argc, char** argv) {
     PersistentStats hybrid_stats;PersistentEncoder hybrid_encoder;PersistentDecoder hybrid_decoder;
     PersistentStats pretrained_stats;
     MultiStats multi_stats;
-    SourceLearner source_learner;SourceStats source_stats;std::vector<LineSourceMeta>source_meta(1);
+    SourceLearner source_learner;SourceStats source_stats;SourcePackStats source_pack_stats,semantic_source_pack_stats,dictionary_source_pack_stats;SourceCatalog source_catalog;std::vector<LineSourceMeta>source_meta(1);
     std::array<std::vector<uint8_t>,kSourceCategoryCount>attributed_bytes;
     uint64_t cumulative_raw = 0;
     const double fractions[] = {0.10, 0.25, 0.50, 0.75, 1.00};
@@ -1498,7 +1817,8 @@ int main(int argc, char** argv) {
             const uint8_t* line_end = hit ? static_cast<const uint8_t*>(hit) + 1 : end;
             const uint32_t len = uint32_t(line_end - p);
             ParsedMarker marker;const bool marker_line=parse_source_marker(p,len,marker);LineSourceMeta line_meta;
-            if(marker_line){line_meta.marker=true;line_meta.category=kMarkerCategory;line_meta.location=make_source_location(marker.path,marker.logical_line);}
+            const uint32_t marker_path_id=marker_line?source_catalog.intern(marker.path):0;
+            if(marker_line){line_meta.marker=true;line_meta.category=kMarkerCategory;line_meta.location=make_source_location(marker.path,marker.logical_line,marker_path_id);}
             else {line_meta.location=current_location;line_meta.category=current_category;}
             const LineStore::Result result = truth.intern(p, len);
             if (result.first) {
@@ -1511,7 +1831,7 @@ int main(int argc, char** argv) {
                 SourceObservation observation{line_meta.location,result.id};if(observation_seen.insert(observation).second)observations.push_back(observation);
                 if(current_new_ids.find(result.id)!=current_new_ids.end()){std::vector<SourceLocation>&locations=current_locations[result.id];bool duplicate=false;for(const SourceLocation&old:locations)if(old.path_hash==line_meta.location.path_hash&&old.logical_line==line_meta.location.logical_line){duplicate=true;break;}if(!duplicate&&locations.size()<8)locations.push_back(line_meta.location);}}
             ++total_occurrences;
-            if(marker_line){current_path=marker.path;current_location=make_source_location(current_path,marker.logical_line);current_category=classify_source_path(current_path);}
+            if(marker_line){current_path=marker.path;current_location=make_source_location(current_path,marker.logical_line,marker_path_id);current_category=classify_source_path(current_path);}
             else if(current_location.logical_line!=UINT32_MAX)++current_location.logical_line;
             p = line_end;
         }
@@ -1566,6 +1886,61 @@ int main(int argc, char** argv) {
         if(p9_frames_b.wire<p9_frames.wire){p9_frames=std::move(p9_frames_b);selected_p9=p9_stats_b;p9_selected=&p9_raw_b;}if(semantic_writer)semantic_writer->add(file.len,*p9_selected);p9.encode_seconds+=elapsed(e9);semantic_stats.rules+=selected_p9.rules;semantic_stats.instances+=selected_p9.instances;semantic_stats.unique_slots+=selected_p9.unique_slots;semantic_stats.slot_occurrences+=selected_p9.slot_occurrences;semantic_stats.literal_fallbacks+=selected_p9.literal_fallbacks;semantic_stats.template_input_bytes+=selected_p9.template_input_bytes;semantic_stats.lexicon_entries+=selected_p9.lexicon_entries;semantic_stats.lexicon_references+=selected_p9.lexicon_references;p9_control_wire+=p9_frames.control.size()+4;for(size_t c=0;c<kSemanticChannels;++c)if(!p9_frames.payload[c].empty())p9_payload_wire[c]+=p9_frames.payload[c].size()+4;
         const auto d9=Clock::now();const SemanticBuffer p9_decoded=decompress_semantic(p9_frames,frames);decode_semantic_templates(p9_decoded,p9.decoder);p9.decode_seconds+=elapsed(d9);verify_definitions(new_ids,truth,p9.decoder);
 
+        SourcePackFrames p9s_source_frames,p9sd_source_frames;size_t p9s_threshold_index=0,p9sd_threshold_index=0;double p9s_tu_encode=0,p9sd_tu_encode=0;
+        for(size_t threshold_index=0;threshold_index<kSourcePackThresholds.size();++threshold_index){
+            const unsigned threshold=kSourcePackThresholds[threshold_index];
+            const auto plan_begin=Clock::now();
+            SourcePackRaw candidate_raw=encode_source_pack(p9_selected->raw_ids,truth,source_meta,current_locations,source_catalog,threshold,true);
+            const double plan_seconds=elapsed(plan_begin);const auto plain_begin=Clock::now();
+            SourcePackFrames candidate=compress_source_pack(candidate_raw,frames,zlevel,threshold);
+            p9s_tu_encode+=plan_seconds+elapsed(plain_begin);
+            if(candidate.valid){++semantic_source_pack_stats.threshold_tus[threshold_index];semantic_source_pack_stats.threshold_wire[threshold_index]+=candidate.wire;
+                semantic_source_pack_stats.threshold_basis_bytes[threshold_index]+=candidate.stats.basis_bytes;semantic_source_pack_stats.threshold_residual_bytes[threshold_index]+=candidate.stats.residual_bytes;}
+            if(candidate.valid&&(!p9s_source_frames.valid||candidate.wire<p9s_source_frames.wire)){p9s_source_frames=std::move(candidate);p9s_threshold_index=threshold_index;}
+            if(use_source_dictionary){const auto dictionary_begin=Clock::now();SourcePackFrames dictionary_candidate=compress_source_pack(candidate_raw,frames,zlevel,threshold,&source_dictionary_encoder_frames);p9sd_tu_encode+=plan_seconds+elapsed(dictionary_begin);
+                if(dictionary_candidate.valid){++dictionary_source_pack_stats.threshold_tus[threshold_index];dictionary_source_pack_stats.threshold_wire[threshold_index]+=dictionary_candidate.wire;
+                    dictionary_source_pack_stats.threshold_basis_bytes[threshold_index]+=dictionary_candidate.stats.basis_bytes;dictionary_source_pack_stats.threshold_residual_bytes[threshold_index]+=dictionary_candidate.stats.residual_bytes;}
+                if(dictionary_candidate.valid&&(!p9sd_source_frames.valid||dictionary_candidate.wire<p9sd_source_frames.wire)){p9sd_source_frames=std::move(dictionary_candidate);p9sd_threshold_index=threshold_index;}}
+        }
+        const uint64_t p9_raw_wire=p9_frames.payload[kRawDefinition].empty()?0:p9_frames.payload[kRawDefinition].size()+4;
+        const uint64_t p9_without_raw=p9_frames.wire-p9_raw_wire;
+        const uint64_t p9_source_size=p9s_source_frames.valid?p9_without_raw+p9s_source_frames.wire:UINT64_MAX;
+        const uint64_t p9_dictionary_source_size=p9sd_source_frames.valid?p9_without_raw+p9sd_source_frames.wire:UINT64_MAX;
+        const bool p9s_use_source=p9s_source_frames.valid&&p9_source_size<p9_frames.wire;
+        const bool p9sd_use_source=p9sd_source_frames.valid&&p9_dictionary_source_size<p9_frames.wire;
+        const uint64_t w9s=std::min(p9_frames.wire,p9_source_size)+1;p9s.encode_seconds+=p9s_tu_encode;
+        const uint64_t w9sd=std::min(p9_frames.wire,p9_dictionary_source_size)+1;
+        if(use_source_dictionary)p9sd.encode_seconds+=p9sd_tu_encode;
+        semantic_source_pack_stats.literal_wire+=p9_raw_wire;semantic_source_pack_stats.selected_wire+=(p9s_use_source?p9s_source_frames.wire:p9_raw_wire)+1;
+        if(p9s_source_frames.valid){
+            ++semantic_source_pack_stats.candidate_tus;++semantic_source_pack_stats.threshold_wins[p9s_threshold_index];semantic_source_pack_stats.source_wire+=p9s_source_frames.wire;
+            if(p9s_use_source)++semantic_source_pack_stats.frame_wins;
+            semantic_source_pack_stats.selected.available_records+=p9s_source_frames.stats.available_records;semantic_source_pack_stats.selected.available_bytes+=p9s_source_frames.stats.available_bytes;
+            semantic_source_pack_stats.selected.source_records+=p9s_source_frames.stats.source_records;semantic_source_pack_stats.selected.literal_records+=p9s_source_frames.stats.literal_records;
+            semantic_source_pack_stats.selected.basis_records+=p9s_source_frames.stats.basis_records;semantic_source_pack_stats.selected.basis_bytes+=p9s_source_frames.stats.basis_bytes;
+            semantic_source_pack_stats.selected.residual_bytes+=p9s_source_frames.stats.residual_bytes;semantic_source_pack_stats.selected.target_bytes+=p9s_source_frames.stats.target_bytes;
+            semantic_source_pack_stats.frame_wire[0]+=p9s_source_frames.basis_control.size()+4;semantic_source_pack_stats.frame_wire[1]+=p9s_source_frames.basis_data.size()+4;
+            semantic_source_pack_stats.frame_wire[2]+=p9s_source_frames.definition_control.size()+4;semantic_source_pack_stats.frame_wire[3]+=p9s_source_frames.definition_data.size()+4;
+        }
+        dictionary_source_pack_stats.literal_wire+=p9_raw_wire;dictionary_source_pack_stats.selected_wire+=(p9sd_use_source?p9sd_source_frames.wire:p9_raw_wire)+1;
+        if(p9sd_source_frames.valid){
+            ++dictionary_source_pack_stats.candidate_tus;++dictionary_source_pack_stats.threshold_wins[p9sd_threshold_index];dictionary_source_pack_stats.source_wire+=p9sd_source_frames.wire;
+            if(p9sd_use_source)++dictionary_source_pack_stats.frame_wins;
+            dictionary_source_pack_stats.selected.available_records+=p9sd_source_frames.stats.available_records;dictionary_source_pack_stats.selected.available_bytes+=p9sd_source_frames.stats.available_bytes;
+            dictionary_source_pack_stats.selected.source_records+=p9sd_source_frames.stats.source_records;dictionary_source_pack_stats.selected.literal_records+=p9sd_source_frames.stats.literal_records;
+            dictionary_source_pack_stats.selected.basis_records+=p9sd_source_frames.stats.basis_records;dictionary_source_pack_stats.selected.basis_bytes+=p9sd_source_frames.stats.basis_bytes;
+            dictionary_source_pack_stats.selected.residual_bytes+=p9sd_source_frames.stats.residual_bytes;dictionary_source_pack_stats.selected.target_bytes+=p9sd_source_frames.stats.target_bytes;
+            dictionary_source_pack_stats.frame_wire[0]+=p9sd_source_frames.basis_control.size()+4;dictionary_source_pack_stats.frame_wire[1]+=p9sd_source_frames.basis_data.size()+4;
+            dictionary_source_pack_stats.frame_wire[2]+=p9sd_source_frames.definition_control.size()+4;dictionary_source_pack_stats.frame_wire[3]+=p9sd_source_frames.definition_data.size()+4;
+        }
+        auto decode_p9_source=[&](const SourcePackFrames&source_frames,ModelFrameCodec*model,DecoderStore&decoder){
+            SemanticBuffer decoded=decompress_semantic(p9_frames,frames);const std::vector<uint64_t>lengths=semantic_raw_lengths(decoded.control);
+            decoded.payload[kRawDefinition]=decode_implicit_source_pack(source_frames,frames,lengths,model);decode_semantic_templates(decoded,decoder);
+        };
+        const auto d9s=Clock::now();if(p9s_use_source)decode_p9_source(p9s_source_frames,nullptr,p9s.decoder);else decode_semantic_templates(p9_decoded,p9s.decoder);
+        p9s.decode_seconds+=elapsed(d9s);verify_definitions(new_ids,truth,p9s.decoder);
+        if(use_source_dictionary){const auto d9sd=Clock::now();if(p9sd_use_source)decode_p9_source(p9sd_source_frames,&source_dictionary_decoder_frames,p9sd.decoder);else decode_semantic_templates(p9_decoded,p9sd.decoder);p9sd.decode_seconds+=elapsed(d9sd);verify_definitions(new_ids,truth,p9sd.decoder);}
+
         const auto e5=Clock::now();size_t p5_size=SIZE_MAX;std::vector<uint8_t>p5_control_frame,p5_data_frame;MultiStats selected_multi;
         for(size_t width:{size_t(2),size_t(4),size_t(8),size_t(16)}){MultiStats candidate_stats;SplitBuffer candidate=encode_multiline(new_ids,truth,width,candidate_stats);std::vector<uint8_t>cf=frames.compress(candidate.control,zlevel),df=frames.compress(candidate.data,zlevel);size_t size=cf.size()+df.size()+8;if(size<p5_size){p5_size=size;p5_control_frame=std::move(cf);p5_data_frame=std::move(df);selected_multi=candidate_stats;}}
         p5.encode_seconds+=elapsed(e5);multi_stats.rules+=selected_multi.rules;multi_stats.instances+=selected_multi.instances;multi_stats.raw_units+=selected_multi.raw_units;multi_stats.lines+=selected_multi.lines;
@@ -1580,6 +1955,33 @@ int main(int argc, char** argv) {
         for(size_t category=0;category<kSourceCategoryCount;++category){source_stats.selected_wire[category]+=p7s_frames.category[category].selected_wire;source_stats.literal_wire[category]+=p7s_frames.category[category].literal_wire;source_stats.mixed_wire[category]+=p7s_frames.category[category].mixed_wire;}
         const auto d7s=Clock::now();const SourceRaw p7s_decoded=decompress_source_variants(p7s_frames,frames);decode_source_variants(p7s_decoded,p7s.decoder);p7s.decode_seconds+=elapsed(d7s);verify_definitions(new_ids,truth,p7s.decoder);
 
+        const auto e7p=Clock::now();
+        SourcePackFrames p7p_frames;size_t p7p_threshold_index=0;
+        for(size_t threshold_index=0;threshold_index<kSourcePackThresholds.size();++threshold_index){
+            const unsigned threshold=kSourcePackThresholds[threshold_index];
+            SourcePackRaw candidate_raw=encode_source_pack(new_ids,truth,source_meta,current_locations,source_catalog,threshold);
+            SourcePackFrames candidate=compress_source_pack(candidate_raw,frames,zlevel,threshold);
+            if(candidate.valid){++source_pack_stats.threshold_tus[threshold_index];source_pack_stats.threshold_wire[threshold_index]+=candidate.wire;
+                source_pack_stats.threshold_basis_bytes[threshold_index]+=candidate.stats.basis_bytes;source_pack_stats.threshold_residual_bytes[threshold_index]+=candidate.stats.residual_bytes;}
+            if(candidate.valid&&(!p7p_frames.valid||candidate.wire<p7p_frames.wire)){p7p_frames=std::move(candidate);p7p_threshold_index=threshold_index;}
+        }
+        const uint64_t p1_wire=p1_frame.size()+4,p7p_size=p7p_frames.valid?p7p_frames.wire:UINT64_MAX;
+        const bool p7p_use_source=p7p_frames.valid&&p7p_size<p1_wire;const uint64_t w7p=std::min(p1_wire,p7p_size)+1;p7p.encode_seconds+=elapsed(e7p);
+        source_pack_stats.literal_wire+=p1_wire;source_pack_stats.selected_wire+=w7p;
+        if(p7p_frames.valid){
+            ++source_pack_stats.candidate_tus;++source_pack_stats.threshold_wins[p7p_threshold_index];source_pack_stats.source_wire+=p7p_size;
+            if(p7p_use_source)++source_pack_stats.frame_wins;
+            source_pack_stats.selected.available_records+=p7p_frames.stats.available_records;source_pack_stats.selected.available_bytes+=p7p_frames.stats.available_bytes;
+            source_pack_stats.selected.source_records+=p7p_frames.stats.source_records;source_pack_stats.selected.literal_records+=p7p_frames.stats.literal_records;
+            source_pack_stats.selected.basis_records+=p7p_frames.stats.basis_records;source_pack_stats.selected.basis_bytes+=p7p_frames.stats.basis_bytes;
+            source_pack_stats.selected.residual_bytes+=p7p_frames.stats.residual_bytes;source_pack_stats.selected.target_bytes+=p7p_frames.stats.target_bytes;
+            source_pack_stats.frame_wire[0]+=p7p_frames.basis_control.size()+4;source_pack_stats.frame_wire[1]+=p7p_frames.basis_data.size()+4;
+            source_pack_stats.frame_wire[2]+=p7p_frames.definition_control.size()+4;source_pack_stats.frame_wire[3]+=p7p_frames.definition_data.size()+4;
+        }
+        const auto d7p=Clock::now();
+        if(p7p_use_source)decode_source_pack(p7p_frames,frames,p7p.decoder);else decode_literals(frames.decompress(p1_frame),p7p.decoder);
+        p7p.decode_seconds+=elapsed(d7p);verify_definitions(new_ids,truth,p7p.decoder);
+
         const auto e7=Clock::now();const SplitBuffer p7_raw=encode_persistent_templates(new_ids,truth,persistent_encoder,persistent_stats);const std::vector<uint8_t>p7_control_frame=frames.compress(p7_raw.control,zlevel);const std::vector<uint8_t>p7_data_frame=frames.compress(p7_raw.data,zlevel);const uint64_t w7=p7_control_frame.size()+p7_data_frame.size()+8;p7.encode_seconds+=elapsed(e7);
         p7_control_wire+=p7_control_frame.size()+4;p7_data_wire+=p7_data_frame.size()+4;
         const auto d7=Clock::now();const std::vector<uint8_t>p7_control_decoded=frames.decompress(p7_control_frame);const std::vector<uint8_t>p7_data_decoded=frames.decompress(p7_data_frame);decode_persistent_templates(p7_control_decoded,p7_data_decoded,persistent_decoder);p7.decode_seconds+=elapsed(d7);verify_definitions(new_ids,truth,persistent_decoder.lines);
@@ -1592,28 +1994,42 @@ int main(int argc, char** argv) {
             const auto d8=Clock::now();const std::vector<uint8_t>p8_control_decoded=model_frames.decompress(p8_control_frame),p8_data_decoded=model_frames.decompress(p8_data_frame);decode_persistent_templates(p8_control_decoded,p8_data_decoded,pretrained.decoder);p8.decode_seconds+=elapsed(d8);verify_definitions(new_ids,truth,pretrained.decoder.lines);}
 
         const uint64_t w1=p1_frame.size()+4,w5=p5_size,w6=p6_frame.size()+4;
-        const size_t best_size=std::min({size_t(w1),p4_size,size_t(w5),size_t(w6),size_t(w7s),size_t(p9_frames.wire)});
+        const size_t best_size=std::min({size_t(w1),p4_size,size_t(w5),size_t(w6),size_t(w7s),size_t(p7p_size),size_t(p9_frames.wire),size_t(p9_source_size)});
         const auto d10 = Clock::now();
         if(best_size==p4_size)decode_templates(p4_control_decoded,p4_data_decoded,p10.decoder);
         else if(best_size==p9_frames.wire)decode_semantic_templates(p9_decoded,p10.decoder);
+        else if(p9s_source_frames.valid&&best_size==p9_source_size)decode_p9_source(p9s_source_frames,nullptr,p10.decoder);
         else if(best_size==p5_size)decode_multiline(p5_control_decoded,p5_data_decoded,p10.decoder);
         else if(best_size==p6_frame.size()+4)decode_forest(frames.decompress(p6_frame),p10.decoder);
         else if(best_size==w7s)decode_source_variants(p7s_decoded,p10.decoder);
+        else if(p7p_frames.valid&&best_size==p7p_size)decode_source_pack(p7p_frames,frames,p10.decoder);
         else decode_literals(frames.decompress(p1_frame), p10.decoder);
         p10.decode_seconds += elapsed(d10);
         verify_definitions(new_ids, truth, p10.decoder);
 
         uint64_t w10p=0;
-        if(use_pretrained){const size_t best_pretrained=std::min({size_t(w1),size_t(w8d),size_t(w5),size_t(w6),size_t(w7s),size_t(p9_frames.wire)});const auto d10p=Clock::now();if(best_pretrained==w8d)decode_templates(p8d_control_decoded,p8d_data_decoded,p10p.decoder);else if(best_pretrained==p9_frames.wire)decode_semantic_templates(p9_decoded,p10p.decoder);else if(best_pretrained==w5)decode_multiline(p5_control_decoded,p5_data_decoded,p10p.decoder);else if(best_pretrained==w6)decode_forest(frames.decompress(p6_frame),p10p.decoder);else if(best_pretrained==w7s)decode_source_variants(p7s_decoded,p10p.decoder);else decode_literals(frames.decompress(p1_frame),p10p.decoder);p10p.decode_seconds+=elapsed(d10p);verify_definitions(new_ids,truth,p10p.decoder);w10p=best_pretrained+1;}
+        if(use_pretrained){const size_t best_pretrained=std::min({size_t(w1),size_t(w8d),size_t(w5),size_t(w6),size_t(w7s),size_t(p7p_size),size_t(p9_frames.wire),size_t(p9_source_size)});const auto d10p=Clock::now();if(best_pretrained==w8d)decode_templates(p8d_control_decoded,p8d_data_decoded,p10p.decoder);else if(best_pretrained==p9_frames.wire)decode_semantic_templates(p9_decoded,p10p.decoder);else if(p9s_source_frames.valid&&best_pretrained==p9_source_size)decode_p9_source(p9s_source_frames,nullptr,p10p.decoder);else if(best_pretrained==w5)decode_multiline(p5_control_decoded,p5_data_decoded,p10p.decoder);else if(best_pretrained==w6)decode_forest(frames.decompress(p6_frame),p10p.decoder);else if(best_pretrained==w7s)decode_source_variants(p7s_decoded,p10p.decoder);else if(p7p_frames.valid&&best_pretrained==p7p_size)decode_source_pack(p7p_frames,frames,p10p.decoder);else decode_literals(frames.decompress(p1_frame),p10p.decoder);p10p.decode_seconds+=elapsed(d10p);verify_definitions(new_ids,truth,p10p.decoder);w10p=best_pretrained+1;}
+
+        uint64_t w10sd=0;
+        if(use_source_dictionary){const size_t best_source_dictionary=std::min({size_t(w1),p4_size,size_t(w5),size_t(w6),size_t(w7s),size_t(p7p_size),size_t(p9_frames.wire),size_t(p9_dictionary_source_size)});const auto d10sd=Clock::now();
+            if(best_source_dictionary==p4_size)decode_templates(p4_control_decoded,p4_data_decoded,p10sd.decoder);
+            else if(best_source_dictionary==p9_frames.wire)decode_semantic_templates(p9_decoded,p10sd.decoder);
+            else if(p9sd_source_frames.valid&&best_source_dictionary==p9_dictionary_source_size)decode_p9_source(p9sd_source_frames,&source_dictionary_decoder_frames,p10sd.decoder);
+            else if(best_source_dictionary==w5)decode_multiline(p5_control_decoded,p5_data_decoded,p10sd.decoder);
+            else if(best_source_dictionary==w6)decode_forest(frames.decompress(p6_frame),p10sd.decoder);
+            else if(best_source_dictionary==w7s)decode_source_variants(p7s_decoded,p10sd.decoder);
+            else if(p7p_frames.valid&&best_source_dictionary==p7p_size)decode_source_pack(p7p_frames,frames,p10sd.decoder);
+            else decode_literals(frames.decompress(p1_frame),p10sd.decoder);
+            p10sd.decode_seconds+=elapsed(d10sd);verify_definitions(new_ids,truth,p10sd.decoder);w10sd=best_source_dictionary+1;}
 
         const uint64_t w0 = p0_frame.size() + 4;
         const uint64_t w4 = p4_size;
         const uint64_t w9=p9_frames.wire;
-        const uint64_t w10 = std::min({w1,w4,w5,w6,w7s,w9}) + 1;
-        std::vector<uint64_t>current{w0,w1,w4,w5,w6,w7s,w7,w7b,w9};if(use_pretrained){current.push_back(w8);current.push_back(w8d);}current.push_back(w10);if(use_pretrained)current.push_back(w10p);
+        const uint64_t w10 = std::min({w1,w4,w5,w6,w7s,p7p_size,w9,p9_source_size}) + 1;
+        std::vector<uint64_t>current{w0,w1,w4,w5,w6,w7s,w7p,w7,w7b,w9,w9s};if(use_source_dictionary)current.push_back(w9sd);if(use_pretrained){current.push_back(w8);current.push_back(w8d);}current.push_back(w10);if(use_source_dictionary)current.push_back(w10sd);if(use_pretrained)current.push_back(w10p);
         for (size_t r = 0; r < rows.size(); ++r) {rows[r]->wire += current[r];rows[r]->tu_wire.push_back(current[r]);}
-        p10.encode_seconds = p1.encode_seconds + p4.encode_seconds+p5.encode_seconds+p6.encode_seconds+p7s.encode_seconds+p9.encode_seconds;
-        if(use_pretrained)p10p.encode_seconds=p1.encode_seconds+p8d.encode_seconds+p5.encode_seconds+p6.encode_seconds+p7s.encode_seconds+p9.encode_seconds;
+        p10.encode_seconds = p1.encode_seconds + p4.encode_seconds+p5.encode_seconds+p6.encode_seconds+p7s.encode_seconds+p7p.encode_seconds+p9.encode_seconds+p9s.encode_seconds;
+        if(use_pretrained)p10p.encode_seconds=p1.encode_seconds+p8d.encode_seconds+p5.encode_seconds+p6.encode_seconds+p7s.encode_seconds+p7p.encode_seconds+p9.encode_seconds+p9s.encode_seconds;
         source_learner.observe_tu(observations,new_ids,truth);
         cumulative_raw += file.len;
         while (checkpoint < std::size(fractions) &&
@@ -1628,9 +2044,14 @@ int main(int argc, char** argv) {
         ++checkpoint;
     }
 
+    // P9s reuses all of P9 and adds an actual-cost source basis over only P9's raw fallback channel.
+    p9s.encode_seconds+=p9.encode_seconds;
+    p10.encode_seconds=p1.encode_seconds+p4.encode_seconds+p5.encode_seconds+p6.encode_seconds+p7s.encode_seconds+p7p.encode_seconds+p9s.encode_seconds;
+    if(use_source_dictionary){p9sd.encode_seconds+=p9.encode_seconds;p10sd.encode_seconds=p1.encode_seconds+p4.encode_seconds+p5.encode_seconds+p6.encode_seconds+p7s.encode_seconds+p7p.encode_seconds+p9sd.encode_seconds;}
+
     // P8d reuses the P4 transform output in this all-row harness.  Charge the transform work as
     // well as its additional dictionary/plain actual-frame comparison before reporting throughput.
-    if(use_pretrained){p8d.encode_seconds+=p4.encode_seconds;p10p.encode_seconds=p1.encode_seconds+p8d.encode_seconds+p5.encode_seconds+p6.encode_seconds+p7s.encode_seconds+p9.encode_seconds;}
+    if(use_pretrained){p8d.encode_seconds+=p4.encode_seconds;p10p.encode_seconds=p1.encode_seconds+p8d.encode_seconds+p5.encode_seconds+p6.encode_seconds+p7s.encode_seconds+p7p.encode_seconds+p9s.encode_seconds;}
 
     std::array<uint64_t,kSourceCategoryCount>attributed_zstd{};
     for(size_t category=0;category<kSourceCategoryCount;++category)attributed_zstd[category]=frames.compress(attributed_bytes[category],zlevel).size();
@@ -1682,6 +2103,23 @@ int main(int argc, char** argv) {
                 source_stats.first_variant_bytes/1048576.0,source_stats.later_variant_bytes/1048576.0,
                 source_stats.exclusive_raw_saving[0]/1048576.0,source_stats.exclusive_raw_saving[1]/1048576.0,source_stats.exclusive_raw_saving[2]/1048576.0,
                 source_stats.exclusive_raw_saving[3]/1048576.0,source_stats.exclusive_raw_saving[4]/1048576.0);
+    std::printf("P7p source-superblock candidate-TUs=%llu frame-wins=%llu available=%llu/%.2f MiB selected source/literal=%llu/%llu basis=%llu/%.2f MiB residual=%.2f MiB target=%.2f MiB\n",
+                static_cast<unsigned long long>(source_pack_stats.candidate_tus),static_cast<unsigned long long>(source_pack_stats.frame_wins),
+                static_cast<unsigned long long>(source_pack_stats.selected.available_records),source_pack_stats.selected.available_bytes/1048576.0,
+                static_cast<unsigned long long>(source_pack_stats.selected.source_records),static_cast<unsigned long long>(source_pack_stats.selected.literal_records),
+                static_cast<unsigned long long>(source_pack_stats.selected.basis_records),source_pack_stats.selected.basis_bytes/1048576.0,
+                source_pack_stats.selected.residual_bytes/1048576.0,source_pack_stats.selected.target_bytes/1048576.0);
+    std::printf("P7p wire literal/source/selected=%.3f/%.3f/%.3f MiB four frames basis-control/basis-data/definition-control/residual=%.3f/%.3f/%.3f/%.3f MiB threshold-wins 0/6/12/25/50/100%%=%llu/%llu/%llu/%llu/%llu/%llu\n",
+                source_pack_stats.literal_wire/1048576.0,source_pack_stats.source_wire/1048576.0,source_pack_stats.selected_wire/1048576.0,
+                source_pack_stats.frame_wire[0]/1048576.0,source_pack_stats.frame_wire[1]/1048576.0,source_pack_stats.frame_wire[2]/1048576.0,source_pack_stats.frame_wire[3]/1048576.0,
+                static_cast<unsigned long long>(source_pack_stats.threshold_wins[0]),static_cast<unsigned long long>(source_pack_stats.threshold_wins[1]),
+                static_cast<unsigned long long>(source_pack_stats.threshold_wins[2]),static_cast<unsigned long long>(source_pack_stats.threshold_wins[3]),
+                static_cast<unsigned long long>(source_pack_stats.threshold_wins[4]),static_cast<unsigned long long>(source_pack_stats.threshold_wins[5]));
+    for(size_t i=0;i<kSourcePackThresholds.size();++i){
+        std::printf("  P7p threshold=%u%% candidate-TUs=%llu wire=%.3f MiB basis-raw=%.2f MiB residual-raw=%.2f MiB\n",kSourcePackThresholds[i],
+                    static_cast<unsigned long long>(source_pack_stats.threshold_tus[i]),source_pack_stats.threshold_wire[i]/1048576.0,
+                    source_pack_stats.threshold_basis_bytes[i]/1048576.0,source_pack_stats.threshold_residual_bytes[i]/1048576.0);
+    }
     std::printf("P5 selected rules=%llu instances=%llu raw-units=%llu lines=%llu\n",static_cast<unsigned long long>(multi_stats.rules),static_cast<unsigned long long>(multi_stats.instances),static_cast<unsigned long long>(multi_stats.raw_units),static_cast<unsigned long long>(multi_stats.lines));
     std::printf("P7 new-rules=%llu refs=%llu new-tokens=%llu token-refs=%llu inline-values=%llu raw-records=%llu\n",
                 static_cast<unsigned long long>(persistent_stats.new_rules),static_cast<unsigned long long>(persistent_stats.rule_refs),
@@ -1693,6 +2131,34 @@ int main(int argc, char** argv) {
     std::printf("P9 semantic rules=%llu instances=%llu literal-fallbacks=%llu lexicon-entries=%llu refs=%llu; wire control=%.3f rule-literal=%.3f raw=%.3f identifier=%.3f number=%.3f string=%.3f MiB\n",
                 static_cast<unsigned long long>(semantic_stats.rules),static_cast<unsigned long long>(semantic_stats.instances),static_cast<unsigned long long>(semantic_stats.literal_fallbacks),static_cast<unsigned long long>(semantic_stats.lexicon_entries),static_cast<unsigned long long>(semantic_stats.lexicon_references),p9_control_wire/1048576.0,p9_payload_wire[kRuleLiteral]/1048576.0,p9_payload_wire[kRawDefinition]/1048576.0,p9_payload_wire[kIdentifierValue]/1048576.0,p9_payload_wire[kNumberValue]/1048576.0,p9_payload_wire[kStringValue]/1048576.0);
     std::printf("P9 semantic exact wire bytes: control=%llu rule-literal=%llu raw=%llu identifier=%llu number=%llu string=%llu\n",static_cast<unsigned long long>(p9_control_wire),static_cast<unsigned long long>(p9_payload_wire[kRuleLiteral]),static_cast<unsigned long long>(p9_payload_wire[kRawDefinition]),static_cast<unsigned long long>(p9_payload_wire[kIdentifierValue]),static_cast<unsigned long long>(p9_payload_wire[kNumberValue]),static_cast<unsigned long long>(p9_payload_wire[kStringValue]));
+    std::printf("P9s raw-channel source-superblock candidate-TUs=%llu frame-wins=%llu available=%llu/%.2f MiB selected source/literal=%llu/%llu basis=%llu/%.2f MiB residual=%.2f MiB target=%.2f MiB\n",
+                static_cast<unsigned long long>(semantic_source_pack_stats.candidate_tus),static_cast<unsigned long long>(semantic_source_pack_stats.frame_wins),
+                static_cast<unsigned long long>(semantic_source_pack_stats.selected.available_records),semantic_source_pack_stats.selected.available_bytes/1048576.0,
+                static_cast<unsigned long long>(semantic_source_pack_stats.selected.source_records),static_cast<unsigned long long>(semantic_source_pack_stats.selected.literal_records),
+                static_cast<unsigned long long>(semantic_source_pack_stats.selected.basis_records),semantic_source_pack_stats.selected.basis_bytes/1048576.0,
+                semantic_source_pack_stats.selected.residual_bytes/1048576.0,semantic_source_pack_stats.selected.target_bytes/1048576.0);
+    std::printf("P9s raw wire literal/source/selected=%.3f/%.3f/%.3f MiB four frames basis-control/basis-data/definition-control/residual=%.3f/%.3f/%.3f/%.3f MiB threshold-wins 0/6/12/25/50/100%%=%llu/%llu/%llu/%llu/%llu/%llu\n",
+                semantic_source_pack_stats.literal_wire/1048576.0,semantic_source_pack_stats.source_wire/1048576.0,semantic_source_pack_stats.selected_wire/1048576.0,
+                semantic_source_pack_stats.frame_wire[0]/1048576.0,semantic_source_pack_stats.frame_wire[1]/1048576.0,semantic_source_pack_stats.frame_wire[2]/1048576.0,semantic_source_pack_stats.frame_wire[3]/1048576.0,
+                static_cast<unsigned long long>(semantic_source_pack_stats.threshold_wins[0]),static_cast<unsigned long long>(semantic_source_pack_stats.threshold_wins[1]),
+                static_cast<unsigned long long>(semantic_source_pack_stats.threshold_wins[2]),static_cast<unsigned long long>(semantic_source_pack_stats.threshold_wins[3]),
+                static_cast<unsigned long long>(semantic_source_pack_stats.threshold_wins[4]),static_cast<unsigned long long>(semantic_source_pack_stats.threshold_wins[5]));
+    for(size_t i=0;i<kSourcePackThresholds.size();++i){
+        std::printf("  P9s threshold=%u%% candidate-TUs=%llu wire=%.3f MiB basis-raw=%.2f MiB residual-raw=%.2f MiB\n",kSourcePackThresholds[i],
+                    static_cast<unsigned long long>(semantic_source_pack_stats.threshold_tus[i]),semantic_source_pack_stats.threshold_wire[i]/1048576.0,
+                    semantic_source_pack_stats.threshold_basis_bytes[i]/1048576.0,semantic_source_pack_stats.threshold_residual_bytes[i]/1048576.0);
+    }
+    if(use_source_dictionary){
+        std::printf("P9sd trained source-superblock dictionary raw/package-wire=%llu/%llu bytes (%.1f/%.1f KiB) model-id=%016llx comparisons-won=%llu saved-before-charge=%.1f KiB frame-wins=%llu raw-channel literal/dictionary/selected=%.3f/%.3f/%.3f MiB\n",
+                    static_cast<unsigned long long>(source_dictionary.size()),static_cast<unsigned long long>(source_dictionary_package.size()+4),source_dictionary.size()/1024.0,(source_dictionary_package.size()+4)/1024.0,
+                    static_cast<unsigned long long>(hash_bytes(source_dictionary.data(),uint32_t(source_dictionary.size()))),static_cast<unsigned long long>(source_dictionary_encoder_frames.dictionary_wins),source_dictionary_encoder_frames.dictionary_saved/1024.0,
+                    static_cast<unsigned long long>(dictionary_source_pack_stats.frame_wins),dictionary_source_pack_stats.literal_wire/1048576.0,dictionary_source_pack_stats.source_wire/1048576.0,dictionary_source_pack_stats.selected_wire/1048576.0);
+        for(size_t i=0;i<kSourcePackThresholds.size();++i){
+            std::printf("  P9sd threshold=%u%% candidate-TUs=%llu wire=%.3f MiB basis-raw=%.2f MiB residual-raw=%.2f MiB\n",kSourcePackThresholds[i],
+                        static_cast<unsigned long long>(dictionary_source_pack_stats.threshold_tus[i]),dictionary_source_pack_stats.threshold_wire[i]/1048576.0,
+                        dictionary_source_pack_stats.threshold_basis_bytes[i]/1048576.0,dictionary_source_pack_stats.threshold_residual_bytes[i]/1048576.0);
+        }
+    }
     if(use_pretrained){std::printf("P8 pretrained model: training=%.2f GiB/%llu lines/%llu per-corpus-distinct in %.2fs; mode=%s min-corpora=%u; candidates=%llu rules/%llu tokens; selected=%u rules/%u tokens; package raw=%.1f KiB wire-z%d=%.1f KiB (charged)\n",
                 pretrained.training_raw/1073741824.0,static_cast<unsigned long long>(pretrained.training_lines),static_cast<unsigned long long>(pretrained.training_distinct_lines),pretrained.training_seconds,
                 pretrain_all_identifiers?"all-identifiers":"keywords-literal",model_min_corpora,

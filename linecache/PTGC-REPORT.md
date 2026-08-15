@@ -293,7 +293,7 @@ Prior-location history therefore cannot solve the cold definition plane. Same-TU
 for 16.66 MiB of raw candidate saving, but record-at-a-time corrections disrupt outer-frame locality
 and lose to grouped literals.
 
-## Next capability: contributing-source superblocks
+## Contributing-source superblock result
 
 A 20-TU direct source-basis probe gives a stronger continuation:
 
@@ -305,51 +305,135 @@ PrefixSuffix residual against the source line        190,395
 unique contributing source-line bytes              2,729,728
 ```
 
-The source basis is almost one source location per definition, so sending uncompressed source lines
-would not help. The useful unit is instead a compressed contributing-source superblock: collect only
-source lines used by the current TU, order them by file and logical line, transmit them once as a
-compact basis block, and encode emitted definitions as source-base IDs plus exact corrections. The
-four separable streams are source-basis control, source-basis bytes, definition control, and exact
-residual bytes. An actual whole-frame literal fallback remains mandatory.
-
-The pretrained artifact should likewise be a superblock basis rather than a broad raw-line model:
-parameterized source templates/phrases are primary, and the same serialized package may optionally
-seed a trained zstd dictionary. Both package bytes and dictionary bytes remain charged. Existing
-measurements say the representation supplies nearly all value and the extra dictionary is only a
-small finishing effect.
-
-## What remains before the PTGC ruling is final
-
-The remaining ladder item is the exact contributing-source superblock codec described above,
-followed by the same chronological, reorder, edit/revert, throughput, and independent reconstruction
-gates. Its actual project-attributed wire result decides whether to integrate:
-
-The next decision should be data-driven:
+The implemented P7p codec collects only source lines referenced by current-TU first-use definitions,
+deduplicates them, sorts them by file and logical line, assigns dense frame-local IDs, and emits four
+separable frames:
 
 ```text
-source-aware/project-attributed P10 <= 3.4 MiB:
-    integrate the winning program into the real two-process codec
-
-source-aware/project-attributed P10 in 3.4--3.8 MiB:
-    inspect complete-wire margin and toolchain residual
-
-source-aware/project-attributed P10 > 3.8 MiB:
-    move to the minimal contributing-source token pack
+source-basis control
+source-basis bytes
+definition control
+exact residual bytes
 ```
 
-The current full-definition result does establish what not to do next: do not spend another round on
-larger shared models, deeper fixed multiline blocks, or broad byte-context tables. They have measured
-ceilings and do not address the dominant residual.
+It sweeps maximum residual fractions of 0/6/12/25/50/100%, reconstructs every definition from the
+chosen basis plus exact PrefixSuffix correction, and compares the complete candidate against the
+complete literal frame. Bases are TU-local in this row, so a losing frame cannot create uncharged
+decoder state.
+
+P9s applies the same source basis only to P9's hard raw-definition channel. The P9 control stream
+already contains raw-definition IDs, order, and lengths, so P9s carries only a source-use bitmap and
+source correction metadata; it does not duplicate those fields. Its decoder independently parses P9
+control, rebuilds the raw payload from the four source frames, and then runs the ordinary semantic
+decoder.
+
+Full DuckDB:
+
+| row | wire bytes | raw/wire | result |
+|---|---:|---:|---|
+| P7p source superblock over all definitions | 10,989,593 | 180.7x | exact |
+| P9 semantic baseline | 9,316,268 | 213.1x | exact |
+| P9s semantic + source frame fallback | 9,316,957 | 213.1x | exact |
+| P10 including the source rows | 9,154,792 | 216.9x | exact |
+
+P7p wins 181 individual TU comparisons but loses in aggregate. P9s wins no raw-channel TU frame;
+its 689-byte difference from P9 is exactly its per-TU selector cost. The full raw-channel accounting
+is:
+
+```text
+ordinary P9 raw channel                 5.018 MiB
+best plain source-superblock channel    5.516 MiB
+accessible source targets              24.48 MiB / 257,301 definitions
+chosen source bases                     15.25 MiB / 93,467 bases
+chosen exact residual                    0.01 MiB
+```
+
+The tiny residual confirms that source location predicts emitted content well. The loss comes from
+paying for almost one source basis per definition; compressing the source lines in file order does
+not repay the basis/control split versus zstd over the emitted literals.
+
+## Pretrained source-superblock dictionary
+
+The dictionary trainer reads only disjoint LLVM, RocksDB, and OpenCV manifests, extracts their
+marker-referenced project files, and groups consecutive source lines into immutable 32-line/8-KiB
+training superblocks. DuckDB is not opened until every package is frozen.
+
+```text
+training project files           8,080
+training source lines        3,794,831
+training superblocks           122,233
+training sample bytes      142,862,614
+training time                  198.2 s
+```
+
+The 32/64/128/256-KiB packages all reconstruct exactly. The 20-TU charged dominance check is:
+
+| raw dictionary | package wire | P10 + dictionary | delta versus P10 |
+|---:|---:|---:|---:|
+| 32 KiB | 13.4 KiB | 974,802 | +13,530 |
+| 64 KiB | 31.0 KiB | 992,874 | +31,602 |
+| 128 KiB | 51.3 KiB | 1,013,768 | +52,496 |
+| 256 KiB | 99.9 KiB | 1,063,415 | +102,143 |
+
+The 32-KiB package strictly dominates the larger rows and received the authoritative full replay.
+The receiving dictionary is rebuilt from a separately decompressed charged package; every source
+frame carries an explicit plain/dictionary selector.
+
+| full 689-TU row | charged wire | delta versus matching baseline |
+|---|---:|---:|
+| P9s + 32-KiB trained source dictionary | 9,329,702 | +13,434 versus P9 |
+| P10 + 32-KiB trained source dictionary | 9,168,276 | +13,484 versus P10 |
+
+The dictionary wins 6,435 individual frame alternatives and removes 527.6 KiB across all evaluated
+alternatives, but that is not an achievable sum because only one threshold/frame representation may
+be selected. The best actual dictionary source channel is 5.425 MiB, still above P9's 5.018 MiB.
+Only 29 TU raw frames select it. The model is useful; the source-line basis it decorates remains too
+expensive.
+
+## PTGC ruling and remaining representation work
+
+No source row or pretrained model should be integrated into the transport from these measurements.
+The best charged definition result remains P10 plus the earlier 16-KiB parameterized-superblock
+package at 9,105,123 bytes. Source locations are highly predictive, but neither prior output variants
+nor whole contributing source lines provide the missing representation.
+
+If definition research continues, the remaining distinct row is a minimal contributing-token-span
+superblock: transmit only source spans actually copied into emitted output, parameterize repeated
+span/correction layouts across a TU, and leave raw fallback available. It must beat P9's raw channel
+before any further ranker, neural teacher, larger dictionary, reorder/edit campaign, or product
+integration is justified. More model work over the current source-line basis is now measured as a
+dead end.
 
 ## Reproduction and retained artifacts
 
 Environment for the authoritative local run:
 
 ```text
-base commit: cab1ec97073916e5425eae8943fcfdc7dd406a8c
+base commit: f1314a9fd404df069c2a8a72bebc28fdd11eace6
 compiler:    g++ 11.4.0
 libzstd:     1.4.8
+trainer:     python-zstandard 0.25.0
 machine:     Intel Xeon Gold 6136, Linux 5.15 x86-64
+```
+
+Source-superblock reproduction:
+
+```sh
+python3 linecache/train_source_superblock_dict.py \
+  --train-manifest /tanksmall/scratch/ictmp/corpus/manifest.txt \
+  --train-manifest /tanksmall/scratch/ictmp/corpus2/manifest.txt \
+  --train-manifest /tanksmall/scratch/ictmp/corpus5/manifest.txt \
+  --dict-kib 32 64 128 256 --sample-mib-per-corpus 64 \
+  --output-prefix /tmp/ptgc-source-superblock
+
+g++ -O3 -DNDEBUG -march=native -std=c++17 -pthread \
+  -Wall -Wextra -Wpedantic -Werror linecache/ptgc_bench.cpp -lzstd \
+  -o /tmp/ptgc-source-pack-final
+
+/tmp/ptgc-source-pack-final \
+  --manifest /tanksmall/scratch/ictmp/corpus3/manifest.txt \
+  --source-k 4 --z 3 \
+  --source-dict /tmp/ptgc-source-superblock-32k.dict
 ```
 
 Primary logs:
@@ -365,6 +449,14 @@ Primary logs:
 /tmp/ptgc-source-p7-v2-full-k4.log
 /tmp/ptgc-source-p7-strict-smoke.log
 /tmp/ptgc-source-p7-sanitize.log
+/tmp/ptgc-source-pack-v3-full.log
+/tmp/ptgc-source-superblock-train.log
+/tmp/ptgc-source-superblock-report.json
+/tmp/ptgc-source-pack-v5-{32,64,128,256}k-20.log
+/tmp/ptgc-source-pack-v7-32k-full.log
+/tmp/ptgc-source-pack-final-strict.log
+/tmp/ptgc-source-pack-final-sanitize.log
+/tmp/ptgc-source-pack-final2-smoke.log
 /tmp/codec50-current-baseline.log
 /tmp/codec50-pretrain-duckdb-independent.log
 ```
