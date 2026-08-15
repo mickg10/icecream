@@ -625,6 +625,43 @@ ASan/UBSan loaded-package replay completed without diagnostics. This makes it po
 common 14-project package once and prove that both complete holdouts consume literally identical
 bytes.
 
+### Common 14-project portable small-window rejection control
+
+The first common-package control trained once on raw source from RocksDB, Abseil, OpenCV, Godot,
+fmt, spdlog, Catch2, nlohmann/json, range-v3, Eigen, RE2, LevelDB, simdjson, and cereal. LLVM and
+DuckDB were excluded from training. The scan produced:
+
+```text
+selected raw source                  0.50 GiB
+source lines                       10,984,935
+per-project distinct lines          5,661,219
+sampled lines                         176,836
+candidate windows                  15,708,459
+candidate normalized shapes          716,426
+selected rules                            812
+raw package / exact frame           14.3 KiB / 4,412 bytes
+training scan / wall time           47.48 s / 52.65 s
+peak RSS                         1,152,816 KiB
+```
+
+The resulting frame has SHA-256
+`e2e5d3789f4950e32bfede9d41346485590ef35725533aa1a8e020ab00abcf34` and internal model ID
+`7537901301232b73`. Every row below loaded that identical file in a fresh process:
+
+| holdout | zstd | P9 | P12 local | charged P14/P16 | candidate raw vs literal | frame wins |
+|---|---:|---:|---:|---:|---:|---:|
+| DuckDB, first 20 | 1 | 1,022,131 | 1,018,721 | 1,026,567 | 0.488 vs 0.419 MiB | 0/20 |
+| DuckDB, first 20 | 3 | 964,895 | 960,478 | 969,331 | 0.471 vs 0.399 MiB | 0/20 |
+| LLVM, first 20 | 1 | 987,572 | 985,129 | 992,008 | 0.556 vs 0.468 MiB | 0/20 |
+| LLVM, first 20 | 3 | 939,453 | 935,323 | 943,889 | 0.533 vs 0.443 MiB | 0/20 |
+
+In all four runs P14/P16 are exactly P9 plus the 4,416-byte framed-package charge and one selector
+byte per TU. The broader training set increases rule coverage, but the small parameter windows still
+create more control/value bytes than grouped literals. This row is therefore stopped at the 20-TU
+gate rather than spending four complete-holdout runs on a candidate with no selected frame. The next
+portable vocabulary must use coarser statement, multi-Line, or source-token blocks; the empty-start
+local learner must use the same units so the bootstrap and online curves are directly comparable.
+
 ## Reproduction and retained artifacts
 
 Environment for the authoritative local run:
@@ -726,6 +763,8 @@ Primary logs:
 /tmp/ptgc-param-load.log
 /tmp/ptgc-param-load-llvm.log
 /tmp/ptgc-param-io-sanitize.log
+/tmp/ptgc-14src-min2-16k-train.log
+/tmp/ptgc-14src-{duckdb,llvm}-z{1,3}-20tu.log
 /tmp/codec50-current-baseline.log
 /tmp/codec50-pretrain-duckdb-independent.log
 ```
@@ -759,4 +798,9 @@ b18c8136a5acd36702a6e3d286ef302d93f0cb29da0d5796d452c134d61e72e4  /tmp/ptgc-para
 23189c1b0baf0298fb9385ed61c6df9fa526075315e857d26f2b0986d8a8a24b  /tmp/ptgc-param-load.log
 a912a8c024eb8743abfc5cc44d87a0f49687bd040cadede22745ab714323513e  /tmp/ptgc-param-load-llvm.log
 e3865367f9a2fe68dad00345303288c3872df07c80891f7e5d26238eba501fb8  /tmp/ptgc-param-io-sanitize.log
+263a2de297783c506293fe90a1745e8448bdd4984a9f47e2d5fc7ba0d33936ae  /tmp/ptgc-14src-min2-16k-train.log
+84f26ad0af3c6b7b1d88ee8d1a78b0b0971b3d2ac6ee9ec47a13201d8fd46f15  /tmp/ptgc-14src-duckdb-z1-20tu.log
+89ddff291da93d6ad45e7d7374e44f0a49c960c3e2512c6ce66d75a86dac6635  /tmp/ptgc-14src-duckdb-z3-20tu.log
+9e525cedceacd35d52a60f50838ac44ff0f2b473d2a0ccd5d960dac72c3b063f  /tmp/ptgc-14src-llvm-z1-20tu.log
+ae164d8e07ed79022624f4bff834e6c6e01b87f33b2741f24f799a0b9505d7df  /tmp/ptgc-14src-llvm-z3-20tu.log
 ```
