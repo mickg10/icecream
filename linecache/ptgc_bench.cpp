@@ -178,6 +178,12 @@ static std::vector<uint8_t>load_file_bytes(const std::string&path){
     std::fclose(file);return bytes;
 }
 
+static void save_file_bytes(const std::string&path,const std::vector<uint8_t>&bytes){
+    FILE*file=std::fopen(path.c_str(),"wb");if(!file)die(path.c_str());
+    if(!bytes.empty()&&std::fwrite(bytes.data(),1,bytes.size(),file)!=bytes.size())die_msg("short model write");
+    if(std::fclose(file)!=0)die_msg("model close failed");
+}
+
 class LineStore {
 public:
     struct Ref {
@@ -295,6 +301,30 @@ static void key_varint(std::string& key, uint64_t v) {
     key.push_back(char(uint8_t(v)));
 }
 
+static void build_parsed_keys(ParsedLine&out){
+    if(out.literals.size()!=out.occurrence_slot.size()+1)die_msg("parsed template literal cardinality mismatch");
+    out.key.clear();out.coarse_key.clear();
+    key_varint(out.key,out.slot_type.size());
+    for(uint8_t type:out.slot_type)out.key.push_back(char(type));
+    key_varint(out.key,out.occurrence_slot.size());
+    for(size_t k=0;k<out.occurrence_slot.size();++k){const uint32_t slot=out.occurrence_slot[k];
+        if(slot>=out.slot_type.size())die_msg("parsed template slot out of range");
+        key_varint(out.key,out.literals[k].size());
+        out.key.append(reinterpret_cast<const char*>(out.literals[k].data()),out.literals[k].size());
+        key_varint(out.key,slot);
+    }
+    key_varint(out.key,out.literals.back().size());
+    out.key.append(reinterpret_cast<const char*>(out.literals.back().data()),out.literals.back().size());
+    key_varint(out.coarse_key,out.occurrence_slot.size());
+    for(size_t k=0;k<out.occurrence_slot.size();++k){
+        key_varint(out.coarse_key,out.literals[k].size());
+        out.coarse_key.append(reinterpret_cast<const char*>(out.literals[k].data()),out.literals[k].size());
+        out.coarse_key.push_back(char(out.slot_type[out.occurrence_slot[k]]));
+    }
+    key_varint(out.coarse_key,out.literals.back().size());
+    out.coarse_key.append(reinterpret_cast<const char*>(out.literals.back().data()),out.literals.back().size());
+}
+
 static ParsedLine parse_line(const uint8_t* p, uint32_t n,bool parameterize_keywords=false) {
     ParsedLine out;
     std::vector<uint8_t> literal;
@@ -351,22 +381,7 @@ static ParsedLine parse_line(const uint8_t* p, uint32_t n,bool parameterize_keyw
     }
     out.literals.push_back(std::move(literal));
 
-    key_varint(out.key, out.values.size());
-    for (uint8_t type : out.slot_type) out.key.push_back(char(type));
-    key_varint(out.key, out.occurrence_slot.size());
-    for (size_t k = 0; k < out.occurrence_slot.size(); ++k) {
-        key_varint(out.key, out.literals[k].size());
-        out.key.append(reinterpret_cast<const char*>(out.literals[k].data()), out.literals[k].size());
-        key_varint(out.key, out.occurrence_slot[k]);
-    }
-    key_varint(out.key, out.literals.back().size());
-    out.key.append(reinterpret_cast<const char*>(out.literals.back().data()), out.literals.back().size());
-    key_varint(out.coarse_key,out.occurrence_slot.size());
-    for(size_t k=0;k<out.occurrence_slot.size();++k){
-        key_varint(out.coarse_key,out.literals[k].size());out.coarse_key.append(reinterpret_cast<const char*>(out.literals[k].data()),out.literals[k].size());
-        out.coarse_key.push_back(char(out.slot_type[out.occurrence_slot[k]]));
-    }
-    key_varint(out.coarse_key,out.literals.back().size());out.coarse_key.append(reinterpret_cast<const char*>(out.literals.back().data()),out.literals.back().size());
+    build_parsed_keys(out);
     return out;
 }
 
@@ -2102,7 +2117,7 @@ static void decode_pretrained_param_package(const std::vector<uint8_t>&raw,
                                              std::vector<DecodedTemplate>&rules){
     const uint8_t*p=raw.data(),*end=p+raw.size();
     if(get_varint(p,end)!=1)die_msg("unknown pretrained parameterized package version");
-    const uint64_t count=get_varint(p,end);rules.reserve(size_t(count));
+    const uint64_t count=get_varint(p,end);rules.clear();rules.reserve(size_t(count));
     for(uint64_t r=0;r<count;++r){DecodedTemplate rule;const uint64_t slots=get_varint(p,end);
         if(slots>uint64_t(end-p))die_msg("pretrained parameterized slots exceed package");
         rule.slot_type.assign(p,p+slots);p+=slots;const uint64_t occurrences=get_varint(p,end);
@@ -2116,6 +2131,28 @@ static void decode_pretrained_param_package(const std::vector<uint8_t>&raw,
         if(len>uint64_t(end-p))die_msg("pretrained parameterized tail exceeds package");
         rule.literals.emplace_back(p,p+len);p+=len;rules.push_back(std::move(rule));}
     if(p!=end)die_msg("trailing pretrained parameterized package bytes");
+}
+
+static PretrainedParamPackage load_pretrained_param_package(const std::string&path){
+    PretrainedParamPackage package;package.frame=load_file_bytes(path);
+    if(package.frame.empty())die_msg("empty pretrained parameterized package frame");
+    FrameCodec codec;package.raw=codec.decompress(package.frame);
+    if(package.raw.size()>UINT32_MAX)die_msg("pretrained parameterized package exceeds 4 GiB");
+    decode_pretrained_param_package(package.raw,package.decoder_rules);
+    package.encoder_rules.reserve(package.decoder_rules.size());
+    package.rule_id.reserve(package.decoder_rules.size()*2+1);
+    for(const DecodedTemplate&decoded:package.decoder_rules){ParsedLine rule;
+        rule.literals=decoded.literals;rule.occurrence_slot=decoded.occurrence_slot;rule.slot_type=decoded.slot_type;
+        for(uint8_t type:rule.slot_type)if(type<kIdentifier||type>kString)die_msg("unknown pretrained parameterized slot type");
+        rule.values.resize(rule.slot_type.size());build_parsed_keys(rule);
+        const uint32_t id=uint32_t(package.encoder_rules.size());
+        if(!package.rule_id.emplace(rule.key,id).second)die_msg("duplicate pretrained parameterized rule");
+        package.encoder_rules.push_back(std::move(rule));
+    }
+    std::vector<uint8_t>rebuilt;put_varint(rebuilt,1);put_varint(rebuilt,package.encoder_rules.size());
+    for(const ParsedLine&rule:package.encoder_rules)serialize_pretrained_rule(rebuilt,rule);
+    if(rebuilt!=package.raw)die_msg("pretrained parameterized package is not canonical");
+    return package;
 }
 
 class PretrainedParamBuilder {
@@ -2545,6 +2582,8 @@ int main(int argc, char** argv) {
     std::vector<std::string> param_pretrain_source_roots;
     std::string semantic_export_prefix;
     std::string source_dictionary_path;
+    std::string param_model_in_path;
+    std::string param_model_out_path;
     bool semantic_export_only = false;
     int zlevel = 3;
     for (int i = 1; i < argc; ++i) {
@@ -2555,6 +2594,8 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--pretrain-max-files") && i + 1 < argc) pretrain_max_files = std::strtoull(argv[++i], nullptr, 10);
         else if (!std::strcmp(argv[i], "--model-kib") && i + 1 < argc) model_kib = std::strtoull(argv[++i], nullptr, 10);
         else if (!std::strcmp(argv[i], "--param-model-kib") && i + 1 < argc) param_model_kib = std::strtoull(argv[++i], nullptr, 10);
+        else if (!std::strcmp(argv[i], "--param-model-in") && i + 1 < argc) param_model_in_path = argv[++i];
+        else if (!std::strcmp(argv[i], "--param-model-out") && i + 1 < argc) param_model_out_path = argv[++i];
         else if (!std::strcmp(argv[i], "--model-min-corpora") && i + 1 < argc) model_min_corpora = unsigned(std::strtoul(argv[++i], nullptr, 10));
         else if (!std::strcmp(argv[i], "--source-k") && i + 1 < argc) source_program_k = unsigned(std::strtoul(argv[++i], nullptr, 10));
         else if (!std::strcmp(argv[i], "--pretrain-all-identifiers")) pretrain_all_identifiers = true;
@@ -2567,12 +2608,16 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
-    const bool any_pretrained=model_kib!=0||param_model_kib!=0;
+    const bool build_param_model=param_model_kib!=0;
+    const bool load_param_model=!param_model_in_path.empty();
+    const bool use_param_pretrained=build_param_model||load_param_model;
     const bool param_training_available=!pretrain_manifests.empty()||!param_pretrain_source_roots.empty();
     if (!manifest || zlevel < 0 || zlevel > 3 || source_program_k > 32 || (model_kib&&pretrain_manifests.empty()) ||
-        (param_model_kib&&!param_training_available) || (!any_pretrained&&(!pretrain_manifests.empty()||!param_pretrain_source_roots.empty())) ||
-        (!param_model_kib&&!param_pretrain_source_roots.empty()) || (semantic_export_only&&semantic_export_prefix.empty())) {
-        std::fprintf(stderr, "usage: %s --manifest FILE [--max-files N] [--z 0..3] [--source-k 0..32] [--source-dict FILE] [--semantic-export-prefix PATH [--semantic-export-only]] [--pretrain-manifest FILE ... --model-kib N] [--param-model-kib N --param-pretrain-source-root DIR ...] [--pretrain-max-files N] [--model-min-corpora N] [--pretrain-all-identifiers]\n", argv[0]);
+        (build_param_model&&!param_training_available) || (build_param_model&&load_param_model) ||
+        (!param_model_out_path.empty()&&!build_param_model) || (load_param_model&&!param_pretrain_source_roots.empty()) ||
+        (!model_kib&&!build_param_model&&!pretrain_manifests.empty()) || (!use_param_pretrained&&!param_pretrain_source_roots.empty()) ||
+        (semantic_export_only&&semantic_export_prefix.empty())) {
+        std::fprintf(stderr, "usage: %s --manifest FILE [--max-files N] [--z 0..3] [--source-k 0..32] [--source-dict FILE] [--semantic-export-prefix PATH [--semantic-export-only]] [--pretrain-manifest FILE ... --model-kib N] [--param-model-kib N --param-pretrain-source-root DIR ... --param-model-out FILE] [--param-model-in FILE] [--pretrain-max-files N] [--model-min-corpora N] [--pretrain-all-identifiers]\n", argv[0]);
         return 2;
     }
     for(const std::string&training:pretrain_manifests)if(training==manifest)die_msg("pretraining and target manifests must be disjoint");
@@ -2582,13 +2627,16 @@ int main(int argc, char** argv) {
     if(use_pretrained){const auto training_begin=Clock::now();PretrainedBuilder builder(pretrain_all_identifiers);for(size_t i=0;i<pretrain_manifests.size();++i)builder.scan_manifest(pretrain_manifests[i],pretrain_max_files,i);const double training_seconds=elapsed(training_begin);pretrained=builder.compile(model_kib*1024,zlevel,training_seconds,model_min_corpora);}
     const PretrainedPackage frozen_pretrained=pretrained;
     FrameCodec pretrained_package_codec;const std::vector<uint8_t>pretrained_receiver_raw=use_pretrained?pretrained_package_codec.decompress(pretrained.frame):std::vector<uint8_t>{};if(pretrained_receiver_raw!=pretrained.raw)die_msg("pretrained receiver package mismatch");
-    const bool use_param_pretrained=param_model_kib!=0;
     PretrainedParamPackage pretrained_param;
-    if(use_param_pretrained){const auto training_begin=Clock::now();PretrainedParamBuilder builder;
+    if(load_param_model)pretrained_param=load_pretrained_param_package(param_model_in_path);
+    else if(build_param_model){const auto training_begin=Clock::now();PretrainedParamBuilder builder;
         for(size_t i=0;i<pretrain_manifests.size();++i)builder.scan_manifest(pretrain_manifests[i],pretrain_max_files,i);
         for(size_t i=0;i<param_pretrain_source_roots.size();++i)builder.scan_source_root(param_pretrain_source_roots[i],pretrain_max_files,pretrain_manifests.size()+i);
         const double training_seconds=elapsed(training_begin);
-        pretrained_param=builder.compile(param_model_kib*1024,zlevel,training_seconds,model_min_corpora);}
+        pretrained_param=builder.compile(param_model_kib*1024,zlevel,training_seconds,model_min_corpora);
+        if(!param_model_out_path.empty()){save_file_bytes(param_model_out_path,pretrained_param.frame);
+            const PretrainedParamPackage exported=load_pretrained_param_package(param_model_out_path);
+            if(exported.frame!=pretrained_param.frame||exported.raw!=pretrained_param.raw)die_msg("exported pretrained parameterized package mismatch");}}
     FrameCodec pretrained_param_package_codec;
     const std::vector<uint8_t>pretrained_param_receiver_raw=use_param_pretrained?pretrained_param_package_codec.decompress(pretrained_param.frame):std::vector<uint8_t>{};
     if(pretrained_param_receiver_raw!=pretrained_param.raw)die_msg("pretrained parameterized receiver package mismatch");
@@ -3236,7 +3284,7 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long long>(param_span_stats.program_records),static_cast<unsigned long long>(param_span_stats.literal_records),param_span_stats.covered_bytes/1048576.0,param_span_stats.residual_bytes/1048576.0,param_span_stats.target_bytes/1048576.0,static_cast<unsigned long long>(param_span_stats.program_ops),
                 static_cast<unsigned long long>(param_span_frame_wins),static_cast<unsigned long long>(param_span_combined_wins),static_cast<unsigned long long>(param_span_columnar_wins),param_span_literal_wire/1048576.0,param_span_candidate_wire/1048576.0,param_span_selected_wire/1048576.0);
     if(use_param_pretrained)std::printf("P14 pretrained parameterized sub-superblocks input=%s training=%.2f GiB/%llu lines/%llu distinct sampled=%llu windows=%llu candidate-shapes=%llu in %.2fs selected-rules=%zu package raw/wire=%.1f/%.1f KiB model-id=%016llx; TU rule-sets=%llu instances/unique=%llu/%llu program/literal-records=%llu/%llu covered/residual/target=%.2f/%.2f/%.2f MiB ops=%llu lexicon entries/refs=%llu/%llu frame-wins=%llu combined/columnar-candidates=%llu/%llu raw-channel literal/candidate/selected=%.3f/%.3f/%.3f MiB model-dictionary wins=%llu saved-before-charge=%.1f KiB\n",
-                param_pretrain_source_roots.empty()?"expanded-ii":(pretrain_manifests.empty()?"raw-source":"mixed"),pretrained_param.training_raw/1073741824.0,static_cast<unsigned long long>(pretrained_param.training_lines),static_cast<unsigned long long>(pretrained_param.training_distinct_lines),static_cast<unsigned long long>(pretrained_param.sampled_lines),
+                load_param_model?"loaded-package":(param_pretrain_source_roots.empty()?"expanded-ii":(pretrain_manifests.empty()?"raw-source":"mixed")),pretrained_param.training_raw/1073741824.0,static_cast<unsigned long long>(pretrained_param.training_lines),static_cast<unsigned long long>(pretrained_param.training_distinct_lines),static_cast<unsigned long long>(pretrained_param.sampled_lines),
                 static_cast<unsigned long long>(pretrained_param.candidate_windows),static_cast<unsigned long long>(pretrained_param.candidate_rules),pretrained_param.training_seconds,pretrained_param.encoder_rules.size(),pretrained_param.raw.size()/1024.0,(pretrained_param.frame.size()+4)/1024.0,
                 static_cast<unsigned long long>(hash_bytes(pretrained_param.raw.data(),uint32_t(pretrained_param.raw.size()))),
                 static_cast<unsigned long long>(pretrained_param_stats.used_rules),static_cast<unsigned long long>(pretrained_param_stats.rule_instances),static_cast<unsigned long long>(pretrained_param_stats.unique_instances),static_cast<unsigned long long>(pretrained_param_stats.program_records),static_cast<unsigned long long>(pretrained_param_stats.literal_records),

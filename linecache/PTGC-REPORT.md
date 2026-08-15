@@ -607,6 +607,24 @@ LLVM and DuckDB, followed by complete LLVM and DuckDB holdouts on quietbox2. The
 given the full 16-corpus map, package/support sweeps, retained-artifact contract, and complete exact
 measurement gates in issue #16 comment 5302494188.
 
+### Frozen package artifact boundary
+
+P14/P16 can now cross a real process boundary without any trainer state:
+
+- `--param-model-out FILE` writes the exact compressed decoder-visible package after training;
+- the writer immediately reloads that file, reconstructs its encoder lookup table, and verifies the
+  original frame and raw package byte-for-byte;
+- `--param-model-in FILE` loads that same frame in a fresh process, rebuilds every `ParsedLine` key
+  from decoder-visible literals, slot types, and equality links, and rejects a non-canonical package;
+- the loaded frame, rather than a recompressed equivalent, is charged to P14/P16.
+
+A two-TU DuckDB smoke trained a 629-rule raw-source package, wrote a 3,721-byte frame, and loaded it
+in a fresh process. All 22 charged row totals, model ID `a60c8c6a0dcaa489`, rule count, and fused P16
+total matched the training process. A separate LLVM invocation loaded the identical frame. A one-TU
+ASan/UBSan loaded-package replay completed without diagnostics. This makes it possible to train the
+common 14-project package once and prove that both complete holdouts consume literally identical
+bytes.
+
 ## Reproduction and retained artifacts
 
 Environment for the authoritative local run:
@@ -704,6 +722,10 @@ Primary logs:
 /tmp/ptgc-p16-source-smoke.log
 /tmp/ptgc-p16-source-fulltrain-20tu.log
 /tmp/ptgc-p16-source-sanitize.log
+/tmp/ptgc-param-build.log
+/tmp/ptgc-param-load.log
+/tmp/ptgc-param-load-llvm.log
+/tmp/ptgc-param-io-sanitize.log
 /tmp/codec50-current-baseline.log
 /tmp/codec50-pretrain-duckdb-independent.log
 ```
@@ -732,4 +754,9 @@ af3a6a3ecf02da10b48b11bafc69674b4f4da9f52e70405bf07ff7ce1dc9aad4  /tmp/ptgc-p16-
 fa3b78c2b107ae040fc345beeb8760ce310d532851cdda9176f579a5602ba94d  /tmp/ptgc-p16-source-smoke.log
 85446ea59db8aa1a6453c9fbf8c1bbc622cde78cce492544334072ca9fc533c5  /tmp/ptgc-p16-source-fulltrain-20tu.log
 e3eb33e474310e75875bb04579bea860b432280558a1920a633ee29349e7985c  /tmp/ptgc-p16-source-sanitize.log
+b18c8136a5acd36702a6e3d286ef302d93f0cb29da0d5796d452c134d61e72e4  /tmp/ptgc-param-smoke.frame
+00da86cf6d31d04cc4cc6c49c975a4a433a42f21a3324ee2bffd95b53fae605c  /tmp/ptgc-param-build.log
+23189c1b0baf0298fb9385ed61c6df9fa526075315e857d26f2b0986d8a8a24b  /tmp/ptgc-param-load.log
+a912a8c024eb8743abfc5cc44d87a0f49687bd040cadede22745ab714323513e  /tmp/ptgc-param-load-llvm.log
+e3865367f9a2fe68dad00345303288c3872df07c80891f7e5d26238eba501fb8  /tmp/ptgc-param-io-sanitize.log
 ```
