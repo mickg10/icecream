@@ -34,12 +34,12 @@ code{background:var(--grid);padding:1px 5px;border-radius:4px;font-size:12.5px}
 </style>
 <div class="wrap">
 <h1>Cold is capped, amortized wins: 15 C++ codebases through the icecream line-dedup transport</h1>
-<p class="sub">Real byte-exact codec (codec50), one cold chronological pass, z&le;3, every wire byte counted &middot; commit <code>538c9c3</code></p>
+<p class="sub">Real byte-exact codec (codec50), one cold chronological pass, z&le;3, every wire byte counted &middot; commit <code>72b3996</code></p>
 
 <div class="kpis">
 <div class="kpi"><div class="n">15</div><div class="l">C++ codebases</div></div>
 <div class="kpi"><div class="n">3706&ndash;41102x</div><div class="l">S0 amortized (all &ge;400x)</div></div>
-<div class="kpi"><div class="n">1 / 15</div><div class="l">under 400x source-conditioned</div></div>
+<div class="kpi"><div class="n">6&rarr;2</div><div class="l">dict-leg corpora under 400x (plain &rarr; source-conditioned)</div></div>
 </div>
 
 <p class="lede">Four findings, consistent across every codebase and cross-checked by the definition-plane probes.
@@ -47,9 +47,10 @@ code{background:var(--grid);padding:1px 5px;border-radius:4px;font-size:12.5px}
 <b>(2)</b> The <b>S0 semantic-Root memo</b> makes the repeated-build basis (the production reality: a persistent
 per-daemon dictionary) clear 400&times; on <i>every</i> codebase, 3706&ndash;41102&times;.
 <b>(3)</b> Throughput is airtight: a real two-process socketpair sustains &ge;1&nbsp;GB/s single-stream, byte-exact.
-<b>(4)</b> Even the <i>definition plane alone</i>, source-conditioned (toolchain headers free, since icecream ships
-the environment), clears 400&times; on <b>14 of 15</b> &mdash; DuckDB is the single holdout (269&times;), because 89% of its
-dictionary is its own project code. Cold-400&times; is a property of how much unique code a codebase ships.</p>
+<b>(4)</b> Source-conditioning the definition plane (toolchain headers free, since icecream ships the environment)
+lifts a codebase's dict-leg ratio by exactly its toolchain fraction &mdash; 2&ndash;4&times; for toolchain-heavy libraries,
+only ~1.1&times; for own-code-dominated apps &mdash; so it rescues most sub-400&times; libraries but cannot rescue DuckDB (269&times;).
+Cold-400&times; on a single build is a property of how much unique code a codebase ships.</p>
 
 <h2>1 &nbsp; The 15-codebase table</h2>
 <p class="lede">cold = holistic FinalRatio (my wire, all legs). srccond = defcodec's source-conditioned dict-leg ratio
@@ -189,55 +190,102 @@ ROOT_REF. Every codebase clears 400&times; by 9&ndash;100&times; &mdash; this is
 <text x="646.8" y="386" class="val">41102x</text>
 </svg></div>
 
-<h2>4 &nbsp; The definition plane: own-source fraction vs source-conditioned ratio</h2>
-<p class="lede">Why only DuckDB stays capped. x = fraction of the dictionary that is project code (must ship); y =
-source-conditioned dict-leg ratio (toolchain lines free). Strong anticorrelation: the more of its own code a
-codebase ships, the lower its ceiling. DuckDB (89% own-source) is the sole point under 400&times; (269&times;); every
-other &mdash; apps and libraries alike &mdash; clears it once toolchain headers are free. (This is the dict leg only;
-the holistic cold in panel 2 is additionally bounded by the per-TU structure legs.)</p>
-<div class="card"><svg viewBox="0 0 720 400" role="img" class="chart" preserveAspectRatio="xMidYMid meet">
-<line x1="58" y1="194.3" x2="696" y2="194.3" class="grid"/>
-<text x="50" y="198.3" class="axlab" text-anchor="end">1000x</text>
-<line x1="58" y1="286.0" x2="696" y2="286.0" class="refline"/>
-<text x="694" y="282.0" class="reflab" text-anchor="end">400x</text>
-<text x="185.6" y="360.0" class="axlab" text-anchor="middle">20%</text>
-<text x="313.2" y="360.0" class="axlab" text-anchor="middle">40%</text>
-<text x="440.8" y="360.0" class="axlab" text-anchor="middle">60%</text>
-<text x="568.4" y="360.0" class="axlab" text-anchor="middle">80%</text>
-<circle cx="628.4" cy="258.3" r="5.5" style="fill:var(--accent2)" class="dot"><title>LLVM (app): 89% own-source, srccond 527.4x, dict 471.6x</title></circle>
-<text x="635.4" y="261.8" class="dotlab">LLVM</text>
-<circle cx="521.2" cy="204.1" r="5.5" style="fill:var(--accent2)" class="dot"><title>RocksDB (app): 72% own-source, srccond 906.7x, dict 658.3x</title></circle>
-<text x="528.2" y="207.6" class="dotlab">RocksDB</text>
-<circle cx="628.5" cy="325.7" r="5.5" style="fill:var(--accent2)" class="dot"><title>DuckDB (app): 89% own-source, srccond 268.9x, dict 240.5x</title></circle>
-<text x="635.5" y="329.2" class="dotlab">DuckDB</text>
-<circle cx="527.1" cy="190.0" r="5.5" style="fill:var(--accent2)" class="dot"><title>abseil+protobuf (app): 73% own-source, srccond 1044.6x, dict 768.2x</title></circle>
-<text x="534.1" y="193.5" class="dotlab">abseil+protobuf</text>
-<circle cx="613.2" cy="216.8" r="5.5" style="fill:var(--accent2)" class="dot"><title>OpenCV (app): 87% own-source, srccond 798.7x, dict 695.2x</title></circle>
-<text x="620.2" y="220.3" class="dotlab">OpenCV</text>
-<circle cx="350.6" cy="286.5" r="5.5" style="fill:var(--accent)" class="dot"><title>fmt (lib): 45% own-source, srccond 398.1x, dict 182.5x</title></circle>
-<text x="357.6" y="290.0" class="dotlab">fmt</text>
-<circle cx="266.9" cy="252.5" r="5.5" style="fill:var(--accent)" class="dot"><title>spdlog (lib): 32% own-source, srccond 559.3x, dict 182.8x</title></circle>
-<text x="273.9" y="256.0" class="dotlab">spdlog</text>
-<circle cx="311.7" cy="72.0" r="5.5" style="fill:var(--accent)" class="dot"><title>Catch2 (lib): 39% own-source, srccond 3396.5x, dict 1350.4x</title></circle>
-<text x="318.7" y="75.5" class="dotlab">Catch2</text>
-<circle cx="346.1" cy="226.7" r="5.5" style="fill:var(--accent)" class="dot"><title>nlohmann-json (lib): 45% own-source, srccond 723.5x, dict 327x</title></circle>
-<text x="353.1" y="230.2" class="dotlab">nlohmann-json</text>
-<circle cx="349.5" cy="131.8" r="5.5" style="fill:var(--accent)" class="dot"><title>range-v3 (lib): 45% own-source, srccond 1868.2x, dict 852.5x</title></circle>
-<text x="356.5" y="135.3" class="dotlab">range-v3</text>
-<circle cx="470.7" cy="32.0" r="5.5" style="fill:var(--accent)" class="dot"><title>Eigen (lib): 64% own-source, srccond 5065.7x, dict 3277.7x</title></circle>
-<text x="477.7" y="35.5" class="dotlab">Eigen</text>
-<circle cx="273.0" cy="232.4" r="5.5" style="fill:var(--accent)" class="dot"><title>re2 (lib): 33% own-source, srccond 683.3x, dict 230x</title></circle>
-<text x="280.0" y="235.9" class="dotlab">re2</text>
-<circle cx="286.4" cy="228.3" r="5.5" style="fill:var(--accent)" class="dot"><title>LevelDB (lib): 35% own-source, srccond 711.9x, dict 254.5x</title></circle>
-<text x="293.4" y="231.8" class="dotlab">LevelDB</text>
-<circle cx="323.4" cy="192.9" r="5.5" style="fill:var(--accent)" class="dot"><title>simdjson (lib): 41% own-source, srccond 1013.9x, dict 421.2x</title></circle>
-<text x="330.4" y="196.4" class="dotlab">simdjson</text>
-<circle cx="223.2" cy="106.9" r="5.5" style="fill:var(--accent)" class="dot"><title>cereal (lib): 25% own-source, srccond 2396.3x, dict 621.4x</title></circle>
-<text x="230.2" y="110.4" class="dotlab">cereal</text>
-<text x="377.0" y="394" class="axtitle" text-anchor="middle">own-source fraction of the dictionary (project-ship / total, z3 bytes) &rarr;</text>
-<rect x="570" y="18" width="10" height="10" style="fill:var(--accent2)"/><text x="584" y="27" class="dotlab">app</text>
-<rect x="620" y="18" width="10" height="10" style="fill:var(--accent)"/><text x="634" y="27" class="dotlab">library</text>
+<h2>4 &nbsp; Source-conditioning: the lift equals the toolchain fraction</h2>
+<p class="lede">The definition/dict plane, plain (grey) vs source-conditioned (toolchain headers free, since icecream
+ships the environment). The gap is the lift &mdash; and it is proportional to how much of a codebase's .ii is
+toolchain: <b style="color:var(--accent)">libraries</b> (toolchain-dominated) get a 2&ndash;4&times; lift that carries
+the sub-400&times; ones (spdlog/nlohmann-json/re2/LevelDB) over the line; <b style="color:var(--accent2)">apps</b>
+(own-code-dominated) get only ~1.1&times;. So source-conditioning rescues 4 of the 6
+dict-leg corpora that were under 400&times; plain, but <b>can't rescue DuckDB</b> (lowest base ratio AND smallest
+toolchain fraction &rarr; 269&times;), with fmt right on the line. This is the dict leg only; the holistic cold (panel 2)
+is additionally bounded by the per-TU structure legs.</p>
+<div class="card"><svg viewBox="0 0 720 375" role="img" class="chart" preserveAspectRatio="xMidYMid meet">
+<line x1="389.2" y1="16" x2="389.2" y2="361" class="grid"/>
+<text x="389.2" y="11" class="axlab" text-anchor="middle">1000x</text>
+<line x1="252.9" y1="16" x2="252.9" y2="361" class="refline"/>
+<text x="252.9" y="372" class="reflab" text-anchor="middle">400x</text>
+<text x="104" y="33" class="rowlab" text-anchor="end">DuckDB</text>
+<line x1="177.2" y1="29.0" x2="193.8" y2="29.0" stroke="var(--accent2)" stroke-width="1.6" opacity="0.5"/>
+<circle cx="177.2" cy="29.0" r="3.6" fill="var(--muted)"><title>DuckDB plain dict-leg: 240.5x</title></circle>
+<circle cx="193.8" cy="29.0" r="5" style="fill:var(--accent2)" class="dot"><title>DuckDB source-conditioned: 268.9x (1.1x lift, app)</title></circle>
+<text x="200.8" y="33.0" class="val">1.1&times;</text>
+<text x="104" y="56" class="rowlab" text-anchor="end">fmt</text>
+<line x1="136.2" y1="52.0" x2="252.2" y2="52.0" stroke="var(--accent)" stroke-width="1.6" opacity="0.5"/>
+<circle cx="136.2" cy="52.0" r="3.6" fill="var(--muted)"><title>fmt plain dict-leg: 182.5x</title></circle>
+<circle cx="252.2" cy="52.0" r="5" style="fill:var(--accent)" class="dot"><title>fmt source-conditioned: 398.1x (2.2x lift, lib)</title></circle>
+<text x="259.2" y="56.0" class="val">2.2&times;</text>
+<text x="104" y="79" class="rowlab" text-anchor="end">LLVM</text>
+<line x1="277.4" y1="75.0" x2="294.0" y2="75.0" stroke="var(--accent2)" stroke-width="1.6" opacity="0.5"/>
+<circle cx="277.4" cy="75.0" r="3.6" fill="var(--muted)"><title>LLVM plain dict-leg: 471.6x</title></circle>
+<circle cx="294.0" cy="75.0" r="5" style="fill:var(--accent2)" class="dot"><title>LLVM source-conditioned: 527.4x (1.1x lift, app)</title></circle>
+<text x="301.0" y="79.0" class="val">1.1&times;</text>
+<text x="104" y="102" class="rowlab" text-anchor="end">spdlog</text>
+<line x1="136.4" y1="98.0" x2="302.8" y2="98.0" stroke="var(--accent)" stroke-width="1.6" opacity="0.5"/>
+<circle cx="136.4" cy="98.0" r="3.6" fill="var(--muted)"><title>spdlog plain dict-leg: 182.8x</title></circle>
+<circle cx="302.8" cy="98.0" r="5" style="fill:var(--accent)" class="dot"><title>spdlog source-conditioned: 559.3x (3.1x lift, lib)</title></circle>
+<text x="309.8" y="102.0" class="val">3.1&times;</text>
+<text x="104" y="125" class="rowlab" text-anchor="end">re2</text>
+<line x1="170.6" y1="121.0" x2="332.5" y2="121.0" stroke="var(--accent)" stroke-width="1.6" opacity="0.5"/>
+<circle cx="170.6" cy="121.0" r="3.6" fill="var(--muted)"><title>re2 plain dict-leg: 230x</title></circle>
+<circle cx="332.5" cy="121.0" r="5" style="fill:var(--accent)" class="dot"><title>re2 source-conditioned: 683.3x (3.0x lift, lib)</title></circle>
+<text x="339.5" y="125.0" class="val">3.0&times;</text>
+<text x="104" y="148" class="rowlab" text-anchor="end">LevelDB</text>
+<line x1="185.6" y1="144.0" x2="338.6" y2="144.0" stroke="var(--accent)" stroke-width="1.6" opacity="0.5"/>
+<circle cx="185.6" cy="144.0" r="3.6" fill="var(--muted)"><title>LevelDB plain dict-leg: 254.5x</title></circle>
+<circle cx="338.6" cy="144.0" r="5" style="fill:var(--accent)" class="dot"><title>LevelDB source-conditioned: 711.9x (2.8x lift, lib)</title></circle>
+<text x="345.6" y="148.0" class="val">2.8&times;</text>
+<text x="104" y="171" class="rowlab" text-anchor="end">nlohmann-json</text>
+<line x1="222.9" y1="167.0" x2="341.0" y2="167.0" stroke="var(--accent)" stroke-width="1.6" opacity="0.5"/>
+<circle cx="222.9" cy="167.0" r="3.6" fill="var(--muted)"><title>nlohmann-json plain dict-leg: 327x</title></circle>
+<circle cx="341.0" cy="167.0" r="5" style="fill:var(--accent)" class="dot"><title>nlohmann-json source-conditioned: 723.5x (2.2x lift, lib)</title></circle>
+<text x="348.0" y="171.0" class="val">2.2&times;</text>
+<text x="104" y="194" class="rowlab" text-anchor="end">OpenCV</text>
+<line x1="335.1" y1="190.0" x2="355.7" y2="190.0" stroke="var(--accent2)" stroke-width="1.6" opacity="0.5"/>
+<circle cx="335.1" cy="190.0" r="3.6" fill="var(--muted)"><title>OpenCV plain dict-leg: 695.2x</title></circle>
+<circle cx="355.7" cy="190.0" r="5" style="fill:var(--accent2)" class="dot"><title>OpenCV source-conditioned: 798.7x (1.1x lift, app)</title></circle>
+<text x="362.7" y="194.0" class="val">1.1&times;</text>
+<text x="104" y="217" class="rowlab" text-anchor="end">RocksDB</text>
+<line x1="327.0" y1="213.0" x2="374.6" y2="213.0" stroke="var(--accent2)" stroke-width="1.6" opacity="0.5"/>
+<circle cx="327.0" cy="213.0" r="3.6" fill="var(--muted)"><title>RocksDB plain dict-leg: 658.3x</title></circle>
+<circle cx="374.6" cy="213.0" r="5" style="fill:var(--accent2)" class="dot"><title>RocksDB source-conditioned: 906.7x (1.4x lift, app)</title></circle>
+<text x="381.6" y="217.0" class="val">1.4&times;</text>
+<text x="104" y="240" class="rowlab" text-anchor="end">simdjson</text>
+<line x1="260.6" y1="236.0" x2="391.2" y2="236.0" stroke="var(--accent)" stroke-width="1.6" opacity="0.5"/>
+<circle cx="260.6" cy="236.0" r="3.6" fill="var(--muted)"><title>simdjson plain dict-leg: 421.2x</title></circle>
+<circle cx="391.2" cy="236.0" r="5" style="fill:var(--accent)" class="dot"><title>simdjson source-conditioned: 1013.9x (2.4x lift, lib)</title></circle>
+<text x="398.2" y="240.0" class="val">2.4&times;</text>
+<text x="104" y="263" class="rowlab" text-anchor="end">abseil+protobuf</text>
+<line x1="350.0" y1="259.0" x2="395.7" y2="259.0" stroke="var(--accent2)" stroke-width="1.6" opacity="0.5"/>
+<circle cx="350.0" cy="259.0" r="3.6" fill="var(--muted)"><title>abseil+protobuf plain dict-leg: 768.2x</title></circle>
+<circle cx="395.7" cy="259.0" r="5" style="fill:var(--accent2)" class="dot"><title>abseil+protobuf source-conditioned: 1044.6x (1.4x lift, app)</title></circle>
+<text x="402.7" y="263.0" class="val">1.4&times;</text>
+<text x="104" y="286" class="rowlab" text-anchor="end">range-v3</text>
+<line x1="365.4" y1="282.0" x2="482.1" y2="282.0" stroke="var(--accent)" stroke-width="1.6" opacity="0.5"/>
+<circle cx="365.4" cy="282.0" r="3.6" fill="var(--muted)"><title>range-v3 plain dict-leg: 852.5x</title></circle>
+<circle cx="482.1" cy="282.0" r="5" style="fill:var(--accent)" class="dot"><title>range-v3 source-conditioned: 1868.2x (2.2x lift, lib)</title></circle>
+<text x="489.1" y="286.0" class="val">2.2&times;</text>
+<text x="104" y="309" class="rowlab" text-anchor="end">cereal</text>
+<line x1="318.4" y1="305.0" x2="519.2" y2="305.0" stroke="var(--accent)" stroke-width="1.6" opacity="0.5"/>
+<circle cx="318.4" cy="305.0" r="3.6" fill="var(--muted)"><title>cereal plain dict-leg: 621.4x</title></circle>
+<circle cx="519.2" cy="305.0" r="5" style="fill:var(--accent)" class="dot"><title>cereal source-conditioned: 2396.3x (3.9x lift, lib)</title></circle>
+<text x="526.2" y="309.0" class="val">3.9&times;</text>
+<text x="104" y="332" class="rowlab" text-anchor="end">Catch2</text>
+<line x1="433.9" y1="328.0" x2="571.1" y2="328.0" stroke="var(--accent)" stroke-width="1.6" opacity="0.5"/>
+<circle cx="433.9" cy="328.0" r="3.6" fill="var(--muted)"><title>Catch2 plain dict-leg: 1350.4x</title></circle>
+<circle cx="571.1" cy="328.0" r="5" style="fill:var(--accent)" class="dot"><title>Catch2 source-conditioned: 3396.5x (2.5x lift, lib)</title></circle>
+<text x="578.1" y="332.0" class="val">2.5&times;</text>
+<text x="104" y="355" class="rowlab" text-anchor="end">Eigen</text>
+<line x1="565.8" y1="351.0" x2="630.5" y2="351.0" stroke="var(--accent)" stroke-width="1.6" opacity="0.5"/>
+<circle cx="565.8" cy="351.0" r="3.6" fill="var(--muted)"><title>Eigen plain dict-leg: 3277.7x</title></circle>
+<circle cx="630.5" cy="351.0" r="5" style="fill:var(--accent)" class="dot"><title>Eigen source-conditioned: 5065.7x (1.5x lift, lib)</title></circle>
+<text x="637.5" y="355.0" class="val">1.5&times;</text>
+<circle cx="120" cy="369" r="3.6" fill="var(--muted)"/><text x="128" y="372" class="dotlab">plain dict leg</text>
+<circle cx="230" cy="369" r="5" style="fill:var(--accent)"/><text x="240" y="372" class="dotlab">source-conditioned (lib)</text>
+<circle cx="412" cy="369" r="5" style="fill:var(--accent2)"/><text x="422" y="372" class="dotlab">app</text>
 </svg></div>
+<p class="lede">(Own-source fraction alone is NOT monotonic with ratio: <b>Eigen</b> is 65% own-source yet tops the
+chart at 5066&times;, because its own header-only templates are reused across all 650 TUs &mdash; huge <i>within-build</i>
+self-repetition. Header-only-template libraries are the exception; per-corpus own-source fractions are in the table.)</p>
 
 <h2>5 &nbsp; Cross-project coverage saturates fast &mdash; and low for apps</h2>
 <p class="lede">defcodec's leave-one-out learning curves: each codebase's line coverage from a prior built of the k
@@ -291,7 +339,7 @@ headers). Curves flatten by k&asymp;3&ndash;9: cross-project transfer is real bu
 <h2>Methodology &amp; reproducibility</h2>
 <p class="lede">Codec metrics from <code>codec50.cpp</code>, byte-exact (F reconstructs each TU == the original .ii;
 whole-source digest); z&le;3; no corpus-name branches; no free dictionaries. Attribution + coverage from defcodec's
-<code>loo-attribution.tsv</code> / <code>loo-learning-curve.tsv</code>. Branch <code>implementer/issue16-superblock</code> @ <code>538c9c3</code>.</p>
+<code>loo-attribution.tsv</code> / <code>loo-learning-curve.tsv</code>. Branch <code>implementer/issue16-superblock</code> @ <code>72b3996</code>.</p>
 <div class="card"><table>
 <thead><tr><th>metric</th><th>command</th></tr></thead><tbody>
 <tr><td class="nm">holistic cold</td><td style="text-align:left"><code>codec50 --manifest C/manifest.txt --stream</code></td></tr>

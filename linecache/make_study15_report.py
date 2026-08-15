@@ -73,7 +73,8 @@ def main():
     s0_min=min(d["s0"] for d in hs); s0_max=max(d["s0"] for d in hs)
     have_attr=any(d["srccond"] is not None for d in D)
     sc=[d for d in D if d["srccond"] is not None]
-    n_sc_over=sum(1 for d in sc if d["srccond"]>=400)
+    plain_under=sum(1 for d in D if d["dict_ratio"] and d["dict_ratio"]<400)
+    sc_under=sum(1 for d in D if d["srccond"] and d["srccond"]<400)
 
     # ---------- inline SVG helpers ----------
     def logbar(items,key,unit,ref=None,refttl="",accent="--accent"):
@@ -96,29 +97,35 @@ def main():
             s.append(f'<text x="{bx+5:.1f}" y="{y+12}" class="val">{d[key]:g}{unit}</text>')
         s.append('</svg>'); return "\n".join(s)
 
-    def scatter():
-        pts=[d for d in D if d["srccond"] is not None and d["own"] is not None]
-        if not pts:
+    def dumbbell():
+        # per corpus: plain dict-leg ratio -> source-conditioned ratio (toolchain-free). The gap = the
+        # source-conditioning lift = the toolchain fraction of the .ii. Shows which corpora the lift pushes
+        # over 400x (toolchain-heavy libs) and which it can't (own-code-dominated apps: DuckDB).
+        items=[d for d in D if d["dict_ratio"] and d["srccond"]]
+        if not items:
             return '<p class="pending">Pending defcodec\'s loo-attribution.tsv (auto-fills on regen).</p>'
-        W=720;H=400;L=58;B=58;T=18
-        ymin=min(p["srccond"] for p in pts)*0.85; ymax=max(p["srccond"] for p in pts)*1.15
-        lo=math.log10(ymin); hi=math.log10(ymax)
-        X=lambda v:L+v*(W-L-24); Y=lambda v:H-B-(math.log10(v)-lo)/(hi-lo)*(H-B-T)
+        items=sorted(items,key=lambda d:d["srccond"])
+        vals=[d["dict_ratio"] for d in items]+[d["srccond"] for d in items]
+        lo=math.log10(min(vals)*0.85); hi=math.log10(max(vals)*1.14)
+        W=720;L=112;R=70;rowh=23;H=len(items)*rowh+30
+        X=lambda v:L+(math.log10(v)-lo)/(hi-lo)*(W-L-R)
         s=[f'<svg viewBox="0 0 {W} {H}" role="img" class="chart" preserveAspectRatio="xMidYMid meet">']
         for e in range(int(math.ceil(lo)),int(math.floor(hi))+1):
-            gy=Y(10**e); s.append(f'<line x1="{L}" y1="{gy:.1f}" x2="{W-24}" y2="{gy:.1f}" class="grid"/>')
-            s.append(f'<text x="{L-8}" y="{gy+4:.1f}" class="axlab" text-anchor="end">{10**e:g}x</text>')
-        gy=Y(400); s.append(f'<line x1="{L}" y1="{gy:.1f}" x2="{W-24}" y2="{gy:.1f}" class="refline"/>')
-        s.append(f'<text x="{W-26}" y="{gy-4:.1f}" class="reflab" text-anchor="end">400x</text>')
-        for fr in (0.2,0.4,0.6,0.8):
-            gx=X(fr); s.append(f'<text x="{gx:.1f}" y="{H-B+18:.1f}" class="axlab" text-anchor="middle">{int(fr*100)}%</text>')
-        for p in pts:
-            cx=X(p["own"]); cy=Y(p["srccond"]); acc="--accent2" if p["kind"]=="app" else "--accent"
-            s.append(f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="5.5" style="fill:var({acc})" class="dot"><title>{html.escape(p["name"])} ({p["kind"]}): {int(p["own"]*100)}% own-source, srccond {p["srccond"]:g}x, dict {p["dict_ratio"]:g}x</title></circle>')
-            s.append(f'<text x="{cx+7:.1f}" y="{cy+3.5:.1f}" class="dotlab">{html.escape(p["name"])}</text>')
-        s.append(f'<text x="{(L+W-24)/2:.1f}" y="{H-6}" class="axtitle" text-anchor="middle">own-source fraction of the dictionary (project-ship / total, z3 bytes) &rarr;</text>')
-        s.append(f'<rect x="{W-150}" y="{T}" width="10" height="10" style="fill:var(--accent2)"/><text x="{W-136}" y="{T+9}" class="dotlab">app</text>')
-        s.append(f'<rect x="{W-100}" y="{T}" width="10" height="10" style="fill:var(--accent)"/><text x="{W-86}" y="{T+9}" class="dotlab">library</text>')
+            gx=X(10**e); s.append(f'<line x1="{gx:.1f}" y1="16" x2="{gx:.1f}" y2="{H-14}" class="grid"/>')
+            s.append(f'<text x="{gx:.1f}" y="11" class="axlab" text-anchor="middle">{10**e:g}x</text>')
+        rx=X(400); s.append(f'<line x1="{rx:.1f}" y1="16" x2="{rx:.1f}" y2="{H-14}" class="refline"/>')
+        s.append(f'<text x="{rx:.1f}" y="{H-3}" class="reflab" text-anchor="middle">400x</text>')
+        for i,d in enumerate(items):
+            y=22+i*rowh; x1=X(d["dict_ratio"]); x2=X(d["srccond"]); acc="--accent2" if d["kind"]=="app" else "--accent"
+            lift=d["srccond"]/d["dict_ratio"]
+            s.append(f'<text x="{L-8}" y="{y+11}" class="rowlab" text-anchor="end">{html.escape(d["name"])}</text>')
+            s.append(f'<line x1="{x1:.1f}" y1="{y+7:.1f}" x2="{x2:.1f}" y2="{y+7:.1f}" stroke="var({acc})" stroke-width="1.6" opacity="0.5"/>')
+            s.append(f'<circle cx="{x1:.1f}" cy="{y+7:.1f}" r="3.6" fill="var(--muted)"><title>{html.escape(d["name"])} plain dict-leg: {d["dict_ratio"]:g}x</title></circle>')
+            s.append(f'<circle cx="{x2:.1f}" cy="{y+7:.1f}" r="5" style="fill:var({acc})" class="dot"><title>{html.escape(d["name"])} source-conditioned: {d["srccond"]:g}x ({lift:.1f}x lift, {d["kind"]})</title></circle>')
+            s.append(f'<text x="{x2+7:.1f}" y="{y+11:.1f}" class="val">{lift:.1f}&times;</text>')
+        s.append(f'<circle cx="{L+8}" cy="{H-6}" r="3.6" fill="var(--muted)"/><text x="{L+16}" y="{H-3}" class="dotlab">plain dict leg</text>')
+        s.append(f'<circle cx="{L+118}" cy="{H-6}" r="5" style="fill:var(--accent)"/><text x="{L+128}" y="{H-3}" class="dotlab">source-conditioned (lib)</text>')
+        s.append(f'<circle cx="{L+300}" cy="{H-6}" r="5" style="fill:var(--accent2)"/><text x="{L+310}" y="{H-3}" class="dotlab">app</text>')
         s.append('</svg>'); return "\n".join(s)
 
     def lcurve():
@@ -196,7 +203,7 @@ code{{background:var(--grid);padding:1px 5px;border-radius:4px;font-size:12.5px}
 <div class="kpis">
 <div class="kpi"><div class="n">{len(D)}</div><div class="l">C++ codebases</div></div>
 <div class="kpi"><div class="n">{s0_min:.0f}&ndash;{s0_max:.0f}x</div><div class="l">S0 amortized (all &ge;400x)</div></div>
-<div class="kpi"><div class="n">1 / {len(sc)}</div><div class="l">under 400x source-conditioned</div></div>
+<div class="kpi"><div class="n">{plain_under}&rarr;{sc_under}</div><div class="l">dict-leg corpora under 400x (plain &rarr; source-conditioned)</div></div>
 </div>
 
 <p class="lede">Four findings, consistent across every codebase and cross-checked by the definition-plane probes.
@@ -204,9 +211,10 @@ code{{background:var(--grid);padding:1px 5px;border-radius:4px;font-size:12.5px}
 <b>(2)</b> The <b>S0 semantic-Root memo</b> makes the repeated-build basis (the production reality: a persistent
 per-daemon dictionary) clear 400&times; on <i>every</i> codebase, {s0_min:.0f}&ndash;{s0_max:.0f}&times;.
 <b>(3)</b> Throughput is airtight: a real two-process socketpair sustains &ge;1&nbsp;GB/s single-stream, byte-exact.
-<b>(4)</b> Even the <i>definition plane alone</i>, source-conditioned (toolchain headers free, since icecream ships
-the environment), clears 400&times; on <b>14 of 15</b> &mdash; DuckDB is the single holdout (269&times;), because 89% of its
-dictionary is its own project code. Cold-400&times; is a property of how much unique code a codebase ships.</p>
+<b>(4)</b> Source-conditioning the definition plane (toolchain headers free, since icecream ships the environment)
+lifts a codebase's dict-leg ratio by exactly its toolchain fraction &mdash; 2&ndash;4&times; for toolchain-heavy libraries,
+only ~1.1&times; for own-code-dominated apps &mdash; so it rescues most sub-400&times; libraries but cannot rescue DuckDB (269&times;).
+Cold-400&times; on a single build is a property of how much unique code a codebase ships.</p>
 
 <h2>1 &nbsp; The 15-codebase table</h2>
 <p class="lede">cold = holistic FinalRatio (my wire, all legs). srccond = defcodec's source-conditioned dict-leg ratio
@@ -232,13 +240,19 @@ pretraining, trained zstd dict, source-conditioned COPY-programs) lifts the capp
 ROOT_REF. Every codebase clears 400&times; by 9&ndash;100&times; &mdash; this is where the win lives.</p>
 <div class="card">{logbar(hs,"s0","x",ref=400,refttl="400x")}</div>
 
-<h2>4 &nbsp; The definition plane: own-source fraction vs source-conditioned ratio</h2>
-<p class="lede">Why only DuckDB stays capped. x = fraction of the dictionary that is project code (must ship); y =
-source-conditioned dict-leg ratio (toolchain lines free). Strong anticorrelation: the more of its own code a
-codebase ships, the lower its ceiling. DuckDB (89% own-source) is the sole point under 400&times; (269&times;); every
-other &mdash; apps and libraries alike &mdash; clears it once toolchain headers are free. (This is the dict leg only;
-the holistic cold in panel 2 is additionally bounded by the per-TU structure legs.)</p>
-<div class="card">{scatter()}</div>
+<h2>4 &nbsp; Source-conditioning: the lift equals the toolchain fraction</h2>
+<p class="lede">The definition/dict plane, plain (grey) vs source-conditioned (toolchain headers free, since icecream
+ships the environment). The gap is the lift &mdash; and it is proportional to how much of a codebase's .ii is
+toolchain: <b style="color:var(--accent)">libraries</b> (toolchain-dominated) get a 2&ndash;4&times; lift that carries
+the sub-400&times; ones (spdlog/nlohmann-json/re2/LevelDB) over the line; <b style="color:var(--accent2)">apps</b>
+(own-code-dominated) get only ~1.1&times;. So source-conditioning rescues {plain_under-sc_under} of the {plain_under}
+dict-leg corpora that were under 400&times; plain, but <b>can't rescue DuckDB</b> (lowest base ratio AND smallest
+toolchain fraction &rarr; 269&times;), with fmt right on the line. This is the dict leg only; the holistic cold (panel 2)
+is additionally bounded by the per-TU structure legs.</p>
+<div class="card">{dumbbell()}</div>
+<p class="lede">(Own-source fraction alone is NOT monotonic with ratio: <b>Eigen</b> is 65% own-source yet tops the
+chart at 5066&times;, because its own header-only templates are reused across all 650 TUs &mdash; huge <i>within-build</i>
+self-repetition. Header-only-template libraries are the exception; per-corpus own-source fractions are in the table.)</p>
 
 <h2>5 &nbsp; Cross-project coverage saturates fast &mdash; and low for apps</h2>
 <p class="lede">defcodec's leave-one-out learning curves: each codebase's line coverage from a prior built of the k
