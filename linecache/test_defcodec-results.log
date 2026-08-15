@@ -205,3 +205,37 @@ corpus: OpenCV  (/tanksmall/scratch/ictmp/corpus5/manifest.txt)
  400x is bottlenecked by DuckDB and must come from the STRUCTURE side (per-TU id streams), not the
  definition dict; the other 3 corpora already exceed 400x dict-only at plain z3.
 ================================================================================
+
+================================================================================
+ HPDC PRETRAINING probe (owner pivot: "zstd is not the optimal predictor") -- reproduce:
+   --pretrain --train <manifest>...   (TOOLCHAIN_BASE = umbrella of bits/stdc++.h + POSIX headers
+   preprocessed with the matching g++-11 -std=c++17; GENERIC_II = LLVM+RocksDB+OpenCV distinct lines)
+
+ The owner's premise: distinct .ii lines are C++ source dominated by IDENTICAL system/toolchain/stdlib
+ headers, so a pretrained model beats zstd's self-entropy. MEASURED on DuckDB -- it does NOT hold at
+ the preprocessed-.ii-line level:
+
+ LINE-LEVEL coverage of DuckDB's 637,610 distinct lines:
+   vs TOOLCHAIN umbrella (57k lines):     3.8% by bytes
+   vs 3 REAL projects (1.85M lines):      4.1% by bytes
+   substantive code (558k lines/44.6 MiB, i.e. excluding 79k linemarkers + trivial): only 4.4% by bytes.
+   => cross-project preprocessed lines barely overlap. Same SOURCE headers, but preprocessing bakes in
+      line markers (# N "path"), template instantiations w/ project types, and macro-dependent expansion
+      => the LINES are project-specific. The 98.5% redundancy the transport exploits is WITHIN a project
+      (same headers/flags repeated across its TUs), not across projects.
+   cold dict (covered lines free) = residual z3 7.47 MiB = 253x  (barely up from 240x). NOT 400x.
+
+ TRAINED ZSTD DICTIONARY (bigoracle 6/7; 512KB dict trained on the prior's 205k line samples):
+   DuckDB full dict z3+dict = 7.875 MiB = 240.5x  == plain z3 (ZERO gain; residual +1KB).
+   => a small cross-project dict adds nothing: z3 already extracts ALL within-blob redundancy (52 MiB,
+      self-redundant); the prior only supplies substrings DuckDB doesn't use. Same for FTRL/codebook,
+      which rest on the same (falsified) cross-project-sharing premise.
+
+ VOCAB-level (skeleton+slot-token text) coverage: skeleton 3.5%/token 8.0% by bytes -> dict 5.92 MiB = 320x.
+
+ FINAL (all axes exhausted): DuckDB distinct-line dict CANNOT reach 400x by ANY method -- LZ (z3..z19),
+ LDM, lexical front-coding, skeleton-grouped columnar, contextual entropy (PPM-C/MTF), cross-project
+ vocab/line pretraining, OR a trained zstd dictionary. Best ~253x (line-pretrain) / ~265x (front-code z3)
+ / ~330x (z19 offline). The token-placement + line->skel-id floor (~340x z3) is corpus-specific. DuckDB's
+ preprocessed content is genuinely ~250-340x-capped; holistic-400x must come from the STRUCTURE side.
+================================================================================

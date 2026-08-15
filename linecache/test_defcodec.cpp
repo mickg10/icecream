@@ -33,6 +33,7 @@
 #include <unordered_map>
 #include <vector>
 #include <zstd.h>
+#include <zdict.h>
 
 using Clock = std::chrono::steady_clock;
 static double secs(Clock::time_point b) { return std::chrono::duration<double>(Clock::now() - b).count(); }
@@ -154,12 +155,13 @@ struct StringInterner {
             i = (i + 1) & mask;
         }
     }
-    bool contains(const uint8_t* p, uint32_t n) const {   // membership without insert (prior lookup)
+    bool contains(const uint8_t* p, uint32_t n) const { return find(p, n) != UINT32_MAX; }
+    uint32_t find(const uint8_t* p, uint32_t n) const {   // interned id, or UINT32_MAX if absent
         uint64_t h = fast_hash(p, n) | 1; uint32_t i = uint32_t(h) & mask;
         for (;;) {
             const Slot& s = tab[i];
-            if (!s.h) return false;
-            if (s.h == h && len[s.id] == n && memcmp(blob.data() + off[s.id], p, n) == 0) return true;
+            if (!s.h) return UINT32_MAX;
+            if (s.h == h && len[s.id] == n && memcmp(blob.data() + off[s.id], p, n) == 0) return s.id;
             i = (i + 1) & mask;
         }
     }
@@ -533,18 +535,88 @@ static bool run_frontcodec(const Distinct& d, uint64_t base_z3, uint64_t raw, ZS
 // trained on OTHER repos cover enough of the target's vocab to push its dict under the 400x budget?
 // The placement (which token per slot) and line->skeleton id are corpus-specific hard floors.
 static void run_pretrain(const Distinct& d, uint64_t raw, const std::vector<std::string>& trains, ZSTD_CCtx* cc) {
-    StringInterner pskel, ptok;                         // 1) prior sets from training corpora
+    StringInterner pline, pskel, ptok;                  // 1) prior sets from training corpora
     for (auto& m : trains) {
         Corpus tc = load_corpus(m.c_str(), SIZE_MAX);
         Distinct td = extract_distinct(tc);
+        for (size_t k = 0; k < td.off.size(); ++k) pline.intern(td.blob.data() + td.off[k], td.len[k]);
         tokenize_corpus(td, pskel, ptok, nullptr, nullptr, nullptr);
-        fprintf(stderr, "  [prior] %s: distinct=%zu  cumulative prior skeletons=%zu tokens=%zu\n",
-                m.c_str(), td.off.size(), pskel.off.size(), ptok.off.size());
+        fprintf(stderr, "  [prior] %s: distinct=%zu  cumulative prior lines=%zu skeletons=%zu tokens=%zu\n",
+                m.c_str(), td.off.size(), pline.off.size(), pskel.off.size(), ptok.off.size());
     }
     StringInterner tskel, ttok;                         // 2) tokenize target
     std::vector<uint32_t> line_skel, slot_tok, line_slot_start;
     tokenize_corpus(d, tskel, ttok, &line_skel, &slot_tok, &line_slot_start);
     const size_t N = d.off.size();
+    std::vector<uint8_t> z;
+    auto Z3 = [&](const std::vector<uint8_t>& v) { return zstd_size(cc, v.data(), v.size(), 3, z); };
+
+    // LINE-LEVEL coverage: DuckDB distinct lines byte-identical to a prior (toolchain) line ship as a
+    // reference, not text. Covered lines are FREE if the reference set is bundled with the environment
+    // (icecream ships it) and referenced via a shared id space; only the residual (project-specific)
+    // lines' text ships. Also price a per-line mapping variant (flags + covered->ref-id) if needed.
+    std::vector<uint8_t> residual_blob, map_s, flag_s;
+    size_t line_cov = 0; uint64_t line_cov_b = 0, line_tot_b = 0;
+    // classify by kind: linemarker (# ...), trivial (<=2 bytes / all-ws), substantive code
+    size_t sub_n = 0, sub_cov = 0, lm_n = 0, triv_n = 0; uint64_t sub_b = 0, sub_cov_b = 0;
+    for (size_t i = 0; i < N; ++i) {
+        const uint8_t* p = d.blob.data() + d.off[i]; uint32_t L = d.len[i]; line_tot_b += L;
+        uint32_t rid = pline.find(p, L);
+        bool cov = rid != UINT32_MAX;
+        if (cov) { ++line_cov; line_cov_b += L; flag_s.push_back(1); bput_varint(map_s, rid); }
+        else { flag_s.push_back(0); residual_blob.insert(residual_blob.end(), p, p + L); }
+        uint32_t ws = 0; while (ws < L && (p[ws] == ' ' || p[ws] == '\t' || p[ws] == '\n')) ++ws;
+        if (L && p[0] == '#') ++lm_n;
+        else if (ws >= L - (L && p[L - 1] == '\n' ? 1 : 0) || L <= 2) ++triv_n;
+        else { ++sub_n; sub_b += L; if (cov) { ++sub_cov; sub_cov_b += L; } }
+    }
+    uint64_t base_z3 = Z3(d.blob);
+    uint64_t res_z3 = Z3(residual_blob), flag_z3 = Z3(flag_s), map_z3 = Z3(map_s);
+    uint64_t cold_strict = res_z3;                       // covered lines free (bundled, shared id space)
+    uint64_t cold_withmap = res_z3 + flag_z3 + map_z3;   // if a per-line dict->ref mapping is charged
+    double budget = double(raw) / 400.0;
+    printf("  ---- TOOLCHAIN/PRIOR LINE-LEVEL coverage (prior distinct lines=%zu) ----\n", pline.off.size());
+    printf("    target distinct lines=%zu  covered=%zu (%.1f%% by count, %.1f%% by BYTES)  residual=%.3f MiB raw\n",
+           N, line_cov, 100.0 * double(line_cov) / double(N), 100.0 * double(line_cov_b) / double(line_tot_b),
+           MB(residual_blob.size()));
+    printf("    kinds: linemarkers=%zu  trivial=%zu  substantive-code=%zu (%.3f MiB); SUBSTANTIVE coverage=%.1f%% by count, %.1f%% by bytes\n",
+           lm_n, triv_n, sub_n, MB(sub_b), 100.0 * double(sub_cov) / double(sub_n ? sub_n : 1),
+           100.0 * double(sub_cov_b) / double(sub_b ? sub_b : 1));
+    printf("    full dict z3 (no prior) = %.3f MiB = %.1fx\n", MB(base_z3), double(raw) / double(base_z3));
+    printf("    cold dict, covered-FREE = residual z3 %.3f MiB = %.1fx   %s 400x (budget %.3f MiB)\n",
+           MB(cold_strict), double(raw) / double(cold_strict),
+           double(cold_strict) <= budget ? "CLEARS" : "under", MB(uint64_t(budget)));
+    printf("    cold dict, +per-line map = %.3f MiB (res %.3f + flags %.3f + map %.3f) = %.1fx   %s 400x\n",
+           MB(cold_withmap), MB(res_z3), MB(flag_z3), MB(map_z3), double(raw) / double(cold_withmap),
+           double(cold_withmap) <= budget ? "CLEARS" : "under");
+
+    // TRAINED ZSTD DICTIONARY (bigoracle 6/7): whole lines don't share cross-project, but SUBSTRINGS
+    // (common tokens, punctuation, type fragments) might. Does a dict trained on the prior beat plain z3?
+    {
+        size_t np = pline.off.size(), stride = np > 200000 ? np / 200000 : 1;
+        std::vector<uint8_t> samples; std::vector<size_t> sizes;
+        for (size_t k = 0; k < np; k += stride) {
+            samples.insert(samples.end(), pline.blob.data() + pline.off[k], pline.blob.data() + pline.off[k] + pline.len[k]);
+            sizes.push_back(pline.len[k]);
+        }
+        std::vector<uint8_t> dict(512 * 1024);
+        size_t ds = ZDICT_trainFromBuffer(dict.data(), dict.size(), samples.data(), sizes.data(), unsigned(sizes.size()));
+        if (ZDICT_isError(ds)) printf("    trained-dict: ZDICT failed (%s)\n", ZDICT_getErrorName(ds));
+        else {
+            auto zdictsz = [&](const std::vector<uint8_t>& v) {
+                ZSTD_CCtx_reset(cc, ZSTD_reset_session_and_parameters);
+                ZSTD_CCtx_setParameter(cc, ZSTD_c_compressionLevel, 3);
+                ZSTD_CCtx_loadDictionary(cc, dict.data(), ds);
+                size_t bound = ZSTD_compressBound(v.size()); if (z.size() < bound) z.resize(bound);
+                size_t r = ZSTD_compress2(cc, z.data(), z.size(), v.data(), v.size());
+                return ZSTD_isError(r) ? uint64_t(0) : uint64_t(r);
+            };
+            uint64_t full_d = zdictsz(d.blob), res_d = zdictsz(residual_blob);
+            printf("    TRAINED-DICT (%zuKB, %zu samples): full dict z3+dict=%.3f MiB=%.1fx (vs plain z3 %.3f=%.1fx); residual z3+dict=%.3f MiB=%.1fx  %s 400x\n",
+                   ds / 1024, sizes.size(), MB(full_d), double(raw) / double(full_d), MB(base_z3), double(raw) / double(base_z3),
+                   MB(res_d), double(raw) / double(res_d), double(res_d) <= budget ? "CLEARS" : "under");
+        }
+    }
 
     // 3) vocab coverage by the prior
     std::vector<uint8_t> inc_skel_blob, inc_skel_len, inc_tok_blob, inc_tok_len;
@@ -561,14 +633,13 @@ static void run_pretrain(const Distinct& d, uint64_t raw, const std::vector<std:
         else { inc_tok_blob.insert(inc_tok_blob.end(), p, p + L); bput_varint(inc_tok_len, L); }
     }
 
-    // 4) target streams + costs
-    std::vector<uint8_t> id_s, tid_row, full_skel_len, full_tok_len, z;
+    // 4) target streams + costs (skeleton/slot-token VOCAB-level coverage, for comparison)
+    std::vector<uint8_t> id_s, tid_row, full_skel_len, full_tok_len;
     for (size_t i = 0; i < N; ++i) bput_varint(id_s, line_skel[i]);
     for (size_t i = 0; i < N; ++i)
         for (uint32_t si = line_slot_start[i]; si < line_slot_start[i + 1]; ++si) bput_varint(tid_row, slot_tok[si]);
     for (size_t s = 0; s < tskel.off.size(); ++s) bput_varint(full_skel_len, tskel.len[s]);
     for (size_t t = 0; t < ttok.off.size(); ++t) bput_varint(full_tok_len, ttok.len[t]);
-    auto Z3 = [&](const std::vector<uint8_t>& v) { return zstd_size(cc, v.data(), v.size(), 3, z); };
     uint64_t id_z3 = Z3(id_s);
     uint64_t plc_z19 = zstd_size_adv(cc, tid_row.data(), tid_row.size(), 19, 1, 27, z);
     uint64_t full_skel_z3 = Z3(tskel.blob) + Z3(full_skel_len);
@@ -579,9 +650,8 @@ static void run_pretrain(const Distinct& d, uint64_t raw, const std::vector<std:
     uint64_t floor_hard = plc_z19 + id_z3;                                   // corpus-specific, un-pretrainable
     uint64_t dict_noprior = floor_hard + full_skel_z3 + full_tok_z3;
     uint64_t dict_prior = floor_hard + inc_skel_z3 + inc_tok_z3;
-    double budget = double(raw) / 400.0;
 
-    printf("  ---- CROSS-PROJECT PRETRAINING probe (prior = %zu training corpora) ----\n", trains.size());
+    printf("  ---- VOCAB-level coverage (skeleton + slot-token text) ----\n");
     printf("    prior vocab: skeletons=%zu tokens=%zu\n", pskel.off.size(), ptok.off.size());
     printf("    target skeletons=%zu covered=%zu (%.1f%% by count, %.1f%% by bytes)  incremental z3=%.3f MiB (full %.3f)\n",
            tskel.off.size(), skel_cov, 100.0 * double(skel_cov) / double(tskel.off.size()),
