@@ -1,0 +1,15 @@
+corpus	variant	order	order_seed	perturb	affected_tus	charged_wire_bytes	charged_ratio	exact
+abseil	perturb	standard	5353740	true	700	7515932	343.4049785176343	true
+abseil	shuffle	shuffled	1	false	0	7122782	362.3596042950634	true
+fmt	perturb	standard	5353740	true	50	929400	146.70764148913278	true
+fmt	reverse	reverse	5353740	false	0	903434	150.92423132182319	true
+fmt	shuffle1	shuffled	1	false	0	905066	150.6520872510955	true
+fmt	shuffle2	shuffled	2	false	0	905099	150.64659446093742	true
+fmt	shuffle3	shuffled	3	false	0	916101	148.8373902004255	true
+leveldb	perturb	standard	5353740	true	72	577782	249.00091903174552	true
+leveldb	reverse	reverse	5353740	false	0	590418	243.6718545166306	true
+leveldb	shuffle1	shuffled	1	false	0	578708	248.6024886471243	true
+leveldb	shuffle2	shuffled	2	false	0	587043	245.0727612798381	true
+leveldb	shuffle3	shuffled	3	false	0	589427	244.0815385111303	true
+rocksdb	perturb	standard	5353740	true	622	14479861	215.07945387044808	true
+rocksdb	shuffle	shuffled	1	false	0	14462408	215.33900827580027	true

@@ -31,7 +31,7 @@ import json
 import random
 import time
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Iterator, Sequence
 
 import zstandard as zstd
 
@@ -42,6 +42,7 @@ from pretrained_superblocks import (
     TuRegions,
     build_package,
     collect_candidates,
+    context_runs,
     decode_key,
     encode_regions,
     expected_regions,
@@ -200,6 +201,355 @@ def clone_encoder(source: ExactEncoder, package: StaticPackage) -> ExactEncoder:
     return clone
 
 
+def overlapping_phrases(
+    regions: Sequence[tuple[int, int, int]],
+    lengths: Sequence[int],
+) -> Iterator[bytes]:
+    """Emit deterministic half-overlapping windows over one Region sequence."""
+    for length in lengths:
+        if length > len(regions):
+            continue
+        stride = max(1, length // 2)
+        starts = list(range(0, len(regions) - length + 1, stride))
+        final = len(regions) - length
+        if not starts or starts[-1] != final:
+            starts.append(final)
+        for start in starts:
+            yield encode_regions(regions[start:start + length])
+
+
+def scoped_phrase_candidates(
+    tu: TuRegions,
+    lengths: Sequence[int],
+    phrase_scope: str,
+) -> Iterator[bytes]:
+    """Add cross-context candidates without removing the stable run-local set."""
+    yield from phrase_candidates(tu, lengths)
+    if phrase_scope == "run":
+        return
+    if phrase_scope != "run-and-tu":
+        raise ValueError(f"unknown phrase scope: {phrase_scope}")
+    yield from overlapping_phrases(expected_regions(tu), lengths)
+
+
+def scoped_materialization_keys(
+    tu: TuRegions,
+    package: StaticPackage,
+    phrase_scope: str,
+    atomize_raw: bool = False,
+) -> list[bytes]:
+    """Greedily match exact phrases across context boundaries when requested."""
+    if phrase_scope == "run" and not atomize_raw:
+        return materialization_keys(tu, package)
+    if phrase_scope not in ("run", "run-and-tu"):
+        raise ValueError(f"unknown phrase scope: {phrase_scope}")
+
+    out: list[bytes] = []
+
+    def append_sequence(regions: Sequence[tuple[int, int, int]]) -> None:
+        raw: list[tuple[int, int, int]] = []
+
+        def flush_raw() -> None:
+            if not raw:
+                return
+            if atomize_raw:
+                out.extend(encode_regions((region,)) for region in raw)
+            else:
+                out.append(encode_regions(raw))
+            raw.clear()
+
+        offset = 0
+        while offset < len(regions):
+            selected: bytes | None = None
+            selected_length = 0
+            for _, key, phrase in package.by_first.get(regions[offset], ()):
+                length = len(phrase)
+                if (
+                    offset + length <= len(regions)
+                    and regions[offset:offset + length] == phrase
+                ):
+                    selected = key
+                    selected_length = length
+                    break
+            if selected is None:
+                raw.append(regions[offset])
+                offset += 1
+                continue
+            flush_raw()
+            out.append(selected)
+            offset += selected_length
+        flush_raw()
+
+    if phrase_scope == "run-and-tu":
+        append_sequence(expected_regions(tu))
+    else:
+        for regions in context_runs(tu):
+            append_sequence(regions)
+    return out
+
+
+def canonical_atom_frame(
+    keys: Sequence[bytes],
+    package: StaticPackage,
+    store: RegionIdStore,
+) -> bytes:
+    """Encode raw atoms against the causal dense Region store without mutating it."""
+    out = bytearray(put_varint(len(keys)))
+    transient: dict[tuple[int, int, int], int] = {}
+    for key in keys:
+        static_id = package.ids.get(key, 0)
+        if static_id:
+            out.append(ExactEncoder.STATIC_ID)
+            out += put_varint(static_id)
+            continue
+        regions = decode_key(key)
+        if len(regions) != 1:
+            raise ValueError("canonical fallback must contain exactly one Region")
+        region = regions[0]
+        dynamic_id = store.ids.get(region) or transient.get(region)
+        if dynamic_id is None:
+            dynamic_id = len(store.values) + len(transient)
+            transient[region] = dynamic_id
+            out.append(ExactEncoder.RAW_DEFINE)
+            out += put_varint(dynamic_id)
+            out += put_varint(len(key))
+            out += key
+        else:
+            out.append(ExactEncoder.DYNAMIC_REF)
+            out += put_varint(dynamic_id)
+    return bytes(out)
+
+
+def decode_canonical_atom_frame(
+    data: bytes,
+    package: StaticPackage,
+    store: RegionIdStore,
+) -> list[tuple[int, int, int]]:
+    """Decode one frame using persistent Region IDs plus frame-local new atoms."""
+    count, offset = get_varint(data, 0)
+    persistent_count = len(store.values) - 1
+    transient: list[tuple[int, int, int]] = []
+    transient_seen: set[tuple[int, int, int]] = set()
+    out: list[tuple[int, int, int]] = []
+    for _ in range(count):
+        if offset >= len(data):
+            raise ValueError("truncated canonical atom opcode")
+        op = data[offset]
+        offset += 1
+        if op == ExactEncoder.RAW_DEFINE:
+            dynamic_id, offset = get_varint(data, offset)
+            size, offset = get_varint(data, offset)
+            expected_id = persistent_count + len(transient) + 1
+            if dynamic_id != expected_id or offset + size > len(data):
+                raise ValueError("bad frame-local Region definition")
+            regions = decode_key(data[offset:offset + size])
+            offset += size
+            if (
+                len(regions) != 1
+                or regions[0] in store.ids
+                or regions[0] in transient_seen
+            ):
+                raise ValueError("non-canonical frame-local Region definition")
+            transient.append(regions[0])
+            transient_seen.add(regions[0])
+            out.append(regions[0])
+        elif op == ExactEncoder.DYNAMIC_REF:
+            dynamic_id, offset = get_varint(data, offset)
+            if 0 < dynamic_id <= persistent_count:
+                out.append(store.values[dynamic_id])
+                continue
+            transient_id = dynamic_id - persistent_count
+            if not 0 < transient_id <= len(transient):
+                raise ValueError("unknown canonical Region ID")
+            out.append(transient[transient_id - 1])
+        elif op == ExactEncoder.STATIC_ID:
+            static_id, offset = get_varint(data, offset)
+            if not 0 < static_id <= len(package.keys):
+                raise ValueError("unknown static phrase ID")
+            out.extend(decode_key(package.keys[static_id - 1]))
+        else:
+            raise ValueError("unsupported canonical atom opcode")
+    if offset != len(data):
+        raise ValueError("trailing canonical atom bytes")
+    return out
+
+
+def context_run_lengths(tu: TuRegions) -> list[int]:
+    """Return the exact Region count of every consecutive semantic-context run."""
+    lengths: list[int] = []
+    offset = 0
+    while offset < len(tu.regions):
+        context = tu.regions[offset][2]
+        end = offset + 1
+        while end < len(tu.regions) and tu.regions[end][2] == context:
+            end += 1
+        lengths.append(end - offset)
+        offset = end
+    return lengths
+
+
+def serialize_context_runs(lengths: Sequence[int]) -> bytes:
+    out = bytearray(put_varint(len(lengths)))
+    for length in lengths:
+        if length <= 0:
+            raise ValueError("context run must contain at least one Region")
+        out += put_varint(length)
+    return bytes(out)
+
+
+def deserialize_context_runs(raw: bytes, region_count: int) -> list[int]:
+    count, offset = get_varint(raw, 0)
+    lengths: list[int] = []
+    for _ in range(count):
+        length, offset = get_varint(raw, offset)
+        if length <= 0:
+            raise ValueError("empty context run")
+        lengths.append(length)
+    if offset != len(raw) or sum(lengths) != region_count:
+        raise ValueError("context runs do not cover the reconstructed TU")
+    return lengths
+
+
+def tu_with_context_runs(
+    regions: Sequence[tuple[int, int, int]],
+    lengths: Sequence[int],
+) -> TuRegions:
+    contextual: list[tuple[int, int, int, int]] = []
+    offset = 0
+    for context, length in enumerate(lengths, 1):
+        for hash1, hash2, raw_length in regions[offset:offset + length]:
+            contextual.append((hash1, hash2, context, raw_length))
+        offset += length
+    if offset != len(regions):
+        raise ValueError("context runs do not match Region count")
+    return TuRegions(0, 0, contextual)
+
+
+def advance_canonical_dynamic(
+    previous: dict[bytes, int],
+    keys: Sequence[bytes],
+    static: StaticPackage,
+) -> dict[bytes, int]:
+    """Apply the fixed canonical parse without retaining frame-local choices."""
+    dynamic = dict(previous)
+    for key in keys:
+        if key not in static.ids and key not in dynamic:
+            dynamic[key] = len(dynamic) + 1
+    return dynamic
+
+
+def dense_decoder_dynamic(dynamic: dict[bytes, int]) -> list[bytes]:
+    values = [b""] * (len(dynamic) + 1)
+    for key, dynamic_id in dynamic.items():
+        if not 0 < dynamic_id < len(values) or values[dynamic_id]:
+            raise ValueError("dynamic dictionary IDs are not dense and unique")
+        values[dynamic_id] = key
+    if any(not key for key in values[1:]):
+        raise ValueError("dynamic dictionary ID gap")
+    return values
+
+
+def coverage_sequence_keys(
+    regions: Sequence[tuple[int, int, int]],
+    package: StaticPackage,
+) -> list[bytes]:
+    """Choose non-overlapping phrases by maximum uncompressed byte coverage."""
+    count = len(regions)
+    best = [0] * (count + 1)
+    choices: list[tuple[bytes, int] | None] = [None] * count
+    for offset in range(count - 1, -1, -1):
+        best[offset] = best[offset + 1]
+        for static_id, key, phrase in package.by_first.get(regions[offset], ()):
+            length = len(phrase)
+            if (
+                offset + length > count
+                or regions[offset:offset + length] != phrase
+            ):
+                continue
+            reference_bytes = 1 + len(put_varint(static_id))
+            score = 20 * length - reference_bytes + best[offset + length]
+            if score > best[offset]:
+                best[offset] = score
+                choices[offset] = (key, length)
+
+    out: list[bytes] = []
+    raw: list[tuple[int, int, int]] = []
+    offset = 0
+    while offset < count:
+        selected = choices[offset]
+        if selected is None:
+            raw.append(regions[offset])
+            offset += 1
+            continue
+        if raw:
+            out.append(encode_regions(raw))
+            raw.clear()
+        key, length = selected
+        out.append(key)
+        offset += length
+    if raw:
+        out.append(encode_regions(raw))
+    return out
+
+
+def coverage_materialization_keys(
+    tu: TuRegions,
+    package: StaticPackage,
+    phrase_scope: str,
+) -> list[bytes]:
+    """Run the coverage parse within runs or across the complete TU."""
+    if not package.keys:
+        return materialization_keys(tu, package)
+    if phrase_scope == "run-and-tu":
+        return coverage_sequence_keys(expected_regions(tu), package)
+    if phrase_scope != "run":
+        raise ValueError(f"unknown phrase scope: {phrase_scope}")
+    out: list[bytes] = []
+    for regions in context_runs(tu):
+        out.extend(coverage_sequence_keys(regions, package))
+    return out
+
+
+def static_cross_materialization_keys(
+    base_keys: Sequence[bytes],
+    package: StaticPackage,
+) -> list[bytes]:
+    """Replace adjacent static keys without changing raw-key state transitions."""
+    decoded = [decode_key(key) for key in base_keys]
+    out: list[bytes] = []
+    key_offset = 0
+    while key_offset < len(base_keys):
+        if base_keys[key_offset] not in package.ids or not decoded[key_offset]:
+            out.append(base_keys[key_offset])
+            key_offset += 1
+            continue
+
+        regions: list[tuple[int, int, int]] = []
+        boundary_to_keys: dict[int, int] = {}
+        end = key_offset
+        while end < len(base_keys) and base_keys[end] in package.ids:
+            regions.extend(decoded[end])
+            boundary_to_keys[len(regions)] = end - key_offset + 1
+            end += 1
+
+        selected: bytes | None = None
+        consumed = 0
+        for _, key, phrase in package.by_first.get(regions[0], ()):
+            key_count = boundary_to_keys.get(len(phrase), 0)
+            if key_count < 2 or regions[:len(phrase)] != phrase:
+                continue
+            selected = key
+            consumed = key_count
+            break
+        if selected is None:
+            out.append(base_keys[key_offset])
+            key_offset += 1
+            continue
+        out.append(selected)
+        key_offset += consumed
+    return out
+
+
 class BoundedDocumentCounts:
     """Deterministic bounded document-frequency table with conservative counts."""
 
@@ -274,6 +624,7 @@ class CausalPhraseLearner:
         candidate_capacity: int,
         maximum_key_bytes: int,
         budget_basis: str,
+        phrase_scope: str,
     ):
         self.vocabulary = clone_package(initial)
         self.initial_assets = len(initial.keys)
@@ -283,6 +634,7 @@ class CausalPhraseLearner:
         self.per_tu_budget = per_tu_budget
         self.maximum_key_bytes = maximum_key_bytes
         self.budget_basis = budget_basis
+        self.phrase_scope = phrase_scope
         self.counts = BoundedDocumentCounts(candidate_capacity)
         self.promoted_raw_bytes = 0
         self.promoted_assets = 0
@@ -300,7 +652,11 @@ class CausalPhraseLearner:
             return []
         seen: set[bytes] = set()
         eligible: list[tuple[float, int, int, bytes]] = []
-        for key in phrase_candidates(tu, self.phrase_lengths):
+        for key in scoped_phrase_candidates(
+            tu,
+            self.phrase_lengths,
+            self.phrase_scope,
+        ):
             if key in seen:
                 continue
             seen.add(key)
@@ -444,10 +800,18 @@ class OnlineResult:
     candidate_capacity: int
     publication: str
     budget_basis: str
+    phrase_scope: str
+    parse_policy: str
+    cross_probe_tus: int
+    cross_probe_min_savings: int
+    cross_probe_live: bool
+    cross_probe_savings: int = 0
+    cross_enabled: bool = False
     raw_bytes: int = 0
     payload_wire_bytes: int = 0
     definition_wire_bytes: int = 0
     definition_uncompressed_bytes: int = 0
+    context_wire_bytes: int = 0
     selector_wire_bytes: int = 0
     online_definition_raw_bytes: int = 0
     online_promoted_assets: int = 0
@@ -467,6 +831,7 @@ class OnlineResult:
             self.initial_model_wire_bytes
             + self.payload_wire_bytes
             + self.definition_wire_bytes
+            + self.context_wire_bytes
             + self.selector_wire_bytes
         )
         return {
@@ -490,6 +855,11 @@ def evaluate_online(
     initial_frame: bytes,
     level: int,
     phrase_lengths: Sequence[int],
+    phrase_scope: str,
+    parse_policy: str,
+    cross_probe_tus: int,
+    cross_probe_min_savings: int,
+    cross_probe_live: bool,
     threshold: int,
     online_budget: int,
     per_tu_budget: int,
@@ -498,6 +868,80 @@ def evaluate_online(
     publication: str,
     budget_basis: str,
 ) -> OnlineResult:
+    if cross_probe_tus < 0 or cross_probe_min_savings < 0:
+        raise ValueError("cross probe controls must be nonnegative")
+    if cross_probe_live and not cross_probe_tus:
+        raise ValueError("live cross probing requires a positive probe length")
+    if cross_probe_tus and phrase_scope != "run-vs-tu-match":
+        raise ValueError("cross probing requires run-vs-tu-match")
+    if (
+        phrase_scope in (
+            "run-vs-tu-match-canonical",
+            "run-vs-tu-match-hybrid",
+        )
+        and parse_policy != "greedy"
+    ):
+        raise ValueError("canonical atom matching currently requires greedy parsing")
+    shadow_probe_wire: int | None = None
+    probe_limit = min(cross_probe_tus, len(target_tus))
+    if cross_probe_live and probe_limit:
+        shadow = evaluate_online(
+            target_tus[:probe_limit],
+            f"{name}-probe-shadow",
+            initial,
+            initial_frame,
+            level,
+            phrase_lengths,
+            "run",
+            "greedy",
+            0,
+            0,
+            False,
+            threshold,
+            online_budget,
+            per_tu_budget,
+            candidate_capacity,
+            maximum_key_bytes,
+            publication,
+            budget_basis,
+        )
+        shadow_probe_wire = shadow.as_dict()["charged_wire_bytes"]
+    learner_scope = (
+        "run"
+        if phrase_scope in (
+            "run-vs-tu-match",
+            "run-vs-tu-match-canonical",
+            "run-vs-tu-match-context",
+            "run-vs-tu-match-hybrid",
+            "run-plus-static-cross",
+        )
+        else phrase_scope
+    )
+    if phrase_scope in (
+        "run-vs-tu-match",
+        "run-vs-tu-match-canonical",
+        "run-vs-tu-match-context",
+        "run-vs-tu-match-hybrid",
+    ):
+        match_scopes = ("run", "run-and-tu")
+    elif phrase_scope == "run-plus-static-cross":
+        match_scopes = ("run",)
+    else:
+        match_scopes = (phrase_scope,)
+    state_identical_cross = phrase_scope == "run-plus-static-cross"
+    canonical_cross = (
+        phrase_scope == "run-vs-tu-match-canonical" and bool(online_budget)
+    )
+    canonical_context = (
+        phrase_scope in (
+            "run-vs-tu-match-context",
+            "run-vs-tu-match-hybrid",
+        )
+        and bool(online_budget)
+    )
+    hybrid_cross = (
+        phrase_scope == "run-vs-tu-match-hybrid" and bool(online_budget)
+    )
     initial_raw = decompress_frame(initial_frame)
     if deserialize_key_batch(initial_raw) != initial.keys:
         raise ValueError("supplied initial model frame differs from encoder package")
@@ -523,6 +967,7 @@ def evaluate_online(
         candidate_capacity,
         maximum_key_bytes,
         budget_basis,
+        learner_scope,
     )
     result = OnlineResult(
         name=name,
@@ -535,6 +980,12 @@ def evaluate_online(
         candidate_capacity=candidate_capacity,
         publication=publication,
         budget_basis=budget_basis,
+        phrase_scope=phrase_scope,
+        parse_policy=parse_policy,
+        cross_probe_tus=cross_probe_tus,
+        cross_probe_min_savings=cross_probe_min_savings,
+        cross_probe_live=cross_probe_live,
+        cross_enabled=cross_probe_tus == 0 or cross_probe_live,
     )
     compressor = zstd.ZstdCompressor(level=level)
     decompressor = zstd.ZstdDecompressor()
@@ -543,73 +994,242 @@ def evaluate_online(
     for ordinal, tu in enumerate(target_tus, 1):
         begin = time.monotonic()
         selector_wire = 1 if online_budget else 0
+        context_wire = 0
+        context_frame = b""
+        sender_context_lengths: list[int] = []
+        receiver_context_tu: TuRegions | None = None
+        context_encoder_before = encoder.dynamic if canonical_context else {}
+        context_decoder_before = (
+            {key: dynamic_id for dynamic_id, key in enumerate(decoder.dynamic) if dynamic_id}
+            if canonical_context
+            else {}
+        )
+        if context_decoder_before != context_encoder_before:
+            raise ValueError("canonical context dictionaries diverged before TU")
+        if canonical_context:
+            sender_context_lengths = context_run_lengths(tu)
+            context_frame = compressor.compress(
+                serialize_context_runs(sender_context_lengths)
+            )
+            context_wire = len(context_frame) + 4
         definition_wire = 0
+        definition_raw = b""
         used_online = False
+        selected_representation = (
+            "atom"
+            if canonical_cross
+            else "context"
+            if canonical_context
+            else "chosen"
+        )
 
         if online_budget:
             # Compare both representations from exactly the same prior dynamic
             # dictionary.  The baseline retains the frozen initial vocabulary;
             # the online candidate may use all causally promoted phrases.
-            baseline_keys = materialization_keys(tu, initial)
+            baseline_keys = (
+                scoped_materialization_keys(
+                    tu,
+                    initial,
+                    "run",
+                    atomize_raw=True,
+                )
+                if canonical_cross
+                else materialization_keys(tu, initial)
+            )
             baseline_encoder = clone_encoder(encoder, installed_encoder)
-            baseline_payload = baseline_encoder.frame(baseline_keys)
+            baseline_payload = (
+                canonical_atom_frame(
+                    baseline_keys,
+                    installed_encoder,
+                    encoder_regions,
+                )
+                if canonical_cross
+                else baseline_encoder.frame(baseline_keys)
+            )
             baseline_frame = compressor.compress(baseline_payload)
-
-            online_keys = materialization_keys(tu, learner.vocabulary)
-            new_definitions: list[bytes] = []
-            if publication == "first-use":
-                selected: set[bytes] = set()
-                for key in online_keys:
-                    if (
-                        key in learner.vocabulary.ids
-                        and key not in installed_encoder.ids
-                        and key not in selected
-                    ):
-                        selected.add(key)
-                        new_definitions.append(key)
-
-            candidate_package = clone_package(installed_encoder)
-            append_package_keys(candidate_package, new_definitions)
-            online_encoder = clone_encoder(encoder, candidate_package)
-            online_payload = online_encoder.frame(online_keys)
-            online_frame = compressor.compress(online_payload)
-            definition_raw = serialize_reference_batch(new_definitions, encoder_regions)
-            definition_frame = (
-                compressor.compress(definition_raw) if new_definitions else b""
-            )
-            candidate_definition_wire = (
-                len(definition_frame) + 4 if new_definitions else 0
-            )
-
             baseline_wire = len(baseline_frame) + 4 + selector_wire
-            online_wire = (
-                len(online_frame)
-                + 4
-                + candidate_definition_wire
-                + selector_wire
+            best_wire = baseline_wire
+            best_encoder = baseline_encoder
+            best_package = installed_encoder
+            best_payload = baseline_payload
+            best_frame = baseline_frame
+            best_definition_raw = b""
+            best_definition_frame = b""
+            best_definitions: list[bytes] = []
+            best_representation = selected_representation
+
+            parse_materializations: list[tuple[str, str]] = [
+                ("greedy", match_scope) for match_scope in match_scopes
+            ]
+            if parse_policy == "greedy-plus-coverage":
+                parse_materializations.extend(
+                    ("coverage", match_scope) for match_scope in match_scopes
+                )
+            elif parse_policy != "greedy":
+                raise ValueError(f"unknown parse policy: {parse_policy}")
+
+            representations = (
+                ("context", "atom")
+                if hybrid_cross
+                else (selected_representation,)
             )
-            if online_wire < baseline_wire:
-                used_online = True
-                installed_encoder = candidate_package
-                encoder = online_encoder
-                payload = online_payload
-                payload_frame = online_frame
-                definition_wire = candidate_definition_wire
-                if new_definitions:
-                    received_raw = decompressor.decompress(definition_frame)
+            materializations = (
+                (materializer, match_scope, representation)
+                for materializer, match_scope in parse_materializations
+                for representation in representations
+            )
+            for materializer, match_scope, representation in materializations:
+                if materializer == "greedy":
+                    online_keys = scoped_materialization_keys(
+                        tu,
+                        learner.vocabulary,
+                        match_scope,
+                        atomize_raw=representation == "atom",
+                    )
+                else:
+                    online_keys = coverage_materialization_keys(
+                        tu,
+                        learner.vocabulary,
+                        match_scope,
+                    )
+                new_definitions: list[bytes] = []
+                if publication == "first-use":
+                    selected: set[bytes] = set()
+                    for key in online_keys:
+                        if (
+                            key in learner.vocabulary.ids
+                            and key not in installed_encoder.ids
+                            and key not in selected
+                        ):
+                            selected.add(key)
+                            new_definitions.append(key)
+
+                candidate_package = clone_package(installed_encoder)
+                append_package_keys(candidate_package, new_definitions)
+                online_encoder = clone_encoder(encoder, candidate_package)
+                online_payload = (
+                    canonical_atom_frame(
+                        online_keys,
+                        candidate_package,
+                        encoder_regions,
+                    )
+                    if representation == "atom"
+                    else online_encoder.frame(online_keys)
+                )
+                online_frame = compressor.compress(online_payload)
+                candidate_definition_raw = serialize_reference_batch(
+                    new_definitions,
+                    encoder_regions,
+                )
+                candidate_definition_frame = (
+                    compressor.compress(candidate_definition_raw)
+                    if new_definitions
+                    else b""
+                )
+                candidate_definition_wire = (
+                    len(candidate_definition_frame) + 4
+                    if new_definitions
+                    else 0
+                )
+                online_wire = (
+                    len(online_frame)
+                    + 4
+                    + candidate_definition_wire
+                    + selector_wire
+                )
+                allow_candidate = True
+                if (
+                    phrase_scope == "run-vs-tu-match"
+                    and match_scope == "run-and-tu"
+                    and cross_probe_tus
+                ):
+                    if cross_probe_live:
+                        allow_candidate = (
+                            ordinal <= cross_probe_tus or result.cross_enabled
+                        )
+                    elif ordinal <= cross_probe_tus:
+                        result.cross_probe_savings += best_wire - online_wire
+                        allow_candidate = False
+                        if ordinal == cross_probe_tus:
+                            result.cross_enabled = (
+                                result.cross_probe_savings
+                                >= cross_probe_min_savings
+                            )
+                    else:
+                        allow_candidate = result.cross_enabled
+                if allow_candidate and online_wire < best_wire:
+                    used_online = True
+                    best_wire = online_wire
+                    best_encoder = online_encoder
+                    best_package = candidate_package
+                    best_payload = online_payload
+                    best_frame = online_frame
+                    best_definition_raw = candidate_definition_raw
+                    best_definition_frame = candidate_definition_frame
+                    best_definitions = new_definitions
+                    best_representation = representation
+
+                if (
+                    state_identical_cross
+                    and representation == "chosen"
+                    and materializer == "greedy"
+                    and match_scope == "run"
+                    and online_wire < baseline_wire
+                ):
+                    cross_keys = static_cross_materialization_keys(
+                        online_keys,
+                        candidate_package,
+                    )
+                    cross_encoder = clone_encoder(encoder, candidate_package)
+                    cross_payload = cross_encoder.frame(cross_keys)
+                    if cross_encoder.dynamic != online_encoder.dynamic:
+                        raise ValueError(
+                            "static cross parse changed dynamic encoder state"
+                        )
+                    cross_frame = compressor.compress(cross_payload)
+                    cross_wire = (
+                        len(cross_frame)
+                        + 4
+                        + candidate_definition_wire
+                        + selector_wire
+                    )
+                    if cross_wire < best_wire:
+                        used_online = True
+                        best_wire = cross_wire
+                        best_encoder = cross_encoder
+                        best_package = candidate_package
+                        best_payload = cross_payload
+                        best_frame = cross_frame
+                        best_definition_raw = candidate_definition_raw
+                        best_definition_frame = candidate_definition_frame
+                        best_definitions = new_definitions
+                        best_representation = representation
+
+            encoder = best_encoder
+            payload = best_payload
+            payload_frame = best_frame
+            selected_representation = best_representation
+            if used_online:
+                installed_encoder = best_package
+                definition_raw = best_definition_raw
+                definition_wire = (
+                    len(best_definition_frame) + 4 if best_definitions else 0
+                )
+                if best_definitions:
+                    received_raw = decompressor.decompress(best_definition_frame)
                     if received_raw != definition_raw:
                         raise ValueError("online definition frame mismatch")
-                    received_keys = deserialize_reference_batch(received_raw, decoder_regions)
+                    received_keys = deserialize_reference_batch(
+                        received_raw,
+                        decoder_regions,
+                    )
                     append_package_keys(installed_decoder, received_keys)
                     if installed_decoder.keys != installed_encoder.keys:
                         raise ValueError(
                             "online receiver package differs from encoder package"
                         )
-                    result.online_published_assets += len(new_definitions)
-            else:
-                encoder = baseline_encoder
-                payload = baseline_payload
-                payload_frame = baseline_frame
+                    result.online_published_assets += len(best_definitions)
         else:
             keys = materialization_keys(tu, initial)
             payload = encoder.frame(keys)
@@ -617,13 +1237,58 @@ def evaluate_online(
         result.encode_seconds += time.monotonic() - begin
 
         begin = time.monotonic()
+        receiver_context_raw = (
+            decompressor.decompress(context_frame) if canonical_context else b""
+        )
         recovered_payload = decompressor.decompress(payload_frame)
-        recovered = decoder.frame(recovered_payload)
+        recovered = (
+            decode_canonical_atom_frame(
+                recovered_payload,
+                installed_decoder,
+                decoder_regions,
+            )
+            if selected_representation == "atom"
+            else decoder.frame(recovered_payload)
+        )
+        receiver_context_lengths = (
+            deserialize_context_runs(receiver_context_raw, len(recovered))
+            if canonical_context
+            else []
+        )
         result.decode_seconds += time.monotonic() - begin
         exact = recovered_payload == payload and recovered == expected_regions(tu)
         result.exact &= exact
         if not exact:
             raise ValueError(f"{name}: exact replay failed at TU {tu.tu}")
+
+        if canonical_context:
+            if receiver_context_lengths != sender_context_lengths:
+                raise ValueError("context-run sidecar differs at receiver")
+            sender_keys = materialization_keys(tu, installed_encoder)
+            receiver_context_tu = tu_with_context_runs(
+                recovered,
+                receiver_context_lengths,
+            )
+            receiver_keys = materialization_keys(
+                receiver_context_tu,
+                installed_decoder,
+            )
+            if receiver_keys != sender_keys:
+                raise ValueError("canonical context parses differ")
+            sender_dynamic = advance_canonical_dynamic(
+                context_encoder_before,
+                sender_keys,
+                installed_encoder,
+            )
+            receiver_dynamic = advance_canonical_dynamic(
+                context_decoder_before,
+                receiver_keys,
+                installed_decoder,
+            )
+            if receiver_dynamic != sender_dynamic:
+                raise ValueError("canonical context dictionaries diverged after TU")
+            encoder.dynamic = sender_dynamic
+            decoder.dynamic = dense_decoder_dynamic(receiver_dynamic)
 
         encoder_regions.observe(expected_regions(tu))
         decoder_regions.observe(recovered)
@@ -632,6 +1297,7 @@ def evaluate_online(
 
         payload_wire = len(payload_frame) + 4
         result.payload_wire_bytes += payload_wire
+        result.context_wire_bytes += context_wire
         result.selector_wire_bytes += selector_wire
         result.online_selected_tus += int(used_online)
         result.raw_bytes += tu.raw_bytes
@@ -661,14 +1327,26 @@ def evaluate_online(
         result.definition_wire_bytes += definition_wire
         result.definition_uncompressed_bytes += len(definition_raw) if definition_wire else 0
 
-        cumulative_wire += definition_wire + payload_wire + selector_wire
+        cumulative_wire += (
+            definition_wire + context_wire + payload_wire + selector_wire
+        )
+        if cross_probe_live and ordinal == probe_limit:
+            if shadow_probe_wire is None:
+                raise ValueError("missing live cross-probe shadow result")
+            result.cross_probe_savings = shadow_probe_wire - cumulative_wire
+            result.cross_enabled = (
+                result.cross_probe_savings >= cross_probe_min_savings
+            )
         result.per_tu_curve.append({
             "tu": ordinal,
             "raw_bytes": tu.raw_bytes,
             "payload_wire_bytes": payload_wire,
             "definition_wire_bytes": definition_wire,
+            "context_wire_bytes": context_wire,
             "selector_wire_bytes": selector_wire,
-            "wire_bytes": payload_wire + definition_wire + selector_wire,
+            "wire_bytes": (
+                payload_wire + definition_wire + context_wire + selector_wire
+            ),
             "cumulative_raw_bytes": result.raw_bytes,
             "cumulative_charged_bytes": cumulative_wire,
             "cumulative_charged_ratio": result.raw_bytes / max(1, cumulative_wire),
@@ -694,6 +1372,7 @@ def write_curve(rows: Sequence[dict], path: str) -> None:
         "raw_bytes",
         "payload_wire_bytes",
         "definition_wire_bytes",
+        "context_wire_bytes",
         "selector_wire_bytes",
         "wire_bytes",
         "cumulative_raw_bytes",
@@ -788,6 +1467,8 @@ def load_target(
 
     if order == "shuffled":
         random.Random(order_seed).shuffle(target)
+    elif order == "reverse":
+        target.reverse()
     return target, details
 
 
@@ -854,6 +1535,11 @@ def run(args: argparse.Namespace) -> int:
             saved_frame if package.keys else compress_frame(serialize_key_batch([]), args.model_level),
             args.level,
             args.phrase_lengths,
+            args.phrase_scope,
+            args.parse_policy,
+            args.cross_probe_tus,
+            args.cross_probe_min_savings,
+            args.cross_probe_live,
             threshold,
             online_budget,
             args.per_tu_budget,
@@ -871,6 +1557,7 @@ def run(args: argparse.Namespace) -> int:
             "initial_model_wire_bytes": row["initial_model_wire_bytes"],
             "online_definition_raw_bytes": row["online_definition_raw_bytes"],
             "definition_wire_bytes": row["definition_wire_bytes"],
+            "context_wire_bytes": row["context_wire_bytes"],
             "selector_wire_bytes": row["selector_wire_bytes"],
             "promoted": row["online_promoted_assets"],
             "published": row["online_published_assets"],
@@ -887,6 +1574,11 @@ def run(args: argparse.Namespace) -> int:
         "level": args.level,
         "model_level": args.model_level,
         "phrase_lengths": args.phrase_lengths,
+        "phrase_scope": args.phrase_scope,
+        "parse_policy": args.parse_policy,
+        "cross_probe_tus": args.cross_probe_tus,
+        "cross_probe_min_savings": args.cross_probe_min_savings,
+        "cross_probe_live": args.cross_probe_live,
         "static_budget": args.static_budget,
         "online_budget": args.online_budget,
         "per_tu_budget": args.per_tu_budget,
@@ -933,11 +1625,36 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--training-candidates", type=int, default=750_000)
     value.add_argument("--maximum-key-bytes", type=int, default=8 << 10)
     value.add_argument("--phrase-lengths", nargs="+", type=int, default=(2, 4, 8, 16, 32))
+    value.add_argument(
+        "--phrase-scope",
+        choices=(
+            "run",
+            "run-and-tu",
+            "run-vs-tu-match",
+            "run-vs-tu-match-canonical",
+            "run-vs-tu-match-context",
+            "run-vs-tu-match-hybrid",
+            "run-plus-static-cross",
+        ),
+        default="run",
+    )
+    value.add_argument(
+        "--parse-policy",
+        choices=("greedy", "greedy-plus-coverage"),
+        default="greedy",
+    )
+    value.add_argument("--cross-probe-tus", type=int, default=0)
+    value.add_argument("--cross-probe-min-savings", type=int, default=0)
+    value.add_argument("--cross-probe-live", action="store_true")
     value.add_argument("--thresholds", nargs="+", type=int, default=(2, 3, 4, 6))
     value.add_argument("--level", type=int, choices=(1, 3), default=1)
     value.add_argument("--model-level", type=int, choices=(1, 3, 6), default=3)
     value.add_argument("--max-tus", type=int, default=0)
-    value.add_argument("--order", choices=("standard", "shuffled"), default="standard")
+    value.add_argument(
+        "--order",
+        choices=("standard", "shuffled", "reverse"),
+        default="standard",
+    )
     value.add_argument("--order-seed", type=int, default=0x51B10C)
     value.add_argument("--perturb-shared-region", action="store_true")
     value.add_argument(

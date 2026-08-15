@@ -73,6 +73,7 @@ def main() -> int:
                     "charged_ratio": row["charged_ratio"],
                     "model_wire_bytes": row["initial_model_wire_bytes"],
                     "definition_wire_bytes": row["definition_wire_bytes"],
+                    "context_wire_bytes": row.get("context_wire_bytes", 0),
                     "payload_wire_bytes": row["payload_wire_bytes"],
                     "selector_wire_bytes": row["selector_wire_bytes"],
                     "promoted_assets": row.get("online_promoted_assets", 0),
@@ -97,7 +98,7 @@ def main() -> int:
         "publication", "row",
         "pretraining_valid", "selected", "charged_wire_bytes", "charged_ratio",
         "model_wire_bytes", "definition_wire_bytes", "payload_wire_bytes",
-        "selector_wire_bytes", "promoted_assets", "published_assets",
+        "context_wire_bytes", "selector_wire_bytes", "promoted_assets", "published_assets",
         "selected_tus", "c50_ratio", "h200_fraction",
         "final_window_ratio", "exact",
     )
