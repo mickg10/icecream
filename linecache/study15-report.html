@@ -34,7 +34,7 @@ code{background:var(--grid);padding:1px 5px;border-radius:4px;font-size:12.5px}
 </style>
 <div class="wrap">
 <h1>Cold is capped, amortized wins: 15 C++ codebases through the icecream line-dedup transport</h1>
-<p class="sub">Real byte-exact codec (codec50), one cold chronological pass, z&le;3, every wire byte counted &middot; commit <code>72b3996</code></p>
+<p class="sub">Real byte-exact codec (codec50), one cold chronological pass, z&le;3, every wire byte counted &middot; commit <code>ed18c0f</code></p>
 
 <div class="kpis">
 <div class="kpi"><div class="n">15</div><div class="l">C++ codebases</div></div>
@@ -43,7 +43,8 @@ code{background:var(--grid);padding:1px 5px;border-radius:4px;font-size:12.5px}
 </div>
 
 <p class="lede">Four findings, consistent across every codebase and cross-checked by the definition-plane probes.
-<b>(1)</b> Holistic cold-strict compressibility is an entropy floor set by the codebase (102&ndash;2131&times;).
+<b>(1)</b> Holistic cold-strict compressibility (102&ndash;2131&times;) is set by the codebase, not its size &mdash; and for the
+own-code-heavy set no measured method reaches 400&times; (a measured upper bound + open question, not a proof).
 <b>(2)</b> The <b>S0 semantic-Root memo</b> makes the repeated-build basis (the production reality: a persistent
 per-daemon dictionary) clear 400&times; on <i>every</i> codebase, 3706&ndash;41102&times;.
 <b>(3)</b> Throughput is airtight: a real two-process socketpair sustains &ge;1&nbsp;GB/s single-stream, byte-exact.
@@ -57,137 +58,178 @@ Cold-400&times; on a single build is a property of how much unique code a codeba
 (toolchain-free). own = project-ship fraction of the dictionary. S0 = 40-build amortized. tput = single-stream
 C-live socketpair. Sorted by holistic cold.</p>
 <div class="card"><table>
-<thead><tr><th>codebase</th><th>kind</th><th>TUs</th><th>cold</th><th>own-src</th><th>srccond</th><th>S0</th><th>tput</th></tr></thead>
+<thead><tr><th>codebase</th><th>kind</th><th>TUs</th><th>cold z&le;3</th><th>z19+LDM</th><th>own-src</th><th>srccond</th><th>S0</th><th>tput</th></tr></thead>
 <tbody>
-<tr><td class="nm">fmt</td><td>lib</td><td>50</td><td>102x</td><td>0.46</td><td class="warn">398x</td><td class="good">3706x</td><td class="warn">0.80</td></tr>
-<tr><td class="nm">spdlog</td><td>lib</td><td>34</td><td>117x</td><td>0.33</td><td class="good">559x</td><td class="good">4225x</td><td class="warn">0.81</td></tr>
-<tr><td class="nm">LevelDB</td><td>lib</td><td>72</td><td>148x</td><td>0.36</td><td class="good">712x</td><td class="good">4995x</td><td class="warn">0.71</td></tr>
-<tr><td class="nm">re2</td><td>lib</td><td>72</td><td>148x</td><td>0.34</td><td class="good">683x</td><td class="good">4937x</td><td class="warn">0.98</td></tr>
-<tr><td class="nm">DuckDB</td><td>app</td><td>689</td><td>166x</td><td>0.89</td><td class="warn">269x</td><td class="good">5778x</td><td>1.27</td></tr>
-<tr><td class="nm">nlohmann-json</td><td>lib</td><td>99</td><td>209x</td><td>0.45</td><td class="good">724x</td><td class="good">6469x</td><td>1.27</td></tr>
-<tr><td class="nm">simdjson</td><td>lib</td><td>153</td><td>267x</td><td>0.42</td><td class="good">1014x</td><td class="good">8382x</td><td>1.33</td></tr>
-<tr><td class="nm">RocksDB</td><td>app</td><td>622</td><td>284x</td><td>0.73</td><td class="good">907x</td><td class="good">9772x</td><td>1.30</td></tr>
-<tr><td class="nm">LLVM</td><td>app</td><td>1238</td><td>322x</td><td>0.89</td><td class="good">527x</td><td class="good">9910x</td><td>1.30</td></tr>
-<tr><td class="nm">abseil+protobuf</td><td>app</td><td>700</td><td>385x</td><td>0.74</td><td class="good">1045x</td><td class="good">12110x</td><td>1.55</td></tr>
-<tr><td class="nm">cereal</td><td>lib</td><td>84</td><td>398x</td><td>0.26</td><td class="good">2396x</td><td class="good">13499x</td><td>1.06</td></tr>
-<tr><td class="nm">OpenCV</td><td>app</td><td>1506</td><td>476x</td><td>0.87</td><td class="good">799x</td><td class="good">13137x</td><td>1.23</td></tr>
-<tr><td class="nm">range-v3</td><td>lib</td><td>259</td><td>529x</td><td>0.46</td><td class="good">1868x</td><td class="good">13525x</td><td>1.33</td></tr>
-<tr><td class="nm">Catch2</td><td>lib</td><td>857</td><td>750x</td><td>0.40</td><td class="good">3396x</td><td class="good">15548x</td><td>1.46</td></tr>
-<tr><td class="nm">Eigen</td><td>lib</td><td>650</td><td>2131x</td><td>0.65</td><td class="good">5066x</td><td class="good">41102x</td><td>1.55</td></tr>
+<tr><td class="nm">fmt</td><td>lib</td><td>50</td><td>102x</td><td class="warn" style="color:var(--thresh)">124x</td><td>0.46</td><td class="warn">398x</td><td class="good">3706x</td><td class="warn">0.80</td></tr>
+<tr><td class="nm">spdlog</td><td>lib</td><td>34</td><td>117x</td><td class="warn" style="color:var(--thresh)">146x</td><td>0.33</td><td class="good">559x</td><td class="good">4225x</td><td class="warn">0.81</td></tr>
+<tr><td class="nm">LevelDB</td><td>lib</td><td>72</td><td>148x</td><td class="warn" style="color:var(--thresh)">181x</td><td>0.36</td><td class="good">712x</td><td class="good">4995x</td><td class="warn">0.71</td></tr>
+<tr><td class="nm">re2</td><td>lib</td><td>72</td><td>148x</td><td class="warn" style="color:var(--thresh)">183x</td><td>0.34</td><td class="good">683x</td><td class="good">4937x</td><td class="warn">0.98</td></tr>
+<tr><td class="nm">DuckDB</td><td>app</td><td>689</td><td>166x</td><td class="warn" style="color:var(--thresh)">213x</td><td>0.89</td><td class="warn">269x</td><td class="good">5778x</td><td>1.27</td></tr>
+<tr><td class="nm">nlohmann-json</td><td>lib</td><td>99</td><td>209x</td><td class="warn" style="color:var(--thresh)">268x</td><td>0.45</td><td class="good">724x</td><td class="good">6469x</td><td>1.27</td></tr>
+<tr><td class="nm">simdjson</td><td>lib</td><td>153</td><td>267x</td><td class="warn" style="color:var(--thresh)">344x</td><td>0.42</td><td class="good">1014x</td><td class="good">8382x</td><td>1.33</td></tr>
+<tr><td class="nm">RocksDB</td><td>app</td><td>622</td><td>284x</td><td class="warn" style="color:var(--thresh)">341x</td><td>0.73</td><td class="good">907x</td><td class="good">9772x</td><td>1.30</td></tr>
+<tr><td class="nm">LLVM</td><td>app</td><td>1238</td><td>322x</td><td style="color:var(--thresh)">420x</td><td>0.89</td><td class="good">527x</td><td class="good">9910x</td><td>1.30</td></tr>
+<tr><td class="nm">abseil+protobuf</td><td>app</td><td>700</td><td>385x</td><td style="color:var(--thresh)">470x</td><td>0.74</td><td class="good">1045x</td><td class="good">12110x</td><td>1.55</td></tr>
+<tr><td class="nm">cereal</td><td>lib</td><td>84</td><td>398x</td><td style="color:var(--thresh)">510x</td><td>0.26</td><td class="good">2396x</td><td class="good">13499x</td><td>1.06</td></tr>
+<tr><td class="nm">OpenCV</td><td>app</td><td>1506</td><td>476x</td><td style="color:var(--thresh)">607x</td><td>0.87</td><td class="good">799x</td><td class="good">13137x</td><td>1.23</td></tr>
+<tr><td class="nm">range-v3</td><td>lib</td><td>259</td><td>529x</td><td style="color:var(--thresh)">691x</td><td>0.46</td><td class="good">1868x</td><td class="good">13525x</td><td>1.33</td></tr>
+<tr><td class="nm">Catch2</td><td>lib</td><td>857</td><td>750x</td><td style="color:var(--thresh)">963x</td><td>0.40</td><td class="good">3396x</td><td class="good">15548x</td><td>1.46</td></tr>
+<tr><td class="nm">Eigen</td><td>lib</td><td>650</td><td>2131x</td><td style="color:var(--thresh)">2798x</td><td>0.65</td><td class="good">5066x</td><td class="good">41102x</td><td>1.55</td></tr>
 </tbody></table></div>
 <p class="lede"><span style="color:var(--warn)">amber</span> tput = the &lt;150-TU libs where fork/startup dominates the
 sub-second wall (small-workload artifact, not a codec limit; min 1.23&nbsp;GB/s over the &ge;800&nbsp;MiB set).
 <span style="color:var(--warn)">amber srccond</span> = the one corpus (DuckDB) under 400&times;.</p>
 
-<h2>2 &nbsp; Holistic cold FinalRatio &mdash; a codebase entropy floor</h2>
-<p class="lede">Log scale. Same-scale codebases differ &gt;10&times; (Eigen vs DuckDB, both ~650 TUs): the spread is the
-codebase, not the corpus size. No method (LZ z3..z19, LDM, front-code, skeleton-columnar, PPM/MTF, cross-project
-pretraining, trained zstd dict, source-conditioned COPY-programs) lifts the capped ones to a holistic 400&times;.</p>
-<div class="card"><svg viewBox="0 0 720 405" role="img" class="chart" preserveAspectRatio="xMidYMid meet">
-<line x1="160.5" y1="18" x2="160.5" y2="393" class="grid"/>
-<text x="160.5" y="12" class="axlab" text-anchor="middle">100</text>
-<line x1="525.9" y1="18" x2="525.9" y2="393" class="grid"/>
-<text x="525.9" y="12" class="axlab" text-anchor="middle">1000</text>
-<line x1="380.5" y1="18" x2="380.5" y2="393" class="refline"/>
-<text x="380.5" y="403" class="reflab" text-anchor="middle">400x</text>
+<h2>2 &nbsp; Holistic cold FinalRatio &mdash; the z&le;3 production number and its z19+LDM ceiling</h2>
+<p class="lede">Log scale. Bars are the production number (z&le;3, the owner's hard cap); the <span style="color:var(--thresh)">&#9670;
+diamonds</span> are a diagnostic ceiling that <i>violates</i> the cap &mdash; the whole codec re-compressed at z19 +
+long-distance-matching + 27-bit window (same six wire categories, batched, region leg min(delta,raw)). The gap is the
+headroom the z&le;3 cap leaves, and it splits the 15 codebases three ways against 400&times;: <b>ships at z3</b> (Eigen,
+Catch2, range-v3, OpenCV &mdash; already &ge;400&times; under the cap); <b>cap-limited</b> (cereal, abseil, LLVM &mdash;
+z3&lt;400 but the ceiling clears it, so the cap is what holds them under, not the codebase); and <b>codebase-limited</b>
+(the other 8 &mdash; still &lt;400&times; even at the z19+LDM ceiling, DuckDB 213&times; the hardest).</p>
+<div class="card"><svg viewBox="0 0 720 421" role="img" class="chart" preserveAspectRatio="xMidYMid meet">
+<line x1="158.4" y1="18" x2="158.4" y2="399" class="grid"/>
+<text x="158.4" y="12" class="axlab" text-anchor="middle">100</text>
+<line x1="490.1" y1="18" x2="490.1" y2="399" class="grid"/>
+<text x="490.1" y="12" class="axlab" text-anchor="middle">1000</text>
+<line x1="358.1" y1="18" x2="358.1" y2="399" class="refline"/>
+<text x="358.1" y="14" class="reflab" text-anchor="middle">400x</text>
 <text x="130" y="36" class="rowlab" text-anchor="end">fmt</text>
-<rect x="138" y="27" width="25.8" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>fmt: 102.1x</title></rect>
-<text x="168.8" y="36" class="val">102.1x</text>
+<rect x="138" y="27" width="23.4" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>fmt: 102.1x</title></rect>
+<line x1="161.4" y1="35.0" x2="189.8" y2="35.0" stroke="var(--muted)" stroke-width="1" stroke-dasharray="2 2" opacity="0.6"/>
+<path d="M 189.8 31.0 L 193.8 35.0 L 189.8 39.0 L 185.8 35.0 Z" fill="var(--thresh)"><title>fmt z19+LDM ceiling: 124.3x</title></path>
+<text x="196.8" y="36" class="val" style="fill:var(--thresh)">124.3x</text>
 <text x="130" y="61" class="rowlab" text-anchor="end">spdlog</text>
-<rect x="138" y="52" width="47.1" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>spdlog: 116.8x</title></rect>
-<text x="190.1" y="61" class="val">116.8x</text>
+<rect x="138" y="52" width="42.8" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>spdlog: 116.8x</title></rect>
+<line x1="180.8" y1="60.0" x2="213.0" y2="60.0" stroke="var(--muted)" stroke-width="1" stroke-dasharray="2 2" opacity="0.6"/>
+<path d="M 213.0 56.0 L 217.0 60.0 L 213.0 64.0 L 209.0 60.0 Z" fill="var(--thresh)"><title>spdlog z19+LDM ceiling: 146.1x</title></path>
+<text x="220.0" y="61" class="val" style="fill:var(--thresh)">146.1x</text>
 <text x="130" y="86" class="rowlab" text-anchor="end">LevelDB</text>
-<rect x="138" y="77" width="84.8" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>LevelDB: 148.1x</title></rect>
-<text x="227.8" y="86" class="val">148.1x</text>
+<rect x="138" y="77" width="77.0" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>LevelDB: 148.1x</title></rect>
+<line x1="215.0" y1="85.0" x2="243.8" y2="85.0" stroke="var(--muted)" stroke-width="1" stroke-dasharray="2 2" opacity="0.6"/>
+<path d="M 243.8 81.0 L 247.8 85.0 L 243.8 89.0 L 239.8 85.0 Z" fill="var(--thresh)"><title>LevelDB z19+LDM ceiling: 180.9x</title></path>
+<text x="250.8" y="86" class="val" style="fill:var(--thresh)">180.9x</text>
 <text x="130" y="111" class="rowlab" text-anchor="end">re2</text>
-<rect x="138" y="102" width="85.0" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>re2: 148.3x</title></rect>
-<text x="228.0" y="111" class="val">148.3x</text>
+<rect x="138" y="102" width="77.2" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>re2: 148.3x</title></rect>
+<line x1="215.2" y1="110.0" x2="245.5" y2="110.0" stroke="var(--muted)" stroke-width="1" stroke-dasharray="2 2" opacity="0.6"/>
+<path d="M 245.5 106.0 L 249.5 110.0 L 245.5 114.0 L 241.5 110.0 Z" fill="var(--thresh)"><title>re2 z19+LDM ceiling: 183x</title></path>
+<text x="252.5" y="111" class="val" style="fill:var(--thresh)">183x</text>
 <text x="130" y="136" class="rowlab" text-anchor="end">DuckDB</text>
-<rect x="138" y="127" width="102.4" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>DuckDB: 165.5x</title></rect>
-<text x="245.4" y="136" class="val">165.5x</text>
+<rect x="138" y="127" width="93.0" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>DuckDB: 165.5x</title></rect>
+<line x1="231.0" y1="135.0" x2="267.4" y2="135.0" stroke="var(--muted)" stroke-width="1" stroke-dasharray="2 2" opacity="0.6"/>
+<path d="M 267.4 131.0 L 271.4 135.0 L 267.4 139.0 L 263.4 135.0 Z" fill="var(--thresh)"><title>DuckDB z19+LDM ceiling: 213.1x</title></path>
+<text x="274.4" y="136" class="val" style="fill:var(--thresh)">213.1x</text>
 <text x="130" y="161" class="rowlab" text-anchor="end">nlohmann-json</text>
-<rect x="138" y="152" width="139.3" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>nlohmann-json: 208.8x</title></rect>
-<text x="282.3" y="161" class="val">208.8x</text>
+<rect x="138" y="152" width="126.5" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>nlohmann-json: 208.8x</title></rect>
+<line x1="264.5" y1="160.0" x2="300.5" y2="160.0" stroke="var(--muted)" stroke-width="1" stroke-dasharray="2 2" opacity="0.6"/>
+<path d="M 300.5 156.0 L 304.5 160.0 L 300.5 164.0 L 296.5 160.0 Z" fill="var(--thresh)"><title>nlohmann-json z19+LDM ceiling: 268.2x</title></path>
+<text x="307.5" y="161" class="val" style="fill:var(--thresh)">268.2x</text>
 <text x="130" y="186" class="rowlab" text-anchor="end">simdjson</text>
-<rect x="138" y="177" width="178.5" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>simdjson: 267.3x</title></rect>
-<text x="321.5" y="186" class="val">267.3x</text>
+<rect x="138" y="177" width="162.1" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>simdjson: 267.3x</title></rect>
+<line x1="300.1" y1="185.0" x2="336.3" y2="185.0" stroke="var(--muted)" stroke-width="1" stroke-dasharray="2 2" opacity="0.6"/>
+<path d="M 336.3 181.0 L 340.3 185.0 L 336.3 189.0 L 332.3 185.0 Z" fill="var(--thresh)"><title>simdjson z19+LDM ceiling: 343.8x</title></path>
+<text x="343.3" y="186" class="val" style="fill:var(--thresh)">343.8x</text>
 <text x="130" y="211" class="rowlab" text-anchor="end">RocksDB</text>
-<rect x="138" y="202" width="187.9" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>RocksDB: 283.6x</title></rect>
-<text x="330.9" y="211" class="val">283.6x</text>
+<rect x="138" y="202" width="170.6" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>RocksDB: 283.6x</title></rect>
+<line x1="308.6" y1="210.0" x2="335.0" y2="210.0" stroke="var(--muted)" stroke-width="1" stroke-dasharray="2 2" opacity="0.6"/>
+<path d="M 335.0 206.0 L 339.0 210.0 L 335.0 214.0 L 331.0 210.0 Z" fill="var(--thresh)"><title>RocksDB z19+LDM ceiling: 340.7x</title></path>
+<text x="342.0" y="211" class="val" style="fill:var(--thresh)">340.7x</text>
 <text x="130" y="236" class="rowlab" text-anchor="end">LLVM</text>
-<rect x="138" y="227" width="208.3" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>LLVM: 322.5x</title></rect>
-<text x="351.3" y="236" class="val">322.5x</text>
+<rect x="138" y="227" width="189.1" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>LLVM: 322.5x</title></rect>
+<line x1="327.1" y1="235.0" x2="365.1" y2="235.0" stroke="var(--muted)" stroke-width="1" stroke-dasharray="2 2" opacity="0.6"/>
+<path d="M 365.1 231.0 L 369.1 235.0 L 365.1 239.0 L 361.1 235.0 Z" fill="var(--thresh)"><title>LLVM z19+LDM ceiling: 419.7x</title></path>
+<text x="372.1" y="236" class="val" style="fill:var(--thresh)">419.7x</text>
 <text x="130" y="261" class="rowlab" text-anchor="end">abseil+protobuf</text>
-<rect x="138" y="252" width="236.4" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>abseil+protobuf: 384.9x</title></rect>
-<text x="379.4" y="261" class="val">384.9x</text>
+<rect x="138" y="252" width="214.6" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>abseil+protobuf: 384.9x</title></rect>
+<line x1="352.6" y1="260.0" x2="381.3" y2="260.0" stroke="var(--muted)" stroke-width="1" stroke-dasharray="2 2" opacity="0.6"/>
+<path d="M 381.3 256.0 L 385.3 260.0 L 381.3 264.0 L 377.3 260.0 Z" fill="var(--thresh)"><title>abseil+protobuf z19+LDM ceiling: 469.8x</title></path>
+<text x="388.3" y="261" class="val" style="fill:var(--thresh)">469.8x</text>
 <text x="130" y="286" class="rowlab" text-anchor="end">cereal</text>
-<rect x="138" y="277" width="241.5" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>cereal: 397.6x</title></rect>
-<text x="384.5" y="286" class="val">397.6x</text>
+<rect x="138" y="277" width="219.3" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>cereal: 397.6x</title></rect>
+<line x1="357.3" y1="285.0" x2="393.1" y2="285.0" stroke="var(--muted)" stroke-width="1" stroke-dasharray="2 2" opacity="0.6"/>
+<path d="M 393.1 281.0 L 397.1 285.0 L 393.1 289.0 L 389.1 285.0 Z" fill="var(--thresh)"><title>cereal z19+LDM ceiling: 509.8x</title></path>
+<text x="400.1" y="286" class="val" style="fill:var(--thresh)">509.8x</text>
 <text x="130" y="311" class="rowlab" text-anchor="end">OpenCV</text>
-<rect x="138" y="302" width="269.9" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>OpenCV: 475.5x</title></rect>
-<text x="412.9" y="311" class="val">475.5x</text>
+<rect x="138" y="302" width="245.0" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>OpenCV: 475.5x</title></rect>
+<line x1="383.0" y1="310.0" x2="418.3" y2="310.0" stroke="var(--muted)" stroke-width="1" stroke-dasharray="2 2" opacity="0.6"/>
+<path d="M 418.3 306.0 L 422.3 310.0 L 418.3 314.0 L 414.3 310.0 Z" fill="var(--thresh)"><title>OpenCV z19+LDM ceiling: 607.4x</title></path>
+<text x="425.3" y="311" class="val" style="fill:var(--thresh)">607.4x</text>
 <text x="130" y="336" class="rowlab" text-anchor="end">range-v3</text>
-<rect x="138" y="327" width="286.9" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>range-v3: 529x</title></rect>
-<text x="429.9" y="336" class="val">529x</text>
+<rect x="138" y="327" width="260.4" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>range-v3: 529x</title></rect>
+<line x1="398.4" y1="335.0" x2="436.9" y2="335.0" stroke="var(--muted)" stroke-width="1" stroke-dasharray="2 2" opacity="0.6"/>
+<path d="M 436.9 331.0 L 440.9 335.0 L 436.9 339.0 L 432.9 335.0 Z" fill="var(--thresh)"><title>range-v3 z19+LDM ceiling: 690.9x</title></path>
+<text x="443.9" y="336" class="val" style="fill:var(--thresh)">690.9x</text>
 <text x="130" y="361" class="rowlab" text-anchor="end">Catch2</text>
-<rect x="138" y="352" width="342.3" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>Catch2: 750.4x</title></rect>
-<text x="485.3" y="361" class="val">750.4x</text>
+<rect x="138" y="352" width="310.8" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>Catch2: 750.4x</title></rect>
+<line x1="448.8" y1="360.0" x2="484.7" y2="360.0" stroke="var(--muted)" stroke-width="1" stroke-dasharray="2 2" opacity="0.6"/>
+<path d="M 484.7 356.0 L 488.7 360.0 L 484.7 364.0 L 480.7 360.0 Z" fill="var(--thresh)"><title>Catch2 z19+LDM ceiling: 963.1x</title></path>
+<text x="491.7" y="361" class="val" style="fill:var(--thresh)">963.1x</text>
 <text x="130" y="386" class="rowlab" text-anchor="end">Eigen</text>
-<rect x="138" y="377" width="508.0" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>Eigen: 2131.3x</title></rect>
-<text x="651.0" y="386" class="val">2131.3x</text>
+<rect x="138" y="377" width="461.2" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>Eigen: 2131.3x</title></rect>
+<line x1="599.2" y1="385.0" x2="638.4" y2="385.0" stroke="var(--muted)" stroke-width="1" stroke-dasharray="2 2" opacity="0.6"/>
+<path d="M 638.4 381.0 L 642.4 385.0 L 638.4 389.0 L 634.4 385.0 Z" fill="var(--thresh)"><title>Eigen z19+LDM ceiling: 2798.5x</title></path>
+<text x="645.4" y="386" class="val" style="fill:var(--thresh)">2798.5x</text>
+<rect x="138" y="404" width="16" height="8" rx="2" style="fill:var(--accent)"/><text x="160" y="411" class="dotlab">z&le;3 (production)</text>
+<path d="M 326 408 l 4 4 l -4 4 l -4 -4 Z" fill="var(--thresh)"/><text x="336" y="411" class="dotlab">z19+LDM ceiling (diagnostic)</text>
 </svg></div>
+<p class="lede">Honest reading of the codebase-limited set: no method we measured &mdash; z3..z19, LDM, front-code,
+skeleton-columnar, PPM/MTF, cross-project pretraining, trained dicts, source-conditioned COPY-programs &mdash; reaches
+a holistic 400&times; on them. But a compressed size is a description-length <i>upper bound</i>, not a theorem: cold-400&times;
+on the own-code-heavy codebases is an <b>open question</b> (a codebase-aware model could still get there &mdash; e.g. an
+untested program-transformation coder projects ~414&times; on DuckDB), <i>not</i> proven impossible.</p>
 
 <h2>3 &nbsp; S0 amortized (40 builds) &mdash; &ge;400x everywhere</h2>
 <p class="lede">Repeated-build basis: build 0 ships the dictionary cold; unchanged TUs in later builds are a 56-byte
 ROOT_REF. Every codebase clears 400&times; by 9&ndash;100&times; &mdash; this is where the win lives.</p>
 <div class="card"><svg viewBox="0 0 720 405" role="img" class="chart" preserveAspectRatio="xMidYMid meet">
-<line x1="364.6" y1="18" x2="364.6" y2="393" class="grid"/>
-<text x="364.6" y="12" class="axlab" text-anchor="middle">10000</text>
+<line x1="360.4" y1="18" x2="360.4" y2="399" class="grid"/>
+<text x="360.4" y="12" class="axlab" text-anchor="middle">10000</text>
 <text x="130" y="36" class="rowlab" text-anchor="end">fmt</text>
-<rect x="138" y="27" width="31.9" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>fmt: 3706x</title></rect>
-<text x="174.9" y="36" class="val">3706x</text>
+<rect x="138" y="27" width="31.3" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>fmt: 3706x</title></rect>
+<text x="174.3" y="36" class="val">3706x</text>
 <text x="130" y="61" class="rowlab" text-anchor="end">spdlog</text>
-<rect x="138" y="52" width="57.6" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>spdlog: 4225x</title></rect>
-<text x="200.6" y="61" class="val">4225x</text>
+<rect x="138" y="52" width="56.5" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>spdlog: 4225x</title></rect>
+<text x="199.5" y="61" class="val">4225x</text>
 <text x="130" y="86" class="rowlab" text-anchor="end">re2</text>
-<rect x="138" y="77" width="88.1" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>re2: 4937x</title></rect>
-<text x="231.1" y="86" class="val">4937x</text>
+<rect x="138" y="77" width="86.5" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>re2: 4937x</title></rect>
+<text x="229.5" y="86" class="val">4937x</text>
 <text x="130" y="111" class="rowlab" text-anchor="end">LevelDB</text>
-<rect x="138" y="102" width="90.4" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>LevelDB: 4995x</title></rect>
-<text x="233.4" y="111" class="val">4995x</text>
+<rect x="138" y="102" width="88.7" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>LevelDB: 4995x</title></rect>
+<text x="231.7" y="111" class="val">4995x</text>
 <text x="130" y="136" class="rowlab" text-anchor="end">DuckDB</text>
-<rect x="138" y="127" width="119.0" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>DuckDB: 5778x</title></rect>
-<text x="262.0" y="136" class="val">5778x</text>
+<rect x="138" y="127" width="116.8" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>DuckDB: 5778x</title></rect>
+<text x="259.8" y="136" class="val">5778x</text>
 <text x="130" y="161" class="rowlab" text-anchor="end">nlohmann-json</text>
-<rect x="138" y="152" width="141.1" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>nlohmann-json: 6469x</title></rect>
-<text x="284.1" y="161" class="val">6469x</text>
+<rect x="138" y="152" width="138.5" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>nlohmann-json: 6469x</title></rect>
+<text x="281.5" y="161" class="val">6469x</text>
 <text x="130" y="186" class="rowlab" text-anchor="end">simdjson</text>
-<rect x="138" y="177" width="191.9" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>simdjson: 8382x</title></rect>
-<text x="334.9" y="186" class="val">8382x</text>
+<rect x="138" y="177" width="188.4" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>simdjson: 8382x</title></rect>
+<text x="331.4" y="186" class="val">8382x</text>
 <text x="130" y="211" class="rowlab" text-anchor="end">RocksDB</text>
-<rect x="138" y="202" width="222.0" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>RocksDB: 9772x</title></rect>
-<text x="365.0" y="211" class="val">9772x</text>
+<rect x="138" y="202" width="217.9" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>RocksDB: 9772x</title></rect>
+<text x="360.9" y="211" class="val">9772x</text>
 <text x="130" y="236" class="rowlab" text-anchor="end">LLVM</text>
-<rect x="138" y="227" width="224.8" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>LLVM: 9910x</title></rect>
-<text x="367.8" y="236" class="val">9910x</text>
+<rect x="138" y="227" width="220.6" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>LLVM: 9910x</title></rect>
+<text x="363.6" y="236" class="val">9910x</text>
 <text x="130" y="261" class="rowlab" text-anchor="end">abseil+protobuf</text>
-<rect x="138" y="252" width="264.1" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>abseil+protobuf: 12110x</title></rect>
-<text x="407.1" y="261" class="val">12110x</text>
+<rect x="138" y="252" width="259.2" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>abseil+protobuf: 12110x</title></rect>
+<text x="402.2" y="261" class="val">12110x</text>
 <text x="130" y="286" class="rowlab" text-anchor="end">OpenCV</text>
-<rect x="138" y="277" width="280.1" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>OpenCV: 13137x</title></rect>
-<text x="423.1" y="286" class="val">13137x</text>
+<rect x="138" y="277" width="274.9" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>OpenCV: 13137x</title></rect>
+<text x="417.9" y="286" class="val">13137x</text>
 <text x="130" y="311" class="rowlab" text-anchor="end">cereal</text>
-<rect x="138" y="302" width="285.4" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>cereal: 13499x</title></rect>
-<text x="428.4" y="311" class="val">13499x</text>
+<rect x="138" y="302" width="280.1" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>cereal: 13499x</title></rect>
+<text x="423.1" y="311" class="val">13499x</text>
 <text x="130" y="336" class="rowlab" text-anchor="end">range-v3</text>
-<rect x="138" y="327" width="285.8" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>range-v3: 13525x</title></rect>
-<text x="428.8" y="336" class="val">13525x</text>
+<rect x="138" y="327" width="280.5" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>range-v3: 13525x</title></rect>
+<text x="423.5" y="336" class="val">13525x</text>
 <text x="130" y="361" class="rowlab" text-anchor="end">Catch2</text>
-<rect x="138" y="352" width="313.1" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>Catch2: 15548x</title></rect>
-<text x="456.1" y="361" class="val">15548x</text>
+<rect x="138" y="352" width="307.3" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>Catch2: 15548x</title></rect>
+<text x="450.3" y="361" class="val">15548x</text>
 <text x="130" y="386" class="rowlab" text-anchor="end">Eigen</text>
-<rect x="138" y="377" width="503.8" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>Eigen: 41102x</title></rect>
-<text x="646.8" y="386" class="val">41102x</text>
+<rect x="138" y="377" width="494.5" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>Eigen: 41102x</title></rect>
+<text x="637.5" y="386" class="val">41102x</text>
 </svg></div>
 
 <h2>4 &nbsp; Source-conditioning: the lift equals the toolchain fraction</h2>
@@ -339,7 +381,7 @@ headers). Curves flatten by k&asymp;3&ndash;9: cross-project transfer is real bu
 <h2>Methodology &amp; reproducibility</h2>
 <p class="lede">Codec metrics from <code>codec50.cpp</code>, byte-exact (F reconstructs each TU == the original .ii;
 whole-source digest); z&le;3; no corpus-name branches; no free dictionaries. Attribution + coverage from defcodec's
-<code>loo-attribution.tsv</code> / <code>loo-learning-curve.tsv</code>. Branch <code>implementer/issue16-superblock</code> @ <code>72b3996</code>.</p>
+<code>loo-attribution.tsv</code> / <code>loo-learning-curve.tsv</code>. Branch <code>implementer/issue16-superblock</code> @ <code>ed18c0f</code>.</p>
 <div class="card"><table>
 <thead><tr><th>metric</th><th>command</th></tr></thead><tbody>
 <tr><td class="nm">holistic cold</td><td style="text-align:left"><code>codec50 --manifest C/manifest.txt --stream</code></td></tr>

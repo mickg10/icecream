@@ -63,7 +63,7 @@ def main():
     for r in rows:
         nm=r["name"]; at=attr.get(nm,{})
         D.append(dict(name=nm,tus=num(r.get("TUs")),raw=num(r.get("raw_MiB")),
-            cold=num(r.get("cold_finalratio")),s0=num(r.get("s0_amortized_40")),tput=num(r.get("tput_n1_gbs")),
+            cold=num(r.get("cold_finalratio")),z19=num(r.get("cold_z19ldm")),s0=num(r.get("s0_amortized_40")),tput=num(r.get("tput_n1_gbs")),
             kind=at.get("kind"),own=at.get("own"),srccond=at.get("srccond"),dict_ratio=at.get("dict_ratio"),
             cov=at.get("cov"),dict_mib=at.get("dict_mib")))
 
@@ -77,24 +77,35 @@ def main():
     sc_under=sum(1 for d in D if d["srccond"] and d["srccond"]<400)
 
     # ---------- inline SVG helpers ----------
-    def logbar(items,key,unit,ref=None,refttl="",accent="--accent"):
+    def logbar(items,key,unit,ref=None,refttl="",accent="--accent",ceilkey=None):
         items=sorted([d for d in items if d[key] is not None],key=lambda d:d[key])
-        vmax=max(d[key] for d in items); vmin=min(d[key] for d in items)
-        lo=math.log10(max(vmin*0.85,1)); hi=math.log10(vmax*1.12)
-        W=720;L=138;R=56;rowh=25;H=len(items)*rowh+30
+        allv=[d[key] for d in items]+([d[ceilkey] for d in items if ceilkey and d.get(ceilkey)] )
+        vmax=max(allv); vmin=min(d[key] for d in items)
+        lo=math.log10(max(vmin*0.85,1)); hi=math.log10(vmax*1.13)
+        W=720;L=138;R=64;rowh=25;H=len(items)*rowh+(46 if ceilkey else 30)
         X=lambda v:L+(math.log10(v)-lo)/(hi-lo)*(W-L-R)
         s=[f'<svg viewBox="0 0 {W} {H}" role="img" class="chart" preserveAspectRatio="xMidYMid meet">']
         for e in range(int(math.ceil(lo)),int(math.floor(hi))+1):
-            gx=X(10**e); s.append(f'<line x1="{gx:.1f}" y1="18" x2="{gx:.1f}" y2="{H-12}" class="grid"/>')
+            gx=X(10**e); s.append(f'<line x1="{gx:.1f}" y1="18" x2="{gx:.1f}" y2="{len(items)*rowh+24}" class="grid"/>')
             s.append(f'<text x="{gx:.1f}" y="12" class="axlab" text-anchor="middle">{10**e:g}</text>')
         if ref and lo<math.log10(ref)<hi:
-            rx=X(ref); s.append(f'<line x1="{rx:.1f}" y1="18" x2="{rx:.1f}" y2="{H-12}" class="refline"/>')
-            s.append(f'<text x="{rx:.1f}" y="{H-2}" class="reflab" text-anchor="middle">{refttl}</text>')
+            rx=X(ref); s.append(f'<line x1="{rx:.1f}" y1="18" x2="{rx:.1f}" y2="{len(items)*rowh+24}" class="refline"/>')
+            s.append(f'<text x="{rx:.1f}" y="14" class="reflab" text-anchor="middle">{refttl}</text>')
         for i,d in enumerate(items):
-            y=24+i*rowh; bx=X(d[key])
+            y=24+i*rowh; bx=X(d[key]); yc=y+(rowh-3)/2
             s.append(f'<text x="{L-8}" y="{y+12}" class="rowlab" text-anchor="end">{html.escape(d["name"])}</text>')
             s.append(f'<rect x="{L}" y="{y+3}" width="{max(bx-L,1):.1f}" height="{rowh-9}" rx="3" class="bar" style="fill:var({accent})"><title>{html.escape(d["name"])}: {d[key]:g}{unit}</title></rect>')
-            s.append(f'<text x="{bx+5:.1f}" y="{y+12}" class="val">{d[key]:g}{unit}</text>')
+            if ceilkey and d.get(ceilkey):
+                cx=X(d[ceilkey])
+                s.append(f'<line x1="{bx:.1f}" y1="{yc:.1f}" x2="{cx:.1f}" y2="{yc:.1f}" stroke="var(--muted)" stroke-width="1" stroke-dasharray="2 2" opacity="0.6"/>')
+                s.append(f'<path d="M {cx:.1f} {yc-4:.1f} L {cx+4:.1f} {yc:.1f} L {cx:.1f} {yc+4:.1f} L {cx-4:.1f} {yc:.1f} Z" fill="var(--thresh)"><title>{html.escape(d["name"])} z19+LDM ceiling: {d[ceilkey]:g}{unit}</title></path>')
+                s.append(f'<text x="{cx+7:.1f}" y="{y+12}" class="val" style="fill:var(--thresh)">{d[ceilkey]:g}{unit}</text>')
+            else:
+                s.append(f'<text x="{bx+5:.1f}" y="{y+12}" class="val">{d[key]:g}{unit}</text>')
+        if ceilkey:
+            ly=len(items)*rowh+38
+            s.append(f'<rect x="{L}" y="{ly-9}" width="16" height="8" rx="2" style="fill:var({accent})"/><text x="{L+22}" y="{ly-2}" class="dotlab">z&le;3 (production)</text>')
+            s.append(f'<path d="M {L+188} {ly-5} l 4 4 l -4 4 l -4 -4 Z" fill="var(--thresh)"/><text x="{L+198}" y="{ly-2}" class="dotlab">z19+LDM ceiling (diagnostic)</text>')
         s.append('</svg>'); return "\n".join(s)
 
     def dumbbell():
@@ -152,8 +163,10 @@ def main():
         tcls=' class="warn"' if (d["tput"] and d["tput"]<1.0) else ''
         s0cls=' class="good"' if (d["s0"] and d["s0"]>=400) else ''
         sccls=' class="good"' if (d["srccond"] and d["srccond"]>=400) else (' class="warn"' if d["srccond"] else '')
+        z19cls=' class="warn"' if (d["z19"] and d["z19"]<400) else ''
         return (f'<tr><td class="nm">{html.escape(d["name"])}</td><td>{c(d["kind"] or "-","{}")}</td>'
                 f'<td>{c(d["tus"],"{:.0f}")}</td><td>{c(d["cold"],"{:.0f}")}x</td>'
+                f'<td{z19cls} style="color:var(--thresh)">{c(d["z19"],"{:.0f}")}x</td>'
                 f'<td>{c(d["own"],"{:.2f}")}</td><td{sccls}>{c(d["srccond"],"{:.0f}")}x</td>'
                 f'<td{s0cls}>{c(d["s0"],"{:.0f}")}x</td><td{tcls}>{c(d["tput"],"{:.2f}")}</td></tr>')
 
@@ -207,7 +220,8 @@ code{{background:var(--grid);padding:1px 5px;border-radius:4px;font-size:12.5px}
 </div>
 
 <p class="lede">Four findings, consistent across every codebase and cross-checked by the definition-plane probes.
-<b>(1)</b> Holistic cold-strict compressibility is an entropy floor set by the codebase (102&ndash;2131&times;).
+<b>(1)</b> Holistic cold-strict compressibility (102&ndash;2131&times;) is set by the codebase, not its size &mdash; and for the
+own-code-heavy set no measured method reaches 400&times; (a measured upper bound + open question, not a proof).
 <b>(2)</b> The <b>S0 semantic-Root memo</b> makes the repeated-build basis (the production reality: a persistent
 per-daemon dictionary) clear 400&times; on <i>every</i> codebase, {s0_min:.0f}&ndash;{s0_max:.0f}&times;.
 <b>(3)</b> Throughput is airtight: a real two-process socketpair sustains &ge;1&nbsp;GB/s single-stream, byte-exact.
@@ -221,7 +235,7 @@ Cold-400&times; on a single build is a property of how much unique code a codeba
 (toolchain-free). own = project-ship fraction of the dictionary. S0 = 40-build amortized. tput = single-stream
 C-live socketpair. Sorted by holistic cold.</p>
 <div class="card"><table>
-<thead><tr><th>codebase</th><th>kind</th><th>TUs</th><th>cold</th><th>own-src</th><th>srccond</th><th>S0</th><th>tput</th></tr></thead>
+<thead><tr><th>codebase</th><th>kind</th><th>TUs</th><th>cold z&le;3</th><th>z19+LDM</th><th>own-src</th><th>srccond</th><th>S0</th><th>tput</th></tr></thead>
 <tbody>
 {table}
 </tbody></table></div>
@@ -229,11 +243,20 @@ C-live socketpair. Sorted by holistic cold.</p>
 sub-second wall (small-workload artifact, not a codec limit; min {tbmin:.2f}&nbsp;GB/s over the &ge;800&nbsp;MiB set).
 <span style="color:var(--warn)">amber srccond</span> = the one corpus (DuckDB) under 400&times;.</p>
 
-<h2>2 &nbsp; Holistic cold FinalRatio &mdash; a codebase entropy floor</h2>
-<p class="lede">Log scale. Same-scale codebases differ &gt;10&times; (Eigen vs DuckDB, both ~650 TUs): the spread is the
-codebase, not the corpus size. No method (LZ z3..z19, LDM, front-code, skeleton-columnar, PPM/MTF, cross-project
-pretraining, trained zstd dict, source-conditioned COPY-programs) lifts the capped ones to a holistic 400&times;.</p>
-<div class="card">{logbar(hc,"cold","x",ref=400,refttl="400x")}</div>
+<h2>2 &nbsp; Holistic cold FinalRatio &mdash; the z&le;3 production number and its z19+LDM ceiling</h2>
+<p class="lede">Log scale. Bars are the production number (z&le;3, the owner's hard cap); the <span style="color:var(--thresh)">&#9670;
+diamonds</span> are a diagnostic ceiling that <i>violates</i> the cap &mdash; the whole codec re-compressed at z19 +
+long-distance-matching + 27-bit window (same six wire categories, batched, region leg min(delta,raw)). The gap is the
+headroom the z&le;3 cap leaves, and it splits the 15 codebases three ways against 400&times;: <b>ships at z3</b> (Eigen,
+Catch2, range-v3, OpenCV &mdash; already &ge;400&times; under the cap); <b>cap-limited</b> (cereal, abseil, LLVM &mdash;
+z3&lt;400 but the ceiling clears it, so the cap is what holds them under, not the codebase); and <b>codebase-limited</b>
+(the other 8 &mdash; still &lt;400&times; even at the z19+LDM ceiling, DuckDB 213&times; the hardest).</p>
+<div class="card">{logbar(hc,"cold","x",ref=400,refttl="400x",ceilkey="z19")}</div>
+<p class="lede">Honest reading of the codebase-limited set: no method we measured &mdash; z3..z19, LDM, front-code,
+skeleton-columnar, PPM/MTF, cross-project pretraining, trained dicts, source-conditioned COPY-programs &mdash; reaches
+a holistic 400&times; on them. But a compressed size is a description-length <i>upper bound</i>, not a theorem: cold-400&times;
+on the own-code-heavy codebases is an <b>open question</b> (a codebase-aware model could still get there &mdash; e.g. an
+untested program-transformation coder projects ~414&times; on DuckDB), <i>not</i> proven impossible.</p>
 
 <h2>3 &nbsp; S0 amortized (40 builds) &mdash; &ge;400x everywhere</h2>
 <p class="lede">Repeated-build basis: build 0 ships the dictionary cold; unchanged TUs in later builds are a 56-byte
