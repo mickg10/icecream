@@ -545,7 +545,9 @@ int main(int argc,char**argv){
       // FULL streamed floor: batch-compress EVERY category (what a persistent shared-window streaming
       // codec reaches by capturing cross-message redundancy) — the real z3 ceiling for this structure.
       auto batch=[&](std::vector<uint8_t>&v){ return v.empty()?0.0:zstd_size(z2,v.data(),v.size(),zlevel,d2b); };
-      double fl_line=bl, fl_root=br, fl_reg=batch(allRegions), fl_blk=batch(allBlocks), fl_path=batch(allPaths), fl_miss=batch(allMiss);
+      // region leg = min(delta, raw) so the batched floor + z19 ceiling use the true best-case region
+      // serialization (matches the adaptive per-message wire; RocksDB/OpenCV pick raw, LLVM/DuckDB delta).
+      double fl_line=bl, fl_root=br, fl_reg=std::min(batch(allRegions),batch(allRegionsRaw)), fl_blk=batch(allBlocks), fl_path=batch(allPaths), fl_miss=batch(allMiss);
       // z19+LDM twin of the SAME six batched categories -- a CEILING DIAGNOSTIC only (owner's rule is z<=3;
       // this shows the headroom the cap leaves). ADDITIVE: the z3 numbers above are untouched. --deep-gated
       // so --stream/--socket/--s0 runs pay no z19 cost.
@@ -554,7 +556,7 @@ int main(int argc,char**argv){
           ZSTD_CCtx_reset(z2,ZSTD_reset_session_and_parameters); ZSTD_CCtx_setParameter(z2,ZSTD_c_compressionLevel,19);
           ZSTD_CCtx_setParameter(z2,ZSTD_c_enableLongDistanceMatching,1); ZSTD_CCtx_setParameter(z2,ZSTD_c_windowLog,27);
           size_t bnd=ZSTD_compressBound(v.size()); if(d2b.size()<bnd)d2b.resize(bnd); return double(ZSTD_compress2(z2,d2b.data(),d2b.size(),v.data(),v.size())); };
-        f19_line=batch19(allLineDefs); f19_root=batch19(allRoots); f19_reg=batch19(allRegions); f19_blk=batch19(allBlocks); f19_path=batch19(allPaths); f19_miss=batch19(allMiss);
+        f19_line=batch19(allLineDefs); f19_root=batch19(allRoots); f19_reg=std::min(batch19(allRegions),batch19(allRegionsRaw)); f19_blk=batch19(allBlocks); f19_path=batch19(allPaths); f19_miss=batch19(allMiss);
         full19=f19_line+f19_root+f19_reg+f19_blk+f19_path+f19_miss+w_framing; }
       ZSTD_freeCCtx(z2);
       double fullfloor=fl_line+fl_root+fl_reg+fl_blk+fl_path+fl_miss+w_framing;
