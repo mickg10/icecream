@@ -662,6 +662,21 @@ gate rather than spending four complete-holdout runs on a candidate with no sele
 portable vocabulary must use coarser statement, multi-Line, or source-token blocks; the empty-start
 local learner must use the same units so the bootstrap and online curves are directly comparable.
 
+`--param-coarse-lines` adds the cheapest larger-unit control without changing the default: 64- and
+128-atom windows plus one whole-Line normalized rule for nonstandard widths. The common 14-project
+scan then considered 16,633,882 windows and 1,011,760 shapes, selected 779 rules, and emitted a
+4,292-byte frame. Training took 59.22 seconds wall and 2,020,056 KiB peak RSS. On zstd-3:
+
+| holdout | P9 | charged coarse P14/P16 | candidate raw vs literal | frame wins |
+|---|---:|---:|---:|---:|
+| DuckDB, first 20 | 964,895 | 969,211 | 0.470 vs 0.399 MiB | 0/20 |
+| LLVM, first 20 | 939,453 | 943,769 | 0.532 vs 0.443 MiB | 0/20 |
+
+The larger spans save only about 1 KiB of candidate stream and still select no frame. Whole-Line
+normalization is therefore also too fine-grained. The flag remains as a rerunnable negative control;
+the unflagged trainer was regression-checked to reproduce the prior smoke artifact byte-for-byte
+(`b18c8136...`). The next row must cross Line boundaries or learn source-level statement blocks.
+
 ## Reproduction and retained artifacts
 
 Environment for the authoritative local run:
@@ -765,6 +780,10 @@ Primary logs:
 /tmp/ptgc-param-io-sanitize.log
 /tmp/ptgc-14src-min2-16k-train.log
 /tmp/ptgc-14src-{duckdb,llvm}-z{1,3}-20tu.log
+/tmp/ptgc-14src-coarse-min2-16k-train.log
+/tmp/ptgc-14src-coarse-{duckdb,llvm}-z3-20tu.log
+/tmp/ptgc-param-default-regression.log
+/tmp/ptgc-coarse-load-smoke.log
 /tmp/codec50-current-baseline.log
 /tmp/codec50-pretrain-duckdb-independent.log
 ```
@@ -803,4 +822,10 @@ e3865367f9a2fe68dad00345303288c3872df07c80891f7e5d26238eba501fb8  /tmp/ptgc-para
 89ddff291da93d6ad45e7d7374e44f0a49c960c3e2512c6ce66d75a86dac6635  /tmp/ptgc-14src-duckdb-z3-20tu.log
 9e525cedceacd35d52a60f50838ac44ff0f2b473d2a0ccd5d960dac72c3b063f  /tmp/ptgc-14src-llvm-z1-20tu.log
 ae164d8e07ed79022624f4bff834e6c6e01b87f33b2741f24f799a0b9505d7df  /tmp/ptgc-14src-llvm-z3-20tu.log
+b4e31c8d070a63f46a8ef5d67f371cd573bb1eeb76530b14905393a7468962bf  /tmp/ptgc-14src-coarse-min2-16k.frame
+86017d03ba41f3edd5f7abd10bd1b39c24f5671bfda5b41cbf534a031a627187  /tmp/ptgc-14src-coarse-min2-16k-train.log
+88afbc89a9ed7617cd9e78a841b8e601e0dc0325f41ec6558379470e8cfd367c  /tmp/ptgc-14src-coarse-duckdb-z3-20tu.log
+4331f011df90c278cb1dc983f40f7422e3030412377a4adaa0694efbd82a04ea  /tmp/ptgc-14src-coarse-llvm-z3-20tu.log
+130fb08edaecca56294f4abd72f03dabb1bf57fb2adc581a3b6068aef041c06d  /tmp/ptgc-param-default-regression.log
+a1a71d373d530f9562df32217b2d0804cbd9be1eb942aa86f0858db52d7aaf9c  /tmp/ptgc-coarse-load-smoke.log
 ```

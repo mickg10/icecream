@@ -2012,6 +2012,7 @@ struct ParamSpanStats {
 };
 
 static constexpr std::array<unsigned,4>kParamSpanWidths={4,8,16,32};
+static constexpr std::array<unsigned,6>kPretrainedParamSpanWidths={4,8,16,32,64,128};
 
 static void observe_param_span_windows(const uint8_t*p,uint32_t n,
                                        std::unordered_map<std::string,ParamSpanCandidate>&candidates){
@@ -2157,6 +2158,8 @@ static PretrainedParamPackage load_pretrained_param_package(const std::string&pa
 
 class PretrainedParamBuilder {
 public:
+    explicit PretrainedParamBuilder(bool coarse_lines=false):coarse_lines_(coarse_lines){}
+
     void scan_manifest(const std::string&manifest,size_t max_files,size_t corpus_index){
         if(corpus_index>=64)die_msg("at most 64 parameterized training corpora are supported");
         LineStore distinct;FILE*mf=std::fopen(manifest.c_str(),"r");if(!mf)die(manifest.c_str());
@@ -2237,20 +2240,25 @@ private:
                 // on file or repository order.  High-frequency generic shapes remain observable.
                 if(((hash_bytes(p,len)>>1)&31u)==0&&len<=4096){++sampled_lines_;
                     const std::vector<Atom>atoms=atomize(p,len);
-                    if(atoms.size()<=256){for(size_t begin=0;begin<atoms.size();++begin){
-                        for(unsigned width:kParamSpanWidths){if(begin+width>atoms.size())continue;
+                    if(atoms.size()<=256){auto observe=[&](size_t begin,size_t width){
                             const uint32_t off=atoms[begin].off;
                             const uint32_t finish=atoms[begin+width-1].off+atoms[begin+width-1].len;
                             const uint32_t span_len=finish-off;ParsedLine parsed=parse_line(p+off,span_len);
-                            if(parsed.values.empty()||parsed.values.size()>32||parsed.occurrence_slot.size()>64||parsed.key.size()>2048)continue;
+                            if(parsed.values.empty()||parsed.values.size()>32||parsed.occurrence_slot.size()>64||parsed.key.size()>2048)return;
                             ++candidate_windows_;size_t instance=1;
                             for(const auto&value:parsed.values)instance+=varint_size(value.size())+value.size();
                             auto inserted=candidates_.try_emplace(parsed.key);PretrainedParamCandidate&candidate=inserted.first->second;
                             if(inserted.second)candidate.shape=std::move(parsed);
                             ++candidate.count;candidate.literal_bytes+=span_len;candidate.instance_bytes+=instance;
                             candidate.corpus_mask|=uint64_t(1)<<corpus_index;
-                        }
-                    }}
+                        };
+                        if(coarse_lines_){
+                            for(size_t begin=0;begin<atoms.size();++begin)for(unsigned width:kPretrainedParamSpanWidths)
+                                if(begin+width<=atoms.size())observe(begin,width);
+                            if(atoms.size()>=4&&std::find(kPretrainedParamSpanWidths.begin(),kPretrainedParamSpanWidths.end(),unsigned(atoms.size()))==kPretrainedParamSpanWidths.end())
+                                observe(0,atoms.size());
+                        }else for(size_t begin=0;begin<atoms.size();++begin)for(unsigned width:kParamSpanWidths)
+                            if(begin+width<=atoms.size())observe(begin,width);}
                 }
             }
             p=line_end;
@@ -2258,6 +2266,7 @@ private:
     }
     std::unordered_map<std::string,PretrainedParamCandidate>candidates_;
     uint64_t training_raw_=0,training_lines_=0,training_distinct_lines_=0,sampled_lines_=0,candidate_windows_=0;
+    bool coarse_lines_=false;
 };
 
 static TokenSpanRaw encode_frozen_param_span_pack(const std::vector<uint32_t>&ids,const LineStore&store,
@@ -2271,12 +2280,13 @@ static TokenSpanRaw encode_frozen_param_span_pack(const std::vector<uint32_t>&id
         for(size_t begin=0;begin<count;++begin){if(cost[begin]==SIZE_MAX)continue;
             const size_t raw_cost=cost[begin]+varint_size(uint64_t(atoms[begin].len)<<1)+atoms[begin].len;
             if(raw_cost<cost[begin+1]){cost[begin+1]=raw_cost;previous[begin+1]=uint32_t(begin);edge_rule[begin+1]=UINT32_MAX;}
-            for(unsigned width:kParamSpanWidths){if(begin+width>count)continue;const uint32_t off=atoms[begin].off;
-                const uint32_t finish=atoms[begin+width-1].off+atoms[begin+width-1].len;ParsedLine parsed=parse_line(p+off,finish-off);
-                auto found=model.rule_id.find(parsed.key);if(found==model.rule_id.end())continue;size_t edge=varint_size((uint64_t(found->second)<<1)|1);
+            auto consider=[&](size_t next){const uint32_t off=atoms[begin].off;
+                const uint32_t finish=atoms[next-1].off+atoms[next-1].len;ParsedLine parsed=parse_line(p+off,finish-off);
+                auto found=model.rule_id.find(parsed.key);if(found==model.rule_id.end())return;size_t edge=varint_size((uint64_t(found->second)<<1)|1);
                 for(const auto&value:parsed.values)edge+=varint_size(value.size())+value.size();
-                const size_t next=begin+width;
-                if(cost[begin]+edge<cost[next]){cost[next]=cost[begin]+edge;previous[next]=uint32_t(begin);edge_rule[next]=found->second;}}
+                if(cost[begin]+edge<cost[next]){cost[next]=cost[begin]+edge;previous[next]=uint32_t(begin);edge_rule[next]=found->second;}};
+            for(unsigned width:kPretrainedParamSpanWidths)if(begin+width<=count)consider(begin+width);
+            if(begin==0&&count>=4&&std::find(kPretrainedParamSpanWidths.begin(),kPretrainedParamSpanWidths.end(),unsigned(count))==kPretrainedParamSpanWidths.end())consider(count);
         }
         struct Choice{uint32_t begin=0,end=0,rule=UINT32_MAX;};std::vector<Choice>choices;
         for(uint32_t finish=uint32_t(count);finish;){const uint32_t begin=previous[finish];choices.push_back({begin,finish,edge_rule[finish]});finish=begin;}
@@ -2578,6 +2588,7 @@ int main(int argc, char** argv) {
     unsigned model_min_corpora = 1;
     unsigned source_program_k = 4;
     bool pretrain_all_identifiers = false;
+    bool param_coarse_lines = false;
     std::vector<std::string> pretrain_manifests;
     std::vector<std::string> param_pretrain_source_roots;
     std::string semantic_export_prefix;
@@ -2599,6 +2610,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--model-min-corpora") && i + 1 < argc) model_min_corpora = unsigned(std::strtoul(argv[++i], nullptr, 10));
         else if (!std::strcmp(argv[i], "--source-k") && i + 1 < argc) source_program_k = unsigned(std::strtoul(argv[++i], nullptr, 10));
         else if (!std::strcmp(argv[i], "--pretrain-all-identifiers")) pretrain_all_identifiers = true;
+        else if (!std::strcmp(argv[i], "--param-coarse-lines")) param_coarse_lines = true;
         else if (!std::strcmp(argv[i], "--semantic-export-prefix") && i + 1 < argc) semantic_export_prefix = argv[++i];
         else if (!std::strcmp(argv[i], "--semantic-export-only")) semantic_export_only = true;
         else if (!std::strcmp(argv[i], "--source-dict") && i + 1 < argc) source_dictionary_path = argv[++i];
@@ -2614,10 +2626,10 @@ int main(int argc, char** argv) {
     const bool param_training_available=!pretrain_manifests.empty()||!param_pretrain_source_roots.empty();
     if (!manifest || zlevel < 0 || zlevel > 3 || source_program_k > 32 || (model_kib&&pretrain_manifests.empty()) ||
         (build_param_model&&!param_training_available) || (build_param_model&&load_param_model) ||
-        (!param_model_out_path.empty()&&!build_param_model) || (load_param_model&&!param_pretrain_source_roots.empty()) ||
+        (!param_model_out_path.empty()&&!build_param_model) || (param_coarse_lines&&!build_param_model) || (load_param_model&&!param_pretrain_source_roots.empty()) ||
         (!model_kib&&!build_param_model&&!pretrain_manifests.empty()) || (!use_param_pretrained&&!param_pretrain_source_roots.empty()) ||
         (semantic_export_only&&semantic_export_prefix.empty())) {
-        std::fprintf(stderr, "usage: %s --manifest FILE [--max-files N] [--z 0..3] [--source-k 0..32] [--source-dict FILE] [--semantic-export-prefix PATH [--semantic-export-only]] [--pretrain-manifest FILE ... --model-kib N] [--param-model-kib N --param-pretrain-source-root DIR ... --param-model-out FILE] [--param-model-in FILE] [--pretrain-max-files N] [--model-min-corpora N] [--pretrain-all-identifiers]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s --manifest FILE [--max-files N] [--z 0..3] [--source-k 0..32] [--source-dict FILE] [--semantic-export-prefix PATH [--semantic-export-only]] [--pretrain-manifest FILE ... --model-kib N] [--param-model-kib N --param-pretrain-source-root DIR ... --param-model-out FILE [--param-coarse-lines]] [--param-model-in FILE] [--pretrain-max-files N] [--model-min-corpora N] [--pretrain-all-identifiers]\n", argv[0]);
         return 2;
     }
     for(const std::string&training:pretrain_manifests)if(training==manifest)die_msg("pretraining and target manifests must be disjoint");
@@ -2629,7 +2641,7 @@ int main(int argc, char** argv) {
     FrameCodec pretrained_package_codec;const std::vector<uint8_t>pretrained_receiver_raw=use_pretrained?pretrained_package_codec.decompress(pretrained.frame):std::vector<uint8_t>{};if(pretrained_receiver_raw!=pretrained.raw)die_msg("pretrained receiver package mismatch");
     PretrainedParamPackage pretrained_param;
     if(load_param_model)pretrained_param=load_pretrained_param_package(param_model_in_path);
-    else if(build_param_model){const auto training_begin=Clock::now();PretrainedParamBuilder builder;
+    else if(build_param_model){const auto training_begin=Clock::now();PretrainedParamBuilder builder(param_coarse_lines);
         for(size_t i=0;i<pretrain_manifests.size();++i)builder.scan_manifest(pretrain_manifests[i],pretrain_max_files,i);
         for(size_t i=0;i<param_pretrain_source_roots.size();++i)builder.scan_source_root(param_pretrain_source_roots[i],pretrain_max_files,pretrain_manifests.size()+i);
         const double training_seconds=elapsed(training_begin);
@@ -3284,7 +3296,7 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long long>(param_span_stats.program_records),static_cast<unsigned long long>(param_span_stats.literal_records),param_span_stats.covered_bytes/1048576.0,param_span_stats.residual_bytes/1048576.0,param_span_stats.target_bytes/1048576.0,static_cast<unsigned long long>(param_span_stats.program_ops),
                 static_cast<unsigned long long>(param_span_frame_wins),static_cast<unsigned long long>(param_span_combined_wins),static_cast<unsigned long long>(param_span_columnar_wins),param_span_literal_wire/1048576.0,param_span_candidate_wire/1048576.0,param_span_selected_wire/1048576.0);
     if(use_param_pretrained)std::printf("P14 pretrained parameterized sub-superblocks input=%s training=%.2f GiB/%llu lines/%llu distinct sampled=%llu windows=%llu candidate-shapes=%llu in %.2fs selected-rules=%zu package raw/wire=%.1f/%.1f KiB model-id=%016llx; TU rule-sets=%llu instances/unique=%llu/%llu program/literal-records=%llu/%llu covered/residual/target=%.2f/%.2f/%.2f MiB ops=%llu lexicon entries/refs=%llu/%llu frame-wins=%llu combined/columnar-candidates=%llu/%llu raw-channel literal/candidate/selected=%.3f/%.3f/%.3f MiB model-dictionary wins=%llu saved-before-charge=%.1f KiB\n",
-                load_param_model?"loaded-package":(param_pretrain_source_roots.empty()?"expanded-ii":(pretrain_manifests.empty()?"raw-source":"mixed")),pretrained_param.training_raw/1073741824.0,static_cast<unsigned long long>(pretrained_param.training_lines),static_cast<unsigned long long>(pretrained_param.training_distinct_lines),static_cast<unsigned long long>(pretrained_param.sampled_lines),
+                load_param_model?"loaded-package":(param_coarse_lines?"coarse-lines":(param_pretrain_source_roots.empty()?"expanded-ii":(pretrain_manifests.empty()?"raw-source":"mixed"))),pretrained_param.training_raw/1073741824.0,static_cast<unsigned long long>(pretrained_param.training_lines),static_cast<unsigned long long>(pretrained_param.training_distinct_lines),static_cast<unsigned long long>(pretrained_param.sampled_lines),
                 static_cast<unsigned long long>(pretrained_param.candidate_windows),static_cast<unsigned long long>(pretrained_param.candidate_rules),pretrained_param.training_seconds,pretrained_param.encoder_rules.size(),pretrained_param.raw.size()/1024.0,(pretrained_param.frame.size()+4)/1024.0,
                 static_cast<unsigned long long>(hash_bytes(pretrained_param.raw.data(),uint32_t(pretrained_param.raw.size()))),
                 static_cast<unsigned long long>(pretrained_param_stats.used_rules),static_cast<unsigned long long>(pretrained_param_stats.rule_instances),static_cast<unsigned long long>(pretrained_param_stats.unique_instances),static_cast<unsigned long long>(pretrained_param_stats.program_records),static_cast<unsigned long long>(pretrained_param_stats.literal_records),
