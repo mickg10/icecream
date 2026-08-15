@@ -545,9 +545,9 @@ int main(int argc,char**argv){
       // FULL streamed floor: batch-compress EVERY category (what a persistent shared-window streaming
       // codec reaches by capturing cross-message redundancy) — the real z3 ceiling for this structure.
       auto batch=[&](std::vector<uint8_t>&v){ return v.empty()?0.0:zstd_size(z2,v.data(),v.size(),zlevel,d2b); };
-      // region leg = min(delta, raw) so the batched floor + z19 ceiling use the true best-case region
-      // serialization (matches the adaptive per-message wire; RocksDB/OpenCV pick raw, LLVM/DuckDB delta).
-      double fl_line=bl, fl_root=br, fl_reg=std::min(batch(allRegions),batch(allRegionsRaw)), fl_blk=batch(allBlocks), fl_path=batch(allPaths), fl_miss=batch(allMiss);
+      // z3 batched floor keeps the region leg DELTA-only (the canonical z3 anchor). The z19+LDM ceiling below
+      // uses min(delta,raw) -- the airtight best-case ceiling -- so the two are reported as distinct diagnostics.
+      double fl_line=bl, fl_root=br, fl_reg=batch(allRegions), fl_blk=batch(allBlocks), fl_path=batch(allPaths), fl_miss=batch(allMiss);
       // z19+LDM twin of the SAME six batched categories -- a CEILING DIAGNOSTIC only (owner's rule is z<=3;
       // this shows the headroom the cap leaves). ADDITIVE: the z3 numbers above are untouched. --deep-gated
       // so --stream/--socket/--s0 runs pay no z19 cost.
