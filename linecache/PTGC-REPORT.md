@@ -2,30 +2,36 @@
 
 ## Verdict
 
-The independently decoded capability harness is complete enough to reject several tempting shortcuts,
-but not complete enough to close the project-attributed PTGC question.
+The independently decoded capability harness now includes the minimal contributing-token-span row,
+TU-local parameterized token sub-superblocks, pretrained source-basis superblocks, and an actual-cost
+union with a frozen 16 KiB cross-project model package.
 
-On all 689 DuckDB translation units (1,985,715,205 raw bytes), the best exact row currently implemented
-is a per-TU actual-cost union of local parameterized templates, semantic stream splitting, raw fallback,
-and a 16 KiB cross-project pretrained package:
+On all 689 DuckDB translation units (1,985,715,205 raw bytes), the current best exact definition-plane
+row is:
 
 ```text
 P0 literal definition frames                    11,060,591 bytes
 P4 alpha-normalized one-Line templates           9,182,120 bytes
-P10 best local frame                              9,157,694 bytes
-P10 + charged 16 KiB pretrained union             9,105,123 bytes
+P10 best local frame                              9,154,792 bytes
+P11 + contributing token-span union               9,071,583 bytes
+P12 + TU-local parameterized spans                9,071,583 bytes
+P13 + charged pretrained-superblock union         9,027,584 bytes
 ```
 
-The best row is 1,955,468 bytes smaller than P0 (1.215x), but remains 8.683 MiB. Pretraining is a
-small finishing component here, not the missing factor-of-two representation.
+The best row is 2,033,007 bytes smaller than P0 (1.225x), but remains 8.609 MiB, or 220.0x raw/wire.
+It improves the previously published charged row by 77,539 bytes. Pretraining and token spans are
+real finishing components here; neither is the missing factor-of-two representation.
 
-The decisive residual is visible rather than guessed: P9 still emits 5,261,865 compressed bytes of
-literal definitions for 298,659 lines that its parameterized rule representation does not cover.
-That one channel alone is larger than the proposed 3.8 MiB project-content continuation line.
+The decisive residual remains visible rather than guessed: P9 emits 5,261,865 compressed bytes in
+its raw-definition channel. Token spans reduce the achievable per-TU union of that channel by about
+62 KiB. The tested TU-local parameterized token windows reduce it by only 381 bytes as a standalone
+row and add nothing to P11. The hard channel therefore remains far above the 3.4--3.8 MiB
+continuation range.
 
 Do not integrate this definition codec into the live two-process path yet. Preserve P4, the semantic
-split, the 16 KiB package, and the small encoder ranker as controls. The next capability row must use
-source-location variants and then, if necessary, the minimal contributing-source token pack.
+split, the token-span union, the 16 KiB package, and the small encoder ranker as controls. The next
+representation must be stronger than local alpha-normalized token windows; more framing or a larger
+generic package does not address the measured residual.
 
 ## What this harness measures
 
@@ -44,7 +50,8 @@ are read and frozen before the DuckDB manifest is loaded.
 This harness currently covers the whole first-use definition plane, including project and toolchain
 content. BigOracle's approximately 7.04 MiB P0 and 3.8 MiB continuation line refer to a
 project-attributed/source-aware decomposition. The byte totals below must therefore not be presented
-as a direct pass/fail of that narrower line. Source-location attribution is the next required pass.
+as a direct pass/fail of that narrower line. Source-location attribution and the minimal contributing
+source representations are reported separately below.
 
 ## Implemented counterfactual ladder
 
@@ -61,10 +68,17 @@ as a direct pass/fail of that narrower line. Source-location attribution is the 
 | P9 | P4 split into control, rule-literal, raw-definition, identifier, number, and string streams |
 | P10 | Actual serialized per-TU union of P1/P4/P5/P6/P9 with raw fallback |
 | P10+P8 | P10 extended with charged pretrained dictionary/model frames |
+| P7t/P9t | Exact contributing source-token spans over all definitions / only P9 raw definitions |
+| P9sg | Source bases encoded by TU-local alpha-template grammar |
+| P9sm | Source bases encoded by frozen cross-project superblocks plus TU-local additions; package also optional zstd history |
+| P9g | TU-local parameterized 4/8/16/32-token sub-superblocks over P9 raw definitions |
+| P11 | P10 extended with actual per-TU contributing-token-span candidates |
+| P12 | P11 extended with source-basis grammar and parameterized token sub-superblocks |
+| P13 | Flat actual per-TU union of P12 and all frozen-package candidates, charging the package once |
 
-The P7 name in BigOracle's full ladder is reserved for source-location medoids and token edits. The
-current cross-TU template row is therefore labelled P7 only as an intermediate and must not be
-confused with the still-missing source-location row.
+The older P7 cross-TU template label is an intermediate historical name. The source-location,
+contributing-source, and token-span successors are all implemented later in this report and should
+be used for conclusions about that part of BigOracle's ladder.
 
 ## Authoritative DuckDB result
 
@@ -82,26 +96,33 @@ g++ -O3 -DNDEBUG -march=native -std=c++17 \
 
 | row | wire bytes | MiB | raw/wire | vs P0 | encode-effective GB/s | decode-effective GB/s | trailing 5%-raw |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| P0 appearance | 11,060,591 | 10.548 | 179.5x | 1.000x | 6.80 | 16.28 | 144.2x |
-| P1 lexicographic | 11,070,283 | 10.557 | 179.4x | 0.999x | 7.36 | 20.90 | 148.2x |
-| P4 one-Line templates | 9,182,120 | 8.757 | 216.3x | 1.205x | 0.26 | 7.57 | 182.6x |
-| P5 multiline | 10,480,697 | 9.995 | 189.5x | 1.055x | 0.18 | 12.81 | 146.9x |
-| P6 token forest | 12,612,618 | 12.028 | 157.4x | 0.877x | 0.29 | 16.34 | 122.0x |
-| P7 online templates | 9,461,691 | 9.023 | 209.9x | 1.169x | 0.49 | 5.42 | 168.4x |
-| P7b local rules/online tokens | 9,500,553 | 9.060 | 209.0x | 1.164x | 0.49 | 6.50 | 169.4x |
-| P9 semantic split | 9,316,268 | 8.885 | 213.1x | 1.187x | 0.27 | 7.85 | 182.8x |
-| P10 local actual-cost union | **9,157,694** | **8.733** | **216.8x** | **1.208x** | 0.06 | 9.63 | 185.9x |
+| P0 appearance | 11,060,591 | 10.548 | 179.5x | 1.000x | 7.08 | 18.07 | 144.2x |
+| P1 lexicographic | 11,070,283 | 10.557 | 179.4x | 0.999x | 8.13 | 22.96 | 148.2x |
+| P4 one-Line templates | 9,182,120 | 8.757 | 216.3x | 1.205x | 0.27 | 7.68 | 182.6x |
+| P5 multiline | 10,480,697 | 9.995 | 189.5x | 1.055x | 0.18 | 13.71 | 146.9x |
+| P6 token forest | 12,612,618 | 12.028 | 157.4x | 0.877x | 0.28 | 18.13 | 122.0x |
+| P7 source-location | 10,444,367 | 9.961 | 190.1x | 1.059x | 0.01 | 14.49 | 152.7x |
+| P7t all-definition token spans | 9,586,185 | 9.142 | 207.1x | 1.154x | 0.03 | 17.22 | 177.4x |
+| P9 semantic split | 9,316,268 | 8.885 | 213.1x | 1.187x | 0.27 | 7.99 | 182.8x |
+| P9t raw-channel token spans | 9,251,614 | 8.823 | 214.6x | 1.196x | 0.05 | 9.56 | 182.8x |
+| P9g parameterized token spans | 9,315,887 | 8.884 | 213.2x | 1.187x | 0.03 | 9.59 | 182.8x |
+| P8 pretrained package as P4 history | 9,125,550 | 8.703 | 217.6x | 1.212x | 0.26 | 7.72 | 184.3x |
+| P10 local actual-cost union | 9,154,792 | 8.731 | 216.9x | 1.208x | 0.01 | 9.18 | 185.9x |
+| P11 token-span union | 9,071,583 | 8.651 | 218.9x | 1.219x | 0.00* | 8.67 | 186.9x |
+| P12 parameterized-span union | 9,071,583 | 8.651 | 218.9x | 1.219x | 0.00* | 8.86 | 186.9x |
+| **P13 charged pretrained-superblock union** | **9,027,584** | **8.609** | **220.0x** | **1.225x** | 0.00* | 7.11 | **187.8x** |
 
-The P10 encoder number is the cost of running every research candidate, not a production selector.
+The starred union encoder numbers are the cost of running every research candidate, including 120
+token-span configurations per TU, not a production selector.
 The existing 54,136-byte, 32-tree encoder ranker remains the production-shaped way to reduce exact
 candidate evaluation. P4's current implementation also parses and serializes both normalization
 variants; it has not received a throughput optimization pass because its byte result misses the
 continuation line.
 
-P10 cumulative raw/wire ratios at 10/25/50/75/100% of chronological raw input are:
+P13 cumulative raw/wire ratios at 10/25/50/75/100% of chronological raw input are:
 
 ```text
-100.4x, 232.4x, 189.3x, 190.3x, 216.8x
+101.6x, 235.3x, 192.6x, 193.1x, 220.0x
 ```
 
 The non-monotonic curve is real: early common headers amortize rapidly, followed by project-owned
@@ -331,7 +352,7 @@ Full DuckDB:
 
 | row | wire bytes | raw/wire | result |
 |---|---:|---:|---|
-| P7p source superblock over all definitions | 10,989,593 | 180.7x | exact |
+| P7p source superblock over all definitions | 10,989,654 | 180.7x | exact |
 | P9 semantic baseline | 9,316,268 | 213.1x | exact |
 | P9s semantic + source frame fallback | 9,316,957 | 213.1x | exact |
 | P10 including the source rows | 9,154,792 | 216.9x | exact |
@@ -390,30 +411,151 @@ be selected. The best actual dictionary source channel is 5.425 MiB, still above
 Only 29 TU raw frames select it. The model is useful; the source-line basis it decorates remains too
 expensive.
 
+## Contributing token spans and parameterized sub-superblocks
+
+The successor removes unused source bytes instead of moving whole source lines. For each target
+definition C resolves its contributing source location, computes an exact token-aligned COPY/ADD
+program, and retains only copied spans. Span contents are deduplicated into a dense TU-local basis.
+The complete candidate is encoded as:
+
+```text
+basis control
+basis bytes
+definition program control
+exact ADD/literal bytes
+```
+
+The harness sweeps whole COPY runs and 2/4/8/16-atom chunks, minimum span sizes 4/4/6/8/12,
+residual limits 0/6/12/25/50/100%, and source-order versus lexical-order bases. For every candidate
+it compares four split zstd frames with one length-delimited combined zstd frame. A final per-TU
+selector compares the best complete span candidate with the original literal frame. F receives no
+source file: it reconstructs only from the selected frame bytes.
+
+Full DuckDB results:
+
+| row | charged wire | change versus matching baseline | exact |
+|---|---:|---:|---|
+| P7t spans over every definition | 9,586,185 | -1,403,469 versus P7p | PASS |
+| P9t spans over P9 raw channel | 9,251,614 | -64,654 versus P9 | PASS |
+| P11 actual union | 9,071,583 | -83,209 versus P10 | PASS |
+
+P9t's selected raw channel is 4.956 MiB versus 5.018 MiB for P9. Only five TU span frames beat the
+literal raw frame, so the gain is concentrated. No one fixed configuration explains it: the best
+fixed row is 5.021 MiB and loses after its selector. The accepted capability is the bounded actual
+per-TU search, not one universal span encoding.
+
+P9g tests the stronger local grammar hypothesis over the same raw channel. It enumerates
+alpha-normalized 4/8/16/32-atom windows, preserves repeated-slot equality, ranks candidate rules by
+MDL benefit, uses a shortest-path program per definition, charges only definitions that survive the
+program pass, prunes one-use/losing rules to a fixed point, and compares inline versus columnar
+instances plus split versus combined frames. Its full ledger is:
+
+```text
+candidate shapes             2,054,723
+selected / used rules          245,315 / 35,356
+rule instances                 387,893
+program / literal records      193,566 / 105,093
+covered / residual / target       8.26 / 4.09 / 27.41 MiB
+ordinary P9 raw channel                         5.018 MiB
+parameterized candidate channel                 5.863 MiB
+actual selected channel                         5.018 MiB
+winning TU frames                                      1
+```
+
+P9g is 381 bytes below P9 as a standalone selected row, but it adds zero bytes of benefit to P11;
+P12 therefore equals P11 exactly at 9,071,583 bytes. Local window grammar is expressive in raw
+coverage and still loses after rule definitions, slot payloads, programs, and outer compression.
+
+## Frozen pretrained-superblock union
+
+The pretrained artifact is a superblock model first, not merely a zstd dictionary. Disjoint LLVM,
+RocksDB, and OpenCV training produces frozen parameterized rules and reusable exact slot tokens.
+The 16 KiB raw package contains 472 rules and 634 tokens, compresses to about 5.8 KiB, and is charged
+once before any DuckDB TU. The previously measured 16/32/64/256-KiB package curve selects 16 KiB
+after charge.
+
+The current harness gives this one artifact three independent uses:
+
+1. frozen parameterized rules plus current-TU private additions (`P8c`);
+2. optional zstd history over P4's structural streams;
+3. frozen parameterized superblocks over the contributing source basis (`P9sm`), again with
+   current-TU private additions and optional history.
+
+Each use may lose independently. The receiver first decompresses the charged package, constructs
+its own rule/token objects and zstd dictionary, then decodes every selected target frame. The final
+P13 selector is flat: it can select any untrained P12 codec or one model-assisted representation
+with one explicit selector byte.
+
+Full selector ledger:
+
+```text
+candidate                              selected TUs    selected frame wire
+untrained P12                                  268             3.249 MiB
+frozen + current-TU private superblocks          8             0.253 MiB
+package as P4 history                          413             5.101 MiB
+pretrained contributing-source basis             0             0.000 MiB
+```
+
+The source-basis model wins 15 comparisons against its own P9 source/literal choice and its package
+history wins 9,652 evaluated frame alternatives, but it never wins the final P13 selector. Its
+complete source candidate is 5.501 MiB versus the ordinary 5.018 MiB raw channel. This is another
+clean separation between a useful model and a losing source representation.
+
+P13 finishes at 9,027,584 bytes, 8.609 MiB, or 220.0x. It improves P12 by 43,999 bytes after the
+package charge and improves the earlier published 9,105,123-byte pretrained result by 77,539 bytes.
+The package helps on 421 TUs, but the gain remains a finishing effect rather than a cold-400 path.
+
 ## PTGC ruling and remaining representation work
 
-No source row or pretrained model should be integrated into the transport from these measurements.
-The best charged definition result remains P10 plus the earlier 16-KiB parameterized-superblock
-package at 9,105,123 bytes. Source locations are highly predictive, but neither prior output variants
-nor whole contributing source lines provide the missing representation.
+The minimal contributing-token-span row is complete and positive, but small. The tested local
+parameterized token-window grammar and pretrained source-basis grammar do not close the residual.
+No new definition representation in this branch should be integrated into the transport yet.
 
-If definition research continues, the remaining distinct row is a minimal contributing-token-span
-superblock: transmit only source spans actually copied into emitted output, parameterize repeated
-span/correction layouts across a TU, and leave raw fallback available. It must beat P9's raw channel
-before any further ranker, neural teacher, larger dictionary, reorder/edit campaign, or product
-integration is justified. More model work over the current source-line basis is now measured as a
-dead end.
+Keep these capability components:
+
+- P9 homogeneous semantic streams and raw fallback;
+- per-TU actual candidate selection;
+- P9t contributing spans as a sparse candidate;
+- the 16 KiB frozen parameterized-superblock package;
+- the 32-tree encoder-side ranker from the separate ML bakeoff.
+
+Do not carry forward whole source bases, the P9g local window grammar, or the P9sm source-basis model
+as product requirements. They remain useful measured controls.
+
+The next research representation must reduce the first-use content itself: a hierarchical token/slot
+language with cheap new-identifier spelling and reusable statement/multi-Line rules, or an exact
+source-token replay that avoids paying nearly one basis per emitted definition. It should begin from
+P11/P13's actual frame accounting and must show a material raw-channel reduction before another
+selector/model family is added. The existing ML bakeoff already covers FTRL, 32/256-tree GBDT,
+CNN/MLP, GRU/TCN teachers, dual retrieval, distillation controls, fixed integer tables, trained zstd
+dictionaries, and the external teacher ceiling; repeating those families over this losing
+representation is not justified.
 
 ## Reproduction and retained artifacts
 
 Environment for the authoritative local run:
 
 ```text
-base commit: f1314a9fd404df069c2a8a72bebc28fdd11eace6
+code commit: ce530ed
 compiler:    g++ 11.4.0
 libzstd:     1.4.8
 trainer:     python-zstandard 0.25.0
 machine:     Intel Xeon Gold 6136, Linux 5.15 x86-64
+```
+
+Token-span and pretrained-superblock reproduction:
+
+```sh
+g++ -O3 -DNDEBUG -march=native -std=c++17 -pthread \
+  -Wall -Wextra -Wpedantic -Werror linecache/ptgc_bench.cpp -lzstd \
+  -o /tmp/ptgc-pretrained-superblocks
+
+/tmp/ptgc-pretrained-superblocks \
+  --manifest /tanksmall/scratch/ictmp/corpus3/manifest.txt \
+  --pretrain-manifest /tanksmall/scratch/ictmp/corpus/manifest.txt \
+  --pretrain-manifest /tanksmall/scratch/ictmp/corpus2/manifest.txt \
+  --pretrain-manifest /tanksmall/scratch/ictmp/corpus5/manifest.txt \
+  --model-kib 16 --model-min-corpora 2 --source-k 4 --z 3
 ```
 
 Source-superblock reproduction:
@@ -457,6 +599,12 @@ Primary logs:
 /tmp/ptgc-source-pack-final-strict.log
 /tmp/ptgc-source-pack-final-sanitize.log
 /tmp/ptgc-source-pack-final2-smoke.log
+/tmp/ptgc-source-combined-20tu.log
+/tmp/ptgc-token-span-strict-2tu.log
+/tmp/ptgc-token-span-sanitize-2tu.log
+/tmp/ptgc-pretrained-superblocks-v3-smoke.log
+/tmp/ptgc-pretrained-superblocks-v3-sanitize.log
+/tmp/ptgc-pretrained-superblocks-v3-full.log
 /tmp/codec50-current-baseline.log
 /tmp/codec50-pretrain-duckdb-independent.log
 ```
@@ -470,6 +618,9 @@ Semantic frame sets and table reports:
 ```
 
 The frame artifacts are generated data and are intentionally not committed. The harness and this
-report are the durable reproduction sources. The final source also passes a two-TU
-AddressSanitizer/UndefinedBehaviorSanitizer reconstruction run and a five-TU optimized `-Werror`
-smoke run.
+report are the durable reproduction sources. The final source passes strict optimized `-Werror`
+builds, a two-TU ASan/UBSan reconstruction with a separately rebuilt receiver package, a 20-TU
+full-training replay, and the complete 689-TU independently decoded replay. The authoritative full
+run took 734.27 seconds and peaked at 4,598,760 KiB RSS; that is exhaustive bakeoff cost, not a
+production throughput claim. The retained full-log SHA-256 is
+`f9065ea4b07a1f5c8899b36846db478e59a933d8a0cce5516a5ba6ea13b82fe0`.
