@@ -8,8 +8,8 @@ learner in two initial states:
 * a frozen exact phrase package learned from disjoint projects and charged at TU 0.
 
 Target-local phrases are observed only after their TU has been encoded.  The primary
-policy publishes a promoted phrase after that TU as a causal investment; an optional
-first-use policy defers publication until a later TU selects it.  The receiver
+first-use policy defers publication until a later TU can repay its definitions in the
+same frame; the promotion-time policy remains as a comparison.  The receiver
 installs definitions from actual compressed frames, decodes every payload with an
 independent state object, and verifies the complete Region stream exactly.
 
@@ -641,7 +641,7 @@ def evaluate_online(
         promotions = learner.observe(tu)
         result.update_seconds += time.monotonic() - begin
 
-        # The primary policy makes a causal investment after observing this TU.
+        # The comparison policy makes an investment after observing this TU.
         # These definitions cannot affect the TU that caused their promotion.
         if publication == "promotion" and promotions:
             definition_raw = serialize_reference_batch(promotions, encoder_regions)
@@ -943,7 +943,7 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument(
         "--publication",
         choices=("promotion", "first-use"),
-        default="promotion",
+        default="first-use",
     )
     value.add_argument("--budget-basis", choices=("raw", "ids32"), default="ids32")
     value.add_argument("--row-set", choices=("all", "empty", "pretrained"), default="all")

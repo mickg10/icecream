@@ -36,41 +36,56 @@ def main() -> int:
     args = parser.parse_args()
 
     invalid = set(args.invalid_pretrained)
+    reports_by_corpus: dict[str, list[Path]] = {}
+    for corpus, path in args.input:
+        reports_by_corpus.setdefault(corpus, []).append(path)
+
     rows_out: list[dict] = []
     selected: list[dict] = []
-    for corpus, path in args.input:
-        report = json.loads(path.read_text())
-        rows = {row["name"]: row for row in report["rows"]}
+    for corpus, paths in reports_by_corpus.items():
         candidates: list[dict] = []
-        for name in ("empty-online-k2", "pretrained-online-k2"):
-            row = rows.get(name)
-            if row is None:
-                continue
-            valid = not (name.startswith("pretrained-") and corpus in invalid)
-            learning = gate(row)
-            current = {
-                "corpus": corpus,
-                "report": str(path),
-                "tus": row["tus"],
-                "raw_bytes": row["raw_bytes"],
-                "online_budget": row["online_budget"],
-                "row": name,
-                "pretraining_valid": valid,
-                "selected": False,
-                "charged_wire_bytes": row["charged_wire_bytes"],
-                "charged_ratio": row["charged_ratio"],
-                "model_wire_bytes": row["initial_model_wire_bytes"],
-                "definition_wire_bytes": row["definition_wire_bytes"],
-                "payload_wire_bytes": row["payload_wire_bytes"],
-                "selector_wire_bytes": row["selector_wire_bytes"],
-                "c50_ratio": learning["c50_ratio"],
-                "h200_fraction": learning["h200_fraction"],
-                "final_window_ratio": learning["final_window_ratio"],
-                "exact": row["exact"],
-            }
-            rows_out.append(current)
-            if valid:
-                candidates.append(current)
+        seen_rows: set[str] = set()
+        for path in paths:
+            report = json.loads(path.read_text())
+            rows = {row["name"]: row for row in report["rows"]}
+            for name in ("empty-online-k2", "pretrained-online-k2"):
+                row = rows.get(name)
+                if row is None:
+                    continue
+                if name in seen_rows:
+                    raise ValueError(f"{corpus}: duplicate {name} row")
+                seen_rows.add(name)
+                valid = not (name.startswith("pretrained-") and corpus in invalid)
+                learning = gate(row)
+                current = {
+                    "corpus": corpus,
+                    "report": str(path),
+                    "tus": row["tus"],
+                    "raw_bytes": row["raw_bytes"],
+                    "online_budget": row["online_budget"],
+                    "publication": row.get(
+                        "publication", report.get("publication", "promotion")
+                    ),
+                    "row": name,
+                    "pretraining_valid": valid,
+                    "selected": False,
+                    "charged_wire_bytes": row["charged_wire_bytes"],
+                    "charged_ratio": row["charged_ratio"],
+                    "model_wire_bytes": row["initial_model_wire_bytes"],
+                    "definition_wire_bytes": row["definition_wire_bytes"],
+                    "payload_wire_bytes": row["payload_wire_bytes"],
+                    "selector_wire_bytes": row["selector_wire_bytes"],
+                    "promoted_assets": row.get("online_promoted_assets", 0),
+                    "published_assets": row.get("online_published_assets", 0),
+                    "selected_tus": row.get("online_selected_tus", 0),
+                    "c50_ratio": learning["c50_ratio"],
+                    "h200_fraction": learning["h200_fraction"],
+                    "final_window_ratio": learning["final_window_ratio"],
+                    "exact": row["exact"],
+                }
+                rows_out.append(current)
+                if valid:
+                    candidates.append(current)
         if not candidates:
             raise ValueError(f"{corpus}: no valid online row")
         winner = min(candidates, key=lambda row: row["charged_wire_bytes"])
@@ -78,10 +93,12 @@ def main() -> int:
         selected.append(winner)
 
     columns = (
-        "corpus", "report", "tus", "raw_bytes", "online_budget", "row",
+        "corpus", "report", "tus", "raw_bytes", "online_budget",
+        "publication", "row",
         "pretraining_valid", "selected", "charged_wire_bytes", "charged_ratio",
         "model_wire_bytes", "definition_wire_bytes", "payload_wire_bytes",
-        "selector_wire_bytes", "c50_ratio", "h200_fraction",
+        "selector_wire_bytes", "promoted_assets", "published_assets",
+        "selected_tus", "c50_ratio", "h200_fraction",
         "final_window_ratio", "exact",
     )
     with open(args.output, "w", newline="") as output:
@@ -102,8 +119,14 @@ def main() -> int:
         "aggregate_raw_bytes": aggregate_raw,
         "aggregate_wire_bytes": aggregate_wire,
         "aggregate_ratio": aggregate_raw / aggregate_wire,
+        # Give every corpus one equal-sized unit of input.  This is the
+        # harmonic mean of the per-corpus ratios and prevents the largest
+        # expanded traces from determining the headline result.
+        "equal_corpus_ratio": len(ratios) / sum(1.0 / ratio for ratio in ratios),
         "minimum_ratio": ratios[0],
-        "lower_quartile_ratio": statistics.median(ratios[: len(ratios) // 2]),
+        "lower_quartile_ratio": statistics.median(
+            ratios[: max(1, len(ratios) // 2)]
+        ),
         "median_ratio": statistics.median(ratios),
         "maximum_ratio": ratios[-1],
         "cold_400_corpora": sum(row["charged_ratio"] >= 400 for row in selected),

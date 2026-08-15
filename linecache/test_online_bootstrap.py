@@ -2,7 +2,13 @@
 
 import unittest
 
-from online_bootstrap_curves import summarize_learning_gate
+from online_bootstrap_curves import (
+    compress_frame,
+    evaluate_online,
+    serialize_key_batch,
+    summarize_learning_gate,
+)
+from pretrained_superblocks import TuRegions, package_from_keys
 
 
 def curve(points: int, raw: int, wire: int) -> list[dict]:
@@ -48,6 +54,40 @@ class LearningGateTest(unittest.TestCase):
         result = summarize_learning_gate(points, 100_000, 200_000)
         self.assertGreater(result["h200_tu"], 64)
         self.assertLessEqual(result["h200_fraction"], 0.50)
+
+
+class FirstUseTest(unittest.TestCase):
+    def test_first_use_publishes_only_an_exact_selected_phrase(self) -> None:
+        common = [(100 + i, 200 + i, 1, 16) for i in range(8)]
+        tus = [
+            TuRegions(tu, 10_000, common + [(1_000 + tu, 2_000 + tu, 1, 16)])
+            for tu in range(1, 5)
+        ]
+        empty = package_from_keys([], 0)
+        empty_frame = compress_frame(serialize_key_batch([]), 3)
+        result = evaluate_online(
+            tus,
+            "first-use-test",
+            empty,
+            empty_frame,
+            3,
+            (8,),
+            2,
+            4_096,
+            4_096,
+            100,
+            8_192,
+            "first-use",
+            "ids32",
+        )
+        self.assertTrue(result.exact)
+        self.assertGreater(result.online_promoted_assets, 0)
+        self.assertGreater(result.online_published_assets, 0)
+        self.assertLessEqual(
+            result.online_published_assets,
+            result.online_promoted_assets,
+        )
+        self.assertGreater(result.online_selected_tus, 0)
 
 
 if __name__ == "__main__":
