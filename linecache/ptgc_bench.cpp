@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <numeric>
 #include <string>
@@ -1992,6 +1993,7 @@ struct ParamSpanRecord {
 struct ParamSpanStats {
     uint64_t candidate_shapes=0,selected_rules=0,used_rules=0,rule_instances=0,unique_instances=0;
     uint64_t program_records=0,literal_records=0,covered_bytes=0,residual_bytes=0,target_bytes=0,program_ops=0;
+    uint64_t lexicon_entries=0,lexicon_references=0;
 };
 
 static constexpr std::array<unsigned,4>kParamSpanWidths={4,8,16,32};
@@ -2076,6 +2078,434 @@ static std::vector<uint8_t>decode_implicit_param_span_pack(const TokenSpanFrames
     return payload;
 }
 
+// P14: a frozen cross-project package of parameterized token sub-superblocks.  P8 learns complete
+// Line shapes; this model learns reusable 4/8/16/32-atom shapes and can therefore cover fragments
+// inside otherwise unique P9 literal definitions.  Training is deterministically sampled by exact
+// Line content so model construction is insensitive to manifest order.  The package is rebuilt by
+// an independent receiver and is also offered as optional zstd history by the ordinary frame codec.
+struct PretrainedParamCandidate {
+    ParsedLine shape;
+    uint64_t count=0,literal_bytes=0,instance_bytes=0,corpus_mask=0;
+};
+
+struct PretrainedParamPackage {
+    std::unordered_map<std::string,uint32_t>rule_id;
+    std::vector<ParsedLine>encoder_rules;
+    std::vector<DecodedTemplate>decoder_rules;
+    std::vector<uint8_t>raw,frame;
+    uint64_t training_raw=0,training_lines=0,training_distinct_lines=0,sampled_lines=0;
+    uint64_t candidate_windows=0,candidate_rules=0;
+    double training_seconds=0;
+};
+
+static void decode_pretrained_param_package(const std::vector<uint8_t>&raw,
+                                             std::vector<DecodedTemplate>&rules){
+    const uint8_t*p=raw.data(),*end=p+raw.size();
+    if(get_varint(p,end)!=1)die_msg("unknown pretrained parameterized package version");
+    const uint64_t count=get_varint(p,end);rules.reserve(size_t(count));
+    for(uint64_t r=0;r<count;++r){DecodedTemplate rule;const uint64_t slots=get_varint(p,end);
+        if(slots>uint64_t(end-p))die_msg("pretrained parameterized slots exceed package");
+        rule.slot_type.assign(p,p+slots);p+=slots;const uint64_t occurrences=get_varint(p,end);
+        rule.literals.reserve(size_t(occurrences)+1);rule.occurrence_slot.reserve(size_t(occurrences));
+        for(uint64_t i=0;i<occurrences;++i){const uint64_t len=get_varint(p,end);
+            if(len>uint64_t(end-p))die_msg("pretrained parameterized literal exceeds package");
+            rule.literals.emplace_back(p,p+len);p+=len;const uint64_t slot=get_varint(p,end);
+            if(slot>=slots)die_msg("pretrained parameterized slot out of range");
+            rule.occurrence_slot.push_back(uint32_t(slot));}
+        const uint64_t len=get_varint(p,end);
+        if(len>uint64_t(end-p))die_msg("pretrained parameterized tail exceeds package");
+        rule.literals.emplace_back(p,p+len);p+=len;rules.push_back(std::move(rule));}
+    if(p!=end)die_msg("trailing pretrained parameterized package bytes");
+}
+
+class PretrainedParamBuilder {
+public:
+    void scan_manifest(const std::string&manifest,size_t max_files,size_t corpus_index){
+        if(corpus_index>=64)die_msg("at most 64 parameterized training corpora are supported");
+        LineStore distinct;FILE*mf=std::fopen(manifest.c_str(),"r");if(!mf)die(manifest.c_str());
+        char path[16384];size_t files=0;
+        while(files<max_files&&std::fgets(path,sizeof(path),mf)){size_t pn=std::strlen(path);
+            while(pn&&(path[pn-1]=='\n'||path[pn-1]=='\r'))path[--pn]=0;
+            if(!pn)continue;
+            scan_file(path,distinct,corpus_index);++files;
+        }
+        std::fclose(mf);
+    }
+
+    void scan_source_root(const std::string&root,size_t max_files,size_t corpus_index){
+        if(corpus_index>=64)die_msg("at most 64 parameterized training corpora are supported");
+        namespace fs=std::filesystem;std::vector<std::string>paths;std::error_code error;
+        fs::recursive_directory_iterator it(root,fs::directory_options::skip_permission_denied,error),end;
+        if(error)die_msg("cannot traverse parameterized source-training root");
+        for(;it!=end;it.increment(error)){if(error){error.clear();continue;}const fs::directory_entry&entry=*it;
+            if(entry.is_directory(error)){const std::string name=entry.path().filename().string();
+                if(name==".git"||name=="build"||name=="CMakeFiles"||name=="cmake-build-debug"||name=="cmake-build-release")it.disable_recursion_pending();
+                error.clear();continue;}
+            if(!entry.is_regular_file(error)){error.clear();continue;}error.clear();
+            const std::string extension=entry.path().extension().string();
+            if(extension==".c"||extension==".cc"||extension==".cpp"||extension==".cxx"||extension==".C"||
+               extension==".h"||extension==".hh"||extension==".hpp"||extension==".hxx"||extension==".inc"||
+               extension==".inl"||extension==".ipp"||extension==".tcc"||extension==".def"||extension==".cu"||extension==".cuh")
+                paths.push_back(entry.path().string());}
+        std::sort(paths.begin(),paths.end());if(paths.size()>max_files)paths.resize(max_files);
+        LineStore distinct;for(const std::string&path:paths)scan_file(path,distinct,corpus_index);
+    }
+
+    PretrainedParamPackage compile(size_t budget,int zlevel,double seconds,unsigned min_corpora){
+        if(budget<4096)die_msg("pretrained parameterized package budget must be at least 4 KiB");
+        struct Ranked{const std::string*key=nullptr;PretrainedParamCandidate*candidate=nullptr;uint64_t cost=0,benefit=0;};
+        std::vector<Ranked>ranked;ranked.reserve(candidates_.size());
+        for(auto&item:candidates_){PretrainedParamCandidate&candidate=item.second;
+            const unsigned corpora=unsigned(__builtin_popcountll(candidate.corpus_mask));
+            const uint64_t cost=encoded_template_size(candidate.shape)+2;
+            if(corpora<min_corpora||candidate.count<2||candidate.literal_bytes<=candidate.instance_bytes+cost)continue;
+            ranked.push_back({&item.first,&candidate,cost,candidate.literal_bytes-candidate.instance_bytes-cost});}
+        std::sort(ranked.begin(),ranked.end(),[](const Ranked&a,const Ranked&b){
+            const __uint128_t lhs=__uint128_t(a.benefit)*b.cost,rhs=__uint128_t(b.benefit)*a.cost;
+            if(lhs!=rhs)return lhs>rhs;
+            if(a.benefit!=b.benefit)return a.benefit>b.benefit;
+            return *a.key<*b.key;});
+        PretrainedParamPackage package;package.training_raw=training_raw_;package.training_lines=training_lines_;
+        package.training_distinct_lines=training_distinct_lines_;package.sampled_lines=sampled_lines_;
+        package.candidate_windows=candidate_windows_;package.candidate_rules=candidates_.size();package.training_seconds=seconds;
+        const size_t usable=budget-64;size_t used=0;
+        for(const Ranked&entry:ranked){if(entry.cost>usable-used)continue;
+            const uint32_t id=uint32_t(package.encoder_rules.size());package.rule_id.emplace(*entry.key,id);
+            package.encoder_rules.push_back(entry.candidate->shape);used+=entry.cost;}
+        put_varint(package.raw,1);put_varint(package.raw,package.encoder_rules.size());
+        for(const ParsedLine&rule:package.encoder_rules)serialize_pretrained_rule(package.raw,rule);
+        if(package.raw.size()>budget)die_msg("pretrained parameterized package exceeded explicit budget");
+        FrameCodec codec;package.frame=codec.compress(package.raw,zlevel);
+        const std::vector<uint8_t>decoded=codec.decompress(package.frame);
+        if(decoded!=package.raw)die_msg("pretrained parameterized package frame mismatch");
+        decode_pretrained_param_package(decoded,package.decoder_rules);
+        if(package.decoder_rules.size()!=package.encoder_rules.size())die_msg("pretrained parameterized package cardinality mismatch");
+        return package;
+    }
+private:
+    void scan_file(const std::string&path,LineStore&distinct,size_t corpus_index){
+        FILE*f=std::fopen(path.c_str(),"rb");if(!f)die(path.c_str());struct stat st{};
+        if(::fstat(::fileno(f),&st)!=0)die(path.c_str());
+        if(st.st_size<0||uint64_t(st.st_size)>UINT32_MAX)die_msg("unsupported parameterized training file size");
+        std::vector<uint8_t>bytes(size_t(st.st_size)+8);
+        if(st.st_size&&std::fread(bytes.data(),1,size_t(st.st_size),f)!=size_t(st.st_size))die_msg("short parameterized training read");
+        std::fclose(f);training_raw_+=uint64_t(st.st_size);
+        const uint8_t*p=bytes.data(),*end=p+st.st_size;
+        while(p<end){const void*hit=std::memchr(p,'\n',size_t(end-p));
+            const uint8_t*line_end=hit?static_cast<const uint8_t*>(hit)+1:end;
+            const uint32_t len=uint32_t(line_end-p);++training_lines_;
+            const LineStore::Result seen=distinct.intern(p,len);
+            if(seen.first){++training_distinct_lines_;
+                // A fixed 1/32 content sample bounds training work without making it dependent
+                // on file or repository order.  High-frequency generic shapes remain observable.
+                if(((hash_bytes(p,len)>>1)&31u)==0&&len<=4096){++sampled_lines_;
+                    const std::vector<Atom>atoms=atomize(p,len);
+                    if(atoms.size()<=256){for(size_t begin=0;begin<atoms.size();++begin){
+                        for(unsigned width:kParamSpanWidths){if(begin+width>atoms.size())continue;
+                            const uint32_t off=atoms[begin].off;
+                            const uint32_t finish=atoms[begin+width-1].off+atoms[begin+width-1].len;
+                            const uint32_t span_len=finish-off;ParsedLine parsed=parse_line(p+off,span_len);
+                            if(parsed.values.empty()||parsed.values.size()>32||parsed.occurrence_slot.size()>64||parsed.key.size()>2048)continue;
+                            ++candidate_windows_;size_t instance=1;
+                            for(const auto&value:parsed.values)instance+=varint_size(value.size())+value.size();
+                            auto inserted=candidates_.try_emplace(parsed.key);PretrainedParamCandidate&candidate=inserted.first->second;
+                            if(inserted.second)candidate.shape=std::move(parsed);
+                            ++candidate.count;candidate.literal_bytes+=span_len;candidate.instance_bytes+=instance;
+                            candidate.corpus_mask|=uint64_t(1)<<corpus_index;
+                        }
+                    }}
+                }
+            }
+            p=line_end;
+        }
+    }
+    std::unordered_map<std::string,PretrainedParamCandidate>candidates_;
+    uint64_t training_raw_=0,training_lines_=0,training_distinct_lines_=0,sampled_lines_=0,candidate_windows_=0;
+};
+
+static TokenSpanRaw encode_frozen_param_span_pack(const std::vector<uint32_t>&ids,const LineStore&store,
+                                                   const PretrainedParamPackage&model,bool columnar,
+                                                   ParamSpanStats&stats,std::vector<ParamSpanRecord>*planned_records=nullptr){
+    std::vector<ParamSpanRecord>records;records.reserve(ids.size());std::vector<uint64_t>rule_uses(model.encoder_rules.size());
+    for(uint32_t id:ids){const uint8_t*p=store.data(id);const uint32_t n=store.len(id);stats.target_bytes+=n;
+        ParamSpanRecord record;record.id=id;const std::vector<Atom>atoms=atomize(p,n);
+        if(atoms.empty()||atoms.size()>256||model.encoder_rules.empty()){++stats.literal_records;records.push_back(std::move(record));continue;}
+        const size_t count=atoms.size();std::vector<size_t>cost(count+1,SIZE_MAX);std::vector<uint32_t>previous(count+1),edge_rule(count+1,UINT32_MAX);cost[0]=0;
+        for(size_t begin=0;begin<count;++begin){if(cost[begin]==SIZE_MAX)continue;
+            const size_t raw_cost=cost[begin]+varint_size(uint64_t(atoms[begin].len)<<1)+atoms[begin].len;
+            if(raw_cost<cost[begin+1]){cost[begin+1]=raw_cost;previous[begin+1]=uint32_t(begin);edge_rule[begin+1]=UINT32_MAX;}
+            for(unsigned width:kParamSpanWidths){if(begin+width>count)continue;const uint32_t off=atoms[begin].off;
+                const uint32_t finish=atoms[begin+width-1].off+atoms[begin+width-1].len;ParsedLine parsed=parse_line(p+off,finish-off);
+                auto found=model.rule_id.find(parsed.key);if(found==model.rule_id.end())continue;size_t edge=varint_size((uint64_t(found->second)<<1)|1);
+                for(const auto&value:parsed.values)edge+=varint_size(value.size())+value.size();
+                const size_t next=begin+width;
+                if(cost[begin]+edge<cost[next]){cost[next]=cost[begin]+edge;previous[next]=uint32_t(begin);edge_rule[next]=found->second;}}
+        }
+        struct Choice{uint32_t begin=0,end=0,rule=UINT32_MAX;};std::vector<Choice>choices;
+        for(uint32_t finish=uint32_t(count);finish;){const uint32_t begin=previous[finish];choices.push_back({begin,finish,edge_rule[finish]});finish=begin;}
+        std::reverse(choices.begin(),choices.end());
+        auto append_raw=[&](uint32_t off,uint32_t len){if(!len)return;
+            if(!record.ops.empty()&&!record.ops.back().rule&&record.ops.back().target_off+record.ops.back().len==off)record.ops.back().len+=len;
+            else{ParamSpanOp op;op.target_off=off;op.len=len;record.ops.push_back(std::move(op));}};
+        bool has_rule=false;
+        for(const Choice&choice:choices){const uint32_t off=atoms[choice.begin].off;
+            const uint32_t finish=atoms[choice.end-1].off+atoms[choice.end-1].len;const uint32_t len=finish-off;
+            if(choice.rule==UINT32_MAX){append_raw(off,len);continue;}ParsedLine parsed=parse_line(p+off,len);
+            ParamSpanOp op;op.rule=true;op.target_off=off;op.len=len;op.rule_id=choice.rule;op.values=std::move(parsed.values);
+            record.ops.push_back(std::move(op));has_rule=true;}
+        size_t encoded=0;for(const ParamSpanOp&op:record.ops){if(op.rule){encoded+=varint_size((uint64_t(op.rule_id)<<1)|1);
+                for(const auto&value:op.values)encoded+=varint_size(value.size())+value.size();}
+            else encoded+=varint_size(uint64_t(op.len)<<1)+op.len;}
+        if(!has_rule||encoded>=n){record.ops.clear();++stats.literal_records;}else record.program=true;
+        records.push_back(std::move(record));
+    }
+    stats.program_records=0;stats.literal_records=0;stats.rule_instances=0;stats.covered_bytes=0;stats.residual_bytes=0;stats.program_ops=0;
+    for(const ParamSpanRecord&record:records){if(!record.program){++stats.literal_records;continue;}++stats.program_records;
+        stats.program_ops+=record.ops.size();for(const ParamSpanOp&op:record.ops){if(op.rule){++rule_uses[op.rule_id];++stats.rule_instances;stats.covered_bytes+=op.len;}
+            else stats.residual_bytes+=op.len;}}
+    if(planned_records)*planned_records=records;
+    std::vector<uint32_t>used;for(uint32_t i=0;i<rule_uses.size();++i)if(rule_uses[i])used.push_back(i);
+    if(used.empty())return {};
+    stats.used_rules=used.size();
+    std::unordered_map<std::string,uint32_t>value_frequency;
+    for(const ParamSpanRecord&record:records)if(record.program)for(const ParamSpanOp&op:record.ops)if(op.rule){
+        const ParsedLine&shape=model.encoder_rules[op.rule_id];
+        for(size_t slot=0;slot<op.values.size();++slot){std::string key;key.reserve(op.values[slot].size()+1);
+            key.push_back(char(shape.slot_type[slot]));
+            key.append(reinterpret_cast<const char*>(op.values[slot].data()),op.values[slot].size());++value_frequency[key];}}
+    struct LexiconValue{uint8_t type=0;std::string value;uint32_t count=0;};std::vector<LexiconValue>lexicon;
+    for(const auto&item:value_frequency){const size_t len=item.first.size()-1;
+        const uint64_t inline_cost=uint64_t(item.second)*(varint_size((uint64_t(len)<<1)|1)+len);
+        const uint64_t dictionary_cost=1+varint_size(len)+len+uint64_t(item.second)*2;
+        if(item.second>=2&&dictionary_cost<inline_cost)lexicon.push_back({uint8_t(item.first[0]),item.first.substr(1),item.second});}
+    std::sort(lexicon.begin(),lexicon.end(),[](const LexiconValue&a,const LexiconValue&b){
+        if(a.count!=b.count)return a.count>b.count;
+        if(a.type!=b.type)return a.type<b.type;
+        return a.value<b.value;});
+    std::unordered_map<std::string,uint32_t>lexicon_id;lexicon_id.reserve(lexicon.size()*2+1);
+    for(uint32_t i=0;i<lexicon.size();++i){std::string key;key.reserve(lexicon[i].value.size()+1);key.push_back(char(lexicon[i].type));key+=lexicon[i].value;lexicon_id.emplace(std::move(key),i);}
+    stats.lexicon_entries=lexicon.size();
+    struct InstanceTable{std::unordered_map<std::string,uint32_t>id;std::vector<std::vector<std::vector<uint8_t>>>rows;};
+    std::vector<InstanceTable>instances(model.encoder_rules.size());
+    if(columnar)for(ParamSpanRecord&record:records)if(record.program)for(ParamSpanOp&op:record.ops)if(op.rule){std::string key;
+        for(const auto&value:op.values){key_varint(key,value.size());key.append(reinterpret_cast<const char*>(value.data()),value.size());}
+        InstanceTable&table=instances[op.rule_id];auto inserted=table.id.emplace(std::move(key),uint32_t(table.rows.size()));
+        if(inserted.second)table.rows.push_back(op.values);
+        op.instance_id=inserted.first->second;}
+    std::vector<uint32_t>remap(model.encoder_rules.size(),UINT32_MAX);TokenSpanRaw raw;raw.valid=true;raw.param_columnar=columnar;
+    raw.stats.target_bytes=stats.target_bytes;raw.stats.source_records=stats.program_records;raw.stats.literal_records=stats.literal_records;
+    raw.stats.copy_bytes=stats.covered_bytes;raw.stats.residual_bytes=stats.residual_bytes;raw.stats.program_ops=stats.program_ops;
+    raw.stats.available_records=stats.program_records;raw.stats.basis_records=used.size();
+    put_varint(raw.basis_control,lexicon.size());
+    for(const LexiconValue&entry:lexicon){raw.basis_control.push_back(entry.type);put_varint(raw.basis_control,entry.value.size());
+        raw.basis_data.insert(raw.basis_data.end(),entry.value.begin(),entry.value.end());raw.stats.basis_bytes+=entry.value.size();}
+    auto emit_value=[&](std::vector<uint8_t>&control,uint8_t type,const std::vector<uint8_t>&value){std::string key;
+        key.reserve(value.size()+1);key.push_back(char(type));key.append(reinterpret_cast<const char*>(value.data()),value.size());
+        auto found=lexicon_id.find(key);if(found!=lexicon_id.end()){put_varint(control,uint64_t(found->second)<<1);++stats.lexicon_references;}
+        else{put_varint(control,(uint64_t(value.size())<<1)|1);raw.basis_data.insert(raw.basis_data.end(),value.begin(),value.end());raw.stats.basis_bytes+=value.size();}};
+    put_varint(raw.basis_control,used.size());
+    for(uint32_t local_id=0;local_id<used.size();++local_id){const uint32_t rule_id=used[local_id];remap[rule_id]=local_id;
+        const ParsedLine&shape=model.encoder_rules[rule_id];const InstanceTable&table=instances[rule_id];put_varint(raw.basis_control,rule_id);
+        put_varint(raw.basis_control,columnar?table.rows.size():0);if(columnar)stats.unique_instances+=table.rows.size();
+        if(columnar)for(size_t slot=0;slot<shape.values.size();++slot)for(const auto&row:table.rows)emit_value(raw.basis_control,shape.slot_type[slot],row[slot]);}
+    put_varint(raw.definition_control,records.size());const size_t bitmap_bytes=(records.size()+7)/8,bitmap_offset=raw.definition_control.size();
+    raw.definition_control.resize(bitmap_offset+bitmap_bytes);
+    for(size_t i=0;i<records.size();++i)if(records[i].program)raw.definition_control[bitmap_offset+i/8]|=uint8_t(1u<<(i%8));
+    for(const ParamSpanRecord&record:records){if(!record.program){const uint32_t len=store.len(record.id);
+            raw.definition_data.insert(raw.definition_data.end(),store.data(record.id),store.data(record.id)+len);continue;}
+        for(const ParamSpanOp&op:record.ops){if(!op.rule){put_varint(raw.definition_control,uint64_t(op.len)<<1);
+                raw.definition_data.insert(raw.definition_data.end(),store.data(record.id)+op.target_off,store.data(record.id)+op.target_off+op.len);continue;}
+            const uint32_t wire_rule=remap[op.rule_id];
+            if(wire_rule==UINT32_MAX)die_msg("frozen parameterized rule remap missing");
+            put_varint(raw.definition_control,(uint64_t(wire_rule)<<1)|1);
+            if(columnar)put_varint(raw.definition_control,op.instance_id);
+            else {const ParsedLine&shape=model.encoder_rules[op.rule_id];
+                for(size_t slot=0;slot<op.values.size();++slot)emit_value(raw.definition_control,shape.slot_type[slot],op.values[slot]);}}}
+    return raw;
+}
+
+static std::vector<uint8_t>decode_frozen_param_span_pack(const TokenSpanFrames&frames,FrameCodec&codec,
+                                                         ModelFrameCodec&frame_codec,
+                                                         const std::vector<DecodedTemplate>&model_rules,
+                                                         const std::vector<uint64_t>&lengths){
+    if(!frames.valid||frames.explicit_ids)die_msg("missing frozen parameterized-span frame");
+    const std::array<std::vector<uint8_t>,4>raw=decompress_token_span_frames(frames,codec,&frame_codec);
+    const std::vector<uint8_t>&table_control=raw[0],&table_data=raw[1],&definition_control=raw[2],&definition_data=raw[3];
+    struct LexiconValue{uint8_t type=0;std::vector<uint8_t>value;};
+    struct Table{uint32_t rule_id=0;std::vector<std::vector<std::vector<uint8_t>>>rows;};
+    const uint8_t*p=table_control.data(),*end=p+table_control.size();
+    const uint8_t*slot_data=table_data.data(),*slot_end=slot_data+table_data.size();
+    const uint64_t lexicon_count=get_varint(p,end);std::vector<LexiconValue>lexicon;lexicon.reserve(size_t(lexicon_count));
+    for(uint64_t i=0;i<lexicon_count;++i){if(p==end)die_msg("frozen parameterized lexicon type missing");const uint8_t type=*p++;
+        const uint64_t len=get_varint(p,end);if(len>uint64_t(slot_end-slot_data))die_msg("frozen parameterized lexicon value exceeds data");
+        lexicon.push_back({type,std::vector<uint8_t>(slot_data,slot_data+len)});slot_data+=len;}
+    auto read_value=[&](const uint8_t*&control,const uint8_t*control_end,uint8_t expected_type){const uint64_t code=get_varint(control,control_end);
+        if(!(code&1)){const uint64_t id=code>>1;if(id>=lexicon.size())die_msg("frozen parameterized lexicon id missing");
+            if(lexicon[size_t(id)].type!=expected_type)die_msg("frozen parameterized lexicon type mismatch");
+            return lexicon[size_t(id)].value;}
+        const uint64_t len=code>>1;if(len>uint64_t(slot_end-slot_data))die_msg("frozen parameterized slot value exceeds data");
+        std::vector<uint8_t>value(slot_data,slot_data+len);slot_data+=len;return value;};
+    const uint64_t table_count=get_varint(p,end);std::vector<Table>tables;tables.reserve(size_t(table_count));
+    for(uint64_t t=0;t<table_count;++t){Table table;table.rule_id=uint32_t(get_varint(p,end));
+        if(table.rule_id>=model_rules.size())die_msg("frozen parameterized table rule missing");
+        const DecodedTemplate&rule=model_rules[table.rule_id];
+        const uint64_t row_count=get_varint(p,end);if(row_count>SIZE_MAX)die_msg("frozen parameterized row count too large");
+        table.rows.resize(size_t(row_count),std::vector<std::vector<uint8_t>>(rule.slot_type.size()));
+        for(size_t slot=0;slot<rule.slot_type.size();++slot)for(size_t row=0;row<size_t(row_count);++row)
+            table.rows[row][slot]=read_value(p,end,rule.slot_type[slot]);
+        tables.push_back(std::move(table));}
+    if(p!=end)die_msg("trailing frozen parameterized table control bytes");
+    p=definition_control.data();end=p+definition_control.size();const uint64_t count=get_varint(p,end);
+    if(count!=lengths.size())die_msg("frozen parameterized record count mismatch");
+    const size_t bitmap_bytes=(lengths.size()+7)/8;
+    if(bitmap_bytes>size_t(end-p))die_msg("frozen parameterized bitmap exceeds control");
+    const uint8_t*bitmap=p;p+=bitmap_bytes;
+    const uint8_t*literal_data=definition_data.data(),*literal_end=literal_data+definition_data.size();std::vector<uint8_t>payload;uint64_t total=0;
+    for(uint64_t len:lengths){if(len>SIZE_MAX-total)die_msg("frozen parameterized payload too large");total+=len;}payload.reserve(size_t(total));
+    for(size_t row=0;row<lengths.size();++row){const uint64_t output_len=lengths[row];const bool program=(bitmap[row/8]>>(row%8))&1u;
+        if(!program){if(output_len>uint64_t(literal_end-literal_data))die_msg("frozen parameterized raw exceeds data");payload.insert(payload.end(),literal_data,literal_data+output_len);literal_data+=output_len;continue;}
+        const size_t output_begin=payload.size();while(payload.size()-output_begin<output_len){const uint64_t code=get_varint(p,end);
+            if(!(code&1)){const uint64_t len=code>>1;if(!len||len>output_len-(payload.size()-output_begin)||len>uint64_t(literal_end-literal_data))die_msg("frozen parameterized ADD exceeds output");
+                payload.insert(payload.end(),literal_data,literal_data+len);literal_data+=len;continue;}
+            const uint64_t wire_rule=code>>1;uint32_t rule_id=0;const std::vector<std::vector<uint8_t>>*values=nullptr;
+            std::vector<std::vector<uint8_t>>inline_values;
+            if(frames.param_columnar){if(wire_rule>=tables.size())die_msg("frozen parameterized table missing");const Table&table=tables[size_t(wire_rule)];
+                rule_id=table.rule_id;const uint64_t instance_id=get_varint(p,end);if(instance_id>=table.rows.size())die_msg("frozen parameterized instance missing");values=&table.rows[size_t(instance_id)];}
+            else {if(wire_rule>=tables.size())die_msg("frozen parameterized inline rule table missing");rule_id=tables[size_t(wire_rule)].rule_id;
+                const DecodedTemplate&rule=model_rules[rule_id];inline_values.resize(rule.slot_type.size());
+                for(size_t slot=0;slot<inline_values.size();++slot)inline_values[slot]=read_value(p,end,rule.slot_type[slot]);
+                values=&inline_values;}
+            const DecodedTemplate&rule=model_rules[rule_id];
+            for(size_t i=0;i<rule.occurrence_slot.size();++i){payload.insert(payload.end(),rule.literals[i].begin(),rule.literals[i].end());
+                const std::vector<uint8_t>&value=(*values)[rule.occurrence_slot[i]];payload.insert(payload.end(),value.begin(),value.end());}
+            payload.insert(payload.end(),rule.literals.back().begin(),rule.literals.back().end());
+            if(payload.size()-output_begin>output_len)die_msg("frozen parameterized rule exceeds output");}
+    }
+    if(p!=end||slot_data!=slot_end||literal_data!=literal_end)die_msg("trailing frozen parameterized definition bytes");
+    return payload;
+}
+
+struct FrozenSemanticParamRaw {
+    std::vector<uint8_t>control,residual;
+    std::array<std::vector<uint8_t>,3>slot_data;
+    uint64_t lexicon_entries=0,lexicon_references=0;
+    bool valid=false;
+};
+
+static size_t frozen_slot_index(uint8_t type){
+    if(type<kIdentifier||type>kString)die_msg("frozen semantic slot type out of range");
+    return size_t(type-kIdentifier);
+}
+
+static FrozenSemanticParamRaw encode_frozen_semantic_param_pack(const std::vector<ParamSpanRecord>&records,
+                                                                 const LineStore&store,
+                                                                 const PretrainedParamPackage&model){
+    FrozenSemanticParamRaw raw;std::vector<uint64_t>uses(model.encoder_rules.size());
+    for(const ParamSpanRecord&record:records)if(record.program)for(const ParamSpanOp&op:record.ops)if(op.rule)++uses[op.rule_id];
+    std::vector<uint32_t>used;for(uint32_t i=0;i<uses.size();++i)if(uses[i])used.push_back(i);if(used.empty())return raw;
+    std::vector<uint32_t>remap(model.encoder_rules.size(),UINT32_MAX);
+    std::unordered_map<std::string,uint32_t>frequency;
+    for(const ParamSpanRecord&record:records)if(record.program)for(const ParamSpanOp&op:record.ops)if(op.rule){const ParsedLine&shape=model.encoder_rules[op.rule_id];
+        for(size_t slot=0;slot<op.values.size();++slot){std::string key;key.reserve(op.values[slot].size()+1);key.push_back(char(shape.slot_type[slot]));
+            key.append(reinterpret_cast<const char*>(op.values[slot].data()),op.values[slot].size());++frequency[key];}}
+    struct LexiconValue{uint8_t type=0;std::string value;uint32_t count=0;};std::vector<LexiconValue>lexicon;
+    for(const auto&item:frequency){const size_t len=item.first.size()-1;const uint64_t inline_cost=uint64_t(item.second)*(varint_size((uint64_t(len)<<1)|1)+len);
+        const uint64_t dictionary_cost=1+varint_size(len)+len+uint64_t(item.second)*2;
+        if(item.second>=2&&dictionary_cost<inline_cost)lexicon.push_back({uint8_t(item.first[0]),item.first.substr(1),item.second});}
+    std::sort(lexicon.begin(),lexicon.end(),[](const LexiconValue&a,const LexiconValue&b){
+        if(a.count!=b.count)return a.count>b.count;
+        if(a.type!=b.type)return a.type<b.type;
+        return a.value<b.value;
+    });
+    std::unordered_map<std::string,uint32_t>lexicon_id;lexicon_id.reserve(lexicon.size()*2+1);
+    for(uint32_t i=0;i<lexicon.size();++i){std::string key;key.reserve(lexicon[i].value.size()+1);key.push_back(char(lexicon[i].type));key+=lexicon[i].value;lexicon_id.emplace(std::move(key),i);}
+    put_varint(raw.control,lexicon.size());for(const LexiconValue&entry:lexicon){raw.control.push_back(entry.type);put_varint(raw.control,entry.value.size());
+        auto&channel=raw.slot_data[frozen_slot_index(entry.type)];channel.insert(channel.end(),entry.value.begin(),entry.value.end());}
+    raw.lexicon_entries=lexicon.size();put_varint(raw.control,used.size());
+    for(uint32_t local=0;local<used.size();++local){remap[used[local]]=local;put_varint(raw.control,used[local]);}
+    auto emit_value=[&](uint8_t type,const std::vector<uint8_t>&value){std::string key;key.reserve(value.size()+1);key.push_back(char(type));
+        key.append(reinterpret_cast<const char*>(value.data()),value.size());auto found=lexicon_id.find(key);
+        if(found!=lexicon_id.end()){put_varint(raw.control,uint64_t(found->second)<<1);++raw.lexicon_references;}
+        else{put_varint(raw.control,(uint64_t(value.size())<<1)|1);auto&channel=raw.slot_data[frozen_slot_index(type)];channel.insert(channel.end(),value.begin(),value.end());}};
+    put_varint(raw.control,records.size());const size_t bitmap_bytes=(records.size()+7)/8,bitmap_offset=raw.control.size();raw.control.resize(bitmap_offset+bitmap_bytes);
+    for(size_t i=0;i<records.size();++i)if(records[i].program)raw.control[bitmap_offset+i/8]|=uint8_t(1u<<(i%8));
+    for(const ParamSpanRecord&record:records){if(!record.program){const uint32_t len=store.len(record.id);raw.residual.insert(raw.residual.end(),store.data(record.id),store.data(record.id)+len);continue;}
+        for(const ParamSpanOp&op:record.ops){if(!op.rule){put_varint(raw.control,uint64_t(op.len)<<1);raw.residual.insert(raw.residual.end(),store.data(record.id)+op.target_off,store.data(record.id)+op.target_off+op.len);continue;}
+            const uint32_t local=remap[op.rule_id];if(local==UINT32_MAX)die_msg("frozen semantic rule remap missing");put_varint(raw.control,(uint64_t(local)<<1)|1);
+            const ParsedLine&shape=model.encoder_rules[op.rule_id];for(size_t slot=0;slot<op.values.size();++slot)emit_value(shape.slot_type[slot],op.values[slot]);}}
+    raw.valid=true;return raw;
+}
+
+static std::vector<uint8_t>decode_frozen_semantic_param_pack(const FrozenSemanticParamRaw&raw,
+                                                              const std::vector<DecodedTemplate>&model_rules,
+                                                              const std::vector<uint64_t>&lengths){
+    if(!raw.valid)die_msg("missing frozen semantic parameterized program");
+    const uint8_t*p=raw.control.data(),*end=p+raw.control.size();
+    std::array<const uint8_t*,3>cursor{},slot_end{};for(size_t i=0;i<3;++i){cursor[i]=raw.slot_data[i].data();slot_end[i]=cursor[i]+raw.slot_data[i].size();}
+    struct LexiconValue{uint8_t type=0;std::vector<uint8_t>value;};const uint64_t lexicon_count=get_varint(p,end);std::vector<LexiconValue>lexicon;lexicon.reserve(size_t(lexicon_count));
+    for(uint64_t i=0;i<lexicon_count;++i){if(p==end)die_msg("frozen semantic lexicon type missing");const uint8_t type=*p++;const size_t channel=frozen_slot_index(type);
+        const uint64_t len=get_varint(p,end);if(len>uint64_t(slot_end[channel]-cursor[channel]))die_msg("frozen semantic lexicon exceeds slot stream");
+        lexicon.push_back({type,std::vector<uint8_t>(cursor[channel],cursor[channel]+len)});cursor[channel]+=len;}
+    const uint64_t used_count=get_varint(p,end);std::vector<uint32_t>used;used.reserve(size_t(used_count));
+    for(uint64_t i=0;i<used_count;++i){const uint64_t id=get_varint(p,end);if(id>=model_rules.size())die_msg("frozen semantic model rule missing");used.push_back(uint32_t(id));}
+    auto read_value=[&](uint8_t type){const uint64_t code=get_varint(p,end);if(!(code&1)){const uint64_t id=code>>1;
+            if(id>=lexicon.size()||lexicon[size_t(id)].type!=type)die_msg("frozen semantic lexicon reference mismatch");
+            return lexicon[size_t(id)].value;
+        }
+        const size_t channel=frozen_slot_index(type);const uint64_t len=code>>1;if(len>uint64_t(slot_end[channel]-cursor[channel]))die_msg("frozen semantic inline slot exceeds stream");
+        std::vector<uint8_t>value(cursor[channel],cursor[channel]+len);cursor[channel]+=len;return value;};
+    const uint64_t count=get_varint(p,end);if(count!=lengths.size())die_msg("frozen semantic record count mismatch");const size_t bitmap_bytes=(lengths.size()+7)/8;
+    if(bitmap_bytes>size_t(end-p))die_msg("frozen semantic bitmap exceeds control");
+    const uint8_t*bitmap=p;p+=bitmap_bytes;
+    const uint8_t*residual=raw.residual.data(),*residual_end=residual+raw.residual.size();std::vector<uint8_t>payload;uint64_t total=0;
+    for(uint64_t len:lengths){if(len>SIZE_MAX-total)die_msg("frozen semantic output too large");total+=len;}payload.reserve(size_t(total));
+    for(size_t row=0;row<lengths.size();++row){const uint64_t output_len=lengths[row];const bool program=(bitmap[row/8]>>(row%8))&1u;
+        if(!program){if(output_len>uint64_t(residual_end-residual))die_msg("frozen semantic raw exceeds stream");payload.insert(payload.end(),residual,residual+output_len);residual+=output_len;continue;}
+        const size_t output_begin=payload.size();while(payload.size()-output_begin<output_len){const uint64_t code=get_varint(p,end);
+            if(!(code&1)){const uint64_t len=code>>1;if(!len||len>output_len-(payload.size()-output_begin)||len>uint64_t(residual_end-residual))die_msg("frozen semantic ADD exceeds output");
+                payload.insert(payload.end(),residual,residual+len);residual+=len;continue;}
+            const uint64_t local=code>>1;if(local>=used.size())die_msg("frozen semantic local rule missing");const DecodedTemplate&rule=model_rules[used[size_t(local)]];
+            std::vector<std::vector<uint8_t>>values(rule.slot_type.size());for(size_t slot=0;slot<values.size();++slot)values[slot]=read_value(rule.slot_type[slot]);
+            for(size_t i=0;i<rule.occurrence_slot.size();++i){payload.insert(payload.end(),rule.literals[i].begin(),rule.literals[i].end());
+                const auto&value=values[rule.occurrence_slot[i]];payload.insert(payload.end(),value.begin(),value.end());}
+            payload.insert(payload.end(),rule.literals.back().begin(),rule.literals.back().end());if(payload.size()-output_begin>output_len)die_msg("frozen semantic rule exceeds output");}}
+    if(p!=end||residual!=residual_end)die_msg("trailing frozen semantic control/residual");
+    for(size_t i=0;i<3;++i)if(cursor[i]!=slot_end[i])die_msg("trailing frozen semantic slot bytes");
+    return payload;
+}
+
+static SemanticBuffer fuse_frozen_semantic_param(const SemanticBuffer&base,const FrozenSemanticParamRaw&program){
+    SemanticBuffer out;put_varint(out.control,1);put_varint(out.control,base.control.size());
+    for(size_t c=0;c<kSemanticChannels;++c)put_varint(out.control,base.payload[c].size());
+    put_varint(out.control,program.control.size());out.control.insert(out.control.end(),base.control.begin(),base.control.end());
+    out.control.insert(out.control.end(),program.control.begin(),program.control.end());out.payload=base.payload;
+    out.payload[kRawDefinition]=program.residual;
+    out.payload[kIdentifierValue].insert(out.payload[kIdentifierValue].end(),program.slot_data[0].begin(),program.slot_data[0].end());
+    out.payload[kNumberValue].insert(out.payload[kNumberValue].end(),program.slot_data[1].begin(),program.slot_data[1].end());
+    out.payload[kStringValue].insert(out.payload[kStringValue].end(),program.slot_data[2].begin(),program.slot_data[2].end());
+    out.raw_ids=base.raw_ids;return out;
+}
+
+static void decode_fused_frozen_semantic(const SemanticBuffer&fused,const std::vector<DecodedTemplate>&model_rules,
+                                         DecoderStore&store){
+    const uint8_t*p=fused.control.data(),*end=p+fused.control.size();if(get_varint(p,end)!=1)die_msg("unknown fused semantic version");
+    const uint64_t base_control_len=get_varint(p,end);std::array<uint64_t,kSemanticChannels>base_lengths{};
+    for(uint64_t&len:base_lengths)len=get_varint(p,end);
+    const uint64_t program_control_len=get_varint(p,end);
+    if(base_control_len+program_control_len!=uint64_t(end-p))die_msg("fused semantic control lengths mismatch");
+    SemanticBuffer base;base.control.assign(p,p+base_control_len);p+=base_control_len;FrozenSemanticParamRaw program;program.valid=true;
+    program.control.assign(p,p+program_control_len);p+=program_control_len;if(p!=end)die_msg("trailing fused semantic control");
+    for(size_t c=0;c<kSemanticChannels;++c){if(c==kRawDefinition)continue;if(base_lengths[c]>fused.payload[c].size())die_msg("fused semantic base payload exceeds stream");
+        base.payload[c].assign(fused.payload[c].begin(),fused.payload[c].begin()+base_lengths[c]);}
+    program.residual=fused.payload[kRawDefinition];
+    const size_t slot_channels[3]={kIdentifierValue,kNumberValue,kStringValue};
+    for(size_t i=0;i<3;++i){const size_t c=slot_channels[i];program.slot_data[i].assign(fused.payload[c].begin()+base_lengths[c],fused.payload[c].end());}
+    const std::vector<uint64_t>raw_lengths=semantic_raw_lengths(base.control);
+    base.payload[kRawDefinition]=decode_frozen_semantic_param_pack(program,model_rules,raw_lengths);
+    if(base.payload[kRawDefinition].size()!=base_lengths[kRawDefinition])die_msg("fused semantic reconstructed raw length mismatch");
+    decode_semantic_templates(base,store);
+}
+
 struct Row {
     const char* name = nullptr;
     uint64_t wire = 0;
@@ -2107,10 +2537,12 @@ int main(int argc, char** argv) {
     size_t max_files = SIZE_MAX;
     size_t pretrain_max_files = SIZE_MAX;
     size_t model_kib = 0;
+    size_t param_model_kib = 0;
     unsigned model_min_corpora = 1;
     unsigned source_program_k = 4;
     bool pretrain_all_identifiers = false;
     std::vector<std::string> pretrain_manifests;
+    std::vector<std::string> param_pretrain_source_roots;
     std::string semantic_export_prefix;
     std::string source_dictionary_path;
     bool semantic_export_only = false;
@@ -2119,8 +2551,10 @@ int main(int argc, char** argv) {
         if (!std::strcmp(argv[i], "--manifest") && i + 1 < argc) manifest = argv[++i];
         else if (!std::strcmp(argv[i], "--max-files") && i + 1 < argc) max_files = std::strtoull(argv[++i], nullptr, 10);
         else if (!std::strcmp(argv[i], "--pretrain-manifest") && i + 1 < argc) pretrain_manifests.emplace_back(argv[++i]);
+        else if (!std::strcmp(argv[i], "--param-pretrain-source-root") && i + 1 < argc) param_pretrain_source_roots.emplace_back(argv[++i]);
         else if (!std::strcmp(argv[i], "--pretrain-max-files") && i + 1 < argc) pretrain_max_files = std::strtoull(argv[++i], nullptr, 10);
         else if (!std::strcmp(argv[i], "--model-kib") && i + 1 < argc) model_kib = std::strtoull(argv[++i], nullptr, 10);
+        else if (!std::strcmp(argv[i], "--param-model-kib") && i + 1 < argc) param_model_kib = std::strtoull(argv[++i], nullptr, 10);
         else if (!std::strcmp(argv[i], "--model-min-corpora") && i + 1 < argc) model_min_corpora = unsigned(std::strtoul(argv[++i], nullptr, 10));
         else if (!std::strcmp(argv[i], "--source-k") && i + 1 < argc) source_program_k = unsigned(std::strtoul(argv[++i], nullptr, 10));
         else if (!std::strcmp(argv[i], "--pretrain-all-identifiers")) pretrain_all_identifiers = true;
@@ -2133,8 +2567,12 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
-    if (!manifest || zlevel < 0 || zlevel > 3 || source_program_k > 32 || (model_kib && pretrain_manifests.empty()) || (!model_kib && !pretrain_manifests.empty()) || (semantic_export_only&&semantic_export_prefix.empty())) {
-        std::fprintf(stderr, "usage: %s --manifest FILE [--max-files N] [--z 0..3] [--source-k 0..32] [--source-dict FILE] [--semantic-export-prefix PATH [--semantic-export-only]] [--pretrain-manifest FILE ... --model-kib N] [--pretrain-max-files N] [--model-min-corpora N] [--pretrain-all-identifiers]\n", argv[0]);
+    const bool any_pretrained=model_kib!=0||param_model_kib!=0;
+    const bool param_training_available=!pretrain_manifests.empty()||!param_pretrain_source_roots.empty();
+    if (!manifest || zlevel < 0 || zlevel > 3 || source_program_k > 32 || (model_kib&&pretrain_manifests.empty()) ||
+        (param_model_kib&&!param_training_available) || (!any_pretrained&&(!pretrain_manifests.empty()||!param_pretrain_source_roots.empty())) ||
+        (!param_model_kib&&!param_pretrain_source_roots.empty()) || (semantic_export_only&&semantic_export_prefix.empty())) {
+        std::fprintf(stderr, "usage: %s --manifest FILE [--max-files N] [--z 0..3] [--source-k 0..32] [--source-dict FILE] [--semantic-export-prefix PATH [--semantic-export-only]] [--pretrain-manifest FILE ... --model-kib N] [--param-model-kib N --param-pretrain-source-root DIR ...] [--pretrain-max-files N] [--model-min-corpora N] [--pretrain-all-identifiers]\n", argv[0]);
         return 2;
     }
     for(const std::string&training:pretrain_manifests)if(training==manifest)die_msg("pretraining and target manifests must be disjoint");
@@ -2144,6 +2582,18 @@ int main(int argc, char** argv) {
     if(use_pretrained){const auto training_begin=Clock::now();PretrainedBuilder builder(pretrain_all_identifiers);for(size_t i=0;i<pretrain_manifests.size();++i)builder.scan_manifest(pretrain_manifests[i],pretrain_max_files,i);const double training_seconds=elapsed(training_begin);pretrained=builder.compile(model_kib*1024,zlevel,training_seconds,model_min_corpora);}
     const PretrainedPackage frozen_pretrained=pretrained;
     FrameCodec pretrained_package_codec;const std::vector<uint8_t>pretrained_receiver_raw=use_pretrained?pretrained_package_codec.decompress(pretrained.frame):std::vector<uint8_t>{};if(pretrained_receiver_raw!=pretrained.raw)die_msg("pretrained receiver package mismatch");
+    const bool use_param_pretrained=param_model_kib!=0;
+    PretrainedParamPackage pretrained_param;
+    if(use_param_pretrained){const auto training_begin=Clock::now();PretrainedParamBuilder builder;
+        for(size_t i=0;i<pretrain_manifests.size();++i)builder.scan_manifest(pretrain_manifests[i],pretrain_max_files,i);
+        for(size_t i=0;i<param_pretrain_source_roots.size();++i)builder.scan_source_root(param_pretrain_source_roots[i],pretrain_max_files,pretrain_manifests.size()+i);
+        const double training_seconds=elapsed(training_begin);
+        pretrained_param=builder.compile(param_model_kib*1024,zlevel,training_seconds,model_min_corpora);}
+    FrameCodec pretrained_param_package_codec;
+    const std::vector<uint8_t>pretrained_param_receiver_raw=use_param_pretrained?pretrained_param_package_codec.decompress(pretrained_param.frame):std::vector<uint8_t>{};
+    if(pretrained_param_receiver_raw!=pretrained_param.raw)die_msg("pretrained parameterized receiver package mismatch");
+    std::vector<DecodedTemplate>pretrained_param_receiver_rules;
+    if(use_param_pretrained)decode_pretrained_param_package(pretrained_param_receiver_raw,pretrained_param_receiver_rules);
     const bool use_source_dictionary=!source_dictionary_path.empty();
     const std::vector<uint8_t>source_dictionary=use_source_dictionary?load_file_bytes(source_dictionary_path):std::vector<uint8_t>{};
     if(use_source_dictionary&&(source_dictionary.empty()||source_dictionary.size()>UINT32_MAX))die_msg("source dictionary size out of range");
@@ -2164,11 +2614,13 @@ int main(int argc, char** argv) {
     ModelFrameCodec model_p4_encoder_frames(pretrained.raw,zlevel),model_p4_decoder_frames(pretrained_receiver_raw,zlevel);
     ModelFrameCodec model_local_superblock_encoder_frames(pretrained.raw,zlevel),model_local_superblock_decoder_frames(pretrained_receiver_raw,zlevel);
     ModelFrameCodec pretrained_source_encoder_frames(pretrained.raw,zlevel),pretrained_source_decoder_frames(pretrained_receiver_raw,zlevel);
+    ModelFrameCodec pretrained_param_encoder_frames(pretrained_param.raw,zlevel),pretrained_param_decoder_frames(pretrained_param_receiver_raw,zlevel);
     ModelFrameCodec source_dictionary_encoder_frames(source_dictionary,zlevel),source_dictionary_decoder_frames(source_dictionary_decoded,zlevel);
     ModelFrameCodec token_dictionary_encoder_frames(source_dictionary,zlevel),token_dictionary_decoder_frames(source_dictionary_decoded,zlevel);
-    Row p0("P0-appearance"), p1("P1-lexicographic"), p4("P4-alpha-template"),p5("P5-multiline"),p6("P6-token-forest"),p7s("P7-source-location"),p7p("P7p-source-superblock"),p7t("P7t-all-token-spans"),p7("P7-online-template"),p7b("P7b-local-rule-online-token"),p9("P9-semantic-split-zstd"),p9s("P9s-semantic+source"),p9sg("P9sg-source-basis-grammar"),p9sm("P9sm-pretrained-source-grammar"),p9sd("P9s+trained-source-dict"),p9t("P9t-semantic+token-spans"),p9td("P9t+trained-source-dict"),p9g("P9g-parameterized-spans"),p8("P8-pretrained-superblock"),p8c("P8c-frozen+TU-local-superblock"),p8d("P8-pretrained-dict-P4"), p10("P10-best-local-frame"),p10sd("P10+source-dict"),p10p("P10+P8-charged-union"),p11("P11-best-token-span-union"),p11d("P11+token-spans+dict"),p12("P12-best-param-superblock"),p13("P13-best-pretrained-superblock-union");
-    std::vector<Row*> rows{&p0, &p1, &p4,&p5,&p6,&p7s,&p7p,&p7t,&p7,&p7b,&p9,&p9s,&p9sg};if(use_pretrained)rows.push_back(&p9sm);if(use_source_dictionary)rows.push_back(&p9sd);rows.push_back(&p9t);if(use_source_dictionary)rows.push_back(&p9td);rows.push_back(&p9g);if(use_pretrained){rows.push_back(&p8);rows.push_back(&p8c);rows.push_back(&p8d);}rows.push_back(&p10);if(use_source_dictionary)rows.push_back(&p10sd);if(use_pretrained)rows.push_back(&p10p);rows.push_back(&p11);if(use_source_dictionary)rows.push_back(&p11d);rows.push_back(&p12);if(use_pretrained)rows.push_back(&p13);
+    Row p0("P0-appearance"), p1("P1-lexicographic"), p4("P4-alpha-template"),p5("P5-multiline"),p6("P6-token-forest"),p7s("P7-source-location"),p7p("P7p-source-superblock"),p7t("P7t-all-token-spans"),p7("P7-online-template"),p7b("P7b-local-rule-online-token"),p9("P9-semantic-split-zstd"),p9s("P9s-semantic+source"),p9sg("P9sg-source-basis-grammar"),p9sm("P9sm-pretrained-source-grammar"),p9sd("P9s+trained-source-dict"),p9t("P9t-semantic+token-spans"),p9td("P9t+trained-source-dict"),p9g("P9g-parameterized-spans"),p8("P8-pretrained-superblock"),p8c("P8c-frozen+TU-local-superblock"),p8d("P8-pretrained-dict-P4"), p10("P10-best-local-frame"),p10sd("P10+source-dict"),p10p("P10+P8-charged-union"),p11("P11-best-token-span-union"),p11d("P11+token-spans+dict"),p12("P12-best-param-superblock"),p13("P13-best-pretrained-superblock-union"),p14("P14-pretrained-param-spans"),p15("P15-all-pretrained-union"),p16("P16-fused-pretrained-param"),p17("P17-all-pretrained-fused-union");
+    std::vector<Row*> rows{&p0, &p1, &p4,&p5,&p6,&p7s,&p7p,&p7t,&p7,&p7b,&p9,&p9s,&p9sg};if(use_pretrained)rows.push_back(&p9sm);if(use_source_dictionary)rows.push_back(&p9sd);rows.push_back(&p9t);if(use_source_dictionary)rows.push_back(&p9td);rows.push_back(&p9g);if(use_pretrained){rows.push_back(&p8);rows.push_back(&p8c);rows.push_back(&p8d);}rows.push_back(&p10);if(use_source_dictionary)rows.push_back(&p10sd);if(use_pretrained)rows.push_back(&p10p);rows.push_back(&p11);if(use_source_dictionary)rows.push_back(&p11d);rows.push_back(&p12);if(use_pretrained)rows.push_back(&p13);if(use_param_pretrained){rows.push_back(&p14);rows.push_back(&p15);rows.push_back(&p16);rows.push_back(&p17);}
     if(use_pretrained){const uint64_t package_wire=pretrained.frame.size()+4;p8.wire=package_wire;p8c.wire=package_wire;p8d.wire=package_wire;p9sm.wire=package_wire;p10p.wire=package_wire;p13.wire=package_wire;}
+    if(use_param_pretrained){const uint64_t package_wire=pretrained_param.frame.size()+4;p14.wire=package_wire;p15.wire=package_wire;p16.wire=package_wire;p17.wire=package_wire;if(use_pretrained){p15.wire+=pretrained.frame.size()+4;p17.wire+=pretrained.frame.size()+4;}}
     if(use_source_dictionary){const uint64_t package_wire=source_dictionary_package.size()+4;p9sd.wire=package_wire;p9td.wire=package_wire;p10sd.wire=package_wire;p11d.wire=package_wire;}
     std::unique_ptr<SemanticFrameWriter>semantic_writer;if(!semantic_export_prefix.empty())semantic_writer=std::make_unique<SemanticFrameWriter>(semantic_export_prefix);
     for (Row* row : rows) row->tu_wire.reserve(corpus.files.size());
@@ -2181,6 +2633,8 @@ int main(int argc, char** argv) {
     MultiStats multi_stats;
     SourceLearner source_learner;SourceStats source_stats;SourcePackStats source_pack_stats,semantic_source_pack_stats,grammar_source_pack_stats,pretrained_source_pack_stats,dictionary_source_pack_stats;TokenSpanStats all_token_span_stats,token_span_stats,dictionary_token_span_stats;TokenSpanSweepStats all_token_span_sweep,token_span_sweep,dictionary_token_span_sweep;SourceCatalog source_catalog;std::vector<LineSourceMeta>source_meta(1);
     ParamSpanStats param_span_stats;uint64_t param_span_literal_wire=0,param_span_candidate_wire=0,param_span_selected_wire=0,param_span_frame_wins=0,param_span_combined_wins=0,param_span_columnar_wins=0;
+    ParamSpanStats pretrained_param_stats;uint64_t pretrained_param_literal_wire=0,pretrained_param_candidate_wire=0,pretrained_param_selected_wire=0,pretrained_param_frame_wins=0,pretrained_param_combined_wins=0,pretrained_param_columnar_wins=0;
+    uint64_t fused_param_candidate_wire=0,fused_param_selected_wire=0,fused_param_frame_wins=0;
     std::array<uint64_t,4>p13_choice_tus{},p13_choice_wire{};
     std::array<std::vector<uint8_t>,kSourceCategoryCount>attributed_bytes;
     uint64_t cumulative_raw = 0;
@@ -2389,6 +2843,55 @@ int main(int argc, char** argv) {
         param_span_literal_wire+=p9_raw_wire;param_span_candidate_wire+=p9g_span_frames.valid?p9g_span_frames.wire:p9_raw_wire;param_span_selected_wire+=(p9g_use_span?p9g_span_frames.wire:p9_raw_wire)+1;if(p9g_use_span)++param_span_frame_wins;if(p9g_span_frames.valid&&p9g_span_frames.combined)++param_span_combined_wins;if(use_columnar)++param_span_columnar_wins;
         const auto d9g=Clock::now();if(p9g_use_span){SemanticBuffer decoded=decompress_semantic(p9_frames,frames);const std::vector<uint64_t>lengths=semantic_raw_lengths(decoded.control);decoded.payload[kRawDefinition]=decode_implicit_param_span_pack(p9g_span_frames,frames,lengths);decode_semantic_templates(decoded,p9g.decoder);}else decode_semantic_templates(p9_decoded,p9g.decoder);p9g.decode_seconds+=elapsed(d9g);verify_definitions(new_ids,truth,p9g.decoder);
 
+        TokenSpanFrames p9h_span_frames;SemanticFrames p16_frames;
+        uint64_t p9_pretrained_param_size=UINT64_MAX,p16_candidate_size=UINT64_MAX,w14=0,w16=0;
+        bool p9h_use_span=false,p16_use_fused=false;
+        auto decode_p9_frozen_param=[&](DecoderStore&decoder){SemanticBuffer decoded=decompress_semantic(p9_frames,frames);
+            const std::vector<uint64_t>lengths=semantic_raw_lengths(decoded.control);
+            decoded.payload[kRawDefinition]=decode_frozen_param_span_pack(p9h_span_frames,frames,pretrained_param_decoder_frames,pretrained_param_receiver_rules,lengths);
+            decode_semantic_templates(decoded,decoder);};
+        auto decode_p16_fused=[&](DecoderStore&decoder){decode_fused_frozen_semantic(decompress_semantic(p16_frames,frames),pretrained_param_receiver_rules,decoder);};
+        if(use_param_pretrained){const auto e9h=Clock::now();ParamSpanStats inline_stats,columnar_stats;
+            std::vector<ParamSpanRecord>planned_records;const auto shared_plan_begin=Clock::now();
+            TokenSpanRaw inline_raw=encode_frozen_param_span_pack(p9_selected->raw_ids,truth,pretrained_param,false,inline_stats,&planned_records);
+            const double shared_plan_seconds=elapsed(shared_plan_begin);
+            TokenSpanRaw columnar_raw=encode_frozen_param_span_pack(p9_selected->raw_ids,truth,pretrained_param,true,columnar_stats);
+            TokenSpanFrames inline_frames=compress_token_span_pack(inline_raw,frames,zlevel,100,32,0,false,&pretrained_param_encoder_frames);
+            TokenSpanFrames columnar_frames=compress_token_span_pack(columnar_raw,frames,zlevel,100,32,0,false,&pretrained_param_encoder_frames);
+            const bool param_columnar=columnar_frames.valid&&(!inline_frames.valid||columnar_frames.wire<inline_frames.wire);
+            p9h_span_frames=param_columnar?std::move(columnar_frames):std::move(inline_frames);
+            const ParamSpanStats&current=param_columnar?columnar_stats:inline_stats;
+            p9_pretrained_param_size=p9h_span_frames.valid?p9_without_raw+p9h_span_frames.wire:UINT64_MAX;
+            p9h_use_span=p9h_span_frames.valid&&p9_pretrained_param_size<p9_frames.wire;
+            w14=std::min<uint64_t>(p9_frames.wire,p9_pretrained_param_size)+1;p14.encode_seconds+=elapsed(e9h);
+            pretrained_param_stats.used_rules+=current.used_rules;pretrained_param_stats.rule_instances+=current.rule_instances;
+            pretrained_param_stats.unique_instances+=current.unique_instances;pretrained_param_stats.program_records+=current.program_records;
+            pretrained_param_stats.literal_records+=current.literal_records;pretrained_param_stats.covered_bytes+=current.covered_bytes;
+            pretrained_param_stats.residual_bytes+=current.residual_bytes;pretrained_param_stats.target_bytes+=current.target_bytes;
+            pretrained_param_stats.program_ops+=current.program_ops;pretrained_param_stats.lexicon_entries+=current.lexicon_entries;
+            pretrained_param_stats.lexicon_references+=current.lexicon_references;pretrained_param_literal_wire+=p9_raw_wire;
+            pretrained_param_candidate_wire+=p9h_span_frames.valid?p9h_span_frames.wire:p9_raw_wire;
+            pretrained_param_selected_wire+=(p9h_use_span?p9h_span_frames.wire:p9_raw_wire)+1;
+            if(p9h_use_span)++pretrained_param_frame_wins;
+            if(p9h_span_frames.valid&&p9h_span_frames.combined)++pretrained_param_combined_wins;
+            if(param_columnar)++pretrained_param_columnar_wins;
+            const auto d9h=Clock::now();if(p9h_use_span)decode_p9_frozen_param(p14.decoder);else decode_semantic_templates(p9_decoded,p14.decoder);
+            p14.decode_seconds+=elapsed(d9h);verify_definitions(new_ids,truth,p14.decoder);
+
+            const auto e16=Clock::now();const FrozenSemanticParamRaw semantic_program=encode_frozen_semantic_param_pack(planned_records,truth,pretrained_param);
+            if(semantic_program.valid){const SemanticBuffer fused= fuse_frozen_semantic_param(*p9_selected,semantic_program);
+                p16_frames=compress_semantic(fused,frames,zlevel);p16_candidate_size=p16_frames.wire;
+                p16_use_fused=p16_candidate_size<p9_frames.wire;}
+            p16.encode_seconds+=shared_plan_seconds+elapsed(e16);w16=std::min<uint64_t>(p9_frames.wire,p16_candidate_size)+1;
+            if(p16_candidate_size!=UINT64_MAX)fused_param_candidate_wire+=p16_candidate_size;
+            else fused_param_candidate_wire+=p9_frames.wire;
+            fused_param_selected_wire+=(p16_use_fused?p16_candidate_size:p9_frames.wire)+1;
+            if(p16_use_fused)++fused_param_frame_wins;
+            const auto d16=Clock::now();if(p16_use_fused)decode_p16_fused(p16.decoder);
+            else decode_semantic_templates(p9_decoded,p16.decoder);
+            p16.decode_seconds+=elapsed(d16);verify_definitions(new_ids,truth,p16.decoder);
+        }
+
         const auto e5=Clock::now();size_t p5_size=SIZE_MAX;std::vector<uint8_t>p5_control_frame,p5_data_frame;MultiStats selected_multi;
         for(size_t width:{size_t(2),size_t(4),size_t(8),size_t(16)}){MultiStats candidate_stats;SplitBuffer candidate=encode_multiline(new_ids,truth,width,candidate_stats);std::vector<uint8_t>cf=frames.compress(candidate.control,zlevel),df=frames.compress(candidate.data,zlevel);size_t size=cf.size()+df.size()+8;if(size<p5_size){p5_size=size;p5_control_frame=std::move(cf);p5_data_frame=std::move(df);selected_multi=candidate_stats;}}
         p5.encode_seconds+=elapsed(e5);multi_stats.rules+=selected_multi.rules;multi_stats.instances+=selected_multi.instances;multi_stats.raw_units+=selected_multi.raw_units;multi_stats.lines+=selected_multi.lines;
@@ -2529,7 +3032,8 @@ int main(int argc, char** argv) {
         const auto d12=Clock::now();decode_param_span_choice(p12.decoder);
         p12.decode_seconds+=elapsed(d12);verify_definitions(new_ids,truth,p12.decoder);const uint64_t w12=best_param_span+1;
 
-        uint64_t w13=0;if(use_pretrained){const size_t best_pretrained_superblock=std::min({best_param_span,size_t(w8c),size_t(w8d),size_t(p9_pretrained_source_size)});const auto d13=Clock::now();
+        size_t best_pretrained_superblock=best_param_span;uint64_t w13=0;
+        if(use_pretrained){best_pretrained_superblock=std::min({best_param_span,size_t(w8c),size_t(w8d),size_t(p9_pretrained_source_size)});const auto d13=Clock::now();
             size_t choice=0;if(best_pretrained_superblock==p9_pretrained_source_size){choice=3;decode_p9_source(p9sm_source_frames,&pretrained_source_decoder_frames,p13.decoder,&frozen_pretrained.decoder);}
             else if(best_pretrained_superblock==w8c){choice=1;decode_p8c(p13.decoder);}
             else if(best_pretrained_superblock==w8d){choice=2;decode_templates(p8d_control_decoded,p8d_data_decoded,p13.decoder);}
@@ -2537,11 +3041,29 @@ int main(int argc, char** argv) {
             ++p13_choice_tus[choice];p13_choice_wire[choice]+=best_pretrained_superblock;
             p13.decode_seconds+=elapsed(d13);verify_definitions(new_ids,truth,p13.decoder);w13=best_pretrained_superblock+1;}
 
+        uint64_t w15=0,w17=0;if(use_param_pretrained){const size_t best_all_pretrained=std::min(best_pretrained_superblock,size_t(p9_pretrained_param_size));
+            const auto d15=Clock::now();
+            if(best_all_pretrained==p9_pretrained_param_size)decode_p9_frozen_param(p15.decoder);
+            else if(use_pretrained&&best_all_pretrained==p9_pretrained_source_size)decode_p9_source(p9sm_source_frames,&pretrained_source_decoder_frames,p15.decoder,&frozen_pretrained.decoder);
+            else if(use_pretrained&&best_all_pretrained==w8c)decode_p8c(p15.decoder);
+            else if(use_pretrained&&best_all_pretrained==w8d)decode_templates(p8d_control_decoded,p8d_data_decoded,p15.decoder);
+            else decode_param_span_choice(p15.decoder);
+            p15.decode_seconds+=elapsed(d15);verify_definitions(new_ids,truth,p15.decoder);w15=best_all_pretrained+1;
+
+            const size_t best_fused_pretrained=std::min(best_all_pretrained,size_t(p16_candidate_size));const auto d17=Clock::now();
+            if(best_fused_pretrained==p16_candidate_size)decode_p16_fused(p17.decoder);
+            else if(best_fused_pretrained==p9_pretrained_param_size)decode_p9_frozen_param(p17.decoder);
+            else if(use_pretrained&&best_fused_pretrained==p9_pretrained_source_size)decode_p9_source(p9sm_source_frames,&pretrained_source_decoder_frames,p17.decoder,&frozen_pretrained.decoder);
+            else if(use_pretrained&&best_fused_pretrained==w8c)decode_p8c(p17.decoder);
+            else if(use_pretrained&&best_fused_pretrained==w8d)decode_templates(p8d_control_decoded,p8d_data_decoded,p17.decoder);
+            else decode_param_span_choice(p17.decoder);
+            p17.decode_seconds+=elapsed(d17);verify_definitions(new_ids,truth,p17.decoder);w17=best_fused_pretrained+1;}
+
         const uint64_t w0 = p0_frame.size() + 4;
         const uint64_t w4 = p4_size;
         const uint64_t w9=p9_frames.wire;
         const uint64_t w10 = std::min({w1,w4,w5,w6,w7s,p7p_size,w9,p9_source_size}) + 1;
-        std::vector<uint64_t>current{w0,w1,w4,w5,w6,w7s,w7p,w7t,w7,w7b,w9,w9s,w9sg};if(use_pretrained)current.push_back(w9sm);if(use_source_dictionary)current.push_back(w9sd);current.push_back(w9t);if(use_source_dictionary)current.push_back(w9td);current.push_back(w9g);if(use_pretrained){current.push_back(w8);current.push_back(w8c);current.push_back(w8d);}current.push_back(w10);if(use_source_dictionary)current.push_back(w10sd);if(use_pretrained)current.push_back(w10p);current.push_back(w11);if(use_source_dictionary)current.push_back(w11d);current.push_back(w12);if(use_pretrained)current.push_back(w13);
+        std::vector<uint64_t>current{w0,w1,w4,w5,w6,w7s,w7p,w7t,w7,w7b,w9,w9s,w9sg};if(use_pretrained)current.push_back(w9sm);if(use_source_dictionary)current.push_back(w9sd);current.push_back(w9t);if(use_source_dictionary)current.push_back(w9td);current.push_back(w9g);if(use_pretrained){current.push_back(w8);current.push_back(w8c);current.push_back(w8d);}current.push_back(w10);if(use_source_dictionary)current.push_back(w10sd);if(use_pretrained)current.push_back(w10p);current.push_back(w11);if(use_source_dictionary)current.push_back(w11d);current.push_back(w12);if(use_pretrained)current.push_back(w13);if(use_param_pretrained){current.push_back(w14);current.push_back(w15);current.push_back(w16);current.push_back(w17);}
         for (size_t r = 0; r < rows.size(); ++r) {rows[r]->wire += current[r];rows[r]->tu_wire.push_back(current[r]);}
         p10.encode_seconds = p1.encode_seconds + p4.encode_seconds+p5.encode_seconds+p6.encode_seconds+p7s.encode_seconds+p7p.encode_seconds+p9.encode_seconds+p9s.encode_seconds;
         p11.encode_seconds=p10.encode_seconds+p7t.encode_seconds+p9t.encode_seconds;
@@ -2575,6 +3097,14 @@ int main(int argc, char** argv) {
     // P8d reuses the P4 transform output in this all-row harness.  Charge the transform work as
     // well as its additional dictionary/plain actual-frame comparison before reporting throughput.
     if(use_pretrained){p8d.encode_seconds+=p4.encode_seconds;p10p.encode_seconds=p1.encode_seconds+p8d.encode_seconds+p5.encode_seconds+p6.encode_seconds+p7s.encode_seconds+p7p.encode_seconds+p9s.encode_seconds;p13.encode_seconds=p12.encode_seconds+p8c.encode_seconds+p8d.encode_seconds+p9sm.encode_seconds;}
+    if(use_param_pretrained){const double parameterized_transform_seconds=p14.encode_seconds;
+        const double fused_transform_seconds=p16.encode_seconds;
+        p14.encode_seconds+=p9.encode_seconds;
+        p16.encode_seconds+=p9.encode_seconds;
+        p15.encode_seconds=p12.encode_seconds+parameterized_transform_seconds;
+        p17.encode_seconds=p12.encode_seconds+parameterized_transform_seconds+fused_transform_seconds;
+        if(use_pretrained){p15.encode_seconds+=p8c.encode_seconds+p8d.encode_seconds+p9sm.encode_seconds;
+            p17.encode_seconds+=p8c.encode_seconds+p8d.encode_seconds+p9sm.encode_seconds;}}
 
     std::array<uint64_t,kSourceCategoryCount>attributed_zstd{};
     for(size_t category=0;category<kSourceCategoryCount;++category)attributed_zstd[category]=frames.compress(attributed_bytes[category],zlevel).size();
@@ -2705,6 +3235,16 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long long>(param_span_stats.candidate_shapes),static_cast<unsigned long long>(param_span_stats.selected_rules),static_cast<unsigned long long>(param_span_stats.used_rules),static_cast<unsigned long long>(param_span_stats.rule_instances),static_cast<unsigned long long>(param_span_stats.unique_instances),
                 static_cast<unsigned long long>(param_span_stats.program_records),static_cast<unsigned long long>(param_span_stats.literal_records),param_span_stats.covered_bytes/1048576.0,param_span_stats.residual_bytes/1048576.0,param_span_stats.target_bytes/1048576.0,static_cast<unsigned long long>(param_span_stats.program_ops),
                 static_cast<unsigned long long>(param_span_frame_wins),static_cast<unsigned long long>(param_span_combined_wins),static_cast<unsigned long long>(param_span_columnar_wins),param_span_literal_wire/1048576.0,param_span_candidate_wire/1048576.0,param_span_selected_wire/1048576.0);
+    if(use_param_pretrained)std::printf("P14 pretrained parameterized sub-superblocks input=%s training=%.2f GiB/%llu lines/%llu distinct sampled=%llu windows=%llu candidate-shapes=%llu in %.2fs selected-rules=%zu package raw/wire=%.1f/%.1f KiB model-id=%016llx; TU rule-sets=%llu instances/unique=%llu/%llu program/literal-records=%llu/%llu covered/residual/target=%.2f/%.2f/%.2f MiB ops=%llu lexicon entries/refs=%llu/%llu frame-wins=%llu combined/columnar-candidates=%llu/%llu raw-channel literal/candidate/selected=%.3f/%.3f/%.3f MiB model-dictionary wins=%llu saved-before-charge=%.1f KiB\n",
+                param_pretrain_source_roots.empty()?"expanded-ii":(pretrain_manifests.empty()?"raw-source":"mixed"),pretrained_param.training_raw/1073741824.0,static_cast<unsigned long long>(pretrained_param.training_lines),static_cast<unsigned long long>(pretrained_param.training_distinct_lines),static_cast<unsigned long long>(pretrained_param.sampled_lines),
+                static_cast<unsigned long long>(pretrained_param.candidate_windows),static_cast<unsigned long long>(pretrained_param.candidate_rules),pretrained_param.training_seconds,pretrained_param.encoder_rules.size(),pretrained_param.raw.size()/1024.0,(pretrained_param.frame.size()+4)/1024.0,
+                static_cast<unsigned long long>(hash_bytes(pretrained_param.raw.data(),uint32_t(pretrained_param.raw.size()))),
+                static_cast<unsigned long long>(pretrained_param_stats.used_rules),static_cast<unsigned long long>(pretrained_param_stats.rule_instances),static_cast<unsigned long long>(pretrained_param_stats.unique_instances),static_cast<unsigned long long>(pretrained_param_stats.program_records),static_cast<unsigned long long>(pretrained_param_stats.literal_records),
+                pretrained_param_stats.covered_bytes/1048576.0,pretrained_param_stats.residual_bytes/1048576.0,pretrained_param_stats.target_bytes/1048576.0,static_cast<unsigned long long>(pretrained_param_stats.program_ops),static_cast<unsigned long long>(pretrained_param_stats.lexicon_entries),static_cast<unsigned long long>(pretrained_param_stats.lexicon_references),static_cast<unsigned long long>(pretrained_param_frame_wins),static_cast<unsigned long long>(pretrained_param_combined_wins),static_cast<unsigned long long>(pretrained_param_columnar_wins),
+                pretrained_param_literal_wire/1048576.0,pretrained_param_candidate_wire/1048576.0,pretrained_param_selected_wire/1048576.0,static_cast<unsigned long long>(pretrained_param_encoder_frames.dictionary_wins),pretrained_param_encoder_frames.dictionary_saved/1024.0);
+    if(use_param_pretrained)std::printf("P16 fused pretrained parameter program candidate/selected=%.3f/%.3f MiB frame-wins=%llu/%zu; control and typed slot values share P9 semantic streams\n",
+                fused_param_candidate_wire/1048576.0,fused_param_selected_wire/1048576.0,
+                static_cast<unsigned long long>(fused_param_frame_wins),corpus.files.size());
     if(use_source_dictionary){
         std::printf("P9sd trained source-superblock dictionary raw/package-wire=%llu/%llu bytes (%.1f/%.1f KiB) model-id=%016llx comparisons-won=%llu saved-before-charge=%.1f KiB frame-wins=%llu raw-channel literal/dictionary/selected=%.3f/%.3f/%.3f MiB\n",
                     static_cast<unsigned long long>(source_dictionary.size()),static_cast<unsigned long long>(source_dictionary_package.size()+4),source_dictionary.size()/1024.0,(source_dictionary_package.size()+4)/1024.0,

@@ -543,6 +543,70 @@ CNN/MLP, GRU/TCN teachers, dual retrieval, distillation controls, fixed integer 
 dictionaries, and the external teacher ceiling; repeating those families over this losing
 representation is not justified.
 
+## P14/P16 follow-up: frozen parameter windows and portable bootstrap input
+
+Two additional exact controls test whether P9g failed only because its rules were TU-local or its
+program streams were separately compressed.
+
+- P14 mines a frozen 16 KiB package of alpha-normalized 4/8/16/32-atom windows from disjoint
+  projects. It uses dense TU-local rule IDs, a typed TU-local value lexicon, inline/columnar instance
+  alternatives, optional model-derived zstd history, and actual raw fallback.
+- P16 uses the same exact program but folds its control into P9 control, appends identifier/number/
+  string values to P9's existing typed streams, replaces only P9's raw-definition payload with the
+  residual, and compresses each homogeneous stream once. Its decoder splits those streams,
+  reconstructs the original raw definitions, and then invokes the ordinary P9 decoder.
+
+The first training control uses the earlier disjoint LLVM + RocksDB + OpenCV expanded streams. On
+the same first 20 held-out DuckDB TUs:
+
+| row | charged bytes | result |
+|---|---:|---|
+| P9 semantic baseline | 964,895 | exact |
+| P12 best untrained union | 960,478 | exact |
+| P14 separate frozen-window program | 969,505 | exact |
+| P16 fused frozen-window program | 969,505 | exact |
+
+The frozen package is 14.4 KiB raw / 4.5 KiB wire. It covers 0.63 MiB of a 1.78 MiB target, but its
+raw-channel candidate is 0.474 MiB versus 0.399 MiB for grouped literals. P14 wins zero TU frames.
+P16's complete fused candidates total 0.989 MiB versus P9's 0.920 MiB and also win zero of 20 TUs.
+Fusing streams therefore removes the separate-frame hypothesis: the small match program itself is
+too expensive.
+
+Expanded output is also the wrong input for a portable bootstrap package. Compiler headers, macro
+expansion, generated paths, and toolchain versions vary between installations even when project
+source is identical. The harness now accepts `--param-pretrain-source-root` and recursively mines
+only raw C/C++ source files, with build output and repository metadata directories excluded. The
+held-out `.ii` manifest is not opened until this package is frozen.
+
+The full raw-source control trains on LLVM + RocksDB + OpenCV source trees:
+
+```text
+raw source bytes                 0.84 GiB
+source lines                   20,265,199
+per-project distinct lines      9,231,937
+sampled lines                     288,774
+candidate windows              10,585,773
+candidate normalized shapes     1,207,059
+selected rules                        977
+package raw/wire               14.0/5.0 KiB
+```
+
+On the same 20 DuckDB TUs it raises covered bytes to 0.70 MiB, but the separate candidate is 0.479
+MiB versus the same 0.399 MiB literal channel. P14 and P16 finish at 970,070 charged bytes, P16's
+complete candidates total 0.993 MiB, and both again win zero of 20 TUs. Every decoder reconstructs
+all 85,493 held-out definitions exactly.
+
+The result supports a portable bootstrap model but rejects this vocabulary. More training finds
+more small matches; it does not make thousands of small opcodes and slot values cheaper. A next
+portable model must learn coarser statement/multi-Line/source-token superblocks and measure package
+debt as TUs observed -> charged ratio. Installation-specific expanded-output superblocks belong in
+a separate chronological online layer and must be encoded before the current TU is learned.
+
+The broader follow-up is a common raw-source model trained on the 14 available projects other than
+LLVM and DuckDB, followed by complete LLVM and DuckDB holdouts on quietbox2. The implementer was
+given the full 16-corpus map, package/support sweeps, retained-artifact contract, and complete exact
+measurement gates in issue #16 comment 5302494188.
+
 ## Reproduction and retained artifacts
 
 Environment for the authoritative local run:
@@ -568,6 +632,21 @@ g++ -O3 -DNDEBUG -march=native -std=c++17 -pthread \
   --pretrain-manifest /tanksmall/scratch/ictmp/corpus2/manifest.txt \
   --pretrain-manifest /tanksmall/scratch/ictmp/corpus5/manifest.txt \
   --model-kib 16 --model-min-corpora 2 --source-k 4 --z 3
+```
+
+Portable raw-source parameter-window control:
+
+```sh
+g++ -O3 -DNDEBUG -march=native -std=c++17 \
+  -Wall -Wextra -Wpedantic -Werror linecache/ptgc_bench.cpp -lzstd \
+  -o /tmp/ptgc-p16-source
+
+/tmp/ptgc-p16-source \
+  --manifest /tanksmall/scratch/ictmp/corpus3/manifest.txt --max-files 20 \
+  --param-pretrain-source-root /tanksmall/scratch/ictmp/corpus/llvm-project \
+  --param-pretrain-source-root /tanksmall/scratch/ictmp/build2/rocksdb \
+  --param-pretrain-source-root /tanksmall/scratch/ictmp/build2/opencv \
+  --param-model-kib 16 --model-min-corpora 2 --source-k 4 --z 3
 ```
 
 Source-superblock reproduction:
@@ -618,6 +697,13 @@ Primary logs:
 /tmp/ptgc-pretrained-superblocks-v3-sanitize.log
 /tmp/ptgc-pretrained-superblocks-v3-{32,64,256}k-20tu.log
 /tmp/ptgc-pretrained-superblocks-v3-full.log
+/tmp/ptgc-p14-fulltrain-20tu.log
+/tmp/ptgc-p14-{64,256}k-20tu.log
+/tmp/ptgc-p16-smoke.log
+/tmp/ptgc-p16-fulltrain-20tu.log
+/tmp/ptgc-p16-source-smoke.log
+/tmp/ptgc-p16-source-fulltrain-20tu.log
+/tmp/ptgc-p16-source-sanitize.log
 /tmp/codec50-current-baseline.log
 /tmp/codec50-pretrain-duckdb-independent.log
 ```
@@ -637,3 +723,13 @@ full-training replay, and the complete 689-TU independently decoded replay. The 
 run took 734.27 seconds and peaked at 4,598,760 KiB RSS; that is exhaustive bakeoff cost, not a
 production throughput claim. The retained full-log SHA-256 is
 `f9065ea4b07a1f5c8899b36846db478e59a933d8a0cce5516a5ba6ea13b82fe0`.
+
+P14/P16 follow-up log SHA-256 values:
+
+```text
+af3a6a3ecf02da10b48b11bafc69674b4f4da9f52e70405bf07ff7ce1dc9aad4  /tmp/ptgc-p16-smoke.log
+95a5b23a39a361f614cd3269ae173eb5438effc13629023cb598ecffba3dd9a0  /tmp/ptgc-p16-fulltrain-20tu.log
+fa3b78c2b107ae040fc345beeb8760ce310d532851cdda9176f579a5602ba94d  /tmp/ptgc-p16-source-smoke.log
+85446ea59db8aa1a6453c9fbf8c1bbc622cde78cce492544334072ca9fc533c5  /tmp/ptgc-p16-source-fulltrain-20tu.log
+e3eb33e474310e75875bb04579bea860b432280558a1920a633ee29349e7985c  /tmp/ptgc-p16-source-sanitize.log
+```
