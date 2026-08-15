@@ -20,13 +20,17 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cerrno>
 #include <string>
 #include <unordered_map>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
+#include <thread>
 #include <immintrin.h>
 #include <zstd.h>
 #if defined(WITH_D2) && __has_include("definition_codec.h")
@@ -186,8 +190,48 @@ struct RelLZ {
     uint64_t store_bytes() const { return store.size(); }
 };
 
+// ---- Real 2-process socketpair path: F-side independent store + standalone packet decoder. ----
+// A per-TU wire packet = [u8 reg_raw][z paths][z lines][z regions][z blocks][z root] (each block =
+// varint(zlen)+zstd bytes). decode_packet installs the defs into F's OWN store and reconstructs the
+// exact .ii bytes -- the identical object model as the in-process decoder, driven only by wire bytes.
+struct FState {
+    std::vector<uint8_t> line_data; std::vector<size_t> line_off;   // line id (1-based) -> bytes
+    std::vector<uint32_t> reg_child; std::vector<size_t> reg_off;   // region id -> line-id composition
+    std::vector<std::string> paths;
+    std::vector<uint32_t> blk_child; std::vector<size_t> blk_off;
+    std::vector<uint32_t> reg_stream;                               // reconstructed region occurrence stream (block-COPY srcs)
+    void init(){ line_data.clear(); line_off.assign(1,0); reg_child.clear(); reg_off.assign(1,0); paths.clear(); blk_child.clear(); blk_off.assign(1,0); reg_stream.clear(); line_data.reserve(64u<<20); }
+};
+static const uint8_t* unz(ZSTD_DCtx* d,const uint8_t* p,std::vector<uint8_t>& out){
+    uint64_t zl=get_varint(p); unsigned long long rl=ZSTD_getFrameContentSize(p,(size_t)zl); out.resize((size_t)rl);
+    size_t r=ZSTD_decompressDCtx(d,out.data(),out.size(),p,(size_t)zl); if(ZSTD_isError(r)){fprintf(stderr,"unz %s\n",ZSTD_getErrorName(r));exit(2);} return p+zl; }
+static void decode_packet(uint32_t NREG,FState& F,const uint8_t* pkt,ZSTD_DCtx* d,
+        std::vector<uint8_t>& fp,std::vector<uint8_t>& fl,std::vector<uint8_t>& fr,std::vector<uint8_t>& fb,std::vector<uint8_t>& rt,
+        std::vector<uint8_t>& recon,std::vector<uint8_t>& tmp){
+    const uint8_t* p=pkt; uint8_t reg_raw=*p++;
+    p=unz(d,p,fp); p=unz(d,p,fl); p=unz(d,p,fr); p=unz(d,p,fb); p=unz(d,p,rt);
+    { const uint8_t* pp=fp.data(),*pe=fp.data()+fp.size(); while(pp<pe){ uint64_t L=get_varint(pp); F.paths.emplace_back((const char*)pp,(size_t)L); pp+=L; } }
+    { const uint8_t* pp=fl.data(),*pe=fl.data()+fl.size();
+      while(pp<pe){ uint8_t kind=*pp++;
+        if(kind==1){ uint64_t pid=get_varint(pp); uint64_t lineno=get_varint(pp); uint8_t nf=*pp++; Marker dm; dm.path=F.paths[pid]; dm.lineno=lineno; for(uint8_t f=0;f<nf;++f) dm.flags.push_back(*pp++);
+            tmp.clear(); emit_marker(dm,tmp); F.line_data.insert(F.line_data.end(),tmp.begin(),tmp.end()); F.line_off.push_back(F.line_data.size()); }
+        else { uint64_t len=get_varint(pp); F.line_data.insert(F.line_data.end(),pp,pp+len); pp+=len; F.line_off.push_back(F.line_data.size()); } } }
+    if(reg_raw){ const uint8_t* pp=fr.data(),*pe=fr.data()+fr.size(); while(pp<pe){ uint64_t c=get_varint(pp); for(uint64_t j=0;j<c;++j) F.reg_child.push_back((uint32_t)get_varint(pp)); F.reg_off.push_back(F.reg_child.size()); } }
+    else { const uint8_t* pp=fr.data(),*pe=fr.data()+fr.size(); while(pp<pe){ uint64_t c=get_varint(pp); int64_t prev=0; for(uint64_t j=0;j<c;++j){ prev+=get_zigzag(pp); F.reg_child.push_back((uint32_t)prev); } F.reg_off.push_back(F.reg_child.size()); } }
+    { const uint8_t* pp=fb.data(),*pe=fb.data()+fb.size(); while(pp<pe){ uint8_t kind=*pp++;
+        if(kind==1){ uint64_t src=get_varint(pp); uint64_t L=get_varint(pp); for(uint64_t j=0;j<L;++j) F.blk_child.push_back(F.reg_stream[src+j]); F.blk_off.push_back(F.blk_child.size()); }
+        else { uint64_t L=get_varint(pp); for(uint64_t j=0;j<L;++j) F.blk_child.push_back((uint32_t)get_varint(pp)); F.blk_off.push_back(F.blk_child.size()); } } }
+    recon.clear();
+    auto emitR=[&](uint32_t r){ F.reg_stream.push_back(r); for(size_t j=F.reg_off[r];j<F.reg_off[r+1];++j){ uint32_t ln=F.reg_child[j]; recon.insert(recon.end(),F.line_data.begin()+F.line_off[ln-1],F.line_data.begin()+F.line_off[ln]); } };
+    { const uint8_t* pp=rt.data(),*pe=rt.data()+rt.size(); while(pp<pe){ uint32_t tok=(uint32_t)get_varint(pp);
+        if(tok<NREG) emitR(tok); else { uint32_t k=tok-NREG; for(size_t j=F.blk_off[k];j<F.blk_off[k+1];++j) emitR(F.blk_child[j]); } } }
+}
+// framed socket read/write (blocking, restart on EINTR)
+static bool sock_wall(int fd,const void* p,size_t n){ const char* b=(const char*)p; while(n){ ssize_t w=write(fd,b,n); if(w<=0){ if(w<0&&errno==EINTR) continue; return false; } b+=w; n-=(size_t)w; } return true; }
+static bool sock_rall(int fd,void* p,size_t n){ char* b=(char*)p; while(n){ ssize_t r=read(fd,b,n); if(r<=0){ if(r<0&&errno==EINTR) continue; return false; } b+=r; n-=(size_t)r; } return true; }
+
 int main(int argc,char**argv){
-    const char* manifest=nullptr; size_t max_files=SIZE_MAX; int zlevel=3; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, useS0=false, useStream=false; int builds=1;
+    const char* manifest=nullptr; size_t max_files=SIZE_MAX; int zlevel=3; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, useS0=false, useStream=false, useSocket=false; int builds=1;
     for(int i=1;i<argc;++i){ if(!strcmp(argv[i],"--manifest")&&i+1<argc)manifest=argv[++i];
         else if(!strcmp(argv[i],"--z")&&i+1<argc)zlevel=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--no-d1"))useD1=false;
@@ -197,6 +241,7 @@ int main(int argc,char**argv){
         else if(!strcmp(argv[i],"--deep"))deep=true;         // run slow z19/z22 entropy ladder + reorder test
         else if(!strcmp(argv[i],"--warm"))warm=true;         // Basis C: 2nd pass with dict retained -> warm steady-state wire
         else if(!strcmp(argv[i],"--stream"))useStream=true;  // shared-window streaming accounting (persistent zstd window across messages)
+        else if(!strcmp(argv[i],"--socket"))useSocket=true;  // real 2-process socketpair + N-stream concurrency throughput sweep
         else if(!strcmp(argv[i],"--s0"))useS0=true;          // S0 semantic-Root memoization (ROOT_REF on exact-Root reuse)
         else if(!strcmp(argv[i],"--builds")&&i+1<argc)builds=atoi(argv[++i]);  // amortize S0 over N chronological builds
         else if(!strcmp(argv[i],"--max-files")&&i+1<argc){ char*t=nullptr; unsigned long long v=strtoull(argv[++i],&t,10); if(!t||*t||!v){fprintf(stderr,"bad max-files\n");return 2;} max_files=size_t(v); }
@@ -278,6 +323,7 @@ int main(int argc,char**argv){
     bool byteexact=true; uint64_t n_marker=0,n_literal=0;
     std::vector<uint8_t> allLineDefs, allRoots, allRegions, allBlocks, allPaths, allMiss;   // diagnostic: batched-z3 floor (cross-message headroom)
     std::vector<uint8_t> allRegionsRaw;   // diagnostic: region-defs as RAW line-ids (no per-region delta) -> preserves cross-region subsequence matches for z3-LDM
+    std::vector<uint8_t> wireblob, zt; std::vector<size_t> pkt_off; pkt_off.push_back(0); std::vector<uint32_t> pkt_raw;   // --socket: captured per-TU wire packets
 
     int npass = useS0 ? builds : (warm?2:1);   // --warm: prime then measure. --s0 --builds N: sum wire over N chronological builds (amortized).
     for(int pass=0; pass<npass; ++pass){
@@ -359,6 +405,12 @@ int main(int argc,char**argv){
         // --- ROOT: token stream (region + block ids) ---
         std::vector<uint8_t> rootb; for(size_t i=0;i<tn;++i) put_varint(rootb,tk[i]);
         w_root += useStream? stream_flush(cs_root,rootb.data(),rootb.size(),sob) : zstd_size(z,rootb.data(),rootb.size(),zlevel,dst); w_framing += FRAME; allRoots.insert(allRoots.end(),rootb.begin(),rootb.end());
+        if(useSocket){   // capture this TU's real wire packet [reg_raw][z paths][z lines][z regions][z blocks][z root] for the socketpair replay
+            auto azp=[&](const std::vector<uint8_t>& b){ size_t bound=ZSTD_compressBound(b.size()); if(zt.size()<bound) zt.resize(bound);
+                size_t zl=ZSTD_compress(zt.data(),zt.size(),b.empty()?(const uint8_t*)"":b.data(),b.size(),zlevel); if(ZSTD_isError(zl)){fprintf(stderr,"cap z %s\n",ZSTD_getErrorName(zl));exit(2);}
+                put_varint(wireblob,zl); wireblob.insert(wireblob.end(),zt.data(),zt.data()+zl); };
+            wireblob.push_back(reg_raw?1:0); azp(fill_paths); azp(fill_lines); azp(reg_raw?fill_regions_raw:fill_regions); azp(fill_blocks); azp(rootb);
+            pkt_off.push_back(wireblob.size()); pkt_raw.push_back(olen); }
 
         enc_s += std::chrono::duration<double>(Clock::now()-_te).count(); auto _td=Clock::now();
         // --- DECODER (F): install FILL from wire into F's OWN store, then expand ROOT tokens ---
@@ -403,6 +455,49 @@ int main(int argc,char**argv){
     }
     while(ck.size()<ck_f.size()) ck.push_back({ck_f[ck.size()], double(cum_raw)/cum_wire});
     ZSTD_freeCCtx(z); ZSTD_freeCStream(cs_line); ZSTD_freeCStream(cs_reg); ZSTD_freeCStream(cs_root);
+
+    if(useSocket){
+        // ===== REAL 2-process socketpair + N-stream concurrency sweep =====
+        // Each stream = a real F process (own store) decoding the captured wire off an AF_UNIX socket a
+        // feeder thread streams into it; F reconstructs byte-exact + times per-TU decode latency. Aggregate
+        // = N*raw/wall; per-stream(min) is the gated >=1 GB/s number; watch the aggregate for F saturation.
+        fprintf(stderr,"\n==== SOCKETPAIR THROUGHPUT — %s (in-proc byte-exact=%s, wire=%.1f MiB, %zu TUs, raw=%.1f MiB) ====\n",
+            manifest, byteexact?"OK":"FAIL", wireblob.size()/1048576.0, TUs, corpus.raw/1048576.0);
+        uint64_t total_raw=corpus.raw;
+        for(int N : std::vector<int>{1,4,8,16,24}){
+            double* shm=(double*)mmap(nullptr,sizeof(double)*8*N,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);
+            std::vector<int> pfd(N); std::vector<pid_t> kids(N);
+            for(int i=0;i<N;++i){ int sv[2]; if(socketpair(AF_UNIX,SOCK_STREAM,0,sv)){perror("socketpair");return 2;}
+                pid_t pid=fork();
+                if(pid==0){ close(sv[0]);
+                    FState F; F.init(); ZSTD_DCtx* d=ZSTD_createDCtx();
+                    std::vector<uint8_t> fp,fl,fr,fb,rt,recon,tmp,pktbuf; std::vector<double> lat; lat.reserve(TUs);
+                    bool ok=true; auto c0=Clock::now();
+                    for(size_t t=0;t<TUs;++t){ uint32_t plen; if(!sock_rall(sv[1],&plen,4)){ok=false;break;} pktbuf.resize(plen); if(!sock_rall(sv[1],pktbuf.data(),plen)){ok=false;break;}
+                        auto q0=Clock::now(); decode_packet(NREG,F,pktbuf.data(),d,fp,fl,fr,fb,rt,recon,tmp);
+                        const char* orig=corpus.bytes.data()+corpus.files[t].off; uint32_t ol=corpus.files[t].len;
+                        if(recon.size()!=ol || memcmp(recon.data(),orig,ol)!=0) ok=false;
+                        lat.push_back(std::chrono::duration<double,std::micro>(Clock::now()-q0).count()); }
+                    double dsec=std::chrono::duration<double>(Clock::now()-c0).count(); std::sort(lat.begin(),lat.end());
+                    struct rusage ru{}; getrusage(RUSAGE_SELF,&ru);
+                    shm[i*8+0]=dsec; shm[i*8+1]=lat.empty()?0:lat[lat.size()/2]; shm[i*8+2]=lat.empty()?0:lat[(size_t)(lat.size()*0.95)]; shm[i*8+3]=lat.empty()?0:lat[(size_t)(lat.size()*0.99)]; shm[i*8+4]=ok?1:0; shm[i*8+5]=(double)ru.ru_maxrss; shm[i*8+6]=(double)lat.size();
+                    ZSTD_freeDCtx(d); close(sv[1]); _exit(0); }
+                close(sv[1]); pfd[i]=sv[0]; kids[i]=pid; }
+            auto t0s=Clock::now(); std::vector<std::thread> feeders;
+            for(int i=0;i<N;++i){ int fd=pfd[i]; feeders.emplace_back([fd,&wireblob,&pkt_off,TUs]{
+                for(size_t t=0;t<TUs;++t){ uint32_t plen=(uint32_t)(pkt_off[t+1]-pkt_off[t]); if(!sock_wall(fd,&plen,4))break; if(!sock_wall(fd,wireblob.data()+pkt_off[t],plen))break; } close(fd); }); }
+            for(auto& th:feeders) th.join();
+            for(int i=0;i<N;++i){ int st; waitpid(kids[i],&st,0); }
+            double wall=std::chrono::duration<double>(Clock::now()-t0s).count();
+            bool allok=true; double maxrss=0,minstream=1e18,p50=0,p95=0,p99=0;
+            for(int i=0;i<N;++i){ if(shm[i*8+4]<0.5)allok=false; double sps=total_raw/1e9/shm[i*8+0]; if(sps<minstream)minstream=sps; if(shm[i*8+5]>maxrss)maxrss=shm[i*8+5]; p50+=shm[i*8+1]; p95+=shm[i*8+2]; p99+=shm[i*8+3]; }
+            double agg=(double)total_raw*N/1e9/wall;
+            fprintf(stderr,"N=%2d  byte-exact=%s  per-stream(min)=%.2f GB/s  AGGREGATE=%.2f GB/s  lat us p50/95/99=%.1f/%.1f/%.1f  peakRSS/F=%.0f MiB  wall=%.2fs\n",
+                N, allok?"OK":"FAIL", minstream, agg, p50/N, p95/N, p99/N, maxrss/1024.0, wall);
+            munmap(shm,sizeof(double)*8*N);
+        }
+        return byteexact?0:1;
+    }
 
     double totalwire = w_root+w_linedef+w_regiondef+w_pathdef+w_blockdef+w_missing+w_framing+w_rootref;
     double MiB=1048576.0;
