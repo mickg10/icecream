@@ -154,9 +154,47 @@ struct StringInterner {
             i = (i + 1) & mask;
         }
     }
+    bool contains(const uint8_t* p, uint32_t n) const {   // membership without insert (prior lookup)
+        uint64_t h = fast_hash(p, n) | 1; uint32_t i = uint32_t(h) & mask;
+        for (;;) {
+            const Slot& s = tab[i];
+            if (!s.h) return false;
+            if (s.h == h && len[s.id] == n && memcmp(blob.data() + off[s.id], p, n) == 0) return true;
+            i = (i + 1) & mask;
+        }
+    }
 };
+
 static inline bool is_slot_char(uint8_t c) {
     return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_';
+}
+// Tokenize a distinct-line set into skeleton keys + slot tokens (populates the interners). If the
+// per-line/per-slot out-arrays are non-null, also records line->skeleton and the slot-token stream
+// (used for the target; passed null when only building the prior sets).
+static void tokenize_corpus(const Distinct& d, StringInterner& skel, StringInterner& tok,
+                            std::vector<uint32_t>* line_skel, std::vector<uint32_t>* slot_tok,
+                            std::vector<uint32_t>* line_slot_start) {
+    const size_t N = d.off.size();
+    std::vector<uint8_t> key;
+    if (line_slot_start) line_slot_start->push_back(0);
+    for (size_t i = 0; i < N; ++i) {
+        const uint8_t* p = d.blob.data() + d.off[i]; uint32_t L = d.len[i];
+        key.clear();
+        uint32_t k = 0; bool first = true;
+        for (;;) {
+            uint32_t ls = k; while (k < L && !is_slot_char(p[k])) ++k;
+            if (!first) key.push_back(0x00);
+            first = false;
+            key.insert(key.end(), p + ls, p + k);
+            if (k >= L) break;
+            uint32_t ss = k; while (k < L && is_slot_char(p[k])) ++k;
+            uint32_t tid = tok.intern(p + ss, k - ss);
+            if (slot_tok) slot_tok->push_back(tid);
+        }
+        uint32_t sid = skel.intern(key.data(), uint32_t(key.size()));
+        if (line_skel) line_skel->push_back(sid);
+        if (line_slot_start) line_slot_start->push_back(uint32_t(slot_tok ? slot_tok->size() : 0));
+    }
 }
 
 // ---------------- zstd ----------------
@@ -491,6 +529,75 @@ static bool run_frontcodec(const Distinct& d, uint64_t base_z3, uint64_t raw, ZS
     return ok;
 }
 
+// Cross-project PRETRAINING probe: can an out-of-band vocabulary prior (skeletons + slot tokens)
+// trained on OTHER repos cover enough of the target's vocab to push its dict under the 400x budget?
+// The placement (which token per slot) and line->skeleton id are corpus-specific hard floors.
+static void run_pretrain(const Distinct& d, uint64_t raw, const std::vector<std::string>& trains, ZSTD_CCtx* cc) {
+    StringInterner pskel, ptok;                         // 1) prior sets from training corpora
+    for (auto& m : trains) {
+        Corpus tc = load_corpus(m.c_str(), SIZE_MAX);
+        Distinct td = extract_distinct(tc);
+        tokenize_corpus(td, pskel, ptok, nullptr, nullptr, nullptr);
+        fprintf(stderr, "  [prior] %s: distinct=%zu  cumulative prior skeletons=%zu tokens=%zu\n",
+                m.c_str(), td.off.size(), pskel.off.size(), ptok.off.size());
+    }
+    StringInterner tskel, ttok;                         // 2) tokenize target
+    std::vector<uint32_t> line_skel, slot_tok, line_slot_start;
+    tokenize_corpus(d, tskel, ttok, &line_skel, &slot_tok, &line_slot_start);
+    const size_t N = d.off.size();
+
+    // 3) vocab coverage by the prior
+    std::vector<uint8_t> inc_skel_blob, inc_skel_len, inc_tok_blob, inc_tok_len;
+    size_t skel_cov = 0; uint64_t skel_cov_b = 0, skel_tot_b = 0;
+    for (size_t s = 0; s < tskel.off.size(); ++s) {
+        const uint8_t* p = tskel.blob.data() + tskel.off[s]; uint32_t L = tskel.len[s]; skel_tot_b += L;
+        if (pskel.contains(p, L)) { ++skel_cov; skel_cov_b += L; }
+        else { inc_skel_blob.insert(inc_skel_blob.end(), p, p + L); bput_varint(inc_skel_len, L); }
+    }
+    size_t tok_cov = 0; uint64_t tok_cov_b = 0, tok_tot_b = 0;
+    for (size_t t = 0; t < ttok.off.size(); ++t) {
+        const uint8_t* p = ttok.blob.data() + ttok.off[t]; uint32_t L = ttok.len[t]; tok_tot_b += L;
+        if (ptok.contains(p, L)) { ++tok_cov; tok_cov_b += L; }
+        else { inc_tok_blob.insert(inc_tok_blob.end(), p, p + L); bput_varint(inc_tok_len, L); }
+    }
+
+    // 4) target streams + costs
+    std::vector<uint8_t> id_s, tid_row, full_skel_len, full_tok_len, z;
+    for (size_t i = 0; i < N; ++i) bput_varint(id_s, line_skel[i]);
+    for (size_t i = 0; i < N; ++i)
+        for (uint32_t si = line_slot_start[i]; si < line_slot_start[i + 1]; ++si) bput_varint(tid_row, slot_tok[si]);
+    for (size_t s = 0; s < tskel.off.size(); ++s) bput_varint(full_skel_len, tskel.len[s]);
+    for (size_t t = 0; t < ttok.off.size(); ++t) bput_varint(full_tok_len, ttok.len[t]);
+    auto Z3 = [&](const std::vector<uint8_t>& v) { return zstd_size(cc, v.data(), v.size(), 3, z); };
+    uint64_t id_z3 = Z3(id_s);
+    uint64_t plc_z19 = zstd_size_adv(cc, tid_row.data(), tid_row.size(), 19, 1, 27, z);
+    uint64_t full_skel_z3 = Z3(tskel.blob) + Z3(full_skel_len);
+    uint64_t full_tok_z3 = Z3(ttok.blob) + Z3(full_tok_len);
+    uint64_t inc_skel_z3 = Z3(inc_skel_blob) + Z3(inc_skel_len);
+    uint64_t inc_tok_z3 = Z3(inc_tok_blob) + Z3(inc_tok_len);
+
+    uint64_t floor_hard = plc_z19 + id_z3;                                   // corpus-specific, un-pretrainable
+    uint64_t dict_noprior = floor_hard + full_skel_z3 + full_tok_z3;
+    uint64_t dict_prior = floor_hard + inc_skel_z3 + inc_tok_z3;
+    double budget = double(raw) / 400.0;
+
+    printf("  ---- CROSS-PROJECT PRETRAINING probe (prior = %zu training corpora) ----\n", trains.size());
+    printf("    prior vocab: skeletons=%zu tokens=%zu\n", pskel.off.size(), ptok.off.size());
+    printf("    target skeletons=%zu covered=%zu (%.1f%% by count, %.1f%% by bytes)  incremental z3=%.3f MiB (full %.3f)\n",
+           tskel.off.size(), skel_cov, 100.0 * double(skel_cov) / double(tskel.off.size()),
+           100.0 * double(skel_cov_b) / double(skel_tot_b), MB(inc_skel_z3), MB(full_skel_z3));
+    printf("    target tokens=%zu covered=%zu (%.1f%% by count, %.1f%% by bytes)  incremental z3=%.3f MiB (full %.3f)\n",
+           ttok.off.size(), tok_cov, 100.0 * double(tok_cov) / double(ttok.off.size()),
+           100.0 * double(tok_cov_b) / double(tok_tot_b), MB(inc_tok_z3), MB(full_tok_z3));
+    printf("    hard floor (placement z19 %.3f + line->skel-id %.3f) = %.3f MiB = %.1fx (un-pretrainable)\n",
+           MB(plc_z19), MB(id_z3), MB(floor_hard), double(raw) / double(floor_hard));
+    printf("    dict WITHOUT prior = %.3f MiB = %.1fx\n", MB(dict_noprior), double(raw) / double(dict_noprior));
+    printf("    dict WITH    prior = %.3f MiB = %.1fx   (incremental vocab %.3f MiB)\n",
+           MB(dict_prior), double(raw) / double(dict_prior), MB(inc_skel_z3 + inc_tok_z3));
+    printf("    400x budget = %.3f MiB  =>  %s\n", MB(uint64_t(budget)),
+           double(dict_prior) <= budget ? "*** WITH-PRIOR dict CLEARS 400x ***" : "with-prior dict still OVER 400x");
+}
+
 int main(int argc, char** argv) {
     const char* manifest = nullptr;
     const char* name = nullptr;
@@ -499,6 +606,8 @@ int main(int argc, char** argv) {
     bool ceiling = false;
     bool reorder = false;
     bool skeleton = false;
+    bool pretrain = false;
+    std::vector<std::string> trains;
     DefCodec::Params P;
     for (int i = 1; i < argc; ++i) {
         auto eat = [&](const char* f) { return !strcmp(argv[i], f) && i + 1 < argc; };
@@ -509,6 +618,8 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--ceiling")) ceiling = true;
         else if (!strcmp(argv[i], "--reorder")) reorder = true;
         else if (!strcmp(argv[i], "--skeleton")) skeleton = true;
+        else if (!strcmp(argv[i], "--pretrain")) pretrain = true;
+        else if (eat("--train")) trains.emplace_back(argv[++i]);
         else if (eat("--stride")) P.stride = uint32_t(atoi(argv[++i]));
         else if (eat("--min-match")) P.min_match = uint32_t(atoi(argv[++i]));
         else if (eat("--table-bits")) P.table_bits = uint32_t(atoi(argv[++i]));
@@ -564,6 +675,13 @@ int main(int argc, char** argv) {
                    g.tag, MB(s), double(dbytes) / double(s), double(c.raw) / double(s),
                    double(dbytes) / dt / 1e9);
         }
+        ZSTD_freeCCtx(cc);
+        return 0;
+    }
+
+    if (pretrain) {
+        if (trains.empty()) { fprintf(stderr, "--pretrain needs at least one --train MANIFEST\n"); return 2; }
+        run_pretrain(d, c.raw, trains, cc);
         ZSTD_freeCCtx(cc);
         return 0;
     }

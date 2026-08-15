@@ -182,3 +182,26 @@ corpus: OpenCV  (/tanksmall/scratch/ictmp/corpus5/manifest.txt)
  3.829 + line-skel-id 0.786 ~= 4.6 MiB ~= 410x). Placement itself is corpus-specific and cannot be
  pretrained away. NEXT: measure DuckDB vocab coverage by a prior trained on LLVM+RocksDB+OpenCV.
 ================================================================================
+
+================================================================================
+ CROSS-PROJECT PRETRAINING probe (--pretrain --train ...) -- the last lever (local-oracle unlock).
+ Prior = skeleton + slot-token sets trained on LLVM + RocksDB + OpenCV; target = DuckDB. Question:
+ does an out-of-band vocabulary prior cover enough of DuckDB's vocab to clear the 400x budget?
+
+ DuckDB vs 3-corpus prior (prior: 334,679 skeletons, 516,373 tokens):
+   skeleton coverage: 25.9% by count but only 7.5% by BYTES  -> incremental skel z3 = 0.636 (full 0.805)
+   token    coverage: 28.8% by count but only 16.8% by BYTES -> incremental tok  z3 = 0.519 (full 0.653)
+   => vocab does NOT transfer: DuckDB's bulk vocab is project-specific (its own template identifiers).
+   dict WITHOUT prior = 6.074 MiB = 311.8x
+   dict WITH    prior = 5.771 MiB = 328.1x   (saved only 0.30 MiB; still OVER the 4.734 budget)
+   hard floor placement(z19 3.829)+line->skel-id(0.786) = 4.615 MiB = 410.3x  (un-pretrainable, offline)
+     ... at z3 SPEED the placement floor is 4.784 (row) => hard floor ~5.57 MiB ~= 340x even with PERFECT vocab.
+
+ FINAL VERDICT (all axes exhausted): DuckDB's distinct-line dict CANNOT reach 400x by ANY measured
+ method -- LZ (z3..z19), LDM, lexical front-coding, skeleton-grouped columnar, contextual entropy
+ coding (PPM-C / MTF), or cross-project vocabulary pretraining. Best achievable ~328x (offline z19
+ + 3-corpus prior) / ~265x at the required z3 speed. The placement stream (which DuckDB token fills
+ each slot) + line->skeleton id is a corpus-specific hard floor of ~340x (z3) / 410x (z19). Holistic
+ 400x is bottlenecked by DuckDB and must come from the STRUCTURE side (per-TU id streams), not the
+ definition dict; the other 3 corpora already exceed 400x dict-only at plain z3.
+================================================================================
