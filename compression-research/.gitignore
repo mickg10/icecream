@@ -2,3 +2,10 @@ snapshots/
 test-regen/
 *.tar.zst
 logs/
+comp/
+comp2/
+cheap/
+joblogs/
+lists/
+*.tmp
+*.lock
