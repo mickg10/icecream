@@ -239,3 +239,30 @@ corpus: OpenCV  (/tanksmall/scratch/ictmp/corpus5/manifest.txt)
  / ~330x (z19 offline). The token-placement + line->skel-id floor (~340x z3) is corpus-specific. DuckDB's
  preprocessed content is genuinely ~250-340x-capped; holistic-400x must come from the STRUCTURE side.
 ================================================================================
+
+================================================================================
+ SOURCE-CONDITIONED REGION probe (bigoracle §11, owner reopen) -- reproduce: --regioncov
+ A preprocessed .ii is mostly verbatim its OWN source (preprocessor expands #include/#define/#if,
+ does NOT instantiate templates); the `# N "path"` markers name the source. If the worker has the
+ source (toolchain headers bundled; project source shipped once), a region is a COPY-program, not a
+ novel-line dict. Aligns each distinct .ii line against its OWN source tree (NOT cross-corpus).
+
+ DuckDB (4894 marker source paths on disk: 503 toolchain + 4391 project; project-src raw 59.3 MiB):
+   EXACT-verbatim classification of the 52.2 MiB distinct dict: toolchain-verbatim 1.9% bytes,
+     project-verbatim 43.8%, residual 54.3% (stdlib is macro-heavy so most toolchain lines are macro-
+     EXPANDED, not verbatim -> land in residual; a PATCH codec would recover them cheaply).
+   SOURCE-ATTRIBUTION of first-seen content (markers excluded = cheap regeneratable structure) -- the
+   CEILING for any source-conditioning:
+     toolchain-attributed = 1.902 MiB -> z3 0.362  (FREE: worker has the toolchain source)
+     project-attributed   = 42.732 MiB -> z3 7.042 (MUST ship: worker lacks DuckDB's own source;
+        and shipping the source (9.9 MiB z3) costs MORE than the deduped lines (7.04))
+   BEST-CASE FILL (toolchain fully free via perfect COPY+PATCH) = 7.042 MiB = 268.9x. UNDER 400x.
+   bigoracle go/no-go: >4.15 MiB => escalate. 7.04 >> 4.15.
+
+ WHY it fails (airtight): after the transport's cross-TU dedup the SHARED toolchain content is TINY
+ (1.9 MiB -- the same stdlib headers repeat across all 689 TUs -> deduped to ~nothing), so making it
+ free saves only 0.36 MiB. The cold cost is dominated by DuckDB's OWN diverse project source
+ (42.7 MiB / 7.04 z3), which is genuinely project-specific -- no source F has can supply it, and
+ preprocessor-trace (§12) escalation still needs that project source, so it can't beat 7.04 MiB either.
+ CONVERGENT with every other axis: DuckDB's project-specific content is ~7 MiB z3 / ~270x, the same wall.
+================================================================================

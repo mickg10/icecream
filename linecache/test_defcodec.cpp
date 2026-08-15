@@ -668,6 +668,107 @@ static void run_pretrain(const Distinct& d, uint64_t raw, const std::vector<std:
            double(dict_prior) <= budget ? "*** WITH-PRIOR dict CLEARS 400x ***" : "with-prior dict still OVER 400x");
 }
 
+// SOURCE-CONDITIONED REGION coverage (bigoracle §11): a preprocessed .ii is mostly VERBATIM its own
+// source files (the preprocessor expands #include/#define/#if but does NOT instantiate templates).
+// The `# N "path"` markers name the source. If the worker has the source (toolchain headers bundled;
+// project source shipped ONCE, content-addressed), a distinct .ii line that is byte-verbatim a source
+// line costs ~a copy reference, not its text. Residual = macro-expanded / generated lines -> z3.
+// This is DIFFERENT from cross-corpus line pretraining: we match against each line's OWN source tree.
+static void run_regioncov(const Corpus& c, const Distinct& d, uint64_t raw, ZSTD_CCtx* cc) {
+    // 1) collect the distinct source paths named by the .ii markers
+    StringInterner paths;
+    for (auto& fsp : c.files) {
+        const uint8_t* p = c.bytes.data() + fsp.off; const uint8_t* e = p + fsp.len;
+        while (p < e) {
+            const uint8_t* nl = (const uint8_t*)memchr(p, '\n', size_t(e - p)); const uint8_t* le = nl ? nl + 1 : e;
+            if (le - p > 5 && p[0] == '#' && p[1] == ' ') {
+                const uint8_t* q = p + 2; while (q < le && *q >= '0' && *q <= '9') ++q;
+                if (q < le && *q == ' ') { ++q; if (q < le && *q == '"') { ++q; const uint8_t* s = q;
+                    while (q < le && *q != '"') ++q;
+                    if (q < le && *q == '"' && q > s && *s != '<') paths.intern(s, uint32_t(q - s)); } }
+            }
+            p = le;
+        }
+    }
+    // 2) load each source file once; build verbatim-line sets (toolchain vs project)
+    StringInterner tool_lines, proj_lines;
+    std::vector<uint8_t> proj_src; uint64_t proj_raw = 0, tool_files = 0, proj_files = 0, miss = 0;
+    std::vector<uint8_t> buf;
+    for (size_t i = 0; i < paths.off.size(); ++i) {
+        std::string path((const char*)paths.blob.data() + paths.off[i], paths.len[i]);
+        bool tool = path.rfind("/usr", 0) == 0 || path.rfind("/lib", 0) == 0;
+        FILE* f = fopen(path.c_str(), "rb"); if (!f) { ++miss; continue; }
+        fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+        buf.clear(); if (sz > 0) { buf.resize(size_t(sz)); if (fread(buf.data(), 1, size_t(sz), f) != size_t(sz)) { fclose(f); ++miss; continue; } }
+        fclose(f);
+        StringInterner& set = tool ? tool_lines : proj_lines;
+        const uint8_t* p = buf.data(); const uint8_t* e = p + buf.size();
+        while (p < e) { const uint8_t* nl = (const uint8_t*)memchr(p, '\n', size_t(e - p)); const uint8_t* le = nl ? nl + 1 : e; set.intern(p, uint32_t(le - p)); p = le; }
+        if (tool) ++tool_files; else { ++proj_files; proj_raw += buf.size(); proj_src.insert(proj_src.end(), buf.begin(), buf.end()); }
+    }
+    // 3) classify each distinct .ii dict line
+    std::vector<uint8_t> residual;
+    uint64_t tb = 0, pb = 0, rb = 0; size_t tc_ = 0, pc_ = 0, rc_ = 0;
+    for (size_t i = 0; i < d.off.size(); ++i) {
+        const uint8_t* p = d.blob.data() + d.off[i]; uint32_t L = d.len[i];
+        if (tool_lines.contains(p, L)) { tb += L; ++tc_; }
+        else if (proj_lines.contains(p, L)) { pb += L; ++pc_; }
+        else { rb += L; ++rc_; residual.insert(residual.end(), p, p + L); }
+    }
+    // 4) costs
+    std::vector<uint8_t> z;
+    uint64_t base_z3 = zstd_size(cc, d.blob.data(), d.blob.size(), 3, z);
+    uint64_t res_z3 = zstd_size(cc, residual.data(), residual.size(), 3, z);
+    uint64_t projsrc_z3 = zstd_size(cc, proj_src.data(), proj_src.size(), 3, z);
+    uint64_t fill = res_z3 + projsrc_z3;               // toolchain copies free; residual + project-src-once
+    double budget = double(raw) / 400.0, dtot = double(d.blob.size());
+
+    printf("  ---- SOURCE-CONDITIONED REGION coverage (bigoracle 11) ----\n");
+    printf("    marker source paths=%zu  loaded: toolchain files=%llu, project files=%llu, missing=%llu  project-src raw=%.1f MiB\n",
+           paths.off.size(), (unsigned long long)tool_files, (unsigned long long)proj_files, (unsigned long long)miss, MB(proj_raw));
+    printf("    distinct dict lines=%zu (%.3f MiB): toolchain-verbatim=%zu (%.1f%% bytes) project-verbatim=%zu (%.1f%% bytes) residual=%zu (%.1f%% bytes)\n",
+           d.off.size(), MB(d.blob.size()), tc_, 100.0 * double(tb) / dtot, pc_, 100.0 * double(pb) / dtot, rc_, 100.0 * double(rb) / dtot);
+    printf("    residual raw=%.3f MiB -> z3=%.3f;  project-src z3 (ship once)=%.3f MiB\n", MB(rb), MB(res_z3), MB(projsrc_z3));
+    printf("    FILL (toolchain free) = residual z3 %.3f + project-src z3 %.3f = %.3f MiB = %.1fx   (base dict z3 %.3f = %.1fx)\n",
+           MB(res_z3), MB(projsrc_z3), MB(fill), double(raw) / double(fill), MB(base_z3), double(raw) / double(base_z3));
+    printf("    go/no-go: <=3.5MB REACHABLE, >4.15MB escalate. budget(400x)=%.3f MiB => %s   (residual-only, toolchain+project free = %.3f MiB = %.1fx)\n",
+           MB(uint64_t(budget)), double(fill) <= budget ? "*** CLEARS 400x ***" : (double(fill) <= 4.15 * 1024 * 1024 ? "fragile zone" : "over"),
+           MB(res_z3), double(raw) / double(res_z3));
+
+    // SOURCE-ATTRIBUTION of FIRST-SEEN content lines (markers excluded = structure). This is the
+    // CEILING for source-conditioning: even with perfect COPY+PATCH, only TOOLCHAIN-attributed lines
+    // are free (worker has the toolchain source); PROJECT-attributed lines must ship (worker lacks the
+    // project source, and shipping it costs more than the lines). FILL floor = z3(project-attributed).
+    StringInterner seen;
+    std::vector<uint8_t> tool_fs, proj_fs; uint64_t tfb = 0, pfb = 0; size_t tfn = 0, pfn = 0;
+    for (auto& fsp : c.files) {
+        const uint8_t* p = c.bytes.data() + fsp.off; const uint8_t* e = p + fsp.len; bool cur_tool = false;
+        while (p < e) {
+            const uint8_t* nl = (const uint8_t*)memchr(p, '\n', size_t(e - p)); const uint8_t* le = nl ? nl + 1 : e;
+            if (le - p > 2 && p[0] == '#' && p[1] == ' ') {                    // marker: update class
+                const uint8_t* q = p + 2; while (q < le && *q >= '0' && *q <= '9') ++q;
+                if (q < le && *q == ' ') { ++q; if (q < le && *q == '"') { ++q; const uint8_t* s = q;
+                    while (q < le && *q != '"') ++q;
+                    if (q > s) cur_tool = (q - s > 4 && (memcmp(s, "/usr", 4) == 0 || memcmp(s, "/lib", 4) == 0)); } }
+            } else {                                                          // content: first-seen -> attribute
+                uint32_t L = uint32_t(le - p);
+                if (!seen.contains(p, L)) { seen.intern(p, L);
+                    if (cur_tool) { tool_fs.insert(tool_fs.end(), p, le); tfb += L; ++tfn; }
+                    else { proj_fs.insert(proj_fs.end(), p, le); pfb += L; ++pfn; } }
+            }
+            p = le;
+        }
+    }
+    uint64_t tool_fs_z3 = zstd_size(cc, tool_fs.data(), tool_fs.size(), 3, z);
+    uint64_t proj_fs_z3 = zstd_size(cc, proj_fs.data(), proj_fs.size(), 3, z);
+    printf("    --- source-attribution of first-seen content (markers excluded) ---\n");
+    printf("    toolchain-attributed=%zu lines %.3f MiB -> z3 %.3f (FREE, worker has toolchain src)\n", tfn, MB(tfb), MB(tool_fs_z3));
+    printf("    project-attributed  =%zu lines %.3f MiB -> z3 %.3f (must ship; worker lacks project src)\n", pfn, MB(pfb), MB(proj_fs_z3));
+    printf("    BEST-CASE FILL (toolchain fully free via COPY+PATCH) = project z3 %.3f MiB = %.1fx   %s 400x (budget %.3f)\n",
+           MB(proj_fs_z3), double(raw) / double(proj_fs_z3),
+           double(proj_fs_z3) <= budget ? "*** CLEARS ***" : "under", MB(uint64_t(budget)));
+}
+
 int main(int argc, char** argv) {
     const char* manifest = nullptr;
     const char* name = nullptr;
@@ -677,6 +778,7 @@ int main(int argc, char** argv) {
     bool reorder = false;
     bool skeleton = false;
     bool pretrain = false;
+    bool regioncov = false;
     std::vector<std::string> trains;
     DefCodec::Params P;
     for (int i = 1; i < argc; ++i) {
@@ -689,6 +791,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--reorder")) reorder = true;
         else if (!strcmp(argv[i], "--skeleton")) skeleton = true;
         else if (!strcmp(argv[i], "--pretrain")) pretrain = true;
+        else if (!strcmp(argv[i], "--regioncov")) regioncov = true;
         else if (eat("--train")) trains.emplace_back(argv[++i]);
         else if (eat("--stride")) P.stride = uint32_t(atoi(argv[++i]));
         else if (eat("--min-match")) P.min_match = uint32_t(atoi(argv[++i]));
@@ -745,6 +848,12 @@ int main(int argc, char** argv) {
                    g.tag, MB(s), double(dbytes) / double(s), double(c.raw) / double(s),
                    double(dbytes) / dt / 1e9);
         }
+        ZSTD_freeCCtx(cc);
+        return 0;
+    }
+
+    if (regioncov) {
+        run_regioncov(c, d, c.raw, cc);
         ZSTD_freeCCtx(cc);
         return 0;
     }
