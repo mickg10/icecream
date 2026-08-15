@@ -1463,7 +1463,7 @@ struct SourcePackPlanStats {
 struct SourcePackRaw {
     std::vector<uint8_t>basis_control,basis_data,definition_control,definition_data;
     SourcePackPlanStats stats;
-    bool implicit_order=false,basis_templates=false;
+    bool implicit_order=false,basis_templates=false,basis_pretrained=false;
     bool valid=false;
 };
 
@@ -1475,7 +1475,7 @@ struct SourcePackFrames {
     SourcePackPlanStats stats;
     uint64_t wire=UINT64_MAX;
     unsigned residual_percent=0;
-    bool implicit_order=false,basis_templates=false;
+    bool implicit_order=false,basis_templates=false,basis_pretrained=false;
     bool valid=false;
 };
 
@@ -1605,24 +1605,39 @@ static SourcePackRaw encode_source_pack(const std::vector<uint32_t>&ids,const Li
 }
 
 static SourcePackRaw template_source_pack_basis(const SourcePackRaw&input,bool parameterize_keywords){
-    if(!input.valid||input.basis_templates)return {};
+    if(!input.valid||input.basis_templates||input.basis_pretrained)return {};
     const uint8_t*p=input.basis_control.data(),*end=p+input.basis_control.size(),*data=input.basis_data.data(),*data_end=data+input.basis_data.size();const uint64_t count=get_varint(p,end);if(count>UINT32_MAX)die_msg("source template basis count too large");LineStore store;std::vector<uint32_t>ids;ids.reserve(size_t(count));
     for(uint64_t i=0;i<count;++i){const uint64_t len=get_varint(p,end);if(len>UINT32_MAX||len>uint64_t(data_end-data))die_msg("source template basis exceeds frame");const LineStore::Result result=store.intern(data,uint32_t(len));if(!result.first||result.id!=i+1)die_msg("source template basis is not unique/dense");ids.push_back(result.id);data+=len;}
     if(p!=end||data!=data_end)die_msg("trailing source template basis bytes");
     TemplateStats stats;const SplitBuffer encoded=encode_templates(ids,store,stats,parameterize_keywords);SourcePackRaw output=input;output.basis_control.clear();put_varint(output.basis_control,count);output.basis_control.insert(output.basis_control.end(),encoded.control.begin(),encoded.control.end());output.basis_data=encoded.data;output.basis_templates=true;return output;
 }
 
+// The frozen model is itself a bank of parameterized superblocks.  Apply those rules to the
+// contributing source basis, allow TU-local rule additions inside this one frame, and discard the
+// additions afterwards.  The same serialized package can independently serve as zstd history.
+static SourcePackRaw pretrained_source_pack_basis(const SourcePackRaw&input,const PretrainedPackage&model,
+                                                   bool parameterize_keywords){
+    if(!input.valid||input.basis_templates||input.basis_pretrained)return {};
+    const uint8_t*p=input.basis_control.data(),*end=p+input.basis_control.size(),*data=input.basis_data.data(),*data_end=data+input.basis_data.size();const uint64_t count=get_varint(p,end);if(count>UINT32_MAX)die_msg("pretrained source basis count too large");LineStore store;std::vector<uint32_t>ids;ids.reserve(size_t(count));
+    for(uint64_t i=0;i<count;++i){const uint64_t len=get_varint(p,end);if(len>UINT32_MAX||len>uint64_t(data_end-data))die_msg("pretrained source basis exceeds frame");const LineStore::Result result=store.intern(data,uint32_t(len));if(!result.first||result.id!=i+1)die_msg("pretrained source basis is not unique/dense");ids.push_back(result.id);data+=len;}
+    if(p!=end||data!=data_end)die_msg("trailing pretrained source basis bytes");
+    PersistentEncoder encoder=model.encoder;PersistentStats stats;const SplitBuffer encoded=encode_persistent_templates(ids,store,encoder,stats,model.rule_count(),model.token_count(),parameterize_keywords);SourcePackRaw output=input;output.basis_control.clear();put_varint(output.basis_control,count);output.basis_control.insert(output.basis_control.end(),encoded.control.begin(),encoded.control.end());output.basis_data=encoded.data;output.basis_pretrained=true;return output;
+}
+
 static std::vector<std::vector<uint8_t>>decode_source_pack_bases(const SourcePackFrames&frames,
                                                                  const std::vector<uint8_t>&basis_control,
-                                                                 const std::vector<uint8_t>&basis_data){
-    if(!frames.basis_templates){const uint8_t*p=basis_control.data(),*end=p+basis_control.size(),*data=basis_data.data(),*data_end=data+basis_data.size();const uint64_t count=get_varint(p,end);std::vector<std::vector<uint8_t>>bases;bases.reserve(size_t(count));for(uint64_t i=0;i<count;++i){const uint64_t len=get_varint(p,end);if(len>uint64_t(data_end-data))die_msg("source-pack basis exceeds frame");bases.emplace_back(data,data+len);data+=len;}if(p!=end||data!=data_end)die_msg("trailing source-pack basis bytes");return bases;}
-    const uint8_t*p=basis_control.data(),*end=p+basis_control.size();const uint64_t count=get_varint(p,end);std::vector<uint8_t>control(p,end);DecoderStore decoded;decode_templates(control,basis_data,decoded);if(decoded.lines.size()!=count+1)die_msg("source template basis cardinality mismatch");std::vector<std::vector<uint8_t>>bases;bases.reserve(size_t(count));for(uint64_t i=1;i<=count;++i)bases.push_back(std::move(decoded.lines[size_t(i)]));return bases;
+                                                                 const std::vector<uint8_t>&basis_data,
+                                                                 const PersistentDecoder*pretrained){
+    if(!frames.basis_templates&&!frames.basis_pretrained){const uint8_t*p=basis_control.data(),*end=p+basis_control.size(),*data=basis_data.data(),*data_end=data+basis_data.size();const uint64_t count=get_varint(p,end);std::vector<std::vector<uint8_t>>bases;bases.reserve(size_t(count));for(uint64_t i=0;i<count;++i){const uint64_t len=get_varint(p,end);if(len>uint64_t(data_end-data))die_msg("source-pack basis exceeds frame");bases.emplace_back(data,data+len);data+=len;}if(p!=end||data!=data_end)die_msg("trailing source-pack basis bytes");return bases;}
+    const uint8_t*p=basis_control.data(),*end=p+basis_control.size();const uint64_t count=get_varint(p,end);std::vector<uint8_t>control(p,end);std::vector<std::vector<uint8_t>>bases;bases.reserve(size_t(count));
+    if(frames.basis_pretrained){if(!pretrained)die_msg("pretrained source basis model unavailable");PersistentDecoder decoded=*pretrained;decode_persistent_templates(control,basis_data,decoded);if(decoded.lines.lines.size()!=count+1)die_msg("pretrained source basis cardinality mismatch");for(uint64_t i=1;i<=count;++i)bases.push_back(std::move(decoded.lines.lines[size_t(i)]));return bases;}
+    DecoderStore decoded;decode_templates(control,basis_data,decoded);if(decoded.lines.size()!=count+1)die_msg("source template basis cardinality mismatch");for(uint64_t i=1;i<=count;++i)bases.push_back(std::move(decoded.lines[size_t(i)]));return bases;
 }
 
 static SourcePackFrames compress_source_pack(const SourcePackRaw&raw,FrameCodec&codec,int level,unsigned residual_percent,
                                              ModelFrameCodec*model=nullptr){
     SourcePackFrames frames;if(!raw.valid)return frames;
-    frames.valid=true;frames.residual_percent=residual_percent;frames.stats=raw.stats;frames.implicit_order=raw.implicit_order;frames.basis_templates=raw.basis_templates;
+    frames.valid=true;frames.residual_percent=residual_percent;frames.stats=raw.stats;frames.implicit_order=raw.implicit_order;frames.basis_templates=raw.basis_templates;frames.basis_pretrained=raw.basis_pretrained;
     auto compress=[&](const std::vector<uint8_t>&input,std::vector<uint8_t>&output,size_t index){
         if(model){PackedFrame packed=model->compress_best(input,level);output=std::move(packed.bytes);frames.dictionary[index]=packed.dictionary;}
         else output=codec.compress(input,level);
@@ -1654,11 +1669,11 @@ static void account_source_pack_layout(SourcePackStats&stats,const SourcePackFra
     stats.frame_wire[3]+=frames.definition_data.size()+4+(frames.dictionary[3]?1:0);
 }
 
-static void decode_source_pack(const SourcePackFrames&frames,FrameCodec&codec,DecoderStore&store,ModelFrameCodec*model=nullptr){
+static void decode_source_pack(const SourcePackFrames&frames,FrameCodec&codec,DecoderStore&store,ModelFrameCodec*model=nullptr,const PersistentDecoder*pretrained=nullptr){
     if(!frames.valid)die_msg("missing source-pack frame");
     if(frames.implicit_order)die_msg("implicit source-pack requires semantic lengths");
     const std::array<std::vector<uint8_t>,4>raw=decompress_source_pack_frames(frames,codec,model);const std::vector<uint8_t>&basis_control=raw[0],&basis_data=raw[1],&definition_control=raw[2],&definition_data=raw[3];
-    std::vector<std::vector<uint8_t>>bases=decode_source_pack_bases(frames,basis_control,basis_data);const uint8_t*p=definition_control.data(),*end=p+definition_control.size(),*data=definition_data.data(),*data_end=data+definition_data.size();
+    std::vector<std::vector<uint8_t>>bases=decode_source_pack_bases(frames,basis_control,basis_data,pretrained);const uint8_t*p=definition_control.data(),*end=p+definition_control.size(),*data=definition_data.data(),*data_end=data+definition_data.size();
     const uint64_t record_count=get_varint(p,end);
     for(uint64_t i=0;i<record_count;++i){
         if(p==end)die_msg("missing source-pack mode");
@@ -1698,10 +1713,10 @@ static std::vector<uint64_t>semantic_raw_lengths(const std::vector<uint8_t>&cont
 }
 
 static std::vector<uint8_t>decode_implicit_source_pack(const SourcePackFrames&frames,FrameCodec&codec,
-                                                       const std::vector<uint64_t>&lengths,ModelFrameCodec*model=nullptr){
+                                                       const std::vector<uint64_t>&lengths,ModelFrameCodec*model=nullptr,const PersistentDecoder*pretrained=nullptr){
     if(!frames.valid||!frames.implicit_order)die_msg("missing implicit source-pack frame");
     const std::array<std::vector<uint8_t>,4>raw=decompress_source_pack_frames(frames,codec,model);const std::vector<uint8_t>&basis_control=raw[0],&basis_data=raw[1],&definition_control=raw[2],&definition_data=raw[3];
-    std::vector<std::vector<uint8_t>>bases=decode_source_pack_bases(frames,basis_control,basis_data);const uint8_t*p=definition_control.data(),*end=p+definition_control.size();const uint64_t count=get_varint(p,end);if(count!=lengths.size())die_msg("implicit source record count mismatch");
+    std::vector<std::vector<uint8_t>>bases=decode_source_pack_bases(frames,basis_control,basis_data,pretrained);const uint8_t*p=definition_control.data(),*end=p+definition_control.size();const uint64_t count=get_varint(p,end);if(count!=lengths.size())die_msg("implicit source record count mismatch");
     const size_t bitmap_bytes=(lengths.size()+7)/8;if(bitmap_bytes>size_t(end-p))die_msg("implicit source bitmap exceeds control");const uint8_t*bitmap=p;p+=bitmap_bytes;
     const uint8_t*data=definition_data.data();const uint8_t*data_end=data+definition_data.size();std::vector<uint8_t>payload;
     uint64_t total=0;for(uint64_t len:lengths){if(len>SIZE_MAX-total)die_msg("implicit source payload too large");total+=len;}payload.reserve(size_t(total));
@@ -2127,6 +2142,8 @@ int main(int argc, char** argv) {
     const bool use_pretrained=model_kib!=0;
     PretrainedPackage pretrained;
     if(use_pretrained){const auto training_begin=Clock::now();PretrainedBuilder builder(pretrain_all_identifiers);for(size_t i=0;i<pretrain_manifests.size();++i)builder.scan_manifest(pretrain_manifests[i],pretrain_max_files,i);const double training_seconds=elapsed(training_begin);pretrained=builder.compile(model_kib*1024,zlevel,training_seconds,model_min_corpora);}
+    const PretrainedPackage frozen_pretrained=pretrained;
+    FrameCodec pretrained_package_codec;const std::vector<uint8_t>pretrained_receiver_raw=use_pretrained?pretrained_package_codec.decompress(pretrained.frame):std::vector<uint8_t>{};if(pretrained_receiver_raw!=pretrained.raw)die_msg("pretrained receiver package mismatch");
     const bool use_source_dictionary=!source_dictionary_path.empty();
     const std::vector<uint8_t>source_dictionary=use_source_dictionary?load_file_bytes(source_dictionary_path):std::vector<uint8_t>{};
     if(use_source_dictionary&&(source_dictionary.empty()||source_dictionary.size()>UINT32_MAX))die_msg("source dictionary size out of range");
@@ -2143,13 +2160,15 @@ int main(int argc, char** argv) {
         std::printf("semantic export exact=PASS manifest=%s TUs=%zu raw=%llu definitions=%llu zstd-wire=%llu prefix=%s seconds=%.2f\n",manifest,corpus.files.size(),static_cast<unsigned long long>(corpus.raw),static_cast<unsigned long long>(definitions),static_cast<unsigned long long>(wire),semantic_export_prefix.c_str(),elapsed(begin));return 0;}
     LineStore truth;
     FrameCodec frames;
-    ModelFrameCodec model_frames(pretrained.raw,zlevel);
-    ModelFrameCodec model_p4_frames(pretrained.raw,zlevel);
+    ModelFrameCodec model_encoder_frames(pretrained.raw,zlevel),model_decoder_frames(pretrained_receiver_raw,zlevel);
+    ModelFrameCodec model_p4_encoder_frames(pretrained.raw,zlevel),model_p4_decoder_frames(pretrained_receiver_raw,zlevel);
+    ModelFrameCodec model_local_superblock_encoder_frames(pretrained.raw,zlevel),model_local_superblock_decoder_frames(pretrained_receiver_raw,zlevel);
+    ModelFrameCodec pretrained_source_encoder_frames(pretrained.raw,zlevel),pretrained_source_decoder_frames(pretrained_receiver_raw,zlevel);
     ModelFrameCodec source_dictionary_encoder_frames(source_dictionary,zlevel),source_dictionary_decoder_frames(source_dictionary_decoded,zlevel);
     ModelFrameCodec token_dictionary_encoder_frames(source_dictionary,zlevel),token_dictionary_decoder_frames(source_dictionary_decoded,zlevel);
-    Row p0("P0-appearance"), p1("P1-lexicographic"), p4("P4-alpha-template"),p5("P5-multiline"),p6("P6-token-forest"),p7s("P7-source-location"),p7p("P7p-source-superblock"),p7t("P7t-all-token-spans"),p7("P7-online-template"),p7b("P7b-local-rule-online-token"),p9("P9-semantic-split-zstd"),p9s("P9s-semantic+source"),p9sg("P9sg-source-basis-grammar"),p9sd("P9s+trained-source-dict"),p9t("P9t-semantic+token-spans"),p9td("P9t+trained-source-dict"),p9g("P9g-parameterized-spans"),p8("P8-pretrained-superblock"),p8d("P8-pretrained-dict-P4"), p10("P10-best-local-frame"),p10sd("P10+source-dict"),p10p("P10+P8-charged-union"),p11("P11-best-token-span-union"),p11d("P11+token-spans+dict"),p12("P12-best-param-superblock");
-    std::vector<Row*> rows{&p0, &p1, &p4,&p5,&p6,&p7s,&p7p,&p7t,&p7,&p7b,&p9,&p9s,&p9sg};if(use_source_dictionary)rows.push_back(&p9sd);rows.push_back(&p9t);if(use_source_dictionary)rows.push_back(&p9td);rows.push_back(&p9g);if(use_pretrained){rows.push_back(&p8);rows.push_back(&p8d);}rows.push_back(&p10);if(use_source_dictionary)rows.push_back(&p10sd);if(use_pretrained)rows.push_back(&p10p);rows.push_back(&p11);if(use_source_dictionary)rows.push_back(&p11d);rows.push_back(&p12);
-    if(use_pretrained){p8.wire=pretrained.frame.size()+4;p8d.wire=pretrained.frame.size()+4;p10p.wire=pretrained.frame.size()+4;}
+    Row p0("P0-appearance"), p1("P1-lexicographic"), p4("P4-alpha-template"),p5("P5-multiline"),p6("P6-token-forest"),p7s("P7-source-location"),p7p("P7p-source-superblock"),p7t("P7t-all-token-spans"),p7("P7-online-template"),p7b("P7b-local-rule-online-token"),p9("P9-semantic-split-zstd"),p9s("P9s-semantic+source"),p9sg("P9sg-source-basis-grammar"),p9sm("P9sm-pretrained-source-grammar"),p9sd("P9s+trained-source-dict"),p9t("P9t-semantic+token-spans"),p9td("P9t+trained-source-dict"),p9g("P9g-parameterized-spans"),p8("P8-pretrained-superblock"),p8c("P8c-frozen+TU-local-superblock"),p8d("P8-pretrained-dict-P4"), p10("P10-best-local-frame"),p10sd("P10+source-dict"),p10p("P10+P8-charged-union"),p11("P11-best-token-span-union"),p11d("P11+token-spans+dict"),p12("P12-best-param-superblock"),p13("P13-best-pretrained-superblock-union");
+    std::vector<Row*> rows{&p0, &p1, &p4,&p5,&p6,&p7s,&p7p,&p7t,&p7,&p7b,&p9,&p9s,&p9sg};if(use_pretrained)rows.push_back(&p9sm);if(use_source_dictionary)rows.push_back(&p9sd);rows.push_back(&p9t);if(use_source_dictionary)rows.push_back(&p9td);rows.push_back(&p9g);if(use_pretrained){rows.push_back(&p8);rows.push_back(&p8c);rows.push_back(&p8d);}rows.push_back(&p10);if(use_source_dictionary)rows.push_back(&p10sd);if(use_pretrained)rows.push_back(&p10p);rows.push_back(&p11);if(use_source_dictionary)rows.push_back(&p11d);rows.push_back(&p12);if(use_pretrained)rows.push_back(&p13);
+    if(use_pretrained){const uint64_t package_wire=pretrained.frame.size()+4;p8.wire=package_wire;p8c.wire=package_wire;p8d.wire=package_wire;p9sm.wire=package_wire;p10p.wire=package_wire;p13.wire=package_wire;}
     if(use_source_dictionary){const uint64_t package_wire=source_dictionary_package.size()+4;p9sd.wire=package_wire;p9td.wire=package_wire;p10sd.wire=package_wire;p11d.wire=package_wire;}
     std::unique_ptr<SemanticFrameWriter>semantic_writer;if(!semantic_export_prefix.empty())semantic_writer=std::make_unique<SemanticFrameWriter>(semantic_export_prefix);
     for (Row* row : rows) row->tu_wire.reserve(corpus.files.size());
@@ -2158,10 +2177,11 @@ int main(int argc, char** argv) {
     ForestStats forest_stats;
     PersistentStats persistent_stats;PersistentEncoder persistent_encoder;PersistentDecoder persistent_decoder;
     PersistentStats hybrid_stats;PersistentEncoder hybrid_encoder;PersistentDecoder hybrid_decoder;
-    PersistentStats pretrained_stats;
+    PersistentStats pretrained_stats,pretrained_local_stats;
     MultiStats multi_stats;
-    SourceLearner source_learner;SourceStats source_stats;SourcePackStats source_pack_stats,semantic_source_pack_stats,grammar_source_pack_stats,dictionary_source_pack_stats;TokenSpanStats all_token_span_stats,token_span_stats,dictionary_token_span_stats;TokenSpanSweepStats all_token_span_sweep,token_span_sweep,dictionary_token_span_sweep;SourceCatalog source_catalog;std::vector<LineSourceMeta>source_meta(1);
+    SourceLearner source_learner;SourceStats source_stats;SourcePackStats source_pack_stats,semantic_source_pack_stats,grammar_source_pack_stats,pretrained_source_pack_stats,dictionary_source_pack_stats;TokenSpanStats all_token_span_stats,token_span_stats,dictionary_token_span_stats;TokenSpanSweepStats all_token_span_sweep,token_span_sweep,dictionary_token_span_sweep;SourceCatalog source_catalog;std::vector<LineSourceMeta>source_meta(1);
     ParamSpanStats param_span_stats;uint64_t param_span_literal_wire=0,param_span_candidate_wire=0,param_span_selected_wire=0,param_span_frame_wins=0,param_span_combined_wins=0,param_span_columnar_wins=0;
+    std::array<uint64_t,4>p13_choice_tus{},p13_choice_wire{};
     std::array<std::vector<uint8_t>,kSourceCategoryCount>attributed_bytes;
     uint64_t cumulative_raw = 0;
     const double fractions[] = {0.10, 0.25, 0.50, 0.75, 1.00};
@@ -2247,14 +2267,14 @@ int main(int argc, char** argv) {
         verify_definitions(new_ids, truth, p4.decoder);
 
         uint64_t w8d=0;PackedFrame p8d_control_frame,p8d_data_frame;std::vector<uint8_t>p8d_control_decoded,p8d_data_decoded;
-        if(use_pretrained){const auto e8d=Clock::now();p8d_control_frame=model_p4_frames.compress_best(p4_selected->control,zlevel);p8d_data_frame=model_p4_frames.compress_best(p4_selected->data,zlevel);w8d=p8d_control_frame.bytes.size()+p8d_data_frame.bytes.size()+10;p8d.encode_seconds+=elapsed(e8d);
-            const auto d8d=Clock::now();p8d_control_decoded=model_p4_frames.decompress(p8d_control_frame);p8d_data_decoded=model_p4_frames.decompress(p8d_data_frame);decode_templates(p8d_control_decoded,p8d_data_decoded,p8d.decoder);p8d.decode_seconds+=elapsed(d8d);verify_definitions(new_ids,truth,p8d.decoder);}
+        if(use_pretrained){const auto e8d=Clock::now();p8d_control_frame=model_p4_encoder_frames.compress_best(p4_selected->control,zlevel);p8d_data_frame=model_p4_encoder_frames.compress_best(p4_selected->data,zlevel);w8d=p8d_control_frame.bytes.size()+p8d_data_frame.bytes.size()+10;p8d.encode_seconds+=elapsed(e8d);
+            const auto d8d=Clock::now();p8d_control_decoded=model_p4_decoder_frames.decompress(p8d_control_frame);p8d_data_decoded=model_p4_decoder_frames.decompress(p8d_data_frame);decode_templates(p8d_control_decoded,p8d_data_decoded,p8d.decoder);p8d.decode_seconds+=elapsed(d8d);verify_definitions(new_ids,truth,p8d.decoder);}
 
         const auto e9=Clock::now();TemplateStats p9_stats_a,p9_stats_b;const SemanticBuffer p9_raw_a=encode_semantic_templates(new_ids,truth,p9_stats_a,false),p9_raw_b=encode_semantic_templates(new_ids,truth,p9_stats_b,true);const SemanticBuffer*p9_selected=&p9_raw_a;SemanticFrames p9_frames=compress_semantic(p9_raw_a,frames,zlevel),p9_frames_b=compress_semantic(p9_raw_b,frames,zlevel);TemplateStats selected_p9=p9_stats_a;
         if(p9_frames_b.wire<p9_frames.wire){p9_frames=std::move(p9_frames_b);selected_p9=p9_stats_b;p9_selected=&p9_raw_b;}if(semantic_writer)semantic_writer->add(file.len,*p9_selected);p9.encode_seconds+=elapsed(e9);semantic_stats.rules+=selected_p9.rules;semantic_stats.instances+=selected_p9.instances;semantic_stats.unique_slots+=selected_p9.unique_slots;semantic_stats.slot_occurrences+=selected_p9.slot_occurrences;semantic_stats.literal_fallbacks+=selected_p9.literal_fallbacks;semantic_stats.template_input_bytes+=selected_p9.template_input_bytes;semantic_stats.lexicon_entries+=selected_p9.lexicon_entries;semantic_stats.lexicon_references+=selected_p9.lexicon_references;p9_control_wire+=p9_frames.control.size()+4;for(size_t c=0;c<kSemanticChannels;++c)if(!p9_frames.payload[c].empty())p9_payload_wire[c]+=p9_frames.payload[c].size()+4;
         const auto d9=Clock::now();const SemanticBuffer p9_decoded=decompress_semantic(p9_frames,frames);decode_semantic_templates(p9_decoded,p9.decoder);p9.decode_seconds+=elapsed(d9);verify_definitions(new_ids,truth,p9.decoder);
 
-        SourcePackFrames p9s_source_frames,p9sg_source_frames,p9sd_source_frames;size_t p9s_threshold_index=0,p9sg_threshold_index=0,p9sd_threshold_index=0;double p9s_tu_encode=0,p9sg_tu_encode=0,p9sd_tu_encode=0;
+        SourcePackFrames p9s_source_frames,p9sg_source_frames,p9sm_source_frames,p9sd_source_frames;size_t p9s_threshold_index=0,p9sg_threshold_index=0,p9sm_threshold_index=0,p9sd_threshold_index=0;double p9s_tu_encode=0,p9sg_tu_encode=0,p9sm_tu_encode=0,p9sd_tu_encode=0;
         for(size_t threshold_index=0;threshold_index<kSourcePackThresholds.size();++threshold_index){
             const unsigned threshold=kSourcePackThresholds[threshold_index];
             const auto plan_begin=Clock::now();
@@ -2268,6 +2288,9 @@ int main(int argc, char** argv) {
             const auto grammar_begin=Clock::now();SourcePackRaw grammar_a=template_source_pack_basis(candidate_raw,false),grammar_b=template_source_pack_basis(candidate_raw,true);SourcePackFrames grammar_frame_a=compress_source_pack(grammar_a,frames,zlevel,threshold),grammar_frame_b=compress_source_pack(grammar_b,frames,zlevel,threshold);SourcePackFrames grammar_candidate=grammar_frame_b.valid&&(!grammar_frame_a.valid||grammar_frame_b.wire<grammar_frame_a.wire)?std::move(grammar_frame_b):std::move(grammar_frame_a);p9sg_tu_encode+=plan_seconds+elapsed(grammar_begin);
             if(grammar_candidate.valid){++grammar_source_pack_stats.threshold_tus[threshold_index];grammar_source_pack_stats.threshold_wire[threshold_index]+=grammar_candidate.wire;grammar_source_pack_stats.threshold_basis_bytes[threshold_index]+=grammar_candidate.stats.basis_bytes;grammar_source_pack_stats.threshold_residual_bytes[threshold_index]+=grammar_candidate.stats.residual_bytes;}
             if(grammar_candidate.valid&&(!p9sg_source_frames.valid||grammar_candidate.wire<p9sg_source_frames.wire)){p9sg_source_frames=std::move(grammar_candidate);p9sg_threshold_index=threshold_index;}
+            if(use_pretrained){const auto pretrained_begin=Clock::now();SourcePackRaw pretrained_raw=pretrained_source_pack_basis(candidate_raw,frozen_pretrained,pretrain_all_identifiers);SourcePackFrames pretrained_candidate=compress_source_pack(pretrained_raw,frames,zlevel,threshold,&pretrained_source_encoder_frames);p9sm_tu_encode+=plan_seconds+elapsed(pretrained_begin);
+                if(pretrained_candidate.valid){++pretrained_source_pack_stats.threshold_tus[threshold_index];pretrained_source_pack_stats.threshold_wire[threshold_index]+=pretrained_candidate.wire;pretrained_source_pack_stats.threshold_basis_bytes[threshold_index]+=pretrained_candidate.stats.basis_bytes;pretrained_source_pack_stats.threshold_residual_bytes[threshold_index]+=pretrained_candidate.stats.residual_bytes;}
+                if(pretrained_candidate.valid&&(!p9sm_source_frames.valid||pretrained_candidate.wire<p9sm_source_frames.wire)){p9sm_source_frames=std::move(pretrained_candidate);p9sm_threshold_index=threshold_index;}}
             if(use_source_dictionary){const auto dictionary_begin=Clock::now();SourcePackFrames dictionary_candidate=compress_source_pack(candidate_raw,frames,zlevel,threshold,&source_dictionary_encoder_frames);p9sd_tu_encode+=plan_seconds+elapsed(dictionary_begin);
                 if(dictionary_candidate.valid){++dictionary_source_pack_stats.threshold_tus[threshold_index];dictionary_source_pack_stats.threshold_wire[threshold_index]+=dictionary_candidate.wire;
                     dictionary_source_pack_stats.threshold_basis_bytes[threshold_index]+=dictionary_candidate.stats.basis_bytes;dictionary_source_pack_stats.threshold_residual_bytes[threshold_index]+=dictionary_candidate.stats.residual_bytes;}
@@ -2277,12 +2300,15 @@ int main(int argc, char** argv) {
         const uint64_t p9_without_raw=p9_frames.wire-p9_raw_wire;
         const uint64_t p9_source_size=p9s_source_frames.valid?p9_without_raw+p9s_source_frames.wire:UINT64_MAX;
         const uint64_t p9_grammar_source_size=p9sg_source_frames.valid?p9_without_raw+p9sg_source_frames.wire:UINT64_MAX;
+        const uint64_t p9_pretrained_source_size=p9sm_source_frames.valid?p9_without_raw+p9sm_source_frames.wire:UINT64_MAX;
         const uint64_t p9_dictionary_source_size=p9sd_source_frames.valid?p9_without_raw+p9sd_source_frames.wire:UINT64_MAX;
         const bool p9s_use_source=p9s_source_frames.valid&&p9_source_size<p9_frames.wire;
         const bool p9sg_use_source=p9sg_source_frames.valid&&p9_grammar_source_size<p9_frames.wire;
+        const bool p9sm_use_source=p9sm_source_frames.valid&&p9_pretrained_source_size<p9_frames.wire;
         const bool p9sd_use_source=p9sd_source_frames.valid&&p9_dictionary_source_size<p9_frames.wire;
         const uint64_t w9s=std::min(p9_frames.wire,p9_source_size)+1;p9s.encode_seconds+=p9s_tu_encode;
         const uint64_t w9sg=std::min(p9_frames.wire,p9_grammar_source_size)+1;p9sg.encode_seconds+=p9sg_tu_encode;
+        const uint64_t w9sm=std::min(p9_frames.wire,p9_pretrained_source_size)+1;if(use_pretrained)p9sm.encode_seconds+=p9sm_tu_encode;
         const uint64_t w9sd=std::min(p9_frames.wire,p9_dictionary_source_size)+1;
         if(use_source_dictionary)p9sd.encode_seconds+=p9sd_tu_encode;
         semantic_source_pack_stats.literal_wire+=p9_raw_wire;semantic_source_pack_stats.selected_wire+=(p9s_use_source?p9s_source_frames.wire:p9_raw_wire)+1;
@@ -2301,6 +2327,9 @@ int main(int argc, char** argv) {
             grammar_source_pack_stats.selected.available_records+=p9sg_source_frames.stats.available_records;grammar_source_pack_stats.selected.available_bytes+=p9sg_source_frames.stats.available_bytes;grammar_source_pack_stats.selected.source_records+=p9sg_source_frames.stats.source_records;grammar_source_pack_stats.selected.literal_records+=p9sg_source_frames.stats.literal_records;grammar_source_pack_stats.selected.basis_records+=p9sg_source_frames.stats.basis_records;grammar_source_pack_stats.selected.basis_bytes+=p9sg_source_frames.stats.basis_bytes;grammar_source_pack_stats.selected.residual_bytes+=p9sg_source_frames.stats.residual_bytes;grammar_source_pack_stats.selected.target_bytes+=p9sg_source_frames.stats.target_bytes;
             account_source_pack_layout(grammar_source_pack_stats,p9sg_source_frames);
         }
+        if(use_pretrained){pretrained_source_pack_stats.literal_wire+=p9_raw_wire;pretrained_source_pack_stats.selected_wire+=(p9sm_use_source?p9sm_source_frames.wire:p9_raw_wire)+1;
+            if(p9sm_source_frames.valid){++pretrained_source_pack_stats.candidate_tus;++pretrained_source_pack_stats.threshold_wins[p9sm_threshold_index];pretrained_source_pack_stats.source_wire+=p9sm_source_frames.wire;if(p9sm_use_source)++pretrained_source_pack_stats.frame_wins;
+                pretrained_source_pack_stats.selected.available_records+=p9sm_source_frames.stats.available_records;pretrained_source_pack_stats.selected.available_bytes+=p9sm_source_frames.stats.available_bytes;pretrained_source_pack_stats.selected.source_records+=p9sm_source_frames.stats.source_records;pretrained_source_pack_stats.selected.literal_records+=p9sm_source_frames.stats.literal_records;pretrained_source_pack_stats.selected.basis_records+=p9sm_source_frames.stats.basis_records;pretrained_source_pack_stats.selected.basis_bytes+=p9sm_source_frames.stats.basis_bytes;pretrained_source_pack_stats.selected.residual_bytes+=p9sm_source_frames.stats.residual_bytes;pretrained_source_pack_stats.selected.target_bytes+=p9sm_source_frames.stats.target_bytes;account_source_pack_layout(pretrained_source_pack_stats,p9sm_source_frames);}}
         dictionary_source_pack_stats.literal_wire+=p9_raw_wire;dictionary_source_pack_stats.selected_wire+=(p9sd_use_source?p9sd_source_frames.wire:p9_raw_wire)+1;
         if(p9sd_source_frames.valid){
             ++dictionary_source_pack_stats.candidate_tus;++dictionary_source_pack_stats.threshold_wins[p9sd_threshold_index];dictionary_source_pack_stats.source_wire+=p9sd_source_frames.wire;
@@ -2311,13 +2340,14 @@ int main(int argc, char** argv) {
             dictionary_source_pack_stats.selected.residual_bytes+=p9sd_source_frames.stats.residual_bytes;dictionary_source_pack_stats.selected.target_bytes+=p9sd_source_frames.stats.target_bytes;
             account_source_pack_layout(dictionary_source_pack_stats,p9sd_source_frames);
         }
-        auto decode_p9_source=[&](const SourcePackFrames&source_frames,ModelFrameCodec*model,DecoderStore&decoder){
+        auto decode_p9_source=[&](const SourcePackFrames&source_frames,ModelFrameCodec*model,DecoderStore&decoder,const PersistentDecoder*basis_model=nullptr){
             SemanticBuffer decoded=decompress_semantic(p9_frames,frames);const std::vector<uint64_t>lengths=semantic_raw_lengths(decoded.control);
-            decoded.payload[kRawDefinition]=decode_implicit_source_pack(source_frames,frames,lengths,model);decode_semantic_templates(decoded,decoder);
+            decoded.payload[kRawDefinition]=decode_implicit_source_pack(source_frames,frames,lengths,model,basis_model);decode_semantic_templates(decoded,decoder);
         };
         const auto d9s=Clock::now();if(p9s_use_source)decode_p9_source(p9s_source_frames,nullptr,p9s.decoder);else decode_semantic_templates(p9_decoded,p9s.decoder);
         p9s.decode_seconds+=elapsed(d9s);verify_definitions(new_ids,truth,p9s.decoder);
         const auto d9sg=Clock::now();if(p9sg_use_source)decode_p9_source(p9sg_source_frames,nullptr,p9sg.decoder);else decode_semantic_templates(p9_decoded,p9sg.decoder);p9sg.decode_seconds+=elapsed(d9sg);verify_definitions(new_ids,truth,p9sg.decoder);
+        if(use_pretrained){const auto d9sm=Clock::now();if(p9sm_use_source)decode_p9_source(p9sm_source_frames,&pretrained_source_decoder_frames,p9sm.decoder,&frozen_pretrained.decoder);else decode_semantic_templates(p9_decoded,p9sm.decoder);p9sm.decode_seconds+=elapsed(d9sm);verify_definitions(new_ids,truth,p9sm.decoder);}
         if(use_source_dictionary){const auto d9sd=Clock::now();if(p9sd_use_source)decode_p9_source(p9sd_source_frames,&source_dictionary_decoder_frames,p9sd.decoder);else decode_semantic_templates(p9_decoded,p9sd.decoder);p9sd.decode_seconds+=elapsed(d9sd);verify_definitions(new_ids,truth,p9sd.decoder);}
 
         const auto token_plan_begin=Clock::now();const std::vector<TokenSpanPlan>token_plans=build_token_span_plans(p9_selected->raw_ids,truth,source_meta,current_locations,source_catalog);const double token_plan_seconds=elapsed(token_plan_begin);
@@ -2418,8 +2448,13 @@ int main(int argc, char** argv) {
         const auto d7b=Clock::now();const std::vector<uint8_t>p7b_control_decoded=frames.decompress(p7b_control_frame),p7b_data_decoded=frames.decompress(p7b_data_frame);decode_persistent_templates(p7b_control_decoded,p7b_data_decoded,hybrid_decoder);p7b.decode_seconds+=elapsed(d7b);verify_definitions(new_ids,truth,hybrid_decoder.lines);
 
         uint64_t w8=0;
-        if(use_pretrained){const auto e8=Clock::now();const SplitBuffer p8_raw=encode_persistent_templates(new_ids,truth,pretrained.encoder,pretrained_stats,pretrained.rule_count(),pretrained.token_count(),pretrain_all_identifiers);const PackedFrame p8_control_frame=model_frames.compress_best(p8_raw.control,zlevel),p8_data_frame=model_frames.compress_best(p8_raw.data,zlevel);w8=p8_control_frame.bytes.size()+p8_data_frame.bytes.size()+10;p8.encode_seconds+=elapsed(e8);
-            const auto d8=Clock::now();const std::vector<uint8_t>p8_control_decoded=model_frames.decompress(p8_control_frame),p8_data_decoded=model_frames.decompress(p8_data_frame);decode_persistent_templates(p8_control_decoded,p8_data_decoded,pretrained.decoder);p8.decode_seconds+=elapsed(d8);verify_definitions(new_ids,truth,pretrained.decoder.lines);}
+        if(use_pretrained){const auto e8=Clock::now();const SplitBuffer p8_raw=encode_persistent_templates(new_ids,truth,pretrained.encoder,pretrained_stats,pretrained.rule_count(),pretrained.token_count(),pretrain_all_identifiers);const PackedFrame p8_control_frame=model_encoder_frames.compress_best(p8_raw.control,zlevel),p8_data_frame=model_encoder_frames.compress_best(p8_raw.data,zlevel);w8=p8_control_frame.bytes.size()+p8_data_frame.bytes.size()+10;p8.encode_seconds+=elapsed(e8);
+            const auto d8=Clock::now();const std::vector<uint8_t>p8_control_decoded=model_decoder_frames.decompress(p8_control_frame),p8_data_decoded=model_decoder_frames.decompress(p8_data_frame);decode_persistent_templates(p8_control_decoded,p8_data_decoded,pretrained.decoder);p8.decode_seconds+=elapsed(d8);verify_definitions(new_ids,truth,pretrained.decoder.lines);}
+
+        uint64_t w8c=0;PackedFrame p8c_control_frame,p8c_data_frame;
+        if(use_pretrained){const auto e8c=Clock::now();PersistentEncoder local_encoder=frozen_pretrained.encoder;const SplitBuffer p8c_raw=encode_persistent_templates(new_ids,truth,local_encoder,pretrained_local_stats,frozen_pretrained.rule_count(),frozen_pretrained.token_count(),pretrain_all_identifiers);p8c_control_frame=model_local_superblock_encoder_frames.compress_best(p8c_raw.control,zlevel);p8c_data_frame=model_local_superblock_encoder_frames.compress_best(p8c_raw.data,zlevel);w8c=p8c_control_frame.bytes.size()+p8c_data_frame.bytes.size()+10;p8c.encode_seconds+=elapsed(e8c);}
+        auto decode_p8c=[&](DecoderStore&target){PersistentDecoder local_decoder=frozen_pretrained.decoder;const std::vector<uint8_t>control=model_local_superblock_decoder_frames.decompress(p8c_control_frame),data=model_local_superblock_decoder_frames.decompress(p8c_data_frame);decode_persistent_templates(control,data,local_decoder);verify_definitions(new_ids,truth,local_decoder.lines);for(uint32_t id:new_ids)target.install(id,std::move(local_decoder.lines.lines[id]));};
+        if(use_pretrained){const auto d8c=Clock::now();decode_p8c(p8c.decoder);p8c.decode_seconds+=elapsed(d8c);verify_definitions(new_ids,truth,p8c.decoder);}
 
         const uint64_t w1=p1_frame.size()+4,w5=p5_size,w6=p6_frame.size()+4;
         const size_t best_size=std::min({size_t(w1),p4_size,size_t(w5),size_t(w6),size_t(w7s),size_t(p7p_size),size_t(p9_frames.wire),size_t(p9_source_size)});
@@ -2476,32 +2511,43 @@ int main(int argc, char** argv) {
             else decode_literals(frames.decompress(p1_frame),p11d.decoder);
             p11d.decode_seconds+=elapsed(d11d);verify_definitions(new_ids,truth,p11d.decoder);w11d=best_token_dictionary+1;}
 
-        const size_t best_param_span=std::min({best_token_span,size_t(p9_param_span_size),size_t(p9_grammar_source_size)});const auto d12=Clock::now();
-        if(best_param_span==p9_grammar_source_size)decode_p9_source(p9sg_source_frames,nullptr,p12.decoder);
-        else if(best_param_span==p9_param_span_size){SemanticBuffer decoded=decompress_semantic(p9_frames,frames);const std::vector<uint64_t>lengths=semantic_raw_lengths(decoded.control);decoded.payload[kRawDefinition]=decode_implicit_param_span_pack(p9g_span_frames,frames,lengths);decode_semantic_templates(decoded,p12.decoder);}
-        else if(best_token_span==p9_token_span_size)decode_p9_token_span(p9t_span_frames,nullptr,p12.decoder);
-        else if(best_token_span==p7t_size)decode_explicit_token_span_pack(p7t_span_frames,frames,p12.decoder);
-        else if(best_token_span==p4_size)decode_templates(p4_control_decoded,p4_data_decoded,p12.decoder);
-        else if(best_token_span==p9_frames.wire)decode_semantic_templates(p9_decoded,p12.decoder);
-        else if(p9s_source_frames.valid&&best_token_span==p9_source_size)decode_p9_source(p9s_source_frames,nullptr,p12.decoder);
-        else if(best_token_span==p5_size)decode_multiline(p5_control_decoded,p5_data_decoded,p12.decoder);
-        else if(best_token_span==p6_frame.size()+4)decode_forest(frames.decompress(p6_frame),p12.decoder);
-        else if(best_token_span==w7s)decode_source_variants(p7s_decoded,p12.decoder);
-        else if(p7p_frames.valid&&best_token_span==p7p_size)decode_source_pack(p7p_frames,frames,p12.decoder);
-        else decode_literals(frames.decompress(p1_frame),p12.decoder);
+        const size_t best_param_span=std::min({best_token_span,size_t(p9_param_span_size),size_t(p9_grammar_source_size)});
+        auto decode_param_span_choice=[&](DecoderStore&decoder){
+            if(best_param_span==p9_grammar_source_size)decode_p9_source(p9sg_source_frames,nullptr,decoder);
+            else if(best_param_span==p9_param_span_size){SemanticBuffer decoded=decompress_semantic(p9_frames,frames);const std::vector<uint64_t>lengths=semantic_raw_lengths(decoded.control);decoded.payload[kRawDefinition]=decode_implicit_param_span_pack(p9g_span_frames,frames,lengths);decode_semantic_templates(decoded,decoder);}
+            else if(best_token_span==p9_token_span_size)decode_p9_token_span(p9t_span_frames,nullptr,decoder);
+            else if(best_token_span==p7t_size)decode_explicit_token_span_pack(p7t_span_frames,frames,decoder);
+            else if(best_token_span==p4_size)decode_templates(p4_control_decoded,p4_data_decoded,decoder);
+            else if(best_token_span==p9_frames.wire)decode_semantic_templates(p9_decoded,decoder);
+            else if(p9s_source_frames.valid&&best_token_span==p9_source_size)decode_p9_source(p9s_source_frames,nullptr,decoder);
+            else if(best_token_span==p5_size)decode_multiline(p5_control_decoded,p5_data_decoded,decoder);
+            else if(best_token_span==p6_frame.size()+4)decode_forest(frames.decompress(p6_frame),decoder);
+            else if(best_token_span==w7s)decode_source_variants(p7s_decoded,decoder);
+            else if(p7p_frames.valid&&best_token_span==p7p_size)decode_source_pack(p7p_frames,frames,decoder);
+            else decode_literals(frames.decompress(p1_frame),decoder);
+        };
+        const auto d12=Clock::now();decode_param_span_choice(p12.decoder);
         p12.decode_seconds+=elapsed(d12);verify_definitions(new_ids,truth,p12.decoder);const uint64_t w12=best_param_span+1;
+
+        uint64_t w13=0;if(use_pretrained){const size_t best_pretrained_superblock=std::min({best_param_span,size_t(w8c),size_t(w8d),size_t(p9_pretrained_source_size)});const auto d13=Clock::now();
+            size_t choice=0;if(best_pretrained_superblock==p9_pretrained_source_size){choice=3;decode_p9_source(p9sm_source_frames,&pretrained_source_decoder_frames,p13.decoder,&frozen_pretrained.decoder);}
+            else if(best_pretrained_superblock==w8c){choice=1;decode_p8c(p13.decoder);}
+            else if(best_pretrained_superblock==w8d){choice=2;decode_templates(p8d_control_decoded,p8d_data_decoded,p13.decoder);}
+            else decode_param_span_choice(p13.decoder);
+            ++p13_choice_tus[choice];p13_choice_wire[choice]+=best_pretrained_superblock;
+            p13.decode_seconds+=elapsed(d13);verify_definitions(new_ids,truth,p13.decoder);w13=best_pretrained_superblock+1;}
 
         const uint64_t w0 = p0_frame.size() + 4;
         const uint64_t w4 = p4_size;
         const uint64_t w9=p9_frames.wire;
         const uint64_t w10 = std::min({w1,w4,w5,w6,w7s,p7p_size,w9,p9_source_size}) + 1;
-        std::vector<uint64_t>current{w0,w1,w4,w5,w6,w7s,w7p,w7t,w7,w7b,w9,w9s,w9sg};if(use_source_dictionary)current.push_back(w9sd);current.push_back(w9t);if(use_source_dictionary)current.push_back(w9td);current.push_back(w9g);if(use_pretrained){current.push_back(w8);current.push_back(w8d);}current.push_back(w10);if(use_source_dictionary)current.push_back(w10sd);if(use_pretrained)current.push_back(w10p);current.push_back(w11);if(use_source_dictionary)current.push_back(w11d);current.push_back(w12);
+        std::vector<uint64_t>current{w0,w1,w4,w5,w6,w7s,w7p,w7t,w7,w7b,w9,w9s,w9sg};if(use_pretrained)current.push_back(w9sm);if(use_source_dictionary)current.push_back(w9sd);current.push_back(w9t);if(use_source_dictionary)current.push_back(w9td);current.push_back(w9g);if(use_pretrained){current.push_back(w8);current.push_back(w8c);current.push_back(w8d);}current.push_back(w10);if(use_source_dictionary)current.push_back(w10sd);if(use_pretrained)current.push_back(w10p);current.push_back(w11);if(use_source_dictionary)current.push_back(w11d);current.push_back(w12);if(use_pretrained)current.push_back(w13);
         for (size_t r = 0; r < rows.size(); ++r) {rows[r]->wire += current[r];rows[r]->tu_wire.push_back(current[r]);}
         p10.encode_seconds = p1.encode_seconds + p4.encode_seconds+p5.encode_seconds+p6.encode_seconds+p7s.encode_seconds+p7p.encode_seconds+p9.encode_seconds+p9s.encode_seconds;
         p11.encode_seconds=p10.encode_seconds+p7t.encode_seconds+p9t.encode_seconds;
         if(use_source_dictionary)p11d.encode_seconds=p10sd.encode_seconds+p7t.encode_seconds+p9td.encode_seconds;
         p12.encode_seconds=p11.encode_seconds+p9g.encode_seconds+p9sg.encode_seconds;
-        if(use_pretrained)p10p.encode_seconds=p1.encode_seconds+p8d.encode_seconds+p5.encode_seconds+p6.encode_seconds+p7s.encode_seconds+p7p.encode_seconds+p9.encode_seconds+p9s.encode_seconds;
+        if(use_pretrained){p10p.encode_seconds=p1.encode_seconds+p8d.encode_seconds+p5.encode_seconds+p6.encode_seconds+p7s.encode_seconds+p7p.encode_seconds+p9.encode_seconds+p9s.encode_seconds;p13.encode_seconds=p12.encode_seconds+p8c.encode_seconds+p8d.encode_seconds+p9sm.encode_seconds;}
         source_learner.observe_tu(observations,new_ids,truth);
         cumulative_raw += file.len;
         while (checkpoint < std::size(fractions) &&
@@ -2519,6 +2565,7 @@ int main(int argc, char** argv) {
     // P9s reuses all of P9 and adds an actual-cost source basis over only P9's raw fallback channel.
     p9s.encode_seconds+=p9.encode_seconds;
     p9sg.encode_seconds+=p9.encode_seconds;
+    if(use_pretrained)p9sm.encode_seconds+=p9.encode_seconds;
     p9t.encode_seconds+=p9.encode_seconds;
     p10.encode_seconds=p1.encode_seconds+p4.encode_seconds+p5.encode_seconds+p6.encode_seconds+p7s.encode_seconds+p7p.encode_seconds+p9s.encode_seconds;
     p11.encode_seconds=p10.encode_seconds+p7t.encode_seconds+p9t.encode_seconds;
@@ -2527,7 +2574,7 @@ int main(int argc, char** argv) {
 
     // P8d reuses the P4 transform output in this all-row harness.  Charge the transform work as
     // well as its additional dictionary/plain actual-frame comparison before reporting throughput.
-    if(use_pretrained){p8d.encode_seconds+=p4.encode_seconds;p10p.encode_seconds=p1.encode_seconds+p8d.encode_seconds+p5.encode_seconds+p6.encode_seconds+p7s.encode_seconds+p7p.encode_seconds+p9s.encode_seconds;}
+    if(use_pretrained){p8d.encode_seconds+=p4.encode_seconds;p10p.encode_seconds=p1.encode_seconds+p8d.encode_seconds+p5.encode_seconds+p6.encode_seconds+p7s.encode_seconds+p7p.encode_seconds+p9s.encode_seconds;p13.encode_seconds=p12.encode_seconds+p8c.encode_seconds+p8d.encode_seconds+p9sm.encode_seconds;}
 
     std::array<uint64_t,kSourceCategoryCount>attributed_zstd{};
     for(size_t category=0;category<kSourceCategoryCount;++category)attributed_zstd[category]=frames.compress(attributed_bytes[category],zlevel).size();
@@ -2630,6 +2677,10 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long long>(grammar_source_pack_stats.candidate_tus),static_cast<unsigned long long>(grammar_source_pack_stats.frame_wins),static_cast<unsigned long long>(grammar_source_pack_stats.selected.source_records),static_cast<unsigned long long>(grammar_source_pack_stats.selected.literal_records),static_cast<unsigned long long>(grammar_source_pack_stats.selected.basis_records),grammar_source_pack_stats.selected.basis_bytes/1048576.0,
                 grammar_source_pack_stats.literal_wire/1048576.0,grammar_source_pack_stats.source_wire/1048576.0,grammar_source_pack_stats.selected_wire/1048576.0,grammar_source_pack_stats.frame_wire[0]/1048576.0,grammar_source_pack_stats.frame_wire[1]/1048576.0,grammar_source_pack_stats.frame_wire[2]/1048576.0,grammar_source_pack_stats.frame_wire[3]/1048576.0,static_cast<unsigned long long>(grammar_source_pack_stats.combined_wins),grammar_source_pack_stats.combined_wire/1048576.0,
                 static_cast<unsigned long long>(grammar_source_pack_stats.threshold_wins[0]),static_cast<unsigned long long>(grammar_source_pack_stats.threshold_wins[1]),static_cast<unsigned long long>(grammar_source_pack_stats.threshold_wins[2]),static_cast<unsigned long long>(grammar_source_pack_stats.threshold_wins[3]),static_cast<unsigned long long>(grammar_source_pack_stats.threshold_wins[4]),static_cast<unsigned long long>(grammar_source_pack_stats.threshold_wins[5]));
+    if(use_pretrained){std::printf("P9sm pretrained source-basis superblocks candidate-TUs=%llu frame-wins=%llu selected source/literal=%llu/%llu source-lines=%llu/%.2f MiB raw wire literal/model/selected=%.3f/%.3f/%.3f MiB split basis-control/basis-data/definition-control/residual=%.3f/%.3f/%.3f/%.3f MiB combined-wins/wire=%llu/%.3f MiB model-dictionary wins=%llu saved-before-charge=%.1f KiB\n",
+                static_cast<unsigned long long>(pretrained_source_pack_stats.candidate_tus),static_cast<unsigned long long>(pretrained_source_pack_stats.frame_wins),static_cast<unsigned long long>(pretrained_source_pack_stats.selected.source_records),static_cast<unsigned long long>(pretrained_source_pack_stats.selected.literal_records),static_cast<unsigned long long>(pretrained_source_pack_stats.selected.basis_records),pretrained_source_pack_stats.selected.basis_bytes/1048576.0,
+                pretrained_source_pack_stats.literal_wire/1048576.0,pretrained_source_pack_stats.source_wire/1048576.0,pretrained_source_pack_stats.selected_wire/1048576.0,pretrained_source_pack_stats.frame_wire[0]/1048576.0,pretrained_source_pack_stats.frame_wire[1]/1048576.0,pretrained_source_pack_stats.frame_wire[2]/1048576.0,pretrained_source_pack_stats.frame_wire[3]/1048576.0,static_cast<unsigned long long>(pretrained_source_pack_stats.combined_wins),pretrained_source_pack_stats.combined_wire/1048576.0,static_cast<unsigned long long>(pretrained_source_encoder_frames.dictionary_wins),pretrained_source_encoder_frames.dictionary_saved/1024.0);
+        for(size_t i=0;i<kSourcePackThresholds.size();++i)std::printf("  P9sm threshold=%u%% candidate-TUs=%llu wire=%.3f MiB basis-raw=%.2f MiB residual-raw=%.2f MiB\n",kSourcePackThresholds[i],static_cast<unsigned long long>(pretrained_source_pack_stats.threshold_tus[i]),pretrained_source_pack_stats.threshold_wire[i]/1048576.0,pretrained_source_pack_stats.threshold_basis_bytes[i]/1048576.0,pretrained_source_pack_stats.threshold_residual_bytes[i]/1048576.0);}
     auto print_token_span_stats=[&](const char*name,const TokenSpanStats&stats){
         std::printf("%s contributing-token-span candidate-TUs=%llu frame-wins=%llu available=%llu/%.2f MiB selected span/literal=%llu/%llu basis=%llu/%.2f MiB copy=%.2f MiB residual=%.2f MiB ops=%llu target=%.2f MiB\n",name,
                     static_cast<unsigned long long>(stats.candidate_tus),static_cast<unsigned long long>(stats.frame_wins),static_cast<unsigned long long>(stats.selected.available_records),stats.selected.available_bytes/1048576.0,
@@ -2674,8 +2725,14 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long long>(pretrained.candidate_rules),static_cast<unsigned long long>(pretrained.candidate_tokens),pretrained.rule_count(),pretrained.token_count(),pretrained.raw.size()/1024.0,zlevel,pretrained.frame.size()/1024.0);
         std::printf("P8 online additions: rules=%llu refs=%llu tokens=%llu token-refs=%llu inline=%llu raw=%llu; pretrained superblocks=%llu lines=%llu token-refs=%llu; model-dictionary wins=%llu saved=%.1f KiB\n",
                 static_cast<unsigned long long>(pretrained_stats.new_rules),static_cast<unsigned long long>(pretrained_stats.rule_refs),static_cast<unsigned long long>(pretrained_stats.new_tokens),static_cast<unsigned long long>(pretrained_stats.token_refs),static_cast<unsigned long long>(pretrained_stats.inline_values),static_cast<unsigned long long>(pretrained_stats.raw_records),
-                static_cast<unsigned long long>(pretrained_stats.pretrained_superblocks),static_cast<unsigned long long>(pretrained_stats.pretrained_rule_refs),static_cast<unsigned long long>(pretrained_stats.pretrained_token_refs),static_cast<unsigned long long>(model_frames.dictionary_wins),model_frames.dictionary_saved/1024.0);
-        std::printf("P8 model-as-dictionary over P4: wins=%llu saved-before-model-charge=%.1f KiB\n",static_cast<unsigned long long>(model_p4_frames.dictionary_wins),model_p4_frames.dictionary_saved/1024.0);}
+                static_cast<unsigned long long>(pretrained_stats.pretrained_superblocks),static_cast<unsigned long long>(pretrained_stats.pretrained_rule_refs),static_cast<unsigned long long>(pretrained_stats.pretrained_token_refs),static_cast<unsigned long long>(model_encoder_frames.dictionary_wins),model_encoder_frames.dictionary_saved/1024.0);
+        std::printf("P8c frozen+TU-local additions: rules=%llu refs=%llu tokens=%llu token-refs=%llu inline=%llu raw=%llu; pretrained superblocks=%llu lines=%llu token-refs=%llu; model-dictionary wins=%llu saved=%.1f KiB\n",
+                static_cast<unsigned long long>(pretrained_local_stats.new_rules),static_cast<unsigned long long>(pretrained_local_stats.rule_refs),static_cast<unsigned long long>(pretrained_local_stats.new_tokens),static_cast<unsigned long long>(pretrained_local_stats.token_refs),static_cast<unsigned long long>(pretrained_local_stats.inline_values),static_cast<unsigned long long>(pretrained_local_stats.raw_records),
+                static_cast<unsigned long long>(pretrained_local_stats.pretrained_superblocks),static_cast<unsigned long long>(pretrained_local_stats.pretrained_rule_refs),static_cast<unsigned long long>(pretrained_local_stats.pretrained_token_refs),static_cast<unsigned long long>(model_local_superblock_encoder_frames.dictionary_wins),model_local_superblock_encoder_frames.dictionary_saved/1024.0);
+        std::printf("P8 model-as-dictionary over P4: wins=%llu saved-before-model-charge=%.1f KiB\n",static_cast<unsigned long long>(model_p4_encoder_frames.dictionary_wins),model_p4_encoder_frames.dictionary_saved/1024.0);
+        std::printf("P13 actual selector TUs/wire: untrained=%llu/%.3f MiB frozen-local=%llu/%.3f MiB model-P4=%llu/%.3f MiB model-source=%llu/%.3f MiB\n",
+                static_cast<unsigned long long>(p13_choice_tus[0]),p13_choice_wire[0]/1048576.0,static_cast<unsigned long long>(p13_choice_tus[1]),p13_choice_wire[1]/1048576.0,
+                static_cast<unsigned long long>(p13_choice_tus[2]),p13_choice_wire[2]/1048576.0,static_cast<unsigned long long>(p13_choice_tus[3]),p13_choice_wire[3]/1048576.0);}
     std::printf("split wire: P4 control=%.3f data=%.3f MiB; P7 control=%.3f data=%.3f MiB\n",p4_control_wire/1048576.0,p4_data_wire/1048576.0,p7_control_wire/1048576.0,p7_data_wire/1048576.0);
     struct rusage usage {};
     getrusage(RUSAGE_SELF, &usage);
