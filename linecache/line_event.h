@@ -93,4 +93,27 @@ struct EventSource {
 // installed the closure in the sticky-F conversation. Root identity is the semantic RegionKey
 // sequence, so later Block/Slice learning can never change a published Root's meaning.
 
+// ---------------------------------------------------------------------------------------------
+// SOURCE ORACLE — the original source/header files as SIDE INFORMATION (both C and F have it: the
+// icecream environment ships the toolchain + system headers, and the submitting client has the
+// project tree). A preprocessed Region is mostly VERBATIM source lines, so a Region can be
+// materialized as a compact COPY-PROGRAM against its originating source file — reference
+// source_lines(path_id, first, count) instead of shipping the novel line text — turning the
+// "line-dictionary entropy wall" into near-zero structure. path_id / logical_line on each LineEvent
+// give the coordinate; this oracle returns the bytes at that coordinate. BOTH sides must return
+// byte-identical results for the same (path_id, first, count) — the codec still verifies each
+// materialized Region against the interner's exact bytes and falls back to shipping text on any
+// mismatch (a header the worker's copy differs from), so correctness never depends on the oracle.
+struct SourceOracle {
+    virtual ~SourceOracle() = default;
+    // Raw bytes of source lines [first, first+count) of file path_id (1-based logical line `first`,
+    // each line INCLUDING its terminator). Sets out_len; returns the pointer, or nullptr if the file
+    // or range is unavailable (then the codec ships the line text — no correctness dependence).
+    virtual const uint8_t* source_lines(uint32_t path_id, uint32_t first, uint32_t count, uint32_t& out_len) const = 0;
+    // Whole-file bytes of path_id (for building a longest-match COPY index over the source). nullptr if absent.
+    virtual const uint8_t* source_file(uint32_t path_id, uint32_t& out_len) const = 0;
+    // Map an interned #line path string to a stable path_id (the same id carried on LineEvent.path_id).
+    virtual uint32_t path_id_of(const char* path, uint32_t len) const = 0;
+};
+
 } // namespace iceline
