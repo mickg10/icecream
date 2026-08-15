@@ -1463,17 +1463,19 @@ struct SourcePackPlanStats {
 struct SourcePackRaw {
     std::vector<uint8_t>basis_control,basis_data,definition_control,definition_data;
     SourcePackPlanStats stats;
-    bool implicit_order=false;
+    bool implicit_order=false,basis_templates=false;
     bool valid=false;
 };
 
 struct SourcePackFrames {
     std::vector<uint8_t>basis_control,basis_data,definition_control,definition_data;
+    std::vector<uint8_t>combined_frame;
     std::array<bool,4>dictionary{};
+    bool combined=false,combined_dictionary=false;
     SourcePackPlanStats stats;
     uint64_t wire=UINT64_MAX;
     unsigned residual_percent=0;
-    bool implicit_order=false;
+    bool implicit_order=false,basis_templates=false;
     bool valid=false;
 };
 
@@ -1483,6 +1485,7 @@ struct SourcePackStats {
     std::array<uint64_t,6>threshold_tus{},threshold_wire{},threshold_basis_bytes{},threshold_residual_bytes{};
     uint64_t candidate_tus=0,frame_wins=0,literal_wire=0,source_wire=0,selected_wire=0;
     std::array<uint64_t,4>frame_wire{};
+    uint64_t combined_wins=0,combined_wire=0;
 };
 
 static constexpr std::array<unsigned,6>kSourcePackThresholds={0,6,12,25,50,100};
@@ -1601,18 +1604,34 @@ static SourcePackRaw encode_source_pack(const std::vector<uint32_t>&ids,const Li
     return raw;
 }
 
+static SourcePackRaw template_source_pack_basis(const SourcePackRaw&input,bool parameterize_keywords){
+    if(!input.valid||input.basis_templates)return {};
+    const uint8_t*p=input.basis_control.data(),*end=p+input.basis_control.size(),*data=input.basis_data.data(),*data_end=data+input.basis_data.size();const uint64_t count=get_varint(p,end);if(count>UINT32_MAX)die_msg("source template basis count too large");LineStore store;std::vector<uint32_t>ids;ids.reserve(size_t(count));
+    for(uint64_t i=0;i<count;++i){const uint64_t len=get_varint(p,end);if(len>UINT32_MAX||len>uint64_t(data_end-data))die_msg("source template basis exceeds frame");const LineStore::Result result=store.intern(data,uint32_t(len));if(!result.first||result.id!=i+1)die_msg("source template basis is not unique/dense");ids.push_back(result.id);data+=len;}
+    if(p!=end||data!=data_end)die_msg("trailing source template basis bytes");
+    TemplateStats stats;const SplitBuffer encoded=encode_templates(ids,store,stats,parameterize_keywords);SourcePackRaw output=input;output.basis_control.clear();put_varint(output.basis_control,count);output.basis_control.insert(output.basis_control.end(),encoded.control.begin(),encoded.control.end());output.basis_data=encoded.data;output.basis_templates=true;return output;
+}
+
+static std::vector<std::vector<uint8_t>>decode_source_pack_bases(const SourcePackFrames&frames,
+                                                                 const std::vector<uint8_t>&basis_control,
+                                                                 const std::vector<uint8_t>&basis_data){
+    if(!frames.basis_templates){const uint8_t*p=basis_control.data(),*end=p+basis_control.size(),*data=basis_data.data(),*data_end=data+basis_data.size();const uint64_t count=get_varint(p,end);std::vector<std::vector<uint8_t>>bases;bases.reserve(size_t(count));for(uint64_t i=0;i<count;++i){const uint64_t len=get_varint(p,end);if(len>uint64_t(data_end-data))die_msg("source-pack basis exceeds frame");bases.emplace_back(data,data+len);data+=len;}if(p!=end||data!=data_end)die_msg("trailing source-pack basis bytes");return bases;}
+    const uint8_t*p=basis_control.data(),*end=p+basis_control.size();const uint64_t count=get_varint(p,end);std::vector<uint8_t>control(p,end);DecoderStore decoded;decode_templates(control,basis_data,decoded);if(decoded.lines.size()!=count+1)die_msg("source template basis cardinality mismatch");std::vector<std::vector<uint8_t>>bases;bases.reserve(size_t(count));for(uint64_t i=1;i<=count;++i)bases.push_back(std::move(decoded.lines[size_t(i)]));return bases;
+}
+
 static SourcePackFrames compress_source_pack(const SourcePackRaw&raw,FrameCodec&codec,int level,unsigned residual_percent,
                                              ModelFrameCodec*model=nullptr){
     SourcePackFrames frames;if(!raw.valid)return frames;
-    frames.valid=true;frames.residual_percent=residual_percent;frames.stats=raw.stats;frames.implicit_order=raw.implicit_order;
+    frames.valid=true;frames.residual_percent=residual_percent;frames.stats=raw.stats;frames.implicit_order=raw.implicit_order;frames.basis_templates=raw.basis_templates;
     auto compress=[&](const std::vector<uint8_t>&input,std::vector<uint8_t>&output,size_t index){
         if(model){PackedFrame packed=model->compress_best(input,level);output=std::move(packed.bytes);frames.dictionary[index]=packed.dictionary;}
         else output=codec.compress(input,level);
     };
-    compress(raw.basis_control,frames.basis_control,0);compress(raw.basis_data,frames.basis_data,1);
-    compress(raw.definition_control,frames.definition_control,2);compress(raw.definition_data,frames.definition_data,3);
-    frames.wire=frames.basis_control.size()+frames.basis_data.size()+frames.definition_control.size()+frames.definition_data.size()+16;
-    if(model)frames.wire+=4; // one explicit plain/dictionary selector per frame
+    compress(raw.basis_control,frames.basis_control,0);compress(raw.basis_data,frames.basis_data,1);compress(raw.definition_control,frames.definition_control,2);compress(raw.definition_data,frames.definition_data,3);
+    const uint64_t split_wire=frames.basis_control.size()+frames.basis_data.size()+frames.definition_control.size()+frames.definition_data.size()+16+(model?4:0);
+    std::vector<uint8_t>combined_raw;put_varint(combined_raw,raw.basis_control.size());put_varint(combined_raw,raw.basis_data.size());put_varint(combined_raw,raw.definition_control.size());put_varint(combined_raw,raw.definition_data.size());combined_raw.insert(combined_raw.end(),raw.basis_control.begin(),raw.basis_control.end());combined_raw.insert(combined_raw.end(),raw.basis_data.begin(),raw.basis_data.end());combined_raw.insert(combined_raw.end(),raw.definition_control.begin(),raw.definition_control.end());combined_raw.insert(combined_raw.end(),raw.definition_data.begin(),raw.definition_data.end());
+    uint64_t combined_wire=0;if(model){PackedFrame packed=model->compress_best(combined_raw,level);frames.combined_frame=std::move(packed.bytes);frames.combined_dictionary=packed.dictionary;combined_wire=frames.combined_frame.size()+5;}else {frames.combined_frame=codec.compress(combined_raw,level);combined_wire=frames.combined_frame.size()+4;}
+    frames.combined=combined_wire<split_wire;frames.wire=std::min(split_wire,combined_wire)+1;
     return frames;
 }
 
@@ -1622,16 +1641,24 @@ static std::vector<uint8_t>decompress_source_pack_frame(const std::vector<uint8_
     return codec.decompress(frame);
 }
 
+static std::array<std::vector<uint8_t>,4>decompress_source_pack_frames(const SourcePackFrames&frames,FrameCodec&codec,ModelFrameCodec*model){
+    std::array<std::vector<uint8_t>,4>raw;if(!frames.combined){raw[0]=decompress_source_pack_frame(frames.basis_control,frames.dictionary[0],codec,model);raw[1]=decompress_source_pack_frame(frames.basis_data,frames.dictionary[1],codec,model);raw[2]=decompress_source_pack_frame(frames.definition_control,frames.dictionary[2],codec,model);raw[3]=decompress_source_pack_frame(frames.definition_data,frames.dictionary[3],codec,model);return raw;}
+    std::vector<uint8_t>packed;if(frames.combined_dictionary){if(!model)die_msg("source-pack combined dictionary unavailable");PackedFrame frame;frame.bytes=frames.combined_frame;frame.dictionary=true;packed=model->decompress(frame);}else packed=codec.decompress(frames.combined_frame);const uint8_t*p=packed.data(),*end=p+packed.size();std::array<uint64_t,4>lengths{};uint64_t total=0;for(uint64_t&len:lengths){len=get_varint(p,end);if(len>SIZE_MAX-total)die_msg("source-pack combined lengths overflow");total+=len;}if(total!=uint64_t(end-p))die_msg("source-pack combined length mismatch");for(size_t i=0;i<raw.size();++i){raw[i].assign(p,p+lengths[i]);p+=lengths[i];}return raw;
+}
+
+static void account_source_pack_layout(SourcePackStats&stats,const SourcePackFrames&frames){
+    if(frames.combined){++stats.combined_wins;stats.combined_wire+=frames.combined_frame.size()+4+(frames.combined_dictionary?1:0);return;}
+    stats.frame_wire[0]+=frames.basis_control.size()+4+(frames.dictionary[0]?1:0);
+    stats.frame_wire[1]+=frames.basis_data.size()+4+(frames.dictionary[1]?1:0);
+    stats.frame_wire[2]+=frames.definition_control.size()+4+(frames.dictionary[2]?1:0);
+    stats.frame_wire[3]+=frames.definition_data.size()+4+(frames.dictionary[3]?1:0);
+}
+
 static void decode_source_pack(const SourcePackFrames&frames,FrameCodec&codec,DecoderStore&store,ModelFrameCodec*model=nullptr){
     if(!frames.valid)die_msg("missing source-pack frame");
     if(frames.implicit_order)die_msg("implicit source-pack requires semantic lengths");
-    const std::vector<uint8_t>basis_control=decompress_source_pack_frame(frames.basis_control,frames.dictionary[0],codec,model),basis_data=decompress_source_pack_frame(frames.basis_data,frames.dictionary[1],codec,model);
-    const std::vector<uint8_t>definition_control=decompress_source_pack_frame(frames.definition_control,frames.dictionary[2],codec,model),definition_data=decompress_source_pack_frame(frames.definition_data,frames.dictionary[3],codec,model);
-    const uint8_t*p=basis_control.data(),*end=p+basis_control.size(),*data=basis_data.data(),*data_end=data+basis_data.size();
-    const uint64_t base_count=get_varint(p,end);std::vector<std::vector<uint8_t>>bases;bases.reserve(size_t(base_count));
-    for(uint64_t i=0;i<base_count;++i){const uint64_t len=get_varint(p,end);if(len>uint64_t(data_end-data))die_msg("source-pack basis exceeds frame");bases.emplace_back(data,data+len);data+=len;}
-    if(p!=end||data!=data_end)die_msg("trailing source-pack basis bytes");
-    p=definition_control.data();end=p+definition_control.size();data=definition_data.data();data_end=data+definition_data.size();
+    const std::array<std::vector<uint8_t>,4>raw=decompress_source_pack_frames(frames,codec,model);const std::vector<uint8_t>&basis_control=raw[0],&basis_data=raw[1],&definition_control=raw[2],&definition_data=raw[3];
+    std::vector<std::vector<uint8_t>>bases=decode_source_pack_bases(frames,basis_control,basis_data);const uint8_t*p=definition_control.data(),*end=p+definition_control.size(),*data=definition_data.data(),*data_end=data+definition_data.size();
     const uint64_t record_count=get_varint(p,end);
     for(uint64_t i=0;i<record_count;++i){
         if(p==end)die_msg("missing source-pack mode");
@@ -1673,15 +1700,10 @@ static std::vector<uint64_t>semantic_raw_lengths(const std::vector<uint8_t>&cont
 static std::vector<uint8_t>decode_implicit_source_pack(const SourcePackFrames&frames,FrameCodec&codec,
                                                        const std::vector<uint64_t>&lengths,ModelFrameCodec*model=nullptr){
     if(!frames.valid||!frames.implicit_order)die_msg("missing implicit source-pack frame");
-    const std::vector<uint8_t>basis_control=decompress_source_pack_frame(frames.basis_control,frames.dictionary[0],codec,model),basis_data=decompress_source_pack_frame(frames.basis_data,frames.dictionary[1],codec,model);
-    const std::vector<uint8_t>definition_control=decompress_source_pack_frame(frames.definition_control,frames.dictionary[2],codec,model),definition_data=decompress_source_pack_frame(frames.definition_data,frames.dictionary[3],codec,model);
-    const uint8_t*p=basis_control.data(),*end=p+basis_control.size(),*data=basis_data.data(),*data_end=data+basis_data.size();
-    const uint64_t base_count=get_varint(p,end);std::vector<std::vector<uint8_t>>bases;bases.reserve(size_t(base_count));
-    for(uint64_t i=0;i<base_count;++i){const uint64_t len=get_varint(p,end);if(len>uint64_t(data_end-data))die_msg("implicit source basis exceeds frame");bases.emplace_back(data,data+len);data+=len;}
-    if(p!=end||data!=data_end)die_msg("trailing implicit source basis bytes");
-    p=definition_control.data();end=p+definition_control.size();const uint64_t count=get_varint(p,end);if(count!=lengths.size())die_msg("implicit source record count mismatch");
+    const std::array<std::vector<uint8_t>,4>raw=decompress_source_pack_frames(frames,codec,model);const std::vector<uint8_t>&basis_control=raw[0],&basis_data=raw[1],&definition_control=raw[2],&definition_data=raw[3];
+    std::vector<std::vector<uint8_t>>bases=decode_source_pack_bases(frames,basis_control,basis_data);const uint8_t*p=definition_control.data(),*end=p+definition_control.size();const uint64_t count=get_varint(p,end);if(count!=lengths.size())die_msg("implicit source record count mismatch");
     const size_t bitmap_bytes=(lengths.size()+7)/8;if(bitmap_bytes>size_t(end-p))die_msg("implicit source bitmap exceeds control");const uint8_t*bitmap=p;p+=bitmap_bytes;
-    data=definition_data.data();data_end=data+definition_data.size();std::vector<uint8_t>payload;
+    const uint8_t*data=definition_data.data();const uint8_t*data_end=data+definition_data.size();std::vector<uint8_t>payload;
     uint64_t total=0;for(uint64_t len:lengths){if(len>SIZE_MAX-total)die_msg("implicit source payload too large");total+=len;}payload.reserve(size_t(total));
     for(size_t i=0;i<lengths.size();++i){const uint64_t output_len=lengths[i];const bool source=(bitmap[i/8]>>(i%8))&1u;
         if(!source){if(output_len>uint64_t(data_end-data))die_msg("implicit source literal exceeds frame");payload.insert(payload.end(),data,data+output_len);data+=output_len;continue;}
@@ -1692,6 +1714,350 @@ static std::vector<uint8_t>decode_implicit_source_pack(const SourcePackFrames&fr
         payload.insert(payload.end(),base.begin(),base.begin()+prefix);payload.insert(payload.end(),data,data+middle);data+=middle;payload.insert(payload.end(),base.end()-suffix,base.end());
     }
     if(p!=end||data!=data_end)die_msg("trailing implicit source definition bytes");
+    return payload;
+}
+
+// P11: keep only token-aligned source spans that are actually copied into P9's raw-definition
+// channel.  Unlike P7p, F never receives a whole source line.  Each TU carries a compact immutable
+// span basis, and each selected definition is a sequence of dense span references and exact ADD
+// bytes.  The source file is used only by C to discover the program; the decoder consumes these
+// four frames and the output lengths already present in P9 semantic control.
+struct TokenSpanPlan {
+    uint32_t id=0;
+    SourceLocation location;
+    std::string base;
+    DeltaProgram delta;
+    uint32_t copy_bytes=0,residual_bytes=0;
+    bool available=false;
+};
+
+struct TokenSpanOp {
+    bool copy=false;
+    uint32_t target_off=0,len=0,basis_old_id=0;
+};
+
+struct TokenSpanRecord {
+    uint32_t id=0;
+    uint32_t path_id=0,logical_line=0;
+    std::vector<TokenSpanOp>ops;
+    bool source=false;
+};
+
+struct TokenSpanBasis {
+    std::string bytes;
+    uint32_t path_id=0,logical_line=0,source_off=0,old_id=0;
+};
+
+struct TokenSpanPlanStats {
+    uint64_t available_records=0,available_bytes=0,source_records=0,literal_records=0;
+    uint64_t basis_records=0,basis_bytes=0,copy_bytes=0,residual_bytes=0,target_bytes=0,program_ops=0;
+};
+
+struct TokenSpanRaw {
+    std::vector<uint8_t>basis_control,basis_data,definition_control,definition_data;
+    TokenSpanPlanStats stats;
+    bool explicit_ids=false,param_columnar=false,valid=false;
+};
+
+struct TokenSpanFrames {
+    std::vector<uint8_t>basis_control,basis_data,definition_control,definition_data;
+    std::vector<uint8_t>combined_frame;
+    std::array<bool,4>dictionary{};
+    bool combined=false,combined_dictionary=false;
+    TokenSpanPlanStats stats;
+    uint64_t wire=UINT64_MAX;
+    unsigned residual_percent=0,max_atoms=0,min_span_bytes=0;
+    bool lexical_basis=false,explicit_ids=false,param_columnar=false,valid=false;
+};
+
+struct TokenSpanStats {
+    TokenSpanPlanStats selected;
+    uint64_t candidate_tus=0,frame_wins=0,literal_wire=0,span_wire=0,selected_wire=0;
+    std::array<uint64_t,4>frame_wire{};
+    uint64_t combined_wins=0,combined_wire=0;
+    std::array<uint64_t,6>threshold_wins{};
+    std::array<uint64_t,5>atom_wins{};
+    std::array<uint64_t,2>order_wins{};
+};
+
+static constexpr std::array<unsigned,5>kTokenSpanAtoms={0,2,4,8,16};
+static constexpr std::array<unsigned,5>kTokenSpanMinBytes={4,4,6,8,12};
+static constexpr size_t kTokenSpanSweepSize=kTokenSpanAtoms.size()*kSourcePackThresholds.size()*2;
+
+struct TokenSpanSweepStats {
+    std::array<uint64_t,kTokenSpanSweepSize>wire{},wins{},candidate_tus{},basis_bytes{},copy_bytes{},residual_bytes{},source_records{};
+};
+
+static size_t token_span_sweep_index(size_t atom_index,size_t threshold_index,unsigned order){
+    return (atom_index*kSourcePackThresholds.size()+threshold_index)*2+order;
+}
+
+static std::vector<TokenSpanPlan>build_token_span_plans(const std::vector<uint32_t>&ids,const LineStore&store,
+                                                        const std::vector<LineSourceMeta>&meta,
+                                                        const std::unordered_map<uint32_t,std::vector<SourceLocation>>&locations,
+                                                        SourceCatalog&catalog){
+    std::vector<TokenSpanPlan>plans;plans.reserve(ids.size());
+    for(uint32_t id:ids){
+        TokenSpanPlan best;best.id=id;const uint32_t target_len=store.len(id);
+        if(meta[id].marker||meta[id].category!=kProjectCategory){plans.push_back(std::move(best));continue;}
+        auto found=locations.find(id);std::vector<SourceLocation>candidates;
+        if(found!=locations.end())candidates=found->second;
+        if(candidates.empty()&&meta[id].location.valid())candidates.push_back(meta[id].location);
+        for(const SourceLocation&location:candidates){
+            const uint8_t*base=nullptr;uint32_t base_len=0;if(!catalog.line(location.path_id,location.logical_line,base,base_len))continue;
+            DeltaProgram delta=token_delta(0,base,base_len,store.data(id),target_len);if(delta.encoded_size==SIZE_MAX)continue;
+            uint32_t copy=0;for(const DeltaOp&op:delta.ops)if(op.copy)copy+=op.len;
+            if(!copy)continue;
+            const uint32_t residual=target_len-copy;
+            if(!best.available||copy>best.copy_bytes||(copy==best.copy_bytes&&delta.ops.size()<best.delta.ops.size())||
+               (copy==best.copy_bytes&&delta.ops.size()==best.delta.ops.size()&&std::tie(location.path_id,location.logical_line)<std::tie(best.location.path_id,best.location.logical_line))){
+                best.location=location;best.base.assign(reinterpret_cast<const char*>(base),base_len);best.delta=std::move(delta);
+                best.copy_bytes=copy;best.residual_bytes=residual;best.available=true;
+            }
+        }
+        plans.push_back(std::move(best));
+    }
+    return plans;
+}
+
+static TokenSpanRaw encode_token_span_pack(const std::vector<TokenSpanPlan>&plans,const LineStore&store,
+                                           unsigned residual_percent,unsigned max_atoms,unsigned min_span_bytes,
+                                           bool lexical_basis,bool explicit_ids=false){
+    TokenSpanRaw raw;raw.explicit_ids=explicit_ids;std::vector<TokenSpanRecord>records;records.reserve(plans.size());
+    std::vector<TokenSpanBasis>bases;std::unordered_map<std::string,uint32_t>basis_ids;basis_ids.reserve(plans.size()*2+1);
+    auto intern_basis=[&](const uint8_t*p,uint32_t len,const TokenSpanPlan&plan,uint32_t source_off){
+        std::string key(reinterpret_cast<const char*>(p),len);auto inserted=basis_ids.emplace(key,uint32_t(bases.size()));
+        if(inserted.second){const uint32_t old_id=inserted.first->second;bases.push_back({std::move(key),plan.location.path_id,plan.location.logical_line,source_off,old_id});}
+        return inserted.first->second;
+    };
+    for(const TokenSpanPlan&plan:plans){
+        TokenSpanRecord record;record.id=plan.id;record.path_id=plan.location.path_id;record.logical_line=plan.location.logical_line;const uint32_t target_len=store.len(plan.id);raw.stats.target_bytes+=target_len;
+        if(plan.available){++raw.stats.available_records;raw.stats.available_bytes+=target_len;}
+        uint32_t cursor=0,copy_bytes=0;
+        auto append_add=[&](uint32_t off,uint32_t len){if(!len)return;if(!record.ops.empty()&&!record.ops.back().copy&&record.ops.back().target_off+record.ops.back().len==off)record.ops.back().len+=len;else record.ops.push_back({false,off,len,0});};
+        auto append_copy=[&](uint32_t target_off,uint32_t source_off,uint32_t len){
+            if(len<min_span_bytes){append_add(target_off,len);return;}
+            const uint32_t old_id=intern_basis(reinterpret_cast<const uint8_t*>(plan.base.data())+source_off,len,plan,source_off);
+            record.ops.push_back({true,target_off,len,old_id});copy_bytes+=len;
+        };
+        if(plan.available){
+            for(const DeltaOp&op:plan.delta.ops){
+                if(!op.copy){append_add(cursor,op.len);cursor+=op.len;continue;}
+                if(max_atoms==0){append_copy(cursor,op.off,op.len);cursor+=op.len;continue;}
+                const uint8_t*span=reinterpret_cast<const uint8_t*>(plan.base.data())+op.off;const std::vector<Atom>atoms=atomize(span,op.len);
+                for(size_t begin=0;begin<atoms.size();begin+=max_atoms){const size_t finish=std::min(atoms.size(),begin+max_atoms);
+                    const uint32_t local_begin=atoms[begin].off,local_end=atoms[finish-1].off+atoms[finish-1].len,len=local_end-local_begin;
+                    append_copy(cursor,op.off+local_begin,len);cursor+=len;
+                }
+            }
+        }
+        if(!plan.available)append_add(0,target_len);
+        if(cursor!=target_len&&plan.available)die_msg("token-span plan length mismatch");
+        const uint32_t residual=target_len-copy_bytes;
+        const bool ratio_ok=copy_bytes&&uint64_t(residual)*100<=uint64_t(target_len)*residual_percent;
+        if(ratio_ok){record.source=true;++raw.stats.source_records;raw.stats.copy_bytes+=copy_bytes;raw.stats.residual_bytes+=residual;raw.stats.program_ops+=record.ops.size();}
+        else {record.ops.clear();record.ops.push_back({false,0,target_len,0});++raw.stats.literal_records;}
+        records.push_back(std::move(record));
+    }
+    // Discard basis entries that were introduced by a record which ultimately selected literal.
+    std::unordered_set<uint32_t>used;for(const TokenSpanRecord&record:records)if(record.source)for(const TokenSpanOp&op:record.ops)if(op.copy)used.insert(op.basis_old_id);
+    if(used.empty())return raw;
+    std::vector<uint32_t>basis_order;basis_order.reserve(used.size());for(uint32_t id:used)basis_order.push_back(id);
+    std::sort(basis_order.begin(),basis_order.end(),[&](uint32_t a,uint32_t b){const TokenSpanBasis&x=bases[a],&y=bases[b];
+        if(lexical_basis){if(x.bytes!=y.bytes)return x.bytes<y.bytes;}
+        else {if(x.path_id!=y.path_id)return x.path_id<y.path_id;if(x.logical_line!=y.logical_line)return x.logical_line<y.logical_line;if(x.source_off!=y.source_off)return x.source_off<y.source_off;}
+        return x.bytes<y.bytes;
+    });
+    std::vector<uint32_t>remap(bases.size(),UINT32_MAX);put_varint(raw.basis_control,basis_order.size());
+    for(uint32_t new_id=0;new_id<basis_order.size();++new_id){const TokenSpanBasis&basis=bases[basis_order[new_id]];remap[basis.old_id]=new_id;put_varint(raw.basis_control,basis.bytes.size());raw.basis_data.insert(raw.basis_data.end(),basis.bytes.begin(),basis.bytes.end());raw.stats.basis_bytes+=basis.bytes.size();}
+    raw.stats.basis_records=basis_order.size();
+    if(explicit_ids)std::sort(records.begin(),records.end(),[&](const TokenSpanRecord&a,const TokenSpanRecord&b){if(a.source!=b.source)return a.source>b.source;if(a.source){if(a.path_id!=b.path_id)return a.path_id<b.path_id;if(a.logical_line!=b.logical_line)return a.logical_line<b.logical_line;}return line_less(a.id,b.id,store);});
+    put_varint(raw.definition_control,records.size());if(explicit_ids){int64_t previous_id=0;for(const TokenSpanRecord&record:records){put_zigzag(raw.definition_control,int64_t(record.id)-previous_id);previous_id=record.id;put_varint(raw.definition_control,store.len(record.id));}}
+    const size_t bitmap_bytes=(records.size()+7)/8,bitmap_offset=raw.definition_control.size();raw.definition_control.resize(bitmap_offset+bitmap_bytes);
+    for(size_t i=0;i<records.size();++i)if(records[i].source)raw.definition_control[bitmap_offset+i/8]|=uint8_t(1u<<(i%8));
+    for(const TokenSpanRecord&record:records){
+        if(!record.source){const uint32_t len=store.len(record.id);raw.definition_data.insert(raw.definition_data.end(),store.data(record.id),store.data(record.id)+len);continue;}
+        for(const TokenSpanOp&op:record.ops){
+            if(op.copy){if(op.basis_old_id>=remap.size()||remap[op.basis_old_id]==UINT32_MAX)die_msg("token-span basis remap missing");put_varint(raw.definition_control,(uint64_t(remap[op.basis_old_id])<<1)|1);}
+            else {put_varint(raw.definition_control,uint64_t(op.len)<<1);raw.definition_data.insert(raw.definition_data.end(),store.data(record.id)+op.target_off,store.data(record.id)+op.target_off+op.len);}
+        }
+    }
+    raw.valid=true;return raw;
+}
+
+static TokenSpanFrames compress_token_span_pack(const TokenSpanRaw&raw,FrameCodec&codec,int level,
+                                                 unsigned residual_percent,unsigned max_atoms,unsigned min_span_bytes,
+                                                 bool lexical_basis,ModelFrameCodec*model=nullptr){
+    TokenSpanFrames frames;if(!raw.valid)return frames;frames.valid=true;frames.stats=raw.stats;frames.residual_percent=residual_percent;
+    frames.max_atoms=max_atoms;frames.min_span_bytes=min_span_bytes;frames.lexical_basis=lexical_basis;frames.explicit_ids=raw.explicit_ids;frames.param_columnar=raw.param_columnar;
+    auto compress=[&](const std::vector<uint8_t>&input,std::vector<uint8_t>&output,size_t index){
+        if(model){PackedFrame packed=model->compress_best(input,level);output=std::move(packed.bytes);frames.dictionary[index]=packed.dictionary;}
+        else output=codec.compress(input,level);
+    };
+    compress(raw.basis_control,frames.basis_control,0);compress(raw.basis_data,frames.basis_data,1);compress(raw.definition_control,frames.definition_control,2);compress(raw.definition_data,frames.definition_data,3);
+    const uint64_t split_wire=frames.basis_control.size()+frames.basis_data.size()+frames.definition_control.size()+frames.definition_data.size()+16+(model?4:0);
+    std::vector<uint8_t>combined_raw;put_varint(combined_raw,raw.basis_control.size());put_varint(combined_raw,raw.basis_data.size());put_varint(combined_raw,raw.definition_control.size());put_varint(combined_raw,raw.definition_data.size());
+    combined_raw.insert(combined_raw.end(),raw.basis_control.begin(),raw.basis_control.end());combined_raw.insert(combined_raw.end(),raw.basis_data.begin(),raw.basis_data.end());combined_raw.insert(combined_raw.end(),raw.definition_control.begin(),raw.definition_control.end());combined_raw.insert(combined_raw.end(),raw.definition_data.begin(),raw.definition_data.end());
+    uint64_t combined_wire=0;if(model){PackedFrame packed=model->compress_best(combined_raw,level);frames.combined_frame=std::move(packed.bytes);frames.combined_dictionary=packed.dictionary;combined_wire=frames.combined_frame.size()+5;}
+    else {frames.combined_frame=codec.compress(combined_raw,level);combined_wire=frames.combined_frame.size()+4;}
+    frames.wire=std::min(split_wire,combined_wire)+1;frames.combined=combined_wire<split_wire;
+    return frames;
+}
+
+static std::array<std::vector<uint8_t>,4>decompress_token_span_frames(const TokenSpanFrames&frames,FrameCodec&codec,ModelFrameCodec*model){
+    std::array<std::vector<uint8_t>,4>raw;
+    if(!frames.combined){raw[0]=decompress_source_pack_frame(frames.basis_control,frames.dictionary[0],codec,model);raw[1]=decompress_source_pack_frame(frames.basis_data,frames.dictionary[1],codec,model);raw[2]=decompress_source_pack_frame(frames.definition_control,frames.dictionary[2],codec,model);raw[3]=decompress_source_pack_frame(frames.definition_data,frames.dictionary[3],codec,model);return raw;}
+    std::vector<uint8_t>packed;if(frames.combined_dictionary){if(!model)die_msg("token-span combined dictionary unavailable");PackedFrame frame;frame.bytes=frames.combined_frame;frame.dictionary=true;packed=model->decompress(frame);}else packed=codec.decompress(frames.combined_frame);
+    const uint8_t*p=packed.data(),*end=p+packed.size();std::array<uint64_t,4>lengths{};uint64_t total=0;for(uint64_t&len:lengths){len=get_varint(p,end);if(len>SIZE_MAX-total)die_msg("token-span combined lengths overflow");total+=len;}if(total!=uint64_t(end-p))die_msg("token-span combined length mismatch");
+    for(size_t i=0;i<raw.size();++i){raw[i].assign(p,p+lengths[i]);p+=lengths[i];}return raw;
+}
+
+static std::vector<uint8_t>decode_implicit_token_span_pack(const TokenSpanFrames&frames,FrameCodec&codec,
+                                                           const std::vector<uint64_t>&lengths,ModelFrameCodec*model=nullptr){
+    if(!frames.valid||frames.explicit_ids)die_msg("missing implicit token-span frame");
+    const std::array<std::vector<uint8_t>,4>raw=decompress_token_span_frames(frames,codec,model);const std::vector<uint8_t>&basis_control=raw[0],&basis_data=raw[1],&definition_control=raw[2],&definition_data=raw[3];
+    const uint8_t*p=basis_control.data(),*end=p+basis_control.size(),*data=basis_data.data(),*data_end=data+basis_data.size();const uint64_t basis_count=get_varint(p,end);std::vector<std::vector<uint8_t>>bases;bases.reserve(size_t(basis_count));
+    for(uint64_t i=0;i<basis_count;++i){const uint64_t len=get_varint(p,end);if(len>uint64_t(data_end-data))die_msg("token-span basis exceeds frame");bases.emplace_back(data,data+len);data+=len;}
+    if(p!=end||data!=data_end)die_msg("trailing token-span basis bytes");
+    p=definition_control.data();end=p+definition_control.size();const uint64_t count=get_varint(p,end);if(count!=lengths.size())die_msg("token-span record count mismatch");const size_t bitmap_bytes=(lengths.size()+7)/8;if(bitmap_bytes>size_t(end-p))die_msg("token-span bitmap exceeds control");const uint8_t*bitmap=p;p+=bitmap_bytes;
+    data=definition_data.data();data_end=data+definition_data.size();std::vector<uint8_t>payload;uint64_t total=0;for(uint64_t len:lengths){if(len>SIZE_MAX-total)die_msg("token-span payload too large");total+=len;}payload.reserve(size_t(total));
+    for(size_t i=0;i<lengths.size();++i){const uint64_t output_len=lengths[i];const bool source=(bitmap[i/8]>>(i%8))&1u;
+        if(!source){if(output_len>uint64_t(data_end-data))die_msg("token-span literal exceeds frame");payload.insert(payload.end(),data,data+output_len);data+=output_len;continue;}
+        const size_t output_begin=payload.size();while(payload.size()-output_begin<output_len){const uint64_t code=get_varint(p,end);
+            if(code&1){const uint64_t id=code>>1;if(id>=bases.size())die_msg("token-span basis missing");const std::vector<uint8_t>&basis=bases[size_t(id)];if(basis.size()>output_len-(payload.size()-output_begin))die_msg("token-span COPY exceeds output");payload.insert(payload.end(),basis.begin(),basis.end());}
+            else {const uint64_t len=code>>1;if(!len||len>output_len-(payload.size()-output_begin)||len>uint64_t(data_end-data))die_msg("token-span ADD exceeds output");payload.insert(payload.end(),data,data+len);data+=len;}
+        }
+    }
+    if(p!=end||data!=data_end)die_msg("trailing token-span definition bytes");
+    return payload;
+}
+
+static void decode_explicit_token_span_pack(const TokenSpanFrames&frames,FrameCodec&codec,DecoderStore&store,ModelFrameCodec*model=nullptr){
+    if(!frames.valid||!frames.explicit_ids)die_msg("missing explicit token-span frame");
+    const std::array<std::vector<uint8_t>,4>raw=decompress_token_span_frames(frames,codec,model);const std::vector<uint8_t>&basis_control=raw[0],&basis_data=raw[1],&definition_control=raw[2],&definition_data=raw[3];
+    const uint8_t*p=basis_control.data(),*end=p+basis_control.size(),*data=basis_data.data(),*data_end=data+basis_data.size();const uint64_t basis_count=get_varint(p,end);std::vector<std::vector<uint8_t>>bases;bases.reserve(size_t(basis_count));
+    for(uint64_t i=0;i<basis_count;++i){const uint64_t len=get_varint(p,end);if(len>uint64_t(data_end-data))die_msg("explicit token-span basis exceeds frame");bases.emplace_back(data,data+len);data+=len;}
+    if(p!=end||data!=data_end)die_msg("trailing explicit token-span basis bytes");
+    p=definition_control.data();end=p+definition_control.size();const uint64_t count=get_varint(p,end);std::vector<uint32_t>ids(static_cast<size_t>(count),0);std::vector<uint64_t>lengths(static_cast<size_t>(count),0);int64_t previous_id=0;
+    for(size_t i=0;i<size_t(count);++i){previous_id+=get_zigzag(p,end);if(previous_id<=0||previous_id>UINT32_MAX)die_msg("explicit token-span id out of range");ids[i]=uint32_t(previous_id);lengths[i]=get_varint(p,end);}
+    const size_t bitmap_bytes=(size_t(count)+7)/8;if(bitmap_bytes>size_t(end-p))die_msg("explicit token-span bitmap exceeds control");const uint8_t*bitmap=p;p+=bitmap_bytes;data=definition_data.data();data_end=data+definition_data.size();
+    for(size_t i=0;i<size_t(count);++i){const uint64_t output_len=lengths[i];const bool source=(bitmap[i/8]>>(i%8))&1u;std::vector<uint8_t>result;result.reserve(size_t(output_len));
+        if(!source){if(output_len>uint64_t(data_end-data))die_msg("explicit token-span literal exceeds frame");result.insert(result.end(),data,data+output_len);data+=output_len;store.install(ids[i],std::move(result));continue;}
+        while(result.size()<output_len){const uint64_t code=get_varint(p,end);if(code&1){const uint64_t id=code>>1;if(id>=bases.size())die_msg("explicit token-span basis missing");const std::vector<uint8_t>&basis=bases[size_t(id)];if(basis.size()>output_len-result.size())die_msg("explicit token-span COPY exceeds output");result.insert(result.end(),basis.begin(),basis.end());}
+            else {const uint64_t len=code>>1;if(!len||len>output_len-result.size()||len>uint64_t(data_end-data))die_msg("explicit token-span ADD exceeds output");result.insert(result.end(),data,data+len);data+=len;}}
+        store.install(ids[i],std::move(result));
+    }
+    if(p!=end||data!=data_end)die_msg("trailing explicit token-span definition bytes");
+}
+
+// P12: TU-local parameterized token superblocks.  Rules are alpha-normalized windows rather than
+// complete Lines, so a unique definition can still reuse several exact structural fragments.  A
+// rule carries literal segments and equality-constrained typed slots; an instance carries each
+// distinct slot spelling once.  The complete TU is known before rule selection, but no rule becomes
+// persistent until a later explicit online-learning row.
+struct ParamSpanCandidate {
+    std::string key;
+    ParsedLine shape;
+    uint64_t count=0,literal_bytes=0,instance_bytes=0;
+    int64_t benefit=0;
+};
+
+struct ParamSpanOp {
+    bool rule=false;
+    uint32_t target_off=0,len=0,rule_id=0,instance_id=0;
+    std::vector<std::vector<uint8_t>>values;
+};
+
+struct ParamSpanRecord {
+    uint32_t id=0;
+    std::vector<ParamSpanOp>ops;
+    bool program=false;
+};
+
+struct ParamSpanStats {
+    uint64_t candidate_shapes=0,selected_rules=0,used_rules=0,rule_instances=0,unique_instances=0;
+    uint64_t program_records=0,literal_records=0,covered_bytes=0,residual_bytes=0,target_bytes=0,program_ops=0;
+};
+
+static constexpr std::array<unsigned,4>kParamSpanWidths={4,8,16,32};
+
+static void observe_param_span_windows(const uint8_t*p,uint32_t n,
+                                       std::unordered_map<std::string,ParamSpanCandidate>&candidates){
+    const std::vector<Atom>atoms=atomize(p,n);if(atoms.size()>256)return;
+    for(size_t begin=0;begin<atoms.size();++begin){for(unsigned width:kParamSpanWidths){if(begin+width>atoms.size())continue;const uint32_t off=atoms[begin].off,end=atoms[begin+width-1].off+atoms[begin+width-1].len,len=end-off;
+            ParsedLine parsed=parse_line(p+off,len);if(parsed.values.empty()||parsed.values.size()>32||parsed.occurrence_slot.size()>64||parsed.key.size()>2048)continue;
+            size_t instance=1;for(const auto&value:parsed.values)instance+=varint_size(value.size())+value.size();auto inserted=candidates.emplace(parsed.key,ParamSpanCandidate{});ParamSpanCandidate&candidate=inserted.first->second;
+            if(inserted.second){candidate.key=parsed.key;candidate.shape=std::move(parsed);}++candidate.count;candidate.literal_bytes+=len;candidate.instance_bytes+=instance;
+        }}
+}
+
+static TokenSpanRaw encode_param_span_pack(const std::vector<uint32_t>&ids,const LineStore&store,size_t rule_cap,bool columnar,ParamSpanStats&stats){
+    std::unordered_map<std::string,ParamSpanCandidate>candidates;candidates.reserve(ids.size()*8+1);
+    for(uint32_t id:ids)observe_param_span_windows(store.data(id),store.len(id),candidates);
+    stats.candidate_shapes=candidates.size();std::vector<ParamSpanCandidate*>ranked;ranked.reserve(candidates.size());
+    for(auto&item:candidates){ParamSpanCandidate&candidate=item.second;if(candidate.count<2)continue;const uint64_t definition=encoded_template_size(candidate.shape)+varint_size(candidate.count);
+        if(candidate.literal_bytes<=candidate.instance_bytes+definition)continue;
+        candidate.benefit=int64_t(candidate.literal_bytes-candidate.instance_bytes-definition);ranked.push_back(&candidate);}
+    std::sort(ranked.begin(),ranked.end(),[](const ParamSpanCandidate*a,const ParamSpanCandidate*b){if(a->benefit!=b->benefit)return a->benefit>b->benefit;if(a->count!=b->count)return a->count>b->count;return a->key<b->key;});if(ranked.size()>rule_cap)ranked.resize(rule_cap);stats.selected_rules=ranked.size();
+    std::unordered_map<std::string,uint32_t>rule_ids;rule_ids.reserve(ranked.size()*2+1);for(uint32_t i=0;i<ranked.size();++i)rule_ids.emplace(ranked[i]->key,i);
+
+    std::vector<ParamSpanRecord>records;records.reserve(ids.size());std::vector<uint64_t>rule_uses(ranked.size());
+    for(uint32_t id:ids){const uint8_t*p=store.data(id);const uint32_t n=store.len(id);stats.target_bytes+=n;ParamSpanRecord record;record.id=id;const std::vector<Atom>atoms=atomize(p,n);
+        if(atoms.empty()||atoms.size()>256||ranked.empty()){++stats.literal_records;records.push_back(std::move(record));continue;}
+        const size_t count=atoms.size();std::vector<size_t>cost(count+1,SIZE_MAX);std::vector<uint32_t>previous(count+1),edge_rule(count+1,UINT32_MAX);cost[0]=0;
+        for(size_t begin=0;begin<count;++begin){if(cost[begin]==SIZE_MAX)continue;const size_t raw_cost=cost[begin]+varint_size(uint64_t(atoms[begin].len)<<1)+atoms[begin].len;if(raw_cost<cost[begin+1]){cost[begin+1]=raw_cost;previous[begin+1]=uint32_t(begin);edge_rule[begin+1]=UINT32_MAX;}
+            for(unsigned width:kParamSpanWidths){if(begin+width>count)continue;const uint32_t off=atoms[begin].off,end=atoms[begin+width-1].off+atoms[begin+width-1].len,len=end-off;ParsedLine parsed=parse_line(p+off,len);auto found=rule_ids.find(parsed.key);if(found==rule_ids.end())continue;
+                const ParamSpanCandidate&candidate=*ranked[found->second];size_t edge=varint_size((uint64_t(found->second)<<1)|1)+encoded_template_size(candidate.shape)/candidate.count;for(const auto&value:parsed.values)edge+=varint_size(value.size())+value.size();const size_t next=begin+width;
+                if(cost[begin]+edge<cost[next]){cost[next]=cost[begin]+edge;previous[next]=uint32_t(begin);edge_rule[next]=found->second;}}
+        }
+        struct Choice{uint32_t begin=0,end=0,rule=UINT32_MAX;};std::vector<Choice>choices;for(uint32_t end=uint32_t(count);end;){const uint32_t begin=previous[end];choices.push_back({begin,end,edge_rule[end]});end=begin;}std::reverse(choices.begin(),choices.end());
+        auto append_raw=[&](uint32_t off,uint32_t len){if(!len)return;if(!record.ops.empty()&&!record.ops.back().rule&&record.ops.back().target_off+record.ops.back().len==off)record.ops.back().len+=len;else {ParamSpanOp op;op.target_off=off;op.len=len;record.ops.push_back(std::move(op));}};
+        bool has_rule=false;for(const Choice&choice:choices){const uint32_t off=atoms[choice.begin].off,end=atoms[choice.end-1].off+atoms[choice.end-1].len,len=end-off;if(choice.rule==UINT32_MAX){append_raw(off,len);continue;}ParsedLine parsed=parse_line(p+off,len);ParamSpanOp op;op.rule=true;op.target_off=off;op.len=len;op.rule_id=choice.rule;op.values=std::move(parsed.values);record.ops.push_back(std::move(op));has_rule=true;}
+        size_t encoded=0;for(const ParamSpanOp&op:record.ops){if(op.rule){encoded+=varint_size((uint64_t(op.rule_id)<<1)|1);for(const auto&value:op.values)encoded+=varint_size(value.size())+value.size();}else encoded+=varint_size(uint64_t(op.len)<<1)+op.len;}
+        if(!has_rule||encoded>=n){record.ops.clear();++stats.literal_records;}
+        else record.program=true;
+        records.push_back(std::move(record));
+    }
+
+    // Candidate windows overlap.  Charge definitions against the uses that survive the line DP,
+    // convert losing rules back to raw spans, and repeat so one-use remnants cannot remain.
+    for(unsigned iteration=0;iteration<3;++iteration){std::vector<uint64_t>uses(ranked.size()),literal(ranked.size()),instance(ranked.size());
+        for(const ParamSpanRecord&record:records)if(record.program)for(const ParamSpanOp&op:record.ops)if(op.rule){++uses[op.rule_id];literal[op.rule_id]+=op.len;instance[op.rule_id]+=varint_size((uint64_t(op.rule_id)<<1)|1);for(const auto&value:op.values)instance[op.rule_id]+=varint_size(value.size())+value.size();}
+        std::vector<uint8_t>keep(ranked.size());for(size_t i=0;i<ranked.size();++i){const uint64_t definition=encoded_template_size(ranked[i]->shape);keep[i]=uses[i]>=2&&literal[i]>instance[i]+definition;}
+        bool changed=false;for(ParamSpanRecord&record:records)if(record.program){std::vector<ParamSpanOp>next;auto append_raw=[&](uint32_t off,uint32_t len){if(!len)return;if(!next.empty()&&!next.back().rule&&next.back().target_off+next.back().len==off)next.back().len+=len;else {ParamSpanOp op;op.target_off=off;op.len=len;next.push_back(std::move(op));}};bool has_rule=false;
+                for(ParamSpanOp&op:record.ops){if(op.rule&&!keep[op.rule_id]){append_raw(op.target_off,op.len);changed=true;}else if(!op.rule)append_raw(op.target_off,op.len);else {has_rule=true;next.push_back(std::move(op));}}
+                size_t encoded=0;for(const ParamSpanOp&op:next){if(op.rule){encoded+=varint_size((uint64_t(op.rule_id)<<1)|1);for(const auto&value:op.values)encoded+=varint_size(value.size())+value.size();}else encoded+=varint_size(uint64_t(op.len)<<1)+op.len;}
+                if(!has_rule||encoded>=store.len(record.id)){record.program=false;record.ops.clear();changed=true;}else record.ops=std::move(next);
+            }
+        if(!changed)break;
+    }
+    std::fill(rule_uses.begin(),rule_uses.end(),0);stats.program_records=0;stats.literal_records=0;stats.rule_instances=0;stats.covered_bytes=0;stats.residual_bytes=0;stats.program_ops=0;
+    for(const ParamSpanRecord&record:records){if(!record.program){++stats.literal_records;continue;}++stats.program_records;stats.program_ops+=record.ops.size();for(const ParamSpanOp&op:record.ops){if(op.rule){++rule_uses[op.rule_id];++stats.rule_instances;stats.covered_bytes+=op.len;}else stats.residual_bytes+=op.len;}}
+    std::vector<uint32_t>used;for(uint32_t i=0;i<rule_uses.size();++i)if(rule_uses[i])used.push_back(i);if(used.empty())return {};
+    struct ParamInstanceTable{std::unordered_map<std::string,uint32_t>id;std::vector<std::vector<std::vector<uint8_t>>>rows;};std::vector<ParamInstanceTable>instances(ranked.size());
+    if(columnar)for(ParamSpanRecord&record:records)if(record.program)for(ParamSpanOp&op:record.ops)if(op.rule){std::string key;for(const auto&value:op.values){key_varint(key,value.size());key.append(reinterpret_cast<const char*>(value.data()),value.size());}ParamInstanceTable&table=instances[op.rule_id];auto inserted=table.id.emplace(std::move(key),uint32_t(table.rows.size()));if(inserted.second)table.rows.push_back(op.values);op.instance_id=inserted.first->second;}
+    std::vector<uint32_t>remap(ranked.size(),UINT32_MAX);TokenSpanRaw raw;raw.valid=true;raw.param_columnar=columnar;raw.stats.target_bytes=stats.target_bytes;raw.stats.source_records=stats.program_records;raw.stats.literal_records=stats.literal_records;raw.stats.copy_bytes=stats.covered_bytes;raw.stats.residual_bytes=stats.residual_bytes;raw.stats.program_ops=stats.program_ops;raw.stats.available_records=stats.program_records;stats.used_rules=used.size();raw.stats.basis_records=used.size();put_varint(raw.basis_control,used.size());
+    for(uint32_t new_id=0;new_id<used.size();++new_id){const uint32_t old_id=used[new_id];remap[old_id]=new_id;const ParsedLine&shape=ranked[old_id]->shape;put_varint(raw.basis_control,shape.values.size());raw.basis_control.insert(raw.basis_control.end(),shape.slot_type.begin(),shape.slot_type.end());put_varint(raw.basis_control,shape.occurrence_slot.size());for(size_t i=0;i<shape.occurrence_slot.size();++i){put_varint(raw.basis_control,shape.literals[i].size());raw.basis_data.insert(raw.basis_data.end(),shape.literals[i].begin(),shape.literals[i].end());raw.stats.basis_bytes+=shape.literals[i].size();put_varint(raw.basis_control,shape.occurrence_slot[i]);}put_varint(raw.basis_control,shape.literals.back().size());raw.basis_data.insert(raw.basis_data.end(),shape.literals.back().begin(),shape.literals.back().end());raw.stats.basis_bytes+=shape.literals.back().size();const ParamInstanceTable&table=instances[old_id];put_varint(raw.basis_control,columnar?table.rows.size():0);if(columnar){stats.unique_instances+=table.rows.size();for(size_t slot=0;slot<shape.values.size();++slot)for(const auto&row:table.rows){const auto&value=row[slot];put_varint(raw.basis_control,value.size());raw.basis_data.insert(raw.basis_data.end(),value.begin(),value.end());raw.stats.basis_bytes+=value.size();}}}
+    put_varint(raw.definition_control,records.size());const size_t bitmap_bytes=(records.size()+7)/8,bitmap_offset=raw.definition_control.size();raw.definition_control.resize(bitmap_offset+bitmap_bytes);for(size_t i=0;i<records.size();++i)if(records[i].program)raw.definition_control[bitmap_offset+i/8]|=uint8_t(1u<<(i%8));
+    for(const ParamSpanRecord&record:records){if(!record.program){const uint32_t len=store.len(record.id);raw.definition_data.insert(raw.definition_data.end(),store.data(record.id),store.data(record.id)+len);continue;}for(const ParamSpanOp&op:record.ops){if(!op.rule){put_varint(raw.definition_control,uint64_t(op.len)<<1);raw.definition_data.insert(raw.definition_data.end(),store.data(record.id)+op.target_off,store.data(record.id)+op.target_off+op.len);continue;}if(op.rule_id>=remap.size()||remap[op.rule_id]==UINT32_MAX)die_msg("parameterized span rule remap missing");put_varint(raw.definition_control,(uint64_t(remap[op.rule_id])<<1)|1);if(columnar)put_varint(raw.definition_control,op.instance_id);else for(const auto&value:op.values){put_varint(raw.definition_control,value.size());raw.definition_data.insert(raw.definition_data.end(),value.begin(),value.end());}}}
+    return raw;
+}
+
+static std::vector<uint8_t>decode_implicit_param_span_pack(const TokenSpanFrames&frames,FrameCodec&codec,const std::vector<uint64_t>&lengths){
+    if(!frames.valid||frames.explicit_ids)die_msg("missing parameterized-span frame");
+    const std::array<std::vector<uint8_t>,4>raw=decompress_token_span_frames(frames,codec,nullptr);const std::vector<uint8_t>&rule_control=raw[0],&rule_data=raw[1],&definition_control=raw[2],&definition_data=raw[3];
+    struct DecodedParamRule{DecodedTemplate shape;std::vector<std::vector<std::vector<uint8_t>>>instances;};
+    const uint8_t*p=rule_control.data(),*end=p+rule_control.size(),*data=rule_data.data(),*data_end=data+rule_data.size();const uint64_t rule_count=get_varint(p,end);std::vector<DecodedParamRule>rules;rules.reserve(size_t(rule_count));
+    for(uint64_t r=0;r<rule_count;++r){DecodedParamRule decoded;DecodedTemplate&rule=decoded.shape;const uint64_t slots=get_varint(p,end);if(slots>uint64_t(end-p))die_msg("parameterized span slots exceed control");rule.slot_type.assign(p,p+slots);p+=slots;const uint64_t occurrences=get_varint(p,end);for(uint64_t i=0;i<occurrences;++i){const uint64_t len=get_varint(p,end);if(len>uint64_t(data_end-data))die_msg("parameterized span literal exceeds data");rule.literals.emplace_back(data,data+len);data+=len;const uint64_t slot=get_varint(p,end);if(slot>=slots)die_msg("parameterized span slot out of range");rule.occurrence_slot.push_back(uint32_t(slot));}const uint64_t len=get_varint(p,end);if(len>uint64_t(data_end-data))die_msg("parameterized span tail exceeds data");rule.literals.emplace_back(data,data+len);data+=len;const uint64_t instance_count=get_varint(p,end);if(instance_count>SIZE_MAX)die_msg("parameterized span instance count too large");decoded.instances.resize(size_t(instance_count),std::vector<std::vector<uint8_t>>(size_t(slots)));for(size_t slot=0;slot<size_t(slots);++slot)for(size_t row=0;row<size_t(instance_count);++row){const uint64_t value_len=get_varint(p,end);if(value_len>uint64_t(data_end-data))die_msg("parameterized span instance exceeds data");decoded.instances[row][slot].assign(data,data+value_len);data+=value_len;}rules.push_back(std::move(decoded));}
+    if(p!=end||data!=data_end)die_msg("trailing parameterized span rule bytes");
+    p=definition_control.data();end=p+definition_control.size();const uint64_t count=get_varint(p,end);if(count!=lengths.size())die_msg("parameterized span record count mismatch");const size_t bitmap_bytes=(lengths.size()+7)/8;if(bitmap_bytes>size_t(end-p))die_msg("parameterized span bitmap exceeds control");const uint8_t*bitmap=p;p+=bitmap_bytes;data=definition_data.data();data_end=data+definition_data.size();std::vector<uint8_t>payload;uint64_t total=0;for(uint64_t len:lengths){if(len>SIZE_MAX-total)die_msg("parameterized span payload too large");total+=len;}payload.reserve(size_t(total));
+    for(size_t row=0;row<lengths.size();++row){const uint64_t output_len=lengths[row];const bool program=(bitmap[row/8]>>(row%8))&1u;if(!program){if(output_len>uint64_t(data_end-data))die_msg("parameterized span raw exceeds data");payload.insert(payload.end(),data,data+output_len);data+=output_len;continue;}const size_t output_begin=payload.size();
+        while(payload.size()-output_begin<output_len){const uint64_t code=get_varint(p,end);if(!(code&1)){const uint64_t len=code>>1;if(!len||len>output_len-(payload.size()-output_begin)||len>uint64_t(data_end-data))die_msg("parameterized span ADD exceeds output");payload.insert(payload.end(),data,data+len);data+=len;continue;}const uint64_t rule_id=code>>1;if(rule_id>=rules.size())die_msg("parameterized span rule missing");const DecodedParamRule&decoded=rules[size_t(rule_id)];const DecodedTemplate&rule=decoded.shape;std::vector<std::vector<uint8_t>>inline_values;const std::vector<std::vector<uint8_t>>*values=nullptr;
+            if(frames.param_columnar){const uint64_t instance_id=get_varint(p,end);if(instance_id>=decoded.instances.size())die_msg("parameterized span instance missing");values=&decoded.instances[size_t(instance_id)];}
+            else {inline_values.resize(rule.slot_type.size());for(auto&value:inline_values){const uint64_t len=get_varint(p,end);if(len>uint64_t(data_end-data))die_msg("parameterized span inline value exceeds data");value.assign(data,data+len);data+=len;}values=&inline_values;}
+            for(size_t i=0;i<rule.occurrence_slot.size();++i){payload.insert(payload.end(),rule.literals[i].begin(),rule.literals[i].end());const std::vector<uint8_t>&value=(*values)[rule.occurrence_slot[i]];payload.insert(payload.end(),value.begin(),value.end());}payload.insert(payload.end(),rule.literals.back().begin(),rule.literals.back().end());if(payload.size()-output_begin>output_len)die_msg("parameterized span rule exceeds output");}
+    }
+    if(p!=end||data!=data_end)die_msg("trailing parameterized span definition bytes");
     return payload;
 }
 
@@ -1780,10 +2146,11 @@ int main(int argc, char** argv) {
     ModelFrameCodec model_frames(pretrained.raw,zlevel);
     ModelFrameCodec model_p4_frames(pretrained.raw,zlevel);
     ModelFrameCodec source_dictionary_encoder_frames(source_dictionary,zlevel),source_dictionary_decoder_frames(source_dictionary_decoded,zlevel);
-    Row p0("P0-appearance"), p1("P1-lexicographic"), p4("P4-alpha-template"),p5("P5-multiline"),p6("P6-token-forest"),p7s("P7-source-location"),p7p("P7p-source-superblock"),p7("P7-online-template"),p7b("P7b-local-rule-online-token"),p9("P9-semantic-split-zstd"),p9s("P9s-semantic+source"),p9sd("P9s+trained-source-dict"),p8("P8-pretrained-superblock"),p8d("P8-pretrained-dict-P4"), p10("P10-best-local-frame"),p10sd("P10+source-dict"),p10p("P10+P8-charged-union");
-    std::vector<Row*> rows{&p0, &p1, &p4,&p5,&p6,&p7s,&p7p,&p7,&p7b,&p9,&p9s};if(use_source_dictionary)rows.push_back(&p9sd);if(use_pretrained){rows.push_back(&p8);rows.push_back(&p8d);}rows.push_back(&p10);if(use_source_dictionary)rows.push_back(&p10sd);if(use_pretrained)rows.push_back(&p10p);
+    ModelFrameCodec token_dictionary_encoder_frames(source_dictionary,zlevel),token_dictionary_decoder_frames(source_dictionary_decoded,zlevel);
+    Row p0("P0-appearance"), p1("P1-lexicographic"), p4("P4-alpha-template"),p5("P5-multiline"),p6("P6-token-forest"),p7s("P7-source-location"),p7p("P7p-source-superblock"),p7t("P7t-all-token-spans"),p7("P7-online-template"),p7b("P7b-local-rule-online-token"),p9("P9-semantic-split-zstd"),p9s("P9s-semantic+source"),p9sg("P9sg-source-basis-grammar"),p9sd("P9s+trained-source-dict"),p9t("P9t-semantic+token-spans"),p9td("P9t+trained-source-dict"),p9g("P9g-parameterized-spans"),p8("P8-pretrained-superblock"),p8d("P8-pretrained-dict-P4"), p10("P10-best-local-frame"),p10sd("P10+source-dict"),p10p("P10+P8-charged-union"),p11("P11-best-token-span-union"),p11d("P11+token-spans+dict"),p12("P12-best-param-superblock");
+    std::vector<Row*> rows{&p0, &p1, &p4,&p5,&p6,&p7s,&p7p,&p7t,&p7,&p7b,&p9,&p9s,&p9sg};if(use_source_dictionary)rows.push_back(&p9sd);rows.push_back(&p9t);if(use_source_dictionary)rows.push_back(&p9td);rows.push_back(&p9g);if(use_pretrained){rows.push_back(&p8);rows.push_back(&p8d);}rows.push_back(&p10);if(use_source_dictionary)rows.push_back(&p10sd);if(use_pretrained)rows.push_back(&p10p);rows.push_back(&p11);if(use_source_dictionary)rows.push_back(&p11d);rows.push_back(&p12);
     if(use_pretrained){p8.wire=pretrained.frame.size()+4;p8d.wire=pretrained.frame.size()+4;p10p.wire=pretrained.frame.size()+4;}
-    if(use_source_dictionary){const uint64_t package_wire=source_dictionary_package.size()+4;p9sd.wire=package_wire;p10sd.wire=package_wire;}
+    if(use_source_dictionary){const uint64_t package_wire=source_dictionary_package.size()+4;p9sd.wire=package_wire;p9td.wire=package_wire;p10sd.wire=package_wire;p11d.wire=package_wire;}
     std::unique_ptr<SemanticFrameWriter>semantic_writer;if(!semantic_export_prefix.empty())semantic_writer=std::make_unique<SemanticFrameWriter>(semantic_export_prefix);
     for (Row* row : rows) row->tu_wire.reserve(corpus.files.size());
     TemplateStats template_stats;
@@ -1793,7 +2160,8 @@ int main(int argc, char** argv) {
     PersistentStats hybrid_stats;PersistentEncoder hybrid_encoder;PersistentDecoder hybrid_decoder;
     PersistentStats pretrained_stats;
     MultiStats multi_stats;
-    SourceLearner source_learner;SourceStats source_stats;SourcePackStats source_pack_stats,semantic_source_pack_stats,dictionary_source_pack_stats;SourceCatalog source_catalog;std::vector<LineSourceMeta>source_meta(1);
+    SourceLearner source_learner;SourceStats source_stats;SourcePackStats source_pack_stats,semantic_source_pack_stats,grammar_source_pack_stats,dictionary_source_pack_stats;TokenSpanStats all_token_span_stats,token_span_stats,dictionary_token_span_stats;TokenSpanSweepStats all_token_span_sweep,token_span_sweep,dictionary_token_span_sweep;SourceCatalog source_catalog;std::vector<LineSourceMeta>source_meta(1);
+    ParamSpanStats param_span_stats;uint64_t param_span_literal_wire=0,param_span_candidate_wire=0,param_span_selected_wire=0,param_span_frame_wins=0,param_span_combined_wins=0,param_span_columnar_wins=0;
     std::array<std::vector<uint8_t>,kSourceCategoryCount>attributed_bytes;
     uint64_t cumulative_raw = 0;
     const double fractions[] = {0.10, 0.25, 0.50, 0.75, 1.00};
@@ -1886,7 +2254,7 @@ int main(int argc, char** argv) {
         if(p9_frames_b.wire<p9_frames.wire){p9_frames=std::move(p9_frames_b);selected_p9=p9_stats_b;p9_selected=&p9_raw_b;}if(semantic_writer)semantic_writer->add(file.len,*p9_selected);p9.encode_seconds+=elapsed(e9);semantic_stats.rules+=selected_p9.rules;semantic_stats.instances+=selected_p9.instances;semantic_stats.unique_slots+=selected_p9.unique_slots;semantic_stats.slot_occurrences+=selected_p9.slot_occurrences;semantic_stats.literal_fallbacks+=selected_p9.literal_fallbacks;semantic_stats.template_input_bytes+=selected_p9.template_input_bytes;semantic_stats.lexicon_entries+=selected_p9.lexicon_entries;semantic_stats.lexicon_references+=selected_p9.lexicon_references;p9_control_wire+=p9_frames.control.size()+4;for(size_t c=0;c<kSemanticChannels;++c)if(!p9_frames.payload[c].empty())p9_payload_wire[c]+=p9_frames.payload[c].size()+4;
         const auto d9=Clock::now();const SemanticBuffer p9_decoded=decompress_semantic(p9_frames,frames);decode_semantic_templates(p9_decoded,p9.decoder);p9.decode_seconds+=elapsed(d9);verify_definitions(new_ids,truth,p9.decoder);
 
-        SourcePackFrames p9s_source_frames,p9sd_source_frames;size_t p9s_threshold_index=0,p9sd_threshold_index=0;double p9s_tu_encode=0,p9sd_tu_encode=0;
+        SourcePackFrames p9s_source_frames,p9sg_source_frames,p9sd_source_frames;size_t p9s_threshold_index=0,p9sg_threshold_index=0,p9sd_threshold_index=0;double p9s_tu_encode=0,p9sg_tu_encode=0,p9sd_tu_encode=0;
         for(size_t threshold_index=0;threshold_index<kSourcePackThresholds.size();++threshold_index){
             const unsigned threshold=kSourcePackThresholds[threshold_index];
             const auto plan_begin=Clock::now();
@@ -1897,6 +2265,9 @@ int main(int argc, char** argv) {
             if(candidate.valid){++semantic_source_pack_stats.threshold_tus[threshold_index];semantic_source_pack_stats.threshold_wire[threshold_index]+=candidate.wire;
                 semantic_source_pack_stats.threshold_basis_bytes[threshold_index]+=candidate.stats.basis_bytes;semantic_source_pack_stats.threshold_residual_bytes[threshold_index]+=candidate.stats.residual_bytes;}
             if(candidate.valid&&(!p9s_source_frames.valid||candidate.wire<p9s_source_frames.wire)){p9s_source_frames=std::move(candidate);p9s_threshold_index=threshold_index;}
+            const auto grammar_begin=Clock::now();SourcePackRaw grammar_a=template_source_pack_basis(candidate_raw,false),grammar_b=template_source_pack_basis(candidate_raw,true);SourcePackFrames grammar_frame_a=compress_source_pack(grammar_a,frames,zlevel,threshold),grammar_frame_b=compress_source_pack(grammar_b,frames,zlevel,threshold);SourcePackFrames grammar_candidate=grammar_frame_b.valid&&(!grammar_frame_a.valid||grammar_frame_b.wire<grammar_frame_a.wire)?std::move(grammar_frame_b):std::move(grammar_frame_a);p9sg_tu_encode+=plan_seconds+elapsed(grammar_begin);
+            if(grammar_candidate.valid){++grammar_source_pack_stats.threshold_tus[threshold_index];grammar_source_pack_stats.threshold_wire[threshold_index]+=grammar_candidate.wire;grammar_source_pack_stats.threshold_basis_bytes[threshold_index]+=grammar_candidate.stats.basis_bytes;grammar_source_pack_stats.threshold_residual_bytes[threshold_index]+=grammar_candidate.stats.residual_bytes;}
+            if(grammar_candidate.valid&&(!p9sg_source_frames.valid||grammar_candidate.wire<p9sg_source_frames.wire)){p9sg_source_frames=std::move(grammar_candidate);p9sg_threshold_index=threshold_index;}
             if(use_source_dictionary){const auto dictionary_begin=Clock::now();SourcePackFrames dictionary_candidate=compress_source_pack(candidate_raw,frames,zlevel,threshold,&source_dictionary_encoder_frames);p9sd_tu_encode+=plan_seconds+elapsed(dictionary_begin);
                 if(dictionary_candidate.valid){++dictionary_source_pack_stats.threshold_tus[threshold_index];dictionary_source_pack_stats.threshold_wire[threshold_index]+=dictionary_candidate.wire;
                     dictionary_source_pack_stats.threshold_basis_bytes[threshold_index]+=dictionary_candidate.stats.basis_bytes;dictionary_source_pack_stats.threshold_residual_bytes[threshold_index]+=dictionary_candidate.stats.residual_bytes;}
@@ -1905,10 +2276,13 @@ int main(int argc, char** argv) {
         const uint64_t p9_raw_wire=p9_frames.payload[kRawDefinition].empty()?0:p9_frames.payload[kRawDefinition].size()+4;
         const uint64_t p9_without_raw=p9_frames.wire-p9_raw_wire;
         const uint64_t p9_source_size=p9s_source_frames.valid?p9_without_raw+p9s_source_frames.wire:UINT64_MAX;
+        const uint64_t p9_grammar_source_size=p9sg_source_frames.valid?p9_without_raw+p9sg_source_frames.wire:UINT64_MAX;
         const uint64_t p9_dictionary_source_size=p9sd_source_frames.valid?p9_without_raw+p9sd_source_frames.wire:UINT64_MAX;
         const bool p9s_use_source=p9s_source_frames.valid&&p9_source_size<p9_frames.wire;
+        const bool p9sg_use_source=p9sg_source_frames.valid&&p9_grammar_source_size<p9_frames.wire;
         const bool p9sd_use_source=p9sd_source_frames.valid&&p9_dictionary_source_size<p9_frames.wire;
         const uint64_t w9s=std::min(p9_frames.wire,p9_source_size)+1;p9s.encode_seconds+=p9s_tu_encode;
+        const uint64_t w9sg=std::min(p9_frames.wire,p9_grammar_source_size)+1;p9sg.encode_seconds+=p9sg_tu_encode;
         const uint64_t w9sd=std::min(p9_frames.wire,p9_dictionary_source_size)+1;
         if(use_source_dictionary)p9sd.encode_seconds+=p9sd_tu_encode;
         semantic_source_pack_stats.literal_wire+=p9_raw_wire;semantic_source_pack_stats.selected_wire+=(p9s_use_source?p9s_source_frames.wire:p9_raw_wire)+1;
@@ -1919,8 +2293,13 @@ int main(int argc, char** argv) {
             semantic_source_pack_stats.selected.source_records+=p9s_source_frames.stats.source_records;semantic_source_pack_stats.selected.literal_records+=p9s_source_frames.stats.literal_records;
             semantic_source_pack_stats.selected.basis_records+=p9s_source_frames.stats.basis_records;semantic_source_pack_stats.selected.basis_bytes+=p9s_source_frames.stats.basis_bytes;
             semantic_source_pack_stats.selected.residual_bytes+=p9s_source_frames.stats.residual_bytes;semantic_source_pack_stats.selected.target_bytes+=p9s_source_frames.stats.target_bytes;
-            semantic_source_pack_stats.frame_wire[0]+=p9s_source_frames.basis_control.size()+4;semantic_source_pack_stats.frame_wire[1]+=p9s_source_frames.basis_data.size()+4;
-            semantic_source_pack_stats.frame_wire[2]+=p9s_source_frames.definition_control.size()+4;semantic_source_pack_stats.frame_wire[3]+=p9s_source_frames.definition_data.size()+4;
+            account_source_pack_layout(semantic_source_pack_stats,p9s_source_frames);
+        }
+        grammar_source_pack_stats.literal_wire+=p9_raw_wire;grammar_source_pack_stats.selected_wire+=(p9sg_use_source?p9sg_source_frames.wire:p9_raw_wire)+1;
+        if(p9sg_source_frames.valid){
+            ++grammar_source_pack_stats.candidate_tus;++grammar_source_pack_stats.threshold_wins[p9sg_threshold_index];grammar_source_pack_stats.source_wire+=p9sg_source_frames.wire;if(p9sg_use_source)++grammar_source_pack_stats.frame_wins;
+            grammar_source_pack_stats.selected.available_records+=p9sg_source_frames.stats.available_records;grammar_source_pack_stats.selected.available_bytes+=p9sg_source_frames.stats.available_bytes;grammar_source_pack_stats.selected.source_records+=p9sg_source_frames.stats.source_records;grammar_source_pack_stats.selected.literal_records+=p9sg_source_frames.stats.literal_records;grammar_source_pack_stats.selected.basis_records+=p9sg_source_frames.stats.basis_records;grammar_source_pack_stats.selected.basis_bytes+=p9sg_source_frames.stats.basis_bytes;grammar_source_pack_stats.selected.residual_bytes+=p9sg_source_frames.stats.residual_bytes;grammar_source_pack_stats.selected.target_bytes+=p9sg_source_frames.stats.target_bytes;
+            account_source_pack_layout(grammar_source_pack_stats,p9sg_source_frames);
         }
         dictionary_source_pack_stats.literal_wire+=p9_raw_wire;dictionary_source_pack_stats.selected_wire+=(p9sd_use_source?p9sd_source_frames.wire:p9_raw_wire)+1;
         if(p9sd_source_frames.valid){
@@ -1930,8 +2309,7 @@ int main(int argc, char** argv) {
             dictionary_source_pack_stats.selected.source_records+=p9sd_source_frames.stats.source_records;dictionary_source_pack_stats.selected.literal_records+=p9sd_source_frames.stats.literal_records;
             dictionary_source_pack_stats.selected.basis_records+=p9sd_source_frames.stats.basis_records;dictionary_source_pack_stats.selected.basis_bytes+=p9sd_source_frames.stats.basis_bytes;
             dictionary_source_pack_stats.selected.residual_bytes+=p9sd_source_frames.stats.residual_bytes;dictionary_source_pack_stats.selected.target_bytes+=p9sd_source_frames.stats.target_bytes;
-            dictionary_source_pack_stats.frame_wire[0]+=p9sd_source_frames.basis_control.size()+4;dictionary_source_pack_stats.frame_wire[1]+=p9sd_source_frames.basis_data.size()+4;
-            dictionary_source_pack_stats.frame_wire[2]+=p9sd_source_frames.definition_control.size()+4;dictionary_source_pack_stats.frame_wire[3]+=p9sd_source_frames.definition_data.size()+4;
+            account_source_pack_layout(dictionary_source_pack_stats,p9sd_source_frames);
         }
         auto decode_p9_source=[&](const SourcePackFrames&source_frames,ModelFrameCodec*model,DecoderStore&decoder){
             SemanticBuffer decoded=decompress_semantic(p9_frames,frames);const std::vector<uint64_t>lengths=semantic_raw_lengths(decoded.control);
@@ -1939,7 +2317,47 @@ int main(int argc, char** argv) {
         };
         const auto d9s=Clock::now();if(p9s_use_source)decode_p9_source(p9s_source_frames,nullptr,p9s.decoder);else decode_semantic_templates(p9_decoded,p9s.decoder);
         p9s.decode_seconds+=elapsed(d9s);verify_definitions(new_ids,truth,p9s.decoder);
+        const auto d9sg=Clock::now();if(p9sg_use_source)decode_p9_source(p9sg_source_frames,nullptr,p9sg.decoder);else decode_semantic_templates(p9_decoded,p9sg.decoder);p9sg.decode_seconds+=elapsed(d9sg);verify_definitions(new_ids,truth,p9sg.decoder);
         if(use_source_dictionary){const auto d9sd=Clock::now();if(p9sd_use_source)decode_p9_source(p9sd_source_frames,&source_dictionary_decoder_frames,p9sd.decoder);else decode_semantic_templates(p9_decoded,p9sd.decoder);p9sd.decode_seconds+=elapsed(d9sd);verify_definitions(new_ids,truth,p9sd.decoder);}
+
+        const auto token_plan_begin=Clock::now();const std::vector<TokenSpanPlan>token_plans=build_token_span_plans(p9_selected->raw_ids,truth,source_meta,current_locations,source_catalog);const double token_plan_seconds=elapsed(token_plan_begin);
+        TokenSpanFrames p9t_span_frames,p9td_span_frames;double p9t_tu_encode=token_plan_seconds,p9td_tu_encode=token_plan_seconds;
+        for(size_t atom_index=0;atom_index<kTokenSpanAtoms.size();++atom_index){for(size_t threshold_index=0;threshold_index<kSourcePackThresholds.size();++threshold_index){for(unsigned order=0;order<2;++order){
+            const auto raw_begin=Clock::now();TokenSpanRaw candidate_raw=encode_token_span_pack(token_plans,truth,kSourcePackThresholds[threshold_index],kTokenSpanAtoms[atom_index],kTokenSpanMinBytes[atom_index],order!=0);const double raw_seconds=elapsed(raw_begin);p9t_tu_encode+=raw_seconds;p9td_tu_encode+=raw_seconds;
+            const auto plain_begin=Clock::now();TokenSpanFrames candidate=compress_token_span_pack(candidate_raw,frames,zlevel,kSourcePackThresholds[threshold_index],kTokenSpanAtoms[atom_index],kTokenSpanMinBytes[atom_index],order!=0);p9t_tu_encode+=elapsed(plain_begin);
+            const size_t sweep_index=token_span_sweep_index(atom_index,threshold_index,order);token_span_sweep.wire[sweep_index]+=candidate.valid?candidate.wire:p9_raw_wire;
+            if(candidate.valid){++token_span_sweep.candidate_tus[sweep_index];if(candidate.wire<p9_raw_wire)++token_span_sweep.wins[sweep_index];token_span_sweep.basis_bytes[sweep_index]+=candidate.stats.basis_bytes;token_span_sweep.copy_bytes[sweep_index]+=candidate.stats.copy_bytes;token_span_sweep.residual_bytes[sweep_index]+=candidate.stats.residual_bytes;token_span_sweep.source_records[sweep_index]+=candidate.stats.source_records;}
+            if(candidate.valid&&(!p9t_span_frames.valid||candidate.wire<p9t_span_frames.wire))p9t_span_frames=std::move(candidate);
+            if(use_source_dictionary){const auto dictionary_begin=Clock::now();TokenSpanFrames dictionary_candidate=compress_token_span_pack(candidate_raw,frames,zlevel,kSourcePackThresholds[threshold_index],kTokenSpanAtoms[atom_index],kTokenSpanMinBytes[atom_index],order!=0,&token_dictionary_encoder_frames);p9td_tu_encode+=elapsed(dictionary_begin);
+                dictionary_token_span_sweep.wire[sweep_index]+=dictionary_candidate.valid?dictionary_candidate.wire:p9_raw_wire;
+                if(dictionary_candidate.valid){++dictionary_token_span_sweep.candidate_tus[sweep_index];if(dictionary_candidate.wire<p9_raw_wire)++dictionary_token_span_sweep.wins[sweep_index];dictionary_token_span_sweep.basis_bytes[sweep_index]+=dictionary_candidate.stats.basis_bytes;dictionary_token_span_sweep.copy_bytes[sweep_index]+=dictionary_candidate.stats.copy_bytes;dictionary_token_span_sweep.residual_bytes[sweep_index]+=dictionary_candidate.stats.residual_bytes;dictionary_token_span_sweep.source_records[sweep_index]+=dictionary_candidate.stats.source_records;}
+                if(dictionary_candidate.valid&&(!p9td_span_frames.valid||dictionary_candidate.wire<p9td_span_frames.wire))p9td_span_frames=std::move(dictionary_candidate);}
+        }}}
+        const uint64_t p9_token_span_size=p9t_span_frames.valid?p9_without_raw+p9t_span_frames.wire:UINT64_MAX;
+        const uint64_t p9_dictionary_token_span_size=p9td_span_frames.valid?p9_without_raw+p9td_span_frames.wire:UINT64_MAX;
+        const bool p9t_use_span=p9t_span_frames.valid&&p9_token_span_size<p9_frames.wire;
+        const bool p9td_use_span=p9td_span_frames.valid&&p9_dictionary_token_span_size<p9_frames.wire;
+        const uint64_t w9t=std::min(p9_frames.wire,p9_token_span_size)+1,w9td=std::min(p9_frames.wire,p9_dictionary_token_span_size)+1;
+        p9t.encode_seconds+=p9t_tu_encode;if(use_source_dictionary)p9td.encode_seconds+=p9td_tu_encode;
+        auto accumulate_token_span=[&](TokenSpanStats&stats,const TokenSpanFrames&selected,bool used,uint64_t literal_wire){
+            stats.literal_wire+=literal_wire;stats.selected_wire+=(used?selected.wire:literal_wire)+1;if(!selected.valid)return;++stats.candidate_tus;stats.span_wire+=selected.wire;if(used)++stats.frame_wins;
+            stats.selected.available_records+=selected.stats.available_records;stats.selected.available_bytes+=selected.stats.available_bytes;stats.selected.source_records+=selected.stats.source_records;stats.selected.literal_records+=selected.stats.literal_records;
+            stats.selected.basis_records+=selected.stats.basis_records;stats.selected.basis_bytes+=selected.stats.basis_bytes;stats.selected.copy_bytes+=selected.stats.copy_bytes;stats.selected.residual_bytes+=selected.stats.residual_bytes;stats.selected.target_bytes+=selected.stats.target_bytes;stats.selected.program_ops+=selected.stats.program_ops;
+            if(selected.combined){++stats.combined_wins;stats.combined_wire+=selected.combined_frame.size()+4+(selected.combined_dictionary?1:0);}
+            else {stats.frame_wire[0]+=selected.basis_control.size()+4+(selected.dictionary[0]?1:0);stats.frame_wire[1]+=selected.basis_data.size()+4+(selected.dictionary[1]?1:0);stats.frame_wire[2]+=selected.definition_control.size()+4+(selected.dictionary[2]?1:0);stats.frame_wire[3]+=selected.definition_data.size()+4+(selected.dictionary[3]?1:0);}
+            for(size_t i=0;i<kSourcePackThresholds.size();++i)if(selected.residual_percent==kSourcePackThresholds[i])++stats.threshold_wins[i];
+            for(size_t i=0;i<kTokenSpanAtoms.size();++i)if(selected.max_atoms==kTokenSpanAtoms[i]&&selected.min_span_bytes==kTokenSpanMinBytes[i])++stats.atom_wins[i];
+            ++stats.order_wins[selected.lexical_basis?1:0];
+        };
+        accumulate_token_span(token_span_stats,p9t_span_frames,p9t_use_span,p9_raw_wire);if(use_source_dictionary)accumulate_token_span(dictionary_token_span_stats,p9td_span_frames,p9td_use_span,p9_raw_wire);
+        auto decode_p9_token_span=[&](const TokenSpanFrames&span_frames,ModelFrameCodec*model,DecoderStore&decoder){SemanticBuffer decoded=decompress_semantic(p9_frames,frames);const std::vector<uint64_t>lengths=semantic_raw_lengths(decoded.control);decoded.payload[kRawDefinition]=decode_implicit_token_span_pack(span_frames,frames,lengths,model);decode_semantic_templates(decoded,decoder);};
+        const auto d9t=Clock::now();if(p9t_use_span)decode_p9_token_span(p9t_span_frames,nullptr,p9t.decoder);else decode_semantic_templates(p9_decoded,p9t.decoder);p9t.decode_seconds+=elapsed(d9t);verify_definitions(new_ids,truth,p9t.decoder);
+        if(use_source_dictionary){const auto d9td=Clock::now();if(p9td_use_span)decode_p9_token_span(p9td_span_frames,&token_dictionary_decoder_frames,p9td.decoder);else decode_semantic_templates(p9_decoded,p9td.decoder);p9td.decode_seconds+=elapsed(d9td);verify_definitions(new_ids,truth,p9td.decoder);}
+
+        const auto e9g=Clock::now();ParamSpanStats inline_param_stats,columnar_param_stats;TokenSpanRaw p9g_inline_raw=encode_param_span_pack(p9_selected->raw_ids,truth,8192,false,inline_param_stats),p9g_columnar_raw=encode_param_span_pack(p9_selected->raw_ids,truth,8192,true,columnar_param_stats);TokenSpanFrames p9g_inline_frames=compress_token_span_pack(p9g_inline_raw,frames,zlevel,100,32,0,false),p9g_columnar_frames=compress_token_span_pack(p9g_columnar_raw,frames,zlevel,100,32,0,false);const bool use_columnar=p9g_columnar_frames.valid&&(!p9g_inline_frames.valid||p9g_columnar_frames.wire<p9g_inline_frames.wire);TokenSpanFrames p9g_span_frames=use_columnar?std::move(p9g_columnar_frames):std::move(p9g_inline_frames);const ParamSpanStats&current_param_stats=use_columnar?columnar_param_stats:inline_param_stats;const uint64_t p9_param_span_size=p9g_span_frames.valid?p9_without_raw+p9g_span_frames.wire:UINT64_MAX;const bool p9g_use_span=p9g_span_frames.valid&&p9_param_span_size<p9_frames.wire;const uint64_t w9g=std::min(p9_frames.wire,p9_param_span_size)+1;p9g.encode_seconds+=elapsed(e9g);
+        param_span_stats.candidate_shapes+=current_param_stats.candidate_shapes;param_span_stats.selected_rules+=current_param_stats.selected_rules;param_span_stats.used_rules+=current_param_stats.used_rules;param_span_stats.rule_instances+=current_param_stats.rule_instances;param_span_stats.unique_instances+=current_param_stats.unique_instances;param_span_stats.program_records+=current_param_stats.program_records;param_span_stats.literal_records+=current_param_stats.literal_records;param_span_stats.covered_bytes+=current_param_stats.covered_bytes;param_span_stats.residual_bytes+=current_param_stats.residual_bytes;param_span_stats.target_bytes+=current_param_stats.target_bytes;param_span_stats.program_ops+=current_param_stats.program_ops;
+        param_span_literal_wire+=p9_raw_wire;param_span_candidate_wire+=p9g_span_frames.valid?p9g_span_frames.wire:p9_raw_wire;param_span_selected_wire+=(p9g_use_span?p9g_span_frames.wire:p9_raw_wire)+1;if(p9g_use_span)++param_span_frame_wins;if(p9g_span_frames.valid&&p9g_span_frames.combined)++param_span_combined_wins;if(use_columnar)++param_span_columnar_wins;
+        const auto d9g=Clock::now();if(p9g_use_span){SemanticBuffer decoded=decompress_semantic(p9_frames,frames);const std::vector<uint64_t>lengths=semantic_raw_lengths(decoded.control);decoded.payload[kRawDefinition]=decode_implicit_param_span_pack(p9g_span_frames,frames,lengths);decode_semantic_templates(decoded,p9g.decoder);}else decode_semantic_templates(p9_decoded,p9g.decoder);p9g.decode_seconds+=elapsed(d9g);verify_definitions(new_ids,truth,p9g.decoder);
 
         const auto e5=Clock::now();size_t p5_size=SIZE_MAX;std::vector<uint8_t>p5_control_frame,p5_data_frame;MultiStats selected_multi;
         for(size_t width:{size_t(2),size_t(4),size_t(8),size_t(16)}){MultiStats candidate_stats;SplitBuffer candidate=encode_multiline(new_ids,truth,width,candidate_stats);std::vector<uint8_t>cf=frames.compress(candidate.control,zlevel),df=frames.compress(candidate.data,zlevel);size_t size=cf.size()+df.size()+8;if(size<p5_size){p5_size=size;p5_control_frame=std::move(cf);p5_data_frame=std::move(df);selected_multi=candidate_stats;}}
@@ -1975,12 +2393,22 @@ int main(int argc, char** argv) {
             source_pack_stats.selected.source_records+=p7p_frames.stats.source_records;source_pack_stats.selected.literal_records+=p7p_frames.stats.literal_records;
             source_pack_stats.selected.basis_records+=p7p_frames.stats.basis_records;source_pack_stats.selected.basis_bytes+=p7p_frames.stats.basis_bytes;
             source_pack_stats.selected.residual_bytes+=p7p_frames.stats.residual_bytes;source_pack_stats.selected.target_bytes+=p7p_frames.stats.target_bytes;
-            source_pack_stats.frame_wire[0]+=p7p_frames.basis_control.size()+4;source_pack_stats.frame_wire[1]+=p7p_frames.basis_data.size()+4;
-            source_pack_stats.frame_wire[2]+=p7p_frames.definition_control.size()+4;source_pack_stats.frame_wire[3]+=p7p_frames.definition_data.size()+4;
+            account_source_pack_layout(source_pack_stats,p7p_frames);
         }
         const auto d7p=Clock::now();
         if(p7p_use_source)decode_source_pack(p7p_frames,frames,p7p.decoder);else decode_literals(frames.decompress(p1_frame),p7p.decoder);
         p7p.decode_seconds+=elapsed(d7p);verify_definitions(new_ids,truth,p7p.decoder);
+
+        const auto all_token_plan_begin=Clock::now();const std::vector<TokenSpanPlan>all_token_plans=build_token_span_plans(new_ids,truth,source_meta,current_locations,source_catalog);TokenSpanFrames p7t_span_frames;double p7t_tu_encode=elapsed(all_token_plan_begin);
+        for(size_t atom_index=0;atom_index<kTokenSpanAtoms.size();++atom_index){for(size_t threshold_index=0;threshold_index<kSourcePackThresholds.size();++threshold_index){for(unsigned order=0;order<2;++order){
+            const auto raw_begin=Clock::now();TokenSpanRaw candidate_raw=encode_token_span_pack(all_token_plans,truth,kSourcePackThresholds[threshold_index],kTokenSpanAtoms[atom_index],kTokenSpanMinBytes[atom_index],order!=0,true);p7t_tu_encode+=elapsed(raw_begin);
+            const auto compress_begin=Clock::now();TokenSpanFrames candidate=compress_token_span_pack(candidate_raw,frames,zlevel,kSourcePackThresholds[threshold_index],kTokenSpanAtoms[atom_index],kTokenSpanMinBytes[atom_index],order!=0);p7t_tu_encode+=elapsed(compress_begin);
+            const size_t sweep_index=token_span_sweep_index(atom_index,threshold_index,order);all_token_span_sweep.wire[sweep_index]+=candidate.valid?candidate.wire:p1_wire;
+            if(candidate.valid){++all_token_span_sweep.candidate_tus[sweep_index];if(candidate.wire<p1_wire)++all_token_span_sweep.wins[sweep_index];all_token_span_sweep.basis_bytes[sweep_index]+=candidate.stats.basis_bytes;all_token_span_sweep.copy_bytes[sweep_index]+=candidate.stats.copy_bytes;all_token_span_sweep.residual_bytes[sweep_index]+=candidate.stats.residual_bytes;all_token_span_sweep.source_records[sweep_index]+=candidate.stats.source_records;}
+            if(candidate.valid&&(!p7t_span_frames.valid||candidate.wire<p7t_span_frames.wire))p7t_span_frames=std::move(candidate);
+        }}}
+        const uint64_t p7t_size=p7t_span_frames.valid?p7t_span_frames.wire:UINT64_MAX;const bool p7t_use_span=p7t_span_frames.valid&&p7t_size<p1_wire;const uint64_t w7t=std::min(p1_wire,p7t_size)+1;p7t.encode_seconds+=p7t_tu_encode;accumulate_token_span(all_token_span_stats,p7t_span_frames,p7t_use_span,p1_wire);
+        const auto d7t=Clock::now();if(p7t_use_span)decode_explicit_token_span_pack(p7t_span_frames,frames,p7t.decoder);else decode_literals(frames.decompress(p1_frame),p7t.decoder);p7t.decode_seconds+=elapsed(d7t);verify_definitions(new_ids,truth,p7t.decoder);
 
         const auto e7=Clock::now();const SplitBuffer p7_raw=encode_persistent_templates(new_ids,truth,persistent_encoder,persistent_stats);const std::vector<uint8_t>p7_control_frame=frames.compress(p7_raw.control,zlevel);const std::vector<uint8_t>p7_data_frame=frames.compress(p7_raw.data,zlevel);const uint64_t w7=p7_control_frame.size()+p7_data_frame.size()+8;p7.encode_seconds+=elapsed(e7);
         p7_control_wire+=p7_control_frame.size()+4;p7_data_wire+=p7_data_frame.size()+4;
@@ -2022,13 +2450,57 @@ int main(int argc, char** argv) {
             else decode_literals(frames.decompress(p1_frame),p10sd.decoder);
             p10sd.decode_seconds+=elapsed(d10sd);verify_definitions(new_ids,truth,p10sd.decoder);w10sd=best_source_dictionary+1;}
 
+        const size_t best_token_span=std::min({size_t(w1),p4_size,size_t(w5),size_t(w6),size_t(w7s),size_t(p7p_size),size_t(p7t_size),size_t(p9_frames.wire),size_t(p9_source_size),size_t(p9_token_span_size)});const auto d11=Clock::now();
+        if(best_token_span==p9_token_span_size)decode_p9_token_span(p9t_span_frames,nullptr,p11.decoder);
+        else if(best_token_span==p7t_size)decode_explicit_token_span_pack(p7t_span_frames,frames,p11.decoder);
+        else if(best_token_span==p4_size)decode_templates(p4_control_decoded,p4_data_decoded,p11.decoder);
+        else if(best_token_span==p9_frames.wire)decode_semantic_templates(p9_decoded,p11.decoder);
+        else if(p9s_source_frames.valid&&best_token_span==p9_source_size)decode_p9_source(p9s_source_frames,nullptr,p11.decoder);
+        else if(best_token_span==p5_size)decode_multiline(p5_control_decoded,p5_data_decoded,p11.decoder);
+        else if(best_token_span==p6_frame.size()+4)decode_forest(frames.decompress(p6_frame),p11.decoder);
+        else if(best_token_span==w7s)decode_source_variants(p7s_decoded,p11.decoder);
+        else if(p7p_frames.valid&&best_token_span==p7p_size)decode_source_pack(p7p_frames,frames,p11.decoder);
+        else decode_literals(frames.decompress(p1_frame),p11.decoder);
+        p11.decode_seconds+=elapsed(d11);verify_definitions(new_ids,truth,p11.decoder);const uint64_t w11=best_token_span+1;
+
+        uint64_t w11d=0;if(use_source_dictionary){const size_t best_token_dictionary=std::min({size_t(w1),p4_size,size_t(w5),size_t(w6),size_t(w7s),size_t(p7p_size),size_t(p7t_size),size_t(p9_frames.wire),size_t(p9_dictionary_source_size),size_t(p9_dictionary_token_span_size)});const auto d11d=Clock::now();
+            if(best_token_dictionary==p9_dictionary_token_span_size)decode_p9_token_span(p9td_span_frames,&token_dictionary_decoder_frames,p11d.decoder);
+            else if(best_token_dictionary==p7t_size)decode_explicit_token_span_pack(p7t_span_frames,frames,p11d.decoder);
+            else if(best_token_dictionary==p4_size)decode_templates(p4_control_decoded,p4_data_decoded,p11d.decoder);
+            else if(best_token_dictionary==p9_frames.wire)decode_semantic_templates(p9_decoded,p11d.decoder);
+            else if(p9sd_source_frames.valid&&best_token_dictionary==p9_dictionary_source_size)decode_p9_source(p9sd_source_frames,&source_dictionary_decoder_frames,p11d.decoder);
+            else if(best_token_dictionary==p5_size)decode_multiline(p5_control_decoded,p5_data_decoded,p11d.decoder);
+            else if(best_token_dictionary==p6_frame.size()+4)decode_forest(frames.decompress(p6_frame),p11d.decoder);
+            else if(best_token_dictionary==w7s)decode_source_variants(p7s_decoded,p11d.decoder);
+            else if(p7p_frames.valid&&best_token_dictionary==p7p_size)decode_source_pack(p7p_frames,frames,p11d.decoder);
+            else decode_literals(frames.decompress(p1_frame),p11d.decoder);
+            p11d.decode_seconds+=elapsed(d11d);verify_definitions(new_ids,truth,p11d.decoder);w11d=best_token_dictionary+1;}
+
+        const size_t best_param_span=std::min({best_token_span,size_t(p9_param_span_size),size_t(p9_grammar_source_size)});const auto d12=Clock::now();
+        if(best_param_span==p9_grammar_source_size)decode_p9_source(p9sg_source_frames,nullptr,p12.decoder);
+        else if(best_param_span==p9_param_span_size){SemanticBuffer decoded=decompress_semantic(p9_frames,frames);const std::vector<uint64_t>lengths=semantic_raw_lengths(decoded.control);decoded.payload[kRawDefinition]=decode_implicit_param_span_pack(p9g_span_frames,frames,lengths);decode_semantic_templates(decoded,p12.decoder);}
+        else if(best_token_span==p9_token_span_size)decode_p9_token_span(p9t_span_frames,nullptr,p12.decoder);
+        else if(best_token_span==p7t_size)decode_explicit_token_span_pack(p7t_span_frames,frames,p12.decoder);
+        else if(best_token_span==p4_size)decode_templates(p4_control_decoded,p4_data_decoded,p12.decoder);
+        else if(best_token_span==p9_frames.wire)decode_semantic_templates(p9_decoded,p12.decoder);
+        else if(p9s_source_frames.valid&&best_token_span==p9_source_size)decode_p9_source(p9s_source_frames,nullptr,p12.decoder);
+        else if(best_token_span==p5_size)decode_multiline(p5_control_decoded,p5_data_decoded,p12.decoder);
+        else if(best_token_span==p6_frame.size()+4)decode_forest(frames.decompress(p6_frame),p12.decoder);
+        else if(best_token_span==w7s)decode_source_variants(p7s_decoded,p12.decoder);
+        else if(p7p_frames.valid&&best_token_span==p7p_size)decode_source_pack(p7p_frames,frames,p12.decoder);
+        else decode_literals(frames.decompress(p1_frame),p12.decoder);
+        p12.decode_seconds+=elapsed(d12);verify_definitions(new_ids,truth,p12.decoder);const uint64_t w12=best_param_span+1;
+
         const uint64_t w0 = p0_frame.size() + 4;
         const uint64_t w4 = p4_size;
         const uint64_t w9=p9_frames.wire;
         const uint64_t w10 = std::min({w1,w4,w5,w6,w7s,p7p_size,w9,p9_source_size}) + 1;
-        std::vector<uint64_t>current{w0,w1,w4,w5,w6,w7s,w7p,w7,w7b,w9,w9s};if(use_source_dictionary)current.push_back(w9sd);if(use_pretrained){current.push_back(w8);current.push_back(w8d);}current.push_back(w10);if(use_source_dictionary)current.push_back(w10sd);if(use_pretrained)current.push_back(w10p);
+        std::vector<uint64_t>current{w0,w1,w4,w5,w6,w7s,w7p,w7t,w7,w7b,w9,w9s,w9sg};if(use_source_dictionary)current.push_back(w9sd);current.push_back(w9t);if(use_source_dictionary)current.push_back(w9td);current.push_back(w9g);if(use_pretrained){current.push_back(w8);current.push_back(w8d);}current.push_back(w10);if(use_source_dictionary)current.push_back(w10sd);if(use_pretrained)current.push_back(w10p);current.push_back(w11);if(use_source_dictionary)current.push_back(w11d);current.push_back(w12);
         for (size_t r = 0; r < rows.size(); ++r) {rows[r]->wire += current[r];rows[r]->tu_wire.push_back(current[r]);}
         p10.encode_seconds = p1.encode_seconds + p4.encode_seconds+p5.encode_seconds+p6.encode_seconds+p7s.encode_seconds+p7p.encode_seconds+p9.encode_seconds+p9s.encode_seconds;
+        p11.encode_seconds=p10.encode_seconds+p7t.encode_seconds+p9t.encode_seconds;
+        if(use_source_dictionary)p11d.encode_seconds=p10sd.encode_seconds+p7t.encode_seconds+p9td.encode_seconds;
+        p12.encode_seconds=p11.encode_seconds+p9g.encode_seconds+p9sg.encode_seconds;
         if(use_pretrained)p10p.encode_seconds=p1.encode_seconds+p8d.encode_seconds+p5.encode_seconds+p6.encode_seconds+p7s.encode_seconds+p7p.encode_seconds+p9.encode_seconds+p9s.encode_seconds;
         source_learner.observe_tu(observations,new_ids,truth);
         cumulative_raw += file.len;
@@ -2046,8 +2518,12 @@ int main(int argc, char** argv) {
 
     // P9s reuses all of P9 and adds an actual-cost source basis over only P9's raw fallback channel.
     p9s.encode_seconds+=p9.encode_seconds;
+    p9sg.encode_seconds+=p9.encode_seconds;
+    p9t.encode_seconds+=p9.encode_seconds;
     p10.encode_seconds=p1.encode_seconds+p4.encode_seconds+p5.encode_seconds+p6.encode_seconds+p7s.encode_seconds+p7p.encode_seconds+p9s.encode_seconds;
-    if(use_source_dictionary){p9sd.encode_seconds+=p9.encode_seconds;p10sd.encode_seconds=p1.encode_seconds+p4.encode_seconds+p5.encode_seconds+p6.encode_seconds+p7s.encode_seconds+p7p.encode_seconds+p9sd.encode_seconds;}
+    p11.encode_seconds=p10.encode_seconds+p7t.encode_seconds+p9t.encode_seconds;
+    p12.encode_seconds=p11.encode_seconds+p9g.encode_seconds+p9sg.encode_seconds;
+    if(use_source_dictionary){p9sd.encode_seconds+=p9.encode_seconds;p9td.encode_seconds+=p9.encode_seconds;p10sd.encode_seconds=p1.encode_seconds+p4.encode_seconds+p5.encode_seconds+p6.encode_seconds+p7s.encode_seconds+p7p.encode_seconds+p9sd.encode_seconds;p11d.encode_seconds=p10sd.encode_seconds+p7t.encode_seconds+p9td.encode_seconds;}
 
     // P8d reuses the P4 transform output in this all-row harness.  Charge the transform work as
     // well as its additional dictionary/plain actual-frame comparison before reporting throughput.
@@ -2109,9 +2585,10 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long long>(source_pack_stats.selected.source_records),static_cast<unsigned long long>(source_pack_stats.selected.literal_records),
                 static_cast<unsigned long long>(source_pack_stats.selected.basis_records),source_pack_stats.selected.basis_bytes/1048576.0,
                 source_pack_stats.selected.residual_bytes/1048576.0,source_pack_stats.selected.target_bytes/1048576.0);
-    std::printf("P7p wire literal/source/selected=%.3f/%.3f/%.3f MiB four frames basis-control/basis-data/definition-control/residual=%.3f/%.3f/%.3f/%.3f MiB threshold-wins 0/6/12/25/50/100%%=%llu/%llu/%llu/%llu/%llu/%llu\n",
+    std::printf("P7p wire literal/source/selected=%.3f/%.3f/%.3f MiB split frames basis-control/basis-data/definition-control/residual=%.3f/%.3f/%.3f/%.3f MiB combined-wins/wire=%llu/%.3f MiB threshold-wins 0/6/12/25/50/100%%=%llu/%llu/%llu/%llu/%llu/%llu\n",
                 source_pack_stats.literal_wire/1048576.0,source_pack_stats.source_wire/1048576.0,source_pack_stats.selected_wire/1048576.0,
                 source_pack_stats.frame_wire[0]/1048576.0,source_pack_stats.frame_wire[1]/1048576.0,source_pack_stats.frame_wire[2]/1048576.0,source_pack_stats.frame_wire[3]/1048576.0,
+                static_cast<unsigned long long>(source_pack_stats.combined_wins),source_pack_stats.combined_wire/1048576.0,
                 static_cast<unsigned long long>(source_pack_stats.threshold_wins[0]),static_cast<unsigned long long>(source_pack_stats.threshold_wins[1]),
                 static_cast<unsigned long long>(source_pack_stats.threshold_wins[2]),static_cast<unsigned long long>(source_pack_stats.threshold_wins[3]),
                 static_cast<unsigned long long>(source_pack_stats.threshold_wins[4]),static_cast<unsigned long long>(source_pack_stats.threshold_wins[5]));
@@ -2137,9 +2614,10 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long long>(semantic_source_pack_stats.selected.source_records),static_cast<unsigned long long>(semantic_source_pack_stats.selected.literal_records),
                 static_cast<unsigned long long>(semantic_source_pack_stats.selected.basis_records),semantic_source_pack_stats.selected.basis_bytes/1048576.0,
                 semantic_source_pack_stats.selected.residual_bytes/1048576.0,semantic_source_pack_stats.selected.target_bytes/1048576.0);
-    std::printf("P9s raw wire literal/source/selected=%.3f/%.3f/%.3f MiB four frames basis-control/basis-data/definition-control/residual=%.3f/%.3f/%.3f/%.3f MiB threshold-wins 0/6/12/25/50/100%%=%llu/%llu/%llu/%llu/%llu/%llu\n",
+    std::printf("P9s raw wire literal/source/selected=%.3f/%.3f/%.3f MiB split frames basis-control/basis-data/definition-control/residual=%.3f/%.3f/%.3f/%.3f MiB combined-wins/wire=%llu/%.3f MiB threshold-wins 0/6/12/25/50/100%%=%llu/%llu/%llu/%llu/%llu/%llu\n",
                 semantic_source_pack_stats.literal_wire/1048576.0,semantic_source_pack_stats.source_wire/1048576.0,semantic_source_pack_stats.selected_wire/1048576.0,
                 semantic_source_pack_stats.frame_wire[0]/1048576.0,semantic_source_pack_stats.frame_wire[1]/1048576.0,semantic_source_pack_stats.frame_wire[2]/1048576.0,semantic_source_pack_stats.frame_wire[3]/1048576.0,
+                static_cast<unsigned long long>(semantic_source_pack_stats.combined_wins),semantic_source_pack_stats.combined_wire/1048576.0,
                 static_cast<unsigned long long>(semantic_source_pack_stats.threshold_wins[0]),static_cast<unsigned long long>(semantic_source_pack_stats.threshold_wins[1]),
                 static_cast<unsigned long long>(semantic_source_pack_stats.threshold_wins[2]),static_cast<unsigned long long>(semantic_source_pack_stats.threshold_wins[3]),
                 static_cast<unsigned long long>(semantic_source_pack_stats.threshold_wins[4]),static_cast<unsigned long long>(semantic_source_pack_stats.threshold_wins[5]));
@@ -2148,6 +2626,34 @@ int main(int argc, char** argv) {
                     static_cast<unsigned long long>(semantic_source_pack_stats.threshold_tus[i]),semantic_source_pack_stats.threshold_wire[i]/1048576.0,
                     semantic_source_pack_stats.threshold_basis_bytes[i]/1048576.0,semantic_source_pack_stats.threshold_residual_bytes[i]/1048576.0);
     }
+    std::printf("P9sg source-basis grammar candidate-TUs=%llu frame-wins=%llu selected source/literal=%llu/%llu source-lines=%llu/%.2f MiB raw wire literal/grammar/selected=%.3f/%.3f/%.3f MiB split basis-control/basis-data/definition-control/residual wire=%.3f/%.3f/%.3f/%.3f MiB combined-wins/wire=%llu/%.3f MiB threshold-wins 0/6/12/25/50/100%%=%llu/%llu/%llu/%llu/%llu/%llu\n",
+                static_cast<unsigned long long>(grammar_source_pack_stats.candidate_tus),static_cast<unsigned long long>(grammar_source_pack_stats.frame_wins),static_cast<unsigned long long>(grammar_source_pack_stats.selected.source_records),static_cast<unsigned long long>(grammar_source_pack_stats.selected.literal_records),static_cast<unsigned long long>(grammar_source_pack_stats.selected.basis_records),grammar_source_pack_stats.selected.basis_bytes/1048576.0,
+                grammar_source_pack_stats.literal_wire/1048576.0,grammar_source_pack_stats.source_wire/1048576.0,grammar_source_pack_stats.selected_wire/1048576.0,grammar_source_pack_stats.frame_wire[0]/1048576.0,grammar_source_pack_stats.frame_wire[1]/1048576.0,grammar_source_pack_stats.frame_wire[2]/1048576.0,grammar_source_pack_stats.frame_wire[3]/1048576.0,static_cast<unsigned long long>(grammar_source_pack_stats.combined_wins),grammar_source_pack_stats.combined_wire/1048576.0,
+                static_cast<unsigned long long>(grammar_source_pack_stats.threshold_wins[0]),static_cast<unsigned long long>(grammar_source_pack_stats.threshold_wins[1]),static_cast<unsigned long long>(grammar_source_pack_stats.threshold_wins[2]),static_cast<unsigned long long>(grammar_source_pack_stats.threshold_wins[3]),static_cast<unsigned long long>(grammar_source_pack_stats.threshold_wins[4]),static_cast<unsigned long long>(grammar_source_pack_stats.threshold_wins[5]));
+    auto print_token_span_stats=[&](const char*name,const TokenSpanStats&stats){
+        std::printf("%s contributing-token-span candidate-TUs=%llu frame-wins=%llu available=%llu/%.2f MiB selected span/literal=%llu/%llu basis=%llu/%.2f MiB copy=%.2f MiB residual=%.2f MiB ops=%llu target=%.2f MiB\n",name,
+                    static_cast<unsigned long long>(stats.candidate_tus),static_cast<unsigned long long>(stats.frame_wins),static_cast<unsigned long long>(stats.selected.available_records),stats.selected.available_bytes/1048576.0,
+                    static_cast<unsigned long long>(stats.selected.source_records),static_cast<unsigned long long>(stats.selected.literal_records),static_cast<unsigned long long>(stats.selected.basis_records),stats.selected.basis_bytes/1048576.0,
+                    stats.selected.copy_bytes/1048576.0,stats.selected.residual_bytes/1048576.0,static_cast<unsigned long long>(stats.selected.program_ops),stats.selected.target_bytes/1048576.0);
+        std::printf("%s raw wire literal/span/selected=%.3f/%.3f/%.3f MiB split frames basis-control/basis-data/program-control/residual=%.3f/%.3f/%.3f/%.3f MiB combined-wins/wire=%llu/%.3f MiB threshold-wins 0/6/12/25/50/100%%=%llu/%llu/%llu/%llu/%llu/%llu atom-cap-wins whole/2/4/8/16=%llu/%llu/%llu/%llu/%llu order source/lexical=%llu/%llu\n",name,
+                    stats.literal_wire/1048576.0,stats.span_wire/1048576.0,stats.selected_wire/1048576.0,stats.frame_wire[0]/1048576.0,stats.frame_wire[1]/1048576.0,stats.frame_wire[2]/1048576.0,stats.frame_wire[3]/1048576.0,static_cast<unsigned long long>(stats.combined_wins),stats.combined_wire/1048576.0,
+                    static_cast<unsigned long long>(stats.threshold_wins[0]),static_cast<unsigned long long>(stats.threshold_wins[1]),static_cast<unsigned long long>(stats.threshold_wins[2]),static_cast<unsigned long long>(stats.threshold_wins[3]),static_cast<unsigned long long>(stats.threshold_wins[4]),static_cast<unsigned long long>(stats.threshold_wins[5]),
+                    static_cast<unsigned long long>(stats.atom_wins[0]),static_cast<unsigned long long>(stats.atom_wins[1]),static_cast<unsigned long long>(stats.atom_wins[2]),static_cast<unsigned long long>(stats.atom_wins[3]),static_cast<unsigned long long>(stats.atom_wins[4]),static_cast<unsigned long long>(stats.order_wins[0]),static_cast<unsigned long long>(stats.order_wins[1]));
+    };
+    auto print_token_span_sweep=[&](const char*name,const TokenSpanSweepStats&sweep){std::vector<size_t>order(kTokenSpanSweepSize);std::iota(order.begin(),order.end(),0);std::sort(order.begin(),order.end(),[&](size_t a,size_t b){return sweep.wire[a]<sweep.wire[b];});
+        std::printf("%s best fixed token-span configurations (raw-channel wire includes literal fallback for unavailable TUs):\n",name);
+        for(size_t rank=0;rank<std::min<size_t>(12,order.size());++rank){const size_t index=order[rank],basis_order=index%2,packed=index/2,threshold_index=packed%kSourcePackThresholds.size(),atom_index=packed/kSourcePackThresholds.size();
+            std::printf("  #%zu atoms=%u min=%u residual<=%u%% order=%s wire=%.3f MiB wins=%llu/%llu source=%llu basis/copy/residual=%.2f/%.2f/%.2f MiB\n",rank+1,kTokenSpanAtoms[atom_index],kTokenSpanMinBytes[atom_index],kSourcePackThresholds[threshold_index],basis_order?"lexical":"source",sweep.wire[index]/1048576.0,
+                        static_cast<unsigned long long>(sweep.wins[index]),static_cast<unsigned long long>(sweep.candidate_tus[index]),static_cast<unsigned long long>(sweep.source_records[index]),sweep.basis_bytes[index]/1048576.0,sweep.copy_bytes[index]/1048576.0,sweep.residual_bytes[index]/1048576.0);}
+    };
+    print_token_span_stats("P7t",all_token_span_stats);
+    print_token_span_sweep("P7t",all_token_span_sweep);
+    print_token_span_stats("P9t",token_span_stats);
+    print_token_span_sweep("P9t",token_span_sweep);
+    std::printf("P9g parameterized token superblocks candidate-shapes=%llu selected/used-rules=%llu/%llu instances/unique=%llu/%llu program/literal-records=%llu/%llu covered/residual/target=%.2f/%.2f/%.2f MiB ops=%llu frame-wins=%llu combined/columnar-candidates=%llu/%llu raw-channel literal/candidate/selected=%.3f/%.3f/%.3f MiB\n",
+                static_cast<unsigned long long>(param_span_stats.candidate_shapes),static_cast<unsigned long long>(param_span_stats.selected_rules),static_cast<unsigned long long>(param_span_stats.used_rules),static_cast<unsigned long long>(param_span_stats.rule_instances),static_cast<unsigned long long>(param_span_stats.unique_instances),
+                static_cast<unsigned long long>(param_span_stats.program_records),static_cast<unsigned long long>(param_span_stats.literal_records),param_span_stats.covered_bytes/1048576.0,param_span_stats.residual_bytes/1048576.0,param_span_stats.target_bytes/1048576.0,static_cast<unsigned long long>(param_span_stats.program_ops),
+                static_cast<unsigned long long>(param_span_frame_wins),static_cast<unsigned long long>(param_span_combined_wins),static_cast<unsigned long long>(param_span_columnar_wins),param_span_literal_wire/1048576.0,param_span_candidate_wire/1048576.0,param_span_selected_wire/1048576.0);
     if(use_source_dictionary){
         std::printf("P9sd trained source-superblock dictionary raw/package-wire=%llu/%llu bytes (%.1f/%.1f KiB) model-id=%016llx comparisons-won=%llu saved-before-charge=%.1f KiB frame-wins=%llu raw-channel literal/dictionary/selected=%.3f/%.3f/%.3f MiB\n",
                     static_cast<unsigned long long>(source_dictionary.size()),static_cast<unsigned long long>(source_dictionary_package.size()+4),source_dictionary.size()/1024.0,(source_dictionary_package.size()+4)/1024.0,
@@ -2158,6 +2664,9 @@ int main(int argc, char** argv) {
                         static_cast<unsigned long long>(dictionary_source_pack_stats.threshold_tus[i]),dictionary_source_pack_stats.threshold_wire[i]/1048576.0,
                         dictionary_source_pack_stats.threshold_basis_bytes[i]/1048576.0,dictionary_source_pack_stats.threshold_residual_bytes[i]/1048576.0);
         }
+        print_token_span_stats("P9td",dictionary_token_span_stats);
+        print_token_span_sweep("P9td",dictionary_token_span_sweep);
+        std::printf("P9td trained token-span dictionary comparisons-won=%llu saved-before-charge=%.1f KiB\n",static_cast<unsigned long long>(token_dictionary_encoder_frames.dictionary_wins),token_dictionary_encoder_frames.dictionary_saved/1024.0);
     }
     if(use_pretrained){std::printf("P8 pretrained model: training=%.2f GiB/%llu lines/%llu per-corpus-distinct in %.2fs; mode=%s min-corpora=%u; candidates=%llu rules/%llu tokens; selected=%u rules/%u tokens; package raw=%.1f KiB wire-z%d=%.1f KiB (charged)\n",
                 pretrained.training_raw/1073741824.0,static_cast<unsigned long long>(pretrained.training_lines),static_cast<unsigned long long>(pretrained.training_distinct_lines),pretrained.training_seconds,
