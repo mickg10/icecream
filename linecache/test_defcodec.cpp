@@ -23,12 +23,14 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
 #include <sys/stat.h>
+#include <unordered_map>
 #include <vector>
 #include <zstd.h>
 
@@ -276,6 +278,80 @@ static void run_skeleton(const Distinct& d, uint64_t base_z3, uint64_t front_z3,
     uint64_t col_int19 = skeldict19 + idz19 + tokdict19 + Z19(tid_col);
     uint64_t row_int19 = skeldict19 + idz19 + tokdict19 + Z19(tid_row);
 
+    // ---- CAUSAL CONTEXTUAL MODEL code-length simulation on the token-placement stream ----
+    // Exact code length a table-driven adaptive rANS/range coder realizes (within <1%), computed
+    // without building the coder yet. PPM-C: order-2 context (skeleton_id, slot_column) -> order-0
+    // global -> novel (token-id implicit = next first-appearance id, so novel costs escape only;
+    // the token TEXT is the separately-counted tok_dict). Processed in columnar order (all
+    // occurrences of a context are consecutive => decoder reproduces the order from the skel-id
+    // stream). No escape-exclusion, so these are a slight OVER-estimate (a real coder does better).
+    // Slot processing order == columnar tid_col order; contexts are runs of cnt[s] within each (s,j).
+    double bits_o0 = 0, bits_o2 = 0;   // order-0-only, order-2 PPM-C code lengths
+    {
+        std::unordered_map<uint32_t, uint32_t> g0; g0.reserve(num_tok * 2); uint64_t g0tot = 0;
+        std::unordered_map<uint32_t, uint32_t> g2; g2.reserve(num_tok * 2); uint64_t g2tot = 0;
+        std::unordered_map<uint32_t, uint32_t> cm; uint64_t cmtot = 0;
+        auto code_o0 = [&](uint32_t t) {                 // global order-0 with novel escape
+            uint32_t gd = uint32_t(g0.size()); auto it = g0.find(t);
+            if (it != g0.end()) bits_o0 += -std::log2(double(it->second) / double(g0tot + gd));
+            else if (gd > 0) bits_o0 += -std::log2(double(gd) / double(g0tot + gd));  // + novel(implicit id)=0
+            ++g0[t]; ++g0tot;
+        };
+        for (size_t s = 0; s < num_skel; ++s) {
+            uint32_t ns = skel_nslots[s];
+            for (uint32_t j = 0; j < ns; ++j) {
+                cm.clear(); cmtot = 0;
+                for (uint32_t idx = gstart[s]; idx < gstart[s + 1]; ++idx) {
+                    uint32_t t = slot_tok[line_slot_start[order[idx]] + j];
+                    code_o0(t);
+                    // order-2 -> order-0 backoff (PPM-C, full update)
+                    uint32_t cd = uint32_t(cm.size()); auto it = cm.find(t);
+                    if (it != cm.end()) bits_o2 += -std::log2(double(it->second) / double(cmtot + cd));
+                    else {
+                        if (cd > 0) bits_o2 += -std::log2(double(cd) / double(cmtot + cd));       // ctx escape
+                        uint32_t gd = uint32_t(g2.size()); auto git = g2.find(t);
+                        if (git != g2.end()) bits_o2 += -std::log2(double(git->second) / double(g2tot + gd));
+                        else if (gd > 0) bits_o2 += -std::log2(double(gd) / double(g2tot + gd));   // + novel=0
+                    }
+                    ++cm[t]; ++cmtot; ++g2[t]; ++g2tot;
+                }
+            }
+        }
+    }
+    uint64_t plc_o0 = uint64_t(bits_o0 / 8.0), plc_o2 = uint64_t(bits_o2 / 8.0);
+    uint64_t tid_col_z19 = Z19(tid_col), tid_row_z19 = Z19(tid_row);
+
+    // per-(skel,col) MTF-rank transform (contextual prediction) then z3/z19 (strong entropy backend).
+    // rank 0 == same token as the most-recent occurrence in this context (the ~47% prev-value hit).
+    // A rank == list-size means "not yet seen in this context" (escape): the rank alone can't say
+    // WHICH token, so we ALSO emit an escape-identity stream (globally-novel token -> implicit next
+    // id, 0 cost; already-seen token -> its global id). True MTF placement = ranks + escape ids.
+    std::vector<uint8_t> mtf_col, esc_ids;
+    { std::vector<uint32_t> lst; lst.reserve(256);
+      std::vector<uint8_t> gseen(num_tok, 0); std::vector<uint32_t> gid(num_tok, 0); uint32_t gnext = 0;
+      for (size_t s = 0; s < num_skel; ++s) { uint32_t ns = skel_nslots[s];
+        for (uint32_t j = 0; j < ns; ++j) { lst.clear();
+          for (uint32_t idx = gstart[s]; idx < gstart[s + 1]; ++idx) {
+            uint32_t t = slot_tok[line_slot_start[order[idx]] + j];
+            uint32_t r = 0; while (r < lst.size() && lst[r] != t) ++r;
+            bput_varint(mtf_col, r);                              // r == lst.size() marks an escape
+            if (r == lst.size()) {                               // escape: identify the token
+              if (gseen[t]) bput_varint(esc_ids, gid[t]);        // known token -> global id
+              else { gseen[t] = 1; gid[t] = gnext++; }           // globally novel -> implicit next id
+              lst.push_back(t);
+            }
+            for (uint32_t m = r; m > 0; --m) lst[m] = lst[m - 1]; // move-to-front
+            lst[0] = t;
+          } } }
+    }
+    uint64_t mtf_rank_z3 = zstd_size(cc, mtf_col.data(), mtf_col.size(), 3, z);
+    uint64_t esc_z3 = zstd_size(cc, esc_ids.data(), esc_ids.size(), 3, z);
+    uint64_t esc_z19 = Z19(esc_ids);
+    uint64_t mtf_col_z3 = mtf_rank_z3 + esc_z3;                   // full decodable MTF placement (z3)
+    uint64_t mtf_col_z19 = Z19(mtf_col) + esc_z19;               // full decodable MTF placement (z19)
+    uint64_t plc_best = std::min({tid_col_z19, tid_row_z19, plc_o2, mtf_col_z3, mtf_col_z19});
+    uint64_t dict_ctx = skeldict + idz + tokdict + plc_best;     // full dict with best placement coder
+
     uint64_t skel_raw_bytes = skel.blob.size(), slot_raw_bytes = 0, tok_raw_bytes = slottok.blob.size();
     for (size_t si = 0; si < num_slot; ++si) slot_raw_bytes += slot_glen[si];
 
@@ -294,6 +370,24 @@ static void run_skeleton(const Distinct& d, uint64_t base_z3, uint64_t front_z3,
            MB(row_raw), MB(row_int), double(base_z3) / double(row_raw), double(base_z3) / double(row_int));
     printf("    z19 ceiling: columnar interned=%.3f  row-wise interned=%.3f MiB  (%.3fx / %.3fx vs z3-plain; front-code+z19 was ~5.05 on DuckDB)\n",
            MB(col_int19), MB(row_int19), double(base_z3) / double(col_int19), double(base_z3) / double(row_int19));
+    printf("    --- CONTEXTUAL entropy coder on the token-PLACEMENT stream (which token fills each slot) ---\n");
+    printf("    placement floor:  columnar z3=%.3f z19=%.3f | row-wise z3=%.3f z19=%.3f MiB\n",
+           MB(tc), MB(tid_col_z19), MB(tr), MB(tid_row_z19));
+    printf("    contextual models: order0-only=%.3f  order2(skel,col)PPM-C=%.3f MiB\n", MB(plc_o0), MB(plc_o2));
+    printf("    MTF(skel,col) DECODABLE = ranks %.3f + escape-ids %.3f = %.3f (z3) / %.3f (z19) MiB\n",
+           MB(mtf_rank_z3), MB(esc_z3), MB(mtf_col_z3), MB(mtf_col_z19));
+    { uint64_t best_ctx = std::min({plc_o2, mtf_col_z3, mtf_col_z19});   // best CONTEXTUAL model
+      uint64_t best_z19 = std::min(tid_col_z19, tid_row_z19);            // best plain z19 (LZ+FSE)
+      printf("    BEST placement = %.3f MiB (%.3fx vs placement-z3 %.3f); best CONTEXTUAL model %.3f vs best plain-z19 %.3f -> contextual beats z19? %s\n",
+             MB(plc_best), double(tc) / double(plc_best), MB(tc), MB(best_ctx), MB(best_z19),
+             best_ctx < best_z19 ? "YES" : "NO (z19 LZ+FSE already near-optimal)"); }
+    printf("    FULL DICT with BEST placement = %.3f MiB (skel %.3f + id %.3f + tok %.3f + plc %.3f)  raw/comp %.1fx  (%.3fx vs z3-plain, %.3fx vs front-code)\n",
+           MB(dict_ctx), MB(skeldict), MB(idz), MB(tokdict), MB(plc_best), double(raw) / double(dict_ctx),
+           double(base_z3) / double(dict_ctx), double(front_z3) / double(dict_ctx));
+    printf("    400x budget = raw/400 = %.3f MiB   => %s (placement floor %.3f + vocab %.3f = %.3f MiB)\n",
+           double(raw) / 400.0 / (1024.0 * 1024.0),
+           double(dict_ctx) <= double(raw) / 400.0 ? "UNDER budget (400x cleared)" : "OVER budget (400x NOT cleared)",
+           MB(plc_best), MB(skeldict + idz + tokdict), MB(dict_ctx));
     printf("    baseline z3-plain=%.3f  front-code=%.3f MiB\n", MB(base_z3), MB(front_z3));
 }
 

@@ -158,3 +158,27 @@ corpus: OpenCV  (/tanksmall/scratch/ictmp/corpus5/manifest.txt)
     TOTAL row-wise   raw/int   = 8.948 / 7.267 MiB  (causal ref; 0.818x / 1.008x vs z3-plain)
     z19 ceiling: columnar interned=6.171  row-wise interned=5.866 MiB  (1.186x / 1.248x vs z3-plain; front-code+z19 was ~5.05 on DuckDB)
     baseline z3-plain=7.322  front-code=6.647 MiB
+
+================================================================================
+ CONTEXTUAL ENTROPY CODER on the token-PLACEMENT stream (owner route B) -- reproduce: --skeleton
+ The placement stream = which distinct slot-token (of ~136k) fills each of ~7.2M slots. Tested a
+ causal contextual model against the z19 floor. Models: PPM-C order-2 (skeleton_id,slot_column)
+ -> order-0 -> novel (exact code length); per-context MTF-rank + z3/z19 (with the escape-identity
+ stream that names novel-in-context tokens); vs plain z3/z19 on the columnar/row-wise id stream.
+
+ DuckDB placement (MiB):  plain z3 col=5.030 row=4.784 | z19 col=4.177 row=3.829 |
+   PPM-C(skel,col)=6.080 | MTF ranks 1.668 + escape-ids 2.892 = 4.560 z3 / 3.945 z19
+   => BEST placement = 3.829 (plain z19 row-wise). CONTEXTUAL MODELS DO NOT BEAT z19.
+ LLVM placement (MiB):    plain z19 col=3.619 row=3.314 | PPM-C=3.732 | MTF=3.787 z3 / 3.271 z19
+   => contextual (MTF+z19 3.271) only marginally < row z19 3.314; immaterial.
+
+ VERDICT: route B does NOT clear 400x on DuckDB. z19's LZ+FSE is already near the placement
+ entropy; (skeleton,column) conditioning adds ~nothing over it (the cheap MTF ranks are undone by
+ the escape-identity cost = which of 136k tokens is novel-in-context). FULL DuckDB dict with the
+ best placement = 6.074 MiB = 311.8x (z19, offline) / ~265x at z3 speed. 400x budget = 4.734 MiB;
+ placement floor 3.829 + irreducible vocab 2.244 (skeletons+slot-tokens+line->skeleton) = 6.074 > 4.734.
+ The ONLY remaining lever (local-oracle) = cross-project PRETRAINING of the VOCABULARY (skeletons +
+ slot tokens are generic C++; if covered by an out-of-band prior, vocab->~0 => DuckDB dict ~= placement
+ 3.829 + line-skel-id 0.786 ~= 4.6 MiB ~= 410x). Placement itself is corpus-specific and cannot be
+ pretrained away. NEXT: measure DuckDB vocab coverage by a prior trained on LLVM+RocksDB+OpenCV.
+================================================================================
