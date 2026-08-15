@@ -1,0 +1,34 @@
+=== 30 snapshot jobs, pool=5, 10:38:24 ===
+[corpus2.ii.tar.zst] 18896423 bytes
+[corpus12.ii.tar.zst] 11828443 bytes
+[corpus.ii.tar.zst] 21021921 bytes
+[corpus5.ii.tar.zst] 19766988 bytes
+[corpus9.ii.tar.zst] 2566645 bytes
+[corpus4.ii.tar.zst] 12199526 bytes
+[corpus3.ii.tar.zst] 15827099 bytes
+[corpus11.ii.tar.zst] 2036422 bytes
+[corpus16.ii.tar.zst] 1273133 bytes
+[corpus15.ii.tar.zst] 2284029 bytes
+[corpus10.ii.tar.zst] 1474409 bytes
+[corpus8.ii] present -- skip
+[corpus14.ii.tar.zst] 782097 bytes
+[corpus7.ii.tar.zst] 1025622 bytes
+[corpus13.ii.tar.zst] 594564 bytes
+[src-abseil-cpp.tar.zst] 2313899 bytes
+[src-fmt] present -- skip
+[src-spdlog.tar.zst] 290167 bytes
+[src-catch2.tar.zst] 790793 bytes
+[src-rocksdb.tar.zst] 15194283 bytes
+[src-range-v3.tar.zst] 590538 bytes
+[src-json.tar.zst] 8268214 bytes
+[src-re2.tar.zst] 396298 bytes
+[corpus6.ii.tar.zst] 92445182 bytes
+[src-leveldb.tar.zst] 1332488 bytes
+[src-cereal.tar.zst] 379887 bytes
+[src-eigen.tar.zst] 3256510 bytes
+[src-simdjson.tar.zst] 2891575 bytes
+[src-opencv.tar.zst] 117775006 bytes
+[src-godot.tar.zst] 400645958 bytes
+=== pool finished rc=0 10:39:18 ===
+SHA256SUMS + REHYDRATE.md written -- ALL SNAPSHOTS COMPLETE 10:39:22
+total 759532261 bytes (724.3 MiB)

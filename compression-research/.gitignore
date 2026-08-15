@@ -1,0 +1,4 @@
+snapshots/
+test-regen/
+*.tar.zst
+logs/

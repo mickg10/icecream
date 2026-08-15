@@ -1,0 +1,16 @@
+key	name	corpus	TUs	raw_MiB	cold_finalratio	cold_z19ldm	s0_amortized_40	tput_n1_gbs	own_source_frac
+LLVM	LLVM	corpus1	1238	3452.6	322.5	419.7	9910	1.30	NA
+RocksDB	RocksDB	corpus2	622	2970.0	283.6	340.7	9772	1.30	NA
+DuckDB	DuckDB	corpus3	689	1893.7	165.5	213.1	5778	1.27	NA
+abseil	abseil+protobuf	corpus4	700	2461.4	384.9	469.8	12110	1.55	NA
+OpenCV	OpenCV	corpus5	1506	4416.5	475.5	607.4	13137	1.23	NA
+fmt	fmt	corpus7	50	130.0	102.1	124.3	3706	0.80	NA
+spdlog	spdlog	corpus8	34	93.8	116.8	146.1	4225	0.81	NA
+Catch2	Catch2	corpus9	857	903.4	750.4	963.1	15548	1.46	NA
+nlohmann-json	nlohmann-json	corpus10	99	280.3	208.8	268.2	6469	1.27	NA
+range-v3	range-v3	corpus11	259	602.8	529.0	690.9	13525	1.33	NA
+Eigen	Eigen	corpus12	650	3368.6	2131.3	2798.5	41102	1.55	NA
+re2	re2	corpus13	72	105.1	148.3	183.0	4937	0.98	NA
+LevelDB	LevelDB	corpus14	72	137.2	148.1	180.9	4995	0.71	NA
+simdjson	simdjson	corpus15	153	446.7	267.3	343.8	8382	1.33	NA
+cereal	cereal	corpus16	84	311.8	397.6	509.8	13499	1.06	NA
