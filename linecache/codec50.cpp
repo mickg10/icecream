@@ -323,7 +323,6 @@ int main(int argc,char**argv){
     bool byteexact=true; uint64_t n_marker=0,n_literal=0;
     std::vector<uint8_t> allLineDefs, allRoots, allRegions, allBlocks, allPaths, allMiss;   // diagnostic: batched-z3 floor (cross-message headroom)
     std::vector<uint8_t> allRegionsRaw;   // diagnostic: region-defs as RAW line-ids (no per-region delta) -> preserves cross-region subsequence matches for z3-LDM
-    std::vector<uint8_t> wireblob, zt; std::vector<size_t> pkt_off; pkt_off.push_back(0); std::vector<uint32_t> pkt_raw;   // --socket: captured per-TU wire packets
 
     int npass = useS0 ? builds : (warm?2:1);   // --warm: prime then measure. --s0 --builds N: sum wire over N chronological builds (amortized).
     for(int pass=0; pass<npass; ++pass){
@@ -405,12 +404,6 @@ int main(int argc,char**argv){
         // --- ROOT: token stream (region + block ids) ---
         std::vector<uint8_t> rootb; for(size_t i=0;i<tn;++i) put_varint(rootb,tk[i]);
         w_root += useStream? stream_flush(cs_root,rootb.data(),rootb.size(),sob) : zstd_size(z,rootb.data(),rootb.size(),zlevel,dst); w_framing += FRAME; allRoots.insert(allRoots.end(),rootb.begin(),rootb.end());
-        if(useSocket){   // capture this TU's real wire packet [reg_raw][z paths][z lines][z regions][z blocks][z root] for the socketpair replay
-            auto azp=[&](const std::vector<uint8_t>& b){ size_t bound=ZSTD_compressBound(b.size()); if(zt.size()<bound) zt.resize(bound);
-                size_t zl=ZSTD_compress(zt.data(),zt.size(),b.empty()?(const uint8_t*)"":b.data(),b.size(),zlevel); if(ZSTD_isError(zl)){fprintf(stderr,"cap z %s\n",ZSTD_getErrorName(zl));exit(2);}
-                put_varint(wireblob,zl); wireblob.insert(wireblob.end(),zt.data(),zt.data()+zl); };
-            wireblob.push_back(reg_raw?1:0); azp(fill_paths); azp(fill_lines); azp(reg_raw?fill_regions_raw:fill_regions); azp(fill_blocks); azp(rootb);
-            pkt_off.push_back(wireblob.size()); pkt_raw.push_back(olen); }
 
         enc_s += std::chrono::duration<double>(Clock::now()-_te).count(); auto _td=Clock::now();
         // --- DECODER (F): install FILL from wire into F's OWN store, then expand ROOT tokens ---
@@ -461,9 +454,40 @@ int main(int argc,char**argv){
         // Each stream = a real F process (own store) decoding the captured wire off an AF_UNIX socket a
         // feeder thread streams into it; F reconstructs byte-exact + times per-TU decode latency. Aggregate
         // = N*raw/wall; per-stream(min) is the gated >=1 GB/s number; watch the aggregate for F saturation.
-        fprintf(stderr,"\n==== SOCKETPAIR THROUGHPUT — %s (in-proc byte-exact=%s, wire=%.1f MiB, %zu TUs, raw=%.1f MiB) ====\n",
-            manifest, byteexact?"OK":"FAIL", wireblob.size()/1048576.0, TUs, corpus.raw/1048576.0);
+        fprintf(stderr,"\n==== SOCKETPAIR THROUGHPUT (C-live end-to-end) — %s (in-proc byte-exact=%s, %zu TUs, raw=%.1f MiB) ====\n",
+            manifest, byteexact?"OK":"FAIL", TUs, corpus.raw/1048576.0);
         uint64_t total_raw=corpus.raw;
+        // Per-stream LIVE encoder: its OWN known-sets (independent C, like a real per-job client) over the
+        // shared read-only interner. encode_tu builds TU t's real wire packet [reg_raw][z fp][z fl][z reg]
+        // [z fb][z rt] -- identical serializer as the in-process pass, adaptive region + D1 + block-COPY.
+        struct CState { std::vector<uint8_t> fknownLine,fknownReg,fknownBlk,inmiss,inmissB; std::unordered_map<std::string,uint32_t> pathid; std::vector<std::string> paths;
+            std::vector<uint32_t> missReg,missBlk; std::vector<uint8_t> fp,fl,frd,frr,fb,rt,zt,pkt;
+            void init(uint32_t nl,uint32_t nr,uint32_t nb){ fknownLine.assign(nl,0); fknownReg.assign(nr,0); fknownBlk.assign(nb,0); inmiss.assign(nr,0); inmissB.assign(nb,0); } };
+        auto encode_tu=[&](CState& C,size_t t){
+            const uint32_t* tk=&tokstream[tokoff[t]]; size_t tn=tokoff[t+1]-tokoff[t];
+            C.fp.clear(); C.fl.clear(); C.frd.clear(); C.frr.clear(); C.fb.clear(); C.rt.clear();
+            std::vector<uint32_t>& missReg=C.missReg; std::vector<uint32_t>& missBlk=C.missBlk; missReg.clear(); missBlk.clear();
+            auto addRegion=[&](uint32_t r){ if(C.fknownReg[r]||C.inmiss[r])return; C.inmiss[r]=1; missReg.push_back(r); };   // O(1) stamp dedup (was O(n^2) scan)
+            for(size_t i=0;i<tn;++i){ uint32_t tok=tk[i]; if(tok<NREG) addRegion(tok); else { uint32_t k=tok-NREG; if(!C.fknownBlk[k]&&!C.inmissB[k]){ C.inmissB[k]=1; for(size_t j=boff2[k];j<boff2[k+1];++j) addRegion(bchild[j]); missBlk.push_back(k); } } }
+            Marker mk;
+            for(uint32_t r:missReg){ const uint32_t* lids=dict.region_ids_ptr(r); uint32_t c=dict.region_ids_count(r);
+                for(uint32_t j=0;j<c;++j){ uint32_t ln=lids[j]; if(C.fknownLine[ln]) continue; C.fknownLine[ln]=1;
+                    const LineRef& lr=dict.ref(ln); const char* txt=dict.line_data(lr.off);
+                    if(useD1 && parse_marker(txt,lr.len,mk)){ uint32_t pid; auto it=C.pathid.find(mk.path); if(it==C.pathid.end()){ pid=(uint32_t)C.paths.size(); C.pathid.emplace(mk.path,pid); C.paths.push_back(mk.path); put_varint(C.fp,mk.path.size()); C.fp.insert(C.fp.end(),mk.path.begin(),mk.path.end()); } else pid=it->second;
+                        C.fl.push_back(1); put_varint(C.fl,pid); put_varint(C.fl,mk.lineno); C.fl.push_back((uint8_t)mk.flags.size()); for(uint8_t f:mk.flags) C.fl.push_back(f); }
+                    else { C.fl.push_back(0); put_varint(C.fl,lr.len); C.fl.insert(C.fl.end(),txt,txt+lr.len); } }
+                put_varint(C.frd,c); { int64_t prev=0; for(uint32_t j=0;j<c;++j){ put_zigzag(C.frd,int64_t(lids[j])-prev); prev=int64_t(lids[j]); } }
+                put_varint(C.frr,c); for(uint32_t j=0;j<c;++j) put_varint(C.frr,lids[j]);
+                C.fknownReg[r]=1; }
+            for(uint32_t k:missBlk){ size_t L=boff2[k+1]-boff2[k]; if(bcopy_ok[k]){ C.fb.push_back(1); put_varint(C.fb,bcopy_src[k]); put_varint(C.fb,L); } else { C.fb.push_back(0); put_varint(C.fb,L); for(size_t j=boff2[k];j<boff2[k+1];++j) put_varint(C.fb,bchild[j]); } C.fknownBlk[k]=1; }
+            for(size_t i=0;i<tn;++i) put_varint(C.rt,tk[i]);
+            auto z3len=[&](const std::vector<uint8_t>& b)->size_t{ size_t bd=ZSTD_compressBound(b.size()); if(C.zt.size()<bd)C.zt.resize(bd); size_t zl=ZSTD_compress(C.zt.data(),C.zt.size(),b.empty()?(const uint8_t*)"":b.data(),b.size(),zlevel); return zl; };
+            bool reg_raw = z3len(C.frr) < z3len(C.frd);
+            C.pkt.clear(); C.pkt.push_back(reg_raw?1:0);
+            auto azp=[&](const std::vector<uint8_t>& b){ size_t bd=ZSTD_compressBound(b.size()); if(C.zt.size()<bd)C.zt.resize(bd); size_t zl=ZSTD_compress(C.zt.data(),C.zt.size(),b.empty()?(const uint8_t*)"":b.data(),b.size(),zlevel); put_varint(C.pkt,zl); C.pkt.insert(C.pkt.end(),C.zt.data(),C.zt.data()+zl); };
+            azp(C.fp); azp(C.fl); azp(reg_raw?C.frr:C.frd); azp(C.fb); azp(C.rt);
+        };
+        uint32_t nblk=(uint32_t)(useS1?boff2.size():1);
         for(int N : std::vector<int>{1,4,8,16,24}){
             double* shm=(double*)mmap(nullptr,sizeof(double)*8*N,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);
             std::vector<int> pfd(N); std::vector<pid_t> kids(N);
@@ -479,21 +503,21 @@ int main(int argc,char**argv){
                         if(recon.size()!=ol || memcmp(recon.data(),orig,ol)!=0) ok=false;
                         lat.push_back(std::chrono::duration<double,std::micro>(Clock::now()-q0).count()); }
                     double dsec=std::chrono::duration<double>(Clock::now()-c0).count(); std::sort(lat.begin(),lat.end());
-                    struct rusage ru{}; getrusage(RUSAGE_SELF,&ru);
-                    shm[i*8+0]=dsec; shm[i*8+1]=lat.empty()?0:lat[lat.size()/2]; shm[i*8+2]=lat.empty()?0:lat[(size_t)(lat.size()*0.95)]; shm[i*8+3]=lat.empty()?0:lat[(size_t)(lat.size()*0.99)]; shm[i*8+4]=ok?1:0; shm[i*8+5]=(double)ru.ru_maxrss; shm[i*8+6]=(double)lat.size();
+                    double own=(double)F.line_data.size()+F.reg_child.size()*4.0+F.reg_off.size()*8.0+F.blk_child.size()*4.0+F.blk_off.size()*8.0+F.line_off.size()*8.0+F.reg_stream.size()*4.0; for(auto&s:F.paths) own+=s.size();
+                    shm[i*8+0]=dsec; shm[i*8+1]=lat.empty()?0:lat[lat.size()/2]; shm[i*8+2]=lat.empty()?0:lat[(size_t)(lat.size()*0.95)]; shm[i*8+3]=lat.empty()?0:lat[(size_t)(lat.size()*0.99)]; shm[i*8+4]=ok?1:0; shm[i*8+5]=own; shm[i*8+6]=(double)lat.size();
                     ZSTD_freeDCtx(d); close(sv[1]); _exit(0); }
                 close(sv[1]); pfd[i]=sv[0]; kids[i]=pid; }
-            auto t0s=Clock::now(); std::vector<std::thread> feeders;
-            for(int i=0;i<N;++i){ int fd=pfd[i]; feeders.emplace_back([fd,&wireblob,&pkt_off,TUs]{
-                for(size_t t=0;t<TUs;++t){ uint32_t plen=(uint32_t)(pkt_off[t+1]-pkt_off[t]); if(!sock_wall(fd,&plen,4))break; if(!sock_wall(fd,wireblob.data()+pkt_off[t],plen))break; } close(fd); }); }
-            for(auto& th:feeders) th.join();
+            auto t0s=Clock::now(); std::vector<std::thread> encoders;
+            for(int i=0;i<N;++i){ int fd=pfd[i]; encoders.emplace_back([&,fd]{ CState C; C.init(dict.distinct()+1,NREG,nblk);
+                for(size_t t=0;t<TUs;++t){ encode_tu(C,t); uint32_t plen=(uint32_t)C.pkt.size(); if(!sock_wall(fd,&plen,4))break; if(!sock_wall(fd,C.pkt.data(),plen))break; } close(fd); }); }
+            for(auto& th:encoders) th.join();
             for(int i=0;i<N;++i){ int st; waitpid(kids[i],&st,0); }
             double wall=std::chrono::duration<double>(Clock::now()-t0s).count();
-            bool allok=true; double maxrss=0,minstream=1e18,p50=0,p95=0,p99=0;
-            for(int i=0;i<N;++i){ if(shm[i*8+4]<0.5)allok=false; double sps=total_raw/1e9/shm[i*8+0]; if(sps<minstream)minstream=sps; if(shm[i*8+5]>maxrss)maxrss=shm[i*8+5]; p50+=shm[i*8+1]; p95+=shm[i*8+2]; p99+=shm[i*8+3]; }
+            bool allok=true; double maxown=0,minstream=1e18,p50=0,p95=0,p99=0;
+            for(int i=0;i<N;++i){ if(shm[i*8+4]<0.5)allok=false; double sps=total_raw/1e9/shm[i*8+0]; if(sps<minstream)minstream=sps; if(shm[i*8+5]>maxown)maxown=shm[i*8+5]; p50+=shm[i*8+1]; p95+=shm[i*8+2]; p99+=shm[i*8+3]; }
             double agg=(double)total_raw*N/1e9/wall;
-            fprintf(stderr,"N=%2d  byte-exact=%s  per-stream(min)=%.2f GB/s  AGGREGATE=%.2f GB/s  lat us p50/95/99=%.1f/%.1f/%.1f  peakRSS/F=%.0f MiB  wall=%.2fs\n",
-                N, allok?"OK":"FAIL", minstream, agg, p50/N, p95/N, p99/N, maxrss/1024.0, wall);
+            fprintf(stderr,"N=%2d  byte-exact=%s  per-stream(min)=%.2f GB/s  AGGREGATE=%.2f GB/s  lat us p50/95/99=%.1f/%.1f/%.1f  F-own-store=%.0f MiB  wall=%.2fs\n",
+                N, allok?"OK":"FAIL", minstream, agg, p50/N, p95/N, p99/N, maxown/1048576.0, wall);
             munmap(shm,sizeof(double)*8*N);
         }
         return byteexact?0:1;
