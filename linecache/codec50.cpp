@@ -133,6 +133,15 @@ static inline void put_zigzag(std::vector<uint8_t>&o,int64_t v){ put_varint(o,(u
 static inline int64_t get_zigzag(const uint8_t*&p){ uint64_t u=get_varint(p); return int64_t(u>>1)^-int64_t(u&1); }
 static size_t zstd_size(ZSTD_CCtx*c,const uint8_t*data,size_t n,int level,std::vector<uint8_t>&dst){ ZSTD_CCtx_reset(c,ZSTD_reset_session_and_parameters); ZSTD_CCtx_setParameter(c,ZSTD_c_compressionLevel,level);
     size_t bound=ZSTD_compressBound(n); if(dst.size()<bound)dst.resize(bound); size_t r=ZSTD_compress2(c,dst.data(),dst.size(),data?data:(const uint8_t*)"",n); if(ZSTD_isError(r)){fprintf(stderr,"zstd %s\n",ZSTD_getErrorName(r));exit(2);} return r; }
+// Persistent shared-window streaming: feed one message into a retained stream + flush; returns the
+// flushed output bytes (captures cross-message redundancy a per-message reset can't). Accounting only
+// -- in-process F reads the raw buffer, so reconstruction stays byte-exact regardless.
+static size_t stream_flush(ZSTD_CStream*cs,const uint8_t*data,size_t n,std::vector<uint8_t>&ob){
+    if(ob.size()<ZSTD_CStreamOutSize()) ob.resize(ZSTD_CStreamOutSize());
+    ZSTD_inBuffer in{data,n,0}; size_t total=0;
+    while(in.pos<in.size){ ZSTD_outBuffer o{ob.data(),ob.size(),0}; size_t r=ZSTD_compressStream2(cs,&o,&in,ZSTD_e_continue); if(ZSTD_isError(r)){fprintf(stderr,"zstream %s\n",ZSTD_getErrorName(r));exit(2);} total+=o.pos; }
+    for(;;){ ZSTD_outBuffer o{ob.data(),ob.size(),0}; size_t rem=ZSTD_compressStream2(cs,&o,&in,ZSTD_e_flush); if(ZSTD_isError(rem)){fprintf(stderr,"zstream %s\n",ZSTD_getErrorName(rem));exit(2);} total+=o.pos; if(rem==0) break; }
+    return total; }
 
 // ---- D1: preprocessor marker factoring. Parse "# <n> \"<path>\"<flags>\n" -> (path,n,flags), and
 // reconstruct EXACT bytes; fall back to literal if reconstruction != original. ----
@@ -178,7 +187,7 @@ struct RelLZ {
 };
 
 int main(int argc,char**argv){
-    const char* manifest=nullptr; size_t max_files=SIZE_MAX; int zlevel=3; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, useS0=false; int builds=1;
+    const char* manifest=nullptr; size_t max_files=SIZE_MAX; int zlevel=3; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, useS0=false, useStream=false; int builds=1;
     for(int i=1;i<argc;++i){ if(!strcmp(argv[i],"--manifest")&&i+1<argc)manifest=argv[++i];
         else if(!strcmp(argv[i],"--z")&&i+1<argc)zlevel=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--no-d1"))useD1=false;
@@ -187,6 +196,7 @@ int main(int argc,char**argv){
         else if(!strcmp(argv[i],"--d2helper"))useD2=true;    // helper's definition_codec (needs -DWITH_D2)
         else if(!strcmp(argv[i],"--deep"))deep=true;         // run slow z19/z22 entropy ladder + reorder test
         else if(!strcmp(argv[i],"--warm"))warm=true;         // Basis C: 2nd pass with dict retained -> warm steady-state wire
+        else if(!strcmp(argv[i],"--stream"))useStream=true;  // shared-window streaming accounting (persistent zstd window across messages)
         else if(!strcmp(argv[i],"--s0"))useS0=true;          // S0 semantic-Root memoization (ROOT_REF on exact-Root reuse)
         else if(!strcmp(argv[i],"--builds")&&i+1<argc)builds=atoi(argv[++i]);  // amortize S0 over N chronological builds
         else if(!strcmp(argv[i],"--max-files")&&i+1<argc){ char*t=nullptr; unsigned long long v=strtoull(argv[++i],&t,10); if(!t||*t||!v){fprintf(stderr,"bad max-files\n");return 2;} max_files=size_t(v); }
@@ -236,6 +246,7 @@ int main(int argc,char**argv){
     // C tracks F's known sets (single F) so it computes exactly the missing closure. Every wire byte is
     // charged by category, compressed at z<=zlevel per message. F reconstructs .ii bytes byte-exact.
     ZSTD_CCtx* z=ZSTD_createCCtx(); std::vector<uint8_t> dst;
+    ZSTD_CStream *cs_line=ZSTD_createCStream(), *cs_reg=ZSTD_createCStream(), *cs_root=ZSTD_createCStream(); std::vector<uint8_t> sob;   // shared-window streams (line/region/root)
     std::vector<uint8_t> fknownLine(dict.distinct()+1,0), fknownReg(NREG,0);
     std::unordered_map<std::string,uint32_t> pathid; std::vector<std::string> paths;   // D1 path objects (both sides derive same order)
     // ---- F's OWN independent store, built ONLY from decoded wire bytes (proves self-describing) ----
@@ -251,7 +262,7 @@ int main(int argc,char**argv){
     double w_root=0, w_linedef=0, w_regiondef=0, w_pathdef=0, w_missing=0, w_framing=0, w_rootref=0;
     // S0 semantic-Root memoization: root_key (hash of the TU's RegionKey sequence) -> global TU seq at
     // first publish (strict online). ROOT_REF on an exact-Root reuse = 32 C->F + 24 F->C ACK = 56 B.
-    std::unordered_map<uint64_t,uint32_t> rootmemo; std::unordered_map<uint64_t,std::vector<uint32_t>> Froot; uint32_t gtu=0; uint64_t n_rootref=0;
+    std::unordered_map<uint64_t,std::pair<uint32_t,uint64_t>> rootmemo; std::unordered_map<uint64_t,std::vector<uint32_t>> Froot; uint32_t gtu=0; uint64_t n_rootref=0;
     const double FRAME=4;   // 4-byte length prefix per framed message
     uint64_t cum_raw=0; double cum_wire=0;
     // f-checkpoints + H200 trailing window
@@ -274,6 +285,7 @@ int main(int argc,char**argv){
         w_root=w_linedef=w_regiondef=w_pathdef=w_blockdef=w_missing=w_framing=0; cum_raw=0; cum_wire=0; n_marker=n_literal=0; byteexact=true;
         ck.clear(); ckidx=0; allLineDefs.clear(); allRoots.clear(); allRegions.clear(); allRegionsRaw.clear(); allBlocks.clear(); allPaths.clear(); allMiss.clear();
       }
+      if(useStream){ for(ZSTD_CStream*cs:{cs_line,cs_reg,cs_root}){ ZSTD_CCtx_reset(cs,ZSTD_reset_session_and_parameters); ZSTD_CCtx_setParameter(cs,ZSTD_c_compressionLevel,zlevel); } }
       auto tpass=Clock::now(); double enc_s=0, dec_s=0;   // split C-encode vs F-decode wall (2-proc per-stream proxy)
       for(size_t t=0; t<TUs; ++t){
         auto _te=Clock::now();
@@ -282,8 +294,9 @@ int main(int argc,char**argv){
         // --- S0: semantic Root = the TU's RegionKey sequence (allreg[roff[t]..roff[t+1])). ---
         uint64_t rk=0;
         if(useS0){ rk=1469598103934665603ULL; for(size_t i=roff[t];i<roff[t+1];++i){ rk^=allreg[i]; rk*=1099511628211ULL; }
+            uint64_t cov=1469598103934665603ULL; for(size_t i=0;i<tn;++i){ cov^=tk[i]; cov*=1099511628211ULL; }   // covering fingerprint (my S1 matchfinder is position-dependent -> verify the block covering matches, else publish)
             auto it=rootmemo.find(rk);
-            if(it!=rootmemo.end() && it->second<gtu){   // strict-online EXACT-Root reuse -> ROOT_REF, no defs/root
+            if(it!=rootmemo.end() && it->second.first<gtu && it->second.second==cov){   // strict-online EXACT-Root reuse (same semantic seq AND same covering) -> ROOT_REF, no defs/root
                 w_rootref += 56;   // 32 C->F {txid,raw_len,root_key} + 24 F->C ACK {txid,digest}
                 ++n_rootref;
                 recon.clear(); const std::vector<uint32_t>& seq=Froot[rk];
@@ -297,7 +310,7 @@ int main(int argc,char**argv){
                 while(ckidx<ck_f.size() && double(cum_raw)>=ck_f[ckidx]*(double)corpus.raw*npass){ ck.push_back({ck_f[ckidx],double(cum_raw)/cum_wire}); ++ckidx; }
                 ++gtu; continue;
             }
-            rootmemo[rk]=gtu;   // publish this Root now (register before F installs its closure)
+            if(it==rootmemo.end()) rootmemo[rk]={gtu,cov};   // register on first publish; a same-seq/diff-covering TU publishes without overwriting
         }
         // --- collect NEW regions (incl. new blocks' child regions) + NEW blocks, topological order ---
         std::vector<uint32_t> missReg, missBlk;
@@ -333,17 +346,19 @@ int main(int argc,char**argv){
             else { fill_blocks.push_back(0); put_varint(fill_blocks,L); for(size_t j=boff2[k];j<boff2[k+1];++j) put_varint(fill_blocks,bchild[j]); }
             fknownBlk[k]=1; ++nb; }
         if(np){ w_pathdef += zstd_size(z,fill_paths.data(),fill_paths.size(),zlevel,dst); allPaths.insert(allPaths.end(),fill_paths.begin(),fill_paths.end()); }
-        if(nl){ w_linedef += zstd_size(z,fill_lines.data(),fill_lines.size(),zlevel,dst); allLineDefs.insert(allLineDefs.end(),fill_lines.begin(),fill_lines.end()); }
+        if(nl){ w_linedef += useStream? stream_flush(cs_line,fill_lines.data(),fill_lines.size(),sob) : zstd_size(z,fill_lines.data(),fill_lines.size(),zlevel,dst); allLineDefs.insert(allLineDefs.end(),fill_lines.begin(),fill_lines.end()); }
         bool reg_raw=false;
         if(nr){ double dz=zstd_size(z,fill_regions.data(),fill_regions.size(),zlevel,dst);
                 double rz=zstd_size(z,fill_regions_raw.data(),fill_regions_raw.size(),zlevel,dst);
-                reg_raw = rz<dz; w_regiondef += (reg_raw?rz:dz) + 1;   // +1 byte serialization flag (delta vs raw line-ids)
+                reg_raw = rz<dz;
+                if(useStream){ std::vector<uint8_t>& chosen = reg_raw?fill_regions_raw:fill_regions; w_regiondef += stream_flush(cs_reg,chosen.data(),chosen.size(),sob) + 1; }
+                else w_regiondef += (reg_raw?rz:dz) + 1;   // +1 byte serialization flag (delta vs raw line-ids)
                 allRegions.insert(allRegions.end(),fill_regions.begin(),fill_regions.end()); }
         if(nb){ w_blockdef += zstd_size(z,fill_blocks.data(),fill_blocks.size(),zlevel,dst); allBlocks.insert(allBlocks.end(),fill_blocks.begin(),fill_blocks.end()); }
         if(np||nl||nr||nb) w_framing += FRAME;
         // --- ROOT: token stream (region + block ids) ---
         std::vector<uint8_t> rootb; for(size_t i=0;i<tn;++i) put_varint(rootb,tk[i]);
-        w_root += zstd_size(z,rootb.data(),rootb.size(),zlevel,dst); w_framing += FRAME; allRoots.insert(allRoots.end(),rootb.begin(),rootb.end());
+        w_root += useStream? stream_flush(cs_root,rootb.data(),rootb.size(),sob) : zstd_size(z,rootb.data(),rootb.size(),zlevel,dst); w_framing += FRAME; allRoots.insert(allRoots.end(),rootb.begin(),rootb.end());
 
         enc_s += std::chrono::duration<double>(Clock::now()-_te).count(); auto _td=Clock::now();
         // --- DECODER (F): install FILL from wire into F's OWN store, then expand ROOT tokens ---
@@ -387,7 +402,7 @@ int main(int argc,char**argv){
               corpus.raw/1e9/enc_s, corpus.raw/1e9/dec_s, corpus.raw/1e9/std::max(enc_s,dec_s));
     }
     while(ck.size()<ck_f.size()) ck.push_back({ck_f[ck.size()], double(cum_raw)/cum_wire});
-    ZSTD_freeCCtx(z);
+    ZSTD_freeCCtx(z); ZSTD_freeCStream(cs_line); ZSTD_freeCStream(cs_reg); ZSTD_freeCStream(cs_root);
 
     double totalwire = w_root+w_linedef+w_regiondef+w_pathdef+w_blockdef+w_missing+w_framing+w_rootref;
     double MiB=1048576.0;
