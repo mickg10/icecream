@@ -100,33 +100,32 @@ reading a size delta as a content change.
 | `regenerate_corpuses.sh` | rebuild corpora from bare clones |
 | `recipes/<corpus>.sh` | per-corpus clone URL / pin / configure flags / expected TU |
 | `preprocess_corpus.py` | the `-E` replay driver (copy of `build2/preprocess_corpus.py`) |
-| `snapshot_corpuses.sh` | build `snapshots/corpusN.tar.zst` + `SHA256SUMS` |
+| `snapshot_corpuses.sh` + `snap_one.sh` | build the transfer archives in `corpus-snapshots/` |
+| `REHYDRATE.md` | how to move those archives to another box and unpack them |
 | `lib_corpora.sh` | shared corpus -> project / source-checkout / description tables |
 | `collect_cheap.sh` | counts, logical bytes, LOC; writes the file lists |
-| `collect_zstd.sh` | the expensive z19 / z19+LDM pass |
-| `build_metadata.py` | folds both into `METADATA.json` + the TSV + the MD |
-| `lists/` | the exact `.ii` and source file lists each measurement used |
-| `cheap/`, `comp/` | intermediate per-corpus counts and compressed sizes (resume points) |
-| `logs/` | configure / build / preprocess / metrics logs |
-| `snapshots/` | `corpusN.tar.zst` + `SHA256SUMS` |
-| `test-regen/test.log` | transcript of the tested regenerate run (fmt) |
+| `collect_zstd.sh` + `z19_one.sh` | the z19-long measurement pass (pooled, 1 thread/job) |
+| `build_metadata.py` | folds both into `METADATA.json`, the catalog, the TSV and the MD |
 
-`comp/` doubles as the resume state for `collect_zstd.sh`: one file per measurement,
+Working directories (not tracked): `lists/` the exact file lists each measurement used,
+`cheap/` and `comp2/` the per-measurement results, `joblogs/` and `logs/` the pass logs,
+`out/` the generated tables, `test-regen/test.log` the regenerate-test transcript.
+
+`comp2/` doubles as the resume state for `collect_zstd.sh`: one file per measurement,
 written only when the whole pipeline exited 0. Delete a file to recompute just that
-number; delete the directory to redo the 25-minute pass.
+number; delete the directory to redo the pass.
 
 ## Running it
 
 ```bash
-# rebuild the metrics (cheap pass ~90 s, zstd pass ~25 min over ~27 GiB)
-./collect_cheap.sh && ./collect_zstd.sh && python3 build_metadata.py
+# rebuild the metrics (cheap pass ~90 s; z19-long pass, 32 pooled 1-thread jobs)
+./collect_cheap.sh && ./collect_zstd.sh -P 6 && python3 build_metadata.py
 
-# snapshots
-./snapshot_corpuses.sh              # all; skips ones already built
-./snapshot_corpuses.sh corpus7      # just one
+# transfer archives -> /tanksmall/scratch/ictmp/corpus-snapshots/ (~1 min, pool of 5)
+./snapshot_corpuses.sh -P 5
 
-# unpacking a snapshot -- --long=31 is REQUIRED, see below
-zstd -dc --long=31 snapshots/corpus7.tar.zst | tar -x -C /somewhere
+# unpacking one (no --long needed at the z3 settings; see REHYDRATE.md)
+zstd -dc /tanksmall/scratch/ictmp/corpus-snapshots/corpus7.ii.tar.zst | tar -x -C /somewhere
 
 # regenerate corpora from scratch (clones into ./sources, corpora into ./corpora)
 ./regenerate_corpuses.sh                     # all 16
@@ -151,26 +150,23 @@ full Godot build first; corpus needs a full LLVM configure plus the 720 s harves
 build. Requirements: git, cmake + ninja, GCC, python3, and `scons` on PATH for
 corpus6 only.
 
-## Unpacking a snapshot: `--long=31` is not optional
+## Two different uses of zstd here — don't confuse them
 
-The archives are compressed with a 2 GiB window, and zstd refuses windows above
-128 MB at *decompression* time unless you ask for them. A plain `zstd -d` fails:
+| | codec | why | output |
+|---|---|---|---|
+| **measurement** | `zstd -19 --long=31`, 1 thread | the entropy number for the metrics table; the 2 GiB window is zstd's max so the whole corpus is (almost) in reach | nothing — piped straight to `wc -c` |
+| **transfer archives** | `zstd -3 --long=27 -T0` | these get rsync'd to a bakeoff box; speed matters, ratio does not | `corpus-snapshots/*.tar.zst` |
 
-```
-Decoding error (36) : Frame requires too much memory for decoding
-Window size larger than maximum : 2147483648 > 134217728
-Use --long=31 or --memory=2048MB
-```
+The measurement is never stored and the archives are never used as a measurement.
 
-So always:
+One practical consequence of the different windows: `--long=27` is a 128 MiB window,
+exactly zstd's default *decode* limit, so the transfer archives unpack with a plain
+`zstd -d`. Anything at `--long=31` does not — it needs `zstd -d --long=31` or it fails
+with *"Frame requires too much memory for decoding"*. See `REHYDRATE.md`.
 
-```bash
-zstd -dc --long=31 snapshots/corpusN.tar.zst | tar -x -C <dest>
-```
-
-The window is where nearly all the compression comes from (up to 10.8x over the
-default 8 MB window on these corpora), so it is worth the flag — but anything that
-consumes these archives has to pass it, including any tooling you point at them.
+Archives are written to `NAME.tar.zst.tmp` and `mv`d into place, so a concurrent rsync
+can ship each one the moment it appears without ever seeing a partial file.
+`SHA256SUMS` and `REHYDRATE.md` are written last and mean "all archives complete".
 
 ## Known non-reproducibilities
 

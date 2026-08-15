@@ -1,0 +1,488 @@
+{
+  "generated_utc": "2026-08-15T14:58:55Z",
+  "zstd_version": "zstd v1.5.7",
+  "window_note": "z19long = zstd -19 --long=31, single-threaded (2 GiB LDM window -- zstd's maximum)",
+  "measurement": "compressed sizes are `cat <file set> | zstd -19 --long=31 | wc -c` -- pure concatenated content, no tar framing, nothing stored",
+  "source_file_extensions": [
+    "c",
+    "cc",
+    "cpp",
+    "cxx",
+    "c++",
+    "C",
+    "h",
+    "hh",
+    "hpp",
+    "hxx",
+    "h++",
+    "tcc",
+    "inl",
+    "inc",
+    "ipp",
+    "ixx"
+  ],
+  "source_exclusions": [
+    "/.git/",
+    "/build/",
+    "/CMakeFiles/",
+    "*.ii"
+  ],
+  "toolchain": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
+  "corpora": [
+    {
+      "corpus_id": "corpus",
+      "project": "LLVM",
+      "description": "LLVM compiler infrastructure (llvm/ only, X86 target, Release)",
+      "source_checkouts": [
+        "/tanksmall/scratch/ictmp/corpus/llvm-project"
+      ],
+      "git_url": "https://github.com/llvm/llvm-project.git",
+      "git_commit": "2cce9ec58",
+      "TU": 1238,
+      "loc_src": 17233314,
+      "bytes_src": 783835954,
+      "nfiles_src": 71983,
+      "loc_ii": 137913644,
+      "bytes_ii": 3620271340,
+      "z19long_src": 74103335,
+      "z19long_ii": 7608807,
+      "window_limited": true,
+      "zstd_version": "zstd v1.5.7",
+      "window_note": "z19long = zstd -19 --long=31, single-threaded (2 GiB LDM window -- zstd's maximum)",
+      "build_recipe": "cmake -S llvm-project/llvm -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLVM_TARGETS_TO_BUILD=X86 -DLLVM_ENABLE_PROJECTS='' -DCMAKE_CXX_FLAGS=-save-temps=obj; bounded ninja build harvests *.ii next to each object",
+      "generated_utc": "2026-08-15T14:58:55Z",
+      "source_subset_llvm_only": {
+        "note": "llvm/ subtree only -- the part that was actually preprocessed",
+        "nfiles_src": 8127,
+        "bytes_src": 159248971,
+        "z19long_src": 23389162
+      },
+      "transfer_snapshot": {
+        "file": "corpus.ii.tar.zst",
+        "bytes": 21021921,
+        "codec": "zstd -3 --long=27 -T0 (transfer archive, not a measurement)"
+      }
+    },
+    {
+      "corpus_id": "corpus2",
+      "project": "RocksDB",
+      "description": "RocksDB embedded persistent key-value store (lib + tests, Debug)",
+      "source_checkouts": [
+        "/tanksmall/scratch/ictmp/build2/rocksdb"
+      ],
+      "git_url": "https://github.com/facebook/rocksdb.git",
+      "git_commit": "2dc6bc5",
+      "TU": 622,
+      "loc_src": 879340,
+      "bytes_src": 32809668,
+      "nfiles_src": 1420,
+      "loc_ii": 110485751,
+      "bytes_ii": 3114320596,
+      "z19long_src": 4159458,
+      "z19long_ii": 6337047,
+      "window_limited": true,
+      "zstd_version": "zstd v1.5.7",
+      "window_note": "z19long = zstd -19 --long=31, single-threaded (2 GiB LDM window -- zstd's maximum)",
+      "build_recipe": "cmake -DCMAKE_BUILD_TYPE=Debug -DWITH_TESTS=ON (tests need Debug) -DCMAKE_EXPORT_COMPILE_COMMANDS=ON; preprocess_corpus.py replays every compile_commands.json entry through -E",
+      "generated_utc": "2026-08-15T14:58:55Z",
+      "transfer_snapshot": {
+        "file": "corpus2.ii.tar.zst",
+        "bytes": 18896423,
+        "codec": "zstd -3 --long=27 -T0 (transfer archive, not a measurement)"
+      }
+    },
+    {
+      "corpus_id": "corpus3",
+      "project": "DuckDB",
+      "description": "DuckDB in-process analytical SQL database (in-tree extensions only)",
+      "source_checkouts": [
+        "/tanksmall/scratch/ictmp/build2/duckdb"
+      ],
+      "git_url": "https://github.com/duckdb/duckdb.git",
+      "git_commit": "43ecd7f",
+      "TU": 689,
+      "loc_src": 1253161,
+      "bytes_src": 63983867,
+      "nfiles_src": 4434,
+      "loc_ii": 69094918,
+      "bytes_ii": 1985715205,
+      "z19long_src": 7269271,
+      "z19long_ii": 7167012,
+      "window_limited": false,
+      "zstd_version": "zstd v1.5.7",
+      "window_note": "z19long = zstd -19 --long=31, single-threaded (2 GiB LDM window -- zstd's maximum)",
+      "build_recipe": "cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_UNITTESTS=ON -DCMAKE_EXPORT_COMPILE_COMMANDS=ON (in-tree extensions only); preprocess_corpus.py -E replay",
+      "generated_utc": "2026-08-15T14:58:55Z",
+      "transfer_snapshot": {
+        "file": "corpus3.ii.tar.zst",
+        "bytes": 15827099,
+        "codec": "zstd -3 --long=27 -T0 (transfer archive, not a measurement)"
+      }
+    },
+    {
+      "corpus_id": "corpus4",
+      "project": "abseil+protobuf",
+      "description": "Abseil C++ common libraries plus protobuf runtime/compiler sources",
+      "source_checkouts": [
+        "/tanksmall/scratch/ictmp/build2/abseil-cpp",
+        "/tanksmall/scratch/ictmp/build2/protobuf"
+      ],
+      "git_url": "https://github.com/abseil/abseil-cpp.git https://github.com/protocolbuffers/protobuf.git",
+      "git_commit": "ee41bbd 02a9c9d",
+      "TU": 700,
+      "loc_src": 918167,
+      "bytes_src": 34756832,
+      "nfiles_src": 2203,
+      "loc_ii": 90359789,
+      "bytes_ii": 2581008467,
+      "z19long_src": 3782763,
+      "z19long_ii": 4119889,
+      "window_limited": true,
+      "zstd_version": "zstd v1.5.7",
+      "window_note": "z19long = zstd -19 --long=31, single-threaded (2 GiB LDM window -- zstd's maximum)",
+      "build_recipe": "cmake abseil-cpp (-DABSL_BUILD_TESTING=ON) and protobuf (src, non-test subset via cc_pbsrc.json); preprocess_corpus.py -E replay into corpus4/{abseil,protobuf}",
+      "generated_utc": "2026-08-15T14:58:55Z",
+      "transfer_snapshot": {
+        "file": "corpus4.ii.tar.zst",
+        "bytes": 12199526,
+        "codec": "zstd -3 --long=27 -T0 (transfer archive, not a measurement)"
+      }
+    },
+    {
+      "corpus_id": "corpus5",
+      "project": "OpenCV",
+      "description": "OpenCV computer-vision library (all default modules)",
+      "source_checkouts": [
+        "/tanksmall/scratch/ictmp/build2/opencv"
+      ],
+      "git_url": "https://github.com/opencv/opencv.git",
+      "git_commit": "681d3ec",
+      "TU": 1506,
+      "loc_src": 2077209,
+      "bytes_src": 77963324,
+      "nfiles_src": 4276,
+      "loc_ii": 159014620,
+      "bytes_ii": 4630994774,
+      "z19long_src": 8972186,
+      "z19long_ii": 6596295,
+      "window_limited": true,
+      "zstd_version": "zstd v1.5.7",
+      "window_note": "z19long = zstd -19 --long=31, single-threaded (2 GiB LDM window -- zstd's maximum)",
+      "build_recipe": "cmake opencv -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXPORT_COMPILE_COMMANDS=ON (default module set); preprocess_corpus.py -E replay",
+      "generated_utc": "2026-08-15T14:58:55Z",
+      "transfer_snapshot": {
+        "file": "corpus5.ii.tar.zst",
+        "bytes": 19766988,
+        "codec": "zstd -3 --long=27 -T0 (transfer archive, not a measurement)"
+      }
+    },
+    {
+      "corpus_id": "corpus6",
+      "project": "Godot",
+      "description": "Godot game engine (all C++ TUs after SCons codegen)",
+      "source_checkouts": [
+        "/tanksmall/scratch/ictmp/build2/godot"
+      ],
+      "git_url": "https://github.com/godotengine/godot.git",
+      "git_commit": "63b7e02",
+      "TU": 2207,
+      "loc_src": 6288358,
+      "bytes_src": 364874847,
+      "nfiles_src": 8509,
+      "loc_ii": 175636352,
+      "bytes_ii": 5932762185,
+      "z19long_src": 65161354,
+      "z19long_ii": 58289521,
+      "window_limited": true,
+      "zstd_version": "zstd v1.5.7",
+      "window_note": "z19long = zstd -19 --long=31, single-threaded (2 GiB LDM window -- zstd's maximum)",
+      "build_recipe": "scons on godot to run codegen + emit compile_commands.json (compiledb), then preprocess_corpus.py -E replay of every C++ TU",
+      "generated_utc": "2026-08-15T14:58:55Z",
+      "transfer_snapshot": {
+        "file": "corpus6.ii.tar.zst",
+        "bytes": 92445182,
+        "codec": "zstd -3 --long=27 -T0 (transfer archive, not a measurement)"
+      }
+    },
+    {
+      "corpus_id": "corpus7",
+      "project": "fmt",
+      "description": "fmt header-only/compiled string formatting library (tests enabled)",
+      "source_checkouts": [
+        "/tanksmall/scratch/ictmp/src2/fmt"
+      ],
+      "git_url": "https://github.com/fmtlib/fmt.git",
+      "git_commit": "cde18a3",
+      "TU": 50,
+      "loc_src": 69231,
+      "bytes_src": 2526674,
+      "nfiles_src": 72,
+      "loc_ii": 4931972,
+      "bytes_ii": 136350082,
+      "z19long_src": 435733,
+      "z19long_ii": 739921,
+      "window_limited": false,
+      "zstd_version": "zstd v1.5.7",
+      "window_note": "z19long = zstd -19 --long=31, single-threaded (2 GiB LDM window -- zstd's maximum)",
+      "build_recipe": "src2/build_one.sh: cmake configure only (-DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=17 + per-project test flags), filter out googletest/benchmark/_deps entries, then preprocess_corpus.py -E replay",
+      "generated_utc": "2026-08-15T14:58:55Z",
+      "transfer_snapshot": {
+        "file": "corpus7.ii.tar.zst",
+        "bytes": 1025622,
+        "codec": "zstd -3 --long=27 -T0 (transfer archive, not a measurement)"
+      }
+    },
+    {
+      "corpus_id": "corpus8",
+      "project": "spdlog",
+      "description": "spdlog fast C++ logging library (tests + examples)",
+      "source_checkouts": [
+        "/tanksmall/scratch/ictmp/src2/spdlog"
+      ],
+      "git_url": "https://github.com/gabime/spdlog.git",
+      "git_commit": "f5f173a",
+      "TU": 34,
+      "loc_src": 32543,
+      "bytes_src": 1149610,
+      "nfiles_src": 151,
+      "loc_ii": 3516541,
+      "bytes_ii": 98384472,
+      "z19long_src": 198813,
+      "z19long_ii": 472193,
+      "window_limited": false,
+      "zstd_version": "zstd v1.5.7",
+      "window_note": "z19long = zstd -19 --long=31, single-threaded (2 GiB LDM window -- zstd's maximum)",
+      "build_recipe": "src2/build_one.sh: cmake configure only (-DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=17 + per-project test flags), filter out googletest/benchmark/_deps entries, then preprocess_corpus.py -E replay",
+      "generated_utc": "2026-08-15T14:58:55Z",
+      "transfer_snapshot": {
+        "file": "corpus8.ii.tar.zst",
+        "bytes": 661562,
+        "codec": "zstd -3 --long=27 -T0 (transfer archive, not a measurement)"
+      }
+    },
+    {
+      "corpus_id": "corpus9",
+      "project": "Catch2",
+      "description": "Catch2 C++ unit-test framework (development build, examples + extra tests)",
+      "source_checkouts": [
+        "/tanksmall/scratch/ictmp/src2/catch2"
+      ],
+      "git_url": "https://github.com/catchorg/Catch2.git",
+      "git_commit": "0aeb818",
+      "TU": 857,
+      "loc_src": 74985,
+      "bytes_src": 2740336,
+      "nfiles_src": 415,
+      "loc_ii": 36035922,
+      "bytes_ii": 947252235,
+      "z19long_src": 249816,
+      "z19long_ii": 847768,
+      "window_limited": false,
+      "zstd_version": "zstd v1.5.7",
+      "window_note": "z19long = zstd -19 --long=31, single-threaded (2 GiB LDM window -- zstd's maximum)",
+      "build_recipe": "src2/build_one.sh: cmake configure only (-DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=17 + per-project test flags), filter out googletest/benchmark/_deps entries, then preprocess_corpus.py -E replay",
+      "generated_utc": "2026-08-15T14:58:55Z",
+      "transfer_snapshot": {
+        "file": "corpus9.ii.tar.zst",
+        "bytes": 2566645,
+        "codec": "zstd -3 --long=27 -T0 (transfer archive, not a measurement)"
+      }
+    },
+    {
+      "corpus_id": "corpus10",
+      "project": "nlohmann-json",
+      "description": "nlohmann/json single-header JSON library (test suite)",
+      "source_checkouts": [
+        "/tanksmall/scratch/ictmp/src2/json"
+      ],
+      "git_url": "https://github.com/nlohmann/json.git",
+      "git_commit": "cdf52ae",
+      "TU": 99,
+      "loc_src": 150463,
+      "bytes_src": 5816059,
+      "nfiles_src": 498,
+      "loc_ii": 10071362,
+      "bytes_ii": 293917707,
+      "z19long_src": 406367,
+      "z19long_ii": 812814,
+      "window_limited": false,
+      "zstd_version": "zstd v1.5.7",
+      "window_note": "z19long = zstd -19 --long=31, single-threaded (2 GiB LDM window -- zstd's maximum)",
+      "build_recipe": "src2/build_one.sh: cmake configure only (-DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=17 + per-project test flags), filter out googletest/benchmark/_deps entries, then preprocess_corpus.py -E replay",
+      "generated_utc": "2026-08-15T14:58:55Z",
+      "transfer_snapshot": {
+        "file": "corpus10.ii.tar.zst",
+        "bytes": 1474409,
+        "codec": "zstd -3 --long=27 -T0 (transfer archive, not a measurement)"
+      }
+    },
+    {
+      "corpus_id": "corpus11",
+      "project": "range-v3",
+      "description": "range-v3 range algorithms/views library (tests + examples)",
+      "source_checkouts": [
+        "/tanksmall/scratch/ictmp/src2/range-v3"
+      ],
+      "git_url": "https://github.com/ericniebler/range-v3.git",
+      "git_commit": "108f93c",
+      "TU": 259,
+      "loc_src": 101916,
+      "bytes_src": 3544049,
+      "nfiles_src": 601,
+      "loc_ii": 22769868,
+      "bytes_ii": 632049016,
+      "z19long_src": 309032,
+      "z19long_ii": 766091,
+      "window_limited": false,
+      "zstd_version": "zstd v1.5.7",
+      "window_note": "z19long = zstd -19 --long=31, single-threaded (2 GiB LDM window -- zstd's maximum)",
+      "build_recipe": "src2/build_one.sh: cmake configure only (-DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=17 + per-project test flags), filter out googletest/benchmark/_deps entries, then preprocess_corpus.py -E replay",
+      "generated_utc": "2026-08-15T14:58:55Z",
+      "transfer_snapshot": {
+        "file": "corpus11.ii.tar.zst",
+        "bytes": 2036422,
+        "codec": "zstd -3 --long=27 -T0 (transfer archive, not a measurement)"
+      }
+    },
+    {
+      "corpus_id": "corpus12",
+      "project": "Eigen",
+      "description": "Eigen header-only linear-algebra template library (test suite)",
+      "source_checkouts": [
+        "/tanksmall/scratch/ictmp/src2/eigen"
+      ],
+      "git_url": "https://gitlab.com/libeigen/eigen.git",
+      "git_commit": "ddd2165",
+      "TU": 650,
+      "loc_src": 384476,
+      "bytes_src": 15554674,
+      "nfiles_src": 1569,
+      "loc_ii": 108282245,
+      "bytes_ii": 3532268956,
+      "z19long_src": 1877377,
+      "z19long_ii": 1402131,
+      "window_limited": true,
+      "zstd_version": "zstd v1.5.7",
+      "window_note": "z19long = zstd -19 --long=31, single-threaded (2 GiB LDM window -- zstd's maximum)",
+      "build_recipe": "src2/build_one.sh: cmake configure only (-DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=17 + per-project test flags), filter out googletest/benchmark/_deps entries, then preprocess_corpus.py -E replay",
+      "generated_utc": "2026-08-15T14:58:55Z",
+      "transfer_snapshot": {
+        "file": "corpus12.ii.tar.zst",
+        "bytes": 11828443,
+        "codec": "zstd -3 --long=27 -T0 (transfer archive, not a measurement)"
+      }
+    },
+    {
+      "corpus_id": "corpus13",
+      "project": "re2",
+      "description": "RE2 regular-expression engine (tests enabled)",
+      "source_checkouts": [
+        "/tanksmall/scratch/ictmp/src2/re2"
+      ],
+      "git_url": "https://github.com/google/re2.git",
+      "git_commit": "0dade9f",
+      "TU": 72,
+      "loc_src": 37814,
+      "bytes_src": 1123171,
+      "nfiles_src": 87,
+      "loc_ii": 4229003,
+      "bytes_ii": 110231455,
+      "z19long_src": 214279,
+      "z19long_ii": 429535,
+      "window_limited": false,
+      "zstd_version": "zstd v1.5.7",
+      "window_note": "z19long = zstd -19 --long=31, single-threaded (2 GiB LDM window -- zstd's maximum)",
+      "build_recipe": "src2/build_one.sh: cmake configure only (-DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=17 + per-project test flags), filter out googletest/benchmark/_deps entries, then preprocess_corpus.py -E replay",
+      "generated_utc": "2026-08-15T14:58:55Z",
+      "transfer_snapshot": {
+        "file": "corpus13.ii.tar.zst",
+        "bytes": 594564,
+        "codec": "zstd -3 --long=27 -T0 (transfer archive, not a measurement)"
+      }
+    },
+    {
+      "corpus_id": "corpus14",
+      "project": "LevelDB",
+      "description": "LevelDB key-value storage library (tests + benchmarks)",
+      "source_checkouts": [
+        "/tanksmall/scratch/ictmp/src2/leveldb"
+      ],
+      "git_url": "https://github.com/google/leveldb.git",
+      "git_commit": "7ee830d",
+      "TU": 72,
+      "loc_src": 136341,
+      "bytes_src": 4771970,
+      "nfiles_src": 405,
+      "loc_ii": 5410057,
+      "bytes_ii": 143868249,
+      "z19long_src": 719661,
+      "z19long_ii": 554104,
+      "window_limited": false,
+      "zstd_version": "zstd v1.5.7",
+      "window_note": "z19long = zstd -19 --long=31, single-threaded (2 GiB LDM window -- zstd's maximum)",
+      "build_recipe": "src2/build_one.sh: cmake configure only (-DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=17 + per-project test flags), filter out googletest/benchmark/_deps entries, then preprocess_corpus.py -E replay",
+      "generated_utc": "2026-08-15T14:58:55Z",
+      "transfer_snapshot": {
+        "file": "corpus14.ii.tar.zst",
+        "bytes": 782097,
+        "codec": "zstd -3 --long=27 -T0 (transfer archive, not a measurement)"
+      }
+    },
+    {
+      "corpus_id": "corpus15",
+      "project": "simdjson",
+      "description": "simdjson SIMD JSON parser (developer mode)",
+      "source_checkouts": [
+        "/tanksmall/scratch/ictmp/src2/simdjson"
+      ],
+      "git_url": "https://github.com/simdjson/simdjson.git",
+      "git_commit": "1f78f3e",
+      "TU": 153,
+      "loc_src": 398960,
+      "bytes_src": 16049094,
+      "nfiles_src": 553,
+      "loc_ii": 16636934,
+      "bytes_ii": 468377342,
+      "z19long_src": 572413,
+      "z19long_ii": 1036075,
+      "window_limited": false,
+      "zstd_version": "zstd v1.5.7",
+      "window_note": "z19long = zstd -19 --long=31, single-threaded (2 GiB LDM window -- zstd's maximum)",
+      "build_recipe": "src2/build_one.sh: cmake configure only (-DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=17 + per-project test flags), filter out googletest/benchmark/_deps entries, then preprocess_corpus.py -E replay",
+      "generated_utc": "2026-08-15T14:58:55Z",
+      "transfer_snapshot": {
+        "file": "corpus15.ii.tar.zst",
+        "bytes": 2284029,
+        "codec": "zstd -3 --long=27 -T0 (transfer archive, not a measurement)"
+      }
+    },
+    {
+      "corpus_id": "corpus16",
+      "project": "cereal",
+      "description": "cereal header-only C++11 serialization library (tests + sandbox)",
+      "source_checkouts": [
+        "/tanksmall/scratch/ictmp/src2/cereal"
+      ],
+      "git_url": "https://github.com/USCiLab/cereal.git",
+      "git_commit": "22a1b36",
+      "TU": 84,
+      "loc_src": 48681,
+      "bytes_src": 1975723,
+      "nfiles_src": 177,
+      "loc_ii": 11297707,
+      "bytes_ii": 326899429,
+      "z19long_src": 244555,
+      "z19long_ii": 492465,
+      "window_limited": false,
+      "zstd_version": "zstd v1.5.7",
+      "window_note": "z19long = zstd -19 --long=31, single-threaded (2 GiB LDM window -- zstd's maximum)",
+      "build_recipe": "src2/build_one.sh: cmake configure only (-DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=17 + per-project test flags), filter out googletest/benchmark/_deps entries, then preprocess_corpus.py -E replay",
+      "generated_utc": "2026-08-15T14:58:55Z",
+      "transfer_snapshot": {
+        "file": "corpus16.ii.tar.zst",
+        "bytes": 1273133,
+        "codec": "zstd -3 --long=27 -T0 (transfer archive, not a measurement)"
+      }
+    }
+  ]
+}

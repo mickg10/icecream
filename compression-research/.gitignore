@@ -1,11 +1,16 @@
-snapshots/
-test-regen/
+# corpus data and transfer archives never belong in the repo
 *.tar.zst
-logs/
-comp/
-comp2/
-cheap/
-joblogs/
-lists/
-*.tmp
-*.lock
+snapshots/
+corpus-snapshots/
+# regenerate_corpuses.sh scratch: clones and rebuilt corpora
+corpus-infra/sources/
+corpus-infra/corpora/
+corpus-infra/test-regen/
+# per-run working state of the metrics passes
+corpus-infra/lists/
+corpus-infra/cheap/
+corpus-infra/comp/
+corpus-infra/comp2/
+corpus-infra/out/
+corpus-infra/logs/
+corpus-infra/joblogs/
