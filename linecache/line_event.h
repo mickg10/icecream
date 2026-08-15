@@ -41,6 +41,15 @@ struct LineEvent {
     bool       region_start; // true iff this line is the first line of `region` in THIS TU occurrence
     bool       first_seen;   // true the FIRST time `line` (this key) appears anywhere, chronologically
     bool       tu_start;     // true iff this is the first event of TU `tu`
+    // --- source-location context (for HPDC TOOLCHAIN_BASE matching + template/config-variant prediction) ---
+    // Populated from the governing preprocessor marker ('# lineno "path" flags'): a MARKER line carries its
+    // own parsed values; a LITERAL line inherits the current path_id and a logical_line that advances by 1
+    // per emitted source line since the last marker. Both codecs derive these identically, so a predictor may
+    // key a line's base candidate on (path_id, logical_line) — the toolchain/system headers that dominate every
+    // .ii live at stable source locations, so the same line reappears at the same (path_id, logical_line).
+    uint32_t   path_id;      // interned #line path of this line's source location (stable across TUs/builds)
+    uint32_t   logical_line; // source line number within path_id (marker lineno, +1 per literal line after it)
+    uint32_t   marker_flags; // packed marker flags for a MARKER line (bit0 push /bit1 return /bit2 system /bit3 extern-C); 0 for a literal
 };
 
 // The event SOURCE. A codec drives the pass by pulling events in strict chronological order.
