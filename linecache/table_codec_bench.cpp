@@ -192,13 +192,15 @@ static double elapsed(Clock::time_point begin) {
 
 int main(int argc, char** argv) {
     std::string model_path, frames_path;
+    int zlevel = 1;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--model") && i + 1 < argc) model_path = argv[++i];
         else if (!std::strcmp(argv[i], "--frames") && i + 1 < argc) frames_path = argv[++i];
+        else if (!std::strcmp(argv[i], "--z") && i + 1 < argc) zlevel = std::atoi(argv[++i]);
         else fail(std::string("unknown/incomplete argument ") + argv[i]);
     }
-    if (model_path.empty() || frames_path.empty())
-        fail("usage: table_codec_bench --model M --frames F");
+    if (model_path.empty() || frames_path.empty() || zlevel < 0 || zlevel > 3)
+        fail("usage: table_codec_bench --model M --frames F [--z 0..3]");
     Model model(model_path);
     std::vector<Frame> frames = read_frames(frames_path);
     RangeEncoder encoder(model);
@@ -225,23 +227,45 @@ int main(int argc, char** argv) {
     ZSTD_CCtx* zc = ZSTD_createCCtx();
     ZSTD_DCtx* zd = ZSTD_createDCtx();
     if (!zc || !zd) fail("zstd context allocation");
-    uint64_t zstd_wire = 0;
+    uint64_t zstd_wire = 0, union_wire = 0, range_wins = 0;
     double zstd_encode = 0, zstd_decode = 0;
     std::vector<uint8_t> zbuffer, zout;
-    for (const Frame& frame : frames) {
+    std::vector<std::vector<uint8_t>> zcompressed; zcompressed.reserve(frames.size());
+    std::vector<uint8_t> use_range; use_range.reserve(frames.size());
+    for (size_t i = 0; i < frames.size(); ++i) {
+        const Frame& frame = frames[i];
         zbuffer.resize(ZSTD_compressBound(frame.payload.size()));
         begin = Clock::now();
         const size_t n = ZSTD_compressCCtx(zc, zbuffer.data(), zbuffer.size(),
-                                          frame.payload.data(), frame.payload.size(), 1);
+                                          frame.payload.data(), frame.payload.size(), zlevel);
         zstd_encode += elapsed(begin);
         if (ZSTD_isError(n)) fail(ZSTD_getErrorName(n));
         zstd_wire += n + 8;
+        zcompressed.emplace_back(zbuffer.begin(), zbuffer.begin() + n);
+        const bool choose_range = compressed[i].size() < n;
+        use_range.push_back(choose_range);
+        range_wins += choose_range;
+        union_wire += std::min(compressed[i].size(), n) + 9;
         zout.resize(frame.payload.size());
         begin = Clock::now();
         const size_t d = ZSTD_decompressDCtx(zd, zout.data(), zout.size(), zbuffer.data(), n);
         zstd_decode += elapsed(begin);
         exact &= !ZSTD_isError(d) && d == frame.payload.size() && zout == frame.payload;
     }
+    begin = Clock::now();
+    for (size_t i = 0; i < frames.size(); ++i) {
+        if (use_range[i]) {
+            exact &= decoder.decode(compressed[i].data(), compressed[i].size(),
+                                    frames[i].payload.size(), recovered);
+        } else {
+            recovered.resize(frames[i].payload.size());
+            const size_t d = ZSTD_decompressDCtx(zd, recovered.data(), recovered.size(),
+                                                 zcompressed[i].data(), zcompressed[i].size());
+            exact &= !ZSTD_isError(d) && d == recovered.size();
+        }
+        exact &= recovered == frames[i].payload;
+    }
+    const double union_decode = elapsed(begin);
     ZSTD_freeCCtx(zc); ZSTD_freeDCtx(zd);
 
     struct rusage usage{}; getrusage(RUSAGE_SELF, &usage);
@@ -254,10 +278,17 @@ int main(int argc, char** argv) {
                 (unsigned long long)(wire + model.bytes), double(raw_input) / wire,
                 double(raw_input) / (wire + model.bytes), raw_input / encode_seconds / 1e9,
                 raw_input / decode_seconds / 1e9, exact ? "PASS" : "FAIL");
-    std::printf("ZSTD1 frames=%zu wire=%llu ratio=%.3f enc_GBps=%.3f dec_GBps=%.3f exact=%s\n",
-                frames.size(), (unsigned long long)zstd_wire, double(raw_input) / zstd_wire,
+    std::printf("ZSTD%d frames=%zu wire=%llu ratio=%.3f enc_GBps=%.3f dec_GBps=%.3f exact=%s\n",
+                zlevel, frames.size(), (unsigned long long)zstd_wire, double(raw_input) / zstd_wire,
                 raw_input / zstd_encode / 1e9, raw_input / zstd_decode / 1e9,
                 exact ? "PASS" : "FAIL");
+    const uint64_t charged_union = union_wire + (range_wins ? model.bytes : 0);
+    std::printf("ACTUAL_UNION zstd=%d range_wins=%llu/%zu wire=%llu charged_wire=%llu ratio=%.3f charged_ratio=%.3f enc_GBps=%.3f dec_GBps=%.3f exact=%s\n",
+                zlevel, (unsigned long long)range_wins, frames.size(),
+                (unsigned long long)union_wire, (unsigned long long)charged_union,
+                double(raw_input) / union_wire, double(raw_input) / charged_union,
+                raw_input / (encode_seconds + zstd_encode) / 1e9,
+                raw_input / union_decode / 1e9, exact ? "PASS" : "FAIL");
     std::printf("peak_RSS_MiB=%.1f\n", usage.ru_maxrss / 1024.0);
     return exact ? 0 : 1;
 }
