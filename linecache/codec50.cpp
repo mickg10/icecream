@@ -178,7 +178,7 @@ struct RelLZ {
 };
 
 int main(int argc,char**argv){
-    const char* manifest=nullptr; size_t max_files=SIZE_MAX; int zlevel=3; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false;
+    const char* manifest=nullptr; size_t max_files=SIZE_MAX; int zlevel=3; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, useS0=false; int builds=1;
     for(int i=1;i<argc;++i){ if(!strcmp(argv[i],"--manifest")&&i+1<argc)manifest=argv[++i];
         else if(!strcmp(argv[i],"--z")&&i+1<argc)zlevel=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--no-d1"))useD1=false;
@@ -187,6 +187,8 @@ int main(int argc,char**argv){
         else if(!strcmp(argv[i],"--d2helper"))useD2=true;    // helper's definition_codec (needs -DWITH_D2)
         else if(!strcmp(argv[i],"--deep"))deep=true;         // run slow z19/z22 entropy ladder + reorder test
         else if(!strcmp(argv[i],"--warm"))warm=true;         // Basis C: 2nd pass with dict retained -> warm steady-state wire
+        else if(!strcmp(argv[i],"--s0"))useS0=true;          // S0 semantic-Root memoization (ROOT_REF on exact-Root reuse)
+        else if(!strcmp(argv[i],"--builds")&&i+1<argc)builds=atoi(argv[++i]);  // amortize S0 over N chronological builds
         else if(!strcmp(argv[i],"--max-files")&&i+1<argc){ char*t=nullptr; unsigned long long v=strtoull(argv[++i],&t,10); if(!t||*t||!v){fprintf(stderr,"bad max-files\n");return 2;} max_files=size_t(v); }
         else { fprintf(stderr,"unknown %s\n",argv[i]); return 2; } }
     if(!manifest){ fprintf(stderr,"usage: %s --manifest F [--z 0|1|3] [--no-d1] [--d2] [--max-files N]\n",argv[0]); return 2; }
@@ -246,7 +248,10 @@ int main(int argc,char**argv){
     std::vector<uint32_t> Freg_stream; Freg_stream.reserve(allreg.size());   // F's reconstructed region occurrence stream (for block COPY defs)
     double w_blockdef=0;
     // wire byte accumulators (post-z, per category) + f-checkpoint tracking
-    double w_root=0, w_linedef=0, w_regiondef=0, w_pathdef=0, w_missing=0, w_framing=0;
+    double w_root=0, w_linedef=0, w_regiondef=0, w_pathdef=0, w_missing=0, w_framing=0, w_rootref=0;
+    // S0 semantic-Root memoization: root_key (hash of the TU's RegionKey sequence) -> global TU seq at
+    // first publish (strict online). ROOT_REF on an exact-Root reuse = 32 C->F + 24 F->C ACK = 56 B.
+    std::unordered_map<uint64_t,uint32_t> rootmemo; std::unordered_map<uint64_t,std::vector<uint32_t>> Froot; uint32_t gtu=0; uint64_t n_rootref=0;
     const double FRAME=4;   // 4-byte length prefix per framed message
     uint64_t cum_raw=0; double cum_wire=0;
     // f-checkpoints + H200 trailing window
@@ -263,9 +268,9 @@ int main(int argc,char**argv){
     std::vector<uint8_t> allLineDefs, allRoots, allRegions, allBlocks, allPaths, allMiss;   // diagnostic: batched-z3 floor (cross-message headroom)
     std::vector<uint8_t> allRegionsRaw;   // diagnostic: region-defs as RAW line-ids (no per-region delta) -> preserves cross-region subsequence matches for z3-LDM
 
-    int npass = warm?2:1;   // --warm: pass 0 primes dict+F-stores (uncounted); final pass measures warm steady-state.
+    int npass = useS0 ? builds : (warm?2:1);   // --warm: prime then measure. --s0 --builds N: sum wire over N chronological builds (amortized).
     for(int pass=0; pass<npass; ++pass){
-      if(pass+1==npass && npass>1){   // reset all measurement state before the warm pass; keep fknown* flags + F-stores
+      if(warm && pass+1==npass && npass>1){   // reset all measurement state before the warm pass; keep fknown* flags + F-stores
         w_root=w_linedef=w_regiondef=w_pathdef=w_blockdef=w_missing=w_framing=0; cum_raw=0; cum_wire=0; n_marker=n_literal=0; byteexact=true;
         ck.clear(); ckidx=0; allLineDefs.clear(); allRoots.clear(); allRegions.clear(); allRegionsRaw.clear(); allBlocks.clear(); allPaths.clear(); allMiss.clear();
       }
@@ -273,6 +278,27 @@ int main(int argc,char**argv){
       for(size_t t=0; t<TUs; ++t){
         auto _te=Clock::now();
         const uint32_t* tk=&tokstream[tokoff[t]]; size_t tn=tokoff[t+1]-tokoff[t];
+        uint32_t olen=corpus.files[t].len;
+        // --- S0: semantic Root = the TU's RegionKey sequence (allreg[roff[t]..roff[t+1])). ---
+        uint64_t rk=0;
+        if(useS0){ rk=1469598103934665603ULL; for(size_t i=roff[t];i<roff[t+1];++i){ rk^=allreg[i]; rk*=1099511628211ULL; }
+            auto it=rootmemo.find(rk);
+            if(it!=rootmemo.end() && it->second<gtu){   // strict-online EXACT-Root reuse -> ROOT_REF, no defs/root
+                w_rootref += 56;   // 32 C->F {txid,raw_len,root_key} + 24 F->C ACK {txid,digest}
+                ++n_rootref;
+                recon.clear(); const std::vector<uint32_t>& seq=Froot[rk];
+                for(uint32_t r:seq){ if(pass==0) Freg_stream.push_back(r);   // keep Freg_stream mirrored to allreg for block-COPY srcs during the cold build
+                    for(size_t j=Freg_off[r];j<Freg_off[r+1];++j){ uint32_t ln=Freg_child[j]; recon.insert(recon.end(),Fline_data.begin()+Fline_off[ln-1],Fline_data.begin()+Fline_off[ln]); } }
+                const char* orig=corpus.bytes.data()+corpus.files[t].off;
+                if(recon.size()!=olen || memcmp(recon.data(),orig,olen)!=0){ byteexact=false; if(gtu<5) fprintf(stderr,"S0 ROOT_REF FAIL TU %zu\n",t); }
+                dec_s += std::chrono::duration<double>(Clock::now()-_te).count();
+                cum_raw += olen; double cw=w_root+w_linedef+w_regiondef+w_pathdef+w_blockdef+w_missing+w_framing+w_rootref;
+                perTU_raw[t]=olen; perTU_wire[t]=cw-cum_wire; cum_wire=cw;
+                while(ckidx<ck_f.size() && double(cum_raw)>=ck_f[ckidx]*(double)corpus.raw*npass){ ck.push_back({ck_f[ckidx],double(cum_raw)/cum_wire}); ++ckidx; }
+                ++gtu; continue;
+            }
+            rootmemo[rk]=gtu;   // publish this Root now (register before F installs its closure)
+        }
         // --- collect NEW regions (incl. new blocks' child regions) + NEW blocks, topological order ---
         std::vector<uint32_t> missReg, missBlk;
         auto addRegion=[&](uint32_t r){ if(fknownReg[r])return; for(uint32_t x:missReg) if(x==r) return; missReg.push_back(r); };
@@ -341,19 +367,20 @@ int main(int argc,char**argv){
           while(pp<pe){ uint8_t kind=*pp++;
             if(kind==1){ uint64_t src=get_varint(pp); uint64_t L=get_varint(pp); for(uint64_t j=0;j<L;++j) Fblk_child.push_back(Freg_stream[src+j]); Fblk_off.push_back(Fblk_child.size()); }
             else { uint64_t L=get_varint(pp); for(uint64_t j=0;j<L;++j) Fblk_child.push_back(uint32_t(get_varint(pp))); Fblk_off.push_back(Fblk_child.size()); } } }
-        recon.clear();
+        recon.clear(); size_t fs0=Freg_stream.size();
         auto emitRegionF=[&](uint32_t r){ Freg_stream.push_back(r); for(size_t j=Freg_off[r];j<Freg_off[r+1];++j){ uint32_t ln=Freg_child[j]; recon.insert(recon.end(), Fline_data.begin()+Fline_off[ln-1], Fline_data.begin()+Fline_off[ln]); } };
         { const uint8_t* pp=rootb.data(), *pe=rootb.data()+rootb.size();
           while(pp<pe){ uint32_t tok=uint32_t(get_varint(pp));
             if(tok<NREG) emitRegionF(tok);
             else { uint32_t k=tok-NREG; for(size_t j=Fblk_off[k];j<Fblk_off[k+1];++j) emitRegionF(Fblk_child[j]); } } }
+        if(useS0) Froot[rk].assign(Freg_stream.begin()+fs0,Freg_stream.end());   // F stores the Root's RegionKey sequence for future ROOT_REF re-expand
         dec_s += std::chrono::duration<double>(Clock::now()-_td).count();   // F-decode ends here; the verify below is harness-only (F doesn't have the original)
-        const char* orig=corpus.bytes.data()+corpus.files[t].off; uint32_t olen=corpus.files[t].len;
+        const char* orig=corpus.bytes.data()+corpus.files[t].off;
         if(recon.size()!=olen || memcmp(recon.data(),orig,olen)!=0){ byteexact=false; if(t<5||TUs<10) fprintf(stderr,"BYTE-EXACT FAIL TU %zu (%zu vs %u)\n",t,recon.size(),olen); }
-        cum_raw += olen;
-        double cur_wire = w_root+w_linedef+w_regiondef+w_pathdef+w_blockdef+w_missing+w_framing;
+        cum_raw += olen; ++gtu;
+        double cur_wire = w_root+w_linedef+w_regiondef+w_pathdef+w_blockdef+w_missing+w_framing+w_rootref;
         perTU_raw[t]=olen; perTU_wire[t]=cur_wire - cum_wire; cum_wire=cur_wire;
-        while(ckidx<ck_f.size() && double(cum_raw)>=ck_f[ckidx]*corpus.raw){ ck.push_back({ck_f[ckidx], double(cum_raw)/cum_wire}); ++ckidx; }
+        while(ckidx<ck_f.size() && double(cum_raw)>=ck_f[ckidx]*(double)corpus.raw*(useS0?npass:1)){ ck.push_back({ck_f[ckidx], double(cum_raw)/cum_wire}); ++ckidx; }
       }
       fprintf(stderr,"pass %d (%s) single-core encode+decode+verify: %.2fs = %.2f GB/s raw\n", pass, (pass+1==npass&&npass>1)?"WARM":"cold", secs(tpass), corpus.raw/1e9/secs(tpass));
       fprintf(stderr,"  split (2-proc per-stream proxy): C-encode %.2f GB/s | F-decode %.2f GB/s => pipelined min = %.2f GB/s\n",
@@ -362,14 +389,16 @@ int main(int argc,char**argv){
     while(ck.size()<ck_f.size()) ck.push_back({ck_f[ck.size()], double(cum_raw)/cum_wire});
     ZSTD_freeCCtx(z);
 
-    double totalwire = w_root+w_linedef+w_regiondef+w_pathdef+w_blockdef+w_missing+w_framing;
+    double totalwire = w_root+w_linedef+w_regiondef+w_pathdef+w_blockdef+w_missing+w_framing+w_rootref;
     double MiB=1048576.0;
-    printf("\n==== CODEC-50 (%s%s%s, z%d) — %s ====\n", useS1?"V1+S1(LZ blocks)":"V1", useD1?"+D1":"", (useD2mine?"+D2(inline)":(useD2?"+D2(helper)":"")), zlevel, manifest);
+    printf("\n==== CODEC-50 (%s%s%s%s, z%d) — %s ====\n", useS1?"V1+S1(LZ blocks)":"V1", useD1?"+D1":"", useS0?"+S0":"", (useD2mine?"+D2(inline)":(useD2?"+D2(helper)":"")), zlevel, manifest);
     printf("byte-exact=%s  TUs=%zu raw=%.1f MiB regions=%u distinct_lines=%u paths=%zu blocks=%zu (marker_lines=%llu literal_lines=%llu)\n",
         byteexact?"OK":"FAIL",TUs,corpus.raw/MiB,NREG,dict.distinct(),paths.size(),boff2.size()-1,(unsigned long long)n_marker,(unsigned long long)n_literal);
-    printf("wire by category (post-z%d, bytes): root=%.0f line_def=%.0f region_def=%.0f block_def=%.0f path_def=%.0f missing=%.0f framing=%.0f  TOTAL=%.0f (%.2f MiB)\n",
-        zlevel,w_root,w_linedef,w_regiondef,w_blockdef,w_pathdef,w_missing,w_framing,totalwire,totalwire/MiB);
+    printf("wire by category (post-z%d, bytes): root=%.0f line_def=%.0f region_def=%.0f block_def=%.0f path_def=%.0f missing=%.0f rootref=%.0f framing=%.0f  TOTAL=%.0f (%.2f MiB)\n",
+        zlevel,w_root,w_linedef,w_regiondef,w_blockdef,w_pathdef,w_missing,w_rootref,w_framing,totalwire,totalwire/MiB);
     printf("FinalRatio (raw / total wire, one cold pass) = %.1fx\n", corpus.raw/totalwire);
+    if(useS0) printf("S0 AMORTIZED over %d builds: raw=%.1f MiB total-wire=%.2f MiB ROOT_REFs=%llu/%llu (%.1f%%) => AmortizedRatio=%.0fx\n",
+        npass, (double)corpus.raw*npass/MiB, totalwire/MiB, (unsigned long long)n_rootref,(unsigned long long)(TUs*(uint64_t)npass), 100.0*n_rootref/(TUs*(double)npass), (double)corpus.raw*npass/totalwire);
     { ZSTD_CCtx* z2=ZSTD_createCCtx(); std::vector<uint8_t> d2b;
       double bl=allLineDefs.empty()?0:zstd_size(z2,allLineDefs.data(),allLineDefs.size(),zlevel,d2b);
       double br=allRoots.empty()?0:zstd_size(z2,allRoots.data(),allRoots.size(),zlevel,d2b);
