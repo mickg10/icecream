@@ -45,13 +45,13 @@ def main():
 
     D=[]
     for r in rows:
-        name=r["name"]; key=r["key"]
-        own=num(r.get("own_source_frac"))
-        if own is None and name in attr: own=num(attr[name].get("own_source_frac"))
+        name=r["name"]; key=r["key"]; ar=attr.get(name,{})
+        own=num(r.get("own_source_frac")) or num(ar.get("own_source_frac"))
         D.append(dict(name=name,key=key,corpus=r.get("corpus",""),
             tus=num(r.get("TUs")),raw=num(r.get("raw_MiB")),
             cold=num(r.get("cold_finalratio")),s0=num(r.get("s0_amortized_40")),
-            tput=num(r.get("tput_n1_gbs")),own=own))
+            tput=num(r.get("tput_n1_gbs")),own=own,
+            cov=num(ar.get("line_cov_pct")),dict_mib=num(ar.get("dict_z3_MiB"))))
 
     have_cold=[d for d in D if d["cold"] is not None]
     have_s0=[d for d in D if d["s0"] is not None]
@@ -86,30 +86,39 @@ def main():
         svg.append('</svg>')
         return "\n".join(svg)
 
-    # ---- scatter: cold-compressibility vs own-source fraction (lights up with defcodec attr) ----
+    # ---- scatter: cross-project coverage vs dict size (defcodec's leave-one-out finding) ----
+    # The clean, non-confounded story: the DICT (the cold-cost bottleneck) is large exactly for the
+    # own-code-heavy corpora, and those get LOW cross-project coverage -> pretraining helps only the
+    # small-dict header-libs that don't need it. (Cold FinalRatio alone is confounded by TU count;
+    # dict size vs coverage is the honest axis pair.)
     def scatter():
-        pts=[d for d in D if d["own"] is not None and d["cold"] is not None]
+        pts=[d for d in D if d["cov"] is not None and d["dict_mib"] is not None]
         if not pts:
-            return ('<p class="pending">Cross-codebase panel pending defcodec\'s per-corpus '
-                    'source-attribution TSV (own-source fraction). The generator auto-populates it '
-                    'from <code>study15-attribution.tsv</code> on regen.</p>')
-        W=720;H=380;L=64;B=54
-        xs=[p["own"] for p in pts]; ys=[math.log10(p["cold"]) for p in pts]
-        def X(v): return L+v*(W-L-30)
-        def Y(v): return H-B-(v-math.log10(cold_min*0.9))/(math.log10(cold_max*1.1)-math.log10(cold_min*0.9))*(H-B-24)
+            return ('<p class="pending">Cross-codebase panel pending defcodec\'s per-corpus leave-one-out '
+                    'coverage TSV. The generator auto-populates it from <code>study15-attribution.tsv</code> '
+                    '(name, line_cov_pct, dict_z3_MiB) on regen.</p>')
+        W=720;H=400;L=58;B=56;T=16
+        dmin=min(p["dict_mib"] for p in pts)*0.8; dmax=max(p["dict_mib"] for p in pts)*1.25
+        lo=math.log10(dmin); hi=math.log10(dmax)
+        def X(v): return L+(math.log10(v)-lo)/(hi-lo)*(W-L-24)
+        def Y(v): return H-B-(v/90.0)*(H-B-T)   # coverage 0..~90%
         svg=[f'<svg viewBox="0 0 {W} {H}" role="img" class="chart" preserveAspectRatio="xMidYMid meet">']
-        for e in range(int(math.floor(math.log10(cold_min))),int(math.ceil(math.log10(cold_max)))+1):
-            gy=Y(e); svg.append(f'<line x1="{L}" y1="{gy:.1f}" x2="{W-30}" y2="{gy:.1f}" class="grid"/>')
-            svg.append(f'<text x="{L-8}" y="{gy+4:.1f}" class="axlab" text-anchor="end">{10**e:g}x</text>')
-        gy=Y(math.log10(400)); svg.append(f'<line x1="{L}" y1="{gy:.1f}" x2="{W-30}" y2="{gy:.1f}" class="refline"/>')
-        svg.append(f'<text x="{W-32}" y="{gy-4:.1f}" class="reflab" text-anchor="end">400x</text>')
-        for frac in (0,0.25,0.5,0.75,1.0):
-            gx=X(frac); svg.append(f'<text x="{gx:.1f}" y="{H-B+18:.1f}" class="axlab" text-anchor="middle">{int(frac*100)}%</text>')
+        for cv in (0,20,40,60,80):
+            gy=Y(cv); svg.append(f'<line x1="{L}" y1="{gy:.1f}" x2="{W-24}" y2="{gy:.1f}" class="grid"/>')
+            svg.append(f'<text x="{L-8}" y="{gy+4:.1f}" class="axlab" text-anchor="end">{cv}%</text>')
+        for e in range(int(math.ceil(lo)),int(math.floor(hi))+1):
+            gx=X(10**e); svg.append(f'<line x1="{gx:.1f}" y1="{T}" x2="{gx:.1f}" y2="{H-B}" class="grid"/>')
+            svg.append(f'<text x="{gx:.1f}" y="{H-B+18:.1f}" class="axlab" text-anchor="middle">{10**e:g}</text>')
+        # tick the actual dict sizes lightly and label points; color the big-dict (>=3 MiB) bottleneck set
         for p in pts:
-            cx=X(p["own"]); cy=Y(math.log10(p["cold"]))
-            svg.append(f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="5" class="dot"><title>{html.escape(p["name"])}: {p["cold"]:g}x cold, {p["own"]*100:.0f}% own-source</title></circle>')
-            svg.append(f'<text x="{cx+7:.1f}" y="{cy+4:.1f}" class="dotlab">{html.escape(p["name"])}</text>')
-        svg.append(f'<text x="{(L+W-30)/2:.1f}" y="{H-8}" class="axtitle" text-anchor="middle">own-source fraction (project-must-ship lines) -&gt;</text>')
+            cx=X(p["dict_mib"]); cy=Y(p["cov"]); big=p["dict_mib"]>=3.0
+            acc="--ref" if big else "--accent"
+            svg.append(f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="5" style="fill:var({acc})" class="dot">'
+                       f'<title>{html.escape(p["name"])}: dict {p["dict_mib"]:.1f} MiB, cross-project coverage {p["cov"]:.0f}%'
+                       f'{(", cold "+format(p["cold"],".0f")+"x") if p["cold"] else ""}</title></circle>')
+            svg.append(f'<text x="{cx+7:.1f}" y="{cy+3.5:.1f}" class="dotlab">{html.escape(p["name"])}</text>')
+        svg.append(f'<text x="{(L+W-24)/2:.1f}" y="{H-6}" class="axtitle" text-anchor="middle">dictionary size (MiB z3, log) &mdash; the cold-cost bottleneck &rarr;</text>')
+        svg.append(f'<text x="{16}" y="{T+2}" class="axtitle" transform="rotate(-90 14 {H/2:.0f})" text-anchor="middle">cross-project coverage</text>')
         svg.append('</svg>')
         return "\n".join(svg)
 
@@ -211,11 +220,19 @@ codebase, not the corpus size. The 400&times; line is unreachable cold for the o
 ROOT_REF. Every codebase clears 400&times; by 9&ndash;100&times;.</p>
 <div class="card">{logbar(have_s0,"s0","x",ref=400,refttl="400x")}</div>
 
-<h2>4 &nbsp; Cross-codebase: cold-compressibility vs own-source fraction</h2>
-<p class="lede">The headline the study exists to show: cold ratio falls as a codebase ships more of its OWN code
-(vs toolchain/system headers that recur across every project). Own-source fraction from defcodec's per-corpus
-source attribution + leave-one-out cross-project coverage.</p>
+<h2>4 &nbsp; Why cold can't be fixed: coverage is inverse to dict size</h2>
+<p class="lede">The mechanism behind the cold floor, from defcodec's 16-codebase leave-one-out study (each corpus vs a
+prior built from the others). <b style="color:var(--ref)">Red</b> = big-dict corpora (&ge;3&nbsp;MiB) &mdash; the
+ones whose one-time dictionary <i>is</i> the cold cost. They get the <i>lowest</i> cross-project coverage
+(LLVM/DuckDB ~5%, OpenCV 7%) because their own code dominates, so a pretrained/toolchain prior can't shrink them.
+The small-dict header-libs (spdlog/re2/cereal ~75%) are highly covered &mdash; pretraining helps them, but their
+dicts are already sub-MiB and irrelevant. Net: <b>pretraining helps exactly the codebases that don't need it and
+cannot help the big-dict corpora that do</b> &mdash; which is why no method reaches cold-400x on the bottleneck set.</p>
 <div class="card">{scatter()}</div>
+<p class="lede">(Cold FinalRatio vs own-source fraction is confounded by TU count &mdash; e.g. Eigen is 73% own-source
+yet 2131x cold because its header-only templates are hugely self-repetitive <i>within</i> a build, and tiny libs like
+spdlog have few TUs to amortize their dict. Dict-size&times;coverage is the clean axis pair; per-corpus own-source
+fractions are in <code>study15-attribution.tsv</code> for the record.)</p>
 
 <h2>Methodology &amp; reproducibility</h2>
 <p class="lede">All numbers from <code>codec50.cpp</code> on branch <code>implementer/issue16-superblock</code>

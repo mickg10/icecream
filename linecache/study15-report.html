@@ -40,7 +40,7 @@ code{background:var(--grid);padding:1px 5px;border-radius:4px;font-size:12.5px}
 </style>
 <div class="wrap">
 <h1>Cold is capped, amortized wins: a 15-codebase study of the icecream line-dedup transport</h1>
-<p class="sub">Real byte-exact codec (Protocol-50 / codec50), one cold chronological pass, z&le;3, every wire byte counted. Commit <code>4fa8754</code>.</p>
+<p class="sub">Real byte-exact codec (Protocol-50 / codec50), one cold chronological pass, z&le;3, every wire byte counted. Commit <code>1d71acc</code>.</p>
 
 <div class="kpis">
 <div class="kpi"><div class="n">15</div><div class="l">C++ codebases</div></div>
@@ -194,15 +194,68 @@ ROOT_REF. Every codebase clears 400&times; by 9&ndash;100&times;.</p>
 <text x="648.7" y="401" class="val">41102x</text>
 </svg></div>
 
-<h2>4 &nbsp; Cross-codebase: cold-compressibility vs own-source fraction</h2>
-<p class="lede">The headline the study exists to show: cold ratio falls as a codebase ships more of its OWN code
-(vs toolchain/system headers that recur across every project). Own-source fraction from defcodec's per-corpus
-source attribution + leave-one-out cross-project coverage.</p>
-<div class="card"><p class="pending">Cross-codebase panel pending defcodec's per-corpus source-attribution TSV (own-source fraction). The generator auto-populates it from <code>study15-attribution.tsv</code> on regen.</p></div>
+<h2>4 &nbsp; Why cold can't be fixed: coverage is inverse to dict size</h2>
+<p class="lede">The mechanism behind the cold floor, from defcodec's 16-codebase leave-one-out study (each corpus vs a
+prior built from the others). <b style="color:var(--ref)">Red</b> = big-dict corpora (&ge;3&nbsp;MiB) &mdash; the
+ones whose one-time dictionary <i>is</i> the cold cost. They get the <i>lowest</i> cross-project coverage
+(LLVM/DuckDB ~5%, OpenCV 7%) because their own code dominates, so a pretrained/toolchain prior can't shrink them.
+The small-dict header-libs (spdlog/re2/cereal ~75%) are highly covered &mdash; pretraining helps them, but their
+dicts are already sub-MiB and irrelevant. Net: <b>pretraining helps exactly the codebases that don't need it and
+cannot help the big-dict corpora that do</b> &mdash; which is why no method reaches cold-400x on the bottleneck set.</p>
+<div class="card"><svg viewBox="0 0 720 400" role="img" class="chart" preserveAspectRatio="xMidYMid meet">
+<line x1="58" y1="344.0" x2="696" y2="344.0" class="grid"/>
+<text x="50" y="348.0" class="axlab" text-anchor="end">0%</text>
+<line x1="58" y1="271.1" x2="696" y2="271.1" class="grid"/>
+<text x="50" y="275.1" class="axlab" text-anchor="end">20%</text>
+<line x1="58" y1="198.2" x2="696" y2="198.2" class="grid"/>
+<text x="50" y="202.2" class="axlab" text-anchor="end">40%</text>
+<line x1="58" y1="125.3" x2="696" y2="125.3" class="grid"/>
+<text x="50" y="129.3" class="axlab" text-anchor="end">60%</text>
+<line x1="58" y1="52.4" x2="696" y2="52.4" class="grid"/>
+<text x="50" y="56.4" class="axlab" text-anchor="end">80%</text>
+<line x1="252.9" y1="16" x2="252.9" y2="344" class="grid"/>
+<text x="252.9" y="362.0" class="axlab" text-anchor="middle">1</text>
+<circle cx="638.7" cy="325.0" r="5" style="fill:var(--ref)" class="dot"><title>LLVM: dict 7.3 MiB, cross-project coverage 5%, cold 322x</title></circle>
+<text x="645.7" y="328.5" class="dotlab">LLVM</text>
+<circle cx="544.9" cy="315.8" r="5" style="fill:var(--ref)" class="dot"><title>RocksDB: dict 4.5 MiB, cross-project coverage 8%, cold 284x</title></circle>
+<text x="551.9" y="319.3" class="dotlab">RocksDB</text>
+<circle cx="652.8" cy="324.2" r="5" style="fill:var(--ref)" class="dot"><title>DuckDB: dict 7.9 MiB, cross-project coverage 5%, cold 166x</title></circle>
+<text x="659.8" y="327.7" class="dotlab">DuckDB</text>
+<circle cx="478.5" cy="291.0" r="5" style="fill:var(--ref)" class="dot"><title>abseil+protobuf: dict 3.2 MiB, cross-project coverage 15%, cold 385x</title></circle>
+<text x="485.5" y="294.5" class="dotlab">abseil+protobuf</text>
+<circle cx="611.2" cy="318.3" r="5" style="fill:var(--ref)" class="dot"><title>OpenCV: dict 6.4 MiB, cross-project coverage 7%, cold 476x</title></circle>
+<text x="618.2" y="321.8" class="dotlab">OpenCV</text>
+<circle cx="187.4" cy="146.0" r="5" style="fill:var(--accent)" class="dot"><title>fmt: dict 0.7 MiB, cross-project coverage 54%, cold 102x</title></circle>
+<text x="194.4" y="149.5" class="dotlab">fmt</text>
+<circle cx="123.6" cy="69.0" r="5" style="fill:var(--accent)" class="dot"><title>spdlog: dict 0.5 MiB, cross-project coverage 75%, cold 117x</title></circle>
+<text x="130.6" y="72.5" class="dotlab">spdlog</text>
+<circle cx="175.1" cy="195.3" r="5" style="fill:var(--accent)" class="dot"><title>Catch2: dict 0.7 MiB, cross-project coverage 41%, cold 750x</title></circle>
+<text x="182.1" y="198.8" class="dotlab">Catch2</text>
+<circle cx="223.0" cy="205.7" r="5" style="fill:var(--accent)" class="dot"><title>nlohmann-json: dict 0.9 MiB, cross-project coverage 38%, cold 209x</title></circle>
+<text x="230.0" y="209.2" class="dotlab">nlohmann-json</text>
+<circle cx="185.8" cy="206.1" r="5" style="fill:var(--accent)" class="dot"><title>range-v3: dict 0.7 MiB, cross-project coverage 38%, cold 529x</title></circle>
+<text x="192.8" y="209.6" class="dotlab">range-v3</text>
+<circle cx="258.3" cy="245.1" r="5" style="fill:var(--accent)" class="dot"><title>Eigen: dict 1.0 MiB, cross-project coverage 27%, cold 2131x</title></circle>
+<text x="265.3" y="248.6" class="dotlab">Eigen</text>
+<circle cx="101.2" cy="64.2" r="5" style="fill:var(--accent)" class="dot"><title>re2: dict 0.5 MiB, cross-project coverage 77%, cold 148x</title></circle>
+<text x="108.2" y="67.7" class="dotlab">re2</text>
+<circle cx="133.2" cy="101.3" r="5" style="fill:var(--accent)" class="dot"><title>LevelDB: dict 0.5 MiB, cross-project coverage 67%, cold 148x</title></circle>
+<text x="140.2" y="104.8" class="dotlab">LevelDB</text>
+<circle cx="264.2" cy="120.5" r="5" style="fill:var(--accent)" class="dot"><title>simdjson: dict 1.1 MiB, cross-project coverage 61%, cold 267x</title></circle>
+<text x="271.2" y="124.0" class="dotlab">simdjson</text>
+<circle cx="119.4" cy="64.0" r="5" style="fill:var(--accent)" class="dot"><title>cereal: dict 0.5 MiB, cross-project coverage 77%, cold 398x</title></circle>
+<text x="126.4" y="67.5" class="dotlab">cereal</text>
+<text x="377.0" y="394" class="axtitle" text-anchor="middle">dictionary size (MiB z3, log) &mdash; the cold-cost bottleneck &rarr;</text>
+<text x="16" y="18" class="axtitle" transform="rotate(-90 14 200)" text-anchor="middle">cross-project coverage</text>
+</svg></div>
+<p class="lede">(Cold FinalRatio vs own-source fraction is confounded by TU count &mdash; e.g. Eigen is 73% own-source
+yet 2131x cold because its header-only templates are hugely self-repetitive <i>within</i> a build, and tiny libs like
+spdlog have few TUs to amortize their dict. Dict-size&times;coverage is the clean axis pair; per-corpus own-source
+fractions are in <code>study15-attribution.tsv</code> for the record.)</p>
 
 <h2>Methodology &amp; reproducibility</h2>
 <p class="lede">All numbers from <code>codec50.cpp</code> on branch <code>implementer/issue16-superblock</code>
-(<code>4fa8754</code>), byte-exact (F reconstructs each TU == the original .ii; whole-source digest). z&le;3 on
+(<code>1d71acc</code>), byte-exact (F reconstructs each TU == the original .ii; whole-source digest). z&le;3 on
 structure legs; no corpus-name branches; no free dictionaries.</p>
 <div class="card"><table>
 <thead><tr><th>metric</th><th>command</th></tr></thead><tbody>
@@ -223,7 +276,7 @@ COPY-programs (<code>193e4bd</code>: DuckDB source-conditioned FILL 269&times; &
 "cold": 322.5,
 "s0": 9910.0,
 "tput": 1.3,
-"own": null
+"own": 0.948
 },
 {
 "name": "RocksDB",
@@ -232,7 +285,7 @@ COPY-programs (<code>193e4bd</code>: DuckDB source-conditioned FILL 269&times; &
 "cold": 283.6,
 "s0": 9772.0,
 "tput": 1.3,
-"own": null
+"own": 0.923
 },
 {
 "name": "DuckDB",
@@ -241,7 +294,7 @@ COPY-programs (<code>193e4bd</code>: DuckDB source-conditioned FILL 269&times; &
 "cold": 165.5,
 "s0": 5778.0,
 "tput": 1.27,
-"own": null
+"own": 0.946
 },
 {
 "name": "abseil+protobuf",
@@ -250,7 +303,7 @@ COPY-programs (<code>193e4bd</code>: DuckDB source-conditioned FILL 269&times; &
 "cold": 384.9,
 "s0": 12110.0,
 "tput": 1.55,
-"own": null
+"own": 0.855
 },
 {
 "name": "OpenCV",
@@ -259,7 +312,7 @@ COPY-programs (<code>193e4bd</code>: DuckDB source-conditioned FILL 269&times; &
 "cold": 475.5,
 "s0": 13137.0,
 "tput": 1.23,
-"own": null
+"own": 0.93
 },
 {
 "name": "fmt",
@@ -268,7 +321,7 @@ COPY-programs (<code>193e4bd</code>: DuckDB source-conditioned FILL 269&times; &
 "cold": 102.1,
 "s0": 3706.0,
 "tput": 0.8,
-"own": null
+"own": 0.457
 },
 {
 "name": "spdlog",
@@ -277,7 +330,7 @@ COPY-programs (<code>193e4bd</code>: DuckDB source-conditioned FILL 269&times; &
 "cold": 116.8,
 "s0": 4225.0,
 "tput": 0.81,
-"own": null
+"own": 0.246
 },
 {
 "name": "Catch2",
@@ -286,7 +339,7 @@ COPY-programs (<code>193e4bd</code>: DuckDB source-conditioned FILL 269&times; &
 "cold": 750.4,
 "s0": 15548.0,
 "tput": 1.46,
-"own": null
+"own": 0.592
 },
 {
 "name": "nlohmann-json",
@@ -295,7 +348,7 @@ COPY-programs (<code>193e4bd</code>: DuckDB source-conditioned FILL 269&times; &
 "cold": 208.8,
 "s0": 6469.0,
 "tput": 1.27,
-"own": null
+"own": 0.621
 },
 {
 "name": "range-v3",
@@ -304,7 +357,7 @@ COPY-programs (<code>193e4bd</code>: DuckDB source-conditioned FILL 269&times; &
 "cold": 529.0,
 "s0": 13525.0,
 "tput": 1.33,
-"own": null
+"own": 0.622
 },
 {
 "name": "Eigen",
@@ -313,7 +366,7 @@ COPY-programs (<code>193e4bd</code>: DuckDB source-conditioned FILL 269&times; &
 "cold": 2131.3,
 "s0": 41102.0,
 "tput": 1.55,
-"own": null
+"own": 0.729
 },
 {
 "name": "re2",
@@ -322,7 +375,7 @@ COPY-programs (<code>193e4bd</code>: DuckDB source-conditioned FILL 269&times; &
 "cold": 148.3,
 "s0": 4937.0,
 "tput": 0.98,
-"own": null
+"own": 0.232
 },
 {
 "name": "LevelDB",
@@ -331,7 +384,7 @@ COPY-programs (<code>193e4bd</code>: DuckDB source-conditioned FILL 269&times; &
 "cold": 148.1,
 "s0": 4995.0,
 "tput": 0.71,
-"own": null
+"own": 0.334
 },
 {
 "name": "simdjson",
@@ -340,7 +393,7 @@ COPY-programs (<code>193e4bd</code>: DuckDB source-conditioned FILL 269&times; &
 "cold": 267.3,
 "s0": 8382.0,
 "tput": 1.33,
-"own": null
+"own": 0.387
 },
 {
 "name": "cereal",
@@ -349,7 +402,7 @@ COPY-programs (<code>193e4bd</code>: DuckDB source-conditioned FILL 269&times; &
 "cold": 397.6,
 "s0": 13499.0,
 "tput": 1.06,
-"own": null
+"own": 0.232
 }
 ]</script>
 <div class="foot">Machine-readable data: <code>study15.tsv</code> (source) and the inline
