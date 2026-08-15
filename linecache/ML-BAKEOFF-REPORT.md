@@ -172,9 +172,39 @@ Charged learning curve:
 | 75% | 61.7x | 184.7x | 184.3x |
 | 100% | 64.0x | 167.0x | 169.6x |
 
-The 256 KiB package crosses 200x early but does not sustain it through the diverse late portion of
-DuckDB. The 1 MiB package repays its larger initial debt only near the half-build point. This is why
-model size and chronology must be reported together.
+The full per-TU rerun charges the complete phrase package and frozen top-K map at TU 0. The actual
+charges are 286,445 bytes for the 256 KiB row and 1,114,245 bytes for the 1 MiB row. Every frame still
+decodes exactly.
+
+| TU | cumulative raw MiB | zero-start exact runs | 256 KiB phrases + map | 1 MiB phrases + map |
+|---:|---:|---:|---:|---:|
+| 1 | 0.8 | **26.4x** | 2.6x | 0.7x |
+| 5 | 19.0 | **45.2x** | 38.1x | 14.9x |
+| 7 | 25.9 | 46.0x | **46.7x** | 19.7x |
+| 20 | 71.5 | 63.2x | **109.7x** | 50.8x |
+| 50 | 150.3 | 85.4x | **180.9x** | 96.8x |
+| 100 | 299.9 | 65.4x | **214.0x** | 149.5x |
+| 120 | 378.2 | 77.4x | **244.8x** | 177.4x |
+| 200 | 616.8 | 63.4x | **230.0x** | 195.7x |
+| 300 | 790.1 | 60.4x | **235.1x** | 213.5x |
+| 500 | 1,414.5 | 61.7x | **185.2x** | 184.5x |
+| 526 | 1,522.6 | 64.0x | 186.0x | **186.3x** |
+| 689 | 1,893.7 | 64.0x | 167.0x | **169.6x** |
+
+The 256 KiB row repays its entire package at TU 7, after 1.37% of raw input, and never falls behind
+the zero-start row again. It first clears 200x at TU 68 and peaks at 244.8x at TU 120. The 1 MiB row
+repays its larger package at TU 38, first clears 200x at TU 219, and only becomes stably smaller than
+the 256 KiB row at TU 526, after 80.4% of raw input. Thus the small package is the clear cold-start
+choice even though the 1 MiB package wins the complete build by 184,365 bytes.
+
+This is intentionally a simple baseline, not the final online-learning comparison. The zero-start
+row learns exact whole semantic-context runs only; it does not induce target-local subphrases. The
+portable-package row is also trained from unrelated expanded streams, not the newer raw-source-only
+contract. A stronger empty-start local phrase/trie learner should narrow this gap and must be tested
+against the common 14-project raw-source package before choosing a production bootstrapper.
+
+The complete 689-TU values for all five rows, including package-only controls, are retained in
+[`ml-artifacts/cold-learning-duckdb-per-tu.tsv`](ml-artifacts/cold-learning-duckdb-per-tu.tsv).
 
 ## 4. ML candidate rankers
 
@@ -314,6 +344,19 @@ g++ -O3 -DNDEBUG -std=c++17 linecache/region_codec_bench.cpp -lzstd -o linecache
 g++ -O3 -DNDEBUG -std=c++17 linecache/table_codec_bench.cpp -lzstd -o linecache/table_codec_bench
 ```
 
+Exact per-TU cold bootstrap control:
+
+```sh
+python3 linecache/pretrained_superblocks.py \
+  --train linecache/traces/ml-llvm.bin linecache/traces/ml-rocksdb.bin \
+          linecache/traces/ml-opencv.bin \
+  --test linecache/traces/ml-duckdb.bin \
+  --budgets 262144 1048576 --teacher-budget 262144 \
+  --skip-teachers --skip-cdict --level 1 \
+  --curve-tsv linecache/ml-artifacts/cold-learning-duckdb-per-tu.tsv \
+  --report /tmp/cold-pretrain-learning-duckdb.json
+```
+
 The retained command logs and machine-readable summaries are under `linecache/traces/` and
 `linecache/ml-artifacts/`. Large `.bin` event exports and `.frames` replay files are generated local
 artifacts and are intentionally not suitable for source control.
@@ -324,6 +367,8 @@ artifacts and are intentionally not suitable for source control.
 - All four Python programs pass `python3 -m py_compile`.
 - Three-TU C++ Line and Region smoke runs independently decode every tested row: `exact=PASS`.
 - The pretrained phrase smoke run independently decodes all five tested rows: `exact=PASS`.
+- The complete 689-TU cold bootstrap rerun independently decodes the zero-start, package-only, and
+  package-plus-map rows at both 256 KiB and 1 MiB: `exact=PASS`; the TSV contains 3,445 data rows.
 - The complete 689-TU fixed-table replay independently decodes both the table-coded and zstd-1
   controls: `exact=PASS` (4.90/2.37 GB/s table encode/decode in the final rerun).
 - The ordinary project build succeeds, and `make check` reports 1/1 pass. The local configure used

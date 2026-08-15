@@ -463,6 +463,7 @@ class CodecResult:
     decode_seconds: float = 0.0
     exact: bool = True
     fraction_curve: list[dict] = dataclasses.field(default_factory=list)
+    per_tu_curve: list[dict] = dataclasses.field(default_factory=list)
 
     def as_dict(self) -> dict:
         total_model = (self.static_definition_bytes + self.prediction_bytes +
@@ -512,13 +513,23 @@ def evaluate_codec(path: str, name: str, budget: int, package: StaticPackage,
     raw_prefix = wire_prefix = 0
     threshold_index = 0
     thresholds = (0.10, 0.25, 0.50, 0.75, 1.00)
-    for raw, wire in per_tu:
+    model_bytes = (result.static_definition_bytes + result.prediction_bytes +
+                   result.outer_dictionary_bytes)
+    for ordinal, (raw, wire) in enumerate(per_tu, 1):
         raw_prefix += raw
         wire_prefix += wire
+        result.per_tu_curve.append({
+            "tu": ordinal,
+            "raw_bytes": raw,
+            "wire_bytes": wire,
+            "marginal_ratio": raw / max(1, wire),
+            "cumulative_raw_bytes": raw_prefix,
+            "cumulative_wire_bytes": wire_prefix,
+            "cumulative_charged_bytes": wire_prefix + model_bytes,
+            "cumulative_charged_ratio": raw_prefix / max(1, wire_prefix + model_bytes),
+        })
         while (threshold_index < len(thresholds) and
                raw_prefix >= result.raw_bytes * thresholds[threshold_index]):
-            model_bytes = (result.static_definition_bytes + result.prediction_bytes +
-                           result.outer_dictionary_bytes)
             result.fraction_curve.append({
                 "fraction": thresholds[threshold_index],
                 "raw_bytes": raw_prefix,
@@ -528,6 +539,20 @@ def evaluate_codec(path: str, name: str, budget: int, package: StaticPackage,
             })
             threshold_index += 1
     return result
+
+
+def write_per_tu_curve(rows: Sequence[dict], path: str | os.PathLike[str]) -> None:
+    columns = (
+        "row", "tu", "raw_bytes", "wire_bytes", "marginal_ratio",
+        "cumulative_raw_bytes", "cumulative_wire_bytes", "cumulative_charged_bytes",
+        "cumulative_charged_ratio",
+    )
+    lines = ["\t".join(columns)]
+    for row in rows:
+        for point in row.get("per_tu_curve", ()):
+            values = {"row": row["name"], **point}
+            lines.append("\t".join(str(values[column]) for column in columns))
+    Path(path).write_text("\n".join(lines) + "\n")
 
 
 def dictionary_samples(paths: Sequence[str], package: StaticPackage,
@@ -747,7 +772,7 @@ def run(args: argparse.Namespace) -> int:
         print(json.dumps({"row": static.as_dict()}), flush=True)
         print(json.dumps({"row": ngram.as_dict()}), flush=True)
 
-    if args.cdict_sizes:
+    if not args.skip_cdict and args.cdict_sizes:
         package = packages[args.cdict_budget]
         predictions = prediction_maps[args.cdict_budget]
         samples = dictionary_samples(args.train, package, predictions, args.cdict_samples,
@@ -801,6 +826,9 @@ def run(args: argparse.Namespace) -> int:
             "width": args.width, "static_vocabulary": len(package.keys),
         }
     result["wall_seconds"] = time.monotonic() - begin
+    if args.curve_tsv:
+        write_per_tu_curve(result["rows"], args.curve_tsv)
+        result["curve_tsv"] = args.curve_tsv
     Path(args.report).write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
@@ -828,9 +856,11 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--level", type=int, default=1)
     p.add_argument("--cdict-budget", type=int, default=1 << 20)
     p.add_argument("--cdict-sizes", nargs="+", type=int, default=(64, 128, 256))
+    p.add_argument("--skip-cdict", action="store_true")
     p.add_argument("--cdict-samples", type=int, default=200_000)
     p.add_argument("--cdict-sample-bytes", type=int, default=256 << 20)
     p.add_argument("--seed", type=int, default=0x51B10C)
+    p.add_argument("--curve-tsv")
     p.add_argument("--report", required=True)
     return p
 
