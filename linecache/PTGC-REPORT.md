@@ -474,6 +474,18 @@ The 16 KiB raw package contains 472 rules and 634 tokens, compresses to about 5.
 once before any DuckDB TU. The previously measured 16/32/64/256-KiB package curve selects 16 KiB
 after charge.
 
+The P13-specific 20-TU dominance replay confirms that the stronger union does not move the optimum:
+
+| raw package cap | package wire | P13 charged bytes | delta versus untrained P12 |
+|---:|---:|---:|---:|
+| **16 KiB** | **5.8 KiB** | **964,432** | **+3,954** |
+| 32 KiB | 11.3 KiB | 970,694 | +10,216 |
+| 64 KiB | 21.5 KiB | 980,779 | +20,301 |
+| 256 KiB | 78.3 KiB | 1,029,979 | +69,501 |
+
+The short slice does not amortize any package, but 16 KiB strictly dominates every larger package.
+Only that size received the authoritative full P13 replay, where the package debt is repaid.
+
 The current harness gives this one artifact three independent uses:
 
 1. frozen parameterized rules plus current-TU private additions (`P8c`);
@@ -604,6 +616,7 @@ Primary logs:
 /tmp/ptgc-token-span-sanitize-2tu.log
 /tmp/ptgc-pretrained-superblocks-v3-smoke.log
 /tmp/ptgc-pretrained-superblocks-v3-sanitize.log
+/tmp/ptgc-pretrained-superblocks-v3-{32,64,256}k-20tu.log
 /tmp/ptgc-pretrained-superblocks-v3-full.log
 /tmp/codec50-current-baseline.log
 /tmp/codec50-pretrain-duckdb-independent.log
