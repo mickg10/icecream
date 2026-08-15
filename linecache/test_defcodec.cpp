@@ -686,7 +686,7 @@ static void run_loo(const char* listfile) {
     ZSTD_CCtx* cc = ZSTD_createCCtx(); std::vector<uint8_t> z;
 
     StringInterner L, S, Tk; std::vector<uint32_t> Lm, Sm, Tm;   // masks indexed by interner id
-    struct CS { std::string name; size_t tus, dlines, dskel, dtok; uint64_t raw, lbytes, dict_z3; };
+    struct CS { std::string name; size_t tus, dlines, dskel, dtok; uint64_t raw, lbytes, dict_z3, toolfree_b, proj_z3; };
     std::vector<CS> cs(NC);
     auto add = [](StringInterner& in, std::vector<uint32_t>& m, const uint8_t* p, uint32_t n, uint32_t bit) {
         uint32_t id = in.intern(p, n); if (id >= m.size()) m.resize(id + 1, 0); m[id] |= bit;
@@ -700,9 +700,27 @@ static void run_loo(const char* listfile) {
         StringInterner ts, tt; tokenize_corpus(d, ts, tt, nullptr, nullptr, nullptr);
         for (size_t k = 0; k < ts.off.size(); ++k) add(S, Sm, ts.blob.data() + ts.off[k], ts.len[k], bit);
         for (size_t k = 0; k < tt.off.size(); ++k) add(Tk, Tm, tt.blob.data() + tt.off[k], tt.len[k], bit);
-        cs[c] = {corp[c].second, co.files.size(), d.off.size(), ts.off.size(), tt.off.size(), co.raw, d.blob.size(), dz};
-        fprintf(stderr, "  [loo] %zu/%zu %s: TUs=%zu distinct_lines=%zu skel=%zu tok=%zu dict_z3=%.2fMiB\n",
-                c + 1, NC, cs[c].name.c_str(), cs[c].tus, cs[c].dlines, cs[c].dskel, cs[c].dtok, MB(dz));
+        // source-attribution: first-seen content lines (markers excluded=structure) by marker path class
+        StringInterner seen; std::vector<uint8_t> proj_blob; uint64_t toolfree_b = 0;
+        for (auto& fsp : co.files) {
+            const uint8_t* p = co.bytes.data() + fsp.off; const uint8_t* e = p + fsp.len; bool cur_tool = false;
+            while (p < e) {
+                const uint8_t* nl = (const uint8_t*)memchr(p, '\n', size_t(e - p)); const uint8_t* le = nl ? nl + 1 : e;
+                if (le - p > 2 && p[0] == '#' && p[1] == ' ') {
+                    const uint8_t* q = p + 2; while (q < le && *q >= '0' && *q <= '9') ++q;
+                    if (q < le && *q == ' ') { ++q; if (q < le && *q == '"') { ++q; const uint8_t* s = q;
+                        while (q < le && *q != '"') ++q;
+                        if (q > s) cur_tool = (q - s > 4 && (memcmp(s, "/usr", 4) == 0 || memcmp(s, "/lib", 4) == 0)); } }
+                } else { uint32_t Ln = uint32_t(le - p);
+                    if (!seen.contains(p, Ln)) { seen.intern(p, Ln);
+                        if (cur_tool) toolfree_b += Ln; else proj_blob.insert(proj_blob.end(), p, le); } }
+                p = le;
+            }
+        }
+        uint64_t proj_z3 = zstd_size(cc, proj_blob.data(), proj_blob.size(), 3, z);
+        cs[c] = {corp[c].second, co.files.size(), d.off.size(), ts.off.size(), tt.off.size(), co.raw, d.blob.size(), dz, toolfree_b, proj_z3};
+        fprintf(stderr, "  [loo] %zu/%zu %s: TUs=%zu dlines=%zu dict_z3=%.2f toolfree=%.2f proj_z3=%.2f MiB\n",
+                c + 1, NC, cs[c].name.c_str(), cs[c].tus, cs[c].dlines, MB(dz), MB(toolfree_b), MB(proj_z3));
     }
 
     // covered bytes/count of target T's entries by the union of all OTHER corpora
@@ -714,21 +732,25 @@ static void run_loo(const char* listfile) {
             if (m[id] & ~self) { ++cov_n; cov_b += in.len[id]; }
         }
     };
-    printf("# SUMMARY  target tus raw_MiB distinct_lines line_MiB dict_z3_MiB  line_cov%%B line_cov%%N  skel_cov%%B  tok_cov%%B\n");
+    auto isApp = [](const std::string& n) {
+        return n == "llvm" || n == "rocksdb" || n == "duckdb" || n == "abseil-protobuf" || n == "opencv"; };
+    printf("ATTR\tcorpus\tkind\ttus\traw_MiB\tdict_z3_MiB\tdict_ratio\ttoolchain_free_MiB\tproject_ship_z3_MiB\tsrccond_ratio\tline_cov_pctB\tline_cov_pctN\tskel_cov_pctB\ttok_cov_pctB\n");
     for (size_t T = 0; T < NC; ++T) {
         uint64_t ltb, lcb, stb, scb, ttb, tcb; size_t ltn, lcn, stn, scn, ttn, tcn;
         cover(L, Lm, uint32_t(T), ltb, lcb, ltn, lcn);
         cover(S, Sm, uint32_t(T), stb, scb, stn, scn);
         cover(Tk, Tm, uint32_t(T), ttb, tcb, ttn, tcn);
-        printf("SUMMARY %-12s %zu %.1f %zu %.2f %.3f  %.2f %.2f  %.2f  %.2f\n",
-               cs[T].name.c_str(), cs[T].tus, MB(cs[T].raw), cs[T].dlines, MB(cs[T].lbytes), MB(cs[T].dict_z3),
+        double rawM = MB(cs[T].raw), dz3 = MB(cs[T].dict_z3), pz3 = MB(cs[T].proj_z3);
+        printf("ATTR\t%s\t%s\t%zu\t%.2f\t%.3f\t%.1f\t%.3f\t%.3f\t%.1f\t%.2f\t%.2f\t%.2f\t%.2f\n",
+               cs[T].name.c_str(), isApp(cs[T].name) ? "app" : "lib", cs[T].tus, rawM, dz3, dz3 > 0 ? rawM / dz3 : 0,
+               MB(cs[T].toolfree_b), pz3, pz3 > 0 ? rawM / pz3 : 0,
                100.0 * double(lcb) / double(ltb ? ltb : 1), 100.0 * double(lcn) / double(ltn ? ltn : 1),
                100.0 * double(scb) / double(stb ? stb : 1), 100.0 * double(tcb) / double(ttb ? ttb : 1));
     }
 
     // LINE-coverage learning curve: prior grows by adding OTHER corpora in descending distinct_lines
     // order; coverage(k) = target bytes covered once the first k prior projects are included.
-    printf("# CURVE  target k line_cov%%B  (prior = k largest other corpora)\n");
+    printf("CURVE\tcorpus\tk_projects\tline_cov_pctB\n");
     for (size_t T = 0; T < NC; ++T) {
         std::vector<size_t> order;
         for (size_t c = 0; c < NC; ++c) if (c != T) order.push_back(c);
@@ -745,7 +767,7 @@ static void run_loo(const char* listfile) {
         }
         uint64_t cum = 0;
         for (size_t k = 0; k < order.size(); ++k) { cum += by_thr[k];
-            printf("CURVE %-12s %zu %.2f\n", cs[T].name.c_str(), k + 1, 100.0 * double(cum) / double(tot ? tot : 1)); }
+            printf("CURVE\t%s\t%zu\t%.2f\n", cs[T].name.c_str(), k + 1, 100.0 * double(cum) / double(tot ? tot : 1)); }
     }
     ZSTD_freeCCtx(cc);
 }
