@@ -668,6 +668,88 @@ static void run_pretrain(const Distinct& d, uint64_t raw, const std::vector<std:
            double(dict_prior) <= budget ? "*** WITH-PRIOR dict CLEARS 400x ***" : "with-prior dict still OVER 400x");
 }
 
+// LEAVE-ONE-OUT cross-project study (task #21): for each corpus, how much of its distinct-line /
+// skeleton / slot-token vocab is covered by a prior of the OTHER corpora? Builds one combined interner
+// per stream with a per-entry corpus bitmask, so coverage + learning curves are bitmask queries.
+static void run_loo(const char* listfile) {
+    std::vector<std::pair<std::string, std::string>> corp;   // (manifest, name)
+    { FILE* f = fopen(listfile, "r"); if (!f) { perror(listfile); exit(2); }
+      char line[8192];
+      while (fgets(line, sizeof line, f)) { std::string s(line);
+        while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+        if (s.empty()) continue;
+        size_t sp = s.find(' '); if (sp == std::string::npos) sp = s.find('\t');
+        if (sp == std::string::npos) corp.push_back({s, s});
+        else corp.push_back({s.substr(0, sp), s.substr(s.find_first_not_of(" \t", sp))}); }
+      fclose(f); }
+    const size_t NC = corp.size();
+    ZSTD_CCtx* cc = ZSTD_createCCtx(); std::vector<uint8_t> z;
+
+    StringInterner L, S, Tk; std::vector<uint32_t> Lm, Sm, Tm;   // masks indexed by interner id
+    struct CS { std::string name; size_t tus, dlines, dskel, dtok; uint64_t raw, lbytes, dict_z3; };
+    std::vector<CS> cs(NC);
+    auto add = [](StringInterner& in, std::vector<uint32_t>& m, const uint8_t* p, uint32_t n, uint32_t bit) {
+        uint32_t id = in.intern(p, n); if (id >= m.size()) m.resize(id + 1, 0); m[id] |= bit;
+    };
+    for (size_t c = 0; c < NC; ++c) {
+        uint32_t bit = 1u << c;
+        Corpus co = load_corpus(corp[c].first.c_str(), SIZE_MAX);
+        Distinct d = extract_distinct(co);
+        uint64_t dz = zstd_size(cc, d.blob.data(), d.blob.size(), 3, z);
+        for (size_t k = 0; k < d.off.size(); ++k) add(L, Lm, d.blob.data() + d.off[k], d.len[k], bit);
+        StringInterner ts, tt; tokenize_corpus(d, ts, tt, nullptr, nullptr, nullptr);
+        for (size_t k = 0; k < ts.off.size(); ++k) add(S, Sm, ts.blob.data() + ts.off[k], ts.len[k], bit);
+        for (size_t k = 0; k < tt.off.size(); ++k) add(Tk, Tm, tt.blob.data() + tt.off[k], tt.len[k], bit);
+        cs[c] = {corp[c].second, co.files.size(), d.off.size(), ts.off.size(), tt.off.size(), co.raw, d.blob.size(), dz};
+        fprintf(stderr, "  [loo] %zu/%zu %s: TUs=%zu distinct_lines=%zu skel=%zu tok=%zu dict_z3=%.2fMiB\n",
+                c + 1, NC, cs[c].name.c_str(), cs[c].tus, cs[c].dlines, cs[c].dskel, cs[c].dtok, MB(dz));
+    }
+
+    // covered bytes/count of target T's entries by the union of all OTHER corpora
+    auto cover = [](const StringInterner& in, const std::vector<uint32_t>& m, uint32_t T,
+                    uint64_t& tot_b, uint64_t& cov_b, size_t& tot_n, size_t& cov_n) {
+        uint32_t self = 1u << T; tot_b = cov_b = 0; tot_n = cov_n = 0;
+        for (size_t id = 0; id < in.off.size(); ++id) if (m[id] & self) {
+            ++tot_n; tot_b += in.len[id];
+            if (m[id] & ~self) { ++cov_n; cov_b += in.len[id]; }
+        }
+    };
+    printf("# SUMMARY  target tus raw_MiB distinct_lines line_MiB dict_z3_MiB  line_cov%%B line_cov%%N  skel_cov%%B  tok_cov%%B\n");
+    for (size_t T = 0; T < NC; ++T) {
+        uint64_t ltb, lcb, stb, scb, ttb, tcb; size_t ltn, lcn, stn, scn, ttn, tcn;
+        cover(L, Lm, uint32_t(T), ltb, lcb, ltn, lcn);
+        cover(S, Sm, uint32_t(T), stb, scb, stn, scn);
+        cover(Tk, Tm, uint32_t(T), ttb, tcb, ttn, tcn);
+        printf("SUMMARY %-12s %zu %.1f %zu %.2f %.3f  %.2f %.2f  %.2f  %.2f\n",
+               cs[T].name.c_str(), cs[T].tus, MB(cs[T].raw), cs[T].dlines, MB(cs[T].lbytes), MB(cs[T].dict_z3),
+               100.0 * double(lcb) / double(ltb ? ltb : 1), 100.0 * double(lcn) / double(ltn ? ltn : 1),
+               100.0 * double(scb) / double(stb ? stb : 1), 100.0 * double(tcb) / double(ttb ? ttb : 1));
+    }
+
+    // LINE-coverage learning curve: prior grows by adding OTHER corpora in descending distinct_lines
+    // order; coverage(k) = target bytes covered once the first k prior projects are included.
+    printf("# CURVE  target k line_cov%%B  (prior = k largest other corpora)\n");
+    for (size_t T = 0; T < NC; ++T) {
+        std::vector<size_t> order;
+        for (size_t c = 0; c < NC; ++c) if (c != T) order.push_back(c);
+        std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return cs[a].dlines > cs[b].dlines; });
+        std::vector<uint32_t> rank(NC, 0xFFFFFFFF);
+        for (size_t r = 0; r < order.size(); ++r) rank[order[r]] = uint32_t(r);
+        uint32_t self = 1u << T;
+        std::vector<uint64_t> by_thr(order.size() + 1, 0); uint64_t tot = 0;
+        for (size_t id = 0; id < L.off.size(); ++id) if (Lm[id] & self) {
+            tot += L.len[id];
+            uint32_t best = 0xFFFFFFFF, mm = Lm[id] & ~self;
+            while (mm) { uint32_t c = uint32_t(__builtin_ctz(mm)); mm &= mm - 1; if (rank[c] < best) best = rank[c]; }
+            if (best != 0xFFFFFFFF) by_thr[best] += L.len[id];
+        }
+        uint64_t cum = 0;
+        for (size_t k = 0; k < order.size(); ++k) { cum += by_thr[k];
+            printf("CURVE %-12s %zu %.2f\n", cs[T].name.c_str(), k + 1, 100.0 * double(cum) / double(tot ? tot : 1)); }
+    }
+    ZSTD_freeCCtx(cc);
+}
+
 // SOURCE-CONDITIONED REGION coverage (bigoracle §11): a preprocessed .ii is mostly VERBATIM its own
 // source files (the preprocessor expands #include/#define/#if but does NOT instantiate templates).
 // The `# N "path"` markers name the source. If the worker has the source (toolchain headers bundled;
@@ -779,6 +861,7 @@ int main(int argc, char** argv) {
     bool skeleton = false;
     bool pretrain = false;
     bool regioncov = false;
+    const char* loofile = nullptr;
     std::vector<std::string> trains;
     DefCodec::Params P;
     for (int i = 1; i < argc; ++i) {
@@ -792,6 +875,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--skeleton")) skeleton = true;
         else if (!strcmp(argv[i], "--pretrain")) pretrain = true;
         else if (!strcmp(argv[i], "--regioncov")) regioncov = true;
+        else if (eat("--loo")) loofile = argv[++i];
         else if (eat("--train")) trains.emplace_back(argv[++i]);
         else if (eat("--stride")) P.stride = uint32_t(atoi(argv[++i]));
         else if (eat("--min-match")) P.min_match = uint32_t(atoi(argv[++i]));
@@ -801,6 +885,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--no-cross-rep")) P.cross_line_rep = false;
         else { fprintf(stderr, "unknown arg %s\n", argv[i]); return 2; }
     }
+    if (loofile) { run_loo(loofile); return 0; }   // leave-one-out study loads its own corpora
     if (!manifest) {
         fprintf(stderr, "usage: %s --manifest F [--name N] [--sweep] "
                         "[--stride N] [--min-match N] [--table-bits N] [--chain N] [--no-cross-rep] [--max-files N]\n", argv[0]);
