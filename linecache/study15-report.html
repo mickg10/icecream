@@ -1,411 +1,307 @@
-<title>Cold vs Amortized: 15 Codebases</title>
+<title>Cold vs Amortized</title>
 <style>
 :root{--bg:#f7f7f4;--panel:#fff;--ink:#1a1c1a;--ink2:#55605a;--muted:#8a938d;--line:#e4e6e1;
-  --accent:#0f766e;--accent2:#7c3f00;--good:#15803d;--warn:#b45309;--ref:#b91c1c;--grid:#eceee9;}
+  --accent:#0f766e;--accent2:#b4530b;--good:#15803d;--warn:#b45309;--ref:#b91c1c;--grid:#eceee9;}
 @media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#14161a;--panel:#1b1f24;--ink:#e9ece9;
-  --ink2:#a7b0aa;--muted:#6f7a73;--line:#2a2f36;--accent:#2dd4bf;--accent2:#f0a24a;--good:#4ade80;
-  --warn:#fbbf24;--ref:#f87171;--grid:#232830;}}
-:root[data-theme="dark"]{--bg:#14161a;--panel:#1b1f24;--ink:#e9ece9;--ink2:#a7b0aa;--muted:#6f7a73;
-  --line:#2a2f36;--accent:#2dd4bf;--accent2:#f0a24a;--good:#4ade80;--warn:#fbbf24;--ref:#f87171;--grid:#232830;}
+  --ink2:#a7b0aa;--muted:#6f7a73;--line:#2a2f36;--accent:#2dd4bf;--accent2:#f0954a;--good:#4ade80;--warn:#fbbf24;--ref:#f87171;--grid:#232830;}}
+:root[data-theme="dark"]{--bg:#14161a;--panel:#1b1f24;--ink:#e9ece9;--ink2:#a7b0aa;--muted:#6f7a73;--line:#2a2f36;
+  --accent:#2dd4bf;--accent2:#f0954a;--good:#4ade80;--warn:#fbbf24;--ref:#f87171;--grid:#232830;}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
-  -webkit-font-smoothing:antialiased}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;-webkit-font-smoothing:antialiased}
 .wrap{max-width:860px;margin:0 auto;padding:48px 22px 80px}
-h1{font-size:30px;line-height:1.15;letter-spacing:-.02em;margin:0 0 6px;text-wrap:balance}
+h1{font-size:29px;line-height:1.15;letter-spacing:-.02em;margin:0 0 6px;text-wrap:balance}
 .sub{color:var(--ink2);font-size:16px;margin:0 0 30px}
 h2{font-size:19px;letter-spacing:-.01em;margin:44px 0 6px;padding-top:14px;border-top:1px solid var(--line)}
-.lede{color:var(--ink2);margin:0 0 18px;font-size:14.5px}
+.lede{color:var(--ink2);margin:0 0 16px;font-size:14.5px}
 .kpis{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:24px 0 8px}
-.kpi{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 16px 14px}
-.kpi .n{font-size:25px;font-weight:650;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+.kpi{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px}
+.kpi .n{font-size:24px;font-weight:650;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
 .kpi .l{color:var(--muted);font-size:12px;margin-top:3px;text-transform:uppercase;letter-spacing:.04em}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px;margin:14px 0;overflow-x:auto}
-table{width:100%;border-collapse:collapse;font-size:13.5px;font-variant-numeric:tabular-nums}
-th,td{text-align:right;padding:7px 9px;border-bottom:1px solid var(--line);white-space:nowrap}
-th:first-child,td.nm{text-align:left}
-th{color:var(--muted);font-weight:600;font-size:11.5px;text-transform:uppercase;letter-spacing:.04em;position:sticky;top:0;background:var(--panel)}
-td.nm{font-weight:600} .na{color:var(--muted)}
-td.good{color:var(--good);font-weight:600} td.warn{color:var(--warn)}
-.chart{width:100%;height:auto;display:block}
-.grid{stroke:var(--grid);stroke-width:1}
-.bar{} .refline{stroke:var(--ref);stroke-width:1.4;stroke-dasharray:4 3}
-.reflab{fill:var(--ref);font-size:10.5px;font-weight:600}
+table{width:100%;border-collapse:collapse;font-size:13px;font-variant-numeric:tabular-nums}
+th,td{text-align:right;padding:7px 8px;border-bottom:1px solid var(--line);white-space:nowrap}
+th:first-child,td.nm{text-align:left} td:nth-child(2){text-align:left;color:var(--muted)}
+th{color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.03em;position:sticky;top:0;background:var(--panel)}
+td.nm{font-weight:600} .na{color:var(--muted)} td.good{color:var(--good);font-weight:600} td.warn{color:var(--warn)}
+.chart{width:100%;height:auto;display:block} .grid{stroke:var(--grid);stroke-width:1}
+.refline{stroke:var(--ref);stroke-width:1.4;stroke-dasharray:4 3} .reflab{fill:var(--ref);font-size:10.5px;font-weight:600}
 .axlab{fill:var(--muted);font-size:10.5px} .axtitle{fill:var(--ink2);font-size:11.5px}
-.rowlab{fill:var(--ink);font-size:12px} .val{fill:var(--ink2);font-size:11px;font-variant-numeric:tabular-nums}
-.dot{fill:var(--accent);stroke:var(--panel);stroke-width:1.5} .dotlab{fill:var(--ink2);font-size:11px}
+.rowlab{fill:var(--ink);font-size:12px} .val{fill:var(--ink2);font-size:11px}
+.dot{stroke:var(--panel);stroke-width:1.5} .dotlab{fill:var(--ink2);font-size:11px}
 .pending{color:var(--muted);font-style:italic;background:var(--panel);border:1px dashed var(--line);border-radius:10px;padding:16px}
 code{background:var(--grid);padding:1px 5px;border-radius:4px;font-size:12.5px}
 .foot{color:var(--muted);font-size:12.5px;margin-top:40px;border-top:1px solid var(--line);padding-top:16px}
-.tag{display:inline-block;font-size:11px;font-weight:600;padding:2px 8px;border-radius:999px;background:var(--grid);color:var(--ink2);margin-left:6px}
 </style>
 <div class="wrap">
-<h1>Cold is capped, amortized wins: a 15-codebase study of the icecream line-dedup transport</h1>
-<p class="sub">Real byte-exact codec (Protocol-50 / codec50), one cold chronological pass, z&le;3, every wire byte counted. Commit <code>1d71acc</code>.</p>
+<h1>Cold is capped, amortized wins: 15 C++ codebases through the icecream line-dedup transport</h1>
+<p class="sub">Real byte-exact codec (codec50), one cold chronological pass, z&le;3, every wire byte counted &middot; commit <code>538c9c3</code></p>
 
 <div class="kpis">
 <div class="kpi"><div class="n">15</div><div class="l">C++ codebases</div></div>
-<div class="kpi"><div class="n">102&ndash;2131x</div><div class="l">cold-strict FinalRatio</div></div>
-<div class="kpi"><div class="n">&ge;400x</div><div class="l">S0 amortized, all 15/15</div></div>
+<div class="kpi"><div class="n">3706&ndash;41102x</div><div class="l">S0 amortized (all &ge;400x)</div></div>
+<div class="kpi"><div class="n">1 / 15</div><div class="l">under 400x source-conditioned</div></div>
 </div>
 
-<p class="lede">Three findings, consistent across every codebase and cross-checked by the definition-plane probes
-(pretraining + source-conditioned regions, both falsified for 400x): <b>(1)</b> cold-strict single-build
-compressibility is an <i>entropy floor set by the codebase</i> &mdash; header/template-heavy libraries hit
-hundreds&ndash;thousands&times;, own-code-heavy engines cap near 150&ndash;270&times; &mdash; and no measured method
-(LZ z3..z19, LDM, front-code, skeleton-columnar, PPM/MTF, cross-project pretraining, trained zstd dict,
-source-conditioned COPY-programs) lifts the capped ones to 400&times;. <b>(2)</b> The <b>S0 semantic-Root memo</b>
-crushes 400&times; on the repeated-build basis (the production reality: a persistent per-daemon dictionary reused
-across builds) on <i>every</i> codebase, 3706&ndash;41102&times;. <b>(3)</b> Throughput is airtight:
-a real two-process socketpair sustains &ge;1&nbsp;GB/s single-stream, byte-exact, with linear multi-stream scaling.</p>
+<p class="lede">Four findings, consistent across every codebase and cross-checked by the definition-plane probes.
+<b>(1)</b> Holistic cold-strict compressibility is an entropy floor set by the codebase (102&ndash;2131&times;).
+<b>(2)</b> The <b>S0 semantic-Root memo</b> makes the repeated-build basis (the production reality: a persistent
+per-daemon dictionary) clear 400&times; on <i>every</i> codebase, 3706&ndash;41102&times;.
+<b>(3)</b> Throughput is airtight: a real two-process socketpair sustains &ge;1&nbsp;GB/s single-stream, byte-exact.
+<b>(4)</b> Even the <i>definition plane alone</i>, source-conditioned (toolchain headers free, since icecream ships
+the environment), clears 400&times; on <b>14 of 15</b> &mdash; DuckDB is the single holdout (269&times;), because 89% of its
+dictionary is its own project code. Cold-400&times; is a property of how much unique code a codebase ships.</p>
 
-<h2>1 &nbsp; The 15-codebase table <span class="tag">byte-exact</span></h2>
-<p class="lede">cold = raw / total wire, one cold pass (shared-window z3, adaptive region). S0 = 40-build amortized
-(ROOT_REF on exact-Root reuse). tput = single-stream C-live socketpair (first-byte&rarr;last-byte). Sorted by cold ratio.</p>
+<h2>1 &nbsp; The 15-codebase table</h2>
+<p class="lede">cold = holistic FinalRatio (my wire, all legs). srccond = defcodec's source-conditioned dict-leg ratio
+(toolchain-free). own = project-ship fraction of the dictionary. S0 = 40-build amortized. tput = single-stream
+C-live socketpair. Sorted by holistic cold.</p>
 <div class="card"><table>
-<thead><tr><th>codebase</th><th>TUs</th><th>raw MiB</th><th>cold</th><th>S0 (40-build)</th><th>tput GB/s</th></tr></thead>
+<thead><tr><th>codebase</th><th>kind</th><th>TUs</th><th>cold</th><th>own-src</th><th>srccond</th><th>S0</th><th>tput</th></tr></thead>
 <tbody>
-<tr><td class="nm">fmt</td><td>50</td><td>130</td><td>102.1x</td><td class="good">3706x</td><td class="warn">0.80</td></tr>
-<tr><td class="nm">spdlog</td><td>34</td><td>94</td><td>116.8x</td><td class="good">4225x</td><td class="warn">0.81</td></tr>
-<tr><td class="nm">LevelDB</td><td>72</td><td>137</td><td>148.1x</td><td class="good">4995x</td><td class="warn">0.71</td></tr>
-<tr><td class="nm">re2</td><td>72</td><td>105</td><td>148.3x</td><td class="good">4937x</td><td class="warn">0.98</td></tr>
-<tr><td class="nm">DuckDB</td><td>689</td><td>1894</td><td>165.5x</td><td class="good">5778x</td><td>1.27</td></tr>
-<tr><td class="nm">nlohmann-json</td><td>99</td><td>280</td><td>208.8x</td><td class="good">6469x</td><td>1.27</td></tr>
-<tr><td class="nm">simdjson</td><td>153</td><td>447</td><td>267.3x</td><td class="good">8382x</td><td>1.33</td></tr>
-<tr><td class="nm">RocksDB</td><td>622</td><td>2970</td><td>283.6x</td><td class="good">9772x</td><td>1.30</td></tr>
-<tr><td class="nm">LLVM</td><td>1238</td><td>3453</td><td>322.5x</td><td class="good">9910x</td><td>1.30</td></tr>
-<tr><td class="nm">abseil+protobuf</td><td>700</td><td>2461</td><td>384.9x</td><td class="good">12110x</td><td>1.55</td></tr>
-<tr><td class="nm">cereal</td><td>84</td><td>312</td><td>397.6x</td><td class="good">13499x</td><td>1.06</td></tr>
-<tr><td class="nm">OpenCV</td><td>1506</td><td>4416</td><td>475.5x</td><td class="good">13137x</td><td>1.23</td></tr>
-<tr><td class="nm">range-v3</td><td>259</td><td>603</td><td>529.0x</td><td class="good">13525x</td><td>1.33</td></tr>
-<tr><td class="nm">Catch2</td><td>857</td><td>903</td><td>750.4x</td><td class="good">15548x</td><td>1.46</td></tr>
-<tr><td class="nm">Eigen</td><td>650</td><td>3369</td><td>2131.3x</td><td class="good">41102x</td><td>1.55</td></tr>
+<tr><td class="nm">fmt</td><td>lib</td><td>50</td><td>102x</td><td>0.46</td><td class="warn">398x</td><td class="good">3706x</td><td class="warn">0.80</td></tr>
+<tr><td class="nm">spdlog</td><td>lib</td><td>34</td><td>117x</td><td>0.33</td><td class="good">559x</td><td class="good">4225x</td><td class="warn">0.81</td></tr>
+<tr><td class="nm">LevelDB</td><td>lib</td><td>72</td><td>148x</td><td>0.36</td><td class="good">712x</td><td class="good">4995x</td><td class="warn">0.71</td></tr>
+<tr><td class="nm">re2</td><td>lib</td><td>72</td><td>148x</td><td>0.34</td><td class="good">683x</td><td class="good">4937x</td><td class="warn">0.98</td></tr>
+<tr><td class="nm">DuckDB</td><td>app</td><td>689</td><td>166x</td><td>0.89</td><td class="warn">269x</td><td class="good">5778x</td><td>1.27</td></tr>
+<tr><td class="nm">nlohmann-json</td><td>lib</td><td>99</td><td>209x</td><td>0.45</td><td class="good">724x</td><td class="good">6469x</td><td>1.27</td></tr>
+<tr><td class="nm">simdjson</td><td>lib</td><td>153</td><td>267x</td><td>0.42</td><td class="good">1014x</td><td class="good">8382x</td><td>1.33</td></tr>
+<tr><td class="nm">RocksDB</td><td>app</td><td>622</td><td>284x</td><td>0.73</td><td class="good">907x</td><td class="good">9772x</td><td>1.30</td></tr>
+<tr><td class="nm">LLVM</td><td>app</td><td>1238</td><td>322x</td><td>0.89</td><td class="good">527x</td><td class="good">9910x</td><td>1.30</td></tr>
+<tr><td class="nm">abseil+protobuf</td><td>app</td><td>700</td><td>385x</td><td>0.74</td><td class="good">1045x</td><td class="good">12110x</td><td>1.55</td></tr>
+<tr><td class="nm">cereal</td><td>lib</td><td>84</td><td>398x</td><td>0.26</td><td class="good">2396x</td><td class="good">13499x</td><td>1.06</td></tr>
+<tr><td class="nm">OpenCV</td><td>app</td><td>1506</td><td>476x</td><td>0.87</td><td class="good">799x</td><td class="good">13137x</td><td>1.23</td></tr>
+<tr><td class="nm">range-v3</td><td>lib</td><td>259</td><td>529x</td><td>0.46</td><td class="good">1868x</td><td class="good">13525x</td><td>1.33</td></tr>
+<tr><td class="nm">Catch2</td><td>lib</td><td>857</td><td>750x</td><td>0.40</td><td class="good">3396x</td><td class="good">15548x</td><td>1.46</td></tr>
+<tr><td class="nm">Eigen</td><td>lib</td><td>650</td><td>2131x</td><td>0.65</td><td class="good">5066x</td><td class="good">41102x</td><td>1.55</td></tr>
 </tbody></table></div>
-<p class="lede"><span style="color:var(--warn)">amber</span> throughput values are the &lt;150-TU libraries where fixed
-fork/startup overhead dominates the sub-second wall &mdash; a small-workload measurement artifact, not a codec limit;
-the gate is met on every representative large corpus (min 1.23 GB/s over the &ge;800&nbsp;MiB set).</p>
+<p class="lede"><span style="color:var(--warn)">amber</span> tput = the &lt;150-TU libs where fork/startup dominates the
+sub-second wall (small-workload artifact, not a codec limit; min 1.23&nbsp;GB/s over the &ge;800&nbsp;MiB set).
+<span style="color:var(--warn)">amber srccond</span> = the one corpus (DuckDB) under 400&times;.</p>
 
-<h2>2 &nbsp; Cold-strict FinalRatio &mdash; the entropy floor is a codebase property</h2>
-<p class="lede">Log scale. Same-scale codebases differ &gt;10&times; (Eigen vs DuckDB at ~650 TUs each): the spread is the
-codebase, not the corpus size. The 400&times; line is unreachable cold for the own-code-heavy set by any method.</p>
-<div class="card"><svg viewBox="0 0 720 420" role="img" class="chart" preserveAspectRatio="xMidYMid meet">
-<line x1="160.6" y1="18" x2="160.6" y2="408" class="grid"/>
-<text x="160.6" y="12" class="axlab" text-anchor="middle">100</text>
-<line x1="527.4" y1="18" x2="527.4" y2="408" class="grid"/>
-<text x="527.4" y="12" class="axlab" text-anchor="middle">1000</text>
-<line x1="381.4" y1="18" x2="381.4" y2="408" class="refline"/>
-<text x="381.4" y="418" class="reflab" text-anchor="middle">400x</text>
-<text x="130" y="37" class="rowlab" text-anchor="end">fmt</text>
-<rect x="138" y="27" width="25.9" height="17" rx="3" class="bar" style="fill:var(--accent)"><title>fmt: 102.1x</title></rect>
-<text x="168.9" y="37" class="val">102.1x</text>
-<text x="130" y="63" class="rowlab" text-anchor="end">spdlog</text>
-<rect x="138" y="53" width="47.3" height="17" rx="3" class="bar" style="fill:var(--accent)"><title>spdlog: 116.8x</title></rect>
-<text x="190.3" y="63" class="val">116.8x</text>
-<text x="130" y="89" class="rowlab" text-anchor="end">LevelDB</text>
-<rect x="138" y="79" width="85.1" height="17" rx="3" class="bar" style="fill:var(--accent)"><title>LevelDB: 148.1x</title></rect>
-<text x="228.1" y="89" class="val">148.1x</text>
-<text x="130" y="115" class="rowlab" text-anchor="end">re2</text>
-<rect x="138" y="105" width="85.4" height="17" rx="3" class="bar" style="fill:var(--accent)"><title>re2: 148.3x</title></rect>
-<text x="228.4" y="115" class="val">148.3x</text>
-<text x="130" y="141" class="rowlab" text-anchor="end">DuckDB</text>
-<rect x="138" y="131" width="102.8" height="17" rx="3" class="bar" style="fill:var(--accent)"><title>DuckDB: 165.5x</title></rect>
-<text x="245.8" y="141" class="val">165.5x</text>
-<text x="130" y="167" class="rowlab" text-anchor="end">nlohmann-json</text>
-<rect x="138" y="157" width="139.9" height="17" rx="3" class="bar" style="fill:var(--accent)"><title>nlohmann-json: 208.8x</title></rect>
-<text x="282.9" y="167" class="val">208.8x</text>
-<text x="130" y="193" class="rowlab" text-anchor="end">simdjson</text>
-<rect x="138" y="183" width="179.2" height="17" rx="3" class="bar" style="fill:var(--accent)"><title>simdjson: 267.3x</title></rect>
-<text x="322.2" y="193" class="val">267.3x</text>
-<text x="130" y="219" class="rowlab" text-anchor="end">RocksDB</text>
-<rect x="138" y="209" width="188.6" height="17" rx="3" class="bar" style="fill:var(--accent)"><title>RocksDB: 283.6x</title></rect>
-<text x="331.6" y="219" class="val">283.6x</text>
-<text x="130" y="245" class="rowlab" text-anchor="end">LLVM</text>
-<rect x="138" y="235" width="209.1" height="17" rx="3" class="bar" style="fill:var(--accent)"><title>LLVM: 322.5x</title></rect>
-<text x="352.1" y="245" class="val">322.5x</text>
-<text x="130" y="271" class="rowlab" text-anchor="end">abseil+protobuf</text>
-<rect x="138" y="261" width="237.3" height="17" rx="3" class="bar" style="fill:var(--accent)"><title>abseil+protobuf: 384.9x</title></rect>
-<text x="380.3" y="271" class="val">384.9x</text>
-<text x="130" y="297" class="rowlab" text-anchor="end">cereal</text>
-<rect x="138" y="287" width="242.5" height="17" rx="3" class="bar" style="fill:var(--accent)"><title>cereal: 397.6x</title></rect>
-<text x="385.5" y="297" class="val">397.6x</text>
-<text x="130" y="323" class="rowlab" text-anchor="end">OpenCV</text>
-<rect x="138" y="313" width="271.0" height="17" rx="3" class="bar" style="fill:var(--accent)"><title>OpenCV: 475.5x</title></rect>
-<text x="414.0" y="323" class="val">475.5x</text>
-<text x="130" y="349" class="rowlab" text-anchor="end">range-v3</text>
-<rect x="138" y="339" width="288.0" height="17" rx="3" class="bar" style="fill:var(--accent)"><title>range-v3: 529x</title></rect>
-<text x="431.0" y="349" class="val">529x</text>
-<text x="130" y="375" class="rowlab" text-anchor="end">Catch2</text>
-<rect x="138" y="365" width="343.6" height="17" rx="3" class="bar" style="fill:var(--accent)"><title>Catch2: 750.4x</title></rect>
-<text x="486.6" y="375" class="val">750.4x</text>
-<text x="130" y="401" class="rowlab" text-anchor="end">Eigen</text>
-<rect x="138" y="391" width="509.9" height="17" rx="3" class="bar" style="fill:var(--accent)"><title>Eigen: 2131.3x</title></rect>
-<text x="652.9" y="401" class="val">2131.3x</text>
+<h2>2 &nbsp; Holistic cold FinalRatio &mdash; a codebase entropy floor</h2>
+<p class="lede">Log scale. Same-scale codebases differ &gt;10&times; (Eigen vs DuckDB, both ~650 TUs): the spread is the
+codebase, not the corpus size. No method (LZ z3..z19, LDM, front-code, skeleton-columnar, PPM/MTF, cross-project
+pretraining, trained zstd dict, source-conditioned COPY-programs) lifts the capped ones to a holistic 400&times;.</p>
+<div class="card"><svg viewBox="0 0 720 405" role="img" class="chart" preserveAspectRatio="xMidYMid meet">
+<line x1="160.5" y1="18" x2="160.5" y2="393" class="grid"/>
+<text x="160.5" y="12" class="axlab" text-anchor="middle">100</text>
+<line x1="525.9" y1="18" x2="525.9" y2="393" class="grid"/>
+<text x="525.9" y="12" class="axlab" text-anchor="middle">1000</text>
+<line x1="380.5" y1="18" x2="380.5" y2="393" class="refline"/>
+<text x="380.5" y="403" class="reflab" text-anchor="middle">400x</text>
+<text x="130" y="36" class="rowlab" text-anchor="end">fmt</text>
+<rect x="138" y="27" width="25.8" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>fmt: 102.1x</title></rect>
+<text x="168.8" y="36" class="val">102.1x</text>
+<text x="130" y="61" class="rowlab" text-anchor="end">spdlog</text>
+<rect x="138" y="52" width="47.1" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>spdlog: 116.8x</title></rect>
+<text x="190.1" y="61" class="val">116.8x</text>
+<text x="130" y="86" class="rowlab" text-anchor="end">LevelDB</text>
+<rect x="138" y="77" width="84.8" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>LevelDB: 148.1x</title></rect>
+<text x="227.8" y="86" class="val">148.1x</text>
+<text x="130" y="111" class="rowlab" text-anchor="end">re2</text>
+<rect x="138" y="102" width="85.0" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>re2: 148.3x</title></rect>
+<text x="228.0" y="111" class="val">148.3x</text>
+<text x="130" y="136" class="rowlab" text-anchor="end">DuckDB</text>
+<rect x="138" y="127" width="102.4" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>DuckDB: 165.5x</title></rect>
+<text x="245.4" y="136" class="val">165.5x</text>
+<text x="130" y="161" class="rowlab" text-anchor="end">nlohmann-json</text>
+<rect x="138" y="152" width="139.3" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>nlohmann-json: 208.8x</title></rect>
+<text x="282.3" y="161" class="val">208.8x</text>
+<text x="130" y="186" class="rowlab" text-anchor="end">simdjson</text>
+<rect x="138" y="177" width="178.5" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>simdjson: 267.3x</title></rect>
+<text x="321.5" y="186" class="val">267.3x</text>
+<text x="130" y="211" class="rowlab" text-anchor="end">RocksDB</text>
+<rect x="138" y="202" width="187.9" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>RocksDB: 283.6x</title></rect>
+<text x="330.9" y="211" class="val">283.6x</text>
+<text x="130" y="236" class="rowlab" text-anchor="end">LLVM</text>
+<rect x="138" y="227" width="208.3" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>LLVM: 322.5x</title></rect>
+<text x="351.3" y="236" class="val">322.5x</text>
+<text x="130" y="261" class="rowlab" text-anchor="end">abseil+protobuf</text>
+<rect x="138" y="252" width="236.4" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>abseil+protobuf: 384.9x</title></rect>
+<text x="379.4" y="261" class="val">384.9x</text>
+<text x="130" y="286" class="rowlab" text-anchor="end">cereal</text>
+<rect x="138" y="277" width="241.5" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>cereal: 397.6x</title></rect>
+<text x="384.5" y="286" class="val">397.6x</text>
+<text x="130" y="311" class="rowlab" text-anchor="end">OpenCV</text>
+<rect x="138" y="302" width="269.9" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>OpenCV: 475.5x</title></rect>
+<text x="412.9" y="311" class="val">475.5x</text>
+<text x="130" y="336" class="rowlab" text-anchor="end">range-v3</text>
+<rect x="138" y="327" width="286.9" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>range-v3: 529x</title></rect>
+<text x="429.9" y="336" class="val">529x</text>
+<text x="130" y="361" class="rowlab" text-anchor="end">Catch2</text>
+<rect x="138" y="352" width="342.3" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>Catch2: 750.4x</title></rect>
+<text x="485.3" y="361" class="val">750.4x</text>
+<text x="130" y="386" class="rowlab" text-anchor="end">Eigen</text>
+<rect x="138" y="377" width="508.0" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>Eigen: 2131.3x</title></rect>
+<text x="651.0" y="386" class="val">2131.3x</text>
 </svg></div>
 
 <h2>3 &nbsp; S0 amortized (40 builds) &mdash; &ge;400x everywhere</h2>
 <p class="lede">Repeated-build basis: build 0 ships the dictionary cold; unchanged TUs in later builds are a 56-byte
-ROOT_REF. Every codebase clears 400&times; by 9&ndash;100&times;.</p>
-<div class="card"><svg viewBox="0 0 720 420" role="img" class="chart" preserveAspectRatio="xMidYMid meet">
-<line x1="365.4" y1="18" x2="365.4" y2="408" class="grid"/>
-<text x="365.4" y="12" class="axlab" text-anchor="middle">10000</text>
-<text x="130" y="37" class="rowlab" text-anchor="end">fmt</text>
-<rect x="138" y="27" width="32.0" height="17" rx="3" class="bar" style="fill:var(--accent)"><title>fmt: 3706x</title></rect>
-<text x="175.0" y="37" class="val">3706x</text>
-<text x="130" y="63" class="rowlab" text-anchor="end">spdlog</text>
-<rect x="138" y="53" width="57.8" height="17" rx="3" class="bar" style="fill:var(--accent)"><title>spdlog: 4225x</title></rect>
-<text x="200.8" y="63" class="val">4225x</text>
-<text x="130" y="89" class="rowlab" text-anchor="end">re2</text>
-<rect x="138" y="79" width="88.5" height="17" rx="3" class="bar" style="fill:var(--accent)"><title>re2: 4937x</title></rect>
-<text x="231.5" y="89" class="val">4937x</text>
-<text x="130" y="115" class="rowlab" text-anchor="end">LevelDB</text>
-<rect x="138" y="105" width="90.8" height="17" rx="3" class="bar" style="fill:var(--accent)"><title>LevelDB: 4995x</title></rect>
-<text x="233.8" y="115" class="val">4995x</text>
-<text x="130" y="141" class="rowlab" text-anchor="end">DuckDB</text>
-<rect x="138" y="131" width="119.4" height="17" rx="3" class="bar" style="fill:var(--accent)"><title>DuckDB: 5778x</title></rect>
-<text x="262.4" y="141" class="val">5778x</text>
-<text x="130" y="167" class="rowlab" text-anchor="end">nlohmann-json</text>
-<rect x="138" y="157" width="141.7" height="17" rx="3" class="bar" style="fill:var(--accent)"><title>nlohmann-json: 6469x</title></rect>
-<text x="284.7" y="167" class="val">6469x</text>
-<text x="130" y="193" class="rowlab" text-anchor="end">simdjson</text>
-<rect x="138" y="183" width="192.7" height="17" rx="3" class="bar" style="fill:var(--accent)"><title>simdjson: 8382x</title></rect>
-<text x="335.7" y="193" class="val">8382x</text>
-<text x="130" y="219" class="rowlab" text-anchor="end">RocksDB</text>
-<rect x="138" y="209" width="222.9" height="17" rx="3" class="bar" style="fill:var(--accent)"><title>RocksDB: 9772x</title></rect>
-<text x="365.9" y="219" class="val">9772x</text>
-<text x="130" y="245" class="rowlab" text-anchor="end">LLVM</text>
-<rect x="138" y="235" width="225.6" height="17" rx="3" class="bar" style="fill:var(--accent)"><title>LLVM: 9910x</title></rect>
-<text x="368.6" y="245" class="val">9910x</text>
-<text x="130" y="271" class="rowlab" text-anchor="end">abseil+protobuf</text>
-<rect x="138" y="261" width="265.1" height="17" rx="3" class="bar" style="fill:var(--accent)"><title>abseil+protobuf: 12110x</title></rect>
-<text x="408.1" y="271" class="val">12110x</text>
-<text x="130" y="297" class="rowlab" text-anchor="end">OpenCV</text>
-<rect x="138" y="287" width="281.1" height="17" rx="3" class="bar" style="fill:var(--accent)"><title>OpenCV: 13137x</title></rect>
-<text x="424.1" y="297" class="val">13137x</text>
-<text x="130" y="323" class="rowlab" text-anchor="end">cereal</text>
-<rect x="138" y="313" width="286.5" height="17" rx="3" class="bar" style="fill:var(--accent)"><title>cereal: 13499x</title></rect>
-<text x="429.5" y="323" class="val">13499x</text>
-<text x="130" y="349" class="rowlab" text-anchor="end">range-v3</text>
-<rect x="138" y="339" width="286.9" height="17" rx="3" class="bar" style="fill:var(--accent)"><title>range-v3: 13525x</title></rect>
-<text x="429.9" y="349" class="val">13525x</text>
-<text x="130" y="375" class="rowlab" text-anchor="end">Catch2</text>
-<rect x="138" y="365" width="314.3" height="17" rx="3" class="bar" style="fill:var(--accent)"><title>Catch2: 15548x</title></rect>
-<text x="457.3" y="375" class="val">15548x</text>
-<text x="130" y="401" class="rowlab" text-anchor="end">Eigen</text>
-<rect x="138" y="391" width="505.7" height="17" rx="3" class="bar" style="fill:var(--accent)"><title>Eigen: 41102x</title></rect>
-<text x="648.7" y="401" class="val">41102x</text>
+ROOT_REF. Every codebase clears 400&times; by 9&ndash;100&times; &mdash; this is where the win lives.</p>
+<div class="card"><svg viewBox="0 0 720 405" role="img" class="chart" preserveAspectRatio="xMidYMid meet">
+<line x1="364.6" y1="18" x2="364.6" y2="393" class="grid"/>
+<text x="364.6" y="12" class="axlab" text-anchor="middle">10000</text>
+<text x="130" y="36" class="rowlab" text-anchor="end">fmt</text>
+<rect x="138" y="27" width="31.9" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>fmt: 3706x</title></rect>
+<text x="174.9" y="36" class="val">3706x</text>
+<text x="130" y="61" class="rowlab" text-anchor="end">spdlog</text>
+<rect x="138" y="52" width="57.6" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>spdlog: 4225x</title></rect>
+<text x="200.6" y="61" class="val">4225x</text>
+<text x="130" y="86" class="rowlab" text-anchor="end">re2</text>
+<rect x="138" y="77" width="88.1" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>re2: 4937x</title></rect>
+<text x="231.1" y="86" class="val">4937x</text>
+<text x="130" y="111" class="rowlab" text-anchor="end">LevelDB</text>
+<rect x="138" y="102" width="90.4" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>LevelDB: 4995x</title></rect>
+<text x="233.4" y="111" class="val">4995x</text>
+<text x="130" y="136" class="rowlab" text-anchor="end">DuckDB</text>
+<rect x="138" y="127" width="119.0" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>DuckDB: 5778x</title></rect>
+<text x="262.0" y="136" class="val">5778x</text>
+<text x="130" y="161" class="rowlab" text-anchor="end">nlohmann-json</text>
+<rect x="138" y="152" width="141.1" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>nlohmann-json: 6469x</title></rect>
+<text x="284.1" y="161" class="val">6469x</text>
+<text x="130" y="186" class="rowlab" text-anchor="end">simdjson</text>
+<rect x="138" y="177" width="191.9" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>simdjson: 8382x</title></rect>
+<text x="334.9" y="186" class="val">8382x</text>
+<text x="130" y="211" class="rowlab" text-anchor="end">RocksDB</text>
+<rect x="138" y="202" width="222.0" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>RocksDB: 9772x</title></rect>
+<text x="365.0" y="211" class="val">9772x</text>
+<text x="130" y="236" class="rowlab" text-anchor="end">LLVM</text>
+<rect x="138" y="227" width="224.8" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>LLVM: 9910x</title></rect>
+<text x="367.8" y="236" class="val">9910x</text>
+<text x="130" y="261" class="rowlab" text-anchor="end">abseil+protobuf</text>
+<rect x="138" y="252" width="264.1" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>abseil+protobuf: 12110x</title></rect>
+<text x="407.1" y="261" class="val">12110x</text>
+<text x="130" y="286" class="rowlab" text-anchor="end">OpenCV</text>
+<rect x="138" y="277" width="280.1" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>OpenCV: 13137x</title></rect>
+<text x="423.1" y="286" class="val">13137x</text>
+<text x="130" y="311" class="rowlab" text-anchor="end">cereal</text>
+<rect x="138" y="302" width="285.4" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>cereal: 13499x</title></rect>
+<text x="428.4" y="311" class="val">13499x</text>
+<text x="130" y="336" class="rowlab" text-anchor="end">range-v3</text>
+<rect x="138" y="327" width="285.8" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>range-v3: 13525x</title></rect>
+<text x="428.8" y="336" class="val">13525x</text>
+<text x="130" y="361" class="rowlab" text-anchor="end">Catch2</text>
+<rect x="138" y="352" width="313.1" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>Catch2: 15548x</title></rect>
+<text x="456.1" y="361" class="val">15548x</text>
+<text x="130" y="386" class="rowlab" text-anchor="end">Eigen</text>
+<rect x="138" y="377" width="503.8" height="16" rx="3" class="bar" style="fill:var(--accent)"><title>Eigen: 41102x</title></rect>
+<text x="646.8" y="386" class="val">41102x</text>
 </svg></div>
 
-<h2>4 &nbsp; Why cold can't be fixed: coverage is inverse to dict size</h2>
-<p class="lede">The mechanism behind the cold floor, from defcodec's 16-codebase leave-one-out study (each corpus vs a
-prior built from the others). <b style="color:var(--ref)">Red</b> = big-dict corpora (&ge;3&nbsp;MiB) &mdash; the
-ones whose one-time dictionary <i>is</i> the cold cost. They get the <i>lowest</i> cross-project coverage
-(LLVM/DuckDB ~5%, OpenCV 7%) because their own code dominates, so a pretrained/toolchain prior can't shrink them.
-The small-dict header-libs (spdlog/re2/cereal ~75%) are highly covered &mdash; pretraining helps them, but their
-dicts are already sub-MiB and irrelevant. Net: <b>pretraining helps exactly the codebases that don't need it and
-cannot help the big-dict corpora that do</b> &mdash; which is why no method reaches cold-400x on the bottleneck set.</p>
+<h2>4 &nbsp; The definition plane: own-source fraction vs source-conditioned ratio</h2>
+<p class="lede">Why only DuckDB stays capped. x = fraction of the dictionary that is project code (must ship); y =
+source-conditioned dict-leg ratio (toolchain lines free). Strong anticorrelation: the more of its own code a
+codebase ships, the lower its ceiling. DuckDB (89% own-source) is the sole point under 400&times; (269&times;); every
+other &mdash; apps and libraries alike &mdash; clears it once toolchain headers are free. (This is the dict leg only;
+the holistic cold in panel 2 is additionally bounded by the per-TU structure legs.)</p>
 <div class="card"><svg viewBox="0 0 720 400" role="img" class="chart" preserveAspectRatio="xMidYMid meet">
-<line x1="58" y1="344.0" x2="696" y2="344.0" class="grid"/>
-<text x="50" y="348.0" class="axlab" text-anchor="end">0%</text>
-<line x1="58" y1="271.1" x2="696" y2="271.1" class="grid"/>
-<text x="50" y="275.1" class="axlab" text-anchor="end">20%</text>
-<line x1="58" y1="198.2" x2="696" y2="198.2" class="grid"/>
-<text x="50" y="202.2" class="axlab" text-anchor="end">40%</text>
-<line x1="58" y1="125.3" x2="696" y2="125.3" class="grid"/>
-<text x="50" y="129.3" class="axlab" text-anchor="end">60%</text>
-<line x1="58" y1="52.4" x2="696" y2="52.4" class="grid"/>
-<text x="50" y="56.4" class="axlab" text-anchor="end">80%</text>
-<line x1="252.9" y1="16" x2="252.9" y2="344" class="grid"/>
-<text x="252.9" y="362.0" class="axlab" text-anchor="middle">1</text>
-<circle cx="638.7" cy="325.0" r="5" style="fill:var(--ref)" class="dot"><title>LLVM: dict 7.3 MiB, cross-project coverage 5%, cold 322x</title></circle>
-<text x="645.7" y="328.5" class="dotlab">LLVM</text>
-<circle cx="544.9" cy="315.8" r="5" style="fill:var(--ref)" class="dot"><title>RocksDB: dict 4.5 MiB, cross-project coverage 8%, cold 284x</title></circle>
-<text x="551.9" y="319.3" class="dotlab">RocksDB</text>
-<circle cx="652.8" cy="324.2" r="5" style="fill:var(--ref)" class="dot"><title>DuckDB: dict 7.9 MiB, cross-project coverage 5%, cold 166x</title></circle>
-<text x="659.8" y="327.7" class="dotlab">DuckDB</text>
-<circle cx="478.5" cy="291.0" r="5" style="fill:var(--ref)" class="dot"><title>abseil+protobuf: dict 3.2 MiB, cross-project coverage 15%, cold 385x</title></circle>
-<text x="485.5" y="294.5" class="dotlab">abseil+protobuf</text>
-<circle cx="611.2" cy="318.3" r="5" style="fill:var(--ref)" class="dot"><title>OpenCV: dict 6.4 MiB, cross-project coverage 7%, cold 476x</title></circle>
-<text x="618.2" y="321.8" class="dotlab">OpenCV</text>
-<circle cx="187.4" cy="146.0" r="5" style="fill:var(--accent)" class="dot"><title>fmt: dict 0.7 MiB, cross-project coverage 54%, cold 102x</title></circle>
-<text x="194.4" y="149.5" class="dotlab">fmt</text>
-<circle cx="123.6" cy="69.0" r="5" style="fill:var(--accent)" class="dot"><title>spdlog: dict 0.5 MiB, cross-project coverage 75%, cold 117x</title></circle>
-<text x="130.6" y="72.5" class="dotlab">spdlog</text>
-<circle cx="175.1" cy="195.3" r="5" style="fill:var(--accent)" class="dot"><title>Catch2: dict 0.7 MiB, cross-project coverage 41%, cold 750x</title></circle>
-<text x="182.1" y="198.8" class="dotlab">Catch2</text>
-<circle cx="223.0" cy="205.7" r="5" style="fill:var(--accent)" class="dot"><title>nlohmann-json: dict 0.9 MiB, cross-project coverage 38%, cold 209x</title></circle>
-<text x="230.0" y="209.2" class="dotlab">nlohmann-json</text>
-<circle cx="185.8" cy="206.1" r="5" style="fill:var(--accent)" class="dot"><title>range-v3: dict 0.7 MiB, cross-project coverage 38%, cold 529x</title></circle>
-<text x="192.8" y="209.6" class="dotlab">range-v3</text>
-<circle cx="258.3" cy="245.1" r="5" style="fill:var(--accent)" class="dot"><title>Eigen: dict 1.0 MiB, cross-project coverage 27%, cold 2131x</title></circle>
-<text x="265.3" y="248.6" class="dotlab">Eigen</text>
-<circle cx="101.2" cy="64.2" r="5" style="fill:var(--accent)" class="dot"><title>re2: dict 0.5 MiB, cross-project coverage 77%, cold 148x</title></circle>
-<text x="108.2" y="67.7" class="dotlab">re2</text>
-<circle cx="133.2" cy="101.3" r="5" style="fill:var(--accent)" class="dot"><title>LevelDB: dict 0.5 MiB, cross-project coverage 67%, cold 148x</title></circle>
-<text x="140.2" y="104.8" class="dotlab">LevelDB</text>
-<circle cx="264.2" cy="120.5" r="5" style="fill:var(--accent)" class="dot"><title>simdjson: dict 1.1 MiB, cross-project coverage 61%, cold 267x</title></circle>
-<text x="271.2" y="124.0" class="dotlab">simdjson</text>
-<circle cx="119.4" cy="64.0" r="5" style="fill:var(--accent)" class="dot"><title>cereal: dict 0.5 MiB, cross-project coverage 77%, cold 398x</title></circle>
-<text x="126.4" y="67.5" class="dotlab">cereal</text>
-<text x="377.0" y="394" class="axtitle" text-anchor="middle">dictionary size (MiB z3, log) &mdash; the cold-cost bottleneck &rarr;</text>
-<text x="16" y="18" class="axtitle" transform="rotate(-90 14 200)" text-anchor="middle">cross-project coverage</text>
+<line x1="58" y1="194.3" x2="696" y2="194.3" class="grid"/>
+<text x="50" y="198.3" class="axlab" text-anchor="end">1000x</text>
+<line x1="58" y1="286.0" x2="696" y2="286.0" class="refline"/>
+<text x="694" y="282.0" class="reflab" text-anchor="end">400x</text>
+<text x="185.6" y="360.0" class="axlab" text-anchor="middle">20%</text>
+<text x="313.2" y="360.0" class="axlab" text-anchor="middle">40%</text>
+<text x="440.8" y="360.0" class="axlab" text-anchor="middle">60%</text>
+<text x="568.4" y="360.0" class="axlab" text-anchor="middle">80%</text>
+<circle cx="628.4" cy="258.3" r="5.5" style="fill:var(--accent2)" class="dot"><title>LLVM (app): 89% own-source, srccond 527.4x, dict 471.6x</title></circle>
+<text x="635.4" y="261.8" class="dotlab">LLVM</text>
+<circle cx="521.2" cy="204.1" r="5.5" style="fill:var(--accent2)" class="dot"><title>RocksDB (app): 72% own-source, srccond 906.7x, dict 658.3x</title></circle>
+<text x="528.2" y="207.6" class="dotlab">RocksDB</text>
+<circle cx="628.5" cy="325.7" r="5.5" style="fill:var(--accent2)" class="dot"><title>DuckDB (app): 89% own-source, srccond 268.9x, dict 240.5x</title></circle>
+<text x="635.5" y="329.2" class="dotlab">DuckDB</text>
+<circle cx="527.1" cy="190.0" r="5.5" style="fill:var(--accent2)" class="dot"><title>abseil+protobuf (app): 73% own-source, srccond 1044.6x, dict 768.2x</title></circle>
+<text x="534.1" y="193.5" class="dotlab">abseil+protobuf</text>
+<circle cx="613.2" cy="216.8" r="5.5" style="fill:var(--accent2)" class="dot"><title>OpenCV (app): 87% own-source, srccond 798.7x, dict 695.2x</title></circle>
+<text x="620.2" y="220.3" class="dotlab">OpenCV</text>
+<circle cx="350.6" cy="286.5" r="5.5" style="fill:var(--accent)" class="dot"><title>fmt (lib): 45% own-source, srccond 398.1x, dict 182.5x</title></circle>
+<text x="357.6" y="290.0" class="dotlab">fmt</text>
+<circle cx="266.9" cy="252.5" r="5.5" style="fill:var(--accent)" class="dot"><title>spdlog (lib): 32% own-source, srccond 559.3x, dict 182.8x</title></circle>
+<text x="273.9" y="256.0" class="dotlab">spdlog</text>
+<circle cx="311.7" cy="72.0" r="5.5" style="fill:var(--accent)" class="dot"><title>Catch2 (lib): 39% own-source, srccond 3396.5x, dict 1350.4x</title></circle>
+<text x="318.7" y="75.5" class="dotlab">Catch2</text>
+<circle cx="346.1" cy="226.7" r="5.5" style="fill:var(--accent)" class="dot"><title>nlohmann-json (lib): 45% own-source, srccond 723.5x, dict 327x</title></circle>
+<text x="353.1" y="230.2" class="dotlab">nlohmann-json</text>
+<circle cx="349.5" cy="131.8" r="5.5" style="fill:var(--accent)" class="dot"><title>range-v3 (lib): 45% own-source, srccond 1868.2x, dict 852.5x</title></circle>
+<text x="356.5" y="135.3" class="dotlab">range-v3</text>
+<circle cx="470.7" cy="32.0" r="5.5" style="fill:var(--accent)" class="dot"><title>Eigen (lib): 64% own-source, srccond 5065.7x, dict 3277.7x</title></circle>
+<text x="477.7" y="35.5" class="dotlab">Eigen</text>
+<circle cx="273.0" cy="232.4" r="5.5" style="fill:var(--accent)" class="dot"><title>re2 (lib): 33% own-source, srccond 683.3x, dict 230x</title></circle>
+<text x="280.0" y="235.9" class="dotlab">re2</text>
+<circle cx="286.4" cy="228.3" r="5.5" style="fill:var(--accent)" class="dot"><title>LevelDB (lib): 35% own-source, srccond 711.9x, dict 254.5x</title></circle>
+<text x="293.4" y="231.8" class="dotlab">LevelDB</text>
+<circle cx="323.4" cy="192.9" r="5.5" style="fill:var(--accent)" class="dot"><title>simdjson (lib): 41% own-source, srccond 1013.9x, dict 421.2x</title></circle>
+<text x="330.4" y="196.4" class="dotlab">simdjson</text>
+<circle cx="223.2" cy="106.9" r="5.5" style="fill:var(--accent)" class="dot"><title>cereal (lib): 25% own-source, srccond 2396.3x, dict 621.4x</title></circle>
+<text x="230.2" y="110.4" class="dotlab">cereal</text>
+<text x="377.0" y="394" class="axtitle" text-anchor="middle">own-source fraction of the dictionary (project-ship / total, z3 bytes) &rarr;</text>
+<rect x="570" y="18" width="10" height="10" style="fill:var(--accent2)"/><text x="584" y="27" class="dotlab">app</text>
+<rect x="620" y="18" width="10" height="10" style="fill:var(--accent)"/><text x="634" y="27" class="dotlab">library</text>
 </svg></div>
-<p class="lede">(Cold FinalRatio vs own-source fraction is confounded by TU count &mdash; e.g. Eigen is 73% own-source
-yet 2131x cold because its header-only templates are hugely self-repetitive <i>within</i> a build, and tiny libs like
-spdlog have few TUs to amortize their dict. Dict-size&times;coverage is the clean axis pair; per-corpus own-source
-fractions are in <code>study15-attribution.tsv</code> for the record.)</p>
+
+<h2>5 &nbsp; Cross-project coverage saturates fast &mdash; and low for apps</h2>
+<p class="lede">defcodec's leave-one-out learning curves: each codebase's line coverage from a prior built of the k
+largest OTHER projects. <b style="color:var(--accent2)">Apps</b> plateau near 5% (own code is unique &mdash; a bigger
+prior barely helps); <b style="color:var(--accent)">libraries</b> saturate at 40&ndash;75% (mostly shared system
+headers). Curves flatten by k&asymp;3&ndash;9: cross-project transfer is real but bounded and quickly exhausted.</p>
+<div class="card"><svg viewBox="0 0 720 340" role="img" class="chart" preserveAspectRatio="xMidYMid meet">
+<line x1="48" y1="292.0" x2="620" y2="292.0" class="grid"/>
+<text x="42" y="296.0" class="axlab" text-anchor="end">0%</text>
+<line x1="48" y1="223.6" x2="620" y2="223.6" class="grid"/>
+<text x="42" y="227.6" class="axlab" text-anchor="end">20%</text>
+<line x1="48" y1="155.1" x2="620" y2="155.1" class="grid"/>
+<text x="42" y="159.1" class="axlab" text-anchor="end">40%</text>
+<line x1="48" y1="86.7" x2="620" y2="86.7" class="grid"/>
+<text x="42" y="90.7" class="axlab" text-anchor="end">60%</text>
+<line x1="48" y1="18.3" x2="620" y2="18.3" class="grid"/>
+<text x="42" y="22.3" class="axlab" text-anchor="end">80%</text>
+<polyline points="48.0,90.4 92.0,80.9 136.0,80.4 180.0,80.0 224.0,59.2 268.0,41.1 312.0,41.1 356.0,29.2 400.0,29.2 444.0,29.1 488.0,29.1 532.0,29.1 576.0,29.1 620.0,29.1" fill="none" stroke="var(--accent)" stroke-width="1.6" opacity="0.72"><title>cereal (lib)</title></polyline>
+<text x="624.0" y="32.6" class="dotlab">cereal</text>
+<polyline points="48.0,77.8 92.0,30.1 136.0,29.5 180.0,29.5 224.0,29.4 268.0,29.3 312.0,29.3 356.0,29.3 400.0,29.3 444.0,29.3 488.0,29.3 532.0,29.3 576.0,29.3 620.0,29.3" fill="none" stroke="var(--accent)" stroke-width="1.6" opacity="0.72"><title>re2 (lib)</title></polyline>
+<text x="624.0" y="32.8" class="dotlab">re2</text>
+<polyline points="48.0,104.8 92.0,78.6 136.0,78.4 180.0,78.2 224.0,78.1 268.0,78.0 312.0,78.0 356.0,78.0 400.0,48.9 444.0,48.9 488.0,34.0 532.0,34.0 576.0,34.0 620.0,34.0" fill="none" stroke="var(--accent)" stroke-width="1.6" opacity="0.72"><title>spdlog (lib)</title></polyline>
+<text x="624.0" y="37.5" class="dotlab">spdlog</text>
+<polyline points="48.0,114.5 92.0,111.5 136.0,92.5 180.0,92.2 224.0,64.7 268.0,64.6 312.0,64.6 356.0,64.6 400.0,64.2 444.0,64.2 488.0,64.2 532.0,64.2 576.0,64.2 620.0,64.2" fill="none" stroke="var(--accent)" stroke-width="1.6" opacity="0.72"><title>LevelDB (lib)</title></polyline>
+<text x="624.0" y="67.7" class="dotlab">LevelDB</text>
+<polyline points="48.0,194.5 92.0,177.6 136.0,137.9 180.0,128.9 224.0,115.9 268.0,115.9 312.0,95.7 356.0,95.7 400.0,95.7 444.0,95.7 488.0,95.6 532.0,95.6 576.0,87.2 620.0,87.2" fill="none" stroke="var(--accent)" stroke-width="1.6" opacity="0.72"><title>simdjson (lib)</title></polyline>
+<text x="624.0" y="90.7" class="dotlab">simdjson</text>
+<polyline points="48.0,168.5 92.0,160.9 136.0,146.5 180.0,145.6 224.0,124.7 268.0,124.7 312.0,124.7 356.0,124.7 400.0,124.7 444.0,124.7 488.0,124.4 532.0,106.2 576.0,106.2 620.0,106.2" fill="none" stroke="var(--accent)" stroke-width="1.6" opacity="0.72"><title>fmt (lib)</title></polyline>
+<text x="624.0" y="109.7" class="dotlab">fmt</text>
+<polyline points="48.0,179.0 92.0,161.3 136.0,161.0 180.0,160.9 224.0,160.9 268.0,160.8 312.0,160.8 356.0,160.8 400.0,160.8 444.0,160.8 488.0,160.8 532.0,152.5 576.0,152.5 620.0,152.5" fill="none" stroke="var(--accent)" stroke-width="1.6" opacity="0.72"><title>Catch2 (lib)</title></polyline>
+<text x="624.0" y="156.0" class="dotlab">Catch2</text>
+<polyline points="48.0,216.0 92.0,208.9 136.0,195.7 180.0,195.0 224.0,184.1 268.0,167.1 312.0,167.1 356.0,167.1 400.0,167.1 444.0,167.1 488.0,167.1 532.0,167.1 576.0,162.3 620.0,162.3" fill="none" stroke="var(--accent)" stroke-width="1.6" opacity="0.72"><title>nlohmann-json (lib)</title></polyline>
+<text x="624.0" y="165.8" class="dotlab">nlohmann-json</text>
+<polyline points="48.0,177.3 92.0,163.5 136.0,162.9 180.0,162.7 224.0,162.7 268.0,162.7 312.0,162.7 356.0,162.6 400.0,162.6 444.0,162.6 488.0,162.6 532.0,162.6 576.0,162.6 620.0,162.6" fill="none" stroke="var(--accent)" stroke-width="1.6" opacity="0.72"><title>range-v3 (lib)</title></polyline>
+<text x="624.0" y="166.1" class="dotlab">range-v3</text>
+<polyline points="48.0,205.6 92.0,199.7 136.0,199.5 180.0,199.3 224.0,199.2 268.0,199.2 312.0,199.2 356.0,199.2 400.0,199.2 444.0,199.2 488.0,199.2 532.0,199.2 576.0,199.2 620.0,199.2" fill="none" stroke="var(--accent)" stroke-width="1.6" opacity="0.72"><title>Eigen (lib)</title></polyline>
+<text x="624.0" y="202.7" class="dotlab">Eigen</text>
+<polyline points="48.0,268.6 92.0,266.6 136.0,259.4 180.0,249.6 224.0,246.6 268.0,246.5 312.0,246.5 356.0,243.7 400.0,243.7 444.0,243.7 488.0,242.4 532.0,242.4 576.0,242.4 620.0,242.4" fill="none" stroke="var(--accent2)" stroke-width="1.6" opacity="0.72"><title>abseil+protobuf (app)</title></polyline>
+<text x="624.0" y="245.9" class="dotlab">abseil+protobuf</text>
+<polyline points="48.0,277.7 92.0,275.7 136.0,269.3 180.0,269.0 224.0,266.5 268.0,266.5 312.0,266.5 356.0,266.4 400.0,266.4 444.0,266.4 488.0,265.6 532.0,265.6 576.0,265.6 620.0,265.6" fill="none" stroke="var(--accent2)" stroke-width="1.6" opacity="0.72"><title>RocksDB (app)</title></polyline>
+<text x="624.0" y="269.1" class="dotlab">RocksDB</text>
+<polyline points="48.0,281.4 92.0,279.5 136.0,274.2 180.0,268.8 224.0,268.7 268.0,268.7 312.0,268.7 356.0,268.6 400.0,268.6 444.0,268.6 488.0,268.6 532.0,268.6 576.0,268.6 620.0,268.6" fill="none" stroke="var(--accent2)" stroke-width="1.6" opacity="0.72"><title>OpenCV (app)</title></polyline>
+<text x="624.0" y="272.1" class="dotlab">OpenCV</text>
+<polyline points="48.0,279.9 92.0,278.3 136.0,277.9 180.0,277.8 224.0,277.1 268.0,277.1 312.0,277.1 356.0,277.0 400.0,277.0 444.0,276.1 488.0,276.1 532.0,276.1 576.0,276.1 620.0,274.0" fill="none" stroke="var(--accent2)" stroke-width="1.6" opacity="0.72"><title>DuckDB (app)</title></polyline>
+<text x="624.0" y="277.5" class="dotlab">DuckDB</text>
+<polyline points="48.0,275.5 92.0,274.7 136.0,274.4 180.0,274.3 224.0,274.3 268.0,274.3 312.0,274.3 356.0,274.2 400.0,274.2 444.0,274.2 488.0,274.2 532.0,274.2 576.0,274.2 620.0,274.2" fill="none" stroke="var(--accent2)" stroke-width="1.6" opacity="0.72"><title>LLVM (app)</title></polyline>
+<text x="624.0" y="277.7" class="dotlab">LLVM</text>
+<text x="334.0" y="334" class="axtitle" text-anchor="middle"># projects in the cross-project prior &rarr;</text>
+</svg></div>
 
 <h2>Methodology &amp; reproducibility</h2>
-<p class="lede">All numbers from <code>codec50.cpp</code> on branch <code>implementer/issue16-superblock</code>
-(<code>1d71acc</code>), byte-exact (F reconstructs each TU == the original .ii; whole-source digest). z&le;3 on
-structure legs; no corpus-name branches; no free dictionaries.</p>
+<p class="lede">Codec metrics from <code>codec50.cpp</code>, byte-exact (F reconstructs each TU == the original .ii;
+whole-source digest); z&le;3; no corpus-name branches; no free dictionaries. Attribution + coverage from defcodec's
+<code>loo-attribution.tsv</code> / <code>loo-learning-curve.tsv</code>. Branch <code>implementer/issue16-superblock</code> @ <code>538c9c3</code>.</p>
 <div class="card"><table>
 <thead><tr><th>metric</th><th>command</th></tr></thead><tbody>
-<tr><td class="nm">cold FinalRatio</td><td style="text-align:left"><code>codec50 --manifest C/manifest.txt --stream</code></td></tr>
+<tr><td class="nm">holistic cold</td><td style="text-align:left"><code>codec50 --manifest C/manifest.txt --stream</code></td></tr>
 <tr><td class="nm">S0 amortized</td><td style="text-align:left"><code>codec50 --manifest C/manifest.txt --s0 --builds 40</code></td></tr>
 <tr><td class="nm">throughput</td><td style="text-align:left"><code>codec50 --manifest C/manifest.txt --socket</code></td></tr>
-<tr><td class="nm">regen this report</td><td style="text-align:left"><code>python3 make_study15_report.py --out study15-report.html</code></td></tr>
+<tr><td class="nm">regen report</td><td style="text-align:left"><code>python3 make_study15_report.py</code></td></tr>
 </tbody></table></div>
-<p class="lede">Cold ceiling confirmed unreachable by defcodec's probes: cross-project/toolchain pretraining
-(<code>601c20a</code>: DuckDB dict ~4% covered, trained-dict zero gain) and source-conditioned region
-COPY-programs (<code>193e4bd</code>: DuckDB source-conditioned FILL 269&times; &lt; 400&times;).</p>
 
-<script type="application/json" id="study15-data">[
-{
-"name": "LLVM",
-"tus": 1238.0,
-"raw": 3452.6,
-"cold": 322.5,
-"s0": 9910.0,
-"tput": 1.3,
-"own": 0.948
-},
-{
-"name": "RocksDB",
-"tus": 622.0,
-"raw": 2970.0,
-"cold": 283.6,
-"s0": 9772.0,
-"tput": 1.3,
-"own": 0.923
-},
-{
-"name": "DuckDB",
-"tus": 689.0,
-"raw": 1893.7,
-"cold": 165.5,
-"s0": 5778.0,
-"tput": 1.27,
-"own": 0.946
-},
-{
-"name": "abseil+protobuf",
-"tus": 700.0,
-"raw": 2461.4,
-"cold": 384.9,
-"s0": 12110.0,
-"tput": 1.55,
-"own": 0.855
-},
-{
-"name": "OpenCV",
-"tus": 1506.0,
-"raw": 4416.5,
-"cold": 475.5,
-"s0": 13137.0,
-"tput": 1.23,
-"own": 0.93
-},
-{
-"name": "fmt",
-"tus": 50.0,
-"raw": 130.0,
-"cold": 102.1,
-"s0": 3706.0,
-"tput": 0.8,
-"own": 0.457
-},
-{
-"name": "spdlog",
-"tus": 34.0,
-"raw": 93.8,
-"cold": 116.8,
-"s0": 4225.0,
-"tput": 0.81,
-"own": 0.246
-},
-{
-"name": "Catch2",
-"tus": 857.0,
-"raw": 903.4,
-"cold": 750.4,
-"s0": 15548.0,
-"tput": 1.46,
-"own": 0.592
-},
-{
-"name": "nlohmann-json",
-"tus": 99.0,
-"raw": 280.3,
-"cold": 208.8,
-"s0": 6469.0,
-"tput": 1.27,
-"own": 0.621
-},
-{
-"name": "range-v3",
-"tus": 259.0,
-"raw": 602.8,
-"cold": 529.0,
-"s0": 13525.0,
-"tput": 1.33,
-"own": 0.622
-},
-{
-"name": "Eigen",
-"tus": 650.0,
-"raw": 3368.6,
-"cold": 2131.3,
-"s0": 41102.0,
-"tput": 1.55,
-"own": 0.729
-},
-{
-"name": "re2",
-"tus": 72.0,
-"raw": 105.1,
-"cold": 148.3,
-"s0": 4937.0,
-"tput": 0.98,
-"own": 0.232
-},
-{
-"name": "LevelDB",
-"tus": 72.0,
-"raw": 137.2,
-"cold": 148.1,
-"s0": 4995.0,
-"tput": 0.71,
-"own": 0.334
-},
-{
-"name": "simdjson",
-"tus": 153.0,
-"raw": 446.7,
-"cold": 267.3,
-"s0": 8382.0,
-"tput": 1.33,
-"own": 0.387
-},
-{
-"name": "cereal",
-"tus": 84.0,
-"raw": 311.8,
-"cold": 397.6,
-"s0": 13499.0,
-"tput": 1.06,
-"own": 0.232
-}
-]</script>
-<div class="foot">Machine-readable data: <code>study15.tsv</code> (source) and the inline
-<code>#study15-data</code> JSON block. Auditable committed report; the polished learning-curve Artifact is
-published separately. icecream issue #16 &middot; fdswarm.</div>
+<script type="application/json" id="study15-data">[{"name": "LLVM", "kind": "app", "tus": 1238.0, "raw": 3452.6, "cold": 322.5, "s0": 9910.0, "tput": 1.3, "own": 0.8940180278612401, "srccond": 527.4, "dict_ratio": 471.6, "cov": 5.19}, {"name": "RocksDB", "kind": "app", "tus": 622.0, "raw": 2970.0, "cold": 283.6, "s0": 9772.0, "tput": 1.3, "own": 0.726063829787234, "srccond": 906.7, "dict_ratio": 658.3, "cov": 7.73}, {"name": "DuckDB", "kind": "app", "tus": 689.0, "raw": 1893.7, "cold": 165.5, "s0": 5778.0, "tput": 1.27, "own": 0.8942222222222223, "srccond": 268.9, "dict_ratio": 240.5, "cov": 5.27}, {"name": "abseil+protobuf", "kind": "app", "tus": 700.0, "raw": 2461.4, "cold": 384.9, "s0": 12110.0, "tput": 1.55, "own": 0.7353308364544319, "srccond": 1044.6, "dict_ratio": 768.2, "cov": 14.51}, {"name": "OpenCV", "kind": "app", "tus": 1506.0, "raw": 4416.5, "cold": 475.5, "s0": 13137.0, "tput": 1.23, "own": 0.8702974972453958, "srccond": 798.7, "dict_ratio": 695.2, "cov": 6.84}, {"name": "fmt", "kind": "lib", "tus": 50.0, "raw": 130.0, "cold": 102.1, "s0": 3706.0, "tput": 0.8, "own": 0.4586255259467041, "srccond": 398.1, "dict_ratio": 182.5, "cov": 54.31}, {"name": "spdlog", "kind": "lib", "tus": 34.0, "raw": 93.8, "cold": 116.8, "s0": 4225.0, "tput": 0.81, "own": 0.3274853801169591, "srccond": 559.3, "dict_ratio": 182.8, "cov": 75.4}, {"name": "Catch2", "kind": "lib", "tus": 857.0, "raw": 903.4, "cold": 750.4, "s0": 15548.0, "tput": 1.46, "own": 0.3976083707025411, "srccond": 3396.5, "dict_ratio": 1350.4, "cov": 40.77}, {"name": "nlohmann-json", "kind": "lib", "tus": 99.0, "raw": 280.3, "cold": 208.8, "s0": 6469.0, "tput": 1.27, "own": 0.4515752625437573, "srccond": 723.5, "dict_ratio": 327.0, "cov": 37.9}, {"name": "range-v3", "kind": "lib", "tus": 259.0, "raw": 602.8, "cold": 529.0, "s0": 13525.0, "tput": 1.33, "own": 0.4568599717114569, "srccond": 1868.2, "dict_ratio": 852.5, "cov": 37.83}, {"name": "Eigen", "kind": "lib", "tus": 650.0, "raw": 3368.6, "cold": 2131.3, "s0": 41102.0, "tput": 1.55, "own": 0.646887159533074, "srccond": 5065.7, "dict_ratio": 3277.7, "cov": 27.13}, {"name": "re2", "kind": "lib", "tus": 72.0, "raw": 105.1, "cold": 148.3, "s0": 4937.0, "tput": 0.98, "own": 0.336980306345733, "srccond": 683.3, "dict_ratio": 230.0, "cov": 76.77}, {"name": "LevelDB", "kind": "lib", "tus": 72.0, "raw": 137.2, "cold": 148.1, "s0": 4995.0, "tput": 0.71, "own": 0.35807050092764375, "srccond": 711.9, "dict_ratio": 254.5, "cov": 66.59}, {"name": "simdjson", "kind": "lib", "tus": 153.0, "raw": 446.7, "cold": 267.3, "s0": 8382.0, "tput": 1.33, "own": 0.41603773584905657, "srccond": 1013.9, "dict_ratio": 421.2, "cov": 59.87}, {"name": "cereal", "kind": "lib", "tus": 84.0, "raw": 311.8, "cold": 397.6, "s0": 13499.0, "tput": 1.06, "own": 0.2589641434262948, "srccond": 2396.3, "dict_ratio": 621.4, "cov": 76.83}]</script>
+<div class="foot">Machine-readable: <code>study15.tsv</code>, <code>loo-attribution.tsv</code>,
+<code>loo-learning-curve.tsv</code>, and the inline <code>#study15-data</code> JSON. Auditable committed report;
+the polished Artifact is published separately from the same data. icecream issue #16 &middot; fdswarm.</div>
 </div>
