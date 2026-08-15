@@ -546,6 +546,16 @@ int main(int argc,char**argv){
       // codec reaches by capturing cross-message redundancy) — the real z3 ceiling for this structure.
       auto batch=[&](std::vector<uint8_t>&v){ return v.empty()?0.0:zstd_size(z2,v.data(),v.size(),zlevel,d2b); };
       double fl_line=bl, fl_root=br, fl_reg=batch(allRegions), fl_blk=batch(allBlocks), fl_path=batch(allPaths), fl_miss=batch(allMiss);
+      // z19+LDM twin of the SAME six batched categories -- a CEILING DIAGNOSTIC only (owner's rule is z<=3;
+      // this shows the headroom the cap leaves). ADDITIVE: the z3 numbers above are untouched. --deep-gated
+      // so --stream/--socket/--s0 runs pay no z19 cost.
+      double f19_line=0,f19_root=0,f19_reg=0,f19_blk=0,f19_path=0,f19_miss=0,full19=0;
+      if(deep){ auto batch19=[&](std::vector<uint8_t>&v)->double{ if(v.empty())return 0.0;
+          ZSTD_CCtx_reset(z2,ZSTD_reset_session_and_parameters); ZSTD_CCtx_setParameter(z2,ZSTD_c_compressionLevel,19);
+          ZSTD_CCtx_setParameter(z2,ZSTD_c_enableLongDistanceMatching,1); ZSTD_CCtx_setParameter(z2,ZSTD_c_windowLog,27);
+          size_t bnd=ZSTD_compressBound(v.size()); if(d2b.size()<bnd)d2b.resize(bnd); return double(ZSTD_compress2(z2,d2b.data(),d2b.size(),v.data(),v.size())); };
+        f19_line=batch19(allLineDefs); f19_root=batch19(allRoots); f19_reg=batch19(allRegions); f19_blk=batch19(allBlocks); f19_path=batch19(allPaths); f19_miss=batch19(allMiss);
+        full19=f19_line+f19_root+f19_reg+f19_blk+f19_path+f19_miss+w_framing; }
       ZSTD_freeCCtx(z2);
       double fullfloor=fl_line+fl_root+fl_reg+fl_blk+fl_path+fl_miss+w_framing;
       double alt=totalwire - w_linedef - w_root + bl + br;
@@ -553,6 +563,8 @@ int main(int argc,char**argv){
       printf("DIAG batched-z%d floor: line_def %.0f->%.0f  root %.0f->%.0f  => streamed TOTAL=%.0f ratio=%.0fx\n",zlevel,w_linedef,bl,w_root,br,alt,corpus.raw/alt);
       printf("DIAG FULL streamed floor (all cats batched z%d): line=%.2f reg=%.2f blk=%.2f path=%.2f miss=%.2f root=%.2f => %.2f MiB ratio=%.0fx\n",
         zlevel,fl_line/MiB,fl_reg/MiB,fl_blk/MiB,fl_path/MiB,fl_miss/MiB,fl_root/MiB,fullfloor/MiB,corpus.raw/fullfloor);
+      if(deep) printf("DIAG FULL z19+LDM ceiling (SAME cats batched z19+LDM+win27): line=%.2f reg=%.2f blk=%.2f path=%.2f miss=%.2f root=%.2f => %.2f MiB  cold_z19ldm FinalRatio=%.1fx  (z3-batched floor=%.1fx)\n",
+        f19_line/MiB,f19_reg/MiB,f19_blk/MiB,f19_path/MiB,f19_miss/MiB,f19_root/MiB,full19/MiB,corpus.raw/full19,corpus.raw/fullfloor);
       // region_def headroom, delta-serialized (current wire) AND raw-line-id serialized (cross-region
       // subsequence-preserving -- per-region delta breaks shared-run matching at each run's first id).
       { auto zldm=[&](std::vector<uint8_t>&v){ if(v.empty())return 0.0; ZSTD_CCtx* zr=ZSTD_createCCtx(); std::vector<uint8_t> rb(ZSTD_compressBound(v.size())+64);
