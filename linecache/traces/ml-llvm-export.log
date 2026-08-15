@@ -1,0 +1,23 @@
+progress 100/1238 raw=0.34 GiB distinct=145120 candidates=912728 elapsed=16.1s
+progress 200/1238 raw=0.67 GiB distinct=259831 candidates=1663145 elapsed=32.8s
+progress 300/1238 raw=0.94 GiB distinct=293357 candidates=1893805 elapsed=47.7s
+progress 400/1238 raw=1.16 GiB distinct=312778 candidates=2030252 elapsed=58.3s
+progress 500/1238 raw=1.42 GiB distinct=426329 candidates=2699803 elapsed=72.2s
+progress 600/1238 raw=1.67 GiB distinct=466023 candidates=2949062 elapsed=84.1s
+progress 700/1238 raw=1.93 GiB distinct=514841 candidates=3278297 elapsed=102.1s
+progress 800/1238 raw=2.12 GiB distinct=556739 candidates=3569195 elapsed=112.0s
+progress 900/1238 raw=2.30 GiB distinct=602607 candidates=3827060 elapsed=121.6s
+progress 1000/1238 raw=2.61 GiB distinct=664850 candidates=4251572 elapsed=137.7s
+progress 1100/1238 raw=2.97 GiB distinct=708949 candidates=4569295 elapsed=156.4s
+progress 1200/1238 raw=3.28 GiB distinct=753845 candidates=4885958 elapsed=172.1s
+progress 1238/1238 raw=3.37 GiB distinct=771055 candidates=5001079 elapsed=176.5s
+==== ISSUE16 ML DEFINITION BAKEOFF: llvm ====
+manifest=/tanksmall/scratch/ictmp/corpus/manifest.txt TUs=1238 raw=3620271340 total_lines=137913644 distinct_lines=771055 distinct_bytes=40025224 regions=4829113 candidate_rows=5001079
+phases seconds: load=4.250 parse=167.946 label-oracle=0.768 model-update=3.334 total=176.516
+FTRL model bytes=8388608 updates=5001079
+FTRL K=1 recall_best=0.509018 byte_regret/event=1.0685 total_regret=823907
+FTRL K=2 recall_best=0.694855 byte_regret/event=0.5038 total_regret=388482
+FTRL K=4 recall_best=0.935792 byte_regret/event=0.1320 total_regret=101803
+FTRL K=8 recall_best=0.998023 byte_regret/event=0.0024 total_regret=1867
+codec rows (actual per-TU zstd-1 frames; four-byte framing; independent exact decoder):
+peak_RSS_MiB=2624.9 complete_harness_raw_GBps=0.021 export=linecache/traces/ml-llvm.bin

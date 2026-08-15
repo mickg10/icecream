@@ -1,0 +1,26 @@
+progress 100/1506 raw=0.10 GiB distinct=74854 candidates=470993 elapsed=5.5s
+progress 200/1506 raw=0.29 GiB distinct=150731 candidates=954175 elapsed=13.8s
+progress 300/1506 raw=0.61 GiB distinct=211660 candidates=1356899 elapsed=25.7s
+progress 400/1506 raw=0.92 GiB distinct=246657 candidates=1574303 elapsed=38.1s
+progress 500/1506 raw=1.29 GiB distinct=266134 candidates=1700754 elapsed=51.9s
+progress 600/1506 raw=1.58 GiB distinct=342525 candidates=2297147 elapsed=64.5s
+progress 700/1506 raw=1.87 GiB distinct=376272 candidates=2518503 elapsed=75.9s
+progress 800/1506 raw=2.15 GiB distinct=394886 candidates=2633577 elapsed=89.1s
+progress 900/1506 raw=2.34 GiB distinct=407535 candidates=2715221 elapsed=97.5s
+progress 1000/1506 raw=2.69 GiB distinct=426451 candidates=2845663 elapsed=111.5s
+progress 1100/1506 raw=3.03 GiB distinct=454864 candidates=3032321 elapsed=125.3s
+progress 1200/1506 raw=3.34 GiB distinct=483615 candidates=3209804 elapsed=137.4s
+progress 1300/1506 raw=3.68 GiB distinct=504195 candidates=3346858 elapsed=150.6s
+progress 1400/1506 raw=3.98 GiB distinct=561432 candidates=3758676 elapsed=163.5s
+progress 1500/1506 raw=4.30 GiB distinct=583011 candidates=3899915 elapsed=176.5s
+progress 1506/1506 raw=4.31 GiB distinct=586099 candidates=3920909 elapsed=177.2s
+==== ISSUE16 ML DEFINITION BAKEOFF: opencv ====
+manifest=/tanksmall/scratch/ictmp/corpus5/manifest.txt TUs=1506 raw=4630994774 total_lines=159014620 distinct_lines=586099 distinct_bytes=53562985 regions=6131525 candidate_rows=3920909
+phases seconds: load=4.921 parse=168.820 label-oracle=0.571 model-update=2.730 total=177.242
+FTRL model bytes=8388608 updates=3920909
+FTRL K=1 recall_best=0.378628 byte_regret/event=4.5276 total_regret=2653638
+FTRL K=2 recall_best=0.560483 byte_regret/event=2.6010 total_regret=1524435
+FTRL K=4 recall_best=0.833931 byte_regret/event=0.7727 total_regret=452890
+FTRL K=8 recall_best=0.995067 byte_regret/event=0.0267 total_regret=15670
+codec rows (actual per-TU zstd-1 frames; four-byte framing; independent exact decoder):
+peak_RSS_MiB=1465.2 complete_harness_raw_GBps=0.026 export=linecache/traces/ml-opencv.bin

@@ -1,0 +1,17 @@
+progress 100/622 raw=0.62 GiB distinct=275379 candidates=2107782 elapsed=29.3s
+progress 200/622 raw=1.14 GiB distinct=369506 candidates=2895380 elapsed=55.1s
+progress 300/622 raw=1.62 GiB distinct=433401 candidates=3343548 elapsed=84.3s
+progress 400/622 raw=2.06 GiB distinct=462480 candidates=3548854 elapsed=105.1s
+progress 500/622 raw=2.39 GiB distinct=490533 candidates=3743389 elapsed=121.9s
+progress 600/622 raw=2.87 GiB distinct=581769 candidates=4502464 elapsed=145.1s
+progress 622/622 raw=2.90 GiB distinct=587613 candidates=4541121 elapsed=146.9s
+==== ISSUE16 ML DEFINITION BAKEOFF: rocksdb ====
+manifest=/tanksmall/scratch/ictmp/corpus2/manifest.txt TUs=622 raw=3114320596 total_lines=110485751 distinct_lines=587613 distinct_bytes=44701802 regions=4358454 candidate_rows=4541121
+phases seconds: load=3.584 parse=139.415 label-oracle=0.693 model-update=3.063 total=146.944
+FTRL model bytes=8388608 updates=4541121
+FTRL K=1 recall_best=0.452212 byte_regret/event=3.1525 total_regret=1852441
+FTRL K=2 recall_best=0.605568 byte_regret/event=1.7116 total_regret=1005758
+FTRL K=4 recall_best=0.862263 byte_regret/event=0.6042 total_regret=355019
+FTRL K=8 recall_best=0.996801 byte_regret/event=0.0085 total_regret=4997
+codec rows (actual per-TU zstd-1 frames; four-byte framing; independent exact decoder):
+peak_RSS_MiB=2854.1 complete_harness_raw_GBps=0.021 export=linecache/traces/ml-rocksdb.bin

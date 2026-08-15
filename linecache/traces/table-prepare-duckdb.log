@@ -1,0 +1,12 @@
+{
+  "datasets": [
+    "linecache/traces/ml-duckdb.bin"
+  ],
+  "exact": true,
+  "frames": 689,
+  "operation": "prepare_exact_dynamic_superblock_frames",
+  "output": "linecache/ml-artifacts/superblock-duckdb.frames",
+  "payload_bytes": 33597241,
+  "raw_bytes": 1985715205,
+  "seconds": 5.452663357951678
+}

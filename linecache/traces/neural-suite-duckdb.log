@@ -1,0 +1,164 @@
+/tanksmall/scratch/ictmp/icecream-local-ml/linecache/ml_models.py:675: DeprecationWarning: torch.ao.quantization is deprecated and will be removed in 2.10.
+For migrations of users:
+1. Eager mode quantization (torch.ao.quantization.quantize, torch.ao.quantization.quantize_dynamic), please migrate to use torchao eager mode quantize_ API instead
+2. FX graph mode quantization (torch.ao.quantization.quantize_fx.prepare_fx,torch.ao.quantization.quantize_fx.convert_fx, please migrate to use torchao pt2e quantization API instead (prepare_pt2e, convert_pt2e)
+3. pt2e quantization has been migrated to torchao (https://github.com/pytorch/ao/tree/main/torchao/quantization/pt2e)
+see https://github.com/pytorch/ao/issues/2259 for more details
+  quantized = torch.ao.quantization.quantize_dynamic(model, {nn.Linear}, dtype=torch.qint8)
+{"model": "shared_byte_cnn_pair_ranker", "result": {"parameters": 86681, "float_model_bytes": 346724, "dynamic_quantized_state_bytes": 172208, "history": [{"epoch": 1, "loss": 0.002187532932963222, "seconds": 48.75027676700847}, {"epoch": 2, "loss": 0.0004162630271539092, "seconds": 47.59989047597628}], "heldout": {"sampled_events": 30000, "candidate_rows": 202255, "recall": {"1": 0.6557, "2": 0.8274666666666667, "4": 0.9812666666666666, "8": 0.9999333333333333}, "total_byte_regret": {"1": 6259, "2": 2280, "4": 443, "8": 0}, "byte_regret_per_event": {"1": 0.20863333333333334, "2": 0.076, "4": 0.014766666666666668, "8": 0.0}, "inference_seconds": 19.492164093011525, "candidate_rows_per_second": 10376.220877009442}, "decoder_requires_ranker": false}}
+{"model": "context_to_base_dual_encoder", "result": {"parameters": 90457, "float_model_bytes": 361828, "dynamic_quantized_state_bytes": 180556, "history": [{"epoch": 1, "loss": 0.01691890830807388, "seconds": 47.353150861978065}, {"epoch": 2, "loss": 0.0012810201992467045, "seconds": 52.247305812023114}], "heldout": {"sampled_events": 30000, "candidate_rows": 202255, "recall": {"1": 0.5833, "2": 0.7612666666666666, "4": 0.9481666666666667, "8": 0.9997}, "total_byte_regret": {"1": 13872, "2": 7429, "4": 2143, "8": 8}, "byte_regret_per_event": {"1": 0.4624, "2": 0.24763333333333334, "4": 0.07143333333333333, "8": 0.0002666666666666667}, "inference_seconds": 20.664935901993886, "candidate_rows_per_second": 9787.351916271133}, "decoder_requires_ranker": false}}
+{"model": "source_location_context_mlp", "result": {"parameters": 6913, "float_model_bytes": 27652, "dynamic_quantized_state_bytes": 12095, "history": [{"epoch": 1, "loss": 0.004748342596963048, "seconds": 6.240391148021445}, {"epoch": 2, "loss": 0.0013630805999785662, "seconds": 5.3735820049769245}], "heldout": {"sampled_events": 30000, "candidate_rows": 202255, "recall": {"1": 0.6625, "2": 0.8078666666666666, "4": 0.9610333333333333, "8": 0.9997333333333334}, "total_byte_regret": {"1": 18272, "2": 8943, "4": 2092, "8": 17}, "byte_regret_per_event": {"1": 0.6090666666666666, "2": 0.2981, "4": 0.06973333333333333, "8": 0.0005666666666666667}, "inference_seconds": 4.622572872962337, "candidate_rows_per_second": 43753.7721001652}, "decoder_requires_ranker": false}}
+{
+  "experiment": "candidate_ml_suite_pair_dual_source_context",
+  "models": {
+    "context_to_base_dual_encoder": {
+      "decoder_requires_ranker": false,
+      "dynamic_quantized_state_bytes": 180556,
+      "float_model_bytes": 361828,
+      "heldout": {
+        "byte_regret_per_event": {
+          "1": 0.4624,
+          "2": 0.24763333333333334,
+          "4": 0.07143333333333333,
+          "8": 0.0002666666666666667
+        },
+        "candidate_rows": 202255,
+        "candidate_rows_per_second": 9787.351916271133,
+        "inference_seconds": 20.664935901993886,
+        "recall": {
+          "1": 0.5833,
+          "2": 0.7612666666666666,
+          "4": 0.9481666666666667,
+          "8": 0.9997
+        },
+        "sampled_events": 30000,
+        "total_byte_regret": {
+          "1": 13872,
+          "2": 7429,
+          "4": 2143,
+          "8": 8
+        }
+      },
+      "history": [
+        {
+          "epoch": 1,
+          "loss": 0.01691890830807388,
+          "seconds": 47.353150861978065
+        },
+        {
+          "epoch": 2,
+          "loss": 0.0012810201992467045,
+          "seconds": 52.247305812023114
+        }
+      ],
+      "parameters": 90457
+    },
+    "shared_byte_cnn_pair_ranker": {
+      "decoder_requires_ranker": false,
+      "dynamic_quantized_state_bytes": 172208,
+      "float_model_bytes": 346724,
+      "heldout": {
+        "byte_regret_per_event": {
+          "1": 0.20863333333333334,
+          "2": 0.076,
+          "4": 0.014766666666666668,
+          "8": 0.0
+        },
+        "candidate_rows": 202255,
+        "candidate_rows_per_second": 10376.220877009442,
+        "inference_seconds": 19.492164093011525,
+        "recall": {
+          "1": 0.6557,
+          "2": 0.8274666666666667,
+          "4": 0.9812666666666666,
+          "8": 0.9999333333333333
+        },
+        "sampled_events": 30000,
+        "total_byte_regret": {
+          "1": 6259,
+          "2": 2280,
+          "4": 443,
+          "8": 0
+        }
+      },
+      "history": [
+        {
+          "epoch": 1,
+          "loss": 0.002187532932963222,
+          "seconds": 48.75027676700847
+        },
+        {
+          "epoch": 2,
+          "loss": 0.0004162630271539092,
+          "seconds": 47.59989047597628
+        }
+      ],
+      "parameters": 86681
+    },
+    "source_location_context_mlp": {
+      "decoder_requires_ranker": false,
+      "dynamic_quantized_state_bytes": 12095,
+      "float_model_bytes": 27652,
+      "heldout": {
+        "byte_regret_per_event": {
+          "1": 0.6090666666666666,
+          "2": 0.2981,
+          "4": 0.06973333333333333,
+          "8": 0.0005666666666666667
+        },
+        "candidate_rows": 202255,
+        "candidate_rows_per_second": 43753.7721001652,
+        "inference_seconds": 4.622572872962337,
+        "recall": {
+          "1": 0.6625,
+          "2": 0.8078666666666666,
+          "4": 0.9610333333333333,
+          "8": 0.9997333333333334
+        },
+        "sampled_events": 30000,
+        "total_byte_regret": {
+          "1": 18272,
+          "2": 8943,
+          "4": 2092,
+          "8": 17
+        }
+      },
+      "history": [
+        {
+          "epoch": 1,
+          "loss": 0.004748342596963048,
+          "seconds": 6.240391148021445
+        },
+        {
+          "epoch": 2,
+          "loss": 0.0013630805999785662,
+          "seconds": 5.3735820049769245
+        }
+      ],
+      "parameters": 6913
+    }
+  },
+  "sample_stats": {
+    "candidates": 13463109,
+    "events": 1944767,
+    "line_bytes": 138290011,
+    "raw_bytes": 11365586710,
+    "sampled": 200000,
+    "seen": 13463109
+  },
+  "test": "linecache/traces/ml-duckdb.bin",
+  "test_stats": {
+    "candidate_rows": 4300903,
+    "events_seen_by_reservoir": 637609,
+    "events_with_candidates": 637609,
+    "raw_bytes": 1985715205,
+    "sampled_events": 30000,
+    "tus": 689
+  },
+  "train": [
+    "linecache/traces/ml-llvm.bin",
+    "linecache/traces/ml-rocksdb.bin",
+    "linecache/traces/ml-opencv.bin"
+  ],
+  "wall_seconds": 382.32755975198234
+}

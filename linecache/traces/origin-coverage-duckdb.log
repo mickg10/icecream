@@ -1,0 +1,42 @@
+training corpus 1/3 files=1238 unique-assets=833373 raw=3.37 GiB
+training corpus 2/3 files=622 unique-assets=2018778 raw=6.27 GiB
+training corpus 3/3 files=1506 unique-assets=2637391 raw=10.59 GiB
+selecting exact assets from 2637391 unique candidates
+assets generic R/L=4813/65252 toolchain R/L=7326/70390
+target 100/689 raw=0.29 GiB regions=366155 lines=11171868
+target 200/689 raw=0.60 GiB regions=764634 lines=22795143
+target 300/689 raw=0.77 GiB regions=976096 lines=28794135
+target 400/689 raw=0.98 GiB regions=1255492 lines=36814349
+target 500/689 raw=1.38 GiB regions=1790314 lines=51727027
+target 600/689 raw=1.71 GiB regions=2271842 lines=64222624
+target 689/689 raw=1.85 GiB regions=2521258 lines=69094918
+==== ORIGIN/STATIC REGION COVERAGE DuckDB-full ====
+target=/tanksmall/scratch/ictmp/corpus3/manifest.txt training_manifests=3 TUs=689 raw=1985715205 region_occ=2521258 line_occ=69094918
+training raw=11365586710 unique_assets=2637391 region_occ=15319092 line_occ=407414015
+COVERAGE track=GENERIC_II_REGION budget=0 model_hit_objects=0/210074 model_hit_bytes=0/94088858 byte_fraction=0.00000000
+COVERAGE track=GENERIC_II_REGION budget=262144 model_hit_objects=828/210074 model_hit_bytes=242241/94088858 byte_fraction=0.00257460
+COVERAGE track=GENERIC_II_REGION budget=1048576 model_hit_objects=2327/210074 model_hit_bytes=990577/94088858 byte_fraction=0.01052810
+COVERAGE track=GENERIC_II_REGION budget=4194304 model_hit_objects=4186/210074 model_hit_bytes=2646798/94088858 byte_fraction=0.02813083
+COVERAGE track=GENERIC_II_REGION budget=16777216 model_hit_objects=4186/210074 model_hit_bytes=2646798/94088858 byte_fraction=0.02813083
+COVERAGE track=GENERIC_II_REGION budget=67108864 model_hit_objects=4186/210074 model_hit_bytes=2646798/94088858 byte_fraction=0.02813083
+COVERAGE track=GENERIC_II_LINE budget=0 model_hit_objects=0/637610 model_hit_bytes=0/54733427 byte_fraction=0.00000000
+COVERAGE track=GENERIC_II_LINE budget=262144 model_hit_objects=4120/637610 model_hit_bytes=162917/54733427 byte_fraction=0.00297655
+COVERAGE track=GENERIC_II_LINE budget=1048576 model_hit_objects=15356/637610 model_hit_bytes=679520/54733427 byte_fraction=0.01241508
+COVERAGE track=GENERIC_II_LINE budget=4194304 model_hit_objects=42976/637610 model_hit_bytes=2030035/54733427 byte_fraction=0.03708949
+COVERAGE track=GENERIC_II_LINE budget=16777216 model_hit_objects=45802/637610 model_hit_bytes=2146343/54733427 byte_fraction=0.03921448
+COVERAGE track=GENERIC_II_LINE budget=67108864 model_hit_objects=45802/637610 model_hit_bytes=2146343/54733427 byte_fraction=0.03921448
+COVERAGE track=TOOLCHAIN_REGION budget=0 model_hit_objects=0/210074 model_hit_bytes=0/94088858 byte_fraction=0.00000000
+COVERAGE track=TOOLCHAIN_REGION budget=262144 model_hit_objects=825/210074 model_hit_bytes=242180/94088858 byte_fraction=0.00257395
+COVERAGE track=TOOLCHAIN_REGION budget=1048576 model_hit_objects=2325/210074 model_hit_bytes=990796/94088858 byte_fraction=0.01053043
+COVERAGE track=TOOLCHAIN_REGION budget=4194304 model_hit_objects=4337/210074 model_hit_bytes=3087556/94088858 byte_fraction=0.03281532
+COVERAGE track=TOOLCHAIN_REGION budget=16777216 model_hit_objects=4577/210074 model_hit_bytes=3396790/94088858 byte_fraction=0.03610194
+COVERAGE track=TOOLCHAIN_REGION budget=67108864 model_hit_objects=4577/210074 model_hit_bytes=3396790/94088858 byte_fraction=0.03610194
+COVERAGE track=TOOLCHAIN_LINE budget=0 model_hit_objects=0/637610 model_hit_bytes=0/54733427 byte_fraction=0.00000000
+COVERAGE track=TOOLCHAIN_LINE budget=262144 model_hit_objects=4112/637610 model_hit_bytes=163422/54733427 byte_fraction=0.00298578
+COVERAGE track=TOOLCHAIN_LINE budget=1048576 model_hit_objects=15301/637610 model_hit_bytes=680074/54733427 byte_fraction=0.01242520
+COVERAGE track=TOOLCHAIN_LINE budget=4194304 model_hit_objects=45565/637610 model_hit_bytes=2155110/54733427 byte_fraction=0.03937466
+COVERAGE track=TOOLCHAIN_LINE budget=16777216 model_hit_objects=46071/637610 model_hit_bytes=2181066/54733427 byte_fraction=0.03984888
+COVERAGE track=TOOLCHAIN_LINE budget=67108864 model_hit_objects=46071/637610 model_hit_bytes=2181066/54733427 byte_fraction=0.03984888
+SOURCE exact_direct_lines=32749932/66573660 exact_direct_bytes=819660757/1822706063 fraction=0.44969443 system_exact_lines=25074342 system_exact_bytes=643124098
+SOURCE available_regions=2519191 available_region_bytes=1985673176 system_files=503 system_package_bytes=6447792 project_files=4391 project_package_bytes=62189711
+elapsed=160.811 peak_RSS_MiB=462.7 raw_GBps=0.012 exact_compare=YES

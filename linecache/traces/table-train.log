@@ -1,0 +1,42 @@
+{"row": {"clusters": 64, "model": "linecache/ml-artifacts/superblock-table-64.bin", "model_bytes": 40984, "training_bits_per_byte": 7.097740555590046, "contexts_used": 4096, "exact_integer_total": 4096}}
+{"row": {"clusters": 128, "model": "linecache/ml-artifacts/superblock-table-128.bin", "model_bytes": 73752, "training_bits_per_byte": 7.024426223723558, "contexts_used": 4096, "exact_integer_total": 4096}}
+{"row": {"clusters": 256, "model": "linecache/ml-artifacts/superblock-table-256.bin", "model_bytes": 139288, "training_bits_per_byte": 6.933905285787914, "contexts_used": 4096, "exact_integer_total": 4096}}
+{
+  "experiment": "pretrained_context_mixture_integer_table_clusters",
+  "rows": [
+    {
+      "clusters": 64,
+      "contexts_used": 4096,
+      "exact_integer_total": 4096,
+      "model": "linecache/ml-artifacts/superblock-table-64.bin",
+      "model_bytes": 40984,
+      "training_bits_per_byte": 7.097740555590046
+    },
+    {
+      "clusters": 128,
+      "contexts_used": 4096,
+      "exact_integer_total": 4096,
+      "model": "linecache/ml-artifacts/superblock-table-128.bin",
+      "model_bytes": 73752,
+      "training_bits_per_byte": 7.024426223723558
+    },
+    {
+      "clusters": 256,
+      "contexts_used": 4096,
+      "exact_integer_total": 4096,
+      "model": "linecache/ml-artifacts/superblock-table-256.bin",
+      "model_bytes": 139288,
+      "training_bits_per_byte": 6.933905285787914
+    }
+  ],
+  "train_frames": [
+    "linecache/ml-artifacts/superblock-train.frames"
+  ],
+  "training": {
+    "frames": 3366,
+    "payload_bytes": 146765057,
+    "raw_bytes": 11365586710,
+    "seconds": 22.671855463006068
+  },
+  "wall_seconds": 28.4073414739687
+}

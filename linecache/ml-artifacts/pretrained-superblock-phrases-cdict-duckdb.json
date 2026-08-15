@@ -1,0 +1,980 @@
+{
+  "experiment": "disjoint_project_exact_pretrained_superblocks_and_teachers",
+  "levels": [
+    1
+  ],
+  "outer_dictionary_training": {
+    "package_budget": 1048576,
+    "sample_bytes": 27625622,
+    "samples": 3366
+  },
+  "rows": [
+    {
+      "blocks": 237923,
+      "budget": 0,
+      "decode_effective_GBps": 1.2769136211516023,
+      "decode_seconds": 1.5550896882195957,
+      "encode_effective_GBps": 5.0485201487748625,
+      "encode_seconds": 0.3933261919301003,
+      "exact": true,
+      "fraction_curve": [
+        {
+          "fraction": 0.1,
+          "raw_bytes": 199669657,
+          "raw_input_ratio_charged": 82.01040092627923,
+          "wire_bytes": 2434686,
+          "wire_plus_model": 2434687
+        },
+        {
+          "fraction": 0.25,
+          "raw_bytes": 499667458,
+          "raw_input_ratio_charged": 68.36364081644939,
+          "wire_bytes": 7308964,
+          "wire_plus_model": 7308965
+        },
+        {
+          "fraction": 0.5,
+          "raw_bytes": 994463627,
+          "raw_input_ratio_charged": 61.507616214062494,
+          "wire_bytes": 16168137,
+          "wire_plus_model": 16168138
+        },
+        {
+          "fraction": 0.75,
+          "raw_bytes": 1491912807,
+          "raw_input_ratio_charged": 61.68921674387849,
+          "wire_bytes": 24184336,
+          "wire_plus_model": 24184337
+        },
+        {
+          "fraction": 1.0,
+          "raw_bytes": 1985715205,
+          "raw_input_ratio_charged": 63.996761834411544,
+          "wire_bytes": 31028369,
+          "wire_plus_model": 31028370
+        }
+      ],
+      "model_bytes": 1,
+      "name": "dynamic-only",
+      "outer_dictionary_bytes": 0,
+      "payload_bytes": 33597241,
+      "prediction_bytes": 1,
+      "raw_bytes": 1985715205,
+      "raw_input_ratio": 63.99676389693574,
+      "raw_input_ratio_charged": 63.996761834411544,
+      "static_assets": 0,
+      "static_definition_bytes": 0,
+      "tus": 689,
+      "wire_bytes": 31028369,
+      "wire_plus_model": 31028370
+    },
+    {
+      "blocks": 237923,
+      "budget": 0,
+      "decode_effective_GBps": 1.2823484931232314,
+      "decode_seconds": 1.548498879710678,
+      "encode_effective_GBps": 5.178567217278288,
+      "encode_seconds": 0.38344876520568505,
+      "exact": true,
+      "fraction_curve": [
+        {
+          "fraction": 0.1,
+          "raw_bytes": 199669657,
+          "raw_input_ratio_charged": 82.01040092627923,
+          "wire_bytes": 2434686,
+          "wire_plus_model": 2434687
+        },
+        {
+          "fraction": 0.25,
+          "raw_bytes": 499667458,
+          "raw_input_ratio_charged": 68.36364081644939,
+          "wire_bytes": 7308964,
+          "wire_plus_model": 7308965
+        },
+        {
+          "fraction": 0.5,
+          "raw_bytes": 994463627,
+          "raw_input_ratio_charged": 61.507616214062494,
+          "wire_bytes": 16168137,
+          "wire_plus_model": 16168138
+        },
+        {
+          "fraction": 0.75,
+          "raw_bytes": 1491912807,
+          "raw_input_ratio_charged": 61.68921674387849,
+          "wire_bytes": 24184336,
+          "wire_plus_model": 24184337
+        },
+        {
+          "fraction": 1.0,
+          "raw_bytes": 1985715205,
+          "raw_input_ratio_charged": 63.996761834411544,
+          "wire_bytes": 31028369,
+          "wire_plus_model": 31028370
+        }
+      ],
+      "model_bytes": 1,
+      "name": "static-0",
+      "outer_dictionary_bytes": 0,
+      "payload_bytes": 33597241,
+      "prediction_bytes": 1,
+      "raw_bytes": 1985715205,
+      "raw_input_ratio": 63.99676389693574,
+      "raw_input_ratio_charged": 63.996761834411544,
+      "static_assets": 0,
+      "static_definition_bytes": 0,
+      "tus": 689,
+      "wire_bytes": 31028369,
+      "wire_plus_model": 31028370
+    },
+    {
+      "blocks": 237923,
+      "budget": 0,
+      "decode_effective_GBps": 1.2679439759059243,
+      "decode_seconds": 1.5660906496923417,
+      "encode_effective_GBps": 5.311043065804003,
+      "encode_seconds": 0.3738842220627703,
+      "exact": true,
+      "fraction_curve": [
+        {
+          "fraction": 0.1,
+          "raw_bytes": 199669657,
+          "raw_input_ratio_charged": 82.01040092627923,
+          "wire_bytes": 2434686,
+          "wire_plus_model": 2434687
+        },
+        {
+          "fraction": 0.25,
+          "raw_bytes": 499667458,
+          "raw_input_ratio_charged": 68.36364081644939,
+          "wire_bytes": 7308964,
+          "wire_plus_model": 7308965
+        },
+        {
+          "fraction": 0.5,
+          "raw_bytes": 994463627,
+          "raw_input_ratio_charged": 61.507616214062494,
+          "wire_bytes": 16168137,
+          "wire_plus_model": 16168138
+        },
+        {
+          "fraction": 0.75,
+          "raw_bytes": 1491912807,
+          "raw_input_ratio_charged": 61.68921674387849,
+          "wire_bytes": 24184336,
+          "wire_plus_model": 24184337
+        },
+        {
+          "fraction": 1.0,
+          "raw_bytes": 1985715205,
+          "raw_input_ratio_charged": 63.996761834411544,
+          "wire_bytes": 31028369,
+          "wire_plus_model": 31028370
+        }
+      ],
+      "model_bytes": 1,
+      "name": "static-ngram-0",
+      "outer_dictionary_bytes": 0,
+      "payload_bytes": 33597241,
+      "prediction_bytes": 1,
+      "raw_bytes": 1985715205,
+      "raw_input_ratio": 63.99676389693574,
+      "raw_input_ratio_charged": 63.996761834411544,
+      "static_assets": 0,
+      "static_definition_bytes": 0,
+      "tus": 689,
+      "wire_bytes": 31028369,
+      "wire_plus_model": 31028370
+    },
+    {
+      "blocks": 750132,
+      "budget": 262144,
+      "decode_effective_GBps": 1.0343408526856817,
+      "decode_seconds": 1.9197880465071648,
+      "encode_effective_GBps": 2.147224848129356,
+      "encode_seconds": 0.9247821469325572,
+      "exact": true,
+      "fraction_curve": [
+        {
+          "fraction": 0.1,
+          "raw_bytes": 199669657,
+          "raw_input_ratio_charged": 181.4227055444553,
+          "wire_bytes": 838443,
+          "wire_plus_model": 1100577
+        },
+        {
+          "fraction": 0.25,
+          "raw_bytes": 499667458,
+          "raw_input_ratio_charged": 213.88253458535033,
+          "wire_bytes": 2074043,
+          "wire_plus_model": 2336177
+        },
+        {
+          "fraction": 0.5,
+          "raw_bytes": 994463627,
+          "raw_input_ratio_charged": 208.87950519896896,
+          "wire_bytes": 4498810,
+          "wire_plus_model": 4760944
+        },
+        {
+          "fraction": 0.75,
+          "raw_bytes": 1491912807,
+          "raw_input_ratio_charged": 172.2282965233479,
+          "wire_bytes": 8400280,
+          "wire_plus_model": 8662414
+        },
+        {
+          "fraction": 1.0,
+          "raw_bytes": 1985715205,
+          "raw_input_ratio_charged": 156.49023277359692,
+          "wire_bytes": 12426934,
+          "wire_plus_model": 12689068
+        }
+      ],
+      "model_bytes": 262134,
+      "name": "static-262144",
+      "outer_dictionary_bytes": 0,
+      "payload_bytes": 13702223,
+      "prediction_bytes": 1,
+      "raw_bytes": 1985715205,
+      "raw_input_ratio": 159.79124094487022,
+      "raw_input_ratio_charged": 156.49023277359692,
+      "static_assets": 4704,
+      "static_definition_bytes": 262133,
+      "tus": 689,
+      "wire_bytes": 12426934,
+      "wire_plus_model": 12689068
+    },
+    {
+      "blocks": 750132,
+      "budget": 262144,
+      "decode_effective_GBps": 1.0434218527445684,
+      "decode_seconds": 1.9030799477477558,
+      "encode_effective_GBps": 2.362812587384171,
+      "encode_seconds": 0.8404031769605353,
+      "exact": true,
+      "fraction_curve": [
+        {
+          "fraction": 0.1,
+          "raw_bytes": 199669657,
+          "raw_input_ratio_charged": 192.68538968025962,
+          "wire_bytes": 749802,
+          "wire_plus_model": 1036247
+        },
+        {
+          "fraction": 0.25,
+          "raw_bytes": 499667458,
+          "raw_input_ratio_charged": 233.0339611870815,
+          "wire_bytes": 1857738,
+          "wire_plus_model": 2144183
+        },
+        {
+          "fraction": 0.5,
+          "raw_bytes": 994463627,
+          "raw_input_ratio_charged": 227.79822432291402,
+          "wire_bytes": 4079101,
+          "wire_plus_model": 4365546
+        },
+        {
+          "fraction": 0.75,
+          "raw_bytes": 1491912807,
+          "raw_input_ratio_charged": 184.70489773906507,
+          "wire_bytes": 7790833,
+          "wire_plus_model": 8077278
+        },
+        {
+          "fraction": 1.0,
+          "raw_bytes": 1985715205,
+          "raw_input_ratio_charged": 167.00619693628354,
+          "wire_bytes": 11603624,
+          "wire_plus_model": 11890069
+        }
+      ],
+      "model_bytes": 286445,
+      "name": "static-ngram-262144",
+      "outer_dictionary_bytes": 0,
+      "payload_bytes": 13330416,
+      "prediction_bytes": 24312,
+      "raw_bytes": 1985715205,
+      "raw_input_ratio": 171.12888223541196,
+      "raw_input_ratio_charged": 167.00619693628354,
+      "static_assets": 4704,
+      "static_definition_bytes": 262133,
+      "tus": 689,
+      "wire_bytes": 11603624,
+      "wire_plus_model": 11890069
+    },
+    {
+      "blocks": 656953,
+      "budget": 1048576,
+      "decode_effective_GBps": 1.0696285346833359,
+      "decode_seconds": 1.8564530962030403,
+      "encode_effective_GBps": 2.2418357584242927,
+      "encode_seconds": 0.885754095739685,
+      "exact": true,
+      "fraction_curve": [
+        {
+          "fraction": 0.1,
+          "raw_bytes": 199669657,
+          "raw_input_ratio_charged": 112.73192429948227,
+          "wire_bytes": 722613,
+          "wire_plus_model": 1771190
+        },
+        {
+          "fraction": 0.25,
+          "raw_bytes": 499667458,
+          "raw_input_ratio_charged": 177.03925800944884,
+          "wire_bytes": 1773777,
+          "wire_plus_model": 2822354
+        },
+        {
+          "fraction": 0.5,
+          "raw_bytes": 994463627,
+          "raw_input_ratio_charged": 201.81332751310413,
+          "wire_bytes": 3879064,
+          "wire_plus_model": 4927641
+        },
+        {
+          "fraction": 0.75,
+          "raw_bytes": 1491912807,
+          "raw_input_ratio_charged": 175.05599678685417,
+          "wire_bytes": 7473912,
+          "wire_plus_model": 8522489
+        },
+        {
+          "fraction": 1.0,
+          "raw_bytes": 1985715205,
+          "raw_input_ratio_charged": 161.62847232594507,
+          "wire_bytes": 11237100,
+          "wire_plus_model": 12285677
+        }
+      ],
+      "model_bytes": 1048577,
+      "name": "static-1048576",
+      "outer_dictionary_bytes": 0,
+      "payload_bytes": 12407262,
+      "prediction_bytes": 1,
+      "raw_bytes": 1985715205,
+      "raw_input_ratio": 176.71064643012878,
+      "raw_input_ratio_charged": 161.62847232594507,
+      "static_assets": 13729,
+      "static_definition_bytes": 1048576,
+      "tus": 689,
+      "wire_bytes": 11237100,
+      "wire_plus_model": 12285677
+    },
+    {
+      "blocks": 656953,
+      "budget": 1048576,
+      "decode_effective_GBps": 0.974333005900934,
+      "decode_seconds": 2.038025185407605,
+      "encode_effective_GBps": 2.0860473823709,
+      "encode_seconds": 0.9519032126409002,
+      "exact": true,
+      "fraction_curve": [
+        {
+          "fraction": 0.1,
+          "raw_bytes": 199669657,
+          "raw_input_ratio_charged": 113.05880857429693,
+          "wire_bytes": 651824,
+          "wire_plus_model": 1766069
+        },
+        {
+          "fraction": 0.25,
+          "raw_bytes": 499667458,
+          "raw_input_ratio_charged": 184.05273083969905,
+          "wire_bytes": 1600561,
+          "wire_plus_model": 2714806
+        },
+        {
+          "fraction": 0.5,
+          "raw_bytes": 994463627,
+          "raw_input_ratio_charged": 213.6039268904424,
+          "wire_bytes": 3541398,
+          "wire_plus_model": 4655643
+        },
+        {
+          "fraction": 0.75,
+          "raw_bytes": 1491912807,
+          "raw_input_ratio_charged": 184.2703249263524,
+          "wire_bytes": 6982082,
+          "wire_plus_model": 8096327
+        },
+        {
+          "fraction": 1.0,
+          "raw_bytes": 1985715205,
+          "raw_input_ratio_charged": 169.6365468492967,
+          "wire_bytes": 10591459,
+          "wire_plus_model": 11705704
+        }
+      ],
+      "model_bytes": 1114245,
+      "name": "static-ngram-1048576",
+      "outer_dictionary_bytes": 0,
+      "payload_bytes": 12111353,
+      "prediction_bytes": 65669,
+      "raw_bytes": 1985715205,
+      "raw_input_ratio": 187.4826881735557,
+      "raw_input_ratio_charged": 169.6365468492967,
+      "static_assets": 13729,
+      "static_definition_bytes": 1048576,
+      "tus": 689,
+      "wire_bytes": 10591459,
+      "wire_plus_model": 11705704
+    },
+    {
+      "blocks": 514040,
+      "budget": 4194304,
+      "decode_effective_GBps": 1.151517687811135,
+      "decode_seconds": 1.7244330903631635,
+      "encode_effective_GBps": 2.565408438889625,
+      "encode_seconds": 0.7740347209037282,
+      "exact": true,
+      "fraction_curve": [
+        {
+          "fraction": 0.1,
+          "raw_bytes": 199669657,
+          "raw_input_ratio_charged": 40.97284710578367,
+          "wire_bytes": 678918,
+          "wire_plus_model": 4873219
+        },
+        {
+          "fraction": 0.25,
+          "raw_bytes": 499667458,
+          "raw_input_ratio_charged": 85.45042987939708,
+          "wire_bytes": 1653153,
+          "wire_plus_model": 5847454
+        },
+        {
+          "fraction": 0.5,
+          "raw_bytes": 994463627,
+          "raw_input_ratio_charged": 127.37364597310365,
+          "wire_bytes": 3613151,
+          "wire_plus_model": 7807452
+        },
+        {
+          "fraction": 0.75,
+          "raw_bytes": 1491912807,
+          "raw_input_ratio_charged": 132.6970505823224,
+          "wire_bytes": 7048698,
+          "wire_plus_model": 11242999
+        },
+        {
+          "fraction": 1.0,
+          "raw_bytes": 1985715205,
+          "raw_input_ratio_charged": 133.26317144054593,
+          "wire_bytes": 10706404,
+          "wire_plus_model": 14900705
+        }
+      ],
+      "model_bytes": 4194301,
+      "name": "static-4194304",
+      "outer_dictionary_bytes": 0,
+      "payload_bytes": 11821992,
+      "prediction_bytes": 1,
+      "raw_bytes": 1985715205,
+      "raw_input_ratio": 185.4698557050528,
+      "raw_input_ratio_charged": 133.26317144054593,
+      "static_assets": 39463,
+      "static_definition_bytes": 4194300,
+      "tus": 689,
+      "wire_bytes": 10706404,
+      "wire_plus_model": 14900705
+    },
+    {
+      "blocks": 514040,
+      "budget": 4194304,
+      "decode_effective_GBps": 1.2072138363931857,
+      "decode_seconds": 1.644874458143022,
+      "encode_effective_GBps": 2.737935768007614,
+      "encode_seconds": 0.7252599670900963,
+      "exact": true,
+      "fraction_curve": [
+        {
+          "fraction": 0.1,
+          "raw_bytes": 199669657,
+          "raw_input_ratio_charged": 39.75216858436485,
+          "wire_bytes": 629487,
+          "wire_plus_model": 5022862
+        },
+        {
+          "fraction": 0.25,
+          "raw_bytes": 499667458,
+          "raw_input_ratio_charged": 84.36260181956168,
+          "wire_bytes": 1529480,
+          "wire_plus_model": 5922855
+        },
+        {
+          "fraction": 0.5,
+          "raw_bytes": 994463627,
+          "raw_input_ratio_charged": 128.0030658788752,
+          "wire_bytes": 3375686,
+          "wire_plus_model": 7769061
+        },
+        {
+          "fraction": 0.75,
+          "raw_bytes": 1491912807,
+          "raw_input_ratio_charged": 134.53619875512476,
+          "wire_bytes": 6695929,
+          "wire_plus_model": 11089304
+        },
+        {
+          "fraction": 1.0,
+          "raw_bytes": 1985715205,
+          "raw_input_ratio_charged": 136.1161963598022,
+          "wire_bytes": 10195008,
+          "wire_plus_model": 14588383
+        }
+      ],
+      "model_bytes": 4393375,
+      "name": "static-ngram-4194304",
+      "outer_dictionary_bytes": 0,
+      "payload_bytes": 11514650,
+      "prediction_bytes": 199075,
+      "raw_bytes": 1985715205,
+      "raw_input_ratio": 194.77328561193872,
+      "raw_input_ratio_charged": 136.1161963598022,
+      "static_assets": 39463,
+      "static_definition_bytes": 4194300,
+      "tus": 689,
+      "wire_bytes": 10195008,
+      "wire_plus_model": 14588383
+    },
+    {
+      "blocks": 402909,
+      "budget": 16777216,
+      "decode_effective_GBps": 1.2623040354794004,
+      "decode_seconds": 1.573087900527753,
+      "encode_effective_GBps": 3.1116193144752184,
+      "encode_seconds": 0.6381613572593778,
+      "exact": true,
+      "fraction_curve": [
+        {
+          "fraction": 0.1,
+          "raw_bytes": 199669657,
+          "raw_input_ratio_charged": 11.477995976514878,
+          "wire_bytes": 618654,
+          "wire_plus_model": 17395864
+        },
+        {
+          "fraction": 0.25,
+          "raw_bytes": 499667458,
+          "raw_input_ratio_charged": 27.31049170503885,
+          "wire_bytes": 1518596,
+          "wire_plus_model": 18295806
+        },
+        {
+          "fraction": 0.5,
+          "raw_bytes": 994463627,
+          "raw_input_ratio_charged": 49.48776803744587,
+          "wire_bytes": 3317930,
+          "wire_plus_model": 20095140
+        },
+        {
+          "fraction": 0.75,
+          "raw_bytes": 1491912807,
+          "raw_input_ratio_charged": 63.855259188108256,
+          "wire_bytes": 6586767,
+          "wire_plus_model": 23363977
+        },
+        {
+          "fraction": 1.0,
+          "raw_bytes": 1985715205,
+          "raw_input_ratio_charged": 73.97713543963455,
+          "wire_bytes": 10065073,
+          "wire_plus_model": 26842283
+        }
+      ],
+      "model_bytes": 16777210,
+      "name": "static-16777216",
+      "outer_dictionary_bytes": 0,
+      "payload_bytes": 11110248,
+      "prediction_bytes": 1,
+      "raw_bytes": 1985715205,
+      "raw_input_ratio": 197.28771018352276,
+      "raw_input_ratio_charged": 73.97713543963455,
+      "static_assets": 90887,
+      "static_definition_bytes": 16777209,
+      "tus": 689,
+      "wire_bytes": 10065073,
+      "wire_plus_model": 26842283
+    },
+    {
+      "blocks": 402909,
+      "budget": 16777216,
+      "decode_effective_GBps": 1.2867471161311776,
+      "decode_seconds": 1.5432054831180722,
+      "encode_effective_GBps": 3.1558498676186364,
+      "encode_seconds": 0.6292172594694421,
+      "exact": true,
+      "fraction_curve": [
+        {
+          "fraction": 0.1,
+          "raw_bytes": 199669657,
+          "raw_input_ratio_charged": 11.225971084430558,
+          "wire_bytes": 599576,
+          "wire_plus_model": 17786404
+        },
+        {
+          "fraction": 0.25,
+          "raw_bytes": 499667458,
+          "raw_input_ratio_charged": 26.77925680980773,
+          "wire_bytes": 1471922,
+          "wire_plus_model": 18658750
+        },
+        {
+          "fraction": 0.5,
+          "raw_bytes": 994463627,
+          "raw_input_ratio_charged": 48.71441302790083,
+          "wire_bytes": 3227328,
+          "wire_plus_model": 20414156
+        },
+        {
+          "fraction": 0.75,
+          "raw_bytes": 1491912807,
+          "raw_input_ratio_charged": 63.11006323388772,
+          "wire_bytes": 6453028,
+          "wire_plus_model": 23639856
+        },
+        {
+          "fraction": 1.0,
+          "raw_bytes": 1985715205,
+          "raw_input_ratio_charged": 73.35902344914294,
+          "wire_bytes": 9881624,
+          "wire_plus_model": 27068452
+        }
+      ],
+      "model_bytes": 17186828,
+      "name": "static-ngram-16777216",
+      "outer_dictionary_bytes": 0,
+      "payload_bytes": 10980893,
+      "prediction_bytes": 409619,
+      "raw_bytes": 1985715205,
+      "raw_input_ratio": 200.950289648746,
+      "raw_input_ratio_charged": 73.35902344914294,
+      "static_assets": 90887,
+      "static_definition_bytes": 16777209,
+      "tus": 689,
+      "wire_bytes": 9881624,
+      "wire_plus_model": 27068452
+    },
+    {
+      "blocks": 359546,
+      "budget": 67108864,
+      "decode_effective_GBps": 1.1950140779127407,
+      "decode_seconds": 1.6616667884518392,
+      "encode_effective_GBps": 3.0260041922010594,
+      "encode_seconds": 0.6562169378739782,
+      "exact": true,
+      "fraction_curve": [
+        {
+          "fraction": 0.1,
+          "raw_bytes": 199669657,
+          "raw_input_ratio_charged": 2.948951577015377,
+          "wire_bytes": 599843,
+          "wire_plus_model": 67708693
+        },
+        {
+          "fraction": 0.25,
+          "raw_bytes": 499667458,
+          "raw_input_ratio_charged": 7.285268657513108,
+          "wire_bytes": 1477153,
+          "wire_plus_model": 68586003
+        },
+        {
+          "fraction": 0.5,
+          "raw_bytes": 994463627,
+          "raw_input_ratio_charged": 14.136943460279436,
+          "wire_bytes": 3236174,
+          "wire_plus_model": 70345024
+        },
+        {
+          "fraction": 0.75,
+          "raw_bytes": 1491912807,
+          "raw_input_ratio_charged": 20.280151694069353,
+          "wire_bytes": 6456320,
+          "wire_plus_model": 73565170
+        },
+        {
+          "fraction": 1.0,
+          "raw_bytes": 1985715205,
+          "raw_input_ratio_charged": 25.78615056028057,
+          "wire_bytes": 9898193,
+          "wire_plus_model": 77007043
+        }
+      ],
+      "model_bytes": 67108850,
+      "name": "static-67108864",
+      "outer_dictionary_bytes": 0,
+      "payload_bytes": 10916485,
+      "prediction_bytes": 1,
+      "raw_bytes": 1985715205,
+      "raw_input_ratio": 200.61391053902466,
+      "raw_input_ratio_charged": 25.78615056028057,
+      "static_assets": 232533,
+      "static_definition_bytes": 67108849,
+      "tus": 689,
+      "wire_bytes": 9898193,
+      "wire_plus_model": 77007043
+    },
+    {
+      "blocks": 359546,
+      "budget": 67108864,
+      "decode_effective_GBps": 1.2708981608289442,
+      "decode_seconds": 1.5624502939754166,
+      "encode_effective_GBps": 2.9886100623697582,
+      "encode_seconds": 0.6644276648876257,
+      "exact": true,
+      "fraction_curve": [
+        {
+          "fraction": 0.1,
+          "raw_bytes": 199669657,
+          "raw_input_ratio_charged": 2.9130164527574434,
+          "wire_bytes": 593376,
+          "wire_plus_model": 68543951
+        },
+        {
+          "fraction": 0.25,
+          "raw_bytes": 499667458,
+          "raw_input_ratio_charged": 7.198541693976301,
+          "wire_bytes": 1461742,
+          "wire_plus_model": 69412317
+        },
+        {
+          "fraction": 0.5,
+          "raw_bytes": 994463627,
+          "raw_input_ratio_charged": 13.97585846003286,
+          "wire_bytes": 3205242,
+          "wire_plus_model": 71155817
+        },
+        {
+          "fraction": 0.75,
+          "raw_bytes": 1491912807,
+          "raw_input_ratio_charged": 20.06328894636039,
+          "wire_bytes": 6409756,
+          "wire_plus_model": 74360331
+        },
+        {
+          "fraction": 1.0,
+          "raw_bytes": 1985715205,
+          "raw_input_ratio_charged": 25.534291408650503,
+          "wire_bytes": 9816032,
+          "wire_plus_model": 77766607
+        }
+      ],
+      "model_bytes": 67950575,
+      "name": "static-ngram-67108864",
+      "outer_dictionary_bytes": 0,
+      "payload_bytes": 10868901,
+      "prediction_bytes": 841726,
+      "raw_bytes": 1985715205,
+      "raw_input_ratio": 202.2930655686534,
+      "raw_input_ratio_charged": 25.534291408650503,
+      "static_assets": 232533,
+      "static_definition_bytes": 67108849,
+      "tus": 689,
+      "wire_bytes": 9816032,
+      "wire_plus_model": 77766607
+    },
+    {
+      "blocks": 656953,
+      "budget": 1048576,
+      "decode_effective_GBps": 0.9434785194125515,
+      "decode_seconds": 2.104674525326118,
+      "encode_effective_GBps": 1.9689081979280638,
+      "encode_seconds": 1.0085362065583467,
+      "exact": true,
+      "fraction_curve": [
+        {
+          "fraction": 0.1,
+          "raw_bytes": 199669657,
+          "raw_input_ratio_charged": 109.24066854287896,
+          "wire_bytes": 648015,
+          "wire_plus_model": 1827796
+        },
+        {
+          "fraction": 0.25,
+          "raw_bytes": 499667458,
+          "raw_input_ratio_charged": 180.21386795814524,
+          "wire_bytes": 1592855,
+          "wire_plus_model": 2772636
+        },
+        {
+          "fraction": 0.5,
+          "raw_bytes": 994463627,
+          "raw_input_ratio_charged": 211.48374875619828,
+          "wire_bytes": 3522536,
+          "wire_plus_model": 4702317
+        },
+        {
+          "fraction": 0.75,
+          "raw_bytes": 1491912807,
+          "raw_input_ratio_charged": 184.2388990810733,
+          "wire_bytes": 6917927,
+          "wire_plus_model": 8097708
+        },
+        {
+          "fraction": 1.0,
+          "raw_bytes": 1985715205,
+          "raw_input_ratio_charged": 170.66228138064446,
+          "wire_bytes": 10455568,
+          "wire_plus_model": 11635349
+        }
+      ],
+      "model_bytes": 1179781,
+      "name": "static-ngram-cdict-1048576-64KiB",
+      "outer_dictionary_bytes": 65536,
+      "payload_bytes": 12111353,
+      "prediction_bytes": 65669,
+      "raw_bytes": 1985715205,
+      "raw_input_ratio": 189.91940036160636,
+      "raw_input_ratio_charged": 170.66228138064446,
+      "static_assets": 13729,
+      "static_definition_bytes": 1048576,
+      "tus": 689,
+      "wire_bytes": 10455568,
+      "wire_plus_model": 11635349
+    },
+    {
+      "blocks": 656953,
+      "budget": 1048576,
+      "decode_effective_GBps": 0.8889388420761559,
+      "decode_seconds": 2.2338040717877448,
+      "encode_effective_GBps": 1.8711657585971473,
+      "encode_seconds": 1.061218224989716,
+      "exact": true,
+      "fraction_curve": [
+        {
+          "fraction": 0.1,
+          "raw_bytes": 199669657,
+          "raw_input_ratio_charged": 105.86247927627201,
+          "wire_bytes": 640806,
+          "wire_plus_model": 1886123
+        },
+        {
+          "fraction": 0.25,
+          "raw_bytes": 499667458,
+          "raw_input_ratio_charged": 176.84676859347937,
+          "wire_bytes": 1580109,
+          "wire_plus_model": 2825426
+        },
+        {
+          "fraction": 0.5,
+          "raw_bytes": 994463627,
+          "raw_input_ratio_charged": 209.86589975408177,
+          "wire_bytes": 3493250,
+          "wire_plus_model": 4738567
+        },
+        {
+          "fraction": 0.75,
+          "raw_bytes": 1491912807,
+          "raw_input_ratio_charged": 184.28537034507104,
+          "wire_bytes": 6850349,
+          "wire_plus_model": 8095666
+        },
+        {
+          "fraction": 1.0,
+          "raw_bytes": 1985715205,
+          "raw_input_ratio_charged": 170.94139157812984,
+          "wire_bytes": 10371034,
+          "wire_plus_model": 11616351
+        }
+      ],
+      "model_bytes": 1245317,
+      "name": "static-ngram-cdict-1048576-128KiB",
+      "outer_dictionary_bytes": 131072,
+      "payload_bytes": 12111353,
+      "prediction_bytes": 65669,
+      "raw_bytes": 1985715205,
+      "raw_input_ratio": 191.46742793437954,
+      "raw_input_ratio_charged": 170.94139157812984,
+      "static_assets": 13729,
+      "static_definition_bytes": 1048576,
+      "tus": 689,
+      "wire_bytes": 10371034,
+      "wire_plus_model": 11616351
+    },
+    {
+      "blocks": 656953,
+      "budget": 1048576,
+      "decode_effective_GBps": 0.881404814800892,
+      "decode_seconds": 2.252898068691138,
+      "encode_effective_GBps": 1.9586891605440755,
+      "encode_seconds": 1.0137980262516066,
+      "exact": true,
+      "fraction_curve": [
+        {
+          "fraction": 0.1,
+          "raw_bytes": 199669657,
+          "raw_input_ratio_charged": 99.04337290709937,
+          "wire_bytes": 639593,
+          "wire_plus_model": 2015982
+        },
+        {
+          "fraction": 0.25,
+          "raw_bytes": 499667458,
+          "raw_input_ratio_charged": 169.04048913631837,
+          "wire_bytes": 1579515,
+          "wire_plus_model": 2955904
+        },
+        {
+          "fraction": 0.5,
+          "raw_bytes": 994463627,
+          "raw_input_ratio_charged": 204.28998509008605,
+          "wire_bytes": 3491513,
+          "wire_plus_model": 4867902
+        },
+        {
+          "fraction": 0.75,
+          "raw_bytes": 1491912807,
+          "raw_input_ratio_charged": 180.27604473475577,
+          "wire_bytes": 6899324,
+          "wire_plus_model": 8275713
+        },
+        {
+          "fraction": 1.0,
+          "raw_bytes": 1985715205,
+          "raw_input_ratio_charged": 167.22015029066458,
+          "wire_bytes": 10498467,
+          "wire_plus_model": 11874856
+        }
+      ],
+      "model_bytes": 1376389,
+      "name": "static-ngram-cdict-1048576-256KiB",
+      "outer_dictionary_bytes": 262144,
+      "payload_bytes": 12111353,
+      "prediction_bytes": 65669,
+      "raw_bytes": 1985715205,
+      "raw_input_ratio": 189.1433487384396,
+      "raw_input_ratio_charged": 167.22015029066458,
+      "static_assets": 13729,
+      "static_definition_bytes": 1048576,
+      "tus": 689,
+      "wire_bytes": 10498467,
+      "wire_plus_model": 11874856
+    }
+  ],
+  "test": "linecache/traces/ml-duckdb.bin",
+  "train": [
+    "linecache/traces/ml-llvm.bin",
+    "linecache/traces/ml-rocksdb.bin",
+    "linecache/traces/ml-opencv.bin"
+  ],
+  "training": {
+    "blocks": 971143,
+    "candidate_observations": 28695952,
+    "phrase_lengths": [
+      2,
+      4,
+      8,
+      16,
+      32
+    ],
+    "raw_bytes": 11365586710,
+    "regions": 15319092,
+    "retained_candidates": 750000,
+    "seconds": 114.10404140100582,
+    "tus": 3366
+  },
+  "wall_seconds": 423.9884149929858
+}

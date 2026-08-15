@@ -1,0 +1,30 @@
+training corpus 1/3 files=1238 unique-assets=833373 raw=3.37 GiB
+training corpus 2/3 files=622 unique-assets=2018778 raw=6.27 GiB
+training corpus 3/3 files=1506 unique-assets=2637391 raw=10.59 GiB
+models generic-regions=4813 toolchain-regions=7326 sources=634
+target 50/689 raw=0.15 GiB distinct-regions=8644 elapsed=122.2s
+target 100/689 raw=0.29 GiB distinct-regions=9941 elapsed=123.1s
+target 150/689 raw=0.48 GiB distinct-regions=10618 elapsed=124.2s
+target 200/689 raw=0.60 GiB distinct-regions=13705 elapsed=125.2s
+target 250/689 raw=0.70 GiB distinct-regions=14448 elapsed=125.8s
+target 300/689 raw=0.77 GiB distinct-regions=16064 elapsed=127.0s
+target 350/689 raw=0.81 GiB distinct-regions=18529 elapsed=127.5s
+target 400/689 raw=0.98 GiB distinct-regions=25713 elapsed=129.0s
+target 450/689 raw=1.17 GiB distinct-regions=31166 elapsed=130.5s
+target 500/689 raw=1.38 GiB distinct-regions=82955 elapsed=133.2s
+target 550/689 raw=1.59 GiB distinct-regions=121225 elapsed=134.9s
+target 600/689 raw=1.71 GiB distinct-regions=132540 elapsed=135.8s
+target 650/689 raw=1.77 GiB distinct-regions=208092 elapsed=137.4s
+target 689/689 raw=1.85 GiB distinct-regions=210074 elapsed=138.0s
+==== HETEROGENEOUS REGION CODEC DuckDB-full ====
+target=/tanksmall/scratch/ictmp/corpus3/manifest.txt training=3 TUs=689 raw=1985715205 region_occ=2521258 distinct_regions=210074 distinct_region_bytes=94088858 zstd=1
+model assets: generic_region_bytes=3129955 toolchain_region_bytes=10123154 source_bytes=9849435
+ROW name=raw model_budget=0 wire=11779650 fill_ratio=168.572 raw_records=95289453 modes_raw/static/source/prior=210074/0/0/0 fallback_frames=0 enc_GBps=3.587 dec_GBps=4.412 decoder_MiB=89.73 exact=PASS
+ROW name=prior model_budget=0 wire=11750704 fill_ratio=168.987 raw_records=94947394 modes_raw/static/source/prior=207225/0/0/2849 fallback_frames=152 enc_GBps=4.118 dec_GBps=4.520 decoder_MiB=89.73 exact=PASS
+ROW name=union-0 model_budget=0 wire=11750704 fill_ratio=168.987 raw_records=94947394 modes_raw/static/source/prior=207225/0/0/2849 fallback_frames=152 enc_GBps=3.181 dec_GBps=4.680 decoder_MiB=89.73 exact=PASS
+ROW name=union-262144 model_budget=262144 wire=11731122 fill_ratio=169.269 raw_records=94821730 modes_raw/static/source/prior=206741/443/44/2846 fallback_frames=151 enc_GBps=3.313 dec_GBps=4.624 decoder_MiB=89.73 exact=PASS
+ROW name=union-1048576 model_budget=1048576 wire=11668368 fill_ratio=170.179 raw_records=94411719 modes_raw/static/source/prior=205775/1363/134/2802 fallback_frames=151 enc_GBps=3.349 dec_GBps=4.740 decoder_MiB=89.73 exact=PASS
+ROW name=union-4194304 model_budget=4194304 wire=11440659 fill_ratio=173.567 raw_records=92856890 modes_raw/static/source/prior=203839/3413/92/2730 fallback_frames=143 enc_GBps=3.389 dec_GBps=4.777 decoder_MiB=89.73 exact=PASS
+ROW name=union-16777216 model_budget=16777216 wire=11234016 fill_ratio=176.759 raw_records=91513990 modes_raw/static/source/prior=202844/4401/72/2757 fallback_frames=139 enc_GBps=3.387 dec_GBps=4.788 decoder_MiB=89.73 exact=PASS
+ROW name=union-67108864 model_budget=67108864 wire=11215411 fill_ratio=177.052 raw_records=91448766 modes_raw/static/source/prior=202677/4552/24/2821 fallback_frames=137 enc_GBps=3.394 dec_GBps=4.784 decoder_MiB=89.73 exact=PASS
+elapsed=137.983 peak_RSS_MiB=1243.3 complete_harness_raw_GBps=0.014

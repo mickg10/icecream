@@ -52,6 +52,25 @@ tests/test-setup.sh
 tests/listing.txt
 unittests/testargs
 unittests/testargs.trs
+unittests/testargs.log
+unittests/test-suite.log
 # others
 compile_commands.json
 .vs*
+
+# issue #16 local ML bakeoff products
+__pycache__/
+linecache/ml_bakeoff
+linecache/origin_coverage
+linecache/region_codec_bench
+linecache/region_codec_bench-*
+linecache/table_codec_bench
+linecache/traces/ml-*.bin
+linecache/traces/*smoke.bin
+linecache/ml-artifacts/*.bin
+linecache/ml-artifacts/*.frames
+linecache/ml-artifacts/*.pt
+linecache/ml-artifacts/*.txt
+linecache/ml-artifacts/*smoke*.json
+!linecache/ml-artifacts/gbdt32-duckdb.txt
+!linecache/ml-artifacts/superblock-table-*.bin

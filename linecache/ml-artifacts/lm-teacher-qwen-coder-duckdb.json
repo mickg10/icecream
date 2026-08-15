@@ -1,0 +1,48 @@
+{
+  "bits_per_sample_byte": 1.902518863125424,
+  "bits_per_token": 4.159443428535755,
+  "dataset": "linecache/traces/ml-duckdb.bin",
+  "dtype": "bfloat16",
+  "exact_bitstream": false,
+  "experiment": "external_pretrained_code_lm_residual_ceiling",
+  "inference_seconds": 67.93179893499473,
+  "model": "Qwen/Qwen2.5-Coder-0.5B",
+  "negative_log_likelihood_bits": 62341.73810689389,
+  "parameters": 494032768,
+  "perplexity": 17.86969900055549,
+  "resident_parameter_bytes": 988065536,
+  "sample": {
+    "all_residual_bytes": 31454801,
+    "dataset_raw_bytes": 1985715205,
+    "eligible_lines_seen": 604270,
+    "invalid_utf8_residual_bytes_skipped": 86,
+    "reservoir_lines": 100000,
+    "sampled_utf8_bytes": 32768
+  },
+  "sample_bytes_per_second": 482.3661453652411,
+  "scored_tokens": 14988,
+  "status": "optimistic_teacher_only_uncontrolled_training_overlap",
+  "tokens": 14989,
+  "tokens_per_second": 220.6330501322703,
+  "wall_seconds": 103.51691423502052,
+  "zstd_controls": [
+    {
+      "bits_per_input_byte": 4.1552734375,
+      "bytes": 17020,
+      "exact": true,
+      "level": 1
+    },
+    {
+      "bits_per_input_byte": 3.84375,
+      "bytes": 15744,
+      "exact": true,
+      "level": 3
+    },
+    {
+      "bits_per_input_byte": 3.648193359375,
+      "bytes": 14943,
+      "exact": true,
+      "level": 6
+    }
+  ]
+}

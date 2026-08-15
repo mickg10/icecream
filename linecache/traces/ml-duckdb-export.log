@@ -1,0 +1,17 @@
+progress 100/689 raw=0.29 GiB distinct=141098 candidates=851309 elapsed=13.8s
+progress 200/689 raw=0.60 GiB distinct=185864 candidates=1150431 elapsed=28.1s
+progress 300/689 raw=0.77 GiB distinct=238332 candidates=1475320 elapsed=37.7s
+progress 400/689 raw=0.98 GiB distinct=328620 candidates=2092372 elapsed=48.0s
+progress 500/689 raw=1.38 GiB distinct=507628 candidates=3409120 elapsed=68.8s
+progress 600/689 raw=1.71 GiB distinct=554575 candidates=3738774 elapsed=88.3s
+progress 689/689 raw=1.85 GiB distinct=637610 candidates=4300903 elapsed=95.3s
+==== ISSUE16 ML DEFINITION BAKEOFF: duckdb ====
+manifest=/tanksmall/scratch/ictmp/corpus3/manifest.txt TUs=689 raw=1985715205 total_lines=69094918 distinct_lines=637610 distinct_bytes=54733427 regions=2521258 candidate_rows=4300903
+phases seconds: load=2.288 parse=89.314 label-oracle=0.639 model-update=2.858 total=95.319
+FTRL model bytes=8388608 updates=4300903
+FTRL K=1 recall_best=0.383740 byte_regret/event=5.2418 total_regret=3342188
+FTRL K=2 recall_best=0.593108 byte_regret/event=3.2483 total_regret=2071123
+FTRL K=4 recall_best=0.895191 byte_regret/event=1.1384 total_regret=725847
+FTRL K=8 recall_best=0.998905 byte_regret/event=0.0048 total_regret=3081
+codec rows (actual per-TU zstd-1 frames; four-byte framing; independent exact decoder):
+peak_RSS_MiB=1950.7 complete_harness_raw_GBps=0.021 export=linecache/traces/ml-duckdb.bin

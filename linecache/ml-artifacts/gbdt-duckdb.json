@@ -1,0 +1,54 @@
+{
+  "decoder_requires_ranker": false,
+  "depth": 8,
+  "experiment": "pretrained_gbdt_source_location_variant_cost_ranker",
+  "heldout": {
+    "byte_regret_per_event": {
+      "1": 0.11525245095348403,
+      "2": 0.05290546400693842,
+      "4": 0.016136848758408366,
+      "8": 0.0004563925540574239
+    },
+    "candidate_rows": 4300903,
+    "candidate_rows_per_predict_second": 686292.3053299568,
+    "complete_scan_raw_GBps": 0.03229775326499314,
+    "complete_scan_seconds": 61.48152748297434,
+    "dataset": "linecache/traces/ml-duckdb.bin",
+    "effective_raw_GBps_predict_only": 0.31685928879777053,
+    "events_with_candidates": 637609,
+    "predict_seconds": 6.266867581929546,
+    "raw_bytes": 1985715205,
+    "recall": {
+      "1": 0.7683047133901811,
+      "2": 0.8882528320647921,
+      "4": 0.9823402743687746,
+      "8": 0.9997867031362481
+    },
+    "total_byte_regret": {
+      "1": 73486,
+      "2": 33733,
+      "4": 10289,
+      "8": 291
+    },
+    "tus": 689
+  },
+  "leaves": 31,
+  "model_bytes": 814565,
+  "sample_stats": {
+    "candidates": 13463109,
+    "events": 1944767,
+    "line_bytes": 138290011,
+    "raw_bytes": 11365586710,
+    "sampled": 500000,
+    "seen": 13463109
+  },
+  "test": "linecache/traces/ml-duckdb.bin",
+  "train": [
+    "linecache/traces/ml-llvm.bin",
+    "linecache/traces/ml-rocksdb.bin",
+    "linecache/traces/ml-opencv.bin"
+  ],
+  "train_seconds": 4.482804520986974,
+  "trees": 256,
+  "wall_seconds": 174.20712194102816
+}

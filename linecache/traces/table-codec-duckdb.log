@@ -1,0 +1,9 @@
+TABLE_CODEC model=linecache/ml-artifacts/superblock-table-64.bin frames=689 tables=64 model_bytes=40984 raw_input=1985715205 payload=33597241 wire=30244878 charged_wire=30285862 ratio=65.655 charged_ratio=65.566 enc_GBps=4.750 dec_GBps=2.252 exact=PASS
+ZSTD1 frames=689 wire=31056778 ratio=63.938 enc_GBps=24.848 dec_GBps=56.517 exact=PASS
+peak_RSS_MiB=73.9
+TABLE_CODEC model=linecache/ml-artifacts/superblock-table-128.bin frames=689 tables=128 model_bytes=73752 raw_input=1985715205 payload=33597241 wire=30087715 charged_wire=30161467 ratio=65.998 charged_ratio=65.836 enc_GBps=4.801 dec_GBps=2.164 exact=PASS
+ZSTD1 frames=689 wire=31056778 ratio=63.938 enc_GBps=26.257 dec_GBps=59.389 exact=PASS
+peak_RSS_MiB=74.0
+TABLE_CODEC model=linecache/ml-artifacts/superblock-table-256.bin frames=689 tables=256 model_bytes=139288 raw_input=1985715205 payload=33597241 wire=29910757 charged_wire=30050045 ratio=66.388 charged_ratio=66.080 enc_GBps=4.770 dec_GBps=2.011 exact=PASS
+ZSTD1 frames=689 wire=31056778 ratio=63.938 enc_GBps=25.879 dec_GBps=55.369 exact=PASS
+peak_RSS_MiB=74.4
