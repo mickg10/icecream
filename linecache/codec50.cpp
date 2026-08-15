@@ -46,7 +46,8 @@ static inline uint64_t read64(const char*p){ uint64_t v; memcpy(&v,p,8); return 
 static inline uint64_t read_tail(const char*p,uint32_t n){ uint64_t v=0; memcpy(&v,p,n); return v; }
 static inline uint64_t sampled_hash(const char*p,uint32_t n){
     constexpr uint64_t A=0xa0761d6478bd642fULL,B=0xe7037ed1a0b428dbULL; uint64_t h=mix64(uint64_t(n)^A);
-    if(n<=8) return mix64(h^read_tail(p,n)); if(n<=16) return fold128(read64(p)^A,read64(p+n-8)^h);
+    if(n<=8) return mix64(h^read_tail(p,n));
+    if(n<=16) return fold128(read64(p)^A,read64(p+n-8)^h);
     if(n<=32){ h=fold128(read64(p)^A,read64(p+8)^h); return fold128(read64(p+n-16)^B,read64(p+n-8)^h); }
     uint32_t mid=(n>>1)-4; h=fold128(read64(p)^A,read64(p+8)^h); h=fold128(read64(p+mid)^B,read64(p+n-16)^h); return fold128(read64(p+n-8)^A,h^B);
 }
@@ -88,6 +89,9 @@ public:
     uint64_t region_count() const { return region_records_.size(); }
     const LineRef& ref(uint32_t id) const { return id_refs_[id]; }
     const char* line_data(uint32_t off) const { return line_bytes_.data()+off; }
+    const char* region_data(uint32_t rid) const { return region_bytes_.data()+region_records_[rid].raw_off; }
+    uint32_t region_raw_len(uint32_t rid) const { return region_records_[rid].raw_len; }
+    uint64_t region_hash(uint32_t rid) const { return region_records_[rid].hash; }
     const uint32_t* region_ids_ptr(uint32_t rid) const { return region_ids_.data()+region_records_[rid].ids_off; }
     uint32_t region_ids_count(uint32_t rid) const { return region_records_[rid].ids_count; }
     uint64_t distinct_line_bytes() const { return line_bytes_.size(); }
@@ -147,13 +151,181 @@ static size_t stream_flush(ZSTD_CStream*cs,const uint8_t*data,size_t n,std::vect
     for(;;){ ZSTD_outBuffer o{ob.data(),ob.size(),0}; size_t rem=ZSTD_compressStream2(cs,&o,&in,ZSTD_e_flush); if(ZSTD_isError(rem)){fprintf(stderr,"zstream %s\n",ZSTD_getErrorName(rem));exit(2);} total+=o.pos; if(rem==0) break; }
     return total; }
 
+// ---- Frozen pretrained Region/superblock package.  Training manifests are scanned before the
+// held-out corpus is loaded.  Selection uses training frequency and an explicit byte budget only;
+// the held-out corpus never influences package contents.  A Region is the useful reconstruction
+// superblock: an exact hit lets F materialize all of its bytes without public Line definitions.
+// Multi-Region phrases are a second, much smaller Root coding layer over those exact model Regions.
+struct StaticRegionModel {
+    struct Candidate { uint64_t hash; uint32_t off,len,count; };
+    struct PhraseCandidate { uint64_t key; uint32_t seq,pos,count; uint16_t len; };
+    std::vector<char> arena;
+    std::vector<Candidate> candidates;
+    std::unordered_map<uint64_t,std::vector<uint32_t>> candidate_buckets;
+    std::vector<char> line_arena;
+    std::vector<Candidate> line_candidates;
+    std::unordered_map<uint64_t,std::vector<uint32_t>> line_candidate_buckets;
+    std::vector<std::vector<uint32_t>> training_sequences;
+
+    std::vector<char> region_bytes;
+    std::vector<uint32_t> region_off{0};
+    std::vector<uint64_t> region_hashes;
+    std::unordered_map<uint64_t,std::vector<uint32_t>> region_buckets;
+    std::vector<char> line_bytes;
+    std::vector<uint32_t> line_off{0};
+    std::vector<uint64_t> line_hashes;
+    std::unordered_map<uint64_t,std::vector<uint32_t>> line_buckets;
+    std::vector<std::vector<uint32_t>> phrases;
+    std::unordered_map<uint64_t,std::vector<uint32_t>> phrase_buckets;
+    std::vector<uint16_t> phrase_lengths;
+    std::vector<uint8_t> package_frame;
+    uint64_t package_raw=0, package_z3=0, training_raw=0, training_occurrences=0, training_unique=0, training_line_unique=0, training_line_occurrences=0;
+
+    static uint64_t phrase_key(const uint32_t* p,size_t n){
+        uint64_t h=1469598103934665603ULL ^ mix64(n);
+        for(size_t i=0;i<n;++i){ h^=mix64(uint64_t(p[i])+0x9e3779b97f4a7c15ULL); h*=1099511628211ULL; }
+        return h|1ULL;
+    }
+    uint32_t intern_training_region(const char* p,uint32_t n){
+        uint64_t h=sampled_hash(p,n)|1ULL;
+        auto &bucket=candidate_buckets[h];
+        for(uint32_t id:bucket){ Candidate &c=candidates[id];
+            if(c.len==n && memcmp(arena.data()+c.off,p,n)==0){ ++c.count; return id; }
+        }
+        uint32_t id=uint32_t(candidates.size()), off=uint32_t(arena.size());
+        arena.insert(arena.end(),p,p+n); candidates.push_back({h,off,n,1}); bucket.push_back(id); return id;
+    }
+    uint32_t intern_training_line(const char* p,uint32_t n){
+        uint64_t h=line_hash(p,n)|1ULL; auto&bucket=line_candidate_buckets[h];
+        for(uint32_t id:bucket){Candidate&c=line_candidates[id];if(c.len==n&&memcmp(line_arena.data()+c.off,p,n)==0){++c.count;return id;}}
+        uint32_t id=uint32_t(line_candidates.size()),off=uint32_t(line_arena.size()); line_arena.insert(line_arena.end(),p,p+n);
+        line_candidates.push_back({h,off,n,1});bucket.push_back(id);return id;
+    }
+    void scan_manifest(const std::string& manifest){
+        FILE* mf=fopen(manifest.c_str(),"r"); if(!mf){perror(manifest.c_str());exit(2);} char path[8192];
+        while(fgets(path,sizeof path,mf)){ size_t pn=strlen(path); while(pn&&(path[pn-1]=='\n'||path[pn-1]=='\r'))path[--pn]=0; if(!pn)continue;
+            FILE* f=fopen(path,"rb"); if(!f){perror(path);exit(2);} struct stat st{}; if(fstat(fileno(f),&st)){perror(path);exit(2);} size_t n=size_t(st.st_size);
+            std::vector<char> b(n+64); if(n&&fread(b.data(),1,n,f)!=n){fprintf(stderr,"short read %s\n",path);exit(2);} fclose(f); training_raw+=n;
+            std::vector<uint32_t> seq; const char*p=b.data(),*e=p+n;
+            while(p<e){ const char*q=next_region(p,e); uint32_t L=uint32_t(q-p); seq.push_back(intern_training_region(p,L)); ++training_occurrences;
+                const char*lp=p; while(lp<q){const void*hit=memchr(lp,'\n',size_t(q-lp));const char*le=hit?(const char*)hit+1:q;intern_training_line(lp,uint32_t(le-lp));++training_line_occurrences;lp=le;} p=q; }
+            training_sequences.push_back(std::move(seq));
+        }
+        fclose(mf);
+    }
+    void compile(uint64_t region_budget,uint64_t line_budget,uint64_t phrase_budget){
+        training_unique=candidates.size();
+        training_line_unique=line_candidates.size();
+        std::vector<uint32_t> order(candidates.size()); for(uint32_t i=0;i<order.size();++i)order[i]=i;
+        std::sort(order.begin(),order.end(),[&](uint32_t a,uint32_t b){ const Candidate&A=candidates[a],&B=candidates[b];
+            if(A.count!=B.count)return A.count>B.count;
+            if(A.len!=B.len)return A.len>B.len;
+            return A.hash<B.hash; });
+        std::vector<uint32_t> remap(candidates.size(),UINT32_MAX); uint64_t used=1;
+        for(uint32_t old:order){ const Candidate&c=candidates[old]; uint64_t cost=c.len+10; if(used>=region_budget||cost>region_budget-used)continue;
+            uint32_t id=uint32_t(region_hashes.size()); remap[old]=id; region_hashes.push_back(c.hash); region_bytes.insert(region_bytes.end(),arena.data()+c.off,arena.data()+c.off+c.len);
+            region_off.push_back(uint32_t(region_bytes.size())); region_buckets[c.hash].push_back(id); used+=cost;
+        }
+        std::vector<uint32_t> lorder(line_candidates.size()); for(uint32_t i=0;i<lorder.size();++i)lorder[i]=i;
+        std::sort(lorder.begin(),lorder.end(),[&](uint32_t a,uint32_t b){const Candidate&A=line_candidates[a],&B=line_candidates[b];
+            if(A.count!=B.count)return A.count>B.count;
+            if(A.len!=B.len)return A.len>B.len;
+            return A.hash<B.hash;});
+        uint64_t lused=1;
+        for(uint32_t old:lorder){const Candidate&c=line_candidates[old];uint64_t cost=c.len+10;if(lused>=line_budget||cost>line_budget-lused)continue;
+            uint32_t id=uint32_t(line_hashes.size());line_hashes.push_back(c.hash);line_bytes.insert(line_bytes.end(),line_arena.data()+c.off,line_arena.data()+c.off+c.len);
+            line_off.push_back(uint32_t(line_bytes.size()));line_buckets[c.hash].push_back(id);lused+=cost;}
+
+        // Count sampled exact n-grams over selected model Regions. Sampling at half-length keeps
+        // training memory bounded while retaining overlapping cross-TU header sequences.
+        std::unordered_map<uint64_t,uint32_t> pindex; std::vector<PhraseCandidate> pc;
+        static const uint16_t lens[]={32,16,8,4,2};
+        for(uint32_t si=0;si<training_sequences.size();++si){ std::vector<uint32_t>&s=training_sequences[si];
+            for(uint32_t&x:s)x=remap[x];
+            for(uint16_t L:lens){ size_t step=std::max<size_t>(1,L/2); if(s.size()<L)continue;
+                for(size_t i=0;i+L<=s.size();i+=step){ bool complete=true; for(size_t j=0;j<L;++j)if(s[i+j]==UINT32_MAX){complete=false;break;} if(!complete)continue;
+                    uint64_t k=phrase_key(s.data()+i,L); auto it=pindex.find(k);
+                    if(it==pindex.end()){ uint32_t id=uint32_t(pc.size()); pindex.emplace(k,id); pc.push_back({k,si,uint32_t(i),1,L}); }
+                    else ++pc[it->second].count;
+                }
+            }
+        }
+        std::sort(pc.begin(),pc.end(),[&](const PhraseCandidate&a,const PhraseCandidate&b){
+            uint64_t av=uint64_t(a.count>1?a.count-1:0)*(a.len-1), bv=uint64_t(b.count>1?b.count-1:0)*(b.len-1);
+            uint64_t ac=uint64_t(a.len)*5+8, bc=uint64_t(b.len)*5+8; __uint128_t lhs=__uint128_t(av)*bc, rhs=__uint128_t(bv)*ac;
+            if(lhs!=rhs)return lhs>rhs;
+            if(a.len!=b.len)return a.len>b.len;
+            return a.key<b.key;
+        });
+        uint64_t pused=phrase_budget?1:0;
+        for(const PhraseCandidate&c:pc){ if(c.count<2)break; uint64_t cost=uint64_t(c.len)*5+8; if(!phrase_budget||pused>=phrase_budget||cost>phrase_budget-pused)continue;
+            const std::vector<uint32_t>&s=training_sequences[c.seq]; std::vector<uint32_t> phrase(s.begin()+c.pos,s.begin()+c.pos+c.len);
+            uint32_t id=uint32_t(phrases.size()); phrases.push_back(std::move(phrase)); phrase_buckets[c.key].push_back(id); pused+=cost;
+        }
+        phrase_lengths.reserve(phrases.size()); for(auto&p:phrases)phrase_lengths.push_back(uint16_t(p.size()));
+        std::sort(phrase_lengths.begin(),phrase_lengths.end(),std::greater<uint16_t>()); phrase_lengths.erase(std::unique(phrase_lengths.begin(),phrase_lengths.end()),phrase_lengths.end());
+
+        std::vector<uint8_t> pkg; put_varint(pkg,region_hashes.size());
+        for(uint32_t i=0;i<region_hashes.size();++i){ uint32_t L=region_off[i+1]-region_off[i]; put_varint(pkg,L); pkg.insert(pkg.end(),region_bytes.begin()+region_off[i],region_bytes.begin()+region_off[i+1]); }
+        put_varint(pkg,line_hashes.size()); for(uint32_t i=0;i<line_hashes.size();++i){uint32_t L=line_off[i+1]-line_off[i];put_varint(pkg,L);pkg.insert(pkg.end(),line_bytes.begin()+line_off[i],line_bytes.begin()+line_off[i+1]);}
+        put_varint(pkg,phrases.size()); for(auto&p:phrases){put_varint(pkg,p.size());for(uint32_t x:p)put_varint(pkg,x);}
+        package_raw=pkg.size(); package_frame.resize(ZSTD_compressBound(pkg.size())); size_t z=ZSTD_compress(package_frame.data(),package_frame.size(),pkg.data(),pkg.size(),3);
+        if(ZSTD_isError(z)){fprintf(stderr,"model zstd %s\n",ZSTD_getErrorName(z));exit(2);} package_z3=z;
+        package_frame.resize(z);
+        // Drop training-only storage before the target interner is constructed.
+        arena.clear(); arena.shrink_to_fit(); candidates.clear(); candidate_buckets.clear(); line_arena.clear(); line_arena.shrink_to_fit(); line_candidates.clear(); line_candidate_buckets.clear(); training_sequences.clear(); training_sequences.shrink_to_fit();
+    }
+    void load_package(const std::vector<uint8_t>&frame){
+        unsigned long long raw_size=ZSTD_getFrameContentSize(frame.data(),frame.size());
+        if(raw_size==ZSTD_CONTENTSIZE_ERROR||raw_size==ZSTD_CONTENTSIZE_UNKNOWN||raw_size>SIZE_MAX){fprintf(stderr,"bad model frame size\n");exit(2);}
+        std::vector<uint8_t>raw(static_cast<size_t>(raw_size));size_t got=ZSTD_decompress(raw.data(),raw.size(),frame.data(),frame.size());
+        if(ZSTD_isError(got)||got!=raw.size()){fprintf(stderr,"model decode failed\n");exit(2);}
+        const uint8_t*p=raw.data(),*e=p+raw.size();
+        auto readv=[&](){uint64_t v=0;unsigned s=0;while(p<e&&s<=63){uint8_t b=*p++;v|=uint64_t(b&0x7f)<<s;if(!(b&0x80))return v;s+=7;}fprintf(stderr,"bad model varint\n");exit(2);};
+        auto read_count=[&](){uint64_t n=readv();if(n>UINT32_MAX){fprintf(stderr,"model count too large\n");exit(2);}return uint32_t(n);};
+        region_bytes.clear();region_off.assign(1,0);region_hashes.clear();region_buckets.clear();
+        line_bytes.clear();line_off.assign(1,0);line_hashes.clear();line_buckets.clear();
+        phrases.clear();phrase_buckets.clear();phrase_lengths.clear();
+        uint32_t nr=read_count();region_hashes.reserve(nr);region_off.reserve(size_t(nr)+1);
+        for(uint32_t i=0;i<nr;++i){uint64_t len=readv();if(len>uint64_t(e-p)||region_bytes.size()+len>UINT32_MAX){fprintf(stderr,"bad model Region\n");exit(2);}uint64_t h=sampled_hash(reinterpret_cast<const char*>(p),uint32_t(len))|1ULL;
+            region_hashes.push_back(h);region_buckets[h].push_back(i);region_bytes.insert(region_bytes.end(),p,p+len);p+=len;region_off.push_back(uint32_t(region_bytes.size()));}
+        uint32_t nl=read_count();line_hashes.reserve(nl);line_off.reserve(size_t(nl)+1);
+        for(uint32_t i=0;i<nl;++i){uint64_t len=readv();if(len>uint64_t(e-p)||line_bytes.size()+len>UINT32_MAX){fprintf(stderr,"bad model Line\n");exit(2);}uint64_t h=line_hash(reinterpret_cast<const char*>(p),uint32_t(len))|1ULL;
+            line_hashes.push_back(h);line_buckets[h].push_back(i);line_bytes.insert(line_bytes.end(),p,p+len);p+=len;line_off.push_back(uint32_t(line_bytes.size()));}
+        uint32_t np=read_count();phrases.reserve(np);
+        for(uint32_t i=0;i<np;++i){uint32_t len=read_count();if(len>UINT16_MAX){fprintf(stderr,"model phrase too long\n");exit(2);}std::vector<uint32_t>phrase;phrase.reserve(len);
+            for(uint32_t j=0;j<len;++j){uint32_t mid=read_count();if(mid>=nr){fprintf(stderr,"model phrase Region out of range\n");exit(2);}phrase.push_back(mid);}uint64_t key=phrase_key(phrase.data(),phrase.size());
+            phrases.push_back(std::move(phrase));phrase_buckets[key].push_back(i);phrase_lengths.push_back(uint16_t(len));}
+        if(p!=e){fprintf(stderr,"trailing model bytes\n");exit(2);}
+        std::sort(phrase_lengths.begin(),phrase_lengths.end(),std::greater<uint16_t>());phrase_lengths.erase(std::unique(phrase_lengths.begin(),phrase_lengths.end()),phrase_lengths.end());
+        package_frame=frame;package_raw=raw.size();package_z3=frame.size();
+    }
+    uint32_t lookup_region(const char*p,uint32_t n,uint64_t h) const {
+        auto it=region_buckets.find(h); if(it==region_buckets.end())return UINT32_MAX;
+        for(uint32_t id:it->second){ uint32_t L=region_off[id+1]-region_off[id]; if(L==n&&memcmp(region_bytes.data()+region_off[id],p,n)==0)return id; }
+        return UINT32_MAX;
+    }
+    uint32_t lookup_phrase(const uint32_t*p,size_t n) const {
+        uint64_t k=phrase_key(p,n); auto it=phrase_buckets.find(k); if(it==phrase_buckets.end())return UINT32_MAX;
+        for(uint32_t id:it->second)if(phrases[id].size()==n&&memcmp(phrases[id].data(),p,n*4)==0)return id;
+        return UINT32_MAX;
+    }
+    uint32_t lookup_line(const char*p,uint32_t n,uint64_t h) const {
+        auto it=line_buckets.find(h);if(it==line_buckets.end())return UINT32_MAX;
+        for(uint32_t id:it->second){uint32_t L=line_off[id+1]-line_off[id];if(L==n&&memcmp(line_bytes.data()+line_off[id],p,n)==0)return id;}return UINT32_MAX;
+    }
+};
+
 // ---- D1: preprocessor marker factoring. Parse "# <n> \"<path>\"<flags>\n" -> (path,n,flags), and
 // reconstruct EXACT bytes; fall back to literal if reconstruction != original. ----
 struct Marker{ std::string path; uint64_t lineno; std::vector<uint8_t> flags; };
 static bool parse_marker(const char* s, uint32_t len, Marker& m){
-    if(len<4 || s[0]!='#' || s[1]!=' ') return false; const char* e=s+len; const char* p=s+2;
-    if(p>=e || *p<'0'||*p>'9') return false; uint64_t n=0; while(p<e && *p>='0'&&*p<='9'){ n=n*10+(*p-'0'); ++p; } m.lineno=n;
-    if(p+2>e || p[0]!=' '||p[1]!='"') return false; p+=2; const char* q=p; while(q<e && *q!='"') ++q; if(q>=e) return false; m.path.assign(p,q); p=q+1;
+    if(len<4 || s[0]!='#' || s[1]!=' ') return false;
+    const char* e=s+len; const char* p=s+2;
+    if(p>=e || *p<'0'||*p>'9') return false;
+    uint64_t n=0; while(p<e && *p>='0'&&*p<='9'){ n=n*10+(*p-'0'); ++p; } m.lineno=n;
+    if(p+2>e || p[0]!=' '||p[1]!='"') return false;
+    p+=2; const char* q=p; while(q<e && *q!='"') ++q; if(q>=e) return false; m.path.assign(p,q); p=q+1;
     m.flags.clear(); while(p<e && *p==' '){ ++p; if(p>=e||*p<'0'||*p>'9') return false; uint8_t fl=0; while(p<e&&*p>='0'&&*p<='9'){ fl=fl*10+(*p-'0'); ++p; } m.flags.push_back(fl); }
     if(p>=e || *p!='\n' || p+1!=e) return false;   // must end exactly with newline
     return true;
@@ -231,7 +403,8 @@ static bool sock_wall(int fd,const void* p,size_t n){ const char* b=(const char*
 static bool sock_rall(int fd,void* p,size_t n){ char* b=(char*)p; while(n){ ssize_t r=read(fd,b,n); if(r<=0){ if(r<0&&errno==EINTR) continue; return false; } b+=r; n-=(size_t)r; } return true; }
 
 int main(int argc,char**argv){
-    const char* manifest=nullptr; size_t max_files=SIZE_MAX; int zlevel=3; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, useS0=false, useStream=false, useSocket=false; int builds=1;
+    const char* manifest=nullptr; size_t max_files=SIZE_MAX; int zlevel=3; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, useS0=false, useStream=false, useSocket=false, chargeModel=false; int builds=1;
+    std::vector<std::string> pretrainManifests; double modelMiB=0.0,lineModelMiB=0.0; uint64_t phraseKiB=0;
     for(int i=1;i<argc;++i){ if(!strcmp(argv[i],"--manifest")&&i+1<argc)manifest=argv[++i];
         else if(!strcmp(argv[i],"--z")&&i+1<argc)zlevel=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--no-d1"))useD1=false;
@@ -243,19 +416,47 @@ int main(int argc,char**argv){
         else if(!strcmp(argv[i],"--stream"))useStream=true;  // shared-window streaming accounting (persistent zstd window across messages)
         else if(!strcmp(argv[i],"--socket"))useSocket=true;  // real 2-process socketpair + N-stream concurrency throughput sweep
         else if(!strcmp(argv[i],"--s0"))useS0=true;          // S0 semantic-Root memoization (ROOT_REF on exact-Root reuse)
+        else if(!strcmp(argv[i],"--pretrain-manifest")&&i+1<argc)pretrainManifests.emplace_back(argv[++i]);
+        else if(!strcmp(argv[i],"--model-mib")&&i+1<argc)modelMiB=strtod(argv[++i],nullptr);
+        else if(!strcmp(argv[i],"--line-model-mib")&&i+1<argc)lineModelMiB=strtod(argv[++i],nullptr);
+        else if(!strcmp(argv[i],"--phrase-kib")&&i+1<argc)phraseKiB=strtoull(argv[++i],nullptr,10);
+        else if(!strcmp(argv[i],"--charge-model"))chargeModel=true; // WIRE_MODEL accounting; otherwise report shared-package bytes separately
         else if(!strcmp(argv[i],"--builds")&&i+1<argc)builds=atoi(argv[++i]);  // amortize S0 over N chronological builds
         else if(!strcmp(argv[i],"--max-files")&&i+1<argc){ char*t=nullptr; unsigned long long v=strtoull(argv[++i],&t,10); if(!t||*t||!v){fprintf(stderr,"bad max-files\n");return 2;} max_files=size_t(v); }
         else { fprintf(stderr,"unknown %s\n",argv[i]); return 2; } }
-    if(!manifest){ fprintf(stderr,"usage: %s --manifest F [--z 0|1|3] [--no-d1] [--d2] [--max-files N]\n",argv[0]); return 2; }
+    if(!manifest){ fprintf(stderr,"usage: %s --manifest F [--z 0|1|3] [--no-d1] [--d2] [--pretrain-manifest F --model-mib N --phrase-kib N --charge-model] [--max-files N]\n",argv[0]); return 2; }
 #ifndef HAVE_DEFCODEC
     if(useD2){ fprintf(stderr,"note: --d2 requested but definition_codec.h not present; ignoring.\n"); useD2=false; }
 #endif
 
-    auto t0=Clock::now(); Corpus corpus=load_corpus(manifest,max_files); Interner dict;
+    auto t0=Clock::now(); StaticRegionModel staticModel,FstaticModel; bool useModel=!pretrainManifests.empty()&&(modelMiB>0.0||lineModelMiB>0.0);
+    if(useModel){
+        for(const std::string&m:pretrainManifests)staticModel.scan_manifest(m);
+        uint64_t rb=uint64_t(modelMiB*1048576.0), pb=phraseKiB*1024;
+        if(rb<1024&&uint64_t(lineModelMiB*1048576.0)<1024){fprintf(stderr,"the pretrained package needs at least 1024 Region or Line model bytes\n");return 2;}
+        uint64_t lb=uint64_t(lineModelMiB*1048576.0); staticModel.compile(rb,lb,pb);
+        FstaticModel.load_package(staticModel.package_frame);
+        fprintf(stderr,"pretrained package: train=%.1f MiB region_occ=%llu region_unique=%zu line_occ=%llu line_unique=%zu selected_regions=%zu selected_lines=%zu phrases=%zu raw=%.2f MiB z3=%.2f MiB accounting=%s\n",
+            staticModel.training_raw/1048576.0,(unsigned long long)staticModel.training_occurrences,(size_t)staticModel.training_unique,
+            (unsigned long long)staticModel.training_line_occurrences,(size_t)staticModel.training_line_unique,staticModel.region_hashes.size(),staticModel.line_hashes.size(),staticModel.phrases.size(),
+            staticModel.package_raw/1048576.0,staticModel.package_z3/1048576.0,chargeModel?"WIRE(charged)":"SHARED(reported)");
+    }
+    if(useModel&&(useD2||useD2mine)){fprintf(stderr,"pretrained Region materialization currently requires literal/D1 dynamic-Line records; omit --d2/--d2helper\n");return 2;}
+    if(useModel&&useSocket){fprintf(stderr,"the pretrained-package experiment is not implemented in the separate socket path\n");return 2;}
+    Corpus corpus=load_corpus(manifest,max_files); Interner dict;
     std::vector<uint32_t> allreg; std::vector<size_t> roff; roff.push_back(0);
     { uint32_t maxlen=0; for(auto&f:corpus.files) maxlen=std::max(maxlen,f.len); std::vector<uint32_t> out(size_t(maxlen)+1); uint64_t hits=0; std::vector<uint32_t> rs;
       for(auto&f:corpus.files){ size_t oc=0; rs.clear(); const char*p=corpus.bytes.data()+f.off; dict.process(p,p+f.len,out.data(),oc,hits,true,&rs); allreg.insert(allreg.end(),rs.begin(),rs.end()); roff.push_back(allreg.size()); } }
     uint32_t NREG=uint32_t(dict.region_count()); size_t TUs=corpus.files.size();
+    std::vector<uint32_t> staticRegion(NREG,UINT32_MAX), targetForModel(staticModel.region_hashes.size(),UINT32_MAX);
+    std::vector<uint32_t> staticLine(dict.distinct()+1,UINT32_MAX);
+    uint64_t staticRegionRaw=0;
+    if(useModel){ for(uint32_t r=0;r<NREG;++r){ uint32_t mid=staticModel.lookup_region(dict.region_data(r),dict.region_raw_len(r),dict.region_hash(r));
+            if(mid!=UINT32_MAX){ staticRegion[r]=mid; targetForModel[mid]=r; staticRegionRaw+=dict.region_raw_len(r); } }
+        uint64_t staticLineRaw=0; for(uint32_t ln=1;ln<=dict.distinct();++ln){const LineRef&lr=dict.ref(ln);uint32_t mid=staticModel.lookup_line(dict.line_data(lr.off),lr.len,line_hash(dict.line_data(lr.off),lr.len)|1ULL);if(mid!=UINT32_MAX){staticLine[ln]=mid;staticLineRaw+=lr.len;}}
+        fprintf(stderr,"held-out exact model coverage: Regions=%zu/%u raw=%.2f/%.2f MiB (%.2f%% raw); distinct Lines=%zu/%u bytes=%.2f/%.2f MiB\n",
+            size_t(std::count_if(staticRegion.begin(),staticRegion.end(),[](uint32_t x){return x!=UINT32_MAX;})),NREG,staticRegionRaw/1048576.0,corpus.raw/1048576.0,100.0*staticRegionRaw/double(corpus.raw),
+            size_t(std::count_if(staticLine.begin(),staticLine.end(),[](uint32_t x){return x!=UINT32_MAX;})),dict.distinct(),staticLineRaw/1048576.0,dict.distinct_line_bytes()/1048576.0); }
     fprintf(stderr,"loaded+interned %.1fs TUs=%zu raw=%llu regions=%u region_occ=%zu distinct_lines=%u\n",secs(t0),TUs,(unsigned long long)corpus.raw,NREG,allreg.size(),dict.distinct());
 
     // ===== S1: LZ longest-previous-factor over region-id stream -> per-TU token streams + flat Blocks =====
@@ -264,6 +465,7 @@ int main(int argc,char**argv){
     std::unordered_map<uint64_t,uint32_t> bdict;
     std::vector<uint32_t> tokstream; std::vector<size_t> tokoff; tokoff.push_back(0);
     std::vector<uint32_t> bcopy_src; std::vector<uint8_t> bcopy_ok;   // block k: def as COPY(src,len) if ok (source in prior TUs)
+    uint64_t staticPhraseUses=0, staticPhraseRegions=0; uint32_t staticTokenBase=0;
     if(useS1){
         size_t NS=allreg.size(); uint32_t MINMATCH=3, MAXCHAIN=64, hbits=22;
         std::vector<uint32_t> head(size_t(1)<<hbits, UINT32_MAX), prevp(NS, UINT32_MAX);
@@ -274,15 +476,29 @@ int main(int argc,char**argv){
         auto tb=Clock::now();
         for(size_t t=0;t<TUs;++t){ size_t a=roff[t],b=roff[t+1]; size_t i=a;
             while(i<b){ size_t bestL=0,bestP=0;
+                uint32_t bestStatic=UINT32_MAX; size_t bestStaticL=0;
+                if(useModel&&!staticModel.phrases.empty()){
+                    uint32_t mids[32];
+                    for(uint16_t L:staticModel.phrase_lengths){ if(L>32||i+L>b)continue; bool complete=true;
+                        for(uint16_t j=0;j<L;++j){ uint32_t m=staticRegion[allreg[i+j]]; if(m==UINT32_MAX){complete=false;break;} mids[j]=m; }
+                        if(!complete)continue;
+                        uint32_t pid=staticModel.lookup_phrase(mids,L); if(pid!=UINT32_MAX){bestStatic=pid;bestStaticL=L;break;}
+                    }
+                }
                 if(i+MINMATCH<=b && i+MINMATCH<=NS){ uint32_t cand=head[kgram(i)],chain=0;
                     while(cand!=UINT32_MAX&&chain<MAXCHAIN){ if(cand<i){ size_t L=0,mx=b-i; while(L<mx&&allreg[cand+L]==allreg[i+L])++L; if(L>=MINMATCH&&L>bestL){bestL=L;bestP=cand;if(L==mx)break;} } cand=prevp[cand]; ++chain; } }
                 size_t step; (void)bestP;
-                if(bestL>=MINMATCH){ tokstream.push_back(block_get(&allreg[i],bestL,uint32_t(bestP),(bestP+bestL<=roff[t])?1:0)); step=bestL; }
+                if(bestStaticL>=2&&bestStaticL>=bestL){ tokstream.push_back(0x80000000u|bestStatic); step=bestStaticL; ++staticPhraseUses; staticPhraseRegions+=bestStaticL; }
+                else if(bestL>=MINMATCH){ tokstream.push_back(block_get(&allreg[i],bestL,uint32_t(bestP),(bestP+bestL<=roff[t])?1:0)); step=bestL; }
                 else { tokstream.push_back(allreg[i]); step=1; }
                 for(size_t j=i;j<i+step;++j){ if(j+MINMATCH<=NS){ uint64_t g=kgram(j); prevp[j]=head[g]; head[g]=uint32_t(j); } }
                 i+=step; }
             tokoff.push_back(tokstream.size()); }
+        staticTokenBase=NREG+uint32_t(boff2.size()-1);
+        for(uint32_t&tok:tokstream)if(tok&0x80000000u)tok=staticTokenBase+(tok&0x7fffffffu);
         fprintf(stderr,"S1 LZ: %.1fs tokens=%zu blocks=%zu (%.4f tok/region)\n",secs(tb),tokstream.size(),boff2.size()-1,double(tokstream.size())/NS);
+        if(useModel)fprintf(stderr,"pretrained multi-Region phrases: uses=%llu covered_regions=%llu (%.2f%% occurrences) token_base=%u\n",
+            (unsigned long long)staticPhraseUses,(unsigned long long)staticPhraseRegions,100.0*staticPhraseRegions/double(NS),staticTokenBase);
     } else { // V1: root = raw region-id sequence
         for(size_t t=0;t<TUs;++t){ for(size_t i=roff[t];i<roff[t+1];++i) tokstream.push_back(allreg[i]); tokoff.push_back(tokstream.size()); }
     }
@@ -297,6 +513,8 @@ int main(int argc,char**argv){
     // ---- F's OWN independent store, built ONLY from decoded wire bytes (proves self-describing) ----
     std::vector<uint8_t> Fline_data; std::vector<size_t> Fline_off; Fline_off.push_back(0);   // line id k (1-based) -> [off[k-1],off[k])
     Fline_data.reserve(64u<<20);
+    std::vector<std::vector<uint8_t>> FlineById(useModel?dict.distinct()+1:0), FregBytes(useModel?NREG:0);
+    std::vector<uint32_t> FtargetForModel(useModel?FstaticModel.region_hashes.size():0,UINT32_MAX);
     std::vector<uint32_t> Freg_child; std::vector<size_t> Freg_off; Freg_off.push_back(0);     // region id k (0-based) -> [off[k],off[k+1])
     std::vector<std::string> Fpaths;
     std::vector<uint8_t> fknownBlk(useS1?boff2.size():1,0);   // C's model of F's known blocks
@@ -305,6 +523,7 @@ int main(int argc,char**argv){
     double w_blockdef=0;
     // wire byte accumulators (post-z, per category) + f-checkpoint tracking
     double w_root=0, w_linedef=0, w_regiondef=0, w_pathdef=0, w_missing=0, w_framing=0, w_rootref=0;
+    double w_model=useModel&&chargeModel ? double(staticModel.package_z3)+4.0 : 0.0;
     // S0 semantic-Root memoization: root_key (hash of the TU's RegionKey sequence) -> global TU seq at
     // first publish (strict online). ROOT_REF on an exact-Root reuse = 32 C->F + 24 F->C ACK = 56 B.
     std::unordered_map<uint64_t,std::pair<uint32_t,uint64_t>> rootmemo; std::unordered_map<uint64_t,std::vector<uint32_t>> Froot; uint32_t gtu=0; uint64_t n_rootref=0;
@@ -320,7 +539,7 @@ int main(int argc,char**argv){
     DefCodec encC, decF;  // helper's relative-LZ line codecs (C + F, identical growing stores)
 #endif
     RelLZ relC, relF; if(useD2mine){ relC.reset(); relF.reset(); }   // inline relative-LZ line codec
-    bool byteexact=true; uint64_t n_marker=0,n_literal=0;
+    bool byteexact=true; uint64_t n_marker=0,n_literal=0,n_static_region_def=0,n_static_region_bytes=0,n_static_line_def=0,n_static_line_bytes=0;
     std::vector<uint8_t> allLineDefs, allRoots, allRegions, allBlocks, allPaths, allMiss;   // diagnostic: batched-z3 floor (cross-message headroom)
     std::vector<uint8_t> allRegionsRaw;   // diagnostic: region-defs as RAW line-ids (no per-region delta) -> preserves cross-region subsequence matches for z3-LDM
 
@@ -346,11 +565,12 @@ int main(int argc,char**argv){
                 ++n_rootref;
                 recon.clear(); const std::vector<uint32_t>& seq=Froot[rk];
                 for(uint32_t r:seq){ if(pass==0) Freg_stream.push_back(r);   // keep Freg_stream mirrored to allreg for block-COPY srcs during the cold build
-                    for(size_t j=Freg_off[r];j<Freg_off[r+1];++j){ uint32_t ln=Freg_child[j]; recon.insert(recon.end(),Fline_data.begin()+Fline_off[ln-1],Fline_data.begin()+Fline_off[ln]); } }
+                    if(useModel){const auto&rb=FregBytes[r];recon.insert(recon.end(),rb.begin(),rb.end());}
+                    else for(size_t j=Freg_off[r];j<Freg_off[r+1];++j){ uint32_t ln=Freg_child[j]; recon.insert(recon.end(),Fline_data.begin()+Fline_off[ln-1],Fline_data.begin()+Fline_off[ln]); } }
                 const char* orig=corpus.bytes.data()+corpus.files[t].off;
                 if(recon.size()!=olen || memcmp(recon.data(),orig,olen)!=0){ byteexact=false; if(gtu<5) fprintf(stderr,"S0 ROOT_REF FAIL TU %zu\n",t); }
                 dec_s += std::chrono::duration<double>(Clock::now()-_te).count();
-                cum_raw += olen; double cw=w_root+w_linedef+w_regiondef+w_pathdef+w_blockdef+w_missing+w_framing+w_rootref;
+                cum_raw += olen; double cw=w_model+w_root+w_linedef+w_regiondef+w_pathdef+w_blockdef+w_missing+w_framing+w_rootref;
                 perTU_raw[t]=olen; perTU_wire[t]=cw-cum_wire; cum_wire=cw;
                 while(ckidx<ck_f.size() && double(cum_raw)>=ck_f[ckidx]*(double)corpus.raw*npass){ ck.push_back({ck_f[ckidx],double(cum_raw)/cum_wire}); ++ckidx; }
                 ++gtu; continue;
@@ -362,19 +582,28 @@ int main(int argc,char**argv){
         auto addRegion=[&](uint32_t r){ if(fknownReg[r])return; for(uint32_t x:missReg) if(x==r) return; missReg.push_back(r); };
         for(size_t i=0;i<tn;++i){ uint32_t tok=tk[i];
             if(tok<NREG) addRegion(tok);
-            else { uint32_t k=tok-NREG; if(!fknownBlk[k]){ bool dup=false; for(uint32_t x:missBlk) if(x==k){dup=true;break;} if(!dup){ for(size_t j=boff2[k];j<boff2[k+1];++j) addRegion(bchild[j]); missBlk.push_back(k); } } } }
+            else if(!useModel||tok<staticTokenBase){ uint32_t k=tok-NREG; if(!fknownBlk[k]){ bool dup=false; for(uint32_t x:missBlk) if(x==k){dup=true;break;} if(!dup){ for(size_t j=boff2[k];j<boff2[k+1];++j) addRegion(bchild[j]); missBlk.push_back(k); } } }
+            else { uint32_t pid=tok-staticTokenBase; for(uint32_t mid:staticModel.phrases[pid]){ uint32_t r=targetForModel[mid]; if(r==UINT32_MAX){fprintf(stderr,"static phrase target map missing\n");return 2;} addRegion(r); } } }
         // MISSING = unknown region ids + unknown block ids (F requests; real round-trip in 2-proc)
         { std::vector<uint8_t> mm; put_varint(mm,missReg.size()); for(uint32_t r:missReg) put_varint(mm,r); put_varint(mm,missBlk.size()); for(uint32_t k:missBlk) put_varint(mm,NREG+k);
           if(!missReg.empty()||!missBlk.empty()){ w_missing += zstd_size(z,mm.data(),mm.size(),zlevel,dst) + FRAME; allMiss.insert(allMiss.end(),mm.begin(),mm.end()); } }
         // --- FILL: new paths, new lines, new region defs, new block defs (topological) ---
         std::vector<uint8_t> fill_paths, fill_lines, fill_regions, fill_regions_raw, fill_blocks; uint32_t np=0,nl=0,nr=0,nb=0;
+        int64_t prevWireLineDef=0,prevWireRegionDef=0;
         for(uint32_t r:missReg){ const uint32_t* lids=dict.region_ids_ptr(r); uint32_t c=dict.region_ids_count(r);
-            for(uint32_t j=0;j<c;++j){ uint32_t ln=lids[j]; if(fknownLine[ln]) continue; fknownLine[ln]=1; ++nl;
+            if(useModel&&staticRegion[r]!=UINT32_MAX){
+                for(std::vector<uint8_t>*v:{&fill_regions,&fill_regions_raw}){ put_zigzag(*v,int64_t(r)-prevWireRegionDef); v->push_back(1); put_varint(*v,staticRegion[r]); }
+                prevWireRegionDef=r;
+                fknownReg[r]=1; ++nr; ++n_static_region_def; n_static_region_bytes+=dict.region_raw_len(r); continue;
+            }
+            for(uint32_t j=0;j<c;++j){ uint32_t ln=lids[j]; if(fknownLine[ln]) continue; fknownLine[ln]=1;
+                if(useModel&&staticLine[ln]!=UINT32_MAX){++n_static_line_def;n_static_line_bytes+=dict.ref(ln).len;continue;}
+                ++nl;
                 const LineRef& lr=dict.ref(ln); const char* txt=dict.line_data(lr.off);
                 if(useD1 && parse_marker(txt,lr.len,mk)){ uint32_t pid; auto it=pathid.find(mk.path); if(it==pathid.end()){ pid=uint32_t(paths.size()); pathid.emplace(mk.path,pid); paths.push_back(mk.path);
                         put_varint(fill_paths,mk.path.size()); fill_paths.insert(fill_paths.end(),mk.path.begin(),mk.path.end()); ++np; } else pid=it->second;
-                    fill_lines.push_back(1); put_varint(fill_lines,pid); put_varint(fill_lines,mk.lineno); fill_lines.push_back(uint8_t(mk.flags.size())); for(uint8_t f:mk.flags) fill_lines.push_back(f); ++n_marker;
-                } else { fill_lines.push_back(0);
+                    fill_lines.push_back(1); if(useModel){put_zigzag(fill_lines,int64_t(ln)-prevWireLineDef);prevWireLineDef=ln;} put_varint(fill_lines,pid); put_varint(fill_lines,mk.lineno); fill_lines.push_back(uint8_t(mk.flags.size())); for(uint8_t f:mk.flags) fill_lines.push_back(f); ++n_marker;
+                } else { fill_lines.push_back(0); if(useModel){put_zigzag(fill_lines,int64_t(ln)-prevWireLineDef);prevWireLineDef=ln;}
                     if(useD2mine){ segbuf.clear(); relC.encode((const uint8_t*)txt,lr.len,segbuf); put_varint(fill_lines,segbuf.size()); fill_lines.insert(fill_lines.end(),segbuf.begin(),segbuf.end()); }
 #ifdef HAVE_DEFCODEC
                     else if(useD2){ segbuf.clear(); encC.encode((const uint8_t*)txt,lr.len,segbuf); put_varint(fill_lines,lr.len); put_varint(fill_lines,segbuf.size()); fill_lines.insert(fill_lines.end(),segbuf.begin(),segbuf.end()); }
@@ -382,8 +611,10 @@ int main(int argc,char**argv){
                     else { put_varint(fill_lines,lr.len); fill_lines.insert(fill_lines.end(),txt,txt+lr.len); }
                     ++n_literal; }
             }
-            put_varint(fill_regions,c); { int64_t prev=0; for(uint32_t j=0;j<c;++j){ put_zigzag(fill_regions,int64_t(lids[j])-prev); prev=int64_t(lids[j]); } } fknownReg[r]=1; ++nr;
-            put_varint(fill_regions_raw,c); for(uint32_t j=0;j<c;++j) put_varint(fill_regions_raw,lids[j]);   // adaptive alt: raw line-ids (cross-region subsequence-preserving; z3 picks the smaller)
+            bool mixed=false; if(useModel)for(uint32_t j=0;j<c;++j)if(staticLine[lids[j]]!=UINT32_MAX){mixed=true;break;}
+            if(useModel){ put_zigzag(fill_regions,int64_t(r)-prevWireRegionDef); fill_regions.push_back(mixed?2:0); put_zigzag(fill_regions_raw,int64_t(r)-prevWireRegionDef); fill_regions_raw.push_back(mixed?2:0); prevWireRegionDef=r; }
+            put_varint(fill_regions,c); { int64_t prev=0; for(uint32_t j=0;j<c;++j){ uint32_t ln=lids[j]; uint32_t lid=useModel&&mixed?(staticLine[ln]!=UINT32_MAX?((staticLine[ln]<<1)|1u):(ln<<1)):ln; put_zigzag(fill_regions,int64_t(lid)-prev); prev=int64_t(lid); } } fknownReg[r]=1; ++nr;
+            put_varint(fill_regions_raw,c); for(uint32_t j=0;j<c;++j){uint32_t ln=lids[j];put_varint(fill_regions_raw,useModel&&mixed?(staticLine[ln]!=UINT32_MAX?((staticLine[ln]<<1)|1u):(ln<<1)):ln);}   // adaptive alt: raw line-ids (cross-region subsequence-preserving; z3 picks the smaller)
             { put_varint(allRegionsRaw,c); for(uint32_t j=0;j<c;++j) put_varint(allRegionsRaw,lids[j]); }   // diag
         }
         for(uint32_t k:missBlk){ size_t L=boff2[k+1]-boff2[k];
@@ -408,18 +639,26 @@ int main(int argc,char**argv){
         enc_s += std::chrono::duration<double>(Clock::now()-_te).count(); auto _td=Clock::now();
         // --- DECODER (F): install FILL from wire into F's OWN store, then expand ROOT tokens ---
         { const uint8_t* pp=fill_paths.data(); for(uint32_t k=0;k<np;++k){ uint64_t L=get_varint(pp); Fpaths.emplace_back((const char*)pp,(size_t)L); pp+=L; } }
-        { const uint8_t* pp=fill_lines.data(), *pe=fill_lines.data()+fill_lines.size();
+        { const uint8_t* pp=fill_lines.data(), *pe=fill_lines.data()+fill_lines.size(); int64_t prevDecodedLine=0;
           while(pp<pe){ uint8_t kind=*pp++;
+            uint32_t decodedLine=0; if(useModel){prevDecodedLine+=get_zigzag(pp);decodedLine=uint32_t(prevDecodedLine);}
             if(kind==1){ uint64_t pid=get_varint(pp); uint64_t lineno=get_varint(pp); uint8_t nf=*pp++; Marker dm; dm.path=Fpaths[pid]; dm.lineno=lineno; for(uint8_t f=0;f<nf;++f) dm.flags.push_back(*pp++);
-                tmp.clear(); emit_marker(dm,tmp); Fline_data.insert(Fline_data.end(),tmp.begin(),tmp.end()); Fline_off.push_back(Fline_data.size()); }
+                tmp.clear(); emit_marker(dm,tmp); if(useModel)FlineById[decodedLine]=tmp; else {Fline_data.insert(Fline_data.end(),tmp.begin(),tmp.end());Fline_off.push_back(Fline_data.size());} }
             else {
               if(useD2mine){ uint64_t sl=get_varint(pp); std::vector<uint8_t> lo; relF.decode(pp,sl,lo); pp+=sl; Fline_data.insert(Fline_data.end(),lo.begin(),lo.end()); Fline_off.push_back(Fline_data.size()); }
 #ifdef HAVE_DEFCODEC
               else if(useD2){ uint64_t len=get_varint(pp); uint64_t sl=get_varint(pp); std::vector<uint8_t> lo; decF.decode(pp,sl,lo); pp+=sl; (void)len; Fline_data.insert(Fline_data.end(),lo.begin(),lo.end()); Fline_off.push_back(Fline_data.size()); }
 #endif
-              else { uint64_t len=get_varint(pp); Fline_data.insert(Fline_data.end(),pp,pp+len); pp+=len; Fline_off.push_back(Fline_data.size()); }
+              else { uint64_t len=get_varint(pp); if(useModel)FlineById[decodedLine].assign(pp,pp+len); else {Fline_data.insert(Fline_data.end(),pp,pp+len);Fline_off.push_back(Fline_data.size());} pp+=len; }
             } } }
-        if(reg_raw){ const uint8_t* pp=fill_regions_raw.data(), *pe=fill_regions_raw.data()+fill_regions_raw.size();
+        if(useModel){ const std::vector<uint8_t>&rv=reg_raw?fill_regions_raw:fill_regions; const uint8_t*pp=rv.data(),*pe=rv.data()+rv.size(); int64_t prevDecodedRegion=0;
+          while(pp<pe){ prevDecodedRegion+=get_zigzag(pp); uint32_t r=uint32_t(prevDecodedRegion); uint8_t kind=*pp++;
+            if(kind==1){ uint32_t mid=uint32_t(get_varint(pp));if(mid>=FstaticModel.region_hashes.size()){fprintf(stderr,"decoded model Region out of range\n");return 2;}FtargetForModel[mid]=r;FregBytes[r].assign(FstaticModel.region_bytes.begin()+FstaticModel.region_off[mid],FstaticModel.region_bytes.begin()+FstaticModel.region_off[mid+1]); }
+            else { uint64_t c=get_varint(pp); int64_t prev=0; std::vector<uint8_t>&rb=FregBytes[r]; rb.clear();
+              for(uint64_t j=0;j<c;++j){ uint32_t code; if(reg_raw)code=uint32_t(get_varint(pp)); else {prev+=get_zigzag(pp);code=uint32_t(prev);}
+                if(kind==2&&code&1u){uint32_t mid=code>>1;if(mid>=FstaticModel.line_hashes.size()){fprintf(stderr,"decoded model Line out of range\n");return 2;}rb.insert(rb.end(),FstaticModel.line_bytes.begin()+FstaticModel.line_off[mid],FstaticModel.line_bytes.begin()+FstaticModel.line_off[mid+1]);}
+                else {uint32_t ln=kind==2?code>>1:code;const auto&lb=FlineById[ln];rb.insert(rb.end(),lb.begin(),lb.end());} } } } }
+        else if(reg_raw){ const uint8_t* pp=fill_regions_raw.data(), *pe=fill_regions_raw.data()+fill_regions_raw.size();
           while(pp<pe){ uint64_t c=get_varint(pp); for(uint64_t j=0;j<c;++j) Freg_child.push_back(uint32_t(get_varint(pp))); Freg_off.push_back(Freg_child.size()); } }
         else { const uint8_t* pp=fill_regions.data(), *pe=fill_regions.data()+fill_regions.size();
           while(pp<pe){ uint64_t c=get_varint(pp); int64_t prev=0; for(uint64_t j=0;j<c;++j){ prev+=get_zigzag(pp); Freg_child.push_back(uint32_t(prev)); } Freg_off.push_back(Freg_child.size()); } }
@@ -428,17 +667,19 @@ int main(int argc,char**argv){
             if(kind==1){ uint64_t src=get_varint(pp); uint64_t L=get_varint(pp); for(uint64_t j=0;j<L;++j) Fblk_child.push_back(Freg_stream[src+j]); Fblk_off.push_back(Fblk_child.size()); }
             else { uint64_t L=get_varint(pp); for(uint64_t j=0;j<L;++j) Fblk_child.push_back(uint32_t(get_varint(pp))); Fblk_off.push_back(Fblk_child.size()); } } }
         recon.clear(); size_t fs0=Freg_stream.size();
-        auto emitRegionF=[&](uint32_t r){ Freg_stream.push_back(r); for(size_t j=Freg_off[r];j<Freg_off[r+1];++j){ uint32_t ln=Freg_child[j]; recon.insert(recon.end(), Fline_data.begin()+Fline_off[ln-1], Fline_data.begin()+Fline_off[ln]); } };
+        auto emitRegionF=[&](uint32_t r){ Freg_stream.push_back(r); if(useModel){const auto&rb=FregBytes[r];recon.insert(recon.end(),rb.begin(),rb.end());}
+            else for(size_t j=Freg_off[r];j<Freg_off[r+1];++j){ uint32_t ln=Freg_child[j]; recon.insert(recon.end(), Fline_data.begin()+Fline_off[ln-1], Fline_data.begin()+Fline_off[ln]); } };
         { const uint8_t* pp=rootb.data(), *pe=rootb.data()+rootb.size();
           while(pp<pe){ uint32_t tok=uint32_t(get_varint(pp));
             if(tok<NREG) emitRegionF(tok);
-            else { uint32_t k=tok-NREG; for(size_t j=Fblk_off[k];j<Fblk_off[k+1];++j) emitRegionF(Fblk_child[j]); } } }
+            else if(!useModel||tok<staticTokenBase){ uint32_t k=tok-NREG; for(size_t j=Fblk_off[k];j<Fblk_off[k+1];++j) emitRegionF(Fblk_child[j]); }
+            else { uint32_t pid=tok-staticTokenBase;if(pid>=FstaticModel.phrases.size()){fprintf(stderr,"decoded model phrase out of range\n");return 2;}for(uint32_t mid:FstaticModel.phrases[pid]){uint32_t r=FtargetForModel[mid];if(r==UINT32_MAX){fprintf(stderr,"decoded model phrase has no target Region\n");return 2;}emitRegionF(r);} } } }
         if(useS0) Froot[rk].assign(Freg_stream.begin()+fs0,Freg_stream.end());   // F stores the Root's RegionKey sequence for future ROOT_REF re-expand
         dec_s += std::chrono::duration<double>(Clock::now()-_td).count();   // F-decode ends here; the verify below is harness-only (F doesn't have the original)
         const char* orig=corpus.bytes.data()+corpus.files[t].off;
         if(recon.size()!=olen || memcmp(recon.data(),orig,olen)!=0){ byteexact=false; if(t<5||TUs<10) fprintf(stderr,"BYTE-EXACT FAIL TU %zu (%zu vs %u)\n",t,recon.size(),olen); }
         cum_raw += olen; ++gtu;
-        double cur_wire = w_root+w_linedef+w_regiondef+w_pathdef+w_blockdef+w_missing+w_framing+w_rootref;
+        double cur_wire = w_model+w_root+w_linedef+w_regiondef+w_pathdef+w_blockdef+w_missing+w_framing+w_rootref;
         perTU_raw[t]=olen; perTU_wire[t]=cur_wire - cum_wire; cum_wire=cur_wire;
         while(ckidx<ck_f.size() && double(cum_raw)>=ck_f[ckidx]*(double)corpus.raw*(useS0?npass:1)){ ck.push_back({ck_f[ckidx], double(cum_raw)/cum_wire}); ++ckidx; }
       }
@@ -523,13 +764,16 @@ int main(int argc,char**argv){
         return byteexact?0:1;
     }
 
-    double totalwire = w_root+w_linedef+w_regiondef+w_pathdef+w_blockdef+w_missing+w_framing+w_rootref;
+    double totalwire = w_model+w_root+w_linedef+w_regiondef+w_pathdef+w_blockdef+w_missing+w_framing+w_rootref;
     double MiB=1048576.0;
     printf("\n==== CODEC-50 (%s%s%s%s, z%d) — %s ====\n", useS1?"V1+S1(LZ blocks)":"V1", useD1?"+D1":"", useS0?"+S0":"", (useD2mine?"+D2(inline)":(useD2?"+D2(helper)":"")), zlevel, manifest);
     printf("byte-exact=%s  TUs=%zu raw=%.1f MiB regions=%u distinct_lines=%u paths=%zu blocks=%zu (marker_lines=%llu literal_lines=%llu)\n",
         byteexact?"OK":"FAIL",TUs,corpus.raw/MiB,NREG,dict.distinct(),paths.size(),boff2.size()-1,(unsigned long long)n_marker,(unsigned long long)n_literal);
-    printf("wire by category (post-z%d, bytes): root=%.0f line_def=%.0f region_def=%.0f block_def=%.0f path_def=%.0f missing=%.0f rootref=%.0f framing=%.0f  TOTAL=%.0f (%.2f MiB)\n",
-        zlevel,w_root,w_linedef,w_regiondef,w_blockdef,w_pathdef,w_missing,w_rootref,w_framing,totalwire,totalwire/MiB);
+    printf("wire by category (post-z%d, bytes): model=%.0f root=%.0f line_def=%.0f region_def=%.0f block_def=%.0f path_def=%.0f missing=%.0f rootref=%.0f framing=%.0f  TOTAL=%.0f (%.2f MiB)\n",
+        zlevel,w_model,w_root,w_linedef,w_regiondef,w_blockdef,w_pathdef,w_missing,w_rootref,w_framing,totalwire,totalwire/MiB);
+    if(useModel)printf("pretrained exact Regions: installed=%llu materialized_raw=%.2f MiB; exact Lines=%llu bytes=%.2f MiB; package raw=%.2f MiB z3=%.2f MiB (%s); static phrases uses=%llu regions=%llu\n",
+        (unsigned long long)n_static_region_def,n_static_region_bytes/MiB,(unsigned long long)n_static_line_def,n_static_line_bytes/MiB,staticModel.package_raw/MiB,staticModel.package_z3/MiB,chargeModel?"charged":"shared/package reported separately",
+        (unsigned long long)staticPhraseUses,(unsigned long long)staticPhraseRegions);
     printf("FinalRatio (raw / total wire, one cold pass) = %.1fx\n", corpus.raw/totalwire);
     if(useS0) printf("S0 AMORTIZED over %d builds: raw=%.1f MiB total-wire=%.2f MiB ROOT_REFs=%llu/%llu (%.1f%%) => AmortizedRatio=%.0fx\n",
         npass, (double)corpus.raw*npass/MiB, totalwire/MiB, (unsigned long long)n_rootref,(unsigned long long)(TUs*(uint64_t)npass), 100.0*n_rootref/(TUs*(double)npass), (double)corpus.raw*npass/totalwire);
@@ -555,9 +799,9 @@ int main(int argc,char**argv){
           ZSTD_CCtx_setParameter(z2,ZSTD_c_enableLongDistanceMatching,1); ZSTD_CCtx_setParameter(z2,ZSTD_c_windowLog,27);
           size_t bnd=ZSTD_compressBound(v.size()); if(d2b.size()<bnd)d2b.resize(bnd); return double(ZSTD_compress2(z2,d2b.data(),d2b.size(),v.data(),v.size())); };
         f19_line=batch19(allLineDefs); f19_root=batch19(allRoots); f19_reg=batch19(allRegions); f19_blk=batch19(allBlocks); f19_path=batch19(allPaths); f19_miss=batch19(allMiss);
-        full19=f19_line+f19_root+f19_reg+f19_blk+f19_path+f19_miss+w_framing; }
+        full19=w_model+f19_line+f19_root+f19_reg+f19_blk+f19_path+f19_miss+w_framing; }
       ZSTD_freeCCtx(z2);
-      double fullfloor=fl_line+fl_root+fl_reg+fl_blk+fl_path+fl_miss+w_framing;
+      double fullfloor=w_model+fl_line+fl_root+fl_reg+fl_blk+fl_path+fl_miss+w_framing;
       double alt=totalwire - w_linedef - w_root + bl + br;
       double altldm=totalwire - w_linedef + bl_ldm;
       printf("DIAG batched-z%d floor: line_def %.0f->%.0f  root %.0f->%.0f  => streamed TOTAL=%.0f ratio=%.0fx\n",zlevel,w_linedef,bl,w_root,br,alt,corpus.raw/alt);
