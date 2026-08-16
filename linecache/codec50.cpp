@@ -12,16 +12,19 @@
 // codec, definition_codec.h) plugs into the line-definition leg when available. The real two-process
 // socketpair + throughput and the S0/S1/S3 structure planes build on this same serializer/decoder.
 //
-// build: g++ -O3 -march=native -std=c++17 codec50.cpp -o codec50 -lzstd
+// build: g++ -O3 -march=native -std=c++17 codec50.cpp -o codec50 -lzstd -lz
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <sys/mman.h>
 #include <sys/resource.h>
@@ -30,6 +33,7 @@
 #include <vector>
 #include <immintrin.h>
 #include <zstd.h>
+#include <zlib.h>
 #if defined(WITH_D2) && __has_include("definition_codec.h")
   #include "definition_codec.h"
   #define HAVE_DEFCODEC 1
@@ -161,6 +165,29 @@ static size_t zstd_message_roundtrip(ZSTD_CCtx*c,ZSTD_DCtx*d,const std::vector<u
     return encodedSize;
 }
 
+static size_t zstd_ldm_frame_encode(ZSTD_CCtx*c,const std::vector<uint8_t>&raw,int level,
+                                    std::vector<uint8_t>&encoded){
+    ZSTD_CCtx_reset(c,ZSTD_reset_session_and_parameters);
+    ZSTD_CCtx_setParameter(c,ZSTD_c_compressionLevel,level);
+    ZSTD_CCtx_setParameter(c,ZSTD_c_enableLongDistanceMatching,1);
+    ZSTD_CCtx_setParameter(c,ZSTD_c_windowLog,27);
+    ZSTD_CCtx_setParameter(c,ZSTD_c_checksumFlag,0);
+    ZSTD_CCtx_setParameter(c,ZSTD_c_contentSizeFlag,0);
+    size_t bound=ZSTD_compressBound(raw.size());encoded.resize(bound);
+    uint8_t empty=0;const void*source=raw.empty()?static_cast<const void*>(&empty):static_cast<const void*>(raw.data());
+    size_t size=ZSTD_compress2(c,encoded.data(),encoded.size(),source,raw.size());
+    if(ZSTD_isError(size)){fprintf(stderr,"blob zstd encode %s\n",ZSTD_getErrorName(size));exit(2);}
+    encoded.resize(size);return size;
+}
+static std::vector<uint8_t> zstd_frame_decode_exact(ZSTD_DCtx*d,const std::vector<uint8_t>&encoded,
+                                                     size_t expected){
+    std::vector<uint8_t> raw(expected);uint8_t empty=0;
+    void*out=raw.empty()?static_cast<void*>(&empty):static_cast<void*>(raw.data());
+    size_t size=ZSTD_decompressDCtx(d,out,raw.size(),encoded.data(),encoded.size());
+    if(ZSTD_isError(size)||size!=expected){fprintf(stderr,"blob zstd decode %s\n",ZSTD_isError(size)?ZSTD_getErrorName(size):"size differs");exit(2);}
+    return raw;
+}
+
 static std::vector<uint8_t> zstd_stream_encode(ZSTD_CCtx*c,const std::vector<uint8_t>&raw,
                                                 ZSTD_EndDirective directive){
     ZSTD_inBuffer input{raw.data(),raw.size(),0}; std::vector<uint8_t> encoded;
@@ -283,6 +310,26 @@ struct GeneratedByteArray {
     std::string prefix, separator, suffix;
     uint8_t format=DECIMAL;
 };
+struct CompressedBlob {
+    uint32_t first_entry=0;
+    uint32_t entry_count=0;
+    uint32_t deflated_size=0;
+    uint32_t inflated_offset=0;
+    uint32_t inflated_size=0;
+    uint64_t digest_lo=0;
+    uint64_t digest_hi=0;
+};
+struct BlobPatch {
+    uint32_t prefix=0;
+    uint32_t suffix=0;
+    uint32_t data_offset=0;
+    uint32_t data_size=0;
+    uint8_t kind=0; // 0 canonical output, 1 prefix/middle/suffix correction, 2 full replacement
+};
+struct ArrayWireRecord {
+    uint32_t style=0;
+    uint32_t count=0;
+};
 struct ByteArrayStyle {
     std::string prefix, separator, suffix;
     uint8_t format=DECIMAL;
@@ -378,8 +425,8 @@ static bool packed_line_less(const PackedLines&a,size_t ai,const PackedLines&b,s
 }
 static bool equal_tail(const char*p,const char*end,const char*value,size_t n){ return size_t(end-p)==n&&!memcmp(p,value,n); }
 static int hex_value(uint8_t c){ if(c>='0'&&c<='9')return c-'0'; if(c>='a'&&c<='f')return c-'a'+10; if(c>='A'&&c<='F')return c-'A'+10; return -1; }
-static bool parse_byte_array(const char*data,uint32_t length,GeneratedByteArray&out){
-    const char*begin=data,*end=data+length; if(length<8||end[-1]!='\n')return false;
+static bool parse_byte_array(const char*data,uint32_t length,GeneratedByteArray&out,size_t minimumValues=4){
+    const char*begin=data,*end=data+length; if(length<2||end[-1]!='\n')return false;
     const char*p=begin; while(p<end&&(*p==' '||*p=='\t'))++p; const char*token=p;
     if(p<end&&*p==','){ ++p;while(p<end&&(*p==' '||*p=='\t'))++p;token=p; }
     else if(p>=end || !( (*p>='0'&&*p<='9') || (p+2<=end&&p[0]=='0'&&(p[1]=='x'||p[1]=='X')) )){
@@ -413,12 +460,98 @@ static bool parse_byte_array(const char*data,uint32_t length,GeneratedByteArray&
         std::string current(separatorBegin,p);
         if(!haveSeparator){out.separator=current;haveSeparator=true;}else if(out.separator!=current)return false;
     }
-    if(out.suffix.empty()||out.values.size()<4||!haveFormat)return false;
+    if(out.suffix.empty()||out.values.size()<minimumValues||!haveFormat)return false;
     if(!haveSeparator)out.separator=",";
     if(numberFormat==DECIMAL)out.format=DECIMAL;
     else if(prefixUpper)out.format=sawLower?HEX_UL:HEX_UU;
     else out.format=sawLower?HEX_LL:HEX_LU;
     return true;
+}
+
+static std::pair<uint64_t,uint64_t> blob_digest(const uint8_t*data,size_t size){
+    uint64_t a=1469598103934665603ULL,b=0x9e3779b97f4a7c15ULL^size;
+    for(size_t i=0;i<size;++i){a=(a^data[i])*1099511628211ULL;b=mix64(b^(uint64_t(data[i])+i*0x100000001b3ULL));}
+    return {mix64(a^size),mix64(b^a)};
+}
+static bool inflate_blob_at(const std::vector<GeneratedByteArray>&entries,size_t first,
+                            CompressedBlob&blob,std::vector<uint8_t>&inflated){
+    if(first>=entries.size()||entries[first].values.size()<2)return false;
+    const auto&head=entries[first].values;uint16_t header=uint16_t(head[0])<<8|head[1];
+    if((head[0]&15)!=8||header%31)return false;
+    z_stream stream{};if(inflateInit(&stream)!=Z_OK)return false;
+    size_t outputBegin=inflated.size(),deflated=0;std::array<uint8_t,256*1024> buffer{};
+    bool success=false;
+    for(size_t i=first;i<entries.size()&&i-first<UINT32_MAX;++i){
+        const auto&values=entries[i].values;
+        if(values.size()>UINT_MAX)break;
+        stream.next_in=const_cast<Bytef*>(reinterpret_cast<const Bytef*>(values.data()));stream.avail_in=uInt(values.size());
+        deflated+=values.size();int result=Z_OK;
+        do {
+            stream.next_out=buffer.data();stream.avail_out=uInt(buffer.size());
+            result=inflate(&stream,Z_NO_FLUSH);size_t made=buffer.size()-stream.avail_out;
+            inflated.insert(inflated.end(),buffer.data(),buffer.data()+made);
+            if(result==Z_STREAM_END){
+                if(stream.avail_in==0&&deflated<=UINT32_MAX&&inflated.size()-outputBegin<=UINT32_MAX){
+                    blob.first_entry=uint32_t(first);blob.entry_count=uint32_t(i-first+1);blob.deflated_size=uint32_t(deflated);
+                    blob.inflated_offset=uint32_t(outputBegin);blob.inflated_size=uint32_t(inflated.size()-outputBegin);
+                    std::vector<uint8_t> original;original.reserve(deflated);
+                    for(size_t j=first;j<=i;++j)original.insert(original.end(),entries[j].values.begin(),entries[j].values.end());
+                    auto digest=blob_digest(original.data(),original.size());blob.digest_lo=digest.first;blob.digest_hi=digest.second;success=true;
+                }
+                break;
+            }
+            if(result!=Z_OK)break;
+        } while(stream.avail_in||stream.avail_out==0);
+        if(success||result!=Z_OK)break;
+    }
+    inflateEnd(&stream);
+    if(!success)inflated.resize(outputBegin);
+    return success;
+}
+static std::vector<CompressedBlob> find_compressed_blobs(const std::vector<GeneratedByteArray>&entries,
+                                                          std::vector<uint8_t>&inflated){
+    std::vector<CompressedBlob> blobs;
+    for(size_t i=0;i<entries.size();){CompressedBlob blob;
+        if(inflate_blob_at(entries,i,blob,inflated)){blobs.push_back(blob);i+=blob.entry_count;}else ++i;}
+    return blobs;
+}
+static bool deflate_blob(const uint8_t*data,size_t size,int level,std::vector<uint8_t>&encoded){
+    if(size>ULONG_MAX)return false;
+    uLong source=uLong(size);encoded.resize(compressBound(source));uLongf output=uLongf(encoded.size());
+    int result=compress2(encoded.data(),&output,data,source,level);if(result!=Z_OK)return false;encoded.resize(size_t(output));return true;
+}
+static std::vector<uint32_t> generate_canonical_blobs(const std::vector<CompressedBlob>&blobs,const std::vector<uint8_t>&inflated,
+                                                       uint32_t requestedThreads,int canonicalLevel,
+                                                       std::vector<std::vector<uint8_t>>&encoded){
+    encoded.resize(blobs.size());if(blobs.empty())return {};
+    uint64_t total=0;for(const auto&blob:blobs)total+=blob.inflated_size;
+    uint32_t workers=total>=(1u<<20)?std::min<uint32_t>(requestedThreads,uint32_t(blobs.size())):1;
+    std::atomic<size_t>next{0};std::vector<uint8_t>generated(blobs.size());std::vector<std::thread>threads;threads.reserve(workers);
+    for(uint32_t worker=0;worker<workers;++worker)threads.emplace_back([&]{for(;;){size_t i=next.fetch_add(1,std::memory_order_relaxed);if(i>=blobs.size())break;
+        const auto&blob=blobs[i];if(uint64_t(blob.inflated_offset)+blob.inflated_size>inflated.size()||!deflate_blob(inflated.data()+blob.inflated_offset,blob.inflated_size,canonicalLevel,encoded[i]))continue;
+        generated[i]=1;
+    }});
+    for(auto&thread:threads)thread.join();
+    std::vector<uint32_t>failed;for(size_t i=0;i<blobs.size();++i)if(!generated[i])failed.push_back(uint32_t(i));return failed;
+}
+static BlobPatch make_blob_patch(const std::vector<uint8_t>&original,const std::vector<uint8_t>*canonical,
+                                 std::vector<uint8_t>&patchData){
+    BlobPatch patch;if(canonical&&*canonical==original)return patch;
+    if(!canonical){patch.kind=2;patch.data_offset=uint32_t(patchData.size());patch.data_size=uint32_t(original.size());patchData.insert(patchData.end(),original.begin(),original.end());return patch;}
+    size_t prefix=0,limit=std::min(original.size(),canonical->size());while(prefix<limit&&original[prefix]==(*canonical)[prefix])++prefix;
+    size_t suffix=0;while(suffix<limit-prefix&&original[original.size()-1-suffix]==(*canonical)[canonical->size()-1-suffix])++suffix;
+    patch.kind=1;patch.prefix=uint32_t(prefix);patch.suffix=uint32_t(suffix);patch.data_offset=uint32_t(patchData.size());patch.data_size=uint32_t(original.size()-prefix-suffix);
+    patchData.insert(patchData.end(),original.begin()+prefix,original.end()-suffix);return patch;
+}
+static bool apply_blob_patch(const BlobPatch&patch,const std::vector<uint8_t>&canonical,
+                             const std::vector<uint8_t>&patchData,std::vector<uint8_t>&output){
+    if(uint64_t(patch.data_offset)+patch.data_size>patchData.size())return false;
+    if(patch.kind==0){output=canonical;return true;}
+    if(patch.kind==2){output.assign(patchData.begin()+patch.data_offset,patchData.begin()+patch.data_offset+patch.data_size);return true;}
+    if(patch.kind!=1||uint64_t(patch.prefix)+patch.suffix>canonical.size())return false;
+    output.assign(canonical.begin(),canonical.begin()+patch.prefix);
+    output.insert(output.end(),patchData.begin()+patch.data_offset,patchData.begin()+patch.data_offset+patch.data_size);
+    output.insert(output.end(),canonical.end()-patch.suffix,canonical.end());return true;
 }
 static void append_rendered_byte_array(const ByteArrayStyle&style,const uint8_t*values,
                                        size_t count,std::vector<uint8_t>&out){
@@ -466,7 +599,7 @@ struct RelLZ {
 };
 
 int main(int argc,char**argv){
-    const char* manifest=nullptr; size_t max_files=SIZE_MAX; int zlevel=3,halfColdBit=-1; uint32_t sourceAdmitRatio=6; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, usePriorRoot=false, useSortedLines=false, useByteArrayLines=false, useMixedRegions=false, useProjectSource=false,useKeyMap=false;
+    const char* manifest=nullptr; size_t max_files=SIZE_MAX; int zlevel=3,halfColdBit=-1,blobCanonicalLevel=9; uint32_t sourceAdmitRatio=6,blobThreads=4,blobFallbackEvery=0; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, usePriorRoot=false, useSortedLines=false, useByteArrayLines=false, useMixedRegions=false, useProjectSource=false,useKeyMap=false,useDirectOrdinals=false,useCompressedBlobs=false,useBlobEagerPatches=true;
     for(int i=1;i<argc;++i){ if(!strcmp(argv[i],"--manifest")&&i+1<argc)manifest=argv[++i];
         else if(!strcmp(argv[i],"--z")&&i+1<argc)zlevel=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--no-d1"))useD1=false;
@@ -477,17 +610,28 @@ int main(int argc,char**argv){
         else if(!strcmp(argv[i],"--sorted-lines"))useSortedLines=true;
         else if(!strcmp(argv[i],"--byte-array-lines")){useSortedLines=true;useByteArrayLines=true;}
         else if(!strcmp(argv[i],"--mixed-regions"))useMixedRegions=true;
+        else if(!strcmp(argv[i],"--compressed-blobs"))useCompressedBlobs=true;
+        else if(!strcmp(argv[i],"--blob-threads")&&i+1<argc){char*end=nullptr;unsigned long value=strtoul(argv[++i],&end,10);if(!end||*end||!value||value>32){fprintf(stderr,"bad blob thread count\n");return 2;}blobThreads=uint32_t(value);}
+        else if(!strcmp(argv[i],"--blob-fallback-every")&&i+1<argc){char*end=nullptr;unsigned long value=strtoul(argv[++i],&end,10);if(!end||*end||!value||value>UINT32_MAX){fprintf(stderr,"bad blob fallback interval\n");return 2;}blobFallbackEvery=uint32_t(value);}
+        else if(!strcmp(argv[i],"--blob-lazy-fallback"))useBlobEagerPatches=false;
+        else if(!strcmp(argv[i],"--blob-canonical-level")&&i+1<argc){char*end=nullptr;long value=strtol(argv[++i],&end,10);if(!end||*end||value<1||value>9){fprintf(stderr,"bad blob canonical level\n");return 2;}blobCanonicalLevel=int(value);}
         else if(!strcmp(argv[i],"--source-package"))useProjectSource=true;
         else if(!strcmp(argv[i],"--source-admit-ratio")&&i+1<argc){char*end=nullptr;unsigned long value=strtoul(argv[++i],&end,10);if(!end||*end||!value||value>1000){fprintf(stderr,"bad source admission ratio\n");return 2;}sourceAdmitRatio=uint32_t(value);}
         else if(!strcmp(argv[i],"--key-map"))useKeyMap=true;
+        else if(!strcmp(argv[i],"--direct-ordinals")){useKeyMap=true;useDirectOrdinals=true;}
         else if(!strcmp(argv[i],"--half-cold-bit")&&i+1<argc){char*end=nullptr;long value=strtol(argv[++i],&end,10);if(!end||*end||(value!=0&&value!=1)){fprintf(stderr,"bad half-cold bit\n");return 2;}halfColdBit=int(value);useKeyMap=true;}
         else if(!strcmp(argv[i],"--deep"))deep=true;         // run slow z19/z22 entropy ladder + reorder test
         else if(!strcmp(argv[i],"--warm"))warm=true;         // Basis C: 2nd pass with dict retained -> warm steady-state wire
         else if(!strcmp(argv[i],"--max-files")&&i+1<argc){ char*t=nullptr; unsigned long long v=strtoull(argv[++i],&t,10); if(!t||*t||!v){fprintf(stderr,"bad max-files\n");return 2;} max_files=size_t(v); }
         else { fprintf(stderr,"unknown %s\n",argv[i]); return 2; } }
-    if(!manifest){ fprintf(stderr,"usage: %s --manifest F [--z 0|1|3] [--no-d1] [--d2] [--prior-root] [--sorted-lines|--byte-array-lines|--mixed-regions [--key-map|--half-cold-bit 0|1] [--source-package [--source-admit-ratio N]]] [--max-files N]\n",argv[0]); return 2; }
+    if(!manifest){ fprintf(stderr,"usage: %s --manifest F [--z 0|1|3] [--no-d1] [--d2] [--prior-root] [--sorted-lines|--byte-array-lines|--mixed-regions [--compressed-blobs [--blob-threads N] [--blob-fallback-every N] [--blob-lazy-fallback] [--blob-canonical-level 1..9]] [--key-map|--direct-ordinals|--half-cold-bit 0|1] [--source-package [--source-admit-ratio N]]] [--max-files N]\n",argv[0]); return 2; }
     if(useProjectSource&&!useMixedRegions){fprintf(stderr,"--source-package requires --mixed-regions\n");return 2;}
     if(useKeyMap&&!useMixedRegions){fprintf(stderr,"--key-map and --half-cold-bit require --mixed-regions\n");return 2;}
+    if(useCompressedBlobs&&(!useMixedRegions||!useByteArrayLines)){fprintf(stderr,"--compressed-blobs requires --mixed-regions --byte-array-lines\n");return 2;}
+    if(blobFallbackEvery&&!useCompressedBlobs){fprintf(stderr,"--blob-fallback-every requires --compressed-blobs\n");return 2;}
+    if(!useBlobEagerPatches&&!useCompressedBlobs){fprintf(stderr,"--blob-lazy-fallback requires --compressed-blobs\n");return 2;}
+    if(blobCanonicalLevel!=9&&!useCompressedBlobs){fprintf(stderr,"--blob-canonical-level requires --compressed-blobs\n");return 2;}
+    if(useCompressedBlobs&&strcmp(zlibVersion(),ZLIB_VERSION)){fprintf(stderr,"zlib header/runtime version differs\n");return 2;}
     if(usePriorRoot) useS1=false;
     if(useSortedLines){ useD1=false; useD2=false; useD2mine=false; if(warm){fprintf(stderr,"--sorted-lines warm pass not implemented\n");return 2;} }
     if(useMixedRegions){ useSortedLines=false; useD1=false; useD2=false; useD2mine=false;
@@ -562,6 +706,10 @@ int main(int argc,char**argv){
         ZSTD_CCtx_setParameter(mixedZC[i],ZSTD_c_compressionLevel,zlevel);
         ZSTD_CCtx_setParameter(mixedZC[i],ZSTD_c_contentSizeFlag,0);
     }
+    ZSTD_CCtx*blobZC=useCompressedBlobs?ZSTD_createCCtx():nullptr;
+    ZSTD_DCtx*blobZD=useCompressedBlobs?ZSTD_createDCtx():nullptr;
+    ZSTD_CCtx*blobPatchZC=useCompressedBlobs?ZSTD_createCCtx():nullptr;
+    ZSTD_DCtx*blobPatchZD=useCompressedBlobs?ZSTD_createDCtx():nullptr;
     std::vector<MixedCLineState> mixedCLine;
     if(useMixedRegions)mixedCLine.resize(dict.distinct()+1);
     uint32_t nextMixedPublic=1;SourceTextStore mixedCSource(useProjectSource),mixedFSource;
@@ -585,6 +733,9 @@ int main(int argc,char**argv){
     // wire byte accumulators (post-z, per category) + f-checkpoint tracking
     double w_root=0, w_linedef=0, w_regiondef=0, w_pathdef=0, w_missing=0, w_framing=0;
     std::array<double,6> mixedPartWire{};std::array<uint64_t,7> mixedOps{};uint64_t mixedLiteralRaw=0,mixedArrayValues=0,mixedSourceBytes=0;
+    double mixedBlobWire=0,mixedBlobPatchWire=0,mixedBlobTransformCandidateWire=0,mixedBlobOrdinaryCandidateWire=0,mixedBlobFallbackRequestWire=0,mixedBlobFallbackReplyWire=0;
+    uint64_t mixedBlobCount=0,mixedBlobDeflated=0,mixedBlobInflated=0,mixedBlobPatchRaw=0,mixedBlobCanonicalExact=0,mixedBlobCorrected=0,mixedBlobReplaced=0,mixedBlobFallbacks=0;
+    uint64_t mixedBlobTransformTus=0,mixedBlobOrdinaryTus=0;
     uint64_t mixedSourcePackageRaw=0,mixedSourcePackageFiles=0,mixedSourcePotentialRaw=0,mixedSourceConsidered=0,mixedSourceAdmitted=0,mixedSourceEstimatedCost=0;double mixedSelectorWire=0;
     uint64_t preloadedRegionBytes=0,preloadedRegionCount=0,associatedRegionCount=0;double mixedAssociationWire=0,mixedMissingRequestWire=0;
     const double FRAME=4;   // 4-byte length prefix per framed message
@@ -615,7 +766,8 @@ int main(int argc,char**argv){
         if(halfColdBit>=0&&int(key&1)==halfColdBit){
           MixedFRegionView view{FmixedRegionData.size(),dict.region_raw_len(r),true};
           FmixedRegionData.insert(FmixedRegionData.end(),dict.region_data(r),dict.region_data(r)+dict.region_raw_len(r));
-          FpreloadedRegions.emplace(key,view);preloadedRegionBytes+=view.length;++preloadedRegionCount;
+          if(useDirectOrdinals)FmixedRegions[r]=view;else FpreloadedRegions.emplace(key,view);
+          preloadedRegionBytes+=view.length;++preloadedRegionCount;
         }
       }
     }
@@ -626,7 +778,7 @@ int main(int argc,char**argv){
         w_root=w_linedef=w_regiondef=w_pathdef=w_blockdef=w_missing=w_framing=0; cum_raw=0; cum_wire=0; n_marker=n_literal=0; byteexact=true;
         ck.clear(); ckidx=0; allLineDefs.clear(); allRoots.clear(); allRegions.clear(); allRegionsRaw.clear(); allBlocks.clear(); allPaths.clear(); allMiss.clear();
       }
-      auto tpass=Clock::now(); double enc_s=0, dec_s=0;   // split C-encode vs F-decode wall (2-proc per-stream proxy)
+      auto tpass=Clock::now(); double enc_s=0, dec_s=0,fallback_c_s=0;   // split C-encode vs F-decode wall (2-proc per-stream proxy)
       for(size_t t=0; t<TUs; ++t){
         auto _te=Clock::now();
         const uint32_t* tk=&tokstream[tokoff[t]]; size_t tn=tokoff[t+1]-tokoff[t];
@@ -640,13 +792,13 @@ int main(int argc,char**argv){
           if(++requestStamp==0){std::fill(requiredRegionStamp.begin(),requiredRegionStamp.end(),0);std::fill(requiredBlockStamp.begin(),requiredBlockStamp.end(),0);requestStamp=1;}
           auto requireRegion=[&](uint32_t r){
             if(requiredRegionStamp[r]!=requestStamp){requiredRegionStamp[r]=requestStamp;requiredRegions.push_back(r);}
-            if(!associatedReg[r]){associatedReg[r]=1;associationRegs.push_back(r);}
+            if(!useDirectOrdinals&&!associatedReg[r]){associatedReg[r]=1;associationRegs.push_back(r);}
           };
           auto requireBlock=[&](uint32_t k){if(requiredBlockStamp[k]!=requestStamp){requiredBlockStamp[k]=requestStamp;requiredBlocks.push_back(k);}};
           if(usePriorRoot){for(size_t i=roff[t];i<roff[t+1];++i)requireRegion(allreg[i]);}
           else for(size_t i=0;i<tn;++i){uint32_t tok=tk[i];if(tok<NREG)requireRegion(tok);else{
             uint32_t k=tok-NREG;requireBlock(k);
-            if(!fknownBlk[k])for(size_t j=boff2[k];j<boff2[k+1];++j)requireRegion(bchild[j]);
+            if(useDirectOrdinals||!fknownBlk[k])for(size_t j=boff2[k];j<boff2[k+1];++j)requireRegion(bchild[j]);
           }}
 
           // C -> F ROOT.  F derives direct Region/Block requirements from these decoded bytes;
@@ -654,6 +806,45 @@ int main(int argc,char**argv){
           w_root+=zstd_message_roundtrip(z,messageD,rootb,zlevel,messageEncoded,messageDecoded);w_framing+=FRAME;
           allRoots.insert(allRoots.end(),rootb.begin(),rootb.end());Frootb=messageDecoded;
 
+          if(useDirectOrdinals){
+            // Blocks precede Region NEED in the direct-ordinal form, so F can derive their child
+            // Region closure from its own decoded manifest without a separate id/key association.
+            std::vector<uint32_t>FrequiredRegions,FrequiredBlocks;
+            auto FrequireRegion=[&](uint32_t r){if(FrequiredRegionStamp[r]!=requestStamp){FrequiredRegionStamp[r]=requestStamp;FrequiredRegions.push_back(r);}};
+            auto FrequireBlock=[&](uint32_t k){if(FrequiredBlockStamp[k]!=requestStamp){FrequiredBlockStamp[k]=requestStamp;FrequiredBlocks.push_back(k);}};
+            const uint8_t*rp=Frootb.data(),*re=rp+Frootb.size();
+            while(rp<re){uint64_t tok=get_varint(rp);if(tok<NREG)FrequireRegion(uint32_t(tok));else if(tok-NREG<fknownBlk.size())FrequireBlock(uint32_t(tok-NREG));else{fprintf(stderr,"bad direct Root token\n");return 2;}}
+            if(FrequiredBlocks.size()!=requiredBlocks.size()){fprintf(stderr,"direct Root Block closure differs\n");return 2;}
+            for(uint32_t k:FrequiredBlocks)if(requiredBlockStamp[k]!=requestStamp){fprintf(stderr,"direct Root Block identity differs\n");return 2;}
+
+            std::vector<uint32_t>manifestBlocks;for(uint32_t k:FrequiredBlocks)if(!fknownBlk[k])manifestBlocks.push_back(k);
+            if(!manifestBlocks.empty()){
+              std::vector<uint8_t>blockRaw;put_varint(blockRaw,manifestBlocks.size());
+              for(uint32_t k:manifestBlocks){put_varint(blockRaw,k);size_t length=boff2[k+1]-boff2[k];
+                if(bcopy_ok[k]){blockRaw.push_back(1);put_varint(blockRaw,bcopy_src[k]);put_varint(blockRaw,length);}
+                else{blockRaw.push_back(0);put_varint(blockRaw,length);for(size_t j=boff2[k];j<boff2[k+1];++j)put_varint(blockRaw,bchild[j]);}
+              }
+              size_t bytes=zstd_message_roundtrip(z,messageD,blockRaw,zlevel,messageEncoded,messageDecoded)+FRAME;w_blockdef+=bytes;
+              const uint8_t*bp=messageDecoded.data(),*be=bp+messageDecoded.size();uint64_t count=get_varint(bp);
+              if(count!=manifestBlocks.size()){fprintf(stderr,"direct Block manifest count differs\n");return 2;}
+              for(uint64_t i=0;i<count;++i){uint64_t id=get_varint(bp);if(id>=FknownBlk.size()||id+1!=Fblk_off.size()||FknownBlk[id]){fprintf(stderr,"bad direct Block identity\n");return 2;}uint8_t kind=*bp++;
+                if(kind==1){uint64_t source=get_varint(bp),length=get_varint(bp);if(source+length>Freg_stream.size()){fprintf(stderr,"bad direct Block copy\n");return 2;}for(uint64_t j=0;j<length;++j)Fblk_child.push_back(Freg_stream[source+j]);}
+                else if(kind==0){uint64_t length=get_varint(bp);for(uint64_t j=0;j<length;++j){uint64_t child=get_varint(bp);if(child>=NREG){fprintf(stderr,"bad direct Block child\n");return 2;}Fblk_child.push_back(uint32_t(child));}}
+                else{fprintf(stderr,"bad direct Block kind\n");return 2;}Fblk_off.push_back(Fblk_child.size());FknownBlk[id]=1;fknownBlk[id]=1;
+              }
+              if(bp!=be){fprintf(stderr,"direct Block manifest has trailing bytes\n");return 2;}
+            }
+            for(uint32_t k:FrequiredBlocks){if(!FknownBlk[k]){fprintf(stderr,"missing direct Block definition\n");return 2;}for(size_t j=Fblk_off[k];j<Fblk_off[k+1];++j)FrequireRegion(Fblk_child[j]);}
+            if(FrequiredRegions.size()!=requiredRegions.size()){fprintf(stderr,"direct Region closure differs\n");return 2;}
+            for(uint32_t r:FrequiredRegions){if(requiredRegionStamp[r]!=requestStamp){fprintf(stderr,"direct Region identity differs\n");return 2;}if(!FmixedRegions[r].known)missReg.push_back(r);}
+            if(!manifestBlocks.empty()||!missReg.empty()){
+              std::vector<uint8_t>missingRaw;put_varint(missingRaw,missReg.size());for(uint32_t r:missReg)put_varint(missingRaw,r);put_varint(missingRaw,0);
+              size_t bytes=zstd_message_roundtrip(z,messageD,missingRaw,zlevel,messageEncoded,messageDecoded)+FRAME;w_missing+=bytes;mixedMissingRequestWire+=bytes;allMiss.insert(allMiss.end(),missingRaw.begin(),missingRaw.end());
+              const uint8_t*mp=messageDecoded.data(),*me=mp+messageDecoded.size();uint64_t count=get_varint(mp);std::vector<uint32_t>decoded;decoded.reserve(count);
+              for(uint64_t i=0;i<count;++i){uint64_t id=get_varint(mp);if(id>=NREG){fprintf(stderr,"bad direct missing Region\n");return 2;}decoded.push_back(uint32_t(id));}
+              if(get_varint(mp)!=0||mp!=me||decoded!=missReg){fprintf(stderr,"direct missing reply differs\n");return 2;}
+            }
+          } else {
           // C -> F: first-use dense-id/key64 associations.  F owns the key-indexed preload and is
           // the only side that decides whether an object is present.
           std::vector<uint32_t> FnewAssociationRegs;
@@ -698,6 +889,7 @@ int main(int argc,char**argv){
             for(uint64_t i=0;i<blockCount;++i){if(mp>=me){fprintf(stderr,"truncated missing Block list\n");return 2;}uint64_t id=get_varint(mp);if(id<NREG||id-NREG>=fknownBlk.size()){fprintf(stderr,"bad missing Block id\n");return 2;}decodedBlk.push_back(uint32_t(id-NREG));}
             if(mp!=me||decodedReg!=missReg||decodedBlk!=missBlk){fprintf(stderr,"missing reply differs\n");return 2;}
           }
+          }
           for(uint32_t r:requiredRegions)fknownReg[r]=FmixedRegions[r].known;
         } else {
           // Original single-empty-F model: C's mirror computes the missing closure.
@@ -716,6 +908,10 @@ int main(int argc,char**argv){
         std::array<std::vector<uint8_t>,5> lineRaw, lineEncoded;
         std::array<std::vector<uint8_t>,6> mixedRaw, mixedEncoded;
         std::vector<GeneratedByteArray> mixedArrayEntries;
+        std::vector<CompressedBlob> compressedBlobs;
+        std::vector<BlobPatch>blobPatches;std::vector<std::vector<uint8_t>>CcanonicalBlobs;
+        std::vector<uint8_t> blobRaw,blobEncoded,blobPatchRaw,blobPatchEncoded,blobOriginalRaw;uint8_t blobWireMode=0;
+        std::vector<uint32_t>compressedBlobEntriesSeen;
         std::vector<std::pair<uint32_t,const SourceText*>> mixedSourceDefinitions;
         if(!useMixedRegions) for(uint32_t r:missReg){ const uint32_t* lids=dict.region_ids_ptr(r); uint32_t c=dict.region_ids_count(r);
             for(uint32_t j=0;j<c;++j){ uint32_t ln=lids[j]; if(fknownLine[ln]) continue; fknownLine[ln]=1; ++nl;
@@ -737,6 +933,18 @@ int main(int argc,char**argv){
             put_varint(mixedRaw[0],missReg.size());
             for(uint32_t r:missReg){
                 const uint32_t* lids=dict.region_ids_ptr(r); uint32_t count=dict.region_ids_count(r),offset=0,literalLength=0;
+                std::vector<GeneratedByteArray>regionProbeEntries;std::vector<int32_t>regionLineToProbe(count,-1),regionProbeToBlob;
+                if(useCompressedBlobs){
+                    for(uint32_t j=0;j<count;++j){const LineRef&line=dict.ref(lids[j]);GeneratedByteArray parsed;
+                        if(parse_byte_array(dict.line_data(line.off),line.len,parsed,1)){regionLineToProbe[j]=int32_t(regionProbeEntries.size());regionProbeEntries.push_back(std::move(parsed));}
+                    }
+                    std::vector<uint8_t>regionInflated;std::vector<CompressedBlob>regionBlobs=find_compressed_blobs(regionProbeEntries,regionInflated);
+                    regionProbeToBlob.assign(regionProbeEntries.size(),-1);size_t inflatedBase=blobRaw.size();blobRaw.insert(blobRaw.end(),regionInflated.begin(),regionInflated.end());
+                    for(auto blob:regionBlobs){size_t global=compressedBlobs.size();
+                        for(size_t entry=blob.first_entry;entry<size_t(blob.first_entry)+blob.entry_count;++entry)regionProbeToBlob[entry]=int32_t(global);
+                        blob.first_entry=UINT32_MAX;blob.inflated_offset+=uint32_t(inflatedBase);compressedBlobs.push_back(blob);compressedBlobEntriesSeen.push_back(0);
+                    }
+                }
                 Marker regionMarker;bool regionMarkerOk=false;
                 if(count){const LineRef&first=dict.ref(lids[0]);regionMarkerOk=parse_marker(dict.line_data(first.off),first.len,regionMarker);}
                 const SourceText*regionSource=regionMarkerOk?&mixedCSource.get(regionMarker.path):nullptr;
@@ -752,7 +960,13 @@ int main(int argc,char**argv){
                 auto flushLiteral=[&](){ if(!literalLength)return; mixedRaw[0].push_back(0);put_varint(mixedRaw[0],literalLength);++mixedOps[0];literalLength=0; };
                 for(uint32_t j=0;j<count;++j){
                     uint32_t lineId=lids[j];const LineRef&line=dict.ref(lineId);const char*text=dict.line_data(line.off);MixedCLineState&state=mixedCLine[lineId];
-                    if(state.public_id){
+                    GeneratedByteArray compressedParsed;int32_t probe=useCompressedBlobs?regionLineToProbe[j]:-1;
+                    int32_t compressedBlob=probe>=0?regionProbeToBlob[size_t(probe)]:-1;bool forceCompressedArray=compressedBlob>=0;
+                    if(forceCompressedArray){compressedParsed=std::move(regionProbeEntries[size_t(probe)]);size_t entry=mixedArrayEntries.size();auto&blob=compressedBlobs[size_t(compressedBlob)];uint32_t&seen=compressedBlobEntriesSeen[size_t(compressedBlob)];
+                        if(!seen)blob.first_entry=uint32_t(entry);else if(entry!=size_t(blob.first_entry)+seen){fprintf(stderr,"non-contiguous compressed blob entries\n");return 2;}++seen;}
+                    if(forceCompressedArray){
+                        mixedArrayValues+=compressedParsed.values.size();flushLiteral();mixedRaw[0].push_back(3);mixedArrayEntries.push_back(std::move(compressedParsed));++mixedOps[3];++n_literal;
+                    } else if(state.public_id){
                         flushLiteral();mixedRaw[0].push_back(2);put_varint(mixedRaw[0],state.public_id);++mixedOps[2];
                     } else if(state.source_region!=UINT32_MAX&&state.source_region!=r){
                         if(state.source_region>=r||state.source_offset+line.len>dict.region_raw_len(state.source_region)||
@@ -824,6 +1038,42 @@ int main(int argc,char**argv){
                 fknownReg[r]=1;++nr;
             }
             if(!mixedArrayEntries.empty()){
+                std::vector<uint8_t> blobEntry(mixedArrayEntries.size());
+                if(useCompressedBlobs){
+                    if(compressedBlobs.size()!=compressedBlobEntriesSeen.size()){fprintf(stderr,"compressed blob state differs\n");return 2;}
+                    std::vector<uint8_t>canonicalFailed(compressedBlobs.size());
+                    if(useBlobEagerPatches){
+                        for(uint32_t index:generate_canonical_blobs(compressedBlobs,blobRaw,blobThreads,blobCanonicalLevel,CcanonicalBlobs))canonicalFailed[index]=1;
+                        blobPatches.reserve(compressedBlobs.size());
+                    }
+                    for(size_t index=0;index<compressedBlobs.size();++index){const auto&blob=compressedBlobs[index];
+                        if(compressedBlobEntriesSeen[index]!=blob.entry_count||blob.first_entry==UINT32_MAX){fprintf(stderr,"compressed blob entry count differs\n");return 2;}
+                        if(uint64_t(blob.first_entry)+blob.entry_count>blobEntry.size()){fprintf(stderr,"blob entry extent differs\n");return 2;}
+                        for(uint32_t i=0;i<blob.entry_count;++i){if(blobEntry[blob.first_entry+i]){fprintf(stderr,"overlapping blobs\n");return 2;}blobEntry[blob.first_entry+i]=1;}
+                        std::vector<uint8_t>original;original.reserve(blob.deflated_size);
+                        for(size_t entry=blob.first_entry;entry<size_t(blob.first_entry)+blob.entry_count;++entry)original.insert(original.end(),mixedArrayEntries[entry].values.begin(),mixedArrayEntries[entry].values.end());
+                        if(original.size()!=blob.deflated_size||original.size()>UINT32_MAX||blobOriginalRaw.size()>UINT32_MAX-original.size()){fprintf(stderr,"blob original source extent differs\n");return 2;}
+                        blobOriginalRaw.insert(blobOriginalRaw.end(),original.begin(),original.end());
+                        if(useBlobEagerPatches){
+                            if(blobPatchRaw.size()>UINT32_MAX-original.size()){fprintf(stderr,"blob patch source extent differs\n");return 2;}
+                            const std::vector<uint8_t>*canonical=canonicalFailed[index]?nullptr:&CcanonicalBlobs[index];BlobPatch patch=make_blob_patch(original,canonical,blobPatchRaw);blobPatches.push_back(patch);
+                            if(!patch.kind)++mixedBlobCanonicalExact;else if(patch.kind==1)++mixedBlobCorrected;else ++mixedBlobReplaced;
+                        }
+                        ++mixedBlobCount;mixedBlobDeflated+=blob.deflated_size;mixedBlobInflated+=blob.inflated_size;
+                    }
+                    mixedBlobPatchRaw+=blobPatchRaw.size();CcanonicalBlobs.clear();
+                    if(!compressedBlobs.empty()){
+                        zstd_ldm_frame_encode(blobZC,blobRaw,zlevel,blobEncoded);
+                        if(!blobPatchRaw.empty())zstd_ldm_frame_encode(blobPatchZC,blobPatchRaw,zlevel,blobPatchEncoded);
+                        size_t patchMetadata=useBlobEagerPatches?compressedBlobs.size():0;
+                        if(useBlobEagerPatches)for(const auto&patch:blobPatches)if(patch.kind)patchMetadata+=varint_size(patch.prefix)+varint_size(patch.suffix)+varint_size(patch.data_size);
+                        double transformWire=blobEncoded.size()+FRAME+(blobPatchEncoded.empty()?0:blobPatchEncoded.size()+FRAME)+patchMetadata;
+                        double ordinaryWire=blobOriginalRaw.size()+FRAME;
+                        mixedBlobTransformCandidateWire+=transformWire;mixedBlobOrdinaryCandidateWire+=ordinaryWire;
+                        if(transformWire<ordinaryWire){blobWireMode=useBlobEagerPatches?1:2;++mixedBlobTransformTus;}
+                        else{blobWireMode=3;blobEncoded=std::move(blobOriginalRaw);blobPatchEncoded.clear();++mixedBlobOrdinaryTus;}
+                    }
+                }
                 std::vector<ByteArrayStyle> styles;styles.reserve(mixedArrayEntries.size());
                 for(const auto&value:mixedArrayEntries)styles.push_back({value.prefix,value.separator,value.suffix,value.format});
                 std::sort(styles.begin(),styles.end());styles.erase(std::unique(styles.begin(),styles.end()),styles.end());
@@ -831,9 +1081,15 @@ int main(int argc,char**argv){
                 for(const auto&style:styles){put_varint(mixedRaw[2],style.format);
                     for(const std::string*field:{&style.prefix,&style.separator,&style.suffix}){put_varint(mixedRaw[2],field->size());mixedRaw[2].insert(mixedRaw[2].end(),field->begin(),field->end());}}
                 put_varint(mixedRaw[2],mixedArrayEntries.size());
-                for(const auto&value:mixedArrayEntries){ByteArrayStyle style{value.prefix,value.separator,value.suffix,value.format};
+                for(size_t entry=0;entry<mixedArrayEntries.size();++entry){const auto&value=mixedArrayEntries[entry];ByteArrayStyle style{value.prefix,value.separator,value.suffix,value.format};
                     size_t styleId=std::lower_bound(styles.begin(),styles.end(),style)-styles.begin();put_varint(mixedRaw[2],styleId);put_varint(mixedRaw[2],value.values.size());
-                    mixedRaw[3].insert(mixedRaw[3].end(),value.values.begin(),value.values.end());}
+                    if(!blobEntry[entry])mixedRaw[3].insert(mixedRaw[3].end(),value.values.begin(),value.values.end());}
+                if(useCompressedBlobs&&!compressedBlobs.empty()){
+                    put_varint(mixedRaw[2],blobWireMode);put_varint(mixedRaw[2],ZLIB_VERNUM);put_varint(mixedRaw[2],blobCanonicalLevel);put_varint(mixedRaw[2],compressedBlobs.size());
+                    for(size_t index=0;index<compressedBlobs.size();++index){const auto&blob=compressedBlobs[index];put_varint(mixedRaw[2],blob.first_entry);put_varint(mixedRaw[2],blob.entry_count);put_varint(mixedRaw[2],blob.deflated_size);put_varint(mixedRaw[2],blob.inflated_size);put_u64le(mixedRaw[2],blob.digest_lo);put_u64le(mixedRaw[2],blob.digest_hi);
+                        if(blobWireMode==1){const auto&patch=blobPatches[index];put_varint(mixedRaw[2],patch.kind);if(patch.kind){put_varint(mixedRaw[2],patch.prefix);put_varint(mixedRaw[2],patch.suffix);put_varint(mixedRaw[2],patch.data_size);}}
+                    }
+                }
             }
             if(!mixedSourceDefinitions.empty()){
                 put_varint(mixedRaw[4],mixedSourceDefinitions.size());
@@ -896,6 +1152,12 @@ int main(int argc,char**argv){
                 double bytes=mixedEncoded[i].size()+FRAME;mixedPartWire[i]+=bytes;(i==0?w_regiondef:w_linedef)+=bytes;
             }
             if(useByteArrayLines){w_linedef+=1;mixedSelectorWire+=1;}
+            if(useCompressedBlobs&&!compressedBlobs.empty()){
+                double bytes=blobEncoded.size()+FRAME;
+                w_linedef+=bytes;mixedBlobWire+=bytes;
+                if(!blobPatchEncoded.empty()){bytes=blobPatchEncoded.size()+FRAME;
+                    w_linedef+=bytes;mixedBlobPatchWire+=bytes;}
+            }
         }
         if(useMixedRegions&&t+1==TUs){
             const std::vector<uint8_t> empty;
@@ -947,14 +1209,90 @@ int main(int argc,char**argv){
             }
             if(sp!=se||bp!=be){fprintf(stderr,"mixed source definitions have trailing bytes\n");return 2;}
           } else if(!recovered[5].empty()){fprintf(stderr,"partial mixed source definition streams\n");return 2;}
-          const uint8_t*ap=recovered[2].data(),*ae=ap+recovered[2].size(),*vp=recovered[3].data(),*ve=vp+recovered[3].size();
-          std::vector<ByteArrayStyle> mixedStyles;uint64_t arrayCount=0,arraysUsed=0;
+          const uint8_t*ap=recovered[2].data(),*ae=ap+recovered[2].size();
+          std::vector<ByteArrayStyle> mixedStyles;std::vector<ArrayWireRecord>arrayRecords;std::vector<CompressedBlob>Fblobs;std::vector<BlobPatch>FblobPatches;uint64_t arrayCount=0,arraysUsed=0;bool FblobEager=false,FblobOrdinary=false;int FblobCanonicalLevel=9;size_t expectedPatchRaw=0;
           if(!recovered[2].empty()){
             uint64_t styleCount=get_varint(ap);mixedStyles.reserve(styleCount);
             for(uint64_t k=0;k<styleCount;++k){ByteArrayStyle style;uint64_t format=get_varint(ap);if(format>HEX_UU){fprintf(stderr,"bad mixed array format\n");return 2;}style.format=uint8_t(format);
               for(std::string*field:{&style.prefix,&style.separator,&style.suffix}){uint64_t size=get_varint(ap);if(size>uint64_t(ae-ap)){fprintf(stderr,"bad mixed array style\n");return 2;}field->assign((const char*)ap,size);ap+=size;}mixedStyles.push_back(std::move(style));}
             arrayCount=get_varint(ap);
+            if(arrayCount>UINT32_MAX){fprintf(stderr,"too many mixed arrays\n");return 2;}arrayRecords.reserve(arrayCount);
+            for(uint64_t k=0;k<arrayCount;++k){uint64_t style=get_varint(ap),count=get_varint(ap);if(style>=mixedStyles.size()||count>UINT32_MAX){fprintf(stderr,"bad mixed array record\n");return 2;}arrayRecords.push_back({uint32_t(style),uint32_t(count)});}
+            if(useCompressedBlobs&&!blobEncoded.empty()){uint64_t patchMode=get_varint(ap),canonicalVersion=get_varint(ap),canonicalLevel=get_varint(ap),blobCount=get_varint(ap);if(patchMode<1||patchMode>3||canonicalVersion!=ZLIB_VERNUM||canonicalLevel<1||canonicalLevel>9||blobCount>UINT32_MAX){fprintf(stderr,"bad compressed blob header\n");return 2;}FblobEager=patchMode==1;FblobOrdinary=patchMode==3;FblobCanonicalLevel=int(canonicalLevel);Fblobs.reserve(blobCount);if(FblobEager)FblobPatches.reserve(blobCount);uint64_t expandedOffset=0,priorEnd=0;
+              for(uint64_t k=0;k<blobCount;++k){CompressedBlob blob;uint64_t first=get_varint(ap),count=get_varint(ap),deflated=get_varint(ap),inflated=get_varint(ap);
+                if(first>UINT32_MAX||count>UINT32_MAX||deflated>UINT32_MAX||inflated>UINT32_MAX||first<priorEnd||first+count>arrayCount){fprintf(stderr,"bad compressed blob descriptor\n");return 2;}
+                blob.first_entry=uint32_t(first);blob.entry_count=uint32_t(count);blob.deflated_size=uint32_t(deflated);blob.inflated_offset=uint32_t(expandedOffset);blob.inflated_size=uint32_t(inflated);
+                blob.digest_lo=get_u64le(ap,ae);blob.digest_hi=get_u64le(ap,ae);expandedOffset+=inflated;if(expandedOffset>UINT32_MAX){fprintf(stderr,"compressed blob payload too large\n");return 2;}priorEnd=first+count;Fblobs.push_back(blob);
+                if(FblobEager){BlobPatch patch;uint64_t kind=get_varint(ap);if(kind>2){fprintf(stderr,"bad blob patch kind\n");return 2;}patch.kind=uint8_t(kind);
+                  if(patch.kind){uint64_t prefix=get_varint(ap),suffix=get_varint(ap),size=get_varint(ap);if(prefix>UINT32_MAX||suffix>UINT32_MAX||size>UINT32_MAX||expectedPatchRaw+size>UINT32_MAX){fprintf(stderr,"bad blob patch extent\n");return 2;}patch.prefix=uint32_t(prefix);patch.suffix=uint32_t(suffix);patch.data_offset=uint32_t(expectedPatchRaw);patch.data_size=uint32_t(size);expectedPatchRaw+=size;}FblobPatches.push_back(patch);}
+              }
+            }
+            if(ap!=ae){fprintf(stderr,"mixed array control has trailing bytes\n");return 2;}
           } else if(!recovered[3].empty()){fprintf(stderr,"partial mixed array streams\n");return 2;}
+          size_t expectedBlobRaw=0;for(const auto&blob:Fblobs)expectedBlobRaw+=FblobOrdinary?blob.deflated_size:blob.inflated_size;
+          std::vector<uint8_t>FblobRaw;
+          if(!Fblobs.empty()){
+            if(blobEncoded.empty()){fprintf(stderr,"missing compressed blob frame\n");return 2;}
+            if(FblobOrdinary){
+              if(blobEncoded.size()!=expectedBlobRaw){fprintf(stderr,"ordinary blob payload size differs\n");return 2;}
+              FblobRaw=blobEncoded;
+            } else {
+              FblobRaw=zstd_frame_decode_exact(blobZD,blobEncoded,expectedBlobRaw);
+              if(FblobRaw!=blobRaw){fprintf(stderr,"compressed blob payload differs\n");return 2;}
+            }
+          }
+          else if(!blobEncoded.empty()){fprintf(stderr,"unexpected compressed blob frame\n");return 2;}
+          std::vector<uint8_t>FblobPatchRaw;
+          if(expectedPatchRaw){if(blobPatchEncoded.empty()){fprintf(stderr,"missing blob patch frame\n");return 2;}FblobPatchRaw=zstd_frame_decode_exact(blobPatchZD,blobPatchEncoded,expectedPatchRaw);if(FblobPatchRaw!=blobPatchRaw){fprintf(stderr,"blob patch payload differs\n");return 2;}}
+          else if(!blobPatchEncoded.empty()){fprintf(stderr,"unexpected blob patch frame\n");return 2;}
+          std::vector<std::vector<uint8_t>>canonicalBlobs,regeneratedBlobs(Fblobs.size());std::vector<uint8_t>canonicalFailed(Fblobs.size());
+          if(!FblobOrdinary)for(uint32_t index:generate_canonical_blobs(Fblobs,FblobRaw,blobThreads,FblobCanonicalLevel,canonicalBlobs))canonicalFailed[index]=1;
+          std::vector<uint32_t>blobFallbacks;
+          size_t ordinaryOffset=0;
+          for(size_t index=0;index<Fblobs.size();++index){bool ok=false;
+            if(FblobOrdinary){const auto&blob=Fblobs[index];if(ordinaryOffset+blob.deflated_size<=FblobRaw.size()){regeneratedBlobs[index].assign(FblobRaw.begin()+ordinaryOffset,FblobRaw.begin()+ordinaryOffset+blob.deflated_size);ordinaryOffset+=blob.deflated_size;ok=true;}}
+            else if(FblobEager){const auto&patch=FblobPatches[index];if(!canonicalFailed[index]||patch.kind==2)ok=apply_blob_patch(patch,canonicalBlobs[index],FblobPatchRaw,regeneratedBlobs[index]);}
+            else if(!canonicalFailed[index]){regeneratedBlobs[index]=std::move(canonicalBlobs[index]);ok=true;}
+            if(ok){const auto&blob=Fblobs[index];auto digest=blob_digest(regeneratedBlobs[index].data(),regeneratedBlobs[index].size());ok=regeneratedBlobs[index].size()==blob.deflated_size&&digest.first==blob.digest_lo&&digest.second==blob.digest_hi;}
+            if(!ok||(blobFallbackEvery&&(index+1)%blobFallbackEvery==0))blobFallbacks.push_back(uint32_t(index));
+          }
+          if(FblobOrdinary&&ordinaryOffset!=FblobRaw.size()){fprintf(stderr,"ordinary blob payload has trailing bytes\n");return 2;}
+          if(!blobFallbacks.empty()){
+            // F names only the blob ordinals that did not reproduce. C replies with their original
+            // deflate bytes in the same order, so the initial descriptor lengths delimit the reply.
+            std::vector<uint8_t>fallbackRequest;put_varint(fallbackRequest,blobFallbacks.size());uint32_t prior=0;
+            for(size_t i=0;i<blobFallbacks.size();++i){uint32_t current=blobFallbacks[i];put_varint(fallbackRequest,i?current-prior:current);prior=current;}
+            double requestWire=fallbackRequest.size()+FRAME;w_missing+=requestWire;mixedBlobFallbackRequestWire+=requestWire;
+            const uint8_t*request=fallbackRequest.data(),*requestEnd=request+fallbackRequest.size();uint64_t requested=get_varint(request);
+            std::vector<uint32_t>requestedByC;requestedByC.reserve(requested);uint64_t requestedPrior=0;
+            for(uint64_t i=0;i<requested;++i){uint64_t delta=get_varint(request);uint64_t current=i?requestedPrior+delta:delta;
+              if(current>=compressedBlobs.size()||(i&&current<=requestedPrior)){fprintf(stderr,"bad blob fallback request\n");return 2;}requestedByC.push_back(uint32_t(current));requestedPrior=current;}
+            if(request!=requestEnd||requestedByC!=blobFallbacks||compressedBlobs.size()!=Fblobs.size()){fprintf(stderr,"blob fallback request differs\n");return 2;}
+            std::vector<uint8_t>fallbackReplyRaw;
+            for(uint32_t index:requestedByC){const auto&blob=compressedBlobs[index];size_t begin=fallbackReplyRaw.size();
+              for(size_t entry=blob.first_entry;entry<size_t(blob.first_entry)+blob.entry_count;++entry)fallbackReplyRaw.insert(fallbackReplyRaw.end(),mixedArrayEntries[entry].values.begin(),mixedArrayEntries[entry].values.end());
+              if(fallbackReplyRaw.size()-begin!=blob.deflated_size){fprintf(stderr,"blob fallback source extent differs\n");return 2;}
+            }
+            auto fallbackCStart=Clock::now();size_t fallbackEncodedSize=zstd_size(z,fallbackReplyRaw.data(),fallbackReplyRaw.size(),zlevel,messageEncoded);
+            fallback_c_s+=std::chrono::duration<double>(Clock::now()-fallbackCStart).count();
+            double replyWire=fallbackEncodedSize+FRAME;w_missing+=replyWire;mixedBlobFallbackReplyWire+=replyWire;mixedBlobFallbacks+=blobFallbacks.size();
+            messageDecoded.resize(fallbackReplyRaw.size());size_t fallbackDecodedSize=ZSTD_decompressDCtx(messageD,messageDecoded.data(),messageDecoded.size(),messageEncoded.data(),fallbackEncodedSize);
+            if(ZSTD_isError(fallbackDecodedSize)||fallbackDecodedSize!=fallbackReplyRaw.size()||messageDecoded!=fallbackReplyRaw){fprintf(stderr,"blob fallback reply differs\n");return 2;}
+            const uint8_t*fallback=messageDecoded.data(),*fallbackEnd=fallback+messageDecoded.size();
+            for(uint32_t index:blobFallbacks){const auto&blob=Fblobs[index];if(blob.deflated_size>size_t(fallbackEnd-fallback)){fprintf(stderr,"truncated blob fallback reply\n");return 2;}
+              auto digest=blob_digest(fallback,blob.deflated_size);if(digest.first!=blob.digest_lo||digest.second!=blob.digest_hi){fprintf(stderr,"blob fallback digest differs\n");return 2;}
+              regeneratedBlobs[index].assign(fallback,fallback+blob.deflated_size);fallback+=blob.deflated_size;}
+            if(fallback!=fallbackEnd){fprintf(stderr,"blob fallback reply has trailing bytes\n");return 2;}
+          }
+          std::vector<uint8_t>mixedArrayValueBytes;size_t totalArrayValues=0;for(const auto&record:arrayRecords)totalArrayValues+=record.count;mixedArrayValueBytes.reserve(totalArrayValues);
+          const uint8_t*residual=recovered[3].data(),*residualEnd=residual+recovered[3].size();size_t blobIndex=0;
+          for(size_t entry=0;entry<arrayRecords.size();){
+            if(blobIndex<Fblobs.size()&&Fblobs[blobIndex].first_entry==entry){const auto&blob=Fblobs[blobIndex];size_t values=0;for(size_t j=0;j<blob.entry_count;++j)values+=arrayRecords[entry+j].count;
+              if(values!=blob.deflated_size||regeneratedBlobs[blobIndex].size()!=values){fprintf(stderr,"regenerated blob extent differs\n");return 2;}mixedArrayValueBytes.insert(mixedArrayValueBytes.end(),regeneratedBlobs[blobIndex].begin(),regeneratedBlobs[blobIndex].end());entry+=blob.entry_count;++blobIndex;
+            }else{size_t count=arrayRecords[entry].count;if(count>size_t(residualEnd-residual)){fprintf(stderr,"truncated mixed array residual\n");return 2;}mixedArrayValueBytes.insert(mixedArrayValueBytes.end(),residual,residual+count);residual+=count;++entry;}
+          }
+          if(blobIndex!=Fblobs.size()||residual!=residualEnd||mixedArrayValueBytes.size()!=totalArrayValues){fprintf(stderr,"mixed array value assembly differs\n");return 2;}
+          uint8_t emptyArrayValue=0;const uint8_t*vp=mixedArrayValueBytes.empty()?&emptyArrayValue:mixedArrayValueBytes.data(),*ve=vp+mixedArrayValueBytes.size();
           if(!recovered[0].empty()){
             const uint8_t*cp=recovered[0].data(),*ce=cp+recovered[0].size();const uint8_t*lp=recovered[1].data(),*le=lp+recovered[1].size();
             uint64_t regionCount=get_varint(cp);if(regionCount!=nr||regionCount!=missReg.size()){fprintf(stderr,"mixed Region count differs\n");return 2;}
@@ -972,9 +1310,9 @@ int main(int argc,char**argv){
                   const MixedFLineView&view=FmixedPublic[publicId];if(!FmixedRegions[view.source_region].known){fprintf(stderr,"bad mixed public source\n");return 2;}
                   size_t sourceBegin=FmixedRegions[view.source_region].offset+view.source_offset,destination=FmixedRegionData.size();
                   FmixedRegionData.resize(destination+view.length);memcpy(FmixedRegionData.data()+destination,FmixedRegionData.data()+sourceBegin,view.length);
-                } else if(op==3){if(arraysUsed>=arrayCount){fprintf(stderr,"missing mixed array record\n");return 2;}uint64_t styleId=get_varint(ap),count=get_varint(ap);
-                  if(styleId>=mixedStyles.size()||count>uint64_t(ve-vp)){fprintf(stderr,"bad mixed array record\n");return 2;}
-                  append_rendered_byte_array(mixedStyles[styleId],vp,count,FmixedRegionData);vp+=count;++arraysUsed;
+                } else if(op==3){if(arraysUsed>=arrayCount){fprintf(stderr,"missing mixed array record\n");return 2;}const auto&record=arrayRecords[arraysUsed];
+                  if(record.style>=mixedStyles.size()||record.count>uint64_t(ve-vp)){fprintf(stderr,"bad mixed array record\n");return 2;}
+                  append_rendered_byte_array(mixedStyles[record.style],vp,record.count,FmixedRegionData);vp+=record.count;++arraysUsed;
                 } else if(op==4){uint64_t pathId=get_varint(cp),lineNumber=get_varint(cp),flagCount=get_varint(cp);
                   if(pathId>=Fpaths.size()||flagCount>uint64_t(ce-cp)){fprintf(stderr,"bad mixed marker record\n");return 2;}Marker marker;marker.path=Fpaths[pathId];marker.lineno=lineNumber;
                   marker.flags.assign(cp,cp+flagCount);cp+=flagCount;tmp.clear();emit_marker(marker,tmp);FmixedRegionData.insert(FmixedRegionData.end(),tmp.begin(),tmp.end());
@@ -992,7 +1330,7 @@ int main(int argc,char**argv){
               if(rawLength!=dict.region_raw_len(regionId)||memcmp(FmixedRegionData.data()+begin,dict.region_data(regionId),rawLength)){fprintf(stderr,"mixed Region differs\n");return 2;}
               FmixedRegions[regionId]={begin,uint32_t(rawLength),true};
             }
-            if(cp!=ce||lp!=le||ap!=ae||vp!=ve||arraysUsed!=arrayCount||FmixedPublic.size()!=nextMixedPublic){fprintf(stderr,"mixed Region streams have trailing bytes or state differs\n");return 2;}
+            if(cp!=ce||lp!=le||vp!=ve||arraysUsed!=arrayCount||FmixedPublic.size()!=nextMixedPublic){fprintf(stderr,"mixed Region streams have trailing bytes or state differs\n");return 2;}
           } else if(nr||!recovered[1].empty()){fprintf(stderr,"partial mixed Region streams\n");return 2;}
         } else if(useSortedLines){
           std::array<std::vector<uint8_t>,5> recovered;
@@ -1091,8 +1429,9 @@ int main(int argc,char**argv){
         perTU_raw[t]=olen; perTU_wire[t]=cur_wire - cum_wire; cum_wire=cur_wire;
         while(ckidx<ck_f.size() && double(cum_raw)>=ck_f[ckidx]*corpus.raw){ ck.push_back({ck_f[ckidx], double(cum_raw)/cum_wire}); ++ckidx; }
       }
-      fprintf(stderr,"pass %d (%s) single-core encode+decode+verify: %.2fs = %.2f GB/s raw\n", pass, (pass+1==npass&&npass>1)?"WARM":"cold", secs(tpass), corpus.raw/1e9/secs(tpass));
-      fprintf(stderr,"  split (2-proc per-stream proxy): C-encode %.2f GB/s | F-decode %.2f GB/s => pipelined min = %.2f GB/s\n",
+      enc_s+=fallback_c_s;dec_s-=fallback_c_s;if(dec_s<0)dec_s=0;
+      fprintf(stderr,"pass %d (%s) single-core encode+decode+verify: %.2fs = %.3f GB/s raw\n", pass, (pass+1==npass&&npass>1)?"WARM":"cold", secs(tpass), corpus.raw/1e9/secs(tpass));
+      fprintf(stderr,"  split (2-proc per-stream proxy): C-encode %.3f GB/s | F-decode %.3f GB/s => pipelined min = %.3f GB/s\n",
               corpus.raw/1e9/enc_s, corpus.raw/1e9/dec_s, corpus.raw/1e9/std::max(enc_s,dec_s));
     }
     while(ck.size()<ck_f.size()) ck.push_back({ck_f[ck.size()], double(cum_raw)/cum_wire});
@@ -1101,12 +1440,16 @@ int main(int argc,char**argv){
     if(sourceCostZ)ZSTD_freeCCtx(sourceCostZ);
     if(useSortedLines) for(size_t i=0;i<linePartCount;++i){ ZSTD_freeCCtx(lineZC[i]); ZSTD_freeDCtx(lineZD[i]); }
     if(useMixedRegions) for(size_t i=0;i<mixedPartCount;++i){ ZSTD_freeCCtx(mixedZC[i]); ZSTD_freeDCtx(mixedZD[i]); }
+    if(blobZC)ZSTD_freeCCtx(blobZC);
+    if(blobZD)ZSTD_freeDCtx(blobZD);
+    if(blobPatchZC)ZSTD_freeCCtx(blobPatchZC);
+    if(blobPatchZD)ZSTD_freeDCtx(blobPatchZD);
 
     double totalwire = w_root+w_linedef+w_regiondef+w_pathdef+w_blockdef+w_missing+w_framing;
     double MiB=1048576.0;
     const char* structure_name=usePriorRoot?"V1+P22(ROOT_SLICE)":(useS1?"V1+S1(LZ blocks)":"V1");
-    const char* line_name=useMixedRegions?(useByteArrayLines?"+P24(mixed-regions+BYTE_ARRAY)":"+P24(mixed-regions)"):(useByteArrayLines?"+P21(BYTE_ARRAY)":(useSortedLines?"+P9(sorted-lines)":""));
-    printf("\n==== CODEC-50 (%s%s%s%s%s, z%d) — %s ====\n", structure_name, useD1?"+D1":"", line_name, useProjectSource?"+SOURCE_PACKAGE":"", (useD2mine?"+D2(inline)":(useD2?"+D2(helper)":"")), zlevel, manifest);
+    const char* line_name=useMixedRegions?(useCompressedBlobs?"+P26(mixed-regions+BYTE_ARRAY+BLOB)":(useByteArrayLines?"+P24(mixed-regions+BYTE_ARRAY)":"+P24(mixed-regions)")):(useByteArrayLines?"+P21(BYTE_ARRAY)":(useSortedLines?"+P9(sorted-lines)":""));
+    printf("\n==== CODEC-50 (%s%s%s%s%s%s, z%d) — %s ====\n", structure_name, useD1?"+D1":"", line_name, useProjectSource?"+SOURCE_PACKAGE":"", (useD2mine?"+D2(inline)":(useD2?"+D2(helper)":"")), useDirectOrdinals?"+DIRECT_ORDINALS":"", zlevel, manifest);
     printf("byte-exact=%s  TUs=%zu raw=%.1f MiB regions=%u distinct_lines=%u paths=%zu blocks=%zu (marker_lines=%llu literal_lines=%llu)\n",
         byteexact?"OK":"FAIL",TUs,corpus.raw/MiB,NREG,dict.distinct(),paths.size(),boff2.size()-1,(unsigned long long)n_marker,(unsigned long long)n_literal);
     printf("wire by category (post-z%d, bytes): root=%.0f line_def=%.0f region_def=%.0f block_def=%.0f path_def=%.0f missing=%.0f framing=%.0f  TOTAL=%.0f (%.2f MiB)\n",
@@ -1120,9 +1463,15 @@ int main(int argc,char**argv){
         mixedPartWire[0],mixedPartWire[1],mixedPartWire[2],mixedPartWire[3],mixedPartWire[4],mixedPartWire[5],mixedSelectorWire,
         (unsigned long long)mixedLiteralRaw,(unsigned long long)mixedArrayValues,(unsigned long long)mixedSourceBytes,(unsigned long long)mixedSourcePackageRaw,(unsigned long long)mixedSourcePackageFiles,nextMixedPublic-1,
         (unsigned long long)mixedOps[0],(unsigned long long)mixedOps[1],(unsigned long long)mixedOps[2],(unsigned long long)mixedOps[3],(unsigned long long)mixedOps[4],(unsigned long long)mixedOps[5],(unsigned long long)mixedOps[6]);
+    if(useCompressedBlobs)printf("compressed blobs: count=%llu deflated=%llu inflated=%llu wire=%.0f patch_raw=%llu patch_wire=%.0f canonical_exact=%llu corrected=%llu replaced=%llu transform_candidate_wire=%.0f ordinary_candidate_wire=%.0f transform_tus=%llu ordinary_tus=%llu fallbacks=%llu fallback_request_wire=%.0f fallback_reply_wire=%.0f threads=%u mode=%s canonical=zlib-%s-level%d\n",
+        (unsigned long long)mixedBlobCount,(unsigned long long)mixedBlobDeflated,(unsigned long long)mixedBlobInflated,mixedBlobWire,
+        (unsigned long long)mixedBlobPatchRaw,mixedBlobPatchWire,(unsigned long long)mixedBlobCanonicalExact,(unsigned long long)mixedBlobCorrected,(unsigned long long)mixedBlobReplaced,
+        mixedBlobTransformCandidateWire,mixedBlobOrdinaryCandidateWire,(unsigned long long)mixedBlobTransformTus,(unsigned long long)mixedBlobOrdinaryTus,
+        (unsigned long long)mixedBlobFallbacks,mixedBlobFallbackRequestWire,mixedBlobFallbackReplyWire,blobThreads,useBlobEagerPatches?"eager-patch":"lazy-reply",zlibVersion(),blobCanonicalLevel);
     if(useKeyMap)printf("key map: half_cold_bit=%d preloaded_regions=%llu preloaded_raw_bytes=%llu associated_regions=%llu association_wire=%.0f missing_reply_wire=%.0f\n",
         halfColdBit,(unsigned long long)preloadedRegionCount,(unsigned long long)preloadedRegionBytes,
         (unsigned long long)associatedRegionCount,mixedAssociationWire,mixedMissingRequestWire);
+    if(useDirectOrdinals)printf("direct ordinals: generation_latched=1 region_namespaces=1 block_lifetime=generation\n");
     if(useProjectSource)printf("source admission: ratio=%u considered=%llu admitted=%llu observed_potential_raw=%llu estimated_independent_package_wire=%llu\n",
         sourceAdmitRatio,(unsigned long long)mixedSourceConsidered,(unsigned long long)mixedSourceAdmitted,(unsigned long long)mixedSourcePotentialRaw,(unsigned long long)mixedSourceEstimatedCost);
     if(!useSortedLines&&!useMixedRegions){ ZSTD_CCtx* z2=ZSTD_createCCtx(); std::vector<uint8_t> d2b;

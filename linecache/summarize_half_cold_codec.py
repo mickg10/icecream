@@ -31,7 +31,8 @@ KEY_FIELDS = (
 
 def parse_key_map(path: Path, expected_bit: int) -> dict[str, object]:
     row = parse_mixed(path)
-    found = KEY_PATTERN.search(path.read_text())
+    text = path.read_text()
+    found = KEY_PATTERN.search(text)
     if found is None:
         raise ValueError(f"{path}: missing key-map ledger")
     row.update(dict(zip(KEY_FIELDS, map(int, found.groups()))))
@@ -40,11 +41,18 @@ def parse_key_map(path: Path, expected_bit: int) -> dict[str, object]:
     if (
         int(row["association_wire_bytes"])
         + int(row["missing_reply_wire_bytes"])
+        + int(row["blob_fallback_request_wire_bytes"])
+        + int(row["blob_fallback_reply_wire_bytes"])
         != int(row["missing_wire_bytes"])
     ):
         raise ValueError(f"{path}: association/reply split does not close missing leg")
-    if int(row["associated_regions"]) != int(row["regions"]):
+    direct_ordinals = "direct ordinals:" in text
+    if direct_ordinals:
+        if int(row["associated_regions"]) or int(row["association_wire_bytes"]):
+            raise ValueError(f"{path}: direct ordinals unexpectedly carry associations")
+    elif int(row["associated_regions"]) != int(row["regions"]):
         raise ValueError(f"{path}: not every dense Region id was associated")
+    row["direct_ordinals"] = direct_ordinals
     return row
 
 

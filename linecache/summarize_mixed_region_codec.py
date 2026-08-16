@@ -42,7 +42,36 @@ MIXED_FIELDS = (
     "marker_ops",
     "source_copy_ops",
     "source_patch_ops",
+    "blob_count",
+    "blob_deflated_bytes",
+    "blob_inflated_bytes",
+    "blob_wire_bytes",
+    "blob_patch_raw_bytes",
+    "blob_patch_wire_bytes",
+    "blob_canonical_exact",
+    "blob_corrected",
+    "blob_replaced",
+    "blob_transform_candidate_wire_bytes",
+    "blob_ordinary_candidate_wire_bytes",
+    "blob_transform_tus",
+    "blob_ordinary_tus",
+    "blob_fallbacks",
+    "blob_fallback_request_wire_bytes",
+    "blob_fallback_reply_wire_bytes",
+    "blob_threads",
 )
+
+BLOB_PATTERN = re.compile(
+    r"compressed blobs: count=(\d+) deflated=(\d+) inflated=(\d+) wire=(\d+) "
+    r"patch_raw=(\d+) patch_wire=(\d+) canonical_exact=(\d+) corrected=(\d+) "
+    r"replaced=(\d+) transform_candidate_wire=(\d+) ordinary_candidate_wire=(\d+) "
+    r"transform_tus=(\d+) ordinary_tus=(\d+) "
+    r"fallbacks=(\d+) fallback_request_wire=(\d+) fallback_reply_wire=(\d+) "
+    r"threads=(\d+)"
+)
+
+BLOB_FIELDS = MIXED_FIELDS[-17:]
+BASE_MIXED_FIELDS = MIXED_FIELDS[:-17]
 
 
 def parse_mixed(path: Path) -> dict[str, object]:
@@ -50,7 +79,13 @@ def parse_mixed(path: Path) -> dict[str, object]:
     found = MIXED_PATTERN.search(path.read_text())
     if found is None:
         raise ValueError(f"{path}: missing mixed-component ledger")
-    row.update(dict(zip(MIXED_FIELDS, map(int, found.groups()))))
+    row.update(dict(zip(BASE_MIXED_FIELDS, map(int, found.groups()))))
+    blob = BLOB_PATTERN.search(path.read_text())
+    row.update(
+        dict(zip(BLOB_FIELDS, map(int, blob.groups())))
+        if blob is not None
+        else {field: 0 for field in BLOB_FIELDS}
+    )
     if (
         int(row["control_wire_bytes"]) != int(row["region_def_wire_bytes"])
         or sum(
@@ -62,6 +97,8 @@ def parse_mixed(path: Path) -> dict[str, object]:
                 "source_control_wire_bytes",
                 "source_files_wire_bytes",
                 "selector_wire_bytes",
+                "blob_wire_bytes",
+                "blob_patch_wire_bytes",
             )
         )
         != int(row["line_def_wire_bytes"])
