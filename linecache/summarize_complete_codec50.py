@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize exact complete-file CODEC-50 logs for issue #16."""
+"""Summarize exact full-file CODEC-50 reconstruction logs for issue #16."""
 
 from __future__ import annotations
 
@@ -196,12 +196,19 @@ def main() -> int:
     baseline = aggregate(baseline_rows)
     candidate = aggregate(candidate_rows)
     report = {
-        "experiment": "complete exact CODEC-50 S1 versus P22 ROOT_SLICE",
+        "experiment": "exact full-file CODEC-50 S1 versus P22 ROOT_SLICE",
         "scope": (
-            "full .ii reconstruction including Line definitions, Region-to-Line "
-            "composition, Roots/Blocks, paths, missing lists, and framing"
+            "one empty-receiver dense-ID conversation; exact full-.ii reconstruction "
+            "including Lines, Region composition, Roots/Blocks, paths, missing lists, "
+            "and framing"
         ),
-        "total_transfer_complete": True,
+        "full_file_reconstruction_complete": True,
+        "total_protocol_acceptance_complete": False,
+        "remaining_acceptance_blocks": [
+            "generation-key and dense-map accounting for nonempty/half-cold receiver state",
+            "actual C/F socket framing and dispatch",
+            "complete complementary half-cold object-cache execution",
+        ],
         "baseline": baseline,
         "candidate": candidate,
         "candidate_wire_delta_bytes": int(candidate["total_wire_bytes"])

@@ -42,7 +42,8 @@
   "candidate_ratio_change_fraction": -0.005495695926945876,
   "candidate_win_corpora": 1,
   "candidate_wire_delta_bytes": 810256,
-  "experiment": "complete exact CODEC-50 S1 versus P22 ROOT_SLICE",
+  "experiment": "exact full-file CODEC-50 S1 versus P22 ROOT_SLICE",
+  "full_file_reconstruction_complete": true,
   "per_corpus": [
     {
       "baseline_ratio": 304.0111380660513,
@@ -333,6 +334,11 @@
       "wire_delta_bytes": 2115
     }
   ],
-  "scope": "full .ii reconstruction including Line definitions, Region-to-Line composition, Roots/Blocks, paths, missing lists, and framing",
-  "total_transfer_complete": true
+  "remaining_acceptance_blocks": [
+    "generation-key and dense-map accounting for nonempty/half-cold receiver state",
+    "actual C/F socket framing and dispatch",
+    "complete complementary half-cold object-cache execution"
+  ],
+  "scope": "one empty-receiver dense-ID conversation; exact full-.ii reconstruction including Lines, Region composition, Roots/Blocks, paths, missing lists, and framing",
+  "total_protocol_acceptance_complete": false
 }

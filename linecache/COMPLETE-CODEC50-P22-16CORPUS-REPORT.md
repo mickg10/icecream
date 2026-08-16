@@ -1,19 +1,19 @@
-# Complete CODEC-50 ledger and P22 `ROOT_SLICE` integration
+# Full-file CODEC-50 reconstruction ledger and P22 `ROOT_SLICE` integration
 
 ## Decision
 
 Do not port P22 `ROOT_SLICE` as the current product Root representation.  Its earlier Region-digest
 capability result is exact, but the gain does not survive integration with the real dense-ID object
-path.  Across the complete balanced corpus, P22 sends **810,256 more bytes** than the existing S1
+path.  Across the balanced full-file reconstruction corpus, P22 sends **810,256 more bytes** than the existing S1
 flat-Block representation and reduces the byte-weighted ratio from **194.75x to 193.68x**.  It wins
 only fmt, by 4,998 bytes, and loses the other 15 corpora.
 
-The next work must stay on the complete path and target the Line-definition and Region-composition
+The next work must stay on the full-file reconstruction path and target the Line-definition and Region-composition
 legs.  Together they are 138,118,681 of the baseline's 146,624,393 bytes (94.2%).
 
 ## Scope and correctness
 
-This is the first P22 comparison against the complete `codec50.cpp` decoder contract.  Every run:
+This is the first P22 comparison against the full-file `codec50.cpp` decoder contract.  Every run:
 
 1. reads each chronological `.ii` manifest;
 2. interns exact Lines and marker-delimited Regions;
@@ -23,11 +23,18 @@ This is the first P22 comparison against the complete `codec50.cpp` decoder cont
 5. expands every Root through Regions and Lines; and
 6. compares every reconstructed TU byte-for-byte with the original `.ii`.
 
-All 9,292 TUs in both 16-corpus matrices reconstruct exactly.  The result is a complete cold pass,
-not a projection.  The P22 candidate uses only completed earlier Roots, checks every proposed range
-over exact dense Region IDs, and commits the current Root only after expansion.
+All 9,292 TUs in both 16-corpus matrices reconstruct exactly.  The result is an exact cold
+empty-receiver reconstruction pass, not a two-plane projection.  The P22 candidate uses only
+completed earlier Roots, checks every proposed range over exact dense Region IDs, and commits the
+current Root only after expansion.
 
-## Complete aggregate ledger
+This is not yet total protocol acceptance.  The harness derives one dense-ID conversation from an
+empty F and does not yet serialize generation-key-to-dense-ID associations for nonempty or
+half-cold F state.  It also does not run these blocks through the actual C/F socket dispatcher or
+execute the complementary half-cold object-cache scenario.  Those bytes and state transitions must
+be measured before either overall target can be accepted.
+
+## Full-file reconstruction aggregate ledger
 
 | category | S1 baseline | P22 `ROOT_SLICE` | change |
 |---|---:|---:|---:|
@@ -74,12 +81,12 @@ P22's standalone atom stream had to define or reference each Region by a 20-byte
 triple before it could copy prior Root ranges.  Avoiding repeated digest atoms created the reported
 29.67% structural win.
 
-The complete transport already assigns each immutable Region a dense `u32` identity and sends its
+The full-file harness already assigns each immutable Region a dense `u32` identity and sends its
 Line composition once.  S1 Roots therefore operate on compact Region IDs and name repeated ranges
 with reusable flat Blocks.  P22 removes 428,568 bytes of Block definitions and saves 180,881 bytes
 of missing/framing traffic, but its per-Root opcode/range programs add 1,419,705 Root bytes.  The net
 is the measured 810,256-byte loss.  The earlier gain was representation-specific, not a missing
-factor in the complete dense-ID protocol.
+factor in the full-file dense-ID reconstruction.
 
 This also validates the architecture rule that F's hot expansion path should remain dense-vector
 based.  Exact digest or cache keys belong at object association boundaries; they should not be paid
@@ -92,21 +99,27 @@ old run terminated with `line tbl`.  The harness now exposes `ICE_LINE_CAP_LOG2`
 uses `2^23`, completes exactly, and peaks at 7.72 GiB while holding the full 5.93 GB corpus in memory.
 This is a harness sizing correction, not the desired product allocation strategy.
 
-## Next exact candidate
+## Next exact candidate and outcome
 
-The complete baseline identifies the next order unambiguously:
+The full-file baseline identifies the next order unambiguously:
 
-1. integrate P21 sorted split-front plus `BYTE_ARRAY` decoding into the complete F store;
+1. integrate P21 sorted split-front plus `BYTE_ARRAY` decoding into the full-file F store;
 2. assign newly received Lines dense F-local IDs in decoded lexical order and translate
    Region-to-Line composition through that map, so no permutation block is hidden;
 3. remeasure Region composition after remapping rather than substituting the 86,865,600-byte Line
    result arithmetically;
 4. implement an actual complementary half-cold object cache over the same decoder; and
-5. only then evaluate the next Line program against the remaining complete cold gap.
+5. only then evaluate the next Line program against the remaining measured cold gap.
 
 P21's independently exact Line result would save about 31.9 MB versus this baseline Line leg, but
 that substitution alone would still leave roughly 43.3 MB above the cold-400 allowance before any
 dense-ID remapping effect.  Therefore P21 is necessary integration work, not target closure.
+
+That sequence has now been executed in
+[`FULL-FILE-P21-16CORPUS-REPORT.md`](FULL-FILE-P21-16CORPUS-REPORT.md).  After the measured
+lexicographic-ID Region penalty, integrated P21 reaches 118,901,432 bytes / 240.15x and remains
+47,514,753 bytes above cold-400.  Generation association, the actual C/F path, and complementary
+half-cold execution remain outside both reconstruction ledgers.
 
 ## Reproduction
 

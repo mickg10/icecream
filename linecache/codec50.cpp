@@ -43,7 +43,8 @@ static inline uint64_t read64(const char*p){ uint64_t v; memcpy(&v,p,8); return 
 static inline uint64_t read_tail(const char*p,uint32_t n){ uint64_t v=0; memcpy(&v,p,n); return v; }
 static inline uint64_t sampled_hash(const char*p,uint32_t n){
     constexpr uint64_t A=0xa0761d6478bd642fULL,B=0xe7037ed1a0b428dbULL; uint64_t h=mix64(uint64_t(n)^A);
-    if(n<=8) return mix64(h^read_tail(p,n)); if(n<=16) return fold128(read64(p)^A,read64(p+n-8)^h);
+    if(n<=8) return mix64(h^read_tail(p,n));
+    if(n<=16) return fold128(read64(p)^A,read64(p+n-8)^h);
     if(n<=32){ h=fold128(read64(p)^A,read64(p+8)^h); return fold128(read64(p+n-16)^B,read64(p+n-8)^h); }
     uint32_t mid=(n>>1)-4; h=fold128(read64(p)^A,read64(p+8)^h); h=fold128(read64(p+mid)^B,read64(p+n-16)^h); return fold128(read64(p+n-8)^A,h^B);
 }
@@ -142,6 +143,32 @@ static inline size_t varint_size(uint64_t v){ size_t n=1; while(v>=0x80){++n;v>>
 static size_t zstd_size(ZSTD_CCtx*c,const uint8_t*data,size_t n,int level,std::vector<uint8_t>&dst){ ZSTD_CCtx_reset(c,ZSTD_reset_session_and_parameters); ZSTD_CCtx_setParameter(c,ZSTD_c_compressionLevel,level);
     size_t bound=ZSTD_compressBound(n); if(dst.size()<bound)dst.resize(bound); size_t r=ZSTD_compress2(c,dst.data(),dst.size(),data?data:(const uint8_t*)"",n); if(ZSTD_isError(r)){fprintf(stderr,"zstd %s\n",ZSTD_getErrorName(r));exit(2);} return r; }
 
+static std::vector<uint8_t> zstd_stream_encode(ZSTD_CCtx*c,const std::vector<uint8_t>&raw,
+                                                ZSTD_EndDirective directive){
+    ZSTD_inBuffer input{raw.data(),raw.size(),0}; std::vector<uint8_t> encoded;
+    std::vector<uint8_t> buffer(ZSTD_CStreamOutSize()); size_t remaining;
+    do { ZSTD_outBuffer output{buffer.data(),buffer.size(),0};
+        remaining=ZSTD_compressStream2(c,&output,&input,directive);
+        if(ZSTD_isError(remaining)){fprintf(stderr,"zstd stream encode %s\n",ZSTD_getErrorName(remaining));exit(2);}
+        encoded.insert(encoded.end(),buffer.begin(),buffer.begin()+output.pos);
+    } while(input.pos<input.size || remaining!=0);
+    return encoded;
+}
+static std::vector<uint8_t> zstd_stream_decode(ZSTD_DCtx*d,const std::vector<uint8_t>&encoded,
+                                                size_t&remaining){
+    ZSTD_inBuffer input{encoded.data(),encoded.size(),0}; std::vector<uint8_t> raw;
+    std::vector<uint8_t> buffer(ZSTD_DStreamOutSize()); remaining=1;
+    bool again;
+    do { ZSTD_outBuffer output{buffer.data(),buffer.size(),0};
+        size_t before=input.pos; remaining=ZSTD_decompressStream(d,&output,&input);
+        if(ZSTD_isError(remaining)){fprintf(stderr,"zstd stream decode %s\n",ZSTD_getErrorName(remaining));exit(2);}
+        raw.insert(raw.end(),buffer.begin(),buffer.begin()+output.pos);
+        if(input.pos==before && output.pos==0){ if(input.pos==input.size)break; fprintf(stderr,"zstd stream made no progress\n");exit(2); }
+        again=input.pos<input.size || output.pos==output.size;
+    } while(again);
+    return raw;
+}
+
 // P22 ROOT_SLICE capability. Each Root may name an exact contiguous range from a completed
 // earlier Root. The sparse C index proposes at most four recent exact candidates; equality is
 // checked over Region IDs before a copy is emitted. F expands the program before committing it.
@@ -220,14 +247,112 @@ static RootSliceBuild build_root_slices(const std::vector<uint32_t>&regions,
 // reconstruct EXACT bytes; fall back to literal if reconstruction != original. ----
 struct Marker{ std::string path; uint64_t lineno; std::vector<uint8_t> flags; };
 static bool parse_marker(const char* s, uint32_t len, Marker& m){
-    if(len<4 || s[0]!='#' || s[1]!=' ') return false; const char* e=s+len; const char* p=s+2;
-    if(p>=e || *p<'0'||*p>'9') return false; uint64_t n=0; while(p<e && *p>='0'&&*p<='9'){ n=n*10+(*p-'0'); ++p; } m.lineno=n;
-    if(p+2>e || p[0]!=' '||p[1]!='"') return false; p+=2; const char* q=p; while(q<e && *q!='"') ++q; if(q>=e) return false; m.path.assign(p,q); p=q+1;
+    if(len<4 || s[0]!='#' || s[1]!=' ') return false;
+    const char* e=s+len; const char* p=s+2;
+    if(p>=e || *p<'0'||*p>'9') return false;
+    uint64_t n=0; while(p<e && *p>='0'&&*p<='9'){ n=n*10+(*p-'0'); ++p; } m.lineno=n;
+    if(p+2>e || p[0]!=' '||p[1]!='"') return false;
+    p+=2; const char* q=p; while(q<e && *q!='"') ++q; if(q>=e) return false; m.path.assign(p,q); p=q+1;
     m.flags.clear(); while(p<e && *p==' '){ ++p; if(p>=e||*p<'0'||*p>'9') return false; uint8_t fl=0; while(p<e&&*p>='0'&&*p<='9'){ fl=fl*10+(*p-'0'); ++p; } m.flags.push_back(fl); }
     if(p>=e || *p!='\n' || p+1!=e) return false;   // must end exactly with newline
     return true;
 }
 static void emit_marker(const Marker& m, std::vector<uint8_t>& out){ char buf[32]; int l=snprintf(buf,sizeof buf,"# %llu \"",(unsigned long long)m.lineno); out.insert(out.end(),buf,buf+l); out.insert(out.end(),m.path.begin(),m.path.end()); out.push_back('"'); for(uint8_t f:m.flags){ out.push_back(' '); l=snprintf(buf,sizeof buf,"%u",f); out.insert(out.end(),buf,buf+l);} out.push_back('\n'); }
+
+enum ByteNumberFormat : uint8_t { DECIMAL=0, HEX_LL=1, HEX_LU=2, HEX_UL=3, HEX_UU=4 };
+struct GeneratedByteArray {
+    std::vector<uint8_t> values;
+    std::string prefix, separator, suffix;
+    uint8_t format=DECIMAL;
+};
+struct ByteArrayStyle {
+    std::string prefix, separator, suffix;
+    uint8_t format=DECIMAL;
+    bool operator<(const ByteArrayStyle&o) const {
+        if(prefix!=o.prefix)return prefix<o.prefix;
+        if(separator!=o.separator)return separator<o.separator;
+        if(suffix!=o.suffix)return suffix<o.suffix;
+        return format<o.format;
+    }
+    bool operator==(const ByteArrayStyle&o) const {
+        return prefix==o.prefix&&separator==o.separator&&suffix==o.suffix&&format==o.format;
+    }
+};
+struct PackedLines {
+    std::vector<uint8_t> bytes;
+    std::vector<size_t> offsets{0};
+
+    size_t size() const { return offsets.size()-1; }
+    size_t line_size(size_t index) const { return offsets[index+1]-offsets[index]; }
+    const uint8_t* line_data(size_t index) const { return bytes.data()+offsets[index]; }
+    void append(const uint8_t* data,size_t size){
+        bytes.insert(bytes.end(),data,data+size);
+        offsets.push_back(bytes.size());
+    }
+};
+static bool packed_line_less(const PackedLines&a,size_t ai,const PackedLines&b,size_t bi){
+    size_t an=a.line_size(ai),bn=b.line_size(bi),common=std::min(an,bn);
+    int order=memcmp(a.line_data(ai),b.line_data(bi),common);
+    return order<0 || (order==0 && an<bn);
+}
+static bool equal_tail(const char*p,const char*end,const char*value,size_t n){ return size_t(end-p)==n&&!memcmp(p,value,n); }
+static int hex_value(uint8_t c){ if(c>='0'&&c<='9')return c-'0'; if(c>='a'&&c<='f')return c-'a'+10; if(c>='A'&&c<='F')return c-'A'+10; return -1; }
+static bool parse_byte_array(const char*data,uint32_t length,GeneratedByteArray&out){
+    const char*begin=data,*end=data+length; if(length<8||end[-1]!='\n')return false;
+    const char*p=begin; while(p<end&&(*p==' '||*p=='\t'))++p; const char*token=p;
+    if(p<end&&*p==','){ ++p;while(p<end&&(*p==' '||*p=='\t'))++p;token=p; }
+    else if(p>=end || !( (*p>='0'&&*p<='9') || (p+2<=end&&p[0]=='0'&&(p[1]=='x'||p[1]=='X')) )){
+        const char*brace=(const char*)memchr(p,'{',size_t(end-p)); if(!brace)return false;
+        std::string declaration(p,brace);
+        if(declaration.find("uint8_t")==std::string::npos&&declaration.find("unsigned char")==std::string::npos)return false;
+        p=brace+1;while(p<end&&(*p==' '||*p=='\t'))++p;token=p;
+    }
+    out={};out.prefix.assign(begin,token); bool haveSeparator=false,haveFormat=false,prefixUpper=false,havePrefix=false,sawLower=false,sawUpper=false; int numberFormat=-2;
+    while(p<end){
+        int value=0,currentFormat;
+        if(p+2<=end&&p[0]=='0'&&(p[1]=='x'||p[1]=='X')){
+            bool pu=p[1]=='X'; if(p+4>end)return false; int a=hex_value(uint8_t(p[2])),b=hex_value(uint8_t(p[3])); if(a<0||b<0)return false;
+            if(!havePrefix){prefixUpper=pu;havePrefix=true;}else if(prefixUpper!=pu)return false;
+            for(int i=2;i<4;++i){sawLower|=p[i]>='a'&&p[i]<='f';sawUpper|=p[i]>='A'&&p[i]<='F';}
+            if(sawLower&&sawUpper)return false;
+            value=(a<<4)|b;currentFormat=-1;p+=4;
+        } else {
+            const char*d=p;while(p<end&&*p>='0'&&*p<='9')++p;if(d==p)return false;
+            if(p-d>1&&*d=='0')return false;
+            for(const char*q=d;q<p;++q){value=value*10+(*q-'0');if(value>255)return false;}
+            currentFormat=DECIMAL;
+        }
+        if(!haveFormat){numberFormat=currentFormat;haveFormat=true;}else if(numberFormat!=currentFormat)return false;
+        out.values.push_back(uint8_t(value));
+        if(equal_tail(p,end,"\n",1)||equal_tail(p,end,"}\n",2)||equal_tail(p,end,"};\n",3)){out.suffix.assign(p,end);break;}
+        if(p>=end||*p!=',')return false;
+        const char*separatorBegin=p++;
+        if(equal_tail(p,end,"\n",1)||equal_tail(p,end,"}\n",2)||equal_tail(p,end,"};\n",3)){out.suffix.assign(separatorBegin,end);break;}
+        while(p<end&&(*p==' '||*p=='\t'))++p;
+        std::string current(separatorBegin,p);
+        if(!haveSeparator){out.separator=current;haveSeparator=true;}else if(out.separator!=current)return false;
+    }
+    if(out.suffix.empty()||out.values.size()<4||!haveFormat)return false;
+    if(!haveSeparator)out.separator=",";
+    if(numberFormat==DECIMAL)out.format=DECIMAL;
+    else if(prefixUpper)out.format=sawLower?HEX_UL:HEX_UU;
+    else out.format=sawLower?HEX_LL:HEX_LU;
+    return true;
+}
+static void append_rendered_byte_array(const ByteArrayStyle&style,const uint8_t*values,
+                                       size_t count,std::vector<uint8_t>&out){
+    out.insert(out.end(),style.prefix.begin(),style.prefix.end());
+    static const char*lo="0123456789abcdef",*up="0123456789ABCDEF";
+    for(size_t i=0;i<count;++i){ if(i)out.insert(out.end(),style.separator.begin(),style.separator.end()); uint8_t v=values[i];
+        if(style.format==DECIMAL){
+            if(v>=100){out.push_back(uint8_t('0'+v/100));v%=100;out.push_back(uint8_t('0'+v/10));out.push_back(uint8_t('0'+v%10));}
+            else if(v>=10){out.push_back(uint8_t('0'+v/10));out.push_back(uint8_t('0'+v%10));}
+            else out.push_back(uint8_t('0'+v));
+        }
+        else { bool prefixUpper=style.format>=HEX_UL, lower=style.format==HEX_LL||style.format==HEX_UL;const char*digits=lower?lo:up;out.push_back('0');out.push_back(prefixUpper?'X':'x');out.push_back(digits[v>>4]);out.push_back(digits[v&15]); }
+    }
+    out.insert(out.end(),style.suffix.begin(),style.suffix.end());
+}
 
 // ---- inline relative-LZ definition codec (D2): LZ77 over a growing byte store of ALL prior line
 // bytes; a new line is COPY(dist,len)/LITERAL segments against that store. Deterministic + byte-exact
@@ -260,7 +385,7 @@ struct RelLZ {
 };
 
 int main(int argc,char**argv){
-    const char* manifest=nullptr; size_t max_files=SIZE_MAX; int zlevel=3; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, usePriorRoot=false;
+    const char* manifest=nullptr; size_t max_files=SIZE_MAX; int zlevel=3; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, usePriorRoot=false, useSortedLines=false, useByteArrayLines=false;
     for(int i=1;i<argc;++i){ if(!strcmp(argv[i],"--manifest")&&i+1<argc)manifest=argv[++i];
         else if(!strcmp(argv[i],"--z")&&i+1<argc)zlevel=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--no-d1"))useD1=false;
@@ -268,12 +393,15 @@ int main(int argc,char**argv){
         else if(!strcmp(argv[i],"--d2"))useD2mine=true;      // inline relative-LZ line codec
         else if(!strcmp(argv[i],"--d2helper"))useD2=true;    // helper's definition_codec (needs -DWITH_D2)
         else if(!strcmp(argv[i],"--prior-root"))usePriorRoot=true;
+        else if(!strcmp(argv[i],"--sorted-lines"))useSortedLines=true;
+        else if(!strcmp(argv[i],"--byte-array-lines")){useSortedLines=true;useByteArrayLines=true;}
         else if(!strcmp(argv[i],"--deep"))deep=true;         // run slow z19/z22 entropy ladder + reorder test
         else if(!strcmp(argv[i],"--warm"))warm=true;         // Basis C: 2nd pass with dict retained -> warm steady-state wire
         else if(!strcmp(argv[i],"--max-files")&&i+1<argc){ char*t=nullptr; unsigned long long v=strtoull(argv[++i],&t,10); if(!t||*t||!v){fprintf(stderr,"bad max-files\n");return 2;} max_files=size_t(v); }
         else { fprintf(stderr,"unknown %s\n",argv[i]); return 2; } }
-    if(!manifest){ fprintf(stderr,"usage: %s --manifest F [--z 0|1|3] [--no-d1] [--d2] [--prior-root] [--max-files N]\n",argv[0]); return 2; }
+    if(!manifest){ fprintf(stderr,"usage: %s --manifest F [--z 0|1|3] [--no-d1] [--d2] [--prior-root] [--sorted-lines|--byte-array-lines] [--max-files N]\n",argv[0]); return 2; }
     if(usePriorRoot) useS1=false;
+    if(useSortedLines){ useD1=false; useD2=false; useD2mine=false; if(warm){fprintf(stderr,"--sorted-lines warm pass not implemented\n");return 2;} }
 #ifndef HAVE_DEFCODEC
     if(useD2){ fprintf(stderr,"note: --d2 requested but definition_codec.h not present; ignoring.\n"); useD2=false; }
 #endif
@@ -328,6 +456,14 @@ int main(int argc,char**argv){
     // charged by category, compressed at z<=zlevel per message. F reconstructs .ii bytes byte-exact.
     ZSTD_CCtx* z=ZSTD_createCCtx(); std::vector<uint8_t> dst;
     std::vector<uint8_t> fknownLine(dict.distinct()+1,0), fknownReg(NREG,0);
+    std::vector<uint32_t> ClineToF(dict.distinct()+1,0); uint32_t nextFline=1;
+    std::array<ZSTD_CCtx*,5> lineZC{}; std::array<ZSTD_DCtx*,5> lineZD{};
+    std::array<uint8_t,5> lineZActive{}; size_t linePartCount=useByteArrayLines?5:3;
+    if(useSortedLines) for(size_t i=0;i<linePartCount;++i){
+        lineZC[i]=ZSTD_createCCtx(); lineZD[i]=ZSTD_createDCtx();
+        ZSTD_CCtx_setParameter(lineZC[i],ZSTD_c_compressionLevel,zlevel);
+        ZSTD_CCtx_setParameter(lineZC[i],ZSTD_c_contentSizeFlag,0);
+    }
     std::unordered_map<std::string,uint32_t> pathid; std::vector<std::string> paths;   // D1 path objects (both sides derive same order)
     // ---- F's OWN independent store, built ONLY from decoded wire bytes (proves self-describing) ----
     std::vector<uint8_t> Fline_data; std::vector<size_t> Fline_off; Fline_off.push_back(0);   // line id k (1-based) -> [off[k-1],off[k])
@@ -380,10 +516,13 @@ int main(int argc,char**argv){
           if(!missReg.empty()||!missBlk.empty()){ w_missing += zstd_size(z,mm.data(),mm.size(),zlevel,dst) + FRAME; allMiss.insert(allMiss.end(),mm.begin(),mm.end()); } }
         // --- FILL: new paths, new lines, new region defs, new block defs (topological) ---
         std::vector<uint8_t> fill_paths, fill_lines, fill_regions, fill_regions_raw, fill_blocks; uint32_t np=0,nl=0,nr=0,nb=0;
+        std::vector<uint32_t> newLineIds;
+        std::array<std::vector<uint8_t>,5> lineRaw, lineEncoded;
         for(uint32_t r:missReg){ const uint32_t* lids=dict.region_ids_ptr(r); uint32_t c=dict.region_ids_count(r);
             for(uint32_t j=0;j<c;++j){ uint32_t ln=lids[j]; if(fknownLine[ln]) continue; fknownLine[ln]=1; ++nl;
                 const LineRef& lr=dict.ref(ln); const char* txt=dict.line_data(lr.off);
-                if(useD1 && parse_marker(txt,lr.len,mk)){ uint32_t pid; auto it=pathid.find(mk.path); if(it==pathid.end()){ pid=uint32_t(paths.size()); pathid.emplace(mk.path,pid); paths.push_back(mk.path);
+                if(useSortedLines) newLineIds.push_back(ln);
+                else if(useD1 && parse_marker(txt,lr.len,mk)){ uint32_t pid; auto it=pathid.find(mk.path); if(it==pathid.end()){ pid=uint32_t(paths.size()); pathid.emplace(mk.path,pid); paths.push_back(mk.path);
                         put_varint(fill_paths,mk.path.size()); fill_paths.insert(fill_paths.end(),mk.path.begin(),mk.path.end()); ++np; } else pid=it->second;
                     fill_lines.push_back(1); put_varint(fill_lines,pid); put_varint(fill_lines,mk.lineno); fill_lines.push_back(uint8_t(mk.flags.size())); for(uint8_t f:mk.flags) fill_lines.push_back(f); ++n_marker;
                 } else { fill_lines.push_back(0);
@@ -394,16 +533,66 @@ int main(int argc,char**argv){
                     else { put_varint(fill_lines,lr.len); fill_lines.insert(fill_lines.end(),txt,txt+lr.len); }
                     ++n_literal; }
             }
-            put_varint(fill_regions,c); { int64_t prev=0; for(uint32_t j=0;j<c;++j){ put_zigzag(fill_regions,int64_t(lids[j])-prev); prev=int64_t(lids[j]); } } fknownReg[r]=1; ++nr;
-            put_varint(fill_regions_raw,c); for(uint32_t j=0;j<c;++j) put_varint(fill_regions_raw,lids[j]);   // adaptive alt: raw line-ids (cross-region subsequence-preserving; z3 picks the smaller)
-            { put_varint(allRegionsRaw,c); for(uint32_t j=0;j<c;++j) put_varint(allRegionsRaw,lids[j]); }   // diag
+        }
+        if(useSortedLines && nl){
+            std::sort(newLineIds.begin(),newLineIds.end(),[&](uint32_t a,uint32_t b){
+                const LineRef& ar=dict.ref(a); const LineRef& br=dict.ref(b); uint32_t m=std::min(ar.len,br.len);
+                int c=memcmp(dict.line_data(ar.off),dict.line_data(br.off),m); return c?c<0:ar.len<br.len;
+            });
+            for(uint32_t ln:newLineIds) ClineToF[ln]=nextFline++;
+            std::vector<uint32_t> restIds; std::vector<std::pair<uint32_t,GeneratedByteArray>> arrayEntries;
+            for(uint32_t ln:newLineIds){
+                if(useByteArrayLines){ GeneratedByteArray parsed; const LineRef& lr=dict.ref(ln);
+                    if(parse_byte_array(dict.line_data(lr.off),lr.len,parsed)){arrayEntries.emplace_back(ln,std::move(parsed));continue;} }
+                restIds.push_back(ln);
+            }
+            const char* previous=nullptr; uint32_t previousLength=0;
+            if(!restIds.empty()) put_varint(lineRaw[0],restIds.size());
+            for(uint32_t ln:restIds){
+                const LineRef& lr=dict.ref(ln); const char* txt=dict.line_data(lr.off); uint32_t lcp=0, m=std::min(previousLength,lr.len);
+                while(lcp<m && previous[lcp]==txt[lcp]) ++lcp;
+                put_varint(lineRaw[0],lcp); put_varint(lineRaw[1],lr.len-lcp); lineRaw[2].insert(lineRaw[2].end(),txt+lcp,txt+lr.len);
+                previous=txt; previousLength=lr.len;
+            }
+            if(!arrayEntries.empty()){
+                std::vector<ByteArrayStyle> styles; styles.reserve(arrayEntries.size());
+                for(const auto&entry:arrayEntries){ const auto&v=entry.second; styles.push_back({v.prefix,v.separator,v.suffix,v.format}); }
+                std::sort(styles.begin(),styles.end()); styles.erase(std::unique(styles.begin(),styles.end()),styles.end());
+                put_varint(lineRaw[3],styles.size());
+                for(const auto&style:styles){ put_varint(lineRaw[3],style.format);
+                    for(const std::string*field:{&style.prefix,&style.separator,&style.suffix}){ put_varint(lineRaw[3],field->size()); lineRaw[3].insert(lineRaw[3].end(),field->begin(),field->end()); } }
+                put_varint(lineRaw[3],arrayEntries.size());
+                for(const auto&entry:arrayEntries){ const auto&v=entry.second; ByteArrayStyle style{v.prefix,v.separator,v.suffix,v.format};
+                    size_t id=std::lower_bound(styles.begin(),styles.end(),style)-styles.begin(); put_varint(lineRaw[3],id); put_varint(lineRaw[3],v.values.size());
+                    lineRaw[4].insert(lineRaw[4].end(),v.values.begin(),v.values.end()); }
+            }
+            for(size_t i=0;i<linePartCount;++i) if(!lineRaw[i].empty()){
+                lineEncoded[i]=zstd_stream_encode(lineZC[i],lineRaw[i],ZSTD_e_flush); lineZActive[i]=1;
+                w_linedef+=lineEncoded[i].size()+FRAME;
+            }
+            if(useByteArrayLines) w_linedef+=1; // selector/presence mask
+        }
+        if(useSortedLines && t+1==TUs){
+            const std::vector<uint8_t> empty;
+            for(size_t i=0;i<linePartCount;++i) if(lineZActive[i]){
+                std::vector<uint8_t> tail=zstd_stream_encode(lineZC[i],empty,ZSTD_e_end);
+                if(lineEncoded[i].empty()&&!tail.empty())w_linedef+=FRAME;
+                w_linedef+=tail.size(); lineEncoded[i].insert(lineEncoded[i].end(),tail.begin(),tail.end());
+            }
+        }
+        for(uint32_t r:missReg){ const uint32_t* lids=dict.region_ids_ptr(r); uint32_t c=dict.region_ids_count(r);
+            put_varint(fill_regions,c); { int64_t prev=0; for(uint32_t j=0;j<c;++j){
+                uint32_t wireLine=useSortedLines?ClineToF[lids[j]]:lids[j]; if(!wireLine){fprintf(stderr,"missing Line mapping\n");return 2;}
+                put_zigzag(fill_regions,int64_t(wireLine)-prev); prev=int64_t(wireLine); } } fknownReg[r]=1; ++nr;
+            put_varint(fill_regions_raw,c); for(uint32_t j=0;j<c;++j){ uint32_t wireLine=useSortedLines?ClineToF[lids[j]]:lids[j]; put_varint(fill_regions_raw,wireLine); }
+            { put_varint(allRegionsRaw,c); for(uint32_t j=0;j<c;++j){ uint32_t wireLine=useSortedLines?ClineToF[lids[j]]:lids[j]; put_varint(allRegionsRaw,wireLine); } }
         }
         for(uint32_t k:missBlk){ size_t L=boff2[k+1]-boff2[k];
             if(bcopy_ok[k]){ fill_blocks.push_back(1); put_varint(fill_blocks,bcopy_src[k]); put_varint(fill_blocks,L); }   // COPY(region-stream src,len)
             else { fill_blocks.push_back(0); put_varint(fill_blocks,L); for(size_t j=boff2[k];j<boff2[k+1];++j) put_varint(fill_blocks,bchild[j]); }
             fknownBlk[k]=1; ++nb; }
         if(np){ w_pathdef += zstd_size(z,fill_paths.data(),fill_paths.size(),zlevel,dst); allPaths.insert(allPaths.end(),fill_paths.begin(),fill_paths.end()); }
-        if(nl){ w_linedef += zstd_size(z,fill_lines.data(),fill_lines.size(),zlevel,dst); allLineDefs.insert(allLineDefs.end(),fill_lines.begin(),fill_lines.end()); }
+        if(nl && !useSortedLines){ w_linedef += zstd_size(z,fill_lines.data(),fill_lines.size(),zlevel,dst); allLineDefs.insert(allLineDefs.end(),fill_lines.begin(),fill_lines.end()); }
         bool reg_raw=false;
         if(nr){ double dz=zstd_size(z,fill_regions.data(),fill_regions.size(),zlevel,dst);
                 double rz=zstd_size(z,fill_regions_raw.data(),fill_regions_raw.size(),zlevel,dst);
@@ -420,7 +609,49 @@ int main(int argc,char**argv){
         enc_s += std::chrono::duration<double>(Clock::now()-_te).count(); auto _td=Clock::now();
         // --- DECODER (F): install FILL from wire into F's OWN store, then expand ROOT tokens ---
         { const uint8_t* pp=fill_paths.data(); for(uint32_t k=0;k<np;++k){ uint64_t L=get_varint(pp); Fpaths.emplace_back((const char*)pp,(size_t)L); pp+=L; } }
-        { const uint8_t* pp=fill_lines.data(), *pe=fill_lines.data()+fill_lines.size();
+        if(useSortedLines){
+          std::array<std::vector<uint8_t>,5> recovered;
+          for(size_t i=0;i<linePartCount;++i) if(!lineEncoded[i].empty()){
+            size_t remaining=1; recovered[i]=zstd_stream_decode(lineZD[i],lineEncoded[i],remaining);
+            if(recovered[i]!=lineRaw[i] || (t+1==TUs && remaining!=0)){fprintf(stderr,"sorted Line stream mismatch TU=%zu part=%zu raw=%zu recovered=%zu encoded=%zu remaining=%zu\n",t,i,lineRaw[i].size(),recovered[i].size(),lineEncoded[i].size(),remaining);return 2;}
+          }
+          PackedLines restLines,arrayLines;
+          if(!recovered[0].empty()){
+            const uint8_t* lp=recovered[0].data(), *le=lp+recovered[0].size();
+            const uint8_t* nptr=recovered[1].data(), *ne=nptr+recovered[1].size();
+            const uint8_t* sp=recovered[2].data(), *se=sp+recovered[2].size();
+            uint64_t count=get_varint(lp);std::vector<uint8_t> previousLine,currentLine;restLines.offsets.reserve(count+1);
+            for(uint64_t k=0;k<count;++k){
+              if(lp>=le||nptr>=ne){fprintf(stderr,"truncated sorted Line control\n");return 2;}
+              uint64_t lcp=get_varint(lp),suffix=get_varint(nptr);
+              if(lcp>previousLine.size()||suffix>uint64_t(se-sp)){fprintf(stderr,"bad sorted Line extent\n");return 2;}
+              currentLine.assign(previousLine.begin(),previousLine.begin()+lcp);currentLine.insert(currentLine.end(),sp,sp+suffix);sp+=suffix;
+              restLines.append(currentLine.data(),currentLine.size());previousLine.swap(currentLine);
+            }
+            if(lp!=le||nptr!=ne||sp!=se){fprintf(stderr,"sorted Line streams have trailing bytes\n");return 2;}
+          } else if(!recovered[1].empty()||!recovered[2].empty()){fprintf(stderr,"partial sorted Line streams\n");return 2;}
+          if(!recovered[3].empty()){
+            const uint8_t* cp=recovered[3].data(),*ce=cp+recovered[3].size();const uint8_t* vp=recovered[4].data(),*ve=vp+recovered[4].size();
+            uint64_t styleCount=get_varint(cp);std::vector<ByteArrayStyle> styles;styles.reserve(styleCount);
+            for(uint64_t k=0;k<styleCount;++k){ ByteArrayStyle style;uint64_t format=get_varint(cp);if(format>HEX_UU){fprintf(stderr,"bad byte-array format\n");return 2;}style.format=uint8_t(format);
+              for(std::string*field:{&style.prefix,&style.separator,&style.suffix}){uint64_t size=get_varint(cp);if(size>uint64_t(ce-cp)){fprintf(stderr,"bad byte-array style\n");return 2;}field->assign((const char*)cp,size);cp+=size;}styles.push_back(std::move(style)); }
+            uint64_t lineCount=get_varint(cp);arrayLines.offsets.reserve(lineCount+1);arrayLines.bytes.reserve(recovered[4].size()*5);
+            for(uint64_t k=0;k<lineCount;++k){uint64_t styleId=get_varint(cp),count=get_varint(cp);if(styleId>=styles.size()||count>uint64_t(ve-vp)){fprintf(stderr,"bad byte-array record\n");return 2;}
+              const auto&style=styles[styleId];append_rendered_byte_array(style,vp,count,arrayLines.bytes);vp+=count;arrayLines.offsets.push_back(arrayLines.bytes.size());}
+            if(cp!=ce||vp!=ve){fprintf(stderr,"byte-array streams have trailing bytes\n");return 2;}
+          } else if(!recovered[4].empty()){fprintf(stderr,"partial byte-array streams\n");return 2;}
+          size_t ri=0,ai=0,decoded=0;
+          while(ri<restLines.size()||ai<arrayLines.size()){
+            bool takeArray=ri==restLines.size() || (ai<arrayLines.size()&&packed_line_less(arrayLines,ai,restLines,ri));
+            const PackedLines&source=takeArray?arrayLines:restLines;size_t index=takeArray?ai++:ri++;
+            const uint8_t*line=source.line_data(index);size_t length=source.line_size(index);
+            if(decoded>=newLineIds.size()){fprintf(stderr,"decoded too many Lines\n");return 2;}
+            uint32_t ln=newLineIds[decoded++];const LineRef&truth=dict.ref(ln);
+            if(length!=truth.len||memcmp(line,dict.line_data(truth.off),truth.len)){fprintf(stderr,"sorted Line differs\n");return 2;}
+            Fline_data.insert(Fline_data.end(),line,line+length);Fline_off.push_back(Fline_data.size());
+          }
+          if(decoded!=newLineIds.size()){fprintf(stderr,"decoded Line count differs\n");return 2;}
+        } else { const uint8_t* pp=fill_lines.data(), *pe=fill_lines.data()+fill_lines.size();
           while(pp<pe){ uint8_t kind=*pp++;
             if(kind==1){ uint64_t pid=get_varint(pp); uint64_t lineno=get_varint(pp); uint8_t nf=*pp++; Marker dm; dm.path=Fpaths[pid]; dm.lineno=lineno; for(uint8_t f=0;f<nf;++f) dm.flags.push_back(*pp++);
                 tmp.clear(); emit_marker(dm,tmp); Fline_data.insert(Fline_data.end(),tmp.begin(),tmp.end()); Fline_off.push_back(Fline_data.size()); }
@@ -472,11 +703,13 @@ int main(int argc,char**argv){
     }
     while(ck.size()<ck_f.size()) ck.push_back({ck_f[ck.size()], double(cum_raw)/cum_wire});
     ZSTD_freeCCtx(z);
+    if(useSortedLines) for(size_t i=0;i<linePartCount;++i){ ZSTD_freeCCtx(lineZC[i]); ZSTD_freeDCtx(lineZD[i]); }
 
     double totalwire = w_root+w_linedef+w_regiondef+w_pathdef+w_blockdef+w_missing+w_framing;
     double MiB=1048576.0;
     const char* structure_name=usePriorRoot?"V1+P22(ROOT_SLICE)":(useS1?"V1+S1(LZ blocks)":"V1");
-    printf("\n==== CODEC-50 (%s%s%s, z%d) — %s ====\n", structure_name, useD1?"+D1":"", (useD2mine?"+D2(inline)":(useD2?"+D2(helper)":"")), zlevel, manifest);
+    const char* line_name=useByteArrayLines?"+P21(BYTE_ARRAY)":(useSortedLines?"+P9(sorted-lines)":"");
+    printf("\n==== CODEC-50 (%s%s%s%s, z%d) — %s ====\n", structure_name, useD1?"+D1":"", line_name, (useD2mine?"+D2(inline)":(useD2?"+D2(helper)":"")), zlevel, manifest);
     printf("byte-exact=%s  TUs=%zu raw=%.1f MiB regions=%u distinct_lines=%u paths=%zu blocks=%zu (marker_lines=%llu literal_lines=%llu)\n",
         byteexact?"OK":"FAIL",TUs,corpus.raw/MiB,NREG,dict.distinct(),paths.size(),boff2.size()-1,(unsigned long long)n_marker,(unsigned long long)n_literal);
     printf("wire by category (post-z%d, bytes): root=%.0f line_def=%.0f region_def=%.0f block_def=%.0f path_def=%.0f missing=%.0f framing=%.0f  TOTAL=%.0f (%.2f MiB)\n",
@@ -486,7 +719,7 @@ int main(int argc,char**argv){
         (unsigned long long)root_slices.copies,(unsigned long long)root_slices.copied_regions,
         (unsigned long long)root_slices.indexed_windows,(unsigned long long)root_slices.index_entries,
         Froot_child.size()*sizeof(uint32_t)+Froot_off.size()*sizeof(size_t));
-    { ZSTD_CCtx* z2=ZSTD_createCCtx(); std::vector<uint8_t> d2b;
+    if(!useSortedLines){ ZSTD_CCtx* z2=ZSTD_createCCtx(); std::vector<uint8_t> d2b;
       double bl=allLineDefs.empty()?0:zstd_size(z2,allLineDefs.data(),allLineDefs.size(),zlevel,d2b);
       double br=allRoots.empty()?0:zstd_size(z2,allRoots.data(),allRoots.size(),zlevel,d2b);
       // long-distance structure ceiling for line_def: z3 with unbounded window + LDM (what a perfect
@@ -548,6 +781,7 @@ int main(int argc,char**argv){
         printf("DIAG reorder test (z%d-legal structure vs z19's 5.96MiB):\n",zlevel);
         printf("    sorted-concat z%d       = %.2f MiB (%.1f B/line)\n",zlevel,rs/MiB,double(rs)/double(n_literal));
         printf("    sorted+front-coded z%d  = %.2f MiB (%.1f B/line)  [+perm cost ~%.2f MiB to send ids]\n",zlevel,rf/MiB,double(rf)/double(n_literal),double(D)*2.2/MiB); } }
+    else printf("DIAG legacy Line ceilings omitted for the persistent sorted-Line format\n");
     printf("H200 f-checkpoints (cum raw fraction -> cumulative ratio):\n");
     for(auto&c:ck) printf("  f=%.2f  ratio=%.0fx\n",c.first,c.second);
     // trailing-window (5% raw) ratio near the end
