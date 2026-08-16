@@ -40,6 +40,14 @@ CATEGORIES = (
     "total",
 )
 
+TIME_RECORD = re.compile(r"peak RSS=[0-9.]+ MiB total=[0-9.]+s\n")
+
+
+def normalize_timed_log(text: str) -> str:
+    """Remove a timing record even when stderr inserted it inside stdout."""
+
+    return TIME_RECORD.sub("", text)
+
 
 def match(pattern: str, text: str, source: Path) -> re.Match[str]:
     found = re.search(pattern, text)
@@ -50,7 +58,8 @@ def match(pattern: str, text: str, source: Path) -> re.Match[str]:
 
 def parse_log(path: Path) -> dict[str, object]:
     raw_log = path.read_bytes()
-    text = raw_log.decode()
+    raw_text = raw_log.decode()
+    text = normalize_timed_log(raw_text)
     load = match(
         r"loaded\+interned ([0-9.]+)s TUs=(\d+) raw=(\d+) "
         r"regions=(\d+) region_occ=(\d+) distinct_lines=(\d+)",
@@ -76,7 +85,7 @@ def parse_log(path: Path) -> dict[str, object]:
         text,
         path,
     )
-    peak = match(r"peak RSS=([0-9.]+) MiB", text, path)
+    peak = match(r"peak RSS=([0-9.]+) MiB", raw_text, path)
     values = dict(zip(CATEGORIES, map(int, wire.groups())))
     if sum(values[name] for name in CATEGORIES[:-1]) != values["total"]:
         raise ValueError(f"{path}: category sum differs from total")

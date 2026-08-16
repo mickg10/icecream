@@ -1,11 +1,12 @@
 // codec50.cpp — real byte-exact "Protocol-50" codec for the icecream line-dedup bake-off (issue #16).
 //
 // This is the honest measurement harness the FINAL spec requires: a real encoder (C) that turns
-// interned .ii structure into a self-describing, length-framed, z3-compressed wire byte stream, and a
+// interned .ii structure into a self-describing, length-framed, zstd-compressed wire byte stream, and a
 // real decoder (F) that consumes ONLY those bytes, installs immutable objects, expands the root, and
 // reconstructs the exact .ii bytes. Every wire byte is charged by category. FinalRatio = raw / wire,
 // ONE cold chronological pass, reported per corpus at f = 0.10/0.25/0.50/0.75/1.00 with the H200
-// trailing-window ratio. z <= 3 only. No corpus-name branches; no free dictionaries.
+// trailing-window ratio.  Each material lane records its selected zstd level; no corpus-name branches
+// or uncharged dictionaries are permitted.
 //
 // Milestone-1 variants (this file): V1 = stable Lines + marker Regions; D1 = preprocessor-marker/path
 // factoring of "# N \"path\" flags" lines into (path-object, lineno, flags). D2 (relative-LZ line
@@ -171,13 +172,22 @@ static size_t zstd_message_roundtrip(ZSTD_CCtx*c,ZSTD_DCtx*d,const std::vector<u
 }
 
 static size_t zstd_ldm_frame_encode(ZSTD_CCtx*c,const std::vector<uint8_t>&raw,int level,
-                                    std::vector<uint8_t>&encoded){
-    ZSTD_CCtx_reset(c,ZSTD_reset_session_and_parameters);
-    ZSTD_CCtx_setParameter(c,ZSTD_c_compressionLevel,level);
-    ZSTD_CCtx_setParameter(c,ZSTD_c_enableLongDistanceMatching,1);
-    ZSTD_CCtx_setParameter(c,ZSTD_c_windowLog,27);
-    ZSTD_CCtx_setParameter(c,ZSTD_c_checksumFlag,0);
-    ZSTD_CCtx_setParameter(c,ZSTD_c_contentSizeFlag,0);
+                                    std::vector<uint8_t>&encoded,int workers=0,
+                                    int jobSize=0,int overlapLog=0){
+    auto require_zstd=[](size_t result,const char*operation){
+        if(ZSTD_isError(result)){fprintf(stderr,"blob zstd %s: %s\n",operation,ZSTD_getErrorName(result));exit(2);}
+    };
+    require_zstd(ZSTD_CCtx_reset(c,ZSTD_reset_session_and_parameters),"reset");
+    require_zstd(ZSTD_CCtx_setParameter(c,ZSTD_c_compressionLevel,level),"compression level");
+    require_zstd(ZSTD_CCtx_setParameter(c,ZSTD_c_enableLongDistanceMatching,1),"long-distance matching");
+    require_zstd(ZSTD_CCtx_setParameter(c,ZSTD_c_windowLog,27),"window log");
+    if(workers){
+        require_zstd(ZSTD_CCtx_setParameter(c,ZSTD_c_nbWorkers,workers),"worker count");
+        require_zstd(ZSTD_CCtx_setParameter(c,ZSTD_c_jobSize,jobSize),"job size");
+        require_zstd(ZSTD_CCtx_setParameter(c,ZSTD_c_overlapLog,overlapLog),"overlap log");
+    }
+    require_zstd(ZSTD_CCtx_setParameter(c,ZSTD_c_checksumFlag,0),"checksum flag");
+    require_zstd(ZSTD_CCtx_setParameter(c,ZSTD_c_contentSizeFlag,0),"content-size flag");
     size_t bound=ZSTD_compressBound(raw.size());encoded.resize(bound);
     uint8_t empty=0;const void*source=raw.empty()?static_cast<const void*>(&empty):static_cast<const void*>(raw.data());
     size_t size=ZSTD_compress2(c,encoded.data(),encoded.size(),source,raw.size());
@@ -610,10 +620,13 @@ struct RelLZ {
 };
 
 int main(int argc,char**argv){
-    const char* manifest=nullptr;const char*residualDumpPath=nullptr;const char*mixedDumpPrefix=nullptr; size_t max_files=SIZE_MAX; int zlevel=3,halfColdBit=-1,blobCanonicalLevel=9; uint32_t sourceAdmitRatio=6,blobThreads=4,blobFallbackEvery=0,s1MinMatch=3,s1MaxChain=1024; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, usePriorRoot=false, useSortedLines=false, useByteArrayLines=false, useMixedRegions=false, useProjectSource=false,useKeyMap=false,useDirectOrdinals=false,useCompressedBlobs=false,useBlobEagerPatches=true,useMoFactor=false,traceMo=false,useAlphaLines=false,useResidualLdm=false,splitControlCeiling=false,structureCeiling=false;
+    const char* manifest=nullptr;const char*residualDumpPath=nullptr;const char*mixedDumpPrefix=nullptr; size_t max_files=SIZE_MAX; int zlevel=3,literalZLevel=-1,arrayZLevel=-1,blobZLevel=-1,halfColdBit=-1,blobCanonicalLevel=9; uint32_t sourceAdmitRatio=6,blobThreads=4,blobZstdWorkers=0,blobZstdJobMiB=0,blobZstdOverlapLog=0,blobFallbackEvery=0,s1MinMatch=3,s1MaxChain=1024; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, usePriorRoot=false, useSortedLines=false, useByteArrayLines=false, useMixedRegions=false, useProjectSource=false,useKeyMap=false,useDirectOrdinals=false,useCompressedBlobs=false,useBlobEagerPatches=true,useMoFactor=false,traceMo=false,useAlphaLines=false,useResidualLdm=false,splitControlCeiling=false,structureCeiling=false;
     const char*blobDumpPath=nullptr;
     for(int i=1;i<argc;++i){ if(!strcmp(argv[i],"--manifest")&&i+1<argc)manifest=argv[++i];
         else if(!strcmp(argv[i],"--z")&&i+1<argc)zlevel=atoi(argv[++i]);
+        else if(!strcmp(argv[i],"--literal-z")&&i+1<argc){char*end=nullptr;long value=strtol(argv[++i],&end,10);if(!end||*end||value<1||value>9){fprintf(stderr,"bad literal zstd level\n");return 2;}literalZLevel=int(value);}
+        else if(!strcmp(argv[i],"--array-z")&&i+1<argc){char*end=nullptr;long value=strtol(argv[++i],&end,10);if(!end||*end||value<1||value>9){fprintf(stderr,"bad array zstd level\n");return 2;}arrayZLevel=int(value);}
+        else if(!strcmp(argv[i],"--blob-z")&&i+1<argc){char*end=nullptr;long value=strtol(argv[++i],&end,10);if(!end||*end||value<1||value>9){fprintf(stderr,"bad blob zstd level\n");return 2;}blobZLevel=int(value);}
         else if(!strcmp(argv[i],"--no-d1"))useD1=false;
         else if(!strcmp(argv[i],"--v1"))useS1=false;   // V1 baseline: raw region-id root, no S1 blocks
         else if(!strcmp(argv[i],"--d2"))useD2mine=true;      // inline relative-LZ line codec
@@ -635,6 +648,9 @@ int main(int argc,char**argv){
         else if(!strcmp(argv[i],"--s1-min-match")&&i+1<argc){char*end=nullptr;unsigned long value=strtoul(argv[++i],&end,10);if(!end||*end||value<2||value>16){fprintf(stderr,"bad S1 minimum match\n");return 2;}s1MinMatch=uint32_t(value);}
         else if(!strcmp(argv[i],"--s1-max-chain")&&i+1<argc){char*end=nullptr;unsigned long value=strtoul(argv[++i],&end,10);if(!end||*end||!value||value>4096){fprintf(stderr,"bad S1 maximum chain\n");return 2;}s1MaxChain=uint32_t(value);}
         else if(!strcmp(argv[i],"--blob-threads")&&i+1<argc){char*end=nullptr;unsigned long value=strtoul(argv[++i],&end,10);if(!end||*end||!value||value>32){fprintf(stderr,"bad blob thread count\n");return 2;}blobThreads=uint32_t(value);}
+        else if(!strcmp(argv[i],"--blob-zstd-workers")&&i+1<argc){char*end=nullptr;unsigned long value=strtoul(argv[++i],&end,10);if(!end||*end||!value||value>8){fprintf(stderr,"bad blob zstd worker count\n");return 2;}blobZstdWorkers=uint32_t(value);}
+        else if(!strcmp(argv[i],"--blob-zstd-job-mib")&&i+1<argc){char*end=nullptr;unsigned long value=strtoul(argv[++i],&end,10);if(!end||*end||!value||value>64){fprintf(stderr,"bad blob zstd job size\n");return 2;}blobZstdJobMiB=uint32_t(value);}
+        else if(!strcmp(argv[i],"--blob-zstd-overlap-log")&&i+1<argc){char*end=nullptr;unsigned long value=strtoul(argv[++i],&end,10);if(!end||*end||!value||value>9){fprintf(stderr,"bad blob zstd overlap log\n");return 2;}blobZstdOverlapLog=uint32_t(value);}
         else if(!strcmp(argv[i],"--blob-fallback-every")&&i+1<argc){char*end=nullptr;unsigned long value=strtoul(argv[++i],&end,10);if(!end||*end||!value||value>UINT32_MAX){fprintf(stderr,"bad blob fallback interval\n");return 2;}blobFallbackEvery=uint32_t(value);}
         else if(!strcmp(argv[i],"--blob-lazy-fallback"))useBlobEagerPatches=false;
         else if(!strcmp(argv[i],"--blob-canonical-level")&&i+1<argc){char*end=nullptr;long value=strtol(argv[++i],&end,10);if(!end||*end||value<1||value>9){fprintf(stderr,"bad blob canonical level\n");return 2;}blobCanonicalLevel=int(value);}
@@ -647,7 +663,7 @@ int main(int argc,char**argv){
         else if(!strcmp(argv[i],"--warm"))warm=true;         // Basis C: 2nd pass with dict retained -> warm steady-state wire
         else if(!strcmp(argv[i],"--max-files")&&i+1<argc){ char*t=nullptr; unsigned long long v=strtoull(argv[++i],&t,10); if(!t||*t||!v){fprintf(stderr,"bad max-files\n");return 2;} max_files=size_t(v); }
         else { fprintf(stderr,"unknown %s\n",argv[i]); return 2; } }
-    if(!manifest){ fprintf(stderr,"usage: %s --manifest F [--z 0|1|3] [--no-d1] [--d2] [--prior-root] [--structure-ceiling] [--s1-min-match N] [--s1-max-chain N] [--sorted-lines|--byte-array-lines|--mixed-regions [--alpha-lines|--residual-ldm] [--residual-dump PATH] [--mixed-dump-prefix PATH] [--split-control-ceiling] [--compressed-blobs [--mo-factor [--mo-trace]] [--blob-threads N] [--blob-fallback-every N] [--blob-lazy-fallback] [--blob-canonical-level 1..9] [--blob-dump PATH]] [--key-map|--direct-ordinals|--half-cold-bit 0|1] [--source-package [--source-admit-ratio N]]] [--max-files N]\n",argv[0]); return 2; }
+    if(!manifest){ fprintf(stderr,"usage: %s --manifest F [--z LEVEL] [--literal-z 1..9] [--array-z 1..9] [--blob-z 1..9] [--no-d1] [--d2] [--prior-root] [--structure-ceiling] [--s1-min-match N] [--s1-max-chain N] [--sorted-lines|--byte-array-lines|--mixed-regions [--alpha-lines|--residual-ldm] [--residual-dump PATH] [--mixed-dump-prefix PATH] [--split-control-ceiling] [--compressed-blobs [--mo-factor [--mo-trace]] [--blob-threads N] [--blob-zstd-workers N --blob-zstd-job-mib N --blob-zstd-overlap-log N] [--blob-fallback-every N] [--blob-lazy-fallback] [--blob-canonical-level 1..9] [--blob-dump PATH]] [--key-map|--direct-ordinals|--half-cold-bit 0|1] [--source-package [--source-admit-ratio N]]] [--max-files N]\n",argv[0]); return 2; }
     if(useProjectSource&&!useMixedRegions){fprintf(stderr,"--source-package requires --mixed-regions\n");return 2;}
     if(useKeyMap&&!useMixedRegions){fprintf(stderr,"--key-map and --half-cold-bit require --mixed-regions\n");return 2;}
     if(useCompressedBlobs&&(!useMixedRegions||!useByteArrayLines)){fprintf(stderr,"--compressed-blobs requires --mixed-regions --byte-array-lines\n");return 2;}
@@ -662,9 +678,17 @@ int main(int argc,char**argv){
     if(splitControlCeiling&&!useMixedRegions){fprintf(stderr,"--split-control-ceiling requires --mixed-regions\n");return 2;}
     if(structureCeiling&&!useDirectOrdinals){fprintf(stderr,"--structure-ceiling requires --direct-ordinals\n");return 2;}
     if(blobFallbackEvery&&!useCompressedBlobs){fprintf(stderr,"--blob-fallback-every requires --compressed-blobs\n");return 2;}
+    if(blobZstdWorkers&&!useCompressedBlobs){fprintf(stderr,"--blob-zstd-workers requires --compressed-blobs\n");return 2;}
+    if((blobZstdJobMiB||blobZstdOverlapLog)&&!blobZstdWorkers){fprintf(stderr,"blob zstd job controls require --blob-zstd-workers\n");return 2;}
+    if(blobZstdWorkers&&(!blobZstdJobMiB||!blobZstdOverlapLog)){fprintf(stderr,"blob zstd workers require job size and overlap log\n");return 2;}
     if(!useBlobEagerPatches&&!useCompressedBlobs){fprintf(stderr,"--blob-lazy-fallback requires --compressed-blobs\n");return 2;}
     if(blobCanonicalLevel!=9&&!useCompressedBlobs){fprintf(stderr,"--blob-canonical-level requires --compressed-blobs\n");return 2;}
     if(useCompressedBlobs&&strcmp(zlibVersion(),ZLIB_VERSION)){fprintf(stderr,"zlib header/runtime version differs\n");return 2;}
+    if(literalZLevel<0)literalZLevel=zlevel;
+    if(arrayZLevel<0)arrayZLevel=zlevel;
+    if(blobZLevel<0)blobZLevel=zlevel;
+    if((literalZLevel!=zlevel||arrayZLevel!=zlevel)&&!useMixedRegions){fprintf(stderr,"material zstd overrides require --mixed-regions\n");return 2;}
+    if(blobZLevel!=zlevel&&!useCompressedBlobs){fprintf(stderr,"--blob-z requires --compressed-blobs\n");return 2;}
     if(usePriorRoot) useS1=false;
     if(useSortedLines){ useD1=false; useD2=false; useD2mine=false; if(warm){fprintf(stderr,"--sorted-lines warm pass not implemented\n");return 2;} }
     if(useMixedRegions){ useSortedLines=false; useD1=false; useD2=false; useD2mine=false;
@@ -734,9 +758,10 @@ int main(int argc,char**argv){
     }
     std::array<ZSTD_CCtx*,6> mixedZC{}; std::array<ZSTD_DCtx*,6> mixedZD{};
     std::array<uint8_t,6> mixedZActive{};size_t mixedPartCount=useProjectSource?6:(useByteArrayLines?4:2);
+    const std::array<int,6> mixedZLevel{{zlevel,literalZLevel,arrayZLevel,arrayZLevel,zlevel,zlevel}};
     if(useMixedRegions) for(size_t i=0;i<mixedPartCount;++i){
         mixedZC[i]=ZSTD_createCCtx(); mixedZD[i]=ZSTD_createDCtx();
-        ZSTD_CCtx_setParameter(mixedZC[i],ZSTD_c_compressionLevel,zlevel);
+        ZSTD_CCtx_setParameter(mixedZC[i],ZSTD_c_compressionLevel,mixedZLevel[i]);
         ZSTD_CCtx_setParameter(mixedZC[i],ZSTD_c_contentSizeFlag,0);
         if(useResidualLdm&&i==1){
             ZSTD_CCtx_setParameter(mixedZC[i],ZSTD_c_enableLongDistanceMatching,1);
@@ -1163,7 +1188,7 @@ int main(int argc,char**argv){
                             moPolicy=moEncoded.mo_members&&uint64_t(moFactorRaw.size())*4<=uint64_t(blobRaw.size())*3;
                             if(moPolicy){
                                 ++mixedBlobMoPolicyTus;
-                                zstd_ldm_frame_encode(blobZC,moFactorRaw,zlevel,moFactorEncoded);
+                                zstd_ldm_frame_encode(blobZC,moFactorRaw,blobZLevel,moFactorEncoded,blobZstdWorkers,int(blobZstdJobMiB<<20),int(blobZstdOverlapLog));
                                 moWire=moFactorEncoded.size()+FRAME+moMetadata;mixedBlobMoCandidateWire+=moWire;
                                 if(moWire<ordinaryWire){
                                     blobWireMode=4;blobEncoded=std::move(moFactorEncoded);
@@ -1173,8 +1198,8 @@ int main(int argc,char**argv){
                             }
                         }
                         if(!moPolicy){
-                            zstd_ldm_frame_encode(blobZC,blobRaw,zlevel,blobEncoded);
-                            if(!blobPatchRaw.empty())zstd_ldm_frame_encode(blobPatchZC,blobPatchRaw,zlevel,blobPatchEncoded);
+                            zstd_ldm_frame_encode(blobZC,blobRaw,blobZLevel,blobEncoded,blobZstdWorkers,int(blobZstdJobMiB<<20),int(blobZstdOverlapLog));
+                            if(!blobPatchRaw.empty())zstd_ldm_frame_encode(blobPatchZC,blobPatchRaw,blobZLevel,blobPatchEncoded,blobZstdWorkers,int(blobZstdJobMiB<<20),int(blobZstdOverlapLog));
                             size_t patchMetadata=useBlobEagerPatches?compressedBlobs.size():0;
                             if(useBlobEagerPatches)for(const auto&patch:blobPatches)if(patch.kind)patchMetadata+=varint_size(patch.prefix)+varint_size(patch.suffix)+varint_size(patch.data_size);
                             transformWire=blobEncoded.size()+FRAME+(blobPatchEncoded.empty()?0:blobPatchEncoded.size()+FRAME)+patchMetadata;
@@ -1689,6 +1714,8 @@ int main(int argc,char**argv){
         byteexact?"OK":"FAIL",TUs,corpus.raw/MiB,NREG,dict.distinct(),paths.size(),boff2.size()-1,(unsigned long long)n_marker,(unsigned long long)n_literal);
     printf("wire by category (post-z%d, bytes): root=%.0f line_def=%.0f region_def=%.0f block_def=%.0f path_def=%.0f missing=%.0f framing=%.0f  TOTAL=%.0f (%.2f MiB)\n",
         zlevel,w_root,w_linedef,w_regiondef,w_blockdef,w_pathdef,w_missing,w_framing,totalwire,totalwire/MiB);
+    if(literalZLevel!=zlevel||arrayZLevel!=zlevel||blobZLevel!=zlevel)
+      printf("material zstd levels: control=%d literal=%d array=%d blob=%d\n",zlevel,literalZLevel,arrayZLevel,blobZLevel);
     printf("FinalRatio (raw / total wire, one cold pass) = %.1fx\n", corpus.raw/totalwire);
     if(structureCeiling){
       double current=w_root+w_blockdef+double(TUs)*FRAME;
@@ -1716,11 +1743,11 @@ int main(int argc,char**argv){
         mixedPartWire[0],mixedPartWire[1],mixedPartWire[2],mixedPartWire[3],mixedPartWire[4],mixedPartWire[5],mixedSelectorWire,
         (unsigned long long)mixedLiteralRaw,(unsigned long long)mixedArrayValues,(unsigned long long)mixedSourceBytes,(unsigned long long)mixedSourcePackageRaw,(unsigned long long)mixedSourcePackageFiles,nextMixedPublic-1,
         (unsigned long long)mixedOps[0],(unsigned long long)mixedOps[1],(unsigned long long)mixedOps[2],(unsigned long long)mixedOps[3],(unsigned long long)mixedOps[4],(unsigned long long)mixedOps[5],(unsigned long long)mixedOps[6]);
-    if(useCompressedBlobs)printf("compressed blobs: count=%llu deflated=%llu inflated=%llu wire=%.0f patch_raw=%llu patch_wire=%.0f canonical_exact=%llu corrected=%llu replaced=%llu transform_candidate_wire=%.0f ordinary_candidate_wire=%.0f transform_tus=%llu ordinary_tus=%llu fallbacks=%llu fallback_request_wire=%.0f fallback_reply_wire=%.0f threads=%u mode=%s canonical=zlib-%s-level%d\n",
+    if(useCompressedBlobs)printf("compressed blobs: count=%llu deflated=%llu inflated=%llu wire=%.0f patch_raw=%llu patch_wire=%.0f canonical_exact=%llu corrected=%llu replaced=%llu transform_candidate_wire=%.0f ordinary_candidate_wire=%.0f transform_tus=%llu ordinary_tus=%llu fallbacks=%llu fallback_request_wire=%.0f fallback_reply_wire=%.0f threads=%u zstd_workers=%u zstd_job_mib=%u zstd_overlap_log=%u mode=%s canonical=zlib-%s-level%d\n",
         (unsigned long long)mixedBlobCount,(unsigned long long)mixedBlobDeflated,(unsigned long long)mixedBlobInflated,mixedBlobWire,
         (unsigned long long)mixedBlobPatchRaw,mixedBlobPatchWire,(unsigned long long)mixedBlobCanonicalExact,(unsigned long long)mixedBlobCorrected,(unsigned long long)mixedBlobReplaced,
         mixedBlobTransformCandidateWire,mixedBlobOrdinaryCandidateWire,(unsigned long long)mixedBlobTransformTus,(unsigned long long)mixedBlobOrdinaryTus,
-        (unsigned long long)mixedBlobFallbacks,mixedBlobFallbackRequestWire,mixedBlobFallbackReplyWire,blobThreads,useBlobEagerPatches?"eager-patch":"lazy-reply",zlibVersion(),blobCanonicalLevel);
+        (unsigned long long)mixedBlobFallbacks,mixedBlobFallbackRequestWire,mixedBlobFallbackReplyWire,blobThreads,blobZstdWorkers,blobZstdJobMiB,blobZstdOverlapLog,useBlobEagerPatches?"eager-patch":"lazy-reply",zlibVersion(),blobCanonicalLevel);
     if(useMoFactor)printf("MO factor: policy_tus=%llu candidate_wire=%.0f selected_tus=%llu members=%llu member_raw=%llu new_originals=%llu C_dictionary=%u F_dictionary=%u C_string_bytes=%llu F_string_bytes=%llu\n",
         (unsigned long long)mixedBlobMoPolicyTus,mixedBlobMoCandidateWire,(unsigned long long)mixedBlobMoTus,(unsigned long long)mixedBlobMoMembers,(unsigned long long)mixedBlobMoBytes,
         (unsigned long long)mixedBlobMoDefinitions,Cmo.size(),Fmo.size(),(unsigned long long)Cmo.string_bytes(),(unsigned long long)Fmo.string_bytes());

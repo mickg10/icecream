@@ -9,7 +9,12 @@ import json
 import re
 from pathlib import Path
 
-from summarize_complete_codec50 import CATEGORIES, CORPORA, aggregate
+from summarize_complete_codec50 import (
+    CATEGORIES,
+    CORPORA,
+    aggregate,
+    normalize_timed_log,
+)
 from summarize_mixed_region_codec import MIXED_FIELDS, parse_mixed
 
 
@@ -31,7 +36,7 @@ KEY_FIELDS = (
 
 def parse_key_map(path: Path, expected_bit: int) -> dict[str, object]:
     row = parse_mixed(path)
-    text = path.read_text()
+    text = normalize_timed_log(path.read_text())
     found = KEY_PATTERN.search(text)
     if found is None:
         raise ValueError(f"{path}: missing key-map ledger")

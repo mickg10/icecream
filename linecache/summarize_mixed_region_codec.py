@@ -9,7 +9,13 @@ import json
 import re
 from pathlib import Path
 
-from summarize_complete_codec50 import CATEGORIES, CORPORA, aggregate, parse_log
+from summarize_complete_codec50 import (
+    CATEGORIES,
+    CORPORA,
+    aggregate,
+    normalize_timed_log,
+    parse_log,
+)
 
 
 MIXED_PATTERN = re.compile(
@@ -76,11 +82,12 @@ BASE_MIXED_FIELDS = MIXED_FIELDS[:-17]
 
 def parse_mixed(path: Path) -> dict[str, object]:
     row = parse_log(path)
-    found = MIXED_PATTERN.search(path.read_text())
+    text = normalize_timed_log(path.read_text())
+    found = MIXED_PATTERN.search(text)
     if found is None:
         raise ValueError(f"{path}: missing mixed-component ledger")
     row.update(dict(zip(BASE_MIXED_FIELDS, map(int, found.groups()))))
-    blob = BLOB_PATTERN.search(path.read_text())
+    blob = BLOB_PATTERN.search(text)
     row.update(
         dict(zip(BLOB_FIELDS, map(int, blob.groups())))
         if blob is not None

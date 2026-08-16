@@ -37,6 +37,7 @@ the C candidate learner.
 | P26 embedded-zlib factor | retain as underlying member codec; reviewer ruling on member-only recovery pending | exact 48/48 complete executions |
 | P27 canonical-MO factor | measured incremental winner; reviewer ruling pending | exact 48/48 complete executions, 3.04 MB same-input cold saving |
 | P28 S1 chain-1,024 cleanup | retain as the S1 default | exact complete cold execution on all 16; monotonic 11,474-byte saving |
+| P29 selective embedded-blob zstd-9 | retain as current measured row | exact 48/48; 2.10 MB cold saving; three designated speed repetitions |
 | P4 alpha-Line residual codec | reject | exact all-16 integration loses bytes and speed |
 | P22 prior-Root slice | reject from the product path | integrated complete codec loses to S1 |
 | P18 statements, P19 flat phrases, local raw backreferences, project-source packages | do not port | integrated or causal screens lose |
@@ -45,16 +46,16 @@ the C candidate learner.
 | neural sequence models and large code models | teacher/ceiling only | too slow or too large for the live path |
 | receiver-side predictor | do not add | no measured need; explicit programs are sufficient |
 
-The best current complete measured row is P28.  All 48 cold and complementary
+The best current complete measured row is P29.  All 48 cold and complementary
 cache executions are exact:
 
 | receiver state | wire bytes | ratio | exact | minimum measured encode/decode subphase |
 |---|---:|---:|---:|---:|
-| cold | **93,968,728** | **303.87x** | 16/16 corpora | **1.067 GB/s** designated Zen 4 replay |
-| cache complement bit 0 | **62,140,320** | **459.52x** | 16/16 corpora | **1.098 GB/s** local-host replay |
-| cache complement bit 1 | **43,852,134** | **651.16x** | 16/16 corpora | **2.085 GB/s** local-host replay |
+| cold | **91,864,787** | **310.83x** | 16/16 corpora | **1.025 GB/s** designated Zen 4 replay |
+| cache complement bit 0 | **60,040,447** | **475.59x** | 16/16 corpora | 0.975 GB/s local capability host; designated replay pending |
+| cache complement bit 1 | **43,848,226** | **651.22x** | 16/16 corpora | **2.109 GB/s** local-host replay |
 
-Cold 400x permits 71,386,679 bytes, so P28's measured cold gap is **22,582,049 bytes**. Both
+Cold 400x permits 71,386,679 bytes, so P29's measured cold gap is **20,478,108 bytes**. Both
 aggregate half-cache 200x rows pass. These deterministic cache complements are not the same claim
 as chronological online H200; that learning-curve test remains required.
 
@@ -902,20 +903,20 @@ Charge a model exactly where an endpoint first receives or maps it:
 
 ## Current complete byte ledger
 
-P28 cold over all 16 corpora:
+P29 cold over all 16 corpora:
 
 | Complete category | Wire bytes | Fraction |
 |---|---:|---:|
-| Root | 3,681,710 | 3.92% |
-| Block definitions | 581,462 | 0.62% |
-| path definitions | 828,100 | 0.88% |
-| object `NEED`/missing dialogue | 3,317,206 | 3.53% |
-| Region definitions/control | 19,746,257 | 21.01% |
-| Line/material plane | 65,743,189 | 69.95% |
+| Root | 3,681,710 | 4.01% |
+| Block definitions | 581,462 | 0.63% |
+| path definitions | 828,100 | 0.90% |
+| object `NEED`/missing dialogue | 3,317,206 | 3.61% |
+| Region definitions/control | 19,746,257 | 21.50% |
+| Line/material plane | 63,639,248 | 69.27% |
 | other framing | 70,804 | 0.08% |
-| **total** | **93,968,728** | **100.00%** |
+| **total** | **91,864,787** | **100.00%** |
 
-The P27 selected blob wire, 16,721,527 bytes, is a subcomponent of the Line/material plane and must
+The P29 selected blob wire, 14,617,593 bytes, is a subcomponent of the Line/material plane and must
 not be added to the total again. The dominant remaining opportunity is material plus Region
 control; Root alone is only 3.69 MB. A new Root predictor must therefore earn a complete integrated
 gain rather than advertise a large ratio over an already-small structural stream.
@@ -933,6 +934,7 @@ gain rather than advertise a large ratio over an already-small structural stream
 | P26 current same-input control | 97,015,268 | 294.33x | control for P27 attribution |
 | P27 | **93,980,202** | **303.84x** | exact canonical-MO factor beneath P26 |
 | P28 | **93,968,728** | **303.87x** | S1 chain 64→1,024; all 16 monotonic |
+| P29 | **91,864,787** | **310.83x** | selective zstd-9/LDM embedded-blob lane with bounded workers |
 | P26 + rejected P4 | 100,546,398 | 283.99x | independent residual frames + alpha selector |
 
 P25 remains useful evidence for cache ownership, but its dense-to-`u64` association is superseded by
@@ -951,7 +953,7 @@ flowchart TB
     MATERIAL[Exact material<br/>Lines + residual + values]
     DIALOGUE[Cache dialogue<br/>NEED + definitions]
     FRAME[Selectors + framing]
-    TOTAL[Complete P28 wire<br/>93.97 MB]
+    TOTAL[Complete P29 wire<br/>91.86 MB]
 
     RAW --> STRUCT
     RAW --> MATERIAL
@@ -1128,7 +1130,7 @@ superblocks:
 2. add one optional immutable material-program Block inside the existing Region materializer;
 3. preserve first-profitable-use publication and transactional F installation;
 4. produce all-16 learning, reorder, header-change, and revert curves;
-5. integrate the winner into the complete P28 ledger before claiming a ratio;
+5. integrate the winner into the complete P29 ledger before claiming a ratio;
 6. only then compare FTRL and the 32-tree GBDT at equal top-K work;
 7. use the broader 25-corpus set to test generalization and C-only raw-source bootstrap.
 
@@ -1154,6 +1156,7 @@ Complete-codec evidence:
 - [`COMPRESSED-BLOB-P26-16CORPUS-REPORT.md`](COMPRESSED-BLOB-P26-16CORPUS-REPORT.md)
 - [`MO-FACTOR-P27-16CORPUS-REPORT.md`](MO-FACTOR-P27-16CORPUS-REPORT.md)
 - [`SUPERBLOCK-P28-CEILING-REPORT.md`](SUPERBLOCK-P28-CEILING-REPORT.md)
+- [`BLOB-MT-P29-16CORPUS-REPORT.md`](BLOB-MT-P29-16CORPUS-REPORT.md)
 - [`RESIDUAL-AND-CONTROL-CEILINGS.md`](RESIDUAL-AND-CONTROL-CEILINGS.md)
 - [`ALPHA-LINES-P4-16CORPUS-REPORT.md`](ALPHA-LINES-P4-16CORPUS-REPORT.md)
 
@@ -1176,6 +1179,8 @@ Machine-readable current ledgers:
 - [`structure-ceiling-p28-16corpus.tsv`](ml-artifacts/structure-ceiling-p28-16corpus.tsv)
 - [`s1-p28-16corpus-summary.json`](ml-artifacts/s1-p28-16corpus-summary.json)
 - [`s1-p28-16corpus.tsv`](ml-artifacts/s1-p28-16corpus.tsv)
+- [`blob-mt-p29-16corpus-summary.json`](ml-artifacts/blob-mt-p29-16corpus-summary.json)
+- [`blob-mt-p29-16corpus.tsv`](ml-artifacts/blob-mt-p29-16corpus.tsv)
 - [`alpha-lines-p4-16corpus-summary.json`](ml-artifacts/alpha-lines-p4-16corpus-summary.json)
 - [`alpha-lines-p4-16corpus.tsv`](ml-artifacts/alpha-lines-p4-16corpus.tsv)
 
@@ -1200,7 +1205,8 @@ P26 may transform complete zlib members inside BYTE_ARRAY values: inflated membe
 one zstd-3/LDM TU frame when smaller; untouched DEFLATE is the alternative. P27 may further
 factor canonical MO catalogs into original IDs, new original definitions, explicit translations,
 and ordinary members. F rebuilds exact inflated catalogs, then regenerates and validates exact
-zlib members, requesting only any member that differs.
+zlib members, requesting only any member that differs. P29 encodes only the selected embedded-blob
+payload with zstd-9/LDM and a bounded C worker pool; F still receives a standard zstd frame.
 
 All remaining RAW_RUN bytes use ordinary per-TU zstd. P4 alpha templates are rejected.
 Root, definitions, controls, residual, values, requests, replies, selectors, and framing
@@ -1210,7 +1216,7 @@ F needs no predictor. It installs immutable definitions, executes the explicit p
 reconstructs the exact .ii, and writes it into the remote compiler pipe.
 
 Binding claims run on all 16 fixed corpora. The broader 25-corpus set screens model
-generalization. P28 is currently 303.87x cold, leaving 22.58 MB to cold 400x; both deterministic
+generalization. P29 is currently 310.83x cold, leaving 20.48 MB to cold 400x; both deterministic
 half-cache 200x rows pass. Chronological H200 and the complete product-pipeline speed gate remain
 open.
 ```
