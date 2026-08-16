@@ -610,7 +610,7 @@ struct RelLZ {
 };
 
 int main(int argc,char**argv){
-    const char* manifest=nullptr;const char*residualDumpPath=nullptr;const char*mixedDumpPrefix=nullptr; size_t max_files=SIZE_MAX; int zlevel=3,halfColdBit=-1,blobCanonicalLevel=9; uint32_t sourceAdmitRatio=6,blobThreads=4,blobFallbackEvery=0; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, usePriorRoot=false, useSortedLines=false, useByteArrayLines=false, useMixedRegions=false, useProjectSource=false,useKeyMap=false,useDirectOrdinals=false,useCompressedBlobs=false,useBlobEagerPatches=true,useMoFactor=false,traceMo=false,useAlphaLines=false,useResidualLdm=false,splitControlCeiling=false;
+    const char* manifest=nullptr;const char*residualDumpPath=nullptr;const char*mixedDumpPrefix=nullptr; size_t max_files=SIZE_MAX; int zlevel=3,halfColdBit=-1,blobCanonicalLevel=9; uint32_t sourceAdmitRatio=6,blobThreads=4,blobFallbackEvery=0,s1MinMatch=3,s1MaxChain=1024; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, usePriorRoot=false, useSortedLines=false, useByteArrayLines=false, useMixedRegions=false, useProjectSource=false,useKeyMap=false,useDirectOrdinals=false,useCompressedBlobs=false,useBlobEagerPatches=true,useMoFactor=false,traceMo=false,useAlphaLines=false,useResidualLdm=false,splitControlCeiling=false,structureCeiling=false;
     const char*blobDumpPath=nullptr;
     for(int i=1;i<argc;++i){ if(!strcmp(argv[i],"--manifest")&&i+1<argc)manifest=argv[++i];
         else if(!strcmp(argv[i],"--z")&&i+1<argc)zlevel=atoi(argv[++i]);
@@ -631,6 +631,9 @@ int main(int argc,char**argv){
         else if(!strcmp(argv[i],"--blob-dump")&&i+1<argc)blobDumpPath=argv[++i];
         else if(!strcmp(argv[i],"--mixed-dump-prefix")&&i+1<argc)mixedDumpPrefix=argv[++i];
         else if(!strcmp(argv[i],"--split-control-ceiling"))splitControlCeiling=true;
+        else if(!strcmp(argv[i],"--structure-ceiling"))structureCeiling=true;
+        else if(!strcmp(argv[i],"--s1-min-match")&&i+1<argc){char*end=nullptr;unsigned long value=strtoul(argv[++i],&end,10);if(!end||*end||value<2||value>16){fprintf(stderr,"bad S1 minimum match\n");return 2;}s1MinMatch=uint32_t(value);}
+        else if(!strcmp(argv[i],"--s1-max-chain")&&i+1<argc){char*end=nullptr;unsigned long value=strtoul(argv[++i],&end,10);if(!end||*end||!value||value>4096){fprintf(stderr,"bad S1 maximum chain\n");return 2;}s1MaxChain=uint32_t(value);}
         else if(!strcmp(argv[i],"--blob-threads")&&i+1<argc){char*end=nullptr;unsigned long value=strtoul(argv[++i],&end,10);if(!end||*end||!value||value>32){fprintf(stderr,"bad blob thread count\n");return 2;}blobThreads=uint32_t(value);}
         else if(!strcmp(argv[i],"--blob-fallback-every")&&i+1<argc){char*end=nullptr;unsigned long value=strtoul(argv[++i],&end,10);if(!end||*end||!value||value>UINT32_MAX){fprintf(stderr,"bad blob fallback interval\n");return 2;}blobFallbackEvery=uint32_t(value);}
         else if(!strcmp(argv[i],"--blob-lazy-fallback"))useBlobEagerPatches=false;
@@ -644,7 +647,7 @@ int main(int argc,char**argv){
         else if(!strcmp(argv[i],"--warm"))warm=true;         // Basis C: 2nd pass with dict retained -> warm steady-state wire
         else if(!strcmp(argv[i],"--max-files")&&i+1<argc){ char*t=nullptr; unsigned long long v=strtoull(argv[++i],&t,10); if(!t||*t||!v){fprintf(stderr,"bad max-files\n");return 2;} max_files=size_t(v); }
         else { fprintf(stderr,"unknown %s\n",argv[i]); return 2; } }
-    if(!manifest){ fprintf(stderr,"usage: %s --manifest F [--z 0|1|3] [--no-d1] [--d2] [--prior-root] [--sorted-lines|--byte-array-lines|--mixed-regions [--alpha-lines|--residual-ldm] [--residual-dump PATH] [--mixed-dump-prefix PATH] [--split-control-ceiling] [--compressed-blobs [--mo-factor [--mo-trace]] [--blob-threads N] [--blob-fallback-every N] [--blob-lazy-fallback] [--blob-canonical-level 1..9] [--blob-dump PATH]] [--key-map|--direct-ordinals|--half-cold-bit 0|1] [--source-package [--source-admit-ratio N]]] [--max-files N]\n",argv[0]); return 2; }
+    if(!manifest){ fprintf(stderr,"usage: %s --manifest F [--z 0|1|3] [--no-d1] [--d2] [--prior-root] [--structure-ceiling] [--s1-min-match N] [--s1-max-chain N] [--sorted-lines|--byte-array-lines|--mixed-regions [--alpha-lines|--residual-ldm] [--residual-dump PATH] [--mixed-dump-prefix PATH] [--split-control-ceiling] [--compressed-blobs [--mo-factor [--mo-trace]] [--blob-threads N] [--blob-fallback-every N] [--blob-lazy-fallback] [--blob-canonical-level 1..9] [--blob-dump PATH]] [--key-map|--direct-ordinals|--half-cold-bit 0|1] [--source-package [--source-admit-ratio N]]] [--max-files N]\n",argv[0]); return 2; }
     if(useProjectSource&&!useMixedRegions){fprintf(stderr,"--source-package requires --mixed-regions\n");return 2;}
     if(useKeyMap&&!useMixedRegions){fprintf(stderr,"--key-map and --half-cold-bit require --mixed-regions\n");return 2;}
     if(useCompressedBlobs&&(!useMixedRegions||!useByteArrayLines)){fprintf(stderr,"--compressed-blobs requires --mixed-regions --byte-array-lines\n");return 2;}
@@ -657,6 +660,7 @@ int main(int argc,char**argv){
     if(blobDumpPath&&!useCompressedBlobs){fprintf(stderr,"--blob-dump requires --compressed-blobs\n");return 2;}
     if(mixedDumpPrefix&&!useMixedRegions){fprintf(stderr,"--mixed-dump-prefix requires --mixed-regions\n");return 2;}
     if(splitControlCeiling&&!useMixedRegions){fprintf(stderr,"--split-control-ceiling requires --mixed-regions\n");return 2;}
+    if(structureCeiling&&!useDirectOrdinals){fprintf(stderr,"--structure-ceiling requires --direct-ordinals\n");return 2;}
     if(blobFallbackEvery&&!useCompressedBlobs){fprintf(stderr,"--blob-fallback-every requires --compressed-blobs\n");return 2;}
     if(!useBlobEagerPatches&&!useCompressedBlobs){fprintf(stderr,"--blob-lazy-fallback requires --compressed-blobs\n");return 2;}
     if(blobCanonicalLevel!=9&&!useCompressedBlobs){fprintf(stderr,"--blob-canonical-level requires --compressed-blobs\n");return 2;}
@@ -692,7 +696,7 @@ int main(int argc,char**argv){
     std::vector<uint32_t> tokstream; std::vector<size_t> tokoff; tokoff.push_back(0);
     std::vector<uint32_t> bcopy_src; std::vector<uint8_t> bcopy_ok;   // block k: def as COPY(src,len) if ok (source in prior TUs)
     if(useS1){
-        size_t NS=allreg.size(); uint32_t MINMATCH=3, MAXCHAIN=64, hbits=22;
+        size_t NS=allreg.size(); uint32_t MINMATCH=s1MinMatch, MAXCHAIN=s1MaxChain, hbits=22;
         std::vector<uint32_t> head(size_t(1)<<hbits, UINT32_MAX), prevp(NS, UINT32_MAX);
         auto kgram=[&](size_t i)->uint64_t{ uint64_t h=1469598103934665603ULL; for(uint32_t j=0;j<MINMATCH;++j){ h^=allreg[i+j]; h*=1099511628211ULL; } return (h*0x9E3779B97F4A7C15ULL)>>(64-hbits); };
         auto block_get=[&](const uint32_t*p,size_t L,uint32_t srcpos,uint8_t copyok)->uint32_t{ uint64_t h=1469598103934665603ULL^(L*0x100000001b3ULL); for(size_t j=0;j<L;++j){h^=p[j];h*=1099511628211ULL;}
@@ -709,7 +713,7 @@ int main(int argc,char**argv){
                 for(size_t j=i;j<i+step;++j){ if(j+MINMATCH<=NS){ uint64_t g=kgram(j); prevp[j]=head[g]; head[g]=uint32_t(j); } }
                 i+=step; }
             tokoff.push_back(tokstream.size()); }
-        fprintf(stderr,"S1 LZ: %.1fs tokens=%zu blocks=%zu (%.4f tok/region)\n",secs(tb),tokstream.size(),boff2.size()-1,double(tokstream.size())/NS);
+        fprintf(stderr,"S1 LZ: %.1fs min_match=%u max_chain=%u tokens=%zu blocks=%zu (%.4f tok/region)\n",secs(tb),MINMATCH,MAXCHAIN,tokstream.size(),boff2.size()-1,double(tokstream.size())/NS);
     } else { // V1: root = raw region-id sequence
         for(size_t t=0;t<TUs;++t){ for(size_t i=roff[t];i<roff[t+1];++i) tokstream.push_back(allreg[i]); tokoff.push_back(tokstream.size()); }
     }
@@ -792,6 +796,7 @@ int main(int argc,char**argv){
     uint64_t mixedSourcePackageRaw=0,mixedSourcePackageFiles=0,mixedSourcePotentialRaw=0,mixedSourceConsidered=0,mixedSourceAdmitted=0,mixedSourceEstimatedCost=0;double mixedSelectorWire=0;
     double alphaOrdinaryCandidateWire=0,alphaLiteralKeywordCandidateWire=0,alphaParameterizedKeywordCandidateWire=0,alphaBestCandidateWire=0,alphaSelectedWire=0,alphaControlWire=0,alphaDataWire=0,alphaSelectorWire=0;
     double splitControlCeilingWire=0;std::array<uint64_t,8>splitControlRawBytes{},splitControlWireBytes{};
+    double structureBatchRoot=0,structureBatchBlock=0,structureBatchJoint=0,structureLdmJoint=0;
     uint64_t alphaInputRaw=0,alphaEligibleLines=0,alphaGapRaw=0,alphaSelectedTus=0,alphaOrdinaryTus=0,alphaLiteralKeywordTus=0,alphaParameterizedKeywordTus=0;
     alpha_line::Stats alphaStats;
     uint64_t preloadedRegionBytes=0,preloadedRegionCount=0,associatedRegionCount=0;double mixedAssociationWire=0,mixedMissingRequestWire=0;
@@ -882,6 +887,7 @@ int main(int argc,char**argv){
                 if(bcopy_ok[k]){blockRaw.push_back(1);put_varint(blockRaw,bcopy_src[k]);put_varint(blockRaw,length);}
                 else{blockRaw.push_back(0);put_varint(blockRaw,length);for(size_t j=boff2[k];j<boff2[k+1];++j)put_varint(blockRaw,bchild[j]);}
               }
+              if(structureCeiling)allBlocks.insert(allBlocks.end(),blockRaw.begin(),blockRaw.end());
               size_t bytes=zstd_message_roundtrip(z,messageD,blockRaw,zlevel,messageEncoded,messageDecoded)+FRAME;w_blockdef+=bytes;
               const uint8_t*bp=messageDecoded.data(),*be=bp+messageDecoded.size();uint64_t count=get_varint(bp);
               if(count!=manifestBlocks.size()){fprintf(stderr,"direct Block manifest count differs\n");return 2;}
@@ -1647,6 +1653,16 @@ int main(int argc,char**argv){
         splitControlCeilingWire+=splitControlWireBytes[i];
       }
     }
+    if(structureCeiling){
+      std::vector<uint8_t>structureJoint;put_varint(structureJoint,allRoots.size());
+      structureJoint.insert(structureJoint.end(),allRoots.begin(),allRoots.end());
+      structureJoint.insert(structureJoint.end(),allBlocks.begin(),allBlocks.end());
+      if(!allRoots.empty())structureBatchRoot=zstd_message_roundtrip(z,messageD,allRoots,zlevel,messageEncoded,messageDecoded)+FRAME;
+      if(!allBlocks.empty())structureBatchBlock=zstd_message_roundtrip(z,messageD,allBlocks,zlevel,messageEncoded,messageDecoded)+FRAME;
+      structureBatchJoint=zstd_message_roundtrip(z,messageD,structureJoint,zlevel,messageEncoded,messageDecoded)+FRAME;
+      structureLdmJoint=zstd_ldm_frame_encode(z,structureJoint,zlevel,messageEncoded)+FRAME;
+      if(zstd_frame_decode_exact(messageD,messageEncoded,structureJoint.size())!=structureJoint){fprintf(stderr,"structure LDM aggregate roundtrip differs\n");return 2;}
+    }
     ZSTD_freeCCtx(z);
     ZSTD_freeDCtx(messageD);
     if(sourceCostZ)ZSTD_freeCCtx(sourceCostZ);
@@ -1674,6 +1690,24 @@ int main(int argc,char**argv){
     printf("wire by category (post-z%d, bytes): root=%.0f line_def=%.0f region_def=%.0f block_def=%.0f path_def=%.0f missing=%.0f framing=%.0f  TOTAL=%.0f (%.2f MiB)\n",
         zlevel,w_root,w_linedef,w_regiondef,w_blockdef,w_pathdef,w_missing,w_framing,totalwire,totalwire/MiB);
     printf("FinalRatio (raw / total wire, one cold pass) = %.1fx\n", corpus.raw/totalwire);
+    if(structureCeiling){
+      double current=w_root+w_blockdef+double(TUs)*FRAME;
+      double separate=structureBatchRoot+structureBatchBlock;
+      double projectedSeparate=totalwire-current+separate;
+      double projectedJoint=totalwire-current+structureBatchJoint;
+      double projectedLdm=totalwire-current+structureLdmJoint;
+      double projectedZero=totalwire-current;
+      printf("structure ceiling (diagnostic whole-run floors; TU boundaries omitted): raw_root=%zu raw_block=%zu current_root+block+root_frames=%.0f\n",
+          allRoots.size(),allBlocks.size(),current);
+      printf("  batched separate: root=%.0f block=%.0f combined=%.0f saving=%.0f => total=%.0f ratio=%.2fx\n",
+          structureBatchRoot,structureBatchBlock,separate,current-separate,projectedSeparate,corpus.raw/projectedSeparate);
+      printf("  batched joint: wire=%.0f saving=%.0f => total=%.0f ratio=%.2fx\n",
+          structureBatchJoint,current-structureBatchJoint,projectedJoint,corpus.raw/projectedJoint);
+      printf("  batched joint + LDM/win27: wire=%.0f saving=%.0f => total=%.0f ratio=%.2fx\n",
+          structureLdmJoint,current-structureLdmJoint,projectedLdm,corpus.raw/projectedLdm);
+      printf("  impossible zero-byte structure bound: saving=%.0f => total=%.0f ratio=%.2fx\n",
+          current,projectedZero,corpus.raw/projectedZero);
+    }
     if(usePriorRoot) printf("ROOT_SLICE stats: copies=%llu copied_regions=%llu indexed_windows=%llu index_entries=%llu receiver_root_bytes=%zu\n",
         (unsigned long long)root_slices.copies,(unsigned long long)root_slices.copied_regions,
         (unsigned long long)root_slices.indexed_windows,(unsigned long long)root_slices.index_entries,
