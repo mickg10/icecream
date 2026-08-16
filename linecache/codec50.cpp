@@ -35,6 +35,7 @@
 #include <zstd.h>
 #include <zlib.h>
 #include "alpha_line_codec.h"
+#include "mo_factor_codec.h"
 #if defined(WITH_D2) && __has_include("definition_codec.h")
   #include "definition_codec.h"
   #define HAVE_DEFCODEC 1
@@ -609,7 +610,8 @@ struct RelLZ {
 };
 
 int main(int argc,char**argv){
-    const char* manifest=nullptr; size_t max_files=SIZE_MAX; int zlevel=3,halfColdBit=-1,blobCanonicalLevel=9; uint32_t sourceAdmitRatio=6,blobThreads=4,blobFallbackEvery=0; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, usePriorRoot=false, useSortedLines=false, useByteArrayLines=false, useMixedRegions=false, useProjectSource=false,useKeyMap=false,useDirectOrdinals=false,useCompressedBlobs=false,useBlobEagerPatches=true,useAlphaLines=false;
+    const char* manifest=nullptr;const char*residualDumpPath=nullptr;const char*mixedDumpPrefix=nullptr; size_t max_files=SIZE_MAX; int zlevel=3,halfColdBit=-1,blobCanonicalLevel=9; uint32_t sourceAdmitRatio=6,blobThreads=4,blobFallbackEvery=0; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, usePriorRoot=false, useSortedLines=false, useByteArrayLines=false, useMixedRegions=false, useProjectSource=false,useKeyMap=false,useDirectOrdinals=false,useCompressedBlobs=false,useBlobEagerPatches=true,useMoFactor=false,traceMo=false,useAlphaLines=false,useResidualLdm=false,splitControlCeiling=false;
+    const char*blobDumpPath=nullptr;
     for(int i=1;i<argc;++i){ if(!strcmp(argv[i],"--manifest")&&i+1<argc)manifest=argv[++i];
         else if(!strcmp(argv[i],"--z")&&i+1<argc)zlevel=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--no-d1"))useD1=false;
@@ -621,7 +623,14 @@ int main(int argc,char**argv){
         else if(!strcmp(argv[i],"--byte-array-lines")){useSortedLines=true;useByteArrayLines=true;}
         else if(!strcmp(argv[i],"--mixed-regions"))useMixedRegions=true;
         else if(!strcmp(argv[i],"--compressed-blobs"))useCompressedBlobs=true;
+        else if(!strcmp(argv[i],"--mo-factor"))useMoFactor=true;
+        else if(!strcmp(argv[i],"--mo-trace"))traceMo=true;
         else if(!strcmp(argv[i],"--alpha-lines"))useAlphaLines=true;
+        else if(!strcmp(argv[i],"--residual-ldm"))useResidualLdm=true;
+        else if(!strcmp(argv[i],"--residual-dump")&&i+1<argc)residualDumpPath=argv[++i];
+        else if(!strcmp(argv[i],"--blob-dump")&&i+1<argc)blobDumpPath=argv[++i];
+        else if(!strcmp(argv[i],"--mixed-dump-prefix")&&i+1<argc)mixedDumpPrefix=argv[++i];
+        else if(!strcmp(argv[i],"--split-control-ceiling"))splitControlCeiling=true;
         else if(!strcmp(argv[i],"--blob-threads")&&i+1<argc){char*end=nullptr;unsigned long value=strtoul(argv[++i],&end,10);if(!end||*end||!value||value>32){fprintf(stderr,"bad blob thread count\n");return 2;}blobThreads=uint32_t(value);}
         else if(!strcmp(argv[i],"--blob-fallback-every")&&i+1<argc){char*end=nullptr;unsigned long value=strtoul(argv[++i],&end,10);if(!end||*end||!value||value>UINT32_MAX){fprintf(stderr,"bad blob fallback interval\n");return 2;}blobFallbackEvery=uint32_t(value);}
         else if(!strcmp(argv[i],"--blob-lazy-fallback"))useBlobEagerPatches=false;
@@ -635,11 +644,19 @@ int main(int argc,char**argv){
         else if(!strcmp(argv[i],"--warm"))warm=true;         // Basis C: 2nd pass with dict retained -> warm steady-state wire
         else if(!strcmp(argv[i],"--max-files")&&i+1<argc){ char*t=nullptr; unsigned long long v=strtoull(argv[++i],&t,10); if(!t||*t||!v){fprintf(stderr,"bad max-files\n");return 2;} max_files=size_t(v); }
         else { fprintf(stderr,"unknown %s\n",argv[i]); return 2; } }
-    if(!manifest){ fprintf(stderr,"usage: %s --manifest F [--z 0|1|3] [--no-d1] [--d2] [--prior-root] [--sorted-lines|--byte-array-lines|--mixed-regions [--alpha-lines] [--compressed-blobs [--blob-threads N] [--blob-fallback-every N] [--blob-lazy-fallback] [--blob-canonical-level 1..9]] [--key-map|--direct-ordinals|--half-cold-bit 0|1] [--source-package [--source-admit-ratio N]]] [--max-files N]\n",argv[0]); return 2; }
+    if(!manifest){ fprintf(stderr,"usage: %s --manifest F [--z 0|1|3] [--no-d1] [--d2] [--prior-root] [--sorted-lines|--byte-array-lines|--mixed-regions [--alpha-lines|--residual-ldm] [--residual-dump PATH] [--mixed-dump-prefix PATH] [--split-control-ceiling] [--compressed-blobs [--mo-factor [--mo-trace]] [--blob-threads N] [--blob-fallback-every N] [--blob-lazy-fallback] [--blob-canonical-level 1..9] [--blob-dump PATH]] [--key-map|--direct-ordinals|--half-cold-bit 0|1] [--source-package [--source-admit-ratio N]]] [--max-files N]\n",argv[0]); return 2; }
     if(useProjectSource&&!useMixedRegions){fprintf(stderr,"--source-package requires --mixed-regions\n");return 2;}
     if(useKeyMap&&!useMixedRegions){fprintf(stderr,"--key-map and --half-cold-bit require --mixed-regions\n");return 2;}
     if(useCompressedBlobs&&(!useMixedRegions||!useByteArrayLines)){fprintf(stderr,"--compressed-blobs requires --mixed-regions --byte-array-lines\n");return 2;}
+    if(useMoFactor&&!useCompressedBlobs){fprintf(stderr,"--mo-factor requires --compressed-blobs\n");return 2;}
+    if(useMoFactor&&useBlobEagerPatches){fprintf(stderr,"--mo-factor requires --blob-lazy-fallback\n");return 2;}
+    if(traceMo&&!useMoFactor){fprintf(stderr,"--mo-trace requires --mo-factor\n");return 2;}
     if(useAlphaLines&&!useMixedRegions){fprintf(stderr,"--alpha-lines requires --mixed-regions\n");return 2;}
+    if(useResidualLdm&&!useMixedRegions){fprintf(stderr,"--residual-ldm requires --mixed-regions\n");return 2;}
+    if(residualDumpPath&&!useMixedRegions){fprintf(stderr,"--residual-dump requires --mixed-regions\n");return 2;}
+    if(blobDumpPath&&!useCompressedBlobs){fprintf(stderr,"--blob-dump requires --compressed-blobs\n");return 2;}
+    if(mixedDumpPrefix&&!useMixedRegions){fprintf(stderr,"--mixed-dump-prefix requires --mixed-regions\n");return 2;}
+    if(splitControlCeiling&&!useMixedRegions){fprintf(stderr,"--split-control-ceiling requires --mixed-regions\n");return 2;}
     if(blobFallbackEvery&&!useCompressedBlobs){fprintf(stderr,"--blob-fallback-every requires --compressed-blobs\n");return 2;}
     if(!useBlobEagerPatches&&!useCompressedBlobs){fprintf(stderr,"--blob-lazy-fallback requires --compressed-blobs\n");return 2;}
     if(blobCanonicalLevel!=9&&!useCompressedBlobs){fprintf(stderr,"--blob-canonical-level requires --compressed-blobs\n");return 2;}
@@ -717,13 +734,35 @@ int main(int argc,char**argv){
         mixedZC[i]=ZSTD_createCCtx(); mixedZD[i]=ZSTD_createDCtx();
         ZSTD_CCtx_setParameter(mixedZC[i],ZSTD_c_compressionLevel,zlevel);
         ZSTD_CCtx_setParameter(mixedZC[i],ZSTD_c_contentSizeFlag,0);
+        if(useResidualLdm&&i==1){
+            ZSTD_CCtx_setParameter(mixedZC[i],ZSTD_c_enableLongDistanceMatching,1);
+            ZSTD_CCtx_setParameter(mixedZC[i],ZSTD_c_windowLog,27);
+        }
     }
     ZSTD_CCtx*blobZC=useCompressedBlobs?ZSTD_createCCtx():nullptr;
     ZSTD_DCtx*blobZD=useCompressedBlobs?ZSTD_createDCtx():nullptr;
     ZSTD_CCtx*blobPatchZC=useCompressedBlobs?ZSTD_createCCtx():nullptr;
     ZSTD_DCtx*blobPatchZD=useCompressedBlobs?ZSTD_createDCtx():nullptr;
+    mo_factor::EncoderState Cmo;mo_factor::DecoderState Fmo;
     ZSTD_CCtx*alphaZC=useAlphaLines?ZSTD_createCCtx():nullptr;
     ZSTD_DCtx*alphaZD=useAlphaLines?ZSTD_createDCtx():nullptr;
+    FILE*residualDump=residualDumpPath?fopen(residualDumpPath,"wb"):nullptr;
+    if(residualDumpPath&&!residualDump){perror(residualDumpPath);return 2;}
+    FILE*blobDump=blobDumpPath?fopen(blobDumpPath,"wb"):nullptr;FILE*blobDumpLengths=nullptr;
+    if(blobDumpPath&&!blobDump){perror(blobDumpPath);return 2;}
+    if(blobDumpPath){std::string path=std::string(blobDumpPath)+".lengths";blobDumpLengths=fopen(path.c_str(),"wb");if(!blobDumpLengths){perror(path.c_str());return 2;}}
+    std::array<FILE*,6>mixedDumps{};FILE*mixedDumpLengths=nullptr;
+    if(mixedDumpPrefix){
+        static constexpr const char*names[]={"control","literal","array-control","array-values","source-control","source-files"};
+        for(size_t i=0;i<mixedPartCount;++i){
+            std::string path=std::string(mixedDumpPrefix)+"."+names[i]+".raw";
+            mixedDumps[i]=fopen(path.c_str(),"wb");
+            if(!mixedDumps[i]){perror(path.c_str());return 2;}
+        }
+        std::string path=std::string(mixedDumpPrefix)+".lengths.raw";
+        mixedDumpLengths=fopen(path.c_str(),"wb");
+        if(!mixedDumpLengths){perror(path.c_str());return 2;}
+    }
     std::vector<MixedCLineState> mixedCLine;
     if(useMixedRegions)mixedCLine.resize(dict.distinct()+1);
     uint32_t nextMixedPublic=1;SourceTextStore mixedCSource(useProjectSource),mixedFSource;
@@ -747,11 +786,12 @@ int main(int argc,char**argv){
     // wire byte accumulators (post-z, per category) + f-checkpoint tracking
     double w_root=0, w_linedef=0, w_regiondef=0, w_pathdef=0, w_missing=0, w_framing=0;
     std::array<double,6> mixedPartWire{};std::array<uint64_t,7> mixedOps{};uint64_t mixedLiteralRaw=0,mixedArrayValues=0,mixedSourceBytes=0;
-    double mixedBlobWire=0,mixedBlobPatchWire=0,mixedBlobTransformCandidateWire=0,mixedBlobOrdinaryCandidateWire=0,mixedBlobFallbackRequestWire=0,mixedBlobFallbackReplyWire=0;
+    double mixedBlobWire=0,mixedBlobPatchWire=0,mixedBlobTransformCandidateWire=0,mixedBlobOrdinaryCandidateWire=0,mixedBlobMoCandidateWire=0,mixedBlobFallbackRequestWire=0,mixedBlobFallbackReplyWire=0;
     uint64_t mixedBlobCount=0,mixedBlobDeflated=0,mixedBlobInflated=0,mixedBlobPatchRaw=0,mixedBlobCanonicalExact=0,mixedBlobCorrected=0,mixedBlobReplaced=0,mixedBlobFallbacks=0;
-    uint64_t mixedBlobTransformTus=0,mixedBlobOrdinaryTus=0;
+    uint64_t mixedBlobTransformTus=0,mixedBlobOrdinaryTus=0,mixedBlobMoPolicyTus=0,mixedBlobMoTus=0,mixedBlobMoMembers=0,mixedBlobMoBytes=0,mixedBlobMoDefinitions=0;
     uint64_t mixedSourcePackageRaw=0,mixedSourcePackageFiles=0,mixedSourcePotentialRaw=0,mixedSourceConsidered=0,mixedSourceAdmitted=0,mixedSourceEstimatedCost=0;double mixedSelectorWire=0;
     double alphaOrdinaryCandidateWire=0,alphaLiteralKeywordCandidateWire=0,alphaParameterizedKeywordCandidateWire=0,alphaBestCandidateWire=0,alphaSelectedWire=0,alphaControlWire=0,alphaDataWire=0,alphaSelectorWire=0;
+    double splitControlCeilingWire=0;std::array<uint64_t,8>splitControlRawBytes{},splitControlWireBytes{};
     uint64_t alphaInputRaw=0,alphaEligibleLines=0,alphaGapRaw=0,alphaSelectedTus=0,alphaOrdinaryTus=0,alphaLiteralKeywordTus=0,alphaParameterizedKeywordTus=0;
     alpha_line::Stats alphaStats;
     uint64_t preloadedRegionBytes=0,preloadedRegionCount=0,associatedRegionCount=0;double mixedAssociationWire=0,mixedMissingRequestWire=0;
@@ -770,6 +810,7 @@ int main(int argc,char**argv){
     bool byteexact=true; uint64_t n_marker=0,n_literal=0;
     std::vector<uint8_t> allLineDefs, allRoots, allRegions, allBlocks, allPaths, allMiss;   // diagnostic: batched-z3 floor (cross-message headroom)
     std::vector<uint8_t> allRegionsRaw;   // diagnostic: region-defs as RAW line-ids (no per-region delta) -> preserves cross-region subsequence matches for z3-LDM
+    std::array<std::vector<uint8_t>,8> splitControlAll;
 
     std::vector<uint8_t> associatedReg(NREG),FassociatedReg(NREG);
     std::vector<uint32_t> requiredRegionStamp(NREG),requiredBlockStamp(fknownBlk.size());
@@ -924,12 +965,14 @@ int main(int argc,char**argv){
         std::vector<uint32_t> newLineIds;
         std::array<std::vector<uint8_t>,5> lineRaw, lineEncoded;
         std::array<std::vector<uint8_t>,6> mixedRaw, mixedEncoded;
+        std::array<std::vector<uint8_t>,8>splitControl;
         std::vector<alpha_line::Slice>alphaLines;std::vector<uint32_t>alphaGaps;std::vector<uint8_t>alphaGapBytes;
         uint32_t alphaPendingGap=0;uint8_t alphaWireMode=0;std::vector<uint8_t>alphaSelector,alphaOrdinaryEncoded,alphaControlEncoded,alphaDataEncoded;
         std::vector<GeneratedByteArray> mixedArrayEntries;
         std::vector<CompressedBlob> compressedBlobs;
         std::vector<BlobPatch>blobPatches;std::vector<std::vector<uint8_t>>CcanonicalBlobs;
         std::vector<uint8_t> blobRaw,blobEncoded,blobPatchRaw,blobPatchEncoded,blobOriginalRaw;uint8_t blobWireMode=0;
+        mo_factor::Encoded moEncoded;std::array<uint32_t,4>moRawSizes{};std::vector<uint8_t>moFactorRaw,moFactorEncoded;
         std::vector<uint32_t>compressedBlobEntriesSeen;
         std::vector<std::pair<uint32_t,const SourceText*>> mixedSourceDefinitions;
         if(!useMixedRegions) for(uint32_t r:missReg){ const uint32_t* lids=dict.region_ids_ptr(r); uint32_t c=dict.region_ids_count(r);
@@ -950,8 +993,12 @@ int main(int argc,char**argv){
         }
         if(useMixedRegions && !missReg.empty()){
             put_varint(mixedRaw[0],missReg.size());
+            if(splitControlCeiling)put_varint(splitControl[0],missReg.size());
             for(uint32_t r:missReg){
                 const uint32_t* lids=dict.region_ids_ptr(r); uint32_t count=dict.region_ids_count(r),offset=0,literalLength=0;
+                uint64_t splitRegionOps=0;
+                auto splitOpcode=[&](uint8_t opcode){if(splitControlCeiling){splitControl[1].push_back(opcode);++splitRegionOps;}};
+                auto splitVarint=[&](size_t stream,uint64_t value){if(splitControlCeiling)put_varint(splitControl[stream],value);};
                 std::vector<GeneratedByteArray>regionProbeEntries;std::vector<int32_t>regionLineToProbe(count,-1),regionProbeToBlob;
                 if(useCompressedBlobs){
                     for(uint32_t j=0;j<count;++j){const LineRef&line=dict.ref(lids[j]);GeneratedByteArray parsed;
@@ -976,7 +1023,8 @@ int main(int argc,char**argv){
                     mixedSourceSent[pathId]=1;mixedSourceDefinitions.emplace_back(pathId,&source);
                 };
                 put_varint(mixedRaw[0],dict.region_raw_len(r));
-                auto flushLiteral=[&](){ if(!literalLength)return; mixedRaw[0].push_back(0);put_varint(mixedRaw[0],literalLength);++mixedOps[0];literalLength=0; };
+                if(splitControlCeiling)put_varint(splitControl[0],dict.region_raw_len(r));
+                auto flushLiteral=[&](){ if(!literalLength)return; mixedRaw[0].push_back(0);put_varint(mixedRaw[0],literalLength);splitOpcode(0);splitVarint(2,literalLength);++mixedOps[0];literalLength=0; };
                 for(uint32_t j=0;j<count;++j){
                     uint32_t lineId=lids[j];const LineRef&line=dict.ref(lineId);const char*text=dict.line_data(line.off);MixedCLineState&state=mixedCLine[lineId];
                     GeneratedByteArray compressedParsed;int32_t probe=useCompressedBlobs?regionLineToProbe[j]:-1;
@@ -984,16 +1032,17 @@ int main(int argc,char**argv){
                     if(forceCompressedArray){compressedParsed=std::move(regionProbeEntries[size_t(probe)]);size_t entry=mixedArrayEntries.size();auto&blob=compressedBlobs[size_t(compressedBlob)];uint32_t&seen=compressedBlobEntriesSeen[size_t(compressedBlob)];
                         if(!seen)blob.first_entry=uint32_t(entry);else if(entry!=size_t(blob.first_entry)+seen){fprintf(stderr,"non-contiguous compressed blob entries\n");return 2;}++seen;}
                     if(forceCompressedArray){
-                        mixedArrayValues+=compressedParsed.values.size();flushLiteral();mixedRaw[0].push_back(3);mixedArrayEntries.push_back(std::move(compressedParsed));++mixedOps[3];++n_literal;
+                        mixedArrayValues+=compressedParsed.values.size();flushLiteral();mixedRaw[0].push_back(3);splitOpcode(3);mixedArrayEntries.push_back(std::move(compressedParsed));++mixedOps[3];++n_literal;
                     } else if(state.public_id){
-                        flushLiteral();mixedRaw[0].push_back(2);put_varint(mixedRaw[0],state.public_id);++mixedOps[2];
+                        flushLiteral();mixedRaw[0].push_back(2);put_varint(mixedRaw[0],state.public_id);splitOpcode(2);splitVarint(3,state.public_id);++mixedOps[2];
                     } else if(state.source_region!=UINT32_MAX&&state.source_region!=r){
                         if(state.source_region>=r||state.source_offset+line.len>dict.region_raw_len(state.source_region)||
                            memcmp(dict.region_data(state.source_region)+state.source_offset,text,line.len)){
                             fprintf(stderr,"bad mixed source Line\n");return 2;
                         }
                         flushLiteral();mixedRaw[0].push_back(1);put_zigzag(mixedRaw[0],int64_t(state.source_region)-int64_t(r));
-                        put_varint(mixedRaw[0],state.source_offset);put_varint(mixedRaw[0],line.len);
+                        put_varint(mixedRaw[0],state.source_offset);put_varint(mixedRaw[0],line.len);splitOpcode(1);
+                        {const int64_t delta=int64_t(state.source_region)-int64_t(r);splitVarint(4,(uint64_t(delta)<<1)^uint64_t(delta>>63));}splitVarint(4,state.source_offset);splitVarint(4,line.len);
                         state.public_id=nextMixedPublic++;++mixedOps[1];
                     } else {
                         if(state.source_region==UINT32_MAX){state.source_region=r;state.source_offset=offset;}
@@ -1030,18 +1079,18 @@ int main(int argc,char**argv){
                         if(sourceCopy&&sourceAdmitted){
                             if(sourcePath==UINT32_MAX)sourcePath=ensurePathId(regionMarker.path);
                             ensureSourceDefinition(regionMarker.path,sourcePath,*regionSource);
-                            flushLiteral();mixedRaw[0].push_back(5);put_varint(mixedRaw[0],sourcePath);put_varint(mixedRaw[0],sourceLine);++mixedOps[5];mixedSourceBytes+=line.len;
+                            flushLiteral();mixedRaw[0].push_back(5);put_varint(mixedRaw[0],sourcePath);put_varint(mixedRaw[0],sourceLine);splitOpcode(5);splitVarint(6,sourcePath);splitVarint(6,sourceLine);++mixedOps[5];mixedSourceBytes+=line.len;
                         } else if(arrayLine){
-                            mixedArrayValues+=parsed.values.size();flushLiteral();mixedRaw[0].push_back(3);mixedArrayEntries.push_back(std::move(parsed));++mixedOps[3];++n_literal;
+                            mixedArrayValues+=parsed.values.size();flushLiteral();mixedRaw[0].push_back(3);splitOpcode(3);mixedArrayEntries.push_back(std::move(parsed));++mixedOps[3];++n_literal;
                         } else if(markerLine){
                             uint32_t pathId=ensurePathId(lineMarker.path);
                             flushLiteral();mixedRaw[0].push_back(4);put_varint(mixedRaw[0],pathId);put_varint(mixedRaw[0],lineMarker.lineno);
-                            put_varint(mixedRaw[0],lineMarker.flags.size());for(uint8_t flag:lineMarker.flags)mixedRaw[0].push_back(flag);++mixedOps[4];++n_marker;
+                            put_varint(mixedRaw[0],lineMarker.flags.size());for(uint8_t flag:lineMarker.flags)mixedRaw[0].push_back(flag);splitOpcode(4);splitVarint(5,pathId);splitVarint(5,lineMarker.lineno);splitVarint(5,lineMarker.flags.size());if(splitControlCeiling)for(uint8_t flag:lineMarker.flags)splitControl[5].push_back(flag);++mixedOps[4];++n_marker;
                         } else if(sourcePatch&&sourceAdmitted){
                             if(sourcePath==UINT32_MAX)sourcePath=ensurePathId(regionMarker.path);
                             ensureSourceDefinition(regionMarker.path,sourcePath,*regionSource);
                             flushLiteral();mixedRaw[0].push_back(6);put_varint(mixedRaw[0],sourcePath);put_varint(mixedRaw[0],sourceLine);
-                            put_varint(mixedRaw[0],patchPrefix);put_varint(mixedRaw[0],patchSuffix);put_varint(mixedRaw[0],patchMiddle);mixedRaw[1].insert(mixedRaw[1].end(),text+patchPrefix,text+patchPrefix+patchMiddle);
+                            put_varint(mixedRaw[0],patchPrefix);put_varint(mixedRaw[0],patchSuffix);put_varint(mixedRaw[0],patchMiddle);splitOpcode(6);splitVarint(7,sourcePath);splitVarint(7,sourceLine);splitVarint(7,patchPrefix);splitVarint(7,patchSuffix);splitVarint(7,patchMiddle);mixedRaw[1].insert(mixedRaw[1].end(),text+patchPrefix,text+patchPrefix+patchMiddle);
                             if(useAlphaLines){if(alphaPendingGap>UINT32_MAX-patchMiddle){fprintf(stderr,"alpha gap overflow\n");return 2;}alphaGapBytes.insert(alphaGapBytes.end(),text+patchPrefix,text+patchPrefix+patchMiddle);alphaPendingGap+=patchMiddle;}
                             ++mixedOps[6];mixedLiteralRaw+=patchMiddle;mixedSourceBytes+=patchPrefix+patchSuffix;++n_literal;
                         } else {mixedRaw[1].insert(mixedRaw[1].end(),text,text+line.len);literalLength+=line.len;mixedLiteralRaw+=line.len;++n_literal;
@@ -1055,6 +1104,7 @@ int main(int argc,char**argv){
                     offset+=line.len;
                 }
                 flushLiteral();
+                if(splitControlCeiling)put_varint(splitControl[0],splitRegionOps);
                 if(offset!=dict.region_raw_len(r)){fprintf(stderr,"mixed Region length differs\n");return 2;}
                 fknownReg[r]=1;++nr;
             }
@@ -1082,18 +1132,52 @@ int main(int argc,char**argv){
                             if(!patch.kind)++mixedBlobCanonicalExact;else if(patch.kind==1)++mixedBlobCorrected;else ++mixedBlobReplaced;
                         }
                         ++mixedBlobCount;mixedBlobDeflated+=blob.deflated_size;mixedBlobInflated+=blob.inflated_size;
+                        if(blobDumpLengths){const uint32_t n=blob.inflated_size;const uint8_t le[4]={uint8_t(n),uint8_t(n>>8),uint8_t(n>>16),uint8_t(n>>24)};if(fwrite(le,1,sizeof le,blobDumpLengths)!=sizeof le){fprintf(stderr,"short blob length dump write\n");return 2;}}
                     }
                     mixedBlobPatchRaw+=blobPatchRaw.size();CcanonicalBlobs.clear();
+                    if(blobDump&&!blobRaw.empty()&&fwrite(blobRaw.data(),1,blobRaw.size(),blobDump)!=blobRaw.size()){fprintf(stderr,"short blob dump write\n");return 2;}
                     if(!compressedBlobs.empty()){
-                        zstd_ldm_frame_encode(blobZC,blobRaw,zlevel,blobEncoded);
-                        if(!blobPatchRaw.empty())zstd_ldm_frame_encode(blobPatchZC,blobPatchRaw,zlevel,blobPatchEncoded);
-                        size_t patchMetadata=useBlobEagerPatches?compressedBlobs.size():0;
-                        if(useBlobEagerPatches)for(const auto&patch:blobPatches)if(patch.kind)patchMetadata+=varint_size(patch.prefix)+varint_size(patch.suffix)+varint_size(patch.data_size);
-                        double transformWire=blobEncoded.size()+FRAME+(blobPatchEncoded.empty()?0:blobPatchEncoded.size()+FRAME)+patchMetadata;
                         double ordinaryWire=blobOriginalRaw.size()+FRAME;
-                        mixedBlobTransformCandidateWire+=transformWire;mixedBlobOrdinaryCandidateWire+=ordinaryWire;
-                        if(transformWire<ordinaryWire){blobWireMode=useBlobEagerPatches?1:2;++mixedBlobTransformTus;}
-                        else{blobWireMode=3;blobEncoded=std::move(blobOriginalRaw);blobPatchEncoded.clear();++mixedBlobOrdinaryTus;}
+                        mixedBlobOrdinaryCandidateWire+=ordinaryWire;double transformWire=-1,moWire=-1;bool moPolicy=false;
+                        if(useMoFactor){
+                            std::vector<mo_factor::Slice>members;members.reserve(compressedBlobs.size());size_t expectedOffset=0;
+                            for(const auto&blob:compressedBlobs){
+                                if(blob.inflated_offset!=expectedOffset||uint64_t(blob.inflated_offset)+blob.inflated_size>blobRaw.size()){fprintf(stderr,"non-contiguous blob factor input\n");return 2;}
+                                members.push_back({blobRaw.data()+blob.inflated_offset,blob.inflated_size});expectedOffset+=blob.inflated_size;
+                            }
+                            if(expectedOffset!=blobRaw.size()||!Cmo.encode(members,moEncoded)){fprintf(stderr,"MO factor encode failed\n");return 2;}
+                            const std::vector<uint8_t>*parts[4]={&moEncoded.control,&moEncoded.definitions,&moEncoded.translations,&moEncoded.ordinary};
+                            size_t moMetadata=0;
+                            for(size_t part=0;part<4;++part){if(parts[part]->size()>UINT32_MAX){fprintf(stderr,"MO factor part too large\n");return 2;}moRawSizes[part]=uint32_t(parts[part]->size());moMetadata+=varint_size(moRawSizes[part]);moFactorRaw.insert(moFactorRaw.end(),parts[part]->begin(),parts[part]->end());}
+                            // A canonical catalog is only routed through the factor when removing its
+                            // repeated original-string/table material shrinks the uncompressed member
+                            // batch by at least 25%.  This cheap structural decision avoids compressing
+                            // both candidates in the live path.  The all-candidate trace established
+                            // that every qualifying Godot TU wins on the final zstd-3 wire as well.
+                            moPolicy=moEncoded.mo_members&&uint64_t(moFactorRaw.size())*4<=uint64_t(blobRaw.size())*3;
+                            if(moPolicy){
+                                ++mixedBlobMoPolicyTus;
+                                zstd_ldm_frame_encode(blobZC,moFactorRaw,zlevel,moFactorEncoded);
+                                moWire=moFactorEncoded.size()+FRAME+moMetadata;mixedBlobMoCandidateWire+=moWire;
+                                if(moWire<ordinaryWire){
+                                    blobWireMode=4;blobEncoded=std::move(moFactorEncoded);
+                                    if(!Cmo.commit(moEncoded)){fprintf(stderr,"MO factor C commit failed\n");return 2;}
+                                    ++mixedBlobMoTus;mixedBlobMoMembers+=moEncoded.mo_members;mixedBlobMoBytes+=moEncoded.mo_bytes;mixedBlobMoDefinitions+=moEncoded.pending_definitions.size();
+                                }else{blobWireMode=3;blobEncoded=std::move(blobOriginalRaw);++mixedBlobOrdinaryTus;}
+                            }
+                        }
+                        if(!moPolicy){
+                            zstd_ldm_frame_encode(blobZC,blobRaw,zlevel,blobEncoded);
+                            if(!blobPatchRaw.empty())zstd_ldm_frame_encode(blobPatchZC,blobPatchRaw,zlevel,blobPatchEncoded);
+                            size_t patchMetadata=useBlobEagerPatches?compressedBlobs.size():0;
+                            if(useBlobEagerPatches)for(const auto&patch:blobPatches)if(patch.kind)patchMetadata+=varint_size(patch.prefix)+varint_size(patch.suffix)+varint_size(patch.data_size);
+                            transformWire=blobEncoded.size()+FRAME+(blobPatchEncoded.empty()?0:blobPatchEncoded.size()+FRAME)+patchMetadata;
+                            mixedBlobTransformCandidateWire+=transformWire;
+                            if(transformWire<ordinaryWire){blobWireMode=useBlobEagerPatches?1:2;++mixedBlobTransformTus;}
+                            else{blobWireMode=3;blobEncoded=std::move(blobOriginalRaw);blobPatchEncoded.clear();++mixedBlobOrdinaryTus;}
+                        }
+                        if(useMoFactor&&traceMo)fprintf(stderr,"MO TU=%zu members=%zu mo_members=%u blob_raw=%zu mo_raw=%zu policy=%u baseline=%.0f ordinary=%.0f mo=%.0f selected=%u new_originals=%zu\n",
+                            t,compressedBlobs.size(),moEncoded.mo_members,blobRaw.size(),moFactorRaw.size(),unsigned(moPolicy),transformWire,ordinaryWire,moWire,unsigned(blobWireMode),moEncoded.pending_definitions.size());
                     }
                 }
                 std::vector<ByteArrayStyle> styles;styles.reserve(mixedArrayEntries.size());
@@ -1108,6 +1192,7 @@ int main(int argc,char**argv){
                     if(!blobEntry[entry])mixedRaw[3].insert(mixedRaw[3].end(),value.values.begin(),value.values.end());}
                 if(useCompressedBlobs&&!compressedBlobs.empty()){
                     put_varint(mixedRaw[2],blobWireMode);put_varint(mixedRaw[2],ZLIB_VERNUM);put_varint(mixedRaw[2],blobCanonicalLevel);put_varint(mixedRaw[2],compressedBlobs.size());
+                    if(blobWireMode==4)for(uint32_t size:moRawSizes)put_varint(mixedRaw[2],size);
                     for(size_t index=0;index<compressedBlobs.size();++index){const auto&blob=compressedBlobs[index];put_varint(mixedRaw[2],blob.first_entry);put_varint(mixedRaw[2],blob.entry_count);put_varint(mixedRaw[2],blob.deflated_size);put_varint(mixedRaw[2],blob.inflated_size);put_u64le(mixedRaw[2],blob.digest_lo);put_u64le(mixedRaw[2],blob.digest_hi);
                         if(blobWireMode==1){const auto&patch=blobPatches[index];put_varint(mixedRaw[2],patch.kind);if(patch.kind){put_varint(mixedRaw[2],patch.prefix);put_varint(mixedRaw[2],patch.suffix);put_varint(mixedRaw[2],patch.data_size);}}
                     }
@@ -1203,6 +1288,47 @@ int main(int argc,char**argv){
                 alphaInputRaw+=mixedRaw[1].size();alphaEligibleLines+=alphaLines.size();alphaGapRaw+=alphaGapBytes.size();
                 w_linedef+=selectedWire+1;mixedPartWire[1]+=selectedWire;alphaSelectorWire+=1;
             }
+            if(residualDump&&!mixedRaw[1].empty()&&
+               fwrite(mixedRaw[1].data(),1,mixedRaw[1].size(),residualDump)!=mixedRaw[1].size()){
+                fprintf(stderr,"short residual dump write\n");return 2;
+            }
+            for(size_t i=0;i<mixedPartCount;++i) if(mixedDumps[i]&&!mixedRaw[i].empty()&&
+               fwrite(mixedRaw[i].data(),1,mixedRaw[i].size(),mixedDumps[i])!=mixedRaw[i].size()){
+                fprintf(stderr,"short mixed stream dump write part=%zu\n",i);return 2;
+            }
+            if(mixedDumpLengths)for(size_t i=0;i<mixedPartCount;++i){
+                if(mixedRaw[i].size()>UINT32_MAX){fprintf(stderr,"mixed stream dump frame too large\n");return 2;}
+                const uint32_t n=uint32_t(mixedRaw[i].size());
+                const uint8_t le[4]={uint8_t(n),uint8_t(n>>8),uint8_t(n>>16),uint8_t(n>>24)};
+                if(fwrite(le,1,sizeof le,mixedDumpLengths)!=sizeof le){fprintf(stderr,"short mixed stream length write\n");return 2;}
+            }
+            if(splitControlCeiling){
+                std::array<const uint8_t*,8>cursor{},end{};
+                for(size_t i=0;i<splitControl.size();++i){cursor[i]=splitControl[i].data();end[i]=cursor[i]+splitControl[i].size();}
+                auto take=[&](size_t stream){if(cursor[stream]>=end[stream]){fprintf(stderr,"split control truncated stream=%zu\n",stream);exit(2);}uint64_t value=get_varint(cursor[stream]);if(cursor[stream]>end[stream]){fprintf(stderr,"split control overrun stream=%zu\n",stream);exit(2);}return value;};
+                std::vector<uint8_t>rebuilt;
+                const uint64_t regions=take(0);put_varint(rebuilt,regions);
+                if(regions!=missReg.size()){fprintf(stderr,"split control Region count differs\n");return 2;}
+                for(uint64_t region=0;region<regions;++region){
+                    const uint64_t rawLength=take(0),operations=take(0);put_varint(rebuilt,rawLength);
+                    for(uint64_t operation=0;operation<operations;++operation){
+                        if(cursor[1]>=end[1]){fprintf(stderr,"split control opcode truncated\n");return 2;}
+                        const uint8_t opcode=*cursor[1]++;rebuilt.push_back(opcode);
+                        auto copyValues=[&](size_t stream,size_t count){for(size_t value=0;value<count;++value)put_varint(rebuilt,take(stream));};
+                        if(opcode==0)copyValues(2,1);
+                        else if(opcode==1)copyValues(4,3);
+                        else if(opcode==2)copyValues(3,1);
+                        else if(opcode==3){}
+                        else if(opcode==4){copyValues(5,2);const uint64_t flags=take(5);put_varint(rebuilt,flags);if(flags>uint64_t(end[5]-cursor[5])){fprintf(stderr,"split control flags truncated\n");return 2;}rebuilt.insert(rebuilt.end(),cursor[5],cursor[5]+flags);cursor[5]+=flags;}
+                        else if(opcode==5)copyValues(6,2);
+                        else if(opcode==6)copyValues(7,5);
+                        else{fprintf(stderr,"split control bad opcode=%u\n",opcode);return 2;}
+                    }
+                }
+                for(size_t i=0;i<splitControl.size();++i)if(cursor[i]!=end[i]){fprintf(stderr,"split control trailing stream=%zu bytes=%zu\n",i,size_t(end[i]-cursor[i]));return 2;}
+                if(rebuilt!=mixedRaw[0]){fprintf(stderr,"split control reconstruction differs\n");return 2;}
+                for(size_t i=0;i<splitControl.size();++i)splitControlAll[i].insert(splitControlAll[i].end(),splitControl[i].begin(),splitControl[i].end());
+            }
             for(size_t i=0;i<mixedPartCount;++i) if((!useAlphaLines||i!=1)&&!mixedRaw[i].empty()){
                 mixedEncoded[i]=zstd_stream_encode(mixedZC[i],mixedRaw[i],ZSTD_e_flush);mixedZActive[i]=1;
                 double bytes=mixedEncoded[i].size()+FRAME;mixedPartWire[i]+=bytes;(i==0?w_regiondef:w_linedef)+=bytes;
@@ -1280,7 +1406,7 @@ int main(int argc,char**argv){
             if(sp!=se||bp!=be){fprintf(stderr,"mixed source definitions have trailing bytes\n");return 2;}
           } else if(!recovered[5].empty()){fprintf(stderr,"partial mixed source definition streams\n");return 2;}
           const uint8_t*ap=recovered[2].data(),*ae=ap+recovered[2].size();
-          std::vector<ByteArrayStyle> mixedStyles;std::vector<ArrayWireRecord>arrayRecords;std::vector<CompressedBlob>Fblobs;std::vector<BlobPatch>FblobPatches;uint64_t arrayCount=0,arraysUsed=0;bool FblobEager=false,FblobOrdinary=false;int FblobCanonicalLevel=9;size_t expectedPatchRaw=0;
+          std::vector<ByteArrayStyle> mixedStyles;std::vector<ArrayWireRecord>arrayRecords;std::vector<CompressedBlob>Fblobs;std::vector<BlobPatch>FblobPatches;std::array<uint32_t,4>FmoRawSizes{};uint64_t arrayCount=0,arraysUsed=0;bool FblobEager=false,FblobOrdinary=false,FblobMo=false;int FblobCanonicalLevel=9;size_t expectedPatchRaw=0;
           if(!recovered[2].empty()){
             uint64_t styleCount=get_varint(ap);mixedStyles.reserve(styleCount);
             for(uint64_t k=0;k<styleCount;++k){ByteArrayStyle style;uint64_t format=get_varint(ap);if(format>HEX_UU){fprintf(stderr,"bad mixed array format\n");return 2;}style.format=uint8_t(format);
@@ -1288,7 +1414,7 @@ int main(int argc,char**argv){
             arrayCount=get_varint(ap);
             if(arrayCount>UINT32_MAX){fprintf(stderr,"too many mixed arrays\n");return 2;}arrayRecords.reserve(arrayCount);
             for(uint64_t k=0;k<arrayCount;++k){uint64_t style=get_varint(ap),count=get_varint(ap);if(style>=mixedStyles.size()||count>UINT32_MAX){fprintf(stderr,"bad mixed array record\n");return 2;}arrayRecords.push_back({uint32_t(style),uint32_t(count)});}
-            if(useCompressedBlobs&&!blobEncoded.empty()){uint64_t patchMode=get_varint(ap),canonicalVersion=get_varint(ap),canonicalLevel=get_varint(ap),blobCount=get_varint(ap);if(patchMode<1||patchMode>3||canonicalVersion!=ZLIB_VERNUM||canonicalLevel<1||canonicalLevel>9||blobCount>UINT32_MAX){fprintf(stderr,"bad compressed blob header\n");return 2;}FblobEager=patchMode==1;FblobOrdinary=patchMode==3;FblobCanonicalLevel=int(canonicalLevel);Fblobs.reserve(blobCount);if(FblobEager)FblobPatches.reserve(blobCount);uint64_t expandedOffset=0,priorEnd=0;
+            if(useCompressedBlobs&&!blobEncoded.empty()){uint64_t patchMode=get_varint(ap),canonicalVersion=get_varint(ap),canonicalLevel=get_varint(ap),blobCount=get_varint(ap);if(patchMode<1||patchMode>4||canonicalVersion!=ZLIB_VERNUM||canonicalLevel<1||canonicalLevel>9||blobCount>UINT32_MAX){fprintf(stderr,"bad compressed blob header\n");return 2;}FblobEager=patchMode==1;FblobOrdinary=patchMode==3;FblobMo=patchMode==4;FblobCanonicalLevel=int(canonicalLevel);Fblobs.reserve(blobCount);if(FblobEager)FblobPatches.reserve(blobCount);if(FblobMo)for(uint32_t&size:FmoRawSizes){uint64_t value=get_varint(ap);if(value>UINT32_MAX){fprintf(stderr,"bad MO factor part size\n");return 2;}size=uint32_t(value);}uint64_t expandedOffset=0,priorEnd=0;
               for(uint64_t k=0;k<blobCount;++k){CompressedBlob blob;uint64_t first=get_varint(ap),count=get_varint(ap),deflated=get_varint(ap),inflated=get_varint(ap);
                 if(first>UINT32_MAX||count>UINT32_MAX||deflated>UINT32_MAX||inflated>UINT32_MAX||first<priorEnd||first+count>arrayCount){fprintf(stderr,"bad compressed blob descriptor\n");return 2;}
                 blob.first_entry=uint32_t(first);blob.entry_count=uint32_t(count);blob.deflated_size=uint32_t(deflated);blob.inflated_offset=uint32_t(expandedOffset);blob.inflated_size=uint32_t(inflated);
@@ -1306,6 +1432,13 @@ int main(int argc,char**argv){
             if(FblobOrdinary){
               if(blobEncoded.size()!=expectedBlobRaw){fprintf(stderr,"ordinary blob payload size differs\n");return 2;}
               FblobRaw=blobEncoded;
+            } else if(FblobMo){
+              size_t packedSize=0;for(uint32_t size:FmoRawSizes){if(size>SIZE_MAX-packedSize){fprintf(stderr,"MO factor packed size overflow\n");return 2;}packedSize+=size;}
+              std::vector<uint8_t>packed=zstd_frame_decode_exact(blobZD,blobEncoded,packedSize);std::array<std::vector<uint8_t>,4>parts;size_t offset=0;
+              for(size_t part=0;part<4;++part){parts[part].assign(packed.begin()+offset,packed.begin()+offset+FmoRawSizes[part]);offset+=FmoRawSizes[part];}
+              std::vector<uint32_t>lengths;if(!Fmo.decode(parts[0],parts[1],parts[2],parts[3],FblobRaw,lengths)||lengths.size()!=Fblobs.size()){fprintf(stderr,"MO factor decode failed\n");return 2;}
+              for(size_t index=0;index<Fblobs.size();++index)if(lengths[index]!=Fblobs[index].inflated_size){fprintf(stderr,"MO factor member length differs\n");return 2;}
+              if(FblobRaw.size()!=expectedBlobRaw||FblobRaw!=blobRaw||Fmo.size()!=Cmo.size()){fprintf(stderr,"MO factor payload/state differs\n");return 2;}
             } else {
               FblobRaw=zstd_frame_decode_exact(blobZD,blobEncoded,expectedBlobRaw);
               if(FblobRaw!=blobRaw){fprintf(stderr,"compressed blob payload differs\n");return 2;}
@@ -1505,6 +1638,15 @@ int main(int argc,char**argv){
               corpus.raw/1e9/enc_s, corpus.raw/1e9/dec_s, corpus.raw/1e9/std::max(enc_s,dec_s));
     }
     while(ck.size()<ck_f.size()) ck.push_back({ck_f[ck.size()], double(cum_raw)/cum_wire});
+    if(splitControlCeiling){
+      for(size_t i=0;i<splitControlAll.size();++i){
+        splitControlRawBytes[i]=splitControlAll[i].size();
+        if(splitControlAll[i].empty())continue;
+        splitControlWireBytes[i]=zstd_message_roundtrip(z,messageD,splitControlAll[i],zlevel,messageEncoded,messageDecoded)+FRAME;
+        if(messageDecoded!=splitControlAll[i]){fprintf(stderr,"split control aggregate roundtrip differs stream=%zu\n",i);return 2;}
+        splitControlCeilingWire+=splitControlWireBytes[i];
+      }
+    }
     ZSTD_freeCCtx(z);
     ZSTD_freeDCtx(messageD);
     if(sourceCostZ)ZSTD_freeCCtx(sourceCostZ);
@@ -1516,12 +1658,17 @@ int main(int argc,char**argv){
     if(blobPatchZD)ZSTD_freeDCtx(blobPatchZD);
     if(alphaZC)ZSTD_freeCCtx(alphaZC);
     if(alphaZD)ZSTD_freeDCtx(alphaZD);
+    if(residualDump&&fclose(residualDump)!=0){perror(residualDumpPath);return 2;}
+    if(blobDump&&fclose(blobDump)!=0){perror(blobDumpPath);return 2;}
+    if(blobDumpLengths&&fclose(blobDumpLengths)!=0){fprintf(stderr,"blob length dump close failed\n");return 2;}
+    for(FILE*f:mixedDumps)if(f&&fclose(f)!=0){fprintf(stderr,"mixed stream dump close failed\n");return 2;}
+    if(mixedDumpLengths&&fclose(mixedDumpLengths)!=0){fprintf(stderr,"mixed stream length close failed\n");return 2;}
 
     double totalwire = w_root+w_linedef+w_regiondef+w_pathdef+w_blockdef+w_missing+w_framing;
     double MiB=1048576.0;
     const char* structure_name=usePriorRoot?"V1+P22(ROOT_SLICE)":(useS1?"V1+S1(LZ blocks)":"V1");
-    const char* line_name=useMixedRegions?(useCompressedBlobs?"+P26(mixed-regions+BYTE_ARRAY+BLOB)":(useByteArrayLines?"+P24(mixed-regions+BYTE_ARRAY)":"+P24(mixed-regions)")):(useByteArrayLines?"+P21(BYTE_ARRAY)":(useSortedLines?"+P9(sorted-lines)":""));
-    printf("\n==== CODEC-50 (%s%s%s%s%s%s%s, z%d) — %s ====\n", structure_name, useD1?"+D1":"", line_name, useAlphaLines?"+P4(ALPHA_LINES)":"", useProjectSource?"+SOURCE_PACKAGE":"", (useD2mine?"+D2(inline)":(useD2?"+D2(helper)":"")), useDirectOrdinals?"+DIRECT_ORDINALS":"", zlevel, manifest);
+    const char* line_name=useMixedRegions?(useCompressedBlobs?(useMoFactor?"+P27(mixed-regions+BYTE_ARRAY+BLOB+MO)":"+P26(mixed-regions+BYTE_ARRAY+BLOB)"):(useByteArrayLines?"+P24(mixed-regions+BYTE_ARRAY)":"+P24(mixed-regions)")):(useByteArrayLines?"+P21(BYTE_ARRAY)":(useSortedLines?"+P9(sorted-lines)":""));
+    printf("\n==== CODEC-50 (%s%s%s%s%s%s%s%s, z%d) — %s ====\n", structure_name, useD1?"+D1":"", line_name, useAlphaLines?"+P4(ALPHA_LINES)":"", useResidualLdm?"+RESIDUAL_LDM":"", useProjectSource?"+SOURCE_PACKAGE":"", (useD2mine?"+D2(inline)":(useD2?"+D2(helper)":"")), useDirectOrdinals?"+DIRECT_ORDINALS":"", zlevel, manifest);
     printf("byte-exact=%s  TUs=%zu raw=%.1f MiB regions=%u distinct_lines=%u paths=%zu blocks=%zu (marker_lines=%llu literal_lines=%llu)\n",
         byteexact?"OK":"FAIL",TUs,corpus.raw/MiB,NREG,dict.distinct(),paths.size(),boff2.size()-1,(unsigned long long)n_marker,(unsigned long long)n_literal);
     printf("wire by category (post-z%d, bytes): root=%.0f line_def=%.0f region_def=%.0f block_def=%.0f path_def=%.0f missing=%.0f framing=%.0f  TOTAL=%.0f (%.2f MiB)\n",
@@ -1540,10 +1687,18 @@ int main(int argc,char**argv){
         (unsigned long long)mixedBlobPatchRaw,mixedBlobPatchWire,(unsigned long long)mixedBlobCanonicalExact,(unsigned long long)mixedBlobCorrected,(unsigned long long)mixedBlobReplaced,
         mixedBlobTransformCandidateWire,mixedBlobOrdinaryCandidateWire,(unsigned long long)mixedBlobTransformTus,(unsigned long long)mixedBlobOrdinaryTus,
         (unsigned long long)mixedBlobFallbacks,mixedBlobFallbackRequestWire,mixedBlobFallbackReplyWire,blobThreads,useBlobEagerPatches?"eager-patch":"lazy-reply",zlibVersion(),blobCanonicalLevel);
+    if(useMoFactor)printf("MO factor: policy_tus=%llu candidate_wire=%.0f selected_tus=%llu members=%llu member_raw=%llu new_originals=%llu C_dictionary=%u F_dictionary=%u C_string_bytes=%llu F_string_bytes=%llu\n",
+        (unsigned long long)mixedBlobMoPolicyTus,mixedBlobMoCandidateWire,(unsigned long long)mixedBlobMoTus,(unsigned long long)mixedBlobMoMembers,(unsigned long long)mixedBlobMoBytes,
+        (unsigned long long)mixedBlobMoDefinitions,Cmo.size(),Fmo.size(),(unsigned long long)Cmo.string_bytes(),(unsigned long long)Fmo.string_bytes());
     if(useAlphaLines)printf("alpha lines: input_raw=%llu eligible_lines=%llu gap_raw=%llu ordinary_candidate_wire=%.0f literal_keyword_candidate_wire=%.0f parameterized_keyword_candidate_wire=%.0f best_alpha_candidate_wire=%.0f selected_wire=%.0f selector_wire=%.0f control_wire=%.0f data_wire=%.0f selected_tus=%llu ordinary_tus=%llu literal_keyword_tus=%llu parameterized_keyword_tus=%llu rules=%llu instances=%llu covered_raw=%llu literal_fallbacks=%llu unique_slots=%llu slot_occurrences=%llu lexicon_entries=%llu lexicon_references=%llu\n",
         (unsigned long long)alphaInputRaw,(unsigned long long)alphaEligibleLines,(unsigned long long)alphaGapRaw,alphaOrdinaryCandidateWire,alphaLiteralKeywordCandidateWire,alphaParameterizedKeywordCandidateWire,alphaBestCandidateWire,alphaSelectedWire,alphaSelectorWire,alphaControlWire,alphaDataWire,
         (unsigned long long)alphaSelectedTus,(unsigned long long)alphaOrdinaryTus,(unsigned long long)alphaLiteralKeywordTus,(unsigned long long)alphaParameterizedKeywordTus,
         (unsigned long long)alphaStats.rules,(unsigned long long)alphaStats.instances,(unsigned long long)alphaStats.template_input_bytes,(unsigned long long)alphaStats.literal_fallbacks,(unsigned long long)alphaStats.unique_slots,(unsigned long long)alphaStats.slot_occurrences,(unsigned long long)alphaStats.lexicon_entries,(unsigned long long)alphaStats.lexicon_references);
+    if(useResidualLdm)printf("residual LDM: window_log=27 literal_wire=%.0f raw_literal=%llu\n",mixedPartWire[1],(unsigned long long)mixedLiteralRaw);
+    if(splitControlCeiling)printf("split control whole-run ceiling: wire=%.0f baseline=%.0f saving=%.0f raw=[%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu] wire_parts=[%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu]\n",
+        splitControlCeilingWire,mixedPartWire[0],mixedPartWire[0]-splitControlCeilingWire,
+        (unsigned long long)splitControlRawBytes[0],(unsigned long long)splitControlRawBytes[1],(unsigned long long)splitControlRawBytes[2],(unsigned long long)splitControlRawBytes[3],(unsigned long long)splitControlRawBytes[4],(unsigned long long)splitControlRawBytes[5],(unsigned long long)splitControlRawBytes[6],(unsigned long long)splitControlRawBytes[7],
+        (unsigned long long)splitControlWireBytes[0],(unsigned long long)splitControlWireBytes[1],(unsigned long long)splitControlWireBytes[2],(unsigned long long)splitControlWireBytes[3],(unsigned long long)splitControlWireBytes[4],(unsigned long long)splitControlWireBytes[5],(unsigned long long)splitControlWireBytes[6],(unsigned long long)splitControlWireBytes[7]);
     if(useKeyMap)printf("key map: half_cold_bit=%d preloaded_regions=%llu preloaded_raw_bytes=%llu associated_regions=%llu association_wire=%.0f missing_reply_wire=%.0f\n",
         halfColdBit,(unsigned long long)preloadedRegionCount,(unsigned long long)preloadedRegionBytes,
         (unsigned long long)associatedRegionCount,mixedAssociationWire,mixedMissingRequestWire);
