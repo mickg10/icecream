@@ -1,0 +1,66 @@
+{
+  "candidate_limit": 4,
+  "exact": true,
+  "experiment": "exact causal prior-frame byte copy over P21 components",
+  "index_stride": 128,
+  "max_tus": 0,
+  "rows": [
+    {
+      "baseline_component_wire": {
+        "array_control": 91,
+        "array_values": 1245,
+        "rest_lcp": 52783,
+        "rest_length": 61020,
+        "rest_suffix": 583839
+      },
+      "baseline_wire_bytes": 699008,
+      "candidate_limit": 4,
+      "component_copied_bytes": {
+        "array_control": 0,
+        "array_values": 0,
+        "rest_lcp": 0,
+        "rest_length": 0,
+        "rest_suffix": 30870
+      },
+      "component_copies": {
+        "array_control": 0,
+        "array_values": 0,
+        "rest_lcp": 0,
+        "rest_length": 0,
+        "rest_suffix": 90
+      },
+      "component_input_bytes": {
+        "array_control": 269,
+        "array_values": 1255,
+        "rest_lcp": 84887,
+        "rest_length": 83692,
+        "rest_suffix": 2935345
+      },
+      "component_wire": {
+        "array_control": 101,
+        "array_values": 1253,
+        "rest_lcp": 52964,
+        "rest_length": 61189,
+        "rest_suffix": 584707
+      },
+      "corpus": "fmt",
+      "decode_seconds": 0.07943281601183116,
+      "encode_seconds": 4.016167943016626,
+      "encoder_index_logical_bytes": 386168,
+      "exact": true,
+      "index_stride": 128,
+      "level": 3,
+      "line_bytes": 4956020,
+      "prior_byte_wire_bytes": 700244,
+      "raw_bytes": 136350082,
+      "receiver_logical_bytes": 3106240,
+      "saving_bytes": -1236,
+      "saving_fraction": -0.0017682201062076963,
+      "seed_length": 256,
+      "selector_wire_bytes": 30,
+      "tus": 50,
+      "wire_bytes": 700244
+    }
+  ],
+  "seed_length": 256
+}

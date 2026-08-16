@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import random
 import tempfile
 import unittest
 from pathlib import Path
@@ -34,6 +35,13 @@ from pretrained_superblocks import (
     package_from_keys,
     put_varint,
 )
+from prior_root_copy import (
+    ExactState as PriorRootState,
+    PriorRootIndex,
+    deserialize as deserialize_prior_root,
+    serialize as serialize_prior_root,
+)
+from prior_byte_copy import PriorByteIndex, decode as decode_prior_bytes, encode as encode_prior_bytes
 
 
 def curve(points: int, raw: int, wire: int) -> list[dict]:
@@ -82,6 +90,116 @@ class LearningGateTest(unittest.TestCase):
 
 
 class FirstUseTest(unittest.TestCase):
+    def test_prior_byte_copy_replays_long_sparse_match(self) -> None:
+        first = bytes(range(256)) * 4
+        second = b"new-prefix" + first[123:900] + b"new-suffix"
+        index = PriorByteIndex(seed_length=16, candidates=4, stride=8)
+        first_raw, first_copies, _ = encode_prior_bytes(first, index)
+        self.assertEqual(decode_prior_bytes(first_raw, index.roots), first)
+        self.assertEqual(first_copies, 0)
+        index.add(first)
+
+        second_raw, copies, copied = encode_prior_bytes(second, index)
+        self.assertEqual(decode_prior_bytes(second_raw, index.roots), second)
+        self.assertGreater(copies, 0)
+        self.assertGreaterEqual(copied, 760)
+        with self.assertRaises(ValueError):
+            decode_prior_bytes(second_raw[:-1], index.roots)
+
+    def test_prior_root_codec_replays_exact_variable_length_copy(self) -> None:
+        first = [(100 + i, 200 + i, 16) for i in range(24)]
+        second = [
+            (999, 1_999, 32),
+            *first[3:21],
+            (1_000, 2_000, 32),
+        ]
+        sender = PriorRootState()
+        receiver = PriorRootState()
+        index = PriorRootIndex(4, 4)
+
+        first_raw, first_new, _, _ = serialize_prior_root(
+            first, sender, index, "greedy"
+        )
+        first_recovered, first_received = deserialize_prior_root(first_raw, receiver)
+        self.assertEqual(first_recovered, first)
+        sender.commit(first, first_new)
+        receiver.commit(first_recovered, first_received)
+        index.add(first)
+
+        second_raw, second_new, copies, copied = serialize_prior_root(
+            second, sender, index, "greedy"
+        )
+        second_recovered, second_received = deserialize_prior_root(second_raw, receiver)
+        self.assertEqual(second_recovered, second)
+        self.assertEqual(second_received, second_new)
+        self.assertEqual(copies, 1)
+        self.assertEqual(copied, 18)
+        with self.assertRaises(ValueError):
+            deserialize_prior_root(second_raw[:-1], receiver)
+        self.assertEqual(index.root_regions, len(first))
+        self.assertGreater(index.indexed_windows, 0)
+        self.assertGreater(index.encoder_logical_bytes, index.root_vector_logical_bytes)
+
+    def test_prior_root_sparse_index_retains_long_match(self) -> None:
+        first = [(100 + i, 200 + i, 16) for i in range(24)]
+        second = [(999, 1_999, 32), *first, (1_000, 2_000, 32)]
+        sender = PriorRootState()
+        receiver = PriorRootState()
+        index = PriorRootIndex(4, 4, stride=8)
+        first_raw, first_new, _, _ = serialize_prior_root(
+            first, sender, index, "greedy"
+        )
+        first_recovered, first_received = deserialize_prior_root(first_raw, receiver)
+        sender.commit(first, first_new)
+        receiver.commit(first_recovered, first_received)
+        index.add(first)
+
+        second_raw, second_new, copies, copied = serialize_prior_root(
+            second, sender, index, "greedy"
+        )
+        recovered, received = deserialize_prior_root(second_raw, receiver)
+        self.assertEqual(recovered, second)
+        self.assertEqual(received, second_new)
+        self.assertGreater(copies, 0)
+        self.assertGreaterEqual(copied, len(first) - index.stride + 1)
+
+    def test_prior_root_codec_survives_causal_mutation_and_reorder(self) -> None:
+        randomizer = random.Random(0x16C0DE)
+        for parse_policy in ("greedy", "dp"):
+            sender = PriorRootState()
+            receiver = PriorRootState()
+            index = PriorRootIndex(4, 4, stride=3)
+            root = [(100 + i, 1_000 + i, 8 + i % 7) for i in range(64)]
+            for ordinal in range(40):
+                if ordinal:
+                    left = randomizer.randrange(0, len(root) - 8)
+                    right = randomizer.randrange(left + 4, len(root))
+                    middle = root[left:right]
+                    if ordinal % 3 == 0:
+                        middle = list(reversed(middle))
+                    new = (
+                        10_000 + ordinal,
+                        20_000 + ordinal,
+                        16 + ordinal % 11,
+                    )
+                    root = [*root[:left], new, *middle, *root[right:]]
+
+                raw, definitions, _, _ = serialize_prior_root(
+                    root,
+                    sender,
+                    index,
+                    parse_policy,
+                )
+                recovered, received = deserialize_prior_root(raw, receiver)
+                self.assertEqual(recovered, root)
+                self.assertEqual(received, definitions)
+                sender.commit(root, definitions)
+                receiver.commit(recovered, received)
+                index.add(root)
+                self.assertEqual(sender.ids, receiver.ids)
+                self.assertEqual(sender.values, receiver.values)
+                self.assertEqual(sender.roots, receiver.roots)
+
     def test_mixed_seed_definition_batch_uses_dense_and_exact_forms(self) -> None:
         known = [(10 + i, 20 + i, 16) for i in range(4)]
         unseen = [(100 + i, 200 + i, 32) for i in range(4)]
@@ -362,6 +480,35 @@ class FirstUseTest(unittest.TestCase):
         self.assertLessEqual(
             hybrid_match.as_dict()["charged_wire_bytes"],
             context_match.as_dict()["charged_wire_bytes"],
+        )
+
+        root_copy_match = evaluate_online(
+            tus,
+            "run-vs-tu-match-hybrid-root-copy-test",
+            empty,
+            empty_frame,
+            3,
+            (8,),
+            "run-vs-tu-match-hybrid",
+            "greedy",
+            0,
+            0,
+            False,
+            2,
+            4_096,
+            4_096,
+            100,
+            8_192,
+            "first-use",
+            "ids32",
+            prior_root_copy=True,
+        )
+        self.assertTrue(root_copy_match.exact)
+        self.assertGreater(root_copy_match.root_copy_selected_tus, 0)
+        self.assertGreater(root_copy_match.root_copy_copied_regions, 0)
+        self.assertLessEqual(
+            root_copy_match.as_dict()["charged_wire_bytes"],
+            hybrid_match.as_dict()["charged_wire_bytes"],
         )
 
 

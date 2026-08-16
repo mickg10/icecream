@@ -1,0 +1,120 @@
+{
+  "checkpoints": [
+    {
+      "control_ratio": 40.873242455462766,
+      "control_wire_bytes": 965765,
+      "corpora": 16,
+      "raw_bytes": 39473947,
+      "root_ratio": 40.873242455462766,
+      "root_wire_bytes": 965765,
+      "saving_bytes": 0,
+      "saving_fraction": 0.0,
+      "strict_win_corpora": 0,
+      "tu": 1
+    },
+    {
+      "control_ratio": 58.41158554648614,
+      "control_wire_bytes": 1535931,
+      "corpora": 16,
+      "raw_bytes": 89716165,
+      "root_ratio": 60.21970863476917,
+      "root_wire_bytes": 1489814,
+      "saving_bytes": 46117,
+      "saving_fraction": 0.030025437340609695,
+      "strict_win_corpora": 11,
+      "tu": 2
+    },
+    {
+      "control_ratio": 105.67005117040367,
+      "control_wire_bytes": 2283742,
+      "corpora": 16,
+      "raw_bytes": 241323134,
+      "root_ratio": 120.31919872004212,
+      "root_wire_bytes": 2005691,
+      "saving_bytes": 278051,
+      "saving_fraction": 0.12175236957589786,
+      "strict_win_corpora": 16,
+      "tu": 5
+    },
+    {
+      "control_ratio": 156.4772159687523,
+      "control_wire_bytes": 3045598,
+      "corpora": 16,
+      "raw_bytes": 476566696,
+      "root_ratio": 190.1620744197776,
+      "root_wire_bytes": 2506108,
+      "saving_bytes": 539490,
+      "saving_fraction": 0.17713762617390738,
+      "strict_win_corpora": 16,
+      "tu": 10
+    },
+    {
+      "control_ratio": 251.31283016420642,
+      "control_wire_bytes": 4672107,
+      "corpora": 16,
+      "raw_bytes": 1174160433,
+      "root_ratio": 321.77048046867935,
+      "root_wire_bytes": 3649062,
+      "saving_bytes": 1023045,
+      "saving_fraction": 0.21896865803801158,
+      "strict_win_corpora": 16,
+      "tu": 25
+    },
+    {
+      "control_ratio": 317.4765673760933,
+      "control_wire_bytes": 6721249,
+      "corpora": 15,
+      "raw_bytes": 2133839061,
+      "root_ratio": 405.0547702308227,
+      "root_wire_bytes": 5268026,
+      "saving_bytes": 1453223,
+      "saving_fraction": 0.21621323655766955,
+      "strict_win_corpora": 15,
+      "tu": 50
+    },
+    {
+      "control_ratio": 274.16392956414853,
+      "control_wire_bytes": 11419923,
+      "corpora": 10,
+      "raw_bytes": 3130930965,
+      "root_ratio": 321.44689043326883,
+      "root_wire_bytes": 9740119,
+      "saving_bytes": 1679804,
+      "saving_fraction": 0.14709416166816536,
+      "strict_win_corpora": 10,
+      "tu": 100
+    },
+    {
+      "control_ratio": 329.30821517260034,
+      "control_wire_bytes": 17094723,
+      "corpora": 9,
+      "raw_bytes": 5629432720,
+      "root_ratio": 390.360732437683,
+      "root_wire_bytes": 14421104,
+      "saving_bytes": 2673619,
+      "saving_fraction": 0.15640025287335746,
+      "strict_win_corpora": 9,
+      "tu": 200
+    }
+  ],
+  "experiment": "paired exact prior-root learning curve",
+  "first_cumulative_win_tu": {
+    "abseil": 3,
+    "catch2": 2,
+    "cereal": 2,
+    "duckdb": 3,
+    "eigen": 2,
+    "fmt": 2,
+    "godot": 2,
+    "leveldb": 2,
+    "llvm": 3,
+    "nlohmann-json": 3,
+    "opencv": 3,
+    "range-v3": 2,
+    "re2": 2,
+    "rocksdb": 2,
+    "simdjson": 2,
+    "spdlog": 2
+  },
+  "scenario": "standard"
+}

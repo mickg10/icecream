@@ -1,0 +1,66 @@
+{
+  "candidate_limit": 4,
+  "exact": true,
+  "experiment": "exact causal prior-frame byte copy over P21 components",
+  "index_stride": 128,
+  "max_tus": 0,
+  "rows": [
+    {
+      "baseline_component_wire": {
+        "array_control": 540164,
+        "array_values": 37054475,
+        "rest_lcp": 860540,
+        "rest_length": 1061482,
+        "rest_suffix": 12286777
+      },
+      "baseline_wire_bytes": 51805645,
+      "candidate_limit": 4,
+      "component_copied_bytes": {
+        "array_control": 1588,
+        "array_values": 0,
+        "rest_lcp": 0,
+        "rest_length": 1772,
+        "rest_suffix": 9988003
+      },
+      "component_copies": {
+        "array_control": 6,
+        "array_values": 0,
+        "rest_lcp": 0,
+        "rest_length": 5,
+        "rest_suffix": 19993
+      },
+      "component_input_bytes": {
+        "array_control": 2935143,
+        "array_values": 38397333,
+        "rest_lcp": 1186900,
+        "rest_length": 1237666,
+        "rest_suffix": 73289782
+      },
+      "component_wire": {
+        "array_control": 540294,
+        "array_values": 37054865,
+        "rest_lcp": 868434,
+        "rest_length": 1075271,
+        "rest_suffix": 12116533
+      },
+      "corpus": "godot",
+      "decode_seconds": 14.304249414941296,
+      "encode_seconds": 140.95658026705496,
+      "encoder_index_logical_bytes": 14387840,
+      "exact": true,
+      "index_stride": 128,
+      "level": 3,
+      "line_bytes": 272752620,
+      "prior_byte_wire_bytes": 51657604,
+      "raw_bytes": 5932762185,
+      "receiver_logical_bytes": 117100920,
+      "saving_bytes": 148041,
+      "saving_fraction": 0.002857622948232774,
+      "seed_length": 256,
+      "selector_wire_bytes": 2207,
+      "tus": 2207,
+      "wire_bytes": 51657604
+    }
+  ],
+  "seed_length": 256
+}

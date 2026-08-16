@@ -1,0 +1,495 @@
+{
+  "exact": true,
+  "experiment": "complete executed complementary half-warm Line cache",
+  "level": 3,
+  "minimum_per_corpus_ratio_across_both_variants": 109.95539853667073,
+  "partition": "blake2b-64(person=ice-hc50) low bit; cold_bit 0 and 1",
+  "per_corpus": [
+    {
+      "best_ratio": 609.5617478496038,
+      "corpus": "llvm",
+      "raw_bytes": 3620271340,
+      "structural_wire_bytes": 1642398,
+      "variants": [
+        {
+          "cold_bit": 0,
+          "complete_ratio": 609.4752390622125,
+          "complete_wire_bytes": 5939981,
+          "line_wire_bytes": 4297583,
+          "missing_line_bytes": 20018717,
+          "missing_lines": 385589,
+          "preinstalled_line_bytes": 20006507,
+          "preinstalled_lines": 385466
+        },
+        {
+          "cold_bit": 1,
+          "complete_ratio": 609.5617478496038,
+          "complete_wire_bytes": 5939138,
+          "line_wire_bytes": 4296740,
+          "missing_line_bytes": 20006507,
+          "missing_lines": 385466,
+          "preinstalled_line_bytes": 20018717,
+          "preinstalled_lines": 385589
+        }
+      ],
+      "worst_ratio": 609.4752390622125
+    },
+    {
+      "best_ratio": 201.6498358186351,
+      "corpus": "rocksdb",
+      "raw_bytes": 3114320596,
+      "structural_wire_bytes": 12857339,
+      "variants": [
+        {
+          "cold_bit": 0,
+          "complete_ratio": 201.6498358186351,
+          "complete_wire_bytes": 15444201,
+          "line_wire_bytes": 2586862,
+          "missing_line_bytes": 22333645,
+          "missing_lines": 293751,
+          "preinstalled_line_bytes": 22368157,
+          "preinstalled_lines": 293862
+        },
+        {
+          "cold_bit": 1,
+          "complete_ratio": 201.64211962194116,
+          "complete_wire_bytes": 15444792,
+          "line_wire_bytes": 2587453,
+          "missing_line_bytes": 22368157,
+          "missing_lines": 293862,
+          "preinstalled_line_bytes": 22333645,
+          "preinstalled_lines": 293751
+        }
+      ],
+      "worst_ratio": 201.64211962194116
+    },
+    {
+      "best_ratio": 245.4329094620664,
+      "corpus": "duckdb",
+      "raw_bytes": 1985715205,
+      "structural_wire_bytes": 4167260,
+      "variants": [
+        {
+          "cold_bit": 0,
+          "complete_ratio": 245.4329094620664,
+          "complete_wire_bytes": 8090664,
+          "line_wire_bytes": 3923404,
+          "missing_line_bytes": 27782436,
+          "missing_lines": 318555,
+          "preinstalled_line_bytes": 26950991,
+          "preinstalled_lines": 319055
+        },
+        {
+          "cold_bit": 1,
+          "complete_ratio": 242.688830985029,
+          "complete_wire_bytes": 8182145,
+          "line_wire_bytes": 4014885,
+          "missing_line_bytes": 26950991,
+          "missing_lines": 319055,
+          "preinstalled_line_bytes": 27782436,
+          "preinstalled_lines": 318555
+        }
+      ],
+      "worst_ratio": 242.688830985029
+    },
+    {
+      "best_ratio": 334.0489023468638,
+      "corpus": "abseil",
+      "raw_bytes": 2581008467,
+      "structural_wire_bytes": 5804742,
+      "variants": [
+        {
+          "cold_bit": 0,
+          "complete_ratio": 333.9175642908874,
+          "complete_wire_bytes": 7729478,
+          "line_wire_bytes": 1924736,
+          "missing_line_bytes": 14386981,
+          "missing_lines": 188613,
+          "preinstalled_line_bytes": 14569516,
+          "preinstalled_lines": 188222
+        },
+        {
+          "cold_bit": 1,
+          "complete_ratio": 334.0489023468638,
+          "complete_wire_bytes": 7726439,
+          "line_wire_bytes": 1921697,
+          "missing_line_bytes": 14569516,
+          "missing_lines": 188222,
+          "preinstalled_line_bytes": 14386981,
+          "preinstalled_lines": 188613
+        }
+      ],
+      "worst_ratio": 333.9175642908874
+    },
+    {
+      "best_ratio": 776.721014947913,
+      "corpus": "opencv",
+      "raw_bytes": 4630994774,
+      "structural_wire_bytes": 2123347,
+      "variants": [
+        {
+          "cold_bit": 0,
+          "complete_ratio": 774.9726515172814,
+          "complete_wire_bytes": 5975688,
+          "line_wire_bytes": 3852341,
+          "missing_line_bytes": 26831334,
+          "missing_lines": 292936,
+          "preinstalled_line_bytes": 26731651,
+          "preinstalled_lines": 293163
+        },
+        {
+          "cold_bit": 1,
+          "complete_ratio": 776.721014947913,
+          "complete_wire_bytes": 5962237,
+          "line_wire_bytes": 3838890,
+          "missing_line_bytes": 26731651,
+          "missing_lines": 293163,
+          "preinstalled_line_bytes": 26831334,
+          "preinstalled_lines": 292936
+        }
+      ],
+      "worst_ratio": 774.9726515172814
+    },
+    {
+      "best_ratio": 199.56474724530406,
+      "corpus": "godot",
+      "raw_bytes": 5932762185,
+      "structural_wire_bytes": 2580411,
+      "variants": [
+        {
+          "cold_bit": 0,
+          "complete_ratio": 199.56474724530406,
+          "complete_wire_bytes": 29728508,
+          "line_wire_bytes": 27148097,
+          "missing_line_bytes": 135997912,
+          "missing_lines": 1320238,
+          "preinstalled_line_bytes": 136754708,
+          "preinstalled_lines": 1320887
+        },
+        {
+          "cold_bit": 1,
+          "complete_ratio": 198.70800073752326,
+          "complete_wire_bytes": 29856685,
+          "line_wire_bytes": 27276274,
+          "missing_line_bytes": 136754708,
+          "missing_lines": 1320887,
+          "preinstalled_line_bytes": 135997912,
+          "preinstalled_lines": 1320238
+        }
+      ],
+      "worst_ratio": 198.70800073752326
+    },
+    {
+      "best_ratio": 110.36426417797492,
+      "corpus": "fmt",
+      "raw_bytes": 136350082,
+      "structural_wire_bytes": 825016,
+      "variants": [
+        {
+          "cold_bit": 0,
+          "complete_ratio": 109.95539853667073,
+          "complete_wire_bytes": 1240049,
+          "line_wire_bytes": 415033,
+          "missing_line_bytes": 2490356,
+          "missing_lines": 41188,
+          "preinstalled_line_bytes": 2465664,
+          "preinstalled_lines": 40910
+        },
+        {
+          "cold_bit": 1,
+          "complete_ratio": 110.36426417797492,
+          "complete_wire_bytes": 1235455,
+          "line_wire_bytes": 410439,
+          "missing_line_bytes": 2465664,
+          "missing_lines": 40910,
+          "preinstalled_line_bytes": 2490356,
+          "preinstalled_lines": 41188
+        }
+      ],
+      "worst_ratio": 109.95539853667073
+    },
+    {
+      "best_ratio": 203.09326837726812,
+      "corpus": "spdlog",
+      "raw_bytes": 98384472,
+      "structural_wire_bytes": 185959,
+      "variants": [
+        {
+          "cold_bit": 0,
+          "complete_ratio": 202.3485015826397,
+          "complete_wire_bytes": 486213,
+          "line_wire_bytes": 300254,
+          "missing_line_bytes": 1552285,
+          "missing_lines": 28014,
+          "preinstalled_line_bytes": 1549843,
+          "preinstalled_lines": 27969
+        },
+        {
+          "cold_bit": 1,
+          "complete_ratio": 203.09326837726812,
+          "complete_wire_bytes": 484430,
+          "line_wire_bytes": 298471,
+          "missing_line_bytes": 1549843,
+          "missing_lines": 27969,
+          "preinstalled_line_bytes": 1552285,
+          "preinstalled_lines": 28014
+        }
+      ],
+      "worst_ratio": 202.3485015826397
+    },
+    {
+      "best_ratio": 872.0742059977573,
+      "corpus": "catch2",
+      "raw_bytes": 947252235,
+      "structural_wire_bytes": 674388,
+      "variants": [
+        {
+          "cold_bit": 0,
+          "complete_ratio": 869.9517980338998,
+          "complete_wire_bytes": 1088856,
+          "line_wire_bytes": 414468,
+          "missing_line_bytes": 2805859,
+          "missing_lines": 35470,
+          "preinstalled_line_bytes": 2782181,
+          "preinstalled_lines": 35248
+        },
+        {
+          "cold_bit": 1,
+          "complete_ratio": 872.0742059977573,
+          "complete_wire_bytes": 1086206,
+          "line_wire_bytes": 411818,
+          "missing_line_bytes": 2782181,
+          "missing_lines": 35248,
+          "preinstalled_line_bytes": 2805859,
+          "preinstalled_lines": 35470
+        }
+      ],
+      "worst_ratio": 869.9517980338998
+    },
+    {
+      "best_ratio": 343.8900963512873,
+      "corpus": "nlohmann-json",
+      "raw_bytes": 293917707,
+      "structural_wire_bytes": 350548,
+      "variants": [
+        {
+          "cold_bit": 0,
+          "complete_ratio": 342.52190831127876,
+          "complete_wire_bytes": 858099,
+          "line_wire_bytes": 507551,
+          "missing_line_bytes": 3987261,
+          "missing_lines": 43494,
+          "preinstalled_line_bytes": 3993523,
+          "preinstalled_lines": 43075
+        },
+        {
+          "cold_bit": 1,
+          "complete_ratio": 343.8900963512873,
+          "complete_wire_bytes": 854685,
+          "line_wire_bytes": 504137,
+          "missing_line_bytes": 3993523,
+          "missing_lines": 43075,
+          "preinstalled_line_bytes": 3987261,
+          "preinstalled_lines": 43494
+        }
+      ],
+      "worst_ratio": 342.52190831127876
+    },
+    {
+      "best_ratio": 867.2866407049726,
+      "corpus": "range-v3",
+      "raw_bytes": 632049016,
+      "structural_wire_bytes": 296158,
+      "variants": [
+        {
+          "cold_bit": 0,
+          "complete_ratio": 866.0970090453528,
+          "complete_wire_bytes": 729767,
+          "line_wire_bytes": 433609,
+          "missing_line_bytes": 2573079,
+          "missing_lines": 38320,
+          "preinstalled_line_bytes": 2598833,
+          "preinstalled_lines": 38241
+        },
+        {
+          "cold_bit": 1,
+          "complete_ratio": 867.2866407049726,
+          "complete_wire_bytes": 728766,
+          "line_wire_bytes": 432608,
+          "missing_line_bytes": 2598833,
+          "missing_lines": 38241,
+          "preinstalled_line_bytes": 2573079,
+          "preinstalled_lines": 38320
+        }
+      ],
+      "worst_ratio": 866.0970090453528
+    },
+    {
+      "best_ratio": 3807.1571216548446,
+      "corpus": "eigen",
+      "raw_bytes": 3532268956,
+      "structural_wire_bytes": 299675,
+      "variants": [
+        {
+          "cold_bit": 0,
+          "complete_ratio": 3772.3366906567016,
+          "complete_wire_bytes": 936361,
+          "line_wire_bytes": 636686,
+          "missing_line_bytes": 3495082,
+          "missing_lines": 49755,
+          "preinstalled_line_bytes": 3421398,
+          "preinstalled_lines": 49353
+        },
+        {
+          "cold_bit": 1,
+          "complete_ratio": 3807.1571216548446,
+          "complete_wire_bytes": 927797,
+          "line_wire_bytes": 628122,
+          "missing_line_bytes": 3421398,
+          "missing_lines": 49353,
+          "preinstalled_line_bytes": 3495082,
+          "preinstalled_lines": 49755
+        }
+      ],
+      "worst_ratio": 3772.3366906567016
+    },
+    {
+      "best_ratio": 270.15262208541446,
+      "corpus": "re2",
+      "raw_bytes": 110231455,
+      "structural_wire_bytes": 139059,
+      "variants": [
+        {
+          "cold_bit": 0,
+          "complete_ratio": 269.41443522211796,
+          "complete_wire_bytes": 409152,
+          "line_wire_bytes": 270093,
+          "missing_line_bytes": 1308707,
+          "missing_lines": 27099,
+          "preinstalled_line_bytes": 1317452,
+          "preinstalled_lines": 26992
+        },
+        {
+          "cold_bit": 1,
+          "complete_ratio": 270.15262208541446,
+          "complete_wire_bytes": 408034,
+          "line_wire_bytes": 268975,
+          "missing_line_bytes": 1317452,
+          "missing_lines": 26992,
+          "preinstalled_line_bytes": 1308707,
+          "preinstalled_lines": 27099
+        }
+      ],
+      "worst_ratio": 269.41443522211796
+    },
+    {
+      "best_ratio": 184.87025257898875,
+      "corpus": "leveldb",
+      "raw_bytes": 143868249,
+      "structural_wire_bytes": 459685,
+      "variants": [
+        {
+          "cold_bit": 0,
+          "complete_ratio": 184.476036544318,
+          "complete_wire_bytes": 779875,
+          "line_wire_bytes": 320190,
+          "missing_line_bytes": 1669337,
+          "missing_lines": 31616,
+          "preinstalled_line_bytes": 1663209,
+          "preinstalled_lines": 31569
+        },
+        {
+          "cold_bit": 1,
+          "complete_ratio": 184.87025257898875,
+          "complete_wire_bytes": 778212,
+          "line_wire_bytes": 318527,
+          "missing_line_bytes": 1663209,
+          "missing_lines": 31569,
+          "preinstalled_line_bytes": 1669337,
+          "preinstalled_lines": 31616
+        }
+      ],
+      "worst_ratio": 184.476036544318
+    },
+    {
+      "best_ratio": 496.5022059587387,
+      "corpus": "simdjson",
+      "raw_bytes": 468377342,
+      "structural_wire_bytes": 320996,
+      "variants": [
+        {
+          "cold_bit": 0,
+          "complete_ratio": 496.01689123000983,
+          "complete_wire_bytes": 944277,
+          "line_wire_bytes": 623281,
+          "missing_line_bytes": 3361173,
+          "missing_lines": 57659,
+          "preinstalled_line_bytes": 3363108,
+          "preinstalled_lines": 57335
+        },
+        {
+          "cold_bit": 1,
+          "complete_ratio": 496.5022059587387,
+          "complete_wire_bytes": 943354,
+          "line_wire_bytes": 622358,
+          "missing_line_bytes": 3363108,
+          "missing_lines": 57335,
+          "preinstalled_line_bytes": 3361173,
+          "preinstalled_lines": 57659
+        }
+      ],
+      "worst_ratio": 496.01689123000983
+    },
+    {
+      "best_ratio": 804.6339241540745,
+      "corpus": "cereal",
+      "raw_bytes": 326899429,
+      "structural_wire_bytes": 111505,
+      "variants": [
+        {
+          "cold_bit": 0,
+          "complete_ratio": 804.6339241540745,
+          "complete_wire_bytes": 406271,
+          "line_wire_bytes": 294766,
+          "missing_line_bytes": 1550717,
+          "missing_lines": 27582,
+          "preinstalled_line_bytes": 1605431,
+          "preinstalled_lines": 27563
+        },
+        {
+          "cold_bit": 1,
+          "complete_ratio": 796.7385308691022,
+          "complete_wire_bytes": 410297,
+          "line_wire_bytes": 298792,
+          "missing_line_bytes": 1605431,
+          "missing_lines": 27563,
+          "preinstalled_line_bytes": 1550717,
+          "preinstalled_lines": 27582
+        }
+      ],
+      "worst_ratio": 796.7385308691022
+    }
+  ],
+  "variants": [
+    {
+      "cold_bit": 0,
+      "complete_wire_bytes": 80787440,
+      "equal_corpus_ratio": 308.3627189952798,
+      "exact_corpora": 16,
+      "pass_200_corpora": 13,
+      "raw_bytes": 28554671510,
+      "weighted_ratio": 353.45434277902604
+    },
+    {
+      "cold_bit": 1,
+      "complete_wire_bytes": 80968672,
+      "equal_corpus_ratio": 308.46998991826234,
+      "exact_corpora": 16,
+      "pass_200_corpora": 13,
+      "raw_bytes": 28554671510,
+      "weighted_ratio": 352.6632067029579
+    }
+  ],
+  "worst_variant_equal_corpus_ratio": 308.3627189952798,
+  "worst_variant_weighted_ratio": 352.6632067029579
+}

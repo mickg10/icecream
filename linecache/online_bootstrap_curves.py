@@ -53,6 +53,12 @@ from pretrained_superblocks import (
     phrase_candidates,
     put_varint,
 )
+from prior_root_copy import (
+    ExactState as PriorRootState,
+    PriorRootIndex,
+    deserialize as deserialize_prior_root,
+    serialize as serialize_prior_root,
+)
 
 
 MODEL_VERSION = 1
@@ -887,8 +893,17 @@ class OnlineResult:
     cross_probe_tus: int
     cross_probe_min_savings: int
     cross_probe_live: bool
+    prior_root_copy: bool
+    root_copy_seed_length: int
+    root_copy_candidates: int
+    root_copy_index_stride: int
     cross_probe_savings: int = 0
     cross_enabled: bool = False
+    root_copy_selected_tus: int = 0
+    root_copy_copies: int = 0
+    root_copy_copied_regions: int = 0
+    root_copy_receiver_state_bytes: int = 0
+    root_copy_encoder_state_bytes: int = 0
     raw_bytes: int = 0
     payload_wire_bytes: int = 0
     definition_wire_bytes: int = 0
@@ -954,6 +969,10 @@ def evaluate_online(
     publication: str,
     budget_basis: str,
     seed_only: bool = False,
+    prior_root_copy: bool = False,
+    root_copy_seed_length: int = 4,
+    root_copy_candidates: int = 4,
+    root_copy_index_stride: int = 1,
 ) -> OnlineResult:
     if cross_probe_tus < 0 or cross_probe_min_savings < 0:
         raise ValueError("cross probe controls must be nonnegative")
@@ -1027,6 +1046,14 @@ def evaluate_online(
         )
         and bool(online_budget)
     )
+    if prior_root_copy and not canonical_context:
+        raise ValueError("prior-root copy requires canonical context state")
+    if (
+        root_copy_seed_length < 2
+        or root_copy_candidates <= 0
+        or root_copy_index_stride <= 0
+    ):
+        raise ValueError("prior-root copy controls must be positive")
     hybrid_cross = (
         phrase_scope == "run-vs-tu-match-hybrid" and bool(online_budget)
     )
@@ -1049,6 +1076,13 @@ def evaluate_online(
     decoder = ExactDecoder(installed_decoder, {})
     encoder_regions = RegionIdStore()
     decoder_regions = RegionIdStore()
+    prior_root_encoder = PriorRootState()
+    prior_root_decoder = PriorRootState()
+    prior_root_index = PriorRootIndex(
+        root_copy_seed_length,
+        root_copy_candidates,
+        root_copy_index_stride,
+    )
     learner = CausalPhraseLearner(
         initial,
         phrase_lengths,
@@ -1079,6 +1113,10 @@ def evaluate_online(
         cross_probe_tus=cross_probe_tus,
         cross_probe_min_savings=cross_probe_min_savings,
         cross_probe_live=cross_probe_live,
+        prior_root_copy=prior_root_copy,
+        root_copy_seed_length=root_copy_seed_length,
+        root_copy_candidates=root_copy_candidates,
+        root_copy_index_stride=root_copy_index_stride,
         cross_enabled=cross_probe_tus == 0 or cross_probe_live,
         seed_assets=len(initial.keys) if seed_only else 0,
         seed_model_raw_bytes=len(initial_raw) if seed_only else 0,
@@ -1090,6 +1128,7 @@ def evaluate_online(
 
     for ordinal, tu in enumerate(target_tus, 1):
         begin = time.monotonic()
+        expected = expected_regions(tu)
         selector_wire = 1 if online_budget else 0
         context_wire = 0
         context_frame = b""
@@ -1112,6 +1151,12 @@ def evaluate_online(
         definition_wire = 0
         definition_raw = b""
         used_online = False
+        root_copy_selected = False
+        root_copy_copies = 0
+        root_copy_copied_regions = 0
+        root_copy_new_regions: list[tuple[int, int, int]] = []
+        root_copy_recovered: list[tuple[int, int, int]] = []
+        root_copy_received: list[tuple[int, int, int]] = []
         selected_representation = (
             "atom"
             if canonical_cross
@@ -1310,6 +1355,47 @@ def evaluate_online(
                         best_definitions = new_definitions
                         best_representation = representation
 
+            if prior_root_copy:
+                if prior_root_encoder.ids != encoder_regions.ids:
+                    raise ValueError("prior-root and dense Region IDs diverged before TU")
+                (
+                    root_copy_payload,
+                    root_copy_new_regions,
+                    root_copy_copies,
+                    root_copy_copied_regions,
+                ) = serialize_prior_root(
+                    expected,
+                    prior_root_encoder,
+                    prior_root_index,
+                    "greedy",
+                )
+                root_copy_frame = compressor.compress(root_copy_payload)
+                root_copy_recovered_raw = decompressor.decompress(root_copy_frame)
+                if root_copy_recovered_raw != root_copy_payload:
+                    raise ValueError("prior-root frame differs after decompression")
+                root_copy_recovered, root_copy_received = deserialize_prior_root(
+                    root_copy_recovered_raw,
+                    prior_root_decoder,
+                )
+                if (
+                    root_copy_recovered != expected
+                    or root_copy_received != root_copy_new_regions
+                ):
+                    raise ValueError("prior-root candidate differs after decode")
+                root_copy_wire = len(root_copy_frame) + 4 + selector_wire
+                if root_copy_wire < best_wire:
+                    used_online = True
+                    root_copy_selected = True
+                    best_wire = root_copy_wire
+                    best_encoder = clone_encoder(encoder, installed_encoder)
+                    best_package = installed_encoder
+                    best_payload = root_copy_payload
+                    best_frame = root_copy_frame
+                    best_definition_raw = b""
+                    best_definition_frame = b""
+                    best_definitions = []
+                    best_representation = "prior-root"
+
             encoder = best_encoder
             payload = best_payload
             payload_frame = best_frame
@@ -1349,22 +1435,31 @@ def evaluate_online(
             decompressor.decompress(context_frame) if canonical_context else b""
         )
         recovered_payload = decompressor.decompress(payload_frame)
-        recovered = (
-            decode_canonical_atom_frame(
+        if selected_representation == "atom":
+            recovered = decode_canonical_atom_frame(
                 recovered_payload,
                 installed_decoder,
                 decoder_regions,
             )
-            if selected_representation == "atom"
-            else decoder.frame(recovered_payload)
-        )
+        elif selected_representation == "prior-root":
+            recovered, selected_root_received = deserialize_prior_root(
+                recovered_payload,
+                prior_root_decoder,
+            )
+            if (
+                recovered != root_copy_recovered
+                or selected_root_received != root_copy_received
+            ):
+                raise ValueError("selected prior-root replay differs from candidate replay")
+        else:
+            recovered = decoder.frame(recovered_payload)
         receiver_context_lengths = (
             deserialize_context_runs(receiver_context_raw, len(recovered))
             if canonical_context
             else []
         )
         result.decode_seconds += time.monotonic() - begin
-        exact = recovered_payload == payload and recovered == expected_regions(tu)
+        exact = recovered_payload == payload and recovered == expected
         result.exact &= exact
         if not exact:
             raise ValueError(f"{name}: exact replay failed at TU {tu.tu}")
@@ -1398,16 +1493,34 @@ def evaluate_online(
             encoder.dynamic = sender_dynamic
             decoder.dynamic = dense_decoder_dynamic(receiver_dynamic)
 
-        encoder_regions.observe(expected_regions(tu))
+        if prior_root_copy:
+            prior_root_encoder.commit(expected, root_copy_new_regions)
+            prior_root_decoder.commit(root_copy_recovered, root_copy_received)
+            prior_root_index.add(expected)
+            if (
+                prior_root_encoder.ids != prior_root_decoder.ids
+                or prior_root_encoder.values != prior_root_decoder.values
+                or prior_root_encoder.roots != prior_root_decoder.roots
+            ):
+                raise ValueError("prior-root encoder and decoder states diverged")
+
+        encoder_regions.observe(expected)
         decoder_regions.observe(recovered)
         if decoder_regions.values != encoder_regions.values:
             raise ValueError("dense Region ID stores diverged")
+        if prior_root_copy and prior_root_encoder.ids != encoder_regions.ids:
+            raise ValueError("prior-root and dense Region IDs diverged after TU")
 
         payload_wire = len(payload_frame) + 4
         result.payload_wire_bytes += payload_wire
         result.context_wire_bytes += context_wire
         result.selector_wire_bytes += selector_wire
         result.online_selected_tus += int(used_online)
+        result.root_copy_selected_tus += int(root_copy_selected)
+        result.root_copy_copies += root_copy_copies if root_copy_selected else 0
+        result.root_copy_copied_regions += (
+            root_copy_copied_regions if root_copy_selected else 0
+        )
         result.raw_bytes += tu.raw_bytes
         result.tus += 1
 
@@ -1474,6 +1587,15 @@ def evaluate_online(
             "online_published_assets": result.online_published_assets,
             "seed_published_assets": result.seed_published_assets,
             "online_selected_tus": result.online_selected_tus,
+            "root_copy_selected": root_copy_selected,
+            "root_copy_copies": root_copy_copies if root_copy_selected else 0,
+            "root_copy_copied_regions": (
+                root_copy_copied_regions if root_copy_selected else 0
+            ),
+            "root_copy_receiver_state_bytes": (
+                prior_root_index.root_vector_logical_bytes
+            ),
+            "root_copy_encoder_state_bytes": prior_root_index.encoder_logical_bytes,
             "candidate_state_bytes": learner.counts.logical_bytes,
             "logical_state_bytes": learner.logical_state_bytes,
         })
@@ -1482,6 +1604,8 @@ def evaluate_online(
     result.online_promoted_assets = learner.promoted_assets
     result.candidate_observations = learner.candidate_observations
     result.final_logical_state_bytes = learner.logical_state_bytes
+    result.root_copy_receiver_state_bytes = prior_root_index.root_vector_logical_bytes
+    result.root_copy_encoder_state_bytes = prior_root_index.encoder_logical_bytes
     return result
 
 
@@ -1503,6 +1627,11 @@ def write_curve(rows: Sequence[dict], path: str) -> None:
         "online_published_assets",
         "seed_published_assets",
         "online_selected_tus",
+        "root_copy_selected",
+        "root_copy_copies",
+        "root_copy_copied_regions",
+        "root_copy_receiver_state_bytes",
+        "root_copy_encoder_state_bytes",
         "candidate_state_bytes",
         "logical_state_bytes",
     )
@@ -1685,6 +1814,10 @@ def run(args: argparse.Namespace) -> int:
             args.publication,
             args.budget_basis,
             seed_only,
+            prior_root_copy=args.prior_root_copy and bool(online_budget),
+            root_copy_seed_length=args.root_copy_seed_length,
+            root_copy_candidates=args.root_copy_candidates,
+            root_copy_index_stride=args.root_copy_index_stride,
         ).as_dict()
         rows.append(row)
         print(json.dumps({
@@ -1703,6 +1836,15 @@ def run(args: argparse.Namespace) -> int:
             "promoted": row["online_promoted_assets"],
             "published": row["online_published_assets"],
             "selected_tus": row["online_selected_tus"],
+            "root_copy_selected_tus": row["root_copy_selected_tus"],
+            "root_copy_copies": row["root_copy_copies"],
+            "root_copy_copied_regions": row["root_copy_copied_regions"],
+            "root_copy_receiver_state_bytes": row[
+                "root_copy_receiver_state_bytes"
+            ],
+            "root_copy_encoder_state_bytes": row[
+                "root_copy_encoder_state_bytes"
+            ],
             "state_bytes": row["final_logical_state_bytes"],
             "exact": row["exact"],
         }), flush=True)
@@ -1720,6 +1862,10 @@ def run(args: argparse.Namespace) -> int:
         "cross_probe_tus": args.cross_probe_tus,
         "cross_probe_min_savings": args.cross_probe_min_savings,
         "cross_probe_live": args.cross_probe_live,
+        "prior_root_copy": args.prior_root_copy,
+        "root_copy_seed_length": args.root_copy_seed_length,
+        "root_copy_candidates": args.root_copy_candidates,
+        "root_copy_index_stride": args.root_copy_index_stride,
         "static_budget": args.static_budget,
         "online_budget": args.online_budget,
         "per_tu_budget": args.per_tu_budget,
@@ -1788,6 +1934,10 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--cross-probe-tus", type=int, default=0)
     value.add_argument("--cross-probe-min-savings", type=int, default=0)
     value.add_argument("--cross-probe-live", action="store_true")
+    value.add_argument("--prior-root-copy", action="store_true")
+    value.add_argument("--root-copy-seed-length", type=int, default=4)
+    value.add_argument("--root-copy-candidates", type=int, default=4)
+    value.add_argument("--root-copy-index-stride", type=int, default=1)
     value.add_argument("--thresholds", nargs="+", type=int, default=(2, 3, 4, 6))
     value.add_argument("--level", type=int, choices=(1, 3), default=1)
     value.add_argument("--model-level", type=int, choices=(1, 3, 6), default=3)
