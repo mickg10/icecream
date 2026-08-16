@@ -1641,7 +1641,7 @@ def run(args: argparse.Namespace) -> int:
     ):
         specifications.append(("pretrained-frozen", initial, 0, 1, False))
     for threshold in args.thresholds:
-        if args.row_set in ("all", "empty"):
+        if args.row_set in ("all", "empty", "online"):
             specifications.append(
                 (
                     f"empty-online-k{threshold}",
@@ -1651,7 +1651,7 @@ def run(args: argparse.Namespace) -> int:
                     False,
                 )
             )
-        if args.row_set in ("all", "pretrained"):
+        if args.row_set in ("all", "pretrained", "online"):
             seed_only = args.pretrained_mode == "seed-only"
             specifications.append(
                 (
@@ -1810,7 +1810,12 @@ def parser() -> argparse.ArgumentParser:
         choices=("installed", "seed-only"),
         default="installed",
     )
-    value.add_argument("--row-set", choices=("all", "empty", "pretrained"), default="all")
+    value.add_argument(
+        "--row-set",
+        choices=("all", "empty", "pretrained", "online"),
+        default="all",
+        help="online selects empty-online and pretrained-online without frozen rows",
+    )
     value.add_argument("--curve-tsv")
     value.add_argument("--report", required=True)
     return value
