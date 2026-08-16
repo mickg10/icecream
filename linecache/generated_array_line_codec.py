@@ -44,6 +44,22 @@ class ByteArrayLine:
     separator: bytes
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class ExtendedByteArrayLine:
+    values: bytes
+    prefix: bytes
+    separator: bytes
+    suffix: bytes
+    number_format: int
+
+
+DECIMAL = 0
+HEX_LOWER_PREFIX_LOWER_DIGITS = 1
+HEX_LOWER_PREFIX_UPPER_DIGITS = 2
+HEX_UPPER_PREFIX_LOWER_DIGITS = 3
+HEX_UPPER_PREFIX_UPPER_DIGITS = 4
+
+
 @dataclasses.dataclass(slots=True)
 class PreparedFrame:
     expected: list[bytes]
@@ -60,6 +76,7 @@ class PreparedCorpus:
     corpus: Corpus
     frames: list[PreparedFrame]
     prepare_seconds: float
+    extended: bool
 
 
 def parse_decimal_byte_line(line: bytes) -> ByteArrayLine | None:
@@ -126,6 +143,147 @@ def render_decimal_byte_line(value: ByteArrayLine) -> bytes:
         if index + 1 != len(value.values):
             output.extend(value.separator)
     output.append(0x0A)
+    return bytes(output)
+
+
+def parse_extended_byte_array_line(line: bytes) -> ExtendedByteArrayLine | None:
+    """Parse a whole decimal/hex u8 initializer fragment without changing its envelope."""
+
+    if len(line) < 8 or not line.endswith(b"\n"):
+        return None
+    position = 0
+    while position < len(line) and line[position] in (0x20, 0x09):
+        position += 1
+
+    token_start = position
+    if position < len(line) and line[position] == 0x2C:
+        position += 1
+        while position < len(line) and line[position] in (0x20, 0x09):
+            position += 1
+        token_start = position
+    elif position >= len(line) or not (
+        0x30 <= line[position] <= 0x39
+        or line.startswith((b"0x", b"0X"), position)
+    ):
+        brace = line.find(b"{", position)
+        if brace < 0:
+            return None
+        declaration = line[:brace]
+        if b"uint8_t" not in declaration and b"unsigned char" not in declaration:
+            return None
+        position = brace + 1
+        while position < len(line) and line[position] in (0x20, 0x09):
+            position += 1
+        token_start = position
+    prefix = line[:token_start]
+
+    values = bytearray()
+    separator: bytes | None = None
+    number_format: int | None = None
+    hex_prefix_upper: bool | None = None
+    saw_lower_hex = saw_upper_hex = False
+    suffix: bytes | None = None
+
+    while position < len(line):
+        if line.startswith((b"0x", b"0X"), position):
+            prefix_upper = line[position + 1] == 0x58
+            digits_begin = position + 2
+            digits_end = digits_begin + 2
+            if digits_end > len(line):
+                return None
+            digits = line[digits_begin:digits_end]
+            if any(
+                not (0x30 <= byte <= 0x39 or 0x41 <= byte <= 0x46 or 0x61 <= byte <= 0x66)
+                for byte in digits
+            ):
+                return None
+            if hex_prefix_upper is None:
+                hex_prefix_upper = prefix_upper
+            elif hex_prefix_upper != prefix_upper:
+                return None
+            saw_lower_hex |= any(0x61 <= byte <= 0x66 for byte in digits)
+            saw_upper_hex |= any(0x41 <= byte <= 0x46 for byte in digits)
+            if saw_lower_hex and saw_upper_hex:
+                return None
+            value = int(digits, 16)
+            current_format = -1
+            position = digits_end
+        else:
+            digits_begin = position
+            while position < len(line) and 0x30 <= line[position] <= 0x39:
+                position += 1
+            if digits_begin == position:
+                return None
+            digits = line[digits_begin:position]
+            if len(digits) > 1 and digits[0] == 0x30:
+                return None
+            value = int(digits)
+            if value > 255:
+                return None
+            current_format = DECIMAL
+
+        if number_format is None:
+            number_format = current_format
+        elif current_format != number_format:
+            return None
+        values.append(value)
+
+        remainder = line[position:]
+        if remainder in (b"\n", b"}\n", b"};\n"):
+            suffix = remainder
+            break
+        if position >= len(line) or line[position] != 0x2C:
+            return None
+        separator_begin = position
+        position += 1
+        remainder = line[position:]
+        if remainder in (b"\n", b"}\n", b"};\n"):
+            suffix = line[separator_begin:]
+            break
+        while position < len(line) and line[position] in (0x20, 0x09):
+            position += 1
+        current_separator = line[separator_begin:position]
+        if separator is None:
+            separator = current_separator
+        elif separator != current_separator:
+            return None
+
+    if suffix is None or len(values) < 4 or number_format is None:
+        return None
+    if number_format == -1:
+        if hex_prefix_upper:
+            number_format = (
+                HEX_UPPER_PREFIX_LOWER_DIGITS
+                if saw_lower_hex
+                else HEX_UPPER_PREFIX_UPPER_DIGITS
+            )
+        else:
+            number_format = (
+                HEX_LOWER_PREFIX_LOWER_DIGITS
+                if saw_lower_hex
+                else HEX_LOWER_PREFIX_UPPER_DIGITS
+            )
+    return ExtendedByteArrayLine(
+        bytes(values), prefix, separator or b",", suffix, number_format
+    )
+
+
+def render_extended_byte_array_line(value: ExtendedByteArrayLine) -> bytes:
+    output = bytearray(value.prefix)
+    for index, byte in enumerate(value.values):
+        if index:
+            output.extend(value.separator)
+        if value.number_format == DECIMAL:
+            output.extend(str(byte).encode("ascii"))
+        else:
+            prefix = b"0X" if value.number_format >= HEX_UPPER_PREFIX_LOWER_DIGITS else b"0x"
+            lower = value.number_format in (
+                HEX_LOWER_PREFIX_LOWER_DIGITS,
+                HEX_UPPER_PREFIX_LOWER_DIGITS,
+            )
+            output.extend(prefix)
+            output.extend(format(byte, "02x" if lower else "02X").encode("ascii"))
+    output.extend(value.suffix)
     return bytes(output)
 
 
@@ -201,6 +359,70 @@ def serialize_array_candidate(
     }
 
 
+def serialize_extended_array_candidate(
+    ordered: Sequence[bytes],
+) -> tuple[
+    tuple[bytes | None, bytes | None, bytes | None, bytes | None, bytes | None],
+    dict[str, int],
+]:
+    rest: list[bytes] = []
+    arrays: list[tuple[bytes, ExtendedByteArrayLine]] = []
+    for line in ordered:
+        parsed = parse_extended_byte_array_line(line)
+        if parsed is None:
+            rest.append(line)
+        else:
+            arrays.append((line, parsed))
+
+    rest_parts: tuple[bytes | None, bytes | None, bytes | None]
+    if rest:
+        rest_parts = serialize_front_split_sorted(rest)
+    else:
+        rest_parts = (None, None, None)
+
+    if not arrays:
+        return (*rest_parts, None, None), {
+            "array_lines": 0,
+            "array_text_bytes": 0,
+            "array_values": 0,
+            "styles": 0,
+        }
+
+    styles = sorted(
+        {
+            (parsed.prefix, parsed.separator, parsed.suffix, parsed.number_format)
+            for _, parsed in arrays
+        }
+    )
+    style_ids = {style: ordinal for ordinal, style in enumerate(styles)}
+    control = bytearray(put_varint(len(styles)))
+    for prefix, separator, suffix, number_format in styles:
+        control.extend(put_varint(number_format))
+        for value in (prefix, separator, suffix):
+            control.extend(put_varint(len(value)))
+            control.extend(value)
+    control.extend(put_varint(len(arrays)))
+
+    values = bytearray()
+    for _, parsed in arrays:
+        style = (
+            parsed.prefix,
+            parsed.separator,
+            parsed.suffix,
+            parsed.number_format,
+        )
+        control.extend(put_varint(style_ids[style]))
+        control.extend(put_varint(len(parsed.values)))
+        values.extend(parsed.values)
+
+    return (*rest_parts, bytes(control), bytes(values)), {
+        "array_lines": len(arrays),
+        "array_text_bytes": sum(len(line) for line, _ in arrays),
+        "array_values": len(values),
+        "styles": len(styles),
+    }
+
+
 def decode_array_streams(control: bytes, values: bytes) -> list[bytes]:
     style_count, position = get_varint(control, 0)
     styles: list[tuple[bytes, bytes]] = []
@@ -238,8 +460,48 @@ def decode_array_streams(control: bytes, values: bytes) -> list[bytes]:
     return output
 
 
+def decode_extended_array_streams(control: bytes, values: bytes) -> list[bytes]:
+    style_count, position = get_varint(control, 0)
+    styles: list[tuple[bytes, bytes, bytes, int]] = []
+    for _ in range(style_count):
+        number_format, position = get_varint(control, position)
+        if number_format > HEX_UPPER_PREFIX_UPPER_DIGITS:
+            raise ValueError("extended array number format is unknown")
+        fields = []
+        for _ in range(3):
+            size, position = get_varint(control, position)
+            end = position + size
+            if end > len(control):
+                raise ValueError("extended array style exceeds control")
+            fields.append(control[position:end])
+            position = end
+        styles.append((fields[0], fields[1], fields[2], number_format))
+
+    line_count, position = get_varint(control, position)
+    output: list[bytes] = []
+    value_position = 0
+    for _ in range(line_count):
+        style_id, position = get_varint(control, position)
+        count, position = get_varint(control, position)
+        if style_id >= len(styles) or count > len(values) - value_position:
+            raise ValueError("extended array record exceeds its style or value stream")
+        prefix, separator, suffix, number_format = styles[style_id]
+        parsed = ExtendedByteArrayLine(
+            values[value_position:value_position + count],
+            prefix,
+            separator,
+            suffix,
+            number_format,
+        )
+        output.append(render_extended_byte_array_line(parsed))
+        value_position += count
+    if position != len(control) or value_position != len(values):
+        raise ValueError("extended array streams have trailing bytes")
+    return output
+
+
 def decode_candidate(
-    parts: Sequence[bytes | None],
+    parts: Sequence[bytes | None], extended: bool = False,
 ) -> list[bytes]:
     if len(parts) != len(PART_NAMES):
         raise ValueError("wrong generated-array part count")
@@ -254,13 +516,17 @@ def decode_candidate(
     if parts[3] is None and parts[4] is None:
         arrays: list[bytes] = []
     elif parts[3] is not None and parts[4] is not None:
-        arrays = decode_array_streams(parts[3], parts[4])
+        arrays = (
+            decode_extended_array_streams(parts[3], parts[4])
+            if extended
+            else decode_array_streams(parts[3], parts[4])
+        )
     else:
         raise ValueError("partial generated-array record")
     return list(heapq.merge(rest, arrays))
 
 
-def prepare_corpus(corpus: Corpus) -> PreparedCorpus:
+def prepare_corpus(corpus: Corpus, extended: bool = False) -> PreparedCorpus:
     begin = time.monotonic()
     frames: list[PreparedFrame] = []
     for lines in corpus.lines_by_tu:
@@ -268,7 +534,11 @@ def prepare_corpus(corpus: Corpus) -> PreparedCorpus:
             continue
         ordered = sorted(lines)
         baseline = serialize_front_split_sorted(ordered)
-        candidate, stats = serialize_array_candidate(ordered)
+        candidate, stats = (
+            serialize_extended_array_candidate(ordered)
+            if extended
+            else serialize_array_candidate(ordered)
+        )
         frames.append(
             PreparedFrame(
                 ordered,
@@ -280,7 +550,7 @@ def prepare_corpus(corpus: Corpus) -> PreparedCorpus:
                 stats["styles"],
             )
         )
-    return PreparedCorpus(corpus, frames, time.monotonic() - begin)
+    return PreparedCorpus(corpus, frames, time.monotonic() - begin, extended)
 
 
 def compressed_part(compressor: zstd.ZstdCompressor, raw: bytes) -> bytes:
@@ -322,7 +592,7 @@ def independent_best(prepared: PreparedCorpus, level: int) -> dict:
                 else None
                 for value in candidate_encoded
             ]
-            if decode_candidate(candidate_raw) != frame.expected:
+            if decode_candidate(candidate_raw, prepared.extended) != frame.expected:
                 raise ValueError("selected generated-array Lines differ after decode")
         else:
             baseline_raw = [
@@ -351,7 +621,7 @@ def independent_best(prepared: PreparedCorpus, level: int) -> dict:
                 else None
                 for value in candidate_encoded
             ]
-            if decode_candidate(candidate_raw) != frame.expected:
+            if decode_candidate(candidate_raw, prepared.extended) != frame.expected:
                 raise ValueError("losing generated-array Lines differ after decode")
         verification_seconds += time.monotonic() - verification_begin
 
@@ -420,8 +690,10 @@ def persistent_stream(prepared: PreparedCorpus, level: int, generated: bool) -> 
                 continue
             recovered.append(decompressor.decompress(value))
             component_wire[index] += len(value) + 4
-        decoded = decode_candidate(recovered) if generated else decode_front_split(
-            [part or b"" for part in recovered]
+        decoded = (
+            decode_candidate(recovered, prepared.extended)
+            if generated
+            else decode_front_split([part or b"" for part in recovered])
         )
         if decoded != frame.expected:
             raise ValueError("persistent Line stream differs after decode")
@@ -537,12 +809,40 @@ def self_test() -> None:
     if decode_candidate(parts) != ordered:
         raise AssertionError("generated-array candidate self-test differs")
 
+    extended_accepted = (
+        b"const uint8_t payload[] = {0, 1, 16, 255};\n",
+        b"  0x00, 0x01, 0xAF, 0xFF,\n",
+        b",1,2,3,4,\n",
+    )
+    extended_rejected = (
+        b"const uint8_t payload[] = {0, 1, 16, 256};\n",
+        b"  0x0, 0x01, 0xAF, 0xFF,\n",
+        b"  0x00, 0x01, 0xaF, 0xFF,\n",
+        b"const int payload[] = {0, 1, 2, 3};\n",
+    )
+    for line in extended_accepted:
+        parsed = parse_extended_byte_array_line(line)
+        if parsed is None or render_extended_byte_array_line(parsed) != line:
+            raise AssertionError(f"accepted extended-array self-test failed: {line!r}")
+    for line in extended_rejected:
+        if parse_extended_byte_array_line(line) is not None:
+            raise AssertionError(f"rejected extended-array self-test failed: {line!r}")
+    extended_ordered = sorted((*extended_accepted, b"alpha\n", b"omega\n"))
+    extended_parts, _ = serialize_extended_array_candidate(extended_ordered)
+    if decode_candidate(extended_parts, True) != extended_ordered:
+        raise AssertionError("extended-array candidate self-test differs")
+
 
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser()
     value.add_argument("--trace", action="append", type=parse_trace, required=True)
     value.add_argument("--levels", nargs="+", type=int, default=(1, 3))
     value.add_argument("--max-tus", type=int, default=0)
+    value.add_argument(
+        "--array-syntax",
+        choices=("decimal-row", "extended"),
+        default="decimal-row",
+    )
     value.add_argument("--output", required=True)
     value.add_argument("--tsv")
     return value
@@ -556,7 +856,7 @@ def main() -> int:
         load_begin = time.monotonic()
         corpus = load_corpus(name, path, args.max_tus)
         load_seconds = time.monotonic() - load_begin
-        prepared = prepare_corpus(corpus)
+        prepared = prepare_corpus(corpus, args.array_syntax == "extended")
         print(
             f"LOAD {name} tus={len(corpus.raw_by_tu)} "
             f"lines={sum(map(len, corpus.lines_by_tu))} bytes={corpus.line_bytes} "
@@ -585,6 +885,9 @@ def main() -> int:
         ],
         "rows": rows,
     }
+    if args.array_syntax == "extended":
+        report["experiment"] = "extended decimal/hex byte-array Line program"
+        report["array_syntax"] = "extended"
     Path(args.output).write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     if args.tsv and rows:
         scalar_names = sorted(
