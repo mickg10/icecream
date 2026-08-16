@@ -34,7 +34,8 @@ the C candidate learner.
 | P21 `BYTE_ARRAY` | retain as one materialization form | exact complete codec |
 | reduced P24 Region materializer | retain | exact complete codec |
 | F-owned cache lookup and F-generated `NEED` | retain | exact capability execution |
-| P26 embedded-zlib factor | measured winner; reviewer ruling on member-only recovery pending | exact 48/48 complete executions, minimum 1.110 GB/s |
+| P26 embedded-zlib factor | retain as underlying member codec; reviewer ruling on member-only recovery pending | exact 48/48 complete executions |
+| P27 canonical-MO factor | measured incremental winner; reviewer ruling pending | exact 48/48 complete executions, 3.04 MB same-input cold saving |
 | P4 alpha-Line residual codec | reject | exact all-16 integration loses bytes and speed |
 | P22 prior-Root slice | reject from the product path | integrated complete codec loses to S1 |
 | P18 statements, P19 flat phrases, local raw backreferences, project-source packages | do not port | integrated or causal screens lose |
@@ -43,17 +44,21 @@ the C candidate learner.
 | neural sequence models and large code models | teacher/ceiling only | too slow or too large for the live path |
 | receiver-side predictor | do not add | no measured need; explicit programs are sufficient |
 
-The best current **complete** measured row is P26:
+The best current **complete** measured row is P27:
 
-| receiver state | wire bytes | ratio | exact | minimum complete pipeline |
+| receiver state | wire bytes | ratio | exact | minimum measured encode/decode subphase |
 |---|---:|---:|---:|---:|
-| cold | **97,021,934** | **294.31x** | 16/16 corpora | **1.110 GB/s** |
-| cache complement bit 0 | **65,181,646** | **438.08x** | 16/16 corpora | **1.266 GB/s** |
-| cache complement bit 1 | **43,876,139** | **650.80x** | 16/16 corpora | **2.843 GB/s** |
+| cold | **93,980,202** | **303.84x** | 16/16 corpora | **1.015 GB/s** |
+| cache complement bit 0 | **62,151,794** | **459.43x** | 16/16 corpora | **1.120 GB/s** |
+| cache complement bit 1 | **43,863,608** | **650.99x** | 16/16 corpora | **2.233 GB/s** |
 
-Cold 400x permits 71,386,679 bytes, so the measured cold gap is **25,635,255 bytes**. Both
+Cold 400x permits 71,386,679 bytes, so the measured cold gap is **22,593,523 bytes**. Both
 aggregate half-cache 200x rows pass. These deterministic cache complements are not the same claim
 as chronological online H200; that learning-curve test remains required.
+
+The throughput column times the already-ingested C encode and F decode/expand subphases. It does
+not include C's initial read/parse/intern pass. The complete product-shaped C pipeline speed gate
+therefore remains open even though the codec subphases exceed 1 GB/s.
 
 ## Evidence-set rule: 16 versus the broader corpus inventory
 
@@ -297,7 +302,7 @@ flowchart TD
     B[3. encode S0 Root with S1 Blocks]
     K[4. resolve F cache closure and NEED]
     R[5. materialize missing Regions]
-    V[6. factor BYTE_ARRAY values and optional P26 blobs]
+    V[6. factor BYTE_ARRAY values and optional P26/P27 blobs]
     L[7. encode remaining RAW_RUN residual]
     Z[8. entropy-code independent semantic streams]
     W[9. frame and send]
@@ -441,7 +446,7 @@ P24's old `SOURCE_COPY`, `SOURCE_PATCH`, and `LOCAL_REF` variants are not in the
 Project-source packages also remain out. The source-copy experiments are retained as history, not
 as implementation instructions.
 
-### Stage 6 — P21 `BYTE_ARRAY` and P26 embedded-zlib factor
+### Stage 6 — P21 `BYTE_ARRAY`, P26 embedded-zlib, and P27 canonical-MO factors
 
 P21 recognizes exact generated C/C++ byte-array syntax. It separates repetitive syntax/control
 from the actual `u8` values, then renders the exact original Line at F.
@@ -462,11 +467,15 @@ flowchart LR
     BA[BYTE_ARRAY values] --> DET[Find complete zlib members]
     DET --> O[Candidate A<br/>untouched DEFLATE bytes]
     DET --> INF[Inflate once at C]
-    INF --> ZL[Candidate B<br/>one zstd-3 LDM frame per TU]
+    INF --> ZL[Candidate B / P26<br/>one zstd-3 LDM frame per TU]
+    INF --> MO[Recognize exact canonical MO catalogs]
+    MO --> MF[Candidate C / P27<br/>factor originals, retain translations]
     O --> SEL[Compare complete framed bytes]
     ZL --> SEL
+    MF --> SEL
     SEL --> F[F decode]
-    F --> CAN[Canonical zlib-9 regeneration]
+    F --> REC[Recover exact inflated members]
+    REC --> CAN[Canonical zlib-9 regeneration]
     CAN --> Q{length and digest match?}
     Q -->|yes| OUT[Exact original member]
     Q -->|no| NEED[NEED failed member ordinal]
@@ -483,9 +492,33 @@ blob wire bytes. It saved 11,348,230 complete-wire bytes, all in Godot. Member-o
 recommended mode because the eager C+F canonical work measured 0.710 GB/s, while member-only mode
 measured 1.095–1.109 GB/s at C.
 
+P27 is a smaller factor inside that P26 boundary. It accepts a member as a canonical little-endian
+GNU MO catalog only when parsing and rebuilding reproduce every inflated byte. Across 107 accepted
+catalogs, 471,784 source/original-string occurrences collapse to 34,542 append-only generation
+IDs and 4,877,391 unique string bytes. Translations are carried explicitly because 445,179 of
+471,784 are unique. Non-catalog members remain explicit.
+
+One selected P27 frame contains four length-delimited raw parts before zstd-3/LDM:
+
+```text
+CONTROL || NEW_ORIGINAL_DEFINITIONS || TRANSLATIONS || ORDINARY_MEMBERS
+```
+
+C encodes against a snapshot and commits new original IDs only if P27 wins. F installs definitions
+in a direct `u32 -> string` vector, rebuilds exact MO catalogs, and then uses the unchanged P26
+canonical-zlib and member-recovery path. A format-based admission rule compresses P27 only when at
+least one canonical catalog exists and factored raw bytes are at most 75% of inflated bytes. This
+avoids compressing both P26 and P27 candidates on the live path.
+
+On the same executable and inputs, P27 reduces selected blob payload from 19,756,636 to 16,721,527
+bytes and complete cold wire by 3,035,066 bytes. Reverse order changes complete wire by -0.13%; a
+fixed shuffle changes it by +1.96%; P27's own factor frame changes by at most 730 bytes and ends
+with the same dictionary contents. A one-byte edit and revert also reconstruct exactly without an
+unselected candidate advancing state.
+
 ### Stage 7 — remaining `RAW_RUN` residual
 
-After public-Line reuse, markers, byte arrays, and P26 blobs are removed, the remaining exact
+After public-Line reuse, markers, byte arrays, and P26/P27 blobs are removed, the remaining exact
 ordinary literal bytes are concatenated into the `RAW_RUN` residual.
 
 The retained path is an ordinary zstd frame. P4 tested a TU-local alpha-normalized definition
@@ -516,6 +549,7 @@ candidate work remains above the throughput floor.
 | byte-array control | packed fields + zstd-1/3 | tiny typed values |
 | ordinary DEFLATE members | raw framed bytes | another zstd pass wastes work |
 | inflated P26 member plane | one zstd-3/LDM frame per TU | large-window cross-member repetition |
+| P27 MO factor plane | one four-part zstd-3/LDM frame per TU | repeated source strings across catalogs |
 | selectors and frame lengths | raw fixed fields | too small to justify a separate coder |
 
 The historical P24 aggregate used persistent flushed zstd-3 contexts. Product M4 requires
@@ -541,7 +575,7 @@ Every reported candidate must charge:
 ### Stage 10 — F reconstruction and compiler feed
 
 F decodes definitions into its generation store, expands the Root into exact Regions, renders each
-Region operation, reconstructs P26 members if selected, and checks the complete output against the
+Region operation, reconstructs P26/P27 members if selected, and checks the complete output against the
 declared exact TU identity in the capability harness. The resulting bytes go directly into the
 remote compiler's stdin pipe.
 
@@ -575,7 +609,9 @@ C -> F: OBJECT_FILL
   BYTE_ARRAY control frame
   BYTE_ARRAY payload:
     ordinary value bytes, or
-    P26 descriptors + per-TU zstd-3/LDM expanded payload
+    P26 descriptors + per-TU zstd-3/LDM expanded payload, or
+    P27 descriptors + four raw lengths + per-TU zstd-3/LDM
+      (control || new originals || translations || ordinary members)
 
 optional F -> C: BLOB_MEMBER_NEED
   failed P26 member ordinals
@@ -809,7 +845,8 @@ Most gains came from exposing the right symbols before zstd:
 - immutable Blocks instead of repeated Region subsequences;
 - marker fields instead of repeated textual line markers;
 - typed values instead of formatted array syntax;
-- inflated compressed-member content instead of opaque DEFLATE where a faster second codec wins.
+- inflated compressed-member content instead of opaque DEFLATE where a faster second codec wins;
+- repeated canonical-MO source strings instead of repeating them across translation catalogs.
 
 zstd then removes local redundancy in the resulting control and residual streams. Raising zstd
 level cannot compensate for a representation that hides structure, and high levels fail the
@@ -823,7 +860,7 @@ Separate streams when their statistics and decode actions differ materially:
 - Region opcodes and integer parameters;
 - text residual;
 - byte-array control;
-- byte-array values/P26 payload;
+- byte-array values/P26/P27 payload;
 - paths;
 - missing ordinals.
 
@@ -863,20 +900,20 @@ Charge a model exactly where an endpoint first receives or maps it:
 
 ## Current complete byte ledger
 
-P26 cold over all 16 corpora:
+P27 cold over all 16 corpora:
 
 | Complete category | Wire bytes | Fraction |
 |---|---:|---:|
-| Root | 3,687,803 | 3.80% |
-| Block definitions | 586,843 | 0.60% |
-| path definitions | 828,100 | 0.85% |
-| object `NEED`/missing dialogue | 3,317,206 | 3.42% |
-| Region definitions/control | 19,741,961 | 20.35% |
-| Line/material plane | 68,789,217 | 70.90% |
-| other framing | 70,804 | 0.07% |
-| **total** | **97,021,934** | **100.00%** |
+| Root | 3,687,803 | 3.92% |
+| Block definitions | 586,843 | 0.62% |
+| path definitions | 828,100 | 0.88% |
+| object `NEED`/missing dialogue | 3,317,206 | 3.53% |
+| Region definitions/control | 19,746,257 | 21.01% |
+| Line/material plane | 65,743,189 | 69.95% |
+| other framing | 70,804 | 0.08% |
+| **total** | **93,980,202** | **100.00%** |
 
-The P26 selected blob wire, 19,756,636 bytes, is a subcomponent of the Line/material plane and must
+The P27 selected blob wire, 16,721,527 bytes, is a subcomponent of the Line/material plane and must
 not be added to the total again. The dominant remaining opportunity is material plus Region
 control; Root alone is only 3.69 MB. A new Root predictor must therefore earn a complete integrated
 gain rather than advertise a large ratio over an already-small structural stream.
@@ -890,7 +927,9 @@ gain rather than advertise a large ratio over an already-small structural stream
 | P24 | 108,378,454 | 263.47x | mixed Region materialization |
 | P25 key map | 113,834,804 | 250.84x | charged old association + F `NEED` |
 | M1 direct ordinal, same-machine control | 108,370,164 | 263.49x | removes redundant association |
-| P26 | **97,021,934** | **294.31x** | exact embedded-zlib factor |
+| P26 published environment | 97,021,934 | 294.31x | exact embedded-zlib factor |
+| P26 current same-input control | 97,015,268 | 294.33x | control for P27 attribution |
+| P27 | **93,980,202** | **303.84x** | exact canonical-MO factor beneath P26 |
 | P26 + rejected P4 | 100,546,398 | 283.99x | independent residual frames + alpha selector |
 
 P25 remains useful evidence for cache ownership, but its dense-to-`u64` association is superseded by
@@ -909,7 +948,7 @@ flowchart TB
     MATERIAL[Exact material<br/>Lines + residual + values]
     DIALOGUE[Cache dialogue<br/>NEED + definitions]
     FRAME[Selectors + framing]
-    TOTAL[Complete P26 wire<br/>97.02 MB]
+    TOTAL[Complete P27 wire<br/>93.98 MB]
 
     RAW --> STRUCT
     RAW --> MATERIAL
@@ -932,6 +971,10 @@ complete TU, and then compute `raw_bytes / complete_wire_bytes`.
 | P18 whole statements | template-like statement definitions | insufficient integrated gain |
 | P19 flat phrases | definition-plane phrases | insufficient integrated gain |
 | P4 alpha Lines | token/gap templates over live residual | +3.52 MB versus P26 and 0.423 GB/s C |
+| global residual word dictionary | complete-future word factor over `RAW_RUN` | loses 0.64 MB on Godot before causal restrictions |
+| sorted/front-coded residual Lines | whole-generation lexical order | loses 3.22 MB on Godot |
+| generation-wide alpha rules | complete-future P4 generalization | loses 1.04 MB on Godot |
+| eight-way Region-control split | whole-generation semantic component frames | saves only 0.24 MB on Godot |
 | local raw backreference | in-Region byte reuse | zstd represents it more cheaply |
 | project-source package | copies/patches from shipped source | causal admission screens do not repay bytes |
 | installed pretraining package | gives whole package to F at TU 0 | startup debt; C-only seed is smaller on 15/16 endpoints |
@@ -957,10 +1000,29 @@ evidence.
    daemon scenarios.
 6. **Broader 25-corpus screen:** portability/generalization, then complete rows as manifests exist.
 
-At the P26 minimum 1.110 GB/s, one ideal serial 28.55 GB codec pass represents about 25.7 seconds of
-transform work before file/process overhead. Cold plus two cache complements process 85.66 GB, or
-about 77 seconds at that limiting rate. The scenario matrix is much larger, which is why early stop
-rules matter.
+At the P27 designated encode/decode minimum of 1.073 GB/s, one ideal 28.55 GB codec subphase pass
+represents about 26.6 seconds before ingestion, file, process, and socket overhead. Cold plus two
+cache complements process 85.66 GB, or about 79.8 seconds at that limiting subphase rate. The
+scenario matrix is much larger, which is why early stop rules matter.
+
+That is not the complete C cost. On the designated Zen 4 host, a timed 5,932,762,185-byte Godot run
+measured:
+
+| Capability-harness phase | Wall time | Raw-rate equivalent |
+|---|---:|---:|
+| read, parse, and intern at C | 6.5 s | 0.91 GB/s |
+| S1 construction | 0.1 s | 59 GB/s |
+| already-ingested C encode | 5.51 s | 1.076 GB/s |
+| F decode and expansion | 4.99 s | 1.190 GB/s |
+| whole one-process harness | 18.16 s | 0.327 GB/s |
+
+GNU time recorded 18.56 user seconds plus 7.09 system seconds, or 25.65 CPU-seconds and 141%
+average utilization. That is 4.32 CPU-seconds per raw GB for the capability harness, including both
+simulated endpoints, exact verification, and harness overhead. Sequential C ingestion plus S1 plus
+encode is about 12.1 seconds, or 0.49 GB/s. If ingestion and encode are placed in independent
+streaming lanes, their observed stage ceiling is about 0.91 GB/s before concurrency. Consequently,
+the product-shaped test must measure the complete preprocessor-pipe-to-wire C path; the encode-only
+number cannot close that gate.
 
 ### Binding objectives
 
@@ -969,7 +1031,7 @@ rules matter.
 | cold 400x | complete empty-F wire no more than raw/400 |
 | half-cold 200x | both deterministic half-cache complements no more than raw/200 |
 | chronological H200 | online trailing-window ratio reaches 200x by 50% raw progress and remains there for the ruled horizon |
-| complete speed | minimum of C encode and F decode/expand at least 1 GB/s on the intended host |
+| complete speed | complete C ingest/intern/encode and F decode/expand each sustain at least 1 GB/s on the intended host |
 | exactness | every complete reconstructed `.ii` byte equals input |
 | balanced reporting | show byte-weighted aggregate, equal-corpus view, per-corpus tails, and exact count |
 
@@ -1049,8 +1111,9 @@ Continue M1 through M5 on the two-process branch:
 4. independent per-TU zstd-1/zstd-3 frames;
 5. complete cold/CACHE50/H200, change/reorder, multi-F, replacement, socket, and speed gates.
 
-P26 should snap in only as the isolated BYTE_ARRAY payload codec after the member-only ruling. It
-must not pull the exploratory capability harness wholesale into daemon code.
+P26 should snap in only as the isolated BYTE_ARRAY payload codec after the member-only ruling. P27
+can then snap in beneath that boundary as a separately selectable canonical-MO mode after review.
+Neither should pull the exploratory capability harness wholesale into daemon code.
 
 ### Research lane — local oracle
 
@@ -1059,18 +1122,19 @@ The P4 residual branch is closed. Return to causal Region/root superblocks:
 1. run deterministic S1, pair-promotion, and phrase-trie candidates first;
 2. preserve canonical immutable Blocks and first-profitable-use publication;
 3. produce all-16 learning, reorder, header-change, and revert curves;
-4. integrate the winner into the complete P26 ledger before claiming a ratio;
+4. integrate the winner into the complete P27 ledger before claiming a ratio;
 5. only then compare FTRL and the 32-tree GBDT at equal top-K work;
 6. use the broader 25-corpus set to test generalization and C-only raw-source bootstrap.
 
 ### Reviewer questions
 
 1. Accept or reject P26 member-only recovery as the exact high-throughput form.
-2. Decide whether pair promotion or a phrase trie is the smallest sufficient online superblock
+2. Accept or reject P27's four-part canonical-MO factor and 25% raw-reduction admission rule.
+3. Decide whether pair promotion or a phrase trie is the smallest sufficient online superblock
    learner after complete integration.
-3. Decide whether the cross-context canonical state earns its extra decoder state beyond ordinary
+4. Decide whether the cross-context canonical state earns its extra decoder state beyond ordinary
    S1 Blocks.
-4. Require ML only if it removes measured candidate-search CPU or complete wire beyond the
+5. Require ML only if it removes measured candidate-search CPU or complete wire beyond the
    deterministic baseline.
 
 ## Source reports
@@ -1081,6 +1145,8 @@ Complete-codec evidence:
 - [`HALF-COLD-P25-16CORPUS-REPORT.md`](HALF-COLD-P25-16CORPUS-REPORT.md)
 - [`DIRECT-ORDINAL-M1-16CORPUS-REPORT.md`](https://github.com/mickg10/icecream/blob/local-oracle/issue16-direct-ordinals/linecache/DIRECT-ORDINAL-M1-16CORPUS-REPORT.md)
 - [`COMPRESSED-BLOB-P26-16CORPUS-REPORT.md`](COMPRESSED-BLOB-P26-16CORPUS-REPORT.md)
+- [`MO-FACTOR-P27-16CORPUS-REPORT.md`](MO-FACTOR-P27-16CORPUS-REPORT.md)
+- [`RESIDUAL-AND-CONTROL-CEILINGS.md`](RESIDUAL-AND-CONTROL-CEILINGS.md)
 - [`ALPHA-LINES-P4-16CORPUS-REPORT.md`](ALPHA-LINES-P4-16CORPUS-REPORT.md)
 
 Predictor and pretraining evidence:
@@ -1096,6 +1162,8 @@ Machine-readable current ledgers:
 
 - [`compressed-blob-p26-16corpus-summary.json`](ml-artifacts/compressed-blob-p26-16corpus-summary.json)
 - [`compressed-blob-p26-16corpus.tsv`](ml-artifacts/compressed-blob-p26-16corpus.tsv)
+- [`mo-factor-p27-16corpus-summary.json`](ml-artifacts/mo-factor-p27-16corpus-summary.json)
+- [`mo-factor-p27-16corpus.tsv`](ml-artifacts/mo-factor-p27-16corpus.tsv)
 - [`alpha-lines-p4-16corpus-summary.json`](ml-artifacts/alpha-lines-p4-16corpus-summary.json)
 - [`alpha-lines-p4-16corpus.tsv`](ml-artifacts/alpha-lines-p4-16corpus.tsv)
 
@@ -1117,8 +1185,10 @@ programs: RAW_RUN, PUBLIC_LINE_REF, BYTE_ARRAY, and PP_MARKER, plus topological 
 and path definitions.
 
 P26 may transform complete zlib members inside BYTE_ARRAY values: inflated members become
-one zstd-3/LDM TU frame when smaller; untouched DEFLATE is the alternative. F regenerates
-and validates exact members, requesting only any member that differs.
+one zstd-3/LDM TU frame when smaller; untouched DEFLATE is the alternative. P27 may further
+factor canonical MO catalogs into original IDs, new original definitions, explicit translations,
+and ordinary members. F rebuilds exact inflated catalogs, then regenerates and validates exact
+zlib members, requesting only any member that differs.
 
 All remaining RAW_RUN bytes use ordinary per-TU zstd. P4 alpha templates are rejected.
 Root, definitions, controls, residual, values, requests, replies, selectors, and framing
@@ -1128,5 +1198,7 @@ F needs no predictor. It installs immutable definitions, executes the explicit p
 reconstructs the exact .ii, and writes it into the remote compiler pipe.
 
 Binding claims run on all 16 fixed corpora. The broader 25-corpus set screens model
-generalization. Cold 400x remains open; both deterministic half-cache 200x rows pass.
+generalization. P27 is currently 303.84x cold, leaving 22.59 MB to cold 400x; both deterministic
+half-cache 200x rows pass. Chronological H200 and the complete product-pipeline speed gate remain
+open.
 ```
