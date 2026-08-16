@@ -94,6 +94,8 @@ public:
     const char* line_data(uint32_t off) const { return line_bytes_.data()+off; }
     const uint32_t* region_ids_ptr(uint32_t rid) const { return region_ids_.data()+region_records_[rid].ids_off; }
     uint32_t region_ids_count(uint32_t rid) const { return region_records_[rid].ids_count; }
+    const char* region_data(uint32_t rid) const { return region_bytes_.data()+region_records_[rid].raw_off; }
+    uint32_t region_raw_len(uint32_t rid) const { return region_records_[rid].raw_len; }
     uint64_t distinct_line_bytes() const { return line_bytes_.size(); }
     void process(const char*begin,const char*end,uint32_t*out,size_t&out_count,uint64_t&hits,bool train,std::vector<uint32_t>*rout){
         const char*p=begin; uint32_t previous=UINT32_MAX;
@@ -290,6 +292,64 @@ struct PackedLines {
         offsets.push_back(bytes.size());
     }
 };
+struct MixedCLineState {
+    uint32_t source_region=UINT32_MAX;
+    uint32_t source_offset=0;
+    uint32_t public_id=0;
+};
+struct MixedFLineView {
+    uint32_t source_region=0;
+    uint32_t source_offset=0;
+    uint32_t length=0;
+};
+static bool system_source_path(const std::string&path){
+    return path.rfind("/usr/include/",0)==0||path.rfind("/usr/lib/gcc/",0)==0||path.rfind("/usr/local/include/",0)==0;
+}
+struct SourceText {
+    bool attempted=false,available=false;
+    std::vector<uint8_t> bytes;
+    std::vector<uint32_t> offsets;
+};
+class SourceTextStore {
+public:
+    explicit SourceTextStore(bool allowProject=false):allowProject_(allowProject){}
+    const SourceText& get(const std::string&path){
+        SourceText&source=files_[path];if(source.attempted)return source;source.attempted=true;source.offsets.push_back(0);
+        struct stat st{};if((!allowProject_&&!system_source_path(path))||stat(path.c_str(),&st)||st.st_size<0||uint64_t(st.st_size)>UINT32_MAX)return source;
+        FILE*file=fopen(path.c_str(),"rb");if(!file)return source;source.bytes.resize(size_t(st.st_size));
+        if(!source.bytes.empty()&&fread(source.bytes.data(),1,source.bytes.size(),file)!=source.bytes.size()){fclose(file);source.bytes.clear();return source;}fclose(file);
+        finish(source);return source;
+    }
+    bool install(const std::string&path,const uint8_t*data,size_t size){
+        if(size>UINT32_MAX)return false;
+        SourceText&source=files_[path];
+        if(source.available)return source.bytes.size()==size&&(!size||!memcmp(source.bytes.data(),data,size));
+        source={};source.attempted=true;source.offsets.push_back(0);
+        if(size)source.bytes.assign(data,data+size);
+        finish(source);return true;
+    }
+private:
+    static void finish(SourceText&source){
+        for(uint32_t i=0;i<source.bytes.size();++i)if(source.bytes[i]=='\n')source.offsets.push_back(i+1);
+        if(source.offsets.back()!=source.bytes.size())source.offsets.push_back(source.bytes.size());
+        source.available=true;
+    }
+    bool allowProject_=false;
+    std::unordered_map<std::string,SourceText> files_;
+};
+struct SourceAdmission {
+    uint64_t observed_benefit=0;
+    uint64_t package_cost=0;
+    size_t last_observed_tu=SIZE_MAX;
+    bool cost_known=false;
+    bool admitted=false;
+};
+static uint32_t common_prefix(const uint8_t*a,uint32_t an,const uint8_t*b,uint32_t bn){
+    uint32_t n=std::min(an,bn),i=0;while(i<n&&a[i]==b[i])++i;return i;
+}
+static uint32_t common_suffix(const uint8_t*a,uint32_t an,const uint8_t*b,uint32_t bn,uint32_t prefix){
+    uint32_t n=std::min(an-std::min(an,prefix),bn-std::min(bn,prefix)),i=0;while(i<n&&a[an-1-i]==b[bn-1-i])++i;return i;
+}
 static bool packed_line_less(const PackedLines&a,size_t ai,const PackedLines&b,size_t bi){
     size_t an=a.line_size(ai),bn=b.line_size(bi),common=std::min(an,bn);
     int order=memcmp(a.line_data(ai),b.line_data(bi),common);
@@ -385,7 +445,7 @@ struct RelLZ {
 };
 
 int main(int argc,char**argv){
-    const char* manifest=nullptr; size_t max_files=SIZE_MAX; int zlevel=3; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, usePriorRoot=false, useSortedLines=false, useByteArrayLines=false;
+    const char* manifest=nullptr; size_t max_files=SIZE_MAX; int zlevel=3; uint32_t sourceAdmitRatio=6; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, usePriorRoot=false, useSortedLines=false, useByteArrayLines=false, useMixedRegions=false, useProjectSource=false;
     for(int i=1;i<argc;++i){ if(!strcmp(argv[i],"--manifest")&&i+1<argc)manifest=argv[++i];
         else if(!strcmp(argv[i],"--z")&&i+1<argc)zlevel=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--no-d1"))useD1=false;
@@ -395,13 +455,19 @@ int main(int argc,char**argv){
         else if(!strcmp(argv[i],"--prior-root"))usePriorRoot=true;
         else if(!strcmp(argv[i],"--sorted-lines"))useSortedLines=true;
         else if(!strcmp(argv[i],"--byte-array-lines")){useSortedLines=true;useByteArrayLines=true;}
+        else if(!strcmp(argv[i],"--mixed-regions"))useMixedRegions=true;
+        else if(!strcmp(argv[i],"--source-package"))useProjectSource=true;
+        else if(!strcmp(argv[i],"--source-admit-ratio")&&i+1<argc){char*end=nullptr;unsigned long value=strtoul(argv[++i],&end,10);if(!end||*end||!value||value>1000){fprintf(stderr,"bad source admission ratio\n");return 2;}sourceAdmitRatio=uint32_t(value);}
         else if(!strcmp(argv[i],"--deep"))deep=true;         // run slow z19/z22 entropy ladder + reorder test
         else if(!strcmp(argv[i],"--warm"))warm=true;         // Basis C: 2nd pass with dict retained -> warm steady-state wire
         else if(!strcmp(argv[i],"--max-files")&&i+1<argc){ char*t=nullptr; unsigned long long v=strtoull(argv[++i],&t,10); if(!t||*t||!v){fprintf(stderr,"bad max-files\n");return 2;} max_files=size_t(v); }
         else { fprintf(stderr,"unknown %s\n",argv[i]); return 2; } }
-    if(!manifest){ fprintf(stderr,"usage: %s --manifest F [--z 0|1|3] [--no-d1] [--d2] [--prior-root] [--sorted-lines|--byte-array-lines] [--max-files N]\n",argv[0]); return 2; }
+    if(!manifest){ fprintf(stderr,"usage: %s --manifest F [--z 0|1|3] [--no-d1] [--d2] [--prior-root] [--sorted-lines|--byte-array-lines|--mixed-regions [--source-package [--source-admit-ratio N]]] [--max-files N]\n",argv[0]); return 2; }
+    if(useProjectSource&&!useMixedRegions){fprintf(stderr,"--source-package requires --mixed-regions\n");return 2;}
     if(usePriorRoot) useS1=false;
     if(useSortedLines){ useD1=false; useD2=false; useD2mine=false; if(warm){fprintf(stderr,"--sorted-lines warm pass not implemented\n");return 2;} }
+    if(useMixedRegions){ useSortedLines=false; useD1=false; useD2=false; useD2mine=false;
+        if(usePriorRoot||warm){fprintf(stderr,"--mixed-regions supports the cold S1 path only\n");return 2;} }
 #ifndef HAVE_DEFCODEC
     if(useD2){ fprintf(stderr,"note: --d2 requested but definition_codec.h not present; ignoring.\n"); useD2=false; }
 #endif
@@ -454,7 +520,7 @@ int main(int argc,char**argv){
     // ===== ENCODER (C) + DECODER (F): one cold chronological pass, PULL protocol (root -> MISSING -> FILL) =====
     // C tracks F's known sets (single F) so it computes exactly the missing closure. Every wire byte is
     // charged by category, compressed at z<=zlevel per message. F reconstructs .ii bytes byte-exact.
-    ZSTD_CCtx* z=ZSTD_createCCtx(); std::vector<uint8_t> dst;
+    ZSTD_CCtx* z=ZSTD_createCCtx();ZSTD_CCtx* sourceCostZ=useProjectSource?ZSTD_createCCtx():nullptr;std::vector<uint8_t> dst,sourceCostDst;
     std::vector<uint8_t> fknownLine(dict.distinct()+1,0), fknownReg(NREG,0);
     std::vector<uint32_t> ClineToF(dict.distinct()+1,0); uint32_t nextFline=1;
     std::array<ZSTD_CCtx*,5> lineZC{}; std::array<ZSTD_DCtx*,5> lineZD{};
@@ -464,11 +530,25 @@ int main(int argc,char**argv){
         ZSTD_CCtx_setParameter(lineZC[i],ZSTD_c_compressionLevel,zlevel);
         ZSTD_CCtx_setParameter(lineZC[i],ZSTD_c_contentSizeFlag,0);
     }
+    std::array<ZSTD_CCtx*,6> mixedZC{}; std::array<ZSTD_DCtx*,6> mixedZD{};
+    std::array<uint8_t,6> mixedZActive{};size_t mixedPartCount=useProjectSource?6:(useByteArrayLines?4:2);
+    if(useMixedRegions) for(size_t i=0;i<mixedPartCount;++i){
+        mixedZC[i]=ZSTD_createCCtx(); mixedZD[i]=ZSTD_createDCtx();
+        ZSTD_CCtx_setParameter(mixedZC[i],ZSTD_c_compressionLevel,zlevel);
+        ZSTD_CCtx_setParameter(mixedZC[i],ZSTD_c_contentSizeFlag,0);
+    }
+    std::vector<MixedCLineState> mixedCLine;
+    if(useMixedRegions)mixedCLine.resize(dict.distinct()+1);
+    uint32_t nextMixedPublic=1;SourceTextStore mixedCSource(useProjectSource),mixedFSource;
+    std::vector<uint8_t> mixedSourceSent;
+    std::vector<SourceAdmission> mixedSourceAdmission;
     std::unordered_map<std::string,uint32_t> pathid; std::vector<std::string> paths;   // D1 path objects (both sides derive same order)
     // ---- F's OWN independent store, built ONLY from decoded wire bytes (proves self-describing) ----
     std::vector<uint8_t> Fline_data; std::vector<size_t> Fline_off; Fline_off.push_back(0);   // line id k (1-based) -> [off[k-1],off[k])
     Fline_data.reserve(64u<<20);
     std::vector<uint32_t> Freg_child; std::vector<size_t> Freg_off; Freg_off.push_back(0);     // region id k (0-based) -> [off[k],off[k+1])
+    std::vector<uint8_t> FmixedRegionData; std::vector<size_t> FmixedRegionOff{0};
+    std::vector<MixedFLineView> FmixedPublic(1);
     std::vector<std::string> Fpaths;
     std::vector<uint8_t> fknownBlk(useS1?boff2.size():1,0);   // C's model of F's known blocks
     std::vector<uint32_t> Fblk_child; std::vector<size_t> Fblk_off; Fblk_off.push_back(0);      // F block k -> region ids
@@ -477,6 +557,8 @@ int main(int argc,char**argv){
     double w_blockdef=0;
     // wire byte accumulators (post-z, per category) + f-checkpoint tracking
     double w_root=0, w_linedef=0, w_regiondef=0, w_pathdef=0, w_missing=0, w_framing=0;
+    std::array<double,6> mixedPartWire{};std::array<uint64_t,7> mixedOps{};uint64_t mixedLiteralRaw=0,mixedArrayValues=0,mixedSourceBytes=0;
+    uint64_t mixedSourcePackageRaw=0,mixedSourcePackageFiles=0,mixedSourcePotentialRaw=0,mixedSourceConsidered=0,mixedSourceAdmitted=0,mixedSourceEstimatedCost=0;double mixedSelectorWire=0;
     const double FRAME=4;   // 4-byte length prefix per framed message
     uint64_t cum_raw=0; double cum_wire=0;
     // f-checkpoints + H200 trailing window
@@ -518,7 +600,10 @@ int main(int argc,char**argv){
         std::vector<uint8_t> fill_paths, fill_lines, fill_regions, fill_regions_raw, fill_blocks; uint32_t np=0,nl=0,nr=0,nb=0;
         std::vector<uint32_t> newLineIds;
         std::array<std::vector<uint8_t>,5> lineRaw, lineEncoded;
-        for(uint32_t r:missReg){ const uint32_t* lids=dict.region_ids_ptr(r); uint32_t c=dict.region_ids_count(r);
+        std::array<std::vector<uint8_t>,6> mixedRaw, mixedEncoded;
+        std::vector<GeneratedByteArray> mixedArrayEntries;
+        std::vector<std::pair<uint32_t,const SourceText*>> mixedSourceDefinitions;
+        if(!useMixedRegions) for(uint32_t r:missReg){ const uint32_t* lids=dict.region_ids_ptr(r); uint32_t c=dict.region_ids_count(r);
             for(uint32_t j=0;j<c;++j){ uint32_t ln=lids[j]; if(fknownLine[ln]) continue; fknownLine[ln]=1; ++nl;
                 const LineRef& lr=dict.ref(ln); const char* txt=dict.line_data(lr.off);
                 if(useSortedLines) newLineIds.push_back(ln);
@@ -532,6 +617,117 @@ int main(int argc,char**argv){
 #endif
                     else { put_varint(fill_lines,lr.len); fill_lines.insert(fill_lines.end(),txt,txt+lr.len); }
                     ++n_literal; }
+            }
+        }
+        if(useMixedRegions && !missReg.empty()){
+            put_varint(mixedRaw[0],missReg.size());
+            for(uint32_t r:missReg){
+                const uint32_t* lids=dict.region_ids_ptr(r); uint32_t count=dict.region_ids_count(r),offset=0,literalLength=0;
+                Marker regionMarker;bool regionMarkerOk=false;
+                if(count){const LineRef&first=dict.ref(lids[0]);regionMarkerOk=parse_marker(dict.line_data(first.off),first.len,regionMarker);}
+                const SourceText*regionSource=regionMarkerOk?&mixedCSource.get(regionMarker.path):nullptr;
+                auto ensurePathId=[&](const std::string&path){auto found=pathid.find(path);if(found!=pathid.end())return found->second;
+                    uint32_t id=uint32_t(paths.size());pathid.emplace(path,id);paths.push_back(path);put_varint(fill_paths,path.size());fill_paths.insert(fill_paths.end(),path.begin(),path.end());++np;return id;};
+                auto ensureSourceDefinition=[&](const std::string&path,uint32_t pathId,const SourceText&source){
+                    if(!useProjectSource||system_source_path(path))return;
+                    if(mixedSourceSent.size()<=pathId)mixedSourceSent.resize(size_t(pathId)+1);
+                    if(mixedSourceSent[pathId])return;
+                    mixedSourceSent[pathId]=1;mixedSourceDefinitions.emplace_back(pathId,&source);
+                };
+                put_varint(mixedRaw[0],dict.region_raw_len(r));
+                auto flushLiteral=[&](){ if(!literalLength)return; mixedRaw[0].push_back(0);put_varint(mixedRaw[0],literalLength);++mixedOps[0];literalLength=0; };
+                for(uint32_t j=0;j<count;++j){
+                    uint32_t lineId=lids[j];const LineRef&line=dict.ref(lineId);const char*text=dict.line_data(line.off);MixedCLineState&state=mixedCLine[lineId];
+                    if(state.public_id){
+                        flushLiteral();mixedRaw[0].push_back(2);put_varint(mixedRaw[0],state.public_id);++mixedOps[2];
+                    } else if(state.source_region!=UINT32_MAX&&state.source_region!=r){
+                        if(state.source_region>=r||state.source_offset+line.len>dict.region_raw_len(state.source_region)||
+                           memcmp(dict.region_data(state.source_region)+state.source_offset,text,line.len)){
+                            fprintf(stderr,"bad mixed source Line\n");return 2;
+                        }
+                        flushLiteral();mixedRaw[0].push_back(1);put_zigzag(mixedRaw[0],int64_t(state.source_region)-int64_t(r));
+                        put_varint(mixedRaw[0],state.source_offset);put_varint(mixedRaw[0],line.len);
+                        state.public_id=nextMixedPublic++;++mixedOps[1];
+                    } else {
+                        if(state.source_region==UINT32_MAX){state.source_region=r;state.source_offset=offset;}
+                        GeneratedByteArray parsed;Marker lineMarker;
+                        bool arrayLine=useByteArrayLines&&parse_byte_array(text,line.len,parsed),markerLine=parse_marker(text,line.len,lineMarker);
+                        size_t arrayValueCount=parsed.values.size();
+                        bool sourceCopy=false,sourcePatch=false;uint32_t sourceLine=0,patchPrefix=0,patchSuffix=0,patchMiddle=0;
+                        if(regionSource&&j>0){uint64_t candidate=uint64_t(regionMarker.lineno)+j-1;
+                            if(candidate&&candidate<regionSource->offsets.size()){uint32_t index=uint32_t(candidate-1),begin=regionSource->offsets[index],end=regionSource->offsets[index+1];
+                                if(regionSource->available){sourceLine=index;const uint8_t*base=regionSource->bytes.data()+begin;uint32_t baseLength=end-begin;
+                                    if(baseLength==line.len&&!memcmp(base,text,line.len))sourceCopy=true;
+                                    else {patchPrefix=common_prefix((const uint8_t*)text,line.len,base,baseLength);patchSuffix=common_suffix((const uint8_t*)text,line.len,base,baseLength,patchPrefix);patchMiddle=line.len-patchPrefix-patchSuffix;
+                                        size_t cost=1+varint_size(paths.size())+varint_size(sourceLine)+varint_size(patchPrefix)+varint_size(patchSuffix)+varint_size(patchMiddle)+patchMiddle;
+                                        sourcePatch=cost<line.len;}}
+                            }
+                        }
+                        bool systemSource=regionSource&&system_source_path(regionMarker.path),sourceAdmitted=systemSource;
+                        uint32_t sourcePath=UINT32_MAX;SourceAdmission*admission=nullptr;
+                        if(regionSource&&(sourceCopy||sourcePatch)&&!systemSource&&useProjectSource){
+                            sourcePath=ensurePathId(regionMarker.path);
+                            if(mixedSourceAdmission.size()<=sourcePath)mixedSourceAdmission.resize(size_t(sourcePath)+1);
+                            admission=&mixedSourceAdmission[sourcePath];
+                            if(!admission->cost_known){
+                                admission->package_cost=zstd_size(sourceCostZ,regionSource->bytes.data(),regionSource->bytes.size(),zlevel,sourceCostDst)
+                                    +varint_size(sourcePath)+varint_size(regionSource->bytes.size())+16;
+                                mixedSourceEstimatedCost+=admission->package_cost;++mixedSourceConsidered;admission->cost_known=true;
+                            }
+                            if(!admission->admitted&&admission->last_observed_tu!=SIZE_MAX&&admission->last_observed_tu<t&&
+                               admission->observed_benefit>=uint64_t(sourceAdmitRatio)*admission->package_cost){
+                                admission->admitted=true;++mixedSourceAdmitted;
+                            }
+                            sourceAdmitted=admission->admitted;
+                        }
+                        if(sourceCopy&&sourceAdmitted){
+                            if(sourcePath==UINT32_MAX)sourcePath=ensurePathId(regionMarker.path);
+                            ensureSourceDefinition(regionMarker.path,sourcePath,*regionSource);
+                            flushLiteral();mixedRaw[0].push_back(5);put_varint(mixedRaw[0],sourcePath);put_varint(mixedRaw[0],sourceLine);++mixedOps[5];mixedSourceBytes+=line.len;
+                        } else if(arrayLine){
+                            mixedArrayValues+=parsed.values.size();flushLiteral();mixedRaw[0].push_back(3);mixedArrayEntries.push_back(std::move(parsed));++mixedOps[3];++n_literal;
+                        } else if(markerLine){
+                            uint32_t pathId=ensurePathId(lineMarker.path);
+                            flushLiteral();mixedRaw[0].push_back(4);put_varint(mixedRaw[0],pathId);put_varint(mixedRaw[0],lineMarker.lineno);
+                            put_varint(mixedRaw[0],lineMarker.flags.size());for(uint8_t flag:lineMarker.flags)mixedRaw[0].push_back(flag);++mixedOps[4];++n_marker;
+                        } else if(sourcePatch&&sourceAdmitted){
+                            if(sourcePath==UINT32_MAX)sourcePath=ensurePathId(regionMarker.path);
+                            ensureSourceDefinition(regionMarker.path,sourcePath,*regionSource);
+                            flushLiteral();mixedRaw[0].push_back(6);put_varint(mixedRaw[0],sourcePath);put_varint(mixedRaw[0],sourceLine);
+                            put_varint(mixedRaw[0],patchPrefix);put_varint(mixedRaw[0],patchSuffix);put_varint(mixedRaw[0],patchMiddle);mixedRaw[1].insert(mixedRaw[1].end(),text+patchPrefix,text+patchPrefix+patchMiddle);
+                            ++mixedOps[6];mixedLiteralRaw+=patchMiddle;mixedSourceBytes+=patchPrefix+patchSuffix;++n_literal;
+                        } else {mixedRaw[1].insert(mixedRaw[1].end(),text,text+line.len);literalLength+=line.len;mixedLiteralRaw+=line.len;++n_literal;}
+                        if(admission&&!admission->admitted){
+                            uint64_t benefit=sourceCopy?(arrayLine?arrayValueCount:(markerLine?0:line.len)):
+                                ((!arrayLine&&!markerLine&&sourcePatch)?uint64_t(patchPrefix)+patchSuffix:0);
+                            admission->observed_benefit+=benefit;admission->last_observed_tu=t;mixedSourcePotentialRaw+=benefit;
+                        }
+                    }
+                    offset+=line.len;
+                }
+                flushLiteral();
+                if(offset!=dict.region_raw_len(r)){fprintf(stderr,"mixed Region length differs\n");return 2;}
+                fknownReg[r]=1;++nr;
+            }
+            if(!mixedArrayEntries.empty()){
+                std::vector<ByteArrayStyle> styles;styles.reserve(mixedArrayEntries.size());
+                for(const auto&value:mixedArrayEntries)styles.push_back({value.prefix,value.separator,value.suffix,value.format});
+                std::sort(styles.begin(),styles.end());styles.erase(std::unique(styles.begin(),styles.end()),styles.end());
+                put_varint(mixedRaw[2],styles.size());
+                for(const auto&style:styles){put_varint(mixedRaw[2],style.format);
+                    for(const std::string*field:{&style.prefix,&style.separator,&style.suffix}){put_varint(mixedRaw[2],field->size());mixedRaw[2].insert(mixedRaw[2].end(),field->begin(),field->end());}}
+                put_varint(mixedRaw[2],mixedArrayEntries.size());
+                for(const auto&value:mixedArrayEntries){ByteArrayStyle style{value.prefix,value.separator,value.suffix,value.format};
+                    size_t styleId=std::lower_bound(styles.begin(),styles.end(),style)-styles.begin();put_varint(mixedRaw[2],styleId);put_varint(mixedRaw[2],value.values.size());
+                    mixedRaw[3].insert(mixedRaw[3].end(),value.values.begin(),value.values.end());}
+            }
+            if(!mixedSourceDefinitions.empty()){
+                put_varint(mixedRaw[4],mixedSourceDefinitions.size());
+                for(const auto&definition:mixedSourceDefinitions){
+                    put_varint(mixedRaw[4],definition.first);put_varint(mixedRaw[4],definition.second->bytes.size());
+                    mixedRaw[5].insert(mixedRaw[5].end(),definition.second->bytes.begin(),definition.second->bytes.end());
+                    mixedSourcePackageRaw+=definition.second->bytes.size();++mixedSourcePackageFiles;
+                }
             }
         }
         if(useSortedLines && nl){
@@ -580,7 +776,22 @@ int main(int argc,char**argv){
                 w_linedef+=tail.size(); lineEncoded[i].insert(lineEncoded[i].end(),tail.begin(),tail.end());
             }
         }
-        for(uint32_t r:missReg){ const uint32_t* lids=dict.region_ids_ptr(r); uint32_t c=dict.region_ids_count(r);
+        if(useMixedRegions&&nr){
+            for(size_t i=0;i<mixedPartCount;++i) if(!mixedRaw[i].empty()){
+                mixedEncoded[i]=zstd_stream_encode(mixedZC[i],mixedRaw[i],ZSTD_e_flush);mixedZActive[i]=1;
+                double bytes=mixedEncoded[i].size()+FRAME;mixedPartWire[i]+=bytes;(i==0?w_regiondef:w_linedef)+=bytes;
+            }
+            if(useByteArrayLines){w_linedef+=1;mixedSelectorWire+=1;}
+        }
+        if(useMixedRegions&&t+1==TUs){
+            const std::vector<uint8_t> empty;
+            for(size_t i=0;i<mixedPartCount;++i) if(mixedZActive[i]){
+                std::vector<uint8_t> tail=zstd_stream_encode(mixedZC[i],empty,ZSTD_e_end);
+                double&wire=i==0?w_regiondef:w_linedef;if(mixedEncoded[i].empty()&&!tail.empty()){wire+=FRAME;mixedPartWire[i]+=FRAME;}
+                wire+=tail.size();mixedPartWire[i]+=tail.size();mixedEncoded[i].insert(mixedEncoded[i].end(),tail.begin(),tail.end());
+            }
+        }
+        if(!useMixedRegions) for(uint32_t r:missReg){ const uint32_t* lids=dict.region_ids_ptr(r); uint32_t c=dict.region_ids_count(r);
             put_varint(fill_regions,c); { int64_t prev=0; for(uint32_t j=0;j<c;++j){
                 uint32_t wireLine=useSortedLines?ClineToF[lids[j]]:lids[j]; if(!wireLine){fprintf(stderr,"missing Line mapping\n");return 2;}
                 put_zigzag(fill_regions,int64_t(wireLine)-prev); prev=int64_t(wireLine); } } fknownReg[r]=1; ++nr;
@@ -594,7 +805,7 @@ int main(int argc,char**argv){
         if(np){ w_pathdef += zstd_size(z,fill_paths.data(),fill_paths.size(),zlevel,dst); allPaths.insert(allPaths.end(),fill_paths.begin(),fill_paths.end()); }
         if(nl && !useSortedLines){ w_linedef += zstd_size(z,fill_lines.data(),fill_lines.size(),zlevel,dst); allLineDefs.insert(allLineDefs.end(),fill_lines.begin(),fill_lines.end()); }
         bool reg_raw=false;
-        if(nr){ double dz=zstd_size(z,fill_regions.data(),fill_regions.size(),zlevel,dst);
+        if(nr&&!useMixedRegions){ double dz=zstd_size(z,fill_regions.data(),fill_regions.size(),zlevel,dst);
                 double rz=zstd_size(z,fill_regions_raw.data(),fill_regions_raw.size(),zlevel,dst);
                 reg_raw = rz<dz; w_regiondef += (reg_raw?rz:dz) + 1;   // +1 byte serialization flag (delta vs raw line-ids)
                 allRegions.insert(allRegions.end(),fill_regions.begin(),fill_regions.end()); }
@@ -609,7 +820,69 @@ int main(int argc,char**argv){
         enc_s += std::chrono::duration<double>(Clock::now()-_te).count(); auto _td=Clock::now();
         // --- DECODER (F): install FILL from wire into F's OWN store, then expand ROOT tokens ---
         { const uint8_t* pp=fill_paths.data(); for(uint32_t k=0;k<np;++k){ uint64_t L=get_varint(pp); Fpaths.emplace_back((const char*)pp,(size_t)L); pp+=L; } }
-        if(useSortedLines){
+        if(useMixedRegions){
+          std::array<std::vector<uint8_t>,6> recovered;
+          for(size_t i=0;i<mixedPartCount;++i) if(!mixedEncoded[i].empty()){
+            size_t remaining=1;recovered[i]=zstd_stream_decode(mixedZD[i],mixedEncoded[i],remaining);
+            if(recovered[i]!=mixedRaw[i]||(t+1==TUs&&remaining!=0)){fprintf(stderr,"mixed Region stream mismatch TU=%zu part=%zu\n",t,i);return 2;}
+          }
+          if(!recovered[4].empty()){
+            const uint8_t*sp=recovered[4].data(),*se=sp+recovered[4].size(),*bp=recovered[5].data(),*be=bp+recovered[5].size();
+            uint64_t sourceCount=get_varint(sp);
+            for(uint64_t k=0;k<sourceCount;++k){
+              uint64_t pathId=get_varint(sp),length=get_varint(sp);
+              if(pathId>=Fpaths.size()||length>uint64_t(be-bp)||!mixedFSource.install(Fpaths[pathId],bp,length)){fprintf(stderr,"bad mixed source definition\n");return 2;}
+              bp+=length;
+            }
+            if(sp!=se||bp!=be){fprintf(stderr,"mixed source definitions have trailing bytes\n");return 2;}
+          } else if(!recovered[5].empty()){fprintf(stderr,"partial mixed source definition streams\n");return 2;}
+          const uint8_t*ap=recovered[2].data(),*ae=ap+recovered[2].size(),*vp=recovered[3].data(),*ve=vp+recovered[3].size();
+          std::vector<ByteArrayStyle> mixedStyles;uint64_t arrayCount=0,arraysUsed=0;
+          if(!recovered[2].empty()){
+            uint64_t styleCount=get_varint(ap);mixedStyles.reserve(styleCount);
+            for(uint64_t k=0;k<styleCount;++k){ByteArrayStyle style;uint64_t format=get_varint(ap);if(format>HEX_UU){fprintf(stderr,"bad mixed array format\n");return 2;}style.format=uint8_t(format);
+              for(std::string*field:{&style.prefix,&style.separator,&style.suffix}){uint64_t size=get_varint(ap);if(size>uint64_t(ae-ap)){fprintf(stderr,"bad mixed array style\n");return 2;}field->assign((const char*)ap,size);ap+=size;}mixedStyles.push_back(std::move(style));}
+            arrayCount=get_varint(ap);
+          } else if(!recovered[3].empty()){fprintf(stderr,"partial mixed array streams\n");return 2;}
+          if(!recovered[0].empty()){
+            const uint8_t*cp=recovered[0].data(),*ce=cp+recovered[0].size();const uint8_t*lp=recovered[1].data(),*le=lp+recovered[1].size();
+            uint64_t regionCount=get_varint(cp);if(regionCount!=nr||regionCount!=missReg.size()){fprintf(stderr,"mixed Region count differs\n");return 2;}
+            for(uint64_t k=0;k<regionCount;++k){
+              uint32_t regionId=uint32_t(FmixedRegionOff.size()-1);if(regionId!=missReg[k]){fprintf(stderr,"mixed Region identity differs\n");return 2;}
+              uint64_t rawLength=get_varint(cp);size_t begin=FmixedRegionData.size();
+              while(FmixedRegionData.size()-begin<rawLength){
+                if(cp>=ce){fprintf(stderr,"truncated mixed Region control\n");return 2;}uint8_t op=*cp++;
+                if(op==0){uint64_t length=get_varint(cp);if(length>uint64_t(le-lp)){fprintf(stderr,"truncated mixed literal\n");return 2;}FmixedRegionData.insert(FmixedRegionData.end(),lp,lp+length);lp+=length;}
+                else if(op==1){int64_t source=int64_t(regionId)+get_zigzag(cp);uint64_t offset=get_varint(cp),length=get_varint(cp);
+                  if(source<0||uint64_t(source+1)>=FmixedRegionOff.size()||offset+length>FmixedRegionOff[source+1]-FmixedRegionOff[source]){fprintf(stderr,"bad mixed publish view\n");return 2;}
+                  size_t sourceBegin=FmixedRegionOff[source]+offset,destination=FmixedRegionData.size();FmixedRegionData.resize(destination+length);memcpy(FmixedRegionData.data()+destination,FmixedRegionData.data()+sourceBegin,length);
+                  FmixedPublic.push_back({uint32_t(source),uint32_t(offset),uint32_t(length)});
+                } else if(op==2){uint64_t publicId=get_varint(cp);if(!publicId||publicId>=FmixedPublic.size()){fprintf(stderr,"bad mixed public ref\n");return 2;}
+                  const MixedFLineView&view=FmixedPublic[publicId];size_t sourceBegin=FmixedRegionOff[view.source_region]+view.source_offset,destination=FmixedRegionData.size();
+                  FmixedRegionData.resize(destination+view.length);memcpy(FmixedRegionData.data()+destination,FmixedRegionData.data()+sourceBegin,view.length);
+                } else if(op==3){if(arraysUsed>=arrayCount){fprintf(stderr,"missing mixed array record\n");return 2;}uint64_t styleId=get_varint(ap),count=get_varint(ap);
+                  if(styleId>=mixedStyles.size()||count>uint64_t(ve-vp)){fprintf(stderr,"bad mixed array record\n");return 2;}
+                  append_rendered_byte_array(mixedStyles[styleId],vp,count,FmixedRegionData);vp+=count;++arraysUsed;
+                } else if(op==4){uint64_t pathId=get_varint(cp),lineNumber=get_varint(cp),flagCount=get_varint(cp);
+                  if(pathId>=Fpaths.size()||flagCount>uint64_t(ce-cp)){fprintf(stderr,"bad mixed marker record\n");return 2;}Marker marker;marker.path=Fpaths[pathId];marker.lineno=lineNumber;
+                  marker.flags.assign(cp,cp+flagCount);cp+=flagCount;tmp.clear();emit_marker(marker,tmp);FmixedRegionData.insert(FmixedRegionData.end(),tmp.begin(),tmp.end());
+                } else if(op==5){uint64_t pathId=get_varint(cp),lineIndex=get_varint(cp);if(pathId>=Fpaths.size()){fprintf(stderr,"bad mixed source path\n");return 2;}
+                  const SourceText&source=mixedFSource.get(Fpaths[pathId]);if(!source.available||lineIndex+1>=source.offsets.size()){fprintf(stderr,"bad mixed source Line\n");return 2;}
+                  uint32_t begin=source.offsets[lineIndex],end=source.offsets[lineIndex+1];FmixedRegionData.insert(FmixedRegionData.end(),source.bytes.begin()+begin,source.bytes.begin()+end);
+                } else if(op==6){uint64_t pathId=get_varint(cp),lineIndex=get_varint(cp),prefix=get_varint(cp),suffix=get_varint(cp),middle=get_varint(cp);
+                  if(pathId>=Fpaths.size()||middle>uint64_t(le-lp)){fprintf(stderr,"bad mixed source patch\n");return 2;}const SourceText&source=mixedFSource.get(Fpaths[pathId]);
+                  if(!source.available||lineIndex+1>=source.offsets.size()){fprintf(stderr,"bad mixed source patch Line\n");return 2;}uint32_t begin=source.offsets[lineIndex],end=source.offsets[lineIndex+1];
+                  if(prefix+suffix>end-begin){fprintf(stderr,"bad mixed source patch extent\n");return 2;}FmixedRegionData.insert(FmixedRegionData.end(),source.bytes.begin()+begin,source.bytes.begin()+begin+prefix);
+                  FmixedRegionData.insert(FmixedRegionData.end(),lp,lp+middle);lp+=middle;FmixedRegionData.insert(FmixedRegionData.end(),source.bytes.begin()+end-suffix,source.bytes.begin()+end);
+                } else {fprintf(stderr,"bad mixed Region opcode\n");return 2;}
+                if(FmixedRegionData.size()-begin>rawLength){fprintf(stderr,"mixed Region overrun\n");return 2;}
+              }
+              if(rawLength!=dict.region_raw_len(regionId)||memcmp(FmixedRegionData.data()+begin,dict.region_data(regionId),rawLength)){fprintf(stderr,"mixed Region differs\n");return 2;}
+              FmixedRegionOff.push_back(FmixedRegionData.size());
+            }
+            if(cp!=ce||lp!=le||ap!=ae||vp!=ve||arraysUsed!=arrayCount||FmixedPublic.size()!=nextMixedPublic){fprintf(stderr,"mixed Region streams have trailing bytes or state differs\n");return 2;}
+          } else if(nr||!recovered[1].empty()){fprintf(stderr,"partial mixed Region streams\n");return 2;}
+        } else if(useSortedLines){
           std::array<std::vector<uint8_t>,5> recovered;
           for(size_t i=0;i<linePartCount;++i) if(!lineEncoded[i].empty()){
             size_t remaining=1; recovered[i]=zstd_stream_decode(lineZD[i],lineEncoded[i],remaining);
@@ -662,16 +935,20 @@ int main(int argc,char**argv){
 #endif
               else { uint64_t len=get_varint(pp); Fline_data.insert(Fline_data.end(),pp,pp+len); pp+=len; Fline_off.push_back(Fline_data.size()); }
             } } }
-        if(reg_raw){ const uint8_t* pp=fill_regions_raw.data(), *pe=fill_regions_raw.data()+fill_regions_raw.size();
-          while(pp<pe){ uint64_t c=get_varint(pp); for(uint64_t j=0;j<c;++j) Freg_child.push_back(uint32_t(get_varint(pp))); Freg_off.push_back(Freg_child.size()); } }
-        else { const uint8_t* pp=fill_regions.data(), *pe=fill_regions.data()+fill_regions.size();
-          while(pp<pe){ uint64_t c=get_varint(pp); int64_t prev=0; for(uint64_t j=0;j<c;++j){ prev+=get_zigzag(pp); Freg_child.push_back(uint32_t(prev)); } Freg_off.push_back(Freg_child.size()); } }
+        if(!useMixedRegions){
+          if(reg_raw){ const uint8_t* pp=fill_regions_raw.data(), *pe=fill_regions_raw.data()+fill_regions_raw.size();
+            while(pp<pe){ uint64_t c=get_varint(pp); for(uint64_t j=0;j<c;++j) Freg_child.push_back(uint32_t(get_varint(pp))); Freg_off.push_back(Freg_child.size()); } }
+          else { const uint8_t* pp=fill_regions.data(), *pe=fill_regions.data()+fill_regions.size();
+            while(pp<pe){ uint64_t c=get_varint(pp); int64_t prev=0; for(uint64_t j=0;j<c;++j){ prev+=get_zigzag(pp); Freg_child.push_back(uint32_t(prev)); } Freg_off.push_back(Freg_child.size()); } }
+        }
         { const uint8_t* pp=fill_blocks.data(), *pe=fill_blocks.data()+fill_blocks.size();
           while(pp<pe){ uint8_t kind=*pp++;
             if(kind==1){ uint64_t src=get_varint(pp); uint64_t L=get_varint(pp); for(uint64_t j=0;j<L;++j) Fblk_child.push_back(Freg_stream[src+j]); Fblk_off.push_back(Fblk_child.size()); }
             else { uint64_t L=get_varint(pp); for(uint64_t j=0;j<L;++j) Fblk_child.push_back(uint32_t(get_varint(pp))); Fblk_off.push_back(Fblk_child.size()); } } }
         recon.clear();
-        auto emitRegionF=[&](uint32_t r){ Freg_stream.push_back(r); for(size_t j=Freg_off[r];j<Freg_off[r+1];++j){ uint32_t ln=Freg_child[j]; recon.insert(recon.end(), Fline_data.begin()+Fline_off[ln-1], Fline_data.begin()+Fline_off[ln]); } };
+        auto emitRegionF=[&](uint32_t r){ Freg_stream.push_back(r);
+          if(useMixedRegions)recon.insert(recon.end(),FmixedRegionData.begin()+FmixedRegionOff[r],FmixedRegionData.begin()+FmixedRegionOff[r+1]);
+          else for(size_t j=Freg_off[r];j<Freg_off[r+1];++j){ uint32_t ln=Freg_child[j]; recon.insert(recon.end(), Fline_data.begin()+Fline_off[ln-1], Fline_data.begin()+Fline_off[ln]); } };
         { const uint8_t* pp=rootb.data(), *pe=rootb.data()+rootb.size();
           if(usePriorRoot){
             uint64_t expected=get_varint(pp), produced=0;
@@ -703,13 +980,15 @@ int main(int argc,char**argv){
     }
     while(ck.size()<ck_f.size()) ck.push_back({ck_f[ck.size()], double(cum_raw)/cum_wire});
     ZSTD_freeCCtx(z);
+    if(sourceCostZ)ZSTD_freeCCtx(sourceCostZ);
     if(useSortedLines) for(size_t i=0;i<linePartCount;++i){ ZSTD_freeCCtx(lineZC[i]); ZSTD_freeDCtx(lineZD[i]); }
+    if(useMixedRegions) for(size_t i=0;i<mixedPartCount;++i){ ZSTD_freeCCtx(mixedZC[i]); ZSTD_freeDCtx(mixedZD[i]); }
 
     double totalwire = w_root+w_linedef+w_regiondef+w_pathdef+w_blockdef+w_missing+w_framing;
     double MiB=1048576.0;
     const char* structure_name=usePriorRoot?"V1+P22(ROOT_SLICE)":(useS1?"V1+S1(LZ blocks)":"V1");
-    const char* line_name=useByteArrayLines?"+P21(BYTE_ARRAY)":(useSortedLines?"+P9(sorted-lines)":"");
-    printf("\n==== CODEC-50 (%s%s%s%s, z%d) — %s ====\n", structure_name, useD1?"+D1":"", line_name, (useD2mine?"+D2(inline)":(useD2?"+D2(helper)":"")), zlevel, manifest);
+    const char* line_name=useMixedRegions?(useByteArrayLines?"+P24(mixed-regions+BYTE_ARRAY)":"+P24(mixed-regions)"):(useByteArrayLines?"+P21(BYTE_ARRAY)":(useSortedLines?"+P9(sorted-lines)":""));
+    printf("\n==== CODEC-50 (%s%s%s%s%s, z%d) — %s ====\n", structure_name, useD1?"+D1":"", line_name, useProjectSource?"+SOURCE_PACKAGE":"", (useD2mine?"+D2(inline)":(useD2?"+D2(helper)":"")), zlevel, manifest);
     printf("byte-exact=%s  TUs=%zu raw=%.1f MiB regions=%u distinct_lines=%u paths=%zu blocks=%zu (marker_lines=%llu literal_lines=%llu)\n",
         byteexact?"OK":"FAIL",TUs,corpus.raw/MiB,NREG,dict.distinct(),paths.size(),boff2.size()-1,(unsigned long long)n_marker,(unsigned long long)n_literal);
     printf("wire by category (post-z%d, bytes): root=%.0f line_def=%.0f region_def=%.0f block_def=%.0f path_def=%.0f missing=%.0f framing=%.0f  TOTAL=%.0f (%.2f MiB)\n",
@@ -719,7 +998,13 @@ int main(int argc,char**argv){
         (unsigned long long)root_slices.copies,(unsigned long long)root_slices.copied_regions,
         (unsigned long long)root_slices.indexed_windows,(unsigned long long)root_slices.index_entries,
         Froot_child.size()*sizeof(uint32_t)+Froot_off.size()*sizeof(size_t));
-    if(!useSortedLines){ ZSTD_CCtx* z2=ZSTD_createCCtx(); std::vector<uint8_t> d2b;
+    if(useMixedRegions)printf("mixed components: control=%.0f literal=%.0f array_control=%.0f array_values=%.0f source_control=%.0f source_files=%.0f selector=%.0f raw_literal=%llu raw_array_values=%llu raw_source_reused=%llu source_package_raw=%llu source_package_files=%llu public_lines=%u ops=[literal=%llu publish=%llu ref=%llu array=%llu marker=%llu source=%llu patch=%llu]\n",
+        mixedPartWire[0],mixedPartWire[1],mixedPartWire[2],mixedPartWire[3],mixedPartWire[4],mixedPartWire[5],mixedSelectorWire,
+        (unsigned long long)mixedLiteralRaw,(unsigned long long)mixedArrayValues,(unsigned long long)mixedSourceBytes,(unsigned long long)mixedSourcePackageRaw,(unsigned long long)mixedSourcePackageFiles,nextMixedPublic-1,
+        (unsigned long long)mixedOps[0],(unsigned long long)mixedOps[1],(unsigned long long)mixedOps[2],(unsigned long long)mixedOps[3],(unsigned long long)mixedOps[4],(unsigned long long)mixedOps[5],(unsigned long long)mixedOps[6]);
+    if(useProjectSource)printf("source admission: ratio=%u considered=%llu admitted=%llu observed_potential_raw=%llu estimated_independent_package_wire=%llu\n",
+        sourceAdmitRatio,(unsigned long long)mixedSourceConsidered,(unsigned long long)mixedSourceAdmitted,(unsigned long long)mixedSourcePotentialRaw,(unsigned long long)mixedSourceEstimatedCost);
+    if(!useSortedLines&&!useMixedRegions){ ZSTD_CCtx* z2=ZSTD_createCCtx(); std::vector<uint8_t> d2b;
       double bl=allLineDefs.empty()?0:zstd_size(z2,allLineDefs.data(),allLineDefs.size(),zlevel,d2b);
       double br=allRoots.empty()?0:zstd_size(z2,allRoots.data(),allRoots.size(),zlevel,d2b);
       // long-distance structure ceiling for line_def: z3 with unbounded window + LDM (what a perfect
@@ -781,7 +1066,7 @@ int main(int argc,char**argv){
         printf("DIAG reorder test (z%d-legal structure vs z19's 5.96MiB):\n",zlevel);
         printf("    sorted-concat z%d       = %.2f MiB (%.1f B/line)\n",zlevel,rs/MiB,double(rs)/double(n_literal));
         printf("    sorted+front-coded z%d  = %.2f MiB (%.1f B/line)  [+perm cost ~%.2f MiB to send ids]\n",zlevel,rf/MiB,double(rf)/double(n_literal),double(D)*2.2/MiB); } }
-    else printf("DIAG legacy Line ceilings omitted for the persistent sorted-Line format\n");
+    else printf("DIAG legacy Line ceilings omitted for the selected persistent definition format\n");
     printf("H200 f-checkpoints (cum raw fraction -> cumulative ratio):\n");
     for(auto&c:ck) printf("  f=%.2f  ratio=%.0fx\n",c.first,c.second);
     // trailing-window (5% raw) ratio near the end
