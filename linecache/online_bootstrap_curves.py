@@ -57,6 +57,7 @@ from pretrained_superblocks import (
 
 MODEL_VERSION = 1
 REFERENCE_MODEL_VERSION = 1
+MIXED_DEFINITION_VERSION = 2
 
 
 def clone_package(package: StaticPackage) -> StaticPackage:
@@ -193,6 +194,86 @@ def deserialize_reference_batch(raw: bytes, store: RegionIdStore) -> list[bytes]
     if len(set(keys)) != len(keys):
         raise ValueError("duplicate phrase within Region-reference batch")
     return keys
+
+
+def serialize_mixed_definition_batch(
+    keys: Sequence[bytes],
+    store: RegionIdStore,
+) -> bytes:
+    """Use dense references when possible and exact keys for unseen Regions."""
+    out = bytearray(put_varint(MIXED_DEFINITION_VERSION))
+    out += put_varint(len(keys))
+    for key in keys:
+        regions = decode_key(key)
+        if all(region in store.ids for region in regions):
+            out.append(0)
+            out += put_varint(len(regions))
+            previous = 0
+            for region in regions:
+                region_id = store.ids[region]
+                out += put_signed_delta(region_id - previous)
+                previous = region_id
+        else:
+            out.append(1)
+            out += put_varint(len(key))
+            out += key
+    return bytes(out)
+
+
+def deserialize_mixed_definition_batch(
+    raw: bytes,
+    store: RegionIdStore,
+) -> list[bytes]:
+    version, offset = get_varint(raw, 0)
+    if version != MIXED_DEFINITION_VERSION:
+        raise ValueError("unknown mixed phrase-definition version")
+    count, offset = get_varint(raw, offset)
+    keys: list[bytes] = []
+    for _ in range(count):
+        if offset >= len(raw):
+            raise ValueError("truncated mixed phrase definition")
+        representation = raw[offset]
+        offset += 1
+        if representation == 0:
+            region_count, offset = get_varint(raw, offset)
+            previous = 0
+            regions: list[tuple[int, int, int]] = []
+            for _ in range(region_count):
+                delta, offset = get_signed_delta(raw, offset)
+                region_id = previous + delta
+                if not 0 < region_id < len(store.values):
+                    raise ValueError("mixed phrase references an unknown Region ID")
+                regions.append(store.values[region_id])
+                previous = region_id
+            keys.append(encode_regions(regions))
+        elif representation == 1:
+            size, offset = get_varint(raw, offset)
+            if offset + size > len(raw):
+                raise ValueError("truncated exact phrase definition")
+            key = raw[offset:offset + size]
+            offset += size
+            decode_key(key)
+            keys.append(key)
+        else:
+            raise ValueError("unknown mixed phrase representation")
+    if offset != len(raw):
+        raise ValueError("trailing mixed phrase-definition bytes")
+    if len(set(keys)) != len(keys):
+        raise ValueError("duplicate phrase within mixed definition batch")
+    return keys
+
+
+def deserialize_definition_batch(
+    raw: bytes,
+    store: RegionIdStore,
+) -> list[bytes]:
+    """Dispatch solely from the definition block's on-wire version."""
+    version, _ = get_varint(raw, 0)
+    if version == REFERENCE_MODEL_VERSION:
+        return deserialize_reference_batch(raw, store)
+    if version == MIXED_DEFINITION_VERSION:
+        return deserialize_mixed_definition_batch(raw, store)
+    raise ValueError("unknown phrase-definition version")
 
 
 def clone_encoder(source: ExactEncoder, package: StaticPackage) -> ExactEncoder:
@@ -800,6 +881,7 @@ class OnlineResult:
     candidate_capacity: int
     publication: str
     budget_basis: str
+    pretrained_mode: str
     phrase_scope: str
     parse_policy: str
     cross_probe_tus: int
@@ -819,6 +901,10 @@ class OnlineResult:
     online_selected_tus: int = 0
     candidate_observations: int = 0
     final_logical_state_bytes: int = 0
+    seed_assets: int = 0
+    seed_model_raw_bytes: int = 0
+    seed_model_compressed_bytes: int = 0
+    seed_published_assets: int = 0
     encode_seconds: float = 0.0
     update_seconds: float = 0.0
     decode_seconds: float = 0.0
@@ -867,6 +953,7 @@ def evaluate_online(
     maximum_key_bytes: int,
     publication: str,
     budget_basis: str,
+    seed_only: bool = False,
 ) -> OnlineResult:
     if cross_probe_tus < 0 or cross_probe_min_savings < 0:
         raise ValueError("cross probe controls must be nonnegative")
@@ -904,6 +991,7 @@ def evaluate_online(
             maximum_key_bytes,
             publication,
             budget_basis,
+            seed_only,
         )
         shadow_probe_wire = shadow.as_dict()["charged_wire_bytes"]
     learner_scope = (
@@ -945,12 +1033,15 @@ def evaluate_online(
     initial_raw = decompress_frame(initial_frame)
     if deserialize_key_batch(initial_raw) != initial.keys:
         raise ValueError("supplied initial model frame differs from encoder package")
-    installed_encoder = clone_package(initial)
+    installed_initial = package_from_keys([], 0) if seed_only else initial
+    frozen_baseline = installed_initial
+    installed_encoder = clone_package(installed_initial)
     installed_decoder = package_from_keys([], 0)
-    append_package_keys(
-        installed_decoder,
-        deserialize_key_batch(decompress_frame(initial_frame)),
-    )
+    if not seed_only:
+        append_package_keys(
+            installed_decoder,
+            deserialize_key_batch(decompress_frame(initial_frame)),
+        )
     if installed_decoder.keys != installed_encoder.keys:
         raise ValueError("initial receiver package differs from encoder package")
 
@@ -971,21 +1062,27 @@ def evaluate_online(
     )
     result = OnlineResult(
         name=name,
-        initial_assets=len(initial.keys),
-        initial_model_raw_bytes=len(initial_raw),
-        initial_model_wire_bytes=(len(initial_frame) + 4 if initial.keys else 0),
+        initial_assets=len(installed_initial.keys),
+        initial_model_raw_bytes=0 if seed_only else len(initial_raw),
+        initial_model_wire_bytes=(
+            0 if seed_only else len(initial_frame) + 4 if initial.keys else 0
+        ),
         online_budget=online_budget,
         promotion_threshold=threshold,
         per_tu_budget=per_tu_budget,
         candidate_capacity=candidate_capacity,
         publication=publication,
         budget_basis=budget_basis,
+        pretrained_mode="seed-only" if seed_only else "installed",
         phrase_scope=phrase_scope,
         parse_policy=parse_policy,
         cross_probe_tus=cross_probe_tus,
         cross_probe_min_savings=cross_probe_min_savings,
         cross_probe_live=cross_probe_live,
         cross_enabled=cross_probe_tus == 0 or cross_probe_live,
+        seed_assets=len(initial.keys) if seed_only else 0,
+        seed_model_raw_bytes=len(initial_raw) if seed_only else 0,
+        seed_model_compressed_bytes=len(initial_frame) if seed_only else 0,
     )
     compressor = zstd.ZstdCompressor(level=level)
     decompressor = zstd.ZstdDecompressor()
@@ -1030,12 +1127,12 @@ def evaluate_online(
             baseline_keys = (
                 scoped_materialization_keys(
                     tu,
-                    initial,
+                    frozen_baseline,
                     "run",
                     atomize_raw=True,
                 )
                 if canonical_cross
-                else materialization_keys(tu, initial)
+                else materialization_keys(tu, frozen_baseline)
             )
             baseline_encoder = clone_encoder(encoder, installed_encoder)
             baseline_payload = (
@@ -1118,9 +1215,16 @@ def evaluate_online(
                     else online_encoder.frame(online_keys)
                 )
                 online_frame = compressor.compress(online_payload)
-                candidate_definition_raw = serialize_reference_batch(
-                    new_definitions,
-                    encoder_regions,
+                candidate_definition_raw = (
+                    serialize_mixed_definition_batch(
+                        new_definitions,
+                        encoder_regions,
+                    )
+                    if seed_only
+                    else serialize_reference_batch(
+                        new_definitions,
+                        encoder_regions,
+                    )
                 )
                 candidate_definition_frame = (
                     compressor.compress(candidate_definition_raw)
@@ -1220,7 +1324,7 @@ def evaluate_online(
                     received_raw = decompressor.decompress(best_definition_frame)
                     if received_raw != definition_raw:
                         raise ValueError("online definition frame mismatch")
-                    received_keys = deserialize_reference_batch(
+                    received_keys = deserialize_definition_batch(
                         received_raw,
                         decoder_regions,
                     )
@@ -1230,8 +1334,12 @@ def evaluate_online(
                             "online receiver package differs from encoder package"
                         )
                     result.online_published_assets += len(best_definitions)
+                    if seed_only:
+                        result.seed_published_assets += sum(
+                            key in initial.ids for key in best_definitions
+                        )
         else:
-            keys = materialization_keys(tu, initial)
+            keys = materialization_keys(tu, frozen_baseline)
             payload = encoder.frame(keys)
             payload_frame = compressor.compress(payload)
         result.encode_seconds += time.monotonic() - begin
@@ -1310,19 +1418,30 @@ def evaluate_online(
         # The comparison policy makes an investment after observing this TU.
         # These definitions cannot affect the TU that caused their promotion.
         if publication == "promotion" and promotions:
-            definition_raw = serialize_reference_batch(promotions, encoder_regions)
+            definition_raw = (
+                serialize_mixed_definition_batch(promotions, encoder_regions)
+                if seed_only
+                else serialize_reference_batch(promotions, encoder_regions)
+            )
             definition_frame = compressor.compress(definition_raw)
             append_package_keys(installed_encoder, promotions)
             received_raw = decompressor.decompress(definition_frame)
             if received_raw != definition_raw:
                 raise ValueError("promoted definition frame mismatch")
-            received_keys = deserialize_reference_batch(received_raw, decoder_regions)
+            received_keys = deserialize_definition_batch(
+                received_raw,
+                decoder_regions,
+            )
             append_package_keys(installed_decoder, received_keys)
             if installed_decoder.keys != installed_encoder.keys:
                 raise ValueError("promoted receiver package differs from encoder package")
             promoted_wire = len(definition_frame) + 4
             definition_wire += promoted_wire
             result.online_published_assets += len(promotions)
+            if seed_only:
+                result.seed_published_assets += sum(
+                    key in initial.ids for key in promotions
+                )
 
         result.definition_wire_bytes += definition_wire
         result.definition_uncompressed_bytes += len(definition_raw) if definition_wire else 0
@@ -1353,6 +1472,7 @@ def evaluate_online(
             "vocabulary_assets": len(learner.vocabulary.keys),
             "online_promoted_assets": learner.promoted_assets,
             "online_published_assets": result.online_published_assets,
+            "seed_published_assets": result.seed_published_assets,
             "online_selected_tus": result.online_selected_tus,
             "candidate_state_bytes": learner.counts.logical_bytes,
             "logical_state_bytes": learner.logical_state_bytes,
@@ -1381,6 +1501,7 @@ def write_curve(rows: Sequence[dict], path: str) -> None:
         "vocabulary_assets",
         "online_promoted_assets",
         "online_published_assets",
+        "seed_published_assets",
         "online_selected_tus",
         "candidate_state_bytes",
         "logical_state_bytes",
@@ -1511,23 +1632,39 @@ def run(args: argparse.Namespace) -> int:
     )
 
     empty = package_from_keys([], 0)
-    specifications: list[tuple[str, StaticPackage, int, int]] = []
+    specifications: list[tuple[str, StaticPackage, int, int, bool]] = []
     if args.row_set in ("all", "empty"):
-        specifications.append(("empty-frozen", empty, 0, 1))
-    if args.row_set in ("all", "pretrained"):
-        specifications.append(("pretrained-frozen", initial, 0, 1))
+        specifications.append(("empty-frozen", empty, 0, 1, False))
+    if (
+        args.row_set in ("all", "pretrained")
+        and args.pretrained_mode == "installed"
+    ):
+        specifications.append(("pretrained-frozen", initial, 0, 1, False))
     for threshold in args.thresholds:
         if args.row_set in ("all", "empty"):
             specifications.append(
-                (f"empty-online-k{threshold}", empty, args.online_budget, threshold)
+                (
+                    f"empty-online-k{threshold}",
+                    empty,
+                    args.online_budget,
+                    threshold,
+                    False,
+                )
             )
         if args.row_set in ("all", "pretrained"):
+            seed_only = args.pretrained_mode == "seed-only"
             specifications.append(
-                (f"pretrained-online-k{threshold}", initial, args.online_budget, threshold)
+                (
+                    f"pretrained-{'seed-' if seed_only else ''}online-k{threshold}",
+                    initial,
+                    args.online_budget,
+                    threshold,
+                    seed_only,
+                )
             )
 
     rows: list[dict] = []
-    for name, package, online_budget, threshold in specifications:
+    for name, package, online_budget, threshold, seed_only in specifications:
         row = evaluate_online(
             target_tus,
             name,
@@ -1547,6 +1684,7 @@ def run(args: argparse.Namespace) -> int:
             args.maximum_key_bytes,
             args.publication,
             args.budget_basis,
+            seed_only,
         ).as_dict()
         rows.append(row)
         print(json.dumps({
@@ -1555,6 +1693,9 @@ def run(args: argparse.Namespace) -> int:
             "charged_wire_bytes": row["charged_wire_bytes"],
             "charged_ratio": row["charged_ratio"],
             "initial_model_wire_bytes": row["initial_model_wire_bytes"],
+            "pretrained_mode": row["pretrained_mode"],
+            "seed_model_compressed_bytes": row["seed_model_compressed_bytes"],
+            "seed_published_assets": row["seed_published_assets"],
             "online_definition_raw_bytes": row["online_definition_raw_bytes"],
             "definition_wire_bytes": row["definition_wire_bytes"],
             "context_wire_bytes": row["context_wire_bytes"],
@@ -1587,6 +1728,7 @@ def run(args: argparse.Namespace) -> int:
         "maximum_key_bytes": args.maximum_key_bytes,
         "publication": args.publication,
         "budget_basis": args.budget_basis,
+        "pretrained_mode": args.pretrained_mode,
         "row_set": args.row_set,
         "max_tus": args.max_tus,
         "initial_package": {
@@ -1663,6 +1805,11 @@ def parser() -> argparse.ArgumentParser:
         default="first-use",
     )
     value.add_argument("--budget-basis", choices=("raw", "ids32"), default="ids32")
+    value.add_argument(
+        "--pretrained-mode",
+        choices=("installed", "seed-only"),
+        default="installed",
+    )
     value.add_argument("--row-set", choices=("all", "empty", "pretrained"), default="all")
     value.add_argument("--curve-tsv")
     value.add_argument("--report", required=True)

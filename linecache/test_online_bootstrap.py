@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
+import tempfile
 import unittest
+from pathlib import Path
 
 from online_bootstrap_curves import (
     RegionIdStore,
@@ -9,14 +11,19 @@ from online_bootstrap_curves import (
     context_run_lengths,
     coverage_materialization_keys,
     decode_canonical_atom_frame,
+    deserialize_definition_batch,
     deserialize_context_runs,
+    deserialize_mixed_definition_batch,
     evaluate_online,
     scoped_materialization_keys,
     scoped_phrase_candidates,
     serialize_context_runs,
     serialize_key_batch,
+    serialize_mixed_definition_batch,
+    serialize_reference_batch,
     summarize_learning_gate,
     tu_with_context_runs,
+    write_curve,
 )
 from pretrained_superblocks import (
     ExactEncoder,
@@ -75,6 +82,90 @@ class LearningGateTest(unittest.TestCase):
 
 
 class FirstUseTest(unittest.TestCase):
+    def test_mixed_seed_definition_batch_uses_dense_and_exact_forms(self) -> None:
+        known = [(10 + i, 20 + i, 16) for i in range(4)]
+        unseen = [(100 + i, 200 + i, 32) for i in range(4)]
+        known_key = encode_regions(known)
+        unseen_key = encode_regions(unseen)
+        sender = RegionIdStore()
+        sender.observe(known)
+        encoded = serialize_mixed_definition_batch(
+            [known_key, unseen_key],
+            sender,
+        )
+
+        receiver = RegionIdStore()
+        receiver.observe(known)
+        self.assertEqual(
+            deserialize_definition_batch(encoded, receiver),
+            [known_key, unseen_key],
+        )
+        self.assertEqual(
+            deserialize_definition_batch(
+                serialize_reference_batch([known_key], sender),
+                receiver,
+            ),
+            [known_key],
+        )
+        with self.assertRaises(ValueError):
+            deserialize_mixed_definition_batch(encoded[:-1], receiver)
+
+    def test_c_only_seed_publishes_unseen_regions_with_winning_tu(self) -> None:
+        phrase_regions = [(100 + i, 200 + i, 16) for i in range(8)]
+        phrase = encode_regions(phrase_regions)
+        seed = package_from_keys([phrase], len(phrase))
+        seed_frame = compress_frame(serialize_key_batch(seed.keys), 3)
+        tus = [
+            TuRegions(
+                tu,
+                1_000_000,
+                [
+                    (h1, h2, 1, raw_len)
+                    for h1, h2, raw_len in phrase_regions * 32
+                ]
+                + [(1_000 + tu, 2_000 + tu, 1, 16)],
+            )
+            for tu in range(1, 4)
+        ]
+
+        result = evaluate_online(
+            tus,
+            "seed-only-test",
+            seed,
+            seed_frame,
+            3,
+            (8,),
+            "run",
+            "greedy",
+            0,
+            0,
+            False,
+            2,
+            4_096,
+            4_096,
+            100,
+            8_192,
+            "first-use",
+            "ids32",
+            True,
+        )
+
+        self.assertTrue(result.exact)
+        self.assertEqual(result.pretrained_mode, "seed-only")
+        self.assertEqual(result.initial_assets, 0)
+        self.assertEqual(result.initial_model_wire_bytes, 0)
+        self.assertEqual(result.seed_assets, 1)
+        self.assertGreater(result.seed_model_compressed_bytes, 0)
+        self.assertEqual(result.seed_published_assets, 1)
+        self.assertGreater(result.online_selected_tus, 0)
+        self.assertGreater(result.definition_wire_bytes, 0)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "curve.tsv"
+            write_curve([result.as_dict()], str(path))
+            lines = path.read_text().splitlines()
+        self.assertIn("seed_published_assets", lines[0].split("\t"))
+        self.assertEqual(len(lines), len(tus) + 1)
+
     def test_context_run_sidecar_reconstructs_exact_boundaries(self) -> None:
         tu = TuRegions(
             1,
