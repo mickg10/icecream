@@ -42,7 +42,9 @@ def main() -> int:
             lines = line[corpus, bit]
             if not lines["exact"] or lines["raw_bytes"] != base["raw_bytes"]:
                 raise ValueError(f"inexact or mismatched half-cold row: {corpus}/{bit}")
-            wire = base["selected_structural_wire_bytes"] + lines["wire_bytes"]
+            projection_wire = (
+                base["selected_structural_wire_bytes"] + lines["wire_bytes"]
+            )
             variants.append(
                 {
                     "cold_bit": bit,
@@ -51,8 +53,10 @@ def main() -> int:
                     "missing_line_bytes": lines["missing_line_bytes"],
                     "preinstalled_lines": lines["preinstalled_lines"],
                     "preinstalled_line_bytes": lines["preinstalled_line_bytes"],
-                    "complete_wire_bytes": wire,
-                    "complete_ratio": base["raw_bytes"] / wire,
+                    "two_plane_projection_wire_bytes": projection_wire,
+                    "two_plane_projection_ratio": (
+                        base["raw_bytes"] / projection_wire
+                    ),
                 }
             )
         per_corpus.append(
@@ -61,8 +65,12 @@ def main() -> int:
                 "raw_bytes": base["raw_bytes"],
                 "structural_wire_bytes": base["selected_structural_wire_bytes"],
                 "variants": variants,
-                "worst_ratio": min(row["complete_ratio"] for row in variants),
-                "best_ratio": max(row["complete_ratio"] for row in variants),
+                "worst_two_plane_ratio": min(
+                    row["two_plane_projection_ratio"] for row in variants
+                ),
+                "best_two_plane_ratio": max(
+                    row["two_plane_projection_ratio"] for row in variants
+                ),
             }
         )
 
@@ -73,38 +81,54 @@ def main() -> int:
             for row in per_corpus
         ]
         raw = sum(row["raw_bytes"] for row in per_corpus)
-        wire = sum(row["complete_wire_bytes"] for row in chosen)
+        projection_wire = sum(
+            row["two_plane_projection_wire_bytes"] for row in chosen
+        )
         variants.append(
             {
                 "cold_bit": bit,
                 "raw_bytes": raw,
-                "complete_wire_bytes": wire,
-                "weighted_ratio": raw / wire,
-                "equal_corpus_ratio": harmonic(
-                    [row["complete_ratio"] for row in chosen]
+                "two_plane_projection_wire_bytes": projection_wire,
+                "two_plane_projection_weighted_ratio": raw / projection_wire,
+                "two_plane_projection_equal_corpus_ratio": harmonic(
+                    [row["two_plane_projection_ratio"] for row in chosen]
                 ),
-                "pass_200_corpora": sum(
-                    row["complete_ratio"] >= 200 for row in chosen
+                "two_plane_projection_200_corpora": sum(
+                    row["two_plane_projection_ratio"] >= 200 for row in chosen
                 ),
-                "exact_corpora": len(chosen),
+                "exact_measured_plane_corpora": len(chosen),
             }
         )
     report = {
-        "experiment": "complete executed complementary half-warm Line cache",
+        "experiment": (
+            "executed complementary half-warm Line cache plus incomplete cold "
+            "structural projection"
+        ),
+        "scope": (
+            "exact half-warm first-use Line-definition plane plus exact cold "
+            "Region-digest structural plane"
+        ),
+        "total_transfer_complete": False,
+        "missing_complete_transfer_blocks": [
+            "Region-to-Line composition",
+            "typed values and literal residuals outside the measured Line plane",
+            "generation key association and missing-object exchange",
+            "final combined framing and real C/F path",
+        ],
         "level": args.level,
         "partition": line_report["partition"],
         "variants": variants,
-        "worst_variant_weighted_ratio": min(
-            row["weighted_ratio"] for row in variants
+        "worst_variant_two_plane_weighted_ratio": min(
+            row["two_plane_projection_weighted_ratio"] for row in variants
         ),
-        "worst_variant_equal_corpus_ratio": min(
-            row["equal_corpus_ratio"] for row in variants
+        "worst_variant_two_plane_equal_corpus_ratio": min(
+            row["two_plane_projection_equal_corpus_ratio"] for row in variants
         ),
-        "minimum_per_corpus_ratio_across_both_variants": min(
-            row["worst_ratio"] for row in per_corpus
+        "minimum_per_corpus_two_plane_ratio_across_both_variants": min(
+            row["worst_two_plane_ratio"] for row in per_corpus
         ),
         "per_corpus": per_corpus,
-        "exact": True,
+        "measured_planes_exact": True,
     }
     args.output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     print(json.dumps({key: value for key, value in report.items() if key != "per_corpus"}, indent=2, sort_keys=True))

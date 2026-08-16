@@ -10,14 +10,29 @@ Across all 9,292 TUs and 28,554,671,510 raw `.ii` bytes, the exact structural wi
 611.58x byte-weighted / 462.92x equal-corpus to 869.55x / 622.44x. Every corpus wins and every frame
 is independently reconstructed exactly.
 
-This is a factor-sized structural gain, not cold-400 closure. Combining it with the exact P21 Line
-plane improves complete cold transfer from 133,555,793 bytes / 213.80x to 119,704,086 bytes /
-238.54x. Cold 400x still permits only 71,386,679 bytes, leaving a measured 48,317,407-byte excess.
+This is a factor-sized structural gain, not cold-400 closure. Adding the exact P21 first-use Line
+definition plane produces an **incomplete two-plane projection** of 119,704,086 bytes / 238.54x.
+The cold-400 allowance is 71,386,679 bytes, so these two measured planes alone are already
+48,317,407 bytes over budget; the true complete-path gap is larger because unmeasured blocks remain.
 
-The complementary executed half-warm Line-cache scenarios both pass the aggregate 200x target:
-352.66--353.45x byte-weighted and 308.36--308.47x equal-corpus. Thirteen of sixteen individual
-corpora pass both complements. Godot is narrowly below 200x; fmt and LevelDB remain materially
-below it.
+The complementary executed half-warm Line-cache scenarios plus the cold structural plane produce
+two-plane projections of 352.66--353.45x byte-weighted and 308.36--308.47x equal-corpus. Those
+figures cross the numerical 200x line but do **not** prove the total half-cold objective. Thirteen of
+sixteen individual projections cross 200x in both complements; Godot, fmt, and LevelDB do not.
+
+### Scope boundary
+
+P22 reconstructs the exact Region-digest Root sequence, and P21 reconstructs exact first-use Line
+definitions. Their sum does not reconstruct the complete `.ii` file. A complete transfer still has
+to integrate and charge at least:
+
+- Region-to-Line composition;
+- typed values and literal residuals outside the measured Line plane;
+- generation key association and missing-object exchange;
+- final combined framing and the real C/F path.
+
+Every ratio that combines P22 structure with P21 Lines below is therefore explicitly a two-plane
+diagnostic, never a complete-transfer result.
 
 ## Exact algorithm
 
@@ -71,9 +86,9 @@ ROOT_SLICE(source_root_id32, start_region_u32, region_count_u32)
 This should be one optional Root-program operation, not a new transport, model, or independent
 cache. F expands the named packed-u32 Root vector and then follows the ordinary output path.
 
-## Complete balanced result
+## Balanced structural result and two-plane diagnostic
 
-| corpus | P18 structure | P22 structure | saving | P21 Line | complete cold | executed half-warm worst |
+| corpus | P18 structure | P22 structure | saving | P21 Line | two-plane cold | two-plane half-warm worst |
 |---|---:|---:|---:|---:|---:|---:|
 | llvm | 3,432,366 | 1,642,398 | 52.15% | 7,362,680 | 402.03x | 609.48x |
 | rocksdb | 14,479,861 | 12,857,339 | 11.21% | 4,178,690 | 182.81x | 201.64x |
@@ -92,7 +107,7 @@ cache. F expands the named packed-u32 Root vector and then follows the ordinary 
 | simdjson | 533,104 | 320,996 | 39.79% | 1,044,406 | 343.03x | 496.02x |
 | cereal | 151,522 | 111,505 | 26.41% | 500,995 | 533.71x | 796.74x |
 
-Complete aggregate ledger:
+Incomplete two-plane ledger:
 
 | quantity | P21/P18 | P22 |
 |---|---:|---:|
@@ -100,11 +115,11 @@ Complete aggregate ledger:
 | structural byte-weighted ratio | 611.58x | **869.55x** |
 | structural equal-corpus ratio | 462.92x | **622.44x** |
 | exact P21 Line wire | 86,865,600 | 86,865,600 |
-| complete cold wire | 133,555,793 | **119,704,086** |
-| complete cold byte-weighted ratio | 213.80x | **238.54x** |
-| complete cold equal-corpus ratio | 200.61x | **225.67x** |
-| cold-400 corpora | 5 / 16 | **6 / 16** |
-| remaining aggregate cold excess | 62,169,114 | **48,317,407** |
+| two-plane cold projection wire | 133,555,793 | **119,704,086** |
+| two-plane cold projection, byte-weighted | 213.80x | **238.54x** |
+| two-plane cold projection, equal-corpus | 200.61x | **225.67x** |
+| two-plane projections at 400x | 5 / 16 | **6 / 16** |
+| two-plane gap to cold allowance, before missing blocks | 62,169,114 | **48,317,407** |
 
 ## Online learning curve
 
@@ -150,25 +165,25 @@ complementary cache states:
 
 1. Hash every exact first-use Line with `blake2b-64(person=ice-hc50)`.
 2. Preinstall one low-bit partition at F.
-3. Encode and independently reconstruct the other partition with the complete P21 codec.
+3. Encode and independently reconstruct the other partition with the complete P21 Line codec.
 4. Verify per TU that the preinstalled and received partitions are disjoint and merge to the exact
    original Line set.
 5. Repeat with the two partitions exchanged.
 
-| cold Line partition | complete wire | weighted ratio | equal-corpus ratio | individual 200x passes | exact |
+| cold Line partition | two-plane wire | weighted ratio | equal-corpus ratio | projections at 200x | measured planes exact |
 |---:|---:|---:|---:|---:|---:|
 | bit 0 | 80,787,440 | 353.45x | 308.36x | 13 / 16 | 16 / 16 |
 | bit 1 | 80,968,672 | 352.66x | 308.47x | 13 / 16 | 16 / 16 |
 
-This is deliberately conservative about structure: every structural byte remains cold. It charges
-the actual nonlinear Line compression cost, which is larger than one half of the cold Line wire.
-The individual failures in both complements are fmt, LevelDB, and Godot. Godot reaches 199.56x and
-198.71x, making it a useful narrow optimization target; fmt and LevelDB require a different Line
-mechanism.
+This is deliberately conservative about structure: every measured structural byte remains cold. It
+charges the actual nonlinear Line compression cost, which is larger than one half of the cold Line
+wire. It still omits the complete-path blocks listed in the scope boundary. The individual
+two-plane failures in both complements are fmt, LevelDB, and Godot. Godot reaches 199.56x and
+198.71x; these are useful component diagnostics, not acceptance results.
 
 ## Per-F availability and state
 
-The complete structural headline uses one persistent F Root store. A separate exact probe assigns
+The full-corpus structural headline uses one persistent F Root store. A separate exact probe assigns
 the first 200 TUs round-robin to independent F caches, gives each F its own dense dictionary and
 Root index, and charges definitions again at every F that needs them. A range may name only a Root
 already decoded by that F.
@@ -205,9 +220,9 @@ explicit missing-Root response.
 - The complete 2,207-TU Godot control confirms the density ceiling: stride one changes structural
   wire from 2,580,411 to 2,473,008 bytes, saving 107,403 bytes while increasing C Root-plus-index
   state from 25,038,008 to 27,576,880 bytes. With the two executed half-warm Line complements this
-  yields 200.29x and 199.43x. It therefore clears only one complement and does not close even the
-  narrow Godot half-warm failure. Keep stride eight as the balanced baseline; index density remains
-  a C-local tuning control and does not alter the operation format.
+  yields two-plane projections of 200.29x and 199.43x. It crosses the diagnostic line in only one
+  complement and does not establish complete-path acceptance. Keep stride eight as the balanced
+  baseline; index density remains a C-local tuning control and does not alter the operation format.
 - Raising the candidate bucket from 4 to 16 on LLVM's first 200 TUs saves only 1,330 bytes while
   nearly doubling index state. Four candidates are sufficient for the product baseline.
 - Seed lengths 4 and 8 are effectively tied on LLVM. Four retains better coverage of short changed
@@ -219,8 +234,8 @@ complete path before promotion.
 
 ## Line-plane range-copy falsification
 
-The same variable-range idea was applied to every P21 byte component to test whether it also closes
-the 48.32 MB cold gap. It does not:
+The same variable-range idea was applied to every P21 byte component to test whether it materially
+reduces the 48.32 MB two-plane overage. It does not:
 
 | corpus / minimum range | P21 Line | range candidate | change | important observation |
 |---|---:|---:|---:|---|
@@ -260,10 +275,10 @@ without changing Line encoding or the P21 `BYTE_ARRAY` operation.
    must not become the multi-F protocol identity.
 4. Confirm or simplify the sparse index baseline: four-Region seed, stride eight, four recent exact
    candidates, greedy longest-positive-saving parse.
-5. Reconcile the remaining 48.32 MB aggregate cold excess. The 38.66 MB array-value block and the
-   negative byte-range experiment must remain explicit in the budget.
-6. Confirm the complementary hash-partition run as the executed half-warm acceptance scenario, or
-   specify a smaller replacement before product gating.
+5. Reconcile the 48.32 MB two-plane overage **plus** the still-missing complete-path blocks. The
+   38.66 MB array-value block and negative byte-range experiment must remain explicit.
+6. Confirm the complementary hash-partition run as the Line-cache component scenario, then specify
+   the additional integrated blocks required for complete half-cold acceptance.
 
 Please keep the ruling to a few independently selectable blocks. P22 does not justify a new model
 family or a second cache subsystem.
@@ -308,5 +323,5 @@ Retained run roots:
 - `/tmp/issue16-prior-root-*-200-f*.json`
 - `/tmp/issue16-prior-byte-line-*.json`
 
-Committed machine summaries contain the complete per-corpus ledger, learning curve, four stability
-scenarios, executed half-warm partitions, and representative multi-F sweep.
+Committed machine summaries contain the structural and two-plane per-corpus ledger, learning curve,
+four stability scenarios, executed half-warm Line partitions, and representative multi-F sweep.

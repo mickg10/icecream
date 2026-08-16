@@ -50,8 +50,8 @@ def main() -> int:
             prior["charged_wire_bytes"], root["charged_wire_bytes"]
         )
         line_wire = lines["generated_array_line_wire_bytes"]
-        cold_wire = selected_structure + line_wire
-        half_wire = selected_structure + line_wire / 2
+        projection_wire = selected_structure + line_wire
+        half_line_projection_wire = selected_structure + line_wire / 2
         raw = root["raw_bytes"]
         rows.append(
             {
@@ -75,10 +75,14 @@ def main() -> int:
                     "root_copy_encoder_state_bytes"
                 ],
                 "p21_line_wire_bytes": line_wire,
-                "cold_wire_bytes": cold_wire,
-                "cold_ratio": raw / cold_wire,
-                "half_cold_projection_wire_bytes": half_wire,
-                "half_cold_projection_ratio": raw / half_wire,
+                "two_plane_projection_wire_bytes": projection_wire,
+                "two_plane_projection_ratio": raw / projection_wire,
+                "two_plane_half_line_projection_wire_bytes": (
+                    half_line_projection_wire
+                ),
+                "two_plane_half_line_projection_ratio": (
+                    raw / half_line_projection_wire
+                ),
                 "exact": True,
             }
         )
@@ -88,10 +92,21 @@ def main() -> int:
     root_structure = sum(row["prior_root_structural_wire_bytes"] for row in rows)
     selected_structure = sum(row["selected_structural_wire_bytes"] for row in rows)
     line_wire = sum(row["p21_line_wire_bytes"] for row in rows)
-    cold_wire = selected_structure + line_wire
-    half_wire = selected_structure + line_wire / 2
+    projection_wire = selected_structure + line_wire
+    half_line_projection_wire = selected_structure + line_wire / 2
     summary = {
-        "experiment": "complete exact P22 prior-root integration",
+        "experiment": "incomplete exact P22 two-plane projection",
+        "scope": (
+            "exact Region-digest structural plane plus exact first-use "
+            "Line-definition plane"
+        ),
+        "total_transfer_complete": False,
+        "missing_complete_transfer_blocks": [
+            "Region-to-Line composition",
+            "typed values and literal residuals outside the measured Line plane",
+            "generation key association and missing-object exchange",
+            "final combined framing and real C/F path",
+        ],
         "corpora": len(rows),
         "tus": sum(row["tus"] for row in rows),
         "raw_bytes": raw,
@@ -106,19 +121,25 @@ def main() -> int:
             [row["raw_bytes"] / row["selected_structural_wire_bytes"] for row in rows]
         ),
         "p21_line_wire_bytes": line_wire,
-        "cold_wire_bytes": cold_wire,
-        "cold_allowance_bytes": raw / 400,
-        "cold_excess_bytes": cold_wire - raw / 400,
-        "cold_weighted_ratio": raw / cold_wire,
-        "cold_equal_corpus_ratio": harmonic([row["cold_ratio"] for row in rows]),
-        "cold_400_corpora": sum(row["cold_ratio"] >= 400 for row in rows),
-        "half_cold_projection_wire_bytes": half_wire,
-        "half_cold_weighted_ratio": raw / half_wire,
-        "half_cold_equal_corpus_ratio": harmonic(
-            [row["half_cold_projection_ratio"] for row in rows]
+        "two_plane_projection_wire_bytes": projection_wire,
+        "cold_target_allowance_bytes": raw / 400,
+        "two_plane_gap_to_cold_target_bytes": projection_wire - raw / 400,
+        "two_plane_projection_weighted_ratio": raw / projection_wire,
+        "two_plane_projection_equal_corpus_ratio": harmonic(
+            [row["two_plane_projection_ratio"] for row in rows]
         ),
-        "half_cold_200_corpora": sum(
-            row["half_cold_projection_ratio"] >= 200 for row in rows
+        "two_plane_projection_400_corpora": sum(
+            row["two_plane_projection_ratio"] >= 400 for row in rows
+        ),
+        "two_plane_half_line_projection_wire_bytes": half_line_projection_wire,
+        "two_plane_half_line_projection_weighted_ratio": (
+            raw / half_line_projection_wire
+        ),
+        "two_plane_half_line_projection_equal_corpus_ratio": harmonic(
+            [row["two_plane_half_line_projection_ratio"] for row in rows]
+        ),
+        "two_plane_half_line_projection_200_corpora": sum(
+            row["two_plane_half_line_projection_ratio"] >= 200 for row in rows
         ),
         "maximum_root_receiver_state_bytes": max(
             row["root_copy_receiver_state_bytes"] for row in rows
