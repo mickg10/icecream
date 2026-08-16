@@ -15,6 +15,7 @@
 // build: g++ -O3 -march=native -std=c++17 codec50.cpp -o codec50 -lzstd
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -75,9 +76,15 @@ struct ShortSlot{ uint64_t lo; uint64_t hi; uint32_t id; uint8_t len; uint8_t pa
 struct LineSlot{ uint64_t hash; uint32_t off; uint32_t len; uint32_t id; uint32_t pad; };
 struct RegionRecord{ uint64_t hash; uint32_t raw_off; uint32_t raw_len; uint32_t ids_off; uint32_t ids_count; uint32_t next1; uint32_t next2; };
 
+#ifndef ICE_LINE_CAP_LOG2
+#define ICE_LINE_CAP_LOG2 21
+#endif
+
 class Interner {
 public:
-    static constexpr uint32_t TINY_CAP=1u<<10, SHORT_CAP=1u<<17, LINE_CAP=1u<<21, REGION_INITIAL_CAP=1u<<17;
+    static constexpr uint32_t TINY_CAP=1u<<10, SHORT_CAP=1u<<17,
+                              LINE_CAP=1u<<ICE_LINE_CAP_LOG2,
+                              REGION_INITIAL_CAP=1u<<17;
     Interner(){ tiny_=(TinySlot*)huge_zeroed(sizeof(TinySlot)*TINY_CAP); short_=(ShortSlot*)huge_zeroed(sizeof(ShortSlot)*SHORT_CAP); lines_=(LineSlot*)huge_zeroed(sizeof(LineSlot)*LINE_CAP);
         region_index_.resize(REGION_INITIAL_CAP); region_mask_=REGION_INITIAL_CAP-1; region_records_.reserve(1u<<20); line_bytes_.reserve(64u<<20); region_bytes_.reserve(80u<<20); region_ids_.reserve(8u<<20); id_refs_.reserve(1000000); id_refs_.push_back({0,0}); }
     uint32_t distinct() const { return next_id_-1; }
@@ -131,8 +138,83 @@ static inline void put_varint(std::vector<uint8_t>&o,uint64_t v){ while(v>=0x80)
 static inline uint64_t get_varint(const uint8_t*&p){ uint64_t v=0; int s=0; for(;;){ uint8_t b=*p++; v|=uint64_t(b&0x7f)<<s; if(!(b&0x80))break; s+=7; } return v; }
 static inline void put_zigzag(std::vector<uint8_t>&o,int64_t v){ put_varint(o,(uint64_t(v)<<1)^uint64_t(v>>63)); }
 static inline int64_t get_zigzag(const uint8_t*&p){ uint64_t u=get_varint(p); return int64_t(u>>1)^-int64_t(u&1); }
+static inline size_t varint_size(uint64_t v){ size_t n=1; while(v>=0x80){++n;v>>=7;} return n; }
 static size_t zstd_size(ZSTD_CCtx*c,const uint8_t*data,size_t n,int level,std::vector<uint8_t>&dst){ ZSTD_CCtx_reset(c,ZSTD_reset_session_and_parameters); ZSTD_CCtx_setParameter(c,ZSTD_c_compressionLevel,level);
     size_t bound=ZSTD_compressBound(n); if(dst.size()<bound)dst.resize(bound); size_t r=ZSTD_compress2(c,dst.data(),dst.size(),data?data:(const uint8_t*)"",n); if(ZSTD_isError(r)){fprintf(stderr,"zstd %s\n",ZSTD_getErrorName(r));exit(2);} return r; }
+
+// P22 ROOT_SLICE capability. Each Root may name an exact contiguous range from a completed
+// earlier Root. The sparse C index proposes at most four recent exact candidates; equality is
+// checked over Region IDs before a copy is emitted. F expands the program before committing it.
+struct RootLocation { uint32_t root=0, start=0; };
+struct RootBucket {
+    std::array<RootLocation,4> recent{};
+    uint32_t count=0;
+    void add(RootLocation value){
+        if(count<recent.size()) recent[count++]=value;
+        else { for(size_t i=1;i<recent.size();++i) recent[i-1]=recent[i]; recent.back()=value; }
+    }
+};
+struct RootSliceBuild {
+    std::vector<std::vector<uint8_t>> programs;
+    uint64_t copies=0, copied_regions=0, indexed_windows=0, index_entries=0;
+};
+static inline uint64_t root_seed_hash(const uint32_t*p,uint32_t n){
+    uint64_t h=0x9e3779b97f4a7c15ULL^n;
+    for(uint32_t i=0;i<n;++i) h=mix64(h^mix64(uint64_t(p[i])+0x9e3779b97f4a7c15ULL+i));
+    return h;
+}
+static RootSliceBuild build_root_slices(const std::vector<uint32_t>&regions,
+                                        const std::vector<size_t>&offsets,
+                                        uint32_t seed=4,uint32_t stride=8){
+    RootSliceBuild out; out.programs.reserve(offsets.size()-1);
+    std::unordered_map<uint64_t,RootBucket> index;
+    index.reserve(regions.size()/stride+1);
+    for(uint32_t root=0;root+1<offsets.size();++root){
+        const size_t begin=offsets[root], end=offsets[root+1];
+        std::vector<uint8_t> program; put_varint(program,end-begin);
+        size_t position=begin;
+        while(position<end){
+            bool have=false; RootLocation best{}; size_t best_len=0, best_saving=0;
+            if(position+seed<=end){
+                auto it=index.find(root_seed_hash(&regions[position],seed));
+                if(it!=index.end()){
+                    const RootBucket& bucket=it->second;
+                    for(uint32_t ci=bucket.count;ci-->0;){
+                        RootLocation candidate=bucket.recent[ci];
+                        size_t source_begin=offsets[candidate.root]+candidate.start;
+                        size_t source_end=offsets[candidate.root+1];
+                        if(source_begin+seed>source_end ||
+                           memcmp(&regions[source_begin],&regions[position],seed*sizeof(uint32_t))) continue;
+                        size_t length=seed, maximum=std::min(source_end-source_begin,end-position);
+                        while(length<maximum && regions[source_begin+length]==regions[position+length]) ++length;
+                        size_t literal=0;
+                        for(size_t j=0;j<length;++j) literal+=1+varint_size(regions[position+j]);
+                        size_t copy=1+varint_size(candidate.root)+varint_size(candidate.start)+varint_size(length);
+                        size_t saving=literal>copy?literal-copy:0;
+                        if(saving>best_saving || (saving==best_saving && saving && length>best_len)){
+                            have=true; best=candidate; best_len=length; best_saving=saving;
+                        }
+                    }
+                }
+            }
+            if(have){
+                program.push_back(1); put_varint(program,best.root); put_varint(program,best.start); put_varint(program,best_len);
+                position+=best_len; ++out.copies; out.copied_regions+=best_len;
+            } else {
+                program.push_back(0); put_varint(program,regions[position]); ++position;
+            }
+        }
+        out.programs.push_back(std::move(program));
+        if(end-begin>=seed){
+            for(size_t p=begin;p+seed<=end;p+=stride){
+                auto& bucket=index[root_seed_hash(&regions[p],seed)];
+                if(bucket.count<bucket.recent.size()) ++out.index_entries;
+                bucket.add({root,uint32_t(p-begin)}); ++out.indexed_windows;
+            }
+        }
+    }
+    return out;
+}
 
 // ---- D1: preprocessor marker factoring. Parse "# <n> \"<path>\"<flags>\n" -> (path,n,flags), and
 // reconstruct EXACT bytes; fall back to literal if reconstruction != original. ----
@@ -178,18 +260,20 @@ struct RelLZ {
 };
 
 int main(int argc,char**argv){
-    const char* manifest=nullptr; size_t max_files=SIZE_MAX; int zlevel=3; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false;
+    const char* manifest=nullptr; size_t max_files=SIZE_MAX; int zlevel=3; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, usePriorRoot=false;
     for(int i=1;i<argc;++i){ if(!strcmp(argv[i],"--manifest")&&i+1<argc)manifest=argv[++i];
         else if(!strcmp(argv[i],"--z")&&i+1<argc)zlevel=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--no-d1"))useD1=false;
         else if(!strcmp(argv[i],"--v1"))useS1=false;   // V1 baseline: raw region-id root, no S1 blocks
         else if(!strcmp(argv[i],"--d2"))useD2mine=true;      // inline relative-LZ line codec
         else if(!strcmp(argv[i],"--d2helper"))useD2=true;    // helper's definition_codec (needs -DWITH_D2)
+        else if(!strcmp(argv[i],"--prior-root"))usePriorRoot=true;
         else if(!strcmp(argv[i],"--deep"))deep=true;         // run slow z19/z22 entropy ladder + reorder test
         else if(!strcmp(argv[i],"--warm"))warm=true;         // Basis C: 2nd pass with dict retained -> warm steady-state wire
         else if(!strcmp(argv[i],"--max-files")&&i+1<argc){ char*t=nullptr; unsigned long long v=strtoull(argv[++i],&t,10); if(!t||*t||!v){fprintf(stderr,"bad max-files\n");return 2;} max_files=size_t(v); }
         else { fprintf(stderr,"unknown %s\n",argv[i]); return 2; } }
-    if(!manifest){ fprintf(stderr,"usage: %s --manifest F [--z 0|1|3] [--no-d1] [--d2] [--max-files N]\n",argv[0]); return 2; }
+    if(!manifest){ fprintf(stderr,"usage: %s --manifest F [--z 0|1|3] [--no-d1] [--d2] [--prior-root] [--max-files N]\n",argv[0]); return 2; }
+    if(usePriorRoot) useS1=false;
 #ifndef HAVE_DEFCODEC
     if(useD2){ fprintf(stderr,"note: --d2 requested but definition_codec.h not present; ignoring.\n"); useD2=false; }
 #endif
@@ -200,6 +284,15 @@ int main(int argc,char**argv){
       for(auto&f:corpus.files){ size_t oc=0; rs.clear(); const char*p=corpus.bytes.data()+f.off; dict.process(p,p+f.len,out.data(),oc,hits,true,&rs); allreg.insert(allreg.end(),rs.begin(),rs.end()); roff.push_back(allreg.size()); } }
     uint32_t NREG=uint32_t(dict.region_count()); size_t TUs=corpus.files.size();
     fprintf(stderr,"loaded+interned %.1fs TUs=%zu raw=%llu regions=%u region_occ=%zu distinct_lines=%u\n",secs(t0),TUs,(unsigned long long)corpus.raw,NREG,allreg.size(),dict.distinct());
+
+    RootSliceBuild root_slices;
+    if(usePriorRoot){
+        auto tr=Clock::now(); root_slices=build_root_slices(allreg,roff,4,8);
+        fprintf(stderr,"P22 ROOT_SLICE: %.1fs copies=%llu copied_regions=%llu index_entries=%llu\n",
+                secs(tr),(unsigned long long)root_slices.copies,
+                (unsigned long long)root_slices.copied_regions,
+                (unsigned long long)root_slices.index_entries);
+    }
 
     // ===== S1: LZ longest-previous-factor over region-id stream -> per-TU token streams + flat Blocks =====
     // token < NREG = region id ; token >= NREG = block id (flat span of region ids). Causal/prequential.
@@ -244,6 +337,7 @@ int main(int argc,char**argv){
     std::vector<uint8_t> fknownBlk(useS1?boff2.size():1,0);   // C's model of F's known blocks
     std::vector<uint32_t> Fblk_child; std::vector<size_t> Fblk_off; Fblk_off.push_back(0);      // F block k -> region ids
     std::vector<uint32_t> Freg_stream; Freg_stream.reserve(allreg.size());   // F's reconstructed region occurrence stream (for block COPY defs)
+    std::vector<uint32_t> Froot_child; std::vector<size_t> Froot_off; Froot_off.push_back(0);   // completed exact Roots for P22 slices
     double w_blockdef=0;
     // wire byte accumulators (post-z, per category) + f-checkpoint tracking
     double w_root=0, w_linedef=0, w_regiondef=0, w_pathdef=0, w_missing=0, w_framing=0;
@@ -276,7 +370,9 @@ int main(int argc,char**argv){
         // --- collect NEW regions (incl. new blocks' child regions) + NEW blocks, topological order ---
         std::vector<uint32_t> missReg, missBlk;
         auto addRegion=[&](uint32_t r){ if(fknownReg[r])return; for(uint32_t x:missReg) if(x==r) return; missReg.push_back(r); };
-        for(size_t i=0;i<tn;++i){ uint32_t tok=tk[i];
+        if(usePriorRoot){
+            for(size_t i=roff[t];i<roff[t+1];++i) addRegion(allreg[i]);
+        } else for(size_t i=0;i<tn;++i){ uint32_t tok=tk[i];
             if(tok<NREG) addRegion(tok);
             else { uint32_t k=tok-NREG; if(!fknownBlk[k]){ bool dup=false; for(uint32_t x:missBlk) if(x==k){dup=true;break;} if(!dup){ for(size_t j=boff2[k];j<boff2[k+1];++j) addRegion(bchild[j]); missBlk.push_back(k); } } } }
         // MISSING = unknown region ids + unknown block ids (F requests; real round-trip in 2-proc)
@@ -316,7 +412,9 @@ int main(int argc,char**argv){
         if(nb){ w_blockdef += zstd_size(z,fill_blocks.data(),fill_blocks.size(),zlevel,dst); allBlocks.insert(allBlocks.end(),fill_blocks.begin(),fill_blocks.end()); }
         if(np||nl||nr||nb) w_framing += FRAME;
         // --- ROOT: token stream (region + block ids) ---
-        std::vector<uint8_t> rootb; for(size_t i=0;i<tn;++i) put_varint(rootb,tk[i]);
+        std::vector<uint8_t> rootb;
+        if(usePriorRoot) rootb=root_slices.programs[t];
+        else for(size_t i=0;i<tn;++i) put_varint(rootb,tk[i]);
         w_root += zstd_size(z,rootb.data(),rootb.size(),zlevel,dst); w_framing += FRAME; allRoots.insert(allRoots.end(),rootb.begin(),rootb.end());
 
         enc_s += std::chrono::duration<double>(Clock::now()-_te).count(); auto _td=Clock::now();
@@ -344,9 +442,22 @@ int main(int argc,char**argv){
         recon.clear();
         auto emitRegionF=[&](uint32_t r){ Freg_stream.push_back(r); for(size_t j=Freg_off[r];j<Freg_off[r+1];++j){ uint32_t ln=Freg_child[j]; recon.insert(recon.end(), Fline_data.begin()+Fline_off[ln-1], Fline_data.begin()+Fline_off[ln]); } };
         { const uint8_t* pp=rootb.data(), *pe=rootb.data()+rootb.size();
-          while(pp<pe){ uint32_t tok=uint32_t(get_varint(pp));
+          if(usePriorRoot){
+            uint64_t expected=get_varint(pp), produced=0;
+            while(pp<pe && produced<expected){ uint8_t op=*pp++;
+              if(op==0){ emitRegionF(uint32_t(get_varint(pp))); ++produced; }
+              else if(op==1){ uint64_t source=get_varint(pp), start=get_varint(pp), count=get_varint(pp);
+                if(source+1>=Froot_off.size() || start+count>Froot_off[source+1]-Froot_off[source]){ fprintf(stderr,"bad ROOT_SLICE\n"); return 2; }
+                for(uint64_t j=0;j<count;++j) emitRegionF(Froot_child[Froot_off[source]+start+j]);
+                produced+=count;
+              } else { fprintf(stderr,"bad ROOT_SLICE opcode\n"); return 2; }
+            }
+            if(pp!=pe || produced!=expected){ fprintf(stderr,"bad ROOT_SLICE extent\n"); return 2; }
+            Froot_child.insert(Froot_child.end(),Freg_stream.end()-(roff[t+1]-roff[t]),Freg_stream.end()); Froot_off.push_back(Froot_child.size());
+          } else while(pp<pe){ uint32_t tok=uint32_t(get_varint(pp));
             if(tok<NREG) emitRegionF(tok);
-            else { uint32_t k=tok-NREG; for(size_t j=Fblk_off[k];j<Fblk_off[k+1];++j) emitRegionF(Fblk_child[j]); } } }
+            else { uint32_t k=tok-NREG; for(size_t j=Fblk_off[k];j<Fblk_off[k+1];++j) emitRegionF(Fblk_child[j]); } }
+        }
         dec_s += std::chrono::duration<double>(Clock::now()-_td).count();   // F-decode ends here; the verify below is harness-only (F doesn't have the original)
         const char* orig=corpus.bytes.data()+corpus.files[t].off; uint32_t olen=corpus.files[t].len;
         if(recon.size()!=olen || memcmp(recon.data(),orig,olen)!=0){ byteexact=false; if(t<5||TUs<10) fprintf(stderr,"BYTE-EXACT FAIL TU %zu (%zu vs %u)\n",t,recon.size(),olen); }
@@ -364,12 +475,17 @@ int main(int argc,char**argv){
 
     double totalwire = w_root+w_linedef+w_regiondef+w_pathdef+w_blockdef+w_missing+w_framing;
     double MiB=1048576.0;
-    printf("\n==== CODEC-50 (%s%s%s, z%d) — %s ====\n", useS1?"V1+S1(LZ blocks)":"V1", useD1?"+D1":"", (useD2mine?"+D2(inline)":(useD2?"+D2(helper)":"")), zlevel, manifest);
+    const char* structure_name=usePriorRoot?"V1+P22(ROOT_SLICE)":(useS1?"V1+S1(LZ blocks)":"V1");
+    printf("\n==== CODEC-50 (%s%s%s, z%d) — %s ====\n", structure_name, useD1?"+D1":"", (useD2mine?"+D2(inline)":(useD2?"+D2(helper)":"")), zlevel, manifest);
     printf("byte-exact=%s  TUs=%zu raw=%.1f MiB regions=%u distinct_lines=%u paths=%zu blocks=%zu (marker_lines=%llu literal_lines=%llu)\n",
         byteexact?"OK":"FAIL",TUs,corpus.raw/MiB,NREG,dict.distinct(),paths.size(),boff2.size()-1,(unsigned long long)n_marker,(unsigned long long)n_literal);
     printf("wire by category (post-z%d, bytes): root=%.0f line_def=%.0f region_def=%.0f block_def=%.0f path_def=%.0f missing=%.0f framing=%.0f  TOTAL=%.0f (%.2f MiB)\n",
         zlevel,w_root,w_linedef,w_regiondef,w_blockdef,w_pathdef,w_missing,w_framing,totalwire,totalwire/MiB);
     printf("FinalRatio (raw / total wire, one cold pass) = %.1fx\n", corpus.raw/totalwire);
+    if(usePriorRoot) printf("ROOT_SLICE stats: copies=%llu copied_regions=%llu indexed_windows=%llu index_entries=%llu receiver_root_bytes=%zu\n",
+        (unsigned long long)root_slices.copies,(unsigned long long)root_slices.copied_regions,
+        (unsigned long long)root_slices.indexed_windows,(unsigned long long)root_slices.index_entries,
+        Froot_child.size()*sizeof(uint32_t)+Froot_off.size()*sizeof(size_t));
     { ZSTD_CCtx* z2=ZSTD_createCCtx(); std::vector<uint8_t> d2b;
       double bl=allLineDefs.empty()?0:zstd_size(z2,allLineDefs.data(),allLineDefs.size(),zlevel,d2b);
       double br=allRoots.empty()?0:zstd_size(z2,allRoots.data(),allRoots.size(),zlevel,d2b);
