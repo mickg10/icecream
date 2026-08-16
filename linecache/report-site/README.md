@@ -1,9 +1,11 @@
 # Issue #16 evidence site
 
-`index.html` is the self-contained, print-ready report for the C-only seed bake-off.
-It contains the complete 16-corpus matrix, startup learning curves, inline SVG plots,
-and protocol/state diagrams. It has no external assets, build step, or runtime data
-dependency.
+`index.html` is the self-contained, print-ready issue #16 research report for the
+generic-bootstrap-to-online-codec design. It contains the complete 16-corpus seed
+matrix, first-200-TU learning curves, the 96-run reorder/input-change matrix, exact
+Line-plane ceilings, source-conditioning evidence, cold-transfer budget, inline SVG
+plots, and the proposed C/F state boundary. It has no external assets, build step, or
+runtime data dependency.
 
 Regenerate it from the committed machine summaries with:
 

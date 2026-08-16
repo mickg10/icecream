@@ -1,6 +1,6 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport"
- content="width=device-width,initial-scale=1"><title>Issue #16 · Superblock Codec Bake-off</title>
+ content="width=device-width,initial-scale=1"><title>Issue #16 · Generic Bootstrap and Online Codec</title>
 <style>
 :root { --paper:#fbfaf7; --ink:#17212b; --muted:#5c6874; --line:#d8dde2;
   --seed:#0e8a74; --installed:#d18b2c; --empty:#617083; --soft:#eef3f2;
@@ -100,28 +100,31 @@ a { color:#087967; }
   thead { display:table-header-group; } tr { break-inside:avoid; }
   a { color:inherit; text-decoration:none; } }
 </style></head><body><article class="page">
-<header class="hero"><div class="kicker">Icecream protocol 50 · issue #16 · evidence snapshot</div>
-<h1>Superblock codec bake-off</h1>
-<p>A corpus-balanced, exact-replay report on cold-start structural coding, online
-learning, and the smallest useful role for pretraining. The C-only seed removes the
-upfront package transfer while preserving ordinary decoder-visible definitions.</p>
+<header class="hero"><div class="kicker">Icecream protocol 50 · issue #16 · research report</div>
+<h1>Generic bootstrap → online codec</h1>
+<p>A corpus-balanced, exact-replay report on a pre-shared generic vocabulary that
+accelerates cold startup and is progressively superseded by project-specific online
+learning. It combines complete structural results, 96 stability runs, exact Line-plane
+ceilings, the whole-transfer budget, and a minimal C/F implementation boundary.</p>
 <div class="hero-meta"><span>16 corpora · 28,554,671,510 bytes in complete runs</span>
 <span>Generated 2026-08-15</span><span>Branch: local-oracle/issue16-c-only-seed</span>
-<span class="status">All 16 complete seed rows exact</span></div></header><main>
+<span class="status">16 complete + 96 stability rows exact</span></div></header><main>
 
-<section><div class="eyebrow">Executive result</div><h2>Pretraining works best as a C-only bootstrapper</h2>
+<section><div class="eyebrow">Executive result</div><h2>Ship a generic output vocabulary; let online learning take over</h2>
 <p class="lead">Across every translation unit of all 16 complete corpora, the C-only
 seed improves the equal-corpus structural ratio from
 <strong>328.83×</strong> for empty learning and
 <strong>361.22×</strong> for a fully installed
 package to <strong>391.62×</strong>. It sends no
 package at TU 0 and publishes only definitions that already repay themselves in the
-TU carrying them.</p>
+TU carrying them. In the max-200 stability matrix it beats empty-start learning in
+<strong>96 / 96</strong> exact
+corpus/scenario pairs.</p>
 <div class="metrics">
 <article class="metric "><div class="metric-label">C-only seed</div><div class="metric-value">391.62×</div><div class="metric-note">Equal-corpus structural ratio at complete-corpus endpoints</div></article>
-<article class="metric "><div class="metric-label">Gain vs empty</div><div class="metric-value">+19.09%</div><div class="metric-note">Strictly smaller on all 16 corpus endpoints</div></article>
-<article class="metric warn"><div class="metric-label">Gain vs installed</div><div class="metric-value">+8.42%</div><div class="metric-note">Smaller on 15/16; Eigen favors installed at completion</div></article>
-<article class="metric neutral"><div class="metric-label">Exact replay</div><div class="metric-value">16 / 16</div><div class="metric-note">Independent reconstruction of every Region sequence</div></article>
+<article class="metric "><div class="metric-label">Stability wins</div><div class="metric-value">96 / 96</div><div class="metric-note">Standard, reverse, three fixed shuffles, and global input perturbation</div></article>
+<article class="metric warn"><div class="metric-label">Line allowance</div><div class="metric-value">24.70 MB</div><div class="metric-note">Maximum left after the best structural hybrid for an aggregate cold-400 result</div></article>
+<article class="metric neutral"><div class="metric-label">Seed exact replay</div><div class="metric-value">112 / 112</div><div class="metric-note">16 complete endpoints plus 96 order/change rows; Line rows are reported separately</div></article>
 </div>
 <p class="small">The complete rows cover 28,554,671,510 raw bytes and
 send 58,342,404 structural bytes: a byte-weighted
@@ -131,27 +134,41 @@ complete endpoints ranges from
 54,239,451 bytes (median
 8,286,827). This is deterministic
 key-and-counter accounting, not Python process RSS or a product allocation estimate.</p>
+<div class="callout"><strong>Recommended product boundary.</strong> Preinstall a
+small, versioned static superblock/output table at C and F. C uses the generic model
+and the growing project learner to choose actual-byte candidates. The wire carries a
+stable static ID, a once-only dynamic definition, or an exact literal fallback. F
+does not need to rerun the ranking model: it expands the selected ID and retains
+received dynamic definitions. The generic artifact is the bootstrap; project history
+becomes the primary codebook.</div>
 <div class="callout warning"><strong>Scope boundary.</strong> These are exact
 Region-program structural bytes, not complete <code>.ii</code> transfer. Line text,
 Region-to-Line composition, typed values, literal residuals, missing-object exchanges,
 and production framing are not in this startup ratio. No total cold-400 claim is made.</div>
 </section>
 
-<section><div class="eyebrow">Whole objective ledger</div><h2>The structural headroom is real; cold total remains open</h2>
-<p>The best full-run structural hybrid reaches 462.92×
-equal-corpus and 611.58× byte-weighted. Once the separately
-measured first-use Line-text leg is added, the optimistic incomplete cold result falls
-to 183.49×. Half-cold has provisional headroom at 262.80×, but still needs the real
-cache scenario and every remaining block.</p>
+<section><div class="eyebrow">Whole objective ledger</div><h2>The Line plane—not structural IDs—is now the dominant gap</h2>
+<p>The best full-run structural hybrid sends 46,690,193
+bytes and reaches 462.92× equal-corpus and
+611.58× byte-weighted. Aggregate cold-400 permits only
+71,386,678 total bytes, leaving 24,696,485 bytes for
+Line text <em>and every remaining block</em>. The exact zstd-3 stateful split-front
+Line contender alone sends 103,210,181
+bytes.</p>
 <div class="goal-row"><strong>Complete cold</strong><div class="goal-track"><div
- class="goal-fill warning" style="width:45.87%"></div></div>
-<div class="goal-value">183.49 / 400×</div></div>
+ class="goal-fill warning" style="width:47.62%"></div></div>
+<div class="goal-value">190.49 / 400×*</div></div>
 <div class="goal-row"><strong>Complete half-cold</strong><div class="goal-track"><div
- class="goal-fill" style="width:100%"></div></div><div class="goal-value">262.80 / 200×*</div></div>
+ class="goal-fill" style="width:100%"></div></div><div class="goal-value">290.50 / 200×*</div></div>
 <div class="goal-row"><strong>Structural installed</strong><div class="goal-track"><div
  class="goal-fill" style="width:100%"></div></div><div class="goal-value">462.92×</div></div>
-<p class="small">*Provisional and incomplete: passing the numerical threshold here is
-not the same as passing the complete half-cold acceptance scenario.</p></section>
+<p class="small">*The new cold number is byte-weighted structure + exact Line text;
+its equal-corpus result is 193.08×. The earlier 262.80× half-cold
+number uses the independently measured TU-local Line block. With the new stateful
+split-front bytes, the optimistic incomplete half-cold figures would be
+290.50× byte-weighted and 272.50× equal-corpus.
+Neither includes typed values, composition, requests, framing, or the real cache
+scenario.</p></section>
 
 <section><div class="eyebrow">Startup behavior</div><h2>Learning curves, with cohort changes visible</h2>
 <p>The fixed startup screen covers 7,207,461,456 raw bytes.
@@ -172,34 +189,126 @@ definition has yet been worth publishing. The installed package is burdened by i
 complete package frame. By TU 5 the seed leads 15/16 corpora; Eigen is the sole early
 exception and crosses empty permanently at TU 126.</div></section>
 
-<section><div class="eyebrow">Protocol algorithm</div><h2>One existing definition path, no F-side predictor</h2>
-<div class="flow"><div class="flow-box"><strong>1 · C candidate state</strong>Start with
-the target-disjoint seed plus bounded chronological learning. This state is never
-automatically transferred.</div><div class="arrow">→</div><div class="flow-box"><strong>2 · Actual-byte choice</strong>
-Encode empty baseline and seed/online candidate from the same pre-TU state. Include
-all definition, payload, length, and selector bytes.</div><div class="arrow">→</div>
-<div class="flow-box"><strong>3 · Ordinary wire blocks</strong>If and only if the
-candidate is smaller, send its exact missing phrase definitions followed by its
-payload. Otherwise send the baseline.</div><div class="arrow">→</div><div class="flow-box">
-<strong>4 · F exact expansion</strong>Install received immutable definitions, decode
-the selected payload, reproduce the complete Region sequence, then advance state.</div></div>
-<div class="split"><div class="plane"><h3>C retains</h3><ul><li>bounded candidate
-learner;</li><li>4,476- or 4,557-phrase seed vocabulary;</li><li>append-only installed
-definition IDs shared with F;</li><li>dense Region IDs from completed TUs.</li></ul></div>
-<div class="plane"><h3>F retains</h3><ul><li>only definitions actually received;</li>
-<li>the same append-only installed IDs;</li><li>dense Region IDs independently rebuilt
-from exact output;</li><li>no seed package and no duplicate learner.</li></ul></div></div>
-<h3>Definition encoding</h3><p>A single versioned definition batch chooses per phrase:
-(a) delta-coded dense Region references when every Region has already been observed,
-or (b) the exact phrase key when a seed phrase contains first-seen Regions. The
-receiver accepts known references, exact canonical keys, complete frames, and unique
-definitions. This is a refinement of the existing definition block, not a
-new message family.</p>
-<ol><li>Encode TU <em>t</em> from state through <em>t−1</em>.</li><li>Compare complete
-current-TU candidates using actual zstd-3 bytes.</li><li>Commit and install only the
-selected candidate’s definitions.</li><li>Decode independently and byte-compare the
-complete Region sequence.</li><li>Only after completion expose TU <em>t</em> to learning
-for future TUs.</li></ol></section>
+<section><div class="eyebrow">Stability matrix</div><h2>The bootstrap survives reorder and a broad input change</h2>
+<p>The max-200 screen covers 7,207,461,456
+raw bytes per scenario. It runs standard order, reverse order, three fixed shuffles,
+and a global replacement of the most-shared Region. Every one of the 96 decodes is
+exact; the seed is strictly smaller than empty learning in every corpus/scenario pair.</p>
+<div class="chart-wrap"><svg class="chart" viewBox="0 0 980 430" role="img" aria-labelledby="stability-title stability-desc"><title id="stability-title">Generic seed under order and input change</title><desc id="stability-desc">Equal-corpus compression ratio for empty and C-only-seeded online learning across six exact scenarios.</desc><line x1="72" y1="344.0" x2="956" y2="344.0" stroke="#d9e0e7" /><text x="62" y="348.0" text-anchor="end" class="axis-label">0×</text><line x1="72" y1="300.9" x2="956" y2="300.9" stroke="#d9e0e7" /><text x="62" y="304.9" text-anchor="end" class="axis-label">50×</text><line x1="72" y1="257.7" x2="956" y2="257.7" stroke="#d9e0e7" /><text x="62" y="261.7" text-anchor="end" class="axis-label">100×</text><line x1="72" y1="214.6" x2="956" y2="214.6" stroke="#d9e0e7" /><text x="62" y="218.6" text-anchor="end" class="axis-label">150×</text><line x1="72" y1="171.4" x2="956" y2="171.4" stroke="#d9e0e7" /><text x="62" y="175.4" text-anchor="end" class="axis-label">200×</text><line x1="72" y1="128.3" x2="956" y2="128.3" stroke="#d9e0e7" /><text x="62" y="132.3" text-anchor="end" class="axis-label">250×</text><line x1="72" y1="85.1" x2="956" y2="85.1" stroke="#d9e0e7" /><text x="62" y="89.1" text-anchor="end" class="axis-label">300×</text><line x1="72" y1="42.0" x2="956" y2="42.0" stroke="#d9e0e7" /><text x="62" y="46.0" text-anchor="end" class="axis-label">350×</text><rect x="101.1" y="113.8" width="41.3" height="230.2" rx="3" fill="#617083"><title>standard · Empty: 266.84×</title></rect><rect x="149.0" y="71.0" width="41.3" height="273.0" rx="3" fill="#0e8a74"><title>standard · Seed: 316.40×</title></rect><text x="145.7" y="31" text-anchor="middle" class="cohort-label">+18.6%</text><text x="145.7" y="367" text-anchor="middle" class="axis-label">standard</text><text x="145.7" y="384" text-anchor="middle" class="cohort-label">16/16 exact</text><rect x="248.4" y="113.4" width="41.3" height="230.6" rx="3" fill="#617083"><title>reverse · Empty: 267.21×</title></rect><rect x="296.3" y="87.4" width="41.3" height="256.6" rx="3" fill="#0e8a74"><title>reverse · Seed: 297.40×</title></rect><text x="293.0" y="31" text-anchor="middle" class="cohort-label">+11.3%</text><text x="293.0" y="367" text-anchor="middle" class="axis-label">reverse</text><text x="293.0" y="384" text-anchor="middle" class="cohort-label">16/16 exact</text><rect x="395.8" y="112.0" width="41.3" height="232.0" rx="3" fill="#617083"><title>shuffle1 · Empty: 268.93×</title></rect><rect x="443.6" y="85.4" width="41.3" height="258.6" rx="3" fill="#0e8a74"><title>shuffle1 · Seed: 299.76×</title></rect><text x="440.3" y="31" text-anchor="middle" class="cohort-label">+11.5%</text><text x="440.3" y="367" text-anchor="middle" class="axis-label">shuffle 1</text><text x="440.3" y="384" text-anchor="middle" class="cohort-label">16/16 exact</text><rect x="543.1" y="111.1" width="41.3" height="232.9" rx="3" fill="#617083"><title>shuffle2 · Empty: 269.91×</title></rect><rect x="591.0" y="79.5" width="41.3" height="264.5" rx="3" fill="#0e8a74"><title>shuffle2 · Seed: 306.50×</title></rect><text x="587.7" y="31" text-anchor="middle" class="cohort-label">+13.6%</text><text x="587.7" y="367" text-anchor="middle" class="axis-label">shuffle 2</text><text x="587.7" y="384" text-anchor="middle" class="cohort-label">16/16 exact</text><rect x="690.4" y="115.0" width="41.3" height="229.0" rx="3" fill="#617083"><title>shuffle3 · Empty: 265.39×</title></rect><rect x="738.3" y="86.1" width="41.3" height="257.9" rx="3" fill="#0e8a74"><title>shuffle3 · Seed: 298.90×</title></rect><text x="735.0" y="31" text-anchor="middle" class="cohort-label">+12.6%</text><text x="735.0" y="367" text-anchor="middle" class="axis-label">shuffle 3</text><text x="735.0" y="384" text-anchor="middle" class="cohort-label">16/16 exact</text><rect x="837.8" y="113.8" width="41.3" height="230.2" rx="3" fill="#617083"><title>perturb · Empty: 266.84×</title></rect><rect x="885.6" y="71.0" width="41.3" height="273.0" rx="3" fill="#0e8a74"><title>perturb · Seed: 316.33×</title></rect><text x="882.3" y="31" text-anchor="middle" class="cohort-label">+18.5%</text><text x="882.3" y="367" text-anchor="middle" class="axis-label">perturb</text><text x="882.3" y="384" text-anchor="middle" class="cohort-label">16/16 exact</text><rect x="72" y="12" width="16" height="12" rx="2" fill="#617083"/><text x="96" y="23" class="legend-label">Empty online</text><rect x="292" y="12" width="16" height="12" rx="2" fill="#0e8a74"/><text x="316" y="23" class="legend-label">Generic seed → online</text><text x="514.0" y="423" text-anchor="middle" class="axis-title">Scenario; labels above groups are seed gain over empty</text></svg></div>
+<p class="caption">Order changes alter the absolute ratio because they alter what the
+online learner has seen. The relevant result is that the target-disjoint seed remains
+useful in every order. Perturb and standard are nearly identical in aggregate.</p>
+<div class="table-scroll"><table><thead><tr><th>Scenario</th><th>Empty equal</th>
+<th>Seed equal</th><th>Seed gain</th><th>Seed weighted</th><th>Seed wire</th>
+<th>Seed wins</th><th>Exact</th></tr></thead><tbody><tr><td><strong>standard</strong></td><td>266.84×</td><td class="best">316.40×</td><td>+18.57%</td><td>289.48×</td><td>24,897,754</td><td>16 / 16</td><td>16 / 16</td></tr><tr><td><strong>reverse</strong></td><td>267.21×</td><td class="best">297.40×</td><td>+11.30%</td><td>278.36×</td><td>25,892,770</td><td>16 / 16</td><td>16 / 16</td></tr><tr><td><strong>shuffle1</strong></td><td>268.93×</td><td class="best">299.76×</td><td>+11.46%</td><td>281.48×</td><td>25,605,739</td><td>16 / 16</td><td>16 / 16</td></tr><tr><td><strong>shuffle2</strong></td><td>269.91×</td><td class="best">306.50×</td><td>+13.55%</td><td>283.99×</td><td>25,379,069</td><td>16 / 16</td><td>16 / 16</td></tr><tr><td><strong>shuffle3</strong></td><td>265.39×</td><td class="best">298.90×</td><td>+12.63%</td><td>279.86×</td><td>25,754,130</td><td>16 / 16</td><td>16 / 16</td></tr><tr><td><strong>perturb</strong></td><td>266.84×</td><td class="best">316.33×</td><td>+18.55%</td><td>289.42×</td><td>24,902,981</td><td>16 / 16</td><td>16 / 16</td></tr></tbody></table></div>
+<h3>Per-corpus worst observed order</h3>
+<div class="table-scroll"><table><thead><tr><th>Corpus</th><th>Standard seed</th>
+<th>Minimum seed</th><th>Worst scenario</th><th>Change from standard</th>
+<th>Minimum seed gain vs empty</th><th>Wins</th></tr></thead>
+<tbody><tr><td><strong>cereal</strong></td><td>1203.58×</td><td>731.80×</td><td>reverse</td><td>-39.20%</td><td>+0.03%</td><td>6 / 6</td></tr><tr><td><strong>eigen</strong></td><td>1326.48×</td><td>942.63×</td><td>reverse</td><td>-28.94%</td><td>+7.27%</td><td>6 / 6</td></tr><tr><td><strong>re2</strong></td><td>436.32×</td><td>351.13×</td><td>shuffle3</td><td>-19.52%</td><td>+28.68%</td><td>6 / 6</td></tr><tr><td><strong>catch2</strong></td><td>550.67×</td><td>460.45×</td><td>reverse</td><td>-16.38%</td><td>+14.47%</td><td>6 / 6</td></tr><tr><td><strong>nlohmann-json</strong></td><td>453.12×</td><td>388.45×</td><td>shuffle1</td><td>-14.27%</td><td>+14.36%</td><td>6 / 6</td></tr><tr><td><strong>range-v3</strong></td><td>795.00×</td><td>687.93×</td><td>reverse</td><td>-13.47%</td><td>+19.57%</td><td>6 / 6</td></tr><tr><td><strong>llvm</strong></td><td>504.26×</td><td>437.70×</td><td>reverse</td><td>-13.20%</td><td>+12.33%</td><td>6 / 6</td></tr><tr><td><strong>godot</strong></td><td>875.28×</td><td>771.55×</td><td>reverse</td><td>-11.85%</td><td>+13.16%</td><td>6 / 6</td></tr><tr><td><strong>leveldb</strong></td><td>222.04×</td><td>196.17×</td><td>shuffle3</td><td>-11.65%</td><td>+13.90%</td><td>6 / 6</td></tr><tr><td><strong>spdlog</strong></td><td>323.06×</td><td>287.46×</td><td>shuffle1</td><td>-11.02%</td><td>+0.76%</td><td>6 / 6</td></tr><tr><td><strong>simdjson</strong></td><td>690.18×</td><td>628.29×</td><td>shuffle3</td><td>-8.97%</td><td>+14.03%</td><td>6 / 6</td></tr><tr><td><strong>fmt</strong></td><td>130.85×</td><td>123.60×</td><td>shuffle3</td><td>-5.54%</td><td>+11.01%</td><td>6 / 6</td></tr><tr><td><strong>abseil</strong></td><td>144.39×</td><td>140.54×</td><td>reverse</td><td>-2.67%</td><td>+3.56%</td><td>6 / 6</td></tr><tr><td><strong>rocksdb</strong></td><td>110.12×</td><td>109.05×</td><td>shuffle3</td><td>-0.97%</td><td>+1.38%</td><td>6 / 6</td></tr><tr><td><strong>duckdb</strong></td><td>472.94×</td><td>470.19×</td><td>perturb</td><td>-0.58%</td><td>+14.30%</td><td>6 / 6</td></tr><tr><td><strong>opencv</strong></td><td>287.75×</td><td>287.67×</td><td>perturb</td><td>-0.03%</td><td>+6.80%</td><td>6 / 6</td></tr></tbody></table></div>
+<p class="small">Cereal is the most order-sensitive absolute ratio (-39.20% in
+reverse), followed by Eigen (-28.94%). Even there, the seed still wins every paired
+empty-start run. Delayed/reverted multi-build changes and scheduler-shaped concurrent
+arrival remain separate required scenarios.</p></section>
+
+<section><div class="eyebrow">Proposed product architecture</div><h2>Share the outputs; keep ranking and learning modular</h2>
+<div class="flow"><div class="flow-box"><strong>1 · Versioned generic pack</strong>
+Ship a compact static vocabulary/output table with protocol 50 at both endpoints.
+Give it a stable pack ID and a reserved static-ID range.</div><div class="arrow">→</div>
+<div class="flow-box"><strong>2 · C candidate engine</strong>Use the generic ranker,
+the static outputs, and bounded per-project online history to propose complete current-TU
+candidates. Keep the literal baseline.</div><div class="arrow">→</div>
+<div class="flow-box"><strong>3 · Actual wire choice</strong>Send static IDs, known
+dynamic IDs, once-only dynamic definitions, and residual literals. Choose only after
+counting every byte in the complete candidate.</div><div class="arrow">→</div>
+<div class="flow-box"><strong>4 · F expansion/store</strong>Resolve static IDs from
+the shared pack, install explicit dynamic definitions under the C-cache identity, and
+emit the exact Line stream into the compiler pipe.</div></div>
+
+<div class="split"><div class="plane"><h3>Pre-shared, software lifetime</h3><ul>
+<li>pack format and codec version;</li><li>immutable static superblock definitions;</li>
+<li>stable static IDs and small decode tables;</li><li>optionally the same generic
+ranker at C and F, although F does not need it for the first implementation.</li></ul></div>
+<div class="plane"><h3>Online, per-C cache lifetime</h3><ul><li>dynamic definition ID
+space and exact definitions;</li><li>C-side candidate statistics and bounded learner;</li>
+<li>F-side installed dynamic dictionary;</li><li>dense Region/Line stores rebuilt from
+completed exact output.</li></ul></div></div>
+
+<h3>Why outputs are the minimal shared object</h3>
+<p>The decoder never has to guess which phrase C selected. A static ID names a
+pre-shared output; a dynamic ID names a previously transmitted exact definition; a
+literal carries itself. That permits the C ranking model to change independently of
+F. It also permits a future larger model without changing the basic wire blocks. If
+measurement later shows that once-only dynamic definitions are a material fraction,
+both endpoints can run the same deterministic learner—but that requires a single
+commit order across concurrent TUs. Explicit definitions avoid that coupling now.</p>
+
+<h3>Per-TU transition</h3>
+<ol><li>Build TU <em>t</em> candidates from the static pack and committed project state
+through <em>t−1</em>.</li><li>Encode the empty/literal baseline and every contender,
+including definitions, indices, lengths, selectors, and compression framing.</li>
+<li>Commit the smallest complete candidate; keep an exact fallback for every field.</li>
+<li>F resolves the static/dynamic IDs, installs complete new definitions, and
+reconstructs the exact stream.</li><li>Only after TU completion may C learn from it for
+future work. F retains only decoder-visible state unless mirrored learning earns its
+complexity in a later measurement.</li></ol>
+<div class="callout warning"><strong>Measured versus proposed.</strong> The current
+16-corpus experiment uses a C-only seed and charges each selected seed definition on
+first use. A truly pre-shared output table should remove those first-use definition
+bytes, but that improvement must be measured as a separate row; it is not silently
+credited to the current result.</div>
+<div class="callout warning"><strong>Training boundary.</strong> The present seed is
+trained on target-disjoint expanded <code>.ii</code> traces only as a mechanism and
+wire-accounting control. It is not the universal product pack. The product candidate
+must be learned from raw C/C++ source and parameterized structural programs, evaluated
+with the target project, alternate builds of that project, and compiler/toolchain
+families held out. Runtime expanded input belongs to the online learner.</div></section>
+
+<section><div class="eyebrow">Exact Line-plane ceiling</div><h2>Continuous state helps, but ordinary compression cannot close cold-400</h2>
+<p>The Line harness extracts exact first-use Line text from all 16 traces and tests
+independent TU frames, one ordered cache-lifetime stream, and whole-corpus offline
+ceilings. Every reported frame is decoded and byte-compared. Split-front coding
+compresses prefix lengths, output lengths, and suffix bytes as separate streams.</p>
+<div class="chart-wrap"><svg class="chart" viewBox="0 0 980 430" role="img" aria-labelledby="line-title line-desc"><title id="line-title">Exact first-use Line wire versus cold-400 allowance</title><desc id="line-desc">Aggregate exact Line wire for four encodings across 16 corpora. The allowance excludes all remaining unmeasured blocks.</desc><line x1="82" y1="318.0" x2="954" y2="318.0" stroke="#d9e0e7" /><text x="72" y="322.0" text-anchor="end" class="axis-label">0 MB</text><line x1="82" y1="272.0" x2="954" y2="272.0" stroke="#d9e0e7" /><text x="72" y="276.0" text-anchor="end" class="axis-label">20 MB</text><line x1="82" y1="226.0" x2="954" y2="226.0" stroke="#d9e0e7" /><text x="72" y="230.0" text-anchor="end" class="axis-label">40 MB</text><line x1="82" y1="180.0" x2="954" y2="180.0" stroke="#d9e0e7" /><text x="72" y="184.0" text-anchor="end" class="axis-label">60 MB</text><line x1="82" y1="134.0" x2="954" y2="134.0" stroke="#d9e0e7" /><text x="72" y="138.0" text-anchor="end" class="axis-label">80 MB</text><line x1="82" y1="88.0" x2="954" y2="88.0" stroke="#d9e0e7" /><text x="72" y="92.0" text-anchor="end" class="axis-label">100 MB</text><line x1="82" y1="42.0" x2="954" y2="42.0" stroke="#d9e0e7" /><text x="72" y="46.0" text-anchor="end" class="axis-label">120 MB</text><line x1="82" y1="261.2" x2="954" y2="261.2" stroke="#d18b2c" stroke-width="3" stroke-dasharray="9 7" /><text x="950" y="254.2" text-anchor="end" class="legend-label" fill="#8a4b1f">24.70 MB maximum after structure</text><rect x="138.5" y="65.1" width="105.0" height="252.9" rx="4" fill="#617083"><title>z3 · TU-local best: 109,937,000 bytes; exact=True</title></rect><text x="191.0" y="56.1" text-anchor="middle" class="legend-label">109.94 MB</text><text x="191.0" y="342" text-anchor="middle" class="axis-label">z3</text><text x="191.0" y="360" text-anchor="middle" class="cohort-label">TU-local best</text><rect x="356.5" y="71.3" width="105.0" height="246.7" rx="4" fill="#3178a8"><title>z3 · TU-local split: 107,270,767 bytes; exact=True</title></rect><text x="409.0" y="62.3" text-anchor="middle" class="legend-label">107.27 MB</text><text x="409.0" y="342" text-anchor="middle" class="axis-label">z3</text><text x="409.0" y="360" text-anchor="middle" class="cohort-label">TU-local split</text><rect x="574.5" y="80.6" width="105.0" height="237.4" rx="4" fill="#0e8a74"><title>z3 · stateful split: 103,210,181 bytes; exact=True</title></rect><text x="627.0" y="71.6" text-anchor="middle" class="legend-label">103.21 MB</text><text x="627.0" y="342" text-anchor="middle" class="axis-label">z3</text><text x="627.0" y="360" text-anchor="middle" class="cohort-label">stateful split</text><rect x="792.5" y="97.9" width="105.0" height="220.1" rx="4" fill="#7656a8"><title>z6 · stateful split: 95,707,737 bytes; exact=True</title></rect><text x="845.0" y="88.9" text-anchor="middle" class="legend-label">95.71 MB</text><text x="845.0" y="342" text-anchor="middle" class="axis-label">z6</text><text x="845.0" y="360" text-anchor="middle" class="cohort-label">stateful split</text><text x="518.0" y="422" text-anchor="middle" class="axis-title">Line-text bytes only; the dashed allowance already assumes the best structural hybrid</text></svg></div>
+<p class="caption">The dashed line is already generous: it is the entire aggregate
+allowance remaining after the 46.69 MB best structural hybrid, before composition,
+typed values, requests, or framing. Whole-corpus rows are capability ceilings, not a
+streaming product design.</p>
+<div class="table-scroll"><table><thead><tr><th>Level</th><th>Representation</th>
+<th>Wire bytes</th><th>Line ratio</th><th>Raw / Line wire</th><th>Corpora</th>
+<th>Exact</th></tr></thead><tbody><tr><td>zstd-3</td><td>TU-local best of literal/front</td><td>109,937,000</td><td>4.95×</td><td>259.74×</td><td>16 / 16</td><td>yes</td></tr><tr><td>zstd-3</td><td>TU-local split-front</td><td>107,270,767</td><td>5.07×</td><td>266.19×</td><td>16 / 16</td><td>yes</td></tr><tr><td>zstd-3</td><td>Ordered stream front</td><td>105,581,094</td><td>5.16×</td><td>270.45×</td><td>16 / 16</td><td>yes</td></tr><tr><td>zstd-3</td><td>Ordered stream split-front</td><td>103,210,181</td><td>5.27×</td><td>276.67×</td><td>16 / 16</td><td>yes</td></tr><tr><td>zstd-6</td><td>Ordered stream split-front</td><td>95,707,737</td><td>5.69×</td><td>298.35×</td><td>16 / 16</td><td>yes</td></tr><tr><td>zstd-6</td><td>Whole-corpus split-front ceiling</td><td>96,160,159</td><td>5.66×</td><td>296.95×</td><td>16 / 16</td><td>yes</td></tr></tbody></table></div>
+<div class="split"><div class="plane"><h3>Retain now</h3><ul><li>TU-local
+split-front as a small independent Line block with literal fallback;</li><li>one
+stateful-stream capability row to quantify cross-TU window value;</li><li>separate
+stream fields because they improve zstd without changing Line semantics.</li></ul></div>
+<div class="plane"><h3>Do not infer</h3><ul><li>Python harness throughput is not the
+C++ product throughput;</li><li>whole-corpus compression is not available to the live
+compiler pipe;</li><li>a 2–5% Line reshaping win does not replace the need for reusable
+multi-Line/superblock outputs;</li><li>the combined ratio is still incomplete.</li></ul>
+</div></div>
+<p>The product-relevant question is therefore not “which zstd level closes the gap?”
+It is “how much exact Line content can the shared generic pack and online project
+dictionary name instead of resending?” zstd-1 or zstd-3 should then compress the much
+smaller residual stream.</p></section>
+
+<section><div class="eyebrow">Related capability result</div><h2>Source attribution points toward a portable generic bootstrap</h2>
+<p>The implementer’s 15-corpus study at commit <code>85c0bd4</code> measured the
+definition/dictionary leg with installed toolchain text reconstructed from source
+attribution. It reduced the count below 400× from six corpora to two: DuckDB at
+268.9× and fmt at 398.1×. This is a related leg-level capability result, not a complete
+transfer result and not yet integrated with the structural hybrid above.</p>
+<div class="chart-wrap"><svg class="chart" viewBox="0 0 980 520" role="img" aria-labelledby="source-title source-desc"><title id="source-title">Related source-conditioning capability result</title><desc id="source-desc">Plain dictionary-leg ratio and ratio when installed toolchain text is reconstructed from its source attribution.</desc><line x1="154.0" y1="34" x2="154.0" y2="466" stroke="#d9e0e7" stroke-width="1" /><text x="154.0" y="491" text-anchor="middle" class="axis-label">100×</text><line x1="288.1" y1="34" x2="288.1" y2="466" stroke="#d9e0e7" stroke-width="1" /><text x="288.1" y="491" text-anchor="middle" class="axis-label">200×</text><line x1="422.2" y1="34" x2="422.2" y2="466" stroke="#d18b2c" stroke-width="2" /><text x="422.2" y="491" text-anchor="middle" class="axis-label">400×</text><line x1="556.2" y1="34" x2="556.2" y2="466" stroke="#d9e0e7" stroke-width="1" /><text x="556.2" y="491" text-anchor="middle" class="axis-label">800×</text><line x1="690.3" y1="34" x2="690.3" y2="466" stroke="#d9e0e7" stroke-width="1" /><text x="690.3" y="491" text-anchor="middle" class="axis-label">1600×</text><line x1="824.4" y1="34" x2="824.4" y2="466" stroke="#d9e0e7" stroke-width="1" /><text x="824.4" y="491" text-anchor="middle" class="axis-label">3200×</text><line x1="946.0" y1="34" x2="946.0" y2="466" stroke="#d9e0e7" stroke-width="1" /><text x="946.0" y="491" text-anchor="middle" class="axis-label">6000×</text><text x="142" y="52.4" text-anchor="end" class="axis-label">duckdb</text><line x1="323.8" y1="48.4" x2="345.3" y2="48.4" stroke="#d9e0e7" stroke-width="4" /><circle cx="323.8" cy="48.4" r="5" fill="#617083"><title>duckdb plain: 240.5×</title></circle><circle cx="345.3" cy="48.4" r="6" fill="#3178a8"><title>duckdb source-conditioned: 268.9×</title></circle><text x="142" y="81.2" text-anchor="end" class="axis-label">fmt</text><line x1="270.4" y1="77.2" x2="421.2" y2="77.2" stroke="#d9e0e7" stroke-width="4" /><circle cx="270.4" cy="77.2" r="5" fill="#617083"><title>fmt plain: 182.5×</title></circle><circle cx="421.2" cy="77.2" r="6" fill="#3178a8"><title>fmt source-conditioned: 398.1×</title></circle><text x="142" y="110.0" text-anchor="end" class="axis-label">llvm</text><line x1="454.0" y1="106.0" x2="475.6" y2="106.0" stroke="#d9e0e7" stroke-width="4" /><circle cx="454.0" cy="106.0" r="5" fill="#617083"><title>llvm plain: 471.6×</title></circle><circle cx="475.6" cy="106.0" r="6" fill="#3178a8"><title>llvm source-conditioned: 527.4×</title></circle><text x="142" y="138.8" text-anchor="end" class="axis-label">spdlog</text><line x1="270.7" y1="134.8" x2="487.0" y2="134.8" stroke="#d9e0e7" stroke-width="4" /><circle cx="270.7" cy="134.8" r="5" fill="#617083"><title>spdlog plain: 182.8×</title></circle><circle cx="487.0" cy="134.8" r="6" fill="#3178a8"><title>spdlog source-conditioned: 559.3×</title></circle><text x="142" y="167.6" text-anchor="end" class="axis-label">re2</text><line x1="315.1" y1="163.6" x2="525.7" y2="163.6" stroke="#d9e0e7" stroke-width="4" /><circle cx="315.1" cy="163.6" r="5" fill="#617083"><title>re2 plain: 230.0×</title></circle><circle cx="525.7" cy="163.6" r="6" fill="#3178a8"><title>re2 source-conditioned: 683.3×</title></circle><text x="142" y="196.4" text-anchor="end" class="axis-label">leveldb</text><line x1="334.7" y1="192.4" x2="533.7" y2="192.4" stroke="#d9e0e7" stroke-width="4" /><circle cx="334.7" cy="192.4" r="5" fill="#617083"><title>leveldb plain: 254.5×</title></circle><circle cx="533.7" cy="192.4" r="6" fill="#3178a8"><title>leveldb source-conditioned: 711.9×</title></circle><text x="142" y="225.2" text-anchor="end" class="axis-label">nlohmann-json</text><line x1="383.2" y1="221.2" x2="536.8" y2="221.2" stroke="#d9e0e7" stroke-width="4" /><circle cx="383.2" cy="221.2" r="5" fill="#617083"><title>nlohmann-json plain: 327.0×</title></circle><circle cx="536.8" cy="221.2" r="6" fill="#3178a8"><title>nlohmann-json source-conditioned: 723.5×</title></circle><text x="142" y="254.0" text-anchor="end" class="axis-label">opencv</text><line x1="529.1" y1="250.0" x2="555.9" y2="250.0" stroke="#d9e0e7" stroke-width="4" /><circle cx="529.1" cy="250.0" r="5" fill="#617083"><title>opencv plain: 695.2×</title></circle><circle cx="555.9" cy="250.0" r="6" fill="#3178a8"><title>opencv source-conditioned: 798.7×</title></circle><text x="142" y="282.8" text-anchor="end" class="axis-label">rocksdb</text><line x1="518.5" y1="278.8" x2="580.5" y2="278.8" stroke="#d9e0e7" stroke-width="4" /><circle cx="518.5" cy="278.8" r="5" fill="#617083"><title>rocksdb plain: 658.3×</title></circle><circle cx="580.5" cy="278.8" r="6" fill="#3178a8"><title>rocksdb source-conditioned: 906.7×</title></circle><text x="142" y="311.6" text-anchor="end" class="axis-label">simdjson</text><line x1="432.2" y1="307.6" x2="602.1" y2="307.6" stroke="#d9e0e7" stroke-width="4" /><circle cx="432.2" cy="307.6" r="5" fill="#617083"><title>simdjson plain: 421.2×</title></circle><circle cx="602.1" cy="307.6" r="6" fill="#3178a8"><title>simdjson source-conditioned: 1013.9×</title></circle><text x="142" y="340.4" text-anchor="end" class="axis-label">abseil-protobuf</text><line x1="548.4" y1="336.4" x2="607.8" y2="336.4" stroke="#d9e0e7" stroke-width="4" /><circle cx="548.4" cy="336.4" r="5" fill="#617083"><title>abseil-protobuf plain: 768.2×</title></circle><circle cx="607.8" cy="336.4" r="6" fill="#3178a8"><title>abseil-protobuf source-conditioned: 1044.6×</title></circle><text x="142" y="369.2" text-anchor="end" class="axis-label">range-v3</text><line x1="568.5" y1="365.2" x2="720.3" y2="365.2" stroke="#d9e0e7" stroke-width="4" /><circle cx="568.5" cy="365.2" r="5" fill="#617083"><title>range-v3 plain: 852.5×</title></circle><circle cx="720.3" cy="365.2" r="6" fill="#3178a8"><title>range-v3 source-conditioned: 1868.2×</title></circle><text x="142" y="398.0" text-anchor="end" class="axis-label">cereal</text><line x1="507.4" y1="394.0" x2="768.5" y2="394.0" stroke="#d9e0e7" stroke-width="4" /><circle cx="507.4" cy="394.0" r="5" fill="#617083"><title>cereal plain: 621.4×</title></circle><circle cx="768.5" cy="394.0" r="6" fill="#3178a8"><title>cereal source-conditioned: 2396.3×</title></circle><text x="142" y="426.8" text-anchor="end" class="axis-label">catch2</text><line x1="657.5" y1="422.8" x2="835.9" y2="422.8" stroke="#d9e0e7" stroke-width="4" /><circle cx="657.5" cy="422.8" r="5" fill="#617083"><title>catch2 plain: 1350.4×</title></circle><circle cx="835.9" cy="422.8" r="6" fill="#3178a8"><title>catch2 source-conditioned: 3396.5×</title></circle><text x="142" y="455.6" text-anchor="end" class="axis-label">eigen</text><line x1="829.0" y1="451.6" x2="913.3" y2="451.6" stroke="#d9e0e7" stroke-width="4" /><circle cx="829.0" cy="451.6" r="5" fill="#617083"><title>eigen plain: 3277.7×</title></circle><circle cx="913.3" cy="451.6" r="6" fill="#3178a8"><title>eigen source-conditioned: 5065.7×</title></circle><circle cx="154" cy="16" r="5" fill="#617083" /><text x="166" y="20" class="legend-label">Plain dict leg</text><circle cx="344" cy="16" r="6" fill="#3178a8" /><text x="356" y="20" class="legend-label">Source-conditioned leg</text></svg></div>
+<p class="caption">Log scale. Grey is the ordinary dictionary leg; blue is the
+source-conditioned result. The vertical 400× marker is a diagnostic threshold for
+this leg, not the whole-message acceptance line.</p>
+<div class="table-scroll"><table><thead><tr><th>Corpus</th><th>TUs</th><th>Raw MiB</th>
+<th>Plain dict</th><th>Source-conditioned</th><th>Lift</th><th>Exact Line coverage</th>
+</tr></thead><tbody><tr><td><strong>duckdb</strong></td><td>689</td><td>1,893.7</td><td>240.50×</td><td class="best">268.90×</td><td>1.12×</td><td>5.27%</td></tr><tr><td><strong>fmt</strong></td><td>50</td><td>130.0</td><td>182.50×</td><td class="best">398.10×</td><td>2.18×</td><td>54.31%</td></tr><tr><td><strong>llvm</strong></td><td>1238</td><td>3,452.6</td><td>471.60×</td><td class="best">527.40×</td><td>1.12×</td><td>5.19%</td></tr><tr><td><strong>spdlog</strong></td><td>34</td><td>93.8</td><td>182.80×</td><td class="best">559.30×</td><td>3.06×</td><td>75.40%</td></tr><tr><td><strong>re2</strong></td><td>72</td><td>105.1</td><td>230.00×</td><td class="best">683.30×</td><td>2.97×</td><td>76.77%</td></tr><tr><td><strong>leveldb</strong></td><td>72</td><td>137.2</td><td>254.50×</td><td class="best">711.90×</td><td>2.80×</td><td>66.59%</td></tr><tr><td><strong>nlohmann-json</strong></td><td>99</td><td>280.3</td><td>327.00×</td><td class="best">723.50×</td><td>2.21×</td><td>37.90%</td></tr><tr><td><strong>opencv</strong></td><td>1506</td><td>4,416.5</td><td>695.20×</td><td class="best">798.70×</td><td>1.15×</td><td>6.84%</td></tr><tr><td><strong>rocksdb</strong></td><td>622</td><td>2,970.1</td><td>658.30×</td><td class="best">906.70×</td><td>1.38×</td><td>7.73%</td></tr><tr><td><strong>simdjson</strong></td><td>153</td><td>446.7</td><td>421.20×</td><td class="best">1013.90×</td><td>2.41×</td><td>59.87%</td></tr><tr><td><strong>abseil-protobuf</strong></td><td>700</td><td>2,461.4</td><td>768.20×</td><td class="best">1044.60×</td><td>1.36×</td><td>14.51%</td></tr><tr><td><strong>range-v3</strong></td><td>259</td><td>602.8</td><td>852.50×</td><td class="best">1868.20×</td><td>2.19×</td><td>37.83%</td></tr><tr><td><strong>cereal</strong></td><td>84</td><td>311.8</td><td>621.40×</td><td class="best">2396.30×</td><td>3.86×</td><td>76.83%</td></tr><tr><td><strong>catch2</strong></td><td>857</td><td>903.4</td><td>1350.40×</td><td class="best">3396.50×</td><td>2.52×</td><td>40.77%</td></tr><tr><td><strong>eigen</strong></td><td>650</td><td>3,368.6</td><td>3277.70×</td><td class="best">5065.70×</td><td>1.55×</td><td>27.13%</td></tr></tbody></table></div>
+<p>The portable training target should therefore be raw C/C++ source plus a small
+set of toolchain-labelled transformations, not one machine’s expanded <code>.ii</code>
+bytes. The shipped artifact is still only a bootstrap: target-local online history
+should replace its ranking quickly, while its shared static outputs remain valid IDs.</p>
+</section>
 
 <section><div class="eyebrow">Corpus balance</div><h2>The gain is broad, not one-project driven</h2>
 <div class="chart-wrap"><svg class="chart" viewBox="0 0 980 470" role="img" aria-labelledby="gain-title gain-desc"><title id="gain-title">C-only seed gain by corpus</title><desc id="gain-desc">Percentage compression-ratio gain of the C-only seed against empty learning and installed pretraining at each corpus endpoint.</desc><line x1="70" y1="352.0" x2="958" y2="352.0" stroke="#d9e0e7" stroke-width="1" /><text x="60" y="356.0" text-anchor="end" class="axis-label">-10%</text><line x1="70" y1="312.2" x2="958" y2="312.2" stroke="#17212b" stroke-width="2" /><text x="60" y="316.2" text-anchor="end" class="axis-label">+0%</text><line x1="70" y1="272.5" x2="958" y2="272.5" stroke="#d9e0e7" stroke-width="1" /><text x="60" y="276.5" text-anchor="end" class="axis-label">+10%</text><line x1="70" y1="232.8" x2="958" y2="232.8" stroke="#d9e0e7" stroke-width="1" /><text x="60" y="236.8" text-anchor="end" class="axis-label">+20%</text><line x1="70" y1="193.0" x2="958" y2="193.0" stroke="#d9e0e7" stroke-width="1" /><text x="60" y="197.0" text-anchor="end" class="axis-label">+30%</text><line x1="70" y1="153.2" x2="958" y2="153.2" stroke="#d9e0e7" stroke-width="1" /><text x="60" y="157.2" text-anchor="end" class="axis-label">+40%</text><line x1="70" y1="113.5" x2="958" y2="113.5" stroke="#d9e0e7" stroke-width="1" /><text x="60" y="117.5" text-anchor="end" class="axis-label">+50%</text><line x1="70" y1="73.8" x2="958" y2="73.8" stroke="#d9e0e7" stroke-width="1" /><text x="60" y="77.8" text-anchor="end" class="axis-label">+60%</text><line x1="70" y1="34.0" x2="958" y2="34.0" stroke="#d9e0e7" stroke-width="1" /><text x="60" y="38.0" text-anchor="end" class="axis-label">+70%</text><line x1="91.8" y1="312.2" x2="91.8" y2="284.8" stroke="#0e8a74" stroke-width="3" opacity="0.68" /><circle cx="91.8" cy="284.8" r="5" fill="#0e8a74"><title>llvm vs empty: +6.90%</title></circle><line x1="103.8" y1="312.2" x2="103.8" y2="304.8" stroke="#d18b2c" stroke-width="3" opacity="0.68" /><circle cx="103.8" cy="304.8" r="5" fill="#d18b2c"><title>llvm vs installed: +1.87%</title></circle><text transform="translate(100.8,365) rotate(52)" text-anchor="start" class="axis-label">llvm</text><line x1="147.2" y1="312.2" x2="147.2" y2="303.6" stroke="#0e8a74" stroke-width="3" opacity="0.68" /><circle cx="147.2" cy="303.6" r="5" fill="#0e8a74"><title>rocksdb vs empty: +2.17%</title></circle><line x1="159.2" y1="312.2" x2="159.2" y2="307.9" stroke="#d18b2c" stroke-width="3" opacity="0.68" /><circle cx="159.2" cy="307.9" r="5" fill="#d18b2c"><title>rocksdb vs installed: +1.08%</title></circle><text transform="translate(156.2,365) rotate(52)" text-anchor="start" class="axis-label">rocksdb</text><line x1="202.8" y1="312.2" x2="202.8" y2="282.0" stroke="#0e8a74" stroke-width="3" opacity="0.68" /><circle cx="202.8" cy="282.0" r="5" fill="#0e8a74"><title>duckdb vs empty: +7.61%</title></circle><line x1="214.8" y1="312.2" x2="214.8" y2="308.3" stroke="#d18b2c" stroke-width="3" opacity="0.68" /><circle cx="214.8" cy="308.3" r="5" fill="#d18b2c"><title>duckdb vs installed: +0.99%</title></circle><text transform="translate(211.8,365) rotate(52)" text-anchor="start" class="axis-label">duckdb</text><line x1="258.2" y1="312.2" x2="258.2" y2="301.7" stroke="#0e8a74" stroke-width="3" opacity="0.68" /><circle cx="258.2" cy="301.7" r="5" fill="#0e8a74"><title>abseil vs empty: +2.64%</title></circle><line x1="270.2" y1="312.2" x2="270.2" y2="309.0" stroke="#d18b2c" stroke-width="3" opacity="0.68" /><circle cx="270.2" cy="309.0" r="5" fill="#d18b2c"><title>abseil vs installed: +0.81%</title></circle><text transform="translate(267.2,365) rotate(52)" text-anchor="start" class="axis-label">abseil</text><line x1="313.8" y1="312.2" x2="313.8" y2="301.2" stroke="#0e8a74" stroke-width="3" opacity="0.68" /><circle cx="313.8" cy="301.2" r="5" fill="#0e8a74"><title>opencv vs empty: +2.77%</title></circle><line x1="325.8" y1="312.2" x2="325.8" y2="306.1" stroke="#d18b2c" stroke-width="3" opacity="0.68" /><circle cx="325.8" cy="306.1" r="5" fill="#d18b2c"><title>opencv vs installed: +1.54%</title></circle><text transform="translate(322.8,365) rotate(52)" text-anchor="start" class="axis-label">opencv</text><line x1="369.2" y1="312.2" x2="369.2" y2="270.9" stroke="#0e8a74" stroke-width="3" opacity="0.68" /><circle cx="369.2" cy="270.9" r="5" fill="#0e8a74"><title>godot vs empty: +10.41%</title></circle><line x1="381.2" y1="312.2" x2="381.2" y2="308.2" stroke="#d18b2c" stroke-width="3" opacity="0.68" /><circle cx="381.2" cy="308.2" r="5" fill="#d18b2c"><title>godot vs installed: +1.01%</title></circle><text transform="translate(378.2,365) rotate(52)" text-anchor="start" class="axis-label">godot</text><line x1="424.8" y1="312.2" x2="424.8" y2="248.5" stroke="#0e8a74" stroke-width="3" opacity="0.68" /><circle cx="424.8" cy="248.5" r="5" fill="#0e8a74"><title>fmt vs empty: +16.05%</title></circle><line x1="436.8" y1="312.2" x2="436.8" y2="284.0" stroke="#d18b2c" stroke-width="3" opacity="0.68" /><circle cx="436.8" cy="284.0" r="5" fill="#d18b2c"><title>fmt vs installed: +7.10%</title></circle><text transform="translate(433.8,365) rotate(52)" text-anchor="start" class="axis-label">fmt</text><line x1="480.2" y1="312.2" x2="480.2" y2="105.4" stroke="#0e8a74" stroke-width="3" opacity="0.68" /><circle cx="480.2" cy="105.4" r="5" fill="#0e8a74"><title>spdlog vs empty: +52.03%</title></circle><line x1="492.2" y1="312.2" x2="492.2" y2="213.4" stroke="#d18b2c" stroke-width="3" opacity="0.68" /><circle cx="492.2" cy="213.4" r="5" fill="#d18b2c"><title>spdlog vs installed: +24.86%</title></circle><text transform="translate(489.2,365) rotate(52)" text-anchor="start" class="axis-label">spdlog</text><line x1="535.8" y1="312.2" x2="535.8" y2="277.6" stroke="#0e8a74" stroke-width="3" opacity="0.68" /><circle cx="535.8" cy="277.6" r="5" fill="#0e8a74"><title>catch2 vs empty: +8.71%</title></circle><line x1="547.8" y1="312.2" x2="547.8" y2="285.3" stroke="#d18b2c" stroke-width="3" opacity="0.68" /><circle cx="547.8" cy="285.3" r="5" fill="#d18b2c"><title>catch2 vs installed: +6.79%</title></circle><text transform="translate(544.8,365) rotate(52)" text-anchor="start" class="axis-label">catch2</text><line x1="591.2" y1="312.2" x2="591.2" y2="207.3" stroke="#0e8a74" stroke-width="3" opacity="0.68" /><circle cx="591.2" cy="207.3" r="5" fill="#0e8a74"><title>nlohmann-json vs empty: +26.41%</title></circle><line x1="603.2" y1="312.2" x2="603.2" y2="266.7" stroke="#d18b2c" stroke-width="3" opacity="0.68" /><circle cx="603.2" cy="266.7" r="5" fill="#d18b2c"><title>nlohmann-json vs installed: +11.46%</title></circle><text transform="translate(600.2,365) rotate(52)" text-anchor="start" class="axis-label">nlohmann-json</text><line x1="646.8" y1="312.2" x2="646.8" y2="208.1" stroke="#0e8a74" stroke-width="3" opacity="0.68" /><circle cx="646.8" cy="208.1" r="5" fill="#0e8a74"><title>range-v3 vs empty: +26.20%</title></circle><line x1="658.8" y1="312.2" x2="658.8" y2="271.0" stroke="#d18b2c" stroke-width="3" opacity="0.68" /><circle cx="658.8" cy="271.0" r="5" fill="#d18b2c"><title>range-v3 vs installed: +10.37%</title></circle><text transform="translate(655.8,365) rotate(52)" text-anchor="start" class="axis-label">range-v3</text><line x1="702.2" y1="312.2" x2="702.2" y2="43.9" stroke="#0e8a74" stroke-width="3" opacity="0.68" /><circle cx="702.2" cy="43.9" r="5" fill="#0e8a74"><title>eigen vs empty: +67.51%</title></circle><line x1="714.2" y1="312.2" x2="714.2" y2="333.4" stroke="#d18b2c" stroke-width="3" opacity="0.68" /><circle cx="714.2" cy="333.4" r="5" fill="#d18b2c"><title>eigen vs installed: -5.33%</title></circle><text transform="translate(711.2,365) rotate(52)" text-anchor="start" class="axis-label">eigen</text><line x1="757.8" y1="312.2" x2="757.8" y2="93.3" stroke="#0e8a74" stroke-width="3" opacity="0.68" /><circle cx="757.8" cy="93.3" r="5" fill="#0e8a74"><title>re2 vs empty: +55.08%</title></circle><line x1="769.8" y1="312.2" x2="769.8" y2="194.2" stroke="#d18b2c" stroke-width="3" opacity="0.68" /><circle cx="769.8" cy="194.2" r="5" fill="#d18b2c"><title>re2 vs installed: +29.69%</title></circle><text transform="translate(766.8,365) rotate(52)" text-anchor="start" class="axis-label">re2</text><line x1="813.2" y1="312.2" x2="813.2" y2="204.7" stroke="#0e8a74" stroke-width="3" opacity="0.68" /><circle cx="813.2" cy="204.7" r="5" fill="#0e8a74"><title>leveldb vs empty: +27.06%</title></circle><line x1="825.2" y1="312.2" x2="825.2" y2="266.6" stroke="#d18b2c" stroke-width="3" opacity="0.68" /><circle cx="825.2" cy="266.6" r="5" fill="#d18b2c"><title>leveldb vs installed: +11.49%</title></circle><text transform="translate(822.2,365) rotate(52)" text-anchor="start" class="axis-label">leveldb</text><line x1="868.8" y1="312.2" x2="868.8" y2="176.3" stroke="#0e8a74" stroke-width="3" opacity="0.68" /><circle cx="868.8" cy="176.3" r="5" fill="#0e8a74"><title>simdjson vs empty: +34.20%</title></circle><line x1="880.8" y1="312.2" x2="880.8" y2="267.8" stroke="#d18b2c" stroke-width="3" opacity="0.68" /><circle cx="880.8" cy="267.8" r="5" fill="#d18b2c"><title>simdjson vs installed: +11.17%</title></circle><text transform="translate(877.8,365) rotate(52)" text-anchor="start" class="axis-label">simdjson</text><line x1="924.2" y1="312.2" x2="924.2" y2="312.1" stroke="#0e8a74" stroke-width="3" opacity="0.68" /><circle cx="924.2" cy="312.1" r="5" fill="#0e8a74"><title>cereal vs empty: +0.03%</title></circle><line x1="936.2" y1="312.2" x2="936.2" y2="233.5" stroke="#d18b2c" stroke-width="3" opacity="0.68" /><circle cx="936.2" cy="233.5" r="5" fill="#d18b2c"><title>cereal vs installed: +19.81%</title></circle><text transform="translate(933.2,365) rotate(52)" text-anchor="start" class="axis-label">cereal</text><circle cx="70" cy="17" r="6" fill="#0e8a74" /><text x="82" y="21" class="legend-label">Seed vs empty</text><circle cx="290" cy="17" r="6" fill="#d18b2c" /><text x="302" y="21" class="legend-label">Seed vs installed</text></svg></div>
@@ -221,29 +330,55 @@ C-only-seed row.</p></section>
 <p>Package A is trained on RocksDB + OpenCV and scores the other 14 corpora. Package B
 is trained on LLVM + Godot and scores RocksDB + OpenCV. This makes every row a valid
 target-disjoint capability measurement. It is still a two-package cross-fit control,
-not the final one-package portable raw-source model.</p>
+not the final one-package portable raw-source model. Because these packages were
+derived from expanded traces on a shared environment, they specifically do not prove
+cross-toolchain portability.</p>
 <div class="table-scroll"><table><thead><tr><th>SHA-256</th><th>Phrases</th><th>Raw</th>
 <th>Compressed</th><th>Scored targets</th></tr></thead><tbody><tr><td><code>4a2950b18807e698…</code></td><td>4,557</td><td>248,586</td><td>82,083</td><td>rocksdb, opencv</td></tr><tr><td><code>8fb47610e74309ea…</code></td><td>4,476</td><td>248,831</td><td>79,134</td><td>llvm, duckdb, abseil, godot, fmt, spdlog, catch2, nlohmann-json, range-v3, eigen, re2, leveldb, simdjson, cereal</td></tr></tbody></table></div>
 <p>The compressed seed is 79–82 KiB of C-local state. It is reported but never charged
 as C→F traffic in seed-only mode. Definitions that become useful are charged in full
 through the same first-profitable-use comparison as target-learned definitions.</p></section>
 
-<section><div class="eyebrow">Acceptance and next experiment</div><h2>What this proves—and what must happen next</h2>
+<section><div class="eyebrow">Acceptance program</div><h2>Turn the capability result into a universal bootstrap</h2>
 <div class="split"><div class="plane"><h3>Proved by the complete matrix</h3><ul>
 <li>16/16 complete seed rows independently replay exactly.</li><li>No TU-0 package bytes are
 charged or transferred.</li><li>Seed wins all 16 endpoints versus empty and 15/16
 versus installed.</li><li>The result is corpus-balanced and covers 28.55 GB of complete
-input.</li><li>Mixed definitions and unseen-Region publication have focused
-tests.</li></ul></div><div class="plane"><h3>Still required</h3><ul>
-<li>Reverse, multiple fixed shuffles, scheduler-like reorder, shared-Region change,
-and delayed/reverted
-change matrices.</li><li>One portable raw-source seed protocol across toolchains.</li>
-<li>Complete Line/value/residual/request/framing ledger.</li><li>Real C++ C/F path at
-≥1 GB/s with cold and actual half-cold scenarios.</li></ul></div></div>
-<p class="callout warning"><strong>Decision requested from BigOracle.</strong> Keep the
-C-only seed as initialization of the existing C candidate store unless the expanded
-or stability matrix finds a broad loss. Do not add an independent F predictor or a new
-message kind to rescue a single corpus.</p></section>
+input.</li><li>All 96 standard/reverse/shuffle/perturb rows are exact and the seed wins
+every paired empty start.</li><li>All reported Line frames decode exactly.</li></ul></div>
+<div class="plane"><h3>Still required</h3><ul><li>One raw-source-trained portable pack,
+with projects, related builds, and toolchains held out.</li><li>Empty, C-only seed, and
+pre-shared-output rows on identical first-200-TU and complete runs.</li><li>Delayed,
+reverted, root-header-change, repeated-build, and concurrent arrival scenarios.</li>
+<li>Complete Line/composition/value/request/framing ledger.</li><li>Real C++ C/F path
+at ≥1 GB/s with cold and actual half-cold scenarios.</li></ul></div></div>
+
+<h3>Required four-row predictor bake-off</h3>
+<div class="table-scroll"><table><thead><tr><th>Row</th><th>Initial shared state</th>
+<th>C behavior</th><th>F behavior</th><th>Question answered</th></tr></thead><tbody>
+<tr><td>C0 · empty</td><td>codec only</td><td>online from zero</td><td>explicit definitions</td><td>How fast does local learning bootstrap itself?</td></tr>
+<tr><td>C1 · C-only generic</td><td>generic candidates at C</td><td>generic → online</td><td>definitions on first use</td><td>Does the generic ranker select useful outputs?</td></tr>
+<tr><td>C2 · shared outputs</td><td>same static output pack at C and F</td><td>generic → online</td><td>static IDs + dynamic definitions</td><td>How many first-use bytes does pre-sharing remove?</td></tr>
+<tr><td>C3 · mirrored online</td><td>same pack and deterministic learner</td><td>ordered online updates</td><td>same ordered updates</td><td>Do avoided dynamic definitions justify coupled commit ordering?</td></tr>
+</tbody></table></div>
+<p>C0–C2 are the minimum product decision. C3 is optional and should be attempted only
+if the dynamic-definition ledger shows enough remaining bytes to matter.</p>
+
+<h3>Training and evaluation folds</h3>
+<ol><li>Build generic candidate programs from raw source across the expanded corpus
+set; do not use the target project or another build of it.</li><li>Hold out at least
+LLVM and DuckDB as prominent end-to-end targets, then rotate every corpus through the
+target role for the balanced score.</li><li>Label compiler and standard-library family;
+include a fold where the entire toolchain family is absent from training.</li><li>Plot
+wire bytes, ratio, literal fraction, static-hit fraction, dynamic-definition bytes,
+and model-state bytes at TU 1–200 and completion.</li><li>Run the same trained artifact
+under standard, reverse, fixed shuffles, global changes, and repeated builds. No
+per-target tuning.</li></ol>
+<p class="callout warning"><strong>Decision requested from BigOracle.</strong> Review
+the pre-shared-output boundary and simplify it if possible. In particular: decide the
+smallest static output representation worth shipping, whether the ranker stays C-only,
+and whether C3 should remain deferred. Keep the literal path and actual-byte selector
+in every row.</p></section>
 
 <section><div class="eyebrow">Reproduction record</div><h2>Durable inputs and checks</h2>
 <p>Machine summaries are committed beside the executable semantics:</p><ul>
@@ -251,8 +386,12 @@ message kind to rescue a single corpus.</p></section>
 <li><a href="https://github.com/mickg10/icecream/blob/local-oracle/issue16-c-only-seed/linecache/ml-artifacts/online-bootstrap-c-only-seed-full-16corpus.tsv">complete per-corpus TSV</a> — <code>3773efe0ce7f1403bfe0f92b7b9a5d641489305a4b12f7315666884deabecd0c</code></li>
 <li><a href="https://github.com/mickg10/icecream/blob/local-oracle/issue16-c-only-seed/linecache/ml-artifacts/online-bootstrap-c-only-seed-screen-16corpus-summary.json">startup-screen summary JSON</a> — <code>e04a670293d62557eea466c77302de36b2b9e1bf8efaec362f77ca4b010a3f3f</code></li>
 <li><a href="https://github.com/mickg10/icecream/blob/local-oracle/issue16-c-only-seed/linecache/ml-artifacts/online-bootstrap-c-only-seed-screen-16corpus.tsv">startup-screen TSV</a> — <code>e6ff2727b6727400a0f433eb28e57351459945274fcd5f5b209ea394f745f5c0</code></li>
+<li><a href="https://github.com/mickg10/icecream/blob/local-oracle/issue16-c-only-seed/linecache/ml-artifacts/online-bootstrap-c-only-seed-stability-16corpus-summary.json">96-run stability summary</a> — <code>70606ddca01e81adc8d7b3d3827dd82a6f6a9e97c40d36c9543bfbe35d2cc811</code></li>
+<li><a href="https://github.com/mickg10/icecream/blob/local-oracle/issue16-c-only-seed/linecache/ml-artifacts/line-stream-split-front-16corpus.json">exact Line ceiling rows</a> — <code>d0295a14b0845758c7cafca92fe81c6b6137cf741e250b4af3e630a71cfe09d2</code></li>
+<li><a href="https://github.com/mickg10/icecream/blob/local-oracle/issue16-c-only-seed/linecache/ml-artifacts/implementer-study15-source-conditioning.tsv">related source-conditioning table</a> — <code>160102a8dc09359aaa6a60fe706c65577490b6665f10f51f034d14d245ac7c70</code>; copied from implementer commit <code>85c0bd4</code></li>
 <li><a href="https://github.com/mickg10/icecream/blob/local-oracle/issue16-c-only-seed/linecache/online_bootstrap_curves.py">exact online codec semantics</a></li>
 <li><a href="https://github.com/mickg10/icecream/blob/local-oracle/issue16-c-only-seed/linecache/compare_seed_bootstrap.py">three-way curve validator</a></li>
+<li><a href="https://github.com/mickg10/icecream/blob/local-oracle/issue16-c-only-seed/linecache/line_stream_ceiling.py">exact Line stream/ceiling harness</a></li>
 </ul>
 <pre>python3 linecache/online_bootstrap_curves.py \
   --package-in PACKAGE.zst --test linecache/traces/ml-CORPUS.bin \
@@ -262,8 +401,11 @@ message kind to rescue a single corpus.</p></section>
   --curve-tsv /tmp/online-bootstrap-seed-full-CORPUS.tsv \
   --report /tmp/online-bootstrap-seed-full-CORPUS.json</pre>
 <p>Validation at publication: Python compile; focused unit suite; lint; exact replay
-for every complete retained row; identical per-TU raw boundaries across all three starts;
-canonical package import; deterministic summary regeneration; and staged diff check.</p></section>
+for every complete retained row; 96/96 stability rows exact; every retained Line mode
+exact across 16 corpora; identical per-TU raw boundaries across compared starts;
+canonical package import; deterministic summary regeneration; and staged diff check.
+The Python Line timing is intentionally reported only as harness timing; the ≥1 GB/s
+gate belongs to the integrated C++ path.</p></section>
 
 <footer class="footer"><strong>From:</strong> mickg10/local-oracle ·
 <strong>To:</strong> owner, mickg10/bigoracle, mickg10/implementer · Canonical tracker:
