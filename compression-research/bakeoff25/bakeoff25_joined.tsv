@@ -1,26 +1,26 @@
-corpus	name	compiler	package	tus	cold_finalratio	pretrained_seed_online	lift	s0_amortized_40
-corpus12	Eigen	clang	rocks-opencv	200	2131.3	1326.48	0.6224	41102.0
-corpus16	cereal	clang	rocks-opencv	84	397.6	1203.58	3.0271	13499.0
-corpus6	Godot	clang	rocks-opencv	200	76.6	875.28	11.4266	2801.0
-corpus11	range-v3	clang	rocks-opencv	200	529.0	795.00	1.5028	13525.0
-corpus18	Firefox	clang	rocks-opencv	200	2039.7	766.32	0.3757	64606.0
-corpus15	simdjson	clang	rocks-opencv	153	267.3	690.18	2.5820	8382.0
-corpus24	Bitcoin	clang	rocks-opencv	200	459.5	631.57	1.3745	13744.0
-corpus23	Arrow	clang	rocks-opencv	200	257.5	630.51	2.4486	8157.0
-corpus17	GCC	gcc	rocks-opencv	200	125.8	582.99	4.6343	4436.0
-corpus20	ClickHouse	clang	rocks-opencv	200	1197.3	579.21	0.4838	30411.0
-corpus9	Catch2	clang	rocks-opencv	200	750.4	550.67	0.7338	15548.0
-corpus	LLVM	clang	rocks-opencv	200	322.5	504.26	1.5636	9910.0
-corpus3	DuckDB	clang	rocks-opencv	200	165.5	472.94	2.8577	5778.0
-corpus10	nlohmann-json	clang	rocks-opencv	99	208.8	453.12	2.1701	6469.0
-corpus13	re2	clang	rocks-opencv	72	148.3	436.32	2.9421	4937.0
-corpus22	Folly	clang	rocks-opencv	200	417.8	352.56	0.8438	13248.0
-corpus8	spdlog	clang	rocks-opencv	34	116.8	323.06	2.7659	4225.0
-corpus5	OpenCV	clang	llvm-godot	200	475.5	287.75	0.6052	13137.0
-corpus21	PyTorch	clang	rocks-opencv	200	835.1	264.97	0.3173	23915.0
-corpus19	Qt6	clang	rocks-opencv	200	537.5	263.35	0.4899	16774.0
-corpus25	V8	clang	rocks-opencv	200	996.0	243.17	0.2441	30871.0
-corpus14	LevelDB	clang	rocks-opencv	72	148.1	222.04	1.4992	4995.0
-corpus4	abseil-protobuf	clang	rocks-opencv	200	384.9	144.39	0.3751	12110.0
-corpus7	fmt	clang	rocks-opencv	50	102.1	130.85	1.2816	3706.0
-corpus2	RocksDB	clang	llvm-godot	200	283.6	110.12	0.3883	9772.0
+corpus	name	toolchain	prior_match	package	tus	cold_finalratio	pretrained_seed_online	lift	s0_amortized_40
+corpus12	Eigen	gcc-11/libstdc++	match	rocks-opencv	200	2131.3	1326.48	0.6224	41102.0
+corpus16	cereal	gcc-11/libstdc++	match	rocks-opencv	84	397.6	1203.58	3.0271	13499.0
+corpus6	Godot	gcc-11/libstdc++	match	rocks-opencv	200	76.6	875.28	11.4266	2801.0
+corpus11	range-v3	gcc-11/libstdc++	match	rocks-opencv	200	529.0	795.00	1.5028	13525.0
+corpus18	Firefox	clang-21/libstdc++15	MISMATCH	rocks-opencv	200	2039.7	766.32	0.3757	64606.0
+corpus15	simdjson	gcc-11/libstdc++	match	rocks-opencv	153	267.3	690.18	2.5820	8382.0
+corpus24	Bitcoin	gcc-11/libstdc++	match	rocks-opencv	200	459.5	631.57	1.3745	13744.0
+corpus23	Arrow	gcc-11/libstdc++	match	rocks-opencv	200	257.5	630.51	2.4486	8157.0
+corpus17	GCC	gcc-11/libstdc++	match	rocks-opencv	200	125.8	582.99	4.6343	4436.0
+corpus20	ClickHouse	clang-21/libc++	MISMATCH	rocks-opencv	200	1197.3	579.21	0.4838	30411.0
+corpus9	Catch2	gcc-11/libstdc++	match	rocks-opencv	200	750.4	550.67	0.7338	15548.0
+corpus	LLVM	gcc-11/libstdc++	match	rocks-opencv	200	322.5	504.26	1.5636	9910.0
+corpus3	DuckDB	gcc-11/libstdc++	match	rocks-opencv	200	165.5	472.94	2.8577	5778.0
+corpus10	nlohmann-json	gcc-11/libstdc++	match	rocks-opencv	99	208.8	453.12	2.1701	6469.0
+corpus13	re2	gcc-11/libstdc++	match	rocks-opencv	72	148.3	436.32	2.9421	4937.0
+corpus22	Folly	gcc-11/libstdc++	match	rocks-opencv	200	417.8	352.56	0.8438	13248.0
+corpus8	spdlog	gcc-11/libstdc++	match	rocks-opencv	34	116.8	323.06	2.7659	4225.0
+corpus5	OpenCV	gcc-11/libstdc++	match	llvm-godot	200	475.5	287.75	0.6052	13137.0
+corpus21	PyTorch	gcc-11/libstdc++	match	rocks-opencv	200	835.1	264.97	0.3173	23915.0
+corpus19	Qt6	gcc-11/libstdc++	match	rocks-opencv	200	537.5	263.35	0.4899	16774.0
+corpus25	V8	clang-23/libstdc++	MISMATCH	rocks-opencv	200	996.0	243.17	0.2441	30871.0
+corpus14	LevelDB	gcc-11/libstdc++	match	rocks-opencv	72	148.1	222.04	1.4992	4995.0
+corpus4	abseil-protobuf	gcc-11/libstdc++	match	rocks-opencv	200	384.9	144.39	0.3751	12110.0
+corpus7	fmt	gcc-11/libstdc++	match	rocks-opencv	50	102.1	130.85	1.2816	3706.0
+corpus2	RocksDB	gcc-11/libstdc++	match	llvm-godot	200	283.6	110.12	0.3883	9772.0
