@@ -64,25 +64,41 @@ static double elapsed(Clock::time_point begin) {
 int main(int argc, char **argv) {
   const char *input_path = nullptr;
   const char *lengths_path = nullptr;
+  const char *dump_factor_path = nullptr;
   bool transpose_translations = false;
   bool patch_translations = false;
+  bool patch_previous_translations = false;
+  bool best_translation_patches = false;
   for (int index = 1; index < argc; ++index) {
     if (!std::strcmp(argv[index], "--input") && index + 1 < argc)
       input_path = argv[++index];
     else if (!std::strcmp(argv[index], "--lengths") && index + 1 < argc)
       lengths_path = argv[++index];
+    else if (!std::strcmp(argv[index], "--dump-factor") && index + 1 < argc)
+      dump_factor_path = argv[++index];
     else if (!std::strcmp(argv[index], "--transpose-translations"))
       transpose_translations = true;
     else if (!std::strcmp(argv[index], "--patch-translations"))
       patch_translations = true;
+    else if (!std::strcmp(argv[index], "--patch-previous-translations"))
+      patch_previous_translations = true;
+    else if (!std::strcmp(argv[index], "--best-translation-patches"))
+      best_translation_patches = true;
     else
       fail("usage: mo_factor_bench --input FILE --lengths FILE "
-           "[--transpose-translations|--patch-translations]");
+           "[--transpose-translations|--patch-translations|"
+           "--patch-previous-translations|--best-translation-patches] "
+           "[--dump-factor FILE]");
   }
   if (!input_path || !lengths_path)
     fail("usage: mo_factor_bench --input FILE --lengths FILE "
-         "[--transpose-translations|--patch-translations]");
-  if (transpose_translations && patch_translations)
+         "[--transpose-translations|--patch-translations|"
+         "--patch-previous-translations|--best-translation-patches] "
+         "[--dump-factor FILE]");
+  if (unsigned(transpose_translations) + unsigned(patch_translations) +
+          unsigned(patch_previous_translations) +
+          unsigned(best_translation_patches) >
+      1)
     fail("translation layouts are mutually exclusive");
 
   std::ifstream input_file(input_path, std::ios::binary),
@@ -112,7 +128,8 @@ int main(int argc, char **argv) {
   mo_factor::Encoded encoded;
   const auto transform_begin = Clock::now();
   if (!encoder.encode(members, encoded, transpose_translations,
-                      patch_translations))
+                      patch_translations, patch_previous_translations,
+                      best_translation_patches))
     fail("MO factor encode");
   const double transform_seconds = elapsed(transform_begin);
   std::printf(
@@ -127,7 +144,11 @@ int main(int argc, char **argv) {
       encoded.ordinary.size(), transform_seconds,
       transpose_translations ? "transpose"
                              : (patch_translations ? "original-patch"
-                                                   : "plain"));
+                                  : (patch_previous_translations
+                                         ? "previous-translation-patch"
+                                     : (best_translation_patches
+                                            ? "best-translation-patch"
+                                            : "plain"))));
   std::vector<uint8_t> material = encoded.definitions;
   material.insert(material.end(), encoded.translations.begin(),
                   encoded.translations.end());
@@ -136,6 +157,13 @@ int main(int argc, char **argv) {
   std::vector<uint8_t> factor_all = semantic;
   factor_all.insert(factor_all.end(), encoded.ordinary.begin(),
                     encoded.ordinary.end());
+  if (dump_factor_path) {
+    std::ofstream dump(dump_factor_path, std::ios::binary);
+    if (!dump ||
+        !dump.write(reinterpret_cast<const char *>(factor_all.data()),
+                    std::streamsize(factor_all.size())))
+      fail("cannot write factor dump");
+  }
   std::printf(
       "level\tbaseline\tfactor4\tfactor3\tfactor2\tfactor1\tbest\tsaving\t"
       "encode_s\tdecode_s\texact\n");
@@ -178,13 +206,17 @@ int main(int argc, char **argv) {
     trailing_control.push_back(0);
     if (decoder.decode(trailing_control, definitions_raw, translations_raw,
                        ordinary_raw, recovered, recovered_lengths,
-                       transpose_translations, patch_translations) ||
+                       transpose_translations, patch_translations,
+                       patch_previous_translations,
+                       best_translation_patches) ||
         decoder.size() || decoder.string_bytes())
       fail("failed frame changed decoder state");
     const bool decoded =
         decoder.decode(control_raw, definitions_raw, translations_raw,
                        ordinary_raw, recovered, recovered_lengths,
-                       transpose_translations, patch_translations);
+                       transpose_translations, patch_translations,
+                       patch_previous_translations,
+                       best_translation_patches);
     const double decode_seconds = elapsed(decode_begin);
     const bool exact =
         decoded && recovered == input && recovered_lengths == expected_lengths;

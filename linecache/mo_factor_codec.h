@@ -163,8 +163,13 @@ public:
 
   bool encode(const std::vector<Slice> &members, Encoded &output,
               bool transpose_translations = false,
-              bool patch_translations = false) const {
-    if ((transpose_translations && patch_translations) ||
+              bool patch_translations = false,
+              bool patch_previous_translations = false,
+              bool best_translation_patches = false) const {
+    if (unsigned(transpose_translations) + unsigned(patch_translations) +
+                unsigned(patch_previous_translations) +
+                unsigned(best_translation_patches) >
+            1 ||
         members.size() > UINT32_MAX)
       return false;
     output = Encoded{};
@@ -178,6 +183,9 @@ public:
       Slice value;
     };
     std::vector<PendingTranslation> pending_translations;
+    std::unordered_map<uint32_t, std::string> previous_translations;
+    std::unordered_map<uint32_t, std::vector<std::string>>
+        translation_histories;
     Parsed parsed;
     for (size_t member_index = 0; member_index < members.size();
          ++member_index) {
@@ -192,7 +200,8 @@ public:
       output.control.push_back(1);
       put_varint(output.control, parsed.originals.size());
       std::vector<uint32_t> original_ids;
-      if (transpose_translations)
+      if (transpose_translations || patch_previous_translations ||
+          best_translation_patches)
         original_ids.reserve(parsed.originals.size());
       for (const auto &original : parsed.originals) {
         std::string key(reinterpret_cast<const char *>(original.data),
@@ -215,7 +224,8 @@ public:
           }
         }
         put_varint(output.control, id);
-        if (transpose_translations)
+        if (transpose_translations || patch_previous_translations ||
+            best_translation_patches)
           original_ids.push_back(id);
       }
       for (size_t entry_index = 0; entry_index < parsed.translations.size();
@@ -225,16 +235,82 @@ public:
           pending_translations.push_back(
               {original_ids[entry_index], uint32_t(member_index),
                uint32_t(entry_index), translation});
-        } else if (patch_translations) {
-          const auto &original = parsed.originals[entry_index];
+        } else if (best_translation_patches) {
+          struct Choice {
+            size_t cost;
+            uint8_t mode;
+            size_t age;
+            uint32_t prefix;
+            uint32_t suffix;
+            uint32_t middle;
+          } best{varint_size(uint64_t(translation.size) << 2) +
+                         translation.size,
+                     0, 0, 0, 0, translation.size};
+          auto consider = [&](const Slice &base, uint8_t mode, size_t age) {
+            uint32_t prefix = 0;
+            const uint32_t shared = std::min(base.size, translation.size);
+            while (prefix < shared &&
+                   base.data[prefix] == translation.data[prefix])
+              ++prefix;
+            uint32_t suffix = 0;
+            while (suffix < shared - prefix &&
+                   base.data[base.size - 1 - suffix] ==
+                       translation.data[translation.size - 1 - suffix])
+              ++suffix;
+            const uint32_t middle = translation.size - prefix - suffix;
+            const size_t cost = varint_size((uint64_t(middle) << 2) | mode) +
+                                (mode == 2 ? varint_size(age) : 0) +
+                                varint_size(prefix) + varint_size(suffix) +
+                                middle;
+            if (cost < best.cost)
+              best = {cost, mode, age, prefix, suffix, middle};
+          };
+          consider(parsed.originals[entry_index], 1, 0);
+          auto &history =
+              translation_histories[original_ids[entry_index]];
+          for (size_t age = 0; age < history.size(); ++age) {
+            const auto &value = history[history.size() - 1 - age];
+            consider({reinterpret_cast<const uint8_t *>(value.data()),
+                      uint32_t(value.size())},
+                     2, age);
+          }
+          put_varint(output.translations,
+                     (uint64_t(best.middle) << 2) | best.mode);
+          if (best.mode == 2)
+            put_varint(output.translations, best.age);
+          if (best.mode) {
+            put_varint(output.translations, best.prefix);
+            put_varint(output.translations, best.suffix);
+          }
+          output.translations.insert(
+              output.translations.end(), translation.data + best.prefix,
+              translation.data + best.prefix + best.middle);
+          history.emplace_back(
+              reinterpret_cast<const char *>(translation.data),
+              translation.size);
+        } else if (patch_translations || patch_previous_translations) {
+          Slice previous_base{};
+          const Slice *base = &parsed.originals[entry_index];
+          if (patch_previous_translations) {
+            const auto known =
+                previous_translations.find(original_ids[entry_index]);
+            if (known != previous_translations.end()) {
+              previous_base = {
+                  reinterpret_cast<const uint8_t *>(known->second.data()),
+                  uint32_t(known->second.size())};
+              base = &previous_base;
+            } else {
+              base = nullptr;
+            }
+          }
           uint32_t prefix = 0;
-          const uint32_t shared = std::min(original.size, translation.size);
-          while (prefix < shared &&
-                 original.data[prefix] == translation.data[prefix])
+          const uint32_t shared =
+              base ? std::min(base->size, translation.size) : 0;
+          while (prefix < shared && base->data[prefix] == translation.data[prefix])
             ++prefix;
           uint32_t suffix = 0;
-          while (suffix < shared - prefix &&
-                 original.data[original.size - 1 - suffix] ==
+          while (base && suffix < shared - prefix &&
+                 base->data[base->size - 1 - suffix] ==
                      translation.data[translation.size - 1 - suffix])
             ++suffix;
           const uint32_t middle = translation.size - prefix - suffix;
@@ -256,6 +332,10 @@ public:
                                        translation.data,
                                        translation.data + translation.size);
           }
+          if (patch_previous_translations)
+            previous_translations[original_ids[entry_index]] = std::string(
+                reinterpret_cast<const char *>(translation.data),
+                translation.size);
         } else {
           put_varint(output.translations, translation.size);
           output.translations.insert(output.translations.end(), translation.data,
@@ -321,8 +401,13 @@ public:
               const std::vector<uint8_t> &ordinary,
               std::vector<uint8_t> &output, std::vector<uint32_t> &lengths,
               bool transpose_translations = false,
-              bool patch_translations = false) {
-    if (transpose_translations && patch_translations)
+              bool patch_translations = false,
+              bool patch_previous_translations = false,
+              bool best_translation_patches = false) {
+    if (unsigned(transpose_translations) + unsigned(patch_translations) +
+            unsigned(patch_previous_translations) +
+            unsigned(best_translation_patches) >
+        1)
       return false;
     static const uint8_t empty = 0;
     const uint8_t *definition =
@@ -366,6 +451,10 @@ public:
     lengths.clear();
     lengths.reserve(size_t(member_count));
     std::vector<Slice> originals, translated_values;
+    std::vector<uint32_t> original_ids;
+    std::unordered_map<uint32_t, std::string> previous_translations;
+    std::unordered_map<uint32_t, std::vector<std::string>>
+        translation_histories;
     std::vector<uint8_t> member;
     for (uint64_t member_index = 0; member_index < member_count;
          ++member_index) {
@@ -389,8 +478,11 @@ public:
         return false;
       originals.clear();
       translated_values.clear();
+      original_ids.clear();
       originals.reserve(size_t(count));
       translated_values.reserve(size_t(count));
+      if (patch_previous_translations || best_translation_patches)
+        original_ids.reserve(size_t(count));
       for (uint64_t index = 0; index < count; ++index) {
         uint64_t id = 0;
         if (!get_varint(command, command_end, id) ||
@@ -401,15 +493,67 @@ public:
                                 : pending_values[size_t(id - values_.size())];
         originals.push_back({reinterpret_cast<const uint8_t *>(value.data()),
                              uint32_t(value.size())});
+        if (patch_previous_translations || best_translation_patches)
+          original_ids.push_back(uint32_t(id));
       }
       std::vector<std::vector<uint8_t>> patched_values;
-      if (patch_translations)
+      if (patch_translations || patch_previous_translations ||
+          best_translation_patches)
         patched_values.resize(size_t(count));
       for (uint64_t index = 0; index < count; ++index) {
         uint64_t descriptor = 0;
         if (!get_varint(translated, translated_end, descriptor))
           return false;
-        if (!patch_translations) {
+        if (best_translation_patches) {
+          const uint8_t mode = uint8_t(descriptor & 3);
+          const uint64_t middle = descriptor >> 2;
+          if (mode == 3 || middle > uint64_t(translated_end - translated) ||
+              middle > UINT32_MAX)
+            return false;
+          auto &history =
+              translation_histories[original_ids[size_t(index)]];
+          if (!mode) {
+            translated_values.push_back({translated, uint32_t(middle)});
+            history.emplace_back(reinterpret_cast<const char *>(translated),
+                                 size_t(middle));
+            translated += middle;
+            continue;
+          }
+          Slice base = originals[size_t(index)];
+          if (mode == 2) {
+            uint64_t age = 0;
+            if (!get_varint(translated, translated_end, age) ||
+                age >= history.size())
+              return false;
+            const auto &value = history[history.size() - 1 - size_t(age)];
+            base = {reinterpret_cast<const uint8_t *>(value.data()),
+                    uint32_t(value.size())};
+          }
+          uint64_t prefix = 0, suffix = 0;
+          if (!get_varint(translated, translated_end, prefix) ||
+              !get_varint(translated, translated_end, suffix) ||
+              prefix > base.size || suffix > base.size - prefix ||
+              middle > uint64_t(translated_end - translated) ||
+              prefix > UINT32_MAX - middle ||
+              suffix > UINT32_MAX - prefix - middle)
+            return false;
+          auto &value = patched_values[size_t(index)];
+          value.reserve(size_t(prefix + middle + suffix));
+          value.insert(value.end(), base.data, base.data + prefix);
+          value.insert(value.end(), translated, translated + middle);
+          value.insert(value.end(), base.data + base.size - suffix,
+                       base.data + base.size);
+          translated += middle;
+          translated_values.push_back(
+              {value.empty() ? &empty : value.data(), uint32_t(value.size())});
+          history.emplace_back(value.empty()
+                                   ? std::string()
+                                   : std::string(reinterpret_cast<const char *>(
+                                                     value.data()),
+                                                 value.size()));
+          continue;
+        }
+        if (!patch_translations && !patch_previous_translations) {
           if (descriptor > uint64_t(translated_end - translated) ||
               descriptor > UINT32_MAX)
             return false;
@@ -423,11 +567,23 @@ public:
           return false;
         if (!(descriptor & 1)) {
           translated_values.push_back({translated, uint32_t(middle)});
+          if (patch_previous_translations)
+            previous_translations[original_ids[size_t(index)]] = std::string(
+                reinterpret_cast<const char *>(translated), size_t(middle));
           translated += middle;
           continue;
         }
         uint64_t prefix = 0, suffix = 0;
-        const uint64_t original_size = originals[size_t(index)].size;
+        Slice base = originals[size_t(index)];
+        if (patch_previous_translations) {
+          const auto known =
+              previous_translations.find(original_ids[size_t(index)]);
+          if (known == previous_translations.end())
+            return false;
+          base = {reinterpret_cast<const uint8_t *>(known->second.data()),
+                  uint32_t(known->second.size())};
+        }
+        const uint64_t original_size = base.size;
         if (!get_varint(translated, translated_end, prefix) ||
             !get_varint(translated, translated_end, suffix) ||
             prefix > original_size || suffix > original_size - prefix ||
@@ -436,15 +592,19 @@ public:
             suffix > UINT32_MAX - prefix - middle)
           return false;
         auto &value = patched_values[size_t(index)];
-        const auto &original = originals[size_t(index)];
         value.reserve(size_t(prefix + middle + suffix));
-        value.insert(value.end(), original.data, original.data + prefix);
+        value.insert(value.end(), base.data, base.data + prefix);
         value.insert(value.end(), translated, translated + middle);
-        value.insert(value.end(), original.data + original.size - suffix,
-                     original.data + original.size);
+        value.insert(value.end(), base.data + base.size - suffix,
+                     base.data + base.size);
         translated += middle;
         translated_values.push_back(
             {value.empty() ? &empty : value.data(), uint32_t(value.size())});
+        if (patch_previous_translations)
+          previous_translations[original_ids[size_t(index)]] = value.empty()
+              ? std::string()
+              : std::string(reinterpret_cast<const char *>(value.data()),
+                            value.size());
       }
       if (!build(originals, translated_values, member) ||
           member.size() > UINT32_MAX)
