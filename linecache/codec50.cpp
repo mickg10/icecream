@@ -466,7 +466,7 @@ struct RelLZ {
 };
 
 int main(int argc,char**argv){
-    const char* manifest=nullptr; size_t max_files=SIZE_MAX; int zlevel=3,halfColdBit=-1; uint32_t sourceAdmitRatio=6; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, usePriorRoot=false, useSortedLines=false, useByteArrayLines=false, useMixedRegions=false, useProjectSource=false,useKeyMap=false;
+    const char* manifest=nullptr; size_t max_files=SIZE_MAX; int zlevel=3,halfColdBit=-1; uint32_t sourceAdmitRatio=6; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, usePriorRoot=false, useSortedLines=false, useByteArrayLines=false, useMixedRegions=false, useProjectSource=false,useKeyMap=false,useDirectOrdinals=false;
     for(int i=1;i<argc;++i){ if(!strcmp(argv[i],"--manifest")&&i+1<argc)manifest=argv[++i];
         else if(!strcmp(argv[i],"--z")&&i+1<argc)zlevel=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--no-d1"))useD1=false;
@@ -480,12 +480,13 @@ int main(int argc,char**argv){
         else if(!strcmp(argv[i],"--source-package"))useProjectSource=true;
         else if(!strcmp(argv[i],"--source-admit-ratio")&&i+1<argc){char*end=nullptr;unsigned long value=strtoul(argv[++i],&end,10);if(!end||*end||!value||value>1000){fprintf(stderr,"bad source admission ratio\n");return 2;}sourceAdmitRatio=uint32_t(value);}
         else if(!strcmp(argv[i],"--key-map"))useKeyMap=true;
+        else if(!strcmp(argv[i],"--direct-ordinals")){useKeyMap=true;useDirectOrdinals=true;}
         else if(!strcmp(argv[i],"--half-cold-bit")&&i+1<argc){char*end=nullptr;long value=strtol(argv[++i],&end,10);if(!end||*end||(value!=0&&value!=1)){fprintf(stderr,"bad half-cold bit\n");return 2;}halfColdBit=int(value);useKeyMap=true;}
         else if(!strcmp(argv[i],"--deep"))deep=true;         // run slow z19/z22 entropy ladder + reorder test
         else if(!strcmp(argv[i],"--warm"))warm=true;         // Basis C: 2nd pass with dict retained -> warm steady-state wire
         else if(!strcmp(argv[i],"--max-files")&&i+1<argc){ char*t=nullptr; unsigned long long v=strtoull(argv[++i],&t,10); if(!t||*t||!v){fprintf(stderr,"bad max-files\n");return 2;} max_files=size_t(v); }
         else { fprintf(stderr,"unknown %s\n",argv[i]); return 2; } }
-    if(!manifest){ fprintf(stderr,"usage: %s --manifest F [--z 0|1|3] [--no-d1] [--d2] [--prior-root] [--sorted-lines|--byte-array-lines|--mixed-regions [--key-map|--half-cold-bit 0|1] [--source-package [--source-admit-ratio N]]] [--max-files N]\n",argv[0]); return 2; }
+    if(!manifest){ fprintf(stderr,"usage: %s --manifest F [--z 0|1|3] [--no-d1] [--d2] [--prior-root] [--sorted-lines|--byte-array-lines|--mixed-regions [--key-map|--direct-ordinals|--half-cold-bit 0|1] [--source-package [--source-admit-ratio N]]] [--max-files N]\n",argv[0]); return 2; }
     if(useProjectSource&&!useMixedRegions){fprintf(stderr,"--source-package requires --mixed-regions\n");return 2;}
     if(useKeyMap&&!useMixedRegions){fprintf(stderr,"--key-map and --half-cold-bit require --mixed-regions\n");return 2;}
     if(usePriorRoot) useS1=false;
@@ -615,7 +616,8 @@ int main(int argc,char**argv){
         if(halfColdBit>=0&&int(key&1)==halfColdBit){
           MixedFRegionView view{FmixedRegionData.size(),dict.region_raw_len(r),true};
           FmixedRegionData.insert(FmixedRegionData.end(),dict.region_data(r),dict.region_data(r)+dict.region_raw_len(r));
-          FpreloadedRegions.emplace(key,view);preloadedRegionBytes+=view.length;++preloadedRegionCount;
+          if(useDirectOrdinals)FmixedRegions[r]=view;else FpreloadedRegions.emplace(key,view);
+          preloadedRegionBytes+=view.length;++preloadedRegionCount;
         }
       }
     }
@@ -640,13 +642,13 @@ int main(int argc,char**argv){
           if(++requestStamp==0){std::fill(requiredRegionStamp.begin(),requiredRegionStamp.end(),0);std::fill(requiredBlockStamp.begin(),requiredBlockStamp.end(),0);requestStamp=1;}
           auto requireRegion=[&](uint32_t r){
             if(requiredRegionStamp[r]!=requestStamp){requiredRegionStamp[r]=requestStamp;requiredRegions.push_back(r);}
-            if(!associatedReg[r]){associatedReg[r]=1;associationRegs.push_back(r);}
+            if(!useDirectOrdinals&&!associatedReg[r]){associatedReg[r]=1;associationRegs.push_back(r);}
           };
           auto requireBlock=[&](uint32_t k){if(requiredBlockStamp[k]!=requestStamp){requiredBlockStamp[k]=requestStamp;requiredBlocks.push_back(k);}};
           if(usePriorRoot){for(size_t i=roff[t];i<roff[t+1];++i)requireRegion(allreg[i]);}
           else for(size_t i=0;i<tn;++i){uint32_t tok=tk[i];if(tok<NREG)requireRegion(tok);else{
             uint32_t k=tok-NREG;requireBlock(k);
-            if(!fknownBlk[k])for(size_t j=boff2[k];j<boff2[k+1];++j)requireRegion(bchild[j]);
+            if(useDirectOrdinals||!fknownBlk[k])for(size_t j=boff2[k];j<boff2[k+1];++j)requireRegion(bchild[j]);
           }}
 
           // C -> F ROOT.  F derives direct Region/Block requirements from these decoded bytes;
@@ -654,6 +656,45 @@ int main(int argc,char**argv){
           w_root+=zstd_message_roundtrip(z,messageD,rootb,zlevel,messageEncoded,messageDecoded);w_framing+=FRAME;
           allRoots.insert(allRoots.end(),rootb.begin(),rootb.end());Frootb=messageDecoded;
 
+          if(useDirectOrdinals){
+            // Decode Blocks before Region NEED so F derives every child Region from its own
+            // manifest state. Blocks are generation-lived and are never independently evicted.
+            std::vector<uint32_t>FrequiredRegions,FrequiredBlocks;
+            auto FrequireRegion=[&](uint32_t r){if(FrequiredRegionStamp[r]!=requestStamp){FrequiredRegionStamp[r]=requestStamp;FrequiredRegions.push_back(r);}};
+            auto FrequireBlock=[&](uint32_t k){if(FrequiredBlockStamp[k]!=requestStamp){FrequiredBlockStamp[k]=requestStamp;FrequiredBlocks.push_back(k);}};
+            const uint8_t*rp=Frootb.data(),*re=rp+Frootb.size();
+            while(rp<re){uint64_t tok=get_varint(rp);if(tok<NREG)FrequireRegion(uint32_t(tok));else if(tok-NREG<fknownBlk.size())FrequireBlock(uint32_t(tok-NREG));else{fprintf(stderr,"bad direct Root token\n");return 2;}}
+            if(FrequiredBlocks.size()!=requiredBlocks.size()){fprintf(stderr,"direct Root Block closure differs\n");return 2;}
+            for(uint32_t k:FrequiredBlocks)if(requiredBlockStamp[k]!=requestStamp){fprintf(stderr,"direct Root Block identity differs\n");return 2;}
+
+            std::vector<uint32_t>manifestBlocks;for(uint32_t k:FrequiredBlocks)if(!fknownBlk[k])manifestBlocks.push_back(k);
+            if(!manifestBlocks.empty()){
+              std::vector<uint8_t>blockRaw;put_varint(blockRaw,manifestBlocks.size());
+              for(uint32_t k:manifestBlocks){put_varint(blockRaw,k);size_t length=boff2[k+1]-boff2[k];
+                if(bcopy_ok[k]){blockRaw.push_back(1);put_varint(blockRaw,bcopy_src[k]);put_varint(blockRaw,length);}
+                else{blockRaw.push_back(0);put_varint(blockRaw,length);for(size_t j=boff2[k];j<boff2[k+1];++j)put_varint(blockRaw,bchild[j]);}
+              }
+              size_t bytes=zstd_message_roundtrip(z,messageD,blockRaw,zlevel,messageEncoded,messageDecoded)+FRAME;w_blockdef+=bytes;
+              const uint8_t*bp=messageDecoded.data(),*be=bp+messageDecoded.size();uint64_t count=get_varint(bp);
+              if(count!=manifestBlocks.size()){fprintf(stderr,"direct Block manifest count differs\n");return 2;}
+              for(uint64_t i=0;i<count;++i){uint64_t id=get_varint(bp);if(id>=FknownBlk.size()||id+1!=Fblk_off.size()||FknownBlk[id]){fprintf(stderr,"bad direct Block identity\n");return 2;}uint8_t kind=*bp++;
+                if(kind==1){uint64_t source=get_varint(bp),length=get_varint(bp);if(source+length>Freg_stream.size()){fprintf(stderr,"bad direct Block copy\n");return 2;}for(uint64_t j=0;j<length;++j)Fblk_child.push_back(Freg_stream[source+j]);}
+                else if(kind==0){uint64_t length=get_varint(bp);for(uint64_t j=0;j<length;++j){uint64_t child=get_varint(bp);if(child>=NREG){fprintf(stderr,"bad direct Block child\n");return 2;}Fblk_child.push_back(uint32_t(child));}}
+                else{fprintf(stderr,"bad direct Block kind\n");return 2;}Fblk_off.push_back(Fblk_child.size());FknownBlk[id]=1;fknownBlk[id]=1;
+              }
+              if(bp!=be){fprintf(stderr,"direct Block manifest has trailing bytes\n");return 2;}
+            }
+            for(uint32_t k:FrequiredBlocks){if(!FknownBlk[k]){fprintf(stderr,"missing direct Block definition\n");return 2;}for(size_t j=Fblk_off[k];j<Fblk_off[k+1];++j)FrequireRegion(Fblk_child[j]);}
+            if(FrequiredRegions.size()!=requiredRegions.size()){fprintf(stderr,"direct Region closure differs\n");return 2;}
+            for(uint32_t r:FrequiredRegions){if(requiredRegionStamp[r]!=requestStamp){fprintf(stderr,"direct Region identity differs\n");return 2;}if(!FmixedRegions[r].known)missReg.push_back(r);}
+            if(!manifestBlocks.empty()||!missReg.empty()){
+              std::vector<uint8_t>missingRaw;put_varint(missingRaw,missReg.size());for(uint32_t r:missReg)put_varint(missingRaw,r);put_varint(missingRaw,0);
+              size_t bytes=zstd_message_roundtrip(z,messageD,missingRaw,zlevel,messageEncoded,messageDecoded)+FRAME;w_missing+=bytes;mixedMissingRequestWire+=bytes;allMiss.insert(allMiss.end(),missingRaw.begin(),missingRaw.end());
+              const uint8_t*mp=messageDecoded.data(),*me=mp+messageDecoded.size();uint64_t count=get_varint(mp);std::vector<uint32_t>decoded;decoded.reserve(count);
+              for(uint64_t i=0;i<count;++i){uint64_t id=get_varint(mp);if(id>=NREG){fprintf(stderr,"bad direct missing Region\n");return 2;}decoded.push_back(uint32_t(id));}
+              if(get_varint(mp)!=0||mp!=me||decoded!=missReg){fprintf(stderr,"direct missing reply differs\n");return 2;}
+            }
+          } else {
           // C -> F: first-use dense-id/key64 associations.  F owns the key-indexed preload and is
           // the only side that decides whether an object is present.
           std::vector<uint32_t> FnewAssociationRegs;
@@ -697,6 +738,7 @@ int main(int argc,char**argv){
             if(mp>=me){fprintf(stderr,"truncated missing Block count\n");return 2;}uint64_t blockCount=get_varint(mp);decodedBlk.reserve(blockCount);
             for(uint64_t i=0;i<blockCount;++i){if(mp>=me){fprintf(stderr,"truncated missing Block list\n");return 2;}uint64_t id=get_varint(mp);if(id<NREG||id-NREG>=fknownBlk.size()){fprintf(stderr,"bad missing Block id\n");return 2;}decodedBlk.push_back(uint32_t(id-NREG));}
             if(mp!=me||decodedReg!=missReg||decodedBlk!=missBlk){fprintf(stderr,"missing reply differs\n");return 2;}
+          }
           }
           for(uint32_t r:requiredRegions)fknownReg[r]=FmixedRegions[r].known;
         } else {
@@ -1106,7 +1148,7 @@ int main(int argc,char**argv){
     double MiB=1048576.0;
     const char* structure_name=usePriorRoot?"V1+P22(ROOT_SLICE)":(useS1?"V1+S1(LZ blocks)":"V1");
     const char* line_name=useMixedRegions?(useByteArrayLines?"+P24(mixed-regions+BYTE_ARRAY)":"+P24(mixed-regions)"):(useByteArrayLines?"+P21(BYTE_ARRAY)":(useSortedLines?"+P9(sorted-lines)":""));
-    printf("\n==== CODEC-50 (%s%s%s%s%s, z%d) — %s ====\n", structure_name, useD1?"+D1":"", line_name, useProjectSource?"+SOURCE_PACKAGE":"", (useD2mine?"+D2(inline)":(useD2?"+D2(helper)":"")), zlevel, manifest);
+    printf("\n==== CODEC-50 (%s%s%s%s%s%s, z%d) — %s ====\n", structure_name, useD1?"+D1":"", line_name, useDirectOrdinals?"+DIRECT_ORDINALS":"", useProjectSource?"+SOURCE_PACKAGE":"", (useD2mine?"+D2(inline)":(useD2?"+D2(helper)":"")), zlevel, manifest);
     printf("byte-exact=%s  TUs=%zu raw=%.1f MiB regions=%u distinct_lines=%u paths=%zu blocks=%zu (marker_lines=%llu literal_lines=%llu)\n",
         byteexact?"OK":"FAIL",TUs,corpus.raw/MiB,NREG,dict.distinct(),paths.size(),boff2.size()-1,(unsigned long long)n_marker,(unsigned long long)n_literal);
     printf("wire by category (post-z%d, bytes): root=%.0f line_def=%.0f region_def=%.0f block_def=%.0f path_def=%.0f missing=%.0f framing=%.0f  TOTAL=%.0f (%.2f MiB)\n",
@@ -1123,6 +1165,7 @@ int main(int argc,char**argv){
     if(useKeyMap)printf("key map: half_cold_bit=%d preloaded_regions=%llu preloaded_raw_bytes=%llu associated_regions=%llu association_wire=%.0f missing_reply_wire=%.0f\n",
         halfColdBit,(unsigned long long)preloadedRegionCount,(unsigned long long)preloadedRegionBytes,
         (unsigned long long)associatedRegionCount,mixedAssociationWire,mixedMissingRequestWire);
+    if(useDirectOrdinals)printf("direct ordinals: generation_latched=1 region_namespaces=1 block_lifetime=generation\n");
     if(useProjectSource)printf("source admission: ratio=%u considered=%llu admitted=%llu observed_potential_raw=%llu estimated_independent_package_wire=%llu\n",
         sourceAdmitRatio,(unsigned long long)mixedSourceConsidered,(unsigned long long)mixedSourceAdmitted,(unsigned long long)mixedSourcePotentialRaw,(unsigned long long)mixedSourceEstimatedCost);
     if(!useSortedLines&&!useMixedRegions){ ZSTD_CCtx* z2=ZSTD_createCCtx(); std::vector<uint8_t> d2b;
