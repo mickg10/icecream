@@ -211,11 +211,14 @@ def metric_card(label: str, value: str, note: str, tone: str = "") -> str:
 
 def render(args: argparse.Namespace) -> str:
     seed_path = Path(args.seed_summary)
+    full_seed_path = Path(args.full_seed_summary)
     hybrid_path = Path(args.hybrid_summary)
     seed = json.loads(seed_path.read_text())
+    full_seed = json.loads(full_seed_path.read_text())
     hybrid = json.loads(hybrid_path.read_text())
-    endpoint = seed["endpoint"]
-    comparisons = seed["comparisons"]
+    screen_endpoint = seed["endpoint"]
+    endpoint = full_seed["endpoint"]
+    comparisons = full_seed["comparisons"]
     checkpoints = seed["checkpoints"]
     hybrid_by_corpus = {
         row["corpus"]: row["charged_ratio"] for row in hybrid["selected"]
@@ -242,11 +245,11 @@ def render(args: argparse.Namespace) -> str:
             '</tr>'
         )
 
-    max_screen_ratio = max(row["seed_ratio"] for row in comparisons)
+    max_endpoint_ratio = max(row["seed_ratio"] for row in comparisons)
     corpus_rows = []
     for row in comparisons:
         installed_class = " negative" if row["seed_vs_installed_percent"] < 0 else ""
-        bar_width = max(1.0, row["seed_ratio"] / max_screen_ratio * 100.0)
+        bar_width = max(1.0, row["seed_ratio"] / max_endpoint_ratio * 100.0)
         corpus_rows.append(
             '<tr>'
             f'<td><strong>{escape(row["corpus"])}</strong></td>'
@@ -267,7 +270,7 @@ def render(args: argparse.Namespace) -> str:
         )
 
     package_rows = []
-    for package in seed["seed_packages"]:
+    for package in full_seed["seed_packages"]:
         package_rows.append(
             '<tr>'
             f'<td><code>{escape(package["sha256"][:16])}…</code></td>'
@@ -390,25 +393,28 @@ a { color:#087967; }
 <p>A corpus-balanced, exact-replay report on cold-start structural coding, online
 learning, and the smallest useful role for pretraining. The C-only seed removes the
 upfront package transfer while preserving ordinary decoder-visible definitions.</p>
-<div class="hero-meta"><span>16 corpora · {comma(endpoint['raw_bytes'])} bytes in startup screen</span>
+<div class="hero-meta"><span>16 corpora · {comma(endpoint['raw_bytes'])} bytes in complete runs</span>
 <span>Generated 2026-08-15</span><span>Branch: local-oracle/issue16-c-only-seed</span>
-<span class="status">All 16 seed rows exact</span></div></header><main>
+<span class="status">All 16 complete seed rows exact</span></div></header><main>
 
 <section><div class="eyebrow">Executive result</div><h2>Pretraining works best as a C-only bootstrapper</h2>
-<p class="lead">Across each corpus’s first min(200, complete corpus) translation units,
-the C-only seed improves the equal-corpus structural ratio from
+<p class="lead">Across every translation unit of all 16 complete corpora, the C-only
+seed improves the equal-corpus structural ratio from
 <strong>{ratio(endpoint['empty_equal_corpus_ratio'])}</strong> for empty learning and
 <strong>{ratio(endpoint['installed_equal_corpus_ratio'])}</strong> for a fully installed
 package to <strong>{ratio(endpoint['seed_equal_corpus_ratio'])}</strong>. It sends no
 package at TU 0 and publishes only definitions that already repay themselves in the
 TU carrying them.</p>
 <div class="metrics">
-{metric_card('C-only seed', ratio(endpoint['seed_equal_corpus_ratio']), 'Equal-corpus structural ratio at each screen endpoint')}
+{metric_card('C-only seed', ratio(endpoint['seed_equal_corpus_ratio']), 'Equal-corpus structural ratio at complete-corpus endpoints')}
 {metric_card('Gain vs empty', percent(endpoint['seed_vs_empty_equal_percent']), 'Strictly smaller on all 16 corpus endpoints')}
-{metric_card('Gain vs installed', percent(endpoint['seed_vs_installed_equal_percent']), 'Smaller on 15/16; Eigen favors installed at TU 200', 'warn')}
+{metric_card('Gain vs installed', percent(endpoint['seed_vs_installed_equal_percent']), 'Smaller on 15/16; Eigen favors installed at completion', 'warn')}
 {metric_card('Exact replay', '16 / 16', 'Independent reconstruction of every Region sequence', 'neutral')}
 </div>
-<p class="small">C-side logical learner state at the screened endpoints ranges from
+<p class="small">The complete rows cover {comma(endpoint['raw_bytes'])} raw bytes and
+send {comma(endpoint['seed_wire_bytes'])} structural bytes: a byte-weighted
+{ratio(endpoint['seed_byte_weighted_ratio'])}. C-side logical learner state at the
+complete endpoints ranges from
 {comma(endpoint['minimum_final_logical_state_bytes'])} to
 {comma(endpoint['maximum_final_logical_state_bytes'])} bytes (median
 {comma(int(endpoint['median_final_logical_state_bytes']))}). This is deterministic
@@ -436,6 +442,11 @@ cache scenario and every remaining block.</p>
 not the same as passing the complete half-cold acceptance scenario.</p></section>
 
 <section><div class="eyebrow">Startup behavior</div><h2>Learning curves, with cohort changes visible</h2>
+<p>The fixed startup screen covers {comma(screen_endpoint['raw_bytes'])} raw bytes.
+At each corpus’s <code>min(200, completion)</code> endpoint, the equal-corpus ratio is
+{ratio(screen_endpoint['seed_equal_corpus_ratio'])}, a
+{percent(screen_endpoint['seed_vs_empty_equal_percent'])} gain over empty learning and
+{percent(screen_endpoint['seed_vs_installed_equal_percent'])} over the installed package.</p>
 <div class="chart-wrap">{svg_learning_curve(checkpoints)}</div>
 <p class="caption">Ratios are harmonic equal-corpus ratios. TU 50/100/200 contain
 survivor cohorts because shorter corpora have already ended; the eligible count is
@@ -469,8 +480,8 @@ from exact output;</li><li>no seed package and no duplicate learner.</li></ul></
 <h3>Definition encoding</h3><p>A single versioned definition batch chooses per phrase:
 (a) delta-coded dense Region references when every Region has already been observed,
 or (b) the exact phrase key when a seed phrase contains first-seen Regions. The
-receiver rejects unknown references, malformed exact keys, trailing bytes, and
-duplicate definitions. This is a refinement of the existing definition block, not a
+receiver accepts known references, exact canonical keys, complete frames, and unique
+definitions. This is a refinement of the existing definition block, not a
 new message family.</p>
 <ol><li>Encode TU <em>t</em> from state through <em>t−1</em>.</li><li>Compare complete
 current-TU candidates using actual zstd-3 bytes.</li><li>Commit and install only the
@@ -480,16 +491,19 @@ for future TUs.</li></ol></section>
 
 <section><div class="eyebrow">Corpus balance</div><h2>The gain is broad, not one-project driven</h2>
 <div class="chart-wrap">{svg_gain_plot(comparisons)}</div>
-<p class="caption">Endpoint is min(200, complete corpus TUs). Positive means the
-C-only seed has the smaller structural stream. Eigen’s −7.61% versus installed is the
-only installed-package win; the seed still beats Eigen’s empty learner by 17.38%.</p>
+<p class="caption">Every point is a complete-corpus endpoint. Positive means the
+C-only seed has the smaller structural stream. Eigen’s
+{percent(next(row['seed_vs_installed_percent'] for row in comparisons if row['corpus'] == 'eigen'))}
+versus installed is the only installed-package loss; the seed still beats Eigen’s
+empty learner by
+{percent(next(row['seed_vs_empty_percent'] for row in comparisons if row['corpus'] == 'eigen'))}.</p>
 <div class="table-scroll"><table><thead><tr><th>Corpus</th><th>TUs</th><th>Empty</th>
 <th>Installed</th><th>C-only seed</th><th>Seed vs empty</th><th>Seed vs installed</th>
-<th>Seed defs / all defs</th><th>Best full structural*</th></tr></thead>
+<th>Seed defs / all defs</th><th>Best structural hybrid*</th></tr></thead>
 <tbody>{''.join(corpus_rows)}</tbody></table></div>
-<p class="caption">*The final column is the separately measured complete-corpus
-cross-context structural hybrid, included as destination headroom—not as a directly
-comparable startup row.</p></section>
+<p class="caption">*The final column is the separately measured cross-context
+structural hybrid, included as destination headroom—not as a directly comparable
+C-only-seed row.</p></section>
 
 <section><div class="eyebrow">Cross-fit design</div><h2>Every scored target is disjoint from its seed package</h2>
 <p>Package A is trained on RocksDB + OpenCV and scores the other 14 corpora. Package B
@@ -503,26 +517,28 @@ as C→F traffic in seed-only mode. Definitions that become useful are charged i
 through the same first-profitable-use comparison as target-learned definitions.</p></section>
 
 <section><div class="eyebrow">Acceptance and next experiment</div><h2>What this proves—and what must happen next</h2>
-<div class="split"><div class="plane"><h3>Proved by this screen</h3><ul>
-<li>16/16 seed rows independently replay exactly.</li><li>No TU-0 package bytes are
+<div class="split"><div class="plane"><h3>Proved by the complete matrix</h3><ul>
+<li>16/16 complete seed rows independently replay exactly.</li><li>No TU-0 package bytes are
 charged or transferred.</li><li>Seed wins all 16 endpoints versus empty and 15/16
-versus installed.</li><li>The result is corpus-balanced and covers 7.21 GB of startup
-input.</li><li>Malformed mixed definitions and unseen-Region publication have focused
+versus installed.</li><li>The result is corpus-balanced and covers 28.55 GB of complete
+input.</li><li>Mixed definitions and unseen-Region publication have focused
 tests.</li></ul></div><div class="plane"><h3>Still required</h3><ul>
-<li>Complete-corpus C-only seed rows on all current corpora.</li><li>Reverse, multiple
-fixed shuffles, scheduler-like reorder, shared-Region change, and delayed/reverted
+<li>Reverse, multiple fixed shuffles, scheduler-like reorder, shared-Region change,
+and delayed/reverted
 change matrices.</li><li>One portable raw-source seed protocol across toolchains.</li>
 <li>Complete Line/value/residual/request/framing ledger.</li><li>Real C++ C/F path at
 ≥1 GB/s with cold and actual half-cold scenarios.</li></ul></div></div>
 <p class="callout warning"><strong>Decision requested from BigOracle.</strong> Keep the
-C-only seed as initialization of the existing C candidate store unless the full or
-stability matrix finds a broad loss. Do not add an independent F predictor or a new
+C-only seed as initialization of the existing C candidate store unless the expanded
+or stability matrix finds a broad loss. Do not add an independent F predictor or a new
 message kind to rescue a single corpus.</p></section>
 
 <section><div class="eyebrow">Reproduction record</div><h2>Durable inputs and checks</h2>
 <p>Machine summaries are committed beside the executable semantics:</p><ul>
-<li><a href="{github_root}/ml-artifacts/online-bootstrap-c-only-seed-screen-16corpus-summary.json">16-corpus summary JSON</a> — <code>{digest(seed_path)}</code></li>
-<li><a href="{github_root}/ml-artifacts/online-bootstrap-c-only-seed-screen-16corpus.tsv">per-corpus TSV</a> — <code>{digest(Path(args.seed_tsv))}</code></li>
+<li><a href="{github_root}/ml-artifacts/online-bootstrap-c-only-seed-full-16corpus-summary.json">complete 16-corpus summary JSON</a> — <code>{digest(full_seed_path)}</code></li>
+<li><a href="{github_root}/ml-artifacts/online-bootstrap-c-only-seed-full-16corpus.tsv">complete per-corpus TSV</a> — <code>{digest(Path(args.full_seed_tsv))}</code></li>
+<li><a href="{github_root}/ml-artifacts/online-bootstrap-c-only-seed-screen-16corpus-summary.json">startup-screen summary JSON</a> — <code>{digest(seed_path)}</code></li>
+<li><a href="{github_root}/ml-artifacts/online-bootstrap-c-only-seed-screen-16corpus.tsv">startup-screen TSV</a> — <code>{digest(Path(args.seed_tsv))}</code></li>
 <li><a href="{github_root}/online_bootstrap_curves.py">exact online codec semantics</a></li>
 <li><a href="{github_root}/compare_seed_bootstrap.py">three-way curve validator</a></li>
 </ul>
@@ -530,11 +546,11 @@ message kind to rescue a single corpus.</p></section>
   --package-in PACKAGE.zst --test linecache/traces/ml-CORPUS.bin \\
   --online-budget 524288 --thresholds 2 --level 3 --model-level 3 \\
   --publication first-use --budget-basis ids32 --row-set pretrained \\
-  --pretrained-mode seed-only --max-tus 200 \\
-  --curve-tsv /tmp/online-bootstrap-seed-CORPUS-200.tsv \\
-  --report /tmp/online-bootstrap-seed-CORPUS-200.json</pre>
+  --pretrained-mode seed-only \\
+  --curve-tsv /tmp/online-bootstrap-seed-full-CORPUS.tsv \\
+  --report /tmp/online-bootstrap-seed-full-CORPUS.json</pre>
 <p>Validation at publication: Python compile; focused unit suite; lint; exact replay
-for every retained row; identical per-TU raw boundaries across all three starts;
+for every complete retained row; identical per-TU raw boundaries across all three starts;
 canonical package import; deterministic summary regeneration; and staged diff check.</p></section>
 
 <footer class="footer"><strong>From:</strong> mickg10/local-oracle ·
@@ -560,6 +576,20 @@ def parser() -> argparse.ArgumentParser:
         default=(
             "linecache/ml-artifacts/"
             "online-bootstrap-c-only-seed-screen-16corpus.tsv"
+        ),
+    )
+    value.add_argument(
+        "--full-seed-summary",
+        default=(
+            "linecache/ml-artifacts/"
+            "online-bootstrap-c-only-seed-full-16corpus-summary.json"
+        ),
+    )
+    value.add_argument(
+        "--full-seed-tsv",
+        default=(
+            "linecache/ml-artifacts/"
+            "online-bootstrap-c-only-seed-full-16corpus.tsv"
         ),
     )
     value.add_argument(

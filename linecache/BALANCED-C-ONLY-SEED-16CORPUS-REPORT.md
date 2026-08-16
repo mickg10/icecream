@@ -1,4 +1,4 @@
-# C-only bootstrap seed: exact 16-corpus startup screen
+# C-only bootstrap seed: exact 16-corpus complete runs and startup curves
 
 Issue: `mickg10/icecream#16`
 
@@ -10,25 +10,29 @@ The target-disjoint pretrained phrase set is substantially more useful when it e
 only in C's candidate vocabulary than when it is installed wholesale at F before the
 first translation unit.
 
-Across the first `min(200, complete corpus)` TUs of all 16 corpora:
+Across every TU of all 16 complete corpora:
 
 | metric | empty online | installed package + online | C-only seed + online |
 |---|---:|---:|---:|
-| charged structural wire | 27,594,704 B | 25,999,211 B | **24,897,754 B** |
-| byte-weighted ratio | 261.19x | 277.22x | **289.48x** |
-| equal-corpus harmonic ratio | 266.84x | 290.86x | **316.40x** |
-| C-only seed change | - | **+8.78%** | **+18.57% vs empty** |
+| charged structural wire | 63,085,685 B | 59,497,403 B | **58,342,404 B** |
+| byte-weighted ratio | 452.63x | 479.93x | **489.43x** |
+| equal-corpus harmonic ratio | 328.83x | 361.22x | **391.62x** |
+| C-only seed change | - | **+8.42%** | **+19.09% vs empty** |
 | C-only seed strict endpoint wins | - | **15 / 16** | **16 / 16** |
 | independently exact rows | 16 / 16 | 16 / 16 | 16 / 16 |
 
-The screen covers 7,207,461,456 raw `.ii` bytes. C-only seeding removes 2,696,950
-structural bytes relative to empty learning and 1,101,457 bytes relative to an
-installed package. The byte-weighted gains are +10.83% and +4.42%, respectively.
+The complete matrix covers 28,554,671,510 raw `.ii` bytes. C-only seeding removes
+4,743,281 structural bytes relative to empty learning and 1,154,999 bytes relative
+to an installed package. The byte-weighted gains are +8.13% and +1.98%, respectively.
 
 The result is broad. All 16 corpus endpoints are strictly smaller than empty learning.
 Fifteen are smaller than installed pretraining. Eigen is the single installed-package
-win at TU 200: seed-only is 1,326.48x versus installed 1,435.77x, while still beating
-empty's 1,130.07x by 17.38%.
+win at completion: seed-only is 2,373.64x versus installed 2,507.23x, while still
+beating empty's 1,417.00x by 67.51%.
+
+The fixed startup screen remains useful for the learning curve. Across each corpus's
+first `min(200, completion)` TUs, the seed is 316.40x equal-corpus and 289.48x
+byte-weighted, +18.57% over empty learning and +8.78% over the installed package.
 
 This changes the design conclusion from “send an optional startup package” to “seed
 the existing C-side candidate store and let ordinary first-profitable-use publication
@@ -46,7 +50,7 @@ not yet charge:
 - missing-object requests and replies;
 - the final production message layout and framing.
 
-Consequently, 316.40x is not a total cold ratio and cannot be compared directly with
+Consequently, 391.62x is not a total cold ratio and cannot be compared directly with
 the requested complete cold-400 target.
 
 The best full-run cross-context structural hybrid remains 462.92x equal-corpus and
@@ -119,12 +123,43 @@ The version-2 mixed batch therefore chooses independently for each definition:
   at least one Region has not yet been observed.
 
 The batch retains one version, one definition count, and one zstd frame. It does not
-add a new message kind. F validates each reference or exact key, rejects trailing
-bytes and duplicates, appends definitions in message order, and then decodes the
-payload.
+add a new message kind. F requires known references or exact canonical keys, complete
+frames, and unique definitions; it appends definitions in message order and then
+decodes the payload.
 
 Focused tests cover a winning seed phrase made entirely from first-seen Regions and a
 batch containing both dense and exact definitions.
+
+## Complete-corpus matrix
+
+Every row below runs to the corpus manifest's end and independently reconstructs the
+entire Region sequence. Ratios are raw bytes divided by charged structural wire.
+
+| corpus | TUs | empty | installed | C-only seed | seed/empty | seed/installed |
+|---|---:|---:|---:|---:|---:|---:|
+| LLVM | 1,238 | 780.97x | 819.50x | **834.82x** | +6.90% | +1.87% |
+| RocksDB | 622 | 187.89x | 189.92x | **191.97x** | +2.17% | +1.08% |
+| DuckDB | 689 | 271.16x | 288.91x | **291.78x** | +7.61% | +0.99% |
+| Abseil | 700 | 279.87x | 284.97x | **287.27x** | +2.64% | +0.81% |
+| OpenCV | 1,506 | 639.18x | 646.91x | **656.88x** | +2.77% | +1.54% |
+| Godot | 2,207 | 687.08x | 751.05x | **758.61x** | +10.41% | +1.01% |
+| fmt | 50 | 112.76x | 122.17x | **130.85x** | +16.05% | +7.10% |
+| spdlog | 34 | 212.50x | 258.73x | **323.06x** | +52.03% | +24.86% |
+| Catch2 | 857 | 804.49x | 818.99x | **874.56x** | +8.71% | +6.79% |
+| nlohmann/json | 99 | 358.47x | 406.54x | **453.12x** | +26.41% | +11.46% |
+| range-v3 | 259 | 709.99x | 811.83x | **895.98x** | +26.20% | +10.37% |
+| Eigen | 650 | 1,417.00x | **2,507.23x** | 2,373.64x | +67.51% | -5.33% |
+| RE2 | 72 | 281.34x | 336.44x | **436.32x** | +55.08% | +29.69% |
+| LevelDB | 72 | 174.75x | 199.16x | **222.04x** | +27.06% | +11.49% |
+| simdjson | 153 | 514.31x | 620.81x | **690.18x** | +34.20% | +11.17% |
+| cereal | 84 | 1,203.18x | 1,004.57x | **1,203.58x** | +0.03% | +19.81% |
+
+The complete endpoints strengthen the broad conclusion but also show diminishing
+bootstrap influence on long runs. Equal-corpus gain remains +19.09% over empty
+because the shorter corpora retain one vote each; byte-weighted gain settles at
++8.13%. The installed-package comparison narrows to +1.98% byte-weighted, as expected
+once its one-time startup cost is amortized. The seed path still sends fewer bytes on
+15 of 16 completed corpora because first-profitable-use suppresses unused seed state.
 
 ## Balanced startup curve
 
@@ -204,17 +239,17 @@ source and tested across target projects and toolchains without target overlap.
 The seed artifact is C-local and is therefore reported separately rather than counted
 as C-to-F wire. It is about 249 KiB uncompressed and 79-82 KiB compressed.
 
-The deterministic logical learner state at each screened endpoint ranges from
-2,017,646 to 24,292,016 bytes, with a median of 6,500,057 bytes. This is exact
+The deterministic logical learner state at each complete endpoint ranges from
+2,017,646 to 54,239,451 bytes, with a median of 8,286,827.5 bytes. This is exact
 key-and-counter accounting for the research algorithm; it excludes Python allocator
 overhead and is not a C++ allocation estimate. The product learner still needs its
 own measured memory budget and compact layout.
 
 Only definitions used by a winning current-TU candidate are installed. For example:
 
-- LLVM publishes 1,499 seed phrases and 12,028 total phrases by TU 200;
-- RocksDB publishes 1,508 seed phrases and 19,405 total phrases by TU 200;
-- Godot publishes 1,041 seed phrases and 6,991 total phrases by TU 200;
+- LLVM publishes 1,612 seed phrases and 12,839 total phrases by TU 1,238;
+- RocksDB publishes 1,557 seed phrases and 19,766 total phrases by TU 622;
+- Godot publishes 1,666 seed phrases and 8,625 total phrases by TU 2,207;
 - cereal publishes 1,130 seed phrases and 3,340 total phrases by TU 84.
 
 The compressed definition frame can contain seed and target-learned phrases together,
@@ -223,7 +258,7 @@ byte attribution for phrases sharing a frame.
 
 ## Design conclusion
 
-Retain C-only seeding as one isolated initialization step for the existing C learner:
+Retain C-only seeding as one bounded initialization step for the existing C learner:
 
 1. no startup package transfer;
 2. no F-side seed or learner;
@@ -232,24 +267,22 @@ Retain C-only seeding as one isolated initialization step for the existing C lea
 5. complete actual-byte comparison against empty on every TU;
 6. target-local chronological learning remains the core mechanism.
 
-Do not optimize around Eigen's TU-200 installed-package win until the complete-corpus
-and order/change matrices are available. One exception out of 16 does not justify a
+Do not optimize around Eigen's complete-corpus installed-package win until the
+order/change matrices are available. One exception out of 16 does not justify a
 second decoder state machine. The empty candidate already bounds regressions.
 
 ## Required next gates
 
-1. Run C-only seed to completion on all current corpora and publish equal-corpus,
-   byte-weighted, per-corpus, C50, and H200 results.
-2. Run reverse order, at least three deterministic shuffles, scheduler-like order,
+1. Run reverse order, at least three deterministic shuffles, scheduler-like order,
    widely shared Region replacement, delayed change, and reverted change. Every row
    must replay exactly.
-3. Extend the target-disjoint experiment to the implementer's 25-corpus set. Primary
+2. Extend the target-disjoint experiment to the implementer's 25-corpus set. Primary
    reporting remains equal-corpus; compiler/toolchain variants must be labeled.
-4. Train a portable raw-source seed and compare it against expanded-trace capability
+3. Train a portable raw-source seed and compare it against expanded-trace capability
    packages without target overlap.
-5. Integrate the retained structural path with Line text, Region composition, values,
+4. Integrate the retained structural path with Line text, Region composition, values,
    residuals, missing exchanges, selectors, and final framing.
-6. Run the real C++ C/F cold and actual half-cold scenarios at >=1 GB/s.
+5. Run the real C++ C/F cold and actual half-cold scenarios at >=1 GB/s.
 
 ## Standalone evidence site
 
@@ -257,7 +290,7 @@ second decoder state machine. The empty candidate already bounds regressions.
 by `linecache/render_codec_bakeoff_report.py`. It includes:
 
 - the complete objective ledger;
-- inline SVG startup and per-corpus gain plots;
+- inline SVG startup and complete-corpus gain plots;
 - the C/F state and message flow;
 - all 16 corpus rows;
 - cross-fit package identities;
@@ -274,6 +307,8 @@ Committed machine artifacts:
 
 - `linecache/ml-artifacts/online-bootstrap-c-only-seed-screen-16corpus.tsv`
 - `linecache/ml-artifacts/online-bootstrap-c-only-seed-screen-16corpus-summary.json`
+- `linecache/ml-artifacts/online-bootstrap-c-only-seed-full-16corpus.tsv`
+- `linecache/ml-artifacts/online-bootstrap-c-only-seed-full-16corpus-summary.json`
 - `linecache/ml-artifacts/online-bootstrap-common-rocks-opencv.zst`
 - `linecache/ml-artifacts/online-bootstrap-common-llvm-godot.zst`
 
@@ -287,9 +322,8 @@ python3 linecache/online_bootstrap_curves.py \
   --level 3 --model-level 3 \
   --publication first-use --budget-basis ids32 \
   --row-set pretrained --pretrained-mode seed-only \
-  --max-tus 200 \
-  --curve-tsv /tmp/online-bootstrap-seed-CORPUS-200.tsv \
-  --report /tmp/online-bootstrap-seed-CORPUS-200.json
+  --curve-tsv /tmp/online-bootstrap-seed-full-CORPUS.tsv \
+  --report /tmp/online-bootstrap-seed-full-CORPUS.json
 ```
 
 Regenerate the static site after regenerating the summary:
@@ -300,7 +334,7 @@ python3 linecache/render_codec_bakeoff_report.py
 
 Verification performed before publication:
 
-- all 16 C-only seed rows exact;
+- all 16 complete C-only seed rows exact;
 - all three curves have identical per-TU raw boundaries at every compared prefix;
 - canonical package A and B hashes reproduced;
 - package B regenerated from LLVM + Godot in a fresh run;

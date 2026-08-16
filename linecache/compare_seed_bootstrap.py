@@ -364,6 +364,14 @@ def main() -> int:
         default=DEFAULT_CHECKPOINTS,
     )
     parser.add_argument("--require-corpora", type=int)
+    parser.add_argument(
+        "--endpoint-semantics",
+        default=(
+            "Each corpus ends at min(200, complete corpus TUs); checkpoints are "
+            "survivor cohorts when fewer corpora remain."
+        ),
+        help="human-readable description of the per-corpus comparison endpoint",
+    )
     parser.add_argument("--output", required=True)
     parser.add_argument("--summary-json", required=True)
     args = parser.parse_args()
@@ -412,10 +420,7 @@ def main() -> int:
 
     summary = {
         "experiment": "C-only seed versus empty and installed-package starts",
-        "endpoint_semantics": (
-            "Each corpus ends at min(200, complete corpus TUs); checkpoints are "
-            "survivor cohorts when fewer corpora remain."
-        ),
+        "endpoint_semantics": args.endpoint_semantics,
         "endpoint": endpoint_summary(comparisons),
         "checkpoints": [
             checkpoint_summary(rows_by_corpus, checkpoint)
