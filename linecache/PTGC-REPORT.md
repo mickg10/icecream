@@ -677,6 +677,82 @@ normalization is therefore also too fine-grained. The flag remains as a rerunnab
 the unflagged trainer was regression-checked to reproduce the prior smoke artifact byte-for-byte
 (`b18c8136...`). The next row must cross Line boundaries or learn source-level statement blocks.
 
+## P18 follow-up: exact source-statement programs reject whole-statement bootstrap
+
+P18 tests that next larger unit directly. It deliberately operates on the entire chronological P9
+raw-definition payload rather than treating each first-use Line in isolation:
+
+1. A conservative byte scanner partitions raw C/C++ training files into coding units at directives,
+   top-level semicolons, and braces. These are byte partitions, not a trusted syntax tree.
+2. The common 14-project raw-source trainer considers one, two, and four adjacent units, replaces
+   identifiers, numbers, quoted objects, and whitespace runs with typed opaque values, and retains
+   only shapes supported by at least two projects under the package budget.
+3. The target encoder scans the complete P9 raw-definition byte stream with the same partitioner and
+   runs a shortest-path choice between an exact raw span and a package-rule invocation. Adjacent raw
+   spans are merged. Actual varint and value lengths, rather than a proxy score, determine the path.
+4. Rule instances are serialized in both inline and per-rule columnar layouts. Each homogeneous
+   stream is actually zstd-compressed and the smaller complete candidate is selected.
+5. The independent receiver decompresses the selected streams, expands rules and exact values,
+   reconstructs the complete raw-definition byte stream, and only then invokes the ordinary P9
+   semantic decoder. The existing P9 lengths and IDs recover the original Line boundaries.
+6. A per-TU selector retains the ordinary grouped-literal P9 raw frame whenever the statement frame
+   is not smaller. The package and every selector byte remain charged.
+
+The package format is self-described: version 2 records statement-unit mode, while the loader and
+canonical reserializer retain version-1 compatibility for the earlier parameter-window packages.
+Thus this row can cross a process boundary without trainer state and cannot rely on target parsing
+state at the receiver.
+
+The two packages were trained from the same common 14 raw-source roots used above, excluding LLVM
+and DuckDB. Both scans processed 0.50 GiB and 10,984,935 lines, retained 410,681 sampled distinct
+unit sequences, considered 407,141 valid windows and 271,323 normalized shapes, and then selected:
+
+| budget | rules | package raw / framed wire | model ID | exact frame SHA-256 |
+|---:|---:|---:|---:|---|
+| 16 KiB | 388 | 15.2 / 4.6 KiB | `b4b00ce0addd3db3` | `5e14a34782837d97f4c87365a31dbcbb412c31403258824bd194d161183fc169` |
+| 64 KiB | 975 | 62.0 / 17.6 KiB | `5f55abdbaa8e3b6d` | `5376447ac46693184c8027744eaf38c275cb50839dd48f8fd0415aaa66d1b0fc` |
+
+Fresh deterministic rebuilds produced byte-identical frames. The target test loaded each frozen frame
+in a separate process and ran the first 20 TUs of each held-out project at zstd-3:
+
+| package | holdout | P9 total | charged P18 | raw literal / candidate | matched windows | covered / target | frame wins |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 16 KiB | DuckDB | 964,895 | 969,668 | 418,440 / 422,042 | 1,308 | 0.019 / 1.782 MiB | 0/20 |
+| 16 KiB | LLVM | 939,453 | 944,226 | 464,759 / 468,446 | 410 | 0.008 / 1.993 MiB | 0/20 |
+| 64 KiB | DuckDB | 964,895 | 982,908 | 418,440 / 422,739 | 1,411 | 0.022 / 1.782 MiB | 0/20 |
+| 64 KiB | LLVM | 939,453 | 957,466 | 464,759 / 469,329 | 569 | 0.012 / 1.993 MiB | 0/20 |
+
+All 80 P18 TU decodes reconstructed the complete raw-definition channel and every installed Line
+exactly. An ASan/UBSan one-TU loaded-package replay also passed without a diagnostic, and a two-TU
+run loaded the earlier 4,412-byte version-1 package and reconstructed all rows exactly.
+
+This is a decisive representation result. Four times the package budget finds more rules and
+matches, but changes DuckDB coverage by only about 3 KiB and LLVM coverage by about 4 KiB. Inline
+versus columnar instance layout is not the limiting factor either. Portable equality at a complete
+statement skeleton is simply too rare in chronological expanded-output definitions; growing this
+table cannot materially reduce the Line plane.
+
+The next portable row must bridge the two measured extremes: P14's small token windows cover many
+bytes but require too many operations, while P18's coarse invocations are cheap but cover almost
+nothing. The concrete next candidate is a hierarchical exact phrase program over the raw-definition
+stream: reusable source-token or byte phrases nested into larger sequences, cheap dense invocation
+IDs, and an exact residual. Static byte phrases, online phrases learned only from prior TUs, and
+their union should use the same decoder language so cold-start value and online learning can be
+measured without changing representations.
+
+P18 retained logs and SHA-256 values:
+
+```text
+25a466795f01c9997314557605c7afbc650b98ec403f0fc917f07914e4dd1547  /tmp/ptgc-statements-16k-rebuild.log
+01767dc822c3749dd50dc7cf658abdcdd43ef6ccfcade29f431d05bdcb0bf7be  /tmp/ptgc-statements-64k-rebuild.log
+312ddb92926c57399da5355203aba12219903b7706a426a8be716651431903ac  /tmp/ptgc-statements-16k-duckdb-z3-20tu.log
+ac65433cd12466e23bb1ae7c37ca3d71af0ded533fc3f59e0c090009d2f2f7ca  /tmp/ptgc-statements-16k-llvm-z3-20tu.log
+fbe947020676b261b0a28c837bce4c50a8354133508115188005d3da7dea9a80  /tmp/ptgc-statements-64k-duckdb-z3-20tu.log
+3ce266af62bf5757752506018e8061b92a4d1452b230abcb5c290db01592ed1a  /tmp/ptgc-statements-64k-llvm-z3-20tu.log
+d51149ce5ca1fdc630a328107cb6e691db663aa6555e5f48814eb695d9b29180  /tmp/ptgc-statements-v1-package-regression.log
+db46ed8467ab7d00b14f82026f4acf107ddf4d639fb24e1a0f0ab7956e2b3c1b  /tmp/ptgc-statements-sanitize-1tu.log
+```
+
 ## Reproduction and retained artifacts
 
 Environment for the authoritative local run:
