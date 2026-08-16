@@ -36,6 +36,7 @@ the C candidate learner.
 | F-owned cache lookup and F-generated `NEED` | retain | exact capability execution |
 | P26 embedded-zlib factor | retain as underlying member codec; reviewer ruling on member-only recovery pending | exact 48/48 complete executions |
 | P27 canonical-MO factor | measured incremental winner; reviewer ruling pending | exact 48/48 complete executions, 3.04 MB same-input cold saving |
+| P28 S1 chain-1,024 cleanup | retain as the S1 default | exact complete cold execution on all 16; monotonic 11,474-byte saving |
 | P4 alpha-Line residual codec | reject | exact all-16 integration loses bytes and speed |
 | P22 prior-Root slice | reject from the product path | integrated complete codec loses to S1 |
 | P18 statements, P19 flat phrases, local raw backreferences, project-source packages | do not port | integrated or causal screens lose |
@@ -44,15 +45,16 @@ the C candidate learner.
 | neural sequence models and large code models | teacher/ceiling only | too slow or too large for the live path |
 | receiver-side predictor | do not add | no measured need; explicit programs are sufficient |
 
-The best current **complete** measured row is P27:
+The best current complete measured row is P28.  All 48 cold and complementary
+cache executions are exact:
 
 | receiver state | wire bytes | ratio | exact | minimum measured encode/decode subphase |
 |---|---:|---:|---:|---:|
-| cold | **93,980,202** | **303.84x** | 16/16 corpora | **1.015 GB/s** |
-| cache complement bit 0 | **62,151,794** | **459.43x** | 16/16 corpora | **1.120 GB/s** |
-| cache complement bit 1 | **43,863,608** | **650.99x** | 16/16 corpora | **2.233 GB/s** |
+| cold | **93,968,728** | **303.87x** | 16/16 corpora | **1.067 GB/s** designated Zen 4 replay |
+| cache complement bit 0 | **62,140,320** | **459.52x** | 16/16 corpora | **1.098 GB/s** local-host replay |
+| cache complement bit 1 | **43,852,134** | **651.16x** | 16/16 corpora | **2.085 GB/s** local-host replay |
 
-Cold 400x permits 71,386,679 bytes, so the measured cold gap is **22,593,523 bytes**. Both
+Cold 400x permits 71,386,679 bytes, so P28's measured cold gap is **22,582,049 bytes**. Both
 aggregate half-cache 200x rows pass. These deterministic cache complements are not the same claim
 as chronological online H200; that learning-curve test remains required.
 
@@ -900,18 +902,18 @@ Charge a model exactly where an endpoint first receives or maps it:
 
 ## Current complete byte ledger
 
-P27 cold over all 16 corpora:
+P28 cold over all 16 corpora:
 
 | Complete category | Wire bytes | Fraction |
 |---|---:|---:|
-| Root | 3,687,803 | 3.92% |
-| Block definitions | 586,843 | 0.62% |
+| Root | 3,681,710 | 3.92% |
+| Block definitions | 581,462 | 0.62% |
 | path definitions | 828,100 | 0.88% |
 | object `NEED`/missing dialogue | 3,317,206 | 3.53% |
 | Region definitions/control | 19,746,257 | 21.01% |
 | Line/material plane | 65,743,189 | 69.95% |
 | other framing | 70,804 | 0.08% |
-| **total** | **93,980,202** | **100.00%** |
+| **total** | **93,968,728** | **100.00%** |
 
 The P27 selected blob wire, 16,721,527 bytes, is a subcomponent of the Line/material plane and must
 not be added to the total again. The dominant remaining opportunity is material plus Region
@@ -930,6 +932,7 @@ gain rather than advertise a large ratio over an already-small structural stream
 | P26 published environment | 97,021,934 | 294.31x | exact embedded-zlib factor |
 | P26 current same-input control | 97,015,268 | 294.33x | control for P27 attribution |
 | P27 | **93,980,202** | **303.84x** | exact canonical-MO factor beneath P26 |
+| P28 | **93,968,728** | **303.87x** | S1 chain 64→1,024; all 16 monotonic |
 | P26 + rejected P4 | 100,546,398 | 283.99x | independent residual frames + alpha selector |
 
 P25 remains useful evidence for cache ownership, but its dense-to-`u64` association is superseded by
@@ -948,7 +951,7 @@ flowchart TB
     MATERIAL[Exact material<br/>Lines + residual + values]
     DIALOGUE[Cache dialogue<br/>NEED + definitions]
     FRAME[Selectors + framing]
-    TOTAL[Complete P27 wire<br/>93.98 MB]
+    TOTAL[Complete P28 wire<br/>93.97 MB]
 
     RAW --> STRUCT
     RAW --> MATERIAL
@@ -1117,21 +1120,25 @@ Neither should pull the exploratory capability harness wholesale into daemon cod
 
 ### Research lane — local oracle
 
-The P4 residual branch is closed. Return to causal Region/root superblocks:
+The P4 residual branch is closed, and P28 proves that even a zero-byte
+Root+Block layer reaches only 318.45x.  Continue with material-bearing
+superblocks:
 
-1. run deterministic S1, pair-promotion, and phrase-trie candidates first;
-2. preserve canonical immutable Blocks and first-profitable-use publication;
-3. produce all-16 learning, reorder, header-change, and revert curves;
-4. integrate the winner into the complete P27 ledger before claiming a ratio;
-5. only then compare FTRL and the 32-tree GBDT at equal top-K work;
-6. use the broader 25-corpus set to test generalization and C-only raw-source bootstrap.
+1. retain deterministic S1 chain 1,024 as the Root baseline;
+2. add one optional immutable material-program Block inside the existing Region materializer;
+3. preserve first-profitable-use publication and transactional F installation;
+4. produce all-16 learning, reorder, header-change, and revert curves;
+5. integrate the winner into the complete P28 ledger before claiming a ratio;
+6. only then compare FTRL and the 32-tree GBDT at equal top-K work;
+7. use the broader 25-corpus set to test generalization and C-only raw-source bootstrap.
 
 ### Reviewer questions
 
 1. Accept or reject P26 member-only recovery as the exact high-throughput form.
 2. Accept or reject P27's four-part canonical-MO factor and 25% raw-reduction admission rule.
-3. Decide whether pair promotion or a phrase trie is the smallest sufficient online superblock
-   learner after complete integration.
+3. Select the smallest typed material-program family for the first
+   `MATERIAL_BLOCK_REF` integration; P28 closes Root-only selection as a route
+   to cold-400.
 4. Decide whether the cross-context canonical state earns its extra decoder state beyond ordinary
    S1 Blocks.
 5. Require ML only if it removes measured candidate-search CPU or complete wire beyond the
@@ -1146,6 +1153,7 @@ Complete-codec evidence:
 - [`DIRECT-ORDINAL-M1-16CORPUS-REPORT.md`](https://github.com/mickg10/icecream/blob/local-oracle/issue16-direct-ordinals/linecache/DIRECT-ORDINAL-M1-16CORPUS-REPORT.md)
 - [`COMPRESSED-BLOB-P26-16CORPUS-REPORT.md`](COMPRESSED-BLOB-P26-16CORPUS-REPORT.md)
 - [`MO-FACTOR-P27-16CORPUS-REPORT.md`](MO-FACTOR-P27-16CORPUS-REPORT.md)
+- [`SUPERBLOCK-P28-CEILING-REPORT.md`](SUPERBLOCK-P28-CEILING-REPORT.md)
 - [`RESIDUAL-AND-CONTROL-CEILINGS.md`](RESIDUAL-AND-CONTROL-CEILINGS.md)
 - [`ALPHA-LINES-P4-16CORPUS-REPORT.md`](ALPHA-LINES-P4-16CORPUS-REPORT.md)
 
@@ -1164,6 +1172,10 @@ Machine-readable current ledgers:
 - [`compressed-blob-p26-16corpus.tsv`](ml-artifacts/compressed-blob-p26-16corpus.tsv)
 - [`mo-factor-p27-16corpus-summary.json`](ml-artifacts/mo-factor-p27-16corpus-summary.json)
 - [`mo-factor-p27-16corpus.tsv`](ml-artifacts/mo-factor-p27-16corpus.tsv)
+- [`structure-ceiling-p28-16corpus-summary.json`](ml-artifacts/structure-ceiling-p28-16corpus-summary.json)
+- [`structure-ceiling-p28-16corpus.tsv`](ml-artifacts/structure-ceiling-p28-16corpus.tsv)
+- [`s1-p28-16corpus-summary.json`](ml-artifacts/s1-p28-16corpus-summary.json)
+- [`s1-p28-16corpus.tsv`](ml-artifacts/s1-p28-16corpus.tsv)
 - [`alpha-lines-p4-16corpus-summary.json`](ml-artifacts/alpha-lines-p4-16corpus-summary.json)
 - [`alpha-lines-p4-16corpus.tsv`](ml-artifacts/alpha-lines-p4-16corpus.tsv)
 
@@ -1198,7 +1210,7 @@ F needs no predictor. It installs immutable definitions, executes the explicit p
 reconstructs the exact .ii, and writes it into the remote compiler pipe.
 
 Binding claims run on all 16 fixed corpora. The broader 25-corpus set screens model
-generalization. P27 is currently 303.84x cold, leaving 22.59 MB to cold 400x; both deterministic
+generalization. P28 is currently 303.87x cold, leaving 22.58 MB to cold 400x; both deterministic
 half-cache 200x rows pass. Chronological H200 and the complete product-pipeline speed gate remain
 open.
 ```
