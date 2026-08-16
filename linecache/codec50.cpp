@@ -96,6 +96,10 @@ public:
     uint32_t region_ids_count(uint32_t rid) const { return region_records_[rid].ids_count; }
     const char* region_data(uint32_t rid) const { return region_bytes_.data()+region_records_[rid].raw_off; }
     uint32_t region_raw_len(uint32_t rid) const { return region_records_[rid].raw_len; }
+    // Faithful stand-in for the persistent C-cache key: the store assigns one nonzero monotonic
+    // u64 when a Region is first installed.  It is deliberately distinct from the sampled lookup
+    // hash above, which may repeat and is always followed by an exact byte comparison.
+    uint64_t region_key(uint32_t rid) const { return uint64_t(rid)+1; }
     uint64_t distinct_line_bytes() const { return line_bytes_.size(); }
     void process(const char*begin,const char*end,uint32_t*out,size_t&out_count,uint64_t&hits,bool train,std::vector<uint32_t>*rout){
         const char*p=begin; uint32_t previous=UINT32_MAX;
@@ -139,11 +143,23 @@ static Corpus load_corpus(const char*manifest,size_t max_files){
 }
 static inline void put_varint(std::vector<uint8_t>&o,uint64_t v){ while(v>=0x80){o.push_back(uint8_t(v)|0x80);v>>=7;} o.push_back(uint8_t(v)); }
 static inline uint64_t get_varint(const uint8_t*&p){ uint64_t v=0; int s=0; for(;;){ uint8_t b=*p++; v|=uint64_t(b&0x7f)<<s; if(!(b&0x80))break; s+=7; } return v; }
+static inline void put_u64le(std::vector<uint8_t>&o,uint64_t v){for(unsigned i=0;i<8;++i)o.push_back(uint8_t(v>>(8*i)));}
+static inline uint64_t get_u64le(const uint8_t*&p,const uint8_t*end){
+    if(end-p<8){fprintf(stderr,"truncated u64\n");exit(2);}uint64_t v=0;for(unsigned i=0;i<8;++i)v|=uint64_t(*p++)<<(8*i);return v;
+}
 static inline void put_zigzag(std::vector<uint8_t>&o,int64_t v){ put_varint(o,(uint64_t(v)<<1)^uint64_t(v>>63)); }
 static inline int64_t get_zigzag(const uint8_t*&p){ uint64_t u=get_varint(p); return int64_t(u>>1)^-int64_t(u&1); }
 static inline size_t varint_size(uint64_t v){ size_t n=1; while(v>=0x80){++n;v>>=7;} return n; }
 static size_t zstd_size(ZSTD_CCtx*c,const uint8_t*data,size_t n,int level,std::vector<uint8_t>&dst){ ZSTD_CCtx_reset(c,ZSTD_reset_session_and_parameters); ZSTD_CCtx_setParameter(c,ZSTD_c_compressionLevel,level);
     size_t bound=ZSTD_compressBound(n); if(dst.size()<bound)dst.resize(bound); size_t r=ZSTD_compress2(c,dst.data(),dst.size(),data?data:(const uint8_t*)"",n); if(ZSTD_isError(r)){fprintf(stderr,"zstd %s\n",ZSTD_getErrorName(r));exit(2);} return r; }
+static size_t zstd_message_roundtrip(ZSTD_CCtx*c,ZSTD_DCtx*d,const std::vector<uint8_t>&raw,int level,
+                                     std::vector<uint8_t>&encoded,std::vector<uint8_t>&decoded){
+    size_t encodedSize=zstd_size(c,raw.data(),raw.size(),level,encoded);decoded.resize(raw.size());uint8_t empty=0;
+    void*out=decoded.empty()?static_cast<void*>(&empty):static_cast<void*>(decoded.data());
+    size_t got=ZSTD_decompressDCtx(d,out,decoded.size(),encoded.data(),encodedSize);
+    if(ZSTD_isError(got)||got!=raw.size()||decoded!=raw){fprintf(stderr,"message roundtrip differs: %s\n",ZSTD_isError(got)?ZSTD_getErrorName(got):"size/content");exit(2);}
+    return encodedSize;
+}
 
 static std::vector<uint8_t> zstd_stream_encode(ZSTD_CCtx*c,const std::vector<uint8_t>&raw,
                                                 ZSTD_EndDirective directive){
@@ -302,6 +318,11 @@ struct MixedFLineView {
     uint32_t source_offset=0;
     uint32_t length=0;
 };
+struct MixedFRegionView {
+    size_t offset=0;
+    uint32_t length=0;
+    bool known=false;
+};
 static bool system_source_path(const std::string&path){
     return path.rfind("/usr/include/",0)==0||path.rfind("/usr/lib/gcc/",0)==0||path.rfind("/usr/local/include/",0)==0;
 }
@@ -445,7 +466,7 @@ struct RelLZ {
 };
 
 int main(int argc,char**argv){
-    const char* manifest=nullptr; size_t max_files=SIZE_MAX; int zlevel=3; uint32_t sourceAdmitRatio=6; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, usePriorRoot=false, useSortedLines=false, useByteArrayLines=false, useMixedRegions=false, useProjectSource=false;
+    const char* manifest=nullptr; size_t max_files=SIZE_MAX; int zlevel=3,halfColdBit=-1; uint32_t sourceAdmitRatio=6; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, usePriorRoot=false, useSortedLines=false, useByteArrayLines=false, useMixedRegions=false, useProjectSource=false,useKeyMap=false;
     for(int i=1;i<argc;++i){ if(!strcmp(argv[i],"--manifest")&&i+1<argc)manifest=argv[++i];
         else if(!strcmp(argv[i],"--z")&&i+1<argc)zlevel=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--no-d1"))useD1=false;
@@ -458,12 +479,15 @@ int main(int argc,char**argv){
         else if(!strcmp(argv[i],"--mixed-regions"))useMixedRegions=true;
         else if(!strcmp(argv[i],"--source-package"))useProjectSource=true;
         else if(!strcmp(argv[i],"--source-admit-ratio")&&i+1<argc){char*end=nullptr;unsigned long value=strtoul(argv[++i],&end,10);if(!end||*end||!value||value>1000){fprintf(stderr,"bad source admission ratio\n");return 2;}sourceAdmitRatio=uint32_t(value);}
+        else if(!strcmp(argv[i],"--key-map"))useKeyMap=true;
+        else if(!strcmp(argv[i],"--half-cold-bit")&&i+1<argc){char*end=nullptr;long value=strtol(argv[++i],&end,10);if(!end||*end||(value!=0&&value!=1)){fprintf(stderr,"bad half-cold bit\n");return 2;}halfColdBit=int(value);useKeyMap=true;}
         else if(!strcmp(argv[i],"--deep"))deep=true;         // run slow z19/z22 entropy ladder + reorder test
         else if(!strcmp(argv[i],"--warm"))warm=true;         // Basis C: 2nd pass with dict retained -> warm steady-state wire
         else if(!strcmp(argv[i],"--max-files")&&i+1<argc){ char*t=nullptr; unsigned long long v=strtoull(argv[++i],&t,10); if(!t||*t||!v){fprintf(stderr,"bad max-files\n");return 2;} max_files=size_t(v); }
         else { fprintf(stderr,"unknown %s\n",argv[i]); return 2; } }
-    if(!manifest){ fprintf(stderr,"usage: %s --manifest F [--z 0|1|3] [--no-d1] [--d2] [--prior-root] [--sorted-lines|--byte-array-lines|--mixed-regions [--source-package [--source-admit-ratio N]]] [--max-files N]\n",argv[0]); return 2; }
+    if(!manifest){ fprintf(stderr,"usage: %s --manifest F [--z 0|1|3] [--no-d1] [--d2] [--prior-root] [--sorted-lines|--byte-array-lines|--mixed-regions [--key-map|--half-cold-bit 0|1] [--source-package [--source-admit-ratio N]]] [--max-files N]\n",argv[0]); return 2; }
     if(useProjectSource&&!useMixedRegions){fprintf(stderr,"--source-package requires --mixed-regions\n");return 2;}
+    if(useKeyMap&&!useMixedRegions){fprintf(stderr,"--key-map and --half-cold-bit require --mixed-regions\n");return 2;}
     if(usePriorRoot) useS1=false;
     if(useSortedLines){ useD1=false; useD2=false; useD2mine=false; if(warm){fprintf(stderr,"--sorted-lines warm pass not implemented\n");return 2;} }
     if(useMixedRegions){ useSortedLines=false; useD1=false; useD2=false; useD2mine=false;
@@ -520,7 +544,8 @@ int main(int argc,char**argv){
     // ===== ENCODER (C) + DECODER (F): one cold chronological pass, PULL protocol (root -> MISSING -> FILL) =====
     // C tracks F's known sets (single F) so it computes exactly the missing closure. Every wire byte is
     // charged by category, compressed at z<=zlevel per message. F reconstructs .ii bytes byte-exact.
-    ZSTD_CCtx* z=ZSTD_createCCtx();ZSTD_CCtx* sourceCostZ=useProjectSource?ZSTD_createCCtx():nullptr;std::vector<uint8_t> dst,sourceCostDst;
+    ZSTD_CCtx* z=ZSTD_createCCtx();ZSTD_DCtx* messageD=ZSTD_createDCtx();ZSTD_CCtx* sourceCostZ=useProjectSource?ZSTD_createCCtx():nullptr;
+    std::vector<uint8_t> dst,sourceCostDst,messageEncoded,messageDecoded;
     std::vector<uint8_t> fknownLine(dict.distinct()+1,0), fknownReg(NREG,0);
     std::vector<uint32_t> ClineToF(dict.distinct()+1,0); uint32_t nextFline=1;
     std::array<ZSTD_CCtx*,5> lineZC{}; std::array<ZSTD_DCtx*,5> lineZD{};
@@ -547,10 +572,12 @@ int main(int argc,char**argv){
     std::vector<uint8_t> Fline_data; std::vector<size_t> Fline_off; Fline_off.push_back(0);   // line id k (1-based) -> [off[k-1],off[k])
     Fline_data.reserve(64u<<20);
     std::vector<uint32_t> Freg_child; std::vector<size_t> Freg_off; Freg_off.push_back(0);     // region id k (0-based) -> [off[k],off[k+1])
-    std::vector<uint8_t> FmixedRegionData; std::vector<size_t> FmixedRegionOff{0};
+    std::vector<uint8_t> FmixedRegionData;std::vector<MixedFRegionView> FmixedRegions(NREG);
+    std::unordered_map<uint64_t,MixedFRegionView> FpreloadedRegions;
     std::vector<MixedFLineView> FmixedPublic(1);
     std::vector<std::string> Fpaths;
     std::vector<uint8_t> fknownBlk(useS1?boff2.size():1,0);   // C's model of F's known blocks
+    std::vector<uint8_t> FknownBlk(fknownBlk.size(),0);        // F's independently derived block state
     std::vector<uint32_t> Fblk_child; std::vector<size_t> Fblk_off; Fblk_off.push_back(0);      // F block k -> region ids
     std::vector<uint32_t> Freg_stream; Freg_stream.reserve(allreg.size());   // F's reconstructed region occurrence stream (for block COPY defs)
     std::vector<uint32_t> Froot_child; std::vector<size_t> Froot_off; Froot_off.push_back(0);   // completed exact Roots for P22 slices
@@ -559,6 +586,7 @@ int main(int argc,char**argv){
     double w_root=0, w_linedef=0, w_regiondef=0, w_pathdef=0, w_missing=0, w_framing=0;
     std::array<double,6> mixedPartWire{};std::array<uint64_t,7> mixedOps{};uint64_t mixedLiteralRaw=0,mixedArrayValues=0,mixedSourceBytes=0;
     uint64_t mixedSourcePackageRaw=0,mixedSourcePackageFiles=0,mixedSourcePotentialRaw=0,mixedSourceConsidered=0,mixedSourceAdmitted=0,mixedSourceEstimatedCost=0;double mixedSelectorWire=0;
+    uint64_t preloadedRegionBytes=0,preloadedRegionCount=0,associatedRegionCount=0;double mixedAssociationWire=0,mixedMissingRequestWire=0;
     const double FRAME=4;   // 4-byte length prefix per framed message
     uint64_t cum_raw=0; double cum_wire=0;
     // f-checkpoints + H200 trailing window
@@ -575,6 +603,23 @@ int main(int argc,char**argv){
     std::vector<uint8_t> allLineDefs, allRoots, allRegions, allBlocks, allPaths, allMiss;   // diagnostic: batched-z3 floor (cross-message headroom)
     std::vector<uint8_t> allRegionsRaw;   // diagnostic: region-defs as RAW line-ids (no per-region delta) -> preserves cross-region subsequence matches for z3-LDM
 
+    std::vector<uint8_t> associatedReg(NREG),FassociatedReg(NREG);
+    std::vector<uint32_t> requiredRegionStamp(NREG),requiredBlockStamp(fknownBlk.size());
+    std::vector<uint32_t> FrequiredRegionStamp(NREG),FrequiredBlockStamp(fknownBlk.size());uint32_t requestStamp=0;
+    if(useKeyMap){
+      std::unordered_map<uint64_t,uint32_t> uniqueKeys;uniqueKeys.reserve(size_t(NREG)*2);
+      if(halfColdBit>=0)FpreloadedRegions.reserve(size_t(NREG));
+      for(uint32_t r=0;r<NREG;++r){
+        uint64_t key=dict.region_key(r);auto inserted=uniqueKeys.emplace(key,r);
+        if(!inserted.second){fprintf(stderr,"Region key collision: %u and %u\n",inserted.first->second,r);return 2;}
+        if(halfColdBit>=0&&int(key&1)==halfColdBit){
+          MixedFRegionView view{FmixedRegionData.size(),dict.region_raw_len(r),true};
+          FmixedRegionData.insert(FmixedRegionData.end(),dict.region_data(r),dict.region_data(r)+dict.region_raw_len(r));
+          FpreloadedRegions.emplace(key,view);preloadedRegionBytes+=view.length;++preloadedRegionCount;
+        }
+      }
+    }
+
     int npass = warm?2:1;   // --warm: pass 0 primes dict+F-stores (uncounted); final pass measures warm steady-state.
     for(int pass=0; pass<npass; ++pass){
       if(pass+1==npass && npass>1){   // reset all measurement state before the warm pass; keep fknown* flags + F-stores
@@ -585,17 +630,86 @@ int main(int argc,char**argv){
       for(size_t t=0; t<TUs; ++t){
         auto _te=Clock::now();
         const uint32_t* tk=&tokstream[tokoff[t]]; size_t tn=tokoff[t+1]-tokoff[t];
-        // --- collect NEW regions (incl. new blocks' child regions) + NEW blocks, topological order ---
-        std::vector<uint32_t> missReg, missBlk;
-        auto addRegion=[&](uint32_t r){ if(fknownReg[r])return; for(uint32_t x:missReg) if(x==r) return; missReg.push_back(r); };
-        if(usePriorRoot){
-            for(size_t i=roff[t];i<roff[t+1];++i) addRegion(allreg[i]);
-        } else for(size_t i=0;i<tn;++i){ uint32_t tok=tk[i];
-            if(tok<NREG) addRegion(tok);
-            else { uint32_t k=tok-NREG; if(!fknownBlk[k]){ bool dup=false; for(uint32_t x:missBlk) if(x==k){dup=true;break;} if(!dup){ for(size_t j=boff2[k];j<boff2[k+1];++j) addRegion(bchild[j]); missBlk.push_back(k); } } } }
-        // MISSING = unknown region ids + unknown block ids (F requests; real round-trip in 2-proc)
-        { std::vector<uint8_t> mm; put_varint(mm,missReg.size()); for(uint32_t r:missReg) put_varint(mm,r); put_varint(mm,missBlk.size()); for(uint32_t k:missBlk) put_varint(mm,NREG+k);
-          if(!missReg.empty()||!missBlk.empty()){ w_missing += zstd_size(z,mm.data(),mm.size(),zlevel,dst) + FRAME; allMiss.insert(allMiss.end(),mm.begin(),mm.end()); } }
+        // ROOT is available to F before its MISSING reply.  With a key map, C first associates every
+        // newly-mentioned conversation-dense Region id with its stable key; F binds cache hits and
+        // independently returns the exact missing closure.  The legacy cold path is left byte-identical.
+        std::vector<uint8_t> rootb,Frootb;
+        if(usePriorRoot)rootb=root_slices.programs[t];else for(size_t i=0;i<tn;++i)put_varint(rootb,tk[i]);
+        std::vector<uint32_t> missReg,missBlk,associationRegs,requiredRegions,requiredBlocks;
+        if(useKeyMap){
+          if(++requestStamp==0){std::fill(requiredRegionStamp.begin(),requiredRegionStamp.end(),0);std::fill(requiredBlockStamp.begin(),requiredBlockStamp.end(),0);requestStamp=1;}
+          auto requireRegion=[&](uint32_t r){
+            if(requiredRegionStamp[r]!=requestStamp){requiredRegionStamp[r]=requestStamp;requiredRegions.push_back(r);}
+            if(!associatedReg[r]){associatedReg[r]=1;associationRegs.push_back(r);}
+          };
+          auto requireBlock=[&](uint32_t k){if(requiredBlockStamp[k]!=requestStamp){requiredBlockStamp[k]=requestStamp;requiredBlocks.push_back(k);}};
+          if(usePriorRoot){for(size_t i=roff[t];i<roff[t+1];++i)requireRegion(allreg[i]);}
+          else for(size_t i=0;i<tn;++i){uint32_t tok=tk[i];if(tok<NREG)requireRegion(tok);else{
+            uint32_t k=tok-NREG;requireBlock(k);
+            if(!fknownBlk[k])for(size_t j=boff2[k];j<boff2[k+1];++j)requireRegion(bchild[j]);
+          }}
+
+          // C -> F ROOT.  F derives direct Region/Block requirements from these decoded bytes;
+          // child Regions of a first-use Block are carried by the association batch below.
+          w_root+=zstd_message_roundtrip(z,messageD,rootb,zlevel,messageEncoded,messageDecoded);w_framing+=FRAME;
+          allRoots.insert(allRoots.end(),rootb.begin(),rootb.end());Frootb=messageDecoded;
+
+          // C -> F: first-use dense-id/key64 associations.  F owns the key-indexed preload and is
+          // the only side that decides whether an object is present.
+          std::vector<uint32_t> FnewAssociationRegs;
+          if(!associationRegs.empty()){
+            std::vector<uint8_t> associationRaw;put_varint(associationRaw,associationRegs.size());
+            for(uint32_t r:associationRegs){put_varint(associationRaw,r);put_u64le(associationRaw,dict.region_key(r));}
+            size_t bytes=zstd_message_roundtrip(z,messageD,associationRaw,zlevel,messageEncoded,messageDecoded)+FRAME;
+            w_missing+=bytes;mixedAssociationWire+=bytes;
+            const uint8_t*ap=messageDecoded.data(),*ae=ap+messageDecoded.size();uint64_t count=get_varint(ap);
+            if(count!=associationRegs.size()){fprintf(stderr,"association count differs\n");return 2;}
+            for(uint64_t i=0;i<count;++i){
+              if(ap>=ae){fprintf(stderr,"truncated association\n");return 2;}uint64_t dense=get_varint(ap);uint64_t key=get_u64le(ap,ae);
+              if(dense>=NREG||FassociatedReg[dense]||key!=dict.region_key(uint32_t(dense))){fprintf(stderr,"bad Region association\n");return 2;}
+              FassociatedReg[dense]=1;FnewAssociationRegs.push_back(uint32_t(dense));++associatedRegionCount;auto hit=FpreloadedRegions.find(key);
+              if(hit!=FpreloadedRegions.end())FmixedRegions[dense]=hit->second;
+            }
+            if(ap!=ae){fprintf(stderr,"association has trailing bytes\n");return 2;}
+          }
+
+          // F -> C: derive the actual requested ids from F-decoded ROOT+association bytes, then
+          // test only F's own stores.  This is also the acknowledgement for an all-hit batch.
+          std::vector<uint32_t> FrequiredRegions,FrequiredBlocks;
+          auto FrequireRegion=[&](uint32_t r){if(FrequiredRegionStamp[r]!=requestStamp){FrequiredRegionStamp[r]=requestStamp;FrequiredRegions.push_back(r);}};
+          auto FrequireBlock=[&](uint32_t k){if(FrequiredBlockStamp[k]!=requestStamp){FrequiredBlockStamp[k]=requestStamp;FrequiredBlocks.push_back(k);}};
+          for(uint32_t r:FnewAssociationRegs)FrequireRegion(r);
+          if(usePriorRoot){fprintf(stderr,"key-map prior Root is not implemented\n");return 2;}
+          const uint8_t*rp=Frootb.data(),*re=rp+Frootb.size();
+          while(rp<re){uint64_t tok=get_varint(rp);if(tok<NREG)FrequireRegion(uint32_t(tok));else if(tok-NREG<fknownBlk.size())FrequireBlock(uint32_t(tok-NREG));else{fprintf(stderr,"bad F Root token\n");return 2;}}
+          if(FrequiredBlocks.size()!=requiredBlocks.size()) {fprintf(stderr,"F Root Block closure differs\n");return 2;}
+          for(uint32_t k:FrequiredBlocks)if(requiredBlockStamp[k]!=requestStamp){fprintf(stderr,"F Root Block identity differs\n");return 2;}
+          for(uint32_t r:FrequiredRegions)if(!FmixedRegions[r].known)missReg.push_back(r);
+          for(uint32_t k:FrequiredBlocks)if(!FknownBlk[k])missBlk.push_back(k);
+          if(!associationRegs.empty()||!missReg.empty()||!missBlk.empty()){
+            std::vector<uint8_t> missingRaw;put_varint(missingRaw,missReg.size());for(uint32_t r:missReg)put_varint(missingRaw,r);
+            put_varint(missingRaw,missBlk.size());for(uint32_t k:missBlk)put_varint(missingRaw,NREG+k);
+            size_t bytes=zstd_message_roundtrip(z,messageD,missingRaw,zlevel,messageEncoded,messageDecoded)+FRAME;
+            w_missing+=bytes;mixedMissingRequestWire+=bytes;allMiss.insert(allMiss.end(),missingRaw.begin(),missingRaw.end());
+            std::vector<uint32_t> decodedReg,decodedBlk;const uint8_t*mp=messageDecoded.data(),*me=mp+messageDecoded.size();
+            uint64_t regionCount=get_varint(mp);decodedReg.reserve(regionCount);
+            for(uint64_t i=0;i<regionCount;++i){if(mp>=me){fprintf(stderr,"truncated missing Region list\n");return 2;}uint64_t r=get_varint(mp);if(r>=NREG) {fprintf(stderr,"bad missing Region id\n");return 2;}decodedReg.push_back(uint32_t(r));}
+            if(mp>=me){fprintf(stderr,"truncated missing Block count\n");return 2;}uint64_t blockCount=get_varint(mp);decodedBlk.reserve(blockCount);
+            for(uint64_t i=0;i<blockCount;++i){if(mp>=me){fprintf(stderr,"truncated missing Block list\n");return 2;}uint64_t id=get_varint(mp);if(id<NREG||id-NREG>=fknownBlk.size()){fprintf(stderr,"bad missing Block id\n");return 2;}decodedBlk.push_back(uint32_t(id-NREG));}
+            if(mp!=me||decodedReg!=missReg||decodedBlk!=missBlk){fprintf(stderr,"missing reply differs\n");return 2;}
+          }
+          for(uint32_t r:requiredRegions)fknownReg[r]=FmixedRegions[r].known;
+        } else {
+          // Original single-empty-F model: C's mirror computes the missing closure.
+          auto addRegion=[&](uint32_t r){if(fknownReg[r])return;for(uint32_t x:missReg)if(x==r)return;missReg.push_back(r);};
+          if(usePriorRoot){for(size_t i=roff[t];i<roff[t+1];++i)addRegion(allreg[i]);}
+          else for(size_t i=0;i<tn;++i){uint32_t tok=tk[i];if(tok<NREG)addRegion(tok);else{uint32_t k=tok-NREG;if(!fknownBlk[k]){
+            bool duplicate=false;for(uint32_t x:missBlk)if(x==k){duplicate=true;break;}if(!duplicate){for(size_t j=boff2[k];j<boff2[k+1];++j)addRegion(bchild[j]);missBlk.push_back(k);}
+          }}}
+          std::vector<uint8_t> missingRaw;put_varint(missingRaw,missReg.size());for(uint32_t r:missReg)put_varint(missingRaw,r);
+          put_varint(missingRaw,missBlk.size());for(uint32_t k:missBlk)put_varint(missingRaw,NREG+k);
+          if(!missReg.empty()||!missBlk.empty()){w_missing+=zstd_size(z,missingRaw.data(),missingRaw.size(),zlevel,dst)+FRAME;allMiss.insert(allMiss.end(),missingRaw.begin(),missingRaw.end());}
+        }
         // --- FILL: new paths, new lines, new region defs, new block defs (topological) ---
         std::vector<uint8_t> fill_paths, fill_lines, fill_regions, fill_regions_raw, fill_blocks; uint32_t np=0,nl=0,nr=0,nb=0;
         std::vector<uint32_t> newLineIds;
@@ -811,11 +925,8 @@ int main(int argc,char**argv){
                 allRegions.insert(allRegions.end(),fill_regions.begin(),fill_regions.end()); }
         if(nb){ w_blockdef += zstd_size(z,fill_blocks.data(),fill_blocks.size(),zlevel,dst); allBlocks.insert(allBlocks.end(),fill_blocks.begin(),fill_blocks.end()); }
         if(np||nl||nr||nb) w_framing += FRAME;
-        // --- ROOT: token stream (region + block ids) ---
-        std::vector<uint8_t> rootb;
-        if(usePriorRoot) rootb=root_slices.programs[t];
-        else for(size_t i=0;i<tn;++i) put_varint(rootb,tk[i]);
-        w_root += zstd_size(z,rootb.data(),rootb.size(),zlevel,dst); w_framing += FRAME; allRoots.insert(allRoots.end(),rootb.begin(),rootb.end());
+        // --- ROOT: token stream (region + block ids), already exposed to the F missing pass above ---
+        if(!useKeyMap){w_root+=zstd_size(z,rootb.data(),rootb.size(),zlevel,dst);w_framing+=FRAME;allRoots.insert(allRoots.end(),rootb.begin(),rootb.end());}
 
         enc_s += std::chrono::duration<double>(Clock::now()-_te).count(); auto _td=Clock::now();
         // --- DECODER (F): install FILL from wire into F's OWN store, then expand ROOT tokens ---
@@ -848,17 +959,18 @@ int main(int argc,char**argv){
             const uint8_t*cp=recovered[0].data(),*ce=cp+recovered[0].size();const uint8_t*lp=recovered[1].data(),*le=lp+recovered[1].size();
             uint64_t regionCount=get_varint(cp);if(regionCount!=nr||regionCount!=missReg.size()){fprintf(stderr,"mixed Region count differs\n");return 2;}
             for(uint64_t k=0;k<regionCount;++k){
-              uint32_t regionId=uint32_t(FmixedRegionOff.size()-1);if(regionId!=missReg[k]){fprintf(stderr,"mixed Region identity differs\n");return 2;}
+              uint32_t regionId=missReg[k];if(regionId>=FmixedRegions.size()||FmixedRegions[regionId].known){fprintf(stderr,"mixed Region identity differs\n");return 2;}
               uint64_t rawLength=get_varint(cp);size_t begin=FmixedRegionData.size();
               while(FmixedRegionData.size()-begin<rawLength){
                 if(cp>=ce){fprintf(stderr,"truncated mixed Region control\n");return 2;}uint8_t op=*cp++;
                 if(op==0){uint64_t length=get_varint(cp);if(length>uint64_t(le-lp)){fprintf(stderr,"truncated mixed literal\n");return 2;}FmixedRegionData.insert(FmixedRegionData.end(),lp,lp+length);lp+=length;}
                 else if(op==1){int64_t source=int64_t(regionId)+get_zigzag(cp);uint64_t offset=get_varint(cp),length=get_varint(cp);
-                  if(source<0||uint64_t(source+1)>=FmixedRegionOff.size()||offset+length>FmixedRegionOff[source+1]-FmixedRegionOff[source]){fprintf(stderr,"bad mixed publish view\n");return 2;}
-                  size_t sourceBegin=FmixedRegionOff[source]+offset,destination=FmixedRegionData.size();FmixedRegionData.resize(destination+length);memcpy(FmixedRegionData.data()+destination,FmixedRegionData.data()+sourceBegin,length);
+                  if(source<0||uint64_t(source)>=FmixedRegions.size()||!FmixedRegions[source].known||offset+length>FmixedRegions[source].length){fprintf(stderr,"bad mixed publish view\n");return 2;}
+                  size_t sourceBegin=FmixedRegions[source].offset+offset,destination=FmixedRegionData.size();FmixedRegionData.resize(destination+length);memcpy(FmixedRegionData.data()+destination,FmixedRegionData.data()+sourceBegin,length);
                   FmixedPublic.push_back({uint32_t(source),uint32_t(offset),uint32_t(length)});
                 } else if(op==2){uint64_t publicId=get_varint(cp);if(!publicId||publicId>=FmixedPublic.size()){fprintf(stderr,"bad mixed public ref\n");return 2;}
-                  const MixedFLineView&view=FmixedPublic[publicId];size_t sourceBegin=FmixedRegionOff[view.source_region]+view.source_offset,destination=FmixedRegionData.size();
+                  const MixedFLineView&view=FmixedPublic[publicId];if(!FmixedRegions[view.source_region].known){fprintf(stderr,"bad mixed public source\n");return 2;}
+                  size_t sourceBegin=FmixedRegions[view.source_region].offset+view.source_offset,destination=FmixedRegionData.size();
                   FmixedRegionData.resize(destination+view.length);memcpy(FmixedRegionData.data()+destination,FmixedRegionData.data()+sourceBegin,view.length);
                 } else if(op==3){if(arraysUsed>=arrayCount){fprintf(stderr,"missing mixed array record\n");return 2;}uint64_t styleId=get_varint(ap),count=get_varint(ap);
                   if(styleId>=mixedStyles.size()||count>uint64_t(ve-vp)){fprintf(stderr,"bad mixed array record\n");return 2;}
@@ -878,7 +990,7 @@ int main(int argc,char**argv){
                 if(FmixedRegionData.size()-begin>rawLength){fprintf(stderr,"mixed Region overrun\n");return 2;}
               }
               if(rawLength!=dict.region_raw_len(regionId)||memcmp(FmixedRegionData.data()+begin,dict.region_data(regionId),rawLength)){fprintf(stderr,"mixed Region differs\n");return 2;}
-              FmixedRegionOff.push_back(FmixedRegionData.size());
+              FmixedRegions[regionId]={begin,uint32_t(rawLength),true};
             }
             if(cp!=ce||lp!=le||ap!=ae||vp!=ve||arraysUsed!=arrayCount||FmixedPublic.size()!=nextMixedPublic){fprintf(stderr,"mixed Region streams have trailing bytes or state differs\n");return 2;}
           } else if(nr||!recovered[1].empty()){fprintf(stderr,"partial mixed Region streams\n");return 2;}
@@ -941,15 +1053,20 @@ int main(int argc,char**argv){
           else { const uint8_t* pp=fill_regions.data(), *pe=fill_regions.data()+fill_regions.size();
             while(pp<pe){ uint64_t c=get_varint(pp); int64_t prev=0; for(uint64_t j=0;j<c;++j){ prev+=get_zigzag(pp); Freg_child.push_back(uint32_t(prev)); } Freg_off.push_back(Freg_child.size()); } }
         }
-        { const uint8_t* pp=fill_blocks.data(), *pe=fill_blocks.data()+fill_blocks.size();
-          while(pp<pe){ uint8_t kind=*pp++;
+        { const uint8_t* pp=fill_blocks.data(), *pe=fill_blocks.data()+fill_blocks.size();size_t decodedBlocks=0;
+          while(pp<pe){if(decodedBlocks>=missBlk.size()){fprintf(stderr,"decoded too many Blocks\n");return 2;}uint32_t blockId=missBlk[decodedBlocks++];
+            if(blockId+1!=Fblk_off.size()||FknownBlk[blockId]){fprintf(stderr,"non-sequential or duplicate Block definition\n");return 2;}uint8_t kind=*pp++;
             if(kind==1){ uint64_t src=get_varint(pp); uint64_t L=get_varint(pp); for(uint64_t j=0;j<L;++j) Fblk_child.push_back(Freg_stream[src+j]); Fblk_off.push_back(Fblk_child.size()); }
-            else { uint64_t L=get_varint(pp); for(uint64_t j=0;j<L;++j) Fblk_child.push_back(uint32_t(get_varint(pp))); Fblk_off.push_back(Fblk_child.size()); } } }
+            else { uint64_t L=get_varint(pp); for(uint64_t j=0;j<L;++j) Fblk_child.push_back(uint32_t(get_varint(pp))); Fblk_off.push_back(Fblk_child.size()); }
+            FknownBlk[blockId]=1;
+          }
+          if(decodedBlocks!=missBlk.size()){fprintf(stderr,"decoded too few Blocks\n");return 2;}
+        }
         recon.clear();
         auto emitRegionF=[&](uint32_t r){ Freg_stream.push_back(r);
-          if(useMixedRegions)recon.insert(recon.end(),FmixedRegionData.begin()+FmixedRegionOff[r],FmixedRegionData.begin()+FmixedRegionOff[r+1]);
+          if(useMixedRegions){if(r>=FmixedRegions.size()||!FmixedRegions[r].known){fprintf(stderr,"unknown mixed Root Region\n");exit(2);}const MixedFRegionView&view=FmixedRegions[r];recon.insert(recon.end(),FmixedRegionData.begin()+view.offset,FmixedRegionData.begin()+view.offset+view.length);}
           else for(size_t j=Freg_off[r];j<Freg_off[r+1];++j){ uint32_t ln=Freg_child[j]; recon.insert(recon.end(), Fline_data.begin()+Fline_off[ln-1], Fline_data.begin()+Fline_off[ln]); } };
-        { const uint8_t* pp=rootb.data(), *pe=rootb.data()+rootb.size();
+        { const std::vector<uint8_t>&decodedRoot=useKeyMap?Frootb:rootb;const uint8_t* pp=decodedRoot.data(), *pe=decodedRoot.data()+decodedRoot.size();
           if(usePriorRoot){
             uint64_t expected=get_varint(pp), produced=0;
             while(pp<pe && produced<expected){ uint8_t op=*pp++;
@@ -980,6 +1097,7 @@ int main(int argc,char**argv){
     }
     while(ck.size()<ck_f.size()) ck.push_back({ck_f[ck.size()], double(cum_raw)/cum_wire});
     ZSTD_freeCCtx(z);
+    ZSTD_freeDCtx(messageD);
     if(sourceCostZ)ZSTD_freeCCtx(sourceCostZ);
     if(useSortedLines) for(size_t i=0;i<linePartCount;++i){ ZSTD_freeCCtx(lineZC[i]); ZSTD_freeDCtx(lineZD[i]); }
     if(useMixedRegions) for(size_t i=0;i<mixedPartCount;++i){ ZSTD_freeCCtx(mixedZC[i]); ZSTD_freeDCtx(mixedZD[i]); }
@@ -1002,6 +1120,9 @@ int main(int argc,char**argv){
         mixedPartWire[0],mixedPartWire[1],mixedPartWire[2],mixedPartWire[3],mixedPartWire[4],mixedPartWire[5],mixedSelectorWire,
         (unsigned long long)mixedLiteralRaw,(unsigned long long)mixedArrayValues,(unsigned long long)mixedSourceBytes,(unsigned long long)mixedSourcePackageRaw,(unsigned long long)mixedSourcePackageFiles,nextMixedPublic-1,
         (unsigned long long)mixedOps[0],(unsigned long long)mixedOps[1],(unsigned long long)mixedOps[2],(unsigned long long)mixedOps[3],(unsigned long long)mixedOps[4],(unsigned long long)mixedOps[5],(unsigned long long)mixedOps[6]);
+    if(useKeyMap)printf("key map: half_cold_bit=%d preloaded_regions=%llu preloaded_raw_bytes=%llu associated_regions=%llu association_wire=%.0f missing_reply_wire=%.0f\n",
+        halfColdBit,(unsigned long long)preloadedRegionCount,(unsigned long long)preloadedRegionBytes,
+        (unsigned long long)associatedRegionCount,mixedAssociationWire,mixedMissingRequestWire);
     if(useProjectSource)printf("source admission: ratio=%u considered=%llu admitted=%llu observed_potential_raw=%llu estimated_independent_package_wire=%llu\n",
         sourceAdmitRatio,(unsigned long long)mixedSourceConsidered,(unsigned long long)mixedSourceAdmitted,(unsigned long long)mixedSourcePotentialRaw,(unsigned long long)mixedSourceEstimatedCost);
     if(!useSortedLines&&!useMixedRegions){ ZSTD_CCtx* z2=ZSTD_createCCtx(); std::vector<uint8_t> d2b;
