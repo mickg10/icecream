@@ -64,16 +64,26 @@ static double elapsed(Clock::time_point begin) {
 int main(int argc, char **argv) {
   const char *input_path = nullptr;
   const char *lengths_path = nullptr;
+  bool transpose_translations = false;
+  bool patch_translations = false;
   for (int index = 1; index < argc; ++index) {
     if (!std::strcmp(argv[index], "--input") && index + 1 < argc)
       input_path = argv[++index];
     else if (!std::strcmp(argv[index], "--lengths") && index + 1 < argc)
       lengths_path = argv[++index];
+    else if (!std::strcmp(argv[index], "--transpose-translations"))
+      transpose_translations = true;
+    else if (!std::strcmp(argv[index], "--patch-translations"))
+      patch_translations = true;
     else
-      fail("usage: mo_factor_bench --input FILE --lengths FILE");
+      fail("usage: mo_factor_bench --input FILE --lengths FILE "
+           "[--transpose-translations|--patch-translations]");
   }
   if (!input_path || !lengths_path)
-    fail("usage: mo_factor_bench --input FILE --lengths FILE");
+    fail("usage: mo_factor_bench --input FILE --lengths FILE "
+         "[--transpose-translations|--patch-translations]");
+  if (transpose_translations && patch_translations)
+    fail("translation layouts are mutually exclusive");
 
   std::ifstream input_file(input_path, std::ios::binary),
       lengths_file(lengths_path, std::ios::binary);
@@ -101,19 +111,23 @@ int main(int argc, char **argv) {
   mo_factor::EncoderState encoder;
   mo_factor::Encoded encoded;
   const auto transform_begin = Clock::now();
-  if (!encoder.encode(members, encoded))
+  if (!encoder.encode(members, encoded, transpose_translations,
+                      patch_translations))
     fail("MO factor encode");
   const double transform_seconds = elapsed(transform_begin);
   std::printf(
       "members=%zu input=%zu mo_members=%u mo_bytes=%llu new_originals=%zu "
       "control_raw=%zu definitions_raw=%zu translations_raw=%zu "
       "ordinary_raw=%zu "
-      "transform_s=%.6f\n",
+      "transform_s=%.6f layout=%s\n",
       members.size(), input.size(), encoded.mo_members,
       static_cast<unsigned long long>(encoded.mo_bytes),
       encoded.pending_definitions.size(), encoded.control.size(),
       encoded.definitions.size(), encoded.translations.size(),
-      encoded.ordinary.size(), transform_seconds);
+      encoded.ordinary.size(), transform_seconds,
+      transpose_translations ? "transpose"
+                             : (patch_translations ? "original-patch"
+                                                   : "plain"));
   std::vector<uint8_t> material = encoded.definitions;
   material.insert(material.end(), encoded.translations.begin(),
                   encoded.translations.end());
@@ -163,12 +177,14 @@ int main(int argc, char **argv) {
     auto trailing_control = control_raw;
     trailing_control.push_back(0);
     if (decoder.decode(trailing_control, definitions_raw, translations_raw,
-                       ordinary_raw, recovered, recovered_lengths) ||
+                       ordinary_raw, recovered, recovered_lengths,
+                       transpose_translations, patch_translations) ||
         decoder.size() || decoder.string_bytes())
       fail("failed frame changed decoder state");
     const bool decoded =
         decoder.decode(control_raw, definitions_raw, translations_raw,
-                       ordinary_raw, recovered, recovered_lengths);
+                       ordinary_raw, recovered, recovered_lengths,
+                       transpose_translations, patch_translations);
     const double decode_seconds = elapsed(decode_begin);
     const bool exact =
         decoded && recovered == input && recovered_lengths == expected_lengths;

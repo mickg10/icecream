@@ -36,6 +36,15 @@ inline void put_varint(std::vector<uint8_t> &output, uint64_t value) {
   output.push_back(uint8_t(value));
 }
 
+inline size_t varint_size(uint64_t value) {
+  size_t size = 1;
+  while (value >= 0x80) {
+    value >>= 7;
+    ++size;
+  }
+  return size;
+}
+
 inline bool get_varint(const uint8_t *&cursor, const uint8_t *end,
                        uint64_t &value) {
   value = 0;
@@ -152,13 +161,27 @@ public:
   uint32_t size() const { return next_id_; }
   uint64_t string_bytes() const { return string_bytes_; }
 
-  bool encode(const std::vector<Slice> &members, Encoded &output) const {
+  bool encode(const std::vector<Slice> &members, Encoded &output,
+              bool transpose_translations = false,
+              bool patch_translations = false) const {
+    if ((transpose_translations && patch_translations) ||
+        members.size() > UINT32_MAX)
+      return false;
     output = Encoded{};
     put_varint(output.control, members.size());
     std::unordered_map<std::string, uint32_t> pending_ids;
     pending_ids.reserve(4096);
+    struct PendingTranslation {
+      uint32_t original_id;
+      uint32_t member_index;
+      uint32_t entry_index;
+      Slice value;
+    };
+    std::vector<PendingTranslation> pending_translations;
     Parsed parsed;
-    for (const auto &member : members) {
+    for (size_t member_index = 0; member_index < members.size();
+         ++member_index) {
+      const auto &member = members[member_index];
       if (!parse_canonical(member.data, member.size, parsed)) {
         output.control.push_back(0);
         put_varint(output.control, member.size);
@@ -168,6 +191,9 @@ public:
       }
       output.control.push_back(1);
       put_varint(output.control, parsed.originals.size());
+      std::vector<uint32_t> original_ids;
+      if (transpose_translations)
+        original_ids.reserve(parsed.originals.size());
       for (const auto &original : parsed.originals) {
         std::string key(reinterpret_cast<const char *>(original.data),
                         original.size);
@@ -189,14 +215,71 @@ public:
           }
         }
         put_varint(output.control, id);
+        if (transpose_translations)
+          original_ids.push_back(id);
       }
-      for (const auto &translation : parsed.translations) {
-        put_varint(output.translations, translation.size);
-        output.translations.insert(output.translations.end(), translation.data,
-                                   translation.data + translation.size);
+      for (size_t entry_index = 0; entry_index < parsed.translations.size();
+           ++entry_index) {
+        const auto &translation = parsed.translations[entry_index];
+        if (transpose_translations) {
+          pending_translations.push_back(
+              {original_ids[entry_index], uint32_t(member_index),
+               uint32_t(entry_index), translation});
+        } else if (patch_translations) {
+          const auto &original = parsed.originals[entry_index];
+          uint32_t prefix = 0;
+          const uint32_t shared = std::min(original.size, translation.size);
+          while (prefix < shared &&
+                 original.data[prefix] == translation.data[prefix])
+            ++prefix;
+          uint32_t suffix = 0;
+          while (suffix < shared - prefix &&
+                 original.data[original.size - 1 - suffix] ==
+                     translation.data[translation.size - 1 - suffix])
+            ++suffix;
+          const uint32_t middle = translation.size - prefix - suffix;
+          const size_t raw_cost =
+              varint_size(uint64_t(translation.size) << 1) + translation.size;
+          const size_t patch_cost =
+              varint_size((uint64_t(middle) << 1) | 1) +
+              varint_size(prefix) + varint_size(suffix) + middle;
+          if (patch_cost < raw_cost) {
+            put_varint(output.translations, (uint64_t(middle) << 1) | 1);
+            put_varint(output.translations, prefix);
+            put_varint(output.translations, suffix);
+            output.translations.insert(
+                output.translations.end(), translation.data + prefix,
+                translation.data + prefix + middle);
+          } else {
+            put_varint(output.translations, uint64_t(translation.size) << 1);
+            output.translations.insert(output.translations.end(),
+                                       translation.data,
+                                       translation.data + translation.size);
+          }
+        } else {
+          put_varint(output.translations, translation.size);
+          output.translations.insert(output.translations.end(), translation.data,
+                                     translation.data + translation.size);
+        }
       }
       ++output.mo_members;
       output.mo_bytes += member.size;
+    }
+    if (transpose_translations) {
+      std::sort(pending_translations.begin(), pending_translations.end(),
+                [](const PendingTranslation &left,
+                   const PendingTranslation &right) {
+                  if (left.original_id != right.original_id)
+                    return left.original_id < right.original_id;
+                  if (left.member_index != right.member_index)
+                    return left.member_index < right.member_index;
+                  return left.entry_index < right.entry_index;
+                });
+      for (const auto &entry : pending_translations) {
+        put_varint(output.translations, entry.value.size);
+        output.translations.insert(output.translations.end(), entry.value.data,
+                                   entry.value.data + entry.value.size);
+      }
     }
     put_varint(output.definitions, output.pending_definitions.size());
     for (const auto &value : output.pending_definitions) {
@@ -236,8 +319,14 @@ public:
               const std::vector<uint8_t> &definitions,
               const std::vector<uint8_t> &translations,
               const std::vector<uint8_t> &ordinary,
-              std::vector<uint8_t> &output, std::vector<uint32_t> &lengths) {
-    const uint8_t *definition = definitions.data();
+              std::vector<uint8_t> &output, std::vector<uint32_t> &lengths,
+              bool transpose_translations = false,
+              bool patch_translations = false) {
+    if (transpose_translations && patch_translations)
+      return false;
+    static const uint8_t empty = 0;
+    const uint8_t *definition =
+        definitions.empty() ? &empty : definitions.data();
     const uint8_t *definition_end = definition + definitions.size();
     uint64_t new_count = 0;
     if (!get_varint(definition, definition_end, new_count) ||
@@ -258,12 +347,16 @@ public:
     }
     if (definition != definition_end)
       return false;
+    if (transpose_translations)
+      return decode_transposed(control, translations, ordinary, pending_values,
+                               pending_string_bytes, output, lengths);
 
-    const uint8_t *command = control.data();
+    const uint8_t *command = control.empty() ? &empty : control.data();
     const uint8_t *command_end = command + control.size();
-    const uint8_t *translated = translations.data();
+    const uint8_t *translated =
+        translations.empty() ? &empty : translations.data();
     const uint8_t *translated_end = translated + translations.size();
-    const uint8_t *raw = ordinary.data();
+    const uint8_t *raw = ordinary.empty() ? &empty : ordinary.data();
     const uint8_t *raw_end = raw + ordinary.size();
     uint64_t member_count = 0;
     if (!get_varint(command, command_end, member_count) ||
@@ -309,13 +402,49 @@ public:
         originals.push_back({reinterpret_cast<const uint8_t *>(value.data()),
                              uint32_t(value.size())});
       }
+      std::vector<std::vector<uint8_t>> patched_values;
+      if (patch_translations)
+        patched_values.resize(size_t(count));
       for (uint64_t index = 0; index < count; ++index) {
-        uint64_t size = 0;
-        if (!get_varint(translated, translated_end, size) ||
-            size > uint64_t(translated_end - translated) || size > UINT32_MAX)
+        uint64_t descriptor = 0;
+        if (!get_varint(translated, translated_end, descriptor))
           return false;
-        translated_values.push_back({translated, uint32_t(size)});
-        translated += size;
+        if (!patch_translations) {
+          if (descriptor > uint64_t(translated_end - translated) ||
+              descriptor > UINT32_MAX)
+            return false;
+          translated_values.push_back({translated, uint32_t(descriptor)});
+          translated += descriptor;
+          continue;
+        }
+        const uint64_t middle = descriptor >> 1;
+        if (middle > uint64_t(translated_end - translated) ||
+            middle > UINT32_MAX)
+          return false;
+        if (!(descriptor & 1)) {
+          translated_values.push_back({translated, uint32_t(middle)});
+          translated += middle;
+          continue;
+        }
+        uint64_t prefix = 0, suffix = 0;
+        const uint64_t original_size = originals[size_t(index)].size;
+        if (!get_varint(translated, translated_end, prefix) ||
+            !get_varint(translated, translated_end, suffix) ||
+            prefix > original_size || suffix > original_size - prefix ||
+            middle > uint64_t(translated_end - translated) ||
+            prefix > UINT32_MAX - middle ||
+            suffix > UINT32_MAX - prefix - middle)
+          return false;
+        auto &value = patched_values[size_t(index)];
+        const auto &original = originals[size_t(index)];
+        value.reserve(size_t(prefix + middle + suffix));
+        value.insert(value.end(), original.data, original.data + prefix);
+        value.insert(value.end(), translated, translated + middle);
+        value.insert(value.end(), original.data + original.size - suffix,
+                     original.data + original.size);
+        translated += middle;
+        translated_values.push_back(
+            {value.empty() ? &empty : value.data(), uint32_t(value.size())});
       }
       if (!build(originals, translated_values, member) ||
           member.size() > UINT32_MAX)
@@ -334,6 +463,126 @@ public:
   }
 
 private:
+  bool decode_transposed(const std::vector<uint8_t> &control,
+                         const std::vector<uint8_t> &translations,
+                         const std::vector<uint8_t> &ordinary,
+                         std::vector<std::string> &pending_values,
+                         uint64_t pending_string_bytes,
+                         std::vector<uint8_t> &output,
+                         std::vector<uint32_t> &lengths) {
+    struct MemberPlan {
+      bool canonical = false;
+      Slice ordinary{};
+      std::vector<Slice> originals;
+      std::vector<Slice> translated_values;
+    };
+    struct TranslationSlot {
+      uint32_t original_id;
+      uint32_t member_index;
+      uint32_t entry_index;
+    };
+
+    static const uint8_t empty = 0;
+    const uint8_t *command = control.empty() ? &empty : control.data();
+    const uint8_t *command_end = command + control.size();
+    const uint8_t *raw = ordinary.empty() ? &empty : ordinary.data();
+    const uint8_t *raw_end = raw + ordinary.size();
+    uint64_t member_count = 0;
+    if (!get_varint(command, command_end, member_count) ||
+        member_count > UINT32_MAX)
+      return false;
+    std::vector<MemberPlan> plans(static_cast<size_t>(member_count));
+    std::vector<TranslationSlot> slots;
+    for (size_t member_index = 0; member_index < member_count;
+         ++member_index) {
+      if (command == command_end)
+        return false;
+      const uint8_t mode = *command++;
+      auto &plan = plans[member_index];
+      if (!mode) {
+        uint64_t size = 0;
+        if (!get_varint(command, command_end, size) ||
+            size > uint64_t(raw_end - raw) || size > UINT32_MAX)
+          return false;
+        plan.ordinary = {raw, uint32_t(size)};
+        raw += size;
+        continue;
+      }
+      if (mode != 1)
+        return false;
+      uint64_t count = 0;
+      if (!get_varint(command, command_end, count) || count > UINT32_MAX ||
+          count > SIZE_MAX - slots.size())
+        return false;
+      plan.canonical = true;
+      plan.originals.reserve(size_t(count));
+      plan.translated_values.resize(size_t(count));
+      for (size_t entry_index = 0; entry_index < count; ++entry_index) {
+        uint64_t id = 0;
+        if (!get_varint(command, command_end, id) ||
+            id >= uint64_t(values_.size()) + pending_values.size())
+          return false;
+        const auto &value = id < values_.size()
+                                ? values_[size_t(id)]
+                                : pending_values[size_t(id - values_.size())];
+        plan.originals.push_back(
+            {reinterpret_cast<const uint8_t *>(value.data()),
+             uint32_t(value.size())});
+        slots.push_back(
+            {uint32_t(id), uint32_t(member_index), uint32_t(entry_index)});
+      }
+    }
+    if (command != command_end || raw != raw_end)
+      return false;
+
+    std::sort(slots.begin(), slots.end(),
+              [](const TranslationSlot &left, const TranslationSlot &right) {
+                if (left.original_id != right.original_id)
+                  return left.original_id < right.original_id;
+                if (left.member_index != right.member_index)
+                  return left.member_index < right.member_index;
+                return left.entry_index < right.entry_index;
+              });
+    const uint8_t *translated =
+        translations.empty() ? &empty : translations.data();
+    const uint8_t *translated_end = translated + translations.size();
+    for (const auto &slot : slots) {
+      uint64_t size = 0;
+      if (!get_varint(translated, translated_end, size) ||
+          size > uint64_t(translated_end - translated) || size > UINT32_MAX)
+        return false;
+      plans[slot.member_index].translated_values[slot.entry_index] =
+          {translated, uint32_t(size)};
+      translated += size;
+    }
+    if (translated != translated_end)
+      return false;
+
+    output.clear();
+    lengths.clear();
+    lengths.reserve(plans.size());
+    std::vector<uint8_t> member;
+    for (const auto &plan : plans) {
+      if (!plan.canonical) {
+        output.insert(output.end(), plan.ordinary.data,
+                      plan.ordinary.data + plan.ordinary.size);
+        lengths.push_back(plan.ordinary.size);
+        continue;
+      }
+      if (!build(plan.originals, plan.translated_values, member) ||
+          member.size() > UINT32_MAX)
+        return false;
+      output.insert(output.end(), member.begin(), member.end());
+      lengths.push_back(uint32_t(member.size()));
+    }
+
+    values_.reserve(values_.size() + pending_values.size());
+    for (auto &value : pending_values)
+      values_.push_back(std::move(value));
+    string_bytes_ += pending_string_bytes;
+    return true;
+  }
+
   std::vector<std::string> values_;
   uint64_t string_bytes_ = 0;
 };
