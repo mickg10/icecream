@@ -145,20 +145,68 @@ ttuser@tt-quietbox2:
 /home/ttuser/grouprlz/retained/grz2g-local-freeze-20260817T2325Z
 ```
 
+## TU100/TU200 transfer and lookahead
+
+Checkpoint accounting uses two deliberately separate quantities:
+
+- `physically_emitted_at_N` is the stream header plus frames whose source groups have
+  already closed when exactly N TUs have arrived. It can cover fewer than N TUs and is
+  therefore not used to claim the transfer gate.
+- `charged_W` is the stream header plus every group containing any of the first N TUs.
+  The whole group frame is charged to its first TU. This is the conservative transfer
+  required to reconstruct the first N TUs; its future-TU and raw-byte wait are reported.
+
+The 36-byte final END frame is not charged at an intermediate checkpoint. Every
+`charged_W` cut ends exactly after a complete GROUP frame and contains no END frame.
+
+Fresh references were generated with zstd CLI 1.4.8 using `-6 --long=31 -T0` over the
+exact concatenation of the first N TUs. No old prefix reference was reused.
+
+| Corpus | N | Raw at N | Physically emitted | Physical material through | Charged W | Material available through | Lookahead | Raw lookahead | zstd-6 long | W/z6 | Result |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|
+| RocksDB | 100 | 669,183,165 | 1,762,650 | TU82 | 2,794,136 | TU166 | 66 TU | 396,769,368 | 3,644,530 | 0.7667 | PASS |
+| RocksDB | 200 | 1,224,557,334 | 2,794,136 | TU166 | 3,263,577 | TU271 | 71 TU | 374,311,726 | 5,099,578 | 0.6400 | PASS |
+| Abseil | 100 | 284,336,916 | 72 | TU0 | 1,049,411 | TU112 | 12 TU | 33,736,287 | 1,572,322 | 0.6674 | PASS |
+| Abseil | 200 | 548,396,320 | 1,049,411 | TU112 | 1,414,663 | TU224 | 24 TU | 74,831,446 | 2,220,670 | 0.6370 | PASS |
+
+`verify_g2_checkpoints.py` independently validates the curve against the binary TU map
+and physical container, creates each cut, runs `decprefix`, and compares the decoded
+bytes with the exact raw prefix through the reported material boundary. All four cuts
+replayed exactly. The same END-less cuts were also passed to strict `dec`; all four were
+correctly rejected with `full decode requires END_FRAME`.
+
+Machine-readable artifacts:
+
+- `g2-fixed112-checkpoints.tsv`: the four checkpoint rows, hashes, and exactness results;
+- `g2-fixed112-group-charges.tsv`: every group's first-TU charge, completion boundary,
+  ADD size, raw size, retained-history extent, and close reason;
+- `verify_g2_checkpoints.py`: the independent cut/replay verifier.
+
+Retained zstd frames, zstd timing/hashes, exact cut containers, decode logs, and generated
+ledgers are under:
+
+```text
+ttuser@tt-quietbox2:
+/home/ttuser/grouprlz/retained/grz2g-local-freeze-20260817T2325Z/checkpoints-v1
+```
+
+The standalone prefix-decoder wall rates are not endpoint-rate measurements. Each test
+starts a fresh process and allocates a new 2-GiB ring to decode only one or two groups;
+the live design retains the F store across group arrivals. Full-build one-worker F rates
+remain the endpoint gate recorded above.
+
 ## What this proves and what remains
 
 This closes the two-corpus bounded-policy existence question at the requested maximum
-112-TU lookahead. It also closes exact frame replay, suffix-independent prefix framing,
-rollback, ring wrap, digest closure, deterministic output, size, and endpoint rates for
-these two development corpora.
+112-TU group cap. It also closes exact frame replay, suffix-independent prefix framing,
+rollback, ring wrap, digest closure, deterministic output, cold size, endpoint rates, and
+TU100/TU200 transfer accounting for these two development corpora.
 
 It does not yet finish Issue #16. The remaining acceptance work is:
 
-1. derive and publish TU100/TU200 cumulative-transfer rows from exact group charge points,
-   with both TU and raw-byte lookahead stated;
-2. run the frozen policy over the fixed 16, then the available broader corpus set;
-3. compare bounded GRZ2 with P29+BSC under a chronological selector, while keeping the
+1. run the frozen policy over the fixed 16, then the available broader corpus set;
+2. compare bounded GRZ2 with P29+BSC under a chronological selector, while keeping the
    complete-program minimum labelled only as a ceiling;
-4. add the eventual live-input adapter and a maximum group wait before product use. The
+3. add the eventual live-input adapter and a maximum group wait before product use. The
    current capability codec maps the input file and models group chronology, but it is not
    itself the compiler-pipe implementation.
