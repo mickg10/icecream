@@ -45,6 +45,8 @@
 
 using Clock = std::chrono::steady_clock;
 static double secs(Clock::time_point b){ return std::chrono::duration<double>(Clock::now()-b).count(); }
+struct CodecStageCounter { double seconds=0; uint64_t input_bytes=0,output_bytes=0,calls=0; };
+static CodecStageCounter profileZstdEncode,profileZstdDecode;
 static inline uint64_t mix64(uint64_t x){ x^=x>>30; x*=0xbf58476d1ce4e5b9ULL; x^=x>>27; x*=0x94d049bb133111ebULL; return x^(x>>31); }
 static inline uint64_t fold128(uint64_t a,uint64_t b){ __uint128_t p=__uint128_t(a)*b; return uint64_t(p)^uint64_t(p>>64); }
 static inline uint64_t read64(const char*p){ uint64_t v; memcpy(&v,p,8); return v; }
@@ -158,8 +160,9 @@ static inline uint64_t get_u64le(const uint8_t*&p,const uint8_t*end){
 static inline void put_zigzag(std::vector<uint8_t>&o,int64_t v){ put_varint(o,(uint64_t(v)<<1)^uint64_t(v>>63)); }
 static inline int64_t get_zigzag(const uint8_t*&p){ uint64_t u=get_varint(p); return int64_t(u>>1)^-int64_t(u&1); }
 static inline size_t varint_size(uint64_t v){ size_t n=1; while(v>=0x80){++n;v>>=7;} return n; }
-static size_t zstd_size(ZSTD_CCtx*c,const uint8_t*data,size_t n,int level,std::vector<uint8_t>&dst){ ZSTD_CCtx_reset(c,ZSTD_reset_session_and_parameters); ZSTD_CCtx_setParameter(c,ZSTD_c_compressionLevel,level);
-    size_t bound=ZSTD_compressBound(n); if(dst.size()<bound)dst.resize(bound); size_t r=ZSTD_compress2(c,dst.data(),dst.size(),data?data:(const uint8_t*)"",n); if(ZSTD_isError(r)){fprintf(stderr,"zstd %s\n",ZSTD_getErrorName(r));exit(2);} return r; }
+static size_t zstd_size(ZSTD_CCtx*c,const uint8_t*data,size_t n,int level,std::vector<uint8_t>&dst){auto started=Clock::now(); ZSTD_CCtx_reset(c,ZSTD_reset_session_and_parameters); ZSTD_CCtx_setParameter(c,ZSTD_c_compressionLevel,level);
+    size_t bound=ZSTD_compressBound(n); if(dst.size()<bound)dst.resize(bound); size_t r=ZSTD_compress2(c,dst.data(),dst.size(),data?data:(const uint8_t*)"",n); if(ZSTD_isError(r)){fprintf(stderr,"zstd %s\n",ZSTD_getErrorName(r));exit(2);}
+    profileZstdEncode.seconds+=secs(started);profileZstdEncode.input_bytes+=n;profileZstdEncode.output_bytes+=r;++profileZstdEncode.calls;return r; }
 static size_t zstd_frame_encode(ZSTD_CCtx*c,const std::vector<uint8_t>&raw,int level,std::vector<uint8_t>&encoded){
     size_t size=zstd_size(c,raw.data(),raw.size(),level,encoded);encoded.resize(size);return size;
 }
@@ -167,14 +170,16 @@ static size_t zstd_message_roundtrip(ZSTD_CCtx*c,ZSTD_DCtx*d,const std::vector<u
                                      std::vector<uint8_t>&encoded,std::vector<uint8_t>&decoded){
     size_t encodedSize=zstd_size(c,raw.data(),raw.size(),level,encoded);decoded.resize(raw.size());uint8_t empty=0;
     void*out=decoded.empty()?static_cast<void*>(&empty):static_cast<void*>(decoded.data());
-    size_t got=ZSTD_decompressDCtx(d,out,decoded.size(),encoded.data(),encodedSize);
+    auto started=Clock::now();size_t got=ZSTD_decompressDCtx(d,out,decoded.size(),encoded.data(),encodedSize);
     if(ZSTD_isError(got)||got!=raw.size()||decoded!=raw){fprintf(stderr,"message roundtrip differs: %s\n",ZSTD_isError(got)?ZSTD_getErrorName(got):"size/content");exit(2);}
+    profileZstdDecode.seconds+=secs(started);profileZstdDecode.input_bytes+=encodedSize;profileZstdDecode.output_bytes+=got;++profileZstdDecode.calls;
     return encodedSize;
 }
 
 static size_t zstd_ldm_frame_encode(ZSTD_CCtx*c,const std::vector<uint8_t>&raw,int level,
                                     std::vector<uint8_t>&encoded,int workers=0,
                                     int jobSize=0,int overlapLog=0){
+    auto started=Clock::now();
     auto require_zstd=[](size_t result,const char*operation){
         if(ZSTD_isError(result)){fprintf(stderr,"blob zstd %s: %s\n",operation,ZSTD_getErrorName(result));exit(2);}
     };
@@ -193,14 +198,15 @@ static size_t zstd_ldm_frame_encode(ZSTD_CCtx*c,const std::vector<uint8_t>&raw,i
     uint8_t empty=0;const void*source=raw.empty()?static_cast<const void*>(&empty):static_cast<const void*>(raw.data());
     size_t size=ZSTD_compress2(c,encoded.data(),encoded.size(),source,raw.size());
     if(ZSTD_isError(size)){fprintf(stderr,"blob zstd encode %s\n",ZSTD_getErrorName(size));exit(2);}
-    encoded.resize(size);return size;
+    encoded.resize(size);profileZstdEncode.seconds+=secs(started);profileZstdEncode.input_bytes+=raw.size();profileZstdEncode.output_bytes+=size;++profileZstdEncode.calls;return size;
 }
 static std::vector<uint8_t> zstd_frame_decode_exact(ZSTD_DCtx*d,const std::vector<uint8_t>&encoded,
                                                      size_t expected){
     std::vector<uint8_t> raw(expected);uint8_t empty=0;
     void*out=raw.empty()?static_cast<void*>(&empty):static_cast<void*>(raw.data());
-    size_t size=ZSTD_decompressDCtx(d,out,raw.size(),encoded.data(),encoded.size());
+    auto started=Clock::now();size_t size=ZSTD_decompressDCtx(d,out,raw.size(),encoded.data(),encoded.size());
     if(ZSTD_isError(size)||size!=expected){fprintf(stderr,"blob zstd decode %s\n",ZSTD_isError(size)?ZSTD_getErrorName(size):"size differs");exit(2);}
+    profileZstdDecode.seconds+=secs(started);profileZstdDecode.input_bytes+=encoded.size();profileZstdDecode.output_bytes+=size;++profileZstdDecode.calls;
     return raw;
 }
 static std::vector<uint8_t> zstd_frame_decode_sized(ZSTD_DCtx*d,const std::vector<uint8_t>&encoded){
@@ -212,6 +218,7 @@ static std::vector<uint8_t> zstd_frame_decode_sized(ZSTD_DCtx*d,const std::vecto
 
 static std::vector<uint8_t> zstd_stream_encode(ZSTD_CCtx*c,const std::vector<uint8_t>&raw,
                                                 ZSTD_EndDirective directive){
+    auto started=Clock::now();
     ZSTD_inBuffer input{raw.data(),raw.size(),0}; std::vector<uint8_t> encoded;
     std::vector<uint8_t> buffer(ZSTD_CStreamOutSize()); size_t remaining;
     do { ZSTD_outBuffer output{buffer.data(),buffer.size(),0};
@@ -219,10 +226,11 @@ static std::vector<uint8_t> zstd_stream_encode(ZSTD_CCtx*c,const std::vector<uin
         if(ZSTD_isError(remaining)){fprintf(stderr,"zstd stream encode %s\n",ZSTD_getErrorName(remaining));exit(2);}
         encoded.insert(encoded.end(),buffer.begin(),buffer.begin()+output.pos);
     } while(input.pos<input.size || remaining!=0);
-    return encoded;
+    profileZstdEncode.seconds+=secs(started);profileZstdEncode.input_bytes+=raw.size();profileZstdEncode.output_bytes+=encoded.size();++profileZstdEncode.calls;return encoded;
 }
 static std::vector<uint8_t> zstd_stream_decode(ZSTD_DCtx*d,const std::vector<uint8_t>&encoded,
                                                 size_t&remaining){
+    auto started=Clock::now();
     ZSTD_inBuffer input{encoded.data(),encoded.size(),0}; std::vector<uint8_t> raw;
     std::vector<uint8_t> buffer(ZSTD_DStreamOutSize()); remaining=1;
     bool again;
@@ -233,7 +241,7 @@ static std::vector<uint8_t> zstd_stream_decode(ZSTD_DCtx*d,const std::vector<uin
         if(input.pos==before && output.pos==0){ if(input.pos==input.size)break; fprintf(stderr,"zstd stream made no progress\n");exit(2); }
         again=input.pos<input.size || output.pos==output.size;
     } while(again);
-    return raw;
+    profileZstdDecode.seconds+=secs(started);profileZstdDecode.input_bytes+=encoded.size();profileZstdDecode.output_bytes+=raw.size();++profileZstdDecode.calls;return raw;
 }
 
 // P22 ROOT_SLICE capability. Each Root may name an exact contiguous range from a completed
@@ -699,10 +707,12 @@ int main(int argc,char**argv){
     if(useD2){ fprintf(stderr,"note: --d2 requested but definition_codec.h not present; ignoring.\n"); useD2=false; }
 #endif
 
-    auto t0=Clock::now(); Corpus corpus=load_corpus(manifest,max_files); Interner dict;
+    auto t0=Clock::now(); auto tload=Clock::now(); Corpus corpus=load_corpus(manifest,max_files);
+    double load_s=secs(tload); auto tintern=Clock::now(); Interner dict;
     std::vector<uint32_t> allreg; std::vector<size_t> roff; roff.push_back(0);
     { uint32_t maxlen=0; for(auto&f:corpus.files) maxlen=std::max(maxlen,f.len); std::vector<uint32_t> out(size_t(maxlen)+1); uint64_t hits=0; std::vector<uint32_t> rs;
       for(auto&f:corpus.files){ size_t oc=0; rs.clear(); const char*p=corpus.bytes.data()+f.off; dict.process(p,p+f.len,out.data(),oc,hits,true,&rs); allreg.insert(allreg.end(),rs.begin(),rs.end()); roff.push_back(allreg.size()); } }
+    double intern_s=secs(tintern);
     uint32_t NREG=uint32_t(dict.region_count()); size_t TUs=corpus.files.size();
     fprintf(stderr,"loaded+interned %.1fs TUs=%zu raw=%llu regions=%u region_occ=%zu distinct_lines=%u\n",secs(t0),TUs,(unsigned long long)corpus.raw,NREG,allreg.size(),dict.distinct());
 
@@ -721,6 +731,7 @@ int main(int argc,char**argv){
     std::unordered_map<uint64_t,uint32_t> bdict;
     std::vector<uint32_t> tokstream; std::vector<size_t> tokoff; tokoff.push_back(0);
     std::vector<uint32_t> bcopy_src; std::vector<uint8_t> bcopy_ok;   // block k: def as COPY(src,len) if ok (source in prior TUs)
+    double s1_s=0;
     if(useS1){
         size_t NS=allreg.size(); uint32_t MINMATCH=s1MinMatch, MAXCHAIN=s1MaxChain, hbits=22;
         std::vector<uint32_t> head(size_t(1)<<hbits, UINT32_MAX), prevp(NS, UINT32_MAX);
@@ -739,10 +750,13 @@ int main(int argc,char**argv){
                 for(size_t j=i;j<i+step;++j){ if(j+MINMATCH<=NS){ uint64_t g=kgram(j); prevp[j]=head[g]; head[g]=uint32_t(j); } }
                 i+=step; }
             tokoff.push_back(tokstream.size()); }
-        fprintf(stderr,"S1 LZ: %.1fs min_match=%u max_chain=%u tokens=%zu blocks=%zu (%.4f tok/region)\n",secs(tb),MINMATCH,MAXCHAIN,tokstream.size(),boff2.size()-1,double(tokstream.size())/NS);
+        s1_s=secs(tb);
+        fprintf(stderr,"S1 LZ: %.1fs min_match=%u max_chain=%u tokens=%zu blocks=%zu (%.4f tok/region)\n",s1_s,MINMATCH,MAXCHAIN,tokstream.size(),boff2.size()-1,double(tokstream.size())/NS);
     } else { // V1: root = raw region-id sequence
         for(size_t t=0;t<TUs;++t){ for(size_t i=roff[t];i<roff[t+1];++i) tokstream.push_back(allreg[i]); tokoff.push_back(tokstream.size()); }
     }
+    fprintf(stderr,"stage profile (original raw denominator): load %.6fs %.3f GB/s | intern+Regionize %.6fs %.3f GB/s | S1 %.6fs %.3f GB/s\n",
+            load_s,corpus.raw/1e9/load_s,intern_s,corpus.raw/1e9/intern_s,s1_s,s1_s?corpus.raw/1e9/s1_s:0.0);
 
     // ===== ENCODER (C) + DECODER (F): one cold chronological pass, PULL protocol (root -> MISSING -> FILL) =====
     // C tracks F's known sets (single F) so it computes exactly the missing closure. Every wire byte is
@@ -868,7 +882,10 @@ int main(int argc,char**argv){
         w_root=w_linedef=w_regiondef=w_pathdef=w_blockdef=w_missing=w_framing=0; cum_raw=0; cum_wire=0; n_marker=n_literal=0; byteexact=true;
         ck.clear(); ckidx=0; allLineDefs.clear(); allRoots.clear(); allRegions.clear(); allRegionsRaw.clear(); allBlocks.clear(); allPaths.clear(); allMiss.clear();
       }
+      profileZstdEncode={};profileZstdDecode={};
       auto tpass=Clock::now(); double enc_s=0, dec_s=0,fallback_c_s=0;   // split C-encode vs F-decode wall (2-proc per-stream proxy)
+      double conversation_s=0,c_fill_s=0,f_install_s=0,f_emit_s=0,verify_s=0,account_s=0;
+      double c_blob_probe_s=0,c_canonical_s=0,c_mo_s=0,f_canonical_s=0,f_mo_s=0;
       for(size_t t=0; t<TUs; ++t){
         auto _te=Clock::now();
         const uint32_t* tk=&tokstream[tokoff[t]]; size_t tn=tokoff[t+1]-tokoff[t];
@@ -993,6 +1010,7 @@ int main(int argc,char**argv){
           put_varint(missingRaw,missBlk.size());for(uint32_t k:missBlk)put_varint(missingRaw,NREG+k);
           if(!missReg.empty()||!missBlk.empty()){w_missing+=zstd_size(z,missingRaw.data(),missingRaw.size(),zlevel,dst)+FRAME;allMiss.insert(allMiss.end(),missingRaw.begin(),missingRaw.end());}
         }
+        conversation_s+=std::chrono::duration<double>(Clock::now()-_te).count();auto _tc_fill=Clock::now();
         // --- FILL: new paths, new lines, new region defs, new block defs (topological) ---
         std::vector<uint8_t> fill_paths, fill_lines, fill_regions, fill_regions_raw, fill_blocks; uint32_t np=0,nl=0,nr=0,nb=0;
         std::vector<uint32_t> newLineIds;
@@ -1037,7 +1055,7 @@ int main(int argc,char**argv){
                     for(uint32_t j=0;j<count;++j){const LineRef&line=dict.ref(lids[j]);GeneratedByteArray parsed;
                         if(parse_byte_array(dict.line_data(line.off),line.len,parsed,1)){regionLineToProbe[j]=int32_t(regionProbeEntries.size());regionProbeEntries.push_back(std::move(parsed));}
                     }
-                    std::vector<uint8_t>regionInflated;std::vector<CompressedBlob>regionBlobs=find_compressed_blobs(regionProbeEntries,regionInflated);
+                    std::vector<uint8_t>regionInflated;auto blobProbeStarted=Clock::now();std::vector<CompressedBlob>regionBlobs=find_compressed_blobs(regionProbeEntries,regionInflated);c_blob_probe_s+=secs(blobProbeStarted);
                     regionProbeToBlob.assign(regionProbeEntries.size(),-1);size_t inflatedBase=blobRaw.size();blobRaw.insert(blobRaw.end(),regionInflated.begin(),regionInflated.end());
                     for(auto blob:regionBlobs){size_t global=compressedBlobs.size();
                         for(size_t entry=blob.first_entry;entry<size_t(blob.first_entry)+blob.entry_count;++entry)regionProbeToBlob[entry]=int32_t(global);
@@ -1148,7 +1166,7 @@ int main(int argc,char**argv){
                     if(compressedBlobs.size()!=compressedBlobEntriesSeen.size()){fprintf(stderr,"compressed blob state differs\n");return 2;}
                     std::vector<uint8_t>canonicalFailed(compressedBlobs.size());
                     if(useBlobEagerPatches){
-                        for(uint32_t index:generate_canonical_blobs(compressedBlobs,blobRaw,blobThreads,blobCanonicalLevel,CcanonicalBlobs))canonicalFailed[index]=1;
+                        auto canonicalStarted=Clock::now();for(uint32_t index:generate_canonical_blobs(compressedBlobs,blobRaw,blobThreads,blobCanonicalLevel,CcanonicalBlobs))canonicalFailed[index]=1;c_canonical_s+=secs(canonicalStarted);
                         blobPatches.reserve(compressedBlobs.size());
                     }
                     for(size_t index=0;index<compressedBlobs.size();++index){const auto&blob=compressedBlobs[index];
@@ -1178,7 +1196,9 @@ int main(int argc,char**argv){
                                 if(blob.inflated_offset!=expectedOffset||uint64_t(blob.inflated_offset)+blob.inflated_size>blobRaw.size()){fprintf(stderr,"non-contiguous blob factor input\n");return 2;}
                                 members.push_back({blobRaw.data()+blob.inflated_offset,blob.inflated_size});expectedOffset+=blob.inflated_size;
                             }
-                            if(expectedOffset!=blobRaw.size()||!Cmo.encode(members,moEncoded)){fprintf(stderr,"MO factor encode failed\n");return 2;}
+                            if(expectedOffset!=blobRaw.size()){fprintf(stderr,"MO factor input extent differs\n");return 2;}
+                            auto moStarted=Clock::now();bool moOk=Cmo.encode(members,moEncoded);c_mo_s+=secs(moStarted);
+                            if(!moOk){fprintf(stderr,"MO factor encode failed\n");return 2;}
                             const std::vector<uint8_t>*parts[4]={&moEncoded.control,&moEncoded.definitions,&moEncoded.translations,&moEncoded.ordinary};
                             size_t moMetadata=0;
                             for(size_t part=0;part<4;++part){if(parts[part]->size()>UINT32_MAX){fprintf(stderr,"MO factor part too large\n");return 2;}moRawSizes[part]=uint32_t(parts[part]->size());moMetadata+=varint_size(moRawSizes[part]);moFactorRaw.insert(moFactorRaw.end(),parts[part]->begin(),parts[part]->end());}
@@ -1194,7 +1214,7 @@ int main(int argc,char**argv){
                                 moWire=moFactorEncoded.size()+FRAME+moMetadata;mixedBlobMoCandidateWire+=moWire;
                                 if(moWire<ordinaryWire){
                                     blobWireMode=4;blobEncoded=std::move(moFactorEncoded);
-                                    if(!Cmo.commit(moEncoded)){fprintf(stderr,"MO factor C commit failed\n");return 2;}
+                                    moStarted=Clock::now();bool committed=Cmo.commit(moEncoded);c_mo_s+=secs(moStarted);if(!committed){fprintf(stderr,"MO factor C commit failed\n");return 2;}
                                     ++mixedBlobMoTus;mixedBlobMoMembers+=moEncoded.mo_members;mixedBlobMoBytes+=moEncoded.mo_bytes;mixedBlobMoDefinitions+=moEncoded.pending_definitions.size();
                                 }else{blobWireMode=3;blobEncoded=std::move(blobOriginalRaw);++mixedBlobOrdinaryTus;}
                             }
@@ -1405,6 +1425,7 @@ int main(int argc,char**argv){
         // --- ROOT: token stream (region + block ids), already exposed to the F missing pass above ---
         if(!useKeyMap){w_root+=zstd_size(z,rootb.data(),rootb.size(),zlevel,dst);w_framing+=FRAME;allRoots.insert(allRoots.end(),rootb.begin(),rootb.end());}
 
+        c_fill_s+=std::chrono::duration<double>(Clock::now()-_tc_fill).count();
         enc_s += std::chrono::duration<double>(Clock::now()-_te).count(); auto _td=Clock::now();
         // --- DECODER (F): install FILL from wire into F's OWN store, then expand ROOT tokens ---
         { const uint8_t* pp=fill_paths.data(); for(uint32_t k=0;k<np;++k){ uint64_t L=get_varint(pp); Fpaths.emplace_back((const char*)pp,(size_t)L); pp+=L; } }
@@ -1469,7 +1490,7 @@ int main(int argc,char**argv){
               size_t packedSize=0;for(uint32_t size:FmoRawSizes){if(size>SIZE_MAX-packedSize){fprintf(stderr,"MO factor packed size overflow\n");return 2;}packedSize+=size;}
               std::vector<uint8_t>packed=zstd_frame_decode_exact(blobZD,blobEncoded,packedSize);std::array<std::vector<uint8_t>,4>parts;size_t offset=0;
               for(size_t part=0;part<4;++part){parts[part].assign(packed.begin()+offset,packed.begin()+offset+FmoRawSizes[part]);offset+=FmoRawSizes[part];}
-              std::vector<uint32_t>lengths;if(!Fmo.decode(parts[0],parts[1],parts[2],parts[3],FblobRaw,lengths)||lengths.size()!=Fblobs.size()){fprintf(stderr,"MO factor decode failed\n");return 2;}
+              std::vector<uint32_t>lengths;auto moStarted=Clock::now();bool moOk=Fmo.decode(parts[0],parts[1],parts[2],parts[3],FblobRaw,lengths);f_mo_s+=secs(moStarted);if(!moOk||lengths.size()!=Fblobs.size()){fprintf(stderr,"MO factor decode failed\n");return 2;}
               for(size_t index=0;index<Fblobs.size();++index)if(lengths[index]!=Fblobs[index].inflated_size){fprintf(stderr,"MO factor member length differs\n");return 2;}
               if(FblobRaw.size()!=expectedBlobRaw||FblobRaw!=blobRaw||Fmo.size()!=Cmo.size()){fprintf(stderr,"MO factor payload/state differs\n");return 2;}
             } else {
@@ -1482,7 +1503,7 @@ int main(int argc,char**argv){
           if(expectedPatchRaw){if(blobPatchEncoded.empty()){fprintf(stderr,"missing blob patch frame\n");return 2;}FblobPatchRaw=zstd_frame_decode_exact(blobPatchZD,blobPatchEncoded,expectedPatchRaw);if(FblobPatchRaw!=blobPatchRaw){fprintf(stderr,"blob patch payload differs\n");return 2;}}
           else if(!blobPatchEncoded.empty()){fprintf(stderr,"unexpected blob patch frame\n");return 2;}
           std::vector<std::vector<uint8_t>>canonicalBlobs,regeneratedBlobs(Fblobs.size());std::vector<uint8_t>canonicalFailed(Fblobs.size());
-          if(!FblobOrdinary)for(uint32_t index:generate_canonical_blobs(Fblobs,FblobRaw,blobThreads,FblobCanonicalLevel,canonicalBlobs))canonicalFailed[index]=1;
+          if(!FblobOrdinary){auto canonicalStarted=Clock::now();for(uint32_t index:generate_canonical_blobs(Fblobs,FblobRaw,blobThreads,FblobCanonicalLevel,canonicalBlobs))canonicalFailed[index]=1;f_canonical_s+=secs(canonicalStarted);}
           std::vector<uint32_t>blobFallbacks;
           size_t ordinaryOffset=0;
           for(size_t index=0;index<Fblobs.size();++index){bool ok=false;
@@ -1636,6 +1657,7 @@ int main(int argc,char**argv){
           }
           if(decodedBlocks!=missBlk.size()){fprintf(stderr,"decoded too few Blocks\n");return 2;}
         }
+        f_install_s+=std::chrono::duration<double>(Clock::now()-_td).count();auto _tf_emit=Clock::now();
         recon.clear();
         auto emitRegionF=[&](uint32_t r){ Freg_stream.push_back(r);
           if(useMixedRegions){if(r>=FmixedRegions.size()||!FmixedRegions[r].known){fprintf(stderr,"unknown mixed Root Region\n");exit(2);}const MixedFRegionView&view=FmixedRegions[r];recon.insert(recon.end(),FmixedRegionData.begin()+view.offset,FmixedRegionData.begin()+view.offset+view.length);}
@@ -1657,18 +1679,33 @@ int main(int argc,char**argv){
             if(tok<NREG) emitRegionF(tok);
             else { uint32_t k=tok-NREG; for(size_t j=Fblk_off[k];j<Fblk_off[k+1];++j) emitRegionF(Fblk_child[j]); } }
         }
+        f_emit_s+=std::chrono::duration<double>(Clock::now()-_tf_emit).count();
         dec_s += std::chrono::duration<double>(Clock::now()-_td).count();   // F-decode ends here; the verify below is harness-only (F doesn't have the original)
+        auto _tv=Clock::now();
         const char* orig=corpus.bytes.data()+corpus.files[t].off; uint32_t olen=corpus.files[t].len;
         if(recon.size()!=olen || memcmp(recon.data(),orig,olen)!=0){ byteexact=false; if(t<5||TUs<10) fprintf(stderr,"BYTE-EXACT FAIL TU %zu (%zu vs %u)\n",t,recon.size(),olen); }
+        verify_s+=std::chrono::duration<double>(Clock::now()-_tv).count();auto _ta=Clock::now();
         cum_raw += olen;
         double cur_wire = w_root+w_linedef+w_regiondef+w_pathdef+w_blockdef+w_missing+w_framing;
         perTU_raw[t]=olen; perTU_wire[t]=cur_wire - cum_wire; cum_wire=cur_wire;
         while(ckidx<ck_f.size() && double(cum_raw)>=ck_f[ckidx]*corpus.raw){ ck.push_back({ck_f[ckidx], double(cum_raw)/cum_wire}); ++ckidx; }
+        account_s+=std::chrono::duration<double>(Clock::now()-_ta).count();
       }
       enc_s+=fallback_c_s;dec_s-=fallback_c_s;if(dec_s<0)dec_s=0;
       fprintf(stderr,"pass %d (%s) single-core encode+decode+verify: %.2fs = %.3f GB/s raw\n", pass, (pass+1==npass&&npass>1)?"WARM":"cold", secs(tpass), corpus.raw/1e9/secs(tpass));
       fprintf(stderr,"  split (2-proc per-stream proxy): C-encode %.3f GB/s | F-decode %.3f GB/s => pipelined min = %.3f GB/s\n",
               corpus.raw/1e9/enc_s, corpus.raw/1e9/dec_s, corpus.raw/1e9/std::max(enc_s,dec_s));
+      fprintf(stderr,"  stage profile (original raw denominator): conversation+need %.6fs %.3f GB/s | C fill/classify/compress %.6fs %.3f GB/s\n",
+              conversation_s,corpus.raw/1e9/conversation_s,c_fill_s,corpus.raw/1e9/c_fill_s);
+      fprintf(stderr,"  stage profile (original raw denominator): F fill/decompress/install %.6fs %.3f GB/s | F root-expand/emit %.6fs %.3f GB/s\n",
+              f_install_s,corpus.raw/1e9/f_install_s,f_emit_s,corpus.raw/1e9/f_emit_s);
+      fprintf(stderr,"  stage profile (harness only): exact-compare %.6fs %.3f GB/s | ledger %.6fs %.3f GB/s\n",
+              verify_s,corpus.raw/1e9/verify_s,account_s,corpus.raw/1e9/account_s);
+      fprintf(stderr,"  codec primitive profile: zstd encode %.6fs calls=%llu native-in=%.3f GB/s | zstd decode %.6fs calls=%llu native-out=%.3f GB/s\n",
+              profileZstdEncode.seconds,(unsigned long long)profileZstdEncode.calls,profileZstdEncode.input_bytes/1e9/profileZstdEncode.seconds,
+              profileZstdDecode.seconds,(unsigned long long)profileZstdDecode.calls,profileZstdDecode.output_bytes/1e9/profileZstdDecode.seconds);
+      fprintf(stderr,"  embedded-object profile (wall): C probe+inflate %.6fs | C canonical %.6fs | C MO %.6fs | F MO %.6fs | F canonical-deflate %.6fs\n",
+              c_blob_probe_s,c_canonical_s,c_mo_s,f_mo_s,f_canonical_s);
     }
     while(ck.size()<ck_f.size()) ck.push_back({ck_f[ck.size()], double(cum_raw)/cum_wire});
     if(splitControlCeiling){
