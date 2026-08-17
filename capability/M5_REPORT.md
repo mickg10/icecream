@@ -1,0 +1,289 @@
+# Protocol-50 M5 capability acceptance
+
+Date: 2026-08-17
+
+Branch: `local-oracle/issue16-m4-m5`
+
+Parent checkpoint: `da1dafc3` (`capability: complete transactional actual-socket M4`)
+
+Target host: `tt-quietbox2`
+
+Final retained run: `/tmp/issue16-m5-final2-fixed16-20260817`
+
+## Result
+
+M5 passes its capability-harness gate. The final one-command run executed 209 rows and every row closed all of these independently checked ledgers:
+
+| Check | Result |
+|---|---:|
+| byte-exact reconstructed TUs | 209/209 |
+| physical frame ledger equals counted socket bytes | 209/209 |
+| prepared/committed/aborted transaction ledger | 209/209 |
+| real compiler-pipe mode used | 209/209 |
+| compiler-pipe bytes and TU count equal accepted input | 209/209 |
+| binding relationship and per-stage rate rows | 2/2 |
+| repeated cold wire-size equivalence | 1/1 |
+| retained-file hashes verified | 539/539 |
+
+The complete run covers the fixed 16 corpora with cold zstd-1 and zstd-3 component policies, both CACHE50 complements, a 50%-raw snapshot/resume, reverse/three shuffled/novelty-max orders, change/revert sequences, 1/4/8/16/32 F stores, sticky/round-robin/random/failover assignment, restart, late join, bounded eviction of all three stores, 24-worker host concurrency, real input/output pipes, latency tails, and the binding full-DuckDB rate rows.
+
+This is the M1-M5 capability harness described by `CAPABILITY-PLAN.md`. It is not the separate P29+BSC or GROUP-RLZ compression candidate and it is not a daemon landing.
+
+## Executed dataflow
+
+```text
+producer process
+  reads ordered .ii files
+       |
+       | real pipe, exact TU lengths from manifest metadata
+       v
+C coordinator process
+  receives bytes -> interns Lines/Regions -> orders TUs -> builds online Blocks
+  owns one SourceGeneration and global immutable ordinal authority
+       |
+       | one AF_UNIX socketpair per F; typed protocol-50 frames
+       | Hello -> Root/Block -> F-generated Need -> Fill -> prepared Ack
+       v
+F worker process (1..32 independent stores)
+  owns Region arena + public-Line bytes + Block definitions + bounded LRU state
+  stages Block and Fill changes -> reconstructs complete TU
+       |
+       | prepared Ack: no externally visible commit yet
+       v
+C ordered decision
+  commits accepted prefix; aborts every prepared suffix after first rejection
+       |
+       +-- abort --> F rolls back Fill; no compiler output/cache commit
+       |
+       `-- commit --> exact bytes written through real compiler pipe
+                            |
+                            v
+                     verifier consumer process
+                     consumes and byte-compares complete TU
+                            |
+                            | one-byte consumption acknowledgement
+                            v
+                     F commits Fill/Block/cache state,
+                     performs eviction, returns final Ack + removals
+                            |
+                            v
+                     C commits authority and repairs that F mirror
+```
+
+The verifier consumer stands in for the downstream compiler process. It consumes the same complete byte stream and replies only after comparing it to the expected TU. That reply makes every final committed Ack evidence that the downstream side consumed exactly one complete TU.
+
+## Transaction boundary
+
+The first M5 draft allowed an F to emit compiler bytes and commit cache state before C knew the ordered accepted prefix. If an earlier TU in the same wave failed, a later accepted TU could then be retried after already producing output. That ordering was incorrect.
+
+The corrected boundary is two-phase:
+
+1. C journals one authority transaction per in-flight TU and sends a complete Fill.
+2. F validates components, stages Block/Fill state, reconstructs the TU, and sends a prepared Ack with no removals.
+3. C finds the first rejected TU in logical order.
+4. C sends commit only to the accepted prefix and abort to every prepared suffix TU.
+5. An aborted F rolls back without compiler output or cache mutation.
+6. A committed F writes the complete TU to the verifier pipe and waits for its reply before committing local state and returning the final Ack.
+7. C commits its authority only after the matching final Ack.
+
+The retained rejection scenario deliberately damages logical TU 5 in a four-TU wave. TU 4 commits; TUs 6 and 7 have already prepared and must abort; TUs 5-7 are then retried. The observed ledger is:
+
+```text
+prepared_accepted = 22
+decode_rejected   = 1
+committed         = 20
+aborted           = 2
+compiler_tus      = 20
+compiler_bytes    = 56,079,068
+```
+
+The p99/max latency for this row is 165.177 ms. Its timestamp starts at the first attempt, so the retained curve includes session closure, suffix abort, restart, and retry rather than restarting the clock at the successful attempt.
+
+## Cache and snapshot state
+
+Each F has independent generation-scoped state:
+
+| Store | Identity | Representation | Removal policy |
+|---|---|---|---|
+| Region | typed generation-local `u32` ordinal | immutable view into F Region arena | indexed LRU by resident bytes |
+| public Line | typed generation-local `u32` ordinal | immutable owned bytes | indexed LRU by resident bytes |
+| Block | typed generation-local `u32` ordinal | Region-child vector | indexed LRU by resident bytes |
+
+The indexed heaps hold one entry per resident object; repeated touches update an existing heap entry and do not grow policy memory. Region removal records dead arena bytes, and compaction rewrites every live view when dead space exceeds the configured slack or the remaining live bytes.
+
+The deliberately small integrated row uses 64 KiB Region, 64 KiB public-Line, and 2 KiB Block limits over the first 20 fmt TUs. It remains exact after:
+
+```text
+80,068 Region removals
+128,616 public-Line removals
+1,010 Block removals
+20 Region-arena compactions
+```
+
+The bounded snapshot/resume row reproduces exactly those same four counts and the same final live-byte totals. Its physical wire differs from the uninterrupted bounded row only by the deterministic snapshot session controls.
+
+C snapshots contain global public-Line authority, paths, counters, and every per-F mirror. F snapshots contain only dynamic state for the latched generation: resident Region bytes, public Lines, Blocks, paths, LRU ticks, limits, and cumulative removal/compaction counters. Focused tests cover round trips, generation mismatch, and partial snapshot rejection.
+
+## Fixed-16 cold results
+
+The table below shows the zstd-3 component policy. Every zstd-1 counterpart also executed and is retained in the TSV/JSON. `C50` is the cumulative raw/wire ratio at the TU crossing half of raw bytes. `H200` is the earliest stable trailing-window 200x crossing, reported as raw fraction and TU. `none` means that the corpus did not establish that crossing under the retained definition.
+
+| Corpus | TUs | Raw bytes | Socket bytes | Ratio | C50 | H200 fraction / TU | Second half | p99 / max ms | F peak MiB |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| LLVM | 1,238 | 3,620,271,340 | 14,189,957 | 255.129x | 226.140x | 0.204 / 204 | 292.695x | 11.74 / 55.44 | 3,882.1 |
+| RocksDB | 622 | 3,114,320,596 | 15,220,938 | 204.608x | 160.604x | 0.365 / 179 | 281.957x | 32.99 / 94.45 | 3,592.4 |
+| DuckDB | 689 | 1,985,715,205 | 12,609,970 | 157.472x | 159.545x | 0.156 / 99 | 155.445x | 53.17 / 105.34 | 2,454.2 |
+| Abseil | 700 | 2,581,008,467 | 10,471,576 | 246.478x | 168.955x | 0.187 / 172 | 457.511x | 16.17 / 46.63 | 2,926.4 |
+| OpenCV | 1,506 | 4,630,994,774 | 12,094,846 | 382.890x | 316.052x | 0.096 / 245 | 485.671x | 10.23 / 65.06 | 4,981.4 |
+| Godot | 2,207 | 5,932,762,185 | 61,809,839 | 95.984x | 59.884x | 0.146 / 347 | 242.225x | 16.06 / 1,957.02 | 7,304.3 |
+| fmt | 50 | 136,350,082 | 1,443,817 | 94.437x | 57.309x | none | 281.461x | 46.90 / 46.90 | 337.4 |
+| spdlog | 34 | 98,384,472 | 768,234 | 128.066x | 69.373x | none | 938.025x | 40.49 / 40.49 | 252.1 |
+| Catch2 | 857 | 947,252,235 | 2,347,456 | 403.523x | 269.126x | 0.086 / 84 | 808.750x | 4.11 / 26.41 | 1,104.0 |
+| nlohmann-json | 99 | 293,917,707 | 1,721,584 | 170.725x | 107.639x | 0.695 / 69 | 438.110x | 35.35 / 35.35 | 501.8 |
+| range-v3 | 259 | 632,049,016 | 1,782,167 | 354.652x | 297.521x | 0.249 / 65 | 440.579x | 12.70 / 40.12 | 811.2 |
+| Eigen | 650 | 3,532,268,956 | 3,228,951 | 1,093.937x | 770.680x | 0.098 / 64 | 1,887.648x | 12.57 / 74.77 | 3,671.6 |
+| RE2 | 72 | 110,231,455 | 809,948 | 136.097x | 94.313x | none | 256.954x | 27.43 / 27.43 | 256.0 |
+| LevelDB | 72 | 143,868,249 | 1,099,849 | 130.807x | 92.396x | 0.887 / 65 | 230.745x | 43.12 / 43.12 | 307.9 |
+| simdjson | 153 | 468,377,342 | 2,212,450 | 211.701x | 134.808x | 0.401 / 66 | 501.499x | 37.84 / 47.85 | 694.0 |
+| cereal | 84 | 326,899,429 | 1,093,307 | 299.001x | 216.114x | 0.756 / 64 | 485.624x | 52.91 / 52.91 | 472.4 |
+
+Godot's approximately 2-second maximum is a single large-TU tail; its p99 remains 16.06 ms. The reported F peak is the maximum `ru_maxrss` of one F process. It includes pages shared from the forked corpus/interner mapping and must not be multiplied by the worker count as if every page were private.
+
+## CACHE50 and order gates
+
+Both parity complements are real starting F stores, not discounted estimates. The full results are:
+
+| Corpus | bit0 bytes / ratio | bit1 bytes / ratio |
+|---|---:|---:|
+| LLVM | 10,260,458 / 352.837x | 9,717,325 / 372.558x |
+| RocksDB | 11,556,380 / 269.489x | 11,583,535 / 268.858x |
+| DuckDB | 8,070,541 / 246.045x | 9,033,865 / 219.808x |
+| Abseil | 8,223,391 / 313.862x | 8,162,383 / 316.208x |
+| OpenCV | 8,096,939 / 571.944x | 8,404,594 / 551.008x |
+| Godot | 19,137,343 / 310.010x | 51,288,577 / 115.674x |
+| fmt | 971,122 / 140.405x | 957,442 / 142.411x |
+| spdlog | 456,192 / 215.665x | 466,524 / 210.888x |
+| Catch2 | 1,872,346 / 505.917x | 1,889,175 / 501.411x |
+| nlohmann-json | 1,150,378 / 255.497x | 1,156,212 / 254.207x |
+| range-v3 | 1,332,050 / 474.493x | 1,314,816 / 480.713x |
+| Eigen | 2,496,942 / 1,414.638x | 2,492,294 / 1,417.276x |
+| RE2 | 521,412 / 211.410x | 548,865 / 200.835x |
+| LevelDB | 760,290 / 189.228x | 748,168 / 192.294x |
+| simdjson | 1,516,147 / 308.926x | 1,555,238 / 301.161x |
+| cereal | 794,677 / 411.361x | 770,453 / 424.295x |
+
+All 80 full reverse/shuffle/novelty rows are exact. Across the five orders, the narrowest/widest socket ratio ranges include 150.681-151.435x for DuckDB, 94.298-94.737x for Godot, 198.067-199.179x for RocksDB, and 1,067.089-1,078.130x for Eigen. The complete per-corpus ranges are in `m5-acceptance.tsv`.
+
+Every full-corpus 50%-raw snapshot row is exact. Its deterministic socket overhead relative to the corresponding uninterrupted zstd-1 row is 197-199 bytes. The compiler consumer still receives exactly the complete corpus byte and TU totals after resume.
+
+## Change and revert gates
+
+The launcher constructs retained A/B/A fixtures by changing one shared header line or one generated hexadecimal line in the first 24 Godot TUs. Each phase's physical wire is derived from its contiguous per-TU curve:
+
+| Scenario | Phases, raw/wire ratio | Complete ratio |
+|---|---|---:|
+| header edit | A 47.281x; header-B 714.526x | 88.694x |
+| generated edit | A 47.281x; generated-B 582.783x | 87.467x |
+| header revert | A1 47.281x; header-B 716.164x; A2 517.982x | 122.565x |
+| branch A-B-A | A1 47.281x; branch-B 723.633x; A2 517.982x | 122.637x |
+
+All four reconstruct every byte exactly. The reverted A2 phase reuses retained definitions while still carrying the complete physical control ledger.
+
+## Throughput and multi-F scaling
+
+The binding rate point is eight F stores on the complete 689-TU DuckDB corpus. Both component policies independently pass aggregate relationship and every selected stage at 1 GB/s or more:
+
+| Policy | Socket bytes | Ratio | Relationship | source pipe | interning | factorization | C transform | F decode/cache | compiler pipe |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| zstd-1 | 27,720,944 | 71.632x | 1.226 GB/s | 2.595 | 2.898 | 22.808 | 2.509 | 1.464 | 1.318 |
+| zstd-3 | 26,608,015 | 74.628x | 1.219 GB/s | 2.641 | 2.912 | 23.073 | 2.432 | 1.436 | 1.352 |
+
+The zstd-3 scaling curve exposes the performance/bytes tradeoff rather than hiding it:
+
+| F stores | Socket bytes | Ratio | Relationship GB/s | F decode/cache GB/s | compiler-pipe GB/s | p99 / max ms |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 12,609,970 | 157.472x | 0.596 | 1.853 | 1.459 | 51.28 / 105.24 |
+| 4 | 19,985,430 | 99.358x | 0.992 | 1.741 | 1.405 | 106.09 / 120.61 |
+| 8 | 26,608,015 | 74.628x | 1.219 | 1.436 | 1.352 | 144.32 / 144.93 |
+| 16 | 37,869,400 | 52.436x | 1.414 | 1.129 | 1.153 | 205.64 / 205.81 |
+| 32 | 55,990,009 | 35.466x | 1.455 | 0.728 | 0.730 | 322.78 / 323.02 |
+
+Eight stores are the measured balanced operating point: they clear the rate gate with margin while retaining substantially more reuse than 16 or 32 stores. Four stores measured 0.992 GB/s in the final run and therefore is not used as the binding point. Sixteen and 32 improve aggregate relationship rate only modestly while duplicating more cache discovery and reducing summed per-worker service efficiency.
+
+At eight F stores, the live semantic stores total 170,640,068 Region bytes, 18,400,058 public-Line bytes, and 7,318,816 Block bytes across the workers (about 187.3 MiB combined). The much larger per-process RSS number includes the fork-shared corpus and interner pages used by the exact verifier.
+
+The 24-worker full-fmt row is exact. The deliberately 64-KiB bounded-cache row is not a performance operating point: its 0.121 GB/s relationship rate measures extreme refill/removal/compaction churn and exists to prove bounded behavior and C-mirror repair.
+
+## Corrections made during the M5 audit
+
+| Defect found | Correction and retained proof |
+|---|---|
+| F output/cache commit preceded C's ordered decision | two-phase prepare/commit; middle-wave rejection gives 20 commits, 2 aborts, and exactly 20 compiler deliveries |
+| forced recovery discarded worker summaries and could undercount accepted pipe work | normal close after prepared abort; forced-stop recovery derives only already-acknowledged exact deliveries |
+| compiler consumer did not acknowledge each TU | second pipe carries one acknowledgement only after full byte comparison |
+| launcher silently used the in-memory input/output path | every run appends `--real-pipes`; parser rejects any non-real row |
+| rate gate was attached to every one-F behavior row | behavior rows remain fully measured; dedicated full-DuckDB eight-F rows bind aggregate and per-stage rates |
+| F decoder timing double-counted compiler-pipe blocking | decoder/cache and compiler-pipe clocks are now disjoint |
+| retry curves restarted the latency clock | first logical send timestamp survives every retry |
+| cache-removal list parsing performed a quadratic duplicate scan | idempotent removals now parse linearly |
+| diagnostic varint sizes made physical wire totals timing-dependent | final worker summary is a fixed 161-byte record; repeated cold ledger/curve equivalence is a launcher gate |
+| `--resume` trusted only path and command | every row records and checks executable SHA-256 plus ordered consumed-corpus SHA-256 |
+| snapshots and generated fixtures were not all in retained hashes | executables, logs, curves, snapshots, and every fixture are now covered by `SHA256SUMS` |
+
+## Validation outside the 209-row launcher
+
+Warning-clean GCC builds and focused tests were rerun from the current source:
+
+```text
+cap_header_test       PASS
+cap_transport_test    PASS (forked two-process frame round trip)
+cap_m2_test           PASS (rebind, complete rollback, reserved op)
+cap_m4_test           PASS (bounded components and staged C/F replay)
+cap_m5_state_test     PASS (LRU/compaction/snapshots)
+```
+
+The current M5 state test and middle-wave rejection scenario also pass with address and undefined-behavior instrumentation. The instrumented rejection retains the same logical transaction result: 22 prepared, 1 rejected, 20 committed, 2 aborted, and exact 56,079,068 compiler bytes over 20 TUs.
+
+Local retained audit: `/tmp/issue16-m1-m5-final-audit-20260817`.
+
+## Reproduction and retained evidence
+
+One-command final run:
+
+```sh
+python3 capability/run_m5_acceptance.py \
+  --suite full \
+  --corpus-root /home/ttuser/ictmp \
+  --output /tmp/issue16-m5-final2-fixed16-20260817 \
+  --timeout 1800
+```
+
+Primary files:
+
+```text
+/tmp/issue16-m5-final2-fixed16-20260817/m5-acceptance.json
+  sha256 4bce8e78103f18724fc9bb0df813b9fbab901576835f21732efce6d441a6ad8b
+/tmp/issue16-m5-final2-fixed16-20260817/m5-acceptance.tsv
+  sha256 2b15687c4b2a5e27408b3054cff060452018cc305658f8b812a32d09a4cdb460
+/tmp/issue16-m5-final2-fixed16-20260817/cap_m5
+  sha256 414a003e6239cc96e263962c100c6c1c7bcb8213ddaf1b64750c32ec950a435a
+/tmp/issue16-m5-final2-fixed16-20260817/SHA256SUMS
+/tmp/issue16-m5-final2-fixed16-20260817/logs/
+/tmp/issue16-m5-final2-fixed16-20260817/curves/
+/tmp/issue16-m5-final2-fixed16-20260817/snapshots/
+/tmp/issue16-m5-final2-fixed16-20260817/fixtures/
+```
+
+`sha256sum -c SHA256SUMS` verified 539/539 entries. Each row additionally records its exact command, executable hash, ordered corpus-content hash, log hash, and curve hash. `--resume` reuses a row only when command, executable, corpus hash, log, and curve inputs are present and compatible; otherwise it reruns it.
+
+## Scope boundary and remaining product work
+
+M5 proves the planned product-shaped capability with actual local sockets, independent F stores, bounded state, snapshots, real pipes, exact downstream consumption, and the measured rate point. It does not by itself land protocol 50 in the production icecc daemons. In particular:
+
+- the downstream consumer is an exact verifier process, not an invoked compiler;
+- the C side prepares the complete benchmark corpus before starting relationships, so `complete` input-to-output timing is diagnostic rather than the binding streaming rate;
+- the fixed-16 M5 semantic payload is the ruled reduced grammar, not the newer P29+BSC or GROUP-RLZ research codec;
+- eight independent F stores trade approximately 2.1x the one-F wire bytes for the measured aggregate rate; a shared cache module or affinity policy could recover some reuse in a later daemon integration;
+- H200 remains `none` where the retained stable-window definition is not established.
+
+Those boundaries are deliberate in `CAPABILITY-PLAN.md`. Within the M1-M5 capability scope, the implementation and retained gate are complete.

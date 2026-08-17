@@ -131,6 +131,33 @@ static inline bool try_unpack_tu_ack(const std::vector<uint8_t>&payload,uint32_t
     accepted=*p!=0;return true;
 }
 
+// M5 Ack carries the receiver's post-TU removals. C applies these to that
+// receiver's mirror before assigning its next TU. Generation-local ordinals
+// remain immutable and are never reused.
+struct CacheDropsM5 {
+    std::vector<uint32_t>regions,public_lines,blocks;
+};
+static inline void put_u32_list(std::vector<uint8_t>&out,const std::vector<uint32_t>&values){
+    capc::put_varint(out,values.size());for(uint32_t value:values)capc::put_varint(out,value);
+}
+static inline bool try_get_u32_list(const uint8_t*&p,const uint8_t*e,std::vector<uint32_t>&values,uint32_t limit,bool allowZero){
+    uint64_t count=0;if(!capc::get_varint_bounded(p,e,count)||count>size_t(e-p))return false;
+    values.clear();values.reserve(size_t(count));
+    for(uint64_t i=0;i<count;++i){uint32_t value=0;if(!capc::get_u32_bounded(p,e,value)||value>=limit||(!allowZero&&!value))return false;
+        values.push_back(value);}
+    return true;
+}
+static inline std::vector<uint8_t> pack_tu_ack_m5(uint32_t tu,bool accepted,const CacheDropsM5&drops){
+    std::vector<uint8_t>out;capc::put_varint(out,tu);out.push_back(accepted?1:0);
+    put_u32_list(out,drops.regions);put_u32_list(out,drops.public_lines);put_u32_list(out,drops.blocks);return out;
+}
+static inline bool try_unpack_tu_ack_m5(const std::vector<uint8_t>&payload,uint32_t&tu,bool&accepted,CacheDropsM5&drops,
+                                        uint32_t nreg,uint32_t nblk,uint32_t publicLimit=UINT32_MAX){
+    const uint8_t*p=payload.data(),*e=p+payload.size();if(!capc::get_u32_bounded(p,e,tu)||p==e||*p>1)return false;
+    accepted=*p++!=0;return try_get_u32_list(p,e,drops.regions,nreg,true)&&
+        try_get_u32_list(p,e,drops.public_lines,publicLimit,false)&&try_get_u32_list(p,e,drops.blocks,nblk,true)&&p==e;
+}
+
 // ---- Root ----
 static inline std::vector<uint8_t> pack_root(const std::vector<uint8_t>& rootb,
                                              const std::vector<uint8_t>& blockRaw){

@@ -55,6 +55,43 @@ static inline const char* next_region(const char*p,const char*end){ const char*q
 }
 static inline void* huge_zeroed(size_t bytes){ constexpr size_t H=2u<<20; bytes=(bytes+H-1)&~(H-1); void*p=mmap(nullptr,bytes,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0); if(p==MAP_FAILED){perror("mmap");exit(2);} madvise(p,bytes,MADV_HUGEPAGE); return p; }
 
+// Corpus input is written completely by the loader. Anonymous demand-paged
+// backing avoids std::vector::resize() first writing zeros across multi-GiB
+// corpora only for the pipe/file reader to overwrite every byte. It also stays
+// copy-on-write shared across forked F workers.
+class CorpusBytes {
+public:
+    CorpusBytes()=default;
+    CorpusBytes(const CorpusBytes&)=delete;
+    CorpusBytes&operator=(const CorpusBytes&)=delete;
+    CorpusBytes(CorpusBytes&&other) noexcept { move_from(other); }
+    CorpusBytes&operator=(CorpusBytes&&other) noexcept {
+        if(this!=&other){release();move_from(other);}return *this;
+    }
+    ~CorpusBytes(){release();}
+    void resize(size_t requested){
+        if(requested<=mapped_){size_=requested;return;}
+        constexpr size_t PAGE=4096;
+        if(requested>SIZE_MAX-(PAGE-1)){fprintf(stderr,"corpus allocation overflow\n");exit(2);}
+        size_t mapped=(requested+PAGE-1)&~(PAGE-1);
+        void*memory=mmap(nullptr,mapped,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+        if(memory==MAP_FAILED){perror("mmap corpus");exit(2);}
+        madvise(memory,mapped,MADV_HUGEPAGE);
+        if(data_&&size_)memcpy(memory,data_,size_);
+        release();data_=static_cast<char*>(memory);size_=requested;mapped_=mapped;
+    }
+    char*data(){return data_;}
+    const char*data()const{return data_;}
+    size_t size()const{return size_;}
+private:
+    char*data_=nullptr;size_t size_=0,mapped_=0;
+    void release(){if(data_)munmap(data_,mapped_);data_=nullptr;size_=mapped_=0;}
+    void move_from(CorpusBytes&other){
+        data_=other.data_;size_=other.size_;mapped_=other.mapped_;
+        other.data_=nullptr;other.size_=other.mapped_=0;
+    }
+};
+
 struct FileSpan{ uint64_t off; uint32_t len; };
 struct LineRef{ uint32_t off; uint32_t len; };
 struct TinySlot{ uint64_t bytes; uint32_t id; uint8_t len; uint8_t pad[3]; };
@@ -115,7 +152,7 @@ private:
     std::vector<uint32_t> region_index_; std::vector<RegionRecord> region_records_; std::vector<char> line_bytes_,region_bytes_; std::vector<uint32_t> region_ids_; std::vector<LineRef> id_refs_; uint32_t next_id_=1,region_mask_=0;
 };
 
-struct Corpus{ std::vector<char> bytes; std::vector<FileSpan> files; uint64_t raw=0; };
+struct Corpus{ CorpusBytes bytes; std::vector<FileSpan> files; uint64_t raw=0; };
 Corpus load_corpus(const char*manifest,size_t max_files);
 
 // ---- varint / zigzag / u64 ----

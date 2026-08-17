@@ -176,7 +176,9 @@ uint32_t MixedEncoder::materialize(const Interner& dict,const std::vector<uint32
                     fknownPublic[ord]=1;
                 }
             } else if(state.source_region!=UINT32_MAX&&state.source_region!=r){
-                if(state.source_region>=r||state.source_offset+line.len>dict.region_raw_len(state.source_region)||
+                // Region ordinals are identities, not observation order. Reverse/shuffled
+                // schedules may discover the matching source at a larger ordinal.
+                if(state.source_offset+line.len>dict.region_raw_len(state.source_region)||
                    memcmp(dict.region_data(state.source_region)+state.source_offset,text,line.len)){
                     fprintf(stderr,"bad mixed source Line\n");exit(2);
                 }
@@ -365,7 +367,9 @@ bool FStore::stage_fill(const std::array<std::vector<uint8_t>,6>&recovered,
     }else if(!recovered[3].empty())return reject("partial array");
 
     uint64_t publicCursor=publicBase;
-    if(!publicBase||publicBase>Fpublic_next)return reject("public base gap");
+    // Public ordinals are allocated once by C across all receiver mirrors. A receiver
+    // may first observe a sparse later ordinal after jobs ran on other F instances.
+    if(!publicBase)return reject("zero public base");
     if(!recovered[0].empty()){
         const uint8_t*cp=recovered[0].data(),*ce=cp+recovered[0].size();
         const uint8_t*lp=recovered[1].data(),*le=lp+recovered[1].size();

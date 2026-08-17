@@ -77,6 +77,10 @@ int main(){
     auto changed=one_region_op9("hello changed\n");
     check(!store.stage_fill(changed,std::vector<uint32_t>{0},paths,0,1,11,fill),"unequal complete Fill replay rejected");
     check(store.FmixedRegionData.size()==dataSize&&store.Fpaths.size()==pathSize&&store.FpublicLastUse[1]==9,"unequal replay leaves retained state unchanged");
+    auto sparse=one_region_op9("sparse ordinal\n");
+    check(store.stage_fill(sparse,std::vector<uint32_t>{2},{},uint32_t(store.Fpaths.size()),17,12,fill),"sparse global public ordinal staged");
+    store.commit_fill(fill);
+    check(store.Fpublic_next==18&&store.FpublicPresent.size()>17&&store.FpublicPresent[17],"receiver accepts sparse C-authoritative ordinal");
 
     fprintf(stderr,"[5] rejected C attempt rolls back authority discoveries:\n");
     const std::string source="# 1 \"a.hpp\"\nshared line\n# 2 \"b.hpp\"\nshared line\n";
@@ -93,6 +97,12 @@ int main(){
     check(pristine&&encoder.mixedOps==std::array<uint64_t,7>{},"rejected attempt restores C authority byte-for-byte fields");
     encoder.begin_authority_transaction(authority);encoder.materialize(dictionary,regions,1,&authority);encoder.commit_authority_transaction(authority);
     check(encoder.nextMixedPublic==2&&encoder.paths.size()==2,"subsequent valid attempt commits the same discoveries");
+
+    fprintf(stderr,"[6] Region identity is independent of observation order:\n");
+    MixedEncoder reverseEncoder;reverseEncoder.init(dictionary.distinct(),uint32_t(dictionary.region_count()));
+    MixedEncoder::AuthorityTransaction reverseAuthority;std::vector<uint32_t>reversed{regions[1],regions[0]};
+    reverseEncoder.begin_authority_transaction(reverseAuthority);reverseEncoder.materialize(dictionary,reversed,2,&reverseAuthority);reverseEncoder.commit_authority_transaction(reverseAuthority);
+    check(reverseEncoder.nextMixedPublic==2,"reverse observation can publish a Line from a larger Region ordinal");
 
     printf("cap_m4_test (components + bounded protocol + staged C/F replay): %s\n",failures?"FAIL":"PASS");
     return failures?1:0;
