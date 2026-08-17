@@ -36,7 +36,7 @@ image_id=$("${docker_command[@]}" image inspect --format '{{.Id}}' "$image")
     --env "SOURCE_ROOT=$source_prefix" --env BUILD_ROOT=/cell/build \
     --env LOOSE_ROOT=/cell/loose --env CELL_ROOT=/cell --env "JOBS=$jobs" \
     --env "MATRIX_PROJECT=$project" --env "MATRIX_PROFILE=$profile" \
-    "$image" bash -lc \
+    "$image" bash -c \
       "bash /harness/adapters/$adapter_name && python3 /harness/scripts/capture_environment.py --output /cell/environment.json --project '$project' --profile '$profile' --source-root '$source_prefix' --build-root /cell/build --image-id '$image_id'" \
     2>&1 | tee "$cell/logs/container.log"
 
