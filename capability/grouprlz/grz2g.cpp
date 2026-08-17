@@ -23,7 +23,7 @@
 //  * the anchor table stores absolute_position+1 so byte 0 is representable, and is sized
 //    from the configured retained-history budget, never from the total input length.
 //
-// build: g++ -O3 -march=native -std=c++17 -I<libbsc> -o grz3 grz3.cpp libbsc.a -lzstd -lpthread
+// build: g++ -O3 -march=native -std=c++17 -I<libbsc> -o grz2g grz2g.cpp libbsc.a -lzstd -lpthread
 
 #include <cstdio>
 #include <cstdint>
@@ -52,7 +52,7 @@ static double now() {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
-static void die(const char* m) { fprintf(stderr, "grz3: %s\n", m); exit(1); }
+static void die(const char* m) { fprintf(stderr, "grz2g: %s\n", m); exit(1); }
 static u64 peak_rss_bytes() {
     rusage ru;
     getrusage(RUSAGE_SELF, &ru);
@@ -324,7 +324,7 @@ static void encode(const char* in, const char* outp, const Cfg& cfg, const char*
 
         u64 gnm = 0;
         int retries = 0;
-        std::vector<u8> probe_ll, probe_lit, probe_sd, probe_ml;
+        std::vector<u8> probe_ll, probe_lit, probe_sd, probe_sd2, probe_ml;
         u64 probe_end = 0, probe_nm = 0;
         bool probing = (cfg.retry_test && (gidx % (u64)cfg.retry_test) == 0);
 
@@ -408,7 +408,7 @@ static void encode(const char* in, const char* outp, const Cfg& cfg, const char*
 
             if (probing) {
                 // Retry probe: roll back and re-parse the identical span; results must match.
-                probe_ll = ll; probe_lit = lits; probe_sd = sd; probe_ml = ml;
+                probe_ll = ll; probe_lit = lits; probe_sd = sd; probe_sd2 = sd2; probe_ml = ml;
                 probe_end = end; probe_nm = gnm;
                 for (size_t i = undo.size(); i-- > 0;) tbl[undo[i].first] = undo[i].second;
                 probing = false;
@@ -416,7 +416,7 @@ static void encode(const char* in, const char* outp, const Cfg& cfg, const char*
             }
             if (probe_end) {
                 if (probe_end != end || probe_ll != ll || probe_lit != lits ||
-                    probe_sd != sd || probe_ml != ml || probe_nm != gnm) {
+                    probe_sd != sd || probe_sd2 != sd2 || probe_ml != ml || probe_nm != gnm) {
                     verify_fail++;
                     fprintf(stderr, "RETRY MISMATCH at group %llu\n", (unsigned long long)gidx);
                 }
@@ -503,7 +503,7 @@ static void encode(const char* in, const char* outp, const Cfg& cfg, const char*
         w.u32v((u32)(tu.empty() ? 0 : tu_hi - tu_lo));
         for (u64 t = tu_lo; t < tu_hi && !tu.empty(); t++) w.u64v(tu[t + 1] - tu[t]);
         w.u8v((u8)offmode);
-        w.u8v(be_ll); w.u8v(lb.empty() ? BE_STORE : lbe[0]); w.u8v(be_sd); w.u8v(be_ml);
+        w.u8v(be_ll); w.u8v(lb.empty() ? (u8)BE_STORE : lbe[0]); w.u8v(be_sd); w.u8v(be_ml);
         w.u64v(ll.size()); w.u64v(lits.size()); w.u64v(srcs.size()); w.u64v(ml.size());
         w.u64v(c_ll.size());
         u64 clit = 0; for (auto& x : lb) clit += x.size();
@@ -572,7 +572,7 @@ static void encode(const char* in, const char* outp, const Cfg& cfg, const char*
             (unsigned long long)src0);
     printf("%llu\t%llu\t%llu\t%.4f\t%.4f\t%.4f\t%zu\t%llu\t%llu\t%llu\t%llu\n",
            (unsigned long long)n, (unsigned long long)total, (unsigned long long)gidx,
-           tmatch, tent, sec, tbytes, peak_rss_bytes(),
+           tmatch, tent, sec, tbytes, (unsigned long long)peak_rss_bytes(),
            (unsigned long long)max_group_out, (unsigned long long)stale,
            (unsigned long long)(verify_fail + oversize_tu));
     munmap(tbl, tbytes);
@@ -846,7 +846,8 @@ static void decode(const char* inp, const char* outp, bool prefix_mode, int thre
             pos / sec, pos / sec / 1048576.0, ring.b.size() / 1073741824.0,
             peak_rss_bytes() / 1073741824.0, prefix_mode ? "[PREFIX]" : "[FULL,VERIFIED]");
     printf("%llu\t%llu\t%.4f\t%.4f\t%llu\t%llu\n", (unsigned long long)pos,
-           (unsigned long long)groups, tent, sec, (u64)ring.b.size(), peak_rss_bytes());
+           (unsigned long long)groups, tent, sec, (unsigned long long)ring.b.size(),
+           (unsigned long long)peak_rss_bytes());
 }
 
 // ------------------------------------------------------------- tu map
@@ -876,12 +877,12 @@ static void make_tu(const char* manifest, const char* outp) {
 int main(int argc, char** argv) {
     if (argc < 3) {
         fprintf(stderr,
-            "usage: grz3 enc <in> <out> -u tu.map [-m g0|g1|g2] [-K n] [-s b] [-t b] [-l be] [-k be]\n"
+            "usage: grz2g enc <in> <out> -u tu.map [-m g0|g1|g2] [-K n] [-s b] [-t b] [-l be] [-k be]\n"
             "                 [-b blkMB] [-j n] [--gtu n] [--graw MB] [--gadd MB] [--hist MB]\n"
             "                 [--anchor-budget MB] [--select 1] [--retry-test n] [--curve f.tsv]\n"
-            "       grz3 dec <in> <out> [-j n]            (requires END_FRAME; verifies digests)\n"
-            "       grz3 decprefix <in> <out> [-g n] [-j n]\n"
-            "       grz3 tu <manifest> <out.tu>\n");
+            "       grz2g dec <in> <out> [-j n]            (requires END_FRAME; verifies digests)\n"
+            "       grz2g decprefix <in> <out> [-g n] [-j n]\n"
+            "       grz2g tu <manifest> <out.tu>\n");
         return 1;
     }
     if (!strcmp(argv[1], "tu")) { make_tu(argv[2], argv[3]); return 0; }
