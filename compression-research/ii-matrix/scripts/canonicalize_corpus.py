@@ -32,6 +32,7 @@ def main() -> int:
     ii_dir = args.stage / "ii"
     ii_dir.mkdir(parents=True, exist_ok=True)
 
+    manifest_root = args.raw_manifest.resolve(strict=True).parent
     source_paths = [Path(line.rstrip("\r\n")) for line in args.raw_manifest.read_text().splitlines()
                     if line.strip()]
     if not source_paths:
@@ -42,7 +43,13 @@ def main() -> int:
     for ordinal, source in enumerate(source_paths):
         if "\t" in str(source) or "\n" in str(source):
             raise SystemExit(f"unsupported path characters: {source!s}")
-        resolved = source.resolve(strict=True)
+        if source.is_absolute():
+            raise SystemExit(f"raw manifest path must be cell-relative: {source!s}")
+        resolved = (manifest_root / source).resolve(strict=True)
+        try:
+            resolved.relative_to(manifest_root)
+        except ValueError as error:
+            raise SystemExit(f"raw manifest path leaves cell root: {source!s}") from error
         if resolved in seen:
             raise SystemExit(f"duplicate TU path: {resolved}")
         seen.add(resolved)
@@ -60,7 +67,7 @@ def main() -> int:
             except OSError:
                 shutil.copyfile(resolved, target)
         size, sha256 = digest(target)
-        rows.append(f"{ordinal}\t{relative.as_posix()}\t{size}\t{sha256}\t{source}\n")
+        rows.append(f"{ordinal}\t{relative.as_posix()}\t{size}\t{sha256}\t{source.as_posix()}\n")
 
     (args.stage / "manifest.tsv").write_text("".join(rows), encoding="utf-8")
     print(f"canonicalized {len(source_paths)} TUs into {args.stage}")

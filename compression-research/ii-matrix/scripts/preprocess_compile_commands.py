@@ -95,7 +95,16 @@ def main() -> int:
 
     successes = [row for row in results if row["returncode"] == 0]
     failures = [row for row in results if row["returncode"] != 0]
-    args.raw_manifest.write_text("".join(f"{row['output']}\n" for row in successes),
+    manifest_root = args.raw_manifest.resolve().parent
+    manifest_paths: list[str] = []
+    for row in successes:
+        output = Path(str(row["output"])).resolve(strict=True)
+        try:
+            relative = output.relative_to(manifest_root)
+        except ValueError as error:
+            raise SystemExit(f"preprocessed output is outside cell root: {output}") from error
+        manifest_paths.append(relative.as_posix())
+    args.raw_manifest.write_text("".join(f"{path}\n" for path in manifest_paths),
                                  encoding="utf-8")
     with args.commands_out.open("w", encoding="utf-8") as stream:
         for row in results:

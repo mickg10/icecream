@@ -7,3 +7,8 @@ The committed `from-compile-commands.sh` adapter is the common final step: a pro
 adapter may configure/code-generate first, set `II_COMPILE_COMMANDS`, and invoke it.  The 25
 existing corpus recipes are being converted into thin profile-aware adapters; until a named
 adapter exists here, that cell is not claimed runnable by this branch.
+
+Currently runnable project adapters:
+
+- `fmt.sh`: configures the fmt test corpus with CMake/Ninja and exports its complete compile
+  database through the common adapter.

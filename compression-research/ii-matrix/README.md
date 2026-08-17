@@ -99,7 +99,7 @@ It must:
 1. run the project's native configure/code-generation steps;
 2. preprocess in deterministic compile-database/build order;
 3. write each successful `.ii` under `LOOSE_ROOT`;
-4. write ordered absolute `.ii` paths to `/cell/raw-manifest.txt`;
+4. write ordered cell-relative `.ii` paths to `/cell/raw-manifest.txt`;
 5. write the effective commands to `/cell/commands.jsonl`;
 6. return nonzero if the accepted TU-count contract is not met.
 
