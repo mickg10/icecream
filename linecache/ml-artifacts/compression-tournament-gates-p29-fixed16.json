@@ -1,0 +1,1488 @@
+{
+  "aggregate": {
+    "cold": {
+      "aggregate_pass": true,
+      "allowance_110pct_bytes": 107438834,
+      "p29_over_z19long": 0.9405469250305012,
+      "p29_wire_bytes": 91864787,
+      "passing_programs": 3,
+      "programs": 16,
+      "z19long_bytes": 97671668
+    },
+    "source": {
+      "allowance_110pct_bytes": 129758464,
+      "candidate_wire_bytes": null,
+      "measured_candidate_programs": 0,
+      "pass": null,
+      "programs": 16,
+      "z19long_bytes": 117962240
+    },
+    "tu100": {
+      "aggregate_pass": false,
+      "delta_bytes": 253173,
+      "eligible_programs": 10,
+      "p29_over_z6long": 1.017802045456591,
+      "p29_wire_bytes": 14474741,
+      "passing_programs": 5,
+      "z6long_bytes": 14221568
+    },
+    "tu200": {
+      "aggregate_pass": false,
+      "delta_bytes": 761826,
+      "eligible_programs": 9,
+      "p29_over_z6long": 1.0383694284761953,
+      "p29_wire_bytes": 20616852,
+      "passing_programs": 4,
+      "z6long_bytes": 19855026
+    }
+  },
+  "candidate": "RBASE-P29 exact incremental empty start",
+  "goal": {
+    "cold": "candidate <= 1.10 * whole-program zstd-19 --long=31",
+    "installed_assets": "reported separately and not charged per build",
+    "prefix": "candidate <= whole-prefix zstd-6 --long=31 at TU100/TU200",
+    "scope": "each eligible program must pass; aggregates are secondary"
+  },
+  "reference_contract": {
+    "all_prefix_raw_totals_match_p29": true,
+    "cold_level": 19,
+    "content": "ordered byte concatenation; no tar or path metadata",
+    "long_log": 31,
+    "prefix_level": 6,
+    "threads": 1,
+    "zstd_version": "*** Zstandard CLI (64-bit) v1.5.7, by Yann Collet ***"
+  },
+  "reference_reports": [
+    {
+      "artifact_path": "/tmp/issue16-z6-prefix-results-20260817/corpus-z6long-prefix.json",
+      "content_contract": "ordered byte concatenation; no tar or path metadata",
+      "file_list": "/home/ttuser/ictmp/corpus/manifest.txt",
+      "file_list_sha256": "33392b9cdb4a21c8148ece5bc4862463d87cbe3a056bc78a2d904eac66996bdf",
+      "kind": "ii",
+      "level": 6,
+      "long_log": 31,
+      "measurements": [
+        {
+          "command": [
+            "/tmp/issue16-compression-tournament/zstd157/bin/zstd",
+            "-6",
+            "--long=31",
+            "-c"
+          ],
+          "complete": false,
+          "compressed_bytes": 1593762,
+          "content_sha256": "8f5760a07fd3d9817be90fe193ded75a53a05b316272d6f66ffd8b15cbdc0691",
+          "files": 100,
+          "input_GBps": 0.2713135833316622,
+          "ratio": 226.3893404410445,
+          "raw_bytes": 360810728,
+          "requested": [
+            100
+          ],
+          "seconds": 1.3298660670407116
+        },
+        {
+          "command": [
+            "/tmp/issue16-compression-tournament/zstd157/bin/zstd",
+            "-6",
+            "--long=31",
+            "-c"
+          ],
+          "complete": false,
+          "compressed_bytes": 2884547,
+          "content_sha256": "cfb425c697da7634e0045769d78cbb507c71b9f6a657e9e09e0d8c8166cabb46",
+          "files": 200,
+          "input_GBps": 0.3656072396736632,
+          "ratio": 251.10481264475843,
+          "raw_bytes": 724323634,
+          "requested": [
+            200
+          ],
+          "seconds": 1.9811523279640824
+        }
+      ],
+      "name": "corpus",
+      "schema": "whole-stream-reference-v1",
+      "threads": 1,
+      "total_files": 1238,
+      "zstd_version": "*** Zstandard CLI (64-bit) v1.5.7, by Yann Collet ***"
+    },
+    {
+      "artifact_path": "/tmp/issue16-z6-prefix-results-20260817/corpus10-z6long-prefix.json",
+      "content_contract": "ordered byte concatenation; no tar or path metadata",
+      "file_list": "/home/ttuser/ictmp/corpus10/manifest.txt",
+      "file_list_sha256": "2fe6eb460dc1597f021e36e5c7fa845f786b3425e77ff7231ef2f556a8cbaec7",
+      "kind": "ii",
+      "level": 6,
+      "long_log": 31,
+      "measurements": [
+        {
+          "command": [
+            "/tmp/issue16-compression-tournament/zstd157/bin/zstd",
+            "-6",
+            "--long=31",
+            "-c"
+          ],
+          "complete": true,
+          "compressed_bytes": 1063308,
+          "content_sha256": "0e08a1abdc53d6b9b644cacfb3ad435a67cadd293797ed915927c2da071dcff2",
+          "files": 99,
+          "input_GBps": 0.38675471182817783,
+          "ratio": 276.41822218961954,
+          "raw_bytes": 293917707,
+          "requested": [
+            100,
+            200
+          ],
+          "seconds": 0.759958955924958
+        }
+      ],
+      "name": "corpus10",
+      "schema": "whole-stream-reference-v1",
+      "threads": 1,
+      "total_files": 99,
+      "zstd_version": "*** Zstandard CLI (64-bit) v1.5.7, by Yann Collet ***"
+    },
+    {
+      "artifact_path": "/tmp/issue16-z6-prefix-results-20260817/corpus11-z6long-prefix.json",
+      "content_contract": "ordered byte concatenation; no tar or path metadata",
+      "file_list": "/home/ttuser/ictmp/corpus11/manifest.txt",
+      "file_list_sha256": "f1ab9b5d43b1ca89b7f41324d421e38da4beab3b23bdf14d3e55f146cd352cc8",
+      "kind": "ii",
+      "level": 6,
+      "long_log": 31,
+      "measurements": [
+        {
+          "command": [
+            "/tmp/issue16-compression-tournament/zstd157/bin/zstd",
+            "-6",
+            "--long=31",
+            "-c"
+          ],
+          "complete": false,
+          "compressed_bytes": 619941,
+          "content_sha256": "6b8d7a594be9de70cd89b5e857759a019f692c33f330a55f8ebb4703a4bfbae9",
+          "files": 100,
+          "input_GBps": 0.35595289429127774,
+          "ratio": 399.4822733131056,
+          "raw_bytes": 247655440,
+          "requested": [
+            100
+          ],
+          "seconds": 0.6957534099929035
+        },
+        {
+          "command": [
+            "/tmp/issue16-compression-tournament/zstd157/bin/zstd",
+            "-6",
+            "--long=31",
+            "-c"
+          ],
+          "complete": false,
+          "compressed_bytes": 897361,
+          "content_sha256": "8c368edc0bece637e86610a52df59304b1842790e2c31ed893719ff7bf8e34d3",
+          "files": 200,
+          "input_GBps": 0.3516311802261093,
+          "ratio": 539.6395118575467,
+          "raw_bytes": 484251452,
+          "requested": [
+            200
+          ],
+          "seconds": 1.3771573149133474
+        }
+      ],
+      "name": "corpus11",
+      "schema": "whole-stream-reference-v1",
+      "threads": 1,
+      "total_files": 259,
+      "zstd_version": "*** Zstandard CLI (64-bit) v1.5.7, by Yann Collet ***"
+    },
+    {
+      "artifact_path": "/tmp/issue16-z6-prefix-results-20260817/corpus12-z6long-prefix.json",
+      "content_contract": "ordered byte concatenation; no tar or path metadata",
+      "file_list": "/home/ttuser/ictmp/corpus12/manifest.txt",
+      "file_list_sha256": "103821425d1e655df463ee83c65d23d480054154b92e64fb2d1e6b02e4bf4397",
+      "kind": "ii",
+      "level": 6,
+      "long_log": 31,
+      "measurements": [
+        {
+          "command": [
+            "/tmp/issue16-compression-tournament/zstd157/bin/zstd",
+            "-6",
+            "--long=31",
+            "-c"
+          ],
+          "complete": false,
+          "compressed_bytes": 768113,
+          "content_sha256": "e6347ceaf40247eb42088afaa612a8dcf5d782e6522de4898bc5fbebd3b3f514",
+          "files": 100,
+          "input_GBps": 0.3305414701751787,
+          "ratio": 701.2331779308513,
+          "raw_bytes": 538626320,
+          "requested": [
+            100
+          ],
+          "seconds": 1.6295272109564394
+        },
+        {
+          "command": [
+            "/tmp/issue16-compression-tournament/zstd157/bin/zstd",
+            "-6",
+            "--long=31",
+            "-c"
+          ],
+          "complete": false,
+          "compressed_bytes": 1159213,
+          "content_sha256": "51f5aa47a20ff3f7cb7ccd7bcc3173eae1222583ca8975e9d6e2b20d6b373b1c",
+          "files": 200,
+          "input_GBps": 0.5057763346813354,
+          "ratio": 947.5230695307937,
+          "raw_bytes": 1098381060,
+          "requested": [
+            200
+          ],
+          "seconds": 2.1716734941583127
+        }
+      ],
+      "name": "corpus12",
+      "schema": "whole-stream-reference-v1",
+      "threads": 1,
+      "total_files": 650,
+      "zstd_version": "*** Zstandard CLI (64-bit) v1.5.7, by Yann Collet ***"
+    },
+    {
+      "artifact_path": "/tmp/issue16-z6-prefix-results-20260817/corpus13-z6long-prefix.json",
+      "content_contract": "ordered byte concatenation; no tar or path metadata",
+      "file_list": "/home/ttuser/ictmp/corpus13/manifest.txt",
+      "file_list_sha256": "f1310c159b88ae3de4ae6ebd193be25b972a730ff7750a88d911638e076db663",
+      "kind": "ii",
+      "level": 6,
+      "long_log": 31,
+      "measurements": [
+        {
+          "command": [
+            "/tmp/issue16-compression-tournament/zstd157/bin/zstd",
+            "-6",
+            "--long=31",
+            "-c"
+          ],
+          "complete": true,
+          "compressed_bytes": 533747,
+          "content_sha256": "fc6fdd85c63f358f290940eec83810fb871eb3b739e9850b8ce1e196de4de7db",
+          "files": 72,
+          "input_GBps": 0.21308391299352186,
+          "ratio": 206.52379310797062,
+          "raw_bytes": 110231455,
+          "requested": [
+            100,
+            200
+          ],
+          "seconds": 0.5173147679306567
+        }
+      ],
+      "name": "corpus13",
+      "schema": "whole-stream-reference-v1",
+      "threads": 1,
+      "total_files": 72,
+      "zstd_version": "*** Zstandard CLI (64-bit) v1.5.7, by Yann Collet ***"
+    },
+    {
+      "artifact_path": "/tmp/issue16-z6-prefix-results-20260817/corpus14-z6long-prefix.json",
+      "content_contract": "ordered byte concatenation; no tar or path metadata",
+      "file_list": "/home/ttuser/ictmp/corpus14/manifest.txt",
+      "file_list_sha256": "012d8190a9be8d749f09ce14c6ad9619b058486b5a386269317a49b98c83fae6",
+      "kind": "ii",
+      "level": 6,
+      "long_log": 31,
+      "measurements": [
+        {
+          "command": [
+            "/tmp/issue16-compression-tournament/zstd157/bin/zstd",
+            "-6",
+            "--long=31",
+            "-c"
+          ],
+          "complete": true,
+          "compressed_bytes": 706226,
+          "content_sha256": "83fca047531416b8827f7892f94403fc5273d84c8ef6e614daa2af762ce59166",
+          "files": 72,
+          "input_GBps": 0.20012220442909448,
+          "ratio": 203.71417789772678,
+          "raw_bytes": 143868249,
+          "requested": [
+            100,
+            200
+          ],
+          "seconds": 0.7189019799698144
+        }
+      ],
+      "name": "corpus14",
+      "schema": "whole-stream-reference-v1",
+      "threads": 1,
+      "total_files": 72,
+      "zstd_version": "*** Zstandard CLI (64-bit) v1.5.7, by Yann Collet ***"
+    },
+    {
+      "artifact_path": "/tmp/issue16-z6-prefix-results-20260817/corpus15-z6long-prefix.json",
+      "content_contract": "ordered byte concatenation; no tar or path metadata",
+      "file_list": "/home/ttuser/ictmp/corpus15/manifest.txt",
+      "file_list_sha256": "958b2d061266dc8f218ee11a6c91ac617c4feecfee5cf0736431b7f17f7be8e8",
+      "kind": "ii",
+      "level": 6,
+      "long_log": 31,
+      "measurements": [
+        {
+          "command": [
+            "/tmp/issue16-compression-tournament/zstd157/bin/zstd",
+            "-6",
+            "--long=31",
+            "-c"
+          ],
+          "complete": false,
+          "compressed_bytes": 1162921,
+          "content_sha256": "7c295d617e72fa3629f158c3f9c970786dccb8d46de92246600991063b0523d6",
+          "files": 100,
+          "input_GBps": 0.37786569977819096,
+          "ratio": 256.4054720827984,
+          "raw_bytes": 298179308,
+          "requested": [
+            100
+          ],
+          "seconds": 0.789114513900131
+        },
+        {
+          "command": [
+            "/tmp/issue16-compression-tournament/zstd157/bin/zstd",
+            "-6",
+            "--long=31",
+            "-c"
+          ],
+          "complete": true,
+          "compressed_bytes": 1328709,
+          "content_sha256": "a849a223d69636004047e42ff999b7d837bba193a05d98aeb0ed9667d85b8b03",
+          "files": 153,
+          "input_GBps": 0.4973172836912747,
+          "ratio": 352.50558399167915,
+          "raw_bytes": 468377342,
+          "requested": [
+            200
+          ],
+          "seconds": 0.9418078907765448
+        }
+      ],
+      "name": "corpus15",
+      "schema": "whole-stream-reference-v1",
+      "threads": 1,
+      "total_files": 153,
+      "zstd_version": "*** Zstandard CLI (64-bit) v1.5.7, by Yann Collet ***"
+    },
+    {
+      "artifact_path": "/tmp/issue16-z6-prefix-results-20260817/corpus16-z6long-prefix.json",
+      "content_contract": "ordered byte concatenation; no tar or path metadata",
+      "file_list": "/home/ttuser/ictmp/corpus16/manifest.txt",
+      "file_list_sha256": "70fbf5eefdce86262606db48c522dc82fe594bd0f0552740e80b4a61d78786b7",
+      "kind": "ii",
+      "level": 6,
+      "long_log": 31,
+      "measurements": [
+        {
+          "command": [
+            "/tmp/issue16-compression-tournament/zstd157/bin/zstd",
+            "-6",
+            "--long=31",
+            "-c"
+          ],
+          "complete": true,
+          "compressed_bytes": 619374,
+          "content_sha256": "b2ebd1cd8568a4d5843c7bac9990414d964bf3d0eb0a17af2f55ebca2c20f9bf",
+          "files": 84,
+          "input_GBps": 0.3516461641632048,
+          "ratio": 527.7900412351826,
+          "raw_bytes": 326899429,
+          "requested": [
+            100,
+            200
+          ],
+          "seconds": 0.9296260341070592
+        }
+      ],
+      "name": "corpus16",
+      "schema": "whole-stream-reference-v1",
+      "threads": 1,
+      "total_files": 84,
+      "zstd_version": "*** Zstandard CLI (64-bit) v1.5.7, by Yann Collet ***"
+    },
+    {
+      "artifact_path": "/tmp/issue16-z6-prefix-results-20260817/corpus2-z6long-prefix.json",
+      "content_contract": "ordered byte concatenation; no tar or path metadata",
+      "file_list": "/home/ttuser/ictmp/corpus2/manifest.txt",
+      "file_list_sha256": "83fe864eb8006a7260cd77d54add1d34a6308332c0a3db14c7a84d96e2f26d79",
+      "kind": "ii",
+      "level": 6,
+      "long_log": 31,
+      "measurements": [
+        {
+          "command": [
+            "/tmp/issue16-compression-tournament/zstd157/bin/zstd",
+            "-6",
+            "--long=31",
+            "-c"
+          ],
+          "complete": false,
+          "compressed_bytes": 3840198,
+          "content_sha256": "21fea204121f1e567338ef615773b529569d08af61fa8c0b7a4bd3ae0f5ae7c7",
+          "files": 100,
+          "input_GBps": 0.43980556960211176,
+          "ratio": 174.25746406825897,
+          "raw_bytes": 669183165,
+          "requested": [
+            100
+          ],
+          "seconds": 1.521543180104345
+        },
+        {
+          "command": [
+            "/tmp/issue16-compression-tournament/zstd157/bin/zstd",
+            "-6",
+            "--long=31",
+            "-c"
+          ],
+          "complete": false,
+          "compressed_bytes": 5414625,
+          "content_sha256": "74909e596c21de3e5ddc91719350f8dea8f7152b47c161011f26ba074530730f",
+          "files": 200,
+          "input_GBps": 0.4855067313782703,
+          "ratio": 226.15736713068773,
+          "raw_bytes": 1224557334,
+          "requested": [
+            200
+          ],
+          "seconds": 2.5222252439707518
+        }
+      ],
+      "name": "corpus2",
+      "schema": "whole-stream-reference-v1",
+      "threads": 1,
+      "total_files": 622,
+      "zstd_version": "*** Zstandard CLI (64-bit) v1.5.7, by Yann Collet ***"
+    },
+    {
+      "artifact_path": "/tmp/issue16-z6-prefix-results-20260817/corpus3-z6long-prefix.json",
+      "content_contract": "ordered byte concatenation; no tar or path metadata",
+      "file_list": "/home/ttuser/ictmp/corpus3/manifest.txt",
+      "file_list_sha256": "bc40a2938860448eb56bbc1bdd9d2e63333c25f54ecc42189d02d0beaae66492",
+      "kind": "ii",
+      "level": 6,
+      "long_log": 31,
+      "measurements": [
+        {
+          "command": [
+            "/tmp/issue16-compression-tournament/zstd157/bin/zstd",
+            "-6",
+            "--long=31",
+            "-c"
+          ],
+          "complete": false,
+          "compressed_bytes": 2129543,
+          "content_sha256": "963ec3c433a2156ed892171a7fbdd2b2f67b5946a8d8b36ec211e1a70364d4b0",
+          "files": 100,
+          "input_GBps": 0.41565262477772136,
+          "ratio": 147.6834959425567,
+          "raw_bytes": 314498355,
+          "requested": [
+            100
+          ],
+          "seconds": 0.7566374810412526
+        },
+        {
+          "command": [
+            "/tmp/issue16-compression-tournament/zstd157/bin/zstd",
+            "-6",
+            "--long=31",
+            "-c"
+          ],
+          "complete": false,
+          "compressed_bytes": 2847389,
+          "content_sha256": "21810373bf0576cb89176e7acd62c733a4a75dcd6589b5696a34c0c1c9d76461",
+          "files": 200,
+          "input_GBps": 0.43026880545085855,
+          "ratio": 227.1537945816325,
+          "raw_bytes": 646795216,
+          "requested": [
+            200
+          ],
+          "seconds": 1.5032352050766349
+        }
+      ],
+      "name": "corpus3",
+      "schema": "whole-stream-reference-v1",
+      "threads": 1,
+      "total_files": 689,
+      "zstd_version": "*** Zstandard CLI (64-bit) v1.5.7, by Yann Collet ***"
+    },
+    {
+      "artifact_path": "/tmp/issue16-z6-prefix-results-20260817/corpus4-z6long-prefix.json",
+      "content_contract": "ordered byte concatenation; no tar or path metadata",
+      "file_list": "/home/ttuser/ictmp/corpus4/manifest.txt",
+      "file_list_sha256": "5348f60dd573dd36e0aba6e7b9de72bd739bc921fcc6ef5de56f1f98481dfc2d",
+      "kind": "ii",
+      "level": 6,
+      "long_log": 31,
+      "measurements": [
+        {
+          "command": [
+            "/tmp/issue16-compression-tournament/zstd157/bin/zstd",
+            "-6",
+            "--long=31",
+            "-c"
+          ],
+          "complete": false,
+          "compressed_bytes": 1645017,
+          "content_sha256": "ed71630b56c0f2e6dee8dac91dc7a308a09191302d9106d0c1363fe1122cff30",
+          "files": 100,
+          "input_GBps": 0.2534231130494405,
+          "ratio": 172.84740279279788,
+          "raw_bytes": 284336916,
+          "requested": [
+            100
+          ],
+          "seconds": 1.121984938858077
+        },
+        {
+          "command": [
+            "/tmp/issue16-compression-tournament/zstd157/bin/zstd",
+            "-6",
+            "--long=31",
+            "-c"
+          ],
+          "complete": false,
+          "compressed_bytes": 2329125,
+          "content_sha256": "4b4a2461866e651e9c481e56a8b35b11768e07a4821886144213085f57744803",
+          "files": 200,
+          "input_GBps": 0.34939404361773047,
+          "ratio": 235.45164815112972,
+          "raw_bytes": 548396320,
+          "requested": [
+            200
+          ],
+          "seconds": 1.5695640209596604
+        }
+      ],
+      "name": "corpus4",
+      "schema": "whole-stream-reference-v1",
+      "threads": 1,
+      "total_files": 700,
+      "zstd_version": "*** Zstandard CLI (64-bit) v1.5.7, by Yann Collet ***"
+    },
+    {
+      "artifact_path": "/tmp/issue16-z6-prefix-results-20260817/corpus5-z6long-prefix.json",
+      "content_contract": "ordered byte concatenation; no tar or path metadata",
+      "file_list": "/home/ttuser/ictmp/corpus5/manifest.txt",
+      "file_list_sha256": "73a378f36fc214e5e8cc2540e64098fab1bdf7127d4af3e1b0dd0eb03b37a637",
+      "kind": "ii",
+      "level": 6,
+      "long_log": 31,
+      "measurements": [
+        {
+          "command": [
+            "/tmp/issue16-compression-tournament/zstd157/bin/zstd",
+            "-6",
+            "--long=31",
+            "-c"
+          ],
+          "complete": false,
+          "compressed_bytes": 639458,
+          "content_sha256": "0d3bcdd8ae52d19f50fd5962fc2fd5fa2877acf2dcfd680beb666eff8fe86587",
+          "files": 100,
+          "input_GBps": 0.18376997867038505,
+          "ratio": 173.3598969752509,
+          "raw_bytes": 110856373,
+          "requested": [
+            100
+          ],
+          "seconds": 0.603234400972724
+        },
+        {
+          "command": [
+            "/tmp/issue16-compression-tournament/zstd157/bin/zstd",
+            "-6",
+            "--long=31",
+            "-c"
+          ],
+          "complete": false,
+          "compressed_bytes": 1493491,
+          "content_sha256": "e5b8a243d7c55d2a28c8ea15d4237ad91e48998826375899d72a0bdccc14bb36",
+          "files": 200,
+          "input_GBps": 0.28567247816635566,
+          "ratio": 205.99745897363962,
+          "raw_bytes": 307655351,
+          "requested": [
+            200
+          ],
+          "seconds": 1.07695131492801
+        }
+      ],
+      "name": "corpus5",
+      "schema": "whole-stream-reference-v1",
+      "threads": 1,
+      "total_files": 1506,
+      "zstd_version": "*** Zstandard CLI (64-bit) v1.5.7, by Yann Collet ***"
+    },
+    {
+      "artifact_path": "/tmp/issue16-z6-prefix-results-20260817/corpus6-z6long-prefix.json",
+      "content_contract": "ordered byte concatenation; no tar or path metadata",
+      "file_list": "/home/ttuser/ictmp/corpus6/manifest.txt",
+      "file_list_sha256": "e01a44c95474e5728138aa4eaf918e67146ce21457b12731806470de8eb0bd15",
+      "kind": "ii",
+      "level": 6,
+      "long_log": 31,
+      "measurements": [
+        {
+          "command": [
+            "/tmp/issue16-compression-tournament/zstd157/bin/zstd",
+            "-6",
+            "--long=31",
+            "-c"
+          ],
+          "complete": false,
+          "compressed_bytes": 1290414,
+          "content_sha256": "d840c39a9b0617f7d3c7bcd729c768fbb122b714fc1d7904286f9cd6b9921256",
+          "files": 100,
+          "input_GBps": 0.3637737896065774,
+          "ratio": 158.42982484690958,
+          "raw_bytes": 204440064,
+          "requested": [
+            100
+          ],
+          "seconds": 0.5619977850001305
+        },
+        {
+          "command": [
+            "/tmp/issue16-compression-tournament/zstd157/bin/zstd",
+            "-6",
+            "--long=31",
+            "-c"
+          ],
+          "complete": false,
+          "compressed_bytes": 2211547,
+          "content_sha256": "6bb639bafe11b02b784dd6f605c8333504ff2b704ca08b51c46297fb2087be05",
+          "files": 200,
+          "input_GBps": 0.4218284776983377,
+          "ratio": 173.02168346410906,
+          "raw_bytes": 382645585,
+          "requested": [
+            200
+          ],
+          "seconds": 0.9071117888670415
+        }
+      ],
+      "name": "corpus6",
+      "schema": "whole-stream-reference-v1",
+      "threads": 1,
+      "total_files": 2207,
+      "zstd_version": "*** Zstandard CLI (64-bit) v1.5.7, by Yann Collet ***"
+    },
+    {
+      "artifact_path": "/tmp/issue16-z6-prefix-results-20260817/corpus7-z6long-prefix.json",
+      "content_contract": "ordered byte concatenation; no tar or path metadata",
+      "file_list": "/home/ttuser/ictmp/corpus7/manifest.txt",
+      "file_list_sha256": "70d4565e16d9bd4aed1ec151a092f198662badd7e23dde070fab1ec4d3ce69a6",
+      "kind": "ii",
+      "level": 6,
+      "long_log": 31,
+      "measurements": [
+        {
+          "command": [
+            "/tmp/issue16-compression-tournament/zstd157/bin/zstd",
+            "-6",
+            "--long=31",
+            "-c"
+          ],
+          "complete": true,
+          "compressed_bytes": 952554,
+          "content_sha256": "e8ed041b36e00561eae45f2f957621d8bf24334e00e0f9ca075e197d7bef0937",
+          "files": 50,
+          "input_GBps": 0.21749948679706815,
+          "ratio": 143.14157727540905,
+          "raw_bytes": 136350082,
+          "requested": [
+            100,
+            200
+          ],
+          "seconds": 0.6268984079360962
+        }
+      ],
+      "name": "corpus7",
+      "schema": "whole-stream-reference-v1",
+      "threads": 1,
+      "total_files": 50,
+      "zstd_version": "*** Zstandard CLI (64-bit) v1.5.7, by Yann Collet ***"
+    },
+    {
+      "artifact_path": "/tmp/issue16-z6-prefix-results-20260817/corpus8-z6long-prefix.json",
+      "content_contract": "ordered byte concatenation; no tar or path metadata",
+      "file_list": "/home/ttuser/ictmp/corpus8/manifest.txt",
+      "file_list_sha256": "a6a4b0404427fa483a8143f98f830e833699c9bb1b356fceee899d7277bcb959",
+      "kind": "ii",
+      "level": 6,
+      "long_log": 31,
+      "measurements": [
+        {
+          "command": [
+            "/tmp/issue16-compression-tournament/zstd157/bin/zstd",
+            "-6",
+            "--long=31",
+            "-c"
+          ],
+          "complete": true,
+          "compressed_bytes": 588456,
+          "content_sha256": "a6bf245d465df9e534f81d1a35e139506771dcb923f5f35106b59bd110c01751",
+          "files": 34,
+          "input_GBps": 0.24397839077863273,
+          "ratio": 167.19087238468126,
+          "raw_bytes": 98384472,
+          "requested": [
+            100,
+            200
+          ],
+          "seconds": 0.40325076202861965
+        }
+      ],
+      "name": "corpus8",
+      "schema": "whole-stream-reference-v1",
+      "threads": 1,
+      "total_files": 34,
+      "zstd_version": "*** Zstandard CLI (64-bit) v1.5.7, by Yann Collet ***"
+    },
+    {
+      "artifact_path": "/tmp/issue16-z6-prefix-results-20260817/corpus9-z6long-prefix.json",
+      "content_contract": "ordered byte concatenation; no tar or path metadata",
+      "file_list": "/home/ttuser/ictmp/corpus9/manifest.txt",
+      "file_list_sha256": "ebd0367f21cd340b52dc0d7cbdd3d7d1f3d340de3e0c7d8af8be5a7d23501305",
+      "kind": "ii",
+      "level": 6,
+      "long_log": 31,
+      "measurements": [
+        {
+          "command": [
+            "/tmp/issue16-compression-tournament/zstd157/bin/zstd",
+            "-6",
+            "--long=31",
+            "-c"
+          ],
+          "complete": false,
+          "compressed_bytes": 532201,
+          "content_sha256": "2ad482f44007be06b5f225425989efea6d5909e071e7cd2bca113a69c7c45959",
+          "files": 100,
+          "input_GBps": 0.1807588775511032,
+          "ratio": 192.30384009049212,
+          "raw_bytes": 102344296,
+          "requested": [
+            100
+          ],
+          "seconds": 0.5661923629231751
+        },
+        {
+          "command": [
+            "/tmp/issue16-compression-tournament/zstd157/bin/zstd",
+            "-6",
+            "--long=31",
+            "-c"
+          ],
+          "complete": false,
+          "compressed_bytes": 617728,
+          "content_sha256": "d8bcc55739c347453866168e41f680abf1dff8eeb11be2d4115d32064e202ebc",
+          "files": 200,
+          "input_GBps": 0.2126724974184986,
+          "ratio": 343.8839877745545,
+          "raw_bytes": 212426768,
+          "requested": [
+            200
+          ],
+          "seconds": 0.9988445641938597
+        }
+      ],
+      "name": "corpus9",
+      "schema": "whole-stream-reference-v1",
+      "threads": 1,
+      "total_files": 857,
+      "zstd_version": "*** Zstandard CLI (64-bit) v1.5.7, by Yann Collet ***"
+    }
+  ],
+  "rows": [
+    {
+      "candidate_source_bytes": null,
+      "cold_110pct_gate_bytes": 8369687,
+      "cold_pass": false,
+      "corpus": "llvm",
+      "corpus_id": "corpus",
+      "p29_cold_bytes": 9328055,
+      "p29_over_z19long": 1.2259550018813725,
+      "project": "LLVM",
+      "raw_ii_bytes": 3620271340,
+      "raw_source_bytes": 159248971,
+      "source_110pct_gate_bytes": 25728078,
+      "source_basis": "built llvm/ subtree",
+      "source_pass": null,
+      "tu100": {
+        "actual_tu": 100,
+        "content_sha256": "8f5760a07fd3d9817be90fe193ded75a53a05b316272d6f66ffd8b15cbdc0691",
+        "delta_bytes": 14163,
+        "eligible": true,
+        "p29_over_z6long": 1.008886521325016,
+        "p29_wire_bytes": 1607925,
+        "pass": false,
+        "raw_bytes": 360810728,
+        "requested_tu": 100,
+        "z6long_bytes": 1593762
+      },
+      "tu200": {
+        "actual_tu": 200,
+        "content_sha256": "cfb425c697da7634e0045769d78cbb507c71b9f6a657e9e09e0d8c8166cabb46",
+        "delta_bytes": 90759,
+        "eligible": true,
+        "p29_over_z6long": 1.031463865903381,
+        "p29_wire_bytes": 2975306,
+        "pass": false,
+        "raw_bytes": 724323634,
+        "requested_tu": 200,
+        "z6long_bytes": 2884547
+      },
+      "tus": 1238,
+      "z19long_ii_bytes": 7608807,
+      "z19long_source_bytes": 23389162
+    },
+    {
+      "candidate_source_bytes": null,
+      "cold_110pct_gate_bytes": 6970751,
+      "cold_pass": false,
+      "corpus": "rocksdb",
+      "corpus_id": "corpus2",
+      "p29_cold_bytes": 9823481,
+      "p29_over_z19long": 1.550166978404926,
+      "project": "RocksDB",
+      "raw_ii_bytes": 3114320596,
+      "raw_source_bytes": 32809668,
+      "source_110pct_gate_bytes": 4575403,
+      "source_basis": "filtered project source set",
+      "source_pass": null,
+      "tu100": {
+        "actual_tu": 100,
+        "content_sha256": "21fea204121f1e567338ef615773b529569d08af61fa8c0b7a4bd3ae0f5ae7c7",
+        "delta_bytes": 595441,
+        "eligible": true,
+        "p29_over_z6long": 1.1550547654053254,
+        "p29_wire_bytes": 4435639,
+        "pass": false,
+        "raw_bytes": 669183165,
+        "requested_tu": 100,
+        "z6long_bytes": 3840198
+      },
+      "tu200": {
+        "actual_tu": 200,
+        "content_sha256": "74909e596c21de3e5ddc91719350f8dea8f7152b47c161011f26ba074530730f",
+        "delta_bytes": 814603,
+        "eligible": true,
+        "p29_over_z6long": 1.1504449523281852,
+        "p29_wire_bytes": 6229228,
+        "pass": false,
+        "raw_bytes": 1224557334,
+        "requested_tu": 200,
+        "z6long_bytes": 5414625
+      },
+      "tus": 622,
+      "z19long_ii_bytes": 6337047,
+      "z19long_source_bytes": 4159458
+    },
+    {
+      "candidate_source_bytes": null,
+      "cold_110pct_gate_bytes": 7883713,
+      "cold_pass": false,
+      "corpus": "duckdb",
+      "corpus_id": "corpus3",
+      "p29_cold_bytes": 9589726,
+      "p29_over_z19long": 1.3380368276207715,
+      "project": "DuckDB",
+      "raw_ii_bytes": 1985715205,
+      "raw_source_bytes": 63983867,
+      "source_110pct_gate_bytes": 7996198,
+      "source_basis": "filtered project source set",
+      "source_pass": null,
+      "tu100": {
+        "actual_tu": 100,
+        "content_sha256": "963ec3c433a2156ed892171a7fbdd2b2f67b5946a8d8b36ec211e1a70364d4b0",
+        "delta_bytes": -348372,
+        "eligible": true,
+        "p29_over_z6long": 0.8364099715291027,
+        "p29_wire_bytes": 1781171,
+        "pass": true,
+        "raw_bytes": 314498355,
+        "requested_tu": 100,
+        "z6long_bytes": 2129543
+      },
+      "tu200": {
+        "actual_tu": 200,
+        "content_sha256": "21810373bf0576cb89176e7acd62c733a4a75dcd6589b5696a34c0c1c9d76461",
+        "delta_bytes": -356058,
+        "eligible": true,
+        "p29_over_z6long": 0.8749528076423699,
+        "p29_wire_bytes": 2491331,
+        "pass": true,
+        "raw_bytes": 646795216,
+        "requested_tu": 200,
+        "z6long_bytes": 2847389
+      },
+      "tus": 689,
+      "z19long_ii_bytes": 7167012,
+      "z19long_source_bytes": 7269271
+    },
+    {
+      "candidate_source_bytes": null,
+      "cold_110pct_gate_bytes": 4531877,
+      "cold_pass": false,
+      "corpus": "abseil",
+      "corpus_id": "corpus4",
+      "p29_cold_bytes": 5863183,
+      "p29_over_z19long": 1.4231410118088132,
+      "project": "abseil+protobuf",
+      "raw_ii_bytes": 2581008467,
+      "raw_source_bytes": 34756832,
+      "source_110pct_gate_bytes": 4161039,
+      "source_basis": "filtered project source set",
+      "source_pass": null,
+      "tu100": {
+        "actual_tu": 100,
+        "content_sha256": "ed71630b56c0f2e6dee8dac91dc7a308a09191302d9106d0c1363fe1122cff30",
+        "delta_bytes": 98391,
+        "eligible": true,
+        "p29_over_z6long": 1.0598115399415324,
+        "p29_wire_bytes": 1743408,
+        "pass": false,
+        "raw_bytes": 284336916,
+        "requested_tu": 100,
+        "z6long_bytes": 1645017
+      },
+      "tu200": {
+        "actual_tu": 200,
+        "content_sha256": "4b4a2461866e651e9c481e56a8b35b11768e07a4821886144213085f57744803",
+        "delta_bytes": 151015,
+        "eligible": true,
+        "p29_over_z6long": 1.0648376536252884,
+        "p29_wire_bytes": 2480140,
+        "pass": false,
+        "raw_bytes": 548396320,
+        "requested_tu": 200,
+        "z6long_bytes": 2329125
+      },
+      "tus": 700,
+      "z19long_ii_bytes": 4119889,
+      "z19long_source_bytes": 3782763
+    },
+    {
+      "candidate_source_bytes": null,
+      "cold_110pct_gate_bytes": 7255924,
+      "cold_pass": false,
+      "corpus": "opencv",
+      "corpus_id": "corpus5",
+      "p29_cold_bytes": 8563234,
+      "p29_over_z19long": 1.2981884527602237,
+      "project": "OpenCV",
+      "raw_ii_bytes": 4630994774,
+      "raw_source_bytes": 77963324,
+      "source_110pct_gate_bytes": 9869404,
+      "source_basis": "filtered project source set",
+      "source_pass": null,
+      "tu100": {
+        "actual_tu": 100,
+        "content_sha256": "0d3bcdd8ae52d19f50fd5962fc2fd5fa2877acf2dcfd680beb666eff8fe86587",
+        "delta_bytes": -17314,
+        "eligible": true,
+        "p29_over_z6long": 0.972923944965893,
+        "p29_wire_bytes": 622144,
+        "pass": true,
+        "raw_bytes": 110856373,
+        "requested_tu": 100,
+        "z6long_bytes": 639458
+      },
+      "tu200": {
+        "actual_tu": 200,
+        "content_sha256": "e5b8a243d7c55d2a28c8ea15d4237ad91e48998826375899d72a0bdccc14bb36",
+        "delta_bytes": 116340,
+        "eligible": true,
+        "p29_over_z6long": 1.0778980254986472,
+        "p29_wire_bytes": 1609831,
+        "pass": false,
+        "raw_bytes": 307655351,
+        "requested_tu": 200,
+        "z6long_bytes": 1493491
+      },
+      "tus": 1506,
+      "z19long_ii_bytes": 6596295,
+      "z19long_source_bytes": 8972186
+    },
+    {
+      "candidate_source_bytes": null,
+      "cold_110pct_gate_bytes": 64118473,
+      "cold_pass": true,
+      "corpus": "godot",
+      "corpus_id": "corpus6",
+      "p29_cold_bytes": 39589524,
+      "p29_over_z19long": 0.6791876707993535,
+      "project": "Godot",
+      "raw_ii_bytes": 5932762185,
+      "raw_source_bytes": 364874847,
+      "source_110pct_gate_bytes": 71677489,
+      "source_basis": "filtered project source set",
+      "source_pass": null,
+      "tu100": {
+        "actual_tu": 100,
+        "content_sha256": "d840c39a9b0617f7d3c7bcd729c768fbb122b714fc1d7904286f9cd6b9921256",
+        "delta_bytes": 71621,
+        "eligible": true,
+        "p29_over_z6long": 1.0555023426590227,
+        "p29_wire_bytes": 1362035,
+        "pass": false,
+        "raw_bytes": 204440064,
+        "requested_tu": 100,
+        "z6long_bytes": 1290414
+      },
+      "tu200": {
+        "actual_tu": 200,
+        "content_sha256": "6bb639bafe11b02b784dd6f605c8333504ff2b704ca08b51c46297fb2087be05",
+        "delta_bytes": 160666,
+        "eligible": true,
+        "p29_over_z6long": 1.072648693425914,
+        "p29_wire_bytes": 2372213,
+        "pass": false,
+        "raw_bytes": 382645585,
+        "requested_tu": 200,
+        "z6long_bytes": 2211547
+      },
+      "tus": 2207,
+      "z19long_ii_bytes": 58289521,
+      "z19long_source_bytes": 65161354
+    },
+    {
+      "candidate_source_bytes": null,
+      "cold_110pct_gate_bytes": 813913,
+      "cold_pass": false,
+      "corpus": "fmt",
+      "corpus_id": "corpus7",
+      "p29_cold_bytes": 1046398,
+      "p29_over_z19long": 1.4142023270051802,
+      "project": "fmt",
+      "raw_ii_bytes": 136350082,
+      "raw_source_bytes": 2526674,
+      "source_110pct_gate_bytes": 479306,
+      "source_basis": "filtered project source set",
+      "source_pass": null,
+      "tu100": {
+        "actual_tu": 50,
+        "content_sha256": "e8ed041b36e00561eae45f2f957621d8bf24334e00e0f9ca075e197d7bef0937",
+        "delta_bytes": 93844,
+        "eligible": false,
+        "p29_over_z6long": 1.0985182992250309,
+        "p29_wire_bytes": 1046398,
+        "pass": null,
+        "raw_bytes": 136350082,
+        "requested_tu": 100,
+        "z6long_bytes": 952554
+      },
+      "tu200": {
+        "actual_tu": 50,
+        "content_sha256": "e8ed041b36e00561eae45f2f957621d8bf24334e00e0f9ca075e197d7bef0937",
+        "delta_bytes": 93844,
+        "eligible": false,
+        "p29_over_z6long": 1.0985182992250309,
+        "p29_wire_bytes": 1046398,
+        "pass": null,
+        "raw_bytes": 136350082,
+        "requested_tu": 200,
+        "z6long_bytes": 952554
+      },
+      "tus": 50,
+      "z19long_ii_bytes": 739921,
+      "z19long_source_bytes": 435733
+    },
+    {
+      "candidate_source_bytes": null,
+      "cold_110pct_gate_bytes": 519412,
+      "cold_pass": false,
+      "corpus": "spdlog",
+      "corpus_id": "corpus8",
+      "p29_cold_bytes": 539513,
+      "p29_over_z19long": 1.142568822494192,
+      "project": "spdlog",
+      "raw_ii_bytes": 98384472,
+      "raw_source_bytes": 1149610,
+      "source_110pct_gate_bytes": 218694,
+      "source_basis": "filtered project source set",
+      "source_pass": null,
+      "tu100": {
+        "actual_tu": 34,
+        "content_sha256": "a6bf245d465df9e534f81d1a35e139506771dcb923f5f35106b59bd110c01751",
+        "delta_bytes": -48943,
+        "eligible": false,
+        "p29_over_z6long": 0.9168281060945933,
+        "p29_wire_bytes": 539513,
+        "pass": null,
+        "raw_bytes": 98384472,
+        "requested_tu": 100,
+        "z6long_bytes": 588456
+      },
+      "tu200": {
+        "actual_tu": 34,
+        "content_sha256": "a6bf245d465df9e534f81d1a35e139506771dcb923f5f35106b59bd110c01751",
+        "delta_bytes": -48943,
+        "eligible": false,
+        "p29_over_z6long": 0.9168281060945933,
+        "p29_wire_bytes": 539513,
+        "pass": null,
+        "raw_bytes": 98384472,
+        "requested_tu": 200,
+        "z6long_bytes": 588456
+      },
+      "tus": 34,
+      "z19long_ii_bytes": 472193,
+      "z19long_source_bytes": 198813
+    },
+    {
+      "candidate_source_bytes": null,
+      "cold_110pct_gate_bytes": 932544,
+      "cold_pass": false,
+      "corpus": "catch2",
+      "corpus_id": "corpus9",
+      "p29_cold_bytes": 1006039,
+      "p29_over_z19long": 1.1866914061394156,
+      "project": "Catch2",
+      "raw_ii_bytes": 947252235,
+      "raw_source_bytes": 2740336,
+      "source_110pct_gate_bytes": 274797,
+      "source_basis": "filtered project source set",
+      "source_pass": null,
+      "tu100": {
+        "actual_tu": 100,
+        "content_sha256": "2ad482f44007be06b5f225425989efea6d5909e071e7cd2bca113a69c7c45959",
+        "delta_bytes": -69033,
+        "eligible": true,
+        "p29_over_z6long": 0.8702877296359834,
+        "p29_wire_bytes": 463168,
+        "pass": true,
+        "raw_bytes": 102344296,
+        "requested_tu": 100,
+        "z6long_bytes": 532201
+      },
+      "tu200": {
+        "actual_tu": 200,
+        "content_sha256": "d8bcc55739c347453866168e41f680abf1dff8eeb11be2d4115d32064e202ebc",
+        "delta_bytes": -28518,
+        "eligible": true,
+        "p29_over_z6long": 0.9538340499378367,
+        "p29_wire_bytes": 589210,
+        "pass": true,
+        "raw_bytes": 212426768,
+        "requested_tu": 200,
+        "z6long_bytes": 617728
+      },
+      "tus": 857,
+      "z19long_ii_bytes": 847768,
+      "z19long_source_bytes": 249816
+    },
+    {
+      "candidate_source_bytes": null,
+      "cold_110pct_gate_bytes": 894095,
+      "cold_pass": false,
+      "corpus": "nlohmann-json",
+      "corpus_id": "corpus10",
+      "p29_cold_bytes": 1168818,
+      "p29_over_z19long": 1.4379895031335583,
+      "project": "nlohmann-json",
+      "raw_ii_bytes": 293917707,
+      "raw_source_bytes": 5816059,
+      "source_110pct_gate_bytes": 447003,
+      "source_basis": "filtered project source set",
+      "source_pass": null,
+      "tu100": {
+        "actual_tu": 99,
+        "content_sha256": "0e08a1abdc53d6b9b644cacfb3ad435a67cadd293797ed915927c2da071dcff2",
+        "delta_bytes": 105510,
+        "eligible": false,
+        "p29_over_z6long": 1.0992280693834713,
+        "p29_wire_bytes": 1168818,
+        "pass": null,
+        "raw_bytes": 293917707,
+        "requested_tu": 100,
+        "z6long_bytes": 1063308
+      },
+      "tu200": {
+        "actual_tu": 99,
+        "content_sha256": "0e08a1abdc53d6b9b644cacfb3ad435a67cadd293797ed915927c2da071dcff2",
+        "delta_bytes": 105510,
+        "eligible": false,
+        "p29_over_z6long": 1.0992280693834713,
+        "p29_wire_bytes": 1168818,
+        "pass": null,
+        "raw_bytes": 293917707,
+        "requested_tu": 200,
+        "z6long_bytes": 1063308
+      },
+      "tus": 99,
+      "z19long_ii_bytes": 812814,
+      "z19long_source_bytes": 406367
+    },
+    {
+      "candidate_source_bytes": null,
+      "cold_110pct_gate_bytes": 842700,
+      "cold_pass": false,
+      "corpus": "range-v3",
+      "corpus_id": "corpus11",
+      "p29_cold_bytes": 874082,
+      "p29_over_z19long": 1.1409636714176252,
+      "project": "range-v3",
+      "raw_ii_bytes": 632049016,
+      "raw_source_bytes": 3544049,
+      "source_110pct_gate_bytes": 339935,
+      "source_basis": "filtered project source set",
+      "source_pass": null,
+      "tu100": {
+        "actual_tu": 100,
+        "content_sha256": "6b8d7a594be9de70cd89b5e857759a019f692c33f330a55f8ebb4703a4bfbae9",
+        "delta_bytes": -65216,
+        "eligible": true,
+        "p29_over_z6long": 0.8948028925333217,
+        "p29_wire_bytes": 554725,
+        "pass": true,
+        "raw_bytes": 247655440,
+        "requested_tu": 100,
+        "z6long_bytes": 619941
+      },
+      "tu200": {
+        "actual_tu": 200,
+        "content_sha256": "8c368edc0bece637e86610a52df59304b1842790e2c31ed893719ff7bf8e34d3",
+        "delta_bytes": -113472,
+        "eligible": true,
+        "p29_over_z6long": 0.873549218207611,
+        "p29_wire_bytes": 783889,
+        "pass": true,
+        "raw_bytes": 484251452,
+        "requested_tu": 200,
+        "z6long_bytes": 897361
+      },
+      "tus": 259,
+      "z19long_ii_bytes": 766091,
+      "z19long_source_bytes": 309032
+    },
+    {
+      "candidate_source_bytes": null,
+      "cold_110pct_gate_bytes": 1542344,
+      "cold_pass": true,
+      "corpus": "eigen",
+      "corpus_id": "corpus12",
+      "p29_cold_bytes": 1377958,
+      "p29_over_z19long": 0.9827598134553761,
+      "project": "Eigen",
+      "raw_ii_bytes": 3532268956,
+      "raw_source_bytes": 15554674,
+      "source_110pct_gate_bytes": 2065114,
+      "source_basis": "filtered project source set",
+      "source_pass": null,
+      "tu100": {
+        "actual_tu": 100,
+        "content_sha256": "e6347ceaf40247eb42088afaa612a8dcf5d782e6522de4898bc5fbebd3b3f514",
+        "delta_bytes": -75487,
+        "eligible": true,
+        "p29_over_z6long": 0.9017240952828555,
+        "p29_wire_bytes": 692626,
+        "pass": true,
+        "raw_bytes": 538626320,
+        "requested_tu": 100,
+        "z6long_bytes": 768113
+      },
+      "tu200": {
+        "actual_tu": 200,
+        "content_sha256": "51f5aa47a20ff3f7cb7ccd7bcc3173eae1222583ca8975e9d6e2b20d6b373b1c",
+        "delta_bytes": -73509,
+        "eligible": true,
+        "p29_over_z6long": 0.9365871500750941,
+        "p29_wire_bytes": 1085704,
+        "pass": true,
+        "raw_bytes": 1098381060,
+        "requested_tu": 200,
+        "z6long_bytes": 1159213
+      },
+      "tus": 650,
+      "z19long_ii_bytes": 1402131,
+      "z19long_source_bytes": 1877377
+    },
+    {
+      "candidate_source_bytes": null,
+      "cold_110pct_gate_bytes": 472488,
+      "cold_pass": false,
+      "corpus": "re2",
+      "corpus_id": "corpus13",
+      "p29_cold_bytes": 488243,
+      "p29_over_z19long": 1.1366780355500716,
+      "project": "re2",
+      "raw_ii_bytes": 110231455,
+      "raw_source_bytes": 1123171,
+      "source_110pct_gate_bytes": 235706,
+      "source_basis": "filtered project source set",
+      "source_pass": null,
+      "tu100": {
+        "actual_tu": 72,
+        "content_sha256": "fc6fdd85c63f358f290940eec83810fb871eb3b739e9850b8ce1e196de4de7db",
+        "delta_bytes": -45504,
+        "eligible": false,
+        "p29_over_z6long": 0.9147461250367683,
+        "p29_wire_bytes": 488243,
+        "pass": null,
+        "raw_bytes": 110231455,
+        "requested_tu": 100,
+        "z6long_bytes": 533747
+      },
+      "tu200": {
+        "actual_tu": 72,
+        "content_sha256": "fc6fdd85c63f358f290940eec83810fb871eb3b739e9850b8ce1e196de4de7db",
+        "delta_bytes": -45504,
+        "eligible": false,
+        "p29_over_z6long": 0.9147461250367683,
+        "p29_wire_bytes": 488243,
+        "pass": null,
+        "raw_bytes": 110231455,
+        "requested_tu": 200,
+        "z6long_bytes": 533747
+      },
+      "tus": 72,
+      "z19long_ii_bytes": 429535,
+      "z19long_source_bytes": 214279
+    },
+    {
+      "candidate_source_bytes": null,
+      "cold_110pct_gate_bytes": 609514,
+      "cold_pass": false,
+      "corpus": "leveldb",
+      "corpus_id": "corpus14",
+      "p29_cold_bytes": 685350,
+      "p29_over_z19long": 1.2368616721770642,
+      "project": "LevelDB",
+      "raw_ii_bytes": 143868249,
+      "raw_source_bytes": 4771970,
+      "source_110pct_gate_bytes": 791627,
+      "source_basis": "filtered project source set",
+      "source_pass": null,
+      "tu100": {
+        "actual_tu": 72,
+        "content_sha256": "83fca047531416b8827f7892f94403fc5273d84c8ef6e614daa2af762ce59166",
+        "delta_bytes": -20876,
+        "eligible": false,
+        "p29_over_z6long": 0.9704400574320402,
+        "p29_wire_bytes": 685350,
+        "pass": null,
+        "raw_bytes": 143868249,
+        "requested_tu": 100,
+        "z6long_bytes": 706226
+      },
+      "tu200": {
+        "actual_tu": 72,
+        "content_sha256": "83fca047531416b8827f7892f94403fc5273d84c8ef6e614daa2af762ce59166",
+        "delta_bytes": -20876,
+        "eligible": false,
+        "p29_over_z6long": 0.9704400574320402,
+        "p29_wire_bytes": 685350,
+        "pass": null,
+        "raw_bytes": 143868249,
+        "requested_tu": 200,
+        "z6long_bytes": 706226
+      },
+      "tus": 72,
+      "z19long_ii_bytes": 554104,
+      "z19long_source_bytes": 719661
+    },
+    {
+      "candidate_source_bytes": null,
+      "cold_110pct_gate_bytes": 1139682,
+      "cold_pass": false,
+      "corpus": "simdjson",
+      "corpus_id": "corpus15",
+      "p29_cold_bytes": 1408595,
+      "p29_over_z19long": 1.3595492604299881,
+      "project": "simdjson",
+      "raw_ii_bytes": 468377342,
+      "raw_source_bytes": 16049094,
+      "source_110pct_gate_bytes": 629654,
+      "source_basis": "filtered project source set",
+      "source_pass": null,
+      "tu100": {
+        "actual_tu": 100,
+        "content_sha256": "7c295d617e72fa3629f158c3f9c970786dccb8d46de92246600991063b0523d6",
+        "delta_bytes": 48979,
+        "eligible": true,
+        "p29_over_z6long": 1.042117220344288,
+        "p29_wire_bytes": 1211900,
+        "pass": false,
+        "raw_bytes": 298179308,
+        "requested_tu": 100,
+        "z6long_bytes": 1162921
+      },
+      "tu200": {
+        "actual_tu": 153,
+        "content_sha256": "a849a223d69636004047e42ff999b7d837bba193a05d98aeb0ed9667d85b8b03",
+        "delta_bytes": 79886,
+        "eligible": false,
+        "p29_over_z6long": 1.0601230216699067,
+        "p29_wire_bytes": 1408595,
+        "pass": null,
+        "raw_bytes": 468377342,
+        "requested_tu": 200,
+        "z6long_bytes": 1328709
+      },
+      "tus": 153,
+      "z19long_ii_bytes": 1036075,
+      "z19long_source_bytes": 572413
+    },
+    {
+      "candidate_source_bytes": null,
+      "cold_110pct_gate_bytes": 541711,
+      "cold_pass": true,
+      "corpus": "cereal",
+      "corpus_id": "corpus16",
+      "p29_cold_bytes": 512588,
+      "p29_over_z19long": 1.0408617871320804,
+      "project": "cereal",
+      "raw_ii_bytes": 326899429,
+      "raw_source_bytes": 1975723,
+      "source_110pct_gate_bytes": 269010,
+      "source_basis": "filtered project source set",
+      "source_pass": null,
+      "tu100": {
+        "actual_tu": 84,
+        "content_sha256": "b2ebd1cd8568a4d5843c7bac9990414d964bf3d0eb0a17af2f55ebca2c20f9bf",
+        "delta_bytes": -106786,
+        "eligible": false,
+        "p29_over_z6long": 0.8275904380874883,
+        "p29_wire_bytes": 512588,
+        "pass": null,
+        "raw_bytes": 326899429,
+        "requested_tu": 100,
+        "z6long_bytes": 619374
+      },
+      "tu200": {
+        "actual_tu": 84,
+        "content_sha256": "b2ebd1cd8568a4d5843c7bac9990414d964bf3d0eb0a17af2f55ebca2c20f9bf",
+        "delta_bytes": -106786,
+        "eligible": false,
+        "p29_over_z6long": 0.8275904380874883,
+        "p29_wire_bytes": 512588,
+        "pass": null,
+        "raw_bytes": 326899429,
+        "requested_tu": 200,
+        "z6long_bytes": 619374
+      },
+      "tus": 84,
+      "z19long_ii_bytes": 492465,
+      "z19long_source_bytes": 244555
+    }
+  ],
+  "schema": "compression-tournament-gates-v1"
+}
