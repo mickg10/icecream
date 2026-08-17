@@ -1,0 +1,35 @@
+# material_lab Phase-1 coverage manifest — provenance of census/ledger runs (2026-08-17)
+# Inventories (per local-oracle): keep these four separate in all model reports.
+#   native-25        : 39,486 TUs (corpus + corpus2..corpus25)      [the full native set]
+#   fixed-16 (P25-P29): 9,292 TUs (corpus + corpus2..corpus16)      [THIS Phase-1 go/no-go set; bigoracle target set]
+#   four-profile v1  : 44 pilot cells, 11 projects, 21,657 TUs      [cross-profile dev data; NOT run here]
+#   cmake-150        : 150 candidates (75 cloned, 0 frozen-v2)      [NOT run here]
+# Phase-1 (RBASE-M3 ledger + residual census + S0 O0 free-def ceiling) ran on: fixed-16 ONLY.
+# Reader: native manifest (~/ictmp/<corpus>/manifest.txt). tar.zst shared-archive reader = TODO (design below).
+#
+# dataset	corpus_dir	project	TUs	inventory	reader	notes
+fixed16	corpus	LLVM	1238	fixed-16;native-25	manifest	trust-anchor gate n/a (DuckDB/RocksDB are the byte-exact anchors)
+fixed16	corpus2	RocksDB	622	fixed-16;native-25	manifest	RBASE-M3 anchor = 10,111,855 B (byte-exact)
+fixed16	corpus3	DuckDB	689	fixed-16;native-25	manifest	RBASE-M3 anchor = 9,802,066 B (byte-exact)
+fixed16	corpus4	abseil	700	fixed-16;native-25	manifest	
+fixed16	corpus5	OpenCV	1506	fixed-16;native-25	manifest	
+fixed16	corpus6	Godot	2207	fixed-16;native-25	manifest	
+fixed16	corpus7	fmt	50	fixed-16;native-25	manifest	
+fixed16	corpus8	spdlog	34	fixed-16;native-25	manifest	
+fixed16	corpus9	Catch2	857	fixed-16;native-25	manifest	
+fixed16	corpus10	json	99	fixed-16;native-25	manifest	nlohmann/json
+fixed16	corpus11	range-v3	259	fixed-16;native-25	manifest	
+fixed16	corpus12	Eigen	650	fixed-16;native-25	manifest	
+fixed16	corpus13	re2	72	fixed-16;native-25	manifest	
+fixed16	corpus14	LevelDB	72	fixed-16;native-25	manifest	
+fixed16	corpus15	simdjson	153	fixed-16;native-25	manifest	
+fixed16	corpus16	cereal	84	fixed-16;native-25	manifest	
+native-only	corpus17	GCC	?	native-25	manifest	coverage pass (not gate)
+native-only	corpus18	Firefox	9646	native-25	manifest	MEGA — coverage pass only
+native-only	corpus19	Qt6	?	native-25	manifest	coverage pass
+native-only	corpus20	ClickHouse	11741	native-25	manifest	MEGA — coverage pass only
+native-only	corpus21	PyTorch	?	native-25	manifest	coverage pass
+native-only	corpus22	Folly	?	native-25	manifest	coverage pass
+native-only	corpus23	Arrow	?	native-25	manifest	coverage pass
+native-only	corpus24	Bitcoin	?	native-25	manifest	coverage pass
+native-only	corpus25	V8	?	native-25	manifest	coverage pass
