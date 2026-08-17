@@ -131,13 +131,15 @@ uint32_t MixedEncoder::materialize(const Interner& dict, const std::vector<uint3
                     put_zigzag(mixedRaw[0],int64_t(state.source_region)-int64_t(r));
                     put_varint(mixedRaw[0],state.source_offset);put_varint(mixedRaw[0],line.len);
                     ++op8_count; op8_wire+=line.len;
-                    if(fknownPublic.size()<=ord){fknownPublic.resize(size_t(ord)+1,0);} fknownPublic[ord]=1;
+                    if(fknownPublic.size()<=ord) fknownPublic.resize(size_t(ord)+1,0);
+                    fknownPublic[ord]=1;
                 } else {
                     // op7 DEFINE_FROM_BYTES: re-bind ordinal with exact immutable bytes (literal lane).
                     mixedRaw[0].push_back(7);put_varint(mixedRaw[0],ord);put_varint(mixedRaw[0],line.len);
                     mixedRaw[1].insert(mixedRaw[1].end(),text,text+line.len);
                     ++op7_count; op7_wire+=line.len;
-                    if(fknownPublic.size()<=ord){fknownPublic.resize(size_t(ord)+1,0);} fknownPublic[ord]=1;
+                    if(fknownPublic.size()<=ord) fknownPublic.resize(size_t(ord)+1,0);
+                    fknownPublic[ord]=1;
                 }
             } else if(state.source_region!=UINT32_MAX&&state.source_region!=r){
                 if(state.source_region>=r||state.source_offset+line.len>dict.region_raw_len(state.source_region)||
@@ -146,7 +148,8 @@ uint32_t MixedEncoder::materialize(const Interner& dict, const std::vector<uint3
                 }
                 flushLiteral();
                 uint32_t ord=nextMixedPublic++; state.public_id=ord;
-                if(fknownPublic.size()<=ord){fknownPublic.resize(size_t(ord)+1,0);} fknownPublic[ord]=1;   // F materializes it now
+                if(fknownPublic.size()<=ord) fknownPublic.resize(size_t(ord)+1,0);
+                fknownPublic[ord]=1;   // F materializes it now
                 if(state.source_region<fknownReg.size() && fknownReg[state.source_region]){
                     // op1 PUBLISH_VIEW (cold + recovery-with-source): implicit ordinal from a view into F's source Region.
                     mixedRaw[0].push_back(1);put_zigzag(mixedRaw[0],int64_t(state.source_region)-int64_t(r));
@@ -225,14 +228,20 @@ bool FStore::decode_fill(const std::array<std::vector<uint8_t>,6>& recovered,
                          const std::vector<uint8_t>& fill_paths, uint32_t t){
     const size_t ck_rd=FmixedRegionData.size();
     const size_t ck_paths=Fpaths.size();
+    const size_t ck_public_size=FpublicBytes.size();
     const uint32_t ck_pubnext=Fpublic_next;
-    std::vector<uint32_t> committedRegions;      // regions marked .known this call
+    const uint32_t ck_public_held=publicHeld;
+    std::vector<std::pair<uint32_t,MixedFRegionView>> committedRegions;
     std::vector<uint32_t> publicFlips;           // ordinals flipped absent->present this call
+    std::vector<uint32_t> publicTouches;         // last-use changes commit only after the whole Fill validates
     auto rollback=[&](const char* why)->bool{
         fprintf(stderr,"decode_fill: rollback (%s) — nothing committed\n",why);
         FmixedRegionData.resize(ck_rd); Fpaths.resize(ck_paths); Fpublic_next=ck_pubnext;
-        for(uint32_t r:committedRegions) FmixedRegions[r].known=false;
-        for(uint32_t o:publicFlips){ FpublicPresent[o]=0; std::vector<uint8_t>().swap(FpublicBytes[o]); if(publicHeld) --publicHeld; }
+        for(auto undo=committedRegions.rbegin();undo!=committedRegions.rend();++undo)
+            FmixedRegions[undo->first]=undo->second;
+        for(uint32_t o:publicFlips){ FpublicPresent[o]=0; std::vector<uint8_t>().swap(FpublicBytes[o]); }
+        FpublicBytes.resize(ck_public_size); FpublicPresent.resize(ck_public_size); FpublicLastUse.resize(ck_public_size);
+        publicHeld=ck_public_held;
         return false;
     };
     auto ensurePublic=[&](uint32_t ord){ if(FpublicBytes.size()<=ord){ FpublicBytes.resize(size_t(ord)+1); FpublicPresent.resize(size_t(ord)+1,0); FpublicLastUse.resize(size_t(ord)+1,0); } };
@@ -241,9 +250,9 @@ bool FStore::decode_fill(const std::array<std::vector<uint8_t>,6>& recovered,
         ensurePublic(ord);
         if(FpublicPresent[ord]){
             if(FpublicBytes[ord].size()!=n || (n && memcmp(FpublicBytes[ord].data(),p,n))) return false;   // UNEQUAL REBIND
-            FpublicLastUse[ord]=t; return true;                                                            // idempotent
+            publicTouches.push_back(ord); return true;                                                     // idempotent; age commits with Fill
         }
-        FpublicBytes[ord].assign(p,p+n); FpublicPresent[ord]=1; FpublicLastUse[ord]=t; ++publicHeld; publicFlips.push_back(ord); return true;
+        FpublicBytes[ord].assign(p,p+n); FpublicPresent[ord]=1; ++publicHeld; publicFlips.push_back(ord); publicTouches.push_back(ord); return true;
     };
 
     // ---- install Fpaths (checkpointed) ----
@@ -269,7 +278,8 @@ bool FStore::decode_fill(const std::array<std::vector<uint8_t>,6>& recovered,
             uint32_t regionId=missReg[k];if(regionId>=FmixedRegions.size()||FmixedRegions[regionId].known)return rollback("region identity");
             uint64_t rawLength=get_varint(cp);size_t begin=FmixedRegionData.size();
             while(FmixedRegionData.size()-begin<rawLength){
-                if(cp>=ce){return rollback("trunc control");}uint8_t op=*cp++;
+                if(cp>=ce)return rollback("trunc control");
+                uint8_t op=*cp++;
                 if(op==0){uint64_t length=get_varint(cp);if(length>uint64_t(le-lp))return rollback("trunc literal");FmixedRegionData.insert(FmixedRegionData.end(),lp,lp+length);lp+=length;}
                 else if(op==1){int64_t source=int64_t(regionId)+get_zigzag(cp);uint64_t offset=get_varint(cp),length=get_varint(cp);
                   if(source<0||uint64_t(source)>=FmixedRegions.size()||!FmixedRegions[source].known||offset+length>FmixedRegions[source].length)return rollback("bad publish view");
@@ -277,13 +287,14 @@ bool FStore::decode_fill(const std::array<std::vector<uint8_t>,6>& recovered,
                   uint32_t ord=Fpublic_next++;                                                     // implicit ordinal (== C's nextMixedPublic)
                   if(!bindPublic(ord,FmixedRegionData.data()+destination,length))return rollback("op1 rebind");   // MATERIALIZE immutable bytes
                 } else if(op==2){uint64_t publicId=get_varint(cp);if(!publicId||publicId>=FpublicBytes.size()||!FpublicPresent[publicId])return rollback("bad public ref");
-                  const std::vector<uint8_t>&bytes=FpublicBytes[publicId];FpublicLastUse[publicId]=t;
+                  const std::vector<uint8_t>&bytes=FpublicBytes[publicId];publicTouches.push_back(uint32_t(publicId));
                   FmixedRegionData.insert(FmixedRegionData.end(),bytes.begin(),bytes.end());        // resolve from IMMUTABLE bytes
                 } else if(op==3){if(arraysUsed>=arrayCount)return rollback("missing array rec");uint64_t styleId=get_varint(ap),count=get_varint(ap);
                   if(styleId>=mixedStyles.size()||count>uint64_t(ve-vp))return rollback("bad array rec");
                   append_rendered_byte_array(mixedStyles[styleId],vp,count,FmixedRegionData);vp+=count;++arraysUsed;
                 } else if(op==4){uint64_t pathId=get_varint(cp),lineNumber=get_varint(cp),flagCount=get_varint(cp);
-                  if(pathId>=Fpaths.size()||flagCount>uint64_t(ce-cp)){return rollback("bad marker rec");}Marker marker;marker.path=Fpaths[pathId];marker.lineno=lineNumber;
+                  if(pathId>=Fpaths.size()||flagCount>uint64_t(ce-cp))return rollback("bad marker rec");
+                  Marker marker;marker.path=Fpaths[pathId];marker.lineno=lineNumber;
                   marker.flags.assign(cp,cp+flagCount);cp+=flagCount;std::vector<uint8_t> tmp;emit_marker(marker,tmp);FmixedRegionData.insert(FmixedRegionData.end(),tmp.begin(),tmp.end());
                 } else if(op==7){uint64_t ord=get_varint(cp),len=get_varint(cp);if(len>uint64_t(le-lp))return rollback("trunc op7 bytes");
                   const uint8_t* b7=lp; lp+=len; FmixedRegionData.insert(FmixedRegionData.end(),b7,b7+len);             // emit into region
@@ -300,10 +311,12 @@ bool FStore::decode_fill(const std::array<std::vector<uint8_t>,6>& recovered,
                 } else return rollback("bad opcode");
                 if(FmixedRegionData.size()-begin>rawLength)return rollback("region overrun");
             }
-            FmixedRegions[regionId]={begin,uint32_t(rawLength),true}; committedRegions.push_back(regionId);
+            committedRegions.emplace_back(regionId,FmixedRegions[regionId]);
+            FmixedRegions[regionId]={begin,uint32_t(rawLength),true};
         }
         if(cp!=ce||lp!=le||ap!=ae||vp!=ve||arraysUsed!=arrayCount)return rollback("stream trailing");
     } else if(!missReg.empty()||!recovered[1].empty()) return rollback("partial region streams");
+    for(uint32_t ord:publicTouches) FpublicLastUse[ord]=t;
     return true;
 }
 

@@ -92,6 +92,40 @@ int main(){
         check(F.FmixedRegionData.size()==rd0 && !F.FmixedRegions[0].known,"op10 reject commits nothing");
     }
 
-    printf("cap_m2_test (rebind + rollback + op10-stub): %s\n", fails==0?"PASS":"FAIL");
+    // ===== TEST 7: rollback restores cache age, vector extent, and complete Region view =====
+    fprintf(stderr,"[7] complete rollback state:\n");
+    {
+        FStore F; F.init(/*NREG*/8,/*NBLK*/0); std::vector<uint8_t> nopaths;
+        std::array<std::vector<uint8_t>,6> first; std::string h="hello world\n";
+        one_region_op7(first,5,h);
+        check(F.decode_fill(first,std::vector<uint32_t>{0u},nopaths,3),"seed public ordinal 5 at TU 3");
+        check(F.FpublicLastUse[5]==3,"seed last-use committed at TU 3");
+
+        std::array<std::vector<uint8_t>,6> badRef; for(auto&v:badRef)v.clear();
+        put_varint(badRef[0],1); put_varint(badRef[0],h.size()+1);
+        badRef[0].push_back(2); put_varint(badRef[0],5); // touches held ordinal
+        badRef[0].push_back(200);                        // then reject the Fill
+        check(!F.decode_fill(badRef,std::vector<uint32_t>{1u},nopaths,99),"failed Fill after op2 rejected");
+        check(F.FpublicLastUse[5]==3,"failed Fill does not age a held public Line");
+
+        size_t publicSize=F.FpublicBytes.size();
+        std::array<std::vector<uint8_t>,6> badGrow; for(auto&v:badGrow)v.clear();
+        put_varint(badGrow[0],1); put_varint(badGrow[0],5);
+        badGrow[0].push_back(7); put_varint(badGrow[0],100); put_varint(badGrow[0],4);
+        badGrow[1].insert(badGrow[1].end(),{'g','r','o','w'}); badGrow[0].push_back(200);
+        check(!F.decode_fill(badGrow,std::vector<uint32_t>{1u},nopaths,100),"failed Fill after public-vector growth rejected");
+        check(F.FpublicBytes.size()==publicSize && F.FpublicPresent.size()==publicSize && F.FpublicLastUse.size()==publicSize,
+              "failed Fill restores public-vector extents");
+
+        F.FmixedRegions[2]={123,456,false};
+        std::array<std::vector<uint8_t>,6> trailing; for(auto&v:trailing)v.clear();
+        put_varint(trailing[0],1); put_varint(trailing[0],4); trailing[0].push_back(0); put_varint(trailing[0],4);
+        trailing[1].insert(trailing[1].end(),{'v','i','e','w'}); trailing[0].push_back(0); // complete Region, then trailing control
+        check(!F.decode_fill(trailing,std::vector<uint32_t>{2u},nopaths,101),"Fill with trailing control rejected after Region assignment");
+        check(F.FmixedRegions[2].offset==123 && F.FmixedRegions[2].length==456 && !F.FmixedRegions[2].known,
+              "failed Fill restores the complete prior Region view");
+    }
+
+    printf("cap_m2_test (rebind + complete rollback + op10-stub): %s\n", fails==0?"PASS":"FAIL");
     return fails==0?0:1;
 }
