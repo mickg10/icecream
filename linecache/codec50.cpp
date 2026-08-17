@@ -621,7 +621,7 @@ struct RelLZ {
 };
 
 int main(int argc,char**argv){
-    const char* manifest=nullptr;const char*residualDumpPath=nullptr;const char*mixedDumpPrefix=nullptr;const char*curveTsvPath=nullptr; size_t max_files=SIZE_MAX; int zlevel=3,literalZLevel=-1,arrayZLevel=-1,blobZLevel=-1,halfColdBit=-1,blobCanonicalLevel=9; uint32_t sourceAdmitRatio=6,blobThreads=4,blobZstdWorkers=0,blobZstdJobMiB=0,blobZstdOverlapLog=0,blobFallbackEvery=0,s1MinMatch=3,s1MaxChain=1024; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, usePriorRoot=false, useSortedLines=false, useByteArrayLines=false, useMixedRegions=false, useProjectSource=false,useKeyMap=false,useDirectOrdinals=false,useCompressedBlobs=false,useBlobEagerPatches=true,useMoFactor=false,traceMo=false,useAlphaLines=false,useResidualLdm=false,splitControlCeiling=false,structureCeiling=false;
+    const char* manifest=nullptr;const char*residualDumpPath=nullptr;const char*mixedDumpPrefix=nullptr;const char*curveTsvPath=nullptr; size_t max_files=SIZE_MAX,buildTus=0; int zlevel=3,literalZLevel=-1,arrayZLevel=-1,blobZLevel=-1,halfColdBit=-1,blobCanonicalLevel=9; uint32_t sourceAdmitRatio=6,blobThreads=4,blobZstdWorkers=0,blobZstdJobMiB=0,blobZstdOverlapLog=0,blobFallbackEvery=0,s1MinMatch=3,s1MaxChain=1024; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, usePriorRoot=false, useSortedLines=false, useByteArrayLines=false, useMixedRegions=false,useProjectSource=false,useKeyMap=false,useDirectOrdinals=false,useCompressedBlobs=false,useBlobEagerPatches=true,useMoFactor=false,traceMo=false,useAlphaLines=false,useResidualLdm=false,splitControlCeiling=false,structureCeiling=false;
     const char*blobDumpPath=nullptr;
     for(int i=1;i<argc;++i){ if(!strcmp(argv[i],"--manifest")&&i+1<argc)manifest=argv[++i];
         else if(!strcmp(argv[i],"--z")&&i+1<argc)zlevel=atoi(argv[++i]);
@@ -664,8 +664,9 @@ int main(int argc,char**argv){
         else if(!strcmp(argv[i],"--deep"))deep=true;         // run slow z19/z22 entropy ladder + reorder test
         else if(!strcmp(argv[i],"--warm"))warm=true;         // Basis C: 2nd pass with dict retained -> warm steady-state wire
         else if(!strcmp(argv[i],"--max-files")&&i+1<argc){ char*t=nullptr; unsigned long long v=strtoull(argv[++i],&t,10); if(!t||*t||!v){fprintf(stderr,"bad max-files\n");return 2;} max_files=size_t(v); }
+        else if(!strcmp(argv[i],"--build-tus")&&i+1<argc){ char*t=nullptr; unsigned long long v=strtoull(argv[++i],&t,10); if(!t||*t||!v||v>SIZE_MAX){fprintf(stderr,"bad build TU count\n");return 2;} buildTus=size_t(v); }
         else { fprintf(stderr,"unknown %s\n",argv[i]); return 2; } }
-    if(!manifest){ fprintf(stderr,"usage: %s --manifest F [--z LEVEL] [--literal-z 1..9] [--array-z 1..9] [--blob-z 1..9] [--no-d1] [--d2] [--prior-root] [--structure-ceiling] [--s1-min-match N] [--s1-max-chain N] [--sorted-lines|--byte-array-lines|--mixed-regions [--alpha-lines|--residual-ldm] [--residual-dump PATH] [--mixed-dump-prefix PATH] [--split-control-ceiling] [--compressed-blobs [--mo-factor [--mo-trace]] [--blob-threads N] [--blob-zstd-workers N --blob-zstd-job-mib N --blob-zstd-overlap-log N] [--blob-fallback-every N] [--blob-lazy-fallback] [--blob-canonical-level 1..9] [--blob-dump PATH]] [--key-map|--direct-ordinals|--half-cold-bit 0|1] [--source-package [--source-admit-ratio N]]] [--max-files N] [--curve-tsv PATH]\n",argv[0]); return 2; }
+    if(!manifest){ fprintf(stderr,"usage: %s --manifest F [--z LEVEL] [--literal-z 1..9] [--array-z 1..9] [--blob-z 1..9] [--no-d1] [--d2] [--prior-root] [--structure-ceiling] [--s1-min-match N] [--s1-max-chain N] [--sorted-lines|--byte-array-lines|--mixed-regions [--alpha-lines|--residual-ldm] [--residual-dump PATH] [--mixed-dump-prefix PATH] [--split-control-ceiling] [--compressed-blobs [--mo-factor [--mo-trace]] [--blob-threads N] [--blob-zstd-workers N --blob-zstd-job-mib N --blob-zstd-overlap-log N] [--blob-fallback-every N] [--blob-lazy-fallback] [--blob-canonical-level 1..9] [--blob-dump PATH]] [--key-map|--direct-ordinals|--half-cold-bit 0|1] [--source-package [--source-admit-ratio N]]] [--max-files N] [--build-tus N] [--curve-tsv PATH]\n",argv[0]); return 2; }
     if(useProjectSource&&!useMixedRegions){fprintf(stderr,"--source-package requires --mixed-regions\n");return 2;}
     if(useKeyMap&&!useMixedRegions){fprintf(stderr,"--key-map and --half-cold-bit require --mixed-regions\n");return 2;}
     if(useCompressedBlobs&&(!useMixedRegions||!useByteArrayLines)){fprintf(stderr,"--compressed-blobs requires --mixed-regions --byte-array-lines\n");return 2;}
@@ -704,7 +705,9 @@ int main(int argc,char**argv){
     { uint32_t maxlen=0; for(auto&f:corpus.files) maxlen=std::max(maxlen,f.len); std::vector<uint32_t> out(size_t(maxlen)+1); uint64_t hits=0; std::vector<uint32_t> rs;
       for(auto&f:corpus.files){ size_t oc=0; rs.clear(); const char*p=corpus.bytes.data()+f.off; dict.process(p,p+f.len,out.data(),oc,hits,true,&rs); allreg.insert(allreg.end(),rs.begin(),rs.end()); roff.push_back(allreg.size()); } }
     uint32_t NREG=uint32_t(dict.region_count()); size_t TUs=corpus.files.size();
+    if(buildTus&&TUs%buildTus){fprintf(stderr,"TU count %zu is not a multiple of build boundary %zu\n",TUs,buildTus);return 2;}
     fprintf(stderr,"loaded+interned %.1fs TUs=%zu raw=%llu regions=%u region_occ=%zu distinct_lines=%u\n",secs(t0),TUs,(unsigned long long)corpus.raw,NREG,allreg.size(),dict.distinct());
+    if(buildTus)fprintf(stderr,"retained-state build boundaries: TUs/build=%zu builds=%zu entropy_stream=restart\n",buildTus,TUs/buildTus);
 
     RootSliceBuild root_slices;
     if(usePriorRoot){
@@ -871,6 +874,7 @@ int main(int argc,char**argv){
       auto tpass=Clock::now(); double enc_s=0, dec_s=0,fallback_c_s=0;   // split C-encode vs F-decode wall (2-proc per-stream proxy)
       for(size_t t=0; t<TUs; ++t){
         auto _te=Clock::now();
+        const bool endOfEntropyStream=t+1==TUs||(buildTus&&(t+1)%buildTus==0);
         const uint32_t* tk=&tokstream[tokoff[t]]; size_t tn=tokoff[t+1]-tokoff[t];
         // ROOT is available to F before its MISSING reply.  With a key map, C first associates every
         // newly-mentioned conversation-dense Region id with its stable key; F binds cache hits and
@@ -1278,7 +1282,7 @@ int main(int argc,char**argv){
             }
             if(useByteArrayLines) w_linedef+=1; // selector/presence mask
         }
-        if(useSortedLines && t+1==TUs){
+        if(useSortedLines && endOfEntropyStream){
             const std::vector<uint8_t> empty;
             for(size_t i=0;i<linePartCount;++i) if(lineZActive[i]){
                 std::vector<uint8_t> tail=zstd_stream_encode(lineZC[i],empty,ZSTD_e_end);
@@ -1374,7 +1378,7 @@ int main(int argc,char**argv){
                     w_linedef+=bytes;mixedBlobPatchWire+=bytes;}
             }
         }
-        if(useMixedRegions&&t+1==TUs){
+        if(useMixedRegions&&endOfEntropyStream){
             const std::vector<uint8_t> empty;
             for(size_t i=0;i<mixedPartCount;++i) if((!useAlphaLines||i!=1)&&mixedZActive[i]){
                 std::vector<uint8_t> tail=zstd_stream_encode(mixedZC[i],empty,ZSTD_e_end);
@@ -1426,7 +1430,7 @@ int main(int argc,char**argv){
           }else if(useAlphaLines&&!mixedRaw[1].empty()){fprintf(stderr,"missing alpha selector\n");return 2;}
           for(size_t i=0;i<mixedPartCount;++i) if((!useAlphaLines||i!=1)&&!mixedEncoded[i].empty()){
             size_t remaining=1;recovered[i]=zstd_stream_decode(mixedZD[i],mixedEncoded[i],remaining);
-            if(recovered[i]!=mixedRaw[i]||(t+1==TUs&&remaining!=0)){fprintf(stderr,"mixed Region stream mismatch TU=%zu part=%zu\n",t,i);return 2;}
+            if(recovered[i]!=mixedRaw[i]||(endOfEntropyStream&&remaining!=0)){fprintf(stderr,"mixed Region stream mismatch TU=%zu part=%zu\n",t,i);return 2;}
           }
           if(!recovered[4].empty()){
             const uint8_t*sp=recovered[4].data(),*se=sp+recovered[4].size(),*bp=recovered[5].data(),*be=bp+recovered[5].size();
@@ -1572,7 +1576,7 @@ int main(int argc,char**argv){
           std::array<std::vector<uint8_t>,5> recovered;
           for(size_t i=0;i<linePartCount;++i) if(!lineEncoded[i].empty()){
             size_t remaining=1; recovered[i]=zstd_stream_decode(lineZD[i],lineEncoded[i],remaining);
-            if(recovered[i]!=lineRaw[i] || (t+1==TUs && remaining!=0)){fprintf(stderr,"sorted Line stream mismatch TU=%zu part=%zu raw=%zu recovered=%zu encoded=%zu remaining=%zu\n",t,i,lineRaw[i].size(),recovered[i].size(),lineEncoded[i].size(),remaining);return 2;}
+            if(recovered[i]!=lineRaw[i] || (endOfEntropyStream&&remaining!=0)){fprintf(stderr,"sorted Line stream mismatch TU=%zu part=%zu raw=%zu recovered=%zu encoded=%zu remaining=%zu\n",t,i,lineRaw[i].size(),recovered[i].size(),lineEncoded[i].size(),remaining);return 2;}
           }
           PackedLines restLines,arrayLines;
           if(!recovered[0].empty()){
