@@ -39,11 +39,27 @@ Diagnostics: `generation_latched=1, region_namespaces=1, block_lifetime=generati
   (Hello[gen] → Root → F-derived Need → Fill(50 KB) → Ack; verifies latch + byte-exactness). **PASS.**
 - `codec50-m1.cpp` — the semantic base (in-process C/F model) that emits the numbers above.
 
-## Next on this branch
-`cap_main.cpp --role c|f`: thread codec50-m1's real ROOT → F-generated NEED → FILL through
-`cap_transport` as a **genuine two-process split**. The cut is the per-TU `missReg` handoff:
-C→F `Root`(tokens+block manifest) → F→C `Need`(F-derived missing region ordinals, in ROOT-expansion
-order) → C→F `Fill`(paths + mixed z3 streams). F rebuilds its store only from decoded wire and
-byte-checks; it never reads the C authority. Must reproduce **9,590,734** byte-exact across the
-socket (per-TU stateful z3 lane preserved; independent z1/z3 frames are M4's job). Then M2
-(explicit public-Line cache identity), M3 (reduced grammar), M4 (independent frames), M5 (gates).
+## M1 socket integration — COMPLETE
+`cap_main.cpp` (fork + AF_UNIX `socketpair`; parent = C authority, child = F store) threads the real
+ROOT → F-derived NEED → FILL dialogue through `cap_transport`'s packed 4-byte frames. Per-TU lockstep:
+`C→Root[rootb|blockRaw]` · `F→Need[missingRaw]` · `C→Fill[fill_paths|mixed0..3]` · `C→Done` ·
+`F→Ack[byteexact]`. F rebuilds its store from wire (+ re-reads the same system headers from disk),
+never touching C's `dict`/`tokstream` after fork, and byte-checks every `.ii`. It reproduces the
+codec50-m1 7-category ledger **to the byte on two corpora**:
+
+| corpus | TOTAL wire (B) | byte-exact |
+|---|---:|---|
+| DuckDB (corpus3, 689 TUs) | **9,590,734** | OK — all 689 TUs |
+| RocksDB (corpus2, 622 TUs) | **9,825,414** | OK — all 622 TUs |
+
+The virtual `FRAME=4` ledger now equals the real 4-byte packed header (zero delta). The **real
+socket total** is reported separately (DuckDB = 10,311,523 B, incl. Hello 20 B + per-job Done/Ack
+4 B + uncompressed root/need/paths payloads). Independently rebuilt + re-run: bit-identical.
+Files: `cap_codec.{h,cpp}`, `cap_protocol.h`, `cap_main.cpp`.
+Build: `g++ -O3 -std=c++17 -DICE_LINE_CAP_LOG2=23 cap_main.cpp cap_codec.cpp -o cap_main -lzstd`.
+
+## Next
+**M2** — public Lines enter typed NEED/FILL (restart / late-join / eviction; materialize immutable
+Line bytes so Region eviction cannot dangle a view; unequal-rebind + transactional-rollback tests).
+Then M3 (reduced RAW_RUN/PUBLIC_LINE_REF/BYTE_ARRAY/PP_MARKER grammar + optional EMBEDDED_OBJECT),
+M4 (independent per-TU z1/z3 frames), M5 (socket/cache/evolution/performance gates).
