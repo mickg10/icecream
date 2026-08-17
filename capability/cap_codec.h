@@ -236,16 +236,24 @@ struct MixedEncoder {
     static constexpr uint32_t sourceAdmitRatio=6;            // (dead)
     // ---- counters (persistent) ----
     std::array<uint64_t,7> mixedOps{};
+    uint64_t op7_count=0, op8_count=0, op9_count=0;          // M2 public-Line recovery ops
+    uint64_t op7_wire=0, op8_wire=0, op9_wire=0;             // M2 "bytes recovered" split (raw)
     uint64_t mixedLiteralRaw=0, mixedArrayValues=0, mixedSourceBytes=0;
     uint64_t mixedSourcePackageRaw=0, mixedSourcePackageFiles=0, mixedSourcePotentialRaw=0;
     uint64_t mixedSourceConsidered=0, mixedSourceAdmitted=0, mixedSourceEstimatedCost=0;
     uint64_t n_marker=0, n_literal=0;
+    // ---- M2 authority model of F's cache (mirror; kept EXACT by F's declarations) ----
+    std::vector<uint8_t> fknownReg;                         // sized NREG in init(); F holds region r
+    std::vector<uint8_t> fknownPublic;                      // grows with nextMixedPublic; F holds ordinal
+    bool recovering=false;                                  // post-restart/late-join: literal blocks + op7/op8
     // ---- per-TU outputs (reset at each materialize) ----
     std::array<std::vector<uint8_t>,6> mixedRaw;
     std::vector<uint8_t> fill_paths;
     uint32_t np=0;
 
-    void init(uint32_t distinctLines){ mixedCLine.assign(size_t(distinctLines)+1, MixedCLineState{}); }
+    void init(uint32_t distinctLines, uint32_t nreg){ mixedCLine.assign(size_t(distinctLines)+1, MixedCLineState{}); fknownReg.assign(nreg,0); fknownPublic.assign(1,0); }
+    void forget_public(uint32_t ord){ if(ord<fknownPublic.size()) fknownPublic[ord]=0; }   // F declared a drop
+    void reset_model(){ std::fill(fknownReg.begin(),fknownReg.end(),0); std::fill(fknownPublic.begin(),fknownPublic.end(),0); recovering=true; }
     // Materialize missReg (IN RECEIVED ORDER) -> mixedRaw[0..3] + fill_paths.  Returns nr.
     uint32_t materialize(const Interner& dict, const std::vector<uint32_t>& missReg, size_t t);
 };
@@ -260,11 +268,18 @@ struct FStore {
     uint32_t NREG=0, NBLK=0;
     std::vector<uint8_t> FmixedRegionData;
     std::vector<MixedFRegionView> FmixedRegions;            // size NREG
-    std::vector<MixedFLineView> FmixedPublic{ MixedFLineView{} };   // 1-based; index 0 unused
+    // ---- M2: public Lines as IMMUTABLE materialized bytes (indexed by generation-local ordinal) ----
+    std::vector<std::vector<uint8_t>> FpublicBytes{ {} };   // 1-based; index 0 unused
+    std::vector<uint8_t> FpublicPresent{ 0 };               // 1 = held, 0 = never had / evicted
+    std::vector<uint32_t> FpublicLastUse{ 0 };              // TU index of last use (LRU eviction)
+    uint32_t Fpublic_next=1;                                // implicit op1 ordinal cursor (resynced on rejoin)
+    uint32_t publicHeld=0;                                  // count of present public Lines
+    uint32_t publicBudget=UINT32_MAX;                       // eviction cap (UINT32_MAX = unbounded)
+    std::vector<uint32_t> pendingDrops;                     // ordinals evicted since last NEED
     std::vector<std::string> Fpaths;
     SourceTextStore mixedFSource{false};
     std::vector<uint8_t> FknownBlk;                         // size NBLK
-    std::vector<uint32_t> Fblk_child; std::vector<size_t> Fblk_off{0};
+    std::vector<std::vector<uint32_t>> FblkChildren;        // id-indexed (SPARSE: restart re-installs subset)
     std::vector<uint32_t> Freg_stream;
     std::vector<uint32_t> FrequiredRegionStamp, FrequiredBlockStamp;
     uint32_t requestStamp=0;
@@ -273,15 +288,44 @@ struct FStore {
         NREG=nreg; NBLK=nblk;
         FmixedRegions.assign(nreg, MixedFRegionView{});
         FknownBlk.assign(nblk, 0);
+        FblkChildren.assign(nblk, {});
         FrequiredRegionStamp.assign(nreg, 0);
         FrequiredBlockStamp.assign(nblk, 0);
         Freg_stream.reserve(1u<<20);
         FmixedRegionData.reserve(64u<<20);
     }
     void install_blocks(const std::vector<uint8_t>& blockRaw);
-    void decode_fill(const std::array<std::vector<uint8_t>,6>& recovered,
-                     const std::vector<uint32_t>& missReg);
+    // Transactional: on any validation failure the whole Fill commits NOTHING (returns false,
+    // store byte-for-byte unchanged).  Installs Fpaths, decodes the mixed streams into the region
+    // store, materializes public-Line bytes (op1), re-establishes them under recovery (op7/op8),
+    // and rejects an unequal rebind of an existing ordinal.
+    bool decode_fill(const std::array<std::vector<uint8_t>,6>& recovered,
+                     const std::vector<uint32_t>& missReg,
+                     const std::vector<uint8_t>& fill_paths, uint32_t t);
     void reconstruct(const std::vector<uint8_t>& Frootb, std::vector<uint8_t>& recon);
+
+    // ---- M2 restart / eviction ----
+    void reset_store(uint32_t resyncPublicNext){           // worker restart: drop the whole store
+        FmixedRegionData.clear(); std::vector<uint8_t>().swap(FmixedRegionData); FmixedRegionData.reserve(64u<<20);
+        FmixedRegions.assign(NREG, MixedFRegionView{});
+        FpublicBytes.assign(1,{}); FpublicPresent.assign(1,0); FpublicLastUse.assign(1,0); publicHeld=0; pendingDrops.clear();
+        Fpublic_next=resyncPublicNext;
+        FknownBlk.assign(NBLK,0); FblkChildren.assign(NBLK,{});
+        Freg_stream.clear(); Fpaths.clear();
+        std::fill(FrequiredRegionStamp.begin(),FrequiredRegionStamp.end(),0);
+        std::fill(FrequiredBlockStamp.begin(),FrequiredBlockStamp.end(),0);
+        requestStamp=0;
+    }
+    void evict_to_budget(uint32_t t){                      // drop LRU public Lines beyond the budget
+        (void)t;
+        while(publicHeld>publicBudget){
+            uint32_t victim=0,best=UINT32_MAX;
+            for(uint32_t o=1;o<FpublicPresent.size();++o) if(FpublicPresent[o]&&FpublicLastUse[o]<best){best=FpublicLastUse[o];victim=o;}
+            if(!victim) break;
+            FpublicPresent[victim]=0; FpublicBytes[victim].clear(); std::vector<uint8_t>().swap(FpublicBytes[victim]); --publicHeld;
+            pendingDrops.push_back(victim);
+        }
+    }
 };
 
 }  // namespace capc

@@ -15,8 +15,11 @@
 // little-endian word — NOT the old [u8 type][u32 len] five-byte form:
 //
 //   header_le = (uint32(type) << 29) | payload_length
-//   type      = header_le >> 29          (3 bits: 6 used types, values 6/7 reserved)
+//   type      = header_le >> 29          (3 bits: 7 used types, value 7 reserved)
 //   length    = header_le & 0x1fffffff   (29 bits, max 536,870,911 bytes)
+//
+// M2 (2026-08-17) adds Frame::Rejoin=6 (F->C worker restart/late-join signal); type 7
+// stays reserved. Hello remains strictly C->F (128-bit generation latch).
 //
 // The real header is therefore exactly 4 bytes, matching codec50's charged FRAME=4:
 // existing codec category frames replace their simulated 4-byte length at no byte
@@ -25,21 +28,21 @@
 // -----------------------------------------------------------------------------
 namespace cap {
 
-enum class Frame : uint8_t { Hello = 0, Root = 1, Need = 2, Fill = 3, Done = 4, Ack = 5 };
-// Only types 0..5 are valid; the two high 3-bit values (6, 7) are reserved and rejected.
+enum class Frame : uint8_t { Hello = 0, Root = 1, Need = 2, Fill = 3, Done = 4, Ack = 5, Rejoin = 6 };
+// Only types 0..6 are valid; the high 3-bit value 7 is reserved and rejected.
 static constexpr uint32_t MAX_PAYLOAD = 0x1fffffffu;   // 29-bit payload cap = 536,870,911 B
 
 // Pack (type,len) into the 32-bit header word. Rejects reserved types and over-length
 // payloads so there is no silent truncation of a large vector::size().
 inline bool pack_header(Frame t, uint32_t len, uint32_t& out) {
     uint32_t ty = uint32_t(t);
-    if (ty > 5u || len > MAX_PAYLOAD) return false;
+    if (ty > 6u || len > MAX_PAYLOAD) return false;
     out = (ty << 29) | len;
     return true;
 }
 inline bool unpack_header(uint32_t hdr, Frame& t, uint32_t& len) {
     uint32_t ty = hdr >> 29;
-    if (ty > 5u) return false;                 // reject the two reserved type values
+    if (ty > 6u) return false;                 // reject the single reserved type value (7)
     t = Frame(ty);
     len = hdr & MAX_PAYLOAD;
     return true;

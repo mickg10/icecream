@@ -54,4 +54,24 @@ static inline void unpack_fill(const std::vector<uint8_t>& payload,
     if(p != e){ fprintf(stderr,"protocol: fill trailing bytes\n"); exit(2); }
 }
 
+// ---- M2 Rejoin (F->C, Frame::Rejoin) / resync reply (C->F, Frame::Ack) ----
+// Rejoin  = varint(resumeTU).  Resync = varint(nextPublicOrdinal) ++ the full path table
+// (generation-lived, bulk-restored so op4/op5 pathIds resolve; public Lines stay on-demand).
+static inline std::vector<uint8_t> pack_rejoin(uint32_t resumeTU){
+    std::vector<uint8_t> o; capc::put_varint(o,resumeTU); return o;
+}
+static inline uint32_t unpack_rejoin(const std::vector<uint8_t>& p){
+    const uint8_t* q=p.data(); return uint32_t(capc::get_varint(q));
+}
+static inline std::vector<uint8_t> pack_resync(uint32_t nextPublic, const std::vector<std::string>& paths){
+    std::vector<uint8_t> o; capc::put_varint(o,nextPublic); capc::put_varint(o,paths.size());
+    for(const auto& s:paths){ capc::put_varint(o,s.size()); o.insert(o.end(),s.begin(),s.end()); }
+    return o;
+}
+static inline void unpack_resync(const std::vector<uint8_t>& p, uint32_t& nextPublic, std::vector<std::string>& paths){
+    const uint8_t* q=p.data(),*e=q+p.size(); nextPublic=uint32_t(capc::get_varint(q));
+    uint64_t n=capc::get_varint(q); paths.clear(); paths.reserve(n);
+    for(uint64_t i=0;i<n;++i){ uint64_t L=capc::get_varint(q); if(uint64_t(e-q)<L){fprintf(stderr,"protocol: resync trunc\n");exit(2);} paths.emplace_back((const char*)q,(size_t)L); q+=L; }
+}
+
 }  // namespace capp
