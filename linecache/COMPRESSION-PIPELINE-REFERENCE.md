@@ -20,11 +20,31 @@ There are currently two measured paths and one target composition:
 | Path | Boundary | Exact evidence | Current result |
 |---|---|---|---|
 | P29 plus fixed-112 residual groups | complete P29 transfer; groups of at most 112 TUs; zstd-3/BSC actual-byte choice | fixed 16 | 16/16 exact, 10/16 cold-size, 14/16 two-sided rate, 9/16 both |
-| GROUP-RLZ prototype | one whole concatenated `.ii` corpus; unbounded prior-byte history | RocksDB, Abseil, fmt | very strong size; retained final table proves the complete two-sided rate on RocksDB, while Abseil/fmt still need faster decode |
+| GROUP-RLZ prototype | one whole concatenated `.ii` corpus; unbounded prior-byte history | RocksDB, Abseil, fmt | strong size; under the revised C >=1 GB/s and single-thread F >=500 MB/s gate, all three retained exact rows pass when fmt uses its measured eight-worker C encode |
 | bounded unified group codec | explicit group bounds, one receiver, one physical ledger, chronological curves | not yet complete | target of the next integration |
 
 The GROUP-RLZ result changes the likely best data path, but it does not erase the bounded P29 result.
 It gives the unified codec a new candidate that is unusually small and fast on the P29+BSC misses.
+
+Two rulings arrived immediately after the first publication of this reference:
+
+1. The owner changed the endpoint gate to C encode at least 1 GB/s and single-thread F decode at
+   least 500 MB/s. The fixed-112 rate misses remain fmt/spdlog C-side misses, so its 14/16 rate and
+   9/16 joint counts do not change.
+2. BigOracle made bounded GROUP-RLZ the P0 row and required match history to persist across entropy
+   group boundaries. Groups bound framing and lookahead; they must not reset committed match history.
+
+The existing exact GROUP-RLZ rows are therefore:
+
+| corpus/config | size / whole-program z19 | C encode MiB/s | single-thread F decode MiB/s | revised endpoint gate |
+|---|---:|---:|---:|:---:|
+| RocksDB FAST3-1T | 0.7350 | 1025.9 | 1089.4 | PASS |
+| Abseil FAST-1T | 0.6889 | 1077.3 | 887.6 | PASS |
+| fmt FAST-8T | 0.9893 | 1430.5 | 768.5 | PASS |
+
+Fmt is still a one-thread **C encode** miss at 564 MiB/s, but the owner gate does not currently say
+C must be single-threaded. Its retained F decode is serial; only C literal compression uses eight
+workers. The runner still needs a real two-sided predicate even though these selected rows now pass.
 
 ## One-page system illustration
 
@@ -347,9 +367,11 @@ flowchart LR
     JOIN --> EXP --> OUT
 ```
 
-This is a current implementation gap, not a new coding idea. The retained 8-thread table parallelizes
-literal compression, while its decoder still walks blocks sequentially. Complete rate acceptance
-must require both encode and decode to reach the configured bar.
+This is a current optimization opportunity, not a new coding idea. The retained 8-thread table
+parallelizes literal compression, while its decoder still walks blocks sequentially. Under the
+revised single-thread F >=500 MB/s gate, decoder parallelism is no longer required for these three
+rows, but the runner must still require both configured endpoint bars and the implementation should
+retain the independent-block option for higher concurrency targets.
 
 ## Stage 5 — where GROUP-RLZ composes with P29
 
@@ -384,6 +406,12 @@ Candidate A preserves P29 object/cache benefits and attacks its dominant literal
 preserves every cross-Line relationship in the raw group and provides a clean fallback when P29's
 representation fragments those relationships. The initial integration should measure both. A later
 cheap routing rule is justified only after it reproduces actual-byte selection broadly.
+
+A program-level best-of computed after both complete programs are encoded is useful only as a
+`PROGRAM_ORACLE` ceiling. It has full-program hindsight and assumes a build boundary. The binding
+bounded row must either choose actual complete bytes per group or freeze a decision from an early
+bounded probe and test it held out. Program-name selection and hindsight selection do not satisfy
+the chronological TU100/TU200 row.
 
 ## Stage 6 — explicit unified group frame
 
@@ -557,12 +585,16 @@ Report at least:
 ```text
 C_rate = raw reconstructed bytes / complete C wall time
 F_rate = raw reconstructed bytes / complete F wall time
-PASS only if C_rate >= 1 GiB/s and F_rate >= 1 GiB/s
+PASS only if C_rate >= 1,000,000,000 bytes/s
+          and single-thread F_rate >= 500,000,000 bytes/s
 ```
 
 Also retain parse, entropy, copy/expand, and pipe subphases so a failure identifies a stage. Threaded
 encode does not imply threaded decode. The GROUP-RLZ `final2.sh` result must therefore be read from
 its separate encode and decode columns, not its current encode-only `speed_pass` expression.
+
+Report exact bytes/second, decimal GB/s, and MiB/s. A runner may use conservative 1024/512 MiB/s
+thresholds, but it must label them as stricter than the stated decimal 1 GB/s and 500 MB/s bars.
 
 Peak RSS must be recorded independently at C and F. Whole-corpus research buffers are useful for a
 ceiling, but the bounded target should scale with group size plus explicit reference history rather
@@ -599,12 +631,12 @@ that independent source-code measurement.
 ```mermaid
 flowchart LR
     R1[1. Correct GROUP-RLZ<br/>two-sided rate gate]
-    R2[2. Parallel literal-block decode]
-    R3[3. Add explicit bounded group frame]
-    R4[4. Measure raw-group and<br/>P29-residual composition]
-    R5[5. Freeze group/history policy]
-    R6[6. Run one-decoder fixed 16]
-    R7[7. Run chronological and<br/>recovery scenarios]
+    R2[2. Add GRZ2 grouped frame,<br/>u64 offsets, staged anchors]
+    R3[3. Measure reset, full, and<br/>rolling committed history]
+    R4[4. Optimize parallel decode<br/>without changing semantics]
+    R5[5. Compare raw-group and<br/>P29-residual composition]
+    R6[6. Freeze policy and run<br/>one-decoder fixed 16]
+    R7[7. Run chronological,<br/>recovery, and broad corpora]
 
     R1 --> R2 --> R3 --> R4 --> R5 --> R6 --> R7
 ```
@@ -630,3 +662,6 @@ already the stronger and simpler contender there.
 - [`CODEC-PREDICTOR-ENTROPY-REFERENCE.md`](CODEC-PREDICTOR-ENTROPY-REFERENCE.md): broader representation/prediction/cache/entropy map.
 - [`mickgvirtu/icecream@48267c7`](https://github.com/mickgvirtu/icecream/commit/48267c7): current whole-corpus GROUP-RLZ prototype and retained tables.
 - [Issue #16 GROUP-RLZ review](https://github.com/mickg10/icecream/issues/16#issuecomment-5319700697): corrected two-sided rate interpretation and minimal integration plan.
+- [Issue #16 revised endpoint gate](https://github.com/mickg10/icecream/issues/16#issuecomment-5319779783): C >=1 GB/s and single-thread F >=500 MB/s.
+- [Issue #16 GRZ2 P0 ruling](https://github.com/mickg10/icecream/issues/16#issuecomment-5319790979): persistent match history across bounded entropy groups.
+- [Issue #16 local-oracle ruling review](https://github.com/mickg10/icecream/issues/16#issuecomment-5319818052): rate, rolling-history, commit, and selector-boundary corrections.
