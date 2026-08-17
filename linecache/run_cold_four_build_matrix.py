@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run P25-P29 cold codecs over four retained-state builds."""
+"""Run P25-P29 cold codecs over four logical retained-state replays."""
 
 from __future__ import annotations
 
@@ -31,23 +31,19 @@ def canonical_manifest_entries(manifest: Path) -> tuple[str, ...]:
     return tuple(entries)
 
 
-def write_repeated_manifest(
-    source: Path,
-    destination: Path,
-    repetitions: int = BUILD_REPETITIONS,
+def logical_replay_manifest(
+    source: Path, repetitions: int = BUILD_REPETITIONS
 ) -> dict:
     if repetitions <= 0:
-        raise ValueError("build repetitions must be positive")
+        raise ValueError("replay repetitions must be positive")
     entries = canonical_manifest_entries(source)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    content = "".join(f"{entry}\n" for _ in range(repetitions) for entry in entries)
-    destination.write_text(content)
     return {
         "source_manifest": str(source.resolve()),
         "source_manifest_sha256": sha256(source),
-        "repeated_manifest": str(destination.resolve()),
-        "repeated_manifest_sha256": sha256(destination),
+        "replay_mode": "logical-single-load",
+        "replay_repetitions": repetitions,
         "build_repetitions": repetitions,
+        "tus_per_repetition": len(entries),
         "tus_per_build": len(entries),
         "total_tus": repetitions * len(entries),
     }
@@ -62,7 +58,7 @@ def run_one(
 ) -> dict:
     name, _ = corpus
     expected_tus = int(manifest_metadata["total_tus"])
-    manifest = Path(manifest_metadata["repeated_manifest"])
+    manifest = Path(manifest_metadata["source_manifest"])
     schema_root = output_root / schema["schema"]
     schema_root.mkdir(parents=True, exist_ok=True)
     curve = schema_root / f"{name}.curve.tsv"
@@ -85,7 +81,9 @@ def run_one(
         "--manifest",
         str(manifest),
         *schema["flags"],
-        "--build-tus",
+        "--replay-repetitions",
+        str(BUILD_REPETITIONS),
+        "--entropy-restart-tus",
         str(manifest_metadata["tus_per_build"]),
         "--curve-tsv",
         str(temporary_curve),
@@ -139,15 +137,12 @@ def main() -> int:
 
     output_root = args.output.resolve()
     output_root.mkdir(parents=True, exist_ok=True)
-    manifest_root = output_root / "manifests"
     manifests = {}
     for corpus, directory in corpora:
         source = args.corpus_root.resolve() / directory / "manifest.txt"
         if not source.is_file():
             raise FileNotFoundError(source)
-        manifests[corpus] = write_repeated_manifest(
-            source, manifest_root / corpus / "manifest.txt"
-        )
+        manifests[corpus] = logical_replay_manifest(source)
 
     tasks = [(schema, corpus) for schema in selected for corpus in corpora]
     results = []
@@ -174,7 +169,7 @@ def main() -> int:
             )
 
     metadata = {
-        "experiment": "P25-P29 cold retained-state four-build matrix",
+        "experiment": "P25-P29 cold retained-state four-repetition matrix",
         "codec": str(args.codec.resolve()),
         "codec_sha256": sha256(args.codec),
         "corpus_root": str(args.corpus_root.resolve()),

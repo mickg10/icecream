@@ -77,7 +77,7 @@ def schema_rows() -> tuple[dict, ...]:
         ),
         (
             "p26",
-            "compressed zlib-member recovery",
+            "direct ordinals plus compressed zlib-member recovery",
             True,
             (*COMPRESSED_BLOBS[1:], "--s1-max-chain", "64"),
         ),

@@ -91,27 +91,21 @@ cloned (about 18 GB), but cloning is not corpus generation: none of those 150
 projects has a frozen-v2 four-profile archive yet. Large non-CMake anchors such
 as Firefox, GCC, Godot, and V8 remain separate adapters.
 
-## Transfer-matrix accounting contract
+## Incremental transfer-matrix contract
 
-Every current P25-P29 row is both:
+Every current P25-P29 row is:
 
 ```text
 receiver learned state at TU 0 = empty
-installed pre-shared S package = none
+learning source after TU 0 = previously committed TUs in this run
 ```
 
-The human and machine matrices therefore report an explicit `S one-time
-transfer` column of zero. When an S package is evaluated, report its compressed
-transfer once per installation, immediately after the one-build column:
-
-```text
-TU 50 ... TU 300 | full build wire | S one-time transfer | 4x build wire
-```
-
-`S one-time transfer` is never folded into each build. The existing
-pre-shared structural experiment is not yet a complete P29 row, so its package
-bytes must not be pasted into this table as though the two codecs had already
-been integrated and replayed.
+`p25-cold` is the base incremental empty-start codec of this series, not a
+raw-zstd or independent-per-TU control: it already uses interning, retained
+Regions/Blocks, S1, mixed material coding, and zstd-3 streams. `p29-cold` starts
+from the same empty state but adds the P26--P29 coding improvements. Their
+fixed-16 first-build totals are 113,834,804 B and 91,864,787 B respectively;
+the difference is representation/coding, not different starting state.
 
 ## Required next coverage
 
@@ -122,4 +116,5 @@ been integrated and replayed.
 3. Freeze the four v2 image digests, then grow exact project/profile cells and
    report coverage continuously rather than waiting for a nominal final size.
 4. For every codec/start-state row, retain exact reconstruction, per-TU
-   checkpoints, full build wire, one-time S bytes, and retained-build totals.
+   checkpoints, full-build wire, incremental/empty-start mode, and
+   retained-build totals.

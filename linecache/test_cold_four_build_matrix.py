@@ -11,14 +11,12 @@ from run_cold_four_build_matrix import (
     BUILD_REPETITIONS,
     COLD_SCHEMAS,
     canonical_manifest_entries,
-    write_repeated_manifest,
+    logical_replay_manifest,
 )
 from summarize_cold_four_build_matrix import (
-    NO_SHARED_S_TRANSFER_BYTES,
     aggregate_by_stage,
     curve_point,
     format_mb_time,
-    format_s_transfer,
     validate_repeated_curve,
 )
 
@@ -48,13 +46,6 @@ def synthetic_curve(tus_per_build: int = 2) -> list[dict]:
 
 
 class ColdFourBuildMatrixTest(unittest.TestCase):
-    def test_no_shared_s_transfer_is_explicitly_zero(self) -> None:
-        self.assertEqual(NO_SHARED_S_TRANSFER_BYTES, 0)
-        self.assertEqual(format_s_transfer("none", 0), "none · 0 B")
-        self.assertEqual(
-            format_s_transfer("example", 80_000), "0.1 MB · 0.001 s once"
-        )
-
     def test_only_five_cold_schemas_are_selected(self) -> None:
         self.assertEqual(len(COLD_SCHEMAS), 5)
         self.assertEqual(
@@ -63,7 +54,7 @@ class ColdFourBuildMatrixTest(unittest.TestCase):
         )
         self.assertTrue(all(row["state"] == "cold" for row in COLD_SCHEMAS))
 
-    def test_repeated_manifest_is_absolute_and_deterministic(self) -> None:
+    def test_logical_replay_uses_one_absolute_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source_dir = root / "source"
@@ -72,20 +63,16 @@ class ColdFourBuildMatrixTest(unittest.TestCase):
             (source_dir / "b.ii").write_text("b")
             source = source_dir / "manifest.txt"
             source.write_text("a.ii\n\nb.ii\n")
-            destination = root / "repeated" / "manifest.txt"
-            metadata = write_repeated_manifest(source, destination)
+            metadata = logical_replay_manifest(source)
             entries = canonical_manifest_entries(source)
             self.assertEqual(metadata["tus_per_build"], 2)
+            self.assertEqual(metadata["tus_per_repetition"], 2)
             self.assertEqual(metadata["total_tus"], 8)
-            self.assertEqual(
-                destination.read_text().splitlines(),
-                list(entries) * BUILD_REPETITIONS,
-            )
-            first_hash = metadata["repeated_manifest_sha256"]
-            self.assertEqual(
-                write_repeated_manifest(source, destination)["repeated_manifest_sha256"],
-                first_hash,
-            )
+            self.assertEqual(metadata["replay_mode"], "logical-single-load")
+            self.assertEqual(Path(metadata["source_manifest"]), source.resolve())
+            self.assertEqual(len(entries), 2)
+            self.assertFalse("repeated_manifest" in metadata)
+            self.assertEqual(logical_replay_manifest(source), metadata)
 
     def test_curve_requires_four_identical_raw_builds(self) -> None:
         curve = synthetic_curve()

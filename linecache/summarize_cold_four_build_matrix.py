@@ -16,10 +16,6 @@ from summarize_complete_tu_matrix import historical_endpoints, load_curve
 DEFAULT_CHECKPOINTS = (50, 100, 150, 200, 250, 300)
 ONE_GBIT_BYTES_PER_SECOND = 125_000_000
 DECIMAL_MB = 1_000_000
-# This experiment starts with no installed pre-shared package.  Keep the
-# one-time package lane explicit so build-wire and installation accounting
-# cannot be conflated when this table is compared with later S-package rows.
-NO_SHARED_S_TRANSFER_BYTES = 0
 
 
 def validate_repeated_curve(curve: list[dict], repetitions: int = BUILD_REPETITIONS) -> int:
@@ -99,10 +95,7 @@ def make_rows(
                 "schema": schema["schema"],
                 "stage": schema["stage"],
                 "receiver_initial_state": "cold",
-                "shared_package": "none",
-                "s_one_time_transfer_bytes": NO_SHARED_S_TRANSFER_BYTES,
-                "s_one_time_transfer_decimal_mb": 0.0,
-                "s_one_time_transfer_seconds_1gbit": 0.0,
+                "learning_mode": "incremental_online_empty_start",
                 "description": schema["description"],
                 "build_repetitions": BUILD_REPETITIONS,
                 "tus_per_build": tus_per_build,
@@ -160,12 +153,6 @@ def format_mb_time(wire_bytes: int) -> str:
     else:
         seconds_text = f"{seconds:.3f} s"
     return f"{mb_text} MB · {seconds_text}"
-
-
-def format_s_transfer(shared_package: str, wire_bytes: int) -> str:
-    if shared_package == "none" and wire_bytes == 0:
-        return "none · 0 B"
-    return format_mb_time(wire_bytes) + " once"
 
 
 def aggregate_by_stage(rows: list[dict]) -> list[dict]:
@@ -254,18 +241,25 @@ def render_markdown(
         "**80 cold rows: 16 projects × P25 through P29**. Bit-0 and bit-1 are separate "
         "half-cache acceptance evidence and are intentionally not repeated here.",
         "",
-        "**Scope boundary:** every row here is a cold **no-shared-package** row. F starts "
-        "with neither learned generation state nor an installed `S` bootstrap package. "
+        "**Scope boundary:** every row here is an **incremental codec with empty dynamic "
+        "state at TU 0**. It learns only from previously committed TUs in this run. "
         "This is a single native/source-visible capture per project; it is not the "
         "25-project inventory and it is not the four-profile Docker matrix. In particular, "
         "GCC, Firefox, Qt6, ClickHouse, PyTorch, Folly, Arrow, Bitcoin, and V8 are absent.",
         "See the [corpus coverage ledger](CORPUS-COVERAGE-STATUS.md) for the complete "
         "native and four-profile pilot inventories.",
+        "See the [P25--P29 pipeline and state contract]"
+        "(P25-P29-INCREMENTAL-PIPELINE.md) for the exact C/F dataflow, state "
+        "lifetimes, and the distinction between empty-start online learning and "
+        "preloaded cache tests.",
         "",
-        "Each codec runs one manifest containing the same project build four times in the "
-        "same order. F starts empty for build 1 and retains learned objects for builds 2--4. "
-        "`full build` is the cumulative endpoint after build 1; `4× full build` is the "
-        "cumulative endpoint after all four builds, not merely the fourth-build increment.",
+        "Each codec runs one manifest containing the same project capture four times in the "
+        "same order. F starts empty for repetition 1 and retains learned objects for "
+        "repetitions 2--4. The harness is told the original manifest length so it can "
+        "restart material entropy streams at each reporting boundary; a real iceccd "
+        "neither knows nor needs to know a build boundary. `full build` is the cumulative "
+        "endpoint after repetition 1; `4× full build` is the cumulative endpoint after "
+        "all four repetitions, not merely the fourth-repetition increment.",
         "",
         "Every TU reconstructs exactly. Every first-build endpoint is required to equal its "
         "previously retained complete P25, P26, P27, P28, or P29 cold ledger byte-for-byte. "
@@ -286,14 +280,30 @@ def render_markdown(
         [
             "",
             "Here `S1 chain` names the causal superblock-sequence transform inside P28/P29. "
-            "It is not an installed pre-shared `S` package; all rows below have no such package.",
+            "It is learned incrementally from preceding committed TUs in each row.",
+            "",
+            "## Base and optimized incremental rows",
+            "",
+            "`p25-cold` is the base incremental codec of this series, but it is not a "
+            "raw-zstd or independent-TU control: it already includes interning, retained "
+            "Regions/Blocks, S1, mixed material coding, and zstd-3 streams. `p29-cold` "
+            "starts from the same empty state but includes the P26--P29 coding "
+            "improvements.",
+            "",
+            "| role | schema | build 1 | build 2 | build 3 | build 4 | four-build total |",
+            "|---|---|---:|---:|---:|---:|---:|",
+            "| base incremental | `p25-cold` | 113,834,804 B | 449,765 B | 148,292 B | 148,292 B | 114,581,153 B |",
+            "| optimized incremental | `p29-cold` | 91,864,787 B | 450,778 B | 148,200 B | 148,200 B | 92,611,965 B |",
+            "",
+            "The 21,970,017 B first-build difference is codec work: P26 saves 16,819,536 B, "
+            "P27 another 3,035,066 B, P28 another 11,474 B, and P29 another 2,103,941 B.",
             "",
             "## Matrix",
             "",
             "| project | schema | start | "
             + " | ".join(f"TU {checkpoint}" for checkpoint in checkpoints)
-            + " | full build | S one-time transfer | 4× full build |",
-            "|---|---|---|" + "---:|" * (len(checkpoints) + 3),
+            + " | full build | 4× full build |",
+            "|---|---|---|" + "---:|" * (len(checkpoints) + 2),
         ]
     )
     for row in rows:
@@ -302,10 +312,9 @@ def render_markdown(
             value = row[f"tu{checkpoint}_wire_bytes"]
             cells.append("—" if value == "" else format_mb_time(int(value)))
         lines.append(
-            f"| {row['project']} | `{row['schema']}` | cold / no S | "
+            f"| {row['project']} | `{row['schema']}` | incremental / empty | "
             + " | ".join(cells)
             + f" | {format_mb_time(int(row['full_build_wire_bytes']))}"
-            + f" | {format_s_transfer(row['shared_package'], int(row['s_one_time_transfer_bytes']))}"
             + f" | {format_mb_time(int(row['four_build_cumulative_wire_bytes']))} |"
         )
     lines.extend(
@@ -341,10 +350,8 @@ def render_markdown(
             "```",
             "",
             "The machine TSV retains exact byte counts, computed seconds, per-build incremental "
-            "wire, cumulative endpoints, one-time `S` transfer, ratios, and log/curve hashes. "
-            "For every row in this no-shared experiment, `S one-time transfer = 0 B`. A later "
-            "row using an installed package must report that package once in this separate "
-            "column; it must not add the package to every build.",
+            "wire, cumulative endpoints, ratios, the explicit incremental/empty-start mode, "
+            "and log/curve hashes.",
             "",
             "The source-visible execution profile uses 70 quietbox2 rows and 10 capture-host "
             "rows. OpenCV and LevelDB retain original absolute source paths, so all five cold "
@@ -399,9 +406,7 @@ def main() -> int:
             "decimal_mb_divisor": DECIMAL_MB,
             "one_gbit_bytes_per_second": ONE_GBIT_BYTES_PER_SECOND,
             "transfer_times_are_computed": True,
-            "s_transfer_is_one_time_and_separate_from_build_wire": True,
-            "shared_package": "none",
-            "s_one_time_transfer_bytes": NO_SHARED_S_TRANSFER_BYTES,
+            "learning_mode": "incremental_online_empty_start",
         },
         "build_repetitions": BUILD_REPETITIONS,
         "checkpoints": list(checkpoints),
