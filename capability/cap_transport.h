@@ -9,18 +9,41 @@
 // icecream #16 capability harness — the real two-process C<->F transport (M1).
 //
 // codec50 runs the whole ROOT -> F-derived NEED -> FILL dialogue in-process; M1's
-// new work (per local-oracle's division of labor) is the ACTUAL transport and the
-// explicit 128-bit generation framing.  This is that layer: a length-typed frame
-// protocol over any stream fd (AF_UNIX socketpair for the prototype).  One opaque
-// SourceGeneration is latched once, in the Hello frame, at conversation start; no
-// per-object key rides the wire (that is the ruled generation-ordinal identity).
+// new work is the ACTUAL transport and the explicit 128-bit generation framing.
 //
-// Wire frame:  [u8 type][u32 little-endian length][length payload bytes]
-// The payload is an opaque codec message; the transport does not parse it.
+// Frame header (owner/local-oracle framing ruling, 2026-08-17): ONE packed 32-bit
+// little-endian word — NOT the old [u8 type][u32 len] five-byte form:
+//
+//   header_le = (uint32(type) << 29) | payload_length
+//   type      = header_le >> 29          (3 bits: 6 used types, values 6/7 reserved)
+//   length    = header_le & 0x1fffffff   (29 bits, max 536,870,911 bytes)
+//
+// The real header is therefore exactly 4 bytes, matching codec50's charged FRAME=4:
+// existing codec category frames replace their simulated 4-byte length at no byte
+// delta. New relationship/job frames are real bytes reported separately: Hello = 20 B
+// (4 header + 16-byte generation), empty Done/Ack = 4 B each.
 // -----------------------------------------------------------------------------
 namespace cap {
 
 enum class Frame : uint8_t { Hello = 0, Root = 1, Need = 2, Fill = 3, Done = 4, Ack = 5 };
+// Only types 0..5 are valid; the two high 3-bit values (6, 7) are reserved and rejected.
+static constexpr uint32_t MAX_PAYLOAD = 0x1fffffffu;   // 29-bit payload cap = 536,870,911 B
+
+// Pack (type,len) into the 32-bit header word. Rejects reserved types and over-length
+// payloads so there is no silent truncation of a large vector::size().
+inline bool pack_header(Frame t, uint32_t len, uint32_t& out) {
+    uint32_t ty = uint32_t(t);
+    if (ty > 5u || len > MAX_PAYLOAD) return false;
+    out = (ty << 29) | len;
+    return true;
+}
+inline bool unpack_header(uint32_t hdr, Frame& t, uint32_t& len) {
+    uint32_t ty = hdr >> 29;
+    if (ty > 5u) return false;                 // reject the two reserved type values
+    t = Frame(ty);
+    len = hdr & MAX_PAYLOAD;
+    return true;
+}
 
 inline bool write_all(int fd, const void* buf, size_t n) {
     const uint8_t* p = static_cast<const uint8_t*>(buf);
@@ -44,27 +67,31 @@ inline bool read_all(int fd, void* buf, size_t n) {
 }
 
 inline bool send_frame(int fd, Frame t, const uint8_t* data, uint32_t len) {
-    uint8_t hdr[5];
-    hdr[0] = uint8_t(t);
-    for (int i = 0; i < 4; ++i) hdr[1 + i] = uint8_t(len >> (8 * i));
-    if (!write_all(fd, hdr, 5)) return false;
+    uint32_t h;
+    if (!pack_header(t, len, h)) return false;
+    uint8_t hdr[4];
+    for (int i = 0; i < 4; ++i) hdr[i] = uint8_t(h >> (8 * i));   // little-endian
+    if (!write_all(fd, hdr, 4)) return false;
     return len == 0 || write_all(fd, data, len);
 }
 inline bool send_frame(int fd, Frame t, const std::vector<uint8_t>& d) {
+    if (d.size() > MAX_PAYLOAD) return false;   // enforce bound BEFORE the size() -> u32 cast
     return send_frame(fd, t, d.data(), uint32_t(d.size()));
 }
 
 inline bool recv_frame(int fd, Frame& t, std::vector<uint8_t>& out) {
-    uint8_t hdr[5];
-    if (!read_all(fd, hdr, 5)) return false;
-    t = Frame(hdr[0]);
-    uint32_t len = 0;
-    for (int i = 0; i < 4; ++i) len |= uint32_t(hdr[1 + i]) << (8 * i);
+    uint8_t hdr[4];
+    if (!read_all(fd, hdr, 4)) return false;
+    uint32_t h = 0;
+    for (int i = 0; i < 4; ++i) h |= uint32_t(hdr[i]) << (8 * i);
+    uint32_t len;
+    if (!unpack_header(h, t, len)) return false;
     out.resize(len);
     return len == 0 || read_all(fd, out.data(), len);
 }
 
-// Latch the 128-bit generation once at conversation start.
+// Latch the 128-bit generation once at conversation start. Hello on the wire = 20 bytes
+// (4-byte header + 16-byte generation payload).
 inline bool send_hello(int fd, const SourceGeneration& g) {
     return send_frame(fd, Frame::Hello, g.data(), 16);
 }
