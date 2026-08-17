@@ -12,6 +12,7 @@ adapter_name=$4
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 matrix_root=${II_MATRIX_ROOT:-/home/ttuser/ictmp/ii-matrix}
 jobs=${JOBS:-24}
+read -r -a docker_command <<< "${DOCKER:-docker}"
 
 profile_row=$(awk -F '\t' -v wanted="$profile" 'NR>1 && $1==wanted {print; found=1} END{if(!found)exit 1}' "$here/profiles.tsv") || {
     echo "unknown profile: $profile" >&2; exit 2;
@@ -26,9 +27,9 @@ archive=$cell/$project-$profile.ii.tar.zst
 [[ ! -e $archive ]] || { echo "cell archive already complete: $archive" >&2; exit 2; }
 mkdir -p "$cell/build" "$cell/loose" "$cell/logs"
 chmod ugo+rwx "$cell" "$cell/build" "$cell/loose" "$cell/logs"
-image_id=$(docker image inspect --format '{{.Id}}' "$image")
+image_id=$("${docker_command[@]}" image inspect --format '{{.Id}}' "$image")
 
-docker run --rm \
+"${docker_command[@]}" run --rm \
     --mount "type=bind,src=$source_checkout,dst=$source_prefix" \
     --mount "type=bind,src=$cell,dst=/cell" \
     --mount "type=bind,src=$here,dst=/harness,readonly" \

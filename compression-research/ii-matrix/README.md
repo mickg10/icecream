@@ -219,6 +219,9 @@ comparison.  It still has a version/digest so both endpoints select the same rul
 # Build/fingerprint the four images.
 compression-research/ii-matrix/scripts/build_images.sh
 
+# On a host where Docker is reached through sudo:
+DOCKER='sudo docker' compression-research/ii-matrix/scripts/build_images.sh
+
 # Run one adapter-defined cell.
 compression-research/ii-matrix/scripts/run_cell.sh \
   debian-gcc firefox /path/to/gecko adapter-script.sh
