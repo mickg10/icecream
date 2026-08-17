@@ -37,7 +37,7 @@
       "residual_fraction": 0.01583282079969771,
       "required_residual_encode_MBps_for_1_GBps": 23.749231199546564,
       "p29_complete_bytes": 9589726,
-      "p29_residual_zstd3_bytes": 5103844,
+      "p29_literal_stream_wire_bytes": 5118367,
       "cold_gate_bytes": 7883713,
       "measurements": [
         {
@@ -127,7 +127,7 @@
       "residual_fraction": 0.01621432192971005,
       "required_residual_encode_MBps_for_1_GBps": 24.321482894565072,
       "p29_complete_bytes": 39589524,
-      "p29_residual_zstd3_bytes": 13605825,
+      "p29_literal_stream_wire_bytes": 13672703,
       "cold_gate_bytes": 64118473,
       "measurements": [
         {

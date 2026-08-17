@@ -1,0 +1,62 @@
+{
+  "schema": "rocksdb-resid-bwt-v1",
+  "corpus": "RocksDB",
+  "tus": 622,
+  "raw_ii_bytes": 3114320596,
+  "whole_ii_z19long_bytes": 6337047,
+  "cold_110pct_gate_bytes": 6970751,
+  "p29_complete_wire_bytes": 9823481,
+  "p29_residual_wire_bytes": 3521608,
+  "fixed_non_residual_wire_bytes": 6301873,
+  "residual": {
+    "raw_bytes": 30118741,
+    "raw_fraction": 0.009671047045922051,
+    "sha256": "a364b6a4a3e820785bf4065a14ed1043c9e8e0185ea653170ec4953da0b6774b"
+  },
+  "candidates": [
+    {
+      "codec": "zstd-19-long31",
+      "residual_bytes": 2464628,
+      "projected_complete_bytes": 8766501,
+      "projected_over_whole_ii_z19": 1.3833732020608338,
+      "delta_to_gate_bytes": 1795750,
+      "exact": true
+    },
+    {
+      "codec": "libbsc-3.3.12-b64-m0-e0",
+      "residual_bytes": 2150824,
+      "encode_MBps": 74.5,
+      "projected_complete_bytes": 8452697,
+      "projected_over_whole_ii_z19": 1.3338542384173575,
+      "delta_to_gate_bytes": 1481946,
+      "exact": true
+    },
+    {
+      "codec": "libbsc-3.3.12-b64-m0-e1",
+      "residual_bytes": 2107830,
+      "encode_MBps": 71.36,
+      "projected_complete_bytes": 8409703,
+      "projected_over_whole_ii_z19": 1.327069690346308,
+      "delta_to_gate_bytes": 1438952,
+      "exact": true
+    },
+    {
+      "codec": "libbsc-3.3.12-b64-m0-e2",
+      "residual_bytes": 2090346,
+      "encode_MBps": 67.04,
+      "decode_MBps": 123.01,
+      "projected_complete_bytes": 8392219,
+      "projected_over_whole_ii_z19": 1.3243106765659147,
+      "delta_to_gate_bytes": 1421468,
+      "exact": true
+    }
+  ],
+  "retained": {
+    "local_raw": "/tmp/issue16-rocksdb-p29-residual.raw",
+    "remote_raw": "/tmp/resid.corpus2.bin",
+    "remote_bsc_e0": "/tmp/resid.corpus2.e0.bsc",
+    "remote_bsc_e1": "/tmp/resid.corpus2.e1.bsc",
+    "remote_bsc_e2": "/tmp/resid.corpus2.e2.bsc",
+    "remote_zstd19long": "/tmp/resid.corpus2.z19long.zst"
+  }
+}
