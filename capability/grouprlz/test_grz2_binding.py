@@ -111,6 +111,7 @@ class GroupFrame:
 @dataclass(frozen=True)
 class Container:
     groups: tuple[GroupFrame, ...]
+    end_frame_start: int
     end_offset: int
     end_raw: int
     end_groups: int
@@ -139,8 +140,8 @@ def parse_container(path: Path) -> Container:
             end_digest = reader.u64()
             if reader.offset != len(data):
                 raise GateFailure("bytes follow END frame")
-            return Container(tuple(groups), reader.offset, end_raw, end_groups,
-                             end_matches, end_digest)
+            return Container(tuple(groups), frame_start, reader.offset, end_raw,
+                             end_groups, end_matches, end_digest)
         if magic != MAGIC_GROUP:
             raise GateFailure(f"unknown frame magic at byte {frame_start}")
 
@@ -203,6 +204,22 @@ def assert_exact(a: Path, b: Path, label: str) -> None:
         raise GateFailure(f"{label}: byte-exact replay failed")
 
 
+def mutate_u64(source: Path, output: Path, offset: int, delta: int = 1) -> None:
+    data = bytearray(source.read_bytes())
+    if offset < 0 or offset + 8 > len(data):
+        raise GateFailure(f"mutation offset {offset} is outside {source}")
+    original = struct.unpack_from("<Q", data, offset)[0]
+    struct.pack_into("<Q", data, offset, (original + delta) & ((1 << 64) - 1))
+    output.write_bytes(data)
+
+
+def require_decode_rejection(codec: Path, wire: Path, root: Path, label: str,
+                             *, prefix: bool = False) -> None:
+    mode = "decprefix" if prefix else "dec"
+    run_must_fail([str(codec), mode, str(wire), str(root / f"reject-{label}.out"),
+                   "-j", "1"])
+
+
 def basic_and_prefix_gate(codec: Path, root: Path) -> None:
     common = (
         b"# 1 /usr/include/vector\n"
@@ -254,7 +271,42 @@ def basic_and_prefix_gate(codec: Path, root: Path) -> None:
     inside.write_bytes(full_wire.read_bytes()[:full_frames.groups[2].frame_end - 1])
     run_must_fail([str(codec), "decprefix", str(inside),
                    str(root / "inside.out"), "-j", "1"])
-    print("PASS basic exact replay, complete-wire prefix identity, and strict cut modes")
+
+    # A complete container is also a valid prefix.  Once its END frame is present, however,
+    # prefix mode must close the same totals and reject trailing bytes just like full mode.
+    prefix_full_out = root / "prefix-full.out"
+    decode(codec, full_wire, prefix_full_out, prefix=True)
+    assert_exact(full_raw, prefix_full_out, "complete container in prefix mode")
+    bad_prefix_end = root / "basic-bad-prefix-end.grz"
+    mutate_u64(full_wire, bad_prefix_end, full_frames.end_frame_start + 4)
+    require_decode_rejection(codec, bad_prefix_end, root, "bad-prefix-end", prefix=True)
+    trailing_after_end = root / "basic-trailing-after-end.grz"
+    trailing_after_end.write_bytes(full_wire.read_bytes() + b"X")
+    require_decode_rejection(codec, trailing_after_end, root, "trailing-after-end",
+                             prefix=True)
+
+    # Bind every state-bearing group field that the writer emits.  Silently ignoring any of
+    # these permits a wire state with no corresponding encoder transition.
+    first = full_frames.groups[0]
+    mutations = [
+        ("group-index", first.frame_start + 4),
+        ("history-extent", first.frame_start + 36),
+        ("tu-length-sum", first.frame_start + 48),
+    ]
+    # After magic/index/start/raw/history-base/history-extent/ntu/TU lengths come five
+    # one-byte modes, four raw u64 sizes, then c0/c1/c2/c3.  Alter c1 while leaving the
+    # literal-block table untouched; the decoder must require both accounts to agree.
+    after_tus = first.frame_start + 48 + 8 * len(first.tu_lengths)
+    mutations.append(("literal-compressed-total", after_tus + 45))
+    for label, offset in mutations:
+        changed = root / f"basic-bad-{label}.grz"
+        mutate_u64(full_wire, changed, offset)
+        require_decode_rejection(codec, changed, root, label)
+
+    bad_end_matches = root / "basic-bad-end-matches.grz"
+    mutate_u64(full_wire, bad_end_matches, full_frames.end_frame_start + 20)
+    require_decode_rejection(codec, bad_end_matches, root, "end-match-total")
+    print("PASS exact replay, prefix identity, strict cuts, and frame/state closure")
 
 
 def zero_anchor_gate(codec: Path, root: Path) -> None:
