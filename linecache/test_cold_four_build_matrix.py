@@ -14,9 +14,11 @@ from run_cold_four_build_matrix import (
     write_repeated_manifest,
 )
 from summarize_cold_four_build_matrix import (
+    NO_SHARED_S_TRANSFER_BYTES,
     aggregate_by_stage,
     curve_point,
     format_mb_time,
+    format_s_transfer,
     validate_repeated_curve,
 )
 
@@ -46,6 +48,13 @@ def synthetic_curve(tus_per_build: int = 2) -> list[dict]:
 
 
 class ColdFourBuildMatrixTest(unittest.TestCase):
+    def test_no_shared_s_transfer_is_explicitly_zero(self) -> None:
+        self.assertEqual(NO_SHARED_S_TRANSFER_BYTES, 0)
+        self.assertEqual(format_s_transfer("none", 0), "none · 0 B")
+        self.assertEqual(
+            format_s_transfer("example", 80_000), "0.1 MB · 0.001 s once"
+        )
+
     def test_only_five_cold_schemas_are_selected(self) -> None:
         self.assertEqual(len(COLD_SCHEMAS), 5)
         self.assertEqual(
