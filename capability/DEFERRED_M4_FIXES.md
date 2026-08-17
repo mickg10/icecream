@@ -18,17 +18,17 @@ Repro: install ordinal 5 @TU3 (last_use=3) → failed Fill @TU99 (op2 ref 5 + in
 and restores a committed Region only by setting `known=false`, not its complete prior view.
 
 ## Required before the M4 transactional gate (local-oracle)
-1. Journal + restore every touched public ordinal's prior presence/bytes/last-use (incl. op2 + idempotent rebind); restore vector sizes.
-2. Restore complete prior Region views, not only `known`.
+1. ~~Journal + restore every touched public ordinal's prior presence/bytes/last-use (incl. op2 + idempotent rebind); restore vector sizes.~~ **Implemented on the local-oracle correction branch.** Last-use changes are deferred until complete Fill validation; new bindings and vector extents roll back.
+2. ~~Restore complete prior Region views, not only `known`.~~ **Implemented on the local-oracle correction branch.** The complete prior view is journaled and restored in reverse mutation order.
 3. Stage Block-manifest installation with the rest of the TU (it currently commits before Fill decoding).
 4. After a rejected TU, do not leave C's F-known mirror advanced — explicit TU acceptance before committing C's mirror, or a conservative resync that also restores the complete path table.
-5. Add the exact last-use reproduction + a live "failed component, then valid independent TU" test.
+5. **Partially implemented:** the exact last-use/vector-extent/Region-view reproduction and subsequent valid Fill are retained in `cap_m2_test`. The live whole-TU failed-component-then-valid-TU test remains part of M4.
 6. Validate the Rejoin TU (C receives the payload but never calls `unpack_rejoin`); convert M4 component parsing to bounded cursor reads requiring complete payload consumption.
 
 ## Also
-- 5 `-Wmisleading-indentation` warnings in `cap_codec.cpp` — to be cleaned opportunistically when `material_lab` reuses cap_codec.
+- ~~5 `-Wmisleading-indentation` warnings in `cap_codec.cpp`.~~ **Cleaned on the local-oracle correction branch; both `cap_main` and `cap_m2_test` compile warning-free with `-Wall -Wextra -Wpedantic -Werror`.**
 - `M1_REPORT.md` relationship-frame sizes corrected: cap_main **Hello = 25 B** (4-byte header + 16-byte generation + NREG + NBLK varints), **Done = 4 B**, **Ack = 5 B** (was mis-stated as 20 / 4 / 4).
 
 ## Status
-M2 transactional-rollback subgate = **PROVISIONAL** (6 state-equivalence items open, deferred with M4).
+M2 transactional-rollback subgate = **PROVISIONAL** (items 3, 4, the live half of 5, and 6 remain for M4).
 M1/M2/M3 semantic + byte-exact + zero-header-read portability results **stand and are independently reproduced**.
