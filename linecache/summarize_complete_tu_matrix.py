@@ -8,7 +8,7 @@ import csv
 import json
 from pathlib import Path
 
-from run_complete_tu_matrix import CORPORA, SCHEMAS
+from run_complete_tu_matrix import CORPORA, SCHEMAS, sha256
 
 
 DEFAULT_CHECKPOINTS = (50, 100, 150, 200, 250, 300)
@@ -36,8 +36,12 @@ def historical_endpoints(repository: Path) -> dict[tuple[str, str, str], int]:
         ),
         (
             "p26",
-            repository / "linecache/ml-artifacts/compressed-blob-p26-16corpus-summary.json",
-            {"cold": "cold_p26_wire_bytes", "bit0": "bit0_p26_wire_bytes", "bit1": "bit1_p26_wire_bytes"},
+            repository / "linecache/ml-artifacts/mo-factor-p27-16corpus-summary.json",
+            {
+                "cold": "cold_p26_wire_bytes",
+                "bit0": "bit0_p26_wire_bytes",
+                "bit1": "bit1_p26_wire_bytes",
+            },
         ),
         (
             "p27",
@@ -89,7 +93,10 @@ def make_rows(
     for corpus, _ in CORPORA:
         for schema in SCHEMAS:
             curve_path = run_root / schema["schema"] / f"{corpus}.curve.tsv"
+            log_path = run_root / schema["schema"] / f"{corpus}.log"
             curve = load_curve(curve_path)
+            if not log_path.is_file():
+                raise FileNotFoundError(log_path)
             full = checkpoint_point(curve, None)
             assert full is not None
             key = (corpus, schema["stage"], schema["state"])
@@ -106,6 +113,8 @@ def make_rows(
                 "description": schema["description"],
                 "tus": len(curve),
                 "raw_bytes": full["raw_bytes"],
+                "curve_sha256": sha256(curve_path),
+                "log_sha256": sha256(log_path),
             }
             for checkpoint in checkpoints:
                 point = checkpoint_point(curve, checkpoint)
@@ -131,7 +140,9 @@ def write_tsv(path: Path, rows: list[dict]) -> None:
         writer.writerows(rows)
 
 
-def render_markdown(rows: list[dict], checkpoints: tuple[int, ...]) -> str:
+def render_markdown(
+    rows: list[dict], checkpoints: tuple[int, ...], run_root: Path
+) -> str:
     lines = [
         "# Complete-codec per-project/per-schema TU transfer matrix",
         "",
@@ -143,6 +154,13 @@ def render_markdown(rows: list[dict], checkpoints: tuple[int, ...]) -> str:
         "All rows reconstruct the complete `.ii` byte stream exactly. The full endpoint of every "
         "row is checked against its previously retained P25, P26, P27, P28, or P29 ledger; this "
         "table is not derived from archive sizes or structural-only estimates.",
+        "",
+        "The execution profile keeps original source files visible where the complete codec can "
+        "reuse them. Quietbox2 supplied 210 rows. OpenCV and LevelDB retain absolute source paths "
+        "from the capture host, so all 30 rows for those two projects were rerun on that host; "
+        "using the copied `.ii` files alone changes their material decisions. P26 is checked "
+        "against the same-binary P26 controls in the P27 ledger, which uses this same source-visible "
+        "profile.",
         "",
         "## Schema legend",
         "",
@@ -195,6 +213,8 @@ def render_markdown(rows: list[dict], checkpoints: tuple[int, ...]) -> str:
             "```",
             "",
             "The machine TSV retains exact byte counts alongside the display values.",
+            f"The 240 per-TU curves and 240 complete logs are retained under `{run_root.resolve()}`; "
+            "the machine summary records a SHA-256 for each.",
             "",
         ]
     )
@@ -217,16 +237,26 @@ def main() -> int:
     write_tsv(args.tsv, rows)
     summary = {
         "experiment": "complete P25-P29 per-project/per-schema TU matrix",
+        "execution_profile": {
+            "name": "source-visible consistent",
+            "quietbox2_rows": 210,
+            "capture_host_opencv_leveldb_rows": 30,
+            "reason": (
+                "OpenCV and LevelDB .ii marker paths resolve only on the capture host; "
+                "all schemas for those projects use that host"
+            ),
+        },
         "accounting": {
             "decimal_mb_divisor": DECIMAL_MB,
             "one_gbit_bytes_per_second": ONE_GBIT_BYTES_PER_SECOND,
         },
         "checkpoints": list(checkpoints),
+        "retained_run_root": str(args.run_root.resolve()),
         "exact_rows": len(rows),
         "rows": rows,
     }
     args.json.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
-    args.markdown.write_text(render_markdown(rows, checkpoints))
+    args.markdown.write_text(render_markdown(rows, checkpoints, args.run_root))
     print(f"wrote {len(rows)} exact project/schema rows")
     return 0
 
