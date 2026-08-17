@@ -117,7 +117,9 @@ def main() -> int:
 
     args.tsv.parent.mkdir(parents=True, exist_ok=True)
     with args.tsv.open("w", newline="") as destination:
-        writer = csv.DictWriter(destination, fieldnames=FIELDS, delimiter="\t")
+        writer = csv.DictWriter(
+            destination, fieldnames=FIELDS, delimiter="\t", lineterminator="\n"
+        )
         writer.writeheader()
         writer.writerows(output_rows)
 
