@@ -1,5 +1,10 @@
 # Residual and Region-control ceilings after P26
 
+> Historical note: the generic-codec decision below predates the exact PAQ/ZPAQ residual sweep.
+> [`PAQ-RESIDUAL-CEILING.md`](PAQ-RESIDUAL-CEILING.md) supersedes the claim that all stronger
+> residual coding should be closed: ZPAQ m3/m4/m5 expose a repeatable residual-only gain, while
+> confirming that the unmodified codecs are too slow for the live path.
+
 ## Question
 
 After P26, the cold ledger still had about 41 MB of zstd-3 RAW_RUN literal wire and 19.7 MB of
