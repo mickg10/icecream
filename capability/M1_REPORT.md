@@ -56,7 +56,9 @@ codec50-m1 7-category ledger **to the byte on two corpora**:
 length charge equals the real 4-byte packed header exactly — but that zero-delta is *only* the
 length prefix; the virtual **category ledger is NOT the socket total**. The real socket total
 (DuckDB = 10,311,523 B) exceeds the 9,590,734 B category ledger for two distinct reasons: (a)
-relationship/job frames the category ledger does not count (Hello 20 B, per-job Done/Ack 4 B), and
+relationship/job frames the category ledger does not count — measured on these corpora as **Hello 25 B**
+(4-byte header + 16-byte generation + NREG + NBLK varints; the transport `send_hello` primitive alone is 20 B,
+but cap_main's Hello also latches NREG/NBLK), **Done 4 B**, **Ack 5 B** (header + 1-byte byte-exact verdict) — and
 (b) ROOT, NEED, Block-material, and path-def payloads are currently sent **raw** on the socket
 whereas the virtual ledger charges their z3-compressed size. The category ledger (9,590,734) is the
 codec accounting model and the byte-exact regression gate; the socket total is the literal transfer,
