@@ -25,31 +25,17 @@ bool parse_marker(const char* s, uint32_t len, Marker& m){
 }
 void emit_marker(const Marker& m, std::vector<uint8_t>& out){ char buf[32]; int l=snprintf(buf,sizeof buf,"# %llu \"",(unsigned long long)m.lineno); out.insert(out.end(),buf,buf+l); out.insert(out.end(),m.path.begin(),m.path.end()); out.push_back('"'); for(uint8_t f:m.flags){ out.push_back(' '); l=snprintf(buf,sizeof buf,"%u",f); out.insert(out.end(),buf,buf+l);} out.push_back('\n'); }
 
-bool system_source_path(const std::string&path){
-    return path.rfind("/usr/include/",0)==0||path.rfind("/usr/lib/gcc/",0)==0||path.rfind("/usr/local/include/",0)==0;
-}
-const SourceText& SourceTextStore::get(const std::string&path){
-    SourceText&source=files_[path];if(source.attempted)return source;source.attempted=true;source.offsets.push_back(0);
-    struct stat st{};if((!allowProject_&&!system_source_path(path))||stat(path.c_str(),&st)||st.st_size<0||uint64_t(st.st_size)>UINT32_MAX)return source;
-    FILE*file=fopen(path.c_str(),"rb");if(!file)return source;source.bytes.resize(size_t(st.st_size));
-    if(!source.bytes.empty()&&fread(source.bytes.data(),1,source.bytes.size(),file)!=source.bytes.size()){fclose(file);source.bytes.clear();return source;}fclose(file);
-    finish(source);return source;
-}
-bool SourceTextStore::install(const std::string&path,const uint8_t*data,size_t size){
-    if(size>UINT32_MAX)return false;
-    SourceText&source=files_[path];
-    if(source.available)return source.bytes.size()==size&&(!size||!memcmp(source.bytes.data(),data,size));
-    source={};source.attempted=true;source.offsets.push_back(0);
-    if(size)source.bytes.assign(data,data+size);
-    finish(source);return true;
+// M3: the system-header read path is DISABLED and abort-guarded (see cap_codec.h). A
+// conformant M3 run never calls this; if a future edit reintroduces a header read it aborts
+// loudly, and system_header_reads() (asserted 0 at end of run) makes the invariant testable.
+static uint64_t g_system_header_reads=0;
+uint64_t system_header_reads(){ return g_system_header_reads; }
+void SourceTextStore::get(const std::string& path){
+    ++g_system_header_reads;
+    fprintf(stderr,"M3 VIOLATION: system-header read attempted for '%s' — the reduced grammar must be self-describing (F needs no headers)\n",path.c_str());
+    abort();
 }
 
-uint32_t common_prefix(const uint8_t*a,uint32_t an,const uint8_t*b,uint32_t bn){
-    uint32_t n=std::min(an,bn),i=0;while(i<n&&a[i]==b[i])++i;return i;
-}
-uint32_t common_suffix(const uint8_t*a,uint32_t an,const uint8_t*b,uint32_t bn,uint32_t prefix){
-    uint32_t n=std::min(an-std::min(an,prefix),bn-std::min(bn,prefix)),i=0;while(i<n&&a[an-1-i]==b[bn-1-i])++i;return i;
-}
 static bool equal_tail(const char*p,const char*end,const char*value,size_t n){ return size_t(end-p)==n&&!memcmp(p,value,n); }
 static int hex_value(uint8_t c){ if(c>='0'&&c<='9')return c-'0'; if(c>='a'&&c<='f')return c-'a'+10; if(c>='A'&&c<='F')return c-'A'+10; return -1; }
 bool parse_byte_array(const char*data,uint32_t length,GeneratedByteArray&out){
@@ -109,34 +95,25 @@ void append_rendered_byte_array(const ByteArrayStyle&style,const uint8_t*values,
 }
 
 // =====================================================================================
-// C: mixed-region materializer (codec50-m1.cpp 778-888), byte-for-byte for the canonical
-// path.  useByteArrayLines=true, useProjectSource=false (the project-source/admission
-// branches are dead for these flags but kept structurally so the live op5/op6 system-
-// header SOURCE_COPY/PATCH branch ordering is identical to the reference).
+// C: mixed-region materializer — M3 REDUCED GRAMMAR.  The control lane emits ONLY the four
+// terminals RAW_RUN(op0) / PUBLIC_LINE {publish op1/op9, ref op2, recover op7/op8} /
+// BYTE_ARRAY(op3) / PP_MARKER(op4).  The system-header SOURCE_COPY/PATCH path (op5/op6) and
+// all project-source/package machinery are REMOVED so the codec is self-describing and F
+// reads zero system headers.  EMBEDDED_OBJECT(op10, P26-P29 material lane) is a reserved
+// stub — never emitted here.
 // =====================================================================================
 uint32_t MixedEncoder::materialize(const Interner& dict, const std::vector<uint32_t>& missReg, size_t t){
-    const bool useByteArrayLines=true, useProjectSource=false;
+    (void)t;
     for(auto& v:mixedRaw) v.clear();
     fill_paths.clear(); np=0;
     std::vector<GeneratedByteArray> mixedArrayEntries;
-    std::vector<std::pair<uint32_t,const SourceText*>> mixedSourceDefinitions;
     uint32_t nr=0;
-    std::vector<uint8_t> sourceCostDst;
 
     put_varint(mixedRaw[0],missReg.size());
     for(uint32_t r:missReg){
         const uint32_t* lids=dict.region_ids_ptr(r); uint32_t count=dict.region_ids_count(r),offset=0,literalLength=0;
-        Marker regionMarker;bool regionMarkerOk=false;
-        if(count){const LineRef&first=dict.ref(lids[0]);regionMarkerOk=parse_marker(dict.line_data(first.off),first.len,regionMarker);}
-        const SourceText*regionSource=regionMarkerOk?&mixedCSource.get(regionMarker.path):nullptr;
         auto ensurePathId=[&](const std::string&path){auto found=pathid.find(path);if(found!=pathid.end())return found->second;
             uint32_t id=uint32_t(paths.size());pathid.emplace(path,id);paths.push_back(path);put_varint(fill_paths,path.size());fill_paths.insert(fill_paths.end(),path.begin(),path.end());++np;return id;};
-        auto ensureSourceDefinition=[&](const std::string&path,uint32_t pathId,const SourceText&source){
-            if(!useProjectSource||system_source_path(path))return;
-            if(mixedSourceSent.size()<=pathId)mixedSourceSent.resize(size_t(pathId)+1);
-            if(mixedSourceSent[pathId])return;
-            mixedSourceSent[pathId]=1;mixedSourceDefinitions.emplace_back(pathId,&source);
-        };
         put_varint(mixedRaw[0],dict.region_raw_len(r));
         auto flushLiteral=[&](){ if(!literalLength)return; mixedRaw[0].push_back(0);put_varint(mixedRaw[0],literalLength);++mixedOps[0];literalLength=0; };
         for(uint32_t j=0;j<count;++j){
@@ -182,56 +159,17 @@ uint32_t MixedEncoder::materialize(const Interner& dict, const std::vector<uint3
             } else {
                 if(state.source_region==UINT32_MAX){state.source_region=r;state.source_offset=offset;}
                 GeneratedByteArray parsed;Marker lineMarker;
-                bool arrayLine=useByteArrayLines&&parse_byte_array(text,line.len,parsed),markerLine=parse_marker(text,line.len,lineMarker);
-                size_t arrayValueCount=parsed.values.size();
-                bool sourceCopy=false,sourcePatch=false;uint32_t sourceLine=0,patchPrefix=0,patchSuffix=0,patchMiddle=0;
-                if(regionSource&&j>0){uint64_t candidate=uint64_t(regionMarker.lineno)+j-1;
-                    if(candidate&&candidate<regionSource->offsets.size()){uint32_t index=uint32_t(candidate-1),begin=regionSource->offsets[index],end=regionSource->offsets[index+1];
-                        if(regionSource->available){sourceLine=index;const uint8_t*base=regionSource->bytes.data()+begin;uint32_t baseLength=end-begin;
-                            if(baseLength==line.len&&!memcmp(base,text,line.len))sourceCopy=true;
-                            else {patchPrefix=common_prefix((const uint8_t*)text,line.len,base,baseLength);patchSuffix=common_suffix((const uint8_t*)text,line.len,base,baseLength,patchPrefix);patchMiddle=line.len-patchPrefix-patchSuffix;
-                                size_t cost=1+varint_size(paths.size())+varint_size(sourceLine)+varint_size(patchPrefix)+varint_size(patchSuffix)+varint_size(patchMiddle)+patchMiddle;
-                                sourcePatch=cost<line.len;}}
-                    }
-                }
-                bool systemSource=regionSource&&system_source_path(regionMarker.path),sourceAdmitted=systemSource;
-                uint32_t sourcePath=UINT32_MAX;SourceAdmission*admission=nullptr;
-                if(regionSource&&(sourceCopy||sourcePatch)&&!systemSource&&useProjectSource){
-                    sourcePath=ensurePathId(regionMarker.path);
-                    if(mixedSourceAdmission.size()<=sourcePath)mixedSourceAdmission.resize(size_t(sourcePath)+1);
-                    admission=&mixedSourceAdmission[sourcePath];
-                    if(!admission->cost_known){
-                        admission->package_cost=zstd_size(sourceCostZ,regionSource->bytes.data(),regionSource->bytes.size(),3,sourceCostDst)
-                            +varint_size(sourcePath)+varint_size(regionSource->bytes.size())+16;
-                        mixedSourceEstimatedCost+=admission->package_cost;++mixedSourceConsidered;admission->cost_known=true;
-                    }
-                    if(!admission->admitted&&admission->last_observed_tu!=SIZE_MAX&&admission->last_observed_tu<t&&
-                       admission->observed_benefit>=uint64_t(sourceAdmitRatio)*admission->package_cost){
-                        admission->admitted=true;++mixedSourceAdmitted;
-                    }
-                    sourceAdmitted=admission->admitted;
-                }
-                if(sourceCopy&&sourceAdmitted){
-                    if(sourcePath==UINT32_MAX)sourcePath=ensurePathId(regionMarker.path);
-                    ensureSourceDefinition(regionMarker.path,sourcePath,*regionSource);
-                    flushLiteral();mixedRaw[0].push_back(5);put_varint(mixedRaw[0],sourcePath);put_varint(mixedRaw[0],sourceLine);++mixedOps[5];mixedSourceBytes+=line.len;
-                } else if(arrayLine){
+                bool arrayLine=parse_byte_array(text,line.len,parsed);
+                bool markerLine=parse_marker(text,line.len,lineMarker);
+                // --- EMBEDDED_OBJECT (op10, P26-P29 material lane) hook point: reserved, not implemented in M3. ---
+                if(arrayLine){                                                      // BYTE_ARRAY
                     mixedArrayValues+=parsed.values.size();flushLiteral();mixedRaw[0].push_back(3);mixedArrayEntries.push_back(std::move(parsed));++mixedOps[3];++n_literal;
-                } else if(markerLine){
+                } else if(markerLine){                                              // PP_MARKER
                     uint32_t pathId=ensurePathId(lineMarker.path);
                     flushLiteral();mixedRaw[0].push_back(4);put_varint(mixedRaw[0],pathId);put_varint(mixedRaw[0],lineMarker.lineno);
                     put_varint(mixedRaw[0],lineMarker.flags.size());for(uint8_t flag:lineMarker.flags)mixedRaw[0].push_back(flag);++mixedOps[4];++n_marker;
-                } else if(sourcePatch&&sourceAdmitted){
-                    if(sourcePath==UINT32_MAX)sourcePath=ensurePathId(regionMarker.path);
-                    ensureSourceDefinition(regionMarker.path,sourcePath,*regionSource);
-                    flushLiteral();mixedRaw[0].push_back(6);put_varint(mixedRaw[0],sourcePath);put_varint(mixedRaw[0],sourceLine);
-                    put_varint(mixedRaw[0],patchPrefix);put_varint(mixedRaw[0],patchSuffix);put_varint(mixedRaw[0],patchMiddle);mixedRaw[1].insert(mixedRaw[1].end(),text+patchPrefix,text+patchPrefix+patchMiddle);
-                    ++mixedOps[6];mixedLiteralRaw+=patchMiddle;mixedSourceBytes+=patchPrefix+patchSuffix;++n_literal;
-                } else {mixedRaw[1].insert(mixedRaw[1].end(),text,text+line.len);literalLength+=line.len;mixedLiteralRaw+=line.len;++n_literal;}
-                if(admission&&!admission->admitted){
-                    uint64_t benefit=sourceCopy?(arrayLine?arrayValueCount:(markerLine?0:line.len)):
-                        ((!arrayLine&&!markerLine&&sourcePatch)?uint64_t(patchPrefix)+patchSuffix:0);
-                    admission->observed_benefit+=benefit;admission->last_observed_tu=t;mixedSourcePotentialRaw+=benefit;
+                } else {                                                            // RAW_RUN (self-describing literal — replaces op5/op6)
+                    mixedRaw[1].insert(mixedRaw[1].end(),text,text+line.len);literalLength+=line.len;mixedLiteralRaw+=line.len;++n_literal;
                 }
             }
             offset+=line.len;
@@ -252,14 +190,6 @@ uint32_t MixedEncoder::materialize(const Interner& dict, const std::vector<uint3
         for(const auto&value:mixedArrayEntries){ByteArrayStyle style{value.prefix,value.separator,value.suffix,value.format};
             size_t styleId=std::lower_bound(styles.begin(),styles.end(),style)-styles.begin();put_varint(mixedRaw[2],styleId);put_varint(mixedRaw[2],value.values.size());
             mixedRaw[3].insert(mixedRaw[3].end(),value.values.begin(),value.values.end());}
-    }
-    if(!mixedSourceDefinitions.empty()){
-        put_varint(mixedRaw[4],mixedSourceDefinitions.size());
-        for(const auto&definition:mixedSourceDefinitions){
-            put_varint(mixedRaw[4],definition.first);put_varint(mixedRaw[4],definition.second->bytes.size());
-            mixedRaw[5].insert(mixedRaw[5].end(),definition.second->bytes.begin(),definition.second->bytes.end());
-            mixedSourcePackageRaw+=definition.second->bytes.size();++mixedSourcePackageFiles;
-        }
     }
     return nr;
 }
@@ -319,14 +249,8 @@ bool FStore::decode_fill(const std::array<std::vector<uint8_t>,6>& recovered,
     { const uint8_t* pp=fill_paths.data(),*pe=pp+fill_paths.size();
       while(pp<pe){ uint64_t L=get_varint(pp); if(uint64_t(pe-pp)<L) return rollback("truncated path"); Fpaths.emplace_back((const char*)pp,(size_t)L); pp+=L; } }
 
-    // ---- source packages (inert in canonical path) ----
-    if(!recovered[4].empty()){
-        const uint8_t*sp=recovered[4].data(),*se=sp+recovered[4].size(),*bp=recovered[5].data(),*be=bp+recovered[5].size();
-        uint64_t sourceCount=get_varint(sp);
-        for(uint64_t k=0;k<sourceCount;++k){ uint64_t pathId=get_varint(sp),length=get_varint(sp);
-            if(pathId>=Fpaths.size()||length>uint64_t(be-bp)||!mixedFSource.install(Fpaths[pathId],bp,length)) return rollback("bad source def"); bp+=length; }
-        if(sp!=se||bp!=be) return rollback("source def trailing");
-    } else if(!recovered[5].empty()) return rollback("partial source def");
+    // ---- M3: source-package lanes are removed (self-describing codec; F reads no headers) ----
+    if(!recovered[4].empty()||!recovered[5].empty()) return rollback("source lanes removed in M3");
 
     const uint8_t*ap=recovered[2].data(),*ae=ap+recovered[2].size(),*vp=recovered[3].data(),*ve=vp+recovered[3].size();
     std::vector<ByteArrayStyle> mixedStyles;uint64_t arrayCount=0,arraysUsed=0;
@@ -360,14 +284,6 @@ bool FStore::decode_fill(const std::array<std::vector<uint8_t>,6>& recovered,
                 } else if(op==4){uint64_t pathId=get_varint(cp),lineNumber=get_varint(cp),flagCount=get_varint(cp);
                   if(pathId>=Fpaths.size()||flagCount>uint64_t(ce-cp))return rollback("bad marker rec");Marker marker;marker.path=Fpaths[pathId];marker.lineno=lineNumber;
                   marker.flags.assign(cp,cp+flagCount);cp+=flagCount;std::vector<uint8_t> tmp;emit_marker(marker,tmp);FmixedRegionData.insert(FmixedRegionData.end(),tmp.begin(),tmp.end());
-                } else if(op==5){uint64_t pathId=get_varint(cp),lineIndex=get_varint(cp);if(pathId>=Fpaths.size())return rollback("bad source path");
-                  const SourceText&source=mixedFSource.get(Fpaths[pathId]);if(!source.available||lineIndex+1>=source.offsets.size())return rollback("bad source line");
-                  uint32_t begin2=source.offsets[lineIndex],end2=source.offsets[lineIndex+1];FmixedRegionData.insert(FmixedRegionData.end(),source.bytes.begin()+begin2,source.bytes.begin()+end2);
-                } else if(op==6){uint64_t pathId=get_varint(cp),lineIndex=get_varint(cp),prefix=get_varint(cp),suffix=get_varint(cp),middle=get_varint(cp);
-                  if(pathId>=Fpaths.size()||middle>uint64_t(le-lp))return rollback("bad source patch");const SourceText&source=mixedFSource.get(Fpaths[pathId]);
-                  if(!source.available||lineIndex+1>=source.offsets.size())return rollback("bad source patch line");uint32_t begin2=source.offsets[lineIndex],end2=source.offsets[lineIndex+1];
-                  if(prefix+suffix>end2-begin2)return rollback("bad source patch extent");FmixedRegionData.insert(FmixedRegionData.end(),source.bytes.begin()+begin2,source.bytes.begin()+begin2+prefix);
-                  FmixedRegionData.insert(FmixedRegionData.end(),lp,lp+middle);lp+=middle;FmixedRegionData.insert(FmixedRegionData.end(),source.bytes.begin()+end2-suffix,source.bytes.begin()+end2);
                 } else if(op==7){uint64_t ord=get_varint(cp),len=get_varint(cp);if(len>uint64_t(le-lp))return rollback("trunc op7 bytes");
                   const uint8_t* b7=lp; lp+=len; FmixedRegionData.insert(FmixedRegionData.end(),b7,b7+len);             // emit into region
                   if(!bindPublic(uint32_t(ord),b7,len))return rollback("op7 unequal rebind");                          // (re)define immutable
@@ -379,6 +295,7 @@ bool FStore::decode_fill(const std::array<std::vector<uint8_t>,6>& recovered,
                   const uint8_t* b9=lp; lp+=len; FmixedRegionData.insert(FmixedRegionData.end(),b9,b9+len);            // emit into region
                   uint32_t ord=Fpublic_next++;                                                                        // implicit ordinal (== op1)
                   if(!bindPublic(ord,b9,len))return rollback("op9 rebind");                                           // MATERIALIZE from bytes
+                } else if(op==10){ return rollback("EMBEDDED_OBJECT (op10) reserved: P26-P29 material lane, not implemented in M3"); // clean stub, never emitted
                 } else return rollback("bad opcode");
                 if(FmixedRegionData.size()-begin>rawLength)return rollback("region overrun");
             }

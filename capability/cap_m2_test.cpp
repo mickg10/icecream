@@ -80,6 +80,18 @@ int main(){
         check(F.FmixedRegionData.size()==rd0+4,"exactly the good region's bytes committed");
     }
 
-    printf("cap_m2_test (unequal-rebind + transactional-rollback): %s\n", fails==0?"PASS":"FAIL");
+    // ===== TEST 6: EMBEDDED_OBJECT (op10) reserved stub rejects cleanly (M3) =====
+    fprintf(stderr,"[6] EMBEDDED_OBJECT op10 stub:\n");
+    {
+        FStore F; F.init(/*NREG*/8,/*NBLK*/0); std::vector<uint8_t> nopaths;
+        std::array<std::vector<uint8_t>,6> rec; for(auto&v:rec)v.clear();
+        put_varint(rec[0],1); put_varint(rec[0],4);   // region 0, rawLength 4
+        rec[0].push_back(10);                          // op10 EMBEDDED_OBJECT (reserved, P26-P29)
+        size_t rd0=F.FmixedRegionData.size();
+        check(!F.decode_fill(rec,std::vector<uint32_t>{0u},nopaths,0),"op10 EMBEDDED_OBJECT rejected (reserved, not implemented)");
+        check(F.FmixedRegionData.size()==rd0 && !F.FmixedRegions[0].known,"op10 reject commits nothing");
+    }
+
+    printf("cap_m2_test (rebind + rollback + op10-stub): %s\n", fails==0?"PASS":"FAIL");
     return fails==0?0:1;
 }

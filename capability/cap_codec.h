@@ -196,27 +196,15 @@ struct MixedCLineState { uint32_t source_region=UINT32_MAX; uint32_t source_offs
 struct MixedFLineView { uint32_t source_region=0; uint32_t source_offset=0; uint32_t length=0; };
 struct MixedFRegionView { size_t offset=0; uint32_t length=0; bool known=false; };
 
-// ---- system-header source text (op5 SOURCE_COPY / op6 SOURCE_PATCH) ----
-bool system_source_path(const std::string&path);
-struct SourceText { bool attempted=false,available=false; std::vector<uint8_t> bytes; std::vector<uint32_t> offsets; };
-class SourceTextStore {
-public:
-    explicit SourceTextStore(bool allowProject=false):allowProject_(allowProject){}
-    const SourceText& get(const std::string&path);
-    bool install(const std::string&path,const uint8_t*data,size_t size);
-private:
-    static void finish(SourceText&source){
-        for(uint32_t i=0;i<source.bytes.size();++i)if(source.bytes[i]=='\n')source.offsets.push_back(i+1);
-        if(source.offsets.back()!=source.bytes.size())source.offsets.push_back(source.bytes.size());
-        source.available=true;
-    }
-    bool allowProject_=false;
-    std::unordered_map<std::string,SourceText> files_;
+// ---- M3: system-header source reads are REMOVED (the reduced grammar is self-describing).
+// This stub exists only to make the disabled read path AUDITABLE and regression-enforced:
+// any call increments a global counter and aborts, so a future edit that reintroduces a
+// header read fails loudly.  A conformant M3 run never calls it (system_header_reads()==0). ----
+uint64_t system_header_reads();
+struct SourceTextStore {
+    explicit SourceTextStore(bool=false){}
+    [[noreturn]] void get(const std::string& path);   // DISABLED — aborts if ever called
 };
-uint32_t common_prefix(const uint8_t*a,uint32_t an,const uint8_t*b,uint32_t bn);
-uint32_t common_suffix(const uint8_t*a,uint32_t an,const uint8_t*b,uint32_t bn,uint32_t prefix);
-
-struct SourceAdmission { uint64_t observed_benefit=0; uint64_t package_cost=0; size_t last_observed_tu=SIZE_MAX; bool cost_known=false; bool admitted=false; };
 
 // =====================================================================================
 // C role: mixed-region materializer (encoder/authority).  Extracted from codec50-m1.cpp
@@ -229,18 +217,11 @@ struct MixedEncoder {
     uint32_t nextMixedPublic=1;
     std::unordered_map<std::string,uint32_t> pathid;
     std::vector<std::string> paths;
-    SourceTextStore mixedCSource{false};                     // system-header source (op5/op6), no project
-    std::vector<uint8_t> mixedSourceSent;                    // (dead for our flags) package sent map
-    std::vector<SourceAdmission> mixedSourceAdmission;       // (dead) admission ledger
-    ZSTD_CCtx* sourceCostZ=nullptr;                          // (dead) package cost estimator
-    static constexpr uint32_t sourceAdmitRatio=6;            // (dead)
-    // ---- counters (persistent) ----
+    // ---- counters (persistent) ---- mixedOps: [0]RAW_RUN runs [1]publish [2]ref [3]BYTE_ARRAY [4]PP_MARKER
     std::array<uint64_t,7> mixedOps{};
     uint64_t op7_count=0, op8_count=0, op9_count=0;          // M2 public-Line recovery ops
     uint64_t op7_wire=0, op8_wire=0, op9_wire=0;             // M2 "bytes recovered" split (raw)
-    uint64_t mixedLiteralRaw=0, mixedArrayValues=0, mixedSourceBytes=0;
-    uint64_t mixedSourcePackageRaw=0, mixedSourcePackageFiles=0, mixedSourcePotentialRaw=0;
-    uint64_t mixedSourceConsidered=0, mixedSourceAdmitted=0, mixedSourceEstimatedCost=0;
+    uint64_t mixedLiteralRaw=0, mixedArrayValues=0;
     uint64_t n_marker=0, n_literal=0;
     // ---- M2 authority model of F's cache (mirror; kept EXACT by F's declarations) ----
     std::vector<uint8_t> fknownReg;                         // sized NREG in init(); F holds region r
@@ -277,7 +258,6 @@ struct FStore {
     uint32_t publicBudget=UINT32_MAX;                       // eviction cap (UINT32_MAX = unbounded)
     std::vector<uint32_t> pendingDrops;                     // ordinals evicted since last NEED
     std::vector<std::string> Fpaths;
-    SourceTextStore mixedFSource{false};
     std::vector<uint8_t> FknownBlk;                         // size NBLK
     std::vector<std::vector<uint32_t>> FblkChildren;        // id-indexed (SPARSE: restart re-installs subset)
     std::vector<uint32_t> Freg_stream;

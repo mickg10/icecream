@@ -160,18 +160,20 @@ static int run_C(int fd, const Interner& dict, const Corpus& corpus,
     double MiB=1048576.0;
     double total = w_root+w_linedef+w_regiondef+w_pathdef+w_blockdef+w_missing+w_framing;
     const char* scn = scenario==SC_RESTART?"restart":(scenario==SC_LATEJOIN?"late-join":"cold");
-    printf("\n==== CAP-M2 (two-process C<->F; scenario=%s%s) — %s ====\n", scn,
+    printf("\n==== CAP-M3 (two-process C<->F; reduced grammar RAW_RUN/PUBLIC_LINE/BYTE_ARRAY/PP_MARKER; self-describing, no headers; scenario=%s%s) — %s ====\n", scn,
         scenario!=SC_COLD?(std::string(" @TU=")+std::to_string(scenarioT)).c_str():"", manifest);
     printf("byte-exact=%s  TUs=%zu(served %zu..%zu) raw=%.1f MiB regions=%u distinct_lines=%u paths=%zu blocks=%zu (marker_lines=%llu literal_lines=%llu)\n",
         byteexact?"OK":"FAIL",TUs,startT,TUs-1,corpus.raw/MiB,NREG,dict.distinct(),enc.paths.size(),boff2.size()-1,(unsigned long long)enc.n_marker,(unsigned long long)enc.n_literal);
     printf("wire by category (post-z%d, bytes): root=%.0f line_def=%.0f region_def=%.0f block_def=%.0f path_def=%.0f missing=%.0f framing=%.0f  TOTAL=%.0f (%.2f MiB)\n",
         zlevel,w_root,w_linedef,w_regiondef,w_blockdef,w_pathdef,w_missing,w_framing,total,total/MiB);
-    printf("mixed components: control=%.0f literal=%.0f array_control=%.0f array_values=%.0f selector=%.0f raw_source_reused=%llu public_lines=%u ops=[literal=%llu publish=%llu ref=%llu array=%llu marker=%llu source=%llu patch=%llu]\n",
-        mixedPartWire[0],mixedPartWire[1],mixedPartWire[2],mixedPartWire[3],mixedSelectorWire,(unsigned long long)enc.mixedSourceBytes,enc.nextMixedPublic-1,
-        (unsigned long long)enc.mixedOps[0],(unsigned long long)enc.mixedOps[1],(unsigned long long)enc.mixedOps[2],(unsigned long long)enc.mixedOps[3],(unsigned long long)enc.mixedOps[4],(unsigned long long)enc.mixedOps[5],(unsigned long long)enc.mixedOps[6]);
+    printf("mixed components: control=%.0f literal=%.0f array_control=%.0f array_values=%.0f selector=%.0f raw_literal=%llu raw_array_values=%llu public_lines=%u ops=[RAW_RUN_runs=%llu publish=%llu ref=%llu BYTE_ARRAY=%llu PP_MARKER=%llu]\n",
+        mixedPartWire[0],mixedPartWire[1],mixedPartWire[2],mixedPartWire[3],mixedSelectorWire,
+        (unsigned long long)enc.mixedLiteralRaw,(unsigned long long)enc.mixedArrayValues,enc.nextMixedPublic-1,
+        (unsigned long long)enc.mixedOps[0],(unsigned long long)enc.mixedOps[1],(unsigned long long)enc.mixedOps[2],(unsigned long long)enc.mixedOps[3],(unsigned long long)enc.mixedOps[4]);
     printf("M2 recovery: op7(reprovide-bytes)=%llu raw=%llu B | op8(reprovide-view)=%llu raw=%llu B | op9(publish-bytes)=%llu raw=%llu B | literal-block-extra=%llu raw B | public-drops-cleared=%llu\n",
         (unsigned long long)enc.op7_count,(unsigned long long)enc.op7_wire,(unsigned long long)enc.op8_count,(unsigned long long)enc.op8_wire,
         (unsigned long long)enc.op9_count,(unsigned long long)enc.op9_wire,(unsigned long long)literalBlockExtraRaw,(unsigned long long)dropsCleared);
+    printf("M3 portability: C system-header reads=%llu (self-describing; must be 0)\n",(unsigned long long)capc::system_header_reads());
     printf("REAL socket bytes (C-observed, incl. 4B headers + Hello/Done/Ack/Rejoin): %llu (%.2f MiB) in %.2fs\n",
         (unsigned long long)socket_bytes, socket_bytes/MiB, dur);
     if(scenario==SC_COLD)
@@ -249,9 +251,11 @@ static int run_F(int fd, const Corpus& corpus, size_t TUs, int zlevel,
     std::vector<uint8_t> ack{ uint8_t(byteexact?1:0) };
     if(!cap::send_frame(fd,cap::Frame::Ack,ack)){fprintf(stderr,"F: ack send\n");return 2;}
     for(size_t i=0;i<mixedPartCount;++i) ZSTD_freeDCtx(mixedZD[i]);
-    fprintf(stderr,"F: reconstruct byte-exact=%s over %llu TUs (served %zu..%zu); public held=%u evicted-total=%llu budget=%s\n",
+    uint64_t hdrReads=capc::system_header_reads();
+    if(hdrReads!=0){ fprintf(stderr,"F: M3 VIOLATION — system_header_reads=%llu (must be 0)\n",(unsigned long long)hdrReads); byteexact=false; }
+    fprintf(stderr,"F: reconstruct byte-exact=%s over %llu TUs (served %zu..%zu); public held=%u evicted-total=%llu budget=%s | system-header reads=%llu (self-describing)\n",
         byteexact?"OK":"FAIL",(unsigned long long)verified,startT,TUs-1,F.publicHeld,(unsigned long long)evictedTotal,
-        evictBudget==UINT32_MAX?"inf":std::to_string(evictBudget).c_str());
+        evictBudget==UINT32_MAX?"inf":std::to_string(evictBudget).c_str(),(unsigned long long)hdrReads);
     return byteexact?0:1;
 }
 
