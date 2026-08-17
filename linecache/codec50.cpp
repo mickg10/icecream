@@ -38,6 +38,9 @@
 #include <zlib.h>
 #include "alpha_line_codec.h"
 #include "mo_factor_codec.h"
+#if defined(WITH_BSC_GROUPS)
+  #include "residual_group_codec.h"
+#endif
 #if defined(WITH_D2) && __has_include("definition_codec.h")
   #include "definition_codec.h"
   #define HAVE_DEFCODEC 1
@@ -149,6 +152,102 @@ static Corpus load_corpus(const char*manifest,size_t max_files){
     for(auto&p:paths){ FILE*f=fopen(p.c_str(),"rb"); if(!f){perror(p.c_str());exit(2);} struct stat st{}; fstat(fileno(f),&st); size_t n=size_t(st.st_size); if(n&&fread(c.bytes.data()+off,1,n,f)!=n){fprintf(stderr,"short read\n");exit(2);} fclose(f); c.files.push_back({off,uint32_t(n)}); off+=n; }
     c.raw=off; return c;
 }
+
+#if defined(WITH_BSC_GROUPS)
+struct LiteralGroupRecord {
+    size_t first_tu=0,last_tu=0,wire_offset=0,wire_size=0;
+    size_t decoded_offset=0,decoded_size=0;
+    residual_group::Kind kind=residual_group::Kind::Zstd3;
+};
+
+struct LiteralGroupPlan {
+    std::vector<uint8_t>wire,decoded;
+    std::vector<uint32_t>per_tu_raw;
+    std::vector<LiteralGroupRecord>groups;
+    std::array<uint64_t,3>selected{};
+    double encode_seconds=0,decode_seconds=0;
+    size_t workers=1;
+    bool evaluated_zstd10=true;
+};
+
+static std::vector<uint8_t>read_binary_file(const std::string&path){
+    FILE*file=fopen(path.c_str(),"rb");if(!file){perror(path.c_str());throw std::runtime_error("open failed");}
+    if(fseek(file,0,SEEK_END)!=0){fclose(file);throw std::runtime_error("seek failed: "+path);}
+    long end=ftell(file);if(end<0||fseek(file,0,SEEK_SET)!=0){fclose(file);throw std::runtime_error("size failed: "+path);}
+    std::vector<uint8_t>bytes(static_cast<size_t>(end));
+    if(!bytes.empty()&&fread(bytes.data(),1,bytes.size(),file)!=bytes.size()){fclose(file);throw std::runtime_error("short read: "+path);}
+    if(fclose(file)!=0)throw std::runtime_error("close failed: "+path);
+    return bytes;
+}
+
+static LiteralGroupPlan build_literal_group_plan(const std::string&prefix,size_t tus,
+                                                  size_t stride,size_t group_tus,
+                                                  size_t workers,bool evaluate_zstd10,
+                                                  const char*wire_path){
+    if(stride<2||!group_tus||!workers)throw std::runtime_error("invalid literal group dimensions");
+    const std::string raw_path=prefix+".literal.raw",length_path=prefix+".lengths.raw";
+    std::vector<uint8_t>raw=read_binary_file(raw_path),length_bytes=read_binary_file(length_path);
+    if(length_bytes.size()%4)throw std::runtime_error("mixed length table is not a u32 array");
+    const size_t values=length_bytes.size()/4;
+    if(values!=tus*stride)throw std::runtime_error("mixed length table must contain one complete row per TU");
+    LiteralGroupPlan plan;plan.per_tu_raw.resize(tus);plan.workers=workers;
+    plan.evaluated_zstd10=evaluate_zstd10;
+    std::vector<size_t>offsets(tus+1);
+    for(size_t t=0;t<tus;++t){
+        const uint8_t*p=length_bytes.data()+4*(t*stride+1);
+        const uint32_t length=uint32_t(p[0])|(uint32_t(p[1])<<8)|(uint32_t(p[2])<<16)|(uint32_t(p[3])<<24);
+        plan.per_tu_raw[t]=length;
+        if(offsets[t]>SIZE_MAX-length)throw std::runtime_error("literal group raw size overflows");
+        offsets[t+1]=offsets[t]+length;
+    }
+    if(offsets.back()!=raw.size())throw std::runtime_error("literal group lengths do not span the raw input");
+    const size_t group_count=(tus+group_tus-1)/group_tus;
+    plan.groups.resize(group_count);std::vector<std::vector<uint8_t>>frames(group_count),decoded_groups(group_count);
+    for(size_t index=0;index<group_count;++index){
+        const size_t first=index*group_tus;
+        const size_t last=std::min(tus,first+group_tus),raw_size=offsets[last]-offsets[first];
+        LiteralGroupRecord&group=plan.groups[index];group.first_tu=first;group.last_tu=last;
+        group.decoded_offset=offsets[first];group.decoded_size=raw_size;
+    }
+    const size_t active_workers=std::min(workers,std::max(size_t(1),group_count));
+    auto parallel=[&](auto task){
+        std::atomic<size_t>next{0};std::vector<std::exception_ptr>errors(active_workers);std::vector<std::thread>threads;threads.reserve(active_workers);
+        for(size_t worker=0;worker<active_workers;++worker)threads.emplace_back([&,worker]{try{
+            residual_group::Codec codec;for(;;){size_t index=next.fetch_add(1);if(index>=group_count)break;task(codec,index);}
+          }catch(...){errors[worker]=std::current_exception();}});
+        for(auto&thread:threads)thread.join();
+        for(const auto&error:errors)if(error)std::rethrow_exception(error);
+    };
+    auto started=Clock::now();
+    parallel([&](residual_group::Codec&codec,size_t index){
+        LiteralGroupRecord&group=plan.groups[index];if(!group.decoded_size)return;
+        frames[index]=codec.encode(raw.data()+group.decoded_offset,group.decoded_size,
+                                   &group.kind,evaluate_zstd10);
+    });
+    plan.encode_seconds=std::chrono::duration<double>(Clock::now()-started).count();
+    started=Clock::now();
+    parallel([&](residual_group::Codec&codec,size_t index){
+        LiteralGroupRecord&group=plan.groups[index];if(!group.decoded_size)return;
+        residual_group::DecodedFrame decoded=codec.decode(frames[index].data(),frames[index].size());
+        if(decoded.wire_bytes!=frames[index].size()||decoded.kind!=group.kind||decoded.raw.size()!=group.decoded_size||
+           memcmp(decoded.raw.data(),raw.data()+group.decoded_offset,group.decoded_size))throw std::runtime_error("literal group frame roundtrip differs");
+        decoded_groups[index]=std::move(decoded.raw);
+    });
+    plan.decode_seconds=std::chrono::duration<double>(Clock::now()-started).count();
+    for(size_t index=0;index<group_count;++index){
+        LiteralGroupRecord&group=plan.groups[index];group.wire_offset=plan.wire.size();group.wire_size=frames[index].size();
+        plan.wire.insert(plan.wire.end(),frames[index].begin(),frames[index].end());
+        if(plan.decoded.size()!=group.decoded_offset)throw std::runtime_error("literal group decoded offset differs");
+        plan.decoded.insert(plan.decoded.end(),decoded_groups[index].begin(),decoded_groups[index].end());
+        if(group.wire_size)++plan.selected[size_t(group.kind)];
+    }
+    if(plan.decoded.size()!=raw.size())throw std::runtime_error("literal group decoded extent differs");
+    if(wire_path){FILE*file=fopen(wire_path,"wb");if(!file){perror(wire_path);throw std::runtime_error("wire output open failed");}
+        if(!plan.wire.empty()&&fwrite(plan.wire.data(),1,plan.wire.size(),file)!=plan.wire.size()){fclose(file);throw std::runtime_error("wire output short write");}
+        if(fclose(file)!=0)throw std::runtime_error("wire output close failed");}
+    return plan;
+}
+#endif
 static inline void put_varint(std::vector<uint8_t>&o,uint64_t v){ while(v>=0x80){o.push_back(uint8_t(v)|0x80);v>>=7;} o.push_back(uint8_t(v)); }
 static inline uint64_t get_varint(const uint8_t*&p){ uint64_t v=0; int s=0; for(;;){ uint8_t b=*p++; v|=uint64_t(b&0x7f)<<s; if(!(b&0x80))break; s+=7; } return v; }
 static inline void put_u64le(std::vector<uint8_t>&o,uint64_t v){for(unsigned i=0;i<8;++i)o.push_back(uint8_t(v>>(8*i)));}
@@ -661,7 +760,7 @@ static constexpr std::array<const char*,8> componentRawNames={
 };
 
 int main(int argc,char**argv){
-    const char* manifest=nullptr;const char*residualDumpPath=nullptr;const char*mixedDumpPrefix=nullptr;const char*curveTsvPath=nullptr; size_t max_files=SIZE_MAX,entropyRestartTus=0,replayRepetitions=1; int zlevel=3,literalZLevel=-1,arrayZLevel=-1,blobZLevel=-1,halfColdBit=-1,blobCanonicalLevel=9; uint32_t sourceAdmitRatio=6,blobThreads=4,blobZstdWorkers=0,blobZstdJobMiB=0,blobZstdOverlapLog=0,blobFallbackEvery=0,s1MinMatch=3,s1MaxChain=1024; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, usePriorRoot=false, useSortedLines=false, useByteArrayLines=false, useMixedRegions=false,useProjectSource=false,useKeyMap=false,useDirectOrdinals=false,useCompressedBlobs=false,useBlobEagerPatches=true,useMoFactor=false,traceMo=false,useAlphaLines=false,useResidualLdm=false,splitControlCeiling=false,structureCeiling=false;
+    const char* manifest=nullptr;const char*residualDumpPath=nullptr;const char*mixedDumpPrefix=nullptr;const char*curveTsvPath=nullptr;const char*literalGroupPrefix=nullptr;const char*literalGroupWirePath=nullptr; size_t max_files=SIZE_MAX,entropyRestartTus=0,replayRepetitions=1,literalGroupTus=0,literalGroupWorkers=1; int zlevel=3,literalZLevel=-1,arrayZLevel=-1,blobZLevel=-1,halfColdBit=-1,blobCanonicalLevel=9; uint32_t sourceAdmitRatio=6,blobThreads=4,blobZstdWorkers=0,blobZstdJobMiB=0,blobZstdOverlapLog=0,blobFallbackEvery=0,s1MinMatch=3,s1MaxChain=1024; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, usePriorRoot=false, useSortedLines=false,useByteArrayLines=false,useMixedRegions=false,useProjectSource=false,useKeyMap=false,useDirectOrdinals=false,useCompressedBlobs=false,useBlobEagerPatches=true,useMoFactor=false,traceMo=false,useAlphaLines=false,useResidualLdm=false,splitControlCeiling=false,structureCeiling=false,literalGroupEvaluateZstd10=true;
     const char*blobDumpPath=nullptr;const char*componentCurveTsvPath=nullptr;
     for(int i=1;i<argc;++i){ if(!strcmp(argv[i],"--manifest")&&i+1<argc)manifest=argv[++i];
         else if(!strcmp(argv[i],"--z")&&i+1<argc)zlevel=atoi(argv[++i]);
@@ -684,6 +783,11 @@ int main(int argc,char**argv){
         else if(!strcmp(argv[i],"--residual-dump")&&i+1<argc)residualDumpPath=argv[++i];
         else if(!strcmp(argv[i],"--blob-dump")&&i+1<argc)blobDumpPath=argv[++i];
         else if(!strcmp(argv[i],"--mixed-dump-prefix")&&i+1<argc)mixedDumpPrefix=argv[++i];
+        else if(!strcmp(argv[i],"--literal-group-prefix")&&i+1<argc)literalGroupPrefix=argv[++i];
+        else if(!strcmp(argv[i],"--literal-group-wire")&&i+1<argc)literalGroupWirePath=argv[++i];
+        else if(!strcmp(argv[i],"--literal-group-tus")&&i+1<argc){char*end=nullptr;unsigned long long value=strtoull(argv[++i],&end,10);if(!end||*end||!value||value>SIZE_MAX){fprintf(stderr,"bad literal group TU count\n");return 2;}literalGroupTus=size_t(value);}
+        else if(!strcmp(argv[i],"--literal-group-workers")&&i+1<argc){char*end=nullptr;unsigned long long value=strtoull(argv[++i],&end,10);if(!end||*end||!value||value>64){fprintf(stderr,"bad literal group worker count\n");return 2;}literalGroupWorkers=size_t(value);}
+        else if(!strcmp(argv[i],"--literal-group-skip-zstd10"))literalGroupEvaluateZstd10=false;
         else if(!strcmp(argv[i],"--curve-tsv")&&i+1<argc)curveTsvPath=argv[++i];
         else if(!strcmp(argv[i],"--component-curve-tsv")&&i+1<argc)componentCurveTsvPath=argv[++i];
         else if(!strcmp(argv[i],"--split-control-ceiling"))splitControlCeiling=true;
@@ -708,7 +812,10 @@ int main(int argc,char**argv){
         else if((!strcmp(argv[i],"--entropy-restart-tus")||!strcmp(argv[i],"--build-tus"))&&i+1<argc){ char*t=nullptr; unsigned long long v=strtoull(argv[++i],&t,10); if(!t||*t||!v||v>SIZE_MAX){fprintf(stderr,"bad entropy restart TU count\n");return 2;} entropyRestartTus=size_t(v); }
         else if((!strcmp(argv[i],"--replay-repetitions")||!strcmp(argv[i],"--build-repetitions"))&&i+1<argc){ char*t=nullptr; unsigned long long v=strtoull(argv[++i],&t,10); if(!t||*t||!v||v>SIZE_MAX){fprintf(stderr,"bad replay repetition count\n");return 2;} replayRepetitions=size_t(v); }
         else { fprintf(stderr,"unknown %s\n",argv[i]); return 2; } }
-    if(!manifest){ fprintf(stderr,"usage: %s --manifest F [--z LEVEL] [--literal-z 1..9] [--array-z 1..9] [--blob-z 1..9] [--no-d1] [--d2] [--prior-root] [--structure-ceiling] [--s1-min-match N] [--s1-max-chain N] [--sorted-lines|--byte-array-lines|--mixed-regions [--alpha-lines|--residual-ldm] [--residual-dump PATH] [--mixed-dump-prefix PATH] [--split-control-ceiling] [--compressed-blobs [--mo-factor [--mo-trace]] [--blob-threads N] [--blob-zstd-workers N --blob-zstd-job-mib N --blob-zstd-overlap-log N] [--blob-fallback-every N] [--blob-lazy-fallback] [--blob-canonical-level 1..9] [--blob-dump PATH]] [--key-map|--direct-ordinals|--half-cold-bit 0|1] [--source-package [--source-admit-ratio N]]] [--max-files N] [--replay-repetitions N] [--entropy-restart-tus N] [--curve-tsv PATH] [--component-curve-tsv PATH]\n",argv[0]); return 2; }
+#if !defined(WITH_BSC_GROUPS)
+    (void)literalGroupEvaluateZstd10;
+#endif
+    if(!manifest){ fprintf(stderr,"usage: %s --manifest F [--z LEVEL] [--literal-z 1..9] [--array-z 1..9] [--blob-z 1..9] [--no-d1] [--d2] [--prior-root] [--structure-ceiling] [--s1-min-match N] [--s1-max-chain N] [--sorted-lines|--byte-array-lines|--mixed-regions [--alpha-lines|--residual-ldm] [--residual-dump PATH] [--mixed-dump-prefix PATH] [--literal-group-prefix PREFIX --literal-group-tus N [--literal-group-workers N] [--literal-group-skip-zstd10] [--literal-group-wire PATH]] [--split-control-ceiling] [--compressed-blobs [--mo-factor [--mo-trace]] [--blob-threads N] [--blob-zstd-workers N --blob-zstd-job-mib N --blob-zstd-overlap-log N] [--blob-fallback-every N] [--blob-lazy-fallback] [--blob-canonical-level 1..9] [--blob-dump PATH]] [--key-map|--direct-ordinals|--half-cold-bit 0|1] [--source-package [--source-admit-ratio N]]] [--max-files N] [--replay-repetitions N] [--entropy-restart-tus N] [--curve-tsv PATH] [--component-curve-tsv PATH]\n",argv[0]); return 2; }
     if(useProjectSource&&!useMixedRegions){fprintf(stderr,"--source-package requires --mixed-regions\n");return 2;}
     if(useKeyMap&&!useMixedRegions){fprintf(stderr,"--key-map and --half-cold-bit require --mixed-regions\n");return 2;}
     if(useCompressedBlobs&&(!useMixedRegions||!useByteArrayLines)){fprintf(stderr,"--compressed-blobs requires --mixed-regions --byte-array-lines\n");return 2;}
@@ -720,6 +827,13 @@ int main(int argc,char**argv){
     if(residualDumpPath&&!useMixedRegions){fprintf(stderr,"--residual-dump requires --mixed-regions\n");return 2;}
     if(blobDumpPath&&!useCompressedBlobs){fprintf(stderr,"--blob-dump requires --compressed-blobs\n");return 2;}
     if(mixedDumpPrefix&&!useMixedRegions){fprintf(stderr,"--mixed-dump-prefix requires --mixed-regions\n");return 2;}
+    if((literalGroupPrefix!=nullptr)!=(literalGroupTus!=0)){fprintf(stderr,"literal groups require both --literal-group-prefix and --literal-group-tus\n");return 2;}
+    if(literalGroupWirePath&&!literalGroupPrefix){fprintf(stderr,"--literal-group-wire requires --literal-group-prefix\n");return 2;}
+    if(literalGroupWorkers!=1&&!literalGroupPrefix){fprintf(stderr,"--literal-group-workers requires --literal-group-prefix\n");return 2;}
+    if(literalGroupPrefix&&(!useMixedRegions||useAlphaLines||useResidualLdm)){fprintf(stderr,"literal groups require ordinary --mixed-regions literal coding\n");return 2;}
+#if !defined(WITH_BSC_GROUPS)
+    if(literalGroupPrefix){fprintf(stderr,"literal groups require a WITH_BSC_GROUPS build\n");return 2;}
+#endif
     if(splitControlCeiling&&!useMixedRegions){fprintf(stderr,"--split-control-ceiling requires --mixed-regions\n");return 2;}
     if(structureCeiling&&!useDirectOrdinals){fprintf(stderr,"--structure-ceiling requires --direct-ordinals\n");return 2;}
     if(blobFallbackEvery&&!useCompressedBlobs){fprintf(stderr,"--blob-fallback-every requires --compressed-blobs\n");return 2;}
@@ -815,6 +929,21 @@ int main(int argc,char**argv){
     }
     std::array<ZSTD_CCtx*,6> mixedZC{}; std::array<ZSTD_DCtx*,6> mixedZD{};
     std::array<uint8_t,6> mixedZActive{};size_t mixedPartCount=useProjectSource?6:(useByteArrayLines?4:2);
+    const bool useLiteralGroups=literalGroupPrefix!=nullptr;
+#if defined(WITH_BSC_GROUPS)
+    LiteralGroupPlan literalGroups;
+    if(useLiteralGroups){try{
+        literalGroups=build_literal_group_plan(literalGroupPrefix,TUs,mixedPartCount,
+            literalGroupTus,literalGroupWorkers,literalGroupEvaluateZstd10,
+            literalGroupWirePath);
+      }catch(const std::exception&error){fprintf(stderr,"literal group plan: %s\n",error.what());return 2;}
+      fprintf(stderr,"literal groups: TUs/group=%zu groups=%zu workers=%zu raw=%zu wire=%zu candidates=%s selector=[z3=%llu bsc=%llu z10=%llu] encode=%.3fs decode=%.3fs\n",
+          literalGroupTus,literalGroups.groups.size(),literalGroups.workers,literalGroups.decoded.size(),literalGroups.wire.size(),
+          literalGroups.evaluated_zstd10?"zstd3,bsc,zstd10":"zstd3,bsc",
+          (unsigned long long)literalGroups.selected[0],(unsigned long long)literalGroups.selected[1],
+          (unsigned long long)literalGroups.selected[2],literalGroups.encode_seconds,literalGroups.decode_seconds);
+    }
+#endif
     const std::array<int,6> mixedZLevel{{zlevel,literalZLevel,arrayZLevel,arrayZLevel,zlevel,zlevel}};
     if(useMixedRegions) for(size_t i=0;i<mixedPartCount;++i){
         mixedZC[i]=ZSTD_createCCtx(); mixedZD[i]=ZSTD_createDCtx();
@@ -941,6 +1070,9 @@ int main(int argc,char**argv){
       }
       std::array<double,CW_COUNT>previousComponentWire=componentWireSnapshot();
       auto tpass=Clock::now(); double enc_s=0, dec_s=0,fallback_c_s=0;   // split C-encode vs F-decode wall (2-proc per-stream proxy)
+#if defined(WITH_BSC_GROUPS)
+      size_t literalGroupDecodedCursor=0;
+#endif
       for(size_t t=0; t<TUs; ++t){
         auto _te=Clock::now();
         const bool endOfEntropyStream=t+1==TUs||(entropyRestartTus&&(t+1)%entropyRestartTus==0);
@@ -1402,12 +1534,6 @@ int main(int argc,char**argv){
                fwrite(mixedRaw[i].data(),1,mixedRaw[i].size(),mixedDumps[i])!=mixedRaw[i].size()){
                 fprintf(stderr,"short mixed stream dump write part=%zu\n",i);return 2;
             }
-            if(mixedDumpLengths)for(size_t i=0;i<mixedPartCount;++i){
-                if(mixedRaw[i].size()>UINT32_MAX){fprintf(stderr,"mixed stream dump frame too large\n");return 2;}
-                const uint32_t n=uint32_t(mixedRaw[i].size());
-                const uint8_t le[4]={uint8_t(n),uint8_t(n>>8),uint8_t(n>>16),uint8_t(n>>24)};
-                if(fwrite(le,1,sizeof le,mixedDumpLengths)!=sizeof le){fprintf(stderr,"short mixed stream length write\n");return 2;}
-            }
             if(splitControlCeiling){
                 std::array<const uint8_t*,8>cursor{},end{};
                 for(size_t i=0;i<splitControl.size();++i){cursor[i]=splitControl[i].data();end[i]=cursor[i]+splitControl[i].size();}
@@ -1435,7 +1561,7 @@ int main(int argc,char**argv){
                 if(rebuilt!=mixedRaw[0]){fprintf(stderr,"split control reconstruction differs\n");return 2;}
                 for(size_t i=0;i<splitControl.size();++i)splitControlAll[i].insert(splitControlAll[i].end(),splitControl[i].begin(),splitControl[i].end());
             }
-            for(size_t i=0;i<mixedPartCount;++i) if((!useAlphaLines||i!=1)&&!mixedRaw[i].empty()){
+            for(size_t i=0;i<mixedPartCount;++i) if((!useAlphaLines||i!=1)&&!(useLiteralGroups&&i==1)&&!mixedRaw[i].empty()){
                 mixedEncoded[i]=zstd_stream_encode(mixedZC[i],mixedRaw[i],ZSTD_e_flush);mixedZActive[i]=1;
                 double bytes=mixedEncoded[i].size()+FRAME;mixedPartWire[i]+=bytes;(i==0?w_regiondef:w_linedef)+=bytes;
             }
@@ -1447,9 +1573,22 @@ int main(int argc,char**argv){
                     w_linedef+=bytes;mixedBlobPatchWire+=bytes;}
             }
         }
+#if defined(WITH_BSC_GROUPS)
+        if(useLiteralGroups){
+            if(mixedRaw[1].size()!=literalGroups.per_tu_raw[t]){fprintf(stderr,"literal group plan differs at TU=%zu planned=%u actual=%zu\n",t,literalGroups.per_tu_raw[t],mixedRaw[1].size());return 2;}
+            const LiteralGroupRecord&group=literalGroups.groups[t/literalGroupTus];
+            if(t==group.first_tu&&group.wire_size){w_linedef+=group.wire_size;mixedPartWire[1]+=group.wire_size;}
+        }
+#endif
+        if(useMixedRegions&&mixedDumpLengths)for(size_t i=0;i<mixedPartCount;++i){
+            if(mixedRaw[i].size()>UINT32_MAX){fprintf(stderr,"mixed stream dump frame too large\n");return 2;}
+            const uint32_t n=uint32_t(mixedRaw[i].size());
+            const uint8_t le[4]={uint8_t(n),uint8_t(n>>8),uint8_t(n>>16),uint8_t(n>>24)};
+            if(fwrite(le,1,sizeof le,mixedDumpLengths)!=sizeof le){fprintf(stderr,"short mixed stream length write\n");return 2;}
+        }
         if(useMixedRegions&&endOfEntropyStream){
             const std::vector<uint8_t> empty;
-            for(size_t i=0;i<mixedPartCount;++i) if((!useAlphaLines||i!=1)&&mixedZActive[i]){
+            for(size_t i=0;i<mixedPartCount;++i) if((!useAlphaLines||i!=1)&&!(useLiteralGroups&&i==1)&&mixedZActive[i]){
                 std::vector<uint8_t> tail=zstd_stream_encode(mixedZC[i],empty,ZSTD_e_end);
                 double&wire=i==0?w_regiondef:w_linedef;if(mixedEncoded[i].empty()&&!tail.empty()){wire+=FRAME;mixedPartWire[i]+=FRAME;}
                 wire+=tail.size();mixedPartWire[i]+=tail.size();mixedEncoded[i].insert(mixedEncoded[i].end(),tail.begin(),tail.end());
@@ -1497,7 +1636,7 @@ int main(int argc,char**argv){
             }
             if(recovered[1]!=mixedRaw[1]){fprintf(stderr,"alpha residual mismatch TU=%zu\n",t);return 2;}
           }else if(useAlphaLines&&!mixedRaw[1].empty()){fprintf(stderr,"missing alpha selector\n");return 2;}
-          for(size_t i=0;i<mixedPartCount;++i) if((!useAlphaLines||i!=1)&&!mixedEncoded[i].empty()){
+          for(size_t i=0;i<mixedPartCount;++i) if((!useAlphaLines||i!=1)&&!(useLiteralGroups&&i==1)&&!mixedEncoded[i].empty()){
             size_t remaining=1;recovered[i]=zstd_stream_decode(mixedZD[i],mixedEncoded[i],remaining);
             if(recovered[i]!=mixedRaw[i]||(endOfEntropyStream&&remaining!=0)){fprintf(stderr,"mixed Region stream mismatch TU=%zu part=%zu\n",t,i);return 2;}
           }
@@ -1602,8 +1741,18 @@ int main(int argc,char**argv){
           }
           if(blobIndex!=Fblobs.size()||residual!=residualEnd||mixedArrayValueBytes.size()!=totalArrayValues){fprintf(stderr,"mixed array value assembly differs\n");return 2;}
           uint8_t emptyArrayValue=0;const uint8_t*vp=mixedArrayValueBytes.empty()?&emptyArrayValue:mixedArrayValueBytes.data(),*ve=vp+mixedArrayValueBytes.size();
+          const uint8_t*groupedLiteralBegin=nullptr,*groupedLiteralEnd=nullptr;
+#if defined(WITH_BSC_GROUPS)
+          uint8_t groupedLiteralEmpty=0;
+          if(useLiteralGroups){
+            const LiteralGroupRecord&group=literalGroups.groups[t/literalGroupTus];
+            const uint8_t*base=literalGroups.decoded.empty()?&groupedLiteralEmpty:literalGroups.decoded.data();
+            if(literalGroupDecodedCursor<group.decoded_offset||literalGroupDecodedCursor>group.decoded_offset+group.decoded_size){fprintf(stderr,"literal group cursor outside group TU=%zu\n",t);return 2;}
+            groupedLiteralBegin=base+literalGroupDecodedCursor;groupedLiteralEnd=base+group.decoded_offset+group.decoded_size;
+          }
+#endif
           if(!recovered[0].empty()){
-            const uint8_t*cp=recovered[0].data(),*ce=cp+recovered[0].size();const uint8_t*lp=recovered[1].data(),*le=lp+recovered[1].size();
+            const uint8_t*cp=recovered[0].data(),*ce=cp+recovered[0].size();const uint8_t*lp=useLiteralGroups?groupedLiteralBegin:recovered[1].data(),*le=useLiteralGroups?groupedLiteralEnd:lp+recovered[1].size();
             uint64_t regionCount=get_varint(cp);if(regionCount!=nr||regionCount!=missReg.size()){fprintf(stderr,"mixed Region count differs\n");return 2;}
             for(uint64_t k=0;k<regionCount;++k){
               uint32_t regionId=missReg[k];if(regionId>=FmixedRegions.size()||FmixedRegions[regionId].known){fprintf(stderr,"mixed Region identity differs\n");return 2;}
@@ -1639,8 +1788,16 @@ int main(int argc,char**argv){
               if(rawLength!=dict.region_raw_len(regionId)||memcmp(FmixedRegionData.data()+begin,dict.region_data(regionId),rawLength)){fprintf(stderr,"mixed Region differs\n");return 2;}
               FmixedRegions[regionId]={begin,uint32_t(rawLength),true};
             }
-            if(cp!=ce||lp!=le||vp!=ve||arraysUsed!=arrayCount||FmixedPublic.size()!=nextMixedPublic){fprintf(stderr,"mixed Region streams have trailing bytes or state differs\n");return 2;}
-          } else if(nr||!recovered[1].empty()){fprintf(stderr,"partial mixed Region streams\n");return 2;}
+            if(useLiteralGroups){
+              const size_t consumed=size_t(lp-groupedLiteralBegin);
+              if(consumed!=mixedRaw[1].size()||(consumed&&memcmp(groupedLiteralBegin,mixedRaw[1].data(),consumed))){fprintf(stderr,"grouped literal consumption differs TU=%zu planned=%zu consumed=%zu\n",t,mixedRaw[1].size(),consumed);return 2;}
+#if defined(WITH_BSC_GROUPS)
+              literalGroupDecodedCursor+=consumed;const LiteralGroupRecord&group=literalGroups.groups[t/literalGroupTus];
+              if(t+1==group.last_tu&&literalGroupDecodedCursor!=group.decoded_offset+group.decoded_size){fprintf(stderr,"literal group has trailing decoded bytes after TU=%zu\n",t);return 2;}
+#endif
+            }
+            if(cp!=ce||(!useLiteralGroups&&lp!=le)||vp!=ve||arraysUsed!=arrayCount||FmixedPublic.size()!=nextMixedPublic){fprintf(stderr,"mixed Region streams have trailing bytes or state differs\n");return 2;}
+          } else if(nr||!mixedRaw[1].empty()||(!useLiteralGroups&&!recovered[1].empty())){fprintf(stderr,"partial mixed Region streams\n");return 2;}
         } else if(useSortedLines){
           std::array<std::vector<uint8_t>,5> recovered;
           for(size_t i=0;i<linePartCount;++i) if(!lineEncoded[i].empty()){
@@ -1749,6 +1906,12 @@ int main(int argc,char**argv){
         while(ckidx<ck_f.size() && double(cum_raw)>=ck_f[ckidx]*corpus.raw){ ck.push_back({ck_f[ckidx], double(cum_raw)/cum_wire}); ++ckidx; }
       }
       enc_s+=fallback_c_s;dec_s-=fallback_c_s;if(dec_s<0)dec_s=0;
+#if defined(WITH_BSC_GROUPS)
+      if(useLiteralGroups){
+        if(literalGroupDecodedCursor!=literalGroups.decoded.size()){fprintf(stderr,"literal group final decoded extent differs\n");return 2;}
+        enc_s+=literalGroups.encode_seconds;dec_s+=literalGroups.decode_seconds;
+      }
+#endif
       fprintf(stderr,"pass %d (%s) single-core encode+decode+verify: %.2fs = %.3f GB/s raw\n", pass, (pass+1==npass&&npass>1)?"WARM":"cold", secs(tpass), corpus.raw/1e9/secs(tpass));
       fprintf(stderr,"  split (2-proc per-stream proxy): C-encode %.3f GB/s | F-decode %.3f GB/s => pipelined min = %.3f GB/s\n",
               corpus.raw/1e9/enc_s, corpus.raw/1e9/dec_s, corpus.raw/1e9/std::max(enc_s,dec_s));
@@ -1794,7 +1957,7 @@ int main(int argc,char**argv){
     double MiB=1048576.0;
     const char* structure_name=usePriorRoot?"V1+P22(ROOT_SLICE)":(useS1?"V1+S1(LZ blocks)":"V1");
     const char* line_name=useMixedRegions?(useCompressedBlobs?(useMoFactor?"+P27(mixed-regions+BYTE_ARRAY+BLOB+MO)":"+P26(mixed-regions+BYTE_ARRAY+BLOB)"):(useByteArrayLines?"+P24(mixed-regions+BYTE_ARRAY)":"+P24(mixed-regions)")):(useByteArrayLines?"+P21(BYTE_ARRAY)":(useSortedLines?"+P9(sorted-lines)":""));
-    printf("\n==== CODEC-50 (%s%s%s%s%s%s%s%s, z%d) — %s ====\n", structure_name, useD1?"+D1":"", line_name, useAlphaLines?"+P4(ALPHA_LINES)":"", useResidualLdm?"+RESIDUAL_LDM":"", useProjectSource?"+SOURCE_PACKAGE":"", (useD2mine?"+D2(inline)":(useD2?"+D2(helper)":"")), useDirectOrdinals?"+DIRECT_ORDINALS":"", zlevel, manifest);
+    printf("\n==== CODEC-50 (%s%s%s%s%s%s%s%s%s, z%d) — %s ====\n", structure_name, useD1?"+D1":"", line_name, useAlphaLines?"+P4(ALPHA_LINES)":"", useResidualLdm?"+RESIDUAL_LDM":"", useLiteralGroups?"+BSC_GROUPS":"", useProjectSource?"+SOURCE_PACKAGE":"", (useD2mine?"+D2(inline)":(useD2?"+D2(helper)":"")), useDirectOrdinals?"+DIRECT_ORDINALS":"", zlevel, manifest);
     printf("byte-exact=%s  TUs=%zu raw=%.1f MiB regions=%u distinct_lines=%u paths=%zu blocks=%zu (marker_lines=%llu literal_lines=%llu)\n",
         byteexact?"OK":"FAIL",TUs,corpus.raw/MiB,NREG,dict.distinct(),paths.size(),boff2.size()-1,(unsigned long long)n_marker,(unsigned long long)n_literal);
     printf("wire by category (post-z%d, bytes): root=%.0f line_def=%.0f region_def=%.0f block_def=%.0f path_def=%.0f missing=%.0f framing=%.0f  TOTAL=%.0f (%.2f MiB)\n",
@@ -1841,6 +2004,14 @@ int main(int argc,char**argv){
         (unsigned long long)alphaSelectedTus,(unsigned long long)alphaOrdinaryTus,(unsigned long long)alphaLiteralKeywordTus,(unsigned long long)alphaParameterizedKeywordTus,
         (unsigned long long)alphaStats.rules,(unsigned long long)alphaStats.instances,(unsigned long long)alphaStats.template_input_bytes,(unsigned long long)alphaStats.literal_fallbacks,(unsigned long long)alphaStats.unique_slots,(unsigned long long)alphaStats.slot_occurrences,(unsigned long long)alphaStats.lexicon_entries,(unsigned long long)alphaStats.lexicon_references);
     if(useResidualLdm)printf("residual LDM: window_log=27 literal_wire=%.0f raw_literal=%llu\n",mixedPartWire[1],(unsigned long long)mixedLiteralRaw);
+#if defined(WITH_BSC_GROUPS)
+    if(useLiteralGroups)printf("literal groups: tus_per_group=%zu groups=%zu workers=%zu raw=%zu wire=%zu packed_header_bytes=%zu candidates=%s selected=[zstd3=%llu bsc=%llu zstd10=%llu] encode_seconds=%.6f decode_seconds=%.6f retained_wire=%s\n",
+        literalGroupTus,literalGroups.groups.size(),literalGroups.workers,literalGroups.decoded.size(),literalGroups.wire.size(),residual_group::kHeaderBytes,
+        literalGroups.evaluated_zstd10?"zstd3,bsc,zstd10":"zstd3,bsc",
+        (unsigned long long)literalGroups.selected[0],(unsigned long long)literalGroups.selected[1],
+        (unsigned long long)literalGroups.selected[2],literalGroups.encode_seconds,literalGroups.decode_seconds,
+        literalGroupWirePath?literalGroupWirePath:"(memory only)");
+#endif
     if(splitControlCeiling)printf("split control whole-run ceiling: wire=%.0f baseline=%.0f saving=%.0f raw=[%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu] wire_parts=[%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu]\n",
         splitControlCeilingWire,mixedPartWire[0],mixedPartWire[0]-splitControlCeilingWire,
         (unsigned long long)splitControlRawBytes[0],(unsigned long long)splitControlRawBytes[1],(unsigned long long)splitControlRawBytes[2],(unsigned long long)splitControlRawBytes[3],(unsigned long long)splitControlRawBytes[4],(unsigned long long)splitControlRawBytes[5],(unsigned long long)splitControlRawBytes[6],(unsigned long long)splitControlRawBytes[7],

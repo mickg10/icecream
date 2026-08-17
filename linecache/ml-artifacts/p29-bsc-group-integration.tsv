@@ -1,0 +1,3 @@
+corpus	tus	raw_bytes	whole_ii_z19_bytes	cold_gate_bytes	complete_wire_bytes	cold_delta_bytes	tu100_reference_bytes	tu100_wire_bytes	tu100_delta_bytes	tu200_reference_bytes	tu200_wire_bytes	tu200_delta_bytes	minimum_c_encode_gbps	minimum_f_decode_gbps	wire_sha256	exact
+duckdb	689	1985715205	7167012	7883713	7873485	-10228	2129543	1519485	-610058	2847389	2124228	-723161	1.708	2.774	747403411c10121fd00f16e4490c8776ae850598ae869c91e9b82d65dace2179	True
+godot	2207	5932762185	58289521	64118473	35094169	-29024304	1290414	1064247	-226167	2211547	2057414	-154133	1.013	1.144	d7a2c4a406eac58db20b9e3512dd6dfc56b2c8a58377db181c9b29a5c54cb712	True

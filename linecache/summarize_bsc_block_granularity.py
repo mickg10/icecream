@@ -200,7 +200,8 @@ def main() -> int:
         "schema": "p29-bsc-tu-granularity-v1",
         "wire_format": {
             "group_outer_frame_bytes": 4,
-            "group_selector_bytes": 1,
+            "group_selector_bytes": 0,
+            "group_header": "packed u32: codec kind in high 3 bits, payload length in low 29 bits",
             "bsc_block_header_bytes": 28,
             "bsc_max_raw_block_bytes": 64 * 1024 * 1024,
             "bsc": "libbsc 3.3.12 BWT + QLFC adaptive, default LZP, fast mode",
@@ -334,7 +335,7 @@ def main() -> int:
 
 ## Result
 
-Most of the build-wide BWT gain does **not** require the complete build. With an exact one-byte
+Most of the build-wide BWT gain does **not** require the complete build. With an exact packed-header
 selector over product-shaped BSC, zstd-3, and zstd-10 frames:
 
 - DuckDB falls from `{duckdb_rows['1']['selected_wire_bytes']:,}` residual bytes at one TU/frame to
@@ -345,28 +346,29 @@ selector over product-shaped BSC, zstd-3, and zstd-10 frames:
   `{godot_rows['full']['selected_wire_bytes']:,}` at the same boundaries.
 - A fixed 100-TU DuckDB grouping projects to `{duckdb_rows['100']['projected_complete_bytes']:,}`
   complete bytes, only `{duckdb_rows['100']['delta_to_cold_gate_bytes']:,}` bytes above its gate.
-  The first passing fixed size is `{duckdb['smallest_fixed_group_passing_cold_gate']}` TUs, at
+  Within this coarse sweep, the first passing fixed size is `{duckdb['smallest_fixed_group_passing_cold_gate']}` TUs, at
   `{duckdb_rows[str(duckdb['smallest_fixed_group_passing_cold_gate'])]['projected_complete_bytes']:,}`
   complete bytes.
 - DuckDB's 500-TU partition is `{duckdb_rows['full']['selected_wire_bytes'] - duckdb_rows['500']['selected_wire_bytes']:,}`
   bytes smaller than one 689-TU BSC block. BWT statistics benefit slightly from a boundary here;
   "one monolithic block" is therefore not automatically the compression optimum.
 
-The engineering implication is a bounded precompute window, initially 128 TUs, with every group
-charged when its first TU becomes eligible. This retains progressive reconstruction and captures
-nearly all of the measured BSC compression. A byte-targeted or cost-selected boundary policy is the
-next experiment because TU byte sizes vary substantially.
+The engineering implication is a bounded precompute window with every group charged when its first
+TU becomes eligible. A focused 104--124 sweep and complete P29 replay subsequently selected one
+fixed **112-TU** boundary: it clears DuckDB cold while preserving both Godot prefix gates. See
+`P29-BSC-GROUP-INTEGRATION.md` for the actual decoder-verified totals and speed repetitions.
 
 ## Exact wire and accounting
 
-Every nonempty group carries one four-byte outer frame, one selector byte, and the selected payload.
+Every nonempty group carries one packed four-byte header and the selected payload. The upper three
+header bits select the codec and the lower 29 bits carry the payload length.
 BSC payloads use one or more self-describing 28-byte libbsc blocks capped at 64 MiB raw. The decoder
 reads only the selected payload, independently reconstructs the exact raw residual, and byte-compares
 it before the row is accepted. Empty groups carry no residual frame.
 
-The complete projections replace only the exact P29 literal-lane wire and retain every other P29
-byte. They are not yet an integrated P29 lane multiplexer. Full group-by-group watermarks are retained
-in the detail TSVs and validated against each summary row.
+The complete projections in this table replace only the exact P29 literal-lane wire and retain every
+other P29 byte. Full group-by-group watermarks are retained in the detail TSVs and validated against
+each summary row. The later 112-TU row is integrated into P29 and reported separately.
 
 The sweep ran on `{args.host}` with `OMP_NUM_THREADS=1`, libbsc 3.3.12 commit
 `{args.libbsc_commit}`. Timing columns describe that host; the size and exact-replay results are the
@@ -380,8 +382,8 @@ primary result.
 
 This experiment answers the granularity question for BSC only. The previously measured ZPAQ m5
 build-wide lane projection remains much smaller, while being a different compression point. The
-next complete-codec proof is to make the 128-TU residual groups first-class P29 frames, replay them
-through the independent decoder, and record the compressed-input watermark at every TU boundary.
+complete follow-up makes 112-TU residual groups first-class P29 frames, replays them through the
+independent decoder, and records the compressed-input watermark at every TU boundary.
 """
 
     args.json.write_text(json.dumps(output, indent=2) + "\n")

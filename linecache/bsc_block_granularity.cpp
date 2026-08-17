@@ -34,7 +34,7 @@ using Bytes = std::vector<unsigned char>;
 using Clock = std::chrono::steady_clock;
 
 constexpr std::size_t kFrameBytes = 4;
-constexpr std::size_t kSelectorBytes = 1;
+constexpr std::size_t kSelectorBytes = 0;  // codec kind occupies the high 3 frame-header bits
 constexpr std::size_t kBscBlockBytes = 64u * 1024u * 1024u;
 constexpr int kBscFeatures =
     LIBBSC_FEATURE_FASTMODE | LIBBSC_FEATURE_MULTITHREADING;
