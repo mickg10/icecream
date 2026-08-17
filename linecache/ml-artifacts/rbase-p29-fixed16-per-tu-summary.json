@@ -1,0 +1,179 @@
+{
+  "artifact": "RBASE-P29 fixed-16 first-repetition per-TU export",
+  "codec": {
+    "blob": [
+      "--compressed-blobs",
+      "--blob-threads",
+      "8",
+      "--blob-lazy-fallback",
+      "--mo-factor",
+      "--blob-z",
+      "9",
+      "--blob-zstd-workers",
+      "4",
+      "--blob-zstd-job-mib",
+      "5",
+      "--blob-zstd-overlap-log",
+      "3"
+    ],
+    "common": [
+      "--z",
+      "3",
+      "--mixed-regions",
+      "--byte-array-lines"
+    ],
+    "identity": [
+      "--direct-ordinals"
+    ],
+    "s1": [
+      "--s1-max-chain",
+      "1024"
+    ],
+    "schema": "p29-cold"
+  },
+  "corpora": [
+    {
+      "corpus": "llvm",
+      "raw_bytes": 3620271340,
+      "source_curve": "/tanksmall/scratch/ictmp/cold-four-build-matrix-p25-p29-source-visible/p29-cold/llvm.curve.tsv",
+      "source_curve_sha256": "a88dc7d7a3b6bcdf1d5624341b8cae340fce66a286a8695d132d8f7efb6be051",
+      "tus": 1238,
+      "wire_bytes": 9328055
+    },
+    {
+      "corpus": "rocksdb",
+      "raw_bytes": 3114320596,
+      "source_curve": "/tanksmall/scratch/ictmp/cold-four-build-matrix-p25-p29-source-visible/p29-cold/rocksdb.curve.tsv",
+      "source_curve_sha256": "f79ff256e6e686aed45450d4f6639814450d94b2f576afc067240bd3088c404f",
+      "tus": 622,
+      "wire_bytes": 9823481
+    },
+    {
+      "corpus": "duckdb",
+      "raw_bytes": 1985715205,
+      "source_curve": "/tanksmall/scratch/ictmp/cold-four-build-matrix-p25-p29-source-visible/p29-cold/duckdb.curve.tsv",
+      "source_curve_sha256": "089550feea727c897a018fb1986fb0221ec6f4b008ce235b8dcddd6a0927a005",
+      "tus": 689,
+      "wire_bytes": 9589726
+    },
+    {
+      "corpus": "abseil",
+      "raw_bytes": 2581008467,
+      "source_curve": "/tanksmall/scratch/ictmp/cold-four-build-matrix-p25-p29-source-visible/p29-cold/abseil.curve.tsv",
+      "source_curve_sha256": "bf81c3bb02fa5e89c3c4edf624dff7866bcfff3a02c0e4d9d24731b4b375a7c3",
+      "tus": 700,
+      "wire_bytes": 5863183
+    },
+    {
+      "corpus": "opencv",
+      "raw_bytes": 4630994774,
+      "source_curve": "/tanksmall/scratch/ictmp/cold-four-build-matrix-p25-p29-source-visible/p29-cold/opencv.curve.tsv",
+      "source_curve_sha256": "b84d07fbade443c7eea44108101d05989f4aa4b38f6e7dabab0780417e305c42",
+      "tus": 1506,
+      "wire_bytes": 8563234
+    },
+    {
+      "corpus": "godot",
+      "raw_bytes": 5932762185,
+      "source_curve": "/tanksmall/scratch/ictmp/cold-four-build-matrix-p25-p29-source-visible/p29-cold/godot.curve.tsv",
+      "source_curve_sha256": "2235759de36a9dc18a9125c765ed87cfdf096fc906f1c920baaa890d992a0191",
+      "tus": 2207,
+      "wire_bytes": 39589524
+    },
+    {
+      "corpus": "fmt",
+      "raw_bytes": 136350082,
+      "source_curve": "/tanksmall/scratch/ictmp/cold-four-build-matrix-p25-p29-source-visible/p29-cold/fmt.curve.tsv",
+      "source_curve_sha256": "6b47540d0a6c48db80d3cc46659c6f0fae63c05040f4cfc72f82322fbef172a3",
+      "tus": 50,
+      "wire_bytes": 1046398
+    },
+    {
+      "corpus": "spdlog",
+      "raw_bytes": 98384472,
+      "source_curve": "/tanksmall/scratch/ictmp/cold-four-build-matrix-p25-p29-source-visible/p29-cold/spdlog.curve.tsv",
+      "source_curve_sha256": "96e9d7d58942ae8f58f799120127f52e936773d6ea987537f02f7867c8cd2b1c",
+      "tus": 34,
+      "wire_bytes": 539513
+    },
+    {
+      "corpus": "catch2",
+      "raw_bytes": 947252235,
+      "source_curve": "/tanksmall/scratch/ictmp/cold-four-build-matrix-p25-p29-source-visible/p29-cold/catch2.curve.tsv",
+      "source_curve_sha256": "f844bfdacf9c2376a3d262b71a2e7bf5b317f55b158bd66e216d1a7c104f1097",
+      "tus": 857,
+      "wire_bytes": 1006039
+    },
+    {
+      "corpus": "nlohmann-json",
+      "raw_bytes": 293917707,
+      "source_curve": "/tanksmall/scratch/ictmp/cold-four-build-matrix-p25-p29-source-visible/p29-cold/nlohmann-json.curve.tsv",
+      "source_curve_sha256": "fb61557323dd3396e00f251fea43fc7665f521182e1e48899816a57d06626bb4",
+      "tus": 99,
+      "wire_bytes": 1168818
+    },
+    {
+      "corpus": "range-v3",
+      "raw_bytes": 632049016,
+      "source_curve": "/tanksmall/scratch/ictmp/cold-four-build-matrix-p25-p29-source-visible/p29-cold/range-v3.curve.tsv",
+      "source_curve_sha256": "b40e74232d95279e4e2a0f5abe613ea86ec429a21b2013d201de8c476b558d3b",
+      "tus": 259,
+      "wire_bytes": 874082
+    },
+    {
+      "corpus": "eigen",
+      "raw_bytes": 3532268956,
+      "source_curve": "/tanksmall/scratch/ictmp/cold-four-build-matrix-p25-p29-source-visible/p29-cold/eigen.curve.tsv",
+      "source_curve_sha256": "151d50e5ac6891918f5bbf0fd011d9da14cf93d3cba17ae4682c7bc9edbd2e5d",
+      "tus": 650,
+      "wire_bytes": 1377958
+    },
+    {
+      "corpus": "re2",
+      "raw_bytes": 110231455,
+      "source_curve": "/tanksmall/scratch/ictmp/cold-four-build-matrix-p25-p29-source-visible/p29-cold/re2.curve.tsv",
+      "source_curve_sha256": "334ed857d3813dda8f53da376c2a9c32f432e48259e2dd331d46f0d91e7bdf49",
+      "tus": 72,
+      "wire_bytes": 488243
+    },
+    {
+      "corpus": "leveldb",
+      "raw_bytes": 143868249,
+      "source_curve": "/tanksmall/scratch/ictmp/cold-four-build-matrix-p25-p29-source-visible/p29-cold/leveldb.curve.tsv",
+      "source_curve_sha256": "ff52407b171f4598c0ac8b07d56ef5d8aa2b1c3ecc6b1261267bf0b71b4f6f45",
+      "tus": 72,
+      "wire_bytes": 685350
+    },
+    {
+      "corpus": "simdjson",
+      "raw_bytes": 468377342,
+      "source_curve": "/tanksmall/scratch/ictmp/cold-four-build-matrix-p25-p29-source-visible/p29-cold/simdjson.curve.tsv",
+      "source_curve_sha256": "ab8386bd7fd120a34bfaac442041d81681708cdedfae89e3b01d9ef76934c329",
+      "tus": 153,
+      "wire_bytes": 1408595
+    },
+    {
+      "corpus": "cereal",
+      "raw_bytes": 326899429,
+      "source_curve": "/tanksmall/scratch/ictmp/cold-four-build-matrix-p25-p29-source-visible/p29-cold/cereal.curve.tsv",
+      "source_curve_sha256": "8dcbba0bc404c5f7106025a08aa3859383c22218cac96afe8f9205839d53a448",
+      "tus": 84,
+      "wire_bytes": 512588
+    }
+  ],
+  "coverage": {
+    "projects": 16,
+    "raw_bytes": 28554671510,
+    "tus": 9292,
+    "wire_bytes": 91864787
+  },
+  "state_contract": {
+    "installed_starting_model": "none",
+    "mixed_material_entropy": "stateful stream with a TU flush; this first repetition has no product build signal and is not an independent-frame M4 result",
+    "object_state": "retained after each exact TU",
+    "receiver_dynamic_state_at_tu_0": "empty",
+    "tu_order": "native retained manifest order"
+  },
+  "tsv": "linecache/ml-artifacts/rbase-p29-fixed16-per-tu.tsv",
+  "tsv_sha256": "f4ba83a236d80c7780dc1888561292a3538a07b71789b5a15fa3e46b82b62248"
+}

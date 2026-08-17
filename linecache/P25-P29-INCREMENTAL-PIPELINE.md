@@ -358,6 +358,15 @@ This is a harness memory correction, not a new codec result. It preserves every
 per-TU byte decision and makes the native-25 replay practical without teaching
 the protocol about builds.
 
+The first-repetition RBASE-P29 rows are published as
+[`ml-artifacts/rbase-p29-fixed16-per-tu.tsv`](ml-artifacts/rbase-p29-fixed16-per-tu.tsv),
+with coverage, state semantics, flags, source-curve hashes, and endpoints in
+[`ml-artifacts/rbase-p29-fixed16-per-tu-summary.json`](ml-artifacts/rbase-p29-fixed16-per-tu-summary.json).
+The TSV contains all 9,292 exact fixed-16 TUs and closes at 28,554,671,510 raw
+bytes and 91,864,787 wire bytes. It is suitable as the retained P29 comparison
+for `material_lab`, with the stated caveat that its mixed-material entropy
+streams are not yet M4 independent transaction frames.
+
 ## What P25 is and is not
 
 P25 is the **base incremental codec of the P25--P29 series**. It is not a raw
