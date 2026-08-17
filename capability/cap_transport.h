@@ -21,10 +21,13 @@
 // M2 (2026-08-17) adds Frame::Rejoin=6 (F->C worker restart/late-join signal); type 7
 // stays reserved. Hello remains strictly C->F (128-bit generation latch).
 //
-// The real header is therefore exactly 4 bytes, matching codec50's charged FRAME=4:
-// existing codec category frames replace their simulated 4-byte length at no byte
-// delta. New relationship/job frames are real bytes reported separately: Hello = 20 B
-// (4 header + 16-byte generation), empty Done/Ack = 4 B each.
+// The real header is therefore exactly 4 bytes, matching codec50's charged FRAME=4 — but
+// that zero-delta is ONLY the length prefix. It does NOT make the virtual category ledger
+// equal the socket total: some codec payloads (ROOT, NEED, Block material, path defs) are
+// sent RAW on the socket while the virtual ledger charges their z3-compressed size, and the
+// relationship/job frames are extra real bytes the ledger omits (Hello = 20 B [4 header +
+// 16-byte generation], empty Done/Ack = 4 B each). The category ledger is the codec
+// accounting model + byte-exact gate; the socket total is the literal transfer, reported apart.
 // -----------------------------------------------------------------------------
 namespace cap {
 

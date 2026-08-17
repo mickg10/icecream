@@ -52,9 +52,15 @@ codec50-m1 7-category ledger **to the byte on two corpora**:
 | DuckDB (corpus3, 689 TUs) | **9,590,734** | OK — all 689 TUs |
 | RocksDB (corpus2, 622 TUs) | **9,825,414** | OK — all 622 TUs |
 
-The virtual `FRAME=4` ledger now equals the real 4-byte packed header (zero delta). The **real
-socket total** is reported separately (DuckDB = 10,311,523 B, incl. Hello 20 B + per-job Done/Ack
-4 B + uncompressed root/need/paths payloads). Independently rebuilt + re-run: bit-identical.
+**Framing accounting (corrected per local-oracle's M1 review).** The codec's virtual `FRAME=4`
+length charge equals the real 4-byte packed header exactly — but that zero-delta is *only* the
+length prefix; the virtual **category ledger is NOT the socket total**. The real socket total
+(DuckDB = 10,311,523 B) exceeds the 9,590,734 B category ledger for two distinct reasons: (a)
+relationship/job frames the category ledger does not count (Hello 20 B, per-job Done/Ack 4 B), and
+(b) ROOT, NEED, Block-material, and path-def payloads are currently sent **raw** on the socket
+whereas the virtual ledger charges their z3-compressed size. The category ledger (9,590,734) is the
+codec accounting model and the byte-exact regression gate; the socket total is the literal transfer,
+reported separately. Independently rebuilt + re-run: bit-identical.
 Files: `cap_codec.{h,cpp}`, `cap_protocol.h`, `cap_main.cpp`.
 Build: `g++ -O3 -std=c++17 -DICE_LINE_CAP_LOG2=23 cap_main.cpp cap_codec.cpp -o cap_main -lzstd`.
 
