@@ -20,6 +20,7 @@
 #include <atomic>
 #include <chrono>
 #include <climits>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -620,7 +621,7 @@ struct RelLZ {
 };
 
 int main(int argc,char**argv){
-    const char* manifest=nullptr;const char*residualDumpPath=nullptr;const char*mixedDumpPrefix=nullptr; size_t max_files=SIZE_MAX; int zlevel=3,literalZLevel=-1,arrayZLevel=-1,blobZLevel=-1,halfColdBit=-1,blobCanonicalLevel=9; uint32_t sourceAdmitRatio=6,blobThreads=4,blobZstdWorkers=0,blobZstdJobMiB=0,blobZstdOverlapLog=0,blobFallbackEvery=0,s1MinMatch=3,s1MaxChain=1024; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, usePriorRoot=false, useSortedLines=false, useByteArrayLines=false, useMixedRegions=false, useProjectSource=false,useKeyMap=false,useDirectOrdinals=false,useCompressedBlobs=false,useBlobEagerPatches=true,useMoFactor=false,traceMo=false,useAlphaLines=false,useResidualLdm=false,splitControlCeiling=false,structureCeiling=false;
+    const char* manifest=nullptr;const char*residualDumpPath=nullptr;const char*mixedDumpPrefix=nullptr;const char*curveTsvPath=nullptr; size_t max_files=SIZE_MAX; int zlevel=3,literalZLevel=-1,arrayZLevel=-1,blobZLevel=-1,halfColdBit=-1,blobCanonicalLevel=9; uint32_t sourceAdmitRatio=6,blobThreads=4,blobZstdWorkers=0,blobZstdJobMiB=0,blobZstdOverlapLog=0,blobFallbackEvery=0,s1MinMatch=3,s1MaxChain=1024; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, usePriorRoot=false, useSortedLines=false, useByteArrayLines=false, useMixedRegions=false, useProjectSource=false,useKeyMap=false,useDirectOrdinals=false,useCompressedBlobs=false,useBlobEagerPatches=true,useMoFactor=false,traceMo=false,useAlphaLines=false,useResidualLdm=false,splitControlCeiling=false,structureCeiling=false;
     const char*blobDumpPath=nullptr;
     for(int i=1;i<argc;++i){ if(!strcmp(argv[i],"--manifest")&&i+1<argc)manifest=argv[++i];
         else if(!strcmp(argv[i],"--z")&&i+1<argc)zlevel=atoi(argv[++i]);
@@ -643,6 +644,7 @@ int main(int argc,char**argv){
         else if(!strcmp(argv[i],"--residual-dump")&&i+1<argc)residualDumpPath=argv[++i];
         else if(!strcmp(argv[i],"--blob-dump")&&i+1<argc)blobDumpPath=argv[++i];
         else if(!strcmp(argv[i],"--mixed-dump-prefix")&&i+1<argc)mixedDumpPrefix=argv[++i];
+        else if(!strcmp(argv[i],"--curve-tsv")&&i+1<argc)curveTsvPath=argv[++i];
         else if(!strcmp(argv[i],"--split-control-ceiling"))splitControlCeiling=true;
         else if(!strcmp(argv[i],"--structure-ceiling"))structureCeiling=true;
         else if(!strcmp(argv[i],"--s1-min-match")&&i+1<argc){char*end=nullptr;unsigned long value=strtoul(argv[++i],&end,10);if(!end||*end||value<2||value>16){fprintf(stderr,"bad S1 minimum match\n");return 2;}s1MinMatch=uint32_t(value);}
@@ -663,7 +665,7 @@ int main(int argc,char**argv){
         else if(!strcmp(argv[i],"--warm"))warm=true;         // Basis C: 2nd pass with dict retained -> warm steady-state wire
         else if(!strcmp(argv[i],"--max-files")&&i+1<argc){ char*t=nullptr; unsigned long long v=strtoull(argv[++i],&t,10); if(!t||*t||!v){fprintf(stderr,"bad max-files\n");return 2;} max_files=size_t(v); }
         else { fprintf(stderr,"unknown %s\n",argv[i]); return 2; } }
-    if(!manifest){ fprintf(stderr,"usage: %s --manifest F [--z LEVEL] [--literal-z 1..9] [--array-z 1..9] [--blob-z 1..9] [--no-d1] [--d2] [--prior-root] [--structure-ceiling] [--s1-min-match N] [--s1-max-chain N] [--sorted-lines|--byte-array-lines|--mixed-regions [--alpha-lines|--residual-ldm] [--residual-dump PATH] [--mixed-dump-prefix PATH] [--split-control-ceiling] [--compressed-blobs [--mo-factor [--mo-trace]] [--blob-threads N] [--blob-zstd-workers N --blob-zstd-job-mib N --blob-zstd-overlap-log N] [--blob-fallback-every N] [--blob-lazy-fallback] [--blob-canonical-level 1..9] [--blob-dump PATH]] [--key-map|--direct-ordinals|--half-cold-bit 0|1] [--source-package [--source-admit-ratio N]]] [--max-files N]\n",argv[0]); return 2; }
+    if(!manifest){ fprintf(stderr,"usage: %s --manifest F [--z LEVEL] [--literal-z 1..9] [--array-z 1..9] [--blob-z 1..9] [--no-d1] [--d2] [--prior-root] [--structure-ceiling] [--s1-min-match N] [--s1-max-chain N] [--sorted-lines|--byte-array-lines|--mixed-regions [--alpha-lines|--residual-ldm] [--residual-dump PATH] [--mixed-dump-prefix PATH] [--split-control-ceiling] [--compressed-blobs [--mo-factor [--mo-trace]] [--blob-threads N] [--blob-zstd-workers N --blob-zstd-job-mib N --blob-zstd-overlap-log N] [--blob-fallback-every N] [--blob-lazy-fallback] [--blob-canonical-level 1..9] [--blob-dump PATH]] [--key-map|--direct-ordinals|--half-cold-bit 0|1] [--source-package [--source-admit-ratio N]]] [--max-files N] [--curve-tsv PATH]\n",argv[0]); return 2; }
     if(useProjectSource&&!useMixedRegions){fprintf(stderr,"--source-package requires --mixed-regions\n");return 2;}
     if(useKeyMap&&!useMixedRegions){fprintf(stderr,"--key-map and --half-cold-bit require --mixed-regions\n");return 2;}
     if(useCompressedBlobs&&(!useMixedRegions||!useByteArrayLines)){fprintf(stderr,"--compressed-blobs requires --mixed-regions --byte-array-lines\n");return 2;}
@@ -1831,6 +1833,21 @@ int main(int argc,char**argv){
     else printf("DIAG legacy Line ceilings omitted for the selected persistent definition format\n");
     printf("H200 f-checkpoints (cum raw fraction -> cumulative ratio):\n");
     for(auto&c:ck) printf("  f=%.2f  ratio=%.0fx\n",c.first,c.second);
+    if(curveTsvPath){
+      FILE*curve=fopen(curveTsvPath,"wb");if(!curve){perror(curveTsvPath);return 2;}
+      if(fprintf(curve,"tu\traw_bytes\twire_bytes\tcumulative_raw_bytes\tcumulative_wire_bytes\tcumulative_ratio\texact\n")<0){fprintf(stderr,"curve TSV header write failed\n");fclose(curve);return 2;}
+      uint64_t curveRaw=0,curveWire=0;
+      for(size_t t=0;t<TUs;++t){
+        const uint64_t raw=uint64_t(perTU_raw[t]);const uint64_t wire=uint64_t(std::llround(perTU_wire[t]));curveRaw+=raw;curveWire+=wire;
+        if(fprintf(curve,"%zu\t%llu\t%llu\t%llu\t%llu\t%.12g\t%s\n",t+1,
+            (unsigned long long)raw,(unsigned long long)wire,(unsigned long long)curveRaw,
+            (unsigned long long)curveWire,curveWire?double(curveRaw)/double(curveWire):0.0,byteexact?"true":"false")<0){fprintf(stderr,"curve TSV row write failed\n");fclose(curve);return 2;}
+      }
+      if(std::fabs(double(curveRaw)-double(cum_raw))>0.5||std::fabs(double(curveWire)-cum_wire)>0.5){fprintf(stderr,"curve TSV total differs\n");fclose(curve);return 2;}
+      if(fclose(curve)!=0){perror(curveTsvPath);return 2;}
+      printf("per-TU curve: %s rows=%zu cumulative_raw=%llu cumulative_wire=%llu\n",curveTsvPath,TUs,
+          (unsigned long long)curveRaw,(unsigned long long)curveWire);
+    }
     // trailing-window (5% raw) ratio near the end
     { double win=0.05*corpus.raw, r=0,wsum=0; for(size_t t=TUs;t-->0;){ r+=perTU_raw[t]; wsum+=perTU_wire[t]; if(r>=win) break; } printf("trailing 5%%-raw window ratio (steady) = %.0fx\n", wsum>0?r/wsum:0); }
     struct rusage ru{}; getrusage(RUSAGE_SELF,&ru); fprintf(stderr,"peak RSS=%.1f MiB total=%.1fs\n",ru.ru_maxrss/1024.0,secs(t0));
