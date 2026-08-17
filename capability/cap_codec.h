@@ -121,6 +121,32 @@ Corpus load_corpus(const char*manifest,size_t max_files);
 // ---- varint / zigzag / u64 ----
 static inline void put_varint(std::vector<uint8_t>&o,uint64_t v){ while(v>=0x80){o.push_back(uint8_t(v)|0x80);v>>=7;} o.push_back(uint8_t(v)); }
 static inline uint64_t get_varint(const uint8_t*&p){ uint64_t v=0; int s=0; for(;;){ uint8_t b=*p++; v|=uint64_t(b&0x7f)<<s; if(!(b&0x80))break; s+=7; } return v; }
+// M4 wire readers use only these bounded forms.  The legacy get_varint() remains for
+// the frozen in-process M3 baseline, but must never consume an M4 socket payload.
+static inline bool get_varint_bounded(const uint8_t*&p,const uint8_t*e,uint64_t&v){
+    v=0;
+    for(unsigned i=0;i<10;++i){
+        if(p==e)return false;
+        uint8_t b=*p++;
+        if(i==9 && b>1)return false;                  // u64 overflow
+        v|=uint64_t(b&0x7f)<<(7*i);
+        if(!(b&0x80)){
+            if(i && b==0)return false;                // reject non-canonical overlong form
+            return true;
+        }
+    }
+    return false;
+}
+static inline bool get_u32_bounded(const uint8_t*&p,const uint8_t*e,uint32_t&v){
+    uint64_t x=0;if(!get_varint_bounded(p,e,x)||x>UINT32_MAX)return false;v=uint32_t(x);return true;
+}
+static inline bool get_zigzag_bounded(const uint8_t*&p,const uint8_t*e,int64_t&v){
+    uint64_t u=0;if(!get_varint_bounded(p,e,u))return false;v=int64_t(u>>1)^-int64_t(u&1);return true;
+}
+static inline bool take_bounded(const uint8_t*&p,const uint8_t*e,size_t n,const uint8_t*&begin){
+    if(n>size_t(e-p))return false;
+    begin=p;p+=n;return true;
+}
 static inline void put_u64le(std::vector<uint8_t>&o,uint64_t v){for(unsigned i=0;i<8;++i)o.push_back(uint8_t(v>>(8*i)));}
 static inline void put_zigzag(std::vector<uint8_t>&o,int64_t v){ put_varint(o,(uint64_t(v)<<1)^uint64_t(v>>63)); }
 static inline int64_t get_zigzag(const uint8_t*&p){ uint64_t u=get_varint(p); return int64_t(u>>1)^-int64_t(u&1); }
@@ -153,7 +179,7 @@ static inline std::vector<uint8_t> zstd_stream_encode(ZSTD_CCtx*c,const std::vec
 // (transactional rollback) instead of aborting.  Used on F's receive path.
 static inline bool zstd_frame_try_decode(ZSTD_DCtx*d,const std::vector<uint8_t>&enc,std::vector<uint8_t>&out){
     unsigned long long n=ZSTD_getFrameContentSize(enc.data(),enc.size());
-    if(n==ZSTD_CONTENTSIZE_ERROR||n==ZSTD_CONTENTSIZE_UNKNOWN) return false;
+    if(n==ZSTD_CONTENTSIZE_ERROR||n==ZSTD_CONTENTSIZE_UNKNOWN||n>0x1fffffffull||n>SIZE_MAX) return false;
     out.assign(size_t(n),uint8_t(0)); uint8_t dummy=0;
     void* dp=out.empty()?static_cast<void*>(&dummy):static_cast<void*>(out.data());
     size_t got=ZSTD_decompressDCtx(d,dp,out.size(),enc.data(),enc.size());
@@ -237,8 +263,20 @@ struct SourceTextStore {
 // Persistent members survive across TUs; the per-TU output buffers are reset each call.
 // =====================================================================================
 struct MixedEncoder {
+    struct AuthorityTransaction {
+        std::vector<std::pair<uint32_t,MixedCLineState>> line_before;
+        size_t path_size=0,census_size=0;
+        uint32_t next_public=1;
+        std::array<uint64_t,7> mixed_ops{};
+        uint64_t op7_count=0,op8_count=0,op9_count=0;
+        uint64_t op7_wire=0,op8_wire=0,op9_wire=0;
+        uint64_t literal_raw=0,array_values=0,markers=0,literals=0;
+        bool had_census=false,active=false;
+    };
     // ---- persistent authority state ----
     std::vector<MixedCLineState> mixedCLine;                 // sized dict.distinct()+1 in init()
+    std::vector<uint32_t> authorityJournalStamp;             // one compact first-touch stamp per Line
+    uint32_t authorityJournalSerial=0;
     uint32_t nextMixedPublic=1;
     std::unordered_map<std::string,uint32_t> pathid;
     std::vector<std::string> paths;
@@ -256,17 +294,23 @@ struct MixedEncoder {
     std::array<std::vector<uint8_t>,6> mixedRaw;
     std::vector<uint8_t> fill_paths;
     uint32_t np=0;
+    uint32_t fill_public_base=1;                            // first implicit op1/op9 ordinal in this TU
+    uint32_t fill_path_base=0;                              // first path ordinal defined in this TU
     // ---- OPTIONAL census observation hook (material_lab): when non-null, materialize()
     // records one entry per RAW_RUN literal line actually emitted into mixedRaw[1] (op0).
     // Pure observation: null => zero behavior change (verified: M3/M4 ledger byte-identical). ----
     struct LiteralOccurrence { uint32_t tu; uint32_t region; uint32_t line_id; uint32_t off; uint32_t len; };
     std::vector<LiteralOccurrence>* census_sink=nullptr;
 
-    void init(uint32_t distinctLines, uint32_t nreg){ mixedCLine.assign(size_t(distinctLines)+1, MixedCLineState{}); fknownReg.assign(nreg,0); fknownPublic.assign(1,0); }
+    void init(uint32_t distinctLines, uint32_t nreg){ mixedCLine.assign(size_t(distinctLines)+1, MixedCLineState{}); authorityJournalStamp.assign(size_t(distinctLines)+1,0); fknownReg.assign(nreg,0); fknownPublic.assign(1,0); }
     void forget_public(uint32_t ord){ if(ord<fknownPublic.size()) fknownPublic[ord]=0; }   // F declared a drop
     void reset_model(){ std::fill(fknownReg.begin(),fknownReg.end(),0); std::fill(fknownPublic.begin(),fknownPublic.end(),0); recovering=true; }
+    void begin_authority_transaction(AuthorityTransaction&tx);
+    void commit_authority_transaction(AuthorityTransaction&tx);
+    void rollback_authority_transaction(AuthorityTransaction&tx);
     // Materialize missReg (IN RECEIVED ORDER) -> mixedRaw[0..3] + fill_paths.  Returns nr.
-    uint32_t materialize(const Interner& dict, const std::vector<uint32_t>& missReg, size_t t);
+    uint32_t materialize(const Interner& dict, const std::vector<uint32_t>& missReg, size_t t,
+                         AuthorityTransaction*tx=nullptr);
 };
 
 // =====================================================================================
@@ -276,6 +320,16 @@ struct MixedEncoder {
 // op5/op6) system-header files on disk, and verifies against corpus in the caller.
 // =====================================================================================
 struct FStore {
+    struct BlockBinding { uint32_t id=0; std::vector<uint32_t> children; bool install=false; };
+    struct BlockTransaction { std::vector<BlockBinding> bindings; bool active=false; };
+    struct FillTransaction {
+        size_t region_data_size=0,path_size=0,public_size=0;
+        uint32_t public_next=1,public_held=0,tu=0;
+        std::vector<std::pair<uint32_t,MixedFRegionView>> regions;
+        std::vector<uint32_t> public_flips;
+        std::vector<uint32_t> public_touches;
+        bool active=false;
+    };
     uint32_t NREG=0, NBLK=0;
     std::vector<uint8_t> FmixedRegionData;
     std::vector<MixedFRegionView> FmixedRegions;            // size NREG
@@ -304,7 +358,10 @@ struct FStore {
         Freg_stream.reserve(1u<<20);
         FmixedRegionData.reserve(64u<<20);
     }
-    void install_blocks(const std::vector<uint8_t>& blockRaw);
+    void install_blocks(const std::vector<uint8_t>& blockRaw); // M3 compatibility wrapper
+    bool stage_blocks(const std::vector<uint8_t>& blockRaw,BlockTransaction&tx) const;
+    void commit_blocks(BlockTransaction&tx);
+    const std::vector<uint32_t>* block_children(uint32_t id,const BlockTransaction*tx=nullptr) const;
     // Transactional: on any validation failure the whole Fill commits NOTHING (returns false,
     // store byte-for-byte unchanged).  Installs Fpaths, decodes the mixed streams into the region
     // store, materializes public-Line bytes (op1), re-establishes them under recovery (op7/op8),
@@ -312,7 +369,15 @@ struct FStore {
     bool decode_fill(const std::array<std::vector<uint8_t>,6>& recovered,
                      const std::vector<uint32_t>& missReg,
                      const std::vector<uint8_t>& fill_paths, uint32_t t);
+    bool stage_fill(const std::array<std::vector<uint8_t>,6>& recovered,
+                    const std::vector<uint32_t>& missReg,
+                    const std::vector<uint8_t>& fill_paths,
+                    uint32_t pathBase,uint32_t publicBase,uint32_t t,FillTransaction&tx);
+    void commit_fill(FillTransaction&tx);
+    void rollback_fill(FillTransaction&tx);
     void reconstruct(const std::vector<uint8_t>& Frootb, std::vector<uint8_t>& recon);
+    bool reconstruct_staged(const std::vector<uint8_t>& rootb,const BlockTransaction*blocks,
+                            std::vector<uint8_t>&recon,std::vector<uint32_t>&occurrences) const;
 
     // ---- M2 restart / eviction ----
     void reset_store(uint32_t resyncPublicNext){           // worker restart: drop the whole store

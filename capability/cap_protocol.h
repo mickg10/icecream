@@ -11,8 +11,49 @@
 #include <cstdint>
 #include <vector>
 #include "cap_codec.h"
+#include "cap_identity.h"
 
 namespace capp {
+
+static constexpr uint32_t CAP_PROTOCOL_VERSION=50;
+enum class ComponentCodec : uint8_t { Raw=0, Zstd1=1, Zstd3=2 };
+enum class CodecPolicy : uint8_t { Raw=0, Zstd1=1, Zstd3=2, Best=3 };
+
+struct EncodedComponent {
+    std::vector<uint8_t> wire;       // selector byte followed by raw bytes or one complete zstd frame
+    ComponentCodec codec=ComponentCodec::Raw;
+    size_t raw_size=0,z1_size=SIZE_MAX,z3_size=SIZE_MAX;
+};
+
+static inline size_t component_cost(size_t payloadBytes,bool blobLengthPrefix){
+    size_t envelope=payloadBytes+1;  // explicit codec selector
+    return envelope+(blobLengthPrefix?capc::varint_size(envelope):0);
+}
+
+static inline EncodedComponent encode_component(const std::vector<uint8_t>&raw,CodecPolicy policy,
+                                                ZSTD_CCtx*z1,ZSTD_CCtx*z3,bool blobLengthPrefix){
+    EncodedComponent result;result.raw_size=raw.size();
+    const std::vector<uint8_t>*best=&raw;size_t bestCost=component_cost(raw.size(),blobLengthPrefix);
+    std::vector<uint8_t>one,three;
+    auto consider=[&](int level,ZSTD_CCtx*ctx,std::vector<uint8_t>&candidate,ComponentCodec codec){
+        size_t n=capc::zstd_size(ctx,raw.data(),raw.size(),level,candidate);candidate.resize(n);
+        if(level==1)result.z1_size=n;else result.z3_size=n;
+        size_t cost=component_cost(n,blobLengthPrefix);
+        if(cost<bestCost){bestCost=cost;best=&candidate;result.codec=codec;}
+    };
+    if(policy==CodecPolicy::Zstd1||policy==CodecPolicy::Best)consider(1,z1,one,ComponentCodec::Zstd1);
+    if(policy==CodecPolicy::Zstd3||policy==CodecPolicy::Best)consider(3,z3,three,ComponentCodec::Zstd3);
+    result.wire.reserve(best->size()+1);result.wire.push_back(uint8_t(result.codec));result.wire.insert(result.wire.end(),best->begin(),best->end());
+    return result;
+}
+
+static inline bool decode_component(const std::vector<uint8_t>&wire,ZSTD_DCtx*d,std::vector<uint8_t>&raw){
+    if(wire.empty())return false;
+    uint8_t selector=wire[0];
+    if(selector==uint8_t(ComponentCodec::Raw)){raw.assign(wire.begin()+1,wire.end());return true;}
+    if(selector!=uint8_t(ComponentCodec::Zstd1)&&selector!=uint8_t(ComponentCodec::Zstd3))return false;
+    std::vector<uint8_t>frame(wire.begin()+1,wire.end());return capc::zstd_frame_try_decode(d,frame,raw);
+}
 
 static inline void put_blob(std::vector<uint8_t>& o, const std::vector<uint8_t>& b){
     capc::put_varint(o, b.size());
@@ -22,6 +63,72 @@ static inline std::vector<uint8_t> get_blob(const uint8_t*& p, const uint8_t* e)
     uint64_t n = capc::get_varint(p);
     if(uint64_t(e-p) < n){ fprintf(stderr,"protocol: truncated blob\n"); exit(2); }
     std::vector<uint8_t> b(p, p+n); p += n; return b;
+}
+static inline bool try_get_blob(const uint8_t*&p,const uint8_t*e,std::vector<uint8_t>&out){
+    uint64_t n=0;if(!capc::get_varint_bounded(p,e,n)||n>size_t(e-p))return false;
+    out.assign(p,p+size_t(n));p+=size_t(n);return true;
+}
+
+// ---- M4 Hello: one relationship-scoped cache generation, protocol 50 ----
+static inline std::vector<uint8_t> pack_hello_m4(const cap::SourceGeneration&generation,uint32_t nreg,
+                                                 uint32_t nblk,uint32_t physicalTus,uint32_t repetitions){
+    std::vector<uint8_t>out(generation.begin(),generation.end());
+    capc::put_varint(out,CAP_PROTOCOL_VERSION);capc::put_varint(out,nreg);capc::put_varint(out,nblk);
+    capc::put_varint(out,physicalTus);capc::put_varint(out,repetitions);return out;
+}
+static inline bool try_unpack_hello_m4(const std::vector<uint8_t>&payload,cap::SourceGeneration&generation,
+                                       uint32_t&nreg,uint32_t&nblk,uint32_t&physicalTus,uint32_t&repetitions){
+    if(payload.size()<16)return false;
+    memcpy(generation.data(),payload.data(),16);
+    const uint8_t*p=payload.data()+16,*e=payload.data()+payload.size();uint64_t version=0;
+    return capc::get_varint_bounded(p,e,version)&&version==CAP_PROTOCOL_VERSION&&
+           capc::get_u32_bounded(p,e,nreg)&&capc::get_u32_bounded(p,e,nblk)&&
+           capc::get_u32_bounded(p,e,physicalTus)&&capc::get_u32_bounded(p,e,repetitions)&&p==e&&
+           physicalTus>0&&repetitions>0;
+}
+
+// ---- M4 Root: TU index + independently selected Root and Block components ----
+static inline std::vector<uint8_t> pack_root_m4(uint32_t tu,const std::vector<uint8_t>&root,
+                                                const std::vector<uint8_t>&blocks){
+    std::vector<uint8_t>out;capc::put_varint(out,tu);put_blob(out,root);put_blob(out,blocks);return out;
+}
+static inline bool try_unpack_root_m4(const std::vector<uint8_t>&payload,uint32_t&tu,
+                                      std::vector<uint8_t>&root,std::vector<uint8_t>&blocks){
+    const uint8_t*p=payload.data(),*e=p+payload.size();
+    return capc::get_u32_bounded(p,e,tu)&&try_get_blob(p,e,root)&&try_get_blob(p,e,blocks)&&p==e;
+}
+
+// ---- M4 Need: TU index + one selected component ----
+static inline std::vector<uint8_t> pack_need_m4(uint32_t tu,const std::vector<uint8_t>&need){
+    std::vector<uint8_t>out;capc::put_varint(out,tu);put_blob(out,need);return out;
+}
+static inline bool try_unpack_need_m4(const std::vector<uint8_t>&payload,uint32_t&tu,std::vector<uint8_t>&need){
+    const uint8_t*p=payload.data(),*e=p+payload.size();return capc::get_u32_bounded(p,e,tu)&&try_get_blob(p,e,need)&&p==e;
+}
+
+// ---- M4 Fill: TU index + replay-stable ordinal bases + five selected components ----
+static inline std::vector<uint8_t> pack_fill_m4(uint32_t tu,uint32_t pathBase,uint32_t publicBase,
+                                                const std::vector<uint8_t>&paths,
+                                                const std::array<std::vector<uint8_t>,6>&mixed,size_t partCount){
+    std::vector<uint8_t>out;capc::put_varint(out,tu);capc::put_varint(out,pathBase);capc::put_varint(out,publicBase);
+    put_blob(out,paths);for(size_t i=0;i<partCount;++i)put_blob(out,mixed[i]);return out;
+}
+static inline bool try_unpack_fill_m4(const std::vector<uint8_t>&payload,uint32_t&tu,uint32_t&pathBase,
+                                      uint32_t&publicBase,std::vector<uint8_t>&paths,
+                                      std::array<std::vector<uint8_t>,6>&mixed,size_t partCount){
+    const uint8_t*p=payload.data(),*e=p+payload.size();
+    if(!capc::get_u32_bounded(p,e,tu)||!capc::get_u32_bounded(p,e,pathBase)||!capc::get_u32_bounded(p,e,publicBase)||!try_get_blob(p,e,paths))return false;
+    for(size_t i=0;i<partCount;++i)if(!try_get_blob(p,e,mixed[i]))return false;
+    return p==e;
+}
+
+static inline std::vector<uint8_t> pack_tu_ack(uint32_t tu,bool accepted){
+    std::vector<uint8_t>out;capc::put_varint(out,tu);out.push_back(accepted?1:0);return out;
+}
+static inline bool try_unpack_tu_ack(const std::vector<uint8_t>&payload,uint32_t&tu,bool&accepted){
+    const uint8_t*p=payload.data(),*e=p+payload.size();
+    if(!capc::get_u32_bounded(p,e,tu)||e-p!=1||*p>1)return false;
+    accepted=*p!=0;return true;
 }
 
 // ---- Root ----
@@ -63,6 +170,9 @@ static inline std::vector<uint8_t> pack_rejoin(uint32_t resumeTU){
 static inline uint32_t unpack_rejoin(const std::vector<uint8_t>& p){
     const uint8_t* q=p.data(); return uint32_t(capc::get_varint(q));
 }
+static inline bool try_unpack_rejoin(const std::vector<uint8_t>&payload,uint32_t&resumeTU){
+    const uint8_t*p=payload.data(),*e=p+payload.size();return capc::get_u32_bounded(p,e,resumeTU)&&p==e;
+}
 static inline std::vector<uint8_t> pack_resync(uint32_t nextPublic, const std::vector<std::string>& paths){
     std::vector<uint8_t> o; capc::put_varint(o,nextPublic); capc::put_varint(o,paths.size());
     for(const auto& s:paths){ capc::put_varint(o,s.size()); o.insert(o.end(),s.begin(),s.end()); }
@@ -72,6 +182,14 @@ static inline void unpack_resync(const std::vector<uint8_t>& p, uint32_t& nextPu
     const uint8_t* q=p.data(),*e=q+p.size(); nextPublic=uint32_t(capc::get_varint(q));
     uint64_t n=capc::get_varint(q); paths.clear(); paths.reserve(n);
     for(uint64_t i=0;i<n;++i){ uint64_t L=capc::get_varint(q); if(uint64_t(e-q)<L){fprintf(stderr,"protocol: resync trunc\n");exit(2);} paths.emplace_back((const char*)q,(size_t)L); q+=L; }
+}
+static inline bool try_unpack_resync(const std::vector<uint8_t>&payload,uint32_t&nextPublic,std::vector<std::string>&paths){
+    const uint8_t*p=payload.data(),*e=p+payload.size();uint64_t count=0;
+    if(!capc::get_u32_bounded(p,e,nextPublic)||!nextPublic||!capc::get_varint_bounded(p,e,count)||count>payload.size())return false;
+    paths.clear();paths.reserve(size_t(count));
+    for(uint64_t i=0;i<count;++i){uint64_t length=0;if(!capc::get_varint_bounded(p,e,length)||length>size_t(e-p))return false;
+        paths.emplace_back((const char*)p,size_t(length));p+=size_t(length);}
+    return p==e;
 }
 
 }  // namespace capp
