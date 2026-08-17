@@ -1,0 +1,174 @@
+{
+  "schema": "precomputed-material-lane-ceiling-v1",
+  "accounting": {
+    "order": "canonical manifest order",
+    "unit": "one complete archive per material lane over the full build",
+    "projection": "replace only measured P29 material-lane wire; retain every other exact P29 byte",
+    "decoder_status": "each lane archive independently decoded and SHA-256 verified; complete projected layout not yet integrated",
+    "receiver_start": "empty",
+    "installed_package_bytes": 0
+  },
+  "codecs": {
+    "zstd19_long": "zstd 1.5.7 -19 --long=31 -T1",
+    "zpaq_m3": "ZPAQ 7.15 method level 3 at commit 9ab539f644e364f0d92e2918b90ce2534c75653f",
+    "zpaq_m4": "ZPAQ 7.15 method level 4 at commit 9ab539f644e364f0d92e2918b90ce2534c75653f",
+    "zpaq_m5": "ZPAQ 7.15 method level 5 at commit 9ab539f644e364f0d92e2918b90ce2534c75653f"
+  },
+  "corpora": [
+    {
+      "name": "DuckDB",
+      "tus": 689,
+      "whole_ii_z19_bytes": 7167012,
+      "cold_gate_bytes": 7883713,
+      "current_complete_wire_bytes": 9589726,
+      "fixed_wire_bytes": 1135034,
+      "lanes": [
+        {
+          "name": "region control",
+          "raw_component": "region_control",
+          "wire_components": ["region_control", "region_other"],
+          "raw_bytes": 4810857,
+          "raw_sha256": "4c9b656da9ce5aa06ce113ba804134334bb99c131830c4fbd002784017fc26bd",
+          "current_wire_bytes": 2016440,
+          "candidate_bytes": {
+            "zstd19_long": 1693733,
+            "zpaq_m3": 1637334,
+            "zpaq_m4": 1383485,
+            "zpaq_m5": 1250919
+          },
+          "decoded_sha256_verified": true
+        },
+        {
+          "name": "literal",
+          "raw_component": "literal",
+          "wire_components": ["literal"],
+          "raw_bytes": 31439473,
+          "raw_sha256": "263157e32ec56f374770da42290eec8abb9baefb12322dca645f7b3090a6c372",
+          "current_wire_bytes": 5118367,
+          "candidate_bytes": {
+            "zstd19_long": 3547566,
+            "zpaq_m3": 3423243,
+            "zpaq_m4": 2657612,
+            "zpaq_m5": 2372254
+          },
+          "decoded_sha256_verified": true
+        },
+        {
+          "name": "array control",
+          "raw_component": "array_control",
+          "wire_components": ["array_control"],
+          "raw_bytes": 220290,
+          "raw_sha256": "77c1ff40ff42ee81bc60ab24c26eb94df1cc96b0bd939617ba2eebd873db5fca",
+          "current_wire_bytes": 12001,
+          "candidate_bytes": {
+            "zstd19_long": 8898,
+            "zpaq_m3": 7888,
+            "zpaq_m4": 7888,
+            "zpaq_m5": 7143
+          },
+          "decoded_sha256_verified": true
+        },
+        {
+          "name": "array values",
+          "raw_component": "array_values",
+          "wire_components": ["array_values"],
+          "raw_bytes": 3701352,
+          "raw_sha256": "c50a6a33b57aed6b35f5921499670dc8d93339e34c75c43fb7e547f4a5797f3d",
+          "current_wire_bytes": 1307884,
+          "candidate_bytes": {
+            "zstd19_long": 1109514,
+            "zpaq_m3": 1141994,
+            "zpaq_m4": 944988,
+            "zpaq_m5": 879914
+          },
+          "decoded_sha256_verified": true
+        }
+      ]
+    },
+    {
+      "name": "Godot",
+      "tus": 2207,
+      "whole_ii_z19_bytes": 58289521,
+      "cold_gate_bytes": 64118473,
+      "current_complete_wire_bytes": 39589524,
+      "fixed_wire_bytes": 888790,
+      "lanes": [
+        {
+          "name": "region control",
+          "raw_component": "region_control",
+          "wire_components": ["region_control", "region_other"],
+          "raw_bytes": 10142549,
+          "raw_sha256": "6b74fbee767f53fb2cc6766c8a90361ca741a4b66a9e3ed5075ec182328967d2",
+          "current_wire_bytes": 4164025,
+          "candidate_bytes": {
+            "zstd19_long": 3449533,
+            "zpaq_m3": 3235274,
+            "zpaq_m4": 2790415,
+            "zpaq_m5": 2497763
+          },
+          "decoded_sha256_verified": true
+        },
+        {
+          "name": "literal",
+          "raw_component": "literal",
+          "wire_components": ["literal"],
+          "raw_bytes": 96195716,
+          "raw_sha256": "7356cc96e3d2dbf80068f2e38f143a7f2c8fadb7e124c79503e01897fffb1570",
+          "current_wire_bytes": 13672703,
+          "candidate_bytes": {
+            "zstd19_long": 9272575,
+            "zpaq_m3": 9241472,
+            "zpaq_m4": 6909348,
+            "zpaq_m5": 6169401
+          },
+          "decoded_sha256_verified": true
+        },
+        {
+          "name": "array control",
+          "raw_component": "array_control",
+          "wire_components": ["array_control"],
+          "raw_bytes": 2981838,
+          "raw_sha256": "6327f5eb448165c4f83dcfbfaf6517bdf22c1dbbe354503be9eff3d70d8ea071",
+          "current_wire_bytes": 538609,
+          "candidate_bytes": {
+            "zstd19_long": 372203,
+            "zpaq_m3": 327576,
+            "zpaq_m4": 327576,
+            "zpaq_m5": 307733
+          },
+          "decoded_sha256_verified": true
+        },
+        {
+          "name": "array values",
+          "raw_component": "array_values",
+          "wire_components": ["array_values"],
+          "raw_bytes": 7780568,
+          "raw_sha256": "4917e6a8df329ddddcfb183f25d8d8d2c9aded524cfd0727f5268a477804c244",
+          "current_wire_bytes": 5707804,
+          "candidate_bytes": {
+            "zstd19_long": 5387926,
+            "zpaq_m3": 5233878,
+            "zpaq_m4": 5059346,
+            "zpaq_m5": 4844578
+          },
+          "decoded_sha256_verified": true
+        },
+        {
+          "name": "inflated embedded blobs",
+          "raw_component": "blob",
+          "wire_components": ["blob", "blob_patch"],
+          "raw_bytes": 124407478,
+          "raw_sha256": "a9d6dcaad60e209d73486267765d285738de12e1c52c13e178588a156d580b20",
+          "current_wire_bytes": 14617593,
+          "candidate_bytes": {
+            "zstd19_long": 12961679,
+            "zpaq_m3": 14330468,
+            "zpaq_m4": 11630246,
+            "zpaq_m5": 10513795
+          },
+          "decoded_sha256_verified": true
+        }
+      ]
+    }
+  ]
+}

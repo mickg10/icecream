@@ -1,0 +1,1486 @@
+{
+  "schema": "p29-component-curve-v1",
+  "wire_components": [
+    "root_wire_bytes",
+    "block_wire_bytes",
+    "path_wire_bytes",
+    "framing_wire_bytes",
+    "region_control_wire_bytes",
+    "region_other_wire_bytes",
+    "literal_wire_bytes",
+    "array_control_wire_bytes",
+    "array_values_wire_bytes",
+    "source_control_wire_bytes",
+    "source_files_wire_bytes",
+    "selector_wire_bytes",
+    "blob_wire_bytes",
+    "blob_patch_wire_bytes",
+    "line_other_wire_bytes",
+    "association_wire_bytes",
+    "missing_request_wire_bytes",
+    "blob_fallback_request_wire_bytes",
+    "blob_fallback_reply_wire_bytes",
+    "missing_other_wire_bytes"
+  ],
+  "families": {
+    "literal": [
+      "literal_wire_bytes"
+    ],
+    "blob": [
+      "blob_wire_bytes",
+      "blob_patch_wire_bytes"
+    ],
+    "array": [
+      "array_control_wire_bytes",
+      "array_values_wire_bytes"
+    ],
+    "region control": [
+      "region_control_wire_bytes",
+      "region_other_wire_bytes"
+    ],
+    "structure": [
+      "root_wire_bytes",
+      "block_wire_bytes",
+      "path_wire_bytes"
+    ],
+    "request/association": [
+      "association_wire_bytes",
+      "missing_request_wire_bytes",
+      "blob_fallback_request_wire_bytes",
+      "blob_fallback_reply_wire_bytes",
+      "missing_other_wire_bytes"
+    ],
+    "source": [
+      "source_control_wire_bytes",
+      "source_files_wire_bytes"
+    ],
+    "framing": [
+      "framing_wire_bytes"
+    ],
+    "other": [
+      "selector_wire_bytes",
+      "line_other_wire_bytes"
+    ]
+  },
+  "corpora": [
+    {
+      "name": "DuckDB",
+      "source": "linecache/ml-artifacts/p29-component-curve.tsv",
+      "tus": 689,
+      "raw_bytes": 1985715205,
+      "wire_bytes": 9589726,
+      "family_wire_bytes": {
+        "literal": 5118367,
+        "blob": 0,
+        "array": 1319885,
+        "region control": 2016440,
+        "structure": 668334,
+        "request/association": 461144,
+        "source": 0,
+        "framing": 4996,
+        "other": 560
+      },
+      "component_wire_bytes": {
+        "root": 504205,
+        "block": 65350,
+        "path": 98779,
+        "framing": 4996,
+        "region_control": 2016440,
+        "region_other": 0,
+        "literal": 5118367,
+        "array_control": 12001,
+        "array_values": 1307884,
+        "source_control": 0,
+        "source_files": 0,
+        "selector": 560,
+        "blob": 0,
+        "blob_patch": 0,
+        "line_other": 0,
+        "association": 0,
+        "missing_request": 461144,
+        "blob_fallback_request": 0,
+        "blob_fallback_reply": 0,
+        "missing_other": 0
+      },
+      "raw_material_bytes": {
+        "region_control": 4810857,
+        "literal": 31439473,
+        "array_control": 220290,
+        "array_values": 3701352,
+        "source_control": 0,
+        "source_files": 0,
+        "blob": 0,
+        "blob_patch": 0
+      },
+      "checkpoints": [
+        {
+          "tus": 1,
+          "raw_bytes": 839260,
+          "wire_bytes": 87856,
+          "family_wire_bytes": {
+            "literal": 10094,
+            "blob": 0,
+            "array": 0,
+            "region control": 71325,
+            "structure": 4115,
+            "request/association": 2313,
+            "source": 0,
+            "framing": 8,
+            "other": 1
+          },
+          "tu": 1
+        },
+        {
+          "tus": 10,
+          "raw_bytes": 38283493,
+          "wire_bytes": 830100,
+          "family_wire_bytes": {
+            "literal": 461315,
+            "blob": 0,
+            "array": 158,
+            "region control": 331237,
+            "structure": 25488,
+            "request/association": 11817,
+            "source": 0,
+            "framing": 76,
+            "other": 9
+          },
+          "tu": 10
+        },
+        {
+          "tus": 25,
+          "raw_bytes": 94056366,
+          "wire_bytes": 1012019,
+          "family_wire_bytes": {
+            "literal": 596341,
+            "blob": 0,
+            "array": 228,
+            "region control": 368290,
+            "structure": 33109,
+            "request/association": 13846,
+            "source": 0,
+            "framing": 184,
+            "other": 21
+          },
+          "tu": 25
+        },
+        {
+          "tus": 50,
+          "raw_bytes": 157611119,
+          "wire_bytes": 1636194,
+          "family_wire_bytes": {
+            "literal": 685982,
+            "blob": 0,
+            "array": 492399,
+            "region control": 402070,
+            "structure": 39764,
+            "request/association": 15549,
+            "source": 0,
+            "framing": 384,
+            "other": 46
+          },
+          "tu": 50
+        },
+        {
+          "tus": 100,
+          "raw_bytes": 314498355,
+          "wire_bytes": 1781171,
+          "family_wire_bytes": {
+            "literal": 779154,
+            "blob": 0,
+            "array": 492399,
+            "region control": 440568,
+            "structure": 49843,
+            "request/association": 18477,
+            "source": 0,
+            "framing": 664,
+            "other": 66
+          },
+          "tu": 100
+        },
+        {
+          "tus": 150,
+          "raw_bytes": 516085068,
+          "wire_bytes": 1862265,
+          "family_wire_bytes": {
+            "literal": 821185,
+            "blob": 0,
+            "array": 492399,
+            "region control": 468577,
+            "structure": 58620,
+            "request/association": 20429,
+            "source": 0,
+            "framing": 964,
+            "other": 91
+          },
+          "tu": 150
+        },
+        {
+          "tus": 200,
+          "raw_bytes": 646795216,
+          "wire_bytes": 2491331,
+          "family_wire_bytes": {
+            "literal": 1241669,
+            "blob": 0,
+            "array": 567898,
+            "region control": 576213,
+            "structure": 77778,
+            "request/association": 26313,
+            "source": 0,
+            "framing": 1328,
+            "other": 132
+          },
+          "tu": 200
+        },
+        {
+          "tus": 250,
+          "raw_bytes": 746619323,
+          "wire_bytes": 2590440,
+          "family_wire_bytes": {
+            "literal": 1307998,
+            "blob": 0,
+            "array": 567994,
+            "region control": 600374,
+            "structure": 83931,
+            "request/association": 28393,
+            "source": 0,
+            "framing": 1600,
+            "other": 150
+          },
+          "tu": 250
+        },
+        {
+          "tus": 300,
+          "raw_bytes": 828521266,
+          "wire_bytes": 3288839,
+          "family_wire_bytes": {
+            "literal": 1385508,
+            "blob": 0,
+            "array": 1140301,
+            "region control": 633566,
+            "structure": 95492,
+            "request/association": 31897,
+            "source": 0,
+            "framing": 1900,
+            "other": 175
+          },
+          "tu": 300
+        },
+        {
+          "tus": 400,
+          "raw_bytes": 1055669028,
+          "wire_bytes": 4709859,
+          "family_wire_bytes": {
+            "literal": 2285919,
+            "blob": 0,
+            "array": 1316868,
+            "region control": 894029,
+            "structure": 157160,
+            "request/association": 52913,
+            "source": 0,
+            "framing": 2696,
+            "other": 274
+          },
+          "tu": 400
+        },
+        {
+          "tus": 500,
+          "raw_bytes": 1483187677,
+          "wire_bytes": 7515459,
+          "family_wire_bytes": {
+            "literal": 4141012,
+            "blob": 0,
+            "array": 1317280,
+            "region control": 1524162,
+            "structure": 349170,
+            "request/association": 179965,
+            "source": 0,
+            "framing": 3496,
+            "other": 374
+          },
+          "tu": 500
+        },
+        {
+          "tus": 689,
+          "raw_bytes": 1985715205,
+          "wire_bytes": 9589726,
+          "family_wire_bytes": {
+            "literal": 5118367,
+            "blob": 0,
+            "array": 1319885,
+            "region control": 2016440,
+            "structure": 668334,
+            "request/association": 461144,
+            "source": 0,
+            "framing": 4996,
+            "other": 560
+          },
+          "tu": 689
+        }
+      ],
+      "bands": [
+        {
+          "tus": 50,
+          "raw_bytes": 157611119,
+          "wire_bytes": 1636194,
+          "family_wire_bytes": {
+            "literal": 685982,
+            "blob": 0,
+            "array": 492399,
+            "region control": 402070,
+            "structure": 39764,
+            "request/association": 15549,
+            "source": 0,
+            "framing": 384,
+            "other": 46
+          },
+          "first_tu": 1,
+          "last_tu": 50
+        },
+        {
+          "tus": 50,
+          "raw_bytes": 156887236,
+          "wire_bytes": 144977,
+          "family_wire_bytes": {
+            "literal": 93172,
+            "blob": 0,
+            "array": 0,
+            "region control": 38498,
+            "structure": 10079,
+            "request/association": 2928,
+            "source": 0,
+            "framing": 280,
+            "other": 20
+          },
+          "first_tu": 51,
+          "last_tu": 100
+        },
+        {
+          "tus": 50,
+          "raw_bytes": 201586713,
+          "wire_bytes": 81094,
+          "family_wire_bytes": {
+            "literal": 42031,
+            "blob": 0,
+            "array": 0,
+            "region control": 28009,
+            "structure": 8777,
+            "request/association": 1952,
+            "source": 0,
+            "framing": 300,
+            "other": 25
+          },
+          "first_tu": 101,
+          "last_tu": 150
+        },
+        {
+          "tus": 50,
+          "raw_bytes": 130710148,
+          "wire_bytes": 629066,
+          "family_wire_bytes": {
+            "literal": 420484,
+            "blob": 0,
+            "array": 75499,
+            "region control": 107636,
+            "structure": 19158,
+            "request/association": 5884,
+            "source": 0,
+            "framing": 364,
+            "other": 41
+          },
+          "first_tu": 151,
+          "last_tu": 200
+        },
+        {
+          "tus": 50,
+          "raw_bytes": 99824107,
+          "wire_bytes": 99109,
+          "family_wire_bytes": {
+            "literal": 66329,
+            "blob": 0,
+            "array": 96,
+            "region control": 24161,
+            "structure": 6153,
+            "request/association": 2080,
+            "source": 0,
+            "framing": 272,
+            "other": 18
+          },
+          "first_tu": 201,
+          "last_tu": 250
+        },
+        {
+          "tus": 50,
+          "raw_bytes": 81901943,
+          "wire_bytes": 698399,
+          "family_wire_bytes": {
+            "literal": 77510,
+            "blob": 0,
+            "array": 572307,
+            "region control": 33192,
+            "structure": 11561,
+            "request/association": 3504,
+            "source": 0,
+            "framing": 300,
+            "other": 25
+          },
+          "first_tu": 251,
+          "last_tu": 300
+        },
+        {
+          "tus": 100,
+          "raw_bytes": 227147762,
+          "wire_bytes": 1421020,
+          "family_wire_bytes": {
+            "literal": 900411,
+            "blob": 0,
+            "array": 176567,
+            "region control": 260463,
+            "structure": 61668,
+            "request/association": 21016,
+            "source": 0,
+            "framing": 796,
+            "other": 99
+          },
+          "first_tu": 301,
+          "last_tu": 400
+        },
+        {
+          "tus": 100,
+          "raw_bytes": 427518649,
+          "wire_bytes": 2805600,
+          "family_wire_bytes": {
+            "literal": 1855093,
+            "blob": 0,
+            "array": 412,
+            "region control": 630133,
+            "structure": 192010,
+            "request/association": 127052,
+            "source": 0,
+            "framing": 800,
+            "other": 100
+          },
+          "first_tu": 401,
+          "last_tu": 500
+        },
+        {
+          "tus": 189,
+          "raw_bytes": 502527528,
+          "wire_bytes": 2074267,
+          "family_wire_bytes": {
+            "literal": 977355,
+            "blob": 0,
+            "array": 2605,
+            "region control": 492278,
+            "structure": 319164,
+            "request/association": 281179,
+            "source": 0,
+            "framing": 1500,
+            "other": 186
+          },
+          "first_tu": 501,
+          "last_tu": 689
+        }
+      ],
+      "per_tu_wire_distribution": {
+        "p50_bytes": 3102,
+        "p90_bytes": 28896,
+        "p99_bytes": 242055,
+        "max_bytes": 577062
+      },
+      "top_tus": [
+        {
+          "tu": 2,
+          "raw_bytes": 5434195,
+          "wire_bytes": 577062,
+          "family_wire_bytes": {
+            "literal": 347817,
+            "blob": 0,
+            "array": 158,
+            "region control": 207732,
+            "structure": 14027,
+            "request/association": 7319,
+            "source": 0,
+            "framing": 8,
+            "other": 1
+          }
+        },
+        {
+          "tu": 635,
+          "raw_bytes": 15786220,
+          "wire_bytes": 548603,
+          "family_wire_bytes": {
+            "literal": 105466,
+            "blob": 0,
+            "array": 1022,
+            "region control": 111204,
+            "structure": 165515,
+            "request/association": 165387,
+            "source": 0,
+            "framing": 8,
+            "other": 1
+          }
+        },
+        {
+          "tu": 35,
+          "raw_bytes": 3697406,
+          "wire_bytes": 450579,
+          "family_wire_bytes": {
+            "literal": 2529,
+            "blob": 0,
+            "array": 447430,
+            "region control": 458,
+            "structure": 130,
+            "request/association": 23,
+            "source": 0,
+            "framing": 8,
+            "other": 1
+          }
+        },
+        {
+          "tu": 283,
+          "raw_bytes": 10085962,
+          "wire_bytes": 351146,
+          "family_wire_bytes": {
+            "literal": 10684,
+            "blob": 0,
+            "array": 338209,
+            "region control": 1622,
+            "structure": 520,
+            "request/association": 102,
+            "source": 0,
+            "framing": 8,
+            "other": 1
+          }
+        },
+        {
+          "tu": 500,
+          "raw_bytes": 10967926,
+          "wire_bytes": 329618,
+          "family_wire_bytes": {
+            "literal": 96432,
+            "blob": 0,
+            "array": 131,
+            "region control": 99946,
+            "structure": 66466,
+            "request/association": 66634,
+            "source": 0,
+            "framing": 8,
+            "other": 1
+          }
+        },
+        {
+          "tu": 290,
+          "raw_bytes": 4151779,
+          "wire_bytes": 242551,
+          "family_wire_bytes": {
+            "literal": 3595,
+            "blob": 0,
+            "array": 234098,
+            "region control": 3465,
+            "structure": 892,
+            "request/association": 492,
+            "source": 0,
+            "framing": 8,
+            "other": 1
+          }
+        },
+        {
+          "tu": 469,
+          "raw_bytes": 7161752,
+          "wire_bytes": 242055,
+          "family_wire_bytes": {
+            "literal": 206707,
+            "blob": 0,
+            "array": 0,
+            "region control": 33016,
+            "structure": 1854,
+            "request/association": 469,
+            "source": 0,
+            "framing": 8,
+            "other": 1
+          }
+        },
+        {
+          "tu": 356,
+          "raw_bytes": 7893133,
+          "wire_bytes": 223848,
+          "family_wire_bytes": {
+            "literal": 173749,
+            "blob": 0,
+            "array": 338,
+            "region control": 40090,
+            "structure": 6809,
+            "request/association": 2853,
+            "source": 0,
+            "framing": 8,
+            "other": 1
+          }
+        },
+        {
+          "tu": 189,
+          "raw_bytes": 1368463,
+          "wire_bytes": 178685,
+          "family_wire_bytes": {
+            "literal": 169145,
+            "blob": 0,
+            "array": 198,
+            "region control": 8062,
+            "structure": 881,
+            "request/association": 390,
+            "source": 0,
+            "framing": 8,
+            "other": 1
+          }
+        },
+        {
+          "tu": 499,
+          "raw_bytes": 7594342,
+          "wire_bytes": 171187,
+          "family_wire_bytes": {
+            "literal": 58289,
+            "blob": 0,
+            "array": 0,
+            "region control": 50314,
+            "structure": 31242,
+            "request/association": 31333,
+            "source": 0,
+            "framing": 8,
+            "other": 1
+          }
+        }
+      ]
+    },
+    {
+      "name": "Godot",
+      "source": "linecache/ml-artifacts/p29-component-curve.tsv",
+      "tus": 2207,
+      "raw_bytes": 5932762185,
+      "wire_bytes": 39589524,
+      "family_wire_bytes": {
+        "literal": 13672703,
+        "blob": 14617593,
+        "array": 6246413,
+        "region control": 4164025,
+        "structure": 616954,
+        "request/association": 251973,
+        "source": 0,
+        "framing": 17656,
+        "other": 2207
+      },
+      "component_wire_bytes": {
+        "root": 327345,
+        "block": 104273,
+        "path": 185336,
+        "framing": 17656,
+        "region_control": 4164025,
+        "region_other": 0,
+        "literal": 13672703,
+        "array_control": 538609,
+        "array_values": 5707804,
+        "source_control": 0,
+        "source_files": 0,
+        "selector": 2207,
+        "blob": 14617593,
+        "blob_patch": 0,
+        "line_other": 0,
+        "association": 0,
+        "missing_request": 251973,
+        "blob_fallback_request": 0,
+        "blob_fallback_reply": 0,
+        "missing_other": 0
+      },
+      "raw_material_bytes": {
+        "region_control": 10142549,
+        "literal": 96195716,
+        "array_control": 2981838,
+        "array_values": 7780568,
+        "source_control": 0,
+        "source_files": 0,
+        "blob": 124407478,
+        "blob_patch": 0
+      },
+      "checkpoints": [
+        {
+          "tus": 1,
+          "raw_bytes": 2364113,
+          "wire_bytes": 340345,
+          "family_wire_bytes": {
+            "literal": 206319,
+            "blob": 0,
+            "array": 0,
+            "region control": 122544,
+            "structure": 7279,
+            "request/association": 4194,
+            "source": 0,
+            "framing": 8,
+            "other": 1
+          },
+          "tu": 1
+        },
+        {
+          "tus": 10,
+          "raw_bytes": 22231384,
+          "wire_bytes": 529084,
+          "family_wire_bytes": {
+            "literal": 355280,
+            "blob": 0,
+            "array": 0,
+            "region control": 155937,
+            "structure": 11832,
+            "request/association": 5945,
+            "source": 0,
+            "framing": 80,
+            "other": 10
+          },
+          "tu": 10
+        },
+        {
+          "tus": 25,
+          "raw_bytes": 55509829,
+          "wire_bytes": 863849,
+          "family_wire_bytes": {
+            "literal": 582974,
+            "blob": 19746,
+            "array": 422,
+            "region control": 235268,
+            "structure": 17197,
+            "request/association": 8017,
+            "source": 0,
+            "framing": 200,
+            "other": 25
+          },
+          "tu": 25
+        },
+        {
+          "tus": 50,
+          "raw_bytes": 107803623,
+          "wire_bytes": 1059470,
+          "family_wire_bytes": {
+            "literal": 739616,
+            "blob": 19746,
+            "array": 422,
+            "region control": 267861,
+            "structure": 21795,
+            "request/association": 9580,
+            "source": 0,
+            "framing": 400,
+            "other": 50
+          },
+          "tu": 50
+        },
+        {
+          "tus": 100,
+          "raw_bytes": 204440064,
+          "wire_bytes": 1362035,
+          "family_wire_bytes": {
+            "literal": 937708,
+            "blob": 19746,
+            "array": 422,
+            "region control": 358870,
+            "structure": 31343,
+            "request/association": 13046,
+            "source": 0,
+            "framing": 800,
+            "other": 100
+          },
+          "tu": 100
+        },
+        {
+          "tus": 150,
+          "raw_bytes": 279432192,
+          "wire_bytes": 1554220,
+          "family_wire_bytes": {
+            "literal": 1066356,
+            "blob": 19746,
+            "array": 463,
+            "region control": 410618,
+            "structure": 39910,
+            "request/association": 15777,
+            "source": 0,
+            "framing": 1200,
+            "other": 150
+          },
+          "tu": 150
+        },
+        {
+          "tus": 200,
+          "raw_bytes": 382645585,
+          "wire_bytes": 2372213,
+          "family_wire_bytes": {
+            "literal": 1648523,
+            "blob": 19746,
+            "array": 104095,
+            "region control": 527071,
+            "structure": 51691,
+            "request/association": 19287,
+            "source": 0,
+            "framing": 1600,
+            "other": 200
+          },
+          "tu": 200
+        },
+        {
+          "tus": 250,
+          "raw_bytes": 529267340,
+          "wire_bytes": 3491481,
+          "family_wire_bytes": {
+            "literal": 2543317,
+            "blob": 19746,
+            "array": 104158,
+            "region control": 717972,
+            "structure": 75096,
+            "request/association": 28942,
+            "source": 0,
+            "framing": 2000,
+            "other": 250
+          },
+          "tu": 250
+        },
+        {
+          "tus": 300,
+          "raw_bytes": 714654730,
+          "wire_bytes": 5638176,
+          "family_wire_bytes": {
+            "literal": 3224902,
+            "blob": 1273170,
+            "array": 125956,
+            "region control": 885503,
+            "structure": 92404,
+            "request/association": 33541,
+            "source": 0,
+            "framing": 2400,
+            "other": 300
+          },
+          "tu": 300
+        },
+        {
+          "tus": 400,
+          "raw_bytes": 1066216412,
+          "wire_bytes": 6471293,
+          "family_wire_bytes": {
+            "literal": 3886533,
+            "blob": 1273170,
+            "array": 125956,
+            "region control": 1022767,
+            "structure": 118052,
+            "request/association": 41215,
+            "source": 0,
+            "framing": 3200,
+            "other": 400
+          },
+          "tu": 400
+        },
+        {
+          "tus": 500,
+          "raw_bytes": 1440740451,
+          "wire_bytes": 7109817,
+          "family_wire_bytes": {
+            "literal": 4377181,
+            "blob": 1273170,
+            "array": 125956,
+            "region control": 1139461,
+            "structure": 141100,
+            "request/association": 48449,
+            "source": 0,
+            "framing": 4000,
+            "other": 500
+          },
+          "tu": 500
+        },
+        {
+          "tus": 2207,
+          "raw_bytes": 5932762185,
+          "wire_bytes": 39589524,
+          "family_wire_bytes": {
+            "literal": 13672703,
+            "blob": 14617593,
+            "array": 6246413,
+            "region control": 4164025,
+            "structure": 616954,
+            "request/association": 251973,
+            "source": 0,
+            "framing": 17656,
+            "other": 2207
+          },
+          "tu": 2207
+        }
+      ],
+      "bands": [
+        {
+          "tus": 50,
+          "raw_bytes": 107803623,
+          "wire_bytes": 1059470,
+          "family_wire_bytes": {
+            "literal": 739616,
+            "blob": 19746,
+            "array": 422,
+            "region control": 267861,
+            "structure": 21795,
+            "request/association": 9580,
+            "source": 0,
+            "framing": 400,
+            "other": 50
+          },
+          "first_tu": 1,
+          "last_tu": 50
+        },
+        {
+          "tus": 50,
+          "raw_bytes": 96636441,
+          "wire_bytes": 302565,
+          "family_wire_bytes": {
+            "literal": 198092,
+            "blob": 0,
+            "array": 0,
+            "region control": 91009,
+            "structure": 9548,
+            "request/association": 3466,
+            "source": 0,
+            "framing": 400,
+            "other": 50
+          },
+          "first_tu": 51,
+          "last_tu": 100
+        },
+        {
+          "tus": 50,
+          "raw_bytes": 74992128,
+          "wire_bytes": 192185,
+          "family_wire_bytes": {
+            "literal": 128648,
+            "blob": 0,
+            "array": 41,
+            "region control": 51748,
+            "structure": 8567,
+            "request/association": 2731,
+            "source": 0,
+            "framing": 400,
+            "other": 50
+          },
+          "first_tu": 101,
+          "last_tu": 150
+        },
+        {
+          "tus": 50,
+          "raw_bytes": 103213393,
+          "wire_bytes": 817993,
+          "family_wire_bytes": {
+            "literal": 582167,
+            "blob": 0,
+            "array": 103632,
+            "region control": 116453,
+            "structure": 11781,
+            "request/association": 3510,
+            "source": 0,
+            "framing": 400,
+            "other": 50
+          },
+          "first_tu": 151,
+          "last_tu": 200
+        },
+        {
+          "tus": 50,
+          "raw_bytes": 146621755,
+          "wire_bytes": 1119268,
+          "family_wire_bytes": {
+            "literal": 894794,
+            "blob": 0,
+            "array": 63,
+            "region control": 190901,
+            "structure": 23405,
+            "request/association": 9655,
+            "source": 0,
+            "framing": 400,
+            "other": 50
+          },
+          "first_tu": 201,
+          "last_tu": 250
+        },
+        {
+          "tus": 50,
+          "raw_bytes": 185387390,
+          "wire_bytes": 2146695,
+          "family_wire_bytes": {
+            "literal": 681585,
+            "blob": 1253424,
+            "array": 21798,
+            "region control": 167531,
+            "structure": 17308,
+            "request/association": 4599,
+            "source": 0,
+            "framing": 400,
+            "other": 50
+          },
+          "first_tu": 251,
+          "last_tu": 300
+        },
+        {
+          "tus": 100,
+          "raw_bytes": 351561682,
+          "wire_bytes": 833117,
+          "family_wire_bytes": {
+            "literal": 661631,
+            "blob": 0,
+            "array": 0,
+            "region control": 137264,
+            "structure": 25648,
+            "request/association": 7674,
+            "source": 0,
+            "framing": 800,
+            "other": 100
+          },
+          "first_tu": 301,
+          "last_tu": 400
+        },
+        {
+          "tus": 100,
+          "raw_bytes": 374524039,
+          "wire_bytes": 638524,
+          "family_wire_bytes": {
+            "literal": 490648,
+            "blob": 0,
+            "array": 0,
+            "region control": 116694,
+            "structure": 23048,
+            "request/association": 7234,
+            "source": 0,
+            "framing": 800,
+            "other": 100
+          },
+          "first_tu": 401,
+          "last_tu": 500
+        },
+        {
+          "tus": 1707,
+          "raw_bytes": 4492021734,
+          "wire_bytes": 32479707,
+          "family_wire_bytes": {
+            "literal": 9295522,
+            "blob": 13344423,
+            "array": 6120457,
+            "region control": 3024564,
+            "structure": 475854,
+            "request/association": 203524,
+            "source": 0,
+            "framing": 13656,
+            "other": 1707
+          },
+          "first_tu": 501,
+          "last_tu": 2207
+        }
+      ],
+      "per_tu_wire_distribution": {
+        "p50_bytes": 3024,
+        "p90_bytes": 18873,
+        "p99_bytes": 112071,
+        "max_bytes": 10482245
+      },
+      "top_tus": [
+        {
+          "tu": 526,
+          "raw_bytes": 102633493,
+          "wire_bytes": 10482245,
+          "family_wire_bytes": {
+            "literal": 427,
+            "blob": 10178658,
+            "array": 302787,
+            "region control": 245,
+            "structure": 86,
+            "request/association": 33,
+            "source": 0,
+            "framing": 8,
+            "other": 1
+          }
+        },
+        {
+          "tu": 889,
+          "raw_bytes": 24534966,
+          "wire_bytes": 2952776,
+          "family_wire_bytes": {
+            "literal": 54875,
+            "blob": 0,
+            "array": 2887901,
+            "region control": 8683,
+            "structure": 993,
+            "request/association": 315,
+            "source": 0,
+            "framing": 8,
+            "other": 1
+          }
+        },
+        {
+          "tu": 519,
+          "raw_bytes": 15072061,
+          "wire_bytes": 2753066,
+          "family_wire_bytes": {
+            "literal": 4258,
+            "blob": 0,
+            "array": 2747743,
+            "region control": 779,
+            "structure": 207,
+            "request/association": 70,
+            "source": 0,
+            "framing": 8,
+            "other": 1
+          }
+        },
+        {
+          "tu": 532,
+          "raw_bytes": 25229237,
+          "wire_bytes": 2373060,
+          "family_wire_bytes": {
+            "literal": 837,
+            "blob": 2296709,
+            "array": 75020,
+            "region control": 379,
+            "structure": 76,
+            "request/association": 30,
+            "source": 0,
+            "framing": 8,
+            "other": 1
+          }
+        },
+        {
+          "tu": 258,
+          "raw_bytes": 12057749,
+          "wire_bytes": 1327711,
+          "family_wire_bytes": {
+            "literal": 42315,
+            "blob": 1253424,
+            "array": 21714,
+            "region control": 9442,
+            "structure": 658,
+            "request/association": 149,
+            "source": 0,
+            "framing": 8,
+            "other": 1
+          }
+        },
+        {
+          "tu": 536,
+          "raw_bytes": 7985337,
+          "wire_bytes": 723799,
+          "family_wire_bytes": {
+            "literal": 560,
+            "blob": 698540,
+            "array": 24328,
+            "region control": 248,
+            "structure": 84,
+            "request/association": 30,
+            "source": 0,
+            "framing": 8,
+            "other": 1
+          }
+        },
+        {
+          "tu": 1535,
+          "raw_bytes": 4010724,
+          "wire_bytes": 395314,
+          "family_wire_bytes": {
+            "literal": 357363,
+            "blob": 0,
+            "array": 843,
+            "region control": 32194,
+            "structure": 2610,
+            "request/association": 2295,
+            "source": 0,
+            "framing": 8,
+            "other": 1
+          }
+        },
+        {
+          "tu": 1,
+          "raw_bytes": 2364113,
+          "wire_bytes": 340345,
+          "family_wire_bytes": {
+            "literal": 206319,
+            "blob": 0,
+            "array": 0,
+            "region control": 122544,
+            "structure": 7279,
+            "request/association": 4194,
+            "source": 0,
+            "framing": 8,
+            "other": 1
+          }
+        },
+        {
+          "tu": 1669,
+          "raw_bytes": 3103089,
+          "wire_bytes": 252927,
+          "family_wire_bytes": {
+            "literal": 201015,
+            "blob": 0,
+            "array": 33,
+            "region control": 45834,
+            "structure": 4033,
+            "request/association": 2003,
+            "source": 0,
+            "framing": 8,
+            "other": 1
+          }
+        },
+        {
+          "tu": 215,
+          "raw_bytes": 4039995,
+          "wire_bytes": 249201,
+          "family_wire_bytes": {
+            "literal": 218637,
+            "blob": 0,
+            "array": 0,
+            "region control": 28398,
+            "structure": 1362,
+            "request/association": 795,
+            "source": 0,
+            "framing": 8,
+            "other": 1
+          }
+        }
+      ]
+    }
+  ],
+  "precomputed": {
+    "schema": "precomputed-material-lane-ceiling-v1",
+    "accounting": {
+      "order": "canonical manifest order",
+      "unit": "one complete archive per material lane over the full build",
+      "projection": "replace only measured P29 material-lane wire; retain every other exact P29 byte",
+      "decoder_status": "each lane archive independently decoded and SHA-256 verified; complete projected layout not yet integrated",
+      "receiver_start": "empty",
+      "installed_package_bytes": 0
+    },
+    "codecs": {
+      "zstd19_long": "zstd 1.5.7 -19 --long=31 -T1",
+      "zpaq_m3": "ZPAQ 7.15 method level 3 at commit 9ab539f644e364f0d92e2918b90ce2534c75653f",
+      "zpaq_m4": "ZPAQ 7.15 method level 4 at commit 9ab539f644e364f0d92e2918b90ce2534c75653f",
+      "zpaq_m5": "ZPAQ 7.15 method level 5 at commit 9ab539f644e364f0d92e2918b90ce2534c75653f"
+    },
+    "corpora": [
+      {
+        "name": "DuckDB",
+        "tus": 689,
+        "whole_ii_z19_bytes": 7167012,
+        "cold_gate_bytes": 7883713,
+        "current_complete_wire_bytes": 9589726,
+        "fixed_wire_bytes": 1135034,
+        "lanes": [
+          {
+            "name": "region control",
+            "raw_component": "region_control",
+            "wire_components": [
+              "region_control",
+              "region_other"
+            ],
+            "raw_bytes": 4810857,
+            "raw_sha256": "4c9b656da9ce5aa06ce113ba804134334bb99c131830c4fbd002784017fc26bd",
+            "current_wire_bytes": 2016440,
+            "candidate_bytes": {
+              "zstd19_long": 1693733,
+              "zpaq_m3": 1637334,
+              "zpaq_m4": 1383485,
+              "zpaq_m5": 1250919
+            },
+            "decoded_sha256_verified": true
+          },
+          {
+            "name": "literal",
+            "raw_component": "literal",
+            "wire_components": [
+              "literal"
+            ],
+            "raw_bytes": 31439473,
+            "raw_sha256": "263157e32ec56f374770da42290eec8abb9baefb12322dca645f7b3090a6c372",
+            "current_wire_bytes": 5118367,
+            "candidate_bytes": {
+              "zstd19_long": 3547566,
+              "zpaq_m3": 3423243,
+              "zpaq_m4": 2657612,
+              "zpaq_m5": 2372254
+            },
+            "decoded_sha256_verified": true
+          },
+          {
+            "name": "array control",
+            "raw_component": "array_control",
+            "wire_components": [
+              "array_control"
+            ],
+            "raw_bytes": 220290,
+            "raw_sha256": "77c1ff40ff42ee81bc60ab24c26eb94df1cc96b0bd939617ba2eebd873db5fca",
+            "current_wire_bytes": 12001,
+            "candidate_bytes": {
+              "zstd19_long": 8898,
+              "zpaq_m3": 7888,
+              "zpaq_m4": 7888,
+              "zpaq_m5": 7143
+            },
+            "decoded_sha256_verified": true
+          },
+          {
+            "name": "array values",
+            "raw_component": "array_values",
+            "wire_components": [
+              "array_values"
+            ],
+            "raw_bytes": 3701352,
+            "raw_sha256": "c50a6a33b57aed6b35f5921499670dc8d93339e34c75c43fb7e547f4a5797f3d",
+            "current_wire_bytes": 1307884,
+            "candidate_bytes": {
+              "zstd19_long": 1109514,
+              "zpaq_m3": 1141994,
+              "zpaq_m4": 944988,
+              "zpaq_m5": 879914
+            },
+            "decoded_sha256_verified": true
+          }
+        ],
+        "projections": {
+          "current_causal": 9589726,
+          "zpaq_m3": 7345493,
+          "zpaq_m4": 6129007,
+          "zpaq_m5": 5645264,
+          "zstd19_long": 7494745,
+          "best_zstd19_or_m3_per_lane": 7313013
+        },
+        "projection_over_whole_ii_z19": {
+          "current_causal": 1.3380368276207715,
+          "zpaq_m3": 1.024903125598227,
+          "zpaq_m4": 0.8551690718530959,
+          "zpaq_m5": 0.7876733009516379,
+          "zstd19_long": 1.0457279825958155,
+          "best_zstd19_or_m3_per_lane": 1.0203712509480938
+        },
+        "projection_delta_to_gate": {
+          "current_causal": 1706013,
+          "zpaq_m3": -538220,
+          "zpaq_m4": -1754706,
+          "zpaq_m5": -2238449,
+          "zstd19_long": -388968,
+          "best_zstd19_or_m3_per_lane": -570700
+        }
+      },
+      {
+        "name": "Godot",
+        "tus": 2207,
+        "whole_ii_z19_bytes": 58289521,
+        "cold_gate_bytes": 64118473,
+        "current_complete_wire_bytes": 39589524,
+        "fixed_wire_bytes": 888790,
+        "lanes": [
+          {
+            "name": "region control",
+            "raw_component": "region_control",
+            "wire_components": [
+              "region_control",
+              "region_other"
+            ],
+            "raw_bytes": 10142549,
+            "raw_sha256": "6b74fbee767f53fb2cc6766c8a90361ca741a4b66a9e3ed5075ec182328967d2",
+            "current_wire_bytes": 4164025,
+            "candidate_bytes": {
+              "zstd19_long": 3449533,
+              "zpaq_m3": 3235274,
+              "zpaq_m4": 2790415,
+              "zpaq_m5": 2497763
+            },
+            "decoded_sha256_verified": true
+          },
+          {
+            "name": "literal",
+            "raw_component": "literal",
+            "wire_components": [
+              "literal"
+            ],
+            "raw_bytes": 96195716,
+            "raw_sha256": "7356cc96e3d2dbf80068f2e38f143a7f2c8fadb7e124c79503e01897fffb1570",
+            "current_wire_bytes": 13672703,
+            "candidate_bytes": {
+              "zstd19_long": 9272575,
+              "zpaq_m3": 9241472,
+              "zpaq_m4": 6909348,
+              "zpaq_m5": 6169401
+            },
+            "decoded_sha256_verified": true
+          },
+          {
+            "name": "array control",
+            "raw_component": "array_control",
+            "wire_components": [
+              "array_control"
+            ],
+            "raw_bytes": 2981838,
+            "raw_sha256": "6327f5eb448165c4f83dcfbfaf6517bdf22c1dbbe354503be9eff3d70d8ea071",
+            "current_wire_bytes": 538609,
+            "candidate_bytes": {
+              "zstd19_long": 372203,
+              "zpaq_m3": 327576,
+              "zpaq_m4": 327576,
+              "zpaq_m5": 307733
+            },
+            "decoded_sha256_verified": true
+          },
+          {
+            "name": "array values",
+            "raw_component": "array_values",
+            "wire_components": [
+              "array_values"
+            ],
+            "raw_bytes": 7780568,
+            "raw_sha256": "4917e6a8df329ddddcfb183f25d8d8d2c9aded524cfd0727f5268a477804c244",
+            "current_wire_bytes": 5707804,
+            "candidate_bytes": {
+              "zstd19_long": 5387926,
+              "zpaq_m3": 5233878,
+              "zpaq_m4": 5059346,
+              "zpaq_m5": 4844578
+            },
+            "decoded_sha256_verified": true
+          },
+          {
+            "name": "inflated embedded blobs",
+            "raw_component": "blob",
+            "wire_components": [
+              "blob",
+              "blob_patch"
+            ],
+            "raw_bytes": 124407478,
+            "raw_sha256": "a9d6dcaad60e209d73486267765d285738de12e1c52c13e178588a156d580b20",
+            "current_wire_bytes": 14617593,
+            "candidate_bytes": {
+              "zstd19_long": 12961679,
+              "zpaq_m3": 14330468,
+              "zpaq_m4": 11630246,
+              "zpaq_m5": 10513795
+            },
+            "decoded_sha256_verified": true
+          }
+        ],
+        "projections": {
+          "current_causal": 39589524,
+          "zpaq_m3": 33257458,
+          "zpaq_m4": 27605721,
+          "zpaq_m5": 25222060,
+          "zstd19_long": 32332706,
+          "best_zstd19_or_m3_per_lane": 31888669
+        },
+        "projection_over_whole_ii_z19": {
+          "current_causal": 0.6791876707993535,
+          "zpaq_m3": 0.5705563783926102,
+          "zpaq_m4": 0.47359663497663673,
+          "zpaq_m5": 0.4327031611736868,
+          "zstd19_long": 0.5546915714061195,
+          "best_zstd19_or_m3_per_lane": 0.5470737870705783
+        },
+        "projection_delta_to_gate": {
+          "current_causal": -24528949,
+          "zpaq_m3": -30861015,
+          "zpaq_m4": -36512752,
+          "zpaq_m5": -38896413,
+          "zstd19_long": -31785767,
+          "best_zstd19_or_m3_per_lane": -32229804
+        }
+      }
+    ]
+  }
+}

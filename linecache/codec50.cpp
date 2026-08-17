@@ -620,9 +620,49 @@ struct RelLZ {
     uint64_t store_bytes() const { return store.size(); }
 };
 
+enum ComponentWirePart : size_t {
+    CW_ROOT,
+    CW_BLOCK,
+    CW_PATH,
+    CW_FRAMING,
+    CW_REGION_CONTROL,
+    CW_REGION_OTHER,
+    CW_LITERAL,
+    CW_ARRAY_CONTROL,
+    CW_ARRAY_VALUES,
+    CW_SOURCE_CONTROL,
+    CW_SOURCE_FILES,
+    CW_SELECTOR,
+    CW_BLOB,
+    CW_BLOB_PATCH,
+    CW_LINE_OTHER,
+    CW_ASSOCIATION,
+    CW_MISSING_REQUEST,
+    CW_BLOB_FALLBACK_REQUEST,
+    CW_BLOB_FALLBACK_REPLY,
+    CW_MISSING_OTHER,
+    CW_COUNT,
+};
+
+static constexpr std::array<const char*,CW_COUNT> componentWireNames={
+    "root_wire_bytes","block_wire_bytes","path_wire_bytes","framing_wire_bytes",
+    "region_control_wire_bytes","region_other_wire_bytes","literal_wire_bytes",
+    "array_control_wire_bytes","array_values_wire_bytes","source_control_wire_bytes",
+    "source_files_wire_bytes","selector_wire_bytes","blob_wire_bytes",
+    "blob_patch_wire_bytes","line_other_wire_bytes","association_wire_bytes",
+    "missing_request_wire_bytes","blob_fallback_request_wire_bytes",
+    "blob_fallback_reply_wire_bytes","missing_other_wire_bytes",
+};
+
+static constexpr std::array<const char*,8> componentRawNames={
+    "region_control_raw_bytes","literal_raw_bytes","array_control_raw_bytes",
+    "array_values_raw_bytes","source_control_raw_bytes","source_files_raw_bytes",
+    "blob_raw_bytes","blob_patch_raw_bytes",
+};
+
 int main(int argc,char**argv){
     const char* manifest=nullptr;const char*residualDumpPath=nullptr;const char*mixedDumpPrefix=nullptr;const char*curveTsvPath=nullptr; size_t max_files=SIZE_MAX,entropyRestartTus=0,replayRepetitions=1; int zlevel=3,literalZLevel=-1,arrayZLevel=-1,blobZLevel=-1,halfColdBit=-1,blobCanonicalLevel=9; uint32_t sourceAdmitRatio=6,blobThreads=4,blobZstdWorkers=0,blobZstdJobMiB=0,blobZstdOverlapLog=0,blobFallbackEvery=0,s1MinMatch=3,s1MaxChain=1024; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, usePriorRoot=false, useSortedLines=false, useByteArrayLines=false, useMixedRegions=false,useProjectSource=false,useKeyMap=false,useDirectOrdinals=false,useCompressedBlobs=false,useBlobEagerPatches=true,useMoFactor=false,traceMo=false,useAlphaLines=false,useResidualLdm=false,splitControlCeiling=false,structureCeiling=false;
-    const char*blobDumpPath=nullptr;
+    const char*blobDumpPath=nullptr;const char*componentCurveTsvPath=nullptr;
     for(int i=1;i<argc;++i){ if(!strcmp(argv[i],"--manifest")&&i+1<argc)manifest=argv[++i];
         else if(!strcmp(argv[i],"--z")&&i+1<argc)zlevel=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--literal-z")&&i+1<argc){char*end=nullptr;long value=strtol(argv[++i],&end,10);if(!end||*end||value<1||value>9){fprintf(stderr,"bad literal zstd level\n");return 2;}literalZLevel=int(value);}
@@ -645,6 +685,7 @@ int main(int argc,char**argv){
         else if(!strcmp(argv[i],"--blob-dump")&&i+1<argc)blobDumpPath=argv[++i];
         else if(!strcmp(argv[i],"--mixed-dump-prefix")&&i+1<argc)mixedDumpPrefix=argv[++i];
         else if(!strcmp(argv[i],"--curve-tsv")&&i+1<argc)curveTsvPath=argv[++i];
+        else if(!strcmp(argv[i],"--component-curve-tsv")&&i+1<argc)componentCurveTsvPath=argv[++i];
         else if(!strcmp(argv[i],"--split-control-ceiling"))splitControlCeiling=true;
         else if(!strcmp(argv[i],"--structure-ceiling"))structureCeiling=true;
         else if(!strcmp(argv[i],"--s1-min-match")&&i+1<argc){char*end=nullptr;unsigned long value=strtoul(argv[++i],&end,10);if(!end||*end||value<2||value>16){fprintf(stderr,"bad S1 minimum match\n");return 2;}s1MinMatch=uint32_t(value);}
@@ -667,7 +708,7 @@ int main(int argc,char**argv){
         else if((!strcmp(argv[i],"--entropy-restart-tus")||!strcmp(argv[i],"--build-tus"))&&i+1<argc){ char*t=nullptr; unsigned long long v=strtoull(argv[++i],&t,10); if(!t||*t||!v||v>SIZE_MAX){fprintf(stderr,"bad entropy restart TU count\n");return 2;} entropyRestartTus=size_t(v); }
         else if((!strcmp(argv[i],"--replay-repetitions")||!strcmp(argv[i],"--build-repetitions"))&&i+1<argc){ char*t=nullptr; unsigned long long v=strtoull(argv[++i],&t,10); if(!t||*t||!v||v>SIZE_MAX){fprintf(stderr,"bad replay repetition count\n");return 2;} replayRepetitions=size_t(v); }
         else { fprintf(stderr,"unknown %s\n",argv[i]); return 2; } }
-    if(!manifest){ fprintf(stderr,"usage: %s --manifest F [--z LEVEL] [--literal-z 1..9] [--array-z 1..9] [--blob-z 1..9] [--no-d1] [--d2] [--prior-root] [--structure-ceiling] [--s1-min-match N] [--s1-max-chain N] [--sorted-lines|--byte-array-lines|--mixed-regions [--alpha-lines|--residual-ldm] [--residual-dump PATH] [--mixed-dump-prefix PATH] [--split-control-ceiling] [--compressed-blobs [--mo-factor [--mo-trace]] [--blob-threads N] [--blob-zstd-workers N --blob-zstd-job-mib N --blob-zstd-overlap-log N] [--blob-fallback-every N] [--blob-lazy-fallback] [--blob-canonical-level 1..9] [--blob-dump PATH]] [--key-map|--direct-ordinals|--half-cold-bit 0|1] [--source-package [--source-admit-ratio N]]] [--max-files N] [--replay-repetitions N] [--entropy-restart-tus N] [--curve-tsv PATH]\n",argv[0]); return 2; }
+    if(!manifest){ fprintf(stderr,"usage: %s --manifest F [--z LEVEL] [--literal-z 1..9] [--array-z 1..9] [--blob-z 1..9] [--no-d1] [--d2] [--prior-root] [--structure-ceiling] [--s1-min-match N] [--s1-max-chain N] [--sorted-lines|--byte-array-lines|--mixed-regions [--alpha-lines|--residual-ldm] [--residual-dump PATH] [--mixed-dump-prefix PATH] [--split-control-ceiling] [--compressed-blobs [--mo-factor [--mo-trace]] [--blob-threads N] [--blob-zstd-workers N --blob-zstd-job-mib N --blob-zstd-overlap-log N] [--blob-fallback-every N] [--blob-lazy-fallback] [--blob-canonical-level 1..9] [--blob-dump PATH]] [--key-map|--direct-ordinals|--half-cold-bit 0|1] [--source-package [--source-admit-ratio N]]] [--max-files N] [--replay-repetitions N] [--entropy-restart-tus N] [--curve-tsv PATH] [--component-curve-tsv PATH]\n",argv[0]); return 2; }
     if(useProjectSource&&!useMixedRegions){fprintf(stderr,"--source-package requires --mixed-regions\n");return 2;}
     if(useKeyMap&&!useMixedRegions){fprintf(stderr,"--key-map and --half-cold-bit require --mixed-regions\n");return 2;}
     if(useCompressedBlobs&&(!useMixedRegions||!useByteArrayLines)){fprintf(stderr,"--compressed-blobs requires --mixed-regions --byte-array-lines\n");return 2;}
@@ -846,6 +887,22 @@ int main(int argc,char**argv){
     // f-checkpoints + H200 trailing window
     std::vector<double> ck_f={0.10,0.25,0.50,0.75,1.00}; std::vector<std::pair<double,double>> ck; // (cum_raw_frac target hit -> ratio) recorded
     size_t ckidx=0; std::vector<double> perTU_raw(TUs), perTU_wire(TUs);
+    std::vector<std::array<double,CW_COUNT>>perTUComponentWire(TUs);
+    std::vector<std::array<uint64_t,8>>perTUComponentRaw(TUs);
+    auto componentWireSnapshot=[&](){
+      std::array<double,CW_COUNT>parts{};
+      parts[CW_ROOT]=w_root;parts[CW_BLOCK]=w_blockdef;parts[CW_PATH]=w_pathdef;parts[CW_FRAMING]=w_framing;
+      parts[CW_REGION_CONTROL]=mixedPartWire[0];parts[CW_REGION_OTHER]=w_regiondef-mixedPartWire[0];
+      parts[CW_LITERAL]=mixedPartWire[1];parts[CW_ARRAY_CONTROL]=mixedPartWire[2];parts[CW_ARRAY_VALUES]=mixedPartWire[3];
+      parts[CW_SOURCE_CONTROL]=mixedPartWire[4];parts[CW_SOURCE_FILES]=mixedPartWire[5];parts[CW_SELECTOR]=mixedSelectorWire;
+      parts[CW_BLOB]=mixedBlobWire;parts[CW_BLOB_PATCH]=mixedBlobPatchWire;
+      parts[CW_LINE_OTHER]=w_linedef-mixedPartWire[1]-mixedPartWire[2]-mixedPartWire[3]-mixedPartWire[4]-mixedPartWire[5]
+          -mixedSelectorWire-mixedBlobWire-mixedBlobPatchWire;
+      parts[CW_ASSOCIATION]=mixedAssociationWire;parts[CW_MISSING_REQUEST]=mixedMissingRequestWire;
+      parts[CW_BLOB_FALLBACK_REQUEST]=mixedBlobFallbackRequestWire;parts[CW_BLOB_FALLBACK_REPLY]=mixedBlobFallbackReplyWire;
+      parts[CW_MISSING_OTHER]=w_missing-mixedAssociationWire-mixedMissingRequestWire-mixedBlobFallbackRequestWire-mixedBlobFallbackReplyWire;
+      return parts;
+    };
     // decoder-side reconstruction store: line bytes (F), region->line composition (F)
     // F re-derives line bytes from the defs it receives; we verify against the interner's truth.
     Marker mk; std::vector<uint8_t> segbuf, msg, recon, tmp, expectbuf;
@@ -882,6 +939,7 @@ int main(int argc,char**argv){
         w_root=w_linedef=w_regiondef=w_pathdef=w_blockdef=w_missing=w_framing=0; cum_raw=0; cum_wire=0; n_marker=n_literal=0; byteexact=true;
         ck.clear(); ckidx=0; allLineDefs.clear(); allRoots.clear(); allRegions.clear(); allRegionsRaw.clear(); allBlocks.clear(); allPaths.clear(); allMiss.clear();
       }
+      std::array<double,CW_COUNT>previousComponentWire=componentWireSnapshot();
       auto tpass=Clock::now(); double enc_s=0, dec_s=0,fallback_c_s=0;   // split C-encode vs F-decode wall (2-proc per-stream proxy)
       for(size_t t=0; t<TUs; ++t){
         auto _te=Clock::now();
@@ -1677,6 +1735,16 @@ int main(int argc,char**argv){
         if(recon.size()!=olen || memcmp(recon.data(),orig,olen)!=0){ byteexact=false; if(t<5||TUs<10) fprintf(stderr,"BYTE-EXACT FAIL TU %zu (%zu vs %u)\n",t,recon.size(),olen); }
         cum_raw += olen;
         double cur_wire = w_root+w_linedef+w_regiondef+w_pathdef+w_blockdef+w_missing+w_framing;
+        std::array<double,CW_COUNT>currentComponentWire=componentWireSnapshot();double componentWireTotal=0;
+        for(size_t part=0;part<CW_COUNT;++part){
+          double delta=currentComponentWire[part]-previousComponentWire[part];
+          if(delta<0){fprintf(stderr,"negative component wire delta TU=%zu part=%s value=%.0f\n",t,componentWireNames[part],delta);return 2;}
+          perTUComponentWire[t][part]=delta;componentWireTotal+=delta;
+        }
+        previousComponentWire=currentComponentWire;
+        for(size_t part=0;part<6;++part)perTUComponentRaw[t][part]=mixedRaw[part].size();
+        perTUComponentRaw[t][6]=blobRaw.size();perTUComponentRaw[t][7]=blobPatchRaw.size();
+        if(std::fabs(componentWireTotal-(cur_wire-cum_wire))>0.5){fprintf(stderr,"component wire total differs TU=%zu parts=%.0f total=%.0f\n",t,componentWireTotal,cur_wire-cum_wire);return 2;}
         perTU_raw[t]=olen; perTU_wire[t]=cur_wire - cum_wire; cum_wire=cur_wire;
         while(ckidx<ck_f.size() && double(cum_raw)>=ck_f[ckidx]*corpus.raw){ ck.push_back({ck_f[ckidx], double(cum_raw)/cum_wire}); ++ckidx; }
       }
@@ -1861,6 +1929,27 @@ int main(int argc,char**argv){
       if(std::fabs(double(curveRaw)-double(cum_raw))>0.5||std::fabs(double(curveWire)-cum_wire)>0.5){fprintf(stderr,"curve TSV total differs\n");fclose(curve);return 2;}
       if(fclose(curve)!=0){perror(curveTsvPath);return 2;}
       printf("per-TU curve: %s rows=%zu cumulative_raw=%llu cumulative_wire=%llu\n",curveTsvPath,TUs,
+          (unsigned long long)curveRaw,(unsigned long long)curveWire);
+    }
+    if(componentCurveTsvPath){
+      FILE*curve=fopen(componentCurveTsvPath,"wb");if(!curve){perror(componentCurveTsvPath);return 2;}
+      if(fprintf(curve,"tu\traw_bytes\twire_bytes")<0){fprintf(stderr,"component curve header write failed\n");fclose(curve);return 2;}
+      for(const char*name:componentRawNames)if(fprintf(curve,"\t%s",name)<0){fprintf(stderr,"component raw header write failed\n");fclose(curve);return 2;}
+      for(const char*name:componentWireNames)if(fprintf(curve,"\t%s",name)<0){fprintf(stderr,"component wire header write failed\n");fclose(curve);return 2;}
+      if(fprintf(curve,"\tcumulative_raw_bytes\tcumulative_wire_bytes\texact\n")<0){fprintf(stderr,"component curve header finish failed\n");fclose(curve);return 2;}
+      uint64_t curveRaw=0,curveWire=0;
+      for(size_t t=0;t<TUs;++t){
+        const uint64_t raw=uint64_t(perTU_raw[t]),wire=uint64_t(std::llround(perTU_wire[t]));curveRaw+=raw;curveWire+=wire;
+        if(fprintf(curve,"%zu\t%llu\t%llu",t+1,(unsigned long long)raw,(unsigned long long)wire)<0){fprintf(stderr,"component curve prefix write failed\n");fclose(curve);return 2;}
+        for(uint64_t value:perTUComponentRaw[t])if(fprintf(curve,"\t%llu",(unsigned long long)value)<0){fprintf(stderr,"component raw row write failed\n");fclose(curve);return 2;}
+        uint64_t componentWire=0;
+        for(double value:perTUComponentWire[t]){uint64_t rounded=uint64_t(std::llround(value));componentWire+=rounded;if(fprintf(curve,"\t%llu",(unsigned long long)rounded)<0){fprintf(stderr,"component wire row write failed\n");fclose(curve);return 2;}}
+        if(componentWire!=wire){fprintf(stderr,"component curve row total differs TU=%zu parts=%llu wire=%llu\n",t,(unsigned long long)componentWire,(unsigned long long)wire);fclose(curve);return 2;}
+        if(fprintf(curve,"\t%llu\t%llu\t%s\n",(unsigned long long)curveRaw,(unsigned long long)curveWire,byteexact?"true":"false")<0){fprintf(stderr,"component curve suffix write failed\n");fclose(curve);return 2;}
+      }
+      if(std::fabs(double(curveRaw)-double(cum_raw))>0.5||std::fabs(double(curveWire)-cum_wire)>0.5){fprintf(stderr,"component curve total differs\n");fclose(curve);return 2;}
+      if(fclose(curve)!=0){perror(componentCurveTsvPath);return 2;}
+      printf("per-TU component curve: %s rows=%zu cumulative_raw=%llu cumulative_wire=%llu\n",componentCurveTsvPath,TUs,
           (unsigned long long)curveRaw,(unsigned long long)curveWire);
     }
     // trailing-window (5% raw) ratio near the end
