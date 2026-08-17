@@ -172,13 +172,17 @@ The archive harness does not assume one model.  At minimum evaluate:
 E0  empty online state
 R0  raw-source-trained zstd dictionary on the residual literal lane
 I0  .ii-trained zstd dictionaries on homogeneous streams
+I1  .ii-trained immutable whole-TU raw-content prefix (cross-Line byte-history control)
 S0  pre-shared parameterized cross-Line superblocks
 S1  S0 plus causal project-local online superblocks
 M0  encoder-only candidate/rule ranker over S1
 ```
 
-`R0`/`I0` are controls.  They mostly capture short byte contexts.  The principal candidate is
-`S0`/`S1`, whose installed package contains decoder-executable rules:
+`R0`/`I0` are short-context controls.  `I1` is built from complete ordered training TUs rather
+than isolated Line samples and is rebound as immutable history for each target TU.  It measures
+literal cross-Line recurrence without claiming parameterized structure; training/test project and
+profile exclusions remain unchanged.  The principal candidate is `S0`/`S1`, whose installed
+package contains decoder-executable rules:
 
 ```text
 SUPERBLOCK_RULE {
