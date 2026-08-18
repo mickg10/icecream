@@ -1,0 +1,12 @@
+payload=native-manifest sha=n/a
+zstd3=OK
+fused=OK verify=PASS
+grz2_pass1=OK wire=401210 decode=EXACT
+p29_pass1=OK wire=436132 endpoint=MATCH byte_exact=OK
+grz2_pass2=OK wire=401931 decode=EXACT
+p29_pass2=OK wire=439130 endpoint=MATCH byte_exact=OK
+grz2_pass3=OK wire=402507 decode=EXACT
+p29_pass3=OK wire=440210 endpoint=MATCH byte_exact=OK
+grz2_pass4=OK wire=403221 decode=EXACT
+p29_pass4=OK wire=441290 endpoint=MATCH byte_exact=OK
+PASS corpus13.native tus_per_pass=72 grz2=[401210 401931 402507 403221] p29=[436132 439130 440210 441290]

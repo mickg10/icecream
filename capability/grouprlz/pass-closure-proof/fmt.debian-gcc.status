@@ -1,0 +1,12 @@
+payload=ii.tar.zst sha=OK tu_count=51
+zstd3=OK
+fused=OK verify=PASS
+grz2_pass1=OK wire=665724 decode=EXACT
+p29_pass1=OK wire=1006187 endpoint=MATCH byte_exact=OK
+grz2_pass2=OK wire=666155 decode=EXACT
+p29_pass2=OK wire=1007953 endpoint=MATCH byte_exact=OK
+grz2_pass3=OK wire=666701 decode=EXACT
+p29_pass3=OK wire=1008718 endpoint=MATCH byte_exact=OK
+grz2_pass4=OK wire=667109 decode=EXACT
+p29_pass4=OK wire=1009483 endpoint=MATCH byte_exact=OK
+PASS fmt.debian-gcc tus_per_pass=51 grz2=[665724 666155 666701 667109] p29=[1006187 1007953 1008718 1009483]

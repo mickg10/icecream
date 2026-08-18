@@ -1,0 +1,12 @@
+payload=ii.tar.zst sha=OK tu_count=80
+zstd3=OK
+fused=OK verify=PASS
+grz2_pass1=OK wire=374637 decode=EXACT
+p29_pass1=OK wire=466708 endpoint=MATCH byte_exact=OK
+grz2_pass2=OK wire=375426 decode=EXACT
+p29_pass2=OK wire=468060 endpoint=MATCH byte_exact=OK
+grz2_pass3=OK wire=376214 decode=EXACT
+p29_pass3=OK wire=469186 endpoint=MATCH byte_exact=OK
+grz2_pass4=OK wire=376855 decode=EXACT
+p29_pass4=OK wire=470312 endpoint=MATCH byte_exact=OK
+PASS cereal.debian-gcc tus_per_pass=80 grz2=[374637 375426 376214 376855] p29=[466708 468060 469186 470312]
