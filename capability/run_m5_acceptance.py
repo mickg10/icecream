@@ -871,8 +871,7 @@ def onepass_specs(corpus_root: Path, selected: set[str]) -> list[RunSpec]:
                 str(workers),
                 "--wave",
                 str(workers),
-            )
-            + (("--queue-depth", str(workers)) if workers > 16 else ()),
+            ),
             one_pass=True,
         )
         for workers in (1, 4, 16, 32)

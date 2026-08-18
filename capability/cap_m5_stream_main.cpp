@@ -51,11 +51,15 @@ using Clock = std::chrono::steady_clock;
 static double seconds_since(Clock::time_point begin) {
   return std::chrono::duration<double>(Clock::now() - begin).count();
 }
+static double seconds_between(Clock::time_point begin,
+                              Clock::time_point end) {
+  return std::chrono::duration<double>(end - begin).count();
+}
 
 struct Options {
   const char *manifest = nullptr;
   size_t max_files = SIZE_MAX;
-  uint32_t workers = 8, wave = 8, queue_depth = 16, raw_queue_depth = 2;
+  uint32_t workers = 8, wave = 8, queue_depth = 128, raw_queue_depth = 2;
   capp::CodecPolicy policy = capp::CodecPolicy::Zstd1;
   capm5::CacheLimits cache_limits;
   const char *curve_out = nullptr;
@@ -395,8 +399,7 @@ public:
                  std::vector<std::shared_ptr<PreparedTU>> &result) {
     std::unique_lock<std::mutex> lock(mutex_);
     readable_.wait(lock, [&] {
-      return failed_ || queue_.size() >= wanted ||
-             (finished_ && !queue_.empty()) || (finished_ && queue_.empty());
+      return failed_ || queue_.size() >= wanted || finished_;
     });
     if (failed_ || (finished_ && queue_.empty()))
       return false;
@@ -1316,7 +1319,13 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
     if (!relationshipExact)
       break;
 
-    phaseBegin = Clock::now();
+    const auto fillPipelineBegin = Clock::now();
+    double materializeWaveSeconds = 0;
+    std::vector<uint8_t> sent(pending.size(), 0);
+    std::vector<Clock::time_point> encodedAt(pending.size());
+    std::vector<std::thread> fillThreads;
+    fillThreads.reserve(pending.size());
+    size_t launched = 0;
     for (size_t index = 0; index < pending.size(); ++index) {
       auto &job = pending[index];
       auto &worker = workers[job.worker];
@@ -1359,65 +1368,63 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
       worker.mirror.path_count = uint32_t(encoder.paths.size());
       for (size_t part = 0; part < 4; ++part)
         encoder.mixedRaw[part].swap(fill.raw[part]);
-      transformSeconds += seconds_since(materializeBegin);
-    }
-    coordinatorTiming.materialize += seconds_since(phaseBegin);
-    if (!relationshipExact)
-      break;
-
-    auto encodeWaveBegin = Clock::now();
-    std::vector<std::thread> encoders;
-    encoders.reserve(pending.size());
-    for (size_t index = 0; index < pending.size(); ++index)
-      encoders.emplace_back([&, index] {
-        auto &fill = fills[index];
+      materializeWaveSeconds += seconds_since(materializeBegin);
+      fillThreads.emplace_back([&, index] {
+        auto &threadJob = pending[index];
+        auto &threadWorker = workers[threadJob.worker];
+        auto &threadFill = fills[index];
         auto &local = *fillCodecs[index];
-        fill.encoded_paths = capp::encode_component(
-            fill.paths, options.policy, local.z1, local.z3, true);
+        threadFill.encoded_paths = capp::encode_component(
+            threadFill.paths, options.policy, local.z1, local.z3, true);
         for (size_t part = 0; part < 4; ++part)
-          fill.encoded[part] = capp::encode_component(
-              fill.raw[part], options.policy, local.z1, local.z3, true);
+          threadFill.encoded[part] = capp::encode_component(
+              threadFill.raw[part], options.policy, local.z1, local.z3, true);
+        encodedAt[index] = Clock::now();
+        std::array<std::vector<uint8_t>, 6> mixed;
+        for (size_t part = 0; part < 4; ++part)
+          mixed[part] = threadFill.encoded[part].wire;
+        sent[index] = send_counted(
+            threadWorker.fd, cap::Frame::Fill,
+            capp::pack_fill_m4(threadJob.prepared->logical,
+                               threadFill.path_base,
+                               threadFill.public_base,
+                               threadFill.encoded_paths.wire, mixed, 4),
+            threadWorker.frames);
       });
-    for (auto &encoderThread : encoders)
-      encoderThread.join();
-    const double encodeWaveSeconds = seconds_since(encodeWaveBegin);
-    transformSeconds += encodeWaveSeconds;
-    coordinatorTiming.encode += encodeWaveSeconds;
-    for (size_t index = 0; index < pending.size(); ++index) {
+      ++launched;
+    }
+    for (auto &fillThread : fillThreads)
+      fillThread.join();
+    const auto fillPipelineEnd = Clock::now();
+    coordinatorTiming.materialize += materializeWaveSeconds;
+    double transformWaveSeconds = materializeWaveSeconds;
+    if (launched) {
+      auto lastEncoded = *std::max_element(encodedAt.begin(),
+                                           encodedAt.begin() + launched);
+      transformWaveSeconds = seconds_between(fillPipelineBegin, lastEncoded);
+    }
+    const double fillPipelineSeconds =
+        seconds_between(fillPipelineBegin, fillPipelineEnd);
+    transformSeconds += transformWaveSeconds;
+    coordinatorTiming.encode +=
+        std::max(0.0, transformWaveSeconds - materializeWaveSeconds);
+    coordinatorTiming.fill_send +=
+        std::max(0.0, fillPipelineSeconds - transformWaveSeconds);
+    for (size_t index = 0; index < launched; ++index) {
       const auto &fill = fills[index];
       components[CK_PATH].note(fill.encoded_paths);
       for (size_t part = 0; part < 4; ++part)
         components[CK_CONTROL + part].note(fill.encoded[part]);
     }
-
-    std::vector<uint8_t> sent(pending.size(), 0);
-    phaseBegin = Clock::now();
-    std::vector<std::thread> senders;
-    senders.reserve(pending.size());
-    for (size_t index = 0; index < pending.size(); ++index)
-      senders.emplace_back([&, index] {
-        auto &job = pending[index];
-        auto &worker = workers[job.worker];
-        auto &fill = fills[index];
-        std::array<std::vector<uint8_t>, 6> mixed;
-        for (size_t part = 0; part < 4; ++part)
-          mixed[part] = fill.encoded[part].wire;
-        sent[index] = send_counted(
-            worker.fd, cap::Frame::Fill,
-            capp::pack_fill_m4(job.prepared->logical, fill.path_base,
-                               fill.public_base, fill.encoded_paths.wire, mixed,
-                               4),
-            worker.frames);
-      });
-    for (auto &sender : senders)
-      sender.join();
-    coordinatorTiming.fill_send += seconds_since(phaseBegin);
-    if (std::find(sent.begin(), sent.end(), uint8_t(0)) != sent.end()) {
+    if (!relationshipExact || launched != pending.size() ||
+        std::find(sent.begin(), sent.end(), uint8_t(0)) != sent.end()) {
       relationshipExact = false;
       break;
     }
 
     std::vector<uint8_t> preparedReplies(pending.size(), 0);
+    size_t firstRejected = pending.size();
+    double decisionSeconds = 0;
     phaseBegin = Clock::now();
     for (size_t index = 0; index < pending.size(); ++index) {
       auto &job = pending[index];
@@ -1439,36 +1446,27 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
         break;
       }
       preparedReplies[index] = accepted ? 1 : 0;
-      if (accepted)
+      if (accepted) {
         ++preparedAccepted;
-      else
+        auto decisionBegin = Clock::now();
+        bool commit = firstRejected == pending.size();
+        if (!send_counted(worker.fd, cap::Frame::Ack,
+                          capp::pack_tu_ack(job.prepared->logical, commit),
+                          worker.frames)) {
+          relationshipExact = false;
+          break;
+        }
+        decisionSeconds += seconds_since(decisionBegin);
+      } else {
         ++decodeRejected;
-    }
-    coordinatorTiming.prepare_receive += seconds_since(phaseBegin);
-    if (!relationshipExact)
-      break;
-
-    size_t firstRejected = pending.size();
-    for (size_t index = 0; index < pending.size(); ++index)
-      if (!preparedReplies[index]) {
-        firstRejected = index;
-        break;
-      }
-    phaseBegin = Clock::now();
-    for (size_t index = 0; index < pending.size(); ++index) {
-      if (!preparedReplies[index])
-        continue;
-      auto &job = pending[index];
-      auto &worker = workers[job.worker];
-      bool commit = index < firstRejected;
-      if (!send_counted(worker.fd, cap::Frame::Ack,
-                        capp::pack_tu_ack(job.prepared->logical, commit),
-                        worker.frames)) {
-        relationshipExact = false;
-        break;
+        if (firstRejected == pending.size())
+          firstRejected = index;
       }
     }
-    coordinatorTiming.decision_send += seconds_since(phaseBegin);
+    const double prepareAndDecisionSeconds = seconds_since(phaseBegin);
+    coordinatorTiming.prepare_receive +=
+        std::max(0.0, prepareAndDecisionSeconds - decisionSeconds);
+    coordinatorTiming.decision_send += decisionSeconds;
     if (!relationshipExact)
       break;
 
