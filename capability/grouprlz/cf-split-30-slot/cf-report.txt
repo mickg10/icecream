@@ -1,0 +1,38 @@
+HOW MUCH OF THE WIRE IS C->F AT ALL  (the rest is Need + the F side's Acks)
+
+  corpus      TUs       wire k=1       C->F k=1    share      C->F k=30    share
+  cereal       84        1120409        1108638   98.95%       19969165   98.77%
+  range-v3    259        1820664        1794099   98.54%       18276808   98.66%
+  catch2      857        2384393        2304142   96.63%       18790157   98.49%
+  eigen       650        3289527        3246460   98.69%       41508730   98.76%
+  duckdb      689       13089408       12614499   96.37%       54132079   98.26%
+  llvm       1238       14614029       14439885   98.81%       67340529   98.81%
+  rocksdb     622       15692955       14336905   91.36%       51995991   96.24%
+  godot      2207       62871696       62579277   99.53%      156562092   99.20%
+
+THE BINDING CASE: one cold build sharded across 30 slots, C->F wire only
+
+  corpus       C->F 1 slot  C->F 30 slots        x  avoidable Fill share  shard eff
+  cereal           1108638       19969165   18.01x      94.4%      96.9%      0.881
+  range-v3         1794099       18276808   10.19x      90.2%      92.9%      0.510
+  catch2           2304142       18790157    8.15x      87.7%      88.3%      0.475
+  eigen            3246460       41508730   12.79x      92.2%      80.5%      0.593
+  duckdb          12614499       54132079    4.29x      76.7%      91.8%      0.174
+  llvm            14439885       67340529    4.66x      78.6%      89.2%      0.200
+  rocksdb         14336905       51995991    3.63x      72.4%      84.6%      0.185
+  godot           62579277      156562092    2.50x      60.0%      94.5%      0.084
+  MEAN                                                  81.5%                 0.388
+
+C->F COMPOSITION AT 30 SLOTS  (Root = references, Fill = definitions)
+
+  corpus           cf_root    share        cf_fill    share   cf_control  missing x
+  cereal            623699     3.1%       19344962    96.9%          504     25.88x
+  range-v3         1296932     7.1%       16978191    92.9%         1685     12.60x
+  catch2           2198732    11.7%       16585554    88.3%         5871      4.83x
+  eigen            8089346    19.5%       33414962    80.5%         4422     20.59x
+  duckdb           4444351     8.2%       49683033    91.8%         4695      2.22x
+  llvm             7250759    10.8%       60081232    89.2%         8538      6.26x
+  rocksdb          7994812    15.4%       43996953    84.6%         4226      1.50x
+  godot            8584758     5.5%      147962013    94.5%        15321      5.68x
+
+  gate: split_ok and dir_ok on every row of every run -- ALL PASS
