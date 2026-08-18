@@ -32,6 +32,47 @@ three corpora — if the build still spreads across all 30. The same warm daemon
 Warmth is not a property of the farm. It is only realised by the routing decision. A
 scheduler that tracks warmth but keeps spreading has bought itself a rounding error.
 
+## Recut on the C→F-only wire
+
+local-oracle expected this to come out nearly unchanged. It does — the headline moves by
+under 1%, and no per-corpus figure moves by more than 5.5%.
+
+| corpus | route to warm (C→F) | spread 30 (C→F) | **x on C→F** | x on duplex | delta | C→F share |
+|---|---:|---:|---:|---:|---:|---:|
+| cereal | 37,713 | 19,431,287 | 515.2x | 488.5x | +5.5% | 98.8% |
+| catch2 | 501,002 | 18,186,722 | 36.3x | 35.0x | +3.6% | 98.5% |
+| duckdb | 3,197,820 | 53,636,799 | 16.8x | 17.0x | −1.1% | 98.3% |
+| godot | 10,815,748 | 159,244,315 | 14.7x | 14.7x | −0.2% | 99.2% |
+| range-v3 | 1,384,037 | 17,903,379 | 12.9x | 13.0x | −0.8% | 98.7% |
+| llvm | 8,553,352 | 67,207,137 | 7.9x | 7.9x | −0.7% | 98.8% |
+| rocksdb | 8,594,654 | 52,483,464 | 6.1x | 6.3x | −3.4% | 96.4% |
+| eigen | 8,632,891 | 41,693,024 | 4.8x | 4.9x | −1.0% | 98.8% |
+| **MEDIAN** | | | **13.8x** | 13.9x | **−0.7%** | |
+
+**The route-to-warm headline is 13.8x median on C→F against 13.9x duplex.** C→F is
+96.4-99.2% of the duplex wire, so the return path was never carrying the result.
+
+The per-TU parallelism price likewise survives. Moving one TU off the warm daemon at 30
+slots, on C→F only:
+
+| corpus | C→F cost per TU moved | on duplex | delta |
+|---|---:|---:|---:|
+| catch2 | 21,302 | 21,600 | −1.4% |
+| llvm | 49,404 | 50,025 | −1.2% |
+| eigen | 52,916 | 53,685 | −1.4% |
+| range-v3 | 66,068 | 66,976 | −1.4% |
+| godot | 69,882 | 70,421 | −0.8% |
+| rocksdb | 71,192 | 74,412 | −4.3% |
+| duckdb | 76,575 | 77,940 | −1.8% |
+| cereal | 239,853 | 242,721 | −1.2% |
+
+**The ~50-70 KB per TU figure holds on the C→F basis** (llvm 49.4 KB, range-v3 66.1 KB,
+godot 69.9 KB, rocksdb 71.2 KB, duckdb 76.6 KB), every one within 4.3% of its duplex value.
+
+Duplex totals are retained in the tables below and in `mixedwarm.tsv` — use them for
+elapsed-time reasoning, where both directions are on the clock; use C→F for wire cost.
+`carry_undirected` is 0 across every run of this recut, so the C→F figures are exact.
+
 ## Bytes per TU, by who served it
 
 The clean way to see it: what does one TU cost depending on which kind of daemon takes it?
@@ -118,7 +159,7 @@ must be justified by compile concurrency alone.
 
 ## Files
 
-`mixed-warmth/mixedwarm.tsv` (8 corpora x {1,2,4,8,30}, pass 1 / pass 2 separated, warm-
+`mixed-warmth/mixedwarm_cf.tsv` (the C->F recut) and `mixed-warmth/mixedwarm.tsv` (8 corpora x {1,2,4,8,30}, pass 1 / pass 2 separated, warm-
 and cold-served bytes and TU counts split out), `mixed-warmth/mixed-report.txt`,
 `dense-affinity/affinity.tsv` (now including llvm and godot),
 `dense-affinity/affinity-report.txt`. Harness `selector_mixedwarm.sh`, tables

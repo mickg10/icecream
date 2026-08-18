@@ -1,0 +1,15 @@
+LEDGER CROSS-CHECK: local-oracle 6c4fd89a vs selector v2, same base, same flags
+
+cell                     local-oracle       selector      match
+range-v3 M=1 C->F             1794129        1794129  IDENTICAL
+range-v3 M=1 F->C               26535          26535  IDENTICAL
+  per-row diffs                     0
+range-v3 M=30 C->F           18277708       18277708  IDENTICAL
+range-v3 M=30 F->C             246720         246720  IDENTICAL
+  per-row diffs                     0
+
+idle-daemon case: cereal rep2 M=30 sticky
+wire                         19829552       19829552  IDENTICAL
+C->F                         19588086       19588057   delta 29
+F->C                           241466         241301  delta 165
+carry_undirected                    -            194

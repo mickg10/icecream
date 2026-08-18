@@ -1,0 +1,53 @@
+ROUTE TO WARM vs SPREAD OVER 30 -- C->F only, with the duplex delta
+
+  corpus       warm (C->F) spread30 (C->F)    x C->F       x duplex     delta    C->F %
+  cereal             37713       19431287    515.2x         488.5x      5.5%     98.8%
+  range-v3         1384037       17903379     12.9x          13.0x     -0.8%     98.7%
+  catch2            501002       18186722     36.3x          35.0x      3.6%     98.5%
+  eigen            8632891       41693024      4.8x           4.9x     -1.0%     98.8%
+  duckdb           3197820       53636799     16.8x          17.0x     -1.1%     98.3%
+  rocksdb          8594654       52483464      6.1x           6.3x     -3.4%     96.4%
+  llvm             8553352       67207137      7.9x           7.9x     -0.7%     98.8%
+  godot           10815748      159244315     14.7x          14.7x     -0.2%     99.2%
+  MEDIAN                                      13.8x          13.9x
+
+BYTES PER TU ON THE C->F WIRE, BY WHO SERVED IT
+
+  corpus       k    warm B/TU    cold B/TU    penalty duplex cold B/TU
+  cereal       1          449            -          -              -
+  cereal      30           38       239891    6258.0x         242842
+
+  range-v3     1         5344            -          -              -
+  range-v3    30         5353        71421      13.3x          72377
+
+  catch2       1          585            -          -              -
+  catch2      30          641        21942      34.3x          22276
+
+  eigen        1        13281            -          -              -
+  eigen       30        13018        65934       5.1x          66740
+
+  duckdb       1         4641            -          -              -
+  duckdb      30         3829        80404      21.0x          81806
+
+  rocksdb      1        13818            -          -              -
+  rocksdb     30        15591        86782       5.6x          90040
+
+  llvm         1         6909            -          -              -
+  llvm        30         6519        55923       8.6x          56578
+
+  godot        1         4901            -          -              -
+  godot       30         4616        74497      16.1x          75069
+
+MARGINAL PRICE OF MOVING ONE TU OFF THE WARM DAEMON AT 30 SLOTS (C->F)
+
+  corpus    cold-warm B/TU      on duplex          delta
+  cereal            239853         242721          -1.2%
+  range-v3           66068          66976          -1.4%
+  catch2             21302          21600          -1.4%
+  eigen              52916          53685          -1.4%
+  duckdb             76575          77940          -1.8%
+  rocksdb            71192          74412          -4.3%
+  llvm               49404          50025          -1.2%
+  godot              69882          70421          -0.8%
+
+  gate: ALL PASS;  carry_undirected total = 0
