@@ -1,0 +1,35 @@
+THIRD CANDIDATE: small-corpus-policy GRZ2, kept iff rate-legal AND within a size delta
+Scope = the 19 cells where the frozen GRZ2 encode is below 1 GB/s (elsewhere frozen already passes).
+
+  project        profile              frozen GRZ  small GRZ        P29  smallC   legal size cost
+  fmt            conan-gcc                676267     727502    1020039   0.821      no   +51235
+  fmt            debian-gcc               665724     717728    1006187   0.803      no   +52004
+  fmt            fedora-clang-libcxx      600948     666262     783182   1.284     YES   +65314
+  fmt            linuxbrew                595186     647690     760819   0.996      no   +52504
+  leveldb        conan-gcc                621537     686784     925045   1.117     YES   +65247
+  leveldb        debian-gcc               612569     671409     911927   1.165     YES   +58840
+  leveldb        fedora-clang-libcxx      621604     755392     945669   1.400     YES  +133788
+  leveldb        linuxbrew                575702     634263     785352   1.200     YES   +58561
+  nlohmann-json  conan-gcc                802802     910111    1202534   1.185     YES  +107309
+  nlohmann-json  debian-gcc               760359     862671    1132913   1.202     YES  +102312
+  nlohmann-json  fedora-clang-libcxx      881905    1030489    1437035   1.338     YES  +148584
+  nlohmann-json  linuxbrew                808811     911341    1272706   1.141     YES  +102530
+  re2            conan-gcc                367974     382924     462550   0.967      no   +14950
+  re2            debian-gcc               362280     375818     453331   0.940      no   +13538
+  re2            fedora-clang-libcxx      396468     419388     501668   1.357     YES   +22920
+  re2            linuxbrew                355812     369455     434258   0.985      no   +13643
+  spdlog         conan-gcc                507502     803799     715752   1.193     YES  +296297
+  spdlog         debian-gcc               502334     799421     703346   1.163     YES  +297087
+  spdlog         linuxbrew                498347     794922     698032   1.197     YES  +296575
+
+  cells made rate-legal by the third candidate: 13/19  (nothing else is legal on these cells:
+   frozen GRZ encode <1 GB/s by construction, and P29 two-pass is 0/44)
+  total size cost of shipping them: +1755364 bytes
+
+  if a delta cap is applied, how many of the 13 survive:
+    cap + 5%: keep  0/13, cost       +0, drop fmt/fedora leveldb/conan- leveldb/debian leveldb/fedora leveldb/linuxb nlohmann-json/conan- nlohmann-json/debian nlohmann-json/fedora nlohmann-json/linuxb re2/fedora spdlog/conan- spdlog/debian spdlog/linuxb
+    cap +10%: keep  2/13, cost   +81760, drop fmt/fedora leveldb/conan- leveldb/fedora leveldb/linuxb nlohmann-json/conan- nlohmann-json/debian nlohmann-json/fedora nlohmann-json/linuxb spdlog/conan- spdlog/debian spdlog/linuxb
+    cap +15%: keep  8/13, cost  +583033, drop leveldb/fedora nlohmann-json/fedora spdlog/conan- spdlog/debian spdlog/linuxb
+    cap +20%: keep  9/13, cost  +731617, drop leveldb/fedora spdlog/conan- spdlog/debian spdlog/linuxb
+    cap +25%: keep 10/13, cost  +865405, drop spdlog/conan- spdlog/debian spdlog/linuxb
+    cap +60%: keep 13/13, cost +1755364, drop -
