@@ -90,3 +90,42 @@ and quoting "+711 per rebuild" as general would have been wrong for any corpus a
 
 So **three of four codecs have real per-build closure**; P29 remains 4x-totals-only pending
 the scope decision.
+
+## Proof gates made real, and a corrected zstd-3 figure
+
+**`selector_grzproof.sh` was evidence collection, not a gate** — it exits success even after
+a DIFFER, a FAIL or a skipped cell. `selector_grzgate.sh` is the gate. Against a declared
+cell list it requires: every declared cell present **exactly once** (no missing, duplicate
+or stale rows), four **strictly increasing** build-close offsets, container size greater than
+the last offset with the terminator equal to the difference, **build 4 carrying the
+terminator**, `prefix_1in4`/`prefix_2in4` IDENTICAL, `decode_k1/k2/k4` EXACT, and
+`build_close_rows` exactly `4/4`.
+
+Verified to fail, by true exit status (not a piped one — my first test read `tail`'s status
+and reported a false pass):
+
+| case | exit |
+|---|---|
+| real 7-cell table | **0** |
+| a `DIFFER` injected | 1 |
+| duplicate rows appended | 1 |
+| missing table | 2 |
+| no declared cells | 2 |
+
+**zstd-3 physical bytes were understated.** The wire writes a 4-byte length before each TU
+frame, but the encoder's curve summed payload only. `selector_zstd3recv.cpp` is a receiver
+that consumes **only the wire artifact**, parses the frames, decompresses and reconstructs
+every TU against the manifest:
+
+```
+ZSTD3RECV tus=72  physical=16,618,723  payload=16,618,435  framing=288    raw=110,231,455  all_reconstructed=YES
+ZSTD3RECV tus=288 physical=66,474,892  payload=66,473,740  framing=1,152  raw=440,925,820  all_reconstructed=YES
+```
+
+So physical = payload + **4 B per TU** exactly; the published per-TU cumulative was low by
+288 B over 72 TUs. Small, but it was wrong, and the figure now comes from a receiver that
+reconstructs the input rather than from the encoder's own accounting.
+
+**The fast interner remains VALUE-level.** Its `--wire` is emitted and `cmp`-compared, but
+there is no receiver parsing and reconstructing from it yet, so it does not get the
+byte-level claim until there is.
