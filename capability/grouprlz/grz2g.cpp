@@ -583,15 +583,37 @@ static void encode(const char* in, const char* outp, const Cfg& cfg, const char*
 // declared extent plus one group -- the whole point of the bounded row.
 struct Hist {
     std::vector<u8> b;
+    u8* mapped = nullptr;
+    u64 mapped_size = 0;
     u64 mask = 0;
     bool bounded = false;
+    ~Hist() {
+        if (mapped && munmap(mapped, (size_t)mapped_size) != 0)
+            fprintf(stderr, "grz2g: munmap history failed\n");
+    }
+    u64 size() const { return bounded ? mapped_size : (u64)b.size(); }
+    u8* data() { return bounded ? mapped : b.data(); }
+    static u64 rounded_capacity(u64 cap) {
+        u64 c = 1;
+        while (c < cap) {
+            if (c > (~u64(0) >> 1)) die("history capacity overflows");
+            c <<= 1;
+        }
+        if (c > (u64)SIZE_MAX) die("history capacity exceeds address space");
+        return c;
+    }
+    static u8* map_bytes(u64 cap) {
+        void* p = mmap(nullptr, (size_t)cap, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED) die("mmap history");
+        return (u8*)p;
+    }
     void init(bool bnd, u64 cap) {
         bounded = bnd;
         if (bnd) {
-            u64 c = 1;
-            while (c < cap) c <<= 1;
-            b.assign(c, 0);
-            mask = c - 1;
+            mapped_size = rounded_capacity(std::max<u64>(1, cap));
+            mapped = map_bytes(mapped_size);
+            mask = mapped_size - 1;
         } else {
             b.reserve(cap ? cap : (1u << 20));
         }
@@ -599,13 +621,13 @@ struct Hist {
     // Unbounded (G0/G1) retains everything, so it grows; the total is never known up front
     // because the stream header carries no future totals.
     void ensure(u64 upto) { if (!bounded && b.size() < upto) b.resize(upto); }
-    inline u8* at(u64 a) { return bounded ? b.data() + (a & mask) : b.data() + a; }
+    inline u8* at(u64 a) { return bounded ? mapped + (a & mask) : b.data() + a; }
     void put(u64 dst, const u8* src, u64 len) {
         if (!bounded) { memcpy(b.data() + dst, src, len); return; }
         while (len) {
             u64 off = dst & mask;
-            u64 k = std::min<u64>(len, b.size() - off);
-            memcpy(b.data() + off, src, k);
+            u64 k = std::min<u64>(len, mapped_size - off);
+            memcpy(mapped + off, src, k);
             src += k; dst += k; len -= k;
         }
     }
@@ -620,8 +642,8 @@ struct Hist {
         if (off >= len) {
             while (len) {
                 u64 dO = dst & mask, sO = src & mask;
-                u64 k = std::min(len, std::min(b.size() - dO, b.size() - sO));
-                memcpy(b.data() + dO, b.data() + sO, k);
+                u64 k = std::min(len, std::min(mapped_size - dO, mapped_size - sO));
+                memcpy(mapped + dO, mapped + sO, k);
                 dst += k; src += k; len -= k;
             }
         } else {
@@ -632,8 +654,8 @@ struct Hist {
     void feed(Dig& dg, u64 from, u64 len) {
         while (len) {
             u64 off = bounded ? (from & mask) : from;
-            u64 k = bounded ? std::min<u64>(len, b.size() - off) : len;
-            dg.add(b.data() + off, k);
+            u64 k = bounded ? std::min<u64>(len, mapped_size - off) : len;
+            dg.add(data() + off, k);
             from += k; len -= k;
         }
     }
@@ -641,21 +663,27 @@ struct Hist {
     // group frame declares its own output length before it is decoded, so the ring is sized
     // from history + THIS group rather than from a future-derived maximum.
     void grow(u64 need, u64 from, u64 len) {
-        u64 c = 1;
-        while (c < need) c <<= 1;
-        if (c <= b.size()) return;
-        std::vector<u8> nb(c, 0);
+        u64 c = rounded_capacity(need);
+        if (c <= mapped_size) return;
+        u8* nb = map_bytes(c);
         u64 nmask = c - 1;
-        for (u64 i = 0; i < len; i++) nb[(from + i) & nmask] = *at(from + i);
-        b.swap(nb);
+        while (len) {
+            u64 old_off = from & mask, new_off = from & nmask;
+            u64 k = std::min(len, std::min(mapped_size - old_off, c - new_off));
+            memcpy(nb + new_off, mapped + old_off, k);
+            from += k; len -= k;
+        }
+        if (munmap(mapped, (size_t)mapped_size) != 0) die("munmap old history");
+        mapped = nb;
+        mapped_size = c;
         mask = nmask;
     }
     void emit(FILE* f, u64 from, u64 len) {
         if (!bounded) { if (len && fwrite(b.data() + from, 1, len, f) != len) die("fwrite output"); return; }
         while (len) {
             u64 off = from & mask;
-            u64 k = std::min<u64>(len, b.size() - off);
-            if (fwrite(b.data() + off, 1, k, f) != k) die("fwrite output");
+            u64 k = std::min<u64>(len, mapped_size - off);
+            if (fwrite(mapped + off, 1, k, f) != k) die("fwrite output");
             from += k; len -= k;
         }
     }
@@ -747,14 +775,18 @@ static void decode(const char* inp, const char* outp, bool prefix_mode, int thre
 
         if (!ring_ready) {
             u64 gcap = std::max(graw, gout);
+            if (gcap > ~u64(0) - hist) die("history + group capacity overflows");
+            // Keep the original stable power-of-two address space. The bounded backing is
+            // demand-populated, so untouched pages cost no startup zero-fill or resident RAM.
             if (mode == MODE_G2) ring.init(true, hist + gcap);
             else                 ring.init(false, 4 * gout + (64u << 20));
             ring_ready = true;
         }
         ring.ensure(pos + gout);
         if (mode == MODE_G2) {
-            if (hist + gout > ring.b.size()) ring.grow(hist + gout, hbase, hext);
-            if (hext + gout > ring.b.size())
+            if (gout > ~u64(0) - hist) die("history + group size overflows");
+            if (hist + gout > ring.size()) ring.grow(hist + gout, hbase, hext);
+            if (gout > ~u64(0) - hext || hext + gout > ring.size())
                 die("retained history + group exceeds the ring capacity");
         }
 
@@ -843,10 +875,10 @@ static void decode(const char* inp, const char* outp, bool prefix_mode, int thre
     fprintf(stderr, "DEC %s groups=%llu bytes=%llu entropy=%.2f total=%.2f  F=%.0f B/s (%.1f MiB/s) "
                     " ring=%.2f GiB peakRSS=%.2f GiB %s\n",
             inp, (unsigned long long)groups, (unsigned long long)pos, tent, sec,
-            pos / sec, pos / sec / 1048576.0, ring.b.size() / 1073741824.0,
+            pos / sec, pos / sec / 1048576.0, ring.size() / 1073741824.0,
             peak_rss_bytes() / 1073741824.0, prefix_mode ? "[PREFIX]" : "[FULL,VERIFIED]");
     printf("%llu\t%llu\t%.4f\t%.4f\t%llu\t%llu\n", (unsigned long long)pos,
-           (unsigned long long)groups, tent, sec, (unsigned long long)ring.b.size(),
+           (unsigned long long)groups, tent, sec, (unsigned long long)ring.size(),
            (unsigned long long)peak_rss_bytes());
 }
 
