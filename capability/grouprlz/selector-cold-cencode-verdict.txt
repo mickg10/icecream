@@ -8,6 +8,7 @@ COLD_1F_STICKY_CODEC -- isolated cold C-encode, in-memory producer, 3 reps, unco
   corpus              raw   P29 wire   P29/z19  P29 GB/s  GRZ2 wire   GRZ/z19  GRZ GB/s
   catch2        947252235     907327    1.1332     1.456     626178    0.7821     1.487
   eigen        3532268956    1143631    0.9215     2.009    2040151    1.6439     1.541
+  godot        5932762185   35085071    0.6079     0.384   53427567    0.9257     0.347
   llvm         3620271340    7275808    0.9972     1.158    7638087    1.0468     0.983
   range-v3      632049016     739437    0.9985     1.128     628319    0.8484     1.294
   rocksdb      3114320596    8533638    1.3765     0.856    5456878    0.8802     1.009
@@ -17,11 +18,12 @@ COLD_1F_STICKY_CODEC -- isolated cold C-encode, in-memory producer, 3 reps, unco
   corpus     selected      sel/z19     sel GB/s BOTH_BARS_PASS
   catch2     GRZ2           0.7821        1.487 TRUE
   eigen      P29+BSC        0.9215        2.009 TRUE
+  godot      P29+BSC        0.6079        0.384 FALSE
   llvm       P29+BSC        0.9972        1.158 TRUE
   range-v3   GRZ2           0.8484        1.294 TRUE
   rocksdb    GRZ2           0.8802        1.009 TRUE
 
-  AGGREGATE: 5/5 corpora pass BOTH bars (size <= 1.10x z19 AND C-encode >= 1 GB/s)
-  selected total 15130814 B over 11846162143 raw = 782.9x raw, 0.9295 x z19
+  AGGREGATE: 5/6 corpora pass BOTH bars (size <= 1.10x z19 AND C-encode >= 1 GB/s)
+  selected total 50215885 B over 17778924328 raw = 354.0x raw, 0.6786 x z19
 
-  Per-codec >= 1 GB/s: P29 4/5, GRZ2 4/5
+  Per-codec >= 1 GB/s: P29 4/6, GRZ2 4/6

@@ -6,7 +6,7 @@ import re
 import statistics
 
 NM = {"corpus": "llvm", "corpus2": "rocksdb", "corpus9": "catch2",
-      "corpus11": "range-v3", "corpus12": "eigen"}
+      "corpus11": "range-v3", "corpus12": "eigen", "corpus6": "godot"}
 Z = {}
 for line in open(os.path.expanduser("~/grouprlz/corpora.tsv")).readlines()[1:]:
     f = line.rstrip("\n").split("\t")

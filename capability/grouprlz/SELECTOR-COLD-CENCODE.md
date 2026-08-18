@@ -37,38 +37,60 @@ file-load artifact is *excluded by where the clock starts*, not subtracted after
 
 **P29+BSC clears 1 GB/s on 4 of the 5 measured corpora** (rocksdb is the miss at 0.856).
 
-## The /goal row closes -- 5/5
+## Verdict: 5 of 6, and Godot is the one that fails
 
-Both codecs now measured on the **same in-memory basis** (the earlier table mixed P29's
-explicit in-memory clock with GRZ2 wall-clock figures from a different run; corrected):
+Both codecs on the same in-memory basis (an earlier draft mixed P29's in-memory clock with
+GRZ2 wall-clock numbers from another run; corrected):
 
 | corpus | P29 wire | P29/z19 | P29 GB/s | GRZ2 wire | GRZ/z19 | GRZ2 GB/s |
 |---|---:|---:|---:|---:|---:|---:|
 | catch2 | 907,327 | 1.1332 | 1.456 | 626,178 | 0.7821 | 1.487 |
 | eigen | 1,143,631 | 0.9215 | 2.009 | 2,040,151 | 1.6439 | 1.541 |
+| **godot** | 35,085,071 | **0.6079** | **0.384** | 53,427,567 | 0.9257 | **0.347** |
 | llvm | 7,275,808 | 0.9972 | 1.158 | 7,638,087 | 1.0468 | 0.983 |
 | range-v3 | 739,437 | 0.9985 | 1.128 | 628,319 | 0.8484 | 1.294 |
 | rocksdb | 8,533,638 | 1.3765 | 0.856 | 5,456,878 | 0.8802 | 1.009 |
 
-Per codec, >= 1 GB/s on 4 of 5 each -- and **they miss on different corpora**: P29 misses
-rocksdb (0.856), GRZ2 misses llvm (0.983). The selector covers each other's gap.
-
-**Verdict, the selected codec and both of its bars:**
+**Selected codec, both bars:**
 
 | corpus | selected | sel / z19 | sel GB/s | BOTH_BARS_PASS |
 |---|---|---:|---:|:---:|
 | catch2 | GRZ2 | 0.7821 | 1.487 | **TRUE** |
 | eigen | P29+BSC | 0.9215 | 2.009 | **TRUE** |
+| **godot** | **P29+BSC** | **0.6079** | **0.384** | **FALSE** |
 | llvm | P29+BSC | 0.9972 | 1.158 | **TRUE** |
 | range-v3 | GRZ2 | 0.8484 | 1.294 | **TRUE** |
 | rocksdb | GRZ2 | 0.8802 | 1.009 | **TRUE** |
 
-**5/5 pass both bars.** Selected total 15,130,814 B over 11,846,162,143 raw =
-**782.9x raw, 0.9295x z19**.
+**5 of 6.** Selected total 50,215,885 B over 17,778,924,328 raw = **354.0x raw, 0.6786x z19**.
 
-That the two codecs fail on *different* corpora is the substantive point: neither alone
-clears both bars everywhere, and the per-cell minimum does. It is the same complementarity
-the size census found, now holding on the rate bar as well.
+Two things this says that the five-corpus table did not:
+
+- **Godot fails the rate bar on BOTH codecs** (P29 0.384, GRZ2 0.347). It is the one corpus
+  where the selector has nothing to fall back on, and it is also where P29 has its largest
+  size win (0.6079x z19 against GRZ2's 0.9257x). Size is not the problem there; rate is.
+- Elsewhere the complementarity holds on rate as well as size: each codec clears >= 1 GB/s
+  on 4 of 6 and **they miss on different corpora** -- P29 on rocksdb (0.856) and godot,
+  GRZ2 on llvm (0.983) and godot. Neither alone clears both bars everywhere; the per-cell
+  minimum does, everywhere except Godot.
+
+### Where Godot's time goes -- not entropy, not interning
+
+The question was whether z19/BSC or interning is the limiter. **Neither.** Of the 15.45 s
+`C_encode_ready`:
+
+| stage | time | share |
+|---|---:|---:|
+| interning (`Interner::process` + corpus scan) | ~3.05 s | 20% |
+| S1 factorization | 0.3 s | 2% |
+| literal-group entropy (BSC, 20 groups) | 0.73 s | **5%** |
+| material construction + serialization | ~11.4 s | **74%** |
+
+Godot has **2,641,125 distinct lines** and 102,838 new regions against a whole-program
+compressibility of only **103x** (eigen, for contrast: 2846x). There is simply far more
+genuinely novel material to define, materialize and serialize. The entropy coder is not the
+bottleneck at 5%; the cost is proportional to novel content, which is exactly what a
+low-redundancy corpus has most of. That is a property of the corpus, not a tunable.
 
 ## Why this differs so much from the earlier 0.370 GB/s
 
