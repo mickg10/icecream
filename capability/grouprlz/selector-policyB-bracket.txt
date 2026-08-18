@@ -1,0 +1,43 @@
+BRACKET (size-only, 44 cells, raw=74.54 GB, z19=64489971)
+
+  ORACLE  per-cell min(complete)                     62587653  x= 1190.96  /z19=0.9705
+  NAIVE   smaller TU112 census -> GRZ2 always        71395383  x= 1044.03  /z19=1.1071
+    reference: P29+BSC always                        71169904  x= 1047.34  /z19=1.1036
+    reference: whole-program zstd-19                 64489971  x= 1155.83  /z19=1.0000
+
+  bracket width = 8807730 B (0.1366 x z19 of headroom a classifier could recover)
+
+The 10 cells where P29+BSC wins the COMPLETE size (GRZ is smaller at TU112 on all 44, so these are pure tail overtakes):
+  project        profile               GRZ compl  P29 compl   margin  TU112 r  close   anchor
+  range-v3       fedora-clang-libcxx     1036737     936114  -100623   0.6945     tu   0.0347
+  opencv         fedora-clang-libcxx     6609636    6144420  -465216   0.7319     tu   0.0451
+  eigen          fedora-clang-libcxx     4864106    2320794 -2543312   0.7639    raw   0.0159
+  eigen          conan-gcc               4329139    2379861 -1949278   0.7691    raw   0.0113
+  eigen          debian-gcc              3932160    2376519 -1555641   0.7711    raw   0.0117
+  eigen          linuxbrew               3874615    2309461 -1565154   0.7822    raw   0.0166
+  rocksdb        debian-gcc              2535516    2468928   -66588   0.7959    raw   0.0290
+  rocksdb        conan-gcc               2679877    2555041  -124836   0.7975    raw   0.0290
+  rocksdb        linuxbrew               2444715    2278907  -165808   0.8193    raw   0.0302
+  rocksdb        fedora-clang-libcxx     2553438    2282164  -271274   0.8391    raw   0.0328
+
+Feature separability, P29BSC-win (n=10) vs GRZ2-win (n=34):
+  TU112 census ratio     P29-win [0.6945 .. 0.8391] med 0.7822 | GRZ-win [0.6137 .. 0.8194] med 0.7330
+  g1 anchor hit rate     P29-win [0.0113 .. 0.0451] med 0.0290 | GRZ-win [0.0113 .. 0.0806] med 0.0392
+  probe raw fraction     P29-win [0.0115 .. 0.3289] med 0.1783 | GRZ-win [0.0095 .. 1.0000] med 1.0000
+
+Per-profile prior:
+  debian-gcc             P29+BSC wins 2/11
+  conan-gcc              P29+BSC wins 2/11
+  linuxbrew              P29+BSC wins 2/11
+  fedora-clang-libcxx    P29+BSC wins 4/11
+
+Per-project prior:
+  eigen                  P29+BSC wins 4/4
+  opencv                 P29+BSC wins 1/4
+  range-v3               P29+BSC wins 1/4
+  rocksdb                P29+BSC wins 4/4
+
+What single thresholds on the TU112 ratio would recover:
+  best single-threshold rule: ratio >= 0.7639 -> P29+BSC  (8 correct, 12 wrong)
+    that rule                                        64952368  x= 1147.60  /z19=1.0072
+  recovers 73.2% of the bracket

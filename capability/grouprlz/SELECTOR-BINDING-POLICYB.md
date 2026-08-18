@@ -182,3 +182,84 @@ Sanity cells as requested: **re2 = 72 TUs** (active corpus, not the old package'
 **rocksdb = 418** (not 367). Per-cell pins -- payload path, payload byte count,
 `corpus.json` SHA-256 and `manifest.tsv` SHA-256 -- are in
 `selector-policyB-provenance.tsv`.
+
+---
+
+# Policy-B classifier bracket (size-only, no rates)
+
+Two corrections to how the census has been read:
+
+- GRZ2 wins the **TU112 census** on 44/44, but wins the **complete** size on **34/44**.
+  P29+BSC wins the complete size on 10. `selected != sum(GRZ2 complete)`.
+- The **naive** policy-B rule -- pick whichever TU112 census is smaller, then ship that
+  codec -- degenerates to GRZ2-always here, and is the **worst** of the three fixed
+  policies: 1.1071x z19 versus 1.1036x for P29+BSC-always.
+
+| policy | bytes | x raw | / z19 |
+|---|---:|---:|---:|
+| **ORACLE** per-cell min(complete) | 62,587,653 | 1190.96 | **0.9705** |
+| whole-program `zstd -19 --long=31` | 64,489,971 | 1155.83 | 1.0000 |
+| P29+BSC always | 71,169,904 | 1047.34 | 1.1036 |
+| **NAIVE** smaller TU112 census (= GRZ2 always) | 71,395,383 | 1044.03 | **1.1071** |
+
+**Bracket width = 8,807,730 B = 0.1366x z19.** That is the headroom a decision-point
+classifier can recover.
+
+## The 10 tail overtakes
+
+GRZ2 is smaller at TU112 on all 44, so every P29+BSC complete win is a pure tail
+overtake:
+
+| project | profile | GRZ complete | P29 complete | margin | TU112 ratio | g1 close |
+|---|---|---:|---:|---:|---:|---|
+| range-v3 | fedora-clang-libcxx | 1,036,737 | 936,114 | -100,623 | 0.6945 | tu |
+| opencv | fedora-clang-libcxx | 6,609,636 | 6,144,420 | -465,216 | 0.7319 | tu |
+| eigen | fedora-clang-libcxx | 4,864,106 | 2,320,794 | -2,543,312 | 0.7639 | **raw** |
+| eigen | conan-gcc | 4,329,139 | 2,379,861 | -1,949,278 | 0.7691 | **raw** |
+| eigen | debian-gcc | 3,932,160 | 2,376,519 | -1,555,641 | 0.7711 | **raw** |
+| eigen | linuxbrew | 3,874,615 | 2,309,461 | -1,565,154 | 0.7822 | **raw** |
+| rocksdb | debian-gcc | 2,535,516 | 2,468,928 | -66,588 | 0.7959 | **raw** |
+| rocksdb | conan-gcc | 2,679,877 | 2,555,041 | -124,836 | 0.7975 | **raw** |
+| rocksdb | linuxbrew | 2,444,715 | 2,278,907 | -165,808 | 0.8193 | **raw** |
+| rocksdb | fedora-clang-libcxx | 2,553,438 | 2,282,164 | -271,274 | 0.8391 | **raw** |
+
+## The separating feature is the group-1 close reason, not the size ratio
+
+The GRZ2 group-1 close reason -- already retained at the decision point -- is a perfect
+one-sided separator on this matrix:
+
+```
+                  closed_by=raw   closed_by=tu
+  P29+BSC wins          8              2
+  GRZ2 wins             0             34
+```
+
+| rule (decision-point features only) | bytes | x raw | / z19 | TP | FP | FN | recovers |
+|---|---:|---:|---:|:---:|:---:|:---:|---:|
+| **A: g1 `closed_by == raw` -> P29+BSC** | 63,153,492 | 1180.29 | **0.9793** | 8 | **0** | 2 | **93.6%** |
+| B: A or (fedora and ratio >= 0.69) | 63,061,295 | 1182.01 | 0.9778 | 10 | 4 | 0 | 94.6% |
+| C: TU112 ratio >= 0.7639 | 67,495,680 | 1104.36 | 1.0466 | 7 | 12 | 3 | 44.3% |
+| D: A or ratio >= 0.7639 | 64,952,368 | 1147.60 | 1.0072 | 8 | 12 | 2 | 73.2% |
+
+**Rule A is a single binary feature, already observed, with zero false positives, and it
+recovers 93.6% of the bracket** -- landing at 0.9793x z19, inside the goal and below plain
+zstd-19. The TU112 size ratio, which was the obvious candidate, is much weaker (44.3%,
+12 false positives): the P29-win and GRZ-win ratio ranges overlap almost completely
+(0.6945-0.8391 versus 0.6137-0.8194). Rule B buys 1 further point of bracket for 4 false
+positives and is not worth it.
+
+Mechanistically this is plausible: an early `raw`-cap close means the cell has large
+per-TU raw volume, so GRZ2's bounded history saturates and its long-range advantage
+decays through the tail, while P29+BSC's structural model keeps paying.
+
+## Do not over-read this yet
+
+Held out **by project lineage**, as the contract requires, the positives are only **four
+lineages**: eigen 4/4, rocksdb 4/4, opencv 1/4, range-v3 1/4. Rule A's 8 true positives
+are **eigen and rocksdb only -- two lineages**. A 2-lineage, 44-cell result is a strong
+hypothesis, not a validated classifier. The honest reading is: the close-reason feature
+is the thing to test next on the fixed-16 and native-25 families, where the large corpora
+(LLVM, Godot, Eigen) are exactly where the selection is expected to bite.
+
+Everything above is **size-only**. Rate-legality is not applied and would only remove
+candidates, so each row is an upper bound on its rate-bound counterpart.

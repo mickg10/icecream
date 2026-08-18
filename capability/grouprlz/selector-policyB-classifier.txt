@@ -1,0 +1,26 @@
+CLASSIFIER CANDIDATES (size-only; decision-point features only)
+
+  ORACLE (per-cell min complete)                          62587653  x=1190.96 /z19=0.9705
+  NAIVE  (smaller TU112 census = GRZ2 always)             71395383  x=1044.03 /z19=1.1071
+
+  A: grz group-1 closed_by == raw  -> P29+BSC             63153492  x=1180.29 /z19=0.9793  TP= 8 FP= 0 FN= 2  recovers  93.6%
+  B: A or (fedora and ratio>=0.69) -> P29+BSC             63061295  x=1182.01 /z19=0.9778  TP=10 FP= 4 FN= 0  recovers  94.6%
+  C: ratio >= 0.7639            -> P29+BSC                67495680  x=1104.36 /z19=1.0466  TP= 7 FP=12 FN= 3  recovers  44.3%
+  D: A or ratio >= 0.7639       -> P29+BSC                64952368  x=1147.60 /z19=1.0072  TP= 8 FP=12 FN= 2  recovers  73.2%
+
+  early-close (closed_by=raw) contingency:
+    label=P29BSC   early= 8  closed-at-tu= 2
+    label=GRZ2     early= 0  closed-at-tu=34
+
+  LINEAGE view (held out by project, as the contract requires):
+    catch2           P29+BSC 0 / GRZ2 4
+    cereal           P29+BSC 0 / GRZ2 4
+    eigen            P29+BSC 4 / GRZ2 0 <- positive lineage
+    fmt              P29+BSC 0 / GRZ2 4
+    leveldb          P29+BSC 0 / GRZ2 4
+    nlohmann-json    P29+BSC 0 / GRZ2 4
+    opencv           P29+BSC 1 / GRZ2 3 <- positive lineage
+    range-v3         P29+BSC 1 / GRZ2 3 <- positive lineage
+    re2              P29+BSC 0 / GRZ2 4
+    rocksdb          P29+BSC 4 / GRZ2 0 <- positive lineage
+    spdlog           P29+BSC 0 / GRZ2 4
