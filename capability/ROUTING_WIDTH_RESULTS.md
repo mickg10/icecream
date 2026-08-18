@@ -68,8 +68,10 @@ The aggregate is only a convenient scale sum; corpora are separate builds.
 
 At `M=30`, individual corpus multipliers range from 2.50x to 18.01x. Fill is 80.5-96.9% of
 the C-to-F score by corpus. Control is negligible. The main width cost is repeated definitions,
-with a smaller Root increase because each destination must establish its own relationship-local
-bindings and reconstruction context.
+with a smaller Root increase because each destination must receive its own first-use Block
+definitions and reconstruction context. Identity remains the same direct `(SourceGeneration,
+ObjectKind, generation-local u32 ordinal)` on every destination; there is no relationship-local
+remap.
 
 ## Thirty requested slots: capacity changes the binding width
 
