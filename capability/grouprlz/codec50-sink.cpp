@@ -823,7 +823,7 @@ static constexpr std::array<const char*,8> componentRawNames={
 };
 
 int main(int argc,char**argv){
-    const char* manifest=nullptr;const char*residualDumpPath=nullptr;const char*mixedDumpPrefix=nullptr;const char*curveTsvPath=nullptr;const char*literalGroupPrefix=nullptr;const char*literalGroupWirePath=nullptr;const char*cfSinkPath=nullptr;const char*fcSinkPath=nullptr;const char*sinkCurvePath=nullptr; size_t sinkBuildTus=0; bool sinkReplay=false; size_t max_files=SIZE_MAX,entropyRestartTus=0,replayRepetitions=1,literalGroupTus=0,literalGroupWorkers=1; int zlevel=3,literalZLevel=-1,arrayZLevel=-1,blobZLevel=-1,halfColdBit=-1,blobCanonicalLevel=9; uint32_t sourceAdmitRatio=6,blobThreads=4,blobZstdWorkers=0,blobZstdJobMiB=0,blobZstdOverlapLog=0,blobFallbackEvery=0,s1MinMatch=3,s1MaxChain=1024; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, usePriorRoot=false,useSortedLines=false,useByteArrayLines=false,useMixedRegions=false,useProjectSource=false,useKeyMap=false,useDirectOrdinals=false,useCompressedBlobs=false,useBlobEagerPatches=true,useMoFactor=false,traceMo=false,useAlphaLines=false,useResidualLdm=false,splitControlCeiling=false,structureCeiling=false,literalGroupEvaluateZstd10=true,stableRootTags=false,openFinalEntropy=false;
+    const char* manifest=nullptr;const char*residualDumpPath=nullptr;const char*mixedDumpPrefix=nullptr;const char*curveTsvPath=nullptr;const char*literalGroupPrefix=nullptr;const char*literalGroupWirePath=nullptr;const char*cfSinkPath=nullptr;const char*fcSinkPath=nullptr;const char*sinkCurvePath=nullptr; size_t sinkBuildTus=0; bool sinkReplay=false,literalOnDemand=false; size_t max_files=SIZE_MAX,entropyRestartTus=0,replayRepetitions=1,literalGroupTus=0,literalGroupWorkers=1; int zlevel=3,literalZLevel=-1,arrayZLevel=-1,blobZLevel=-1,halfColdBit=-1,blobCanonicalLevel=9; uint32_t sourceAdmitRatio=6,blobThreads=4,blobZstdWorkers=0,blobZstdJobMiB=0,blobZstdOverlapLog=0,blobFallbackEvery=0,s1MinMatch=3,s1MaxChain=1024; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, usePriorRoot=false,useSortedLines=false,useByteArrayLines=false,useMixedRegions=false,useProjectSource=false,useKeyMap=false,useDirectOrdinals=false,useCompressedBlobs=false,useBlobEagerPatches=true,useMoFactor=false,traceMo=false,useAlphaLines=false,useResidualLdm=false,splitControlCeiling=false,structureCeiling=false,literalGroupEvaluateZstd10=true,stableRootTags=false,openFinalEntropy=false;
     const char*blobDumpPath=nullptr;const char*componentCurveTsvPath=nullptr;
     for(int i=1;i<argc;++i){ if(!strcmp(argv[i],"--manifest")&&i+1<argc)manifest=argv[++i];
         else if(!strcmp(argv[i],"--z")&&i+1<argc)zlevel=atoi(argv[++i]);
@@ -854,6 +854,7 @@ int main(int argc,char**argv){
         else if(!strcmp(argv[i],"--cf-sink")&&i+1<argc)cfSinkPath=argv[++i];
         else if(!strcmp(argv[i],"--fc-sink")&&i+1<argc)fcSinkPath=argv[++i];
         else if(!strcmp(argv[i],"--sink-replay"))sinkReplay=true;
+        else if(!strcmp(argv[i],"--literal-ondemand"))literalOnDemand=true;
         else if(!strcmp(argv[i],"--sink-curve")&&i+1<argc)sinkCurvePath=argv[++i];
         else if(!strcmp(argv[i],"--sink-build-tus")&&i+1<argc){char*end=nullptr;unsigned long long value=strtoull(argv[++i],&end,10);if(!end||*end||!value||value>SIZE_MAX){fprintf(stderr,"bad sink build TU count\n");return 2;}sinkBuildTus=size_t(value);}
         else if(!strcmp(argv[i],"--curve-tsv")&&i+1<argc)curveTsvPath=argv[++i];
@@ -897,7 +898,12 @@ int main(int argc,char**argv){
     if(residualDumpPath&&!useMixedRegions){fprintf(stderr,"--residual-dump requires --mixed-regions\n");return 2;}
     if(blobDumpPath&&!useCompressedBlobs){fprintf(stderr,"--blob-dump requires --compressed-blobs\n");return 2;}
     if(mixedDumpPrefix&&!useMixedRegions){fprintf(stderr,"--mixed-dump-prefix requires --mixed-regions\n");return 2;}
-    if((literalGroupPrefix!=nullptr)!=(literalGroupTus!=0)){fprintf(stderr,"literal groups require both --literal-group-prefix and --literal-group-tus\n");return 2;}
+    // --literal-ondemand is the PRODUCT path: one TU's literal frame, encoded at that TU
+    // from that TU's own bytes.  It needs no dump file and no planning pass, so it is
+    // mutually exclusive with the offline plan rather than a mode of it.
+    if(literalOnDemand&&literalGroupPrefix){fprintf(stderr,"--literal-ondemand replaces --literal-group-prefix; they are alternatives\n");return 2;}
+    if(literalOnDemand&&literalGroupTus&&literalGroupTus!=1){fprintf(stderr,"--literal-ondemand encodes exactly one TU per frame\n");return 2;}
+    if((literalGroupPrefix!=nullptr)!=(literalGroupTus!=0)&&!literalOnDemand){fprintf(stderr,"literal groups require both --literal-group-prefix and --literal-group-tus\n");return 2;}
     if(literalGroupWirePath&&!literalGroupPrefix){fprintf(stderr,"--literal-group-wire requires --literal-group-prefix\n");return 2;}
     // Sinks are only meaningful for the message-based path this binding uses; refusing the
     // other paths is better than silently emitting a stream that omits their traffic.
@@ -1012,10 +1018,21 @@ int main(int argc,char**argv){
     }
     std::array<ZSTD_CCtx*,6> mixedZC{}; std::array<ZSTD_DCtx*,6> mixedZD{};
     std::array<uint8_t,6> mixedZActive{};size_t mixedPartCount=useProjectSource?6:(useByteArrayLines?4:2);
-    const bool useLiteralGroups=literalGroupPrefix!=nullptr;
+    // useLiteralGroups selects the literal-frame CHANNEL; usePlannedGroups selects the
+    // offline whole-route planner behind it.  The product path has the channel without
+    // the planner.
+    const bool useLiteralGroups=literalGroupPrefix!=nullptr||literalOnDemand;
+    const bool usePlannedGroups=literalGroupPrefix!=nullptr;
 #if defined(WITH_BSC_GROUPS)
     LiteralGroupPlan literalGroups;
-    if(useLiteralGroups){try{
+    // The on-demand encoder.  residual_group::Codec carries no state between frames --
+    // verified by encoding re2 with --literal-group-workers 1/4/8 and getting a
+    // byte-identical stream -- so one instance reused across TUs is safe and matches what
+    // the planner's per-worker instances do.
+    residual_group::Codec onDemandCodec;
+    std::vector<uint8_t> onDemandFrame, onDemandRaw;
+    std::array<uint64_t,3> onDemandSelected{};
+    if(usePlannedGroups){try{
         literalGroups=build_literal_group_plan(literalGroupPrefix,TUs,mixedPartCount,
             literalGroupTus,literalGroupWorkers,literalGroupEvaluateZstd10,
             literalGroupWirePath);
@@ -1671,10 +1688,21 @@ int main(int argc,char**argv){
             }
         }
 #if defined(WITH_BSC_GROUPS)
-        if(useLiteralGroups){
+        if(usePlannedGroups){
             if(mixedRaw[1].size()!=literalGroups.per_tu_raw[t]){fprintf(stderr,"literal group plan differs at TU=%zu planned=%u actual=%zu\n",t,literalGroups.per_tu_raw[t],mixedRaw[1].size());return 2;}
             const LiteralGroupRecord&group=literalGroups.groups[t/literalGroupTus];
             if(t==group.first_tu&&group.wire_size){w_linedef+=group.wire_size;mixedPartWire[1]+=group.wire_size;}
+        }else if(literalOnDemand){
+            // T_current: this TU's literal frame, built from this TU's bytes, right now.
+            onDemandFrame.clear();
+            if(!mixedRaw[1].empty()){
+                residual_group::Kind kind=residual_group::Kind::Zstd3;
+                try{ onDemandFrame=onDemandCodec.encode(mixedRaw[1].data(),mixedRaw[1].size(),
+                                                        &kind,literalGroupEvaluateZstd10); }
+                catch(const std::exception&error){fprintf(stderr,"on-demand literal frame at TU=%zu: %s\n",t,error.what());return 2;}
+                ++onDemandSelected[size_t(kind)];
+            }
+            w_linedef+=double(onDemandFrame.size());mixedPartWire[1]+=double(onDemandFrame.size());
         }
 #endif
         if(useMixedRegions&&mixedDumpLengths)for(size_t i=0;i<mixedPartCount;++i){
@@ -1701,12 +1729,14 @@ int main(int argc,char**argv){
                 if(!blobPatchEncoded.empty())cfSink.emit(WT_BLOBPATCH,blobPatchEncoded);
             }
 #if defined(WITH_BSC_GROUPS)
-            if(useLiteralGroups){
+            if(usePlannedGroups){
                 const LiteralGroupRecord&group=literalGroups.groups[t/literalGroupTus];
                 // A group frame may only be sent once every TU it covers has been dispatched;
                 // otherwise the stream carries bytes derived from TUs that do not exist yet.
                 if(t+1==group.last_tu&&group.wire_size)
                     cfSink.emit(WT_LITGROUP,literalGroups.wire.data()+group.wire_offset,group.wire_size);
+            }else if(literalOnDemand&&!onDemandFrame.empty()){
+                cfSink.emit(WT_LITGROUP,onDemandFrame);
             }
 #endif
         }
@@ -1863,11 +1893,22 @@ int main(int argc,char**argv){
           const uint8_t*groupedLiteralBegin=nullptr,*groupedLiteralEnd=nullptr;
 #if defined(WITH_BSC_GROUPS)
           uint8_t groupedLiteralEmpty=0;
-          if(useLiteralGroups){
+          if(usePlannedGroups){
             const LiteralGroupRecord&group=literalGroups.groups[t/literalGroupTus];
             const uint8_t*base=literalGroups.decoded.empty()?&groupedLiteralEmpty:literalGroups.decoded.data();
             if(literalGroupDecodedCursor<group.decoded_offset||literalGroupDecodedCursor>group.decoded_offset+group.decoded_size){fprintf(stderr,"literal group cursor outside group TU=%zu\n",t);return 2;}
             groupedLiteralBegin=base+literalGroupDecodedCursor;groupedLiteralEnd=base+group.decoded_offset+group.decoded_size;
+          }else if(literalOnDemand){
+            // F decodes the frame it was just sent -- nothing carried over, nothing planned.
+            onDemandRaw.clear();
+            if(!onDemandFrame.empty()){
+              try{ residual_group::DecodedFrame decoded=onDemandCodec.decode(onDemandFrame.data(),onDemandFrame.size());
+                   if(decoded.wire_bytes!=onDemandFrame.size()){fprintf(stderr,"on-demand literal frame length differs TU=%zu\n",t);return 2;}
+                   onDemandRaw=std::move(decoded.raw); }
+              catch(const std::exception&error){fprintf(stderr,"on-demand literal decode at TU=%zu: %s\n",t,error.what());return 2;}
+            }
+            const uint8_t*base=onDemandRaw.empty()?&groupedLiteralEmpty:onDemandRaw.data();
+            groupedLiteralBegin=base;groupedLiteralEnd=base+onDemandRaw.size();
           }
 #endif
           if(!recovered[0].empty()){
@@ -1911,8 +1952,10 @@ int main(int argc,char**argv){
               const size_t consumed=size_t(lp-groupedLiteralBegin);
               if(consumed!=mixedRaw[1].size()||(consumed&&memcmp(groupedLiteralBegin,mixedRaw[1].data(),consumed))){fprintf(stderr,"grouped literal consumption differs TU=%zu planned=%zu consumed=%zu\n",t,mixedRaw[1].size(),consumed);return 2;}
 #if defined(WITH_BSC_GROUPS)
-              literalGroupDecodedCursor+=consumed;const LiteralGroupRecord&group=literalGroups.groups[t/literalGroupTus];
-              if(t+1==group.last_tu&&literalGroupDecodedCursor!=group.decoded_offset+group.decoded_size){fprintf(stderr,"literal group has trailing decoded bytes after TU=%zu\n",t);return 2;}
+              if(usePlannedGroups){
+                literalGroupDecodedCursor+=consumed;const LiteralGroupRecord&group=literalGroups.groups[t/literalGroupTus];
+                if(t+1==group.last_tu&&literalGroupDecodedCursor!=group.decoded_offset+group.decoded_size){fprintf(stderr,"literal group has trailing decoded bytes after TU=%zu\n",t);return 2;}
+              }else if(consumed!=onDemandRaw.size()){fprintf(stderr,"on-demand literal frame has trailing decoded bytes after TU=%zu\n",t);return 2;}
 #endif
             }
             if(cp!=ce||(!useLiteralGroups&&lp!=le)||vp!=ve||arraysUsed!=arrayCount||FmixedPublic.size()!=nextMixedPublic){fprintf(stderr,"mixed Region streams have trailing bytes or state differs\n");return 2;}
@@ -2044,7 +2087,7 @@ int main(int argc,char**argv){
       }
       enc_s+=fallback_c_s;dec_s-=fallback_c_s;if(dec_s<0)dec_s=0;
 #if defined(WITH_BSC_GROUPS)
-      if(useLiteralGroups){
+      if(usePlannedGroups){
         if(literalGroupDecodedCursor!=literalGroups.decoded.size()){fprintf(stderr,"literal group final decoded extent differs\n");return 2;}
         enc_s+=literalGroups.encode_seconds;dec_s+=literalGroups.decode_seconds;
       }
@@ -2142,7 +2185,11 @@ int main(int argc,char**argv){
         (unsigned long long)alphaStats.rules,(unsigned long long)alphaStats.instances,(unsigned long long)alphaStats.template_input_bytes,(unsigned long long)alphaStats.literal_fallbacks,(unsigned long long)alphaStats.unique_slots,(unsigned long long)alphaStats.slot_occurrences,(unsigned long long)alphaStats.lexicon_entries,(unsigned long long)alphaStats.lexicon_references);
     if(useResidualLdm)printf("residual LDM: window_log=27 literal_wire=%.0f raw_literal=%llu\n",mixedPartWire[1],(unsigned long long)mixedLiteralRaw);
 #if defined(WITH_BSC_GROUPS)
-    if(useLiteralGroups)printf("literal groups: tus_per_group=%zu groups=%zu workers=%zu raw=%zu wire=%zu packed_header_bytes=%zu candidates=%s selected=[zstd3=%llu bsc=%llu zstd10=%llu] encode_seconds=%.6f decode_seconds=%.6f retained_wire=%s\n",
+    if(literalOnDemand)printf("literal frames on demand: frames=%zu wire=%.0f packed_header_bytes=%zu selector=[z3=%llu bsc=%llu z10=%llu] (no dump, no planning pass)\n",
+        TUs,mixedPartWire[1],residual_group::kHeaderBytes,
+        (unsigned long long)onDemandSelected[0],(unsigned long long)onDemandSelected[1],
+        (unsigned long long)onDemandSelected[2]);
+    if(usePlannedGroups)printf("literal groups: tus_per_group=%zu groups=%zu workers=%zu raw=%zu wire=%zu packed_header_bytes=%zucandidates=%s selected=[zstd3=%llu bsc=%llu zstd10=%llu] encode_seconds=%.6f decode_seconds=%.6f retained_wire=%s\n",
         literalGroupTus,literalGroups.groups.size(),literalGroups.workers,literalGroups.decoded.size(),literalGroups.wire.size(),residual_group::kHeaderBytes,
         literalGroups.evaluated_zstd10?"zstd3,bsc,zstd10":"zstd3,bsc",
         (unsigned long long)literalGroups.selected[0],(unsigned long long)literalGroups.selected[1],

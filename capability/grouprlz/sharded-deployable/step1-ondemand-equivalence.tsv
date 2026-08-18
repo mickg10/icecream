@@ -1,0 +1,11 @@
+cell	n	plan_cf	od_cf	cf_identical	fc_identical	plan_wall	od_wall
+re2.debian-gcc	72	476189	476189	YES	YES	1.00	0.70
+fmt.debian-gcc	51	979468	979468	YES	YES	1.59	1.10
+cereal.debian-gcc	80	490893	490893	YES	YES	2.62	1.44
+leveldb.debian-gcc	94	944052	944052	YES	YES	1.88	1.28
+nlohmann-json.debian-gcc	99	1224656	1224656	YES	YES	2.95	1.95
+spdlog.debian-gcc	168	765463	765463	YES	YES	2.53	1.54
+re2.fedora-clang-libcxx	72	517327	517327	YES	YES	2.22	1.28
+fmt.linuxbrew	51	806025	806025	YES	YES	1.47	1.07
+cereal.conan-gcc	80	500589	500589	YES	YES	2.64	1.45
+leveldb.fedora-clang-libcxx	94	1023994	1023994	YES	YES	3.15	1.93
