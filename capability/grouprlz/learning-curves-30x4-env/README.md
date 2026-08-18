@@ -1,5 +1,12 @@
 # Per-corpus panels: codec (colour) x docker env (dash), 4 passes
 
+> **PROVISIONAL — superseded grouping.** These cells were produced by the single-4x-stream
+> harness, in which a GRZ2 group can span the cold build into the first warm rebuild, so the
+> per-build boundaries here are **not independently closed** (only 48 of 176 pass endpoints
+> were GRZ2 close points). The 4x endpoints are correct and unchanged, but the intermediate
+> builds are not. Regenerate with `selector_passcell.sh`, whose prefix method closes and
+> independently decodes every build boundary — see `../pass-closure-proof/`.
+
 One file per **(corpus, docker env)**, since the panel is per corpus with colour = codec and
 dash = env. Each project is run **4 times back-to-back** — cold pass 1, warm rebuilds 2-4 —
 off one shared 4x manifest, so every codec sees literally the same TU sequence.
@@ -10,9 +17,17 @@ p29_cum_wire         P29+BSC line-interning (codec50, batch basis)
 grz2_cum_wire        GRZ2, binding --gtu 112; step function, forward-filled
 fastintern_cum_wire  ultra-fast interner (production-fused, dedup + z3)
 zstd3_cum_wire       zstd-3 per TU, independent -- the no-cross-TU-memory baseline
-pred_cum_wire        online prediction (empty-online-k2, cold, no seed)
+pred_cum_wire        Region-sequence ORACLE (empty-online-k2, cold, no seed)
+                     -- NOT a full-.ii wire; see the note below
 grz2_group_closes    1 where a GRZ2 group closed on this TU
 ```
+
+> **Prediction line — read this before comparing totals.** `pred_cum_wire` is a
+> **Region-sequence oracle** (`empty-online-k2`, cold, no pre-shared seed), **not a
+> full-`.ii` wire** like the other four columns. It predicts over the Region stream rather
+> than encoding the complete preprocessed input, so **its totals are NOT comparable to the
+> P29+BSC / GRZ2 / fast-interner / zstd-3 totals — only the SHAPE of its curve is.** Any
+> ratio taken against it is meaningless. This matches how the dashboard labels it.
 
 ## Coverage: 11 projects x 4 envs = 44 cells
 
