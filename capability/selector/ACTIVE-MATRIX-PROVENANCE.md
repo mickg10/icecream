@@ -16,6 +16,10 @@ foreground, resumable process. Every cell independently verifies the archive and
 digests, reconstructs the complete GRZ2 input exactly, and retains the complete codec wires,
 curves, timing logs, and whole-program zstd references.
 
+The exact cell identities, TU/raw extents, and archive payload digests are frozen in
+`verified-44-cells.tsv`. This is a complete 11-by-4 matrix; it contains no partial-profile
+projects.
+
 ## GRZ2 source and binary closure
 
 The deployed GRZ2 source is the accepted demand-populated decoder-ring source plus five
