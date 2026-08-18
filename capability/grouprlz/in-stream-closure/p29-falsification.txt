@@ -1,0 +1,22 @@
+=== P29 BYTE-PREFIX FALSIFICATION (re2, 72 TUs/build) ===
+
+-- the only wire artifact codec50 writes: the literal-group wire --
+1-build literal wire:   143842 B  sha=6280e06c38c0b611
+2-build literal wire:   143842 B  sha=6280e06c38c0b611
+cmp -n 143842 w1 w2 : IDENTICAL   <- this component IS prefix-stable
+
+-- but it is only part of the wire, and TOTAL is an ACCOUNTING SUM --
+category        1-build    2-build delta
+root              12936      13728 +792
+line_def         143895     143895 +0
+region_def       255738     255742 +4
+block_def          5867       7001 +1134
+path_def           6729       6729 +0
+missing           10467      11247 +780
+framing             500        788 +288
+TOTAL            436132     439130 +2998
+
+literal wire is 143842 B of TOTAL 436132 B
+=> no single stream exists in which to take per-build offsets;
+=> and appending an IDENTICAL build changes earlier categories (region_def +4),
+   which is retroactive re-encoding -- the immutability failure point 6 forbids.

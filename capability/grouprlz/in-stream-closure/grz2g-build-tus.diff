@@ -1,0 +1,82 @@
+--- /home/ttuser/grouprlz/grz2g.cpp	2026-08-17 23:01:08.626121744 +0000
++++ /home/ttuser/selbind/grzflush/grz2g_flush.cpp	2026-08-18 19:53:48.849074171 +0000
+@@ -205,6 +205,7 @@
+     u32 tbits_cap = 26;
+     int retry_test = 0;                  // parse every Nth group twice, assert identical
+     int select = 0;                      // 1 = per-group actual-byte backend selection
++    u64 build_tus = 0;                   // force a group close at every multiple of this
+ };
+ 
+ struct Buf { u8* p; size_t n; };
+@@ -245,6 +246,7 @@
+ struct GroupStat {
+     u64 idx, tu_lo, tu_hi, out_bytes, add_bytes, comp_bytes, hist_base, hist_extent;
+     const char* closed_by;
++    u64 end_offset;      // absolute byte offset in THIS stream after the group is written
+ };
+ 
+ static void encode(const char* in, const char* outp, const Cfg& cfg, const char* tupath,
+@@ -312,9 +314,18 @@
+         const char* closed = "eof";
+         if (cfg.mode != MODE_G0) {
+             u64 lim = std::min(tu_lo + cfg.gtu, ntu);
++            // A build boundary is a hard close: the group must end there so the build is
++            // complete and independently decodable at its own last TU.  Only the GROUP
++            // closes; matcher and dictionary state carry forward untouched.
++            bool at_build = false;
++            if (cfg.build_tus) {
++                u64 nb = (tu_lo / cfg.build_tus + 1) * cfg.build_tus;
++                if (nb < lim) { lim = nb; at_build = true; }
++                else if (nb == lim) at_build = true;
++            }
+             tu_hi = tu_lo + 1;
+             while (tu_hi < lim && tu[tu_hi + 1] - gpos <= cfg.graw) tu_hi++;
+-            closed = (tu_hi == lim) ? "tu" : "raw";
++            closed = (tu_hi == lim) ? (at_build ? "build" : "tu") : "raw";
+             s1 = tu[tu_hi];
+             if (tu_hi == tu_lo + 1 && s1 - gpos > cfg.graw) { closed = "oversize_single_tu"; oversize_tu++; }
+         }
+@@ -518,7 +529,7 @@
+         tent += now() - e0;
+ 
+         curves.push_back({gidx, tu_lo, tu_hi, gout, (u64)lits.size(), w.n - before,
+-                          hist_base, gpos - hist_base, closed});
++                          hist_base, gpos - hist_base, closed, w.n});
+         if (gout > max_group_out) max_group_out = gout;
+ 
+         // G2: release everything below the NEXT group's history base on the encoder side too,
+@@ -550,14 +561,15 @@
+     if (curve) {
+         FILE* cf = fopen(curve, "w");
+         if (cf) {
+-            fprintf(cf, "group\ttu_lo\ttu_hi\tout_bytes\tadd_bytes\tcomp_bytes\tratio\thist_base\thist_extent\tclosed_by\n");
++            fprintf(cf, "group\ttu_lo\ttu_hi\tout_bytes\tadd_bytes\tcomp_bytes\tratio\thist_base\thist_extent\tclosed_by\tend_offset\n");
+             for (auto& g : curves)
+-                fprintf(cf, "%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%.2f\t%llu\t%llu\t%s\n",
++                fprintf(cf, "%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%.2f\t%llu\t%llu\t%s\t%llu\n",
+                         (unsigned long long)g.idx, (unsigned long long)g.tu_lo, (unsigned long long)g.tu_hi,
+                         (unsigned long long)g.out_bytes, (unsigned long long)g.add_bytes,
+                         (unsigned long long)g.comp_bytes,
+                         g.comp_bytes ? (double)g.out_bytes / g.comp_bytes : 0.0,
+-                        (unsigned long long)g.hist_base, (unsigned long long)g.hist_extent, g.closed_by);
++                        (unsigned long long)g.hist_base, (unsigned long long)g.hist_extent, g.closed_by,
++                        (unsigned long long)g.end_offset);
+             fclose(cf);
+         }
+     }
+@@ -879,6 +891,7 @@
+             "usage: grz3 enc <in> <out> -u tu.map [-m g0|g1|g2] [-K n] [-s b] [-t b] [-l be] [-k be]\n"
+             "                 [-b blkMB] [-j n] [--gtu n] [--graw MB] [--gadd MB] [--hist MB]\n"
+             "                 [--anchor-budget MB] [--select 1] [--retry-test n] [--curve f.tsv]\n"
++            "                 [--build-tus n]   (close a group exactly at every n TUs)\n"
+             "       grz3 dec <in> <out> [-j n]            (requires END_FRAME; verifies digests)\n"
+             "       grz3 decprefix <in> <out> [-g n] [-j n]\n"
+             "       grz3 tu <manifest> <out.tu>\n");
+@@ -918,6 +931,7 @@
+         else if (!strcmp(o, "--select")) c.select = atoi(v);
+         else if (!strcmp(o, "--retry-test")) c.retry_test = atoi(v);
+         else if (!strcmp(o, "--curve")) curve = v;
++        else if (!strcmp(o, "--build-tus")) c.build_tus = atoll(v);
+         else die("unknown option");
+     }
+     encode(argv[2], argv[3], c, tup, curve);

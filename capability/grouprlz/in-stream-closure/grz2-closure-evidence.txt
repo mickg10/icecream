@@ -1,0 +1,35 @@
+=== GRZ2 IN-STREAM CLOSURE EVIDENCE (re2, 72 TUs/build) ===
+
+-- binaries --
+grz2g-flush            5071f4240051bcd0
+grz2g-selector(orig)   647883b7a346ae48
+
+-- streams: size + sha256 --
+1-build      401210 B  34a1b9626f77a165211964da78105d6b
+2-build      401921 B  74bf7e348fccbf80e78aa687e7585be2
+4-build      403343 B  97642b2751a9eec0d6e17fdded1dc905
+
+-- boundary offsets in the SINGLE 4-build stream --
+group	tu_lo	tu_hi	closed_by	end_offset
+0	0	72	build	401174
+1	72	144	build	401885
+2	144	216	build	402596
+3	216	288	build	403307
+
+-- per-build bytes DERIVED FROM OFFSETS (never from re-runs) --
+build 1: end_offset=401174 marginal=401174
+build 2: end_offset=401885 marginal=711
+build 3: end_offset=402596 marginal=711
+build 4: end_offset=403307 marginal=711
+
+-- point 6: earlier bytes immutable when a later build appends --
+cmp -n 401174 g1.grz g4.grz : IDENTICAL
+cmp -n 401885 g2.grz g4.grz : IDENTICAL
+
+-- point 4: each k-build stream decodes to exactly builds 1..k --
+k=1 DECODE=EXACT
+k=2 DECODE=EXACT
+k=4 DECODE=EXACT
+
+-- the REJECTED prefix method, for contrast --
+old 1x vs 2x independent encodes: /home/ttuser/selbind/prefixtest/g1.grz /home/ttuser/selbind/prefixtest/g2.grz differ: byte 93, line 1
