@@ -1050,7 +1050,6 @@ int main(int argc,char**argv){
     // ===== S1: LZ longest-previous-factor over region-id stream -> per-TU token streams + flat Blocks =====
     // token < NREG = region id ; token >= NREG = block id (flat span of region ids). Causal/prequential.
     std::vector<uint32_t> bchild; std::vector<size_t> boff2; boff2.push_back(0);
-    std::unordered_map<uint64_t,uint32_t> bdict;
     std::vector<uint32_t> tokstream; std::vector<size_t> tokoff; tokoff.push_back(0);
     std::vector<uint32_t> bcopy_src; std::vector<uint8_t> bcopy_ok;   // block k: def as COPY(src,len) if ok (source in prior TUs)
     // Per-TU sizes of the Region and Block id spaces: what has been DISCOVERED by TU t, never
