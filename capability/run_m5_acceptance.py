@@ -128,6 +128,7 @@ def parse_log(text: str) -> dict[str, object]:
             result["f_decode_cpu_gbps"] = float(fields["F_decode_cpu"])
             result["relationship_gbps"] = float(fields["relationship"])
             result["wall_seconds"] = float(fields["wall"].removesuffix("s"))
+            result["c_peak_mib"] = float(fields.get("C_peak", "0MiB").removesuffix("MiB"))
             result["f_peak_mib"] = float(fields["F_peak"].removesuffix("MiB"))
         elif line.startswith("PIPE_PATH "):
             fields = kv_fields(line)
@@ -970,6 +971,7 @@ def write_outputs(
         "c_factorization_gbps",
         "c_transform_gbps",
         "f_decode_cpu_gbps",
+        "c_peak_mib",
         "f_peak_mib",
         "pipe_mode",
         "c_pipe_to_wire_gbps",

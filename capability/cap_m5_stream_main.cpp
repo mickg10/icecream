@@ -1624,6 +1624,8 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
   }
   const double activeSeconds = seconds_since(activeStart);
   const double completeSeconds = seconds_since(processStart);
+  struct rusage coordinatorUsage {};
+  getrusage(RUSAGE_SELF, &coordinatorUsage);
 
   uint64_t socketBytes = 0, compilerBytes = 0, compilerTus = 0,
            compilerNs = 0, decodeNs = 0, pathNs = 0, failures = 0,
@@ -1747,11 +1749,12 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
              ? rawTotal / producerTiming.factorization / 1e9
              : 0.0);
   printf("THROUGHPUT C_transform=%.3f GB/s F_decode_cpu=%.3f GB/s "
-         "relationship=%.3f GB/s wall=%.6fs F_peak=%.1fMiB\n",
+         "relationship=%.3f GB/s wall=%.6fs C_peak=%.1fMiB "
+         "F_peak=%.1fMiB\n",
          transformSeconds ? rawTotal / transformSeconds / 1e9 : 0.0,
          decodeNs ? rawTotal / (double(decodeNs) / 1e9) / 1e9 : 0.0,
          activeSeconds ? rawTotal / activeSeconds / 1e9 : 0.0, activeSeconds,
-         peakRss / 1024.0);
+         coordinatorUsage.ru_maxrss / 1024.0, peakRss / 1024.0);
   printf("PIPE_PATH mode=real C_pipe_to_wire=%.3f GB/s "
          "F_wire_to_compiler_pipe=%.3f GB/s F_aggregate=%.3f GB/s "
          "F_pipe_write=%.3f GB/s complete=%.3f GB/s prepare=0.000000s "
