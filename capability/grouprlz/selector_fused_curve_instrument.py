@@ -23,11 +23,12 @@ def sub(tag, old, new, count=1):
 
 sub("opt", """        else if(!strcmp(argv[i],"--level")&&i+1<argc)only_level=atoi(argv[++i]); }""",
     """        else if(!strcmp(argv[i],"--level")&&i+1<argc)only_level=atoi(argv[++i]);
-        else if(!strcmp(argv[i],"--curve")&&i+1<argc)curve_out=argv[++i]; }""")
+        else if(!strcmp(argv[i],"--curve")&&i+1<argc)curve_out=argv[++i];
+        else if(!strcmp(argv[i],"--wire")&&i+1<argc)wire_out=argv[++i]; }""")
 
 sub("decl", """    const char* manifest=nullptr; size_t maxf=SIZE_MAX; int only_level=-1;""",
     """    const char* manifest=nullptr; size_t maxf=SIZE_MAX; int only_level=-1;
-    const char* curve_out=nullptr;   // OBSERVATION-ONLY""")
+    const char* curve_out=nullptr, *wire_out=nullptr;   // OBSERVATION-ONLY""")
 
 sub("open", """        Stats st{}; bool ok=true;""",
     """        Stats st{}; bool ok=true;
@@ -35,10 +36,15 @@ sub("open", """        Stats st{}; bool ok=true;""",
         FILE* curve=nullptr; uint64_t cum_raw=0, cum_wire=0; long tu_index=0;
         if(curve_out && !warm){ curve=fopen(curve_out,"w");
             if(curve) fprintf(curve,"tu\\traw\\twire\\tcumulative_raw\\tcumulative_wire\\t"
-                                    "keys\\tmissing\\toccurrences\\tbody_bytes\\n"); }""")
+                                    "keys\\tmissing\\toccurrences\\tbody_bytes\\n"); }
+        // OBSERVATION-ONLY: concatenated length-prefixed per-TU frames, so the physical
+        // wire can be byte-compared across runs of different length
+        FILE* wf=nullptr; if(wire_out && !warm) wf=fopen(wire_out,"wb");""")
 
 sub("row", """            st.rec+=seconds_since(t5); st.rbytes+=reconbuf.size(); st.keys+=nloc; st.miss+=nmiss; st.occ+=occ; st.tus++;""",
     """            st.rec+=seconds_since(t5); st.rbytes+=reconbuf.size(); st.keys+=nloc; st.miss+=nmiss; st.occ+=occ; st.tus++;
+            if(wf){ uint32_t L=(uint32_t)csz;
+                if(fwrite(&L,4,1,wf)!=1 || (L && fwrite(comp.data(),1,L,wf)!=L)){ fprintf(stderr,"wire write\\n"); return 2; } }
             if(curve){ cum_raw+=flen; cum_wire+=csz;   // OBSERVATION-ONLY
                 fprintf(curve,"%ld\\t%u\\t%zu\\t%llu\\t%llu\\t%zu\\t%llu\\t%zu\\t%zu\\n",
                         tu_index++, flen, csz, (unsigned long long)cum_raw,
@@ -47,6 +53,7 @@ sub("row", """            st.rec+=seconds_since(t5); st.rbytes+=reconbuf.size();
 
 sub("close", """        if(!ok) return 1;""",
     """        if(curve){ if(fclose(curve)!=0){ fprintf(stderr,"curve write failed\\n"); return 2; } }
+        if(wf){ if(fclose(wf)!=0){ fprintf(stderr,"wire write failed\\n"); return 2; } }
         if(!ok) return 1;""")
 
 open(dst, "w").write(text)

@@ -1,0 +1,36 @@
+=== GRZ2 IN-STREAM CLOSURE: FULL PROVENANCE ===
+
+-- source --
+grz2g.cpp (local-oracle)     906c84b935b7420e6118ec6d77aee52f0f770fa4202ec425939beb73c3e6862e
+grz2g_flush.cpp (corrected)  07f0713ebe57e029a1533bd30ea31c4d2d46e4c9740ce48d9a2aa1ed0c2ea37b
+grz2g-flush (binary)         ea04fd6b301930690c223c9f68d7f4fb167bee908384cdae5eb3650b16dd6be4
+
+-- exact build command --
+g++ -O3 -march=native -std=c++17 -I $HOME -I $HOME/libbsc -o grz2g-flush grz2g_flush.cpp $HOME/grouprlz/libbsc.a -lzstd -lpthread
+
+-- exact encode command (re2.debian-gcc, N=72) --
+grz2g-flush enc ii4 g4.grz -u tu4.map -m g2 -K 256 -s 6 -t 21 -l 4 -k 5 -b 8 --gtu 112 --graw 512 --gadd 128 --hist 1024 -j 8 --build-tus 72 --curve c4.tsv
+-- exact decode command --
+grz2g-flush dec g4.grz out -j 8
+
+-- stream hashes (full) --
+1-build     362280 B  923022ac653335e615929b2bed361a63c45216f3e3ee5254191a203d50d0ab9b
+2-build     362991 B  ad67bde2c6b72826e6e727268ce6c04791038d1a224d014f20a381aabcdd5490
+4-build     364413 B  4d47aa7026ef8f05ab16a856ca449e2bfba05410ca600a4185c317be20771449
+
+-- offsets, terminator, per-build physical bytes --
+open-stream offsets: 362244 / 362955 / 363666 / 364377
+complete container:  364413 B   terminator (END frame): 36 B
+per-build physical:  362244 / 711 / 711 / 747  <- terminator charged to the final build
+
+-- --build-tus validation (all must reject) --
+  0                        -> grz3: --build-tus must be > 0
+  -5                       -> grz3: --build-tus must be a positive integer
+  abc                      -> grz3: --build-tus must be a positive integer
+  12x                      -> grz3: --build-tus must be a positive integer
+                           -> grz3: --build-tus requires a value
+  99999999999999999999999  -> grz3: --build-tus out of range
+
+-- scope --
+--build-tus N is a FIXED-PERIOD boundary: closes at every multiple of N.
+It is not an arbitrary boundary list; unequal build sizes are out of scope.
