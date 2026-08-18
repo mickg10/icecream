@@ -63,12 +63,32 @@ summary separately.  In the retained 4-F failover smoke row, the reply ledger
 closes **56,079,068 B / 20 TUs**; the intentionally incomplete summaries cover
 **50,057,710 B / 18 TUs** and explicitly report one lost summary.
 
-Current executed gates at `58f41bbf`:
+The same audit found two incompatible `H200` calculations.  The batch path
+used a 5%-raw window but silently enlarged it to at least 64 TUs; the one-pass
+path used a fixed 32-TU window and did not check the required following 10%
+persistence interval.  Neither is the ruled metric.  Commit `5f336d13`
+replaces both with one shared calculation:
+
+```text
+candidate at a complete-TU boundary
+  trailing complete-TU window covers at least 5% of total raw bytes
+  trailing raw / trailing physical wire >= 200x
+  the rolling trailing window remains >= 200x through at least
+  the following 10% of total raw bytes
+```
+
+A candidate in the final 10% cannot establish persistence.  Focused tests
+exercise a transient 200x hit followed by a drop and prove that it is not
+reported.  Consequently, every historical `H200` value in the table below is
+withdrawn until the complete typed matrix regenerates it with this shared
+definition.  Historical cold/CACHE50/socket byte ledgers are unaffected.
+
+Current executed gates through `5f336d13`:
 
 | Gate | Result |
 |---|---:|
 | warning-clean optimized builds | PASS |
-| focused M4/state tests, including typed closure | PASS |
+| focused M4/state tests, including typed closure and raw-weighted H200 | PASS |
 | expanded typed smoke suite | **45/45 exact** |
 | batch rejection/rollback under ASan+UBSan | PASS, 20 commits / 2 prepared aborts |
 | bounded one-pass grow/removal under ASan+UBSan | PASS, 79,376 / 127,633 / 856 removals and 20 compactions |
@@ -206,6 +226,11 @@ The bounded snapshot/resume row reproduces exactly those same four counts and th
 C snapshots contain global public-Line authority, paths, counters, and every per-F mirror. F snapshots contain only dynamic state for the latched generation: resident Region bytes, public Lines, Blocks, paths, LRU ticks, limits, and cumulative removal/compaction counters. Focused tests cover round trips, generation mismatch, and partial snapshot rejection.
 
 ## Fixed-16 cold results
+
+> **Historical metric warning:** the byte, ratio, latency, and memory columns
+> below remain the retained batch observations. The `H200` column used the
+> superseded calculation and is not current acceptance evidence; it will be
+> replaced by the complete typed rerun.
 
 The table below shows the zstd-3 component policy. Every zstd-1 counterpart also executed and is retained in the TSV/JSON. `C50` is the cumulative raw/wire ratio at the TU crossing half of raw bytes. `H200` is the earliest stable trailing-window 200x crossing, reported as raw fraction and TU. `none` means that the corpus did not establish that crossing under the retained definition.
 
@@ -359,12 +384,20 @@ Primary files:
 
 ## Scope boundary and remaining product work
 
-M5 proves the planned product-shaped capability with actual local sockets, independent F stores, bounded state, snapshots, real pipes, exact downstream consumption, and the measured rate point. It does not by itself land protocol 50 in the production icecc daemons. In particular:
+The M5 capability target is a product-shaped prototype with actual local
+sockets, independent F stores, bounded state, snapshots, real pipes, exact
+downstream consumption, and a complete-rate measurement. It does not by
+itself land protocol 50 in the production icecc daemons. In particular:
 
 - the downstream consumer is an exact verifier process, not an invoked compiler;
-- the C side prepares the complete benchmark corpus before starting relationships, so `complete` input-to-output timing is diagnostic rather than the binding streaming rate;
+- the historical batch runner prepares the complete benchmark corpus before
+  starting relationships; only the newer one-pass runner binds the producer,
+  protocol, reconstruction, and verifier under one complete timer;
 - the fixed-16 M5 semantic payload is the ruled reduced grammar, not the newer P29+BSC or GROUP-RLZ research codec;
 - eight independent F stores trade approximately 2.1x the one-F wire bytes for the measured aggregate rate; a shared cache module or affinity policy could recover some reuse in a later daemon integration;
 - H200 remains `none` where the retained stable-window definition is not established.
 
-Those boundaries are deliberate in `CAPABILITY-PLAN.md`. Within the M1-M5 capability scope, the implementation and retained gate are complete.
+Those boundaries are deliberate in `CAPABILITY-PLAN.md`. The historical
+batch-scenario scope is complete, but it is no longer sufficient evidence for
+the current typed protocol. M5 remains open until the focused complete-rate
+gate and the complete fixed-16 typed rerun pass with the shared H200 rule.
