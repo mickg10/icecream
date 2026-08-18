@@ -1,0 +1,16 @@
+COLD_1F_STICKY_CODEC -- direct isolated C-encode, in-memory producer, 3 reps each
+
+  corpus              raw    P29 wire      /z19 C_enc GB/s GRZ wire   GRZ/z19 selected 
+  range-v3      632049016      739437    0.9985     1.128   628319    0.8484 GRZ2     
+  catch2        947252235      907327    1.1332     1.456   626178    0.7821 GRZ2     
+  rocksdb      3114320596     8533638    1.3765     0.856  5456878    0.8802 GRZ2     
+  eigen        3532268956     1143631    0.9215     2.009  2040151    1.6439 P29+BSC  
+  llvm         3620271340     7275808    0.9972     1.158  7638087    1.0468 P29+BSC  
+
+Traceback (most recent call last):
+  File "<stdin>", line 16, in <module>
+  File "<stdin>", line 16, in <genexpr>
+  File "/usr/lib/python3.10/statistics.py", line 449, in median
+    data = sorted(data)
+  File "<stdin>", line 16, in <genexpr>
+NameError: name 'C_encode_GBps' is not defined
