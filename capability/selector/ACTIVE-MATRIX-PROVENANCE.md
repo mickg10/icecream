@@ -1,4 +1,4 @@
-# Active 44-cell replay: provenance and reuse boundary
+# Completed 44-cell replay: provenance and reuse boundary
 
 Date: 2026-08-18 UTC
 
@@ -11,7 +11,7 @@ Retained run:
 ```
 
 This replay is a measurement cache, not a fitted or resource-normalized selector result. It
-traverses the 44 verified `ice-ii-corpus-v1` cells (11 projects by four build profiles) in one
+traversed the 44 verified `ice-ii-corpus-v1` cells (11 projects by four build profiles) in one
 foreground, resumable process. Every cell independently verifies the archive and ordered TU
 digests, reconstructs the complete GRZ2 input exactly, and retains the complete codec wires,
 curves, timing logs, and whole-program zstd references.
@@ -91,7 +91,7 @@ small-corpus F rates were dominated by populating the unused logical ring.
 
 ## P29 source and known correction boundary
 
-The active replay predates the chronological Root-token correction:
+The completed replay predates the chronological Root-token correction:
 
 ```text
 P29 source commit
@@ -104,11 +104,36 @@ P29 binary SHA-256
 
 The corrected source is commit `56c1744` on
 `local-oracle/issue16-p29-prefix-state`. It uses stable Region/Block Root tags and has a
-suffix-blind identity gate. The active replay does not contain that correction.
+suffix-blind identity gate. The completed replay does not contain that correction.
 
-The active runner also truncates its short P29 run to GRZ2's first-group TU count. GRZ2 may close
+The replay runner also truncates its short P29 run to GRZ2's first-group TU count. GRZ2 may close
 before TU112 because of its raw or ADD cap, while P29's first literal group still spans TU112.
 Those rows compare different source extents and are not selector inputs.
+
+## Completion and corrected size join
+
+The diagnostic replay completed all 44 cells at `2026-08-18T05:12:42Z`; every complete GRZ2
+decode compared exactly. Its complete legacy-P29/GRZ2/zstd summary is retained with the run.
+
+The separate corrected P29 sweep then passed stable-Root prefix identity on 44/44 cells. The
+independent size-only join is retained and checked in under
+`policy-b-size-census-v1/`. It rechecks the corrected P29 prefix wire and complete curve, the
+complete GRZ2 wire, and both whole-program zstd references for every cell. Aggregate results:
+
+```text
+raw                                          74,539,226,911 B
+whole-program zstd-19-long                       64,489,971 B
+corrected P29                                    71,169,904 B  (1.103581x z19)
+GRZ2                                             71,395,383 B  (1.107077x z19)
+per-cell hindsight                              62,587,653 B  (0.970502x z19)
+500 MB TU112-raw threshold                      63,153,492 B  (0.979276x z19)
+leave-one-project-out TU112-raw threshold       63,153,492 B  (0.979276x z19)
+```
+
+The project-held-out threshold is correct on 42/44 cells and leaves 7,785,476 bytes of margin
+under the 1.10x-zstd-19 limit. This closes a 44-cell cold-size capability point only. It does not
+close resource accounting, fixed-16/native-25 generalization, or the TU100/TU200 chronological
+gates.
 
 ## What may be reused
 
@@ -120,17 +145,14 @@ Those rows compare different source extents and are not selector inputs.
   research harness retains its literal-group wire, not one monolithic P29 container);
 - all retained logs and hashes needed to audit those measurements.
 
-## What must be regenerated before fitting
+## What remains before binding
 
-- complete P29 with stable Root tags;
-- suffix-blind P29 through `min(112, total_TUs)`, regardless of where GRZ2 closes group one;
-- exact complete-versus-suffix-blind prefix identity for every P29 row;
 - P29 C-stage timing that directly accounts for the shared input producer, interning, planning,
   material construction, entropy work, and serialization without subtracting an inferred F time;
 - a TU112 probe makespan and core-seconds measurement under one fixed total core budget;
-- final labels and selected totals using only the corrected complete wires;
-- lineage-held-out selector evaluation, fixed-16 replay, native-25 replay, and all verified v2
-  cells.
+- fixed-16, native-25, and additional verified-lineage replay of the raw-extent policy;
+- TU100 and TU200 cumulative-transfer comparison against whole-program zstd-6-long checkpoints;
+- live buffering/decision accounting for the TU112 policy.
 
-Until those rows exist, any complete-size minimum is a hindsight ceiling and any rate-composed
-selection total is diagnostic only.
+Until those rows exist, the 63,153,492-byte row is a held-out size capability, not a bound
+resource or live-pipeline result.

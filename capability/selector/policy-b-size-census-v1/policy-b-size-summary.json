@@ -1,0 +1,68 @@
+{
+  "all_exact": true,
+  "all_prefix_identical": true,
+  "always_grz": {
+    "bytes": 71395383,
+    "headroom_to_1_10_z19_bytes": -456415,
+    "meets_1_10_z19": false,
+    "over_z19": 1.107077300437924,
+    "raw_ratio": 1044.0342747513519
+  },
+  "always_p29": {
+    "bytes": 71169904,
+    "headroom_to_1_10_z19_bytes": -230936,
+    "meets_1_10_z19": false,
+    "over_z19": 1.1035809583477716,
+    "raw_ratio": 1047.3419622850693
+  },
+  "cells": 44,
+  "complete_winner_cells": {
+    "grz": 34,
+    "p29": 10
+  },
+  "fixed_500m_raw_threshold": {
+    "bytes": 63153492,
+    "headroom_to_1_10_z19_bytes": 7785476,
+    "meets_1_10_z19": true,
+    "over_z19": 0.9792761730347188,
+    "raw_ratio": 1180.2867038769607
+  },
+  "fixed_threshold_bytes": 500000000,
+  "heldout_correct_cells": 42,
+  "heldout_regret_bytes": 565839,
+  "heldout_threshold_max_bytes": 510880565,
+  "heldout_threshold_min_bytes": 479182801,
+  "hindsight": {
+    "bytes": 62587653,
+    "headroom_to_1_10_z19_bytes": 8351315,
+    "meets_1_10_z19": true,
+    "over_z19": 0.9705021110956927,
+    "raw_ratio": 1190.9573747876439
+  },
+  "one_point_one_z19_limit_bytes": 70938968,
+  "profiles": [
+    "conan-gcc",
+    "debian-gcc",
+    "fedora-clang-libcxx",
+    "linuxbrew"
+  ],
+  "project_heldout_raw_threshold": {
+    "bytes": 63153492,
+    "headroom_to_1_10_z19_bytes": 7785476,
+    "meets_1_10_z19": true,
+    "over_z19": 0.9792761730347188,
+    "raw_ratio": 1180.2867038769607
+  },
+  "projects": 11,
+  "raw_bytes": 74539226911,
+  "schema": "policy-b-size-census-v1",
+  "timing_scope": "excluded: source sweep was not isolated and omitted required P29 plan work",
+  "tooling": {
+    "grz_binary_sha256": "647883b7a346ae48d76ea2ac542240e5c78b4a56049372ee6067f5ec94276af9",
+    "grz_source_sha256": "e997b612c3445c951fa8bfc4abd2942fbad532fac85ebae5aa5fe753fe64a6b9",
+    "p29_binary_sha256": "3967d6ca12b034c0752485a81f3c0dd64f2196c52d1ab32b18f82fadf678418e",
+    "p29_source_sha256": "89ed3b299332f90898b0bd86338052d67d686e93797d2e332080f7ed33c7c753"
+  },
+  "z19_long_bytes": 64489971,
+  "z6_long_bytes": 84550636
+}
