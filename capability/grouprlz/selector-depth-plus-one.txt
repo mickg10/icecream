@@ -1,0 +1,42 @@
+rows: docker 44, fixed16 16
+
+Baseline regret (lower is better):
+  docker   frozen-500MB     564099 | always-GRZ    8810160 | always-P29    8582092 | oracle 0
+  fixed16  frozen-500MB   21769955 | always-GRZ   19587482 | always-P29    7539040 | oracle 0
+
+LEAVE-ONE-PROJECT-OUT (fit on all other projects, both families together):
+  depth + feature         held docker held fixed16        total
+  depth + seen_frac           1921792     20939932     22861724
+  depth + ref_per_lit         2779404     20884930     23664334
+  depth + remaining_tus       3040977     21221487     24262464
+  depth + regions             8001249     20941849     28943098
+  depth + ratio              10618913     20043495     30662408
+  depth + regions_per_mb      9331965     21333372     30665337
+  depth + distinct_per_region      9860056     20977642     30837698
+  depth + addfrac            10279992     20977642     31257634
+  depth + litfrac            10688314     20977642     31665956
+
+BEST-ON-ALL rule (reported for inspection, NOT held out):
+  P29+BSC iff depth >= 14.5 and seen_frac <= 0.0904685
+  docker   regret     823797 (frozen     564099)  TP=5 FP=1 FN=5
+  fixed16  regret     953356 (frozen   21769955)  TP=2 FP=1 FN=1
+
+  the named cells:
+    fixed16  llvm       depth    39.3  seen_frac      0.09047  label P29  rule P29  ok
+    fixed16  eigen      depth    84.2  seen_frac       0.1723  label P29  rule GRZ  WRONG
+    fixed16  rocksdb    depth     3.6  seen_frac       0.1801  label GRZ  rule GRZ  ok
+    fixed16  godot      depth    36.4  seen_frac      0.05075  label P29  rule P29  ok
+
+HOW CONCENTRATED IS THE METRIC? (regret of always-GRZ, i.e. what a classifier must recover)
+  fixed-16 total recoverable = 19587482
+    godot        18333398   93.6% of the whole metric
+    eigen          898354    4.6% of the whole metric
+    llvm           355730    1.8% of the whole metric
+  docker-44 total recoverable = 8810160
+    eigen/fedora-clang-libcxx       2544644   28.9%
+    eigen/conan-gcc                 1950560   22.1%
+    eigen/linuxbrew                 1565508   17.8%
+    eigen/debian-gcc                1557160   17.7%
+    opencv/fedora-clang-libcxx       464123    5.3%
+
+  => fixed-16 byte-regret is dominated by ONE corpus; it cannot validate a classifier.
