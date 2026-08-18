@@ -1,4 +1,20 @@
-# In-stream closure: breadth proof + the history-window law
+# In-stream closure
+
+> ## WITHDRAWN: the general "+711 per warm rebuild"
+>
+> The constant marginal is a **small-corpus regime, not a universal**, and it must not be
+> quoted as a general warm-rebuild cost. A warm rebuild stays nearly free **only while the
+> matching earlier build is still inside the retained `--hist` window**. Once the corpus
+> exceeds roughly `hist/3` the earlier build is evicted and the marginal climbs toward a
+> **second cold build** — measured: range-v3 **+625,060 B** on build 3, catch2 **+251,604**
+> on build 2 and **+502,895** on build 3, cereal **+154,086** on build 4.
+>
+> Mechanism, straight from the group curve: `hist_base` goes non-zero, `hist_extent` pins at
+> the cap, and once `hist_base` passes build 1's extent that build can no longer be matched.
+> This is the bounded-history codec doing exactly what it says — not a harness artifact.
+> Only the 4-pass design makes it visible; a single pass would have left "+711" looking
+> universal.
+
 
 ## GRZ2 across 9 cells (4 docker profiles, native, 51-861 TUs/build)
 
