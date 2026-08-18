@@ -988,6 +988,9 @@ int main(int argc,char**argv){
     if(sinkCurvePath&&!cfSinkPath){fprintf(stderr,"--sink-curve requires --cf-sink\n");return 2;}
     if(sinkBuildTus&&!cfSinkPath){fprintf(stderr,"--sink-build-tus requires --cf-sink\n");return 2;}
     if(cfSinkPath&&!fcSinkPath){fprintf(stderr,"--cf-sink requires --fc-sink: the reverse direction is reported, never dropped\n");return 2;}
+    // Without S1 there are no Blocks and no route matcher, so --route-s1 would exit 0 having
+    // gated nothing -- a silent no-op is worse than a refusal.
+    if(routeCount&&!useS1){fprintf(stderr,"--route-s1 requires S1; --v1 has no Blocks to share\n");return 2;}
     if(cfSinkPath&&(warm||replayRepetitions!=1)){fprintf(stderr,"the wire sinks require a single measured pass (no --warm/--replay-repetitions)\n");return 2;}
     if(literalGroupWorkers!=1&&!literalGroupPrefix){fprintf(stderr,"--literal-group-workers requires --literal-group-prefix\n");return 2;}
     if(literalGroupPrefix&&(!useMixedRegions||useAlphaLines||useResidualLdm)){fprintf(stderr,"literal groups require ordinary --mixed-regions literal coding\n");return 2;}
@@ -1330,6 +1333,12 @@ int main(int argc,char**argv){
                 const p29::TuPlan rp=routeS1->admit(tuRegions);
                 if(blockCatalogue.size()!=before){fprintf(stderr,"1F seam: route admission grew the catalogue %zu -> %zu at TU=%zu\n",before,blockCatalogue.size(),t);return 2;}
                 if(rp.root.size()!=plan.root.size()||rp.block_uses.size()!=plan.block_uses.size()){fprintf(stderr,"1F seam: Root/BlockUse counts differ at TU=%zu\n",t);return 2;}
+                // Identical 1F histories must give identical occurrence windows -- asserted
+                // rather than inferred from the plans agreeing.
+                if(rp.occurrence_begin!=plan.occurrence_begin||rp.occurrence_end!=plan.occurrence_end){fprintf(stderr,"1F seam: occurrence window differs at TU=%zu\n",t);return 2;}
+                // The direct invariant: GLOBAL admitted this exact plan first, so the route
+                // must find everything and mint nothing.
+                if(!rp.new_blocks.empty()){fprintf(stderr,"1F seam: route minted %zu Block(s) at TU=%zu\n",rp.new_blocks.size(),t);return 2;}
                 for(size_t i=0;i<rp.root.size();++i)
                     if(rp.root[i].kind!=plan.root[i].kind||rp.root[i].id!=plan.root[i].id){fprintf(stderr,"1F seam: Root ref %zu differs at TU=%zu\n",i,t);return 2;}
                 for(size_t i=0;i<rp.block_uses.size();++i){
@@ -1340,6 +1349,7 @@ int main(int argc,char**argv){
                     // first and MINTS, so the route then FINDS the same id.  That asymmetry is
                     // positive evidence the catalogue is shared -- with separate catalogues
                     // both would report a fresh mint -- so it is asserted rather than ignored.
+                    if(b.canonical_was_new){fprintf(stderr,"1F seam: the route minted Block %u at TU=%zu after GLOBAL admitted the identical plan\n",b.block_id,t);return 2;}
                     if(a.canonical_was_new&&b.canonical_was_new){fprintf(stderr,"1F seam: both matchers minted Block %u at TU=%zu, so the catalogue is not shared\n",a.block_id,t);return 2;}
                 }
             }
