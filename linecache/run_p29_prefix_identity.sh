@@ -13,6 +13,9 @@ SOURCE_MANIFEST=${SOURCE_MANIFEST:-}
 PREPARE_CELL=${PREPARE_CELL:-}
 
 P29_BIN=${P29_BIN:-/home/ttuser/issue16-p29-prefix-state/bin/codec50-prefix}
+P29_SOURCE=${P29_SOURCE:-}
+P29_COMMIT=${P29_COMMIT:-56c1744d1ef8c3ee6ce0c785e80b2ea4123bb720}
+LIBBSC_COMMIT=${LIBBSC_COMMIT:-baffa62c70b6ebbecc9af14ce550e965ea247680}
 CORES=${CORES:-16-31}
 GROUP_TUS=${GROUP_TUS:-112}
 PREFIX_TUS=${PREFIX_TUS:-$GROUP_TUS}
@@ -60,6 +63,13 @@ if (( prefix_tus != total_tus && prefix_tus % GROUP_TUS != 0 )); then
         "$prefix_tus" "$GROUP_TUS" >&2
     exit 1
 fi
+if (( prefix_tus < total_tus )); then
+    prefix_mode=suffix-blind
+    prefix_entropy_args=(--open-final-entropy)
+else
+    prefix_mode=complete-program
+    prefix_entropy_args=()
+fi
 head -n "$prefix_tus" "$manifest" > "$RUN_DIR/input/manifest.prefix.txt"
 
 P29_COMMON=(
@@ -86,18 +96,18 @@ printf 'running complete stable-Root P29+BSC\n'
     --component-curve-tsv "$RUN_DIR/full/components.tsv" \
     > "$RUN_DIR/full/grouped.stdout" 2> "$RUN_DIR/full/grouped.stderr"
 
-printf 'forming suffix-blind raw-plane plan (%s TUs)\n' "$prefix_tus"
+printf 'forming %s raw-plane plan (%s TUs)\n' "$prefix_mode" "$prefix_tus"
 /usr/bin/time -v -o "$RUN_DIR/prefix/plan.time" \
     taskset -c "$CORES" "$P29_BIN" --manifest "$RUN_DIR/input/manifest.prefix.txt" \
     "${P29_COMMON[@]}" --mixed-dump-prefix "$RUN_DIR/prefix/plan" \
     > "$RUN_DIR/prefix/plan.stdout" 2> "$RUN_DIR/prefix/plan.stderr"
 
-printf 'running suffix-blind open-stream P29+BSC\n'
+printf 'running %s prefix P29+BSC\n' "$prefix_mode"
 /usr/bin/time -v -o "$RUN_DIR/prefix/grouped.time" \
     taskset -c "$CORES" "$P29_BIN" --manifest "$RUN_DIR/input/manifest.prefix.txt" \
     "${P29_COMMON[@]}" \
     --literal-group-prefix "$RUN_DIR/prefix/plan" --literal-group-tus "$GROUP_TUS" \
-    --stable-root-tags --open-final-entropy \
+    --stable-root-tags "${prefix_entropy_args[@]}" \
     --literal-group-workers "$P29_WORKERS" --literal-group-skip-zstd10 \
     --literal-group-wire "$RUN_DIR/prefix/literal.wire" \
     --curve-tsv "$RUN_DIR/prefix/curve.tsv" \
@@ -120,6 +130,10 @@ python3 "$SCRIPT_DIR/verify_p29_prefix_identity.py" \
 
 tooling=("$P29_BIN" "$SCRIPT_PATH" "$SCRIPT_DIR/verify_p29_prefix_identity.py")
 if [[ -n "$PREPARE_CELL" ]]; then tooling+=("$PREPARE_CELL"); fi
+if [[ -n "$P29_SOURCE" ]]; then
+    [[ -f "$P29_SOURCE" ]] || { printf 'missing P29 source: %s\n' "$P29_SOURCE" >&2; exit 1; }
+    tooling+=("$P29_SOURCE")
+fi
 sha256sum "${tooling[@]}" > "$RUN_DIR/tooling.sha256"
 {
     printf 'host=%s\n' "$(hostname)"
@@ -127,9 +141,13 @@ sha256sum "${tooling[@]}" > "$RUN_DIR/tooling.sha256"
     printf 'source_manifest=%s\n' "$SOURCE_MANIFEST"
     printf 'total_tus=%s\n' "$total_tus"
     printf 'prefix_tus=%s\n' "$prefix_tus"
+    printf 'prefix_mode=%s\n' "$prefix_mode"
     printf 'group_tus=%s\n' "$GROUP_TUS"
     printf 'cores=%s\n' "$CORES"
     printf 'omp_num_threads=%s\n' "$OMP_NUM_THREADS"
+    printf 'p29_commit=%s\n' "$P29_COMMIT"
+    printf 'libbsc_commit=%s\n' "$LIBBSC_COMMIT"
+    printf 'zstd_version=%s\n' "$(zstd --version)"
     printf 'completed_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } > "$RUN_DIR/run.meta"
 

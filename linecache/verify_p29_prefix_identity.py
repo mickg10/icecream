@@ -154,6 +154,9 @@ def main() -> int:
         "prefix_tus": args.prefix_tus,
         "group_tus": args.group_tus,
         "full_tus": len(full_curve),
+        "prefix_mode": (
+            "suffix-blind" if args.prefix_tus < len(full_curve) else "complete-program"
+        ),
         "curve_identical": curve_identical,
         "components_identical": components_identical,
         "prefix_wire_bytes": int(prefix_curve[-1]["cumulative_wire_bytes"]),

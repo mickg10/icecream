@@ -106,12 +106,14 @@ Retained runs:
 
 1. flag-off output remains byte-identical to the frozen legacy binary;
 2. stable-tag complete output is exact;
-3. a suffix-blind one-group run equals the first complete-run group;
-4. a suffix-blind two-group run equals the first two complete-run groups;
-5. a seven-TU input with three-TU groups exercises a partial final group;
-6. the fixture actually defines an S1 Block, so the namespace correction is exercised;
-7. inconsistent diagnostic mode is rejected;
-8. existing malformed literal-plan rejection remains active.
+3. a second normally terminated complete-program run is byte-identical (the mode used when the
+   program ends at or before the decision boundary);
+4. a suffix-blind one-group run equals the first complete-run group;
+5. a suffix-blind two-group run equals the first two complete-run groups;
+6. a seven-TU input with three-TU groups exercises a partial final group;
+7. the fixture actually defines an S1 Block, so the namespace correction is exercised;
+8. inconsistent diagnostic mode is rejected;
+9. existing malformed literal-plan rejection remains active.
 
 Exact output on the final binary:
 
@@ -167,6 +169,11 @@ at TU112:
     retain the selected encoder's state and discard the other
 ```
 
+If the complete program has at most 112 TUs, the decision is at program end. There is no unseen
+suffix, so both identity runs terminate normally and include the same entropy END bytes. Diagnostic
+open-final mode is used only when `prefix_tus < complete_tus`; applying it to an already complete
+program would create an artificial tail difference.
+
 The currently running 44-cell matrix remains useful for whole-program labels and GRZ features,
 but its P29 short probe used the GRZ first-group TU count. Cells where that count is below 112
 must be regenerated with stable Root tags, a suffix-blind open-stream gate, and the common TU112
@@ -179,3 +186,16 @@ decision point before fitting the selector.
 3. fit and evaluate the selector with whole projects held out;
 4. replay native-25, preserving the same TU112 decision contract;
 5. put the selected codec behind the live compiler-pipe adapter.
+
+The corrected P29-only matrix pass is driven by `run_p29_prefix_matrix.sh`. It freezes an exact
+cell ledger before execution, is foreground and resumable, rejects tooling or execution-config
+drift, and runs the identity gate for every cell. `summarize_p29_prefix_matrix.py` independently
+rechecks artifact hashes, curves, components, complete totals, provenance, and both prefix modes
+before emitting a TSV, JSON summary, and Markdown report. Its process timings are explicitly
+diagnostic; selector resource accounting belongs to the common-input runner.
+
+The ledger verifier resolves only `corpus.json.payload.path`; it never selects an archive by a
+filename glob. This matters because some matrix directories retain an older project-named build
+package alongside the later active `ii.tar.zst` corpus generation. The frozen ledger binds the
+declared payload path and byte count, payload digest, corpus digest, manifest digest, TU count, and
+raw extent before any codec process runs.

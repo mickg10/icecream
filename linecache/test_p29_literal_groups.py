@@ -188,6 +188,39 @@ def main() -> int:
         if "byte-exact=OK" not in stable_output or "stable Root tags" not in stable_output:
             raise RuntimeError(f"stable-Root run was not exact and bound:\n{stable_output}")
 
+        # A program that ends before a full selector group has no unseen suffix.  Its replay
+        # must terminate normally (including entropy END bytes), and a second complete run must
+        # be identical.  The matrix runner uses this mode for programs with at most 112 TUs.
+        stable_repeat_wire = root / "stable-repeat.wire"
+        stable_repeat_curve = root / "stable-repeat.tsv"
+        stable_repeat_components = root / "stable-repeat-components.tsv"
+        stable_repeat_output = run(
+            [
+                str(grouped),
+                *common,
+                "--literal-group-prefix",
+                str(prefix),
+                "--literal-group-tus",
+                "3",
+                "--stable-root-tags",
+                "--literal-group-skip-zstd10",
+                "--literal-group-wire",
+                str(stable_repeat_wire),
+                "--curve-tsv",
+                str(stable_repeat_curve),
+                "--component-curve-tsv",
+                str(stable_repeat_components),
+            ]
+        )
+        if "byte-exact=OK" not in stable_repeat_output:
+            raise RuntimeError(f"complete-program repeat was not exact:\n{stable_repeat_output}")
+        if stable_repeat_wire.read_bytes() != stable_wire.read_bytes():
+            raise RuntimeError("complete-program literal replay differs")
+        if stable_repeat_curve.read_bytes() != stable_curve.read_bytes():
+            raise RuntimeError("complete-program curve replay differs")
+        if stable_repeat_components.read_bytes() != stable_components.read_bytes():
+            raise RuntimeError("complete-program component replay differs")
+
         prefix_manifest = root / "manifest-first.txt"
         prefix_manifest.write_text("".join(f"{path}\n" for path in paths[:3]))
         prefix_plan = root / "p29-first"
