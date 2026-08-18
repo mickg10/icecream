@@ -1180,6 +1180,10 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
   MixedEncoder encoder;
   encoder.init(0, 0);
   CodecContexts codec;
+  std::vector<std::unique_ptr<CodecContexts>> fillCodecs;
+  fillCodecs.reserve(options.wave);
+  for (uint32_t index = 0; index < options.wave; ++index)
+    fillCodecs.push_back(std::make_unique<CodecContexts>());
   std::array<ComponentLedger, CK_COUNT> components{};
   PreparedQueue queue(options.queue_depth);
   ProducerTiming producerTiming;
@@ -1283,7 +1287,7 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
       auto &job = pending[index];
       auto &worker = workers[job.worker];
       auto &fill = fills[index];
-      auto transformBegin = Clock::now();
+      auto materializeBegin = Clock::now();
       {
         std::lock_guard<std::mutex> lock(dictMutex);
         uint32_t currentNreg = uint32_t(dict.region_count());
@@ -1316,16 +1320,32 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
         for (size_t part = 0; part < 4; ++part)
           fill.raw[part] = encoder.mixedRaw[part];
       }
-      fill.encoded_paths = encode_component(fill.paths, options.policy, codec,
-                                            components[CK_PATH]);
-      for (size_t part = 0; part < 4; ++part)
-        fill.encoded[part] =
-            encode_component(fill.raw[part], options.policy, codec,
-                             components[CK_CONTROL + part]);
-      transformSeconds += seconds_since(transformBegin);
+      transformSeconds += seconds_since(materializeBegin);
     }
     if (!relationshipExact)
       break;
+
+    auto encodeWaveBegin = Clock::now();
+    std::vector<std::thread> encoders;
+    encoders.reserve(pending.size());
+    for (size_t index = 0; index < pending.size(); ++index)
+      encoders.emplace_back([&, index] {
+        auto &fill = fills[index];
+        auto &local = *fillCodecs[index];
+        fill.encoded_paths = capp::encode_component(
+            fill.paths, options.policy, local.z1, local.z3, true);
+        for (size_t part = 0; part < 4; ++part)
+          fill.encoded[part] = capp::encode_component(
+              fill.raw[part], options.policy, local.z1, local.z3, true);
+      });
+    for (auto &encoderThread : encoders)
+      encoderThread.join();
+    transformSeconds += seconds_since(encodeWaveBegin);
+    for (const auto &fill : fills) {
+      components[CK_PATH].note(fill.encoded_paths);
+      for (size_t part = 0; part < 4; ++part)
+        components[CK_CONTROL + part].note(fill.encoded[part]);
+    }
 
     std::vector<uint8_t> sent(pending.size(), 0);
     std::vector<std::thread> senders;
