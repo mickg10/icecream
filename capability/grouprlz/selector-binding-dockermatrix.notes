@@ -1,0 +1,11 @@
+# cells=36
+# debian-gcc             n= 9 raw=    4.75GB selected=   8306507 /z19=1.1139 x_raw= 571.88  hindsight_x= 678.58  GRZ2_wins=3 P29BSC_wins=6  P29BSC_floor_miss=9/9  selF_miss=1/9
+#                        GRZ2_only_x= 672.26  P29BSC_only_x= 529.74  z19_x= 637.00
+# conan-gcc              n= 9 raw=    5.09GB selected=   8533091 /z19=1.1128 x_raw= 596.25  hindsight_x= 708.90  GRZ2_wins=3 P29BSC_wins=6  P29BSC_floor_miss=9/9  selF_miss=1/9
+#                        GRZ2_only_x= 696.86  P29BSC_only_x= 552.37  z19_x= 663.52
+# linuxbrew              n= 9 raw=    5.04GB selected=   7856027 /z19=1.0674 x_raw= 640.91  hindsight_x= 746.85  GRZ2_wins=3 P29BSC_wins=6  P29BSC_floor_miss=9/9  selF_miss=1/9
+#                        GRZ2_only_x= 728.88  P29BSC_only_x= 590.13  z19_x= 684.10
+# fedora-clang-libcxx    n= 9 raw=    9.15GB selected=   8858425 /z19=1.0844 x_raw=1032.60  hindsight_x=1188.27  GRZ2_wins=3 P29BSC_wins=6  P29BSC_floor_miss=9/9  selF_miss=2/9
+#                        GRZ2_only_x=1133.46  P29BSC_only_x= 984.08  z19_x=1119.77
+# ALL                    n=36 raw=   24.02GB selected=  33554050 /z19=1.0946 x_raw= 715.87  hindsight_x= 839.37  GRZ2_wins=12 P29BSC_wins=24  P29BSC_floor_miss=36/36  selF_miss=5/36
+#                        GRZ2_only_x= 818.54  P29BSC_only_x= 667.13  z19_x= 783.59
