@@ -857,7 +857,7 @@ static constexpr std::array<const char*,8> componentRawNames={
 };
 
 int main(int argc,char**argv){
-    const char* manifest=nullptr;const char*residualDumpPath=nullptr;const char*mixedDumpPrefix=nullptr;const char*curveTsvPath=nullptr;const char*literalGroupPrefix=nullptr;const char*literalGroupWirePath=nullptr;const char*cfSinkPath=nullptr;const char*fcSinkPath=nullptr;const char*sinkCurvePath=nullptr; size_t sinkBuildTus=0; bool sinkReplay=false,literalOnDemand=false,selftestTags=false,selftestBadRoot=false; size_t max_files=SIZE_MAX,entropyRestartTus=0,replayRepetitions=1,literalGroupTus=0,literalGroupWorkers=1; int zlevel=3,literalZLevel=-1,arrayZLevel=-1,blobZLevel=-1,halfColdBit=-1,blobCanonicalLevel=9; uint32_t sourceAdmitRatio=6,blobThreads=4,blobZstdWorkers=0,blobZstdJobMiB=0,blobZstdOverlapLog=0,blobFallbackEvery=0,s1MinMatch=3,s1MaxChain=1024; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, usePriorRoot=false,useSortedLines=false,useByteArrayLines=false,useMixedRegions=false,useProjectSource=false,useKeyMap=false,useDirectOrdinals=false,useCompressedBlobs=false,useBlobEagerPatches=true,useMoFactor=false,traceMo=false,useAlphaLines=false,useResidualLdm=false,splitControlCeiling=false,structureCeiling=false,literalGroupEvaluateZstd10=true,stableRootTags=false,openFinalEntropy=false;
+    const char* manifest=nullptr;const char*residualDumpPath=nullptr;const char*mixedDumpPrefix=nullptr;const char*curveTsvPath=nullptr;const char*literalGroupPrefix=nullptr;const char*literalGroupWirePath=nullptr;const char*cfSinkPath=nullptr;const char*fcSinkPath=nullptr;const char*sinkCurvePath=nullptr; size_t sinkBuildTus=0; bool sinkReplay=false,literalOnDemand=false,selftestTags=false,selftestBadRoot=false; size_t routeCount=0; size_t max_files=SIZE_MAX,entropyRestartTus=0,replayRepetitions=1,literalGroupTus=0,literalGroupWorkers=1; int zlevel=3,literalZLevel=-1,arrayZLevel=-1,blobZLevel=-1,halfColdBit=-1,blobCanonicalLevel=9; uint32_t sourceAdmitRatio=6,blobThreads=4,blobZstdWorkers=0,blobZstdJobMiB=0,blobZstdOverlapLog=0,blobFallbackEvery=0,s1MinMatch=3,s1MaxChain=1024; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, usePriorRoot=false,useSortedLines=false,useByteArrayLines=false,useMixedRegions=false,useProjectSource=false,useKeyMap=false,useDirectOrdinals=false,useCompressedBlobs=false,useBlobEagerPatches=true,useMoFactor=false,traceMo=false,useAlphaLines=false,useResidualLdm=false,splitControlCeiling=false,structureCeiling=false,literalGroupEvaluateZstd10=true,stableRootTags=false,openFinalEntropy=false;
     const char*blobDumpPath=nullptr;const char*componentCurveTsvPath=nullptr;
     for(int i=1;i<argc;++i){ if(!strcmp(argv[i],"--manifest")&&i+1<argc)manifest=argv[++i];
         else if(!strcmp(argv[i],"--z")&&i+1<argc)zlevel=atoi(argv[++i]);
@@ -889,6 +889,15 @@ int main(int argc,char**argv){
         else if(!strcmp(argv[i],"--fc-sink")&&i+1<argc)fcSinkPath=argv[++i];
         else if(!strcmp(argv[i],"--sink-replay"))sinkReplay=true;
         else if(!strcmp(argv[i],"--literal-ondemand"))literalOnDemand=true;
+        else if(!strcmp(argv[i],"--route-s1")&&i+1<argc){char*e=nullptr;unsigned long long v=strtoull(argv[++i],&e,10);
+            if(!e||*e||!v){fprintf(stderr,"bad route count\n");return 2;}
+            // Only the 1F slice exists.  A second route mints canonical Block ids this route
+            // never receives, and F installs Blocks by dense arrival order (id+1 must equal
+            // Fblk_off.size()), so the gap breaks the NEXT Block's install -- measured as
+            // "bad direct Block identity" at W>=4.  Multi-route needs the catalogue
+            // materializer and a canonical-id-keyed F store; refuse rather than pretend.
+            if(v!=1){fprintf(stderr,"--route-s1 %llu: multi-route is not yet materialized; only 1 is supported\n",v);return 2;}
+            routeCount=size_t(v);}
         else if(!strcmp(argv[i],"--selftest-tags"))selftestTags=true;
         else if(!strcmp(argv[i],"--selftest-bad-root"))selftestBadRoot=true;
         else if(!strcmp(argv[i],"--sink-curve")&&i+1<argc)sinkCurvePath=argv[++i];
@@ -1065,16 +1074,42 @@ int main(int argc,char**argv){
     // read the first Regions of the next TU (j+MINMATCH<=NS); the online form retains the
     // incomplete tail and installs those anchors when the next TU becomes current.
     p29::BlockCatalogue blockCatalogue;
-    std::unique_ptr<p29::OnlineS1> globalS1;
+    std::unique_ptr<p29::OnlineS1> globalS1, routeS1;   // 1F slice: exactly one route matcher
     if(useS1){
         size_t NS=allreg.size(); uint32_t MINMATCH=s1MinMatch, MAXCHAIN=s1MaxChain, hbits=22;
         p29::OnlineS1::Config s1cfg; s1cfg.min_match=MINMATCH; s1cfg.max_chain=MAXCHAIN; s1cfg.hash_bits=hbits;
         globalS1.reset(new p29::OnlineS1(s1cfg,blockCatalogue));
+        if(routeCount) routeS1.reset(new p29::OnlineS1(s1cfg,blockCatalogue));
         auto tb=Clock::now();
         std::vector<uint32_t> tuRegions;
         for(size_t t=0;t<TUs;++t){
             tuRegions.assign(allreg.begin()+roff[t],allreg.begin()+roff[t+1]);
+            // GLOBAL admits FIRST, in the defined C admission order, so canonical ids are
+            // assigned by the global chronology and never by route scheduling.
             const p29::TuPlan plan=globalS1->admit(tuRegions);
+            // 1F SEAM GATE.  With one route the route matcher sees exactly GLOBAL's sequence,
+            // so it must mint NOTHING and must agree with GLOBAL on every field -- including
+            // the source coordinates, which are only equal because the two histories coincide
+            // at 1F and will NOT be equal once routes diverge.  Checking it here is what makes
+            // the shared-catalogue seam a proven property rather than an assumption.
+            if(routeS1){
+                const size_t before=blockCatalogue.size();
+                const p29::TuPlan rp=routeS1->admit(tuRegions);
+                if(blockCatalogue.size()!=before){fprintf(stderr,"1F seam: route admission grew the catalogue %zu -> %zu at TU=%zu\n",before,blockCatalogue.size(),t);return 2;}
+                if(rp.root.size()!=plan.root.size()||rp.block_uses.size()!=plan.block_uses.size()){fprintf(stderr,"1F seam: Root/BlockUse counts differ at TU=%zu\n",t);return 2;}
+                for(size_t i=0;i<rp.root.size();++i)
+                    if(rp.root[i].kind!=plan.root[i].kind||rp.root[i].id!=plan.root[i].id){fprintf(stderr,"1F seam: Root ref %zu differs at TU=%zu\n",i,t);return 2;}
+                for(size_t i=0;i<rp.block_uses.size();++i){
+                    const p29::BlockUse&a=plan.block_uses[i],&b=rp.block_uses[i];
+                    if(a.root_index!=b.root_index||a.block_id!=b.block_id||a.source_position!=b.source_position||
+                       a.length!=b.length||a.source_precedes_current_tu!=b.source_precedes_current_tu){fprintf(stderr,"1F seam: BlockUse %zu differs at TU=%zu\n",i,t);return 2;}
+                    // canonical_was_new is deliberately NOT required to match: GLOBAL admits
+                    // first and MINTS, so the route then FINDS the same id.  That asymmetry is
+                    // positive evidence the catalogue is shared -- with separate catalogues
+                    // both would report a fresh mint -- so it is asserted rather than ignored.
+                    if(a.canonical_was_new&&b.canonical_was_new){fprintf(stderr,"1F seam: both matchers minted Block %u at TU=%zu, so the catalogue is not shared\n",a.block_id,t);return 2;}
+                }
+            }
             for(const p29::Ref&ref:plan.root)
                 tokstream.push_back(ref.kind==p29::RefKind::Block?block_tag(ref.id):region_tag(ref.id));
             // Canonical children come from the shared catalogue; the COPY-legality flag is
