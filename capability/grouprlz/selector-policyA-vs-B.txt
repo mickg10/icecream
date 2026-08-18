@@ -1,0 +1,18 @@
+POLICY A (run BOTH complete, take per-cell min) vs POLICY B (probe, then finish one)
+Fixed 16-core budget, disjoint 8 P29 / 8 GRZ. Encode-only basis for GRZ (production
+holds the stream in memory); P29 charged both passes.
+
+                                               makespan         GB/s core-s/raw-GiB
+  policy A: both complete, per-cell min          201.3s        0.370           3.72
+  policy B: probe then finish selected           199.7s        0.373           3.67
+    (GRZ complete alone, encode-only)             57.2s        1.304
+    (P29 complete alone, two-pass)               201.3s        0.370
+
+  policy A costs 1.02x the core-seconds of policy B and +0.8% makespan
+  cells where policy A is rate-legal TODAY: 0/44 (bounded by P29, which is 0/44)
+
+  KEY: policy A makespan = max(P29, GRZ) per cell. P29 is the slower side on 44/44 cells,
+  so policy A is rate-legal exactly when P29 is. The classifier is only needed if running
+  both is unaffordable -- and P29 must become rate-legal anyway for the selector to have
+  any value at all. Once it is, policy A is legal BY CONSTRUCTION and yields the oracle.
+  Its only extra cost is core-seconds: 3.72 vs 3.67 per raw GiB.

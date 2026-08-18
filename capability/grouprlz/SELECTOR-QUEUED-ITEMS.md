@@ -71,3 +71,44 @@ TU100 and TU200 no runway has been consumed yet, so P29's structural model has n
 the job count to amortize over. It also means the chronological cap is not the binding
 constraint anywhere -- GRZ2 alone satisfies it with 17-43% headroom on every eligible
 corpus, so the chronological gate does not constrain the selector design.
+
+---
+
+## Strategic check: does the classifier gate the size result at all?
+
+Raised in review: if running both codecs (policy A) is affordable once P29 is rate-legal,
+per-cell min gives the oracle 0.9705x with **no classifier at all**. Measured against the
+rate-pass data rather than argued.
+
+Fixed 16-core budget, disjoint 8 P29 / 8 GRZ, GRZ on the encode-only (in-memory) basis,
+P29 charged both passes, summed over all 44 docker cells (74.54 GB):
+
+| policy | makespan | GB/s | core-s per raw GiB |
+|---|---:|---:|---:|
+| **A: run both complete, take per-cell min** | 201.3 s | 0.370 | **3.72** |
+| **B: TU112 probe, then finish only the selected** | 199.7 s | 0.373 | **3.67** |
+| GRZ complete alone (encode-only) | 57.2 s | 1.304 | |
+| P29 complete alone (two-pass) | 201.3 s | 0.370 | |
+
+**Policy A costs 1.02x the core-seconds of policy B and +0.8% makespan.**
+
+The reason is structural: **P29 is the slower side on 44 of 44 cells**, so
+`max(P29, GRZ) = P29` everywhere and running GRZ concurrently on its own cores is free in
+wall time -- it finishes in 57 s while P29 is still working. Meanwhile policy B does not
+actually save that work: it still pays the probe race *and* the finish.
+
+Two consequences:
+
+1. **The classifier is off the critical path for the size result.** Policy A is rate-legal
+   exactly when P29 is, because P29 sets the makespan on every cell. So the moment P29
+   becomes rate-legal, policy A is legal *by construction* and delivers the oracle
+   0.9705x z19 with no classification decision at all -- for about 2% more CPU.
+2. **The classifier only earns its place if core-seconds, not makespan, are the binding
+   resource.** At 3.72 versus 3.67 core-s per raw GiB the difference is not close to
+   justifying a rule we cannot yet validate.
+
+This does not make the classifier work wasted -- policy B remains the cheaper design if
+the C side is CPU-constrained rather than latency-constrained, and the runway finding is
+the honest state of that question. But it does mean the selector's size advantage is
+**not blocked on the classifier**. It is blocked, like everything else in this lane, on
+P29's encode throughput.
