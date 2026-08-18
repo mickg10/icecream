@@ -1,0 +1,15 @@
+Folded grouprlz runway census: +3 new lineages (magnum 40 TU, draco 136, taglib 148)
+  all three are GRZ winners with remaining_tus of 0 / 24 / 36
+
+  rows now: {'docker': 44, 'fixed16': 16, 'native': 6, 'runway': 3}
+  positive lineages: 9 of 26
+
+  leave-one-PROJECT-out, remaining_tus rule, WITH the 3 new lineages:
+    docker       1921792
+    fixed16       953356
+    native       1150996
+    runway             0
+    TOTAL        4026144   (was 4,026,144 before the fold-in)
+
+  the 3 new rows are all correctly classified and add 0 regret --
+  they are short-runway NEGATIVES, so they confirm the easy side and test nothing.
