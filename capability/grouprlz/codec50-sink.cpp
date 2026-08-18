@@ -940,6 +940,10 @@ int main(int argc,char**argv){
         if(make_region_tag(kTagIdLimit,tag)) note("checked creation accepted Region 2^31");
         if(make_block_tag (kTagIdLimit,tag)) note("checked creation accepted Block 2^31");
         if(make_region_tag(~uint64_t(0),tag)) note("checked creation accepted a 64-bit Region id");
+        // UINT32_MAX+1 truncates to 0, which is a perfectly valid id -- so this case fails
+        // only if the check happens BEFORE the narrowing, which is the property under test.
+        if(make_region_tag(uint64_t(UINT32_MAX)+1,tag)) note("checked creation accepted Region UINT32_MAX+1");
+        if(make_block_tag (uint64_t(UINT32_MAX)+1,tag)) note("checked creation accepted Block UINT32_MAX+1");
         printf("selftest-tags: %s\n",bad?"FAIL":"PASS");
         return bad?1:0;
     }
@@ -1013,10 +1017,13 @@ int main(int argc,char**argv){
       for(size_t repetition=0;repetition<replayRepetitions;++repetition){const size_t base=allreg.size();allreg.insert(allreg.end(),physicalRegions.begin(),physicalRegions.end());for(size_t t=0;t<physicalTUs;++t)roff.push_back(base+physicalOffsets[t+1]);}
       corpus.raw=physicalRaw*replayRepetitions;
     }
-    uint32_t NREG=uint32_t(dict.region_count());const size_t TUs=physicalTUs*replayRepetitions;
-    // The typed tag spends one bit on the kind, so both id spaces are bounded at 2^31.  The
-    // per-id check lives in make_region_tag/make_block_tag; this only fails earlier and louder.
-    { uint32_t probe; if(!make_region_tag(NREG?NREG-1:0,probe)){fprintf(stderr,"too many Regions for a typed Root tag: %u\n",NREG);return 2;} }
+    // Validate the Region count at its FULL width and narrow only after it passes.  Narrowing
+    // first would make a count of 2^32+n indistinguishable from n, and no amount of checking
+    // inside make_region_tag can recover information the cast already discarded.
+    const uint64_t regionCountWide=dict.region_count();
+    { uint32_t probe; if(!make_region_tag(regionCountWide?regionCountWide-1:0,probe)){
+        fprintf(stderr,"too many Regions for a typed Root tag: %llu\n",(unsigned long long)regionCountWide);return 2;} }
+    uint32_t NREG=uint32_t(regionCountWide);const size_t TUs=physicalTUs*replayRepetitions;
     if(useS1&&allreg.size()>UINT32_MAX){fprintf(stderr,"S1 logical Region occurrence space exceeds u32\n");return 2;}
     if(entropyRestartTus&&TUs%entropyRestartTus){fprintf(stderr,"TU count %zu is not a multiple of experimental entropy restart interval %zu\n",TUs,entropyRestartTus);return 2;}
     fprintf(stderr,"loaded+interned %.1fs TUs=%zu raw=%llu physical_tus=%zu physical_raw=%llu replay_repetitions=%zu regions=%u region_occ=%zu distinct_lines=%u\n",secs(t0),TUs,(unsigned long long)corpus.raw,physicalTUs,(unsigned long long)physicalRaw,replayRepetitions,NREG,allreg.size(),dict.distinct());
@@ -1051,8 +1058,12 @@ int main(int argc,char**argv){
         auto kgram=[&](size_t i)->uint64_t{ uint64_t h=1469598103934665603ULL; for(uint32_t j=0;j<MINMATCH;++j){ h^=allreg[i+j]; h*=1099511628211ULL; } return (h*0x9E3779B97F4A7C15ULL)>>(64-hbits); };
         auto block_get=[&](const uint32_t*p,size_t L,uint32_t srcpos,uint8_t copyok)->uint32_t{ uint64_t h=1469598103934665603ULL^(L*0x100000001b3ULL); for(size_t j=0;j<L;++j){h^=p[j];h*=1099511628211ULL;}
             auto it=bdict.find(h); if(it!=bdict.end()){ uint32_t k=it->second; if(boff2[k+1]-boff2[k]==L && memcmp(&bchild[boff2[k]],p,L*4)==0) return block_tag(k); }
-            uint32_t k=uint32_t(boff2.size()-1);
-            bchild.insert(bchild.end(),p,p+L); boff2.push_back(bchild.size()); bcopy_src.push_back(srcpos); bcopy_ok.push_back(copyok); if(it==bdict.end()) bdict.emplace(h,k); return block_tag(k); };
+            // Same discipline on the Block side: check the size_t, then narrow, and store k
+            // only once the id is known to be representable.
+            const size_t nextBlock=boff2.size()-1; uint32_t tag;
+            if(!make_block_tag(nextBlock,tag)){fprintf(stderr,"too many Blocks for a typed Root tag: %zu\n",nextBlock);exit(2);}
+            const uint32_t k=uint32_t(nextBlock);
+            bchild.insert(bchild.end(),p,p+L); boff2.push_back(bchild.size()); bcopy_src.push_back(srcpos); bcopy_ok.push_back(copyok); if(it==bdict.end()) bdict.emplace(h,k); return tag; };
         auto tb=Clock::now();
         for(size_t t=0;t<TUs;++t){ size_t a=roff[t],b=roff[t+1]; size_t i=a;
             while(i<b){ size_t bestL=0,bestP=0;
