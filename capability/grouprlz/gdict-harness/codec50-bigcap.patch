@@ -1,0 +1,10 @@
+97c97,103
+<     static constexpr uint32_t TINY_CAP=1u<<10, SHORT_CAP=1u<<17,
+---
+> #ifndef ICE_TINY_CAP_LOG2
+> #define ICE_TINY_CAP_LOG2 10
+> #endif
+> #ifndef ICE_SHORT_CAP_LOG2
+> #define ICE_SHORT_CAP_LOG2 17
+> #endif
+>     static constexpr uint32_t TINY_CAP=1u<<ICE_TINY_CAP_LOG2, SHORT_CAP=1u<<ICE_SHORT_CAP_LOG2,

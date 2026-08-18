@@ -1,0 +1,22 @@
+
+==== CODEC-50 (V1+S1(LZ blocks)+P27(mixed-regions+BYTE_ARRAY+BLOB+MO)+BSC_GROUPS+DIRECT_ORDINALS, z3) — manifests/llvmfull_withdictA1.man ====
+byte-exact=OK  TUs=14749 raw=59119.9 MiB regions=1011719 distinct_lines=10622944 paths=36910 blocks=88901 (marker_lines=684194 literal_lines=13468312)
+wire by category (post-z3, bytes): root=2949087 line_def=80810528 region_def=23045582 block_def=937299 path_def=1224086 missing=2416408 framing=114668  TOTAL=111497658 (106.33 MiB)
+material zstd levels: control=3 literal=3 array=3 blob=9
+FinalRatio (raw / total wire, one cold pass) = 556.0x
+mixed components: control=23045582 literal=58276097 array_control=567374 array_values=7335546 source_control=0 source_files=0 selector=13918 raw_literal=877285223 raw_array_values=44719091 raw_source_reused=3852795 source_package_raw=0 source_package_files=0 public_lines=1189941 ops=[literal=3648718 publish=1189941 ref=16477936 array=1634158 marker=684194 source=47030 patch=44782]
+compressed blobs: count=112 deflated=31189526 inflated=124407478 wire=14617593 patch_raw=0 patch_wire=0 canonical_exact=0 corrected=0 replaced=0 transform_candidate_wire=1416431 ordinary_candidate_wire=31189558 transform_tus=4 ordinary_tus=0 fallbacks=0 fallback_request_wire=0 fallback_reply_wire=0 threads=8 zstd_workers=4 zstd_job_mib=5 zstd_overlap_log=3 mode=lazy-reply canonical=zlib-1.2.11-level9
+MO factor: policy_tus=4 candidate_wire=13201205 selected_tus=4 members=107 member_raw=114059263 new_originals=34542 C_dictionary=34542 F_dictionary=34542 C_string_bytes=4877391 F_string_bytes=4877391
+literal groups: tus_per_group=112 groups=132 workers=16 raw=877285223 wire=58276097 packed_header_bytes=4 candidates=zstd3,bsc selected=[zstd3=3 bsc=129 zstd10=0] encode_seconds=5.486517 decode_seconds=3.958299 retained_wire=/home/ttuser/gdict/runs/llvmfull_withdictA1.wire
+key map: half_cold_bit=-1 preloaded_regions=0 preloaded_raw_bytes=0 associated_regions=0 association_wire=0 missing_reply_wire=2416408
+direct ordinals: generation_latched=1 region_namespaces=1 block_lifetime=generation
+DIAG legacy Line ceilings omitted for the selected persistent definition format
+H200 f-checkpoints (cum raw fraction -> cumulative ratio):
+  f=0.10  ratio=439x
+  f=0.25  ratio=297x
+  f=0.50  ratio=375x
+  f=0.75  ratio=458x
+  f=1.00  ratio=556x
+per-TU curve: /home/ttuser/gdict/runs/llvmfull_withdictA1.curve.tsv rows=14749 cumulative_raw=61991728648 cumulative_wire=111497658
+per-TU component curve: /home/ttuser/gdict/runs/llvmfull_withdictA1.components.tsv rows=14749 cumulative_raw=61991728648 cumulative_wire=111497658
+trailing 5%-raw window ratio (steady) = 1083x

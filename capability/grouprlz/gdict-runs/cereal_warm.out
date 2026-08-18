@@ -1,0 +1,22 @@
+
+==== CODEC-50 (V1+S1(LZ blocks)+P27(mixed-regions+BYTE_ARRAY+BLOB+MO)+BSC_GROUPS+DIRECT_ORDINALS, z3) — manifests/cereal_warm.man ====
+byte-exact=OK  TUs=196 raw=729.9 MiB regions=5187 distinct_lines=55145 paths=546 blocks=172 (marker_lines=4940 literal_lines=34129)
+wire by category (post-z3, bytes): root=12143 line_def=130046 region_def=298218 block_def=1911 path_def=7375 missing=10619 framing=964  TOTAL=461276 (0.44 MiB)
+material zstd levels: control=3 literal=3 array=3 blob=9
+FinalRatio (raw / total wire, one cold pass) = 1659.3x
+mixed components: control=298218 literal=129506 array_control=101 array_values=394 source_control=0 source_files=0 selector=45 raw_literal=1428976 raw_array_values=3072 raw_source_reused=1826754 source_package_raw=0 source_package_files=0 public_lines=7809 ops=[literal=7556 publish=7809 ref=82338 array=192 marker=4940 source=24914 patch=18660]
+compressed blobs: count=0 deflated=0 inflated=0 wire=0 patch_raw=0 patch_wire=0 canonical_exact=0 corrected=0 replaced=0 transform_candidate_wire=0 ordinary_candidate_wire=0 transform_tus=0 ordinary_tus=0 fallbacks=0 fallback_request_wire=0 fallback_reply_wire=0 threads=8 zstd_workers=4 zstd_job_mib=5 zstd_overlap_log=3 mode=lazy-reply canonical=zlib-1.2.11-level9
+MO factor: policy_tus=0 candidate_wire=0 selected_tus=0 members=0 member_raw=0 new_originals=0 C_dictionary=0 F_dictionary=0 C_string_bytes=0 F_string_bytes=0
+literal groups: tus_per_group=112 groups=2 workers=16 raw=1428976 wire=129506 packed_header_bytes=4 candidates=zstd3,bsc selected=[zstd3=0 bsc=1 zstd10=0] encode_seconds=0.051542 decode_seconds=0.074143 retained_wire=/home/ttuser/gdict/runs/cereal_warm.wire
+key map: half_cold_bit=-1 preloaded_regions=0 preloaded_raw_bytes=0 associated_regions=0 association_wire=0 missing_reply_wire=10619
+direct ordinals: generation_latched=1 region_namespaces=1 block_lifetime=generation
+DIAG legacy Line ceilings omitted for the selected persistent definition format
+H200 f-checkpoints (cum raw fraction -> cumulative ratio):
+  f=0.10  ratio=180x
+  f=0.25  ratio=418x
+  f=0.50  ratio=833x
+  f=0.75  ratio=1256x
+  f=1.00  ratio=1659x
+per-TU curve: /home/ttuser/gdict/runs/cereal_warm.curve.tsv rows=196 cumulative_raw=765386024 cumulative_wire=461276
+per-TU component curve: /home/ttuser/gdict/runs/cereal_warm.components.tsv rows=196 cumulative_raw=765386024 cumulative_wire=461276
+trailing 5%-raw window ratio (steady) = 232852x

@@ -1,0 +1,22 @@
+
+==== CODEC-50 (V1+S1(LZ blocks)+P27(mixed-regions+BYTE_ARRAY+BLOB+MO)+BSC_GROUPS+DIRECT_ORDINALS, z3) — manifests/dictB_prefix.man ====
+byte-exact=OK  TUs=10192 raw=32040.4 MiB regions=917379 distinct_lines=6851499 paths=33578 blocks=63831 (marker_lines=558347 literal_lines=6975581)
+wire by category (post-z3, bytes): root=2521744 line_def=58814490 region_def=18340213 block_def=643756 path_def=907690 missing=2085112 framing=78192  TOTAL=83391197 (79.53 MiB)
+material zstd levels: control=3 literal=3 array=3 blob=9
+FinalRatio (raw / total wire, one cold pass) = 402.9x
+mixed components: control=18340213 literal=35777149 array_control=569581 array_values=7840811 source_control=0 source_files=0 selector=9356 raw_literal=367049403 raw_array_values=44189417 raw_source_reused=3606874 source_package_raw=0 source_package_files=0 public_lines=1047201 ops=[literal=2271860 publish=1047201 ref=9691623 array=1725426 marker=558347 source=48262 patch=37026]
+compressed blobs: count=112 deflated=31189526 inflated=124407478 wire=14617593 patch_raw=0 patch_wire=0 canonical_exact=0 corrected=0 replaced=0 transform_candidate_wire=1416431 ordinary_candidate_wire=31189558 transform_tus=4 ordinary_tus=0 fallbacks=0 fallback_request_wire=0 fallback_reply_wire=0 threads=8 zstd_workers=4 zstd_job_mib=5 zstd_overlap_log=3 mode=lazy-reply canonical=zlib-1.2.11-level9
+MO factor: policy_tus=4 candidate_wire=13201205 selected_tus=4 members=107 member_raw=114059263 new_originals=34542 C_dictionary=34542 F_dictionary=34542 C_string_bytes=4877391 F_string_bytes=4877391
+literal groups: tus_per_group=112 groups=91 workers=16 raw=367049403 wire=35777149 packed_header_bytes=4 candidates=zstd3,bsc selected=[zstd3=3 bsc=88 zstd10=0] encode_seconds=2.547820 decode_seconds=2.077208 retained_wire=/home/ttuser/gdict/runs/dictB_prefix.wire
+key map: half_cold_bit=-1 preloaded_regions=0 preloaded_raw_bytes=0 associated_regions=0 association_wire=0 missing_reply_wire=2085112
+direct ordinals: generation_latched=1 region_namespaces=1 block_lifetime=generation
+DIAG legacy Line ceilings omitted for the selected persistent definition format
+H200 f-checkpoints (cum raw fraction -> cumulative ratio):
+  f=0.10  ratio=473x
+  f=0.25  ratio=434x
+  f=0.50  ratio=293x
+  f=0.75  ratio=340x
+  f=1.00  ratio=403x
+per-TU curve: /home/ttuser/gdict/runs/dictB_prefix.curve.tsv rows=10192 cumulative_raw=33596772689 cumulative_wire=83391197
+per-TU component curve: /home/ttuser/gdict/runs/dictB_prefix.components.tsv rows=10192 cumulative_raw=33596772689 cumulative_wire=83391197
+trailing 5%-raw window ratio (steady) = 1293x

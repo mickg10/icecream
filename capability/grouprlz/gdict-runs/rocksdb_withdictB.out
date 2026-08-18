@@ -1,0 +1,22 @@
+
+==== CODEC-50 (V1+S1(LZ blocks)+P27(mixed-regions+BYTE_ARRAY+BLOB+MO)+BSC_GROUPS+DIRECT_ORDINALS, z3) — manifests/rocksdb_withdictB.man ====
+byte-exact=OK  TUs=10814 raw=35010.4 MiB regions=1553786 distinct_lines=7366176 paths=34817 blocks=70655 (marker_lines=715805 literal_lines=7343609)
+wire by category (post-z3, bytes): root=3907642 line_def=60953717 region_def=21436753 block_def=713737 path_def=961627 missing=3416844 framing=83164  TOTAL=91473484 (87.24 MiB)
+material zstd levels: control=3 literal=3 array=3 blob=9
+FinalRatio (raw / total wire, one cold pass) = 401.3x
+mixed components: control=21436753 literal=37915621 array_control=569652 array_values=7840874 source_control=0 source_files=0 selector=9977 raw_literal=396125889 raw_array_values=44189475 raw_source_reused=3614575 source_package_raw=0 source_package_files=0 public_lines=1251888 ops=[literal=2520991 publish=1251888 ref=10957294 array=1725432 marker=715805 source=48368 patch=37109]
+compressed blobs: count=112 deflated=31189526 inflated=124407478 wire=14617593 patch_raw=0 patch_wire=0 canonical_exact=0 corrected=0 replaced=0 transform_candidate_wire=1416431 ordinary_candidate_wire=31189558 transform_tus=4 ordinary_tus=0 fallbacks=0 fallback_request_wire=0 fallback_reply_wire=0 threads=8 zstd_workers=4 zstd_job_mib=5 zstd_overlap_log=3 mode=lazy-reply canonical=zlib-1.2.11-level9
+MO factor: policy_tus=4 candidate_wire=13201205 selected_tus=4 members=107 member_raw=114059263 new_originals=34542 C_dictionary=34542 F_dictionary=34542 C_string_bytes=4877391 F_string_bytes=4877391
+literal groups: tus_per_group=112 groups=97 workers=16 raw=396125889 wire=37915621 packed_header_bytes=4 candidates=zstd3,bsc selected=[zstd3=3 bsc=94 zstd10=0] encode_seconds=2.760988 decode_seconds=2.084862 retained_wire=/home/ttuser/gdict/runs/rocksdb_withdictB.wire
+key map: half_cold_bit=-1 preloaded_regions=0 preloaded_raw_bytes=0 associated_regions=0 association_wire=0 missing_reply_wire=3416844
+direct ordinals: generation_latched=1 region_namespaces=1 block_lifetime=generation
+DIAG legacy Line ceilings omitted for the selected persistent definition format
+H200 f-checkpoints (cum raw fraction -> cumulative ratio):
+  f=0.10  ratio=462x
+  f=0.25  ratio=452x
+  f=0.50  ratio=310x
+  f=0.75  ratio=357x
+  f=1.00  ratio=401x
+per-TU curve: /home/ttuser/gdict/runs/rocksdb_withdictB.curve.tsv rows=10814 cumulative_raw=36711093285 cumulative_wire=91473484
+per-TU component curve: /home/ttuser/gdict/runs/rocksdb_withdictB.components.tsv rows=10814 cumulative_raw=36711093285 cumulative_wire=91473484
+trailing 5%-raw window ratio (steady) = 651x

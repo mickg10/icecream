@@ -1,0 +1,22 @@
+
+==== CODEC-50 (V1+S1(LZ blocks)+P27(mixed-regions+BYTE_ARRAY+BLOB+MO)+BSC_GROUPS+DIRECT_ORDINALS, z3) — manifests/firefox_withdictA.man ====
+byte-exact=OK  TUs=17850 raw=125951.5 MiB regions=811054 distinct_lines=7839630 paths=54462 blocks=113502 (marker_lines=553124 literal_lines=8025079)
+wire by category (post-z3, bytes): root=2594032 line_def=68002879 region_def=22288624 block_def=1071352 path_def=1155451 missing=1887163 framing=109436  TOTAL=97108937 (92.61 MiB)
+material zstd levels: control=3 literal=3 array=3 blob=9
+FinalRatio (raw / total wire, one cold pass) = 1360.0x
+mixed components: control=22288624 literal=44455955 array_control=561594 array_values=8358228 source_control=0 source_files=0 selector=9509 raw_literal=438687642 raw_array_values=44253184 raw_source_reused=3482205 source_package_raw=0 source_package_files=0 public_lines=1281518 ops=[literal=2748407 publish=1281518 ref=11702667 array=1717727 marker=553124 source=47019 patch=34622]
+compressed blobs: count=112 deflated=31189526 inflated=124407478 wire=14617593 patch_raw=0 patch_wire=0 canonical_exact=0 corrected=0 replaced=0 transform_candidate_wire=1416431 ordinary_candidate_wire=31189558 transform_tus=4 ordinary_tus=0 fallbacks=0 fallback_request_wire=0 fallback_reply_wire=0 threads=8 zstd_workers=4 zstd_job_mib=5 zstd_overlap_log=3 mode=lazy-reply canonical=zlib-1.2.11-level9
+MO factor: policy_tus=4 candidate_wire=13201205 selected_tus=4 members=107 member_raw=114059263 new_originals=34542 C_dictionary=34542 F_dictionary=34542 C_string_bytes=4877391 F_string_bytes=4877391
+literal groups: tus_per_group=112 groups=160 workers=16 raw=438687642 wire=44455955 packed_header_bytes=4 candidates=zstd3,bsc selected=[zstd3=3 bsc=157 zstd10=0] encode_seconds=1.674939 decode_seconds=1.372827 retained_wire=/home/ttuser/gdict/runs/firefox_withdictA.wire
+key map: half_cold_bit=-1 preloaded_regions=0 preloaded_raw_bytes=0 associated_regions=0 association_wire=0 missing_reply_wire=1887163
+direct ordinals: generation_latched=1 region_namespaces=1 block_lifetime=generation
+DIAG legacy Line ceilings omitted for the selected persistent definition format
+H200 f-checkpoints (cum raw fraction -> cumulative ratio):
+  f=0.10  ratio=269x
+  f=0.25  ratio=470x
+  f=0.50  ratio=815x
+  f=0.75  ratio=1133x
+  f=1.00  ratio=1360x
+per-TU curve: /home/ttuser/gdict/runs/firefox_withdictA.curve.tsv rows=17850 cumulative_raw=132069693282 cumulative_wire=97108937
+per-TU component curve: /home/ttuser/gdict/runs/firefox_withdictA.components.tsv rows=17850 cumulative_raw=132069693282 cumulative_wire=97108937
+trailing 5%-raw window ratio (steady) = 1629x
