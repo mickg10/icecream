@@ -1,0 +1,20 @@
+=== 1/2. three variants, physical C->F and F->C, with build closes ===
+stream   C->F=1142030    F->C=76484     lag=0    closes=1137974 1139728 1140863 1142030 
+lg1      C->F=979468     F->C=76484     lag=0    closes=975420 977174 978309 979468 
+lg112    C->F=935724     F->C=76484     lag=111  closes=468139 469893 934565 935724 
+   lg112 build increments: [468139, 1754, 464672, 1159]  <- a later build carries the cold build's literal frame
+=== 3. prefix immutability, BOTH directions, at every build close ===
+   build-1 cf: BYTE-PREFIX IDENTICAL (1137974 bytes)
+   build-1 fc: BYTE-PREFIX IDENTICAL (75248 bytes)
+   build-2 cf: BYTE-PREFIX IDENTICAL (1139728 bytes)
+   build-2 fc: BYTE-PREFIX IDENTICAL (75948 bytes)
+   build-3 cf: BYTE-PREFIX IDENTICAL (1140863 bytes)
+   build-3 fc: BYTE-PREFIX IDENTICAL (76216 bytes)
+=== 4. the replay gate must reject damage (control must pass) ===
+   control (intact)             exit=0  
+   C->F truncated 100 B         exit=2  truncated type-1 payload at offset 1141919
+   C->F one byte flipped        exit=2  type-9 payload differs at offset 569863
+   C->F 8 bytes appended        exit=2  /tmp/tmp.7kj6biO9nV/x.cf has trailing bytes past the last frame the run consumed
+   C->F one frame deleted       exit=2  expected type=9 len=214368 at offset 66188, stream has type=10 len=65
+   F->C truncated 20 B          exit=2  stream ended before a type-254 frame at offset 76461
+GATE PASS
