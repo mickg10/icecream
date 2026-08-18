@@ -106,6 +106,16 @@ def parse_log(text: str) -> dict[str, object]:
             result["direction_total"] = int(fields["total"])
             result["c_to_f"] = int(fields["C_to_F"])
             result["f_to_c"] = int(fields["F_to_C"])
+        elif line.startswith("ROUTING_LEDGER "):
+            fields = kv_fields(line)
+            result["routing_closure"] = fields["closure"]
+            result["c_root"] = int(fields["C_root"])
+            result["c_fill"] = int(fields["C_fill"])
+            result["c_control"] = int(fields["C_control"])
+            result["f_need"] = int(fields["F_need"])
+            result["f_control"] = int(fields["F_control"])
+            result["routing_c_total"] = int(fields["C_total"])
+            result["routing_f_total"] = int(fields["F_total"])
         elif line.startswith("C_TO_F_FRAME_LEDGER "):
             fields = kv_fields(line)
             result["c_to_f_frame_closure"] = fields.pop("closure")
@@ -222,6 +232,14 @@ def parse_log(text: str) -> dict[str, object]:
         "c_to_f_frame_total",
         "f_to_c_frame_closure",
         "f_to_c_frame_total",
+        "routing_closure",
+        "c_root",
+        "c_fill",
+        "c_control",
+        "f_need",
+        "f_control",
+        "routing_c_total",
+        "routing_f_total",
         "c_to_f_ratio",
         "c50",
         "c50_tu",
@@ -270,6 +288,13 @@ def parse_log(text: str) -> dict[str, object]:
         "actual_socket",
         "c_to_f",
         "f_to_c",
+        "c_root",
+        "c_fill",
+        "c_control",
+        "f_need",
+        "f_control",
+        "routing_c_total",
+        "routing_f_total",
         "failures",
     ):
         result[name] = int(result[name])
@@ -326,6 +351,13 @@ def phase_summary(
                 "end_tu": offset + length,
                 "raw": raw,
                 "wire": wire,
+                "c_to_f": sum(row["c_to_f"] for row in selected),
+                "f_to_c": sum(row["f_to_c"] for row in selected),
+                "c_root": sum(row["c_root"] for row in selected),
+                "c_fill": sum(row["c_fill"] for row in selected),
+                "c_control": sum(row["c_control"] for row in selected),
+                "f_need": sum(row["f_need"] for row in selected),
+                "f_control": sum(row["f_control"] for row in selected),
                 "ratio": raw / wire if wire else None,
             }
         )
@@ -1018,6 +1050,15 @@ def run_one(
         or parsed["f_to_c_frame_total"] != parsed["f_to_c"]
     ):
         raise RuntimeError(f"{spec.name}: directional frame ledgers do not close")
+    if (
+        parsed["routing_closure"] != "OK"
+        or parsed["routing_c_total"] != parsed["c_to_f"]
+        or parsed["routing_f_total"] != parsed["f_to_c"]
+        or parsed["c_root"] + parsed["c_fill"] + parsed["c_control"]
+        != parsed["c_to_f"]
+        or parsed["f_need"] + parsed["f_control"] != parsed["f_to_c"]
+    ):
+        raise RuntimeError(f"{spec.name}: routing category ledger does not close")
     if sum(frame["bytes"] for frame in parsed["frames"].values()) != parsed["frame_total"]:
         raise RuntimeError(f"{spec.name}: frame categories do not close")
     if (
@@ -1039,6 +1080,12 @@ def run_one(
             raise RuntimeError(
                 f"{spec.name}: direction split does not close for {frame_name}"
             )
+    if (
+        parsed["c_root"] != parsed["c_to_f_frames"]["Root"]["bytes"]
+        or parsed["c_fill"] != parsed["c_to_f_frames"]["Fill"]["bytes"]
+        or parsed["f_need"] != parsed["f_to_c_frames"]["Need"]["bytes"]
+    ):
+        raise RuntimeError(f"{spec.name}: routing categories differ from frame ledger")
     if sum(row["raw"] for row in curve_rows) != parsed["raw"]:
         raise RuntimeError(f"{spec.name}: curve raw does not close")
     if sum(row["wire"] for row in curve_rows) != parsed["actual_socket"]:
@@ -1052,6 +1099,16 @@ def run_one(
         for row in curve_rows
     ):
         raise RuntimeError(f"{spec.name}: per-TU direction split does not close")
+    if any(
+        row["category_ok"] != 1
+        or row["c_to_f"] != row["c_root"] + row["c_fill"] + row["c_control"]
+        or row["f_to_c"] != row["f_need"] + row["f_control"]
+        for row in curve_rows
+    ):
+        raise RuntimeError(f"{spec.name}: per-TU routing categories do not close")
+    for key in ("c_root", "c_fill", "c_control", "f_need", "f_control"):
+        if sum(row[key] for row in curve_rows) != parsed[key]:
+            raise RuntimeError(f"{spec.name}: per-TU {key} does not close")
     if curve_rows and (
         curve_rows[-1]["cumulative_c_to_f"] != parsed["c_to_f"]
         or curve_rows[-1]["cumulative_f_to_c"] != parsed["f_to_c"]
@@ -1164,6 +1221,11 @@ def write_outputs(
         "c_to_f",
         "f_to_c",
         "c_to_f_ratio",
+        "c_root",
+        "c_fill",
+        "c_control",
+        "f_need",
+        "f_control",
         "failures",
         "prepared_accepted",
         "decode_rejected",

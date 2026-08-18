@@ -27,7 +27,8 @@ The physical size remains the four-byte protocol header plus payload.  Every
 send updates total and sent; every receive updates total and received.
 
 The batch and one-pass curves record `c_to_f` and `f_to_c` for every committed
-TU.  Hello and final Done/Ack controls are attributed to the first/last
+TU. They also split those bytes into `c_root`, `c_fill`, `c_control`,
+`f_need`, and `f_control`. Hello and final Done/Ack controls are attributed to the first/last
 committed TU on their relationship.  Controls for an entirely idle
 relationship are assigned by physical direction to the final global row.  A
 restart or retry retains its already observed directional bytes and charges
@@ -43,6 +44,8 @@ for every frame type:
 
 for every TU row:
     wire == c_to_f + f_to_c
+    c_to_f == c_root + c_fill + c_control
+    f_to_c == f_need + f_control
 
 for the complete run:
     actual_socket == sum(TU.wire)
@@ -52,16 +55,20 @@ for the complete run:
 ```
 
 The binaries publish `C_TO_F_FRAME_LEDGER`, `F_TO_C_FRAME_LEDGER`,
-`DIRECTION_LEDGER`, and `C_TO_F_CURVE_SUMMARY`.  Curves carry per-TU and
-cumulative directional columns plus `direction_ok`.
+`DIRECTION_LEDGER`, `ROUTING_LEDGER`, and `C_TO_F_CURVE_SUMMARY`. Curves carry
+per-TU and cumulative directional columns plus `direction_ok` and
+`category_ok`.
 
 ## Executed gates
 
 Retained root:
 
 ```text
-/tanksmall/scratch/ictmp/issue16-routing-direction-5329465782
+/tanksmall/scratch/ictmp/issue16-routing-categories-5329795604
 ```
+
+The unchanged instrumented state gate remains retained at
+`/tanksmall/scratch/ictmp/issue16-routing-direction-5329465782/asan-ubsan/state.log`.
 
 | Gate | Result |
 |---|---:|
@@ -70,6 +77,7 @@ Retained root:
 | complete smoke/evolution launcher | 45/45 exact |
 | per-frame direction closure | PASS on every frame in every row |
 | per-TU direction closure | PASS on every committed TU |
+| per-TU Root/Fill/control and Need/control closure | PASS on every committed TU |
 | rejection/rollback | 20 commits, 1 decode rejection, 2 prepared aborts; PASS |
 | restart and late join | PASS |
 | 1/4/8/16/32 relationship rows | PASS |
@@ -80,13 +88,13 @@ Retained root:
 | instrumented bounded one-pass removal/compaction | PASS |
 | `git diff --check` | PASS |
 
-The accepted pre-change artifact at
-`/tanksmall/scratch/ictmp/issue16-snapshot-bounds-P5YEOI/smoke` was compared
-against the new artifact for all 41 scenarios with identical inputs.  Every
-historical frame/component byte and every non-latency field in the old curve
-is byte-identical.  The four evolution rows were excluded only because this
-focused run deliberately used four evolution TUs instead of the retained
-run's larger fixture.
+The first no-carry artifact at
+`/tanksmall/scratch/ictmp/issue16-routing-direction-5329465782` was compared
+against the category artifact for all 45 scenarios. Every pre-existing
+socket, direction, frame, component, and non-latency curve value is
+byte-identical. Generated-fixture corpus fingerprints differ only because the
+fingerprint intentionally includes the different artifact-root paths; fixture
+bytes and measured rows match.
 
 Selected direction totals from the optimized smoke run:
 
@@ -101,22 +109,22 @@ Selected direction totals from the optimized smoke run:
 | one-pass grow | 20 | 3,073,809 | 3,001,230 | 72,579 | 97.639% |
 | one-pass bounded | 20 | 10,139,545 | 9,561,486 | 578,059 | 94.299% |
 
-The global C-to-F frame ledger already separates Root, Fill, and C control
-exactly for a complete run.  The next routing artifact still needs per-TU
-Root/Fill fields so material-frontier curves can be replayed without inferring
-frame ownership.
+The global and per-TU ledgers now separate Root, Fill, C control, Need, and F
+control exactly. Material-frontier and mixed-warmth curves can therefore be
+replayed from explicit row fields without inferring ownership from frame type
+or duplex bytes.
 
 ## Retained hashes
 
 ```text
-afb4480e2ef180b72e8ef07dd02278fe43c80a3db380ed01b4caa5e388355840  m5-acceptance.tsv
-9c1adededc863947a74c3167c6d1fa324725efee8b4497262630f04c43de3620  m5-acceptance.json
-693cbf036f51a59a513e0312006e4eb7304537c2a17789975f610244770f82a9  SHA256SUMS
-a00fa083a7b9ad798f1a033467b77b464121e5de70f8cbc1751e66e9539d3b09  logs/fill-reject-retry.log
-0b50aff0829d94ed6ade7b9020684a9894cf8b7877f91535e33af5fc93e2aa69  logs/onepass-typed-bounded.log
-c91b2d03153c8fe5b58ed589dea3538bbf2878a5e0c5fdae284da96cee237f93  asan-ubsan/main-retry.log
-67608b71ac400d83e30a407ed6f2b89a30a15e7b76f61eccc5f6ab9d0d4aecc1  asan-ubsan/stream-bounded.log
-02db067e5c7c8effa0701e7572865449b0981162f05d13456d5d65d73fab1244  asan-ubsan/state.log
+809e80100bd66dd913adb81c9cdb97979fabe3197e3fc4c664774dd6dec5130d  m5-acceptance.tsv
+e25d0cd7193ac655f6cf90e63c476fc1ffc74967d677afc6d8fe794a5a88de15  m5-acceptance.json
+25ba4febbcffdf5444ab563ad1c1ae06065bca81c46f3333ef46fc4f67d431b2  SHA256SUMS
+f5d0f19c98be8d8c56230c83f18f97c455e5d18534a5f700691cc7324a919970  logs/fill-reject-retry.log
+7823f1295b9349d05e19acee4fba0267cad6e35e360f38cf0b63fe357a747964  logs/onepass-typed-bounded.log
+a4903d65acb87741ebfa8151d49b758b1122fca06460558039be6d8dd22546b2  asan-ubsan/main-retry.log
+bda104100554f0e7450e228c59190cdcfca85e8bc7bdf5b83f883262e56e8623  asan-ubsan/stream-bounded.log
+02db067e5c7c8effa0701e7572865449b0981162f05d13456d5d65d73fab1244  ../issue16-routing-direction-5329465782/asan-ubsan/state.log
 ```
 
 ## Immediate use

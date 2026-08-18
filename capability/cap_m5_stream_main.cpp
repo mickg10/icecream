@@ -1215,12 +1215,15 @@ private:
 struct CurveRow {
   uint32_t logical = 0, worker = 0;
   uint64_t raw = 0, wire = 0, latency_ns = 0, c_to_f = 0, f_to_c = 0;
+  uint64_t c_root = 0, c_fill = 0, c_control = 0, f_need = 0,
+           f_control = 0;
 };
 
 struct Pending {
   std::shared_ptr<PreparedTU> prepared;
   uint32_t worker = 0;
   uint64_t wire_start = 0, c_to_f_start = 0, f_to_c_start = 0;
+  uint64_t c_root_start = 0, c_fill_start = 0, f_need_start = 0;
   std::vector<uint32_t> missing;
   MixedEncoder::AuthorityTransaction authority;
   Clock::time_point started;
@@ -1299,6 +1302,12 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
       job.wire_start = worker.frames.total();
       job.c_to_f_start = worker.frames.sent_total();
       job.f_to_c_start = worker.frames.received_total();
+      job.c_root_start =
+          worker.frames.sent_bytes[size_t(cap::Frame::Root)];
+      job.c_fill_start =
+          worker.frames.sent_bytes[size_t(cap::Frame::Fill)];
+      job.f_need_start =
+          worker.frames.received_bytes[size_t(cap::Frame::Need)];
       job.started = Clock::now();
       auto transformBegin = Clock::now();
       std::vector<uint8_t> rootRaw;
@@ -1555,10 +1564,20 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
                             worker.pending_control_c_to_f;
       const uint64_t fToC = worker.frames.received_total() - job.f_to_c_start +
                             worker.pending_control_f_to_c;
+      const uint64_t cRoot =
+          worker.frames.sent_bytes[size_t(cap::Frame::Root)] -
+          job.c_root_start;
+      const uint64_t cFill =
+          worker.frames.sent_bytes[size_t(cap::Frame::Fill)] -
+          job.c_fill_start;
+      const uint64_t fNeed =
+          worker.frames.received_bytes[size_t(cap::Frame::Need)] -
+          job.f_need_start;
       const uint64_t wire = cToF + fToC;
       if (wire != worker.frames.total() - job.wire_start +
                       worker.pending_control_c_to_f +
-                      worker.pending_control_f_to_c) {
+                      worker.pending_control_f_to_c ||
+          cRoot + cFill > cToF || fNeed > fToC) {
         relationshipExact = false;
         break;
       }
@@ -1569,7 +1588,9 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
               replies[index].received - job.started)
               .count());
       curve.push_back({job.prepared->logical, job.worker,
-                       job.prepared->raw_length, wire, latency, cToF, fToC});
+                       job.prepared->raw_length, wire, latency, cToF, fToC,
+                       cRoot, cFill, cToF - cRoot - cFill, fNeed,
+                       fToC - fNeed});
       rawTotal += job.prepared->raw_length;
       ++worker.accepted;
       worker.accepted_raw += job.prepared->raw_length;
@@ -1613,6 +1634,8 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
     }
     found->c_to_f += workers[id].pending_control_c_to_f;
     found->f_to_c += workers[id].pending_control_f_to_c;
+    found->c_control += workers[id].pending_control_c_to_f;
+    found->f_control += workers[id].pending_control_f_to_c;
     found->wire += workers[id].pending_control_c_to_f +
                    workers[id].pending_control_f_to_c;
     workers[id].pending_control_c_to_f = 0;
@@ -1671,13 +1694,22 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
         worker.summary.compiler_pipe_tus != worker.accepted)
       relationshipExact = false;
   }
-  uint64_t curveRaw = 0, curveWire = 0, curveCToF = 0, curveFToC = 0;
+  uint64_t curveRaw = 0, curveWire = 0, curveCToF = 0, curveFToC = 0,
+           curveCRoot = 0, curveCFill = 0, curveCControl = 0, curveFNeed = 0,
+           curveFControl = 0;
   for (const auto &row : curve) {
     curveRaw += row.raw;
     curveWire += row.wire;
     curveCToF += row.c_to_f;
     curveFToC += row.f_to_c;
-    if (row.wire != row.c_to_f + row.f_to_c)
+    curveCRoot += row.c_root;
+    curveCFill += row.c_fill;
+    curveCControl += row.c_control;
+    curveFNeed += row.f_need;
+    curveFControl += row.f_control;
+    if (row.wire != row.c_to_f + row.f_to_c ||
+        row.c_to_f != row.c_root + row.c_fill + row.c_control ||
+        row.f_to_c != row.f_need + row.f_control)
       relationshipExact = false;
   }
   // Entirely idle relationships have no accepted TU to own their Hello and
@@ -1688,16 +1720,25 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
     const uint64_t residualFToC = socketFToC - curveFToC;
     curve.back().c_to_f += residualCToF;
     curve.back().f_to_c += residualFToC;
+    curve.back().c_control += residualCToF;
+    curve.back().f_control += residualFToC;
     curve.back().wire += residualCToF + residualFToC;
     curveWire += residualCToF + residualFToC;
     curveCToF += residualCToF;
     curveFToC += residualFToC;
+    curveCControl += residualCToF;
+    curveFControl += residualFToC;
   } else if (curveCToF != socketCToF || curveFToC != socketFToC) {
     relationshipExact = false;
   }
   if (!sourceExact || rawTotal != manifest.raw || curveRaw != rawTotal ||
       curveWire != socketBytes || curveCToF != socketCToF ||
       curveFToC != socketFToC || socketCToF + socketFToC != socketBytes ||
+      curveCRoot != frameCToFBytes[size_t(cap::Frame::Root)] ||
+      curveCFill != frameCToFBytes[size_t(cap::Frame::Fill)] ||
+      curveCControl != socketCToF - curveCRoot - curveCFill ||
+      curveFNeed != frameFToCBytes[size_t(cap::Frame::Need)] ||
+      curveFControl != socketFToC - curveFNeed ||
       compilerBytes != rawTotal ||
       compilerTus != curve.size() || committed != curve.size() ||
       preparedAccepted != committed + aborted || decodeRejected != 0 ||
@@ -1708,7 +1749,8 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
     std::ofstream output(options.curve_out);
     output << "logical\tphysical\tworker\traw\twire\tlatency_ns\t"
               "cumulative_raw\tcumulative_wire\tc_to_f\tf_to_c\t"
-              "cumulative_c_to_f\tcumulative_f_to_c\tdirection_ok\n";
+              "cumulative_c_to_f\tcumulative_f_to_c\tc_root\tc_fill\t"
+              "c_control\tf_need\tf_control\tdirection_ok\tcategory_ok\n";
     uint64_t cumulativeRaw = 0, cumulativeWire = 0, cumulativeCToF = 0,
              cumulativeFToC = 0;
     for (const auto &row : curve) {
@@ -1721,7 +1763,14 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
              << row.latency_ns << '\t' << cumulativeRaw << '\t'
              << cumulativeWire << '\t' << row.c_to_f << '\t' << row.f_to_c
              << '\t' << cumulativeCToF << '\t' << cumulativeFToC << '\t'
-             << (row.wire == row.c_to_f + row.f_to_c ? 1 : 0) << '\n';
+             << row.c_root << '\t' << row.c_fill << '\t' << row.c_control
+             << '\t' << row.f_need << '\t' << row.f_control << '\t'
+             << (row.wire == row.c_to_f + row.f_to_c ? 1 : 0) << '\t'
+             << (row.c_to_f == row.c_root + row.c_fill + row.c_control &&
+                         row.f_to_c == row.f_need + row.f_control
+                     ? 1
+                     : 0)
+             << '\n';
     }
     if (!output)
       relationshipExact = false;
@@ -1761,6 +1810,16 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
          (unsigned long long)socketBytes,
          socketCToF + socketFToC == socketBytes &&
                  curveCToF == socketCToF && curveFToC == socketFToC
+             ? "OK"
+             : "FAIL");
+  printf("ROUTING_LEDGER C_root=%llu C_fill=%llu C_control=%llu "
+         "F_need=%llu F_control=%llu C_total=%llu F_total=%llu closure=%s\n",
+         (unsigned long long)curveCRoot, (unsigned long long)curveCFill,
+         (unsigned long long)curveCControl, (unsigned long long)curveFNeed,
+         (unsigned long long)curveFControl, (unsigned long long)curveCToF,
+         (unsigned long long)curveFToC,
+         curveCRoot + curveCFill + curveCControl == curveCToF &&
+                 curveFNeed + curveFControl == curveFToC
              ? "OK"
              : "FAIL");
   printf("RESULT exact=%s codec=%s order=standard assignment=roundrobin "

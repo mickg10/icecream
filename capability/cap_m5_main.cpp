@@ -975,7 +975,9 @@ struct Worker {
   bool session_cache_cumulative = false;
   uint32_t completed_sessions = 0;
   uint64_t session_start = 0, pending_curve_c_to_f = 0,
-           pending_curve_f_to_c = 0, accepted = 0, accepted_raw = 0;
+           pending_curve_f_to_c = 0, pending_curve_c_root = 0,
+           pending_curve_c_fill = 0, pending_curve_f_need = 0, accepted = 0,
+           accepted_raw = 0;
   std::string snapshot_path;
   FrameLedger frames;
   capm5::ReceiverMirror mirror;
@@ -1126,10 +1128,13 @@ static bool resync_worker(Worker &worker, uint32_t logical) {
 struct CurveRow {
   uint32_t logical = 0, physical = 0, worker = 0;
   uint64_t raw = 0, wire = 0, latency_ns = 0, c_to_f = 0, f_to_c = 0;
+  uint64_t c_root = 0, c_fill = 0, c_control = 0, f_need = 0,
+           f_control = 0;
 };
 struct Pending {
   uint32_t logical = 0, worker = 0, physical = 0;
   uint64_t wire_start = 0, c_to_f_start = 0, f_to_c_start = 0;
+  uint64_t c_root_start = 0, c_fill_start = 0, f_need_start = 0;
   std::vector<uint32_t> missing;
   MixedEncoder::AuthorityTransaction authority;
   bool authority_started = false;
@@ -1313,6 +1318,12 @@ static int run_coordinator(const Corpus &corpus, const Interner &dict,
                          workers[worker].frames.total(),
                          workers[worker].frames.sent_total(),
                          workers[worker].frames.received_total(),
+                         workers[worker]
+                             .frames.sent_bytes[size_t(cap::Frame::Root)],
+                         workers[worker]
+                             .frames.sent_bytes[size_t(cap::Frame::Fill)],
+                         workers[worker]
+                             .frames.received_bytes[size_t(cap::Frame::Need)],
                          {},
                          {},
                          false,
@@ -1604,19 +1615,36 @@ static int run_coordinator(const Corpus &corpus, const Interner &dict,
                             worker.pending_curve_c_to_f;
       const uint64_t fToC = worker.frames.received_total() - job.f_to_c_start +
                             worker.pending_curve_f_to_c;
+      const uint64_t cRoot =
+          worker.frames.sent_bytes[size_t(cap::Frame::Root)] -
+              job.c_root_start +
+          worker.pending_curve_c_root;
+      const uint64_t cFill =
+          worker.frames.sent_bytes[size_t(cap::Frame::Fill)] -
+              job.c_fill_start +
+          worker.pending_curve_c_fill;
+      const uint64_t fNeed =
+          worker.frames.received_bytes[size_t(cap::Frame::Need)] -
+              job.f_need_start +
+          worker.pending_curve_f_need;
       const uint64_t wire = cToF + fToC;
       if (wire != worker.frames.total() - job.wire_start +
                       worker.pending_curve_c_to_f +
-                      worker.pending_curve_f_to_c)
+                      worker.pending_curve_f_to_c ||
+          cRoot + cFill > cToF || fNeed > fToC)
         return false;
       worker.pending_curve_c_to_f = 0;
       worker.pending_curve_f_to_c = 0;
+      worker.pending_curve_c_root = 0;
+      worker.pending_curve_c_fill = 0;
+      worker.pending_curve_f_need = 0;
       uint64_t latencyNs =
           uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                        finalReplies[i].received - job.started)
                        .count());
       curve.push_back({job.logical, job.physical, job.worker, file.len, wire,
-                       latencyNs, cToF, fToC});
+                       latencyNs, cToF, fToC, cRoot, cFill,
+                       cToF - cRoot - cFill, fNeed, fToC - fNeed});
       rawTotal += file.len;
       ++worker.accepted;
       worker.accepted_raw += file.len;
@@ -1650,6 +1678,15 @@ static int run_coordinator(const Corpus &corpus, const Interner &dict,
           worker.frames.sent_total() - job.c_to_f_start;
       worker.pending_curve_f_to_c +=
           worker.frames.received_total() - job.f_to_c_start;
+      worker.pending_curve_c_root +=
+          worker.frames.sent_bytes[size_t(cap::Frame::Root)] -
+          job.c_root_start;
+      worker.pending_curve_c_fill +=
+          worker.frames.sent_bytes[size_t(cap::Frame::Fill)] -
+          job.c_fill_start;
+      worker.pending_curve_f_need +=
+          worker.frames.received_bytes[size_t(cap::Frame::Need)] -
+          job.f_need_start;
       if (!finish_worker(worker))
         return 2;
       worker.mirror.reset();
@@ -1682,12 +1719,31 @@ static int run_coordinator(const Corpus &corpus, const Interner &dict,
         std::find_if(curve.rbegin(), curve.rend(),
                      [&](const CurveRow &row) { return row.worker == id; });
     if (last != curve.rend()) {
+      if (workers[id].pending_curve_c_root +
+                  workers[id].pending_curve_c_fill >
+              workers[id].pending_curve_c_to_f ||
+          workers[id].pending_curve_f_need >
+              workers[id].pending_curve_f_to_c) {
+        exact = false;
+        continue;
+      }
       last->c_to_f += workers[id].pending_curve_c_to_f;
       last->f_to_c += workers[id].pending_curve_f_to_c;
+      last->c_root += workers[id].pending_curve_c_root;
+      last->c_fill += workers[id].pending_curve_c_fill;
+      last->f_need += workers[id].pending_curve_f_need;
+      last->c_control += workers[id].pending_curve_c_to_f -
+                         workers[id].pending_curve_c_root -
+                         workers[id].pending_curve_c_fill;
+      last->f_control += workers[id].pending_curve_f_to_c -
+                         workers[id].pending_curve_f_need;
       last->wire += workers[id].pending_curve_c_to_f +
                     workers[id].pending_curve_f_to_c;
       workers[id].pending_curve_c_to_f = 0;
       workers[id].pending_curve_f_to_c = 0;
+      workers[id].pending_curve_c_root = 0;
+      workers[id].pending_curve_c_fill = 0;
+      workers[id].pending_curve_f_need = 0;
     }
   }
   uint64_t socketBytes = 0, socketCToF = 0, socketFToC = 0, fDecodeNs = 0,
@@ -1731,12 +1787,21 @@ static int run_coordinator(const Corpus &corpus, const Interner &dict,
       }
     }
   }
-  uint64_t curveWire = 0, curveCToF = 0, curveFToC = 0;
+  uint64_t curveWire = 0, curveCToF = 0, curveFToC = 0, curveCRoot = 0,
+           curveCFill = 0, curveCControl = 0, curveFNeed = 0,
+           curveFControl = 0;
   for (const auto &row : curve) {
     curveWire += row.wire;
     curveCToF += row.c_to_f;
     curveFToC += row.f_to_c;
-    if (row.wire != row.c_to_f + row.f_to_c)
+    curveCRoot += row.c_root;
+    curveCFill += row.c_fill;
+    curveCControl += row.c_control;
+    curveFNeed += row.f_need;
+    curveFControl += row.f_control;
+    if (row.wire != row.c_to_f + row.f_to_c ||
+        row.c_to_f != row.c_root + row.c_fill + row.c_control ||
+        row.f_to_c != row.f_need + row.f_control)
       exact = false;
   }
   if (!curve.empty() && curveCToF <= socketCToF && curveFToC <= socketFToC) {
@@ -1744,10 +1809,14 @@ static int run_coordinator(const Corpus &corpus, const Interner &dict,
     const uint64_t residualFToC = socketFToC - curveFToC;
     curve.back().c_to_f += residualCToF;
     curve.back().f_to_c += residualFToC;
+    curve.back().c_control += residualCToF;
+    curve.back().f_control += residualFToC;
     curve.back().wire += residualCToF + residualFToC;
     curveWire += residualCToF + residualFToC;
     curveCToF += residualCToF;
     curveFToC += residualFToC;
+    curveCControl += residualCToF;
+    curveFControl += residualFToC;
   } else if (curveCToF != socketCToF || curveFToC != socketFToC) {
     exact = false;
   }
@@ -1763,7 +1832,8 @@ static int run_coordinator(const Corpus &corpus, const Interner &dict,
     std::ofstream out(options.curve_out);
     out << "logical\tphysical\tworker\traw\twire\tlatency_ns\tcumulative_raw\t"
            "cumulative_wire\tc_to_f\tf_to_c\tcumulative_c_to_f\t"
-           "cumulative_f_to_c\tdirection_ok\n";
+           "cumulative_f_to_c\tc_root\tc_fill\tc_control\tf_need\t"
+           "f_control\tdirection_ok\tcategory_ok\n";
     uint64_t cr = 0, cw = 0, cumulativeCToF = 0, cumulativeFToC = 0;
     for (const auto &row : curve) {
       cr += row.raw;
@@ -1773,8 +1843,15 @@ static int run_coordinator(const Corpus &corpus, const Interner &dict,
       out << row.logical << '\t' << row.physical << '\t' << row.worker << '\t'
           << row.raw << '\t' << row.wire << '\t' << row.latency_ns << '\t' << cr
           << '\t' << cw << '\t' << row.c_to_f << '\t' << row.f_to_c << '\t'
-          << cumulativeCToF << '\t' << cumulativeFToC << '\t'
-          << (row.wire == row.c_to_f + row.f_to_c ? 1 : 0) << '\n';
+          << cumulativeCToF << '\t' << cumulativeFToC << '\t' << row.c_root
+          << '\t' << row.c_fill << '\t' << row.c_control << '\t' << row.f_need
+          << '\t' << row.f_control << '\t'
+          << (row.wire == row.c_to_f + row.f_to_c ? 1 : 0) << '\t'
+          << (row.c_to_f == row.c_root + row.c_fill + row.c_control &&
+                      row.f_to_c == row.f_need + row.f_control
+                  ? 1
+                  : 0)
+          << '\n';
     }
     if (!out.good())
       exact = false;
@@ -1800,7 +1877,13 @@ static int run_coordinator(const Corpus &corpus, const Interner &dict,
         exact = false;
     }
   if (frameClosure != socketBytes || frameCToFClosure != socketCToF ||
-      frameFToCClosure != socketFToC || curve.size() != sequence.size() ||
+      frameFToCClosure != socketFToC ||
+      curveCRoot != frameCToFBytes[size_t(cap::Frame::Root)] ||
+      curveCFill != frameCToFBytes[size_t(cap::Frame::Fill)] ||
+      curveCControl != socketCToF - curveCRoot - curveCFill ||
+      curveFNeed != frameFToCBytes[size_t(cap::Frame::Need)] ||
+      curveFControl != socketFToC - curveFNeed ||
+      curve.size() != sequence.size() ||
       rawTotal != expectedRaw ||
       (options.real_pipes &&
        (compilerPipeBytes != rawTotal || compilerPipeMeasuredBytes != rawTotal ||
@@ -1855,6 +1938,16 @@ static int run_coordinator(const Corpus &corpus, const Interner &dict,
          (unsigned long long)socketBytes,
          socketCToF + socketFToC == socketBytes &&
                  curveCToF == socketCToF && curveFToC == socketFToC
+             ? "OK"
+             : "FAIL");
+  printf("ROUTING_LEDGER C_root=%llu C_fill=%llu C_control=%llu "
+         "F_need=%llu F_control=%llu C_total=%llu F_total=%llu closure=%s\n",
+         (unsigned long long)curveCRoot, (unsigned long long)curveCFill,
+         (unsigned long long)curveCControl, (unsigned long long)curveFNeed,
+         (unsigned long long)curveFControl, (unsigned long long)curveCToF,
+         (unsigned long long)curveFToC,
+         curveCRoot + curveCFill + curveCControl == curveCToF &&
+                 curveFNeed + curveFControl == curveFToC
              ? "OK"
              : "FAIL");
   printf("RESULT exact=%s codec=%s order=%s assignment=%s workers=%u wave=%u "
