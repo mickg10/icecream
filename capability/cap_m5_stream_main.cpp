@@ -63,6 +63,10 @@ struct Options {
   capp::CodecPolicy policy = capp::CodecPolicy::Zstd1;
   capm5::CacheLimits cache_limits;
   const char *curve_out = nullptr;
+  // Optional audit-only cache ledger.  Computing it scans the receiver mirror
+  // at each TU boundary, so it is deliberately separate from --curve-out and
+  // must not be enabled for a throughput gate.
+  const char *cache_curve_out = nullptr;
 };
 
 struct Manifest {
@@ -1217,13 +1221,63 @@ struct CurveRow {
   uint64_t raw = 0, wire = 0, latency_ns = 0, c_to_f = 0, f_to_c = 0;
   uint64_t c_root = 0, c_fill = 0, c_control = 0, f_need = 0,
            f_control = 0;
+  struct MirrorDigest {
+    uint64_t region_hash = 0, public_hash = 0, block_hash = 0;
+    uint32_t regions = 0, public_lines = 0, blocks = 0, paths = 0;
+
+    bool operator==(const MirrorDigest &other) const {
+      return region_hash == other.region_hash &&
+             public_hash == other.public_hash &&
+             block_hash == other.block_hash && regions == other.regions &&
+             public_lines == other.public_lines && blocks == other.blocks &&
+             paths == other.paths;
+    }
+  } cache_before, cache_filled, cache_after;
+  uint32_t need_regions = 0, install_regions = 0, install_public = 0,
+           install_blocks = 0, install_paths = 0, drop_regions = 0,
+           drop_public = 0, drop_blocks = 0;
+  bool cache_observed = false, cache_chain_ok = false,
+       cache_accounting_ok = false;
 };
+
+static uint64_t known_id_hash(const std::vector<uint8_t> &known,
+                              uint64_t kind) {
+  // Hash only resident typed ordinals, not vector capacity: grow-only zero
+  // extension is not a cache-state transition.  The independent kind salt
+  // prevents equal ID sets in different namespaces from looking identical.
+  uint64_t hash = 1469598103934665603ull ^ kind;
+  for (uint32_t id = 0; id < known.size(); ++id)
+    if (known[id]) {
+      hash ^= uint64_t(id) + 0x9e3779b97f4a7c15ull;
+      hash *= 1099511628211ull;
+    }
+  return hash;
+}
+
+static CurveRow::MirrorDigest
+mirror_digest(const capm5::ReceiverMirror &mirror) {
+  CurveRow::MirrorDigest result;
+  result.region_hash = known_id_hash(mirror.regions, 0x524547494f4eull);
+  result.public_hash = known_id_hash(mirror.public_lines, 0x5055424c4943ull);
+  result.block_hash = known_id_hash(mirror.blocks, 0x424c4f434bull);
+  result.regions = uint32_t(std::count(mirror.regions.begin(),
+                                       mirror.regions.end(), uint8_t(1)));
+  result.public_lines =
+      uint32_t(std::count(mirror.public_lines.begin(),
+                          mirror.public_lines.end(), uint8_t(1)));
+  result.blocks = uint32_t(
+      std::count(mirror.blocks.begin(), mirror.blocks.end(), uint8_t(1)));
+  result.paths = mirror.path_count;
+  return result;
+}
 
 struct Pending {
   std::shared_ptr<PreparedTU> prepared;
   uint32_t worker = 0;
   uint64_t wire_start = 0, c_to_f_start = 0, f_to_c_start = 0;
   uint64_t c_root_start = 0, c_fill_start = 0, f_need_start = 0;
+  CurveRow::MirrorDigest cache_before, cache_filled;
+  uint32_t block_installs = 0;
   std::vector<uint32_t> missing;
   MixedEncoder::AuthorityTransaction authority;
   Clock::time_point started;
@@ -1244,6 +1298,10 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
   for (uint32_t id = 0; id < options.workers; ++id)
     if (!spawn_worker(workers[id], id, workers, manifest, options, generation))
       return 2;
+  std::vector<CurveRow::MirrorDigest> lastCacheState(options.workers);
+  if (options.cache_curve_out)
+    for (uint32_t id = 0; id < options.workers; ++id)
+      lastCacheState[id] = mirror_digest(workers[id].mirror);
 
   Interner dict;
   MixedEncoder encoder;
@@ -1299,6 +1357,8 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
       auto &worker = workers[job.worker];
       worker.mirror.ensure_dimensions(job.prepared->nreg,
                                       job.prepared->nblk);
+      if (options.cache_curve_out)
+        job.cache_before = mirror_digest(worker.mirror);
       job.wire_start = worker.frames.total();
       job.c_to_f_start = worker.frames.sent_total();
       job.f_to_c_start = worker.frames.received_total();
@@ -1329,6 +1389,7 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
           worker.mirror.blocks[block->id] = 1;
         }
       }
+      job.block_installs = uint32_t(definitions.size());
       auto root = encode_component(rootRaw, options.policy, codec,
                                    components[CK_ROOT]);
       auto blocks = encode_component(blockRaw, options.policy, codec,
@@ -1392,30 +1453,34 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
       worker.mirror.ensure_dimensions(job.prepared->nreg,
                                       job.prepared->nblk);
       fill.path_base = worker.mirror.path_count;
-      capm5::MirrorScope scope(encoder, worker.mirror);
-      encoder.begin_authority_transaction(job.authority);
-      if (!job.missing.empty())
-        encoder.materialize(*job.prepared->dictionary, job.missing,
-                            job.prepared->logical, &job.authority);
-      else {
-        for (auto &part : encoder.mixedRaw)
-          part.clear();
-        encoder.fill_paths.clear();
-        encoder.fill_public_base = encoder.nextMixedPublic;
+      {
+        capm5::MirrorScope scope(encoder, worker.mirror);
+        encoder.begin_authority_transaction(job.authority);
+        if (!job.missing.empty())
+          encoder.materialize(*job.prepared->dictionary, job.missing,
+                              job.prepared->logical, &job.authority);
+        else {
+          for (auto &part : encoder.mixedRaw)
+            part.clear();
+          encoder.fill_paths.clear();
+          encoder.fill_public_base = encoder.nextMixedPublic;
+        }
+        fill.public_base = encoder.fill_public_base;
+        if (fill.path_base > encoder.paths.size()) {
+          relationshipExact = false;
+          break;
+        }
+        for (size_t path = fill.path_base; path < encoder.paths.size(); ++path) {
+          put_varint(fill.paths, encoder.paths[path].size());
+          fill.paths.insert(fill.paths.end(), encoder.paths[path].begin(),
+                            encoder.paths[path].end());
+        }
+        worker.mirror.path_count = uint32_t(encoder.paths.size());
+        for (size_t part = 0; part < 4; ++part)
+          encoder.mixedRaw[part].swap(fill.raw[part]);
       }
-      fill.public_base = encoder.fill_public_base;
-      if (fill.path_base > encoder.paths.size()) {
-        relationshipExact = false;
-        break;
-      }
-      for (size_t path = fill.path_base; path < encoder.paths.size(); ++path) {
-        put_varint(fill.paths, encoder.paths[path].size());
-        fill.paths.insert(fill.paths.end(), encoder.paths[path].begin(),
-                          encoder.paths[path].end());
-      }
-      worker.mirror.path_count = uint32_t(encoder.paths.size());
-      for (size_t part = 0; part < 4; ++part)
-        encoder.mixedRaw[part].swap(fill.raw[part]);
+      if (options.cache_curve_out)
+        job.cache_filled = mirror_digest(worker.mirror);
       materializeWaveSeconds += seconds_since(materializeBegin);
       fillThreads.emplace_back([&, index] {
         auto &threadJob = pending[index];
@@ -1587,10 +1652,66 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
           std::chrono::duration_cast<std::chrono::nanoseconds>(
               replies[index].received - job.started)
               .count());
-      curve.push_back({job.prepared->logical, job.worker,
-                       job.prepared->raw_length, wire, latency, cToF, fToC,
-                       cRoot, cFill, cToF - cRoot - cFill, fNeed,
-                       fToC - fNeed});
+      CurveRow row;
+      row.logical = job.prepared->logical;
+      row.worker = job.worker;
+      row.raw = job.prepared->raw_length;
+      row.wire = wire;
+      row.latency_ns = latency;
+      row.c_to_f = cToF;
+      row.f_to_c = fToC;
+      row.c_root = cRoot;
+      row.c_fill = cFill;
+      row.c_control = cToF - cRoot - cFill;
+      row.f_need = fNeed;
+      row.f_control = fToC - fNeed;
+      if (options.cache_curve_out) {
+        row.cache_observed = true;
+        row.cache_before = job.cache_before;
+        row.cache_filled = job.cache_filled;
+        row.cache_after = mirror_digest(worker.mirror);
+        row.need_regions = uint32_t(job.missing.size());
+        row.install_regions = row.cache_filled.regions >=
+                                      row.cache_before.regions
+                                  ? row.cache_filled.regions -
+                                        row.cache_before.regions
+                                  : UINT32_MAX;
+        row.install_public = row.cache_filled.public_lines >=
+                                     row.cache_before.public_lines
+                                 ? row.cache_filled.public_lines -
+                                       row.cache_before.public_lines
+                                 : UINT32_MAX;
+        row.install_blocks = job.block_installs;
+        row.install_paths = row.cache_filled.paths >= row.cache_before.paths
+                                ? row.cache_filled.paths -
+                                      row.cache_before.paths
+                                : UINT32_MAX;
+        row.drop_regions = uint32_t(replies[index].drops.regions.size());
+        row.drop_public =
+            uint32_t(replies[index].drops.public_lines.size());
+        row.drop_blocks = uint32_t(replies[index].drops.blocks.size());
+        row.cache_chain_ok =
+            row.cache_before == lastCacheState[job.worker];
+        row.cache_accounting_ok =
+            row.install_regions == row.need_regions &&
+            row.cache_filled.regions ==
+                row.cache_before.regions + row.install_regions &&
+            row.cache_filled.public_lines ==
+                row.cache_before.public_lines + row.install_public &&
+            row.cache_filled.blocks ==
+                row.cache_before.blocks + row.install_blocks &&
+            row.cache_filled.paths ==
+                row.cache_before.paths + row.install_paths &&
+            row.cache_after.regions + row.drop_regions ==
+                row.cache_filled.regions &&
+            row.cache_after.public_lines + row.drop_public ==
+                row.cache_filled.public_lines &&
+            row.cache_after.blocks + row.drop_blocks ==
+                row.cache_filled.blocks &&
+            row.cache_after.paths == row.cache_filled.paths;
+        lastCacheState[job.worker] = row.cache_after;
+      }
+      curve.push_back(row);
       rawTotal += job.prepared->raw_length;
       ++worker.accepted;
       worker.accepted_raw += job.prepared->raw_length;
@@ -1771,6 +1892,52 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
                      ? 1
                      : 0)
              << '\n';
+    }
+    if (!output)
+      relationshipExact = false;
+  }
+
+  if (options.cache_curve_out) {
+    std::ofstream output(options.cache_curve_out);
+    output << "logical\tworker\tbefore_regions\tbefore_public\t"
+              "before_blocks\tbefore_paths\tbefore_region_hash\t"
+              "before_public_hash\tbefore_block_hash\tneed_regions\t"
+              "install_regions\tinstall_public\tinstall_blocks\t"
+              "install_paths\tfilled_regions\tfilled_public\t"
+              "filled_blocks\tfilled_paths\tfilled_region_hash\t"
+              "filled_public_hash\tfilled_block_hash\tdrop_regions\t"
+              "drop_public\tdrop_blocks\tafter_regions\tafter_public\t"
+              "after_blocks\tafter_paths\tafter_region_hash\t"
+              "after_public_hash\tafter_block_hash\tchain_ok\t"
+              "accounting_ok\n";
+    for (const auto &row : curve) {
+      if (!row.cache_observed || !row.cache_chain_ok ||
+          !row.cache_accounting_ok)
+        relationshipExact = false;
+      output << row.logical << '\t' << row.worker << '\t'
+             << row.cache_before.regions << '\t'
+             << row.cache_before.public_lines << '\t'
+             << row.cache_before.blocks << '\t' << row.cache_before.paths
+             << '\t' << row.cache_before.region_hash << '\t'
+             << row.cache_before.public_hash << '\t'
+             << row.cache_before.block_hash << '\t' << row.need_regions
+             << '\t' << row.install_regions << '\t' << row.install_public
+             << '\t' << row.install_blocks << '\t' << row.install_paths
+             << '\t' << row.cache_filled.regions << '\t'
+             << row.cache_filled.public_lines << '\t'
+             << row.cache_filled.blocks << '\t' << row.cache_filled.paths
+             << '\t' << row.cache_filled.region_hash << '\t'
+             << row.cache_filled.public_hash << '\t'
+             << row.cache_filled.block_hash << '\t' << row.drop_regions
+             << '\t' << row.drop_public << '\t' << row.drop_blocks << '\t'
+             << row.cache_after.regions << '\t'
+             << row.cache_after.public_lines << '\t'
+             << row.cache_after.blocks << '\t' << row.cache_after.paths
+             << '\t' << row.cache_after.region_hash << '\t'
+             << row.cache_after.public_hash << '\t'
+             << row.cache_after.block_hash << '\t'
+             << (row.cache_chain_ok ? 1 : 0) << '\t'
+             << (row.cache_accounting_ok ? 1 : 0) << '\n';
     }
     if (!output)
       relationshipExact = false;
@@ -2003,6 +2170,9 @@ int main(int argc, char **argv) {
         return 2;
     } else if (!strcmp(argv[index], "--curve-out") && index + 1 < argc) {
       options.curve_out = argv[++index];
+    } else if (!strcmp(argv[index], "--cache-curve-out") &&
+               index + 1 < argc) {
+      options.cache_curve_out = argv[++index];
     } else if (!strcmp(argv[index], "--real-pipes")) {
       // Required by the shared launcher; this executable is always pipe-shaped.
     } else {
@@ -2015,6 +2185,7 @@ int main(int argc, char **argv) {
     fprintf(stderr,
             "usage: %s --manifest F [--workers N --wave N --queue-depth N] "
             "[--raw-queue-depth N] [--codec z1|z3] [--curve-out F] "
+            "[--cache-curve-out F] "
             "[--real-pipes]\n",
             argv[0]);
     return 2;

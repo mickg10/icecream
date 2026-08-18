@@ -327,7 +327,7 @@ these independently checked ledgers:
 | repeated cold wire-size equivalence | 1/1 |
 | retained-file hashes verified | 539/539 |
 
-The complete run covers the fixed 16 corpora with cold zstd-1 and zstd-3 component policies, both CACHE50 complements, a 50%-raw snapshot/resume, reverse/three shuffled/novelty-max orders, change/revert sequences, 1/4/8/16/32 F stores, sticky/round-robin/random/failover assignment, restart, late join, bounded eviction of all three stores, 24-worker host concurrency, real input/output pipes, latency tails, and the binding full-DuckDB rate rows.
+The complete run covers the fixed 16 corpora with cold zstd-1 and zstd-3 component policies, both CACHE50 complements, a 50%-raw snapshot/resume, reverse/three shuffled/novelty-max orders, change/revert sequences, 1/4/8/16/32 F stores, `TU_HASH_STICKY`/round-robin/random/failover assignment, restart, late join, bounded eviction of all three stores, 24-worker host concurrency, real input/output pipes, latency tails, and the binding full-DuckDB rate rows. `TU_HASH_STICKY` is the historical hashed-physical-TU spread control; it is not GUID-aware cache affinity.
 
 This is the M1-M5 capability harness described by `CAPABILITY-PLAN.md`. It is not the separate P29+BSC or GROUP-RLZ compression candidate and it is not a daemon landing.
 
