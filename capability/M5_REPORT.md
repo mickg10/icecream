@@ -1,6 +1,140 @@
 # Protocol-50 M5 capability acceptance
 
-## 2026-08-18 binding-rate correction (authoritative)
+## 2026-08-18 final one-pass closure (authoritative)
+
+M5 capability acceptance is **PASS** at commit `dc5e0ab5` on branch
+`local-oracle/issue16-m4-m5`.  This verdict binds the complete one-pass path
+from producer pipe through C interning/factorization, protocol-50 socket
+dialogue, F reconstruction, and the compiler-verifier pipe.  It supersedes
+every intermediate `M5 is OPEN` statement retained later in this report as
+audit history.
+
+The final performance correction overlaps two independent pieces of accepted
+F work: writing the reconstructed TU into the compiler pipe and committing the
+same TU's F cache transaction.  The writer is joined before the final Ack, so
+the next TU cannot reuse or overwrite its reconstruction buffer.  The exact
+verifier consumes and compares every TU in order; its replies are drained at
+session close, and the run fails unless the reply count, byte count, TU count,
+worker exits, and all physical ledgers close.
+
+This small final change sits on the earlier one-pass work that:
+
+- pipelines source reads, interning, and causal factorization through bounded
+  queues;
+- publishes immutable dictionary snapshots instead of serializing the
+  producer and materializer behind one lock;
+- compresses each Fill wave concurrently and sends each ordered Fill as soon
+  as its own materialization completes;
+- avoids redundant verifier/fill copies while preserving byte-exact replay;
+- uses a bounded default prepared queue of 128 TUs.
+
+### Final executed gates
+
+| Gate | Result | Retained evidence |
+|---|---:|---|
+| optimized focused binaries | 5/5 PASS in each launcher build | each rate/full root below |
+| exact local z3 one-pass | 689/689 TUs; 1,985,715,205 B; 0 failures | `/tanksmall/scratch/ictmp/issue16-m5-f-overlap-final-build-BZwgzw` |
+| ASan+UBSan exact one-pass | 689/689 TUs; exit 0; no finding | `/tanksmall/scratch/ictmp/issue16-m5-dc5e0ab5-sanitize-ZTkLdt/asan-z3-rerun.log` |
+| thread checker, 8-F focused | 40/40 TUs; exit 0; no finding | same root, `tsan-z3-40.log` |
+| thread checker, complete corpus | 689/689 TUs; 1-F; exit 0; no finding | same root, `tsan-z3-full-1f.log` |
+| focused complete-rate suite, run 1 | 6/6 exact; required z1/z3 rows PASS | `.../rate-suite-v1` |
+| focused complete-rate suite, run 2 | 6/6 exact; required z1/z3 rows PASS | `.../rate-suite-v2` |
+| fixed-16 M1-M5 suite | **211/211 exact; overall PASS** | `.../full-fixed16-v1` |
+
+The omitted prefix on the quietbox paths above is:
+
+```text
+/home/ttuser/issue16-m5-f-compiler-overlap-dc5e0ab5
+```
+
+The first full local ASan+UBSan wrapper invocation printed a complete exact
+summary but returned a nonzero status without an instrumentation diagnostic;
+it is retained but is not counted as a pass.  A direct rerun of the same
+binary returned zero and is the row cited above.  A quietbox thread-checker
+binary stopped at runtime startup with `unexpected memory mapping`; that host
+run is likewise not counted.  The locally working runtime then completed all
+689 TUs and all 689 compiler/cache overlaps successfully.
+
+### Binding complete rates
+
+All three executions use the identical DuckDB manifest and exact physical
+socket bytes: 27,705,253 B for zstd-1 and 26,587,144 B for zstd-3.
+
+| Execution | zstd-1 complete | zstd-3 complete | Required result |
+|---|---:|---:|---:|
+| focused run 1 | 1.117 GB/s | 1.081 GB/s | PASS / PASS |
+| focused run 2 | 1.061 GB/s | 1.041 GB/s | PASS / PASS |
+| complete fixed-16 run | 1.072 GB/s | 1.074 GB/s | PASS / PASS |
+
+The complete zstd-3 scaling rows are informative rather than independent
+1-GB/s gates:
+
+| F stores | focused run 1 GB/s | focused run 2 GB/s | fixed-16 run GB/s |
+|---:|---:|---:|---:|
+| 1 | 0.519 | 0.481 | 0.514 |
+| 4 | 0.926 | 0.963 | 0.952 |
+| 16 | 1.037 | 1.057 | 0.998 |
+| 32 | 0.929 | 0.914 | 0.945 |
+
+Eight F stores remain the binding operating point.  The final code clears the
+gate on three complete runs without changing physical bytes.  The retained
+phase logs show why: the new overlap reduces the F-side final-Ack interval,
+while the producer, interner, causal factorizer, component choices, and wire
+representation remain unchanged.
+
+### Fixed-16 closure and artifact hashes
+
+The 211-row launcher contains the 45 behavior/transition rows, 160 full-corpus
+rows (16 corpora times cold z1, cold z3, both CACHE50 complements, snapshot,
+and five orders), and six one-pass rate/scaling rows.  Every row reconstructs
+exactly, uses real pipes and sockets, and closes frame, transaction, compiler
+byte/TU, and per-TU curve ledgers.
+
+```text
+rate-suite-v1/m5-acceptance.tsv
+  ea4494f0476a7f98cda4ae1fae7dd71fe5d412ecc6d213c0970a130b24a8aa49
+rate-suite-v2/m5-acceptance.tsv
+  9b3681c1eb27c87b35526f87cb47cc7cf14cdd120516c0b46abc5d23533406ef
+full-fixed16-v1/m5-acceptance.tsv
+  cd88a1e778e2f271ce93c89673f000f9fe76744b5e12007af026f651ccf8427b
+full-fixed16-v1/m5-acceptance.json
+  5d86e8fdacc97952887a1e8d120cf26fe68d7fe375a0451d64736f054a0b5540
+```
+
+Both focused roots verify 26/26 retained hashes; the full root verifies
+550/550.
+
+### Related Native9 selector checkpoint (separate from M5)
+
+The pending frozen-selector checkpoint was executed after the M5 rate work so
+the two measurements did not compete for quietbox resources.  All nine native
+holdouts produced independently complete GRZ streams at forced TU100 and
+TU200 boundaries and decoded byte-for-byte.  GRZ alone passes 9/9 TU100 cells
+and 8/9 TU200 cells; Firefox is the explicit GRZ TU200 miss.  Applying the
+policy frozen before those labels selects P29 for Firefox and GRZ elsewhere:
+
+| Metric | Selected bytes | Control bytes | Result |
+|---|---:|---:|---:|
+| complete cold | 211,299,160 | 210,048,331 zstd-19-long | 1.005955x; aggregate 1.10x gate PASS |
+| TU100 | 11,460,367 | 15,260,004 zstd-6-long | 0.751007x; 9/9 PASS |
+| TU200 | 18,827,954 | 26,504,769 zstd-6-long | 0.710361x; 9/9 PASS |
+
+This does **not** establish a good general codec selector: only 4/9 cold
+choices match per-cell hindsight, only 4/9 cells individually meet the cold
+1.10x target, and retained regret is 81,333,446 B.  It establishes the stated
+aggregate cold and chronological prefix capability points while leaving
+selector improvement as separate research.
+
+```text
+/home/ttuser/issue16-selector-v1/native9-prefix-checkpoints-v1
+/home/ttuser/issue16-selector-v1/native9-selector-holdout-v1
+checkpoint table SHA-256
+  2b32ab8c5e634a0883e2637f420d9fdf49a7153ab72cff675dff75d49a284406
+selector policy SHA-256
+  b5c3ec67f6262e06e0dd4e1554d289b77e974c8f01c55c3f446a38f97017455b
+```
+
+## 2026-08-18 binding-rate correction (historical; superseded above)
 
 The 209-row batch scenario matrix below remains valid exactness, lifecycle,
 cache, and accounting evidence, but its original **M5 passes** conclusion is
@@ -14,8 +148,9 @@ The retained DuckDB rows actually report:
 | zstd-1 | 1.226 GB/s | 0.620 GB/s | 0.542 GB/s |
 | zstd-3 | 1.219 GB/s | 0.622 GB/s | 0.549 GB/s |
 
-Therefore M5 is **OPEN**, not accepted, until a one-pass path clears 1 GB/s
-using the complete timer.  Commits `b1ad1e18` and later add that binding path:
+At that audit point M5 was **OPEN**, pending a one-pass path that cleared
+1 GB/s using the complete timer.  Commits `b1ad1e18` through `dc5e0ab5` added
+and closed that binding path:
 
 ```text
 producer process
@@ -32,7 +167,7 @@ GB/s` in addition to the relationship and individual stage floors.  Do not use
 the historical PASS line below as the overall M5 verdict; it describes only
 the closed 209-row batch scenario set.
 
-## 2026-08-18 typed-path reconciliation (authoritative)
+## 2026-08-18 typed-path reconciliation (historical; superseded above)
 
 A later completion audit found that the 209 scenario rows and the one-pass
 rate path did not use the same Root representation.  The historical batch
@@ -134,19 +269,19 @@ retained comparison is
 now enforces this equality between `mesh-4f-roundrobin` and
 `onepass-typed-grow`.
 
-M5 remains **OPEN**.  The current typed code still needs the complete fixed-16
-scenario rerun and the uncontended quietbox focused complete-rate rows before
-the overall milestone can be accepted.
+This was the intermediate **OPEN** status.  The final typed fixed-16 rerun and
+three uncontended quietbox complete-rate executions are now recorded in the
+authoritative closure section above.
 
-Date: 2026-08-17
+Historical batch date: 2026-08-17
 
 Branch: `local-oracle/issue16-m4-m5`
 
-Parent checkpoint: `da1dafc3` (`capability: complete transactional actual-socket M4`)
+Historical parent checkpoint: `da1dafc3` (`capability: complete transactional actual-socket M4`)
 
 Target host: `tt-quietbox2`
 
-Final retained run: `/tmp/issue16-m5-final2-fixed16-20260817`
+Historical retained run: `/tmp/issue16-m5-final2-fixed16-20260817`
 
 ## Historical batch-scenario result
 
@@ -194,22 +329,33 @@ C ordered decision
        |
        +-- abort --> F rolls back Fill; no compiler output/cache commit
        |
-       `-- commit --> exact bytes written through real compiler pipe
+       `-- commit --> F starts two independent local operations
                             |
-                            v
-                     verifier consumer process
-                     consumes and byte-compares complete TU
+                            +--> exact bytes written through real compiler pipe
+                            |         |
+                            |         v
+                            |    verifier consumes and byte-compares TU,
+                            |    then queues one asynchronous reply
                             |
-                            | one-byte consumption acknowledgement
-                            v
-                     F commits Fill/Block/cache state,
-                     performs eviction, returns final Ack + removals
-                            |
-                            v
-                     C commits authority and repairs that F mirror
+                            `--> commit Fill/Block/cache state and evict
+                                      |
+                                      v
+                            join pipe writer; return final Ack + removals
+                                      |
+                                      v
+                            C commits authority and repairs that F mirror
+
+session Done --> close compiler pipe --> drain exactly one verifier reply per TU
+             --> require verifier exit 0 --> return exact worker summary
 ```
 
-The verifier consumer stands in for the downstream compiler process. It consumes the same complete byte stream and replies only after comparing it to the expected TU. That reply makes every final committed Ack evidence that the downstream side consumed exactly one complete TU.
+The verifier consumer stands in for the downstream compiler process.  A final
+per-TU Ack proves that F completed the pipe write and cache transaction.  The
+verifier's byte comparison is asynchronous: session acceptance additionally
+requires exactly one successful verifier reply per committed TU, matching
+aggregate byte/TU counts, a clean verifier exit, and a closed worker summary.
+Thus exact downstream consumption is a complete-session property rather than
+an inaccurate claim that each final Ack waits for the comparison reply.
 
 ## Transaction boundary
 
@@ -222,8 +368,13 @@ The corrected boundary is two-phase:
 3. C finds the first rejected TU in logical order.
 4. C sends commit only to the accepted prefix and abort to every prepared suffix TU.
 5. An aborted F rolls back without compiler output or cache mutation.
-6. A committed F writes the complete TU to the verifier pipe and waits for its reply before committing local state and returning the final Ack.
+6. A committed F writes the complete TU to the verifier pipe concurrently with
+   committing its local cache transaction, joins the writer, and returns the
+   final Ack only after both operations finish.
 7. C commits its authority only after the matching final Ack.
+8. At session close, F drains exactly one post-comparison verifier reply per
+   committed TU and reports the exact compiler byte/TU ledger; any mismatch or
+   nonzero verifier exit rejects the complete run.
 
 The retained rejection scenario deliberately damages logical TU 5 in a four-TU wave. TU 4 commits; TUs 6 and 7 have already prepared and must abort; TUs 5-7 are then retried. The observed ledger is:
 
@@ -333,9 +484,15 @@ The launcher constructs retained A/B/A fixtures by changing one shared header li
 
 All four reconstruct every byte exactly. The reverted A2 phase reuses retained definitions while still carrying the complete physical control ledger.
 
-## Throughput and multi-F scaling
+## Historical batch throughput and multi-F scaling
 
-The binding rate point is eight F stores on the complete 689-TU DuckDB corpus. Both component policies independently pass aggregate relationship and every selected stage at 1 GB/s or more:
+The following table is retained batch relationship evidence.  It is not the
+final complete one-pass rate gate; current binding values are in the
+authoritative closure section at the top of this report.
+
+The historical batch rate point used eight F stores on the complete 689-TU
+DuckDB corpus. Both component policies independently passed the prepared
+relationship and selected stage rates at 1 GB/s or more:
 
 | Policy | Socket bytes | Ratio | Relationship | source pipe | interning | factorization | C transform | F decode/cache | compiler pipe |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -352,7 +509,11 @@ The zstd-3 scaling curve exposes the performance/bytes tradeoff rather than hidi
 | 16 | 37,869,400 | 52.436x | 1.414 | 1.129 | 1.153 | 205.64 / 205.81 |
 | 32 | 55,990,009 | 35.466x | 1.455 | 0.728 | 0.730 | 322.78 / 323.02 |
 
-Eight stores are the measured balanced operating point: they clear the rate gate with margin while retaining substantially more reuse than 16 or 32 stores. Four stores measured 0.992 GB/s in the final run and therefore is not used as the binding point. Sixteen and 32 improve aggregate relationship rate only modestly while duplicating more cache discovery and reducing summed per-worker service efficiency.
+Eight stores were the balanced point in this historical prepared-relationship
+measurement. Four stores measured 0.992 GB/s in that run. Sixteen and 32
+improved aggregate relationship rate only modestly while duplicating more
+cache discovery and reducing summed per-worker service efficiency. The
+current complete-timer evidence is reported at the top of this document.
 
 At eight F stores, the live semantic stores total 170,640,068 Region bytes, 18,400,058 public-Line bytes, and 7,318,816 Block bytes across the workers (about 187.3 MiB combined). The much larger per-process RSS number includes the fork-shared corpus and interner pages used by the exact verifier.
 
@@ -364,7 +525,12 @@ The 24-worker full-fmt row is exact. The deliberately 64-KiB bounded-cache row i
 |---|---|
 | F output/cache commit preceded C's ordered decision | two-phase prepare/commit; middle-wave rejection gives 20 commits, 2 aborts, and exactly 20 compiler deliveries |
 | forced recovery discarded worker summaries and could undercount accepted pipe work | normal close after prepared abort; forced-stop recovery derives only already-acknowledged exact deliveries |
-| compiler consumer did not acknowledge each TU | second pipe carries one acknowledgement only after full byte comparison |
+| compiler consumer did not acknowledge each TU | second pipe carries one acknowledgement only after full byte comparison; session close drains and checks exactly one reply per committed TU |
+| complete producer-to-compiler rate was not measured | bounded one-pass producer/interner/factorizer path and mandatory `complete >= 1.0 GB/s` rate rows |
+| producer and materializer serialized on mutable dictionary state | immutable causally published dictionary snapshots, with direct/snapshot byte-identity coverage |
+| Fill work serialized inside a wave | concurrent component compression and ordered send as soon as each Fill is materialized |
+| F compiler-pipe write serialized cache commit | joined writer overlaps the pipe write with the independent cache transaction; exact 689-TU thread-check run |
+| shallow prepared queue starved the eight-F operating point | bounded default queue depth 128, with high-water byte/count reporting |
 | launcher silently used the in-memory input/output path | every run appends `--real-pipes`; parser rejects any non-real row |
 | rate gate was attached to every one-F behavior row | behavior rows remain fully measured; dedicated full-DuckDB eight-F rows bind aggregate and per-stage rates |
 | F decoder timing double-counted compiler-pipe blocking | decoder/cache and compiler-pipe clocks are now disjoint |
@@ -390,35 +556,38 @@ The current M5 state test and middle-wave rejection scenario also pass with addr
 
 Local retained audit: `/tmp/issue16-m1-m5-final-audit-20260817`.
 
-## Reproduction and retained evidence
+## Current reproduction and retained evidence
 
-One-command final run:
+One-command final fixed-16 run on quietbox:
 
 ```sh
 python3 capability/run_m5_acceptance.py \
   --suite full \
   --corpus-root /home/ttuser/ictmp \
-  --output /tmp/issue16-m5-final2-fixed16-20260817 \
+  --output /home/ttuser/issue16-m5-f-compiler-overlap-dc5e0ab5/full-fixed16-v1 \
   --timeout 1800
 ```
 
 Primary files:
 
 ```text
-/tmp/issue16-m5-final2-fixed16-20260817/m5-acceptance.json
-  sha256 4bce8e78103f18724fc9bb0df813b9fbab901576835f21732efce6d441a6ad8b
-/tmp/issue16-m5-final2-fixed16-20260817/m5-acceptance.tsv
-  sha256 2b15687c4b2a5e27408b3054cff060452018cc305658f8b812a32d09a4cdb460
-/tmp/issue16-m5-final2-fixed16-20260817/cap_m5
-  sha256 414a003e6239cc96e263962c100c6c1c7bcb8213ddaf1b64750c32ec950a435a
-/tmp/issue16-m5-final2-fixed16-20260817/SHA256SUMS
-/tmp/issue16-m5-final2-fixed16-20260817/logs/
-/tmp/issue16-m5-final2-fixed16-20260817/curves/
-/tmp/issue16-m5-final2-fixed16-20260817/snapshots/
-/tmp/issue16-m5-final2-fixed16-20260817/fixtures/
+full-fixed16-v1/m5-acceptance.json
+  sha256 5d86e8fdacc97952887a1e8d120cf26fe68d7fe375a0451d64736f054a0b5540
+full-fixed16-v1/m5-acceptance.tsv
+  sha256 cd88a1e778e2f271ce93c89673f000f9fe76744b5e12007af026f651ccf8427b
+full-fixed16-v1/SHA256SUMS
+  sha256 48593ca04d06f4cc8ef0590d35c0abc109595fa4824afae62cbbf79771d14c40
+full-fixed16-v1/logs/
+full-fixed16-v1/curves/
+full-fixed16-v1/snapshots/
+full-fixed16-v1/fixtures/
 ```
 
-`sha256sum -c SHA256SUMS` verified 539/539 entries. Each row additionally records its exact command, executable hash, ordered corpus-content hash, log hash, and curve hash. `--resume` reuses a row only when command, executable, corpus hash, log, and curve inputs are present and compatible; otherwise it reruns it.
+`sha256sum -c SHA256SUMS` verified 550/550 entries. Each row additionally
+records its exact command, executable hash, ordered corpus-content hash, log
+hash, and curve hash. `--resume` reuses a row only when command, executable,
+corpus hash, log, and curve inputs are present and compatible; otherwise it
+reruns it.
 
 ## Scope boundary and remaining product work
 
@@ -435,7 +604,8 @@ itself land protocol 50 in the production icecc daemons. In particular:
 - eight independent F stores trade approximately 2.1x the one-F wire bytes for the measured aggregate rate; a shared cache module or affinity policy could recover some reuse in a later daemon integration;
 - H200 remains `none` where the retained stable-window definition is not established.
 
-Those boundaries are deliberate in `CAPABILITY-PLAN.md`. The historical
-batch-scenario scope is complete, but it is no longer sufficient evidence for
-the current typed protocol. M5 remains open until the focused complete-rate
-gate and the complete fixed-16 typed rerun pass with the shared H200 rule.
+Those boundaries are deliberate in `CAPABILITY-PLAN.md`.  The historical
+batch-scenario run is retained only as audit history; the current typed
+one-pass rate gates and complete fixed-16 rerun have now passed.  M5 capability
+acceptance is closed at `dc5e0ab5`; production-daemon integration remains a
+separate implementation milestone.
