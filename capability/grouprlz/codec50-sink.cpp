@@ -1267,11 +1267,20 @@ int main(int argc,char**argv){
         }
       }
     }
-    // Region keys must stay unique, and that is checked as each Region is admitted rather
-    // than by a sweep over the final count.  Same objects checked, same failure, no
-    // whole-corpus walk -- and it now fails at the TU that introduces the collision.
+    // Region-key uniqueness is only MEANINGFUL where the 64-bit key is what identifies an
+    // object on the wire -- the key-map association path.  With --direct-ordinals the wire
+    // carries ordinals, the key is never transmitted or looked up, and the table is pure
+    // overhead on the product hot path, so it is not built there.
+    //
+    // Worth stating plainly rather than leaving implied: Interner::region_key(rid) is
+    // rid+1, a bijection, so this check cannot fire under ANY mode as the Interner stands
+    // today.  It is kept for the key-consuming path because that is the path that breaks
+    // first if the key ever becomes a content hash -- which is exactly when a collision
+    // stops being impossible.
+    const bool keysIdentifyObjects = useKeyMap && !useDirectOrdinals;
     std::unordered_map<uint64_t,uint32_t> uniqueKeys; uint32_t keyedRegions=0;
     auto admitRegionKeys=[&](uint32_t upto)->bool{
+      if(!keysIdentifyObjects) return true;
       for(;keyedRegions<upto;++keyedRegions){
         auto inserted=uniqueKeys.emplace(dict.region_key(keyedRegions),keyedRegions);
         if(!inserted.second){fprintf(stderr,"Region key collision: %u and %u\n",inserted.first->second,keyedRegions);return false;}
@@ -2218,7 +2227,7 @@ int main(int argc,char**argv){
       }
       // Moving the key check per-TU must not quietly check FEWER Regions than the sweep did:
       // by the last TU every Region has been admitted, so this must have reached NREG.
-      if(keyedRegions!=NREG){fprintf(stderr,"Region key check covered %u of %u Regions\n",keyedRegions,NREG);return 2;}
+      if(keysIdentifyObjects&&keyedRegions!=NREG){fprintf(stderr,"Region key check covered %u of %u Regions\n",keyedRegions,NREG);return 2;}
       enc_s+=fallback_c_s;dec_s-=fallback_c_s;if(dec_s<0)dec_s=0;
 #if defined(WITH_BSC_GROUPS)
       if(usePlannedGroups){
