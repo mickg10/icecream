@@ -1,0 +1,12 @@
+{
+  "cells": 16,
+  "exact_cells": 16,
+  "group_tus": 112,
+  "grz_binary_sha256": "647883b7a346ae48d76ea2ac542240e5c78b4a56049372ee6067f5ec94276af9",
+  "grz_source_sha256": "e997b612c3445c951fa8bfc4abd2942fbad532fac85ebae5aa5fe753fe64a6b9",
+  "ledger_sha256": "cf40a7ab8d286150108b94299ae8c2d762dab89d2c5c127edd83e07b5784f4f4",
+  "probe_raw_bytes": 4620961001,
+  "probe_wire_bytes": 12982407,
+  "schema": "grz-fixed16-selector-probe-v1",
+  "timing_scope": "diagnostic retained probe process"
+}

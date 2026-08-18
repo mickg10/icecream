@@ -1,0 +1,13 @@
+{
+  "cells": 16,
+  "complete_wire_bytes": 78541028,
+  "exact_cells": 16,
+  "ledger_sha256": "cf40a7ab8d286150108b94299ae8c2d762dab89d2c5c127edd83e07b5784f4f4",
+  "p29_binary_sha256": "6cb0d9dbbf04f2e90459a49a715e55e06308cc05b382343a460c6dd62e5b526a",
+  "p29_source_sha256": "89ed3b299332f90898b0bd86338052d67d686e93797d2e332080f7ed33c7c753",
+  "prefix_identity_cells": 16,
+  "probe_wire_bytes": 17195369,
+  "raw_bytes": 28554671510,
+  "schema": "p29-fixed16-prefix-identity-v1",
+  "timing_scope": "diagnostic two-process research pass"
+}
