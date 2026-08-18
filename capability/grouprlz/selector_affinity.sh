@@ -5,7 +5,7 @@
 # recorded too but the box has 32 cores, so k=32 is oversubscribed (C side + 32 real
 # compiler-pipe consumers) and its wall time is indicative only.
 set -uo pipefail
-S=$HOME/selbind/m5split/cap_m5_split
+S=$HOME/selbind/m5split/cap_m5_dir
 R=$HOME/selbind/affinity; mkdir -p $R
 OUT=$R/affinity.tsv
 [ -f $OUT ] || printf "corpus\ttus\tworkers\tassignment\traw\twire\tb_root\tb_need\tb_fill\tb_control\tb_carry\twall_s\tsplit_ok\tdistinct_workers\n" > $OUT

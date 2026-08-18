@@ -1,0 +1,78 @@
+MIXED WARMTH -- pass 2 lands on a farm with 1 warm daemon and k-1 cold ones.
+  Pass 1 ran entirely on worker 0, so it alone carries this project's history.
+
+BYTES PER TU, BY WHO SERVED IT
+
+  corpus       k    warm B/TU    cold B/TU    penalty  warmTUs  coldTUs
+  cereal       1          479            -          -       84        0
+  cereal       2          496        25657      51.7x       42       42
+  cereal       4          618        41174      66.6x       21       63
+  cereal       8          608        71710     118.0x       10       74
+  cereal      30          121       242842    2001.4x        3       81
+
+  range-v3     1         5374            -          -      259        0
+  range-v3     2         5364        12715       2.4x      129      130
+  range-v3     4         5238        18699       3.6x       65      194
+  range-v3     8         5407        28131       5.2x       32      227
+  range-v3    30         5401        72377      13.4x        9      250
+
+  catch2       1          615            -          -      857        0
+  catch2       2          634         3914       6.2x      428      429
+  catch2       4          685         6284       9.2x      214      643
+  catch2       8          679         9529      14.0x      107      750
+  catch2      30          676        22276      32.9x       29      828
+
+  eigen        1        13312            -          -      650        0
+  eigen        2        13331        18507       1.4x      325      325
+  eigen        4        13262        22860       1.7x      162      488
+  eigen        8        13183        30797       2.3x       81      569
+  eigen       30        13055        66740       5.1x       22      628
+
+  duckdb       1         4671            -          -      689        0
+  duckdb       2         4575        26410       5.8x      344      345
+  duckdb       4         4960        32057       6.5x      172      517
+  duckdb       8         4032        42622      10.6x       86      603
+  duckdb      30         3866        81806      21.2x       23      666
+
+  rocksdb      1        13848            -          -      622        0
+  rocksdb      2        14084        31807       2.3x      311      311
+  rocksdb      4        14003        37439       2.7x      155      467
+  rocksdb      8        13728        46232       3.4x       78      544
+  rocksdb     30        15628        90040       5.8x       21      601
+
+  llvm         1         6939            -          -     1238        0
+  llvm         2         6935        17459       2.5x      619      619
+  llvm         4         6896        21525       3.1x      309      929
+  llvm         8         6815        28170       4.1x      155     1083
+  llvm        30         6553        56578       8.6x       41     1197
+
+  godot        1         4931            -          -     2207        0
+  godot        2         4920        23494       4.8x     1103     1104
+  godot        4         4926        31138       6.3x      552     1655
+  godot        8         4946        49408      10.0x      276     1931
+  godot       30         4648        75069      16.2x       74     2133
+
+WHAT WARMTH IS WORTH -- and only if you route to it
+
+  corpus     route to warm spread over 30          x cold 30 (no warm)  warm buys
+  cereal             40266       19670582     488.5x       20217591      -2.7%
+  range-v3         1391972       18142916      13.0x       18524428      -2.1%
+  catch2            526877       18464546      35.0x       19078143      -3.2%
+  eigen            8652556       42199817       4.9x       42029723       0.4%
+  duckdb           3218655       54571661      17.0x       55090705      -0.9%
+  rocksdb          8613479       54442418       6.3x       54028700       0.8%
+  llvm             8590657       67992737       7.9x       68150955      -0.2%
+  godot           10882123      160466272      14.7x      157822682       1.7%
+  MEAN                                         73.4x                     -0.8%
+
+MARGINAL COST OF RECRUITING COLD DAEMONS (pass-2 wire vs k=1)
+
+  corpus           k=2        k=4        k=8       k=30
+  cereal         27.3x      64.7x     131.9x     488.5x
+  range-v3        1.7x       2.9x       4.7x      13.0x
+  catch2          3.7x       7.9x      13.7x      35.0x
+  eigen           1.2x       1.5x       2.1x       4.9x
+  duckdb          3.3x       5.4x       8.1x      17.0x
+  rocksdb         1.7x       2.3x       3.0x       6.3x
+  llvm            1.8x       2.6x       3.7x       7.9x
+  godot           2.9x       5.0x       8.9x      14.7x
