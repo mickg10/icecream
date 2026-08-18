@@ -1,20 +1,33 @@
 # In-stream closure
 
-> ## WITHDRAWN: the general "+711 per warm rebuild"
+> ## TWO WITHDRAWALS
 >
-> The constant marginal is a **small-corpus regime, not a universal**, and it must not be
-> quoted as a general warm-rebuild cost. A warm rebuild stays nearly free **only while the
-> matching earlier build is still inside the retained `--hist` window**. Once the corpus
-> exceeds roughly `hist/3` the earlier build is evicted and the marginal climbs toward a
-> **second cold build** — measured: range-v3 **+625,060 B** on build 3, catch2 **+251,604**
-> on build 2 and **+502,895** on build 3, cereal **+154,086** on build 4.
+> **1. The general "+711 per warm rebuild" is withdrawn.** The constant marginal is a
+> small-corpus regime and must not be quoted as a general warm-rebuild cost.
 >
-> Mechanism, straight from the group curve: `hist_base` goes non-zero, `hist_extent` pins at
-> the cap, and once `hist_base` passes build 1's extent that build can no longer be matched.
-> This is the bounded-history codec doing exactly what it says — not a harness artifact.
-> Only the 4-pass design makes it visible; a single pass would have left "+711" looking
-> universal.
-
+> **2. My "fundamental bounded-history law" is ALSO withdrawn — it was wrong.** I explained
+> the large-corpus spikes as pure `--hist` eviction. local-oracle showed that is at most
+> partly true, and the source confirms it: in `grz2g.cpp` the anchor insert
+> (`tbl[slot] = wp + 1`, line 392) sits **inside the `if (!did)` no-match branch**, while a
+> successful COPY does `wp = lit_start` (line 381) and **jumps past the copied span without
+> planting any anchors in it**. So build 2 matches build 1 but never anchors its own bytes;
+> build 3 can therefore only match build 1, and once build 1 leaves the window build 3 pays
+> cold.
+>
+> **The tell was in my own table and I missed it.** range-v3 alternates
+> **+4,987 / +625,060 / +4,991** — build 2 cheap (matches build 1), build 3 cold (build 1
+> evicted, build 2 never anchored), build 4 cheap again (matches build 3, which *was*
+> anchored as literal). **Pure eviction would degrade monotonically, not alternate.** I
+> asserted a mechanism from correlation without checking that the pattern was consistent
+> with it.
+>
+> **What is actually established:** for corpora where a build exceeds roughly `hist/3`, the
+> *current* matcher policy — no re-anchoring across COPY output — leaves warm rebuilds
+> unable to chain, and the marginal alternates between near-free and near-cold. That is a
+> **fixable policy artifact, not a codec law**. A bounded anchor-refresh experiment (plant at
+> normal sampling positions while advancing through COPY output; report
+> compression/rate/churn/memory) is the follow-up, scheduled after the P29 work. Corpora
+> genuinely larger than the window are a separate question that does need more history.
 
 ## GRZ2 across 9 cells (4 docker profiles, native, 51-861 TUs/build)
 
