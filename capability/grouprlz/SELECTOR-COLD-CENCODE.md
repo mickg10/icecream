@@ -101,11 +101,15 @@ only the grouped pass is charged, the same binary measures 0.86-2.01 GB/s. **The
 harness, not codec** -- the same conclusion the stage split reached, now confirmed by a
 direct clock rather than by decomposition.
 
-## Not measured, and why
+## Superseded by the breadth pass
 
-**Godot.** Its plan pass fails with `blob zstd worker count: Unsupported parameter` even
-against a statically linked libzstd carrying the ZSTDMT symbols, so the corpus with real
-compressed blobs cannot be encoded by any build I can produce. local-oracle's reference
-binary handles it, so this is a build-environment gap on my side, not a codec limit; the
-row needs its build. Godot is also the largest fixed-16 corpus and the one where P29+BSC
-has its biggest size win, so the row is worth having.
+Godot's `blob zstd worker count: Unsupported parameter` was a build-environment gap, not
+a codec limit: linking `~/gdict/zstd/zstd-1.4.8/lib/libzstd.a` (which carries the ZSTDMT
+symbols) with `-DICE_LINE_CAP_LOG2=24` produces `codec50-cencZ`, re-verified byte-identical
+to the gated identity wire, and the Godot row above is measured with it.
+
+**This six-corpus row does not generalise.** Broadened to all 22 native corpora with a
+whole-program z19 reference, the size bar holds 22/22 but the rate bar holds only 11/22,
+and the separator is whole-program compressibility. See
+[`SELECTOR-COLD-CENCODE-BREADTH.md`](SELECTOR-COLD-CENCODE-BREADTH.md) — the honest
+both-bars number is **11/22**, not 5/6.
