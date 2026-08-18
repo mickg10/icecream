@@ -123,6 +123,11 @@ The option is intentionally separate from `--curve-out`: it scans receiver
 mirrors and must remain disabled for rate gates.
 `verify_m5_cache_curve.py` independently checks schema, chronological TU
 coverage, per-F state chaining, Need/install equality, and every count equation.
+When this mode is enabled, each F also sends its actual before-Fill,
+after-commit, and after-eviction store digest over a dedicated local audit
+pipe. C requires all three F digests to equal its receiver mirror. The audit
+pipe is not a protocol/network lane and none of its bytes enter the C-to-F or
+F-to-C ledger.
 
 Each row contains:
 
@@ -135,6 +140,7 @@ cache counts + fingerprints after Fill
 evicted Region/public-Line/Block counts
 cache counts + fingerprints after eviction
 per-F chain closure and count-accounting closure
+C-mirror/F-store equality at all three boundaries
 ```
 
 For every row:

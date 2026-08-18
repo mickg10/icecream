@@ -42,6 +42,7 @@ FIELDS = [
     "after_block_hash",
     "chain_ok",
     "accounting_ok",
+    "receiver_ok",
 ]
 
 STATE_KINDS = ("regions", "public", "blocks")
@@ -80,6 +81,10 @@ def verify(path: Path, expected_tus: int | None, require_removals: bool) -> None
             require(
                 row["accounting_ok"] == 1,
                 f"TU {logical}: producer accounting failed",
+            )
+            require(
+                row["receiver_ok"] == 1,
+                f"TU {logical}: C mirror and F store differ",
             )
 
             before = state(row, "before")

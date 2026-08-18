@@ -75,6 +75,130 @@ struct Manifest {
   uint64_t raw = 0;
 };
 
+struct MirrorDigest {
+  uint64_t region_hash = 0, public_hash = 0, block_hash = 0;
+  uint32_t regions = 0, public_lines = 0, blocks = 0, paths = 0;
+
+  bool operator==(const MirrorDigest &other) const {
+    return region_hash == other.region_hash &&
+           public_hash == other.public_hash &&
+           block_hash == other.block_hash && regions == other.regions &&
+           public_lines == other.public_lines && blocks == other.blocks &&
+           paths == other.paths;
+  }
+};
+
+static uint64_t known_id_hash(const std::vector<uint8_t> &known,
+                              uint64_t kind) {
+  // Hash only resident typed ordinals, not vector capacity: grow-only zero
+  // extension is not a cache-state transition.  The independent kind salt
+  // prevents equal ID sets in different namespaces from looking identical.
+  uint64_t hash = 1469598103934665603ull ^ kind;
+  for (uint32_t id = 0; id < known.size(); ++id)
+    if (known[id]) {
+      hash ^= uint64_t(id) + 0x9e3779b97f4a7c15ull;
+      hash *= 1099511628211ull;
+    }
+  return hash;
+}
+
+static MirrorDigest mirror_digest(const capm5::ReceiverMirror &mirror) {
+  MirrorDigest result;
+  result.region_hash = known_id_hash(mirror.regions, 0x524547494f4eull);
+  result.public_hash = known_id_hash(mirror.public_lines, 0x5055424c4943ull);
+  result.block_hash = known_id_hash(mirror.blocks, 0x424c4f434bull);
+  result.regions = uint32_t(std::count(mirror.regions.begin(),
+                                       mirror.regions.end(), uint8_t(1)));
+  result.public_lines =
+      uint32_t(std::count(mirror.public_lines.begin(),
+                          mirror.public_lines.end(), uint8_t(1)));
+  result.blocks = uint32_t(
+      std::count(mirror.blocks.begin(), mirror.blocks.end(), uint8_t(1)));
+  result.paths = mirror.path_count;
+  return result;
+}
+
+static MirrorDigest store_digest(const FStore &store) {
+  MirrorDigest result;
+  std::vector<uint8_t> regions(store.FmixedRegions.size(), 0);
+  for (uint32_t id = 0; id < store.FmixedRegions.size(); ++id)
+    if (store.FmixedRegions[id].known) {
+      regions[id] = 1;
+      ++result.regions;
+    }
+  result.region_hash = known_id_hash(regions, 0x524547494f4eull);
+  result.public_hash =
+      known_id_hash(store.FpublicPresent, 0x5055424c4943ull);
+  result.block_hash = known_id_hash(store.FknownBlk, 0x424c4f434bull);
+  result.public_lines = uint32_t(std::count(
+      store.FpublicPresent.begin(), store.FpublicPresent.end(), uint8_t(1)));
+  result.blocks = uint32_t(
+      std::count(store.FknownBlk.begin(), store.FknownBlk.end(), uint8_t(1)));
+  result.paths = uint32_t(store.Fpaths.size());
+  return result;
+}
+
+struct CacheAuditRecord {
+  uint32_t logical = 0, need_regions = 0;
+  MirrorDigest before, filled, after;
+};
+
+using CacheAuditWire = std::array<uint64_t, 23>;
+
+static void pack_digest(CacheAuditWire &wire, size_t offset,
+                        const MirrorDigest &value) {
+  wire[offset + 0] = value.regions;
+  wire[offset + 1] = value.public_lines;
+  wire[offset + 2] = value.blocks;
+  wire[offset + 3] = value.paths;
+  wire[offset + 4] = value.region_hash;
+  wire[offset + 5] = value.public_hash;
+  wire[offset + 6] = value.block_hash;
+}
+
+static MirrorDigest unpack_digest(const CacheAuditWire &wire, size_t offset) {
+  MirrorDigest value;
+  value.regions = uint32_t(wire[offset + 0]);
+  value.public_lines = uint32_t(wire[offset + 1]);
+  value.blocks = uint32_t(wire[offset + 2]);
+  value.paths = uint32_t(wire[offset + 3]);
+  value.region_hash = wire[offset + 4];
+  value.public_hash = wire[offset + 5];
+  value.block_hash = wire[offset + 6];
+  return value;
+}
+
+static bool write_cache_audit(int fd, const CacheAuditRecord &record) {
+  if (fd < 0)
+    return true;
+  CacheAuditWire wire{};
+  wire[0] = record.logical;
+  wire[1] = record.need_regions;
+  pack_digest(wire, 2, record.before);
+  pack_digest(wire, 9, record.filled);
+  pack_digest(wire, 16, record.after);
+  return cap::write_all(fd, wire.data(), sizeof wire);
+}
+
+static bool read_cache_audit(int fd, CacheAuditRecord &record) {
+  if (fd < 0)
+    return false;
+  CacheAuditWire wire{};
+  if (!cap::read_all(fd, wire.data(), sizeof wire) ||
+      wire[0] > UINT32_MAX || wire[1] > UINT32_MAX)
+    return false;
+  for (size_t offset : {size_t(2), size_t(9), size_t(16)})
+    for (size_t field = 0; field < 4; ++field)
+      if (wire[offset + field] > UINT32_MAX)
+        return false;
+  record.logical = uint32_t(wire[0]);
+  record.need_regions = uint32_t(wire[1]);
+  record.before = unpack_digest(wire, 2);
+  record.filled = unpack_digest(wire, 9);
+  record.after = unpack_digest(wire, 16);
+  return true;
+}
+
 static bool read_manifest(const char *path, size_t maxFiles, Manifest &out) {
   FILE *input = fopen(path, "r");
   if (!input) {
@@ -764,8 +888,8 @@ private:
   }
 };
 
-static int worker_loop(int fd, uint32_t workerId, const Manifest &manifest,
-                       const Options &options) {
+static int worker_loop(int fd, int auditFd, uint32_t workerId,
+                       const Manifest &manifest, const Options &options) {
   CodecContexts codec;
   FrameLedger frames;
   cap::Frame frame;
@@ -825,6 +949,7 @@ static int worker_loop(int fd, uint32_t workerId, const Manifest &manifest,
     auto pathBegin = Clock::now();
     auto decodeBegin = Clock::now();
     uint32_t logical = 0;
+    CacheAuditRecord cacheAudit;
     std::vector<uint8_t> rootWire, blockWire, rootRaw, blockRaw;
     auto reject = [&](FStore::FillTransaction *fill, const char *reason) {
       if (fill && fill->active)
@@ -845,6 +970,10 @@ static int worker_loop(int fd, uint32_t workerId, const Manifest &manifest,
       if (!reject(nullptr, "Root/component"))
         return 2;
       continue;
+    }
+    if (auditFd >= 0) {
+      cacheAudit.logical = logical;
+      cacheAudit.before = store_digest(store);
     }
     uint32_t requiredNreg = 0, requiredNblk = 0;
     if (!capp::try_scan_typed_dimensions(rootRaw, blockRaw, requiredNreg,
@@ -871,6 +1000,7 @@ static int worker_loop(int fd, uint32_t workerId, const Manifest &manifest,
     for (uint32_t id : requiredRegions)
       if (!store.FmixedRegions[id].known)
         missing.push_back(id);
+    cacheAudit.need_regions = uint32_t(missing.size());
     decodeSeconds += seconds_since(decodeBegin);
     auto need = capp::encode_component(build_need(missing), options.policy,
                                        codec.z1, codec.z3, true);
@@ -944,11 +1074,18 @@ static int worker_loop(int fd, uint32_t workerId, const Manifest &manifest,
     auto commitBegin = Clock::now();
     store.commit_fill(fillTx);
     store.commit_blocks(blockTx);
+    if (auditFd >= 0)
+      cacheAudit.filled = store_digest(store);
     cache.account_fill(store, missing, blockTx, fillTx,
                        uint64_t(logical) + 1);
     cache.touch_committed(store, occurrences, requiredBlocks,
                           uint64_t(logical) + 1);
     auto drops = cache.evict(store);
+    if (auditFd >= 0) {
+      cacheAudit.after = store_digest(store);
+      if (!write_cache_audit(auditFd, cacheAudit))
+        return 2;
+    }
     decodeSeconds += seconds_since(commitBegin);
     compilerWriter.join();
     if (!compilerOk)
@@ -965,7 +1102,7 @@ static int worker_loop(int fd, uint32_t workerId, const Manifest &manifest,
 
 struct Worker {
   pid_t pid = -1;
-  int fd = -1;
+  int fd = -1, audit_fd = -1;
   FrameLedger frames;
   capm5::ReceiverMirror mirror;
   WorkerSummary summary;
@@ -982,25 +1119,46 @@ static bool spawn_worker(Worker &worker, uint32_t id,
     perror("socketpair");
     return false;
   }
+  int audit[2] = {-1, -1};
+  if (options.cache_curve_out && pipe(audit) != 0) {
+    perror("cache audit pipe");
+    close(sockets[0]);
+    close(sockets[1]);
+    return false;
+  }
   pid_t child = fork();
   if (child < 0) {
     perror("fork");
     close(sockets[0]);
     close(sockets[1]);
+    if (audit[0] >= 0) {
+      close(audit[0]);
+      close(audit[1]);
+    }
     return false;
   }
   if (child == 0) {
     close(sockets[0]);
-    for (const auto &other : existing)
+    if (audit[0] >= 0)
+      close(audit[0]);
+    for (const auto &other : existing) {
       if (other.fd >= 0)
         close(other.fd);
-    int result = worker_loop(sockets[1], id, manifest, options);
+      if (other.audit_fd >= 0)
+        close(other.audit_fd);
+    }
+    int result = worker_loop(sockets[1], audit[1], id, manifest, options);
     close(sockets[1]);
+    if (audit[1] >= 0)
+      close(audit[1]);
     _exit(result);
   }
   close(sockets[1]);
+  if (audit[1] >= 0)
+    close(audit[1]);
   worker.pid = child;
   worker.fd = sockets[0];
+  worker.audit_fd = audit[0];
   worker.mirror.init(0, 0);
   auto hello = capp::pack_hello_m4(generation, 0, 0,
                                    uint32_t(manifest.paths.size()), 1);
@@ -1037,7 +1195,18 @@ static bool finish_worker(Worker &worker) {
   int status = 0;
   waitpid(worker.pid, &status, 0);
   worker.pid = -1;
-  return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+  bool auditExact = true;
+  if (worker.audit_fd >= 0) {
+    uint8_t extra = 0;
+    ssize_t count = 0;
+    do {
+      count = read(worker.audit_fd, &extra, 1);
+    } while (count < 0 && errno == EINTR);
+    auditExact = count == 0;
+    close(worker.audit_fd);
+    worker.audit_fd = -1;
+  }
+  return WIFEXITED(status) && WEXITSTATUS(status) == 0 && auditExact;
 }
 
 class SourcePipeline {
@@ -1221,62 +1390,20 @@ struct CurveRow {
   uint64_t raw = 0, wire = 0, latency_ns = 0, c_to_f = 0, f_to_c = 0;
   uint64_t c_root = 0, c_fill = 0, c_control = 0, f_need = 0,
            f_control = 0;
-  struct MirrorDigest {
-    uint64_t region_hash = 0, public_hash = 0, block_hash = 0;
-    uint32_t regions = 0, public_lines = 0, blocks = 0, paths = 0;
-
-    bool operator==(const MirrorDigest &other) const {
-      return region_hash == other.region_hash &&
-             public_hash == other.public_hash &&
-             block_hash == other.block_hash && regions == other.regions &&
-             public_lines == other.public_lines && blocks == other.blocks &&
-             paths == other.paths;
-    }
-  } cache_before, cache_filled, cache_after;
+  MirrorDigest cache_before, cache_filled, cache_after;
   uint32_t need_regions = 0, install_regions = 0, install_public = 0,
            install_blocks = 0, install_paths = 0, drop_regions = 0,
            drop_public = 0, drop_blocks = 0;
   bool cache_observed = false, cache_chain_ok = false,
-       cache_accounting_ok = false;
+       cache_accounting_ok = false, cache_receiver_ok = false;
 };
-
-static uint64_t known_id_hash(const std::vector<uint8_t> &known,
-                              uint64_t kind) {
-  // Hash only resident typed ordinals, not vector capacity: grow-only zero
-  // extension is not a cache-state transition.  The independent kind salt
-  // prevents equal ID sets in different namespaces from looking identical.
-  uint64_t hash = 1469598103934665603ull ^ kind;
-  for (uint32_t id = 0; id < known.size(); ++id)
-    if (known[id]) {
-      hash ^= uint64_t(id) + 0x9e3779b97f4a7c15ull;
-      hash *= 1099511628211ull;
-    }
-  return hash;
-}
-
-static CurveRow::MirrorDigest
-mirror_digest(const capm5::ReceiverMirror &mirror) {
-  CurveRow::MirrorDigest result;
-  result.region_hash = known_id_hash(mirror.regions, 0x524547494f4eull);
-  result.public_hash = known_id_hash(mirror.public_lines, 0x5055424c4943ull);
-  result.block_hash = known_id_hash(mirror.blocks, 0x424c4f434bull);
-  result.regions = uint32_t(std::count(mirror.regions.begin(),
-                                       mirror.regions.end(), uint8_t(1)));
-  result.public_lines =
-      uint32_t(std::count(mirror.public_lines.begin(),
-                          mirror.public_lines.end(), uint8_t(1)));
-  result.blocks = uint32_t(
-      std::count(mirror.blocks.begin(), mirror.blocks.end(), uint8_t(1)));
-  result.paths = mirror.path_count;
-  return result;
-}
 
 struct Pending {
   std::shared_ptr<PreparedTU> prepared;
   uint32_t worker = 0;
   uint64_t wire_start = 0, c_to_f_start = 0, f_to_c_start = 0;
   uint64_t c_root_start = 0, c_fill_start = 0, f_need_start = 0;
-  CurveRow::MirrorDigest cache_before, cache_filled;
+  MirrorDigest cache_before, cache_filled;
   uint32_t block_installs = 0;
   std::vector<uint32_t> missing;
   MixedEncoder::AuthorityTransaction authority;
@@ -1298,7 +1425,7 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
   for (uint32_t id = 0; id < options.workers; ++id)
     if (!spawn_worker(workers[id], id, workers, manifest, options, generation))
       return 2;
-  std::vector<CurveRow::MirrorDigest> lastCacheState(options.workers);
+  std::vector<MirrorDigest> lastCacheState(options.workers);
   if (options.cache_curve_out)
     for (uint32_t id = 0; id < options.workers; ++id)
       lastCacheState[id] = mirror_digest(workers[id].mirror);
@@ -1709,6 +1836,14 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
             row.cache_after.blocks + row.drop_blocks ==
                 row.cache_filled.blocks &&
             row.cache_after.paths == row.cache_filled.paths;
+        CacheAuditRecord receiver;
+        row.cache_receiver_ok =
+            read_cache_audit(worker.audit_fd, receiver) &&
+            receiver.logical == row.logical &&
+            receiver.need_regions == row.need_regions &&
+            receiver.before == row.cache_before &&
+            receiver.filled == row.cache_filled &&
+            receiver.after == row.cache_after;
         lastCacheState[job.worker] = row.cache_after;
       }
       curve.push_back(row);
@@ -1909,10 +2044,10 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
               "drop_public\tdrop_blocks\tafter_regions\tafter_public\t"
               "after_blocks\tafter_paths\tafter_region_hash\t"
               "after_public_hash\tafter_block_hash\tchain_ok\t"
-              "accounting_ok\n";
+              "accounting_ok\treceiver_ok\n";
     for (const auto &row : curve) {
       if (!row.cache_observed || !row.cache_chain_ok ||
-          !row.cache_accounting_ok)
+          !row.cache_accounting_ok || !row.cache_receiver_ok)
         relationshipExact = false;
       output << row.logical << '\t' << row.worker << '\t'
              << row.cache_before.regions << '\t'
@@ -1937,7 +2072,8 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
              << row.cache_after.public_hash << '\t'
              << row.cache_after.block_hash << '\t'
              << (row.cache_chain_ok ? 1 : 0) << '\t'
-             << (row.cache_accounting_ok ? 1 : 0) << '\n';
+             << (row.cache_accounting_ok ? 1 : 0) << '\t'
+             << (row.cache_receiver_ok ? 1 : 0) << '\n';
     }
     if (!output)
       relationshipExact = false;
