@@ -1,0 +1,20 @@
+P29 complete encode: how much of the two-pass wall is load+intern?
+
+  cell                                intern s   total s    share
+  eigen-linuxbrew                         13.2      16.7    79.0%
+  catch2-fedora-clang-libcxx               4.6       5.9    78.0%
+  eigen-debian-gcc                        12.8      16.7    76.6%
+  eigen-conan-gcc                         13.2      17.3    76.3%
+  eigen-fedora-clang-libcxx               16.2      21.5    75.3%
+  range-v3-fedora-clang-libcxx             3.4       4.6    73.9%
+  catch2-debian-gcc                        1.6       2.3    69.6%
+  catch2-linuxbrew                         1.6       2.3    69.6%
+  ... 44 cells total
+
+  AGGREGATE: intern 127.3 s of 186.2 s = 68.4% of the two-pass encode wall
+
+  Projections -- both are UPPER BOUNDS, they assume the stage goes to ZERO:
+    measured two-pass, research interner       0.370 GB/s   (0/44 clear)
+    two-pass, interning FREE                   1.170 GB/s
+    one-pass, research interner (measured)     0.693 GB/s   (0/44 clear)
+    one-pass AND interning FREE                2.191 GB/s
