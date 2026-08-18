@@ -198,3 +198,44 @@ Caveat on the measurements: a sibling job was active on the same 16 cores throug
 Rate spread across reps was under 3% on the corpora above 900 MB and up to 10.5% on
 spdlog (0.4 s wall); see `C_spread_pct`. The tune rounds ran under load average 4-7, so
 their rates are, if anything, pessimistic.
+
+---
+
+# CORRECTION (2026-08-18): stale GRZ2 decoder
+
+The GRZ2 F-decode column above came from `~/grouprlz/grz2g` (bin `62fa45e1...`,
+src `906c84b9...`), which predates the demand-ring decoder and understates GRZ2 F by
+up to 9.8x on small corpora. The current decoder is
+`grz2g-demand-ring-local-oracle-20260817` (bin `aed6de17...`, src `1f6beb20...`).
+
+Sizes are unaffected: `grz2g`, the demand-ring build and local-oracle's
+`grz2g-selector` all emit a byte-identical wire on the same input, so every byte count,
+selector choice and x ratio in this document stands.
+
+Corrected fixed-16 F, from local-oracle's decoder-replay gate over the identical wire
+SHA-256s (`grz2g-fixed16-demand-ring-20260818T0045Z/g2-fixed16-decoder-replay.tsv`):
+
+| corpus | stale F | demand-ring F | multiple |
+|---|---:|---:|---:|
+| fmt | 0.105 | 0.549 | 5.23 |
+| spdlog | 0.081 | 0.631 | 7.75 |
+| re2 | 0.091 | 0.731 | 8.02 |
+| leveldb | 0.116 | 0.684 | 5.88 |
+| nlohmann-json | 0.221 | 0.756 | 3.43 |
+| simdjson | 0.333 | 0.835 | 2.51 |
+| cereal | 0.258 | 0.944 | 3.66 |
+| range-v3 | 0.445 | 1.006 | 2.26 |
+
+## What changes
+
+- **Selected-codec F < 500 MB/s: 3/16 -> 1/16.** range-v3 (0.427 -> 1.006) and cereal
+  (0.246 -> 0.944) both clear the floor. The only remaining miss is Godot, where the
+  selected codec is P29+BSC at 0.436 GB/s -- a different decoder, unaffected by this fix.
+- **"causal, frozen policies, C and F >= 500 MB/s" 388.41x -> 389.18x**, i.e. identical
+  to the C-gate-only row. The 145,610-byte penalty in that row was exactly range-v3
+  (109,817) plus cereal (35,793), and both are now admissible.
+- The "+tuned GRZ2, C and F gates = 394.54x" row is **withdrawn pending re-measurement**:
+  its tuned candidates' F was measured with the stale decoder, so its 6 excluded flips
+  must be re-tested before that number is quoted.
+- Qualification 2 in the secondary section ("six of the seven flips break the decode
+  floor") is withdrawn on the same grounds.

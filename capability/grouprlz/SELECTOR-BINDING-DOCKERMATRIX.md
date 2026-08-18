@@ -110,3 +110,35 @@ cells on the same 16 physical cores throughout, at load average 2.7-4.4. Rates h
 therefore conservative.
 
 opencv and eigen (the remaining 8 verified cells, 50.5 GB) are measured separately.
+
+---
+
+# CORRECTION (2026-08-18): stale GRZ2 decoder
+
+Every GRZ2 F-decode rate above was produced by `~/grouprlz/grz2g`
+(bin `62fa45e1...`, src `906c84b9...`) -- the binary the frozen
+`g2-fixed112-fixed16.tsv` ledger was built with, and which predates the demand-ring
+decoder. It understates GRZ2 F by up to 9.8x.
+
+Re-decoded with `grz2g-demand-ring-local-oracle-20260817`
+(bin `aed6de17...`, src `1f6beb20...`): all 37 retained wires decode `[FULL,VERIFIED]`
+at the correct byte count, 1.00x-9.81x faster, peak RSS 2.02 -> 0.27 GiB on the small
+cells. Per-cell numbers in `selector-demandring-F-correction.tsv`.
+
+**Sizes are unaffected.** The three GRZ2 builds in play -- `grz2g`,
+`grz2g-demand-ring-local-oracle-20260817`, and local-oracle's
+`grz2g-selector` (bin `647883b7...`, src `e997b612...`) -- were checked head to head on
+re2/debian-gcc and all three emit a byte-identical wire (`8caf6e7e...`, 271,780 B).
+The encoder differences are instrumentation only. So every wire size, selector choice,
+per-profile x and win count above stands; only the decode-floor column changes.
+
+## What changes
+
+- **Selected-codec F < 500 MB/s: 5/36 -> 0/36.** The slowest GRZ2 decode across the
+  whole matrix is now fmt/debian-gcc at 0.552 GB/s. cereal (all four profiles) moves
+  0.201-0.257 -> 0.787-0.828; spdlog/fedora-clang-libcxx 0.376 -> 1.026.
+- The claim in the body that cereal x4 and spdlog/fedora fail the decode floor is
+  **withdrawn**. No cell in this matrix fails it.
+- Nothing else in the body changes: P29+BSC still misses the 1 GB/s C floor 36/36,
+  the causal selector is still 715.87x against a hindsight 839.37x, and the selector
+  still emits 1.0946x whole-program z19.
