@@ -12,6 +12,58 @@ Corpus load_corpus(const char*manifest,size_t max_files){
     c.raw=off; return c;
 }
 
+const PublishedRegion* PublishedDictionarySnapshot::pin(uint32_t id) const{
+    if(id>=region_count_)return nullptr;
+    const size_t chunk=id/CHUNK_REGIONS,index=id%CHUNK_REGIONS;
+    if(chunk>=chunks_.size()||!chunks_[chunk]||index>=chunks_[chunk]->regions.size())return nullptr;
+    return chunks_[chunk]->regions[index].get();
+}
+
+std::shared_ptr<const PublishedDictionarySnapshot>
+PublishedDictionaryPublisher::publish(const Interner&dict){
+    const uint64_t available=dict.region_count();
+    if(available>UINT32_MAX||published_>available)return {};
+    while(published_<available){
+        const uint32_t id=published_;
+        auto region=std::make_shared<PublishedRegion>();
+        const uint32_t rawLength=dict.region_raw_len(id);
+        const char*raw=dict.region_data(id);
+        region->raw.assign(raw,raw+rawLength);
+        const uint32_t count=dict.region_ids_count(id);
+        const uint32_t*ids=dict.region_ids_ptr(id);
+        region->lines.reserve(count);
+        uint64_t offset=0;
+        for(uint32_t index=0;index<count;++index){
+            const LineRef&line=dict.ref(ids[index]);
+            if(offset+line.len>rawLength)return {};
+            region->lines.push_back({ids[index],uint32_t(offset),line.len});
+            offset+=line.len;
+        }
+        if(offset!=rawLength)return {};
+        raw_bytes_+=rawLength;line_entries_+=count;
+        partial_.push_back(std::move(region));
+        ++published_;
+        if(partial_.size()==PublishedDictionarySnapshot::CHUNK_REGIONS){
+            auto chunk=std::make_shared<PublishedRegionChunk>();
+            chunk->regions=std::move(partial_);
+            complete_.push_back(std::move(chunk));
+            partial_.clear();
+            partial_.reserve(PublishedDictionarySnapshot::CHUNK_REGIONS);
+        }
+    }
+    auto snapshot=std::make_shared<PublishedDictionarySnapshot>();
+    snapshot->chunks_=complete_;
+    if(!partial_.empty()){
+        auto tail=std::make_shared<PublishedRegionChunk>();
+        tail->regions=partial_;
+        snapshot->chunks_.push_back(std::move(tail));
+    }
+    snapshot->region_count_=published_;
+    snapshot->raw_bytes_=raw_bytes_;
+    snapshot->line_entries_=line_entries_;
+    return snapshot;
+}
+
 bool parse_marker(const char* s, uint32_t len, Marker& m){
     if(len<4 || s[0]!='#' || s[1]!=' ') return false;
     const char* e=s+len; const char* p=s+2;
@@ -127,8 +179,47 @@ void MixedEncoder::rollback_authority_transaction(AuthorityTransaction&tx){
     tx.active=false;tx.line_before.clear();
 }
 
-uint32_t MixedEncoder::materialize(const Interner& dict,const std::vector<uint32_t>&missReg,size_t t,
-                                   AuthorityTransaction*tx){
+struct MaterialLineView { uint32_t id=0,len=0; const char*data=nullptr; };
+struct InternerMaterialAccess {
+    using Region=uint32_t;
+    const Interner&dict;
+    Region pin(uint32_t id) const { if(id>=dict.region_count()){fprintf(stderr,"materialize: bad Region\n");exit(2);}return id; }
+    uint32_t line_count(Region region) const { return dict.region_ids_count(region); }
+    MaterialLineView line(Region region,uint32_t index) const {
+        uint32_t id=dict.region_ids_ptr(region)[index];const LineRef&ref=dict.ref(id);
+        return {id,ref.len,dict.line_data(ref.off)};
+    }
+    uint32_t raw_len(Region region) const { return dict.region_raw_len(region); }
+    const char*raw_data(Region region) const { return dict.region_data(region); }
+};
+struct PublishedMaterialAccess {
+    using Region=const PublishedRegion*;
+    const PublishedDictionarySnapshot&dict;
+    Region pin(uint32_t id) const { auto*region=dict.pin(id);if(!region){fprintf(stderr,"materialize: unpublished Region\n");exit(2);}return region; }
+    uint32_t line_count(Region region) const { return uint32_t(region->lines.size()); }
+    MaterialLineView line(Region region,uint32_t index) const {
+        const auto&line=region->lines[index];
+        return {line.id,line.length,reinterpret_cast<const char*>(region->raw.data()+line.offset)};
+    }
+    uint32_t raw_len(Region region) const { return uint32_t(region->raw.size()); }
+    const char*raw_data(Region region) const { return reinterpret_cast<const char*>(region->raw.data()); }
+};
+
+template<class Dictionary>
+static uint32_t materialize_impl(MixedEncoder&encoder,const Dictionary&dict,
+                                 const std::vector<uint32_t>&missReg,size_t t,
+                                 MixedEncoder::AuthorityTransaction*tx){
+    auto&authorityJournalStamp=encoder.authorityJournalStamp;
+    const uint32_t authorityJournalSerial=encoder.authorityJournalSerial;
+    auto&mixedRaw=encoder.mixedRaw;auto&fill_paths=encoder.fill_paths;auto&np=encoder.np;
+    auto&fill_public_base=encoder.fill_public_base;auto&nextMixedPublic=encoder.nextMixedPublic;
+    auto&fill_path_base=encoder.fill_path_base;auto&paths=encoder.paths;auto&pathid=encoder.pathid;
+    auto&mixedCLine=encoder.mixedCLine;
+    auto&mixedOps=encoder.mixedOps;auto&fknownPublic=encoder.fknownPublic;auto&fknownReg=encoder.fknownReg;
+    auto&op7_count=encoder.op7_count;auto&op8_count=encoder.op8_count;auto&op9_count=encoder.op9_count;
+    auto&op7_wire=encoder.op7_wire;auto&op8_wire=encoder.op8_wire;auto&op9_wire=encoder.op9_wire;
+    auto&mixedLiteralRaw=encoder.mixedLiteralRaw;auto&mixedArrayValues=encoder.mixedArrayValues;
+    auto&n_marker=encoder.n_marker;auto&n_literal=encoder.n_literal;auto&census_sink=encoder.census_sink;
     if(tx&&!tx->active){fprintf(stderr,"materialize: inactive authority transaction\n");exit(2);}
     auto journalLine=[&](uint32_t lineId,const MixedCLineState&state){
         if(tx&&authorityJournalStamp[lineId]!=authorityJournalSerial){
@@ -145,13 +236,13 @@ uint32_t MixedEncoder::materialize(const Interner& dict,const std::vector<uint32
 
     put_varint(mixedRaw[0],missReg.size());
     for(uint32_t r:missReg){
-        const uint32_t* lids=dict.region_ids_ptr(r); uint32_t count=dict.region_ids_count(r),offset=0,literalLength=0;
+        auto region=dict.pin(r);uint32_t count=dict.line_count(region),offset=0,literalLength=0;
         auto ensurePathId=[&](const std::string&path){auto found=pathid.find(path);if(found!=pathid.end())return found->second;
             uint32_t id=uint32_t(paths.size());pathid.emplace(path,id);paths.push_back(path);put_varint(fill_paths,path.size());fill_paths.insert(fill_paths.end(),path.begin(),path.end());++np;return id;};
-        put_varint(mixedRaw[0],dict.region_raw_len(r));
+        put_varint(mixedRaw[0],dict.raw_len(region));
         auto flushLiteral=[&](){ if(!literalLength)return; mixedRaw[0].push_back(0);put_varint(mixedRaw[0],literalLength);++mixedOps[0];literalLength=0; };
         for(uint32_t j=0;j<count;++j){
-            uint32_t lineId=lids[j];const LineRef&line=dict.ref(lineId);const char*text=dict.line_data(line.off);MixedCLineState&state=mixedCLine[lineId];
+            MaterialLineView line=dict.line(region,j);uint32_t lineId=line.id;const char*text=line.data;MixedCLineState&state=mixedCLine[lineId];
             if(state.public_id){
                 uint32_t ord=state.public_id; flushLiteral();
                 bool haveIt = ord<fknownPublic.size() && fknownPublic[ord];
@@ -178,8 +269,9 @@ uint32_t MixedEncoder::materialize(const Interner& dict,const std::vector<uint32
             } else if(state.source_region!=UINT32_MAX&&state.source_region!=r){
                 // Region ordinals are identities, not observation order. Reverse/shuffled
                 // schedules may discover the matching source at a larger ordinal.
-                if(state.source_offset+line.len>dict.region_raw_len(state.source_region)||
-                   memcmp(dict.region_data(state.source_region)+state.source_offset,text,line.len)){
+                auto source=dict.pin(state.source_region);
+                if(state.source_offset+line.len>dict.raw_len(source)||
+                   memcmp(dict.raw_data(source)+state.source_offset,text,line.len)){
                     fprintf(stderr,"bad mixed source Line\n");exit(2);
                 }
                 flushLiteral();
@@ -216,7 +308,7 @@ uint32_t MixedEncoder::materialize(const Interner& dict,const std::vector<uint32
             offset+=line.len;
         }
         flushLiteral();
-        if(offset!=dict.region_raw_len(r)){fprintf(stderr,"mixed Region length differs\n");exit(2);}
+        if(offset!=dict.raw_len(region)){fprintf(stderr,"mixed Region length differs\n");exit(2);}
         if(r<fknownReg.size()) fknownReg[r]=1;   // C now believes F holds region r (F materializes it from this Fill)
         ++nr;
     }
@@ -233,6 +325,17 @@ uint32_t MixedEncoder::materialize(const Interner& dict,const std::vector<uint32
             mixedRaw[3].insert(mixedRaw[3].end(),value.values.begin(),value.values.end());}
     }
     return nr;
+}
+
+uint32_t MixedEncoder::materialize(const Interner&dict,const std::vector<uint32_t>&missReg,size_t t,
+                                   AuthorityTransaction*tx){
+    return materialize_impl(*this,InternerMaterialAccess{dict},missReg,t,tx);
+}
+
+uint32_t MixedEncoder::materialize(const PublishedDictionarySnapshot&dict,
+                                   const std::vector<uint32_t>&missReg,size_t t,
+                                   AuthorityTransaction*tx){
+    return materialize_impl(*this,PublishedMaterialAccess{dict},missReg,t,tx);
 }
 
 // =====================================================================================

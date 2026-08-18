@@ -114,6 +114,37 @@ int main(){
     reverseEncoder.begin_authority_transaction(reverseAuthority);reverseEncoder.materialize(dictionary,reversed,2,&reverseAuthority);reverseEncoder.commit_authority_transaction(reverseAuthority);
     check(reverseEncoder.nextMixedPublic==2,"reverse observation can publish a Line from a larger Region ordinal");
 
+    fprintf(stderr,"[7] immutable streaming dictionary snapshots:\n");
+    Interner liveDictionary;PublishedDictionaryPublisher publisher;
+    std::vector<uint32_t>liveIds(256),liveRegions;size_t liveCount=0;uint64_t liveHits=0;
+    const std::string first="# 1 \"first.hpp\"\nshared\n";
+    liveDictionary.process(first.data(),first.data()+first.size(),liveIds.data(),liveCount,liveHits,true,&liveRegions);
+    auto firstSnapshot=publisher.publish(liveDictionary);uint32_t firstRegions=uint32_t(liveDictionary.region_count());
+    const std::string second="# 2 \"second.hpp\"\nshared\nsecond only\n";
+    liveRegions.clear();liveCount=0;
+    liveDictionary.process(second.data(),second.data()+second.size(),liveIds.data(),liveCount,liveHits,true,&liveRegions);
+    auto secondSnapshot=publisher.publish(liveDictionary);uint32_t allRegions=uint32_t(liveDictionary.region_count());
+    check(firstSnapshot&&secondSnapshot&&firstRegions<allRegions,"publisher advances after new Regions");
+    check(firstSnapshot->region_count()==firstRegions&&firstSnapshot->pin(firstRegions)==nullptr,
+          "older snapshot does not observe later Regions");
+    const PublishedRegion*firstView=firstSnapshot->pin(0);
+    check(firstView&&std::string(firstView->raw.begin(),firstView->raw.end())==first,
+          "published Region owns exact immutable bytes");
+    std::vector<uint32_t>allMissing(allRegions);for(uint32_t id=0;id<allRegions;++id)allMissing[id]=id;
+    MixedEncoder direct,published;direct.init(liveDictionary.distinct(),allRegions);published.init(liveDictionary.distinct(),allRegions);
+    MixedEncoder::AuthorityTransaction directTx,publishedTx;
+    direct.begin_authority_transaction(directTx);published.begin_authority_transaction(publishedTx);
+    direct.materialize(liveDictionary,allMissing,3,&directTx);
+    published.materialize(*secondSnapshot,allMissing,3,&publishedTx);
+    bool same=direct.mixedRaw==published.mixedRaw&&direct.fill_paths==published.fill_paths&&
+              direct.paths==published.paths&&direct.nextMixedPublic==published.nextMixedPublic&&
+              direct.mixedOps==published.mixedOps&&direct.mixedCLine.size()==published.mixedCLine.size();
+    for(size_t id=0;same&&id<direct.mixedCLine.size();++id)
+        same=direct.mixedCLine[id].source_region==published.mixedCLine[id].source_region&&
+             direct.mixedCLine[id].source_offset==published.mixedCLine[id].source_offset&&
+             direct.mixedCLine[id].public_id==published.mixedCLine[id].public_id;
+    check(same,"published and direct materialization are byte-identical");
+
     printf("cap_m4_test (components + bounded protocol + staged C/F replay): %s\n",failures?"FAIL":"PASS");
     return failures?1:0;
 }

@@ -251,6 +251,7 @@ struct PreparedTU {
   uint32_t logical = 0;
   uint32_t raw_length = 0;
   uint32_t nreg = 0, nblk = 0, distinct_lines = 0;
+  std::shared_ptr<const capc::PublishedDictionarySnapshot> dictionary;
   std::vector<uint64_t> tokens;
   std::vector<BlockDefinition> blocks;
   size_t buffered_bytes() const {
@@ -976,10 +977,9 @@ class SourcePipeline {
 public:
   SourcePipeline(const Manifest &manifest, const Options &options,
                  const std::vector<Worker> &workers, PreparedQueue &queue,
-                 Interner &dict, std::mutex &dictMutex,
-                 ProducerTiming &timing)
+                 Interner &dict, ProducerTiming &timing)
       : manifest_(manifest), queue_(queue), raw_queue_(options.raw_queue_depth),
-        dict_(dict), dict_mutex_(dictMutex), timing_(timing) {
+        dict_(dict), timing_(timing) {
     if (pipe(descriptors_) != 0) {
       perror("source pipe");
       queue_.fail();
@@ -1052,7 +1052,7 @@ private:
   PreparedQueue &queue_;
   RawQueue raw_queue_;
   Interner &dict_;
-  std::mutex &dict_mutex_;
+  capc::PublishedDictionaryPublisher publisher_;
   ProducerTiming &timing_;
   int descriptors_[2]{-1, -1};
   pid_t pid_ = -1;
@@ -1113,23 +1113,27 @@ private:
       size_t lineCount = 0;
       uint32_t distinct = 0, nreg = 0;
       auto internBegin = Clock::now();
-      {
-        std::lock_guard<std::mutex> lock(dict_mutex_);
-        const char empty = 0;
-        const char *begin = raw->bytes.empty()
-                                ? &empty
-                                : reinterpret_cast<const char *>(
-                                      raw->bytes.data());
-        dict_.process(begin, begin + raw->bytes.size(), lineIds.data(),
-                      lineCount, hits, true, &regions);
-        distinct = dict_.distinct();
-        nreg = uint32_t(dict_.region_count());
+      const char empty = 0;
+      const char *begin = raw->bytes.empty()
+                              ? &empty
+                              : reinterpret_cast<const char *>(
+                                    raw->bytes.data());
+      dict_.process(begin, begin + raw->bytes.size(), lineIds.data(),
+                    lineCount, hits, true, &regions);
+      distinct = dict_.distinct();
+      nreg = uint32_t(dict_.region_count());
+      auto dictionary = publisher_.publish(dict_);
+      if (!dictionary || dictionary->region_count() != nreg) {
+        raw_queue_.fail();
+        queue_.fail();
+        return;
       }
       timing_.interning += seconds_since(internBegin);
       auto factorBegin = Clock::now();
       auto prepared = std::make_shared<PreparedTU>(factorizer.process(
           raw->logical, uint32_t(raw->bytes.size()), regions, distinct,
           nreg));
+      prepared->dictionary = std::move(dictionary);
       timing_.factorization += seconds_since(factorBegin);
       raw.reset();
       if (!queue_.push(std::move(prepared))) {
@@ -1176,7 +1180,6 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
       return 2;
 
   Interner dict;
-  std::mutex dictMutex;
   MixedEncoder encoder;
   encoder.init(0, 0);
   CodecContexts codec;
@@ -1188,7 +1191,7 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
   PreparedQueue queue(options.queue_depth);
   ProducerTiming producerTiming;
   auto activeStart = Clock::now();
-  SourcePipeline source(manifest, options, workers, queue, dict, dictMutex,
+  SourcePipeline source(manifest, options, workers, queue, dict,
                         producerTiming);
   if (queue.failed())
     return 2;
@@ -1288,38 +1291,40 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
       auto &worker = workers[job.worker];
       auto &fill = fills[index];
       auto materializeBegin = Clock::now();
-      {
-        std::lock_guard<std::mutex> lock(dictMutex);
-        uint32_t currentNreg = uint32_t(dict.region_count());
-        encoder.ensure_dimensions(dict.distinct(), currentNreg);
-        worker.mirror.ensure_dimensions(currentNreg,
-                                        job.prepared->nblk);
-        fill.path_base = worker.mirror.path_count;
-        capm5::MirrorScope scope(encoder, worker.mirror);
-        encoder.begin_authority_transaction(job.authority);
-        if (!job.missing.empty())
-          encoder.materialize(dict, job.missing, job.prepared->logical,
-                              &job.authority);
-        else {
-          for (auto &part : encoder.mixedRaw)
-            part.clear();
-          encoder.fill_paths.clear();
-          encoder.fill_public_base = encoder.nextMixedPublic;
-        }
-        fill.public_base = encoder.fill_public_base;
-        if (fill.path_base > encoder.paths.size()) {
-          relationshipExact = false;
-          break;
-        }
-        for (size_t path = fill.path_base; path < encoder.paths.size(); ++path) {
-          put_varint(fill.paths, encoder.paths[path].size());
-          fill.paths.insert(fill.paths.end(), encoder.paths[path].begin(),
-                            encoder.paths[path].end());
-        }
-        worker.mirror.path_count = uint32_t(encoder.paths.size());
-        for (size_t part = 0; part < 4; ++part)
-          fill.raw[part] = encoder.mixedRaw[part];
+      if (!job.prepared->dictionary ||
+          job.prepared->dictionary->region_count() != job.prepared->nreg) {
+        relationshipExact = false;
+        break;
       }
+      encoder.ensure_dimensions(job.prepared->distinct_lines,
+                                job.prepared->nreg);
+      worker.mirror.ensure_dimensions(job.prepared->nreg,
+                                      job.prepared->nblk);
+      fill.path_base = worker.mirror.path_count;
+      capm5::MirrorScope scope(encoder, worker.mirror);
+      encoder.begin_authority_transaction(job.authority);
+      if (!job.missing.empty())
+        encoder.materialize(*job.prepared->dictionary, job.missing,
+                            job.prepared->logical, &job.authority);
+      else {
+        for (auto &part : encoder.mixedRaw)
+          part.clear();
+        encoder.fill_paths.clear();
+        encoder.fill_public_base = encoder.nextMixedPublic;
+      }
+      fill.public_base = encoder.fill_public_base;
+      if (fill.path_base > encoder.paths.size()) {
+        relationshipExact = false;
+        break;
+      }
+      for (size_t path = fill.path_base; path < encoder.paths.size(); ++path) {
+        put_varint(fill.paths, encoder.paths[path].size());
+        fill.paths.insert(fill.paths.end(), encoder.paths[path].begin(),
+                          encoder.paths[path].end());
+      }
+      worker.mirror.path_count = uint32_t(encoder.paths.size());
+      for (size_t part = 0; part < 4; ++part)
+        fill.raw[part] = encoder.mixedRaw[part];
       transformSeconds += seconds_since(materializeBegin);
     }
     if (!relationshipExact)

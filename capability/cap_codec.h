@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <sys/mman.h>
@@ -150,6 +151,46 @@ private:
         for(;;){ if(++probes>SHORT_CAP){fprintf(stderr,"short\n");exit(2);} ShortSlot&s=short_[slot]; if(!s.id){uint32_t id=add_line(p,n);s.lo=lo;s.hi=hi;s.id=id;s.len=uint8_t(n);return id;} if(s.len==n&&s.lo==lo&&s.hi==hi)return s.id; slot=(slot+1)&(SHORT_CAP-1);} }
     TinySlot*tiny_=nullptr; ShortSlot*short_=nullptr; LineSlot*lines_=nullptr;
     std::vector<uint32_t> region_index_; std::vector<RegionRecord> region_records_; std::vector<char> line_bytes_,region_bytes_; std::vector<uint32_t> region_ids_; std::vector<LineRef> id_refs_; uint32_t next_id_=1,region_mask_=0;
+};
+
+// Immutable, causally published view of the Interner.  The streaming C path
+// gives each prepared TU a snapshot after that TU has been interned.  Region
+// objects and completed chunks are shared between snapshots, so publication
+// copies only the current partial chunk and the small chunk-pointer spine.
+// The coordinator can therefore materialize an older TU while the sole
+// Interner writer continues to append later TUs without touching a growing
+// std::vector concurrently.
+struct PublishedRegionLine {
+    uint32_t id=0, offset=0, length=0;
+};
+struct PublishedRegion {
+    std::vector<uint8_t> raw;
+    std::vector<PublishedRegionLine> lines;
+};
+struct PublishedRegionChunk {
+    std::vector<std::shared_ptr<const PublishedRegion>> regions;
+};
+class PublishedDictionarySnapshot {
+public:
+    static constexpr uint32_t CHUNK_REGIONS=1024;
+    const PublishedRegion* pin(uint32_t id) const;
+    uint32_t region_count() const { return region_count_; }
+    uint64_t raw_bytes() const { return raw_bytes_; }
+    uint64_t line_entries() const { return line_entries_; }
+private:
+    friend class PublishedDictionaryPublisher;
+    std::vector<std::shared_ptr<const PublishedRegionChunk>> chunks_;
+    uint32_t region_count_=0;
+    uint64_t raw_bytes_=0, line_entries_=0;
+};
+class PublishedDictionaryPublisher {
+public:
+    std::shared_ptr<const PublishedDictionarySnapshot> publish(const Interner&dict);
+private:
+    std::vector<std::shared_ptr<const PublishedRegionChunk>> complete_;
+    std::vector<std::shared_ptr<const PublishedRegion>> partial_;
+    uint32_t published_=0;
+    uint64_t raw_bytes_=0, line_entries_=0;
 };
 
 struct Corpus{ CorpusBytes bytes; std::vector<FileSpan> files; uint64_t raw=0; };
@@ -357,6 +398,9 @@ struct MixedEncoder {
     void rollback_authority_transaction(AuthorityTransaction&tx);
     // Materialize missReg (IN RECEIVED ORDER) -> mixedRaw[0..3] + fill_paths.  Returns nr.
     uint32_t materialize(const Interner& dict, const std::vector<uint32_t>& missReg, size_t t,
+                         AuthorityTransaction*tx=nullptr);
+    uint32_t materialize(const PublishedDictionarySnapshot&dict,
+                         const std::vector<uint32_t>&missReg,size_t t,
                          AuthorityTransaction*tx=nullptr);
 };
 
