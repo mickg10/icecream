@@ -1,0 +1,53 @@
+REGION REUSE DEPTH at TU112 (p29 region_occurrences / distinct regions)
+the causal quantity: how many times P29 gets to re-use each structural region
+
+DOCKER-44:
+  project        profile                 reprep    ratio complete winner
+  eigen          linuxbrew                 89.6   0.7928 P29BSC
+  eigen          fedora-clang-libcxx       78.7   0.7862 P29BSC
+  eigen          conan-gcc                 77.3   0.7790 P29BSC
+  eigen          debian-gcc                76.2   0.7714 P29BSC
+  cereal         conan-gcc                 74.1   0.7973 GRZ2
+  catch2         fedora-clang-libcxx       71.9   0.7501 GRZ2
+  cereal         debian-gcc                71.8   0.8023 GRZ2
+  cereal         fedora-clang-libcxx       67.9   0.7672 GRZ2
+  range-v3       fedora-clang-libcxx       67.0   0.6984 P29BSC
+  range-v3       conan-gcc                 60.7   0.7449 GRZ2
+  range-v3       debian-gcc                60.0   0.7437 GRZ2
+  spdlog         fedora-clang-libcxx       58.8   0.6692 GRZ2
+  cereal         linuxbrew                 56.6   0.7993 GRZ2
+  rocksdb        linuxbrew                 56.0   0.8152 P29BSC
+  re2            fedora-clang-libcxx       53.8   0.7915 GRZ2
+  leveldb        fedora-clang-libcxx       53.3   0.6592 GRZ2
+  rocksdb        fedora-clang-libcxx       49.9   0.8251 P29BSC
+  range-v3       linuxbrew                 42.0   0.7098 GRZ2
+  fmt            fedora-clang-libcxx       36.3   0.7685 GRZ2
+  re2            linuxbrew                 35.3   0.8190 GRZ2
+  rocksdb        conan-gcc                 34.8   0.7884 P29BSC
+  catch2         linuxbrew                 32.9   0.7725 GRZ2
+  rocksdb        debian-gcc                32.8   0.7926 P29BSC
+  catch2         conan-gcc                 32.8   0.7628 GRZ2
+  spdlog         conan-gcc                 32.7   0.7064 GRZ2
+  leveldb        linuxbrew                 32.2   0.7330 GRZ2
+  spdlog         linuxbrew                 32.0   0.7126 GRZ2
+  spdlog         debian-gcc                31.2   0.7122 GRZ2
+  catch2         debian-gcc                30.0   0.7677 GRZ2
+  fmt            linuxbrew                 28.3   0.7822 GRZ2
+  re2            conan-gcc                 26.0   0.7953 GRZ2
+  re2            debian-gcc                24.8   0.7988 GRZ2
+  nlohmann-json  debian-gcc                22.1   0.6725 GRZ2
+  nlohmann-json  conan-gcc                 21.7   0.6686 GRZ2
+  nlohmann-json  fedora-clang-libcxx       17.8   0.6141 GRZ2
+  opencv         linuxbrew                 17.4   0.7066 GRZ2
+  opencv         fedora-clang-libcxx       16.2   0.7336 P29BSC
+  opencv         conan-gcc                 12.5   0.7270 GRZ2
+  opencv         debian-gcc                12.4   0.7297 GRZ2
+  leveldb        conan-gcc                 11.1   0.6713 GRZ2
+  leveldb        debian-gcc                10.3   0.6709 GRZ2
+  nlohmann-json  linuxbrew                  9.0   0.6362 GRZ2
+  fmt            conan-gcc                  5.3   0.6572 GRZ2
+  fmt            debian-gcc                 5.1   0.6587 GRZ2
+
+  docker reprep: P29-win [16.2 .. 89.6]  GRZ-win [5.1 .. 74.1]
+  docker rocksdb reprep = ['34.8', '32.8', '49.9', '56.0']   <- compare fixed-16 rocksdb = 3.6
+  best reprep>=T on docker: T=76.2  TP=4 FP=0 FN=6

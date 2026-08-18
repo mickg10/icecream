@@ -1,0 +1,22 @@
+id        name             TUs    raw@TU112  GRZ compl  P29 compl actual  rule    verdict
+corpus2   corpus2          622    739716080    5456878    8537705 GRZ2    P29BSC  WRONG regret=3080827
+corpus12  eigen @ ddd2165   650    612714455    2040151    1141797 P29BSC  P29BSC  ok
+corpus    llvm            1238    404433872    7638087    7282357 P29BSC  GRZ2    WRONG regret=355730
+corpus3   corpus3          689    363349979    6576037    7873485 GRZ2    GRZ2    ok
+corpus15  simdjson @ 1f78f3e   153    337573645     955208    1258040 GRZ2    GRZ2    ok
+corpus16  cereal @ 22a1b36    84    326899429     423581     459374 GRZ2    GRZ2    ok
+corpus4   corpus4          700    318073203    3424583    5058543 GRZ2    GRZ2    ok
+corpus10  json @ cdf52ae    99    293917707     743198    1009497 GRZ2    GRZ2    ok
+corpus11  range-v3 @ 108f93c   259    276081683     628319     738136 GRZ2    GRZ2    ok
+corpus6   corpus6         2207    219324625   53427567   35094169 P29BSC  GRZ2    WRONG regret=18333398
+corpus14  leveldb @ 7ee830d    72    143868249     489989     618813 GRZ2    GRZ2    ok
+corpus7   fmt @ cde18a3     50    136350082     662261     932222 GRZ2    GRZ2    ok
+corpus5   corpus5         1506    121562194    6687096    6742098 GRZ2    GRZ2    ok
+corpus9   catch2 @ 0aeb818   857    118479871     626178     907733 GRZ2    GRZ2    ok
+corpus13  re2 @ 0dade9f     72    110231455     401210     436126 GRZ2    GRZ2    ok
+corpus8   spdlog @ f5f173a    34     98384472     436106     477912 GRZ2    GRZ2    ok
+
+frozen 500MB rule fixed-16: 92798922  x=307.7  /z19=0.9679
+oracle              fixed-16: 71028967  x=402.0  /z19=0.7409
+always-P29          fixed-16: 78568007  x=363.4  /z19=0.8195
+always-GRZ          fixed-16: 90616449  x=315.1  /z19=0.9452
