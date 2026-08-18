@@ -1,0 +1,4 @@
+group	tu_lo	tu_hi	out_bytes	add_bytes	comp_bytes	ratio	hist_base	hist_extent	anchor_samples	anchor_occupied	anchor_usable	anchor_collisions	anchor_matches	closed_by
+0	0	112	276081683	4731843	409592	674.04	0	0	77581	5299	5299	1445	3854	tu
+1	112	224	267319325	1794725	182448	1465.18	0	276081683	30560	4704	4704	1099	3605	tu
+2	224	259	88648008	343982	36171	2450.80	0	543401008	6443	1484	1484	243	1241	tu
