@@ -1,0 +1,11 @@
+cell	n	stable_cf	stable_ident	legacy_total	legacy_ident
+re2.debian-gcc	72	476189	YES	484759	YES
+fmt.debian-gcc	51	979468	YES	1057577	YES
+cereal.debian-gcc	80	490893	YES	498405	YES
+leveldb.debian-gcc	94	944052	YES	986979	YES
+nlohmann-json.debian-gcc	99	1224656	YES	1248145	YES
+spdlog.debian-gcc	168	765463	YES	780910	YES
+re2.fedora-clang-libcxx	72	517327	YES	532817	YES
+fmt.linuxbrew	51	806025	YES	814112	YES
+cereal.conan-gcc	80	500589	YES	508534	YES
+leveldb.fedora-clang-libcxx	94	1023994	YES	1044047	YES
