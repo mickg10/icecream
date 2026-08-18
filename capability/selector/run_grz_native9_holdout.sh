@@ -154,22 +154,39 @@ while IFS=$'\t' read -r id name manifest_path total_tus total_raw manifest_sha; 
         "$cell/cell.ii" -o "$cell/cell.z6.zst"
     zstd -d -q -c "$cell/cell.z6.zst" | cmp -s "$cell/cell.ii" -
 
+    tu100_raw=$(head -n 100 "$cell/manifest.txt" | tr '\n' '\0' | \
+        xargs -0 stat -Lc %s | awk '{sum += $1} END {printf "%.0f", sum}')
+    tu200_raw=$(head -n 200 "$cell/manifest.txt" | tr '\n' '\0' | \
+        xargs -0 stat -Lc %s | awk '{sum += $1} END {printf "%.0f", sum}')
+    head -c "$tu100_raw" "$cell/cell.ii" | \
+        taskset -c "$CORES" zstd -6 --long=31 -T"$ZSTD_THREADS" -q -f \
+        -o "$cell/tu100.z6.zst"
+    zstd -d -q -c "$cell/tu100.z6.zst" | cmp -n "$tu100_raw" "$cell/cell.ii" -
+    head -c "$tu200_raw" "$cell/cell.ii" | \
+        taskset -c "$CORES" zstd -6 --long=31 -T"$ZSTD_THREADS" -q -f \
+        -o "$cell/tu200.z6.zst"
+    zstd -d -q -c "$cell/tu200.z6.zst" | cmp -n "$tu200_raw" "$cell/cell.ii" -
+
     grz_wire=$(stat -Lc %s "$cell/cell.grz")
     z19_wire=$(stat -Lc %s "$cell/cell.z19.zst")
     z6_wire=$(stat -Lc %s "$cell/cell.z6.zst")
+    tu100_z6_wire=$(stat -Lc %s "$cell/tu100.z6.zst")
+    tu200_z6_wire=$(stat -Lc %s "$cell/tu200.z6.zst")
     curve_tus=$(awk -F '\t' 'NR > 1 {last=$3} END {print last+0}' "$cell/grz-curve.tsv")
     [[ "$curve_tus" -eq "$total_tus" ]] || {
         printf 'GRZ curve extent differs: %s\n' "$id" >&2
         exit 1
     }
     sha256sum "$cell/cell.ii" "$cell/replay.ii" "$cell/cell.tu" "$cell/cell.grz" \
-        "$cell/cell.z19.zst" "$cell/cell.z6.zst" "$cell/grz-curve.tsv" \
+        "$cell/cell.z19.zst" "$cell/cell.z6.zst" "$cell/tu100.z6.zst" \
+        "$cell/tu200.z6.zst" "$cell/grz-curve.tsv" \
         > "$cell/exact.sha256"
     {
-        printf 'id\tname\ttus\traw_bytes\tmanifest_sha256\tgrz_wire_bytes\tz19_long_bytes\tz6_long_bytes\tgrz_exact\tz19_exact\tz6_exact\n'
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\ttrue\ttrue\ttrue\n' \
+        printf 'id\tname\ttus\traw_bytes\tmanifest_sha256\tgrz_wire_bytes\tz19_long_bytes\tz6_long_bytes\ttu100_raw_bytes\ttu100_z6_long_bytes\ttu200_raw_bytes\ttu200_z6_long_bytes\tgrz_exact\tz19_exact\tz6_exact\n'
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\ttrue\ttrue\ttrue\n' \
             "$id" "$name" "$total_tus" "$total_raw" "$manifest_sha" \
-            "$grz_wire" "$z19_wire" "$z6_wire"
+            "$grz_wire" "$z19_wire" "$z6_wire" "$tu100_raw" "$tu100_z6_wire" \
+            "$tu200_raw" "$tu200_z6_wire"
     } > "$cell/measurement.tsv"
     rm -f -- "$cell/cell.ii" "$cell/replay.ii"
 done < "$RUN_ROOT/native9-ledger.tsv"
