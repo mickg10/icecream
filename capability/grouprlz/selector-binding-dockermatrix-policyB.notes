@@ -1,0 +1,12 @@
+# cells=44  identity_PASS=44/44  p29_complete_byte_exact=44/44
+# GRZ complete rows reused from local-oracle: 44/44 (pending: )
+# debian-gcc           n=11 raw=  16.37GB  P29corrected=  18122190  /z19=1.1380 (11 refs)  argmin@probe={'GRZ2': 11}  g1_close={'tu': 9, 'raw': 2}
+#                      probe: P29=  8103699 GRZ=  5929553 (GRZ/P29=0.7317)  makespan_sum=  7.83s  core-s/probe-GiB=4.54
+# conan-gcc            n=11 raw=  16.88GB  P29corrected=  18380816  /z19=1.1364 (11 refs)  argmin@probe={'GRZ2': 11}  g1_close={'tu': 9, 'raw': 2}
+#                      probe: P29=  8366730 GRZ=  6111000 (GRZ/P29=0.7304)  makespan_sum=  8.18s  core-s/probe-GiB=4.53
+# linuxbrew            n=11 raw=  16.80GB  P29corrected=  16896087  /z19=1.0908 (11 refs)  argmin@probe={'GRZ2': 11}  g1_close={'tu': 9, 'raw': 2}
+#                      probe: P29=  7728594 GRZ=  5788724 (GRZ/P29=0.7490)  makespan_sum=  8.03s  core-s/probe-GiB=4.51
+# fedora-clang-libcxx  n=11 raw=  24.50GB  P29corrected=  17770811  /z19=1.0514 (11 refs)  argmin@probe={'GRZ2': 11}  g1_close={'tu': 9, 'raw': 2}
+#                      probe: P29=  8642965 GRZ=  6275655 (GRZ/P29=0.7261)  makespan_sum= 10.19s  core-s/probe-GiB=3.70
+# ALL                  n=44 raw=  74.54GB  P29corrected=  71169904  /z19=1.1036 (44 refs)  argmin@probe={'GRZ2': 44}  g1_close={'tu': 36, 'raw': 8}
+#                      probe: P29= 32841988 GRZ= 24104932 (GRZ/P29=0.7340)  makespan_sum= 34.22s  core-s/probe-GiB=4.24
