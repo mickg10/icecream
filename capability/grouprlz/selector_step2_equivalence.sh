@@ -1,5 +1,10 @@
 set +e
-MX=$HOME/ictmp/ii-matrix; S1=$HOME/selbind/p29build/codec50-sink; S2=$HOME/selbind/p29build/codec50-sink-s2
+MX=${MX:-$HOME/ictmp/ii-matrix}
+# S1 = the reference build to compare against, S2 = the build under test.  Both are branch
+# builds; point S1 at a checkout of the previous step to reproduce that step's delta.
+S1=${S1:?set S1 to the reference codec50-sink build}
+S2=${S2:-$(dirname "${BASH_SOURCE[0]:-$0}")/build/codec50-sink}
+for b in "$S1" "$S2"; do [ -x "$b" ] || { echo "not executable: $b" >&2; exit 1; }; done
 BASE="--z 3 --mixed-regions --byte-array-lines --direct-ordinals --compressed-blobs --blob-threads 8 --blob-lazy-fallback --mo-factor --s1-max-chain 1024 --blob-z 9 --blob-zstd-workers 4 --blob-zstd-job-mib 5 --blob-zstd-overlap-log 3"
 printf "cell\tn\tstable_cf\tstable_ident\tlegacy_total\tlegacy_ident\n"
 for cell in "re2 debian-gcc" "fmt debian-gcc" "cereal debian-gcc" "leveldb debian-gcc" "nlohmann-json debian-gcc" "spdlog debian-gcc" "re2 fedora-clang-libcxx" "fmt linuxbrew" "cereal conan-gcc" "leveldb fedora-clang-libcxx"; do
