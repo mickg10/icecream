@@ -15,7 +15,17 @@
 #
 # EVERY gate is enforced: the script exits nonzero and writes FAIL into the status file, so
 # the join can refuse the cell rather than publish an unchecked number.
-set -uo pipefail
+set -Eeuo pipefail
+# any unhandled failure marks the cell FAILED rather than leaving a half-written status
+trap 'echo "FAIL ${TAG:-cell}: unhandled error at line $LINENO" >> "${S:-/dev/stderr}"; exit 1' ERR
+
+# every scalar a gate depends on must be present AND numeric -- an empty TOTAL compared
+# against an empty endpoint used to pass as equal, which is no check at all
+num() {  # num <name> <value>
+  case "$2" in
+    ''|*[!0-9]*) die "$1 is not a nonempty integer: '$2'" ;;
+  esac
+}
 P29=$HOME/selbind/p29build/codec50-refZ
 FUSED=$HOME/selbind/fused/fused-curveB
 Z3=$HOME/selbind/zstd3tu
@@ -54,7 +64,7 @@ print(d['payload']['path'], d['payload']['sha256'], d['tu_count'])") || die "cor
   [ "$N0" = "$TUS" ] || die "manifest $N0 != corpus.json tu_count $TUS"
   echo "payload=$REL sha=OK tu_count=$TUS" >> $S
 fi
-N=$(wc -l < $D/man.txt)
+N=$(wc -l < $D/man.txt); num "manifest TU count" "$N"
 [ "$N" -gt 0 ] || die "empty manifest"
 
 for k in 1 2 3 4; do : > $D/man$k.txt; for i in $(seq 1 $k); do cat $D/man.txt >> $D/man$k.txt; done; done
@@ -80,7 +90,7 @@ for k in 1 2 3 4; do
   tr '\n' '\0' < $D/man$k.txt | xargs -0 cat > $D/ii$k || die "concat x$k failed"
   taskset -c 0-31 $GRZ enc $D/ii$k $D/g$k.grz -u $D/tu$k.map $GRZP \
     --curve $W/$TAG.grz2.p$k.tsv > $D/g$k.out 2> $D/g$k.err || die "GRZ2 enc x$k failed"
-  GW+=("$(cut -f2 $D/g$k.out)")
+  gw=$(cut -f2 $D/g$k.out || true); num "GRZ2 x$k wire" "$gw"; GW+=("$gw")
   # independent decode of the complete stream + byte comparison against the input
   $GRZ dec $D/g$k.grz $D/g$k.dec -j 8 > $D/g$k.dec.out 2>&1 || die "GRZ2 x$k did not decode"
   cmp -s $D/g$k.dec $D/ii$k || die "GRZ2 x$k decode differs from input"
@@ -95,8 +105,10 @@ for k in 1 2 3 4; do
     --literal-group-skip-zstd10 --literal-group-wire $T/lit \
     --curve-tsv $W/$TAG.p29.p$k.tsv > $D/p$k.out 2> $D/p$k.err || { rm -rf $T; die "P29 x$k failed"; }
   rm -rf $T
-  tot=$(grep -o 'TOTAL=[0-9]*' $D/p$k.out | head -1 | cut -d= -f2)
-  end=$(tail -1 $W/$TAG.p29.p$k.tsv | cut -f5)
+  tot=$(grep -o 'TOTAL=[0-9]*' $D/p$k.out | head -1 | cut -d= -f2 || true)
+  end=$(tail -1 $W/$TAG.p29.p$k.tsv | cut -f5 || true)
+  num "P29 x$k TOTAL" "$tot"
+  num "P29 x$k endpoint" "$end"
   [ "$tot" = "$end" ] || die "P29 x$k endpoint $end != TOTAL $tot"
   grep -q 'byte-exact=OK' $D/p$k.out || die "P29 x$k not byte-exact"
   PW+=("$tot")
