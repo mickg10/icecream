@@ -1,0 +1,19 @@
+1) DEPTH SEPARATION BY FAMILY (does depth order the labels the same way?)
+
+  fixed16  P29-win depth 36.4 39.3 84.2
+           GRZ-win depth 3.6 5.1 5.2 9.1 14.5 22.4 25.8 26.4 28.2 38.9 41.8 67.5 72.5
+           -> P29 range [36.4,84.2] vs GRZ range [3.6,72.5]  overlapping
+
+  native   P29-win depth 18.7 20.1 20.1
+           GRZ-win depth 22.8 31.9 35.8
+           -> P29 range [18.7,20.1] vs GRZ range [22.8,35.8]  P29 LOWER (INVERTED)
+
+  docker   P29-win depth 16.2 32.8 34.8 49.9 56.0 67.0 76.2 77.3 78.7 89.6
+           GRZ-win depth 5.1 5.3 9.0 10.3 11.1 12.4 12.5 17.4 17.8 21.7 22.1 24.8 26.0 28.3 30.0 31.2 32.0 32.2 32.7 32.8 32.9 35.3 36.3 42.0 53.3 53.8 56.6 58.8 60.0 60.7 67.9 71.8 71.9 74.1
+           -> P29 range [16.2,89.6] vs GRZ range [5.1,74.1]  overlapping
+
+2) ABLATION: does the depth term earn its place?
+
+  depth + remaining_tus    held docker   1921792  fixed16    953356  native   1150996  TOTAL    4026144
+  remaining_tus ALONE      held docker   1921792  fixed16    953356  native   1150996  TOTAL    4026144
+  depth ALONE              held docker   3530971  fixed16  20360843  native   6414928  TOTAL   30306742

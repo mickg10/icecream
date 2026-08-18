@@ -173,3 +173,65 @@ Recommendation: adopt `depth + remaining_tus` as the current best cheap causal r
 keep the frozen 500 MB rule as the docker-side reference it genuinely still beats, and
 resolve the disagreement with more short-runway P29-winning lineages rather than more
 thresholds.
+
+---
+
+# CORRECTION: the depth term is inert. The working rule is one counter, not two.
+
+I reported `depth + remaining_tus` as a depth+1 result. An ablation the reviewer's
+question prompted shows that is wrong, and I am withdrawing the framing.
+
+## Depth does not separate on any family, and inverts on one
+
+| family | P29-win depth range | GRZ-win depth range | verdict |
+|---|---|---|---|
+| fixed-16 | 36.4 - 84.2 | 3.6 - 72.5 | overlapping |
+| docker-44 | 16.2 - 89.6 | 5.1 - 74.1 | overlapping |
+| **native-6** | **18.7 - 20.1** | **22.8 - 35.8** | **INVERTED -- P29 winners have LOWER depth** |
+
+On the native family the P29 winners (corpus19 20.1, corpus21 20.1, corpus22 18.7) all
+sit *below* every GRZ winner (corpus17 22.8, corpus24 31.9, corpus23 35.8). The proposed
+law -- high region reuse implies P29 amortizes and wins -- is contradicted, cleanly, by
+the third family.
+
+## The ablation: depth contributes nothing
+
+Leave-one-project-out over all 66 rows:
+
+| rule | held docker | held fixed-16 | held native | **total** |
+|---|---:|---:|---:|---:|
+| depth + remaining_tus | 1,921,792 | 953,356 | 1,150,996 | **4,026,144** |
+| **remaining_tus ALONE** | 1,921,792 | 953,356 | 1,150,996 | **4,026,144** |
+| depth ALONE | 3,530,971 | 20,360,843 | 6,414,928 | 30,306,742 |
+
+**Identical to the byte.** The `depth >= 14.5` term never binds on any held-out decision;
+every row that the runway threshold admits already clears it. My "depth + 1" rule was
+`remaining_tus` with an inert companion, and depth alone is worse than the frozen
+baseline (30,306,742 vs 27,050,421).
+
+## What actually survives
+
+A **single causal counter**: `P29+BSC iff remaining_tus >= ~1093`, i.e. P29 is worth
+choosing only when enough TUs remain after the decision point for its structural model to
+amortize. Held out it is 4,026,144 -- **6.7x better than the frozen 500 MB rule and 4.6x
+better than always-P29** -- and it still gets Godot, LLVM and RocksDB right. It is one
+threshold on a number the build system already knows at submit time.
+
+What does **not** survive is the mechanism story. Region reuse depth remains a real
+measurement -- RocksDB is genuinely 3.6 on fixed-16 and 32.8-56.0 on docker, and that
+reversal is real -- but it does not predict the label across families and it earns no
+place in a rule. I over-read a two-family pattern as a causal law; the third family
+refutes it.
+
+## Caveats the reviewer asked to record
+
+- **The frozen rule's 0.9793x docker score is an eigen-dominance artifact.** Eigen's four
+  docker profiles are 86.5% of everything recoverable on that family, so scoring well
+  there mostly means classifying Eigen correctly. The same applies to the earlier
+  fixed-16 band curiosity (Godot alone is 93.6% of fixed-16). Neither is a validated
+  selector; both are reports about one project.
+- **The three families want opposite constant policies.** always-P29+BSC is the best
+  constant on fixed-16 by 3x (7,539,040 vs frozen 21,769,955) and on native
+  (2,325,495 vs 4,716,367); the frozen rule is far the best on docker (564,099 vs
+  8,582,092). A metric where the best constant policy flips between families is not yet
+  able to certify a universal rule, however good the held-out number looks.
