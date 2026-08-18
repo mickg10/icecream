@@ -143,6 +143,9 @@ def parse_log(text: str) -> dict[str, object]:
             result["compiler_bytes"] = int(fields["compiler_bytes"])
             result["compiler_tus"] = int(fields["compiler_tus"])
             result["compiler_measured_bytes"] = int(fields["compiler_measured_bytes"])
+            result["compiler_summary_bytes"] = int(fields["compiler_summary_bytes"])
+            result["compiler_summary_tus"] = int(fields["compiler_summary_tus"])
+            result["summary_lost_workers"] = int(fields["summary_lost_workers"])
         elif line.startswith("TRANSACTIONS "):
             fields = kv_fields(line)
             result["transaction_closure"] = fields["closure"]
@@ -168,12 +171,27 @@ def parse_log(text: str) -> dict[str, object]:
         "frame_closure",
         "frame_total",
         "c50",
+        "c50_tu",
+        "h200",
+        "h200_tu",
+        "second_half",
         "c_transform_gbps",
         "f_decode_cpu_gbps",
         "relationship_gbps",
+        "c_peak_mib",
+        "f_peak_mib",
         "pipe_mode",
+        "c_pipe_to_wire_gbps",
+        "f_wire_to_compiler_pipe_gbps",
+        "f_aggregate_gbps",
+        "f_pipe_write_gbps",
+        "complete_gbps",
         "compiler_bytes",
         "compiler_tus",
+        "compiler_measured_bytes",
+        "compiler_summary_bytes",
+        "compiler_summary_tus",
+        "summary_lost_workers",
         "transaction_closure",
         "prepared_accepted",
         "decode_rejected",
@@ -711,6 +729,33 @@ def smoke_specs(
                     ),
                 )
             )
+    specs.extend(
+        (
+            RunSpec(
+                "onepass-typed-grow",
+                **common,
+                extra=("--workers", "4", "--wave", "4"),
+                one_pass=True,
+            ),
+            RunSpec(
+                "onepass-typed-bounded",
+                **common,
+                extra=(
+                    "--workers",
+                    "4",
+                    "--wave",
+                    "4",
+                    "--region-bytes",
+                    "65536",
+                    "--public-bytes",
+                    "65536",
+                    "--block-bytes",
+                    "2048",
+                ),
+                one_pass=True,
+            ),
+        )
+    )
     evolution, metadata = evolution_fixtures(corpus_root, output, evolution_tus)
     specs.extend(evolution)
     return specs, metadata
@@ -862,6 +907,8 @@ def run_one(
         raise RuntimeError(f"{spec.name}: transaction closure failed")
     if parsed["frame_total"] != parsed["actual_socket"]:
         raise RuntimeError(f"{spec.name}: frame total differs from socket total")
+    if sum(frame["bytes"] for frame in parsed["frames"].values()) != parsed["frame_total"]:
+        raise RuntimeError(f"{spec.name}: frame categories do not close")
     if sum(row["raw"] for row in curve_rows) != parsed["raw"]:
         raise RuntimeError(f"{spec.name}: curve raw does not close")
     if sum(row["wire"] for row in curve_rows) != parsed["actual_socket"]:
@@ -870,14 +917,33 @@ def run_one(
         raise RuntimeError(f"{spec.name}: TU/failure count mismatch")
     if parsed["transaction_committed"] != parsed["tus"]:
         raise RuntimeError(f"{spec.name}: committed transaction count does not close")
+    if parsed["prepared_accepted"] != (
+        parsed["transaction_committed"] + parsed["transaction_aborted"]
+    ):
+        raise RuntimeError(f"{spec.name}: prepared transaction count does not close")
     if parsed["transaction_aborted"] != spec.expected_prepared_aborts:
         raise RuntimeError(f"{spec.name}: prepared-abort count mismatch")
+    if parsed["decode_rejected"] != spec.expected_failures:
+        raise RuntimeError(f"{spec.name}: decode-rejection count mismatch")
     if parsed["pipe_mode"] != "real":
         raise RuntimeError(f"{spec.name}: real compiler-pipe path was not used")
     if parsed["compiler_bytes"] != parsed["raw"]:
         raise RuntimeError(f"{spec.name}: compiler-pipe bytes do not close")
+    if parsed["compiler_measured_bytes"] != parsed["raw"]:
+        raise RuntimeError(f"{spec.name}: compiler consumer bytes do not close")
     if parsed["compiler_tus"] != parsed["tus"]:
         raise RuntimeError(f"{spec.name}: compiler-pipe TU count does not close")
+    if parsed["summary_lost_workers"]:
+        if (
+            parsed["compiler_summary_bytes"] > parsed["raw"]
+            or parsed["compiler_summary_tus"] > parsed["tus"]
+        ):
+            raise RuntimeError(f"{spec.name}: partial compiler summary exceeds Ack ledger")
+    elif (
+        parsed["compiler_summary_bytes"] != parsed["raw"]
+        or parsed["compiler_summary_tus"] != parsed["tus"]
+    ):
+        raise RuntimeError(f"{spec.name}: complete compiler summary does not close")
     parsed["latency_p50_ms"] = latency_percentile_ms(curve_rows, 0.50)
     parsed["latency_p95_ms"] = latency_percentile_ms(curve_rows, 0.95)
     parsed["latency_p99_ms"] = latency_percentile_ms(curve_rows, 0.99)
@@ -982,6 +1048,9 @@ def write_outputs(
         "compiler_bytes",
         "compiler_tus",
         "compiler_measured_bytes",
+        "compiler_summary_bytes",
+        "compiler_summary_tus",
+        "summary_lost_workers",
         "minimum_relationship_gbps",
         "minimum_stage_gbps",
         "minimum_complete_gbps",

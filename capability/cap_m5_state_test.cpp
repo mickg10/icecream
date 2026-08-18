@@ -94,6 +94,44 @@ int main() {
                 7 * (sizeof(uint64_t) + sizeof(uint32_t)),
         "cache policy indexes grow to cover typed stores");
 
+  fprintf(stderr, "[1c] typed Root closure and expansion:\n");
+  FStore typedStore;
+  typedStore.init(2, 1);
+  typedStore.FmixedRegionData = {'a', 'b', 'c'};
+  typedStore.FmixedRegions[0] = {0, 1, true};
+  typedStore.FmixedRegions[1] = {1, 2, true};
+  std::vector<uint8_t> blockDefinition;
+  put_varint(blockDefinition, 1);
+  put_varint(blockDefinition, 0);
+  blockDefinition.push_back(0);
+  put_varint(blockDefinition, 2);
+  put_varint(blockDefinition, 0);
+  put_varint(blockDefinition, 1);
+  FStore::BlockTransaction typedBlocks;
+  check(typedStore.stage_blocks(blockDefinition, typedBlocks),
+        "typed Block staged");
+  std::vector<uint8_t> typedRoot;
+  put_varint(typedRoot, uint64_t(1) << 1);
+  put_varint(typedRoot, (uint64_t(0) << 1) | 1);
+  std::vector<uint32_t> typedRegions, typedRequiredBlocks;
+  check(typedStore.typed_requirements(typedRoot, &typedBlocks, typedRegions,
+                                      typedRequiredBlocks) &&
+            typedRegions == std::vector<uint32_t>({0, 1}) &&
+            typedRequiredBlocks == std::vector<uint32_t>({0}),
+        "typed Root derives complete Region/Block closure");
+  std::vector<uint8_t> typedOutput;
+  std::vector<uint32_t> typedOccurrences;
+  check(typedStore.reconstruct_typed_staged(
+            typedRoot, &typedBlocks, typedOutput, typedOccurrences) &&
+            typedOutput == std::vector<uint8_t>({'b', 'c', 'a', 'b', 'c'}) &&
+            typedOccurrences == std::vector<uint32_t>({1, 0, 1}),
+        "typed Root expands exact Region and Block order");
+  std::vector<uint8_t> invalidTypedRoot;
+  put_varint(invalidTypedRoot, uint64_t(2) << 1);
+  check(!typedStore.typed_requirements(invalidTypedRoot, &typedBlocks,
+                                       typedRegions, typedRequiredBlocks),
+        "typed Root rejects an undefined ordinal");
+
   fprintf(stderr, "[2] bounded stores and compaction:\n");
   const std::string source = "# 1 \"a.hpp\"\nalpha\n# 2 \"b.hpp\"\nbeta beta\n";
   Interner dict;

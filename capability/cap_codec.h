@@ -438,6 +438,10 @@ struct FStore {
     void reconstruct(const std::vector<uint8_t>& Frootb, std::vector<uint8_t>& recon);
     bool reconstruct_staged(const std::vector<uint8_t>& rootb,const BlockTransaction*blocks,
                             std::vector<uint8_t>&recon,std::vector<uint32_t>&occurrences) const;
+    bool typed_requirements(const std::vector<uint8_t>&rootb,const BlockTransaction*blocks,
+                            std::vector<uint32_t>&regions,std::vector<uint32_t>&requiredBlocks) const;
+    bool reconstruct_typed_staged(const std::vector<uint8_t>&rootb,const BlockTransaction*blocks,
+                                  std::vector<uint8_t>&recon,std::vector<uint32_t>&occurrences) const;
 
     // ---- M2 restart / eviction ----
     void reset_store(uint32_t resyncPublicNext){           // worker restart: drop the whole store

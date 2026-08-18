@@ -750,77 +750,6 @@ static bool scan_typed_dimensions(const std::vector<uint8_t> &root,
   return p == end;
 }
 
-static bool typed_requirements(
-    const FStore &store, const std::vector<uint8_t> &root,
-    const FStore::BlockTransaction &transaction,
-    std::vector<uint32_t> &regions, std::vector<uint32_t> &blocks) {
-  regions.clear();
-  blocks.clear();
-  const uint8_t *p = root.data(), *end = p + root.size();
-  while (p < end) {
-    uint64_t token = 0;
-    if (!get_varint_bounded(p, end, token) || (token >> 1) > UINT32_MAX)
-      return false;
-    uint32_t id = uint32_t(token >> 1);
-    if (token & 1)
-      blocks.push_back(id);
-    else
-      regions.push_back(id);
-  }
-  std::sort(blocks.begin(), blocks.end());
-  blocks.erase(std::unique(blocks.begin(), blocks.end()), blocks.end());
-  for (uint32_t block : blocks) {
-    const auto *children = store.block_children(block, &transaction);
-    if (!children)
-      return false;
-    regions.insert(regions.end(), children->begin(), children->end());
-  }
-  std::sort(regions.begin(), regions.end());
-  regions.erase(std::unique(regions.begin(), regions.end()), regions.end());
-  return std::all_of(regions.begin(), regions.end(),
-                     [&](uint32_t id) { return id < store.NREG; });
-}
-
-static bool reconstruct_typed(
-    const FStore &store, const std::vector<uint8_t> &root,
-    const FStore::BlockTransaction &transaction, std::vector<uint8_t> &output,
-    std::vector<uint32_t> &occurrences) {
-  output.clear();
-  occurrences.clear();
-  auto emit_region = [&](uint32_t id) {
-    if (id >= store.FmixedRegions.size() || !store.FmixedRegions[id].known)
-      return false;
-    const auto &view = store.FmixedRegions[id];
-    if (view.offset > store.FmixedRegionData.size() ||
-        view.length > store.FmixedRegionData.size() - view.offset ||
-        view.length > SIZE_MAX - output.size())
-      return false;
-    occurrences.push_back(id);
-    output.insert(output.end(), store.FmixedRegionData.begin() + view.offset,
-                  store.FmixedRegionData.begin() + view.offset + view.length);
-    return true;
-  };
-  const uint8_t *p = root.data(), *end = p + root.size();
-  while (p < end) {
-    uint64_t token = 0;
-    if (!get_varint_bounded(p, end, token) || (token >> 1) > UINT32_MAX)
-      return false;
-    uint32_t id = uint32_t(token >> 1);
-    if (!(token & 1)) {
-      if (!emit_region(id))
-        return false;
-      continue;
-    }
-    const auto *children = store.block_children(id, &transaction);
-    if (!children)
-      return false;
-    for (uint32_t child : *children)
-      if (!emit_region(child))
-        return false;
-  }
-  return true;
-}
-
 static int worker_loop(int fd, uint32_t workerId, const Manifest &manifest,
                        const Options &options) {
   CodecContexts codec;
@@ -918,8 +847,8 @@ static int worker_loop(int fd, uint32_t workerId, const Manifest &manifest,
       continue;
     }
     std::vector<uint32_t> requiredRegions, requiredBlocks, missing;
-    if (!typed_requirements(store, rootRaw, blockTx, requiredRegions,
-                            requiredBlocks)) {
+    if (!store.typed_requirements(rootRaw, &blockTx, requiredRegions,
+                                  requiredBlocks)) {
       if (!reject(nullptr, "closure"))
         return 2;
       continue;
@@ -964,8 +893,8 @@ static int worker_loop(int fd, uint32_t workerId, const Manifest &manifest,
         return 2;
       continue;
     }
-    bool expanded = reconstruct_typed(store, rootRaw, blockTx, reconstructed,
-                                      occurrences);
+    bool expanded = store.reconstruct_typed_staged(
+        rootRaw, &blockTx, reconstructed, occurrences);
     if (!expanded || reconstructed.size() != manifest.lengths[logical]) {
       if (!reject(&fillTx, "exact expansion"))
         return 2;
@@ -1759,7 +1688,9 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
          "F_wire_to_compiler_pipe=%.3f GB/s F_aggregate=%.3f GB/s "
          "F_pipe_write=%.3f GB/s complete=%.3f GB/s prepare=0.000000s "
          "compiler_bytes=%llu compiler_tus=%llu "
-         "compiler_measured_bytes=%llu queue_high=%zu/%zu "
+         "compiler_measured_bytes=%llu compiler_summary_bytes=%llu "
+         "compiler_summary_tus=%llu summary_lost_workers=0 "
+         "queue_high=%zu/%zu "
          "raw_queue_high=%zu/%zu\n",
          activeSeconds ? rawTotal / activeSeconds / 1e9 : 0.0,
          pathNs ? rawTotal / (double(pathNs) / 1e9) / 1e9 : 0.0,
@@ -1767,8 +1698,9 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
          compilerNs ? rawTotal / (double(compilerNs) / 1e9) / 1e9 : 0.0,
          completeSeconds ? rawTotal / completeSeconds / 1e9 : 0.0,
          (unsigned long long)compilerBytes, (unsigned long long)compilerTus,
-         (unsigned long long)compilerBytes, queue.high_count(),
-         queue.high_bytes(), source.raw_high_count(), source.raw_high_bytes());
+         (unsigned long long)compilerBytes, (unsigned long long)compilerBytes,
+         (unsigned long long)compilerTus, queue.high_count(), queue.high_bytes(),
+         source.raw_high_count(), source.raw_high_bytes());
   for (size_t index = 0; index < CK_COUNT; ++index) {
     const auto &part = components[index];
     printf("COMPONENT %-13s raw=%llu selected=%llu choices=%llu/%llu/%llu "

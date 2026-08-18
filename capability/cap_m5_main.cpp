@@ -325,6 +325,10 @@ static std::vector<uint8_t> build_need(const std::vector<uint32_t> &missing) {
   put_varint(raw, 0);
   return raw;
 }
+static uint64_t region_token(uint32_t id) { return uint64_t(id) << 1; }
+static uint64_t block_token(uint32_t id) {
+  return (uint64_t(id) << 1) | 1;
+}
 static bool parse_need(const std::vector<uint8_t> &raw, uint32_t nreg,
                        std::vector<uint32_t> &missing) {
   const uint8_t *p = raw.data(), *e = p + raw.size();
@@ -347,61 +351,17 @@ static bool derive_requirements(FStore &store, const std::vector<uint8_t> &root,
                                 const FStore::BlockTransaction &blocks,
                                 std::vector<uint32_t> &regions,
                                 std::vector<uint32_t> &requiredBlocks) {
-  if (++store.requestStamp == 0) {
-    std::fill(store.FrequiredRegionStamp.begin(),
-              store.FrequiredRegionStamp.end(), 0);
-    std::fill(store.FrequiredBlockStamp.begin(),
-              store.FrequiredBlockStamp.end(), 0);
-    store.requestStamp = 1;
-  }
-  regions.clear();
-  requiredBlocks.clear();
-  auto region = [&](uint32_t id) {
-    if (store.FrequiredRegionStamp[id] != store.requestStamp) {
-      store.FrequiredRegionStamp[id] = store.requestStamp;
-      regions.push_back(id);
-    }
-  };
-  auto block = [&](uint32_t id) {
-    if (store.FrequiredBlockStamp[id] != store.requestStamp) {
-      store.FrequiredBlockStamp[id] = store.requestStamp;
-      requiredBlocks.push_back(id);
-    }
-  };
-  const uint8_t *p = root.data(), *e = p + root.size();
-  while (p < e) {
-    uint32_t token = 0;
-    if (!get_u32_bounded(p, e, token))
-      return false;
-    if (token < store.NREG)
-      region(token);
-    else {
-      uint32_t id = token - store.NREG;
-      if (id >= store.NBLK)
-        return false;
-      block(id);
-    }
-  }
-  for (uint32_t id : requiredBlocks) {
-    const auto *children = store.block_children(id, &blocks);
-    if (!children)
-      return false;
-    for (uint32_t child : *children) {
-      if (child >= store.NREG)
-        return false;
-      region(child);
-    }
-  }
-  return true;
+  return store.typed_requirements(root, &blocks, regions, requiredBlocks);
 }
 
 struct Factorized {
-  std::vector<uint32_t> tokens, block_children;
+  std::vector<uint64_t> tokens;
+  std::vector<uint32_t> block_children;
   std::vector<size_t> token_offsets{0}, block_offsets{0};
 };
 static Factorized
 factor_sequence(const std::vector<std::vector<uint32_t>> &tuRegions,
-                const std::vector<uint32_t> &sequence, uint32_t nreg) {
+                const std::vector<uint32_t> &sequence) {
   Factorized result;
   std::vector<uint32_t> stream;
   std::vector<size_t> tuOffsets{0};
@@ -434,7 +394,7 @@ factor_sequence(const std::vector<std::vector<uint32_t>> &tuRegions,
       if (result.block_offsets[id + 1] - result.block_offsets[id] == length &&
           !memcmp(result.block_children.data() + result.block_offsets[id],
                   values, length * sizeof(uint32_t)))
-        return nreg + id;
+        return block_token(id);
     }
     uint32_t id = uint32_t(result.block_offsets.size() - 1);
     result.block_children.insert(result.block_children.end(), values,
@@ -442,7 +402,7 @@ factor_sequence(const std::vector<std::vector<uint32_t>> &tuRegions,
     result.block_offsets.push_back(result.block_children.size());
     if (found == dictionary.end())
       dictionary.emplace(hash, id);
-    return nreg + id;
+    return block_token(id);
   };
   for (size_t logical = 0; logical < sequence.size(); ++logical) {
     size_t begin = tuOffsets[logical], end = tuOffsets[logical + 1],
@@ -473,7 +433,7 @@ factor_sequence(const std::vector<std::vector<uint32_t>> &tuRegions,
         result.tokens.push_back(block(stream.data() + position, bestLength));
         step = bestLength;
       } else
-        result.tokens.push_back(stream[position]);
+        result.tokens.push_back(region_token(stream[position]));
       for (size_t i = position; i < position + step; ++i)
         if (i + MIN_MATCH <= stream.size()) {
           uint64_t hash = kgram(i);
@@ -911,8 +871,8 @@ static int worker_loop(int fd, uint32_t workerId, const Corpus &corpus,
     }
     const auto &file = corpus.files[sequence[logical]];
     reconstructed.reserve(file.len);
-    bool expanded =
-        store.reconstruct_staged(rootRaw, &blockTx, reconstructed, occurrences);
+    bool expanded = store.reconstruct_typed_staged(
+        rootRaw, &blockTx, reconstructed, occurrences);
     const char *original = corpus.bytes.data() + file.off;
     if (!expanded || reconstructed.size() != file.len ||
         (!options.real_pipes && file.len &&
@@ -1383,7 +1343,7 @@ static int run_coordinator(const Corpus &corpus, const Interner &dict,
         firstStarted = Clock::now();
       job.started = firstStarted;
       auto encodeBegin = Clock::now();
-      const uint32_t *tokens =
+      const uint64_t *tokens =
           factor.tokens.data() + factor.token_offsets[job.logical];
       size_t count = factor.token_offsets[job.logical + 1] -
                      factor.token_offsets[job.logical];
@@ -1392,10 +1352,10 @@ static int run_coordinator(const Corpus &corpus, const Interner &dict,
       std::vector<uint32_t> requiredBlocks;
       for (size_t i = 0; i < count; ++i) {
         put_varint(rootRaw, tokens[i]);
-        if (tokens[i] >= nreg &&
+        if ((tokens[i] & 1) &&
             std::find(requiredBlocks.begin(), requiredBlocks.end(),
-                      tokens[i] - nreg) == requiredBlocks.end())
-          requiredBlocks.push_back(tokens[i] - nreg);
+                      uint32_t(tokens[i] >> 1)) == requiredBlocks.end())
+          requiredBlocks.push_back(uint32_t(tokens[i] >> 1));
       }
       std::vector<uint8_t> blockRaw;
       size_t definitionCount = 0;
@@ -1726,17 +1686,24 @@ static int run_coordinator(const Corpus &corpus, const Interner &dict,
     }
   }
   uint64_t socketBytes = 0, fDecodeNs = 0, fPathNs = 0, compilerPipeBytes = 0,
-           compilerPipeMeasuredBytes = 0, compilerPipeNs = 0,
-           compilerPipeTus = 0, peakRss = 0;
+           compilerPipeMeasuredBytes = 0, compilerPipeSummaryBytes = 0,
+           compilerPipeNs = 0, compilerPipeTus = 0,
+           compilerPipeSummaryTus = 0, summaryLostWorkers = 0, peakRss = 0;
   capm5::CacheTotals cacheTotals;
   for (const auto &worker : workers) {
     socketBytes += worker.frames.total();
     fDecodeNs += worker.accumulated.decode_ns;
     fPathNs += worker.accumulated.path_ns;
-    compilerPipeBytes += worker.accumulated.compiler_pipe_bytes;
-    compilerPipeMeasuredBytes += worker.accumulated.compiler_pipe_bytes;
+    // accepted/accepted_raw are advanced only after C receives F's final Ack;
+    // F sends that Ack only after the verifier process consumed and accepted
+    // the complete TU.  This event ledger therefore survives a later worker
+    // stop even when the optional aggregate worker summary does not.
+    compilerPipeBytes += worker.accepted_raw;
+    compilerPipeMeasuredBytes += worker.accepted_raw;
+    compilerPipeTus += worker.accepted;
+    compilerPipeSummaryBytes += worker.accumulated.compiler_pipe_bytes;
+    compilerPipeSummaryTus += worker.accumulated.compiler_pipe_tus;
     compilerPipeNs += worker.accumulated.compiler_pipe_ns;
-    compilerPipeTus += worker.accumulated.compiler_pipe_tus;
     peakRss = std::max(peakRss, worker.accumulated.peak_rss_kib);
     cacheTotals.region_bytes += worker.accumulated.cache.region_bytes;
     cacheTotals.public_bytes += worker.accumulated.cache.public_bytes;
@@ -1749,17 +1716,10 @@ static int run_coordinator(const Corpus &corpus, const Interner &dict,
     cacheTotals.block_removals += worker.accumulated.cache.block_removals;
     cacheTotals.compactions += worker.accumulated.cache.compactions;
     if (options.real_pipes && worker.summary_lost) {
+      ++summaryLostWorkers;
       if (worker.accumulated.compiler_pipe_bytes > worker.accepted_raw ||
           worker.accumulated.compiler_pipe_tus > worker.accepted) {
         exact = false;
-      } else {
-        // Every committed TU waits for the verifier child's per-TU reply
-        // before F sends its final Ack.  A later forced worker stop can lose
-        // only the aggregate timing summary, not that per-TU proof.
-        compilerPipeBytes +=
-            worker.accepted_raw - worker.accumulated.compiler_pipe_bytes;
-        compilerPipeTus +=
-            worker.accepted - worker.accumulated.compiler_pipe_tus;
       }
     }
   }
@@ -1796,6 +1756,9 @@ static int run_coordinator(const Corpus &corpus, const Interner &dict,
     }
   if (frameClosure != socketBytes || curve.size() != sequence.size() ||
       rawTotal != expectedRaw ||
+      (options.real_pipes &&
+       (compilerPipeBytes != rawTotal || compilerPipeMeasuredBytes != rawTotal ||
+        compilerPipeTus != curve.size())) ||
       preparedAccepted != transactionCommitted + transactionAborted ||
       transactionCommitted != curve.size())
     exact = false;
@@ -1879,7 +1842,8 @@ static int run_coordinator(const Corpus &corpus, const Interner &dict,
          "F_pipe_write=%.3f GB/s "
          "complete=%.3f GB/s "
          "prepare=%.6fs compiler_bytes=%llu compiler_tus=%llu "
-         "compiler_measured_bytes=%llu\n",
+         "compiler_measured_bytes=%llu compiler_summary_bytes=%llu "
+         "compiler_summary_tus=%llu summary_lost_workers=%llu\n",
          options.real_pipes ? "real" : "memory",
          options.real_pipes && preparationSeconds + relationshipSeconds > 0
              ? rawTotal / (preparationSeconds + relationshipSeconds) / 1e9
@@ -1891,7 +1855,7 @@ static int run_coordinator(const Corpus &corpus, const Interner &dict,
              ? rawTotal / relationshipSeconds / 1e9
              : 0.0,
          options.real_pipes && compilerPipeNs
-             ? compilerPipeMeasuredBytes / (double(compilerPipeNs) / 1e9) /
+             ? compilerPipeSummaryBytes / (double(compilerPipeNs) / 1e9) /
                    1e9
              : 0.0,
          options.real_pipes && completeSeconds > 0
@@ -1899,7 +1863,10 @@ static int run_coordinator(const Corpus &corpus, const Interner &dict,
              : 0.0,
          preparationSeconds, (unsigned long long)compilerPipeBytes,
          (unsigned long long)compilerPipeTus,
-         (unsigned long long)compilerPipeMeasuredBytes);
+         (unsigned long long)compilerPipeMeasuredBytes,
+         (unsigned long long)compilerPipeSummaryBytes,
+         (unsigned long long)compilerPipeSummaryTus,
+         (unsigned long long)summaryLostWorkers);
   for (size_t i = 0; i < CK_COUNT; ++i) {
     const auto &part = components[i];
     printf("COMPONENT %-13s raw=%llu selected=%llu choices=%llu/%llu/%llu "
@@ -2093,8 +2060,7 @@ int main(int argc, char **argv) {
   if (options.corrupt_tu >= sequence.size() && options.corrupt_tu != UINT32_MAX)
     return 2;
   auto factorBegin = Clock::now();
-  auto factor =
-      factor_sequence(regions, sequence, uint32_t(dict.region_count()));
+  auto factor = factor_sequence(regions, sequence);
   preparation.factorization = seconds_since(factorBegin);
   double preparationSeconds = seconds_since(start);
   fprintf(stderr,

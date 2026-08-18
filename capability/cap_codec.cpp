@@ -473,6 +473,54 @@ bool FStore::reconstruct_staged(const std::vector<uint8_t>&rootb,const BlockTran
     return true;
 }
 
+bool FStore::typed_requirements(const std::vector<uint8_t>&rootb,const BlockTransaction*blocks,
+                                std::vector<uint32_t>&regions,
+                                std::vector<uint32_t>&requiredBlocks) const{
+    regions.clear();requiredBlocks.clear();
+    const uint8_t*rp=rootb.data(),*re=rp+rootb.size();
+    while(rp<re){
+        uint64_t token=0;if(!get_varint_bounded(rp,re,token)||(token>>1)>UINT32_MAX)return false;
+        uint32_t id=uint32_t(token>>1);
+        if(token&1){if(id>=NBLK)return false;requiredBlocks.push_back(id);}
+        else{if(id>=NREG)return false;regions.push_back(id);}
+    }
+    std::sort(requiredBlocks.begin(),requiredBlocks.end());
+    requiredBlocks.erase(std::unique(requiredBlocks.begin(),requiredBlocks.end()),requiredBlocks.end());
+    for(uint32_t block:requiredBlocks){
+        const auto*children=block_children(block,blocks);if(!children)return false;
+        for(uint32_t child:*children){if(child>=NREG)return false;regions.push_back(child);}
+    }
+    std::sort(regions.begin(),regions.end());
+    regions.erase(std::unique(regions.begin(),regions.end()),regions.end());
+    return true;
+}
+
+bool FStore::reconstruct_typed_staged(const std::vector<uint8_t>&rootb,
+                                      const BlockTransaction*blocks,
+                                      std::vector<uint8_t>&recon,
+                                      std::vector<uint32_t>&occurrences) const{
+    recon.clear();occurrences.clear();
+    auto emitRegion=[&](uint32_t region)->bool{
+        if(region>=FmixedRegions.size()||!FmixedRegions[region].known)return false;
+        const auto&view=FmixedRegions[region];
+        if(view.offset>FmixedRegionData.size()||view.length>FmixedRegionData.size()-view.offset)return false;
+        if(view.length>SIZE_MAX-recon.size())return false;
+        occurrences.push_back(region);
+        recon.insert(recon.end(),FmixedRegionData.begin()+view.offset,
+                     FmixedRegionData.begin()+view.offset+view.length);
+        return true;
+    };
+    const uint8_t*rp=rootb.data(),*re=rp+rootb.size();
+    while(rp<re){
+        uint64_t token=0;if(!get_varint_bounded(rp,re,token)||(token>>1)>UINT32_MAX)return false;
+        uint32_t id=uint32_t(token>>1);
+        if(!(token&1)){if(!emitRegion(id))return false;continue;}
+        const auto*children=block_children(id,blocks);if(!children)return false;
+        for(uint32_t child:*children)if(!emitRegion(child))return false;
+    }
+    return true;
+}
+
 void FStore::reconstruct(const std::vector<uint8_t>&rootb,std::vector<uint8_t>&recon){
     std::vector<uint32_t>occurrences;
     if(!reconstruct_staged(rootb,nullptr,recon,occurrences)){fprintf(stderr,"bad Root expansion\n");exit(2);}
