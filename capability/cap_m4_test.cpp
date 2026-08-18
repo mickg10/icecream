@@ -42,6 +42,16 @@ int main(){
     std::vector<uint8_t>overlong{0x80,0x00};const uint8_t*p=overlong.data(),*e=p+overlong.size();uint64_t value=0;
     check(!get_varint_bounded(p,e,value),"non-canonical overlong varint rejected");
     check(!capp::try_unpack_rejoin(std::vector<uint8_t>{1,0},tu),"Rejoin trailing bytes rejected");
+    std::vector<uint8_t>typedRoot,typedBlocks;
+    put_varint(typedRoot,uint64_t(3)<<1);put_varint(typedRoot,(uint64_t(5)<<1)|1);
+    put_varint(typedBlocks,1);put_varint(typedBlocks,5);typedBlocks.push_back(0);put_varint(typedBlocks,3);
+    put_varint(typedBlocks,3);put_varint(typedBlocks,3);put_varint(typedBlocks,1);
+    uint32_t typedNreg=0,typedNblk=0;
+    check(capp::try_scan_typed_dimensions(typedRoot,typedBlocks,typedNreg,typedNblk)&&typedNreg==4&&typedNblk==6,
+          "typed Root derives grow-only dimensions with repeated children");
+    std::vector<uint8_t>unrepresentable;put_varint(unrepresentable,uint64_t(UINT32_MAX)<<1);
+    check(!capp::try_scan_typed_dimensions(unrepresentable,{},typedNreg,typedNblk),
+          "typed dimension scan rejects an unrepresentable terminal ordinal");
 
     fprintf(stderr,"[3] staged and idempotent Block definitions:\n");
     FStore blocks;blocks.init(16,2);std::vector<uint8_t>blockRaw;

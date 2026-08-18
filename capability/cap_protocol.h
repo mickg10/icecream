@@ -7,6 +7,7 @@
 //   Root (C->F) = blob(rootb) ++ blob(blockRaw)          blockRaw empty => no new blocks
 //   Need (F->C) = missingRaw                              (varint cnt ++ ids ++ varint 0)
 //   Fill (C->F) = blob(fill_paths) ++ blob(m0)..blob(m3) mixed parts, empty when absent
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <vector>
@@ -85,6 +86,39 @@ static inline bool try_unpack_hello_m4(const std::vector<uint8_t>&payload,cap::S
            capc::get_u32_bounded(p,e,nreg)&&capc::get_u32_bounded(p,e,nblk)&&
            capc::get_u32_bounded(p,e,physicalTus)&&capc::get_u32_bounded(p,e,repetitions)&&p==e&&
            physicalTus>0&&repetitions>0;
+}
+
+// Derive the grow-only receiver dimensions from one typed Root plus the Block
+// definitions carried beside it. This is shared by the batch scenario and
+// one-pass paths so neither needs final generation dimensions in Hello.
+static inline bool try_scan_typed_dimensions(const std::vector<uint8_t>&root,
+                                              const std::vector<uint8_t>&blocks,
+                                              uint32_t&nreg,uint32_t&nblk){
+    nreg=nblk=0;
+    const uint8_t*p=root.data(),*e=p+root.size();
+    while(p<e){
+        uint64_t token=0;
+        if(!capc::get_varint_bounded(p,e,token)||(token>>1)>=UINT32_MAX)return false;
+        uint32_t id=uint32_t(token>>1);
+        if(token&1)nblk=std::max(nblk,id+1);else nreg=std::max(nreg,id+1);
+    }
+    p=blocks.data();e=p+blocks.size();
+    if(p==e)return true;
+    uint64_t count=0;
+    if(!capc::get_varint_bounded(p,e,count)||count>size_t(e-p))return false;
+    for(uint64_t item=0;item<count;++item){
+        uint32_t id=0;
+        if(!capc::get_u32_bounded(p,e,id)||id==UINT32_MAX||p==e||*p++!=0)return false;
+        nblk=std::max(nblk,id+1);
+        uint64_t length=0;
+        if(!capc::get_varint_bounded(p,e,length)||length>size_t(e-p))return false;
+        for(uint64_t child=0;child<length;++child){
+            uint32_t region=0;
+            if(!capc::get_u32_bounded(p,e,region)||region==UINT32_MAX)return false;
+            nreg=std::max(nreg,region+1);
+        }
+    }
+    return p==e;
 }
 
 // ---- M4 Root: TU index + independently selected Root and Block components ----

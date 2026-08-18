@@ -783,7 +783,7 @@ static inline bool load_f_snapshot(const std::string &path,
       memcmp(magic, SNAP_MAGIC, sizeof magic) || !in.u8(kind) || kind != 'F' ||
       !in.u32(version) || version != capp::CAP_PROTOCOL_VERSION ||
       !in.raw(generation.data(), generation.size()) || generation != expected ||
-      !in.u32(nreg) || !in.u32(nblk) || !nreg)
+      !in.u32(nreg) || !in.u32(nblk))
     return false;
   store = capc::FStore{};
   store.init(nreg, nblk);

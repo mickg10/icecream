@@ -303,10 +303,22 @@ int main() {
                              loadedCache),
         "partial F snapshot rejected");
 
+  FStore emptyStore;
+  emptyStore.init(0, 0);
+  CacheState emptyCache;
+  emptyCache.init(0, 0, unlimited);
+  check(save_f_snapshot(base + ".f.empty", generation, emptyStore,
+                        emptyCache) &&
+            load_f_snapshot(base + ".f.empty", generation, loadedStore,
+                            loadedCache) &&
+            loadedStore.NREG == 0 && loadedStore.NBLK == 0,
+        "zero-dimension grow-only F snapshot round trips");
+
   unlink((base + ".c").c_str());
   unlink((base + ".c.partial").c_str());
   unlink((base + ".f").c_str());
   unlink((base + ".f.partial").c_str());
+  unlink((base + ".f.empty").c_str());
   printf("cap_m5_state_test: %s\n", failures ? "FAIL" : "PASS");
   return failures ? 1 : 0;
 }

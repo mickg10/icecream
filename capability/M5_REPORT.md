@@ -83,7 +83,7 @@ reported.  Consequently, every historical `H200` value in the table below is
 withdrawn until the complete typed matrix regenerates it with this shared
 definition.  Historical cold/CACHE50/socket byte ledgers are unaffected.
 
-Current executed gates through `5f336d13`:
+Current executed gates on the branch tip:
 
 | Gate | Result |
 |---|---:|
@@ -94,8 +94,10 @@ Current executed gates through `5f336d13`:
 | batch rejection/rollback under ASan+UBSan | PASS, 20 commits / 2 prepared aborts |
 | bounded one-pass grow/removal under ASan+UBSan | PASS, 79,376 / 127,633 / 856 removals and 20 compactions |
 
-Retained smoke root:
-`/tanksmall/scratch/ictmp/issue16-m5-typed-smoke-v2-fNJNXW`.
+Latest retained smoke root:
+`/tanksmall/scratch/ictmp/issue16-m5-unified-smoke-nTRcYC`. It passes all
+**45/45** scenario rows, the five focused binaries, complete artifact hashes,
+and the enforced batch/one-pass physical-wire equivalence row.
 
 The acceptance launcher now rebuilds and runs all five focused regression
 binaries before any scenario row: `cap_header_test`, `cap_transport_test`,
@@ -107,7 +109,30 @@ The same audit removed an invalid F-snapshot restriction: Block child count
 had been bounded by the number of distinct Regions even though a Block is a
 sequence and may reference one Region repeatedly. Snapshot restore now uses
 the actual encoded-count bound, and a repeated-child Block round trip passes
-both the warning-clean and ASan+UBSan state gates.
+both the warning-clean and ASan+UBSan state gates. A zero-dimension snapshot
+also round-trips, preserving the valid grow-on-arrival state before the first
+non-empty TU.
+
+A final scenario/rate comparison found four remaining wire differences. The
+batch factorizer could index a 3-Region sequence across the next TU boundary,
+Block definitions used a different order, an empty material Fill had two
+representations, and batch Hello carried final Region/Block counts while the
+one-pass path grew dimensions from typed definitions. These are now unified:
+
+- batch factorization is causal at each complete-TU boundary;
+- Block definitions use sorted unique ordinals;
+- empty material components have one representation;
+- both paths latch zero initial dimensions and use the same bounded typed
+  dimension scanner to grow Region/Block stores;
+- both final worker summaries carry and verify the pre-Ack physical ledger.
+
+The resulting 4-F, 20-TU fmt comparison is byte-identical across batch and
+one-pass: all seven frame categories, all eight component ledgers, every
+per-TU wire curve row, and the **3,073,809-byte** physical total match. The
+retained comparison is
+`/tanksmall/scratch/ictmp/issue16-m5-wire-parity-GLn29q`. The smoke launcher
+now enforces this equality between `mesh-4f-roundrobin` and
+`onepass-typed-grow`.
 
 M5 remains **OPEN**.  The current typed code still needs the complete fixed-16
 scenario rerun and the uncontended quietbox focused complete-rate rows before

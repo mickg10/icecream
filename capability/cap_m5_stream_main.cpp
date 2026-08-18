@@ -508,20 +508,21 @@ struct ProducerTiming {
 struct WorkerSummary {
   bool exact = false;
   uint64_t verified = 0, raw = 0, decode_ns = 0, path_ns = 0, failures = 0,
-           peak_rss_kib = 0, compiler_pipe_bytes = 0, compiler_pipe_tus = 0,
-           compiler_pipe_ns = 0;
+           wire_before_ack = 0, peak_rss_kib = 0, compiler_pipe_bytes = 0,
+           compiler_pipe_tus = 0, compiler_pipe_ns = 0;
   capm5::CacheTotals cache;
 };
 
 static std::vector<uint8_t> pack_worker_summary(const WorkerSummary &value) {
   std::vector<uint8_t> output;
   output.push_back(value.exact ? 1 : 0);
-  const std::array<uint64_t, 19> fields = {
+  const std::array<uint64_t, 20> fields = {
       value.verified,
       value.raw,
       value.decode_ns,
       value.path_ns,
       value.failures,
+      value.wire_before_ack,
       value.peak_rss_kib,
       value.compiler_pipe_bytes,
       value.compiler_pipe_tus,
@@ -544,7 +545,7 @@ static std::vector<uint8_t> pack_worker_summary(const WorkerSummary &value) {
 
 static bool unpack_worker_summary(const std::vector<uint8_t> &payload,
                                   WorkerSummary &value) {
-  constexpr size_t FIELD_COUNT = 19;
+  constexpr size_t FIELD_COUNT = 20;
   if (payload.size() != 1 + FIELD_COUNT * sizeof(uint64_t) || payload[0] > 1)
     return false;
   value.exact = payload[0] != 0;
@@ -556,28 +557,29 @@ static bool unpack_worker_summary(const std::vector<uint8_t> &payload,
     for (unsigned byte = 0; byte < sizeof(uint64_t); ++byte)
       field |= uint64_t(*p++) << (8 * byte);
   }
-  if (fields[12] > UINT32_MAX || fields[13] > UINT32_MAX ||
-      fields[14] > UINT32_MAX || p != end)
+  if (fields[13] > UINT32_MAX || fields[14] > UINT32_MAX ||
+      fields[15] > UINT32_MAX || p != end)
     return false;
   value.verified = fields[0];
   value.raw = fields[1];
   value.decode_ns = fields[2];
   value.path_ns = fields[3];
   value.failures = fields[4];
-  value.peak_rss_kib = fields[5];
-  value.compiler_pipe_bytes = fields[6];
-  value.compiler_pipe_tus = fields[7];
-  value.compiler_pipe_ns = fields[8];
-  value.cache.region_bytes = fields[9];
-  value.cache.public_bytes = fields[10];
-  value.cache.block_bytes = fields[11];
-  value.cache.regions = uint32_t(fields[12]);
-  value.cache.public_lines = uint32_t(fields[13]);
-  value.cache.blocks = uint32_t(fields[14]);
-  value.cache.region_removals = fields[15];
-  value.cache.public_removals = fields[16];
-  value.cache.block_removals = fields[17];
-  value.cache.compactions = fields[18];
+  value.wire_before_ack = fields[5];
+  value.peak_rss_kib = fields[6];
+  value.compiler_pipe_bytes = fields[7];
+  value.compiler_pipe_tus = fields[8];
+  value.compiler_pipe_ns = fields[9];
+  value.cache.region_bytes = fields[10];
+  value.cache.public_bytes = fields[11];
+  value.cache.block_bytes = fields[12];
+  value.cache.regions = uint32_t(fields[13]);
+  value.cache.public_lines = uint32_t(fields[14]);
+  value.cache.blocks = uint32_t(fields[15]);
+  value.cache.region_removals = fields[16];
+  value.cache.public_removals = fields[17];
+  value.cache.block_removals = fields[18];
+  value.cache.compactions = fields[19];
   return true;
 }
 
@@ -711,46 +713,6 @@ private:
   }
 };
 
-static bool scan_typed_dimensions(const std::vector<uint8_t> &root,
-                                  const std::vector<uint8_t> &blocks,
-                                  uint32_t &nreg, uint32_t &nblk) {
-  nreg = nblk = 0;
-  const uint8_t *p = root.data(), *end = p + root.size();
-  while (p < end) {
-    uint64_t token = 0;
-    if (!get_varint_bounded(p, end, token) || (token >> 1) > UINT32_MAX)
-      return false;
-    uint32_t id = uint32_t(token >> 1);
-    if (token & 1)
-      nblk = std::max(nblk, id + 1);
-    else
-      nreg = std::max(nreg, id + 1);
-  }
-  p = blocks.data();
-  end = p + blocks.size();
-  if (p == end)
-    return true;
-  uint64_t count = 0;
-  if (!get_varint_bounded(p, end, count) || count > size_t(end - p))
-    return false;
-  for (uint64_t item = 0; item < count; ++item) {
-    uint32_t id = 0;
-    if (!get_u32_bounded(p, end, id) || p == end || *p++ != 0)
-      return false;
-    nblk = std::max(nblk, id + 1);
-    uint64_t length = 0;
-    if (!get_varint_bounded(p, end, length) || length > size_t(end - p))
-      return false;
-    for (uint64_t child = 0; child < length; ++child) {
-      uint32_t region = 0;
-      if (!get_u32_bounded(p, end, region))
-        return false;
-      nreg = std::max(nreg, region + 1);
-    }
-  }
-  return p == end;
-}
-
 static int worker_loop(int fd, uint32_t workerId, const Manifest &manifest,
                        const Options &options) {
   CodecContexts codec;
@@ -795,6 +757,7 @@ static int worker_loop(int fd, uint32_t workerId, const Manifest &manifest,
       summary.decode_ns = uint64_t(decodeSeconds * 1e9);
       summary.path_ns = uint64_t(pathSeconds * 1e9);
       summary.failures = failures;
+      summary.wire_before_ack = frames.total();
       summary.peak_rss_kib = uint64_t(usage.ru_maxrss);
       summary.compiler_pipe_bytes = compiler.transferred;
       summary.compiler_pipe_tus = compiler.tus;
@@ -833,8 +796,8 @@ static int worker_loop(int fd, uint32_t workerId, const Manifest &manifest,
       continue;
     }
     uint32_t requiredNreg = 0, requiredNblk = 0;
-    if (!scan_typed_dimensions(rootRaw, blockRaw, requiredNreg,
-                               requiredNblk)) {
+    if (!capp::try_scan_typed_dimensions(rootRaw, blockRaw, requiredNreg,
+                                         requiredNblk)) {
       if (!reject(nullptr, "typed dimensions"))
         return 2;
       continue;
@@ -992,11 +955,13 @@ static bool finish_worker(Worker &worker) {
   uint64_t before = worker.frames.total();
   if (!send_counted(worker.fd, cap::Frame::Done, {}, worker.frames))
     return false;
+  uint64_t wireBeforeAck = worker.frames.total();
   cap::Frame frame;
   std::vector<uint8_t> payload;
   if (!recv_counted(worker.fd, frame, payload, worker.frames) ||
       frame != cap::Frame::Ack ||
-      !unpack_worker_summary(payload, worker.summary))
+      !unpack_worker_summary(payload, worker.summary) ||
+      worker.summary.wire_before_ack != wireBeforeAck)
     return false;
   worker.pending_control += worker.frames.total() - before;
   close(worker.fd);
@@ -1328,8 +1293,15 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
         fill.path_base = worker.mirror.path_count;
         capm5::MirrorScope scope(encoder, worker.mirror);
         encoder.begin_authority_transaction(job.authority);
-        encoder.materialize(dict, job.missing, job.prepared->logical,
-                            &job.authority);
+        if (!job.missing.empty())
+          encoder.materialize(dict, job.missing, job.prepared->logical,
+                              &job.authority);
+        else {
+          for (auto &part : encoder.mixedRaw)
+            part.clear();
+          encoder.fill_paths.clear();
+          encoder.fill_public_base = encoder.nextMixedPublic;
+        }
         fill.public_base = encoder.fill_public_base;
         if (fill.path_base > encoder.paths.size()) {
           relationshipExact = false;

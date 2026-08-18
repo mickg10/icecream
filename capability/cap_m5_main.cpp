@@ -435,8 +435,11 @@ factor_sequence(const std::vector<std::vector<uint32_t>> &tuRegions,
         step = bestLength;
       } else
         result.tokens.push_back(region_token(stream[position]));
+      // Keep the scenario factorizer causal like the one-pass factorizer: a
+      // k-gram may use bytes from this complete TU, but never the first
+      // Regions of a future TU that only the batch preload can see.
       for (size_t i = position; i < position + step; ++i)
-        if (i + MIN_MATCH <= stream.size()) {
+        if (i + MIN_MATCH <= end) {
           uint64_t hash = kgram(i);
           previous[i] = head[hash];
           head[hash] = uint32_t(i);
@@ -716,29 +719,34 @@ static int worker_loop(int fd, uint32_t workerId, const Corpus &corpus,
   if (!recv_counted(fd, frame, payload, frames) || frame != cap::Frame::Hello)
     return 2;
   cap::SourceGeneration generation{};
-  uint32_t nreg = 0, nblk = 0, physicalTus = 0, repetitions = 0;
-  if (!capp::try_unpack_hello_m4(payload, generation, nreg, nblk, physicalTus,
-                                 repetitions) ||
-      physicalTus != corpus.files.size() || repetitions != options.repetitions)
+  uint32_t helloNreg = 0, helloNblk = 0, physicalTus = 0, repetitions = 0;
+  if (!capp::try_unpack_hello_m4(payload, generation, helloNreg, helloNblk,
+                                 physicalTus, repetitions) ||
+      helloNreg != 0 || helloNblk != 0 ||
+      physicalTus != corpus.files.size() || repetitions != options.repetitions ||
+      dict.region_count() > UINT32_MAX)
     return 2;
+  const uint32_t availableNreg = uint32_t(dict.region_count());
   FStore store;
   capm5::CacheState cache;
   if (resumeSnapshot) {
     if (snapshotPath.empty() ||
-        !capm5::load_f_snapshot(snapshotPath, generation, store, cache) ||
-        store.NREG != nreg || store.NBLK != nblk)
+        !capm5::load_f_snapshot(snapshotPath, generation, store, cache))
       return 2;
   } else {
-    store.init(nreg, nblk);
-    cache.init(nreg, nblk, options.cache_limits);
+    store.init(0, 0);
+    cache.init(0, 0, options.cache_limits);
   }
-  if (!resumeSnapshot && preloadCache && options.cache50 >= 0)
-    for (uint32_t id = 0; id < nreg; ++id)
+  if (!resumeSnapshot && preloadCache && options.cache50 >= 0) {
+    store.ensure_dimensions(availableNreg, 0);
+    cache.ensure_dimensions(availableNreg, 0);
+    for (uint32_t id = 0; id < availableNreg; ++id)
       if (int(id & 1) == options.cache50) {
         if (!capm5::install_raw_region(store, dict, id))
           return 2;
         cache.account_preloaded_region(store, id);
       }
+  }
   CompilerPipe compilerPipe;
   if (options.real_pipes && !compilerPipe.start(fd, corpus, sequence))
     return 2;
@@ -785,7 +793,7 @@ static int worker_loop(int fd, uint32_t workerId, const Corpus &corpus,
         return 2;
       (void)resume;
       store.reset_store(1);
-      cache.init(nreg, nblk, options.cache_limits);
+      cache.init(store.NREG, store.NBLK, options.cache_limits);
       capp::CacheDropsM5 none;
       if (!send_counted(fd, cap::Frame::Ack,
                         capp::pack_tu_ack_m5(resume, true, none), frames))
@@ -818,6 +826,15 @@ static int worker_loop(int fd, uint32_t workerId, const Corpus &corpus,
         return 2;
       continue;
     }
+    uint32_t requiredNreg = 0, requiredNblk = 0;
+    if (!capp::try_scan_typed_dimensions(rootRaw, blockRaw, requiredNreg,
+                                         requiredNblk)) {
+      if (!reject(nullptr, "typed dimensions"))
+        return 2;
+      continue;
+    }
+    store.ensure_dimensions(requiredNreg, requiredNblk);
+    cache.ensure_dimensions(requiredNreg, requiredNblk);
     FStore::BlockTransaction blockTx;
     if (!store.stage_blocks(blockRaw, blockTx)) {
       if (!reject(nullptr, "Block"))
@@ -986,9 +1003,9 @@ static bool spawn_worker(Worker &worker, uint32_t id, std::vector<Worker> &all,
       if (int(region & 1) == options.cache50)
         worker.mirror.regions[region] = 1;
   uint64_t before = worker.frames.total();
-  auto hello =
-      capp::pack_hello_m4(generation, nreg, nblk, uint32_t(corpus.files.size()),
-                          options.repetitions);
+  auto hello = capp::pack_hello_m4(generation, 0, 0,
+                                   uint32_t(corpus.files.size()),
+                                   options.repetitions);
   if (!send_counted(worker.fd, cap::Frame::Hello, hello, worker.frames))
     return false;
   worker.pending_curve_bytes += worker.frames.total() - before;
@@ -1292,11 +1309,13 @@ static int run_coordinator(const Corpus &corpus, const Interner &dict,
       std::vector<uint32_t> requiredBlocks;
       for (size_t i = 0; i < count; ++i) {
         put_varint(rootRaw, tokens[i]);
-        if ((tokens[i] & 1) &&
-            std::find(requiredBlocks.begin(), requiredBlocks.end(),
-                      uint32_t(tokens[i] >> 1)) == requiredBlocks.end())
+        if (tokens[i] & 1)
           requiredBlocks.push_back(uint32_t(tokens[i] >> 1));
       }
+      std::sort(requiredBlocks.begin(), requiredBlocks.end());
+      requiredBlocks.erase(
+          std::unique(requiredBlocks.begin(), requiredBlocks.end()),
+          requiredBlocks.end());
       std::vector<uint8_t> blockRaw;
       size_t definitionCount = 0;
       for (uint32_t block : requiredBlocks)

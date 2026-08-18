@@ -760,6 +760,7 @@ def smoke_specs(
                 **common,
                 extra=("--workers", "4", "--wave", "4"),
                 one_pass=True,
+                wire_equivalent_to="mesh-4f-roundrobin",
             ),
             RunSpec(
                 "onepass-typed-bounded",
