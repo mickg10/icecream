@@ -7,6 +7,7 @@
 // Region/public-Line/Block stores.
 #include "cap_codec.h"
 #include "cap_identity.h"
+#include "cap_m5_metrics.h"
 #include "cap_m5_state.h"
 #include "cap_protocol.h"
 #include "cap_transport.h"
@@ -1083,67 +1084,6 @@ struct CurveRow {
   uint32_t logical = 0, physical = 0, worker = 0;
   uint64_t raw = 0, wire = 0, latency_ns = 0;
 };
-struct CurveSummary {
-  double c50 = 0, second_half = 0, h200 = -1;
-  uint32_t c50_tu = 0, h200_tu = UINT32_MAX;
-};
-static double window_ratio(const std::vector<uint64_t> &raw,
-                           const std::vector<uint64_t> &wire, size_t end,
-                           uint64_t target, size_t minimumTus) {
-  size_t begin = end;
-  while (begin && raw[end + 1] - raw[begin] < target)
-    --begin;
-  if (end + 1 - begin < minimumTus)
-    begin = end + 1 > minimumTus ? end + 1 - minimumTus : 0;
-  uint64_t bytes = wire[end + 1] - wire[begin];
-  return bytes ? double(raw[end + 1] - raw[begin]) / bytes
-               : std::numeric_limits<double>::infinity();
-}
-static CurveSummary summarize_curve(const std::vector<CurveRow> &rows) {
-  CurveSummary result;
-  if (rows.empty())
-    return result;
-  std::vector<uint64_t> raw(rows.size() + 1), wire(rows.size() + 1);
-  for (size_t i = 0; i < rows.size(); ++i) {
-    raw[i + 1] = raw[i] + rows[i].raw;
-    wire[i + 1] = wire[i] + rows[i].wire;
-  }
-  uint64_t half = (raw.back() + 1) / 2;
-  size_t halfIndex = 0;
-  while (halfIndex < rows.size() && raw[halfIndex + 1] < half)
-    ++halfIndex;
-  result.c50_tu = uint32_t(halfIndex + 1);
-  result.c50 = wire[halfIndex + 1]
-                   ? double(raw[halfIndex + 1]) / wire[halfIndex + 1]
-                   : 0;
-  uint64_t secondWire = wire.back() - wire[halfIndex + 1];
-  result.second_half =
-      secondWire ? double(raw.back() - raw[halfIndex + 1]) / secondWire : 0;
-  uint64_t trailing = uint64_t(std::ceil(raw.back() * 0.05)),
-           future = uint64_t(std::ceil(raw.back() * 0.10));
-  for (size_t i = 0; i < rows.size(); ++i) {
-    if (i + 1 < 64 || window_ratio(raw, wire, i, trailing, 64) < 200.0)
-      continue;
-    size_t end = i;
-    while (end + 1 < rows.size() && raw[end + 1] - raw[i + 1] < future)
-      ++end;
-    if (raw[end + 1] - raw[i + 1] < future)
-      continue;
-    bool holds = true;
-    for (size_t j = i + 1; j <= end; ++j)
-      if (window_ratio(raw, wire, j, trailing, 64) < 200.0) {
-        holds = false;
-        break;
-      }
-    if (holds) {
-      result.h200_tu = uint32_t(i + 1);
-      result.h200 = double(raw[i + 1]) / raw.back();
-      break;
-    }
-  }
-  return result;
-}
-
 struct Pending {
   uint32_t logical = 0, worker = 0, physical = 0;
   uint64_t wire_start = 0;
@@ -1730,7 +1670,7 @@ static int run_coordinator(const Corpus &corpus, const Interner &dict,
     curve.back().wire += socketBytes - curveWire;
   else if (curveWire != socketBytes)
     exact = false;
-  auto summary = summarize_curve(curve);
+  auto summary = capm5::summarize_curve(curve);
   if (options.curve_out) {
     std::ofstream out(options.curve_out);
     out << "logical\tphysical\tworker\traw\twire\tlatency_ns\tcumulative_raw\t"

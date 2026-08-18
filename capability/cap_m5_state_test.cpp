@@ -2,6 +2,7 @@
 // Region/public-Line/Block removal, arena compaction, and C/F snapshot round
 // trips.
 #include "cap_m5_state.h"
+#include "cap_m5_metrics.h"
 #include <cstdio>
 #include <fstream>
 #include <iterator>
@@ -131,6 +132,26 @@ int main() {
   check(!typedStore.typed_requirements(invalidTypedRoot, &typedBlocks,
                                        typedRegions, typedRequiredBlocks),
         "typed Root rejects an undefined ordinal");
+
+  fprintf(stderr, "[1d] raw-weighted learning gates:\n");
+  struct MetricRow {
+    uint64_t raw = 0, wire = 0;
+  };
+  std::vector<MetricRow> learningCurve(20, {1000, 4});
+  for (size_t index = 0; index < 4; ++index)
+    learningCurve[index].wire = 10;
+  learningCurve[5].wire = 10;
+  auto learning = summarize_curve(learningCurve);
+  check(learning.c50_tu == 10 && learning.c50 > 142.8 &&
+            learning.c50 < 142.9 && learning.second_half == 250.0,
+        "C50 and second-half use raw-byte boundary");
+  check(learning.h200_tu == 7 && learning.h200 == 0.35,
+        "H200 rejects a transient hit and requires following 10% persistence");
+  for (auto &row : learningCurve)
+    row.wire = 10;
+  learning = summarize_curve(learningCurve);
+  check(learning.h200_tu == UINT32_MAX && learning.h200 < 0,
+        "H200 remains absent when the trailing 5% never reaches 200x");
 
   fprintf(stderr, "[2] bounded stores and compaction:\n");
   const std::string source = "# 1 \"a.hpp\"\nalpha\n# 2 \"b.hpp\"\nbeta beta\n";

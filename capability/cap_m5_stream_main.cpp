@@ -15,6 +15,7 @@
 
 #include "cap_codec.h"
 #include "cap_identity.h"
+#include "cap_m5_metrics.h"
 #include "cap_m5_state.h"
 #include "cap_protocol.h"
 #include "cap_transport.h"
@@ -1184,41 +1185,6 @@ struct CurveRow {
   uint64_t raw = 0, wire = 0, latency_ns = 0;
 };
 
-struct CurveSummary {
-  double c50 = 0, h200 = -1, second_half = 0;
-  uint32_t c50_tu = 0, h200_tu = UINT32_MAX;
-};
-
-static CurveSummary summarize_curve(const std::vector<CurveRow> &rows) {
-  CurveSummary result;
-  if (rows.empty())
-    return result;
-  std::vector<uint64_t> raw(rows.size() + 1), wire(rows.size() + 1);
-  for (size_t index = 0; index < rows.size(); ++index) {
-    raw[index + 1] = raw[index] + rows[index].raw;
-    wire[index + 1] = wire[index] + rows[index].wire;
-  }
-  uint64_t half = (raw.back() + 1) / 2;
-  size_t boundary =
-      size_t(std::lower_bound(raw.begin() + 1, raw.end(), half) - raw.begin());
-  result.c50_tu = uint32_t(boundary);
-  result.c50 = wire[boundary] ? double(raw[boundary]) / wire[boundary] : 0;
-  uint64_t secondRaw = raw.back() - raw[boundary];
-  uint64_t secondWire = wire.back() - wire[boundary];
-  result.second_half = secondWire ? double(secondRaw) / secondWire : 0;
-  constexpr size_t WINDOW = 32;
-  for (size_t index = 0; index + WINDOW <= rows.size(); ++index) {
-    uint64_t windowRaw = raw[index + WINDOW] - raw[index];
-    uint64_t windowWire = wire[index + WINDOW] - wire[index];
-    if (windowWire && double(windowRaw) / windowWire >= 200.0) {
-      result.h200_tu = uint32_t(index + 1);
-      result.h200 = raw.back() ? double(raw[index + 1]) / raw.back() : 0;
-      break;
-    }
-  }
-  return result;
-}
-
 struct Pending {
   std::shared_ptr<PreparedTU> prepared;
   uint32_t worker = 0;
@@ -1645,7 +1611,7 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
          preparedAccepted == committed + aborted && committed == curve.size()
              ? "OK"
              : "FAIL");
-  CurveSummary summary = summarize_curve(curve);
+  auto summary = capm5::summarize_curve(curve);
   printf("CURVE_SUMMARY C50=%.3f C50_TU=%u H200=", summary.c50,
          summary.c50_tu);
   if (summary.h200 < 0)
