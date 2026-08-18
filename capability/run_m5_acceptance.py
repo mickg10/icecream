@@ -57,6 +57,8 @@ class RunSpec:
     expected_prepared_aborts: int = 0
     minimum_relationship_gbps: float | None = None
     minimum_stage_gbps: float | None = None
+    minimum_complete_gbps: float | None = None
+    one_pass: bool = False
     wire_equivalent_to: str | None = None
 
 
@@ -244,8 +246,9 @@ def phase_summary(
     return result
 
 
-def build(source: Path, output: Path, cxx: str) -> tuple[Path, list[list[str]]]:
+def build(source: Path, output: Path, cxx: str) -> tuple[Path, Path, list[list[str]]]:
     binary = output / "cap_m5"
+    stream_binary = output / "cap_m5_stream"
     state_test = output / "cap_m5_state_test"
     m4_test = output / "cap_m4_test"
     common = [
@@ -267,6 +270,15 @@ def build(source: Path, output: Path, cxx: str) -> tuple[Path, list[list[str]]]:
             str(source / "cap_codec.cpp"),
             "-o",
             str(binary),
+            "-lzstd",
+            "-pthread",
+        ],
+        common
+        + [
+            str(source / "cap_m5_stream_main.cpp"),
+            str(source / "cap_codec.cpp"),
+            "-o",
+            str(stream_binary),
             "-lzstd",
             "-pthread",
         ],
@@ -298,7 +310,7 @@ def build(source: Path, output: Path, cxx: str) -> tuple[Path, list[list[str]]]:
         (output / "logs" / f"{test.name}.log").write_text(completed.stdout)
         if completed.returncode:
             raise RuntimeError(f"{test.name} failed")
-    return binary, commands
+    return binary, stream_binary, commands
 
 
 def manifest_paths(path: Path, limit: int | None = None) -> list[Path]:
@@ -767,6 +779,8 @@ def full_specs(corpus_root: Path, output: Path, selected: set[str]) -> list[RunS
                     extra=("--workers", "8", "--wave", "8"),
                     minimum_relationship_gbps=1.0,
                     minimum_stage_gbps=1.0,
+                    minimum_complete_gbps=1.0,
+                    one_pass=True,
                 )
             )
         for workers in (1, 4, 16, 32):
@@ -777,18 +791,25 @@ def full_specs(corpus_root: Path, output: Path, selected: set[str]) -> list[RunS
                     manifest,
                     codec="z3",
                     extra=("--workers", str(workers), "--wave", str(workers)),
+                    one_pass=True,
                 )
             )
     return specs
 
 
 def run_one(
-    binary: Path, output: Path, spec: RunSpec, timeout: int, resume: bool
+    binary: Path,
+    stream_binary: Path,
+    output: Path,
+    spec: RunSpec,
+    timeout: int,
+    resume: bool,
 ) -> dict[str, object]:
     log = output / "logs" / f"{spec.name}.log"
     curve = output / "curves" / f"{spec.name}.tsv"
+    selected_binary = stream_binary if spec.one_pass else binary
     command = [
-        str(binary),
+        str(selected_binary),
         "--manifest",
         spec.manifest,
         "--codec",
@@ -801,7 +822,7 @@ def run_one(
         command += ["--max-files", str(spec.max_files)]
     command += spec.extra
     command_record = f"COMMAND {shlex.join(command)}\n"
-    binary_record = f"BINARY_SHA256 {sha256(binary)}\n"
+    binary_record = f"BINARY_SHA256 {sha256(selected_binary)}\n"
     corpus_record = (
         f"CORPUS_SHA256 {corpus_fingerprint(spec.manifest, spec.max_files)}\n"
     )
@@ -870,8 +891,14 @@ def run_one(
     parsed["stage_speed_pass"] = (
         spec.minimum_stage_gbps is None or min(stage_rates) >= spec.minimum_stage_gbps
     )
+    parsed["complete_speed_pass"] = (
+        spec.minimum_complete_gbps is None
+        or parsed["complete_gbps"] >= spec.minimum_complete_gbps
+    )
     parsed["speed_pass"] = (
-        parsed["relationship_speed_pass"] and parsed["stage_speed_pass"]
+        parsed["relationship_speed_pass"]
+        and parsed["stage_speed_pass"]
+        and parsed["complete_speed_pass"]
     )
     parsed["command"] = command
     parsed["curve"] = str(curve)
@@ -949,9 +976,12 @@ def write_outputs(
         "compiler_measured_bytes",
         "minimum_relationship_gbps",
         "minimum_stage_gbps",
+        "minimum_complete_gbps",
         "relationship_speed_pass",
         "stage_speed_pass",
+        "complete_speed_pass",
         "speed_pass",
+        "one_pass",
         "region_removals",
         "public_removals",
         "block_removals",
@@ -1011,14 +1041,16 @@ def main() -> int:
     for name in ("logs", "curves", "snapshots"):
         (args.output / name).mkdir(exist_ok=True)
     source = Path(__file__).resolve().parent
-    binary, builds = build(source, args.output, args.cxx)
+    binary, stream_binary, builds = build(source, args.output, args.cxx)
     specs, fixture = smoke_specs(args.corpus_root, args.output, args.evolution_tus)
     if args.suite == "full":
         specs += full_specs(args.corpus_root, args.output, selected)
     rows: list[dict[str, object]] = []
     row_by_name: dict[str, dict[str, object]] = {}
     for ordinal, spec in enumerate(specs, 1):
-        row = run_one(binary, args.output, spec, args.timeout, args.resume)
+        row = run_one(
+            binary, stream_binary, args.output, spec, args.timeout, args.resume
+        )
         row["wire_equivalent_pass"] = None
         if spec.wire_equivalent_to is not None:
             reference = row_by_name.get(spec.wire_equivalent_to)
@@ -1042,13 +1074,14 @@ def main() -> int:
         write_outputs(args.output, rows, builds, fixture)
         print(
             f"EXACT {ordinal}/{len(specs)} {spec.name}: {row['actual_socket']} B "
-            f"{row['ratio']:.3f}x e2e={row['relationship_gbps']:.3f} GB/s",
+            f"{row['ratio']:.3f}x relationship={row['relationship_gbps']:.3f} "
+            f"GB/s complete={row['complete_gbps']:.3f} GB/s",
             flush=True,
         )
     speed_failures = [row["name"] for row in rows if not row["speed_pass"]]
     if speed_failures:
         print(
-            "M5 ACCEPTANCE FAIL: relationship speed below required floor for "
+            "M5 ACCEPTANCE FAIL: required complete/stage rate below floor for "
             + ", ".join(speed_failures)
         )
         return 1

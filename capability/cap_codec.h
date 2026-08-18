@@ -340,6 +340,16 @@ struct MixedEncoder {
     std::vector<LiteralOccurrence>* census_sink=nullptr;
 
     void init(uint32_t distinctLines, uint32_t nreg){ mixedCLine.assign(size_t(distinctLines)+1, MixedCLineState{}); authorityJournalStamp.assign(size_t(distinctLines)+1,0); fknownReg.assign(nreg,0); fknownPublic.assign(1,0); }
+    // A live relationship does not know the final number of Lines or Regions
+    // when Hello is sent.  Typed generation-local ordinals make both stores
+    // grow-only: existing bindings keep their indices and newly discovered
+    // objects append zero (unknown/unpublished) state.
+    void ensure_dimensions(uint32_t distinctLines,uint32_t nreg){
+        size_t lines=size_t(distinctLines)+1;
+        if(mixedCLine.size()<lines)mixedCLine.resize(lines,MixedCLineState{});
+        if(authorityJournalStamp.size()<lines)authorityJournalStamp.resize(lines,0);
+        if(fknownReg.size()<nreg)fknownReg.resize(nreg,0);
+    }
     void forget_public(uint32_t ord){ if(ord<fknownPublic.size()) fknownPublic[ord]=0; }   // F declared a drop
     void reset_model(){ std::fill(fknownReg.begin(),fknownReg.end(),0); std::fill(fknownPublic.begin(),fknownPublic.end(),0); recovering=true; }
     void begin_authority_transaction(AuthorityTransaction&tx);
@@ -394,6 +404,19 @@ struct FStore {
         FrequiredBlockStamp.assign(nblk, 0);
         Freg_stream.reserve(1u<<20);
         FmixedRegionData.reserve(64u<<20);
+    }
+    void ensure_dimensions(uint32_t nreg,uint32_t nblk){
+        if(nreg>NREG){
+            FmixedRegions.resize(nreg,MixedFRegionView{});
+            FrequiredRegionStamp.resize(nreg,0);
+            NREG=nreg;
+        }
+        if(nblk>NBLK){
+            FknownBlk.resize(nblk,0);
+            FblkChildren.resize(nblk);
+            FrequiredBlockStamp.resize(nblk,0);
+            NBLK=nblk;
+        }
     }
     void install_blocks(const std::vector<uint8_t>& blockRaw); // M3 compatibility wrapper
     bool stage_blocks(const std::vector<uint8_t>& blockRaw,BlockTransaction&tx) const;

@@ -31,6 +31,12 @@ struct ReceiverMirror {
     path_count = 0;
     recovering = false;
   }
+  void ensure_dimensions(uint32_t nreg, uint32_t nblk) {
+    if (regions.size() < nreg)
+      regions.resize(nreg, 0);
+    if (blocks.size() < nblk)
+      blocks.resize(nblk, 0);
+  }
   void reset() {
     std::fill(regions.begin(), regions.end(), 0);
     std::fill(public_lines.begin(), public_lines.end(), 0);
@@ -197,6 +203,19 @@ public:
     public_heap.reset(1);
     block_heap.reset(nblk);
     totals = CacheTotals{};
+  }
+
+  void ensure_dimensions(uint32_t nreg, uint32_t nblk) {
+    if (region_last.size() < nreg) {
+      region_last.resize(nreg, 0);
+      region_accounted.resize(nreg, 0);
+      region_heap.ensure(nreg);
+    }
+    if (block_last.size() < nblk) {
+      block_last.resize(nblk, 0);
+      block_accounted.resize(nblk, 0);
+      block_heap.ensure(nblk);
+    }
   }
 
   void account_preloaded_region(const capc::FStore &store, uint32_t id,

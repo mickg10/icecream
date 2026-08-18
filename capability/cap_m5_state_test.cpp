@@ -54,6 +54,46 @@ int main() {
   check(first.regions[0] && first.regions[1] && !second.regions[0],
         "mutations return only to selected mirror");
 
+  fprintf(stderr, "[1b] grow-only typed dimensions:\n");
+  MixedEncoder growingEncoder;
+  growingEncoder.init(2, 2);
+  growingEncoder.mixedCLine[1].public_id = 7;
+  growingEncoder.fknownReg[1] = 1;
+  growingEncoder.ensure_dimensions(9, 11);
+  check(growingEncoder.mixedCLine.size() == 10 &&
+            growingEncoder.fknownReg.size() == 11 &&
+            growingEncoder.mixedCLine[1].public_id == 7 &&
+            growingEncoder.fknownReg[1],
+        "C authority grows without changing prior bindings");
+  ReceiverMirror growingMirror;
+  growingMirror.init(2, 2);
+  growingMirror.regions[1] = 1;
+  growingMirror.blocks[0] = 1;
+  growingMirror.ensure_dimensions(11, 7);
+  check(growingMirror.regions.size() == 11 &&
+            growingMirror.blocks.size() == 7 && growingMirror.regions[1] &&
+            growingMirror.blocks[0] && !growingMirror.regions[10] &&
+            !growingMirror.blocks[6],
+        "receiver mirror grows with unknown appended ordinals");
+  FStore growingStore;
+  growingStore.init(2, 2);
+  growingStore.FmixedRegions[1].known = true;
+  growingStore.FknownBlk[0] = 1;
+  growingStore.ensure_dimensions(11, 7);
+  check(growingStore.NREG == 11 && growingStore.NBLK == 7 &&
+            growingStore.FmixedRegions[1].known &&
+            growingStore.FknownBlk[0] &&
+            !growingStore.FmixedRegions[10].known &&
+            !growingStore.FknownBlk[6],
+        "F stores grow without changing resident objects");
+  CacheState growingCache;
+  growingCache.init(2, 2, CacheLimits{});
+  growingCache.ensure_dimensions(11, 7);
+  check(growingCache.semantic_bytes() >=
+            11 * (sizeof(uint64_t) + sizeof(uint32_t)) +
+                7 * (sizeof(uint64_t) + sizeof(uint32_t)),
+        "cache policy indexes grow to cover typed stores");
+
   fprintf(stderr, "[2] bounded stores and compaction:\n");
   const std::string source = "# 1 \"a.hpp\"\nalpha\n# 2 \"b.hpp\"\nbeta beta\n";
   Interner dict;
