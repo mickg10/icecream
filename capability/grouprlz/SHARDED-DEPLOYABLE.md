@@ -71,6 +71,17 @@ binding it does not fully instrument, and refuses `--warm` / `--replay-repetitio
    run restricted to those TUs: the byte range must hold every frame that run consumes, in
    order, byte-identically, with nothing left over, and that run must reconstruct all its
    TUs byte-exact. 3 cuts × 10 cells = 30, all pass.
+8. **Prefix immutability against a genuinely SHORTER corpus.** Gate 6 compares build
+   prefixes of a 4× manifest — but those repeat the same files, so the region and
+   distinct-line counts are *identical* in both encodes and the test is blind to any
+   dependence on a whole-corpus quantity. This one truncates the source instead: half the
+   project has strictly fewer Regions than all of it, and the gate refuses to run if the
+   two halves happen to report the same count. **All ten cells: byte-identical prefix in
+   both directions**, with the region count differing by 6% to 101% (leveldb/fedora-clang:
+   11,945 vs 24,048). That is a real falsification test of what `--stable-root-tags` claims
+   — every Root token a function of state available at that TU (region r → 2r, block k →
+   2k+1, no NREG on the wire) — and it survives it. I only thought to run it while scoping
+   the receiver; the earlier prefix result was correct but could not have caught this class.
 
 `selector_p29sinkproof.sh` is the gate and exits nonzero on any failure; all ten cells
 report `GATE PASS`. One over-fitted assertion was found and removed along the way: an
@@ -204,7 +215,14 @@ from the properly terminated encode; only the immutability reference is the open
   sharding for P29**; the definition and literal costs it measures are unaffected.
 * The P29 replay gate proves the streams carry every frame the run consumes, in order,
   byte-identically. It is still **in-process**: a separate receiver binary that reconstructs
-  `.ii` from the two files alone is not built. That is the remaining bar.
+  `.ii` from the two files alone is not built. That is the remaining bar. Scoping it gave a
+  useful answer, though: the F side is ~273 lines (`codec50-sink.cpp`, the block after
+  `--- DECODER (F)`) plus state consistently named `F*`/`mixedF*`, and almost every C-side
+  name it touches is a harness assertion (`recovered[i] != mixedRaw[i]`, `dict.region_data`
+  comparisons) rather than a data dependency. In `--direct-ordinals` mode F already derives
+  its own `missReg`/`missBlk` from its own store. So the extraction is real surgery but it
+  is not a rewrite, and — per gate 8 — it does **not** need NREG or any other whole-corpus
+  quantity shipped to it.
 * GRZ2 has no F→C codec channel, so its reverse total is 0 by construction — a structural
   difference from P29, not a free pass.
 * cereal's single-stream `gtu=1` build-4 spike (137,908) is the previously reported

@@ -14,11 +14,13 @@ lg112    C->F=929813     F->C=28497     lag=111  closes=441551 925627 927708 929
    control (intact)             exit=0  
    C->F truncated 100 B         exit=2  truncated type-1 payload at offset 1180794
    C->F one byte flipped        exit=2  type-8 payload differs at offset 583482
-   C->F 8 bytes appended        exit=2  /tmp/tmp.xKXKxjL8M0/x.cf has trailing bytes past the last frame the run consumed
+   C->F 8 bytes appended        exit=2  /tmp/tmp.5Pp78mawac/x.cf has trailing bytes past the last frame the run consumed
    C->F one frame deleted       exit=2  expected type=9 len=264741 at offset 98614, stream has type=5 len=6768
    F->C truncated 20 B          exit=2  stream ended before a type-254 frame at offset 28474
 === 5. a stream truncated at a build close is EXACTLY that build's frames ===
    cut at build 1 (C→F 1172564 B, F→C 25608 B): fully consumed, 94 TUs byte-exact
    cut at build 2 (C→F 1176711 B, F→C 27531 B): fully consumed, 188 TUs byte-exact
    cut at build 3 (C→F 1178792 B, F→C 28014 B): fully consumed, 282 TUs byte-exact
+=== 6. prefix immutability against a corpus that is genuinely SHORTER ===
+   47 TUs (regions=10008) is a byte-identical prefix of 94 TUs (regions=13374), both directions
 GATE PASS

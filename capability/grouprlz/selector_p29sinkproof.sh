@@ -127,4 +127,32 @@ for K in 1 2 3; do
   echo "   cut at build $K (C→F $CCUT B, F→C $FCUT B): fully consumed, $((NB*K)) TUs byte-exact"
 done
 
+echo "=== 6. prefix immutability against a corpus that is genuinely SHORTER ==="
+# Section 3 compares build prefixes of a 4x manifest -- but those repeat the same files, so
+# the region/line counts are IDENTICAL in both encodes and the test cannot see a dependence
+# on whole-corpus quantities.  This one truncates the SOURCE: half the project has strictly
+# fewer Regions and distinct Lines than all of it.  --stable-root-tags claims every Root
+# token is a function of state available at that TU (region r -> 2r, block k -> 2k+1, no
+# NREG); this is the test that can falsify that claim.
+H=$(( (NB + 1) / 2 ))
+head -n "$H" "$MAN" > "$W/half"    # the 4x manifest's first NB lines are one whole build
+head -n "$NB" "$MAN" > "$W/full"
+for TAG in half full; do
+  $BIN --manifest "$W/$TAG" $BO --cf-sink "$W/$TAG.cf" --fc-sink "$W/$TAG.fc" \
+       --sink-curve "$W/$TAG.tsv" > "$W/$TAG.out" 2>&1 || fail "shorter-corpus encode ($TAG)"
+  grep -q 'byte-exact=OK' "$W/$TAG.out" || fail "shorter-corpus encode ($TAG) not byte-exact"
+done
+RH=$(sed -n 's/.*\(regions=[0-9]*\).*/\1/p' "$W/half.out" | head -1)
+RF=$(sed -n 's/.*\(regions=[0-9]*\).*/\1/p' "$W/full.out" | head -1)
+[ "$RH" != "$RF" ] || fail "the half corpus has the same $RH as the full one -- this test proves nothing"
+for D in cf fc; do
+  C=$([ $D = cf ] && echo 3 || echo 4)
+  CUT=$(awk -F'\t' -v k="$H" -v c=$C '$1==k{print $c}' "$W/full.tsv"); num "cut" "$CUT"
+  S=$(stat -c %s "$W/half.$D")
+  [ "$S" = "$CUT" ] || fail "shorter-corpus $D size $S != offset $CUT"
+  head -c "$CUT" "$W/full.$D" > "$W/cut.bin"
+  cmp -s "$W/half.$D" "$W/cut.bin" || fail "shorter-corpus $D is NOT a byte-identical prefix"
+done
+echo "   $H TUs ($RH) is a byte-identical prefix of $NB TUs ($RF), both directions"
+
 echo "GATE PASS"
