@@ -16,9 +16,33 @@ foreground, resumable process. Every cell independently verifies the archive and
 digests, reconstructs the complete GRZ2 input exactly, and retains the complete codec wires,
 curves, timing logs, and whole-program zstd references.
 
-The exact cell identities, TU/raw extents, and archive payload digests are frozen in
+The exact cell identities, TU/raw extents, declared payload paths and sizes, archive payload
+digests, `corpus.json` digests, and `manifest.tsv` digests are frozen in
 `verified-44-cells.tsv`. This is a complete 11-by-4 matrix; it contains no partial-profile
-projects.
+projects. `freeze_selector_ledger.py` regenerates or checks that ledger from the declared corpus
+generation.
+
+Some cell directories also retain an older project-named archive, for example
+`catch2-debian-gcc.ii.tar.zst`. That is a different corpus generation. Corpus selection must
+never glob `*.ii.tar.zst`: the only active payload is the relative path in
+`corpus.json.payload.path` (currently `ii.tar.zst` for all 44 cells). The replay resolves that
+field, checks its byte count and digest, then verifies every extracted TU against the manifest.
+
+The extended ledger SHA-256 is:
+
+```text
+6a496fe71ed9282c06cc308599deb4f5ce38a0301e8193531efeea15c79d438d
+```
+
+It was regenerated and then independently checked in place with:
+
+```text
+freeze_selector_ledger.py \
+  --matrix-root /home/ttuser/ictmp/ii-matrix \
+  --expected-cells 44 \
+  --check /home/ttuser/issue16-selector-v1/verified-44-cells-v2.tsv
+verified 44 corpus cells against .../verified-44-cells-v2.tsv
+```
 
 ## GRZ2 source and binary closure
 
