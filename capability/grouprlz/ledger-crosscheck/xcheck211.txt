@@ -1,0 +1,22 @@
+CROSS-CHECK vs local-oracle 211bd585 -- corpus corpus11
+quantity                     local-oracle       selector match
+--- M=1 ---
+C->F                              1794129        1794129 IDENTICAL
+F->C                                26535          26535 IDENTICAL
+c_root                             682111         682111 IDENTICAL
+c_fill                            1110303        1110303 IDENTICAL
+c_control                            1715           1715 IDENTICAL
+f_need                              21446          21446 IDENTICAL
+f_control                            5089           5089 IDENTICAL
+per-row category diffs                  0 / 259 rows
+gates (failures)           lo direction_ok=0 category_ok=0 | mine dir_ok=0
+--- M=30 ---
+C->F                             18277708       18277708 IDENTICAL
+F->C                               246720         246720 IDENTICAL
+c_root                            1296932        1296932 IDENTICAL
+c_fill                           16978191       16978191 IDENTICAL
+c_control                            2585           2585 IDENTICAL
+f_need                             236846         236846 IDENTICAL
+f_control                            9874           9874 IDENTICAL
+per-row category diffs                  0 / 259 rows
+gates (failures)           lo direction_ok=0 category_ok=0 | mine dir_ok=0

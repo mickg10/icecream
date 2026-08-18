@@ -73,6 +73,10 @@ Duplex totals are retained in the tables below and in `mixedwarm.tsv` — use th
 elapsed-time reasoning, where both directions are on the clock; use C→F for wire cost.
 `carry_undirected` is 0 across every run of this recut, so the C→F figures are exact.
 
+Re-derived on local-oracle `211bd585` (now canonical, with native per-TU `c_to_f`): **40 of
+40 cells identical**, on both the rebuild total and the warm-served split. See
+`LEDGER-CROSSCHECK.md`.
+
 ## Bytes per TU, by who served it
 
 The clean way to see it: what does one TU cost depending on which kind of daemon takes it?
