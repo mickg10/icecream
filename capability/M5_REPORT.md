@@ -32,6 +32,54 @@ GB/s` in addition to the relationship and individual stage floors.  Do not use
 the historical PASS line below as the overall M5 verdict; it describes only
 the closed 209-row batch scenario set.
 
+## 2026-08-18 typed-path reconciliation (authoritative)
+
+A later completion audit found that the 209 scenario rows and the one-pass
+rate path did not use the same Root representation.  The historical batch
+path encoded a Block as `final_NREG + block_id`; the one-pass path correctly
+used an explicitly typed token and grew Region/Block stores as definitions
+arrived.  Thus the old matrix remained useful lifecycle evidence, but it did
+not by itself exercise the exact Root form whose rate was being bound.
+
+Commit `58f41bbf` removes that split:
+
+- both scenario and one-pass executables now encode Region as `id << 1` and
+  Block as `(id << 1) | 1`;
+- typed dependency closure and typed exact expansion live in the shared
+  `FStore` implementation used by both executables;
+- focused state tests cover mixed Region/Block order and rejection of an
+  undefined typed ordinal;
+- the smoke suite now includes direct one-pass grow-only and bounded-cache
+  rows in addition to the lifecycle rows;
+- the launcher independently closes frame categories, prepared/committed/
+  aborted transactions, decode rejections, compiler-consumption replies, and
+  optional aggregate worker summaries.
+
+The stricter compiler ledger exposed a failover-reporting ambiguity.  A worker
+may be deliberately stopped after several TUs have already been consumed, so
+its final aggregate summary can be unavailable.  C now records the per-TU
+consumption-reply ledger at each final Ack and reports the partial aggregate
+summary separately.  In the retained 4-F failover smoke row, the reply ledger
+closes **56,079,068 B / 20 TUs**; the intentionally incomplete summaries cover
+**50,057,710 B / 18 TUs** and explicitly report one lost summary.
+
+Current executed gates at `58f41bbf`:
+
+| Gate | Result |
+|---|---:|
+| warning-clean optimized builds | PASS |
+| focused M4/state tests, including typed closure | PASS |
+| expanded typed smoke suite | **45/45 exact** |
+| batch rejection/rollback under ASan+UBSan | PASS, 20 commits / 2 prepared aborts |
+| bounded one-pass grow/removal under ASan+UBSan | PASS, 79,376 / 127,633 / 856 removals and 20 compactions |
+
+Retained smoke root:
+`/tanksmall/scratch/ictmp/issue16-m5-typed-smoke-v2-fNJNXW`.
+
+M5 remains **OPEN**.  The current typed code still needs the complete fixed-16
+scenario rerun and the uncontended quietbox focused complete-rate rows before
+the overall milestone can be accepted.
+
 Date: 2026-08-17
 
 Branch: `local-oracle/issue16-m4-m5`
