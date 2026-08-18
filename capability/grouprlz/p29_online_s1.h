@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
@@ -35,11 +36,65 @@ struct NewBlock {
     bool source_precedes_current_tu = false;
 };
 
+// Recorded for EVERY Block use, not only the ones that mint a new canonical id.  A Block
+// can already hold a global id while THIS route has its own acknowledged occurrence, which
+// is what makes COPY legal there -- so residency and legality are per route, and a source
+// coordinate produced by one matcher is meaningless to another.
+struct BlockUse {
+    size_t root_index = 0;          // index into TuPlan::root
+    uint32_t block_id = 0;          // canonical, from the shared catalogue
+    uint32_t source_position = 0;   // MATCHER-LOCAL coordinate; not portable across routes
+    uint32_t length = 0;
+    bool source_precedes_current_tu = false;   // admission order in THIS matcher only
+    bool canonical_was_new = false;            // the catalogue minted the id on this use
+};
+
 struct TuPlan {
     uint64_t occurrence_begin = 0;
     uint64_t occurrence_end = 0;
     std::vector<Ref> root;
-    std::vector<NewBlock> new_blocks;
+    std::vector<NewBlock> new_blocks;   // retained for the full-route equivalence audit
+    std::vector<BlockUse> block_uses;   // what a selected-F serializer must consume
+};
+
+// The canonical Block identity space, shared by every matcher.  It owns ONLY the children,
+// the lookup index and the ids; it holds no occurrence stream, so children arrive as a span
+// rather than being read out of some matcher's buffer.  It must outlive every matcher that
+// references it.
+class BlockCatalogue {
+public:
+    std::pair<uint32_t, bool> intern(const uint32_t* regions, uint32_t length) {
+        uint64_t hash = 1469598103934665603ULL ^ (uint64_t(length) * 0x100000001b3ULL);
+        for (uint32_t index = 0; index < length; ++index) {
+            hash ^= regions[index];
+            hash *= 1099511628211ULL;
+        }
+        auto& candidates = index_[hash];
+        for (uint32_t id : candidates) {
+            const auto& existing = blocks_[id].regions;
+            if (existing.size() == length &&
+                std::memcmp(existing.data(), regions, size_t(length) * sizeof(uint32_t)) == 0) {
+                return {id, false};
+            }
+        }
+        if (blocks_.size() == std::numeric_limits<uint32_t>::max()) {
+            throw std::overflow_error("S1 Block space exceeds u32");
+        }
+        const uint32_t id = static_cast<uint32_t>(blocks_.size());
+        Block block;
+        block.regions.assign(regions, regions + length);
+        blocks_.push_back(std::move(block));
+        candidates.push_back(id);
+        return {id, true};
+    }
+
+    const Block& block(uint32_t id) const { return blocks_.at(id); }
+    size_t size() const { return blocks_.size(); }
+    const std::vector<Block>& blocks() const { return blocks_; }
+
+private:
+    std::vector<Block> blocks_;
+    std::unordered_map<uint64_t, std::vector<uint32_t>> index_;
 };
 
 // Online S1 longest-previous-factor state.
@@ -58,16 +113,17 @@ public:
 
     OnlineS1() : OnlineS1(Config{}) {}
 
-    explicit OnlineS1(Config config) : config_(config) {
-        if (config_.min_match < 2 || config_.min_match > 16) {
-            throw std::invalid_argument("S1 min_match must be in [2,16]");
-        }
-        if (!config_.max_chain) throw std::invalid_argument("S1 max_chain must be positive");
-        if (config_.hash_bits < 4 || config_.hash_bits > 30) {
-            throw std::invalid_argument("S1 hash_bits must be in [4,30]");
-        }
-        heads_.assign(size_t{1} << config_.hash_bits, kNone);
-    }
+    // Standalone: the matcher owns a private catalogue, which is the single-matcher case
+    // the equivalence test exercises.  Shared: several matchers reference one catalogue, so
+    // identical children get identical canonical ids across routes.
+    // NOT a delegating constructor: delegation would initialise every member of the target,
+    // including owned_, destroying the catalogue this one just created and leaving
+    // catalogue_ dangling.  Each form initialises its own members and shares only start().
+    explicit OnlineS1(Config config)
+        : owned_(new BlockCatalogue), catalogue_(owned_.get()), config_(config) { start(); }
+
+    OnlineS1(Config config, BlockCatalogue& catalogue)
+        : catalogue_(&catalogue), config_(config) { start(); }
 
     TuPlan admit(const std::vector<uint32_t>& current_regions) {
         const size_t u32_max = std::numeric_limits<uint32_t>::max();
@@ -117,7 +173,10 @@ public:
 
             uint32_t step = 1;
             if (best_length >= config_.min_match) {
-                const auto result = intern_block(position, best_length);
+                const auto result = catalogue_->intern(occurrences_.data() + position, best_length);
+                plan.block_uses.push_back({plan.root.size(), result.first, best_source,
+                                           best_length, best_source + best_length <= begin,
+                                           result.second});
                 plan.root.push_back({RefKind::Block, result.first});
                 if (result.second) {
                     plan.new_blocks.push_back(
@@ -139,10 +198,22 @@ public:
     }
 
     const std::vector<uint32_t>& occurrences() const { return occurrences_; }
-    const std::vector<Block>& blocks() const { return blocks_; }
+    const std::vector<Block>& blocks() const { return catalogue_->blocks(); }
+    const BlockCatalogue& catalogue() const { return *catalogue_; }
 
 private:
     static constexpr uint32_t kNone = std::numeric_limits<uint32_t>::max();
+
+    void start() {
+        if (config_.min_match < 2 || config_.min_match > 16) {
+            throw std::invalid_argument("S1 min_match must be in [2,16]");
+        }
+        if (!config_.max_chain) throw std::invalid_argument("S1 max_chain must be positive");
+        if (config_.hash_bits < 4 || config_.hash_bits > 30) {
+            throw std::invalid_argument("S1 hash_bits must be in [4,30]");
+        }
+        heads_.assign(size_t{1} << config_.hash_bits, kNone);
+    }
 
     uint64_t sequence_hash(uint32_t position) const {
         uint64_t hash = 1469598103934665603ULL;
@@ -175,42 +246,12 @@ private:
         }
     }
 
-    std::pair<uint32_t, bool> intern_block(uint32_t position, uint32_t length) {
-        uint64_t hash = 1469598103934665603ULL ^
-                        (uint64_t(length) * 0x100000001b3ULL);
-        for (uint32_t index = 0; index < length; ++index) {
-            hash ^= occurrences_[position + index];
-            hash *= 1099511628211ULL;
-        }
-
-        auto& candidates = block_index_[hash];
-        for (uint32_t id : candidates) {
-            const auto& existing = blocks_[id].regions;
-            if (existing.size() == length &&
-                std::memcmp(existing.data(), occurrences_.data() + position,
-                            size_t(length) * sizeof(uint32_t)) == 0) {
-                return {id, false};
-            }
-        }
-
-        if (blocks_.size() == std::numeric_limits<uint32_t>::max()) {
-            throw std::overflow_error("S1 Block space exceeds u32");
-        }
-        const uint32_t id = static_cast<uint32_t>(blocks_.size());
-        Block block;
-        block.regions.assign(occurrences_.begin() + position,
-                             occurrences_.begin() + position + length);
-        blocks_.push_back(std::move(block));
-        candidates.push_back(id);
-        return {id, true};
-    }
-
+    std::unique_ptr<BlockCatalogue> owned_;   // only for the standalone form; declared first
+    BlockCatalogue* catalogue_ = nullptr;      // so it outlives catalogue_ and the matcher
     Config config_;
     std::vector<uint32_t> occurrences_;
     std::vector<uint32_t> heads_;
     std::vector<uint32_t> predecessors_;
-    std::vector<Block> blocks_;
-    std::unordered_map<uint64_t, std::vector<uint32_t>> block_index_;
 };
 
 }  // namespace p29

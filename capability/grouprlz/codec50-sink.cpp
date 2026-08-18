@@ -310,9 +310,15 @@ static inline uint32_t tag_id      (uint32_t tag){ return tag>>1; }
 // from a dead one, or from one placed after the shift; these return false instead.
 static constexpr uint64_t kTagIdLimit = uint64_t(1)<<31;   // one bit of the u32 is the kind
 static inline bool make_region_tag(uint64_t id,uint32_t&tag){
-    if(id>=kTagIdLimit) return false; tag=uint32_t(id)<<1; return true; }
-static inline bool make_block_tag (uint64_t id,uint32_t&tag){
-    if(id>=kTagIdLimit) return false; tag=(uint32_t(id)<<1)|1u; return true; }
+    if(id>=kTagIdLimit){ return false; }
+    tag=uint32_t(id)<<1;
+    return true;
+}
+static inline bool make_block_tag(uint64_t id,uint32_t&tag){
+    if(id>=kTagIdLimit){ return false; }
+    tag=(uint32_t(id)<<1)|1u;
+    return true;
+}
 // Unchecked convenience for ids already validated at admission; both hard-fail rather than
 // silently truncating, so neither can become the quiet path.
 static inline uint32_t region_tag(uint32_t r){ uint32_t t; if(!make_region_tag(r,t)){fprintf(stderr,"Region id %u exceeds the typed Root tag space\n",r);exit(2);} return t; }

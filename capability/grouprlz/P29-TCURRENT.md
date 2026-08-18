@@ -75,3 +75,47 @@ The committed `dca69f31` source also includes three local headers that are absen
 commit: `alpha_line_codec.h`, `mo_factor_codec.h`, and `residual_group_codec.h`. A clean checkout
 cannot reproduce its documented build until those exact dependencies are committed alongside
 the source.
+
+## Shared BlockCatalogue (extraction on implementer/issue16-capability)
+
+`OnlineS1` originally owned `blocks_` and `block_index_`, and `intern_block()` read the
+matcher's own `occurrences_`. That makes "one global catalogue + one matcher per route"
+unreachable by instantiation: a second matcher gets a second Block id space, so identical
+content mints different ids and a Block imported on one route cannot be referenced on
+another.
+
+`BlockCatalogue` now owns the canonical children, the lookup index and the ids, and takes
+children as a span. `OnlineS1(Config, BlockCatalogue&)` shares one; `OnlineS1(Config)` owns
+a private one, which is the single-matcher case the equivalence test exercises. Those are
+deliberately NOT delegating constructors — delegation initialises every member of the
+target, including `owned_`, which destroys the just-created catalogue and leaves the
+pointer dangling. That bug segfaulted the unmodified equivalence test on the first attempt.
+
+`BlockUse` is recorded for EVERY Block use, not only when the catalogue mints an id, and
+carries a matcher-local `source_position`. Identity is global; coordinates are not. A
+source coordinate from the global matcher is not evidence that a selected F holds that
+material, which is what makes per-F COPY legality a separate question.
+
+### Gates
+
+1. `p29_online_s1_test.cpp`, unmodified, still PASS (opt `-Werror` and ASan+UBSan) — it is
+   the guard that the extraction is behaviour-preserving, so it is deliberately untouched.
+2-5. `p29_block_catalogue_test.cpp`: same children → same id across matchers; source
+   positions matcher-local and differing; a sequence only route A has admitted is not a
+   route-B match until B admits it; the catalogue does not grow when a second or third
+   matcher interns identical children.
+6. The deferred-boundary mutations still fail (drop the boundary-anchor install; restore
+   the `j+MINMATCH<=NS` future read).
+
+Mutation-tested, because gates that cannot fail prove nothing:
+
+| mutation | caught by |
+|---|---|
+| each matcher gets its own catalogue | gate 5 |
+| report a global coordinate instead of the matcher-local one | gate 3 |
+| record a use only when the id is new | gates 4/5 (no use recorded) |
+
+**Gate 2 alone does not catch separate catalogues.** Two fresh catalogues assign ids in the
+same order, so the ids coincide and gate 2 passes; only gate 5 — "the second matcher must
+not mint" — detects it. Gate 2 is necessary but not sufficient, and the pair is what makes
+the property sound.
