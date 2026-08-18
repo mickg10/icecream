@@ -1,5 +1,37 @@
 # Protocol-50 M5 capability acceptance
 
+## 2026-08-18 binding-rate correction (authoritative)
+
+The 209-row batch scenario matrix below remains valid exactness, lifecycle,
+cache, and accounting evidence, but its original **M5 passes** conclusion is
+withdrawn.  The rate gate checked the already-prepared relationship and
+individual stages; it did not require the complete producer-to-compiler rate.
+
+The retained DuckDB rows actually report:
+
+| policy | prepared relationship | producer-to-wire | process complete |
+|---|---:|---:|---:|
+| zstd-1 | 1.226 GB/s | 0.620 GB/s | 0.542 GB/s |
+| zstd-3 | 1.219 GB/s | 0.622 GB/s | 0.549 GB/s |
+
+Therefore M5 is **OPEN**, not accepted, until a one-pass path clears 1 GB/s
+using the complete timer.  Commits `b1ad1e18` and later add that binding path:
+
+```text
+producer process
+  -> bounded raw-TU pipe/read queue
+  -> C interning + causal factorization
+  -> typed grow-only Region/Block stores
+  -> Root / F-generated Need / Fill / prepare+commit socket dialogue
+  -> F reconstruction
+  -> exact compiler-verifier pipe
+```
+
+The new launcher has a focused `--suite rate` and requires `complete >= 1.0
+GB/s` in addition to the relationship and individual stage floors.  Do not use
+the historical PASS line below as the overall M5 verdict; it describes only
+the closed 209-row batch scenario set.
+
 Date: 2026-08-17
 
 Branch: `local-oracle/issue16-m4-m5`
@@ -10,9 +42,10 @@ Target host: `tt-quietbox2`
 
 Final retained run: `/tmp/issue16-m5-final2-fixed16-20260817`
 
-## Result
+## Historical batch-scenario result
 
-M5 passes its capability-harness gate. The final one-command run executed 209 rows and every row closed all of these independently checked ledgers:
+The final one-command batch run executed 209 rows and every row closed all of
+these independently checked ledgers:
 
 | Check | Result |
 |---|---:|

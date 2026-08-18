@@ -54,7 +54,7 @@ static double seconds_since(Clock::time_point begin) {
 struct Options {
   const char *manifest = nullptr;
   size_t max_files = SIZE_MAX;
-  uint32_t workers = 8, wave = 8, queue_depth = 16;
+  uint32_t workers = 8, wave = 8, queue_depth = 16, raw_queue_depth = 2;
   capp::CodecPolicy policy = capp::CodecPolicy::Zstd1;
   capm5::CacheLimits cache_limits;
   const char *curve_out = nullptr;
@@ -433,6 +433,69 @@ private:
   mutable std::mutex mutex_;
   std::condition_variable readable_, writable_;
   std::deque<std::shared_ptr<PreparedTU>> queue_;
+  size_t buffered_ = 0, high_count_ = 0, high_bytes_ = 0;
+  bool finished_ = false, failed_ = false;
+};
+
+struct RawTU {
+  uint32_t logical = 0;
+  std::vector<uint8_t> bytes;
+  size_t buffered_bytes() const { return bytes.size(); }
+};
+
+class RawQueue {
+public:
+  explicit RawQueue(size_t capacity) : capacity_(capacity) {}
+
+  bool push(std::shared_ptr<RawTU> value) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    writable_.wait(lock, [&] { return failed_ || queue_.size() < capacity_; });
+    if (failed_)
+      return false;
+    buffered_ += value->buffered_bytes();
+    queue_.push_back(std::move(value));
+    high_count_ = std::max(high_count_, queue_.size());
+    high_bytes_ = std::max(high_bytes_, buffered_);
+    readable_.notify_one();
+    return true;
+  }
+
+  bool pop(std::shared_ptr<RawTU> &result) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    readable_.wait(lock,
+                   [&] { return failed_ || !queue_.empty() || finished_; });
+    if (failed_ || queue_.empty())
+      return false;
+    buffered_ -= queue_.front()->buffered_bytes();
+    result = std::move(queue_.front());
+    queue_.pop_front();
+    writable_.notify_one();
+    return true;
+  }
+
+  void finish() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    finished_ = true;
+    readable_.notify_all();
+  }
+  void fail() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    failed_ = true;
+    readable_.notify_all();
+    writable_.notify_all();
+  }
+  bool failed() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return failed_;
+  }
+  size_t high_count() const { return high_count_; }
+  size_t high_bytes() const { return high_bytes_; }
+
+private:
+  const size_t capacity_;
+  mutable std::mutex mutex_;
+  std::condition_variable readable_, writable_;
+  std::deque<std::shared_ptr<RawTU>> queue_;
   size_t buffered_ = 0, high_count_ = 0, high_bytes_ = 0;
   bool finished_ = false, failed_ = false;
 };
@@ -1020,8 +1083,8 @@ public:
                  const std::vector<Worker> &workers, PreparedQueue &queue,
                  Interner &dict, std::mutex &dictMutex,
                  ProducerTiming &timing)
-      : manifest_(manifest), options_(options), queue_(queue), dict_(dict),
-        dict_mutex_(dictMutex), timing_(timing) {
+      : manifest_(manifest), queue_(queue), raw_queue_(options.raw_queue_depth),
+        dict_(dict), dict_mutex_(dictMutex), timing_(timing) {
     if (pipe(descriptors_) != 0) {
       perror("source pipe");
       queue_.fail();
@@ -1066,6 +1129,7 @@ public:
     close(descriptors_[1]);
     descriptors_[1] = -1;
     reader_ = std::thread([this] { read_loop(); });
+    interner_ = std::thread([this] { intern_loop(); });
   }
 
   SourcePipeline(const SourcePipeline &) = delete;
@@ -1074,61 +1138,48 @@ public:
   bool finish() {
     if (reader_.joinable())
       reader_.join();
+    if (interner_.joinable())
+      interner_.join();
     int status = 0;
     if (pid_ >= 0) {
       waitpid(pid_, &status, 0);
       pid_ = -1;
     }
-    return !queue_.failed() && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    return !queue_.failed() && !raw_queue_.failed() && WIFEXITED(status) &&
+           WEXITSTATUS(status) == 0;
   }
+
+  size_t raw_high_count() const { return raw_queue_.high_count(); }
+  size_t raw_high_bytes() const { return raw_queue_.high_bytes(); }
 
 private:
   const Manifest &manifest_;
-  const Options &options_;
   PreparedQueue &queue_;
+  RawQueue raw_queue_;
   Interner &dict_;
   std::mutex &dict_mutex_;
   ProducerTiming &timing_;
   int descriptors_[2]{-1, -1};
   pid_t pid_ = -1;
-  std::thread reader_;
+  std::thread reader_, interner_;
 
   void read_loop() {
-    uint32_t maximum = *std::max_element(manifest_.lengths.begin(),
-                                         manifest_.lengths.end());
-    std::vector<uint8_t> bytes(maximum);
-    std::vector<uint32_t> lineIds(size_t(maximum) + 1);
-    uint64_t hits = 0;
-    OnlineFactorizer factorizer;
     for (uint32_t logical = 0; logical < manifest_.lengths.size(); ++logical) {
       uint32_t length = manifest_.lengths[logical];
+      auto raw = std::make_shared<RawTU>();
+      raw->logical = logical;
+      raw->bytes.resize(length);
       auto sourceBegin = Clock::now();
       if (length &&
-          !cap::read_all(descriptors_[0], bytes.data(), size_t(length))) {
+          !cap::read_all(descriptors_[0], raw->bytes.data(), size_t(length))) {
+        raw_queue_.fail();
         queue_.fail();
         close(descriptors_[0]);
         descriptors_[0] = -1;
         return;
       }
       timing_.source_pipe += seconds_since(sourceBegin);
-      std::vector<uint32_t> regions;
-      size_t lineCount = 0;
-      uint32_t distinct = 0, nreg = 0;
-      auto internBegin = Clock::now();
-      {
-        std::lock_guard<std::mutex> lock(dict_mutex_);
-        const char *begin = reinterpret_cast<const char *>(bytes.data());
-        dict_.process(begin, begin + length, lineIds.data(), lineCount, hits,
-                      true, &regions);
-        distinct = dict_.distinct();
-        nreg = uint32_t(dict_.region_count());
-      }
-      timing_.interning += seconds_since(internBegin);
-      auto factorBegin = Clock::now();
-      auto prepared = std::make_shared<PreparedTU>(factorizer.process(
-          logical, length, regions, distinct, nreg));
-      timing_.factorization += seconds_since(factorBegin);
-      if (!queue_.push(std::move(prepared))) {
+      if (!raw_queue_.push(std::move(raw))) {
         close(descriptors_[0]);
         descriptors_[0] = -1;
         return;
@@ -1142,6 +1193,56 @@ private:
     close(descriptors_[0]);
     descriptors_[0] = -1;
     if (count != 0) {
+      raw_queue_.fail();
+      queue_.fail();
+      return;
+    }
+    raw_queue_.finish();
+  }
+
+  void intern_loop() {
+    std::vector<uint32_t> lineIds;
+    uint64_t hits = 0;
+    OnlineFactorizer factorizer;
+    uint32_t expected = 0;
+    std::shared_ptr<RawTU> raw;
+    while (raw_queue_.pop(raw)) {
+      if (!raw || raw->logical != expected++) {
+        raw_queue_.fail();
+        queue_.fail();
+        return;
+      }
+      if (lineIds.size() < raw->bytes.size() + 1)
+        lineIds.resize(raw->bytes.size() + 1);
+      std::vector<uint32_t> regions;
+      size_t lineCount = 0;
+      uint32_t distinct = 0, nreg = 0;
+      auto internBegin = Clock::now();
+      {
+        std::lock_guard<std::mutex> lock(dict_mutex_);
+        const char empty = 0;
+        const char *begin = raw->bytes.empty()
+                                ? &empty
+                                : reinterpret_cast<const char *>(
+                                      raw->bytes.data());
+        dict_.process(begin, begin + raw->bytes.size(), lineIds.data(),
+                      lineCount, hits, true, &regions);
+        distinct = dict_.distinct();
+        nreg = uint32_t(dict_.region_count());
+      }
+      timing_.interning += seconds_since(internBegin);
+      auto factorBegin = Clock::now();
+      auto prepared = std::make_shared<PreparedTU>(factorizer.process(
+          raw->logical, uint32_t(raw->bytes.size()), regions, distinct,
+          nreg));
+      timing_.factorization += seconds_since(factorBegin);
+      raw.reset();
+      if (!queue_.push(std::move(prepared))) {
+        raw_queue_.fail();
+        return;
+      }
+    }
+    if (raw_queue_.failed() || expected != manifest_.paths.size()) {
       queue_.fail();
       return;
     }
@@ -1655,7 +1756,8 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
          "F_wire_to_compiler_pipe=%.3f GB/s F_aggregate=%.3f GB/s "
          "F_pipe_write=%.3f GB/s complete=%.3f GB/s prepare=0.000000s "
          "compiler_bytes=%llu compiler_tus=%llu "
-         "compiler_measured_bytes=%llu queue_high=%zu/%zu\n",
+         "compiler_measured_bytes=%llu queue_high=%zu/%zu "
+         "raw_queue_high=%zu/%zu\n",
          activeSeconds ? rawTotal / activeSeconds / 1e9 : 0.0,
          pathNs ? rawTotal / (double(pathNs) / 1e9) / 1e9 : 0.0,
          activeSeconds ? rawTotal / activeSeconds / 1e9 : 0.0,
@@ -1663,7 +1765,7 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
          completeSeconds ? rawTotal / completeSeconds / 1e9 : 0.0,
          (unsigned long long)compilerBytes, (unsigned long long)compilerTus,
          (unsigned long long)compilerBytes, queue.high_count(),
-         queue.high_bytes());
+         queue.high_bytes(), source.raw_high_count(), source.raw_high_bytes());
   for (size_t index = 0; index < CK_COUNT; ++index) {
     const auto &part = components[index];
     printf("COMPONENT %-13s raw=%llu selected=%llu choices=%llu/%llu/%llu "
@@ -1719,6 +1821,11 @@ int main(int argc, char **argv) {
       if (!parse_u32(argv[++index], options.queue_depth) ||
           !options.queue_depth || options.queue_depth > 1024)
         return 2;
+    } else if (!strcmp(argv[index], "--raw-queue-depth") &&
+               index + 1 < argc) {
+      if (!parse_u32(argv[++index], options.raw_queue_depth) ||
+          !options.raw_queue_depth || options.raw_queue_depth > 32)
+        return 2;
     } else if (!strcmp(argv[index], "--codec") && index + 1 < argc) {
       const char *value = argv[++index];
       if (!strcmp(value, "z1"))
@@ -1749,7 +1856,8 @@ int main(int argc, char **argv) {
       options.queue_depth < options.wave) {
     fprintf(stderr,
             "usage: %s --manifest F [--workers N --wave N --queue-depth N] "
-            "[--codec z1|z3] [--curve-out F] [--real-pipes]\n",
+            "[--raw-queue-depth N] [--codec z1|z3] [--curve-out F] "
+            "[--real-pipes]\n",
             argv[0]);
     return 2;
   }
