@@ -767,33 +767,39 @@ def full_specs(corpus_root: Path, output: Path, selected: set[str]) -> list[RunS
                     extra=extra,
                 )
             )
-    if "duckdb" in selected:
-        manifest = str(corpus_root / "corpus3" / "manifest.txt")
-        for codec in ("z1", "z3"):
-            specs.append(
-                RunSpec(
-                    f"throughput-duckdb-{codec}-8f",
-                    "throughput",
-                    manifest,
-                    codec=codec,
-                    extra=("--workers", "8", "--wave", "8"),
-                    minimum_relationship_gbps=1.0,
-                    minimum_stage_gbps=1.0,
-                    minimum_complete_gbps=1.0,
-                    one_pass=True,
-                )
-            )
-        for workers in (1, 4, 16, 32):
-            specs.append(
-                RunSpec(
-                    f"scale-duckdb-z3-{workers}f",
-                    "scaling",
-                    manifest,
-                    codec="z3",
-                    extra=("--workers", str(workers), "--wave", str(workers)),
-                    one_pass=True,
-                )
-            )
+    specs.extend(onepass_specs(corpus_root, selected))
+    return specs
+
+
+def onepass_specs(corpus_root: Path, selected: set[str]) -> list[RunSpec]:
+    if "duckdb" not in selected:
+        return []
+    manifest = str(corpus_root / "corpus3" / "manifest.txt")
+    specs = [
+        RunSpec(
+            f"throughput-duckdb-{codec}-8f",
+            "throughput",
+            manifest,
+            codec=codec,
+            extra=("--workers", "8", "--wave", "8"),
+            minimum_relationship_gbps=1.0,
+            minimum_stage_gbps=1.0,
+            minimum_complete_gbps=1.0,
+            one_pass=True,
+        )
+        for codec in ("z1", "z3")
+    ]
+    specs.extend(
+        RunSpec(
+            f"scale-duckdb-z3-{workers}f",
+            "scaling",
+            manifest,
+            codec="z3",
+            extra=("--workers", str(workers), "--wave", str(workers)),
+            one_pass=True,
+        )
+        for workers in (1, 4, 16, 32)
+    )
     return specs
 
 
@@ -1024,7 +1030,9 @@ def main() -> int:
         "--corpus-root", type=Path, default=Path("/tanksmall/scratch/ictmp")
     )
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--suite", choices=("smoke", "full"), default="full")
+    parser.add_argument(
+        "--suite", choices=("smoke", "rate", "full"), default="full"
+    )
     parser.add_argument("--corpora", default=",".join(name for name, _ in CORPORA))
     parser.add_argument("--evolution-tus", type=int, default=24)
     parser.add_argument("--timeout", type=int, default=3600)
@@ -1042,7 +1050,12 @@ def main() -> int:
         (args.output / name).mkdir(exist_ok=True)
     source = Path(__file__).resolve().parent
     binary, stream_binary, builds = build(source, args.output, args.cxx)
-    specs, fixture = smoke_specs(args.corpus_root, args.output, args.evolution_tus)
+    if args.suite == "rate":
+        specs, fixture = onepass_specs(args.corpus_root, selected), {}
+    else:
+        specs, fixture = smoke_specs(
+            args.corpus_root, args.output, args.evolution_tus
+        )
     if args.suite == "full":
         specs += full_specs(args.corpus_root, args.output, selected)
     rows: list[dict[str, object]] = []
