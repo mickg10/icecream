@@ -80,7 +80,12 @@ def kv_fields(line: str) -> dict[str, str]:
 
 
 def parse_log(text: str) -> dict[str, object]:
-    result: dict[str, object] = {"components": {}, "frames": {}}
+    result: dict[str, object] = {
+        "components": {},
+        "frames": {},
+        "c_to_f_frames": {},
+        "f_to_c_frames": {},
+    }
     for line in text.splitlines():
         if line.startswith("RESULT "):
             result.update(kv_fields(line))
@@ -89,6 +94,34 @@ def parse_log(text: str) -> dict[str, object]:
             result["frame_closure"] = fields.pop("closure")
             result["frame_total"] = int(fields.pop("total"))
             result["frames"] = {
+                name: {
+                    "bytes": int(value.split("/")[0]),
+                    "count": int(value.split("/")[1]),
+                }
+                for name, value in fields.items()
+            }
+        elif line.startswith("DIRECTION_LEDGER "):
+            fields = kv_fields(line)
+            result["direction_closure"] = fields["closure"]
+            result["direction_total"] = int(fields["total"])
+            result["c_to_f"] = int(fields["C_to_F"])
+            result["f_to_c"] = int(fields["F_to_C"])
+        elif line.startswith("C_TO_F_FRAME_LEDGER "):
+            fields = kv_fields(line)
+            result["c_to_f_frame_closure"] = fields.pop("closure")
+            result["c_to_f_frame_total"] = int(fields.pop("total"))
+            result["c_to_f_frames"] = {
+                name: {
+                    "bytes": int(value.split("/")[0]),
+                    "count": int(value.split("/")[1]),
+                }
+                for name, value in fields.items()
+            }
+        elif line.startswith("F_TO_C_FRAME_LEDGER "):
+            fields = kv_fields(line)
+            result["f_to_c_frame_closure"] = fields.pop("closure")
+            result["f_to_c_frame_total"] = int(fields.pop("total"))
+            result["f_to_c_frames"] = {
                 name: {
                     "bytes": int(value.split("/")[0]),
                     "count": int(value.split("/")[1]),
@@ -104,6 +137,17 @@ def parse_log(text: str) -> dict[str, object]:
                 None if fields["H200_TU"] == "none" else int(fields["H200_TU"])
             )
             result["second_half"] = float(fields["SECOND_HALF"])
+        elif line.startswith("C_TO_F_CURVE_SUMMARY "):
+            fields = kv_fields(line)
+            result["c_to_f_c50"] = float(fields["C50"])
+            result["c_to_f_c50_tu"] = int(fields["C50_TU"])
+            result["c_to_f_h200"] = (
+                None if fields["H200"] == "none" else float(fields["H200"])
+            )
+            result["c_to_f_h200_tu"] = (
+                None if fields["H200_TU"] == "none" else int(fields["H200_TU"])
+            )
+            result["c_to_f_second_half"] = float(fields["SECOND_HALF"])
         elif line.startswith("CACHE "):
             fields = kv_fields(line)
             result["cache_regions"], result["cache_region_bytes"] = map(
@@ -170,11 +214,25 @@ def parse_log(text: str) -> dict[str, object]:
         "failures",
         "frame_closure",
         "frame_total",
+        "direction_closure",
+        "direction_total",
+        "c_to_f",
+        "f_to_c",
+        "c_to_f_frame_closure",
+        "c_to_f_frame_total",
+        "f_to_c_frame_closure",
+        "f_to_c_frame_total",
+        "c_to_f_ratio",
         "c50",
         "c50_tu",
         "h200",
         "h200_tu",
         "second_half",
+        "c_to_f_c50",
+        "c_to_f_c50_tu",
+        "c_to_f_h200",
+        "c_to_f_h200_tu",
+        "c_to_f_second_half",
         "c_transform_gbps",
         "f_decode_cpu_gbps",
         "relationship_gbps",
@@ -204,9 +262,19 @@ def parse_log(text: str) -> dict[str, object]:
     missing = sorted(required - result.keys())
     if missing:
         raise ValueError(f"M5 log lacks fields: {', '.join(missing)}")
-    for name in ("workers", "wave", "tus", "raw", "actual_socket", "failures"):
+    for name in (
+        "workers",
+        "wave",
+        "tus",
+        "raw",
+        "actual_socket",
+        "c_to_f",
+        "f_to_c",
+        "failures",
+    ):
         result[name] = int(result[name])
     result["ratio"] = float(result["ratio"])
+    result["c_to_f_ratio"] = float(result["c_to_f_ratio"])
     return result
 
 
@@ -937,12 +1005,58 @@ def run_one(
         raise RuntimeError(f"{spec.name}: transaction closure failed")
     if parsed["frame_total"] != parsed["actual_socket"]:
         raise RuntimeError(f"{spec.name}: frame total differs from socket total")
+    if (
+        parsed["direction_closure"] != "OK"
+        or parsed["direction_total"] != parsed["actual_socket"]
+        or parsed["c_to_f"] + parsed["f_to_c"] != parsed["actual_socket"]
+    ):
+        raise RuntimeError(f"{spec.name}: direction ledger does not close")
+    if (
+        parsed["c_to_f_frame_closure"] != "OK"
+        or parsed["f_to_c_frame_closure"] != "OK"
+        or parsed["c_to_f_frame_total"] != parsed["c_to_f"]
+        or parsed["f_to_c_frame_total"] != parsed["f_to_c"]
+    ):
+        raise RuntimeError(f"{spec.name}: directional frame ledgers do not close")
     if sum(frame["bytes"] for frame in parsed["frames"].values()) != parsed["frame_total"]:
         raise RuntimeError(f"{spec.name}: frame categories do not close")
+    if (
+        sum(frame["bytes"] for frame in parsed["c_to_f_frames"].values())
+        != parsed["c_to_f"]
+        or sum(frame["bytes"] for frame in parsed["f_to_c_frames"].values())
+        != parsed["f_to_c"]
+    ):
+        raise RuntimeError(f"{spec.name}: directional frame categories do not close")
+    for frame_name, frame in parsed["frames"].items():
+        c_to_f_frame = parsed["c_to_f_frames"].get(frame_name)
+        f_to_c_frame = parsed["f_to_c_frames"].get(frame_name)
+        if c_to_f_frame is None or f_to_c_frame is None:
+            raise RuntimeError(f"{spec.name}: directional frame type is missing")
+        if (
+            frame["bytes"] != c_to_f_frame["bytes"] + f_to_c_frame["bytes"]
+            or frame["count"] != c_to_f_frame["count"] + f_to_c_frame["count"]
+        ):
+            raise RuntimeError(
+                f"{spec.name}: direction split does not close for {frame_name}"
+            )
     if sum(row["raw"] for row in curve_rows) != parsed["raw"]:
         raise RuntimeError(f"{spec.name}: curve raw does not close")
     if sum(row["wire"] for row in curve_rows) != parsed["actual_socket"]:
         raise RuntimeError(f"{spec.name}: curve wire does not close")
+    if sum(row["c_to_f"] for row in curve_rows) != parsed["c_to_f"]:
+        raise RuntimeError(f"{spec.name}: C-to-F curve does not close")
+    if sum(row["f_to_c"] for row in curve_rows) != parsed["f_to_c"]:
+        raise RuntimeError(f"{spec.name}: F-to-C curve does not close")
+    if any(
+        row["direction_ok"] != 1 or row["wire"] != row["c_to_f"] + row["f_to_c"]
+        for row in curve_rows
+    ):
+        raise RuntimeError(f"{spec.name}: per-TU direction split does not close")
+    if curve_rows and (
+        curve_rows[-1]["cumulative_c_to_f"] != parsed["c_to_f"]
+        or curve_rows[-1]["cumulative_f_to_c"] != parsed["f_to_c"]
+    ):
+        raise RuntimeError(f"{spec.name}: cumulative direction curve does not close")
     if len(curve_rows) != parsed["tus"] or parsed["failures"] != spec.expected_failures:
         raise RuntimeError(f"{spec.name}: TU/failure count mismatch")
     if parsed["transaction_committed"] != parsed["tus"]:
@@ -1047,6 +1161,9 @@ def write_outputs(
         "raw",
         "actual_socket",
         "ratio",
+        "c_to_f",
+        "f_to_c",
+        "c_to_f_ratio",
         "failures",
         "prepared_accepted",
         "decode_rejected",
@@ -1057,6 +1174,11 @@ def write_outputs(
         "h200",
         "h200_tu",
         "second_half",
+        "c_to_f_c50",
+        "c_to_f_c50_tu",
+        "c_to_f_h200",
+        "c_to_f_h200_tu",
+        "c_to_f_second_half",
         "latency_p50_ms",
         "latency_p95_ms",
         "latency_p99_ms",
@@ -1174,7 +1296,11 @@ def main() -> int:
                 )
             if (
                 row["actual_socket"] != reference["actual_socket"]
+                or row["c_to_f"] != reference["c_to_f"]
+                or row["f_to_c"] != reference["f_to_c"]
                 or row["frames"] != reference["frames"]
+                or row["c_to_f_frames"] != reference["c_to_f_frames"]
+                or row["f_to_c_frames"] != reference["f_to_c_frames"]
                 or row["components"] != reference["components"]
                 or wire_curve_signature(Path(str(row["curve"])))
                 != wire_curve_signature(Path(str(reference["curve"])))
@@ -1188,7 +1314,8 @@ def main() -> int:
         write_outputs(args.output, rows, builds, fixture)
         print(
             f"EXACT {ordinal}/{len(specs)} {spec.name}: {row['actual_socket']} B "
-            f"{row['ratio']:.3f}x relationship={row['relationship_gbps']:.3f} "
+            f"C->F={row['c_to_f']} B/{row['c_to_f_ratio']:.3f}x "
+            f"relationship={row['relationship_gbps']:.3f} "
             f"GB/s complete={row['complete_gbps']:.3f} GB/s",
             flush=True,
         )

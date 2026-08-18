@@ -111,13 +111,33 @@ static void enlarge_pipe(int fd) {
 
 struct FrameLedger {
   std::array<uint64_t, 7> bytes{}, count{};
-  void note(cap::Frame frame, size_t payload) {
+  std::array<uint64_t, 7> sent_bytes{}, sent_count{};
+  std::array<uint64_t, 7> received_bytes{}, received_count{};
+  void note(cap::Frame frame, size_t payload,
+            std::array<uint64_t, 7> &directionBytes,
+            std::array<uint64_t, 7> &directionCount) {
     size_t index = size_t(frame);
-    bytes[index] += 4 + payload;
+    const uint64_t physical = 4 + payload;
+    bytes[index] += physical;
     ++count[index];
+    directionBytes[index] += physical;
+    ++directionCount[index];
+  }
+  void note_sent(cap::Frame frame, size_t payload) {
+    note(frame, payload, sent_bytes, sent_count);
+  }
+  void note_received(cap::Frame frame, size_t payload) {
+    note(frame, payload, received_bytes, received_count);
   }
   uint64_t total() const {
     return std::accumulate(bytes.begin(), bytes.end(), uint64_t(0));
+  }
+  uint64_t sent_total() const {
+    return std::accumulate(sent_bytes.begin(), sent_bytes.end(), uint64_t(0));
+  }
+  uint64_t received_total() const {
+    return std::accumulate(received_bytes.begin(), received_bytes.end(),
+                           uint64_t(0));
   }
 };
 
@@ -126,7 +146,7 @@ static bool send_counted(int fd, cap::Frame frame,
                          FrameLedger &ledger) {
   if (!cap::send_frame(fd, frame, payload))
     return false;
-  ledger.note(frame, payload.size());
+  ledger.note_sent(frame, payload.size());
   return true;
 }
 
@@ -135,7 +155,7 @@ static bool recv_counted(int fd, cap::Frame &frame,
                          FrameLedger &ledger) {
   if (!cap::recv_frame(fd, frame, payload))
     return false;
-  ledger.note(frame, payload.size());
+  ledger.note_received(frame, payload.size());
   return true;
 }
 
@@ -945,7 +965,8 @@ struct Worker {
   FrameLedger frames;
   capm5::ReceiverMirror mirror;
   WorkerSummary summary;
-  uint64_t pending_control = 0, accepted = 0, accepted_raw = 0;
+  uint64_t pending_control_c_to_f = 0, pending_control_f_to_c = 0,
+           accepted = 0, accepted_raw = 0;
 };
 
 static bool spawn_worker(Worker &worker, uint32_t id,
@@ -979,14 +1000,20 @@ static bool spawn_worker(Worker &worker, uint32_t id,
   worker.mirror.init(0, 0);
   auto hello = capp::pack_hello_m4(generation, 0, 0,
                                    uint32_t(manifest.paths.size()), 1);
+  const uint64_t cToFBefore = worker.frames.sent_total();
+  const uint64_t fToCBefore = worker.frames.received_total();
   if (!send_counted(worker.fd, cap::Frame::Hello, hello, worker.frames))
     return false;
-  worker.pending_control = worker.frames.total();
+  worker.pending_control_c_to_f +=
+      worker.frames.sent_total() - cToFBefore;
+  worker.pending_control_f_to_c +=
+      worker.frames.received_total() - fToCBefore;
   return true;
 }
 
 static bool finish_worker(Worker &worker) {
-  uint64_t before = worker.frames.total();
+  const uint64_t cToFBefore = worker.frames.sent_total();
+  const uint64_t fToCBefore = worker.frames.received_total();
   if (!send_counted(worker.fd, cap::Frame::Done, {}, worker.frames))
     return false;
   uint64_t wireBeforeAck = worker.frames.total();
@@ -997,7 +1024,10 @@ static bool finish_worker(Worker &worker) {
       !unpack_worker_summary(payload, worker.summary) ||
       worker.summary.wire_before_ack != wireBeforeAck)
     return false;
-  worker.pending_control += worker.frames.total() - before;
+  worker.pending_control_c_to_f +=
+      worker.frames.sent_total() - cToFBefore;
+  worker.pending_control_f_to_c +=
+      worker.frames.received_total() - fToCBefore;
   close(worker.fd);
   worker.fd = -1;
   int status = 0;
@@ -1184,13 +1214,13 @@ private:
 
 struct CurveRow {
   uint32_t logical = 0, worker = 0;
-  uint64_t raw = 0, wire = 0, latency_ns = 0;
+  uint64_t raw = 0, wire = 0, latency_ns = 0, c_to_f = 0, f_to_c = 0;
 };
 
 struct Pending {
   std::shared_ptr<PreparedTU> prepared;
   uint32_t worker = 0;
-  uint64_t wire_start = 0;
+  uint64_t wire_start = 0, c_to_f_start = 0, f_to_c_start = 0;
   std::vector<uint32_t> missing;
   MixedEncoder::AuthorityTransaction authority;
   Clock::time_point started;
@@ -1267,6 +1297,8 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
       worker.mirror.ensure_dimensions(job.prepared->nreg,
                                       job.prepared->nblk);
       job.wire_start = worker.frames.total();
+      job.c_to_f_start = worker.frames.sent_total();
+      job.f_to_c_start = worker.frames.received_total();
       job.started = Clock::now();
       auto transformBegin = Clock::now();
       std::vector<uint8_t> rootRaw;
@@ -1519,15 +1551,25 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
       auto &worker = workers[job.worker];
       encoder.commit_authority_transaction(job.authority);
       worker.mirror.apply(replies[index].drops);
-      uint64_t wire = worker.frames.total() - job.wire_start +
-                      worker.pending_control;
-      worker.pending_control = 0;
+      const uint64_t cToF = worker.frames.sent_total() - job.c_to_f_start +
+                            worker.pending_control_c_to_f;
+      const uint64_t fToC = worker.frames.received_total() - job.f_to_c_start +
+                            worker.pending_control_f_to_c;
+      const uint64_t wire = cToF + fToC;
+      if (wire != worker.frames.total() - job.wire_start +
+                      worker.pending_control_c_to_f +
+                      worker.pending_control_f_to_c) {
+        relationshipExact = false;
+        break;
+      }
+      worker.pending_control_c_to_f = 0;
+      worker.pending_control_f_to_c = 0;
       uint64_t latency = uint64_t(
           std::chrono::duration_cast<std::chrono::nanoseconds>(
               replies[index].received - job.started)
               .count());
       curve.push_back({job.prepared->logical, job.worker,
-                       job.prepared->raw_length, wire, latency});
+                       job.prepared->raw_length, wire, latency, cToF, fToC});
       rawTotal += job.prepared->raw_length;
       ++worker.accepted;
       worker.accepted_raw += job.prepared->raw_length;
@@ -1558,7 +1600,8 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
               return left.logical < right.logical;
             });
   for (uint32_t id = 0; id < workers.size(); ++id) {
-    if (!workers[id].pending_control)
+    if (!workers[id].pending_control_c_to_f &&
+        !workers[id].pending_control_f_to_c)
       continue;
     auto found = std::find_if(curve.rbegin(), curve.rend(),
                               [&](const CurveRow &row) {
@@ -1568,21 +1611,28 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
       relationshipExact = false;
       continue;
     }
-    found->wire += workers[id].pending_control;
-    workers[id].pending_control = 0;
+    found->c_to_f += workers[id].pending_control_c_to_f;
+    found->f_to_c += workers[id].pending_control_f_to_c;
+    found->wire += workers[id].pending_control_c_to_f +
+                   workers[id].pending_control_f_to_c;
+    workers[id].pending_control_c_to_f = 0;
+    workers[id].pending_control_f_to_c = 0;
   }
   const double activeSeconds = seconds_since(activeStart);
   const double completeSeconds = seconds_since(processStart);
   struct rusage coordinatorUsage {};
   getrusage(RUSAGE_SELF, &coordinatorUsage);
 
-  uint64_t socketBytes = 0, compilerBytes = 0, compilerTus = 0,
-           compilerNs = 0, decodeNs = 0, pathNs = 0, failures = 0,
-           peakRss = 0;
+  uint64_t socketBytes = 0, socketCToF = 0, socketFToC = 0,
+           compilerBytes = 0, compilerTus = 0, compilerNs = 0, decodeNs = 0,
+           pathNs = 0, failures = 0, peakRss = 0;
   capm5::CacheTotals cacheTotals;
-  std::array<uint64_t, 7> frameBytes{}, frameCount{};
+  std::array<uint64_t, 7> frameBytes{}, frameCount{}, frameCToFBytes{},
+      frameCToFCount{}, frameFToCBytes{}, frameFToCCount{};
   for (const auto &worker : workers) {
     socketBytes += worker.frames.total();
+    socketCToF += worker.frames.sent_total();
+    socketFToC += worker.frames.received_total();
     compilerBytes += worker.summary.compiler_pipe_bytes;
     compilerTus += worker.summary.compiler_pipe_tus;
     compilerNs += worker.summary.compiler_pipe_ns;
@@ -1603,6 +1653,17 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
     for (size_t index = 0; index < frameBytes.size(); ++index) {
       frameBytes[index] += worker.frames.bytes[index];
       frameCount[index] += worker.frames.count[index];
+      frameCToFBytes[index] += worker.frames.sent_bytes[index];
+      frameCToFCount[index] += worker.frames.sent_count[index];
+      frameFToCBytes[index] += worker.frames.received_bytes[index];
+      frameFToCCount[index] += worker.frames.received_count[index];
+      if (worker.frames.bytes[index] !=
+              worker.frames.sent_bytes[index] +
+                  worker.frames.received_bytes[index] ||
+          worker.frames.count[index] !=
+              worker.frames.sent_count[index] +
+                  worker.frames.received_count[index])
+        relationshipExact = false;
     }
     if (!worker.summary.exact || worker.summary.verified != worker.accepted ||
         worker.summary.raw != worker.accepted_raw ||
@@ -1610,13 +1671,34 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
         worker.summary.compiler_pipe_tus != worker.accepted)
       relationshipExact = false;
   }
-  uint64_t curveRaw = 0, curveWire = 0;
+  uint64_t curveRaw = 0, curveWire = 0, curveCToF = 0, curveFToC = 0;
   for (const auto &row : curve) {
     curveRaw += row.raw;
     curveWire += row.wire;
+    curveCToF += row.c_to_f;
+    curveFToC += row.f_to_c;
+    if (row.wire != row.c_to_f + row.f_to_c)
+      relationshipExact = false;
+  }
+  // Entirely idle relationships have no accepted TU to own their Hello and
+  // final Done/Ack controls.  Preserve the historical global-residual policy,
+  // but attribute each residual to its observed physical direction.
+  if (!curve.empty() && curveCToF <= socketCToF && curveFToC <= socketFToC) {
+    const uint64_t residualCToF = socketCToF - curveCToF;
+    const uint64_t residualFToC = socketFToC - curveFToC;
+    curve.back().c_to_f += residualCToF;
+    curve.back().f_to_c += residualFToC;
+    curve.back().wire += residualCToF + residualFToC;
+    curveWire += residualCToF + residualFToC;
+    curveCToF += residualCToF;
+    curveFToC += residualFToC;
+  } else if (curveCToF != socketCToF || curveFToC != socketFToC) {
+    relationshipExact = false;
   }
   if (!sourceExact || rawTotal != manifest.raw || curveRaw != rawTotal ||
-      curveWire != socketBytes || compilerBytes != rawTotal ||
+      curveWire != socketBytes || curveCToF != socketCToF ||
+      curveFToC != socketFToC || socketCToF + socketFToC != socketBytes ||
+      compilerBytes != rawTotal ||
       compilerTus != curve.size() || committed != curve.size() ||
       preparedAccepted != committed + aborted || decodeRejected != 0 ||
       aborted != 0)
@@ -1625,15 +1707,21 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
   if (options.curve_out) {
     std::ofstream output(options.curve_out);
     output << "logical\tphysical\tworker\traw\twire\tlatency_ns\t"
-              "cumulative_raw\tcumulative_wire\n";
-    uint64_t cumulativeRaw = 0, cumulativeWire = 0;
+              "cumulative_raw\tcumulative_wire\tc_to_f\tf_to_c\t"
+              "cumulative_c_to_f\tcumulative_f_to_c\tdirection_ok\n";
+    uint64_t cumulativeRaw = 0, cumulativeWire = 0, cumulativeCToF = 0,
+             cumulativeFToC = 0;
     for (const auto &row : curve) {
       cumulativeRaw += row.raw;
       cumulativeWire += row.wire;
+      cumulativeCToF += row.c_to_f;
+      cumulativeFToC += row.f_to_c;
       output << row.logical << '\t' << row.logical << '\t' << row.worker
              << '\t' << row.raw << '\t' << row.wire << '\t'
              << row.latency_ns << '\t' << cumulativeRaw << '\t'
-             << cumulativeWire << '\n';
+             << cumulativeWire << '\t' << row.c_to_f << '\t' << row.f_to_c
+             << '\t' << cumulativeCToF << '\t' << cumulativeFToC << '\t'
+             << (row.wire == row.c_to_f + row.f_to_c ? 1 : 0) << '\n';
     }
     if (!output)
       relationshipExact = false;
@@ -1648,14 +1736,44 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
            (unsigned long long)frameCount[index]);
   printf(" total=%llu closure=%s\n", (unsigned long long)socketBytes,
          curveWire == socketBytes ? "OK" : "FAIL");
+  printf("C_TO_F_FRAME_LEDGER");
+  for (size_t index = 0; index < frameCToFBytes.size(); ++index)
+    printf(" %s=%llu/%llu", frameNames[index],
+           (unsigned long long)frameCToFBytes[index],
+           (unsigned long long)frameCToFCount[index]);
+  printf(" total=%llu closure=%s\n", (unsigned long long)socketCToF,
+         std::accumulate(frameCToFBytes.begin(), frameCToFBytes.end(),
+                         uint64_t(0)) == socketCToF
+             ? "OK"
+             : "FAIL");
+  printf("F_TO_C_FRAME_LEDGER");
+  for (size_t index = 0; index < frameFToCBytes.size(); ++index)
+    printf(" %s=%llu/%llu", frameNames[index],
+           (unsigned long long)frameFToCBytes[index],
+           (unsigned long long)frameFToCCount[index]);
+  printf(" total=%llu closure=%s\n", (unsigned long long)socketFToC,
+         std::accumulate(frameFToCBytes.begin(), frameFToCBytes.end(),
+                         uint64_t(0)) == socketFToC
+             ? "OK"
+             : "FAIL");
+  printf("DIRECTION_LEDGER C_to_F=%llu F_to_C=%llu total=%llu closure=%s\n",
+         (unsigned long long)socketCToF, (unsigned long long)socketFToC,
+         (unsigned long long)socketBytes,
+         socketCToF + socketFToC == socketBytes &&
+                 curveCToF == socketCToF && curveFToC == socketFToC
+             ? "OK"
+             : "FAIL");
   printf("RESULT exact=%s codec=%s order=standard assignment=roundrobin "
          "workers=%u wave=%u tus=%zu raw=%llu actual_socket=%llu ratio=%.3f "
-         "failures=%llu snapshot=none\n",
+         "c_to_f=%llu f_to_c=%llu c_to_f_ratio=%.3f failures=%llu "
+         "snapshot=none\n",
          relationshipExact ? "OK" : "FAIL",
          options.policy == capp::CodecPolicy::Zstd1 ? "z1" : "z3",
          options.workers, options.wave, curve.size(),
          (unsigned long long)rawTotal, (unsigned long long)socketBytes,
          socketBytes ? double(rawTotal) / socketBytes : 0.0,
+         (unsigned long long)socketCToF, (unsigned long long)socketFToC,
+         socketCToF ? double(rawTotal) / socketCToF : 0.0,
          (unsigned long long)failures);
   printf("TRANSACTIONS prepared_accepted=%llu decode_rejected=%llu "
          "committed=%llu aborted=%llu closure=%s\n",
@@ -1666,6 +1784,10 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
              ? "OK"
              : "FAIL");
   auto summary = capm5::summarize_curve(curve);
+  auto cToFCurve = curve;
+  for (auto &row : cToFCurve)
+    row.wire = row.c_to_f;
+  auto cToFSummary = capm5::summarize_curve(cToFCurve);
   printf("CURVE_SUMMARY C50=%.3f C50_TU=%u H200=", summary.c50,
          summary.c50_tu);
   if (summary.h200 < 0)
@@ -1678,6 +1800,18 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
   else
     printf("%u", summary.h200_tu);
   printf(" SECOND_HALF=%.3f\n", summary.second_half);
+  printf("C_TO_F_CURVE_SUMMARY C50=%.3f C50_TU=%u H200=",
+         cToFSummary.c50, cToFSummary.c50_tu);
+  if (cToFSummary.h200 < 0)
+    printf("none");
+  else
+    printf("%.6f", cToFSummary.h200);
+  printf(" H200_TU=");
+  if (cToFSummary.h200_tu == UINT32_MAX)
+    printf("none");
+  else
+    printf("%u", cToFSummary.h200_tu);
+  printf(" SECOND_HALF=%.3f\n", cToFSummary.second_half);
   printf("CACHE regions=%u/%llu public=%u/%llu blocks=%u/%llu "
          "removals=%llu/%llu/%llu compactions=%llu\n",
          cacheTotals.regions, (unsigned long long)cacheTotals.region_bytes,
