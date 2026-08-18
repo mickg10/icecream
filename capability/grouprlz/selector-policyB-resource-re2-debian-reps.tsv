@@ -1,0 +1,4 @@
+rep	makespan_s	load_before	load_after	p29_e	p29_user	p29_sys	p29_rssKiB	grz_e	grz_user	grz_sys	grz_rssKiB	p29_wire	grz_wire	p29_wire_matches_gate	grz_roundtrip
+1	.619924365	0.71	0.71	0.61	0.34	0.26	182924	0.25	0.12	0.13	125252	453331	362280	MATCH	EXACT
+2	.633144263	0.71	0.71	0.62	0.32	0.30	182916	0.25	0.13	0.12	125000	453331	362280	MATCH	EXACT
+3	.621713200	0.74	0.74	0.61	0.32	0.29	182924	0.25	0.13	0.12	125000	453331	362280	MATCH	EXACT

@@ -1,0 +1,24 @@
+project	re2
+profile	debian-gcc
+total_tus	72
+probe_tus	72
+probe_raw_bytes	84637328
+p29_cores	16-23
+grz_cores	24-31
+reps	3
+runner_kind	offline-census (races both probes; NOT production policy B)
+p29_passes_charged	plan+grouped (two-pass; one-pass P29 would replace both)
+input_charging	per-candidate (GRZ pays concat+TU map, P29 pays its own open+intern)
+p29_interner	research (not fast M5; not the product limit)
+payload	ii.tar.zst
+payload_sha256	4b3bfaad19cd75659636b40468c1157a3a867fac0187e6185b0f5fc7832a7a8a
+corpus_json_sha256	bc0723495fb04ebb72a9b953e7021246ed86689c4dc0cacc059ff72ca3e2296d
+manifest_tsv_sha256	9fc5bb434bc6b7c85de2ccf84b926d2fabdccc360d7b9af59fdedb481af4b955
+p29_src_sha256	89ed3b299332f90898b0bd86338052d67d686e93797d2e332080f7ed33c7c753
+p29_bin_sha256	3967d6ca12b034c0752485a81f3c0dd64f2196c52d1ab32b18f82fadf678418e
+grz_src_sha256	e997b612c3445c951fa8bfc4abd2942fbad532fac85ebae5aa5fe753fe64a6b9
+grz_bin_sha256	647883b7a346ae48d76ea2ac542240e5c78b4a56049372ee6067f5ec94276af9
+runner_sha256	4357f72485ee9623566fe876954b2b82a7563995d9913e89ad41bede3e068eab
+zstd	v1.4.8
+host	tt-quietbox
+completed_utc	2026-08-18T05:22:05Z
