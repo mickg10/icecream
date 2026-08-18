@@ -2,7 +2,7 @@
 """Independent binding gate for GRZ2_GROUPED.
 
 Parses the STREAM/GROUP/END wire directly from the format spec -- it does not link the codec
-or trust its own reporting -- and checks the seven binding invariants:
+or trust its own reporting -- and checks the eight binding invariants:
 
   1 complete exact replay
   2 encode(P) is byte-identical to the prefix of encode(P||S) through P's last complete group
@@ -11,6 +11,7 @@ or trust its own reporting -- and checks the seven binding invariants:
   5 absolute byte zero usable as a COPY source, and same-group anchor visibility
   6 forced ADD-cap rollback with a deterministic retry
   7 repeated ring wrap with exact group and whole-stream digests
+  8 a late oversized TU grows the ring, preserves prior history, then wraps exactly
 
 usage: gate_grz2.py <grz2g binary> <workdir> <manifest>
 """
@@ -175,6 +176,43 @@ ng = len(parse(WORK + "/wrap.grz")[0])
 check("7 repeated ring wrap, digests + replay",
       r.returncode == 0 and sha(WORK + "/wrap.out") == sha(w),
       "%d groups, 1 MiB history over %.0f MiB" % (ng, os.path.getsize(w) / 1048576))
+
+# ---- 8 late oversized TU: grow after history exists, then wrap -------------------------
+seed = bytes((i * 37 + (i >> 5) * 11 + (i >> 13) * 7) & 0xff for i in range(1 << 20))
+late_tus = [
+    seed[:700000],
+    seed[:700000] + seed * 4,
+    (seed[:700000] + seed * 4)[-700000:] + seed * 3,
+]
+late_raw = WORK + "/late-grow.ii"
+late_map = WORK + "/late-grow.tu"
+offsets = [0]
+with open(late_raw, "wb") as f:
+    for tu in late_tus:
+        f.write(tu)
+        offsets.append(offsets[-1] + len(tu))
+with open(late_map, "wb") as f:
+    for offset in offsets:
+        f.write(struct.pack("<Q", offset))
+late_wire = WORK + "/late-grow.grz"
+r_enc = run([GRZ, "enc", late_raw, late_wire, "-m", "g2", "-u", late_map,
+             "-K", "64", "-s", "0", "-t", "20", "-l", "4", "-k", "1",
+             "-b", "1", "-j", "2", "--gtu", "1", "--graw", "1",
+             "--gadd", "16", "--hist", "1", "--retry-test", "1"])
+r_dec = run([GRZ, "dec", late_wire, WORK + "/late-grow.out", "-j", "1"])
+enc_diag = r_enc.stderr.decode()
+src0 = int(enc_diag.split("src0=")[1].split()[0])
+oversize = int(enc_diag.split("oversize_tu=")[1].split()[0])
+retry_fail = int(enc_diag.split("retry_fail=")[1].split()[0])
+dec_fields = r_dec.stdout.decode().strip().splitlines()[-1].split("\t")
+final_ring = int(dec_fields[4])
+late_groups = parse(late_wire)[0]
+check("8 late oversized grow preserves + wraps",
+      sha(WORK + "/late-grow.out") == sha(late_raw) and
+      len(late_groups) == 3 and late_groups[1]["gout"] > (1 << 20) and
+      final_ring > (2 << 20) and src0 > 0 and oversize > 0 and retry_fail == 0,
+      "%d groups, ring %.0f MiB, src0=%d, oversized=%d, retry_fail=%d" %
+      (len(late_groups), final_ring / 1048576, src0, oversize, retry_fail))
 
 n_fail = sum(1 for _, ok, _ in results if not ok)
 print("\n%d/%d checks PASS" % (len(results) - n_fail, len(results)))
