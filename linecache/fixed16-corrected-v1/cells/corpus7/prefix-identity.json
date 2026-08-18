@@ -1,0 +1,40 @@
+{
+  "artifacts": {
+    "/home/ttuser/issue16-p29-prefix-state/fixed16-corrected-v1/cells/corpus7/full/components.tsv": "5e2f59f5fa63405e52abc13ca5f9de3ffb9231aec5ffc9400d43545d330e0c9a",
+    "/home/ttuser/issue16-p29-prefix-state/fixed16-corrected-v1/cells/corpus7/full/curve.tsv": "c084354be259348f0dc570b72215295c7dcdcc0723590273b190a8d05fb8b18a",
+    "/home/ttuser/issue16-p29-prefix-state/fixed16-corrected-v1/cells/corpus7/full/literal.wire": "65180c2fb8f7717b3f4489911a5bb205c3144c708ac4ce678568028196969f22",
+    "/home/ttuser/issue16-p29-prefix-state/fixed16-corrected-v1/cells/corpus7/prefix/components.tsv": "5e2f59f5fa63405e52abc13ca5f9de3ffb9231aec5ffc9400d43545d330e0c9a",
+    "/home/ttuser/issue16-p29-prefix-state/fixed16-corrected-v1/cells/corpus7/prefix/curve.tsv": "c084354be259348f0dc570b72215295c7dcdcc0723590273b190a8d05fb8b18a",
+    "/home/ttuser/issue16-p29-prefix-state/fixed16-corrected-v1/cells/corpus7/prefix/literal.wire": "65180c2fb8f7717b3f4489911a5bb205c3144c708ac4ce678568028196969f22"
+  },
+  "components_identical": true,
+  "curve_identical": true,
+  "full_tus": 50,
+  "group_tus": 112,
+  "literal_frame_bytes": 265386,
+  "literal_frame_sha256": "65180c2fb8f7717b3f4489911a5bb205c3144c708ac4ce678568028196969f22",
+  "literal_frames": 1,
+  "plan_prefixes": {
+    "array-control": {
+      "prefix_bytes": 269,
+      "prefix_sha256": "2daa08dd5dd0de29cf450c1589b99ed66ddb1c1fc217040216951b8253c1b413"
+    },
+    "array-values": {
+      "prefix_bytes": 1255,
+      "prefix_sha256": "bc1eafdee703193061eb527b71068cc1ffc3396a480e7fd8be2d8df8b0324b0b"
+    },
+    "control": {
+      "prefix_bytes": 933600,
+      "prefix_sha256": "784027c7e17f20afc7bc661557d703e0d6216402ced1aca86487d3448b45754f"
+    },
+    "literal": {
+      "prefix_bytes": 2861293,
+      "prefix_sha256": "472c2f1ccab8e1884f270e7168d629b970e202f96c916a51d8040c8c1d8363ec"
+    }
+  },
+  "prefix_mode": "complete-program",
+  "prefix_raw_bytes": 136350082,
+  "prefix_tus": 50,
+  "prefix_wire_bytes": 923382,
+  "schema": "p29-prefix-identity-v1"
+}

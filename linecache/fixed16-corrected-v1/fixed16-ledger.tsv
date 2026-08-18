@@ -1,0 +1,17 @@
+id	name	manifest_path	tu_count	raw_bytes	manifest_sha256
+corpus	llvm	/home/ttuser/ictmp/corpus/manifest.txt	1238	3620271340	33392b9cdb4a21c8148ece5bc4862463d87cbe3a056bc78a2d904eac66996bdf
+corpus2	rocksdb	/home/ttuser/ictmp/corpus2/manifest.txt	622	3114320596	83fe864eb8006a7260cd77d54add1d34a6308332c0a3db14c7a84d96e2f26d79
+corpus3	duckdb	/home/ttuser/ictmp/corpus3/manifest.txt	689	1985715205	bc40a2938860448eb56bbc1bdd9d2e63333c25f54ecc42189d02d0beaae66492
+corpus4	abseil	/home/ttuser/ictmp/corpus4/manifest.txt	700	2581008467	5348f60dd573dd36e0aba6e7b9de72bd739bc921fcc6ef5de56f1f98481dfc2d
+corpus5	opencv	/home/ttuser/ictmp/corpus5/manifest.txt	1506	4630994774	73a378f36fc214e5e8cc2540e64098fab1bdf7127d4af3e1b0dd0eb03b37a637
+corpus6	godot	/home/ttuser/ictmp/corpus6/manifest.txt	2207	5932762185	e01a44c95474e5728138aa4eaf918e67146ce21457b12731806470de8eb0bd15
+corpus7	fmt	/home/ttuser/ictmp/corpus7/manifest.txt	50	136350082	70d4565e16d9bd4aed1ec151a092f198662badd7e23dde070fab1ec4d3ce69a6
+corpus8	spdlog	/home/ttuser/ictmp/corpus8/manifest.txt	34	98384472	a6a4b0404427fa483a8143f98f830e833699c9bb1b356fceee899d7277bcb959
+corpus9	catch2	/home/ttuser/ictmp/corpus9/manifest.txt	857	947252235	ebd0367f21cd340b52dc0d7cbdd3d7d1f3d340de3e0c7d8af8be5a7d23501305
+corpus10	nlohmann-json	/home/ttuser/ictmp/corpus10/manifest.txt	99	293917707	2fe6eb460dc1597f021e36e5c7fa845f786b3425e77ff7231ef2f556a8cbaec7
+corpus11	range-v3	/home/ttuser/ictmp/corpus11/manifest.txt	259	632049016	f1ab9b5d43b1ca89b7f41324d421e38da4beab3b23bdf14d3e55f146cd352cc8
+corpus12	eigen	/home/ttuser/ictmp/corpus12/manifest.txt	650	3532268956	103821425d1e655df463ee83c65d23d480054154b92e64fb2d1e6b02e4bf4397
+corpus13	re2	/home/ttuser/ictmp/corpus13/manifest.txt	72	110231455	f1310c159b88ae3de4ae6ebd193be25b972a730ff7750a88d911638e076db663
+corpus14	leveldb	/home/ttuser/ictmp/corpus14/manifest.txt	72	143868249	012d8190a9be8d749f09ce14c6ad9619b058486b5a386269317a49b98c83fae6
+corpus15	simdjson	/home/ttuser/ictmp/corpus15/manifest.txt	153	468377342	958b2d061266dc8f218ee11a6c91ac617c4feecfee5cf0736431b7f17f7be8e8
+corpus16	cereal	/home/ttuser/ictmp/corpus16/manifest.txt	84	326899429	70fbf5eefdce86262606db48c522dc82fe594bd0f0552740e80b4a61d78786b7

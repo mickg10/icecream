@@ -1,0 +1,40 @@
+{
+  "artifacts": {
+    "/home/ttuser/issue16-p29-prefix-state/fixed16-corrected-v1/cells/corpus10/full/components.tsv": "964d4df70434d8639da6ea8c2d2cffee83da8b2afdc4b3596761a9f05e7e3bd2",
+    "/home/ttuser/issue16-p29-prefix-state/fixed16-corrected-v1/cells/corpus10/full/curve.tsv": "4cabb6167f683af7025102ec48ac780a4573edfb3bba5c5f5099a8cd31a8e1ce",
+    "/home/ttuser/issue16-p29-prefix-state/fixed16-corrected-v1/cells/corpus10/full/literal.wire": "729dd1ca81e47691080d1c0b74a51fda6d5e7cc83e8b73787dfb5b6be203094f",
+    "/home/ttuser/issue16-p29-prefix-state/fixed16-corrected-v1/cells/corpus10/prefix/components.tsv": "964d4df70434d8639da6ea8c2d2cffee83da8b2afdc4b3596761a9f05e7e3bd2",
+    "/home/ttuser/issue16-p29-prefix-state/fixed16-corrected-v1/cells/corpus10/prefix/curve.tsv": "4cabb6167f683af7025102ec48ac780a4573edfb3bba5c5f5099a8cd31a8e1ce",
+    "/home/ttuser/issue16-p29-prefix-state/fixed16-corrected-v1/cells/corpus10/prefix/literal.wire": "729dd1ca81e47691080d1c0b74a51fda6d5e7cc83e8b73787dfb5b6be203094f"
+  },
+  "components_identical": true,
+  "curve_identical": true,
+  "full_tus": 99,
+  "group_tus": 112,
+  "literal_frame_bytes": 298546,
+  "literal_frame_sha256": "729dd1ca81e47691080d1c0b74a51fda6d5e7cc83e8b73787dfb5b6be203094f",
+  "literal_frames": 1,
+  "plan_prefixes": {
+    "array-control": {
+      "prefix_bytes": 2175,
+      "prefix_sha256": "658c982b9a96ce43c863fdeb2194e72717ad4bbf706e2d282e5cdabbe64e1ebb"
+    },
+    "array-values": {
+      "prefix_bytes": 1464,
+      "prefix_sha256": "d1683a7cc5393b2a9e3023a78b7c5ee47053211c7fdbe35ad0a522bd5c569fd1"
+    },
+    "control": {
+      "prefix_bytes": 1247700,
+      "prefix_sha256": "356e9d3eb216b1c0880ea9aebdb12a9b6aa428332b41917dc18e7e54ba1a151f"
+    },
+    "literal": {
+      "prefix_bytes": 5830508,
+      "prefix_sha256": "2da40f73aec844bd1a8967ce891e0c9930634ada7e3f86b76bd2d4f673ba1ddd"
+    }
+  },
+  "prefix_mode": "complete-program",
+  "prefix_raw_bytes": 293917707,
+  "prefix_tus": 99,
+  "prefix_wire_bytes": 1011863,
+  "schema": "p29-prefix-identity-v1"
+}

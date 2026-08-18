@@ -1,0 +1,40 @@
+{
+  "artifacts": {
+    "/home/ttuser/issue16-p29-prefix-state/fixed16-corrected-v1/cells/corpus/full/components.tsv": "c365a591dcb62a3aba7d255693f2a95d2cae5c10f41aaeda6a71d91bcb142f07",
+    "/home/ttuser/issue16-p29-prefix-state/fixed16-corrected-v1/cells/corpus/full/curve.tsv": "585d8fd9ac0ec2deb2940649aedea17546f726a78c107d3d8cafc90187327173",
+    "/home/ttuser/issue16-p29-prefix-state/fixed16-corrected-v1/cells/corpus/full/literal.wire": "e566d2086b9fad6f31e6caae06c8ff64c259f24798e68124ed470071098a19ec",
+    "/home/ttuser/issue16-p29-prefix-state/fixed16-corrected-v1/cells/corpus/prefix/components.tsv": "aa9e7aeb613fa6d2945c174882dc34624d65a827d4d2d94a826a56bbbed66748",
+    "/home/ttuser/issue16-p29-prefix-state/fixed16-corrected-v1/cells/corpus/prefix/curve.tsv": "cf8a9c676919903e936068660436c3590dc23da7b7b7b3fa2489fb27dcf91c28",
+    "/home/ttuser/issue16-p29-prefix-state/fixed16-corrected-v1/cells/corpus/prefix/literal.wire": "5d54c575a78e6e5af5afc28fc121c69cc12f4214756bfa71ad3002c4c89456c9"
+  },
+  "components_identical": true,
+  "curve_identical": true,
+  "full_tus": 1238,
+  "group_tus": 112,
+  "literal_frame_bytes": 789070,
+  "literal_frame_sha256": "5d54c575a78e6e5af5afc28fc121c69cc12f4214756bfa71ad3002c4c89456c9",
+  "literal_frames": 1,
+  "plan_prefixes": {
+    "array-control": {
+      "prefix_bytes": 0,
+      "prefix_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "array-values": {
+      "prefix_bytes": 0,
+      "prefix_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "control": {
+      "prefix_bytes": 962975,
+      "prefix_sha256": "3338c2e3af78afe26d688dbcdeec8c45b36bae45b616809c451410dd1023d83d"
+    },
+    "literal": {
+      "prefix_bytes": 6107220,
+      "prefix_sha256": "6ab292c218071b39cf9f0d2bf2f24e69b10731725d4d660f35812b7ba4cb4475"
+    }
+  },
+  "prefix_mode": "suffix-blind",
+  "prefix_raw_bytes": 404433872,
+  "prefix_tus": 112,
+  "prefix_wire_bytes": 1381054,
+  "schema": "p29-prefix-identity-v1"
+}

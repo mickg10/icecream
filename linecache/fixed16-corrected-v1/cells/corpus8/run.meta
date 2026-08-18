@@ -1,0 +1,13 @@
+host=tt-quietbox
+cell_dir=
+source_manifest=/home/ttuser/ictmp/corpus8/manifest.txt
+total_tus=34
+prefix_tus=34
+prefix_mode=complete-program
+group_tus=112
+cores=0-31
+omp_num_threads=1
+p29_commit=56c1744d1ef8c3ee6ce0c785e80b2ea4123bb720
+libbsc_commit=baffa62c70b6ebbecc9af14ce550e965ea247680
+zstd_version=*** zstd command line interface 64-bits v1.4.8, by Yann Collet ***
+completed_utc=2026-08-18T05:51:20Z
