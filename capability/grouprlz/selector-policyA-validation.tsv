@@ -1,0 +1,3 @@
+project	profile	raw	p29_bytes	grz_bytes	min_bytes	winner	p29_gbps	grz_gbps	policyA_gbps	p29_gate	policyA_gate	grz_exact
+re2	debian-gcc	84637328	453331	362280	362280	GRZ2	0.110	0.529	0.109	P29_SLOW	POLICY_A_SLOW	YES
+rocksdb	debian-gcc	1804295565	2468928	2535516	2468928	P29BSC	0.330	1.080	0.330	P29_SLOW	POLICY_A_SLOW	YES

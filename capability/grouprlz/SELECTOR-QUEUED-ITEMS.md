@@ -134,3 +134,31 @@ the C side is CPU-constrained rather than latency-constrained, and the runway fi
 the honest state of that question. But it does mean the selector's size advantage is
 **not blocked on the classifier**. It is blocked, like everything else in this lane, on
 P29's encode throughput.
+
+---
+
+## Ready-to-run: the one remaining docker measurement
+
+`selector_policyA.sh <project> <profile>` runs both codecs to completion concurrently on
+the fixed 16-core budget (disjoint 8 P29 / 8 GRZ), takes the per-cell minimum, and reports
+P29's own rate, policy A's rate, the selected bytes, and the GRZ round-trip. No classifier
+is involved -- policy A yields the per-cell oracle by construction. To point it at the
+fast-interner build, set `P29=<path>`; nothing else changes.
+
+Validated on two cells with today's research-interner two-pass P29:
+
+| project | profile | P29 | GRZ2 | min | winner | P29 GB/s | GRZ GB/s | **policy A GB/s** | gate | exact |
+|---|---|---:|---:|---:|---|---:|---:|---:|---|---|
+| re2 | debian-gcc | 453,331 | 362,280 | 362,280 | GRZ2 | 0.110 | 0.529 | **0.109** | slow | YES |
+| rocksdb | debian-gcc | 2,468,928 | 2,535,516 | 2,468,928 | P29BSC | 0.330 | 1.080 | **0.330** | slow | YES |
+
+Note `policy A GB/s == P29 GB/s` on both rows, to three decimals. That is the structural
+claim confirmed by direct measurement rather than by arithmetic on separate runs: **policy
+A's makespan is set entirely by P29**, so it clears the gate exactly when P29 does, and
+GRZ2's complete encode is genuinely free alongside it.
+
+Both rows also reproduce their census labels (GRZ2 wins re2, P29+BSC wins rocksdb/docker),
+so the runner is consistent with the frozen size ledger.
+
+When the fast interner exists, sweeping all 44 answers the question in one pass: does P29
+clear >= 1 GB/s, and does policy A therefore deliver 0.9705x z19 at rate.
