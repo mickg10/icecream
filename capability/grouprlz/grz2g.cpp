@@ -244,6 +244,7 @@ static void init_gear(u64* T) {
 // ------------------------------------------------------------- encoder
 struct GroupStat {
     u64 idx, tu_lo, tu_hi, out_bytes, add_bytes, comp_bytes, hist_base, hist_extent;
+    u64 anchor_samples, anchor_occupied, anchor_usable, anchor_collisions, anchor_matches;
     const char* closed_by;
 };
 
@@ -323,6 +324,7 @@ static void encode(const char* in, const char* outp, const Cfg& cfg, const char*
         if (cfg.mode == MODE_G2) hist_base = gpos > cfg.hist ? gpos - cfg.hist : 0;
 
         u64 gnm = 0;
+        u64 ga_samples = 0, ga_occupied = 0, ga_usable = 0, ga_collisions = 0, ga_matches = 0;
         int retries = 0;
         std::vector<u8> probe_ll, probe_lit, probe_sd, probe_sd2, probe_ml;
         u64 probe_end = 0, probe_nm = 0;
@@ -332,6 +334,7 @@ static void encode(const char* in, const char* outp, const Cfg& cfg, const char*
             lits.clear(); ll.clear(); sd.clear(); sd2.clear(); ml.clear();
             undo.clear();
             gnm = 0;
+            ga_samples = ga_occupied = ga_usable = ga_collisions = ga_matches = 0;
             double a0 = now();
             u64 lit_start = gpos, prev_src_end = 0, prev_off = 0;
             const u64 end = s1;
@@ -342,12 +345,21 @@ static void encode(const char* in, const char* outp, const Cfg& cfg, const char*
                 for (;;) {
                     bool did = false;
                     if ((h & amask) == 0) {
+                        ga_samples++;
                         u32 slot = (u32)((h * 0x9E3779B97F4A7C15ull) >> (64 - tbits));
                         u64 rawv = tbl[slot];
                         u64 q = rawv ? rawv - 1 : 0;
+                        if (rawv) ga_occupied++;
                         bool usable = rawv && q < wp && q >= hist_base;
                         if (rawv && q < hist_base) stale++;   // released -- lazily replaced below
-                        if (usable && memcmp(d + q, d + wp, K) == 0) {
+                        bool anchor_equal = false;
+                        if (usable) {
+                            ga_usable++;
+                            anchor_equal = memcmp(d + q, d + wp, K) == 0;
+                            if (anchor_equal) ga_matches++;
+                            else ga_collisions++;
+                        }
+                        if (anchor_equal) {
                             // Forward extension bounded by the GROUP end: parsing this group
                             // never reads a byte at or past its own end.
                             u64 a = wp + K, c = q + K;
@@ -518,7 +530,8 @@ static void encode(const char* in, const char* outp, const Cfg& cfg, const char*
         tent += now() - e0;
 
         curves.push_back({gidx, tu_lo, tu_hi, gout, (u64)lits.size(), w.n - before,
-                          hist_base, gpos - hist_base, closed});
+                          hist_base, gpos - hist_base, ga_samples, ga_occupied, ga_usable,
+                          ga_collisions, ga_matches, closed});
         if (gout > max_group_out) max_group_out = gout;
 
         // G2: release everything below the NEXT group's history base on the encoder side too,
@@ -550,14 +563,19 @@ static void encode(const char* in, const char* outp, const Cfg& cfg, const char*
     if (curve) {
         FILE* cf = fopen(curve, "w");
         if (cf) {
-            fprintf(cf, "group\ttu_lo\ttu_hi\tout_bytes\tadd_bytes\tcomp_bytes\tratio\thist_base\thist_extent\tclosed_by\n");
+            fprintf(cf, "group\ttu_lo\ttu_hi\tout_bytes\tadd_bytes\tcomp_bytes\tratio\thist_base\thist_extent"
+                        "\tanchor_samples\tanchor_occupied\tanchor_usable\tanchor_collisions\tanchor_matches\tclosed_by\n");
             for (auto& g : curves)
-                fprintf(cf, "%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%.2f\t%llu\t%llu\t%s\n",
+                fprintf(cf, "%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%.2f\t%llu\t%llu"
+                            "\t%llu\t%llu\t%llu\t%llu\t%llu\t%s\n",
                         (unsigned long long)g.idx, (unsigned long long)g.tu_lo, (unsigned long long)g.tu_hi,
                         (unsigned long long)g.out_bytes, (unsigned long long)g.add_bytes,
                         (unsigned long long)g.comp_bytes,
                         g.comp_bytes ? (double)g.out_bytes / g.comp_bytes : 0.0,
-                        (unsigned long long)g.hist_base, (unsigned long long)g.hist_extent, g.closed_by);
+                        (unsigned long long)g.hist_base, (unsigned long long)g.hist_extent,
+                        (unsigned long long)g.anchor_samples, (unsigned long long)g.anchor_occupied,
+                        (unsigned long long)g.anchor_usable, (unsigned long long)g.anchor_collisions,
+                        (unsigned long long)g.anchor_matches, g.closed_by);
             fclose(cf);
         }
     }

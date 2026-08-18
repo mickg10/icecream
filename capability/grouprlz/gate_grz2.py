@@ -158,7 +158,10 @@ r = run([GRZ, "enc", P, WORK + "/add.grz", "-m", "g2", "-u", WORK + "/P.tu",
          "--gtu", "112", "--graw", "512", "--gadd", "4", "--hist", "512",
          "--retry-test", "1", "--curve", WORK + "/add.tsv"])
 rf = int(r.stderr.decode().split("retry_fail=")[1].split()[0])
-closed = [l.split("\t")[9].strip() for l in open(WORK + "/add.tsv").read().splitlines()[1:]]
+add_rows = open(WORK + "/add.tsv").read().splitlines()
+add_header = add_rows[0].split("\t")
+closed_index = add_header.index("closed_by")
+closed = [line.split("\t")[closed_index].strip() for line in add_rows[1:]]
 run([GRZ, "dec", WORK + "/add.grz", WORK + "/add.out", "-j", "1"])
 check("6 ADD cap fires + retry deterministic",
       rf == 0 and "add" in closed and sha(WORK + "/add.out") == sha(P),
