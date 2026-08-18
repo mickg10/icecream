@@ -37,24 +37,38 @@ file-load artifact is *excluded by where the clock starts*, not subtracted after
 
 **P29+BSC clears 1 GB/s on 4 of the 5 measured corpora** (rocksdb is the miss at 0.856).
 
-## The /goal row closes
+## The /goal row closes -- 5/5
 
-Taking, per corpus, the codec that is actually **selected** -- and both of its bars:
+Both codecs now measured on the **same in-memory basis** (the earlier table mixed P29's
+explicit in-memory clock with GRZ2 wall-clock figures from a different run; corrected):
 
-| corpus | selected | size / z19 (<= 1.10) | isolated C-encode (>= 1 GB/s) | |
-|---|---|---:|---:|---|
-| eigen | P29+BSC | **0.9215** PASS | **2.009** PASS | **both** |
-| llvm | P29+BSC | **0.9972** PASS | **1.158** PASS | **both** |
-| range-v3 | GRZ2 | **0.8484** PASS | 1.264 PASS | **both** |
-| catch2 | GRZ2 | **0.7821** PASS | 1.414 PASS | **both** |
-| rocksdb | GRZ2 | **0.8802** PASS | 1.056 PASS | **both** |
+| corpus | P29 wire | P29/z19 | P29 GB/s | GRZ2 wire | GRZ/z19 | GRZ2 GB/s |
+|---|---:|---:|---:|---:|---:|---:|
+| catch2 | 907,327 | 1.1332 | 1.456 | 626,178 | 0.7821 | 1.487 |
+| eigen | 1,143,631 | 0.9215 | 2.009 | 2,040,151 | 1.6439 | 1.541 |
+| llvm | 7,275,808 | 0.9972 | 1.158 | 7,638,087 | 1.0468 | 0.983 |
+| range-v3 | 739,437 | 0.9985 | 1.128 | 628,319 | 0.8484 | 1.294 |
+| rocksdb | 8,533,638 | 1.3765 | 0.856 | 5,456,878 | 0.8802 | 1.009 |
 
-GRZ2 rates are its measured wall-clock encode from the fixed-16 sweep, which still charges
-the mmap read, so they are conservative; encode-only in memory it aggregates 1.304 GB/s.
+Per codec, >= 1 GB/s on 4 of 5 each -- and **they miss on different corpora**: P29 misses
+rocksdb (0.856), GRZ2 misses llvm (0.983). The selector covers each other's gap.
 
-**On all five corpora the selected codec passes both bars in the same row.** That is the
-statement that was open: size within 10% of whole-program z19 *and* >= 1 GB/s isolated
-C-encode, on one identical row, for the codec actually shipped on that corpus.
+**Verdict, the selected codec and both of its bars:**
+
+| corpus | selected | sel / z19 | sel GB/s | BOTH_BARS_PASS |
+|---|---|---:|---:|:---:|
+| catch2 | GRZ2 | 0.7821 | 1.487 | **TRUE** |
+| eigen | P29+BSC | 0.9215 | 2.009 | **TRUE** |
+| llvm | P29+BSC | 0.9972 | 1.158 | **TRUE** |
+| range-v3 | GRZ2 | 0.8484 | 1.294 | **TRUE** |
+| rocksdb | GRZ2 | 0.8802 | 1.009 | **TRUE** |
+
+**5/5 pass both bars.** Selected total 15,130,814 B over 11,846,162,143 raw =
+**782.9x raw, 0.9295x z19**.
+
+That the two codecs fail on *different* corpora is the substantive point: neither alone
+clears both bars everywhere, and the per-cell minimum does. It is the same complementarity
+the size census found, now holding on the rate bar as well.
 
 ## Why this differs so much from the earlier 0.370 GB/s
 

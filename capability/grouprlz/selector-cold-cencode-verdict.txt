@@ -1,16 +1,27 @@
-COLD_1F_STICKY_CODEC -- direct isolated C-encode, in-memory producer, 3 reps each
+COLD_1F_STICKY_CODEC -- isolated cold C-encode, in-memory producer, 3 reps, uncontended
 
-  corpus              raw    P29 wire      /z19 C_enc GB/s GRZ wire   GRZ/z19 selected 
-  range-v3      632049016      739437    0.9985     1.128   628319    0.8484 GRZ2     
-  catch2        947252235      907327    1.1332     1.456   626178    0.7821 GRZ2     
-  rocksdb      3114320596     8533638    1.3765     0.856  5456878    0.8802 GRZ2     
-  eigen        3532268956     1143631    0.9215     2.009  2040151    1.6439 P29+BSC  
-  llvm         3620271340     7275808    0.9972     1.158  7638087    1.0468 P29+BSC  
+  P29 clock  = C_encode_ready (bytes resident -> last payload fully encoded),
+               an explicit timestamp pair, nothing subtracted.
+  GRZ2 clock = the codec's own ENC timer over a page-cache-warm mmap -- the same
+               bytes-already-in-memory basis. Both exclude any file-read artifact.
 
-Traceback (most recent call last):
-  File "<stdin>", line 16, in <module>
-  File "<stdin>", line 16, in <genexpr>
-  File "/usr/lib/python3.10/statistics.py", line 449, in median
-    data = sorted(data)
-  File "<stdin>", line 16, in <genexpr>
-NameError: name 'C_encode_GBps' is not defined
+  corpus              raw   P29 wire   P29/z19  P29 GB/s  GRZ2 wire   GRZ/z19  GRZ GB/s
+  catch2        947252235     907327    1.1332     1.456     626178    0.7821     1.487
+  eigen        3532268956    1143631    0.9215     2.009    2040151    1.6439     1.541
+  llvm         3620271340    7275808    0.9972     1.158    7638087    1.0468     0.983
+  range-v3      632049016     739437    0.9985     1.128     628319    0.8484     1.294
+  rocksdb      3114320596    8533638    1.3765     0.856    5456878    0.8802     1.009
+
+  FINAL VERDICT -- the SELECTED codec and BOTH its bars
+
+  corpus     selected      sel/z19     sel GB/s BOTH_BARS_PASS
+  catch2     GRZ2           0.7821        1.487 TRUE
+  eigen      P29+BSC        0.9215        2.009 TRUE
+  llvm       P29+BSC        0.9972        1.158 TRUE
+  range-v3   GRZ2           0.8484        1.294 TRUE
+  rocksdb    GRZ2           0.8802        1.009 TRUE
+
+  AGGREGATE: 5/5 corpora pass BOTH bars (size <= 1.10x z19 AND C-encode >= 1 GB/s)
+  selected total 15130814 B over 11846162143 raw = 782.9x raw, 0.9295 x z19
+
+  Per-codec >= 1 GB/s: P29 4/5, GRZ2 4/5
