@@ -678,9 +678,6 @@ public:
     if (!cap::write_all(fd_, header, sizeof header) ||
         (length && !cap::write_all(fd_, bytes.data(), length)))
       return false;
-    uint8_t accepted = 0;
-    if (!cap::read_all(ack_fd_, &accepted, 1) || accepted != 1)
-      return false;
     transferred += length;
     ++tus;
     return true;
@@ -694,12 +691,31 @@ public:
       header[byte] = 0xff;
     bool sent = cap::write_all(fd_, header, sizeof header);
     close(fd_);
+    fd_ = -1;
+    uint64_t acknowledgements = 0;
+    std::array<uint8_t, 4096> values{};
+    bool repliesExact = true;
+    for (;;) {
+      ssize_t count = read(ack_fd_, values.data(), values.size());
+      if (count < 0 && errno == EINTR)
+        continue;
+      if (count < 0) {
+        repliesExact = false;
+        break;
+      }
+      if (!count)
+        break;
+      acknowledgements += uint64_t(count);
+      for (ssize_t index = 0; index < count; ++index)
+        repliesExact = repliesExact && values[size_t(index)] == 1;
+    }
     close(ack_fd_);
-    fd_ = ack_fd_ = -1;
+    ack_fd_ = -1;
     int status = 0;
     waitpid(pid_, &status, 0);
     pid_ = -1;
-    return sent && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    return sent && repliesExact && acknowledgements == tus &&
+           WIFEXITED(status) && WEXITSTATUS(status) == 0;
   }
 
   uint64_t transferred = 0, tus = 0;
@@ -1206,6 +1222,7 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
 
   std::vector<CurveRow> curve;
   curve.reserve(manifest.paths.size());
+  std::vector<PreparedFill> fills(options.wave);
   uint64_t rawTotal = 0, preparedAccepted = 0, committed = 0,
            decodeRejected = 0, aborted = 0;
   double transformSeconds = 0;
@@ -1299,12 +1316,14 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
     if (!relationshipExact)
       break;
 
-    std::vector<PreparedFill> fills(pending.size());
     phaseBegin = Clock::now();
     for (size_t index = 0; index < pending.size(); ++index) {
       auto &job = pending[index];
       auto &worker = workers[job.worker];
       auto &fill = fills[index];
+      fill.paths.clear();
+      for (size_t part = 0; part < 4; ++part)
+        encoder.mixedRaw[part].swap(fill.raw[part]);
       auto materializeBegin = Clock::now();
       if (!job.prepared->dictionary ||
           job.prepared->dictionary->region_count() != job.prepared->nreg) {
@@ -1339,7 +1358,7 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
       }
       worker.mirror.path_count = uint32_t(encoder.paths.size());
       for (size_t part = 0; part < 4; ++part)
-        fill.raw[part] = encoder.mixedRaw[part];
+        encoder.mixedRaw[part].swap(fill.raw[part]);
       transformSeconds += seconds_since(materializeBegin);
     }
     coordinatorTiming.materialize += seconds_since(phaseBegin);
@@ -1364,7 +1383,8 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
     const double encodeWaveSeconds = seconds_since(encodeWaveBegin);
     transformSeconds += encodeWaveSeconds;
     coordinatorTiming.encode += encodeWaveSeconds;
-    for (const auto &fill : fills) {
+    for (size_t index = 0; index < pending.size(); ++index) {
+      const auto &fill = fills[index];
       components[CK_PATH].note(fill.encoded_paths);
       for (size_t part = 0; part < 4; ++part)
         components[CK_CONTROL + part].note(fill.encoded[part]);
