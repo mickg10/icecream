@@ -35,6 +35,28 @@ wire (794,922-803,799) is **larger than P29+BSC's** (698,032-715,752). If P29 we
 rate-legal there it would be the better choice; it is not, so on spdlog the real options
 are a 59%-larger wire or a missed deadline. That is an owner call, not a codec one.
 
+### Scope: this is the isolated-single-build case only
+
+Everything above assumes each cell is encoded by its own short-lived process, so the
+per-invocation setup is paid once per build and cannot be spread. The cost model measured
+earlier says exactly what happens when it can be:
+
+```
+frozen GRZ2 encode:  time = 0.2241 s + raw / 1.575 GB/s
+```
+
+In a streaming farm -- a long-lived encoder handling job after job -- the 0.2241 s setup
+is paid once for the daemon, not once per build, so each corpus is charged only its
+marginal term and every cell encodes at the asymptotic **1.575 GB/s** regardless of size.
+Under that deployment **the frozen GRZ2 policy is rate-legal on all 44 cells and the third
+candidate is not needed at all**, along with its +1,755,364 bytes.
+
+So the third candidate is a fix for one specific deployment shape: isolated builds, each
+paying their own setup. The spdlog dilemma -- a 59%-larger wire or a missed deadline --
+exists only in that shape. In a streaming farm spdlog ships the frozen wire at full rate
+and the question does not arise. Worth settling which deployment the gate is meant to
+describe before paying any size for it.
+
 ## 3. TU100 / TU200 chronological checkpoints
 
 What each codec would actually have emitted by TU N, measured by encoding the real
