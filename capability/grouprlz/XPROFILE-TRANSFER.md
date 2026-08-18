@@ -82,9 +82,26 @@ Three things follow:
    cells are 1.2–3.1× larger raw than the same project's gcc cells (catch2 873 MB → 2.66 GB,
    re2 85 MB → 217 MB, leveldb 175 MB → 322 MB).
 
-**Deployment read:** key shared history by **(compiler, standard library)** — not by "system", and
-not by project. Two gcc images that differ only in libstdc++ minor version share almost as little
-as a gcc and a clang image do.
+## Deployment consequence: key shared history by (compiler, standard library)
+
+The cache key for the online tier's shared history should be the pair **(compiler, standard
+library)** — not "system", not distro, and not project. Two gcc images differing only in
+libstdc++ minor version share almost as little as a gcc and a clang image do, so an
+`is-it-gcc?` or `is-it-Debian?` key will merge histories that have ~35 % of their content in
+common and will keep paying most of the cold-start cost on every build. A profile is warm only
+against itself.
+
+### This also reframes the selector regime: most cells are small
+
+Cell sizes in the authoritative matrix are heavily skewed toward **small**: fmt 51 TU, re2 72,
+cereal 80, leveldb 94, nlohmann-json 99, spdlog 168 — **6 of 11 projects are ≤ 200 TUs** — against
+rocksdb 418, range-v3 537, catch2 861, opencv 1500, eigen 1516. Combined with per-(compiler,
+stdlib) keying, the common deployment case is therefore a **small corpus against a cold or
+weakly-related history**, not a large corpus riding a warm one. Selector and codec choices tuned
+on the eigen/opencv end of the range are tuned on the minority of the matrix.
+
+(These are the verified-44 counts. An earlier revision of this study quoted spdlog at 8 TUs and
+re2 at 22 — those came from the superseded package described below and should not be used.)
 
 ### Per-project spread
 
@@ -94,9 +111,29 @@ are their own headers, which survive a toolchain change. **range-v3 (28.9/29.2 %
 worst.** rocksdb, opencv, catch2, cereal, leveldb, nlohmann-json, re2 and fmt fill the 11–43 %
 band. Full per-row detail in `xprofile-transfer.tsv`.
 
-## Cross-*project* transfer is strictly worse, and we already measured it
+## The two-tarball trap — read this before touching a matrix cell
 
-Not re-run here, deliberately. `GENERIC-DICT-COLDSTART.md` (commit c1daf4e) measured the
+Every cell directory contains **two** tarballs of different vintages, and the older one sorts
+first under a `*.ii.tar.zst` glob:
+
+| file | vintage | example counts |
+|---|---|---|
+| `ii.tar.zst` | **CURRENT** — declared by `corpus.json` (`schema: ice-ii-corpus-v1`), agrees with `raw-manifest.txt` and with local-oracle's `verified-44-cells.tsv` | rocksdb 418 TU, catch2 861 |
+| `<project>-<profile>.ii.tar.zst` | **older, superseded** | rocksdb 367 TU, catch2 107 |
+
+**Rule: resolve the payload from `corpus.json` → `payload.path`, verify its SHA-256 against
+`payload.sha256`, and use the `manifest.tsv` that is the *sibling of the declared payload*. Never
+glob `*.ii.tar.zst`.** The older package also carries its own internal manifest, so reading "the
+manifest inside the tar" silently yields the superseded TU set with no error anywhere.
+
+An earlier revision of this study (commit 3f3766b) fell into exactly that trap and measured the
+superseded package. Everything on this page is from the declared payloads, verified cell by cell.
+That revision also claimed `raw-manifest.txt` was stale; **that claim was wrong and is
+retracted** — `raw-manifest.txt` agreed with the current cells all along.
+
+## Cross-*project* transfer: definitively closed, not measured
+
+Deliberately **not** run, and no further compute will be spent on it. `GENERIC-DICT-COLDSTART.md` (commit c1daf4e) measured the
 cross-project case directly: a 23.6 MB generic dictionary trained on 21.4 GiB of 12 disjoint
 projects closes **5.0 %** of RocksDB's bootstrap, **10.0 %** of Abseil's, **1.8 %** of Firefox's
 and **0.7 %** of LLVM-full's. That study showed the binding constraint is **distinct-line
@@ -104,6 +141,11 @@ coverage** — `gap_closed` tracked it almost exactly — and the same constrain
 different project shares far fewer lines with the target than the *same* project built with a
 different toolchain does, so cross-project transfer is bounded below the 20–39 % measured on this
 page. Both results are the same mechanism seen at two distances.
+
+**A generic dictionary trained under one toolchain and tested on a cell built under another
+combines both weak effects — a coverage-bound cross-project prior *and* a cross-toolchain
+penalty — so it is provably near-zero and measuring it would only re-confirm two results we
+already hold.** The transfer lane is closed.
 
 ## Method
 
@@ -161,12 +203,11 @@ Every row of `xprofile-transfer.tsv` is re-derivable from that file alone.
   `ice-ii-corpus-v1` cell; it is carried from the legacy `abseil-<profile>.ii.tar.zst` archive,
   labelled in the `corpus_set` column and **excluded from every aggregate above**. Its rows sit
   squarely inside the verified-44 band (16.5–35.7 %).
-* An earlier revision of this study (commit 3f3766b) measured the **wrong archives** — the
-  earlier partial `<project>-<profile>.ii.tar.zst` packings rather than the authoritative
-  `ii.tar.zst` — giving 107 TUs for catch2 instead of 861, 367 for rocksdb instead of 418, 8 for
-  spdlog instead of 168. Every number on this page is from the verified payloads. That revision
-  also claimed `raw-manifest.txt` was stale; **that claim was wrong and is retracted** —
-  `raw-manifest.txt` agreed with the authoritative cells all along.
+* Superseded-corpus history is covered above under "The two-tarball trap"; commit 3f3766b's
+  numbers are void.
+* An earlier revision of the padding helper truncated the pad when the prior had fewer TUs than
+  the pad length, silently misaligning the smallest projects. Fixed (cycle-pad) before this sweep;
+  every number here is post-fix.
 * `warm_sameprofile` is an *identical* rebuild — the true floor. A realistic incremental rebuild
   sits above it, which would raise every `gap_closed` slightly without changing any ordering.
 
