@@ -1,0 +1,12 @@
+# Second GRZ2 candidate: same frozen G2 policy, size-keyed encode parameters.
+# raw >  256 MB : -b 2 -j 16                      (2 MiB literal blocks)
+# raw <= 256 MB : -b 1 -t 16 -s 8 --hist 32 -j 16 (also shrinks index + history ring)
+# C rates are the codec internal encode timer (same basis as g2-fixed112-fixed16.tsv).
+# id	bytes	C_med_codec	C_min_codec	C_med_wall	F_1T	policy
+corpus3	6730947	1.2038	1.1979	1.1545	0.7186	b2-j16
+corpus15	993865	1.4346	1.4151	1.3010	0.3444	b2-j16
+corpus10	780245	1.2066	0.8936	1.1305	0.1970	b2-j16
+corpus14	517256	1.1697	1.1267	1.1067	0.2052	b1-t16-s8-h32
+corpus13	421830	1.0909	0.9327	1.0021	0.1668	b1-t16-s8-h32
+corpus7	712090	1.0682	1.0317	0.9739	0.1938	b1-t16-s8-h32
+corpus8	460224	1.0738	1.0063	0.9838	0.1488	b1-t16-s8-h32

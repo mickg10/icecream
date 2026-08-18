@@ -1,0 +1,47 @@
+# frozen policy, C AND F>=500MB/s gates: bytes=73516663  over_z19=0.7668  x_raw=388.41  wins={'P29BSC': 12, 'GRZ2': 4, 'GRZ2_tuned': 0}
+#   400x needs <= 71386679 B -> SHORT by 2129984 B
+# +tuned GRZ2, C gate only, codec timer (median): bytes=71381415  over_z19=0.7445  x_raw=400.03  wins={'P29BSC': 3, 'GRZ2': 6, 'GRZ2_tuned': 7}
+#   400x needs <= 71386679 B -> CLEARS by 5264 B
+# +tuned GRZ2, C gate only, codec timer (min of reps): bytes=71624963  over_z19=0.7471  x_raw=398.67  wins={'P29BSC': 5, 'GRZ2': 6, 'GRZ2_tuned': 5}
+#   400x needs <= 71386679 B -> SHORT by 238284 B
+# +tuned GRZ2, C gate only, process wall clock: bytes=71619235  over_z19=0.7470  x_raw=398.70  wins={'P29BSC': 5, 'GRZ2': 6, 'GRZ2_tuned': 5}
+#   400x needs <= 71386679 B -> SHORT by 232556 B
+# +tuned GRZ2, C AND F>=500MB/s gates, codec timer: bytes=72374125  over_z19=0.7549  x_raw=394.54  wins={'P29BSC': 11, 'GRZ2': 4, 'GRZ2_tuned': 1}
+#   400x needs <= 71386679 B -> SHORT by 987446 B
+# --- 10 corpora with >= 100 TUs only ---
+#   causal   bytes=69472902 over_z19=0.7518 x_raw=395.05
+#   hindsight bytes=67872622 over_z19=0.7344 x_raw=404.36
+# raw_total=28554671510  wp_z19_total=95872989
+# GRZ2_only   bytes=90616449  over_z19=0.9452  x_raw=315.12
+# P29BSC_only bytes=78568007  over_z19=0.8195  x_raw=363.44
+# HINDSIGHT_min bytes=71028967  over_z19=0.7409  x_raw=402.01
+# CAUSAL selector (full C cost): bytes=73371053  over_z19=0.7653  x_raw=389.18  wins={'GRZ2': 6, 'P29BSC': 10}
+# CAUSAL selector (published C basis): bytes=73371053  over_z19=0.7653  x_raw=389.18  wins={'GRZ2': 6, 'P29BSC': 10}
+# P29+BSC 1 GB/s FLOOR misses (full C cost): 16/16
+#   llvm: full C=0.742 GB/s (published proxy said 4.056)
+#   rocksdb: full C=0.647 GB/s (published proxy said 3.536)
+#   duckdb: full C=0.524 GB/s (published proxy said 1.809)
+#   abseil: full C=0.701 GB/s (published proxy said 4.323)
+#   opencv: full C=0.824 GB/s (published proxy said 6.611)
+#   godot: full C=0.417 GB/s (published proxy said 0.988)
+#   fmt: full C=0.307 GB/s (published proxy said 0.995)
+#   spdlog: full C=0.311 GB/s (published proxy said 1.091)
+#   catch2: full C=0.735 GB/s (published proxy said 5.698)
+#   nlohmann-json: full C=0.461 GB/s (published proxy said 1.741)
+#   range-v3: full C=0.694 GB/s (published proxy said 4.375)
+#   eigen: full C=0.937 GB/s (published proxy said 15.124)
+#   re2: full C=0.351 GB/s (published proxy said 1.268)
+#   leveldb: full C=0.361 GB/s (published proxy said 1.420)
+#   simdjson: full C=0.556 GB/s (published proxy said 2.577)
+#   cereal: full C=0.617 GB/s (published proxy said 3.407)
+# selected-codec F<500 MB/s single thread: 3/16
+#   godot: P29BSC F=0.436 GB/s
+#   range-v3: GRZ2 F=0.427 GB/s
+#   cereal: GRZ2 F=0.246 GB/s
+# GRZ2 smaller but rate-illegal: duckdb costs +1297448 B (GRZ2 C=0.807 GB/s)
+# GRZ2 smaller but rate-illegal: fmt costs +269961 B (GRZ2 C=0.426 GB/s)
+# GRZ2 smaller but rate-illegal: spdlog costs +41806 B (GRZ2 C=0.518 GB/s)
+# GRZ2 smaller but rate-illegal: nlohmann-json costs +266299 B (GRZ2 C=0.773 GB/s)
+# GRZ2 smaller but rate-illegal: re2 costs +34916 B (GRZ2 C=0.580 GB/s)
+# GRZ2 smaller but rate-illegal: leveldb costs +128824 B (GRZ2 C=0.553 GB/s)
+# GRZ2 smaller but rate-illegal: simdjson costs +302832 B (GRZ2 C=0.918 GB/s)
