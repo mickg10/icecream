@@ -59,9 +59,26 @@ for c in sys.argv[1:]:
             fclosed[int(g[fidx["tu_hi"]]) - 1] = frun
         fine_total = int(open(W + "/%s.grz2fine.out" % c).read().split("\t")[1])
 
+    # P29 line-interning per-TU wire (cap_m5, workers=1) with its Root/Need/Fill split
+    M5 = os.path.expanduser("~/selbind/m5split/runs/%s.w1.tsv" % c)
+    p29 = []
+    if os.path.exists(M5):
+        p29 = [l.split("\t") for l in open(M5).read().splitlines()[1:]]
+        if len(p29) != len(frows):
+            print("  P29 LENGTH MISMATCH %s: %d vs %d" % (c, len(p29), len(frows)),
+                  file=sys.stderr)
+            p29 = []
+        else:
+            for i, r in enumerate(p29):
+                if int(r[3]) != int(frows[i][1]):
+                    print("  P29 AXIS MISMATCH %s at tu %d" % (c, i), file=sys.stderr)
+                    p29 = []
+                    break
+
     out = [("tu\traw\tcumulative_raw\tfastintern_wire\tfastintern_cum_wire\t"
             "grz2_cum_wire\tgrz2_group\tgrz2_group_closes\tfastintern_ratio\tgrz2_ratio\t"
-            "grz2_fine_cum_wire")]
+            "grz2_fine_cum_wire\tp29_wire\tp29_cum_wire\tp29_ratio\t"
+            "p29_b_root\tp29_b_need\tp29_b_fill")]
     cum, grp, n, fcum = 0, -1, len(frows), 0
     for i, f in enumerate(frows):
         raw, cr, fw, fc = int(f[1]), int(f[3]), int(f[2]), int(f[4])
@@ -74,12 +91,19 @@ for c in sys.argv[1:]:
             cum += grz_total - group_sum      # stream framing owned by no group
             if fine_total:
                 fcum += fine_total - frun
-        out.append("%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%.2f\t%s\t%d"
+        if p29:
+            pw, pc = int(p29[i][4]), int(p29[i][7])
+            ptail = "\t%d\t%d\t%.2f\t%s\t%s\t%s" % (
+                pw, pc, cr / pc if pc else 0, p29[i][8], p29[i][9], p29[i][10])
+        else:
+            ptail = "\tNA\tNA\tNA\tNA\tNA\tNA"
+        out.append("%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%.2f\t%s\t%d%s"
                    % (i, raw, cr, fw, fc, cum, grp, 1 if hit else 0,
-                      cr / fc if fc else 0, "%.2f" % (cr / cum) if cum else "NA", fcum))
+                      cr / fc if fc else 0, "%.2f" % (cr / cum) if cum else "NA", fcum, ptail))
     path = W + "/%s.learning-curve.tsv" % c
     open(path, "w").write("\n".join(out) + "\n")
     print("%-9s %-9s TUs=%d  fast_total=%d (%.1fx)  grz2_total=%d (%.1fx)  framing=%d"
           % (c, NM.get(c, c), n, int(frows[-1][4]), int(frows[-1][3]) / int(frows[-1][4]),
              cum, int(frows[-1][3]) / cum, grz_total - group_sum)
-          + ("  fine(gtu8)=%d (+%.1f%%, %d pts)" % (fine_total, (fine_total / cum - 1) * 100, len(fclosed)) if fine_total else ""))
+          + ("  fine(gtu8)=%d (+%.1f%%, %d pts)" % (fine_total, (fine_total / cum - 1) * 100, len(fclosed)) if fine_total else "")
+          + ("  p29=%d (%.1fx)" % (int(p29[-1][7]), int(frows[-1][3]) / int(p29[-1][7])) if p29 else "  p29=MISSING"))
