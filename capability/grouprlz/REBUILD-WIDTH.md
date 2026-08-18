@@ -4,6 +4,12 @@ The cold build pays 2.40x–17.36x to open 30 cache domains instead of one. **Th
 pays nothing — if the routing pins.** That is the closing piece of the daemon lane: the
 cost of a wide farm is paid once, on the cold build, not on every build after it.
 
+**Scope of "paid once".** That claim is measured for exactly one case: an *identical*
+second pass, same C generation, retained F cache, no eviction and no restart, same
+placement, no input change. Header changes, cache spill or eviction, daemon restart, and a
+changed definition closure are **separate acceptance rows that this arm does not cover** —
+each could reintroduce cost on the second build, and none is measured here.
+
 `--repetitions 2`: TUs `[0,N)` are the cold build, `[N,2N)` the rebuild. `sticky` hashes
 each file to a fixed daemon so a rebuild returns to it; `roundrobin` indexes the
 concatenated sequence, so `N mod M ≠ 0` shifts files onto other daemons — a scheduler that
@@ -36,15 +42,17 @@ does not pin. All wire figures are the **direction-exact C→F** measure.
 | cereal | 37,713 | 342,951 | +809.37% | 17.36x |
 | **MEDIAN** | | | **+0.69%** | **6.32x** |
 
-**Six of eight corpora pay under 1.1% to spread a pinned rebuild across 30 cache domains,
-against 2.40x–12.19x for the same width on the cold build.** The mean growth of 117% is
-carried entirely by cereal; the median is +0.69%, which is the number that describes the
-behaviour.
+**Five of eight corpora pay under 1.1% to spread a pinned rebuild across 30 cache domains**
+— eigen, godot, llvm, rocksdb and range-v3 — **against 2.40x–12.19x for the same width on
+the cold build.** The mean growth of 117% is carried entirely by cereal; the median is
++0.69%, which is the number that describes the behaviour.
 
-The two exceptions are the small, highly redundant corpora — cereal (84 TUs, 2.8 per
-domain at M=30) and catch2 — where a narrower domain has seen less history and every later
-reference is therefore longer. Same reference-vocabulary effect as the earlier rebuild arm,
-and the same corpora.
+There are **three** material exceptions, and they are not one phenomenon: cereal +809.37%,
+catch2 +102.67%, and duckdb +24.01%. cereal and catch2 fit the reference-vocabulary effect
+seen in the earlier rebuild arm — small and highly redundant, so a narrower domain has seen
+less history and every later reference is longer. **duckdb is neither small nor highly
+redundant** (689 TUs, 280x whole-program compressibility) and sits at a distinctly milder
++24%; it is a separate, unexplained case rather than more of the same.
 
 ## What pinning is worth, at each binding width
 
@@ -65,7 +73,7 @@ C→F rebuild wire saved by pinning against a non-pinning scheduler:
 At M=1 pinning is definitionally free — there is only one daemon. Its value grows with
 width precisely because width is what it protects against.
 
-## Definition requests: pinning drives them to zero
+## Definition bodies: pinning drives them to zero
 
 Missing regions requested during the rebuild:
 
@@ -80,9 +88,14 @@ Missing regions requested during the rebuild:
 | llvm | 0 | 0 | 0 | 0 | 97,922 |
 | godot | 0 | 0 | 0 | 0 | 223,225 |
 
-**Exactly zero, at every width, on every corpus.** A pinned rebuild asks for no definitions
-at all — the residual wire is pure reference stream. That is the cleanest statement of what
-affinity buys, and it is why the width penalty disappears.
+**Exactly zero, at every width, on every corpus.** A pinned rebuild transfers **zero
+definition bodies and issues zero missing-region requests**. That is the cleanest statement
+of what affinity buys, and it is why the width penalty disappears.
+
+**Fill is not literally zero, and the residual is not a pure reference stream.** `p2_cf_fill`
+retains Fill framing and empty-Fill envelopes even when no body is carried — 1,636 B on
+cereal at M=1, 64,934 B on godot at M=30. The accurate form is: the residual wire is
+**Root/reference plus framing and control**, with no definition bodies in it.
 
 ## Putting the lane together
 
@@ -95,6 +108,10 @@ The two levers are complementary and each is nearly worthless in the other's reg
 scheduler should choose width from the cold build's marginal price and pin from the first
 build onward, because pinning costs nothing when it is not needed and removes the width
 penalty when it is.
+
+The rebuild column carries the scope above: identical second pass, retained cache, no
+eviction or restart, no input change. Read it as the best case a pinned rebuild can reach,
+not as the cost of an arbitrary next build.
 
 ## Gate, and one honest exception
 
