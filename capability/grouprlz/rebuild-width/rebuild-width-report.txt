@@ -1,0 +1,53 @@
+REBUILD AT THE BINDING WIDTHS -- C->F wire of the second build
+
+  M=1 is M_min(30) for c_f=30, M=4 for c_f=8, M=8 for c_f=4, M=30 for c_f=1.
+
+  corpus        cold build            M=1        M=4 pin        M=8 pin       M=30 pin
+  cereal           1108663          37713         274407         323420         342951
+  range-v3         1794125        1384037        1384281        1384817        1398472
+  catch2           2304168         501002         805199         903594        1015363
+  eigen            3246486        8632891        8632956        8633106        8635259
+  duckdb          12614525        3197820        3706523        3845592        3965705
+  rocksdb         14336931        8594654        8606828        8608228        8623711
+  llvm            14439911        8553352        8553734        8555416        8570845
+  godot           62579303       10815748       10815947       10817470       10834451
+
+WITH PINNING THE REBUILD IS WIDTH-INDEPENDENT  (M=30 vs M=1)
+
+  corpus         M=1 pin     M=30 pin     growth    cold M=30 x
+  cereal           37713       342951    809.37%         17.36x
+  range-v3       1384037      1398472      1.04%         10.04x
+  catch2          501002      1015363    102.67%          8.12x
+  eigen          8632891      8635259      0.03%         12.19x
+  duckdb         3197820      3965705     24.01%          4.25x
+  rocksdb        8594654      8623711      0.34%          3.61x
+  llvm           8553352      8570845      0.20%          4.52x
+  godot         10815748     10834451      0.17%          2.40x
+  MEAN                                   117.23%
+
+PINNING vs NOT, AT EACH BINDING WIDTH  (C->F wire saved by pinning)
+
+  corpus           M=1        M=4        M=8       M=30
+  cereal          0.0%     -22.9%     -63.4%     -62.1%
+  range-v3        0.0%     -21.0%     -36.4%     -67.6%
+  catch2          0.0%     -42.5%     -67.0%     -80.6%
+  eigen           0.0%      -6.4%      -9.5%     -35.3%
+  duckdb          0.0%     -72.1%     -73.0%     -78.2%
+  rocksdb         0.0%     -46.3%     -48.0%     -52.4%
+  llvm            0.0%     -48.8%     -52.0%     -64.2%
+  godot           0.0%     -83.7%     -84.5%     -88.1%
+  MEAN            0.0%     -42.9%     -54.2%     -66.1%
+
+DEFINITION REQUESTS ON THE REBUILD  (missing regions; pinning should be zero)
+
+  corpus       M=1 pin    M=4 pin    M=8 pin   M=30 pin  M=30 no-pin
+  cereal             0          0          0          0         1930
+  range-v3           0          0          0          0        26091
+  catch2             0          0          0          0        45343
+  eigen              0          0          0          0        34996
+  duckdb             0          0          0          0       232847
+  rocksdb            0          0          0          0       659011
+  llvm               0          0          0          0        97922
+  godot              0          0          0          0       223225
+
+  gate: ALL PASS;  carry_undirected total = 194
