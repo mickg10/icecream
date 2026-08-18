@@ -1,0 +1,27 @@
+{
+  "development_input_sha256": {
+    "development": "b0ab8ed4da76bf0222db136f74ed3f919bc27779d27e9b76c40864ddfe527c90",
+    "fixed_grz_complete": "b6fa4b32d38494c39b88ccaec76d579a4e6bce6675d57e3367084f1a5e211ea4",
+    "fixed_grz_probe": "599bd8ae51147422d2103e49a99b28c0aa7ef8acad6de5db281002321a7fc4cf",
+    "fixed_p29": "e3242606b8f72c6b289a102cde4560068dbfecab36b13db402445c1af219c246"
+  },
+  "high_raw_bytes": 500000000,
+  "holdout_projects": [
+    "gcc",
+    "firefox",
+    "qt6",
+    "clickhouse",
+    "pytorch",
+    "folly",
+    "arrow",
+    "bitcoin",
+    "v8"
+  ],
+  "low_raw_bytes": 200000000,
+  "max_p29_root_missing_wire_fraction": 0.05,
+  "max_p29_trajectory": 0.3,
+  "min_p29_literal_wire_fraction": 0.57,
+  "probe_tus": 112,
+  "schema": "causal-selector-policy-v1",
+  "status": "frozen-before-native9-holdout"
+}
