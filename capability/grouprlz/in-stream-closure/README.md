@@ -177,3 +177,42 @@ Consequences, stated conservatively:
 Fixing it means emitting USED_KEYS as a real C→F frame and charging it — a change to
 `production-fused.cpp`, not to the harness. Flagged rather than started, since it changes a
 published line and the P29 work is queued ahead of it.
+
+## PER-TU EMISSION: the correct transport, and what it costs
+
+The owner is right that `--gtu 112` is not a legal transport. A compile farm dispatches each
+TU the moment it is produced; the codec cannot hold 112 TUs before emitting, because the
+remote cannot wait for a group to close.
+
+Re-run with **`--gtu 1`** — one frame per TU, emitted immediately — while **retaining
+matcher, history and dictionary state across TUs**, so the cross-TU long-range dedup is
+untouched and only the emission granularity changes. `--build-tus N` still marks the build
+closes, and the two are compatible: each build is N per-TU frames, the last of which is the
+build close.
+
+Frame counts confirm it: 288 / 204 / 320 / 376 frames for 4x72 / 4x51 / 4x80 / 4x94 TUs —
+**exactly one frame per TU**, against 4 frames for the grouped run. The 4-build per-TU stream
+**decodes EXACT**.
+
+| cell | TUs/build | build 1 | build 2 | build 3 | build 4 | cost vs `--gtu 112` |
+|---|---:|---:|---:|---:|---:|---:|
+| re2 | 72 | 430,143 | 14,076 | 14,076 | 14,112 | **1.30x** |
+| fmt | 51 | 682,565 | 8,820 | 8,820 | 8,856 | **1.19x** |
+| cereal | 80 | 438,330 | 12,088 | 12,088 | 444,132 | **1.69x** |
+| leveldb | 94 | 774,297 | 13,872 | 13,875 | 13,911 | **1.31x** |
+
+**Per-TU framing costs 1.19-1.69x the grouped wire** — the price of emitting immediately.
+
+**But the cross-TU win survives intact**, which is the important part: a warm rebuild is
+still ~3% of its cold build (re2 14,076 against 430,143). The long-range history match is
+doing its job; what is lost is only intra-group batching and the per-frame overhead, now
+paid once per TU instead of once per 112. On re2 that is ~195 B/TU warm against ~10 B/TU
+grouped — the same ~185 B/TU frame cost, charged 72 times instead of once.
+
+cereal's build-4 spike persists unchanged (444,132), as expected: it is the
+no-copy-reanchoring behaviour documented above, which is independent of emission
+granularity.
+
+**This replaces the grouped line as the transport-correct GRZ2 result, and it is also the
+correct learning curve — a real point at every TU rather than one per 112.** Per-TU curves:
+`{re2,fmt,cereal,leveldb}.pertu.tsv`.
