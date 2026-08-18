@@ -148,11 +148,11 @@ while IFS=$'\t' read -r id name manifest_path total_tus total_raw manifest_sha; 
     /usr/bin/time -v -o "$cell/z19.time" \
         taskset -c "$CORES" zstd -19 --long=31 -T"$ZSTD_THREADS" -q -f \
         "$cell/cell.ii" -o "$cell/cell.z19.zst"
-    zstd -d -q -c "$cell/cell.z19.zst" | cmp -s "$cell/cell.ii" -
+    zstd -d --long=31 -q -c "$cell/cell.z19.zst" | cmp -s "$cell/cell.ii" -
     /usr/bin/time -v -o "$cell/z6.time" \
         taskset -c "$CORES" zstd -6 --long=31 -T"$ZSTD_THREADS" -q -f \
         "$cell/cell.ii" -o "$cell/cell.z6.zst"
-    zstd -d -q -c "$cell/cell.z6.zst" | cmp -s "$cell/cell.ii" -
+    zstd -d --long=31 -q -c "$cell/cell.z6.zst" | cmp -s "$cell/cell.ii" -
 
     tu100_raw=$(head -n 100 "$cell/manifest.txt" | tr '\n' '\0' | \
         xargs -0 stat -Lc %s | awk '{sum += $1} END {printf "%.0f", sum}')
@@ -161,11 +161,13 @@ while IFS=$'\t' read -r id name manifest_path total_tus total_raw manifest_sha; 
     head -c "$tu100_raw" "$cell/cell.ii" | \
         taskset -c "$CORES" zstd -6 --long=31 -T"$ZSTD_THREADS" -q -f \
         -o "$cell/tu100.z6.zst"
-    zstd -d -q -c "$cell/tu100.z6.zst" | cmp -n "$tu100_raw" "$cell/cell.ii" -
+    zstd -d --long=31 -q -c "$cell/tu100.z6.zst" | \
+        cmp -n "$tu100_raw" "$cell/cell.ii" -
     head -c "$tu200_raw" "$cell/cell.ii" | \
         taskset -c "$CORES" zstd -6 --long=31 -T"$ZSTD_THREADS" -q -f \
         -o "$cell/tu200.z6.zst"
-    zstd -d -q -c "$cell/tu200.z6.zst" | cmp -n "$tu200_raw" "$cell/cell.ii" -
+    zstd -d --long=31 -q -c "$cell/tu200.z6.zst" | \
+        cmp -n "$tu200_raw" "$cell/cell.ii" -
 
     grz_wire=$(stat -Lc %s "$cell/cell.grz")
     z19_wire=$(stat -Lc %s "$cell/cell.z19.zst")
