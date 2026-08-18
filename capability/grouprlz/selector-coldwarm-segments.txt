@@ -1,0 +1,26 @@
+SEGMENT BREAKDOWN. latency_ns is PER-TU service time (verified: TU0=22.6ms, TU1=1.87ms),
+so segment wall = SUM of per-TU latency. That equals wall clock only for the 1-F rows;
+for multi-worker rows the per-TU services overlap, so the SUM is service-time, NOT wall.
+
+  corpus    row         TU0-50                   TU50-100                 TU100-200                TU200-end               
+  corpus11  ctl-1F      0.484 GB/s   149x  4.0ms 0.833 GB/s   622x  2.7ms 0.821 GB/s   408x  2.4ms 1.048 GB/s   655x  2.5ms
+  corpus11  ctl-8F      0.248 GB/s    30x  3.9ms 0.599 GB/s   162x  3.6ms 0.530 GB/s   130x  3.5ms 0.730 GB/s   343x  3.3ms  (service-time)
+  corpus11  t1to4-at100 0.554 GB/s   149x  3.5ms 0.909 GB/s   622x  2.7ms 0.414 GB/s    80x  3.5ms 0.698 GB/s   462x  3.5ms  (service-time)
+  corpus11  t1to8-at100 0.561 GB/s   149x  3.6ms 0.911 GB/s   622x  2.7ms 0.295 GB/s    44x  3.7ms 0.681 GB/s   323x  3.6ms  (service-time)
+
+  corpus9   ctl-1F      0.344 GB/s    76x  2.0ms 0.567 GB/s   269x  1.8ms 0.760 GB/s   317x  1.4ms 0.956 GB/s   620x  1.2ms
+  corpus9   ctl-8F      0.153 GB/s    18x  3.4ms 0.375 GB/s    69x  2.0ms 0.432 GB/s   100x  1.9ms 0.576 GB/s   220x  1.8ms  (service-time)
+  corpus9   t1to4-at100 0.359 GB/s    76x  2.0ms 0.452 GB/s   269x  2.2ms 0.331 GB/s    57x  2.0ms 0.571 GB/s   280x  1.9ms  (service-time)
+  corpus9   t1to8-at100 0.349 GB/s    76x  2.1ms 0.454 GB/s   269x  2.2ms 0.214 GB/s    30x  2.3ms 0.553 GB/s   216x  1.9ms  (service-time)
+
+  corpus2   ctl-1F      0.533 GB/s   101x  8.6ms 0.513 GB/s   120x 11.7ms 0.621 GB/s   201x  8.1ms 0.758 GB/s   274x  5.8ms
+  corpus2   ctl-8F      0.235 GB/s    27x 13.3ms 0.468 GB/s   102x 13.2ms 0.608 GB/s   167x  8.6ms 0.687 GB/s   212x  6.3ms  (service-time)
+  corpus2   t1to4-at100 0.535 GB/s   101x  9.5ms 0.562 GB/s   120x 10.1ms 0.458 GB/s    83x  8.5ms 0.690 GB/s   228x  6.2ms  (service-time)
+  corpus2   t1to8-at100 0.542 GB/s   101x  9.0ms 0.527 GB/s   120x 11.5ms 0.332 GB/s    49x  9.3ms 0.694 GB/s   207x  6.2ms  (service-time)
+
+  corpus12  ctl-1F      0.649 GB/s   279x  7.1ms 0.730 GB/s  1946x  7.2ms 0.750 GB/s   723x  7.0ms 0.794 GB/s  1727x  6.6ms
+  corpus12  ctl-8F      0.274 GB/s    38x  7.4ms 0.754 GB/s   407x  7.1ms 0.660 GB/s   158x  6.9ms 0.837 GB/s   415x  6.4ms  (service-time)
+  corpus12  t1to4-at100 0.645 GB/s   279x  7.2ms 0.773 GB/s  1946x  6.6ms 0.528 GB/s   119x  6.9ms 0.826 GB/s   643x  6.4ms  (service-time)
+  corpus12  t1to8-at100 0.622 GB/s   279x  7.6ms 0.721 GB/s  1946x  7.3ms 0.407 GB/s    59x  6.9ms 0.822 GB/s   413x  6.5ms  (service-time)
+
+Read the 1-F rows as wall rate; the others as per-TU service time and the ratio column.
