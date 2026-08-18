@@ -129,3 +129,51 @@ reconstructs the input rather than from the encoder's own accounting.
 **The fast interner remains VALUE-level.** Its `--wire` is emitted and `cmp`-compared, but
 there is no receiver parsing and reconstructing from it yet, so it does not get the
 byte-level claim until there is.
+
+## Fast interner: the wire is not self-contained, and USED_KEYS is uncounted
+
+Building the receiver local-oracle asked for surfaced a bigger problem than the missing
+receiver itself.
+
+`production-fused.cpp` never serialises `used_g` — the per-TU list of global line keys. F
+reads C's in-process vector directly at line 728 (`F.have(used_g[i])` for the MISSING
+bitmap) and again at 744-745 when resolving every non-missing local index back to a store
+entry. So:
+
+1. **The emitted wire is not self-contained.** A receiver consuming only the body frames
+   cannot reconstruct, because the local-index → global-key mapping never crosses it. The
+   `--wire` I added captures the body frames only; it is not the complete protocol wire.
+2. **USED_KEYS is never charged.** `st.comp` accumulates only `csz`, the compressed body
+   (line 737). The keyset message — which the header comment describes as a real C→F
+   transmission — contributes **zero** to the reported wire.
+
+Measured on re2 (72 TUs, 1 build):
+
+| | bytes |
+|---|---:|
+| reported wire (body only) | 5,765,164 |
+| USED_KEYS transmitted | 1,554,824 keys |
+| uncounted at 4 B/key (raw u32) | 6,219,296 → reported wire is **48.1%** of that basis |
+| uncounted at 2 B/key (varint estimate) | 3,109,648 → **65.0%** |
+
+Over the 4-build run: 20,913,868 B reported against 6,219,296 keys, so the reported figure
+is **45.7%** of the 4 B/key basis.
+
+**So the fast-interner line is understated by roughly 2x, not by a rounding term.** This is
+not the zstd-3 case (a real wire, missing its 4-byte frame headers); here a required protocol
+message is absent from the wire entirely and absent from the accounting.
+
+Consequences, stated conservatively:
+
+- The fast interner **cannot** be given a byte-level immutability claim: there is no
+  self-contained wire to reconstruct from. It stays value-level, and the earlier `cmp` was
+  over an incomplete artifact.
+- Its published per-TU and cumulative figures should be read as **body-only, a lower bound**,
+  until USED_KEYS is serialised and charged.
+- This is the same class of defect as P29's: an accounting total that does not correspond to
+  a physical stream. It is exactly why local-oracle's two-sink requirement (charge only real
+  protocol frame header+payload, on a real directional sink) is the right bar.
+
+Fixing it means emitting USED_KEYS as a real C→F frame and charging it — a change to
+`production-fused.cpp`, not to the harness. Flagged rather than started, since it changes a
+published line and the P29 work is queued ahead of it.
