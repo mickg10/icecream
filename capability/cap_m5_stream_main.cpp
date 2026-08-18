@@ -910,10 +910,13 @@ static int worker_loop(int fd, uint32_t workerId, const Manifest &manifest,
         return 2;
       continue;
     }
-    auto compilerBegin = Clock::now();
-    if (!compiler.emit(logical, reconstructed))
-      return 2;
-    compilerSeconds += seconds_since(compilerBegin);
+    bool compilerOk = false;
+    double compilerElapsed = 0;
+    std::thread compilerWriter([&] {
+      auto compilerBegin = Clock::now();
+      compilerOk = compiler.emit(logical, reconstructed);
+      compilerElapsed = seconds_since(compilerBegin);
+    });
     auto commitBegin = Clock::now();
     store.commit_fill(fillTx);
     store.commit_blocks(blockTx);
@@ -923,6 +926,10 @@ static int worker_loop(int fd, uint32_t workerId, const Manifest &manifest,
                           uint64_t(logical) + 1);
     auto drops = cache.evict(store);
     decodeSeconds += seconds_since(commitBegin);
+    compilerWriter.join();
+    if (!compilerOk)
+      return 2;
+    compilerSeconds += compilerElapsed;
     pathSeconds += seconds_since(pathBegin);
     if (!send_counted(fd, cap::Frame::Ack,
                       capp::pack_tu_ack_m5(logical, true, drops), frames))
