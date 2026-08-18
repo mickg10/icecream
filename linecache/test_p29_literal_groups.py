@@ -44,12 +44,18 @@ def main() -> int:
         paths: list[Path] = []
         for tu in range(7):
             path = root / f"unit-{tu}.ii"
-            lines = [f'# 1 "unit-{tu}.cc"\n']
-            lines.extend(
-                f"template <class T> T repeated_identifier_{index % 17}(T value) "
-                f"{{ return value + {index % 13}; }}\n"
-                for index in range(240 + tu * 13)
-            )
+            lines: list[str] = []
+            # Repeated marker-delimited Region sequences force the first group to define and
+            # reference S1 Blocks.  The per-TU tail then adds new Regions after that group, so
+            # the fixture detects the legacy final-NREG-dependent Block namespace.
+            for region in range(12):
+                lines.append(f'# 1 "/usr/include/prefix-fixture-{region % 4}.h" 1 3 4\n')
+                lines.extend(
+                    f"template <class T> T repeated_identifier_{index % 17}(T value) "
+                    f"{{ return value + {index % 13}; }}\n"
+                    for index in range(24 + region % 3)
+                )
+            lines.append(f'# 1 "unit-{tu}.cc"\n')
             lines.append(f"int changed_tail_{tu} = {tu};\n")
             path.write_text("".join(lines))
             paths.append(path)
@@ -124,6 +130,189 @@ def main() -> int:
             if component_wire != int(component_row["wire_bytes"]):
                 raise RuntimeError("component ledger does not sum to complete wire")
 
+        legacy_wire = root / "legacy-literal-groups.wire"
+        legacy_curve = root / "legacy-curve.tsv"
+        legacy_components = root / "legacy-components.tsv"
+        legacy_grouped = run(
+            [
+                str(legacy),
+                *common,
+                "--literal-group-prefix",
+                str(prefix),
+                "--literal-group-tus",
+                "3",
+                "--literal-group-skip-zstd10",
+                "--literal-group-wire",
+                str(legacy_wire),
+                "--curve-tsv",
+                str(legacy_curve),
+                "--component-curve-tsv",
+                str(legacy_components),
+            ]
+        )
+        if "byte-exact=OK" not in legacy_grouped:
+            raise RuntimeError(f"legacy grouped codec was not exact:\n{legacy_grouped}")
+        if legacy_wire.read_bytes() != wire.read_bytes():
+            raise RuntimeError("opt-in prefix correction changed the legacy literal wire")
+        if legacy_curve.read_bytes() != curve.read_bytes():
+            raise RuntimeError("opt-in prefix correction changed the legacy curve")
+        if legacy_components.read_bytes() != components.read_bytes():
+            raise RuntimeError("opt-in prefix correction changed legacy component accounting")
+
+        # Stable Root ids do not depend on Regions introduced by later TUs.  The ordinary
+        # structure streams flush after each TU; diagnostic open-final mode omits only the END
+        # bytes a standalone run would otherwise add.  A complete run's first group must then
+        # match a suffix-blind run byte-for-byte and account-for-account without paying for a
+        # new entropy frame at every literal-group boundary.
+        stable_wire = root / "stable-full.wire"
+        stable_curve = root / "stable-full.tsv"
+        stable_components = root / "stable-full-components.tsv"
+        stable_output = run(
+            [
+                str(grouped),
+                *common,
+                "--literal-group-prefix",
+                str(prefix),
+                "--literal-group-tus",
+                "3",
+                "--stable-root-tags",
+                "--literal-group-skip-zstd10",
+                "--literal-group-wire",
+                str(stable_wire),
+                "--curve-tsv",
+                str(stable_curve),
+                "--component-curve-tsv",
+                str(stable_components),
+            ]
+        )
+        if "byte-exact=OK" not in stable_output or "stable Root tags" not in stable_output:
+            raise RuntimeError(f"stable-Root run was not exact and bound:\n{stable_output}")
+
+        prefix_manifest = root / "manifest-first.txt"
+        prefix_manifest.write_text("".join(f"{path}\n" for path in paths[:3]))
+        prefix_plan = root / "p29-first"
+        prefix_common = common.copy()
+        prefix_common[1] = str(prefix_manifest)
+        prefix_baseline = run(
+            [str(legacy), *prefix_common, "--mixed-dump-prefix", str(prefix_plan)]
+        )
+        if "byte-exact=OK" not in prefix_baseline:
+            raise RuntimeError(f"prefix plan was not exact:\n{prefix_baseline}")
+
+        prefix_wire = root / "stable-prefix.wire"
+        prefix_curve = root / "stable-prefix.tsv"
+        prefix_components = root / "stable-prefix-components.tsv"
+        prefix_output = run(
+            [
+                str(grouped),
+                *prefix_common,
+                "--literal-group-prefix",
+                str(prefix_plan),
+                "--literal-group-tus",
+                "3",
+                "--stable-root-tags",
+                "--open-final-entropy",
+                "--literal-group-skip-zstd10",
+                "--literal-group-wire",
+                str(prefix_wire),
+                "--curve-tsv",
+                str(prefix_curve),
+                "--component-curve-tsv",
+                str(prefix_components),
+            ]
+        )
+        if "byte-exact=OK" not in prefix_output:
+            raise RuntimeError(f"standalone prefix run was not exact:\n{prefix_output}")
+
+        stable_curve_rows = list(csv.DictReader(stable_curve.open(), delimiter="\t"))
+        prefix_curve_rows = list(csv.DictReader(prefix_curve.open(), delimiter="\t"))
+        stable_component_rows = list(
+            csv.DictReader(stable_components.open(), delimiter="\t")
+        )
+        prefix_component_rows = list(
+            csv.DictReader(prefix_components.open(), delimiter="\t")
+        )
+        if stable_curve_rows[:3] != prefix_curve_rows:
+            raise RuntimeError("full-run and standalone first-group curves differ")
+        if stable_component_rows[:3] != prefix_component_rows:
+            raise RuntimeError("full-run and standalone first-group component ledgers differ")
+        if sum(int(row["block_wire_bytes"]) for row in prefix_component_rows) == 0:
+            raise RuntimeError("prefix identity fixture did not exercise a Block definition")
+
+        complete_wire = stable_wire.read_bytes()
+        standalone_wire = prefix_wire.read_bytes()
+        first_header = struct.unpack_from("<I", complete_wire)[0]
+        first_frame_size = 4 + (first_header & ((1 << 29) - 1))
+        if complete_wire[:first_frame_size] != standalone_wire:
+            raise RuntimeError("full-run and standalone first literal-group frames differ")
+
+        second_manifest = root / "manifest-first-two-groups.txt"
+        second_manifest.write_text("".join(f"{path}\n" for path in paths[:6]))
+        second_plan = root / "p29-first-two-groups"
+        second_common = common.copy()
+        second_common[1] = str(second_manifest)
+        if "byte-exact=OK" not in run(
+            [str(legacy), *second_common, "--mixed-dump-prefix", str(second_plan)]
+        ):
+            raise RuntimeError("two-group prefix plan was not exact")
+        second_wire = root / "stable-prefix-two-groups.wire"
+        second_curve = root / "stable-prefix-two-groups.tsv"
+        second_components = root / "stable-prefix-two-groups-components.tsv"
+        second_output = run(
+            [
+                str(grouped),
+                *second_common,
+                "--literal-group-prefix",
+                str(second_plan),
+                "--literal-group-tus",
+                "3",
+                "--stable-root-tags",
+                "--open-final-entropy",
+                "--literal-group-skip-zstd10",
+                "--literal-group-wire",
+                str(second_wire),
+                "--curve-tsv",
+                str(second_curve),
+                "--component-curve-tsv",
+                str(second_components),
+            ]
+        )
+        if "byte-exact=OK" not in second_output:
+            raise RuntimeError(f"two-group standalone prefix was not exact:\n{second_output}")
+        second_curve_rows = list(csv.DictReader(second_curve.open(), delimiter="\t"))
+        second_component_rows = list(
+            csv.DictReader(second_components.open(), delimiter="\t")
+        )
+        if stable_curve_rows[:6] != second_curve_rows:
+            raise RuntimeError("full-run and standalone two-group curves differ")
+        if stable_component_rows[:6] != second_component_rows:
+            raise RuntimeError("full-run and standalone two-group component ledgers differ")
+        second_frame_offset = first_frame_size
+        second_header = struct.unpack_from("<I", complete_wire, second_frame_offset)[0]
+        second_frame_end = (
+            second_frame_offset + 4 + (second_header & ((1 << 29) - 1))
+        )
+        if complete_wire[:second_frame_end] != second_wire.read_bytes():
+            raise RuntimeError("full-run and standalone first two literal-group frames differ")
+
+        incomplete_without_stable_ids = run(
+            [
+                str(grouped),
+                *common,
+                "--literal-group-prefix",
+                str(prefix),
+                "--literal-group-tus",
+                "3",
+                "--open-final-entropy",
+            ],
+            expect_success=False,
+        )
+        if "--open-final-entropy requires --stable-root-tags" not in incomplete_without_stable_ids:
+            raise RuntimeError(
+                "unbound open-prefix mode failed for the wrong reason:\n"
+                f"{incomplete_without_stable_ids}"
+            )
+
         bad_prefix = root / "bad"
         bad_prefix.with_suffix(".literal.raw").write_bytes(
             prefix.with_suffix(".literal.raw").read_bytes()
@@ -146,7 +335,9 @@ def main() -> int:
         if "lengths do not span the raw input" not in failed:
             raise RuntimeError(f"bad length plan failed for the wrong reason:\n{failed}")
 
-    print("P29 bounded literal groups exactness/accounting/rejection PASS")
+    print(
+        "P29 bounded literal groups exactness/accounting/rejection and prefix identity PASS"
+    )
     return 0
 
 

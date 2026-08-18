@@ -250,6 +250,25 @@ static LiteralGroupPlan build_literal_group_plan(const std::string&prefix,size_t
 #endif
 static inline void put_varint(std::vector<uint8_t>&o,uint64_t v){ while(v>=0x80){o.push_back(uint8_t(v)|0x80);v>>=7;} o.push_back(uint8_t(v)); }
 static inline uint64_t get_varint(const uint8_t*&p){ uint64_t v=0; int s=0; for(;;){ uint8_t b=*p++; v|=uint64_t(b&0x7f)<<s; if(!(b&0x80))break; s+=7; } return v; }
+// The legacy Root namespace places Blocks after the final Region count (NREG+k).  That is
+// compact, but the same chronological prefix receives different token values when later TUs add
+// Regions.  Stable-Root mode instead uses an explicit low-bit kind tag so every Root token is a
+// function of state available at that TU: Region r -> 2*r, Block k -> 2*k+1.
+static inline uint64_t stable_root_token(uint32_t token,uint32_t regionCount){
+    return token<regionCount ? uint64_t(token)<<1 : (uint64_t(token-regionCount)<<1)|1;
+}
+static inline bool decode_stable_root_token(uint64_t wire,uint32_t regionCount,size_t blockCount,
+                                            uint32_t&token){
+    const uint64_t id=wire>>1;
+    if(wire&1){
+        if(id>=blockCount||uint64_t(regionCount)+id>UINT32_MAX)return false;
+        token=regionCount+uint32_t(id);
+    }else{
+        if(id>=regionCount)return false;
+        token=uint32_t(id);
+    }
+    return true;
+}
 static inline void put_u64le(std::vector<uint8_t>&o,uint64_t v){for(unsigned i=0;i<8;++i)o.push_back(uint8_t(v>>(8*i)));}
 static inline uint64_t get_u64le(const uint8_t*&p,const uint8_t*end){
     if(end-p<8){fprintf(stderr,"truncated u64\n");exit(2);}uint64_t v=0;for(unsigned i=0;i<8;++i)v|=uint64_t(*p++)<<(8*i);return v;
@@ -760,7 +779,7 @@ static constexpr std::array<const char*,8> componentRawNames={
 };
 
 int main(int argc,char**argv){
-    const char* manifest=nullptr;const char*residualDumpPath=nullptr;const char*mixedDumpPrefix=nullptr;const char*curveTsvPath=nullptr;const char*literalGroupPrefix=nullptr;const char*literalGroupWirePath=nullptr; size_t max_files=SIZE_MAX,entropyRestartTus=0,replayRepetitions=1,literalGroupTus=0,literalGroupWorkers=1; int zlevel=3,literalZLevel=-1,arrayZLevel=-1,blobZLevel=-1,halfColdBit=-1,blobCanonicalLevel=9; uint32_t sourceAdmitRatio=6,blobThreads=4,blobZstdWorkers=0,blobZstdJobMiB=0,blobZstdOverlapLog=0,blobFallbackEvery=0,s1MinMatch=3,s1MaxChain=1024; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, usePriorRoot=false, useSortedLines=false,useByteArrayLines=false,useMixedRegions=false,useProjectSource=false,useKeyMap=false,useDirectOrdinals=false,useCompressedBlobs=false,useBlobEagerPatches=true,useMoFactor=false,traceMo=false,useAlphaLines=false,useResidualLdm=false,splitControlCeiling=false,structureCeiling=false,literalGroupEvaluateZstd10=true;
+    const char* manifest=nullptr;const char*residualDumpPath=nullptr;const char*mixedDumpPrefix=nullptr;const char*curveTsvPath=nullptr;const char*literalGroupPrefix=nullptr;const char*literalGroupWirePath=nullptr; size_t max_files=SIZE_MAX,entropyRestartTus=0,replayRepetitions=1,literalGroupTus=0,literalGroupWorkers=1; int zlevel=3,literalZLevel=-1,arrayZLevel=-1,blobZLevel=-1,halfColdBit=-1,blobCanonicalLevel=9; uint32_t sourceAdmitRatio=6,blobThreads=4,blobZstdWorkers=0,blobZstdJobMiB=0,blobZstdOverlapLog=0,blobFallbackEvery=0,s1MinMatch=3,s1MaxChain=1024; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, usePriorRoot=false,useSortedLines=false,useByteArrayLines=false,useMixedRegions=false,useProjectSource=false,useKeyMap=false,useDirectOrdinals=false,useCompressedBlobs=false,useBlobEagerPatches=true,useMoFactor=false,traceMo=false,useAlphaLines=false,useResidualLdm=false,splitControlCeiling=false,structureCeiling=false,literalGroupEvaluateZstd10=true,stableRootTags=false,openFinalEntropy=false;
     const char*blobDumpPath=nullptr;const char*componentCurveTsvPath=nullptr;
     for(int i=1;i<argc;++i){ if(!strcmp(argv[i],"--manifest")&&i+1<argc)manifest=argv[++i];
         else if(!strcmp(argv[i],"--z")&&i+1<argc)zlevel=atoi(argv[++i]);
@@ -810,12 +829,14 @@ int main(int argc,char**argv){
         else if(!strcmp(argv[i],"--warm"))warm=true;         // Basis C: 2nd pass with dict retained -> warm steady-state wire
         else if(!strcmp(argv[i],"--max-files")&&i+1<argc){ char*t=nullptr; unsigned long long v=strtoull(argv[++i],&t,10); if(!t||*t||!v){fprintf(stderr,"bad max-files\n");return 2;} max_files=size_t(v); }
         else if((!strcmp(argv[i],"--entropy-restart-tus")||!strcmp(argv[i],"--build-tus"))&&i+1<argc){ char*t=nullptr; unsigned long long v=strtoull(argv[++i],&t,10); if(!t||*t||!v||v>SIZE_MAX){fprintf(stderr,"bad entropy restart TU count\n");return 2;} entropyRestartTus=size_t(v); }
+        else if(!strcmp(argv[i],"--stable-root-tags"))stableRootTags=true;
+        else if(!strcmp(argv[i],"--open-final-entropy"))openFinalEntropy=true;
         else if((!strcmp(argv[i],"--replay-repetitions")||!strcmp(argv[i],"--build-repetitions"))&&i+1<argc){ char*t=nullptr; unsigned long long v=strtoull(argv[++i],&t,10); if(!t||*t||!v||v>SIZE_MAX){fprintf(stderr,"bad replay repetition count\n");return 2;} replayRepetitions=size_t(v); }
         else { fprintf(stderr,"unknown %s\n",argv[i]); return 2; } }
 #if !defined(WITH_BSC_GROUPS)
     (void)literalGroupEvaluateZstd10;
 #endif
-    if(!manifest){ fprintf(stderr,"usage: %s --manifest F [--z LEVEL] [--literal-z 1..9] [--array-z 1..9] [--blob-z 1..9] [--no-d1] [--d2] [--prior-root] [--structure-ceiling] [--s1-min-match N] [--s1-max-chain N] [--sorted-lines|--byte-array-lines|--mixed-regions [--alpha-lines|--residual-ldm] [--residual-dump PATH] [--mixed-dump-prefix PATH] [--literal-group-prefix PREFIX --literal-group-tus N [--literal-group-workers N] [--literal-group-skip-zstd10] [--literal-group-wire PATH]] [--split-control-ceiling] [--compressed-blobs [--mo-factor [--mo-trace]] [--blob-threads N] [--blob-zstd-workers N --blob-zstd-job-mib N --blob-zstd-overlap-log N] [--blob-fallback-every N] [--blob-lazy-fallback] [--blob-canonical-level 1..9] [--blob-dump PATH]] [--key-map|--direct-ordinals|--half-cold-bit 0|1] [--source-package [--source-admit-ratio N]]] [--max-files N] [--replay-repetitions N] [--entropy-restart-tus N] [--curve-tsv PATH] [--component-curve-tsv PATH]\n",argv[0]); return 2; }
+    if(!manifest){ fprintf(stderr,"usage: %s --manifest F [--z LEVEL] [--literal-z 1..9] [--array-z 1..9] [--blob-z 1..9] [--no-d1] [--d2] [--prior-root] [--structure-ceiling] [--s1-min-match N] [--s1-max-chain N] [--sorted-lines|--byte-array-lines|--mixed-regions [--alpha-lines|--residual-ldm] [--residual-dump PATH] [--mixed-dump-prefix PATH] [--literal-group-prefix PREFIX --literal-group-tus N [--literal-group-workers N] [--literal-group-skip-zstd10] [--literal-group-wire PATH]] [--split-control-ceiling] [--compressed-blobs [--mo-factor [--mo-trace]] [--blob-threads N] [--blob-zstd-workers N --blob-zstd-job-mib N --blob-zstd-overlap-log N] [--blob-fallback-every N] [--blob-lazy-fallback] [--blob-canonical-level 1..9] [--blob-dump PATH]] [--key-map|--direct-ordinals|--half-cold-bit 0|1] [--source-package [--source-admit-ratio N]]] [--max-files N] [--replay-repetitions N] [--entropy-restart-tus N] [--stable-root-tags] [--open-final-entropy] [--curve-tsv PATH] [--component-curve-tsv PATH]\n",argv[0]); return 2; }
     if(useProjectSource&&!useMixedRegions){fprintf(stderr,"--source-package requires --mixed-regions\n");return 2;}
     if(useKeyMap&&!useMixedRegions){fprintf(stderr,"--key-map and --half-cold-bit require --mixed-regions\n");return 2;}
     if(useCompressedBlobs&&(!useMixedRegions||!useByteArrayLines)){fprintf(stderr,"--compressed-blobs requires --mixed-regions --byte-array-lines\n");return 2;}
@@ -831,6 +852,10 @@ int main(int argc,char**argv){
     if(literalGroupWirePath&&!literalGroupPrefix){fprintf(stderr,"--literal-group-wire requires --literal-group-prefix\n");return 2;}
     if(literalGroupWorkers!=1&&!literalGroupPrefix){fprintf(stderr,"--literal-group-workers requires --literal-group-prefix\n");return 2;}
     if(literalGroupPrefix&&(!useMixedRegions||useAlphaLines||useResidualLdm)){fprintf(stderr,"literal groups require ordinary --mixed-regions literal coding\n");return 2;}
+    if(stableRootTags&&!useDirectOrdinals){fprintf(stderr,"--stable-root-tags requires --direct-ordinals\n");return 2;}
+    if(stableRootTags&&usePriorRoot){fprintf(stderr,"--stable-root-tags does not support --prior-root\n");return 2;}
+    if(openFinalEntropy&&!stableRootTags){fprintf(stderr,"--open-final-entropy requires --stable-root-tags\n");return 2;}
+    if(openFinalEntropy&&entropyRestartTus){fprintf(stderr,"--open-final-entropy cannot be combined with entropy restarts\n");return 2;}
 #if !defined(WITH_BSC_GROUPS)
     if(literalGroupPrefix){fprintf(stderr,"literal groups require a WITH_BSC_GROUPS build\n");return 2;}
 #endif
@@ -874,6 +899,8 @@ int main(int argc,char**argv){
     if(entropyRestartTus&&TUs%entropyRestartTus){fprintf(stderr,"TU count %zu is not a multiple of experimental entropy restart interval %zu\n",TUs,entropyRestartTus);return 2;}
     fprintf(stderr,"loaded+interned %.1fs TUs=%zu raw=%llu physical_tus=%zu physical_raw=%llu replay_repetitions=%zu regions=%u region_occ=%zu distinct_lines=%u\n",secs(t0),TUs,(unsigned long long)corpus.raw,physicalTUs,(unsigned long long)physicalRaw,replayRepetitions,NREG,allreg.size(),dict.distinct());
     if(entropyRestartTus)fprintf(stderr,"experimental entropy restarts: TUs/segment=%zu segments=%zu (not a product build signal)\n",entropyRestartTus,TUs/entropyRestartTus);
+    if(stableRootTags)fprintf(stderr,"stable Root tags: region=2*r block=2*k+1\n");
+    if(openFinalEntropy)fprintf(stderr,"open final entropy streams: diagnostic prefix mode (no END bytes)\n");
 
     RootSliceBuild root_slices;
     if(usePriorRoot){
@@ -1075,13 +1102,13 @@ int main(int argc,char**argv){
 #endif
       for(size_t t=0; t<TUs; ++t){
         auto _te=Clock::now();
-        const bool endOfEntropyStream=t+1==TUs||(entropyRestartTus&&(t+1)%entropyRestartTus==0);
+        const bool endOfEntropyStream=(!openFinalEntropy&&t+1==TUs)||(entropyRestartTus&&(t+1)%entropyRestartTus==0);
         const uint32_t* tk=&tokstream[tokoff[t]]; size_t tn=tokoff[t+1]-tokoff[t];
         // ROOT is available to F before its MISSING reply.  With a key map, C first associates every
         // newly-mentioned conversation-dense Region id with its stable key; F binds cache hits and
         // independently returns the exact missing closure.  The legacy cold path is left byte-identical.
         std::vector<uint8_t> rootb,Frootb;
-        if(usePriorRoot)rootb=root_slices.programs[t];else for(size_t i=0;i<tn;++i)put_varint(rootb,tk[i]);
+        if(usePriorRoot)rootb=root_slices.programs[t];else for(size_t i=0;i<tn;++i)put_varint(rootb,stableRootTags?stable_root_token(tk[i],NREG):tk[i]);
         std::vector<uint32_t> missReg,missBlk,associationRegs,requiredRegions,requiredBlocks;
         if(useKeyMap){
           if(++requestStamp==0){std::fill(requiredRegionStamp.begin(),requiredRegionStamp.end(),0);std::fill(requiredBlockStamp.begin(),requiredBlockStamp.end(),0);requestStamp=1;}
@@ -1108,7 +1135,10 @@ int main(int argc,char**argv){
             auto FrequireRegion=[&](uint32_t r){if(FrequiredRegionStamp[r]!=requestStamp){FrequiredRegionStamp[r]=requestStamp;FrequiredRegions.push_back(r);}};
             auto FrequireBlock=[&](uint32_t k){if(FrequiredBlockStamp[k]!=requestStamp){FrequiredBlockStamp[k]=requestStamp;FrequiredBlocks.push_back(k);}};
             const uint8_t*rp=Frootb.data(),*re=rp+Frootb.size();
-            while(rp<re){uint64_t tok=get_varint(rp);if(tok<NREG)FrequireRegion(uint32_t(tok));else if(tok-NREG<fknownBlk.size())FrequireBlock(uint32_t(tok-NREG));else{fprintf(stderr,"bad direct Root token\n");return 2;}}
+            while(rp<re){uint64_t wire=get_varint(rp);uint32_t tok;
+              if(stableRootTags){if(!decode_stable_root_token(wire,NREG,fknownBlk.size()-1,tok)){fprintf(stderr,"bad stable direct Root token\n");return 2;}}
+              else if(wire<=UINT32_MAX)tok=uint32_t(wire);else{fprintf(stderr,"bad direct Root token\n");return 2;}
+              if(tok<NREG)FrequireRegion(tok);else if(tok-NREG<fknownBlk.size())FrequireBlock(tok-NREG);else{fprintf(stderr,"bad direct Root token\n");return 2;}}
             if(FrequiredBlocks.size()!=requiredBlocks.size()){fprintf(stderr,"direct Root Block closure differs\n");return 2;}
             for(uint32_t k:FrequiredBlocks)if(requiredBlockStamp[k]!=requestStamp){fprintf(stderr,"direct Root Block identity differs\n");return 2;}
 
@@ -1168,7 +1198,10 @@ int main(int argc,char**argv){
           for(uint32_t r:FnewAssociationRegs)FrequireRegion(r);
           if(usePriorRoot){fprintf(stderr,"key-map prior Root is not implemented\n");return 2;}
           const uint8_t*rp=Frootb.data(),*re=rp+Frootb.size();
-          while(rp<re){uint64_t tok=get_varint(rp);if(tok<NREG)FrequireRegion(uint32_t(tok));else if(tok-NREG<fknownBlk.size())FrequireBlock(uint32_t(tok-NREG));else{fprintf(stderr,"bad F Root token\n");return 2;}}
+          while(rp<re){uint64_t wire=get_varint(rp);uint32_t tok;
+            if(stableRootTags){if(!decode_stable_root_token(wire,NREG,fknownBlk.size()-1,tok)){fprintf(stderr,"bad stable F Root token\n");return 2;}}
+            else if(wire<=UINT32_MAX)tok=uint32_t(wire);else{fprintf(stderr,"bad F Root token\n");return 2;}
+            if(tok<NREG)FrequireRegion(tok);else if(tok-NREG<fknownBlk.size())FrequireBlock(tok-NREG);else{fprintf(stderr,"bad F Root token\n");return 2;}}
           if(FrequiredBlocks.size()!=requiredBlocks.size()) {fprintf(stderr,"F Root Block closure differs\n");return 2;}
           for(uint32_t k:FrequiredBlocks)if(requiredBlockStamp[k]!=requestStamp){fprintf(stderr,"F Root Block identity differs\n");return 2;}
           for(uint32_t r:FrequiredRegions)if(!FmixedRegions[r].known)missReg.push_back(r);
@@ -1883,7 +1916,9 @@ int main(int argc,char**argv){
             }
             if(pp!=pe || produced!=expected){ fprintf(stderr,"bad ROOT_SLICE extent\n"); return 2; }
             Froot_child.insert(Froot_child.end(),Freg_stream.end()-(roff[t+1]-roff[t]),Freg_stream.end()); Froot_off.push_back(Froot_child.size());
-          } else while(pp<pe){ uint32_t tok=uint32_t(get_varint(pp));
+          } else while(pp<pe){ uint64_t wire=get_varint(pp);uint32_t tok;
+            if(stableRootTags){if(!decode_stable_root_token(wire,NREG,FknownBlk.size()-1,tok)){fprintf(stderr,"bad stable decoded Root token\n");return 2;}}
+            else if(wire<=UINT32_MAX)tok=uint32_t(wire);else{fprintf(stderr,"bad decoded Root token\n");return 2;}
             if(tok<NREG) emitRegionF(tok);
             else { uint32_t k=tok-NREG; for(size_t j=Fblk_off[k];j<Fblk_off[k+1];++j) emitRegionF(Fblk_child[j]); } }
         }
