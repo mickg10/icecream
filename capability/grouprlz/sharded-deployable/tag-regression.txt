@@ -6,6 +6,6 @@
 === G2b: the CALL SITE refuses a Root naming the sentinel Block ===
    stable: rejected (exit 2) by the Root-token bound
    legacy: rejected (exit 2) by the Root-token bound
-=== G3: the Block-half tag guard is present in the source ===
-   both halves of the id space are guarded against the tag shift
+=== G3: checked tag creation at the 2^31 boundary ===
+   2^31-1 accepted, 2^31 and a full 64-bit id refused, both halves
 TAG REGRESSION PASS

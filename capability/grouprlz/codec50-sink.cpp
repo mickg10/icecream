@@ -304,8 +304,19 @@ static inline uint64_t get_varint(const uint8_t*&p){ uint64_t v=0; int s=0; for(
 // tag is self-describing: low bit = kind, rest = the id within that kind.
 static inline bool     tag_is_block(uint32_t tag){ return tag&1u; }
 static inline uint32_t tag_id      (uint32_t tag){ return tag>>1; }
-static inline uint32_t region_tag  (uint32_t r)  { return r<<1; }
-static inline uint32_t block_tag   (uint32_t k)  { return (k<<1)|1u; }
+// CHECKED creation.  The id arrives as a 64-bit value and is validated BEFORE it is narrowed
+// or shifted, so the bound is a property of the operation rather than of whatever the caller
+// happened to compute.  A source-level "is the guard present" check cannot tell a live guard
+// from a dead one, or from one placed after the shift; these return false instead.
+static constexpr uint64_t kTagIdLimit = uint64_t(1)<<31;   // one bit of the u32 is the kind
+static inline bool make_region_tag(uint64_t id,uint32_t&tag){
+    if(id>=kTagIdLimit) return false; tag=uint32_t(id)<<1; return true; }
+static inline bool make_block_tag (uint64_t id,uint32_t&tag){
+    if(id>=kTagIdLimit) return false; tag=(uint32_t(id)<<1)|1u; return true; }
+// Unchecked convenience for ids already validated at admission; both hard-fail rather than
+// silently truncating, so neither can become the quiet path.
+static inline uint32_t region_tag(uint32_t r){ uint32_t t; if(!make_region_tag(r,t)){fprintf(stderr,"Region id %u exceeds the typed Root tag space\n",r);exit(2);} return t; }
+static inline uint32_t block_tag (uint32_t k){ uint32_t t; if(!make_block_tag(k,t)) {fprintf(stderr,"Block id %u exceeds the typed Root tag space\n",k);exit(2);} return t; }
 // The legacy Root namespace still wants NREG+k, so that -- and only that -- converts late.
 static inline uint32_t legacy_flat_token(uint32_t tag,uint32_t regionCount){
     return tag_is_block(tag) ? regionCount+tag_id(tag) : tag_id(tag);
@@ -923,6 +934,12 @@ int main(int argc,char**argv){
         if(!wire_to_tag(uint64_t(R)+B-1,false,R,B,tag)||!tag_is_block(tag)||tag_id(tag)!=B-1) note("legacy rejected the last real Block");
         for(uint32_t r=0;r<R;++r)
             if(!wire_to_tag(r,false,R,B,tag)||tag_is_block(tag)||tag_id(tag)!=r) note("legacy Region round trip");
+        // checked creation at the boundary, both halves of the id space
+        if(!make_region_tag(kTagIdLimit-1,tag)||tag_is_block(tag)||tag_id(tag)!=uint32_t(kTagIdLimit-1)) note("checked creation rejected Region 2^31-1");
+        if(!make_block_tag (kTagIdLimit-1,tag)||!tag_is_block(tag)||tag_id(tag)!=uint32_t(kTagIdLimit-1)) note("checked creation rejected Block 2^31-1");
+        if(make_region_tag(kTagIdLimit,tag)) note("checked creation accepted Region 2^31");
+        if(make_block_tag (kTagIdLimit,tag)) note("checked creation accepted Block 2^31");
+        if(make_region_tag(~uint64_t(0),tag)) note("checked creation accepted a 64-bit Region id");
         printf("selftest-tags: %s\n",bad?"FAIL":"PASS");
         return bad?1:0;
     }
@@ -997,8 +1014,9 @@ int main(int argc,char**argv){
       corpus.raw=physicalRaw*replayRepetitions;
     }
     uint32_t NREG=uint32_t(dict.region_count());const size_t TUs=physicalTUs*replayRepetitions;
-    // The typed tag spends one bit on the kind, so both id spaces are bounded at 2^31.
-    if(NREG>=(1u<<31)){fprintf(stderr,"too many Regions for a typed Root tag: %u\n",NREG);return 2;}
+    // The typed tag spends one bit on the kind, so both id spaces are bounded at 2^31.  The
+    // per-id check lives in make_region_tag/make_block_tag; this only fails earlier and louder.
+    { uint32_t probe; if(!make_region_tag(NREG?NREG-1:0,probe)){fprintf(stderr,"too many Regions for a typed Root tag: %u\n",NREG);return 2;} }
     if(useS1&&allreg.size()>UINT32_MAX){fprintf(stderr,"S1 logical Region occurrence space exceeds u32\n");return 2;}
     if(entropyRestartTus&&TUs%entropyRestartTus){fprintf(stderr,"TU count %zu is not a multiple of experimental entropy restart interval %zu\n",TUs,entropyRestartTus);return 2;}
     fprintf(stderr,"loaded+interned %.1fs TUs=%zu raw=%llu physical_tus=%zu physical_raw=%llu replay_repetitions=%zu regions=%u region_occ=%zu distinct_lines=%u\n",secs(t0),TUs,(unsigned long long)corpus.raw,physicalTUs,(unsigned long long)physicalRaw,replayRepetitions,NREG,allreg.size(),dict.distinct());
@@ -1034,10 +1052,6 @@ int main(int argc,char**argv){
         auto block_get=[&](const uint32_t*p,size_t L,uint32_t srcpos,uint8_t copyok)->uint32_t{ uint64_t h=1469598103934665603ULL^(L*0x100000001b3ULL); for(size_t j=0;j<L;++j){h^=p[j];h*=1099511628211ULL;}
             auto it=bdict.find(h); if(it!=bdict.end()){ uint32_t k=it->second; if(boff2[k+1]-boff2[k]==L && memcmp(&bchild[boff2[k]],p,L*4)==0) return block_tag(k); }
             uint32_t k=uint32_t(boff2.size()-1);
-            // block_tag() shifts left by one, same as region_tag(): guard the BLOCK half of
-            // the id space too.  The occurrence-space bound makes this unreachable in
-            // practice, which is not the same as the shift being defined by contract.
-            if(k>=(1u<<31)){fprintf(stderr,"too many Blocks for a typed Root tag: %u\n",k);exit(2);}
             bchild.insert(bchild.end(),p,p+L); boff2.push_back(bchild.size()); bcopy_src.push_back(srcpos); bcopy_ok.push_back(copyok); if(it==bdict.end()) bdict.emplace(h,k); return block_tag(k); };
         auto tb=Clock::now();
         for(size_t t=0;t<TUs;++t){ size_t a=roff[t],b=roff[t+1]; size_t i=a;

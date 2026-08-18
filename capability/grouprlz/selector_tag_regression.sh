@@ -53,11 +53,12 @@ for MODE in "--stable-root-tags" ""; do
   echo "   $L: rejected (exit $rc) by the Root-token bound"
 done
 
-echo "=== G3: the Block-half tag guard is present in the source ==="
-grep -q 'too many Blocks for a typed Root tag' "$HERE/codec50-sink.cpp" \
-  || fail "no Block-half 2^31 guard in codec50-sink.cpp"
-grep -q 'too many Regions for a typed Root tag' "$HERE/codec50-sink.cpp" \
-  || fail "no Region-half 2^31 guard in codec50-sink.cpp"
-echo "   both halves of the id space are guarded against the tag shift"
+echo "=== G3: checked tag creation at the 2^31 boundary ==="
+# Covered by --selftest-tags above, which calls make_region_tag/make_block_tag with
+# 2^31-1 (must be accepted) and 2^31 and ~0 (must be refused).  Deliberately NOT a grep for
+# the guard's source text: that cannot distinguish a live guard from a dead one, from one
+# placed after the shift, or from an unused duplicate of the string.
+grep -q 'selftest-tags: PASS' "$W/st.out" || fail "checked tag creation did not pass"
+echo "   2^31-1 accepted, 2^31 and a full 64-bit id refused, both halves"
 
 echo "TAG REGRESSION PASS"
