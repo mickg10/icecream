@@ -103,6 +103,12 @@ binaries before any scenario row: `cap_header_test`, `cap_transport_test`,
 warning-clean rehearsal of that combined gate is retained at
 `/tanksmall/scratch/ictmp/issue16-m5-focused-build-NXbUv8`.
 
+The same audit removed an invalid F-snapshot restriction: Block child count
+had been bounded by the number of distinct Regions even though a Block is a
+sequence and may reference one Region repeatedly. Snapshot restore now uses
+the actual encoded-count bound, and a repeated-child Block round trip passes
+both the warning-clean and ASan+UBSan state gates.
+
 M5 remains **OPEN**.  The current typed code still needs the complete fixed-16
 scenario rerun and the uncontended quietbox focused complete-rate rows before
 the overall milestone can be accepted.

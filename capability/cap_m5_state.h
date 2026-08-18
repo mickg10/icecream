@@ -832,7 +832,7 @@ static inline bool load_f_snapshot(const std::string &path,
     return false;
   for (uint64_t i = 0; i < count; ++i) {
     if (!in.u32(id) || id >= nblk || store.FknownBlk[id] || !in.u64(tick) ||
-        !in.u64(children) || children > nreg)
+        !in.u64(children) || children > cap::MAX_PAYLOAD)
       return false;
     store.FknownBlk[id] = 1;
     store.FblkChildren[id].resize(size_t(children));

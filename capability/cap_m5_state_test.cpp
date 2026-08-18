@@ -257,6 +257,7 @@ int main() {
         "partial C snapshot rejected");
 
   fprintf(stderr, "[4] F snapshot round trip:\n");
+  store.FblkChildren[1] = {regions[1], regions[1], regions[1]};
   CacheLimits unlimited;
   CacheState savedCache;
   savedCache.init(store.NREG, store.NBLK, unlimited);
@@ -277,7 +278,9 @@ int main() {
   check(load_f_snapshot(base + ".f", generation, loadedStore, loadedCache),
         "F snapshot loaded");
   check(loadedStore.FmixedRegions[regions[1]].known &&
-            loadedStore.FpublicPresent[2] && loadedStore.FknownBlk[1],
+            loadedStore.FpublicPresent[2] && loadedStore.FknownBlk[1] &&
+            loadedStore.FblkChildren[1] ==
+                std::vector<uint32_t>({regions[1], regions[1], regions[1]}),
         "F typed stores restored");
   const auto &view = loadedStore.FmixedRegions[regions[1]];
   check(view.length == dict.region_raw_len(regions[1]) &&
