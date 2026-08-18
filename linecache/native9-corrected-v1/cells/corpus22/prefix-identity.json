@@ -1,0 +1,40 @@
+{
+  "artifacts": {
+    "/home/ttuser/issue16-p29-prefix-state/native9-corrected-v1/cells/corpus22/full/components.tsv": "29f8a6bb237c6079cba90ca274ca7441d054efe320c6f4bbfce4538e566998ef",
+    "/home/ttuser/issue16-p29-prefix-state/native9-corrected-v1/cells/corpus22/full/curve.tsv": "493bf80fa00e3ee4d294c5fb8c56f5ae3c2278a7425cb3f66f5b7efa3e01e973",
+    "/home/ttuser/issue16-p29-prefix-state/native9-corrected-v1/cells/corpus22/full/literal.wire": "fb8435a0e8007d05c672c0d030969ba90ae820aeb0e490ef82ae59893db23bbc",
+    "/home/ttuser/issue16-p29-prefix-state/native9-corrected-v1/cells/corpus22/prefix/components.tsv": "82239117f896b82727e13923ab61671a4268baf4fccb965921a5f72d67cba437",
+    "/home/ttuser/issue16-p29-prefix-state/native9-corrected-v1/cells/corpus22/prefix/curve.tsv": "80c06e8c0d46375bc4c27cd703491a46cc898e8439125ff0378666d08f0cf903",
+    "/home/ttuser/issue16-p29-prefix-state/native9-corrected-v1/cells/corpus22/prefix/literal.wire": "a78c97b19e68952fb6ad45f68a181fcc13bbfa390570af32de15411dddc351d8"
+  },
+  "components_identical": true,
+  "curve_identical": true,
+  "full_tus": 364,
+  "group_tus": 112,
+  "literal_frame_bytes": 843380,
+  "literal_frame_sha256": "a78c97b19e68952fb6ad45f68a181fcc13bbfa390570af32de15411dddc351d8",
+  "literal_frames": 1,
+  "plan_prefixes": {
+    "array-control": {
+      "prefix_bytes": 248,
+      "prefix_sha256": "417661e4c20465a942d5dbcdedf1890f57ea9e9ab33bd71c9d7e74d61e958f74"
+    },
+    "array-values": {
+      "prefix_bytes": 722,
+      "prefix_sha256": "c189a6e5b3b46cf23f18c34c8f44f5604d7f75f27358065245c56514523322e4"
+    },
+    "control": {
+      "prefix_bytes": 1557153,
+      "prefix_sha256": "442707ee53f19ad50f2f53abd690374ae614e39bb6b2557d367f3e5c52fe8e8a"
+    },
+    "literal": {
+      "prefix_bytes": 6829886,
+      "prefix_sha256": "7377cf435364b19292306457a1111b1a334d29c770e4a631b5414194525ccec6"
+    }
+  },
+  "prefix_mode": "suffix-blind",
+  "prefix_raw_bytes": 429406449,
+  "prefix_tus": 112,
+  "prefix_wire_bytes": 1803779,
+  "schema": "p29-prefix-identity-v1"
+}

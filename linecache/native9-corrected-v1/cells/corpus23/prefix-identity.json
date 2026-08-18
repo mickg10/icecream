@@ -1,0 +1,40 @@
+{
+  "artifacts": {
+    "/home/ttuser/issue16-p29-prefix-state/native9-corrected-v1/cells/corpus23/full/components.tsv": "72218c52749cf9ee015735ab2b29c43c12af94ec28da9cea014c9f7eff0619fd",
+    "/home/ttuser/issue16-p29-prefix-state/native9-corrected-v1/cells/corpus23/full/curve.tsv": "8495a6f047d548ef0b9df536548f95b063149ee72f81466f7c09768acac8f1cc",
+    "/home/ttuser/issue16-p29-prefix-state/native9-corrected-v1/cells/corpus23/full/literal.wire": "7259f86dd20aa7282d6baae9db5e259ac494ed913de49423f6ecb202f25966af",
+    "/home/ttuser/issue16-p29-prefix-state/native9-corrected-v1/cells/corpus23/prefix/components.tsv": "1cd8e82722a279fda8049970a16c7a78ae9dfe9586e3f02c37dec0e27905cbbf",
+    "/home/ttuser/issue16-p29-prefix-state/native9-corrected-v1/cells/corpus23/prefix/curve.tsv": "794defb134b3ce1cc1e9c015aa7e82a6bf81d37d899e1bd5178188ca8fd3bac7",
+    "/home/ttuser/issue16-p29-prefix-state/native9-corrected-v1/cells/corpus23/prefix/literal.wire": "7fdbb909c4a2cb6b7fe6ada87f57c976f42dbfdac040af4af62853a59561290f"
+  },
+  "components_identical": true,
+  "curve_identical": true,
+  "full_tus": 297,
+  "group_tus": 112,
+  "literal_frame_bytes": 545658,
+  "literal_frame_sha256": "7fdbb909c4a2cb6b7fe6ada87f57c976f42dbfdac040af4af62853a59561290f",
+  "literal_frames": 1,
+  "plan_prefixes": {
+    "array-control": {
+      "prefix_bytes": 855,
+      "prefix_sha256": "0a01a6244409b5374edac22ddb56f4a3cb63d811a490fabdca8a8269d87a9847"
+    },
+    "array-values": {
+      "prefix_bytes": 3888,
+      "prefix_sha256": "15134d7d2d14a6f8b0c79799ecafe5f6996dd829aefd3ef6ef43f3d4033e7c06"
+    },
+    "control": {
+      "prefix_bytes": 1240666,
+      "prefix_sha256": "5b8962e1bc4164c480d85295341bc9cb80a510c28ebe525740519923827c67de"
+    },
+    "literal": {
+      "prefix_bytes": 5225097,
+      "prefix_sha256": "50e18a938548858b9b7114a3410161f457f9105383903c9a6d317a20ef17aa3f"
+    }
+  },
+  "prefix_mode": "suffix-blind",
+  "prefix_raw_bytes": 391518194,
+  "prefix_tus": 112,
+  "prefix_wire_bytes": 1254403,
+  "schema": "p29-prefix-identity-v1"
+}

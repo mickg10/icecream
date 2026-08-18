@@ -1,0 +1,10 @@
+id	name	manifest_path	tu_count	raw_bytes	manifest_sha256
+corpus23	arrow	/home/ttuser/ictmp/corpus23/manifest.txt	297	916009779	09d8f82ad56bf31bfbc2a82069983e4cb98774fa670d5fae1c458ee7d129e80d
+corpus22	folly	/home/ttuser/ictmp/corpus22/manifest.txt	364	1514916526	f0596031a3168fb85f6b9f706c64d6e251ee199b58dccbda8f2aba7bb0601435
+corpus24	bitcoin	/home/ttuser/ictmp/corpus24/manifest.txt	621	2311143894	56abdc9f6596ce97cab40265a8ff4bfeae7be4ff701896885184f26f9a5f21b7
+corpus17	gcc	/home/ttuser/ictmp/corpus17/manifest.txt	780	2542399239	c6ccdbf3eefba3fb8e47eae0cb7d3105a61da679df888f5f633a1e05448ceecb
+corpus19	qt6	/home/ttuser/ictmp/corpus19/manifest.txt	1205	7050790103	eadb029bb1a4c1c883956c42d84c3304dd714b4730eebf2a90a775b6a92ff244
+corpus21	pytorch	/home/ttuser/ictmp/corpus21/manifest.txt	1742	10802074073	1196417358990e2195f7c98ee4a0de146d4e231c9daf7a6e4807cdaefcf915ae
+corpus25	v8	/home/ttuser/ictmp/corpus25/manifest.txt	3798	30951684155	1fcc9b6e8b64664aebb40cc525f5201adbc00a3a2906272826e2198304c72642
+corpus20	clickhouse	/home/ttuser/ictmp/corpus20/manifest.txt	11741	63514078131	aa71c3744f455b6a174dc10223a91b46b94db31a0987883de8942d21ddaec48a
+corpus18	firefox	/home/ttuser/ictmp/corpus18/manifest.txt	9646	102047678234	af68d98f67a1763138bf1618d62d0a2e5a862cbfaf108b9490c23c6f96f3ed67

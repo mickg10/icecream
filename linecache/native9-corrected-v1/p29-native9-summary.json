@@ -1,0 +1,14 @@
+{
+  "cells": 9,
+  "complete_wire_bytes": 132291209,
+  "exact_cells": 9,
+  "holdout_status": "not used to fit frozen causal-selector-policy-v1",
+  "ledger_sha256": "36399fa6e9545c2a4888f9518e3a69de29923cdf25d1eb997d53975bfd9b0937",
+  "p29_binary_sha256": "6cb0d9dbbf04f2e90459a49a715e55e06308cc05b382343a460c6dd62e5b526a",
+  "p29_source_sha256": "89ed3b299332f90898b0bd86338052d67d686e93797d2e332080f7ed33c7c753",
+  "prefix_identity_cells": 9,
+  "probe_wire_bytes": 13835928,
+  "raw_bytes": 221650774134,
+  "schema": "p29-native9-prefix-identity-v1",
+  "timing_scope": "diagnostic two-process research pass"
+}
