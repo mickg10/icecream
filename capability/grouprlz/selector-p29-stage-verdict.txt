@@ -1,0 +1,27 @@
+WHERE P29 ENCODE TIME ACTUALLY GOES (one grouped pass, complete program)
+
+  project         total s intern s    load s process s load%tot lines%tot
+  re2                 0.4      0.1     0.043     0.057    10.7%     9.9%
+  fmt                 0.7      0.2     0.115     0.085    16.4%     7.2%
+  leveldb             0.7      0.2     0.111     0.089    15.9%     7.3%
+  cereal              0.6      0.3     0.222     0.078    36.9%     6.2%
+  nlohmann-json       1.0      0.3     0.185     0.115    18.5%     5.9%
+  spdlog              0.7      0.3     0.208     0.092    29.7%     6.3%
+  range-v3            1.3      0.9     0.674     0.226    51.8%     3.8%
+  catch2              1.3      0.9     0.687     0.213    52.9%     4.1%
+  rocksdb             2.9      1.7     1.341     0.359    46.2%     3.4%
+  opencv              5.3      3.6     2.768     0.832    52.2%     4.0%
+  eigen               9.8      7.8     6.449     1.351    65.8%     1.2%
+
+  AGGREGATE over 11 projects (debian-gcc), one grouped pass:
+    total encode wall              24.7 s
+    load+intern phase              16.3 s  (66.0% of wall)
+      -> load_corpus (file read/copy)    12.8 s  (51.8% of wall, 78.5% of the phase)
+      -> Interner::process                3.5 s  (14.2% of wall, 21.5% of the phase)
+         of which per-line interning      0.8 s  (3.3% of wall)   <- the intern_line seam
+
+  UPPER BOUNDS (stage -> zero), against the measured two-pass 0.370 GB/s:
+    M5 behind intern_line (line loop)            0.383 GB/s 
+    whole Interner::process free                 0.431 GB/s 
+    shared in-memory producer (no load_corpus)   0.768 GB/s 
+    producer AND whole process free              1.088 GB/s CLEARS
