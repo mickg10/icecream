@@ -32,6 +32,77 @@ static bool write_partial_copy(const std::string &source,
   return output.good();
 }
 
+static void write_snapshot_prefix(SnapshotWriter &out, uint8_t kind,
+                                  const cap::SourceGeneration &generation) {
+  out.raw(SNAP_MAGIC, sizeof SNAP_MAGIC);
+  out.u8(kind);
+  out.u32(capp::CAP_PROTOCOL_VERSION);
+  out.raw(generation.data(), generation.size());
+}
+
+static bool write_f_block_count_fixture(
+    const std::string &path, const cap::SourceGeneration &generation,
+    uint64_t children) {
+  SnapshotWriter out(path);
+  if (!out.good())
+    return false;
+  write_snapshot_prefix(out, 'F', generation);
+  out.u32(1); // Regions
+  out.u32(1); // Blocks
+  out.u64(0); // known Regions
+  out.u32(1); // next public ordinal
+  out.u32(0); // held public Lines
+  out.u64(0); // paths
+  out.u64(1); // known Blocks
+  out.u32(0); // Block id
+  out.u64(1); // last-use tick
+  out.u64(children);
+  return out.finish();
+}
+
+static bool write_f_public_count_fixture(
+    const std::string &path, const cap::SourceGeneration &generation,
+    uint32_t publicNext) {
+  SnapshotWriter out(path);
+  if (!out.good())
+    return false;
+  write_snapshot_prefix(out, 'F', generation);
+  out.u32(0);
+  out.u32(0);
+  out.u64(0);
+  out.u32(publicNext);
+  out.u32(0);
+  return out.finish();
+}
+
+static bool write_f_dimension_fixture(
+    const std::string &path, const cap::SourceGeneration &generation,
+    uint32_t nreg) {
+  SnapshotWriter out(path);
+  if (!out.good())
+    return false;
+  write_snapshot_prefix(out, 'F', generation);
+  out.u32(nreg);
+  out.u32(0);
+  return out.finish();
+}
+
+static bool write_c_path_count_fixture(
+    const std::string &path, const cap::SourceGeneration &generation,
+    uint64_t paths) {
+  SnapshotWriter out(path);
+  if (!out.good())
+    return false;
+  write_snapshot_prefix(out, 'C', generation);
+  out.u64(1); // distinctLines + sentinel
+  out.u32(0);
+  out.u32(0);
+  out.u32(0);
+  out.u32(1); // next public ordinal
+  out.u64(paths);
+  return out.finish();
+}
+
 int main() {
   fprintf(stderr, "[1] receiver mirror scope:\n");
   MixedEncoder encoder;
@@ -303,6 +374,61 @@ int main() {
                              loadedCache),
         "partial F snapshot rejected");
 
+  fprintf(stderr, "[4b] snapshot count and byte bounds:\n");
+  const uint64_t tooManyChildren =
+      uint64_t(cap::MAX_PAYLOAD) / sizeof(uint32_t) + 1;
+  check(write_f_block_count_fixture(base + ".f.children-cap", generation,
+                                    tooManyChildren) &&
+            !load_f_snapshot(base + ".f.children-cap", generation,
+                             loadedStore, loadedCache),
+        "Block child count is bounded in elements before allocation");
+  check(write_f_block_count_fixture(base + ".f.children-short", generation,
+                                    1) &&
+            !load_f_snapshot(base + ".f.children-short", generation,
+                             loadedStore, loadedCache),
+        "Block child count is bounded by encoded bytes before allocation");
+  const uint32_t tooManyPublic = uint32_t(
+      uint64_t(cap::MAX_PAYLOAD) /
+          (sizeof(std::vector<uint8_t>) + sizeof(uint8_t) +
+           sizeof(uint32_t)) +
+      1);
+  check(write_f_public_count_fixture(base + ".f.public-cap", generation,
+                                     tooManyPublic) &&
+            !load_f_snapshot(base + ".f.public-cap", generation, loadedStore,
+                             loadedCache),
+        "public-Line table count is bounded before allocation");
+  const uint32_t tooManyRegions = uint32_t(
+      uint64_t(cap::MAX_PAYLOAD) / sizeof(capc::MixedFRegionView) + 1);
+  check(write_f_dimension_fixture(base + ".f.dimension-cap", generation,
+                                  tooManyRegions) &&
+            !load_f_snapshot(base + ".f.dimension-cap", generation,
+                             loadedStore, loadedCache),
+        "F snapshot dimensions are bounded before store allocation");
+  const uint64_t tooManyPaths =
+      uint64_t(cap::MAX_PAYLOAD) / sizeof(std::string) + 1;
+  check(write_c_path_count_fixture(base + ".c.paths-cap", generation,
+                                   tooManyPaths) &&
+            !load_c_snapshot(base + ".c.paths-cap", generation,
+                             loadedEncoder, loadedMirrors, 0, 0, 0),
+        "C path count is bounded before vector allocation");
+  check(write_c_path_count_fixture(base + ".c.paths-short", generation, 1) &&
+            !load_c_snapshot(base + ".c.paths-short", generation,
+                             loadedEncoder, loadedMirrors, 0, 0, 0),
+        "C path count is bounded by encoded bytes before allocation");
+  {
+    SnapshotWriter out(base + ".aggregate-cap");
+    std::vector<uint8_t> one{1};
+    out.bytes(one);
+    check(out.finish(), "aggregate-budget fixture written");
+    SnapshotReader in(base + ".aggregate-cap");
+    std::vector<uint8_t> decoded;
+    uint64_t allocationBytes = cap::MAX_PAYLOAD;
+    check(in.good() &&
+              !in.bytes(decoded, cap::MAX_PAYLOAD, &allocationBytes) &&
+              decoded.empty() && allocationBytes == cap::MAX_PAYLOAD,
+          "aggregate byte budget is checked before vector allocation");
+  }
+
   FStore emptyStore;
   emptyStore.init(0, 0);
   CacheState emptyCache;
@@ -319,6 +445,13 @@ int main() {
   unlink((base + ".f").c_str());
   unlink((base + ".f.partial").c_str());
   unlink((base + ".f.empty").c_str());
+  unlink((base + ".f.children-cap").c_str());
+  unlink((base + ".f.children-short").c_str());
+  unlink((base + ".f.public-cap").c_str());
+  unlink((base + ".f.dimension-cap").c_str());
+  unlink((base + ".c.paths-cap").c_str());
+  unlink((base + ".c.paths-short").c_str());
+  unlink((base + ".aggregate-cap").c_str());
   printf("cap_m5_state_test: %s\n", failures ? "FAIL" : "PASS");
   return failures ? 1 : 0;
 }

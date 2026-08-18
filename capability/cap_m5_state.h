@@ -516,12 +516,20 @@ private:
 class SnapshotReader {
 public:
   explicit SnapshotReader(const std::string &path)
-      : in(path, std::ios::binary) {}
-  bool good() const { return in.good(); }
+      : in(path, std::ios::binary) {
+    std::error_code error;
+    remaining_bytes = std::filesystem::file_size(path, error);
+    valid = !error && in.good();
+  }
+  bool good() const { return valid && in.good(); }
+  uint64_t remaining() const { return remaining_bytes; }
   bool u8(uint8_t &value) {
+    if (!valid || !remaining_bytes)
+      return false;
     char byte = 0;
     if (!in.get(byte))
       return false;
+    --remaining_bytes;
     value = uint8_t(byte);
     return true;
   }
@@ -546,31 +554,78 @@ public:
     return true;
   }
   bool raw(void *data, size_t size) {
-    return !size ||
-           bool(in.read(static_cast<char *>(data), std::streamsize(size)));
+    if (!valid || uint64_t(size) > remaining_bytes ||
+        size > size_t(std::numeric_limits<std::streamsize>::max()))
+      return false;
+    if (size &&
+        !in.read(static_cast<char *>(data), std::streamsize(size)))
+      return false;
+    remaining_bytes -= size;
+    return true;
   }
-  bool bytes(std::vector<uint8_t> &value, uint64_t maximum = 1ull << 40) {
+  bool bytes(std::vector<uint8_t> &value, uint64_t maximum = 1ull << 40,
+             uint64_t *aggregate = nullptr) {
     uint64_t size = 0;
-    if (!u64(size) || size > maximum || size > SIZE_MAX)
+    if (!u64(size) || size > maximum || size > cap::MAX_PAYLOAD ||
+        size > remaining_bytes || size > SIZE_MAX ||
+        size > value.max_size() ||
+        (aggregate && (*aggregate > cap::MAX_PAYLOAD ||
+                       size > uint64_t(cap::MAX_PAYLOAD) - *aggregate)))
       return false;
     value.resize(size_t(size));
-    return raw(value.data(), value.size());
+    if (!raw(value.data(), value.size()))
+      return false;
+    if (aggregate)
+      *aggregate += size;
+    return true;
   }
-  bool string(std::string &value, uint64_t maximum = 1ull << 30) {
+  bool string(std::string &value, uint64_t maximum = 1ull << 30,
+              uint64_t *aggregate = nullptr) {
     uint64_t size = 0;
-    if (!u64(size) || size > maximum || size > SIZE_MAX)
+    if (!u64(size) || size > maximum || size > cap::MAX_PAYLOAD ||
+        size > remaining_bytes || size > SIZE_MAX ||
+        size > value.max_size() ||
+        (aggregate && (*aggregate > cap::MAX_PAYLOAD ||
+                       size > uint64_t(cap::MAX_PAYLOAD) - *aggregate)))
       return false;
     value.resize(size_t(size));
-    return raw(value.data(), value.size());
+    if (!raw(value.data(), value.size()))
+      return false;
+    if (aggregate)
+      *aggregate += size;
+    return true;
   }
-  bool end() {
-    char byte = 0;
-    return !in.get(byte) && in.eof();
-  }
+  bool end() const { return valid && remaining_bytes == 0; }
 
 private:
   std::ifstream in;
+  uint64_t remaining_bytes = 0;
+  bool valid = false;
 };
+
+template <typename Element>
+static inline bool snapshot_vector_count_fits(const SnapshotReader &in,
+                                              uint64_t count,
+                                              uint64_t maximum,
+                                              uint64_t minimum_encoded_bytes) {
+  if (count > maximum || count > SIZE_MAX ||
+      count > std::vector<Element>().max_size() ||
+      count > uint64_t(cap::MAX_PAYLOAD) / sizeof(Element))
+    return false;
+  return !minimum_encoded_bytes ||
+         count <= in.remaining() / minimum_encoded_bytes;
+}
+
+static inline bool snapshot_add_bytes(uint64_t &total, uint64_t count,
+                                      uint64_t element_bytes) {
+  if (element_bytes && count > uint64_t(cap::MAX_PAYLOAD) / element_bytes)
+    return false;
+  const uint64_t added = count * element_bytes;
+  if (total > uint64_t(cap::MAX_PAYLOAD) - added)
+    return false;
+  total += added;
+  return true;
+}
 
 static constexpr char SNAP_MAGIC[8] = {'C', 'A', 'P', 'M', '5', 'S', '1', '\0'};
 
@@ -580,8 +635,9 @@ static inline void write_u8_vector(SnapshotWriter &out,
 }
 static inline bool read_u8_vector(SnapshotReader &in,
                                   std::vector<uint8_t> &values,
-                                  uint64_t maximum) {
-  return in.bytes(values, maximum);
+                                  uint64_t maximum,
+                                  uint64_t *aggregate = nullptr) {
+  return in.bytes(values, maximum, aggregate);
 }
 static inline void write_u64_vector(SnapshotWriter &out,
                                     const std::vector<uint64_t> &values) {
@@ -593,7 +649,9 @@ static inline bool read_u64_vector(SnapshotReader &in,
                                    std::vector<uint64_t> &values,
                                    uint64_t maximum) {
   uint64_t count = 0;
-  if (!in.u64(count) || count > maximum || count > SIZE_MAX)
+  if (!in.u64(count) ||
+      !snapshot_vector_count_fits<uint64_t>(in, count, maximum,
+                                            sizeof(uint64_t)))
     return false;
   values.resize(size_t(count));
   for (uint64_t &value : values)
@@ -666,12 +724,15 @@ static inline bool load_c_snapshot(const std::string &path,
         !in.u32(line.public_id))
       return false;
   if (!in.u32(encoder.nextMixedPublic) || !encoder.nextMixedPublic ||
-      !in.u64(count) || count > UINT32_MAX)
+      !in.u64(count) ||
+      !snapshot_vector_count_fits<std::string>(in, count, UINT32_MAX,
+                                               sizeof(uint64_t)))
     return false;
   encoder.paths.resize(size_t(count));
   encoder.pathid.clear();
+  uint64_t pathBytes = 0;
   for (uint32_t i = 0; i < count; ++i) {
-    if (!in.string(encoder.paths[i]))
+    if (!in.string(encoder.paths[i], cap::MAX_PAYLOAD, &pathBytes))
       return false;
     if (!encoder.pathid.emplace(encoder.paths[i], i).second)
       return false;
@@ -687,15 +748,17 @@ static inline bool load_c_snapshot(const std::string &path,
   for (uint64_t *field : fields)
     if (!in.u64(*field))
       return false;
-  if (!in.u64(count) || count > 1024)
+  if (!in.u64(count) ||
+      !snapshot_vector_count_fits<ReceiverMirror>(in, count, 1024, 30))
     return false;
   mirrors.resize(size_t(count));
+  uint64_t mirrorBytes = 0;
   for (auto &mirror : mirrors) {
-    if (!read_u8_vector(in, mirror.regions, nreg) ||
+    if (!read_u8_vector(in, mirror.regions, nreg, &mirrorBytes) ||
         mirror.regions.size() != nreg ||
-        !read_u8_vector(in, mirror.public_lines, UINT32_MAX) ||
+        !read_u8_vector(in, mirror.public_lines, UINT32_MAX, &mirrorBytes) ||
         mirror.public_lines.empty() ||
-        !read_u8_vector(in, mirror.blocks, nblk) ||
+        !read_u8_vector(in, mirror.blocks, nblk, &mirrorBytes) ||
         mirror.blocks.size() != nblk || !in.u32(mirror.path_count) ||
         mirror.path_count > encoder.paths.size() || !in.u8(recovering) ||
         recovering > 1)
@@ -785,20 +848,32 @@ static inline bool load_f_snapshot(const std::string &path,
       !in.raw(generation.data(), generation.size()) || generation != expected ||
       !in.u32(nreg) || !in.u32(nblk))
     return false;
+  uint64_t dimensionBytes = 0;
+  constexpr uint64_t regionDimensionBytes =
+      sizeof(capc::MixedFRegionView) + 2 * sizeof(uint64_t) +
+      3 * sizeof(uint32_t) + sizeof(uint8_t);
+  constexpr uint64_t blockDimensionBytes =
+      sizeof(std::vector<uint32_t>) + 2 * sizeof(uint64_t) +
+      3 * sizeof(uint32_t) + 2 * sizeof(uint8_t);
+  if (!snapshot_add_bytes(dimensionBytes, nreg, regionDimensionBytes) ||
+      !snapshot_add_bytes(dimensionBytes, nblk, blockDimensionBytes))
+    return false;
   store = capc::FStore{};
   store.init(nreg, nblk);
   regionTicks.assign(nreg, 0);
   blockTicks.assign(nblk, 0);
-  if (!in.u64(count) || count > nreg)
+  if (!in.u64(count) || count > nreg || count > in.remaining() / 16)
     return false;
+  uint64_t regionDataBytes = 0;
   for (uint64_t i = 0; i < count; ++i) {
     if (!in.u32(id) || id >= nreg || store.FmixedRegions[id].known ||
         !in.u64(tick) || !in.u32(length))
       return false;
     size_t offset = store.FmixedRegionData.size();
-    if (length > cap::MAX_PAYLOAD)
+    if (length > cap::MAX_PAYLOAD || length > in.remaining() ||
+        !snapshot_add_bytes(regionDataBytes, length, 1))
       return false;
-    store.FmixedRegionData.resize(offset + length);
+    store.FmixedRegionData.resize(size_t(regionDataBytes));
     if (!in.raw(store.FmixedRegionData.data() + offset, length))
       return false;
     store.FmixedRegions[id] = {offset, length, true};
@@ -808,31 +883,45 @@ static inline bool load_f_snapshot(const std::string &path,
   if (!in.u32(publicNext) || !publicNext || !in.u32(publicHeld) ||
       publicHeld > publicNext)
     return false;
+  uint64_t publicTableBytes = 0;
+  if (!snapshot_add_bytes(publicTableBytes, publicNext,
+                          sizeof(std::vector<uint8_t>) + sizeof(uint8_t) +
+                              sizeof(uint32_t)) ||
+      uint64_t(publicHeld) > in.remaining() / 16)
+    return false;
   store.Fpublic_next = publicNext;
   store.publicHeld = publicHeld;
   store.FpublicBytes.resize(publicNext);
   store.FpublicPresent.resize(publicNext, 0);
   store.FpublicLastUse.resize(publicNext, 0);
+  uint64_t publicContentBytes = 0;
   for (uint32_t i = 0; i < publicHeld; ++i) {
     std::vector<uint8_t> bytes;
     if (!in.u32(id) || !id || id >= publicNext || store.FpublicPresent[id] ||
-        !in.u32(last32) || !in.bytes(bytes, cap::MAX_PAYLOAD))
+        !in.u32(last32) ||
+        !in.bytes(bytes, cap::MAX_PAYLOAD, &publicContentBytes))
       return false;
     store.FpublicPresent[id] = 1;
     store.FpublicLastUse[id] = last32;
     store.FpublicBytes[id] = std::move(bytes);
   }
-  if (!in.u64(count) || count > UINT32_MAX)
+  if (!in.u64(count) ||
+      !snapshot_vector_count_fits<std::string>(in, count, UINT32_MAX,
+                                               sizeof(uint64_t)))
     return false;
   store.Fpaths.resize(size_t(count));
+  uint64_t pathBytes = 0;
   for (auto &value : store.Fpaths)
-    if (!in.string(value))
+    if (!in.string(value, cap::MAX_PAYLOAD, &pathBytes))
       return false;
-  if (!in.u64(count) || count > nblk)
+  if (!in.u64(count) || count > nblk || count > in.remaining() / 20)
     return false;
   for (uint64_t i = 0; i < count; ++i) {
     if (!in.u32(id) || id >= nblk || store.FknownBlk[id] || !in.u64(tick) ||
-        !in.u64(children) || children > cap::MAX_PAYLOAD)
+        !in.u64(children) ||
+        !snapshot_vector_count_fits<uint32_t>(
+            in, children, uint64_t(cap::MAX_PAYLOAD) / sizeof(uint32_t),
+            sizeof(uint32_t)))
       return false;
     store.FknownBlk[id] = 1;
     store.FblkChildren[id].resize(size_t(children));

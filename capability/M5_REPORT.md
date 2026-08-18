@@ -234,14 +234,22 @@ Current executed gates on the branch tip:
 | warning-clean optimized builds | PASS |
 | focused M1 header/transport, M2 transaction, M4 protocol, and M5 state tests | PASS |
 | typed Root closure and raw-weighted H200 focused cases | PASS |
+| snapshot count/byte allocation bounds, optimized and ASan+UBSan | PASS |
 | expanded typed smoke suite | **45/45 exact** |
 | batch rejection/rollback under ASan+UBSan | PASS, 20 commits / 2 prepared aborts |
 | bounded one-pass grow/removal under ASan+UBSan | PASS, 79,376 / 127,633 / 856 removals and 20 compactions |
 
 Latest retained smoke root:
-`/tanksmall/scratch/ictmp/issue16-m5-unified-smoke-nTRcYC`. It passes all
+`/tanksmall/scratch/ictmp/issue16-snapshot-bounds-P5YEOI/smoke`. It passes all
 **45/45** scenario rows, the five focused binaries, complete artifact hashes,
 and the enforced batch/one-pass physical-wire equivalence row.
+
+The focused optimized and instrumented snapshot logs are retained at:
+
+```text
+/tanksmall/scratch/ictmp/issue16-snapshot-bounds-P5YEOI/optimized/test.log
+/tanksmall/scratch/ictmp/issue16-snapshot-bounds-P5YEOI/asan-ubsan/test-rerun.log
+```
 
 The acceptance launcher now rebuilds and runs all five focused regression
 binaries before any scenario row: `cap_header_test`, `cap_transport_test`,
@@ -251,11 +259,20 @@ warning-clean rehearsal of that combined gate is retained at
 
 The same audit removed an invalid F-snapshot restriction: Block child count
 had been bounded by the number of distinct Regions even though a Block is a
-sequence and may reference one Region repeatedly. Snapshot restore now uses
-the actual encoded-count bound, and a repeated-child Block round trip passes
-both the warning-clean and ASan+UBSan state gates. A zero-dimension snapshot
-also round-trips, preserving the valid grow-on-arrival state before the first
-non-empty TU.
+sequence and may reference one Region repeatedly. The follow-up allocation
+audit closes the remaining count/byte mismatch. Before any snapshot-driven
+resize, restore now checks the container's element limit, the explicit
+allocation cap in elements, checked element-byte multiplication, and the
+minimum encoded bytes remaining in the file. In particular, Block children
+are bounded by both `MAX_PAYLOAD / sizeof(uint32_t)` and the available encoded
+child words. The reader tracks exact remaining bytes, and cumulative byte
+vectors are checked against their aggregate budget before allocation.
+
+Focused fixtures cover oversized and truncated Block-child arrays, oversized
+public-Line tables and F dimensions, oversized and truncated C path tables,
+and exhausted aggregate byte budgets. A repeated-child Block and a
+zero-dimension snapshot still round-trip, preserving the valid grow-on-arrival
+state before the first non-empty TU.
 
 A final scenario/rate comparison found four remaining wire differences. The
 batch factorizer could index a 3-Region sequence across the next TU boundary,
