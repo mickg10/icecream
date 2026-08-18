@@ -263,3 +263,92 @@ is the thing to test next on the fixed-16 and native-25 families, where the larg
 
 Everything above is **size-only**. Rate-legality is not applied and would only remove
 candidates, so each row is an upper bound on its rate-bound counterpart.
+
+---
+
+# INTERIM rate binding (conservative two-pass P29 charge)
+
+Measured isolated, box quiescent (load 1.2-1.7 throughout), fixed 16-core budget split
+disjoint **8 P29 (cores 16-23) / 8 GRZ (cores 24-31)**. Every P29 C rate is a
+**pessimistic floor**: both the raw-plane plan pass and the grouped encode are inside the
+candidate clock, so a one-pass encoder can only be faster. Each candidate is charged its
+own input conversion -- GRZ pays concat + TU map, P29 pays its own open + intern
+in-process. Nothing is derived by subtracting a stage. Probe reps 3, complete-encode and
+decode reps 2, **every rep retained in the TSV, none discarded**.
+
+## Headline: the decode floor is met everywhere, the encode floor nowhere
+
+| gate | cells clearing |
+|---|---|
+| F >= 500 MB/s, GRZ2 (real single-thread decode) | **44/44** |
+| F >= 500 MB/s, P29+BSC (codec in-process proxy) | **44/44** |
+| C >= 1 GB/s, GRZ2 (charged) | **0/44** |
+| C >= 1 GB/s, P29+BSC (two-pass, charged) | **0/44** |
+| full gate, either codec | **0/44** |
+
+Distribution (median of reps): P29 C 0.128-0.444 (med 0.286) · GRZ C 0.269-0.589
+(med 0.470) · GRZ F 0.531-2.059 (med 0.875) · P29 F proxy 0.653-11.308 (med 2.486).
+
+## What each proposed fix actually buys
+
+Aggregate over all 44 cells, 74.54 GB raw:
+
+| configuration | C GB/s | gate |
+|---|---:|---|
+| P29 as measured (plan + grouped, research interner) | 0.370 | FAIL 0/44 |
+| **P29 if one-pass** (grouped only, research interner) | **0.693** | **FAIL 0/44** |
+| GRZ as measured (concat + TU map + encode) | 0.516 | FAIL 0/44 |
+| **GRZ if one-producer fanout** (encode only) | **1.304** | **PASS 25/44** |
+
+The plan pass is 46.6% of P29's candidate time; the concat is 60.4% of GRZ's.
+
+This answers the open question empirically, and the two codecs answer it differently:
+
+- **For GRZ2 the binding cost is the harness, not the codec.** Materializing a
+  concatenated `cell.ii` on disk is a measurement artifact -- production holds the TU
+  stream in memory. A one-producer fanout moves GRZ from 0.516 to **1.304 GB/s**, clearing
+  the gate on 25/44 and on **15/15 of the cells at or above 1 GB raw**. The small cells
+  that still miss are fixed-overhead-bound, as they have been throughout.
+- **For P29+BSC one-pass is necessary but nowhere near sufficient.** Removing the plan
+  pass entirely still leaves 0.693 GB/s and **0/44** cells clearing. P29 needs the
+  one-pass refinement *and* fast M5 interning *and* more cores before this gate is in
+  reach. Its C-stage numbers remain research-interner labelled.
+
+## The tension the census exposed, now answered
+
+On the 10 cells where P29+BSC wins the complete size -- the cells a selector actually
+needs P29+BSC to be rate-legal on -- **P29 clears the gate on 0 of 10**:
+
+| project | profile | P29 C | P29 F | GRZ C | P29 gate |
+|---|---|---:|---:|---:|:---:|
+| eigen | linuxbrew | 0.444 | 11.308 | 0.580 | FAIL |
+| eigen | debian-gcc | 0.441 | 10.882 | 0.586 | FAIL |
+| eigen | conan-gcc | 0.435 | 10.630 | 0.578 | FAIL |
+| eigen | fedora-clang-libcxx | 0.429 | 10.643 | 0.589 | FAIL |
+| range-v3 | fedora-clang-libcxx | 0.407 | 8.760 | 0.574 | FAIL |
+| opencv | fedora-clang-libcxx | 0.367 | 6.702 | 0.499 | FAIL |
+| rocksdb | fedora-clang-libcxx | 0.361 | 4.261 | 0.512 | FAIL |
+| rocksdb | linuxbrew | 0.346 | 3.753 | 0.484 | FAIL |
+| rocksdb | conan-gcc | 0.345 | 3.752 | 0.491 | FAIL |
+| rocksdb | debian-gcc | 0.341 | 3.703 | 0.483 | FAIL |
+
+These are the *fastest* P29 cells in the matrix -- they top the P29 C distribution -- and
+they still sit at roughly a third of the deadline. Even a perfect one-pass would land them
+near 0.68-0.89 GB/s. **The 0.9705x oracle is therefore not rate-reachable on this matrix
+with P29 as it stands**: a rate-legal selector would be forced onto GRZ2 everywhere, which
+is the 1.1071x naive result. Closing that gap is a P29 encode-throughput problem, not a
+selector problem.
+
+## Carried-through selection
+
+Size-census selection is unchanged and size-consistent: 62,587,653 B, 1190.96x,
+**0.9705x z19**. The rate-legal-restricted selection is identical only because no cell has
+a legal candidate under this charge, so every cell falls back to the size minimum; that
+row is a placeholder, not a rate-bound result.
+
+## Status of this table
+
+**INTERIM / conservative-two-pass**, pending bigoracle's ruling. Two labels stay attached:
+P29's C uses the research interner and is not the product limit, and P29's F is the
+codec's in-process per-stream proxy because there is no standalone P29 decoder -- a direct
+codec report, but not the same measurement as GRZ's real standalone decode.

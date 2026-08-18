@@ -1,0 +1,32 @@
+# INTERIM / conservative-two-pass P29. Gate: C >= 1 GB/s AND F >= 500 MB/s.
+# P29 F is the codec's in-process proxy (no standalone decoder); GRZ F is a real single-thread decode.
+
+# cells clearing the full gate under the pessimistic charge:
+#  debian-gcc           n=11  P29 legal  0  GRZ legal  0  both  0  either  0
+#  conan-gcc            n=11  P29 legal  0  GRZ legal  0  both  0  either  0
+#  linuxbrew            n=11  P29 legal  0  GRZ legal  0  both  0  either  0
+#  fedora-clang-libcxx  n=11  P29 legal  0  GRZ legal  0  both  0  either  0
+#  ALL                  n=44  P29 legal  0  GRZ legal  0  both  0  either  0
+
+# rate distribution (median of reps):
+#  P29 C (2-pass)   min 0.128  p25 0.187  med 0.286  p75 0.365  max 0.444  >=floor 0/44
+#  GRZ C            min 0.269  p25 0.383  med 0.470  p75 0.525  max 0.589  >=floor 0/44
+#  GRZ F (1T)       min 0.531  p25 0.759  med 0.875  p75 1.100  max 2.059  >=floor 44/44
+#  P29 F (proxy)    min 0.653  p25 1.070  med 2.486  p75 5.903  max 11.308  >=floor 44/44
+
+# THE 10 CELLS WHERE P29+BSC WINS COMPLETE SIZE -- does P29 clear the gate there?
+#  project        profile                 P29 C    P29 F    GRZ C  P29 gate
+#  eigen          linuxbrew               0.444   11.308    0.580  FAIL
+#  eigen          debian-gcc              0.441   10.882    0.586  FAIL
+#  eigen          conan-gcc               0.435   10.630    0.578  FAIL
+#  eigen          fedora-clang-libcxx     0.429   10.643    0.589  FAIL
+#  range-v3       fedora-clang-libcxx     0.407    8.760    0.574  FAIL
+#  opencv         fedora-clang-libcxx     0.367    6.702    0.509  FAIL
+#  rocksdb        fedora-clang-libcxx     0.361    4.261    0.525  FAIL
+#  rocksdb        linuxbrew               0.346    3.753    0.498  FAIL
+#  rocksdb        conan-gcc               0.345    3.752    0.503  FAIL
+#  rocksdb        debian-gcc              0.341    3.703    0.494  FAIL
+#  -> P29 clears the gate on 0 of those 10 cells
+
+# size-census selection carried through: selected=62587653  x=1190.96  /z19=0.9705
+# rate-legal-restricted selection: 62587653  x=1190.96  /z19=0.9705  (cells with NO legal candidate: 44, charged at size-min)
