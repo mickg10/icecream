@@ -13,6 +13,7 @@ import sys
 
 DOCKER = os.path.expanduser("~/issue16-selector-v1/matrix44-20260818T0230Z/cells")
 F16 = os.path.expanduser("~/selbind/f16")
+N25 = os.path.expanduser("~/selbind/n25")
 F16_GRZ = {"corpus": 7638087, "corpus2": 5456878, "corpus3": 6576037, "corpus4": 3424583,
            "corpus5": 6687096, "corpus6": 53427567, "corpus7": 662261, "corpus8": 436106,
            "corpus9": 626178, "corpus10": 743198, "corpus11": 628319, "corpus12": 2040151,
@@ -47,6 +48,20 @@ for f in sorted(glob.glob(f"{F16}/*/feat.tsv")):
     rows.append(dict(
         family="fixed16", project=F16_NAME[c], profile="fixed16",
         p29=F16_P29[c], grz=F16_GRZ[c], z19=0, raw=0,
+        total_tus=i("total_tus"), probe_tus=i("probe_tus"), probe_raw=i("probe_raw"),
+        depth=i("p29_region_occ") / i("p29_regions"), regions=i("p29_regions"),
+        distinct=i("p29_distinct_lines"),
+        litfrac=i("p29_raw_literal") / i("probe_raw"),
+        addfrac=i("grz_g1_add_bytes") / i("grz_g1_out_bytes"),
+        ratio=i("grz_probe_bytes") / i("p29_probe_bytes"),
+        ref_ops=i("p29_op_ref"), lit_ops=i("p29_op_literal")))
+
+for f in sorted(glob.glob(f"{N25}/*/feat.tsv")):
+    d = dict(l.rstrip("\n").split("\t", 1) for l in open(f) if "\t" in l)
+    i = lambda k: int(d[k])
+    rows.append(dict(
+        family="native", project=d["id"], profile="native",
+        p29=i("p29_complete"), grz=i("grz_complete"), z19=0, raw=0,
         total_tus=i("total_tus"), probe_tus=i("probe_tus"), probe_raw=i("probe_raw"),
         depth=i("p29_region_occ") / i("p29_regions"), regions=i("p29_regions"),
         distinct=i("p29_distinct_lines"),
@@ -96,10 +111,11 @@ def rule(D, F2, sense, feat):
 
 
 e = sys.stderr
-print("rows: docker %d, fixed16 %d" % (sum(r["family"] == "docker" for r in rows),
-                                       sum(r["family"] == "fixed16" for r in rows)), file=e)
+print("rows: docker %d, fixed16 %d, native %d" % (
+    sum(r["family"] == "docker" for r in rows), sum(r["family"] == "fixed16" for r in rows),
+    sum(r["family"] == "native" for r in rows)), file=e)
 print("\nBaseline regret (lower is better):", file=e)
-for fam in ("docker", "fixed16"):
+for fam in ("docker", "fixed16", "native"):
     sub = [r for r in rows if r["family"] == fam]
     print("  %-8s frozen-500MB %10d | always-GRZ %10d | always-P29 %10d | oracle 0" % (
         fam, regret(sub, frozen), regret(sub, lambda r: False),
@@ -117,19 +133,21 @@ for feat in FEATS:
         pick = rule(D, F2, sense, feat)
         for r in test:
             held[r["family"]] += (r["p29"] if pick(r) else r["grz"]) - min(r["p29"], r["grz"])
-    results.append((held["docker"] + held["fixed16"], held["docker"], held["fixed16"], feat))
+    results.append((held["docker"] + held["fixed16"] + held["native"],
+                    held["docker"], held["fixed16"], held["native"], feat))
 results.sort()
-print("  %-22s %12s %12s %12s" % ("depth + feature", "held docker", "held fixed16", "total"), file=e)
-for tot, dk, f16, feat in results:
-    print("  depth + %-14s %12d %12d %12d" % (feat, dk, f16, tot), file=e)
+print("  %-22s %12s %12s %12s %12s" % ("depth + feature", "held docker", "held fixed16",
+                                        "held native", "total"), file=e)
+for tot, dk, f16, nat, feat in results:
+    print("  depth + %-14s %12d %12d %12d %12d" % (feat, dk, f16, nat, tot), file=e)
 
-best_feat = results[0][3]
+best_feat = results[0][4]
 g, err, D, F2, sense = grid(rows, best_feat)
 pick = rule(D, F2, sense, best_feat)
 print("\nBEST-ON-ALL rule (reported for inspection, NOT held out):", file=e)
 print("  P29+BSC iff depth >= %.4g and %s %s %.6g" % (
     D, best_feat, ">=" if sense > 0 else "<=", F2), file=e)
-for fam in ("docker", "fixed16"):
+for fam in ("docker", "fixed16", "native"):
     sub = [r for r in rows if r["family"] == fam]
     tp = sum(1 for r in sub if pick(r) and r["label"] == "P29")
     fp = sum(1 for r in sub if pick(r) and r["label"] == "GRZ")
@@ -138,7 +156,7 @@ for fam in ("docker", "fixed16"):
         fam, regret(sub, pick), regret(sub, frozen), tp, fp, fn), file=e)
 print("\n  the named cells:", file=e)
 for r in rows:
-    if (r["family"] == "fixed16" and r["project"] in ("godot", "llvm", "eigen", "rocksdb")):
+    if (r["family"] == "fixed16" and r["project"] in ("godot", "llvm", "eigen", "rocksdb")) or r["family"] == "native":
         print("    %-8s %-10s depth %7.1f  %s %12.4g  label %s  rule %s  %s" % (
             r["family"], r["project"], r["depth"], best_feat, r[best_feat], r["label"],
             "P29" if pick(r) else "GRZ",

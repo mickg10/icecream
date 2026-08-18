@@ -1,0 +1,36 @@
+rows: docker 44, fixed16 16, native 6
+
+Baseline regret (lower is better):
+  docker   frozen-500MB     564099 | always-GRZ    8810160 | always-P29    8582092 | oracle 0
+  fixed16  frozen-500MB   21769955 | always-GRZ   19587482 | always-P29    7539040 | oracle 0
+  native   frozen-500MB    4716367 | always-GRZ    4716367 | always-P29    2325495 | oracle 0
+
+LEAVE-ONE-PROJECT-OUT (fit on all other projects, both families together):
+  depth + feature         held docker held fixed16  held native        total
+  depth + remaining_tus       1921792       953356      1150996      4026144
+  depth + seen_frac           1921792       953356      1150996      4026144
+  depth + ref_per_lit         9447503      2383662      4446716     16277881
+  depth + regions_per_mb      9521718     21333372      5115407     35970497
+  depth + ratio               9910990     20492567      6787451     37191008
+  depth + distinct_per_region     10134743     21259197      6813968     38207908
+  depth + regions            11427798     21544705      7041862     40014365
+  depth + litfrac            13359810     21560412      5343301     40263523
+  depth + addfrac            13540743     21560412      5343301     40444456
+
+BEST-ON-ALL rule (reported for inspection, NOT held out):
+  P29+BSC iff depth >= 14.5 and remaining_tus >= 1093
+  docker   regret     823797 (frozen     564099)  TP=5 FP=1 FN=5
+  fixed16  regret     953356 (frozen   21769955)  TP=2 FP=1 FN=1
+  native   regret     254411 (frozen    4716367)  TP=2 FP=0 FN=1
+
+  the named cells:
+    fixed16  llvm       depth    39.3  remaining_tus         1126  label P29  rule P29  ok
+    fixed16  eigen      depth    84.2  remaining_tus          538  label P29  rule GRZ  WRONG
+    fixed16  rocksdb    depth     3.6  remaining_tus          510  label GRZ  rule GRZ  ok
+    fixed16  godot      depth    36.4  remaining_tus         2095  label P29  rule P29  ok
+    native   corpus17   depth    22.8  remaining_tus          668  label GRZ  rule GRZ  ok
+    native   corpus19   depth    20.1  remaining_tus         1093  label P29  rule P29  ok
+    native   corpus21   depth    20.1  remaining_tus         1630  label P29  rule P29  ok
+    native   corpus22   depth    18.7  remaining_tus          252  label P29  rule GRZ  WRONG
+    native   corpus23   depth    35.8  remaining_tus          185  label GRZ  rule GRZ  ok
+    native   corpus24   depth    31.9  remaining_tus          509  label GRZ  rule GRZ  ok
