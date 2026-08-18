@@ -506,6 +506,13 @@ struct ProducerTiming {
   double source_pipe = 0, interning = 0, factorization = 0;
 };
 
+struct CoordinatorTiming {
+  double queue_wait = 0, root_send = 0, need_receive = 0,
+         materialize = 0, encode = 0, fill_send = 0,
+         prepare_receive = 0, decision_send = 0, final_receive = 0,
+         account = 0, source_finish = 0, worker_finish = 0;
+};
+
 struct WorkerSummary {
   bool exact = false;
   uint64_t verified = 0, raw = 0, decode_ns = 0, path_ns = 0, failures = 0,
@@ -1190,6 +1197,7 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
   std::array<ComponentLedger, CK_COUNT> components{};
   PreparedQueue queue(options.queue_depth);
   ProducerTiming producerTiming;
+  CoordinatorTiming coordinatorTiming;
   auto activeStart = Clock::now();
   SourcePipeline source(manifest, options, workers, queue, dict,
                         producerTiming);
@@ -1207,12 +1215,15 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
     size_t wanted = std::min<size_t>(options.wave,
                                      manifest.paths.size() - cursor);
     std::vector<std::shared_ptr<PreparedTU>> batch;
+    auto phaseBegin = Clock::now();
     if (!queue.pop_batch(wanted, batch) || batch.empty()) {
       relationshipExact = false;
       break;
     }
+    coordinatorTiming.queue_wait += seconds_since(phaseBegin);
     std::vector<Pending> pending(batch.size());
     std::set<uint32_t> assigned;
+    phaseBegin = Clock::now();
     for (size_t index = 0; index < batch.size(); ++index) {
       auto &job = pending[index];
       job.prepared = batch[index];
@@ -1263,9 +1274,11 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
         break;
       }
     }
+    coordinatorTiming.root_send += seconds_since(phaseBegin);
     if (!relationshipExact)
       break;
 
+    phaseBegin = Clock::now();
     for (auto &job : pending) {
       auto &worker = workers[job.worker];
       cap::Frame frame;
@@ -1282,10 +1295,12 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
       }
       components[CK_NEED].received(needWire, needRaw.size());
     }
+    coordinatorTiming.need_receive += seconds_since(phaseBegin);
     if (!relationshipExact)
       break;
 
     std::vector<PreparedFill> fills(pending.size());
+    phaseBegin = Clock::now();
     for (size_t index = 0; index < pending.size(); ++index) {
       auto &job = pending[index];
       auto &worker = workers[job.worker];
@@ -1327,6 +1342,7 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
         fill.raw[part] = encoder.mixedRaw[part];
       transformSeconds += seconds_since(materializeBegin);
     }
+    coordinatorTiming.materialize += seconds_since(phaseBegin);
     if (!relationshipExact)
       break;
 
@@ -1345,7 +1361,9 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
       });
     for (auto &encoderThread : encoders)
       encoderThread.join();
-    transformSeconds += seconds_since(encodeWaveBegin);
+    const double encodeWaveSeconds = seconds_since(encodeWaveBegin);
+    transformSeconds += encodeWaveSeconds;
+    coordinatorTiming.encode += encodeWaveSeconds;
     for (const auto &fill : fills) {
       components[CK_PATH].note(fill.encoded_paths);
       for (size_t part = 0; part < 4; ++part)
@@ -1353,6 +1371,7 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
     }
 
     std::vector<uint8_t> sent(pending.size(), 0);
+    phaseBegin = Clock::now();
     std::vector<std::thread> senders;
     senders.reserve(pending.size());
     for (size_t index = 0; index < pending.size(); ++index)
@@ -1372,12 +1391,14 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
       });
     for (auto &sender : senders)
       sender.join();
+    coordinatorTiming.fill_send += seconds_since(phaseBegin);
     if (std::find(sent.begin(), sent.end(), uint8_t(0)) != sent.end()) {
       relationshipExact = false;
       break;
     }
 
     std::vector<uint8_t> preparedReplies(pending.size(), 0);
+    phaseBegin = Clock::now();
     for (size_t index = 0; index < pending.size(); ++index) {
       auto &job = pending[index];
       auto &worker = workers[job.worker];
@@ -1403,6 +1424,7 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
       else
         ++decodeRejected;
     }
+    coordinatorTiming.prepare_receive += seconds_since(phaseBegin);
     if (!relationshipExact)
       break;
 
@@ -1412,6 +1434,7 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
         firstRejected = index;
         break;
       }
+    phaseBegin = Clock::now();
     for (size_t index = 0; index < pending.size(); ++index) {
       if (!preparedReplies[index])
         continue;
@@ -1425,6 +1448,7 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
         break;
       }
     }
+    coordinatorTiming.decision_send += seconds_since(phaseBegin);
     if (!relationshipExact)
       break;
 
@@ -1434,6 +1458,7 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
       Clock::time_point received;
     };
     std::vector<FinalReply> replies(pending.size());
+    phaseBegin = Clock::now();
     for (size_t index = 0; index < pending.size(); ++index) {
       if (!preparedReplies[index])
         continue;
@@ -1459,9 +1484,11 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
       else
         ++aborted;
     }
+    coordinatorTiming.final_receive += seconds_since(phaseBegin);
     if (!relationshipExact)
       break;
 
+    phaseBegin = Clock::now();
     for (size_t index = 0; index < firstRejected; ++index) {
       auto &job = pending[index];
       auto &worker = workers[job.worker];
@@ -1487,14 +1514,19 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
       break;
     }
     cursor += batch.size();
+    coordinatorTiming.account += seconds_since(phaseBegin);
   }
 
   if (!relationshipExact)
     queue.fail();
+  auto finishBegin = Clock::now();
   bool sourceExact = source.finish();
+  coordinatorTiming.source_finish += seconds_since(finishBegin);
+  finishBegin = Clock::now();
   for (auto &worker : workers)
     if (!finish_worker(worker))
       relationshipExact = false;
+  coordinatorTiming.worker_finish += seconds_since(finishBegin);
 
   std::sort(curve.begin(), curve.end(),
             [](const CurveRow &left, const CurveRow &right) {
@@ -1640,6 +1672,16 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
          producerTiming.factorization
              ? rawTotal / producerTiming.factorization / 1e9
              : 0.0);
+  printf("WALL_PHASE queue=%.6fs root=%.6fs need=%.6fs materialize=%.6fs "
+         "encode=%.6fs fill=%.6fs prepare_ack=%.6fs decision=%.6fs "
+         "final_ack=%.6fs account=%.6fs source_finish=%.6fs "
+         "worker_finish=%.6fs\n",
+         coordinatorTiming.queue_wait, coordinatorTiming.root_send,
+         coordinatorTiming.need_receive, coordinatorTiming.materialize,
+         coordinatorTiming.encode, coordinatorTiming.fill_send,
+         coordinatorTiming.prepare_receive, coordinatorTiming.decision_send,
+         coordinatorTiming.final_receive, coordinatorTiming.account,
+         coordinatorTiming.source_finish, coordinatorTiming.worker_finish);
   printf("THROUGHPUT C_transform=%.3f GB/s F_decode_cpu=%.3f GB/s "
          "relationship=%.3f GB/s wall=%.6fs C_peak=%.1fMiB "
          "F_peak=%.1fMiB\n",
