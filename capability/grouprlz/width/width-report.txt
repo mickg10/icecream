@@ -1,0 +1,89 @@
+M_min(30): the binding cache-domain width, by slots-per-daemon c_f
+  30 simultaneous compiler slots.  M=30 is the c_f=1 THIN-DAEMON SPRAY DIAGNOSTIC.
+  Feasible saving is measured against that spray, not against M=1.
+
+  corpus                    c_f=1          c_f=4          c_f=8         c_f=30
+                         M_min=30        M_min=8        M_min=4        M_min=1
+  cereal      C->F       19970035        5737579        3162974        1108667
+             saved              -          71.3%          84.2%          94.4%
+  range-v3    C->F       18277708        6981504        4366363        1794129
+             saved              -          61.8%          76.1%          90.2%
+  catch2      C->F       18791057        7864635        5380433        2304172
+             saved              -          58.1%          71.4%          87.7%
+  eigen       C->F       41509630       17029852        9818578        3246490
+             saved              -          59.0%          76.3%          92.2%
+  duckdb      C->F       54132979       27067649       20230753       12614529
+             saved              -          50.0%          62.6%          76.7%
+  rocksdb     C->F       51996891       25269808       19693546       14336935
+             saved              -          51.4%          62.1%          72.4%
+  llvm        C->F       67341429       31604373       22897858       14439915
+             saved              -          53.1%          66.0%          78.6%
+  godot       C->F      156562992       98507383       81442848       62579307
+             saved              -          37.1%          48.0%          60.0%
+  MEAN saved vs the c_f=1 spray at c_f=4  (M_min= 8):  55.2%
+  MEAN saved vs the c_f=1 spray at c_f=8  (M_min= 4):  68.3%
+  MEAN saved vs the c_f=1 spray at c_f=30 (M_min= 1):  81.5%
+
+WIDTH SWEEP -- C->F wire by cache-domain width M (direction-exact)
+
+  corpus     raw/z19           M=1       M=2       M=4       M=8      M=16      M=30
+  cereal         694       1108667     1.67x     2.85x     5.18x     9.85x    18.01x
+  range-v3       853       1794129     1.51x     2.43x     3.89x     6.43x    10.19x
+  catch2        1183       2304172     1.49x     2.34x     3.41x     5.25x     8.16x
+  eigen         2846       3246490     1.70x     3.02x     5.25x     8.57x    12.79x
+  duckdb         280      12614529     1.23x     1.60x     2.15x     3.07x     4.29x
+  rocksdb        502      14336935     1.14x     1.37x     1.76x     2.47x     3.63x
+  llvm           496      14439915     1.23x     1.59x     2.19x     3.20x     4.66x
+  godot          103      62579307     1.12x     1.30x     1.57x     1.98x     2.50x
+
+MARGINAL COST OF THE NEXT CACHE DOMAIN -- extra C->F bytes per added daemon
+
+  corpus           1->2        2->4        4->8       8->16      16->30
+  cereal         746902     653702     643651     648166     646223
+  range-v3       910587     830824     653785     569875     481229
+  catch2        1129983     973139     621050     528281     478584
+  eigen         2279310    2146389    1802818    1350766     976689
+  duckdb        2871810    2372207    1709224    1453989    1102387
+  rocksdb       2042355    1657128    1394066    1267658    1184701
+  llvm          3284189    2586877    2176629    1825360    1509584
+  godot         7446489    5708526    4266134    3165135    2338181
+
+MARGINAL PRICE OF THE NEXT CACHE DOMAIN, as % of the build's OWN M=1 C->F wire
+  There is no knee -- the cost is near-linear in width -- so pick a threshold
+  and read off the widest M that still clears it.
+
+  corpus     raw/z19      1->2      2->4      4->8     8->16    16->30
+  cereal         694     67.4%     59.0%     58.1%     58.5%     58.3%
+  range-v3       853     50.8%     46.3%     36.4%     31.8%     26.8%
+  catch2        1183     49.0%     42.2%     27.0%     22.9%     20.8%
+  eigen         2846     70.2%     66.1%     55.5%     41.6%     30.1%
+  duckdb         280     22.8%     18.8%     13.5%     11.5%      8.7%
+  rocksdb        502     14.2%     11.6%      9.7%      8.8%      8.3%
+  llvm           496     22.7%     17.9%     15.1%     12.6%     10.5%
+  godot          103     11.9%      9.1%      6.8%      5.1%      3.7%
+
+WIDEST M WHOSE MARGINAL DAEMON COSTS UNDER X% OF THE M=1 WIRE
+
+  corpus     raw/z19       X=5%      X=10%      X=25%
+  cereal         694          1         1         1
+  range-v3       853          1         1         1
+  catch2        1183          1         1         1
+  eigen         2846          1         1         1
+  duckdb         280          1         1        30
+  rocksdb        502          1         1        30
+  llvm           496          1         1        30
+  godot          103          1         1        30
+
+FILL SHARE OF THE C->F WIRE, BY WIDTH
+
+  corpus         M=1      M=2      M=4      M=8     M=16     M=30
+  cereal       66.0%    78.7%    87.0%    92.2%    95.3%    96.9%
+  range-v3     61.9%    69.8%    77.7%    84.2%    89.3%    92.9%
+  catch2       50.5%    56.7%    63.8%    74.5%    83.0%    88.3%
+  eigen        57.9%    60.0%    62.0%    64.8%    73.2%    80.5%
+  duckdb       75.5%    78.5%    82.3%    85.7%    89.2%    91.8%
+  rocksdb      55.3%    58.2%    63.2%    70.1%    77.8%    84.6%
+  llvm         69.4%    71.7%    75.6%    80.5%    85.3%    89.2%
+  godot        93.6%    93.2%    93.0%    93.2%    93.8%    94.5%
+
+  gate: split_ok and dir_ok on every row -- ALL PASS;  carry_undirected total = 0
