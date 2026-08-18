@@ -76,10 +76,19 @@ The complete zstd-3 scaling rows are informative rather than independent
 | 16 | 1.037 | 1.057 | 0.998 |
 | 32 | 0.929 | 0.914 | 0.945 |
 
-Eight F stores remain the binding operating point.  The final code clears the
-gate on three complete runs without changing physical bytes.  The retained
-phase logs show why: the new overlap reduces the F-side final-Ack interval,
-while the producer, interner, causal factorizer, component choices, and wire
+Eight F stores remain the binding **test** point, not the preferred initial
+product configuration.  Subsequent owner direction accepts approximately
+0.5 GB/s while cold and prioritizes compressibility: the one-F rows retain
+12,613,513 B at 157.428x and complete at 0.481-0.519 GB/s, whereas eight
+independent F stores retain 26,587,144 B at 74.687x.  The intended follow-up
+is one shared per-C-GUID F cache populated by the compressibility-first lane,
+then warm fan-out to multiple compiler consumers without resetting that
+state.  That shared-cache transition is not implemented or timed by M5.
+
+The final M5 code nevertheless clears its stricter eight-F capability gate on
+three complete runs without changing physical bytes.  The retained phase logs
+show why: the new overlap reduces the F-side final-Ack interval, while the
+producer, interner, causal factorizer, component choices, and wire
 representation remain unchanged.
 
 ### Fixed-16 closure and artifact hashes
