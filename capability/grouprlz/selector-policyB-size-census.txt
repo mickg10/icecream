@@ -1,0 +1,59 @@
+SIZE-CENSUS (size-only, NOT rate-bound; no rate gate applied; not a fitted selector)
+per-cell selected = min(corrected P29+BSC complete, GRZ2 complete)
+
+project        profile                        raw    P29corr       GRZ2   selected winner      /z19
+catch2         conan-gcc                946329192     997420     630989     630989 GRZ2      0.7771
+catch2         debian-gcc               873426739     980640     627742     627742 GRZ2      0.7959
+catch2         fedora-clang-libcxx     2661096447    1144702    1074972    1074972 GRZ2      1.0326
+catch2         linuxbrew                909464733     940671     611125     611125 GRZ2      0.7837
+cereal         conan-gcc                278081296     476746     380387     380387 GRZ2      0.9003
+cereal         debian-gcc               273782205     466708     374637     374637 GRZ2      0.9009
+cereal         fedora-clang-libcxx      375959867     498257     381779     381779 GRZ2      0.8541
+cereal         linuxbrew                280493336     470913     376529     376529 GRZ2      0.8946
+eigen          conan-gcc               8189328289    2379861    4329139    2379861 P29BSC    0.9783
+eigen          debian-gcc              8094963600    2376519    3932160    2376519 P29BSC    0.9827
+eigen          fedora-clang-libcxx    10096756857    2320794    4864106    2320794 P29BSC    0.8973
+eigen          linuxbrew               8152489841    2309461    3874615    2309461 P29BSC    0.9660
+fmt            conan-gcc                131371127    1020039     676267     676267 GRZ2      0.9043
+fmt            debian-gcc               128551487    1006187     665724     665724 GRZ2      0.9042
+fmt            fedora-clang-libcxx      192626053     783182     600948     600948 GRZ2      0.8905
+fmt            linuxbrew                129410391     760819     595186     595186 GRZ2      0.9127
+leveldb        conan-gcc                178753005     925045     621537     621537 GRZ2      0.8886
+leveldb        debian-gcc               174821287     911927     612569     612569 GRZ2      0.8904
+leveldb        fedora-clang-libcxx      321953631     945669     621604     621604 GRZ2      0.8860
+leveldb        linuxbrew                180059857     785352     575702     575702 GRZ2      0.8958
+nlohmann-json  conan-gcc                296219113    1202534     802802     802802 GRZ2      0.9386
+nlohmann-json  debian-gcc               288512502    1132913     760359     760359 GRZ2      0.9383
+nlohmann-json  fedora-clang-libcxx      428239197    1437035     881905     881905 GRZ2      0.9417
+nlohmann-json  linuxbrew                296702050    1272706     808811     808811 GRZ2      0.9259
+opencv         conan-gcc               3598096497    6795281    6251815    6251815 GRZ2      1.0293
+opencv         debian-gcc              3524073698    6779047    6229483    6229483 GRZ2      1.0300
+opencv         fedora-clang-libcxx     5252526171    6144420    6609636    6144420 P29BSC    0.9996
+opencv         linuxbrew               3610590484    6052292    5959063    5959063 GRZ2      1.0384
+range-v3       conan-gcc                912083285     850547     633756     633756 GRZ2      0.8224
+range-v3       debian-gcc               866488941     842644     625132     625132 GRZ2      0.8269
+range-v3       fedora-clang-libcxx     2005784147     936114    1036737     936114 P29BSC    0.9860
+range-v3       linuxbrew               1043257878     892676     641613     641613 GRZ2      0.7853
+re2            conan-gcc                 87032434     462550     367974     367974 GRZ2      0.9442
+re2            debian-gcc                84637328     453331     362280     362280 GRZ2      0.9422
+re2            fedora-clang-libcxx      217114604     501668     396468     396468 GRZ2      0.8901
+re2            linuxbrew                 88654287     434258     355812     355812 GRZ2      0.9437
+rocksdb        conan-gcc               1995458263    2555041    2679877    2555041 P29BSC    1.0624
+rocksdb        debian-gcc              1804295565    2468928    2535516    2468928 P29BSC    1.0636
+rocksdb        fedora-clang-libcxx     2407316918    2282164    2553438    2282164 P29BSC    0.9704
+rocksdb        linuxbrew               1843673630    2278907    2444715    2278907 P29BSC    1.0171
+spdlog         conan-gcc                262532575     715752     507502     507502 GRZ2      0.8976
+spdlog         debian-gcc               255841435     703346     502334     502334 GRZ2      0.9027
+spdlog         fedora-clang-libcxx      537083605     776806     522291     522291 GRZ2      0.8407
+spdlog         linuxbrew                263293064     698032     498347     498347 GRZ2      0.8958
+
+debian-gcc           n=11 raw=  16.37GB selected=  15605707  x=raw/selected= 1048.94  /z19=0.9800  wins GRZ2=9 P29BSC=2
+                       GRZ2-only x=950.17 (/z19=1.0819)  P29-only x=903.28 (/z19=1.1380)  z19-only x=1027.97
+conan-gcc            n=11 raw=  16.88GB selected=  15807931  x=raw/selected= 1067.52  /z19=0.9773  wins GRZ2=9 P29BSC=2
+                       GRZ2-only x=943.70 (/z19=1.1056)  P29-only x=918.09 (/z19=1.1364)  z19-only x=1043.33
+linuxbrew            n=11 raw=  16.80GB selected=  15010556  x=raw/selected= 1119.09  /z19=0.9691  wins GRZ2=9 P29BSC=2
+                       GRZ2-only x=1003.38 (/z19=1.0808)  P29-only x=994.20 (/z19=1.0908)  z19-only x=1084.48
+fedora-clang-libcxx  n=11 raw=  24.50GB selected=  16163459  x=raw/selected= 1515.55  /z19=0.9563  wins GRZ2=7 P29BSC=4
+                       GRZ2-only x=1253.41 (/z19=1.1563)  P29-only x=1378.47 (/z19=1.0514)  z19-only x=1449.34
+ALL                  n=44 raw=  74.54GB selected=  62587653  x=raw/selected= 1190.96  /z19=0.9705  wins GRZ2=34 P29BSC=10
+                       GRZ2-only x=1044.03 (/z19=1.1071)  P29-only x=1047.34 (/z19=1.1036)  z19-only x=1155.83

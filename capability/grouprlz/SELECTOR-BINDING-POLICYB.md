@@ -135,3 +135,50 @@ census, and all stage clocks.
 Contention note: local-oracle's own 44-cell replay was running on cores 0-15 throughout,
 which are the SMT siblings of the physical cores under 16-31. Load average 3.4-4.8. The
 rate figures are therefore conservative; sizes and identity are unaffected.
+
+---
+
+# SIZE-CENSUS (size-only, NOT rate-bound)
+
+Per-cell `selected = min(corrected P29+BSC complete, GRZ2 complete)`. **No rate gate is
+applied and no selector is fitted.** This is a size observation over the 44 verified-v2
+docker cells; the rate-binding resource run is separate and gated.
+
+| profile | cells | raw | selected | **x = raw/selected** | / z19 | GRZ2 wins | P29+BSC wins |
+|---|---:|---:|---:|---:|---:|:---:|:---:|
+| debian-gcc | 11 | 16.37 GB | 15,605,707 | **1048.94** | 0.9800 | 9 | 2 |
+| conan-gcc | 11 | 16.88 GB | 15,807,931 | **1067.52** | 0.9773 | 9 | 2 |
+| linuxbrew | 11 | 16.80 GB | 15,010,556 | **1119.09** | 0.9691 | 9 | 2 |
+| fedora-clang-libcxx | 11 | 24.50 GB | 16,163,459 | **1515.55** | 0.9563 | 7 | 4 |
+| **ALL** | **44** | **74.54 GB** | **62,587,653** | **1190.96** | **0.9705** | **34** | **10** |
+
+Single-codec references on the same 44 cells:
+
+| | x raw | / z19 |
+|---|---:|---:|
+| GRZ2 alone | 1044.03 | 1.1071 |
+| corrected P29+BSC alone | 1047.34 | 1.1036 |
+| whole-program `zstd -19 --long=31` alone | 1155.83 | 1.0000 |
+| **per-cell min (this census)** | **1190.96** | **0.9705** |
+
+The complementarity is the finding: **neither codec alone beats whole-program zstd-19**
+(both about 1.10x z19), but the per-cell minimum does, at 0.9705x. The two codecs win on
+different cells -- 34/10 overall -- and fedora-clang-libcxx shifts hardest toward P29+BSC
+(7/4 versus 9/2 on the three gcc-family profiles).
+
+Because this is size-only, it is an upper bound on any rate-legal selector: applying a
+C-rate deadline can only remove candidates, never add them.
+
+## Corpus binding rule: verified on all 44
+
+`selector_pb_provenance.py` re-derives, per cell, that the payload was resolved from
+`corpus.json` `payload.path` (never globbed, never the older project-named package), that
+its SHA-256 and byte count match `payload.sha256`/`payload.bytes`, that the `manifest.tsv`
+used is the on-disk sibling of that declared payload, and that
+`probe_tus == min(112, tu_count)` with the measured TU count equal to `tu_count`.
+
+**44/44 cells: payload `ii.tar.zst`, SHA match True, counts_ok True. Zero violations.**
+Sanity cells as requested: **re2 = 72 TUs** (active corpus, not the old package's 22) and
+**rocksdb = 418** (not 367). Per-cell pins -- payload path, payload byte count,
+`corpus.json` SHA-256 and `manifest.tsv` SHA-256 -- are in
+`selector-policyB-provenance.tsv`.
