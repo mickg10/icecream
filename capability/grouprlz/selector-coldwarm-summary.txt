@@ -1,0 +1,44 @@
+rows=96  exact+ledger+txn OK on 96/96
+
+corpus    row             tus   first_ms    wire_TU50    wire_full  x_vs_1F    C_wall
+corpus11  ctl-1F          259      34.73       811144      1820664     1.00      1.34
+corpus11  ctl-8F          259      32.92      4049753      7076645     3.89      2.02
+corpus11  t1to4-at50      259      33.54       811144      4393096     2.41      1.80
+corpus11  t1to4-at100     259      33.77       811144      4310222     2.37      1.75
+corpus11  t1to4-at200     259      33.70       811144      3521837     1.93      1.67
+corpus11  t1to8-at50      259      34.66       811144      7019997     3.86      2.13
+corpus11  t1to8-at100     259      33.01       811144      6815648     3.74      2.07
+corpus11  t1to8-at200     259      33.63       811144      5496418     3.02      1.83
+
+corpus9   ctl-1F          857      23.74       658600      2384393     1.00      1.88
+corpus9   ctl-8F          857      15.13      2820461      8010182     3.36      2.80
+corpus9   t1to4-at50      857      22.35       658600      5457004     2.29      2.57
+corpus9   t1to4-at100     857      23.25       658600      5420799     2.27      2.64
+corpus9   t1to4-at200     857      23.43       658600      5368732     2.25      2.67
+corpus9   t1to8-at50      857      23.67       658600      7934451     3.33      2.92
+corpus9   t1to8-at100     857      23.77       658600      7909349     3.32      2.96
+corpus9   t1to8-at200     857      23.02       658600      7858919     3.30      2.94
+
+corpus2   ctl-1F          622      95.21      2920057     15692955     1.00      7.31
+corpus2   ctl-8F          622      95.47     10914469     26831854     1.71      8.78
+corpus2   t1to4-at50      622      85.92      2920057     21105387     1.34      7.99
+corpus2   t1to4-at100     622      82.71      2920057     21025959     1.34      7.97
+corpus2   t1to4-at200     622      92.08      2920057     20813791     1.33      8.11
+corpus2   t1to8-at50      622      85.08      2920057     26756155     1.70      8.75
+corpus2   t1to8-at100     622      83.65      2920057     26586352     1.69      8.72
+corpus2   t1to8-at200     622      83.56      2920057     26295263     1.68      8.85
+
+corpus12  ctl-1F          650      72.64       968586      3289527     1.00      6.64
+corpus12  ctl-8F          650      77.93      7128680     17208713     5.23      7.45
+corpus12  t1to4-at50      650      71.49       968586      9880843     3.00      6.93
+corpus12  t1to4-at100     650      72.74       968586      9609073     2.92      6.98
+corpus12  t1to4-at200     650      71.70       968586      8845801     2.69      7.04
+corpus12  t1to8-at50      650      75.34       968586     17103264     5.20      7.50
+corpus12  t1to8-at100     650      73.28       968586     16438751     5.00      7.49
+corpus12  t1to8-at200     650      72.89       968586     15320616     4.66      7.64
+
+PREFIX PRESERVATION (constraint a): cumulative wire at TU50 must equal the 1-F prefix
+  corpus11  1F@TU50=811144    transitions-joining-later match: YES
+  corpus9   1F@TU50=658600    transitions-joining-later match: YES
+  corpus2   1F@TU50=2920057   transitions-joining-later match: YES
+  corpus12  1F@TU50=968586    transitions-joining-later match: YES
