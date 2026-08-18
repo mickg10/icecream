@@ -1,0 +1,38 @@
+LEAVE-ONE-PROJECT-OUT FOLD AUDIT: is the threshold fit to the project it judges?
+
+  held-out project    fit thr held-out decisions (label -> rule)            
+  abseil                 1093 fix/fixed1 rt=588 GRZ->GRZ
+  catch2                 1093 doc/conan- rt=749 GRZ->GRZ; doc/debian rt=749 GRZ->GRZ; doc/fedora rt=749 GRZ->GRZ; doc/linuxb rt=749 GRZ->GRZ ...
+  cereal                 1093 doc/conan- rt=0 GRZ->GRZ; doc/debian rt=0 GRZ->GRZ; doc/fedora rt=0 GRZ->GRZ; doc/linuxb rt=0 GRZ->GRZ ...
+  corpus17               1093 nat/native rt=668 GRZ->GRZ
+  corpus19               1411 nat/native rt=1093 P29->GRZ X <-- POSITIVE LINEAGE
+                              regret 896585
+  corpus21               1093 nat/native rt=1630 P29->P29 <-- POSITIVE LINEAGE
+  corpus22               1093 nat/native rt=252 P29->GRZ X <-- POSITIVE LINEAGE
+                              regret 254411
+  corpus23               1093 nat/native rt=185 GRZ->GRZ
+  corpus24               1093 nat/native rt=509 GRZ->GRZ
+  duckdb                 1093 fix/fixed1 rt=577 GRZ->GRZ
+  eigen                  1093 doc/conan- rt=1412 P29->P29; doc/debian rt=1411 P29->P29; doc/fedora rt=1439 P29->P29; doc/linuxb rt=1417 P29->P29 ... <-- POSITIVE LINEAGE
+                              regret 898354
+  fmt                    1093 doc/conan- rt=0 GRZ->GRZ; doc/debian rt=0 GRZ->GRZ; doc/fedora rt=0 GRZ->GRZ; doc/linuxb rt=0 GRZ->GRZ ...
+  godot                  1093 fix/fixed1 rt=2095 P29->P29 <-- POSITIVE LINEAGE
+  json                   1093 fix/fixed1 rt=0 GRZ->GRZ
+  leveldb                1093 doc/conan- rt=0 GRZ->GRZ; doc/debian rt=0 GRZ->GRZ; doc/fedora rt=0 GRZ->GRZ; doc/linuxb rt=0 GRZ->GRZ ...
+  llvm                   1093 fix/fixed1 rt=1126 P29->P29 <-- POSITIVE LINEAGE
+  nlohmann-json          1093 doc/conan- rt=0 GRZ->GRZ; doc/debian rt=0 GRZ->GRZ; doc/fedora rt=0 GRZ->GRZ; doc/linuxb rt=0 GRZ->GRZ
+  opencv                 1093 doc/conan- rt=1388 GRZ->P29 X; doc/debian rt=1388 GRZ->P29 X; doc/fedora rt=1388 P29->P29; doc/linuxb rt=1373 GRZ->P29 X ... <-- POSITIVE LINEAGE
+                              regret 1248629
+  range-v3               1093 doc/conan- rt=425 GRZ->GRZ; doc/debian rt=425 GRZ->GRZ; doc/fedora rt=463 P29->GRZ X; doc/linuxb rt=463 GRZ->GRZ ... <-- POSITIVE LINEAGE
+                              regret 99976
+  re2                    1093 doc/conan- rt=0 GRZ->GRZ; doc/debian rt=0 GRZ->GRZ; doc/fedora rt=0 GRZ->GRZ; doc/linuxb rt=0 GRZ->GRZ ...
+  rocksdb                1093 doc/conan- rt=326 P29->GRZ X; doc/debian rt=317 P29->GRZ X; doc/fedora rt=339 P29->GRZ X; doc/linuxb rt=319 P29->GRZ X ... <-- POSITIVE LINEAGE
+                              regret 628189
+  simdjson               1093 fix/fixed1 rt=41 GRZ->GRZ
+  spdlog                 1093 doc/conan- rt=56 GRZ->GRZ; doc/debian rt=56 GRZ->GRZ; doc/fedora rt=56 GRZ->GRZ; doc/linuxb rt=56 GRZ->GRZ ...
+
+  total held-out regret = 4026144
+
+THE corpus19 FOLD SPECIFICALLY:
+  threshold refit WITHOUT corpus19 = 1411   (all-data threshold was 1093)
+  corpus19 remaining_tus = 1093, label = P29, rule says GRZ -> FLIPS

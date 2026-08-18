@@ -235,3 +235,59 @@ refutes it.
   (2,325,495 vs 4,716,367); the frozen rule is far the best on docker (564,099 vs
   8,582,092). A metric where the best constant policy flips between families is not yet
   able to certify a universal rule, however good the held-out number looks.
+
+---
+
+# FOLD AUDIT: the corpus19 fold FLIPS, and most positive lineages fail held out
+
+Asked: `remaining_tus = 1093` is exactly corpus19's value, so is the threshold fit to the
+project it judges? **Yes. The corpus19 fold flips.**
+
+```
+threshold refit WITHOUT corpus19 = 1411   (all-data threshold was 1093)
+corpus19 remaining_tus = 1093, label P29, rule says GRZ  ->  FLIPS, regret 896,585
+```
+
+23 of 24 folds fit 1093; only the fold that holds corpus19 out fits anything else. So the
+threshold is stable *because corpus19 pins it at exactly its own value* -- textbook
+single-point fitting.
+
+**The reported held-out total is not contaminated by this.** The leave-one-project-out
+protocol already charged corpus19's fold its full 896,585 regret; 4,026,144 includes the
+failure. The headline number stands. What does not stand is any impression that the rule
+reliably identifies P29 winners.
+
+## Held out, the rule gets 3 of 7 positive lineages right
+
+| held-out lineage | fitted thr | outcome | regret |
+|---|---:|---|---:|
+| godot | 1093 | correct | 0 |
+| llvm | 1093 | correct | 0 |
+| corpus21 | 1093 | correct | 0 |
+| **corpus19** | **1411** | **flips to GRZ** | 896,585 |
+| **corpus22** | 1093 | wrong (runway 252) | 254,411 |
+| **eigen** | 1093 | docker x4 correct, fixed-16 wrong (runway 538) | 898,354 |
+| **rocksdb** | 1093 | all 4 docker wrong (P29 -> GRZ) | 628,189 |
+| **opencv** | 1093 | 3 of 4 docker wrong (GRZ -> P29, false positives) | 1,248,629 |
+| **range-v3** | 1093 | 1 of 4 wrong | 99,976 |
+| 15 negative lineages | 1093 | all correct | 0 |
+
+Only **godot, llvm and corpus21** survive being held out. The largest single fold regret
+is opencv at 1,248,629 -- and those are *false positives*, the rule shipping P29+BSC where
+GRZ2 was smaller, which the earlier framing never surfaced.
+
+## Verdict
+
+`remaining_tus >= T` beats the frozen baseline by 6.7x mainly because **frozen is
+catastrophic on fixed-16 and native**, not because the rule is itself reliable. It is a
+better reference point than frozen, and it is not a selector. I would state it as:
+
+> the only cheap causal signal that survives contact with three families is "P29 needs
+> runway", it is worth roughly 4 MB of the 33 MB available across 66 rows, and its
+> threshold is currently pinned by a single corpus.
+
+This strengthens, rather than weakens, the standing recommendation: **do not promote any
+classifier over the frozen baseline**, and get more short-runway P29-winning lineages
+before fitting anything further. Combined with the earlier finding that the depth term is
+inert and inverts on native, the honest position is that **no validated selector rule
+exists yet on this evidence base.**
