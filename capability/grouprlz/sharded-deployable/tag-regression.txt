@@ -1,0 +1,11 @@
+=== G1: --v1 + --stable-root-tags round-trips ===
+   byte-exact with regions=5600 (ids 0..5599 include both parities)
+=== G2: tag/bound semantics, including the sentinel slot ===
+   both parities round-trip; out-of-range Region and Block refused; legacy NREG+count
+   (the sentinel slot) refused while NREG+count-1 is accepted
+=== G2b: the CALL SITE refuses a Root naming the sentinel Block ===
+   stable: rejected (exit 2) by the Root-token bound
+   legacy: rejected (exit 2) by the Root-token bound
+=== G3: the Block-half tag guard is present in the source ===
+   both halves of the id space are guarded against the tag shift
+TAG REGRESSION PASS

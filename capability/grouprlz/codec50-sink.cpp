@@ -839,7 +839,7 @@ static constexpr std::array<const char*,8> componentRawNames={
 };
 
 int main(int argc,char**argv){
-    const char* manifest=nullptr;const char*residualDumpPath=nullptr;const char*mixedDumpPrefix=nullptr;const char*curveTsvPath=nullptr;const char*literalGroupPrefix=nullptr;const char*literalGroupWirePath=nullptr;const char*cfSinkPath=nullptr;const char*fcSinkPath=nullptr;const char*sinkCurvePath=nullptr; size_t sinkBuildTus=0; bool sinkReplay=false,literalOnDemand=false; size_t max_files=SIZE_MAX,entropyRestartTus=0,replayRepetitions=1,literalGroupTus=0,literalGroupWorkers=1; int zlevel=3,literalZLevel=-1,arrayZLevel=-1,blobZLevel=-1,halfColdBit=-1,blobCanonicalLevel=9; uint32_t sourceAdmitRatio=6,blobThreads=4,blobZstdWorkers=0,blobZstdJobMiB=0,blobZstdOverlapLog=0,blobFallbackEvery=0,s1MinMatch=3,s1MaxChain=1024; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, usePriorRoot=false,useSortedLines=false,useByteArrayLines=false,useMixedRegions=false,useProjectSource=false,useKeyMap=false,useDirectOrdinals=false,useCompressedBlobs=false,useBlobEagerPatches=true,useMoFactor=false,traceMo=false,useAlphaLines=false,useResidualLdm=false,splitControlCeiling=false,structureCeiling=false,literalGroupEvaluateZstd10=true,stableRootTags=false,openFinalEntropy=false;
+    const char* manifest=nullptr;const char*residualDumpPath=nullptr;const char*mixedDumpPrefix=nullptr;const char*curveTsvPath=nullptr;const char*literalGroupPrefix=nullptr;const char*literalGroupWirePath=nullptr;const char*cfSinkPath=nullptr;const char*fcSinkPath=nullptr;const char*sinkCurvePath=nullptr; size_t sinkBuildTus=0; bool sinkReplay=false,literalOnDemand=false,selftestTags=false,selftestBadRoot=false; size_t max_files=SIZE_MAX,entropyRestartTus=0,replayRepetitions=1,literalGroupTus=0,literalGroupWorkers=1; int zlevel=3,literalZLevel=-1,arrayZLevel=-1,blobZLevel=-1,halfColdBit=-1,blobCanonicalLevel=9; uint32_t sourceAdmitRatio=6,blobThreads=4,blobZstdWorkers=0,blobZstdJobMiB=0,blobZstdOverlapLog=0,blobFallbackEvery=0,s1MinMatch=3,s1MaxChain=1024; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, usePriorRoot=false,useSortedLines=false,useByteArrayLines=false,useMixedRegions=false,useProjectSource=false,useKeyMap=false,useDirectOrdinals=false,useCompressedBlobs=false,useBlobEagerPatches=true,useMoFactor=false,traceMo=false,useAlphaLines=false,useResidualLdm=false,splitControlCeiling=false,structureCeiling=false,literalGroupEvaluateZstd10=true,stableRootTags=false,openFinalEntropy=false;
     const char*blobDumpPath=nullptr;const char*componentCurveTsvPath=nullptr;
     for(int i=1;i<argc;++i){ if(!strcmp(argv[i],"--manifest")&&i+1<argc)manifest=argv[++i];
         else if(!strcmp(argv[i],"--z")&&i+1<argc)zlevel=atoi(argv[++i]);
@@ -871,6 +871,8 @@ int main(int argc,char**argv){
         else if(!strcmp(argv[i],"--fc-sink")&&i+1<argc)fcSinkPath=argv[++i];
         else if(!strcmp(argv[i],"--sink-replay"))sinkReplay=true;
         else if(!strcmp(argv[i],"--literal-ondemand"))literalOnDemand=true;
+        else if(!strcmp(argv[i],"--selftest-tags"))selftestTags=true;
+        else if(!strcmp(argv[i],"--selftest-bad-root"))selftestBadRoot=true;
         else if(!strcmp(argv[i],"--sink-curve")&&i+1<argc)sinkCurvePath=argv[++i];
         else if(!strcmp(argv[i],"--sink-build-tus")&&i+1<argc){char*end=nullptr;unsigned long long value=strtoull(argv[++i],&end,10);if(!end||*end||!value||value>SIZE_MAX){fprintf(stderr,"bad sink build TU count\n");return 2;}sinkBuildTus=size_t(value);}
         else if(!strcmp(argv[i],"--curve-tsv")&&i+1<argc)curveTsvPath=argv[++i];
@@ -902,6 +904,28 @@ int main(int argc,char**argv){
 #if !defined(WITH_BSC_GROUPS)
     (void)literalGroupEvaluateZstd10;
 #endif
+    if(selftestTags){
+        // Direct test of the tag/bound semantics, including the case a well-formed encoder
+        // never produces: the sentinel slot just past the last real Block.  Driven from the
+        // regression script; every branch below is one local-oracle named.
+        uint32_t tag=0; int bad=0;
+        const uint32_t R=7,B=3;   // Regions 0..6, Blocks 0..2
+        auto note=[&](const char*what){ fprintf(stderr,"selftest-tags: %s\n",what); ++bad; };
+        for(uint32_t r=0;r<R;++r)            // both parities of Region id must survive
+            if(!wire_to_tag(region_tag(r),true,R,B,tag)||tag_is_block(tag)||tag_id(tag)!=r) note("stable Region round trip");
+        for(uint32_t k=0;k<B;++k)
+            if(!wire_to_tag(block_tag(k),true,R,B,tag)||!tag_is_block(tag)||tag_id(tag)!=k) note("stable Block round trip");
+        if(wire_to_tag(region_tag(R),true,R,B,tag)) note("stable accepted an out-of-range Region");
+        if(wire_to_tag(block_tag(B),true,R,B,tag))  note("stable accepted an out-of-range Block");
+        // legacy flat: NREG+count names the sentinel slot and must be refused, while
+        // NREG+count-1 is the last real Block and must be accepted
+        if(wire_to_tag(uint64_t(R)+B,false,R,B,tag)) note("legacy accepted the sentinel Block slot");
+        if(!wire_to_tag(uint64_t(R)+B-1,false,R,B,tag)||!tag_is_block(tag)||tag_id(tag)!=B-1) note("legacy rejected the last real Block");
+        for(uint32_t r=0;r<R;++r)
+            if(!wire_to_tag(r,false,R,B,tag)||tag_is_block(tag)||tag_id(tag)!=r) note("legacy Region round trip");
+        printf("selftest-tags: %s\n",bad?"FAIL":"PASS");
+        return bad?1:0;
+    }
     if(!manifest){ fprintf(stderr,"usage: %s --manifest F [--z LEVEL] [--literal-z 1..9] [--array-z 1..9] [--blob-z 1..9] [--no-d1] [--d2] [--prior-root] [--structure-ceiling] [--s1-min-match N] [--s1-max-chain N] [--sorted-lines|--byte-array-lines|--mixed-regions [--alpha-lines|--residual-ldm] [--residual-dump PATH] [--mixed-dump-prefix PATH] [--literal-group-prefix PREFIX --literal-group-tus N [--literal-group-workers N] [--literal-group-skip-zstd10] [--literal-group-wire PATH]] [--split-control-ceiling] [--compressed-blobs [--mo-factor [--mo-trace]] [--blob-threads N] [--blob-zstd-workers N --blob-zstd-job-mib N --blob-zstd-overlap-log N] [--blob-fallback-every N] [--blob-lazy-fallback] [--blob-canonical-level 1..9] [--blob-dump PATH]] [--key-map|--direct-ordinals|--half-cold-bit 0|1] [--source-package [--source-admit-ratio N]]] [--max-files N] [--replay-repetitions N] [--entropy-restart-tus N] [--stable-root-tags] [--open-final-entropy] [--curve-tsv PATH] [--component-curve-tsv PATH]\n",argv[0]); return 2; }
     if(useProjectSource&&!useMixedRegions){fprintf(stderr,"--source-package requires --mixed-regions\n");return 2;}
     if(useKeyMap&&!useMixedRegions){fprintf(stderr,"--key-map and --half-cold-bit require --mixed-regions\n");return 2;}
@@ -1009,7 +1033,12 @@ int main(int argc,char**argv){
         auto kgram=[&](size_t i)->uint64_t{ uint64_t h=1469598103934665603ULL; for(uint32_t j=0;j<MINMATCH;++j){ h^=allreg[i+j]; h*=1099511628211ULL; } return (h*0x9E3779B97F4A7C15ULL)>>(64-hbits); };
         auto block_get=[&](const uint32_t*p,size_t L,uint32_t srcpos,uint8_t copyok)->uint32_t{ uint64_t h=1469598103934665603ULL^(L*0x100000001b3ULL); for(size_t j=0;j<L;++j){h^=p[j];h*=1099511628211ULL;}
             auto it=bdict.find(h); if(it!=bdict.end()){ uint32_t k=it->second; if(boff2[k+1]-boff2[k]==L && memcmp(&bchild[boff2[k]],p,L*4)==0) return block_tag(k); }
-            uint32_t k=uint32_t(boff2.size()-1); bchild.insert(bchild.end(),p,p+L); boff2.push_back(bchild.size()); bcopy_src.push_back(srcpos); bcopy_ok.push_back(copyok); if(it==bdict.end()) bdict.emplace(h,k); return block_tag(k); };
+            uint32_t k=uint32_t(boff2.size()-1);
+            // block_tag() shifts left by one, same as region_tag(): guard the BLOCK half of
+            // the id space too.  The occurrence-space bound makes this unreachable in
+            // practice, which is not the same as the shift being defined by contract.
+            if(k>=(1u<<31)){fprintf(stderr,"too many Blocks for a typed Root tag: %u\n",k);exit(2);}
+            bchild.insert(bchild.end(),p,p+L); boff2.push_back(bchild.size()); bcopy_src.push_back(srcpos); bcopy_ok.push_back(copyok); if(it==bdict.end()) bdict.emplace(h,k); return block_tag(k); };
         auto tb=Clock::now();
         for(size_t t=0;t<TUs;++t){ size_t a=roff[t],b=roff[t+1]; size_t i=a;
             while(i<b){ size_t bestL=0,bestP=0;
@@ -1248,6 +1277,15 @@ int main(int argc,char**argv){
           {const size_t n=zstd_message_roundtrip(z,messageD,rootb,zlevel,messageEncoded,messageDecoded);
            w_root+=n;w_framing+=FRAME;cfSink.emit(WT_ROOT,messageEncoded.data(),n);}
           allRoots.insert(allRoots.end(),rootb.begin(),rootb.end());Frootb=messageDecoded;
+          // Test-only: append a Root token naming the sentinel slot one past the last real
+          // Block.  A well-formed encoder never emits this, so the CALL-SITE bound is
+          // otherwise never exercised and a sentinel-inclusive bound would go unnoticed.
+          // The decode below must refuse it.
+          if(selftestBadRoot&&t==0){
+            const uint32_t nblk=blocksAfterTu[0];
+            put_varint(Frootb,stableRootTags?uint64_t(block_tag(nblk)):uint64_t(NREG)+nblk);
+            fprintf(stderr,"selftest-bad-root: injected sentinel Block %u at TU 0\n",nblk);
+          }
 
           if(useDirectOrdinals){
             // Blocks precede Region NEED in the direct-ordinal form, so F can derive their child
