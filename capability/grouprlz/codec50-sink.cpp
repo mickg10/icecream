@@ -1091,8 +1091,13 @@ int main(int argc,char**argv){
     // charged by category, compressed at z<=zlevel per message. F reconstructs .ii bytes byte-exact.
     ZSTD_CCtx* z=ZSTD_createCCtx();ZSTD_DCtx* messageD=ZSTD_createDCtx();ZSTD_CCtx* sourceCostZ=useProjectSource?ZSTD_createCCtx():nullptr;
     std::vector<uint8_t> dst,sourceCostDst,messageEncoded,messageDecoded;
-    std::vector<uint8_t> fknownLine(dict.distinct()+1,0), fknownReg;   // fknownReg grows per TU
-    std::vector<uint32_t> ClineToF(dict.distinct()+1,0); uint32_t nextFline=1;
+    // Line-indexed state grows as Lines are admitted, exactly like the Region/Block arrays.
+    // at_line() is used for reads as well as writes: growing on a read is harmless (the slot
+    // reads as the same value-initialised zero a pre-sized vector would have held) and it
+    // removes the last way an index could run past the end.
+    std::vector<uint8_t> fknownLine; std::vector<uint32_t> ClineToF; uint32_t nextFline=1;
+    std::vector<uint8_t> fknownReg;   // fknownReg grows per TU
+    auto at_line=[](auto&v,uint32_t ln)->auto&{ if(size_t(ln)>=v.size()) v.resize(size_t(ln)+1); return v[ln]; };
     std::array<ZSTD_CCtx*,5> lineZC{}; std::array<ZSTD_DCtx*,5> lineZD{};
     std::array<uint8_t,5> lineZActive{}; size_t linePartCount=useByteArrayLines?5:3;
     if(useSortedLines) for(size_t i=0;i<linePartCount;++i){
@@ -1162,8 +1167,7 @@ int main(int argc,char**argv){
         mixedDumpLengths=fopen(path.c_str(),"wb");
         if(!mixedDumpLengths){perror(path.c_str());return 2;}
     }
-    std::vector<MixedCLineState> mixedCLine;
-    if(useMixedRegions)mixedCLine.resize(dict.distinct()+1);
+    std::vector<MixedCLineState> mixedCLine;   // grows with the Lines actually admitted
     uint32_t nextMixedPublic=1;SourceTextStore mixedCSource(useProjectSource),mixedFSource;
     std::vector<uint8_t> mixedSourceSent;
     std::vector<SourceAdmission> mixedSourceAdmission;
@@ -1235,14 +1239,16 @@ int main(int argc,char**argv){
     std::vector<uint32_t> requiredRegionStamp,requiredBlockStamp;
     std::vector<uint32_t> FrequiredRegionStamp,FrequiredBlockStamp;uint32_t requestStamp=0;
     if(useKeyMap){
-      std::unordered_map<uint64_t,uint32_t> uniqueKeys;uniqueKeys.reserve(size_t(NREG)*2);
       // --half-cold-bit preloads F from the WHOLE corpus before any TU is sent, so it is not
-      // a T_current path and sizing its store from the final count is what it actually is.
-      if(halfColdBit>=0){FpreloadedRegions.reserve(size_t(NREG));if(useDirectOrdinals&&FmixedRegions.size()<NREG)FmixedRegions.resize(NREG);}
-      for(uint32_t r=0;r<NREG;++r){
-        uint64_t key=dict.region_key(r);auto inserted=uniqueKeys.emplace(key,r);
-        if(!inserted.second){fprintf(stderr,"Region key collision: %u and %u\n",inserted.first->second,r);return 2;}
-        if(halfColdBit>=0&&int(key&1)==halfColdBit){
+      // a T_current path and walking the final Region count is what it actually is.  The key
+      // COLLISION check is not preload -- it now runs per TU over newly admitted Regions
+      // only (see admitRegionKeys below), so the ordinary path never touches a final count.
+      if(halfColdBit>=0){
+        FpreloadedRegions.reserve(size_t(NREG));
+        if(useDirectOrdinals&&FmixedRegions.size()<NREG)FmixedRegions.resize(NREG);
+        for(uint32_t r=0;r<NREG;++r){
+          const uint64_t key=dict.region_key(r);
+          if(int(key&1)!=halfColdBit) continue;
           MixedFRegionView view{FmixedRegionData.size(),dict.region_raw_len(r),true};
           FmixedRegionData.insert(FmixedRegionData.end(),dict.region_data(r),dict.region_data(r)+dict.region_raw_len(r));
           if(useDirectOrdinals)FmixedRegions[r]=view;else FpreloadedRegions.emplace(key,view);
@@ -1250,6 +1256,17 @@ int main(int argc,char**argv){
         }
       }
     }
+    // Region keys must stay unique, and that is checked as each Region is admitted rather
+    // than by a sweep over the final count.  Same objects checked, same failure, no
+    // whole-corpus walk -- and it now fails at the TU that introduces the collision.
+    std::unordered_map<uint64_t,uint32_t> uniqueKeys; uint32_t keyedRegions=0;
+    auto admitRegionKeys=[&](uint32_t upto)->bool{
+      for(;keyedRegions<upto;++keyedRegions){
+        auto inserted=uniqueKeys.emplace(dict.region_key(keyedRegions),keyedRegions);
+        if(!inserted.second){fprintf(stderr,"Region key collision: %u and %u\n",inserted.first->second,keyedRegions);return false;}
+      }
+      return true;
+    };
 
     int npass = warm?2:1;   // --warm: pass 0 primes dict+F-stores (uncounted); final pass measures warm steady-state.
     for(int pass=0; pass<npass; ++pass){
@@ -1272,7 +1289,8 @@ int main(int argc,char**argv){
             associatedReg.resize(nreg,0); FassociatedReg.resize(nreg,0);
             requiredRegionStamp.resize(nreg,0); FrequiredRegionStamp.resize(nreg,0); }
           if(fknownBlk.size()<nblk){ fknownBlk.resize(nblk,0); FknownBlk.resize(nblk,0);
-            requiredBlockStamp.resize(nblk,0); FrequiredBlockStamp.resize(nblk,0); } }
+            requiredBlockStamp.resize(nblk,0); FrequiredBlockStamp.resize(nblk,0); }
+          if(!admitRegionKeys(uint32_t(nreg))) return 2; }
         const bool endOfEntropyStream=(!openFinalEntropy&&t+1==TUs)||(entropyRestartTus&&(t+1)%entropyRestartTus==0);
         const uint32_t* tk=&tokstream[tokoff[t]]; size_t tn=tokoff[t+1]-tokoff[t];
         // ROOT is available to F before its MISSING reply.  With a key map, C first associates every
@@ -1431,7 +1449,7 @@ int main(int argc,char**argv){
         std::vector<uint32_t>compressedBlobEntriesSeen;
         std::vector<std::pair<uint32_t,const SourceText*>> mixedSourceDefinitions;
         if(!useMixedRegions) for(uint32_t r:missReg){ const uint32_t* lids=dict.region_ids_ptr(r); uint32_t c=dict.region_ids_count(r);
-            for(uint32_t j=0;j<c;++j){ uint32_t ln=lids[j]; if(fknownLine[ln]) continue; fknownLine[ln]=1; ++nl;
+            for(uint32_t j=0;j<c;++j){ uint32_t ln=lids[j]; if(at_line(fknownLine,ln)) continue; at_line(fknownLine,ln)=1; ++nl;
                 const LineRef& lr=dict.ref(ln); const char* txt=dict.line_data(lr.off);
                 if(useSortedLines) newLineIds.push_back(ln);
                 else if(useD1 && parse_marker(txt,lr.len,mk)){ uint32_t pid; auto it=pathid.find(mk.path); if(it==pathid.end()){ pid=uint32_t(paths.size()); pathid.emplace(mk.path,pid); paths.push_back(mk.path);
@@ -1481,7 +1499,7 @@ int main(int argc,char**argv){
                 if(splitControlCeiling)put_varint(splitControl[0],dict.region_raw_len(r));
                 auto flushLiteral=[&](){ if(!literalLength)return; mixedRaw[0].push_back(0);put_varint(mixedRaw[0],literalLength);splitOpcode(0);splitVarint(2,literalLength);++mixedOps[0];literalLength=0; };
                 for(uint32_t j=0;j<count;++j){
-                    uint32_t lineId=lids[j];const LineRef&line=dict.ref(lineId);const char*text=dict.line_data(line.off);MixedCLineState&state=mixedCLine[lineId];
+                    uint32_t lineId=lids[j];const LineRef&line=dict.ref(lineId);const char*text=dict.line_data(line.off);MixedCLineState&state=at_line(mixedCLine,lineId);
                     GeneratedByteArray compressedParsed;int32_t probe=useCompressedBlobs?regionLineToProbe[j]:-1;
                     int32_t compressedBlob=probe>=0?regionProbeToBlob[size_t(probe)]:-1;bool forceCompressedArray=compressedBlob>=0;
                     if(forceCompressedArray){compressedParsed=std::move(regionProbeEntries[size_t(probe)]);size_t entry=mixedArrayEntries.size();auto&blob=compressedBlobs[size_t(compressedBlob)];uint32_t&seen=compressedBlobEntriesSeen[size_t(compressedBlob)];
@@ -1667,7 +1685,7 @@ int main(int argc,char**argv){
                 const LineRef& ar=dict.ref(a); const LineRef& br=dict.ref(b); uint32_t m=std::min(ar.len,br.len);
                 int c=memcmp(dict.line_data(ar.off),dict.line_data(br.off),m); return c?c<0:ar.len<br.len;
             });
-            for(uint32_t ln:newLineIds) ClineToF[ln]=nextFline++;
+            for(uint32_t ln:newLineIds) at_line(ClineToF,ln)=nextFline++;
             std::vector<uint32_t> restIds; std::vector<std::pair<uint32_t,GeneratedByteArray>> arrayEntries;
             for(uint32_t ln:newLineIds){
                 if(useByteArrayLines){ GeneratedByteArray parsed; const LineRef& lr=dict.ref(ln);
@@ -1845,10 +1863,10 @@ int main(int argc,char**argv){
         }
         if(!useMixedRegions) for(uint32_t r:missReg){ const uint32_t* lids=dict.region_ids_ptr(r); uint32_t c=dict.region_ids_count(r);
             put_varint(fill_regions,c); { int64_t prev=0; for(uint32_t j=0;j<c;++j){
-                uint32_t wireLine=useSortedLines?ClineToF[lids[j]]:lids[j]; if(!wireLine){fprintf(stderr,"missing Line mapping\n");return 2;}
+                uint32_t wireLine=useSortedLines?at_line(ClineToF,lids[j]):lids[j]; if(!wireLine){fprintf(stderr,"missing Line mapping\n");return 2;}
                 put_zigzag(fill_regions,int64_t(wireLine)-prev); prev=int64_t(wireLine); } } fknownReg[r]=1; ++nr;
-            put_varint(fill_regions_raw,c); for(uint32_t j=0;j<c;++j){ uint32_t wireLine=useSortedLines?ClineToF[lids[j]]:lids[j]; put_varint(fill_regions_raw,wireLine); }
-            { put_varint(allRegionsRaw,c); for(uint32_t j=0;j<c;++j){ uint32_t wireLine=useSortedLines?ClineToF[lids[j]]:lids[j]; put_varint(allRegionsRaw,wireLine); } }
+            put_varint(fill_regions_raw,c); for(uint32_t j=0;j<c;++j){ uint32_t wireLine=useSortedLines?at_line(ClineToF,lids[j]):lids[j]; put_varint(fill_regions_raw,wireLine); }
+            { put_varint(allRegionsRaw,c); for(uint32_t j=0;j<c;++j){ uint32_t wireLine=useSortedLines?at_line(ClineToF,lids[j]):lids[j]; put_varint(allRegionsRaw,wireLine); } }
         }
         for(uint32_t k:missBlk){ size_t L=boff2[k+1]-boff2[k];
             if(bcopy_ok[k]){ fill_blocks.push_back(1); put_varint(fill_blocks,bcopy_src[k]); put_varint(fill_blocks,L); }   // COPY(region-stream src,len)
@@ -2187,6 +2205,9 @@ int main(int argc,char**argv){
         }
         while(ckidx<ck_f.size() && double(cum_raw)>=ck_f[ckidx]*corpus.raw){ ck.push_back({ck_f[ckidx], double(cum_raw)/cum_wire}); ++ckidx; }
       }
+      // Moving the key check per-TU must not quietly check FEWER Regions than the sweep did:
+      // by the last TU every Region has been admitted, so this must have reached NREG.
+      if(keyedRegions!=NREG){fprintf(stderr,"Region key check covered %u of %u Regions\n",keyedRegions,NREG);return 2;}
       enc_s+=fallback_c_s;dec_s-=fallback_c_s;if(dec_s<0)dec_s=0;
 #if defined(WITH_BSC_GROUPS)
       if(usePlannedGroups){
