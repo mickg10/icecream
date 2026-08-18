@@ -14,7 +14,11 @@ lg112    C->F=877346     F->C=47217     lag=111  closes=429539 873160 875241 877
    control (intact)             exit=0  
    C->F truncated 100 B         exit=2  truncated type-1 payload at offset 1069896
    C->F one byte flipped        exit=2  type-8 payload differs at offset 522420
-   C->F 8 bytes appended        exit=2  /tmp/tmp.ZbWaiA4kgC/x.cf has trailing bytes past the last frame the run consumed
+   C->F 8 bytes appended        exit=2  /tmp/tmp.S3eaQMG4dU/x.cf has trailing bytes past the last frame the run consumed
    C->F one frame deleted       exit=2  expected type=9 len=152933 at offset 60738, stream has type=5 len=2154
    F->C truncated 20 B          exit=2  stream ended before a type-254 frame at offset 47194
+=== 5. a stream truncated at a build close is EXACTLY that build's frames ===
+   cut at build 1 (C→F 1061673 B, F→C 44328 B): fully consumed, 94 TUs byte-exact
+   cut at build 2 (C→F 1065813 B, F→C 46251 B): fully consumed, 188 TUs byte-exact
+   cut at build 3 (C→F 1067894 B, F→C 46734 B): fully consumed, 282 TUs byte-exact
 GATE PASS

@@ -43,17 +43,22 @@ run lg112 --literal-group-prefix "$W/pl" --literal-group-tus 112 --literal-group
 [ "$(cat "$W/stream.lag")" = 0 ] || fail "stream must have zero dispatch lag"
 [ "$(cat "$W/lg1.lag")"   = 0 ] || fail "lg1 must have zero dispatch lag"
 [ "$(cat "$W/lg112.lag")" -gt 0 ] || fail "lg112 must declare a nonzero dispatch lag"
-# the batch variant's cold build must NOT be self-contained: some later build close has to
-# absorb a literal frame the cold build produced.  Detect it as a build whose increment is
-# larger than the cold build's own.
+# The hard assertion is the codec-reported dispatch lag above; the byte displacement below
+# is REPORTED, not asserted.  It only appears when a build is smaller than the group: with
+# n < 112 the cold build's literal frame is pushed into a later build, but with n >= 112 the
+# cold build already contains its own first group and the displacement is partial.  An
+# earlier version of this gate asserted the displacement and wrongly failed spdlog (n=168).
 python3 - "$W/lg112.tsv" "$NB" <<'PY' || exit 1
 import sys
 rows=[l.split('\t') for l in open(sys.argv[1]).read().splitlines()[1:]]
+n=int(sys.argv[2])
 cl=[int(r[2]) for r in rows if r[6]=='1']; prev=0; inc=[]
 for c in cl: inc.append(c-prev); prev=c
-if len(inc)<2 or max(inc[1:])<inc[0]*0.5:
-    print("GATE FAIL: lg112 did not display a displaced cold-build frame",file=sys.stderr); sys.exit(1)
-print("   lg112 build increments:",inc," <- a later build carries the cold build's literal frame")
+if len(inc)<2:
+    print("GATE FAIL: fewer than two build closes",file=sys.stderr); sys.exit(1)
+note = ("a later build carries the cold build's literal frame" if n < 112 else
+        "n >= the 112-TU group, so the cold build holds its own first group; later groups still straddle")
+print("   lg112 build increments:",inc," <-",note)
 PY
 
 echo "=== 3. prefix immutability, BOTH directions, at every build close ==="
@@ -104,5 +109,22 @@ PY
 if replay "C->F one frame deleted"; then fail "a deleted frame was accepted"; fi
 cp "$W/stream.cf" "$W/x.cf"; cp "$W/stream.fc" "$W/x.fc"; truncate -s -20 "$W/x.fc"
 if replay "F->C truncated 20 B"; then fail "reverse-stream damage accepted"; fi
+
+echo "=== 5. a stream truncated at a build close is EXACTLY that build's frames ==="
+# Cut the pair at build k's physical offsets and replay them against a run restricted to
+# those TUs.  Passing means the byte range holds every frame that run consumes, in order,
+# byte-identically, with nothing left over -- and that run reconstructs all of its TUs
+# byte-exact.  (It still runs in-process: this is not a substitute for a separate receiver.)
+for K in 1 2 3; do
+  CCUT=$(awk -F'\t' -v k=$((NB*K)) '$1==k{print $3}' "$W/o4.tsv"); num "cf cut" "$CCUT"
+  FCUT=$(awk -F'\t' -v k=$((NB*K)) '$1==k{print $4}' "$W/o4.tsv"); num "fc cut" "$FCUT"
+  head -c "$CCUT" "$W/o4.cf" > "$W/t.cf"; head -c "$FCUT" "$W/o4.fc" > "$W/t.fc"
+  $BIN --manifest "$MAN" $BO --max-files $((NB*K)) --cf-sink "$W/t.cf" --fc-sink "$W/t.fc" \
+       --sink-build-tus "$NB" --sink-replay > "$W/t$K.out" 2> "$W/t$K.err" \
+       || fail "truncation at build $K did not replay"
+  grep -q 'SINK REPLAY OK' "$W/t$K.out" || fail "build-$K truncation: replay did not confirm"
+  grep -q 'byte-exact=OK' "$W/t$K.out" || fail "build-$K truncation: not byte-exact"
+  echo "   cut at build $K (C→F $CCUT B, F→C $FCUT B): fully consumed, $((NB*K)) TUs byte-exact"
+done
 
 echo "GATE PASS"

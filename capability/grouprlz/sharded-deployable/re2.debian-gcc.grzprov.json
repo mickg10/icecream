@@ -1,0 +1,9 @@
+{
+ "cell": "re2.debian-gcc",
+ "payload": "ii.tar.zst",
+ "sha256": "4b3bfaad19cd75659636b40468c1157a3a867fac0187e6185b0f5fc7832a7a8a",
+ "tu_count": 72,
+ "binding": "-m g2 -K 256 -s 6 -t 21 -l 4 -k 5 -b 8 --graw 512 --gadd 128 --hist 1024 -j 8 --gtu 1",
+ "seed": 12345,
+ "sweep": "sample"
+}

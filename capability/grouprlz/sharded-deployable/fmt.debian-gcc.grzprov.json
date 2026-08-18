@@ -1,0 +1,9 @@
+{
+ "cell": "fmt.debian-gcc",
+ "payload": "ii.tar.zst",
+ "sha256": "2ee51e14b4c0ff985950599629c4efbe9eab3987bc93b77ef1534192f7175228",
+ "tu_count": 51,
+ "binding": "-m g2 -K 256 -s 6 -t 21 -l 4 -k 5 -b 8 --graw 512 --gadd 128 --hist 1024 -j 8 --gtu 1",
+ "seed": 12345,
+ "sweep": "sample"
+}

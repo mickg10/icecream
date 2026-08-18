@@ -1,0 +1,16 @@
+cell	policy	W	routes	g1_frames_per_tu	g2_decode_exact	g3_prefix_immutable	g4_immediate_routes	g4_points	sweep
+cereal.debian-gcc	sticky	1	1	1	1	3	1	44	sample
+cereal.debian-gcc	sticky	4	4	4	4	12	4	56	sample
+cereal.debian-gcc	sticky	8	8	8	8	24	8	72	sample
+cereal.debian-gcc	sticky	16	16	16	16	48	16	112	sample
+cereal.debian-gcc	sticky	32	32	32	32	96	32	160	sample
+cereal.debian-gcc	rr	1	1	1	1	3	1	44	sample
+cereal.debian-gcc	rr	4	4	4	4	12	4	56	sample
+cereal.debian-gcc	rr	8	8	8	8	24	8	72	sample
+cereal.debian-gcc	rr	16	16	16	16	48	16	112	sample
+cereal.debian-gcc	rr	32	32	32	32	96	32	192	sample
+cereal.debian-gcc	shuf	1	1	1	1	3	1	44	sample
+cereal.debian-gcc	shuf	4	4	4	4	12	4	56	sample
+cereal.debian-gcc	shuf	8	8	8	8	24	8	72	sample
+cereal.debian-gcc	shuf	16	16	16	16	48	16	112	sample
+cereal.debian-gcc	shuf	32	32	32	32	96	32	160	sample

@@ -1,0 +1,16 @@
+cell	policy	W	routes	g1_frames_per_tu	g2_decode_exact	g3_prefix_immutable	g4_immediate_routes	g4_points	sweep
+leveldb.debian-gcc	sticky	1	1	1	1	3	1	51	sample
+leveldb.debian-gcc	sticky	4	4	4	4	12	4	64	sample
+leveldb.debian-gcc	sticky	8	8	8	8	24	8	78	sample
+leveldb.debian-gcc	sticky	16	16	16	16	48	16	112	sample
+leveldb.debian-gcc	sticky	32	32	32	32	96	32	160	sample
+leveldb.debian-gcc	rr	1	1	1	1	3	1	51	sample
+leveldb.debian-gcc	rr	4	4	4	4	12	4	64	sample
+leveldb.debian-gcc	rr	8	8	8	8	24	8	80	sample
+leveldb.debian-gcc	rr	16	16	16	16	48	16	106	sample
+leveldb.debian-gcc	rr	32	32	32	32	96	32	166	sample
+leveldb.debian-gcc	shuf	1	1	1	1	3	1	51	sample
+leveldb.debian-gcc	shuf	4	4	4	4	12	4	64	sample
+leveldb.debian-gcc	shuf	8	8	8	8	24	8	78	sample
+leveldb.debian-gcc	shuf	16	16	16	16	48	16	112	sample
+leveldb.debian-gcc	shuf	32	32	32	32	96	32	160	sample

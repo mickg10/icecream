@@ -124,32 +124,6 @@ def main():
                 out.append(f"{v:,}" if v else "—")
         print(f"| {c.split('.')[0]} | " + " | ".join(out) + " |")
 
-    print("\n### G. P29 single-stream: deployable vs bound, from the gate transcripts")
-    print("`lag` is the codec's own `dispatch_lag_tus`: how many TUs after a TU is dispatched")
-    print("its literals become sendable. Only 0 is a transport.\n")
-    print("| cell | stream C→F | lg1 C→F (deployable) | lg112 C→F (bound) | lg1 vs bound | lg1 vs stream | F→C | lg112 lag | lg112 build increments |")
-    print("|---|--:|--:|--:|--:|--:|--:|--:|---|")
-    for f in sorted(glob.glob(f"{P29}/*.debian-gcc.txt")):
-        txt = open(f).read()
-        if "GATE PASS" not in txt:
-            print(f"| {os.path.basename(f)} | GATE DID NOT PASS — row withheld |"); continue
-        v = {}
-        for ln in txt.splitlines():
-            p2 = ln.split()
-            # match only the variant SUMMARY lines; the "lg112 build increments" note also
-            # starts with a variant name and would otherwise clobber the entry
-            if p2 and p2[0] in ("stream", "lg1", "lg112") and "C->F=" in ln:
-                v[p2[0]] = {k: s for k, s in (x.split("=", 1) for x in p2[1:] if "=" in x)}
-        inc = ""
-        for ln in txt.splitlines():
-            if "build increments" in ln:
-                inc = ln.split("increments:")[1].split("]")[0].strip() + "]"
-        if len(v) != 3: continue
-        s, o, b = int(v["stream"]["C->F"]), int(v["lg1"]["C->F"]), int(v["lg112"]["C->F"])
-        print(f"| {os.path.basename(f).split('.')[0]} | {s:,} | {o:,} | {b:,} | "
-              f"+{100*(o/b-1):.1f}% | −{100*(1-o/s):.1f}% | {int(v['lg1']['F->C']):,} | "
-              f"{v['lg112']['lag']} | {inc} |")
-
     print("\n### F. Gate ledger (GRZ) — configurations, not spot checks")
     tot = {}
     for p2 in sorted(glob.glob(f"{GRZ}/*.grzgates.tsv")):
@@ -167,6 +141,44 @@ def main():
         print(f"- G2 whole route stream decodes byte-exact: {tot['g2_decode_exact']}/{tot['routes']} routes")
         print(f"- G3 per-route prefix immutability: {tot['g3_prefix_immutable']}/{3*tot['routes']} (route × build boundary)")
         print(f"- G4 immediate decodability: {tot['g4_immediate_routes']}/{tot['routes']} routes, {tot['g4_points']} truncation points")
+
+    print("\n### G. P29 single-stream: deployable vs bound, from the gate transcripts")
+    print("`lag` is the codec's own `dispatch_lag_tus`: how many TUs after a TU is dispatched")
+    print("its literals become sendable. Only 0 is a transport.\n")
+    print("| cell | stream C→F | lg1 C→F (deployable) | lg112 C→F (bound) | lg1 vs bound | lg1 vs stream | F→C | lg112 lag | lg112 build increments |")
+    print("|---|--:|--:|--:|--:|--:|--:|--:|---|")
+    for f in sorted(glob.glob(f"{P29}/*.p29gate.txt")):
+        txt = open(f).read()
+        if "GATE PASS" not in txt:
+            print(f"| {os.path.basename(f)} | **GATE DID NOT PASS — row withheld** |"); continue
+        v = {}
+        for ln in txt.splitlines():
+            p2 = ln.split()
+            # match only the variant SUMMARY lines; the "lg112 build increments" note also
+            # starts with a variant name and would otherwise clobber the entry
+            if p2 and p2[0] in ("stream", "lg1", "lg112") and "C->F=" in ln:
+                v[p2[0]] = {k: s for k, s in (x.split("=", 1) for x in p2[1:] if "=" in x)}
+        inc = ""
+        for ln in txt.splitlines():
+            if "build increments" in ln:
+                inc = ln.split("increments:")[1].split("]")[0].strip() + "]"
+        if len(v) != 3: continue
+        s, o, b = int(v["stream"]["C->F"]), int(v["lg1"]["C->F"]), int(v["lg112"]["C->F"])
+        print(f"| {os.path.basename(f)[:-len('.p29gate.txt')]} | {s:,} | {o:,} | {b:,} | "
+              f"+{100*(o/b-1):.1f}% | −{100*(1-o/s):.1f}% | {int(v['lg1']['F->C']):,} | "
+              f"{v['lg112']['lag']} | {inc} |")
+
+    print("\n### H. Gate ledger (P29 sharded)")
+    if p:
+        rt = sum(r["routes"] for r in p)
+        print(f"- configurations: {len(p)}, routes gated: {rt}")
+        print(f"- every route: byte-exact reconstruction AND `dispatch_lag_tus=0`, "
+              f"or the configuration aborts")
+        print(f"- per-route prefix immutability (route × build boundary × direction): "
+              f"{sum(r['prefix_checks_passed'] for r in p)}/{6*rt}")
+        print(f"- routes additionally replayed frame-by-frame off their own files: "
+              f"{sum(r['replays_verified'] for r in p)} (the first route of each configuration)")
+
 
 
 if __name__ == "__main__":
