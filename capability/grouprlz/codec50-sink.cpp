@@ -1060,6 +1060,7 @@ int main(int argc,char**argv){
     // token < NREG = region id ; token >= NREG = block id (flat span of region ids). Causal/prequential.
     std::vector<uint32_t> bchild; std::vector<size_t> boff2; boff2.push_back(0);
     std::vector<uint32_t> tokstream; std::vector<size_t> tokoff; tokoff.push_back(0);
+    bool s1Ready=false; uint64_t s1Tokens=0; std::vector<uint32_t> curTok, tuRegions;
     std::vector<uint32_t> bcopy_src; std::vector<uint8_t> bcopy_ok;   // block k: def as COPY(src,len) if ok (source in prior TUs)
     // Per-TU sizes of the Region and Block id spaces: what has been DISCOVERED by TU t, never
     // the final totals.  Every bound and every array length below is taken from these.
@@ -1080,55 +1081,16 @@ int main(int argc,char**argv){
         p29::OnlineS1::Config s1cfg; s1cfg.min_match=MINMATCH; s1cfg.max_chain=MAXCHAIN; s1cfg.hash_bits=hbits;
         globalS1.reset(new p29::OnlineS1(s1cfg,blockCatalogue));
         if(routeCount) routeS1.reset(new p29::OnlineS1(s1cfg,blockCatalogue));
-        auto tb=Clock::now();
-        std::vector<uint32_t> tuRegions;
-        for(size_t t=0;t<TUs;++t){
-            tuRegions.assign(allreg.begin()+roff[t],allreg.begin()+roff[t+1]);
-            // GLOBAL admits FIRST, in the defined C admission order, so canonical ids are
-            // assigned by the global chronology and never by route scheduling.
-            const p29::TuPlan plan=globalS1->admit(tuRegions);
-            // 1F SEAM GATE.  With one route the route matcher sees exactly GLOBAL's sequence,
-            // so it must mint NOTHING and must agree with GLOBAL on every field -- including
-            // the source coordinates, which are only equal because the two histories coincide
-            // at 1F and will NOT be equal once routes diverge.  Checking it here is what makes
-            // the shared-catalogue seam a proven property rather than an assumption.
-            if(routeS1){
-                const size_t before=blockCatalogue.size();
-                const p29::TuPlan rp=routeS1->admit(tuRegions);
-                if(blockCatalogue.size()!=before){fprintf(stderr,"1F seam: route admission grew the catalogue %zu -> %zu at TU=%zu\n",before,blockCatalogue.size(),t);return 2;}
-                if(rp.root.size()!=plan.root.size()||rp.block_uses.size()!=plan.block_uses.size()){fprintf(stderr,"1F seam: Root/BlockUse counts differ at TU=%zu\n",t);return 2;}
-                for(size_t i=0;i<rp.root.size();++i)
-                    if(rp.root[i].kind!=plan.root[i].kind||rp.root[i].id!=plan.root[i].id){fprintf(stderr,"1F seam: Root ref %zu differs at TU=%zu\n",i,t);return 2;}
-                for(size_t i=0;i<rp.block_uses.size();++i){
-                    const p29::BlockUse&a=plan.block_uses[i],&b=rp.block_uses[i];
-                    if(a.root_index!=b.root_index||a.block_id!=b.block_id||a.source_position!=b.source_position||
-                       a.length!=b.length||a.source_precedes_current_tu!=b.source_precedes_current_tu){fprintf(stderr,"1F seam: BlockUse %zu differs at TU=%zu\n",i,t);return 2;}
-                    // canonical_was_new is deliberately NOT required to match: GLOBAL admits
-                    // first and MINTS, so the route then FINDS the same id.  That asymmetry is
-                    // positive evidence the catalogue is shared -- with separate catalogues
-                    // both would report a fresh mint -- so it is asserted rather than ignored.
-                    if(a.canonical_was_new&&b.canonical_was_new){fprintf(stderr,"1F seam: both matchers minted Block %u at TU=%zu, so the catalogue is not shared\n",a.block_id,t);return 2;}
-                }
-            }
-            for(const p29::Ref&ref:plan.root)
-                tokstream.push_back(ref.kind==p29::RefKind::Block?block_tag(ref.id):region_tag(ref.id));
-            // Canonical children come from the shared catalogue; the COPY-legality flag is
-            // this matcher's admission order and is NOT a claim about any F's residency.
-            for(const p29::NewBlock&nb:plan.new_blocks){
-                const std::vector<uint32_t>&kids=blockCatalogue.block(nb.id).regions;
-                bchild.insert(bchild.end(),kids.begin(),kids.end());
-                boff2.push_back(bchild.size());
-                bcopy_src.push_back(nb.first_source_position);
-                bcopy_ok.push_back(nb.source_precedes_current_tu?1:0);
-            }
-            tokoff.push_back(tokstream.size());
-            blocksAfterTu.push_back(uint32_t(blockCatalogue.size()));
-        }
-        fprintf(stderr,"S1 LZ: %.1fs min_match=%u max_chain=%u tokens=%zu blocks=%zu (%.4f tok/region)\n",secs(tb),MINMATCH,MAXCHAIN,tokstream.size(),boff2.size()-1,double(tokstream.size())/NS);
+        // T_current prereq 2: NOTHING is admitted here.  Admission moved into the
+        // chronological transaction loop, so at TU t the matcher and catalogue contain only
+        // TUs 0..t -- previously the whole corpus had been admitted before TU 0 was even
+        // sent, which a live selector cannot rely on (it would query state holding later TUs).
+        (void)NS; s1Ready=true;
     } else { // V1: root = raw region-id sequence
         for(size_t t=0;t<TUs;++t){ for(size_t i=roff[t];i<roff[t+1];++i) tokstream.push_back(region_tag(allreg[i])); tokoff.push_back(tokstream.size()); }
         blocksAfterTu.assign(TUs,0);   // no S1 means no Blocks at any TU
     }
+    if(useS1) blocksAfterTu.assign(TUs,0);   // filled live, one TU at a time, in the loop
     if(blocksAfterTu.size()!=TUs||regionsAfterTu.size()!=TUs){fprintf(stderr,"per-TU id-space sizes are incomplete\n");return 2;}
 
     // ===== ENCODER (C) + DECODER (F): one cold chronological pass, PULL protocol (root -> MISSING -> FILL) =====
@@ -1349,6 +1311,56 @@ int main(int argc,char**argv){
 #endif
       for(size_t t=0; t<TUs; ++t){
         auto _te=Clock::now();
+        // --- T_current: admit ONLY this TU, here, then use the plan it just produced ------
+        if(s1Ready){
+            curTok.clear();
+            tuRegions.assign(allreg.begin()+roff[t],allreg.begin()+roff[t+1]);
+
+            tuRegions.assign(allreg.begin()+roff[t],allreg.begin()+roff[t+1]);
+            // GLOBAL admits FIRST, in the defined C admission order, so canonical ids are
+            // assigned by the global chronology and never by route scheduling.
+            const p29::TuPlan plan=globalS1->admit(tuRegions);
+            // 1F SEAM GATE.  With one route the route matcher sees exactly GLOBAL's sequence,
+            // so it must mint NOTHING and must agree with GLOBAL on every field -- including
+            // the source coordinates, which are only equal because the two histories coincide
+            // at 1F and will NOT be equal once routes diverge.  Checking it here is what makes
+            // the shared-catalogue seam a proven property rather than an assumption.
+            if(routeS1){
+                const size_t before=blockCatalogue.size();
+                const p29::TuPlan rp=routeS1->admit(tuRegions);
+                if(blockCatalogue.size()!=before){fprintf(stderr,"1F seam: route admission grew the catalogue %zu -> %zu at TU=%zu\n",before,blockCatalogue.size(),t);return 2;}
+                if(rp.root.size()!=plan.root.size()||rp.block_uses.size()!=plan.block_uses.size()){fprintf(stderr,"1F seam: Root/BlockUse counts differ at TU=%zu\n",t);return 2;}
+                for(size_t i=0;i<rp.root.size();++i)
+                    if(rp.root[i].kind!=plan.root[i].kind||rp.root[i].id!=plan.root[i].id){fprintf(stderr,"1F seam: Root ref %zu differs at TU=%zu\n",i,t);return 2;}
+                for(size_t i=0;i<rp.block_uses.size();++i){
+                    const p29::BlockUse&a=plan.block_uses[i],&b=rp.block_uses[i];
+                    if(a.root_index!=b.root_index||a.block_id!=b.block_id||a.source_position!=b.source_position||
+                       a.length!=b.length||a.source_precedes_current_tu!=b.source_precedes_current_tu){fprintf(stderr,"1F seam: BlockUse %zu differs at TU=%zu\n",i,t);return 2;}
+                    // canonical_was_new is deliberately NOT required to match: GLOBAL admits
+                    // first and MINTS, so the route then FINDS the same id.  That asymmetry is
+                    // positive evidence the catalogue is shared -- with separate catalogues
+                    // both would report a fresh mint -- so it is asserted rather than ignored.
+                    if(a.canonical_was_new&&b.canonical_was_new){fprintf(stderr,"1F seam: both matchers minted Block %u at TU=%zu, so the catalogue is not shared\n",a.block_id,t);return 2;}
+                }
+            }
+            for(const p29::Ref&ref:plan.root)
+                curTok.push_back(ref.kind==p29::RefKind::Block?block_tag(ref.id):region_tag(ref.id));
+            // Canonical children come from the shared catalogue; the COPY-legality flag is
+            // this matcher's admission order and is NOT a claim about any F's residency.
+            for(const p29::NewBlock&nb:plan.new_blocks){
+                const std::vector<uint32_t>&kids=blockCatalogue.block(nb.id).regions;
+                bchild.insert(bchild.end(),kids.begin(),kids.end());
+                boff2.push_back(bchild.size());
+                bcopy_src.push_back(nb.first_source_position);
+                bcopy_ok.push_back(nb.source_precedes_current_tu?1:0);
+            }
+
+                        blocksAfterTu[t]=uint32_t(blockCatalogue.size());
+            s1Tokens+=curTok.size();
+        } else {
+            curTok.assign(tokstream.begin()+tokoff[t],tokstream.begin()+tokoff[t+1]);
+        }
+        // Growth must follow admission now: blocksAfterTu[t] is produced BY this TU's admit.
         // Grow every id-indexed array to what EXISTS at this TU.  Nothing here is ever
         // sized from a final count, and size() therefore means "discovered so far" -- which
         // is also the right bound to validate an incoming id against.
@@ -1360,7 +1372,7 @@ int main(int argc,char**argv){
             requiredBlockStamp.resize(nblk,0); FrequiredBlockStamp.resize(nblk,0); }
           if(!admitRegionKeys(uint32_t(nreg))) return 2; }
         const bool endOfEntropyStream=(!openFinalEntropy&&t+1==TUs)||(entropyRestartTus&&(t+1)%entropyRestartTus==0);
-        const uint32_t* tk=&tokstream[tokoff[t]]; size_t tn=tokoff[t+1]-tokoff[t];
+        const uint32_t* tk=curTok.data(); size_t tn=curTok.size();
         // ROOT is available to F before its MISSING reply.  With a key map, C first associates every
         // newly-mentioned conversation-dense Region id with its stable key; F binds cache hits and
         // independently returns the exact missing closure.  The legacy cold path is left byte-identical.
