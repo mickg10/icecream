@@ -223,9 +223,11 @@ candidate at a complete-TU boundary
 
 A candidate in the final 10% cannot establish persistence.  Focused tests
 exercise a transient 200x hit followed by a drop and prove that it is not
-reported.  Consequently, every historical `H200` value in the table below is
-withdrawn until the complete typed matrix regenerates it with this shared
-definition.  Historical cold/CACHE50/socket byte ledgers are unaffected.
+reported. Consequently, every historical `H200` value was withdrawn. The
+complete typed fixed-16 run at `dc5e0ab5` then regenerated the metric with
+this shared definition; the current values are published in the fixed-16
+table below. Historical cold/CACHE50/socket byte ledgers remain audit history
+only.
 
 Current executed gates on the branch tip:
 
@@ -442,33 +444,36 @@ C snapshots contain global public-Line authority, paths, counters, and every per
 
 ## Fixed-16 cold results
 
-> **Historical metric warning:** the byte, ratio, latency, and memory columns
-> below remain the retained batch observations. The `H200` column used the
-> superseded calculation and is not current acceptance evidence; it will be
-> replaced by the complete typed rerun.
-
-The table below shows the zstd-3 component policy. Every zstd-1 counterpart also executed and is retained in the TSV/JSON. `C50` is the cumulative raw/wire ratio at the TU crossing half of raw bytes. `H200` is the earliest stable trailing-window 200x crossing, reported as raw fraction and TU. `none` means that the corpus did not establish that crossing under the retained definition.
+This is the current typed zstd-3 table from the final `dc5e0ab5` fixed-16
+run, not the withdrawn historical H200 table. Every zstd-1 counterpart also
+executed and is retained in the TSV/JSON. `C50` is cumulative raw/socket ratio
+at the complete-TU boundary crossing half the corpus raw bytes. `H200` is the
+earliest raw-weighted stable trailing-window 200x crossing under the shared
+5%-window/10%-persistence definition, reported as raw fraction and TU.
 
 | Corpus | TUs | Raw bytes | Socket bytes | Ratio | C50 | H200 fraction / TU | Second half | p99 / max ms | F peak MiB |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| LLVM | 1,238 | 3,620,271,340 | 14,189,957 | 255.129x | 226.140x | 0.204 / 204 | 292.695x | 11.74 / 55.44 | 3,882.1 |
-| RocksDB | 622 | 3,114,320,596 | 15,220,938 | 204.608x | 160.604x | 0.365 / 179 | 281.957x | 32.99 / 94.45 | 3,592.4 |
-| DuckDB | 689 | 1,985,715,205 | 12,609,970 | 157.472x | 159.545x | 0.156 / 99 | 155.445x | 53.17 / 105.34 | 2,454.2 |
-| Abseil | 700 | 2,581,008,467 | 10,471,576 | 246.478x | 168.955x | 0.187 / 172 | 457.511x | 16.17 / 46.63 | 2,926.4 |
-| OpenCV | 1,506 | 4,630,994,774 | 12,094,846 | 382.890x | 316.052x | 0.096 / 245 | 485.671x | 10.23 / 65.06 | 4,981.4 |
-| Godot | 2,207 | 5,932,762,185 | 61,809,839 | 95.984x | 59.884x | 0.146 / 347 | 242.225x | 16.06 / 1,957.02 | 7,304.3 |
-| fmt | 50 | 136,350,082 | 1,443,817 | 94.437x | 57.309x | none | 281.461x | 46.90 / 46.90 | 337.4 |
-| spdlog | 34 | 98,384,472 | 768,234 | 128.066x | 69.373x | none | 938.025x | 40.49 / 40.49 | 252.1 |
-| Catch2 | 857 | 947,252,235 | 2,347,456 | 403.523x | 269.126x | 0.086 / 84 | 808.750x | 4.11 / 26.41 | 1,104.0 |
-| nlohmann-json | 99 | 293,917,707 | 1,721,584 | 170.725x | 107.639x | 0.695 / 69 | 438.110x | 35.35 / 35.35 | 501.8 |
-| range-v3 | 259 | 632,049,016 | 1,782,167 | 354.652x | 297.521x | 0.249 / 65 | 440.579x | 12.70 / 40.12 | 811.2 |
-| Eigen | 650 | 3,532,268,956 | 3,228,951 | 1,093.937x | 770.680x | 0.098 / 64 | 1,887.648x | 12.57 / 74.77 | 3,671.6 |
-| RE2 | 72 | 110,231,455 | 809,948 | 136.097x | 94.313x | none | 256.954x | 27.43 / 27.43 | 256.0 |
-| LevelDB | 72 | 143,868,249 | 1,099,849 | 130.807x | 92.396x | 0.887 / 65 | 230.745x | 43.12 / 43.12 | 307.9 |
-| simdjson | 153 | 468,377,342 | 2,212,450 | 211.701x | 134.808x | 0.401 / 66 | 501.499x | 37.84 / 47.85 | 694.0 |
-| cereal | 84 | 326,899,429 | 1,093,307 | 299.001x | 216.114x | 0.756 / 64 | 485.624x | 52.91 / 52.91 | 472.4 |
+| LLVM | 1,238 | 3,620,271,340 | 14,182,192 | 255.269x | 226.262x | 0.199 / 199 | 292.858x | 10.94 / 56.32 | 3,882.2 |
+| RocksDB | 622 | 3,114,320,596 | 15,218,562 | 204.640x | 160.589x | 0.370 / 183 | 282.126x | 24.65 / 100.54 | 3,605.4 |
+| DuckDB | 689 | 1,985,715,205 | 12,613,513 | 157.428x | 159.510x | 0.113 / 74 | 155.392x | 57.78 / 106.85 | 2,454.2 |
+| Abseil | 700 | 2,581,008,467 | 10,474,834 | 246.401x | 168.880x | 0.176 / 164 | 457.532x | 17.79 / 47.80 | 2,932.9 |
+| OpenCV | 1,506 | 4,630,994,774 | 12,089,310 | 383.065x | 316.141x | 0.096 / 245 | 486.025x | 10.90 / 64.21 | 4,980.5 |
+| Godot | 2,207 | 5,932,762,185 | 61,799,491 | 96.000x | 59.888x | 0.146 / 347 | 242.365x | 16.98 / 2,014.64 | 7,301.2 |
+| fmt | 50 | 136,350,082 | 1,434,963 | 95.020x | 57.711x | 0.767 / 38 | 282.001x | 48.01 / 48.01 | 337.6 |
+| spdlog | 34 | 98,384,472 | 768,283 | 128.058x | 69.376x | 0.274 / 11 | 936.474x | 42.30 / 42.30 | 251.5 |
+| Catch2 | 857 | 947,252,235 | 2,346,965 | 403.607x | 269.454x | 0.077 / 74 | 806.472x | 3.73 / 25.12 | 1,104.2 |
+| nlohmann-json | 99 | 293,917,707 | 1,724,015 | 170.484x | 107.542x | 0.300 / 31 | 436.551x | 36.02 / 36.02 | 502.0 |
+| range-v3 | 259 | 632,049,016 | 1,783,606 | 354.366x | 297.625x | 0.102 / 25 | 439.459x | 12.08 / 36.68 | 810.3 |
+| Eigen | 650 | 3,532,268,956 | 3,230,830 | 1,093.301x | 770.252x | 0.052 / 34 | 1,886.431x | 10.95 / 75.93 | 3,672.4 |
+| RE2 | 72 | 110,231,455 | 809,916 | 136.102x | 94.314x | 0.125 / 9 | 256.990x | 31.28 / 31.28 | 255.5 |
+| LevelDB | 72 | 143,868,249 | 1,097,396 | 131.100x | 92.465x | 0.071 / 4 | 232.157x | 42.34 / 42.34 | 307.1 |
+| simdjson | 153 | 468,377,342 | 2,215,012 | 211.456x | 134.720x | 0.129 / 17 | 499.968x | 37.94 / 49.29 | 694.0 |
+| cereal | 84 | 326,899,429 | 1,093,126 | 299.050x | 216.164x | 0.073 / 6 | 485.630x | 62.27 / 62.27 | 471.9 |
 
-Godot's approximately 2-second maximum is a single large-TU tail; its p99 remains 16.06 ms. The reported F peak is the maximum `ru_maxrss` of one F process. It includes pages shared from the forked corpus/interner mapping and must not be multiplied by the worker count as if every page were private.
+Godot's approximately 2-second maximum is a single large-TU tail; its p99
+remains 16.98 ms. The reported F peak is the maximum `ru_maxrss` of one F
+process. It includes pages shared from the forked corpus/interner mapping and
+must not be multiplied by the worker count as if every page were private.
 
 ## CACHE50 and order gates
 
@@ -628,7 +633,7 @@ itself land protocol 50 in the production icecc daemons. In particular:
   protocol, reconstruction, and verifier under one complete timer;
 - the fixed-16 M5 semantic payload is the ruled reduced grammar, not the newer P29+BSC or GROUP-RLZ research codec;
 - eight independent F stores trade approximately 2.1x the one-F wire bytes for the measured aggregate rate; a shared cache module or affinity policy could recover some reuse in a later daemon integration;
-- H200 remains `none` where the retained stable-window definition is not established.
+- H200 remains `none` in any row that does not establish the retained stable-window definition; the current typed fixed-16 zstd-3 rows establish it for all 16 corpora.
 
 Those boundaries are deliberate in `CAPABILITY-PLAN.md`.  The historical
 batch-scenario run is retained only as audit history; the current typed
