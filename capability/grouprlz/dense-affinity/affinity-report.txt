@@ -1,0 +1,51 @@
+FAN-OUT COST -- total C->F wire when one build is spread across k F daemons
+  round-robin, cold, single build.  Wire is exact and deterministic; every row's
+  per-TU split closes against its own wire.
+
+  corpus      TUs     k=1 wire        k=2        k=4        k=8       k=16       k=32
+  catch2      857      2384393      1.48x      2.30x      3.36x      5.15x      8.16x
+  cereal       84      1120409      1.67x      2.86x      5.18x      9.87x     19.21x
+  duckdb      689     13089408      1.22x      1.59x      2.12x      3.02x      4.46x
+  eigen       650      3289527      1.70x      3.02x      5.23x      8.56x     13.33x
+  range-v3    259      1820664      1.51x      2.43x      3.89x      6.42x     10.58x
+  rocksdb     622     15692955      1.13x      1.35x      1.71x      2.37x      3.59x
+
+AVOIDABLE FRACTION -- (wire(k) - wire(1)) / wire(k): the share of the wire that
+routing to ONE warm daemon instead of k would not have sent at all
+
+  corpus         k=2      k=4      k=8     k=16     k=32
+  catch2       32.4%    56.6%    70.2%    80.6%    87.7%
+  cereal       40.3%    65.0%    80.7%    89.9%    94.8%
+  duckdb       18.2%    37.0%    52.8%    66.8%    77.6%
+  eigen        41.2%    66.9%    80.9%    88.3%    92.5%
+  range-v3     33.6%    58.9%    74.3%    84.4%    90.6%
+  rocksdb      11.7%    25.8%    41.5%    57.8%    72.2%
+  MEAN         29.6%    51.7%    66.7%    78.0%    85.9%
+
+WHERE IT GOES -- multiplier vs k=1, by frame kind (mean over corpora)
+  k          Root x     Need x     Fill x per-consumer
+                                          Fill bytes x
+  1            1.00       1.00       1.00        1.000
+  2            1.22       1.41       1.60        0.801
+  4            1.54       2.16       2.72        0.680
+  8            1.90       3.47       4.68        0.585
+  16           2.17       5.98       8.35        0.522
+  32           2.34      10.42      14.82        0.463
+
+ASSIGNMENT POLICY AT FIXED FAN-OUT (k=8) -- wire vs round-robin
+  corpus      roundrobin       sticky       random
+  catch2         8010182       -1.10%       -1.59%
+  cereal         5807880       -0.03%       -0.21%
+  duckdb        27705253       -1.58%       -0.86%
+  eigen         17208713       -8.86%       -2.42%
+  range-v3       7076645       -0.75%       -0.02%
+  rocksdb       26831854       -0.60%       -0.14%
+
+TRANSPORT MAKESPAN (wall s) -- C-side bound, see caveat
+  corpus         k=1      k=2      k=4      k=8     k=16     k=32
+  catch2        1.27     1.80     1.82     2.08     2.39     2.80
+  cereal        0.41     0.57     0.64     0.88     1.28     2.15
+  duckdb        3.51     3.88     4.16     4.66     5.50     7.04
+  eigen         4.23     4.71     4.74     5.18     5.87     7.11
+  range-v3      0.83     1.12     1.21     1.37     1.73     2.41
+  rocksdb       4.53     5.01     5.04     5.52     6.68     8.74
