@@ -37,6 +37,7 @@
 #include <zstd.h>
 #include <zlib.h>
 #include "alpha_line_codec.h"
+#include "p29_online_s1.h"
 #include "mo_factor_codec.h"
 #if defined(WITH_BSC_GROUPS)
   #include "residual_group_codec.h"
@@ -1058,33 +1059,37 @@ int main(int argc,char**argv){
     { uint32_t seen=0; regionsAfterTu.reserve(TUs);
       for(size_t t=0;t<TUs;++t){ for(size_t i=roff[t];i<roff[t+1];++i) if(allreg[i]+1>seen) seen=allreg[i]+1;
         regionsAfterTu.push_back(seen); } }
+    // T_current step 3: S1 is p29::OnlineS1, admitting ONE complete TU at a time.  It
+    // reproduces the old full-route matcher exactly -- same hash, chain, longest match, tie
+    // break, canonical children and first source -- so this must be BYTE-IDENTICAL; a delta
+    // would be a bug to locate, not a cost of going online.  The old loop's anchors could
+    // read the first Regions of the next TU (j+MINMATCH<=NS); the online form retains the
+    // incomplete tail and installs those anchors when the next TU becomes current.
+    p29::BlockCatalogue blockCatalogue;
+    std::unique_ptr<p29::OnlineS1> globalS1;
     if(useS1){
         size_t NS=allreg.size(); uint32_t MINMATCH=s1MinMatch, MAXCHAIN=s1MaxChain, hbits=22;
-        std::vector<uint32_t> head(size_t(1)<<hbits, UINT32_MAX), prevp(NS, UINT32_MAX);
-        auto kgram=[&](size_t i)->uint64_t{ uint64_t h=1469598103934665603ULL; for(uint32_t j=0;j<MINMATCH;++j){ h^=allreg[i+j]; h*=1099511628211ULL; } return (h*0x9E3779B97F4A7C15ULL)>>(64-hbits); };
-        auto block_get=[&](const uint32_t*p,size_t L,uint32_t srcpos,uint8_t copyok)->uint32_t{ uint64_t h=1469598103934665603ULL^(L*0x100000001b3ULL); for(size_t j=0;j<L;++j){h^=p[j];h*=1099511628211ULL;}
-            auto it=bdict.find(h); if(it!=bdict.end()){ uint32_t k=it->second; if(boff2[k+1]-boff2[k]==L && memcmp(&bchild[boff2[k]],p,L*4)==0) return block_tag(k); }
-            // Same discipline on the Block side: check the size_t, then narrow, and store k
-            // only once the id is known to be representable.
-            const size_t nextBlock=boff2.size()-1; uint32_t tag;
-            if(!make_block_tag(nextBlock,tag)){fprintf(stderr,"too many Blocks for a typed Root tag: %zu\n",nextBlock);exit(2);}
-            const uint32_t k=uint32_t(nextBlock);
-            bchild.insert(bchild.end(),p,p+L); boff2.push_back(bchild.size()); bcopy_src.push_back(srcpos); bcopy_ok.push_back(copyok); if(it==bdict.end()) bdict.emplace(h,k); return tag; };
+        p29::OnlineS1::Config s1cfg; s1cfg.min_match=MINMATCH; s1cfg.max_chain=MAXCHAIN; s1cfg.hash_bits=hbits;
+        globalS1.reset(new p29::OnlineS1(s1cfg,blockCatalogue));
         auto tb=Clock::now();
-        for(size_t t=0;t<TUs;++t){ size_t a=roff[t],b=roff[t+1]; size_t i=a;
-            while(i<b){ size_t bestL=0,bestP=0;
-                if(i+MINMATCH<=b && i+MINMATCH<=NS){ uint32_t cand=head[kgram(i)],chain=0;
-                    while(cand!=UINT32_MAX&&chain<MAXCHAIN){ if(cand<i){ size_t L=0,mx=b-i; while(L<mx&&allreg[cand+L]==allreg[i+L])++L; if(L>=MINMATCH&&L>bestL){bestL=L;bestP=cand;if(L==mx)break;} } cand=prevp[cand]; ++chain; } }
-                size_t step; (void)bestP;
-                if(bestL>=MINMATCH){ tokstream.push_back(block_get(&allreg[i],bestL,uint32_t(bestP),(bestP+bestL<=roff[t])?1:0)); step=bestL; }
-                else { tokstream.push_back(region_tag(allreg[i])); step=1; }
-                for(size_t j=i;j<i+step;++j){ if(j+MINMATCH<=NS){ uint64_t g=kgram(j); prevp[j]=head[g]; head[g]=uint32_t(j); } }
-                i+=step; }
+        std::vector<uint32_t> tuRegions;
+        for(size_t t=0;t<TUs;++t){
+            tuRegions.assign(allreg.begin()+roff[t],allreg.begin()+roff[t+1]);
+            const p29::TuPlan plan=globalS1->admit(tuRegions);
+            for(const p29::Ref&ref:plan.root)
+                tokstream.push_back(ref.kind==p29::RefKind::Block?block_tag(ref.id):region_tag(ref.id));
+            // Canonical children come from the shared catalogue; the COPY-legality flag is
+            // this matcher's admission order and is NOT a claim about any F's residency.
+            for(const p29::NewBlock&nb:plan.new_blocks){
+                const std::vector<uint32_t>&kids=blockCatalogue.block(nb.id).regions;
+                bchild.insert(bchild.end(),kids.begin(),kids.end());
+                boff2.push_back(bchild.size());
+                bcopy_src.push_back(nb.first_source_position);
+                bcopy_ok.push_back(nb.source_precedes_current_tu?1:0);
+            }
             tokoff.push_back(tokstream.size());
-            // How much of each id space exists once TU t has been tokenised.  Step 3 makes
-            // S1 produce these live; recording them here already removes every FINAL-count
-            // bound and array size, so the two changes can be verified independently.
-            blocksAfterTu.push_back(boff2.size()-1); }
+            blocksAfterTu.push_back(uint32_t(blockCatalogue.size()));
+        }
         fprintf(stderr,"S1 LZ: %.1fs min_match=%u max_chain=%u tokens=%zu blocks=%zu (%.4f tok/region)\n",secs(tb),MINMATCH,MAXCHAIN,tokstream.size(),boff2.size()-1,double(tokstream.size())/NS);
     } else { // V1: root = raw region-id sequence
         for(size_t t=0;t<TUs;++t){ for(size_t i=roff[t];i<roff[t+1];++i) tokstream.push_back(region_tag(allreg[i])); tokoff.push_back(tokstream.size()); }
