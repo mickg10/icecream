@@ -1,0 +1,34 @@
+GRZ2 small-cell verdict: removable fixed cost, not a throughput floor
+
+  project        profile                raw MB   frozen    small  speedup size +%
+  re2            debian-gcc               84.6    0.529    0.940     1.78x    +3.7  
+  re2            conan-gcc                87.0    0.544    0.967     1.78x    +4.1  
+  re2            linuxbrew                88.7    0.554    0.985     1.78x    +3.8  
+  fmt            debian-gcc              128.6    0.402    0.803     2.00x    +7.8  
+  fmt            linuxbrew               129.4    0.498    0.996     2.00x    +8.8  
+  fmt            conan-gcc               131.4    0.410    0.821     2.00x    +7.6  
+  leveldb        debian-gcc              174.8    0.564    1.165     2.07x    +9.6  CROSSES
+  leveldb        conan-gcc               178.8    0.577    1.117     1.94x   +10.5  CROSSES
+  leveldb        linuxbrew               180.1    0.667    1.200     1.80x   +10.2  CROSSES
+  fmt            fedora-clang-libcxx     192.6    0.621    1.284     2.07x   +10.9  CROSSES
+  re2            fedora-clang-libcxx     217.1    0.905    1.357     1.50x    +5.8  CROSSES
+  spdlog         debian-gcc              255.8    0.853    1.163     1.36x   +59.1  CROSSES
+  spdlog         conan-gcc               262.5    0.875    1.193     1.36x   +58.4  CROSSES
+  spdlog         linuxbrew               263.3    0.878    1.197     1.36x   +59.5  CROSSES
+  nlohmann-json  debian-gcc              288.5    0.740    1.202     1.62x   +13.5  CROSSES
+  nlohmann-json  conan-gcc               296.2    0.723    1.185     1.64x   +13.4  CROSSES
+  nlohmann-json  linuxbrew               296.7    0.690    1.141     1.65x   +12.7  CROSSES
+  leveldb        fedora-clang-libcxx     322.0    0.870    1.400     1.61x   +21.5  CROSSES
+  nlohmann-json  fedora-clang-libcxx     428.2    0.911    1.338     1.47x   +16.9  CROSSES
+
+  speedup from the small-corpus policy: min 1.36x med 1.78x max 2.07x
+  of the 19 sub-1GB/s cells, 13 cross 1 GB/s with it; 6 remain (all <= 131 MB raw)
+  small-policy cost model: time = 0.0431 s + raw / 1.522 GB/s   (frozen was 0.2241 s + raw / 1.575)
+  -> fixed cost cut 81%; that is the entire small-cell story
+
+  SIZE COST is real and NOT uniform:
+    spdlog         linuxbrew            498347 -> 794922 bytes  +59.5%
+    spdlog         debian-gcc           502334 -> 799421 bytes  +59.1%
+    spdlog         conan-gcc            507502 -> 803799 bytes  +58.4%
+    leveldb        fedora-clang-libcxx  621604 -> 755392 bytes  +21.5%
+  every small-policy wire decoded byte-exact: 19/19

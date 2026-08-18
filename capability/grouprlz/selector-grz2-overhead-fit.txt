@@ -1,0 +1,53 @@
+GRZ2 ENCODE-ONLY (in-memory input) cost model across 44 cells
+  fit: time = 0.2241 s + raw / 1.575 GB/s
+
+  project        profile                 raw MB    enc s     GB/s   fixed% predicted
+  re2            debian-gcc                84.6    0.160    0.529   140.0%     0.278
+  re2            conan-gcc                 87.0    0.160    0.544   140.0%     0.279
+  re2            linuxbrew                 88.7    0.160    0.554   140.0%     0.280
+  fmt            debian-gcc               128.6    0.320    0.402    70.0%     0.306
+  fmt            linuxbrew                129.4    0.260    0.498    86.2%     0.306
+  fmt            conan-gcc                131.4    0.320    0.411    70.0%     0.307
+  leveldb        debian-gcc               174.8    0.310    0.564    72.3%     0.335
+  leveldb        conan-gcc                178.8    0.310    0.577    72.3%     0.338
+  leveldb        linuxbrew                180.1    0.270    0.667    83.0%     0.338
+  fmt            fedora-clang-libcxx      192.6    0.310    0.621    72.3%     0.346
+  re2            fedora-clang-libcxx      217.1    0.245    0.886    91.5%     0.362
+  spdlog         debian-gcc               255.8    0.290    0.882    77.3%     0.386
+  spdlog         conan-gcc                262.5    0.300    0.875    74.7%     0.391
+  spdlog         linuxbrew                263.3    0.300    0.878    74.7%     0.391
+  cereal         debian-gcc               273.8    0.265    1.033    84.6%     0.398
+  cereal         conan-gcc                278.1    0.270    1.030    83.0%     0.401
+  cereal         linuxbrew                280.5    0.270    1.039    83.0%     0.402
+  nlohmann-json  debian-gcc               288.5    0.400    0.721    56.0%     0.407
+  nlohmann-json  conan-gcc                296.2    0.415    0.714    54.0%     0.412
+  nlohmann-json  linuxbrew                296.7    0.425    0.698    52.7%     0.412
+  leveldb        fedora-clang-libcxx      322.0    0.380    0.847    59.0%     0.428
+  cereal         fedora-clang-libcxx      376.0    0.320    1.175    70.0%     0.463
+  nlohmann-json  fedora-clang-libcxx      428.2    0.490    0.874    45.7%     0.496
+  spdlog         fedora-clang-libcxx      537.1    0.455    1.180    49.2%     0.565
+  range-v3       debian-gcc               866.5    0.640    1.354    35.0%     0.774
+  catch2         debian-gcc               873.4    0.665    1.313    33.7%     0.778
+  catch2         linuxbrew                909.5    0.655    1.388    34.2%     0.801
+  range-v3       conan-gcc                912.1    0.640    1.425    35.0%     0.803
+  catch2         conan-gcc                946.3    0.700    1.352    32.0%     0.825
+  range-v3       linuxbrew               1043.3    0.705    1.480    31.8%     0.886
+  rocksdb        debian-gcc              1804.3    1.615    1.117    13.9%     1.369
+  rocksdb        linuxbrew               1843.7    1.595    1.156    14.0%     1.394
+  rocksdb        conan-gcc               1995.5    1.725    1.157    13.0%     1.491
+  range-v3       fedora-clang-libcxx     2005.8    1.310    1.531    17.1%     1.497
+  rocksdb        fedora-clang-libcxx     2407.3    1.860    1.294    12.0%     1.752
+  catch2         fedora-clang-libcxx     2661.1    1.630    1.633    13.7%     1.913
+  opencv         debian-gcc              3524.1    3.490    1.010     6.4%     2.461
+  opencv         conan-gcc               3598.1    3.525    1.021     6.4%     2.508
+  opencv         linuxbrew               3610.6    3.420    1.056     6.6%     2.516
+  opencv         fedora-clang-libcxx     5252.5    4.390    1.196     5.1%     3.558
+  eigen          debian-gcc              8095.0    4.990    1.622     4.5%     5.363
+  eigen          linuxbrew               8152.5    4.985    1.635     4.5%     5.399
+  eigen          conan-gcc               8189.3    5.105    1.604     4.4%     5.423
+  eigen          fedora-clang-libcxx    10096.8    6.125    1.648     3.7%     6.633
+
+  interpretation: at raw = 353 MB the fixed cost is half the encode time
+  cells where fixed cost is >25% of encode time: 30/44
+  asymptotic throughput (raw -> inf) = 1.575 GB/s
+  cells >=1GB: measured GB/s min 1.010 med 1.294 max 1.648
