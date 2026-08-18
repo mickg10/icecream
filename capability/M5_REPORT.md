@@ -88,13 +88,20 @@ Current executed gates through `5f336d13`:
 | Gate | Result |
 |---|---:|
 | warning-clean optimized builds | PASS |
-| focused M4/state tests, including typed closure and raw-weighted H200 | PASS |
+| focused M1 header/transport, M2 transaction, M4 protocol, and M5 state tests | PASS |
+| typed Root closure and raw-weighted H200 focused cases | PASS |
 | expanded typed smoke suite | **45/45 exact** |
 | batch rejection/rollback under ASan+UBSan | PASS, 20 commits / 2 prepared aborts |
 | bounded one-pass grow/removal under ASan+UBSan | PASS, 79,376 / 127,633 / 856 removals and 20 compactions |
 
 Retained smoke root:
 `/tanksmall/scratch/ictmp/issue16-m5-typed-smoke-v2-fNJNXW`.
+
+The acceptance launcher now rebuilds and runs all five focused regression
+binaries before any scenario row: `cap_header_test`, `cap_transport_test`,
+`cap_m2_test`, `cap_m4_test`, and `cap_m5_state_test`. The first complete
+warning-clean rehearsal of that combined gate is retained at
+`/tanksmall/scratch/ictmp/issue16-m5-focused-build-NXbUv8`.
 
 M5 remains **OPEN**.  The current typed code still needs the complete fixed-16
 scenario rerun and the uncontended quietbox focused complete-rate rows before

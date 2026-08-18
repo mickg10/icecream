@@ -268,6 +268,9 @@ def phase_summary(
 def build(source: Path, output: Path, cxx: str) -> tuple[Path, Path, list[list[str]]]:
     binary = output / "cap_m5"
     stream_binary = output / "cap_m5_stream"
+    header_test = output / "cap_header_test"
+    transport_test = output / "cap_transport_test"
+    m2_test = output / "cap_m2_test"
     state_test = output / "cap_m5_state_test"
     m4_test = output / "cap_m4_test"
     common = [
@@ -303,6 +306,27 @@ def build(source: Path, output: Path, cxx: str) -> tuple[Path, Path, list[list[s
         ],
         common
         + [
+            str(source / "cap_header_test.cpp"),
+            "-o",
+            str(header_test),
+        ],
+        common
+        + [
+            str(source / "cap_transport_test.cpp"),
+            "-o",
+            str(transport_test),
+        ],
+        common
+        + [
+            str(source / "cap_m2_test.cpp"),
+            str(source / "cap_codec.cpp"),
+            "-o",
+            str(m2_test),
+            "-lzstd",
+            "-pthread",
+        ],
+        common
+        + [
             str(source / "cap_m5_state_test.cpp"),
             str(source / "cap_codec.cpp"),
             "-o",
@@ -322,7 +346,7 @@ def build(source: Path, output: Path, cxx: str) -> tuple[Path, Path, list[list[s
     ]
     for command in commands:
         subprocess.run(command, check=True)
-    for test in (state_test, m4_test):
+    for test in (header_test, transport_test, m2_test, state_test, m4_test):
         completed = subprocess.run(
             test, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
         )
