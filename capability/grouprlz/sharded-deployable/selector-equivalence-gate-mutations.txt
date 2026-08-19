@@ -1,0 +1,11 @@
+# selector_equivalence_mutations.sh
+controls: both gates accept the unmutated fmt/debian-gcc
+caught step1_equivalence/rc         exit=1  STEP1 FAIL [fmt/debian-gcc]: od: codec exited 2
+caught step1_equivalence/be         exit=1  STEP1 FAIL [fmt/debian-gcc]: od: byte-exact is not OK
+caught step1_equivalence/cf         exit=1  STEP1 FAIL [fmt/debian-gcc]: C->F streams differ
+caught step1_equivalence/empty      exit=1  STEP1 FAIL [fmt/debian-gcc]: od.cf is missing or empty
+caught step2_equivalence/rc         exit=1  STEP2 FAIL [fmt/debian-gcc]: b: codec exited 2
+caught step2_equivalence/be         exit=1  STEP2 FAIL [fmt/debian-gcc]: b: byte-exact is not OK
+caught step2_equivalence/cf         exit=1  STEP2 FAIL [fmt/debian-gcc]: C->F streams differ between the reference and the build under test
+caught step2_equivalence/total      exit=1  STEP2 FAIL [fmt/debian-gcc]: legacy accounting TOTAL differs: TOTAL=1057577 vs TOTAL=11057577
+both equivalence gates reject every mutation by the check it targets, and both controls pass
