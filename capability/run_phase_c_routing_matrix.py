@@ -421,7 +421,14 @@ def write_tsv(path: Path, rows: list[dict[str, object]]) -> None:
         writer.writerows(rows)
 
 
-def write_report(path: Path, rows: list[dict[str, object]], widths: list[int]) -> None:
+def write_report(
+    path: Path,
+    rows: list[dict[str, object]],
+    widths: list[int],
+    planner_commit: str,
+    physical_commit: str,
+    runner_commit: str,
+) -> None:
     by_key = {
         (str(row["corpus"]), int(row["nominal_width"]), str(row["policy"])): row
         for row in rows
@@ -435,6 +442,9 @@ def write_report(path: Path, rows: list[dict[str, object]], widths: list[int]) -
         "1-Gbit/s, one-egress-lane-per-F and 0.5-GB/s compiler model.",
         "R5 lower bounds live only in the labelled independent-Region estimator; they do not "
         "bound the physical byte columns and are reported separately.",
+        "",
+        f"Planner `{planner_commit}` · physical source `{physical_commit}` · "
+        f"matrix runner `{runner_commit}`.",
         "",
     ]
     for corpus in CORPORA:
@@ -518,6 +528,7 @@ def main() -> int:
     parser.add_argument("--cxx", default="g++")
     parser.add_argument("--planner-commit", required=True)
     parser.add_argument("--physical-commit", required=True)
+    parser.add_argument("--runner-commit", required=True)
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
 
@@ -572,7 +583,14 @@ def main() -> int:
                 )
                 rows.append(row)
                 write_tsv(args.output / "matrix.tsv", rows)
-                write_report(args.output / "REPORT.md", rows, widths)
+                write_report(
+                    args.output / "REPORT.md",
+                    rows,
+                    widths,
+                    args.planner_commit,
+                    args.physical_commit,
+                    args.runner_commit,
+                )
                 print(
                     f"EXACT {ordinal}/{total} {corpus.name} M={width} {policy.label}: "
                     f"cold={row['cold_c_to_f']} warm={row['warm_c_to_f']} "
@@ -581,9 +599,11 @@ def main() -> int:
                 )
 
     provenance = {
-        "schema": 1,
+        "schema": 2,
         "planner_commit": args.planner_commit,
         "physical_commit": args.physical_commit,
+        "runner_commit": args.runner_commit,
+        "runner_sha256": sha256(Path(__file__).resolve()),
         "planner_sha256": planner_sha,
         "physical_sha256": physical_sha,
         "physical_build_command": build_command,
