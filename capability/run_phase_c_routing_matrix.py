@@ -48,6 +48,7 @@ class PolicySpec:
     time_weight: tuple[int, int] = (0, 1)
     r5_horizon: int = 0
     r5_beam: int = 0
+    investment_weight: tuple[int, int] = (1, 1)
 
 
 POLICIES = (
@@ -72,6 +73,33 @@ POLICIES = (
     ),
     PolicySpec(
         "R4_W500", "r4-state", "R4_STATE_AWARE", (500_000, 1_000_000)
+    ),
+    PolicySpec(
+        "R4_W0625_I0",
+        "r4-state",
+        "R4_STATE_AWARE",
+        (62_500, 1_000_000),
+        0,
+        0,
+        (0, 1),
+    ),
+    PolicySpec(
+        "R4_1GBIT_I0",
+        "r4-state",
+        "R4_STATE_AWARE",
+        (125_000, 1_000_000),
+        0,
+        0,
+        (0, 1),
+    ),
+    PolicySpec(
+        "R4_W250_I0",
+        "r4-state",
+        "R4_STATE_AWARE",
+        (250_000, 1_000_000),
+        0,
+        0,
+        (0, 1),
     ),
     PolicySpec("R5_BYTES", "r5-bounded", "R5_BOUNDED", (0, 1), 4, 64),
     PolicySpec(
@@ -327,6 +355,12 @@ def run_cell(
             str(policy.r5_horizon),
             "--r5-beam",
             str(policy.r5_beam),
+        ]
+    if policy.investment_weight != (1, 1):
+        planner_command += [
+            "--investment-weight",
+            str(policy.investment_weight[0]),
+            str(policy.investment_weight[1]),
         ]
     header = (
         f"PLANNER_COMMAND {shlex.join(planner_command)}\n"
