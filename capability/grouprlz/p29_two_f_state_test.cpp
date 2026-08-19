@@ -74,13 +74,17 @@ p29::TransactionClosure closure_for(
             admitted.output_digest, admitted.source_extent};
 }
 
+size_t count_copy(const p29::RouteCandidate& candidate);
+
 p29::AckReceipt transfer(p29::FRouteEndpoint& endpoint,
                          const std::shared_ptr<const p29::SharedCAuthority::AdmittedTu>& admitted,
                          p29::RepresentationMode mode, uint8_t key_base,
                          bool recover_lost_ack = false) {
+    const size_t events_before = endpoint.events().size();
     endpoint.prepare(admitted, {opaque(240), opaque(key_base)});
-    const auto closure = closure_for(*admitted, endpoint.candidate(mode).route_sequence);
-    endpoint.begin_attempt(mode, closure);
+    const p29::RouteCandidate selected = endpoint.candidate(mode);
+    const auto closure = closure_for(*admitted, selected.route_sequence);
+    endpoint.begin_attempt(selected, closure);
     const p29::AckReceipt first = endpoint.commit_at_f();
     if (recover_lost_ack) {
         const uint64_t applies = endpoint.f_apply_count();
@@ -100,6 +104,34 @@ p29::AckReceipt transfer(p29::FRouteEndpoint& endpoint,
               committed.c_route.occurrence_count == endpoint.occurrences().size() &&
               committed.c_mirror.mirror_sequence == committed.c_route.committed_sequence,
           "successful representation did not commit its exact C route history");
+    check(endpoint.events().size() == events_before + 1,
+          "successful transaction did not append exactly one unified event");
+    const p29::TuEventRecord& event = endpoint.events().back();
+    std::string event_reason;
+    check(event.validate(&event_reason), event_reason.c_str());
+    const p29::CandidateKind selected_kind =
+        mode == p29::RepresentationMode::Raw
+            ? p29::CandidateKind::Raw
+            : (mode == p29::RepresentationMode::RouteS1
+                   ? p29::CandidateKind::RouteS1
+                   : p29::CandidateKind::GlobalS1);
+    check(event.selected == selected_kind && event.c_guid == first.id.scope.c_guid &&
+              event.source_generation == first.id.scope.source_generation &&
+              event.f == endpoint.lane().f && event.route_lane_id == endpoint.lane().lane_id &&
+              event.canonical_admission_sequence == admitted->canonical_admission_sequence &&
+              event.physical_ordinal == selected.route_sequence &&
+              event.transaction_digest == closure.transaction_digest &&
+              event.output_digest == closure.output_digest &&
+              event.before.route_commit_sequence + 1 == event.after.route_commit_sequence &&
+              event.before.mirror_sequence + 1 == event.after.mirror_sequence &&
+              event.before.residency_sequence + 1 == event.after.residency_sequence,
+          "unified event identity/closure/state boundary differs from the transaction");
+    check(event.attempts == (recover_lost_ack ? 2U : 1U) &&
+              event.retained_ack_recovery == recover_lost_ack,
+          "unified event did not retain the exact attempt/Ack history");
+    check(event.missing_ordinals.size() == selected.definitions.size() &&
+              event.copy_uses.size() == count_copy(selected),
+          "unified event did not retain the selected missing/COPY closure");
     return first;
 }
 
@@ -215,6 +247,36 @@ int main() {
               "stale route ticket was accepted for a later prepare");
         if (fixture.authority.route_history_mark(lane).pending)
             fixture.authority.abort_route(second);
+    }
+
+    // The receiver closure is bound to the canonical admission.  A caller cannot Ack the
+    // right Region reconstruction under a different output extent/digest, and the refused
+    // call leaves the prepared route available for the correct closure.
+    {
+        Fixture fixture;
+        const std::vector<uint32_t> x{fixture.region_ids[0], fixture.region_ids[1],
+                                      fixture.region_ids[2], fixture.region_ids[3]};
+        p29::FRouteEndpoint f(fixture.authority, {opaque(101), 7}, 0);
+        const auto admitted = fixture.admit(x, 39);
+        f.prepare(admitted, {opaque(229), opaque(139)});
+        const auto selected = f.candidate(p29::RepresentationMode::Raw);
+        const auto before = f.state_mark();
+        auto wrong = closure_for(*admitted, selected.route_sequence);
+        ++wrong.output_extent;
+        bool refused = false;
+        try {
+            f.begin_attempt(selected, wrong);
+        } catch (const std::invalid_argument&) {
+            refused = true;
+        }
+        check(refused && f.state_mark() == before && f.events().empty(),
+              "mismatched canonical closure changed prepared route/F/event state");
+        const auto correct = closure_for(*admitted, selected.route_sequence);
+        f.begin_attempt(selected, correct);
+        const auto ack = f.commit_at_f();
+        f.deliver_ack(ack);
+        check(f.events().size() == 1 && f.events().back().attempts == 1,
+              "correct closure did not produce one exact event after refusal");
     }
 
     // Independent F endpoints may prepare and close concurrently.  The shared authority
@@ -426,6 +488,8 @@ int main() {
         const auto close = closure_for(*retry_admitted, first_candidate.route_sequence);
         f.begin_attempt(first_candidate, close);
         f.reject_attempt();
+        check(f.events().size() == 1,
+              "a rejected transaction appended a successful-TU event");
         check(f.state_mark() == before,
               "mid-transaction rejection did not restore the two-F endpoint state");
         check(fixture.authority.block_count() == catalogue_before &&
@@ -440,6 +504,9 @@ int main() {
         const auto retry_ack = f.commit_at_f();
         f.deliver_ack(retry_ack);
         check(f.f_apply_count() == 2, "retry did not apply exactly once after the seed");
+        check(f.events().size() == 2 && f.events().back().attempts == 2 &&
+                  !f.events().back().retained_ack_recovery,
+              "retry event did not combine the rejected and successful attempts");
 
         const auto lost = fixture.admit(x, 92);
         transfer(f, lost, p29::RepresentationMode::Raw, 192, true);
@@ -472,6 +539,10 @@ int main() {
         f.begin_attempt(after_eviction, close);
         const auto ack = f.commit_at_f();
         f.deliver_ack(ack);
+        check(f.events().back().attempts == 2 &&
+                  f.events().back().evicted_objects == 1 &&
+                  f.events().back().evicted_source_bytes == x.size() * sizeof(uint32_t),
+              "post-eviction event did not retain retry and eviction accounting");
     }
 
     // A new F cache epoch and a new SourceGeneration are independent exact domains even

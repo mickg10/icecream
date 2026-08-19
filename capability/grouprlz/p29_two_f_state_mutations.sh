@@ -15,6 +15,7 @@ mkdir -p "$WORK"
 copy_sources(){
   local dir=$1
   cp "$HERE/p29_two_f_state_test.cpp" "$HERE/p29_two_f_state.h" \
+     "$HERE/p29_event_record.h" \
      "$HERE/p29_shared_authority.h" "$HERE/p29_online_s1.h" \
      "$HERE/p29_transfer_transaction.h" "$HERE/p29_sparse_blocks.h" "$dir/"
 }
@@ -65,7 +66,7 @@ mutate merged_route_lanes p29_shared_authority.h \
 # Ack installs objects but aborts semantic route history.  RAW is the first discriminating
 # representation, so the per-transfer check observes this before a later prepare cascades.
 mutate route_not_committed p29_shared_authority.h \
-  "C route history and F occurrence history diverged" \
+  "successful TU did not advance route commit sequence exactly once" \
   's/lane\.matcher\.commit();/lane.matcher.abort();/g' \
   '/++lane\.committed_sequence;/d'
 

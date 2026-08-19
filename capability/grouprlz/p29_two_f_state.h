@@ -8,11 +8,13 @@
 #ifndef P29_TWO_F_STATE_H
 #define P29_TWO_F_STATE_H
 
+#include "p29_event_record.h"
 #include "p29_shared_authority.h"
 #include "p29_sparse_blocks.h"
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstdint>
 #include <limits>
 #include <optional>
@@ -135,6 +137,7 @@ public:
     const SparseBlockStore& blocks() const { return blocks_; }
     const std::vector<uint32_t>& occurrences() const { return occurrences_; }
     const std::vector<CommittedSpan>& committed_spans() const { return spans_; }
+    const std::vector<TuEventRecord>& events() const { return events_; }
     bool has_pending() const { return pending_.has_value(); }
 
     StateMark state_mark() const {
@@ -164,6 +167,8 @@ public:
     void prepare(const std::shared_ptr<const SharedCAuthority::AdmittedTu>& admitted,
                  RoutingHints hints = {}) {
         if (pending_) throw std::logic_error("endpoint prepare while a TU is pending");
+        const StateMark before = state_mark();
+        const uint64_t catalogue_before = authority_.block_count();
         SharedCAuthority::RoutePreparation route = authority_.prepare_route(lane_, admitted);
         try {
             if (route.plan.occurrence_begin != occurrences_.size())
@@ -172,6 +177,11 @@ public:
             pending.admitted = admitted;
             pending.hints = hints;
             pending.route = std::move(route);
+            pending.before = make_event_state(before, catalogue_before);
+            if (retry_ && retry_->canonical_admission_sequence ==
+                              admitted->canonical_admission_sequence &&
+                retry_->route_sequence == pending.route.route_sequence)
+                pending.attempts = retry_->attempts;
             pending.candidates[mode_index(RepresentationMode::Raw)] =
                 build_candidate(RepresentationMode::Raw, pending);
             pending.candidates[mode_index(RepresentationMode::RouteS1)] =
@@ -256,20 +266,32 @@ public:
             pending_->candidates[mode_index(selected.mode)];
         if (!(selected == expected) || !candidate_legal_for(selected))
             throw std::invalid_argument("candidate is not legal for this F route");
+        if (closure.output_digest != pending_->admitted->output_digest ||
+            closure.output_extent != pending_->admitted->source_extent)
+            throw std::invalid_argument("transaction closure differs from canonical admission");
 
         const TransferTxnId id{receiver_scope(), pending_->route.route_sequence};
         if (receiver_.begin(id, closure) != BeginResult::Ready)
             throw std::logic_error("receiver refused a new route attempt");
         if (source_residency_sequence_ == std::numeric_limits<uint64_t>::max() ||
-            f_apply_count_ == std::numeric_limits<uint64_t>::max()) {
+            f_apply_count_ == std::numeric_limits<uint64_t>::max() ||
+            pending_->attempts == std::numeric_limits<uint32_t>::max()) {
             receiver_.abort();
             throw std::overflow_error("F route state clock exhausted");
         }
         pending_->closure = closure;
         pending_->selected = selected.mode;
         pending_->attempt_active = true;
+        ++pending_->attempts;
 
         try {
+            // Everything which can allocate for the durable event is prepared before the F
+            // commit.  Ack delivery only fills scalars, validates allocation-free, and moves
+            // the row into already-reserved storage.
+            if (events_.size() == events_.max_size())
+                throw std::overflow_error("unified event log exhausted");
+            events_.reserve(events_.size() + 1);
+            pending_->event = build_event(selected, closure);
             occurrences_.reserve(occurrences_.size() + pending_->admitted->regions.size());
             resident_.reserve(resident_.size() + pending_->admitted->regions.size());
             spans_.reserve(spans_.size() + 1);
@@ -303,6 +325,11 @@ public:
                 throw std::logic_error("F reconstructed a different Region sequence");
         } catch (...) {
             rollback_attempt_only();
+            const RetryState retry{pending_->admitted->canonical_admission_sequence,
+                                   pending_->route.route_sequence, pending_->attempts};
+            authority_.abort_route(pending_->route);
+            retry_ = retry;
+            pending_.reset();
             throw;
         }
     }
@@ -314,7 +341,10 @@ public:
         if (!pending_->attempt_active || pending_->f_committed)
             throw std::logic_error("no rejectable F attempt");
         rollback_attempt_only();
+        const RetryState retry{pending_->admitted->canonical_admission_sequence,
+                               pending_->route.route_sequence, pending_->attempts};
         authority_.abort_route(pending_->route);
+        retry_ = retry;
         pending_.reset();
     }
 
@@ -348,19 +378,45 @@ public:
         require_pending();
         if (!pending_->f_committed || !pending_->ack || !(ack == *pending_->ack))
             throw std::invalid_argument("Ack does not close the pending F transaction");
+        if (!pending_->event)
+            throw std::logic_error("Acked route transaction has no unified event record");
         authority_.commit_route_and_installs(pending_->route, pending_->claims);
-        pending_.reset();
+        try {
+            TuEventRecord event = std::move(*pending_->event);
+            event.attempts = pending_->attempts;
+            event.retained_ack_recovery = pending_->retained_ack_recovery;
+            pending_.reset();
+            event.after = make_event_state(state_mark(), authority_.block_count());
+            const char* reason = nullptr;
+            if (!event.validate(&reason)) {
+                std::fprintf(stderr, "unified event rejected after Ack: %s\n",
+                             reason ? reason : "unknown event invariant");
+                std::terminate();
+            }
+            events_.push_back(std::move(event));
+            evicted_objects_since_event_ = 0;
+            evicted_source_bytes_since_event_ = 0;
+            retry_.reset();
+        } catch (...) {
+            // C and F have committed.  Reusing this endpoint without its corresponding event
+            // would create a history the replay cannot account for.
+            std::terminate();
+        }
     }
 
     AckReceipt recover_retained_ack() {
         require_pending();
         if (!pending_->f_committed || !pending_->ack)
             throw std::logic_error("no committed F transaction awaiting Ack recovery");
+        if (pending_->attempts == std::numeric_limits<uint32_t>::max())
+            throw std::overflow_error("F route attempt counter exhausted");
         AckReceipt retained;
         const TransferTxnId id{receiver_scope(), pending_->route.route_sequence};
         const BeginResult result = receiver_.begin(id, pending_->closure, &retained);
         if (result != BeginResult::DuplicateCommitted || !(retained == *pending_->ack))
             throw std::logic_error("receiver did not return the retained Ack");
+        ++pending_->attempts;
+        pending_->retained_ack_recovery = true;
         return retained;
     }
 
@@ -370,13 +426,22 @@ public:
         if (pending_) throw std::logic_error("source eviction while a TU is pending");
         for (const CommittedSpan& span : spans_) {
             if (span.route_sequence != route_sequence) continue;
-            bool changed = false;
-            for (size_t index = span.begin; index < span.end; ++index) {
-                changed |= resident_[index] != 0;
+            uint64_t changed = 0;
+            for (size_t index = span.begin; index < span.end; ++index)
+                changed += resident_[index] != 0;
+            if (!changed) return false;
+            if (source_residency_sequence_ == std::numeric_limits<uint64_t>::max() ||
+                evicted_objects_since_event_ == std::numeric_limits<uint64_t>::max() ||
+                changed > std::numeric_limits<uint64_t>::max() / sizeof(uint32_t) ||
+                changed * sizeof(uint32_t) >
+                    std::numeric_limits<uint64_t>::max() - evicted_source_bytes_since_event_)
+                throw std::overflow_error("F source eviction accounting exhausted");
+            for (size_t index = span.begin; index < span.end; ++index)
                 resident_[index] = 0;
-            }
-            if (changed) ++source_residency_sequence_;
-            return changed;
+            ++source_residency_sequence_;
+            ++evicted_objects_since_event_;
+            evicted_source_bytes_since_event_ += changed * sizeof(uint32_t);
+            return true;
         }
         return false;
     }
@@ -387,12 +452,22 @@ private:
         RoutingHints hints{};
         SharedCAuthority::RoutePreparation route;
         std::array<RouteCandidate, 3> candidates;
+        EventState before{};
         std::optional<RepresentationMode> selected;
         TransactionClosure closure{};
         std::vector<PerFRelationship::InstallClaim> claims;
         std::optional<AckReceipt> ack;
+        std::optional<TuEventRecord> event;
+        uint32_t attempts = 0;
         bool attempt_active = false;
         bool f_committed = false;
+        bool retained_ack_recovery = false;
+    };
+
+    struct RetryState {
+        uint64_t canonical_admission_sequence = 0;
+        uint64_t route_sequence = 0;
+        uint32_t attempts = 0;
     };
 
     static size_t mode_index(RepresentationMode mode) {
@@ -409,6 +484,120 @@ private:
 
     TypedObjectKey block_key(uint32_t id) const {
         return {authority_.source_generation(), ObjectKind::Block, id};
+    }
+
+    static CandidateKind event_kind(RepresentationMode mode) {
+        switch (mode) {
+            case RepresentationMode::Raw: return CandidateKind::Raw;
+            case RepresentationMode::RouteS1: return CandidateKind::RouteS1;
+            case RepresentationMode::GlobalS1: return CandidateKind::GlobalS1;
+        }
+        std::terminate();
+    }
+
+    static uint64_t digest_state(const StateMark& mark) {
+        uint64_t digest = 0;
+        uint64_t ordinal = 1;
+        const auto add = [&](uint64_t value) {
+            digest = mix(digest ^ mix(value + ordinal * 0x9e3779b97f4a7c15ULL));
+            ++ordinal;
+        };
+        add(mark.c_route.committed_sequence);
+        add(mark.c_route.occurrence_count);
+        add(mark.c_route.pending);
+        add(mark.c_route.pending_prepare_token);
+        add(mark.c_route.pending_admission_sequence);
+        add(mark.c_mirror.residency_sequence);
+        add(mark.c_mirror.known_objects);
+        add(mark.c_mirror.pending_installs);
+        add(mark.c_mirror.mirror_sequence);
+        add(mark.f_blocks.block_slots);
+        add(mark.f_blocks.child_count);
+        add(mark.f_blocks.known_blocks);
+        add(mark.f_blocks.block_digest);
+        add(mark.f_blocks.child_digest);
+        add(mark.f_ledger.expected_sequence);
+        add(mark.f_ledger.pending);
+        add(mark.f_ledger.pending_sequence);
+        add(mark.f_ledger.pending_transaction_digest.lo);
+        add(mark.f_ledger.pending_transaction_digest.hi);
+        add(mark.f_ledger.pending_output_digest.lo);
+        add(mark.f_ledger.pending_output_digest.hi);
+        add(mark.f_ledger.pending_output_extent);
+        add(mark.f_ledger.retained_ack);
+        add(mark.f_ledger.retained_sequence);
+        add(mark.f_ledger.retained_transaction_digest.lo);
+        add(mark.f_ledger.retained_transaction_digest.hi);
+        add(mark.f_ledger.retained_output_digest.lo);
+        add(mark.f_ledger.retained_output_digest.hi);
+        add(mark.f_ledger.retained_output_extent);
+        add(mark.f_occurrence_count);
+        add(mark.f_occurrence_digest);
+        add(mark.resident_occurrences);
+        add(mark.residency_digest);
+        add(mark.source_residency_sequence);
+        add(mark.f_apply_count);
+        add(mark.committed_spans);
+        add(mark.c_pending);
+        add(mark.f_attempt_active);
+        add(mark.f_committed_waiting_for_ack);
+        return digest;
+    }
+
+    static EventState make_event_state(const StateMark& mark, uint64_t catalogue_objects) {
+        return {catalogue_objects,
+                mark.c_route.occurrence_count,
+                mark.f_blocks.known_blocks,
+                mark.c_route.committed_sequence,
+                mark.c_mirror.mirror_sequence,
+                mark.source_residency_sequence,
+                digest_state(mark)};
+    }
+
+    TuEventRecord build_event(const RouteCandidate& selected,
+                              const TransactionClosure& closure) const {
+        TuEventRecord event;
+        event.c_guid = authority_.c_guid();
+        event.source_generation = authority_.source_generation();
+        event.producer_request_id = pending_->admitted->producer_request_id;
+        event.f = lane_.f;
+        event.route_lane_id = lane_.lane_id;
+        event.routing_cohort_key = pending_->hints.routing_cohort_key;
+        event.tu_key = pending_->hints.tu_key;
+        event.canonical_admission_sequence =
+            pending_->admitted->canonical_admission_sequence;
+        event.shared_c_snapshot_version = pending_->admitted->shared_c_snapshot_version;
+        event.logical_ordinal = pending_->admitted->canonical_admission_sequence;
+        event.physical_ordinal = pending_->route.route_sequence;
+        event.raw_bytes = pending_->admitted->source_extent;
+        event.output_extent = closure.output_extent;
+        event.transaction_digest = closure.transaction_digest;
+        event.output_digest = closure.output_digest;
+        event.before = pending_->before;
+        event.attempts = pending_->attempts;
+        event.evicted_objects = evicted_objects_since_event_;
+        event.evicted_source_bytes = evicted_source_bytes_since_event_;
+
+        for (const RouteCandidate& candidate : pending_->candidates) {
+            CandidateMeasurement& measurement =
+                event.candidates[static_cast<size_t>(event_kind(candidate.mode))];
+            measurement.offered = true;
+            measurement.legal = candidate_legal_for(candidate);
+        }
+        event.selected = event_kind(selected.mode);
+        event.missing_ordinals.reserve(selected.definitions.size());
+        event.copy_uses.reserve(selected.definitions.size());
+        for (const CandidateBlockDefinition& definition : selected.definitions) {
+            event.missing_ordinals.push_back(definition.block_id);
+            if (!definition.copy) continue;
+            event.copy_uses.push_back({definition.copy->lane,
+                                       definition.copy->source_generation,
+                                       definition.copy->source_residency_sequence,
+                                       definition.copy->source_position,
+                                       definition.copy->length,
+                                       definition.block_id});
+        }
+        return event;
     }
 
     RouteCandidate build_candidate(RepresentationMode mode, const Pending& pending) const {
@@ -502,8 +691,10 @@ private:
             if (!relation_->abort_install(claim.key, claim.token))
                 throw std::logic_error("could not abort the C install reservation");
         pending_->claims.clear();
+        pending_->event.reset();
         pending_->attempt_active = false;
         pending_->selected.reset();
+        pending_->retained_ack_recovery = false;
     }
 
     static uint64_t mix(uint64_t value) {
@@ -530,8 +721,12 @@ private:
     std::vector<uint32_t> occurrences_;
     std::vector<uint8_t> resident_;
     std::vector<CommittedSpan> spans_;
+    std::vector<TuEventRecord> events_;
     uint64_t source_residency_sequence_ = 0;
     uint64_t f_apply_count_ = 0;
+    uint64_t evicted_objects_since_event_ = 0;
+    uint64_t evicted_source_bytes_since_event_ = 0;
+    std::optional<RetryState> retry_;
     std::optional<Pending> pending_;
 };
 

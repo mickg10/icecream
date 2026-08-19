@@ -15,6 +15,7 @@
 #                  mo_factor_transaction_test.cpp MO dictionary whole-TU rollback
 #                  p29_shared_authority_test.cpp multi-C admission + per-F single-flight
 #                  p29_two_f_state_test.cpp      two-F route/COPY/epoch/retry state
+#                  p29_event_record_test.cpp     unified replay row and exact invariants
 #   fault runners  p29_journal_mutations.sh          the journal's failure paths
 #                  selector_equivalence_mutations.sh both byte-equivalence gates' paths
 #                  selector_1f_costing_mutations.sh  the 1F launcher's own failure path
@@ -143,7 +144,7 @@ cxx_tsan_gate() { # TSan needs a non-random address layout on some Linux kernels
 }
 for t in p29_online_s1_test p29_block_catalogue_test p29_sparse_fblocks_test p29_prepare_commit_test \
          p29_transfer_transaction_test mo_factor_transaction_test p29_shared_authority_test \
-         p29_two_f_state_test; do
+         p29_two_f_state_test p29_event_record_test; do
   step "$t (opt)" -- cxx_gate "$t.cpp" "$CXX_OPT" "$t.opt"
   step "$t (asan+ubsan)" -- cxx_gate "$t.cpp" "$CXX_SAN" "$t.san"
 done
