@@ -14,6 +14,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -115,6 +116,24 @@ struct FCacheIdentityHash {
     }
 };
 
+struct RouteLaneIdentity {
+    FCacheIdentity f{};
+    uint64_t lane_id = 0;
+
+    bool operator==(const RouteLaneIdentity& other) const {
+        return f == other.f && lane_id == other.lane_id;
+    }
+    bool operator!=(const RouteLaneIdentity& other) const { return !(*this == other); }
+};
+
+struct RouteLaneIdentityHash {
+    size_t operator()(const RouteLaneIdentity& key) const {
+        const uint64_t hash = FCacheIdentityHash{}(key.f);
+        return static_cast<size_t>(hash ^
+                                   (key.lane_id * 0xbf58476d1ce4e5b9ULL));
+    }
+};
+
 class PerFRelationship {
 public:
     enum class ReserveResult { Owner, Joined, Known };
@@ -125,14 +144,21 @@ public:
         uint64_t token = 0;
     };
 
+    struct InstallClaim {
+        TypedObjectKey key{};
+        uint64_t token = 0;
+    };
+
     struct StateMark {
         uint64_t residency_sequence = 0;
         size_t known_objects = 0;
         size_t pending_installs = 0;
+        uint64_t mirror_sequence = 0;  // one step per ACKed TU closure, including no-install
         bool operator==(const StateMark& other) const {
             return residency_sequence == other.residency_sequence &&
                    known_objects == other.known_objects &&
-                   pending_installs == other.pending_installs;
+                   pending_installs == other.pending_installs &&
+                   mirror_sequence == other.mirror_sequence;
         }
     };
 
@@ -165,6 +191,41 @@ public:
         return CommitResult::Committed;
     }
 
+    // Commit the object closure of one ACKed TU as one C-mirror transition.  Every claim is
+    // validated, duplicate keys are refused, and hash-table runway is allocated before the
+    // first visible mutation.  Once insertion starts, allocation failure follows the same
+    // process-fatal policy as the canonical matcher; a partly advanced mirror is never reused.
+    bool commit_installs(const std::vector<InstallClaim>& claims) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (claims.size() > std::numeric_limits<uint64_t>::max() - residency_sequence_ ||
+            mirror_sequence_ == std::numeric_limits<uint64_t>::max())
+            throw std::overflow_error("per-F relationship sequence exhausted");
+        std::unordered_set<TypedObjectKey, TypedObjectKeyHash> distinct;
+        distinct.reserve(claims.size());
+        for (const InstallClaim& claim : claims) {
+            if (!distinct.insert(claim.key).second) return false;
+            const auto pending = pending_.find(claim.key);
+            if (pending == pending_.end() || pending->second != claim.token ||
+                known_.find(claim.key) != known_.end())
+                return false;
+        }
+        known_.reserve(known_.size() + claims.size());
+        bool mutation_started = false;
+        try {
+            for (const InstallClaim& claim : claims) {
+                mutation_started = true;
+                known_.insert(claim.key);
+                pending_.erase(claim.key);
+                ++residency_sequence_;
+            }
+        } catch (...) {
+            if (mutation_started) std::terminate();
+            throw;
+        }
+        ++mirror_sequence_;
+        return true;
+    }
+
     bool abort_install(const TypedObjectKey& key, uint64_t token) {
         std::lock_guard<std::mutex> lock(mutex_);
         const auto pending = pending_.find(key);
@@ -180,7 +241,7 @@ public:
 
     StateMark state_mark() const {
         std::lock_guard<std::mutex> lock(mutex_);
-        return {residency_sequence_, known_.size(), pending_.size()};
+        return {residency_sequence_, known_.size(), pending_.size(), mirror_sequence_};
     }
 
     const FCacheIdentity& identity() const { return identity_; }
@@ -190,6 +251,7 @@ private:
     mutable std::mutex mutex_;
     uint64_t next_token_ = 1;
     uint64_t residency_sequence_ = 0;
+    uint64_t mirror_sequence_ = 0;
     std::unordered_set<TypedObjectKey, TypedObjectKeyHash> known_;
     std::unordered_map<TypedObjectKey, uint64_t, TypedObjectKeyHash> pending_;
 };
@@ -225,10 +287,37 @@ public:
         std::shared_ptr<const AdmittedTu> admitted;
     };
 
+    // A route plan is a ticket, not merely a TuPlan.  The internal token prevents an old
+    // caller from committing a later prepare that happens to reuse the same route sequence
+    // and AdmittedTu after an abort.  The token is authority-local and never appears on the
+    // wire; route_sequence is the durable per-lane clock.
+    struct RoutePreparation {
+        RouteLaneIdentity lane{};
+        uint64_t route_sequence = 0;
+        uint64_t prepare_token = 0;
+        uint64_t canonical_admission_sequence = 0;
+        TuPlan plan;
+    };
+
+    struct RouteHistoryMark {
+        uint64_t committed_sequence = 0;
+        uint64_t occurrence_count = 0;
+        bool pending = false;
+        uint64_t pending_prepare_token = 0;
+        uint64_t pending_admission_sequence = 0;
+
+        bool operator==(const RouteHistoryMark& other) const {
+            return committed_sequence == other.committed_sequence &&
+                   occurrence_count == other.occurrence_count && pending == other.pending &&
+                   pending_prepare_token == other.pending_prepare_token &&
+                   pending_admission_sequence == other.pending_admission_sequence;
+        }
+    };
+
     SharedCAuthority(Opaque128 c_guid, Opaque128 source_generation,
                      OnlineS1::Config config = OnlineS1::Config{})
         : c_guid_(std::move(c_guid)), source_generation_(std::move(source_generation)),
-          global_(config, blocks_) {}
+          global_(config, blocks_), route_config_(config) {}
 
     PublishedBatch publish_atoms(const std::vector<std::string>& distinct_atoms) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -340,11 +429,91 @@ public:
 
     std::shared_ptr<PerFRelationship> relationship(const FCacheIdentity& identity) {
         std::lock_guard<std::mutex> lock(mutex_);
-        const auto found = relationships_.find(identity);
-        if (found != relationships_.end()) return found->second;
-        auto relation = std::make_shared<PerFRelationship>(identity);
-        relationships_.emplace(identity, relation);
-        return relation;
+        return relationship_locked(identity);
+    }
+
+    // Prepare one current TU against exactly one F/lane's committed semantic history.  All
+    // route matchers share the authority's immutable Block catalogue, so this operation is
+    // serialized with global publication.  A route-specific match may discover a canonical
+    // Block the global matcher did not; that ID remains global even if this route aborts.
+    RoutePreparation prepare_route(const RouteLaneIdentity& identity,
+                                   const std::shared_ptr<const AdmittedTu>& admitted) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        require_own_admission(admitted);
+        RouteLaneState& lane = route_lane_locked(identity);
+        if (lane.pending) throw std::logic_error("route prepare while a transaction is pending");
+        if (lane.next_prepare_token == std::numeric_limits<uint64_t>::max())
+            throw std::overflow_error("route prepare token space exhausted");
+        if (lane.committed_sequence == std::numeric_limits<uint64_t>::max())
+            throw std::overflow_error("route sequence exhausted");
+        // A plan can create no more Blocks than it has Region occurrences.  Reserve that
+        // snapshot runway before the shared catalogue can change.
+        require_snapshot_runway(admitted->regions.size());
+
+        const size_t blocks_before = blocks_.size();
+        try {
+            const TuPlan& plan = lane.matcher.prepare(admitted->regions);
+            RoutePreparation prepared;
+            prepared.lane = identity;
+            prepared.route_sequence = lane.committed_sequence;
+            prepared.prepare_token = lane.next_prepare_token++;
+            prepared.canonical_admission_sequence =
+                admitted->canonical_admission_sequence;
+            prepared.plan = plan;
+            advance_snapshot(blocks_.size() - blocks_before);
+            lane.pending = RouteLaneState::Pending{prepared.prepare_token,
+                                                    prepared.canonical_admission_sequence};
+            return prepared;
+        } catch (...) {
+            // Block IDs are monotonic and deliberately survive an aborted/failed route
+            // prepare.  Account for any IDs minted before restoring the route matcher.
+            advance_snapshot(blocks_.size() - blocks_before);
+            if (lane.matcher.has_pending()) lane.matcher.abort();
+            throw;
+        }
+    }
+
+    void commit_route_and_installs(
+        const RoutePreparation& prepared,
+        const std::vector<PerFRelationship::InstallClaim>& claims) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        RouteLaneState& lane = existing_route_lane_locked(prepared.lane);
+        require_route_ticket(lane, prepared);
+        const auto relation = relationship_locked(prepared.lane.f);
+        if (!relation->commit_installs(claims))
+            throw std::logic_error("route Ack carries an invalid install closure");
+        lane.matcher.commit();
+        ++lane.committed_sequence;
+        lane.pending.reset();
+    }
+
+    void abort_route(const RoutePreparation& prepared) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        RouteLaneState& lane = existing_route_lane_locked(prepared.lane);
+        require_route_ticket(lane, prepared);
+        lane.matcher.abort();
+        lane.pending.reset();
+    }
+
+    RouteHistoryMark route_history_mark(const RouteLaneIdentity& identity) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto found = route_lanes_.find(identity);
+        if (found == route_lanes_.end()) return {};
+        const RouteLaneState& lane = *found->second;
+        RouteHistoryMark mark;
+        mark.committed_sequence = lane.committed_sequence;
+        mark.occurrence_count = lane.matcher.occurrences().size();
+        mark.pending = lane.pending.has_value();
+        if (lane.pending) {
+            mark.pending_prepare_token = lane.pending->prepare_token;
+            mark.pending_admission_sequence = lane.pending->canonical_admission_sequence;
+        }
+        return mark;
+    }
+
+    std::vector<uint32_t> canonical_block_children(uint32_t block_id) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return blocks_.block(block_id).regions;
     }
 
     size_t admission_count() const {
@@ -375,6 +544,64 @@ public:
     const Opaque128& source_generation() const { return source_generation_; }
 
 private:
+    struct RouteLaneState {
+        struct Pending {
+            uint64_t prepare_token = 0;
+            uint64_t canonical_admission_sequence = 0;
+        };
+
+        RouteLaneState(OnlineS1::Config config, BlockCatalogue& catalogue)
+            : matcher(config, catalogue) {}
+
+        OnlineS1 matcher;
+        uint64_t committed_sequence = 0;
+        uint64_t next_prepare_token = 1;
+        std::optional<Pending> pending;
+    };
+
+    std::shared_ptr<PerFRelationship> relationship_locked(const FCacheIdentity& identity) {
+        const auto found = relationships_.find(identity);
+        if (found != relationships_.end()) return found->second;
+        auto relation = std::make_shared<PerFRelationship>(identity);
+        relationships_.emplace(identity, relation);
+        return relation;
+    }
+
+    RouteLaneState& route_lane_locked(const RouteLaneIdentity& identity) {
+        // Creating a lane also establishes the durable per-F relationship owner.  The
+        // returned handle is intentionally discarded here; the authority retains it.
+        static_cast<void>(relationship_locked(identity.f));
+        const auto found = route_lanes_.find(identity);
+        if (found != route_lanes_.end()) return *found->second;
+        auto lane = std::make_unique<RouteLaneState>(route_config_, blocks_);
+        RouteLaneState* result = lane.get();
+        route_lanes_.emplace(identity, std::move(lane));
+        return *result;
+    }
+
+    RouteLaneState& existing_route_lane_locked(const RouteLaneIdentity& identity) {
+        const auto found = route_lanes_.find(identity);
+        if (found == route_lanes_.end())
+            throw std::logic_error("route ticket names an unknown lane");
+        return *found->second;
+    }
+
+    void require_own_admission(const std::shared_ptr<const AdmittedTu>& admitted) const {
+        if (!admitted || admitted->canonical_admission_sequence >= admissions_.size() ||
+            admissions_[admitted->canonical_admission_sequence] != admitted)
+            throw std::invalid_argument("route prepare names a foreign AdmittedTu");
+    }
+
+    static void require_route_ticket(const RouteLaneState& lane,
+                                     const RoutePreparation& prepared) {
+        if (!lane.pending ||
+            lane.pending->prepare_token != prepared.prepare_token ||
+            lane.pending->canonical_admission_sequence !=
+                prepared.canonical_admission_sequence ||
+            lane.committed_sequence != prepared.route_sequence)
+            throw std::logic_error("stale or mismatched route ticket");
+    }
+
     void advance_snapshot(size_t count) {
         if (count > std::numeric_limits<uint64_t>::max() - snapshot_version_)
             throw std::overflow_error("shared-C snapshot version exhausted");
@@ -393,10 +620,13 @@ private:
     CanonicalTable<std::vector<uint32_t>, U32VectorHash> regions_;
     BlockCatalogue blocks_;
     OnlineS1 global_;
+    OnlineS1::Config route_config_;
     std::vector<std::shared_ptr<const AdmittedTu>> admissions_;
     std::unordered_map<Opaque128, std::shared_ptr<const AdmittedTu>, Opaque128Hash> requests_;
     std::unordered_map<FCacheIdentity, std::shared_ptr<PerFRelationship>, FCacheIdentityHash>
         relationships_;
+    std::unordered_map<RouteLaneIdentity, std::unique_ptr<RouteLaneState>, RouteLaneIdentityHash>
+        route_lanes_;
 };
 
 }  // namespace p29

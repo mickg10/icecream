@@ -14,12 +14,14 @@
 #                  p29_transfer_transaction_test.cpp exact retry identity + retained Ack
 #                  mo_factor_transaction_test.cpp MO dictionary whole-TU rollback
 #                  p29_shared_authority_test.cpp multi-C admission + per-F single-flight
+#                  p29_two_f_state_test.cpp      two-F route/COPY/epoch/retry state
 #   fault runners  p29_journal_mutations.sh          the journal's failure paths
 #                  selector_equivalence_mutations.sh both byte-equivalence gates' paths
 #                  selector_1f_costing_mutations.sh  the 1F launcher's own failure path
 #                  selector_live_source_mutations.sh source-level selector attribution faults
 #                  selector_transaction_source_mutations.sh whole-state abort/Ack-order faults
 #                  p29_shared_authority_mutations.sh shared-authority failure paths
+#                  p29_two_f_state_mutations.sh      two-F route/F boundary paths
 #   wire gates     selector_step1_equivalence.sh  planning vs on-demand, byte-identical
 #                  selector_step2_equivalence.sh  reference vs build under test
 #                  selector_tag_regression.sh     typed-tag guards G1-G3
@@ -140,12 +142,15 @@ cxx_tsan_gate() { # TSan needs a non-random address layout on some Linux kernels
   fi
 }
 for t in p29_online_s1_test p29_block_catalogue_test p29_sparse_fblocks_test p29_prepare_commit_test \
-         p29_transfer_transaction_test mo_factor_transaction_test p29_shared_authority_test; do
+         p29_transfer_transaction_test mo_factor_transaction_test p29_shared_authority_test \
+         p29_two_f_state_test; do
   step "$t (opt)" -- cxx_gate "$t.cpp" "$CXX_OPT" "$t.opt"
   step "$t (asan+ubsan)" -- cxx_gate "$t.cpp" "$CXX_SAN" "$t.san"
 done
 step "p29_shared_authority_test (tsan)" -- cxx_tsan_gate p29_shared_authority_test.cpp \
      "$CXX_TSAN" p29_shared_authority_test.tsan
+step "p29_two_f_state_test (tsan)" -- cxx_tsan_gate p29_two_f_state_test.cpp \
+     "$CXX_TSAN" p29_two_f_state_test.tsan
 
 # --- fault runners: the gates' own failure paths -------------------------------------------
 step p29_journal_mutations -- env WORK="$WORK/mut.journal" "$HERE/p29_journal_mutations.sh"
@@ -159,6 +164,8 @@ step selector_transaction_source_mutations -- env BIN="$BIN" WORK="$WORK/mut.tra
      "$HERE/selector_transaction_source_mutations.sh" "$WORK/man1"
 step p29_shared_authority_mutations -- env WORK="$WORK/mut.shared-authority" \
      "$HERE/p29_shared_authority_mutations.sh"
+step p29_two_f_state_mutations -- env WORK="$WORK/mut.two-f" \
+     "$HERE/p29_two_f_state_mutations.sh"
 
 # --- wire gates ----------------------------------------------------------------------------
 step selector_tag_regression -- env BIN="$BIN" "$HERE/selector_tag_regression.sh" "$WORK/man4" "$WORK/man1"
