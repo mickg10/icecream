@@ -1,0 +1,91 @@
+# Harness audit inventory — icecream #16 selector lane
+#
+# Three fail-open defects were found in harnesses whose output had already been published:
+# selector_1f_costing.sh accepted cells on a log marker the codec prints BEFORE its own checks;
+# selector_step2_equivalence.sh checked byte-exactness with `|| echo`, which never fed the
+# verdict; selector_step1_equivalence.sh had no row-count requirement, so a dropped cell
+# vanished and "10/10" was a count of rows that happened to appear.  All three are fixed and
+# their failure paths are mutation-gated.
+#
+# This file exists so the REST is a KNOWN list rather than a silent cap.  The three inert
+# classes actually hit in this lane:
+#   (a) QUOTE-INCLUDE  a C++ mutation harness compiling the test from its own directory, so a
+#                      quoted #include picks up the UNMUTATED header and every mutation passes
+#   (b) STATUS-LOST    set +e / no set -e / `|| continue` / `|| echo` swallowing a non-zero exit
+#   (c) INERT-FIXTURE  the "bad" state is unreachable or out of bounds, so it never changes an
+#                      answer.  NOT mechanically detectable -- it needs reading, and it is the
+#                      class that fooled me twice.  Unassessed below unless stated otherwise.
+#
+# STATUS
+#   AUDITED   read, fail-closed, and its failure path is mutation-gated
+#   HELPER    sourced library, not a gate in its own right
+#   UNAUDITED not examined.  The flags are STRUCTURAL ONLY, from grep -- absence of a flag is
+#             not evidence of correctness, and class (c) is unassessed for every one of them.
+#
+# Sweep order is by blast radius: any script whose output became a published claim is
+# mandatory.  local-oracle is naming that set so the boundary is not my guess; until it does,
+# everything below AUDITED is unaudited regardless of how harmless its flags look.
+
+script                                 status     flags                    note
+selector_1f_costing.sh                 AUDITED    fail-closed              7 checks, 7 mutations
+selector_step1_equivalence.sh          AUDITED    fail-closed              4 mutations
+selector_step2_equivalence.sh          AUDITED    fail-closed              4 mutations
+selector_1f_costing_mutations.sh       AUDITED    fail-closed              gates the launcher; has a control
+selector_equivalence_mutations.sh      AUDITED    fail-closed              gates both equivalence gates; controls
+p29_journal_mutations.sh               AUDITED    fail-closed              5 mutations on the production header
+selector_build_codec50_sink.sh         AUDITED    fail-closed              errors on a missing dependency
+selector_tag_regression.sh             AUDITED    fail-closed              G1-G3 paired with mutations; CAVEAT: merges stdout+stderr into one log, though it does check the exit status separately
+selector_evidence.sh                   HELPER     n/a                      sourced by the three launchers
+baseref.sh                             UNAUDITED  no-set-e,swallow         class (c) unassessed
+final2.sh                              UNAUDITED  no-set-e,swallow         class (c) unassessed
+frontier.sh                            UNAUDITED  no-set-e,swallow         class (c) unassessed
+g012.sh                                UNAUDITED  no-set-e,swallow         class (c) unassessed
+g2_fixed112.sh                         UNAUDITED  none-structural          class (c) unassessed
+g2_replay_fixed16.sh                   UNAUDITED  none-structural          class (c) unassessed
+ratepass.sh                            UNAUDITED  no-set-e,swallow         class (c) unassessed
+selector_affinity_rebuild.sh           UNAUDITED  no-set-e                 class (c) unassessed
+selector_affinity.sh                   UNAUDITED  no-set-e                 class (c) unassessed
+selector_cell.sh                       UNAUDITED  no-set-e,swallow         class (c) unassessed
+selector_cfsplit.sh                    UNAUDITED  no-set-e                 class (c) unassessed
+selector_chrono_checkpoints.sh         UNAUDITED  no-set-e                 class (c) unassessed
+selector_coldc2.sh                     UNAUDITED  no-set-e                 class (c) unassessed
+selector_coldc2sweep.sh                UNAUDITED  no-set-e                 class (c) unassessed
+selector_cold_cencode.sh               UNAUDITED  no-set-e                 class (c) unassessed
+selector_coldwarm.sh                   UNAUDITED  no-set-e,swallow         class (c) unassessed
+selector_dm_cell.sh                    UNAUDITED  no-set-e                 class (c) unassessed
+selector_dm_sweep.sh                   UNAUDITED  no-set-e,swallow         class (c) unassessed
+selector_envcell.sh                    UNAUDITED  no-set-e,swallow         class (c) unassessed
+selector_f16_probe.sh                  UNAUDITED  none-structural          class (c) unassessed
+selector_fusedcurve.sh                 UNAUDITED  no-set-e                 class (c) unassessed
+selector_grz2curve.sh                  UNAUDITED  no-set-e                 class (c) unassessed
+selector_grz2fine.sh                   UNAUDITED  no-set-e                 class (c) unassessed
+selector_grz2_smallcell.sh             UNAUDITED  no-set-e                 class (c) unassessed
+selector_grzgate.sh                    UNAUDITED  none-structural          class (c) unassessed
+selector_grzproof.sh                   UNAUDITED  swallow                  class (c) unassessed
+selector_m5dir2_gate.sh                UNAUDITED  no-set-e                 class (c) unassessed
+selector_m5dir_gate.sh                 UNAUDITED  no-set-e                 class (c) unassessed
+selector_m5split_gate.sh               UNAUDITED  no-set-e                 class (c) unassessed
+selector_m5split_run.sh                UNAUDITED  no-set-e                 class (c) unassessed
+selector_mixedwarm_cf.sh               UNAUDITED  no-set-e                 class (c) unassessed
+selector_mixedwarm_lo211.sh            UNAUDITED  no-set-e                 class (c) unassessed
+selector_mixedwarm.sh                  UNAUDITED  no-set-e                 class (c) unassessed
+selector_native_extra.sh               UNAUDITED  no-set-e                 class (c) unassessed
+selector_p29curve.sh                   UNAUDITED  no-set-e,swallow         class (c) unassessed
+selector_p29sinkproof.sh               UNAUDITED  swallow                  class (c) unassessed
+selector_p29_stagesplit.sh             UNAUDITED  no-set-e                 class (c) unassessed
+selector_passcell.sh                   UNAUDITED  swallow                  class (c) unassessed
+selector_pb_cell.sh                    UNAUDITED  no-set-e                 class (c) unassessed
+selector_pb_rate.sh                    UNAUDITED  none-structural          class (c) unassessed
+selector_pb_resource.sh                UNAUDITED  swallow                  class (c) unassessed
+selector_pb_sweep.sh                   UNAUDITED  no-set-e,swallow         class (c) unassessed
+selector_policyA.sh                    UNAUDITED  none-structural          class (c) unassessed
+selector_raw_candidate.sh              UNAUDITED  SET+E,no-set-e           class (c) unassessed
+selector_rebuildwidth.sh               UNAUDITED  no-set-e                 class (c) unassessed
+selector_tune1.sh                      UNAUDITED  no-set-e                 class (c) unassessed
+selector_tune2.sh                      UNAUDITED  no-set-e                 class (c) unassessed
+selector_width.sh                      UNAUDITED  no-set-e                 class (c) unassessed
+selector_x4run.sh                      UNAUDITED  no-set-e,swallow         class (c) unassessed
+selector_xcheck211.sh                  UNAUDITED  no-set-e,swallow         class (c) unassessed
+test_suffix.sh                         UNAUDITED  none-structural          class (c) unassessed
+universal.sh                           UNAUDITED  no-set-e,swallow         class (c) unassessed
+window.sh                              UNAUDITED  no-set-e,swallow         class (c) unassessed
