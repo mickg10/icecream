@@ -7,6 +7,7 @@
 // Region/public-Line/Block stores.
 #include "cap_codec.h"
 #include "cap_identity.h"
+#include "cap_m5_exact_routing.h"
 #include "cap_m5_metrics.h"
 #include "cap_m5_state.h"
 #include "cap_protocol.h"
@@ -41,7 +42,7 @@ static double seconds_since(Clock::time_point begin) {
 }
 
 enum class OrderMode { Standard, Reverse, Shuffle, Novelty };
-enum class AssignmentMode { RoundRobin, Sticky, Random, Failover };
+enum class AssignmentMode { RoundRobin, Sticky, Random, Failover, ExactR5 };
 enum ComponentKind {
   CK_ROOT = 0,
   CK_BLOCK = 1,
@@ -70,6 +71,15 @@ struct Options {
   uint32_t restart_at = UINT32_MAX, latejoin_at = UINT32_MAX,
            failover_at = UINT32_MAX, corrupt_tu = UINT32_MAX;
   bool real_pipes = false;
+  bool exact_cost_check = false;
+  bool exact_plan_only = false;
+  std::vector<uint32_t> exact_compiler_slots;
+  uint32_t exact_egress_lanes = 0;
+  uint64_t exact_link_bits_per_second = 1000000000ULL;
+  uint64_t exact_compiler_bytes_per_second = 500000000ULL;
+  uint64_t exact_time_weight_bytes = 0, exact_time_weight_ns = 1;
+  size_t exact_r5_horizon = 4, exact_r5_beam = 64;
+  const char *assignment_out = nullptr;
   const char *curve_out = nullptr;
   const char *assignment_file = nullptr;
   bool assignment_option_seen = false;
@@ -337,6 +347,8 @@ static const char *assignment_name(AssignmentMode value) {
     return "random";
   case AssignmentMode::Failover:
     return "failover";
+  case AssignmentMode::ExactR5:
+    return "exact-r5";
   }
   return "unknown";
 }
@@ -383,6 +395,66 @@ struct Factorized {
   std::vector<uint32_t> block_children;
   std::vector<size_t> token_offsets{0}, block_offsets{0};
 };
+
+static capm5::ExactRoutingModel
+make_exact_routing_model(const Corpus &corpus, const Interner &dict,
+                         const std::vector<uint32_t> &sequence,
+                         const Factorized &factor,
+                         uint64_t compiler_bytes_per_second) {
+  capm5::ExactRoutingModel model;
+  model.dictionary = &dict;
+  model.block_children = &factor.block_children;
+  model.block_offsets = &factor.block_offsets;
+  model.tus.reserve(sequence.size());
+  std::vector<uint32_t> region_stamp(dict.region_count(), 0);
+  uint32_t stamp = 0;
+  for (size_t logical = 0; logical < sequence.size(); ++logical) {
+    if (++stamp == 0) {
+      std::fill(region_stamp.begin(), region_stamp.end(), 0);
+      stamp = 1;
+    }
+    capm5::ExactRoutingTu tu;
+    tu.logical = uint32_t(logical);
+    tu.raw_bytes = corpus.files[sequence[logical]].len;
+    tu.compile_ns =
+        (tu.raw_bytes * 1000000000ULL + compiler_bytes_per_second - 1) /
+        compiler_bytes_per_second;
+    const size_t begin = factor.token_offsets[logical];
+    const size_t end = factor.token_offsets[logical + 1];
+    for (size_t index = begin; index < end; ++index) {
+      const uint64_t token = factor.tokens[index];
+      capc::put_varint(tu.root_raw, token);
+      if (token & 1) {
+        const uint32_t block = uint32_t(token >> 1);
+        tu.required_blocks.push_back(block);
+        for (size_t child = factor.block_offsets[block];
+             child < factor.block_offsets[block + 1]; ++child) {
+          const uint32_t region = factor.block_children[child];
+          if (region_stamp[region] != stamp) {
+            region_stamp[region] = stamp;
+            tu.required_regions.push_back(region);
+          }
+        }
+      } else {
+        const uint32_t region = uint32_t(token >> 1);
+        if (region_stamp[region] != stamp) {
+          region_stamp[region] = stamp;
+          tu.required_regions.push_back(region);
+        }
+      }
+    }
+    std::sort(tu.required_blocks.begin(), tu.required_blocks.end());
+    tu.required_blocks.erase(
+        std::unique(tu.required_blocks.begin(), tu.required_blocks.end()),
+        tu.required_blocks.end());
+    // FStore::typed_requirements() canonicalizes Need ordinals before it
+    // filters resident Regions.  The exact oracle must feed materialize() in
+    // that same order because public-Line/path discovery is order-sensitive.
+    std::sort(tu.required_regions.begin(), tu.required_regions.end());
+    model.tus.push_back(std::move(tu));
+  }
+  return model;
+}
 static Factorized
 factor_sequence(const std::vector<std::vector<uint32_t>> &tuRegions,
                 const std::vector<uint32_t> &sequence) {
@@ -1221,11 +1293,105 @@ static int run_coordinator(const Corpus &corpus, const Interner &dict,
     }
   }
   uint32_t initial = options.latejoin_at == UINT32_MAX ? options.workers : 1;
+  std::vector<uint32_t> assignments;
+  capm5::ExactRoutingResult exactRouting;
+  if (options.exact_cost_check) {
+    const auto exactModel = make_exact_routing_model(
+        corpus, dict, sequence, factor,
+        options.exact_compiler_bytes_per_second);
+    capm5::ExactRoutingConfig exactConfig;
+    exactConfig.compiler_slots = options.exact_compiler_slots;
+    exactConfig.egress_lanes = options.exact_egress_lanes;
+    exactConfig.link_bits_per_second = options.exact_link_bits_per_second;
+    exactConfig.codec = options.policy;
+    if (options.assignment == AssignmentMode::ExactR5) {
+      capm5::ExactR5Options search;
+      search.horizon = options.exact_r5_horizon;
+      search.beam_width = options.exact_r5_beam;
+      search.time_weight_bytes = options.exact_time_weight_bytes;
+      search.time_weight_ns = options.exact_time_weight_ns;
+      auto bounded =
+          capm5::bounded_exact_r5_replay(exactModel, exactConfig, search);
+      exactRouting = std::move(bounded.feasible);
+      assignments.reserve(exactRouting.rows.size());
+      for (const auto &row : exactRouting.rows)
+        assignments.push_back(row.worker);
+      std::vector<uint64_t> rawByWorker(options.workers, 0);
+      uint64_t routedRaw = 0;
+      for (size_t index = 0; index < exactRouting.rows.size(); ++index) {
+        const uint32_t worker = exactRouting.rows[index].worker;
+        rawByWorker[worker] += exactModel.tus[index].raw_bytes;
+        routedRaw += exactModel.tus[index].raw_bytes;
+      }
+      double squared = 0.0, routeEntropy = 0.0;
+      for (uint64_t raw : rawByWorker) {
+        if (!raw || !routedRaw)
+          continue;
+        const double probability = double(raw) / double(routedRaw);
+        squared += probability * probability;
+        routeEntropy -= probability * std::log2(probability);
+      }
+      const double effectiveWidth = squared ? 1.0 / squared : 0.0;
+      printf("EXACT_R5_SEARCH tus=%zu workers=%u event_c_to_f=%llu "
+             "makespan_ns=%llu horizon=%zu beam=%zu expanded=%llu "
+             "pruned=%llu symmetry_collapsed=%llu\n",
+             sequence.size(), options.workers,
+             (unsigned long long)exactRouting.event_c_to_f,
+             (unsigned long long)exactRouting.makespan_ns, bounded.horizon,
+             bounded.beam_width,
+             (unsigned long long)bounded.expanded_paths,
+             (unsigned long long)bounded.pruned_paths,
+             (unsigned long long)bounded.symmetric_actions_collapsed);
+      printf("ROUTING_ESTIMATE schema=exact-m5-event-v1 "
+             "policy=R5_EXACT_BOUNDED tus=%zu workers=%u "
+             "estimated_c_to_f=%llu makespan_ns=%llu N_eff=%.9f "
+             "H_route=%.9f r5_horizon=%zu r5_beam=%zu "
+             "r5_expanded=%llu r5_pruned=%llu r5_symmetry=%llu\n",
+             sequence.size(), options.workers,
+             (unsigned long long)exactRouting.event_c_to_f,
+             (unsigned long long)exactRouting.makespan_ns, effectiveWidth,
+             routeEntropy, bounded.horizon, bounded.beam_width,
+             (unsigned long long)bounded.expanded_paths,
+             (unsigned long long)bounded.pruned_paths,
+             (unsigned long long)bounded.symmetric_actions_collapsed);
+      std::ofstream assignmentOut(options.assignment_out);
+      assignmentOut << "routing-assignment-v1\n";
+      for (size_t index = 0; index < assignments.size(); ++index)
+        assignmentOut << index << ' ' << assignments[index] << '\n';
+      if (!assignmentOut.good())
+        return 2;
+      if (options.exact_plan_only) {
+        if (options.curve_out) {
+          std::ofstream curveOut(options.curve_out);
+          curveOut << "logical\tworker\traw\texact_c_to_f\t"
+                      "transfer_start_ns\ttransfer_finish_ns\t"
+                      "compile_start_ns\tcompile_finish_ns\n";
+          for (size_t index = 0; index < exactRouting.rows.size(); ++index) {
+            const auto &row = exactRouting.rows[index];
+            curveOut << row.logical << '\t' << row.worker << '\t'
+                     << exactModel.tus[index].raw_bytes << '\t'
+                     << row.cost.total() << '\t' << row.transfer_start_ns
+                     << '\t' << row.transfer_finish_ns << '\t'
+                     << row.compile_start_ns << '\t' << row.compile_finish_ns
+                     << '\n';
+          }
+          if (!curveOut.good())
+            return 2;
+        }
+        return 0;
+      }
+    } else {
+      assignments = make_assignments(options, sequence);
+      exactRouting =
+          capm5::exact_routing_replay(exactModel, exactConfig, assignments);
+    }
+  } else {
+    assignments = make_assignments(options, sequence);
+  }
   for (uint32_t id = 0; id < initial; ++id)
     if (!spawn_worker(workers[id], id, workers, corpus, dict, sequence, nreg,
                       nblk, options, generation, true))
       return 2;
-  auto assignments = make_assignments(options, sequence);
   std::vector<CurveRow> curve;
   curve.reserve(sequence.size());
   std::vector<uint8_t> fillAttempts(sequence.size(), 0);
@@ -1672,6 +1838,8 @@ static int run_coordinator(const Corpus &corpus, const Interner &dict,
     for (size_t i = pending.size(); i-- > firstRejected;) {
       if (!pending[i].authority_started)
         return 2;
+      auto &worker = workers[pending[i].worker];
+      capm5::MirrorScope scope(encoder, worker.mirror);
       encoder.rollback_authority_transaction(pending[i].authority);
       pending[i].authority_started = false;
     }
@@ -1827,6 +1995,55 @@ static int run_coordinator(const Corpus &corpus, const Interner &dict,
     curveFControl += residualFToC;
   } else if (curveCToF != socketCToF || curveFToC != socketFToC) {
     exact = false;
+  }
+  bool exactRoutingClosure = !options.exact_cost_check;
+  if (options.exact_cost_check) {
+    uint64_t exactRoot = 0, exactFill = 0, exactControl = 0;
+    const auto exactHello = capp::pack_hello_m4(
+        generation, 0, 0, uint32_t(corpus.files.size()), options.repetitions);
+    const uint64_t lifecycleControl =
+        uint64_t(options.workers) * (4 + exactHello.size() + 4);
+    exactRoutingClosure = exactRouting.rows.size() == curve.size();
+    bool mismatchReported = false;
+    for (size_t index = 0; index < exactRouting.rows.size() &&
+                           index < curve.size();
+         ++index) {
+      const auto &expected = exactRouting.rows[index];
+      const auto &actual = curve[index];
+      exactRoot += expected.cost.c_root;
+      exactFill += expected.cost.c_fill;
+      exactControl += expected.cost.c_control;
+      const bool rowMatches = expected.logical == actual.logical &&
+                              expected.worker == actual.worker &&
+                              expected.cost.c_root == actual.c_root &&
+                              expected.cost.c_fill == actual.c_fill;
+      if (!rowMatches && !mismatchReported) {
+        fprintf(stderr,
+                "exact routing mismatch row=%zu logical=%u/%u worker=%u/%u "
+                "root=%llu/%llu fill=%llu/%llu\n",
+                index, expected.logical, actual.logical, expected.worker,
+                actual.worker, (unsigned long long)expected.cost.c_root,
+                (unsigned long long)actual.c_root,
+                (unsigned long long)expected.cost.c_fill,
+                (unsigned long long)actual.c_fill);
+        mismatchReported = true;
+      }
+      exactRoutingClosure = exactRoutingClosure && rowMatches;
+    }
+    exactRoutingClosure =
+        exactRoutingClosure && exactRoot == curveCRoot &&
+        exactFill == curveCFill &&
+        exactControl + lifecycleControl == curveCControl &&
+        exactRouting.event_c_to_f == exactRoot + exactFill + exactControl;
+    if (!exactRoutingClosure)
+      exact = false;
+    printf("EXACT_ROUTING_COST event_c_to_f=%llu root=%llu fill=%llu "
+           "control=%llu lifecycle_control=%llu closure=%s\n",
+           (unsigned long long)exactRouting.event_c_to_f,
+           (unsigned long long)exactRoot, (unsigned long long)exactFill,
+           (unsigned long long)exactControl,
+           (unsigned long long)lifecycleControl,
+           exactRoutingClosure ? "OK" : "FAIL");
   }
   if (curveWire != socketBytes || curveCToF != socketCToF ||
       curveFToC != socketFToC || socketCToF + socketFToC != socketBytes)
@@ -2083,6 +2300,27 @@ static bool parse_u64(const char *text, uint64_t &value) {
   return true;
 }
 
+static bool parse_slots(const char *text, std::vector<uint32_t> &slots) {
+  slots.clear();
+  const std::string input(text);
+  size_t begin = 0;
+  while (begin <= input.size()) {
+    const size_t comma = input.find(',', begin);
+    const std::string field = input.substr(
+        begin, comma == std::string::npos ? std::string::npos : comma - begin);
+    uint32_t value = 0;
+    if (field.empty() || !parse_u32(field.c_str(), value) || !value) {
+      slots.clear();
+      return false;
+    }
+    slots.push_back(value);
+    if (comma == std::string::npos)
+      return true;
+    begin = comma + 1;
+  }
+  return false;
+}
+
 static bool read_assignment_file(const char *path, size_t expected,
                                  uint32_t workers,
                                  std::vector<uint32_t> &assignments) {
@@ -2172,10 +2410,44 @@ int main(int argc, char **argv) {
         options.assignment = AssignmentMode::Random;
       else if (!strcmp(value, "failover"))
         options.assignment = AssignmentMode::Failover;
+      else if (!strcmp(value, "exact-r5"))
+        options.assignment = AssignmentMode::ExactR5;
       else
         return 2;
     } else if (!strcmp(argv[i], "--assignment-file") && i + 1 < argc) {
       options.assignment_file = argv[++i];
+    } else if (!strcmp(argv[i], "--assignment-out") && i + 1 < argc) {
+      options.assignment_out = argv[++i];
+    } else if (!strcmp(argv[i], "--slots") && i + 1 < argc) {
+      if (!parse_slots(argv[++i], options.exact_compiler_slots))
+        return 2;
+    } else if (!strcmp(argv[i], "--egress-lanes") && i + 1 < argc) {
+      if (!parse_u32(argv[++i], options.exact_egress_lanes) ||
+          !options.exact_egress_lanes)
+        return 2;
+    } else if (!strcmp(argv[i], "--link-bps") && i + 1 < argc) {
+      if (!parse_u64(argv[++i], options.exact_link_bits_per_second) ||
+          !options.exact_link_bits_per_second)
+        return 2;
+    } else if (!strcmp(argv[i], "--compiler-bps") && i + 1 < argc) {
+      if (!parse_u64(argv[++i], options.exact_compiler_bytes_per_second) ||
+          !options.exact_compiler_bytes_per_second)
+        return 2;
+    } else if (!strcmp(argv[i], "--time-weight") && i + 2 < argc) {
+      if (!parse_u64(argv[++i], options.exact_time_weight_bytes) ||
+          !parse_u64(argv[++i], options.exact_time_weight_ns) ||
+          !options.exact_time_weight_ns)
+        return 2;
+    } else if (!strcmp(argv[i], "--r5-horizon") && i + 1 < argc) {
+      uint64_t value = 0;
+      if (!parse_u64(argv[++i], value) || !value || value > SIZE_MAX)
+        return 2;
+      options.exact_r5_horizon = size_t(value);
+    } else if (!strcmp(argv[i], "--r5-beam") && i + 1 < argc) {
+      uint64_t value = 0;
+      if (!parse_u64(argv[++i], value) || !value || value > SIZE_MAX)
+        return 2;
+      options.exact_r5_beam = size_t(value);
     } else if (!strcmp(argv[i], "--seed") && i + 1 < argc) {
       if (!parse_u64(argv[++i], options.seed))
         return 2;
@@ -2214,20 +2486,58 @@ int main(int argc, char **argv) {
       options.snapshot_prefix = argv[++i];
     else if (!strcmp(argv[i], "--real-pipes"))
       options.real_pipes = true;
+    else if (!strcmp(argv[i], "--exact-cost-check"))
+      options.exact_cost_check = true;
+    else if (!strcmp(argv[i], "--exact-plan-only"))
+      options.exact_plan_only = true;
     else {
       fprintf(stderr, "unknown option: %s\n", argv[i]);
       return 2;
     }
   }
+  const bool exactR5 = options.assignment_option_seen &&
+                       options.assignment == AssignmentMode::ExactR5;
+  if (exactR5)
+    options.exact_cost_check = true;
+  if (options.exact_compiler_slots.empty())
+    options.exact_compiler_slots.assign(options.workers, 1);
+  if (!options.exact_egress_lanes)
+    options.exact_egress_lanes = options.workers;
+  const bool exactTopologyInvalid =
+      options.exact_compiler_slots.size() != options.workers ||
+      std::any_of(options.exact_compiler_slots.begin(),
+                  options.exact_compiler_slots.end(),
+                  [](uint32_t slots) { return slots == 0; });
+  const bool boundedCache =
+      options.cache_limits.region_bytes !=
+          std::numeric_limits<uint64_t>::max() ||
+      options.cache_limits.public_bytes !=
+          std::numeric_limits<uint64_t>::max() ||
+      options.cache_limits.block_bytes !=
+          std::numeric_limits<uint64_t>::max();
+  const bool exactCostUnsupported =
+      options.exact_cost_check &&
+      ((!options.assignment_file && !exactR5) || options.cache50 >= 0 ||
+       boundedCache ||
+       options.restart_at != UINT32_MAX || options.latejoin_at != UINT32_MAX ||
+       options.failover_at != UINT32_MAX || options.corrupt_tu != UINT32_MAX ||
+       !options.snapshot_prefix.empty());
   if (!options.manifest || options.wave > options.workers ||
       (options.assignment == AssignmentMode::Failover && options.workers < 2) ||
-      (options.assignment_file && options.assignment_option_seen)) {
+      (options.assignment_file && options.assignment_option_seen) ||
+      (exactR5 && !options.assignment_out) ||
+      (!exactR5 && options.assignment_out) || exactTopologyInvalid ||
+      (options.exact_plan_only && !exactR5) || exactCostUnsupported) {
     fprintf(stderr,
             "usage: %s --manifest F [--workers 1..32] [--wave N] [--order "
             "standard|reverse|shuffle|novelty-max] [--assignment "
-            "roundrobin|sticky|random|failover | --assignment-file PATH] "
+            "roundrobin|sticky|random|failover|exact-r5 | "
+            "--assignment-file PATH] [--assignment-out PATH] "
+            "[--slots N,...] [--egress-lanes N] [--link-bps N] "
+            "[--compiler-bps N] [--time-weight NUM DEN] "
+            "[--r5-horizon N] [--r5-beam N] "
             "[--snapshot50-prefix PATH] "
-            "[--real-pipes]\n",
+            "[--real-pipes] [--exact-cost-check] [--exact-plan-only]\n",
             argv[0]);
     return 2;
   }

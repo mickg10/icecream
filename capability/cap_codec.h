@@ -343,13 +343,22 @@ struct SourceTextStore {
 struct MixedEncoder {
     struct AuthorityTransaction {
         std::vector<std::pair<uint32_t,MixedCLineState>> line_before;
+        // materialize() normally runs with one ReceiverMirror swapped into
+        // fknownReg/fknownPublic.  Record the 0 -> 1 receiver-knowledge flips
+        // made by this TU as part of the same transaction.  This is needed by
+        // both rejected M5 attempts and reversible exact-routing search: an
+        // authority rollback that leaves the selected receiver mirror ahead
+        // is not a rollback of the physical relationship state.
+        std::vector<uint32_t> receiver_region_flips;
+        std::vector<uint32_t> receiver_public_flips;
         size_t path_size=0,census_size=0;
+        size_t receiver_region_size=0,receiver_public_size=0;
         uint32_t next_public=1;
         std::array<uint64_t,7> mixed_ops{};
         uint64_t op7_count=0,op8_count=0,op9_count=0;
         uint64_t op7_wire=0,op8_wire=0,op9_wire=0;
         uint64_t literal_raw=0,array_values=0,markers=0,literals=0;
-        bool had_census=false,active=false;
+        bool had_census=false,receiver_started=false,active=false;
     };
     // ---- persistent authority state ----
     std::vector<MixedCLineState> mixedCLine;                 // sized dict.distinct()+1 in init()

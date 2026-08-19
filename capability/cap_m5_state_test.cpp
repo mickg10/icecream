@@ -147,6 +147,45 @@ int main() {
             growingMirror.blocks[0] && !growingMirror.regions[10] &&
             !growingMirror.blocks[6],
         "receiver mirror grows with unknown appended ordinals");
+
+  fprintf(stderr, "[1c] authority rollback includes selected receiver mirror:\n");
+  const std::string journalSource =
+      "# 1 \"first.hpp\"\nshared line\n# 2 \"second.hpp\"\nshared line\n";
+  Interner journalDictionary;
+  std::vector<uint32_t> journalLineIds(journalSource.size() + 1),
+      journalRegions;
+  size_t journalLineCount = 0;
+  uint64_t journalHits = 0;
+  journalDictionary.process(journalSource.data(),
+                            journalSource.data() + journalSource.size(),
+                            journalLineIds.data(), journalLineCount,
+                            journalHits, true, &journalRegions);
+  MixedEncoder journalEncoder;
+  journalEncoder.init(journalDictionary.distinct(),
+                      uint32_t(journalDictionary.region_count()));
+  ReceiverMirror journalMirror;
+  journalMirror.init(uint32_t(journalDictionary.region_count()), 0);
+  MixedEncoder::AuthorityTransaction journalTransaction;
+  journalEncoder.begin_authority_transaction(journalTransaction);
+  {
+    MirrorScope scope(journalEncoder, journalMirror);
+    journalEncoder.materialize(journalDictionary, journalRegions, 0,
+                               &journalTransaction);
+  }
+  check(std::all_of(journalMirror.regions.begin(), journalMirror.regions.end(),
+                    [](uint8_t known) { return known != 0; }) &&
+            journalMirror.public_lines.size() > 1,
+        "tentative materialization advances the selected mirror");
+  {
+    MirrorScope scope(journalEncoder, journalMirror);
+    journalEncoder.rollback_authority_transaction(journalTransaction);
+  }
+  check(std::none_of(journalMirror.regions.begin(), journalMirror.regions.end(),
+                     [](uint8_t known) { return known != 0; }) &&
+            journalMirror.public_lines == std::vector<uint8_t>{0},
+        "rollback restores selected Region and public-Line knowledge");
+  check(journalEncoder.nextMixedPublic == 1 && journalEncoder.paths.empty(),
+        "receiver rollback and authority rollback close together");
   FStore growingStore;
   growingStore.init(2, 2);
   growingStore.FmixedRegions[1].known = true;
@@ -166,7 +205,7 @@ int main() {
                 7 * (sizeof(uint64_t) + sizeof(uint32_t)),
         "cache policy indexes grow to cover typed stores");
 
-  fprintf(stderr, "[1c] typed Root closure and expansion:\n");
+  fprintf(stderr, "[1d] typed Root closure and expansion:\n");
   FStore typedStore;
   typedStore.init(2, 1);
   typedStore.FmixedRegionData = {'a', 'b', 'c'};
@@ -204,7 +243,7 @@ int main() {
                                        typedRegions, typedRequiredBlocks),
         "typed Root rejects an undefined ordinal");
 
-  fprintf(stderr, "[1d] raw-weighted learning gates:\n");
+  fprintf(stderr, "[1e] raw-weighted learning gates:\n");
   struct MetricRow {
     uint64_t raw = 0, wire = 0;
   };

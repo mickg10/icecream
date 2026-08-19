@@ -164,7 +164,7 @@ void MixedEncoder::begin_authority_transaction(AuthorityTransaction&tx){
 }
 
 void MixedEncoder::commit_authority_transaction(AuthorityTransaction&tx){
-    tx.active=false;tx.line_before.clear();
+    tx.active=false;tx.line_before.clear();tx.receiver_region_flips.clear();tx.receiver_public_flips.clear();
 }
 
 void MixedEncoder::rollback_authority_transaction(AuthorityTransaction&tx){
@@ -176,7 +176,15 @@ void MixedEncoder::rollback_authority_transaction(AuthorityTransaction&tx){
     op7_wire=tx.op7_wire;op8_wire=tx.op8_wire;op9_wire=tx.op9_wire;
     mixedLiteralRaw=tx.literal_raw;mixedArrayValues=tx.array_values;n_marker=tx.markers;n_literal=tx.literals;
     if(tx.had_census&&census_sink)census_sink->resize(tx.census_size);
-    tx.active=false;tx.line_before.clear();
+    if(tx.receiver_started){
+        for(uint32_t id:tx.receiver_region_flips)
+            if(id<tx.receiver_region_size)fknownReg[id]=0;
+        for(uint32_t id:tx.receiver_public_flips)
+            if(id<tx.receiver_public_size)fknownPublic[id]=0;
+        fknownReg.resize(tx.receiver_region_size);
+        fknownPublic.resize(tx.receiver_public_size);
+    }
+    tx.active=false;tx.line_before.clear();tx.receiver_region_flips.clear();tx.receiver_public_flips.clear();
 }
 
 struct MaterialLineView { uint32_t id=0,len=0; const char*data=nullptr; };
@@ -221,9 +229,27 @@ static uint32_t materialize_impl(MixedEncoder&encoder,const Dictionary&dict,
     auto&mixedLiteralRaw=encoder.mixedLiteralRaw;auto&mixedArrayValues=encoder.mixedArrayValues;
     auto&n_marker=encoder.n_marker;auto&n_literal=encoder.n_literal;auto&census_sink=encoder.census_sink;
     if(tx&&!tx->active){fprintf(stderr,"materialize: inactive authority transaction\n");exit(2);}
+    if(tx&&!tx->receiver_started){
+        tx->receiver_region_size=fknownReg.size();tx->receiver_public_size=fknownPublic.size();
+        tx->receiver_started=true;
+    }
     auto journalLine=[&](uint32_t lineId,const MixedCLineState&state){
         if(tx&&authorityJournalStamp[lineId]!=authorityJournalSerial){
             authorityJournalStamp[lineId]=authorityJournalSerial;tx->line_before.emplace_back(lineId,state);
+        }
+    };
+    auto markPublicKnown=[&](uint32_t ord){
+        if(fknownPublic.size()<=ord)fknownPublic.resize(size_t(ord)+1,0);
+        if(!fknownPublic[ord]){
+            if(tx&&ord<tx->receiver_public_size)tx->receiver_public_flips.push_back(ord);
+            fknownPublic[ord]=1;
+        }
+    };
+    auto markRegionKnown=[&](uint32_t ord){
+        if(ord>=fknownReg.size())return;
+        if(!fknownReg[ord]){
+            if(tx&&ord<tx->receiver_region_size)tx->receiver_region_flips.push_back(ord);
+            fknownReg[ord]=1;
         }
     };
     (void)t;
@@ -256,15 +282,13 @@ static uint32_t materialize_impl(MixedEncoder&encoder,const Dictionary&dict,
                     put_zigzag(mixedRaw[0],int64_t(state.source_region)-int64_t(r));
                     put_varint(mixedRaw[0],state.source_offset);put_varint(mixedRaw[0],line.len);
                     ++op8_count; op8_wire+=line.len;
-                    if(fknownPublic.size()<=ord) fknownPublic.resize(size_t(ord)+1,0);
-                    fknownPublic[ord]=1;
+                    markPublicKnown(ord);
                 } else {
                     // op7 DEFINE_FROM_BYTES: re-bind ordinal with exact immutable bytes (literal lane).
                     mixedRaw[0].push_back(7);put_varint(mixedRaw[0],ord);put_varint(mixedRaw[0],line.len);
                     mixedRaw[1].insert(mixedRaw[1].end(),text,text+line.len);
                     ++op7_count; op7_wire+=line.len;
-                    if(fknownPublic.size()<=ord) fknownPublic.resize(size_t(ord)+1,0);
-                    fknownPublic[ord]=1;
+                    markPublicKnown(ord);
                 }
             } else if(state.source_region!=UINT32_MAX&&state.source_region!=r){
                 // Region ordinals are identities, not observation order. Reverse/shuffled
@@ -277,8 +301,7 @@ static uint32_t materialize_impl(MixedEncoder&encoder,const Dictionary&dict,
                 flushLiteral();
                 journalLine(lineId,state);
                 uint32_t ord=nextMixedPublic++; state.public_id=ord;
-                if(fknownPublic.size()<=ord) fknownPublic.resize(size_t(ord)+1,0);
-                fknownPublic[ord]=1;   // F materializes it now
+                markPublicKnown(ord);   // F materializes it now
                 if(state.source_region<fknownReg.size() && fknownReg[state.source_region]){
                     // op1 PUBLISH_VIEW (cold + recovery-with-source): implicit ordinal from a view into F's source Region.
                     mixedRaw[0].push_back(1);put_zigzag(mixedRaw[0],int64_t(state.source_region)-int64_t(r));
@@ -309,7 +332,7 @@ static uint32_t materialize_impl(MixedEncoder&encoder,const Dictionary&dict,
         }
         flushLiteral();
         if(offset!=dict.raw_len(region)){fprintf(stderr,"mixed Region length differs\n");exit(2);}
-        if(r<fknownReg.size()) fknownReg[r]=1;   // C now believes F holds region r (F materializes it from this Fill)
+        markRegionKnown(r);   // C now believes F holds region r (F materializes it from this Fill)
         ++nr;
     }
     if(!mixedArrayEntries.empty()){

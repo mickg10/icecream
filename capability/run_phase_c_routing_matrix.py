@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Run causal R0-R4 and bounded R5 assignments through the exact M5 transaction.
+"""Run causal R0-R4 and bounded estimated/exact R5 through the M5 transaction.
 
-The planner's independent-Region byte values are estimates used only to choose a route.
-Every published C-to-F/F-to-C value comes from the socket frame ledger after the selected
-assignment reconstructs byte-exactly.  This script refuses a row if the physical worker
-sequence differs from the assignment file.
+Estimated policies use independent-Region values only to choose a route. R5_EXACT instead
+searches with the reversible M5 serializer itself. Every published C-to-F/F-to-C value still
+comes from the socket frame ledger after the selected assignment reconstructs byte-exactly,
+and every physical run cross-checks its Root/Fill events against the socket-free M5 replay.
 """
 
 from __future__ import annotations
@@ -49,6 +49,7 @@ class PolicySpec:
     r5_horizon: int = 0
     r5_beam: int = 0
     investment_weight: tuple[int, int] = (1, 1)
+    exact_m5: bool = False
 
 
 POLICIES = (
@@ -125,6 +126,26 @@ POLICIES = (
     PolicySpec(
         "R5_W500", "r5-bounded", "R5_BOUNDED", (500_000, 1_000_000), 4, 64
     ),
+    PolicySpec(
+        "R5_EXACT_BYTES", "exact-r5", "R5_EXACT_BOUNDED", (0, 1), 4, 64,
+        (1, 1), True,
+    ),
+    PolicySpec(
+        "R5_EXACT_W0625", "exact-r5", "R5_EXACT_BOUNDED",
+        (62_500, 1_000_000), 4, 64, (1, 1), True,
+    ),
+    PolicySpec(
+        "R5_EXACT_1GBIT", "exact-r5", "R5_EXACT_BOUNDED",
+        (125_000, 1_000_000), 4, 64, (1, 1), True,
+    ),
+    PolicySpec(
+        "R5_EXACT_W250", "exact-r5", "R5_EXACT_BOUNDED",
+        (250_000, 1_000_000), 4, 64, (1, 1), True,
+    ),
+    PolicySpec(
+        "R5_EXACT_W500", "exact-r5", "R5_EXACT_BOUNDED",
+        (500_000, 1_000_000), 4, 64, (1, 1), True,
+    ),
 )
 
 
@@ -181,7 +202,10 @@ def planner_fields(output: str) -> dict[str, str]:
     required = {"schema", "policy", "tus", "estimated_c_to_f", "makespan_ns", "N_eff", "H_route"}
     if required - fields.keys():
         raise ValueError(f"planner row lacks {sorted(required - fields.keys())}")
-    if fields["schema"] != "independent-region-zstd3-v1":
+    if fields["schema"] not in {
+        "independent-region-zstd3-v1",
+        "exact-m5-event-v1",
+    }:
         raise ValueError("unknown planner estimator schema")
     return fields
 
@@ -304,30 +328,6 @@ def run_cell(
     fingerprint, tus_per_build, raw_per_build = manifest_fingerprint(manifest, max_files)
     total_tus = tus_per_build * repetitions
 
-    planner_command = [
-        str(planner),
-        "--manifest",
-        str(manifest),
-        "--workers",
-        str(width),
-        "--requested-slots",
-        str(requested_slots),
-        "--egress-lanes",
-        str(width),
-        "--repetitions",
-        str(repetitions),
-        "--policy",
-        policy.planner_name,
-        "--time-weight",
-        str(policy.time_weight[0]),
-        str(policy.time_weight[1]),
-        "--assignment-out",
-        str(assignment),
-        "--curve-out",
-        str(estimate_curve),
-    ]
-    if slots != [1] * width:
-        planner_command += ["--slots", ",".join(str(value) for value in slots)]
     physical_command = [
         str(physical),
         "--manifest",
@@ -343,20 +343,82 @@ def run_cell(
         "--real-pipes",
         "--assignment-file",
         str(assignment),
+        "--exact-cost-check",
+        "--slots",
+        ",".join(str(value) for value in slots),
+        "--egress-lanes",
+        str(width),
         "--curve-out",
         str(physical_curve),
     ]
+    if policy.exact_m5:
+        planner_command = [
+            str(physical),
+            "--manifest",
+            str(manifest),
+            "--workers",
+            str(width),
+            "--wave",
+            str(width),
+            "--repetitions",
+            str(repetitions),
+            "--codec",
+            codec,
+            "--assignment",
+            "exact-r5",
+            "--assignment-out",
+            str(assignment),
+            "--curve-out",
+            str(estimate_curve),
+            "--slots",
+            ",".join(str(value) for value in slots),
+            "--egress-lanes",
+            str(width),
+            "--time-weight",
+            str(policy.time_weight[0]),
+            str(policy.time_weight[1]),
+            "--r5-horizon",
+            str(policy.r5_horizon),
+            "--r5-beam",
+            str(policy.r5_beam),
+            "--exact-plan-only",
+        ]
+    else:
+        planner_command = [
+            str(planner),
+            "--manifest",
+            str(manifest),
+            "--workers",
+            str(width),
+            "--requested-slots",
+            str(requested_slots),
+            "--egress-lanes",
+            str(width),
+            "--repetitions",
+            str(repetitions),
+            "--policy",
+            policy.planner_name,
+            "--time-weight",
+            str(policy.time_weight[0]),
+            str(policy.time_weight[1]),
+            "--assignment-out",
+            str(assignment),
+            "--curve-out",
+            str(estimate_curve),
+        ]
+        if slots != [1] * width:
+            planner_command += ["--slots", ",".join(str(value) for value in slots)]
     if max_files is not None:
         planner_command += ["--max-files", str(max_files)]
         physical_command += ["--max-files", str(max_files)]
-    if policy.r5_horizon:
+    if policy.r5_horizon and not policy.exact_m5:
         planner_command += [
             "--r5-horizon",
             str(policy.r5_horizon),
             "--r5-beam",
             str(policy.r5_beam),
         ]
-    if policy.investment_weight != (1, 1):
+    if policy.investment_weight != (1, 1) and not policy.exact_m5:
         planner_command += [
             "--investment-weight",
             str(policy.investment_weight[0]),
@@ -365,7 +427,7 @@ def run_cell(
     header = (
         f"PLANNER_COMMAND {shlex.join(planner_command)}\n"
         f"PHYSICAL_COMMAND {shlex.join(physical_command)}\n"
-        f"PLANNER_SHA256 {planner_sha}\n"
+        f"PLANNER_SHA256 {physical_sha if policy.exact_m5 else planner_sha}\n"
         f"PHYSICAL_SHA256 {physical_sha}\n"
         f"MANIFEST_FINGERPRINT {fingerprint}\n"
     )
@@ -409,15 +471,24 @@ def run_cell(
     if estimate["policy"] != policy.reported_name:
         raise RuntimeError(f"{tag}: planner reported a different policy")
     if policy.r5_horizon:
-        required_r5 = {
-            "r5_lower_c_to_f",
-            "r5_lower_makespan_ns",
-            "r5_bound",
-            "r5_horizon",
-            "r5_beam",
-            "r5_expanded",
-            "r5_pruned",
-        }
+        if policy.exact_m5:
+            required_r5 = {
+                "r5_horizon",
+                "r5_beam",
+                "r5_expanded",
+                "r5_pruned",
+                "r5_symmetry",
+            }
+        else:
+            required_r5 = {
+                "r5_lower_c_to_f",
+                "r5_lower_makespan_ns",
+                "r5_bound",
+                "r5_horizon",
+                "r5_beam",
+                "r5_expanded",
+                "r5_pruned",
+            }
         if required_r5 - estimate.keys():
             raise RuntimeError(f"{tag}: planner omitted R5 bound fields")
         if int(estimate["r5_horizon"]) != policy.r5_horizon or int(
@@ -425,6 +496,13 @@ def run_cell(
         ) != policy.r5_beam:
             raise RuntimeError(f"{tag}: planner used different R5 search limits")
     parsed = parse_log(physical_text)
+    exact_cost_rows = [
+        line
+        for line in physical_text.splitlines()
+        if line.startswith("EXACT_ROUTING_COST ")
+    ]
+    if len(exact_cost_rows) != 1 or "closure=OK" not in exact_cost_rows[0].split():
+        raise RuntimeError(f"{tag}: exact M5 event/socket cross-check failed")
     rows = read_curve(physical_curve)
     assignments = read_assignment(assignment, total_tus, width)
     if [row["worker"] for row in rows] != assignments:
@@ -472,6 +550,7 @@ def run_cell(
         "fill": parsed["c_fill"],
         "control": parsed["c_control"],
         "estimated_c_to_f": int(estimate["estimated_c_to_f"]),
+        "planner_schema": estimate["schema"],
         "estimated_makespan_ns": int(estimate["makespan_ns"]),
         "physical_byte_model_makespan_ns": physical_makespan,
         "estimated_lower_c_to_f": int(estimate.get("r5_lower_c_to_f", "0")),

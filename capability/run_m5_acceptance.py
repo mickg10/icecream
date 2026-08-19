@@ -372,6 +372,7 @@ def build(source: Path, output: Path, cxx: str) -> tuple[Path, Path, list[list[s
     transport_test = output / "cap_transport_test"
     m2_test = output / "cap_m2_test"
     state_test = output / "cap_m5_state_test"
+    exact_routing_test = output / "cap_m5_exact_routing_test"
     m4_test = output / "cap_m4_test"
     common = [
         cxx,
@@ -436,6 +437,15 @@ def build(source: Path, output: Path, cxx: str) -> tuple[Path, Path, list[list[s
         ],
         common
         + [
+            str(source / "cap_m5_exact_routing_test.cpp"),
+            str(source / "cap_codec.cpp"),
+            "-o",
+            str(exact_routing_test),
+            "-lzstd",
+            "-pthread",
+        ],
+        common
+        + [
             str(source / "cap_m4_test.cpp"),
             str(source / "cap_codec.cpp"),
             "-o",
@@ -446,7 +456,14 @@ def build(source: Path, output: Path, cxx: str) -> tuple[Path, Path, list[list[s
     ]
     for command in commands:
         subprocess.run(command, check=True)
-    for test in (header_test, transport_test, m2_test, state_test, m4_test):
+    for test in (
+        header_test,
+        transport_test,
+        m2_test,
+        state_test,
+        exact_routing_test,
+        m4_test,
+    ):
         completed = subprocess.run(
             test, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
         )

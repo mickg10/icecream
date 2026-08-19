@@ -1852,8 +1852,11 @@ static int run_pipeline(const Manifest &manifest, const Options &options,
       worker.accepted_raw += job.prepared->raw_length;
     }
     if (firstRejected != pending.size()) {
-      for (size_t index = pending.size(); index-- > firstRejected;)
+      for (size_t index = pending.size(); index-- > firstRejected;) {
+        auto &worker = workers[pending[index].worker];
+        capm5::MirrorScope scope(encoder, worker.mirror);
         encoder.rollback_authority_transaction(pending[index].authority);
+      }
       relationshipExact = false;
       break;
     }
