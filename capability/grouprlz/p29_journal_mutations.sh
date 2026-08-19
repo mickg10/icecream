@@ -32,29 +32,39 @@ mkdir -p "$WORK/control"; cp "$HERE/p29_online_s1.h" "$WORK/control/"
   cat "$WORK/control/build.err" "$WORK/control/run.err" 2>/dev/null >&2; exit 1; }
 echo "control: unmutated header PASSES"
 
-mutate() { # mutate <name> <sed script...>
-  local name=$1; shift
+mutate() { # mutate <name> <required|optional> <sed script...>
+  local name=$1 kind=$2; shift 2
   mkdir -p "$WORK/$name"; cp "$HERE/p29_online_s1.h" "$WORK/$name/"
   for s in "$@"; do sed -i "$s" "$WORK/$name/p29_online_s1.h"; done
-  cmp -s "$HERE/p29_online_s1.h" "$WORK/$name/p29_online_s1.h" && {
-    echo "MUTATION $name CHANGED NOTHING -- the sed pattern no longer matches the header" >&2
-    return 1; }
+  if cmp -s "$HERE/p29_online_s1.h" "$WORK/$name/p29_online_s1.h"; then
+    # A mutation that changes nothing must never be reported as a pass -- that is exactly how
+    # this script reported five clean "passes" on its first run.  For a REQUIRED mutation the
+    # pattern going stale is a hard error; for an OPTIONAL one it means the mechanism itself
+    # is no longer in the header, which is a legitimate outcome to state rather than fake.
+    if [ "$kind" = required ]; then
+      echo "MUTATION $name CHANGED NOTHING -- the sed pattern no longer matches the header" >&2
+      exit 1
+    fi
+    RESULT[$name]=ABSENT
+    return 0
+  fi
   RESULT[$name]=$(build_and_run "$WORK/$name")
 }
 
 declare -A RESULT
 # M1: heads are never restored -- the pure "size-only rollback".
-mutate no_head_restore '/heads_\[journal_\.heads\[i\]\.first\] = journal_\.heads\[i\]\.second;/d'
+mutate no_head_restore required '/heads_\[journal_\.heads\[i\]\.first\] = journal_\.heads\[i\]\.second;/d'
 # M2: heads restored in FORWARD order, so a slot written twice keeps the wrong old value.
-mutate forward_head_restore 's/for (size_t i = journal_\.heads\.size(); i-- > 0;)/for (size_t i = 0; i < journal_.heads.size(); ++i)/'
-# M3: boundary anchors into the previous TU's tail are not recorded.
-mutate no_boundary_record 's/if (pending_ \&\& position < journal_\.begin) {/if (false) {/'
-# M4: recorded boundary predecessors are never restored.
-mutate no_predecessor_restore \
+mutate forward_head_restore required 's/for (size_t i = journal_\.heads\.size(); i-- > 0;)/for (size_t i = 0; i < journal_.heads.size(); ++i)/'
+# M3/M4 target the boundary-predecessor record and its restore.  They are OPTIONAL because
+# the mechanism is a candidate for removal precisely on the grounds measured here -- if it is
+# gone, these report ABSENT instead of inventing a result.
+mutate no_boundary_record optional 's/if (pending_ \&\& position < journal_\.begin) {/if (false) {/'
+mutate no_predecessor_restore optional \
   '/for (size_t i = journal_\.predecessors\.size(); i-- > 0;)/d' \
   '/predecessors_\[journal_\.predecessors\[i\]\.first\] = journal_\.predecessors\[i\]\.second;/d'
 # M5: the occurrence stream is not truncated at all.
-mutate no_occurrence_truncate '/occurrences_\.resize(journal_\.occurrences);/d'
+mutate no_occurrence_truncate required '/occurrences_\.resize(journal_\.occurrences);/d'
 
 # These must be caught: they are the failures the journal exists to prevent, and each one
 # changes an answer a later TU depends on.
@@ -76,11 +86,11 @@ done
 # than load-bearing.  It is kept because that argument depends on the current call pattern,
 # and it is stated here rather than dressed up as a gate that passes.
 for m in no_boundary_record no_predecessor_restore; do
-  if [ "${RESULT[$m]}" = FAIL ]; then
-    printf 'caught   %-24s %s\n' "$m" "$(head -1 "$WORK/$m/run.err")"
-  else
-    printf 'not observable  %-17s (%s) -- see the note in this script\n' "$m" "${RESULT[$m]}"
-  fi
+  case ${RESULT[$m]} in
+    FAIL)   printf 'caught   %-24s %s\n' "$m" "$(head -1 "$WORK/$m/run.err")" ;;
+    ABSENT) printf 'absent   %-24s the mechanism is no longer in the header\n' "$m" ;;
+    *)      printf 'not observable  %-17s (%s) -- see the note in this script\n' "$m" "${RESULT[$m]}" ;;
+  esac
 done
 
 [ "$bad" -eq 0 ] || { echo "required mutation coverage incomplete" >&2; exit 1; }
