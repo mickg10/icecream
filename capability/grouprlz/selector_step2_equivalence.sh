@@ -24,6 +24,8 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 S1=${S1:?set S1 to the reference codec50-sink build}
 S2=${S2:-$HERE/build/codec50-sink}
 WORK=${WORK:-/tmp/step2eq}
+OUT=${OUT:-$WORK/evidence}
+. "$HERE/selector_evidence.sh"
 
 CELL=""; T=""
 fail() {
@@ -55,6 +57,7 @@ run() {
   grep -qF 'byte-exact=OK' "$dir/$tag.out" || fail "$tag: byte-exact is not OK"
 }
 
+selector_evidence_init "$OUT" "$S1" "$S2"
 printf 'cell\tn\tstable_cf\tstable_ident\tlegacy_total\tlegacy_ident\n'
 done_cells=0
 for cell in "${CELLS[@]}"; do
@@ -94,6 +97,10 @@ print(d['payload']['path'], d['payload']['sha256'], d['tu_count'])" "$J")
   [ -n "$LA" ] && [ -n "$LB" ] || fail "no accounting TOTAL on the legacy path"
   [ "$LA" = "$LB" ] || fail "legacy accounting TOTAL differs: $LA vs $LB"
 
+  selector_evidence_cell "$OUT" "$P.$PR" \
+      "S1=$S1 S2=$S2 --manifest <man x4> ${BASE[*]} [--stable-root-tags] --literal-ondemand --literal-group-skip-zstd10 [--cf-sink --fc-sink --sink-build-tus $N]" \
+      "$T/a.out" "$T/a.err" "$T/b.out" "$T/b.err" "$T/c.out" "$T/c.err" "$T/d.out" "$T/d.err" \
+      "$T/a.cf" "$T/a.fc" "$T/b.cf" "$T/b.fc"
   printf '%s.%s\t%s\t%s\tYES\t%s\tYES\n' "$P" "$PR" "$N" "$(stat -c %s "$T/b.cf")" "${LB#TOTAL=}"
   done_cells=$((done_cells + 1))
   rm -rf "$T"; T=""

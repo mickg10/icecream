@@ -1,3 +1,4 @@
+# differential on the always-GLOBAL baseline; not the live selector curve
 cell	TUs	raw_cum	global_cum	RAW_wins	GLOBAL_wins	ties	RAW_win_pct	raw_full_total	global_full_total	cf_bytes
 re2	288	938720	23395	1	287	0	0.35%	1391462	476137	476137
 fmt	204	1392672	99452	1	203	0	0.49%	2272636	979416	979416

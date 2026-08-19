@@ -29,10 +29,13 @@ for f in "$LIBBSC_DIR/libbsc/libbsc.h" "$LIBBSC_A" "$LIBZSTD_A"; do
 done
 mkdir -p "$OUT"
 
-# the exact command every measurement on this branch was built with
-CXXFLAGS_OPT="-O3 -march=native -std=c++17 -DWITH_BSC_GROUPS"
+# the exact command every measurement on this branch was built with.
+# -fopenmp is REQUIRED, not optional: the recorded static libbsc is built with OpenMP, so
+# omitting it fails the link with undefined GOMP_* references.  It has to be on BOTH flag
+# sets -- a sanitizer build that cannot link is a gate that never runs.
+CXXFLAGS_OPT="-O3 -march=native -std=c++17 -fopenmp -DWITH_BSC_GROUPS"
 # and the sanitizer build used to verify the step-2b grow-on-demand change
-CXXFLAGS_SAN="-O1 -g -fsanitize=address,undefined -std=c++17 -DWITH_BSC_GROUPS"
+CXXFLAGS_SAN="-O1 -g -fsanitize=address,undefined -std=c++17 -fopenmp -DWITH_BSC_GROUPS"
 
 build() { # build <flags> <output>
   g++ $1 -I"$HERE" -I"$LIBBSC_DIR/libbsc" "$HERE/codec50-sink.cpp" -o "$2" \

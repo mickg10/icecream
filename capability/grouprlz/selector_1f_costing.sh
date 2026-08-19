@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 # selector_1f_costing.sh — per-TU RAW vs GLOBAL_S1 costing at 1F (--route-s1 1).
 #
+# WHAT THIS MEASURES, and what it does not.  Every row is a DIFFERENTIAL ON THE ALWAYS-GLOBAL
+# BASELINE STATE: the codec runs GLOBAL_S1 throughout and prices what RAW would have cost for
+# that TU against the same history.  It is NOT the live selector curve.  The moment RAW wins a
+# TU for real, the F mirror acquires Block holes, and every later candidate cost has to be
+# recomputed against that SELECTED history rather than against the global one.  So the RAW-win
+# percentages here bound how often RAW would be preferred at the first divergence, not how a
+# live selector would behave over a whole build.  The live curve comes from the
+# prepare/choose/Ack integration, which emits its own selected-history TSV.
+#
 # This launcher is FAIL CLOSED.  The previous version began with `set +e`, ignored the
 # codec's exit status, and accepted a cell on the log containing `byte-exact=OK` — which
 # the codec prints BEFORE the closure/manifest/full-total checks run.  So a mutation could
@@ -29,6 +38,8 @@
 # Usage:  ./selector_1f_costing.sh [project/profile ...]
 #   MX=<ii-matrix>  BIN=<codec50-sink>  WORK=<scratch>  OUT=<results dir>  REPS=<builds>
 set -Eeuo pipefail
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+. "$HERE/selector_evidence.sh"
 
 MX=${MX:-$HOME/ictmp/ii-matrix}
 BIN=${BIN:-/tmp/tagreg/build/codec50-sink}
@@ -64,8 +75,10 @@ CELLS=("$@")
 [ ${#CELLS[@]} -gt 0 ] || CELLS=(re2/debian-gcc fmt/debian-gcc cereal/debian-gcc leveldb/debian-gcc spdlog/debian-gcc)
 
 mkdir -p "$OUT"
+selector_evidence_init "$OUT" "$BIN"
 RESULTS=$OUT/selector-1f-per-tu-costing.tsv
-printf 'cell\tTUs\traw_cum\tglobal_cum\tRAW_wins\tGLOBAL_wins\tties\tRAW_win_pct\traw_full_total\tglobal_full_total\tcf_bytes\n' >"$RESULTS"
+printf '# differential on the always-GLOBAL baseline; not the live selector curve\n' >"$RESULTS"
+printf 'cell\tTUs\traw_cum\tglobal_cum\tRAW_wins\tGLOBAL_wins\tties\tRAW_win_pct\traw_full_total\tglobal_full_total\tcf_bytes\n' >>"$RESULTS"
 
 for cell in "${CELLS[@]}"; do
   CELL=$cell
@@ -148,6 +161,10 @@ print(d['payload']['path'], d['payload']['sha256'], d['tu_count'])" "$J")
 
   cp "$T/sel.tsv" "$OUT/sel.$P.$PR.tsv"
   cp "$T/out" "$OUT/log.$P.$PR.out"
+  # Retain the ACCEPTED cell too, not just the failed ones: stdout, stderr, both physical
+  # streams, sizes + SHA-256, and the command line that produced them.
+  selector_evidence_cell "$OUT" "$P.$PR" "$BIN --manifest <man x$REPS> ${BASE[*]} --selector-tsv sel.tsv --cf-sink s.cf --fc-sink s.fc" \
+      "$T/out" "$T/err" "$T/sel.tsv" "$T/s.cf" "$T/s.fc"
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%.2f%%\t%s\t%s\t%s\n' \
       "$P" "$TU" "$raw_cum" "$global_cum" "$raw_wins" "$global_wins" "$ties" \
       "$(awk -v a="$raw_wins" -v b="$TU" 'BEGIN{printf "%.4f", a*100/b}')" \

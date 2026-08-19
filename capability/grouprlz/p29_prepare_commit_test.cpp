@@ -3,7 +3,15 @@
 //
 // A prepared TU is APPLIED immediately, because the plan has to be built against real
 // matcher state; the journal is what makes it reversible.  These gates check that the undo
-// restores VALUES and not merely sizes, which is the failure a size-only rollback hides.
+// restores head VALUES in reverse mutation order and not merely vector sizes, which is the
+// failure a size-only rollback hides.  Predecessor VALUES are deliberately NOT restored --
+// see the reasoning in undo(); there is no gate for that because the state is unreachable,
+// and inventing one would be a check that cannot fail.
+//
+// The two matchers take different paths on purpose: GLOBAL_S1 uses the direct, always-
+// committed admit(), and the SELECTED ROUTE uses prepare()/commit()/abort().  Gate 2 proves
+// the two produce the same plan and the same resulting state; gate 5 proves they cannot be
+// interleaved.
 //
 //   g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror p29_prepare_commit_test.cpp -o t && ./t
 #include "p29_online_s1.h"
@@ -64,6 +72,17 @@ bool same(const p29::TuPlan& a, const p29::TuPlan& b) {
 // min_match 3 with a short reach, so boundary anchors genuinely straddle TUs
 const p29::OnlineS1::Config kCfg{3, 1024, 12};
 
+// GATE 4's fixture (local-oracle's).  A chain budget of ONE, and a hash space small enough
+// (2^4 slots) that the aborted TU is certain to leave a COLLIDING head in front of the
+// genuine committed source.  With max_chain == 1 that one stale candidate consumes the whole
+// search budget, so the real match is never reached -- which is what makes the restoration
+// observable.  The earlier blind fixtures failed for the opposite reason: their stale head
+// pointed at another EXACT occurrence, so content verification accepted it and the match came
+// out valid anyway.
+const p29::OnlineS1::Config kBudgetCfg{3, 1, 4};
+const std::vector<uint32_t> kBudgetA{10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21};
+const std::vector<uint32_t> kBudgetB{132, 121, 106, 141, 118, 129, 109, 120, 163, 162, 112, 133};
+
 // The fixture that makes a stale head CHANGE THE ANSWER.  An earlier attempt put the shared
 // content at the START of both the aborted TU and the retry, and could not discriminate:
 // the stale head pointed at an index at or past the retry's own end, so following it was an
@@ -99,33 +118,63 @@ int main() {
         check(c1.size() == c2.size(), "gate 2: catalogue sizes differ");
     }
 
-    // GATE 3+4: abort restores the matcher, VALUES not just sizes.  The control never sees
-    // the aborted TU; the test prepares and aborts it in between.  kC matches back across
-    // the A/C boundary, so a head or predecessor left dangling from the aborted TU changes
-    // the plan even though every vector is back to the right LENGTH.
+    // GATE 4: the canonical rollback fixture.
+    //
+    // MECHANISM, stated precisely because it is easy to describe wrongly: prepare(B)
+    // SUCCEEDS.  Nothing throws.  The caller then EXPLICITLY calls abort(), and it is
+    // undo()'s head restoration that is under test -- restoring every touched slot in REVERSE
+    // mutation order, so a slot written several times inside one TU ends at the value it held
+    // before that TU.  The NEXT admitted TU must then see no stale head.  This is NOT a
+    // build()-throw-induced undo, and it is not affected by admit() taking the direct
+    // non-journalled path: abort() belongs to the ROUTE path, which still journals.
+    {
+        p29::BlockCatalogue cc, ct;
+        p29::OnlineS1 control(kBudgetCfg, cc), tested(kBudgetCfg, ct);
+        control.admit(kBudgetA);
+        tested.admit(kBudgetA);
+        tested.prepare(kBudgetB);
+        tested.abort();
+        const p29::TuPlan a = control.admit(kBudgetA);
+        const p29::TuPlan b = [&]{ const p29::TuPlan& r = tested.prepare(kBudgetA); p29::TuPlan cp = r; tested.commit(); return cp; }();
+        check(!a.block_uses.empty(),
+              "gate 4: the control matched nothing, so the fixture cannot discriminate");
+        check(sameShape(a, b),
+              "gate 4: a stale head changed bounded-chain match selection after abort");
+        check(expand(a, cc) == expand(b, ct),
+              "gate 4c: Root expands to a different Region sequence after the aborted TU");
+        check(control.occurrences() == tested.occurrences(), "gate 4: history diverged");
+    }
+
+    // GATE 3 + GATE 4c: abort clears the pending flag and restores the history (gate 3), and
+    // a second, independently derived rollback fixture (gate 4c) -- kept because it
+    // discriminates through a DIFFERENT mechanism from gate 4's: an in-bounds stale head
+    // pointing FORWARD of the position being matched, whose successor link is kNone, so the
+    // chain ENDS rather than being exhausted by a budget of one.  Two fixtures failing for
+    // two different reasons is worth more than one, and neither is load-bearing alone.
+    // The control never sees the aborted TU; the test prepares and aborts it in between.
     {
         p29::BlockCatalogue cc, ct;
         p29::OnlineS1 control(kCfg, cc), tested(kCfg, ct);
         control.admit(kA);
         tested.admit(kA);
         tested.prepare(kB);
-        check(tested.has_pending(), "gate 3: prepare did not mark a pending transaction");
+        check(tested.has_pending(), "gate 4c: prepare did not mark a pending transaction");
         tested.abort();
-        check(!tested.has_pending(), "gate 3: abort left the transaction pending");
+        check(!tested.has_pending(), "gate 4c: abort left the transaction pending");
         check(control.occurrences() == tested.occurrences(), "gate 3: occurrence history not restored");
         const p29::TuPlan a = control.admit(kC);
         const p29::TuPlan b = [&]{ const p29::TuPlan& r = tested.prepare(kC); p29::TuPlan cp = r; tested.commit(); return cp; }();
         // The fixture is only a gate if the correct answer is one a stale head would LOSE.
         // Without this the check would pass on a fixture where neither side matches anything.
         check(!a.root.empty() && a.root[0].kind == p29::RefKind::Block,
-              "gate 4: the control found no Block to match back into, so the fixture cannot discriminate");
+              "gate 4c: the control found no Block to match back into, so the fixture cannot discriminate");
         check(!a.block_uses.empty() && a.block_uses[0].source_position < b.occurrence_begin &&
               a.block_uses[0].length == 6,
-              "gate 4: the control's match is not the six-deep one reachable only via the restored head");
-        check(sameShape(a, b), "gate 4: Root shape after abort differs -- head/predecessor values were not restored");
+              "gate 4c: the control's match is not the six-deep one reachable only via the restored head");
+        check(sameShape(a, b), "gate 4c: Root shape after abort differs -- head values were not restored");
         check(expand(a, cc) == expand(b, ct),
-              "gate 4: Root expands to a different Region sequence after the aborted TU");
-        check(control.occurrences() == tested.occurrences(), "gate 4: history diverged after the aborted TU");
+              "gate 4c: Root expands to a different Region sequence after the aborted TU");
+        check(control.occurrences() == tested.occurrences(), "gate 4c: history diverged after the aborted TU");
     }
 
     // GATE 4b: the same property over a randomised space, so the gate does not rest on one
@@ -181,7 +230,18 @@ int main() {
         threw = false;
         try { s.prepare(kB); } catch (const std::logic_error&) { threw = true; }
         check(threw, "gate 5: a second prepare was accepted while one was pending");
+        // The load-bearing half.  admit() is a SECOND entrance to the state machine and takes
+        // the direct, non-journalled path: an admit() landing inside a live route transaction
+        // would mutate heads_ and the occurrence stream without recording them, and that
+        // route's later abort() would roll back to a state that never existed.  The rejection
+        // is what makes the two paths safe to coexist.
+        threw = false;
+        try { s.admit(kB); } catch (const std::logic_error&) { threw = true; }
+        check(threw, "gate 5: a direct admit was accepted while a transaction was pending");
+        const std::vector<uint32_t> occDuringPending = s.occurrences();
         s.abort();
+        check(s.occurrences().size() < occDuringPending.size(),
+              "gate 5: the rejected admit fixture never had a pending TU to protect");
     }
 
     // GATE 6: an aborted prepare that minted a Block KEEPS the canonical id -- catalogue ids

@@ -1,0 +1,7 @@
+date       2026-08-19T02:53:34+00:00
+host       tt-quietbox
+user       ttuser
+commit     unknown (not a git checkout; set SELECTOR_SOURCE_COMMIT to declare one)
+harness    selector_1f_costing.sh  sha256=a0a425f56b45ce1c7e0caa43559749d6ea89638c6e003505d93a4f7b17008015
+harness    selector_evidence.sh  sha256=6b62a872ac5f9e2fbcb51ff76ab0ca7f2f75bbe086dbf0c23794e7eddcf5934d
+binary     /tmp/tagreg/build2/codec50-sink  bytes=1563024  sha256=d0119cbef4957fccfc4dba120c8016a0986244bc2a71a4fbaed998792d9b5d3f

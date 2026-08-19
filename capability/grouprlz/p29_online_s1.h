@@ -134,7 +134,6 @@ public:
     const TuPlan& prepare(const std::vector<uint32_t>& current_regions) {
         if (pending_) throw std::logic_error("S1 prepare while a transaction is already pending");
         journal_.clear();
-        journal_.begin = static_cast<uint32_t>(occurrences_.size());
         journal_.occurrences = occurrences_.size();
         journal_.predecessor_count = predecessors_.size();
         pending_ = true;
@@ -160,11 +159,30 @@ public:
         pending_ = false;
     }
 
+    // Ordinary admission: always-committed, so it does not go through the journal at all.
+    // GLOBAL_S1 uses this; the SELECTED ROUTE matcher uses prepare()/commit()/abort(),
+    // because a route transaction can be discarded before its Ack.
+    //
+    // The pending_ guard is load-bearing, not defensive.  Direct admission is a second
+    // entrance to the state machine: an admit() landing in the middle of a live route
+    // prepare() would mutate heads_ and the occurrence stream WITHOUT journalling them
+    // (install_anchor only records while pending_), and the route's later abort() would then
+    // roll back to a state that never existed.  Gate 5 tests this rejection.
+    //
+    // build() is called directly rather than via prepare()+commit(): with pending_ false the
+    // journal stays empty instead of recording every head write only to discard it, and the
+    // plan is returned by value so nothing is copied.
+    //
+    // API CONTRACT: this form does NOT roll the matcher back if an allocation throws after
+    // mutation has begun.  That is acceptable only because allocation failure terminates the
+    // process here, so a partly-built matcher is never reused.  A daemon that wants to CATCH
+    // allocation failures and keep using the same matcher needs a different staging design --
+    // a parked decision, recorded so it is not rediscovered as a bug.
     TuPlan admit(const std::vector<uint32_t>& current_regions) {
-        const TuPlan& plan = prepare(current_regions);
-        TuPlan copy = plan;    // the reference is only valid until commit
-        commit();
-        return copy;
+        if (pending_) {
+            throw std::logic_error("S1 admit while a transaction is already pending");
+        }
+        return build(current_regions);
     }
 
 private:
@@ -275,12 +293,7 @@ private:
 
     void install_anchor(uint32_t position) {
         const uint32_t slot = bucket(position);
-        // Only positions BEFORE this transaction's first occurrence need their predecessor
-        // recorded: everything at or after `begin` is discarded wholesale by the truncate on
-        // abort, so journalling it would be dead weight on the hot path.
-        if (pending_ && position < journal_.begin) {
-            journal_.predecessors.push_back({position, predecessors_[position]});
-        }
+        // Predecessor VALUES are deliberately not journalled -- see undo().
         if (pending_) journal_.heads.push_back({slot, heads_[slot]});
         predecessors_[position] = heads_[slot];
         heads_[slot] = position;
@@ -300,19 +313,22 @@ private:
     // Undo log for one pending transaction.  Capacity is reused between transactions, and
     // the 2^hash_bits head table is never copied -- only the slots actually touched.
     struct Journal {
-        uint32_t begin = 0;
         size_t occurrences = 0, predecessor_count = 0;
         std::vector<std::pair<uint32_t, uint32_t>> heads;         // {slot, old head}
-        std::vector<std::pair<uint32_t, uint32_t>> predecessors;  // {position, old predecessor}
-        void clear() { heads.clear(); predecessors.clear(); }
+        void clear() { heads.clear(); }
     };
 
     void undo() {
         // Heads in REVERSE mutation order: one slot can be written several times in a
         // transaction, and only the reverse walk lands the earliest recorded value last.
         for (size_t i = journal_.heads.size(); i-- > 0;) heads_[journal_.heads[i].first] = journal_.heads[i].second;
-        for (size_t i = journal_.predecessors.size(); i-- > 0;)
-            predecessors_[journal_.predecessors[i].first] = journal_.predecessors[i].second;
+        // Predecessor VALUES at positions before this transaction are NOT restored, and do
+        // not need to be.  A position touched by install_newly_complete_boundary_anchors was
+        // not a published anchor in the committed prefix (its k-gram was still incomplete);
+        // once the heads are rolled back in reverse nothing reaches its temporary predecessor
+        // value; and any later TU that completes that anchor overwrites predecessors_[p]
+        // before publishing p as a head.  So the old value is dead, and a restore loop for it
+        // would be a check that can never fail.  Only the SIZES are rolled back.
         occurrences_.resize(journal_.occurrences);
         predecessors_.resize(journal_.predecessor_count);
         journal_.clear();

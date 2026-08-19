@@ -19,6 +19,8 @@ MX=${MX:-$HOME/ictmp/ii-matrix}
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 BIN=${BIN:-$HERE/build/codec50-sink}
 WORK=${WORK:-/tmp/step1eq}
+OUT=${OUT:-$WORK/evidence}
+. "$HERE/selector_evidence.sh"
 
 CELL=""; T=""
 fail() {
@@ -51,6 +53,7 @@ run() {
   grep -qF 'byte-exact=OK' "$dir/$tag.out" || fail "$tag: byte-exact is not OK"
 }
 
+selector_evidence_init "$OUT" "$BIN"
 printf 'cell\tn\tplan_cf\tod_cf\tcf_identical\tfc_identical\tplan_wall\tod_wall\n'
 done_cells=0
 for cell in "${CELLS[@]}"; do
@@ -90,6 +93,10 @@ print(d['payload']['path'], d['payload']['sha256'], d['tu_count'])" "$J")
   cmp -s "$T/plan.cf" "$T/od.cf" || fail "C->F streams differ"
   cmp -s "$T/plan.fc" "$T/od.fc" || fail "F->C streams differ"
 
+  selector_evidence_cell "$OUT" "$P.$PR" \
+      "$BIN --manifest <man x4> ${BASE[*]} [--mixed-dump-prefix|--literal-group-prefix|--literal-ondemand] --cf-sink --fc-sink --sink-build-tus $N" \
+      "$T/dump.out" "$T/dump.err" "$T/plan.out" "$T/plan.err" "$T/od.out" "$T/od.err" \
+      "$T/plan.cf" "$T/plan.fc" "$T/od.cf" "$T/od.fc"
   printf '%s.%s\t%s\t%s\t%s\tYES\tYES\t%.2f\t%.2f\n' "$P" "$PR" "$N" \
       "$(stat -c %s "$T/plan.cf")" "$(stat -c %s "$T/od.cf")" \
       "$(awk -v a="$S1" -v b="$S2" 'BEGIN{printf "%.2f", b-a}')" \

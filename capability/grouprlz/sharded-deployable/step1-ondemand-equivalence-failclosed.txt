@@ -1,13 +1,13 @@
-# selector_step1_equivalence.sh, fail-closed, BIN=HEAD build
+# selector_step1_equivalence.sh, fail-closed, HEAD build (direct-admit header)
 cell	n	plan_cf	od_cf	cf_identical	fc_identical	plan_wall	od_wall
-re2.debian-gcc	72	476189	476189	YES	YES	1.06	0.70
-fmt.debian-gcc	51	979468	979468	YES	YES	1.65	1.13
-cereal.debian-gcc	80	490893	490893	YES	YES	2.66	1.45
-leveldb.debian-gcc	94	944052	944052	YES	YES	1.93	1.32
-nlohmann-json.debian-gcc	99	1224656	1224656	YES	YES	3.02	1.97
-spdlog.debian-gcc	168	765463	765463	YES	YES	2.65	1.56
-re2.fedora-clang-libcxx	72	517327	517327	YES	YES	2.30	1.36
-fmt.linuxbrew	51	806025	806025	YES	YES	1.51	1.10
-cereal.conan-gcc	80	500589	500589	YES	YES	2.81	1.50
-leveldb.fedora-clang-libcxx	94	1023994	1023994	YES	YES	3.35	2.06
+re2.debian-gcc	72	476189	476189	YES	YES	1.08	0.73
+fmt.debian-gcc	51	979468	979468	YES	YES	1.65	1.15
+cereal.debian-gcc	80	490893	490893	YES	YES	2.68	1.48
+leveldb.debian-gcc	94	944052	944052	YES	YES	1.89	1.31
+nlohmann-json.debian-gcc	99	1224656	1224656	YES	YES	3.02	1.98
+spdlog.debian-gcc	168	765463	765463	YES	YES	2.55	1.56
+re2.fedora-clang-libcxx	72	517327	517327	YES	YES	2.31	1.35
+fmt.linuxbrew	51	806025	806025	YES	YES	1.52	1.09
+cereal.conan-gcc	80	500589	500589	YES	YES	2.65	1.45
+leveldb.fedora-clang-libcxx	94	1023994	1023994	YES	YES	3.35	2.08
 # 10/10 cells: both streams byte-identical, every codec run exited 0 and byte-exact

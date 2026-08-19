@@ -3,8 +3,23 @@
 # journal in p29_online_s1.h itself and requiring the test to notice.
 #
 # The mutations are applied to a COPY of the production header and the unmodified test is
-# compiled against it, so what is being gated is the real undo() and the real install_anchor()
-# -- not a paraphrase of them living in the test.
+# compiled against it, so what is being gated is the real undo(), the real install_anchor()
+# and the real admit() -- not a paraphrase of them living in the test.
+#
+# There is deliberately NO mutation for the boundary-predecessor value journal: it was removed
+# because those values are unreachable after a correct reverse head rollback, and a mutation
+# targeting state that no longer exists would be dead weight that always "passes" -- the exact
+# anti-pattern the rest of this file is built to avoid.
+#
+# Nor is there one for `predecessors_.resize(journal_.predecessor_count)`.  I wrote that
+# mutation and it was NOT caught, so I checked why rather than leaving it in as an always-green
+# entry.  It is the same invariant one level out: a position is only ever reachable as a chain
+# candidate through a head that install_anchor() published, and that same call WROTE
+# predecessors_ for the position before publishing it -- so no stale predecessor value is ever
+# read, whether it survived in the vector or in a journal.  The truncation is still correct and
+# still there: it keeps predecessors_.size() == occurrences_.size() between transactions, which
+# build()'s grow-with-kNone resize depends on.  It is simply not observable in a plan, so there
+# is no honest gate for it.
 #
 # Usage:  ./p29_journal_mutations.sh
 set -Eeuo pipefail
@@ -32,43 +47,35 @@ mkdir -p "$WORK/control"; cp "$HERE/p29_online_s1.h" "$WORK/control/"
   cat "$WORK/control/build.err" "$WORK/control/run.err" 2>/dev/null >&2; exit 1; }
 echo "control: unmutated header PASSES"
 
-mutate() { # mutate <name> <required|optional> <sed script...>
-  local name=$1 kind=$2; shift 2
+mutate() { # mutate <name> <sed script...>
+  local name=$1; shift
   mkdir -p "$WORK/$name"; cp "$HERE/p29_online_s1.h" "$WORK/$name/"
   for s in "$@"; do sed -i "$s" "$WORK/$name/p29_online_s1.h"; done
   if cmp -s "$HERE/p29_online_s1.h" "$WORK/$name/p29_online_s1.h"; then
     # A mutation that changes nothing must never be reported as a pass -- that is exactly how
-    # this script reported five clean "passes" on its first run.  For a REQUIRED mutation the
-    # pattern going stale is a hard error; for an OPTIONAL one it means the mechanism itself
-    # is no longer in the header, which is a legitimate outcome to state rather than fake.
-    if [ "$kind" = required ]; then
-      echo "MUTATION $name CHANGED NOTHING -- the sed pattern no longer matches the header" >&2
-      exit 1
-    fi
-    RESULT[$name]=ABSENT
-    return 0
+    # this script reported five clean "passes" on its first run.  A stale pattern is a hard
+    # error, not a result.
+    echo "MUTATION $name CHANGED NOTHING -- the sed pattern no longer matches the header" >&2
+    exit 1
   fi
   RESULT[$name]=$(build_and_run "$WORK/$name")
 }
 
 declare -A RESULT
 # M1: heads are never restored -- the pure "size-only rollback".
-mutate no_head_restore required '/heads_\[journal_\.heads\[i\]\.first\] = journal_\.heads\[i\]\.second;/d'
+mutate no_head_restore '/heads_\[journal_\.heads\[i\]\.first\] = journal_\.heads\[i\]\.second;/d'
 # M2: heads restored in FORWARD order, so a slot written twice keeps the wrong old value.
-mutate forward_head_restore required 's/for (size_t i = journal_\.heads\.size(); i-- > 0;)/for (size_t i = 0; i < journal_.heads.size(); ++i)/'
-# M3/M4 target the boundary-predecessor record and its restore.  They are OPTIONAL because
-# the mechanism is a candidate for removal precisely on the grounds measured here -- if it is
-# gone, these report ABSENT instead of inventing a result.
-mutate no_boundary_record optional 's/if (pending_ \&\& position < journal_\.begin) {/if (false) {/'
-mutate no_predecessor_restore optional \
-  '/for (size_t i = journal_\.predecessors\.size(); i-- > 0;)/d' \
-  '/predecessors_\[journal_\.predecessors\[i\]\.first\] = journal_\.predecessors\[i\]\.second;/d'
-# M5: the occurrence stream is not truncated at all.
-mutate no_occurrence_truncate required '/occurrences_\.resize(journal_\.occurrences);/d'
+mutate forward_head_restore 's/for (size_t i = journal_\.heads\.size(); i-- > 0;)/for (size_t i = 0; i < journal_.heads.size(); ++i)/'
+# M3: the occurrence stream is not truncated.
+mutate no_occurrence_truncate '/occurrences_\.resize(journal_\.occurrences);/d'
+# M4: the pending guard on direct admission is dropped, so a GLOBAL admit() can land inside a
+# live route transaction and mutate un-journalled state that the route's abort() then "rolls
+# back" to a state that never existed.
+mutate no_pending_admit_guard 's/            throw std::logic_error("S1 admit while a transaction is already pending");/            (void)0;/'
 
 # These must be caught: they are the failures the journal exists to prevent, and each one
 # changes an answer a later TU depends on.
-required=(no_head_restore forward_head_restore no_occurrence_truncate)
+required=(no_head_restore forward_head_restore no_occurrence_truncate no_pending_admit_guard)
 bad=0
 for m in "${required[@]}"; do
   if [ "${RESULT[$m]}" = FAIL ]; then
@@ -78,20 +85,6 @@ for m in "${required[@]}"; do
   fi
 done
 
-# These two are REPORTED, not required.  A boundary predecessor at q < begin is only ever
-# reached through heads_[slot(q)] or through a predecessors_ link created while that head
-# equalled q; heads_ is restored, and any such link belongs to the aborted TU and dies with
-# the truncate.  Every later TU that can match at all has already reinstalled the boundary
-# anchors the aborted TU touched, before it matches.  So the recording looks defensive rather
-# than load-bearing.  It is kept because that argument depends on the current call pattern,
-# and it is stated here rather than dressed up as a gate that passes.
-for m in no_boundary_record no_predecessor_restore; do
-  case ${RESULT[$m]} in
-    FAIL)   printf 'caught   %-24s %s\n' "$m" "$(head -1 "$WORK/$m/run.err")" ;;
-    ABSENT) printf 'absent   %-24s the mechanism is no longer in the header\n' "$m" ;;
-    *)      printf 'not observable  %-17s (%s) -- see the note in this script\n' "$m" "${RESULT[$m]}" ;;
-  esac
-done
 
 [ "$bad" -eq 0 ] || { echo "required mutation coverage incomplete" >&2; exit 1; }
 echo "every journal failure the gates must catch is caught, and the control passes"
