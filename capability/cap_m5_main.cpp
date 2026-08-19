@@ -71,6 +71,9 @@ struct Options {
            failover_at = UINT32_MAX, corrupt_tu = UINT32_MAX;
   bool real_pipes = false;
   const char *curve_out = nullptr;
+  const char *assignment_file = nullptr;
+  bool assignment_option_seen = false;
+  std::vector<uint32_t> explicit_assignments;
   std::string snapshot_prefix;
 };
 
@@ -1144,6 +1147,11 @@ struct Pending {
 static std::vector<uint32_t>
 make_assignments(const Options &options,
                  const std::vector<uint32_t> &sequence) {
+  if (!options.explicit_assignments.empty()) {
+    if (options.explicit_assignments.size() != sequence.size())
+      throw std::logic_error("validated assignment length changed");
+    return options.explicit_assignments;
+  }
   std::vector<uint32_t> result(sequence.size());
   uint32_t workers = options.workers;
   std::mt19937_64 random(options.seed ^ 0x9e3779b97f4a7c15ull);
@@ -1955,7 +1963,9 @@ static int run_coordinator(const Corpus &corpus, const Interner &dict,
          "f_to_c=%llu c_to_f_ratio=%.3f failures=%llu "
          "snapshot=%s\n",
          exact ? "OK" : "FAIL", policy_name(options.policy),
-         order_name(options.order), assignment_name(options.assignment),
+         order_name(options.order),
+         options.assignment_file ? "routing-assignment-v1"
+                                 : assignment_name(options.assignment),
          options.workers, options.wave, curve.size(),
          (unsigned long long)rawTotal, (unsigned long long)socketBytes,
          socketBytes ? double(rawTotal) / socketBytes : 0.0,
@@ -2072,6 +2082,40 @@ static bool parse_u64(const char *text, uint64_t &value) {
   value = parsed;
   return true;
 }
+
+static bool read_assignment_file(const char *path, size_t expected,
+                                 uint32_t workers,
+                                 std::vector<uint32_t> &assignments) {
+  std::ifstream input(path);
+  std::string magic;
+  if (!(input >> magic) || magic != "routing-assignment-v1") {
+    fprintf(stderr, "%s: missing routing-assignment-v1 header\n", path);
+    return false;
+  }
+  assignments.clear();
+  assignments.reserve(expected);
+  for (size_t index = 0; index < expected; ++index) {
+    uint64_t ordinal = 0, worker = 0;
+    if (!(input >> ordinal >> worker) || ordinal != index || worker >= workers) {
+      fprintf(stderr,
+              "%s: assignment row %zu must be exactly '<ordinal> <worker>' "
+              "with ordinal=%zu and worker<%u\n",
+              path, index, index, workers);
+      assignments.clear();
+      return false;
+    }
+    assignments.push_back(uint32_t(worker));
+  }
+  std::string extra;
+  if (input >> extra) {
+    fprintf(stderr, "%s: extra assignment data after %zu rows\n", path,
+            expected);
+    assignments.clear();
+    return false;
+  }
+  return input.eof();
+}
+
 int main(int argc, char **argv) {
   Options options;
   for (int i = 1; i < argc; ++i) {
@@ -2118,6 +2162,7 @@ int main(int argc, char **argv) {
       else
         return 2;
     } else if (!strcmp(argv[i], "--assignment") && i + 1 < argc) {
+      options.assignment_option_seen = true;
       const char *value = argv[++i];
       if (!strcmp(value, "roundrobin"))
         options.assignment = AssignmentMode::RoundRobin;
@@ -2129,6 +2174,8 @@ int main(int argc, char **argv) {
         options.assignment = AssignmentMode::Failover;
       else
         return 2;
+    } else if (!strcmp(argv[i], "--assignment-file") && i + 1 < argc) {
+      options.assignment_file = argv[++i];
     } else if (!strcmp(argv[i], "--seed") && i + 1 < argc) {
       if (!parse_u64(argv[++i], options.seed))
         return 2;
@@ -2173,11 +2220,13 @@ int main(int argc, char **argv) {
     }
   }
   if (!options.manifest || options.wave > options.workers ||
-      (options.assignment == AssignmentMode::Failover && options.workers < 2)) {
+      (options.assignment == AssignmentMode::Failover && options.workers < 2) ||
+      (options.assignment_file && options.assignment_option_seen)) {
     fprintf(stderr,
             "usage: %s --manifest F [--workers 1..32] [--wave N] [--order "
             "standard|reverse|shuffle|novelty-max] [--assignment "
-            "roundrobin|sticky|random|failover] [--snapshot50-prefix PATH] "
+            "roundrobin|sticky|random|failover | --assignment-file PATH] "
+            "[--snapshot50-prefix PATH] "
             "[--real-pipes]\n",
             argv[0]);
     return 2;
@@ -2224,6 +2273,10 @@ int main(int argc, char **argv) {
     sequence.insert(sequence.end(), order.begin(), order.end());
   if (sequence.size() > UINT32_MAX)
     return 2;
+  if (options.assignment_file &&
+      !read_assignment_file(options.assignment_file, sequence.size(),
+                            options.workers, options.explicit_assignments))
+    return 2;
   if (options.restart_at >= sequence.size() && options.restart_at != UINT32_MAX)
     return 2;
   if (options.latejoin_at >= sequence.size() &&
@@ -2234,6 +2287,14 @@ int main(int argc, char **argv) {
     return 2;
   if (options.corrupt_tu >= sequence.size() && options.corrupt_tu != UINT32_MAX)
     return 2;
+  if (options.assignment_file && options.latejoin_at != UINT32_MAX)
+    for (size_t index = 0; index < options.latejoin_at; ++index)
+      if (options.explicit_assignments[index] != 0) {
+        fprintf(stderr,
+                "assignment row %zu targets an F that has not joined yet\n",
+                index);
+        return 2;
+      }
   auto factorBegin = Clock::now();
   auto factor = factor_sequence(regions, sequence);
   preparation.factorization = seconds_since(factorBegin);

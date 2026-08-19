@@ -461,6 +461,103 @@ def manifest_paths(path: Path, limit: int | None = None) -> list[Path]:
     return values if limit is None else values[:limit]
 
 
+def assignment_file_gate(
+    binary: Path, corpus_root: Path, output: Path, timeout: int
+) -> None:
+    """Prove that a policy assignment reaches the named physical F sequence exactly."""
+    manifest = corpus_root / "corpus16" / "manifest.txt"
+    if len(manifest_paths(manifest, 4)) != 4:
+        raise RuntimeError("assignment-file gate needs four corpus16 TUs")
+    valid = output / "routing-assignment.valid"
+    curve = output / "curves" / "routing-assignment.tsv"
+    valid.write_text("routing-assignment-v1\n0 1\n1 1\n2 0\n3 1\n")
+    command = [
+        str(binary),
+        "--manifest",
+        str(manifest),
+        "--max-files",
+        "4",
+        "--workers",
+        "2",
+        "--wave",
+        "2",
+        "--codec",
+        "z1",
+        "--real-pipes",
+        "--assignment-file",
+        str(valid),
+        "--curve-out",
+        str(curve),
+    ]
+    completed = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=timeout,
+    )
+    (output / "logs" / "routing-assignment.log").write_text(completed.stdout)
+    if completed.returncode or "exact=OK" not in completed.stdout or not curve.is_file():
+        raise RuntimeError("valid routing-assignment-v1 physical run failed")
+    with curve.open(newline="") as stream:
+        workers = [int(row["worker"]) for row in csv.DictReader(stream, delimiter="\t")]
+    if workers != [1, 1, 0, 1]:
+        raise RuntimeError(f"assignment file produced F sequence {workers}")
+
+    invalid = {
+        "header": "wrong-header\n0 1\n1 1\n2 0\n3 1\n",
+        "ordinal": "routing-assignment-v1\n0 1\n7 0\n2 1\n3 0\n",
+        "worker": "routing-assignment-v1\n0 1\n1 2\n2 0\n3 1\n",
+        "short": "routing-assignment-v1\n0 1\n1 0\n2 1\n",
+        "extra": "routing-assignment-v1\n0 1\n1 0\n2 1\n3 0\n4 1\n",
+    }
+    for name, contents in invalid.items():
+        path = output / f"routing-assignment.invalid-{name}"
+        path.write_text(contents)
+        bad = subprocess.run(
+            command[:-4]
+            + ["--assignment-file", str(path), "--curve-out", str(curve)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=timeout,
+        )
+        (output / "logs" / f"routing-assignment-invalid-{name}.log").write_text(
+            bad.stdout
+        )
+        if bad.returncode == 0:
+            raise RuntimeError(f"invalid assignment file was accepted: {name}")
+    incompatible = {
+        "builtin": command + ["--assignment", "roundrobin"],
+        "prejoin": command + ["--latejoin-at", "2"],
+    }
+    for name, bad_command in incompatible.items():
+        bad = subprocess.run(
+            bad_command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=timeout,
+        )
+        (output / "logs" / f"routing-assignment-invalid-{name}.log").write_text(
+            bad.stdout
+        )
+        if bad.returncode == 0:
+            raise RuntimeError(f"incompatible assignment mode was accepted: {name}")
+    (output / "routing-assignment-gate.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "workers": workers,
+                "invalid_cases": sorted(invalid) + sorted(incompatible),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+
+
 def corpus_fingerprint(manifest: str, limit: int | None) -> str:
     key = (manifest, limit)
     retained = CORPUS_FINGERPRINTS.get(key)
@@ -1335,6 +1432,7 @@ def main() -> int:
         (args.output / name).mkdir(exist_ok=True)
     source = Path(__file__).resolve().parent
     binary, stream_binary, builds = build(source, args.output, args.cxx)
+    assignment_file_gate(binary, args.corpus_root, args.output, args.timeout)
     if args.suite == "rate":
         specs, fixture = onepass_specs(args.corpus_root, selected), {}
     else:
