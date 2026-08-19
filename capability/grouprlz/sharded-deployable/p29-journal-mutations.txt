@@ -1,0 +1,7 @@
+control: unmutated header PASSES
+caught   no_head_restore          FAIL: gate 4: Root shape after abort differs -- head/predecessor values were not restored
+caught   forward_head_restore     FAIL: gate 4: Root shape after abort differs -- head/predecessor values were not restored
+caught   no_occurrence_truncate   FAIL: gate 3: occurrence history not restored
+not observable  no_boundary_record (PASS) -- see the note in this script
+not observable  no_predecessor_restore (PASS) -- see the note in this script
+every journal failure the gates must catch is caught, and the control passes

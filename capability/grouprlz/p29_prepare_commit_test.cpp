@@ -9,6 +9,7 @@
 #include "p29_online_s1.h"
 
 #include <cstdio>
+#include <random>
 #include <stdexcept>
 #include <vector>
 
@@ -62,14 +63,27 @@ bool same(const p29::TuPlan& a, const p29::TuPlan& b) {
 }
 // min_match 3 with a short reach, so boundary anchors genuinely straddle TUs
 const p29::OnlineS1::Config kCfg{3, 1024, 12};
-const std::vector<uint32_t> kA{10, 11, 12, 13, 14};
-// The aborted TU must seed anchors that the LATER TU would consult, or a size-only rollback
-// looks identical to a correct one: stale heads pointing into truncated positions are simply
-// never reached.  So kB carries the same content kC will match on, with internal repetition
-// so a single hash slot is written several times in one transaction -- which is what makes
-// the REVERSE-order restore observable.
-const std::vector<uint32_t> kB{50, 51, 52, 53, 50, 51, 52, 53, 50, 51, 52, 53};
-const std::vector<uint32_t> kC{50, 51, 52, 53, 50, 51, 52, 53};
+
+// The fixture that makes a stale head CHANGE THE ANSWER.  An earlier attempt put the shared
+// content at the START of both the aborted TU and the retry, and could not discriminate:
+// the stale head pointed at an index at or past the retry's own end, so following it was an
+// out-of-bounds read whose result happened not to matter.  What is needed is a stale head
+// that is IN BOUNDS, points FORWARD of the position being matched, and terminates the chain.
+//
+// Let H be the slot of the 3-gram (50,51,52) and let the retry begin at occurrence 9.
+//   kA  installs H at position 0, where a SIX-symbol match is available.
+//   kB  is the aborted TU.  It writes H twice, at positions 10 and 16 -- late, so both are
+//       forward of where the retry looks, and twice, so only a REVERSE-order restore lands
+//       the earliest recorded value.  It is longer than 3 so 10 and 16 both exceed 9.
+//   kC  is the retry, and is LONGER than kB (12 > 10) so the stale index 10 or 16 is inside
+//       the retry's own freshly-kNone predecessor range instead of past the end.
+// Correct undo  -> heads_[H] == 0,  0 < 9, content matches six deep -> root[0] is a Block.
+// Stale head    -> heads_[H] == 16 (no restore) or 10 (forward-order restore); both are
+//                  >= 9 so the candidate is skipped, and predecessors_[that] is kNone, so
+//                  the chain ends and root[0] is a bare Region.
+const std::vector<uint32_t> kA{50, 51, 52, 53, 54, 55, 7, 8, 9};
+const std::vector<uint32_t> kB{90, 50, 51, 52, 93, 94, 95, 50, 51, 52};
+const std::vector<uint32_t> kC{50, 51, 52, 53, 54, 55, 60, 61, 62, 63, 64, 65};
 }  // namespace
 
 int main() {
@@ -101,10 +115,57 @@ int main() {
         check(control.occurrences() == tested.occurrences(), "gate 3: occurrence history not restored");
         const p29::TuPlan a = control.admit(kC);
         const p29::TuPlan b = [&]{ const p29::TuPlan& r = tested.prepare(kC); p29::TuPlan cp = r; tested.commit(); return cp; }();
+        // The fixture is only a gate if the correct answer is one a stale head would LOSE.
+        // Without this the check would pass on a fixture where neither side matches anything.
+        check(!a.root.empty() && a.root[0].kind == p29::RefKind::Block,
+              "gate 4: the control found no Block to match back into, so the fixture cannot discriminate");
+        check(!a.block_uses.empty() && a.block_uses[0].source_position < b.occurrence_begin &&
+              a.block_uses[0].length == 6,
+              "gate 4: the control's match is not the six-deep one reachable only via the restored head");
         check(sameShape(a, b), "gate 4: Root shape after abort differs -- head/predecessor values were not restored");
         check(expand(a, cc) == expand(b, ct),
               "gate 4: Root expands to a different Region sequence after the aborted TU");
         check(control.occurrences() == tested.occurrences(), "gate 4: history diverged after the aborted TU");
+    }
+
+    // GATE 4b: the same property over a randomised space, so the gate does not rest on one
+    // hand-built shape.  A control matcher is fed only the TUs that were kept; the tested
+    // matcher additionally prepares and aborts a ghost TU before some of them.  Ghosts are
+    // drawn from the same small alphabet as the real TUs, so their anchors land in the same
+    // hash slots -- which is what makes a stale head reachable at all.  Every kept TU's plan
+    // must be identical in everything the MATCHER decides, and the histories must agree.
+    {
+        std::mt19937 rng(20260819u);
+        size_t ghosts = 0, blocks = 0;
+        for (int trial = 0; trial < 4000 && !failures; ++trial) {
+            p29::BlockCatalogue cc, ct;
+            p29::OnlineS1 control(kCfg, cc), tested(kCfg, ct);
+            const int tus = 2 + int(rng() % 8);
+            for (int t = 0; t < tus; ++t) {
+                if (rng() % 3 == 0) {                       // a ghost, prepared then aborted
+                    std::vector<uint32_t> ghost(1 + rng() % 24);
+                    for (uint32_t& v : ghost) v = 40 + rng() % 6;
+                    tested.prepare(ghost);
+                    tested.abort();
+                    ++ghosts;
+                }
+                std::vector<uint32_t> tu(1 + rng() % 24);
+                for (uint32_t& v : tu) v = 40 + rng() % 6;
+                const p29::TuPlan a = control.admit(tu);
+                const p29::TuPlan b = tested.admit(tu);
+                for (const p29::Ref& r : a.root) if (r.kind == p29::RefKind::Block) ++blocks;
+                check(sameShape(a, b), "gate 4b: a plan differs after an aborted ghost TU");
+                check(expand(a, cc) == expand(b, ct), "gate 4b: Root expands differently after a ghost TU");
+                check(control.occurrences() == tested.occurrences(), "gate 4b: history diverged");
+            }
+        }
+        // Coverage guards, only meaningful if the loop ran to completion -- the trial loop
+        // stops at the first failure, so checking them after a real failure would report a
+        // thin corpus that is merely the early exit.
+        if (!failures) {
+            check(ghosts > 1000, "gate 4b: too few aborted transactions to be a net");
+            check(blocks > 1000, "gate 4b: too few Block matches, so stale heads would go unexercised");
+        }
     }
 
     // GATE 5: one pending transaction, and no commit/abort without one.
