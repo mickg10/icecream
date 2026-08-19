@@ -16,10 +16,11 @@
 # entry.  It is the same invariant one level out: a position is only ever reachable as a chain
 # candidate through a head that install_anchor() published, and that same call WROTE
 # predecessors_ for the position before publishing it -- so no stale predecessor value is ever
-# read, whether it survived in the vector or in a journal.  The truncation is still correct and
-# still there: it keeps predecessors_.size() == occurrences_.size() between transactions, which
-# build()'s grow-with-kNone resize depends on.  It is simply not observable in a plan, so there
-# is no honest gate for it.
+# read, whether it survived in the vector or in a journal.  The truncation stays as a
+# PARALLEL-VECTOR REPRESENTATION INVARIANT at negligible cost: predecessors_ and occurrences_
+# describe the same positions and are kept the same length.  It is NOT behaviourally
+# load-bearing -- my earlier note that build() depends on it was wrong, since build() resizes
+# to occurrences_.size() regardless -- so there is no honest gate for it.
 #
 # Usage:  ./p29_journal_mutations.sh
 set -Eeuo pipefail
@@ -71,8 +72,11 @@ mutate forward_head_restore 's/for (size_t i = journal_\.heads\.size(); i-- > 0;
 # M3: the occurrence stream is not truncated.
 mutate no_occurrence_truncate '/occurrences_\.resize(journal_\.occurrences);/d'
 # M4: the pending guard on direct admission is dropped, so a GLOBAL admit() can land inside a
-# live route transaction and mutate un-journalled state that the route's abort() then "rolls
-# back" to a state that never existed.
+# live route transaction.  The hazard is NOT un-journalled mutation -- with a transaction
+# pending, install_anchor() still journals.  It is that the admitted TU FOLDS INTO the pending
+# transaction, appending to the same occurrence stream and the same journal, while
+# pending_plan_ still describes only the prepared TU: commit() and abort() then act on an
+# ill-defined two-TU transaction.
 mutate no_pending_admit_guard 's/            throw std::logic_error("S1 admit while a transaction is already pending");/            (void)0;/'
 # M5b: the guard REJECTS, but only after the TU has already been built into the pending
 # transaction.  It still throws, so a gate that checks "it threw" passes -- which is why

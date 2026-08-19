@@ -33,9 +33,14 @@ mkdir -p "$OUT"
 # -fopenmp is REQUIRED, not optional: the recorded static libbsc is built with OpenMP, so
 # omitting it fails the link with undefined GOMP_* references.  It has to be on BOTH flag
 # sets -- a sanitizer build that cannot link is a gate that never runs.
-CXXFLAGS_OPT="-O3 -march=native -std=c++17 -fopenmp -DWITH_BSC_GROUPS"
+#
+# -Werror=format is here because this codec writes its evidence with printf: a TSV column
+# added to the header but not to the format string produced a silently EMPTY column, and
+# separately a format slot with no argument once printed stack garbage as a byte count.  Both
+# are compile-time detectable, so they are now compile-time errors.
+CXXFLAGS_OPT="-O3 -march=native -std=c++17 -fopenmp -Wformat=2 -Werror=format -DWITH_BSC_GROUPS"
 # and the sanitizer build used to verify the step-2b grow-on-demand change
-CXXFLAGS_SAN="-O1 -g -fsanitize=address,undefined -std=c++17 -fopenmp -DWITH_BSC_GROUPS"
+CXXFLAGS_SAN="-O1 -g -fsanitize=address,undefined -std=c++17 -fopenmp -Wformat=2 -Werror=format -DWITH_BSC_GROUPS"
 
 build() { # build <flags> <output>
   g++ $1 -I"$HERE" -I"$LIBBSC_DIR/libbsc" "$HERE/codec50-sink.cpp" -o "$2" \

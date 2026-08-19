@@ -27,9 +27,9 @@
 === selector_step2_equivalence
     # 10/10 cells: streams byte-identical and legacy TOTAL unchanged, every run exited 0 and byte-exact
 === selector_1f_costing
-    all 5 cell(s) passed every check; results in /tmp/acc6/costing/results/selector-1f-per-tu-costing.tsv
+    all 5 cell(s) passed every check; results in /tmp/fin/acc/costing/results/selector-1f-per-tu-costing.tsv
 === selector_live_history
-    difference attributed to per-TU rows.  A positive delta means live sent FEWER bytes.
+    A positive delta means live sent FEWER bytes than always-ROUTE_S1.
 
 STEP                                   RESULT
 p29_online_s1_test (opt)               PASS
@@ -49,5 +49,5 @@ selector_step2_equivalence             PASS
 selector_1f_costing                    PASS
 selector_live_history                  PASS
 
-logs: /tmp/acc6/logs
+logs: /tmp/fin/acc/logs
 acceptance set: 16/16 steps passed

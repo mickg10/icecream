@@ -1,7 +1,7 @@
-# LIVE selected history vs the always-GLOBAL baseline; both physical C->F streams
-cell	TUs	baseline_cf	live_cf	delta	delta_pct	RAW_wins	GLOBAL_wins	blocks_sent_base	blocks_sent_live
-re2	288	476137	476124	+13	+0.0027%	1	287	815	813
-fmt	204	979416	979399	+17	+0.0017%	1	203	1557	1555
-cereal	320	490841	490869	-28	-0.0057%	1	319	179	171
-leveldb	376	944000	944002	-2	-0.0002%	1	375	1979	1978
-spdlog	672	765411	765486	-75	-0.0098%	11	661	1394	1390
+# LIVE selected history vs the always-ROUTE_S1 baseline; both physical C->F streams
+cell	TUs	baseline_cf	live_cf	delta	delta_pct	RAW_wins	ROUTE_wins	ties	live_route_counterfactual	blocks_sent_base	blocks_sent_live
+re2	288	476137	476124	+13	+0.0027%	1	287	0	476146	815	816
+fmt	204	979416	979399	+17	+0.0017%	1	203	0	979428	1557	1559
+cereal	320	490841	490869	-28	-0.0057%	1	319	0	490874	179	181
+leveldb	376	944000	944002	-2	-0.0002%	1	375	0	944041	1979	1983
+spdlog	672	765411	765486	-75	-0.0098%	11	661	0	765654	1394	1408

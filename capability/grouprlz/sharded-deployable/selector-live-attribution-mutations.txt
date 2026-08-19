@@ -1,0 +1,6 @@
+# live-selector attribution mutations, against the production codec
+# each must be rejected by the check it targets
+winner       TU 0: winner ROUTE_S1 does not minimise the retained candidate costs (raw=3584 route=3613)
+root_attr    TU 0: emitted Root frame 3583 != the selected candidate's costed 3584 (winner=RAW)
+def_attr     TU 1: emitted BlockDef frame 219 != the selected candidate's costed 220 (winner=ROUTE_S1)
+unselected   TU 0: a candidate cost was rewritten by selection

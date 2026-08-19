@@ -24,7 +24,7 @@
 #   3. all three SELECTOR check lines are present         (closure / manifest / full total)
 #   4. the TSV header is exactly the expected columns     (we parse by column index)
 #   5. the TSV has exactly one row per TU
-#   6. sum(global_full) over the TSV == the SIZE OF THE C->F SINK FILE on disk
+#   6. sum(actual_delta) over the TSV == the SIZE OF THE C->F SINK FILE on disk
 #   7. the TSV's own tallies reproduce the codec's printed tallies
 #
 # Check 6 is the one that does not go through the codec: both sides are read back from the
@@ -69,7 +69,7 @@ BASE=(--z 3 --mixed-regions --byte-array-lines --direct-ordinals --compressed-bl
 
 # Parsed by column index below, so a rename or reorder must be a hard error, not a silent
 # mis-read of some other column.
-WANT_HDR=$'tu\traw_root_bytes\traw_root_z\tglobal_root_bytes\tglobal_root_z\tglobal_new_blocks\tglobal_blockdef_bytes\tglobal_blockdef_z\tglobal_diff_z\tcommon_physical\traw_full\tglobal_full\twinner'
+WANT_HDR=$'tu\traw_root_bytes\traw_root_frame\troute_root_bytes\troute_root_frame\troute_new_blocks\troute_blockdef_bytes\troute_blockdef_frame\temitted_root_frame\temitted_blockdef_frame\tactual_delta\tcommon\traw_full\troute_full\twinner\ttie\traw_cheaper'
 
 CELLS=("$@")
 [ ${#CELLS[@]} -gt 0 ] || CELLS=(re2/debian-gcc fmt/debian-gcc cereal/debian-gcc leveldb/debian-gcc spdlog/debian-gcc)
@@ -77,8 +77,8 @@ CELLS=("$@")
 mkdir -p "$OUT"
 selector_evidence_init "$OUT" "$BIN"
 RESULTS=$OUT/selector-1f-per-tu-costing.tsv
-printf '# differential on the always-GLOBAL baseline; not the live selector curve\n' >"$RESULTS"
-printf 'cell\tTUs\traw_cum\tglobal_cum\tRAW_wins\tGLOBAL_wins\tties\tRAW_win_pct\traw_full_total\tglobal_full_total\tcf_bytes\n' >>"$RESULTS"
+printf '# differential on the always-ROUTE_S1 baseline; not the live selector curve\n' >"$RESULTS"
+printf 'cell\tTUs\traw_full\troute_full\tactual\traw_cheaper\tsent_ROUTE\tties\traw_cheaper_pct\tcf_bytes\n' >>"$RESULTS"
 
 for cell in "${CELLS[@]}"; do
   CELL=$cell
@@ -127,11 +127,13 @@ print(d['payload']['path'], d['payload']['sha256'], d['tu_count'])" "$J")
   hdr=$(head -1 "$T/sel.tsv")
   [ "$hdr" = "$WANT_HDR" ] || fail "unexpected selector TSV header (columns are parsed by index)"
   stats=$(awk -F'\t' 'NR>1 {
-        r++; a += $3; g += $9; rf += $11; gf += $12;
-        if ($9 > $3) rw++; else if ($9 < $3) gw++; else tw++
+        r++; rf += $13; tf += $14; act += $11;
+        if ($15 == "RAW") sent_raw++; else sent_route++
+        if ($17 == 1) rw++
+        if ($16 == 1) tw++
       }
-      END { printf "%d %.0f %.0f %.0f %.0f %d %d %d", r, a, g, rf, gf, rw+0, gw+0, tw+0 }' "$T/sel.tsv")
-  read -r rows raw_cum global_cum raw_full global_full raw_wins global_wins ties <<<"$stats"
+      END { printf "%d %.0f %.0f %.0f %d %d %d %d", r, rf, tf, act, sent_raw+0, sent_route+0, rw+0, tw+0 }' "$T/sel.tsv")
+  read -r rows raw_full route_full actual sent_raw sent_route raw_cheaper ties <<<"$stats"
   [ "$rows" = "$TU" ] || fail "selector TSV has $rows rows, expected one per TU ($TU = $N x $REPS)"
 
   # 6. the independent one: the TSV read back from disk must sum to the SIZE of the C->F
@@ -139,22 +141,23 @@ print(d['payload']['path'], d['payload']['sha256'], d['tu_count'])" "$J")
   #    agree with itself.
   [ -f "$T/s.cf" ] || fail "no C->F sink file was written"
   cf_size=$(stat -c %s "$T/s.cf")
-  [ "$global_full" = "$cf_size" ] || fail "TSV global_full sums to $global_full but the C->F file holds $cf_size bytes ($((global_full - cf_size)) off)"
+  [ "$actual" = "$cf_size" ] || fail "TSV actual_delta sums to $actual but the C->F file holds $cf_size bytes ($((actual - cf_size)) off)"
 
   # 7. the codec's printed tallies must reproduce from the rows it wrote.
   costing=$(grep -F 'SELECTOR per-TU costing:' "$T/out") || fail "no per-TU costing line"
   totals=$(grep -F 'SELECTOR FULL transaction totals:' "$T/out") || fail "no full-transaction totals line"
   p_rows=$(sed 's/.*rows=\([0-9]*\).*/\1/' <<<"$costing")
-  p_raw=$(sed 's/.*raw_cum=\([0-9]*\).*/\1/' <<<"$costing")
-  p_glob=$(sed 's/.*global_cum=\([0-9]*\).*/\1/' <<<"$costing")
-  p_rw=$(sed 's/.*RAW=\([0-9]*\).*/\1/' <<<"$costing")
-  p_gw=$(sed 's/.*GLOBAL_S1=\([0-9]*\).*/\1/' <<<"$costing")
-  p_tie=$(sed 's/.*tie=\([0-9]*\)\].*/\1/' <<<"$costing")
-  p_rawfull=$(sed 's/.*raw=\([0-9]*\).*/\1/' <<<"$totals")
-  p_globfull=$(sed 's/.* global=\([0-9]*\).*/\1/' <<<"$totals")
-  for pair in "rows:$p_rows:$rows" "raw_cum:$p_raw:$raw_cum" "global_cum:$p_glob:$global_cum" \
-              "RAW_wins:$p_rw:$raw_wins" "GLOBAL_wins:$p_gw:$global_wins" "ties:$p_tie:$ties" \
-              "raw_full:$p_rawfull:$raw_full" "global_full:$p_globfull:$global_full"; do
+  p_rawfull=$(sed 's/.*raw_full=\([0-9]*\).*/\1/' <<<"$costing")
+  p_routefull=$(sed 's/.*route_full=\([0-9]*\).*/\1/' <<<"$costing")
+  p_actual=$(sed 's/.*actual=\([0-9]*\).*/\1/' <<<"$costing")
+  p_rw=$(sed 's/.*sent\[RAW=\([0-9]*\).*/\1/' <<<"$costing")
+  p_gw=$(sed 's/.*ROUTE_S1=\([0-9]*\)\].*/\1/' <<<"$costing")
+  p_cheap=$(sed 's/.*raw_cheaper=\([0-9]*\).*/\1/' <<<"$costing")
+  p_tie=$(sed 's/.*tie=\([0-9]*\).*/\1/' <<<"$costing")
+  p_tot_actual=$(sed 's/.*actually_sent=\([0-9]*\).*/\1/' <<<"$totals")
+  for pair in "rows:$p_rows:$rows" "raw_full:$p_rawfull:$raw_full" "route_full:$p_routefull:$route_full" \
+              "actual:$p_actual:$actual" "sent_RAW:$p_rw:$sent_raw" "sent_ROUTE:$p_gw:$sent_route" \
+              "raw_cheaper:$p_cheap:$raw_cheaper" "ties:$p_tie:$ties" "actually_sent:$p_tot_actual:$actual"; do
     IFS=: read -r what printed derived <<<"$pair"
     [ "$printed" = "$derived" ] || fail "$what: the codec printed $printed, the TSV rows give $derived"
   done
@@ -165,11 +168,10 @@ print(d['payload']['path'], d['payload']['sha256'], d['tu_count'])" "$J")
   # streams, sizes + SHA-256, and the command line that produced them.
   selector_evidence_cell "$OUT" "$P.$PR" "$BIN --manifest <man x$REPS> ${BASE[*]} --selector-tsv sel.tsv --cf-sink s.cf --fc-sink s.fc" \
       "$T/out" "$T/err" "$T/sel.tsv" "$T/s.cf" "$T/s.fc"
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%.2f%%\t%s\t%s\t%s\n' \
-      "$P" "$TU" "$raw_cum" "$global_cum" "$raw_wins" "$global_wins" "$ties" \
-      "$(awk -v a="$raw_wins" -v b="$TU" 'BEGIN{printf "%.4f", a*100/b}')" \
-      "$raw_full" "$global_full" "$cf_size" >>"$RESULTS"
-  echo "OK $P/$PR: $TU TUs, C->F $cf_size bytes, RAW wins $raw_wins, GLOBAL_S1 wins $global_wins, ties $ties"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%.2f%%\t%s\n' \
+      "$P" "$TU" "$raw_full" "$route_full" "$actual" "$raw_cheaper" "$sent_route" "$ties" \
+      "$(awk -v a="$raw_cheaper" -v b="$TU" 'BEGIN{printf "%.4f", a*100/b}')" "$cf_size" >>"$RESULTS"
+  echo "OK $P/$PR: $TU TUs, C->F $cf_size bytes, RAW cheaper on $raw_cheaper, sent ROUTE_S1 $sent_route, ties $ties"
   rm -rf "$T"; T=""
 done
 

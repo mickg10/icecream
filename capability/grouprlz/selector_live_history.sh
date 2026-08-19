@@ -7,25 +7,36 @@
 # on F, and every later TU that needs one pays for it then.  That is the selected history, and
 # the curve it produces is the thing the differential could only bound.
 #
-# WHAT THIS GATE DOES NOT ASSERT: that live is smaller than always-GLOBAL.  Per-TU selection is
-# GREEDY, and greedy is not globally optimal here -- choosing RAW defers Block definitions
+# WHAT THIS GATE DOES NOT ASSERT: that live is smaller than always-ROUTE_S1.  Per-TU selection
+# is GREEDY, and greedy is not globally optimal here -- choosing RAW defers Block definitions
 # rather than avoiding them, so a TU that looks cheaper can cost more over the rest of the
 # build.  Asserting "live wins" would be assuming the result instead of measuring it.  The sign
 # is REPORTED per cell, either way.
 #
-# What it does require, per cell, for BOTH runs:
-#   1. the codec process exits 0
-#   2. byte-exact=OK  -- the decoder must reconstruct from a RAW Root just as well
-#   3. one TSV row per TU
-#   4. sum(global_full) == the SIZE of that run's C->F file on disk
-#   5. the two runs' C->F sizes differ by EXACTLY the sum of their per-TU differences
-#      -- so the effect of every choice is accounted for, including the deferred cost, and a
-#      saving that quietly reappears somewhere else cannot be reported as a saving
-#   6. the live run declares the LIVE basis and the baseline declares the differential basis
+# A CHECK I REMOVED, because it could not fail.  An earlier version required
+#     sum(base col - live col) == size(base.cf) - size(live.cf)
+# and described it as the check that made this a measurement.  It is the DIFFERENCE of the two
+# per-run equalities already required below, so it follows by subtraction and can never fail
+# independently -- the same telescoping shape removed from the per-TU costing gate earlier.
+# The baseline-vs-live size difference is kept as a MEASUREMENT; it proves nothing on its own.
 #
-# Check 5 is the one that makes this a measurement rather than a headline: at 1F on fmt the
-# live run saves 29 bytes at TU 0 and pays back 7 at TU 1 and 5 at TU 21, netting 17 -- and 17
-# is exactly the difference between the two files on disk.
+# The discriminating work is in the codec, per TU, and is mutation-tested there: the RAW and
+# ROUTE_S1 candidate costs are fixed BEFORE selection and never rewritten; the frames actually
+# emitted (measured from the sink's byte offsets) must equal the SELECTED candidate's
+# separately scratch-compressed cost; `common` comes from the measured physical delta; both
+# candidates' full costs are reconstructed from it; and the transaction must equal the CHOSEN
+# candidate's reconstruction.  Mutating the winner, the Root attribution, the BlockDef
+# attribution, or an unselected candidate field each fires its own targeted check.
+#
+# What this launcher requires, per cell, for BOTH runs:
+#   1. the codec process exits 0
+#   2. byte-exact=OK  -- the receiver must reconstruct from a RAW Root just as well
+#   3. one TSV row per TU
+#   4. sum(actual_delta) == the SIZE of that run's C->F file on disk
+#   5. every row's chosen candidate full cost == its actual delta, re-derived here from the
+#      TSV rather than trusted from the codec's own check
+#   6. the live run declares the LIVE basis and the baseline the differential basis, and both
+#      declare the producer boundary
 #
 # Usage:  BIN=<codec50-sink> ./selector_live_history.sh [project/profile ...]
 set -Eeuo pipefail
@@ -60,8 +71,8 @@ CELLS=("$@")
 mkdir -p "$OUT"
 selector_evidence_init "$OUT" "$BIN"
 RESULTS=$OUT/selector-live-selected-history.tsv
-printf '# LIVE selected history vs the always-GLOBAL baseline; both physical C->F streams\n' >"$RESULTS"
-printf 'cell\tTUs\tbaseline_cf\tlive_cf\tdelta\tdelta_pct\tRAW_wins\tGLOBAL_wins\tblocks_sent_base\tblocks_sent_live\n' >>"$RESULTS"
+printf '# LIVE selected history vs the always-ROUTE_S1 baseline; both physical C->F streams\n' >"$RESULTS"
+printf 'cell\tTUs\tbaseline_cf\tlive_cf\tdelta\tdelta_pct\tRAW_wins\tROUTE_wins\tties\tlive_route_counterfactual\tblocks_sent_base\tblocks_sent_live\n' >>"$RESULTS"
 
 run_one() { # run_one <tag> <extra flag...>
   local tag=$1; shift
@@ -73,9 +84,19 @@ run_one() { # run_one <tag> <extra flag...>
   grep -qF 'byte-exact=OK' "$T/$tag.out" || fail "$tag: byte-exact is not OK"
   local rows; rows=$(( $(wc -l <"$T/$tag.tsv") - 1 ))
   [ "$rows" = "$TU" ] || fail "$tag: selector TSV has $rows rows, expected $TU"
-  local sum; sum=$(awk -F'\t' 'NR>1{g+=$12}END{printf "%.0f", g}' "$T/$tag.tsv")
+  local sum; sum=$(awk -F'\t' 'NR>1{g+=$11}END{printf "%.0f", g}' "$T/$tag.tsv")
   local size; size=$(stat -c %s "$T/$tag.cf")
-  [ "$sum" = "$size" ] || fail "$tag: TSV global_full sums to $sum but the C->F file holds $size"
+  [ "$sum" = "$size" ] || fail "$tag: TSV actual_delta sums to $sum but the C->F file holds $size"
+  # 5. re-derived here rather than trusted: for every row the CHOSEN candidate's full cost
+  #    must equal the actual transaction.  raw_full and route_full are reconstructed from a
+  #    MEASURED common plus SEPARATELY costed candidate frames, so the unchosen one is a real
+  #    counterfactual and this comparison has something to disagree with.
+  local bad; bad=$(awk -F'\t' 'NR>1{
+        chosen = ($15=="RAW") ? $13 : $14
+        if (chosen != $11) { print $1; n++ }
+      } END { }' "$T/$tag.tsv" | head -3 | tr '\n' ' ')
+  [ -z "$bad" ] || fail "$tag: the chosen candidate does not reconstruct the actual transaction at TU(s): $bad"
+  grep -qF 'SELECTOR boundary:' "$T/$tag.out" || fail "$tag: the producer boundary is not declared"
 }
 
 for cell in "${CELLS[@]}"; do
@@ -103,21 +124,21 @@ print(d['payload']['path'], d['payload']['sha256'], d['tu_count'])" "$J")
   grep -qF 'SELECTOR basis: LIVE' "$T/live.out" || fail "the live run did not declare the LIVE basis"
 
   base_cf=$(stat -c %s "$T/base.cf"); live_cf=$(stat -c %s "$T/live.cf")
-  # 5. every byte of the difference must be attributable to per-TU rows.  A saving that
-  #    quietly reappears elsewhere is not a saving, and this is what catches it.
-  rowdelta=$(paste <(awk -F'\t' 'NR>1{print $12}' "$T/base.tsv") <(awk -F'\t' 'NR>1{print $12}' "$T/live.tsv") \
-             | awk '{d+=$1-$2}END{printf "%.0f", d}')
-  [ "$rowdelta" = "$((base_cf - live_cf))" ] || fail \
-      "per-TU differences sum to $rowdelta but the two C->F files differ by $((base_cf - live_cf))"
-
-  rawwin=$(awk -F'\t' 'NR>1 && $13=="RAW"{n++}END{print n+0}' "$T/live.tsv")
-  globwin=$(awk -F'\t' 'NR>1 && $13=="GLOBAL_S1"{n++}END{print n+0}' "$T/live.tsv")
+  # The size difference is a MEASUREMENT and is reported as one.  It is deliberately not
+  # dressed up as a proof of per-TU attribution: that lives in the codec's own checks, which
+  # are mutation-tested against the winner, both frame attributions, and an unselected field.
+  rawwin=$(awk -F'\t' 'NR>1 && $15=="RAW"{n++}END{print n+0}' "$T/live.tsv")
+  globwin=$(awk -F'\t' 'NR>1 && $15=="ROUTE_S1"{n++}END{print n+0}' "$T/live.tsv")
+  ties=$(awk -F'\t' 'NR>1 && $16==1{n++}END{print n+0}' "$T/live.tsv")
   blk_base=$(awk -F'\t' 'NR>1{n+=$6}END{print n+0}' "$T/base.tsv")
   blk_live=$(awk -F'\t' 'NR>1{n+=$6}END{print n+0}' "$T/live.tsv")
+  # The counterfactual the separated records make available: what the live run WOULD have
+  # cost had it sent ROUTE_S1 for every TU against its own selected history.
+  live_route_cf=$(awk -F'\t' 'NR>1{g+=$14}END{printf "%.0f", g}' "$T/live.tsv")
   delta=$((base_cf - live_cf))
-  printf '%s\t%s\t%s\t%s\t%+d\t%s\t%s\t%s\t%s\t%s\n' "$P" "$TU" "$base_cf" "$live_cf" "$delta" \
+  printf '%s\t%s\t%s\t%s\t%+d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$P" "$TU" "$base_cf" "$live_cf" "$delta" \
       "$(awk -v d="$delta" -v b="$base_cf" 'BEGIN{printf "%+.4f%%", d*100/b}')" \
-      "$rawwin" "$globwin" "$blk_base" "$blk_live" >>"$RESULTS"
+      "$rawwin" "$globwin" "$ties" "$live_route_cf" "$blk_base" "$blk_live" >>"$RESULTS"
   selector_evidence_cell "$OUT" "$P.$PR" "$BIN ${BASE[*]} [--live-selector]" \
       "$T/base.out" "$T/base.err" "$T/base.tsv" "$T/base.cf" "$T/base.fc" \
       "$T/live.out" "$T/live.err" "$T/live.tsv" "$T/live.cf" "$T/live.fc"
@@ -129,5 +150,6 @@ CELL=""
 echo
 cat "$RESULTS"
 echo
-echo "all ${#CELLS[@]} cell(s): both runs byte-exact, both accountings closed, every byte of the"
-echo "difference attributed to per-TU rows.  A positive delta means live sent FEWER bytes."
+echo "all ${#CELLS[@]} cell(s): both runs byte-exact, both accountings closed against the file on"
+echo "disk, and every row's chosen candidate reconstructs its actual transaction."
+echo "A positive delta means live sent FEWER bytes than always-ROUTE_S1."

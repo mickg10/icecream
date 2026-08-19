@@ -997,6 +997,9 @@ int main(int argc,char**argv){
     // byte-identical to before, which is what keeps the equivalence gates meaningful.
     if(liveSelector&&!selectorTsvPath){fprintf(stderr,"--live-selector requires --selector-tsv: a selection nobody records is not a measurement\n");return 2;}
     if(liveSelector&&usePriorRoot){fprintf(stderr,"--live-selector is incompatible with the prior-Root path\n");return 2;}
+    // "Live selection" with no selected-route matcher would be the wrong mode wearing the
+    // right name: the transaction that Acks the choice belongs to the route.
+    if(liveSelector&&routeCount!=1){fprintf(stderr,"--live-selector requires --route-s1 1: the selection is Acked by the selected route's transaction\n");return 2;}
     if(sinkBuildTus&&!cfSinkPath){fprintf(stderr,"--sink-build-tus requires --cf-sink\n");return 2;}
     if(cfSinkPath&&!fcSinkPath){fprintf(stderr,"--cf-sink requires --fc-sink: the reverse direction is reported, never dropped\n");return 2;}
     // Without S1 there are no Blocks and no route matcher, so --route-s1 would exit 0 having
@@ -1223,8 +1226,24 @@ int main(int argc,char**argv){
     alpha_line::Stats alphaStats;
     uint64_t preloadedRegionBytes=0,preloadedRegionCount=0,associatedRegionCount=0;double mixedAssociationWire=0,mixedMissingRequestWire=0;
     const double FRAME=4;   // 4-byte length prefix per framed message (the ACCOUNTING charge)
-    struct SelRow{size_t tu;uint64_t rawRootRaw,rawRootZ,globalRootRaw,globalRootZ,newBlocks,defRaw,defZ,common,globalFull,rawFull;bool chosenRaw;};
-    std::vector<SelRow> selRows; uint64_t closureChecked=0,manifestChecks=0,tuRootFrame=0,tuBlockFrame=0,fullTotalChecks=0,sumDelta=0; std::vector<uint32_t> tuManifest; std::vector<uint32_t> costedBlocks;
+    // THREE distinct records per TU, deliberately not collapsed into one:
+    //   the RAW candidate, the ROUTE_S1 candidate -- both as costed BEFORE selection and
+    //   never rewritten by it -- and what was ACTUALLY sent.  Collapsing them loses the
+    //   unselected candidate, and reporting the actual transaction under a candidate's column
+    //   names makes the curve unable to answer what the selector compared.
+    struct SelRow{
+        size_t tu;
+        uint64_t rawRootRaw,rawRootFrame;                                    // RAW candidate
+        uint64_t routeRootRaw,routeRootFrame,routeNewBlocks,routeDefRaw,routeDefFrame; // ROUTE_S1
+        uint64_t emittedRootFrame,emittedDefFrame,actualDelta,common,rawFull,routeFull; // actual
+        bool chosenRaw,tie;
+    };
+    std::vector<SelRow> selRows; uint64_t closureChecked=0,manifestChecks=0,tuRootFrame=0,tuBlockFrame=0,fullTotalChecks=0,sumDelta=0,selExpectRootFrame=0,selExpectDefFrame=0;
+    // A snapshot of the candidate costs taken at costing time and compared against the row
+    // after emission.  Held separately from the row on purpose: comparing the row with itself
+    // would prove nothing, and this is what catches code that rewrites a candidate record
+    // during selection.
+    uint64_t snapRawFrame=0,snapRouteRootFrame=0,snapRouteDefFrame=0,snapRouteNewBlocks=0; std::vector<uint32_t> tuManifest; std::vector<uint32_t> costedBlocks;
     WireSink cfSink,fcSink;   // the PHYSICAL streams: 5-byte typed header per frame
     std::vector<uint64_t>sinkCfOff(TUs),sinkFcOff(TUs),sinkCfFrames(TUs),sinkFcFrames(TUs);
     if(cfSinkPath){cfSink.open(cfSinkPath,sinkReplay);fcSink.open(fcSinkPath,sinkReplay);}
@@ -1327,9 +1346,21 @@ int main(int argc,char**argv){
             // the source coordinates, which are only equal because the two histories coincide
             // at 1F and will NOT be equal once routes diverge.  Checking it here is what makes
             // the shared-catalogue seam a proven property rather than an assumption.
+            // The selected route runs a TRANSACTION: prepare here, before costing, and
+            // commit only once the receiver has reconstructed this TU (or abort if it has
+            // not).  A route's occurrence history is every TU that was successfully
+            // dispatched to that F, whichever candidate represented it -- RAW reconstructs
+            // the same Region sequence -- so candidate choice puts holes in BLOCK RESIDENCY,
+            // never in the route's occurrence sequence.  The sequence is holed relative to
+            // GLOBAL because of scheduler ROUTING, which at 1F means not at all.
+            //
+            // The reference below stays valid until commit()/abort() at the end of this
+            // iteration; nothing else touches the matcher in between.
+            const p29::TuPlan* wirePlan=&plan;
             if(routeS1){
                 const size_t before=blockCatalogue.size();
-                const p29::TuPlan rp=routeS1->admit(tuRegions);
+                const p29::TuPlan& rp=routeS1->prepare(tuRegions);
+                wirePlan=&rp;
                 if(blockCatalogue.size()!=before){fprintf(stderr,"1F seam: route admission grew the catalogue %zu -> %zu at TU=%zu\n",before,blockCatalogue.size(),t);return 2;}
                 if(rp.root.size()!=plan.root.size()||rp.block_uses.size()!=plan.block_uses.size()){fprintf(stderr,"1F seam: Root/BlockUse counts differ at TU=%zu\n",t);return 2;}
                 // Identical 1F histories must give identical occurrence windows -- asserted
@@ -1352,7 +1383,11 @@ int main(int argc,char**argv){
                     if(a.canonical_was_new&&b.canonical_was_new){fprintf(stderr,"1F seam: both matchers minted Block %u at TU=%zu, so the catalogue is not shared\n",a.block_id,t);return 2;}
                 }
             }
-            for(const p29::Ref&ref:plan.root)
+            // The S1 wire candidate is built from the plan of the matcher that will actually
+            // hold this TU -- the ROUTE's, when one is selected.  At 1F the seam gate above
+            // has just proved the two agree field for field; past 1F they will not, and the
+            // route's is the one that describes what its F can resolve.
+            for(const p29::Ref&ref:wirePlan->root)
                 curTok.push_back(ref.kind==p29::RefKind::Block?block_tag(ref.id):region_tag(ref.id));
             // Canonical children come from the shared catalogue; the COPY-legality flag is
             // this matcher's admission order and is NOT a claim about any F's residency.
@@ -1476,12 +1511,26 @@ int main(int argc,char**argv){
             // plan does not feed back into matcher state.  So the 1F live selector is a pure
             // wire-side choice.  prepare/commit/abort becomes load-bearing at 2F+, where a
             // route's history is a holed subsequence and therefore choice-dependent.
-            bool chooseRaw=false;
+            // The candidate costs are FIXED here, before any selection, and are never
+            // rewritten afterwards.  An earlier draft cleared the Block manifest and
+            // overwrote the Root on a RAW win, then filed the result under the other
+            // candidate's column names -- which lost the candidate that was not chosen and
+            // reported the actual transaction as if it were the comparison.
+            const uint64_t rawRootFrameC=uint64_t(rawZ);
+            const uint64_t routeRootRawC=uint64_t(rootb.size()), routeRootFrameC=uint64_t(globalZ);
+            const uint64_t routeNewBlocksC=uint64_t(costBlocks.size());
+            const uint64_t routeDefRawC=uint64_t(costDef.size()), routeDefFrameC=uint64_t(defZ);
+
+            bool chooseRaw=false,tie=false;
             if(liveSelector){
-                // Ties go to GLOBAL: it leaves F holding the Block, which can only help later
-                // TUs, so a tie is not really a tie over the rest of the build.
-                chooseRaw = rawZ < globalZ+defZ;
+                // A cost tie is tracked separately and resolved to ROUTE_S1: it leaves F
+                // holding the Block, which can only help later TUs, so a tie now is not a tie
+                // over the rest of the build.
+                tie = (rawRootFrameC == routeRootFrameC+routeDefFrameC);
+                chooseRaw = rawRootFrameC < routeRootFrameC+routeDefFrameC;
                 if(chooseRaw){
+                    // Selection swaps only what is SENT.  The candidate records above are
+                    // untouched, and the checks below re-assert that.
                     curTok.assign(rawRootTags.begin(),rawRootTags.end());
                     tk=curTok.data(); tn=curTok.size();
                     rootb=rawRoot;
@@ -1489,10 +1538,14 @@ int main(int argc,char**argv){
                 }
             }
             costedBlocks=costBlocks;   // checked against the real manifest below
-            selRows.push_back({t,uint64_t(rawRoot.size()),uint64_t(rawZ),
-                               uint64_t(rootb.size()),uint64_t(chooseRaw?rawZ:globalZ),
-                               uint64_t(costBlocks.size()),uint64_t(costDef.size()),
-                               uint64_t(chooseRaw?0:defZ),0,0,0,chooseRaw});
+            selRows.push_back({t,uint64_t(rawRoot.size()),rawRootFrameC,
+                               routeRootRawC,routeRootFrameC,routeNewBlocksC,routeDefRawC,routeDefFrameC,
+                               0,0,0,0,0,0,chooseRaw,tie});
+            // The frames the SELECTED candidate should produce, kept for the emission check.
+            selExpectRootFrame = chooseRaw?rawRootFrameC:routeRootFrameC;
+            selExpectDefFrame  = chooseRaw?0:routeDefFrameC;
+            snapRawFrame=rawRootFrameC; snapRouteRootFrame=routeRootFrameC;
+            snapRouteDefFrame=routeDefFrameC; snapRouteNewBlocks=routeNewBlocksC;
             tuRootFrame=0; tuBlockFrame=0; tuManifest.clear();
         }
         std::vector<uint32_t> missReg,missBlk,associationRegs,requiredRegions,requiredBlocks;
@@ -2370,7 +2423,15 @@ int main(int argc,char**argv){
         }
         dec_s += std::chrono::duration<double>(Clock::now()-_td).count();   // F-decode ends here; the verify below is harness-only (F doesn't have the original)
         const FileSpan&physicalFile=corpus.files[t%physicalTUs];const char* orig=corpus.bytes.data()+physicalFile.off; uint32_t olen=physicalFile.len;
-        if(recon.size()!=olen || memcmp(recon.data(),orig,olen)!=0){ byteexact=false; if(t<5||TUs<10) fprintf(stderr,"BYTE-EXACT FAIL TU %zu (%zu vs %u)\n",t,recon.size(),olen); }
+        const bool tuReconstructed = (recon.size()==olen && memcmp(recon.data(),orig,olen)==0);
+        if(!tuReconstructed){ byteexact=false; if(t<5||TUs<10) fprintf(stderr,"BYTE-EXACT FAIL TU %zu (%zu vs %u)\n",t,recon.size(),olen); }
+        // ACK.  The route's transaction resolves HERE, after the receiver has reconstructed
+        // the TU -- not at plan time -- and it commits REGARDLESS of which candidate won,
+        // because the TU physically went to this route either way.  The in-process receiver
+        // stands in for the explicit Ack of the eventual protocol; putting the state
+        // transition at the right point now is what keeps the seam exercised rather than
+        // merely present.
+        if(routeS1&&routeS1->has_pending()){ if(tuReconstructed) routeS1->commit(); else routeS1->abort(); }
         cum_raw += olen;
         double cur_wire = w_root+w_linedef+w_regiondef+w_pathdef+w_blockdef+w_missing+w_framing;
         std::array<double,CW_COUNT>currentComponentWire=componentWireSnapshot();double componentWireTotal=0;
@@ -2413,12 +2474,37 @@ int main(int argc,char**argv){
                     fprintf(stderr,"costing priced %zu Block definition(s) but the transaction sends %zu at TU=%zu\n",
                             costedBlocks.size(),tuManifest.size(),t);return 2;}
                 ++manifestChecks;
-                if(tuRootFrame!=r.globalRootZ){
-                    fprintf(stderr,"TU %zu: emitted Root frame %llu != costed %llu\n",t,
-                            (unsigned long long)tuRootFrame,(unsigned long long)r.globalRootZ);return 2;}
-                if(tuBlockFrame!=r.defZ){
-                    fprintf(stderr,"TU %zu: emitted BlockDef frame %llu != costed %llu\n",t,
-                            (unsigned long long)tuBlockFrame,(unsigned long long)r.defZ);return 2;}
+                // ATTRIBUTION.  The frames the sink ACTUALLY wrote, measured from its byte
+                // offsets, against the SELECTED candidate's separately scratch-compressed
+                // cost.  Two different computations, so a wrong winner, a wrong Root
+                // attribution or a wrong BlockDef attribution each shows up here rather than
+                // netting out in a total.
+                if(tuRootFrame!=selExpectRootFrame){
+                    fprintf(stderr,"TU %zu: emitted Root frame %llu != the selected candidate's costed %llu (winner=%s)\n",t,
+                            (unsigned long long)tuRootFrame,(unsigned long long)selExpectRootFrame,
+                            r.chosenRaw?"RAW":"ROUTE_S1");return 2;}
+                if(tuBlockFrame!=selExpectDefFrame){
+                    fprintf(stderr,"TU %zu: emitted BlockDef frame %llu != the selected candidate's costed %llu (winner=%s)\n",t,
+                            (unsigned long long)tuBlockFrame,(unsigned long long)selExpectDefFrame,
+                            r.chosenRaw?"RAW":"ROUTE_S1");return 2;}
+                // A RAW transaction must send NO Block definition at all -- checked against
+                // the manifest the transaction actually built, not against the costing.
+                if(r.chosenRaw&&!tuManifest.empty()){
+                    fprintf(stderr,"TU %zu: RAW was selected but the transaction sent %zu Block definition(s)\n",t,tuManifest.size());return 2;}
+                // The candidate records must be exactly what was costed BEFORE selection.
+                // This is the check that would have caught the draft that rewrote them.
+                if(r.rawRootFrame!=snapRawFrame||r.routeRootFrame!=snapRouteRootFrame||
+                   r.routeDefFrame!=snapRouteDefFrame||r.routeNewBlocks!=snapRouteNewBlocks){
+                    fprintf(stderr,"TU %zu: a candidate cost was rewritten by selection\n",t);return 2;}
+                // The winner must be the argmin over the RETAINED candidate costs, so a
+                // selection that emits one candidate while recording the other cannot pass.
+                if(liveSelector){
+                    const bool shouldRaw = snapRawFrame < snapRouteRootFrame+snapRouteDefFrame;
+                    if(r.chosenRaw!=shouldRaw){
+                        fprintf(stderr,"TU %zu: winner %s does not minimise the retained candidate costs (raw=%llu route=%llu)\n",t,
+                                r.chosenRaw?"RAW":"ROUTE_S1",(unsigned long long)snapRawFrame,
+                                (unsigned long long)(snapRouteRootFrame+snapRouteDefFrame));return 2;}
+                }
                 // The TU-close frame is ALREADY in cfSink.off here -- it is emitted just
                 // above.  Adding it again cost 6 bytes per TU and, because it landed in
                 // common_physical, inflated BOTH candidates identically.
@@ -2427,9 +2513,15 @@ int main(int argc,char**argv){
                 if(delta<tuRootFrame+tuBlockFrame){fprintf(stderr,"TU %zu: frames exceed the physical delta\n",t);return 2;}
                 // globalFull IS the measured delta -- taken directly, not re-derived from a
                 // decomposition of itself, which is what made the previous check tautological.
-                r.globalFull=delta;
+                r.actualDelta=delta;
+                r.emittedRootFrame=tuRootFrame; r.emittedDefFrame=tuBlockFrame;
+                // common is what EVERY candidate would have sent: the measured delta less the
+                // frames that differ between them.  Both candidate full costs are then
+                // reconstructed from it independently, so the row states what each WOULD have
+                // cost, not merely what the chosen one did.
                 r.common=delta-tuRootFrame-tuBlockFrame;
-                r.rawFull=r.common+r.rawRootZ;
+                r.rawFull=r.common+r.rawRootFrame;
+                r.routeFull=r.common+r.routeRootFrame+r.routeDefFrame;
                 sumDelta+=delta;
                 ++fullTotalChecks;
             }
@@ -2669,26 +2761,37 @@ int main(int argc,char**argv){
     }
     if(selectorTsvPath){
       FILE*f=fopen(selectorTsvPath,"wb");if(!f){perror(selectorTsvPath);return 2;}
-      if(fprintf(f,"tu\traw_root_bytes\traw_root_z\tglobal_root_bytes\tglobal_root_z\tglobal_new_blocks\tglobal_blockdef_bytes\tglobal_blockdef_z\tglobal_diff_z\tcommon_physical\traw_full\tglobal_full\twinner\n")<0){fclose(f);return 2;}
-      uint64_t rawCum=0,globalCum=0,rawWins=0,globalWins=0,ties=0;
+      if(fprintf(f,"tu\traw_root_bytes\traw_root_frame\troute_root_bytes\troute_root_frame\troute_new_blocks\troute_blockdef_bytes\troute_blockdef_frame\temitted_root_frame\temitted_blockdef_frame\tactual_delta\tcommon\traw_full\troute_full\twinner\ttie\traw_cheaper\n")<0){fclose(f);return 2;}
+      uint64_t rawSent=0,routeSent=0,rawCheaper=0,ties=0,rawFullCum=0,routeFullCum=0,actualCum=0;
       for(const SelRow&r:selRows){
-        const uint64_t g=r.globalRootZ+r.defZ;
-        // With --live-selector the winner is what this TU ACTUALLY SENT, not a comparison
-        // re-derived here; the row's own columns already describe the chosen candidate.
-        // Without it the row is the differential on the always-GLOBAL baseline, and the
-        // comparison below is the report.  Ties go to GLOBAL either way: leaving F holding
-        // the Block can only help later TUs, so a tie now is not a tie over the build.
-        const char*win = liveSelector ? (r.chosenRaw?"RAW":"GLOBAL_S1")
-                       : (g<r.rawRootZ ? "GLOBAL_S1" : (g>r.rawRootZ ? "RAW" : "GLOBAL_S1"));
-        if(liveSelector){ if(r.chosenRaw)++rawWins; else ++globalWins; }
-        else if(g<r.rawRootZ)++globalWins; else if(g>r.rawRootZ)++rawWins; else ++ties;
-        rawCum+=r.rawRootZ; globalCum+=g;
-        if(fprintf(f,"%zu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%s\n",r.tu,
-            (unsigned long long)r.rawRootRaw,(unsigned long long)r.rawRootZ,
-            (unsigned long long)r.globalRootRaw,(unsigned long long)r.globalRootZ,
-            (unsigned long long)r.newBlocks,(unsigned long long)r.defRaw,(unsigned long long)r.defZ,
-            (unsigned long long)g,(unsigned long long)r.common,
-            (unsigned long long)r.rawFull,(unsigned long long)r.globalFull,win)<0){fclose(f);return 2;}
+        // `winner` means ONE thing in both bases: what this TU ACTUALLY SENT.  Without
+        // --live-selector that is always ROUTE_S1.  Whether RAW would have been cheaper is a
+        // SEPARATE column, because a name that means "sent" in one file and "would have won"
+        // in the other makes the two files silently incomparable -- and makes any check that
+        // reads it wrong in exactly one of them.
+        const bool cheaperRaw = r.rawRootFrame < r.routeRootFrame+r.routeDefFrame;
+        const char*win = (liveSelector&&r.chosenRaw) ? "RAW" : "ROUTE_S1";
+        if(liveSelector&&r.chosenRaw)++rawSent; else ++routeSent;
+        if(cheaperRaw)++rawCheaper;
+        if(r.tie)++ties;
+        rawFullCum+=r.rawFull; routeFullCum+=r.routeFull; actualCum+=r.actualDelta;
+        if(fprintf(f,"%zu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%s\t%d\t%d\n",r.tu,
+            (unsigned long long)r.rawRootRaw,(unsigned long long)r.rawRootFrame,
+            (unsigned long long)r.routeRootRaw,(unsigned long long)r.routeRootFrame,
+            (unsigned long long)r.routeNewBlocks,(unsigned long long)r.routeDefRaw,
+            (unsigned long long)r.routeDefFrame,
+            (unsigned long long)r.emittedRootFrame,(unsigned long long)r.emittedDefFrame,
+            (unsigned long long)r.actualDelta,(unsigned long long)r.common,
+            (unsigned long long)r.rawFull,(unsigned long long)r.routeFull,win,r.tie?1:0,cheaperRaw?1:0)<0){fclose(f);return 2;}
+        // The actual transaction must equal the CHOSEN candidate's independently
+        // reconstructed full cost -- and, because `common` is measured and the candidate
+        // frames are costed separately, the unchosen one is a real counterfactual rather
+        // than a restatement of the same number.
+        const uint64_t chosenFull = (liveSelector&&r.chosenRaw) ? r.rawFull : r.routeFull;
+        if(r.actualDelta&&chosenFull!=r.actualDelta){
+          fprintf(stderr,"TU %zu: the %s transaction cost %llu but the chosen candidate reconstructs to %llu\n",
+              r.tu,win,(unsigned long long)r.actualDelta,(unsigned long long)chosenFull);
+          fclose(f);return 2;}
       }
       if(fclose(f)!=0){perror(selectorTsvPath);return 2;}
       printf("SELECTOR closure: %llu Region memberships checked identical across candidates\n",(unsigned long long)closureChecked);
@@ -2704,16 +2807,21 @@ int main(int argc,char**argv){
         printf("SELECTOR full total: %llu per-TU deltas tile the %llu-byte C->F stream exactly\n",
             (unsigned long long)fullTotalChecks,(unsigned long long)cfSink.off);
       }
-      uint64_t rawFullCum=0,globalFullCum=0;
-      for(const SelRow&r:selRows){rawFullCum+=r.rawFull;globalFullCum+=r.globalFull;}
+      // BOUNDARY, stated in the output rather than left to be discovered: the Interner
+      // dictionary, allreg and roff are still built from the COMPLETE manifest before the
+      // transaction loop.  What this measures is a live SELECTED route and Block-residency
+      // history over current-TU slices; making the PRODUCER one-phase is the separate
+      // unavailable-suffix step, and is not claimed here.
+      printf("SELECTOR boundary: live selected route/Block-residency history over current-TU slices; the Interner dictionary, allreg and roff are still populated from the COMPLETE manifest before the loop (the unavailable-suffix gate is a separate later step)\n");
       printf("SELECTOR basis: %s\n", liveSelector
           ? "LIVE selected history -- each TU sent the winner, and F's Block knowledge has the resulting holes"
           : "differential on the always-GLOBAL baseline -- every TU sent GLOBAL_S1; RAW is priced, not sent");
-      printf("SELECTOR per-TU costing: rows=%zu raw_cum=%llu global_cum=%llu wins[RAW=%llu GLOBAL_S1=%llu tie=%llu]\n",
-          selRows.size(),(unsigned long long)rawCum,(unsigned long long)globalCum,
-          (unsigned long long)rawWins,(unsigned long long)globalWins,(unsigned long long)ties);
-      if(fullTotalChecks) printf("SELECTOR FULL transaction totals: raw=%llu global=%llu (common material included; the winner is unchanged because common cancels)\n",
-          (unsigned long long)rawFullCum,(unsigned long long)globalFullCum);
+      printf("SELECTOR per-TU costing: rows=%zu raw_full=%llu route_full=%llu actual=%llu sent[RAW=%llu ROUTE_S1=%llu] raw_cheaper=%llu tie=%llu\n",
+          selRows.size(),(unsigned long long)rawFullCum,(unsigned long long)routeFullCum,
+          (unsigned long long)actualCum,(unsigned long long)rawSent,(unsigned long long)routeSent,
+          (unsigned long long)rawCheaper,(unsigned long long)ties);
+      if(fullTotalChecks) printf("SELECTOR FULL transaction totals: raw_if_always_RAW=%llu route_if_always_ROUTE_S1=%llu actually_sent=%llu\n",
+          (unsigned long long)rawFullCum,(unsigned long long)routeFullCum,(unsigned long long)actualCum);
     }
     if(curveTsvPath){
       FILE*curve=fopen(curveTsvPath,"wb");if(!curve){perror(curveTsvPath);return 2;}

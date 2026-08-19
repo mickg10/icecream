@@ -334,6 +334,13 @@ private:
         // value; and any later TU that completes that anchor overwrites predecessors_[p]
         // before publishing p as a head.  So the old value is dead, and a restore loop for it
         // would be a check that can never fail.  Only the SIZES are rolled back.
+        //
+        // The predecessor SIZE rollback below is a PARALLEL-VECTOR REPRESENTATION INVARIANT at
+        // negligible cost -- predecessors_ and occurrences_ describe the same positions, so
+        // they are kept the same length.  It is not currently behaviourally load-bearing: by
+        // the argument above the stale tail is unreachable either way.  (I previously wrote
+        // that build()'s grow-with-kNone resize depends on it; that was wrong -- build()
+        // resizes to occurrences_.size() regardless.)
         occurrences_.resize(journal_.occurrences);
         predecessors_.resize(journal_.predecessor_count);
         journal_.clear();

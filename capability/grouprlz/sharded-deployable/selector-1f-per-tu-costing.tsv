@@ -1,7 +1,7 @@
-# differential on the always-GLOBAL baseline; not the live selector curve
-cell	TUs	raw_cum	global_cum	RAW_wins	GLOBAL_wins	ties	RAW_win_pct	raw_full_total	global_full_total	cf_bytes
-re2	288	938720	23395	1	287	0	0.35%	1391462	476137	476137
-fmt	204	1392672	99452	1	203	0	0.49%	2272636	979416	979416
-cereal	320	2412956	15785	1	319	0	0.31%	2888012	490841	490841
-leveldb	376	1741916	76886	1	375	0	0.27%	2609030	944000	944000
-spdlog	672	2689828	48711	3	669	0	0.45%	3406528	765411	765411
+# differential on the always-ROUTE_S1 baseline; not the live selector curve
+cell	TUs	raw_full	route_full	actual	raw_cheaper	sent_ROUTE	ties	raw_cheaper_pct	cf_bytes
+re2	288	1391462	476137	476137	1	288	0	0.35%	476137
+fmt	204	2272636	979416	979416	1	204	0	0.49%	979416
+cereal	320	2888012	490841	490841	1	320	0	0.31%	490841
+leveldb	376	2609030	944000	944000	1	376	0	0.27%	944000
+spdlog	672	3406528	765411	765411	3	672	0	0.45%	765411

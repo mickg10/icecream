@@ -57,10 +57,23 @@ for a in "$@"; do
 done
 case "$MUT" in
   rc)  exit 2 ;;
-  hdr) sed -i '1s/global_full/global_total/' "$tsv" ;;
-  row) sed -i '$d' "$tsv" ;;
-  cf)  printf '\x00' >> "$cf" ;;
-  win) awk -F'\t' -v OFS='\t' 'NR==2{$3=1}1' "$tsv" >"$tsv.m" || exit 9; mv "$tsv.m" "$tsv" ;;
+  *)
+    # A mutation whose pattern has gone stale must SAY SO, not look like a clean pass.  Two of
+    # these silently stopped applying when the TSV schema changed, and the suite then reported
+    # "NOT CAUGHT" -- which reads as a hole in the launcher rather than a stale mutation.
+    cp "$tsv" "$tsv.orig"
+    case "$MUT" in
+      hdr) sed -i '1s/actual_delta/actual_total/' "$tsv" ;;
+      row) sed -i '$d' "$tsv" ;;
+      cf)  printf '\x00' >> "$cf" ;;
+      win) awk -F'\t' -v OFS='\t' 'NR==2{$13=1}1' "$tsv" >"$tsv.m" || exit 9; mv "$tsv.m" "$tsv" ;;
+      *)   echo "shim: unknown MUT=$MUT" >&2; exit 9 ;;
+    esac
+    if [ "$MUT" != cf ] && cmp -s "$tsv.orig" "$tsv"; then
+      echo "shim: MUT=$MUT changed nothing -- the pattern is stale" >&2; exit 9
+    fi
+    rm -f "$tsv.orig"
+    ;;
 esac
 exit $rc
 EOF
