@@ -1065,7 +1065,7 @@ int main(int argc,char**argv){
     // token < NREG = region id ; token >= NREG = block id (flat span of region ids). Causal/prequential.
     std::vector<uint32_t> bchild; std::vector<size_t> boff2; boff2.push_back(0);
     std::vector<uint32_t> tokstream; std::vector<size_t> tokoff; tokoff.push_back(0);
-    bool s1Ready=false; uint64_t s1Tokens=0; std::vector<uint32_t> curTok, tuRegions;
+    bool s1Ready=false; std::vector<uint32_t> curTok, tuRegions;
     std::vector<uint32_t> bcopy_src; std::vector<uint8_t> bcopy_ok;   // block k: def as COPY(src,len) if ok (source in prior TUs)
     // Per-TU sizes of the Region and Block id spaces: what has been DISCOVERED by TU t, never
     // the final totals.  Every bound and every array length below is taken from these.
@@ -1310,8 +1310,6 @@ int main(int argc,char**argv){
         if(s1Ready){
             curTok.clear();
             tuRegions.assign(allreg.begin()+roff[t],allreg.begin()+roff[t+1]);
-
-            tuRegions.assign(allreg.begin()+roff[t],allreg.begin()+roff[t+1]);
             // GLOBAL admits FIRST, in the defined C admission order, so canonical ids are
             // assigned by the global chronology and never by route scheduling.
             const p29::TuPlan plan=globalS1->admit(tuRegions);
@@ -1358,7 +1356,6 @@ int main(int argc,char**argv){
             }
 
                         blocksAfterTu[t]=uint32_t(blockCatalogue.size());
-            s1Tokens+=curTok.size();
         } else {
             curTok.assign(tokstream.begin()+tokoff[t],tokstream.begin()+tokoff[t+1]);
         }
