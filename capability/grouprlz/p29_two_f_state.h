@@ -585,10 +585,10 @@ private:
             measurement.legal = candidate_legal_for(candidate);
         }
         event.selected = event_kind(selected.mode);
-        event.missing_ordinals.reserve(selected.definitions.size());
+        event.missing_objects.reserve(selected.definitions.size());
         event.copy_uses.reserve(selected.definitions.size());
         for (const CandidateBlockDefinition& definition : selected.definitions) {
-            event.missing_ordinals.push_back(definition.block_id);
+            event.missing_objects.push_back({ObjectKind::Block, definition.block_id});
             if (!definition.copy) continue;
             event.copy_uses.push_back({definition.copy->lane,
                                        definition.copy->source_generation,

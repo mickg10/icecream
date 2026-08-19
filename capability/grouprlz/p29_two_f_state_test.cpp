@@ -129,7 +129,7 @@ p29::AckReceipt transfer(p29::FRouteEndpoint& endpoint,
     check(event.attempts == (recover_lost_ack ? 2U : 1U) &&
               event.retained_ack_recovery == recover_lost_ack,
           "unified event did not retain the exact attempt/Ack history");
-    check(event.missing_ordinals.size() == selected.definitions.size() &&
+    check(event.missing_objects.size() == selected.definitions.size() &&
               event.copy_uses.size() == count_copy(selected),
           "unified event did not retain the selected missing/COPY closure");
     return first;

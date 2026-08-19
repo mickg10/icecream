@@ -61,6 +61,17 @@ struct CopyUseEvent {
     uint32_t block_id = 0;
 };
 
+// SourceGeneration is carried once by the enclosing row.  Object kind is still load-bearing:
+// direct ordinal 7 in the Region table and direct ordinal 7 in the Block table are unrelated.
+struct MissingObjectEvent {
+    ObjectKind kind = ObjectKind::Atom;
+    uint32_t ordinal = 0;
+
+    bool operator==(const MissingObjectEvent& other) const {
+        return kind == other.kind && ordinal == other.ordinal;
+    }
+};
+
 struct EventTimestamps {
     std::optional<uint64_t> codec_ready_ns;
     std::optional<uint64_t> handoff_ns;
@@ -71,7 +82,7 @@ struct EventTimestamps {
 };
 
 struct TuEventRecord {
-    static constexpr uint32_t kSchemaVersion = 1;
+    static constexpr uint32_t kSchemaVersion = 2;
 
     uint32_t schema_version = kSchemaVersion;
     Opaque128 c_guid{};
@@ -111,7 +122,7 @@ struct TuEventRecord {
     std::optional<uint64_t> presend_used_bytes;
     std::optional<uint64_t> presend_unused_bytes;
 
-    std::vector<uint32_t> missing_ordinals;
+    std::vector<MissingObjectEvent> missing_objects;
     std::vector<CopyUseEvent> copy_uses;
     EventState before{};
     EventState after{};
@@ -196,18 +207,33 @@ struct TuEventRecord {
         // The event is validated on the Ack/commit boundary.  Keep validation allocation-free
         // there: missing lists are normally tiny, and a quadratic duplicate check avoids a
         // hash-table allocation after the state transition has become visible.
-        for (size_t left = 0; left < missing_ordinals.size(); ++left)
-            for (size_t right = left + 1; right < missing_ordinals.size(); ++right)
-                if (missing_ordinals[left] == missing_ordinals[right])
-                    return reject("missing ordinal list contains a duplicate");
+        for (size_t left = 0; left < missing_objects.size(); ++left) {
+            if (!valid_object_kind(missing_objects[left].kind))
+                return reject("missing object has an invalid kind");
+            for (size_t right = left + 1; right < missing_objects.size(); ++right)
+                if (missing_objects[left] == missing_objects[right])
+                    return reject("typed missing object list contains a duplicate");
+        }
 
         if (selected == CandidateKind::Raw && !copy_uses.empty())
             return reject("RAW event contains a COPY use");
         const RouteLaneIdentity event_lane{f, route_lane_id};
-        for (const CopyUseEvent& copy : copy_uses) {
+        for (size_t index = 0; index < copy_uses.size(); ++index) {
+            const CopyUseEvent& copy = copy_uses[index];
             if (copy.lane != event_lane || copy.source_generation != source_generation ||
                 copy.source_residency_sequence != before.residency_sequence || !copy.length)
                 return reject("COPY evidence is not local to the event's pre-TU F state");
+            bool names_missing_block = false;
+            for (const MissingObjectEvent& missing : missing_objects)
+                if (missing.kind == ObjectKind::Block && missing.ordinal == copy.block_id) {
+                    names_missing_block = true;
+                    break;
+                }
+            if (!names_missing_block)
+                return reject("COPY evidence does not name a missing Block install");
+            for (size_t prior = 0; prior < index; ++prior)
+                if (copy_uses[prior].block_id == copy.block_id)
+                    return reject("COPY evidence repeats a Block install");
         }
 
         std::optional<uint64_t> previous;
@@ -267,7 +293,7 @@ struct TuEventRecord {
         out << "\tselected\ttie\tregret_bytes\tactual_c_to_f_bytes\troot_bytes"
                "\tblock_definition_bytes\tmaterial_bytes\tcontrol_bytes"
                "\tattributed_presend_bytes\tneed_bytes\tpresend_used_bytes"
-               "\tpresend_unused_bytes\tmissing_ordinals\tcopy_uses"
+               "\tpresend_unused_bytes\tmissing_objects\tcopy_uses"
                "\tbefore_catalogue\tafter_catalogue\tbefore_route_occurrences"
                "\tafter_route_occurrences\tbefore_f_known\tafter_f_known"
                "\tbefore_route_commit\tafter_route_commit\tbefore_mirror\tafter_mirror"
@@ -307,7 +333,7 @@ struct TuEventRecord {
         out << '\t'; append_optional(out, need_bytes);
         out << '\t'; append_optional(out, presend_used_bytes);
         out << '\t'; append_optional(out, presend_unused_bytes);
-        out << '\t' << join_u32(missing_ordinals) << '\t' << join_copies(copy_uses)
+        out << '\t' << join_missing(missing_objects) << '\t' << join_copies(copy_uses)
             << '\t' << before.catalogue_objects << '\t' << after.catalogue_objects
             << '\t' << before.route_occurrences << '\t' << after.route_occurrences
             << '\t' << before.f_known_objects << '\t' << after.f_known_objects
@@ -353,11 +379,26 @@ private:
         return out.str();
     }
 
-    static std::string join_u32(const std::vector<uint32_t>& values) {
+    static bool valid_object_kind(ObjectKind kind) {
+        return kind == ObjectKind::Atom || kind == ObjectKind::Region ||
+               kind == ObjectKind::Block || kind == ObjectKind::Material;
+    }
+
+    static char object_kind_token(ObjectKind kind) {
+        switch (kind) {
+            case ObjectKind::Atom: return 'A';
+            case ObjectKind::Region: return 'R';
+            case ObjectKind::Block: return 'B';
+            case ObjectKind::Material: return 'M';
+        }
+        return '?';
+    }
+
+    static std::string join_missing(const std::vector<MissingObjectEvent>& values) {
         std::ostringstream out;
         for (size_t index = 0; index < values.size(); ++index) {
             if (index) out << ',';
-            out << values[index];
+            out << object_kind_token(values[index].kind) << ':' << values[index].ordinal;
         }
         return out.str();
     }

@@ -71,7 +71,9 @@ p29::TuEventRecord full_record() {
     row.need_bytes = 9;
     row.presend_used_bytes = 3;
     row.presend_unused_bytes = 2;
-    row.missing_ordinals = {12, 44};
+    row.missing_objects = {{p29::ObjectKind::Region, 12},
+                           {p29::ObjectKind::Block, 44},
+                           {p29::ObjectKind::Material, 12}};
 
     row.before = {100, 200, 5, 9, 11, 13, 0x1234};
     row.after = {102, 207, 6, 10, 12, 14, 0x5678};
@@ -121,6 +123,8 @@ int main() {
           "TSV header and full row have different column counts");
     check(header == p29::TuEventRecord::tsv_header() && row == full.to_tsv(),
           "TSV serialization is not deterministic");
+    check(row.find("R:12,B:44,M:12") != std::string::npos,
+          "typed missing objects were not serialized distinctly");
 
     p29::TuEventRecord partial;
     partial.c_guid = opaque(20);
@@ -167,8 +171,11 @@ int main() {
     expect_rejected(full, "source residency sequence", [](auto& value) {
         value.after.residency_sequence = value.before.residency_sequence;
     });
-    expect_rejected(full, "duplicate missing ordinal", [](auto& value) {
-        value.missing_ordinals.push_back(value.missing_ordinals.front());
+    expect_rejected(full, "duplicate typed missing object", [](auto& value) {
+        value.missing_objects.push_back(value.missing_objects.front());
+    });
+    expect_rejected(full, "invalid missing object kind", [](auto& value) {
+        value.missing_objects.front().kind = static_cast<p29::ObjectKind>(0);
     });
     expect_rejected(full, "RAW with COPY", [](auto& value) {
         value.selected = p29::CandidateKind::Raw;
@@ -181,6 +188,12 @@ int main() {
     });
     expect_rejected(full, "zero COPY length", [](auto& value) {
         value.copy_uses.front().length = 0;
+    });
+    expect_rejected(full, "COPY without missing Block", [](auto& value) {
+        value.copy_uses.front().block_id++;
+    });
+    expect_rejected(full, "duplicate COPY Block", [](auto& value) {
+        value.copy_uses.push_back(value.copy_uses.front());
     });
     expect_rejected(full, "timestamp inversion", [](auto& value) {
         value.timestamps.reconstructed_ns = 19;
