@@ -1215,7 +1215,7 @@ int main(int argc,char**argv){
     uint64_t preloadedRegionBytes=0,preloadedRegionCount=0,associatedRegionCount=0;double mixedAssociationWire=0,mixedMissingRequestWire=0;
     const double FRAME=4;   // 4-byte length prefix per framed message (the ACCOUNTING charge)
     struct SelRow{size_t tu;uint64_t rawRootRaw,rawRootZ,globalRootRaw,globalRootZ,newBlocks,defRaw,defZ,common,globalFull,rawFull;};
-    std::vector<SelRow> selRows; uint64_t closureChecked=0,manifestChecks=0,tuRootFrame=0,tuBlockFrame=0,fullTotalChecks=0; std::vector<uint32_t> costedBlocks;
+    std::vector<SelRow> selRows; uint64_t closureChecked=0,manifestChecks=0,tuRootFrame=0,tuBlockFrame=0,fullTotalChecks=0,sumDelta=0; std::vector<uint32_t> costedBlocks;
     WireSink cfSink,fcSink;   // the PHYSICAL streams: 5-byte typed header per frame
     std::vector<uint64_t>sinkCfOff(TUs),sinkFcOff(TUs),sinkCfFrames(TUs),sinkFcFrames(TUs);
     if(cfSinkPath){cfSink.open(cfSinkPath,sinkReplay);fcSink.open(fcSinkPath,sinkReplay);}
@@ -2376,14 +2376,22 @@ int main(int argc,char**argv){
             // is material every candidate would have sent, so it is the common part by
             // construction -- and GLOBAL_full must reproduce the measured delta exactly.
             if(selectorTsvPath&&!selRows.empty()&&selRows.back().tu==t){
+                // The TU-close frame is ALREADY in cfSink.off by this point -- it is emitted
+                // just above.  Adding it again cost 6 bytes per TU and, because it landed in
+                // common_physical, it inflated BOTH candidates identically: the "agreement
+                // to 0.12%" with the independent policy run was 1,728 = 6 x 288 TUs of the
+                // same double count in each column, not agreement.
                 const uint64_t prev=t?sinkCfOff[t-1]:0;
-                const uint64_t delta=cfSink.off+5+1-prev;   // include this TU's close frame
+                const uint64_t delta=cfSink.off-prev;
                 if(delta<tuRootFrame+tuBlockFrame){fprintf(stderr,"TU %zu: frames exceed the physical delta\n",t);return 2;}
                 SelRow&r=selRows.back();
                 r.common=delta-tuRootFrame-tuBlockFrame;
                 r.globalFull=r.common+tuRootFrame+tuBlockFrame;
                 r.rawFull=r.common+r.rawRootZ;
-                if(r.globalFull!=delta){fprintf(stderr,"TU %zu: full total %llu != measured delta %llu\n",t,(unsigned long long)r.globalFull,(unsigned long long)delta);return 2;}
+                // NOT a check: globalFull == (delta - a - b) + a + b == delta by construction,
+                // true whatever delta is.  The real property is that the per-TU deltas TILE
+                // the stream exactly -- no gaps, no overlaps -- asserted after the loop.
+                sumDelta+=delta;
                 ++fullTotalChecks;
             }
             sinkCfOff[t]=cfSink.off; sinkFcOff[t]=fcSink.off;
@@ -2642,7 +2650,13 @@ int main(int argc,char**argv){
       if(fclose(f)!=0){perror(selectorTsvPath);return 2;}
       printf("SELECTOR closure: %llu Region memberships checked identical across candidates\n",(unsigned long long)closureChecked);
       printf("SELECTOR manifest: %llu transaction(s) sent exactly the Block set costing priced\n",(unsigned long long)manifestChecks);
-      if(fullTotalChecks) printf("SELECTOR full total: %llu TU(s) reproduced the measured physical C->F delta exactly\n",(unsigned long long)fullTotalChecks);
+      if(fullTotalChecks){
+        // Discriminating: the +6/TU double count made this sum exceed the stream by 1,728.
+        if(sumDelta!=cfSink.off){fprintf(stderr,"per-TU deltas sum to %llu but the C->F stream is %llu (%+lld)\n",
+            (unsigned long long)sumDelta,(unsigned long long)cfSink.off,(long long)(sumDelta-cfSink.off));return 2;}
+        printf("SELECTOR full total: %llu per-TU deltas tile the %llu-byte C->F stream exactly\n",
+            (unsigned long long)fullTotalChecks,(unsigned long long)cfSink.off);
+      }
       uint64_t rawFullCum=0,globalFullCum=0;
       for(const SelRow&r:selRows){rawFullCum+=r.rawFull;globalFullCum+=r.globalFull;}
       printf("SELECTOR per-TU costing: rows=%zu raw_cum=%llu global_cum=%llu wins[RAW=%llu GLOBAL_S1=%llu tie=%llu]\n",
