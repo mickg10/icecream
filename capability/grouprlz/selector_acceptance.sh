@@ -26,6 +26,7 @@
 #                  p29_two_f_state_mutations.sh      two-F route/F boundary paths
 #   chronology     p29_unavailable_suffix.sh         TU2 absent through TU1 Ack
 #                  selector_prefix_invariance.sh     physical prefixes vs supplied suffix
+#   routing        p29_routing_manifest_test.sh      R0-R4 assignments + prefix causality
 #   wire gates     selector_step1_equivalence.sh  planning vs on-demand, byte-identical
 #                  selector_step2_equivalence.sh  reference vs build under test
 #                  selector_tag_regression.sh     typed-tag guards G1-G3
@@ -176,6 +177,10 @@ step p29_unavailable_suffix -- env WORK="$WORK/unavailable-suffix" \
      "$HERE/p29_unavailable_suffix.sh"
 step selector_prefix_invariance -- env BIN="$BIN" WORK="$WORK/prefix-invariance" \
      "$HERE/selector_prefix_invariance.sh" "$WORK/man1"
+
+# --- no-socket routing assignment adapter -------------------------------------------------
+step p29_routing_manifest -- env WORK="$WORK/routing-manifest" \
+     "$HERE/p29_routing_manifest_test.sh" "$WORK/man1" "$WORK/routing-manifest"
 
 # --- wire gates ----------------------------------------------------------------------------
 step selector_tag_regression -- env BIN="$BIN" "$HERE/selector_tag_regression.sh" "$WORK/man4" "$WORK/man1"
