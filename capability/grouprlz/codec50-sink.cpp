@@ -38,6 +38,7 @@
 #include <zlib.h>
 #include "alpha_line_codec.h"
 #include "p29_online_s1.h"
+#include "p29_sparse_blocks.h"
 #include "mo_factor_codec.h"
 #if defined(WITH_BSC_GROUPS)
   #include "residual_group_codec.h"
@@ -1191,22 +1192,10 @@ int main(int argc,char**argv){
     std::vector<MixedFLineView> FmixedPublic(1);
     std::vector<std::string> Fpaths;
     std::vector<uint8_t> fknownBlk;   // C's model of F's known blocks; grows per TU
-    std::vector<uint8_t> FknownBlk;        // F's independently derived block state; grows per TU
-    // F's Block store is keyed by CANONICAL id and tolerates holes.  The old form indexed it
-    // by dense ARRIVAL ORDER (id+1 had to equal Fblk_off.size()), which cannot represent
-    // "minted on C, not known on F" -- and that state is unavoidable the moment a candidate
-    // that does not install a Block wins, since the id is minted and never rewound.  With
-    // arrival-order indexing the unsent id does not merely stay unknown, it breaks the NEXT
-    // Block's install.
-    struct FBlockView { size_t offset=0; uint32_t length=0; bool known=false; };
-    std::vector<FBlockView> Fblocks;              // by canonical Block id; may contain holes
-    std::vector<uint32_t> FblockChildren;         // arena, append-only
-    auto Finstall_block=[&](uint64_t id,size_t first,uint32_t len)->bool{
-        if(id>=Fblocks.size()) Fblocks.resize(size_t(id)+1);
-        if(Fblocks[id].known) return false;       // only "already known" is an error now
-        Fblocks[id]={first,len,true};
-        return true;
-    };
+    // The shared store (p29_sparse_blocks.h) -- the same definition the test links against,
+    // so a decoder regression here cannot leave the gate green.  Fblocks.known() is now THE
+    // F-side truth for "does F hold this Block"; the C-side mirror fknownBlk stays separate.
+    p29::SparseBlockStore Fblocks;
     std::vector<uint32_t> Freg_stream; Freg_stream.reserve(allreg.size());   // F's reconstructed region occurrence stream (for block COPY defs)
     std::vector<uint32_t> Froot_child; std::vector<size_t> Froot_off; Froot_off.push_back(0);   // completed exact Roots for P22 slices
     double w_blockdef=0;
@@ -1378,7 +1367,7 @@ int main(int argc,char**argv){
           if(fknownReg.size()<nreg){ fknownReg.resize(nreg,0); FmixedRegions.resize(nreg);
             associatedReg.resize(nreg,0); FassociatedReg.resize(nreg,0);
             requiredRegionStamp.resize(nreg,0); FrequiredRegionStamp.resize(nreg,0); }
-          if(fknownBlk.size()<nblk){ fknownBlk.resize(nblk,0); FknownBlk.resize(nblk,0);
+          if(fknownBlk.size()<nblk){ fknownBlk.resize(nblk,0);
             requiredBlockStamp.resize(nblk,0); FrequiredBlockStamp.resize(nblk,0); }
           if(!admitRegionKeys(uint32_t(nreg))) return 2; }
         const bool endOfEntropyStream=(!openFinalEntropy&&t+1==TUs)||(entropyRestartTus&&(t+1)%entropyRestartTus==0);
@@ -1445,15 +1434,16 @@ int main(int argc,char**argv){
               cfSink.emit(WT_BLOCKDEF,messageEncoded.data(),bytes-size_t(FRAME));
               const uint8_t*bp=messageDecoded.data(),*be=bp+messageDecoded.size();uint64_t count=get_varint(bp);
               if(count!=manifestBlocks.size()){fprintf(stderr,"direct Block manifest count differs\n");return 2;}
-              for(uint64_t i=0;i<count;++i){uint64_t id=get_varint(bp);if(id>=FknownBlk.size()||(id<Fblocks.size()&&Fblocks[id].known)||FknownBlk[id]){fprintf(stderr,"bad direct Block identity\n");return 2;}uint8_t kind=*bp++;const size_t blkFirst=FblockChildren.size();
-                if(kind==1){uint64_t source=get_varint(bp),length=get_varint(bp);if(source+length>Freg_stream.size()){fprintf(stderr,"bad direct Block copy\n");return 2;}for(uint64_t j=0;j<length;++j)FblockChildren.push_back(Freg_stream[source+j]);}
-                else if(kind==0){uint64_t length=get_varint(bp);for(uint64_t j=0;j<length;++j){uint64_t child=get_varint(bp);if(child>=regionsAfterTu[t]){fprintf(stderr,"bad direct Block child\n");return 2;}FblockChildren.push_back(uint32_t(child));}}
+              for(uint64_t i=0;i<count;++i){uint64_t id=get_varint(bp);if(Fblocks.known(id)){fprintf(stderr,"bad direct Block identity\n");return 2;}uint8_t kind=*bp++;
+                if(kind==1){uint64_t source=get_varint(bp),length=get_varint(bp);if(!Fblocks.install_copy(id,Freg_stream,source,length)){fprintf(stderr,"bad direct Block copy\n");return 2;}}
+                else if(kind==0){uint64_t length=get_varint(bp);std::vector<uint32_t>kids;kids.reserve(size_t(length<4096?length:4096));for(uint64_t j=0;j<length;++j){uint64_t child=get_varint(bp);if(child>=regionsAfterTu[t]){fprintf(stderr,"bad direct Block child\n");return 2;}kids.push_back(uint32_t(child));}
+                  if(!Fblocks.install_children(id,kids.data(),kids.size())){fprintf(stderr,"bad direct Block identity\n");return 2;}}
                 else{fprintf(stderr,"bad direct Block kind\n");return 2;}
-                if(!Finstall_block(id,blkFirst,uint32_t(FblockChildren.size()-blkFirst))){fprintf(stderr,"duplicate Block definition\n");return 2;}FknownBlk[id]=1;fknownBlk[id]=1;
+                fknownBlk[id]=1;
               }
               if(bp!=be){fprintf(stderr,"direct Block manifest has trailing bytes\n");return 2;}
             }
-            for(uint32_t k:FrequiredBlocks){if(!FknownBlk[k]||k>=Fblocks.size()||!Fblocks[k].known){fprintf(stderr,"missing direct Block definition\n");return 2;}const FBlockView&v=Fblocks[k];for(uint32_t j=0;j<v.length;++j)FrequireRegion(FblockChildren[v.offset+j]);}
+            for(uint32_t k:FrequiredBlocks){if(!Fblocks.known(k)){fprintf(stderr,"missing direct Block definition\n");return 2;}const uint32_t*kb=Fblocks.begin(k);for(uint32_t j=0,n=Fblocks.length(k);j<n;++j)FrequireRegion(kb[j]);}
             if(FrequiredRegions.size()!=requiredRegions.size()){fprintf(stderr,"direct Region closure differs\n");return 2;}
             for(uint32_t r:FrequiredRegions){if(requiredRegionStamp[r]!=requestStamp){fprintf(stderr,"direct Region identity differs\n");return 2;}if(!FmixedRegions[r].known)missReg.push_back(r);}
             if(!manifestBlocks.empty()||!missReg.empty()){
@@ -1498,7 +1488,7 @@ int main(int argc,char**argv){
           if(FrequiredBlocks.size()!=requiredBlocks.size()) {fprintf(stderr,"F Root Block closure differs\n");return 2;}
           for(uint32_t k:FrequiredBlocks)if(requiredBlockStamp[k]!=requestStamp){fprintf(stderr,"F Root Block identity differs\n");return 2;}
           for(uint32_t r:FrequiredRegions)if(!FmixedRegions[r].known)missReg.push_back(r);
-          for(uint32_t k:FrequiredBlocks)if(!FknownBlk[k])missBlk.push_back(k);
+          for(uint32_t k:FrequiredBlocks)if(!Fblocks.known(k))missBlk.push_back(k);
           if(!associationRegs.empty()||!missReg.empty()||!missBlk.empty()){
             std::vector<uint8_t> missingRaw;put_varint(missingRaw,missReg.size());for(uint32_t r:missReg)put_varint(missingRaw,r);
             put_varint(missingRaw,missBlk.size());for(uint32_t k:missBlk)put_varint(missingRaw,NREG+k);
@@ -2233,11 +2223,11 @@ int main(int argc,char**argv){
         }
         { const uint8_t* pp=fill_blocks.data(), *pe=fill_blocks.data()+fill_blocks.size();size_t decodedBlocks=0;
           while(pp<pe){if(decodedBlocks>=missBlk.size()){fprintf(stderr,"decoded too many Blocks\n");return 2;}uint32_t blockId=missBlk[decodedBlocks++];
-            if(FknownBlk[blockId]||(blockId<Fblocks.size()&&Fblocks[blockId].known)){fprintf(stderr,"duplicate Block definition\n");return 2;}uint8_t kind=*pp++;const size_t blkFirst=FblockChildren.size();
-            if(kind==1){ uint64_t src=get_varint(pp); uint64_t L=get_varint(pp); for(uint64_t j=0;j<L;++j) FblockChildren.push_back(Freg_stream[src+j]); }
-            else { uint64_t L=get_varint(pp); for(uint64_t j=0;j<L;++j) FblockChildren.push_back(uint32_t(get_varint(pp))); }
-            if(!Finstall_block(blockId,blkFirst,uint32_t(FblockChildren.size()-blkFirst))){fprintf(stderr,"duplicate Block definition\n");return 2;}
-            FknownBlk[blockId]=1;
+            if(Fblocks.known(blockId)){fprintf(stderr,"duplicate Block definition\n");return 2;}uint8_t kind=*pp++;
+            if(kind==1){ uint64_t src=get_varint(pp); uint64_t L=get_varint(pp);
+              if(!Fblocks.install_copy(blockId,Freg_stream,src,L)){fprintf(stderr,"bad Block copy\n");return 2;} }
+            else { uint64_t L=get_varint(pp); std::vector<uint32_t>kids;kids.reserve(size_t(L<4096?L:4096)); for(uint64_t j=0;j<L;++j) kids.push_back(uint32_t(get_varint(pp)));
+              if(!Fblocks.install_children(blockId,kids.data(),kids.size())){fprintf(stderr,"duplicate Block definition\n");return 2;} }
           }
           if(decodedBlocks!=missBlk.size()){fprintf(stderr,"decoded too few Blocks\n");return 2;}
         }
@@ -2261,7 +2251,7 @@ int main(int argc,char**argv){
           } else while(pp<pe){ uint64_t wire=get_varint(pp);uint32_t tok;
             if(!wire_to_tag(wire,stableRootTags,stableRootTags?regionsAfterTu[t]:NREG,blocksAfterTu[t],tok)){fprintf(stderr,"bad decoded Root token\n");return 2;}
             if(!tag_is_block(tok)) emitRegionF(tag_id(tok));
-            else { uint32_t k=tag_id(tok); if(k>=Fblocks.size()||!Fblocks[k].known){fprintf(stderr,"Root names a Block this F does not hold\n");exit(2);} const FBlockView&v=Fblocks[k]; for(uint32_t j=0;j<v.length;++j) emitRegionF(FblockChildren[v.offset+j]); } }
+            else { uint32_t k=tag_id(tok); if(!Fblocks.known(k)){fprintf(stderr,"Root names a Block this F does not hold\n");exit(2);} const uint32_t*kb=Fblocks.begin(k); for(uint32_t j=0,n=Fblocks.length(k);j<n;++j) emitRegionF(kb[j]); } }
         }
         dec_s += std::chrono::duration<double>(Clock::now()-_td).count();   // F-decode ends here; the verify below is harness-only (F doesn't have the original)
         const FileSpan&physicalFile=corpus.files[t%physicalTUs];const char* orig=corpus.bytes.data()+physicalFile.off; uint32_t olen=physicalFile.len;
