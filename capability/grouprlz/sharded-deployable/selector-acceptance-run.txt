@@ -1,0 +1,20 @@
+
+STEP                                   RESULT
+p29_online_s1_test (opt)               PASS
+p29_online_s1_test (asan+ubsan)        PASS
+p29_block_catalogue_test (opt)         PASS
+p29_block_catalogue_test (asan+ubsan)  PASS
+p29_sparse_fblocks_test (opt)          PASS
+p29_sparse_fblocks_test (asan+ubsan)   PASS
+p29_prepare_commit_test (opt)          PASS
+p29_prepare_commit_test (asan+ubsan)   PASS
+p29_journal_mutations                  PASS
+selector_equivalence_mutations         PASS
+selector_1f_costing_mutations          PASS
+selector_tag_regression                PASS
+selector_step1_equivalence             PASS
+selector_step2_equivalence             PASS
+selector_1f_costing                    PASS
+
+logs: /tmp/acc4/logs
+acceptance set: 15/15 steps passed
