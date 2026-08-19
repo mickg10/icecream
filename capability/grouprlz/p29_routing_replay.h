@@ -962,15 +962,19 @@ inline BoundedR5Result bounded_r5_replay(const ReplayConfig& config,
                 const std::vector<EvaluatedAction> candidates =
                     actions_for(config, state, trace[index], fs);
                 for (const EvaluatedAction& candidate : candidates) {
-                    detail::ApplyUndo candidate_undo;
-                    detail::reversible_apply(config, state, trace[index], candidate,
-                                             candidate_undo);
                     detail::R5Path child = prefix;
                     child.actions.push_back(candidate.action);
-                    child.c_to_f_bytes = state.c_to_f_bytes;
-                    child.makespan_ns = state.makespan_ns;
+                    // The child is replayed from the committed prefix if it survives the
+                    // beam.  At expansion time only its two objective totals are needed,
+                    // and evaluate() already computed the complete transition.  Avoiding
+                    // an apply/undo pair here leaves search semantics unchanged while
+                    // removing one catalogue mutation per expanded action.
+                    child.c_to_f_bytes = detail::checked_add(
+                        state.c_to_f_bytes, candidate.cost.total_bytes,
+                        "R5 candidate byte total overflow");
+                    child.makespan_ns =
+                        std::max(state.makespan_ns, candidate.compile_finish_ns);
                     next.push_back(std::move(child));
-                    detail::undo_reversible_apply(state, candidate_undo);
                     result.expanded_paths = detail::checked_add(
                         result.expanded_paths, 1, "R5 expanded-path count overflow");
                 }
