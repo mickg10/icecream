@@ -162,6 +162,28 @@ def effective_width(rows: list[dict[str, int]]) -> tuple[float, float, int]:
     )
 
 
+def physical_byte_model_makespan(rows: list[dict[str, int]], workers: int) -> int:
+    """Replay the declared 1-Gbit/0.5-GBps model using physical per-TU bytes."""
+    egress_ready = [0] * workers
+    compiler_ready = [0] * workers
+    makespan = 0
+    for row in rows:
+        lane = min(range(workers), key=lambda value: (egress_ready[value], value))
+        transfer_ns = (
+            row["c_to_f"] * 8_000_000_000 + 1_000_000_000 - 1
+        ) // 1_000_000_000
+        transfer_finish = egress_ready[lane] + transfer_ns
+        egress_ready[lane] = transfer_finish
+        worker = row["worker"]
+        compile_ns = (
+            row["raw"] * 1_000_000_000 + 500_000_000 - 1
+        ) // 500_000_000
+        compile_finish = max(transfer_finish, compiler_ready[worker]) + compile_ns
+        compiler_ready[worker] = compile_finish
+        makespan = max(makespan, compile_finish)
+    return makespan
+
+
 def split_sums(rows: list[dict[str, int]], tus_per_build: int) -> tuple[int, int]:
     if len(rows) == tus_per_build:
         return sum(row["c_to_f"] for row in rows), 0
@@ -340,6 +362,7 @@ def run_cell(
     if sum(row["raw"] for row in rows) != raw_per_build * repetitions:
         raise RuntimeError(f"{tag}: physical raw curve differs from manifest")
     n_eff, entropy, opened = effective_width(rows)
+    physical_makespan = physical_byte_model_makespan(rows, width)
     if abs(float(estimate["N_eff"]) - n_eff) > 1e-5:
         raise RuntimeError(f"{tag}: planner and physical N_eff differ")
     if abs(float(estimate["H_route"]) - entropy) > 1e-5:
@@ -369,6 +392,7 @@ def run_cell(
         "control": parsed["c_control"],
         "estimated_c_to_f": int(estimate["estimated_c_to_f"]),
         "estimated_makespan_ns": int(estimate["makespan_ns"]),
+        "physical_byte_model_makespan_ns": physical_makespan,
         "estimated_lower_c_to_f": int(estimate.get("r5_lower_c_to_f", "0")),
         "estimated_lower_makespan_ns": int(
             estimate.get("r5_lower_makespan_ns", "0")
@@ -407,6 +431,8 @@ def write_report(path: Path, rows: list[dict[str, object]], widths: list[int]) -
         "",
         "All byte columns below are exact C-to-F socket bytes after byte-exact reconstruction. "
         "The planner estimate chooses the route but is not substituted for the physical score.",
+        "The main makespan column replays those physical per-TU bytes through the declared "
+        "1-Gbit/s, one-egress-lane-per-F and 0.5-GB/s compiler model.",
         "R5 lower bounds live only in the labelled independent-Region estimator; they do not "
         "bound the physical byte columns and are reported separately.",
         "",
@@ -419,7 +445,7 @@ def write_report(path: Path, rows: list[dict[str, object]], widths: list[int]) -
             lines += [
                 f"### M={width}",
                 "",
-                "| policy | cold C→F | warm C→F | N_eff | H_route | model makespan |",
+                "| policy | cold C→F | warm C→F | N_eff | H_route | physical-byte model makespan |",
                 "|---|---:|---:|---:|---:|---:|",
             ]
             for policy in POLICIES:
@@ -430,7 +456,7 @@ def write_report(path: Path, rows: list[dict[str, object]], widths: list[int]) -
                     f"| {policy.label} | {int(row['cold_c_to_f']) / 1e6:.3f} MB | "
                     f"{int(row['warm_c_to_f']) / 1e6:.3f} MB | "
                     f"{float(row['n_eff']):.2f} | {float(row['route_entropy']):.2f} | "
-                    f"{int(row['estimated_makespan_ns']) / 1e6:.2f} ms |"
+                    f"{int(row['physical_byte_model_makespan_ns']) / 1e6:.2f} ms |"
                 )
             r5_rows = [
                 by_key[(corpus.name, width, policy.label)]
