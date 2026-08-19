@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # selector_live_history.sh — the LIVE selected-history gate.
 #
-# The 1F costing TSV is a differential on the always-GLOBAL baseline: every TU sends GLOBAL_S1
+# The 1F costing TSV is a differential on the always-ROUTE_S1 baseline: every TU sends ROUTE_S1
 # and RAW is priced but never sent.  This runs the selector for real (--live-selector): each TU
 # sends the winner, so when RAW wins, the Blocks that TU would have defined are NOT installed
 # on F, and every later TU that needs one pays for it then.  That is the selected history, and
@@ -64,6 +64,7 @@ BASE=(--z 3 --mixed-regions --byte-array-lines --direct-ordinals --compressed-bl
       --blob-threads 8 --blob-lazy-fallback --mo-factor --s1-max-chain 1024
       --blob-z 9 --blob-zstd-workers 4 --blob-zstd-job-mib 5 --blob-zstd-overlap-log 3
       --stable-root-tags --literal-ondemand --literal-group-skip-zstd10 --route-s1 1)
+WANT_HDR=$'tu\traw_root_bytes\traw_root_frame\troute_root_bytes\troute_root_frame\troute_candidate_blockdefs\troute_blockdef_bytes\troute_blockdef_frame\temitted_root_frame\temitted_blockdefs\temitted_blockdef_frame\tactual_delta\tcommon\traw_full\troute_full\twinner\ttie\traw_cheaper'
 
 CELLS=("$@")
 [ ${#CELLS[@]} -gt 0 ] || CELLS=(re2/debian-gcc fmt/debian-gcc cereal/debian-gcc leveldb/debian-gcc spdlog/debian-gcc)
@@ -72,7 +73,7 @@ mkdir -p "$OUT"
 selector_evidence_init "$OUT" "$BIN"
 RESULTS=$OUT/selector-live-selected-history.tsv
 printf '# LIVE selected history vs the always-ROUTE_S1 baseline; both physical C->F streams\n' >"$RESULTS"
-printf 'cell\tTUs\tbaseline_cf\tlive_cf\tdelta\tdelta_pct\tRAW_wins\tROUTE_wins\tties\tlive_route_counterfactual\tblocks_sent_base\tblocks_sent_live\n' >>"$RESULTS"
+printf 'cell\tTUs\tbaseline_cf\tlive_cf\tdelta\tdelta_pct\tRAW_wins\tROUTE_wins\tties\tlive_route_counterfactual\troute_candidate_blockdefs_live\temitted_blockdefs_base\temitted_blockdefs_live\n' >>"$RESULTS"
 
 run_one() { # run_one <tag> <extra flag...>
   local tag=$1; shift
@@ -82,9 +83,11 @@ run_one() { # run_one <tag> <extra flag...>
          >"$T/$tag.out" 2>"$T/$tag.err" || rc=$?
   [ "$rc" -eq 0 ] || fail "$tag: codec exited $rc"
   grep -qF 'byte-exact=OK' "$T/$tag.out" || fail "$tag: byte-exact is not OK"
+  local hdr; hdr=$(head -1 "$T/$tag.tsv")
+  [ "$hdr" = "$WANT_HDR" ] || fail "$tag: unexpected selector TSV header"
   local rows; rows=$(( $(wc -l <"$T/$tag.tsv") - 1 ))
   [ "$rows" = "$TU" ] || fail "$tag: selector TSV has $rows rows, expected $TU"
-  local sum; sum=$(awk -F'\t' 'NR>1{g+=$11}END{printf "%.0f", g}' "$T/$tag.tsv")
+  local sum; sum=$(awk -F'\t' 'NR>1{g+=$12}END{printf "%.0f", g}' "$T/$tag.tsv")
   local size; size=$(stat -c %s "$T/$tag.cf")
   [ "$sum" = "$size" ] || fail "$tag: TSV actual_delta sums to $sum but the C->F file holds $size"
   # 5. re-derived here rather than trusted: for every row the CHOSEN candidate's full cost
@@ -92,8 +95,8 @@ run_one() { # run_one <tag> <extra flag...>
   #    MEASURED common plus SEPARATELY costed candidate frames, so the unchosen one is a real
   #    counterfactual and this comparison has something to disagree with.
   local bad; bad=$(awk -F'\t' 'NR>1{
-        chosen = ($15=="RAW") ? $13 : $14
-        if (chosen != $11) { print $1; n++ }
+        chosen = ($16=="RAW") ? $14 : $15
+        if (chosen != $12) { print $1; n++ }
       } END { }' "$T/$tag.tsv" | head -3 | tr '\n' ' ')
   [ -z "$bad" ] || fail "$tag: the chosen candidate does not reconstruct the actual transaction at TU(s): $bad"
   grep -qF 'SELECTOR boundary:' "$T/$tag.out" || fail "$tag: the producer boundary is not declared"
@@ -127,18 +130,19 @@ print(d['payload']['path'], d['payload']['sha256'], d['tu_count'])" "$J")
   # The size difference is a MEASUREMENT and is reported as one.  It is deliberately not
   # dressed up as a proof of per-TU attribution: that lives in the codec's own checks, which
   # are mutation-tested against the winner, both frame attributions, and an unselected field.
-  rawwin=$(awk -F'\t' 'NR>1 && $15=="RAW"{n++}END{print n+0}' "$T/live.tsv")
-  globwin=$(awk -F'\t' 'NR>1 && $15=="ROUTE_S1"{n++}END{print n+0}' "$T/live.tsv")
-  ties=$(awk -F'\t' 'NR>1 && $16==1{n++}END{print n+0}' "$T/live.tsv")
-  blk_base=$(awk -F'\t' 'NR>1{n+=$6}END{print n+0}' "$T/base.tsv")
-  blk_live=$(awk -F'\t' 'NR>1{n+=$6}END{print n+0}' "$T/live.tsv")
+  rawwin=$(awk -F'\t' 'NR>1 && $16=="RAW"{n++}END{print n+0}' "$T/live.tsv")
+  globwin=$(awk -F'\t' 'NR>1 && $16=="ROUTE_S1"{n++}END{print n+0}' "$T/live.tsv")
+  ties=$(awk -F'\t' 'NR>1 && $17==1{n++}END{print n+0}' "$T/live.tsv")
+  route_candidate_defs_live=$(awk -F'\t' 'NR>1{n+=$6}END{print n+0}' "$T/live.tsv")
+  blk_base=$(awk -F'\t' 'NR>1{n+=$10}END{print n+0}' "$T/base.tsv")
+  blk_live=$(awk -F'\t' 'NR>1{n+=$10}END{print n+0}' "$T/live.tsv")
   # The counterfactual the separated records make available: what the live run WOULD have
   # cost had it sent ROUTE_S1 for every TU against its own selected history.
-  live_route_cf=$(awk -F'\t' 'NR>1{g+=$14}END{printf "%.0f", g}' "$T/live.tsv")
+  live_route_cf=$(awk -F'\t' 'NR>1{g+=$15}END{printf "%.0f", g}' "$T/live.tsv")
   delta=$((base_cf - live_cf))
-  printf '%s\t%s\t%s\t%s\t%+d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$P" "$TU" "$base_cf" "$live_cf" "$delta" \
+  printf '%s\t%s\t%s\t%s\t%+d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$P" "$TU" "$base_cf" "$live_cf" "$delta" \
       "$(awk -v d="$delta" -v b="$base_cf" 'BEGIN{printf "%+.4f%%", d*100/b}')" \
-      "$rawwin" "$globwin" "$ties" "$live_route_cf" "$blk_base" "$blk_live" >>"$RESULTS"
+      "$rawwin" "$globwin" "$ties" "$live_route_cf" "$route_candidate_defs_live" "$blk_base" "$blk_live" >>"$RESULTS"
   selector_evidence_cell "$OUT" "$P.$PR" "$BIN ${BASE[*]} [--live-selector]" \
       "$T/base.out" "$T/base.err" "$T/base.tsv" "$T/base.cf" "$T/base.fc" \
       "$T/live.out" "$T/live.err" "$T/live.tsv" "$T/live.cf" "$T/live.fc"

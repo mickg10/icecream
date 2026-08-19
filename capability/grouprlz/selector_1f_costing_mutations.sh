@@ -66,7 +66,7 @@ case "$MUT" in
       hdr) sed -i '1s/actual_delta/actual_total/' "$tsv" ;;
       row) sed -i '$d' "$tsv" ;;
       cf)  printf '\x00' >> "$cf" ;;
-      win) awk -F'\t' -v OFS='\t' 'NR==2{$13=1}1' "$tsv" >"$tsv.m" || exit 9; mv "$tsv.m" "$tsv" ;;
+      win) awk -F'\t' -v OFS='\t' 'NR==2{$14=1}1' "$tsv" >"$tsv.m" || exit 9; mv "$tsv.m" "$tsv" ;;
       *)   echo "shim: unknown MUT=$MUT" >&2; exit 9 ;;
     esac
     if [ "$MUT" != cf ] && cmp -s "$tsv.orig" "$tsv"; then

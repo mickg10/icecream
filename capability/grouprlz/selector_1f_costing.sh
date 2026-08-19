@@ -69,7 +69,7 @@ BASE=(--z 3 --mixed-regions --byte-array-lines --direct-ordinals --compressed-bl
 
 # Parsed by column index below, so a rename or reorder must be a hard error, not a silent
 # mis-read of some other column.
-WANT_HDR=$'tu\traw_root_bytes\traw_root_frame\troute_root_bytes\troute_root_frame\troute_new_blocks\troute_blockdef_bytes\troute_blockdef_frame\temitted_root_frame\temitted_blockdef_frame\tactual_delta\tcommon\traw_full\troute_full\twinner\ttie\traw_cheaper'
+WANT_HDR=$'tu\traw_root_bytes\traw_root_frame\troute_root_bytes\troute_root_frame\troute_candidate_blockdefs\troute_blockdef_bytes\troute_blockdef_frame\temitted_root_frame\temitted_blockdefs\temitted_blockdef_frame\tactual_delta\tcommon\traw_full\troute_full\twinner\ttie\traw_cheaper'
 
 CELLS=("$@")
 [ ${#CELLS[@]} -gt 0 ] || CELLS=(re2/debian-gcc fmt/debian-gcc cereal/debian-gcc leveldb/debian-gcc spdlog/debian-gcc)
@@ -127,10 +127,10 @@ print(d['payload']['path'], d['payload']['sha256'], d['tu_count'])" "$J")
   hdr=$(head -1 "$T/sel.tsv")
   [ "$hdr" = "$WANT_HDR" ] || fail "unexpected selector TSV header (columns are parsed by index)"
   stats=$(awk -F'\t' 'NR>1 {
-        r++; rf += $13; tf += $14; act += $11;
-        if ($15 == "RAW") sent_raw++; else sent_route++
-        if ($17 == 1) rw++
-        if ($16 == 1) tw++
+        r++; rf += $14; tf += $15; act += $12;
+        if ($16 == "RAW") sent_raw++; else sent_route++
+        if ($18 == 1) rw++
+        if ($17 == 1) tw++
       }
       END { printf "%d %.0f %.0f %.0f %d %d %d %d", r, rf, tf, act, sent_raw+0, sent_route+0, rw+0, tw+0 }' "$T/sel.tsv")
   read -r rows raw_full route_full actual sent_raw sent_route raw_cheaper ties <<<"$stats"

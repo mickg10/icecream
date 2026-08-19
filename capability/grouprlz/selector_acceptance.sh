@@ -14,6 +14,7 @@
 #   fault runners  p29_journal_mutations.sh          the journal's failure paths
 #                  selector_equivalence_mutations.sh both byte-equivalence gates' paths
 #                  selector_1f_costing_mutations.sh  the 1F launcher's own failure path
+#                  selector_live_source_mutations.sh source-level selector attribution faults
 #   wire gates     selector_step1_equivalence.sh  planning vs on-demand, byte-identical
 #                  selector_step2_equivalence.sh  reference vs build under test
 #                  selector_tag_regression.sh     typed-tag guards G1-G3
@@ -132,6 +133,8 @@ step selector_equivalence_mutations -- env BIN="$BIN" S1REF="$REF_BIN" MX="$MX" 
      WORK="$WORK/mut.equiv" "$HERE/selector_equivalence_mutations.sh" "$CELL"
 step selector_1f_costing_mutations -- env BIN="$BIN" MX="$MX" \
      WORK="$WORK/mut.costing" "$HERE/selector_1f_costing_mutations.sh" "$CELL"
+step selector_live_source_mutations -- env BIN="$BIN" WORK="$WORK/mut.selector-source" \
+     "$HERE/selector_live_source_mutations.sh" "$WORK/man1"
 
 # --- wire gates ----------------------------------------------------------------------------
 step selector_tag_regression -- env BIN="$BIN" "$HERE/selector_tag_regression.sh" "$WORK/man4" "$WORK/man1"
