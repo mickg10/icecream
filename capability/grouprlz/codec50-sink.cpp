@@ -1215,7 +1215,7 @@ int main(int argc,char**argv){
     uint64_t preloadedRegionBytes=0,preloadedRegionCount=0,associatedRegionCount=0;double mixedAssociationWire=0,mixedMissingRequestWire=0;
     const double FRAME=4;   // 4-byte length prefix per framed message (the ACCOUNTING charge)
     struct SelRow{size_t tu;uint64_t rawRootRaw,rawRootZ,globalRootRaw,globalRootZ,newBlocks,defRaw,defZ;};
-    std::vector<SelRow> selRows;
+    std::vector<SelRow> selRows; uint64_t closureChecked=0;
     WireSink cfSink,fcSink;   // the PHYSICAL streams: 5-byte typed header per frame
     std::vector<uint64_t>sinkCfOff(TUs),sinkFcOff(TUs),sinkCfFrames(TUs),sinkFcFrames(TUs);
     if(cfSinkPath){cfSink.open(cfSinkPath,sinkReplay);fcSink.open(fcSinkPath,sinkReplay);}
@@ -1411,6 +1411,25 @@ int main(int argc,char**argv){
             }
             std::vector<uint8_t> costDef;
             if(!costBlocks.empty()) serialize_block_manifest(costBlocks,costDef);
+            // CORRECTION 5: prove the common material really is common.  Both candidates must
+            // expand to the SAME unique Region set -- that is what makes it legitimate to
+            // exclude the missing-Region and Line material from the differential at all.  If
+            // they ever diverged, the excluded material would differ between candidates and
+            // the comparison would be meaningless, so this is asserted rather than assumed.
+            {
+                std::vector<uint32_t> rawClosure, globalClosure;
+                auto addOnce=[&](std::vector<uint32_t>&v,uint32_t r){
+                    for(uint32_t q:v) if(q==r) return; v.push_back(r); };
+                for(size_t i=roff[t];i<roff[t+1];++i) addOnce(rawClosure,allreg[i]);
+                for(size_t i=0;i<tn;++i){
+                    if(!tag_is_block(tk[i])) addOnce(globalClosure,tag_id(tk[i]));
+                    else for(uint32_t r:blockCatalogue.block(tag_id(tk[i])).regions) addOnce(globalClosure,r);
+                }
+                std::vector<uint32_t> a=rawClosure,b=globalClosure;
+                std::sort(a.begin(),a.end()); std::sort(b.begin(),b.end());
+                if(a!=b){fprintf(stderr,"candidate closures differ at TU=%zu: RAW %zu Regions, GLOBAL_S1 %zu\n",t,a.size(),b.size());return 2;}
+                closureChecked+=a.size();
+            }
             // Score the PHYSICAL FRAME: encoded payload plus the typed frame header the
             // sink writes, for each message the candidate would emit.
             const size_t hdr=5;
@@ -2574,6 +2593,7 @@ int main(int argc,char**argv){
             (unsigned long long)g,win)<0){fclose(f);return 2;}
       }
       if(fclose(f)!=0){perror(selectorTsvPath);return 2;}
+      printf("SELECTOR closure: %llu Region memberships checked identical across candidates\n",(unsigned long long)closureChecked);
       printf("SELECTOR per-TU costing: rows=%zu raw_cum=%llu global_cum=%llu wins[RAW=%llu GLOBAL_S1=%llu tie=%llu]\n",
           selRows.size(),(unsigned long long)rawCum,(unsigned long long)globalCum,
           (unsigned long long)rawWins,(unsigned long long)globalWins,(unsigned long long)ties);
