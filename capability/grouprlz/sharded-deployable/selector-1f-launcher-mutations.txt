@@ -1,0 +1,9 @@
+control: unmutated fmt/debian-gcc accepted
+caught rc        exit=1  CELL FAIL [fmt/debian-gcc]: codec exited 2
+caught be        exit=1  CELL FAIL [fmt/debian-gcc]: byte-exact is not OK
+caught nomarker  exit=1  CELL FAIL [fmt/debian-gcc]: missing check line: SELECTOR full total:
+caught hdr       exit=1  CELL FAIL [fmt/debian-gcc]: unexpected selector TSV header (columns are parsed by index)
+caught row       exit=1  CELL FAIL [fmt/debian-gcc]: selector TSV has 203 rows, expected one per TU (204 = 51 x 4)
+caught cf        exit=1  CELL FAIL [fmt/debian-gcc]: TSV global_full sums to 979416 but the C->F file holds 979417 bytes (-1 off)
+caught win       exit=1  CELL FAIL [fmt/debian-gcc]: raw_cum: the codec printed 1392672, the TSV rows give 1389089
+all 7 checks fire on the mutation each one targets, and the control still passes
