@@ -63,12 +63,27 @@ POLICIES = (
     ),
     PolicySpec("R5_BYTES", "r5-bounded", "R5_BOUNDED", (0, 1), 4, 64),
     PolicySpec(
+        "R5_W015625", "r5-bounded", "R5_BOUNDED", (15_625, 1_000_000), 4, 64
+    ),
+    PolicySpec(
+        "R5_W03125", "r5-bounded", "R5_BOUNDED", (31_250, 1_000_000), 4, 64
+    ),
+    PolicySpec(
+        "R5_W0625", "r5-bounded", "R5_BOUNDED", (62_500, 1_000_000), 4, 64
+    ),
+    PolicySpec(
         "R5_1GBIT_TIME",
         "r5-bounded",
         "R5_BOUNDED",
         (125_000, 1_000_000),
         4,
         64,
+    ),
+    PolicySpec(
+        "R5_W250", "r5-bounded", "R5_BOUNDED", (250_000, 1_000_000), 4, 64
+    ),
+    PolicySpec(
+        "R5_W500", "r5-bounded", "R5_BOUNDED", (500_000, 1_000_000), 4, 64
     ),
 )
 
