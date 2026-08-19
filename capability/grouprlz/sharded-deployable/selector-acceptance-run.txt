@@ -1,3 +1,35 @@
+=== p29_online_s1_test (opt)
+    P29 online S1 T_current/full-route equivalence PASS
+=== p29_online_s1_test (asan+ubsan)
+    P29 online S1 T_current/full-route equivalence PASS
+=== p29_block_catalogue_test (opt)
+    P29 shared BlockCatalogue gates 2-5,7 PASS
+=== p29_block_catalogue_test (asan+ubsan)
+    P29 shared BlockCatalogue gates 2-5,7 PASS
+=== p29_sparse_fblocks_test (opt)
+    P29 sparse F Block store PASS
+=== p29_sparse_fblocks_test (asan+ubsan)
+    P29 sparse F Block store PASS
+=== p29_prepare_commit_test (opt)
+    P29 prepare/commit/abort gates 2-6 PASS
+=== p29_prepare_commit_test (asan+ubsan)
+    P29 prepare/commit/abort gates 2-6 PASS
+=== p29_journal_mutations
+    every journal failure the gates must catch is caught, and the control passes
+=== selector_equivalence_mutations
+    both equivalence gates reject every mutation by the check it targets, and both controls pass
+=== selector_1f_costing_mutations
+    all 7 checks fire on the mutation each one targets, and the control still passes
+=== selector_tag_regression
+    TAG REGRESSION PASS
+=== selector_step1_equivalence
+    # 10/10 cells: both streams byte-identical, every codec run exited 0 and byte-exact
+=== selector_step2_equivalence
+    # 10/10 cells: streams byte-identical and legacy TOTAL unchanged, every run exited 0 and byte-exact
+=== selector_1f_costing
+    all 5 cell(s) passed every check; results in /tmp/acc6/costing/results/selector-1f-per-tu-costing.tsv
+=== selector_live_history
+    difference attributed to per-TU rows.  A positive delta means live sent FEWER bytes.
 
 STEP                                   RESULT
 p29_online_s1_test (opt)               PASS
@@ -15,6 +47,7 @@ selector_tag_regression                PASS
 selector_step1_equivalence             PASS
 selector_step2_equivalence             PASS
 selector_1f_costing                    PASS
+selector_live_history                  PASS
 
-logs: /tmp/acc4/logs
-acceptance set: 15/15 steps passed
+logs: /tmp/acc6/logs
+acceptance set: 16/16 steps passed

@@ -17,7 +17,8 @@
 #   wire gates     selector_step1_equivalence.sh  planning vs on-demand, byte-identical
 #                  selector_step2_equivalence.sh  reference vs build under test
 #                  selector_tag_regression.sh     typed-tag guards G1-G3
-#                  selector_1f_costing.sh         per-TU candidate costing
+#                  selector_1f_costing.sh         per-TU candidate costing (differential basis)
+#                  selector_live_history.sh       the LIVE selected history (added by ruling)
 #
 # FAIL CLOSED, and the whole point is that it can fail: every step's EXIT STATUS is required,
 # a step that fails aborts the run non-zero, and the summary is printed from recorded results
@@ -123,6 +124,8 @@ step selector_step2_equivalence -- env S1="$REF_BIN" S2="$BIN" MX="$MX" \
      WORK="$WORK/step2" OUT="$WORK/step2/evidence" "$HERE/selector_step2_equivalence.sh"
 step selector_1f_costing -- env BIN="$BIN" MX="$MX" \
      WORK="$WORK/costing" OUT="$WORK/costing/results" "$HERE/selector_1f_costing.sh"
+step selector_live_history -- env BIN="$BIN" MX="$MX" \
+     WORK="$WORK/livehist" OUT="$WORK/livehist/results" "$HERE/selector_live_history.sh"
 
 # A runner whose failure path is never exercised is the thing this lane keeps finding.  This
 # injects a failing step on demand so the propagation can be checked rather than assumed.

@@ -858,7 +858,7 @@ static constexpr std::array<const char*,8> componentRawNames={
 };
 
 int main(int argc,char**argv){
-    const char* manifest=nullptr;const char*residualDumpPath=nullptr;const char*mixedDumpPrefix=nullptr;const char*curveTsvPath=nullptr;const char*literalGroupPrefix=nullptr;const char*literalGroupWirePath=nullptr;const char*cfSinkPath=nullptr;const char*fcSinkPath=nullptr;const char*sinkCurvePath=nullptr; size_t sinkBuildTus=0; bool sinkReplay=false,literalOnDemand=false,selftestTags=false,selftestBadRoot=false; size_t routeCount=0; const char*selectorTsvPath=nullptr; size_t max_files=SIZE_MAX,entropyRestartTus=0,replayRepetitions=1,literalGroupTus=0,literalGroupWorkers=1; int zlevel=3,literalZLevel=-1,arrayZLevel=-1,blobZLevel=-1,halfColdBit=-1,blobCanonicalLevel=9; uint32_t sourceAdmitRatio=6,blobThreads=4,blobZstdWorkers=0,blobZstdJobMiB=0,blobZstdOverlapLog=0,blobFallbackEvery=0,s1MinMatch=3,s1MaxChain=1024; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, usePriorRoot=false,useSortedLines=false,useByteArrayLines=false,useMixedRegions=false,useProjectSource=false,useKeyMap=false,useDirectOrdinals=false,useCompressedBlobs=false,useBlobEagerPatches=true,useMoFactor=false,traceMo=false,useAlphaLines=false,useResidualLdm=false,splitControlCeiling=false,structureCeiling=false,literalGroupEvaluateZstd10=true,stableRootTags=false,openFinalEntropy=false;
+    const char* manifest=nullptr;const char*residualDumpPath=nullptr;const char*mixedDumpPrefix=nullptr;const char*curveTsvPath=nullptr;const char*literalGroupPrefix=nullptr;const char*literalGroupWirePath=nullptr;const char*cfSinkPath=nullptr;const char*fcSinkPath=nullptr;const char*sinkCurvePath=nullptr; size_t sinkBuildTus=0; bool sinkReplay=false,literalOnDemand=false,selftestTags=false,selftestBadRoot=false,liveSelector=false; size_t routeCount=0; const char*selectorTsvPath=nullptr; size_t max_files=SIZE_MAX,entropyRestartTus=0,replayRepetitions=1,literalGroupTus=0,literalGroupWorkers=1; int zlevel=3,literalZLevel=-1,arrayZLevel=-1,blobZLevel=-1,halfColdBit=-1,blobCanonicalLevel=9; uint32_t sourceAdmitRatio=6,blobThreads=4,blobZstdWorkers=0,blobZstdJobMiB=0,blobZstdOverlapLog=0,blobFallbackEvery=0,s1MinMatch=3,s1MaxChain=1024; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, usePriorRoot=false,useSortedLines=false,useByteArrayLines=false,useMixedRegions=false,useProjectSource=false,useKeyMap=false,useDirectOrdinals=false,useCompressedBlobs=false,useBlobEagerPatches=true,useMoFactor=false,traceMo=false,useAlphaLines=false,useResidualLdm=false,splitControlCeiling=false,structureCeiling=false,literalGroupEvaluateZstd10=true,stableRootTags=false,openFinalEntropy=false;
     const char*blobDumpPath=nullptr;const char*componentCurveTsvPath=nullptr;
     for(int i=1;i<argc;++i){ if(!strcmp(argv[i],"--manifest")&&i+1<argc)manifest=argv[++i];
         else if(!strcmp(argv[i],"--z")&&i+1<argc)zlevel=atoi(argv[++i]);
@@ -900,6 +900,7 @@ int main(int argc,char**argv){
             if(v!=1){fprintf(stderr,"--route-s1 %llu: multi-route is not yet materialized; only 1 is supported\n",v);return 2;}
             routeCount=size_t(v);}
         else if(!strcmp(argv[i],"--selector-tsv")&&i+1<argc)selectorTsvPath=argv[++i];
+        else if(!strcmp(argv[i],"--live-selector"))liveSelector=true;
         else if(!strcmp(argv[i],"--selftest-tags"))selftestTags=true;
         else if(!strcmp(argv[i],"--selftest-bad-root"))selftestBadRoot=true;
         else if(!strcmp(argv[i],"--sink-curve")&&i+1<argc)sinkCurvePath=argv[++i];
@@ -991,6 +992,11 @@ int main(int argc,char**argv){
     // The full-total closure is measured off the physical stream, so the sinks are not
     // optional in this mode -- without them there is nothing to check the costing against.
     if(selectorTsvPath&&!cfSinkPath){fprintf(stderr,"--selector-tsv requires --cf-sink/--fc-sink: the totals are measured from the physical stream\n");return 2;}
+    // Live selection changes the WIRE, so it must never be reachable without the physical
+    // streams and the per-TU record that report it.  Without this flag the codec is
+    // byte-identical to before, which is what keeps the equivalence gates meaningful.
+    if(liveSelector&&!selectorTsvPath){fprintf(stderr,"--live-selector requires --selector-tsv: a selection nobody records is not a measurement\n");return 2;}
+    if(liveSelector&&usePriorRoot){fprintf(stderr,"--live-selector is incompatible with the prior-Root path\n");return 2;}
     if(sinkBuildTus&&!cfSinkPath){fprintf(stderr,"--sink-build-tus requires --cf-sink\n");return 2;}
     if(cfSinkPath&&!fcSinkPath){fprintf(stderr,"--cf-sink requires --fc-sink: the reverse direction is reported, never dropped\n");return 2;}
     // Without S1 there are no Blocks and no route matcher, so --route-s1 would exit 0 having
@@ -1217,7 +1223,7 @@ int main(int argc,char**argv){
     alpha_line::Stats alphaStats;
     uint64_t preloadedRegionBytes=0,preloadedRegionCount=0,associatedRegionCount=0;double mixedAssociationWire=0,mixedMissingRequestWire=0;
     const double FRAME=4;   // 4-byte length prefix per framed message (the ACCOUNTING charge)
-    struct SelRow{size_t tu;uint64_t rawRootRaw,rawRootZ,globalRootRaw,globalRootZ,newBlocks,defRaw,defZ,common,globalFull,rawFull;};
+    struct SelRow{size_t tu;uint64_t rawRootRaw,rawRootZ,globalRootRaw,globalRootZ,newBlocks,defRaw,defZ,common,globalFull,rawFull;bool chosenRaw;};
     std::vector<SelRow> selRows; uint64_t closureChecked=0,manifestChecks=0,tuRootFrame=0,tuBlockFrame=0,fullTotalChecks=0,sumDelta=0; std::vector<uint32_t> tuManifest; std::vector<uint32_t> costedBlocks;
     WireSink cfSink,fcSink;   // the PHYSICAL streams: 5-byte typed header per frame
     std::vector<uint64_t>sinkCfOff(TUs),sinkFcOff(TUs),sinkCfFrames(TUs),sinkFcFrames(TUs);
@@ -1374,7 +1380,7 @@ int main(int argc,char**argv){
             requiredBlockStamp.resize(nblk,0); FrequiredBlockStamp.resize(nblk,0); }
           if(!admitRegionKeys(uint32_t(nreg))) return 2; }
         const bool endOfEntropyStream=(!openFinalEntropy&&t+1==TUs)||(entropyRestartTus&&(t+1)%entropyRestartTus==0);
-        const uint32_t* tk=curTok.data(); size_t tn=curTok.size();
+        const uint32_t* tk=curTok.data(); size_t tn=curTok.size();   // re-taken if live selection swaps curTok
         // ROOT is available to F before its MISSING reply.  With a key map, C first associates every
         // newly-mentioned conversation-dense Region id with its stable key; F binds cache hits and
         // independently returns the exact missing closure.  The legacy cold path is left byte-identical.
@@ -1400,9 +1406,10 @@ int main(int argc,char**argv){
             // C prices candidates from ITS OWN mirror of what F holds (fknownBlk).  Reading
             // the decoder's Fblocks would be C consulting F-private state, which the real
             // sender cannot do -- mirror-vs-F divergence is a post-Ack gate, not an input.
-            std::vector<uint8_t> rawRoot;
-            for(size_t i=roff[t];i<roff[t+1];++i)
-                put_varint(rawRoot,stableRootTags?uint64_t(region_tag(allreg[i])):uint64_t(allreg[i]));
+            std::vector<uint8_t> rawRoot; std::vector<uint32_t> rawRootTags;
+            for(size_t i=roff[t];i<roff[t+1];++i){
+                rawRootTags.push_back(region_tag(allreg[i]));
+                put_varint(rawRoot,stableRootTags?uint64_t(region_tag(allreg[i])):uint64_t(allreg[i]));}
             std::vector<uint8_t> costDst;
             // The UNIQUE ORDERED closure: a Block named twice in one Root is defined once.
             std::vector<uint32_t> costBlocks; 
@@ -1456,10 +1463,36 @@ int main(int argc,char**argv){
             const size_t rawZ=zstd_size(z,rawRoot.data(),rawRoot.size(),zlevel,costDst)+hdr;
             const size_t globalZ=zstd_size(z,rootb.data(),rootb.size(),zlevel,costDst)+hdr;
             const size_t defZ=costDef.empty()?0:zstd_size(z,costDef.data(),costDef.size(),zlevel,costDst)+hdr;
+            // --- LIVE SELECTION ------------------------------------------------------
+            // Selection is a choice of WHICH TOKEN SEQUENCE this TU sends, nothing more.
+            // Replacing curTok with the raw Region tags makes every downstream stage do the
+            // right thing on its own: no Block is required, so none is demanded of F, none is
+            // defined on the wire, and fknownBlk is not marked -- which is exactly what gives
+            // the SELECTED history its holes.  The alternative, special-casing each stage,
+            // would have left one of them consulting the global plan.
+            //
+            // Note what does NOT need rolling back at 1F: the matcher's occurrence history is
+            // the TU's Region sequence, which is identical under either candidate, and the
+            // plan does not feed back into matcher state.  So the 1F live selector is a pure
+            // wire-side choice.  prepare/commit/abort becomes load-bearing at 2F+, where a
+            // route's history is a holed subsequence and therefore choice-dependent.
+            bool chooseRaw=false;
+            if(liveSelector){
+                // Ties go to GLOBAL: it leaves F holding the Block, which can only help later
+                // TUs, so a tie is not really a tie over the rest of the build.
+                chooseRaw = rawZ < globalZ+defZ;
+                if(chooseRaw){
+                    curTok.assign(rawRootTags.begin(),rawRootTags.end());
+                    tk=curTok.data(); tn=curTok.size();
+                    rootb=rawRoot;
+                    costBlocks.clear(); costDef.clear();
+                }
+            }
             costedBlocks=costBlocks;   // checked against the real manifest below
             selRows.push_back({t,uint64_t(rawRoot.size()),uint64_t(rawZ),
-                               uint64_t(rootb.size()),uint64_t(globalZ),
-                               uint64_t(costBlocks.size()),uint64_t(costDef.size()),uint64_t(defZ),0,0,0});
+                               uint64_t(rootb.size()),uint64_t(chooseRaw?rawZ:globalZ),
+                               uint64_t(costBlocks.size()),uint64_t(costDef.size()),
+                               uint64_t(chooseRaw?0:defZ),0,0,0,chooseRaw});
             tuRootFrame=0; tuBlockFrame=0; tuManifest.clear();
         }
         std::vector<uint32_t> missReg,missBlk,associationRegs,requiredRegions,requiredBlocks;
@@ -2640,11 +2673,15 @@ int main(int argc,char**argv){
       uint64_t rawCum=0,globalCum=0,rawWins=0,globalWins=0,ties=0;
       for(const SelRow&r:selRows){
         const uint64_t g=r.globalRootZ+r.defZ;
-        // Deterministic tie rule: fewer newly-installed Blocks first, then RAW.
-        // Deterministic tie rule: fewer newly-installed Blocks first, then RAW.
-        const char*win = g<r.rawRootZ ? "GLOBAL_S1" : (g>r.rawRootZ ? "RAW" : (r.newBlocks?"RAW":"RAW"));
-        (void)0;
-        if(g<r.rawRootZ)++globalWins; else if(g>r.rawRootZ)++rawWins; else ++ties;
+        // With --live-selector the winner is what this TU ACTUALLY SENT, not a comparison
+        // re-derived here; the row's own columns already describe the chosen candidate.
+        // Without it the row is the differential on the always-GLOBAL baseline, and the
+        // comparison below is the report.  Ties go to GLOBAL either way: leaving F holding
+        // the Block can only help later TUs, so a tie now is not a tie over the build.
+        const char*win = liveSelector ? (r.chosenRaw?"RAW":"GLOBAL_S1")
+                       : (g<r.rawRootZ ? "GLOBAL_S1" : (g>r.rawRootZ ? "RAW" : "GLOBAL_S1"));
+        if(liveSelector){ if(r.chosenRaw)++rawWins; else ++globalWins; }
+        else if(g<r.rawRootZ)++globalWins; else if(g>r.rawRootZ)++rawWins; else ++ties;
         rawCum+=r.rawRootZ; globalCum+=g;
         if(fprintf(f,"%zu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%s\n",r.tu,
             (unsigned long long)r.rawRootRaw,(unsigned long long)r.rawRootZ,
@@ -2669,6 +2706,9 @@ int main(int argc,char**argv){
       }
       uint64_t rawFullCum=0,globalFullCum=0;
       for(const SelRow&r:selRows){rawFullCum+=r.rawFull;globalFullCum+=r.globalFull;}
+      printf("SELECTOR basis: %s\n", liveSelector
+          ? "LIVE selected history -- each TU sent the winner, and F's Block knowledge has the resulting holes"
+          : "differential on the always-GLOBAL baseline -- every TU sent GLOBAL_S1; RAW is priced, not sent");
       printf("SELECTOR per-TU costing: rows=%zu raw_cum=%llu global_cum=%llu wins[RAW=%llu GLOBAL_S1=%llu tie=%llu]\n",
           selRows.size(),(unsigned long long)rawCum,(unsigned long long)globalCum,
           (unsigned long long)rawWins,(unsigned long long)globalWins,(unsigned long long)ties);
