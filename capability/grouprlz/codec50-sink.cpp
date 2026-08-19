@@ -1354,6 +1354,17 @@ int main(int argc,char**argv){
             // never in the route's occurrence sequence.  The sequence is holed relative to
             // GLOBAL because of scheduler ROUTING, which at 1F means not at all.
             //
+            // HONEST LABEL: at 1F this transaction is behaviourally a NO-OP.  One route sees
+            // GLOBAL's whole sequence, and the occurrence history it commits is identical
+            // under either candidate, so nothing observable would change if the route simply
+            // admitted.  It is wired as a real transaction anyway, deliberately: "route
+            // history advances after every ACKed exact TU, regardless of which candidate
+            // won" is the invariant that GENERALISES, and a 1F gate that took the wire-side
+            // shortcut would leave 2F to inherit untested code and would rest the seam on a
+            // path nothing exercises.  So the no-op is the point, not a defect -- and saying
+            // so here is better than letting a later reader infer that 1F proves the
+            // transaction works.
+            //
             // The reference below stays valid until commit()/abort() at the end of this
             // iteration; nothing else touches the matcher in between.
             const p29::TuPlan* wirePlan=&plan;

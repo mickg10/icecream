@@ -38,22 +38,35 @@ CELL=${CELL:-fmt/debian-gcc}
 CXX_OPT=${CXX_OPT:--std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror}
 CXX_SAN=${CXX_SAN:--std=c++17 -O1 -g -fsanitize=address,undefined -Wall -Wextra -Wpedantic -Werror}
 
-mkdir -p "$WORK/logs"
 NAMES=(); STATUS=()
 
 die() { echo "ACCEPTANCE ABORTED: $*" >&2; exit 1; }
+mkdir -p "$WORK/logs"
 
 [ -x "$BIN" ] || die "codec binary not executable: $BIN (build with ./selector_build_codec50_sink.sh)"
 [ -d "$MX" ] || die "ii-matrix not found: $MX"
 # Required, not silently skipped: step 2 compares a reference build against the build under
 # test, and a comparison with nothing to compare against is not a weaker gate, it is no gate.
+#
+# But "REF_BIN is executable" does not make it a REFERENCE.  Pointing it at the build under
+# test turns step 2 into current-vs-current -- which passes trivially and still reports every
+# step green.  So the reference commit is NAMED here, and a REF_BIN byte-identical to BIN is
+# rejected outright.  Both binaries' SHA-256s go into the log, so what a green run compared is
+# recoverable from the record rather than from whoever ran it.
+REF_COMMIT=749ca47c7ed21b1997cd87c81158e85d5bb4c653   # T_current step 1: on-demand one-TU literals
 [ -n "${REF_BIN:-}" ] && [ -x "$REF_BIN" ] || die \
-"REF_BIN must point at a reference codec50-sink build (the commit step 2 compares against).
+"REF_BIN must point at a build of the step-1 reference commit
+     $REF_COMMIT
    Build one with:
-     git show <ref-commit>:capability/grouprlz/codec50-sink.cpp > <dir>/codec50-sink.cpp
+     git show $REF_COMMIT:capability/grouprlz/codec50-sink.cpp > <dir>/codec50-sink.cpp
      cp $HERE/*.h <dir>/ && (cd <dir> && g++ -O3 -march=native -std=c++17 -fopenmp \\
         -DWITH_BSC_GROUPS -I. -I\$HOME/libbsc/libbsc codec50-sink.cpp -o codec50-sink \\
         \$HOME/grouprlz/libbsc.a /usr/lib/x86_64-linux-gnu/libzstd.a -lz -lpthread)"
+cmp -s "$REF_BIN" "$BIN" && die \
+"REF_BIN is byte-identical to BIN, so step 2 would compare the build under test with itself.
+   REF_BIN must be a build of $REF_COMMIT."
+BIN_SHA=$(sha256sum "$BIN" | cut -d' ' -f1)
+REF_SHA=$(sha256sum "$REF_BIN" | cut -d' ' -f1)
 
 step() { # step <name> -- <command...>
   local name=$1; shift 2
@@ -71,6 +84,10 @@ step() { # step <name> -- <command...>
 }
 
 summary() {
+  echo
+  printf 'build under test  %s  sha256=%s\n' "$BIN" "$BIN_SHA"
+  printf 'step-1 reference  %s  sha256=%s\n' "$REF_BIN" "$REF_SHA"
+  printf 'reference commit  %s\n' "$REF_COMMIT"
   echo
   printf '%-38s %s\n' STEP RESULT
   local i

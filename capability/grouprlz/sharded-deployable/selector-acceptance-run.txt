@@ -27,9 +27,13 @@
 === selector_step2_equivalence
     # 10/10 cells: streams byte-identical and legacy TOTAL unchanged, every run exited 0 and byte-exact
 === selector_1f_costing
-    all 5 cell(s) passed every check; results in /tmp/fin/acc/costing/results/selector-1f-per-tu-costing.tsv
+    all 5 cell(s) passed every check; results in /tmp/fin2/costing/results/selector-1f-per-tu-costing.tsv
 === selector_live_history
     A positive delta means live sent FEWER bytes than always-ROUTE_S1.
+
+build under test  /tmp/tagreg/build9/codec50-sink  sha256=b407ab0a25742592d57f726ae4753efdf58098e96b16e7c1ab70b36d57726683
+step-1 reference  /tmp/tagreg/ref749/codec50-sink  sha256=bdd746f19bab2852e9937b67c52a71c40e3eb4aa859b7d0d0d8c359471764827
+reference commit  749ca47c7ed21b1997cd87c81158e85d5bb4c653
 
 STEP                                   RESULT
 p29_online_s1_test (opt)               PASS
@@ -49,5 +53,5 @@ selector_step2_equivalence             PASS
 selector_1f_costing                    PASS
 selector_live_history                  PASS
 
-logs: /tmp/fin/acc/logs
+logs: /tmp/fin2/logs
 acceptance set: 16/16 steps passed

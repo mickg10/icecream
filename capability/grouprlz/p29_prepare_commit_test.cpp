@@ -151,6 +151,10 @@ int main() {
     // pointing FORWARD of the position being matched, whose successor link is kNone, so the
     // chain ENDS rather than being exhausted by a budget of one.  Two fixtures failing for
     // two different reasons is worth more than one, and neither is load-bearing alone.
+    //
+    // TEMPORARY, by ruling: once the live two-route fixture exercises this same six-deep
+    // chain, 4c folds into it and this duplicate should be REMOVED rather than left to
+    // accumulate.  Recorded here so the removal is a scheduled step and not a discovery.
     // The control never sees the aborted TU; the test prepares and aborts it in between.
     {
         p29::BlockCatalogue cc, ct;
