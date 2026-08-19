@@ -71,7 +71,8 @@ int main() {
   capm5::ExactRoutingState::Undo first_undo;
   const auto first = state.apply(0, 0, first_undo);
   state.rollback(first_undo);
-  check(state.c_to_f_bytes() == 0 && state.makespan_ns() == 0,
+  check(state.c_to_f_bytes() == 0 && state.f_to_c_bytes() == 0 &&
+            state.makespan_ns() == 0,
         "rollback did not restore exact routing totals");
   capm5::ExactRoutingState::Undo repeated_undo;
   const auto repeated = state.apply(0, 0, repeated_undo);
@@ -83,6 +84,8 @@ int main() {
 
   capm5::ExactRoutingState::Undo warm_undo;
   const auto warm = state.apply(1, 0, warm_undo);
+  check(warm.root_start_ns >= repeated.relationship_ready_ns,
+        "same-F dialogue spent state before the prior final Ack");
   state.rollback(warm_undo);
   capm5::ExactRoutingState::Undo cold_undo;
   const auto cold = state.apply(1, 1, cold_undo);
@@ -101,7 +104,10 @@ int main() {
   const auto replay = capm5::exact_routing_replay(model, config, {0, 0});
   check(replay.rows.size() == 2 &&
             replay.event_c_to_f ==
-                replay.rows[0].cost.total() + replay.rows[1].cost.total(),
+                replay.rows[0].cost.total() + replay.rows[1].cost.total() &&
+            replay.event_f_to_c == replay.rows[0].cost.f_total() +
+                                       replay.rows[1].cost.f_total() &&
+            replay.event_f_to_c > 0,
         "exact replay event ledger does not close");
   check(replay.rows[0].cost.total() == first.cost.total() &&
             replay.rows[1].cost.total() == warm.cost.total(),
@@ -127,6 +133,20 @@ int main() {
   check(time_r5.feasible.rows[0].worker !=
             time_r5.feasible.rows[1].worker,
         "time-weighted exact R5 did not use available compiler parallelism");
+
+  const auto parallel = capm5::exact_routing_replay(model, config, {0, 1});
+  check(parallel.rows[1].root_start_ns <
+            parallel.rows[0].relationship_ready_ns,
+        "independent F relationships did not overlap");
+
+  capm5::ExactRoutingConfig delayed_config = config;
+  delayed_config.one_way_latency_ns = 1000;
+  const auto delayed =
+      capm5::exact_routing_replay(model, delayed_config, {0, 0});
+  check(delayed.makespan_ns > replay.makespan_ns &&
+            delayed.rows[1].root_start_ns >=
+                delayed.rows[0].relationship_ready_ns,
+        "configured dialogue latency did not reach scheduling state");
 
   std::printf("cap_m5_exact_routing_test: PASS\n");
   return 0;

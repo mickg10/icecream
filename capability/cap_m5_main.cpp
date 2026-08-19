@@ -76,6 +76,8 @@ struct Options {
   std::vector<uint32_t> exact_compiler_slots;
   uint32_t exact_egress_lanes = 0;
   uint64_t exact_link_bits_per_second = 1000000000ULL;
+  uint64_t exact_f_to_c_bits_per_second = 1000000000ULL;
+  uint64_t exact_one_way_latency_ns = 0;
   uint64_t exact_compiler_bytes_per_second = 500000000ULL;
   uint64_t exact_time_weight_bytes = 0, exact_time_weight_ns = 1;
   size_t exact_r5_horizon = 4, exact_r5_beam = 64;
@@ -1303,6 +1305,9 @@ static int run_coordinator(const Corpus &corpus, const Interner &dict,
     exactConfig.compiler_slots = options.exact_compiler_slots;
     exactConfig.egress_lanes = options.exact_egress_lanes;
     exactConfig.link_bits_per_second = options.exact_link_bits_per_second;
+    exactConfig.f_to_c_bits_per_second =
+        options.exact_f_to_c_bits_per_second;
+    exactConfig.one_way_latency_ns = options.exact_one_way_latency_ns;
     exactConfig.codec = options.policy;
     if (options.assignment == AssignmentMode::ExactR5) {
       capm5::ExactR5Options search;
@@ -1333,22 +1338,26 @@ static int run_coordinator(const Corpus &corpus, const Interner &dict,
       }
       const double effectiveWidth = squared ? 1.0 / squared : 0.0;
       printf("EXACT_R5_SEARCH tus=%zu workers=%u event_c_to_f=%llu "
+             "event_f_to_c=%llu "
              "makespan_ns=%llu horizon=%zu beam=%zu expanded=%llu "
              "pruned=%llu symmetry_collapsed=%llu\n",
              sequence.size(), options.workers,
              (unsigned long long)exactRouting.event_c_to_f,
+             (unsigned long long)exactRouting.event_f_to_c,
              (unsigned long long)exactRouting.makespan_ns, bounded.horizon,
              bounded.beam_width,
              (unsigned long long)bounded.expanded_paths,
              (unsigned long long)bounded.pruned_paths,
              (unsigned long long)bounded.symmetric_actions_collapsed);
-      printf("ROUTING_ESTIMATE schema=exact-m5-event-v1 "
+      printf("ROUTING_ESTIMATE schema=exact-m5-dialogue-v2 "
              "policy=R5_EXACT_BOUNDED tus=%zu workers=%u "
-             "estimated_c_to_f=%llu makespan_ns=%llu N_eff=%.9f "
+             "estimated_c_to_f=%llu estimated_f_to_c=%llu "
+             "makespan_ns=%llu N_eff=%.9f "
              "H_route=%.9f r5_horizon=%zu r5_beam=%zu "
              "r5_expanded=%llu r5_pruned=%llu r5_symmetry=%llu\n",
              sequence.size(), options.workers,
              (unsigned long long)exactRouting.event_c_to_f,
+             (unsigned long long)exactRouting.event_f_to_c,
              (unsigned long long)exactRouting.makespan_ns, effectiveWidth,
              routeEntropy, bounded.horizon, bounded.beam_width,
              (unsigned long long)bounded.expanded_paths,
@@ -1363,15 +1372,24 @@ static int run_coordinator(const Corpus &corpus, const Interner &dict,
       if (options.exact_plan_only) {
         if (options.curve_out) {
           std::ofstream curveOut(options.curve_out);
-          curveOut << "logical\tworker\traw\texact_c_to_f\t"
+          curveOut << "logical\tworker\traw\texact_c_to_f\texact_f_to_c\t"
+                      "root_start_ns\troot_finish_ns\tneed_finish_ns\t"
+                      "fill_start_ns\tfill_finish_ns\tcommit_start_ns\t"
+                      "commit_finish_ns\trelationship_ready_ns\t"
                       "transfer_start_ns\ttransfer_finish_ns\t"
                       "compile_start_ns\tcompile_finish_ns\n";
           for (size_t index = 0; index < exactRouting.rows.size(); ++index) {
             const auto &row = exactRouting.rows[index];
             curveOut << row.logical << '\t' << row.worker << '\t'
                      << exactModel.tus[index].raw_bytes << '\t'
-                     << row.cost.total() << '\t' << row.transfer_start_ns
-                     << '\t' << row.transfer_finish_ns << '\t'
+                     << row.cost.total() << '\t' << row.cost.f_total() << '\t'
+                     << row.root_start_ns << '\t' << row.root_finish_ns << '\t'
+                     << row.need_finish_ns << '\t' << row.fill_start_ns << '\t'
+                     << row.fill_finish_ns << '\t' << row.commit_start_ns << '\t'
+                     << row.commit_finish_ns << '\t'
+                     << row.relationship_ready_ns << '\t'
+                     << row.transfer_start_ns << '\t'
+                     << row.transfer_finish_ns << '\t'
                      << row.compile_start_ns << '\t' << row.compile_finish_ns
                      << '\n';
           }
@@ -1998,12 +2016,16 @@ static int run_coordinator(const Corpus &corpus, const Interner &dict,
   }
   bool exactRoutingClosure = !options.exact_cost_check;
   if (options.exact_cost_check) {
-    uint64_t exactRoot = 0, exactFill = 0, exactControl = 0;
+    uint64_t exactRoot = 0, exactFill = 0, exactControl = 0,
+             exactNeed = 0, exactFControl = 0;
     const auto exactHello = capp::pack_hello_m4(
         generation, 0, 0, uint32_t(corpus.files.size()), options.repetitions);
     const uint64_t lifecycleControl =
         uint64_t(options.workers) * (4 + exactHello.size() + 4);
     exactRoutingClosure = exactRouting.rows.size() == curve.size();
+    std::vector<size_t> lastByWorker(options.workers, SIZE_MAX);
+    for (size_t index = 0; index < exactRouting.rows.size(); ++index)
+      lastByWorker[exactRouting.rows[index].worker] = index;
     bool mismatchReported = false;
     for (size_t index = 0; index < exactRouting.rows.size() &&
                            index < curve.size();
@@ -2013,19 +2035,39 @@ static int run_coordinator(const Corpus &corpus, const Interner &dict,
       exactRoot += expected.cost.c_root;
       exactFill += expected.cost.c_fill;
       exactControl += expected.cost.c_control;
+      exactNeed += expected.cost.f_need;
+      exactFControl +=
+          expected.cost.f_prepare_ack + expected.cost.f_final_ack;
+      const bool relationshipLast =
+          expected.worker < lastByWorker.size() &&
+          lastByWorker[expected.worker] == index;
       const bool rowMatches = expected.logical == actual.logical &&
                               expected.worker == actual.worker &&
                               expected.cost.c_root == actual.c_root &&
-                              expected.cost.c_fill == actual.c_fill;
+                              expected.cost.c_fill == actual.c_fill &&
+                              expected.cost.f_need == actual.f_need &&
+                              (relationshipLast
+                                   ? expected.cost.f_prepare_ack +
+                                             expected.cost.f_final_ack <=
+                                         actual.f_control
+                                   : expected.cost.f_prepare_ack +
+                                             expected.cost.f_final_ack ==
+                                         actual.f_control);
       if (!rowMatches && !mismatchReported) {
         fprintf(stderr,
                 "exact routing mismatch row=%zu logical=%u/%u worker=%u/%u "
-                "root=%llu/%llu fill=%llu/%llu\n",
+                "root=%llu/%llu fill=%llu/%llu need=%llu/%llu "
+                "f_control=%llu/%llu\n",
                 index, expected.logical, actual.logical, expected.worker,
                 actual.worker, (unsigned long long)expected.cost.c_root,
                 (unsigned long long)actual.c_root,
                 (unsigned long long)expected.cost.c_fill,
-                (unsigned long long)actual.c_fill);
+                (unsigned long long)actual.c_fill,
+                (unsigned long long)expected.cost.f_need,
+                (unsigned long long)actual.f_need,
+                (unsigned long long)(expected.cost.f_prepare_ack +
+                                     expected.cost.f_final_ack),
+                (unsigned long long)actual.f_control);
         mismatchReported = true;
       }
       exactRoutingClosure = exactRoutingClosure && rowMatches;
@@ -2034,15 +2076,23 @@ static int run_coordinator(const Corpus &corpus, const Interner &dict,
         exactRoutingClosure && exactRoot == curveCRoot &&
         exactFill == curveCFill &&
         exactControl + lifecycleControl == curveCControl &&
-        exactRouting.event_c_to_f == exactRoot + exactFill + exactControl;
+        exactNeed == curveFNeed && exactFControl <= curveFControl &&
+        exactRouting.event_c_to_f == exactRoot + exactFill + exactControl &&
+        exactRouting.event_f_to_c == exactNeed + exactFControl;
     if (!exactRoutingClosure)
       exact = false;
-    printf("EXACT_ROUTING_COST event_c_to_f=%llu root=%llu fill=%llu "
-           "control=%llu lifecycle_control=%llu closure=%s\n",
+    const uint64_t fLifecycleControl =
+        curveFControl >= exactFControl ? curveFControl - exactFControl : 0;
+    printf("EXACT_ROUTING_COST event_c_to_f=%llu event_f_to_c=%llu "
+           "root=%llu fill=%llu control=%llu need=%llu f_control=%llu "
+           "c_lifecycle_control=%llu f_lifecycle_control=%llu closure=%s\n",
            (unsigned long long)exactRouting.event_c_to_f,
+           (unsigned long long)exactRouting.event_f_to_c,
            (unsigned long long)exactRoot, (unsigned long long)exactFill,
-           (unsigned long long)exactControl,
+           (unsigned long long)exactControl, (unsigned long long)exactNeed,
+           (unsigned long long)exactFControl,
            (unsigned long long)lifecycleControl,
+           (unsigned long long)fLifecycleControl,
            exactRoutingClosure ? "OK" : "FAIL");
   }
   if (curveWire != socketBytes || curveCToF != socketCToF ||
@@ -2429,6 +2479,13 @@ int main(int argc, char **argv) {
       if (!parse_u64(argv[++i], options.exact_link_bits_per_second) ||
           !options.exact_link_bits_per_second)
         return 2;
+    } else if (!strcmp(argv[i], "--f-to-c-link-bps") && i + 1 < argc) {
+      if (!parse_u64(argv[++i], options.exact_f_to_c_bits_per_second) ||
+          !options.exact_f_to_c_bits_per_second)
+        return 2;
+    } else if (!strcmp(argv[i], "--one-way-latency-ns") && i + 1 < argc) {
+      if (!parse_u64(argv[++i], options.exact_one_way_latency_ns))
+        return 2;
     } else if (!strcmp(argv[i], "--compiler-bps") && i + 1 < argc) {
       if (!parse_u64(argv[++i], options.exact_compiler_bytes_per_second) ||
           !options.exact_compiler_bytes_per_second)
@@ -2534,6 +2591,7 @@ int main(int argc, char **argv) {
             "roundrobin|sticky|random|failover|exact-r5 | "
             "--assignment-file PATH] [--assignment-out PATH] "
             "[--slots N,...] [--egress-lanes N] [--link-bps N] "
+            "[--f-to-c-link-bps N] [--one-way-latency-ns N] "
             "[--compiler-bps N] [--time-weight NUM DEN] "
             "[--r5-horizon N] [--r5-beam N] "
             "[--snapshot50-prefix PATH] "

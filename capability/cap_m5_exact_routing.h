@@ -1,6 +1,7 @@
 #pragma once
 
-// Socket-free exact C->F event accounting for the protocol-50 M5 codec.
+// Socket-free exact Root -> Need -> Fill -> Ack dialogue accounting for the
+// protocol-50 M5 codec.
 //
 // The ordinary routing planner operates on independently compressed Region
 // estimates.  That is useful for causal policies, but it cannot serve as the
@@ -8,7 +9,10 @@
 // path dependent.  This state applies the real component serializer against
 // the real shared-C authority and one ReceiverMirror per F.  Every transition
 // can be committed or rolled back, so bounded search can explore futures
-// without copying the complete catalogue for every branch.
+// without copying the complete catalogue for every branch.  C->F bytes remain
+// the optimization score; exact F->C bytes and the request/reply dependency
+// participate in time.  A selected F cannot spend state until that
+// relationship's final Ack has returned.
 
 #include "cap_codec.h"
 #include "cap_m5_state.h"
@@ -44,6 +48,8 @@ struct ExactRoutingConfig {
   std::vector<uint32_t> compiler_slots;
   uint32_t egress_lanes = 1;
   uint64_t link_bits_per_second = 1000000000ULL;
+  uint64_t f_to_c_bits_per_second = 1000000000ULL;
+  uint64_t one_way_latency_ns = 0;
   capp::CodecPolicy codec = capp::CodecPolicy::Zstd1;
 };
 
@@ -51,6 +57,9 @@ struct ExactRoutingCost {
   uint64_t c_root = 0;
   uint64_t c_fill = 0;
   uint64_t c_control = 0;
+  uint64_t f_need = 0;
+  uint64_t f_prepare_ack = 0;
+  uint64_t f_final_ack = 0;
 
   uint64_t total() const {
     if (c_fill > std::numeric_limits<uint64_t>::max() - c_root ||
@@ -58,12 +67,28 @@ struct ExactRoutingCost {
       throw std::overflow_error("exact M5 event total overflow");
     return c_root + c_fill + c_control;
   }
+
+  uint64_t f_total() const {
+    if (f_prepare_ack > std::numeric_limits<uint64_t>::max() - f_need ||
+        f_final_ack >
+            std::numeric_limits<uint64_t>::max() - f_need - f_prepare_ack)
+      throw std::overflow_error("exact M5 F-to-C event total overflow");
+    return f_need + f_prepare_ack + f_final_ack;
+  }
 };
 
 struct ExactRoutingAction {
   uint32_t logical = 0;
   uint32_t worker = 0;
   ExactRoutingCost cost;
+  uint64_t root_start_ns = 0;
+  uint64_t root_finish_ns = 0;
+  uint64_t need_finish_ns = 0;
+  uint64_t fill_start_ns = 0;
+  uint64_t fill_finish_ns = 0;
+  uint64_t commit_start_ns = 0;
+  uint64_t commit_finish_ns = 0;
+  uint64_t relationship_ready_ns = 0;
   uint64_t transfer_start_ns = 0;
   uint64_t transfer_finish_ns = 0;
   uint64_t compile_start_ns = 0;
@@ -73,6 +98,7 @@ struct ExactRoutingAction {
 struct ExactRoutingResult {
   std::vector<ExactRoutingAction> rows;
   uint64_t event_c_to_f = 0;
+  uint64_t event_f_to_c = 0;
   uint64_t makespan_ns = 0;
 };
 
@@ -156,11 +182,12 @@ public:
     std::vector<uint32_t> installed_blocks;
     uint32_t worker = 0;
     uint32_t prior_path_count = 0;
-    size_t egress_lane = 0;
+    std::vector<std::pair<size_t, uint64_t>> egress_before;
     size_t compiler_slot = 0;
-    uint64_t prior_egress_ready_ns = 0;
     uint64_t prior_compiler_ready_ns = 0;
+    uint64_t prior_relationship_ready_ns = 0;
     uint64_t prior_c_to_f = 0;
+    uint64_t prior_f_to_c = 0;
     uint64_t prior_makespan_ns = 0;
     uint64_t prior_worker_commits = 0;
     bool active = false;
@@ -181,6 +208,7 @@ public:
       compiler_ready_ns_[worker].assign(config.compiler_slots[worker], 0);
     }
     egress_ready_ns_.assign(config.egress_lanes, 0);
+    relationship_ready_ns_.assign(config.compiler_slots.size(), 0);
   }
 
   ExactRoutingState(const ExactRoutingState &) = delete;
@@ -188,6 +216,7 @@ public:
 
   size_t workers() const { return mirrors_.size(); }
   uint64_t c_to_f_bytes() const { return c_to_f_bytes_; }
+  uint64_t f_to_c_bytes() const { return f_to_c_bytes_; }
   uint64_t makespan_ns() const { return makespan_ns_; }
 
   // Every exact-mode F starts empty.  Two still-unused Fs with equal compiler
@@ -202,6 +231,8 @@ public:
       if (worker_commits_[worker] == 0) {
         for (uint32_t retained : result)
           if (worker_commits_[retained] == 0 &&
+              relationship_ready_ns_[retained] ==
+                  relationship_ready_ns_[worker] &&
               compiler_ready_ns_[retained] == compiler_ready_ns_[worker]) {
             duplicate = true;
             break;
@@ -224,8 +255,10 @@ public:
     undo.worker = worker;
     undo.prior_path_count = mirror.path_count;
     undo.prior_c_to_f = c_to_f_bytes_;
+    undo.prior_f_to_c = f_to_c_bytes_;
     undo.prior_makespan_ns = makespan_ns_;
     undo.prior_worker_commits = worker_commits_[worker];
+    undo.prior_relationship_ready_ns = relationship_ready_ns_[worker];
 
     std::vector<uint8_t> block_raw;
     size_t definition_count = 0;
@@ -300,20 +333,74 @@ public:
     cost.c_control =
         exact_detail::frame_bytes(capp::pack_tu_ack(tu.logical, true));
 
+    std::vector<uint8_t> need_raw;
+    capc::put_varint(need_raw, missing.size());
+    for (uint32_t region : missing)
+      capc::put_varint(need_raw, region);
+    capc::put_varint(need_raw, 0);
+    const auto need = codec_.encode(need_raw, config_.codec);
+    cost.f_need = exact_detail::frame_bytes(
+        capp::pack_need_m4(tu.logical, need.wire));
+    capp::CacheDropsM5 no_drops;
+    cost.f_prepare_ack = exact_detail::frame_bytes(
+        capp::pack_tu_ack_m5(tu.logical, true, no_drops));
+    cost.f_final_ack = cost.f_prepare_ack;
+
     ExactRoutingAction action;
     action.logical = tu.logical;
     action.worker = worker;
     action.cost = cost;
-    undo.egress_lane = exact_detail::earliest(egress_ready_ns_);
-    undo.prior_egress_ready_ns = egress_ready_ns_[undo.egress_lane];
-    action.transfer_start_ns =
-        std::max(tu.release_ns, undo.prior_egress_ready_ns);
-    action.transfer_finish_ns = exact_detail::checked_add(
-        action.transfer_start_ns,
-        exact_detail::mul_div_ceil(cost.total(), 8000000000ULL,
-                                   config_.link_bits_per_second,
-                                   "exact M5 transfer duration overflow"),
-        "exact M5 transfer finish overflow");
+    const uint64_t relationship_start =
+        std::max(tu.release_ns, undo.prior_relationship_ready_ns);
+    const auto root_send = schedule_c_send(
+        relationship_start, cost.c_root, undo,
+        "exact M5 Root transfer duration overflow");
+    action.root_start_ns = root_send.first;
+    action.root_finish_ns = root_send.second;
+    const uint64_t root_received = with_latency(
+        action.root_finish_ns, "exact M5 Root receive overflow");
+    const uint64_t need_sent = exact_detail::checked_add(
+        root_received,
+        exact_detail::mul_div_ceil(
+            cost.f_need, 8000000000ULL, config_.f_to_c_bits_per_second,
+            "exact M5 Need transfer duration overflow"),
+        "exact M5 Need send overflow");
+    action.need_finish_ns =
+        with_latency(need_sent, "exact M5 Need receive overflow");
+    const auto fill_send = schedule_c_send(
+        action.need_finish_ns, cost.c_fill, undo,
+        "exact M5 Fill transfer duration overflow");
+    action.fill_start_ns = fill_send.first;
+    action.fill_finish_ns = fill_send.second;
+    const uint64_t fill_received = with_latency(
+        action.fill_finish_ns, "exact M5 Fill receive overflow");
+    const uint64_t prepare_ack_sent = exact_detail::checked_add(
+        fill_received,
+        exact_detail::mul_div_ceil(
+            cost.f_prepare_ack, 8000000000ULL,
+            config_.f_to_c_bits_per_second,
+            "exact M5 prepared-Ack transfer duration overflow"),
+        "exact M5 prepared-Ack send overflow");
+    const uint64_t prepare_ack_received = with_latency(
+        prepare_ack_sent, "exact M5 prepared-Ack receive overflow");
+    const auto commit_send = schedule_c_send(
+        prepare_ack_received, cost.c_control, undo,
+        "exact M5 commit transfer duration overflow");
+    action.commit_start_ns = commit_send.first;
+    action.commit_finish_ns = commit_send.second;
+    const uint64_t commit_received = with_latency(
+        action.commit_finish_ns, "exact M5 commit receive overflow");
+    const uint64_t final_ack_sent = exact_detail::checked_add(
+        commit_received,
+        exact_detail::mul_div_ceil(
+            cost.f_final_ack, 8000000000ULL,
+            config_.f_to_c_bits_per_second,
+            "exact M5 final-Ack transfer duration overflow"),
+        "exact M5 final-Ack send overflow");
+    action.relationship_ready_ns = with_latency(
+        final_ack_sent, "exact M5 final-Ack receive overflow");
+    action.transfer_start_ns = action.root_start_ns;
+    action.transfer_finish_ns = commit_received;
     undo.compiler_slot = exact_detail::earliest(compiler_ready_ns_[worker]);
     undo.prior_compiler_ready_ns =
         compiler_ready_ns_[worker][undo.compiler_slot];
@@ -323,10 +410,12 @@ public:
         action.compile_start_ns, tu.compile_ns,
         "exact M5 compile finish overflow");
 
-    egress_ready_ns_[undo.egress_lane] = action.transfer_finish_ns;
     compiler_ready_ns_[worker][undo.compiler_slot] = action.compile_finish_ns;
+    relationship_ready_ns_[worker] = action.relationship_ready_ns;
     c_to_f_bytes_ = exact_detail::checked_add(
         c_to_f_bytes_, cost.total(), "exact M5 C-to-F total overflow");
+    f_to_c_bytes_ = exact_detail::checked_add(
+        f_to_c_bytes_, cost.f_total(), "exact M5 F-to-C total overflow");
     makespan_ns_ = std::max(makespan_ns_, action.compile_finish_ns);
     worker_commits_[worker] = exact_detail::checked_add(
         worker_commits_[worker], 1, "exact M5 worker commit count overflow");
@@ -356,10 +445,15 @@ public:
         throw std::logic_error("exact M5 Block undo disagrees with mirror");
       mirror.blocks[block] = 0;
     }
-    egress_ready_ns_[undo.egress_lane] = undo.prior_egress_ready_ns;
+    for (auto item = undo.egress_before.rbegin();
+         item != undo.egress_before.rend(); ++item)
+      egress_ready_ns_[item->first] = item->second;
     compiler_ready_ns_[undo.worker][undo.compiler_slot] =
         undo.prior_compiler_ready_ns;
+    relationship_ready_ns_[undo.worker] =
+        undo.prior_relationship_ready_ns;
     c_to_f_bytes_ = undo.prior_c_to_f;
+    f_to_c_bytes_ = undo.prior_f_to_c;
     makespan_ns_ = undo.prior_makespan_ns;
     worker_commits_[undo.worker] = undo.prior_worker_commits;
     undo.active = false;
@@ -372,18 +466,40 @@ private:
   capc::MixedEncoder encoder_;
   std::vector<ReceiverMirror> mirrors_;
   std::vector<uint64_t> egress_ready_ns_;
+  std::vector<uint64_t> relationship_ready_ns_;
   std::vector<std::vector<uint64_t>> compiler_ready_ns_;
   std::vector<uint64_t> worker_commits_;
   uint64_t c_to_f_bytes_ = 0;
+  uint64_t f_to_c_bytes_ = 0;
   uint64_t makespan_ns_ = 0;
   exact_detail::CodecContexts codec_;
+
+  uint64_t with_latency(uint64_t value, const char *what) const {
+    return exact_detail::checked_add(value, config_.one_way_latency_ns, what);
+  }
+
+  std::pair<uint64_t, uint64_t>
+  schedule_c_send(uint64_t ready_ns, uint64_t bytes, Undo &undo,
+                  const char *duration_what) {
+    const size_t lane = exact_detail::earliest(egress_ready_ns_);
+    const uint64_t start = std::max(ready_ns, egress_ready_ns_[lane]);
+    const uint64_t finish = exact_detail::checked_add(
+        start,
+        exact_detail::mul_div_ceil(bytes, 8000000000ULL,
+                                   config_.link_bits_per_second,
+                                   duration_what),
+        "exact M5 C-to-F send finish overflow");
+    undo.egress_before.emplace_back(lane, egress_ready_ns_[lane]);
+    egress_ready_ns_[lane] = finish;
+    return {start, finish};
+  }
 
   void validate_model() const {
     if (!model_.dictionary || !model_.block_children ||
         !model_.block_offsets || model_.block_offsets->empty())
       throw std::invalid_argument("exact M5 routing model is incomplete");
     if (config_.compiler_slots.empty() || !config_.egress_lanes ||
-        !config_.link_bits_per_second)
+        !config_.link_bits_per_second || !config_.f_to_c_bits_per_second)
       throw std::invalid_argument("exact M5 routing capacity is empty");
     for (uint32_t slots : config_.compiler_slots)
       if (!slots)
@@ -427,6 +543,7 @@ inline ExactRoutingResult exact_routing_replay(
     state.commit(undo);
   }
   result.event_c_to_f = state.c_to_f_bytes();
+  result.event_f_to_c = state.f_to_c_bytes();
   result.makespan_ns = state.makespan_ns();
   return result;
 }
@@ -538,6 +655,7 @@ inline ExactR5Result bounded_exact_r5_replay(
     state.commit(committed);
   }
   result.feasible.event_c_to_f = state.c_to_f_bytes();
+  result.feasible.event_f_to_c = state.f_to_c_bytes();
   result.feasible.makespan_ns = state.makespan_ns();
   return result;
 }

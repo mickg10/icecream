@@ -205,6 +205,7 @@ def planner_fields(output: str) -> dict[str, str]:
     if fields["schema"] not in {
         "independent-region-zstd3-v1",
         "exact-m5-event-v1",
+        "exact-m5-dialogue-v2",
     }:
         raise ValueError("unknown planner estimator schema")
     return fields
@@ -268,6 +269,67 @@ def physical_byte_model_makespan(
         compile_finish = (
             max(transfer_finish, compiler_ready[worker][compiler_slot]) + compile_ns
         )
+        compiler_ready[worker][compiler_slot] = compile_finish
+        makespan = max(makespan, compile_finish)
+    return makespan
+
+
+def varint_size(value: int) -> int:
+    size = 1
+    while value >= 0x80:
+        value >>= 7
+        size += 1
+    return size
+
+
+def physical_dialogue_makespan(
+    rows: list[dict[str, int]], slots: list[int]
+) -> int:
+    """Replay Root -> Need -> Fill -> prepare/commit/final-Ack causality.
+
+    C->F and F->C links are both 1 Gbit/s with zero propagation delay in the
+    Phase-C baseline.  A relationship cannot spend state installed by its
+    previous TU until that TU's final Ack has returned.  Compiler work may
+    continue in parallel behind the shared per-F relationship.
+    """
+
+    def duration(byte_count: int) -> int:
+        return (byte_count * 8_000_000_000 + 1_000_000_000 - 1) // 1_000_000_000
+
+    def c_send(ready: int, byte_count: int) -> tuple[int, int]:
+        lane = min(range(len(egress_ready)), key=lambda i: (egress_ready[i], i))
+        start = max(ready, egress_ready[lane])
+        finish = start + duration(byte_count)
+        egress_ready[lane] = finish
+        return start, finish
+
+    egress_ready = [0] * len(slots)
+    relationship_ready = [0] * len(slots)
+    compiler_ready = [[0] * count for count in slots]
+    makespan = 0
+    for row in rows:
+        worker = row["worker"]
+        _, root_finish = c_send(relationship_ready[worker], row["c_root"])
+        need_finish = root_finish + duration(row["f_need"])
+        _, fill_finish = c_send(need_finish, row["c_fill"])
+        # Empty-drop prepared and final Ack payloads are identical.  Lifecycle
+        # summary bytes are deliberately excluded, as they are constant for a
+        # fixed set of configured Fs and are not part of a placement action.
+        f_ack = varint_size(row["logical"]) + 8
+        prepared_ack_finish = fill_finish + duration(f_ack)
+        c_commit = varint_size(row["logical"]) + 5
+        _, commit_finish = c_send(prepared_ack_finish, c_commit)
+        relationship_ready[worker] = commit_finish + duration(f_ack)
+        compiler_slot = min(
+            range(slots[worker]),
+            key=lambda value: (compiler_ready[worker][value], value),
+        )
+        compile_ns = (
+            row["raw"] * 1_000_000_000 + 500_000_000 - 1
+        ) // 500_000_000
+        compile_finish = max(
+            commit_finish, compiler_ready[worker][compiler_slot]
+        ) + compile_ns
         compiler_ready[worker][compiler_slot] = compile_finish
         makespan = max(makespan, compile_finish)
     return makespan
@@ -520,6 +582,12 @@ def run_cell(
         raise RuntimeError(f"{tag}: physical raw curve differs from manifest")
     n_eff, entropy, opened = effective_width(rows)
     physical_makespan = physical_byte_model_makespan(rows, slots)
+    physical_dialogue = physical_dialogue_makespan(rows, slots)
+    if policy.exact_m5 and int(estimate["makespan_ns"]) != physical_dialogue:
+        raise ValueError(
+            "exact planner and physical dialogue makespans differ: "
+            f"{estimate['makespan_ns']} != {physical_dialogue}"
+        )
     if abs(float(estimate["N_eff"]) - n_eff) > 1e-5:
         raise RuntimeError(f"{tag}: planner and physical N_eff differ")
     if abs(float(estimate["H_route"]) - entropy) > 1e-5:
@@ -553,6 +621,7 @@ def run_cell(
         "planner_schema": estimate["schema"],
         "estimated_makespan_ns": int(estimate["makespan_ns"]),
         "physical_byte_model_makespan_ns": physical_makespan,
+        "physical_dialogue_makespan_ns": physical_dialogue,
         "estimated_lower_c_to_f": int(estimate.get("r5_lower_c_to_f", "0")),
         "estimated_lower_makespan_ns": int(
             estimate.get("r5_lower_makespan_ns", "0")
@@ -598,8 +667,9 @@ def write_report(
         "",
         "All byte columns below are exact C-to-F socket bytes after byte-exact reconstruction. "
         "The planner estimate chooses the route but is not substituted for the physical score.",
-        "The main makespan column replays those physical per-TU bytes through the declared "
-        "1-Gbit/s, one-egress-lane-per-F and 0.5-GB/s compiler model.",
+        "The main makespan column replays the exact Root→Need→Fill→Ack dialogue through "
+        "symmetric 1-Gbit/s links, one C egress lane per F, an ordered state relationship "
+        "per F, and the declared 0.5-GB/s compiler model.",
         "R5 lower bounds live only in the labelled independent-Region estimator; they do not "
         "bound the physical byte columns and are reported separately.",
         "",
@@ -627,7 +697,7 @@ def write_report(
                 f"### M={width}; F slots={topology['slot_capacities']}; "
                 f"requested={topology['requested_slots']}",
                 "",
-                "| policy | cold C→F | warm C→F | N_eff | H_route | physical-byte model makespan |",
+                "| policy | cold C→F | warm C→F | N_eff | H_route | physical-dialogue makespan |",
                 "|---|---:|---:|---:|---:|---:|",
             ]
             for policy in POLICIES:
@@ -638,7 +708,7 @@ def write_report(
                     f"| {policy.label} | {int(row['cold_c_to_f']) / 1e6:.3f} MB | "
                     f"{int(row['warm_c_to_f']) / 1e6:.3f} MB | "
                     f"{float(row['n_eff']):.2f} | {float(row['route_entropy']):.2f} | "
-                    f"{int(row['physical_byte_model_makespan_ns']) / 1e6:.2f} ms |"
+                    f"{int(row['physical_dialogue_makespan_ns']) / 1e6:.2f} ms |"
                 )
             r5_rows = [
                 by_key[(corpus.name, width, policy.label)]
