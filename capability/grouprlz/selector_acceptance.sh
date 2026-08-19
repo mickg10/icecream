@@ -13,11 +13,13 @@
 #                  p29_prepare_commit_test.cpp   prepare/commit/abort, gates 2-6
 #                  p29_transfer_transaction_test.cpp exact retry identity + retained Ack
 #                  mo_factor_transaction_test.cpp MO dictionary whole-TU rollback
+#                  p29_shared_authority_test.cpp multi-C admission + per-F single-flight
 #   fault runners  p29_journal_mutations.sh          the journal's failure paths
 #                  selector_equivalence_mutations.sh both byte-equivalence gates' paths
 #                  selector_1f_costing_mutations.sh  the 1F launcher's own failure path
 #                  selector_live_source_mutations.sh source-level selector attribution faults
 #                  selector_transaction_source_mutations.sh whole-state abort/Ack-order faults
+#                  p29_shared_authority_mutations.sh shared-authority failure paths
 #   wire gates     selector_step1_equivalence.sh  planning vs on-demand, byte-identical
 #                  selector_step2_equivalence.sh  reference vs build under test
 #                  selector_tag_regression.sh     typed-tag guards G1-G3
@@ -42,6 +44,7 @@ WORK=${WORK:-$(mktemp -d /tmp/selacc.XXXXXX)}
 CELL=${CELL:-fmt/debian-gcc}
 CXX_OPT=${CXX_OPT:--std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror}
 CXX_SAN=${CXX_SAN:--std=c++17 -O1 -g -fsanitize=address,undefined -Wall -Wextra -Wpedantic -Werror}
+CXX_TSAN=${CXX_TSAN:--std=c++17 -O1 -g -fsanitize=thread -fno-pie -no-pie -Wall -Wextra -Wpedantic -Werror}
 
 NAMES=(); STATUS=()
 
@@ -123,14 +126,26 @@ M=$(wc -l <"$WORK/man1"); [ "$M" = "$N" ] || die "extracted $M .ii files, corpus
 # --- C++ gates, optimized and sanitized ----------------------------------------------------
 cxx_gate() { # cxx_gate <test.cpp> <flags> <outname>
   local src=$1 flags=$2 out=$3
-  g++ $flags "$HERE/$src" -o "$WORK/$out" || return 1
+  g++ $flags -pthread "$HERE/$src" -o "$WORK/$out" || return 1
   "$WORK/$out"
 }
+cxx_tsan_gate() { # TSan needs a non-random address layout on some Linux kernels.
+  local src=$1 flags=$2 out=$3 arch
+  g++ $flags -pthread "$HERE/$src" -o "$WORK/$out" || return 1
+  arch=$(uname -m)
+  if command -v setarch >/dev/null 2>&1 && setarch "$arch" -R true >/dev/null 2>&1; then
+    setarch "$arch" -R "$WORK/$out"
+  else
+    "$WORK/$out"
+  fi
+}
 for t in p29_online_s1_test p29_block_catalogue_test p29_sparse_fblocks_test p29_prepare_commit_test \
-         p29_transfer_transaction_test mo_factor_transaction_test; do
+         p29_transfer_transaction_test mo_factor_transaction_test p29_shared_authority_test; do
   step "$t (opt)" -- cxx_gate "$t.cpp" "$CXX_OPT" "$t.opt"
   step "$t (asan+ubsan)" -- cxx_gate "$t.cpp" "$CXX_SAN" "$t.san"
 done
+step "p29_shared_authority_test (tsan)" -- cxx_tsan_gate p29_shared_authority_test.cpp \
+     "$CXX_TSAN" p29_shared_authority_test.tsan
 
 # --- fault runners: the gates' own failure paths -------------------------------------------
 step p29_journal_mutations -- env WORK="$WORK/mut.journal" "$HERE/p29_journal_mutations.sh"
@@ -142,6 +157,8 @@ step selector_live_source_mutations -- env BIN="$BIN" WORK="$WORK/mut.selector-s
      "$HERE/selector_live_source_mutations.sh" "$WORK/man1"
 step selector_transaction_source_mutations -- env BIN="$BIN" WORK="$WORK/mut.transaction-source" \
      "$HERE/selector_transaction_source_mutations.sh" "$WORK/man1"
+step p29_shared_authority_mutations -- env WORK="$WORK/mut.shared-authority" \
+     "$HERE/p29_shared_authority_mutations.sh"
 
 # --- wire gates ----------------------------------------------------------------------------
 step selector_tag_regression -- env BIN="$BIN" "$HERE/selector_tag_regression.sh" "$WORK/man4" "$WORK/man1"
