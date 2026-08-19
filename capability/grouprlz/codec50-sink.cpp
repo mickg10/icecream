@@ -1214,8 +1214,8 @@ int main(int argc,char**argv){
     alpha_line::Stats alphaStats;
     uint64_t preloadedRegionBytes=0,preloadedRegionCount=0,associatedRegionCount=0;double mixedAssociationWire=0,mixedMissingRequestWire=0;
     const double FRAME=4;   // 4-byte length prefix per framed message (the ACCOUNTING charge)
-    struct SelRow{size_t tu;uint64_t rawRootRaw,rawRootZ,globalRootRaw,globalRootZ,newBlocks,defRaw,defZ;};
-    std::vector<SelRow> selRows; uint64_t closureChecked=0,manifestChecks=0; std::vector<uint32_t> costedBlocks;
+    struct SelRow{size_t tu;uint64_t rawRootRaw,rawRootZ,globalRootRaw,globalRootZ,newBlocks,defRaw,defZ,common,globalFull,rawFull;};
+    std::vector<SelRow> selRows; uint64_t closureChecked=0,manifestChecks=0,tuRootFrame=0,tuBlockFrame=0,fullTotalChecks=0; std::vector<uint32_t> costedBlocks;
     WireSink cfSink,fcSink;   // the PHYSICAL streams: 5-byte typed header per frame
     std::vector<uint64_t>sinkCfOff(TUs),sinkFcOff(TUs),sinkCfFrames(TUs),sinkFcFrames(TUs);
     if(cfSinkPath){cfSink.open(cfSinkPath,sinkReplay);fcSink.open(fcSinkPath,sinkReplay);}
@@ -1411,24 +1411,41 @@ int main(int argc,char**argv){
             }
             std::vector<uint8_t> costDef;
             if(!costBlocks.empty()) serialize_block_manifest(costBlocks,costDef);
-            // CORRECTION 5: prove the common material really is common.  Both candidates must
-            // expand to the SAME unique Region set -- that is what makes it legitimate to
-            // exclude the missing-Region and Line material from the differential at all.  If
-            // they ever diverged, the excluded material would differ between candidates and
-            // the comparison would be meaningless, so this is asserted rather than assumed.
+            // CORRECTION 5, ordered.  A SORTED set comparison is too weak: two candidates
+            // can name the same Regions in a different FIRST-USE order, which changes the
+            // admission order and therefore the serialized Fill, while the sorted sets stay
+            // identical.  So order and multiplicity are checked, not membership.
             {
-                std::vector<uint32_t> rawClosure, globalClosure;
-                auto addOnce=[&](std::vector<uint32_t>&v,uint32_t r){
-                    for(uint32_t q:v) if(q==r) return; v.push_back(r); };
-                for(size_t i=roff[t];i<roff[t+1];++i) addOnce(rawClosure,allreg[i]);
+                // (a) each candidate's Root, expanded, must reproduce THIS TU's Region
+                //     sequence exactly -- same order, same multiplicity.  That is what makes
+                //     it a representation of the current TU rather than merely of its set.
+                std::vector<uint32_t> expandedGlobal;
                 for(size_t i=0;i<tn;++i){
-                    if(!tag_is_block(tk[i])) addOnce(globalClosure,tag_id(tk[i]));
-                    else for(uint32_t r:blockCatalogue.block(tag_id(tk[i])).regions) addOnce(globalClosure,r);
+                    if(!tag_is_block(tk[i])) expandedGlobal.push_back(tag_id(tk[i]));
+                    else for(uint32_t r:blockCatalogue.block(tag_id(tk[i])).regions) expandedGlobal.push_back(r);
                 }
-                std::vector<uint32_t> a=rawClosure,b=globalClosure;
-                std::sort(a.begin(),a.end()); std::sort(b.begin(),b.end());
-                if(a!=b){fprintf(stderr,"candidate closures differ at TU=%zu: RAW %zu Regions, GLOBAL_S1 %zu\n",t,a.size(),b.size());return 2;}
-                closureChecked+=a.size();
+                const size_t want=roff[t+1]-roff[t];
+                if(expandedGlobal.size()!=want||!std::equal(expandedGlobal.begin(),expandedGlobal.end(),allreg.begin()+roff[t])){
+                    fprintf(stderr,"GLOBAL_S1 Root does not expand to this TU's Region sequence at TU=%zu (%zu vs %zu)\n",t,expandedGlobal.size(),want);return 2;}
+                // RAW is the sequence itself, so expanding it is the identity; asserted so
+                // the two candidates are checked by the same rule rather than by assumption.
+                std::vector<uint32_t> expandedRaw(allreg.begin()+roff[t],allreg.begin()+roff[t+1]);
+                if(expandedRaw!=expandedGlobal){fprintf(stderr,"candidate expansions differ at TU=%zu\n",t);return 2;}
+
+                // (b) the list that actually drives common-material serialization: Regions
+                //     needed for the first time, in FIRST-APPEARANCE order, against the same
+                //     pre-TU mirror.  Compared WITHOUT sorting.
+                auto firstNeeded=[&](const std::vector<uint32_t>&seq){
+                    std::vector<uint32_t> out; 
+                    for(uint32_t r:seq){
+                        if(r<fknownReg.size()&&fknownReg[r]) continue;
+                        bool seen=false; for(uint32_t q:out) if(q==r){seen=true;break;}
+                        if(!seen) out.push_back(r);
+                    }
+                    return out; };
+                const std::vector<uint32_t> needRaw=firstNeeded(expandedRaw),needGlobal=firstNeeded(expandedGlobal);
+                if(needRaw!=needGlobal){fprintf(stderr,"first-needed Region order differs at TU=%zu (%zu vs %zu)\n",t,needRaw.size(),needGlobal.size());return 2;}
+                closureChecked+=expandedGlobal.size();
             }
             // Score the PHYSICAL FRAME: encoded payload plus the typed frame header the
             // sink writes, for each message the candidate would emit.
@@ -1439,7 +1456,8 @@ int main(int argc,char**argv){
             costedBlocks=costBlocks;   // checked against the real manifest below
             selRows.push_back({t,uint64_t(rawRoot.size()),uint64_t(rawZ),
                                uint64_t(rootb.size()),uint64_t(globalZ),
-                               uint64_t(costBlocks.size()),uint64_t(costDef.size()),uint64_t(defZ)});
+                               uint64_t(costBlocks.size()),uint64_t(costDef.size()),uint64_t(defZ),0,0,0});
+            tuRootFrame=0; tuBlockFrame=0;
         }
         std::vector<uint32_t> missReg,missBlk,associationRegs,requiredRegions,requiredBlocks;
         if(useKeyMap){
@@ -1460,7 +1478,8 @@ int main(int argc,char**argv){
           // messageEncoded is a reused scratch buffer sized to ZSTD_compressBound, so the
           // RETURNED length is the frame -- messageEncoded.size() is not.
           {const size_t n=zstd_message_roundtrip(z,messageD,rootb,zlevel,messageEncoded,messageDecoded);
-           w_root+=n;w_framing+=FRAME;cfSink.emit(WT_ROOT,messageEncoded.data(),n);}
+           w_root+=n;w_framing+=FRAME;
+           {const uint64_t before=cfSink.off;cfSink.emit(WT_ROOT,messageEncoded.data(),n);tuRootFrame=cfSink.off-before;}}
           allRoots.insert(allRoots.end(),rootb.begin(),rootb.end());Frootb=messageDecoded;
           // Test-only: append a Root token naming the sentinel slot one past the last real
           // Block.  A well-formed encoder never emits this, so the CALL-SITE bound is
@@ -1501,7 +1520,7 @@ int main(int argc,char**argv){
               }
               if(structureCeiling)allBlocks.insert(allBlocks.end(),blockRaw.begin(),blockRaw.end());
               size_t bytes=zstd_message_roundtrip(z,messageD,blockRaw,zlevel,messageEncoded,messageDecoded)+FRAME;w_blockdef+=bytes;
-              cfSink.emit(WT_BLOCKDEF,messageEncoded.data(),bytes-size_t(FRAME));
+              {const uint64_t before=cfSink.off;cfSink.emit(WT_BLOCKDEF,messageEncoded.data(),bytes-size_t(FRAME));tuBlockFrame=cfSink.off-before;}
               const uint8_t*bp=messageDecoded.data(),*be=bp+messageDecoded.size();uint64_t count=get_varint(bp);
               if(count!=manifestBlocks.size()){fprintf(stderr,"direct Block manifest count differs\n");return 2;}
               for(uint64_t i=0;i<count;++i){uint64_t id=get_varint(bp);if(Fblocks.known(id)){fprintf(stderr,"bad direct Block identity\n");return 2;}uint8_t kind=*bp++;
@@ -2352,6 +2371,21 @@ int main(int argc,char**argv){
                                     uint8_t(c),uint8_t(c>>8),uint8_t(c>>16),uint8_t(c>>24)};
                 cfSink.emit(WT_BUILD_CLOSE,p,sizeof p); fcSink.emit(WT_BUILD_CLOSE,p,sizeof p);
             }
+            // Close differential -> FULL total using the PHYSICAL C->F delta for this TU.
+            // Everything the transaction sent that is not this candidate's Root or BlockDef
+            // is material every candidate would have sent, so it is the common part by
+            // construction -- and GLOBAL_full must reproduce the measured delta exactly.
+            if(selectorTsvPath&&!selRows.empty()&&selRows.back().tu==t){
+                const uint64_t prev=t?sinkCfOff[t-1]:0;
+                const uint64_t delta=cfSink.off+5+1-prev;   // include this TU's close frame
+                if(delta<tuRootFrame+tuBlockFrame){fprintf(stderr,"TU %zu: frames exceed the physical delta\n",t);return 2;}
+                SelRow&r=selRows.back();
+                r.common=delta-tuRootFrame-tuBlockFrame;
+                r.globalFull=r.common+tuRootFrame+tuBlockFrame;
+                r.rawFull=r.common+r.rawRootZ;
+                if(r.globalFull!=delta){fprintf(stderr,"TU %zu: full total %llu != measured delta %llu\n",t,(unsigned long long)r.globalFull,(unsigned long long)delta);return 2;}
+                ++fullTotalChecks;
+            }
             sinkCfOff[t]=cfSink.off; sinkFcOff[t]=fcSink.off;
             sinkCfFrames[t]=cfSink.frames; sinkFcFrames[t]=fcSink.frames;
         }
@@ -2588,7 +2622,7 @@ int main(int argc,char**argv){
     }
     if(selectorTsvPath){
       FILE*f=fopen(selectorTsvPath,"wb");if(!f){perror(selectorTsvPath);return 2;}
-      if(fprintf(f,"tu\traw_root_bytes\traw_root_z\tglobal_root_bytes\tglobal_root_z\tglobal_new_blocks\tglobal_blockdef_bytes\tglobal_blockdef_z\tglobal_total_z\twinner\n")<0){fclose(f);return 2;}
+      if(fprintf(f,"tu\traw_root_bytes\traw_root_z\tglobal_root_bytes\tglobal_root_z\tglobal_new_blocks\tglobal_blockdef_bytes\tglobal_blockdef_z\tglobal_diff_z\tcommon_physical\traw_full\tglobal_full\twinner\n")<0){fclose(f);return 2;}
       uint64_t rawCum=0,globalCum=0,rawWins=0,globalWins=0,ties=0;
       for(const SelRow&r:selRows){
         const uint64_t g=r.globalRootZ+r.defZ;
@@ -2598,18 +2632,24 @@ int main(int argc,char**argv){
         (void)0;
         if(g<r.rawRootZ)++globalWins; else if(g>r.rawRootZ)++rawWins; else ++ties;
         rawCum+=r.rawRootZ; globalCum+=g;
-        if(fprintf(f,"%zu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%s\n",r.tu,
+        if(fprintf(f,"%zu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%s\n",r.tu,
             (unsigned long long)r.rawRootRaw,(unsigned long long)r.rawRootZ,
             (unsigned long long)r.globalRootRaw,(unsigned long long)r.globalRootZ,
             (unsigned long long)r.newBlocks,(unsigned long long)r.defRaw,(unsigned long long)r.defZ,
-            (unsigned long long)g,win)<0){fclose(f);return 2;}
+            (unsigned long long)g,(unsigned long long)r.common,
+            (unsigned long long)r.rawFull,(unsigned long long)r.globalFull,win)<0){fclose(f);return 2;}
       }
       if(fclose(f)!=0){perror(selectorTsvPath);return 2;}
       printf("SELECTOR closure: %llu Region memberships checked identical across candidates\n",(unsigned long long)closureChecked);
       printf("SELECTOR manifest: %llu transaction(s) sent exactly the Block set costing priced\n",(unsigned long long)manifestChecks);
+      if(fullTotalChecks) printf("SELECTOR full total: %llu TU(s) reproduced the measured physical C->F delta exactly\n",(unsigned long long)fullTotalChecks);
+      uint64_t rawFullCum=0,globalFullCum=0;
+      for(const SelRow&r:selRows){rawFullCum+=r.rawFull;globalFullCum+=r.globalFull;}
       printf("SELECTOR per-TU costing: rows=%zu raw_cum=%llu global_cum=%llu wins[RAW=%llu GLOBAL_S1=%llu tie=%llu]\n",
           selRows.size(),(unsigned long long)rawCum,(unsigned long long)globalCum,
           (unsigned long long)rawWins,(unsigned long long)globalWins,(unsigned long long)ties);
+      if(fullTotalChecks) printf("SELECTOR FULL transaction totals: raw=%llu global=%llu (common material included; the winner is unchanged because common cancels)\n",
+          (unsigned long long)rawFullCum,(unsigned long long)globalFullCum);
     }
     if(curveTsvPath){
       FILE*curve=fopen(curveTsvPath,"wb");if(!curve){perror(curveTsvPath);return 2;}
