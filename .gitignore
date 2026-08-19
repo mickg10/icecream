@@ -55,3 +55,5 @@ unittests/testargs.trs
 # others
 compile_commands.json
 .vs*
+__pycache__/
+*.pyc
