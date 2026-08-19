@@ -49,7 +49,6 @@ class PolicySpec:
     r5_horizon: int = 0
     r5_beam: int = 0
     investment_weight: tuple[int, int] = (1, 1)
-    replica_gap_weight: tuple[int, int] = (0, 1)
 
 
 POLICIES = (
@@ -101,36 +100,6 @@ POLICIES = (
         0,
         0,
         (0, 1),
-    ),
-    # Charge for opening a less-materialized SourceGeneration replica.  These points test
-    # whether a causal R4 policy can recover the useful two/three-F portion of R5's frontier.
-    PolicySpec(
-        "R4_1GBIT_G8",
-        "r4-state",
-        "R4_STATE_AWARE",
-        (125_000, 1_000_000),
-        replica_gap_weight=(8, 1),
-    ),
-    PolicySpec(
-        "R4_1GBIT_G16",
-        "r4-state",
-        "R4_STATE_AWARE",
-        (125_000, 1_000_000),
-        replica_gap_weight=(16, 1),
-    ),
-    PolicySpec(
-        "R4_1GBIT_G24",
-        "r4-state",
-        "R4_STATE_AWARE",
-        (125_000, 1_000_000),
-        replica_gap_weight=(24, 1),
-    ),
-    PolicySpec(
-        "R4_1GBIT_G32",
-        "r4-state",
-        "R4_STATE_AWARE",
-        (125_000, 1_000_000),
-        replica_gap_weight=(32, 1),
     ),
     PolicySpec("R5_BYTES", "r5-bounded", "R5_BOUNDED", (0, 1), 4, 64),
     PolicySpec(
@@ -393,12 +362,6 @@ def run_cell(
             str(policy.investment_weight[0]),
             str(policy.investment_weight[1]),
         ]
-    if policy.replica_gap_weight != (0, 1):
-        planner_command += [
-            "--replica-gap-weight",
-            str(policy.replica_gap_weight[0]),
-            str(policy.replica_gap_weight[1]),
-        ]
     header = (
         f"PLANNER_COMMAND {shlex.join(planner_command)}\n"
         f"PHYSICAL_COMMAND {shlex.join(physical_command)}\n"
@@ -445,12 +408,6 @@ def run_cell(
         raise RuntimeError(f"{tag}: planner TU count differs from manifest")
     if estimate["policy"] != policy.reported_name:
         raise RuntimeError(f"{tag}: planner reported a different policy")
-    reported_replica_gap = estimate.get("replica_gap_weight")
-    expected_replica_gap = (
-        f"{policy.replica_gap_weight[0]}/{policy.replica_gap_weight[1]}"
-    )
-    if reported_replica_gap != expected_replica_gap:
-        raise RuntimeError(f"{tag}: planner reported a different replica-gap weight")
     if policy.r5_horizon:
         required_r5 = {
             "r5_lower_c_to_f",
