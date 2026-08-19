@@ -57,9 +57,21 @@ POLICIES = (
     PolicySpec("R2_HOME", "r2-home", "R2_HOME"),
     PolicySpec("R3_RENDEZVOUS", "r3-rendezvous", "R3_RENDEZVOUS"),
     PolicySpec("R4_BYTES", "r4-state", "R4_STATE_AWARE"),
+    PolicySpec(
+        "R4_W03125", "r4-state", "R4_STATE_AWARE", (31_250, 1_000_000)
+    ),
+    PolicySpec(
+        "R4_W0625", "r4-state", "R4_STATE_AWARE", (62_500, 1_000_000)
+    ),
     # At 1 Gbit/s, 1 ms of completion delay is equivalent to 125,000 wire bytes.
     PolicySpec(
         "R4_1GBIT_TIME", "r4-state", "R4_STATE_AWARE", (125_000, 1_000_000)
+    ),
+    PolicySpec(
+        "R4_W250", "r4-state", "R4_STATE_AWARE", (250_000, 1_000_000)
+    ),
+    PolicySpec(
+        "R4_W500", "r4-state", "R4_STATE_AWARE", (500_000, 1_000_000)
     ),
     PolicySpec("R5_BYTES", "r5-bounded", "R5_BOUNDED", (0, 1), 4, 64),
     PolicySpec(
