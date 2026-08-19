@@ -1215,7 +1215,7 @@ int main(int argc,char**argv){
     uint64_t preloadedRegionBytes=0,preloadedRegionCount=0,associatedRegionCount=0;double mixedAssociationWire=0,mixedMissingRequestWire=0;
     const double FRAME=4;   // 4-byte length prefix per framed message (the ACCOUNTING charge)
     struct SelRow{size_t tu;uint64_t rawRootRaw,rawRootZ,globalRootRaw,globalRootZ,newBlocks,defRaw,defZ;};
-    std::vector<SelRow> selRows; uint64_t closureChecked=0;
+    std::vector<SelRow> selRows; uint64_t closureChecked=0,manifestChecks=0; std::vector<uint32_t> costedBlocks;
     WireSink cfSink,fcSink;   // the PHYSICAL streams: 5-byte typed header per frame
     std::vector<uint64_t>sinkCfOff(TUs),sinkFcOff(TUs),sinkCfFrames(TUs),sinkFcFrames(TUs);
     if(cfSinkPath){cfSink.open(cfSinkPath,sinkReplay);fcSink.open(fcSinkPath,sinkReplay);}
@@ -1436,6 +1436,7 @@ int main(int argc,char**argv){
             const size_t rawZ=zstd_size(z,rawRoot.data(),rawRoot.size(),zlevel,costDst)+hdr;
             const size_t globalZ=zstd_size(z,rootb.data(),rootb.size(),zlevel,costDst)+hdr;
             const size_t defZ=costDef.empty()?0:zstd_size(z,costDef.data(),costDef.size(),zlevel,costDst)+hdr;
+            costedBlocks=costBlocks;   // checked against the real manifest below
             selRows.push_back({t,uint64_t(rawRoot.size()),uint64_t(rawZ),
                                uint64_t(rootb.size()),uint64_t(globalZ),
                                uint64_t(costBlocks.size()),uint64_t(costDef.size()),uint64_t(defZ)});
@@ -1487,6 +1488,17 @@ int main(int argc,char**argv){
             std::vector<uint32_t>manifestBlocks;for(uint32_t k:FrequiredBlocks)if(!fknownBlk[k])manifestBlocks.push_back(k);
             if(!manifestBlocks.empty()){
               std::vector<uint8_t>blockRaw;serialize_block_manifest(manifestBlocks,blockRaw);
+              // GATE: costing must price the bytes that are ACTUALLY SENT.  Both sides call
+              // the one serializer, so the remaining risk is that they disagree on WHICH
+              // Blocks need defining -- which would make the candidate score fiction while
+              // still looking self-consistent.  Compared as ordered sequences, since the
+              // manifest order is part of the bytes.
+              if(selectorTsvPath){
+                if(costedBlocks!=manifestBlocks){
+                  fprintf(stderr,"costing priced %zu Block definition(s) but the transaction sends %zu at TU=%zu\n",
+                          costedBlocks.size(),manifestBlocks.size(),t);return 2;}
+                ++manifestChecks;
+              }
               if(structureCeiling)allBlocks.insert(allBlocks.end(),blockRaw.begin(),blockRaw.end());
               size_t bytes=zstd_message_roundtrip(z,messageD,blockRaw,zlevel,messageEncoded,messageDecoded)+FRAME;w_blockdef+=bytes;
               cfSink.emit(WT_BLOCKDEF,messageEncoded.data(),bytes-size_t(FRAME));
@@ -2594,6 +2606,7 @@ int main(int argc,char**argv){
       }
       if(fclose(f)!=0){perror(selectorTsvPath);return 2;}
       printf("SELECTOR closure: %llu Region memberships checked identical across candidates\n",(unsigned long long)closureChecked);
+      printf("SELECTOR manifest: %llu transaction(s) sent exactly the Block set costing priced\n",(unsigned long long)manifestChecks);
       printf("SELECTOR per-TU costing: rows=%zu raw_cum=%llu global_cum=%llu wins[RAW=%llu GLOBAL_S1=%llu tie=%llu]\n",
           selRows.size(),(unsigned long long)rawCum,(unsigned long long)globalCum,
           (unsigned long long)rawWins,(unsigned long long)globalWins,(unsigned long long)ties);
