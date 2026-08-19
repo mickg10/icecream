@@ -1257,8 +1257,10 @@ int main(int argc,char**argv){
     if(transactionalTu&&(!useS1||routeCount!=1||!useMixedRegions||!useByteArrayLines||!useDirectOrdinals||
                          !useCompressedBlobs||!useMoFactor||useBlobEagerPatches||!literalOnDemand||!stableRootTags)){
         fprintf(stderr,"--transactional-tu currently binds the measured S1/mixed/direct/BLOB+MO/literal-on-demand active profile\n");return 2;}
+    // openFinalEntropy is deliberately allowed here: it suppresses only the final END tail
+    // for physical-prefix comparison and neither reads later TUs nor adds mutable codec state.
     if(transactionalTu&&(useProjectSource||useAlphaLines||useResidualLdm||splitControlCeiling||usePriorRoot||
-                         literalGroupPrefix||halfColdBit>=0||warm||replayRepetitions!=1||entropyRestartTus||openFinalEntropy)){
+                         literalGroupPrefix||halfColdBit>=0||warm||replayRepetitions!=1||entropyRestartTus)){
         fprintf(stderr,"--transactional-tu refuses an unjournalled or cross-TU codec-history option\n");return 2;}
     if(transactionSelftestTu!=SIZE_MAX&&(selectorTsvPath||sinkReplay||sinkBuildTus)){
         fprintf(stderr,"the transaction reject/retry selftest is a focused gate, not a selector/replay/build-cost run\n");return 2;}

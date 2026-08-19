@@ -23,6 +23,8 @@
 #                  selector_transaction_source_mutations.sh whole-state abort/Ack-order faults
 #                  p29_shared_authority_mutations.sh shared-authority failure paths
 #                  p29_two_f_state_mutations.sh      two-F route/F boundary paths
+#   chronology     p29_unavailable_suffix.sh         TU2 absent through TU1 Ack
+#                  selector_prefix_invariance.sh     physical prefixes vs supplied suffix
 #   wire gates     selector_step1_equivalence.sh  planning vs on-demand, byte-identical
 #                  selector_step2_equivalence.sh  reference vs build under test
 #                  selector_tag_regression.sh     typed-tag guards G1-G3
@@ -167,6 +169,12 @@ step p29_shared_authority_mutations -- env WORK="$WORK/mut.shared-authority" \
      "$HERE/p29_shared_authority_mutations.sh"
 step p29_two_f_state_mutations -- env WORK="$WORK/mut.two-f" \
      "$HERE/p29_two_f_state_mutations.sh"
+
+# --- current-input chronology ---------------------------------------------------------------
+step p29_unavailable_suffix -- env WORK="$WORK/unavailable-suffix" \
+     "$HERE/p29_unavailable_suffix.sh"
+step selector_prefix_invariance -- env BIN="$BIN" WORK="$WORK/prefix-invariance" \
+     "$HERE/selector_prefix_invariance.sh" "$WORK/man1"
 
 # --- wire gates ----------------------------------------------------------------------------
 step selector_tag_regression -- env BIN="$BIN" "$HERE/selector_tag_regression.sh" "$WORK/man4" "$WORK/man1"
