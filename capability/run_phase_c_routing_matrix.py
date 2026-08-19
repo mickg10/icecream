@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run causal R0-R4 assignments through the exact M5 physical transaction.
+"""Run causal R0-R4 and bounded R5 assignments through the exact M5 transaction.
 
 The planner's independent-Region byte values are estimates used only to choose a route.
 Every published C-to-F/F-to-C value comes from the socket frame ledger after the selected
@@ -46,6 +46,8 @@ class PolicySpec:
     planner_name: str
     reported_name: str
     time_weight: tuple[int, int] = (0, 1)
+    r5_horizon: int = 0
+    r5_beam: int = 0
 
 
 POLICIES = (
@@ -58,6 +60,15 @@ POLICIES = (
     # At 1 Gbit/s, 1 ms of completion delay is equivalent to 125,000 wire bytes.
     PolicySpec(
         "R4_1GBIT_TIME", "r4-state", "R4_STATE_AWARE", (125_000, 1_000_000)
+    ),
+    PolicySpec("R5_BYTES", "r5-bounded", "R5_BOUNDED", (0, 1), 4, 64),
+    PolicySpec(
+        "R5_1GBIT_TIME",
+        "r5-bounded",
+        "R5_BOUNDED",
+        (125_000, 1_000_000),
+        4,
+        64,
     ),
 )
 
@@ -243,6 +254,13 @@ def run_cell(
     if max_files is not None:
         planner_command += ["--max-files", str(max_files)]
         physical_command += ["--max-files", str(max_files)]
+    if policy.r5_horizon:
+        planner_command += [
+            "--r5-horizon",
+            str(policy.r5_horizon),
+            "--r5-beam",
+            str(policy.r5_beam),
+        ]
     header = (
         f"PLANNER_COMMAND {shlex.join(planner_command)}\n"
         f"PHYSICAL_COMMAND {shlex.join(physical_command)}\n"
@@ -289,6 +307,22 @@ def run_cell(
         raise RuntimeError(f"{tag}: planner TU count differs from manifest")
     if estimate["policy"] != policy.reported_name:
         raise RuntimeError(f"{tag}: planner reported a different policy")
+    if policy.r5_horizon:
+        required_r5 = {
+            "r5_lower_c_to_f",
+            "r5_lower_makespan_ns",
+            "r5_bound",
+            "r5_horizon",
+            "r5_beam",
+            "r5_expanded",
+            "r5_pruned",
+        }
+        if required_r5 - estimate.keys():
+            raise RuntimeError(f"{tag}: planner omitted R5 bound fields")
+        if int(estimate["r5_horizon"]) != policy.r5_horizon or int(
+            estimate["r5_beam"]
+        ) != policy.r5_beam:
+            raise RuntimeError(f"{tag}: planner used different R5 search limits")
     parsed = parse_log(physical_text)
     rows = read_curve(physical_curve)
     assignments = read_assignment(assignment, total_tus, width)
@@ -335,6 +369,13 @@ def run_cell(
         "control": parsed["c_control"],
         "estimated_c_to_f": int(estimate["estimated_c_to_f"]),
         "estimated_makespan_ns": int(estimate["makespan_ns"]),
+        "estimated_lower_c_to_f": int(estimate.get("r5_lower_c_to_f", "0")),
+        "estimated_lower_makespan_ns": int(
+            estimate.get("r5_lower_makespan_ns", "0")
+        ),
+        "estimated_bound_kind": estimate.get("r5_bound", "none"),
+        "r5_expanded": int(estimate.get("r5_expanded", "0")),
+        "r5_pruned": int(estimate.get("r5_pruned", "0")),
         "n_eff": n_eff,
         "route_entropy": entropy,
         "cache_domains_opened": opened,
@@ -366,6 +407,8 @@ def write_report(path: Path, rows: list[dict[str, object]], widths: list[int]) -
         "",
         "All byte columns below are exact C-to-F socket bytes after byte-exact reconstruction. "
         "The planner estimate chooses the route but is not substituted for the physical score.",
+        "R5 lower bounds live only in the labelled independent-Region estimator; they do not "
+        "bound the physical byte columns and are reported separately.",
         "",
     ]
     for corpus in CORPORA:
@@ -389,6 +432,28 @@ def write_report(path: Path, rows: list[dict[str, object]], widths: list[int]) -
                     f"{float(row['n_eff']):.2f} | {float(row['route_entropy']):.2f} | "
                     f"{int(row['estimated_makespan_ns']) / 1e6:.2f} ms |"
                 )
+            r5_rows = [
+                by_key[(corpus.name, width, policy.label)]
+                for policy in POLICIES
+                if policy.r5_horizon
+                and (corpus.name, width, policy.label) in by_key
+            ]
+            if r5_rows:
+                lines += [
+                    "",
+                    "R5 estimator-space bounds:",
+                    "",
+                    "| policy | feasible bytes | byte lower | feasible makespan | makespan lower | pruned paths |",
+                    "|---|---:|---:|---:|---:|---:|",
+                ]
+                for row in r5_rows:
+                    lines.append(
+                        f"| {row['policy']} | {int(row['estimated_c_to_f']) / 1e6:.3f} MB | "
+                        f"{int(row['estimated_lower_c_to_f']) / 1e6:.3f} MB | "
+                        f"{int(row['estimated_makespan_ns']) / 1e6:.2f} ms | "
+                        f"{int(row['estimated_lower_makespan_ns']) / 1e6:.2f} ms | "
+                        f"{int(row['r5_pruned'])} |"
+                    )
             lines += [
                 "",
                 "Exact direction components:",
@@ -511,7 +576,7 @@ def main() -> int:
             if path.name != "SHA256SUMS"
         )
     )
-    print(f"PHASE C R0-R4 MATRIX PASS rows={len(rows)} artifacts={args.output}")
+    print(f"PHASE C R0-R5 MATRIX PASS rows={len(rows)} artifacts={args.output}")
     return 0
 
 
