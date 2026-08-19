@@ -858,7 +858,7 @@ static constexpr std::array<const char*,8> componentRawNames={
 };
 
 int main(int argc,char**argv){
-    const char* manifest=nullptr;const char*residualDumpPath=nullptr;const char*mixedDumpPrefix=nullptr;const char*curveTsvPath=nullptr;const char*literalGroupPrefix=nullptr;const char*literalGroupWirePath=nullptr;const char*cfSinkPath=nullptr;const char*fcSinkPath=nullptr;const char*sinkCurvePath=nullptr; size_t sinkBuildTus=0; bool sinkReplay=false,literalOnDemand=false,selftestTags=false,selftestBadRoot=false; size_t routeCount=0; size_t max_files=SIZE_MAX,entropyRestartTus=0,replayRepetitions=1,literalGroupTus=0,literalGroupWorkers=1; int zlevel=3,literalZLevel=-1,arrayZLevel=-1,blobZLevel=-1,halfColdBit=-1,blobCanonicalLevel=9; uint32_t sourceAdmitRatio=6,blobThreads=4,blobZstdWorkers=0,blobZstdJobMiB=0,blobZstdOverlapLog=0,blobFallbackEvery=0,s1MinMatch=3,s1MaxChain=1024; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, usePriorRoot=false,useSortedLines=false,useByteArrayLines=false,useMixedRegions=false,useProjectSource=false,useKeyMap=false,useDirectOrdinals=false,useCompressedBlobs=false,useBlobEagerPatches=true,useMoFactor=false,traceMo=false,useAlphaLines=false,useResidualLdm=false,splitControlCeiling=false,structureCeiling=false,literalGroupEvaluateZstd10=true,stableRootTags=false,openFinalEntropy=false;
+    const char* manifest=nullptr;const char*residualDumpPath=nullptr;const char*mixedDumpPrefix=nullptr;const char*curveTsvPath=nullptr;const char*literalGroupPrefix=nullptr;const char*literalGroupWirePath=nullptr;const char*cfSinkPath=nullptr;const char*fcSinkPath=nullptr;const char*sinkCurvePath=nullptr; size_t sinkBuildTus=0; bool sinkReplay=false,literalOnDemand=false,selftestTags=false,selftestBadRoot=false; size_t routeCount=0; const char*selectorTsvPath=nullptr; size_t max_files=SIZE_MAX,entropyRestartTus=0,replayRepetitions=1,literalGroupTus=0,literalGroupWorkers=1; int zlevel=3,literalZLevel=-1,arrayZLevel=-1,blobZLevel=-1,halfColdBit=-1,blobCanonicalLevel=9; uint32_t sourceAdmitRatio=6,blobThreads=4,blobZstdWorkers=0,blobZstdJobMiB=0,blobZstdOverlapLog=0,blobFallbackEvery=0,s1MinMatch=3,s1MaxChain=1024; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, usePriorRoot=false,useSortedLines=false,useByteArrayLines=false,useMixedRegions=false,useProjectSource=false,useKeyMap=false,useDirectOrdinals=false,useCompressedBlobs=false,useBlobEagerPatches=true,useMoFactor=false,traceMo=false,useAlphaLines=false,useResidualLdm=false,splitControlCeiling=false,structureCeiling=false,literalGroupEvaluateZstd10=true,stableRootTags=false,openFinalEntropy=false;
     const char*blobDumpPath=nullptr;const char*componentCurveTsvPath=nullptr;
     for(int i=1;i<argc;++i){ if(!strcmp(argv[i],"--manifest")&&i+1<argc)manifest=argv[++i];
         else if(!strcmp(argv[i],"--z")&&i+1<argc)zlevel=atoi(argv[++i]);
@@ -899,6 +899,7 @@ int main(int argc,char**argv){
             // materializer and a canonical-id-keyed F store; refuse rather than pretend.
             if(v!=1){fprintf(stderr,"--route-s1 %llu: multi-route is not yet materialized; only 1 is supported\n",v);return 2;}
             routeCount=size_t(v);}
+        else if(!strcmp(argv[i],"--selector-tsv")&&i+1<argc)selectorTsvPath=argv[++i];
         else if(!strcmp(argv[i],"--selftest-tags"))selftestTags=true;
         else if(!strcmp(argv[i],"--selftest-bad-root"))selftestBadRoot=true;
         else if(!strcmp(argv[i],"--sink-curve")&&i+1<argc)sinkCurvePath=argv[++i];
@@ -1213,6 +1214,8 @@ int main(int argc,char**argv){
     alpha_line::Stats alphaStats;
     uint64_t preloadedRegionBytes=0,preloadedRegionCount=0,associatedRegionCount=0;double mixedAssociationWire=0,mixedMissingRequestWire=0;
     const double FRAME=4;   // 4-byte length prefix per framed message (the ACCOUNTING charge)
+    struct SelRow{size_t tu;uint64_t reserved,rawRootRaw,rawRootZ,globalRootRaw,globalRootZ,newBlocks,defRaw,defZ;};
+    std::vector<SelRow> selRows;
     WireSink cfSink,fcSink;   // the PHYSICAL streams: 5-byte typed header per frame
     std::vector<uint64_t>sinkCfOff(TUs),sinkFcOff(TUs),sinkCfFrames(TUs),sinkFcFrames(TUs);
     if(cfSinkPath){cfSink.open(cfSinkPath,sinkReplay);fcSink.open(fcSinkPath,sinkReplay);}
@@ -1378,6 +1381,31 @@ int main(int argc,char**argv){
         std::vector<uint8_t> rootb,Frootb;
         // The tag goes out as-is; only the legacy namespace needs the final Region count.
         if(usePriorRoot)rootb=root_slices.programs[t];else for(size_t i=0;i<tn;++i)put_varint(rootb,stableRootTags?uint64_t(tk[i]):uint64_t(legacy_flat_token(tk[i],NREG)));
+        // --- candidate COSTING (not yet selection) --------------------------------------
+        // Every candidate is built from the SAME pre-TU state and expands to the IDENTICAL
+        // Region sequence, so the missing-Region and Line material is common to all three
+        // and is deliberately NOT counted here: this measures only what the candidates
+        // actually differ in, the Root and the Block definitions it implies.
+        if(selectorTsvPath&&!usePriorRoot){
+            std::vector<uint8_t> rawRoot;
+            for(size_t i=roff[t];i<roff[t+1];++i)
+                put_varint(rawRoot,stableRootTags?uint64_t(region_tag(allreg[i])):uint64_t(allreg[i]));
+            std::vector<uint8_t> costDst;
+            const size_t rawBytes=zstd_size(z,rawRoot.data(),rawRoot.size(),zlevel,costDst);
+            const size_t globalBytes=zstd_size(z,rootb.data(),rootb.size(),zlevel,costDst);
+            // Blocks this Root names that F does not already hold have to be defined too;
+            // RAW names none by construction.
+            uint64_t newBlocks=0,defRaw=0;
+            for(size_t i=0;i<tn;++i) if(tag_is_block(tk[i])&&!Fblocks.known(tag_id(tk[i]))){
+                ++newBlocks; defRaw+=blockCatalogue.block(tag_id(tk[i])).regions.size();
+            }
+            std::vector<uint8_t> defBytes;
+            for(size_t i=0;i<tn;++i) if(tag_is_block(tk[i])&&!Fblocks.known(tag_id(tk[i])))
+                for(uint32_t r:blockCatalogue.block(tag_id(tk[i])).regions) put_varint(defBytes,r);
+            const size_t globalDef=defBytes.empty()?0:zstd_size(z,defBytes.data(),defBytes.size(),zlevel,costDst);
+            selRows.push_back({t,uint64_t(perTU_raw.size()>t?0:0),uint64_t(rawRoot.size()),uint64_t(rawBytes),
+                               uint64_t(rootb.size()),uint64_t(globalBytes),newBlocks,uint64_t(defRaw),uint64_t(globalDef)});
+        }
         std::vector<uint32_t> missReg,missBlk,associationRegs,requiredRegions,requiredBlocks;
         if(useKeyMap){
           if(++requestStamp==0){std::fill(requiredRegionStamp.begin(),requiredRegionStamp.end(),0);std::fill(requiredBlockStamp.begin(),requiredBlockStamp.end(),0);requestStamp=1;}
@@ -2515,6 +2543,27 @@ int main(int argc,char**argv){
         for(size_t t=1;t<TUs;++t)if(sinkCfOff[t]<sinkCfOff[t-1]||sinkFcOff[t]<sinkFcOff[t-1]){fprintf(stderr,"sink offsets are not monotone at TU=%zu\n",t);return 2;}
         if(TUs&&(sinkCfOff[TUs-1]!=cfSink.off||sinkFcOff[TUs-1]!=fcSink.off)){fprintf(stderr,"final sink offset differs from the stream size\n");return 2;}
       }
+    }
+    if(selectorTsvPath){
+      FILE*f=fopen(selectorTsvPath,"wb");if(!f){perror(selectorTsvPath);return 2;}
+      if(fprintf(f,"tu\traw_root_bytes\traw_root_z\tglobal_root_bytes\tglobal_root_z\tglobal_new_blocks\tglobal_blockdef_bytes\tglobal_blockdef_z\tglobal_total_z\twinner\n")<0){fclose(f);return 2;}
+      uint64_t rawCum=0,globalCum=0,rawWins=0,globalWins=0,ties=0;
+      for(const SelRow&r:selRows){
+        const uint64_t g=r.globalRootZ+r.defZ;
+        // Deterministic tie rule: fewer newly-installed Blocks first, then RAW.
+        const char*win = g<r.rawRootZ ? "GLOBAL_S1" : (g>r.rawRootZ ? "RAW" : (r.newBlocks?"RAW":"RAW"));
+        if(g<r.rawRootZ)++globalWins; else if(g>r.rawRootZ)++rawWins; else ++ties;
+        rawCum+=r.rawRootZ; globalCum+=g;
+        if(fprintf(f,"%zu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%s\n",r.tu,
+            (unsigned long long)r.rawRootRaw,(unsigned long long)r.rawRootZ,
+            (unsigned long long)r.globalRootRaw,(unsigned long long)r.globalRootZ,
+            (unsigned long long)r.newBlocks,(unsigned long long)r.defRaw,(unsigned long long)r.defZ,
+            (unsigned long long)g,win)<0){fclose(f);return 2;}
+      }
+      if(fclose(f)!=0){perror(selectorTsvPath);return 2;}
+      printf("SELECTOR per-TU costing: rows=%zu raw_cum=%llu global_cum=%llu wins[RAW=%llu GLOBAL_S1=%llu tie=%llu]\n",
+          selRows.size(),(unsigned long long)rawCum,(unsigned long long)globalCum,
+          (unsigned long long)rawWins,(unsigned long long)globalWins,(unsigned long long)ties);
     }
     if(curveTsvPath){
       FILE*curve=fopen(curveTsvPath,"wb");if(!curve){perror(curveTsvPath);return 2;}
