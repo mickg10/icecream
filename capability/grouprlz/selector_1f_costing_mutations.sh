@@ -25,13 +25,15 @@ set -Eeuo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 LAUNCH=$HERE/selector_1f_costing.sh
 BIN=${BIN:-/tmp/tagreg/build/codec50-sink}
-WORK=${WORK:-/tmp/selcost-mut}
+# A fixed shared path plus `rm -rf` means two concurrent gate runs erase each other's
+# evidence -- and the loser reports on files the winner replaced.  Default to a private dir.
+WORK=${WORK:-$(mktemp -d /tmp/selcost-mut.XXXXXX)}
 CELL=${1:-fmt/debian-gcc}
 
 [ -x "$LAUNCH" ] || { echo "not executable: $LAUNCH" >&2; exit 1; }
 [ -x "$BIN" ] || { echo "codec binary not executable: $BIN" >&2; exit 1; }
 
-rm -rf "$WORK"; mkdir -p "$WORK"
+mkdir -p "$WORK"
 SHIM=$WORK/shim.sh
 cat >"$SHIM" <<EOF
 #!/usr/bin/env bash

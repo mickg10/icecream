@@ -141,7 +141,7 @@ int main() {
         check(sameShape(a, b),
               "gate 4: a stale head changed bounded-chain match selection after abort");
         check(expand(a, cc) == expand(b, ct),
-              "gate 4c: Root expands to a different Region sequence after the aborted TU");
+              "gate 4: Root expands to a different Region sequence after the aborted TU");
         check(control.occurrences() == tested.occurrences(), "gate 4: history diverged");
     }
 
@@ -218,6 +218,12 @@ int main() {
     }
 
     // GATE 5: one pending transaction, and no commit/abort without one.
+    //
+    // "It threw" is NOT the property.  A faulty guard that runs build() and THEN throws also
+    // throws, and the transaction's own abort() would truncate BOTH admissions afterwards and
+    // hide the damage -- while leaving whatever Block ids the second build minted behind in
+    // the catalogue, which is never rolled back.  So the rejection is checked as an INVARIANT:
+    // nothing may have moved before the throw.
     {
         p29::BlockCatalogue c; p29::OnlineS1 s(kCfg, c);
         bool threw = false;
@@ -226,22 +232,39 @@ int main() {
         threw = false;
         try { s.abort(); } catch (const std::logic_error&) { threw = true; }
         check(threw, "gate 5: abort without a pending transaction was accepted");
+
+        const std::vector<uint32_t> beforePrepare = s.occurrences();
+        const size_t catalogueBeforePrepare = c.size();
         s.prepare(kA);
         threw = false;
         try { s.prepare(kB); } catch (const std::logic_error&) { threw = true; }
         check(threw, "gate 5: a second prepare was accepted while one was pending");
-        // The load-bearing half.  admit() is a SECOND entrance to the state machine and takes
-        // the direct, non-journalled path: an admit() landing inside a live route transaction
-        // would mutate heads_ and the occurrence stream without recording them, and that
-        // route's later abort() would roll back to a state that never existed.  The rejection
-        // is what makes the two paths safe to coexist.
+
+        // The load-bearing half.  admit() is a SECOND entrance to the state machine.  Note
+        // what the hazard is NOT: with a transaction pending, install_anchor() still journals,
+        // so this is not un-journalled mutation.  The hazard is that the second TU FOLDS INTO
+        // the first transaction -- its occurrences append to the same stream and its head
+        // writes append to the same journal -- while pending_plan_ still describes only the
+        // first TU.  commit() and abort() would then act on an ill-defined two-TU transaction:
+        // abort() silently discards a TU the caller believes was admitted, and commit()
+        // retains both while the plan the caller holds covers one.
+        const std::vector<uint32_t> beforeRejectedAdmit = s.occurrences();
+        const size_t catalogueBeforeRejectedAdmit = c.size();
         threw = false;
         try { s.admit(kB); } catch (const std::logic_error&) { threw = true; }
         check(threw, "gate 5: a direct admit was accepted while a transaction was pending");
-        const std::vector<uint32_t> occDuringPending = s.occurrences();
+        check(s.has_pending(), "gate 5: the rejected admit cleared the existing transaction");
+        check(s.occurrences() == beforeRejectedAdmit,
+              "gate 5: the rejected admit mutated the pending occurrence history");
+        check(c.size() == catalogueBeforeRejectedAdmit,
+              "gate 5: the rejected admit minted into the canonical catalogue");
+        // And the pending transaction it protected must still roll back cleanly to the state
+        // from before prepare() -- otherwise the fixture proves nothing about a live route.
+        check(beforeRejectedAdmit.size() > beforePrepare.size(),
+              "gate 5: the fixture had no pending TU to protect");
         s.abort();
-        check(s.occurrences().size() < occDuringPending.size(),
-              "gate 5: the rejected admit fixture never had a pending TU to protect");
+        check(s.occurrences() == beforePrepare, "gate 5: abort after a rejected admit did not restore the history");
+        check(c.size() >= catalogueBeforePrepare, "gate 5: the catalogue was rewound");
     }
 
     // GATE 6: an aborted prepare that minted a Block KEEPS the canonical id -- catalogue ids

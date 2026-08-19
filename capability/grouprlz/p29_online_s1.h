@@ -164,10 +164,15 @@ public:
     // because a route transaction can be discarded before its Ack.
     //
     // The pending_ guard is load-bearing, not defensive.  Direct admission is a second
-    // entrance to the state machine: an admit() landing in the middle of a live route
-    // prepare() would mutate heads_ and the occurrence stream WITHOUT journalling them
-    // (install_anchor only records while pending_), and the route's later abort() would then
-    // roll back to a state that never existed.  Gate 5 tests this rejection.
+    // entrance to the state machine, and the hazard is NOT un-journalled mutation: with a
+    // transaction pending, install_anchor() still journals whatever this call touches.  The
+    // hazard is that the admitted TU FOLDS INTO the pending transaction -- its occurrences
+    // append to the same stream, its head writes append to the same journal -- while
+    // pending_plan_ still describes only the prepared TU.  commit() and abort() would then
+    // act on an ill-defined two-TU transaction: abort() silently discards a TU the caller
+    // believes was admitted, and commit() retains both while the plan the caller holds covers
+    // one.  Gate 5 tests the rejection, and tests it as an invariant -- nothing moved before
+    // the throw -- because a guard that builds first and throws afterwards also throws.
     //
     // build() is called directly rather than via prepare()+commit(): with pending_ false the
     // journal stays empty instead of recording every head write only to discard it, and the

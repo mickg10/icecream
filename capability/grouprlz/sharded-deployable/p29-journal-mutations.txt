@@ -4,4 +4,5 @@ caught   no_head_restore          FAIL: gate 4: a stale head changed bounded-cha
 caught   forward_head_restore     FAIL: gate 4: a stale head changed bounded-chain match selection after abort
 caught   no_occurrence_truncate   FAIL: gate 4: a stale head changed bounded-chain match selection after abort
 caught   no_pending_admit_guard   FAIL: gate 5: a direct admit was accepted while a transaction was pending
+caught   admit_builds_before_rejecting FAIL: gate 5: the rejected admit mutated the pending occurrence history
 every journal failure the gates must catch is caught, and the control passes

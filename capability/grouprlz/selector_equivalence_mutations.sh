@@ -17,13 +17,15 @@ set -Eeuo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 BIN=${BIN:-$HERE/build/codec50-sink}
 S1REF=${S1REF:?set S1REF to the reference codec50-sink build}
-WORK=${WORK:-/tmp/eqmut}
+# A fixed shared path plus `rm -rf` means two concurrent gate runs erase each other's
+# evidence -- and the loser reports on files the winner replaced.  Default to a private dir.
+WORK=${WORK:-$(mktemp -d /tmp/eqmut.XXXXXX)}
 CELL=${1:-fmt/debian-gcc}
 
 [ -x "$BIN" ] || { echo "not executable: $BIN" >&2; exit 1; }
 [ -x "$S1REF" ] || { echo "not executable: $S1REF" >&2; exit 1; }
 
-rm -rf "$WORK"; mkdir -p "$WORK"
+mkdir -p "$WORK"
 SHIM=$WORK/shim.sh
 cat >"$SHIM" <<EOF
 #!/usr/bin/env bash

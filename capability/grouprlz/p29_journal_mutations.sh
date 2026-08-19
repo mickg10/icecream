@@ -24,10 +24,12 @@
 # Usage:  ./p29_journal_mutations.sh
 set -Eeuo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-WORK=${WORK:-/tmp/p29journalmut}
+# A fixed shared path plus `rm -rf` means two concurrent gate runs erase each other's
+# evidence -- and the loser reports on files the winner replaced.  Default to a private dir.
+WORK=${WORK:-$(mktemp -d /tmp/p29journalmut.XXXXXX)}
 CXXFLAGS=${CXXFLAGS:--std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror}
 
-rm -rf "$WORK"; mkdir -p "$WORK"
+mkdir -p "$WORK"
 build_and_run() { # build_and_run <dir> ; echoes PASS or FAIL
   local dir=$1
   # The test includes the header with QUOTES, so the compiler searches the directory of the
@@ -72,10 +74,16 @@ mutate no_occurrence_truncate '/occurrences_\.resize(journal_\.occurrences);/d'
 # live route transaction and mutate un-journalled state that the route's abort() then "rolls
 # back" to a state that never existed.
 mutate no_pending_admit_guard 's/            throw std::logic_error("S1 admit while a transaction is already pending");/            (void)0;/'
+# M5b: the guard REJECTS, but only after the TU has already been built into the pending
+# transaction.  It still throws, so a gate that checks "it threw" passes -- which is why
+# gate 5 checks the invariant (nothing moved before the throw) instead.
+mutate admit_builds_before_rejecting \
+  's|^        if (pending_) {$|        if (pending_) { build(current_regions);|' \
+  's|^            throw std::logic_error("S1 admit while a transaction is already pending");$|            throw std::logic_error("S1 admit while a transaction is already pending");|'
 
 # These must be caught: they are the failures the journal exists to prevent, and each one
 # changes an answer a later TU depends on.
-required=(no_head_restore forward_head_restore no_occurrence_truncate no_pending_admit_guard)
+required=(no_head_restore forward_head_restore no_occurrence_truncate no_pending_admit_guard admit_builds_before_rejecting)
 bad=0
 for m in "${required[@]}"; do
   if [ "${RESULT[$m]}" = FAIL ]; then
