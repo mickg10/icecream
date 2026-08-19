@@ -1,0 +1,11 @@
+{
+  "schema": "icecream-distribution-suite-v1",
+  "name": "firefox-cold-plus-four-warm",
+  "scenarios": [
+    "scenarios/firefox-1c-1f-1000000cores.json",
+    "scenarios/firefox-1c-20f-50cores.json",
+    "scenarios/firefox-1c-50f-50cores.json",
+    "scenarios/firefox-10c-50f-60cores.json"
+  ],
+  "diagnostic_codecs": ["compile-only"]
+}

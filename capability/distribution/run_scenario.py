@@ -177,6 +177,44 @@ class SimulationResult:
     assignments: list[dict[str, object]]
     events: list[dict[str, object]]
     workers: list[dict[str, object]]
+    builds: list[dict[str, object]]
+
+
+class SparseSlotPool:
+    """Lowest-numbered free slot without materializing the worker's capacity.
+
+    A scenario may use one giant F with a million compile slots while exposing only a
+    few thousand jobs.  The old ``set(range(capacity))`` representation made memory use
+    proportional to declared capacity.  This pool grows only with slots actually used.
+    """
+
+    def __init__(self, capacity: int):
+        self.capacity = checked_positive_int(capacity, "slot capacity")
+        self.next_unused = 0
+        self.released: list[int] = []
+        self.in_use: set[int] = set()
+
+    def __bool__(self) -> bool:
+        return len(self.in_use) < self.capacity
+
+    def acquire(self) -> int:
+        if not self:
+            raise RuntimeError("slot acquisition from a full worker")
+        if self.released:
+            slot = heapq.heappop(self.released)
+        else:
+            slot = self.next_unused
+            self.next_unused += 1
+        if slot >= self.capacity or slot in self.in_use:
+            raise AssertionError("sparse slot pool is internally inconsistent")
+        self.in_use.add(slot)
+        return slot
+
+    def release(self, slot: int) -> None:
+        if slot not in self.in_use:
+            raise RuntimeError(f"slot {slot} was not reserved")
+        self.in_use.remove(slot)
+        heapq.heappush(self.released, slot)
 
 
 @dataclass
@@ -314,6 +352,7 @@ def load_scenario(
     checked_positive_int(network.get("shared_fabric_bps"), "network.shared_fabric_bps")
     if scheduler.get("ready_job_policy") not in {
         "fifo-release",
+        "environment-round-robin",
         "shortest-known",
         "trace",
     }:
@@ -388,6 +427,16 @@ def load_scenario(
             checked_nonnegative_int(
                 build_release.get("interval_ns"), "build interval_ns"
             )
+        elif "interval_ns" in build_release:
+            raise ValueError(
+                f"{workload}: interval_ns is valid only for fixed-interval release"
+            )
+        if build_mode == "after-previous":
+            checked_nonnegative_int(build_release.get("gap_ns", 0), "build gap_ns")
+        elif "gap_ns" in build_release:
+            raise ValueError(
+                f"{workload}: gap_ns is valid only for after-previous release"
+            )
         workload_config[workload] = job
         for build in range(builds):
             items: list[WorkItem] = []
@@ -426,9 +475,11 @@ class Simulator:
         self.scheduler = document["scheduler"]
         self.now = Fraction(0)
         self.release_heap: list[tuple[int, int, WorkItem]] = []
-        self.ready: list[WorkItem] = []
-        self.free_slots: dict[int, set[int]] = {
-            worker: set(range(self.slots_per_f)) for worker in range(self.f_count)
+        self.ready_heap: list[tuple[tuple[int, ...], int, WorkItem]] = []
+        self.ready_by_environment: dict[int, deque[WorkItem]] = defaultdict(deque)
+        self.ready_environment_cycle: deque[int] = deque()
+        self.free_slots: dict[int, SparseSlotPool] = {
+            worker: SparseSlotPool(self.slots_per_f) for worker in range(self.f_count)
         }
         self.compile_heap: list[tuple[Fraction, int, Transaction]] = []
         self.delivery_heap: list[tuple[Fraction, int, Flow]] = []
@@ -442,6 +493,7 @@ class Simulator:
         self.flow_sequence = 0
         self.transaction_sequence = 0
         self.round_robin_cursor = 0
+        self.ready_environment_members: set[int] = set()
         self.completed = 0
         self.total_items = sum(len(items) for items in scenario.work_items.values())
         self.build_remaining = {
@@ -497,15 +549,40 @@ class Simulator:
     def _release_ready(self) -> None:
         while self.release_heap and self.release_heap[0][0] <= self.now:
             _, _, item = heapq.heappop(self.release_heap)
-            self.ready.append(item)
-        if self.scheduler["ready_job_policy"] == "fifo-release":
-            self.ready.sort(key=lambda item: (item.release_ns, item.ordinal))
-        elif self.scheduler["ready_job_policy"] == "shortest-known":
-            self.ready.sort(
-                key=lambda item: (item.compile_ns, item.release_ns, item.ordinal)
-            )
-        elif self.scheduler["ready_job_policy"] == "trace":
-            self.ready.sort(key=lambda item: item.ordinal)
+            policy = self.scheduler["ready_job_policy"]
+            if policy == "environment-round-robin":
+                queue = self.ready_by_environment[item.environment]
+                queue.append(item)
+                if item.environment not in self.ready_environment_members:
+                    self.ready_environment_cycle.append(item.environment)
+                    self.ready_environment_members.add(item.environment)
+                continue
+            if policy == "fifo-release":
+                key = (int(item.release_ns), item.ordinal)
+            elif policy == "shortest-known":
+                key = (item.compile_ns, int(item.release_ns), item.ordinal)
+            elif policy == "trace":
+                key = (item.ordinal,)
+            else:
+                raise AssertionError(f"unvalidated ready-job policy {policy!r}")
+            heapq.heappush(self.ready_heap, (key, item.ordinal, item))
+
+    def _has_ready(self) -> bool:
+        if self.scheduler["ready_job_policy"] == "environment-round-robin":
+            return bool(self.ready_environment_cycle)
+        return bool(self.ready_heap)
+
+    def _pop_ready(self) -> WorkItem:
+        if self.scheduler["ready_job_policy"] != "environment-round-robin":
+            return heapq.heappop(self.ready_heap)[2]
+        environment = self.ready_environment_cycle.popleft()
+        queue = self.ready_by_environment[environment]
+        item = queue.popleft()
+        if queue:
+            self.ready_environment_cycle.append(environment)
+        else:
+            self.ready_environment_members.remove(environment)
+        return item
 
     def _free_workers(self) -> list[int]:
         return [worker for worker in range(self.f_count) if self.free_slots[worker]]
@@ -521,7 +598,7 @@ class Simulator:
                 worker = (self.round_robin_cursor + offset) % self.f_count
                 if worker in available:
                     self.round_robin_cursor = (worker + 1) % self.f_count
-                    return worker, min(self.free_slots[worker])
+                    return worker, self.free_slots[worker].acquire()
             raise AssertionError("round-robin failed to find a free worker")
         if policy == "fastest":
             worker = min(
@@ -531,16 +608,15 @@ class Simulator:
                     candidate,
                 ),
             )
-            return worker, min(self.free_slots[worker])
+            return worker, self.free_slots[worker].acquire()
         raise NotImplementedError(
             f"placement policy {policy!r} needs its stateful adapter in the common core"
         )
 
     def _dispatch(self) -> None:
-        while self.ready and self._free_workers():
-            item = self.ready.pop(0)
+        while self._has_ready() and self._free_workers():
+            item = self._pop_ready()
             worker, slot = self._select_slot(item)
-            self.free_slots[worker].remove(slot)
             phases = tuple(self.adapter.begin(item, worker))
             tx = Transaction(
                 self.transaction_sequence,
@@ -628,13 +704,14 @@ class Simulator:
         unresolved = set(self.active_flows)
         rates = {sequence: Fraction(0) for sequence in unresolved}
         while unresolved:
-            candidates: list[tuple[Fraction, tuple[object, ...]]] = []
-            for resource, capacity in capacities.items():
-                consumers = sum(
-                    resource in resources[sequence] for sequence in unresolved
-                )
-                if consumers:
-                    candidates.append((capacity / consumers, resource))
+            consumer_counts: dict[tuple[object, ...], int] = defaultdict(int)
+            for sequence in unresolved:
+                for resource in resources[sequence]:
+                    consumer_counts[resource] += 1
+            candidates = [
+                (capacities[resource] / consumers, resource)
+                for resource, consumers in consumer_counts.items()
+            ]
             if not candidates:
                 raise RuntimeError("active network flow has no capacity resource")
             increment = min(value for value, _ in candidates)
@@ -644,10 +721,7 @@ class Simulator:
                 )
             for sequence in unresolved:
                 rates[sequence] += increment
-            for resource in list(capacities):
-                consumers = sum(
-                    resource in resources[sequence] for sequence in unresolved
-                )
+            for resource, consumers in consumer_counts.items():
                 capacities[resource] -= increment * consumers
             saturated = {
                 resource for resource, capacity in capacities.items() if capacity == 0
@@ -711,7 +785,7 @@ class Simulator:
         while self.compile_heap and self.compile_heap[0][0] <= self.now:
             _, _, tx = heapq.heappop(self.compile_heap)
             self._event("compile-finish", tx)
-            self.free_slots[tx.worker].add(tx.slot)
+            self.free_slots[tx.worker].release(tx.slot)
             self.worker_reserved_ns[tx.worker] += self.now - tx.dispatch_ns
             self.completed += 1
             key = (tx.item.workload, tx.item.build)
@@ -722,8 +796,11 @@ class Simulator:
                 if config["build_release"][
                     "mode"
                 ] == "after-previous" and next_build < int(config["builds"]):
+                    gap_ns = int(config["build_release"].get("gap_ns", 0))
                     self._enqueue_build(
-                        tx.item.workload, next_build, ceil_fraction(self.now)
+                        tx.item.workload,
+                        next_build,
+                        ceil_fraction(self.now) + gap_ns,
                     )
 
     def _next_time(self) -> Fraction:
@@ -807,6 +884,58 @@ class Simulator:
                     ),
                 }
             )
+        transactions_by_build: dict[tuple[str, int], list[Transaction]] = defaultdict(
+            list
+        )
+        for tx in self.transactions:
+            transactions_by_build[(tx.item.workload, tx.item.build)].append(tx)
+        builds = []
+        previous_finish: dict[str, int] = {}
+        for workload, build in sorted(
+            transactions_by_build,
+            key=lambda key: (
+                transactions_by_build[key][0].item.environment,
+                key[0],
+                key[1],
+            ),
+        ):
+            transactions = transactions_by_build[(workload, build)]
+            release_ns = min(int(tx.item.release_ns) for tx in transactions)
+            first_dispatch_ns = min(
+                ceil_fraction(tx.dispatch_ns) for tx in transactions
+            )
+            last_transfer_done_ns = max(
+                ceil_fraction(tx.transfer_done_ns)  # type: ignore[arg-type]
+                for tx in transactions
+            )
+            finish_ns = max(
+                ceil_fraction(tx.compile_finish_ns)  # type: ignore[arg-type]
+                for tx in transactions
+            )
+            prior_finish_ns = previous_finish.get(workload)
+            builds.append(
+                {
+                    "environment": transactions[0].item.environment,
+                    "workload": workload,
+                    "build": build,
+                    "temperature": "cold" if build == 0 else "warm",
+                    "jobs": len(transactions),
+                    "release_ns": release_ns,
+                    "first_dispatch_ns": first_dispatch_ns,
+                    "last_transfer_done_ns": last_transfer_done_ns,
+                    "finish_ns": finish_ns,
+                    "elapsed_from_release_ns": finish_ns - release_ns,
+                    "gap_from_previous_finish_ns": (
+                        "" if prior_finish_ns is None else release_ns - prior_finish_ns
+                    ),
+                    "workers_used": len({tx.worker for tx in transactions}),
+                    "raw_bytes": sum(tx.item.raw_bytes for tx in transactions),
+                    "c_to_f_bytes": sum(tx.c_to_f_bytes for tx in transactions),
+                    "f_to_c_bytes": sum(tx.f_to_c_bytes for tx in transactions),
+                    "compiler_work_ns": sum(tx.item.compile_ns for tx in transactions),
+                }
+            )
+            previous_finish[workload] = finish_ns
         c_to_f = sum(tx.c_to_f_bytes for tx in self.transactions)
         f_to_c = sum(tx.f_to_c_bytes for tx in self.transactions)
         summary = {
@@ -820,8 +949,13 @@ class Simulator:
             "placement_policy": self.scheduler["placement_policy"],
             "ready_job_policy": self.scheduler["ready_job_policy"],
             "jobs": self.total_items,
+            "environments": int(self.scenario.document["environments"]["env_count"]),
+            "build_epochs": len(builds),
+            "cold_builds": sum(row["temperature"] == "cold" for row in builds),
+            "warm_builds": sum(row["temperature"] == "warm" for row in builds),
             "workers": self.f_count,
             "slots_per_worker": self.slots_per_f,
+            "total_worker_slots": self.f_count * self.slots_per_f,
             "raw_bytes": sum(
                 item.raw_bytes
                 for items in self.scenario.work_items.values()
@@ -838,7 +972,7 @@ class Simulator:
                 for item in items
             ),
         }
-        return SimulationResult(summary, assignments, self.events, workers)
+        return SimulationResult(summary, assignments, self.events, workers, builds)
 
 
 def write_tsv(path: Path, rows: Iterable[dict[str, object]]) -> None:
@@ -863,6 +997,25 @@ def payload_overrides(values: list[str]) -> dict[str, Path]:
             raise ValueError("invalid or repeated --corpus-root override")
         result[workload] = Path(path).resolve()
     return result
+
+
+def write_result(
+    scenario: LoadedScenario, result: SimulationResult, output_directory: Path
+) -> None:
+    output_directory.mkdir(parents=True, exist_ok=True)
+    resolved_document = json.loads(json.dumps(scenario.document))
+    for job in resolved_document["environments"]["job_selection"]["jobs"]:
+        job["corpus_root"] = scenario.workload_inputs[job["id"]]["corpus_root"]
+    (output_directory / "resolved-scenario.json").write_text(
+        json.dumps(resolved_document, indent=2) + "\n"
+    )
+    (output_directory / "summary.json").write_text(
+        json.dumps(result.summary, indent=2) + "\n"
+    )
+    write_tsv(output_directory / "assignments.tsv", result.assignments)
+    write_tsv(output_directory / "events.tsv", result.events)
+    write_tsv(output_directory / "workers.tsv", result.workers)
+    write_tsv(output_directory / "builds.tsv", result.builds)
 
 
 def main() -> int:
@@ -891,17 +1044,7 @@ def main() -> int:
         CompileOnlyAdapter() if args.codec == "compile-only" else RawAdapter()
     )
     result = Simulator(scenario, adapter).run()
-    args.out.mkdir(parents=True, exist_ok=True)
-    resolved_document = json.loads(json.dumps(scenario.document))
-    for job in resolved_document["environments"]["job_selection"]["jobs"]:
-        job["corpus_root"] = scenario.workload_inputs[job["id"]]["corpus_root"]
-    (args.out / "resolved-scenario.json").write_text(
-        json.dumps(resolved_document, indent=2) + "\n"
-    )
-    (args.out / "summary.json").write_text(json.dumps(result.summary, indent=2) + "\n")
-    write_tsv(args.out / "assignments.tsv", result.assignments)
-    write_tsv(args.out / "events.tsv", result.events)
-    write_tsv(args.out / "workers.tsv", result.workers)
+    write_result(scenario, result, args.out)
     print(json.dumps(result.summary, indent=2))
     return 0
 

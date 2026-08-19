@@ -59,12 +59,32 @@
                     "required": ["mode"],
                     "properties": {
                       "mode": { "enum": ["after-previous", "concurrent", "fixed-interval"] },
-                      "interval_ns": { "type": "integer", "minimum": 0 }
+                      "interval_ns": { "type": "integer", "minimum": 0 },
+                      "gap_ns": { "type": "integer", "minimum": 0 }
                     },
                     "allOf": [
                       {
                         "if": { "properties": { "mode": { "const": "fixed-interval" } } },
                         "then": { "required": ["interval_ns"] }
+                      },
+                      {
+                        "if": { "properties": { "mode": { "const": "fixed-interval" } } },
+                        "then": { "not": { "required": ["gap_ns"] } }
+                      },
+                      {
+                        "if": { "properties": { "mode": { "const": "after-previous" } } },
+                        "then": { "not": { "required": ["interval_ns"] } }
+                      },
+                      {
+                        "if": { "properties": { "mode": { "const": "concurrent" } } },
+                        "then": {
+                          "not": {
+                            "anyOf": [
+                              { "required": ["interval_ns"] },
+                              { "required": ["gap_ns"] }
+                            ]
+                          }
+                        }
                       }
                     ]
                   },
@@ -117,7 +137,9 @@
       "additionalProperties": false,
       "required": ["ready_job_policy", "placement_policy"],
       "properties": {
-        "ready_job_policy": { "enum": ["fifo-release", "shortest-known", "trace"] },
+        "ready_job_policy": {
+          "enum": ["fifo-release", "environment-round-robin", "shortest-known", "trace"]
+        },
         "placement_policy": {
           "enum": [
             "round-robin",

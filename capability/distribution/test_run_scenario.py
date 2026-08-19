@@ -115,12 +115,68 @@ class SimulatorTest(unittest.TestCase):
             path = write_fixture(root, [5], [1], workers=1)
             document = json.loads(path.read_text())
             document["environments"]["job_selection"]["jobs"][0]["builds"] = 2
+            document["environments"]["job_selection"]["jobs"][0]["build_release"][
+                "gap_ns"
+            ] = 600
             path.write_text(json.dumps(document))
             result = sim.Simulator(
                 sim.load_scenario(path), sim.CompileOnlyAdapter()
             ).run()
-            self.assertEqual([row["dispatch_ns"] for row in result.assignments], [0, 5])
-            self.assertEqual(result.summary["makespan_ns"], 10)
+            self.assertEqual(
+                [row["dispatch_ns"] for row in result.assignments], [0, 605]
+            )
+            self.assertEqual(result.summary["makespan_ns"], 610)
+            self.assertEqual(
+                [row["gap_from_previous_finish_ns"] for row in result.builds],
+                ["", 600],
+            )
+
+    def test_million_slot_worker_is_sparse(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_fixture(root, [4, 1, 1], [1, 1, 1], workers=1)
+            document = json.loads(path.read_text())
+            document["workers"]["template"]["slots"] = 1_000_000
+            path.write_text(json.dumps(document))
+            simulator = sim.Simulator(sim.load_scenario(path), sim.CompileOnlyAdapter())
+            result = simulator.run()
+            self.assertEqual([row["slot"] for row in result.assignments], [0, 1, 2])
+            self.assertEqual(result.summary["total_worker_slots"], 1_000_000)
+            self.assertEqual(simulator.free_slots[0].next_unused, 3)
+            self.assertEqual(simulator.free_slots[0].in_use, set())
+
+    def test_environments_advance_builds_independently_and_fairly(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_fixture(root, [5], [1], workers=2)
+            document = json.loads(path.read_text())
+            first = document["environments"]["job_selection"]["jobs"][0]
+            first["builds"] = 2
+            first["build_release"]["gap_ns"] = 600
+            second = json.loads(json.dumps(first))
+            second["id"] = "test-c1"
+            second["environment"] = 1
+            document["environments"]["env_count"] = 2
+            document["environments"]["job_selection"]["jobs"].append(second)
+            document["scheduler"]["ready_job_policy"] = "environment-round-robin"
+            path.write_text(json.dumps(document))
+            result = sim.Simulator(
+                sim.load_scenario(path), sim.CompileOnlyAdapter()
+            ).run()
+            self.assertEqual(
+                [(row["environment"], row["build"]) for row in result.assignments],
+                [(0, 0), (1, 0), (0, 1), (1, 1)],
+            )
+            self.assertEqual(
+                [row["dispatch_ns"] for row in result.assignments],
+                [0, 0, 605, 605],
+            )
+            self.assertEqual(result.summary["cold_builds"], 2)
+            self.assertEqual(result.summary["warm_builds"], 2)
+            self.assertEqual(
+                [row["gap_from_previous_finish_ns"] for row in result.builds],
+                ["", 600, "", 600],
+            )
 
     def test_dialogue_waits_for_each_arrival_and_scores_only_c_to_f(self) -> None:
         class ThreePhase(sim.CodecAdapter):

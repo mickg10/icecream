@@ -60,6 +60,70 @@ python3 capability/distribution/run_scenario.py \
   --out /tmp/firefox-compile-only
 ```
 
+## Cold plus four-warm topology suite
+
+`firefox-5build-topology-suite.json` is the one-command suite for the four requested
+topologies.  Each C executes five complete Firefox builds: build 0 starts with cold codec
+state, then builds 1 through 4 reuse the same adapter state.  A warm build is released only
+after that C's previous build completes and a further 600 seconds elapse.  Cs advance their
+own build sequences independently while competing for the common F pool and network.
+
+The workload is the complete corrected 2,498-TU trace on every build.  Compile duration
+remains paired with its source TU; this suite does not draw durations from an unrelated
+synthetic distribution.
+
+| scenario | Cs | Fs | slots/F | build epochs | TU executions |
+|---|---:|---:|---:|---:|---:|
+| giant F | 1 | 1 | 1,000,000 | 5 | 12,490 |
+| 20-F pool | 1 | 20 | 50 | 5 | 12,490 |
+| 50-F pool | 1 | 50 | 50 | 5 | 12,490 |
+| ten concurrent Cs | 10 | 50 | 60 | 50 | 124,900 |
+
+The million-slot case uses a sparse allocator, so simulator memory grows with slots that
+actually run work rather than with the declared million-slot capacity.  The ten-C scenario
+uses environment-round-robin ready selection so one C cannot occupy the whole initial
+queue merely because its trace appeared first in JSON.
+
+Run the complete diagnostic suite with:
+
+```bash
+python3 capability/distribution/run_suite.py \
+  capability/distribution/firefox-5build-topology-suite.json \
+  --codec compile-only --codec raw --require-payload \
+  --out /tmp/firefox-5build-topology-suite
+```
+
+`compile-only` isolates scheduling and compiler occupancy.  `raw` sends every `.ii` byte
+and exercises route serialization, propagation, shared-fabric allocation and compile
+overlap.  They are controls, not compression candidates.  A stateful GRZ or P29 adapter
+will use the same simulator instance for all five builds; it must key C state by
+`environment` and F relationship state by `(environment, worker)`.
+
+Every run writes `resolved-scenario.json`, `summary.json`, `assignments.tsv`, `events.tsv`,
+`workers.tsv`, and `builds.tsv`.  The suite additionally writes deterministic `matrix.tsv`,
+`builds.tsv`, and `suite-summary.json`; host runner timings are deliberately kept separate
+in `runner-timings.tsv`.
+
+The first full replay produced:
+
+| topology | compile-only makespan | raw makespan | raw C-to-F bytes |
+|---|---:|---:|---:|
+| 1C / 1F / 1,000,000 slots | 2,516.383 s | 3,084.792 s | 76,204,381,990 |
+| 1C / 20F / 50 slots | 2,522.896 s | 2,554.908 s | 76,204,381,990 |
+| 1C / 50F / 50 slots | 2,516.383 s | 2,556.821 s | 76,204,381,990 |
+| 10C / 50F / 60 slots | 2,634.893 s | 3,084.550 s | 762,043,819,900 |
+
+These makespans include four 600-second inter-build gaps.  Across both controls there are
+130 per-C build rows: 26 cold and 104 warm.  Every noninitial row has an observed
+600,000,000,000 ns completion-to-release gap.
+
+The combined 33 MiB ledger is retained at
+`/tanksmall/scratch/ictmp/issue16-results/firefox-5build-topology-suite-v2/`.
+SHA-256 values for `suite-summary.json`, `matrix.tsv`, and `builds.tsv` are respectively
+`64c50672b9cdd3ddd7682f50d1948af46a73b91013ea4b671e8e90a5251279a7`,
+`1b15f27bec60e42094d1539242e7084fa36ad520da41bf165bcf3ba5c09ff169`, and
+`04c40680e5543675ed42e9b1ba19ac9806e8971e7c575c59e351af9fce999715`.
+
 ## First measured replay
 
 The corrected 2,498-job trace contains 15,240,876,398 raw bytes and
