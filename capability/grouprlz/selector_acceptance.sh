@@ -26,7 +26,7 @@
 #                  p29_two_f_state_mutations.sh      two-F route/F boundary paths
 #   chronology     p29_unavailable_suffix.sh         TU2 absent through TU1 Ack
 #                  selector_prefix_invariance.sh     physical prefixes vs supplied suffix
-#   routing        p29_routing_manifest_test.sh      R0-R4 assignments + prefix causality
+#   routing        p29_routing_manifest_test.sh      R0-R5 assignments + prefix causality
 #   wire gates     selector_step1_equivalence.sh  planning vs on-demand, byte-identical
 #                  selector_step2_equivalence.sh  reference vs build under test
 #                  selector_tag_regression.sh     typed-tag guards G1-G3

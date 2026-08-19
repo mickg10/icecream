@@ -40,6 +40,8 @@ struct Options {
     uint64_t investment_weight_num = 1;
     uint64_t investment_weight_den = 1;
     uint64_t investment_history_scale = 4;
+    size_t r5_horizon = 4;
+    size_t r5_beam_width = 64;
     p29::routing::Policy policy = p29::routing::Policy::R0RoundRobin;
 };
 
@@ -85,6 +87,7 @@ bool parse_policy(const char* text, p29::routing::Policy& policy) {
         {"r2-home", p29::routing::Policy::R2Home},
         {"r3-rendezvous", p29::routing::Policy::R3Rendezvous},
         {"r4-state", p29::routing::Policy::R4StateAware},
+        {"r5-bounded", p29::routing::Policy::R5Bounded},
     };
     for (const Entry& entry : entries)
         if (!std::strcmp(text, entry.name)) {
@@ -140,11 +143,12 @@ void usage(const char* program) {
     std::fprintf(
         stderr,
         "usage: %s --manifest FILE --assignment-out FILE --curve-out FILE "
-        "--policy r0-roundrobin|r0-fastest|r1-resident|r2-home|r3-rendezvous|r4-state "
+        "--policy r0-roundrobin|r0-fastest|r1-resident|r2-home|r3-rendezvous|r4-state|"
+        "r5-bounded "
         "[--workers N] [--slots N,N,...] [--requested-slots N] [--repetitions N] "
         "[--max-files N] [--egress-lanes N] [--link-bps N] [--compiler-bps N] "
         "[--time-weight NUM DEN] [--investment-weight NUM DEN] "
-        "[--investment-history-scale N]\n",
+        "[--investment-history-scale N] [--r5-horizon N] [--r5-beam N]\n",
         program);
 }
 
@@ -205,6 +209,16 @@ int main(int argc, char** argv) {
             if (!parse_u64(argv[++index], options.investment_history_scale) ||
                 !options.investment_history_scale)
                 return 2;
+        } else if (!std::strcmp(argv[index], "--r5-horizon") && index + 1 < argc) {
+            uint64_t value = 0;
+            if (!parse_u64(argv[++index], value) || !value || value > SIZE_MAX)
+                return 2;
+            options.r5_horizon = static_cast<size_t>(value);
+        } else if (!std::strcmp(argv[index], "--r5-beam") && index + 1 < argc) {
+            uint64_t value = 0;
+            if (!parse_u64(argv[++index], value) || !value || value > SIZE_MAX)
+                return 2;
+            options.r5_beam_width = static_cast<size_t>(value);
         } else {
             usage(argv[0]);
             return 2;
@@ -326,8 +340,24 @@ int main(int argc, char** argv) {
             }
         }
 
-        const p29::routing::ReplayResult result =
-            p29::routing::replay(replay_config, trace, options.policy);
+        p29::routing::ReplayResult result;
+        p29::routing::R5LowerBounds r5_lower;
+        uint64_t r5_expanded = 0, r5_pruned = 0;
+        if (options.policy == p29::routing::Policy::R5Bounded) {
+            p29::routing::R5SearchOptions search;
+            search.horizon = options.r5_horizon;
+            search.beam_width = options.r5_beam_width;
+            search.time_weight_bytes = options.time_weight_bytes;
+            search.time_weight_ns = options.time_weight_ns;
+            p29::routing::BoundedR5Result bounded =
+                p29::routing::bounded_r5_replay(replay_config, trace, search);
+            r5_lower = bounded.lower_bounds;
+            r5_expanded = bounded.expanded_paths;
+            r5_pruned = bounded.pruned_paths;
+            result = std::move(bounded.feasible);
+        } else {
+            result = p29::routing::replay(replay_config, trace, options.policy);
+        }
         std::ofstream assignments(options.assignment_out);
         if (!assignments) throw std::runtime_error("cannot open assignment output");
         assignments << "routing-assignment-v1\n";
@@ -351,12 +381,22 @@ int main(int argc, char** argv) {
         std::printf(
             "ROUTING_ESTIMATE schema=independent-region-zstd3-v1 policy=%s tus=%zu "
             "workers=%u requested_slots=%u estimated_c_to_f=%llu makespan_ns=%llu "
-            "N_eff=%.9f H_route=%.9f assignment=%s curve=%s\n",
+            "N_eff=%.9f H_route=%.9f r5_lower_c_to_f=%llu "
+            "r5_lower_makespan_ns=%llu r5_bound=%s r5_horizon=%zu r5_beam=%zu "
+            "r5_expanded=%llu r5_pruned=%llu assignment=%s curve=%s\n",
             p29::routing::policy_name(options.policy), trace.size(), options.workers,
             options.requested_slots,
             static_cast<unsigned long long>(result.c_to_f_bytes),
             static_cast<unsigned long long>(result.makespan_ns), result.n_eff,
-            result.route_entropy, options.assignment_out, options.curve_out);
+            result.route_entropy,
+            static_cast<unsigned long long>(r5_lower.c_to_f_bytes),
+            static_cast<unsigned long long>(r5_lower.makespan_ns),
+            r5_lower.includes_mandatory_single_rep_closure ? "single-rep-union"
+                                                           : "root-control-only",
+            options.r5_horizon, options.r5_beam_width,
+            static_cast<unsigned long long>(r5_expanded),
+            static_cast<unsigned long long>(r5_pruned), options.assignment_out,
+            options.curve_out);
         return 0;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "routing manifest adapter: %s\n", error.what());

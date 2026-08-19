@@ -10,7 +10,7 @@ g++ -O2 -std=c++17 -DICE_LINE_CAP_LOG2=23 -Wall -Wextra -Wpedantic -Werror \
     -pthread "$HERE/p29_routing_manifest.cpp" "$HERE/../cap_codec.cpp" \
     -o "$WORK/p29-routing-manifest" -lzstd
 
-for policy in r0-roundrobin r0-fastest r1-resident r2-home r3-rendezvous r4-state; do
+for policy in r0-roundrobin r0-fastest r1-resident r2-home r3-rendezvous r4-state r5-bounded; do
     "$WORK/p29-routing-manifest" --manifest "$MANIFEST" --max-files 4 \
         --repetitions 2 --workers 3 --slots 2,1,1 --requested-slots 3 \
         --egress-lanes 3 --policy "$policy" \
@@ -21,6 +21,8 @@ for policy in r0-roundrobin r0-fastest r1-resident r2-home r3-rendezvous r4-stat
     test "$(wc -l <"$WORK/$policy.tsv")" -eq 9
     grep -q '^ROUTING_ESTIMATE schema=independent-region-zstd3-v1' "$WORK/$policy.out"
 done
+grep -q 'policy=R5_BOUNDED .*r5_lower_c_to_f=[1-9][0-9]* .*r5_bound=single-rep-union' \
+    "$WORK/r5-bounded.out"
 
 # Stable TUKey rendezvous must retain each TU's destination on the second repetition.
 awk 'NR==2 { first[0]=$2 } NR==3 { first[1]=$2 } NR==4 { first[2]=$2 } NR==5 { first[3]=$2 }
@@ -45,4 +47,4 @@ ASAN_OPTIONS=detect_leaks=1 "$WORK/p29-routing-manifest.san" \
     --assignment-out "$WORK/r4-san.assignment" --curve-out "$WORK/r4-san.tsv" \
     >"$WORK/r4-san.out" 2>"$WORK/r4-san.err"
 
-echo "P29 manifest R0-R4 assignment adapter PASS evidence=$WORK"
+echo "P29 manifest R0-R5 assignment adapter PASS evidence=$WORK"

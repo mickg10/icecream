@@ -145,6 +145,19 @@ int main() {
                   frontier[0].actions[0].representation == 1 &&
                   frontier[0].actions[1].representation == 1,
               "R5 did not value future installed state");
+
+        R5SearchOptions search;
+        search.horizon = 2;
+        search.beam_width = 4;
+        const BoundedR5Result bounded = bounded_r5_replay(c, trace, search);
+        check(bounded.feasible.c_to_f_bytes == frontier[0].c_to_f_bytes &&
+                  bounded.feasible.rows[0].action == frontier[0].actions[0] &&
+                  bounded.feasible.rows[1].action == frontier[0].actions[1] &&
+                  bounded.expanded_paths == 8 && bounded.pruned_paths == 0,
+              "bounded R5 did not reproduce an enumerable byte optimum");
+        check(!bounded.lower_bounds.includes_mandatory_single_rep_closure &&
+                  bounded.lower_bounds.c_to_f_bytes == 20,
+              "multi-representation R5 lower bound claimed forced closure bytes");
     }
 
     // The online investment learner observes semantic TU use, not the number of candidate
@@ -180,6 +193,29 @@ int main() {
         check(frontier[0].c_to_f_bytes == 110 && frontier[0].makespan_ns > 1900 &&
                   frontier[1].c_to_f_bytes == 200 && frontier[1].makespan_ns < 1100,
               "R5 Pareto costs differ from exact chronological state");
+
+        R5SearchOptions byte_search;
+        byte_search.horizon = 2;
+        byte_search.beam_width = 4;
+        const BoundedR5Result byte_result = bounded_r5_replay(c, trace, byte_search);
+        check(byte_result.feasible.c_to_f_bytes == frontier[0].c_to_f_bytes &&
+                  byte_result.lower_bounds.includes_mandatory_single_rep_closure &&
+                  byte_result.lower_bounds.c_to_f_bytes == frontier[0].c_to_f_bytes,
+              "single-representation closure union is not a tight byte lower bound");
+
+        R5SearchOptions time_search = byte_search;
+        time_search.time_weight_bytes = 1;
+        const BoundedR5Result time_result = bounded_r5_replay(c, trace, time_search);
+        check(time_result.feasible.c_to_f_bytes == frontier[1].c_to_f_bytes &&
+                  time_result.feasible.makespan_ns == frontier[1].makespan_ns &&
+                  time_result.lower_bounds.makespan_ns <= frontier[1].makespan_ns,
+              "bounded R5 did not reproduce the enumerable fast Pareto point");
+
+        R5SearchOptions pruned_search = byte_search;
+        pruned_search.beam_width = 1;
+        const BoundedR5Result pruned = bounded_r5_replay(c, trace, pruned_search);
+        check(pruned.pruned_paths > 0 && pruned.feasible.rows.size() == trace.size(),
+              "bounded R5 did not label beam truncation while retaining a feasible replay");
     }
 
     // R2 opens the fewest capacity-sufficient Fs.  An 8-slot F alone satisfies six requested
@@ -189,6 +225,53 @@ int main() {
         const auto homes = home_set(c, opaque(30));
         check(homes.size() == 1 && homes[0] == 0,
               "R2 did not choose the minimum capacity-sufficient home set");
+    }
+
+    // With a full horizon and a beam large enough to retain every path, bounded R5 must agree
+    // with exhaustive R5.  Vary bytes, shared objects and compile durations so this exercises
+    // both state restoration and the byte/time ordering rather than one fixed example.
+    for (uint32_t seed = 0; seed < 8; ++seed) {
+        ReplayConfig c = config({1, 1}, 2);
+        c.egress_lanes = 2;
+        const WireFragment shared{uint32_t(30 + seed), uint64_t(20 + seed),
+                                  FragmentKind::Material};
+        const WireFragment tail{uint32_t(50 + seed), uint64_t(9 + seed),
+                                FragmentKind::Material};
+        std::vector<Tu> trace{
+            tu(0, uint8_t(60 + seed), 20 + seed,
+               {rep(p29::CandidateKind::Raw, 45 + seed),
+                rep(p29::CandidateKind::Fi, 7, {shared})}),
+            tu(1, uint8_t(70 + seed), 35 - seed,
+               {rep(p29::CandidateKind::Raw, 42 + seed),
+                rep(p29::CandidateKind::Fi, 6, {shared, tail})}),
+            tu(2, uint8_t(80 + seed), 11 + seed,
+               {rep(p29::CandidateKind::Raw, 31 + seed),
+                rep(p29::CandidateKind::Fi, 5, {tail})})};
+        const std::vector<ParetoOutcome> exact = exact_r5_frontier(c, trace);
+        for (uint64_t time_weight : {uint64_t{0}, uint64_t{1}}) {
+            const auto expected = std::min_element(
+                exact.begin(), exact.end(), [&](const auto& left, const auto& right) {
+                    const uint64_t left_score =
+                        left.c_to_f_bytes + left.makespan_ns * time_weight;
+                    const uint64_t right_score =
+                        right.c_to_f_bytes + right.makespan_ns * time_weight;
+                    if (left_score != right_score) return left_score < right_score;
+                    if (left.c_to_f_bytes != right.c_to_f_bytes)
+                        return left.c_to_f_bytes < right.c_to_f_bytes;
+                    if (left.makespan_ns != right.makespan_ns)
+                        return left.makespan_ns < right.makespan_ns;
+                    return left.actions < right.actions;
+                });
+            R5SearchOptions search;
+            search.horizon = trace.size();
+            search.beam_width = 64;
+            search.time_weight_bytes = time_weight;
+            const BoundedR5Result bounded = bounded_r5_replay(c, trace, search);
+            check(bounded.pruned_paths == 0 &&
+                      bounded.feasible.c_to_f_bytes == expected->c_to_f_bytes &&
+                      bounded.feasible.makespan_ns == expected->makespan_ns,
+                  "unpruned full-horizon R5 disagrees with exhaustive R5");
+        }
     }
 
     // Independent Fs never receive one another's installed-object credit.  Round-robin sends

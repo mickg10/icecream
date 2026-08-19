@@ -82,11 +82,13 @@ enum class Policy : uint8_t {
     R2Home = 3,
     R3Rendezvous = 4,
     R4StateAware = 5,
+    R5Bounded = 6,
 };
 
 inline const char* policy_name(Policy policy) {
     static constexpr const char* names[]{"R0_ROUND_ROBIN", "R0_FASTEST", "R1_RESIDENT",
-                                          "R2_HOME", "R3_RENDEZVOUS", "R4_STATE_AWARE"};
+                                          "R2_HOME", "R3_RENDEZVOUS", "R4_STATE_AWARE",
+                                          "R5_BOUNDED"};
     const size_t index = static_cast<size_t>(policy);
     return index < sizeof(names) / sizeof(names[0]) ? names[index] : "INVALID";
 }
@@ -173,6 +175,31 @@ struct ParetoOutcome {
     uint64_t c_to_f_bytes = 0;
     uint64_t makespan_ns = 0;
     std::vector<Action> actions;
+};
+
+struct R5SearchOptions {
+    size_t horizon = 4;
+    size_t beam_width = 64;
+    uint64_t time_weight_bytes = 0;
+    uint64_t time_weight_ns = 1;
+};
+
+struct R5LowerBounds {
+    uint64_t c_to_f_bytes = 0;
+    uint64_t makespan_ns = 0;
+    // True means every TU had one forced representation, so the byte bound also includes one
+    // globally necessary transmission of each initially-unavailable typed closure object.
+    // False means the relaxation charges only the cheapest per-TU root/control pair.
+    bool includes_mandatory_single_rep_closure = false;
+};
+
+struct BoundedR5Result {
+    ReplayResult feasible{};
+    R5LowerBounds lower_bounds{};
+    uint64_t expanded_paths = 0;
+    uint64_t pruned_paths = 0;
+    size_t horizon = 0;
+    size_t beam_width = 0;
 };
 
 namespace detail {
@@ -475,6 +502,88 @@ inline DecisionRow apply(const ReplayConfig& config, ReplayState& state, const T
             f.route_commits};
 }
 
+namespace detail {
+
+// A bounded R5 window explores many futures from the same committed prefix.  Copying the
+// complete per-F object vectors for every branch makes that search scale with catalogue size
+// instead of with the window.  This log records exactly the fields touched by one apply so a
+// depth-first path can be restored in place.
+struct ApplyUndo {
+    size_t f = 0;
+    size_t egress_lane = 0;
+    size_t compiler_slot = 0;
+    uint64_t prior_egress_ready_ns = 0;
+    uint64_t prior_compiler_ready_ns = 0;
+    uint64_t prior_route_commits = 0;
+    uint64_t prior_accepted_raw_bytes = 0;
+    uint64_t prior_c_to_f_bytes = 0;
+    uint64_t prior_makespan_ns = 0;
+    Opaque128 generation{};
+    bool generation_created = false;
+    std::array<size_t, 5> prior_known_sizes{};
+    std::vector<MissingObjectEvent> installed;
+};
+
+inline DecisionRow reversible_apply(const ReplayConfig& config, ReplayState& state,
+                                    const Tu& tu, const EvaluatedAction& evaluated,
+                                    ApplyUndo& undo) {
+    undo = {};
+    undo.f = evaluated.action.f;
+    undo.egress_lane = evaluated.egress_lane;
+    undo.compiler_slot = evaluated.compiler_slot;
+    undo.prior_egress_ready_ns = state.egress_ready_ns[evaluated.egress_lane];
+    FState& f = state.fs[evaluated.action.f];
+    undo.prior_compiler_ready_ns = f.compiler_ready_ns[evaluated.compiler_slot];
+    undo.prior_route_commits = f.route_commits;
+    undo.prior_accepted_raw_bytes = f.accepted_raw_bytes;
+    undo.prior_c_to_f_bytes = state.c_to_f_bytes;
+    undo.prior_makespan_ns = state.makespan_ns;
+    undo.generation = tu.source_generation;
+    const GenerationState* generation_before = generation(f, tu.source_generation);
+    undo.generation_created = !generation_before &&
+                              !tu.representations[evaluated.action.representation]
+                                   .closure.empty();
+    if (generation_before)
+        for (size_t kind = 0; kind < generation_before->known.size(); ++kind)
+            undo.prior_known_sizes[kind] = generation_before->known[kind].size();
+    undo.installed = evaluated.cost.missing_objects;
+    return apply(config, state, tu, evaluated, false);
+}
+
+inline void undo_reversible_apply(ReplayState& state, const ApplyUndo& undo) {
+    FState& f = state.fs[undo.f];
+    state.egress_ready_ns[undo.egress_lane] = undo.prior_egress_ready_ns;
+    f.compiler_ready_ns[undo.compiler_slot] = undo.prior_compiler_ready_ns;
+    f.route_commits = undo.prior_route_commits;
+    f.accepted_raw_bytes = undo.prior_accepted_raw_bytes;
+    state.c_to_f_bytes = undo.prior_c_to_f_bytes;
+    state.makespan_ns = undo.prior_makespan_ns;
+
+    if (undo.generation_created) {
+        if (f.generations.empty() || f.generations.back().generation != undo.generation)
+            throw std::logic_error("R5 reversible generation stack is not LIFO");
+        f.generations.pop_back();
+        return;
+    }
+    GenerationState* generation_state = generation(f, undo.generation, false);
+    if (!generation_state) {
+        if (!undo.installed.empty())
+            throw std::logic_error("R5 reversible generation disappeared");
+        return;
+    }
+    for (const MissingObjectEvent& object : undo.installed) {
+        std::vector<uint8_t>& typed =
+            generation_state->known[object_kind_index(object.kind)];
+        if (object.ordinal >= typed.size() || !typed[object.ordinal])
+            throw std::logic_error("R5 reversible install record disagrees with state");
+        typed[object.ordinal] = 0;
+    }
+    for (size_t kind = 0; kind < generation_state->known.size(); ++kind)
+        generation_state->known[kind].resize(undo.prior_known_sizes[kind]);
+}
+
+}  // namespace detail
+
 inline std::vector<size_t> eligible_fs(const ReplayConfig& config) {
     std::vector<size_t> result;
     for (size_t index = 0; index < config.fs.size(); ++index)
@@ -660,6 +769,241 @@ inline ReplayResult replay(const ReplayConfig& config, const std::vector<Tu>& tr
 inline ReplayResult replay(const ReplayConfig& config, const std::vector<Tu>& trace,
                            Policy policy) {
     return replay(config, trace, policy, initial_state(config));
+}
+
+namespace detail {
+
+struct R5Path {
+    std::vector<Action> actions;
+    uint64_t c_to_f_bytes = 0;
+    uint64_t makespan_ns = 0;
+};
+
+inline uint64_t r5_objective(const R5Path& path, const R5SearchOptions& options) {
+    const uint64_t time = mul_div_ceil(path.makespan_ns, options.time_weight_bytes,
+                                       options.time_weight_ns,
+                                       "R5 weighted time overflow");
+    return checked_add(path.c_to_f_bytes, time, "R5 weighted objective overflow");
+}
+
+inline bool r5_path_less(const R5Path& left, const R5Path& right,
+                         const R5SearchOptions& options) {
+    const uint64_t left_score = r5_objective(left, options);
+    const uint64_t right_score = r5_objective(right, options);
+    if (left_score != right_score) return left_score < right_score;
+    if (left.c_to_f_bytes != right.c_to_f_bytes)
+        return left.c_to_f_bytes < right.c_to_f_bytes;
+    if (left.makespan_ns != right.makespan_ns)
+        return left.makespan_ns < right.makespan_ns;
+    return left.actions < right.actions;
+}
+
+inline bool known_on_any_eligible_f(const ReplayConfig& config, const ReplayState& state,
+                                    const Opaque128& generation_id, ObjectKind kind,
+                                    uint32_t ordinal) {
+    for (size_t f = 0; f < config.fs.size(); ++f)
+        if (config.fs[f].eligible && known(state.fs[f], generation_id, kind, ordinal))
+            return true;
+    return false;
+}
+
+}  // namespace detail
+
+// These are relaxations, not a fabricated full-trace optimum.  The byte bound is especially
+// useful for the current one-representation routing trace: every typed object used by that
+// forced representation must cross C-to-F at least once unless some eligible F already has it.
+// With competing representations, closure choice is relaxed away and the result is the sum of
+// the cheapest roots/controls.  Both forms are guaranteed lower bounds, but only the former is
+// normally tight enough to close a byte-regret decision.
+inline R5LowerBounds r5_lower_bounds(const ReplayConfig& config,
+                                     const std::vector<Tu>& trace,
+                                     const ReplayState& state) {
+    validate(config, trace);
+    if (state.fs.size() != config.fs.size() ||
+        state.egress_ready_ns.size() != config.egress_lanes)
+        throw std::invalid_argument("R5 lower-bound state dimensions differ from config");
+    for (size_t f = 0; f < state.fs.size(); ++f)
+        if (state.fs[f].identity.f_id != config.fs[f].identity.f_id ||
+            state.fs[f].compiler_ready_ns.size() != config.fs[f].compiler_slots)
+            throw std::invalid_argument(
+                "R5 lower-bound F identity/capacity differs from config");
+
+    R5LowerBounds bounds;
+    bounds.c_to_f_bytes = state.c_to_f_bytes;
+    bounds.makespan_ns = state.makespan_ns;
+    bounds.includes_mandatory_single_rep_closure =
+        std::all_of(trace.begin(), trace.end(), [](const Tu& tu) {
+            return tu.representations.size() == 1;
+        });
+
+    std::unordered_map<TypedObjectKey, uint64_t, TypedObjectKeyHash> mandatory;
+    uint64_t total_compile_ns = 0;
+    uint64_t min_release_ns = trace.empty() ? 0 : trace.front().release_ns;
+    uint64_t eligible_slots = 0;
+    for (const FConfig& f : config.fs)
+        if (f.eligible)
+            eligible_slots = detail::checked_add(eligible_slots, f.compiler_slots,
+                                                 "R5 lower-bound slot overflow");
+
+    for (const Tu& tu : trace) {
+        min_release_ns = std::min(min_release_ns, tu.release_ns);
+        total_compile_ns = detail::checked_add(total_compile_ns, tu.compile_ns,
+                                               "R5 lower-bound compile overflow");
+        uint64_t base = std::numeric_limits<uint64_t>::max();
+        for (const Representation& representation : tu.representations) {
+            const uint64_t candidate = detail::checked_add(
+                representation.root_bytes, representation.control_bytes,
+                "R5 lower-bound base overflow");
+            base = std::min(base, candidate);
+        }
+        bounds.c_to_f_bytes = detail::checked_add(
+            bounds.c_to_f_bytes, base, "R5 lower-bound byte overflow");
+        const uint64_t transfer_ns = detail::mul_div_ceil(
+            base, 8000000000ULL, config.link_bits_per_second,
+            "R5 lower-bound transfer overflow");
+        uint64_t individual = detail::checked_add(tu.release_ns, transfer_ns,
+                                                  "R5 lower-bound finish overflow");
+        individual = detail::checked_add(individual, tu.compile_ns,
+                                         "R5 lower-bound finish overflow");
+        bounds.makespan_ns = std::max(bounds.makespan_ns, individual);
+
+        if (!bounds.includes_mandatory_single_rep_closure) continue;
+        for (const WireFragment& fragment : tu.representations.front().closure) {
+            if (detail::known_on_any_eligible_f(config, state, tu.source_generation,
+                                                fragment.object_kind, fragment.ordinal))
+                continue;
+            const TypedObjectKey key{tu.source_generation, fragment.object_kind,
+                                     fragment.ordinal};
+            auto [found, inserted] = mandatory.emplace(key, fragment.bytes);
+            if (!inserted) found->second = std::min(found->second, fragment.bytes);
+        }
+    }
+    if (bounds.includes_mandatory_single_rep_closure)
+        for (const auto& entry : mandatory)
+            bounds.c_to_f_bytes = detail::checked_add(
+                bounds.c_to_f_bytes, entry.second, "R5 closure lower-bound overflow");
+
+    if (!trace.empty()) {
+        // Let all compiler work begin at the earliest release and divide it perfectly among
+        // all eligible slots.  Flooring makes this a relaxation even when work is uneven.
+        const uint64_t compiler_capacity = detail::checked_add(
+            min_release_ns, total_compile_ns / eligible_slots,
+            "R5 compiler-capacity lower-bound overflow");
+        bounds.makespan_ns = std::max(bounds.makespan_ns, compiler_capacity);
+
+        // Likewise, distribute the mandatory bytes perfectly among all egress lanes.  The
+        // first floor is intentional: the result cannot exceed the true link-capacity bound.
+        const uint64_t remaining_bytes = bounds.c_to_f_bytes - state.c_to_f_bytes;
+        const uint64_t bytes_per_lane = remaining_bytes / config.egress_lanes;
+        const uint64_t link_duration = detail::mul_div_ceil(
+            bytes_per_lane, 8000000000ULL, config.link_bits_per_second,
+            "R5 link-capacity lower-bound overflow");
+        const uint64_t link_capacity = detail::checked_add(
+            min_release_ns, link_duration, "R5 link-capacity lower-bound overflow");
+        bounds.makespan_ns = std::max(bounds.makespan_ns, link_capacity);
+    }
+    return bounds;
+}
+
+inline R5LowerBounds r5_lower_bounds(const ReplayConfig& config,
+                                     const std::vector<Tu>& trace) {
+    return r5_lower_bounds(config, trace, initial_state(config));
+}
+
+// Deterministic receding-horizon beam search.  It always returns a physically feasible replay,
+// hence an upper bound for the declared weighted objective.  It is deliberately named bounded:
+// only exact_r5_frontier below may claim exactness.  Search branches are applied and undone in
+// place so cost scales with the horizon's mutations rather than copying the whole F catalogue.
+inline BoundedR5Result bounded_r5_replay(const ReplayConfig& config,
+                                         const std::vector<Tu>& trace,
+                                         const R5SearchOptions& options,
+                                         ReplayState state) {
+    validate(config, trace);
+    if (!options.horizon || !options.beam_width || !options.time_weight_ns)
+        throw std::invalid_argument("R5 search has a zero horizon/beam/denominator");
+    if (state.fs.size() != config.fs.size() ||
+        state.egress_ready_ns.size() != config.egress_lanes)
+        throw std::invalid_argument("R5 search state dimensions differ from config");
+    for (size_t f = 0; f < state.fs.size(); ++f)
+        if (state.fs[f].identity.f_id != config.fs[f].identity.f_id ||
+            state.fs[f].compiler_ready_ns.size() != config.fs[f].compiler_slots)
+            throw std::invalid_argument("R5 search F identity/capacity differs from config");
+
+    BoundedR5Result result;
+    result.lower_bounds = r5_lower_bounds(config, trace, state);
+    result.horizon = options.horizon;
+    result.beam_width = options.beam_width;
+    result.feasible.policy = Policy::R5Bounded;
+    result.feasible.rows.reserve(trace.size());
+    const std::vector<size_t> fs = eligible_fs(config);
+
+    for (size_t begin = 0; begin < trace.size(); ++begin) {
+        const size_t remaining = trace.size() - begin;
+        const size_t end = options.horizon >= remaining ? trace.size()
+                                                        : begin + options.horizon;
+        std::vector<detail::R5Path> beam(1);
+        beam.front().c_to_f_bytes = state.c_to_f_bytes;
+        beam.front().makespan_ns = state.makespan_ns;
+
+        for (size_t index = begin; index < end; ++index) {
+            std::vector<detail::R5Path> next;
+            for (const detail::R5Path& prefix : beam) {
+                std::vector<detail::ApplyUndo> prefix_undos;
+                prefix_undos.reserve(prefix.actions.size());
+                for (size_t offset = 0; offset < prefix.actions.size(); ++offset) {
+                    const Tu& prior = trace[begin + offset];
+                    const EvaluatedAction evaluated =
+                        evaluate(config, state, prior, prefix.actions[offset]);
+                    prefix_undos.emplace_back();
+                    detail::reversible_apply(config, state, prior, evaluated,
+                                             prefix_undos.back());
+                }
+
+                const std::vector<EvaluatedAction> candidates =
+                    actions_for(config, state, trace[index], fs);
+                for (const EvaluatedAction& candidate : candidates) {
+                    detail::ApplyUndo candidate_undo;
+                    detail::reversible_apply(config, state, trace[index], candidate,
+                                             candidate_undo);
+                    detail::R5Path child = prefix;
+                    child.actions.push_back(candidate.action);
+                    child.c_to_f_bytes = state.c_to_f_bytes;
+                    child.makespan_ns = state.makespan_ns;
+                    next.push_back(std::move(child));
+                    detail::undo_reversible_apply(state, candidate_undo);
+                    result.expanded_paths = detail::checked_add(
+                        result.expanded_paths, 1, "R5 expanded-path count overflow");
+                }
+                for (auto undo = prefix_undos.rbegin(); undo != prefix_undos.rend(); ++undo)
+                    detail::undo_reversible_apply(state, *undo);
+            }
+            std::sort(next.begin(), next.end(), [&](const auto& left, const auto& right) {
+                return detail::r5_path_less(left, right, options);
+            });
+            if (next.size() > options.beam_width) {
+                result.pruned_paths = detail::checked_add(
+                    result.pruned_paths, next.size() - options.beam_width,
+                    "R5 pruned-path count overflow");
+                next.resize(options.beam_width);
+            }
+            if (next.empty()) throw std::logic_error("R5 window has no feasible path");
+            beam = std::move(next);
+        }
+
+        const Action selected = beam.front().actions.front();
+        const EvaluatedAction evaluated = evaluate(config, state, trace[begin], selected);
+        result.feasible.rows.push_back(apply(config, state, trace[begin], evaluated));
+    }
+    result.feasible.c_to_f_bytes = state.c_to_f_bytes;
+    result.feasible.makespan_ns = state.makespan_ns;
+    finish_metrics(result.feasible, state);
+    return result;
+}
+
+inline BoundedR5Result bounded_r5_replay(const ReplayConfig& config,
+                                         const std::vector<Tu>& trace,
+                                         const R5SearchOptions& options) {
+    return bounded_r5_replay(config, trace, options, initial_state(config));
 }
 
 namespace detail {
