@@ -177,24 +177,34 @@ def effective_width(rows: list[dict[str, int]]) -> tuple[float, float, int]:
     )
 
 
-def physical_byte_model_makespan(rows: list[dict[str, int]], workers: int) -> int:
+def physical_byte_model_makespan(
+    rows: list[dict[str, int]], slots: list[int]
+) -> int:
     """Replay the declared 1-Gbit/0.5-GBps model using physical per-TU bytes."""
-    egress_ready = [0] * workers
-    compiler_ready = [0] * workers
+    egress_ready = [0] * len(slots)
+    compiler_ready = [[0] * count for count in slots]
     makespan = 0
     for row in rows:
-        lane = min(range(workers), key=lambda value: (egress_ready[value], value))
+        lane = min(
+            range(len(slots)), key=lambda value: (egress_ready[value], value)
+        )
         transfer_ns = (
             row["c_to_f"] * 8_000_000_000 + 1_000_000_000 - 1
         ) // 1_000_000_000
         transfer_finish = egress_ready[lane] + transfer_ns
         egress_ready[lane] = transfer_finish
         worker = row["worker"]
+        compiler_slot = min(
+            range(slots[worker]),
+            key=lambda value: (compiler_ready[worker][value], value),
+        )
         compile_ns = (
             row["raw"] * 1_000_000_000 + 500_000_000 - 1
         ) // 500_000_000
-        compile_finish = max(transfer_finish, compiler_ready[worker]) + compile_ns
-        compiler_ready[worker] = compile_finish
+        compile_finish = (
+            max(transfer_finish, compiler_ready[worker][compiler_slot]) + compile_ns
+        )
+        compiler_ready[worker][compiler_slot] = compile_finish
         makespan = max(makespan, compile_finish)
     return makespan
 
@@ -230,6 +240,8 @@ def run_cell(
     output: Path,
     corpus: Corpus,
     width: int,
+    slots: list[int],
+    requested_slots: int,
     policy: PolicySpec,
     repetitions: int,
     codec: str,
@@ -239,7 +251,11 @@ def run_cell(
     planner_sha: str,
     physical_sha: str,
 ) -> dict[str, object]:
-    tag = f"{corpus.name}.m{width}.{policy.label}.b{repetitions}"
+    slot_tag = "-".join(str(value) for value in slots)
+    tag = (
+        f"{corpus.name}.m{width}.s{slot_tag}.q{requested_slots}."
+        f"{policy.label}.b{repetitions}"
+    )
     assignment = output / "assignments" / f"{tag}.txt"
     estimate_curve = output / "estimate-curves" / f"{tag}.tsv"
     physical_curve = output / "physical-curves" / f"{tag}.tsv"
@@ -255,7 +271,7 @@ def run_cell(
         "--workers",
         str(width),
         "--requested-slots",
-        str(width),
+        str(requested_slots),
         "--egress-lanes",
         str(width),
         "--repetitions",
@@ -270,6 +286,8 @@ def run_cell(
         "--curve-out",
         str(estimate_curve),
     ]
+    if slots != [1] * width:
+        planner_command += ["--slots", ",".join(str(value) for value in slots)]
     physical_command = [
         str(physical),
         "--manifest",
@@ -377,7 +395,7 @@ def run_cell(
     if sum(row["raw"] for row in rows) != raw_per_build * repetitions:
         raise RuntimeError(f"{tag}: physical raw curve differs from manifest")
     n_eff, entropy, opened = effective_width(rows)
-    physical_makespan = physical_byte_model_makespan(rows, width)
+    physical_makespan = physical_byte_model_makespan(rows, slots)
     if abs(float(estimate["N_eff"]) - n_eff) > 1e-5:
         raise RuntimeError(f"{tag}: planner and physical N_eff differ")
     if abs(float(estimate["H_route"]) - entropy) > 1e-5:
@@ -389,6 +407,8 @@ def run_cell(
         "tus_per_build": tus_per_build,
         "repetitions": repetitions,
         "nominal_width": width,
+        "slot_capacities": ",".join(str(value) for value in slots),
+        "requested_slots": requested_slots,
         "policy": policy.label,
         "codec": codec,
         "raw": parsed["raw"],
@@ -467,8 +487,20 @@ def write_report(
             continue
         lines += [f"## {corpus.name}", ""]
         for width in widths:
+            topology = next(
+                (
+                    row
+                    for row in rows
+                    if str(row["corpus"]) == corpus.name
+                    and int(row["nominal_width"]) == width
+                ),
+                None,
+            )
+            if topology is None:
+                continue
             lines += [
-                f"### M={width}",
+                f"### M={width}; F slots={topology['slot_capacities']}; "
+                f"requested={topology['requested_slots']}",
                 "",
                 "| policy | cold C→F | warm C→F | N_eff | H_route | physical-byte model makespan |",
                 "|---|---:|---:|---:|---:|---:|",
@@ -534,6 +566,8 @@ def main() -> int:
     parser.add_argument("--corpus-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--widths", default="1,4,8,20")
+    parser.add_argument("--slots")
+    parser.add_argument("--requested-slots", type=int)
     parser.add_argument("--corpora", default=",".join(corpus.name for corpus in CORPORA))
     parser.add_argument("--policies", default=",".join(policy.label for policy in POLICIES))
     parser.add_argument("--repetitions", type=int, choices=(1, 2), default=2)
@@ -550,6 +584,31 @@ def main() -> int:
     widths = [int(value) for value in args.widths.split(",") if value]
     if not widths or widths != sorted(set(widths)) or any(not 1 <= value <= 32 for value in widths):
         parser.error("widths must be unique, sorted and in [1,32]")
+    if args.slots:
+        if len(widths) != 1:
+            parser.error("--slots requires exactly one --widths value")
+        try:
+            slots = [int(value) for value in args.slots.split(",")]
+        except ValueError:
+            parser.error("--slots must contain positive integers")
+        if len(slots) != widths[0] or any(value < 1 for value in slots):
+            parser.error("--slots count must equal width and every value must be positive")
+    else:
+        slots = [1] * widths[0] if len(widths) == 1 else []
+    if args.requested_slots is not None and args.requested_slots < 1:
+        parser.error("--requested-slots must be positive")
+    if args.slots:
+        requested_slots = args.requested_slots or sum(slots)
+        if requested_slots > sum(slots):
+            parser.error("--requested-slots exceeds supplied capacity")
+    elif args.requested_slots is not None:
+        if len(widths) != 1:
+            parser.error("--requested-slots requires exactly one --widths value")
+        requested_slots = args.requested_slots
+        if requested_slots > widths[0]:
+            parser.error("--requested-slots exceeds one-slot-per-F capacity")
+    else:
+        requested_slots = 0
     corpus_names = {value for value in args.corpora.split(",") if value}
     policy_names = {value for value in args.policies.split(",") if value}
     selected_corpora = [corpus for corpus in CORPORA if corpus.name in corpus_names]
@@ -578,6 +637,8 @@ def main() -> int:
         if not manifest.is_file():
             raise RuntimeError(f"missing manifest: {manifest}")
         for width in widths:
+            cell_slots = slots if slots else [1] * width
+            cell_requested_slots = requested_slots or width
             for policy in selected_policies:
                 ordinal += 1
                 row = run_cell(
@@ -587,6 +648,8 @@ def main() -> int:
                     output=args.output,
                     corpus=corpus,
                     width=width,
+                    slots=cell_slots,
+                    requested_slots=cell_requested_slots,
                     policy=policy,
                     repetitions=args.repetitions,
                     codec=args.codec,
@@ -614,11 +677,13 @@ def main() -> int:
                 )
 
     provenance = {
-        "schema": 2,
+        "schema": 3,
         "planner_commit": args.planner_commit,
         "physical_commit": args.physical_commit,
         "runner_commit": args.runner_commit,
         "runner_sha256": sha256(Path(__file__).resolve()),
+        "slots": args.slots or "one-per-F",
+        "requested_slots": args.requested_slots or "all",
         "planner_sha256": planner_sha,
         "physical_sha256": physical_sha,
         "physical_build_command": build_command,
