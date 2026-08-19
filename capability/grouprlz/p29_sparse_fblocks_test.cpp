@@ -8,6 +8,7 @@
 #include "p29_sparse_blocks.h"
 
 #include <cstdio>
+#include <stdexcept>
 #include <vector>
 
 namespace {
@@ -86,6 +87,45 @@ int main() {
               "a length of 2^32 was accepted (it narrows to 0, so this only fails if the "
               "check precedes the narrowing)");
         check(!f.known(3), "a refused oversized install still marked the id known");
+    }
+
+    // --- low-copy whole-TU transaction: earlier holes + vector growth + COPY all roll back --
+    {
+        std::vector<uint32_t> route;
+        route.insert(route.end(), kids0.begin(), kids0.end());
+        route.insert(route.end(), kids1.begin(), kids1.end());
+        route.insert(route.end(), kids2.begin(), kids2.end());
+        p29::SparseBlockStore f;
+        check(f.install_children(5, kids0.data(), kids0.size()), "transaction fixture install refused");
+        const auto before = f.state_mark();
+        const auto five = expand(f, 5);
+
+        f.begin_transaction();
+        check(f.install_copy(2, route, 3, kids1.size()), "transaction COPY into an old hole refused");
+        check(f.install_children(11, kids2.data(), kids2.size()), "transaction sparse growth refused");
+        check(f.state_mark() != before, "transaction mutations did not change the state mark");
+        f.abort_transaction();
+        check(f.state_mark() == before, "abort did not restore the exact state mark");
+        check(!f.known(2) && !f.known(11), "abort left a tentative Block known");
+        check(f.known(5) && expand(f, 5) == five, "abort changed a pre-existing Block");
+
+        // Retry the identical transaction and commit it.  The first aborted attempt must not
+        // perturb arena offsets or the resulting digest.
+        f.begin_transaction();
+        check(f.install_copy(2, route, 3, kids1.size()), "retry COPY refused");
+        check(f.install_children(11, kids2.data(), kids2.size()), "retry sparse growth refused");
+        const auto retry = f.state_mark();
+        f.commit_transaction();
+        check(f.state_mark() == retry, "commit changed the already-installed transaction state");
+        check(expand(f, 2) == kids1 && expand(f, 11) == kids2, "committed retry reconstructed differently");
+
+        bool threw = false;
+        try { f.begin_transaction(); f.begin_transaction(); }
+        catch (const std::logic_error&) { threw = true; }
+        check(threw && f.has_pending_transaction(), "a second begin did not preserve the first transaction");
+        f.abort_transaction();
+        threw = false; try { f.abort_transaction(); } catch (const std::logic_error&) { threw = true; }
+        check(threw, "abort without a transaction was accepted");
     }
 
     std::printf("P29 sparse F Block store %s\n", failures ? "FAIL" : "PASS");

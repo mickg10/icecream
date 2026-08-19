@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -15,6 +16,23 @@ struct Slice {
   const uint8_t *data = nullptr;
   uint32_t size = 0;
 };
+
+inline uint64_t state_mix(uint64_t value) {
+  value ^= value >> 30;
+  value *= 0xbf58476d1ce4e5b9ULL;
+  value ^= value >> 27;
+  value *= 0x94d049bb133111ebULL;
+  return value ^ (value >> 31);
+}
+
+inline uint64_t append_state_digest(uint64_t prior, uint32_t id,
+                                    const std::string &value) {
+  uint64_t bytes = 1469598103934665603ULL;
+  for (const unsigned char byte : value)
+    bytes = (bytes ^ byte) * 1099511628211ULL;
+  return state_mix(prior ^ state_mix(bytes ^ uint64_t(value.size())) ^
+                   state_mix(uint64_t(id) + 0x9e3779b97f4a7c15ULL));
+}
 
 inline uint32_t read_u32(const uint8_t *data) {
   return uint32_t(data[0]) | (uint32_t(data[1]) << 8) |
@@ -158,8 +176,21 @@ struct Encoded {
 
 class EncoderState {
 public:
+  struct StateMark {
+    uint32_t values = 0;
+    uint64_t string_bytes = 0;
+    uint64_t content_digest = 0;
+    bool operator==(const StateMark &other) const {
+      return values == other.values && string_bytes == other.string_bytes &&
+             content_digest == other.content_digest;
+    }
+    bool operator!=(const StateMark &other) const { return !(*this == other); }
+  };
+
   uint32_t size() const { return next_id_; }
   uint64_t string_bytes() const { return string_bytes_; }
+  uint64_t content_digest() const { return content_digest_; }
+  StateMark state_mark() const { return {next_id_, string_bytes_, content_digest_}; }
 
   bool encode(const std::vector<Slice> &members, Encoded &output,
               bool transpose_translations = false,
@@ -370,17 +401,47 @@ public:
     return true;
   }
 
-  bool commit(Encoded &encoded) {
-    for (auto &value : encoded.pending_definitions) {
-      if (next_id_ >= UINT32_MAX)
+  // Apply prepared definitions with a strong all-or-nothing result.  Encoded remains intact
+  // so a transfer attempt can be retried byte-for-byte; C should call this only after Ack.
+  bool commit(const Encoded &encoded) {
+    const size_t count = encoded.pending_definitions.size();
+    if (count > uint64_t(UINT32_MAX) - next_id_)
+      return false;
+    uint64_t added_bytes = 0;
+    for (const auto &value : encoded.pending_definitions) {
+      if (value.size() > UINT64_MAX - added_bytes)
         return false;
-      const uint32_t id = next_id_;
-      auto [position, inserted] = ids_.emplace(std::move(value), id);
-      if (!inserted || position->second != id)
-        return false;
-      ++next_id_;
-      string_bytes_ += position->first.size();
+      added_bytes += value.size();
     }
+    if (added_bytes > UINT64_MAX - string_bytes_)
+      return false;
+
+    size_t inserted_count = 0;
+    auto rollback = [&]() {
+      for (size_t index = 0; index < inserted_count; ++index)
+        ids_.erase(encoded.pending_definitions[index]);
+    };
+    try {
+      for (size_t index = 0; index < count; ++index) {
+        const uint32_t id = uint32_t(next_id_ + index);
+        const auto [position, inserted] =
+            ids_.emplace(encoded.pending_definitions[index], id);
+        if (!inserted || position->second != id) {
+          rollback();
+          return false;
+        }
+        ++inserted_count;
+      }
+    } catch (...) {
+      rollback();
+      throw;
+    }
+    for (size_t index = 0; index < count; ++index)
+      content_digest_ = append_state_digest(
+          content_digest_, uint32_t(next_id_ + index),
+          encoded.pending_definitions[index]);
+    next_id_ += uint32_t(count);
+    string_bytes_ += added_bytes;
     return true;
   }
 
@@ -388,12 +449,49 @@ private:
   std::unordered_map<std::string, uint32_t> ids_;
   uint32_t next_id_ = 0;
   uint64_t string_bytes_ = 0;
+  uint64_t content_digest_ = 0;
 };
 
 class DecoderState {
 public:
+  struct StateMark {
+    size_t values = 0;
+    uint64_t string_bytes = 0;
+    uint64_t content_digest = 0;
+    bool operator==(const StateMark &other) const {
+      return values == other.values && string_bytes == other.string_bytes &&
+             content_digest == other.content_digest;
+    }
+    bool operator!=(const StateMark &other) const { return !(*this == other); }
+  };
+
   uint32_t size() const { return uint32_t(values_.size()); }
   uint64_t string_bytes() const { return string_bytes_; }
+  uint64_t content_digest() const { return content_digest_; }
+  StateMark state_mark() const {
+    return {values_.size(), string_bytes_, content_digest_};
+  }
+
+  // Decoder definitions append only.  A whole-TU abort therefore destroys just the values
+  // appended by that TU and restores three scalars; it never copies the established dictionary.
+  void begin_transaction() {
+    if (transaction_active_)
+      throw std::logic_error("MO decoder transaction already active");
+    checkpoint_ = state_mark();
+    transaction_active_ = true;
+  }
+  void commit_transaction() {
+    require_transaction();
+    transaction_active_ = false;
+  }
+  void abort_transaction() {
+    require_transaction();
+    values_.resize(checkpoint_.values);
+    string_bytes_ = checkpoint_.string_bytes;
+    content_digest_ = checkpoint_.content_digest;
+    transaction_active_ = false;
+  }
+  bool has_pending_transaction() const { return transaction_active_; }
 
   bool decode(const std::vector<uint8_t> &control,
               const std::vector<uint8_t> &definitions,
@@ -615,14 +713,23 @@ public:
     if (command != command_end || translated != translated_end ||
         raw != raw_end)
       return false;
+    if (pending_string_bytes > UINT64_MAX - string_bytes_)
+      return false;
     values_.reserve(values_.size() + pending_values.size());
-    for (auto &value : pending_values)
+    for (auto &value : pending_values) {
+      content_digest_ = append_state_digest(content_digest_, uint32_t(values_.size()), value);
       values_.push_back(std::move(value));
+    }
     string_bytes_ += pending_string_bytes;
     return true;
   }
 
 private:
+  void require_transaction() const {
+    if (!transaction_active_)
+      throw std::logic_error("MO decoder has no active transaction");
+  }
+
   bool decode_transposed(const std::vector<uint8_t> &control,
                          const std::vector<uint8_t> &translations,
                          const std::vector<uint8_t> &ordinary,
@@ -736,15 +843,22 @@ private:
       lengths.push_back(uint32_t(member.size()));
     }
 
+    if (pending_string_bytes > UINT64_MAX - string_bytes_)
+      return false;
     values_.reserve(values_.size() + pending_values.size());
-    for (auto &value : pending_values)
+    for (auto &value : pending_values) {
+      content_digest_ = append_state_digest(content_digest_, uint32_t(values_.size()), value);
       values_.push_back(std::move(value));
+    }
     string_bytes_ += pending_string_bytes;
     return true;
   }
 
   std::vector<std::string> values_;
   uint64_t string_bytes_ = 0;
+  uint64_t content_digest_ = 0;
+  bool transaction_active_ = false;
+  StateMark checkpoint_{};
 };
 
 } // namespace mo_factor

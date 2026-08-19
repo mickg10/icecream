@@ -11,6 +11,8 @@
 #                  p29_block_catalogue_test.cpp  shared canonical Block id space
 #                  p29_sparse_fblocks_test.cpp   F's hole-tolerant Block store
 #                  p29_prepare_commit_test.cpp   prepare/commit/abort, gates 2-6
+#                  p29_transfer_transaction_test.cpp exact retry identity + retained Ack
+#                  mo_factor_transaction_test.cpp MO dictionary whole-TU rollback
 #   fault runners  p29_journal_mutations.sh          the journal's failure paths
 #                  selector_equivalence_mutations.sh both byte-equivalence gates' paths
 #                  selector_1f_costing_mutations.sh  the 1F launcher's own failure path
@@ -122,7 +124,8 @@ cxx_gate() { # cxx_gate <test.cpp> <flags> <outname>
   g++ $flags "$HERE/$src" -o "$WORK/$out" || return 1
   "$WORK/$out"
 }
-for t in p29_online_s1_test p29_block_catalogue_test p29_sparse_fblocks_test p29_prepare_commit_test; do
+for t in p29_online_s1_test p29_block_catalogue_test p29_sparse_fblocks_test p29_prepare_commit_test \
+         p29_transfer_transaction_test mo_factor_transaction_test; do
   step "$t (opt)" -- cxx_gate "$t.cpp" "$CXX_OPT" "$t.opt"
   step "$t (asan+ubsan)" -- cxx_gate "$t.cpp" "$CXX_SAN" "$t.san"
 done
