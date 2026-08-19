@@ -13,7 +13,7 @@ print(d['payload']['path'], d['payload']['sha256'], d['tu_count'])")
   find $T/ii -name '*.ii'|sort>$T/man; M=$(wc -l < $T/man)
   [ "$M" = "$N" ] || { echo "$P manifest $M != $N"; rm -rf $T; continue; }
   :>$T/man4; for i in 1 2 3 4; do cat $T/man>>$T/man4; done
-  $BIN --manifest $T/man4 $B --literal-ondemand --literal-group-skip-zstd10 --route-s1 1 --selector-tsv $T/sel.tsv >$T/o 2>&1
+  $BIN --manifest $T/man4 $B --literal-ondemand --literal-group-skip-zstd10 --route-s1 1 --selector-tsv $T/sel.tsv --cf-sink $T/s.cf --fc-sink $T/s.fc >$T/o 2>&1
   grep -q byte-exact=OK $T/o || { echo "$P NOT byte-exact"; rm -rf $T; continue; }
   L=$(grep -o 'SELECTOR per-TU costing:.*' $T/o)
   R=$(echo "$L"|sed 's/.*raw_cum=\([0-9]*\).*/\1/'); G=$(echo "$L"|sed 's/.*global_cum=\([0-9]*\).*/\1/')

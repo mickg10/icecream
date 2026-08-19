@@ -988,6 +988,9 @@ int main(int argc,char**argv){
     // other paths is better than silently emitting a stream that omits their traffic.
     if((cfSinkPath||fcSinkPath)&&!(useMixedRegions&&useKeyMap&&useDirectOrdinals)){fprintf(stderr,"the wire sinks require --mixed-regions with --direct-ordinals\n");return 2;}
     if(sinkCurvePath&&!cfSinkPath){fprintf(stderr,"--sink-curve requires --cf-sink\n");return 2;}
+    // The full-total closure is measured off the physical stream, so the sinks are not
+    // optional in this mode -- without them there is nothing to check the costing against.
+    if(selectorTsvPath&&!cfSinkPath){fprintf(stderr,"--selector-tsv requires --cf-sink/--fc-sink: the totals are measured from the physical stream\n");return 2;}
     if(sinkBuildTus&&!cfSinkPath){fprintf(stderr,"--sink-build-tus requires --cf-sink\n");return 2;}
     if(cfSinkPath&&!fcSinkPath){fprintf(stderr,"--cf-sink requires --fc-sink: the reverse direction is reported, never dropped\n");return 2;}
     // Without S1 there are no Blocks and no route matcher, so --route-s1 would exit 0 having
@@ -1215,7 +1218,7 @@ int main(int argc,char**argv){
     uint64_t preloadedRegionBytes=0,preloadedRegionCount=0,associatedRegionCount=0;double mixedAssociationWire=0,mixedMissingRequestWire=0;
     const double FRAME=4;   // 4-byte length prefix per framed message (the ACCOUNTING charge)
     struct SelRow{size_t tu;uint64_t rawRootRaw,rawRootZ,globalRootRaw,globalRootZ,newBlocks,defRaw,defZ,common,globalFull,rawFull;};
-    std::vector<SelRow> selRows; uint64_t closureChecked=0,manifestChecks=0,tuRootFrame=0,tuBlockFrame=0,fullTotalChecks=0,sumDelta=0; std::vector<uint32_t> costedBlocks;
+    std::vector<SelRow> selRows; uint64_t closureChecked=0,manifestChecks=0,tuRootFrame=0,tuBlockFrame=0,fullTotalChecks=0,sumDelta=0; std::vector<uint32_t> tuManifest; std::vector<uint32_t> costedBlocks;
     WireSink cfSink,fcSink;   // the PHYSICAL streams: 5-byte typed header per frame
     std::vector<uint64_t>sinkCfOff(TUs),sinkFcOff(TUs),sinkCfFrames(TUs),sinkFcFrames(TUs);
     if(cfSinkPath){cfSink.open(cfSinkPath,sinkReplay);fcSink.open(fcSinkPath,sinkReplay);}
@@ -1457,7 +1460,7 @@ int main(int argc,char**argv){
             selRows.push_back({t,uint64_t(rawRoot.size()),uint64_t(rawZ),
                                uint64_t(rootb.size()),uint64_t(globalZ),
                                uint64_t(costBlocks.size()),uint64_t(costDef.size()),uint64_t(defZ),0,0,0});
-            tuRootFrame=0; tuBlockFrame=0;
+            tuRootFrame=0; tuBlockFrame=0; tuManifest.clear();
         }
         std::vector<uint32_t> missReg,missBlk,associationRegs,requiredRegions,requiredBlocks;
         if(useKeyMap){
@@ -1505,19 +1508,9 @@ int main(int argc,char**argv){
             for(uint32_t k:FrequiredBlocks)if(requiredBlockStamp[k]!=requestStamp){fprintf(stderr,"direct Root Block identity differs\n");return 2;}
 
             std::vector<uint32_t>manifestBlocks;for(uint32_t k:FrequiredBlocks)if(!fknownBlk[k])manifestBlocks.push_back(k);
+            tuManifest=manifestBlocks;   // recorded even when EMPTY, so the check covers every TU
             if(!manifestBlocks.empty()){
               std::vector<uint8_t>blockRaw;serialize_block_manifest(manifestBlocks,blockRaw);
-              // GATE: costing must price the bytes that are ACTUALLY SENT.  Both sides call
-              // the one serializer, so the remaining risk is that they disagree on WHICH
-              // Blocks need defining -- which would make the candidate score fiction while
-              // still looking self-consistent.  Compared as ordered sequences, since the
-              // manifest order is part of the bytes.
-              if(selectorTsvPath){
-                if(costedBlocks!=manifestBlocks){
-                  fprintf(stderr,"costing priced %zu Block definition(s) but the transaction sends %zu at TU=%zu\n",
-                          costedBlocks.size(),manifestBlocks.size(),t);return 2;}
-                ++manifestChecks;
-              }
               if(structureCeiling)allBlocks.insert(allBlocks.end(),blockRaw.begin(),blockRaw.end());
               size_t bytes=zstd_message_roundtrip(z,messageD,blockRaw,zlevel,messageEncoded,messageDecoded)+FRAME;w_blockdef+=bytes;
               {const uint64_t before=cfSink.off;cfSink.emit(WT_BLOCKDEF,messageEncoded.data(),bytes-size_t(FRAME));tuBlockFrame=cfSink.off-before;}
@@ -2376,21 +2369,34 @@ int main(int argc,char**argv){
             // is material every candidate would have sent, so it is the common part by
             // construction -- and GLOBAL_full must reproduce the measured delta exactly.
             if(selectorTsvPath&&!selRows.empty()&&selRows.back().tu==t){
-                // The TU-close frame is ALREADY in cfSink.off by this point -- it is emitted
-                // just above.  Adding it again cost 6 bytes per TU and, because it landed in
-                // common_physical, it inflated BOTH candidates identically: the "agreement
-                // to 0.12%" with the independent policy run was 1,728 = 6 x 288 TUs of the
-                // same double count in each column, not agreement.
+                // INDEPENDENT FRAME-LEVEL CHECKS.  The per-TU delta tiling below telescopes
+                // by construction (delta[t]=off[t]-off[t-1] sums to the final offset whatever
+                // the parts are), so it cannot detect a wrong ATTRIBUTION between Root,
+                // BlockDef and common -- a mis-split nets out at the total.  These compare the
+                // ACTUALLY EMITTED frame bytes against the separately scratch-compressed
+                // costing, which is a different computation, so a mis-split cannot pass.
+                SelRow&r=selRows.back();
+                if(costedBlocks!=tuManifest){
+                    fprintf(stderr,"costing priced %zu Block definition(s) but the transaction sends %zu at TU=%zu\n",
+                            costedBlocks.size(),tuManifest.size(),t);return 2;}
+                ++manifestChecks;
+                if(tuRootFrame!=r.globalRootZ){
+                    fprintf(stderr,"TU %zu: emitted Root frame %llu != costed %llu\n",t,
+                            (unsigned long long)tuRootFrame,(unsigned long long)r.globalRootZ);return 2;}
+                if(tuBlockFrame!=r.defZ){
+                    fprintf(stderr,"TU %zu: emitted BlockDef frame %llu != costed %llu\n",t,
+                            (unsigned long long)tuBlockFrame,(unsigned long long)r.defZ);return 2;}
+                // The TU-close frame is ALREADY in cfSink.off here -- it is emitted just
+                // above.  Adding it again cost 6 bytes per TU and, because it landed in
+                // common_physical, inflated BOTH candidates identically.
                 const uint64_t prev=t?sinkCfOff[t-1]:0;
                 const uint64_t delta=cfSink.off-prev;
                 if(delta<tuRootFrame+tuBlockFrame){fprintf(stderr,"TU %zu: frames exceed the physical delta\n",t);return 2;}
-                SelRow&r=selRows.back();
+                // globalFull IS the measured delta -- taken directly, not re-derived from a
+                // decomposition of itself, which is what made the previous check tautological.
+                r.globalFull=delta;
                 r.common=delta-tuRootFrame-tuBlockFrame;
-                r.globalFull=r.common+tuRootFrame+tuBlockFrame;
                 r.rawFull=r.common+r.rawRootZ;
-                // NOT a check: globalFull == (delta - a - b) + a + b == delta by construction,
-                // true whatever delta is.  The real property is that the per-TU deltas TILE
-                // the stream exactly -- no gaps, no overlaps -- asserted after the loop.
                 sumDelta+=delta;
                 ++fullTotalChecks;
             }
@@ -2650,6 +2656,10 @@ int main(int argc,char**argv){
       if(fclose(f)!=0){perror(selectorTsvPath);return 2;}
       printf("SELECTOR closure: %llu Region memberships checked identical across candidates\n",(unsigned long long)closureChecked);
       printf("SELECTOR manifest: %llu transaction(s) sent exactly the Block set costing priced\n",(unsigned long long)manifestChecks);
+      if(manifestChecks!=selRows.size()||fullTotalChecks!=selRows.size()){
+        fprintf(stderr,"selector checks covered %llu/%llu manifests and %llu/%llu totals\n",
+            (unsigned long long)manifestChecks,(unsigned long long)selRows.size(),
+            (unsigned long long)fullTotalChecks,(unsigned long long)selRows.size());return 2;}
       if(fullTotalChecks){
         // Discriminating: the +6/TU double count made this sum exceed the stream by 1,728.
         if(sumDelta!=cfSink.off){fprintf(stderr,"per-TU deltas sum to %llu but the C->F stream is %llu (%+lld)\n",
