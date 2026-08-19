@@ -125,7 +125,50 @@ public:
     OnlineS1(Config config, BlockCatalogue& catalogue)
         : catalogue_(&catalogue), config_(config) { start(); }
 
+    // prepare / commit / abort.  A prepared TU is APPLIED to the matcher immediately -- the
+    // plan has to be built against real state -- and the journal is what makes it reversible.
+    // Only one may be pending: a route evaluates one transaction at a time, and the caller
+    // either Acks it or discards it before the next TU.
+    bool has_pending() const { return pending_; }
+
+    const TuPlan& prepare(const std::vector<uint32_t>& current_regions) {
+        if (pending_) throw std::logic_error("S1 prepare while a transaction is already pending");
+        journal_.clear();
+        journal_.begin = static_cast<uint32_t>(occurrences_.size());
+        journal_.occurrences = occurrences_.size();
+        journal_.predecessor_count = predecessors_.size();
+        pending_ = true;
+        try {
+            pending_plan_ = build(current_regions);
+        } catch (...) {
+            undo();            // a half-applied TU must not survive a failed build
+            pending_ = false;
+            throw;
+        }
+        return pending_plan_;
+    }
+
+    void commit() {
+        if (!pending_) throw std::logic_error("S1 commit without a pending transaction");
+        pending_ = false;
+        journal_.clear();      // applied state is retained; only the undo log is dropped
+    }
+
+    void abort() {
+        if (!pending_) throw std::logic_error("S1 abort without a pending transaction");
+        undo();
+        pending_ = false;
+    }
+
     TuPlan admit(const std::vector<uint32_t>& current_regions) {
+        const TuPlan& plan = prepare(current_regions);
+        TuPlan copy = plan;    // the reference is only valid until commit
+        commit();
+        return copy;
+    }
+
+private:
+    TuPlan build(const std::vector<uint32_t>& current_regions) {
         const size_t u32_max = std::numeric_limits<uint32_t>::max();
         if (current_regions.size() > u32_max ||
             occurrences_.size() > u32_max - current_regions.size()) {
@@ -197,6 +240,7 @@ public:
         return plan;
     }
 
+public:
     const std::vector<uint32_t>& occurrences() const { return occurrences_; }
     const std::vector<Block>& blocks() const { return catalogue_->blocks(); }
     const BlockCatalogue& catalogue() const { return *catalogue_; }
@@ -231,6 +275,13 @@ private:
 
     void install_anchor(uint32_t position) {
         const uint32_t slot = bucket(position);
+        // Only positions BEFORE this transaction's first occurrence need their predecessor
+        // recorded: everything at or after `begin` is discarded wholesale by the truncate on
+        // abort, so journalling it would be dead weight on the hot path.
+        if (pending_ && position < journal_.begin) {
+            journal_.predecessors.push_back({position, predecessors_[position]});
+        }
+        if (pending_) journal_.heads.push_back({slot, heads_[slot]});
         predecessors_[position] = heads_[slot];
         heads_[slot] = position;
     }
@@ -246,6 +297,30 @@ private:
         }
     }
 
+    // Undo log for one pending transaction.  Capacity is reused between transactions, and
+    // the 2^hash_bits head table is never copied -- only the slots actually touched.
+    struct Journal {
+        uint32_t begin = 0;
+        size_t occurrences = 0, predecessor_count = 0;
+        std::vector<std::pair<uint32_t, uint32_t>> heads;         // {slot, old head}
+        std::vector<std::pair<uint32_t, uint32_t>> predecessors;  // {position, old predecessor}
+        void clear() { heads.clear(); predecessors.clear(); }
+    };
+
+    void undo() {
+        // Heads in REVERSE mutation order: one slot can be written several times in a
+        // transaction, and only the reverse walk lands the earliest recorded value last.
+        for (size_t i = journal_.heads.size(); i-- > 0;) heads_[journal_.heads[i].first] = journal_.heads[i].second;
+        for (size_t i = journal_.predecessors.size(); i-- > 0;)
+            predecessors_[journal_.predecessors[i].first] = journal_.predecessors[i].second;
+        occurrences_.resize(journal_.occurrences);
+        predecessors_.resize(journal_.predecessor_count);
+        journal_.clear();
+    }
+
+    bool pending_ = false;
+    Journal journal_;
+    TuPlan pending_plan_;
     std::unique_ptr<BlockCatalogue> owned_;   // only for the standalone form; declared first
     BlockCatalogue* catalogue_ = nullptr;      // so it outlives catalogue_ and the matcher
     Config config_;

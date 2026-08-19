@@ -1,0 +1,147 @@
+// Gates 2-6 for OnlineS1's prepare/commit/abort state machine.
+// (Gate 1 is p29_online_s1_test.cpp -- the existing admit() equivalence, kept unmodified.)
+//
+// A prepared TU is APPLIED immediately, because the plan has to be built against real
+// matcher state; the journal is what makes it reversible.  These gates check that the undo
+// restores VALUES and not merely sizes, which is the failure a size-only rollback hides.
+//
+//   g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror p29_prepare_commit_test.cpp -o t && ./t
+#include "p29_online_s1.h"
+
+#include <cstdio>
+#include <stdexcept>
+#include <vector>
+
+namespace {
+int failures = 0;
+void check(bool ok, const char* what) {
+    if (!ok) { std::fprintf(stderr, "FAIL: %s\n", what); ++failures; }
+}
+// Expand a Root to the Region sequence it represents.  Comparing RAW canonical Block ids
+// across an abort is wrong by design: the catalogue is deliberately NOT rolled back, so an
+// aborted TU's minted ids survive and the retry legitimately sees different ids (and
+// canonical_was_new flips true->false).  What must be exact is the Root's IDENTITY -- the
+// same Regions in the same order -- and the matcher history.
+std::vector<uint32_t> expand(const p29::TuPlan& p, const p29::BlockCatalogue& c) {
+    std::vector<uint32_t> out;
+    for (const p29::Ref& r : p.root) {
+        if (r.kind == p29::RefKind::Region) out.push_back(r.id);
+        else for (uint32_t k : c.block(r.id).regions) out.push_back(k);
+    }
+    return out;
+}
+// Everything the MATCHER determines must be exact after an abort -- including
+// source_position, which is matcher-local and is precisely what a stale hash head would
+// change.  Only the canonical Block id and canonical_was_new may differ, because the
+// catalogue is deliberately not rolled back.
+bool sameShape(const p29::TuPlan& a, const p29::TuPlan& b) {
+    if (a.root.size() != b.root.size() || a.block_uses.size() != b.block_uses.size()) return false;
+    if (a.occurrence_begin != b.occurrence_begin || a.occurrence_end != b.occurrence_end) return false;
+    for (size_t i = 0; i < a.root.size(); ++i) {
+        if (a.root[i].kind != b.root[i].kind) return false;
+        if (a.root[i].kind == p29::RefKind::Region && a.root[i].id != b.root[i].id) return false;
+    }
+    for (size_t i = 0; i < a.block_uses.size(); ++i) {
+        const p29::BlockUse& x = a.block_uses[i]; const p29::BlockUse& y = b.block_uses[i];
+        if (x.root_index != y.root_index || x.source_position != y.source_position ||
+            x.length != y.length || x.source_precedes_current_tu != y.source_precedes_current_tu) return false;
+    }
+    return true;
+}
+bool same(const p29::TuPlan& a, const p29::TuPlan& b) {
+    if (a.root.size() != b.root.size() || a.block_uses.size() != b.block_uses.size()) return false;
+    if (a.occurrence_begin != b.occurrence_begin || a.occurrence_end != b.occurrence_end) return false;
+    for (size_t i = 0; i < a.root.size(); ++i) if (a.root[i] != b.root[i]) return false;
+    for (size_t i = 0; i < a.block_uses.size(); ++i) {
+        const p29::BlockUse& x = a.block_uses[i]; const p29::BlockUse& y = b.block_uses[i];
+        if (x.root_index != y.root_index || x.block_id != y.block_id ||
+            x.source_position != y.source_position || x.length != y.length ||
+            x.source_precedes_current_tu != y.source_precedes_current_tu) return false;
+    }
+    return true;
+}
+// min_match 3 with a short reach, so boundary anchors genuinely straddle TUs
+const p29::OnlineS1::Config kCfg{3, 1024, 12};
+const std::vector<uint32_t> kA{10, 11, 12, 13, 14};
+// The aborted TU must seed anchors that the LATER TU would consult, or a size-only rollback
+// looks identical to a correct one: stale heads pointing into truncated positions are simply
+// never reached.  So kB carries the same content kC will match on, with internal repetition
+// so a single hash slot is written several times in one transaction -- which is what makes
+// the REVERSE-order restore observable.
+const std::vector<uint32_t> kB{50, 51, 52, 53, 50, 51, 52, 53, 50, 51, 52, 53};
+const std::vector<uint32_t> kC{50, 51, 52, 53, 50, 51, 52, 53};
+}  // namespace
+
+int main() {
+    // GATE 2: prepare+commit is admit, in plan AND in resulting state.
+    {
+        p29::BlockCatalogue c1, c2;
+        p29::OnlineS1 viaAdmit(kCfg, c1), viaPrepare(kCfg, c2);
+        viaAdmit.admit(kA); viaPrepare.prepare(kA); viaPrepare.commit();
+        const p29::TuPlan pa = viaAdmit.admit(kC);
+        const p29::TuPlan pb = [&]{ const p29::TuPlan& r = viaPrepare.prepare(kC); p29::TuPlan cp = r; viaPrepare.commit(); return cp; }();
+        check(same(pa, pb), "gate 2: prepare+commit plan differs from admit");
+        check(viaAdmit.occurrences() == viaPrepare.occurrences(), "gate 2: occurrence history differs");
+        check(c1.size() == c2.size(), "gate 2: catalogue sizes differ");
+    }
+
+    // GATE 3+4: abort restores the matcher, VALUES not just sizes.  The control never sees
+    // the aborted TU; the test prepares and aborts it in between.  kC matches back across
+    // the A/C boundary, so a head or predecessor left dangling from the aborted TU changes
+    // the plan even though every vector is back to the right LENGTH.
+    {
+        p29::BlockCatalogue cc, ct;
+        p29::OnlineS1 control(kCfg, cc), tested(kCfg, ct);
+        control.admit(kA);
+        tested.admit(kA);
+        tested.prepare(kB);
+        check(tested.has_pending(), "gate 3: prepare did not mark a pending transaction");
+        tested.abort();
+        check(!tested.has_pending(), "gate 3: abort left the transaction pending");
+        check(control.occurrences() == tested.occurrences(), "gate 3: occurrence history not restored");
+        const p29::TuPlan a = control.admit(kC);
+        const p29::TuPlan b = [&]{ const p29::TuPlan& r = tested.prepare(kC); p29::TuPlan cp = r; tested.commit(); return cp; }();
+        check(sameShape(a, b), "gate 4: Root shape after abort differs -- head/predecessor values were not restored");
+        check(expand(a, cc) == expand(b, ct),
+              "gate 4: Root expands to a different Region sequence after the aborted TU");
+        check(control.occurrences() == tested.occurrences(), "gate 4: history diverged after the aborted TU");
+    }
+
+    // GATE 5: one pending transaction, and no commit/abort without one.
+    {
+        p29::BlockCatalogue c; p29::OnlineS1 s(kCfg, c);
+        bool threw = false;
+        try { s.commit(); } catch (const std::logic_error&) { threw = true; }
+        check(threw, "gate 5: commit without a pending transaction was accepted");
+        threw = false;
+        try { s.abort(); } catch (const std::logic_error&) { threw = true; }
+        check(threw, "gate 5: abort without a pending transaction was accepted");
+        s.prepare(kA);
+        threw = false;
+        try { s.prepare(kB); } catch (const std::logic_error&) { threw = true; }
+        check(threw, "gate 5: a second prepare was accepted while one was pending");
+        s.abort();
+    }
+
+    // GATE 6: an aborted prepare that minted a Block KEEPS the canonical id -- catalogue ids
+    // are monotonic and never rewound -- while the route matcher is restored.  The id is
+    // simply never marked known-on-F.
+    {
+        p29::BlockCatalogue c; p29::OnlineS1 s(kCfg, c);
+        s.admit(kA);
+        s.admit(kA);                       // second sight interns a Block
+        const size_t afterCommit = c.size();
+        check(afterCommit > 0, "gate 6: fixture minted no Block, so it cannot discriminate");
+        const std::vector<uint32_t> occBefore = s.occurrences();
+        s.prepare(kB);
+        const size_t afterPrepare = c.size();          // EXACT size, so losing even one id shows
+        const bool mintedInPrepare = afterPrepare > afterCommit;
+        s.abort();
+        check(mintedInPrepare, "gate 6: the prepared TU minted nothing, so it cannot discriminate");
+        check(c.size() == afterPrepare, "gate 6: the catalogue was rolled back with the matcher");
+        check(s.occurrences() == occBefore, "gate 6: the matcher was not restored");
+    }
+
+    std::printf("P29 prepare/commit/abort gates 2-6 %s\n", failures ? "FAIL" : "PASS");
+    return failures ? 1 : 0;
+}
