@@ -1,7 +1,7 @@
 // Manifest-to-routing adapter for Issue #16 Phase C.
 //
 // It uses the same Region interner as the protocol-50 capability harness, then runs the
-// deterministic R0-R4 policy engine over typed Region closures.  Its byte model is explicitly
+// causal R0-R4 or bounded R5 engine over typed Region closures.  Its byte model is explicitly
 // an independent-Region zstd-3 estimate; the emitted assignment must be passed to the M5
 // physical runner before any result is reported as C-to-F wire bytes.
 #include "p29_routing_replay.h"
@@ -40,6 +40,8 @@ struct Options {
     uint64_t investment_weight_num = 1;
     uint64_t investment_weight_den = 1;
     uint64_t investment_history_scale = 4;
+    uint64_t replica_gap_weight_num = 0;
+    uint64_t replica_gap_weight_den = 1;
     size_t r5_horizon = 4;
     size_t r5_beam_width = 64;
     p29::routing::Policy policy = p29::routing::Policy::R0RoundRobin;
@@ -148,7 +150,8 @@ void usage(const char* program) {
         "[--workers N] [--slots N,N,...] [--requested-slots N] [--repetitions N] "
         "[--max-files N] [--egress-lanes N] [--link-bps N] [--compiler-bps N] "
         "[--time-weight NUM DEN] [--investment-weight NUM DEN] "
-        "[--investment-history-scale N] [--r5-horizon N] [--r5-beam N]\n",
+        "[--investment-history-scale N] [--replica-gap-weight NUM DEN] "
+        "[--r5-horizon N] [--r5-beam N]\n",
         program);
 }
 
@@ -208,6 +211,12 @@ int main(int argc, char** argv) {
                    index + 1 < argc) {
             if (!parse_u64(argv[++index], options.investment_history_scale) ||
                 !options.investment_history_scale)
+                return 2;
+        } else if (!std::strcmp(argv[index], "--replica-gap-weight") &&
+                   index + 2 < argc) {
+            if (!parse_u64(argv[++index], options.replica_gap_weight_num) ||
+                !parse_u64(argv[++index], options.replica_gap_weight_den) ||
+                !options.replica_gap_weight_den)
                 return 2;
         } else if (!std::strcmp(argv[index], "--r5-horizon") && index + 1 < argc) {
             uint64_t value = 0;
@@ -292,6 +301,8 @@ int main(int argc, char** argv) {
         replay_config.investment_weight_num = options.investment_weight_num;
         replay_config.investment_weight_den = options.investment_weight_den;
         replay_config.investment_history_scale = options.investment_history_scale;
+        replay_config.replica_gap_weight_num = options.replica_gap_weight_num;
+        replay_config.replica_gap_weight_den = options.replica_gap_weight_den;
         for (uint32_t f = 0; f < options.workers; ++f)
             replay_config.fs.push_back({{opaque(0xf0000000ULL + f), 1},
                                         options.slots[f], true});
@@ -383,7 +394,8 @@ int main(int argc, char** argv) {
             "workers=%u requested_slots=%u estimated_c_to_f=%llu makespan_ns=%llu "
             "N_eff=%.9f H_route=%.9f r5_lower_c_to_f=%llu "
             "r5_lower_makespan_ns=%llu r5_bound=%s r5_horizon=%zu r5_beam=%zu "
-            "r5_expanded=%llu r5_pruned=%llu assignment=%s curve=%s\n",
+            "r5_expanded=%llu r5_pruned=%llu replica_gap_weight=%llu/%llu "
+            "assignment=%s curve=%s\n",
             p29::routing::policy_name(options.policy), trace.size(), options.workers,
             options.requested_slots,
             static_cast<unsigned long long>(result.c_to_f_bytes),
@@ -395,8 +407,10 @@ int main(int argc, char** argv) {
                                                            : "root-control-only",
             options.r5_horizon, options.r5_beam_width,
             static_cast<unsigned long long>(r5_expanded),
-            static_cast<unsigned long long>(r5_pruned), options.assignment_out,
-            options.curve_out);
+            static_cast<unsigned long long>(r5_pruned),
+            static_cast<unsigned long long>(options.replica_gap_weight_num),
+            static_cast<unsigned long long>(options.replica_gap_weight_den),
+            options.assignment_out, options.curve_out);
         return 0;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "routing manifest adapter: %s\n", error.what());

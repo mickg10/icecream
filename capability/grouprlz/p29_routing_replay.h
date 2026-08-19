@@ -29,6 +29,9 @@ struct WireFragment {
     uint64_t bytes = 0;
     FragmentKind kind = FragmentKind::Material;
     ObjectKind object_kind = ObjectKind::Material;
+    // Optional representation-independent resident value used by the replica-gap heuristic.
+    // Zero means use this representation's wire bytes.
+    uint64_t resident_bytes = 0;
 };
 
 // root/control are paid on every use.  A closure fragment is paid only when the selected F
@@ -73,6 +76,10 @@ struct ReplayConfig {
     uint64_t investment_weight_num = 1;
     uint64_t investment_weight_den = 1;
     uint64_t investment_history_scale = 4;
+    // Optional online facility charge: opening/using a less-materialized F pays a fraction of
+    // the gap to the best resident copy of this SourceGeneration.
+    uint64_t replica_gap_weight_num = 0;
+    uint64_t replica_gap_weight_den = 1;
 };
 
 enum class Policy : uint8_t {
@@ -139,6 +146,7 @@ struct ReplayResult {
 struct GenerationState {
     Opaque128 generation{};
     std::array<std::vector<uint8_t>, 5> known;
+    uint64_t resident_bytes = 0;
 };
 
 struct FState {
@@ -153,6 +161,7 @@ struct ReplayState {
     std::vector<FState> fs;
     std::vector<uint64_t> egress_ready_ns;
     std::unordered_map<TypedObjectKey, uint64_t, TypedObjectKeyHash> prior_object_uses;
+    std::unordered_map<TypedObjectKey, uint64_t, TypedObjectKeyHash> object_bytes;
     uint64_t admitted_tus = 0;
     uint64_t c_to_f_bytes = 0;
     uint64_t makespan_ns = 0;
@@ -167,6 +176,7 @@ struct EvaluatedAction {
     uint64_t compile_start_ns = 0;
     uint64_t compile_finish_ns = 0;
     uint64_t investment_estimate_bytes = 0;
+    uint64_t replica_gap_bytes = 0;
     size_t egress_lane = 0;
     size_t compiler_slot = 0;
 };
@@ -280,12 +290,16 @@ inline bool has_generation_state(const FState& f, const Opaque128& generation_id
     return false;
 }
 
-inline void install(FState& f, const Opaque128& generation_id, ObjectKind kind,
-                    uint32_t ordinal) {
+inline bool install(FState& f, const Opaque128& generation_id, ObjectKind kind,
+                    uint32_t ordinal, uint64_t bytes) {
     GenerationState* state = generation(f, generation_id, true);
     std::vector<uint8_t>& typed = state->known[object_kind_index(kind)];
     if (typed.size() <= ordinal) typed.resize(size_t(ordinal) + 1, 0);
+    if (typed[ordinal]) return false;
     typed[ordinal] = 1;
+    state->resident_bytes =
+        checked_add(state->resident_bytes, bytes, "resident byte total overflow");
+    return true;
 }
 
 inline size_t earliest(const std::vector<uint64_t>& values) {
@@ -301,6 +315,10 @@ inline uint64_t stable_fragment_use_count(const ReplayState& state,
     return found == state.prior_object_uses.end() ? 0 : found->second;
 }
 
+inline uint64_t resident_fragment_bytes(const WireFragment& fragment) {
+    return fragment.resident_bytes ? fragment.resident_bytes : fragment.bytes;
+}
+
 }  // namespace detail
 
 inline void validate(const ReplayConfig& config, const std::vector<Tu>& trace) {
@@ -308,6 +326,7 @@ inline void validate(const ReplayConfig& config, const std::vector<Tu>& trace) {
     if (!config.requested_slots || !config.egress_lanes || !config.link_bits_per_second)
         throw std::invalid_argument("routing replay has a zero capacity/rate");
     if (!config.time_weight_ns || !config.investment_weight_den ||
+        !config.replica_gap_weight_den ||
         !config.investment_history_scale)
         throw std::invalid_argument("routing replay has a zero policy denominator");
     uint64_t eligible_slots = 0;
@@ -320,6 +339,7 @@ inline void validate(const ReplayConfig& config, const std::vector<Tu>& trace) {
     if (!eligible_slots) throw std::invalid_argument("routing replay has no eligible F");
     std::vector<uint64_t> logical_ids;
     logical_ids.reserve(trace.size());
+    std::unordered_map<TypedObjectKey, uint64_t, TypedObjectKeyHash> object_sizes;
     std::optional<uint64_t> prior_release;
     for (const Tu& tu : trace) {
         if (prior_release && tu.release_ns < *prior_release)
@@ -343,6 +363,14 @@ inline void validate(const ReplayConfig& config, const std::vector<Tu>& trace) {
                     throw std::invalid_argument(
                         "BlockDefinition fragment does not name a Block object");
                 ids.emplace_back(fragment.object_kind, fragment.ordinal);
+                const TypedObjectKey key{tu.source_generation, fragment.object_kind,
+                                         fragment.ordinal};
+                const uint64_t resident_bytes =
+                    detail::resident_fragment_bytes(fragment);
+                const auto [found, inserted] = object_sizes.emplace(key, resident_bytes);
+                if (!inserted && found->second != resident_bytes)
+                    throw std::invalid_argument(
+                        "typed closure object changes its resident-byte size");
             }
             std::sort(ids.begin(), ids.end());
             if (std::adjacent_find(ids.begin(), ids.end()) != ids.end())
@@ -380,7 +408,14 @@ inline void evict_object(ReplayState& state, size_t f, const Opaque128& generati
     GenerationState* generation = detail::generation(state.fs[f], generation_id, false);
     if (!generation) return;
     std::vector<uint8_t>& typed = generation->known[detail::object_kind_index(kind)];
-    if (ordinal < typed.size()) typed[ordinal] = 0;
+    if (ordinal < typed.size() && typed[ordinal]) {
+        const TypedObjectKey key{generation_id, kind, ordinal};
+        const auto found = state.object_bytes.find(key);
+        if (found == state.object_bytes.end() || found->second > generation->resident_bytes)
+            throw std::logic_error("evicted object has no resident-byte accounting");
+        generation->resident_bytes -= found->second;
+        typed[ordinal] = 0;
+    }
 }
 
 inline bool legal(const FState& f, const Representation& representation) {
@@ -453,6 +488,22 @@ inline EvaluatedAction evaluate(const ReplayConfig& config, const ReplayState& s
                                          "investment estimate overflow");
     }
     result.investment_estimate_bytes = investment;
+    uint64_t best_resident_bytes = 0;
+    for (size_t index = 0; index < config.fs.size(); ++index) {
+        if (!config.fs[index].eligible) continue;
+        const GenerationState* generation =
+            detail::generation(state.fs[index], tu.source_generation);
+        if (generation)
+            best_resident_bytes = std::max(best_resident_bytes,
+                                           generation->resident_bytes);
+    }
+    const GenerationState* selected_generation =
+        detail::generation(f, tu.source_generation);
+    const uint64_t selected_resident_bytes =
+        selected_generation ? selected_generation->resident_bytes : 0;
+    result.replica_gap_bytes = best_resident_bytes > selected_resident_bytes
+                                   ? best_resident_bytes - selected_resident_bytes
+                                   : 0;
     return result;
 }
 
@@ -464,8 +515,17 @@ inline DecisionRow apply(const ReplayConfig& config, ReplayState& state, const T
     const uint64_t commits_before = f.route_commits;
     state.egress_ready_ns[evaluated.egress_lane] = evaluated.transfer_finish_ns;
     f.compiler_ready_ns[evaluated.compiler_slot] = evaluated.compile_finish_ns;
-    for (const WireFragment& fragment : representation.closure)
-        detail::install(f, tu.source_generation, fragment.object_kind, fragment.ordinal);
+    for (const WireFragment& fragment : representation.closure) {
+        const TypedObjectKey key{tu.source_generation, fragment.object_kind,
+                                 fragment.ordinal};
+        const uint64_t resident_bytes = detail::resident_fragment_bytes(fragment);
+        const auto [found, inserted] = state.object_bytes.emplace(key, resident_bytes);
+        if (!inserted && found->second != resident_bytes)
+            throw std::invalid_argument(
+                "applied closure object changes its resident-byte size");
+        detail::install(f, tu.source_generation, fragment.object_kind, fragment.ordinal,
+                        resident_bytes);
+    }
     if (f.route_commits == std::numeric_limits<uint64_t>::max())
         throw std::overflow_error("route commit sequence overflow");
     ++f.route_commits;
@@ -520,6 +580,7 @@ struct ApplyUndo {
     uint64_t prior_makespan_ns = 0;
     Opaque128 generation{};
     bool generation_created = false;
+    uint64_t prior_resident_bytes = 0;
     std::array<size_t, 5> prior_known_sizes{};
     std::vector<MissingObjectEvent> installed;
 };
@@ -546,6 +607,7 @@ inline DecisionRow reversible_apply(const ReplayConfig& config, ReplayState& sta
     if (generation_before)
         for (size_t kind = 0; kind < generation_before->known.size(); ++kind)
             undo.prior_known_sizes[kind] = generation_before->known[kind].size();
+    if (generation_before) undo.prior_resident_bytes = generation_before->resident_bytes;
     undo.installed = evaluated.cost.missing_objects;
     return apply(config, state, tu, evaluated, false);
 }
@@ -580,6 +642,7 @@ inline void undo_reversible_apply(ReplayState& state, const ApplyUndo& undo) {
     }
     for (size_t kind = 0; kind < generation_state->known.size(); ++kind)
         generation_state->known[kind].resize(undo.prior_known_sizes[kind]);
+    generation_state->resident_bytes = undo.prior_resident_bytes;
 }
 
 }  // namespace detail
@@ -710,6 +773,11 @@ inline EvaluatedAction select_action(const ReplayConfig& config, const ReplaySta
             "R4 time score overflow");
         uint64_t positive = detail::checked_add(action.cost.total_bytes, time,
                                                 "R4 positive score overflow");
+        const uint64_t replica_gap = detail::mul_div_ceil(
+            action.replica_gap_bytes, config.replica_gap_weight_num,
+            config.replica_gap_weight_den, "R4 replica-gap score overflow");
+        positive = detail::checked_add(positive, replica_gap,
+                                       "R4 replica-gap score overflow");
         const uint64_t investment = detail::mul_div_ceil(
             action.investment_estimate_bytes, config.investment_weight_num,
             config.investment_weight_den, "R4 investment score overflow");

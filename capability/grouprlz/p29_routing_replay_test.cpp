@@ -83,6 +83,30 @@ int main() {
             rejected = true;
         }
         check(rejected, "BlockDefinition fragment with Region identity was accepted");
+        trace = {
+            tu(0, 40, 1,
+               {rep(p29::CandidateKind::Fi, 1,
+                    {{7, 2, FragmentKind::Material, p29::ObjectKind::Region}})}),
+            tu(1, 41, 1,
+               {rep(p29::CandidateKind::Fi, 1,
+                    {{7, 3, FragmentKind::Material, p29::ObjectKind::Region}})})};
+        rejected = false;
+        try {
+            (void)replay(c, trace, Policy::R0RoundRobin);
+        } catch (const std::invalid_argument&) {
+            rejected = true;
+        }
+        check(rejected, "typed closure object changed its resident-byte size");
+        trace = {
+            tu(0, 40, 1,
+               {rep(p29::CandidateKind::Fi, 1,
+                    {{7, 2, FragmentKind::Material, p29::ObjectKind::Region, 10}})}),
+            tu(1, 41, 1,
+               {rep(p29::CandidateKind::Fi, 1,
+                    {{7, 3, FragmentKind::Material, p29::ObjectKind::Region, 10}})})};
+        const ReplayResult alternate_wire = replay(c, trace, Policy::R0RoundRobin);
+        check(alternate_wire.c_to_f_bytes == 4,
+              "representation-independent resident size rejected alternate wire cost");
         // Direct ordinals are typed: Region 7 and Block 7 are distinct and both must be paid.
         trace = {tu(0, 40, 1,
                     {rep(p29::CandidateKind::Fi, 1,
@@ -102,6 +126,48 @@ int main() {
             rejected = true;
         }
         check(rejected, "zero egress capacity was accepted");
+    }
+
+    // R4 may price the online cost of opening a less-materialized replica.  The charge is the
+    // selected F's byte-coverage gap to the best resident F, and reversible R5 exploration must
+    // restore that accounting exactly.
+    {
+        ReplayConfig c = config({1, 1}, 2);
+        c.egress_lanes = 2;
+        c.link_bits_per_second = std::numeric_limits<uint64_t>::max();
+        c.time_weight_bytes = 1;
+        c.time_weight_ns = 1;
+        c.investment_weight_num = 0;
+        c.replica_gap_weight_num = 10;
+        const WireFragment object{60, 90, FragmentKind::Material};
+        Tu first = tu(0, 90, 100, {rep(p29::CandidateKind::Fi, 10, {object})});
+        Tu second = tu(1, 91, 100, {rep(p29::CandidateKind::Fi, 10, {object})});
+        ReplayState state = initial_state(c);
+        apply(c, state, first, evaluate(c, state, first, {0, 0}));
+        const EvaluatedAction warm = evaluate(c, state, second, {0, 0});
+        const EvaluatedAction cold = evaluate(c, state, second, {1, 0});
+        check(warm.replica_gap_bytes == 0 && cold.replica_gap_bytes == 90,
+              "R4 replica gap does not match resident byte coverage");
+        const ReplayResult result = replay(c, {second}, Policy::R4StateAware, state);
+        check(result.rows[0].action.f == 0,
+              "R4 replica-gap price did not retain the materialized F");
+
+        ReplayState reversible = initial_state(c);
+        const EvaluatedAction install = evaluate(c, reversible, first, {0, 0});
+        detail::ApplyUndo undo;
+        detail::reversible_apply(c, reversible, first, install, undo);
+        const GenerationState* installed =
+            detail::generation(reversible.fs[0], first.source_generation);
+        check(installed && installed->resident_bytes == object.bytes,
+              "reversible R5 apply did not account resident bytes");
+        detail::undo_reversible_apply(reversible, undo);
+        check(!detail::generation(reversible.fs[0], first.source_generation),
+              "reversible R5 undo retained replica coverage");
+
+        evict_object(state, 0, first.source_generation, object.ordinal);
+        installed = detail::generation(state.fs[0], first.source_generation);
+        check(installed && installed->resident_bytes == 0,
+              "eviction retained resident-byte coverage");
     }
 
     // Route history advances after every successful representation.  A route-local candidate
