@@ -1,0 +1,35 @@
+{
+  "schema": "firefox-corrected-workload-v1",
+  "compile_model": "firefox-compile-v1-size-linear",
+  "manifest": "/tanksmall/scratch/ictmp/corpus18/manifest.txt",
+  "manifest_sha256": "cbca563b6efe3255382db61b490ba948f3d2cdc0d95b793317f7d0134ec6f3fa",
+  "compile_commands": "/tanksmall/scratch/ictmp/src3/gecko-dev/obj-cc/compile_commands.json",
+  "compile_commands_sha256": "fa52727dbbe42978678b29b3d52a33d66ad415845e34a1d577d72200a9dcd503",
+  "samples": "/tanksmall/scratch/ictmp/icecream-push/capability/distribution/firefox_compile_samples.tsv",
+  "samples_sha256": "c0624a4b3b16b9492bbded6e8a5d3e3b3d48da3692c51b78643c039aab61ef79",
+  "sample_status": {
+    "complete": 9,
+    "early-error": 3
+  },
+  "manifest_rows": 9646,
+  "real_compile_jobs": 2498,
+  "duplicate_rows_removed": 7148,
+  "logical_bytes_before": 102047678234,
+  "logical_bytes_after": 15240876398,
+  "logical_byte_ratio_before_over_after": 6.695656835547286,
+  "ambiguous_sources": 51,
+  "ambiguous_compile_variants_dropped": 113,
+  "compile_ns": {
+    "min": 468546000,
+    "p10": 579110313,
+    "p25": 651980086,
+    "p50": 2168000322,
+    "p75": 5312722491,
+    "p90": 11018054589,
+    "p95": 14078382659,
+    "p99": 17865332998,
+    "max": 23276600000,
+    "sum": 10270631607299
+  },
+  "trace": "capability/distribution/firefox-corrected.compile-trace.tsv"
+}
