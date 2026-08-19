@@ -1214,7 +1214,7 @@ int main(int argc,char**argv){
     alpha_line::Stats alphaStats;
     uint64_t preloadedRegionBytes=0,preloadedRegionCount=0,associatedRegionCount=0;double mixedAssociationWire=0,mixedMissingRequestWire=0;
     const double FRAME=4;   // 4-byte length prefix per framed message (the ACCOUNTING charge)
-    struct SelRow{size_t tu;uint64_t reserved,rawRootRaw,rawRootZ,globalRootRaw,globalRootZ,newBlocks,defRaw,defZ;};
+    struct SelRow{size_t tu;uint64_t rawRootRaw,rawRootZ,globalRootRaw,globalRootZ,newBlocks,defRaw,defZ;};
     std::vector<SelRow> selRows;
     WireSink cfSink,fcSink;   // the PHYSICAL streams: 5-byte typed header per frame
     std::vector<uint64_t>sinkCfOff(TUs),sinkFcOff(TUs),sinkCfFrames(TUs),sinkFcFrames(TUs);
@@ -1378,30 +1378,48 @@ int main(int argc,char**argv){
         std::vector<uint8_t> rootb,Frootb;
         // The tag goes out as-is; only the legacy namespace needs the final Region count.
         if(usePriorRoot)rootb=root_slices.programs[t];else for(size_t i=0;i<tn;++i)put_varint(rootb,stableRootTags?uint64_t(tk[i]):uint64_t(legacy_flat_token(tk[i],NREG)));
+        // The ONE BlockDef serializer.  Costing and emission call it, so a candidate is
+        // priced with the bytes that would actually be sent -- an approximation written
+        // beside the real encoder drifts from it silently.
+        auto serialize_block_manifest=[&](const std::vector<uint32_t>&ids,std::vector<uint8_t>&out){
+            out.clear(); put_varint(out,ids.size());
+            for(uint32_t k:ids){ put_varint(out,k); const size_t length=boff2[k+1]-boff2[k];
+                if(bcopy_ok[k]){ out.push_back(1); put_varint(out,bcopy_src[k]); put_varint(out,length); }
+                else { out.push_back(0); put_varint(out,length);
+                       for(size_t j=boff2[k];j<boff2[k+1];++j) put_varint(out,bchild[j]); } }
+        };
         // --- candidate COSTING (not yet selection) --------------------------------------
         // Every candidate is built from the SAME pre-TU state and expands to the IDENTICAL
         // Region sequence, so the missing-Region and Line material is common to all three
         // and is deliberately NOT counted here: this measures only what the candidates
         // actually differ in, the Root and the Block definitions it implies.
         if(selectorTsvPath&&!usePriorRoot){
+            // C prices candidates from ITS OWN mirror of what F holds (fknownBlk).  Reading
+            // the decoder's Fblocks would be C consulting F-private state, which the real
+            // sender cannot do -- mirror-vs-F divergence is a post-Ack gate, not an input.
             std::vector<uint8_t> rawRoot;
             for(size_t i=roff[t];i<roff[t+1];++i)
                 put_varint(rawRoot,stableRootTags?uint64_t(region_tag(allreg[i])):uint64_t(allreg[i]));
             std::vector<uint8_t> costDst;
-            const size_t rawBytes=zstd_size(z,rawRoot.data(),rawRoot.size(),zlevel,costDst);
-            const size_t globalBytes=zstd_size(z,rootb.data(),rootb.size(),zlevel,costDst);
-            // Blocks this Root names that F does not already hold have to be defined too;
-            // RAW names none by construction.
-            uint64_t newBlocks=0,defRaw=0;
-            for(size_t i=0;i<tn;++i) if(tag_is_block(tk[i])&&!Fblocks.known(tag_id(tk[i]))){
-                ++newBlocks; defRaw+=blockCatalogue.block(tag_id(tk[i])).regions.size();
+            // The UNIQUE ORDERED closure: a Block named twice in one Root is defined once.
+            std::vector<uint32_t> costBlocks; 
+            for(size_t i=0;i<tn;++i) if(tag_is_block(tk[i])){
+                const uint32_t k=tag_id(tk[i]);
+                if(k<fknownBlk.size()&&fknownBlk[k]) continue;
+                bool seen=false; for(uint32_t q:costBlocks) if(q==k){seen=true;break;}
+                if(!seen) costBlocks.push_back(k);
             }
-            std::vector<uint8_t> defBytes;
-            for(size_t i=0;i<tn;++i) if(tag_is_block(tk[i])&&!Fblocks.known(tag_id(tk[i])))
-                for(uint32_t r:blockCatalogue.block(tag_id(tk[i])).regions) put_varint(defBytes,r);
-            const size_t globalDef=defBytes.empty()?0:zstd_size(z,defBytes.data(),defBytes.size(),zlevel,costDst);
-            selRows.push_back({t,uint64_t(perTU_raw.size()>t?0:0),uint64_t(rawRoot.size()),uint64_t(rawBytes),
-                               uint64_t(rootb.size()),uint64_t(globalBytes),newBlocks,uint64_t(defRaw),uint64_t(globalDef)});
+            std::vector<uint8_t> costDef;
+            if(!costBlocks.empty()) serialize_block_manifest(costBlocks,costDef);
+            // Score the PHYSICAL FRAME: encoded payload plus the typed frame header the
+            // sink writes, for each message the candidate would emit.
+            const size_t hdr=5;
+            const size_t rawZ=zstd_size(z,rawRoot.data(),rawRoot.size(),zlevel,costDst)+hdr;
+            const size_t globalZ=zstd_size(z,rootb.data(),rootb.size(),zlevel,costDst)+hdr;
+            const size_t defZ=costDef.empty()?0:zstd_size(z,costDef.data(),costDef.size(),zlevel,costDst)+hdr;
+            selRows.push_back({t,uint64_t(rawRoot.size()),uint64_t(rawZ),
+                               uint64_t(rootb.size()),uint64_t(globalZ),
+                               uint64_t(costBlocks.size()),uint64_t(costDef.size()),uint64_t(defZ)});
         }
         std::vector<uint32_t> missReg,missBlk,associationRegs,requiredRegions,requiredBlocks;
         if(useKeyMap){
@@ -1449,11 +1467,7 @@ int main(int argc,char**argv){
 
             std::vector<uint32_t>manifestBlocks;for(uint32_t k:FrequiredBlocks)if(!fknownBlk[k])manifestBlocks.push_back(k);
             if(!manifestBlocks.empty()){
-              std::vector<uint8_t>blockRaw;put_varint(blockRaw,manifestBlocks.size());
-              for(uint32_t k:manifestBlocks){put_varint(blockRaw,k);size_t length=boff2[k+1]-boff2[k];
-                if(bcopy_ok[k]){blockRaw.push_back(1);put_varint(blockRaw,bcopy_src[k]);put_varint(blockRaw,length);}
-                else{blockRaw.push_back(0);put_varint(blockRaw,length);for(size_t j=boff2[k];j<boff2[k+1];++j)put_varint(blockRaw,bchild[j]);}
-              }
+              std::vector<uint8_t>blockRaw;serialize_block_manifest(manifestBlocks,blockRaw);
               if(structureCeiling)allBlocks.insert(allBlocks.end(),blockRaw.begin(),blockRaw.end());
               size_t bytes=zstd_message_roundtrip(z,messageD,blockRaw,zlevel,messageEncoded,messageDecoded)+FRAME;w_blockdef+=bytes;
               cfSink.emit(WT_BLOCKDEF,messageEncoded.data(),bytes-size_t(FRAME));
@@ -2548,7 +2562,9 @@ int main(int argc,char**argv){
       for(const SelRow&r:selRows){
         const uint64_t g=r.globalRootZ+r.defZ;
         // Deterministic tie rule: fewer newly-installed Blocks first, then RAW.
+        // Deterministic tie rule: fewer newly-installed Blocks first, then RAW.
         const char*win = g<r.rawRootZ ? "GLOBAL_S1" : (g>r.rawRootZ ? "RAW" : (r.newBlocks?"RAW":"RAW"));
+        (void)0;
         if(g<r.rawRootZ)++globalWins; else if(g>r.rawRootZ)++rawWins; else ++ties;
         rawCum+=r.rawRootZ; globalCum+=g;
         if(fprintf(f,"%zu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%s\n",r.tu,
