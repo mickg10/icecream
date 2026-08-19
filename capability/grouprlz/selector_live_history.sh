@@ -63,7 +63,8 @@ trap 'rc=$?; [ $rc -eq 0 ] || fail "aborted with status $rc at line $LINENO"' ER
 BASE=(--z 3 --mixed-regions --byte-array-lines --direct-ordinals --compressed-blobs
       --blob-threads 8 --blob-lazy-fallback --mo-factor --s1-max-chain 1024
       --blob-z 9 --blob-zstd-workers 4 --blob-zstd-job-mib 5 --blob-zstd-overlap-log 3
-      --stable-root-tags --literal-ondemand --literal-group-skip-zstd10 --route-s1 1)
+      --stable-root-tags --literal-ondemand --literal-group-skip-zstd10 --route-s1 1
+      --transactional-tu)
 WANT_HDR=$'tu\traw_root_bytes\traw_root_frame\troute_root_bytes\troute_root_frame\troute_candidate_blockdefs\troute_blockdef_bytes\troute_blockdef_frame\temitted_root_frame\temitted_blockdefs\temitted_blockdef_frame\tactual_delta\tcommon\traw_full\troute_full\twinner\ttie\traw_cheaper'
 
 CELLS=("$@")

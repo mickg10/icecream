@@ -1,8 +1,9 @@
 // One-pending-TU receiver ledger for the deployable P29 route.
 //
 // The receiver owns one instance per (C GUID, source generation, F cache epoch).  A committed
-// transaction retains the exact Ack fields needed to answer a repeated delivery without
-// installing objects or appending occurrence history twice.  Aborting leaves the expected
+// transaction retains the exact transaction digest, output digest and output extent needed
+// to answer a repeated delivery without installing objects or appending occurrence history
+// twice.  A repeat with any changed closure field is refused.  Aborting leaves the expected
 // sequence unchanged, so the identical transaction can be retried.
 #ifndef P29_TRANSFER_TRANSACTION_H
 #define P29_TRANSFER_TRANSACTION_H
@@ -41,6 +42,17 @@ struct Digest128 {
     bool operator!=(const Digest128& other) const { return !(*this == other); }
 };
 
+struct TransactionClosure {
+    Digest128 transaction_digest{};
+    Digest128 output_digest{};
+    uint64_t output_extent = 0;
+    bool operator==(const TransactionClosure& other) const {
+        return transaction_digest == other.transaction_digest &&
+               output_digest == other.output_digest && output_extent == other.output_extent;
+    }
+    bool operator!=(const TransactionClosure& other) const { return !(*this == other); }
+};
+
 struct AckReceipt {
     TransferTxnId id{};
     Digest128 transaction_digest{};
@@ -70,6 +82,8 @@ public:
         bool pending = false;
         uint64_t pending_sequence = 0;
         Digest128 pending_transaction_digest{};
+        Digest128 pending_output_digest{};
+        uint64_t pending_output_extent = 0;
         bool retained_ack = false;
         uint64_t retained_sequence = 0;
         Digest128 retained_transaction_digest{};
@@ -79,6 +93,8 @@ public:
             return expected_sequence == other.expected_sequence && pending == other.pending &&
                    pending_sequence == other.pending_sequence &&
                    pending_transaction_digest == other.pending_transaction_digest &&
+                   pending_output_digest == other.pending_output_digest &&
+                   pending_output_extent == other.pending_output_extent &&
                    retained_ack == other.retained_ack &&
                    retained_sequence == other.retained_sequence &&
                    retained_transaction_digest == other.retained_transaction_digest &&
@@ -90,18 +106,21 @@ public:
     explicit ReceiverTxnLedger(RouteScope scope, uint64_t expected_sequence = 0)
         : scope_(scope), expected_sequence_(expected_sequence) {}
 
-    BeginResult begin(const TransferTxnId& id, Digest128 transaction_digest,
+    BeginResult begin(const TransferTxnId& id, TransactionClosure closure,
                       AckReceipt* duplicate_ack = nullptr) {
         if (id.scope != scope_) return BeginResult::ScopeMismatch;
         if (pending_) {
             if (id != pending_->id) return BeginResult::Busy;
-            return transaction_digest == pending_->transaction_digest
+            return closure == pending_->closure
                        ? BeginResult::PendingDuplicate
                        : BeginResult::DigestMismatch;
         }
         if (id.route_sequence < expected_sequence_) {
             if (last_ack_ && id == last_ack_->id) {
-                if (transaction_digest != last_ack_->transaction_digest)
+                const TransactionClosure retained{last_ack_->transaction_digest,
+                                                  last_ack_->output_digest,
+                                                  last_ack_->output_extent};
+                if (closure != retained)
                     return BeginResult::DigestMismatch;
                 if (duplicate_ack) *duplicate_ack = *last_ack_;
                 return BeginResult::DuplicateCommitted;
@@ -112,13 +131,14 @@ public:
             return BeginResult::SequenceMismatch;
         if (id.route_sequence == UINT64_MAX)
             return BeginResult::SequenceExhausted;
-        pending_ = Pending{id, transaction_digest};
+        pending_ = Pending{id, closure};
         return BeginResult::Ready;
     }
 
-    bool commit(Digest128 output_digest, uint64_t output_extent, AckReceipt& ack) {
+    bool commit(AckReceipt& ack) {
         if (!pending_) return false;
-        ack = {pending_->id, pending_->transaction_digest, output_digest, output_extent};
+        ack = {pending_->id, pending_->closure.transaction_digest,
+               pending_->closure.output_digest, pending_->closure.output_extent};
         last_ack_ = ack;
         expected_sequence_ = pending_->id.route_sequence + 1;
         pending_.reset();
@@ -140,7 +160,9 @@ public:
         mark.pending = pending_.has_value();
         if (pending_) {
             mark.pending_sequence = pending_->id.route_sequence;
-            mark.pending_transaction_digest = pending_->transaction_digest;
+            mark.pending_transaction_digest = pending_->closure.transaction_digest;
+            mark.pending_output_digest = pending_->closure.output_digest;
+            mark.pending_output_extent = pending_->closure.output_extent;
         }
         mark.retained_ack = last_ack_.has_value();
         if (last_ack_) {
@@ -153,7 +175,7 @@ public:
     }
 
 private:
-    struct Pending { TransferTxnId id; Digest128 transaction_digest; };
+    struct Pending { TransferTxnId id; TransactionClosure closure; };
     RouteScope scope_{};
     uint64_t expected_sequence_ = 0;
     std::optional<Pending> pending_;

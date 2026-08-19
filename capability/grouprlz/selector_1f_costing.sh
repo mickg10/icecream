@@ -65,7 +65,8 @@ trap 'rc=$?; [ $rc -eq 0 ] || fail "aborted with status $rc at line $LINENO"' ER
 BASE=(--z 3 --mixed-regions --byte-array-lines --direct-ordinals --compressed-blobs
       --blob-threads 8 --blob-lazy-fallback --mo-factor --s1-max-chain 1024
       --blob-z 9 --blob-zstd-workers 4 --blob-zstd-job-mib 5 --blob-zstd-overlap-log 3
-      --stable-root-tags --literal-ondemand --literal-group-skip-zstd10 --route-s1 1)
+      --stable-root-tags --literal-ondemand --literal-group-skip-zstd10 --route-s1 1
+      --transactional-tu)
 
 # Parsed by column index below, so a rename or reorder must be a hard error, not a silent
 # mis-read of some other column.

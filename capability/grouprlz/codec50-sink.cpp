@@ -39,6 +39,7 @@
 #include "alpha_line_codec.h"
 #include "p29_online_s1.h"
 #include "p29_sparse_blocks.h"
+#include "p29_transfer_transaction.h"
 #include "mo_factor_codec.h"
 #if defined(WITH_BSC_GROUPS)
   #include "residual_group_codec.h"
@@ -259,7 +260,8 @@ static LiteralGroupPlan build_literal_group_plan(const std::string&prefix,size_t
 enum : uint8_t {
     WT_ROOT=1, WT_BLOCKDEF=2, WT_NEED=3, WT_ASSOC=4, WT_PATHDEF=5, WT_LINEDEF=6,
     WT_REGIONDEF=7, WT_FILL0=8, WT_SELECTOR=20, WT_BLOB=21, WT_BLOBPATCH=22,
-    WT_LITGROUP=23, WT_FBREQ=30, WT_FBREPLY=31, WT_TU_END=0xFE, WT_BUILD_CLOSE=0xFF };
+    WT_LITGROUP=23, WT_FBREQ=30, WT_FBREPLY=31, WT_ACK=0xFD,
+    WT_TU_END=0xFE, WT_BUILD_CLOSE=0xFF };
 // In REPLAY mode the identical call sites read the stream back instead of writing it: each
 // message must be present, in order, with the declared type and a byte-identical payload, and
 // the stream must be fully consumed at the end.  That turns "I believe I emitted everything"
@@ -268,11 +270,55 @@ enum : uint8_t {
 struct WireSink {
     FILE* f=nullptr; bool replay=false; uint64_t off=0, frames=0, payload=0;
     std::vector<uint8_t> back;
+    struct CapturedTransaction {
+        p29::Digest128 digest{};
+        std::vector<uint8_t> frames;
+    };
+    bool transaction_active=false;
+    p29::Digest128 transaction_digest{};
+    std::vector<uint8_t> transaction_frames;
+
+    void begin_transaction(){
+        if(transaction_active){fprintf(stderr,"wire transaction already active\n");exit(2);}
+        transaction_active=true;
+        transaction_digest={1469598103934665603ULL,0x9e3779b97f4a7c15ULL};
+        transaction_frames.clear();
+    }
+    void digest_bytes(const uint8_t*data,size_t n){
+        for(size_t i=0;i<n;++i){
+            transaction_digest.lo=(transaction_digest.lo^data[i])*1099511628211ULL;
+            transaction_digest.hi=(transaction_digest.hi+uint64_t(data[i])+0x9e3779b97f4a7c15ULL)*0xbf58476d1ce4e5b9ULL;
+            transaction_digest.hi=(transaction_digest.hi<<17)|(transaction_digest.hi>>47);
+        }
+    }
+    CapturedTransaction end_transaction(){
+        if(!transaction_active){fprintf(stderr,"wire transaction is not active\n");exit(2);}
+        transaction_active=false;
+        transaction_digest.lo=mix64(transaction_digest.lo^transaction_frames.size());
+        transaction_digest.hi=mix64(transaction_digest.hi^transaction_digest.lo^transaction_frames.size());
+        return {transaction_digest,std::move(transaction_frames)};
+    }
+    void replay_transaction(const CapturedTransaction&captured){
+        const uint8_t*p=captured.frames.data(),*end=p+captured.frames.size();
+        while(p<end){
+            if(size_t(end-p)<5){fprintf(stderr,"captured transaction has a truncated header\n");exit(2);}
+            const uint8_t type=p[0];
+            const uint32_t n=uint32_t(p[1])|(uint32_t(p[2])<<8)|(uint32_t(p[3])<<16)|(uint32_t(p[4])<<24);
+            p+=5;
+            if(size_t(end-p)<n){fprintf(stderr,"captured transaction has a truncated payload\n");exit(2);}
+            emit(type,p,n);p+=n;
+        }
+    }
     void open(const char*p,bool forReplay){ replay=forReplay; f=fopen(p,forReplay?"rb":"wb"); if(!f){perror(p);exit(2);} }
     void emit(uint8_t type,const uint8_t*data,size_t n){
         if(!f) return;
         if(n>0xffffffffull){fprintf(stderr,"sink frame too large\n");exit(2);}
         const uint8_t h[5]={type,uint8_t(n),uint8_t(n>>8),uint8_t(n>>16),uint8_t(n>>24)};
+        if(transaction_active){
+            digest_bytes(h,sizeof h);if(n)digest_bytes(data,n);
+            transaction_frames.insert(transaction_frames.end(),h,h+sizeof h);
+            if(n)transaction_frames.insert(transaction_frames.end(),data,data+n);
+        }
         if(!replay){
             if(fwrite(h,1,sizeof h,f)!=sizeof h){fprintf(stderr,"sink short write\n");exit(2);}
             if(n&&fwrite(data,1,n,f)!=n){fprintf(stderr,"sink short write\n");exit(2);}
@@ -285,7 +331,7 @@ struct WireSink {
             if(n&&memcmp(back.data(),data,n)!=0){fprintf(stderr,"replay: type-%u payload differs at offset %llu\n",type,(unsigned long long)off);exit(2);}
         }
         off+=sizeof h+n; ++frames;
-        if(type!=WT_TU_END&&type!=WT_BUILD_CLOSE)payload+=n;
+        if(type!=WT_ACK&&type!=WT_TU_END&&type!=WT_BUILD_CLOSE)payload+=n;
     }
     void emit(uint8_t type,const std::vector<uint8_t>&v){ emit(type,v.data(),v.size()); }
     void close(const char*name){
@@ -589,6 +635,166 @@ struct MixedFRegionView {
     uint32_t length=0;
     bool known=false;
 };
+
+// One shared-C admission.  The soft placement fields deliberately do not participate in
+// TransferTxnId: moving this admitted TU to another F changes placement, not canonical object
+// identity.  global_plan is created once in the shared admission order and survives every
+// per-F retry of the transaction built from it.
+struct SharedCAdmittedTu {
+    p29::Digest128 producer_request_id{};
+    uint64_t canonical_admission_sequence=0;
+    uint64_t shared_c_snapshot_version=0;
+    uint64_t routing_cohort_key=0;       // soft placement only
+    uint64_t tu_key=0;                   // soft stable-TU hint only
+    uint64_t source_extent=0;
+    p29::Digest128 expected_output_digest{};
+    std::vector<uint32_t> regions;
+    p29::TuPlan global_plan;
+};
+
+// C builds a transaction against tentative per-F codec state, then freezes the delta and
+// restores the committed state before F finishes decoding.  Ack applies this compact redo;
+// failure simply discards it.  The redo contains only paths and line-state slots touched by
+// the current TU plus vector extents -- never a copy of the established dictionaries.
+struct PreparedCActiveState {
+    size_t base_paths=0,base_mixed_lines=0,base_fknown_regions=0,base_fknown_blocks=0;
+    size_t final_mixed_lines=0,final_fknown_regions=0,final_fknown_blocks=0;
+    uint32_t base_next_public=1,final_next_public=1;
+    std::vector<std::string>new_paths;
+    std::vector<std::pair<uint32_t,MixedCLineState>>changed_lines;
+
+    bool apply(std::unordered_map<std::string,uint32_t>&path_ids,std::vector<std::string>&paths,
+               std::vector<MixedCLineState>&mixed_lines,uint32_t&next_public,
+               std::vector<uint8_t>&fknown_regions,std::vector<uint8_t>&fknown_blocks) const {
+        if(paths.size()!=base_paths||path_ids.size()!=base_paths||mixed_lines.size()!=base_mixed_lines||
+           next_public!=base_next_public||fknown_regions.size()!=base_fknown_regions||
+           fknown_blocks.size()!=base_fknown_blocks)
+            return false;
+        for(const std::string&path:new_paths){
+            const uint32_t id=uint32_t(paths.size());
+            if(!path_ids.emplace(path,id).second)return false;
+            paths.push_back(path);
+        }
+        mixed_lines.resize(final_mixed_lines);
+        for(const auto&change:changed_lines){
+            if(change.first>=mixed_lines.size())return false;
+            mixed_lines[change.first]=change.second;
+        }
+        fknown_regions.resize(final_fknown_regions,0);
+        fknown_blocks.resize(final_fknown_blocks,0);
+        next_public=final_next_public;
+        return true;
+    }
+};
+
+// Exactly one of these may be in flight for a route lane.  It is built from one immutable
+// SharedCAdmittedTu, owns the exact physical attempt bytes and receiver closure, and holds the
+// C-side redo/mirror delta that becomes visible only after the matching retained Ack arrives.
+struct PendingFTu {
+    p29::TransferTxnId id{};
+    uint64_t expected_mirror_sequence=0;
+    WireSink::CapturedTransaction c_to_f{};
+    WireSink::CapturedTransaction f_to_c{};
+    p29::TransactionClosure closure{};
+    PreparedCActiveState prepared_c_state{};
+    std::vector<uint32_t> known_regions;
+    std::vector<uint32_t> known_blocks;
+};
+
+class CActiveTuJournal {
+public:
+    void begin(const std::vector<std::string>&paths,const std::vector<MixedCLineState>&mixed_lines,
+               uint32_t next_public,const std::vector<uint8_t>&fknown_regions,
+               const std::vector<uint8_t>&fknown_blocks){
+        if(active_)throw std::logic_error("C active-TU journal already active");
+        paths_=paths.size();mixed_lines_=mixed_lines.size();next_public_=next_public;
+        fknown_regions_=fknown_regions.size();fknown_blocks_=fknown_blocks.size();
+        line_undo_.clear();line_touched_.clear();active_=true;
+    }
+    void touch_line(uint32_t id,const std::vector<MixedCLineState>&mixed_lines){
+        if(!active_||line_touched_.find(id)!=line_touched_.end())return;
+        const bool existed=id<mixed_lines_;MixedCLineState prior{};
+        if(existed)prior=mixed_lines[id];
+        line_touched_.emplace(id,uint8_t(1));line_undo_.push_back({id,existed,prior});
+    }
+    PreparedCActiveState freeze_and_restore(std::unordered_map<std::string,uint32_t>&path_ids,
+               std::vector<std::string>&paths,std::vector<MixedCLineState>&mixed_lines,
+               uint32_t&next_public,std::vector<uint8_t>&fknown_regions,
+               std::vector<uint8_t>&fknown_blocks){
+        require_active();PreparedCActiveState prepared;
+        prepared.base_paths=paths_;prepared.base_mixed_lines=mixed_lines_;
+        prepared.base_fknown_regions=fknown_regions_;prepared.base_fknown_blocks=fknown_blocks_;
+        prepared.base_next_public=next_public_;prepared.final_mixed_lines=mixed_lines.size();
+        prepared.final_fknown_regions=fknown_regions.size();prepared.final_fknown_blocks=fknown_blocks.size();
+        prepared.final_next_public=next_public;
+        prepared.new_paths.assign(paths.begin()+paths_,paths.end());
+        prepared.changed_lines.reserve(line_undo_.size());
+        for(const LineUndo&undo:line_undo_){
+            if(undo.id>=mixed_lines.size())throw std::logic_error("C line journal lost a touched slot");
+            prepared.changed_lines.emplace_back(undo.id,mixed_lines[undo.id]);
+        }
+        restore(path_ids,paths,mixed_lines,next_public,fknown_regions,fknown_blocks);
+        return prepared;
+    }
+    bool active() const {return active_;}
+private:
+    struct LineUndo {uint32_t id;bool existed;MixedCLineState prior;};
+    void require_active() const {if(!active_)throw std::logic_error("C active-TU journal is not active");}
+    void restore(std::unordered_map<std::string,uint32_t>&path_ids,std::vector<std::string>&paths,
+               std::vector<MixedCLineState>&mixed_lines,uint32_t&next_public,
+               std::vector<uint8_t>&fknown_regions,std::vector<uint8_t>&fknown_blocks){
+        for(size_t i=paths.size();i>paths_;--i)path_ids.erase(paths[i-1]);
+        paths.resize(paths_);
+        for(auto it=line_undo_.rbegin();it!=line_undo_.rend();++it)
+            if(it->existed)mixed_lines[it->id]=it->prior;
+        mixed_lines.resize(mixed_lines_);next_public=next_public_;
+        fknown_regions.resize(fknown_regions_);fknown_blocks.resize(fknown_blocks_);
+        line_undo_.clear();line_touched_.clear();active_=false;
+    }
+    bool active_=false;size_t paths_=0,mixed_lines_=0,fknown_regions_=0,fknown_blocks_=0;
+    uint32_t next_public_=1;
+    std::vector<LineUndo>line_undo_;
+    std::unordered_map<uint32_t,uint8_t>line_touched_;
+};
+
+// F mutates append-only stores in place so reconstruction can resolve committed plus current-TU
+// objects without a second lookup layer.  Abort truncates arenas and restores only Region slots
+// that existed before this TU.  Sparse Blocks and the MO dictionary own equivalent journals.
+class FActiveTuJournal {
+public:
+    void begin(const std::vector<std::string>&paths,const std::vector<uint8_t>&region_data,
+               const std::vector<MixedFRegionView>&regions,const std::vector<MixedFLineView>&public_lines,
+               const std::vector<uint32_t>&occurrences,const std::vector<uint32_t>&root_children,
+               const std::vector<size_t>&root_offsets){
+        if(active_)throw std::logic_error("F active-TU journal already active");
+        paths_=paths.size();region_data_=region_data.size();regions_=regions.size();public_lines_=public_lines.size();
+        occurrences_=occurrences.size();root_children_=root_children.size();root_offsets_=root_offsets.size();
+        region_undo_.clear();region_touched_.clear();active_=true;
+    }
+    void touch_region(uint32_t id,const std::vector<MixedFRegionView>&regions){
+        if(!active_||id>=regions_||region_touched_.find(id)!=region_touched_.end())return;
+        region_touched_.emplace(id,uint8_t(1));region_undo_.push_back({id,regions[id]});
+    }
+    void abort(std::vector<std::string>&paths,std::vector<uint8_t>&region_data,
+               std::vector<MixedFRegionView>&regions,std::vector<MixedFLineView>&public_lines,
+               std::vector<uint32_t>&occurrences,std::vector<uint32_t>&root_children,
+               std::vector<size_t>&root_offsets){
+        require_active();
+        for(auto it=region_undo_.rbegin();it!=region_undo_.rend();++it)regions[it->first]=it->second;
+        paths.resize(paths_);region_data.resize(region_data_);regions.resize(regions_);public_lines.resize(public_lines_);
+        occurrences.resize(occurrences_);root_children.resize(root_children_);root_offsets.resize(root_offsets_);
+        clear();
+    }
+    void commit(){require_active();clear();}
+    bool active() const {return active_;}
+private:
+    void require_active() const {if(!active_)throw std::logic_error("F active-TU journal is not active");}
+    void clear(){region_undo_.clear();region_touched_.clear();active_=false;}
+    bool active_=false;size_t paths_=0,region_data_=0,regions_=0,public_lines_=0;
+    size_t occurrences_=0,root_children_=0,root_offsets_=0;
+    std::vector<std::pair<uint32_t,MixedFRegionView>>region_undo_;
+    std::unordered_map<uint32_t,uint8_t>region_touched_;
+};
 static bool system_source_path(const std::string&path){
     return path.rfind("/usr/include/",0)==0||path.rfind("/usr/lib/gcc/",0)==0||path.rfind("/usr/local/include/",0)==0;
 }
@@ -601,7 +807,14 @@ class SourceTextStore {
 public:
     explicit SourceTextStore(bool allowProject=false):allowProject_(allowProject){}
     const SourceText& get(const std::string&path){
-        SourceText&source=files_[path];if(source.attempted)return source;source.attempted=true;source.offsets.push_back(0);
+        auto found=files_.find(path);
+        if(found==files_.end()){
+            if(transaction_active_)undo_.push_back({path,false,{}});
+            found=files_.emplace(path,SourceText{}).first;
+        }
+        SourceText&source=found->second;if(source.attempted)return source;
+        if(transaction_active_&&!was_inserted_in_transaction(path))undo_.push_back({path,true,source});
+        source.attempted=true;source.offsets.push_back(0);
         struct stat st{};if((!allowProject_&&!system_source_path(path))||stat(path.c_str(),&st)||st.st_size<0||uint64_t(st.st_size)>UINT32_MAX)return source;
         FILE*file=fopen(path.c_str(),"rb");if(!file)return source;source.bytes.resize(size_t(st.st_size));
         if(!source.bytes.empty()&&fread(source.bytes.data(),1,source.bytes.size(),file)!=source.bytes.size()){fclose(file);source.bytes.clear();return source;}fclose(file);
@@ -609,13 +822,49 @@ public:
     }
     bool install(const std::string&path,const uint8_t*data,size_t size){
         if(size>UINT32_MAX)return false;
-        SourceText&source=files_[path];
+        auto found=files_.find(path);
+        if(found==files_.end()){
+            if(transaction_active_)undo_.push_back({path,false,{}});
+            found=files_.emplace(path,SourceText{}).first;
+        }
+        SourceText&source=found->second;
         if(source.available)return source.bytes.size()==size&&(!size||!memcmp(source.bytes.data(),data,size));
+        if(transaction_active_&&!was_inserted_in_transaction(path))undo_.push_back({path,true,source});
         source={};source.attempted=true;source.offsets.push_back(0);
         if(size)source.bytes.assign(data,data+size);
         finish(source);return true;
     }
+    void begin_transaction(){
+        if(transaction_active_)throw std::logic_error("SourceTextStore transaction already active");
+        undo_.clear();transaction_active_=true;
+    }
+    void commit_transaction(){
+        if(!transaction_active_)throw std::logic_error("SourceTextStore has no active transaction");
+        undo_.clear();transaction_active_=false;
+    }
+    void abort_transaction(){
+        if(!transaction_active_)throw std::logic_error("SourceTextStore has no active transaction");
+        for(auto it=undo_.rbegin();it!=undo_.rend();++it){if(it->existed)files_[it->path]=std::move(it->prior);else files_.erase(it->path);}
+        undo_.clear();transaction_active_=false;
+    }
+    bool has_pending_transaction() const{return transaction_active_;}
+    p29::Digest128 diagnostic_state_digest() const{
+        std::vector<std::string>keys;keys.reserve(files_.size());for(const auto&entry:files_)keys.push_back(entry.first);
+        std::sort(keys.begin(),keys.end());uint64_t lo=1469598103934665603ULL,hi=0x9e3779b97f4a7c15ULL;
+        auto add=[&](const uint8_t*data,size_t size){for(size_t i=0;i<size;++i){lo=(lo^data[i])*1099511628211ULL;hi=mix64(hi^(uint64_t(data[i])+i));}};
+        auto add_u64=[&](uint64_t value){uint8_t raw[8];for(unsigned i=0;i<8;++i)raw[i]=uint8_t(value>>(8*i));add(raw,sizeof raw);};
+        for(const std::string&key:keys){add_u64(key.size());add(reinterpret_cast<const uint8_t*>(key.data()),key.size());const SourceText&source=files_.at(key);
+            const uint8_t flags=uint8_t(source.attempted)|(uint8_t(source.available)<<1);add(&flags,1);
+            add_u64(source.bytes.size());if(!source.bytes.empty())add(source.bytes.data(),source.bytes.size());add_u64(source.offsets.size());
+            for(uint32_t offset:source.offsets){uint8_t raw[4];for(unsigned i=0;i<4;++i)raw[i]=uint8_t(offset>>(8*i));add(raw,sizeof raw);}}
+        return {mix64(lo^files_.size()),mix64(hi^lo^files_.size())};
+    }
 private:
+    struct Undo{std::string path;bool existed;SourceText prior;};
+    bool was_inserted_in_transaction(const std::string&path) const{
+        for(const Undo&undo:undo_)if(undo.path==path&&!undo.existed)return true;
+        return false;
+    }
     static void finish(SourceText&source){
         for(uint32_t i=0;i<source.bytes.size();++i)if(source.bytes[i]=='\n')source.offsets.push_back(i+1);
         if(source.offsets.back()!=source.bytes.size())source.offsets.push_back(source.bytes.size());
@@ -623,6 +872,7 @@ private:
     }
     bool allowProject_=false;
     std::unordered_map<std::string,SourceText> files_;
+    bool transaction_active_=false;std::vector<Undo>undo_;
 };
 struct SourceAdmission {
     uint64_t observed_benefit=0;
@@ -858,7 +1108,7 @@ static constexpr std::array<const char*,8> componentRawNames={
 };
 
 int main(int argc,char**argv){
-    const char* manifest=nullptr;const char*residualDumpPath=nullptr;const char*mixedDumpPrefix=nullptr;const char*curveTsvPath=nullptr;const char*literalGroupPrefix=nullptr;const char*literalGroupWirePath=nullptr;const char*cfSinkPath=nullptr;const char*fcSinkPath=nullptr;const char*sinkCurvePath=nullptr; size_t sinkBuildTus=0; bool sinkReplay=false,literalOnDemand=false,selftestTags=false,selftestBadRoot=false,liveSelector=false; size_t routeCount=0; const char*selectorTsvPath=nullptr; size_t max_files=SIZE_MAX,entropyRestartTus=0,replayRepetitions=1,literalGroupTus=0,literalGroupWorkers=1; int zlevel=3,literalZLevel=-1,arrayZLevel=-1,blobZLevel=-1,halfColdBit=-1,blobCanonicalLevel=9; uint32_t sourceAdmitRatio=6,blobThreads=4,blobZstdWorkers=0,blobZstdJobMiB=0,blobZstdOverlapLog=0,blobFallbackEvery=0,s1MinMatch=3,s1MaxChain=1024; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, usePriorRoot=false,useSortedLines=false,useByteArrayLines=false,useMixedRegions=false,useProjectSource=false,useKeyMap=false,useDirectOrdinals=false,useCompressedBlobs=false,useBlobEagerPatches=true,useMoFactor=false,traceMo=false,useAlphaLines=false,useResidualLdm=false,splitControlCeiling=false,structureCeiling=false,literalGroupEvaluateZstd10=true,stableRootTags=false,openFinalEntropy=false;
+    const char* manifest=nullptr;const char*residualDumpPath=nullptr;const char*mixedDumpPrefix=nullptr;const char*curveTsvPath=nullptr;const char*literalGroupPrefix=nullptr;const char*literalGroupWirePath=nullptr;const char*cfSinkPath=nullptr;const char*fcSinkPath=nullptr;const char*sinkCurvePath=nullptr; size_t sinkBuildTus=0; bool sinkReplay=false,literalOnDemand=false,selftestTags=false,selftestBadRoot=false,liveSelector=false,transactionalTu=false; size_t transactionSelftestTu=SIZE_MAX; size_t routeCount=0; const char*selectorTsvPath=nullptr; size_t max_files=SIZE_MAX,entropyRestartTus=0,replayRepetitions=1,literalGroupTus=0,literalGroupWorkers=1; int zlevel=3,literalZLevel=-1,arrayZLevel=-1,blobZLevel=-1,halfColdBit=-1,blobCanonicalLevel=9; uint32_t sourceAdmitRatio=6,blobThreads=4,blobZstdWorkers=0,blobZstdJobMiB=0,blobZstdOverlapLog=0,blobFallbackEvery=0,s1MinMatch=3,s1MaxChain=1024; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, usePriorRoot=false,useSortedLines=false,useByteArrayLines=false,useMixedRegions=false,useProjectSource=false,useKeyMap=false,useDirectOrdinals=false,useCompressedBlobs=false,useBlobEagerPatches=true,useMoFactor=false,traceMo=false,useAlphaLines=false,useResidualLdm=false,splitControlCeiling=false,structureCeiling=false,literalGroupEvaluateZstd10=true,stableRootTags=false,openFinalEntropy=false;
     const char*blobDumpPath=nullptr;const char*componentCurveTsvPath=nullptr;
     for(int i=1;i<argc;++i){ if(!strcmp(argv[i],"--manifest")&&i+1<argc)manifest=argv[++i];
         else if(!strcmp(argv[i],"--z")&&i+1<argc)zlevel=atoi(argv[++i]);
@@ -901,6 +1151,8 @@ int main(int argc,char**argv){
             routeCount=size_t(v);}
         else if(!strcmp(argv[i],"--selector-tsv")&&i+1<argc)selectorTsvPath=argv[++i];
         else if(!strcmp(argv[i],"--live-selector"))liveSelector=true;
+        else if(!strcmp(argv[i],"--transactional-tu"))transactionalTu=true;
+        else if(!strcmp(argv[i],"--selftest-transaction-reject-once")&&i+1<argc){char*end=nullptr;unsigned long long value=strtoull(argv[++i],&end,10);if(!end||*end||value>SIZE_MAX){fprintf(stderr,"bad transaction selftest TU index\n");return 2;}transactionSelftestTu=size_t(value);transactionalTu=true;}
         else if(!strcmp(argv[i],"--selftest-tags"))selftestTags=true;
         else if(!strcmp(argv[i],"--selftest-bad-root"))selftestBadRoot=true;
         else if(!strcmp(argv[i],"--sink-curve")&&i+1<argc)sinkCurvePath=argv[++i];
@@ -966,7 +1218,7 @@ int main(int argc,char**argv){
         printf("selftest-tags: %s\n",bad?"FAIL":"PASS");
         return bad?1:0;
     }
-    if(!manifest){ fprintf(stderr,"usage: %s --manifest F [--z LEVEL] [--literal-z 1..9] [--array-z 1..9] [--blob-z 1..9] [--no-d1] [--d2] [--prior-root] [--structure-ceiling] [--s1-min-match N] [--s1-max-chain N] [--sorted-lines|--byte-array-lines|--mixed-regions [--alpha-lines|--residual-ldm] [--residual-dump PATH] [--mixed-dump-prefix PATH] [--literal-group-prefix PREFIX --literal-group-tus N [--literal-group-workers N] [--literal-group-skip-zstd10] [--literal-group-wire PATH]] [--split-control-ceiling] [--compressed-blobs [--mo-factor [--mo-trace]] [--blob-threads N] [--blob-zstd-workers N --blob-zstd-job-mib N --blob-zstd-overlap-log N] [--blob-fallback-every N] [--blob-lazy-fallback] [--blob-canonical-level 1..9] [--blob-dump PATH]] [--key-map|--direct-ordinals|--half-cold-bit 0|1] [--source-package [--source-admit-ratio N]]] [--max-files N] [--replay-repetitions N] [--entropy-restart-tus N] [--stable-root-tags] [--open-final-entropy] [--curve-tsv PATH] [--component-curve-tsv PATH]\n",argv[0]); return 2; }
+    if(!manifest){ fprintf(stderr,"usage: %s --manifest F [--z LEVEL] [--literal-z 1..9] [--array-z 1..9] [--blob-z 1..9] [--no-d1] [--d2] [--prior-root] [--structure-ceiling] [--s1-min-match N] [--s1-max-chain N] [--sorted-lines|--byte-array-lines|--mixed-regions [--alpha-lines|--residual-ldm] [--residual-dump PATH] [--mixed-dump-prefix PATH] [--literal-group-prefix PREFIX --literal-group-tus N [--literal-group-workers N] [--literal-group-skip-zstd10] [--literal-group-wire PATH]] [--split-control-ceiling] [--compressed-blobs [--mo-factor [--mo-trace]] [--blob-threads N] [--blob-zstd-workers N --blob-zstd-job-mib N --blob-zstd-overlap-log N] [--blob-fallback-every N] [--blob-lazy-fallback] [--blob-canonical-level 1..9] [--blob-dump PATH]] [--key-map|--direct-ordinals|--half-cold-bit 0|1] [--source-package [--source-admit-ratio N]]] [--max-files N] [--replay-repetitions N] [--entropy-restart-tus N] [--stable-root-tags] [--open-final-entropy] [--cf-sink F --fc-sink F [--transactional-tu [--selftest-transaction-reject-once TU]]] [--curve-tsv PATH] [--component-curve-tsv PATH]\n",argv[0]); return 2; }
     if(useProjectSource&&!useMixedRegions){fprintf(stderr,"--source-package requires --mixed-regions\n");return 2;}
     if(useKeyMap&&!useMixedRegions){fprintf(stderr,"--key-map and --half-cold-bit require --mixed-regions\n");return 2;}
     if(useCompressedBlobs&&(!useMixedRegions||!useByteArrayLines)){fprintf(stderr,"--compressed-blobs requires --mixed-regions --byte-array-lines\n");return 2;}
@@ -996,10 +1248,20 @@ int main(int argc,char**argv){
     // streams and the per-TU record that report it.  Without this flag the codec is
     // byte-identical to before, which is what keeps the equivalence gates meaningful.
     if(liveSelector&&!selectorTsvPath){fprintf(stderr,"--live-selector requires --selector-tsv: a selection nobody records is not a measurement\n");return 2;}
+    if(liveSelector&&!transactionalTu){fprintf(stderr,"--live-selector requires --transactional-tu: selected route state may advance only through close/Ack\n");return 2;}
     if(liveSelector&&usePriorRoot){fprintf(stderr,"--live-selector is incompatible with the prior-Root path\n");return 2;}
     // "Live selection" with no selected-route matcher would be the wrong mode wearing the
     // right name: the transaction that Acks the choice belongs to the route.
     if(liveSelector&&routeCount!=1){fprintf(stderr,"--live-selector requires --route-s1 1: the selection is Acked by the selected route's transaction\n");return 2;}
+    if(transactionalTu&&(!cfSinkPath||!fcSinkPath)){fprintf(stderr,"--transactional-tu requires both physical wire sinks\n");return 2;}
+    if(transactionalTu&&(!useS1||routeCount!=1||!useMixedRegions||!useByteArrayLines||!useDirectOrdinals||
+                         !useCompressedBlobs||!useMoFactor||useBlobEagerPatches||!literalOnDemand||!stableRootTags)){
+        fprintf(stderr,"--transactional-tu currently binds the measured S1/mixed/direct/BLOB+MO/literal-on-demand active profile\n");return 2;}
+    if(transactionalTu&&(useProjectSource||useAlphaLines||useResidualLdm||splitControlCeiling||usePriorRoot||
+                         literalGroupPrefix||halfColdBit>=0||warm||replayRepetitions!=1||entropyRestartTus||openFinalEntropy)){
+        fprintf(stderr,"--transactional-tu refuses an unjournalled or cross-TU codec-history option\n");return 2;}
+    if(transactionSelftestTu!=SIZE_MAX&&(selectorTsvPath||sinkReplay||sinkBuildTus)){
+        fprintf(stderr,"the transaction reject/retry selftest is a focused gate, not a selector/replay/build-cost run\n");return 2;}
     if(sinkBuildTus&&!cfSinkPath){fprintf(stderr,"--sink-build-tus requires --cf-sink\n");return 2;}
     if(cfSinkPath&&!fcSinkPath){fprintf(stderr,"--cf-sink requires --fc-sink: the reverse direction is reported, never dropped\n");return 2;}
     // Without S1 there are no Blocks and no route matcher, so --route-s1 would exit 0 having
@@ -1057,6 +1319,7 @@ int main(int argc,char**argv){
     { uint32_t probe; if(!make_region_tag(regionCountWide?regionCountWide-1:0,probe)){
         fprintf(stderr,"too many Regions for a typed Root tag: %llu\n",(unsigned long long)regionCountWide);return 2;} }
     uint32_t NREG=uint32_t(regionCountWide);const size_t TUs=physicalTUs*replayRepetitions;
+    if(transactionSelftestTu!=SIZE_MAX&&transactionSelftestTu>=TUs){fprintf(stderr,"transaction selftest TU %zu is outside the %zu-TU manifest\n",transactionSelftestTu,TUs);return 2;}
     if(useS1&&allreg.size()>UINT32_MAX){fprintf(stderr,"S1 logical Region occurrence space exceeds u32\n");return 2;}
     if(entropyRestartTus&&TUs%entropyRestartTus){fprintf(stderr,"TU count %zu is not a multiple of experimental entropy restart interval %zu\n",TUs,entropyRestartTus);return 2;}
     fprintf(stderr,"loaded+interned %.1fs TUs=%zu raw=%llu physical_tus=%zu physical_raw=%llu replay_repetitions=%zu regions=%u region_occ=%zu distinct_lines=%u\n",secs(t0),TUs,(unsigned long long)corpus.raw,physicalTUs,(unsigned long long)physicalRaw,replayRepetitions,NREG,allreg.size(),dict.distinct());
@@ -1077,7 +1340,7 @@ int main(int argc,char**argv){
     // token < NREG = region id ; token >= NREG = block id (flat span of region ids). Causal/prequential.
     std::vector<uint32_t> bchild; std::vector<size_t> boff2; boff2.push_back(0);
     std::vector<uint32_t> tokstream; std::vector<size_t> tokoff; tokoff.push_back(0);
-    bool s1Ready=false; std::vector<uint32_t> curTok, tuRegions;
+    bool s1Ready=false; std::vector<uint32_t> curTok;
     std::vector<uint32_t> bcopy_src; std::vector<uint8_t> bcopy_ok;   // block k: def as COPY(src,len) if ok (source in prior TUs)
     // Per-TU sizes of the Region and Block id spaces: what has been DISCOVERED by TU t, never
     // the final totals.  Every bound and every array length below is taken from these.
@@ -1191,6 +1454,24 @@ int main(int argc,char**argv){
         mixedDumpLengths=fopen(path.c_str(),"wb");
         if(!mixedDumpLengths){perror(path.c_str());return 2;}
     }
+    bool codecResourcesReleased=false;
+    auto releaseCodecResources=[&](){
+      if(codecResourcesReleased)return true;
+      codecResourcesReleased=true;bool ok=true;
+      ZSTD_freeCCtx(z);z=nullptr;ZSTD_freeDCtx(messageD);messageD=nullptr;
+      if(sourceCostZ){ZSTD_freeCCtx(sourceCostZ);sourceCostZ=nullptr;}
+      if(useSortedLines)for(size_t i=0;i<linePartCount;++i){ZSTD_freeCCtx(lineZC[i]);lineZC[i]=nullptr;ZSTD_freeDCtx(lineZD[i]);lineZD[i]=nullptr;}
+      if(useMixedRegions)for(size_t i=0;i<mixedPartCount;++i){ZSTD_freeCCtx(mixedZC[i]);mixedZC[i]=nullptr;ZSTD_freeDCtx(mixedZD[i]);mixedZD[i]=nullptr;}
+      if(blobZC){ZSTD_freeCCtx(blobZC);blobZC=nullptr;}if(blobZD){ZSTD_freeDCtx(blobZD);blobZD=nullptr;}
+      if(blobPatchZC){ZSTD_freeCCtx(blobPatchZC);blobPatchZC=nullptr;}if(blobPatchZD){ZSTD_freeDCtx(blobPatchZD);blobPatchZD=nullptr;}
+      if(alphaZC){ZSTD_freeCCtx(alphaZC);alphaZC=nullptr;}if(alphaZD){ZSTD_freeDCtx(alphaZD);alphaZD=nullptr;}
+      if(residualDump){if(fclose(residualDump)!=0){perror(residualDumpPath);ok=false;}residualDump=nullptr;}
+      if(blobDump){if(fclose(blobDump)!=0){perror(blobDumpPath);ok=false;}blobDump=nullptr;}
+      if(blobDumpLengths){if(fclose(blobDumpLengths)!=0){fprintf(stderr,"blob length dump close failed\n");ok=false;}blobDumpLengths=nullptr;}
+      for(FILE*&file:mixedDumps)if(file){if(fclose(file)!=0){fprintf(stderr,"mixed stream dump close failed\n");ok=false;}file=nullptr;}
+      if(mixedDumpLengths){if(fclose(mixedDumpLengths)!=0){fprintf(stderr,"mixed stream length close failed\n");ok=false;}mixedDumpLengths=nullptr;}
+      return ok;
+    };
     std::vector<MixedCLineState> mixedCLine;   // grows with the Lines actually admitted
     uint32_t nextMixedPublic=1;SourceTextStore mixedCSource(useProjectSource),mixedFSource;
     std::vector<uint8_t> mixedSourceSent;
@@ -1209,6 +1490,15 @@ int main(int argc,char**argv){
     // so a decoder regression here cannot leave the gate green.  Fblocks.known() is now THE
     // F-side truth for "does F hold this Block"; the C-side mirror fknownBlk stays separate.
     p29::SparseBlockStore Fblocks;
+    CActiveTuJournal cTuJournal;FActiveTuJournal fTuJournal;
+    p29::RouteScope routeScope;
+    for(size_t i=0;i<routeScope.c_guid.size();++i){
+      routeScope.c_guid[i]=uint8_t(0x31u+i*7u);          // one shared-C authority for this run
+      routeScope.source_generation[i]=uint8_t(0xa7u+i*11u);
+    }
+    routeScope.f_cache_epoch=1;
+    p29::ReceiverTxnLedger receiverLedger(routeScope);
+    uint64_t perFMirrorSequence=0,canonicalAdmissions=0;
     std::vector<uint32_t> Freg_stream; Freg_stream.reserve(allreg.size());   // F's reconstructed region occurrence stream (for block COPY defs)
     std::vector<uint32_t> Froot_child; std::vector<size_t> Froot_off; Froot_off.push_back(0);   // completed exact Roots for P22 slices
     double w_blockdef=0;
@@ -1321,6 +1611,47 @@ int main(int argc,char**argv){
       return true;
     };
 
+    // Expensive by design and used only by the focused reject/retry gate.  It closes every
+    // committed route-local plane the active profile can observe; ordinary product runs use
+    // the O(current-TU-change) journals above and never sweep established state.
+    auto routeLocalStateDigest=[&](){
+      std::vector<uint8_t>state;
+      auto u8=[&](uint8_t value){state.push_back(value);};
+      auto u32=[&](uint32_t value){for(unsigned i=0;i<4;++i)state.push_back(uint8_t(value>>(8*i)));};
+      auto u64=[&](uint64_t value){for(unsigned i=0;i<8;++i)state.push_back(uint8_t(value>>(8*i)));};
+      auto bytes=[&](const uint8_t*data,size_t size){u64(size);if(size)state.insert(state.end(),data,data+size);};
+      auto u8vec=[&](const std::vector<uint8_t>&values){bytes(values.data(),values.size());};
+      auto u32vec=[&](const std::vector<uint32_t>&values){u64(values.size());for(uint32_t value:values)u32(value);};
+      auto sizevec=[&](const std::vector<size_t>&values){u64(values.size());for(size_t value:values)u64(value);};
+
+      u64(perFMirrorSequence);u32(nextMixedPublic);u8vec(fknownReg);u8vec(fknownBlk);
+      u64(paths.size());
+      for(size_t id=0;id<paths.size();++id){
+        auto found=pathid.find(paths[id]);
+        if(found==pathid.end()||found->second!=id){fprintf(stderr,"C path map/vector state differs\n");exit(2);}
+        bytes(reinterpret_cast<const uint8_t*>(paths[id].data()),paths[id].size());
+      }
+      u64(mixedCLine.size());for(const auto&line:mixedCLine){u32(line.source_region);u32(line.source_offset);u32(line.public_id);}
+      u64(Fpaths.size());for(const std::string&path:Fpaths)bytes(reinterpret_cast<const uint8_t*>(path.data()),path.size());
+      u8vec(FmixedRegionData);
+      u64(FmixedRegions.size());for(const auto&view:FmixedRegions){u64(view.offset);u32(view.length);u8(view.known?1:0);}
+      u64(FmixedPublic.size());for(const auto&view:FmixedPublic){u32(view.source_region);u32(view.source_offset);u32(view.length);}
+      u32vec(Freg_stream);u32vec(Froot_child);sizevec(Froot_off);
+      const auto block=Fblocks.state_mark();u64(block.block_slots);u64(block.child_count);u64(block.known_blocks);u64(block.block_digest);u64(block.child_digest);
+      const auto cm=Cmo.state_mark();const auto fm=Fmo.state_mark();
+      u32(cm.values);u64(cm.string_bytes);u64(cm.content_digest);u64(fm.values);u64(fm.string_bytes);u64(fm.content_digest);
+      const auto source=mixedFSource.diagnostic_state_digest();u64(source.lo);u64(source.hi);
+      if(routeS1){u8(routeS1->has_pending()?1:0);u32vec(routeS1->occurrences());}else u8(0);
+      const auto receipt=receiverLedger.state_mark();
+      u64(receipt.expected_sequence);u8(receipt.pending?1:0);u64(receipt.pending_sequence);
+      u64(receipt.pending_transaction_digest.lo);u64(receipt.pending_transaction_digest.hi);
+      u64(receipt.pending_output_digest.lo);u64(receipt.pending_output_digest.hi);u64(receipt.pending_output_extent);
+      u8(receipt.retained_ack?1:0);u64(receipt.retained_sequence);
+      u64(receipt.retained_transaction_digest.lo);u64(receipt.retained_transaction_digest.hi);
+      u64(receipt.retained_output_digest.lo);u64(receipt.retained_output_digest.hi);u64(receipt.retained_output_extent);
+      const auto digest=blob_digest(state.data(),state.size());return p29::Digest128{digest.first,digest.second};
+    };
+
     int npass = warm?2:1;   // --warm: pass 0 primes dict+F-stores (uncounted); final pass measures warm steady-state.
     for(int pass=0; pass<npass; ++pass){
       if(pass+1==npass && npass>1){   // reset all measurement state before the warm pass; keep fknown* flags + F-stores
@@ -1334,13 +1665,46 @@ int main(int argc,char**argv){
 #endif
       for(size_t t=0; t<TUs; ++t){
         auto _te=Clock::now();
+        const FileSpan&physicalFile=corpus.files[t%physicalTUs];
+        const char*orig=corpus.bytes.data()+physicalFile.off;const uint32_t olen=physicalFile.len;
+        const auto expectedPair=blob_digest(reinterpret_cast<const uint8_t*>(orig),olen);
+        SharedCAdmittedTu admitted;
+        admitted.canonical_admission_sequence=canonicalAdmissions++;
+        admitted.shared_c_snapshot_version=admitted.canonical_admission_sequence+1;
+        admitted.routing_cohort_key=0;admitted.tu_key=mix64(expectedPair.first^uint64_t(t));
+        admitted.source_extent=olen;admitted.expected_output_digest={expectedPair.first,expectedPair.second};
+        admitted.producer_request_id={mix64(expectedPair.first^uint64_t(t)),mix64(expectedPair.second^olen)};
+        const bool transactionSelftest=(transactionSelftestTu==t);
+        p29::Digest128 selftestPreState{},selftestGlobalDigest{};
+        size_t selftestGlobalBlocks=0;uint64_t selftestAdmissions=0;
         // --- T_current: admit ONLY this TU, here, then use the plan it just produced ------
         if(s1Ready){
             curTok.clear();
-            tuRegions.assign(allreg.begin()+roff[t],allreg.begin()+roff[t+1]);
+            admitted.regions.assign(allreg.begin()+roff[t],allreg.begin()+roff[t+1]);
             // GLOBAL admits FIRST, in the defined C admission order, so canonical ids are
             // assigned by the global chronology and never by route scheduling.
-            const p29::TuPlan plan=globalS1->admit(tuRegions);
+            admitted.global_plan=globalS1->admit(admitted.regions);
+            const p29::TuPlan&plan=admitted.global_plan;
+            // Canonical children are a property of the shared-C admission and are recorded
+            // before any per-F transaction starts.  A route abort never rewinds this plane.
+            for(const p29::NewBlock&nb:plan.new_blocks){
+                const std::vector<uint32_t>&kids=blockCatalogue.block(nb.id).regions;
+                bchild.insert(bchild.end(),kids.begin(),kids.end());
+                boff2.push_back(bchild.size());
+                bcopy_src.push_back(nb.first_source_position);
+                bcopy_ok.push_back(nb.source_precedes_current_tu?1:0);
+            }
+            blocksAfterTu[t]=uint32_t(blockCatalogue.size());
+            if(transactionSelftest){
+                selftestPreState=routeLocalStateDigest();selftestGlobalBlocks=blockCatalogue.size();
+                const auto globalPair=blob_digest(reinterpret_cast<const uint8_t*>(globalS1->occurrences().data()),globalS1->occurrences().size()*sizeof(uint32_t));
+                selftestGlobalDigest={globalPair.first,globalPair.second};selftestAdmissions=canonicalAdmissions;
+            }
+            if(transactionalTu){
+                cTuJournal.begin(paths,mixedCLine,nextMixedPublic,fknownReg,fknownBlk);
+                fTuJournal.begin(Fpaths,FmixedRegionData,FmixedRegions,FmixedPublic,Freg_stream,Froot_child,Froot_off);
+                Fblocks.begin_transaction();Fmo.begin_transaction();mixedFSource.begin_transaction();
+            }
             // 1F SEAM GATE.  With one route the route matcher sees exactly GLOBAL's sequence,
             // so it must mint NOTHING and must agree with GLOBAL on every field -- including
             // the source coordinates, which are only equal because the two histories coincide
@@ -1370,7 +1734,7 @@ int main(int argc,char**argv){
             const p29::TuPlan* wirePlan=&plan;
             if(routeS1){
                 const size_t before=blockCatalogue.size();
-                const p29::TuPlan& rp=routeS1->prepare(tuRegions);
+                const p29::TuPlan& rp=routeS1->prepare(admitted.regions);
                 wirePlan=&rp;
                 if(blockCatalogue.size()!=before){fprintf(stderr,"1F seam: route admission grew the catalogue %zu -> %zu at TU=%zu\n",before,blockCatalogue.size(),t);return 2;}
                 if(rp.root.size()!=plan.root.size()||rp.block_uses.size()!=plan.block_uses.size()){fprintf(stderr,"1F seam: Root/BlockUse counts differ at TU=%zu\n",t);return 2;}
@@ -1400,17 +1764,6 @@ int main(int argc,char**argv){
             // route's is the one that describes what its F can resolve.
             for(const p29::Ref&ref:wirePlan->root)
                 curTok.push_back(ref.kind==p29::RefKind::Block?block_tag(ref.id):region_tag(ref.id));
-            // Canonical children come from the shared catalogue; the COPY-legality flag is
-            // this matcher's admission order and is NOT a claim about any F's residency.
-            for(const p29::NewBlock&nb:plan.new_blocks){
-                const std::vector<uint32_t>&kids=blockCatalogue.block(nb.id).regions;
-                bchild.insert(bchild.end(),kids.begin(),kids.end());
-                boff2.push_back(bchild.size());
-                bcopy_src.push_back(nb.first_source_position);
-                bcopy_ok.push_back(nb.source_precedes_current_tu?1:0);
-            }
-
-                        blocksAfterTu[t]=uint32_t(blockCatalogue.size());
         } else {
             curTok.assign(tokstream.begin()+tokoff[t],tokstream.begin()+tokoff[t+1]);
         }
@@ -1425,6 +1778,13 @@ int main(int argc,char**argv){
           if(fknownBlk.size()<nblk){ fknownBlk.resize(nblk,0);
             requiredBlockStamp.resize(nblk,0); FrequiredBlockStamp.resize(nblk,0); }
           if(!admitRegionKeys(uint32_t(nreg))) return 2; }
+        PendingFTu pendingF;
+        pendingF.id={routeScope,receiverLedger.expected_sequence()};
+        pendingF.expected_mirror_sequence=perFMirrorSequence;
+        if(transactionalTu){
+          if(pendingF.id.route_sequence!=pendingF.expected_mirror_sequence){fprintf(stderr,"per-F mirror/route sequence differs before TU=%zu\n",t);return 2;}
+          cfSink.begin_transaction();fcSink.begin_transaction();
+        }
         const bool endOfEntropyStream=(!openFinalEntropy&&t+1==TUs)||(entropyRestartTus&&(t+1)%entropyRestartTus==0);
         const uint32_t* tk=curTok.data(); size_t tn=curTok.size();   // re-taken if live selection swaps curTok
         // ROOT is available to F before its MISSING reply.  With a key map, C first associates every
@@ -1562,6 +1922,23 @@ int main(int argc,char**argv){
             tuRootFrame=0; tuBlockFrame=0; tuManifest.clear();
         }
         std::vector<uint32_t> missReg,missBlk,associationRegs,requiredRegions,requiredBlocks;
+        std::vector<uint8_t>directBlockDecoded;
+        auto installDirectBlocks=[&]()->bool{
+          if(directBlockDecoded.empty())return tuManifest.empty();
+          const uint8_t*bp=directBlockDecoded.data(),*be=bp+directBlockDecoded.size();uint64_t count=get_varint(bp);
+          if(count!=tuManifest.size()){fprintf(stderr,"direct Block manifest count differs\n");return false;}
+          for(uint64_t i=0;i<count;++i){
+            if(bp>=be){fprintf(stderr,"truncated direct Block manifest\n");return false;}
+            uint64_t id=get_varint(bp);if(Fblocks.known(id)){fprintf(stderr,"bad direct Block identity\n");return false;}uint8_t kind=*bp++;
+            if(kind==1){uint64_t source=get_varint(bp),length=get_varint(bp);if(!Fblocks.install_copy(id,Freg_stream,source,length)){fprintf(stderr,"bad direct Block copy\n");return false;}}
+            else if(kind==0){uint64_t length=get_varint(bp);std::vector<uint32_t>kids;kids.reserve(size_t(length<4096?length:4096));
+              for(uint64_t j=0;j<length;++j){uint64_t child=get_varint(bp);if(child>=regionsAfterTu[t]){fprintf(stderr,"bad direct Block child\n");return false;}kids.push_back(uint32_t(child));}
+              if(!Fblocks.install_children(id,kids.data(),kids.size())){fprintf(stderr,"bad direct Block identity\n");return false;}}
+            else{fprintf(stderr,"bad direct Block kind\n");return false;}
+          }
+          if(bp!=be){fprintf(stderr,"direct Block manifest has trailing bytes\n");return false;}
+          return true;
+        };
         if(useKeyMap){
           if(++requestStamp==0){std::fill(requiredRegionStamp.begin(),requiredRegionStamp.end(),0);std::fill(requiredBlockStamp.begin(),requiredBlockStamp.end(),0);requestStamp=1;}
           auto requireRegion=[&](uint32_t r){
@@ -1613,16 +1990,10 @@ int main(int argc,char**argv){
               if(structureCeiling)allBlocks.insert(allBlocks.end(),blockRaw.begin(),blockRaw.end());
               size_t bytes=zstd_message_roundtrip(z,messageD,blockRaw,zlevel,messageEncoded,messageDecoded)+FRAME;w_blockdef+=bytes;
               {const uint64_t before=cfSink.off;cfSink.emit(WT_BLOCKDEF,messageEncoded.data(),bytes-size_t(FRAME));tuBlockFrame=cfSink.off-before;}
-              const uint8_t*bp=messageDecoded.data(),*be=bp+messageDecoded.size();uint64_t count=get_varint(bp);
-              if(count!=manifestBlocks.size()){fprintf(stderr,"direct Block manifest count differs\n");return 2;}
-              for(uint64_t i=0;i<count;++i){uint64_t id=get_varint(bp);if(Fblocks.known(id)){fprintf(stderr,"bad direct Block identity\n");return 2;}uint8_t kind=*bp++;
-                if(kind==1){uint64_t source=get_varint(bp),length=get_varint(bp);if(!Fblocks.install_copy(id,Freg_stream,source,length)){fprintf(stderr,"bad direct Block copy\n");return 2;}}
-                else if(kind==0){uint64_t length=get_varint(bp);std::vector<uint32_t>kids;kids.reserve(size_t(length<4096?length:4096));for(uint64_t j=0;j<length;++j){uint64_t child=get_varint(bp);if(child>=regionsAfterTu[t]){fprintf(stderr,"bad direct Block child\n");return 2;}kids.push_back(uint32_t(child));}
-                  if(!Fblocks.install_children(id,kids.data(),kids.size())){fprintf(stderr,"bad direct Block identity\n");return 2;}}
-                else{fprintf(stderr,"bad direct Block kind\n");return 2;}
-                fknownBlk[id]=1;
-              }
-              if(bp!=be){fprintf(stderr,"direct Block manifest has trailing bytes\n");return 2;}
+              directBlockDecoded=messageDecoded;
+              if(!installDirectBlocks())return 2;
+              if(transactionalTu)pendingF.known_blocks.insert(pendingF.known_blocks.end(),manifestBlocks.begin(),manifestBlocks.end());
+              else for(uint32_t id:manifestBlocks)fknownBlk[id]=1;
             }
             for(uint32_t k:FrequiredBlocks){if(!Fblocks.known(k)){fprintf(stderr,"missing direct Block definition\n");return 2;}const uint32_t*kb=Fblocks.begin(k);for(uint32_t j=0,n=Fblocks.length(k);j<n;++j)FrequireRegion(kb[j]);}
             if(FrequiredRegions.size()!=requiredRegions.size()){fprintf(stderr,"direct Region closure differs\n");return 2;}
@@ -1683,7 +2054,10 @@ int main(int argc,char**argv){
             if(mp!=me||decodedReg!=missReg||decodedBlk!=missBlk){fprintf(stderr,"missing reply differs\n");return 2;}
           }
           }
-          for(uint32_t r:requiredRegions)fknownReg[r]=FmixedRegions[r].known;
+          for(uint32_t r:requiredRegions){
+            if(transactionalTu){if(bool(fknownReg[r])!=FmixedRegions[r].known){fprintf(stderr,"C/F Region mirror differs before TU=%zu id=%u\n",t,r);return 2;}}
+            else fknownReg[r]=FmixedRegions[r].known;
+          }
         } else {
           // Original single-empty-F model: C's mirror computes the missing closure.
           auto addRegion=[&](uint32_t r){if(fknownReg[r])return;for(uint32_t x:missReg)if(x==r)return;missReg.push_back(r);};
@@ -1778,9 +2152,10 @@ int main(int argc,char**argv){
                         flushLiteral();mixedRaw[0].push_back(1);put_zigzag(mixedRaw[0],int64_t(state.source_region)-int64_t(r));
                         put_varint(mixedRaw[0],state.source_offset);put_varint(mixedRaw[0],line.len);splitOpcode(1);
                         {const int64_t delta=int64_t(state.source_region)-int64_t(r);splitVarint(4,(uint64_t(delta)<<1)^uint64_t(delta>>63));}splitVarint(4,state.source_offset);splitVarint(4,line.len);
+                        if(transactionalTu)cTuJournal.touch_line(lineId,mixedCLine);
                         state.public_id=nextMixedPublic++;++mixedOps[1];
                     } else {
-                        if(state.source_region==UINT32_MAX){state.source_region=r;state.source_offset=offset;}
+                        if(state.source_region==UINT32_MAX){if(transactionalTu)cTuJournal.touch_line(lineId,mixedCLine);state.source_region=r;state.source_offset=offset;}
                         GeneratedByteArray parsed;Marker lineMarker;
                         bool arrayLine=useByteArrayLines&&parse_byte_array(text,line.len,parsed),markerLine=parse_marker(text,line.len,lineMarker);
                         size_t arrayValueCount=parsed.values.size();
@@ -1841,7 +2216,7 @@ int main(int argc,char**argv){
                 flushLiteral();
                 if(splitControlCeiling)put_varint(splitControl[0],splitRegionOps);
                 if(offset!=dict.region_raw_len(r)){fprintf(stderr,"mixed Region length differs\n");return 2;}
-                fknownReg[r]=1;++nr;
+                if(transactionalTu)pendingF.known_regions.push_back(r);else fknownReg[r]=1;++nr;
             }
             if(useAlphaLines)alphaGaps.push_back(alphaPendingGap);
             if(!mixedArrayEntries.empty()){
@@ -1896,7 +2271,7 @@ int main(int argc,char**argv){
                                 moWire=moFactorEncoded.size()+FRAME+moMetadata;mixedBlobMoCandidateWire+=moWire;
                                 if(moWire<ordinaryWire){
                                     blobWireMode=4;blobEncoded=std::move(moFactorEncoded);
-                                    if(!Cmo.commit(moEncoded)){fprintf(stderr,"MO factor C commit failed\n");return 2;}
+                                    if(!transactionalTu&&!Cmo.commit(moEncoded)){fprintf(stderr,"MO factor C commit failed\n");return 2;}
                                     ++mixedBlobMoTus;mixedBlobMoMembers+=moEncoded.mo_members;mixedBlobMoBytes+=moEncoded.mo_bytes;mixedBlobMoDefinitions+=moEncoded.pending_definitions.size();
                                 }else{blobWireMode=3;blobEncoded=std::move(blobOriginalRaw);++mixedBlobOrdinaryTus;}
                             }
@@ -2059,7 +2434,8 @@ int main(int argc,char**argv){
                 for(size_t i=0;i<splitControl.size();++i)splitControlAll[i].insert(splitControlAll[i].end(),splitControl[i].begin(),splitControl[i].end());
             }
             for(size_t i=0;i<mixedPartCount;++i) if((!useAlphaLines||i!=1)&&!(useLiteralGroups&&i==1)&&!mixedRaw[i].empty()){
-                mixedEncoded[i]=zstd_stream_encode(mixedZC[i],mixedRaw[i],ZSTD_e_flush);mixedZActive[i]=1;
+                if(transactionalTu)zstd_frame_encode(mixedZC[i],mixedRaw[i],mixedZLevel[i],mixedEncoded[i]);
+                else {mixedEncoded[i]=zstd_stream_encode(mixedZC[i],mixedRaw[i],ZSTD_e_flush);mixedZActive[i]=1;}
                 double bytes=mixedEncoded[i].size()+FRAME;mixedPartWire[i]+=bytes;(i==0?w_regiondef:w_linedef)+=bytes;
             }
             if(useByteArrayLines){w_linedef+=1;mixedSelectorWire+=1;}
@@ -2094,7 +2470,7 @@ int main(int argc,char**argv){
             const uint8_t le[4]={uint8_t(n),uint8_t(n>>8),uint8_t(n>>16),uint8_t(n>>24)};
             if(fwrite(le,1,sizeof le,mixedDumpLengths)!=sizeof le){fprintf(stderr,"short mixed stream length write\n");return 2;}
         }
-        if(useMixedRegions&&endOfEntropyStream){
+        if(useMixedRegions&&endOfEntropyStream&&!transactionalTu){
             const std::vector<uint8_t> empty;
             for(size_t i=0;i<mixedPartCount;++i) if((!useAlphaLines||i!=1)&&!(useLiteralGroups&&i==1)&&mixedZActive[i]){
                 std::vector<uint8_t> tail=zstd_stream_encode(mixedZC[i],empty,ZSTD_e_end);
@@ -2126,14 +2502,15 @@ int main(int argc,char**argv){
         if(!useMixedRegions) for(uint32_t r:missReg){ const uint32_t* lids=dict.region_ids_ptr(r); uint32_t c=dict.region_ids_count(r);
             put_varint(fill_regions,c); { int64_t prev=0; for(uint32_t j=0;j<c;++j){
                 uint32_t wireLine=useSortedLines?at_line(ClineToF,lids[j]):lids[j]; if(!wireLine){fprintf(stderr,"missing Line mapping\n");return 2;}
-                put_zigzag(fill_regions,int64_t(wireLine)-prev); prev=int64_t(wireLine); } } fknownReg[r]=1; ++nr;
+                put_zigzag(fill_regions,int64_t(wireLine)-prev); prev=int64_t(wireLine); } }
+            if(transactionalTu)pendingF.known_regions.push_back(r);else fknownReg[r]=1; ++nr;
             put_varint(fill_regions_raw,c); for(uint32_t j=0;j<c;++j){ uint32_t wireLine=useSortedLines?at_line(ClineToF,lids[j]):lids[j]; put_varint(fill_regions_raw,wireLine); }
             { put_varint(allRegionsRaw,c); for(uint32_t j=0;j<c;++j){ uint32_t wireLine=useSortedLines?at_line(ClineToF,lids[j]):lids[j]; put_varint(allRegionsRaw,wireLine); } }
         }
         for(uint32_t k:missBlk){ size_t L=boff2[k+1]-boff2[k];
             if(bcopy_ok[k]){ fill_blocks.push_back(1); put_varint(fill_blocks,bcopy_src[k]); put_varint(fill_blocks,L); }   // COPY(region-stream src,len)
             else { fill_blocks.push_back(0); put_varint(fill_blocks,L); for(size_t j=boff2[k];j<boff2[k+1];++j) put_varint(fill_blocks,bchild[j]); }
-            fknownBlk[k]=1; ++nb; }
+            if(transactionalTu)pendingF.known_blocks.push_back(k);else fknownBlk[k]=1; ++nb; }
         if(np){ size_t n=zstd_size(z,fill_paths.data(),fill_paths.size(),zlevel,dst); w_pathdef += n; cfSink.emit(WT_PATHDEF,dst.data(),n); allPaths.insert(allPaths.end(),fill_paths.begin(),fill_paths.end()); }
         if(nl && !useSortedLines){ size_t n=zstd_size(z,fill_lines.data(),fill_lines.size(),zlevel,dst); w_linedef += n; cfSink.emit(WT_LINEDEF,dst.data(),n); allLineDefs.insert(allLineDefs.end(),fill_lines.begin(),fill_lines.end()); }
         bool reg_raw=false;
@@ -2147,8 +2524,19 @@ int main(int argc,char**argv){
         // --- ROOT: token stream (region + block ids), already exposed to the F missing pass above ---
         if(!useKeyMap){w_root+=zstd_size(z,rootb.data(),rootb.size(),zlevel,dst);w_framing+=FRAME;allRoots.insert(allRoots.end(),rootb.begin(),rootb.end());}
 
+        uint32_t transactionNextMixedPublic=nextMixedPublic;
+        uint64_t expectedMoSize=Cmo.size();
+        if(transactionalTu&&blobWireMode==4)expectedMoSize+=moEncoded.pending_definitions.size();
+        if(expectedMoSize>UINT32_MAX){fprintf(stderr,"MO factor transaction dictionary size overflow\n");return 2;}
+        if(transactionalTu){
+          pendingF.prepared_c_state=cTuJournal.freeze_and_restore(pathid,paths,mixedCLine,nextMixedPublic,fknownReg,fknownBlk);
+          // Nothing owned by C's per-F mirror/history is committed while F is decoding.
+          if(cTuJournal.active()){fprintf(stderr,"C active-TU journal remained active after freeze\n");return 2;}
+        }
         enc_s += std::chrono::duration<double>(Clock::now()-_te).count(); auto _td=Clock::now();
         // --- DECODER (F): install FILL from wire into F's OWN store, then expand ROOT tokens ---
+        bool suppressRetryWire=false;
+        auto decodeAttempt=[&]()->int {
         { const uint8_t* pp=fill_paths.data(); for(uint32_t k=0;k<np;++k){ uint64_t L=get_varint(pp); Fpaths.emplace_back((const char*)pp,(size_t)L); pp+=L; } }
         if(useMixedRegions){
           std::array<std::vector<uint8_t>,6> recovered;
@@ -2167,8 +2555,10 @@ int main(int argc,char**argv){
             if(recovered[1]!=mixedRaw[1]){fprintf(stderr,"alpha residual mismatch TU=%zu\n",t);return 2;}
           }else if(useAlphaLines&&!mixedRaw[1].empty()){fprintf(stderr,"missing alpha selector\n");return 2;}
           for(size_t i=0;i<mixedPartCount;++i) if((!useAlphaLines||i!=1)&&!(useLiteralGroups&&i==1)&&!mixedEncoded[i].empty()){
-            size_t remaining=1;recovered[i]=zstd_stream_decode(mixedZD[i],mixedEncoded[i],remaining);
-            if(recovered[i]!=mixedRaw[i]||(endOfEntropyStream&&remaining!=0)){fprintf(stderr,"mixed Region stream mismatch TU=%zu part=%zu\n",t,i);return 2;}
+            if(transactionalTu)recovered[i]=zstd_frame_decode_sized(mixedZD[i],mixedEncoded[i]);
+            else {size_t remaining=1;recovered[i]=zstd_stream_decode(mixedZD[i],mixedEncoded[i],remaining);
+              if(endOfEntropyStream&&remaining!=0){fprintf(stderr,"mixed Region stream did not close TU=%zu part=%zu\n",t,i);return 2;}}
+            if(recovered[i]!=mixedRaw[i]){fprintf(stderr,"mixed Region stream mismatch TU=%zu part=%zu\n",t,i);return 2;}
           }
           if(!recovered[4].empty()){
             const uint8_t*sp=recovered[4].data(),*se=sp+recovered[4].size(),*bp=recovered[5].data(),*be=bp+recovered[5].size();
@@ -2213,7 +2603,7 @@ int main(int argc,char**argv){
               for(size_t part=0;part<4;++part){parts[part].assign(packed.begin()+offset,packed.begin()+offset+FmoRawSizes[part]);offset+=FmoRawSizes[part];}
               std::vector<uint32_t>lengths;if(!Fmo.decode(parts[0],parts[1],parts[2],parts[3],FblobRaw,lengths)||lengths.size()!=Fblobs.size()){fprintf(stderr,"MO factor decode failed\n");return 2;}
               for(size_t index=0;index<Fblobs.size();++index)if(lengths[index]!=Fblobs[index].inflated_size){fprintf(stderr,"MO factor member length differs\n");return 2;}
-              if(FblobRaw.size()!=expectedBlobRaw||FblobRaw!=blobRaw||Fmo.size()!=Cmo.size()){fprintf(stderr,"MO factor payload/state differs\n");return 2;}
+              if(FblobRaw.size()!=expectedBlobRaw||FblobRaw!=blobRaw||Fmo.size()!=expectedMoSize){fprintf(stderr,"MO factor payload/state differs\n");return 2;}
             } else {
               FblobRaw=zstd_frame_decode_exact(blobZD,blobEncoded,expectedBlobRaw);
               if(FblobRaw!=blobRaw){fprintf(stderr,"compressed blob payload differs\n");return 2;}
@@ -2241,7 +2631,7 @@ int main(int argc,char**argv){
             std::vector<uint8_t>fallbackRequest;put_varint(fallbackRequest,blobFallbacks.size());uint32_t prior=0;
             for(size_t i=0;i<blobFallbacks.size();++i){uint32_t current=blobFallbacks[i];put_varint(fallbackRequest,i?current-prior:current);prior=current;}
             double requestWire=fallbackRequest.size()+FRAME;w_missing+=requestWire;mixedBlobFallbackRequestWire+=requestWire;
-            fcSink.emit(WT_FBREQ,fallbackRequest);   // F -> C
+            if(!suppressRetryWire)fcSink.emit(WT_FBREQ,fallbackRequest);   // F -> C
             const uint8_t*request=fallbackRequest.data(),*requestEnd=request+fallbackRequest.size();uint64_t requested=get_varint(request);
             std::vector<uint32_t>requestedByC;requestedByC.reserve(requested);uint64_t requestedPrior=0;
             for(uint64_t i=0;i<requested;++i){uint64_t delta=get_varint(request);uint64_t current=i?requestedPrior+delta:delta;
@@ -2255,7 +2645,7 @@ int main(int argc,char**argv){
             auto fallbackCStart=Clock::now();size_t fallbackEncodedSize=zstd_size(z,fallbackReplyRaw.data(),fallbackReplyRaw.size(),zlevel,messageEncoded);
             fallback_c_s+=std::chrono::duration<double>(Clock::now()-fallbackCStart).count();
             double replyWire=fallbackEncodedSize+FRAME;w_missing+=replyWire;mixedBlobFallbackReplyWire+=replyWire;mixedBlobFallbacks+=blobFallbacks.size();
-            cfSink.emit(WT_FBREPLY,messageEncoded.data(),fallbackEncodedSize);   // C -> F
+            if(!suppressRetryWire)cfSink.emit(WT_FBREPLY,messageEncoded.data(),fallbackEncodedSize);   // C -> F
             messageDecoded.resize(fallbackReplyRaw.size());size_t fallbackDecodedSize=ZSTD_decompressDCtx(messageD,messageDecoded.data(),messageDecoded.size(),messageEncoded.data(),fallbackEncodedSize);
             if(ZSTD_isError(fallbackDecodedSize)||fallbackDecodedSize!=fallbackReplyRaw.size()||messageDecoded!=fallbackReplyRaw){fprintf(stderr,"blob fallback reply differs\n");return 2;}
             const uint8_t*fallback=messageDecoded.data(),*fallbackEnd=fallback+messageDecoded.size();
@@ -2329,6 +2719,7 @@ int main(int argc,char**argv){
                 if(FmixedRegionData.size()-begin>rawLength){fprintf(stderr,"mixed Region overrun\n");return 2;}
               }
               if(rawLength!=dict.region_raw_len(regionId)||memcmp(FmixedRegionData.data()+begin,dict.region_data(regionId),rawLength)){fprintf(stderr,"mixed Region differs\n");return 2;}
+              if(transactionalTu)fTuJournal.touch_region(regionId,FmixedRegions);
               FmixedRegions[regionId]={begin,uint32_t(rawLength),true};
             }
             if(useLiteralGroups){
@@ -2341,7 +2732,7 @@ int main(int argc,char**argv){
               }else if(consumed!=onDemandRaw.size()){fprintf(stderr,"on-demand literal frame has trailing decoded bytes after TU=%zu\n",t);return 2;}
 #endif
             }
-            if(cp!=ce||(!useLiteralGroups&&lp!=le)||vp!=ve||arraysUsed!=arrayCount||FmixedPublic.size()!=nextMixedPublic){fprintf(stderr,"mixed Region streams have trailing bytes or state differs\n");return 2;}
+            if(cp!=ce||(!useLiteralGroups&&lp!=le)||vp!=ve||arraysUsed!=arrayCount||FmixedPublic.size()!=(transactionalTu?transactionNextMixedPublic:nextMixedPublic)){fprintf(stderr,"mixed Region streams have trailing bytes or state differs\n");return 2;}
           } else if(nr||!mixedRaw[1].empty()||(!useLiteralGroups&&!recovered[1].empty())){fprintf(stderr,"partial mixed Region streams\n");return 2;}
         } else if(useSortedLines){
           std::array<std::vector<uint8_t>,5> recovered;
@@ -2434,17 +2825,152 @@ int main(int argc,char**argv){
             if(!tag_is_block(tok)) emitRegionF(tag_id(tok));
             else { uint32_t k=tag_id(tok); if(!Fblocks.known(k)){fprintf(stderr,"Root names a Block this F does not hold\n");exit(2);} const uint32_t*kb=Fblocks.begin(k); for(uint32_t j=0,n=Fblocks.length(k);j<n;++j) emitRegionF(kb[j]); } }
         }
+        return 0;
+        };
+        int decodeStatus=decodeAttempt();
         dec_s += std::chrono::duration<double>(Clock::now()-_td).count();   // F-decode ends here; the verify below is harness-only (F doesn't have the original)
-        const FileSpan&physicalFile=corpus.files[t%physicalTUs];const char* orig=corpus.bytes.data()+physicalFile.off; uint32_t olen=physicalFile.len;
-        const bool tuReconstructed = (recon.size()==olen && memcmp(recon.data(),orig,olen)==0);
-        if(!tuReconstructed){ byteexact=false; if(t<5||TUs<10) fprintf(stderr,"BYTE-EXACT FAIL TU %zu (%zu vs %u)\n",t,recon.size(),olen); }
-        // ACK.  The route's transaction resolves HERE, after the receiver has reconstructed
-        // the TU -- not at plan time -- and it commits REGARDLESS of which candidate won,
-        // because the TU physically went to this route either way.  The in-process receiver
-        // stands in for the explicit Ack of the eventual protocol; putting the state
-        // transition at the right point now is what keeps the seam exercised rather than
-        // merely present.
-        if(routeS1&&routeS1->has_pending()){ if(tuReconstructed) routeS1->commit(); else routeS1->abort(); }
+        if(decodeStatus){
+          if(transactionalTu){
+            if(fTuJournal.active())fTuJournal.abort(Fpaths,FmixedRegionData,FmixedRegions,FmixedPublic,Freg_stream,Froot_child,Froot_off);
+            if(Fblocks.has_pending_transaction())Fblocks.abort_transaction();
+            if(Fmo.has_pending_transaction())Fmo.abort_transaction();
+            if(mixedFSource.has_pending_transaction())mixedFSource.abort_transaction();
+            if(routeS1&&routeS1->has_pending())routeS1->abort();
+          }
+          return decodeStatus;
+        }
+        bool tuReconstructed = (recon.size()==olen && memcmp(recon.data(),orig,olen)==0);
+        if(!tuReconstructed){byteexact=false;if(t<5||TUs<10)fprintf(stderr,"BYTE-EXACT FAIL TU %zu (%zu vs %u)\n",t,recon.size(),olen);}
+        if(transactionalTu){
+          pendingF.c_to_f=cfSink.end_transaction();pendingF.f_to_c=fcSink.end_transaction();
+          if(!tuReconstructed){
+            fTuJournal.abort(Fpaths,FmixedRegionData,FmixedRegions,FmixedPublic,Freg_stream,Froot_child,Froot_off);
+            Fblocks.abort_transaction();Fmo.abort_transaction();mixedFSource.abort_transaction();routeS1->abort();return 2;
+          }
+
+          if(transactionSelftest){
+            // Reject after complete reconstruction but before close.  C is already restored;
+            // discard every tentative F plane and route history, then prove exact equality.
+            fTuJournal.abort(Fpaths,FmixedRegionData,FmixedRegions,FmixedPublic,Freg_stream,Froot_child,Froot_off);
+            Fblocks.abort_transaction();Fmo.abort_transaction();mixedFSource.abort_transaction();routeS1->abort();
+            if(routeLocalStateDigest()!=selftestPreState){fprintf(stderr,"transaction selftest: reject did not restore full route-local state\n");return 2;}
+            const auto globalPair=blob_digest(reinterpret_cast<const uint8_t*>(globalS1->occurrences().data()),globalS1->occurrences().size()*sizeof(uint32_t));
+            if(canonicalAdmissions!=selftestAdmissions||blockCatalogue.size()!=selftestGlobalBlocks||
+               p29::Digest128{globalPair.first,globalPair.second}!=selftestGlobalDigest){
+              fprintf(stderr,"transaction selftest: retry boundary changed shared-C canonical admission\n");return 2;}
+
+            // Retry the immutable PendingFTu bytes against the same AdmittedTu.  GLOBAL is not
+            // called again; only the aborted per-F route prepare and receiver journals reopen.
+            const size_t before=blockCatalogue.size();const p29::TuPlan&retryPlan=routeS1->prepare(admitted.regions);
+            if(blockCatalogue.size()!=before||!retryPlan.new_blocks.empty()||
+               retryPlan.root.size()!=admitted.global_plan.root.size()||
+               retryPlan.block_uses.size()!=admitted.global_plan.block_uses.size()){
+              fprintf(stderr,"transaction selftest: retry route plan differs structurally\n");return 2;}
+            for(size_t i=0;i<retryPlan.root.size();++i)if(retryPlan.root[i].kind!=admitted.global_plan.root[i].kind||retryPlan.root[i].id!=admitted.global_plan.root[i].id){
+              fprintf(stderr,"transaction selftest: retry Root differs at %zu\n",i);return 2;}
+            fTuJournal.begin(Fpaths,FmixedRegionData,FmixedRegions,FmixedPublic,Freg_stream,Froot_child,Froot_off);
+            Fblocks.begin_transaction();Fmo.begin_transaction();mixedFSource.begin_transaction();
+            if(FmixedRegions.size()<regionsAfterTu[t])FmixedRegions.resize(regionsAfterTu[t]);
+            if(!installDirectBlocks()){fprintf(stderr,"transaction selftest: retry Block install failed\n");return 2;}
+            cfSink.begin_transaction();fcSink.begin_transaction();
+            cfSink.replay_transaction(pendingF.c_to_f);fcSink.replay_transaction(pendingF.f_to_c);
+            suppressRetryWire=true;recon.clear();_td=Clock::now();decodeStatus=decodeAttempt();
+            dec_s+=std::chrono::duration<double>(Clock::now()-_td).count();
+            if(decodeStatus){fprintf(stderr,"transaction selftest: same-byte retry decode failed\n");return decodeStatus;}
+            WireSink::CapturedTransaction retryCf=cfSink.end_transaction(),retryFc=fcSink.end_transaction();
+            if(retryCf.digest!=pendingF.c_to_f.digest||retryCf.frames!=pendingF.c_to_f.frames||
+               retryFc.digest!=pendingF.f_to_c.digest||retryFc.frames!=pendingF.f_to_c.frames){
+              fprintf(stderr,"transaction selftest: retried physical transaction differs\n");return 2;}
+            pendingF.c_to_f=std::move(retryCf);pendingF.f_to_c=std::move(retryFc);
+            tuReconstructed=(recon.size()==olen&&!memcmp(recon.data(),orig,olen));
+            if(!tuReconstructed){fprintf(stderr,"transaction selftest: retry output differs\n");return 2;}
+          }
+
+          const auto actualPair=blob_digest(recon.data(),recon.size());
+          const p29::Digest128 actualOutput{actualPair.first,actualPair.second};
+          if(recon.size()!=admitted.source_extent||actualOutput!=admitted.expected_output_digest){
+            fprintf(stderr,"receiver output extent/digest differs at TU=%zu\n",t);return 2;}
+
+          uint8_t mask=0;for(size_t i=0;i<mixedPartCount;++i)if(!mixedEncoded[i].empty())mask|=uint8_t(1u<<i);
+          std::vector<uint8_t>close;close.push_back(1);close.push_back(mask);
+          put_u64le(close,pendingF.id.route_sequence);put_u64le(close,admitted.canonical_admission_sequence);
+          put_u64le(close,admitted.shared_c_snapshot_version);put_u64le(close,pendingF.expected_mirror_sequence);
+          put_u64le(close,pendingF.c_to_f.digest.lo);put_u64le(close,pendingF.c_to_f.digest.hi);
+          put_u64le(close,admitted.source_extent);put_u64le(close,admitted.expected_output_digest.lo);put_u64le(close,admitted.expected_output_digest.hi);
+          cfSink.emit(WT_TU_END,close);
+
+          // F consumes the physical close and checks every closure field before making its
+          // staged object/history state visible.
+          const uint8_t*cp=close.data(),*ce=cp+close.size();
+          if(cp==ce||*cp++!=1||cp==ce||*cp++!=mask){fprintf(stderr,"bad transactional TU_END prefix\n");return 2;}
+          const uint64_t closeSequence=get_u64le(cp,ce),closeAdmission=get_u64le(cp,ce),closeSnapshot=get_u64le(cp,ce),closeMirror=get_u64le(cp,ce);
+          const p29::Digest128 closeTransaction{get_u64le(cp,ce),get_u64le(cp,ce)};
+          const uint64_t closeExtent=get_u64le(cp,ce);const p29::Digest128 closeOutput{get_u64le(cp,ce),get_u64le(cp,ce)};
+          if(cp!=ce||closeSequence!=pendingF.id.route_sequence||closeAdmission!=admitted.canonical_admission_sequence||
+             closeSnapshot!=admitted.shared_c_snapshot_version||closeMirror!=pendingF.expected_mirror_sequence||
+             closeTransaction!=pendingF.c_to_f.digest||closeExtent!=admitted.source_extent||closeOutput!=admitted.expected_output_digest||
+             closeExtent!=recon.size()||closeOutput!=actualOutput){
+            fprintf(stderr,"transactional TU_END fields differ at TU=%zu\n",t);return 2;}
+          pendingF.closure={closeTransaction,closeOutput,closeExtent};
+          p29::AckReceipt duplicateAck;
+          if(receiverLedger.begin(pendingF.id,pendingF.closure,&duplicateAck)!=p29::BeginResult::Ready){
+            fprintf(stderr,"receiver refused a new transaction at TU=%zu\n",t);return 2;}
+
+          fTuJournal.commit();Fblocks.commit_transaction();Fmo.commit_transaction();mixedFSource.commit_transaction();
+          p29::AckReceipt ack;
+          if(!receiverLedger.commit(ack)){fprintf(stderr,"receiver commit produced no Ack\n");return 2;}
+
+          if(transactionSelftest){
+            // Lose the first Ack, repeat the exact identity, and require the retained receipt
+            // without a second F application.  A changed transaction digest is refused and
+            // likewise leaves the committed F state unchanged.
+            const p29::Digest128 committedFState=routeLocalStateDigest();
+            p29::AckReceipt retained;
+            if(receiverLedger.begin(pendingF.id,pendingF.closure,&retained)!=p29::BeginResult::DuplicateCommitted||!(retained==ack)||
+               routeLocalStateDigest()!=committedFState){fprintf(stderr,"transaction selftest: retained Ack replay changed F state\n");return 2;}
+            p29::TransactionClosure changed=pendingF.closure;changed.transaction_digest.lo^=1;
+            if(receiverLedger.begin(pendingF.id,changed,nullptr)!=p29::BeginResult::DigestMismatch||routeLocalStateDigest()!=committedFState){
+              fprintf(stderr,"transaction selftest: changed transaction digest was not refused without state change\n");return 2;}
+            changed=pendingF.closure;changed.output_digest.hi^=1;
+            if(receiverLedger.begin(pendingF.id,changed,nullptr)!=p29::BeginResult::DigestMismatch||routeLocalStateDigest()!=committedFState){
+              fprintf(stderr,"transaction selftest: changed output digest was not refused without state change\n");return 2;}
+            changed=pendingF.closure;++changed.output_extent;
+            if(receiverLedger.begin(pendingF.id,changed,nullptr)!=p29::BeginResult::DigestMismatch||routeLocalStateDigest()!=committedFState){
+              fprintf(stderr,"transaction selftest: changed output extent was not refused without state change\n");return 2;}
+          }
+
+          std::vector<uint8_t>ackWire;ackWire.push_back(1);put_u64le(ackWire,ack.id.route_sequence);
+          put_u64le(ackWire,ack.transaction_digest.lo);put_u64le(ackWire,ack.transaction_digest.hi);
+          put_u64le(ackWire,ack.output_extent);put_u64le(ackWire,ack.output_digest.lo);put_u64le(ackWire,ack.output_digest.hi);
+          fcSink.emit(WT_ACK,ackWire);
+          const uint8_t*ap=ackWire.data(),*ae=ap+ackWire.size();
+          if(ap==ae||*ap++!=1){fprintf(stderr,"bad Ack prefix\n");return 2;}
+          p29::AckReceipt received;received.id.scope=routeScope;received.id.route_sequence=get_u64le(ap,ae);
+          received.transaction_digest={get_u64le(ap,ae),get_u64le(ap,ae)};received.output_extent=get_u64le(ap,ae);
+          received.output_digest={get_u64le(ap,ae),get_u64le(ap,ae)};
+          if(ap!=ae||!(received==ack)){fprintf(stderr,"C received an Ack that differs\n");return 2;}
+
+          // Only now may shared C advance the per-F codec state, mirror and route history.
+          if(!pendingF.prepared_c_state.apply(pathid,paths,mixedCLine,nextMixedPublic,fknownReg,fknownBlk)){
+            fprintf(stderr,"prepared C transaction no longer applies to its base state\n");return 2;}
+          for(uint32_t r:pendingF.known_regions){if(r>=fknownReg.size()||!FmixedRegions[r].known){fprintf(stderr,"Acked Region is absent on F\n");return 2;}fknownReg[r]=1;}
+          for(uint32_t k:pendingF.known_blocks){if(k>=fknownBlk.size()||!Fblocks.known(k)){fprintf(stderr,"Acked Block is absent on F\n");return 2;}fknownBlk[k]=1;}
+          if(blobWireMode==4&&!Cmo.commit(moEncoded)){fprintf(stderr,"MO factor C Ack commit failed\n");return 2;}
+          if(Cmo.state_mark().values!=Fmo.state_mark().values||Cmo.state_mark().string_bytes!=Fmo.state_mark().string_bytes||
+             Cmo.state_mark().content_digest!=Fmo.state_mark().content_digest){fprintf(stderr,"C/F MO state differs after Ack\n");return 2;}
+          routeS1->commit();++perFMirrorSequence;
+          if(receiverLedger.expected_sequence()!=perFMirrorSequence){fprintf(stderr,"receiver/mirror sequence differs after Ack\n");return 2;}
+
+          if(transactionSelftest){
+            printf("transaction reject/retry selftest: PASS TU=%zu admission=%llu route_sequence=%llu blob_mode=%u mo_pending=%zu\n",t,
+                   (unsigned long long)admitted.canonical_admission_sequence,(unsigned long long)pendingF.id.route_sequence,
+                   unsigned(blobWireMode),moEncoded.pending_definitions.size());
+            cfSink.close(cfSinkPath);fcSink.close(fcSinkPath);
+            return releaseCodecResources()?0:2;
+          }
+        }else if(routeS1&&routeS1->has_pending()){
+          if(tuReconstructed)routeS1->commit();else routeS1->abort();
+        }
         cum_raw += olen;
         double cur_wire = w_root+w_linedef+w_regiondef+w_pathdef+w_blockdef+w_missing+w_framing;
         std::array<double,CW_COUNT>currentComponentWire=componentWireSnapshot();double componentWireTotal=0;
@@ -2462,9 +2988,11 @@ int main(int argc,char**argv){
         // (the byte the accounting charges as the selector) and makes the TU boundary an
         // explicit, parseable offset rather than something the receiver has to infer.
         if(cfSink.f){
-            uint8_t mask=0;
-            for(size_t i=0;i<mixedPartCount;++i) if(!mixedEncoded[i].empty()) mask|=uint8_t(1u<<i);
-            cfSink.emit(WT_TU_END,&mask,1); fcSink.emit(WT_TU_END,nullptr,0);
+            if(!transactionalTu){
+              uint8_t mask=0;
+              for(size_t i=0;i<mixedPartCount;++i) if(!mixedEncoded[i].empty()) mask|=uint8_t(1u<<i);
+              cfSink.emit(WT_TU_END,&mask,1);fcSink.emit(WT_TU_END,nullptr,0);
+            }
             if(sinkBuildTus&&(t+1)%sinkBuildTus==0){
                 const uint32_t b=uint32_t(t/sinkBuildTus),c=uint32_t(t+1);
                 const uint8_t p[8]={uint8_t(b),uint8_t(b>>8),uint8_t(b>>16),uint8_t(b>>24),
@@ -2580,22 +3108,7 @@ int main(int argc,char**argv){
       structureLdmJoint=zstd_ldm_frame_encode(z,structureJoint,zlevel,messageEncoded)+FRAME;
       if(zstd_frame_decode_exact(messageD,messageEncoded,structureJoint.size())!=structureJoint){fprintf(stderr,"structure LDM aggregate roundtrip differs\n");return 2;}
     }
-    ZSTD_freeCCtx(z);
-    ZSTD_freeDCtx(messageD);
-    if(sourceCostZ)ZSTD_freeCCtx(sourceCostZ);
-    if(useSortedLines) for(size_t i=0;i<linePartCount;++i){ ZSTD_freeCCtx(lineZC[i]); ZSTD_freeDCtx(lineZD[i]); }
-    if(useMixedRegions) for(size_t i=0;i<mixedPartCount;++i){ ZSTD_freeCCtx(mixedZC[i]); ZSTD_freeDCtx(mixedZD[i]); }
-    if(blobZC)ZSTD_freeCCtx(blobZC);
-    if(blobZD)ZSTD_freeDCtx(blobZD);
-    if(blobPatchZC)ZSTD_freeCCtx(blobPatchZC);
-    if(blobPatchZD)ZSTD_freeDCtx(blobPatchZD);
-    if(alphaZC)ZSTD_freeCCtx(alphaZC);
-    if(alphaZD)ZSTD_freeDCtx(alphaZD);
-    if(residualDump&&fclose(residualDump)!=0){perror(residualDumpPath);return 2;}
-    if(blobDump&&fclose(blobDump)!=0){perror(blobDumpPath);return 2;}
-    if(blobDumpLengths&&fclose(blobDumpLengths)!=0){fprintf(stderr,"blob length dump close failed\n");return 2;}
-    for(FILE*f:mixedDumps)if(f&&fclose(f)!=0){fprintf(stderr,"mixed stream dump close failed\n");return 2;}
-    if(mixedDumpLengths&&fclose(mixedDumpLengths)!=0){fprintf(stderr,"mixed stream length close failed\n");return 2;}
+    if(!releaseCodecResources())return 2;
 
     double totalwire = w_root+w_linedef+w_regiondef+w_pathdef+w_blockdef+w_missing+w_framing;
     double MiB=1048576.0;

@@ -17,9 +17,11 @@
 #                  selector_equivalence_mutations.sh both byte-equivalence gates' paths
 #                  selector_1f_costing_mutations.sh  the 1F launcher's own failure path
 #                  selector_live_source_mutations.sh source-level selector attribution faults
+#                  selector_transaction_source_mutations.sh whole-state abort/Ack-order faults
 #   wire gates     selector_step1_equivalence.sh  planning vs on-demand, byte-identical
 #                  selector_step2_equivalence.sh  reference vs build under test
 #                  selector_tag_regression.sh     typed-tag guards G1-G3
+#                  selector_transaction_retry.sh whole-TU reject/retry + retained Ack
 #                  selector_1f_costing.sh         per-TU candidate costing (differential basis)
 #                  selector_live_history.sh       the LIVE selected history (added by ruling)
 #
@@ -138,9 +140,13 @@ step selector_1f_costing_mutations -- env BIN="$BIN" MX="$MX" \
      WORK="$WORK/mut.costing" "$HERE/selector_1f_costing_mutations.sh" "$CELL"
 step selector_live_source_mutations -- env BIN="$BIN" WORK="$WORK/mut.selector-source" \
      "$HERE/selector_live_source_mutations.sh" "$WORK/man1"
+step selector_transaction_source_mutations -- env BIN="$BIN" WORK="$WORK/mut.transaction-source" \
+     "$HERE/selector_transaction_source_mutations.sh" "$WORK/man1"
 
 # --- wire gates ----------------------------------------------------------------------------
 step selector_tag_regression -- env BIN="$BIN" "$HERE/selector_tag_regression.sh" "$WORK/man4" "$WORK/man1"
+step selector_transaction_retry -- env BIN="$BIN" WORK="$WORK/transaction-retry" \
+     "$HERE/selector_transaction_retry.sh" "$WORK/man1"
 step selector_step1_equivalence -- env BIN="$BIN" MX="$MX" \
      WORK="$WORK/step1" OUT="$WORK/step1/evidence" "$HERE/selector_step1_equivalence.sh"
 step selector_step2_equivalence -- env S1="$REF_BIN" S2="$BIN" MX="$MX" \
