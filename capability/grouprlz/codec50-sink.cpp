@@ -88,7 +88,7 @@ static inline const char* next_region(const char*p,const char*end){ const char*q
 }
 static void* huge_zeroed(size_t bytes){ constexpr size_t H=2u<<20; bytes=(bytes+H-1)&~(H-1); void*p=mmap(nullptr,bytes,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0); if(p==MAP_FAILED){perror("mmap");exit(2);} madvise(p,bytes,MADV_HUGEPAGE); return p; }
 
-struct FileSpan{ uint64_t off; uint32_t len; };
+struct FileSpan{ uint64_t off; uint32_t len; uint32_t storage; };
 struct LineRef{ uint32_t off; uint32_t len; };
 struct TinySlot{ uint64_t bytes; uint32_t id; uint8_t len; uint8_t pad[3]; };
 struct ShortSlot{ uint64_t lo; uint64_t hi; uint32_t id; uint8_t len; uint8_t pad[3]; };
@@ -151,13 +151,52 @@ private:
     std::vector<uint32_t> region_index_; std::vector<RegionRecord> region_records_; std::vector<char> line_bytes_,region_bytes_; std::vector<uint32_t> region_ids_; std::vector<LineRef> id_refs_; uint32_t next_id_=1,region_mask_=0;
 };
 
-struct Corpus{ std::vector<char> bytes; std::vector<FileSpan> files; uint64_t raw=0; };
+struct Corpus{
+    std::vector<char> bytes;
+    std::vector<FileSpan> files;
+    uint64_t raw=0,unique_raw=0;
+    uint32_t unique_files=0;
+};
 static Corpus load_corpus(const char*manifest,size_t max_files){
-    FILE*mf=fopen(manifest,"r"); if(!mf){perror(manifest);exit(2);} std::vector<std::string> paths; char path[8192]; uint64_t total=0;
-    while(fgets(path,sizeof path,mf)){ size_t n=strlen(path); while(n&&(path[n-1]=='\n'||path[n-1]=='\r'))path[--n]=0; if(!n)continue; struct stat st{}; if(stat(path,&st)!=0){perror(path);exit(2);} paths.emplace_back(path); total+=uint64_t(st.st_size); if(paths.size()==max_files)break; }
-    fclose(mf); Corpus c; c.bytes.resize(size_t(total)+64); c.files.reserve(paths.size()); uint64_t off=0;
-    for(auto&p:paths){ FILE*f=fopen(p.c_str(),"rb"); if(!f){perror(p.c_str());exit(2);} struct stat st{}; fstat(fileno(f),&st); size_t n=size_t(st.st_size); if(n&&fread(c.bytes.data()+off,1,n,f)!=n){fprintf(stderr,"short read\n");exit(2);} fclose(f); c.files.push_back({off,uint32_t(n)}); off+=n; }
-    c.raw=off; return c;
+    // A multi-build capability manifest repeats the same immutable .ii pathname.  Keep every
+    // logical occurrence, but retain one byte extent per exact pathname; otherwise five Firefox
+    // builds turn 15 GB of input into a needless 75 GB allocation before the codec can run.
+    struct UniqueFile{ std::string path; uint64_t size=0,off=0; };
+    FILE*mf=fopen(manifest,"r"); if(!mf){perror(manifest);exit(2);}
+    std::vector<UniqueFile>unique;
+    std::vector<std::pair<uint32_t,uint32_t>>logical;
+    std::unordered_map<std::string,uint32_t>byPath;
+    char path[8192]; uint64_t logicalRaw=0,uniqueRaw=0;
+    while(fgets(path,sizeof path,mf)){
+        size_t n=strlen(path); while(n&&(path[n-1]=='\n'||path[n-1]=='\r'))path[--n]=0; if(!n)continue;
+        struct stat st{}; if(stat(path,&st)!=0){perror(path);exit(2);}
+        if(st.st_size<0||uint64_t(st.st_size)>UINT32_MAX){fprintf(stderr,"TU is too large for the u32 FileSpan: %s\n",path);exit(2);}
+        const uint32_t len=uint32_t(st.st_size);
+        auto found=byPath.find(path);uint32_t storage;
+        if(found==byPath.end()){
+            if(unique.size()==UINT32_MAX){fprintf(stderr,"too many unique manifest paths\n");exit(2);}
+            storage=uint32_t(unique.size());byPath.emplace(path,storage);
+            unique.push_back({path,uint64_t(len),0});
+            if(uniqueRaw>UINT64_MAX-len){fprintf(stderr,"unique corpus size overflow\n");exit(2);} uniqueRaw+=len;
+        }else{
+            storage=found->second;
+            if(unique[storage].size!=len){fprintf(stderr,"manifest path changed size while loading: %s\n",path);exit(2);}
+        }
+        if(logicalRaw>UINT64_MAX-len){fprintf(stderr,"logical corpus size overflow\n");exit(2);} logicalRaw+=len;
+        logical.emplace_back(storage,len);if(logical.size()==max_files)break;
+    }
+    fclose(mf);
+    if(uniqueRaw>SIZE_MAX-64){fprintf(stderr,"unique corpus does not fit address space\n");exit(2);}
+    Corpus c;c.bytes.resize(size_t(uniqueRaw)+64);c.files.reserve(logical.size());uint64_t off=0;
+    for(auto&entry:unique){
+        entry.off=off;FILE*f=fopen(entry.path.c_str(),"rb");if(!f){perror(entry.path.c_str());exit(2);}
+        struct stat st{};if(fstat(fileno(f),&st)!=0){perror(entry.path.c_str());exit(2);}
+        if(st.st_size<0||uint64_t(st.st_size)!=entry.size){fprintf(stderr,"manifest path changed before read: %s\n",entry.path.c_str());exit(2);}
+        const size_t n=size_t(entry.size);if(n&&fread(c.bytes.data()+off,1,n,f)!=n){fprintf(stderr,"short read: %s\n",entry.path.c_str());exit(2);}
+        if(fclose(f)!=0){perror(entry.path.c_str());exit(2);}off+=n;
+    }
+    for(const auto&entry:logical){const UniqueFile&stored=unique[entry.first];c.files.push_back({stored.off,entry.second,entry.first});}
+    c.raw=logicalRaw;c.unique_raw=uniqueRaw;c.unique_files=uint32_t(unique.size());return c;
 }
 
 #if defined(WITH_BSC_GROUPS)
@@ -1309,8 +1348,17 @@ int main(int argc,char**argv){
 
     auto t0=Clock::now(); Corpus corpus=load_corpus(manifest,max_files); Interner dict;
     std::vector<uint32_t> allreg; std::vector<size_t> roff; roff.push_back(0);
-    { uint32_t maxlen=0; for(auto&f:corpus.files) maxlen=std::max(maxlen,f.len); std::vector<uint32_t> out(size_t(maxlen)+1); uint64_t hits=0; std::vector<uint32_t> rs;
-      for(auto&f:corpus.files){ size_t oc=0; rs.clear(); const char*p=corpus.bytes.data()+f.off; dict.process(p,p+f.len,out.data(),oc,hits,true,&rs); allreg.insert(allreg.end(),rs.begin(),rs.end()); roff.push_back(allreg.size()); } }
+    { uint32_t maxlen=0; for(auto&f:corpus.files) maxlen=std::max(maxlen,f.len); std::vector<uint32_t> out(size_t(maxlen)+1); uint64_t hits=0;
+      // process() resets its previous-Region cursor at each TU boundary and trains only
+      // relationships inside that TU.  The first occurrence therefore installs every object and
+      // transition an identical later occurrence could install.  Reuse its immutable Region-id
+      // sequence while still appending every logical occurrence to allreg/roff in manifest order.
+      std::vector<std::vector<uint32_t>>regionsByStorage(corpus.unique_files);std::vector<uint8_t>parsed(corpus.unique_files);
+      for(auto&f:corpus.files){
+        std::vector<uint32_t>&rs=regionsByStorage[f.storage];
+        if(!parsed[f.storage]){size_t oc=0;const char*p=corpus.bytes.data()+f.off;dict.process(p,p+f.len,out.data(),oc,hits,true,&rs);parsed[f.storage]=1;}
+        allreg.insert(allreg.end(),rs.begin(),rs.end());roff.push_back(allreg.size());
+      } }
     const size_t physicalTUs=corpus.files.size();const uint64_t physicalRaw=corpus.raw;
     if(!physicalTUs){fprintf(stderr,"manifest contains no TUs\n");return 2;}
     if(physicalTUs>SIZE_MAX/replayRepetitions||allreg.size()>SIZE_MAX/replayRepetitions||physicalRaw>UINT64_MAX/replayRepetitions){fprintf(stderr,"logical replay size overflow\n");return 2;}
@@ -1347,7 +1395,7 @@ int main(int argc,char**argv){
       std::string trailing;if(input>>trailing){fprintf(stderr,"route map has trailing data\n");return 2;}
       if(!materializedTus){fprintf(stderr,"materialized route %zu has no TUs\n",materializeRoute);return 2;}
     }
-    fprintf(stderr,"loaded+interned %.1fs TUs=%zu raw=%llu physical_tus=%zu physical_raw=%llu replay_repetitions=%zu regions=%u region_occ=%zu distinct_lines=%u\n",secs(t0),TUs,(unsigned long long)corpus.raw,physicalTUs,(unsigned long long)physicalRaw,replayRepetitions,NREG,allreg.size(),dict.distinct());
+    fprintf(stderr,"loaded+interned %.1fs TUs=%zu raw=%llu physical_tus=%zu physical_raw=%llu unique_tus=%u unique_raw=%llu replay_repetitions=%zu regions=%u region_occ=%zu distinct_lines=%u\n",secs(t0),TUs,(unsigned long long)corpus.raw,physicalTUs,(unsigned long long)physicalRaw,corpus.unique_files,(unsigned long long)corpus.unique_raw,replayRepetitions,NREG,allreg.size(),dict.distinct());
     if(mappedRoutes)fprintf(stderr,"multi-route projection: routes=%zu target=%zu target_tus=%zu target_raw=%llu\n",routeCount,materializeRoute,materializedTus,(unsigned long long)materializedRaw);
     if(entropyRestartTus)fprintf(stderr,"experimental entropy restarts: TUs/segment=%zu segments=%zu (not a product build signal)\n",entropyRestartTus,TUs/entropyRestartTus);
     if(stableRootTags)fprintf(stderr,"stable Root tags: region=2*r block=2*k+1\n");
