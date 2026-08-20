@@ -52,10 +52,12 @@ The common runner must retain these outputs for every codec/policy run:
 
 `run_scenario.py` is the single event/scheduling core.  Its `compile-only` and `raw`
 adapters are diagnostic references, not compression results.  A physical codec adapter
-supplies a sequence of C-to-F/F-to-C phases for each dispatched TU; it does not get its own
-scheduler.  The core reserves real F slots, shares the configured fabric between active
-flows, applies per-route, per-C, per-F, and fabric capacities simultaneously, and dispatches
-another TU only after a slot becomes free.
+supplies a transaction graph of C-to-F/F-to-C extents for each dispatched TU; it does not get
+its own scheduler.  Graph edges distinguish `sent` from `delivered`, and input readiness and
+transaction commit are independent joins.  The core has separate F input-staging and compiler
+pools, shares all configured bandwidth resources between active flows, and schedules bounded
+writer quanta by frame priority.  Omitting `input_staging_slots` retains the historical
+assign-and-reserve-compiler behavior for old scenarios.
 
 ```bash
 python3 capability/distribution/run_scenario.py \
@@ -110,9 +112,13 @@ python3 capability/distribution/run_scenario.py SCENARIO.json \
 ```
 
 The P29 builder runs the real codec, parses the typed C-to-F and F-to-C streams into causal
-Root/Need/Fill/close phases, requires the selector and component ledgers to agree, and reruns
-the codec's directional sink replay.  Its present producer has only one materialized route,
-so the builder deliberately refuses multi-F scenarios.
+Root/Need/LINES/Fill/close/Ack extents, requires the selector and component ledgers to agree,
+and reruns the codec's directional sink replay.  LINES is released after Root serialization,
+Need after Root delivery, Fill after Need delivery, and close joins every material branch.
+Fill can move ahead of an unfinished LINES extent at the next configured writer quantum.
+Compiler input becomes ready after close delivery; codec state commits after Ack delivery.
+Its present producer has only one materialized route, so the builder deliberately refuses
+multi-F scenarios.
 
 Build and replay a multi-route GRZ ledger:
 
@@ -127,8 +133,8 @@ python3 capability/distribution/run_scenario.py SCENARIO.json \
 The GRZ builder uses the common simulator assignment, partitions TUs by `(C,F)`, and creates
 one persistent G2 stream per route with one complete current-TU frame per transaction.  It
 requires full route reconstruction, an identical retry, and exact selected prefix decodes.
-The resulting per-frame bytes are then scheduled by the same event engine used by every other
-adapter.
+The resulting current-TU frame is a one-node transaction graph and is then scheduled by the
+same event engine used by every other adapter.
 
 Ledger generation currently starts from the compile-only assignment and replay refuses any
 placement drift.  That is exact for the primary `C1F20_200B1G` case because all 2,498 TUs fit in
@@ -142,10 +148,11 @@ Run the deterministic integration gate from the repository root:
 make integration_tests
 ```
 
-This current gate covers the scenario engine, simultaneous bandwidth ceilings, active-time
-JSONL/report generation, physical-ledger refusal rules, and P29/GRZ ledger parsing.  The later
-live-process launcher described in the architecture document will extend this same target with
-scheduler, daemon, cache-sidecar, and compiler-pipe scenarios.
+This current gate covers the scenario engine, fork/join causality, independent readiness and
+commit, writer-quantum priority, split staging/compiler capacity, simultaneous directional
+bandwidth ceilings, active-time JSONL/report generation, physical-ledger refusal rules, and
+P29/GRZ ledger parsing.  The later live-process launcher described in the architecture document
+will extend this same target with scheduler, daemon, cache-sidecar, and compiler-pipe scenarios.
 
 ## Cold plus four-warm topology suite
 

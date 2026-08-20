@@ -23,7 +23,7 @@ import hashlib
 import heapq
 import json
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -88,12 +88,87 @@ class Phase:
     name: str
     direction: str
     byte_count: int
+    priority: int = 3
 
     def __post_init__(self) -> None:
         if self.direction not in DIRECTIONS:
             raise ValueError(f"unknown phase direction {self.direction!r}")
         if self.byte_count < 0:
             raise ValueError("phase byte count is negative")
+        checked_nonnegative_int(self.priority, "phase priority")
+
+
+@dataclass(frozen=True)
+class DagNode:
+    """One physical frame/stream extent in a transaction dependency graph."""
+
+    name: str
+    direction: str
+    byte_count: int
+    dependencies: tuple[str, ...] = ()
+    priority: int = 3
+
+    def __post_init__(self) -> None:
+        if not self.name or ":" in self.name:
+            raise ValueError("DAG node name must be nonempty and contain no colon")
+        if self.direction not in DIRECTIONS:
+            raise ValueError(f"unknown DAG node direction {self.direction!r}")
+        checked_positive_int(self.byte_count, f"DAG node {self.name} bytes")
+        checked_nonnegative_int(self.priority, f"DAG node {self.name} priority")
+
+
+@dataclass(frozen=True)
+class TransactionPlan:
+    """Fork/join transport graph and its independent readiness/commit joins."""
+
+    nodes: tuple[DagNode, ...]
+    initial_tokens: tuple[str, ...]
+    input_ready_after: tuple[str, ...]
+    commit_after: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not self.nodes:
+            raise ValueError("transaction DAG has no nodes")
+        names = [node.name for node in self.nodes]
+        if len(names) != len(set(names)):
+            raise ValueError("transaction DAG repeats a node name")
+        initial = set(self.initial_tokens)
+        if len(initial) != len(self.initial_tokens) or any(not token for token in initial):
+            raise ValueError("transaction DAG has empty or repeated initial tokens")
+        allowed = initial | {
+            f"{name}:{stage}" for name in names for stage in ("sent", "delivered")
+        }
+        for label, tokens in (
+            ("input_ready_after", self.input_ready_after),
+            ("commit_after", self.commit_after),
+        ):
+            if not tokens or len(tokens) != len(set(tokens)):
+                raise ValueError(f"transaction DAG {label} is empty or repeated")
+            unknown = set(tokens) - allowed
+            if unknown:
+                raise ValueError(f"transaction DAG {label} has unknown tokens {unknown}")
+        dependencies: dict[str, set[str]] = {}
+        for node in self.nodes:
+            unknown = set(node.dependencies) - allowed
+            if unknown:
+                raise ValueError(
+                    f"transaction DAG node {node.name} has unknown tokens {unknown}"
+                )
+            dependencies[node.name] = {
+                token.rsplit(":", 1)[0]
+                for token in node.dependencies
+                if token not in initial
+            }
+        resolved: set[str] = set()
+        while len(resolved) != len(names):
+            ready = {
+                name
+                for name, required in dependencies.items()
+                if name not in resolved and required <= resolved
+            }
+            if not ready:
+                raise ValueError("transaction DAG contains a dependency cycle")
+            resolved.update(ready)
 
 
 class CodecAdapter:
@@ -104,6 +179,13 @@ class CodecAdapter:
 
     def begin(self, item: WorkItem, worker: int) -> Sequence[Phase]:
         raise NotImplementedError
+
+    def transaction_plan(
+        self, item: WorkItem, worker: int
+    ) -> TransactionPlan | None:
+        """Return a fork/join plan, or ``None`` to use the linear phase adapter."""
+        del item, worker
+        return None
 
     def commit(self, item: WorkItem, worker: int) -> None:
         """Commit state only after the complete dialogue has finished."""
@@ -183,6 +265,7 @@ class PhysicalLedgerEntry:
     raw_bytes: int
     raw_sha256: str
     phases: tuple[Phase, ...]
+    plan: TransactionPlan
     state_after: dict[str, object]
 
 
@@ -257,6 +340,19 @@ class PhysicalLedgerAdapter(CodecAdapter):
             if not isinstance(phase_rows, list) or not phase_rows:
                 raise ValueError(f"{self.path}:{row_number}: phases are empty")
             phases = []
+            graph_declared = any(
+                key in row
+                for key in (
+                    "initial_tokens",
+                    "input_ready_after",
+                    "commit_after",
+                )
+            ) or any(
+                isinstance(phase_row, dict)
+                and ("depends_on" in phase_row or "priority" in phase_row)
+                for phase_row in phase_rows
+            )
+            dag_nodes = []
             for phase_index, phase_row in enumerate(phase_rows):
                 if not isinstance(phase_row, dict):
                     raise ValueError(
@@ -267,14 +363,71 @@ class PhysicalLedgerAdapter(CodecAdapter):
                     raise ValueError(
                         f"{self.path}:{row_number}: phase {phase_index} has no name"
                     )
-                phases.append(
-                    Phase(
-                        phase_name,
-                        phase_row.get("direction"),
-                        checked_nonnegative_int(
-                            phase_row.get("bytes"), "ledger phase bytes"
-                        ),
+                direction = phase_row.get("direction")
+                byte_count = checked_nonnegative_int(
+                    phase_row.get("bytes"), "ledger phase bytes"
+                )
+                priority = checked_nonnegative_int(
+                    phase_row.get("priority", 3), "ledger phase priority"
+                )
+                phase = Phase(phase_name, direction, byte_count, priority)
+                phases.append(phase)
+                if graph_declared:
+                    dependencies = phase_row.get("depends_on", [])
+                    if not isinstance(dependencies, list) or not all(
+                        isinstance(token, str) for token in dependencies
+                    ):
+                        raise ValueError(
+                            f"{self.path}:{row_number}: phase {phase_index} dependencies are invalid"
+                        )
+                    dag_nodes.append(
+                        DagNode(
+                            phase_name,
+                            direction,
+                            byte_count,
+                            tuple(dependencies),
+                            priority,
+                        )
                     )
+            if graph_declared:
+                initial_tokens = row.get("initial_tokens", [])
+                input_ready_after = row.get("input_ready_after")
+                commit_after = row.get("commit_after")
+                if not all(
+                    isinstance(tokens, list)
+                    and all(isinstance(token, str) for token in tokens)
+                    for tokens in (initial_tokens, input_ready_after, commit_after)
+                ):
+                    raise ValueError(
+                        f"{self.path}:{row_number}: transaction DAG token lists are invalid"
+                    )
+                plan = TransactionPlan(
+                    tuple(dag_nodes),
+                    tuple(initial_tokens),
+                    tuple(input_ready_after),
+                    tuple(commit_after),
+                )
+            else:
+                dag_nodes = []
+                previous: str | None = None
+                for phase in phases:
+                    dependencies = () if previous is None else (f"{previous}:delivered",)
+                    dag_nodes.append(
+                        DagNode(
+                            phase.name,
+                            phase.direction,
+                            phase.byte_count,
+                            dependencies,
+                            phase.priority,
+                        )
+                    )
+                    previous = phase.name
+                final_token = f"{dag_nodes[-1].name}:delivered"
+                plan = TransactionPlan(
+                    tuple(dag_nodes),
+                    ("attachment:accepted",),
+                    ("attachment:accepted", final_token),
+                    (final_token,),
                 )
             state_after = row.get("state_after", {})
             if not isinstance(state_after, dict):
@@ -288,6 +441,7 @@ class PhysicalLedgerAdapter(CodecAdapter):
                 raw_bytes,
                 raw_sha256,
                 tuple(phases),
+                plan,
                 state_after,
             )
             key = (workload, build, logical)
@@ -358,7 +512,7 @@ class PhysicalLedgerAdapter(CodecAdapter):
     def dialogue_window_per_route(self) -> int | None:
         return 1
 
-    def begin(self, item: WorkItem, worker: int) -> Sequence[Phase]:
+    def _activate(self, item: WorkItem, worker: int) -> PhysicalLedgerEntry:
         entry = self.entries[item.key]
         if entry.worker != worker:
             raise RuntimeError(
@@ -373,7 +527,16 @@ class PhysicalLedgerAdapter(CodecAdapter):
         if item.key in self.active:
             raise RuntimeError(f"physical ledger TU {item.key} began twice")
         self.active.add(item.key)
+        return entry
+
+    def begin(self, item: WorkItem, worker: int) -> Sequence[Phase]:
+        entry = self._activate(item, worker)
         return entry.phases
+
+    def transaction_plan(
+        self, item: WorkItem, worker: int
+    ) -> TransactionPlan | None:
+        return self._activate(item, worker).plan
 
     def commit(self, item: WorkItem, worker: int) -> None:
         if item.key not in self.active:
@@ -441,14 +604,26 @@ class Transaction:
     worker: int
     slot: int
     phases: tuple[Phase, ...]
+    staging_slot: int | None = None
+    compiler_slot: int | None = None
+    staging_released: bool = False
+    compiler_slot_released: bool = False
     phase_index: int = 0
     dispatch_ns: Fraction = Fraction(0)
     transfer_done_ns: Fraction | None = None
     compile_start_ns: Fraction | None = None
     compile_finish_ns: Fraction | None = None
+    transaction_commit_ns: Fraction | None = None
+    complete_ns: Fraction | None = None
     c_to_f_bytes: int = 0
     f_to_c_bytes: int = 0
     dialogue_started: bool = False
+    plan: TransactionPlan | None = None
+    dag_tokens: set[str] = field(default_factory=set)
+    dag_started: set[str] = field(default_factory=set)
+    input_ready: bool = False
+    transaction_committed: bool = False
+    compile_completed: bool = False
 
 
 @dataclass
@@ -458,6 +633,7 @@ class Flow:
     phase: Phase
     remaining_bits: Fraction
     start_ns: Fraction | None = None
+    quantum_remaining_bits: Fraction | None = None
 
     @property
     def endpoint(self) -> tuple[str, int, int]:
@@ -544,9 +720,13 @@ class TimelineRecorder:
         self.sample_elapsed_ns = Fraction(0)
         self.route_bits: dict[tuple[str, int, int], Fraction] = defaultdict(Fraction)
         self.fabric_bits = Fraction(0)
+        self.direction_fabric_bits: dict[str, Fraction] = defaultdict(Fraction)
         self.compile_slot_ns = [Fraction(0) for _ in range(workers)]
         self.input_wait_slot_ns = [Fraction(0) for _ in range(workers)]
+        self.ready_input_slot_ns = [Fraction(0) for _ in range(workers)]
+        self.commit_wait_slot_ns = [Fraction(0) for _ in range(workers)]
         self.reserved_slot_ns = [Fraction(0) for _ in range(workers)]
+        self.staging_slot_ns = [Fraction(0) for _ in range(workers)]
         self.snapshot_due = False
 
     @property
@@ -571,6 +751,7 @@ class TimelineRecorder:
             bits = rate * elapsed_ns
             self.route_bits[flow.endpoint] += bits
             self.fabric_bits += bits
+            self.direction_fabric_bits[flow.phase.direction] += bits
         for worker in range(self.workers):
             self.compile_slot_ns[worker] += (
                 simulator.worker_compiling[worker] * elapsed_ns
@@ -578,8 +759,17 @@ class TimelineRecorder:
             self.input_wait_slot_ns[worker] += (
                 simulator.worker_input_wait[worker] * elapsed_ns
             )
+            self.ready_input_slot_ns[worker] += (
+                simulator.worker_ready_input[worker] * elapsed_ns
+            )
+            self.commit_wait_slot_ns[worker] += (
+                simulator.worker_commit_wait[worker] * elapsed_ns
+            )
             self.reserved_slot_ns[worker] += (
-                len(simulator.free_slots[worker].in_use) * elapsed_ns
+                len(simulator.compiler_slots[worker].in_use) * elapsed_ns
+            )
+            self.staging_slot_ns[worker] += (
+                len(simulator.staging_slots[worker].in_use) * elapsed_ns
             )
         if self.sample_elapsed_ns > self.interval_ns:
             raise AssertionError("timeline sample exceeded its configured interval")
@@ -648,8 +838,17 @@ class TimelineRecorder:
                 "average_input_wait_slots": float(
                     self.input_wait_slot_ns[worker] / duration
                 ),
+                "average_ready_input_slots": float(
+                    self.ready_input_slot_ns[worker] / duration
+                ),
+                "average_commit_wait_slots": float(
+                    self.commit_wait_slot_ns[worker] / duration
+                ),
                 "average_reserved_slots": float(
                     self.reserved_slot_ns[worker] / duration
+                ),
+                "average_staging_slots": float(
+                    self.staging_slot_ns[worker] / duration
                 ),
             }
             for direction in DIRECTIONS:
@@ -663,16 +862,38 @@ class TimelineRecorder:
                     None if capacity is None else average_bps / int(capacity)
                 )
             worker_metrics.append(row)
+        common_fabric_capacity = simulator.network.get("shared_fabric_bps")
+        direction_fabrics = []
+        for direction in DIRECTIONS:
+            bits = self.direction_fabric_bits[direction]
+            average_bps = float(bits * NANOSECONDS / duration)
+            capacity = simulator.network[direction].get("fabric_bits_per_second")
+            direction_fabrics.append(
+                {
+                    "direction": direction,
+                    "bits": float(bits),
+                    "average_bps": average_bps,
+                    "capacity_bps": capacity,
+                    "utilization": (
+                        None if capacity is None else average_bps / int(capacity)
+                    ),
+                }
+            )
         metrics = {
             "fabric_bits": float(self.fabric_bits),
             "fabric_average_bps": float(self.fabric_bits * NANOSECONDS / duration),
-            "fabric_capacity_bps": int(simulator.network["shared_fabric_bps"]),
-            "fabric_utilization": float(
-                self.fabric_bits
-                * NANOSECONDS
-                / duration
-                / int(simulator.network["shared_fabric_bps"])
+            "fabric_capacity_bps": common_fabric_capacity,
+            "fabric_utilization": (
+                None
+                if common_fabric_capacity is None
+                else float(
+                    self.fabric_bits
+                    * NANOSECONDS
+                    / duration
+                    / int(common_fabric_capacity)
+                )
             ),
+            "direction_fabrics": direction_fabrics,
             "routes": route_metrics,
             "environments": environment_metrics,
             "workers": worker_metrics,
@@ -700,9 +921,13 @@ class TimelineRecorder:
         self.sample_elapsed_ns = Fraction(0)
         self.route_bits.clear()
         self.fabric_bits = Fraction(0)
+        self.direction_fabric_bits.clear()
         self.compile_slot_ns = [Fraction(0) for _ in range(self.workers)]
         self.input_wait_slot_ns = [Fraction(0) for _ in range(self.workers)]
+        self.ready_input_slot_ns = [Fraction(0) for _ in range(self.workers)]
+        self.commit_wait_slot_ns = [Fraction(0) for _ in range(self.workers)]
         self.reserved_slot_ns = [Fraction(0) for _ in range(self.workers)]
+        self.staging_slot_ns = [Fraction(0) for _ in range(self.workers)]
         self.snapshot_due = False
 
     def emit_gap(
@@ -841,6 +1066,10 @@ def load_scenario(
     if not isinstance(template, dict):
         raise ValueError("workers.template is not an object")
     checked_positive_int(template.get("slots"), "worker slots")
+    if "input_staging_slots" in template:
+        checked_positive_int(
+            template.get("input_staging_slots"), "worker input_staging_slots"
+        )
     for direction in DIRECTIONS:
         link = network.get(direction)
         if not isinstance(link, dict):
@@ -857,13 +1086,25 @@ def load_scenario(
         for optional_capacity in (
             "per_environment_bits_per_second",
             "per_worker_bits_per_second",
+            "fabric_bits_per_second",
+            "writer_quantum_bytes",
         ):
             if optional_capacity in link:
                 checked_positive_int(
                     link.get(optional_capacity),
                     f"network.{direction}.{optional_capacity}",
                 )
-    checked_positive_int(network.get("shared_fabric_bps"), "network.shared_fabric_bps")
+    if "shared_fabric_bps" in network:
+        checked_positive_int(
+            network.get("shared_fabric_bps"), "network.shared_fabric_bps"
+        )
+    elif any(
+        "fabric_bits_per_second" not in network[direction]
+        for direction in DIRECTIONS
+    ):
+        raise ValueError(
+            "network needs shared_fabric_bps or one fabric_bits_per_second per direction"
+        )
     if scheduler.get("ready_job_policy") not in {
         "fifo-release",
         "environment-round-robin",
@@ -991,6 +1232,12 @@ class Simulator:
         self.env_count = int(document["environments"]["env_count"])
         self.f_count = int(worker_config["f_count"])
         self.slots_per_f = int(worker_config["template"]["slots"])
+        self.decoupled_staging = (
+            "input_staging_slots" in worker_config["template"]
+        )
+        self.input_staging_slots_per_f = int(
+            worker_config["template"].get("input_staging_slots", self.slots_per_f)
+        )
         self.network = document["network"]
         self.scheduler = document["scheduler"]
         self.now = Fraction(0)
@@ -998,14 +1245,23 @@ class Simulator:
         self.ready_heap: list[tuple[tuple[int, ...], int, WorkItem]] = []
         self.ready_by_environment: dict[int, deque[WorkItem]] = defaultdict(deque)
         self.ready_environment_cycle: deque[int] = deque()
-        self.free_slots: dict[int, SparseSlotPool] = {
+        self.compiler_slots: dict[int, SparseSlotPool] = {
             worker: SparseSlotPool(self.slots_per_f) for worker in range(self.f_count)
         }
+        # Historical callers inspect ``free_slots``; it remains the compiler pool.
+        self.free_slots = self.compiler_slots
+        self.staging_slots: dict[int, SparseSlotPool] = {
+            worker: SparseSlotPool(self.input_staging_slots_per_f)
+            for worker in range(self.f_count)
+        }
+        self.ready_compiler_queues: dict[int, deque[Transaction]] = defaultdict(deque)
         self.compile_heap: list[tuple[Fraction, int, Transaction]] = []
         self.delivery_heap: list[tuple[Fraction, int, Flow]] = []
         self.active_flows: dict[int, Flow] = {}
-        self.endpoint_queues: dict[tuple[str, int, int], deque[Flow]] = defaultdict(
-            deque
+        self.endpoint_queues: dict[
+            tuple[str, int, int], list[tuple[int, int, Flow]]
+        ] = defaultdict(
+            list
         )
         self.dialogue_active: dict[tuple[int, int], int] = defaultdict(int)
         self.dialogue_queues: dict[tuple[int, int], deque[Transaction]] = defaultdict(
@@ -1036,7 +1292,9 @@ class Simulator:
         self.env_active = [0] * self.env_count
         self.env_completed = [0] * self.env_count
         self.worker_input_wait = [0] * self.f_count
+        self.worker_ready_input = [0] * self.f_count
         self.worker_compiling = [0] * self.f_count
+        self.worker_commit_wait = [0] * self.f_count
         self.worker_dispatched = [0] * self.f_count
         self.worker_completed = [0] * self.f_count
         self.timeline = TimelineRecorder(snapshot_interval_ns, self.f_count)
@@ -1067,6 +1325,7 @@ class Simulator:
         phase: Phase | None = None,
         item: WorkItem | None = None,
         flow: Flow | None = None,
+        detail: str = "",
     ) -> None:
         item = tx.item if tx is not None else item
         self.events.append(
@@ -1080,11 +1339,14 @@ class Simulator:
                 "logical": "" if item is None else item.logical,
                 "worker": "" if tx is None else tx.worker,
                 "slot": "" if tx is None else tx.slot,
+                "staging_slot": "" if tx is None else tx.staging_slot,
+                "compiler_slot": "" if tx is None else tx.compiler_slot,
                 "transaction": "" if tx is None else tx.sequence,
                 "flow": "" if flow is None else flow.sequence,
                 "phase": "" if phase is None else phase.name,
                 "direction": "" if phase is None else phase.direction,
                 "bytes": "" if phase is None else phase.byte_count,
+                "detail": detail,
             }
         )
         self.event_sequence += 1
@@ -1133,9 +1395,22 @@ class Simulator:
         return item
 
     def _free_workers(self) -> list[int]:
-        return [worker for worker in range(self.f_count) if self.free_slots[worker]]
+        pool = self.staging_slots if self.decoupled_staging else self.compiler_slots
+        return [worker for worker in range(self.f_count) if pool[worker]]
 
-    def _select_slot(self, item: WorkItem) -> tuple[int, int]:
+    def _reserve_worker(self, worker: int) -> tuple[int, int, int | None]:
+        staging_slot = self.staging_slots[worker].acquire()
+        compiler_slot = (
+            None
+            if self.decoupled_staging
+            else self.compiler_slots[worker].acquire()
+        )
+        assignment_slot = (
+            staging_slot if compiler_slot is None else compiler_slot
+        )
+        return assignment_slot, staging_slot, compiler_slot
+
+    def _select_slot(self, item: WorkItem) -> tuple[int, int, int, int | None]:
         free_workers = self._free_workers()
         if not free_workers:
             raise RuntimeError("slot selection without a free worker")
@@ -1146,7 +1421,8 @@ class Simulator:
                 worker = (self.round_robin_cursor + offset) % self.f_count
                 if worker in available:
                     self.round_robin_cursor = (worker + 1) % self.f_count
-                    return worker, self.free_slots[worker].acquire()
+                    slot, staging_slot, compiler_slot = self._reserve_worker(worker)
+                    return worker, slot, staging_slot, compiler_slot
             raise AssertionError("round-robin failed to find a free worker")
         if policy == "fastest":
             worker = min(
@@ -1156,7 +1432,8 @@ class Simulator:
                     candidate,
                 ),
             )
-            return worker, self.free_slots[worker].acquire()
+            slot, staging_slot, compiler_slot = self._reserve_worker(worker)
+            return worker, slot, staging_slot, compiler_slot
         raise NotImplementedError(
             f"placement policy {policy!r} needs its stateful adapter in the common core"
         )
@@ -1164,13 +1441,15 @@ class Simulator:
     def _dispatch(self) -> None:
         while self._has_ready() and self._free_workers():
             item = self._pop_ready()
-            worker, slot = self._select_slot(item)
+            worker, slot, staging_slot, compiler_slot = self._select_slot(item)
             tx = Transaction(
                 self.transaction_sequence,
                 item,
                 worker,
                 slot,
                 (),
+                staging_slot=staging_slot,
+                compiler_slot=compiler_slot,
                 dispatch_ns=self.now,
             )
             self.transaction_sequence += 1
@@ -1196,10 +1475,18 @@ class Simulator:
     def _start_dialogue(self, tx: Transaction) -> None:
         if tx.dialogue_started:
             raise RuntimeError("transaction dialogue started twice")
-        tx.phases = tuple(self.adapter.begin(tx.item, tx.worker))
+        tx.plan = self.adapter.transaction_plan(tx.item, tx.worker)
+        if tx.plan is None:
+            tx.phases = tuple(self.adapter.begin(tx.item, tx.worker))
+        else:
+            tx.dag_tokens.update(tx.plan.initial_tokens)
         tx.dialogue_started = True
         self._event("dialogue-start", tx)
-        self._start_next_phase(tx)
+        if tx.plan is None:
+            self._start_next_phase(tx)
+        else:
+            self._release_dag_nodes(tx)
+            self._check_dag_joins(tx)
 
     def _finish_dialogue(self, tx: Transaction) -> None:
         self._event("dialogue-finish", tx)
@@ -1216,20 +1503,88 @@ class Simulator:
             self.dialogue_active[route] += 1
             self._start_dialogue(following)
 
-    def _start_next_phase(self, tx: Transaction) -> None:
-        if tx.phase_index == len(tx.phases):
-            tx.transfer_done_ns = self.now
-            self.adapter.commit(tx.item, tx.worker)
-            self._finish_dialogue(tx)
-            tx.compile_start_ns = self.now
-            tx.compile_finish_ns = self.now + tx.item.compile_ns
-            self.worker_compile_ns[tx.worker] += tx.item.compile_ns
-            self.worker_input_wait[tx.worker] -= 1
-            self.worker_compiling[tx.worker] += 1
-            self._event("compile-start", tx)
-            heapq.heappush(self.compile_heap, (tx.compile_finish_ns, tx.sequence, tx))
+    def _start_compile(self, tx: Transaction) -> None:
+        if tx.input_ready or tx.compile_start_ns is not None:
+            raise RuntimeError("transaction input became ready twice")
+        tx.input_ready = True
+        tx.transfer_done_ns = self.now
+        self.worker_input_wait[tx.worker] -= 1
+        self._event("input-ready", tx)
+        if tx.compiler_slot is not None:
+            self._begin_compile(tx)
             return
-        phase = tx.phases[tx.phase_index]
+        self.worker_ready_input[tx.worker] += 1
+        self.ready_compiler_queues[tx.worker].append(tx)
+        self._event("compiler-queued", tx)
+        self._start_ready_compiles(tx.worker)
+
+    def _release_staging_slot(self, tx: Transaction) -> None:
+        if tx.staging_slot is None or tx.staging_released:
+            raise RuntimeError("transaction input-staging slot released twice")
+        self.staging_slots[tx.worker].release(tx.staging_slot)
+        tx.staging_released = True
+
+    def _begin_compile(self, tx: Transaction) -> None:
+        if tx.compile_start_ns is not None or tx.compiler_slot is None:
+            raise RuntimeError("transaction has no available compiler slot")
+        self._release_staging_slot(tx)
+        tx.compile_start_ns = self.now
+        tx.compile_finish_ns = self.now + tx.item.compile_ns
+        self.worker_compile_ns[tx.worker] += tx.item.compile_ns
+        self.worker_compiling[tx.worker] += 1
+        self._event("compile-start", tx)
+        heapq.heappush(self.compile_heap, (tx.compile_finish_ns, tx.sequence, tx))
+
+    def _start_ready_compiles(self, worker: int) -> None:
+        queue = self.ready_compiler_queues[worker]
+        while queue and self.compiler_slots[worker]:
+            tx = queue.popleft()
+            self.worker_ready_input[worker] -= 1
+            tx.compiler_slot = self.compiler_slots[worker].acquire()
+            self._begin_compile(tx)
+
+    def _complete_transaction(self, tx: Transaction) -> None:
+        if not tx.compile_completed or not tx.transaction_committed:
+            raise RuntimeError("transaction completed before compile and commit joined")
+        if not tx.staging_released or not tx.compiler_slot_released:
+            raise RuntimeError("transaction completed while an F resource remained reserved")
+        if tx.complete_ns is not None:
+            raise RuntimeError("transaction completed twice")
+        tx.complete_ns = self.now
+        self._event("transaction-complete", tx)
+        self.worker_reserved_ns[tx.worker] += self.now - tx.dispatch_ns
+        self.completed += 1
+        self.env_active[tx.item.environment] -= 1
+        self.env_completed[tx.item.environment] += 1
+        self.worker_completed[tx.worker] += 1
+        key = (tx.item.workload, tx.item.build)
+        self.build_remaining[key] -= 1
+        if self.build_remaining[key] == 0:
+            config = self.scenario.workload_config[tx.item.workload]
+            next_build = tx.item.build + 1
+            if config["build_release"][
+                "mode"
+            ] == "after-previous" and next_build < int(config["builds"]):
+                gap_ns = int(config["build_release"].get("gap_ns", 0))
+                self._enqueue_build(
+                    tx.item.workload,
+                    next_build,
+                    ceil_fraction(self.now) + gap_ns,
+                )
+
+    def _commit_transaction(self, tx: Transaction) -> None:
+        if tx.transaction_committed:
+            raise RuntimeError("transaction committed twice")
+        self.adapter.commit(tx.item, tx.worker)
+        tx.transaction_committed = True
+        tx.transaction_commit_ns = self.now
+        self._event("transaction-commit", tx)
+        self._finish_dialogue(tx)
+        if tx.compile_completed:
+            self.worker_commit_wait[tx.worker] -= 1
+            self._complete_transaction(tx)
+
+    def _start_flow(self, tx: Transaction, phase: Phase) -> None:
         if phase.direction == "c_to_f":
             tx.c_to_f_bytes += phase.byte_count
             self.worker_c_to_f[tx.worker] += phase.byte_count
@@ -1249,12 +1604,62 @@ class Simulator:
                 )
             else:
                 self._event("flow-finish", tx, phase, flow=flow)
-                tx.phase_index += 1
-                self._start_next_phase(tx)
+                if tx.plan is None:
+                    tx.phase_index += 1
+                    self._start_next_phase(tx)
+                else:
+                    self._dag_token(tx, f"{phase.name}:sent")
+                    self._dag_token(tx, f"{phase.name}:delivered")
             return
         self._event("flow-queued", tx, phase, flow=flow)
-        self.endpoint_queues[flow.endpoint].append(flow)
-        self._fill_endpoint_queues()
+        heapq.heappush(
+            self.endpoint_queues[flow.endpoint],
+            (phase.priority, flow.sequence, flow),
+        )
+
+    def _release_dag_nodes(self, tx: Transaction) -> None:
+        if tx.plan is None:
+            raise RuntimeError("DAG release requested for a linear transaction")
+        for node in tx.plan.nodes:
+            if node.name in tx.dag_started or not set(node.dependencies) <= tx.dag_tokens:
+                continue
+            tx.dag_started.add(node.name)
+            self._event(
+                "dag-node-ready",
+                tx,
+                Phase(node.name, node.direction, node.byte_count, node.priority),
+            )
+            self._start_flow(
+                tx,
+                Phase(node.name, node.direction, node.byte_count, node.priority),
+            )
+
+    def _check_dag_joins(self, tx: Transaction) -> None:
+        if tx.plan is None:
+            raise RuntimeError("DAG join requested for a linear transaction")
+        if not tx.input_ready and set(tx.plan.input_ready_after) <= tx.dag_tokens:
+            self._start_compile(tx)
+        if (
+            not tx.transaction_committed
+            and set(tx.plan.commit_after) <= tx.dag_tokens
+        ):
+            self._commit_transaction(tx)
+
+    def _dag_token(self, tx: Transaction, token: str) -> None:
+        if token in tx.dag_tokens:
+            raise RuntimeError(f"transaction DAG produced token {token!r} twice")
+        tx.dag_tokens.add(token)
+        self._event("dag-token", tx, phase=None, detail=token)
+        self._release_dag_nodes(tx)
+        self._check_dag_joins(tx)
+
+    def _start_next_phase(self, tx: Transaction) -> None:
+        if tx.phase_index == len(tx.phases):
+            self._commit_transaction(tx)
+            self._start_compile(tx)
+            return
+        phase = tx.phases[tx.phase_index]
+        self._start_flow(tx, phase)
 
     def _endpoint_lanes(self, endpoint: tuple[str, int, int]) -> int:
         return int(self.network[endpoint[0]]["lanes_per_endpoint"])
@@ -1266,21 +1671,34 @@ class Simulator:
         for endpoint in sorted(self.endpoint_queues):
             queue = self.endpoint_queues[endpoint]
             while queue and active_count[endpoint] < self._endpoint_lanes(endpoint):
-                flow = queue.popleft()
-                flow.start_ns = self.now
+                _, _, flow = heapq.heappop(queue)
+                event = "flow-start" if flow.start_ns is None else "flow-resume"
+                if flow.start_ns is None:
+                    flow.start_ns = self.now
+                quantum_bytes = self.network[endpoint[0]].get("writer_quantum_bytes")
+                flow.quantum_remaining_bits = min(
+                    flow.remaining_bits,
+                    Fraction(
+                        flow.remaining_bits
+                        if quantum_bytes is None
+                        else int(quantum_bytes) * 8
+                    ),
+                )
                 self.active_flows[flow.sequence] = flow
                 active_count[endpoint] += 1
                 self._event(
-                    "flow-start", flow.transaction, flow.phase, flow=flow
+                    event, flow.transaction, flow.phase, flow=flow
                 )
 
     def _flow_rates(self) -> dict[int, Fraction]:
         """Return max-min fair bits/ns under every configured network capacity."""
         if not self.active_flows:
             return {}
-        capacities: dict[tuple[object, ...], Fraction] = {
-            ("fabric",): Fraction(int(self.network["shared_fabric_bps"]), NANOSECONDS)
-        }
+        capacities: dict[tuple[object, ...], Fraction] = {}
+        if "shared_fabric_bps" in self.network:
+            capacities[("fabric", "common")] = Fraction(
+                int(self.network["shared_fabric_bps"]), NANOSECONDS
+            )
         resources: dict[int, tuple[tuple[object, ...], ...]] = {}
         for sequence, flow in self.active_flows.items():
             direction, environment, worker = flow.endpoint
@@ -1292,8 +1710,17 @@ class Simulator:
                     NANOSECONDS,
                 ),
             )
-            flow_resources: list[tuple[object, ...]] = [("fabric",), route]
+            flow_resources: list[tuple[object, ...]] = [route]
+            if "shared_fabric_bps" in self.network:
+                flow_resources.append(("fabric", "common"))
             link = self.network[direction]
+            if "fabric_bits_per_second" in link:
+                direction_fabric = ("fabric", direction)
+                capacities.setdefault(
+                    direction_fabric,
+                    Fraction(int(link["fabric_bits_per_second"]), NANOSECONDS),
+                )
+                flow_resources.append(direction_fabric)
             if "per_environment_bits_per_second" in link:
                 environment_resource = ("environment", direction, environment)
                 capacities.setdefault(
@@ -1351,7 +1778,13 @@ class Simulator:
         if not rates:
             return None
         return self.now + min(
-            flow.remaining_bits / rates[sequence]
+            min(
+                flow.remaining_bits,
+                flow.quantum_remaining_bits
+                if flow.quantum_remaining_bits is not None
+                else flow.remaining_bits,
+            )
+            / rates[sequence]
             for sequence, flow in self.active_flows.items()
         )
 
@@ -1369,9 +1802,15 @@ class Simulator:
             rates = self._flow_rates()
             self.timeline.accumulate(self, elapsed, rates)
             for sequence, flow in self.active_flows.items():
-                flow.remaining_bits -= rates[sequence] * elapsed
+                transmitted = rates[sequence] * elapsed
+                flow.remaining_bits -= transmitted
+                if flow.quantum_remaining_bits is None:
+                    raise RuntimeError("active flow has no writer quantum")
+                flow.quantum_remaining_bits -= transmitted
                 if flow.remaining_bits < 0:
                     raise RuntimeError("network flow overran its completion point")
+                if flow.quantum_remaining_bits < 0:
+                    raise RuntimeError("network flow overran its writer quantum")
             self.now += elapsed
             self.timeline.mark_or_emit_boundary(self, external=self.now == target)
 
@@ -1379,20 +1818,34 @@ class Simulator:
         finished = [
             flow for flow in self.active_flows.values() if flow.remaining_bits == 0
         ]
-        if not finished:
+        yielded = [
+            flow
+            for flow in self.active_flows.values()
+            if flow.remaining_bits > 0 and flow.quantum_remaining_bits == 0
+        ]
+        if not finished and not yielded:
             return
-        for flow in sorted(finished, key=lambda value: value.sequence):
+        for flow in sorted((*finished, *yielded), key=lambda value: value.sequence):
             del self.active_flows[flow.sequence]
         for flow in sorted(finished, key=lambda value: value.sequence):
             self._event(
                 "flow-sent", flow.transaction, flow.phase, flow=flow
             )
+            if flow.transaction.plan is not None:
+                self._dag_token(
+                    flow.transaction, f"{flow.phase.name}:sent"
+                )
             latency = int(self.network[flow.phase.direction]["one_way_latency_ns"])
             heapq.heappush(
                 self.delivery_heap,
                 (self.now + latency, flow.sequence, flow),
             )
-        self._fill_endpoint_queues()
+        for flow in sorted(yielded, key=lambda value: value.sequence):
+            self._event("flow-yield", flow.transaction, flow.phase, flow=flow)
+            heapq.heappush(
+                self.endpoint_queues[flow.endpoint],
+                (flow.phase.priority, flow.sequence, flow),
+            )
 
     def _finish_deliveries(self) -> None:
         while self.delivery_heap and self.delivery_heap[0][0] <= self.now:
@@ -1400,34 +1853,33 @@ class Simulator:
             self._event(
                 "flow-finish", flow.transaction, flow.phase, flow=flow
             )
-            flow.transaction.phase_index += 1
-            self._start_next_phase(flow.transaction)
+            if flow.transaction.plan is None:
+                flow.transaction.phase_index += 1
+                self._start_next_phase(flow.transaction)
+            else:
+                self._dag_token(
+                    flow.transaction, f"{flow.phase.name}:delivered"
+                )
 
     def _finish_compiles(self) -> None:
+        refill_workers: set[int] = set()
         while self.compile_heap and self.compile_heap[0][0] <= self.now:
             _, _, tx = heapq.heappop(self.compile_heap)
             self._event("compile-finish", tx)
             self.worker_compiling[tx.worker] -= 1
-            self.free_slots[tx.worker].release(tx.slot)
-            self.worker_reserved_ns[tx.worker] += self.now - tx.dispatch_ns
-            self.completed += 1
-            self.env_active[tx.item.environment] -= 1
-            self.env_completed[tx.item.environment] += 1
-            self.worker_completed[tx.worker] += 1
-            key = (tx.item.workload, tx.item.build)
-            self.build_remaining[key] -= 1
-            if self.build_remaining[key] == 0:
-                config = self.scenario.workload_config[tx.item.workload]
-                next_build = tx.item.build + 1
-                if config["build_release"][
-                    "mode"
-                ] == "after-previous" and next_build < int(config["builds"]):
-                    gap_ns = int(config["build_release"].get("gap_ns", 0))
-                    self._enqueue_build(
-                        tx.item.workload,
-                        next_build,
-                        ceil_fraction(self.now) + gap_ns,
-                    )
+            if tx.compiler_slot is None or tx.compiler_slot_released:
+                raise RuntimeError("compiler finished without an owned compiler slot")
+            self.compiler_slots[tx.worker].release(tx.compiler_slot)
+            tx.compiler_slot_released = True
+            refill_workers.add(tx.worker)
+            tx.compile_completed = True
+            if tx.transaction_committed:
+                self._complete_transaction(tx)
+            else:
+                self.worker_commit_wait[tx.worker] += 1
+                self._event("compile-await-commit", tx)
+        for worker in sorted(refill_workers):
+            self._start_ready_compiles(worker)
 
     def _next_time(self) -> Fraction:
         candidates: list[Fraction] = []
@@ -1522,10 +1974,18 @@ class Simulator:
                     "worker": worker,
                     "slots": self.slots_per_f,
                     "free_slots": self.slots_per_f
-                    - len(self.free_slots[worker].in_use),
-                    "reserved_slots": len(self.free_slots[worker].in_use),
+                    - len(self.compiler_slots[worker].in_use),
+                    "reserved_slots": len(self.compiler_slots[worker].in_use),
+                    "input_staging_slots": self.input_staging_slots_per_f,
+                    "free_input_staging_slots": self.input_staging_slots_per_f
+                    - len(self.staging_slots[worker].in_use),
+                    "occupied_input_staging_slots": len(
+                        self.staging_slots[worker].in_use
+                    ),
                     "input_wait_slots": self.worker_input_wait[worker],
+                    "ready_input_slots": self.worker_ready_input[worker],
                     "compiling_slots": self.worker_compiling[worker],
+                    "commit_wait_slots": self.worker_commit_wait[worker],
                     "dispatched_tus": self.worker_dispatched[worker],
                     "completed_tus": self.worker_completed[worker],
                     "active_flows": sum(
@@ -1582,6 +2042,9 @@ class Simulator:
             "release_heap": len(self.release_heap),
             "ready_heap": len(self.ready_heap),
             "ready_environment_cycle": len(self.ready_environment_cycle),
+            "ready_compiler_queues": sum(
+                len(queue) for queue in self.ready_compiler_queues.values()
+            ),
             "active_flows": len(self.active_flows),
             "queued_flows": sum(len(queue) for queue in self.endpoint_queues.values()),
             "deliveries": len(self.delivery_heap),
@@ -1594,9 +2057,14 @@ class Simulator:
             "environment_ready": sum(self.env_ready),
             "environment_active": sum(self.env_active),
             "worker_input_wait": sum(self.worker_input_wait),
+            "worker_ready_input": sum(self.worker_ready_input),
             "worker_compiling": sum(self.worker_compiling),
-            "reserved_slots": sum(
-                len(pool.in_use) for pool in self.free_slots.values()
+            "worker_commit_wait": sum(self.worker_commit_wait),
+            "reserved_compiler_slots": sum(
+                len(pool.in_use) for pool in self.compiler_slots.values()
+            ),
+            "reserved_staging_slots": sum(
+                len(pool.in_use) for pool in self.staging_slots.values()
             ),
         }
         nonzero = {name: value for name, value in failures.items() if value}
@@ -1615,6 +2083,7 @@ class Simulator:
             self._finish_compiles()
             self._release_ready()
             self._dispatch()
+            self._fill_endpoint_queues()
             self.timeline.flush_due(self)
             if self.completed == self.total_items:
                 break
@@ -1633,6 +2102,8 @@ class Simulator:
                 tx.transfer_done_ns is None
                 or tx.compile_start_ns is None
                 or tx.compile_finish_ns is None
+                or tx.transaction_commit_ns is None
+                or tx.complete_ns is None
             ):
                 raise RuntimeError("completed simulation has an unfinished transaction")
             assignments.append(
@@ -1644,11 +2115,17 @@ class Simulator:
                     "logical": tx.item.logical,
                     "worker": tx.worker,
                     "slot": tx.slot,
+                    "staging_slot": tx.staging_slot,
+                    "compiler_slot": tx.compiler_slot,
                     "release_ns": tx.item.release_ns,
                     "dispatch_ns": ceil_fraction(tx.dispatch_ns),
                     "transfer_done_ns": ceil_fraction(tx.transfer_done_ns),
                     "compile_start_ns": ceil_fraction(tx.compile_start_ns),
                     "compile_finish_ns": ceil_fraction(tx.compile_finish_ns),
+                    "transaction_commit_ns": ceil_fraction(
+                        tx.transaction_commit_ns
+                    ),
+                    "complete_ns": ceil_fraction(tx.complete_ns),
                     "raw_bytes": tx.item.raw_bytes,
                     "compile_ns": tx.item.compile_ns,
                     "c_to_f_bytes": tx.c_to_f_bytes,
@@ -1698,8 +2175,16 @@ class Simulator:
                 ceil_fraction(tx.transfer_done_ns)  # type: ignore[arg-type]
                 for tx in transactions
             )
-            finish_ns = max(
+            last_compile_finish_ns = max(
                 ceil_fraction(tx.compile_finish_ns)  # type: ignore[arg-type]
+                for tx in transactions
+            )
+            last_transaction_commit_ns = max(
+                ceil_fraction(tx.transaction_commit_ns)  # type: ignore[arg-type]
+                for tx in transactions
+            )
+            finish_ns = max(
+                ceil_fraction(tx.complete_ns)  # type: ignore[arg-type]
                 for tx in transactions
             )
             prior_finish_ns = previous_finish.get(workload)
@@ -1713,6 +2198,8 @@ class Simulator:
                     "release_ns": release_ns,
                     "first_dispatch_ns": first_dispatch_ns,
                     "last_transfer_done_ns": last_transfer_done_ns,
+                    "last_compile_finish_ns": last_compile_finish_ns,
+                    "last_transaction_commit_ns": last_transaction_commit_ns,
                     "finish_ns": finish_ns,
                     "elapsed_from_release_ns": finish_ns - release_ns,
                     "gap_from_previous_finish_ns": (
@@ -1736,8 +2223,16 @@ class Simulator:
             first_dispatch_ns = min(
                 ceil_fraction(tx.dispatch_ns) for tx in transactions
             )
-            stop_ns = max(
+            last_compile_finish_ns = max(
                 ceil_fraction(tx.compile_finish_ns)  # type: ignore[arg-type]
+                for tx in transactions
+            )
+            last_transaction_commit_ns = max(
+                ceil_fraction(tx.transaction_commit_ns)  # type: ignore[arg-type]
+                for tx in transactions
+            )
+            stop_ns = max(
+                ceil_fraction(tx.complete_ns)  # type: ignore[arg-type]
                 for tx in transactions
             )
             generations.append(
@@ -1749,6 +2244,8 @@ class Simulator:
                     "jobs": len(transactions),
                     "start_ns": start_ns,
                     "first_dispatch_ns": first_dispatch_ns,
+                    "last_compile_finish_ns": last_compile_finish_ns,
+                    "last_transaction_commit_ns": last_transaction_commit_ns,
                     "stop_ns": stop_ns,
                     "duration_ns": stop_ns - start_ns,
                     "raw_bytes": sum(tx.item.raw_bytes for tx in transactions),
@@ -1779,6 +2276,12 @@ class Simulator:
             "warm_builds": sum(row["temperature"] == "warm" for row in builds),
             "workers": self.f_count,
             "slots_per_worker": self.slots_per_f,
+            "input_staging_slots_per_worker": self.input_staging_slots_per_f,
+            "compiler_slot_assignment": (
+                "at input readiness"
+                if self.decoupled_staging
+                else "reserved with scheduler assignment"
+            ),
             "total_worker_slots": self.f_count * self.slots_per_f,
             "raw_bytes": sum(
                 item.raw_bytes
@@ -1810,10 +2313,11 @@ class Simulator:
             "timeline_state_coverage": {
                 "modelled": [
                     "TU release and scheduler-ready queues",
-                    "C-to-F placement and F-slot reservation",
-                    "ordered dialogue phase serialization and propagation",
-                    "per-route, per-C, per-F, and shared-fabric max-min allocation",
-                    "F input-wait and compiler occupancy",
+                    "C-to-F placement and independent F input-staging/compiler pools",
+                    "fork/join dialogue release, serialization, and propagation",
+                    "writer priority with bounded serialization quanta",
+                    "per-route, per-C, per-F, common-fabric, and directional-fabric max-min allocation",
+                    "F input-wait, ready-input, compiler, and commit-wait occupancy",
                     "build barriers and workload release gaps",
                     "exact C-to-F and F-to-C byte events",
                 ],
@@ -1890,7 +2394,12 @@ def topology_label(document: dict[str, object]) -> str:
     environment_bps = c_to_f.get("per_environment_bits_per_second")
     if environment_bps is not None:
         capacity = f"B{bandwidth_label(int(environment_bps))}"
-        fabric_bps = int(network["shared_fabric_bps"])
+        fabric_value = network.get(
+            "shared_fabric_bps", c_to_f.get("fabric_bits_per_second")
+        )
+        if fabric_value is None:
+            raise ValueError("topology has no C-to-F fabric capacity")
+        fabric_bps = int(fabric_value)
         fabric = (
             f"X{bandwidth_label(fabric_bps)}"
             if fabric_bps < int(environment_bps) * environments
@@ -1898,7 +2407,12 @@ def topology_label(document: dict[str, object]) -> str:
         )
     else:
         capacity = f"R{bandwidth_label(int(c_to_f['bits_per_second']))}"
-        fabric = f"X{bandwidth_label(int(network['shared_fabric_bps']))}"
+        fabric_value = network.get(
+            "shared_fabric_bps", c_to_f.get("fabric_bits_per_second")
+        )
+        if fabric_value is None:
+            raise ValueError("topology has no C-to-F fabric capacity")
+        fabric = f"X{bandwidth_label(int(fabric_value))}"
     return f"C{environments}F{workers}_{slots}{capacity}{fabric}"
 
 
@@ -1907,7 +2421,14 @@ def experiment_records(
 ) -> tuple[dict[str, object], list[dict[str, object]], dict[str, object]]:
     """Build one deterministic, self-describing JSONL experiment stream."""
     resolved = resolved_scenario_document(scenario)
-    allocation_resources = ["shared fabric", "direction/environment/F route"]
+    allocation_resources = ["direction/environment/F route"]
+    if "shared_fabric_bps" in resolved["network"]:
+        allocation_resources.append("optional common fabric")
+    if any(
+        "fabric_bits_per_second" in resolved["network"][direction]
+        for direction in DIRECTIONS
+    ):
+        allocation_resources.append("per-direction fabric")
     if any(
         "per_environment_bits_per_second" in resolved["network"][direction]
         for direction in DIRECTIONS
@@ -1933,6 +2454,9 @@ def experiment_records(
             "c_egress_groups": result.summary["environments"],
             "f_stores": result.summary["workers"],
             "compiler_slots_per_f": result.summary["slots_per_worker"],
+            "input_staging_slots_per_f": result.summary[
+                "input_staging_slots_per_worker"
+            ],
         },
         "codec_adapter": result.summary["codec_adapter"],
         "physical_codec_result": result.summary["physical_codec_result"],
@@ -1991,7 +2515,10 @@ def experiment_records(
     event_index = 0
     timeline: list[dict[str, object]] = []
     for source_record in result.timeline:
-        record = json.loads(json.dumps(source_record))
+        # The nested state and metrics are immutable after Simulator.run().  A shallow
+        # row copy is sufficient for attaching events and avoids duplicating the full
+        # active-time state stream in memory while writing large experiments.
+        record = dict(source_record)
         cutoff = int(record["wall_end_ns"])
         attached = []
         while event_index < len(events) and int(events[event_index]["time_ns"]) <= cutoff:
@@ -2103,7 +2630,7 @@ h1{font-size:24px;margin:0 0 4px}h2{font-size:17px;margin:0 0 12px}.sub{color:va
 <div class="controls"><label>F <select id="worker"></select></label><label>Snapshot <input id="cursor" type="range" min="0" step="1"></label><span id="cursorLabel"></span></div>
 <div class="grid">
  <section class="panel wide"><h2>Network serialization rate</h2><canvas id="bandwidth"></canvas><div class="legend"><span class="dot" style="background:var(--cf)"></span>all C→F <span class="dot" style="background:var(--fc)"></span>all F→C <span class="dot" style="background:var(--sel)"></span>selected F C→F</div></section>
- <section class="panel"><h2>Selected F slot occupancy</h2><canvas id="slots"></canvas><div class="legend"><span class="dot" style="background:var(--cf)"></span>compiling <span class="dot" style="background:var(--sel)"></span>waiting for input <span class="dot" style="background:var(--fc)"></span>reserved</div></section>
+ <section class="panel"><h2>Selected F pipeline occupancy</h2><canvas id="slots"></canvas><div class="legend"><span class="dot" style="background:var(--cf)"></span>compiling <span class="dot" style="background:var(--sel)"></span>waiting for input <span class="dot" style="background:var(--fc)"></span>ready input <span class="dot" style="background:var(--queue)"></span>waiting for commit <span class="dot" style="background:#ef6f6c"></span>staging occupied</div></section>
  <section class="panel"><h2>Scheduler state</h2><canvas id="queue"></canvas><div class="legend"><span class="dot" style="background:var(--queue)"></span>ready <span class="dot" style="background:var(--sel)"></span>active <span class="dot" style="background:var(--cf)"></span>completed</div></section>
  <section class="panel wide"><h2>C→F rate by F</h2><canvas class="heat" id="heatmap"></canvas><div class="legend">Rows are Fs; brighter cells carry more interval-average C→F traffic.</div></section>
  <section class="panel"><h2>Compressed idle gaps</h2><div id="gaps"></div></section>
@@ -2122,11 +2649,11 @@ $('cards').innerHTML=cards.map(x=>'<div class="card"><div class="v">'+x[1]+'</di
 for(let w=0;w<SUM.workers;w++)$('worker').add(new Option('F'+(w+1),w));
 $('cursor').max=Math.max(0,S.length-1);$('cursor').value=0;
 function rate(row,dir,worker=null){return row.metrics.routes.filter(r=>r.direction===dir&&(worker===null||r.worker===worker)).reduce((a,r)=>a+r.average_bps,0)}
-function workerMetric(row,w){return row.metrics.workers.find(x=>x.worker===w)||{average_compiling_slots:0,average_input_wait_slots:0,average_reserved_slots:0}}
+function workerMetric(row,w){return row.metrics.workers.find(x=>x.worker===w)||{average_compiling_slots:0,average_input_wait_slots:0,average_ready_input_slots:0,average_commit_wait_slots:0,average_staging_slots:0}}
 function fit(c,h=250){const d=devicePixelRatio||1,w=Math.max(320,c.clientWidth);c.width=w*d;c.height=h*d;c.style.height=h+'px';const x=c.getContext('2d');x.setTransform(d,0,0,d,0,0);return{x,w,h}}
 function axes(ctx,w,h,max,label){ctx.strokeStyle='#263451';ctx.fillStyle='#94a3b8';ctx.font='11px system-ui';ctx.beginPath();for(let i=0;i<=4;i++){let y=12+(h-32)*i/4;ctx.moveTo(45,y);ctx.lineTo(w-8,y);ctx.fillText(label(max*(1-i/4)),4,y+3)}ctx.stroke()}
 function lineChart(id,series,colors,label){const c=$(id),{x,w,h}=fit(c);const vals=series.flat();const max=Math.max(1,...vals);axes(x,w,h,max,label);for(let k=0;k<series.length;k++){x.strokeStyle=colors[k];x.lineWidth=1.7;x.beginPath();series[k].forEach((v,i)=>{const px=45+(w-53)*(series[k].length===1?0:i/(series[k].length-1)),py=12+(h-32)*(1-v/max);i?x.lineTo(px,py):x.moveTo(px,py)});x.stroke()}}
-function draw(){const w=+$('worker').value;lineChart('bandwidth',[S.map(r=>rate(r,'c_to_f')),S.map(r=>rate(r,'f_to_c')),S.map(r=>rate(r,'c_to_f',w))],['#39d98a','#6ea8fe','#ffbe55'],fmtRate);lineChart('slots',[S.map(r=>workerMetric(r,w).average_compiling_slots),S.map(r=>workerMetric(r,w).average_input_wait_slots),S.map(r=>workerMetric(r,w).average_reserved_slots)],['#39d98a','#ffbe55','#6ea8fe'],x=>fmtN(x));lineChart('queue',[S.map(r=>r.state.scheduler.ready_tus),S.map(r=>r.state.scheduler.active_tus),S.map(r=>r.state.scheduler.completed_tus)],['#d58cff','#ffbe55','#39d98a'],x=>fmtN(x));drawHeat();showDetail()}
+function draw(){const w=+$('worker').value;lineChart('bandwidth',[S.map(r=>rate(r,'c_to_f')),S.map(r=>rate(r,'f_to_c')),S.map(r=>rate(r,'c_to_f',w))],['#39d98a','#6ea8fe','#ffbe55'],fmtRate);lineChart('slots',[S.map(r=>workerMetric(r,w).average_compiling_slots),S.map(r=>workerMetric(r,w).average_input_wait_slots),S.map(r=>workerMetric(r,w).average_ready_input_slots),S.map(r=>workerMetric(r,w).average_commit_wait_slots),S.map(r=>workerMetric(r,w).average_staging_slots)],['#39d98a','#ffbe55','#6ea8fe','#d58cff','#ef6f6c'],x=>fmtN(x));lineChart('queue',[S.map(r=>r.state.scheduler.ready_tus),S.map(r=>r.state.scheduler.active_tus),S.map(r=>r.state.scheduler.completed_tus)],['#d58cff','#ffbe55','#39d98a'],x=>fmtN(x));drawHeat();showDetail()}
 function drawHeat(){const c=$('heatmap'),rowH=Math.max(7,Math.min(16,600/SUM.workers)),h=24+rowH*SUM.workers,{x,w}=fit(c,h),plotW=Math.max(1,Math.floor(w-55)),bins=Array.from({length:SUM.workers},()=>new Float64Array(plotW));let max=1;S.forEach((r,i)=>{const px=Math.min(plotW-1,Math.floor(i*plotW/Math.max(1,S.length)));for(const q of r.metrics.routes)if(q.direction==='c_to_f'){bins[q.worker][px]=Math.max(bins[q.worker][px],q.average_bps);max=Math.max(max,q.average_bps)}});x.font='10px system-ui';for(let f=0;f<SUM.workers;f++){let y=10+f*rowH;x.fillStyle='#94a3b8';x.fillText('F'+(f+1),4,y+rowH-2);for(let px=0;px<plotW;px++){let z=bins[f][px]/max;x.fillStyle='rgba(57,217,138,'+(0.04+0.96*Math.sqrt(z))+')';x.fillRect(48+px,y,1,Math.max(1,rowH-1))}}}
 function showDetail(){if(!S.length){$('detail').textContent='No active snapshots';return}const i=+$('cursor').value,r=S[i],w=+$('worker').value,f=r.state.f.find(x=>x.worker===w);$('cursorLabel').textContent=(i+1)+' / '+S.length+' · active '+fmtT(r.active_end_ns)+' · wall '+fmtT(r.wall_end_ns);$('detail').textContent=JSON.stringify({interval:{wall_start_ns:r.wall_start_ns,wall_end_ns:r.wall_end_ns,active_start_ns:r.active_start_ns,active_end_ns:r.active_end_ns},scheduler:r.state.scheduler,selected_f:f,selected_f_metrics:workerMetric(r,w),selected_f_routes:r.metrics.routes.filter(x=>x.worker===w),events:r.events},null,2)}
 $('worker').onchange=draw;$('cursor').oninput=showDetail;window.onresize=draw;

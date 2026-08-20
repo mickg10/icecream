@@ -347,8 +347,16 @@ def build_ledger(
                         "name": "grz-current-tu-frame",
                         "direction": "c_to_f",
                         "bytes": byte_count,
+                        "priority": 4,
+                        "depends_on": [],
                     }
                 ],
+                "initial_tokens": ["attachment:accepted"],
+                "input_ready_after": [
+                    "attachment:accepted",
+                    "grz-current-tu-frame:delivered",
+                ],
+                "commit_after": ["grz-current-tu-frame:delivered"],
                 "state_after": {
                     "route_commits": route_sequence + 1,
                     "cumulative_c_to_f_bytes": cumulative,

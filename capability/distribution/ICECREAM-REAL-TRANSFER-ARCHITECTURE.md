@@ -1595,8 +1595,25 @@ selected `(C,F)` route. Codec CPU time and automatic fallback timing are not yet
 report must state that boundary.
 
 The physical-ledger adapter, active-time JSONL trace, and self-contained HTML report now share the
-same event engine. The next simulator component remains one live stateful cache-channel adapter,
-not another simulator:
+same event engine. That engine now executes a per-TU fork/join graph rather than forcing a phase
+list to be stop-and-wait. A dependency may wait for an extent to be serialized or delivered;
+input readiness and transaction commit are distinct joins; F input staging and compiler slots are
+distinct resources; the two fabric directions can be capped separately; and priority traffic can
+take the next bounded writer quantum. The physical P29 projection therefore executes:
+
+```text
+Root sent ------> LINES ----------------------+--> close delivered --> input ready
+Root delivered -> Need delivered -> Fill -----+
+close delivered -> Ack delivered -------------------------------> state commit
+attachment accepted --------------------------+------------------> input ready
+```
+
+Compilation and the final acknowledgement can overlap. A transaction and its build complete only
+after compiler completion and state commit have both occurred. The current physical GRZ projection
+is a one-node current-TU graph on each independent route.
+
+The next simulator component remains one live stateful cache-channel adapter, not another
+simulator:
 
 1. shared C-uplink, per-F-ingress, per-route, and optional fabric limits applied simultaneously;
 2. C preparation/EOF and a byte-bounded prepared queue;
@@ -1607,7 +1624,7 @@ not another simulator:
 7. Fill delivery that installs definitions and wakes every dependent TU;
 8. job-reference arrival independent of cache-data arrival;
 9. compilation start only when attachment and cache readiness both exist;
-10. relationship-channel frame priority without one-TU serialization;
+10. a wider relationship dialogue window with explicit state-consistent route lanes;
 11. `legacy`/`auto`/`cache` selection and whole-attempt fallback accounting;
 12. exact C-to-F frame bytes, separate reverse bytes/time, CPU stages, and peak buffers.
 

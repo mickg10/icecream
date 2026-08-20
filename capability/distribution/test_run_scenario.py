@@ -237,6 +237,53 @@ class SimulatorTest(unittest.TestCase):
                 1.0,
             )
 
+    def test_directional_fabrics_allow_full_duplex_flows(self) -> None:
+        class FullDuplex(sim.CodecAdapter):
+            name = "full-duplex-test"
+
+            def begin(self, item: sim.WorkItem, worker: int):
+                raise AssertionError("DAG adapter must not enter the linear path")
+
+            def transaction_plan(
+                self, item: sim.WorkItem, worker: int
+            ) -> sim.TransactionPlan | None:
+                del item, worker
+                return sim.TransactionPlan(
+                    (
+                        sim.DagNode("forward", "c_to_f", 100),
+                        sim.DagNode("return", "f_to_c", 100),
+                    ),
+                    ("attachment:accepted",),
+                    (
+                        "attachment:accepted",
+                        "forward:delivered",
+                        "return:delivered",
+                    ),
+                    ("forward:delivered", "return:delivered"),
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_fixture(root, [1], [1], workers=1)
+            document = json.loads(path.read_text())
+            del document["network"]["shared_fabric_bps"]
+            document["network"]["c_to_f"]["fabric_bits_per_second"] = 800
+            document["network"]["f_to_c"]["fabric_bits_per_second"] = 800
+            path.write_text(json.dumps(document))
+            result = sim.Simulator(sim.load_scenario(path), FullDuplex()).run()
+            self.assertEqual(result.summary["makespan_ns"], 1_000_000_001)
+            sample = next(row for row in result.timeline if row["record"] == "snapshot")
+            self.assertIsNone(sample["metrics"]["fabric_capacity_bps"])
+            self.assertIsNone(sample["metrics"]["fabric_utilization"])
+            self.assertEqual(
+                [row["average_bps"] for row in sample["metrics"]["direction_fabrics"]],
+                [800.0, 800.0],
+            )
+            self.assertEqual(
+                [row["utilization"] for row in sample["metrics"]["direction_fabrics"]],
+                [1.0, 1.0],
+            )
+
     def test_after_previous_build_is_a_completion_barrier(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -275,6 +322,31 @@ class SimulatorTest(unittest.TestCase):
             self.assertEqual(result.summary["summed_generation_ns"], 4)
             self.assertEqual(simulator.free_slots[0].next_unused, 3)
             self.assertEqual(simulator.free_slots[0].in_use, set())
+
+    def test_input_staging_admits_work_without_reserving_compiler_slots(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_fixture(root, [10, 1, 1], [1, 1, 1], workers=1)
+            document = json.loads(path.read_text())
+            document["workers"]["template"]["input_staging_slots"] = 2
+            path.write_text(json.dumps(document))
+            result = sim.Simulator(
+                sim.load_scenario(path), sim.CompileOnlyAdapter()
+            ).run()
+            self.assertEqual(
+                [row["dispatch_ns"] for row in result.assignments], [0, 0, 0]
+            )
+            self.assertEqual(
+                [row["compile_start_ns"] for row in result.assignments], [0, 10, 11]
+            )
+            self.assertEqual(
+                [row["compiler_slot"] for row in result.assignments], [0, 0, 0]
+            )
+            self.assertEqual(result.summary["makespan_ns"], 12)
+            self.assertEqual(result.summary["input_staging_slots_per_worker"], 2)
+            self.assertEqual(
+                result.summary["compiler_slot_assignment"], "at input readiness"
+            )
 
     def test_environments_advance_builds_independently_and_fairly(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -337,6 +409,104 @@ class SimulatorTest(unittest.TestCase):
             # Three serial one-second phases, three one-way delays, then 1 ns compile.
             self.assertEqual(result.summary["makespan_ns"], 3_000_000_031)
 
+    def test_dag_need_overlaps_lines_and_fill_preempts_at_writer_quantum(self) -> None:
+        class ForkJoin(sim.CodecAdapter):
+            name = "fork-join-test"
+
+            def begin(self, item: sim.WorkItem, worker: int):
+                raise AssertionError("DAG adapter must not enter the linear path")
+
+            def transaction_plan(
+                self, item: sim.WorkItem, worker: int
+            ) -> sim.TransactionPlan | None:
+                del worker
+                if item.logical == 0:
+                    return sim.TransactionPlan(
+                        (
+                            sim.DagNode("dict", "c_to_f", 100, (), 3),
+                            sim.DagNode(
+                                "need", "f_to_c", 100, ("dict:delivered",), 1
+                            ),
+                            sim.DagNode(
+                                "fill", "c_to_f", 100, ("need:delivered",), 2
+                            ),
+                        ),
+                        ("attachment:accepted",),
+                        ("attachment:accepted", "fill:delivered"),
+                        ("fill:delivered",),
+                    )
+                return sim.TransactionPlan(
+                    (sim.DagNode("lines", "c_to_f", 1_000, (), 4),),
+                    ("attachment:accepted",),
+                    ("attachment:accepted", "lines:delivered"),
+                    ("lines:delivered",),
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_fixture(root, [1, 1], [1, 1], workers=1)
+            document = json.loads(path.read_text())
+            document["workers"]["template"]["slots"] = 2
+            document["network"]["shared_fabric_bps"] = 1_600
+            document["network"]["c_to_f"]["writer_quantum_bytes"] = 100
+            document["network"]["f_to_c"]["writer_quantum_bytes"] = 100
+            path.write_text(json.dumps(document))
+            result = sim.Simulator(
+                sim.load_scenario(path),
+                ForkJoin(),
+                snapshot_interval_ns=1_000_000_000,
+            ).run()
+            self.assertEqual(result.assignments[0]["transfer_done_ns"], 3_000_000_000)
+            self.assertEqual(result.assignments[1]["transfer_done_ns"], 12_000_000_000)
+            fill_start = next(
+                row
+                for row in result.events
+                if row["event"] == "flow-start" and row["phase"] == "fill"
+            )
+            lines_resume = [
+                row
+                for row in result.events
+                if row["event"] == "flow-resume" and row["phase"] == "lines"
+            ]
+            self.assertEqual(fill_start["time_ns"], 2_000_000_000)
+            self.assertEqual(lines_resume[0]["time_ns"], 3_000_000_000)
+            self.assertEqual(result.summary["c_to_f_bytes"], 1_200)
+            self.assertEqual(result.summary["f_to_c_bytes"], 100)
+
+    def test_build_finishes_at_compile_and_transaction_join(self) -> None:
+        class LateCommit(sim.CodecAdapter):
+            name = "late-commit-test"
+
+            def begin(self, item: sim.WorkItem, worker: int):
+                raise AssertionError("DAG adapter must not enter the linear path")
+
+            def transaction_plan(
+                self, item: sim.WorkItem, worker: int
+            ) -> sim.TransactionPlan | None:
+                del item, worker
+                return sim.TransactionPlan(
+                    (sim.DagNode("ack-path", "c_to_f", 100),),
+                    ("attachment:accepted",),
+                    ("attachment:accepted",),
+                    ("ack-path:delivered",),
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_fixture(root, [1], [1], workers=1)
+            result = sim.Simulator(sim.load_scenario(path), LateCommit()).run()
+            assignment = result.assignments[0]
+            self.assertEqual(assignment["compile_finish_ns"], 1)
+            self.assertEqual(assignment["transaction_commit_ns"], 1_000_000_000)
+            self.assertEqual(assignment["complete_ns"], 1_000_000_000)
+            self.assertEqual(result.builds[0]["last_compile_finish_ns"], 1)
+            self.assertEqual(
+                result.builds[0]["last_transaction_commit_ns"], 1_000_000_000
+            )
+            self.assertEqual(result.builds[0]["finish_ns"], 1_000_000_000)
+            self.assertEqual(result.generations[0]["stop_ns"], 1_000_000_000)
+            self.assertEqual(result.summary["makespan_ns"], 1_000_000_000)
+
     def test_timeline_uses_ten_ms_active_samples_and_compresses_idle_gap(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -377,6 +547,7 @@ class SimulatorTest(unittest.TestCase):
                     "c_egress_groups": 1,
                     "f_stores": 1,
                     "compiler_slots_per_f": 1,
+                    "input_staging_slots_per_f": 1,
                 },
             )
             self.assertEqual(rows[-1]["record"], "summary")

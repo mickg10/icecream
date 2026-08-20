@@ -138,12 +138,20 @@ def summed(frames: list[Frame], kinds: set[int]) -> int:
 def phase_rows(c_frames: list[Frame], f_frames: list[Frame]) -> list[dict[str, object]]:
     """Map typed frames onto their causal transaction order without changing a byte."""
     initial_types = {1, 2, 4}
+    lines_types = {8, 9, 10, 11, 12, 13, 20, 21, 22, 23}
+    definition_types = {5, 6, 7}
     close_types = {0xFE, 0xFF}
     c_fallback_types = {31}
     f_need_types = {3}
     f_fallback_types = {30}
     f_ack_types = {0xFD, 0xFE, 0xFF}
-    classified_c = initial_types | close_types | c_fallback_types
+    classified_c = (
+        initial_types
+        | lines_types
+        | definition_types
+        | close_types
+        | c_fallback_types
+    )
     classified_f = f_need_types | f_fallback_types | f_ack_types
     phases: list[dict[str, object]] = []
 
@@ -153,15 +161,15 @@ def phase_rows(c_frames: list[Frame], f_frames: list[Frame]) -> list[dict[str, o
 
     add("p29-root", "c_to_f", summed(c_frames, initial_types))
     add("p29-need", "f_to_c", summed(f_frames, f_need_types))
-    add(
-        "p29-fill",
-        "c_to_f",
-        sum(frame.bytes for frame in c_frames if frame.kind not in classified_c),
-    )
+    add("p29-lines", "c_to_f", summed(c_frames, lines_types))
+    add("p29-fill", "c_to_f", summed(c_frames, definition_types))
     add("p29-fallback-request", "f_to_c", summed(f_frames, f_fallback_types))
     add("p29-fallback-reply", "c_to_f", summed(c_frames, c_fallback_types))
     add("p29-close", "c_to_f", summed(c_frames, close_types))
     add("p29-ack", "f_to_c", summed(f_frames, f_ack_types))
+    unknown_c = [frame.kind for frame in c_frames if frame.kind not in classified_c]
+    if unknown_c:
+        raise ValueError(f"unclassified C-to-F frame types: {unknown_c}")
     unknown_f = [frame.kind for frame in f_frames if frame.kind not in classified_f]
     if unknown_f:
         raise ValueError(f"unclassified F-to-C frame types: {unknown_f}")
@@ -174,6 +182,70 @@ def phase_rows(c_frames: list[Frame], f_frames: list[Frame]) -> list[dict[str, o
     ):
         raise AssertionError("F-to-C phase split does not tile its physical frame slice")
     return phases
+
+
+def transaction_graph(phases: list[dict[str, object]]) -> dict[str, object]:
+    """Project exact P29 frames onto the Protocol-50 fork/join dialogue."""
+    names = {str(phase["name"]) for phase in phases}
+    dependencies: dict[str, list[str]] = {}
+    priorities = {
+        "p29-root": 3,
+        "p29-need": 1,
+        "p29-lines": 4,
+        "p29-fill": 2,
+        "p29-fallback-request": 1,
+        "p29-fallback-reply": 2,
+        "p29-close": 0,
+        "p29-ack": 0,
+    }
+    if "p29-root" not in names or "p29-close" not in names:
+        raise ValueError("P29 transaction lacks Root or close frames")
+    dependencies["p29-root"] = []
+    if "p29-need" in names:
+        dependencies["p29-need"] = ["p29-root:delivered"]
+    if "p29-lines" in names:
+        dependencies["p29-lines"] = ["p29-root:sent"]
+    if "p29-fill" in names:
+        dependencies["p29-fill"] = [
+            "p29-need:delivered" if "p29-need" in names else "p29-root:delivered"
+        ]
+    material = [
+        f"{name}:delivered"
+        for name in ("p29-lines", "p29-fill")
+        if name in names
+    ]
+    if "p29-need" in names:
+        material.append("p29-need:delivered")
+    if "p29-fallback-request" in names:
+        dependencies["p29-fallback-request"] = material or ["p29-root:delivered"]
+    if "p29-fallback-reply" in names:
+        if "p29-fallback-request" not in names:
+            raise ValueError("P29 fallback reply has no request")
+        dependencies["p29-fallback-reply"] = [
+            "p29-fallback-request:delivered"
+        ]
+        material.append("p29-fallback-reply:delivered")
+    dependencies["p29-close"] = material or ["p29-root:delivered"]
+    if "p29-ack" in names:
+        dependencies["p29-ack"] = ["p29-close:delivered"]
+    graph_phases = []
+    for phase in phases:
+        name = str(phase["name"])
+        graph_phases.append(
+            {
+                **phase,
+                "priority": priorities[name],
+                "depends_on": dependencies[name],
+            }
+        )
+    return {
+        "phases": graph_phases,
+        "initial_tokens": ["attachment:accepted"],
+        "input_ready_after": ["attachment:accepted", "p29-close:delivered"],
+        "commit_after": [
+            "p29-ack:delivered" if "p29-ack" in names else "p29-close:delivered"
+        ],
+    }
 
 
 def checked_run(command: list[str], stdout_path: Path, stderr_path: Path) -> None:
@@ -287,6 +359,7 @@ def build_ledger(
         c_frames = parse_frames(c_data, c_prior, c_end, f"C-to-F TU {expected_tu}")
         f_frames = parse_frames(f_data, f_prior, f_end, f"F-to-C TU {expected_tu}")
         phases = phase_rows(c_frames, f_frames)
+        graph = transaction_graph(phases)
         c_delta, f_delta = c_end - c_prior, f_end - f_prior
         if int(selector_row["actual_delta"]) != c_delta:
             raise RuntimeError(f"selector C-to-F bytes differ at TU {expected_tu}")
@@ -315,7 +388,10 @@ def build_ledger(
                 "route_sequence": route_sequence,
                 "raw_bytes": item.raw_bytes,
                 "raw_sha256": raw_digest,
-                "phases": phases,
+                "phases": graph["phases"],
+                "initial_tokens": graph["initial_tokens"],
+                "input_ready_after": graph["input_ready_after"],
+                "commit_after": graph["commit_after"],
                 "frame_bytes": dict(sorted(frame_types.items())),
                 "state_after": {
                     "route_commits": route_sequence + 1,

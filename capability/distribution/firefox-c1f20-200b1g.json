@@ -24,6 +24,7 @@
     "f_count": 20,
     "template": {
       "slots": 200,
+      "input_staging_slots": 400,
       "compile_profile": "firefox-compile-v1-size-linear",
       "initial_cache": "cold"
     }
@@ -33,6 +34,7 @@
       "bits_per_second": 10000000000,
       "per_environment_bits_per_second": 1000000000,
       "per_worker_bits_per_second": 10000000000,
+      "writer_quantum_bytes": 102400,
       "one_way_latency_ns": 250000,
       "lanes_per_endpoint": 1
     },
@@ -40,6 +42,7 @@
       "bits_per_second": 10000000000,
       "per_environment_bits_per_second": 1000000000,
       "per_worker_bits_per_second": 10000000000,
+      "writer_quantum_bytes": 102400,
       "one_way_latency_ns": 250000,
       "lanes_per_endpoint": 1
     },

@@ -116,6 +116,7 @@
           "required": ["slots", "compile_profile", "initial_cache"],
           "properties": {
             "slots": { "type": "integer", "minimum": 1 },
+            "input_staging_slots": { "type": "integer", "minimum": 1 },
             "compile_profile": { "type": "string", "minLength": 1 },
             "initial_cache": { "enum": ["cold", "retained"] }
           }
@@ -125,12 +126,21 @@
     "network": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["c_to_f", "f_to_c", "shared_fabric_bps"],
+      "required": ["c_to_f", "f_to_c"],
       "properties": {
         "c_to_f": { "$ref": "#/$defs/link" },
         "f_to_c": { "$ref": "#/$defs/link" },
         "shared_fabric_bps": { "type": "integer", "minimum": 1 }
-      }
+      },
+      "anyOf": [
+        { "required": ["shared_fabric_bps"] },
+        {
+          "properties": {
+            "c_to_f": { "required": ["fabric_bits_per_second"] },
+            "f_to_c": { "required": ["fabric_bits_per_second"] }
+          }
+        }
+      ]
     },
     "scheduler": {
       "type": "object",
@@ -178,6 +188,8 @@
         "bits_per_second": { "type": "integer", "minimum": 1 },
         "per_environment_bits_per_second": { "type": "integer", "minimum": 1 },
         "per_worker_bits_per_second": { "type": "integer", "minimum": 1 },
+        "fabric_bits_per_second": { "type": "integer", "minimum": 1 },
+        "writer_quantum_bytes": { "type": "integer", "minimum": 1 },
         "one_way_latency_ns": { "type": "integer", "minimum": 0 },
         "lanes_per_endpoint": { "type": "integer", "minimum": 1 }
       }
