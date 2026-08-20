@@ -178,6 +178,7 @@ class SimulationResult:
     events: list[dict[str, object]]
     workers: list[dict[str, object]]
     builds: list[dict[str, object]]
+    generations: list[dict[str, object]]
 
 
 class SparseSlotPool:
@@ -936,6 +937,38 @@ class Simulator:
                 }
             )
             previous_finish[workload] = finish_ns
+        transactions_by_generation: dict[int, list[Transaction]] = defaultdict(list)
+        for tx in self.transactions:
+            transactions_by_generation[tx.item.build].append(tx)
+        generations = []
+        for generation in sorted(transactions_by_generation):
+            transactions = transactions_by_generation[generation]
+            start_ns = min(int(tx.item.release_ns) for tx in transactions)
+            first_dispatch_ns = min(
+                ceil_fraction(tx.dispatch_ns) for tx in transactions
+            )
+            stop_ns = max(
+                ceil_fraction(tx.compile_finish_ns)  # type: ignore[arg-type]
+                for tx in transactions
+            )
+            generations.append(
+                {
+                    "generation": generation,
+                    "temperature": "cold" if generation == 0 else "warm",
+                    "environments": len({tx.item.environment for tx in transactions}),
+                    "workloads": len({tx.item.workload for tx in transactions}),
+                    "jobs": len(transactions),
+                    "start_ns": start_ns,
+                    "first_dispatch_ns": first_dispatch_ns,
+                    "stop_ns": stop_ns,
+                    "duration_ns": stop_ns - start_ns,
+                    "raw_bytes": sum(tx.item.raw_bytes for tx in transactions),
+                    "c_to_f_bytes": sum(tx.c_to_f_bytes for tx in transactions),
+                    "f_to_c_bytes": sum(tx.f_to_c_bytes for tx in transactions),
+                    "compiler_work_ns": sum(tx.item.compile_ns for tx in transactions),
+                }
+            )
+        summed_generation_ns = sum(row["duration_ns"] for row in generations)
         c_to_f = sum(tx.c_to_f_bytes for tx in self.transactions)
         f_to_c = sum(tx.f_to_c_bytes for tx in self.transactions)
         summary = {
@@ -966,13 +999,18 @@ class Simulator:
             "scored_outgoing_bytes": c_to_f,
             "makespan_ns": makespan_ns,
             "makespan_seconds": makespan_ns / NANOSECONDS,
+            "summed_generation_ns": summed_generation_ns,
+            "summed_generation_seconds": summed_generation_ns / NANOSECONDS,
+            "wall_minus_summed_generation_ns": makespan_ns - summed_generation_ns,
             "compiler_work_ns": sum(
                 item.compile_ns
                 for items in self.scenario.work_items.values()
                 for item in items
             ),
         }
-        return SimulationResult(summary, assignments, self.events, workers, builds)
+        return SimulationResult(
+            summary, assignments, self.events, workers, builds, generations
+        )
 
 
 def write_tsv(path: Path, rows: Iterable[dict[str, object]]) -> None:
@@ -1016,6 +1054,7 @@ def write_result(
     write_tsv(output_directory / "events.tsv", result.events)
     write_tsv(output_directory / "workers.tsv", result.workers)
     write_tsv(output_directory / "builds.tsv", result.builds)
+    write_tsv(output_directory / "generations.tsv", result.generations)
 
 
 def main() -> int:

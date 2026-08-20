@@ -126,6 +126,8 @@ class SimulatorTest(unittest.TestCase):
                 [row["dispatch_ns"] for row in result.assignments], [0, 605]
             )
             self.assertEqual(result.summary["makespan_ns"], 610)
+            self.assertEqual(result.summary["summed_generation_ns"], 10)
+            self.assertEqual(result.summary["wall_minus_summed_generation_ns"], 600)
             self.assertEqual(
                 [row["gap_from_previous_finish_ns"] for row in result.builds],
                 ["", 600],
@@ -142,6 +144,7 @@ class SimulatorTest(unittest.TestCase):
             result = simulator.run()
             self.assertEqual([row["slot"] for row in result.assignments], [0, 1, 2])
             self.assertEqual(result.summary["total_worker_slots"], 1_000_000)
+            self.assertEqual(result.summary["summed_generation_ns"], 4)
             self.assertEqual(simulator.free_slots[0].next_unused, 3)
             self.assertEqual(simulator.free_slots[0].in_use, set())
 
@@ -173,6 +176,8 @@ class SimulatorTest(unittest.TestCase):
             )
             self.assertEqual(result.summary["cold_builds"], 2)
             self.assertEqual(result.summary["warm_builds"], 2)
+            self.assertEqual(result.summary["summed_generation_ns"], 10)
+            self.assertEqual([row["duration_ns"] for row in result.generations], [5, 5])
             self.assertEqual(
                 [row["gap_from_previous_finish_ns"] for row in result.builds],
                 ["", 600, "", 600],

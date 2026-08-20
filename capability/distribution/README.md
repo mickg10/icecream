@@ -4,6 +4,10 @@ One scenario document owns the workload, C/F topology, timing, network and sched
 GRZ and P29 are codec adapters beneath that common experiment; they do not own separate
 scheduler simulations.
 
+[`ICECREAM-REAL-TRANSFER-ARCHITECTURE.md`](ICECREAM-REAL-TRANSFER-ARCHITECTURE.md)
+maps the simulator onto the actual C client, C/F daemons, persistent stores, per-job TCP
+connections, A/Need/Fill dialogue, and compiler stdin pipe.
+
 The initial scenario is `firefox-1c-20f.json`: one C, one corrected Firefox build,
 twenty one-slot Fs, 1 Gbit/s per direction and a 10 Gbit/s shared fabric.  All TUs are
 released at time zero for the first comparison.  A measured C-preprocessor release trace
@@ -100,29 +104,43 @@ will use the same simulator instance for all five builds; it must key C state by
 `environment` and F relationship state by `(environment, worker)`.
 
 Every run writes `resolved-scenario.json`, `summary.json`, `assignments.tsv`, `events.tsv`,
-`workers.tsv`, and `builds.tsv`.  The suite additionally writes deterministic `matrix.tsv`,
-`builds.tsv`, and `suite-summary.json`; host runner timings are deliberately kept separate
-in `runner-timings.tsv`.
+`workers.tsv`, `builds.tsv`, and `generations.tsv`.  The suite additionally writes
+deterministic `matrix.tsv`, `builds.tsv`, `generations.tsv`, and `suite-summary.json`; host
+runner timings are deliberately kept separate in `runner-timings.tsv`.
 
-The first full replay produced:
+The primary elapsed-time score removes the deliberate idle time between builds.  For build
+generation `g`, take the earliest release across the participating Cs and the latest compile
+completion across those Cs, then sum those five intervals:
 
-| topology | compile-only makespan | raw makespan | raw C-to-F bytes |
-|---|---:|---:|---:|
-| 1C / 1F / 1,000,000 slots | 2,516.383 s | 3,084.792 s | 76,204,381,990 |
-| 1C / 20F / 50 slots | 2,522.896 s | 2,554.908 s | 76,204,381,990 |
-| 1C / 50F / 50 slots | 2,516.383 s | 2,556.821 s | 76,204,381,990 |
-| 10C / 50F / 60 slots | 2,634.893 s | 3,084.550 s | 762,043,819,900 |
+```text
+summed_generation_time = sum_g(max_g(compile_finish) - min_g(release))
+```
 
-These makespans include four 600-second inter-build gaps.  Across both controls there are
-130 per-C build rows: 26 cold and 104 warm.  Every noninitial row has an observed
-600,000,000,000 ns completion-to-release gap.
+This preserves overlap between concurrent Cs inside each generation, but does not charge the
+four configured 600-second gaps.  The wall makespan is retained as a secondary scheduling
+check.
+
+The corrected full replay produced:
+
+| topology | compile-only generation sum | raw generation sum | wall makespan (compile / raw) | raw C-to-F bytes |
+|---|---:|---:|---:|---:|
+| 1C / 1F / 1,000,000 slots | 116.383 s | 684.792 s | 2,516.383 / 3,084.792 s | 76,204,381,990 |
+| 1C / 20F / 50 slots | 122.896 s | 154.908 s | 2,522.896 / 2,554.908 s | 76,204,381,990 |
+| 1C / 50F / 50 slots | 116.383 s | 156.821 s | 2,516.383 / 2,556.821 s | 76,204,381,990 |
+| 10C / 50F / 60 slots | 234.893 s | 684.550 s | 2,634.893 / 3,084.550 s | 762,043,819,900 |
+
+Across both controls there are 130 per-C build rows: 26 cold and 104 warm.  Every noninitial
+row has an observed 600,000,000,000 ns completion-to-release gap.  Each run also has exactly
+five generation rows, and their durations sum exactly to its primary matrix value.
 
 The combined 33 MiB ledger is retained at
-`/tanksmall/scratch/ictmp/issue16-results/firefox-5build-topology-suite-v2/`.
-SHA-256 values for `suite-summary.json`, `matrix.tsv`, and `builds.tsv` are respectively
-`64c50672b9cdd3ddd7682f50d1948af46a73b91013ea4b671e8e90a5251279a7`,
-`1b15f27bec60e42094d1539242e7084fa36ad520da41bf165bcf3ba5c09ff169`, and
-`04c40680e5543675ed42e9b1ba19ac9806e8971e7c575c59e351af9fce999715`.
+`/tanksmall/scratch/ictmp/issue16-results/firefox-5build-topology-suite-v3/`.
+SHA-256 values for `suite-summary.json`, `matrix.tsv`, `builds.tsv`, and `generations.tsv`
+are respectively
+`397e7cddabac50fa841df7f053f6fe1788f11a62a93eebd5d98b2a35c69fe673`,
+`f2ca26e0c157079f2d8b98f1aac6a7015a242ee280c8f0ccc9a856bfd5c6908c`,
+`04c40680e5543675ed42e9b1ba19ac9806e8971e7c575c59e351af9fce999715`, and
+`5d7a9d7e6849d39f9a5677e344daafc882e3644496b9890096812a891f67792f`.
 
 ## First measured replay
 

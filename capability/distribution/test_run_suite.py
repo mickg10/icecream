@@ -134,11 +134,14 @@ class SuiteTest(unittest.TestCase):
             self.assertEqual(len(builds), 4)
             self.assertEqual({row["cold_builds"] for row in matrix}, {1})
             self.assertEqual({row["warm_builds"] for row in matrix}, {1})
+            self.assertEqual({row["summed_generation_ns"] for row in matrix}, {10})
+            self.assertEqual({row["wall_makespan_ns"] for row in matrix}, {610})
             self.assertEqual(
                 {row["gap_from_previous_finish_ns"] for row in builds}, {"", 600}
             )
             self.assertTrue((output / "matrix.tsv").is_file())
             self.assertTrue((output / "builds.tsv").is_file())
+            self.assertTrue((output / "generations.tsv").is_file())
             self.assertTrue((output / "runner-timings.tsv").is_file())
             self.assertTrue((output / "suite-summary.json").is_file())
             self.assertTrue(
@@ -146,7 +149,12 @@ class SuiteTest(unittest.TestCase):
             )
             second_output = root / "out-second"
             suite.run_suite(suite_path, second_output)
-            for relative in ("matrix.tsv", "builds.tsv", "suite-summary.json"):
+            for relative in (
+                "matrix.tsv",
+                "builds.tsv",
+                "generations.tsv",
+                "suite-summary.json",
+            ):
                 self.assertEqual(
                     (output / relative).read_bytes(),
                     (second_output / relative).read_bytes(),

@@ -77,6 +77,7 @@ def run_suite(
     output_directory.mkdir(parents=True, exist_ok=True)
     matrix: list[dict[str, object]] = []
     all_builds: list[dict[str, object]] = []
+    all_generations: list[dict[str, object]] = []
     runner_timings: list[dict[str, object]] = []
     suite_start = time.perf_counter()
     for scenario_path in scenario_paths:
@@ -125,8 +126,12 @@ def run_suite(
                 "raw_bytes": result.summary["raw_bytes"],
                 "c_to_f_bytes": result.summary["c_to_f_bytes"],
                 "f_to_c_bytes": result.summary["f_to_c_bytes"],
-                "makespan_ns": result.summary["makespan_ns"],
-                "makespan_seconds": result.summary["makespan_seconds"],
+                "summed_generation_ns": result.summary["summed_generation_ns"],
+                "summed_generation_seconds": result.summary[
+                    "summed_generation_seconds"
+                ],
+                "wall_makespan_ns": result.summary["makespan_ns"],
+                "wall_makespan_seconds": result.summary["makespan_seconds"],
             }
             matrix.append(row)
             runner_timings.append(
@@ -140,11 +145,20 @@ def run_suite(
                 all_builds.append(
                     {"scenario": result.summary["scenario"], "codec": codec, **build}
                 )
+            for generation in result.generations:
+                all_generations.append(
+                    {
+                        "scenario": result.summary["scenario"],
+                        "codec": codec,
+                        **generation,
+                    }
+                )
             print(
                 f"PASS {scenario.document['name']} codec={codec} "
                 f"jobs={result.summary['jobs']} "
-                f"makespan_s={result.summary['makespan_seconds']:.9f} "
-                f"wall_s={wall_seconds:.3f}",
+                f"generation_sum_s={result.summary['summed_generation_seconds']:.9f} "
+                f"wall_makespan_s={result.summary['makespan_seconds']:.9f} "
+                f"runner_s={wall_seconds:.3f}",
                 flush=True,
             )
             del result
@@ -152,6 +166,7 @@ def run_suite(
 
     sim.write_tsv(output_directory / "matrix.tsv", matrix)
     sim.write_tsv(output_directory / "builds.tsv", all_builds)
+    sim.write_tsv(output_directory / "generations.tsv", all_generations)
     sim.write_tsv(output_directory / "runner-timings.tsv", runner_timings)
     suite_summary = {
         "schema": "icecream-distribution-suite-result-v1",
@@ -167,7 +182,7 @@ def run_suite(
         json.dumps(suite_summary, indent=2) + "\n"
     )
     print(
-        f"SUITE PASS runs={len(matrix)} wall_s={time.perf_counter() - suite_start:.3f}",
+        f"SUITE PASS runs={len(matrix)} runner_s={time.perf_counter() - suite_start:.3f}",
         flush=True,
     )
     return matrix, all_builds
