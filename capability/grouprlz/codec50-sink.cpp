@@ -25,6 +25,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <limits>
+#include <memory>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -1108,7 +1112,7 @@ static constexpr std::array<const char*,8> componentRawNames={
 };
 
 int main(int argc,char**argv){
-    const char* manifest=nullptr;const char*residualDumpPath=nullptr;const char*mixedDumpPrefix=nullptr;const char*curveTsvPath=nullptr;const char*literalGroupPrefix=nullptr;const char*literalGroupWirePath=nullptr;const char*cfSinkPath=nullptr;const char*fcSinkPath=nullptr;const char*sinkCurvePath=nullptr; size_t sinkBuildTus=0; bool sinkReplay=false,literalOnDemand=false,selftestTags=false,selftestBadRoot=false,liveSelector=false,transactionalTu=false; size_t transactionSelftestTu=SIZE_MAX; size_t routeCount=0; const char*selectorTsvPath=nullptr; size_t max_files=SIZE_MAX,entropyRestartTus=0,replayRepetitions=1,literalGroupTus=0,literalGroupWorkers=1; int zlevel=3,literalZLevel=-1,arrayZLevel=-1,blobZLevel=-1,halfColdBit=-1,blobCanonicalLevel=9; uint32_t sourceAdmitRatio=6,blobThreads=4,blobZstdWorkers=0,blobZstdJobMiB=0,blobZstdOverlapLog=0,blobFallbackEvery=0,s1MinMatch=3,s1MaxChain=1024; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, usePriorRoot=false,useSortedLines=false,useByteArrayLines=false,useMixedRegions=false,useProjectSource=false,useKeyMap=false,useDirectOrdinals=false,useCompressedBlobs=false,useBlobEagerPatches=true,useMoFactor=false,traceMo=false,useAlphaLines=false,useResidualLdm=false,splitControlCeiling=false,structureCeiling=false,literalGroupEvaluateZstd10=true,stableRootTags=false,openFinalEntropy=false;
+    const char* manifest=nullptr;const char*residualDumpPath=nullptr;const char*mixedDumpPrefix=nullptr;const char*curveTsvPath=nullptr;const char*literalGroupPrefix=nullptr;const char*literalGroupWirePath=nullptr;const char*cfSinkPath=nullptr;const char*fcSinkPath=nullptr;const char*sinkCurvePath=nullptr;const char*routeMapPath=nullptr; size_t sinkBuildTus=0; bool sinkReplay=false,literalOnDemand=false,selftestTags=false,selftestBadRoot=false,liveSelector=false,transactionalTu=false; size_t transactionSelftestTu=SIZE_MAX; size_t routeCount=0,materializeRoute=SIZE_MAX; const char*selectorTsvPath=nullptr; size_t max_files=SIZE_MAX,entropyRestartTus=0,replayRepetitions=1,literalGroupTus=0,literalGroupWorkers=1; int zlevel=3,literalZLevel=-1,arrayZLevel=-1,blobZLevel=-1,halfColdBit=-1,blobCanonicalLevel=9; uint32_t sourceAdmitRatio=6,blobThreads=4,blobZstdWorkers=0,blobZstdJobMiB=0,blobZstdOverlapLog=0,blobFallbackEvery=0,s1MinMatch=3,s1MaxChain=1024; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, usePriorRoot=false,useSortedLines=false,useByteArrayLines=false,useMixedRegions=false,useProjectSource=false,useKeyMap=false,useDirectOrdinals=false,useCompressedBlobs=false,useBlobEagerPatches=true,useMoFactor=false,traceMo=false,useAlphaLines=false,useResidualLdm=false,splitControlCeiling=false,structureCeiling=false,literalGroupEvaluateZstd10=true,stableRootTags=false,openFinalEntropy=false;
     const char*blobDumpPath=nullptr;const char*componentCurveTsvPath=nullptr;
     for(int i=1;i<argc;++i){ if(!strcmp(argv[i],"--manifest")&&i+1<argc)manifest=argv[++i];
         else if(!strcmp(argv[i],"--z")&&i+1<argc)zlevel=atoi(argv[++i]);
@@ -1141,14 +1145,10 @@ int main(int argc,char**argv){
         else if(!strcmp(argv[i],"--sink-replay"))sinkReplay=true;
         else if(!strcmp(argv[i],"--literal-ondemand"))literalOnDemand=true;
         else if(!strcmp(argv[i],"--route-s1")&&i+1<argc){char*e=nullptr;unsigned long long v=strtoull(argv[++i],&e,10);
-            if(!e||*e||!v){fprintf(stderr,"bad route count\n");return 2;}
-            // Only the 1F slice exists.  A second route mints canonical Block ids this route
-            // never receives, and F installs Blocks by dense arrival order (id+1 must equal
-            // Fblk_off.size()), so the gap breaks the NEXT Block's install -- measured as
-            // "bad direct Block identity" at W>=4.  Multi-route needs the catalogue
-            // materializer and a canonical-id-keyed F store; refuse rather than pretend.
-            if(v!=1){fprintf(stderr,"--route-s1 %llu: multi-route is not yet materialized; only 1 is supported\n",v);return 2;}
+            if(!e||*e||!v||v>4096){fprintf(stderr,"bad route count\n");return 2;}
             routeCount=size_t(v);}
+        else if(!strcmp(argv[i],"--route-map")&&i+1<argc)routeMapPath=argv[++i];
+        else if(!strcmp(argv[i],"--materialize-route")&&i+1<argc){char*e=nullptr;unsigned long long v=strtoull(argv[++i],&e,10);if(!e||*e||v>SIZE_MAX){fprintf(stderr,"bad materialized route\n");return 2;}materializeRoute=size_t(v);}
         else if(!strcmp(argv[i],"--selector-tsv")&&i+1<argc)selectorTsvPath=argv[++i];
         else if(!strcmp(argv[i],"--live-selector"))liveSelector=true;
         else if(!strcmp(argv[i],"--transactional-tu"))transactionalTu=true;
@@ -1218,7 +1218,7 @@ int main(int argc,char**argv){
         printf("selftest-tags: %s\n",bad?"FAIL":"PASS");
         return bad?1:0;
     }
-    if(!manifest){ fprintf(stderr,"usage: %s --manifest F [--z LEVEL] [--literal-z 1..9] [--array-z 1..9] [--blob-z 1..9] [--no-d1] [--d2] [--prior-root] [--structure-ceiling] [--s1-min-match N] [--s1-max-chain N] [--sorted-lines|--byte-array-lines|--mixed-regions [--alpha-lines|--residual-ldm] [--residual-dump PATH] [--mixed-dump-prefix PATH] [--literal-group-prefix PREFIX --literal-group-tus N [--literal-group-workers N] [--literal-group-skip-zstd10] [--literal-group-wire PATH]] [--split-control-ceiling] [--compressed-blobs [--mo-factor [--mo-trace]] [--blob-threads N] [--blob-zstd-workers N --blob-zstd-job-mib N --blob-zstd-overlap-log N] [--blob-fallback-every N] [--blob-lazy-fallback] [--blob-canonical-level 1..9] [--blob-dump PATH]] [--key-map|--direct-ordinals|--half-cold-bit 0|1] [--source-package [--source-admit-ratio N]]] [--max-files N] [--replay-repetitions N] [--entropy-restart-tus N] [--stable-root-tags] [--open-final-entropy] [--cf-sink F --fc-sink F [--transactional-tu [--selftest-transaction-reject-once TU]]] [--curve-tsv PATH] [--component-curve-tsv PATH]\n",argv[0]); return 2; }
+    if(!manifest){ fprintf(stderr,"usage: %s --manifest F [--z LEVEL] [--literal-z 1..9] [--array-z 1..9] [--blob-z 1..9] [--no-d1] [--d2] [--prior-root] [--structure-ceiling] [--s1-min-match N] [--s1-max-chain N] [--sorted-lines|--byte-array-lines|--mixed-regions [--alpha-lines|--residual-ldm] [--residual-dump PATH] [--mixed-dump-prefix PATH] [--literal-group-prefix PREFIX --literal-group-tus N [--literal-group-workers N] [--literal-group-skip-zstd10] [--literal-group-wire PATH]] [--split-control-ceiling] [--compressed-blobs [--mo-factor [--mo-trace]] [--blob-threads N] [--blob-zstd-workers N --blob-zstd-job-mib N --blob-zstd-overlap-log N] [--blob-fallback-every N] [--blob-lazy-fallback] [--blob-canonical-level 1..9] [--blob-dump PATH]] [--key-map|--direct-ordinals|--half-cold-bit 0|1] [--source-package [--source-admit-ratio N]]] [--max-files N] [--replay-repetitions N] [--entropy-restart-tus N] [--stable-root-tags] [--open-final-entropy] [--route-s1 N [--route-map F --materialize-route R]] [--cf-sink F --fc-sink F [--transactional-tu [--selftest-transaction-reject-once TU]]] [--curve-tsv PATH] [--component-curve-tsv PATH]\n",argv[0]); return 2; }
     if(useProjectSource&&!useMixedRegions){fprintf(stderr,"--source-package requires --mixed-regions\n");return 2;}
     if(useKeyMap&&!useMixedRegions){fprintf(stderr,"--key-map and --half-cold-bit require --mixed-regions\n");return 2;}
     if(useCompressedBlobs&&(!useMixedRegions||!useByteArrayLines)){fprintf(stderr,"--compressed-blobs requires --mixed-regions --byte-array-lines\n");return 2;}
@@ -1252,9 +1252,13 @@ int main(int argc,char**argv){
     if(liveSelector&&usePriorRoot){fprintf(stderr,"--live-selector is incompatible with the prior-Root path\n");return 2;}
     // "Live selection" with no selected-route matcher would be the wrong mode wearing the
     // right name: the transaction that Acks the choice belongs to the route.
-    if(liveSelector&&routeCount!=1){fprintf(stderr,"--live-selector requires --route-s1 1: the selection is Acked by the selected route's transaction\n");return 2;}
+    const bool mappedRoutes=routeMapPath!=nullptr||materializeRoute!=SIZE_MAX;
+    if((routeMapPath==nullptr)!=(materializeRoute==SIZE_MAX)){fprintf(stderr,"--route-map and --materialize-route must be supplied together\n");return 2;}
+    if(mappedRoutes&&(!routeCount||materializeRoute>=routeCount)){fprintf(stderr,"mapped materialization requires --route-s1 N and a target below N\n");return 2;}
+    if(routeCount>1&&!mappedRoutes){fprintf(stderr,"multi-route S1 requires --route-map and --materialize-route\n");return 2;}
+    if(liveSelector&&routeCount!=1&&!mappedRoutes){fprintf(stderr,"--live-selector requires a materialized selected route\n");return 2;}
     if(transactionalTu&&(!cfSinkPath||!fcSinkPath)){fprintf(stderr,"--transactional-tu requires both physical wire sinks\n");return 2;}
-    if(transactionalTu&&(!useS1||routeCount!=1||!useMixedRegions||!useByteArrayLines||!useDirectOrdinals||
+    if(transactionalTu&&(!useS1||!routeCount||(!mappedRoutes&&routeCount!=1)||!useMixedRegions||!useByteArrayLines||!useDirectOrdinals||
                          !useCompressedBlobs||!useMoFactor||useBlobEagerPatches||!literalOnDemand||!stableRootTags)){
         fprintf(stderr,"--transactional-tu currently binds the measured S1/mixed/direct/BLOB+MO/literal-on-demand active profile\n");return 2;}
     // openFinalEntropy is deliberately allowed here: it suppresses only the final END tail
@@ -1264,6 +1268,8 @@ int main(int argc,char**argv){
         fprintf(stderr,"--transactional-tu refuses an unjournalled or cross-TU codec-history option\n");return 2;}
     if(transactionSelftestTu!=SIZE_MAX&&(selectorTsvPath||sinkReplay||sinkBuildTus)){
         fprintf(stderr,"the transaction reject/retry selftest is a focused gate, not a selector/replay/build-cost run\n");return 2;}
+    if(transactionSelftestTu!=SIZE_MAX&&mappedRoutes){fprintf(stderr,"the transaction reject/retry selftest uses the live one-route matcher\n");return 2;}
+    if(sinkBuildTus&&mappedRoutes){fprintf(stderr,"--sink-build-tus is not defined over a sparse route projection\n");return 2;}
     if(sinkBuildTus&&!cfSinkPath){fprintf(stderr,"--sink-build-tus requires --cf-sink\n");return 2;}
     if(cfSinkPath&&!fcSinkPath){fprintf(stderr,"--cf-sink requires --fc-sink: the reverse direction is reported, never dropped\n");return 2;}
     // Without S1 there are no Blocks and no route matcher, so --route-s1 would exit 0 having
@@ -1324,7 +1330,25 @@ int main(int argc,char**argv){
     if(transactionSelftestTu!=SIZE_MAX&&transactionSelftestTu>=TUs){fprintf(stderr,"transaction selftest TU %zu is outside the %zu-TU manifest\n",transactionSelftestTu,TUs);return 2;}
     if(useS1&&allreg.size()>UINT32_MAX){fprintf(stderr,"S1 logical Region occurrence space exceeds u32\n");return 2;}
     if(entropyRestartTus&&TUs%entropyRestartTus){fprintf(stderr,"TU count %zu is not a multiple of experimental entropy restart interval %zu\n",TUs,entropyRestartTus);return 2;}
+    std::vector<size_t>routeForTu;
+    std::vector<uint8_t>routeActive(TUs,mappedRoutes?0:1);
+    std::vector<uint64_t>routeOrdinal(TUs,0);
+    size_t materializedTus=TUs,lastMaterializedTu=TUs?TUs-1:0;
+    uint64_t materializedRaw=corpus.raw;
+    if(mappedRoutes){
+      std::ifstream input(routeMapPath);std::string magic;size_t declaredRoutes=0,declaredTus=0;
+      if(!(input>>magic>>declaredRoutes>>declaredTus)||magic!="p29-route-map-v1"||declaredRoutes!=routeCount||declaredTus!=TUs){
+        fprintf(stderr,"route map header differs: expected p29-route-map-v1 %zu %zu\n",routeCount,TUs);return 2;}
+      routeForTu.resize(TUs);materializedTus=0;materializedRaw=0;
+      for(size_t t=0;t<TUs;++t){
+        if(!(input>>routeForTu[t])||routeForTu[t]>=routeCount){fprintf(stderr,"bad route map entry at TU=%zu\n",t);return 2;}
+        if(routeForTu[t]==materializeRoute){routeActive[t]=1;routeOrdinal[t]=materializedTus++;materializedRaw+=corpus.files[t%physicalTUs].len;lastMaterializedTu=t;}
+      }
+      std::string trailing;if(input>>trailing){fprintf(stderr,"route map has trailing data\n");return 2;}
+      if(!materializedTus){fprintf(stderr,"materialized route %zu has no TUs\n",materializeRoute);return 2;}
+    }
     fprintf(stderr,"loaded+interned %.1fs TUs=%zu raw=%llu physical_tus=%zu physical_raw=%llu replay_repetitions=%zu regions=%u region_occ=%zu distinct_lines=%u\n",secs(t0),TUs,(unsigned long long)corpus.raw,physicalTUs,(unsigned long long)physicalRaw,replayRepetitions,NREG,allreg.size(),dict.distinct());
+    if(mappedRoutes)fprintf(stderr,"multi-route projection: routes=%zu target=%zu target_tus=%zu target_raw=%llu\n",routeCount,materializeRoute,materializedTus,(unsigned long long)materializedRaw);
     if(entropyRestartTus)fprintf(stderr,"experimental entropy restarts: TUs/segment=%zu segments=%zu (not a product build signal)\n",entropyRestartTus,TUs/entropyRestartTus);
     if(stableRootTags)fprintf(stderr,"stable Root tags: region=2*r block=2*k+1\n");
     if(openFinalEntropy)fprintf(stderr,"open final entropy streams: diagnostic prefix mode (no END bytes)\n");
@@ -1357,22 +1381,75 @@ int main(int argc,char**argv){
     // read the first Regions of the next TU (j+MINMATCH<=NS); the online form retains the
     // incomplete tail and installs those anchors when the next TU becomes current.
     p29::BlockCatalogue blockCatalogue;
-    std::unique_ptr<p29::OnlineS1> globalS1, routeS1;   // 1F slice: exactly one route matcher
+    std::unique_ptr<p29::OnlineS1> globalS1, routeS1;
+    std::vector<p29::TuPlan>mappedRoutePlans;
+    uint64_t mappedPlanDigestLo=1469598103934665603ULL;
+    uint64_t mappedPlanDigestHi=0x9e3779b97f4a7c15ULL;
+    auto digestPlanWord=[&](uint64_t value){
+      for(unsigned byte=0;byte<8;++byte){const uint8_t part=uint8_t(value>>(byte*8));
+        mappedPlanDigestLo=(mappedPlanDigestLo^part)*1099511628211ULL;
+        mappedPlanDigestHi=mix64(mappedPlanDigestHi^uint64_t(part));}
+    };
+    auto digestPlan=[&](uint64_t plane,uint64_t tu,uint64_t route,const p29::TuPlan&plan){
+      digestPlanWord(plane);digestPlanWord(tu);digestPlanWord(route);
+      digestPlanWord(plan.occurrence_begin);digestPlanWord(plan.occurrence_end);
+      digestPlanWord(plan.root.size());for(const p29::Ref&ref:plan.root){digestPlanWord(uint64_t(ref.kind));digestPlanWord(ref.id);}
+      digestPlanWord(plan.block_uses.size());for(const p29::BlockUse&use:plan.block_uses){
+        digestPlanWord(use.root_index);digestPlanWord(use.block_id);digestPlanWord(use.source_position);
+        digestPlanWord(use.length);digestPlanWord(use.source_precedes_current_tu?1:0);}
+    };
     if(useS1){
         size_t NS=allreg.size(); uint32_t MINMATCH=s1MinMatch, MAXCHAIN=s1MaxChain, hbits=22;
         p29::OnlineS1::Config s1cfg; s1cfg.min_match=MINMATCH; s1cfg.max_chain=MAXCHAIN; s1cfg.hash_bits=hbits;
         globalS1.reset(new p29::OnlineS1(s1cfg,blockCatalogue));
-        if(routeCount) routeS1.reset(new p29::OnlineS1(s1cfg,blockCatalogue));
-        // T_current prereq 2: NOTHING is admitted here.  Admission moved into the
-        // chronological transaction loop, so at TU t the matcher and catalogue contain only
-        // TUs 0..t -- previously the whole corpus had been admitted before TU 0 was even
-        // sent, which a live selector cannot rely on (it would query state holding later TUs).
+        if(mappedRoutes){
+          // Build the single logical C catalogue once in TU_SEQ order.  Each TU is also
+          // admitted to exactly one ordered route projection.  The target route's immutable
+          // plans are retained for the physical receiver pass below; every target invocation
+          // repeats this deterministic preparation and must publish the same digest.
+          std::vector<std::unique_ptr<p29::OnlineS1>>routes;routes.reserve(routeCount);
+          for(size_t route=0;route<routeCount;++route)routes.emplace_back(new p29::OnlineS1(s1cfg,blockCatalogue));
+          mappedRoutePlans.resize(TUs);blocksAfterTu.resize(TUs);
+          for(size_t t=0;t<TUs;++t){
+            const std::vector<uint32_t>regions(allreg.begin()+roff[t],allreg.begin()+roff[t+1]);
+            const p29::TuPlan globalPlan=globalS1->admit(regions);
+            digestPlan(0,t,routeForTu[t],globalPlan);
+            const p29::TuPlan routePlan=routes[routeForTu[t]]->admit(regions);
+            digestPlan(1,t,routeForTu[t],routePlan);
+            if(routeActive[t])mappedRoutePlans[t]=routePlan;
+            if(blockCatalogue.size()>kTagIdLimit){fprintf(stderr,"multi-route Block space exceeds typed tag range at TU=%zu\n",t);return 2;}
+            blocksAfterTu[t]=uint32_t(blockCatalogue.size());
+          }
+          // The serializer addresses canonical Blocks by id.  Materialize that shared table
+          // densely once; receiver stores remain sparse and independent.
+          bchild.clear();boff2.clear();boff2.push_back(0);
+          bcopy_src.assign(blockCatalogue.size(),0);bcopy_ok.assign(blockCatalogue.size(),0);
+          digestPlanWord(blockCatalogue.size());
+          for(uint32_t block=0;block<blockCatalogue.size();++block){
+            const std::vector<uint32_t>&children=blockCatalogue.block(block).regions;
+            digestPlanWord(block);digestPlanWord(children.size());
+            for(uint32_t child:children){bchild.push_back(child);digestPlanWord(child);}
+            boff2.push_back(bchild.size());
+          }
+          mappedPlanDigestLo=mix64(mappedPlanDigestLo^TUs^blockCatalogue.size());
+          mappedPlanDigestHi=mix64(mappedPlanDigestHi^mappedPlanDigestLo^routeCount);
+          printf("MULTIROUTE_PLAN routes=%zu target=%zu active_tus=%zu blocks=%zu digest=%016llx%016llx\n",
+              routeCount,materializeRoute,materializedTus,blockCatalogue.size(),
+              (unsigned long long)mappedPlanDigestHi,(unsigned long long)mappedPlanDigestLo);
+          globalS1.reset();
+        }else{
+          if(routeCount) routeS1.reset(new p29::OnlineS1(s1cfg,blockCatalogue));
+          // T_current prereq 2: NOTHING is admitted here.  Admission moved into the
+          // chronological transaction loop, so at TU t the matcher and catalogue contain only
+          // TUs 0..t -- previously the whole corpus had been admitted before TU 0 was even
+          // sent, which a live selector cannot rely on (it would query state holding later TUs).
+          blocksAfterTu.assign(TUs,0);   // filled live, one TU at a time, in the loop
+        }
         (void)NS; s1Ready=true;
     } else { // V1: root = raw region-id sequence
         for(size_t t=0;t<TUs;++t){ for(size_t i=roff[t];i<roff[t+1];++i) tokstream.push_back(region_tag(allreg[i])); tokoff.push_back(tokstream.size()); }
         blocksAfterTu.assign(TUs,0);   // no S1 means no Blocks at any TU
     }
-    if(useS1) blocksAfterTu.assign(TUs,0);   // filled live, one TU at a time, in the loop
     if(blocksAfterTu.size()!=TUs||regionsAfterTu.size()!=TUs){fprintf(stderr,"per-TU id-space sizes are incomplete\n");return 2;}
 
     // ===== ENCODER (C) + DECODER (F): one cold chronological pass, PULL protocol (root -> MISSING -> FILL) =====
@@ -1498,7 +1575,7 @@ int main(int argc,char**argv){
       routeScope.c_guid[i]=uint8_t(0x31u+i*7u);          // one shared-C authority for this run
       routeScope.source_generation[i]=uint8_t(0xa7u+i*11u);
     }
-    routeScope.f_cache_epoch=1;
+    routeScope.f_cache_epoch=mappedRoutes?uint64_t(materializeRoute)+1:1;
     p29::ReceiverTxnLedger receiverLedger(routeScope);
     uint64_t perFMirrorSequence=0,canonicalAdmissions=0;
     std::vector<uint32_t> Freg_stream; Freg_stream.reserve(allreg.size());   // F's reconstructed region occurrence stream (for block COPY defs)
@@ -1666,12 +1743,16 @@ int main(int argc,char**argv){
       size_t literalGroupDecodedCursor=0;
 #endif
       for(size_t t=0; t<TUs; ++t){
+        if(mappedRoutes&&!routeActive[t]){
+          if(cfSink.f){sinkCfOff[t]=cfSink.off;sinkFcOff[t]=fcSink.off;sinkCfFrames[t]=cfSink.frames;sinkFcFrames[t]=fcSink.frames;}
+          continue;
+        }
         auto _te=Clock::now();
         const FileSpan&physicalFile=corpus.files[t%physicalTUs];
         const char*orig=corpus.bytes.data()+physicalFile.off;const uint32_t olen=physicalFile.len;
         const auto expectedPair=blob_digest(reinterpret_cast<const uint8_t*>(orig),olen);
         SharedCAdmittedTu admitted;
-        admitted.canonical_admission_sequence=canonicalAdmissions++;
+        admitted.canonical_admission_sequence=mappedRoutes?t:canonicalAdmissions++;
         admitted.shared_c_snapshot_version=admitted.canonical_admission_sequence+1;
         admitted.routing_cohort_key=0;admitted.tu_key=mix64(expectedPair.first^uint64_t(t));
         admitted.source_extent=olen;admitted.expected_output_digest={expectedPair.first,expectedPair.second};
@@ -1679,28 +1760,34 @@ int main(int argc,char**argv){
         const bool transactionSelftest=(transactionSelftestTu==t);
         p29::Digest128 selftestPreState{},selftestGlobalDigest{};
         size_t selftestGlobalBlocks=0;uint64_t selftestAdmissions=0;
+        const p29::TuPlan*wirePlan=nullptr;
         // --- T_current: admit ONLY this TU, here, then use the plan it just produced ------
         if(s1Ready){
             curTok.clear();
             admitted.regions.assign(allreg.begin()+roff[t],allreg.begin()+roff[t+1]);
-            // GLOBAL admits FIRST, in the defined C admission order, so canonical ids are
-            // assigned by the global chronology and never by route scheduling.
-            admitted.global_plan=globalS1->admit(admitted.regions);
-            const p29::TuPlan&plan=admitted.global_plan;
-            // Canonical children are a property of the shared-C admission and are recorded
-            // before any per-F transaction starts.  A route abort never rewinds this plane.
-            for(const p29::NewBlock&nb:plan.new_blocks){
-                const std::vector<uint32_t>&kids=blockCatalogue.block(nb.id).regions;
-                bchild.insert(bchild.end(),kids.begin(),kids.end());
-                boff2.push_back(bchild.size());
-                bcopy_src.push_back(nb.first_source_position);
-                bcopy_ok.push_back(nb.source_precedes_current_tu?1:0);
-            }
-            blocksAfterTu[t]=uint32_t(blockCatalogue.size());
-            if(transactionSelftest){
-                selftestPreState=routeLocalStateDigest();selftestGlobalBlocks=blockCatalogue.size();
-                const auto globalPair=blob_digest(reinterpret_cast<const uint8_t*>(globalS1->occurrences().data()),globalS1->occurrences().size()*sizeof(uint32_t));
-                selftestGlobalDigest={globalPair.first,globalPair.second};selftestAdmissions=canonicalAdmissions;
+            if(mappedRoutes){
+                wirePlan=&mappedRoutePlans[t];
+            }else{
+                // GLOBAL admits FIRST, in the defined C admission order, so canonical ids are
+                // assigned by the global chronology and never by route scheduling.
+                admitted.global_plan=globalS1->admit(admitted.regions);
+                const p29::TuPlan&plan=admitted.global_plan;
+                wirePlan=&plan;
+                // Canonical children are a property of the shared-C admission and are recorded
+                // before any per-F transaction starts.  A route abort never rewinds this plane.
+                for(const p29::NewBlock&nb:plan.new_blocks){
+                    const std::vector<uint32_t>&kids=blockCatalogue.block(nb.id).regions;
+                    bchild.insert(bchild.end(),kids.begin(),kids.end());
+                    boff2.push_back(bchild.size());
+                    bcopy_src.push_back(nb.first_source_position);
+                    bcopy_ok.push_back(nb.source_precedes_current_tu?1:0);
+                }
+                blocksAfterTu[t]=uint32_t(blockCatalogue.size());
+                if(transactionSelftest){
+                    selftestPreState=routeLocalStateDigest();selftestGlobalBlocks=blockCatalogue.size();
+                    const auto globalPair=blob_digest(reinterpret_cast<const uint8_t*>(globalS1->occurrences().data()),globalS1->occurrences().size()*sizeof(uint32_t));
+                    selftestGlobalDigest={globalPair.first,globalPair.second};selftestAdmissions=canonicalAdmissions;
+                }
             }
             if(transactionalTu){
                 cTuJournal.begin(paths,mixedCLine,nextMixedPublic,fknownReg,fknownBlk);
@@ -1733,12 +1820,12 @@ int main(int argc,char**argv){
             //
             // The reference below stays valid until commit()/abort() at the end of this
             // iteration; nothing else touches the matcher in between.
-            const p29::TuPlan* wirePlan=&plan;
             if(routeS1){
                 const size_t before=blockCatalogue.size();
                 const p29::TuPlan& rp=routeS1->prepare(admitted.regions);
                 wirePlan=&rp;
                 if(blockCatalogue.size()!=before){fprintf(stderr,"1F seam: route admission grew the catalogue %zu -> %zu at TU=%zu\n",before,blockCatalogue.size(),t);return 2;}
+                const p29::TuPlan&plan=admitted.global_plan;
                 if(rp.root.size()!=plan.root.size()||rp.block_uses.size()!=plan.block_uses.size()){fprintf(stderr,"1F seam: Root/BlockUse counts differ at TU=%zu\n",t);return 2;}
                 // Identical 1F histories must give identical occurrence windows -- asserted
                 // rather than inferred from the plans agreeing.
@@ -1764,6 +1851,7 @@ int main(int argc,char**argv){
             // hold this TU -- the ROUTE's, when one is selected.  At 1F the seam gate above
             // has just proved the two agree field for field; past 1F they will not, and the
             // route's is the one that describes what its F can resolve.
+            if(!wirePlan){fprintf(stderr,"S1 produced no wire plan at TU=%zu\n",t);return 2;}
             for(const p29::Ref&ref:wirePlan->root)
                 curTok.push_back(ref.kind==p29::RefKind::Block?block_tag(ref.id):region_tag(ref.id));
         } else {
@@ -1785,9 +1873,10 @@ int main(int argc,char**argv){
         pendingF.expected_mirror_sequence=perFMirrorSequence;
         if(transactionalTu){
           if(pendingF.id.route_sequence!=pendingF.expected_mirror_sequence){fprintf(stderr,"per-F mirror/route sequence differs before TU=%zu\n",t);return 2;}
+          if(mappedRoutes&&pendingF.id.route_sequence!=routeOrdinal[t]){fprintf(stderr,"materialized REL_SEQ differs before TU=%zu\n",t);return 2;}
           cfSink.begin_transaction();fcSink.begin_transaction();
         }
-        const bool endOfEntropyStream=(!openFinalEntropy&&t+1==TUs)||(entropyRestartTus&&(t+1)%entropyRestartTus==0);
+        const bool endOfEntropyStream=(!openFinalEntropy&&t==lastMaterializedTu)||(entropyRestartTus&&(t+1)%entropyRestartTus==0);
         const uint32_t* tk=curTok.data(); size_t tn=curTok.size();   // re-taken if live selection swaps curTok
         // ROOT is available to F before its MISSING reply.  With a key map, C first associates every
         // newly-mentioned conversation-dense Region id with its stable key; F binds cache hits and
@@ -1798,10 +1887,18 @@ int main(int argc,char**argv){
         // The ONE BlockDef serializer.  Costing and emission call it, so a candidate is
         // priced with the bytes that would actually be sent -- an approximation written
         // beside the real encoder drifts from it silently.
+        auto block_copy_source=[&](uint32_t k,size_t length,uint32_t&copySource){
+            if(wirePlan)for(const p29::BlockUse&use:wirePlan->block_uses)if(use.block_id==k&&use.source_precedes_current_tu){
+                if(use.length!=length){fprintf(stderr,"route BlockUse length differs for Block %u at TU=%zu\n",k,t);exit(2);}
+                copySource=use.source_position;return true;}
+            if(!wirePlan&&k<bcopy_ok.size()&&bcopy_ok[k]){copySource=bcopy_src[k];return true;}
+            return false;
+        };
         auto serialize_block_manifest=[&](const std::vector<uint32_t>&ids,std::vector<uint8_t>&out){
             out.clear(); put_varint(out,ids.size());
             for(uint32_t k:ids){ put_varint(out,k); const size_t length=boff2[k+1]-boff2[k];
-                if(bcopy_ok[k]){ out.push_back(1); put_varint(out,bcopy_src[k]); put_varint(out,length); }
+                uint32_t copySource=0;
+                if(block_copy_source(k,length,copySource)){ out.push_back(1); put_varint(out,copySource); put_varint(out,length); }
                 else { out.push_back(0); put_varint(out,length);
                        for(size_t j=boff2[k];j<boff2[k+1];++j) put_varint(out,bchild[j]); } }
         };
@@ -2147,7 +2244,12 @@ int main(int argc,char**argv){
                     } else if(state.public_id){
                         flushLiteral();mixedRaw[0].push_back(2);put_varint(mixedRaw[0],state.public_id);splitOpcode(2);splitVarint(3,state.public_id);++mixedOps[2];
                     } else if(state.source_region!=UINT32_MAX&&state.source_region!=r){
-                        if(state.source_region>=r||state.source_offset+line.len>dict.region_raw_len(state.source_region)||
+                        // Region ids are assigned by shared-C admission order, not by this
+                        // receiver's sparse route order.  A previously installed source may
+                        // therefore have a numerically greater id.  The wire delta is signed,
+                        // and the receiver validates actual availability before copying, so
+                        // serialization order -- not numeric id order -- is the invariant.
+                        if(state.source_offset+line.len>dict.region_raw_len(state.source_region)||
                            memcmp(dict.region_data(state.source_region)+state.source_offset,text,line.len)){
                             fprintf(stderr,"bad mixed source Line\n");return 2;
                         }
@@ -2510,7 +2612,8 @@ int main(int argc,char**argv){
             { put_varint(allRegionsRaw,c); for(uint32_t j=0;j<c;++j){ uint32_t wireLine=useSortedLines?at_line(ClineToF,lids[j]):lids[j]; put_varint(allRegionsRaw,wireLine); } }
         }
         for(uint32_t k:missBlk){ size_t L=boff2[k+1]-boff2[k];
-            if(bcopy_ok[k]){ fill_blocks.push_back(1); put_varint(fill_blocks,bcopy_src[k]); put_varint(fill_blocks,L); }   // COPY(region-stream src,len)
+            uint32_t copySource=0;
+            if(block_copy_source(k,L,copySource)){ fill_blocks.push_back(1); put_varint(fill_blocks,copySource); put_varint(fill_blocks,L); }   // COPY(region-stream src,len)
             else { fill_blocks.push_back(0); put_varint(fill_blocks,L); for(size_t j=boff2[k];j<boff2[k+1];++j) put_varint(fill_blocks,bchild[j]); }
             if(transactionalTu)pendingF.known_blocks.push_back(k);else fknownBlk[k]=1; ++nb; }
         if(np){ size_t n=zstd_size(z,fill_paths.data(),fill_paths.size(),zlevel,dst); w_pathdef += n; cfSink.emit(WT_PATHDEF,dst.data(),n); allPaths.insert(allPaths.end(),fill_paths.begin(),fill_paths.end()); }
@@ -2847,14 +2950,14 @@ int main(int argc,char**argv){
           pendingF.c_to_f=cfSink.end_transaction();pendingF.f_to_c=fcSink.end_transaction();
           if(!tuReconstructed){
             fTuJournal.abort(Fpaths,FmixedRegionData,FmixedRegions,FmixedPublic,Freg_stream,Froot_child,Froot_off);
-            Fblocks.abort_transaction();Fmo.abort_transaction();mixedFSource.abort_transaction();routeS1->abort();return 2;
+            Fblocks.abort_transaction();Fmo.abort_transaction();mixedFSource.abort_transaction();if(routeS1)routeS1->abort();return 2;
           }
 
           if(transactionSelftest){
             // Reject after complete reconstruction but before close.  C is already restored;
             // discard every tentative F plane and route history, then prove exact equality.
             fTuJournal.abort(Fpaths,FmixedRegionData,FmixedRegions,FmixedPublic,Freg_stream,Froot_child,Froot_off);
-            Fblocks.abort_transaction();Fmo.abort_transaction();mixedFSource.abort_transaction();routeS1->abort();
+            Fblocks.abort_transaction();Fmo.abort_transaction();mixedFSource.abort_transaction();if(routeS1)routeS1->abort();
             if(routeLocalStateDigest()!=selftestPreState){fprintf(stderr,"transaction selftest: reject did not restore full route-local state\n");return 2;}
             const auto globalPair=blob_digest(reinterpret_cast<const uint8_t*>(globalS1->occurrences().data()),globalS1->occurrences().size()*sizeof(uint32_t));
             if(canonicalAdmissions!=selftestAdmissions||blockCatalogue.size()!=selftestGlobalBlocks||
@@ -2960,7 +3063,8 @@ int main(int argc,char**argv){
           if(blobWireMode==4&&!Cmo.commit(moEncoded)){fprintf(stderr,"MO factor C Ack commit failed\n");return 2;}
           if(Cmo.state_mark().values!=Fmo.state_mark().values||Cmo.state_mark().string_bytes!=Fmo.state_mark().string_bytes||
              Cmo.state_mark().content_digest!=Fmo.state_mark().content_digest){fprintf(stderr,"C/F MO state differs after Ack\n");return 2;}
-          routeS1->commit();++perFMirrorSequence;
+          if(routeS1)routeS1->commit();
+          ++perFMirrorSequence;
           if(receiverLedger.expected_sequence()!=perFMirrorSequence){fprintf(stderr,"receiver/mirror sequence differs after Ack\n");return 2;}
 
           if(transactionSelftest){
@@ -3074,7 +3178,7 @@ int main(int argc,char**argv){
             sinkCfOff[t]=cfSink.off; sinkFcOff[t]=fcSink.off;
             sinkCfFrames[t]=cfSink.frames; sinkFcFrames[t]=fcSink.frames;
         }
-        while(ckidx<ck_f.size() && double(cum_raw)>=ck_f[ckidx]*corpus.raw){ ck.push_back({ck_f[ckidx], double(cum_raw)/cum_wire}); ++ckidx; }
+        while(ckidx<ck_f.size() && double(cum_raw)>=ck_f[ckidx]*materializedRaw){ ck.push_back({ck_f[ckidx], double(cum_raw)/cum_wire}); ++ckidx; }
       }
       // Moving the key check per-TU must not quietly check FEWER Regions than the sweep did:
       // by the last TU every Region has been admitted, so this must have reached NREG.
@@ -3086,9 +3190,9 @@ int main(int argc,char**argv){
         enc_s+=literalGroups.encode_seconds;dec_s+=literalGroups.decode_seconds;
       }
 #endif
-      fprintf(stderr,"pass %d (%s) single-core encode+decode+verify: %.2fs = %.3f GB/s raw\n", pass, (pass+1==npass&&npass>1)?"WARM":"cold", secs(tpass), corpus.raw/1e9/secs(tpass));
+      fprintf(stderr,"pass %d (%s) single-core encode+decode+verify: %.2fs = %.3f GB/s raw\n", pass, (pass+1==npass&&npass>1)?"WARM":"cold", secs(tpass), materializedRaw/1e9/secs(tpass));
       fprintf(stderr,"  split (2-proc per-stream proxy): C-encode %.3f GB/s | F-decode %.3f GB/s => pipelined min = %.3f GB/s\n",
-              corpus.raw/1e9/enc_s, corpus.raw/1e9/dec_s, corpus.raw/1e9/std::max(enc_s,dec_s));
+              materializedRaw/1e9/enc_s, materializedRaw/1e9/dec_s, materializedRaw/1e9/std::max(enc_s,dec_s));
     }
     while(ck.size()<ck_f.size()) ck.push_back({ck_f[ck.size()], double(cum_raw)/cum_wire});
     if(splitControlCeiling){
@@ -3118,14 +3222,14 @@ int main(int argc,char**argv){
     const char* line_name=useMixedRegions?(useCompressedBlobs?(useMoFactor?"+P27(mixed-regions+BYTE_ARRAY+BLOB+MO)":"+P26(mixed-regions+BYTE_ARRAY+BLOB)"):(useByteArrayLines?"+P24(mixed-regions+BYTE_ARRAY)":"+P24(mixed-regions)")):(useByteArrayLines?"+P21(BYTE_ARRAY)":(useSortedLines?"+P9(sorted-lines)":""));
     printf("\n==== CODEC-50 (%s%s%s%s%s%s%s%s%s, z%d) — %s ====\n", structure_name, useD1?"+D1":"", line_name, useAlphaLines?"+P4(ALPHA_LINES)":"", useResidualLdm?"+RESIDUAL_LDM":"", useLiteralGroups?"+BSC_GROUPS":"", useProjectSource?"+SOURCE_PACKAGE":"", (useD2mine?"+D2(inline)":(useD2?"+D2(helper)":"")), useDirectOrdinals?"+DIRECT_ORDINALS":"", zlevel, manifest);
     printf("byte-exact=%s  TUs=%zu raw=%.1f MiB regions=%u distinct_lines=%u paths=%zu blocks=%zu (marker_lines=%llu literal_lines=%llu)\n",
-        byteexact?"OK":"FAIL",TUs,corpus.raw/MiB,NREG,dict.distinct(),paths.size(),boff2.size()-1,(unsigned long long)n_marker,(unsigned long long)n_literal);
+        byteexact?"OK":"FAIL",materializedTus,materializedRaw/MiB,NREG,dict.distinct(),paths.size(),boff2.size()-1,(unsigned long long)n_marker,(unsigned long long)n_literal);
     printf("wire by category (post-z%d, bytes): root=%.0f line_def=%.0f region_def=%.0f block_def=%.0f path_def=%.0f missing=%.0f framing=%.0f  TOTAL=%.0f (%.2f MiB)\n",
         zlevel,w_root,w_linedef,w_regiondef,w_blockdef,w_pathdef,w_missing,w_framing,totalwire,totalwire/MiB);
     if(literalZLevel!=zlevel||arrayZLevel!=zlevel||blobZLevel!=zlevel)
       printf("material zstd levels: control=%d literal=%d array=%d blob=%d\n",zlevel,literalZLevel,arrayZLevel,blobZLevel);
-    printf("FinalRatio (raw / total wire, one cold pass) = %.1fx\n", corpus.raw/totalwire);
+    printf("FinalRatio (raw / total wire, one cold pass) = %.1fx\n", materializedRaw/totalwire);
     if(structureCeiling){
-      double current=w_root+w_blockdef+double(TUs)*FRAME;
+      double current=w_root+w_blockdef+double(materializedTus)*FRAME;
       double separate=structureBatchRoot+structureBatchBlock;
       double projectedSeparate=totalwire-current+separate;
       double projectedJoint=totalwire-current+structureBatchJoint;
@@ -3134,13 +3238,13 @@ int main(int argc,char**argv){
       printf("structure ceiling (diagnostic whole-run floors; TU boundaries omitted): raw_root=%zu raw_block=%zu current_root+block+root_frames=%.0f\n",
           allRoots.size(),allBlocks.size(),current);
       printf("  batched separate: root=%.0f block=%.0f combined=%.0f saving=%.0f => total=%.0f ratio=%.2fx\n",
-          structureBatchRoot,structureBatchBlock,separate,current-separate,projectedSeparate,corpus.raw/projectedSeparate);
+          structureBatchRoot,structureBatchBlock,separate,current-separate,projectedSeparate,materializedRaw/projectedSeparate);
       printf("  batched joint: wire=%.0f saving=%.0f => total=%.0f ratio=%.2fx\n",
-          structureBatchJoint,current-structureBatchJoint,projectedJoint,corpus.raw/projectedJoint);
+          structureBatchJoint,current-structureBatchJoint,projectedJoint,materializedRaw/projectedJoint);
       printf("  batched joint + LDM/win27: wire=%.0f saving=%.0f => total=%.0f ratio=%.2fx\n",
-          structureLdmJoint,current-structureLdmJoint,projectedLdm,corpus.raw/projectedLdm);
+          structureLdmJoint,current-structureLdmJoint,projectedLdm,materializedRaw/projectedLdm);
       printf("  impossible zero-byte structure bound: saving=%.0f => total=%.0f ratio=%.2fx\n",
-          current,projectedZero,corpus.raw/projectedZero);
+          current,projectedZero,materializedRaw/projectedZero);
     }
     if(usePriorRoot) printf("ROOT_SLICE stats: copies=%llu copied_regions=%llu indexed_windows=%llu index_entries=%llu receiver_root_bytes=%zu\n",
         (unsigned long long)root_slices.copies,(unsigned long long)root_slices.copied_regions,
@@ -3165,7 +3269,7 @@ int main(int argc,char**argv){
     if(useResidualLdm)printf("residual LDM: window_log=27 literal_wire=%.0f raw_literal=%llu\n",mixedPartWire[1],(unsigned long long)mixedLiteralRaw);
 #if defined(WITH_BSC_GROUPS)
     if(literalOnDemand)printf("literal frames on demand: frames=%zu wire=%.0f packed_header_bytes=%zu selector=[z3=%llu bsc=%llu z10=%llu] (no dump, no planning pass)\n",
-        TUs,mixedPartWire[1],residual_group::kHeaderBytes,
+        materializedTus,mixedPartWire[1],residual_group::kHeaderBytes,
         (unsigned long long)onDemandSelected[0],(unsigned long long)onDemandSelected[1],
         (unsigned long long)onDemandSelected[2]);
     if(usePlannedGroups)printf("literal groups: tus_per_group=%zu groups=%zu workers=%zu raw=%zu wire=%zu packed_header_bytes=%zucandidates=%s selected=[zstd3=%llu bsc=%llu zstd10=%llu] encode_seconds=%.6f decode_seconds=%.6f retained_wire=%s\n",
@@ -3202,9 +3306,9 @@ int main(int argc,char**argv){
       double fullfloor=fl_line+fl_root+fl_reg+fl_blk+fl_path+fl_miss+w_framing;
       double alt=totalwire - w_linedef - w_root + bl + br;
       double altldm=totalwire - w_linedef + bl_ldm;
-      printf("DIAG batched-z%d floor: line_def %.0f->%.0f  root %.0f->%.0f  => streamed TOTAL=%.0f ratio=%.0fx\n",zlevel,w_linedef,bl,w_root,br,alt,corpus.raw/alt);
+      printf("DIAG batched-z%d floor: line_def %.0f->%.0f  root %.0f->%.0f  => streamed TOTAL=%.0f ratio=%.0fx\n",zlevel,w_linedef,bl,w_root,br,alt,materializedRaw/alt);
       printf("DIAG FULL streamed floor (all cats batched z%d): line=%.2f reg=%.2f blk=%.2f path=%.2f miss=%.2f root=%.2f => %.2f MiB ratio=%.0fx\n",
-        zlevel,fl_line/MiB,fl_reg/MiB,fl_blk/MiB,fl_path/MiB,fl_miss/MiB,fl_root/MiB,fullfloor/MiB,corpus.raw/fullfloor);
+        zlevel,fl_line/MiB,fl_reg/MiB,fl_blk/MiB,fl_path/MiB,fl_miss/MiB,fl_root/MiB,fullfloor/MiB,materializedRaw/fullfloor);
       // region_def headroom, delta-serialized (current wire) AND raw-line-id serialized (cross-region
       // subsequence-preserving -- per-region delta breaks shared-run matching at each run's first id).
       { auto zldm=[&](std::vector<uint8_t>&v){ if(v.empty())return 0.0; ZSTD_CCtx* zr=ZSTD_createCCtx(); std::vector<uint8_t> rb(ZSTD_compressBound(v.size())+64);
@@ -3215,7 +3319,7 @@ int main(int argc,char**argv){
           rl_raw_z3=allRegionsRaw.empty()?0:double(ZSTD_compress2(zr,rb.data(),rb.size(),allRegionsRaw.data(),allRegionsRaw.size())); ZSTD_freeCCtx(zr); }
         printf("DIAG region_def headroom: delta-stream raw=%.2f batched-z%d=%.2f +LDM=%.2f | RAW-line-id z%d=%.2f +LDM+win27=%.2f MiB (cross-region SLICE ceiling)\n",
           allRegions.size()/MiB,zlevel,fl_reg/MiB,rl_delta/MiB,zlevel,rl_raw_z3/MiB,rl_raw_ldm/MiB); }
-      printf("DIAG long-distance ceiling: line_def z%d+LDM+win27 = %.0f (%.2f MiB) => TOTAL=%.0f ratio=%.0fx  [what a perfect relative-LZ OBJECT could reach]\n",zlevel,bl_ldm,bl_ldm/MiB,altldm,corpus.raw/altldm);
+      printf("DIAG long-distance ceiling: line_def z%d+LDM+win27 = %.0f (%.2f MiB) => TOTAL=%.0f ratio=%.0fx  [what a perfect relative-LZ OBJECT could reach]\n",zlevel,bl_ldm,bl_ldm/MiB,altldm,materializedRaw/altldm);
       // entropy ladder on the distinct-line dictionary leg: is 8.47MB a z3-level wall or an information floor?
       if(deep && !allLineDefs.empty()){ printf("DIAG line_def entropy ladder (%.2f MiB raw, %.0f distinct literal lines):\n",allLineDefs.size()/MiB,double(n_literal));
         for(int lv:{3,9,19,22}){ ZSTD_CCtx* zc=ZSTD_createCCtx(); ZSTD_CCtx_setParameter(zc,ZSTD_c_compressionLevel,lv);
@@ -3223,7 +3327,7 @@ int main(int argc,char**argv){
           size_t bnd=ZSTD_compressBound(allLineDefs.size()); std::vector<uint8_t> ob(bnd);
           size_t r=ZSTD_compress2(zc,ob.data(),bnd,allLineDefs.data(),allLineDefs.size()); ZSTD_freeCCtx(zc);
           double t=totalwire - w_linedef + double(r);
-          printf("    z%-2d = %.2f MiB (%.1f B/line)  => TOTAL ratio=%.0fx\n",lv,r/MiB,double(r)/double(n_literal),corpus.raw/t); }
+          printf("    z%-2d = %.2f MiB (%.1f B/line)  => TOTAL ratio=%.0fx\n",lv,r/MiB,double(r)/double(n_literal),materializedRaw/t); }
         // Is z19's win reachable at z3 by a REORDER? Cluster similar distinct lines adjacent so z3's
         // greedy matcher finds what z19 finds by deep search. Sort lexicographically + front-code
         // (shared-prefix-len + suffix) — a fully z3-legal structural transform, not a level bump.
@@ -3277,13 +3381,21 @@ int main(int argc,char**argv){
           literalGroupTus?literalGroupTus-1:0);
       if(sinkCurvePath){
         FILE*sc=fopen(sinkCurvePath,"wb");if(!sc){perror(sinkCurvePath);return 2;}
-        if(fprintf(sc,"tu\traw_bytes\tcf_offset\tfc_offset\tcf_frames\tfc_frames\tbuild_close\n")<0){fprintf(stderr,"sink curve header write failed\n");fclose(sc);return 2;}
-        for(size_t t=0;t<TUs;++t)
-          if(fprintf(sc,"%zu\t%llu\t%llu\t%llu\t%llu\t%llu\t%d\n",t+1,
-              (unsigned long long)perTU_raw[t],(unsigned long long)sinkCfOff[t],
-              (unsigned long long)sinkFcOff[t],(unsigned long long)sinkCfFrames[t],
-              (unsigned long long)sinkFcFrames[t],
-              int(sinkBuildTus&&(t+1)%sinkBuildTus==0))<0){fprintf(stderr,"sink curve row write failed\n");fclose(sc);return 2;}
+        if(fprintf(sc,mappedRoutes?
+            "tu\tactive\trel_seq\traw_bytes\tcf_offset\tfc_offset\tcf_frames\tfc_frames\tbuild_close\n":
+            "tu\traw_bytes\tcf_offset\tfc_offset\tcf_frames\tfc_frames\tbuild_close\n")<0){fprintf(stderr,"sink curve header write failed\n");fclose(sc);return 2;}
+        for(size_t t=0;t<TUs;++t){
+          const int written=mappedRoutes?
+            fprintf(sc,"%zu\t%d\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%d\n",t+1,int(routeActive[t]),
+                (unsigned long long)routeOrdinal[t],(unsigned long long)perTU_raw[t],(unsigned long long)sinkCfOff[t],
+                (unsigned long long)sinkFcOff[t],(unsigned long long)sinkCfFrames[t],
+                (unsigned long long)sinkFcFrames[t],int(sinkBuildTus&&(t+1)%sinkBuildTus==0)):
+            fprintf(sc,"%zu\t%llu\t%llu\t%llu\t%llu\t%llu\t%d\n",t+1,
+                (unsigned long long)perTU_raw[t],(unsigned long long)sinkCfOff[t],
+                (unsigned long long)sinkFcOff[t],(unsigned long long)sinkCfFrames[t],
+                (unsigned long long)sinkFcFrames[t],int(sinkBuildTus&&(t+1)%sinkBuildTus==0));
+          if(written<0){fprintf(stderr,"sink curve row write failed\n");fclose(sc);return 2;}
+        }
         if(fclose(sc)!=0){perror(sinkCurvePath);return 2;}
         // offsets must be non-decreasing and end exactly at the file sizes
         for(size_t t=1;t<TUs;++t)if(sinkCfOff[t]<sinkCfOff[t-1]||sinkFcOff[t]<sinkFcOff[t-1]){fprintf(stderr,"sink offsets are not monotone at TU=%zu\n",t);return 2;}
@@ -3292,7 +3404,9 @@ int main(int argc,char**argv){
     }
     if(selectorTsvPath){
       FILE*f=fopen(selectorTsvPath,"wb");if(!f){perror(selectorTsvPath);return 2;}
-      if(fprintf(f,"tu\traw_root_bytes\traw_root_frame\troute_root_bytes\troute_root_frame\troute_candidate_blockdefs\troute_blockdef_bytes\troute_blockdef_frame\temitted_root_frame\temitted_blockdefs\temitted_blockdef_frame\tactual_delta\tcommon\traw_full\troute_full\twinner\ttie\traw_cheaper\n")<0){fclose(f);return 2;}
+      if(fprintf(f,mappedRoutes?
+          "tu\trel_seq\traw_root_bytes\traw_root_frame\troute_root_bytes\troute_root_frame\troute_candidate_blockdefs\troute_blockdef_bytes\troute_blockdef_frame\temitted_root_frame\temitted_blockdefs\temitted_blockdef_frame\tactual_delta\tcommon\traw_full\troute_full\twinner\ttie\traw_cheaper\n":
+          "tu\traw_root_bytes\traw_root_frame\troute_root_bytes\troute_root_frame\troute_candidate_blockdefs\troute_blockdef_bytes\troute_blockdef_frame\temitted_root_frame\temitted_blockdefs\temitted_blockdef_frame\tactual_delta\tcommon\traw_full\troute_full\twinner\ttie\traw_cheaper\n")<0){fclose(f);return 2;}
       uint64_t rawSent=0,routeSent=0,rawCheaper=0,ties=0,rawFullCum=0,routeFullCum=0,actualCum=0;
       for(const SelRow&r:selRows){
         // `winner` means ONE thing in both bases: what this TU ACTUALLY SENT.  Without
@@ -3306,15 +3420,27 @@ int main(int argc,char**argv){
         if(cheaperRaw)++rawCheaper;
         if(r.tie)++ties;
         rawFullCum+=r.rawFull; routeFullCum+=r.routeFull; actualCum+=r.actualDelta;
-        if(fprintf(f,"%zu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%s\t%d\t%d\n",r.tu,
-            (unsigned long long)r.rawRootRaw,(unsigned long long)r.rawRootFrame,
-            (unsigned long long)r.routeRootRaw,(unsigned long long)r.routeRootFrame,
-            (unsigned long long)r.routeCandidateBlockDefs,(unsigned long long)r.routeDefRaw,
-            (unsigned long long)r.routeDefFrame,
-            (unsigned long long)r.emittedRootFrame,(unsigned long long)r.emittedBlockDefs,
-            (unsigned long long)r.emittedDefFrame,
-            (unsigned long long)r.actualDelta,(unsigned long long)r.common,
-            (unsigned long long)r.rawFull,(unsigned long long)r.routeFull,win,r.tie?1:0,cheaperRaw?1:0)<0){fclose(f);return 2;}
+        const int written=mappedRoutes?
+          fprintf(f,"%zu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%s\t%d\t%d\n",r.tu,
+              (unsigned long long)routeOrdinal[r.tu],
+              (unsigned long long)r.rawRootRaw,(unsigned long long)r.rawRootFrame,
+              (unsigned long long)r.routeRootRaw,(unsigned long long)r.routeRootFrame,
+              (unsigned long long)r.routeCandidateBlockDefs,(unsigned long long)r.routeDefRaw,
+              (unsigned long long)r.routeDefFrame,
+              (unsigned long long)r.emittedRootFrame,(unsigned long long)r.emittedBlockDefs,
+              (unsigned long long)r.emittedDefFrame,
+              (unsigned long long)r.actualDelta,(unsigned long long)r.common,
+              (unsigned long long)r.rawFull,(unsigned long long)r.routeFull,win,r.tie?1:0,cheaperRaw?1:0):
+          fprintf(f,"%zu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%s\t%d\t%d\n",r.tu,
+              (unsigned long long)r.rawRootRaw,(unsigned long long)r.rawRootFrame,
+              (unsigned long long)r.routeRootRaw,(unsigned long long)r.routeRootFrame,
+              (unsigned long long)r.routeCandidateBlockDefs,(unsigned long long)r.routeDefRaw,
+              (unsigned long long)r.routeDefFrame,
+              (unsigned long long)r.emittedRootFrame,(unsigned long long)r.emittedBlockDefs,
+              (unsigned long long)r.emittedDefFrame,
+              (unsigned long long)r.actualDelta,(unsigned long long)r.common,
+              (unsigned long long)r.rawFull,(unsigned long long)r.routeFull,win,r.tie?1:0,cheaperRaw?1:0);
+        if(written<0){fclose(f);return 2;}
         // The actual transaction must equal the CHOSEN candidate's independently
         // reconstructed full cost -- and, because `common` is measured and the candidate
         // frames are costed separately, the unchosen one is a real counterfactual rather
@@ -3357,13 +3483,20 @@ int main(int argc,char**argv){
     }
     if(curveTsvPath){
       FILE*curve=fopen(curveTsvPath,"wb");if(!curve){perror(curveTsvPath);return 2;}
-      if(fprintf(curve,"tu\traw_bytes\twire_bytes\tcumulative_raw_bytes\tcumulative_wire_bytes\tcumulative_ratio\texact\n")<0){fprintf(stderr,"curve TSV header write failed\n");fclose(curve);return 2;}
+      if(fprintf(curve,mappedRoutes?
+          "tu\tactive\trel_seq\traw_bytes\twire_bytes\tcumulative_raw_bytes\tcumulative_wire_bytes\tcumulative_ratio\texact\n":
+          "tu\traw_bytes\twire_bytes\tcumulative_raw_bytes\tcumulative_wire_bytes\tcumulative_ratio\texact\n")<0){fprintf(stderr,"curve TSV header write failed\n");fclose(curve);return 2;}
       uint64_t curveRaw=0,curveWire=0;
       for(size_t t=0;t<TUs;++t){
         const uint64_t raw=uint64_t(perTU_raw[t]);const uint64_t wire=uint64_t(std::llround(perTU_wire[t]));curveRaw+=raw;curveWire+=wire;
-        if(fprintf(curve,"%zu\t%llu\t%llu\t%llu\t%llu\t%.12g\t%s\n",t+1,
-            (unsigned long long)raw,(unsigned long long)wire,(unsigned long long)curveRaw,
-            (unsigned long long)curveWire,curveWire?double(curveRaw)/double(curveWire):0.0,byteexact?"true":"false")<0){fprintf(stderr,"curve TSV row write failed\n");fclose(curve);return 2;}
+        const int written=mappedRoutes?
+          fprintf(curve,"%zu\t%d\t%llu\t%llu\t%llu\t%llu\t%llu\t%.12g\t%s\n",t+1,int(routeActive[t]),(unsigned long long)routeOrdinal[t],
+              (unsigned long long)raw,(unsigned long long)wire,(unsigned long long)curveRaw,
+              (unsigned long long)curveWire,curveWire?double(curveRaw)/double(curveWire):0.0,byteexact?"true":"false"):
+          fprintf(curve,"%zu\t%llu\t%llu\t%llu\t%llu\t%.12g\t%s\n",t+1,
+              (unsigned long long)raw,(unsigned long long)wire,(unsigned long long)curveRaw,
+              (unsigned long long)curveWire,curveWire?double(curveRaw)/double(curveWire):0.0,byteexact?"true":"false");
+        if(written<0){fprintf(stderr,"curve TSV row write failed\n");fclose(curve);return 2;}
       }
       if(std::fabs(double(curveRaw)-double(cum_raw))>0.5||std::fabs(double(curveWire)-cum_wire)>0.5){fprintf(stderr,"curve TSV total differs\n");fclose(curve);return 2;}
       if(fclose(curve)!=0){perror(curveTsvPath);return 2;}
@@ -3372,14 +3505,17 @@ int main(int argc,char**argv){
     }
     if(componentCurveTsvPath){
       FILE*curve=fopen(componentCurveTsvPath,"wb");if(!curve){perror(componentCurveTsvPath);return 2;}
-      if(fprintf(curve,"tu\traw_bytes\twire_bytes")<0){fprintf(stderr,"component curve header write failed\n");fclose(curve);return 2;}
+      if(fprintf(curve,mappedRoutes?"tu\tactive\trel_seq\traw_bytes\twire_bytes":"tu\traw_bytes\twire_bytes")<0){fprintf(stderr,"component curve header write failed\n");fclose(curve);return 2;}
       for(const char*name:componentRawNames)if(fprintf(curve,"\t%s",name)<0){fprintf(stderr,"component raw header write failed\n");fclose(curve);return 2;}
       for(const char*name:componentWireNames)if(fprintf(curve,"\t%s",name)<0){fprintf(stderr,"component wire header write failed\n");fclose(curve);return 2;}
       if(fprintf(curve,"\tcumulative_raw_bytes\tcumulative_wire_bytes\texact\n")<0){fprintf(stderr,"component curve header finish failed\n");fclose(curve);return 2;}
       uint64_t curveRaw=0,curveWire=0;
       for(size_t t=0;t<TUs;++t){
         const uint64_t raw=uint64_t(perTU_raw[t]),wire=uint64_t(std::llround(perTU_wire[t]));curveRaw+=raw;curveWire+=wire;
-        if(fprintf(curve,"%zu\t%llu\t%llu",t+1,(unsigned long long)raw,(unsigned long long)wire)<0){fprintf(stderr,"component curve prefix write failed\n");fclose(curve);return 2;}
+        const int written=mappedRoutes?
+          fprintf(curve,"%zu\t%d\t%llu\t%llu\t%llu",t+1,int(routeActive[t]),(unsigned long long)routeOrdinal[t],(unsigned long long)raw,(unsigned long long)wire):
+          fprintf(curve,"%zu\t%llu\t%llu",t+1,(unsigned long long)raw,(unsigned long long)wire);
+        if(written<0){fprintf(stderr,"component curve prefix write failed\n");fclose(curve);return 2;}
         for(uint64_t value:perTUComponentRaw[t])if(fprintf(curve,"\t%llu",(unsigned long long)value)<0){fprintf(stderr,"component raw row write failed\n");fclose(curve);return 2;}
         uint64_t componentWire=0;
         for(double value:perTUComponentWire[t]){uint64_t rounded=uint64_t(std::llround(value));componentWire+=rounded;if(fprintf(curve,"\t%llu",(unsigned long long)rounded)<0){fprintf(stderr,"component wire row write failed\n");fclose(curve);return 2;}}
@@ -3392,7 +3528,7 @@ int main(int argc,char**argv){
           (unsigned long long)curveRaw,(unsigned long long)curveWire);
     }
     // trailing-window (5% raw) ratio near the end
-    { double win=0.05*corpus.raw, r=0,wsum=0; for(size_t t=TUs;t-->0;){ r+=perTU_raw[t]; wsum+=perTU_wire[t]; if(r>=win) break; } printf("trailing 5%%-raw window ratio (steady) = %.0fx\n", wsum>0?r/wsum:0); }
+    { double win=0.05*materializedRaw, r=0,wsum=0; for(size_t t=TUs;t-->0;){ r+=perTU_raw[t]; wsum+=perTU_wire[t]; if(r>=win) break; } printf("trailing 5%%-raw window ratio (steady) = %.0fx\n", wsum>0?r/wsum:0); }
     struct rusage ru{}; getrusage(RUSAGE_SELF,&ru); fprintf(stderr,"peak RSS=%.1f MiB total=%.1fs\n",ru.ru_maxrss/1024.0,secs(t0));
     return byteexact?0:1;
 }

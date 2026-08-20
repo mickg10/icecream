@@ -138,7 +138,7 @@ messages do not exist in the implementation being replayed.  The reverse adapter
 retained separately.  The live cache-channel stage must add both omitted C-to-F categories before
 the field can be interpreted as every byte written by C.
 
-Build and replay a one-route P29 ledger:
+Build and replay a shared-C P29 ledger:
 
 ```bash
 python3 capability/distribution/build_p29_ledger.py SCENARIO.json \
@@ -148,14 +148,21 @@ python3 capability/distribution/run_scenario.py SCENARIO.json \
   --codec p29 --ledger /tmp/p29-ledger.jsonl --out /tmp/p29-simulation
 ```
 
-The P29 builder runs the real codec, parses the typed C-to-F and F-to-C streams into causal
-Root/Need/LINES/Fill/close/Ack extents, requires the selector and component ledgers to agree,
-and reruns the codec's directional sink replay.  LINES is released after Root serialization,
-Need after Root delivery, Fill after Need delivery, and close joins every material branch.
-Fill can move ahead of an unfinished LINES extent at the next configured writer quantum.
-Compiler input becomes ready after close delivery; codec state commits after Ack delivery.
-Its present materializer has only one route, so the builder deliberately refuses
-multi-F scenarios.
+The P29 builder takes the common simulator assignment, admits the complete TU sequence into one
+logical C catalogue, and forms one ordered projection per populated F.  Every projection gets an
+independent receiver store and contiguous `REL_SEQ`; canonical Block IDs and the global plan
+digest remain common.  The capability harness currently repeats the deterministic global/route
+preparation for each output route and requires the resulting digest and Block count to agree
+before it combines any bytes.  This repeats host-side harness CPU, but it does not create separate
+logical learners or count shared state more than once.
+
+For every F, the builder runs the real codec, parses the typed C-to-F and F-to-C streams into
+causal Root/Need/LINES/Fill/close/Ack extents, requires the selector and component ledgers to
+agree, and reruns the codec's directional sink replay.  LINES is released after Root
+serialization, Need after Root delivery, Fill after Need delivery, and close joins every
+material branch.  Fill can move ahead of an unfinished LINES extent at the next configured
+writer quantum.  Compiler input becomes ready after close delivery; codec state commits after
+Ack delivery.  Ledger rows are then restored to global `TU_SEQ` order for the common simulator.
 
 Build and replay a multi-route GRZ ledger:
 

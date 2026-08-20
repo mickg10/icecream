@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
-"""Build an exact P29 physical-ledger JSONL for a one-route scenario.
+"""Build an exact shared-C P29 physical-ledger JSONL for a multi-F scenario.
 
-The codec is run once to create its two typed directional streams and again in sink-replay
-mode.  The resulting frame slices are converted into the Root/Need/Fill/fallback/close/Ack
-dialogue consumed by ``run_scenario.py``.  Every per-TU directional sum is checked against
-the codec's physical sink curve and the selector's C-to-F transaction total.
-
-P29's current producer has one materialized route.  This builder therefore refuses F>1
-instead of labelling independent per-route processes as the shared-C P29 design.
+Every route run reads the same complete manifest and TU-to-F map, deterministically replays
+one global catalogue plus every ordered route plan, and then materializes only its selected F
+receiver.  The builder requires the global plan digest to match across runs before combining
+their typed directional streams.  Resulting frame slices become the Root/Need/Fill/fallback/
+close/Ack dialogues consumed by ``run_scenario.py``.
 """
 
 from __future__ import annotations
@@ -17,6 +15,7 @@ import csv
 import hashlib
 import importlib.util
 import json
+import re
 import struct
 import subprocess
 import sys
@@ -58,8 +57,6 @@ P29_OPTIONS = (
     "--stable-root-tags",
     "--literal-ondemand",
     "--literal-group-skip-zstd10",
-    "--route-s1",
-    "1",
     "--transactional-tu",
     "--live-selector",
 )
@@ -94,6 +91,14 @@ TYPE_NAMES = {
 class Frame:
     kind: int
     bytes: int
+
+
+@dataclass(frozen=True)
+class AssignedItem:
+    item: sim.WorkItem
+    worker: int
+    tu_seq: int
+    rel_seq: int
 
 
 def sha256(path: Path) -> str:
@@ -258,11 +263,9 @@ def checked_run(command: list[str], stdout_path: Path, stderr_path: Path) -> Non
         )
 
 
-def scenario_items(scenario: sim.LoadedScenario) -> list[sim.WorkItem]:
+def scenario_items(scenario: sim.LoadedScenario) -> list[AssignedItem]:
     if int(scenario.document["environments"]["env_count"]) != 1:
         raise ValueError("P29 physical builder currently requires exactly one C authority")
-    if int(scenario.document["workers"]["f_count"]) != 1:
-        raise ValueError("P29 physical builder refuses F>1 until shared-C multi-route is materialized")
     diagnostic = sim.Simulator(
         scenario, sim.CompileOnlyAdapter(), snapshot_interval_ns=10**30
     ).run()
@@ -271,13 +274,37 @@ def scenario_items(scenario: sim.LoadedScenario) -> list[sim.WorkItem]:
         for items in scenario.work_items.values()
         for item in items
     }
-    items = [
-        by_key[(row["workload"], int(row["build"]), int(row["logical"]))]
-        for row in diagnostic.assignments
-    ]
-    if any(int(row["worker"]) != 0 for row in diagnostic.assignments):
-        raise AssertionError("one-F diagnostic assignment selected a different F")
-    return items
+    assigned = []
+    for expected_tu_seq, row in enumerate(diagnostic.assignments):
+        item = by_key[(row["workload"], int(row["build"]), int(row["logical"]))]
+        tu_seq = int(row["tu_seq"])
+        if tu_seq != expected_tu_seq:
+            raise AssertionError("diagnostic assignment is not in contiguous TU_SEQ order")
+        assigned.append(
+            AssignedItem(item, int(row["worker"]), tu_seq, int(row["rel_seq"]))
+        )
+    if len(assigned) != len(by_key):
+        raise AssertionError("diagnostic assignment did not cover every scenario TU")
+    return assigned
+
+
+def shared_plan_record(output: str) -> dict[str, object]:
+    matches = re.findall(
+        r"^MULTIROUTE_PLAN routes=(\d+) target=(\d+) active_tus=(\d+) "
+        r"blocks=(\d+) digest=([0-9a-f]{32})$",
+        output,
+        re.MULTILINE,
+    )
+    if len(matches) != 1:
+        raise RuntimeError("P29 output does not contain exactly one multi-route plan record")
+    routes, target, active_tus, blocks, digest = matches[0]
+    return {
+        "routes": int(routes),
+        "target": int(target),
+        "active_tus": int(active_tus),
+        "blocks": int(blocks),
+        "digest": digest,
+    }
 
 
 def build_ledger(
@@ -290,7 +317,8 @@ def build_ledger(
     scenario = sim.load_scenario(scenario_path)
     if not codec.is_file():
         raise ValueError(f"P29 codec binary is absent: {codec}")
-    items = scenario_items(scenario)
+    assigned = scenario_items(scenario)
+    items = [entry.item for entry in assigned]
     for item in items:
         if not item.payload.is_file():
             raise ValueError(f"payload is absent: {item.payload}")
@@ -299,93 +327,159 @@ def build_ledger(
     work.mkdir(parents=True, exist_ok=True)
     manifest = work / "manifest.txt"
     manifest.write_text("".join(f"{item.payload}\n" for item in items))
-    c_sink, f_sink = work / "p29.c-to-f.bin", work / "p29.f-to-c.bin"
-    curve, selector = work / "sink-curve.tsv", work / "selector.tsv"
-    components = work / "components.tsv"
-    common = [
-        str(codec.resolve()),
-        "--manifest",
-        str(manifest),
-        *P29_OPTIONS,
-        *extra_options,
-        "--selector-tsv",
-        str(selector),
-        "--sink-curve",
-        str(curve),
-        "--component-curve-tsv",
-        str(components),
-        "--cf-sink",
-        str(c_sink),
-        "--fc-sink",
-        str(f_sink),
-    ]
-    encode_stdout, encode_stderr = work / "encode.stdout", work / "encode.stderr"
-    checked_run(common, encode_stdout, encode_stderr)
-    encode_text = encode_stdout.read_text(errors="replace")
-    for marker in (
+    worker_count = int(scenario.document["workers"]["f_count"])
+    route_map = work / "route-map.txt"
+    route_map.write_text(
+        f"p29-route-map-v1 {worker_count} {len(assigned)}\n"
+        + "".join(f"{entry.worker}\n" for entry in assigned)
+    )
+    by_worker: dict[int, list[AssignedItem]] = defaultdict(list)
+    for entry in assigned:
+        by_worker[entry.worker].append(entry)
+    for worker, route in by_worker.items():
+        if [entry.rel_seq for entry in route] != list(range(len(route))):
+            raise AssertionError(f"P29 F{worker} projection is not contiguous")
+
+    shared_digest: str | None = None
+    shared_blocks: int | None = None
+    route_metadata: dict[str, object] = {}
+    ledger_by_item: dict[tuple[str, int, int], dict[str, object]] = {}
+    payload_digests: dict[Path, str] = {}
+    c_total = f_total = 0
+    required_markers = (
         "byte-exact=OK",
         "SELECTOR closure:",
         "SELECTOR manifest:",
         "SELECTOR full total:",
-    ):
-        if marker not in encode_text:
-            raise RuntimeError(f"P29 encode output lacks required record: {marker}")
-    replay_stdout, replay_stderr = work / "replay.stdout", work / "replay.stderr"
-    checked_run([*common, "--sink-replay"], replay_stdout, replay_stderr)
-    replay_text = replay_stdout.read_text(errors="replace")
-    if "SINK REPLAY OK:" not in replay_text or "byte-exact=OK" not in replay_text:
-        raise RuntimeError("P29 directional sink replay did not report complete exact replay")
+    )
+    for worker, route in sorted(by_worker.items()):
+        route_name = f"C0-F{worker}"
+        route_directory = work / route_name
+        route_directory.mkdir(parents=True, exist_ok=True)
+        c_sink = route_directory / "p29.c-to-f.bin"
+        f_sink = route_directory / "p29.f-to-c.bin"
+        curve = route_directory / "sink-curve.tsv"
+        selector = route_directory / "selector.tsv"
+        components = route_directory / "components.tsv"
+        common = [
+            str(codec.resolve()),
+            "--manifest",
+            str(manifest),
+            *P29_OPTIONS,
+            "--route-s1",
+            str(worker_count),
+            "--route-map",
+            str(route_map),
+            "--materialize-route",
+            str(worker),
+            *extra_options,
+            "--selector-tsv",
+            str(selector),
+            "--sink-curve",
+            str(curve),
+            "--component-curve-tsv",
+            str(components),
+            "--cf-sink",
+            str(c_sink),
+            "--fc-sink",
+            str(f_sink),
+        ]
+        encode_stdout = route_directory / "encode.stdout"
+        encode_stderr = route_directory / "encode.stderr"
+        checked_run(common, encode_stdout, encode_stderr)
+        encode_text = encode_stdout.read_text(errors="replace")
+        for marker in required_markers:
+            if marker not in encode_text:
+                raise RuntimeError(f"P29 F{worker} encode output lacks: {marker}")
+        plan = shared_plan_record(encode_text)
+        if (
+            plan["routes"] != worker_count
+            or plan["target"] != worker
+            or plan["active_tus"] != len(route)
+        ):
+            raise RuntimeError(f"P29 F{worker} plan record differs from its projection")
+        if shared_digest is None:
+            shared_digest = str(plan["digest"])
+            shared_blocks = int(plan["blocks"])
+        elif plan["digest"] != shared_digest or plan["blocks"] != shared_blocks:
+            raise RuntimeError("P29 route runs produced different shared-C plans")
 
-    curve_rows = read_tsv(curve)
-    selector_rows = read_tsv(selector)
-    component_rows = read_tsv(components)
-    if not (len(curve_rows) == len(selector_rows) == len(component_rows) == len(items)):
-        raise RuntimeError("P29 per-TU output row counts differ from the scenario")
-    c_data, f_data = c_sink.read_bytes(), f_sink.read_bytes()
-    c_prior = f_prior = 0
-    emitted_blocks = 0
-    payload_digests: dict[Path, str] = {}
-    ledger_rows: list[dict[str, object]] = []
-    c_total = f_total = 0
-    for route_sequence, (item, curve_row, selector_row, component_row) in enumerate(
-        zip(items, curve_rows, selector_rows, component_rows)
-    ):
-        expected_tu = route_sequence + 1
-        if int(curve_row["tu"]) != expected_tu or int(component_row["tu"]) != expected_tu:
-            raise RuntimeError(f"P29 curve order differs at TU {expected_tu}")
-        if int(selector_row["tu"]) != route_sequence:
-            raise RuntimeError(f"P29 selector order differs at TU {expected_tu}")
-        c_end, f_end = int(curve_row["cf_offset"]), int(curve_row["fc_offset"])
-        c_frames = parse_frames(c_data, c_prior, c_end, f"C-to-F TU {expected_tu}")
-        f_frames = parse_frames(f_data, f_prior, f_end, f"F-to-C TU {expected_tu}")
-        phases = phase_rows(c_frames, f_frames)
-        graph = transaction_graph(phases)
-        c_delta, f_delta = c_end - c_prior, f_end - f_prior
-        if int(selector_row["actual_delta"]) != c_delta:
-            raise RuntimeError(f"selector C-to-F bytes differ at TU {expected_tu}")
-        if component_row["exact"] != "true":
-            raise RuntimeError(f"component reconstruction row is not exact at TU {expected_tu}")
-        if int(curve_row["raw_bytes"]) != item.raw_bytes:
-            raise RuntimeError(f"P29 raw bytes differ at TU {expected_tu}")
-        emitted_blocks += int(selector_row["emitted_blockdefs"])
-        frame_types = defaultdict(int)
-        for frame in c_frames:
-            frame_types[f"c_to_f:{TYPE_NAMES[frame.kind]}"] += frame.bytes
-        for frame in f_frames:
-            frame_types[f"f_to_c:{TYPE_NAMES[frame.kind]}"] += frame.bytes
-        payload = item.payload.resolve()
-        raw_digest = payload_digests.get(payload)
-        if raw_digest is None:
-            raw_digest = sha256(payload)
-            payload_digests[payload] = raw_digest
-        ledger_rows.append(
-            {
+        replay_stdout = route_directory / "replay.stdout"
+        replay_stderr = route_directory / "replay.stderr"
+        checked_run([*common, "--sink-replay"], replay_stdout, replay_stderr)
+        replay_text = replay_stdout.read_text(errors="replace")
+        if "SINK REPLAY OK:" not in replay_text or "byte-exact=OK" not in replay_text:
+            raise RuntimeError(f"P29 F{worker} directional replay was not exact")
+        if shared_plan_record(replay_text) != plan:
+            raise RuntimeError(f"P29 F{worker} replay changed the shared plan record")
+
+        curve_rows = [row for row in read_tsv(curve) if row["active"] == "1"]
+        selector_rows = read_tsv(selector)
+        component_rows = [
+            row for row in read_tsv(components) if row["active"] == "1"
+        ]
+        if not (
+            len(curve_rows)
+            == len(selector_rows)
+            == len(component_rows)
+            == len(route)
+        ):
+            raise RuntimeError(f"P29 F{worker} per-TU row counts differ")
+        c_data, f_data = c_sink.read_bytes(), f_sink.read_bytes()
+        c_prior = f_prior = emitted_blocks = 0
+        for route_sequence, (
+            entry,
+            curve_row,
+            selector_row,
+            component_row,
+        ) in enumerate(zip(route, curve_rows, selector_rows, component_rows)):
+            item = entry.item
+            expected_tu = entry.tu_seq + 1
+            if (
+                int(curve_row["tu"]) != expected_tu
+                or int(component_row["tu"]) != expected_tu
+                or int(selector_row["tu"]) != entry.tu_seq
+                or int(curve_row["rel_seq"]) != route_sequence
+                or int(component_row["rel_seq"]) != route_sequence
+                or int(selector_row["rel_seq"]) != route_sequence
+            ):
+                raise RuntimeError(f"P29 F{worker} order differs at TU_SEQ {entry.tu_seq}")
+            if entry.rel_seq != route_sequence:
+                raise AssertionError("P29 route order differs from simulator REL_SEQ")
+            c_end, f_end = int(curve_row["cf_offset"]), int(curve_row["fc_offset"])
+            c_frames = parse_frames(
+                c_data, c_prior, c_end, f"C-to-F F{worker} TU {expected_tu}"
+            )
+            f_frames = parse_frames(
+                f_data, f_prior, f_end, f"F-to-C F{worker} TU {expected_tu}"
+            )
+            phases = phase_rows(c_frames, f_frames)
+            graph = transaction_graph(phases)
+            c_delta, f_delta = c_end - c_prior, f_end - f_prior
+            if int(selector_row["actual_delta"]) != c_delta:
+                raise RuntimeError(f"P29 selector bytes differ at TU_SEQ {entry.tu_seq}")
+            if component_row["exact"] != "true":
+                raise RuntimeError(f"P29 reconstruction is not exact at TU_SEQ {entry.tu_seq}")
+            if int(curve_row["raw_bytes"]) != item.raw_bytes:
+                raise RuntimeError(f"P29 raw bytes differ at TU_SEQ {entry.tu_seq}")
+            emitted_blocks += int(selector_row["emitted_blockdefs"])
+            frame_types = defaultdict(int)
+            for frame in c_frames:
+                frame_types[f"c_to_f:{TYPE_NAMES[frame.kind]}"] += frame.bytes
+            for frame in f_frames:
+                frame_types[f"f_to_c:{TYPE_NAMES[frame.kind]}"] += frame.bytes
+            payload = item.payload.resolve()
+            raw_digest = payload_digests.get(payload)
+            if raw_digest is None:
+                raw_digest = sha256(payload)
+                payload_digests[payload] = raw_digest
+            ledger_by_item[item.key] = {
                 "record": "tu",
                 "workload": item.workload,
                 "build": item.build,
                 "logical": item.logical,
-                "worker": 0,
-                "tu_seq": route_sequence,
+                "worker": worker,
+                "tu_seq": entry.tu_seq,
                 "rel_seq": route_sequence,
                 "route_sequence": route_sequence,
                 "raw_bytes": item.raw_bytes,
@@ -401,42 +495,70 @@ def build_ledger(
                     "cumulative_f_to_c_bytes": f_end,
                     "cumulative_emitted_block_definitions": emitted_blocks,
                     "selected_representation": selector_row["winner"],
+                    "shared_plan_digest": shared_digest,
                 },
                 "exact": True,
             }
-        )
-        c_total += c_delta
-        f_total += f_delta
-        c_prior, f_prior = c_end, f_end
-    if c_prior != len(c_data) or f_prior != len(f_data):
-        raise RuntimeError("P29 sink curve does not consume both directional streams")
+            c_total += c_delta
+            f_total += f_delta
+            c_prior, f_prior = c_end, f_end
+        if c_prior != len(c_data) or f_prior != len(f_data):
+            raise RuntimeError(f"P29 F{worker} curves do not consume both streams")
+        route_metadata[route_name] = {
+            "tus": len(route),
+            "c_to_f_bytes": len(c_data),
+            "f_to_c_bytes": len(f_data),
+            "c_to_f_sha256": sha256(c_sink),
+            "f_to_c_sha256": sha256(f_sink),
+            "encode_stdout_sha256": sha256(encode_stdout),
+            "replay_stdout_sha256": sha256(replay_stdout),
+            "shared_plan_digest": shared_digest,
+            "reconstruction": "pass",
+            "typed_sink_replay": "pass",
+        }
 
-    command_display = [str(codec.resolve()), "--manifest", str(manifest), *P29_OPTIONS, *extra_options]
+    ledger_rows = [ledger_by_item[entry.item.key] for entry in assigned]
+    command_display = [
+        str(codec.resolve()),
+        "--manifest",
+        str(manifest),
+        *P29_OPTIONS,
+        "--route-s1",
+        str(worker_count),
+        "--route-map",
+        str(route_map),
+        "--materialize-route",
+        "F",
+        *extra_options,
+    ]
     descriptor = {
         "record": "physical-ledger",
         "schema": "icecream-physical-codec-ledger-v1",
         "codec": "p29",
         "scenario": scenario.document["name"],
         "scenario_sha256": sim.sha256(scenario.path),
-        "assignment": "common simulator compile-only dispatch order; one materialized route",
+        "assignment": "common simulator compile-only dispatch order; ordered per-F projections",
         "dialogue_window_per_route": 1,
         "command": command_display,
         "codec_binary": str(codec.resolve()),
         "codec_binary_sha256": sha256(codec.resolve()),
         "manifest_sha256": sha256(manifest),
+        "route_map_sha256": sha256(route_map),
+        "shared_plan_digest": shared_digest,
+        "shared_block_count": shared_blocks,
         "directional_streams": {
-            "c_to_f": {"bytes": len(c_data), "sha256": sha256(c_sink)},
-            "f_to_c": {"bytes": len(f_data), "sha256": sha256(f_sink)},
+            "c_to_f": {"bytes": c_total},
+            "f_to_c": {"bytes": f_total},
         },
+        "routes": route_metadata,
         "reconstruction": {
             "status": "pass",
-            "method": "codec byte comparison plus typed directional sink replay",
-            "encode_stdout_sha256": sha256(encode_stdout),
-            "replay_stdout_sha256": sha256(replay_stdout),
+            "method": "per-route codec byte comparison plus typed directional sink replay; shared plan digests equal",
         },
-        "codec_cpu": "measured by the codec run, not scheduled in this ledger revision",
+        "codec_cpu": "measured by route materializer runs, not scheduled in this ledger revision",
         "limitations": [
-            "one C authority and one F route",
+            "one C authority",
+            "the deterministic shared catalogue/plan preparation is replayed per output route and digest-checked; its bytes and state are counted once logically",
             "route dialogue window fixed at one committed transaction",
         ],
     }
