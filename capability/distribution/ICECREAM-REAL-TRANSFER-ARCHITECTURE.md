@@ -18,23 +18,29 @@ implementation, but many TUs occupy different pipeline stages concurrently.
    They share the interner and definition implementation.
 3. Each cache-store incarnation receives a startup GUID. A cache relationship is identified by
    `(C_STORE_GUID, F_STORE_GUID)`. A TU is named `(C_STORE_GUID, TU_SEQ)`; `TU_SEQ` is unique
-   within that C-store lifetime and is an identifier, not an arrival-order requirement.
+   within that C-store lifetime and records the C cache's total PreparedTU admission order.
+   `REL_SEQ` is the contiguous ordinal in one destination F's order-preserving projection of
+   that total order.
 4. A C clone sends `CompileFileMsg` with a cache-reference input descriptor containing
    `(C_STORE_GUID, TU_SEQ)`. The F clone attaches that job to the same key in its local F cache.
    The job connection never carries DICT, LINES, or Fill payload.
 5. C cache and F cache exchange `DICT + LINES / NEED / FILL` over one persistent, multiplexed,
    full-duplex channel per active relationship. DICT contains the complete dependency manifest.
    F sends Need at `DICT_END` while C continues sending LINES, and C queues Fill as soon as Need
-   is processed. Many TU transactions are in flight at once.
-6. Root, Fill, and installed definitions are immutable and idempotent. There is no implicit
-   cross-TU decoder history. Any learned item needed later is an explicitly named cache object.
+   is processed. One dialogue is active per relationship initially; different F relationships
+   advance concurrently.
+6. Root, Fill, and installed definitions are immutable and idempotent. No hidden state crosses a
+   relationship. Route-local history belongs to one `(C_GUID, F arena)` and advances only in
+   `REL_SEQ` order. Globally reusable material is explicitly named and immutable.
 7. Clone lifetime and cache lifetime are independent. A clone ending detaches one compiler
    consumer; it does not cancel cache transfer or delete Root, definitions, or learned blocks.
 8. F cache retains a completed Root and its reusable objects under its normal cache policy.
    It creates reconstructed bytes only for an attached job and may discard that materialized
    byte buffer after consumption.
-9. The cache channel schedules bounded frames from many TUs. Fill and completion traffic may
-   move ahead of new Root frames; complete transactions are never serialized.
+9. The C uplink schedules bounded frames across the active head transaction of every F
+   relationship. Fill and completion traffic may move ahead of lower-priority body traffic, but
+   bounded priority bursts give an older flow a turn. A relationship starts TU `q+1` when TU `q`
+   commits; compilation of `q` may continue while `q+1` transfers.
 10. The scored size is every C-to-F socket byte, including cache-channel framing and job-control
     references. F-to-C Need and acknowledgement bytes are timed and logged separately.
 11. The existing transfer remains a complete fallback. Selection occurs before a TU begins its
@@ -92,11 +98,10 @@ The following are intentionally not frozen by this document:
 The letter F denotes a host/cache in the architecture and an F index in the simulator. An F may
 offer many compile slots. A slot is not a separate cache.
 
-The primary topology co-locates one producer pool and one C authority, so `C1` is unambiguous.
-For later multi-producer experiments, distinguish producer hosts from C-store authorities. Many
-producers may connect to one logical C authority and therefore share one C GUID; alternatively,
-each producer host may own a separate authority/GUID. Those are different cache and bandwidth
-topologies and must not share one label.
+The first deployment binds these names one-to-one: one submitting box owns one C cache authority,
+one C GUID, and one physical uplink. A later scenario with several submitting boxes represents
+independent authorities, GUIDs, uplinks, and F arenas. The simulator does not add a delegated
+egress layer between a submitting box and its C cache.
 
 ## Existing Icecream path
 
@@ -279,9 +284,9 @@ established format. For version 50 with `LEGACY_CHUNKS`, the receiver enters its
 does today but obtains stdin bytes from the local F cache attachment instead of the job socket.
 Diagnostics, object chunks, statistics, and `CompileResultMsg` remain on the job socket.
 
-The C clone learns `C_STORE_GUID` and `TU_SEQ` from local `PREPARE_ACCEPTED`; it does not need to
-know the F GUID. `PREPARED` later confirms immutable publication. The C cache learns F GUID
-through SESSION and internally binds the route. This removes a
+The C clone receives a local preparation handle at `PREPARE_ACCEPTED` and learns
+`C_STORE_GUID/TU_SEQ` when `PREPARED` publishes the immutable result. It does not need to know the
+F GUID. The C cache learns F GUID through SESSION and internally binds the route. This removes a
 needless clone round trip and makes daemon restart handling a cache-channel concern.
 
 Do not duplicate the compiler process loop in `daemon/workit.cpp`. Extract its input side behind
@@ -574,7 +579,8 @@ to `disconnected-retained`, keeps complete objects, and starts reconnect/idle-re
 |---|---|---|
 | `C_STORE_GUID` | one C-store incarnation | namespaces all C definitions and transactions |
 | `F_STORE_GUID` | one F-store incarnation | identifies the actual destination cache incarnation |
-| `TU_SEQ` | monotonically unique under one C GUID | names a TU transaction; does not impose delivery order |
+| `TU_SEQ` | contiguous PreparedTU admission order under one C GUID | names one immutable prepared TU |
+| `REL_SEQ` | contiguous projection under one `(C GUID, F arena)` | orders transfer and route-state commit |
 | `ID64` | one immutable definition under a C GUID | stable shared-cache key |
 | `LOCAL32` | one Root only | dense array index used during expansion |
 | `DELIVERY_ID` | one cache relationship | names one Fill batch for acknowledgement/replay |
@@ -592,17 +598,18 @@ simply `(C_STORE_GUID, TU_SEQ)`.
 
 ### 1. Allocate and prepare the TU on C
 
-`TU_SEQ` is allocated at `PREPARE_BEGIN`, before raw bytes arrive, so an F clone may attach and
-wait while preprocessing proceeds:
+`PREPARE_BEGIN` creates a local preparation handle. `TU_SEQ` is allocated when the complete,
+immutable PreparedTU is admitted to the C-global catalogue:
 
-1. C clone opens a bounded local session and sends `PREPARE_BEGIN`.
-2. C cache allocates `TU_SEQ` and replies `PREPARE_ACCEPTED(C_STORE_GUID, TU_SEQ)`.
-3. C clone forks the normal preprocessor and drains its pipe into `PREPARE_DATA` messages.
-4. The first version assembles one complete raw TU before interning and factorization.
-5. C cache interns lines/regions, assigns immutable ID64 values, selects superblocks, emits
+1. C clone opens a bounded local session and sends `PREPARE_BEGIN`; the session or a local-only
+   handle identifies the in-progress preparation.
+2. C clone forks the normal preprocessor and drains its pipe into `PREPARE_DATA` messages.
+3. The first version assembles one complete raw TU before interning and factorization.
+4. C cache interns lines/regions, assigns immutable ID64 values, selects superblocks, emits
    inline material, and constructs a dense `LOCAL32 -> ID64` map.
-6. C cache atomically publishes `PreparedTu` and replies `PREPARED(C_STORE_GUID, TU_SEQ)`.
-7. The prepared queue is bounded by both bytes and TU count. Build parallelism and that queue,
+5. C cache allocates the next `TU_SEQ`, atomically publishes `PreparedTu`, and replies
+   `PREPARED(C_STORE_GUID, TU_SEQ)`.
+6. The prepared queue is bounded by both bytes and TU count. Build parallelism and that queue,
    rather than the number of remote slots alone, bound memory.
 
 Allocation does not publish a partial transaction. Before `PREPARED`, the key may exist only as
@@ -613,8 +620,8 @@ The PreparedTu is independent of its destination. Two client orderings fit the s
 
 ```text
 minimal first patch:
-  GetCS/UseCS -> establish cache SESSION -> PREPARE_BEGIN/TU_SEQ -> send cache job reference
-  -> preprocess/prepare -> ROUTE -> cache transfer
+  GetCS/UseCS -> establish cache SESSION -> PREPARE_BEGIN -> preprocess/prepare/TU_SEQ
+  -> ROUTE -> send cache job reference -> cache transfer
 
 later measured option:
   PREPARE_BEGIN -> preprocess/prepare -> GetCS/UseCS -> establish cache SESSION
@@ -653,7 +660,7 @@ Root is one logical transaction split at the earliest useful dependency boundary
 
 | Component | Meaning |
 |---|---|
-| DICT header | C GUID, TU sequence, generation, raw length, component counts |
+| DICT header | C GUID, TU sequence, relationship sequence, generation, raw length, component counts |
 | DICT used map | dense `LOCAL32 -> ID64` vector containing every shared dependency |
 | DICT block metadata | immutable identifiers needed to interpret the body token stream |
 | LINES body | ordered local32/superblock token stream |
@@ -662,7 +669,8 @@ Root is one logical transaction split at the earliest useful dependency boundary
 C cache sends `DICT_BEGIN`, the complete DICT, and `DICT_END`, then continues with LINES frames.
 F can determine the exact missing ID64 set at `DICT_END`; it does not wait for `LINES_END`.
 Because the cache channel is full duplex, F sends Need in the reverse direction while C continues
-transmitting LINES for this and other TUs.
+transmitting this TU's LINES. Other F relationships may progress concurrently through the shared
+C-uplink scheduler.
 
 ```text
 time -------------------------------------------------------------------->
@@ -673,13 +681,15 @@ C CPU:                                  build FILL(343)
 C -> F:                                             FILL at next queue quantum
 ```
 
-Frames are ordered within each DICT or LINES component; frames from other transactions may
-appear between them. `DICT_END` is the Need barrier. `LINES_END`, all dependencies resident, and
-a live job attachment are the three conditions for compiler input readiness.
+Frames are ordered within each DICT or LINES component. Frames for other F relationships may
+appear between this relationship's writer quanta, but the next TU on this relationship starts
+only after the current transaction commits. `DICT_END` is the Need barrier. `LINES_END`, all
+dependencies resident, and a live job attachment are the three conditions for compiler input
+readiness.
 
-Root is self-describing with explicit IDs. Arrival order between TUs has no semantic meaning.
-Any candidate codec that learns across TUs must publish its learned artifacts as immutable,
-named definitions or named model checkpoints. It may not rely on an unrecorded decoder history.
+Root is self-describing with explicit IDs. Cross-F completion order has no semantic meaning.
+Within one F arena, route-local codec history advances exactly at committed `REL_SEQ`; globally
+reusable learned artifacts remain immutable, named definitions or model checkpoints.
 
 ### 4. Compute Need
 
@@ -690,16 +700,17 @@ transaction's full dependency set while LINES continues arriving. Its semantic r
 NEED(C_STORE_GUID, TU_SEQ, sorted unique missing ID64 set)
 ```
 
-Multiple concurrently received Roots may report overlapping Need sets. This is harmless: the
-persistent cache channel delivers all Need messages to the one C cache that owns the definitions.
+Need sets from different F relationships may overlap. The persistent channels deliver all of
+them to the one C cache that owns the definitions, while each F receives the objects missing from
+its own arena.
 
 ### 5. Materialize and send Fill
 
-C cache compares each Need with definitions already assigned to an unacknowledged Fill on this
-relationship. Fill construction overlaps the remaining LINES transfer. As soon as an encoded
-Fill buffer is ready, it enters the relationship's Fill-priority queue and is submitted at the
-next bounded writer quantum; already-submitted bytes cannot be overtaken. C sends each definition
-once while that delivery is active and may satisfy many transactions with one cache-scoped Fill:
+C cache builds Fill from the active transaction's Need. Fill construction overlaps the remaining
+LINES transfer. As soon as an encoded Fill buffer is ready, it enters the relationship's
+Fill-priority queue and is submitted at the next bounded writer quantum; already-submitted bytes
+cannot be overtaken. Each completed definition is installed once in that F arena and is then
+available to later `REL_SEQ` values:
 
 ```text
 FILL(DELIVERY_ID,
@@ -743,34 +754,34 @@ The compiler result, diagnostics, and object file continue over the normal job c
 
 ## Concurrency example
 
-Suppose transactions A, B, and C are launched together and need:
+Suppose global admission is `A, B, C, D`, routing projects it as:
 
 ```text
-A -> {1,2,3}
-B -> {2,3,4}
-C -> {3,4,5}
+Fa: A(REL_SEQ 0), C(REL_SEQ 1)
+Fb: B(REL_SEQ 0), D(REL_SEQ 1)
 ```
 
-Their DICT and LINES frames may be interleaved. F emits each Need as soon as that transaction's
-DICT completes, regardless of whether its LINES has completed. If Need arrives at C cache in
-order B, C, A:
+At time zero, A and B may be the active transaction on their independent relationships. Their
+writer quanta share the one physical C uplink. Each F emits Need as soon as its active DICT
+completes, regardless of whether that TU's LINES has completed. Fill takes the next permitted
+quantum on that relationship. If B commits first, D may begin while A is still transferring:
 
 ```text
-Need B -> Fill delivery 70: {2,3,4}
-Need C -> Fill delivery 71: {5}; {3,4} already in delivery 70
-Need A -> Fill delivery 72: {1}; {2,3} already in delivery 70
+Fa: A [DICT -> Need -> LINES/Fill -> commit] -> C [starts]
+Fb: B [DICT -> Need -> LINES/Fill -> commit] -> D [starts]
+                         |                         |
+                         +-- B compiler continues while D transfers
 ```
 
-Fill deliveries may also arrive in any order. F installs `{1}`, `{5}`, and `{2,3,4}` into the
-same shared store. Each transaction becomes ready when its complete dependency set is resident.
-All five definitions cross C-to-F once in the normal path; no clone waits for another clone to
-finish its complete transaction.
+Cross-F completion may reorder. Fa's state nevertheless advances only A then C, and Fb's state
+only B then D. Objects installed for A remain available when C computes Need. The same object may
+still cross again to Fb because its arena is independent.
 
 The cache-channel sender uses a bounded frame scheduler, initially:
 
 1. Fill and completion/control traffic;
 2. continuation frames required to reach an already-started `DICT_END`;
-3. bounded LINES continuation quanta and new DICT starts under deficit round-robin;
+3. bounded LINES continuation quanta and relationship-head DICT starts under deficit round-robin;
 4. unrelated bulk cache work.
 
 A DICT is kept compact and normally completed without interleaving so F can launch Need quickly.
@@ -783,10 +794,10 @@ Round-robin within a class prevents a large TU from occupying the channel indefi
 quantum is a measured parameter, not part of codec semantics. Start with the existing roughly
 100 KiB scale and compare 64, 128, 256, and near-1-MiB frames.
 
-One persistent full-duplex socket per relationship is the first implementation. The physical
-link already emits one byte stream, while multiplexing avoids stop-and-wait at the transaction
-level. Multiple transport lanes remain a measured fallback only if one socket/I/O loop fails to
-fill the link; they do not alter transaction identity or cache state.
+One persistent full-duplex socket per relationship is the first implementation. The C-uplink
+scheduler multiplexes these relationship sockets while each socket carries one active dialogue.
+Multiple transport lanes per relationship remain a measured later option only if a singleton
+dialogue leaves the physical link idle; they do not alter transaction identity or cache state.
 
 ## Clone-independent lifetime
 
@@ -818,20 +829,22 @@ normal policy, after which a future Need restores it.
 
 ## Cache-channel interruption and restart
 
-The cache dialogue is replayable:
+The one-dialogue relationship deliberately makes replay a one-cursor operation:
 
-1. Every Root transaction and Fill batch has a stable identifier.
-2. F acknowledges complete Fill batches with `FILL_APPLIED` and ready transactions with
-   `CACHE_READY`.
-3. C retains unacknowledged encoded buffers within a bounded resend window.
-4. On reconnect under the same GUID pair, peers exchange acknowledged watermarks/sets and C
-   resends incomplete frames or whole idempotent batches.
-5. A restarted F cache has a new F GUID. C treats it as a cold destination and responds to its
-   Needs without trusting state associated with the old GUID.
-6. A restarted C cache has a new C GUID. Old F entries remain isolated under the old namespace
-   until ordinary eviction.
+1. Every PreparedTU, Root, and complete Fill object has a stable identity and digest.
+2. F retains `next_REL_SEQ`, the committed route-state digest, installed immutable objects, and
+   an arena epoch for each C GUID.
+3. C retains the current encoded transaction until its relationship commit is acknowledged.
+4. On reconnect, F returns its arena epoch, `next_REL_SEQ`, and route-state digest. If they match
+   C's retained committed state, C replays at most the one current transaction from its start.
+5. Complete immutable objects installed before interruption remain present; partial frames and
+   the incomplete active overlay are discarded. F recomputes Need from its actual object set.
+6. A restarted F cache, or an explicitly discarded arena, reports a new epoch and begins cold.
+7. A restarted C cache uses a new C GUID. Old F entries remain separate until ordinary eviction.
 
-No compiler clone owns progress for the cache channel.
+Only one live session epoch may advance a relationship. Repeating the same `REL_SEQ` with the
+same transaction digest has the same effect; a different digest for that cursor is an exactness
+error. No compiler clone owns cache-channel progress.
 
 ## Many Fs and many Cs
 
@@ -848,7 +861,7 @@ Each F retains the subset it has learned. Cold definition bytes are therefore re
 per destination F that actually needs them. Scheduler affinity reduces this replication when
 load permits, but round-robin placement remains valid.
 
-With sixteen independent C authorities (`P16C16`), an F cache partitions state by C GUID:
+With sixteen independent submitting boxes, an F cache partitions state by C GUID:
 
 ```text
 F cache
@@ -859,8 +872,8 @@ F cache
 ```
 
 At most one persistent channel is needed for each active GUID pair, not one per compiler slot.
-With sixteen producers sharing one authority (`P16C1`), F sees one C namespace and one logical
-authority relationship even though producer-side admission may be concurrent.
+Each submitting box retains its own authority, GUID, and uplink; the first simulator does not
+combine them behind a shared logical authority.
 
 ## Topology, bandwidth, and launch semantics
 
@@ -869,9 +882,7 @@ human-readable names:
 
 | Field | Meaning |
 |---|---|
-| `producer_count` | number of C-side producer hosts/pools |
-| `c_store_count` | number of independent C cache authorities/GUIDs |
-| `producer_to_c_store` | explicit mapping when producer and authority counts differ |
+| `c_count` | number of independent submitting boxes/C authorities/GUIDs/uplinks |
 | `f_count` | number of F hosts/caches |
 | `slots_per_f` | simultaneous compiler jobs available on each F, not across all Fs |
 | `c_uplink_bps` | aggregate C-to-network limit for one C across all of its F relationships |
@@ -897,10 +908,9 @@ If a test intentionally grants per-route bandwidth, say so explicitly, for examp
 `C1F20_200B20G_R1G`. Optional nondefault suffixes are `I` for each F's ingress ceiling,
 `R` for each C/F route ceiling, and `X` for the shared fabric ceiling.
 
-Here `C1` is shorthand for the common one-to-one case `P1C1`: one producer pool using one C
-authority. A multi-producer name must spell out both counts when they differ. For example,
-`P16C1F20_200B1G` means sixteen producers share one authority/GUID and its 1-Gbit/s limit, while
-`P16C16F20_200B1G` means sixteen independent authorities/GUIDs, each with a 1-Gbit/s limit.
+`C1` means exactly one submitting box, C authority, GUID, and shared C uplink. `C16` means sixteen
+independent instances of that unit. Each has its own configured C-uplink capacity; F ingress and
+the shared fabric may still couple their physical progress.
 
 Two large-capacity controls need careful interpretation:
 
@@ -920,15 +930,15 @@ they are not the primary deployment topology.
 
 One C is one source host and one authoritative cache, not one serial compile process. A build may
 run many C clones and preprocessor children concurrently. The scheduler may assign their TUs to
-many Fs. The simulator and product implementation must therefore avoid a per-C stop-and-wait
-queue:
+many Fs. The simulator and product implementation therefore admit globally without a per-C
+stop-and-wait queue, then use one ordered active dialogue independently on each F relationship:
 
 ```text
 one C host
   C clone 17 -> preprocess TU17 -> prepare -> route Fa
   C clone 18 -> preprocess TU18 -> prepare -> route Fc
   C clone 19 -> preprocess TU19 -> prepare -> route Fb
-  ... all overlap subject to measured local producer capacity and bounded buffers
+  ... Fa/Fb/Fc heads overlap subject to the one C uplink and bounded buffers
 ```
 
 TU release is governed by the measured producer/preprocessor readiness trace and explicit local
@@ -948,11 +958,11 @@ The first product/simulator acceptance matrix should include:
 | Purpose | Topology |
 |---|---|
 | single-destination byte/timing reference | `C1F1_1000000B1G` |
-| primary large-F farm | `C1F20_200B1G` |
-| same farm with faster C source | `C1F20_200B10G` |
-| shared-authority multi-producer contention | `P16C1F20_200B1G`, with explicit producer/authority link limits |
-| independent-authority contention | `P16C16F20_200B1G`, plus explicit F ingress and fabric limits |
-| cache-distribution comparison | primary topology under round-robin and GUID-sticky placement |
+| large-slot 1-Gbit/s and 10-Gbit/s controls | `C1F1_10000B1G`, `C1F1_10000B10G` |
+| active-F width sweep, 200 slots/F, one shared 1-Gbit/s uplink | `C1F1_200B1G`, `C1F2_200B1G`, `C1F3_200B1G`, `C1F4_200B1G`, `C1F20_200B1G` |
+| same active-F width sweep with faster C source | replace `B1G` with `B10G` |
+| independent-C contention | `C16F20_200B1G`, with explicit F ingress and fabric limits |
+| cache-distribution comparison | width sweep under round-robin and bounded sticky-frontier placement |
 
 Every result header must print the expanded capacities, not only the concise name. Otherwise a
 per-route 1-Gbit run and a shared-uplink 1-Gbit run are too easy to confuse.
@@ -1017,8 +1027,8 @@ payload
 
 | type3 | Class | Examples |
 |---:|---|---|
-| 0 | SESSION | HELLO, GUID pair, codec capabilities, resume summary |
-| 1 | ROOT | DICT/DICT_END and LINES/LINES_END frames for multiplexed transactions |
+| 0 | SESSION | HELLO, GUID pair, arena epoch, codec capabilities, `next_REL_SEQ`, route-state digest |
+| 1 | ROOT | `TU_SEQ/REL_SEQ`, DICT/DICT_END, and LINES/LINES_END for the active transaction |
 | 2 | NEED | TU key and missing ID64 set |
 | 3 | FILL | delivery ID and immutable definitions |
 | 4 | ACK | Fill applied and frame/batch progress |
@@ -1039,8 +1049,8 @@ different job or cache protocol.
 ```text
 C clone <-> C cache:
     ENSURE_ROUTE(F endpoint) / SESSION_READY(F GUID, profile)
-    PREPARE_BEGIN / PREPARE_ACCEPTED(C GUID, TU sequence)
-    PREPARE_DATA* / PREPARE_END / PREPARED
+    PREPARE_BEGIN / PREPARE_ACCEPTED(local preparation handle)
+    PREPARE_DATA* / PREPARE_END / PREPARED(C GUID, TU sequence)
     ROUTE(TU sequence, F endpoint)
     TAKE_LEGACY_INPUT / RAW_DATA* / RAW_END
     DETACH
@@ -1223,7 +1233,7 @@ global local-event sequence
 monotonic timestamp
 process/store role
 C_STORE_GUID and F_STORE_GUID when known
-TU_SEQ and DELIVERY_ID when applicable
+TU_SEQ, REL_SEQ, and DELIVERY_ID when applicable
 event/action name
 before and after transaction state
 frame class, logical payload bytes, and physical socket bytes
@@ -1329,9 +1339,9 @@ current F_STORE_GUID or unknown-before-SESSION
 SESSION state and selected codec profile
 one CacheChannel
 priority queues and partial write cursor
-routed TU table
-active definition -> DELIVERY_ID coalescing table
-unacknowledged immutable Fill batches
+ordered PreparedTU queue with assigned REL_SEQ values
+one active transaction and its unacknowledged immutable Fill batches
+next committed REL_SEQ and route-state digest
 reconnect state and byte counters
 ```
 
@@ -1345,10 +1355,9 @@ One `FNamespace` is keyed by `C_STORE_GUID` and owns:
 
 ```text
 complete immutable definitions by ID64
-in-progress definition reservations and dependent TU waiters
-transactions by TU_SEQ
-Root/DICT/LINES receive state
-local clone attachments
+next REL_SEQ and committed route-state digest
+one active transaction overlay and missing-ID set
+queued local clone attachments by TU_SEQ
 materialized or streaming output state
 retention/eviction metadata
 current cache-channel attachment and reply queues
@@ -1374,21 +1383,20 @@ materialized. A cache-ready transaction may be retained without an attachment. M
 attachments are allowed only when retry policy explicitly wants them; otherwise a second active
 consumer is refused as duplicate work while the cache object remains valid.
 
-### Dependency waiter structure
+### Active dependency set
 
-Do not scan all live TUs after every Fill. On DICT completion, each missing ID records a waiter
-reference to the transaction. Installing an ID removes that one dependency and decrements each
-waiter's unresolved count. The final decrement posts a readiness check to the namespace owner.
-Reservations are namespace-local:
+The singleton relationship does not need a cross-TU waiter index. At DICT completion, the active
+transaction records its missing-ID set. Installing a complete object updates the arena store and
+removes that ID from the active set. Removing the final ID posts one readiness check to the arena
+owner:
 
 ```text
-missing ID64 -> {
-    state: unrequested | requested(delivery/Need) | installed
-    waiting TU_SEQ list
-}
+active transaction -> {missing ID64 set, lines_complete, attachment}
+arena object store -> immutable ID64 objects retained for later REL_SEQ values
 ```
 
-This structure coalesces simultaneous cold Roots without coupling compiler-clone lifetimes.
+Different relationships perform this independently. A future wider relationship window may add
+a waiter index after measurement; it is not needed in the first implementation.
 
 ## Implementation sequence and coherent commit boundaries
 
@@ -1437,9 +1445,10 @@ Build the new I/O library with one in-process C/F loopback and no Icecream daemo
 - reconnect preserving application-level objects.
 
 Use a raw-root integration codec initially if necessary: empty dependency DICT plus raw LINES.
-It is an implementation probe, not a compression result. Acceptance proves that 32 or more TUs
-can be multiplexed, Fill takes the next permitted quantum, a slow relationship does not stop a
-ready relationship, and measured socket bytes equal the frame ledger.
+It is an implementation probe, not a compression result. Acceptance proves that 20 independent
+relationships can share one C uplink, each relationship has one active dialogue, Fill takes the
+next permitted quantum, a slow relationship does not stop a ready relationship, and measured
+socket bytes equal the frame ledger.
 
 ### Stage 3: sidecar and local clone sessions
 
@@ -1538,8 +1547,9 @@ Minimum scenario order:
 3. protocol-50 physical codec 1C/1F cold then warm;
 4. automatic fallback with old F;
 5. automatic fallback after cache-channel attempt interruption;
-6. 32 concurrent TUs over one cache relationship;
-7. 1C/20F with 200 slots/F and shared C bandwidth enforcement;
+6. several queued TUs on one relationship, proving one active dialogue and compile/next-transfer
+   overlap;
+7. 1C with 1/2/3/4/20 Fs at 200 slots/F, proving one shared C bandwidth ceiling;
 8. multi-C/F namespace partition and reconnect;
 9. zero-gap repeated builds;
 10. retention-specific run with an explicit idle gap.
@@ -1586,41 +1596,6 @@ The flow allocator applies all applicable ceilings through max-min sharing. Hist
 scenario files and ledgers keep their original labels and hashes; no conversion or silent
 reinterpretation is needed.
 
-Topology v2 is also executable. `environment` is the producer index, and the scenario supplies
-two total maps:
-
-```text
-producer -> logical C authority
-producer -> physical C egress group
-```
-
-Codec relationship ordering is keyed by `(authority, egress, F)`, so two delegated egress lanes
-may carry work for one shared authority without pretending they are independent cache
-authorities. Physical endpoint serialization is keyed by `(egress, F)`. The allocator can apply
-all of these at once:
-
-```text
-network.<direction>.per_producer_bits_per_second
-network.<direction>.per_authority_bits_per_second
-network.<direction>.per_egress_bits_per_second
-network.<direction>.per_worker_bits_per_second
-network.<direction>.bits_per_second
-network.<direction>.fabric_bits_per_second
-network.shared_fabric_bps
-```
-
-This distinguishes the required controls without changing byte ledgers:
-
-```text
-P16A1E1    sixteen producers, one shared state authority, one central egress
-P16A1E16   sixteen producers, one shared state authority, delegated egress
-P16A16E16  sixteen independent authorities and egresses
-```
-
-Every event and assignment carries producer, authority, and egress IDs. The JSONL samples retain
-separate producer, authority, egress, F, route, and fabric rates, so an authority ceiling cannot
-be mistaken for an egress or fabric ceiling.
-
 The current raw adapter models one complete raw-TU transfer before compilation; that is a
 conservative control, not a cycle-accurate model of protocol 44's within-TU streaming. The
 executable adapters are `compile-only`, `raw`, `p29`, and `grz`. The latter two require a
@@ -1650,20 +1625,26 @@ after compiler completion and state commit have both occurred. The current physi
 is a one-node current-TU graph on each independent route.
 
 The next simulator component remains one live stateful cache-channel adapter, not another
-simulator:
+simulator. Its core objects are `PreparedTU`, `RelationshipQueue[(C,F)]`,
+`ActiveTransaction[(C,F)]`, `FArena[(C,F)]`, `COutScheduler[C]`, and `CompilerPool[F]`:
 
 1. shared C-uplink, per-F-ingress, per-route, and optional fabric limits applied simultaneously;
 2. C preparation/EOF and a byte-bounded prepared queue;
 3. one persistent relationship channel for every active `(C,F)` pair;
 4. multiplexed DICT and LINES flows released when their TUs are prepared and routed;
 5. F-generated Need at `DICT_END` using actual resident state while LINES continues;
-6. C-side active-Fill coalescing across independent Need sets;
+6. C-side Fill construction from canonical definitions, with encoded-buffer reuse where useful
+   but separate bytes charged to every F arena that needs the object;
 7. Fill delivery that installs definitions and wakes every dependent TU;
 8. job-reference arrival independent of cache-data arrival;
 9. compilation start only when attachment and cache readiness both exist;
-10. a wider relationship dialogue window with explicit state-consistent route lanes;
+10. explicit `TU_SEQ`, per-route `REL_SEQ`, committed route-state digest, and one active dialogue
+    per relationship;
 11. `legacy`/`auto`/`cache` selection and whole-attempt fallback accounting;
 12. exact C-to-F frame bytes, separate reverse bytes/time, CPU stages, and peak buffers.
+
+A wider relationship window is a later measured option only if the singleton dialogue leaves the
+C uplink idle. It is not part of the first comparison.
 
 For roughly 90% timing fidelity, DICT, LINES, and Fill begin as logical bandwidth-sharing flows.
 Frame overhead is charged analytically, and Fill precedence is represented at configurable
@@ -1687,7 +1668,10 @@ for zero-gap inputs because cache timers observe real simulated time.
 
 - reconstruct every TU byte-for-byte and compile it through a real compiler pipe;
 - job reference before Root and Root before job reference;
-- at least 32 concurrent Roots multiplexed over one cache channel;
+- global C admission order projects to contiguous `REL_SEQ` order on every F;
+- one relationship keeps at most one active dialogue while different relationships progress
+  concurrently;
+- a committed TU's compilation overlaps the next transfer on the same relationship;
 - Need emitted at `DICT_END` while the same transaction's LINES remains in flight;
 - Fill inserted at the first permitted writer quantum after Need processing;
 - three overlapping Need sets resulting in one transmitted copy of each active missing ID;
@@ -1700,8 +1684,9 @@ for zero-gap inputs because cache timers observe real simulated time.
 - frame splits at zero, one byte, selected scheduler quantum, and the 1-MiB outer limit;
 - established-path fallback from an already prepared raw TU, including a failed cache attempt;
 - `C1F1_1000000B1G` reference and primary `C1F20_200B1G` scenario;
-- `P16C1F20_200B1G` and `P16C16F20_200B1G` contention with explicit endpoint/fabric bandwidth and both
-  round-robin/GUID-sticky placement;
+- `C1F1/2/3/4/20_200B1G` with one identical shared C uplink and identical global admission order;
+- independent `C16F20_200B1G` contention with explicit C/F/fabric bandwidth and both
+  round-robin/bounded-sticky placement;
 - zero artificial launch/build gaps in primary runs and explicit gaps only in retention runs;
 - bounded memory with a deliberately large ready queue.
 
@@ -1767,8 +1752,8 @@ cold path if byte targets are met. Warm throughput and simulated completion over
     cheaper and simpler than advertising a dedicated cache port?
 12. What SESSION-ready deadline gives `auto` a quick established-path fallback without discarding
     cache mode during ordinary daemon startup?
-13. Under `C1F20_200B1G`, how much completion time changes between round-robin and
-    GUID-sticky placement after accounting for shared C uplink, F ingress, and repeated Fill?
+13. Across `C1F1/2/3/4/20_200B1G`, what is the smallest warm F frontier that prevents compiler
+    starvation after accounting for the shared C uplink and repeated Fill?
 14. Which prepared-queue TU/byte ceilings retain producer parallelism without holding multiple
     copies of too many large preprocessed inputs?
 
@@ -1786,9 +1771,9 @@ simulator as its measurement companion. The highest-value review questions are:
    scheduler state or one bulk connection per job?
 3. Is `CompileFileMsg::InputDescriptor` the correct and sufficient job/cache rendezvous seam?
 4. Does DICT contain everything F needs to emit its one exact Need at `DICT_END`, independently
-   of LINES arrival and cross-TU decoder history?
-5. Are active Fill coalescing and the F dependency-waiter structure sufficient for many
-   simultaneous cold TUs without serializing transactions?
+   of LINES arrival, while naming the expected predecessor route-state digest?
+5. Is one active missing-ID set per relationship sufficient for the first implementation, with
+   object reuse supplied by the arena store and concurrency supplied across F relationships?
 6. Which F NamespaceRuntime should be the first implementation: process per C GUID, dedicated
    thread/Asio context per C GUID, or shared contexts with a strand per GUID? In particular,
    please evaluate the dedicated-thread option rather than assuming it must eventually be the
@@ -1801,9 +1786,8 @@ simulator as its measurement companion. The highest-value review questions are:
    reconnect, and cache reuse?
 10. Are the primary topology semantics and zero-gap launch rules sufficient to prevent a
     per-route-bandwidth result from being mistaken for a shared-C-uplink result?
-11. Confirm the deployment mapping for multiple producers: `P16C1` (one shared C authority/GUID)
-    or `P16C16` (one authority/GUID per producer host). The primary `P1C1` path is identical,
-    but F namespace count, C uplink placement, and sidecar deployment differ at scale.
+11. Does the `C1F1/2/3/4/20` width sweep expose enough information to choose a bounded sticky
+    frontier before adding independent multi-C scenarios?
 
 Prefer simplifications that remove objects, states, messages, copies, or commit stages. Preserve
 the essential snap-together boundaries:
@@ -1816,6 +1800,6 @@ codec/state library
 ```
 
 The first accepted implementation does not need every later optimization. It does need one exact
-full-TU round trip, real compiler-pipe execution, automatic fallback, multiple in-flight TUs, one
-persistent cache relationship, bounded memory, and a byte/time ledger that agrees with the
-physical socket path.
+full-TU round trip, real compiler-pipe execution, automatic fallback, concurrent relationships,
+one ordered dialogue per relationship, bounded memory, and a byte/time ledger that agrees with
+the physical socket path.

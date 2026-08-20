@@ -73,26 +73,47 @@ def scenario_document(name: str, workers: int, slots: int) -> dict[str, object]:
 
 
 class SuiteTest(unittest.TestCase):
-    def test_checked_in_topology_v2_suite_has_expected_physical_limits(self) -> None:
+    def test_shared_uplink_f_width_suite_shape(self) -> None:
         root = Path(__file__).parent
-        with tempfile.TemporaryDirectory() as directory:
-            matrix, _ = suite.run_suite(
-                root / "topology-v2-smoke-suite.json",
-                Path(directory),
-                require_payload=True,
-            )
+        suite_document, scenario_paths = suite.load_suite(
+            root / "firefox-f-width-suite.json"
+        )
         self.assertEqual(
-            [row["topology"] for row in matrix],
+            suite_document["diagnostic_codecs"], ["compile-only", "raw"]
+        )
+        self.assertEqual(
+            [json.loads(path.read_text())["workers"]["f_count"] for path in scenario_paths],
+            [1, 2, 3, 4, 20],
+        )
+        self.assertEqual(
             [
-                "P2A1E1F2_1E72X144",
-                "P2A1E2F2_1E72X144",
-                "P2A1E2F2_1A72E72X144",
+                suite.sim.topology_label(json.loads(path.read_text()))
+                for path in scenario_paths
+            ],
+            [
+                "C1F1_200B1G",
+                "C1F2_200B1G",
+                "C1F3_200B1G",
+                "C1F4_200B1G",
+                "C1F20_200B1G",
             ],
         )
-        self.assertEqual(
-            [row["wall_makespan_ns"] for row in matrix],
-            [2_000_000_001, 1_000_000_001, 2_000_000_001],
-        )
+        for path in scenario_paths:
+            document = json.loads(path.read_text())
+            self.assertEqual(document["environments"]["env_count"], 1)
+            self.assertEqual(document["workers"]["template"]["slots"], 200)
+            self.assertEqual(
+                document["workers"]["template"]["input_staging_slots"], 400
+            )
+            job = document["environments"]["job_selection"]["jobs"][0]
+            self.assertEqual(job["builds"], 5)
+            self.assertEqual(job["build_release"], {"mode": "after-previous", "gap_ns": 0})
+            for direction in ("c_to_f", "f_to_c"):
+                link = document["network"][direction]
+                self.assertEqual(link["per_environment_bits_per_second"], 1_000_000_000)
+                self.assertEqual(link["bits_per_second"], 40_000_000_000)
+                self.assertEqual(link["per_worker_bits_per_second"], 40_000_000_000)
+                self.assertEqual(link["fabric_bits_per_second"], 40_000_000_000)
 
     def test_requested_firefox_suite_shape(self) -> None:
         root = Path(__file__).parent
@@ -156,6 +177,11 @@ class SuiteTest(unittest.TestCase):
             self.assertEqual({row["cold_builds"] for row in matrix}, {1})
             self.assertEqual({row["warm_builds"] for row in matrix}, {1})
             self.assertEqual({row["summed_generation_ns"] for row in matrix}, {10})
+            self.assertEqual({row["summed_capacity_floor_ns"] for row in matrix}, {10})
+            self.assertEqual(
+                {row["summed_generation_over_capacity_floor"] for row in matrix},
+                {1.0},
+            )
             self.assertEqual({row["wall_makespan_ns"] for row in matrix}, {610})
             self.assertEqual(
                 {row["gap_from_previous_finish_ns"] for row in builds}, {"", 600}

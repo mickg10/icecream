@@ -109,7 +109,10 @@ def file_equals_prefix(actual_path: Path, expected_path: Path, byte_count: int) 
 
 def assignment_routes(
     scenario: sim.LoadedScenario,
-) -> dict[tuple[int, int, int], list[sim.WorkItem]]:
+) -> tuple[
+    dict[tuple[int, int], list[sim.WorkItem]],
+    dict[tuple[str, int, int], tuple[int, int]],
+]:
     diagnostic = sim.Simulator(
         scenario, sim.CompileOnlyAdapter(), snapshot_interval_ns=10**30
     ).run()
@@ -118,13 +121,15 @@ def assignment_routes(
         for items in scenario.work_items.values()
         for item in items
     }
-    routes: dict[tuple[int, int, int], list[sim.WorkItem]] = defaultdict(list)
+    routes: dict[tuple[int, int], list[sim.WorkItem]] = defaultdict(list)
+    identities: dict[tuple[str, int, int], tuple[int, int]] = {}
     for row in diagnostic.assignments:
         item = by_key[(row["workload"], int(row["build"]), int(row["logical"]))]
-        routes[(item.authority, item.egress, int(row["worker"]))].append(item)
+        routes[(item.environment, int(row["worker"]))].append(item)
+        identities[item.key] = (int(row["tu_seq"]), int(row["rel_seq"]))
     if sum(map(len, routes.values())) != len(by_key):
         raise AssertionError("diagnostic assignment did not cover every scenario TU")
-    return dict(routes)
+    return dict(routes), identities
 
 
 def write_route_input(
@@ -304,7 +309,7 @@ def build_ledger(
     scenario = sim.load_scenario(scenario_path)
     if not binary.is_file():
         raise ValueError(f"GRZ binary is absent: {binary}")
-    routes = assignment_routes(scenario)
+    routes, identities = assignment_routes(scenario)
     for items in routes.values():
         for item in items:
             if not item.payload.is_file():
@@ -316,8 +321,8 @@ def build_ledger(
     route_metadata: dict[str, object] = {}
     payload_digests: dict[Path, str] = {}
     total_c_to_f = 0
-    for (authority, egress, worker), items in sorted(routes.items()):
-        route_name = f"A{authority}-E{egress}-F{worker}"
+    for (environment, worker), items in sorted(routes.items()):
+        route_name = f"C{environment}-F{worker}"
         physical_bytes, metadata = build_route(
             binary.resolve(), work / route_name, items, extra_options, stride
         )
@@ -325,6 +330,8 @@ def build_ledger(
         cumulative = 0
         cumulative_raw = 0
         for route_sequence, (item, byte_count) in enumerate(zip(items, physical_bytes)):
+            if identities[item.key][1] != route_sequence:
+                raise AssertionError("GRZ route order differs from simulator REL_SEQ")
             payload = item.payload.resolve()
             raw_digest = payload_digests.get(payload)
             if raw_digest is None:
@@ -338,10 +345,9 @@ def build_ledger(
                 "workload": item.workload,
                 "build": item.build,
                 "logical": item.logical,
-                "producer": item.environment,
-                "authority": item.authority,
-                "egress": item.egress,
                 "worker": worker,
+                "tu_seq": identities[item.key][0],
+                "rel_seq": identities[item.key][1],
                 "route_sequence": route_sequence,
                 "raw_bytes": item.raw_bytes,
                 "raw_sha256": raw_digest,
@@ -382,10 +388,7 @@ def build_ledger(
         "codec": "grz",
         "scenario": scenario.document["name"],
         "scenario_sha256": sim.sha256(scenario.path),
-        "assignment": (
-            "common simulator compile-only dispatch order, partitioned by "
-            "(authority,egress,F) route lane"
-        ),
+        "assignment": "common simulator compile-only dispatch order, partitioned by (C,F)",
         "dialogue_window_per_route": 1,
         "command_options": list(GRZ_OPTIONS) + extra_options,
         "codec_binary": str(binary.resolve()),

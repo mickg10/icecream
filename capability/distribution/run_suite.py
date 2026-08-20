@@ -109,8 +109,14 @@ def run_suite(
         for codec in selected_codecs:
             run_start = time.perf_counter()
             print(f"RUN {scenario.document['name']} codec={codec}", flush=True)
-            result = sim.Simulator(scenario, ADAPTERS[codec]()).run()
             run_directory = output_directory / str(scenario.document["name"]) / codec
+            run_directory.mkdir(parents=True, exist_ok=True)
+            result = sim.Simulator(
+                scenario,
+                ADAPTERS[codec](),
+                timeline_spool_path=run_directory / ".timeline-spool.jsonl",
+                event_spool_path=run_directory / ".event-spool.jsonl",
+            ).run()
             sim.write_result(scenario, result, run_directory)
             wall_seconds = time.perf_counter() - run_start
             row = {
@@ -120,9 +126,6 @@ def run_suite(
                 ),
                 "codec": codec,
                 "environments": result.summary["environments"],
-                "producers": result.summary["producers"],
-                "authorities": result.summary["authorities"],
-                "egress_groups": result.summary["egress_groups"],
                 "workers": result.summary["workers"],
                 "slots_per_worker": result.summary["slots_per_worker"],
                 "total_worker_slots": result.summary["total_worker_slots"],
@@ -135,6 +138,18 @@ def run_suite(
                 "summed_generation_ns": result.summary["summed_generation_ns"],
                 "summed_generation_seconds": result.summary[
                     "summed_generation_seconds"
+                ],
+                "summed_capacity_floor_ns": result.summary[
+                    "summed_capacity_floor_ns"
+                ],
+                "summed_capacity_floor_seconds": result.summary[
+                    "summed_capacity_floor_seconds"
+                ],
+                "summed_generation_over_capacity_floor": result.summary[
+                    "summed_generation_over_capacity_floor"
+                ],
+                "capacity_floor_efficiency": result.summary[
+                    "capacity_floor_efficiency"
                 ],
                 "wall_makespan_ns": result.summary["makespan_ns"],
                 "wall_makespan_seconds": result.summary["makespan_seconds"],

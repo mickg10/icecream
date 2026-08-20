@@ -8,6 +8,10 @@ scheduler simulations.
 maps the simulator onto the actual C client, C/F daemons, persistent stores, per-job TCP
 connections, A/Need/Fill dialogue, and compiler stdin pipe.
 
+[`SHARED-UPLINK-WIDTH-RESULTS.md`](SHARED-UPLINK-WIDTH-RESULTS.md) records the executable
+1/2/3/4/20-F width gate, capacity-only lower bounds, raw and compile-only matrices, exact P29/GRZ
+controls, and bounded-memory report measurements.
+
 The initial scenario is `firefox-1c-20f.json`: one C, one corrected Firefox build,
 twenty one-slot Fs, 1 Gbit/s per direction and a 10 Gbit/s shared fabric.  All TUs are
 released at time zero for the first comparison.  A measured C-preprocessor release trace
@@ -78,49 +82,47 @@ whose boundary contains them, so no transition is lost when the view is sampled.
 `experiment.jsonl` always retains the complete 10-ms stream.  To keep a large self-contained
 HTML file responsive, `report.html` embeds at most 2,000 evenly spaced active snapshots plus
 every idle-gap row, and labels the retained/source counts in the page.  The JSONL remains the
-canonical source for intervals omitted from the browser overview.
+canonical source for intervals omitted from the browser overview.  Foreground runners spool both
+timeline rows and exact events during simulation, merge them into the canonical JSONL in one
+streaming pass, retain only the bounded browser view in memory, and remove both temporary spools
+after all outputs are complete.  Thus recorder RSS does not grow with snapshot or event count.
 
 The compact primary scenario is `firefox-c1f20-200b1g.json`: one C, twenty Fs, 200 compile
 slots per F, five zero-gap builds, a one-Gbit/s shared C ceiling, and ten-Gbit/s route, F, and
 fabric ceilings.  Its report label is `C1F20_200B1G`.
 
-The v1 schema keeps its historical one-to-one interpretation: each `environment` is
-simultaneously one producer agent, one logical C authority, and one C egress group.  The v2
-schema makes both relationships explicit:
+The scenario's `environment` is deliberately one submitting box, one C authority/GUID, and one
+physical C egress.  Multiple environments are independent boxes with independent GUIDs and
+uplinks.  The first deployment does not model delegated egress or several producer boxes sharing
+one authority.  `per_environment_bits_per_second` is therefore the one aggregate uplink ceiling
+shared by all of that C's F relationships.
 
-```json
-{
-  "schema": "icecream-distribution-scenario-v2",
-  "environments": {"env_count": 4},
-  "topology": {
-    "authority_count": 1,
-    "egress_count": 4,
-    "producer_to_authority": [0, 0, 0, 0],
-    "producer_to_egress": [0, 1, 2, 3]
-  }
-}
-```
+Each dispatched TU receives a contiguous `TU_SEQ` in its C admission order.  Routing projects
+that order onto each destination F and assigns a contiguous `REL_SEQ`; every assignment and event
+records both.  A relationship with TU sequence `[0, 3, 7]` therefore carries REL sequence
+`[0, 1, 2]`.  Physical-ledger replay rejects a changed TU identity, destination, or projection.
+Whole-TU raw, P29, and GRZ use one active dialogue per `(C,F)` relationship while different Fs
+advance concurrently.  Once a TU's input commits, its compiler can continue while the next TU on
+that relationship transfers.
 
-Here `environment` selects a producer.  Codec state and relationship ordering are keyed by the
-mapped authority, while endpoint serialization is keyed by the mapped egress and F.  V2 link
-limits use unambiguous `per_producer_bits_per_second`,
-`per_authority_bits_per_second`, and `per_egress_bits_per_second` fields; any applicable limits
-are enforced simultaneously.  The old `per_environment_bits_per_second` name is accepted only
-by v1.  Reports use `P…A…E…F…` labels for v2, retain both maps, and publish producer, authority,
-egress, route, F, and fabric interval rates separately.
-
-The checked-in three-case smoke suite makes the distinction executable:
+`firefox-f-width-suite.json` is the corrected one-C routing-width gate.  It runs five zero-gap
+builds at F widths 1, 2, 3, 4, and 20, always with 200 compiler slots and 400 input-staging slots
+per F.  Every route, F ingress, and directional fabric is capped at 40 Gbit/s while the one C
+authority remains capped at an aggregate 1 Gbit/s in each direction.  Adding Fs therefore adds
+compiler capacity and independent cache arenas, never source bandwidth:
 
 ```bash
 python3 capability/distribution/run_suite.py \
-  capability/distribution/topology-v2-smoke-suite.json \
-  --require-payload --out /tmp/topology-v2-smoke
+  capability/distribution/firefox-f-width-suite.json \
+  --codec compile-only --codec raw --require-payload \
+  --out /tmp/firefox-f-width
 ```
 
-Its two 9-byte TUs take 2.000000001 s through one 72-bit/s egress, 1.000000001 s through
-two delegated 72-bit/s egresses behind a 144-bit/s fabric, and 2.000000001 s again when the
-delegated case receives a 72-bit/s shared-authority ceiling.  Each case emits its own JSONL and
-self-contained report.
+Each build and generation row reports input-ready elapsed time, compile elapsed time, the
+capacity-only C-to-F floor, compiler floor, ideal overlap floor, actual/floor ratio, and capacity
+efficiency.  These are intentionally optimistic lower bounds: they omit release timing,
+propagation, codec CPU, dependency round trips, and queue order.  The gap between the bound and
+the run is therefore visible rather than folded into a single makespan.
 
 ## Physical codec ledgers
 
@@ -128,7 +130,7 @@ The simulator accepts physical codec bytes only through
 `icecream-physical-codec-ledger-v1`.  It rejects an incomplete reconstruction result, a
 scenario hash mismatch, missing or repeated TUs, route-order drift, assignment drift, and byte
 totals that do not tile the physical streams.  A physical route currently has one committed
-dialogue at a time; distinct `(authority, egress, F)` route lanes still advance concurrently.
+dialogue at a time; distinct `(C,F)` routes still advance concurrently.
 
 The current byte score covers the adapter's measured C-to-F phases.  It does not yet claim
 bytes for the live compile-job reference or for the outer cache-channel envelope, because those
@@ -152,7 +154,7 @@ and reruns the codec's directional sink replay.  LINES is released after Root se
 Need after Root delivery, Fill after Need delivery, and close joins every material branch.
 Fill can move ahead of an unfinished LINES extent at the next configured writer quantum.
 Compiler input becomes ready after close delivery; codec state commits after Ack delivery.
-Its present producer has only one materialized route, so the builder deliberately refuses
+Its present materializer has only one route, so the builder deliberately refuses
 multi-F scenarios.
 
 Build and replay a multi-route GRZ ledger:

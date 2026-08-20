@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "icecream-distribution-scenario",
-  "title": "Icecream codec distribution scenario v1/v2",
+  "$id": "icecream-distribution-scenario-v1",
+  "title": "Icecream codec distribution scenario",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -15,38 +15,9 @@
     "experiment"
   ],
   "properties": {
-    "schema": {
-      "enum": [
-        "icecream-distribution-scenario-v1",
-        "icecream-distribution-scenario-v2"
-      ]
-    },
+    "schema": { "const": "icecream-distribution-scenario-v1" },
     "name": { "type": "string", "minLength": 1 },
     "seed": { "type": "integer", "minimum": 0 },
-    "topology": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "authority_count",
-        "egress_count",
-        "producer_to_authority",
-        "producer_to_egress"
-      ],
-      "properties": {
-        "authority_count": { "type": "integer", "minimum": 1 },
-        "egress_count": { "type": "integer", "minimum": 1 },
-        "producer_to_authority": {
-          "type": "array",
-          "minItems": 1,
-          "items": { "type": "integer", "minimum": 0 }
-        },
-        "producer_to_egress": {
-          "type": "array",
-          "minItems": 1,
-          "items": { "type": "integer", "minimum": 0 }
-        }
-      }
-    },
     "environments": {
       "type": "object",
       "additionalProperties": false,
@@ -208,17 +179,6 @@
       }
     }
   },
-  "allOf": [
-    {
-      "if": {
-        "properties": {
-          "schema": { "const": "icecream-distribution-scenario-v2" }
-        }
-      },
-      "then": { "required": ["topology"] },
-      "else": { "not": { "required": ["topology"] } }
-    }
-  ],
   "$defs": {
     "link": {
       "type": "object",
@@ -227,9 +187,6 @@
       "properties": {
         "bits_per_second": { "type": "integer", "minimum": 1 },
         "per_environment_bits_per_second": { "type": "integer", "minimum": 1 },
-        "per_producer_bits_per_second": { "type": "integer", "minimum": 1 },
-        "per_authority_bits_per_second": { "type": "integer", "minimum": 1 },
-        "per_egress_bits_per_second": { "type": "integer", "minimum": 1 },
         "per_worker_bits_per_second": { "type": "integer", "minimum": 1 },
         "fabric_bits_per_second": { "type": "integer", "minimum": 1 },
         "writer_quantum_bytes": { "type": "integer", "minimum": 1 },
