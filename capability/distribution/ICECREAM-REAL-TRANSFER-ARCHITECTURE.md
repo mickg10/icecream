@@ -1586,6 +1586,41 @@ The flow allocator applies all applicable ceilings through max-min sharing. Hist
 scenario files and ledgers keep their original labels and hashes; no conversion or silent
 reinterpretation is needed.
 
+Topology v2 is also executable. `environment` is the producer index, and the scenario supplies
+two total maps:
+
+```text
+producer -> logical C authority
+producer -> physical C egress group
+```
+
+Codec relationship ordering is keyed by `(authority, egress, F)`, so two delegated egress lanes
+may carry work for one shared authority without pretending they are independent cache
+authorities. Physical endpoint serialization is keyed by `(egress, F)`. The allocator can apply
+all of these at once:
+
+```text
+network.<direction>.per_producer_bits_per_second
+network.<direction>.per_authority_bits_per_second
+network.<direction>.per_egress_bits_per_second
+network.<direction>.per_worker_bits_per_second
+network.<direction>.bits_per_second
+network.<direction>.fabric_bits_per_second
+network.shared_fabric_bps
+```
+
+This distinguishes the required controls without changing byte ledgers:
+
+```text
+P16A1E1    sixteen producers, one shared state authority, one central egress
+P16A1E16   sixteen producers, one shared state authority, delegated egress
+P16A16E16  sixteen independent authorities and egresses
+```
+
+Every event and assignment carries producer, authority, and egress IDs. The JSONL samples retain
+separate producer, authority, egress, F, route, and fabric rates, so an authority ceiling cannot
+be mistaken for an egress or fabric ceiling.
+
 The current raw adapter models one complete raw-TU transfer before compilation; that is a
 conservative control, not a cycle-accurate model of protocol 44's within-TU streaming. The
 executable adapters are `compile-only`, `raw`, `p29`, and `grz`. The latter two require a
@@ -1599,7 +1634,9 @@ same event engine. That engine now executes a per-TU fork/join graph rather than
 list to be stop-and-wait. A dependency may wait for an extent to be serialized or delivered;
 input readiness and transaction commit are distinct joins; F input staging and compiler slots are
 distinct resources; the two fabric directions can be capped separately; and priority traffic can
-take the next bounded writer quantum. The physical P29 projection therefore executes:
+take the next bounded writer quantum. The oldest queued extent receives a turn after a configurable
+maximum number of priority overtakes, so an ongoing stream of completion traffic cannot suppress
+LINES indefinitely. The physical P29 projection therefore executes:
 
 ```text
 Root sent ------> LINES ----------------------+--> close delivered --> input ready

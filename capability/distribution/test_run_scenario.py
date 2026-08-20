@@ -237,6 +237,105 @@ class SimulatorTest(unittest.TestCase):
                 1.0,
             )
 
+    def test_v2_distinguishes_shared_authority_from_physical_egress(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_fixture(root, [1], [100], workers=2)
+            document = json.loads(path.read_text())
+            first = document["environments"]["job_selection"]["jobs"][0]
+            second = json.loads(json.dumps(first))
+            second["id"] = "test-p1"
+            second["environment"] = 1
+            document["schema"] = "icecream-distribution-scenario-v2"
+            document["environments"]["env_count"] = 2
+            document["environments"]["job_selection"]["jobs"].append(second)
+            document["topology"] = {
+                "authority_count": 1,
+                "egress_count": 1,
+                "producer_to_authority": [0, 0],
+                "producer_to_egress": [0, 0],
+            }
+            document["network"]["shared_fabric_bps"] = 1_600
+            for direction in ("c_to_f", "f_to_c"):
+                document["network"][direction]["bits_per_second"] = 1_600
+                document["network"][direction][
+                    "per_egress_bits_per_second"
+                ] = 800
+            path.write_text(json.dumps(document))
+            centralized = sim.Simulator(
+                sim.load_scenario(path), sim.RawAdapter()
+            ).run()
+            self.assertEqual(centralized.summary["makespan_ns"], 2_000_000_001)
+            self.assertEqual(centralized.summary["producers"], 2)
+            self.assertEqual(centralized.summary["authorities"], 1)
+            self.assertEqual(centralized.summary["egress_groups"], 1)
+            self.assertEqual(
+                sim.topology_label(document), "P2A1E1F2_1E800X1600"
+            )
+
+            document["topology"]["egress_count"] = 2
+            document["topology"]["producer_to_egress"] = [0, 1]
+            path.write_text(json.dumps(document))
+            delegated = sim.Simulator(
+                sim.load_scenario(path), sim.RawAdapter()
+            ).run()
+            self.assertEqual(delegated.summary["makespan_ns"], 1_000_000_001)
+            self.assertEqual(delegated.summary["egress_groups"], 2)
+            first_sample = next(
+                row
+                for row in delegated.timeline
+                if row["record"] == "snapshot"
+            )
+            self.assertEqual(
+                [row["c_to_f_average_bps"] for row in first_sample["metrics"]["egresses"]],
+                [800.0, 800.0],
+            )
+            self.assertEqual(
+                first_sample["metrics"]["authorities"][0]["c_to_f_average_bps"],
+                1_600.0,
+            )
+            self.assertEqual(first_sample["state"]["c"][0]["authority"], 0)
+            self.assertNotIn("environment", first_sample["state"]["c"][0])
+            self.assertEqual(first_sample["state"]["producers"][1]["egress"], 1)
+            dispatches = [
+                row for row in delegated.events if row["event"] == "dispatch"
+            ]
+            self.assertEqual(
+                [(row["producer"], row["authority"], row["egress"]) for row in dispatches],
+                [(0, 0, 0), (1, 0, 1)],
+            )
+
+            for direction in ("c_to_f", "f_to_c"):
+                document["network"][direction][
+                    "per_authority_bits_per_second"
+                ] = 800
+            path.write_text(json.dumps(document))
+            authority_limited = sim.Simulator(
+                sim.load_scenario(path), sim.RawAdapter()
+            ).run()
+            self.assertEqual(
+                authority_limited.summary["makespan_ns"], 2_000_000_001
+            )
+
+    def test_v2_rejects_ambiguous_legacy_capacity_name(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_fixture(root, [1], [1], workers=1)
+            document = json.loads(path.read_text())
+            document["schema"] = "icecream-distribution-scenario-v2"
+            document["topology"] = {
+                "authority_count": 1,
+                "egress_count": 1,
+                "producer_to_authority": [0],
+                "producer_to_egress": [0],
+            }
+            document["network"]["c_to_f"][
+                "per_environment_bits_per_second"
+            ] = 800
+            path.write_text(json.dumps(document))
+            with self.assertRaisesRegex(ValueError, "explicit per_producer"):
+                sim.load_scenario(path)
+
     def test_directional_fabrics_allow_full_duplex_flows(self) -> None:
         class FullDuplex(sim.CodecAdapter):
             name = "full-duplex-test"
@@ -473,6 +572,36 @@ class SimulatorTest(unittest.TestCase):
             self.assertEqual(result.summary["c_to_f_bytes"], 1_200)
             self.assertEqual(result.summary["f_to_c_bytes"], 100)
 
+    def test_priority_burst_bound_eventually_runs_the_oldest_flow(self) -> None:
+        class PriorityBurst(sim.CodecAdapter):
+            name = "priority-burst-test"
+
+            def begin(self, item: sim.WorkItem, worker: int):
+                del worker
+                priority = 4 if item.logical == 0 else 0
+                return (sim.Phase(f"flow-{item.logical}", "c_to_f", 300, priority),)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_fixture(root, [1] * 5, [1] * 5, workers=1)
+            document = json.loads(path.read_text())
+            document["workers"]["template"]["slots"] = 5
+            document["network"]["c_to_f"]["writer_quantum_bytes"] = 100
+            document["network"]["c_to_f"]["max_priority_burst_quanta"] = 2
+            path.write_text(json.dumps(document))
+            result = sim.Simulator(
+                sim.load_scenario(path),
+                PriorityBurst(),
+                snapshot_interval_ns=1_000_000_000,
+            ).run()
+            oldest_start = next(
+                row
+                for row in result.events
+                if row["event"] == "flow-start" and row["phase"] == "flow-0"
+            )
+            self.assertEqual(oldest_start["time_ns"], 2_000_000_000)
+            self.assertEqual(oldest_start["detail"], "bounded-priority-turn")
+
     def test_build_finishes_at_compile_and_transaction_join(self) -> None:
         class LateCommit(sim.CodecAdapter):
             name = "late-commit-test"
@@ -545,6 +674,8 @@ class SimulatorTest(unittest.TestCase):
                     "producer_agents": 1,
                     "logical_c_authorities": 1,
                     "c_egress_groups": 1,
+                    "producer_to_authority": [0],
+                    "producer_to_egress": [0],
                     "f_stores": 1,
                     "compiler_slots_per_f": 1,
                     "input_staging_slots_per_f": 1,
@@ -619,8 +750,10 @@ class SimulatorTest(unittest.TestCase):
             ]
             self.assertEqual(len(starts), 2)
             self.assertEqual(starts[1]["time_ns"], finishes[0]["time_ns"])
-            self.assertEqual(adapter.committed_by_route[(0, 0)], 2)
-            self.assertEqual(adapter.last_route_state[(0, 0)]["known_objects"], 5)
+            self.assertEqual(adapter.committed_by_route[(0, 0, 0)], 2)
+            self.assertEqual(
+                adapter.last_route_state[(0, 0, 0)]["known_objects"], 5
+            )
 
     def test_physical_ledger_refuses_unverified_or_mismatched_input(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

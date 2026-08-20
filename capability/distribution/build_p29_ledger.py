@@ -259,8 +259,10 @@ def checked_run(command: list[str], stdout_path: Path, stderr_path: Path) -> Non
 
 
 def scenario_items(scenario: sim.LoadedScenario) -> list[sim.WorkItem]:
-    if int(scenario.document["environments"]["env_count"]) != 1:
+    if int(scenario.topology["authority_count"]) != 1:
         raise ValueError("P29 physical builder currently requires exactly one C authority")
+    if int(scenario.topology["egress_count"]) != 1:
+        raise ValueError("P29 physical builder currently requires exactly one C egress")
     if int(scenario.document["workers"]["f_count"]) != 1:
         raise ValueError("P29 physical builder refuses F>1 until shared-C multi-route is materialized")
     diagnostic = sim.Simulator(
@@ -384,6 +386,9 @@ def build_ledger(
                 "workload": item.workload,
                 "build": item.build,
                 "logical": item.logical,
+                "producer": item.environment,
+                "authority": item.authority,
+                "egress": item.egress,
                 "worker": 0,
                 "route_sequence": route_sequence,
                 "raw_bytes": item.raw_bytes,

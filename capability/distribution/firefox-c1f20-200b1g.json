@@ -35,6 +35,7 @@
       "per_environment_bits_per_second": 1000000000,
       "per_worker_bits_per_second": 10000000000,
       "writer_quantum_bytes": 102400,
+      "max_priority_burst_quanta": 8,
       "one_way_latency_ns": 250000,
       "lanes_per_endpoint": 1
     },
@@ -43,6 +44,7 @@
       "per_environment_bits_per_second": 1000000000,
       "per_worker_bits_per_second": 10000000000,
       "writer_quantum_bytes": 102400,
+      "max_priority_burst_quanta": 8,
       "one_way_latency_ns": 250000,
       "lanes_per_endpoint": 1
     },

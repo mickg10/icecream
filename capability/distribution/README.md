@@ -56,7 +56,9 @@ supplies a transaction graph of C-to-F/F-to-C extents for each dispatched TU; it
 its own scheduler.  Graph edges distinguish `sent` from `delivered`, and input readiness and
 transaction commit are independent joins.  The core has separate F input-staging and compiler
 pools, shares all configured bandwidth resources between active flows, and schedules bounded
-writer quanta by frame priority.  Omitting `input_staging_slots` retains the historical
+writer quanta by frame priority.  A priority class may overtake an older queued extent only
+`max_priority_burst_quanta` times (eight by default) before that oldest extent gets a turn.
+Omitting `input_staging_slots` retains the historical
 assign-and-reserve-compiler behavior for old scenarios.
 
 ```bash
@@ -82,10 +84,43 @@ The compact primary scenario is `firefox-c1f20-200b1g.json`: one C, twenty Fs, 2
 slots per F, five zero-gap builds, a one-Gbit/s shared C ceiling, and ten-Gbit/s route, F, and
 fabric ceilings.  Its report label is `C1F20_200B1G`.
 
-The v1 schema explicitly has a one-to-one interpretation: each `environment` is simultaneously
-one producer agent, one logical C authority, and one C egress group.  Every report records those
-three counts separately even though they are equal.  A future topology schema must split them
-before modelling many producers under one authority or delegated producer egress.
+The v1 schema keeps its historical one-to-one interpretation: each `environment` is
+simultaneously one producer agent, one logical C authority, and one C egress group.  The v2
+schema makes both relationships explicit:
+
+```json
+{
+  "schema": "icecream-distribution-scenario-v2",
+  "environments": {"env_count": 4},
+  "topology": {
+    "authority_count": 1,
+    "egress_count": 4,
+    "producer_to_authority": [0, 0, 0, 0],
+    "producer_to_egress": [0, 1, 2, 3]
+  }
+}
+```
+
+Here `environment` selects a producer.  Codec state and relationship ordering are keyed by the
+mapped authority, while endpoint serialization is keyed by the mapped egress and F.  V2 link
+limits use unambiguous `per_producer_bits_per_second`,
+`per_authority_bits_per_second`, and `per_egress_bits_per_second` fields; any applicable limits
+are enforced simultaneously.  The old `per_environment_bits_per_second` name is accepted only
+by v1.  Reports use `P…A…E…F…` labels for v2, retain both maps, and publish producer, authority,
+egress, route, F, and fabric interval rates separately.
+
+The checked-in three-case smoke suite makes the distinction executable:
+
+```bash
+python3 capability/distribution/run_suite.py \
+  capability/distribution/topology-v2-smoke-suite.json \
+  --require-payload --out /tmp/topology-v2-smoke
+```
+
+Its two 9-byte TUs take 2.000000001 s through one 72-bit/s egress, 1.000000001 s through
+two delegated 72-bit/s egresses behind a 144-bit/s fabric, and 2.000000001 s again when the
+delegated case receives a 72-bit/s shared-authority ceiling.  Each case emits its own JSONL and
+self-contained report.
 
 ## Physical codec ledgers
 
@@ -93,7 +128,7 @@ The simulator accepts physical codec bytes only through
 `icecream-physical-codec-ledger-v1`.  It rejects an incomplete reconstruction result, a
 scenario hash mismatch, missing or repeated TUs, route-order drift, assignment drift, and byte
 totals that do not tile the physical streams.  A physical route currently has one committed
-dialogue at a time; distinct `(C,F)` routes still advance concurrently.
+dialogue at a time; distinct `(authority, egress, F)` route lanes still advance concurrently.
 
 The current byte score covers the adapter's measured C-to-F phases.  It does not yet claim
 bytes for the live compile-job reference or for the outer cache-channel envelope, because those

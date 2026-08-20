@@ -1,0 +1,67 @@
+{
+  "schema": "icecream-distribution-scenario-v2",
+  "name": "topology-v2-P2A1E1",
+  "seed": 1,
+  "topology": {
+    "authority_count": 1,
+    "egress_count": 1,
+    "producer_to_authority": [0, 0],
+    "producer_to_egress": [0, 0]
+  },
+  "environments": {
+    "env_count": 2,
+    "job_selection": {
+      "mode": "explicit",
+      "jobs": [
+        {
+          "id": "producer-0",
+          "environment": 0,
+          "trace": "../fixtures/topology.compile-trace.tsv",
+          "corpus_root": "../fixtures",
+          "builds": 1,
+          "start_ns": 0,
+          "build_release": {"mode": "after-previous"},
+          "tu_release": {"mode": "all-at-zero"}
+        },
+        {
+          "id": "producer-1",
+          "environment": 1,
+          "trace": "../fixtures/topology.compile-trace.tsv",
+          "corpus_root": "../fixtures",
+          "builds": 1,
+          "start_ns": 0,
+          "build_release": {"mode": "after-previous"},
+          "tu_release": {"mode": "all-at-zero"}
+        }
+      ]
+    }
+  },
+  "workers": {
+    "f_count": 2,
+    "template": {
+      "slots": 1,
+      "compile_profile": "topology-smoke-v1",
+      "initial_cache": "cold"
+    }
+  },
+  "network": {
+    "c_to_f": {
+      "bits_per_second": 144,
+      "per_egress_bits_per_second": 72,
+      "one_way_latency_ns": 0,
+      "lanes_per_endpoint": 1
+    },
+    "f_to_c": {
+      "bits_per_second": 144,
+      "per_egress_bits_per_second": 72,
+      "one_way_latency_ns": 0,
+      "lanes_per_endpoint": 1
+    },
+    "shared_fabric_bps": 144
+  },
+  "scheduler": {
+    "ready_job_policy": "fifo-release",
+    "placement_policy": "round-robin"
+  },
+  "experiment": {"codecs": ["grz", "p29"], "routing_mode": "online"}
+}

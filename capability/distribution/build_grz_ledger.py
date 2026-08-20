@@ -109,7 +109,7 @@ def file_equals_prefix(actual_path: Path, expected_path: Path, byte_count: int) 
 
 def assignment_routes(
     scenario: sim.LoadedScenario,
-) -> dict[tuple[int, int], list[sim.WorkItem]]:
+) -> dict[tuple[int, int, int], list[sim.WorkItem]]:
     diagnostic = sim.Simulator(
         scenario, sim.CompileOnlyAdapter(), snapshot_interval_ns=10**30
     ).run()
@@ -118,10 +118,10 @@ def assignment_routes(
         for items in scenario.work_items.values()
         for item in items
     }
-    routes: dict[tuple[int, int], list[sim.WorkItem]] = defaultdict(list)
+    routes: dict[tuple[int, int, int], list[sim.WorkItem]] = defaultdict(list)
     for row in diagnostic.assignments:
         item = by_key[(row["workload"], int(row["build"]), int(row["logical"]))]
-        routes[(item.environment, int(row["worker"]))].append(item)
+        routes[(item.authority, item.egress, int(row["worker"]))].append(item)
     if sum(map(len, routes.values())) != len(by_key):
         raise AssertionError("diagnostic assignment did not cover every scenario TU")
     return dict(routes)
@@ -316,8 +316,8 @@ def build_ledger(
     route_metadata: dict[str, object] = {}
     payload_digests: dict[Path, str] = {}
     total_c_to_f = 0
-    for (environment, worker), items in sorted(routes.items()):
-        route_name = f"C{environment}-F{worker}"
+    for (authority, egress, worker), items in sorted(routes.items()):
+        route_name = f"A{authority}-E{egress}-F{worker}"
         physical_bytes, metadata = build_route(
             binary.resolve(), work / route_name, items, extra_options, stride
         )
@@ -338,6 +338,9 @@ def build_ledger(
                 "workload": item.workload,
                 "build": item.build,
                 "logical": item.logical,
+                "producer": item.environment,
+                "authority": item.authority,
+                "egress": item.egress,
                 "worker": worker,
                 "route_sequence": route_sequence,
                 "raw_bytes": item.raw_bytes,
@@ -379,7 +382,10 @@ def build_ledger(
         "codec": "grz",
         "scenario": scenario.document["name"],
         "scenario_sha256": sim.sha256(scenario.path),
-        "assignment": "common simulator compile-only dispatch order, partitioned by (C,F)",
+        "assignment": (
+            "common simulator compile-only dispatch order, partitioned by "
+            "(authority,egress,F) route lane"
+        ),
         "dialogue_window_per_route": 1,
         "command_options": list(GRZ_OPTIONS) + extra_options,
         "codec_binary": str(binary.resolve()),

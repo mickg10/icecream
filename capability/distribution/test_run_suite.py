@@ -73,6 +73,27 @@ def scenario_document(name: str, workers: int, slots: int) -> dict[str, object]:
 
 
 class SuiteTest(unittest.TestCase):
+    def test_checked_in_topology_v2_suite_has_expected_physical_limits(self) -> None:
+        root = Path(__file__).parent
+        with tempfile.TemporaryDirectory() as directory:
+            matrix, _ = suite.run_suite(
+                root / "topology-v2-smoke-suite.json",
+                Path(directory),
+                require_payload=True,
+            )
+        self.assertEqual(
+            [row["topology"] for row in matrix],
+            [
+                "P2A1E1F2_1E72X144",
+                "P2A1E2F2_1E72X144",
+                "P2A1E2F2_1A72E72X144",
+            ],
+        )
+        self.assertEqual(
+            [row["wall_makespan_ns"] for row in matrix],
+            [2_000_000_001, 1_000_000_001, 2_000_000_001],
+        )
+
     def test_requested_firefox_suite_shape(self) -> None:
         root = Path(__file__).parent
         suite_document, scenario_paths = suite.load_suite(

@@ -68,6 +68,8 @@ class TraceRow:
 class WorkItem:
     ordinal: int
     environment: int
+    authority: int
+    egress: int
     workload: str
     build: int
     logical: int
@@ -260,6 +262,9 @@ class PhysicalLedgerEntry:
     workload: str
     build: int
     logical: int
+    producer: int
+    authority: int
+    egress: int
     worker: int
     route_sequence: int
     raw_bytes: int
@@ -310,7 +315,7 @@ class PhysicalLedgerAdapter(CodecAdapter):
         self.descriptor = descriptor
         self.final = final
         self.entries: dict[tuple[str, int, int], PhysicalLedgerEntry] = {}
-        route_sequences: dict[tuple[int, int], list[int]] = defaultdict(list)
+        route_sequences: dict[tuple[int, int, int], list[int]] = defaultdict(list)
         payload_digests: dict[Path, str] = {}
         c_to_f_total = 0
         f_to_c_total = 0
@@ -322,6 +327,33 @@ class PhysicalLedgerAdapter(CodecAdapter):
                 raise ValueError(f"{self.path}:{row_number}: workload is empty")
             build = checked_nonnegative_int(row.get("build"), "ledger build")
             logical = checked_nonnegative_int(row.get("logical"), "ledger logical")
+            scenario_key = (workload, build)
+            if (
+                scenario_key not in scenario.work_items
+                or logical >= len(scenario.work_items[scenario_key])
+            ):
+                raise ValueError(
+                    f"{self.path}:{row_number}: TU identity is outside the scenario"
+                )
+            item = scenario.work_items[scenario_key][logical]
+            topology_fields = {
+                "producer": item.environment,
+                "authority": item.authority,
+                "egress": item.egress,
+            }
+            for topology_field, expected in topology_fields.items():
+                if topology_field in row:
+                    actual = checked_nonnegative_int(
+                        row.get(topology_field), f"ledger {topology_field}"
+                    )
+                    if actual != expected:
+                        raise ValueError(
+                            f"{self.path}:{row_number}: ledger {topology_field} differs from scenario"
+                        )
+                elif scenario.document["schema"] == "icecream-distribution-scenario-v2":
+                    raise ValueError(
+                        f"{self.path}:{row_number}: v2 ledger omits {topology_field}"
+                    )
             worker = checked_nonnegative_int(row.get("worker"), "ledger worker")
             if worker >= int(scenario.document["workers"]["f_count"]):
                 raise ValueError(f"{self.path}:{row_number}: worker is outside scenario")
@@ -436,6 +468,9 @@ class PhysicalLedgerAdapter(CodecAdapter):
                 workload,
                 build,
                 logical,
+                item.environment,
+                item.authority,
+                item.egress,
                 worker,
                 route_sequence,
                 raw_bytes,
@@ -448,8 +483,9 @@ class PhysicalLedgerAdapter(CodecAdapter):
             if key in self.entries:
                 raise ValueError(f"{self.path}:{row_number}: repeated TU identity {key}")
             self.entries[key] = entry
-            environment = scenario.work_items[(workload, build)][logical].environment
-            route_sequences[(environment, worker)].append(route_sequence)
+            route_sequences[(item.authority, item.egress, worker)].append(
+                route_sequence
+            )
             c_to_f_total += sum(
                 phase.byte_count for phase in phases if phase.direction == "c_to_f"
             )
@@ -495,19 +531,16 @@ class PhysicalLedgerAdapter(CodecAdapter):
             raise ValueError(
                 f"{self.path}: final totals {totals!r} differ from {expected_totals!r}"
             )
-        self.committed_by_route: dict[tuple[int, int], int] = defaultdict(int)
-        self.committed_by_environment = [
-            0 for _ in range(int(scenario.document["environments"]["env_count"]))
+        self.committed_by_route: dict[tuple[int, int, int], int] = defaultdict(int)
+        self.committed_by_authority = [
+            0 for _ in range(int(scenario.topology["authority_count"]))
         ]
-        self.committed_bytes_by_environment = [
-            0 for _ in range(int(scenario.document["environments"]["env_count"]))
+        self.committed_bytes_by_authority = [
+            0 for _ in range(int(scenario.topology["authority_count"]))
         ]
-        self.committed_bytes_by_route: dict[tuple[int, int], int] = defaultdict(int)
+        self.committed_bytes_by_route: dict[tuple[int, int, int], int] = defaultdict(int)
         self.active: set[tuple[str, int, int]] = set()
-        self.last_route_state: dict[tuple[int, int], dict[str, object]] = {}
-        self.item_environment = {
-            key: item.environment for key, item in expected_items.items()
-        }
+        self.last_route_state: dict[tuple[int, int, int], dict[str, object]] = {}
 
     def dialogue_window_per_route(self) -> int | None:
         return 1
@@ -518,7 +551,7 @@ class PhysicalLedgerAdapter(CodecAdapter):
             raise RuntimeError(
                 f"physical ledger assigned {item.key} to F{entry.worker}, simulator chose F{worker}"
             )
-        route = (item.environment, worker)
+        route = (item.authority, item.egress, worker)
         if entry.route_sequence != self.committed_by_route[route]:
             raise RuntimeError(
                 f"physical ledger route {route} expected sequence {entry.route_sequence}, "
@@ -542,16 +575,16 @@ class PhysicalLedgerAdapter(CodecAdapter):
         if item.key not in self.active:
             raise RuntimeError(f"physical ledger TU {item.key} committed without begin")
         entry = self.entries[item.key]
-        route = (item.environment, worker)
+        route = (item.authority, item.egress, worker)
         if entry.worker != worker or entry.route_sequence != self.committed_by_route[route]:
             raise RuntimeError(f"physical ledger commit order changed for {item.key}")
         self.active.remove(item.key)
         self.committed_by_route[route] += 1
-        self.committed_by_environment[item.environment] += 1
+        self.committed_by_authority[item.authority] += 1
         c_to_f = sum(
             phase.byte_count for phase in entry.phases if phase.direction == "c_to_f"
         )
-        self.committed_bytes_by_environment[item.environment] += c_to_f
+        self.committed_bytes_by_authority[item.authority] += c_to_f
         self.committed_bytes_by_route[route] += c_to_f
         self.last_route_state[route] = entry.state_after
 
@@ -565,20 +598,37 @@ class PhysicalLedgerAdapter(CodecAdapter):
 
     def timeline_c_state(self, environment: int) -> dict[str, object]:
         return {
-            "committed_tus": self.committed_by_environment[environment],
-            "committed_c_to_f_bytes": self.committed_bytes_by_environment[environment],
+            "committed_tus": self.committed_by_authority[environment],
+            "committed_c_to_f_bytes": self.committed_bytes_by_authority[environment],
         }
 
     def timeline_f_state(
         self, environment: int, worker: int
     ) -> dict[str, object]:
-        route = (environment, worker)
+        routes = [
+            route
+            for route in self.committed_by_route
+            if route[0] == environment and route[2] == worker
+        ]
         state = {
-            "committed_transactions": self.committed_by_route[route],
-            "committed_c_to_f_bytes": self.committed_bytes_by_route[route],
+            "committed_transactions": sum(
+                self.committed_by_route[route] for route in routes
+            ),
+            "committed_c_to_f_bytes": sum(
+                self.committed_bytes_by_route[route] for route in routes
+            ),
         }
-        if route in self.last_route_state:
-            state["codec_state"] = self.last_route_state[route]
+        lane_states = [
+            {
+                "egress": route[1],
+                "committed_transactions": self.committed_by_route[route],
+                "committed_c_to_f_bytes": self.committed_bytes_by_route[route],
+                "codec_state": self.last_route_state.get(route, {}),
+            }
+            for route in sorted(routes)
+        ]
+        if lane_states:
+            state["route_lanes"] = lane_states
         return state
 
     def timeline_coverage(self) -> dict[str, object]:
@@ -639,7 +689,7 @@ class Flow:
     def endpoint(self) -> tuple[str, int, int]:
         return (
             self.phase.direction,
-            self.transaction.item.environment,
+            self.transaction.item.egress,
             self.transaction.worker,
         )
 
@@ -699,6 +749,7 @@ class LoadedScenario:
     work_items: dict[tuple[str, int], list[WorkItem]]
     workload_config: dict[str, dict[str, object]]
     workload_inputs: dict[str, dict[str, object]]
+    topology: dict[str, object]
 
 
 class TimelineRecorder:
@@ -719,6 +770,8 @@ class TimelineRecorder:
         self.sample_wall_start_ns: Fraction | None = None
         self.sample_elapsed_ns = Fraction(0)
         self.route_bits: dict[tuple[str, int, int], Fraction] = defaultdict(Fraction)
+        self.producer_bits: dict[tuple[str, int], Fraction] = defaultdict(Fraction)
+        self.authority_bits: dict[tuple[str, int], Fraction] = defaultdict(Fraction)
         self.fabric_bits = Fraction(0)
         self.direction_fabric_bits: dict[str, Fraction] = defaultdict(Fraction)
         self.compile_slot_ns = [Fraction(0) for _ in range(workers)]
@@ -750,6 +803,12 @@ class TimelineRecorder:
             flow = simulator.active_flows[flow_sequence]
             bits = rate * elapsed_ns
             self.route_bits[flow.endpoint] += bits
+            self.producer_bits[
+                (flow.phase.direction, flow.transaction.item.environment)
+            ] += bits
+            self.authority_bits[
+                (flow.phase.direction, flow.transaction.item.authority)
+            ] += bits
             self.fabric_bits += bits
             self.direction_fabric_bits[flow.phase.direction] += bits
         for worker in range(self.workers):
@@ -796,38 +855,86 @@ class TimelineRecorder:
             raise RuntimeError("cannot emit an empty active timeline sample")
         duration = self.sample_elapsed_ns
         route_metrics: list[dict[str, object]] = []
-        environment_rates: dict[tuple[str, int], float] = defaultdict(float)
+        egress_rates: dict[tuple[str, int], float] = defaultdict(float)
         worker_rates: dict[tuple[str, int], float] = defaultdict(float)
-        for (direction, environment, worker), bits in sorted(self.route_bits.items()):
+        for (direction, egress, worker), bits in sorted(self.route_bits.items()):
             average_bps = float(bits * NANOSECONDS / duration)
-            environment_rates[(direction, environment)] += average_bps
+            egress_rates[(direction, egress)] += average_bps
             worker_rates[(direction, worker)] += average_bps
             route_capacity = int(simulator.network[direction]["bits_per_second"])
-            route_metrics.append(
-                {
-                    "direction": direction,
-                    "environment": environment,
-                    "worker": worker,
-                    "bits": float(bits),
-                    "average_bps": average_bps,
-                    "route_capacity_bps": route_capacity,
-                    "route_utilization": average_bps / route_capacity,
-                }
-            )
-        environment_metrics = []
-        for environment in range(simulator.env_count):
-            row: dict[str, object] = {"environment": environment}
+            route_row = {
+                "direction": direction,
+                "egress": egress,
+                "worker": worker,
+                "bits": float(bits),
+                "average_bps": average_bps,
+                "route_capacity_bps": route_capacity,
+                "route_utilization": average_bps / route_capacity,
+            }
+            if simulator.scenario.document["schema"] == "icecream-distribution-scenario-v1":
+                route_row["environment"] = egress
+            route_metrics.append(route_row)
+        producer_metrics = []
+        for producer in range(simulator.producer_count):
+            row: dict[str, object] = {
+                "environment": producer,
+                "producer": producer,
+                "authority": simulator.producer_to_authority[producer],
+                "egress": simulator.producer_to_egress[producer],
+            }
             for direction in DIRECTIONS:
-                average_bps = environment_rates[(direction, environment)]
-                capacity = simulator.network[direction].get(
-                    "per_environment_bits_per_second"
+                average_bps = float(
+                    self.producer_bits[(direction, producer)]
+                    * NANOSECONDS
+                    / duration
+                )
+                link = simulator.network[direction]
+                capacity = link.get(
+                    "per_producer_bits_per_second",
+                    link.get("per_environment_bits_per_second"),
                 )
                 row[f"{direction}_average_bps"] = average_bps
                 row[f"{direction}_capacity_bps"] = capacity
                 row[f"{direction}_utilization"] = (
                     None if capacity is None else average_bps / int(capacity)
                 )
-            environment_metrics.append(row)
+            producer_metrics.append(row)
+        authority_metrics = []
+        for authority in range(simulator.authority_count):
+            row = {"authority": authority}
+            for direction in DIRECTIONS:
+                average_bps = float(
+                    self.authority_bits[(direction, authority)]
+                    * NANOSECONDS
+                    / duration
+                )
+                link = simulator.network[direction]
+                capacity = link.get(
+                    "per_authority_bits_per_second",
+                    link.get("per_environment_bits_per_second"),
+                )
+                row[f"{direction}_average_bps"] = average_bps
+                row[f"{direction}_capacity_bps"] = capacity
+                row[f"{direction}_utilization"] = (
+                    None if capacity is None else average_bps / int(capacity)
+                )
+            authority_metrics.append(row)
+        egress_metrics = []
+        for egress in range(simulator.egress_count):
+            row = {"egress": egress}
+            for direction in DIRECTIONS:
+                average_bps = egress_rates[(direction, egress)]
+                link = simulator.network[direction]
+                capacity = link.get(
+                    "per_egress_bits_per_second",
+                    link.get("per_environment_bits_per_second"),
+                )
+                row[f"{direction}_average_bps"] = average_bps
+                row[f"{direction}_capacity_bps"] = capacity
+                row[f"{direction}_utilization"] = (
+                    None if capacity is None else average_bps / int(capacity)
+                )
+            egress_metrics.append(row)
         worker_metrics = []
         for worker in range(self.workers):
             row = {
@@ -895,7 +1002,10 @@ class TimelineRecorder:
             ),
             "direction_fabrics": direction_fabrics,
             "routes": route_metrics,
-            "environments": environment_metrics,
+            "environments": producer_metrics,
+            "producers": producer_metrics,
+            "authorities": authority_metrics,
+            "egresses": egress_metrics,
             "workers": worker_metrics,
         }
         state = simulator.timeline_state()
@@ -920,6 +1030,8 @@ class TimelineRecorder:
         self.sample_wall_start_ns = None
         self.sample_elapsed_ns = Fraction(0)
         self.route_bits.clear()
+        self.producer_bits.clear()
+        self.authority_bits.clear()
         self.fabric_bits = Fraction(0)
         self.direction_fabric_bits.clear()
         self.compile_slot_ns = [Fraction(0) for _ in range(self.workers)]
@@ -1042,15 +1154,77 @@ def read_release_offsets(
     return result
 
 
+def normalized_topology(
+    document: dict[str, object], producer_count: int
+) -> dict[str, object]:
+    """Return explicit producer/authority/egress dimensions for v1 or v2."""
+    schema = document.get("schema")
+    if schema == "icecream-distribution-scenario-v1":
+        if "topology" in document:
+            raise ValueError("v1 scenario cannot contain a topology-v2 mapping")
+        identity = list(range(producer_count))
+        return {
+            "schema_semantics": (
+                "v1 maps one producer agent, one logical C authority, and one C "
+                "egress group to each environment"
+            ),
+            "producer_count": producer_count,
+            "authority_count": producer_count,
+            "egress_count": producer_count,
+            "producer_to_authority": identity,
+            "producer_to_egress": identity,
+        }
+    if schema != "icecream-distribution-scenario-v2":
+        raise ValueError(f"unknown scenario schema {schema!r}")
+    topology = document.get("topology")
+    if not isinstance(topology, dict):
+        raise ValueError("v2 scenario lacks a topology object")
+    authority_count = checked_positive_int(
+        topology.get("authority_count"), "topology.authority_count"
+    )
+    egress_count = checked_positive_int(
+        topology.get("egress_count"), "topology.egress_count"
+    )
+    mappings: dict[str, list[int]] = {}
+    for name, count in (
+        ("producer_to_authority", authority_count),
+        ("producer_to_egress", egress_count),
+    ):
+        values = topology.get(name)
+        if not isinstance(values, list) or len(values) != producer_count:
+            raise ValueError(
+                f"topology.{name} must contain exactly {producer_count} entries"
+            )
+        checked = [
+            checked_nonnegative_int(value, f"topology.{name}[{index}]")
+            for index, value in enumerate(values)
+        ]
+        if any(value >= count for value in checked):
+            raise ValueError(f"topology.{name} contains an out-of-range target")
+        if set(checked) != set(range(count)):
+            raise ValueError(f"topology.{name} leaves a declared target unused")
+        mappings[name] = checked
+    return {
+        "schema_semantics": (
+            "v2 explicit mapping from producer agents to logical C authorities and "
+            "physical C egress groups"
+        ),
+        "producer_count": producer_count,
+        "authority_count": authority_count,
+        "egress_count": egress_count,
+        **mappings,
+    }
+
+
 def load_scenario(
     path: Path, payload_overrides: dict[str, Path] | None = None
 ) -> LoadedScenario:
     path = path.resolve()
     document = json.loads(path.read_text())
-    if (
-        not isinstance(document, dict)
-        or document.get("schema") != "icecream-distribution-scenario-v1"
-    ):
+    if not isinstance(document, dict) or document.get("schema") not in {
+        "icecream-distribution-scenario-v1",
+        "icecream-distribution-scenario-v2",
+    }:
         raise ValueError(f"{path}: unknown scenario schema")
     environments = document.get("environments")
     workers = document.get("workers")
@@ -1061,6 +1235,7 @@ def load_scenario(
     ):
         raise ValueError(f"{path}: scenario lacks a required object")
     env_count = checked_positive_int(environments.get("env_count"), "env_count")
+    topology = normalized_topology(document, env_count)
     f_count = checked_positive_int(workers.get("f_count"), "f_count")
     template = workers.get("template")
     if not isinstance(template, dict):
@@ -1085,15 +1260,27 @@ def load_scenario(
         )
         for optional_capacity in (
             "per_environment_bits_per_second",
+            "per_producer_bits_per_second",
+            "per_authority_bits_per_second",
+            "per_egress_bits_per_second",
             "per_worker_bits_per_second",
             "fabric_bits_per_second",
             "writer_quantum_bytes",
+            "max_priority_burst_quanta",
         ):
             if optional_capacity in link:
                 checked_positive_int(
                     link.get(optional_capacity),
                     f"network.{direction}.{optional_capacity}",
                 )
+        if (
+            document["schema"] == "icecream-distribution-scenario-v2"
+            and "per_environment_bits_per_second" in link
+        ):
+            raise ValueError(
+                "v2 network links must use explicit per_producer, per_authority, "
+                "or per_egress capacity names"
+            )
     if "shared_fabric_bps" in network:
         checked_positive_int(
             network.get("shared_fabric_bps"), "network.shared_fabric_bps"
@@ -1148,6 +1335,8 @@ def load_scenario(
                 f"{workload}: environment {environment} is outside env_count"
             )
         builds = checked_positive_int(job.get("builds"), f"{workload}.builds")
+        authority = int(topology["producer_to_authority"][environment])
+        egress = int(topology["producer_to_egress"][environment])
         start_ns = checked_nonnegative_int(job.get("start_ns"), f"{workload}.start_ns")
         trace_value = job.get("trace")
         root_value = job.get("corpus_root")
@@ -1200,6 +1389,8 @@ def load_scenario(
                     WorkItem(
                         next_ordinal,
                         environment,
+                        authority,
+                        egress,
                         workload,
                         build,
                         row.logical,
@@ -1215,7 +1406,14 @@ def load_scenario(
         workload_config[workload] = {**job, "start_ns": start_ns, "builds": builds}
     if f_count < 1:
         raise AssertionError("validated f_count became empty")
-    return LoadedScenario(document, path, work_items, workload_config, workload_inputs)
+    return LoadedScenario(
+        document,
+        path,
+        work_items,
+        workload_config,
+        workload_inputs,
+        topology,
+    )
 
 
 class Simulator:
@@ -1230,6 +1428,34 @@ class Simulator:
         document = scenario.document
         worker_config = document["workers"]
         self.env_count = int(document["environments"]["env_count"])
+        self.producer_count = int(scenario.topology["producer_count"])
+        self.authority_count = int(scenario.topology["authority_count"])
+        self.egress_count = int(scenario.topology["egress_count"])
+        self.producer_to_authority = tuple(
+            int(value) for value in scenario.topology["producer_to_authority"]
+        )
+        self.producer_to_egress = tuple(
+            int(value) for value in scenario.topology["producer_to_egress"]
+        )
+        self.authority_to_producers = {
+            authority: tuple(
+                producer
+                for producer, mapped in enumerate(self.producer_to_authority)
+                if mapped == authority
+            )
+            for authority in range(self.authority_count)
+        }
+        self.authority_to_egresses = {
+            authority: tuple(
+                sorted(
+                    {
+                        self.producer_to_egress[producer]
+                        for producer in self.authority_to_producers[authority]
+                    }
+                )
+            )
+            for authority in range(self.authority_count)
+        }
         self.f_count = int(worker_config["f_count"])
         self.slots_per_f = int(worker_config["template"]["slots"])
         self.decoupled_staging = (
@@ -1263,8 +1489,13 @@ class Simulator:
         ] = defaultdict(
             list
         )
-        self.dialogue_active: dict[tuple[int, int], int] = defaultdict(int)
-        self.dialogue_queues: dict[tuple[int, int], deque[Transaction]] = defaultdict(
+        self.endpoint_priority_overtakes: dict[
+            tuple[str, int, int], int
+        ] = defaultdict(int)
+        self.dialogue_active: dict[tuple[int, int, int], int] = defaultdict(int)
+        self.dialogue_queues: dict[
+            tuple[int, int, int], deque[Transaction]
+        ] = defaultdict(
             deque
         )
         self.transactions: list[Transaction] = []
@@ -1334,6 +1565,9 @@ class Simulator:
                 "time_ns": ceil_fraction(self.now),
                 "event": name,
                 "environment": "" if item is None else item.environment,
+                "producer": "" if item is None else item.environment,
+                "authority": "" if item is None else item.authority,
+                "egress": "" if item is None else item.egress,
                 "workload": "" if item is None else item.workload,
                 "build": "" if item is None else item.build,
                 "logical": "" if item is None else item.logical,
@@ -1463,7 +1697,7 @@ class Simulator:
 
     def _queue_or_start_dialogue(self, tx: Transaction) -> None:
         window = self.adapter.dialogue_window_per_route()
-        route = (tx.item.environment, tx.worker)
+        route = (tx.item.authority, tx.item.egress, tx.worker)
         if window is not None and self.dialogue_active[route] >= window:
             self.dialogue_queues[route].append(tx)
             self._event("dialogue-queued", tx)
@@ -1493,7 +1727,7 @@ class Simulator:
         window = self.adapter.dialogue_window_per_route()
         if window is None:
             return
-        route = (tx.item.environment, tx.worker)
+        route = (tx.item.authority, tx.item.egress, tx.worker)
         if self.dialogue_active[route] <= 0:
             raise RuntimeError("dialogue route count underflow")
         self.dialogue_active[route] -= 1
@@ -1664,6 +1898,37 @@ class Simulator:
     def _endpoint_lanes(self, endpoint: tuple[str, int, int]) -> int:
         return int(self.network[endpoint[0]]["lanes_per_endpoint"])
 
+    def _pop_endpoint_flow(
+        self, endpoint: tuple[str, int, int]
+    ) -> tuple[Flow, bool]:
+        """Select by priority while bounding how often the oldest flow is overtaken."""
+        queue = self.endpoint_queues[endpoint]
+        if not queue:
+            raise RuntimeError("endpoint selection from an empty queue")
+        oldest_index = min(range(len(queue)), key=lambda index: queue[index][1])
+        limit = int(
+            self.network[endpoint[0]].get("max_priority_burst_quanta", 8)
+        )
+        forced_oldest = (
+            oldest_index != 0
+            and self.endpoint_priority_overtakes[endpoint] >= limit
+        )
+        if forced_oldest:
+            _, _, flow = queue[oldest_index]
+            queue[oldest_index] = queue[-1]
+            queue.pop()
+            if queue:
+                heapq.heapify(queue)
+            self.endpoint_priority_overtakes[endpoint] = 0
+            return flow, True
+        _, selected_sequence, flow = heapq.heappop(queue)
+        older_waits = any(sequence < selected_sequence for _, sequence, _ in queue)
+        if older_waits:
+            self.endpoint_priority_overtakes[endpoint] += 1
+        else:
+            self.endpoint_priority_overtakes[endpoint] = 0
+        return flow, False
+
     def _fill_endpoint_queues(self) -> None:
         active_count: dict[tuple[str, int, int], int] = defaultdict(int)
         for flow in self.active_flows.values():
@@ -1671,7 +1936,7 @@ class Simulator:
         for endpoint in sorted(self.endpoint_queues):
             queue = self.endpoint_queues[endpoint]
             while queue and active_count[endpoint] < self._endpoint_lanes(endpoint):
-                _, _, flow = heapq.heappop(queue)
+                flow, forced_oldest = self._pop_endpoint_flow(endpoint)
                 event = "flow-start" if flow.start_ns is None else "flow-resume"
                 if flow.start_ns is None:
                     flow.start_ns = self.now
@@ -1687,7 +1952,11 @@ class Simulator:
                 self.active_flows[flow.sequence] = flow
                 active_count[endpoint] += 1
                 self._event(
-                    event, flow.transaction, flow.phase, flow=flow
+                    event,
+                    flow.transaction,
+                    flow.phase,
+                    flow=flow,
+                    detail="bounded-priority-turn" if forced_oldest else "",
                 )
 
     def _flow_rates(self) -> dict[int, Fraction]:
@@ -1701,7 +1970,9 @@ class Simulator:
             )
         resources: dict[int, tuple[tuple[object, ...], ...]] = {}
         for sequence, flow in self.active_flows.items():
-            direction, environment, worker = flow.endpoint
+            direction, egress, worker = flow.endpoint
+            producer = flow.transaction.item.environment
+            authority = flow.transaction.item.authority
             route = ("route",) + flow.endpoint
             capacities.setdefault(
                 route,
@@ -1722,14 +1993,26 @@ class Simulator:
                 )
                 flow_resources.append(direction_fabric)
             if "per_environment_bits_per_second" in link:
-                environment_resource = ("environment", direction, environment)
+                authority_resource = ("authority", direction, authority)
                 capacities.setdefault(
-                    environment_resource,
+                    authority_resource,
                     Fraction(
                         int(link["per_environment_bits_per_second"]), NANOSECONDS
                     ),
                 )
-                flow_resources.append(environment_resource)
+                flow_resources.append(authority_resource)
+            for capacity_field, kind, identity in (
+                ("per_producer_bits_per_second", "producer", producer),
+                ("per_authority_bits_per_second", "authority", authority),
+                ("per_egress_bits_per_second", "egress", egress),
+            ):
+                if capacity_field in link:
+                    resource = (kind, direction, identity)
+                    capacities.setdefault(
+                        resource,
+                        Fraction(int(link[capacity_field]), NANOSECONDS),
+                    )
+                    flow_resources.append(resource)
             if "per_worker_bits_per_second" in link:
                 worker_resource = ("worker", direction, worker)
                 capacities.setdefault(
@@ -1903,72 +2186,134 @@ class Simulator:
         active_by_route: dict[tuple[str, int, int], int] = defaultdict(int)
         queued_by_route: dict[tuple[str, int, int], int] = defaultdict(int)
         delivery_by_route: dict[tuple[str, int, int], int] = defaultdict(int)
+        active_by_relationship: dict[tuple[str, int, int, int], int] = defaultdict(int)
+        queued_by_relationship: dict[tuple[str, int, int, int], int] = defaultdict(int)
+        delivery_by_relationship: dict[tuple[str, int, int, int], int] = defaultdict(int)
         for flow in self.active_flows.values():
             active_by_route[flow.endpoint] += 1
+            active_by_relationship[
+                (
+                    flow.phase.direction,
+                    flow.transaction.item.authority,
+                    flow.transaction.item.egress,
+                    flow.transaction.worker,
+                )
+            ] += 1
         for endpoint, queue in self.endpoint_queues.items():
             queued_by_route[endpoint] += len(queue)
+            for _, _, flow in queue:
+                queued_by_relationship[
+                    (
+                        flow.phase.direction,
+                        flow.transaction.item.authority,
+                        flow.transaction.item.egress,
+                        flow.transaction.worker,
+                    )
+                ] += 1
         for _, _, flow in self.delivery_heap:
             delivery_by_route[flow.endpoint] += 1
+            delivery_by_relationship[
+                (
+                    flow.phase.direction,
+                    flow.transaction.item.authority,
+                    flow.transaction.item.egress,
+                    flow.transaction.worker,
+                )
+            ] += 1
 
+        producer_state = [
+            {
+                "producer": producer,
+                "authority": self.producer_to_authority[producer],
+                "egress": self.producer_to_egress[producer],
+                "unreleased_tus": self.env_unreleased[producer],
+                "ready_tus": self.env_ready[producer],
+                "active_tus": self.env_active[producer],
+                "completed_tus": self.env_completed[producer],
+            }
+            for producer in range(self.producer_count)
+        ]
         c_state = []
-        for environment in range(self.env_count):
+        for authority in range(self.authority_count):
+            producers = self.authority_to_producers[authority]
             targets = []
-            for worker in range(self.f_count):
-                route = (environment, worker)
-                active_dialogues = self.dialogue_active[route]
-                queued_dialogues = len(self.dialogue_queues[route])
-                forward_active = active_by_route[("c_to_f", environment, worker)]
-                forward_queued = queued_by_route[("c_to_f", environment, worker)]
-                forward_delivery = delivery_by_route[("c_to_f", environment, worker)]
-                reverse_active = active_by_route[("f_to_c", environment, worker)]
-                reverse_queued = queued_by_route[("f_to_c", environment, worker)]
-                reverse_delivery = delivery_by_route[("f_to_c", environment, worker)]
-                if any(
-                    (
-                        forward_active,
-                        forward_queued,
-                        forward_delivery,
-                        reverse_active,
-                        reverse_queued,
-                        reverse_delivery,
-                        active_dialogues,
-                        queued_dialogues,
-                    )
-                ):
-                    targets.append(
-                        {
-                            "worker": worker,
-                            "active_dialogues": active_dialogues,
-                            "queued_dialogues": queued_dialogues,
-                            "c_to_f_active_flows": forward_active,
-                            "c_to_f_queued_flows": forward_queued,
-                            "c_to_f_in_propagation": forward_delivery,
-                            "f_to_c_active_flows": reverse_active,
-                            "f_to_c_queued_flows": reverse_queued,
-                            "f_to_c_in_propagation": reverse_delivery,
-                        }
-                    )
-            c_state.append(
-                {
-                    "environment": environment,
-                    "unreleased_tus": self.env_unreleased[environment],
-                    "ready_tus": self.env_ready[environment],
-                    "active_tus": self.env_active[environment],
-                    "completed_tus": self.env_completed[environment],
-                    "targets": targets,
-                    "codec": self.adapter.timeline_c_state(environment),
-                }
-            )
+            for egress in self.authority_to_egresses[authority]:
+                for worker in range(self.f_count):
+                    route = (authority, egress, worker)
+                    active_dialogues = self.dialogue_active[route]
+                    queued_dialogues = len(self.dialogue_queues[route])
+                    forward_active = active_by_relationship[
+                        ("c_to_f", authority, egress, worker)
+                    ]
+                    forward_queued = queued_by_relationship[
+                        ("c_to_f", authority, egress, worker)
+                    ]
+                    forward_delivery = delivery_by_relationship[
+                        ("c_to_f", authority, egress, worker)
+                    ]
+                    reverse_active = active_by_relationship[
+                        ("f_to_c", authority, egress, worker)
+                    ]
+                    reverse_queued = queued_by_relationship[
+                        ("f_to_c", authority, egress, worker)
+                    ]
+                    reverse_delivery = delivery_by_relationship[
+                        ("f_to_c", authority, egress, worker)
+                    ]
+                    if any(
+                        (
+                            forward_active,
+                            forward_queued,
+                            forward_delivery,
+                            reverse_active,
+                            reverse_queued,
+                            reverse_delivery,
+                            active_dialogues,
+                            queued_dialogues,
+                        )
+                    ):
+                        targets.append(
+                            {
+                                "egress": egress,
+                                "worker": worker,
+                                "active_dialogues": active_dialogues,
+                                "queued_dialogues": queued_dialogues,
+                                "c_to_f_active_flows": forward_active,
+                                "c_to_f_queued_flows": forward_queued,
+                                "c_to_f_in_propagation": forward_delivery,
+                                "f_to_c_active_flows": reverse_active,
+                                "f_to_c_queued_flows": reverse_queued,
+                                "f_to_c_in_propagation": reverse_delivery,
+                            }
+                        )
+            authority_row = {
+                "authority": authority,
+                "producers": list(producers),
+                "egresses": list(self.authority_to_egresses[authority]),
+                "unreleased_tus": sum(self.env_unreleased[p] for p in producers),
+                "ready_tus": sum(self.env_ready[p] for p in producers),
+                "active_tus": sum(self.env_active[p] for p in producers),
+                "completed_tus": sum(self.env_completed[p] for p in producers),
+                "targets": targets,
+                "codec": self.adapter.timeline_c_state(authority),
+            }
+            if self.scenario.document["schema"] == "icecream-distribution-scenario-v1":
+                authority_row["environment"] = authority
+            c_state.append(authority_row)
 
         f_state = []
         for worker in range(self.f_count):
             namespaces = []
-            for environment in range(self.env_count):
-                codec_state = self.adapter.timeline_f_state(environment, worker)
+            for authority in range(self.authority_count):
+                codec_state = self.adapter.timeline_f_state(authority, worker)
                 if codec_state:
-                    namespaces.append(
-                        {"environment": environment, "codec": codec_state}
-                    )
+                    namespace = {"authority": authority, "codec": codec_state}
+                    if (
+                        self.scenario.document["schema"]
+                        == "icecream-distribution-scenario-v1"
+                    ):
+                        namespace["environment"] = authority
+                    namespaces.append(namespace)
             f_state.append(
                 {
                     "worker": worker,
@@ -1990,26 +2335,28 @@ class Simulator:
                     "completed_tus": self.worker_completed[worker],
                     "active_flows": sum(
                         value
-                        for (direction, environment, route_worker), value in active_by_route.items()
+                        for (direction, egress, route_worker), value in active_by_route.items()
                         if route_worker == worker
                     ),
                     "queued_flows": sum(
                         value
-                        for (direction, environment, route_worker), value in queued_by_route.items()
+                        for (direction, egress, route_worker), value in queued_by_route.items()
                         if route_worker == worker
                     ),
                     "in_propagation": sum(
                         value
-                        for (direction, environment, route_worker), value in delivery_by_route.items()
+                        for (direction, egress, route_worker), value in delivery_by_route.items()
                         if route_worker == worker
                     ),
                     "active_dialogues": sum(
-                        self.dialogue_active[(environment, worker)]
-                        for environment in range(self.env_count)
+                        value
+                        for (authority, egress, route_worker), value in self.dialogue_active.items()
+                        if route_worker == worker
                     ),
                     "queued_dialogues": sum(
-                        len(self.dialogue_queues[(environment, worker)])
-                        for environment in range(self.env_count)
+                        len(queue)
+                        for (authority, egress, route_worker), queue in self.dialogue_queues.items()
+                        if route_worker == worker
                     ),
                     "codec_namespaces": namespaces,
                 }
@@ -2023,6 +2370,7 @@ class Simulator:
                 "completed_tus": self.completed,
                 "total_tus": self.total_items,
             },
+            "producers": producer_state,
             "c": c_state,
             "f": f_state,
             "network": {
@@ -2110,6 +2458,9 @@ class Simulator:
                 {
                     "dispatch_order": tx.sequence,
                     "environment": tx.item.environment,
+                    "producer": tx.item.environment,
+                    "authority": tx.item.authority,
+                    "egress": tx.item.egress,
                     "workload": tx.item.workload,
                     "build": tx.item.build,
                     "logical": tx.item.logical,
@@ -2191,6 +2542,9 @@ class Simulator:
             builds.append(
                 {
                     "environment": transactions[0].item.environment,
+                    "producer": transactions[0].item.environment,
+                    "authority": transactions[0].item.authority,
+                    "egress": transactions[0].item.egress,
                     "workload": workload,
                     "build": build,
                     "temperature": "cold" if build == 0 else "warm",
@@ -2240,6 +2594,9 @@ class Simulator:
                     "generation": generation,
                     "temperature": "cold" if generation == 0 else "warm",
                     "environments": len({tx.item.environment for tx in transactions}),
+                    "producers": len({tx.item.environment for tx in transactions}),
+                    "authorities": len({tx.item.authority for tx in transactions}),
+                    "egresses": len({tx.item.egress for tx in transactions}),
                     "workloads": len({tx.item.workload for tx in transactions}),
                     "jobs": len(transactions),
                     "start_ns": start_ns,
@@ -2271,6 +2628,10 @@ class Simulator:
             "ready_job_policy": self.scheduler["ready_job_policy"],
             "jobs": self.total_items,
             "environments": int(self.scenario.document["environments"]["env_count"]),
+            "producers": self.producer_count,
+            "authorities": self.authority_count,
+            "egress_groups": self.egress_count,
+            "topology_mapping": self.scenario.topology,
             "build_epochs": len(builds),
             "cold_builds": sum(row["temperature"] == "cold" for row in builds),
             "warm_builds": sum(row["temperature"] == "warm" for row in builds),
@@ -2316,7 +2677,7 @@ class Simulator:
                     "C-to-F placement and independent F input-staging/compiler pools",
                     "fork/join dialogue release, serialization, and propagation",
                     "writer priority with bounded serialization quanta",
-                    "per-route, per-C, per-F, common-fabric, and directional-fabric max-min allocation",
+                    "per-route, per-producer, per-authority, per-egress, per-F, common-fabric, and directional-fabric max-min allocation",
                     "F input-wait, ready-input, compiler, and commit-wait occupancy",
                     "build barriers and workload release gaps",
                     "exact C-to-F and F-to-C byte events",
@@ -2391,6 +2752,29 @@ def topology_label(document: dict[str, object]) -> str:
     slots = int(document["workers"]["template"]["slots"])
     network = document["network"]
     c_to_f = network["c_to_f"]
+    if document["schema"] == "icecream-distribution-scenario-v2":
+        topology = normalized_topology(document, environments)
+        prefix = (
+            f"P{topology['producer_count']}A{topology['authority_count']}"
+            f"E{topology['egress_count']}F{workers}_{slots}"
+        )
+        capacities = "".join(
+            f"{label}{bandwidth_label(int(c_to_f[field]))}"
+            for field, label in (
+                ("per_producer_bits_per_second", "P"),
+                ("per_authority_bits_per_second", "A"),
+                ("per_egress_bits_per_second", "E"),
+            )
+            if field in c_to_f
+        )
+        if not capacities:
+            capacities = f"R{bandwidth_label(int(c_to_f['bits_per_second']))}"
+        fabric_value = network.get(
+            "shared_fabric_bps", c_to_f.get("fabric_bits_per_second")
+        )
+        if fabric_value is None:
+            raise ValueError("topology has no C-to-F fabric capacity")
+        return f"{prefix}{capacities}X{bandwidth_label(int(fabric_value))}"
     environment_bps = c_to_f.get("per_environment_bits_per_second")
     if environment_bps is not None:
         capacity = f"B{bandwidth_label(int(environment_bps))}"
@@ -2421,7 +2805,7 @@ def experiment_records(
 ) -> tuple[dict[str, object], list[dict[str, object]], dict[str, object]]:
     """Build one deterministic, self-describing JSONL experiment stream."""
     resolved = resolved_scenario_document(scenario)
-    allocation_resources = ["direction/environment/F route"]
+    allocation_resources = ["direction/egress/F route"]
     if "shared_fabric_bps" in resolved["network"]:
         allocation_resources.append("optional common fabric")
     if any(
@@ -2433,7 +2817,17 @@ def experiment_records(
         "per_environment_bits_per_second" in resolved["network"][direction]
         for direction in DIRECTIONS
     ):
-        allocation_resources.append("per-direction C-authority aggregate")
+        allocation_resources.append("v1 per-direction C-authority aggregate")
+    for capacity_field, label in (
+        ("per_producer_bits_per_second", "per-direction producer aggregate"),
+        ("per_authority_bits_per_second", "per-direction C-authority aggregate"),
+        ("per_egress_bits_per_second", "per-direction C-egress aggregate"),
+    ):
+        if any(
+            capacity_field in resolved["network"][direction]
+            for direction in DIRECTIONS
+        ):
+            allocation_resources.append(label)
     if any(
         "per_worker_bits_per_second" in resolved["network"][direction]
         for direction in DIRECTIONS
@@ -2445,13 +2839,14 @@ def experiment_records(
         "scenario": result.summary["scenario"],
         "topology": topology_label(resolved),
         "topology_dimensions": {
-            "schema_semantics": (
-                "v1 maps one producer agent, one logical C authority, and one C egress "
-                "group to each environment"
-            ),
-            "producer_agents": result.summary["environments"],
-            "logical_c_authorities": result.summary["environments"],
-            "c_egress_groups": result.summary["environments"],
+            "schema_semantics": scenario.topology["schema_semantics"],
+            "producer_agents": result.summary["producers"],
+            "logical_c_authorities": result.summary["authorities"],
+            "c_egress_groups": result.summary["egress_groups"],
+            "producer_to_authority": scenario.topology[
+                "producer_to_authority"
+            ],
+            "producer_to_egress": scenario.topology["producer_to_egress"],
             "f_stores": result.summary["workers"],
             "compiler_slots_per_f": result.summary["slots_per_worker"],
             "input_staging_slots_per_f": result.summary[

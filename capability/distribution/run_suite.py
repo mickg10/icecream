@@ -115,8 +115,14 @@ def run_suite(
             wall_seconds = time.perf_counter() - run_start
             row = {
                 "scenario": result.summary["scenario"],
+                "topology": sim.topology_label(
+                    sim.resolved_scenario_document(scenario)
+                ),
                 "codec": codec,
                 "environments": result.summary["environments"],
+                "producers": result.summary["producers"],
+                "authorities": result.summary["authorities"],
+                "egress_groups": result.summary["egress_groups"],
                 "workers": result.summary["workers"],
                 "slots_per_worker": result.summary["slots_per_worker"],
                 "total_worker_slots": result.summary["total_worker_slots"],
