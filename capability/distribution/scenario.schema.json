@@ -176,6 +176,8 @@
       "required": ["bits_per_second", "one_way_latency_ns", "lanes_per_endpoint"],
       "properties": {
         "bits_per_second": { "type": "integer", "minimum": 1 },
+        "per_environment_bits_per_second": { "type": "integer", "minimum": 1 },
+        "per_worker_bits_per_second": { "type": "integer", "minimum": 1 },
         "one_way_latency_ns": { "type": "integer", "minimum": 0 },
         "lanes_per_endpoint": { "type": "integer", "minimum": 1 }
       }

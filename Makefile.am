@@ -24,3 +24,12 @@ test: install
 test-strict: install
 	$(MAKE) check
 	$(MAKE) -C tests $@
+
+.PHONY: integration_tests
+integration_tests:
+	python3 -m unittest \
+		capability/distribution/test_run_scenario.py \
+		capability/distribution/test_build_p29_ledger.py \
+		capability/distribution/test_build_grz_ledger.py \
+		capability/distribution/test_run_suite.py
+	python3 -m compileall -q capability/distribution

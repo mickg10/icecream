@@ -54,8 +54,8 @@ The common runner must retain these outputs for every codec/policy run:
 adapters are diagnostic references, not compression results.  A physical codec adapter
 supplies a sequence of C-to-F/F-to-C phases for each dispatched TU; it does not get its own
 scheduler.  The core reserves real F slots, shares the configured fabric between active
-flows, applies per-route link capacity, and dispatches another TU only after a slot becomes
-free.
+flows, applies per-route, per-C, per-F, and fabric capacities simultaneously, and dispatches
+another TU only after a slot becomes free.
 
 ```bash
 python3 capability/distribution/run_scenario.py \
@@ -63,6 +63,89 @@ python3 capability/distribution/run_scenario.py \
   --codec compile-only \
   --out /tmp/firefox-compile-only
 ```
+
+Every run now also writes `experiment.jsonl` and a self-contained `report.html`.  The first
+JSONL row is the complete resolved experiment descriptor.  While work is active, subsequent
+rows are 10-ms snapshots of scheduler, C, F, codec, and network state.  An idle interval is
+represented by one explicit gap row rather than thousands of empty samples.  The final row
+contains the complete result summary.  Exact events are attached to the first snapshot or gap
+whose boundary contains them, so no transition is lost when the view is sampled.
+
+`experiment.jsonl` always retains the complete 10-ms stream.  To keep a large self-contained
+HTML file responsive, `report.html` embeds at most 2,000 evenly spaced active snapshots plus
+every idle-gap row, and labels the retained/source counts in the page.  The JSONL remains the
+canonical source for intervals omitted from the browser overview.
+
+The compact primary scenario is `firefox-c1f20-200b1g.json`: one C, twenty Fs, 200 compile
+slots per F, five zero-gap builds, a one-Gbit/s shared C ceiling, and ten-Gbit/s route, F, and
+fabric ceilings.  Its report label is `C1F20_200B1G`.
+
+The v1 schema explicitly has a one-to-one interpretation: each `environment` is simultaneously
+one producer agent, one logical C authority, and one C egress group.  Every report records those
+three counts separately even though they are equal.  A future topology schema must split them
+before modelling many producers under one authority or delegated producer egress.
+
+## Physical codec ledgers
+
+The simulator accepts physical codec bytes only through
+`icecream-physical-codec-ledger-v1`.  It rejects an incomplete reconstruction result, a
+scenario hash mismatch, missing or repeated TUs, route-order drift, assignment drift, and byte
+totals that do not tile the physical streams.  A physical route currently has one committed
+dialogue at a time; distinct `(C,F)` routes still advance concurrently.
+
+The current byte score covers the adapter's measured C-to-F phases.  It does not yet claim
+bytes for the live compile-job reference or for the outer cache-channel envelope, because those
+messages do not exist in the implementation being replayed.  The reverse adapter phases are
+retained separately.  The live cache-channel stage must add both omitted C-to-F categories before
+the field can be interpreted as every byte written by C.
+
+Build and replay a one-route P29 ledger:
+
+```bash
+python3 capability/distribution/build_p29_ledger.py SCENARIO.json \
+  --codec /path/to/codec50-sink \
+  --work /tmp/p29-codec --out /tmp/p29-ledger.jsonl
+python3 capability/distribution/run_scenario.py SCENARIO.json \
+  --codec p29 --ledger /tmp/p29-ledger.jsonl --out /tmp/p29-simulation
+```
+
+The P29 builder runs the real codec, parses the typed C-to-F and F-to-C streams into causal
+Root/Need/Fill/close phases, requires the selector and component ledgers to agree, and reruns
+the codec's directional sink replay.  Its present producer has only one materialized route,
+so the builder deliberately refuses multi-F scenarios.
+
+Build and replay a multi-route GRZ ledger:
+
+```bash
+python3 capability/distribution/build_grz_ledger.py SCENARIO.json \
+  --codec /path/to/grz2g \
+  --work /tmp/grz-codec --out /tmp/grz-ledger.jsonl
+python3 capability/distribution/run_scenario.py SCENARIO.json \
+  --codec grz --ledger /tmp/grz-ledger.jsonl --out /tmp/grz-simulation
+```
+
+The GRZ builder uses the common simulator assignment, partitions TUs by `(C,F)`, and creates
+one persistent G2 stream per route with one complete current-TU frame per transaction.  It
+requires full route reconstruction, an identical retry, and exact selected prefix decodes.
+The resulting per-frame bytes are then scheduled by the same event engine used by every other
+adapter.
+
+Ledger generation currently starts from the compile-only assignment and replay refuses any
+placement drift.  That is exact for the primary `C1F20_200B1G` case because all 2,498 TUs fit in
+the 4,000 available slots at each build barrier.  Slot-constrained dynamic-placement studies need
+an explicit assignment trace or a converged assignment/codec loop before their physical timing is
+reportable.
+
+Run the deterministic integration gate from the repository root:
+
+```bash
+make integration_tests
+```
+
+This current gate covers the scenario engine, simultaneous bandwidth ceilings, active-time
+JSONL/report generation, physical-ledger refusal rules, and P29/GRZ ledger parsing.  The later
+live-process launcher described in the architecture document will extend this same target with
+scheduler, daemon, cache-sidecar, and compiler-pipe scenarios.
 
 ## Cold plus four-warm topology suite
 

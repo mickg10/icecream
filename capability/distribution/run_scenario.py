@@ -31,6 +31,8 @@ from typing import Iterable, Sequence
 
 NANOSECONDS = 1_000_000_000
 DIRECTIONS = ("c_to_f", "f_to_c")
+DEFAULT_SNAPSHOT_NS = 10_000_000
+MAX_REPORT_SNAPSHOTS = 2_000
 
 
 def ceil_fraction(value: Fraction) -> int:
@@ -113,6 +115,39 @@ class CodecAdapter:
             "this adapter does not provide a side-effect-free preview"
         )
 
+    def timeline_c_state(self, environment: int) -> dict[str, object]:
+        """Return adapter-owned state for one C authority.
+
+        Physical adapters use this hook for resident definitions, prepared work and
+        committed codec state.  The common event engine owns all scheduler/network state.
+        """
+        del environment
+        return {}
+
+    def timeline_f_state(
+        self, environment: int, worker: int
+    ) -> dict[str, object]:
+        """Return adapter-owned state for one (C authority, F) namespace."""
+        del environment, worker
+        return {}
+
+    def timeline_coverage(self) -> dict[str, object]:
+        return {
+            "codec_state": "not-modelled-by-this-adapter",
+            "codec_cpu": "not-modelled-by-this-adapter",
+        }
+
+    def dialogue_window_per_route(self) -> int | None:
+        """Maximum prepared-but-uncommitted transactions on one (C,F) route.
+
+        ``None`` keeps the diagnostic adapters unrestricted.  Physical replay adapters use
+        one unless their ledger explicitly describes a wider, state-consistent window.
+        """
+        return None
+
+    def result_metadata(self) -> dict[str, object]:
+        return {}
+
 
 class CompileOnlyAdapter(CodecAdapter):
     name = "compile-only"
@@ -138,6 +173,267 @@ class RawAdapter(CodecAdapter):
         return item.raw_bytes
 
 
+@dataclass(frozen=True)
+class PhysicalLedgerEntry:
+    workload: str
+    build: int
+    logical: int
+    worker: int
+    route_sequence: int
+    raw_bytes: int
+    raw_sha256: str
+    phases: tuple[Phase, ...]
+    state_after: dict[str, object]
+
+
+class PhysicalLedgerAdapter(CodecAdapter):
+    """Replay exact per-TU codec transactions inside the common event engine.
+
+    The producer of this ledger owns encoding and byte-exact reconstruction.  This class
+    rejects incomplete ledgers, mismatched scenarios, estimated rows, byte-total drift and
+    assignment drift before any result can carry the physical-result label.
+    """
+
+    physical = True
+
+    def __init__(
+        self, path: Path, scenario: "LoadedScenario", expected_codec: str | None = None
+    ):
+        self.path = path.resolve()
+        rows = [json.loads(line) for line in self.path.read_text().splitlines() if line]
+        if len(rows) < 3:
+            raise ValueError(f"{self.path}: physical ledger is incomplete")
+        descriptor, final = rows[0], rows[-1]
+        if (
+            descriptor.get("record") != "physical-ledger"
+            or descriptor.get("schema") != "icecream-physical-codec-ledger-v1"
+        ):
+            raise ValueError(f"{self.path}: unknown physical ledger schema")
+        codec = descriptor.get("codec")
+        if not isinstance(codec, str) or not codec:
+            raise ValueError(f"{self.path}: physical ledger codec is empty")
+        if expected_codec is not None and codec != expected_codec:
+            raise ValueError(
+                f"{self.path}: ledger codec {codec!r} differs from {expected_codec!r}"
+            )
+        reconstruction = descriptor.get("reconstruction")
+        if not isinstance(reconstruction, dict) or reconstruction.get("status") != "pass":
+            raise ValueError(f"{self.path}: reconstruction result is not pass")
+        if descriptor.get("scenario_sha256") != sha256(scenario.path):
+            raise ValueError(f"{self.path}: ledger belongs to a different scenario")
+        if final.get("record") != "physical-summary":
+            raise ValueError(f"{self.path}: physical ledger has no final summary")
+        self.name = codec
+        self.descriptor = descriptor
+        self.final = final
+        self.entries: dict[tuple[str, int, int], PhysicalLedgerEntry] = {}
+        route_sequences: dict[tuple[int, int], list[int]] = defaultdict(list)
+        payload_digests: dict[Path, str] = {}
+        c_to_f_total = 0
+        f_to_c_total = 0
+        for row_number, row in enumerate(rows[1:-1], start=2):
+            if row.get("record") != "tu" or row.get("exact") is not True:
+                raise ValueError(f"{self.path}:{row_number}: non-exact TU row")
+            workload = row.get("workload")
+            if not isinstance(workload, str) or not workload:
+                raise ValueError(f"{self.path}:{row_number}: workload is empty")
+            build = checked_nonnegative_int(row.get("build"), "ledger build")
+            logical = checked_nonnegative_int(row.get("logical"), "ledger logical")
+            worker = checked_nonnegative_int(row.get("worker"), "ledger worker")
+            if worker >= int(scenario.document["workers"]["f_count"]):
+                raise ValueError(f"{self.path}:{row_number}: worker is outside scenario")
+            route_sequence = checked_nonnegative_int(
+                row.get("route_sequence"), "ledger route_sequence"
+            )
+            raw_bytes = checked_positive_int(row.get("raw_bytes"), "ledger raw_bytes")
+            raw_sha256 = row.get("raw_sha256")
+            if (
+                not isinstance(raw_sha256, str)
+                or len(raw_sha256) != 64
+                or any(character not in "0123456789abcdef" for character in raw_sha256)
+            ):
+                raise ValueError(f"{self.path}:{row_number}: raw_sha256 is not canonical")
+            phase_rows = row.get("phases")
+            if not isinstance(phase_rows, list) or not phase_rows:
+                raise ValueError(f"{self.path}:{row_number}: phases are empty")
+            phases = []
+            for phase_index, phase_row in enumerate(phase_rows):
+                if not isinstance(phase_row, dict):
+                    raise ValueError(
+                        f"{self.path}:{row_number}: phase {phase_index} is not an object"
+                    )
+                phase_name = phase_row.get("name")
+                if not isinstance(phase_name, str) or not phase_name:
+                    raise ValueError(
+                        f"{self.path}:{row_number}: phase {phase_index} has no name"
+                    )
+                phases.append(
+                    Phase(
+                        phase_name,
+                        phase_row.get("direction"),
+                        checked_nonnegative_int(
+                            phase_row.get("bytes"), "ledger phase bytes"
+                        ),
+                    )
+                )
+            state_after = row.get("state_after", {})
+            if not isinstance(state_after, dict):
+                raise ValueError(f"{self.path}:{row_number}: state_after is not an object")
+            entry = PhysicalLedgerEntry(
+                workload,
+                build,
+                logical,
+                worker,
+                route_sequence,
+                raw_bytes,
+                raw_sha256,
+                tuple(phases),
+                state_after,
+            )
+            key = (workload, build, logical)
+            if key in self.entries:
+                raise ValueError(f"{self.path}:{row_number}: repeated TU identity {key}")
+            self.entries[key] = entry
+            environment = scenario.work_items[(workload, build)][logical].environment
+            route_sequences[(environment, worker)].append(route_sequence)
+            c_to_f_total += sum(
+                phase.byte_count for phase in phases if phase.direction == "c_to_f"
+            )
+            f_to_c_total += sum(
+                phase.byte_count for phase in phases if phase.direction == "f_to_c"
+            )
+
+        expected_items = {
+            item.key: item
+            for items in scenario.work_items.values()
+            for item in items
+        }
+        if set(self.entries) != set(expected_items):
+            missing = sorted(set(expected_items) - set(self.entries))
+            extra = sorted(set(self.entries) - set(expected_items))
+            raise ValueError(
+                f"{self.path}: ledger TU set differs: missing={missing[:1]} extra={extra[:1]}"
+            )
+        for key, item in expected_items.items():
+            if self.entries[key].raw_bytes != item.raw_bytes:
+                raise ValueError(f"{self.path}: raw byte count differs for {key}")
+            if not item.payload.is_file():
+                raise ValueError(f"{self.path}: payload is absent for {key}: {item.payload}")
+            payload = item.payload.resolve()
+            digest = payload_digests.get(payload)
+            if digest is None:
+                digest = sha256(payload)
+                payload_digests[payload] = digest
+            if self.entries[key].raw_sha256 != digest:
+                raise ValueError(f"{self.path}: raw content digest differs for {key}")
+        for route, sequences in route_sequences.items():
+            if sequences != list(range(len(sequences))):
+                raise ValueError(
+                    f"{self.path}: route {route} sequence is not contiguous in ledger order"
+                )
+        totals = final.get("totals")
+        expected_totals = {
+            "tus": len(self.entries),
+            "c_to_f_bytes": c_to_f_total,
+            "f_to_c_bytes": f_to_c_total,
+        }
+        if totals != expected_totals:
+            raise ValueError(
+                f"{self.path}: final totals {totals!r} differ from {expected_totals!r}"
+            )
+        self.committed_by_route: dict[tuple[int, int], int] = defaultdict(int)
+        self.committed_by_environment = [
+            0 for _ in range(int(scenario.document["environments"]["env_count"]))
+        ]
+        self.committed_bytes_by_environment = [
+            0 for _ in range(int(scenario.document["environments"]["env_count"]))
+        ]
+        self.committed_bytes_by_route: dict[tuple[int, int], int] = defaultdict(int)
+        self.active: set[tuple[str, int, int]] = set()
+        self.last_route_state: dict[tuple[int, int], dict[str, object]] = {}
+        self.item_environment = {
+            key: item.environment for key, item in expected_items.items()
+        }
+
+    def dialogue_window_per_route(self) -> int | None:
+        return 1
+
+    def begin(self, item: WorkItem, worker: int) -> Sequence[Phase]:
+        entry = self.entries[item.key]
+        if entry.worker != worker:
+            raise RuntimeError(
+                f"physical ledger assigned {item.key} to F{entry.worker}, simulator chose F{worker}"
+            )
+        route = (item.environment, worker)
+        if entry.route_sequence != self.committed_by_route[route]:
+            raise RuntimeError(
+                f"physical ledger route {route} expected sequence {entry.route_sequence}, "
+                f"committed {self.committed_by_route[route]}"
+            )
+        if item.key in self.active:
+            raise RuntimeError(f"physical ledger TU {item.key} began twice")
+        self.active.add(item.key)
+        return entry.phases
+
+    def commit(self, item: WorkItem, worker: int) -> None:
+        if item.key not in self.active:
+            raise RuntimeError(f"physical ledger TU {item.key} committed without begin")
+        entry = self.entries[item.key]
+        route = (item.environment, worker)
+        if entry.worker != worker or entry.route_sequence != self.committed_by_route[route]:
+            raise RuntimeError(f"physical ledger commit order changed for {item.key}")
+        self.active.remove(item.key)
+        self.committed_by_route[route] += 1
+        self.committed_by_environment[item.environment] += 1
+        c_to_f = sum(
+            phase.byte_count for phase in entry.phases if phase.direction == "c_to_f"
+        )
+        self.committed_bytes_by_environment[item.environment] += c_to_f
+        self.committed_bytes_by_route[route] += c_to_f
+        self.last_route_state[route] = entry.state_after
+
+    def preview_c_to_f(self, item: WorkItem, worker: int) -> int:
+        entry = self.entries[item.key]
+        if entry.worker != worker:
+            return 1 << 62
+        return sum(
+            phase.byte_count for phase in entry.phases if phase.direction == "c_to_f"
+        )
+
+    def timeline_c_state(self, environment: int) -> dict[str, object]:
+        return {
+            "committed_tus": self.committed_by_environment[environment],
+            "committed_c_to_f_bytes": self.committed_bytes_by_environment[environment],
+        }
+
+    def timeline_f_state(
+        self, environment: int, worker: int
+    ) -> dict[str, object]:
+        route = (environment, worker)
+        state = {
+            "committed_transactions": self.committed_by_route[route],
+            "committed_c_to_f_bytes": self.committed_bytes_by_route[route],
+        }
+        if route in self.last_route_state:
+            state["codec_state"] = self.last_route_state[route]
+        return state
+
+    def timeline_coverage(self) -> dict[str, object]:
+        return {
+            "codec_state": "committed physical-ledger state_after rows",
+            "codec_cpu": self.descriptor.get("codec_cpu", "not-modelled"),
+            "reconstruction": self.descriptor["reconstruction"],
+        }
+
+    def result_metadata(self) -> dict[str, object]:
+        return {
+            "ledger": str(self.path),
+            "ledger_sha256": sha256(self.path),
+            "descriptor": self.descriptor,
+            "physical_summary": self.final,
+        }
+
+
 @dataclass
 class Transaction:
     sequence: int
@@ -152,6 +448,7 @@ class Transaction:
     compile_finish_ns: Fraction | None = None
     c_to_f_bytes: int = 0
     f_to_c_bytes: int = 0
+    dialogue_started: bool = False
 
 
 @dataclass
@@ -179,6 +476,7 @@ class SimulationResult:
     workers: list[dict[str, object]]
     builds: list[dict[str, object]]
     generations: list[dict[str, object]]
+    timeline: list[dict[str, object]]
 
 
 class SparseSlotPool:
@@ -225,6 +523,212 @@ class LoadedScenario:
     work_items: dict[tuple[str, int], list[WorkItem]]
     workload_config: dict[str, dict[str, object]]
     workload_inputs: dict[str, dict[str, object]]
+
+
+class TimelineRecorder:
+    """Integrate exact engine state into bounded active-time observations.
+
+    Ten milliseconds is measured only while a compiler or a network serializer is doing
+    work.  A wall-clock interval with neither is represented by one gap record, preserving
+    release and propagation timers without manufacturing thousands of empty samples.
+    """
+
+    def __init__(self, interval_ns: int, workers: int):
+        self.interval_ns = checked_positive_int(interval_ns, "snapshot interval_ns")
+        self.workers = workers
+        self.records: list[dict[str, object]] = []
+        self.sequence = 0
+        self.active_ns = Fraction(0)
+        self.sample_active_start_ns = Fraction(0)
+        self.sample_wall_start_ns: Fraction | None = None
+        self.sample_elapsed_ns = Fraction(0)
+        self.route_bits: dict[tuple[str, int, int], Fraction] = defaultdict(Fraction)
+        self.fabric_bits = Fraction(0)
+        self.compile_slot_ns = [Fraction(0) for _ in range(workers)]
+        self.input_wait_slot_ns = [Fraction(0) for _ in range(workers)]
+        self.reserved_slot_ns = [Fraction(0) for _ in range(workers)]
+        self.snapshot_due = False
+
+    @property
+    def remaining_sample_ns(self) -> Fraction:
+        return Fraction(self.interval_ns) - self.sample_elapsed_ns
+
+    def accumulate(
+        self,
+        simulator: "Simulator",
+        elapsed_ns: Fraction,
+        rates: dict[int, Fraction],
+    ) -> None:
+        if elapsed_ns <= 0:
+            raise ValueError("timeline accumulation requires positive elapsed time")
+        if self.sample_wall_start_ns is None:
+            self.sample_wall_start_ns = simulator.now
+            self.sample_active_start_ns = self.active_ns
+        self.sample_elapsed_ns += elapsed_ns
+        self.active_ns += elapsed_ns
+        for flow_sequence, rate in rates.items():
+            flow = simulator.active_flows[flow_sequence]
+            bits = rate * elapsed_ns
+            self.route_bits[flow.endpoint] += bits
+            self.fabric_bits += bits
+        for worker in range(self.workers):
+            self.compile_slot_ns[worker] += (
+                simulator.worker_compiling[worker] * elapsed_ns
+            )
+            self.input_wait_slot_ns[worker] += (
+                simulator.worker_input_wait[worker] * elapsed_ns
+            )
+            self.reserved_slot_ns[worker] += (
+                len(simulator.free_slots[worker].in_use) * elapsed_ns
+            )
+        if self.sample_elapsed_ns > self.interval_ns:
+            raise AssertionError("timeline sample exceeded its configured interval")
+
+    def mark_or_emit_boundary(self, simulator: "Simulator", external: bool) -> None:
+        if self.sample_elapsed_ns != self.interval_ns:
+            return
+        if external:
+            self.snapshot_due = True
+        else:
+            self.emit_snapshot(simulator)
+
+    def flush_due(self, simulator: "Simulator") -> None:
+        if self.snapshot_due:
+            self.emit_snapshot(simulator)
+
+    def flush_partial(self, simulator: "Simulator") -> None:
+        self.flush_due(simulator)
+        if self.sample_elapsed_ns:
+            self.emit_snapshot(simulator)
+
+    def emit_snapshot(self, simulator: "Simulator") -> None:
+        if not self.sample_elapsed_ns or self.sample_wall_start_ns is None:
+            raise RuntimeError("cannot emit an empty active timeline sample")
+        duration = self.sample_elapsed_ns
+        route_metrics: list[dict[str, object]] = []
+        environment_rates: dict[tuple[str, int], float] = defaultdict(float)
+        worker_rates: dict[tuple[str, int], float] = defaultdict(float)
+        for (direction, environment, worker), bits in sorted(self.route_bits.items()):
+            average_bps = float(bits * NANOSECONDS / duration)
+            environment_rates[(direction, environment)] += average_bps
+            worker_rates[(direction, worker)] += average_bps
+            route_capacity = int(simulator.network[direction]["bits_per_second"])
+            route_metrics.append(
+                {
+                    "direction": direction,
+                    "environment": environment,
+                    "worker": worker,
+                    "bits": float(bits),
+                    "average_bps": average_bps,
+                    "route_capacity_bps": route_capacity,
+                    "route_utilization": average_bps / route_capacity,
+                }
+            )
+        environment_metrics = []
+        for environment in range(simulator.env_count):
+            row: dict[str, object] = {"environment": environment}
+            for direction in DIRECTIONS:
+                average_bps = environment_rates[(direction, environment)]
+                capacity = simulator.network[direction].get(
+                    "per_environment_bits_per_second"
+                )
+                row[f"{direction}_average_bps"] = average_bps
+                row[f"{direction}_capacity_bps"] = capacity
+                row[f"{direction}_utilization"] = (
+                    None if capacity is None else average_bps / int(capacity)
+                )
+            environment_metrics.append(row)
+        worker_metrics = []
+        for worker in range(self.workers):
+            row = {
+                "worker": worker,
+                "average_compiling_slots": float(
+                    self.compile_slot_ns[worker] / duration
+                ),
+                "average_input_wait_slots": float(
+                    self.input_wait_slot_ns[worker] / duration
+                ),
+                "average_reserved_slots": float(
+                    self.reserved_slot_ns[worker] / duration
+                ),
+            }
+            for direction in DIRECTIONS:
+                average_bps = worker_rates[(direction, worker)]
+                capacity = simulator.network[direction].get(
+                    "per_worker_bits_per_second"
+                )
+                row[f"{direction}_average_bps"] = average_bps
+                row[f"{direction}_capacity_bps"] = capacity
+                row[f"{direction}_utilization"] = (
+                    None if capacity is None else average_bps / int(capacity)
+                )
+            worker_metrics.append(row)
+        metrics = {
+            "fabric_bits": float(self.fabric_bits),
+            "fabric_average_bps": float(self.fabric_bits * NANOSECONDS / duration),
+            "fabric_capacity_bps": int(simulator.network["shared_fabric_bps"]),
+            "fabric_utilization": float(
+                self.fabric_bits
+                * NANOSECONDS
+                / duration
+                / int(simulator.network["shared_fabric_bps"])
+            ),
+            "routes": route_metrics,
+            "environments": environment_metrics,
+            "workers": worker_metrics,
+        }
+        state = simulator.timeline_state()
+        self.records.append(
+            {
+                "record": "snapshot",
+                "sequence": self.sequence,
+                "wall_start_ns": ceil_fraction(self.sample_wall_start_ns),
+                "wall_end_ns": ceil_fraction(simulator.now),
+                "wall_duration_ns": ceil_fraction(
+                    simulator.now - self.sample_wall_start_ns
+                ),
+                "active_start_ns": ceil_fraction(self.sample_active_start_ns),
+                "active_end_ns": ceil_fraction(self.active_ns),
+                "active_duration_ns": ceil_fraction(duration),
+                "state": state,
+                "metrics": metrics,
+            }
+        )
+        self.sequence += 1
+        self.sample_active_start_ns = self.active_ns
+        self.sample_wall_start_ns = None
+        self.sample_elapsed_ns = Fraction(0)
+        self.route_bits.clear()
+        self.fabric_bits = Fraction(0)
+        self.compile_slot_ns = [Fraction(0) for _ in range(self.workers)]
+        self.input_wait_slot_ns = [Fraction(0) for _ in range(self.workers)]
+        self.reserved_slot_ns = [Fraction(0) for _ in range(self.workers)]
+        self.snapshot_due = False
+
+    def emit_gap(
+        self, simulator: "Simulator", start_ns: Fraction, end_ns: Fraction
+    ) -> None:
+        if end_ns <= start_ns:
+            raise ValueError("timeline gap must have positive duration")
+        if simulator.delivery_heap:
+            reason = "network-propagation"
+        elif simulator.release_heap:
+            reason = "workload-release"
+        else:
+            reason = "timer"
+        self.records.append(
+            {
+                "record": "gap",
+                "sequence": self.sequence,
+                "wall_start_ns": ceil_fraction(start_ns),
+                "wall_end_ns": ceil_fraction(end_ns),
+                "wall_duration_ns": ceil_fraction(end_ns - start_ns),
+                "active_position_ns": ceil_fraction(self.active_ns),
+                "reason": reason,
+                "state": simulator.timeline_state(),
+            }
+        )
+        self.sequence += 1
 
 
 def sha256(path: Path) -> str:
@@ -350,6 +854,15 @@ def load_scenario(
         checked_positive_int(
             link.get("lanes_per_endpoint"), f"network.{direction}.lanes_per_endpoint"
         )
+        for optional_capacity in (
+            "per_environment_bits_per_second",
+            "per_worker_bits_per_second",
+        ):
+            if optional_capacity in link:
+                checked_positive_int(
+                    link.get(optional_capacity),
+                    f"network.{direction}.{optional_capacity}",
+                )
     checked_positive_int(network.get("shared_fabric_bps"), "network.shared_fabric_bps")
     if scheduler.get("ready_job_policy") not in {
         "fifo-release",
@@ -465,11 +978,17 @@ def load_scenario(
 
 
 class Simulator:
-    def __init__(self, scenario: LoadedScenario, adapter: CodecAdapter):
+    def __init__(
+        self,
+        scenario: LoadedScenario,
+        adapter: CodecAdapter,
+        snapshot_interval_ns: int = DEFAULT_SNAPSHOT_NS,
+    ):
         self.scenario = scenario
         self.adapter = adapter
         document = scenario.document
         worker_config = document["workers"]
+        self.env_count = int(document["environments"]["env_count"])
         self.f_count = int(worker_config["f_count"])
         self.slots_per_f = int(worker_config["template"]["slots"])
         self.network = document["network"]
@@ -486,6 +1005,10 @@ class Simulator:
         self.delivery_heap: list[tuple[Fraction, int, Flow]] = []
         self.active_flows: dict[int, Flow] = {}
         self.endpoint_queues: dict[tuple[str, int, int], deque[Flow]] = defaultdict(
+            deque
+        )
+        self.dialogue_active: dict[tuple[int, int], int] = defaultdict(int)
+        self.dialogue_queues: dict[tuple[int, int], deque[Transaction]] = defaultdict(
             deque
         )
         self.transactions: list[Transaction] = []
@@ -505,6 +1028,18 @@ class Simulator:
         self.worker_raw_bytes = [0] * self.f_count
         self.worker_c_to_f = [0] * self.f_count
         self.worker_f_to_c = [0] * self.f_count
+        self.env_unreleased = [0] * self.env_count
+        for items in scenario.work_items.values():
+            for item in items:
+                self.env_unreleased[item.environment] += 1
+        self.env_ready = [0] * self.env_count
+        self.env_active = [0] * self.env_count
+        self.env_completed = [0] * self.env_count
+        self.worker_input_wait = [0] * self.f_count
+        self.worker_compiling = [0] * self.f_count
+        self.worker_dispatched = [0] * self.f_count
+        self.worker_completed = [0] * self.f_count
+        self.timeline = TimelineRecorder(snapshot_interval_ns, self.f_count)
         self._seed_releases()
 
     def _seed_releases(self) -> None:
@@ -526,9 +1061,14 @@ class Simulator:
             heapq.heappush(self.release_heap, (item.release_ns, item.ordinal, item))
 
     def _event(
-        self, name: str, tx: Transaction | None = None, phase: Phase | None = None
+        self,
+        name: str,
+        tx: Transaction | None = None,
+        phase: Phase | None = None,
+        item: WorkItem | None = None,
+        flow: Flow | None = None,
     ) -> None:
-        item = tx.item if tx is not None else None
+        item = tx.item if tx is not None else item
         self.events.append(
             {
                 "sequence": self.event_sequence,
@@ -540,6 +1080,8 @@ class Simulator:
                 "logical": "" if item is None else item.logical,
                 "worker": "" if tx is None else tx.worker,
                 "slot": "" if tx is None else tx.slot,
+                "transaction": "" if tx is None else tx.sequence,
+                "flow": "" if flow is None else flow.sequence,
                 "phase": "" if phase is None else phase.name,
                 "direction": "" if phase is None else phase.direction,
                 "bytes": "" if phase is None else phase.byte_count,
@@ -550,6 +1092,9 @@ class Simulator:
     def _release_ready(self) -> None:
         while self.release_heap and self.release_heap[0][0] <= self.now:
             _, _, item = heapq.heappop(self.release_heap)
+            self.env_unreleased[item.environment] -= 1
+            self.env_ready[item.environment] += 1
+            self._event("release", item=item)
             policy = self.scheduler["ready_job_policy"]
             if policy == "environment-round-robin":
                 queue = self.ready_by_environment[item.environment]
@@ -575,14 +1120,16 @@ class Simulator:
 
     def _pop_ready(self) -> WorkItem:
         if self.scheduler["ready_job_policy"] != "environment-round-robin":
-            return heapq.heappop(self.ready_heap)[2]
-        environment = self.ready_environment_cycle.popleft()
-        queue = self.ready_by_environment[environment]
-        item = queue.popleft()
-        if queue:
-            self.ready_environment_cycle.append(environment)
+            item = heapq.heappop(self.ready_heap)[2]
         else:
-            self.ready_environment_members.remove(environment)
+            environment = self.ready_environment_cycle.popleft()
+            queue = self.ready_by_environment[environment]
+            item = queue.popleft()
+            if queue:
+                self.ready_environment_cycle.append(environment)
+            else:
+                self.ready_environment_members.remove(environment)
+        self.env_ready[item.environment] -= 1
         return item
 
     def _free_workers(self) -> list[int]:
@@ -618,28 +1165,67 @@ class Simulator:
         while self._has_ready() and self._free_workers():
             item = self._pop_ready()
             worker, slot = self._select_slot(item)
-            phases = tuple(self.adapter.begin(item, worker))
             tx = Transaction(
                 self.transaction_sequence,
                 item,
                 worker,
                 slot,
-                phases,
+                (),
                 dispatch_ns=self.now,
             )
             self.transaction_sequence += 1
             self.transactions.append(tx)
             self.worker_raw_bytes[worker] += item.raw_bytes
+            self.env_active[item.environment] += 1
+            self.worker_input_wait[worker] += 1
+            self.worker_dispatched[worker] += 1
             self._event("dispatch", tx)
-            self._start_next_phase(tx)
+            self._queue_or_start_dialogue(tx)
+
+    def _queue_or_start_dialogue(self, tx: Transaction) -> None:
+        window = self.adapter.dialogue_window_per_route()
+        route = (tx.item.environment, tx.worker)
+        if window is not None and self.dialogue_active[route] >= window:
+            self.dialogue_queues[route].append(tx)
+            self._event("dialogue-queued", tx)
+            return
+        if window is not None:
+            self.dialogue_active[route] += 1
+        self._start_dialogue(tx)
+
+    def _start_dialogue(self, tx: Transaction) -> None:
+        if tx.dialogue_started:
+            raise RuntimeError("transaction dialogue started twice")
+        tx.phases = tuple(self.adapter.begin(tx.item, tx.worker))
+        tx.dialogue_started = True
+        self._event("dialogue-start", tx)
+        self._start_next_phase(tx)
+
+    def _finish_dialogue(self, tx: Transaction) -> None:
+        self._event("dialogue-finish", tx)
+        window = self.adapter.dialogue_window_per_route()
+        if window is None:
+            return
+        route = (tx.item.environment, tx.worker)
+        if self.dialogue_active[route] <= 0:
+            raise RuntimeError("dialogue route count underflow")
+        self.dialogue_active[route] -= 1
+        queue = self.dialogue_queues[route]
+        if queue:
+            following = queue.popleft()
+            self.dialogue_active[route] += 1
+            self._start_dialogue(following)
 
     def _start_next_phase(self, tx: Transaction) -> None:
         if tx.phase_index == len(tx.phases):
             tx.transfer_done_ns = self.now
             self.adapter.commit(tx.item, tx.worker)
+            self._finish_dialogue(tx)
             tx.compile_start_ns = self.now
             tx.compile_finish_ns = self.now + tx.item.compile_ns
             self.worker_compile_ns[tx.worker] += tx.item.compile_ns
+            self.worker_input_wait[tx.worker] -= 1
+            self.worker_compiling[tx.worker] += 1
             self._event("compile-start", tx)
             heapq.heappush(self.compile_heap, (tx.compile_finish_ns, tx.sequence, tx))
             return
@@ -653,18 +1239,20 @@ class Simulator:
         flow = Flow(self.flow_sequence, tx, phase, Fraction(phase.byte_count * 8))
         self.flow_sequence += 1
         if phase.byte_count == 0:
-            self._event("flow-start", tx, phase)
+            self._event("flow-queued", tx, phase, flow=flow)
+            self._event("flow-start", tx, phase, flow=flow)
             latency = int(self.network[phase.direction]["one_way_latency_ns"])
-            self._event("flow-sent", tx, phase)
+            self._event("flow-sent", tx, phase, flow=flow)
             if latency:
                 heapq.heappush(
                     self.delivery_heap, (self.now + latency, flow.sequence, flow)
                 )
             else:
-                self._event("flow-finish", tx, phase)
+                self._event("flow-finish", tx, phase, flow=flow)
                 tx.phase_index += 1
                 self._start_next_phase(tx)
             return
+        self._event("flow-queued", tx, phase, flow=flow)
         self.endpoint_queues[flow.endpoint].append(flow)
         self._fill_endpoint_queues()
 
@@ -682,10 +1270,12 @@ class Simulator:
                 flow.start_ns = self.now
                 self.active_flows[flow.sequence] = flow
                 active_count[endpoint] += 1
-                self._event("flow-start", flow.transaction, flow.phase)
+                self._event(
+                    "flow-start", flow.transaction, flow.phase, flow=flow
+                )
 
     def _flow_rates(self) -> dict[int, Fraction]:
-        """Return max-min fair bits/ns under route and shared-fabric capacities."""
+        """Return max-min fair bits/ns under every configured network capacity."""
         if not self.active_flows:
             return {}
         capacities: dict[tuple[object, ...], Fraction] = {
@@ -693,6 +1283,7 @@ class Simulator:
         }
         resources: dict[int, tuple[tuple[object, ...], ...]] = {}
         for sequence, flow in self.active_flows.items():
+            direction, environment, worker = flow.endpoint
             route = ("route",) + flow.endpoint
             capacities.setdefault(
                 route,
@@ -701,7 +1292,25 @@ class Simulator:
                     NANOSECONDS,
                 ),
             )
-            resources[sequence] = (("fabric",), route)
+            flow_resources: list[tuple[object, ...]] = [("fabric",), route]
+            link = self.network[direction]
+            if "per_environment_bits_per_second" in link:
+                environment_resource = ("environment", direction, environment)
+                capacities.setdefault(
+                    environment_resource,
+                    Fraction(
+                        int(link["per_environment_bits_per_second"]), NANOSECONDS
+                    ),
+                )
+                flow_resources.append(environment_resource)
+            if "per_worker_bits_per_second" in link:
+                worker_resource = ("worker", direction, worker)
+                capacities.setdefault(
+                    worker_resource,
+                    Fraction(int(link["per_worker_bits_per_second"]), NANOSECONDS),
+                )
+                flow_resources.append(worker_resource)
+            resources[sequence] = tuple(flow_resources)
         unresolved = set(self.active_flows)
         rates = {sequence: Fraction(0) for sequence in unresolved}
         while unresolved:
@@ -749,14 +1358,22 @@ class Simulator:
     def _advance_network(self, target: Fraction) -> None:
         if target < self.now:
             raise RuntimeError("simulation clock moved backwards")
-        elapsed = target - self.now
-        if elapsed and self.active_flows:
+        while self.now < target:
+            if not self.active_flows and not self.compile_heap:
+                self.timeline.flush_partial(self)
+                start = self.now
+                self.timeline.emit_gap(self, start, target)
+                self.now = target
+                return
+            elapsed = min(target - self.now, self.timeline.remaining_sample_ns)
             rates = self._flow_rates()
+            self.timeline.accumulate(self, elapsed, rates)
             for sequence, flow in self.active_flows.items():
                 flow.remaining_bits -= rates[sequence] * elapsed
                 if flow.remaining_bits < 0:
                     raise RuntimeError("network flow overran its completion point")
-        self.now = target
+            self.now += elapsed
+            self.timeline.mark_or_emit_boundary(self, external=self.now == target)
 
     def _finish_serializations(self) -> None:
         finished = [
@@ -767,7 +1384,9 @@ class Simulator:
         for flow in sorted(finished, key=lambda value: value.sequence):
             del self.active_flows[flow.sequence]
         for flow in sorted(finished, key=lambda value: value.sequence):
-            self._event("flow-sent", flow.transaction, flow.phase)
+            self._event(
+                "flow-sent", flow.transaction, flow.phase, flow=flow
+            )
             latency = int(self.network[flow.phase.direction]["one_way_latency_ns"])
             heapq.heappush(
                 self.delivery_heap,
@@ -778,7 +1397,9 @@ class Simulator:
     def _finish_deliveries(self) -> None:
         while self.delivery_heap and self.delivery_heap[0][0] <= self.now:
             _, _, flow = heapq.heappop(self.delivery_heap)
-            self._event("flow-finish", flow.transaction, flow.phase)
+            self._event(
+                "flow-finish", flow.transaction, flow.phase, flow=flow
+            )
             flow.transaction.phase_index += 1
             self._start_next_phase(flow.transaction)
 
@@ -786,9 +1407,13 @@ class Simulator:
         while self.compile_heap and self.compile_heap[0][0] <= self.now:
             _, _, tx = heapq.heappop(self.compile_heap)
             self._event("compile-finish", tx)
+            self.worker_compiling[tx.worker] -= 1
             self.free_slots[tx.worker].release(tx.slot)
             self.worker_reserved_ns[tx.worker] += self.now - tx.dispatch_ns
             self.completed += 1
+            self.env_active[tx.item.environment] -= 1
+            self.env_completed[tx.item.environment] += 1
+            self.worker_completed[tx.worker] += 1
             key = (tx.item.workload, tx.item.build)
             self.build_remaining[key] -= 1
             if self.build_remaining[key] == 0:
@@ -822,6 +1447,166 @@ class Simulator:
             )
         return min(future)
 
+    def timeline_state(self) -> dict[str, object]:
+        active_by_route: dict[tuple[str, int, int], int] = defaultdict(int)
+        queued_by_route: dict[tuple[str, int, int], int] = defaultdict(int)
+        delivery_by_route: dict[tuple[str, int, int], int] = defaultdict(int)
+        for flow in self.active_flows.values():
+            active_by_route[flow.endpoint] += 1
+        for endpoint, queue in self.endpoint_queues.items():
+            queued_by_route[endpoint] += len(queue)
+        for _, _, flow in self.delivery_heap:
+            delivery_by_route[flow.endpoint] += 1
+
+        c_state = []
+        for environment in range(self.env_count):
+            targets = []
+            for worker in range(self.f_count):
+                route = (environment, worker)
+                active_dialogues = self.dialogue_active[route]
+                queued_dialogues = len(self.dialogue_queues[route])
+                forward_active = active_by_route[("c_to_f", environment, worker)]
+                forward_queued = queued_by_route[("c_to_f", environment, worker)]
+                forward_delivery = delivery_by_route[("c_to_f", environment, worker)]
+                reverse_active = active_by_route[("f_to_c", environment, worker)]
+                reverse_queued = queued_by_route[("f_to_c", environment, worker)]
+                reverse_delivery = delivery_by_route[("f_to_c", environment, worker)]
+                if any(
+                    (
+                        forward_active,
+                        forward_queued,
+                        forward_delivery,
+                        reverse_active,
+                        reverse_queued,
+                        reverse_delivery,
+                        active_dialogues,
+                        queued_dialogues,
+                    )
+                ):
+                    targets.append(
+                        {
+                            "worker": worker,
+                            "active_dialogues": active_dialogues,
+                            "queued_dialogues": queued_dialogues,
+                            "c_to_f_active_flows": forward_active,
+                            "c_to_f_queued_flows": forward_queued,
+                            "c_to_f_in_propagation": forward_delivery,
+                            "f_to_c_active_flows": reverse_active,
+                            "f_to_c_queued_flows": reverse_queued,
+                            "f_to_c_in_propagation": reverse_delivery,
+                        }
+                    )
+            c_state.append(
+                {
+                    "environment": environment,
+                    "unreleased_tus": self.env_unreleased[environment],
+                    "ready_tus": self.env_ready[environment],
+                    "active_tus": self.env_active[environment],
+                    "completed_tus": self.env_completed[environment],
+                    "targets": targets,
+                    "codec": self.adapter.timeline_c_state(environment),
+                }
+            )
+
+        f_state = []
+        for worker in range(self.f_count):
+            namespaces = []
+            for environment in range(self.env_count):
+                codec_state = self.adapter.timeline_f_state(environment, worker)
+                if codec_state:
+                    namespaces.append(
+                        {"environment": environment, "codec": codec_state}
+                    )
+            f_state.append(
+                {
+                    "worker": worker,
+                    "slots": self.slots_per_f,
+                    "free_slots": self.slots_per_f
+                    - len(self.free_slots[worker].in_use),
+                    "reserved_slots": len(self.free_slots[worker].in_use),
+                    "input_wait_slots": self.worker_input_wait[worker],
+                    "compiling_slots": self.worker_compiling[worker],
+                    "dispatched_tus": self.worker_dispatched[worker],
+                    "completed_tus": self.worker_completed[worker],
+                    "active_flows": sum(
+                        value
+                        for (direction, environment, route_worker), value in active_by_route.items()
+                        if route_worker == worker
+                    ),
+                    "queued_flows": sum(
+                        value
+                        for (direction, environment, route_worker), value in queued_by_route.items()
+                        if route_worker == worker
+                    ),
+                    "in_propagation": sum(
+                        value
+                        for (direction, environment, route_worker), value in delivery_by_route.items()
+                        if route_worker == worker
+                    ),
+                    "active_dialogues": sum(
+                        self.dialogue_active[(environment, worker)]
+                        for environment in range(self.env_count)
+                    ),
+                    "queued_dialogues": sum(
+                        len(self.dialogue_queues[(environment, worker)])
+                        for environment in range(self.env_count)
+                    ),
+                    "codec_namespaces": namespaces,
+                }
+            )
+
+        return {
+            "scheduler": {
+                "unreleased_tus": sum(self.env_unreleased),
+                "ready_tus": sum(self.env_ready),
+                "active_tus": sum(self.env_active),
+                "completed_tus": self.completed,
+                "total_tus": self.total_items,
+            },
+            "c": c_state,
+            "f": f_state,
+            "network": {
+                "active_flows": len(self.active_flows),
+                "queued_flows": sum(len(queue) for queue in self.endpoint_queues.values()),
+                "in_propagation": len(self.delivery_heap),
+                "active_dialogues": sum(self.dialogue_active.values()),
+                "queued_dialogues": sum(
+                    len(queue) for queue in self.dialogue_queues.values()
+                ),
+            },
+        }
+
+    def _assert_terminal_state(self) -> None:
+        """Require every scheduler, route, and F-slot counter to close exactly."""
+        failures = {
+            "release_heap": len(self.release_heap),
+            "ready_heap": len(self.ready_heap),
+            "ready_environment_cycle": len(self.ready_environment_cycle),
+            "active_flows": len(self.active_flows),
+            "queued_flows": sum(len(queue) for queue in self.endpoint_queues.values()),
+            "deliveries": len(self.delivery_heap),
+            "compiles": len(self.compile_heap),
+            "active_dialogues": sum(self.dialogue_active.values()),
+            "queued_dialogues": sum(
+                len(queue) for queue in self.dialogue_queues.values()
+            ),
+            "environment_unreleased": sum(self.env_unreleased),
+            "environment_ready": sum(self.env_ready),
+            "environment_active": sum(self.env_active),
+            "worker_input_wait": sum(self.worker_input_wait),
+            "worker_compiling": sum(self.worker_compiling),
+            "reserved_slots": sum(
+                len(pool.in_use) for pool in self.free_slots.values()
+            ),
+        }
+        nonzero = {name: value for name, value in failures.items() if value}
+        if nonzero:
+            raise RuntimeError(f"completed simulation retained active state: {nonzero}")
+        if self.completed != self.total_items or sum(self.env_completed) != self.total_items:
+            raise RuntimeError(
+                "completed simulation counters differ from the scenario TU count"
+            )
+
     def run(self) -> SimulationResult:
         while self.completed < self.total_items:
             self._release_ready()
@@ -830,12 +1615,16 @@ class Simulator:
             self._finish_compiles()
             self._release_ready()
             self._dispatch()
+            self.timeline.flush_due(self)
             if self.completed == self.total_items:
                 break
             target = self._next_time()
             if target == self.now:
                 raise RuntimeError("simulation produced a zero-time event loop")
             self._advance_network(target)
+
+        self.timeline.flush_partial(self)
+        self._assert_terminal_state()
 
         makespan_ns = ceil_fraction(self.now)
         assignments = []
@@ -979,6 +1768,8 @@ class Simulator:
             "workload_inputs": self.scenario.workload_inputs,
             "codec_adapter": self.adapter.name,
             "physical_codec_result": self.adapter.physical,
+            "codec_metadata": self.adapter.result_metadata(),
+            "dialogue_window_per_route": self.adapter.dialogue_window_per_route(),
             "placement_policy": self.scheduler["placement_policy"],
             "ready_job_policy": self.scheduler["ready_job_policy"],
             "jobs": self.total_items,
@@ -1007,9 +1798,43 @@ class Simulator:
                 for items in self.scenario.work_items.values()
                 for item in items
             ),
+            "timeline_snapshot_interval_ns": self.timeline.interval_ns,
+            "timeline_active_ns": ceil_fraction(self.timeline.active_ns),
+            "timeline_records": len(self.timeline.records),
+            "timeline_snapshots": sum(
+                row["record"] == "snapshot" for row in self.timeline.records
+            ),
+            "timeline_gaps": sum(
+                row["record"] == "gap" for row in self.timeline.records
+            ),
+            "timeline_state_coverage": {
+                "modelled": [
+                    "TU release and scheduler-ready queues",
+                    "C-to-F placement and F-slot reservation",
+                    "ordered dialogue phase serialization and propagation",
+                    "per-route, per-C, per-F, and shared-fabric max-min allocation",
+                    "F input-wait and compiler occupancy",
+                    "build barriers and workload release gaps",
+                    "exact C-to-F and F-to-C byte events",
+                ],
+                "adapter": self.adapter.timeline_coverage(),
+                "not_modelled": [
+                    "preprocessor CPU and producer pipe backpressure",
+                    "codec CPU and cache-thread queueing",
+                    "memory and cache eviction",
+                    "compile-job reference and outer cache-channel framing bytes",
+                    "OS socket buffering and packet headers",
+                ],
+            },
         }
         return SimulationResult(
-            summary, assignments, self.events, workers, builds, generations
+            summary,
+            assignments,
+            self.events,
+            workers,
+            builds,
+            generations,
+            self.timeline.records,
         )
 
 
@@ -1037,13 +1862,285 @@ def payload_overrides(values: list[str]) -> dict[str, Path]:
     return result
 
 
+def resolved_scenario_document(scenario: LoadedScenario) -> dict[str, object]:
+    document = json.loads(json.dumps(scenario.document))
+    for job in document["environments"]["job_selection"]["jobs"]:
+        job["corpus_root"] = scenario.workload_inputs[job["id"]]["corpus_root"]
+    return document
+
+
+def bandwidth_label(bits_per_second: int) -> str:
+    for divisor, suffix in (
+        (1_000_000_000_000, "T"),
+        (1_000_000_000, "G"),
+        (1_000_000, "M"),
+        (1_000, "K"),
+    ):
+        if bits_per_second % divisor == 0 and bits_per_second >= divisor:
+            return f"{bits_per_second // divisor}{suffix}"
+    return str(bits_per_second)
+
+
+def topology_label(document: dict[str, object]) -> str:
+    environments = int(document["environments"]["env_count"])
+    workers = int(document["workers"]["f_count"])
+    slots = int(document["workers"]["template"]["slots"])
+    network = document["network"]
+    c_to_f = network["c_to_f"]
+    environment_bps = c_to_f.get("per_environment_bits_per_second")
+    if environment_bps is not None:
+        capacity = f"B{bandwidth_label(int(environment_bps))}"
+        fabric_bps = int(network["shared_fabric_bps"])
+        fabric = (
+            f"X{bandwidth_label(fabric_bps)}"
+            if fabric_bps < int(environment_bps) * environments
+            else ""
+        )
+    else:
+        capacity = f"R{bandwidth_label(int(c_to_f['bits_per_second']))}"
+        fabric = f"X{bandwidth_label(int(network['shared_fabric_bps']))}"
+    return f"C{environments}F{workers}_{slots}{capacity}{fabric}"
+
+
+def experiment_records(
+    scenario: LoadedScenario, result: SimulationResult
+) -> tuple[dict[str, object], list[dict[str, object]], dict[str, object]]:
+    """Build one deterministic, self-describing JSONL experiment stream."""
+    resolved = resolved_scenario_document(scenario)
+    allocation_resources = ["shared fabric", "direction/environment/F route"]
+    if any(
+        "per_environment_bits_per_second" in resolved["network"][direction]
+        for direction in DIRECTIONS
+    ):
+        allocation_resources.append("per-direction C-authority aggregate")
+    if any(
+        "per_worker_bits_per_second" in resolved["network"][direction]
+        for direction in DIRECTIONS
+    ):
+        allocation_resources.append("per-direction F aggregate")
+    descriptor = {
+        "record": "experiment",
+        "schema": "icecream-distribution-timeline-v1",
+        "scenario": result.summary["scenario"],
+        "topology": topology_label(resolved),
+        "topology_dimensions": {
+            "schema_semantics": (
+                "v1 maps one producer agent, one logical C authority, and one C egress "
+                "group to each environment"
+            ),
+            "producer_agents": result.summary["environments"],
+            "logical_c_authorities": result.summary["environments"],
+            "c_egress_groups": result.summary["environments"],
+            "f_stores": result.summary["workers"],
+            "compiler_slots_per_f": result.summary["slots_per_worker"],
+        },
+        "codec_adapter": result.summary["codec_adapter"],
+        "physical_codec_result": result.summary["physical_codec_result"],
+        "clock": {
+            "unit": "nanosecond",
+            "snapshot_interval_ns": result.summary[
+                "timeline_snapshot_interval_ns"
+            ],
+            "snapshot_axis": "active time",
+            "gap_rule": (
+                "wall intervals with no compiler work and no network serialization "
+                "are represented by one gap record; wall timers still advance"
+            ),
+        },
+        "score": {
+            "name": "modelled C-to-F bytes",
+            "direction": "c_to_f",
+            "field": "scored_outgoing_bytes",
+            "return_bytes_retained_separately": True,
+            "scope": (
+                "adapter phases only; live job-reference messages and outer cache-channel "
+                "framing are not yet present"
+            ),
+        },
+        "network_allocation": {
+            "algorithm": "deterministic max-min fairness",
+            "resources": allocation_resources,
+            "serialization_then_propagation": True,
+        },
+        "record_order": [
+            "experiment descriptor",
+            "active snapshots and compressed idle gaps",
+            "final reconciliation summary",
+        ],
+        "snapshot_semantics": {
+            "metrics": "exact interval averages from integrated flow rates",
+            "snapshot_state": (
+                "state after all engine transitions at the snapshot boundary"
+            ),
+            "gap_state": (
+                "state at the gap start; no compiler or serializer is active inside the gap"
+            ),
+            "events": "each exact engine event appears once, on the first record ending at or after it",
+        },
+        "state_coverage": result.summary["timeline_state_coverage"],
+        "resolved_scenario": resolved,
+        "workload_inputs": result.summary["workload_inputs"],
+        "simulator": {
+            "source": str(Path(__file__).resolve()),
+            "source_sha256": sha256(Path(__file__).resolve()),
+        },
+        "expected_summary": result.summary,
+    }
+
+    events = result.events
+    event_index = 0
+    timeline: list[dict[str, object]] = []
+    for source_record in result.timeline:
+        record = json.loads(json.dumps(source_record))
+        cutoff = int(record["wall_end_ns"])
+        attached = []
+        while event_index < len(events) and int(events[event_index]["time_ns"]) <= cutoff:
+            attached.append(events[event_index])
+            event_index += 1
+        record["events"] = attached
+        record["event_sequence_start"] = (
+            "" if not attached else attached[0]["sequence"]
+        )
+        record["event_sequence_end"] = "" if not attached else attached[-1]["sequence"]
+        timeline.append(record)
+    if event_index != len(events):
+        raise RuntimeError(
+            f"timeline ended before {len(events) - event_index} engine events"
+        )
+    final = {
+        "record": "summary",
+        "schema": "icecream-distribution-timeline-summary-v1",
+        "timeline_records": len(timeline),
+        "event_count": len(events),
+        "summary": result.summary,
+    }
+    return descriptor, timeline, final
+
+
+def write_jsonl(
+    path: Path,
+    descriptor: dict[str, object],
+    timeline: list[dict[str, object]],
+    final: dict[str, object],
+) -> None:
+    with path.open("w") as output:
+        for row in (descriptor, *timeline, final):
+            output.write(json.dumps(row, separators=(",", ":"), sort_keys=True))
+            output.write("\n")
+
+
+def compact_report_timeline(
+    timeline: list[dict[str, object]], limit: int = MAX_REPORT_SNAPSHOTS
+) -> tuple[list[dict[str, object]], dict[str, object]]:
+    """Retain an evenly spaced browser view while leaving canonical JSONL untouched."""
+    checked_positive_int(limit, "report snapshot limit")
+    snapshot_positions = [
+        index for index, row in enumerate(timeline) if row["record"] == "snapshot"
+    ]
+    if len(snapshot_positions) <= limit:
+        selected = set(snapshot_positions)
+        selection = "all"
+    elif limit == 1:
+        selected = {snapshot_positions[-1]}
+        selection = "last snapshot"
+    else:
+        selected = {
+            snapshot_positions[index * (len(snapshot_positions) - 1) // (limit - 1)]
+            for index in range(limit)
+        }
+        selection = "evenly spaced including first and last"
+    view = [
+        row
+        for index, row in enumerate(timeline)
+        if row["record"] == "gap" or index in selected
+    ]
+    metadata = {
+        "source_records": len(timeline),
+        "source_snapshots": len(snapshot_positions),
+        "embedded_records": len(view),
+        "embedded_snapshots": len(selected),
+        "snapshot_selection": selection,
+        "all_gap_records_embedded": True,
+        "canonical_detail": (
+            "experiment.jsonl retains every active-time snapshot and event"
+        ),
+    }
+    return view, metadata
+
+
+def render_report_html(
+    descriptor: dict[str, object],
+    timeline: list[dict[str, object]],
+    final: dict[str, object],
+) -> str:
+    """Return a dependency-free report which also works when opened via file://."""
+    report_timeline, report_view = compact_report_timeline(timeline)
+    report_descriptor = json.loads(json.dumps(descriptor))
+    report_descriptor["report_view"] = report_view
+    payload = json.dumps(
+        {
+            "descriptor": report_descriptor,
+            "timeline": report_timeline,
+            "final": final,
+        },
+        separators=(",", ":"),
+    ).replace("</", "<\\/")
+    template = r'''<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Icecream distribution experiment</title>
+<style>
+:root{color-scheme:dark;--bg:#0b1020;--panel:#121a2d;--line:#263451;--text:#e8edf7;--muted:#94a3b8;--cf:#39d98a;--fc:#6ea8fe;--sel:#ffbe55;--queue:#d58cff}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,sans-serif}main{max-width:1500px;margin:auto;padding:24px}
+h1{font-size:24px;margin:0 0 4px}h2{font-size:17px;margin:0 0 12px}.sub{color:var(--muted);margin-bottom:20px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;margin:16px 0}.card,.panel{background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:14px}.card .v{font-size:20px;font-weight:700}.card .k{color:var(--muted);font-size:12px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.wide{grid-column:1/-1}canvas{display:block;width:100%;height:250px;background:#0c1425;border-radius:5px}.heat{height:auto;min-height:180px}.controls{display:flex;gap:16px;align-items:center;flex-wrap:wrap;margin:10px 0 16px}select,input{background:#0c1425;color:var(--text);border:1px solid var(--line);border-radius:5px;padding:5px}input[type=range]{width:min(700px,70vw)}table{border-collapse:collapse;width:100%}th,td{text-align:left;border-bottom:1px solid var(--line);padding:6px 8px}th{color:var(--muted)}pre{white-space:pre-wrap;overflow:auto;max-height:460px;background:#090e1a;padding:12px;border-radius:5px}.legend{color:var(--muted);font-size:12px;margin-top:7px}.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin:0 4px 0 12px}.dot:first-child{margin-left:0}@media(max-width:850px){.grid{grid-template-columns:1fr}.wide{grid-column:auto}}
+</style>
+</head>
+<body><main>
+<h1 id="title">Icecream distribution experiment</h1><div class="sub" id="subtitle"></div>
+<div class="cards" id="cards"></div>
+<div class="controls"><label>F <select id="worker"></select></label><label>Snapshot <input id="cursor" type="range" min="0" step="1"></label><span id="cursorLabel"></span></div>
+<div class="grid">
+ <section class="panel wide"><h2>Network serialization rate</h2><canvas id="bandwidth"></canvas><div class="legend"><span class="dot" style="background:var(--cf)"></span>all C→F <span class="dot" style="background:var(--fc)"></span>all F→C <span class="dot" style="background:var(--sel)"></span>selected F C→F</div></section>
+ <section class="panel"><h2>Selected F slot occupancy</h2><canvas id="slots"></canvas><div class="legend"><span class="dot" style="background:var(--cf)"></span>compiling <span class="dot" style="background:var(--sel)"></span>waiting for input <span class="dot" style="background:var(--fc)"></span>reserved</div></section>
+ <section class="panel"><h2>Scheduler state</h2><canvas id="queue"></canvas><div class="legend"><span class="dot" style="background:var(--queue)"></span>ready <span class="dot" style="background:var(--sel)"></span>active <span class="dot" style="background:var(--cf)"></span>completed</div></section>
+ <section class="panel wide"><h2>C→F rate by F</h2><canvas class="heat" id="heatmap"></canvas><div class="legend">Rows are Fs; brighter cells carry more interval-average C→F traffic.</div></section>
+ <section class="panel"><h2>Compressed idle gaps</h2><div id="gaps"></div></section>
+ <section class="panel"><h2>Selected report snapshot and exact transitions</h2><pre id="detail"></pre></section>
+ <section class="panel wide"><h2>Experiment definition</h2><pre id="definition"></pre></section>
+</div>
+</main>
+<script>
+const DATA=__PAYLOAD__;
+const D=DATA.descriptor,S=DATA.timeline.filter(x=>x.record==='snapshot'),G=DATA.timeline.filter(x=>x.record==='gap'),SUM=DATA.final.summary;
+const $=id=>document.getElementById(id), fmtN=n=>new Intl.NumberFormat('en-US',{maximumFractionDigits:2}).format(n), fmtB=n=>n>=1e9?fmtN(n/1e9)+' GB':n>=1e6?fmtN(n/1e6)+' MB':n>=1e3?fmtN(n/1e3)+' kB':fmtN(n)+' B', fmtT=n=>n>=1e9?fmtN(n/1e9)+' s':n>=1e6?fmtN(n/1e6)+' ms':n>=1e3?fmtN(n/1e3)+' µs':fmtN(n)+' ns', fmtRate=n=>n>=1e9?fmtN(n/1e9)+' Gb/s':n>=1e6?fmtN(n/1e6)+' Mb/s':fmtN(n)+' b/s';
+$('title').textContent=D.scenario+' — '+D.codec_adapter;
+$('subtitle').textContent=D.topology+' · active-time samples every '+fmtT(D.clock.snapshot_interval_ns)+' · report view '+fmtN(D.report_view.embedded_snapshots)+' / '+fmtN(D.report_view.source_snapshots)+' snapshots · '+(D.physical_codec_result?'physical codec result':'diagnostic adapter');
+const cards=[['Outgoing score',fmtB(SUM.scored_outgoing_bytes)],['Return bytes',fmtB(SUM.f_to_c_bytes)],['Active timeline',fmtT(SUM.timeline_active_ns)],['Generation sum',fmtT(SUM.summed_generation_ns)],['Wall makespan',fmtT(SUM.makespan_ns)],['Jobs',fmtN(SUM.jobs)],['Fs / slots each',SUM.workers+' / '+fmtN(SUM.slots_per_worker)],['Trace rows',fmtN(SUM.timeline_records)]];
+$('cards').innerHTML=cards.map(x=>'<div class="card"><div class="v">'+x[1]+'</div><div class="k">'+x[0]+'</div></div>').join('');
+for(let w=0;w<SUM.workers;w++)$('worker').add(new Option('F'+(w+1),w));
+$('cursor').max=Math.max(0,S.length-1);$('cursor').value=0;
+function rate(row,dir,worker=null){return row.metrics.routes.filter(r=>r.direction===dir&&(worker===null||r.worker===worker)).reduce((a,r)=>a+r.average_bps,0)}
+function workerMetric(row,w){return row.metrics.workers.find(x=>x.worker===w)||{average_compiling_slots:0,average_input_wait_slots:0,average_reserved_slots:0}}
+function fit(c,h=250){const d=devicePixelRatio||1,w=Math.max(320,c.clientWidth);c.width=w*d;c.height=h*d;c.style.height=h+'px';const x=c.getContext('2d');x.setTransform(d,0,0,d,0,0);return{x,w,h}}
+function axes(ctx,w,h,max,label){ctx.strokeStyle='#263451';ctx.fillStyle='#94a3b8';ctx.font='11px system-ui';ctx.beginPath();for(let i=0;i<=4;i++){let y=12+(h-32)*i/4;ctx.moveTo(45,y);ctx.lineTo(w-8,y);ctx.fillText(label(max*(1-i/4)),4,y+3)}ctx.stroke()}
+function lineChart(id,series,colors,label){const c=$(id),{x,w,h}=fit(c);const vals=series.flat();const max=Math.max(1,...vals);axes(x,w,h,max,label);for(let k=0;k<series.length;k++){x.strokeStyle=colors[k];x.lineWidth=1.7;x.beginPath();series[k].forEach((v,i)=>{const px=45+(w-53)*(series[k].length===1?0:i/(series[k].length-1)),py=12+(h-32)*(1-v/max);i?x.lineTo(px,py):x.moveTo(px,py)});x.stroke()}}
+function draw(){const w=+$('worker').value;lineChart('bandwidth',[S.map(r=>rate(r,'c_to_f')),S.map(r=>rate(r,'f_to_c')),S.map(r=>rate(r,'c_to_f',w))],['#39d98a','#6ea8fe','#ffbe55'],fmtRate);lineChart('slots',[S.map(r=>workerMetric(r,w).average_compiling_slots),S.map(r=>workerMetric(r,w).average_input_wait_slots),S.map(r=>workerMetric(r,w).average_reserved_slots)],['#39d98a','#ffbe55','#6ea8fe'],x=>fmtN(x));lineChart('queue',[S.map(r=>r.state.scheduler.ready_tus),S.map(r=>r.state.scheduler.active_tus),S.map(r=>r.state.scheduler.completed_tus)],['#d58cff','#ffbe55','#39d98a'],x=>fmtN(x));drawHeat();showDetail()}
+function drawHeat(){const c=$('heatmap'),rowH=Math.max(7,Math.min(16,600/SUM.workers)),h=24+rowH*SUM.workers,{x,w}=fit(c,h),plotW=Math.max(1,Math.floor(w-55)),bins=Array.from({length:SUM.workers},()=>new Float64Array(plotW));let max=1;S.forEach((r,i)=>{const px=Math.min(plotW-1,Math.floor(i*plotW/Math.max(1,S.length)));for(const q of r.metrics.routes)if(q.direction==='c_to_f'){bins[q.worker][px]=Math.max(bins[q.worker][px],q.average_bps);max=Math.max(max,q.average_bps)}});x.font='10px system-ui';for(let f=0;f<SUM.workers;f++){let y=10+f*rowH;x.fillStyle='#94a3b8';x.fillText('F'+(f+1),4,y+rowH-2);for(let px=0;px<plotW;px++){let z=bins[f][px]/max;x.fillStyle='rgba(57,217,138,'+(0.04+0.96*Math.sqrt(z))+')';x.fillRect(48+px,y,1,Math.max(1,rowH-1))}}}
+function showDetail(){if(!S.length){$('detail').textContent='No active snapshots';return}const i=+$('cursor').value,r=S[i],w=+$('worker').value,f=r.state.f.find(x=>x.worker===w);$('cursorLabel').textContent=(i+1)+' / '+S.length+' · active '+fmtT(r.active_end_ns)+' · wall '+fmtT(r.wall_end_ns);$('detail').textContent=JSON.stringify({interval:{wall_start_ns:r.wall_start_ns,wall_end_ns:r.wall_end_ns,active_start_ns:r.active_start_ns,active_end_ns:r.active_end_ns},scheduler:r.state.scheduler,selected_f:f,selected_f_metrics:workerMetric(r,w),selected_f_routes:r.metrics.routes.filter(x=>x.worker===w),events:r.events},null,2)}
+$('worker').onchange=draw;$('cursor').oninput=showDetail;window.onresize=draw;
+if(G.length){$('gaps').innerHTML='<table><thead><tr><th>Wall start</th><th>Duration</th><th>Reason</th></tr></thead><tbody>'+G.map(g=>'<tr><td>'+fmtT(g.wall_start_ns)+'</td><td>'+fmtT(g.wall_duration_ns)+'</td><td>'+g.reason+'</td></tr>').join('')+'</tbody></table>'}else $('gaps').textContent='No idle gaps.';
+$('definition').textContent=JSON.stringify(D,null,2);draw();
+</script></body></html>'''
+    return template.replace("__PAYLOAD__", payload)
+
+
 def write_result(
     scenario: LoadedScenario, result: SimulationResult, output_directory: Path
 ) -> None:
     output_directory.mkdir(parents=True, exist_ok=True)
-    resolved_document = json.loads(json.dumps(scenario.document))
-    for job in resolved_document["environments"]["job_selection"]["jobs"]:
-        job["corpus_root"] = scenario.workload_inputs[job["id"]]["corpus_root"]
+    resolved_document = resolved_scenario_document(scenario)
     (output_directory / "resolved-scenario.json").write_text(
         json.dumps(resolved_document, indent=2) + "\n"
     )
@@ -1055,12 +2152,24 @@ def write_result(
     write_tsv(output_directory / "workers.tsv", result.workers)
     write_tsv(output_directory / "builds.tsv", result.builds)
     write_tsv(output_directory / "generations.tsv", result.generations)
+    descriptor, timeline, final = experiment_records(scenario, result)
+    write_jsonl(output_directory / "experiment.jsonl", descriptor, timeline, final)
+    (output_directory / "report.html").write_text(
+        render_report_html(descriptor, timeline, final)
+    )
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("scenario", type=Path)
-    parser.add_argument("--codec", choices=("compile-only", "raw"), required=True)
+    parser.add_argument(
+        "--codec", choices=("compile-only", "raw", "p29", "grz"), required=True
+    )
+    parser.add_argument(
+        "--ledger",
+        type=Path,
+        help="required physical-ledger JSONL for p29/grz",
+    )
     parser.add_argument(
         "--corpus-root", action="append", default=[], metavar="WORKLOAD=PATH"
     )
@@ -1079,9 +2188,18 @@ def main() -> int:
             raise ValueError(
                 f"{len(missing)} payloads are absent; first is {missing[0]}"
             )
-    adapter: CodecAdapter = (
-        CompileOnlyAdapter() if args.codec == "compile-only" else RawAdapter()
-    )
+    if args.codec == "compile-only":
+        if args.ledger is not None:
+            raise ValueError("compile-only does not accept --ledger")
+        adapter: CodecAdapter = CompileOnlyAdapter()
+    elif args.codec == "raw":
+        if args.ledger is not None:
+            raise ValueError("raw does not accept --ledger")
+        adapter = RawAdapter()
+    else:
+        if args.ledger is None:
+            raise ValueError(f"{args.codec} requires --ledger")
+        adapter = PhysicalLedgerAdapter(args.ledger, scenario, args.codec)
     result = Simulator(scenario, adapter).run()
     write_result(scenario, result, args.out)
     print(json.dumps(result.summary, indent=2))

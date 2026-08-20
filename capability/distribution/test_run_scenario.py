@@ -28,6 +28,8 @@ def write_fixture(
             for logical, (duration, size) in enumerate(zip(durations, sizes))
         )
     )
+    for logical, size in enumerate(sizes):
+        (root / f"j{logical}.ii").write_bytes(bytes([logical % 251]) * size)
     scenario = {
         "schema": "icecream-distribution-scenario-v1",
         "name": "test",
@@ -82,6 +84,61 @@ def write_fixture(
     return path
 
 
+def write_physical_ledger(path: Path, scenario_path: Path) -> Path:
+    rows = [
+        {
+            "record": "physical-ledger",
+            "schema": "icecream-physical-codec-ledger-v1",
+            "codec": "p29",
+            "scenario_sha256": sim.sha256(scenario_path),
+            "reconstruction": {
+                "status": "pass",
+                "method": "test byte comparison",
+            },
+        },
+        {
+            "record": "tu",
+            "workload": "test",
+            "build": 0,
+            "logical": 0,
+            "worker": 0,
+            "route_sequence": 0,
+            "raw_bytes": 10,
+            "raw_sha256": sim.sha256(scenario_path.parent / "j0.ii"),
+            "phases": [
+                {"name": "dict", "direction": "c_to_f", "bytes": 10},
+                {"name": "need", "direction": "f_to_c", "bytes": 2},
+                {"name": "fill", "direction": "c_to_f", "bytes": 3},
+            ],
+            "state_after": {"known_objects": 4},
+            "exact": True,
+        },
+        {
+            "record": "tu",
+            "workload": "test",
+            "build": 0,
+            "logical": 1,
+            "worker": 0,
+            "route_sequence": 1,
+            "raw_bytes": 11,
+            "raw_sha256": sim.sha256(scenario_path.parent / "j1.ii"),
+            "phases": [
+                {"name": "dict", "direction": "c_to_f", "bytes": 5},
+                {"name": "need", "direction": "f_to_c", "bytes": 1},
+                {"name": "fill", "direction": "c_to_f", "bytes": 1},
+            ],
+            "state_after": {"known_objects": 5},
+            "exact": True,
+        },
+        {
+            "record": "physical-summary",
+            "totals": {"tus": 2, "c_to_f_bytes": 19, "f_to_c_bytes": 3},
+        },
+    ]
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    return path
+
+
 class SimulatorTest(unittest.TestCase):
     def test_round_robin_only_dispatches_to_free_slots(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -107,6 +164,77 @@ class SimulatorTest(unittest.TestCase):
             self.assertEqual(
                 [row["transfer_done_ns"] for row in result.assignments],
                 [2_000_000_000, 2_000_000_000],
+            )
+
+    def test_c_authority_bandwidth_is_shared_across_its_f_routes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_fixture(root, [1, 1], [100, 100])
+            document = json.loads(path.read_text())
+            document["network"]["shared_fabric_bps"] = 1_600
+            document["network"]["c_to_f"][
+                "per_environment_bits_per_second"
+            ] = 800
+            path.write_text(json.dumps(document))
+            result = sim.Simulator(sim.load_scenario(path), sim.RawAdapter()).run()
+            self.assertEqual(
+                [row["transfer_done_ns"] for row in result.assignments],
+                [2_000_000_000, 2_000_000_000],
+            )
+            network_samples = [
+                row
+                for row in result.timeline
+                if row["record"] == "snapshot" and row["metrics"]["routes"]
+            ]
+            self.assertEqual(
+                network_samples[0]["metrics"]["environments"][0][
+                    "c_to_f_average_bps"
+                ],
+                800.0,
+            )
+            self.assertEqual(
+                network_samples[0]["metrics"]["environments"][0][
+                    "c_to_f_utilization"
+                ],
+                1.0,
+            )
+
+    def test_f_bandwidth_is_shared_across_c_authorities(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_fixture(root, [1], [100], workers=1)
+            document = json.loads(path.read_text())
+            first = document["environments"]["job_selection"]["jobs"][0]
+            second = json.loads(json.dumps(first))
+            second["id"] = "test-c1"
+            second["environment"] = 1
+            document["environments"]["env_count"] = 2
+            document["environments"]["job_selection"]["jobs"].append(second)
+            document["workers"]["template"]["slots"] = 2
+            document["network"]["shared_fabric_bps"] = 1_600
+            document["network"]["c_to_f"]["per_worker_bits_per_second"] = 800
+            path.write_text(json.dumps(document))
+            result = sim.Simulator(sim.load_scenario(path), sim.RawAdapter()).run()
+            self.assertEqual(
+                [row["transfer_done_ns"] for row in result.assignments],
+                [2_000_000_000, 2_000_000_000],
+            )
+            network_samples = [
+                row
+                for row in result.timeline
+                if row["record"] == "snapshot" and row["metrics"]["routes"]
+            ]
+            self.assertEqual(
+                network_samples[0]["metrics"]["workers"][0][
+                    "c_to_f_average_bps"
+                ],
+                800.0,
+            )
+            self.assertEqual(
+                network_samples[0]["metrics"]["workers"][0][
+                    "c_to_f_utilization"
+                ],
+                1.0,
             )
 
     def test_after_previous_build_is_a_completion_barrier(self) -> None:
@@ -208,6 +336,137 @@ class SimulatorTest(unittest.TestCase):
             self.assertEqual(result.summary["scored_outgoing_bytes"], 200)
             # Three serial one-second phases, three one-way delays, then 1 ns compile.
             self.assertEqual(result.summary["makespan_ns"], 3_000_000_031)
+
+    def test_timeline_uses_ten_ms_active_samples_and_compresses_idle_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_fixture(root, [25_000_000], [1], workers=1)
+            document = json.loads(path.read_text())
+            document["environments"]["job_selection"]["jobs"][0]["builds"] = 2
+            document["environments"]["job_selection"]["jobs"][0]["build_release"][
+                "gap_ns"
+            ] = 600_000_000
+            path.write_text(json.dumps(document))
+            scenario = sim.load_scenario(path)
+            result = sim.Simulator(scenario, sim.CompileOnlyAdapter()).run()
+            snapshots = [x for x in result.timeline if x["record"] == "snapshot"]
+            gaps = [x for x in result.timeline if x["record"] == "gap"]
+            self.assertEqual(
+                [x["active_duration_ns"] for x in snapshots],
+                [10_000_000, 10_000_000, 5_000_000] * 2,
+            )
+            self.assertEqual(len(gaps), 1)
+            self.assertEqual(gaps[0]["wall_duration_ns"], 600_000_000)
+            self.assertEqual(result.summary["timeline_active_ns"], 50_000_000)
+            self.assertEqual(snapshots[-1]["state"]["scheduler"]["completed_tus"], 2)
+
+            output = root / "out"
+            sim.write_result(scenario, result, output)
+            rows = [json.loads(line) for line in (output / "experiment.jsonl").read_text().splitlines()]
+            self.assertEqual(rows[0]["record"], "experiment")
+            self.assertEqual(rows[0]["clock"]["snapshot_interval_ns"], 10_000_000)
+            self.assertEqual(
+                rows[0]["topology_dimensions"],
+                {
+                    "schema_semantics": (
+                        "v1 maps one producer agent, one logical C authority, and one C "
+                        "egress group to each environment"
+                    ),
+                    "producer_agents": 1,
+                    "logical_c_authorities": 1,
+                    "c_egress_groups": 1,
+                    "f_stores": 1,
+                    "compiler_slots_per_f": 1,
+                },
+            )
+            self.assertEqual(rows[-1]["record"], "summary")
+            event_sequences = [
+                event["sequence"]
+                for row in rows[1:-1]
+                for event in row["events"]
+            ]
+            self.assertEqual(event_sequences, list(range(len(result.events))))
+            report = (output / "report.html").read_text()
+            self.assertIn("Network serialization rate", report)
+            self.assertIn("icecream-distribution-timeline-v1", report)
+
+    def test_timeline_integrates_route_and_fabric_rate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_fixture(root, [1], [100], workers=1)
+            result = sim.Simulator(
+                sim.load_scenario(path),
+                sim.RawAdapter(),
+                snapshot_interval_ns=500_000_000,
+            ).run()
+            network_samples = [
+                row
+                for row in result.timeline
+                if row["record"] == "snapshot" and row["metrics"]["routes"]
+            ]
+            self.assertEqual(len(network_samples), 2)
+            for row in network_samples:
+                self.assertEqual(row["metrics"]["fabric_average_bps"], 800.0)
+                self.assertEqual(row["metrics"]["routes"][0]["average_bps"], 800.0)
+                self.assertEqual(row["metrics"]["routes"][0]["route_utilization"], 1.0)
+
+    def test_report_compaction_keeps_boundaries_and_every_gap(self) -> None:
+        timeline = [
+            {"record": "snapshot", "sequence": sequence}
+            for sequence in range(2_005)
+        ]
+        timeline.insert(100, {"record": "gap", "sequence": 10_000})
+        view, metadata = sim.compact_report_timeline(timeline, limit=2_000)
+        snapshots = [row for row in view if row["record"] == "snapshot"]
+        gaps = [row for row in view if row["record"] == "gap"]
+        self.assertEqual(len(snapshots), 2_000)
+        self.assertEqual(snapshots[0]["sequence"], 0)
+        self.assertEqual(snapshots[-1]["sequence"], 2_004)
+        self.assertEqual(gaps, [{"record": "gap", "sequence": 10_000}])
+        self.assertEqual(metadata["source_snapshots"], 2_005)
+        self.assertEqual(metadata["embedded_snapshots"], 2_000)
+
+    def test_physical_ledger_runs_in_common_engine_with_committed_route_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scenario_path = write_fixture(root, [1, 1], [10, 11], workers=1)
+            document = json.loads(scenario_path.read_text())
+            document["workers"]["template"]["slots"] = 2
+            scenario_path.write_text(json.dumps(document))
+            scenario = sim.load_scenario(scenario_path)
+            ledger_path = write_physical_ledger(root / "physical.jsonl", scenario_path)
+            adapter = sim.PhysicalLedgerAdapter(ledger_path, scenario, "p29")
+            result = sim.Simulator(scenario, adapter).run()
+            self.assertTrue(result.summary["physical_codec_result"])
+            self.assertEqual(result.summary["c_to_f_bytes"], 19)
+            self.assertEqual(result.summary["f_to_c_bytes"], 3)
+            starts = [
+                row for row in result.events if row["event"] == "dialogue-start"
+            ]
+            finishes = [
+                row for row in result.events if row["event"] == "dialogue-finish"
+            ]
+            self.assertEqual(len(starts), 2)
+            self.assertEqual(starts[1]["time_ns"], finishes[0]["time_ns"])
+            self.assertEqual(adapter.committed_by_route[(0, 0)], 2)
+            self.assertEqual(adapter.last_route_state[(0, 0)]["known_objects"], 5)
+
+    def test_physical_ledger_refuses_unverified_or_mismatched_input(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scenario_path = write_fixture(root, [1, 1], [10, 11], workers=1)
+            scenario = sim.load_scenario(scenario_path)
+            ledger_path = write_physical_ledger(root / "physical.jsonl", scenario_path)
+            rows = [json.loads(line) for line in ledger_path.read_text().splitlines()]
+            rows[0]["reconstruction"]["status"] = "not-run"
+            ledger_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            with self.assertRaisesRegex(ValueError, "reconstruction result"):
+                sim.PhysicalLedgerAdapter(ledger_path, scenario, "p29")
+            rows[0]["reconstruction"]["status"] = "pass"
+            ledger_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            (root / "j0.ii").write_bytes(b"x" * 10)
+            with self.assertRaisesRegex(ValueError, "raw content digest"):
+                sim.PhysicalLedgerAdapter(ledger_path, scenario, "p29")
 
 
 if __name__ == "__main__":

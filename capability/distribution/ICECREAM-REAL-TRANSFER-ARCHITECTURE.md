@@ -1557,41 +1557,46 @@ compiler results and exact reconstructed-input digests
 summary with pass/fail and elapsed/resource measurements
 ```
 
-Unit tests remain under `make check`; `make integration_tests` is the explicit multiprocess gate.
-Do not make long corpus performance runs part of every incremental build. Provide a separate
-foreground `make protocol50_bench` launcher that consumes named corpus manifests and retains the
-same ledger shape.
+The first `make integration_tests` target now runs the deterministic scenario engine,
+active-time ledger/report, simultaneous bandwidth-limit, and physical-ledger adapter tests. As
+the live components land, extend that same foreground target with the ordered multiprocess
+scenarios above. Unit tests remain under `make check`. Do not make long corpus performance runs
+part of every incremental build. Provide a separate foreground `make protocol50_bench` launcher
+that consumes named corpus manifests and retains the same ledger shape.
 
 ## Simulator correspondence and next component
 
-The common simulator already owns C count, F count, slots per F, job-selection policy, compile
-trace, per-route rate, shared fabric, and placement policy. It does **not** yet model separate
-shared C-uplink and F-ingress ceilings. Existing Firefox scenarios therefore allow one C to use
-several 1-Gbit routes concurrently up to their configured 10-Gbit fabric ceiling. Those runs are
-useful historical controls but are not the primary `C1F20_200B1G` topology defined above.
-Endpoint bandwidth ceilings must land before new codec timing is treated as primary evidence.
+The common simulator owns C count, F count, slots per F, job-selection policy, compile trace,
+placement policy, and simultaneous per-route, per-C, per-F, and shared-fabric capacities.
+Existing scenario files retain their original meaning: omitted per-C and per-F fields mean no
+additional ceiling beyond the route and fabric. The primary
+`firefox-c1f20-200b1g.json` scenario supplies every ceiling explicitly and reports the compact
+label `C1F20_200B1G`.
 
-Do not silently reinterpret existing `icecream-distribution-scenario-v1` files. In v1,
-`network.c_to_f.bits_per_second` is a per-route limit and `shared_fabric_bps` is the only shared
-ceiling. Add a v2 schema with explicit producer/store mapping and:
+The implemented v1-compatible fields are:
 
 ```text
-network.c_uplink_bps[]
-network.f_ingress_bps[]
-network.route_bps (scalar or matrix)
+network.<direction>.per_environment_bits_per_second
+network.<direction>.per_worker_bits_per_second
+network.<direction>.bits_per_second
 network.shared_fabric_bps
 ```
 
-A v1-to-v2 converter preserves the old meaning by mapping its link rate to `route_bps`, retaining
-its fabric limit, and marking endpoint ceilings unspecified. New primary scenarios must specify
-all endpoint ceilings and use v2. Historical v1 ledgers keep their original labels and hashes.
+The flow allocator applies all applicable ceilings through max-min sharing. Historical v1
+scenario files and ledgers keep their original labels and hashes; no conversion or silent
+reinterpretation is needed.
 
 The current raw adapter models one complete raw-TU transfer before compilation; that is a
 conservative control, not a cycle-accurate model of protocol 44's within-TU streaming. The
-current executable adapters are `compile-only` and `raw`; a report must not imply that physical
-P29, GRZ, or automatic fallback timing already exists.
+executable adapters are `compile-only`, `raw`, `p29`, and `grz`. The latter two require a
+scenario-bound physical ledger whose producer has already passed reconstruction checks. P29 is
+currently materialized only for one C and one F. GRZ is materialized as one persistent stream per
+selected `(C,F)` route. Codec CPU time and automatic fallback timing are not yet scheduled, and a
+report must state that boundary.
 
-The next simulator component is one stateful cache-channel adapter, not another simulator:
+The physical-ledger adapter, active-time JSONL trace, and self-contained HTML report now share the
+same event engine. The next simulator component remains one live stateful cache-channel adapter,
+not another simulator:
 
 1. shared C-uplink, per-F-ingress, per-route, and optional fabric limits applied simultaneously;
 2. C preparation/EOF and a byte-bounded prepared queue;
