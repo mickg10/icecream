@@ -43,7 +43,7 @@ implementation, but many TUs occupy different pipeline stages concurrently.
     active C GUID a process, a dedicated thread/context, or a shared-context strand remains open
     for review and measurement.
 13. Simulator topology names distinguish a shared C uplink, each F ingress, and an optional
-    per-route ceiling. `C1_F20_CAP200_CBW1G` means one C, twenty Fs, 200 slots on every F, and
+    per-route ceiling. `C1F20_200B1G` means one C, twenty Fs, 200 slots on every F, and
     one shared 1-Gbit/s C uplink; it does not create twenty independent 1-Gbit/s C uplinks.
 14. The production implementation and simulator are parallel tracks. The simulator compares
     P29, GRZ, routing, and cache distribution; it does not replace implementation of cache
@@ -848,7 +848,7 @@ Each F retains the subset it has learned. Cold definition bytes are therefore re
 per destination F that actually needs them. Scheduler affinity reduces this replication when
 load permits, but round-robin placement remains valid.
 
-With sixteen independent C authorities (`P16_C16`), an F cache partitions state by C GUID:
+With sixteen independent C authorities (`P16C16`), an F cache partitions state by C GUID:
 
 ```text
 F cache
@@ -859,7 +859,7 @@ F cache
 ```
 
 At most one persistent channel is needed for each active GUID pair, not one per compiler slot.
-With sixteen producers sharing one authority (`P16_C1`), F sees one C namespace and one logical
+With sixteen producers sharing one authority (`P16C1`), F sees one C namespace and one logical
 authority relationship even though producer-side admission may be concurrent.
 
 ## Topology, bandwidth, and launch semantics
@@ -879,27 +879,34 @@ human-readable names:
 | `route_bps` | optional ceiling for one `(C,F)` relationship; defaults to no lower than the endpoint limits |
 | `fabric_bps` | optional aggregate shared-fabric limit across all active relationships |
 
-The concise name puts the C-shared bandwidth in the field itself. For example:
+The concise grammar is:
 
 ```text
-C1_F20_CAP200_CBW1G
+C<c-store-count>F<f-count>_<slots-per-F>B<shared-bandwidth-per-C>
+```
+
+For example:
+
+```text
+C1F20_200B1G
 ```
 
 means one C, twenty Fs, 200 compile slots on **each** F (4,000 slots total), and one shared
 1-Gbit/s outgoing limit at C. It does not grant 1 Gbit/s independently to all twenty routes.
 If a test intentionally grants per-route bandwidth, say so explicitly, for example
-`C1_F20_CAP200_CBW20G_RBW1G`.
+`C1F20_200B20G_R1G`. Optional nondefault suffixes are `I` for each F's ingress ceiling,
+`R` for each C/F route ceiling, and `X` for the shared fabric ceiling.
 
-Here `C1` is shorthand for the common one-to-one case `P1_C1`: one producer pool using one C
+Here `C1` is shorthand for the common one-to-one case `P1C1`: one producer pool using one C
 authority. A multi-producer name must spell out both counts when they differ. For example,
-`P16_C1_F20_CAP200` means sixteen producers share one authority/GUID, while
-`P16_C16_F20_CAP200` means sixteen independent authorities/GUIDs.
+`P16C1F20_200B1G` means sixteen producers share one authority/GUID and its 1-Gbit/s limit, while
+`P16C16F20_200B1G` means sixteen independent authorities/GUIDs, each with a 1-Gbit/s limit.
 
 Two large-capacity controls need careful interpretation:
 
 ```text
-C1_F1_CAP1000000_CBW1G
-C1_F10_CAP100000_CBW1G
+C1F1_1000000B1G
+C1F10_100000B1G
 ```
 
 Both expose one million nominal compile slots and the same shared 1-Gbit/s C uplink. The second
@@ -940,11 +947,11 @@ The first product/simulator acceptance matrix should include:
 
 | Purpose | Topology |
 |---|---|
-| single-destination byte/timing reference | `C1_F1_CAP1000000_CBW1G` |
-| primary large-F farm | `C1_F20_CAP200_CBW1G` |
-| same farm with faster C source | `C1_F20_CAP200_CBW10G` |
-| shared-authority multi-producer contention | `P16_C1_F20_CAP200`, with explicit producer/authority link limits |
-| independent-authority contention | `P16_C16_F20_CAP200`, with explicit C uplinks, F ingress, and fabric limit |
+| single-destination byte/timing reference | `C1F1_1000000B1G` |
+| primary large-F farm | `C1F20_200B1G` |
+| same farm with faster C source | `C1F20_200B10G` |
+| shared-authority multi-producer contention | `P16C1F20_200B1G`, with explicit producer/authority link limits |
+| independent-authority contention | `P16C16F20_200B1G`, plus explicit F ingress and fabric limits |
 | cache-distribution comparison | primary topology under round-robin and GUID-sticky placement |
 
 Every result header must print the expanded capacities, not only the concise name. Otherwise a
@@ -1561,7 +1568,7 @@ The common simulator already owns C count, F count, slots per F, job-selection p
 trace, per-route rate, shared fabric, and placement policy. It does **not** yet model separate
 shared C-uplink and F-ingress ceilings. Existing Firefox scenarios therefore allow one C to use
 several 1-Gbit routes concurrently up to their configured 10-Gbit fabric ceiling. Those runs are
-useful historical controls but are not the primary `C1_F20_CAP200_CBW1G` topology defined above.
+useful historical controls but are not the primary `C1F20_200B1G` topology defined above.
 Endpoint bandwidth ceilings must land before new codec timing is treated as primary evidence.
 
 Do not silently reinterpret existing `icecream-distribution-scenario-v1` files. In v1,
@@ -1633,8 +1640,8 @@ for zero-gap inputs because cache timers observe real simulated time.
 - retained Root reused by a later transaction and restored after eviction;
 - frame splits at zero, one byte, selected scheduler quantum, and the 1-MiB outer limit;
 - established-path fallback from an already prepared raw TU, including a failed cache attempt;
-- `C1_F1_CAP1000000_CBW1G` reference and primary `C1_F20_CAP200_CBW1G` scenario;
-- `P16_C1_F20` and `P16_C16_F20` contention with explicit endpoint/fabric bandwidth and both
+- `C1F1_1000000B1G` reference and primary `C1F20_200B1G` scenario;
+- `P16C1F20_200B1G` and `P16C16F20_200B1G` contention with explicit endpoint/fabric bandwidth and both
   round-robin/GUID-sticky placement;
 - zero artificial launch/build gaps in primary runs and explicit gaps only in retention runs;
 - bounded memory with a deliberately large ready queue.
@@ -1701,7 +1708,7 @@ cold path if byte targets are met. Warm throughput and simulated completion over
     cheaper and simpler than advertising a dedicated cache port?
 12. What SESSION-ready deadline gives `auto` a quick established-path fallback without discarding
     cache mode during ordinary daemon startup?
-13. Under `C1_F20_CAP200_CBW1G`, how much completion time changes between round-robin and
+13. Under `C1F20_200B1G`, how much completion time changes between round-robin and
     GUID-sticky placement after accounting for shared C uplink, F ingress, and repeated Fill?
 14. Which prepared-queue TU/byte ceilings retain producer parallelism without holding multiple
     copies of too many large preprocessed inputs?
@@ -1735,8 +1742,8 @@ simulator as its measurement companion. The highest-value review questions are:
    reconnect, and cache reuse?
 10. Are the primary topology semantics and zero-gap launch rules sufficient to prevent a
     per-route-bandwidth result from being mistaken for a shared-C-uplink result?
-11. Confirm the deployment mapping for multiple producers: `P16_C1` (one shared C authority/GUID)
-    or `P16_C16` (one authority/GUID per producer host). The primary `P1_C1` path is identical,
+11. Confirm the deployment mapping for multiple producers: `P16C1` (one shared C authority/GUID)
+    or `P16C16` (one authority/GUID per producer host). The primary `P1C1` path is identical,
     but F namespace count, C uplink placement, and sidecar deployment differ at scale.
 
 Prefer simplifications that remove objects, states, messages, copies, or commit stages. Preserve
