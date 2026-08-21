@@ -12,9 +12,9 @@
 #   libbsc  https://github.com/IlyaGrebnov/libbsc  v3.3.12, commit baffa62
 #           ("Merge pull request #14 from vgaetera/fix-build-warning").
 #           Needs libbsc.h on the include path and libbsc.a to link.
-#   zstd    linked statically; a system libzstd.a is fine.  Note the ambient trap
-#           recorded elsewhere in this lane: a plain `-lzstd` against the distro shared
-#           object loses zstd multithreading, which only shows up on blob-bearing corpora.
+#   zstd    linked statically with worker support.  Note the ambient trap recorded elsewhere
+#           in this lane: some distro static/shared builds accept the API but return
+#           `Unsupported parameter` only after a blob-bearing corpus requests workers.
 #
 # Usage:  LIBBSC_DIR=~/libbsc LIBBSC_A=~/grouprlz/libbsc.a ./selector_build_codec50_sink.sh [outdir]
 set -Eeuo pipefail
@@ -22,7 +22,17 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 OUT=${1:-$HERE/build}
 LIBBSC_DIR=${LIBBSC_DIR:-$HOME/libbsc}
 LIBBSC_A=${LIBBSC_A:-$HOME/grouprlz/libbsc.a}
-LIBZSTD_A=${LIBZSTD_A:-/usr/lib/x86_64-linux-gnu/libzstd.a}
+ZSTD_MT_CANDIDATE=$HOME/gdict/zstd/zstd-1.4.8/lib/libzstd.a
+if [ -f "$ZSTD_MT_CANDIDATE" ]; then
+  ZSTD_DEFAULT=$ZSTD_MT_CANDIDATE
+else
+  ZSTD_DEFAULT=/usr/lib/x86_64-linux-gnu/libzstd.a
+fi
+LIBZSTD_A=${LIBZSTD_A:-$ZSTD_DEFAULT}
+# The 2^21 source default is a small-corpus development setting.  The published breadth
+# measurements already established 2^24 as output-neutral and large enough for Firefox/Godot;
+# make the reproducible measurement build use that capacity unless a larger run overrides it.
+LINE_CAP_LOG2=${ICE_LINE_CAP_LOG2:-24}
 
 for f in "$LIBBSC_DIR/libbsc/libbsc.h" "$LIBBSC_A" "$LIBZSTD_A"; do
   [ -e "$f" ] || { echo "missing dependency: $f" >&2; exit 1; }
@@ -38,9 +48,9 @@ mkdir -p "$OUT"
 # added to the header but not to the format string produced a silently EMPTY column, and
 # separately a format slot with no argument once printed stack garbage as a byte count.  Both
 # are compile-time detectable, so they are now compile-time errors.
-CXXFLAGS_OPT="-O3 -march=native -std=c++17 -fopenmp -Wformat=2 -Werror=format -DWITH_BSC_GROUPS"
+CXXFLAGS_OPT="-O3 -march=native -std=c++17 -fopenmp -Wformat=2 -Werror=format -DWITH_BSC_GROUPS -DICE_LINE_CAP_LOG2=$LINE_CAP_LOG2"
 # and the sanitizer build used to verify the step-2b grow-on-demand change
-CXXFLAGS_SAN="-O1 -g -fsanitize=address,undefined -std=c++17 -fopenmp -Wformat=2 -Werror=format -DWITH_BSC_GROUPS"
+CXXFLAGS_SAN="-O1 -g -fsanitize=address,undefined -std=c++17 -fopenmp -Wformat=2 -Werror=format -DWITH_BSC_GROUPS -DICE_LINE_CAP_LOG2=$LINE_CAP_LOG2"
 
 build() { # build <flags> <output>
   g++ $1 -I"$HERE" -I"$LIBBSC_DIR/libbsc" "$HERE/codec50-sink.cpp" -o "$2" \
@@ -48,5 +58,9 @@ build() { # build <flags> <output>
   echo "built $2"
 }
 build "$CXXFLAGS_OPT" "$OUT/codec50-sink"
+if ! "$OUT/codec50-sink" --selftest-zstd-workers; then
+  echo "selected libzstd lacks worker support; set LIBZSTD_A to an MT-enabled static build" >&2
+  exit 1
+fi
 [ "${WITH_SANITIZERS:-0}" = 1 ] && build "$CXXFLAGS_SAN" "$OUT/codec50-sink-asan"
 exit 0
