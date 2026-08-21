@@ -50,7 +50,7 @@ Op(f, n, r, t) == <<f, n, r, t>>
 NoOp == <<NoF, 2, MaxRel + 1, NoTU>>
 RealOps ==
     {Op(f, n, r, t) :
-        f \in Fs, n \in Nonces, r \in 0..(MaxRel - 1), t \in TUs}
+        f \in Fs, n \in Nonces, r \in Rels, t \in TUs}
 Ops == RealOps \cup {NoOp}
 
 OpF(op) == op[1]
