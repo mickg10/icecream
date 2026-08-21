@@ -766,6 +766,37 @@ class SimulatorTest(unittest.TestCase):
             self.assertIn("Network serialization rate", report)
             self.assertIn("icecream-distribution-timeline-v1", report)
 
+    def test_fractional_timeline_intervals_tile_integer_active_time(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_fixture(root, [1], [1], workers=1)
+            document = json.loads(path.read_text())
+            job = document["environments"]["job_selection"]["jobs"][0]
+            job["builds"] = 2
+            job["build_release"]["gap_ns"] = 1
+            for direction in ("c_to_f", "f_to_c"):
+                document["network"][direction]["bits_per_second"] = 6
+            document["network"]["shared_fabric_bps"] = 6
+            path.write_text(json.dumps(document))
+
+            result = sim.Simulator(
+                sim.load_scenario(path),
+                sim.RawAdapter(),
+            ).run()
+            snapshots = [x for x in result.timeline if x["record"] == "snapshot"]
+
+            self.assertEqual(
+                sum(row["active_duration_ns"] for row in snapshots),
+                result.summary["timeline_active_ns"],
+            )
+            self.assertTrue(
+                all(
+                    row["active_duration_ns"]
+                    == row["active_end_ns"] - row["active_start_ns"]
+                    for row in snapshots
+                )
+            )
+
     def test_timeline_integrates_route_and_fabric_rate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

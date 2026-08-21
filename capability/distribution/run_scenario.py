@@ -1016,6 +1016,10 @@ class TimelineRecorder:
         if not self.sample_elapsed_ns or self.sample_wall_start_ns is None:
             raise RuntimeError("cannot emit an empty active timeline sample")
         duration = self.sample_elapsed_ns
+        wall_start_ns = ceil_fraction(self.sample_wall_start_ns)
+        wall_end_ns = ceil_fraction(simulator.now)
+        active_start_ns = ceil_fraction(self.sample_active_start_ns)
+        active_end_ns = ceil_fraction(self.active_ns)
         route_metrics: list[dict[str, object]] = []
         environment_rates: dict[tuple[str, int], float] = defaultdict(float)
         worker_rates: dict[tuple[str, int], float] = defaultdict(float)
@@ -1122,14 +1126,12 @@ class TimelineRecorder:
             {
                 "record": "snapshot",
                 "sequence": self.sequence,
-                "wall_start_ns": ceil_fraction(self.sample_wall_start_ns),
-                "wall_end_ns": ceil_fraction(simulator.now),
-                "wall_duration_ns": ceil_fraction(
-                    simulator.now - self.sample_wall_start_ns
-                ),
-                "active_start_ns": ceil_fraction(self.sample_active_start_ns),
-                "active_end_ns": ceil_fraction(self.active_ns),
-                "active_duration_ns": ceil_fraction(duration),
+                "wall_start_ns": wall_start_ns,
+                "wall_end_ns": wall_end_ns,
+                "wall_duration_ns": wall_end_ns - wall_start_ns,
+                "active_start_ns": active_start_ns,
+                "active_end_ns": active_end_ns,
+                "active_duration_ns": active_end_ns - active_start_ns,
                 "state": state,
                 "metrics": metrics,
             }
@@ -1160,13 +1162,15 @@ class TimelineRecorder:
             reason = "workload-release"
         else:
             reason = "timer"
+        wall_start_ns = ceil_fraction(start_ns)
+        wall_end_ns = ceil_fraction(end_ns)
         self._record(
             {
                 "record": "gap",
                 "sequence": self.sequence,
-                "wall_start_ns": ceil_fraction(start_ns),
-                "wall_end_ns": ceil_fraction(end_ns),
-                "wall_duration_ns": ceil_fraction(end_ns - start_ns),
+                "wall_start_ns": wall_start_ns,
+                "wall_end_ns": wall_end_ns,
+                "wall_duration_ns": wall_end_ns - wall_start_ns,
                 "active_position_ns": ceil_fraction(self.active_ns),
                 "reason": reason,
                 "state": simulator.timeline_state(),
