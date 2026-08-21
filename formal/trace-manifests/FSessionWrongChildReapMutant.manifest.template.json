@@ -1,0 +1,87 @@
+{
+  "schema": 1,
+  "scenario": "FSessionWrongChildReapMutant",
+  "property": "ExactCompilerReapedBeforeQuiesce",
+  "expected_result": "counterexample",
+  "min_states": 6,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "WriterBecomesWaitable",
+      "all": [
+        {"path": "writerDirect", "from": "Alive", "to": "Waitable"}
+      ]
+    },
+    {
+      "name": "LoseSchedulerSession",
+      "all": [
+        {"path": "phase", "from": "Connected", "to": "Lost"}
+      ]
+    },
+    {
+      "name": "StartCompilerCleanup",
+      "all": [
+        {"path": "phase", "from": "Lost", "to": "Cleaning"},
+        {"path": "compilerDirect", "from": "Alive", "to": "Waitable"}
+      ]
+    },
+    {
+      "name": "WaitAnyReapsWriter",
+      "all": [
+        {"path": "writerDirect", "from": "Waitable", "to": "Reaped"},
+        {"path": "compilerDirect", "to": "Waitable"},
+        {"path": "scalarKids", "from": 1, "to": 0},
+        {"path": "reapedWrongChild", "from": false, "to": true}
+      ]
+    },
+    {
+      "name": "ScalarDeclaresQuiescence",
+      "all": [
+        {"path": "phase", "from": "Cleaning", "to": "Quiesced"},
+        {"path": "scalarKids", "to": 0},
+        {"path": "compilerDirect", "to": "Waitable"},
+        {"path": "compilerGroupAlive", "to": true}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "WriterBecomesWaitable",
+    "LoseSchedulerSession",
+    "StartCompilerCleanup",
+    "WaitAnyReapsWriter",
+    "ScalarDeclaresQuiescence"
+  ],
+  "final_all": [
+    {"path": "phase", "eq": "Quiesced"},
+    {"path": "compilerDirect", "eq": "Waitable"},
+    {"path": "compilerGroupAlive", "eq": true},
+    {"path": "reapedWrongChild", "eq": true}
+  ],
+  "harness_steps": [
+    {
+      "after": "WriterBecomesWaitable",
+      "emit": "make_state_writer_waitable_before_session_loss",
+      "actor": "fulfillment-daemon"
+    },
+    {
+      "after": "StartCompilerCleanup",
+      "emit": "hold_old_session_compiler_process_group_alive",
+      "actor": "compiler-child"
+    },
+    {
+      "after": "WaitAnyReapsWriter",
+      "emit": "assert_wait_any_consumed_unrelated_writer",
+      "actor": "fulfillment-daemon"
+    },
+    {
+      "after": "ScalarDeclaresQuiescence",
+      "emit": "assert_capacity_quiescence_while_compiler_is_alive",
+      "actor": "fulfillment-daemon"
+    }
+  ],
+  "metadata": {
+    "module": "FSessionQuiescenceAbsolute",
+    "config": "FSessionWrongChildReapMutant.cfg",
+    "mutant": "MutantWaitAny = TRUE"
+  }
+}

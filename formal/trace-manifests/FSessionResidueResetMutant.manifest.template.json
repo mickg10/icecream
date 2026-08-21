@@ -1,0 +1,61 @@
+{
+  "schema": 1,
+  "scenario": "FSessionResidueResetMutant",
+  "property": "NoResidueReset",
+  "expected_result": "counterexample",
+  "min_states": 4,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "LoseSchedulerSession",
+      "all": [
+        {"path": "phase", "from": "Connected", "to": "Lost"}
+      ]
+    },
+    {
+      "name": "StartCompilerCleanup",
+      "all": [
+        {"path": "phase", "from": "Lost", "to": "Cleaning"},
+        {"path": "compilerDirect", "from": "Alive", "to": "Waitable"}
+      ]
+    },
+    {
+      "name": "ResetUnexplainedResidueToZero",
+      "all": [
+        {"path": "phase", "from": "Cleaning", "to": "Quiesced"},
+        {"path": "residueReset", "from": false, "to": true},
+        {"path": "scalarKids", "from": 1, "to": 0},
+        {"path": "compilerDirect", "to": "Waitable"},
+        {"path": "compilerGroupAlive", "to": true}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "LoseSchedulerSession",
+    "StartCompilerCleanup",
+    "ResetUnexplainedResidueToZero"
+  ],
+  "final_all": [
+    {"path": "phase", "eq": "Quiesced"},
+    {"path": "residueReset", "eq": true},
+    {"path": "compilerDirect", "eq": "Waitable"},
+    {"path": "compilerGroupAlive", "eq": true}
+  ],
+  "harness_steps": [
+    {
+      "after": "StartCompilerCleanup",
+      "emit": "inject_unresolved_compiler_occupancy_residue",
+      "actor": "fulfillment-daemon"
+    },
+    {
+      "after": "ResetUnexplainedResidueToZero",
+      "emit": "assert_uncertainty_was_converted_into_free_capacity",
+      "actor": "fulfillment-daemon"
+    }
+  ],
+  "metadata": {
+    "module": "FSessionQuiescenceAbsolute",
+    "config": "FSessionResidueResetMutant.cfg",
+    "mutant": "MutantResetResidue = TRUE"
+  }
+}

@@ -1,0 +1,55 @@
+{
+  "schema": 1,
+  "scenario": "UseCSHandoffCut0Witness",
+  "property": "NoFailureAt0",
+  "expected_result": "counterexample",
+  "min_states": 3,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "BeginForwardWithExactId",
+      "all": [
+        {"path": "phase", "from": "Idle", "to": "Forwarding"},
+        {"path": "exactIdKnown", "from": false, "to": true},
+        {"path": "bytesWritten", "to": 0}
+      ]
+    },
+    {
+      "name": "FailBeforeByte1",
+      "all": [
+        {"path": "phase", "from": "Forwarding", "to": "ExactAbortPending"},
+        {"path": "failureObservedAt", "from": 4, "to": 0},
+        {"path": "bytesWritten", "to": 0},
+        {"path": "frameCommitted", "to": false}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "BeginForwardWithExactId",
+    "FailBeforeByte1"
+  ],
+  "final_all": [
+    {"path": "phase", "eq": "ExactAbortPending"},
+    {"path": "failureObservedAt", "eq": 0},
+    {"path": "exactIdKnown", "eq": true},
+    {"path": "frameCommitted", "eq": false}
+  ],
+  "harness_steps": [
+    {
+      "after": "BeginForwardWithExactId",
+      "emit": "cut_usecs_before_first_byte",
+      "actor": "submitter-daemon"
+    },
+    {
+      "after": "FailBeforeByte1",
+      "emit": "assert_exact_abort_pending_after_zero_byte_failure",
+      "actor": "submitter-daemon"
+    }
+  ],
+  "metadata": {
+    "module": "UseCSHandoff",
+    "config": "UseCSHandoffCut0Witness.cfg",
+    "cut": "before-byte-1",
+    "no_failure_sentinel": 4
+  }
+}

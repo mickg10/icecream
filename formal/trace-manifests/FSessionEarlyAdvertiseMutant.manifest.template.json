@@ -1,0 +1,52 @@
+{
+  "schema": 1,
+  "scenario": "FSessionEarlyAdvertiseMutant",
+  "property": "PriorSessionQuiescedBeforeAdvertise",
+  "expected_result": "counterexample",
+  "min_states": 3,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "LoseSchedulerSession",
+      "all": [
+        {"path": "phase", "from": "Connected", "to": "Lost"}
+      ]
+    },
+    {
+      "name": "AdvertiseReplacementSessionEarly",
+      "all": [
+        {"path": "phase", "from": "Lost", "to": "Advertised"},
+        {"path": "advertised", "from": false, "to": true},
+        {"path": "compilerDirect", "to": "Alive"},
+        {"path": "compilerGroupAlive", "to": true}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "LoseSchedulerSession",
+    "AdvertiseReplacementSessionEarly"
+  ],
+  "final_all": [
+    {"path": "phase", "eq": "Advertised"},
+    {"path": "advertised", "eq": true},
+    {"path": "compilerDirect", "eq": "Alive"},
+    {"path": "compilerGroupAlive", "eq": true}
+  ],
+  "harness_steps": [
+    {
+      "after": "LoseSchedulerSession",
+      "emit": "hold_prior_session_compiler_alive",
+      "actor": "compiler-process-group"
+    },
+    {
+      "after": "AdvertiseReplacementSessionEarly",
+      "emit": "assert_new_session_advertised_prior_capacity",
+      "actor": "fulfillment-daemon"
+    }
+  ],
+  "metadata": {
+    "module": "FSessionQuiescenceAbsolute",
+    "config": "FSessionEarlyAdvertiseMutant.cfg",
+    "mutant": "MutantAdvertiseEarly = TRUE"
+  }
+}

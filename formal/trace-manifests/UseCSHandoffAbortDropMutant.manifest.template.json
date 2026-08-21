@@ -1,0 +1,64 @@
+{
+  "schema": 1,
+  "scenario": "UseCSHandoffAbortDropMutant",
+  "property": "NoSilentAbortLoss",
+  "expected_result": "counterexample",
+  "min_states": 4,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "BeginForwardWithExactId",
+      "all": [
+        {"path": "phase", "from": "Idle", "to": "Forwarding"},
+        {"path": "exactIdKnown", "from": false, "to": true}
+      ]
+    },
+    {
+      "name": "FailBeforeFrameCommit",
+      "all": [
+        {"path": "phase", "from": "Forwarding", "to": "ExactAbortPending"},
+        {"path": "failureObservedAt", "from": 4, "to": 0},
+        {"path": "frameCommitted", "to": false}
+      ]
+    },
+    {
+      "name": "DropFailedAbortWhileSchedulerSessionStaysLive",
+      "all": [
+        {"path": "phase", "from": "ExactAbortPending", "to": "Terminal"},
+        {"path": "abortFailureInjected", "from": false, "to": true},
+        {"path": "terminalCause", "from": "None", "to": "Dropped"},
+        {"path": "schedulerLive", "to": true},
+        {"path": "abortConsumed", "to": false}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "BeginForwardWithExactId",
+    "FailBeforeFrameCommit",
+    "DropFailedAbortWhileSchedulerSessionStaysLive"
+  ],
+  "final_all": [
+    {"path": "phase", "eq": "Terminal"},
+    {"path": "terminalCause", "eq": "Dropped"},
+    {"path": "schedulerLive", "eq": true},
+    {"path": "abortConsumed", "eq": false}
+  ],
+  "harness_steps": [
+    {
+      "after": "FailBeforeFrameCommit",
+      "emit": "inject_exact_abort_scheduler_send_failure",
+      "actor": "scheduler-channel"
+    },
+    {
+      "after": "DropFailedAbortWhileSchedulerSessionStaysLive",
+      "emit": "assert_exact_abort_was_dropped_without_session_loss",
+      "actor": "submitter-daemon"
+    }
+  ],
+  "metadata": {
+    "module": "UseCSHandoff",
+    "config": "UseCSHandoffAbortDropMutant.cfg",
+    "mutant": "MutantDropAbortOnTransportFailure = TRUE",
+    "no_failure_sentinel": 4
+  }
+}
