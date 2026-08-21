@@ -1,0 +1,230 @@
+{
+  "schema": 1,
+  "description": "Proof-bearing assignment-fence acceptance matrix. The abstract ownership core, FIFO-quotiented network, race witnesses, one-premise mutants, bounded liveness, and the unbounded logical TLAPS safety theorem are the sole authoritative inputs.",
+  "checks": [
+    {
+      "id": "core-fixed",
+      "module": "AssignmentFenceCore",
+      "config": "AssignmentFenceCore.cfg",
+      "kind": "safety",
+      "workers": 1,
+      "expected": "pass",
+      "property": "CoreInvariant",
+      "toolchains": [
+        "stable",
+        "differential"
+      ],
+      "timeout_seconds": 1800
+    },
+    {
+      "id": "core-heterogeneous",
+      "module": "AssignmentFenceCoreHeterogeneous",
+      "config": "AssignmentFenceCoreHeterogeneous.cfg",
+      "kind": "safety",
+      "workers": 1,
+      "expected": "pass",
+      "property": "CoreInvariant",
+      "toolchains": [
+        "stable",
+        "differential"
+      ],
+      "timeout_seconds": 1800
+    },
+    {
+      "id": "core-mixed-token-mutant",
+      "module": "AssignmentFenceCore",
+      "config": "AssignmentFenceCoreMixedMutant.cfg",
+      "kind": "safety",
+      "workers": 1,
+      "expected": "counterexample",
+      "property": "TokenRequiredExactness",
+      "trace_manifest": "trace-manifests/AssignmentFenceCoreMixedMutant.manifest.template.json",
+      "toolchains": [
+        "stable",
+        "differential"
+      ],
+      "timeout_seconds": 1800
+    },
+    {
+      "id": "core-release-claimed-mutant",
+      "module": "AssignmentFenceCore",
+      "config": "AssignmentFenceCoreReleaseMutant.cfg",
+      "kind": "safety",
+      "workers": 1,
+      "expected": "counterexample",
+      "property": "ReleaseSafety",
+      "trace_manifest": "trace-manifests/AssignmentFenceCoreReleaseMutant.manifest.template.json",
+      "toolchains": [
+        "stable",
+        "differential"
+      ],
+      "timeout_seconds": 1800
+    },
+    {
+      "id": "core-revoked-result-liveness",
+      "module": "AssignmentFenceCoreProgress",
+      "config": "AssignmentFenceCoreFair.cfg",
+      "kind": "liveness",
+      "workers": 1,
+      "expected": "pass",
+      "property": "RevokedEventuallyConsumed",
+      "toolchains": [
+        "stable",
+        "differential"
+      ],
+      "timeout_seconds": 3600,
+      "assumptions": [
+        "For each assignment, weak fairness only for S consuming an already-linearized REVOKED result; compiler completion and worker loss are separate environment outcomes and are not assumed by this accepted theorem"
+      ]
+    },
+    {
+      "id": "network-fixed",
+      "module": "AssignmentFenceNetwork",
+      "config": "AssignmentFenceNetwork.cfg",
+      "kind": "safety",
+      "workers": 1,
+      "expected": "pass",
+      "property": "SafetyInvariant",
+      "toolchains": [
+        "stable",
+        "differential"
+      ],
+      "timeout_seconds": 3600
+    },
+    {
+      "id": "network-claim-wins-queued-revoke-witness",
+      "module": "AssignmentFenceNetwork",
+      "config": "AssignmentFenceNetworkClaimWinsQueuedRevokeWitness.cfg",
+      "kind": "safety",
+      "workers": 1,
+      "expected": "counterexample",
+      "property": "NoClaimBeforeRevokeConsume",
+      "trace_manifest": "trace-manifests/AssignmentFenceNetworkClaimWinsQueuedRevokeWitness.manifest.template.json",
+      "toolchains": [
+        "stable",
+        "differential"
+      ],
+      "timeout_seconds": 1800,
+      "assumptions": [
+        "Reachability witness on the fixed model: S has queued REVOKE while a concrete claim frame remains pending, and F accepts that claim before consuming REVOKE"
+      ]
+    },
+    {
+      "id": "network-fence-wins-delayed-claim-witness",
+      "module": "AssignmentFenceNetwork",
+      "config": "AssignmentFenceNetworkFenceWinsDelayedClaimWitness.cfg",
+      "kind": "safety",
+      "workers": 1,
+      "expected": "counterexample",
+      "property": "NoRejectAfterFence",
+      "trace_manifest": "trace-manifests/AssignmentFenceNetworkFenceWinsDelayedClaimWitness.manifest.template.json",
+      "toolchains": [
+        "stable",
+        "differential"
+      ],
+      "timeout_seconds": 1800,
+      "assumptions": [
+        "Reachability witness on the fixed model: F consumes REVOKE and installs the rejection fence before the retained concrete claim reaches F"
+      ]
+    },
+    {
+      "id": "network-compaction-fixed",
+      "module": "AssignmentFenceNetworkCompaction",
+      "config": "AssignmentFenceNetworkCompaction.cfg",
+      "kind": "safety",
+      "workers": 1,
+      "expected": "pass",
+      "property": "SafetyInvariant",
+      "toolchains": [
+        "stable",
+        "differential"
+      ],
+      "timeout_seconds": 3600
+    },
+    {
+      "id": "network-usecs-before-ready-mutant",
+      "module": "AssignmentFenceNetwork",
+      "config": "AssignmentFenceNetworkUseCSBeforeReadyMutant.cfg",
+      "kind": "safety",
+      "workers": 1,
+      "expected": "counterexample",
+      "property": "ReadyBeforeUseCS",
+      "trace_manifest": "trace-manifests/AssignmentFenceNetworkUseCSBeforeReadyMutant.manifest.template.json",
+      "toolchains": [
+        "stable",
+        "differential"
+      ],
+      "timeout_seconds": 1800
+    },
+    {
+      "id": "network-release-on-enqueue-mutant",
+      "module": "AssignmentFenceNetwork",
+      "config": "AssignmentFenceNetworkReleaseOnEnqueueMutant.cfg",
+      "kind": "safety",
+      "workers": 1,
+      "expected": "counterexample",
+      "property": "ReleaseAfterRevokedConsume",
+      "trace_manifest": "trace-manifests/AssignmentFenceNetworkReleaseOnEnqueueMutant.manifest.template.json",
+      "toolchains": [
+        "stable",
+        "differential"
+      ],
+      "timeout_seconds": 1800
+    },
+    {
+      "id": "network-default-allow-after-compaction-mutant",
+      "module": "AssignmentFenceNetworkCompaction",
+      "config": "AssignmentFenceNetworkDefaultAllowMutant.cfg",
+      "kind": "safety",
+      "workers": 1,
+      "expected": "counterexample",
+      "property": "NoStartAfterRevokedCompaction",
+      "trace_manifest": "trace-manifests/AssignmentFenceNetworkDefaultAllowMutant.manifest.template.json",
+      "toolchains": [
+        "stable",
+        "differential"
+      ],
+      "timeout_seconds": 1800
+    },
+    {
+      "id": "network-f2s-bypass-mutant",
+      "module": "AssignmentFenceNetwork",
+      "config": "AssignmentFenceNetworkF2SBypassMutant.cfg",
+      "kind": "safety",
+      "workers": 1,
+      "expected": "counterexample",
+      "property": "F2SStrictlyIncreasing",
+      "trace_manifest": "trace-manifests/AssignmentFenceNetworkF2SBypassMutant.manifest.template.json",
+      "toolchains": [
+        "stable",
+        "differential"
+      ],
+      "timeout_seconds": 1800
+    },
+    {
+      "id": "network-fair-liveness",
+      "module": "AssignmentFenceNetwork",
+      "config": "AssignmentFenceNetworkFair.cfg",
+      "kind": "liveness",
+      "workers": 1,
+      "expected": "pass",
+      "property": "NoPermanentQueuedFrame",
+      "toolchains": [
+        "stable",
+        "differential"
+      ],
+      "timeout_seconds": 7200,
+      "assumptions": [
+        "Weak fairness only for live-link S-to-F, F-to-S, S-to-D, and delayed-client-to-F drain/processing actions; connection loss remains explicit"
+      ]
+    }
+  ],
+  "proofs": [
+    {
+      "id": "core-tlaps-proof",
+      "file": "AssignmentFenceCoreProof.tla",
+      "expected": "pass",
+      "timeout_seconds": 7200
+    }
+  ]
+}

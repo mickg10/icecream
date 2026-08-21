@@ -1,0 +1,92 @@
+{
+  "schema": 1,
+  "scenario": "ModeRefinementUnboundedPendingMutant",
+  "property": "PendingBound",
+  "expected_result": "counterexample",
+  "min_states": 6,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "QueuePrepareAbstractAwaiting",
+      "all": [
+        {"path": "prepareQueued", "from": false, "to": true},
+        {"path": "abstractState", "from": "Idle", "to": "Awaiting"},
+        {"path": "pendingCount", "to": 0}
+      ]
+    },
+    {
+      "name": "ExposeUseCSBeforePrepareConsumption",
+      "all": [
+        {"path": "usecsExposed", "from": false, "to": true},
+        {"path": "prepared", "to": false},
+        {"path": "abstractState", "to": "Awaiting"},
+        {"path": "pendingCount", "to": 0}
+      ]
+    },
+    {
+      "name": "PendingOne",
+      "all": [
+        {"path": "pendingCount", "from": 0, "to": 1},
+        {"path": "claimArrived", "to": true},
+        {"path": "matched", "to": false},
+        {"path": "authorizationSeen", "to": false},
+        {"path": "abstractState", "from": "Awaiting", "to": "Awaiting"}
+      ]
+    },
+    {
+      "name": "PendingTwoAtBound",
+      "all": [
+        {"path": "pendingCount", "from": 1, "to": 2},
+        {"path": "matched", "to": false},
+        {"path": "authorizationSeen", "to": false},
+        {"path": "abstractState", "from": "Awaiting", "to": "Awaiting"}
+      ]
+    },
+    {
+      "name": "PendingOverflowBeyondBound",
+      "all": [
+        {"path": "pendingCount", "from": 2, "to": 3},
+        {"path": "matched", "to": false},
+        {"path": "authorizationSeen", "to": false},
+        {"path": "abstractState", "from": "Awaiting", "to": "Awaiting"},
+        {"path": "rejectedClaims", "to": 0}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "QueuePrepareAbstractAwaiting",
+    "ExposeUseCSBeforePrepareConsumption",
+    "PendingOne",
+    "PendingTwoAtBound",
+    "PendingOverflowBeyondBound"
+  ],
+  "final_all": [
+    {"path": "prepareQueued", "eq": true},
+    {"path": "prepared", "eq": false},
+    {"path": "usecsExposed", "eq": true},
+    {"path": "pendingCount", "eq": 3},
+    {"path": "matched", "eq": false},
+    {"path": "authorizationSeen", "eq": false},
+    {"path": "abstractState", "eq": "Awaiting"},
+    {"path": "rejectedClaims", "eq": 0}
+  ],
+  "harness_steps": [
+    {
+      "after": "PendingTwoAtBound",
+      "emit": "fill_pending_assignment_table_to_exact_bound",
+      "actor": "claim-generator"
+    },
+    {
+      "after": "PendingOverflowBeyondBound",
+      "emit": "assert_overflow_was_retained_instead_of_rejected",
+      "actor": "fulfillment-daemon"
+    }
+  ],
+  "metadata": {
+    "module": "AssignmentFenceModeRefinement",
+    "config": "ModeRefinementUnboundedPendingMutant.cfg",
+    "mode": "PipelinedEnforcing",
+    "mutant": "MutantUnboundedPending = TRUE",
+    "max_pending": 2
+  }
+}

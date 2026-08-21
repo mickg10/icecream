@@ -223,6 +223,75 @@ def _require_clean_checkout(repo: Path, context: str) -> None:
         )
 
 
+_base_run_tlc_check = v2.run_tlc_check
+
+
+def run_tlc_check(
+    *,
+    check: Mapping[str, Any],
+    toolchain: v2.Toolchain,
+    java: str,
+    formal_dir: Path,
+    artifacts: Path,
+    time_bin: Path,
+) -> dict[str, Any]:
+    """Run one TLC row from an artifact-tree copy of the formal sources."""
+    source_formal_dir = formal_dir
+    run_dir = artifacts / check["id"] / toolchain.name
+    work_dir = run_dir / "work"
+    if work_dir.exists():
+        raise v2.FormalRunError(
+            f"{check['id']}/{toolchain.name}: isolated TLC work directory "
+            f"already exists: {work_dir}"
+        )
+    work_dir.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(
+        source_formal_dir,
+        work_dir,
+        ignore=shutil.ignore_patterns("__pycache__", ".tlacache", "states"),
+    )
+
+    copied_inputs = {
+        str(path.relative_to(work_dir)): v2.sha256_file(path)
+        for path in sorted(work_dir.rglob("*"))
+        if path.is_file()
+    }
+    record = _base_run_tlc_check(
+        check=check,
+        toolchain=toolchain,
+        java=java,
+        formal_dir=work_dir,
+        artifacts=artifacts,
+        time_bin=time_bin,
+    )
+
+    _require_clean_checkout(
+        source_formal_dir.parent, f"{check['id']}/{toolchain.name}"
+    )
+    for relative, digest in copied_inputs.items():
+        copied = work_dir / relative
+        if not copied.is_file() or v2.sha256_file(copied) != digest:
+            raise v2.FormalRunError(
+                f"{check['id']}/{toolchain.name}: TLC modified copied input "
+                f"{relative}"
+            )
+
+    generated_files = sorted(
+        str(path.relative_to(work_dir))
+        for path in work_dir.rglob("*")
+        if path.is_file() and str(path.relative_to(work_dir)) not in copied_inputs
+    )
+    record.update(
+        {
+            "source_formal_dir": str(source_formal_dir),
+            "isolated_work_dir": str(work_dir),
+            "isolated_generated_files": generated_files,
+        }
+    )
+    v2.write_json(run_dir / "result.json", record)
+    return record
+
+
 def run_tlaps_proof(
     *,
     proof: Mapping[str, Any],
@@ -504,6 +573,7 @@ def run_python_self_tests(
 
 # v2.main resolves these names from its module globals at runtime.
 v2.pin_backends = pin_backends
+v2.run_tlc_check = run_tlc_check
 v2.run_tlaps_proof = run_tlaps_proof
 v2.differential_compare = differential_compare
 v2.run_python_self_tests = run_python_self_tests

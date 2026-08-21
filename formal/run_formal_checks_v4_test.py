@@ -11,6 +11,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 sys.dont_write_bytecode = True
 
@@ -421,6 +423,69 @@ G ==
         work = Path(record["isolated_work_dir"])
         self.assertTrue((work / ".tlacache" / "cache").is_file())
         self.assertTrue((work / "AssignmentFenceCore_TTrace_1.tla").is_file())
+        status = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            cwd=repo,
+            text=True,
+            stdout=subprocess.PIPE,
+            check=True,
+        )
+        self.assertEqual(status.stdout, "")
+
+    def test_tlc_generated_trace_is_isolated_from_source_checkout(self) -> None:
+        repo = self.root / "repo-tlc"
+        formal = repo / "formal"
+        formal.mkdir(parents=True)
+        (formal / "Model.tla").write_text(
+            "---- MODULE Model ----\nX == TRUE\n====\n",
+            encoding="utf-8",
+        )
+        (formal / "Model.cfg").write_text(
+            "INVARIANT X\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "config", "user.email", "formal-test@example.invalid"],
+            cwd=repo,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Formal Test"],
+            cwd=repo,
+            check=True,
+        )
+        subprocess.run(["git", "add", "formal"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "fixture"],
+            cwd=repo,
+            check=True,
+        )
+
+        def fake_tlc_check(**kwargs: object) -> dict[str, object]:
+            isolated = Path(kwargs["formal_dir"])
+            (isolated / "Model_TTrace_1.tla").write_text(
+                "trace\n", encoding="utf-8"
+            )
+            return {"id": "model", "toolchain": "stable"}
+
+        artifacts = self.root / "artifacts-tlc"
+        with mock.patch.object(
+            module, "_base_run_tlc_check", side_effect=fake_tlc_check
+        ):
+            record = module.run_tlc_check(
+                check={"id": "model", "module": "Model", "config": "Model.cfg"},
+                toolchain=SimpleNamespace(name="stable"),
+                java="java",
+                formal_dir=formal,
+                artifacts=artifacts,
+                time_bin=Path("/usr/bin/time"),
+            )
+
+        self.assertFalse((formal / "Model_TTrace_1.tla").exists())
+        work = Path(record["isolated_work_dir"])
+        self.assertTrue((work / "Model_TTrace_1.tla").is_file())
+        self.assertIn("Model_TTrace_1.tla", record["isolated_generated_files"])
         status = subprocess.run(
             ["git", "status", "--porcelain", "--untracked-files=all"],
             cwd=repo,

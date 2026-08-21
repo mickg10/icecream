@@ -1,0 +1,70 @@
+{
+  "schema": 1,
+  "scenario": "ModeRefinementRevokeWitness",
+  "property": "NoRevocationSeen",
+  "expected_result": "counterexample",
+  "min_states": 4,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "QueuePrepareAbstractAwaiting",
+      "all": [
+        {"path": "prepareQueued", "from": false, "to": true},
+        {"path": "abstractState", "from": "Idle", "to": "Awaiting"},
+        {"path": "revoked", "to": false},
+        {"path": "matched", "to": false}
+      ]
+    },
+    {
+      "name": "QueueOrderedRevoke",
+      "all": [
+        {"path": "revokeQueued", "from": false, "to": true},
+        {"path": "abstractState", "to": "Awaiting"},
+        {"path": "revoked", "to": false},
+        {"path": "matched", "to": false},
+        {"path": "started", "to": false}
+      ]
+    },
+    {
+      "name": "ConsumeRevokeOnBothMachines",
+      "all": [
+        {"path": "revokeQueued", "from": true, "to": false},
+        {"path": "revoked", "from": false, "to": true},
+        {"path": "abstractState", "from": "Awaiting", "to": "Revoked"},
+        {"path": "pendingCount", "to": 0},
+        {"path": "started", "to": false}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "QueuePrepareAbstractAwaiting",
+    "QueueOrderedRevoke",
+    "ConsumeRevokeOnBothMachines"
+  ],
+  "final_all": [
+    {"path": "prepareQueued", "eq": true},
+    {"path": "revokeQueued", "eq": false},
+    {"path": "revoked", "eq": true},
+    {"path": "matched", "eq": false},
+    {"path": "started", "eq": false},
+    {"path": "abstractState", "eq": "Revoked"}
+  ],
+  "harness_steps": [
+    {
+      "after": "QueueOrderedRevoke",
+      "emit": "retain_revoke_on_ordered_scheduler_to_fulfillment_stream",
+      "actor": "scheduler"
+    },
+    {
+      "after": "ConsumeRevokeOnBothMachines",
+      "emit": "assert_concrete_fence_and_abstract_revoke_linearize_together",
+      "actor": "fulfillment-daemon"
+    }
+  ],
+  "metadata": {
+    "module": "AssignmentFenceModeRefinement",
+    "config": "ModeRefinementRevokeWitness.cfg",
+    "mode": "PipelinedEnforcing",
+    "purpose": "Direct witness that a fence-winning concrete REVOKE maps to the abstract Revoked state."
+  }
+}

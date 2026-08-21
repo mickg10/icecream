@@ -1,0 +1,135 @@
+{
+  "schema": 1,
+  "scenario": "P49PipelinedClaimBeforePrepareWitness",
+  "property": "NoClaimBeforePrepareWitness",
+  "expected_result": "counterexample",
+  "min_states": 6,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "ExposeUseCSBeforePrepareConsumed",
+      "all": [
+        {
+          "path": "usecsExposed",
+          "from": false,
+          "to": true
+        },
+        {
+          "path": "prepared",
+          "to": false
+        },
+        {
+          "path": "prepareQueuedEver",
+          "to": true
+        }
+      ]
+    },
+    {
+      "name": "ParkClaimPending",
+      "all": [
+        {
+          "path": "claimArrived",
+          "from": false,
+          "to": true
+        },
+        {
+          "path": "pendingCount",
+          "from": 0,
+          "to": 1
+        },
+        {
+          "path": "matchedClaim",
+          "to": false
+        },
+        {
+          "path": "sideEffect",
+          "to": false
+        }
+      ]
+    },
+    {
+      "name": "ConsumePrepareAndMatch",
+      "all": [
+        {
+          "path": "prepared",
+          "from": false,
+          "to": true
+        },
+        {
+          "path": "pendingCount",
+          "from": 1,
+          "to": 0
+        },
+        {
+          "path": "matchedClaim",
+          "from": false,
+          "to": true
+        }
+      ]
+    },
+    {
+      "name": "StartAfterAuthorization",
+      "all": [
+        {
+          "path": "started",
+          "from": false,
+          "to": true
+        },
+        {
+          "path": "sideEffect",
+          "from": false,
+          "to": true
+        },
+        {
+          "path": "revoked",
+          "to": false
+        }
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "ExposeUseCSBeforePrepareConsumed",
+    "ParkClaimPending",
+    "ConsumePrepareAndMatch",
+    "StartAfterAuthorization"
+  ],
+  "final_all": [
+    {
+      "path": "started",
+      "eq": true
+    },
+    {
+      "path": "prepared",
+      "eq": true
+    },
+    {
+      "path": "matchedClaim",
+      "eq": true
+    },
+    {
+      "path": "pendingCount",
+      "eq": 0
+    }
+  ],
+  "harness_steps": [
+    {
+      "after": "ExposeUseCSBeforePrepareConsumed",
+      "emit": "expose_usecs_after_prepare_enqueue_without_ready",
+      "actor": "scheduler"
+    },
+    {
+      "after": "ParkClaimPending",
+      "emit": "assert_claim_parked_without_side_effect",
+      "actor": "fulfillment-daemon"
+    },
+    {
+      "after": "ConsumePrepareAndMatch",
+      "emit": "authorize_exact_pending_claim",
+      "actor": "fulfillment-daemon"
+    }
+  ],
+  "metadata": {
+    "module": "AssignmentFenceAdmissionModes",
+    "config": "P49PipelinedClaimBeforePrepareWitness.cfg"
+  }
+}

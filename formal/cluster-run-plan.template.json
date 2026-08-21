@@ -1,0 +1,107 @@
+{
+  "schema": 1,
+  "revision": "<exact-40-hex-git-sha>",
+  "binaries": {
+    "old": {
+      "scheduler_sha256": "<64-hex-sha256>",
+      "daemon_sha256": "<64-hex-sha256>",
+      "client_sha256": "<64-hex-sha256>"
+    },
+    "candidate": {
+      "scheduler_sha256": "<64-hex-sha256>",
+      "daemon_sha256": "<64-hex-sha256>",
+      "client_sha256": "<64-hex-sha256>"
+    }
+  },
+  "hosts": [
+    {
+      "name": "scheduler-01",
+      "roles": ["scheduler"],
+      "versions": ["candidate"]
+    },
+    {
+      "name": "fulfillment-old-pool",
+      "roles": ["fulfillment"],
+      "versions": ["old"]
+    },
+    {
+      "name": "fulfillment-candidate-pool",
+      "roles": ["fulfillment"],
+      "versions": ["candidate"]
+    },
+    {
+      "name": "clients-old-pool",
+      "roles": ["client-generator"],
+      "versions": ["old"]
+    },
+    {
+      "name": "clients-candidate-pool",
+      "roles": ["client-generator"],
+      "versions": ["candidate"]
+    },
+    {
+      "name": "observer-01",
+      "roles": ["observer"],
+      "versions": []
+    }
+  ],
+  "enable_pipelined_contingency": false,
+  "pipelined_contingency_reason": "",
+  "tiers": [
+    {
+      "id": "smoke",
+      "fulfillment_count": 2,
+      "client_count": 4,
+      "duration_seconds": 120,
+      "topologies": ["S'FC", "S'FC'", "S'F'C", "S'F'C'", "S'F[F']C[C']", "S'F'[CC']"],
+      "scenarios": ["normal-completion", "cancel-before-usecs", "claim-before-queued-revoke", "revoke-before-delayed-claim", "submitter-loss-before-begin", "submitter-loss-after-begin-worker-completes", "submitter-loss-after-begin-worker-lost", "scheduler-restart-delayed-claim", "fulfillment-relogin-generation", "client-reconnect-generation", "duplicate-begin", "duplicate-terminal", "partial-usecs-all-cuts", "compaction-delayed-claim", "management-under-saturation", "connectivity-retry-storm"],
+      "modes": ["baseline", "strict"],
+      "metrics": ["assignments_per_second", "completions_per_second", "request_to_usecs_latency", "request_to_begin_latency", "scheduler_cpu", "scheduler_rss", "scheduler_fds", "management_latency", "queue_depth", "pending_claim_high_water", "tombstone_count", "wire_bytes_per_assignment", "terminal_uniqueness_failures", "identity_uniqueness_failures", "accounting_conservation_failures"]
+    },
+    {
+      "id": "small",
+      "fulfillment_count": 10,
+      "client_count": 100,
+      "duration_seconds": 300,
+      "topologies": ["S'FC", "S'FC'", "S'F'C", "S'F'C'", "S'F[F']C[C']", "S'F'[CC']"],
+      "scenarios": ["normal-completion", "cancel-before-usecs", "claim-before-queued-revoke", "revoke-before-delayed-claim", "submitter-loss-before-begin", "submitter-loss-after-begin-worker-completes", "submitter-loss-after-begin-worker-lost", "scheduler-restart-delayed-claim", "fulfillment-relogin-generation", "client-reconnect-generation", "duplicate-begin", "duplicate-terminal", "partial-usecs-all-cuts", "compaction-delayed-claim", "management-under-saturation", "connectivity-retry-storm"],
+      "modes": ["baseline", "strict"],
+      "metrics": ["assignments_per_second", "completions_per_second", "request_to_usecs_latency", "request_to_begin_latency", "scheduler_cpu", "scheduler_rss", "scheduler_fds", "management_latency", "queue_depth", "pending_claim_high_water", "tombstone_count", "wire_bytes_per_assignment", "terminal_uniqueness_failures", "identity_uniqueness_failures", "accounting_conservation_failures"]
+    },
+    {
+      "id": "medium",
+      "fulfillment_count": 25,
+      "client_count": 1000,
+      "duration_seconds": 900,
+      "topologies": ["S'FC", "S'FC'", "S'F'C", "S'F'C'", "S'F[F']C[C']", "S'F'[CC']"],
+      "scenarios": ["normal-completion", "cancel-before-usecs", "claim-before-queued-revoke", "revoke-before-delayed-claim", "submitter-loss-before-begin", "submitter-loss-after-begin-worker-completes", "submitter-loss-after-begin-worker-lost", "scheduler-restart-delayed-claim", "fulfillment-relogin-generation", "client-reconnect-generation", "duplicate-begin", "duplicate-terminal", "partial-usecs-all-cuts", "compaction-delayed-claim", "management-under-saturation", "connectivity-retry-storm"],
+      "modes": ["baseline", "strict"],
+      "metrics": ["assignments_per_second", "completions_per_second", "request_to_usecs_latency", "request_to_begin_latency", "scheduler_cpu", "scheduler_rss", "scheduler_fds", "management_latency", "queue_depth", "pending_claim_high_water", "tombstone_count", "wire_bytes_per_assignment", "terminal_uniqueness_failures", "identity_uniqueness_failures", "accounting_conservation_failures"]
+    },
+    {
+      "id": "high",
+      "fulfillment_count": 50,
+      "client_count": 5000,
+      "duration_seconds": 1800,
+      "topologies": ["S'FC", "S'FC'", "S'F'C", "S'F'C'", "S'F[F']C[C']", "S'F'[CC']"],
+      "scenarios": ["normal-completion", "cancel-before-usecs", "claim-before-queued-revoke", "revoke-before-delayed-claim", "submitter-loss-before-begin", "submitter-loss-after-begin-worker-completes", "submitter-loss-after-begin-worker-lost", "scheduler-restart-delayed-claim", "fulfillment-relogin-generation", "client-reconnect-generation", "duplicate-begin", "duplicate-terminal", "partial-usecs-all-cuts", "compaction-delayed-claim", "management-under-saturation", "connectivity-retry-storm"],
+      "modes": ["baseline", "strict"],
+      "metrics": ["assignments_per_second", "completions_per_second", "request_to_usecs_latency", "request_to_begin_latency", "scheduler_cpu", "scheduler_rss", "scheduler_fds", "management_latency", "queue_depth", "pending_claim_high_water", "tombstone_count", "wire_bytes_per_assignment", "terminal_uniqueness_failures", "identity_uniqueness_failures", "accounting_conservation_failures"]
+    },
+    {
+      "id": "saturation",
+      "fulfillment_count": 50,
+      "client_count": 10000,
+      "duration_seconds": 3600,
+      "topologies": ["S'FC", "S'FC'", "S'F'C", "S'F'C'", "S'F[F']C[C']", "S'F'[CC']"],
+      "scenarios": ["normal-completion", "cancel-before-usecs", "claim-before-queued-revoke", "revoke-before-delayed-claim", "submitter-loss-before-begin", "submitter-loss-after-begin-worker-completes", "submitter-loss-after-begin-worker-lost", "scheduler-restart-delayed-claim", "fulfillment-relogin-generation", "client-reconnect-generation", "duplicate-begin", "duplicate-terminal", "partial-usecs-all-cuts", "compaction-delayed-claim", "management-under-saturation", "connectivity-retry-storm"],
+      "modes": ["baseline", "strict"],
+      "metrics": ["assignments_per_second", "completions_per_second", "request_to_usecs_latency", "request_to_begin_latency", "scheduler_cpu", "scheduler_rss", "scheduler_fds", "management_latency", "queue_depth", "pending_claim_high_water", "tombstone_count", "wire_bytes_per_assignment", "terminal_uniqueness_failures", "identity_uniqueness_failures", "accounting_conservation_failures"]
+    }
+  ],
+  "evidence": {
+    "artifacts_root": "/absolute/path/outside/the/checkout",
+    "require_clean_checkout": true,
+    "require_complete_management_replies": true
+  }
+}

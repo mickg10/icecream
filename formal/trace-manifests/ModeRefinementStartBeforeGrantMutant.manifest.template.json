@@ -1,0 +1,77 @@
+{
+  "schema": 1,
+  "scenario": "ModeRefinementStartBeforeGrantMutant",
+  "property": "StartRequiresAuthorization",
+  "expected_result": "counterexample",
+  "min_states": 5,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "QueuePrepareAbstractAwaiting",
+      "all": [
+        {"path": "prepareQueued", "from": false, "to": true},
+        {"path": "abstractState", "from": "Idle", "to": "Awaiting"},
+        {"path": "authorizationSeen", "to": false}
+      ]
+    },
+    {
+      "name": "ExposeUseCSBeforePrepareConsumption",
+      "all": [
+        {"path": "usecsExposed", "from": false, "to": true},
+        {"path": "prepared", "to": false},
+        {"path": "abstractState", "to": "Awaiting"}
+      ]
+    },
+    {
+      "name": "CreatePendingClaimWithoutGrant",
+      "all": [
+        {"path": "claimArrived", "from": false, "to": true},
+        {"path": "pendingCount", "from": 0, "to": 1},
+        {"path": "matched", "to": false},
+        {"path": "authorizationSeen", "to": false},
+        {"path": "abstractState", "from": "Awaiting", "to": "Awaiting"}
+      ]
+    },
+    {
+      "name": "StartCompilerBeforeAbstractGrant",
+      "all": [
+        {"path": "started", "from": false, "to": true},
+        {"path": "authorizationSeen", "to": false},
+        {"path": "matched", "to": false},
+        {"path": "pendingCount", "to": 1},
+        {"path": "abstractState", "from": "Awaiting", "to": "Awaiting"}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "QueuePrepareAbstractAwaiting",
+    "ExposeUseCSBeforePrepareConsumption",
+    "CreatePendingClaimWithoutGrant",
+    "StartCompilerBeforeAbstractGrant"
+  ],
+  "final_all": [
+    {"path": "started", "eq": true},
+    {"path": "authorizationSeen", "eq": false},
+    {"path": "matched", "eq": false},
+    {"path": "pendingCount", "eq": 1},
+    {"path": "abstractState", "eq": "Awaiting"}
+  ],
+  "harness_steps": [
+    {
+      "after": "CreatePendingClaimWithoutGrant",
+      "emit": "hold_exact_pending_claim_before_prepare_consumption",
+      "actor": "fulfillment-daemon"
+    },
+    {
+      "after": "StartCompilerBeforeAbstractGrant",
+      "emit": "assert_compiler_or_environment_side_effect_preceded_authorization",
+      "actor": "compiler-supervisor"
+    }
+  ],
+  "metadata": {
+    "module": "AssignmentFenceModeRefinement",
+    "config": "ModeRefinementStartBeforeGrantMutant.cfg",
+    "mode": "PipelinedEnforcing",
+    "mutant": "MutantStartBeforeGrant = TRUE"
+  }
+}

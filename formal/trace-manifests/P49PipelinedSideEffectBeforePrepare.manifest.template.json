@@ -1,0 +1,81 @@
+{
+  "schema": 1,
+  "scenario": "P49PipelinedSideEffectBeforePrepare",
+  "property": "NoSideEffectBeforePrepare",
+  "expected_result": "counterexample",
+  "min_states": 4,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "ExposePipelinedUseCS",
+      "all": [
+        {
+          "path": "usecsExposed",
+          "from": false,
+          "to": true
+        },
+        {
+          "path": "prepared",
+          "to": false
+        }
+      ]
+    },
+    {
+      "name": "PrematureClaimSideEffect",
+      "all": [
+        {
+          "path": "claimArrived",
+          "from": false,
+          "to": true
+        },
+        {
+          "path": "sideEffect",
+          "from": false,
+          "to": true
+        },
+        {
+          "path": "prepared",
+          "to": false
+        },
+        {
+          "path": "matchedClaim",
+          "to": false
+        }
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "ExposePipelinedUseCS",
+    "PrematureClaimSideEffect"
+  ],
+  "final_all": [
+    {
+      "path": "sideEffect",
+      "eq": true
+    },
+    {
+      "path": "prepared",
+      "eq": false
+    },
+    {
+      "path": "matchedClaim",
+      "eq": false
+    }
+  ],
+  "harness_steps": [
+    {
+      "after": "ExposePipelinedUseCS",
+      "emit": "deliver_claim_before_prepare_consume",
+      "actor": "client-channel"
+    },
+    {
+      "after": "PrematureClaimSideEffect",
+      "emit": "assert_environment_side_effect_preceded_authorization",
+      "actor": "fulfillment-daemon"
+    }
+  ],
+  "metadata": {
+    "module": "AssignmentFenceAdmissionModes",
+    "config": "P49PipelinedSideEffectBeforePrepare.cfg"
+  }
+}

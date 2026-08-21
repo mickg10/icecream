@@ -1,0 +1,45 @@
+{
+  "schema": 1,
+  "description": "Lockstep bounded validation of the concrete absolute-sequence F-to-S queue and the finite position-only quotient. The fixed row checks projection plus FIFO; one witness reaches depth two; one direct mutant consumes index two.",
+  "checks": [
+    {
+      "id": "f2s-quotient-fixed",
+      "module": "F2SQuotientSimulation",
+      "config": "F2SQuotientSimulation.cfg",
+      "kind": "safety",
+      "workers": 1,
+      "expected": "pass",
+      "property": "SimulationInvariant",
+      "toolchains": ["stable", "differential"],
+      "timeout_seconds": 1800,
+      "assumptions": [
+        "The synthetic concrete sequence magnitude is bounded only for exhaustive lockstep validation; the projection lemmas are local to enqueue/consume and do not inspect that magnitude."
+      ]
+    },
+    {
+      "id": "f2s-quotient-two-frame-witness",
+      "module": "F2SQuotientSimulation",
+      "config": "F2SQuotientTwoFrameWitness.cfg",
+      "kind": "safety",
+      "workers": 1,
+      "expected": "counterexample",
+      "property": "NoTwoFrameQueue",
+      "trace_manifest": "trace-manifests/F2SQuotientTwoFrameWitness.manifest.template.json",
+      "toolchains": ["stable", "differential"],
+      "timeout_seconds": 1800
+    },
+    {
+      "id": "f2s-quotient-index-two-mutant",
+      "module": "F2SQuotientSimulation",
+      "config": "F2SQuotientBypassMutant.cfg",
+      "kind": "safety",
+      "workers": 1,
+      "expected": "counterexample",
+      "property": "NoBypassObserved",
+      "trace_manifest": "trace-manifests/F2SQuotientBypassMutant.manifest.template.json",
+      "toolchains": ["stable", "differential"],
+      "timeout_seconds": 1800
+    }
+  ],
+  "proofs": []
+}

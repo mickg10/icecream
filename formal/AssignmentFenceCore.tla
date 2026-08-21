@@ -22,7 +22,7 @@ CONSTANTS Assignments, Workers, NoWorker, NoClaimant,
           Capacity, PolicyOf, WorkerOf, WireOf, FullIdOf, TokenOf,
           MutantLegacyCanClaimToken, MutantReleaseClaimed
 
-ASSUME /\ Assignments # {}
+ASSUME CoreConstants == /\ Assignments # {}
        /\ Workers # {}
        /\ NoWorker \notin Workers
        /\ NoClaimant \notin Assignments

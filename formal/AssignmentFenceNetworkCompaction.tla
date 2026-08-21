@@ -29,7 +29,7 @@ CompactRevoked(a) ==
                     startAfterRelease, revokedEnqueued, revokedConsumed,
                     beginConsumed, claimAfterRevokeQueued,
                     claimRejectedAfterFence, s2f, f2s, s2d, c2f,
-                    nextF2SSeq, lastF2SConsumed, sfLive, sdLive>>
+                    f2sBypassObserved, sfLive, sdLive>>
 
 CompactionNext ==
     Next \/ \E a \in Assignments : CompactRevoked(a)
@@ -43,5 +43,15 @@ CompactionFencedLivenessSpec ==
     /\ WF_vars(DrainF2S)
     /\ WF_vars(DrainS2D)
     /\ WF_vars(DrainC2F)
+
+(***************************************************************************
+Direct mutant property.  Restrict the violation to a scheduler release caused
+by consuming REVOKED, followed by terminal-record compaction.  A shorter
+session-loss release is a different recovery path and must not satisfy this
+row's trace contract.
+***************************************************************************)
+NoStartAfterRevokedCompaction ==
+    \A a \in Assignments :
+        releaseCause[a] = "Revoked" => startAfterRelease[a] = 0
 
 =============================================================================

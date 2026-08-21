@@ -1,0 +1,114 @@
+{
+  "schema": 1,
+  "scenario": "P49PipelinedDefaultAllowMutant",
+  "property": "NoStartAfterRelease",
+  "expected_result": "counterexample",
+  "min_states": 8,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "FenceBeforeClaim",
+      "all": [
+        {
+          "path": "revoked",
+          "from": false,
+          "to": true
+        },
+        {
+          "path": "terminalQueued",
+          "from": false,
+          "to": true
+        },
+        {
+          "path": "matchedClaim",
+          "to": false
+        }
+      ]
+    },
+    {
+      "name": "ConsumeTerminalRelease",
+      "all": [
+        {
+          "path": "terminalConsumed",
+          "from": false,
+          "to": true
+        },
+        {
+          "path": "released",
+          "from": false,
+          "to": true
+        }
+      ]
+    },
+    {
+      "name": "CompactFenceRecord",
+      "all": [
+        {
+          "path": "compacted",
+          "from": false,
+          "to": true
+        },
+        {
+          "path": "released",
+          "to": true
+        }
+      ]
+    },
+    {
+      "name": "DefaultAllowLateUnknown",
+      "all": [
+        {
+          "path": "startAfterRelease",
+          "from": false,
+          "to": true
+        },
+        {
+          "path": "started",
+          "from": false,
+          "to": true
+        },
+        {
+          "path": "sideEffect",
+          "from": false,
+          "to": true
+        }
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "FenceBeforeClaim",
+    "ConsumeTerminalRelease",
+    "CompactFenceRecord",
+    "DefaultAllowLateUnknown"
+  ],
+  "final_all": [
+    {
+      "path": "released",
+      "eq": true
+    },
+    {
+      "path": "compacted",
+      "eq": true
+    },
+    {
+      "path": "startAfterRelease",
+      "eq": true
+    }
+  ],
+  "harness_steps": [
+    {
+      "after": "CompactFenceRecord",
+      "emit": "compact_terminal_assignment_record",
+      "actor": "fulfillment-daemon"
+    },
+    {
+      "after": "DefaultAllowLateUnknown",
+      "emit": "assert_late_unknown_claim_started_after_release",
+      "actor": "fulfillment-daemon"
+    }
+  ],
+  "metadata": {
+    "module": "AssignmentFenceAdmissionModes",
+    "config": "P49PipelinedDefaultAllowMutant.cfg"
+  }
+}

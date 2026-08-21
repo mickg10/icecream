@@ -145,7 +145,7 @@
       "kind": "safety",
       "workers": 1,
       "expected": "counterexample",
-      "property": "NoStartAfterRelease",
+      "property": "NoStartAfterRevokedCompaction",
       "trace_manifest": "trace-manifests/AssignmentFenceNetworkDefaultAllowMutant.manifest.template.json",
       "toolchains": ["stable", "differential"],
       "timeout_seconds": 1800

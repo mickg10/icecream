@@ -1,0 +1,121 @@
+{
+  "schema": 1,
+  "description": "Exact nine-row strict/pipelined concrete-to-abstract refinement matrix. Fixed rows check the abstraction relation and authorization safety; witnesses make the pre-PREPARE stutter and revoke mapping reachable; direct one-premise mutants expose premature authorization, premature start, dropped abstract revoke, and pending overflow; the sole progress row assumes weak fairness only for an already-enabled PREPARE consume.",
+  "checks": [
+    {
+      "id": "mode-refinement-strict-fixed",
+      "module": "AssignmentFenceModeRefinement",
+      "config": "ModeRefinementStrict.cfg",
+      "kind": "safety",
+      "workers": 1,
+      "expected": "pass",
+      "property": "RefinementSafety",
+      "toolchains": ["stable", "differential"],
+      "timeout_seconds": 1800,
+      "assumptions": [
+        "StrictEnforcing exposes UseCS only after PREPARE consumption and READY observation; no environment outcome is assumed."
+      ]
+    },
+    {
+      "id": "mode-refinement-pipelined-fixed",
+      "module": "AssignmentFenceModeRefinement",
+      "config": "ModeRefinementPipelined.cfg",
+      "kind": "safety",
+      "workers": 1,
+      "expected": "pass",
+      "property": "RefinementSafety",
+      "toolchains": ["stable", "differential"],
+      "timeout_seconds": 1800,
+      "assumptions": [
+        "The finite cutoff MaxPending=2 is sufficient to distinguish in-bound insertion, saturation rejection, PREPARE resolution, and the direct overflow mutant."
+      ]
+    },
+    {
+      "id": "mode-refinement-pending-stutter-witness",
+      "module": "AssignmentFenceModeRefinement",
+      "config": "ModeRefinementPendingStutterWitness.cfg",
+      "kind": "safety",
+      "workers": 1,
+      "expected": "counterexample",
+      "property": "NoPendingStutterSeen",
+      "trace_manifest": "trace-manifests/ModeRefinementPendingStutterWitness.manifest.template.json",
+      "toolchains": ["stable", "differential"],
+      "timeout_seconds": 1800
+    },
+    {
+      "id": "mode-refinement-revoke-witness",
+      "module": "AssignmentFenceModeRefinement",
+      "config": "ModeRefinementRevokeWitness.cfg",
+      "kind": "safety",
+      "workers": 1,
+      "expected": "counterexample",
+      "property": "NoRevocationSeen",
+      "trace_manifest": "trace-manifests/ModeRefinementRevokeWitness.manifest.template.json",
+      "toolchains": ["stable", "differential"],
+      "timeout_seconds": 1800
+    },
+    {
+      "id": "mode-refinement-pending-authorizes-mutant",
+      "module": "AssignmentFenceModeRefinement",
+      "config": "ModeRefinementPendingAuthorizesMutant.cfg",
+      "kind": "safety",
+      "workers": 1,
+      "expected": "counterexample",
+      "property": "PendingDoesNotAuthorize",
+      "trace_manifest": "trace-manifests/ModeRefinementPendingAuthorizesMutant.manifest.template.json",
+      "toolchains": ["stable", "differential"],
+      "timeout_seconds": 1800
+    },
+    {
+      "id": "mode-refinement-start-before-grant-mutant",
+      "module": "AssignmentFenceModeRefinement",
+      "config": "ModeRefinementStartBeforeGrantMutant.cfg",
+      "kind": "safety",
+      "workers": 1,
+      "expected": "counterexample",
+      "property": "StartRequiresAuthorization",
+      "trace_manifest": "trace-manifests/ModeRefinementStartBeforeGrantMutant.manifest.template.json",
+      "toolchains": ["stable", "differential"],
+      "timeout_seconds": 1800
+    },
+    {
+      "id": "mode-refinement-drop-revoke-mutant",
+      "module": "AssignmentFenceModeRefinement",
+      "config": "ModeRefinementDropRevokeMutant.cfg",
+      "kind": "safety",
+      "workers": 1,
+      "expected": "counterexample",
+      "property": "AbstractionRelation",
+      "trace_manifest": "trace-manifests/ModeRefinementDropRevokeMutant.manifest.template.json",
+      "toolchains": ["stable", "differential"],
+      "timeout_seconds": 1800
+    },
+    {
+      "id": "mode-refinement-unbounded-pending-mutant",
+      "module": "AssignmentFenceModeRefinement",
+      "config": "ModeRefinementUnboundedPendingMutant.cfg",
+      "kind": "safety",
+      "workers": 1,
+      "expected": "counterexample",
+      "property": "PendingBound",
+      "trace_manifest": "trace-manifests/ModeRefinementUnboundedPendingMutant.manifest.template.json",
+      "toolchains": ["stable", "differential"],
+      "timeout_seconds": 1800
+    },
+    {
+      "id": "mode-refinement-pending-liveness",
+      "module": "AssignmentFenceModeRefinement",
+      "config": "ModeRefinementPendingLiveness.cfg",
+      "kind": "liveness",
+      "workers": 1,
+      "expected": "pass",
+      "property": "PendingEventuallyResolved",
+      "toolchains": ["stable", "differential"],
+      "timeout_seconds": 3600,
+      "assumptions": [
+        "Weak fairness only for ConsumePrepare while an exact pending claim leaves that action continuously enabled; compiler completion, peer loss, restart, and connection repair are not assumed."
+      ]
+    }
+  ],
+  "proofs": []
+}

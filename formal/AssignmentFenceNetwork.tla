@@ -15,6 +15,12 @@ Four bounded streams are explicit:
   s2d  scheduler -> submitter daemon/client: USECS
   c2f  delayed client -> fulfillment daemon: concrete assignment claim
 
+F->S ordering is represented by queue position, not by an absolute sequence
+number.  This is the finite quotient of the concrete numbered FIFO: appending
+preserves order and consuming index 1 is the FIFO transition.  A monotone
+`f2sBypassObserved` bit records the only ordering fact needed by the bypass
+mutant, so history-equivalent absolute counter values do not multiply states.
+
 The C->F claim carries the assignment correlation fields.  F claim/revoke
 transitions inspect only F-visible state plus the received claim; they never
 consult the scheduler's instantaneous phase.  This admits both distributed
@@ -90,11 +96,11 @@ F2SKinds == {"READY", "REVOKED", "OWNED", "BEGIN", "DONE"}
 S2DKinds == {"USECS"}
 AllKinds == S2FKinds \cup F2SKinds \cup S2DKinds
 
-Msg(kind, assignment, seq) ==
-    [kind |-> kind, assignment |-> assignment, seq |-> seq]
+Msg(kind, assignment) ==
+    [kind |-> kind, assignment |-> assignment]
 
 MessageType ==
-    [kind : AllKinds, assignment : Assignments, seq : Nat]
+    [kind : AllKinds, assignment : Assignments]
 
 ClaimMsg(a, exact) ==
     [assignment |-> a,
@@ -141,8 +147,7 @@ VARIABLES phase,
           f2s,
           s2d,
           c2f,
-          nextF2SSeq,
-          lastF2SConsumed,
+          f2sBypassObserved,
           sfLive,
           sdLive
 
@@ -152,7 +157,7 @@ vars ==
       claimExact, claimedWire, claimedFull, claimedToken, claimRejected,
       startCount, startAfterRelease, revokedEnqueued, revokedConsumed,
       beginConsumed, claimAfterRevokeQueued, claimRejectedAfterFence,
-      s2f, f2s, s2d, c2f, nextF2SSeq, lastF2SConsumed, sfLive, sdLive>>
+      s2f, f2s, s2d, c2f, f2sBypassObserved, sfLive, sdLive>>
 
 WorkerOccupancy(w) ==
     Cardinality({a \in Assignments : workerSlot[a] /\ WorkerOf[a] = w})
@@ -189,8 +194,7 @@ Init ==
     /\ f2s = <<>>
     /\ s2d = <<>>
     /\ c2f = <<>>
-    /\ nextF2SSeq = 1
-    /\ lastF2SConsumed = 0
+    /\ f2sBypassObserved = FALSE
     /\ sfLive = TRUE
     /\ sdLive = TRUE
 
@@ -201,14 +205,14 @@ SPrepare(a) ==
     /\ Len(s2f) < MaxS2F
     /\ phase' = [phase EXCEPT ![a] = "PrepareQueued"]
     /\ schedulerReservation' = [schedulerReservation EXCEPT ![a] = TRUE]
-    /\ s2f' = Append(s2f, Msg("PREPARE", a, 0))
+    /\ s2f' = Append(s2f, Msg("PREPARE", a))
     /\ UNCHANGED <<fState, workerSlot, released, releaseCause,
                     terminalCount, readySeen, usecsDelivered, claimMade,
                     claimExact, claimedWire, claimedFull, claimedToken,
                     claimRejected, startCount, startAfterRelease,
                     revokedEnqueued, revokedConsumed, beginConsumed,
                     claimAfterRevokeQueued, claimRejectedAfterFence,
-                    f2s, s2d, c2f, nextF2SSeq, lastF2SConsumed,
+                    f2s, s2d, c2f, f2sBypassObserved,
                     sfLive, sdLive>>
 
 FReceivePrepare ==
@@ -223,16 +227,15 @@ FReceivePrepare ==
           /\ phase' = [phase EXCEPT ![a] = "Prepared"]
           /\ fState' = [fState EXCEPT ![a] = "Reserved"]
           /\ workerSlot' = [workerSlot EXCEPT ![a] = TRUE]
-          /\ f2s' = Append(f2s, Msg("READY", a, nextF2SSeq))
+          /\ f2s' = Append(f2s, Msg("READY", a))
     /\ s2f' = Tail(s2f)
-    /\ nextF2SSeq' = nextF2SSeq + 1
     /\ UNCHANGED <<schedulerReservation, released, releaseCause,
                     terminalCount, readySeen, usecsDelivered, claimMade,
                     claimExact, claimedWire, claimedFull, claimedToken,
                     claimRejected, startCount, startAfterRelease,
                     revokedEnqueued, revokedConsumed, beginConsumed,
                     claimAfterRevokeQueued, claimRejectedAfterFence,
-                    s2d, c2f, lastF2SConsumed, sfLive, sdLive>>
+                    s2d, c2f, f2sBypassObserved, sfLive, sdLive>>
 
 (***************************************************************************
 READY can already be in F->S when S queues REVOKE.  Consume it in FIFO order.
@@ -249,7 +252,8 @@ SReceiveReady ==
                 THEN [phase EXCEPT ![a] = "Ready"]
                 ELSE phase
           /\ readySeen' = [readySeen EXCEPT ![a] = TRUE]
-    /\ lastF2SConsumed' = ChosenF2S.seq
+    /\ f2sBypassObserved' =
+          (f2sBypassObserved \/ (ChosenF2SIndex # 1))
     /\ f2s' = RemoveAt(f2s, ChosenF2SIndex)
     /\ UNCHANGED <<fState, schedulerReservation, workerSlot, released,
                     releaseCause, terminalCount, usecsDelivered, claimMade,
@@ -257,7 +261,7 @@ SReceiveReady ==
                     claimRejected, startCount, startAfterRelease,
                     revokedEnqueued, revokedConsumed, beginConsumed,
                     claimAfterRevokeQueued, claimRejectedAfterFence,
-                    s2f, s2d, c2f, nextF2SSeq, sfLive, sdLive>>
+                    s2f, s2d, c2f, sfLive, sdLive>>
 
 SQueueUseCS(a) ==
     /\ a \in Assignments
@@ -267,7 +271,7 @@ SQueueUseCS(a) ==
         \/ (MutantUseCSBeforeReady
             /\ phase[a] \in {"PrepareQueued", "Prepared"}))
     /\ phase' = [phase EXCEPT ![a] = "UseCSQueued"]
-    /\ s2d' = Append(s2d, Msg("USECS", a, 0))
+    /\ s2d' = Append(s2d, Msg("USECS", a))
     /\ UNCHANGED <<fState, schedulerReservation, workerSlot, released,
                     releaseCause, terminalCount, readySeen, usecsDelivered,
                     claimMade, claimExact, claimedWire, claimedFull,
@@ -275,7 +279,7 @@ SQueueUseCS(a) ==
                     startAfterRelease, revokedEnqueued, revokedConsumed,
                     beginConsumed, claimAfterRevokeQueued,
                     claimRejectedAfterFence, s2f, f2s, c2f,
-                    nextF2SSeq, lastF2SConsumed, sfLive, sdLive>>
+                    f2sBypassObserved, sfLive, sdLive>>
 
 (***************************************************************************
 A complete UseCS frame cannot be retracted from an independent stream.  Its
@@ -302,7 +306,7 @@ DReceiveUseCS ==
                     claimRejected, startCount, startAfterRelease,
                     revokedEnqueued, revokedConsumed, beginConsumed,
                     claimAfterRevokeQueued, claimRejectedAfterFence,
-                    s2f, f2s, nextF2SSeq, lastF2SConsumed, sfLive, sdLive>>
+                    s2f, f2s, f2sBypassObserved, sfLive, sdLive>>
 
 FClaimExact ==
     /\ sfLive
@@ -331,7 +335,7 @@ FClaimExact ==
                     terminalCount, readySeen, usecsDelivered, claimRejected,
                     startCount, startAfterRelease, revokedEnqueued,
                     revokedConsumed, beginConsumed, claimRejectedAfterFence,
-                    s2f, f2s, s2d, nextF2SSeq, lastF2SConsumed,
+                    s2f, f2s, s2d, f2sBypassObserved,
                     sfLive, sdLive>>
 
 FClaimLegacy ==
@@ -360,7 +364,7 @@ FClaimLegacy ==
                     terminalCount, readySeen, usecsDelivered, claimRejected,
                     startCount, startAfterRelease, revokedEnqueued,
                     revokedConsumed, beginConsumed, claimRejectedAfterFence,
-                    s2f, f2s, s2d, nextF2SSeq, lastF2SConsumed,
+                    s2f, f2s, s2d, f2sBypassObserved,
                     sfLive, sdLive>>
 
 FRejectClaimFenced ==
@@ -379,7 +383,7 @@ FRejectClaimFenced ==
                     claimedFull, claimedToken, startCount, startAfterRelease,
                     revokedEnqueued, revokedConsumed, beginConsumed,
                     claimAfterRevokeQueued, s2f, f2s, s2d,
-                    nextF2SSeq, lastF2SConsumed, sfLive, sdLive>>
+                    f2sBypassObserved, sfLive, sdLive>>
 
 FRejectUnknownClaim ==
     /\ sfLive
@@ -397,7 +401,7 @@ FRejectUnknownClaim ==
                     claimedFull, claimedToken, startCount, startAfterRelease,
                     revokedEnqueued, revokedConsumed, beginConsumed,
                     claimAfterRevokeQueued, claimRejectedAfterFence,
-                    s2f, f2s, s2d, nextF2SSeq, lastF2SConsumed,
+                    s2f, f2s, s2d, f2sBypassObserved,
                     sfLive, sdLive>>
 
 (***************************************************************************
@@ -430,7 +434,7 @@ FDefaultAllowUnknownClaim ==
                     terminalCount, readySeen, usecsDelivered, claimRejected,
                     revokedEnqueued, revokedConsumed, beginConsumed,
                     claimAfterRevokeQueued, claimRejectedAfterFence,
-                    s2f, f2s, s2d, nextF2SSeq, lastF2SConsumed,
+                    s2f, f2s, s2d, f2sBypassObserved,
                     sfLive, sdLive>>
 
 FStart(a) ==
@@ -440,15 +444,14 @@ FStart(a) ==
     /\ Len(f2s) < MaxF2S
     /\ fState' = [fState EXCEPT ![a] = "Started"]
     /\ startCount' = [startCount EXCEPT ![a] = @ + 1]
-    /\ f2s' = Append(f2s, Msg("BEGIN", a, nextF2SSeq))
-    /\ nextF2SSeq' = nextF2SSeq + 1
+    /\ f2s' = Append(f2s, Msg("BEGIN", a))
     /\ UNCHANGED <<phase, schedulerReservation, workerSlot, released,
                     releaseCause, terminalCount, readySeen, usecsDelivered,
                     claimMade, claimExact, claimedWire, claimedFull,
                     claimedToken, claimRejected, startAfterRelease,
                     revokedEnqueued, revokedConsumed, beginConsumed,
                     claimAfterRevokeQueued, claimRejectedAfterFence,
-                    s2f, s2d, c2f, lastF2SConsumed, sfLive, sdLive>>
+                    s2f, s2d, c2f, f2sBypassObserved, sfLive, sdLive>>
 
 SReceiveBegin ==
     /\ sfLive
@@ -461,7 +464,8 @@ SReceiveBegin ==
                 THEN phase
                 ELSE [phase EXCEPT ![a] = "Started"]
           /\ beginConsumed' = [beginConsumed EXCEPT ![a] = TRUE]
-    /\ lastF2SConsumed' = ChosenF2S.seq
+    /\ f2sBypassObserved' =
+          (f2sBypassObserved \/ (ChosenF2SIndex # 1))
     /\ f2s' = RemoveAt(f2s, ChosenF2SIndex)
     /\ UNCHANGED <<fState, schedulerReservation, workerSlot, released,
                     releaseCause, terminalCount, readySeen, usecsDelivered,
@@ -469,7 +473,7 @@ SReceiveBegin ==
                     claimedToken, claimRejected, startCount,
                     startAfterRelease, revokedEnqueued, revokedConsumed,
                     claimAfterRevokeQueued, claimRejectedAfterFence,
-                    s2f, s2d, c2f, nextF2SSeq, sfLive, sdLive>>
+                    s2f, s2d, c2f, sfLive, sdLive>>
 
 SQueueRevoke(a) ==
     /\ a \in Assignments
@@ -479,7 +483,7 @@ SQueueRevoke(a) ==
                       "DeliveryUncertain", "Claimed"}
     /\ Len(s2f) < MaxS2F
     /\ phase' = [phase EXCEPT ![a] = "RevokeQueued"]
-    /\ s2f' = Append(s2f, Msg("REVOKE", a, 0))
+    /\ s2f' = Append(s2f, Msg("REVOKE", a))
     /\ UNCHANGED <<fState, schedulerReservation, workerSlot, released,
                     releaseCause, terminalCount, readySeen, usecsDelivered,
                     claimMade, claimExact, claimedWire, claimedFull,
@@ -487,7 +491,7 @@ SQueueRevoke(a) ==
                     startAfterRelease, revokedEnqueued, revokedConsumed,
                     beginConsumed, claimAfterRevokeQueued,
                     claimRejectedAfterFence, f2s, s2d, c2f,
-                    nextF2SSeq, lastF2SConsumed, sfLive, sdLive>>
+                    f2sBypassObserved, sfLive, sdLive>>
 
 FReceiveRevokeReserved ==
     /\ sfLive
@@ -518,14 +522,13 @@ FReceiveRevokeReserved ==
                  THEN [terminalCount EXCEPT ![a] = @ + 1]
                  ELSE terminalCount
           /\ revokedEnqueued' = [revokedEnqueued EXCEPT ![a] = TRUE]
-          /\ f2s' = Append(f2s, Msg("REVOKED", a, nextF2SSeq))
+          /\ f2s' = Append(f2s, Msg("REVOKED", a))
     /\ s2f' = Tail(s2f)
-    /\ nextF2SSeq' = nextF2SSeq + 1
     /\ UNCHANGED <<readySeen, usecsDelivered, claimMade, claimExact,
                     claimedWire, claimedFull, claimedToken, claimRejected,
                     startCount, startAfterRelease, revokedConsumed,
                     beginConsumed, claimAfterRevokeQueued,
-                    claimRejectedAfterFence, s2d, c2f, lastF2SConsumed,
+                    claimRejectedAfterFence, s2d, c2f, f2sBypassObserved,
                     sfLive, sdLive>>
 
 (***************************************************************************
@@ -540,16 +543,15 @@ FReceiveRevokeOwned ==
     /\ LET a == s2f[1].assignment
        IN /\ fState[a] \in {"Claimed", "Started"}
           /\ Len(f2s) < MaxF2S
-          /\ f2s' = Append(f2s, Msg("OWNED", a, nextF2SSeq))
+          /\ f2s' = Append(f2s, Msg("OWNED", a))
     /\ s2f' = Tail(s2f)
-    /\ nextF2SSeq' = nextF2SSeq + 1
     /\ UNCHANGED <<phase, fState, schedulerReservation, workerSlot,
                     released, releaseCause, terminalCount, readySeen,
                     usecsDelivered, claimMade, claimExact, claimedWire,
                     claimedFull, claimedToken, claimRejected, startCount,
                     startAfterRelease, revokedEnqueued, revokedConsumed,
                     beginConsumed, claimAfterRevokeQueued,
-                    claimRejectedAfterFence, s2d, c2f, lastF2SConsumed,
+                    claimRejectedAfterFence, s2d, c2f, f2sBypassObserved,
                     sfLive, sdLive>>
 
 (***************************************************************************
@@ -565,16 +567,15 @@ FReceiveRevokeAfterDone ==
        IN /\ fState[a] = "None"
           /\ startCount[a] > 0
           /\ Len(f2s) < MaxF2S
-          /\ f2s' = Append(f2s, Msg("OWNED", a, nextF2SSeq))
+          /\ f2s' = Append(f2s, Msg("OWNED", a))
     /\ s2f' = Tail(s2f)
-    /\ nextF2SSeq' = nextF2SSeq + 1
     /\ UNCHANGED <<phase, fState, schedulerReservation, workerSlot,
                     released, releaseCause, terminalCount, readySeen,
                     usecsDelivered, claimMade, claimExact, claimedWire,
                     claimedFull, claimedToken, claimRejected, startCount,
                     startAfterRelease, revokedEnqueued, revokedConsumed,
                     beginConsumed, claimAfterRevokeQueued,
-                    claimRejectedAfterFence, s2d, c2f, lastF2SConsumed,
+                    claimRejectedAfterFence, s2d, c2f, f2sBypassObserved,
                     sfLive, sdLive>>
 
 SReceiveRevoked ==
@@ -604,14 +605,15 @@ SReceiveRevoked ==
                 THEN terminalCount
                 ELSE [terminalCount EXCEPT ![a] = @ + 1]
           /\ revokedConsumed' = [revokedConsumed EXCEPT ![a] = TRUE]
-    /\ lastF2SConsumed' = ChosenF2S.seq
+    /\ f2sBypassObserved' =
+          (f2sBypassObserved \/ (ChosenF2SIndex # 1))
     /\ f2s' = RemoveAt(f2s, ChosenF2SIndex)
     /\ UNCHANGED <<fState, workerSlot, readySeen, usecsDelivered,
                     claimMade, claimExact, claimedWire, claimedFull,
                     claimedToken, claimRejected, startCount,
                     startAfterRelease, revokedEnqueued, beginConsumed,
                     claimAfterRevokeQueued, claimRejectedAfterFence,
-                    s2f, s2d, c2f, nextF2SSeq, sfLive, sdLive>>
+                    s2f, s2d, c2f, sfLive, sdLive>>
 
 SReceiveOwned ==
     /\ sfLive
@@ -625,7 +627,8 @@ SReceiveOwned ==
                 ELSE [phase EXCEPT
                         ![a] = IF fState[a] = "Started"
                                THEN "Started" ELSE "Claimed"]
-    /\ lastF2SConsumed' = ChosenF2S.seq
+    /\ f2sBypassObserved' =
+          (f2sBypassObserved \/ (ChosenF2SIndex # 1))
     /\ f2s' = RemoveAt(f2s, ChosenF2SIndex)
     /\ UNCHANGED <<fState, schedulerReservation, workerSlot, released,
                     releaseCause, terminalCount, readySeen, usecsDelivered,
@@ -633,8 +636,7 @@ SReceiveOwned ==
                     claimedToken, claimRejected, startCount,
                     startAfterRelease, revokedEnqueued, revokedConsumed,
                     beginConsumed, claimAfterRevokeQueued,
-                    claimRejectedAfterFence, s2f, s2d, c2f,
-                    nextF2SSeq, sfLive, sdLive>>
+                    claimRejectedAfterFence, s2f, s2d, c2f, sfLive, sdLive>>
 
 FComplete(a) ==
     /\ a \in Assignments
@@ -642,15 +644,14 @@ FComplete(a) ==
     /\ Len(f2s) < MaxF2S
     /\ fState' = [fState EXCEPT ![a] = "None"]
     /\ workerSlot' = [workerSlot EXCEPT ![a] = FALSE]
-    /\ f2s' = Append(f2s, Msg("DONE", a, nextF2SSeq))
-    /\ nextF2SSeq' = nextF2SSeq + 1
+    /\ f2s' = Append(f2s, Msg("DONE", a))
     /\ UNCHANGED <<phase, schedulerReservation, released, releaseCause,
                     terminalCount, readySeen, usecsDelivered, claimMade,
                     claimExact, claimedWire, claimedFull, claimedToken,
                     claimRejected, startCount, startAfterRelease,
                     revokedEnqueued, revokedConsumed, beginConsumed,
                     claimAfterRevokeQueued, claimRejectedAfterFence,
-                    s2f, s2d, c2f, lastF2SConsumed, sfLive, sdLive>>
+                    s2f, s2d, c2f, f2sBypassObserved, sfLive, sdLive>>
 
 SReceiveDone ==
     /\ sfLive
@@ -677,15 +678,15 @@ SReceiveDone ==
                 IF released[a]
                 THEN terminalCount
                 ELSE [terminalCount EXCEPT ![a] = @ + 1]
-    /\ lastF2SConsumed' = ChosenF2S.seq
+    /\ f2sBypassObserved' =
+          (f2sBypassObserved \/ (ChosenF2SIndex # 1))
     /\ f2s' = RemoveAt(f2s, ChosenF2SIndex)
     /\ UNCHANGED <<fState, workerSlot, readySeen, usecsDelivered,
                     claimMade, claimExact, claimedWire, claimedFull,
                     claimedToken, claimRejected, startCount,
                     startAfterRelease, revokedEnqueued, revokedConsumed,
                     beginConsumed, claimAfterRevokeQueued,
-                    claimRejectedAfterFence, s2f, s2d, c2f,
-                    nextF2SSeq, sfLive, sdLive>>
+                    claimRejectedAfterFence, s2f, s2d, c2f, sfLive, sdLive>>
 
 LoseSFSession ==
     /\ sfLive
@@ -718,8 +719,7 @@ LoseSFSession ==
                     claimedWire, claimedFull, claimedToken, claimRejected,
                     startCount, startAfterRelease, revokedEnqueued,
                     revokedConsumed, beginConsumed, claimAfterRevokeQueued,
-                    claimRejectedAfterFence, s2d, nextF2SSeq,
-                    lastF2SConsumed, sdLive>>
+                    claimRejectedAfterFence, s2d, f2sBypassObserved, sdLive>>
 
 ReconnectSF ==
     /\ ~sfLive
@@ -732,7 +732,7 @@ ReconnectSF ==
                     startAfterRelease, revokedEnqueued, revokedConsumed,
                     beginConsumed, claimAfterRevokeQueued,
                     claimRejectedAfterFence, s2f, f2s, s2d, c2f,
-                    nextF2SSeq, lastF2SConsumed, sdLive>>
+                    f2sBypassObserved, sdLive>>
 
 LoseSDSession ==
     /\ sdLive
@@ -745,7 +745,7 @@ LoseSDSession ==
                     startAfterRelease, revokedEnqueued, revokedConsumed,
                     beginConsumed, claimAfterRevokeQueued,
                     claimRejectedAfterFence, s2f, f2s, c2f,
-                    nextF2SSeq, lastF2SConsumed, sfLive>>
+                    f2sBypassObserved, sfLive>>
 
 ReconnectSD ==
     /\ ~sdLive
@@ -757,7 +757,7 @@ ReconnectSD ==
                     startAfterRelease, revokedEnqueued, revokedConsumed,
                     beginConsumed, claimAfterRevokeQueued,
                     claimRejectedAfterFence, s2f, f2s, s2d, c2f,
-                    nextF2SSeq, lastF2SConsumed, sfLive>>
+                    f2sBypassObserved, sfLive>>
 
 Next ==
     \/ \E a \in Assignments : SPrepare(a)
@@ -814,8 +814,7 @@ TypeOK ==
     /\ f2s \in Seq(MessageType)
     /\ s2d \in Seq(MessageType)
     /\ c2f \in Seq(ClaimType)
-    /\ nextF2SSeq \in Nat \ {0}
-    /\ lastF2SConsumed \in Nat
+    /\ f2sBypassObserved \in BOOLEAN
     /\ sfLive \in BOOLEAN
     /\ sdLive \in BOOLEAN
 
@@ -825,14 +824,30 @@ BufferBound ==
     /\ Len(s2d) <= MaxS2D
     /\ Len(c2f) <= MaxC2F
 
-MessageDirectionOK ==
-    /\ \A m \in SeqElems(s2f) : m.kind \in S2FKinds /\ m.seq = 0
-    /\ \A m \in SeqElems(f2s) : m.kind \in F2SKinds /\ m.seq > 0
-    /\ \A m \in SeqElems(s2d) : m.kind \in S2DKinds /\ m.seq = 0
+(***************************************************************************
+Each queue key is unique while live.  This lets the liveness theorem track a
+concrete queued frame by its finite kind/assignment record after absolute
+sequence history is quotient-reduced.  Reuse is permitted only after a state
+in which the prior key is absent.
+***************************************************************************)
+QueueEntriesUnique ==
+    /\ Cardinality(SeqElems(s2f)) = Len(s2f)
+    /\ Cardinality(SeqElems(f2s)) = Len(f2s)
+    /\ Cardinality(SeqElems(s2d)) = Len(s2d)
+    /\ Cardinality(SeqElems(c2f)) = Len(c2f)
 
-F2SStrictlyIncreasing ==
-    /\ \A i, j \in 1..Len(f2s) : i < j => f2s[i].seq < f2s[j].seq
-    /\ \A m \in SeqElems(f2s) : m.seq > lastF2SConsumed
+MessageDirectionOK ==
+    /\ \A m \in SeqElems(s2f) : m.kind \in S2FKinds
+    /\ \A m \in SeqElems(f2s) : m.kind \in F2SKinds
+    /\ \A m \in SeqElems(s2d) : m.kind \in S2DKinds
+
+(***************************************************************************
+The fixed transition relation always consumes index 1.  The mutant consumes
+index 2 when available, which makes this monotone observer true immediately.
+The historical operator name is retained so the existing matrix row and trace
+contract remain stable while the state representation is quotient-reduced.
+***************************************************************************)
+F2SStrictlyIncreasing == ~f2sBypassObserved
 
 WorkerSlotCoherence ==
     \A a \in Assignments :
@@ -892,6 +907,7 @@ TerminalCoherence ==
 SafetyInvariant ==
     /\ TypeOK
     /\ BufferBound
+    /\ QueueEntriesUnique
     /\ MessageDirectionOK
     /\ F2SStrictlyIncreasing
     /\ WorkerSlotCoherence
@@ -945,11 +961,36 @@ FencedLivenessSpec ==
     /\ WF_vars(DrainS2D)
     /\ WF_vars(DrainC2F)
 
+MessageQueued(q, kind, assignment) ==
+    \E i \in 1..Len(q) :
+        /\ q[i].kind = kind
+        /\ q[i].assignment = assignment
+
+ClaimQueued(assignment, exact) ==
+    \E i \in 1..Len(c2f) :
+        /\ c2f[i].assignment = assignment
+        /\ c2f[i].exact = exact
+
+(***************************************************************************
+A queue need not become globally empty when new work keeps arriving.  The
+load-bearing progress property is instead per finite queue key: every concrete
+kind/assignment frame that is present eventually becomes absent, or its link
+is lost. QueueEntriesUnique makes this equivalent to consuming that frame;
+a later reuse must pass through an observable absent state.
+***************************************************************************)
 NoPermanentQueuedFrame ==
-    /\ [](Len(s2f) > 0 /\ sfLive => <> (Len(s2f) = 0 \/ ~sfLive))
-    /\ [](Len(f2s) > 0 /\ sfLive => <> (Len(f2s) = 0 \/ ~sfLive))
-    /\ [](Len(s2d) > 0 /\ sdLive => <> (Len(s2d) = 0 \/ ~sdLive))
-    /\ [](Len(c2f) > 0 /\ sfLive => <> (Len(c2f) = 0 \/ ~sfLive))
+    /\ \A kind \in S2FKinds, a \in Assignments :
+          [](MessageQueued(s2f, kind, a) /\ sfLive
+             => <> (~MessageQueued(s2f, kind, a) \/ ~sfLive))
+    /\ \A kind \in F2SKinds, a \in Assignments :
+          [](MessageQueued(f2s, kind, a) /\ sfLive
+             => <> (~MessageQueued(f2s, kind, a) \/ ~sfLive))
+    /\ \A kind \in S2DKinds, a \in Assignments :
+          [](MessageQueued(s2d, kind, a) /\ sdLive
+             => <> (~MessageQueued(s2d, kind, a) \/ ~sdLive))
+    /\ \A a \in Assignments, exact \in BOOLEAN :
+          [](ClaimQueued(a, exact) /\ sfLive
+             => <> (~ClaimQueued(a, exact) \/ ~sfLive))
 
 FirstWorker == CHOOSE w \in Workers : TRUE
 OtherWorker == CHOOSE w \in Workers : w # FirstWorker

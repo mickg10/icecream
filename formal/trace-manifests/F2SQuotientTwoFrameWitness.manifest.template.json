@@ -1,0 +1,58 @@
+{
+  "schema": 1,
+  "scenario": "F2SQuotientTwoFrameWitness",
+  "property": "NoTwoFrameQueue",
+  "expected_result": "counterexample",
+  "min_states": 3,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "EnqueueFirstFrame",
+      "all": [
+        {"path": "enqueueCount", "from": 0, "to": 1},
+        {"path": "nextSequence", "from": 0, "to": 1},
+        {"path": "consumeCount", "to": 0},
+        {"path": "abstractLastIndex", "to": 0},
+        {"path": "concreteLastIndex", "to": 0}
+      ]
+    },
+    {
+      "name": "EnqueueSecondFrame",
+      "all": [
+        {"path": "enqueueCount", "from": 1, "to": 2},
+        {"path": "nextSequence", "from": 1, "to": 2},
+        {"path": "consumeCount", "to": 0},
+        {"path": "abstractLastIndex", "to": 0},
+        {"path": "concreteLastIndex", "to": 0}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "EnqueueFirstFrame",
+    "EnqueueSecondFrame"
+  ],
+  "final_all": [
+    {"path": "enqueueCount", "eq": 2},
+    {"path": "nextSequence", "eq": 2},
+    {"path": "consumeCount", "eq": 0},
+    {"path": "abstractLastIndex", "eq": 0},
+    {"path": "concreteLastIndex", "eq": 0}
+  ],
+  "harness_steps": [
+    {
+      "after": "EnqueueFirstFrame",
+      "emit": "enqueue_first_f2s_payload_with_absolute_sequence",
+      "actor": "formal-controller"
+    },
+    {
+      "after": "EnqueueSecondFrame",
+      "emit": "assert_concrete_and_quotient_queues_both_reach_depth_two",
+      "actor": "formal-controller"
+    }
+  ],
+  "metadata": {
+    "module": "F2SQuotientSimulation",
+    "config": "F2SQuotientTwoFrameWitness.cfg",
+    "purpose": "The fixed projection check is nonvacuous at the depth required to distinguish FIFO from index-two bypass."
+  }
+}

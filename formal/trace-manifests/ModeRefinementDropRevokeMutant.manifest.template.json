@@ -1,0 +1,68 @@
+{
+  "schema": 1,
+  "scenario": "ModeRefinementDropRevokeMutant",
+  "property": "AbstractionRelation",
+  "expected_result": "counterexample",
+  "min_states": 4,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "QueuePrepareAbstractAwaiting",
+      "all": [
+        {"path": "prepareQueued", "from": false, "to": true},
+        {"path": "abstractState", "from": "Idle", "to": "Awaiting"},
+        {"path": "revoked", "to": false},
+        {"path": "started", "to": false}
+      ]
+    },
+    {
+      "name": "QueueOrderedRevoke",
+      "all": [
+        {"path": "revokeQueued", "from": false, "to": true},
+        {"path": "abstractState", "to": "Awaiting"},
+        {"path": "revoked", "to": false},
+        {"path": "matched", "to": false},
+        {"path": "started", "to": false}
+      ]
+    },
+    {
+      "name": "ConcreteRevokeWithoutAbstractTransition",
+      "all": [
+        {"path": "revokeQueued", "from": true, "to": false},
+        {"path": "revoked", "from": false, "to": true},
+        {"path": "abstractState", "from": "Awaiting", "to": "Awaiting"},
+        {"path": "matched", "to": false},
+        {"path": "started", "to": false}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "QueuePrepareAbstractAwaiting",
+    "QueueOrderedRevoke",
+    "ConcreteRevokeWithoutAbstractTransition"
+  ],
+  "final_all": [
+    {"path": "revoked", "eq": true},
+    {"path": "matched", "eq": false},
+    {"path": "started", "eq": false},
+    {"path": "abstractState", "eq": "Awaiting"}
+  ],
+  "harness_steps": [
+    {
+      "after": "QueueOrderedRevoke",
+      "emit": "place_revoke_at_ordered_stream_head",
+      "actor": "scheduler"
+    },
+    {
+      "after": "ConcreteRevokeWithoutAbstractTransition",
+      "emit": "assert_concrete_fence_was_hidden_from_abstract_state",
+      "actor": "refinement-observer"
+    }
+  ],
+  "metadata": {
+    "module": "AssignmentFenceModeRefinement",
+    "config": "ModeRefinementDropRevokeMutant.cfg",
+    "mode": "PipelinedEnforcing",
+    "mutant": "MutantDropRevoke = TRUE"
+  }
+}

@@ -1,0 +1,65 @@
+{
+  "schema": 1,
+  "scenario": "F2SQuotientBypassMutant",
+  "property": "NoBypassObserved",
+  "expected_result": "counterexample",
+  "min_states": 4,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "EnqueueFirstFrame",
+      "all": [
+        {"path": "enqueueCount", "from": 0, "to": 1},
+        {"path": "nextSequence", "from": 0, "to": 1},
+        {"path": "consumeCount", "to": 0}
+      ]
+    },
+    {
+      "name": "EnqueueSecondFrame",
+      "all": [
+        {"path": "enqueueCount", "from": 1, "to": 2},
+        {"path": "nextSequence", "from": 1, "to": 2},
+        {"path": "consumeCount", "to": 0}
+      ]
+    },
+    {
+      "name": "ConsumeIndexTwo",
+      "all": [
+        {"path": "consumeCount", "from": 0, "to": 1},
+        {"path": "abstractLastIndex", "from": 0, "to": 2},
+        {"path": "concreteLastIndex", "from": 0, "to": 2},
+        {"path": "enqueueCount", "to": 2},
+        {"path": "nextSequence", "to": 2}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "EnqueueFirstFrame",
+    "EnqueueSecondFrame",
+    "ConsumeIndexTwo"
+  ],
+  "final_all": [
+    {"path": "enqueueCount", "eq": 2},
+    {"path": "consumeCount", "eq": 1},
+    {"path": "abstractLastIndex", "eq": 2},
+    {"path": "concreteLastIndex", "eq": 2}
+  ],
+  "harness_steps": [
+    {
+      "after": "EnqueueSecondFrame",
+      "emit": "hold_two_f2s_payloads_in_concrete_and_quotient_queues",
+      "actor": "formal-controller"
+    },
+    {
+      "after": "ConsumeIndexTwo",
+      "emit": "assert_index_two_bypass_is_observed_on_both_sides",
+      "actor": "formal-controller"
+    }
+  ],
+  "metadata": {
+    "module": "F2SQuotientSimulation",
+    "config": "F2SQuotientBypassMutant.cfg",
+    "mutant": "MutantBypass = TRUE",
+    "purpose": "The finite quotient retains the relative-order distinction needed to kill a non-FIFO consume."
+  }
+}

@@ -1,0 +1,60 @@
+{
+  "schema": 1,
+  "scenario": "P49PipelinedUnboundedPending",
+  "property": "PendingBound",
+  "expected_result": "counterexample",
+  "min_states": 6,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "GrowPendingTable",
+      "all": [
+        {
+          "path": "pendingCount",
+          "delta": 1
+        },
+        {
+          "path": "prepared",
+          "to": false
+        }
+      ]
+    },
+    {
+      "name": "ExceedPendingLimit",
+      "all": [
+        {
+          "path": "pendingCount",
+          "from": 2,
+          "to": 3
+        },
+        {
+          "path": "prepared",
+          "to": false
+        }
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "GrowPendingTable",
+    "GrowPendingTable",
+    "ExceedPendingLimit"
+  ],
+  "final_all": [
+    {
+      "path": "pendingCount",
+      "eq": 3
+    }
+  ],
+  "harness_steps": [
+    {
+      "after": "ExceedPendingLimit",
+      "emit": "assert_pending_claim_table_exceeded_negotiated_bound",
+      "actor": "fulfillment-daemon"
+    }
+  ],
+  "metadata": {
+    "module": "AssignmentFenceAdmissionModes",
+    "config": "P49PipelinedUnboundedPending.cfg",
+    "max_pending": 2
+  }
+}
