@@ -191,7 +191,6 @@ public:
     std::vector<ImmutableObject> build_fill(const Need& need) const;
     void accept_commit(const TxCommit& committed,
                        ActionType action = ActionType::COMMIT_ACCEPTED);
-    void abandon_active();
 
     [[nodiscard]] const std::optional<CActiveTx>& active() const { return active_; }
     [[nodiscard]] const CStoreGuid& c_store_guid() const { return authority_.guid(); }
@@ -202,6 +201,7 @@ public:
 
 private:
     friend ReconnectResult reconnect(CRoute&, FStore&, HistoryNonce);
+    void abandon_active();
     void reset_history(FStoreGuid f_store_guid, HistoryNonce history_nonce);
     void record(ActionType action, const CActiveTx& active);
 
