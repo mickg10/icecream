@@ -795,6 +795,42 @@ def report(output: Path, binaries: dict[str, Path]) -> None:
     lines.extend(
         [
             "",
+            "## Physical phase breakdown",
+            "",
+            "All values below are decimal MB over the cold build plus four warm builds.",
+            "A dash means that the codec has no such phase.",
+            "",
+            "| policy | codec | Root | LINES | Fill | close | Need | Ack | GRZ frame |",
+            "|---|---|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    phase_columns = (
+        ("c_to_f:p29-root", "p29"),
+        ("c_to_f:p29-lines", "p29"),
+        ("c_to_f:p29-fill", "p29"),
+        ("c_to_f:p29-close", "p29"),
+        ("f_to_c:p29-need", "p29"),
+        ("f_to_c:p29-ack", "p29"),
+        ("c_to_f:grz-current-tu-frame", "grz"),
+    )
+    for row in rows:
+        values = []
+        for phase, owner in phase_columns:
+            values.append(
+                decimal_mb(row["phase_bytes"].get(phase, 0))
+                if row["codec"] == owner
+                else "—"
+            )
+        lines.append(
+            "| {policy} | {codec} | {values} |".format(
+                policy=row["policy"],
+                codec=row["codec"].upper(),
+                values=" | ".join(values),
+            )
+        )
+    lines.extend(
+        [
+            "",
             "## Interpretation boundary",
             "",
             "The time columns cover exact source-dialogue network behavior plus the existing",
