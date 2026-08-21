@@ -9,10 +9,21 @@ from pathlib import Path
 
 
 ACTIONS = {
-    "SESSION_OPENED", "SESSION_REPLACED", "SESSION_DISCONNECTED", "HISTORY_RESET",
-    "TX_BEGIN", "TX_ABORTED", "DICT_COMPLETE", "BODY_COMPLETE", "NEED_RECORDED",
-    "OBJECT_APPLIED", "INPUT_MATERIALIZED", "INPUT_COMMITTED", "COMMIT_ACCEPTED",
-    "ACTIVE_REPLAYED", "LOST_COMMIT_ACCEPTED",
+    "SESSION_OPENED",
+    "SESSION_REPLACED",
+    "SESSION_DISCONNECTED",
+    "HISTORY_RESET",
+    "TX_BEGIN",
+    "TX_ABORTED",
+    "DICT_COMPLETE",
+    "BODY_COMPLETE",
+    "NEED_RECORDED",
+    "OBJECT_APPLIED",
+    "INPUT_MATERIALIZED",
+    "INPUT_COMMITTED",
+    "COMMIT_ACCEPTED",
+    "ACTIVE_REPLAYED",
+    "LOST_COMMIT_ACCEPTED",
 }
 
 
@@ -23,23 +34,51 @@ def check(path: Path) -> None:
         return {
             "c": {"cursor": None, "active": None},
             "f": {
-                "connected": False, "session": 0, "route": None,
-                "pending": None, "dict": False, "body": False,
-                "need": False, "requested": set(), "remaining": set(),
-                "materialized": False, "last_commit": None,
-                "commit_unacknowledged": False, "commit_disconnected": False,
+                "connected": False,
+                "session": 0,
+                "route": None,
+                "pending": None,
+                "dict": False,
+                "body": False,
+                "need": False,
+                "requested": set(),
+                "remaining": set(),
+                "materialized": False,
+                "last_commit": None,
+                "commit_unacknowledged": False,
+                "commit_disconnected": False,
                 "installed": {},
             },
         }
 
     def identity(row: dict) -> tuple:
-        return (row["history_nonce"], row["rel_seq"], row["tu_seq"],
-                row["transaction_digest"], row["raw_digest"])
+        return (
+            row["history_nonce"],
+            row["rel_seq"],
+            row["tu_seq"],
+            row["transaction_digest"],
+            row["raw_digest"],
+        )
 
     def clear_f_pending(f: dict) -> None:
-        f.update({"pending": None, "dict": False, "body": False,
-                  "need": False, "requested": set(), "remaining": set(),
-                  "materialized": False})
+        f.update(
+            {
+                "pending": None,
+                "dict": False,
+                "body": False,
+                "need": False,
+                "requested": set(),
+                "remaining": set(),
+                "materialized": False,
+            }
+        )
+
+    def current_f_session(row: dict, f: dict) -> bool:
+        return (
+            row["actor"] == "F"
+            and f["connected"]
+            and row["session_serial"] == f["session"]
+        )
 
     for index, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         row = json.loads(line)
@@ -50,7 +89,8 @@ def check(path: Path) -> None:
         if actor not in {"C", "F"}:
             raise ValueError(f"line {index}: unknown actor {actor!r}")
         relationship = relationships.setdefault(
-            (row["c_store_guid"], row["f_store_guid"]), new_relationship())
+            (row["c_store_guid"], row["f_store_guid"]), new_relationship()
+        )
         c = relationship["c"]
         f = relationship["f"]
         tx = identity(row)
@@ -64,15 +104,19 @@ def check(path: Path) -> None:
             f["session"] = row["session_serial"]
             clear_f_pending(f)
         elif action == "SESSION_DISCONNECTED":
-            if actor != "F" or not f["connected"] or row["session_serial"] != f["session"]:
+            if not current_f_session(row, f):
                 raise ValueError(f"line {index}: disconnect without current F session")
             f["connected"] = False
             if f["commit_unacknowledged"]:
                 f["commit_disconnected"] = True
             clear_f_pending(f)
         elif action == "HISTORY_RESET":
-            if (actor != "F" or not f["connected"] or f["pending"] is not None or
-                    c["active"] is not None or f["commit_unacknowledged"]):
+            if (
+                not current_f_session(row, f)
+                or f["pending"] is not None
+                or c["active"] is not None
+                or f["commit_unacknowledged"]
+            ):
                 raise ValueError(f"line {index}: F history reset at the wrong boundary")
             if f["route"] is not None and row["history_nonce"] == f["route"][0]:
                 raise ValueError(f"line {index}: HISTORY_NONCE was reused")
@@ -87,52 +131,84 @@ def check(path: Path) -> None:
                 cursor = c["cursor"]
                 if cursor is None or row["history_nonce"] != cursor[0]:
                     if row["rel_seq"] != 0:
-                        raise ValueError(f"line {index}: new C history did not start at zero")
-                    c["cursor"] = (row["history_nonce"], row["rel_seq"],
-                                   row["state_digest"])
+                        raise ValueError(
+                            f"line {index}: new C history did not start at zero"
+                        )
+                    c["cursor"] = (
+                        row["history_nonce"],
+                        row["rel_seq"],
+                        row["state_digest"],
+                    )
                 elif (row["rel_seq"], row["state_digest"]) != (cursor[1], cursor[2]):
                     raise ValueError(f"line {index}: C TX_BEGIN missed its cursor")
                 c["active"] = tx
             else:
-                if not f["connected"] or f["route"] is None or f["pending"] is not None:
+                if (
+                    not current_f_session(row, f)
+                    or f["route"] is None
+                    or f["pending"] is not None
+                ):
                     raise ValueError(f"line {index}: F TX_BEGIN at the wrong boundary")
                 if c["active"] != tx:
-                    raise ValueError(f"line {index}: F TX_BEGIN does not match C active")
-                if (row["history_nonce"], row["rel_seq"], row["state_digest"]) != f["route"]:
+                    raise ValueError(
+                        f"line {index}: F TX_BEGIN does not match C active"
+                    )
+                if (row["history_nonce"], row["rel_seq"], row["state_digest"]) != f[
+                    "route"
+                ]:
                     raise ValueError(f"line {index}: F TX_BEGIN missed its cursor")
                 clear_f_pending(f)
                 f["pending"] = tx
         elif action == "ACTIVE_REPLAYED":
-            if (actor != "F" or not f["connected"] or f["route"] is None or
-                    f["pending"] is not None or c["active"] != tx or
-                    (row["history_nonce"], row["rel_seq"], row["state_digest"]) != f["route"]):
+            if (
+                not current_f_session(row, f)
+                or f["route"] is None
+                or f["pending"] is not None
+                or c["active"] != tx
+                or (row["history_nonce"], row["rel_seq"], row["state_digest"])
+                != f["route"]
+            ):
                 raise ValueError(f"line {index}: replay does not match C/F state")
             clear_f_pending(f)
             f["pending"] = tx
         elif action == "TX_ABORTED":
             if actor != "C" or c["active"] != tx:
                 raise ValueError(f"line {index}: abort does not match C active")
+            if f["pending"] is not None:
+                raise ValueError(f"line {index}: C abort while F pending")
+            if f["commit_unacknowledged"]:
+                raise ValueError(f"line {index}: C abort before F commit acceptance")
             c["active"] = None
         elif action == "DICT_COMPLETE":
-            if actor != "F" or f["pending"] != tx or f["dict"]:
+            if not current_f_session(row, f) or f["pending"] != tx or f["dict"]:
                 raise ValueError(f"line {index}: DICT does not match F pending")
             f["dict"] = True
         elif action == "NEED_RECORDED":
             keys = row["need_keys"]
-            if (actor != "F" or f["pending"] != tx or not f["dict"] or f["need"] or
-                    keys != sorted(set(keys)) or row["remaining_need"] != len(keys)):
+            if (
+                not current_f_session(row, f)
+                or f["pending"] != tx
+                or not f["dict"]
+                or f["need"]
+                or keys != sorted(set(keys))
+                or row["remaining_need"] != len(keys)
+            ):
                 raise ValueError(f"line {index}: Need precedes exact DICT")
             f["need"] = True
             f["requested"] = set(keys)
             f["remaining"] = set(keys)
         elif action == "BODY_COMPLETE":
-            if actor != "F" or f["pending"] != tx or f["body"]:
+            if not current_f_session(row, f) or f["pending"] != tx or f["body"]:
                 raise ValueError(f"line {index}: BODY does not match F pending")
             f["body"] = True
         elif action == "OBJECT_APPLIED":
             key = row["key64"]
-            if (actor != "F" or f["pending"] != tx or not f["need"] or
-                    key not in f["requested"]):
+            if (
+                not current_f_session(row, f)
+                or f["pending"] != tx
+                or not f["need"]
+                or key not in f["requested"]
+            ):
                 raise ValueError(f"line {index}: object is outside recorded Need")
             old_content = f["installed"].get(key)
             if old_content is not None and old_content != row["content_digest"]:
@@ -140,36 +216,57 @@ def check(path: Path) -> None:
             f["installed"][key] = row["content_digest"]
             first = key in f["remaining"]
             if first == row["duplicate"]:
-                raise ValueError(f"line {index}: duplicate marker disagrees with Need state")
+                raise ValueError(
+                    f"line {index}: duplicate marker disagrees with Need state"
+                )
             f["remaining"].discard(key)
             if row["remaining_need"] != len(f["remaining"]):
                 raise ValueError(f"line {index}: object changed exact Need incorrectly")
         elif action == "INPUT_MATERIALIZED":
-            if (actor != "F" or f["pending"] != tx or
-                    not (f["dict"] and f["body"] and f["need"]) or
-                    f["remaining"] or f["materialized"]):
-                raise ValueError(f"line {index}: input materialized before exact closure")
+            if (
+                not current_f_session(row, f)
+                or f["pending"] != tx
+                or not (f["dict"] and f["body"] and f["need"])
+                or f["remaining"]
+                or f["materialized"]
+            ):
+                raise ValueError(
+                    f"line {index}: input materialized before exact closure"
+                )
             f["materialized"] = True
         elif action == "INPUT_COMMITTED":
-            if actor != "F" or f["pending"] != tx or not f["materialized"]:
+            if (
+                not current_f_session(row, f)
+                or f["pending"] != tx
+                or not f["materialized"]
+            ):
                 raise ValueError(f"line {index}: F commit lacks exact materialization")
             f["last_commit"] = tx
             f["commit_unacknowledged"] = True
             f["commit_disconnected"] = False
             clear_f_pending(f)
-            f["route"] = (row["history_nonce"], row["rel_seq"] + 1,
-                          row["state_digest"])
+            f["route"] = (row["history_nonce"], row["rel_seq"] + 1, row["state_digest"])
         elif action in {"COMMIT_ACCEPTED", "LOST_COMMIT_ACCEPTED"}:
-            if (actor != "C" or c["active"] != tx or f["last_commit"] != tx or
-                    f["route"] is None or row["state_digest"] != f["route"][2]):
+            if (
+                actor != "C"
+                or c["active"] != tx
+                or f["last_commit"] != tx
+                or f["route"] is None
+                or row["state_digest"] != f["route"][2]
+            ):
                 raise ValueError(f"line {index}: C acceptance lacks matching F commit")
-            if (not f["commit_unacknowledged"] or
-                    (action == "COMMIT_ACCEPTED" and f["commit_disconnected"]) or
-                    (action == "LOST_COMMIT_ACCEPTED" and not f["commit_disconnected"])):
+            if (
+                not f["commit_unacknowledged"]
+                or (action == "COMMIT_ACCEPTED" and f["commit_disconnected"])
+                or (action == "LOST_COMMIT_ACCEPTED" and not f["commit_disconnected"])
+            ):
                 raise ValueError(f"line {index}: wrong normal/lost acceptance path")
             c["active"] = None
-            c["cursor"] = (row["history_nonce"], row["rel_seq"] + 1,
-                           row["state_digest"])
+            c["cursor"] = (
+                row["history_nonce"],
+                row["rel_seq"] + 1,
+                row["state_digest"],
+            )
             f["commit_unacknowledged"] = False
             f["commit_disconnected"] = False
 
