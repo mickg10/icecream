@@ -22,6 +22,10 @@ EXTRA_DIST = \
 	formal/Protocol50JobLifecycle.cfg \
 	formal/Protocol50JobLeaseMutant.cfg \
 	formal/Protocol50JobLifecycle.md \
+	formal/Protocol50IncarnationBridge.tla \
+	formal/Protocol50IncarnationBridge.cfg \
+	formal/Protocol50IncarnationMutant.cfg \
+	formal/Protocol50IncarnationProgress.cfg \
 	formal/run_tlc.sh \
 	formal/.gitignore \
 	formal/check_trace.py \
