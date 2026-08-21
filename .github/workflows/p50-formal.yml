@@ -7,6 +7,12 @@ on:
     paths:
       - 'cache/formal/**'
       - '.github/workflows/p50-formal.yml'
+  pull_request:
+    branches:
+      - implementer/issue16-p50-vertical
+    paths:
+      - 'cache/formal/**'
+      - '.github/workflows/p50-formal.yml'
   workflow_dispatch:
 
 permissions:
