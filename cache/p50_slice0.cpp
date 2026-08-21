@@ -780,12 +780,14 @@ std::vector<ObjectApplied> FStore::append_fill(SessionHandle session,
     Namespace& space = require_namespace(session);
     if (!space.route || !space.route->pending)
         throw std::logic_error("FILL has no F ACTIVE_TX");
+    Namespace::FPending& pending = *space.route->pending;
     const std::vector<FillRecord> records =
-        space.route->pending->partial_fill.push(message);
+        pending.partial_fill.push(message);
     std::vector<ObjectApplied> result;
     result.reserve(records.size());
     for (const FillRecord& record : records)
         result.push_back(apply_object(session, ImmutableObject::from_record(record)));
+    if (pending.remaining.empty()) pending.partial_fill.finish();
     return result;
 }
 
@@ -801,6 +803,7 @@ std::vector<uint8_t> FStore::materialize_and_verify(SessionHandle session) {
     if (!space.route || !space.route->pending)
         throw std::logic_error("F route has no ACTIVE_TX to materialize");
     Namespace::FPending& pending = *space.route->pending;
+    pending.partial_fill.finish();
     if (!pending.dict_complete || !pending.body_complete || !pending.remaining.empty())
         throw std::logic_error("input cannot materialize before DICT, BODY, and Need finish");
     if (pending.materialized)
