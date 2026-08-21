@@ -51,8 +51,10 @@ run_expected_failure() {
 mkdir -p "$TLC_STATE_ROOT"
 run_pass cache Protocol50.tla Protocol50.cfg
 run_pass job Protocol50JobLifecycle.tla Protocol50JobLifecycle.cfg
+run_pass reconnect Protocol50Reconnect.tla Protocol50Reconnect.cfg
 run_pass incarnation Protocol50IncarnationBridge.tla Protocol50IncarnationBridge.cfg
 run_pass incarnation-progress Protocol50IncarnationBridge.tla Protocol50IncarnationProgress.cfg
+
 run_expected_failure abort-mutant Protocol50.tla Protocol50AbortMutant.cfg \
     CommitReconciliationWitness
 run_expected_failure relseq-mutant Protocol50.tla Protocol50RelSeqMutant.cfg \
@@ -61,5 +63,14 @@ run_expected_failure operation-digest-mutant Protocol50.tla \
     Protocol50OperationDigestMutant.cfg CommitOnlyAfterExactMaterialization
 run_expected_failure job-lease-mutant Protocol50JobLifecycle.tla \
     Protocol50JobLeaseMutant.cfg CommittedInputForOpenJobKeepsLease
+run_expected_failure reconnect-same-guid-mutant Protocol50Reconnect.tla \
+    Protocol50ReconnectSameGuidMutant.cfg ColdRetirementHasProof
+run_expected_failure reconnect-active-reset-mutant Protocol50Reconnect.tla \
+    Protocol50ReconnectActiveResetMutant.cfg UnresolvedActiveNotDiscarded
+run_expected_failure reconnect-repeat-reset-mutant Protocol50Reconnect.tla \
+    Protocol50ReconnectRepeatResetMutant.cfg AtMostOneResetPerSession
 run_expected_failure incarnation-mutant Protocol50IncarnationBridge.tla \
     Protocol50IncarnationMutant.cfg ReplacementPreservesRetryIdentity
+run_expected_failure incarnation-ownership-mutant Protocol50IncarnationBridge.tla \
+    Protocol50IncarnationOwnershipMutant.cfg \
+    AuthorizedCompilerOwnsIndependentInput
