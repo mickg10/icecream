@@ -3,148 +3,192 @@ set -eu
 
 srcdir=${srcdir:-$(dirname "$0")}
 PYTHON=${PYTHON:-python3}
-trace_file=${TMPDIR:-/tmp}/p50-trace-$$.jsonl
-mutated_file=${TMPDIR:-/tmp}/p50-trace-mutated-$$.jsonl
-cross_file=${TMPDIR:-/tmp}/p50-trace-cross-$$.jsonl
-abort_file=${TMPDIR:-/tmp}/p50-trace-abort-$$.jsonl
-relseq_file=${TMPDIR:-/tmp}/p50-trace-relseq-$$.jsonl
-nonce_file=${TMPDIR:-/tmp}/p50-trace-nonce-$$.jsonl
-trap 'rm -f "$trace_file" "$mutated_file" "$cross_file" "$abort_file" "$relseq_file" "$nonce_file"' EXIT HUP INT TERM
+workdir="${TMPDIR:-/tmp}/icecream-p50-trace-$$"
+trace_file="$workdir/canonical.jsonl"
+checker="$srcdir/../cache/formal/check_trace.py"
+trap 'rm -rf "$workdir"' EXIT HUP INT TERM
+mkdir -p "$workdir"
 
-P50_TRACE_PATH=$trace_file "$srcdir/p50_slice0_test"
-"$PYTHON" "$srcdir/../cache/formal/check_trace.py" "$trace_file"
-
-"$PYTHON" - "$trace_file" "$mutated_file" <<'PY'
-import json
-import sys
-
-source, target = sys.argv[1:]
-rows = [json.loads(line) for line in open(source, encoding="utf-8")]
-index = next(i for i, row in enumerate(rows) if row["action"] == "NEED_RECORDED")
-rows[index]["remaining_need"] += 1
-with open(target, "w", encoding="utf-8") as output:
-    for row in rows:
-        output.write(json.dumps(row, separators=(",", ":")) + "\n")
-PY
-
-if "$PYTHON" "$srcdir/../cache/formal/check_trace.py" "$mutated_file" \
-        >"$mutated_file.out" 2>&1; then
-    echo "p50_trace_check: mutated trace unexpectedly passed" >&2
-    rm -f "$mutated_file.out"
-    exit 1
-fi
-grep -F "Need precedes exact DICT" "$mutated_file.out" >/dev/null || {
-    cat "$mutated_file.out" >&2
-    rm -f "$mutated_file.out"
-    exit 1
+expect_reject() {
+    file=$1
+    pattern=$2
+    label=$3
+    output="$file.out"
+    if "$PYTHON" "$checker" "$file" >"$output" 2>&1; then
+        echo "p50_trace_check: $label unexpectedly passed" >&2
+        exit 1
+    fi
+    if ! grep -E "$pattern" "$output" >/dev/null 2>&1; then
+        echo "p50_trace_check: $label failed through the wrong gate" >&2
+        cat "$output" >&2
+        exit 1
+    fi
 }
-rm -f "$mutated_file.out"
 
-"$PYTHON" - "$trace_file" "$cross_file" <<'PY'
+P50_TRACE_PATH="$trace_file" ./p50slice0 >/dev/null
+"$PYTHON" "$checker" "$trace_file"
+
+"$PYTHON" - "$trace_file" "$workdir" <<'PY'
+import copy
 import json
+import pathlib
 import sys
 
-source, target = sys.argv[1:]
-rows = [json.loads(line) for line in open(source, encoding="utf-8")]
+source = pathlib.Path(sys.argv[1])
+outdir = pathlib.Path(sys.argv[2])
+rows = [json.loads(line) for line in source.read_text(encoding="utf-8").splitlines()]
+
+
+def write(name, records):
+    path = outdir / name
+    with path.open("w", encoding="utf-8") as output:
+        for record in records:
+            output.write(json.dumps(record, separators=(",", ":")) + "\n")
+
+
+def flip_hex(text):
+    if not text:
+        return "1"
+    return ("0" if text[0] != "0" else "1") + text[1:]
+
+
+def record(action, actor="F", serial=1, nonce=0, rel=0, tu=0,
+           tx="", raw="", state="", **extra):
+    value = {
+        "action": action,
+        "actor": actor,
+        "c_store_guid": "c",
+        "f_store_guid": "f",
+        "session_serial": serial,
+        "history_nonce": nonce,
+        "rel_seq": rel,
+        "tu_seq": tu,
+        "transaction_digest": tx,
+        "raw_digest": raw,
+        "state_digest": state,
+        "content_digest": "",
+        "key64": None,
+        "need_keys": [],
+        "remaining_need": 0,
+        "duplicate": False,
+    }
+    value.update(extra)
+    return value
+
+need_rows = copy.deepcopy(rows)
+need_index = next(i for i, row in enumerate(need_rows)
+                  if row["action"] == "NEED_RECORDED")
+need_rows[need_index]["remaining_need"] += 1
+write("bad-need.jsonl", need_rows)
+
+content_rows = copy.deepcopy(rows)
+for index, row in enumerate(content_rows):
+    if row["action"] == "OBJECT_APPLIED":
+        changed = dict(row)
+        changed["duplicate"] = True
+        changed["content_digest"] = flip_hex(row["content_digest"])
+        content_rows.insert(index + 1, changed)
+        break
+else:
+    raise SystemExit("canonical trace lacks OBJECT_APPLIED")
+write("changed-object.jsonl", content_rows)
+
+pending_rows = copy.deepcopy(rows)
+c_begin = next(row for row in pending_rows
+               if row["action"] == "TX_BEGIN" and row["actor"] == "C")
+f_begin_index = next(i for i, row in enumerate(pending_rows)
+                     if row["action"] == "TX_BEGIN" and row["actor"] == "F")
+pending_abort = dict(c_begin)
+pending_abort["action"] = "TX_ABORTED"
+pending_abort["actor"] = "C"
+pending_rows.insert(f_begin_index + 1, pending_abort)
+write("pending-abort.jsonl", pending_rows)
+
+commit_rows = copy.deepcopy(rows)
+commit_index = next(i for i, row in enumerate(commit_rows)
+                    if row["action"] == "INPUT_COMMITTED")
+commit_abort = dict(commit_rows[commit_index])
+commit_abort["action"] = "TX_ABORTED"
+commit_abort["actor"] = "C"
+commit_rows.insert(commit_index + 1, commit_abort)
+write("commit-abort.jsonl", commit_rows)
+
+digest_rows = copy.deepcopy(rows)
+digest_index = next(i for i, row in enumerate(digest_rows)
+                    if row["action"] == "DICT_COMPLETE")
+digest_rows[digest_index]["transaction_digest"] = flip_hex(
+    digest_rows[digest_index]["transaction_digest"])
+write("wrong-operation-digest.jsonl", digest_rows)
+
+cursor_rows = copy.deepcopy(rows)
 relations = {}
-for i, row in enumerate(rows):
+for index, row in enumerate(cursor_rows):
     if row["action"] == "TX_BEGIN" and row["actor"] == "C":
-        relations.setdefault((row["c_store_guid"], row["f_store_guid"]), []).append(i)
+        key = (row["c_store_guid"], row["f_store_guid"])
+        relations.setdefault(key, []).append(index)
 selected = next(indices for indices in relations.values() if len(indices) >= 2)
-rows[selected[1]]["rel_seq"] = rows[selected[0]]["rel_seq"]
-with open(target, "w", encoding="utf-8") as output:
-    for row in rows:
-        output.write(json.dumps(row, separators=(",", ":")) + "\n")
+cursor_rows[selected[1]]["rel_seq"] = cursor_rows[selected[0]]["rel_seq"]
+write("cursor-reuse.jsonl", cursor_rows)
+
+relseq_rows = copy.deepcopy(rows)
+relseq_index = next(i for i, row in enumerate(relseq_rows)
+                    if row["action"] == "TX_BEGIN" and row["actor"] == "C")
+relseq_rows[relseq_index]["rel_seq"] = (1 << 64) - 1
+write("terminal-relseq.jsonl", relseq_rows)
+
+write("stale-session.jsonl", [
+    record("SESSION_OPENED", serial=1),
+    record("HISTORY_RESET", serial=1, nonce=10, state="s0"),
+    record("TX_BEGIN", actor="C", serial=0, nonce=10, rel=0, tu=7,
+           tx="tx", raw="raw", state="s0"),
+    record("SESSION_REPLACED", serial=2, nonce=10, state="s0"),
+    record("TX_BEGIN", serial=1, nonce=10, rel=0, tu=7,
+           tx="tx", raw="raw", state="s0"),
+])
+
+write("session-serial-reuse.jsonl", [
+    record("SESSION_OPENED", serial=2),
+    record("SESSION_DISCONNECTED", serial=2),
+    record("SESSION_OPENED", serial=2),
+])
+
+write("nonce-decrease.jsonl", [
+    record("SESSION_OPENED", serial=1),
+    record("HISTORY_RESET", serial=1, nonce=9, state="s9"),
+    record("SESSION_DISCONNECTED", serial=1, nonce=9, state="s9"),
+    record("SESSION_OPENED", serial=2, nonce=9, state="s9"),
+    record("HISTORY_RESET", serial=2, nonce=8, state="s8"),
+])
+
+write("second-reset.jsonl", [
+    record("SESSION_OPENED", serial=1),
+    record("HISTORY_RESET", serial=1, nonce=1, state="s1"),
+    record("HISTORY_RESET", serial=1, nonce=2, state="s2"),
+])
 PY
 
-if "$PYTHON" "$srcdir/../cache/formal/check_trace.py" "$cross_file" \
-        >"$cross_file.out" 2>&1; then
-    echo "p50_trace_check: cross-TU cursor mutation unexpectedly passed" >&2
-    rm -f "$cross_file.out"
-    exit 1
-fi
-grep -E "(C TX_BEGIN missed its cursor|second C active transaction)" \
-    "$cross_file.out" >/dev/null || {
-    cat "$cross_file.out" >&2
-    rm -f "$cross_file.out"
-    exit 1
-}
-rm -f "$cross_file.out"
+expect_reject "$workdir/bad-need.jsonl" \
+    'Need precedes exact DICT' 'inexact Need mutation'
+expect_reject "$workdir/changed-object.jsonl" \
+    'Key64 changed immutable content' 'immutable-content mutation'
+expect_reject "$workdir/pending-abort.jsonl" \
+    'C abort while F still owns pending overlay' 'abort with F pending'
+expect_reject "$workdir/commit-abort.jsonl" \
+    'C abort after durable F commit before acceptance' 'abort after durable commit'
+expect_reject "$workdir/wrong-operation-digest.jsonl" \
+    'DICT does not match F pending/current session' 'same-cursor digest ABA'
+expect_reject "$workdir/cursor-reuse.jsonl" \
+    '(C TX_BEGIN missed its cursor|second C active transaction)' \
+    'route-cursor reuse'
+expect_reject "$workdir/terminal-relseq.jsonl" \
+    'C REL_SEQ exhausted before TX_BEGIN' 'terminal REL_SEQ begin'
+expect_reject "$workdir/stale-session.jsonl" \
+    'F TX_BEGIN at the wrong boundary' 'stale-session mutation'
+expect_reject "$workdir/session-serial-reuse.jsonl" \
+    'F session serial was reused or did not increase' 'session-serial reuse'
+expect_reject "$workdir/nonce-decrease.jsonl" \
+    'HISTORY_NONCE was reused or did not increase' 'history-nonce decrease'
+expect_reject "$workdir/second-reset.jsonl" \
+    'second HISTORY_RESET in one F session' 'second reset in one session'
 
-cat >"$abort_file" <<'EOF'
-{"actor":"F","action":"SESSION_OPENED","c_store_guid":"c","f_store_guid":"f","session_serial":1,"history_nonce":0,"rel_seq":0,"tu_seq":0,"transaction_digest":"","raw_digest":"","state_digest":""}
-{"actor":"F","action":"HISTORY_RESET","c_store_guid":"c","f_store_guid":"f","session_serial":1,"history_nonce":1,"rel_seq":0,"tu_seq":0,"transaction_digest":"","raw_digest":"","state_digest":"s0"}
-{"actor":"C","action":"TX_BEGIN","c_store_guid":"c","f_store_guid":"f","session_serial":1,"history_nonce":1,"rel_seq":0,"tu_seq":9,"transaction_digest":"tx","raw_digest":"raw","state_digest":"s0"}
-{"actor":"F","action":"TX_BEGIN","c_store_guid":"c","f_store_guid":"f","session_serial":1,"history_nonce":1,"rel_seq":0,"tu_seq":9,"transaction_digest":"tx","raw_digest":"raw","state_digest":"s0"}
-{"actor":"F","action":"DICT_COMPLETE","c_store_guid":"c","f_store_guid":"f","session_serial":1,"history_nonce":1,"rel_seq":0,"tu_seq":9,"transaction_digest":"tx","raw_digest":"raw","state_digest":"s0"}
-{"actor":"F","action":"NEED_RECORDED","c_store_guid":"c","f_store_guid":"f","session_serial":1,"history_nonce":1,"rel_seq":0,"tu_seq":9,"transaction_digest":"tx","raw_digest":"raw","state_digest":"s0","need_keys":[],"remaining_need":0}
-{"actor":"F","action":"BODY_COMPLETE","c_store_guid":"c","f_store_guid":"f","session_serial":1,"history_nonce":1,"rel_seq":0,"tu_seq":9,"transaction_digest":"tx","raw_digest":"raw","state_digest":"s0"}
-{"actor":"F","action":"INPUT_MATERIALIZED","c_store_guid":"c","f_store_guid":"f","session_serial":1,"history_nonce":1,"rel_seq":0,"tu_seq":9,"transaction_digest":"tx","raw_digest":"raw","state_digest":"s0"}
-{"actor":"F","action":"INPUT_COMMITTED","c_store_guid":"c","f_store_guid":"f","session_serial":1,"history_nonce":1,"rel_seq":0,"tu_seq":9,"transaction_digest":"tx","raw_digest":"raw","state_digest":"s1"}
-{"actor":"C","action":"TX_ABORTED","c_store_guid":"c","f_store_guid":"f","session_serial":1,"history_nonce":1,"rel_seq":0,"tu_seq":9,"transaction_digest":"tx","raw_digest":"raw","state_digest":"s0"}
-EOF
-
-if "$PYTHON" "$srcdir/../cache/formal/check_trace.py" "$abort_file" \
-        >"$abort_file.out" 2>&1; then
-    echo "p50_trace_check: abort-after-commit fixture unexpectedly passed" >&2
-    rm -f "$abort_file.out"
-    exit 1
-fi
-grep -F "C abort after durable F commit before acceptance" \
-    "$abort_file.out" >/dev/null || {
-    cat "$abort_file.out" >&2
-    rm -f "$abort_file.out"
-    exit 1
-}
-rm -f "$abort_file.out"
-
-"$PYTHON" - "$trace_file" "$relseq_file" <<'PY'
-import json
-import sys
-
-source, target = sys.argv[1:]
-rows = [json.loads(line) for line in open(source, encoding="utf-8")]
-begins = [i for i, row in enumerate(rows)
-          if row["action"] == "TX_BEGIN" and row["actor"] == "C"]
-index = begins[-1]
-rows[index]["rel_seq"] = (1 << 64) - 1
-with open(target, "w", encoding="utf-8") as output:
-    for row in rows:
-        output.write(json.dumps(row, separators=(",", ":")) + "\n")
-PY
-
-if "$PYTHON" "$srcdir/../cache/formal/check_trace.py" "$relseq_file" \
-        >"$relseq_file.out" 2>&1; then
-    echo "p50_trace_check: terminal REL_SEQ fixture unexpectedly passed" >&2
-    rm -f "$relseq_file.out"
-    exit 1
-fi
-grep -E "(C TX_BEGIN missed its cursor|new C history did not start at zero|second C active transaction)" \
-    "$relseq_file.out" >/dev/null || {
-    cat "$relseq_file.out" >&2
-    rm -f "$relseq_file.out"
-    exit 1
-}
-rm -f "$relseq_file.out"
-
-cat >"$nonce_file" <<'EOF'
-{"actor":"F","action":"SESSION_OPENED","c_store_guid":"c","f_store_guid":"f","session_serial":1,"history_nonce":0,"rel_seq":0,"tu_seq":0,"transaction_digest":"","raw_digest":"","state_digest":""}
-{"actor":"F","action":"HISTORY_RESET","c_store_guid":"c","f_store_guid":"f","session_serial":1,"history_nonce":9,"rel_seq":0,"tu_seq":0,"transaction_digest":"","raw_digest":"","state_digest":"s9"}
-{"actor":"F","action":"HISTORY_RESET","c_store_guid":"c","f_store_guid":"f","session_serial":1,"history_nonce":8,"rel_seq":0,"tu_seq":0,"transaction_digest":"","raw_digest":"","state_digest":"s8"}
-EOF
-
-if "$PYTHON" "$srcdir/../cache/formal/check_trace.py" "$nonce_file" \
-        >"$nonce_file.out" 2>&1; then
-    echo "p50_trace_check: decreasing HISTORY_NONCE fixture unexpectedly passed" >&2
-    rm -f "$nonce_file.out"
-    exit 1
-fi
-grep -F "HISTORY_NONCE was reused or did not increase" \
-    "$nonce_file.out" >/dev/null || {
-    cat "$nonce_file.out" >&2
-    rm -f "$nonce_file.out"
-    exit 1
-}
-rm -f "$nonce_file.out"
-
-echo "p50_trace_check: canonical trace and semantic mutations passed"
+echo "p50_trace_check: canonical trace and fail-closed mutations passed"
