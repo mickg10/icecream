@@ -242,6 +242,58 @@ void test_valid_then_invalid_fill_retains_first_object() {
     pair.route.accept_commit(pair.f.commit_input(pair.session));
 }
 
+void test_trailing_partial_fill_blocks_commit_and_replays() {
+    Pair pair;
+    const PreparedTUPtr prepared =
+        pair.c.prepare_from_regions(regions({"trailing\n", "partial\n", "fill\n"}));
+    const CActiveTx& active = pair.route.begin(prepared);
+    const Need need = start(pair, active);
+    const std::vector<ImmutableObject> fill = pair.route.build_fill(need);
+    require(!fill.empty(), "trailing-partial FILL fixture has no requested objects");
+
+    std::vector<FillRecord> records;
+    records.reserve(fill.size());
+    for (const ImmutableObject& object : fill)
+        records.push_back(object.fill_record());
+    const auto complete = encode_fill_messages(records, kInitialMaxFramePayload);
+    const std::array<FillRecord, 1> extra{fill.front().fill_record()};
+    const auto trailing = encode_fill_messages(extra, kInitialMaxFramePayload);
+    require(complete.size() == 1 && trailing.size() == 1 &&
+                trailing.front().bytes.size() >= 4,
+            "trailing-partial FILL fixture unexpectedly split");
+
+    FillMessage message = complete.front();
+    message.bytes.insert(message.bytes.end(), trailing.front().bytes.begin(),
+                         trailing.front().bytes.begin() + 4);
+    pair.f.append_body(pair.session, active.body);
+    require_throws<std::invalid_argument>(
+        [&] { (void)pair.f.append_fill(pair.session, message); },
+        "trailing partial record was accepted after the final requested object");
+    for (const ImmutableObject& object : fill)
+        require(pair.f.contains(pair.c.guid(), object.key),
+                "complete object preceding trailing partial bytes was rolled back");
+    require_throws<std::invalid_argument>(
+        [&] { (void)pair.f.materialize_and_verify(pair.session); },
+        "transaction materialized with a trailing partial FILL record");
+    require_throws<std::logic_error>(
+        [&] { (void)pair.f.commit_input(pair.session); },
+        "transaction committed after rejected trailing partial FILL bytes");
+
+    pair.f.disconnect(pair.session);
+    const ReconnectResult resumed =
+        reconnect(pair.route, pair.f, HistoryNonce{350});
+    require(resumed.outcome == ReconnectOutcome::ExactMatch && resumed.replay_active,
+            "trailing-partial FILL did not take exact replay path");
+    pair.session = resumed.session;
+    pair.f.begin(pair.session, pair.route.active()->begin, true);
+    pair.f.append_dict(pair.session, pair.route.active()->dict);
+    require(pair.f.need(pair.session).missing.empty(),
+            "replay did not recompute Need from retained complete objects");
+    pair.f.append_body(pair.session, pair.route.active()->body);
+    pair.f.materialize_and_verify(pair.session);
+    pair.route.accept_commit(pair.f.commit_input(pair.session));
+}
+
 void test_body_and_fill_complete_in_both_orders() {
     {
         Pair pair;
@@ -690,6 +742,7 @@ int main() {
     test_separate_preparation_real_interning_and_p29();
     test_exact_need_and_duplicate_application();
     test_valid_then_invalid_fill_retains_first_object();
+    test_trailing_partial_fill_blocks_commit_and_replays();
     test_body_and_fill_complete_in_both_orders();
     test_zero_components_and_component_boundaries();
     test_p29_key_vector_encoding_boundary();
