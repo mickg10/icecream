@@ -26,7 +26,10 @@ CONSTANTS F0, F1, A0, A1,
           P50Mode, LegacyMode, NoMode,
           New, Waiting, Running, Finished, Cancelled,
           NoResult, OkResult,
-          ExactDigest, NoDigest
+          ExactDigest, NoDigest,
+          MutantCommitWithoutLease
+
+ASSUME MutantCommitWithoutLease \in BOOLEAN
 
 Fs == {F0, F1}
 Attempts == {A0, A1}
@@ -69,7 +72,10 @@ CommitExactInput(f) ==
     /\ jobOpen
     /\ inputCommitted' = [inputCommitted EXCEPT ![f] = TRUE]
     /\ inputDigest' = [inputDigest EXCEPT ![f] = ExactDigest]
-    /\ inputLease' = [inputLease EXCEPT ![f] = TRUE]
+    /\ inputLease' =
+        IF MutantCommitWithoutLease
+        THEN inputLease
+        ELSE [inputLease EXCEPT ![f] = TRUE]
     /\ UNCHANGED <<fCacheEpoch, environmentReady, jobOpen,
                     attemptState, attemptMode, attemptF, attemptEpoch,
                     attemptEligible, attemptAuthorized, legacyInputReady,
