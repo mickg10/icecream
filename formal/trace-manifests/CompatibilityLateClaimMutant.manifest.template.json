@@ -1,0 +1,57 @@
+{
+  "schema": 1,
+  "scenario": "CompatibilityLateClaimMutant",
+  "property": "NoStartAfterRelease",
+  "expected_result": "counterexample",
+  "min_states": 6,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "CompactReleasedLegacyRecord",
+      "all": [
+        {"path": "phase", "to": "Terminal"},
+        {"path": "released", "to": true},
+        {"path": "compacted", "from": false, "to": true},
+        {"path": "startAfterRelease", "to": false}
+      ]
+    },
+    {
+      "name": "StartLateUnknownLegacyClaimAfterRelease",
+      "all": [
+        {"path": "phase", "from": "Terminal", "to": "Started"},
+        {"path": "released", "to": true},
+        {"path": "compacted", "to": true},
+        {"path": "startAfterRelease", "from": false, "to": true},
+        {"path": "policy", "to": "Legacy"}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "CompactReleasedLegacyRecord",
+    "StartLateUnknownLegacyClaimAfterRelease"
+  ],
+  "final_all": [
+    {"path": "phase", "eq": "Started"},
+    {"path": "released", "eq": true},
+    {"path": "compacted", "eq": true},
+    {"path": "startAfterRelease", "eq": true},
+    {"path": "policy", "eq": "Legacy"}
+  ],
+  "harness_steps": [
+    {
+      "after": "CompactReleasedLegacyRecord",
+      "emit": "compact_released_legacy_assignment_record_while_late_claim_is_retained",
+      "actor": "fulfillment-daemon"
+    },
+    {
+      "after": "StartLateUnknownLegacyClaimAfterRelease",
+      "emit": "assert_unknown_late_claim_started_after_scheduler_release",
+      "actor": "fulfillment-daemon"
+    }
+  ],
+  "metadata": {
+    "module": "MixedVersionCompatibilityChecked",
+    "configs": ["CompatibilityLateClaimMutant.cfg"],
+    "mutant": "MutantDefaultAllowUnknown = TRUE"
+  }
+}

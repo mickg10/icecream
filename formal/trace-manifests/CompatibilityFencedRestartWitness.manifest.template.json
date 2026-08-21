@@ -1,0 +1,42 @@
+{
+  "schema": 1,
+  "scenario": "CompatibilityFencedRestartWitness",
+  "property": "NoFencedRestartAmbiguity",
+  "expected_result": "counterexample",
+  "min_states": 6,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "DelayedOldClientClaimAfterRestartIsEpochAmbiguous",
+      "all": [
+        {"path": "phase", "from": "Restarted", "to": "Claimed"},
+        {"path": "schedulerEpoch", "to": 1},
+        {"path": "policy", "to": "FencedLegacy"},
+        {"path": "guarantee", "to": "EpochScoped"},
+        {"path": "fencedRestartAmbiguous", "from": false, "to": true},
+        {"path": "staleTokenRejected", "to": false},
+        {"path": "projectedTrace", "len_delta": 1}
+      ]
+    }
+  ],
+  "required_subsequence": ["DelayedOldClientClaimAfterRestartIsEpochAmbiguous"],
+  "final_all": [
+    {"path": "fencedRestartAmbiguous", "eq": true},
+    {"path": "phase", "eq": "Claimed"},
+    {"path": "policy", "eq": "FencedLegacy"},
+    {"path": "schedulerEpoch", "eq": 1},
+    {"path": "staleTokenRejected", "eq": false}
+  ],
+  "harness_steps": [
+    {
+      "after": "DelayedOldClientClaimAfterRestartIsEpochAmbiguous",
+      "emit": "assert_old_client_new_worker_claim_is_only_epoch_scoped_after_restart",
+      "actor": "fulfillment-daemon"
+    }
+  ],
+  "metadata": {
+    "module": "MixedVersionCompatibilityChecked",
+    "configs": ["CompatibilityFencedRestartWitness.cfg"],
+    "limitation": "FencedLegacy prevents within-session release races but old client identity does not prove exact restart freshness."
+  }
+}

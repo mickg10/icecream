@@ -1,0 +1,39 @@
+{
+  "schema": 1,
+  "scenario": "CompatibilitySubmitterLossWitness",
+  "property": "NoSubmitterLossHandled",
+  "expected_result": "counterexample",
+  "min_states": 4,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "SettleSubmitterLossBeforeStart",
+      "all": [
+        {"path": "phase", "from_in": ["Assigned", "UseCSDelivered", "Claimed"], "to": "Terminal"},
+        {"path": "submitterLossHandled", "from": false, "to": true},
+        {"path": "terminalCount", "from": 0, "to": 1},
+        {"path": "released", "from": false, "to": true},
+        {"path": "projectedTrace", "len_delta": 1}
+      ]
+    }
+  ],
+  "required_subsequence": ["SettleSubmitterLossBeforeStart"],
+  "final_all": [
+    {"path": "submitterLossHandled", "eq": true},
+    {"path": "phase", "eq": "Terminal"},
+    {"path": "terminalCount", "eq": 1},
+    {"path": "released", "eq": true}
+  ],
+  "harness_steps": [
+    {
+      "after": "SettleSubmitterLossBeforeStart",
+      "emit": "drop_submitter_generation_before_start_and_assert_single_terminal_release",
+      "actor": "scheduler"
+    }
+  ],
+  "metadata": {
+    "module": "MixedVersionCompatibilityChecked",
+    "configs": ["CompatibilitySubmitterLossWitness.cfg"],
+    "witness": "Submitter loss before Start remains bounded and terminal for every negotiated policy."
+  }
+}

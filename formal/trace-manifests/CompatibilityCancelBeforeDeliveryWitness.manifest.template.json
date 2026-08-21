@@ -1,0 +1,41 @@
+{
+  "schema": 1,
+  "scenario": "CompatibilityCancelBeforeDeliveryWitness",
+  "property": "NoCancelBeforeDelivery",
+  "expected_result": "counterexample",
+  "min_states": 4,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "CancelAssignedBeforeUseCS",
+      "all": [
+        {"path": "phase", "from": "Assigned", "to": "Terminal"},
+        {"path": "cancelPreDeliverySeen", "from": false, "to": true},
+        {"path": "terminalCount", "from": 0, "to": 1},
+        {"path": "released", "from": false, "to": true},
+        {"path": "claimIdentity", "to": "None"},
+        {"path": "projectedTrace", "len_delta": 1}
+      ]
+    }
+  ],
+  "required_subsequence": ["CancelAssignedBeforeUseCS"],
+  "final_all": [
+    {"path": "cancelPreDeliverySeen", "eq": true},
+    {"path": "phase", "eq": "Terminal"},
+    {"path": "terminalCount", "eq": 1},
+    {"path": "claimIdentity", "eq": "None"},
+    {"path": "projectedTrace", "eq": ["REQUEST", "ASSIGN", "CANCEL"]}
+  ],
+  "harness_steps": [
+    {
+      "after": "CancelAssignedBeforeUseCS",
+      "emit": "cancel_assignment_before_usecs_delivery_and_assert_old_projection_terminal",
+      "actor": "scheduler"
+    }
+  ],
+  "metadata": {
+    "module": "MixedVersionCompatibilityChecked",
+    "configs": ["CompatibilityCancelBeforeDeliveryWitness.cfg"],
+    "witness": "Pre-delivery cancellation requires no claim identity and remains an old-language trace."
+  }
+}

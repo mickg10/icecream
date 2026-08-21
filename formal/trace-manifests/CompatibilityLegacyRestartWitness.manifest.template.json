@@ -1,0 +1,42 @@
+{
+  "schema": 1,
+  "scenario": "CompatibilityLegacyRestartWitness",
+  "property": "NoLegacyRestartAmbiguity",
+  "expected_result": "counterexample",
+  "min_states": 6,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "DelayedLegacyClaimAfterRestartIsAmbiguous",
+      "all": [
+        {"path": "phase", "from": "Restarted", "to": "Claimed"},
+        {"path": "schedulerEpoch", "to": 1},
+        {"path": "policy", "to": "Legacy"},
+        {"path": "guarantee", "to": "LegacyOnly"},
+        {"path": "legacyRestartAmbiguous", "from": false, "to": true},
+        {"path": "staleTokenRejected", "to": false},
+        {"path": "projectedTrace", "len_delta": 1}
+      ]
+    }
+  ],
+  "required_subsequence": ["DelayedLegacyClaimAfterRestartIsAmbiguous"],
+  "final_all": [
+    {"path": "legacyRestartAmbiguous", "eq": true},
+    {"path": "phase", "eq": "Claimed"},
+    {"path": "policy", "eq": "Legacy"},
+    {"path": "schedulerEpoch", "eq": 1},
+    {"path": "staleTokenRejected", "eq": false}
+  ],
+  "harness_steps": [
+    {
+      "after": "DelayedLegacyClaimAfterRestartIsAmbiguous",
+      "emit": "assert_old_f_old_c_restart_claim_remains_legacy_ambiguous",
+      "actor": "fulfillment-daemon"
+    }
+  ],
+  "metadata": {
+    "module": "MixedVersionCompatibilityChecked",
+    "configs": ["CompatibilityLegacyRestartWitness.cfg"],
+    "limitation": "Legacy wire identity cannot prove exact restart freshness under arbitrary delay."
+  }
+}

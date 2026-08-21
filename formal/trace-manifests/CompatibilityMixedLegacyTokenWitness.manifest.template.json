@@ -1,0 +1,40 @@
+{
+  "schema": 1,
+  "scenario": "CompatibilityMixedLegacyTokenWitness",
+  "property": "NoMixedLegacyToken",
+  "expected_result": "counterexample",
+  "min_states": 6,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "ObserveLegacyAndTokenPoliciesInOneScheduler",
+      "all": [
+        {"path": "seenLegacy", "to": true},
+        {"path": "seenToken", "to": true},
+        {"path": "phase", "from": "Requested", "to": "Assigned"}
+      ],
+      "any": [
+        {"path": "seenLegacy", "from": false, "to": true},
+        {"path": "seenToken", "from": false, "to": true}
+      ]
+    }
+  ],
+  "required_subsequence": ["ObserveLegacyAndTokenPoliciesInOneScheduler"],
+  "final_all": [
+    {"path": "seenLegacy", "eq": true},
+    {"path": "seenToken", "eq": true},
+    {"path": "capabilityLeak", "eq": false}
+  ],
+  "harness_steps": [
+    {
+      "after": "ObserveLegacyAndTokenPoliciesInOneScheduler",
+      "emit": "assert_mixed_old_and_new_workers_select_policy_per_assignment",
+      "actor": "scheduler"
+    }
+  ],
+  "metadata": {
+    "module": "MixedVersionCompatibilityChecked",
+    "configs": ["CompatibilityMixedLegacyTokenWitness.cfg"],
+    "witness": "One scheduler session can complete a Legacy assignment and a Token assignment without global capability leakage."
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "schema": 1,
+  "scenario": "CompatibilityRevokeBeforeClaimWitness",
+  "property": "NoRevokeBeforeClaim",
+  "expected_result": "counterexample",
+  "min_states": 5,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "RevokeFencedAssignmentBeforeClaim",
+      "all": [
+        {"path": "phase", "from": "UseCSDelivered", "to": "Terminal"},
+        {"path": "revokeBeforeClaimSeen", "from": false, "to": true},
+        {"path": "terminalCount", "from": 0, "to": 1},
+        {"path": "released", "from": false, "to": true},
+        {"path": "projectedTrace", "len_delta": 1}
+      ],
+      "any": [
+        {"path": "policy", "to": "FencedLegacy"},
+        {"path": "policy", "to": "Token"}
+      ]
+    }
+  ],
+  "required_subsequence": ["RevokeFencedAssignmentBeforeClaim"],
+  "final_all": [
+    {"path": "revokeBeforeClaimSeen", "eq": true},
+    {"path": "phase", "eq": "Terminal"},
+    {"path": "released", "eq": true},
+    {"path": "projectedTrace", "eq": ["REQUEST", "ASSIGN", "USECS", "CANCEL"]}
+  ],
+  "harness_steps": [
+    {
+      "after": "RevokeFencedAssignmentBeforeClaim",
+      "emit": "revoke_new_worker_assignment_before_client_claim_and_assert_old_projection",
+      "actor": "scheduler-worker-control"
+    }
+  ],
+  "metadata": {
+    "module": "MixedVersionCompatibilityChecked",
+    "configs": [
+      "CompatibilityFencedRevokeWitness.cfg",
+      "CompatibilityTokenRevokeWitness.cfg"
+    ],
+    "witness": "Both FencedLegacy and Token assignments can settle before claim without exposing new vocabulary to an old client projection."
+  }
+}

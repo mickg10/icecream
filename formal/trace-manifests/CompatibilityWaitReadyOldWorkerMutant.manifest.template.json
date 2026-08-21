@@ -1,0 +1,38 @@
+{
+  "schema": 1,
+  "scenario": "CompatibilityWaitReadyOldWorkerMutant",
+  "property": "OldPeerHasNoNewHandshakeWait",
+  "expected_result": "counterexample",
+  "min_states": 3,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "WaitForUnsupportedReadyFromOldWorker",
+      "all": [
+        {"path": "phase", "from": "Requested", "to": "WaitingReady"},
+        {"path": "policy", "from": "None", "to": "Legacy"},
+        {"path": "oldPermanentWait", "from": false, "to": true},
+        {"path": "oldWorkerSawNewControl", "to": false}
+      ]
+    }
+  ],
+  "required_subsequence": ["WaitForUnsupportedReadyFromOldWorker"],
+  "final_all": [
+    {"path": "phase", "eq": "WaitingReady"},
+    {"path": "policy", "eq": "Legacy"},
+    {"path": "oldPermanentWait", "eq": true},
+    {"path": "oldWorkerSawNewControl", "eq": false}
+  ],
+  "harness_steps": [
+    {
+      "after": "WaitForUnsupportedReadyFromOldWorker",
+      "emit": "assert_scheduler_waited_for_unnegotiated_ready_from_old_worker",
+      "actor": "scheduler"
+    }
+  ],
+  "metadata": {
+    "module": "MixedVersionCompatibilityChecked",
+    "configs": ["CompatibilityWaitReadyOldWorkerMutant.cfg"],
+    "mutant": "MutantWaitReadyOldWorker = TRUE"
+  }
+}

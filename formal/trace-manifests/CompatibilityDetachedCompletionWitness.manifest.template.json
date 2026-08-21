@@ -1,0 +1,58 @@
+{
+  "schema": 1,
+  "scenario": "CompatibilityDetachedCompletionWitness",
+  "property": "NoDetachedCompletion",
+  "expected_result": "counterexample",
+  "min_states": 8,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "DetachStartedSubmitter",
+      "all": [
+        {"path": "phase", "from": "Started", "to": "Detached"},
+        {"path": "submitterLossHandled", "from": false, "to": true},
+        {"path": "terminalCount", "to": 0},
+        {"path": "released", "to": false}
+      ]
+    },
+    {
+      "name": "CompleteFromAssignedWorkerAfterDetach",
+      "all": [
+        {"path": "phase", "from": "Detached", "to": "Terminal"},
+        {"path": "detachedCompletionSeen", "from": false, "to": true},
+        {"path": "normalCompleted", "from": false, "to": true},
+        {"path": "terminalCount", "from": 0, "to": 1},
+        {"path": "released", "from": false, "to": true},
+        {"path": "projectedTrace", "len_delta": 1}
+      ]
+    }
+  ],
+  "required_subsequence": [
+    "DetachStartedSubmitter",
+    "CompleteFromAssignedWorkerAfterDetach"
+  ],
+  "final_all": [
+    {"path": "detachedCompletionSeen", "eq": true},
+    {"path": "normalCompleted", "eq": true},
+    {"path": "phase", "eq": "Terminal"},
+    {"path": "terminalCount", "eq": 1},
+    {"path": "projectedTrace", "eq": ["REQUEST", "ASSIGN", "USECS", "CLAIM", "BEGIN", "DONE"]}
+  ],
+  "harness_steps": [
+    {
+      "after": "DetachStartedSubmitter",
+      "emit": "detach_submitter_after_assigned_worker_begin",
+      "actor": "scheduler"
+    },
+    {
+      "after": "CompleteFromAssignedWorkerAfterDetach",
+      "emit": "assert_assigned_worker_completion_terminalizes_detached_job_once",
+      "actor": "assigned-worker"
+    }
+  ],
+  "metadata": {
+    "module": "MixedVersionCompatibilityChecked",
+    "configs": ["CompatibilityDetachedCompletionWitness.cfg"],
+    "witness": "Started-job worker completion remains authoritative after old submitter detaches."
+  }
+}

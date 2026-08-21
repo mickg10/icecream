@@ -1,0 +1,41 @@
+{
+  "schema": 1,
+  "scenario": "CompatibilityAcceptStaleTokenMutant",
+  "property": "TokenRejectsStaleRestartClaim",
+  "expected_result": "counterexample",
+  "min_states": 6,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "AcceptPriorEpochTokenClaim",
+      "all": [
+        {"path": "phase", "from": "Restarted", "to": "Claimed"},
+        {"path": "schedulerEpoch", "to": 1},
+        {"path": "policy", "to": "Token"},
+        {"path": "staleTokenAccepted", "from": false, "to": true},
+        {"path": "staleTokenRejected", "to": false},
+        {"path": "projectedTrace", "len_delta": 1}
+      ]
+    }
+  ],
+  "required_subsequence": ["AcceptPriorEpochTokenClaim"],
+  "final_all": [
+    {"path": "phase", "eq": "Claimed"},
+    {"path": "policy", "eq": "Token"},
+    {"path": "schedulerEpoch", "eq": 1},
+    {"path": "staleTokenAccepted", "eq": true},
+    {"path": "staleTokenRejected", "eq": false}
+  ],
+  "harness_steps": [
+    {
+      "after": "AcceptPriorEpochTokenClaim",
+      "emit": "assert_prior_epoch_full_id_and_nonce_were_accepted",
+      "actor": "fulfillment-daemon"
+    }
+  ],
+  "metadata": {
+    "module": "MixedVersionCompatibilityChecked",
+    "configs": ["CompatibilityAcceptStaleTokenMutant.cfg"],
+    "mutant": "MutantAcceptStaleToken = TRUE"
+  }
+}

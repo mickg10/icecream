@@ -1,0 +1,43 @@
+{
+  "schema": 1,
+  "scenario": "CompatibilityTokenRestartRejectWitness",
+  "property": "NoTokenStaleReject",
+  "expected_result": "counterexample",
+  "min_states": 6,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "RejectStaleTokenClaimAfterRestart",
+      "all": [
+        {"path": "phase", "from": "Restarted", "to": "Terminal"},
+        {"path": "schedulerEpoch", "to": 1},
+        {"path": "policy", "to": "Token"},
+        {"path": "guarantee", "to": "ExactRestart"},
+        {"path": "staleTokenRejected", "from": false, "to": true},
+        {"path": "staleTokenAccepted", "to": false},
+        {"path": "terminalCount", "from": 0, "to": 1},
+        {"path": "released", "from": false, "to": true}
+      ]
+    }
+  ],
+  "required_subsequence": ["RejectStaleTokenClaimAfterRestart"],
+  "final_all": [
+    {"path": "staleTokenRejected", "eq": true},
+    {"path": "staleTokenAccepted", "eq": false},
+    {"path": "phase", "eq": "Terminal"},
+    {"path": "policy", "eq": "Token"},
+    {"path": "schedulerEpoch", "eq": 1}
+  ],
+  "harness_steps": [
+    {
+      "after": "RejectStaleTokenClaimAfterRestart",
+      "emit": "assert_full_assignment_id_and_nonce_reject_prior_epoch_claim",
+      "actor": "fulfillment-daemon"
+    }
+  ],
+  "metadata": {
+    "module": "MixedVersionCompatibilityChecked",
+    "configs": ["CompatibilityTokenRestartRejectWitness.cfg"],
+    "witness": "Token assignments provide the exact restart guarantee not claimed for old-client modes."
+  }
+}

@@ -1,0 +1,40 @@
+{
+  "schema": 1,
+  "scenario": "CompatibilityTokenWitness",
+  "property": "NoTokenAssignmentSeen",
+  "expected_result": "counterexample",
+  "min_states": 3,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "ObserveTokenAssignment",
+      "all": [
+        {"path": "seenToken", "from": false, "to": true},
+        {"path": "policy", "from": "None", "to": "Token"},
+        {"path": "expectedPolicy", "from": "None", "to": "Token"},
+        {"path": "guarantee", "from": "None", "to": "ExactRestart"},
+        {"path": "phase", "from": "Requested", "to": "Assigned"},
+        {"path": "projectedTrace", "len_delta": 1}
+      ]
+    }
+  ],
+  "required_subsequence": ["ObserveTokenAssignment"],
+  "final_all": [
+    {"path": "seenToken", "eq": true},
+    {"path": "policy", "eq": "Token"},
+    {"path": "guarantee", "eq": "ExactRestart"},
+    {"path": "claimIdentity", "eq": "None"}
+  ],
+  "harness_steps": [
+    {
+      "after": "ObserveTokenAssignment",
+      "emit": "assert_new_client_new_worker_assignment_selects_full_id_and_token_policy",
+      "actor": "scheduler"
+    }
+  ],
+  "metadata": {
+    "module": "MixedVersionCompatibilityChecked",
+    "configs": ["CompatibilityTokenNewFNewCWitness.cfg"],
+    "witness": "Token policy is selected only when both client and worker links negotiated new capability."
+  }
+}

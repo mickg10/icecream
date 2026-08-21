@@ -1,0 +1,39 @@
+{
+  "schema": 1,
+  "scenario": "CompatibilityGlobalCapabilityMutant",
+  "property": "NoGlobalCapabilityLeak",
+  "expected_result": "counterexample",
+  "min_states": 6,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "LeakPriorTokenCapabilityIntoLegacyAssignment",
+      "all": [
+        {"path": "phase", "from": "Requested", "to": "Assigned"},
+        {"path": "globalCapability", "to": "Token"},
+        {"path": "expectedPolicy", "from": "None", "to": "Legacy"},
+        {"path": "policy", "from": "None", "to": "Token"},
+        {"path": "capabilityLeak", "from": false, "to": true}
+      ]
+    }
+  ],
+  "required_subsequence": ["LeakPriorTokenCapabilityIntoLegacyAssignment"],
+  "final_all": [
+    {"path": "globalCapability", "eq": "Token"},
+    {"path": "expectedPolicy", "eq": "Legacy"},
+    {"path": "policy", "eq": "Token"},
+    {"path": "capabilityLeak", "eq": true}
+  ],
+  "harness_steps": [
+    {
+      "after": "LeakPriorTokenCapabilityIntoLegacyAssignment",
+      "emit": "assert_prior_new_peer_capability_changed_later_old_peer_assignment_policy",
+      "actor": "scheduler"
+    }
+  ],
+  "metadata": {
+    "module": "MixedVersionCompatibilityChecked",
+    "configs": ["CompatibilityGlobalCapabilityMutant.cfg"],
+    "mutant": "MutantGlobalCapability = TRUE"
+  }
+}

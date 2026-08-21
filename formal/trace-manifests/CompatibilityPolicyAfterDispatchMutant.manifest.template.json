@@ -1,0 +1,40 @@
+{
+  "schema": 1,
+  "scenario": "CompatibilityPolicyAfterDispatchMutant",
+  "property": "PolicyChosenBeforeDispatch",
+  "expected_result": "counterexample",
+  "min_states": 3,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "DispatchBeforeAssignmentPolicyIsKnown",
+      "all": [
+        {"path": "phase", "from": "Requested", "to": "DispatchedUndecided"},
+        {"path": "expectedPolicy", "from": "None", "to_in": ["Legacy", "FencedLegacy", "Token"]},
+        {"path": "policy", "from": "None", "to": "Undecided"},
+        {"path": "guarantee", "to": "None"},
+        {"path": "policyChosenAfterDispatch", "from": false, "to": true},
+        {"path": "projectedTrace", "len_delta": 1}
+      ]
+    }
+  ],
+  "required_subsequence": ["DispatchBeforeAssignmentPolicyIsKnown"],
+  "final_all": [
+    {"path": "phase", "eq": "DispatchedUndecided"},
+    {"path": "policy", "eq": "Undecided"},
+    {"path": "guarantee", "eq": "None"},
+    {"path": "policyChosenAfterDispatch", "eq": true}
+  ],
+  "harness_steps": [
+    {
+      "after": "DispatchBeforeAssignmentPolicyIsKnown",
+      "emit": "assert_worker_was_selected_before_per_assignment_compatibility_policy",
+      "actor": "scheduler"
+    }
+  ],
+  "metadata": {
+    "module": "MixedVersionCompatibilityChecked",
+    "configs": ["CompatibilityPolicyAfterDispatchMutant.cfg"],
+    "mutant": "MutantChoosePolicyAfterDispatch = TRUE"
+  }
+}

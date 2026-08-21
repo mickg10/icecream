@@ -1,0 +1,41 @@
+{
+  "schema": 1,
+  "scenario": "CompatibilityMixedFencedTokenWitness",
+  "property": "NoMixedFencedToken",
+  "expected_result": "counterexample",
+  "min_states": 6,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "ObserveFencedLegacyAndTokenPoliciesInOneScheduler",
+      "all": [
+        {"path": "seenFenced", "to": true},
+        {"path": "seenToken", "to": true},
+        {"path": "phase", "from": "Requested", "to": "Assigned"}
+      ],
+      "any": [
+        {"path": "seenFenced", "from": false, "to": true},
+        {"path": "seenToken", "from": false, "to": true}
+      ]
+    }
+  ],
+  "required_subsequence": ["ObserveFencedLegacyAndTokenPoliciesInOneScheduler"],
+  "final_all": [
+    {"path": "seenFenced", "eq": true},
+    {"path": "seenToken", "eq": true},
+    {"path": "capabilityLeak", "eq": false},
+    {"path": "oldClientSawToken", "eq": false}
+  ],
+  "harness_steps": [
+    {
+      "after": "ObserveFencedLegacyAndTokenPoliciesInOneScheduler",
+      "emit": "assert_mixed_old_and_new_clients_select_worker_policy_per_assignment",
+      "actor": "scheduler"
+    }
+  ],
+  "metadata": {
+    "module": "MixedVersionCompatibilityChecked",
+    "configs": ["CompatibilityMixedFencedTokenWitness.cfg"],
+    "witness": "A new-worker fleet can serve old clients with FencedLegacy and new clients with Token in one scheduler session."
+  }
+}

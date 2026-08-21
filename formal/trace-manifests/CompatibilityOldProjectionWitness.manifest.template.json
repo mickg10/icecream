@@ -1,0 +1,42 @@
+{
+  "schema": 1,
+  "scenario": "CompatibilityOldProjectionWitness",
+  "property": "NoOldProjectionCompletion",
+  "expected_result": "counterexample",
+  "min_states": 7,
+  "event_mode": "exclusive",
+  "events": [
+    {
+      "name": "CompleteFrozenOldProtocolTrace",
+      "all": [
+        {"path": "phase", "from": "Started", "to": "Terminal"},
+        {"path": "oldProjectionComplete", "from": false, "to": true},
+        {"path": "normalCompleted", "from": false, "to": true},
+        {"path": "terminalCount", "from": 0, "to": 1},
+        {"path": "projectedTrace", "from_len": 5, "to_len": 6}
+      ]
+    }
+  ],
+  "required_subsequence": ["CompleteFrozenOldProtocolTrace"],
+  "final_all": [
+    {"path": "oldProjectionComplete", "eq": true},
+    {"path": "normalCompleted", "eq": true},
+    {"path": "phase", "eq": "Terminal"},
+    {"path": "projectedTrace", "eq": ["REQUEST", "ASSIGN", "USECS", "CLAIM", "BEGIN", "DONE"]},
+    {"path": "oldWorkerSawNewControl", "eq": false},
+    {"path": "oldClientSawToken", "eq": false},
+    {"path": "newTerminalToOld", "eq": false}
+  ],
+  "harness_steps": [
+    {
+      "after": "CompleteFrozenOldProtocolTrace",
+      "emit": "assert_old_peer_consumed_complete_frozen_message_sequence",
+      "actor": "old-codec-fixture"
+    }
+  ],
+  "metadata": {
+    "module": "MixedVersionCompatibilityChecked",
+    "configs": ["CompatibilityOldProjectionWitness.cfg"],
+    "witness": "The new scheduler's old-link projection is a complete frozen REQUEST/ASSIGN/USECS/CLAIM/BEGIN/DONE trace."
+  }
+}
