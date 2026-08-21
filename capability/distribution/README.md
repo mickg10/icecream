@@ -19,6 +19,10 @@ breakdowns, capacity distance, raw controls, and the wider independent-arena exp
 [`SIMULATOR-RULING-AUDIT.md`](SIMULATOR-RULING-AUDIT.md) audits the current engine against the
 ordered Issue 16 simulator additions and documents the first static stable/dense routing slice.
 
+[`FIREFOX-STATIC-ROUTING-SWEEP-RESULTS.md`](FIREFOX-STATIC-ROUTING-SWEEP-RESULTS.md) records the
+exact cold-plus-four-warm P29/GRZ round-robin and stable-frontier sweep, its byte/time closure,
+resource evidence, retained artifacts, and the selected next simulator stage.
+
 The initial scenario is `firefox-1c-20f.json`: one C, one corrected Firefox build,
 twenty one-slot Fs, 1 Gbit/s per direction and a 10 Gbit/s shared fabric.  All TUs are
 released at time zero for the first comparison.  A measured C-preprocessor release trace

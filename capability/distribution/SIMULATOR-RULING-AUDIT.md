@@ -22,7 +22,7 @@ Producer timing is not part of this model.
 
 | Order | Required addition | State at `c697107` | State in this branch |
 |---:|---|---|---|
-| 1 | static stable/dense routing with exact P29/GRZ bytes | Physical ledgers were exact, but their route map came only from a compile-only dynamic assignment. The schema named `rendezvous` without implementing it. | First coherent slice implemented. A stable compile identity is bound to one F inside a configurable dense home frontier. Both physical builders consume that route map, and replay refuses drift. A real-codec two-build smoke passes. The full Firefox width sweep remains the next experiment. |
+| 1 | static stable/dense routing with exact P29/GRZ bytes | Physical ledgers were exact, but their route map came only from a compile-only dynamic assignment. The schema named `rendezvous` without implementing it. | Complete. A stable compile identity is bound to one F inside a configurable dense home frontier. Both physical builders consume that route map, and replay refuses drift. The real-codec smoke and the full corrected Firefox round-robin/`k1`/`k2`/`k3`/`k4`/`k8`/`k20` sweep pass. See `FIREFOX-STATIC-ROUTING-SWEEP-RESULTS.md`. |
 | 2 | F decode/install/materialize/verify and compiler-pipe stages | Missing. P29 close delivery and GRZ frame delivery immediately meant input ready. | Still missing; this is the next simulator implementation slice after the exact width sweep. |
 | 3 | compiled-result return traffic | Missing. | Still missing. Add measured per-TU result bytes only after the F input stages are explicit. |
 | 4 | optional `ENV_ENSURE` | Missing, and the primary rows correctly assume resident environments. | Still missing. It remains an optional single-flight stress row and its bytes must stay separate from source bytes. |
@@ -129,28 +129,16 @@ for P29 and `018bef04367819aa34712241cae380e8ac07371610c410a4be2b7451b15b3c72`
 for GRZ.
 These tiny sizes validate the machinery; they are not a codec ranking.
 
-## Next experiment
+## Completed width experiment and next slice
 
-Run the corrected Firefox cold-plus-four-warm workload with separate scenario-bound ledgers for:
+The corrected cold-plus-four-warm Firefox width sweep is complete. Every routing/codec cell has
+its own scenario-bound real-codec ledger and corrected common-simulator replay. The exact byte,
+phase, build, time, resource, closure, and artifact results are in
+`FIREFOX-STATIC-ROUTING-SWEEP-RESULTS.md`. P29 `k8` is the selected primary row: it is both smaller
+and faster than the P29 round-robin and `k20` rows in the current model.
 
-```text
-round-robin control
-stable rendezvous k = 1, 2, 3, 4, 8, 20
-codec = P29, GRZ
-```
-
-Do not reuse one physical ledger across different route maps. For each cell, report:
-
-```text
-complete C-to-F and F-to-C physical bytes
-cold and each warm-build bytes
-Root / Need / Lines / Fill / close / Ack or GRZ-frame breakdown
-selected home frontier and populated F count
-per-F jobs, bytes, and retained codec state
-last input-ready, last route commit, last compile finish, and build finish
-summed active-generation time and capacity floors
-stable TU destination retention from cold to warm builds
-```
-
-That sweep answers the replication curve honestly. Only then should the simulator add explicit F
-decode/install/materialize/verify/compiler-pipe stages and rerun selected frontier cells.
+The next coherent simulator slice is now ruling item 2: explicit F
+decode/install/materialize/verify/compiler-pipe stages. Preserve the exact source ledgers and route
+assignments, add measured per-TU stage work and JSONL state, and rerun P29 `k8`, P29 round-robin,
+and GRZ `k8`. Do not introduce preprocessing. Compiled-result return traffic remains the following
+separate slice.
