@@ -1,6 +1,7 @@
 EXTRA_DIST = \
 	README.md \
 	capability/distribution/firefox-corrected.compile-trace.tsv \
+	capability/grouprlz/p29_online_s1.h \
 	capability/grouprlz/runway-census.tsv
 
 ACLOCAL_AMFLAGS = -I m4

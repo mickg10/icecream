@@ -1,0 +1,935 @@
+#include "p50_slice0.h"
+
+#include <algorithm>
+#include <functional>
+#include <limits>
+#include <stdexcept>
+#include <utility>
+
+namespace icecc::p50 {
+namespace {
+
+bool byte_object(ObjectType type) {
+    return type == ObjectType::Atom || type == ObjectType::Line ||
+           type == ObjectType::Material || type == ObjectType::Path ||
+           type == ObjectType::Blob;
+}
+
+std::vector<uint8_t> encode_payload(ObjectType type, const ObjectPayload& payload) {
+    std::vector<uint8_t> result;
+    const auto append_u64 = [&](uint64_t value) {
+        for (int shift = 56; shift >= 0; shift -= 8)
+            result.push_back(static_cast<uint8_t>(value >> shift));
+    };
+    if (const auto* bytes = std::get_if<BytesPayload>(&payload)) {
+        result.push_back(0);
+        append_u64(bytes->bytes.size());
+        result.insert(result.end(), bytes->bytes.begin(), bytes->bytes.end());
+    } else {
+        const auto& children = std::get<ChildrenPayload>(payload).children;
+        result.push_back(1);
+        append_u64(children.size());
+        for (Key64 child : children) append_u64(child.wire_value());
+    }
+    (void)type;
+    return result;
+}
+
+uint64_t read_u64(std::span<const uint8_t> bytes, size_t& offset) {
+    if (bytes.size() - offset < 8)
+        throw std::invalid_argument("canonical object payload ended early");
+    uint64_t result = 0;
+    for (unsigned i = 0; i != 8; ++i) result = (result << 8) | bytes[offset++];
+    return result;
+}
+
+ObjectPayload decode_object_payload(ObjectType type, std::span<const uint8_t> bytes) {
+    if (bytes.empty()) throw std::invalid_argument("canonical object payload is empty");
+    size_t offset = 1;
+    const uint64_t count = read_u64(bytes, offset);
+    if (bytes[0] == 0) {
+        if (!byte_object(type) || count != bytes.size() - offset)
+            throw std::invalid_argument("byte object payload has the wrong shape");
+        return BytesPayload{{bytes.begin() + offset, bytes.end()}};
+    }
+    if (bytes[0] != 1 || byte_object(type) || count > (bytes.size() - offset) / 8 ||
+        count * 8 != bytes.size() - offset)
+        throw std::invalid_argument("child object payload has the wrong shape");
+    ChildrenPayload result;
+    result.children.reserve(static_cast<size_t>(count));
+    for (uint64_t i = 0; i != count; ++i) {
+        const auto key = Key64::from_wire(read_u64(bytes, offset));
+        if (!key) throw std::invalid_argument("child object contains invalid Key64");
+        result.children.push_back(*key);
+    }
+    return result;
+}
+
+Digest128 object_digest(ObjectType type, const ObjectPayload& payload) {
+    const std::vector<uint8_t> encoded = encode_payload(type, payload);
+    Digest128Builder out;
+    out.append("ICECC-P50-OBJECT-V1");
+    out.append_u8(static_cast<uint8_t>(type));
+    out.append_u64(encoded.size());
+    out.append(encoded);
+    return out.finish();
+}
+
+void append_materialized(const ImmutableObjectStore& objects, Key64 key,
+                         std::set<Key64>& visiting, std::set<Key64>& reached,
+                         std::vector<uint8_t>& output) {
+    const ImmutableObject* object = objects.find(key);
+    if (!object) throw std::logic_error("materialization references a missing object");
+    if (!visiting.insert(key).second)
+        throw std::logic_error("immutable object graph contains a cycle");
+    reached.insert(key);
+    if (const auto* bytes = std::get_if<BytesPayload>(&object->payload)) {
+        if (bytes->bytes.size() > output.max_size() - output.size())
+            throw std::overflow_error("materialized input exceeds addressable size");
+        output.insert(output.end(), bytes->bytes.begin(), bytes->bytes.end());
+    } else {
+        for (Key64 child : std::get<ChildrenPayload>(object->payload).children)
+            append_materialized(objects, child, visiting, reached, output);
+    }
+    visiting.erase(key);
+}
+
+std::vector<uint8_t> materialize_objects(const ImmutableObjectStore& objects,
+                                         std::span<const Key64> roots,
+                                         std::set<Key64>* reached = nullptr) {
+    std::set<Key64> visiting;
+    std::set<Key64> local_reached;
+    std::vector<uint8_t> result;
+    for (Key64 root : roots)
+        append_materialized(objects, root, visiting, local_reached, result);
+    if (reached) *reached = std::move(local_reached);
+    return result;
+}
+
+std::vector<uint8_t> encode_key_vector(std::span<const Key64> keys) {
+    if (keys.empty()) return {};
+    if (keys.size() > std::numeric_limits<uint32_t>::max())
+        throw std::overflow_error("Key64 vector exceeds u32 count");
+    std::vector<uint8_t> result;
+    result.reserve(4 + keys.size() * 8);
+    const uint32_t count = static_cast<uint32_t>(keys.size());
+    for (int shift = 24; shift >= 0; shift -= 8)
+        result.push_back(static_cast<uint8_t>(count >> shift));
+    for (Key64 key : keys)
+        for (int shift = 56; shift >= 0; shift -= 8)
+            result.push_back(static_cast<uint8_t>(key.wire_value() >> shift));
+    return result;
+}
+
+std::vector<Key64> decode_key_vector(std::span<const uint8_t> bytes) {
+    if (bytes.empty()) return {};
+    if (bytes.size() < 4) throw std::invalid_argument("key vector ended before count");
+    uint32_t count = 0;
+    for (unsigned i = 0; i != 4; ++i) count = (count << 8) | bytes[i];
+    if (bytes.size() != 4 + uint64_t(count) * 8)
+        throw std::invalid_argument("key vector length does not match count");
+    std::vector<Key64> result;
+    result.reserve(count);
+    size_t offset = 4;
+    for (uint32_t i = 0; i != count; ++i) {
+        uint64_t raw = 0;
+        for (unsigned j = 0; j != 8; ++j) raw = (raw << 8) | bytes[offset++];
+        const auto key = Key64::from_wire(raw);
+        if (!key) throw std::invalid_argument("key vector contains invalid Key64");
+        result.push_back(*key);
+    }
+    return result;
+}
+
+bool same_commit(const TxCommit& commit, const CActiveTx& active) {
+    const Digest128 expected_post = compute_post_state_digest(
+        active.begin.pre_state_digest, active.begin.history_nonce,
+        active.begin.rel_seq, active.begin.tu_seq, active.begin.transaction_digest);
+    return commit.history_nonce == active.begin.history_nonce &&
+           commit.rel_seq == active.begin.rel_seq &&
+           commit.tu_seq == active.begin.tu_seq &&
+           commit.transaction_digest == active.begin.transaction_digest &&
+           commit.raw_digest == active.begin.raw_digest &&
+           commit.post_state_digest == expected_post;
+}
+
+bool same_begin(const TxBegin& left, const TxBegin& right) { return left == right; }
+
+}  // namespace
+
+ImmutableObject ImmutableObject::bytes(Key64 key,
+                                       std::span<const uint8_t> payload) {
+    ImmutableObject result{key, BytesPayload{{payload.begin(), payload.end()}}, {}};
+    result.content_digest = object_digest(key.type(), result.payload);
+    if (!result.valid_shape()) throw std::invalid_argument("invalid byte object shape");
+    return result;
+}
+
+ImmutableObject ImmutableObject::children(Key64 key,
+                                          std::span<const Key64> payload) {
+    ImmutableObject result{key, ChildrenPayload{{payload.begin(), payload.end()}}, {}};
+    result.content_digest = object_digest(key.type(), result.payload);
+    if (!result.valid_shape()) throw std::invalid_argument("invalid child object shape");
+    return result;
+}
+
+ImmutableObject ImmutableObject::from_record(const FillRecord& record) {
+    if (!record.key.valid()) throw std::invalid_argument("FILL object has invalid Key64");
+    ImmutableObject result{record.key,
+                           decode_object_payload(record.key.type(), record.object_bytes),
+                           record.content_digest};
+    if (!result.valid_shape())
+        throw std::invalid_argument("FILL object content does not match its digest or type");
+    return result;
+}
+
+bool ImmutableObject::valid_shape() const {
+    if (!key.valid() || content_digest != object_digest(key.type(), payload)) return false;
+    if (byte_object(key.type())) return std::holds_alternative<BytesPayload>(payload);
+    const auto* children = std::get_if<ChildrenPayload>(&payload);
+    if (!children) return false;
+    if (key.type() == ObjectType::Block)
+        return std::all_of(children->children.begin(), children->children.end(),
+                           [](Key64 child) { return child.type() == ObjectType::Region; });
+    return key.type() == ObjectType::Region &&
+           std::all_of(children->children.begin(), children->children.end(),
+                       [](Key64 child) {
+                           return child.valid() && child.type() != ObjectType::Region &&
+                                  child.type() != ObjectType::Block;
+                       });
+}
+
+std::vector<uint8_t> ImmutableObject::canonical_payload() const {
+    return encode_payload(key.type(), payload);
+}
+
+FillRecord ImmutableObject::fill_record() const {
+    return {key, content_digest, canonical_payload()};
+}
+
+ObjectApplyResult ImmutableObjectStore::apply(const ImmutableObject& object) {
+    if (!object.valid_shape()) throw std::invalid_argument("invalid immutable object");
+    auto [position, inserted] = objects_.emplace(object.key, object);
+    if (inserted) return ObjectApplyResult::Applied;
+    if (position->second != object)
+        throw std::logic_error("Key64 already names different immutable content");
+    return ObjectApplyResult::Duplicate;
+}
+
+const ImmutableObject* ImmutableObjectStore::find(Key64 key) const {
+    const auto position = objects_.find(key);
+    return position == objects_.end() ? nullptr : &position->second;
+}
+
+CObjectArena::CObjectArena(CStoreGuid guid, uint16_t generation,
+                           uint64_t first_ordinal)
+    : guid_(guid), generation_(generation), first_ordinal_(first_ordinal) {
+    if (generation > KeyLayoutV1::generation_value_mask)
+        throw std::invalid_argument("Key64 generation exceeds KeyLayoutV1");
+    if (first_ordinal == 0 || first_ordinal > KeyLayoutV1::ordinal_mask)
+        throw std::invalid_argument("Key64 first ordinal exceeds KeyLayoutV1");
+    next_ordinal_.fill(first_ordinal_);
+}
+
+Key64 CObjectArena::allocate(ObjectType type) {
+    if (!Key64::make(type, generation_, 1))
+        throw std::invalid_argument("unknown Key64 object type");
+    const uint8_t type_value = static_cast<uint8_t>(type);
+    uint64_t& next = next_ordinal_[type_value];
+    if (next == 0 || next > KeyLayoutV1::ordinal_mask)
+        throw std::overflow_error("Key64 ordinal space exhausted");
+    const std::optional<Key64> key = Key64::make(type, generation_, next);
+    if (!key) throw std::invalid_argument("invalid Key64 arena allocation");
+    next = next == KeyLayoutV1::ordinal_mask ? 0 : next + 1;
+    return *key;
+}
+
+std::optional<Key64> CObjectArena::find_equal(ObjectType type,
+                                              const ObjectPayload& payload,
+                                              Digest128 digest) const {
+    const auto position = content_index_.find(digest);
+    if (position == content_index_.end()) return std::nullopt;
+    for (Key64 key : position->second) {
+        const ImmutableObject& object = this->object(key);
+        if (key.type() == type && object.payload == payload) return key;
+    }
+    return std::nullopt;
+}
+
+Key64 CObjectArena::install(ObjectType type, ObjectPayload payload) {
+    const Digest128 digest = object_digest(type, payload);
+    if (const auto existing = find_equal(type, payload, digest)) return *existing;
+    const Key64 key = allocate(type);
+    ImmutableObject object{key, std::move(payload), digest};
+    objects_.apply(object);
+    content_index_[digest].push_back(key);
+    return key;
+}
+
+Key64 CObjectArena::intern_bytes(ObjectType type,
+                                 std::span<const uint8_t> payload) {
+    if (!Key64::make(type, generation_, 1))
+        throw std::invalid_argument("unknown Key64 object type");
+    if (!byte_object(type)) throw std::invalid_argument("object type does not carry bytes");
+    return install(type, BytesPayload{{payload.begin(), payload.end()}});
+}
+
+Key64 CObjectArena::intern_children(ObjectType type,
+                                    std::span<const Key64> payload) {
+    const std::optional<Key64> probe = Key64::make(type, generation_, 1);
+    if (!probe) throw std::invalid_argument("unknown Key64 object type");
+    if (byte_object(type)) throw std::invalid_argument("object type does not carry children");
+    ObjectPayload candidate = ChildrenPayload{{payload.begin(), payload.end()}};
+    ImmutableObject shape{*probe, candidate, object_digest(type, candidate)};
+    if (!shape.valid_shape()) throw std::invalid_argument("invalid child object shape");
+    return install(type, std::move(candidate));
+}
+
+GenerationAdvanceResult CObjectArena::advance_generation() {
+    if (generation_ == KeyLayoutV1::generation_value_mask)
+        return GenerationAdvanceResult::GuidFlipRequired;
+    ++generation_;
+    next_ordinal_.fill(first_ordinal_);
+    return GenerationAdvanceResult::Advanced;
+}
+
+const ImmutableObject& CObjectArena::object(Key64 key) const {
+    const ImmutableObject* result = objects_.find(key);
+    if (!result) throw std::out_of_range("Key64 is absent from C object arena");
+    return *result;
+}
+
+CAuthority::CAuthority(CStoreGuid guid, p29::OnlineS1::Config config,
+                       uint16_t generation, uint64_t first_ordinal)
+    : arena_(guid, generation, first_ordinal), s1_config_(config) {}
+
+TuSeq CAuthority::allocate_tu_seq() {
+    if (tu_seq_exhausted_) throw std::overflow_error("TU_SEQ space exhausted");
+    const TuSeq result{next_tu_seq_};
+    if (next_tu_seq_ == std::numeric_limits<uint64_t>::max())
+        tu_seq_exhausted_ = true;
+    else
+        ++next_tu_seq_;
+    return result;
+}
+
+uint32_t CAuthority::dense_region(Key64 key) {
+    if (key.type() != ObjectType::Region || !arena_.objects().contains(key))
+        throw std::invalid_argument("PreparedTU root is not a C Region object");
+    const auto found = region_to_dense_.find(key);
+    if (found != region_to_dense_.end()) return found->second;
+    if (dense_to_region_.size() >= std::numeric_limits<uint32_t>::max())
+        throw std::overflow_error("dense Region space exceeds P29 u32");
+    const uint32_t id = static_cast<uint32_t>(dense_to_region_.size());
+    dense_to_region_.push_back(key);
+    region_to_dense_.emplace(key, id);
+    return id;
+}
+
+PreparedTUPtr CAuthority::prepare_tu(std::span<const uint8_t> exact_input,
+                                     std::span<const Key64> regions) {
+    const std::vector<uint8_t> materialized = materialize(arena_.objects(), regions);
+    if (materialized.size() != exact_input.size() ||
+        !std::equal(materialized.begin(), materialized.end(), exact_input.begin()))
+        throw std::invalid_argument("PreparedTU Regions do not reproduce exact input");
+    std::vector<uint32_t> dense;
+    dense.reserve(regions.size());
+    for (Key64 key : regions) dense.push_back(dense_region(key));
+    auto prepared = std::make_shared<PreparedTU>();
+    prepared->tu_seq = allocate_tu_seq();
+    prepared->raw_bytes = exact_input.size();
+    prepared->raw_digest = digest128(exact_input);
+    prepared->regions.assign(regions.begin(), regions.end());
+    prepared->dense_regions = std::move(dense);
+    return prepared;
+}
+
+PreparedTUPtr CAuthority::prepare_from_regions(
+    std::span<const std::vector<uint8_t>> region_bytes) {
+    std::vector<Key64> regions;
+    std::vector<uint8_t> exact;
+    regions.reserve(region_bytes.size());
+    for (const auto& bytes : region_bytes) {
+        const Key64 line = arena_.intern_bytes(ObjectType::Line, bytes);
+        const std::array<Key64, 1> children{line};
+        regions.push_back(arena_.intern_children(ObjectType::Region, children));
+        exact.insert(exact.end(), bytes.begin(), bytes.end());
+    }
+    return prepare_tu(exact, regions);
+}
+
+Key64 CAuthority::dense_region_key(uint32_t id) const { return dense_to_region_.at(id); }
+Key64 CAuthority::block_key(uint32_t id) const { return block_keys_.at(id); }
+
+void CAuthority::publish_new_p29_blocks() {
+    while (block_keys_.size() < block_catalogue_.size()) {
+        const p29::Block& block = block_catalogue_.block(
+            static_cast<uint32_t>(block_keys_.size()));
+        std::vector<Key64> children;
+        children.reserve(block.regions.size());
+        for (uint32_t id : block.regions) children.push_back(dense_region_key(id));
+        block_keys_.push_back(arena_.intern_children(ObjectType::Block, children));
+    }
+}
+
+std::vector<Key64> CAuthority::transitive_manifest(
+    std::span<const Key64> roots) const {
+    std::set<Key64> seen;
+    std::function<void(Key64)> visit = [&](Key64 key) {
+        if (!seen.insert(key).second) return;
+        const ImmutableObject& object = arena_.object(key);
+        if (const auto* children = std::get_if<ChildrenPayload>(&object.payload))
+            for (Key64 child : children->children) visit(child);
+    };
+    for (Key64 root : roots) visit(root);
+    return {seen.begin(), seen.end()};
+}
+
+std::vector<uint8_t> CAuthority::materialize(
+    const ImmutableObjectStore& objects, std::span<const Key64> roots) const {
+    return materialize_objects(objects, roots);
+}
+
+CRoute::CRoute(CAuthority& authority, FStoreGuid f_store_guid,
+               HistoryNonce history_nonce, ActionTrace* trace)
+    : authority_(authority), f_store_guid_(f_store_guid),
+      history_nonce_(history_nonce),
+      state_digest_(initial_route_digest(authority.guid(), history_nonce)),
+      matcher_(std::make_unique<p29::OnlineS1>(authority.s1_config(),
+                                               authority.block_catalogue())),
+      trace_(trace) {}
+
+CRoute::~CRoute() = default;
+
+const CActiveTx& CRoute::begin(const PreparedTUPtr& prepared,
+                              P29RootMode root_mode) {
+    if (!prepared) throw std::invalid_argument("cannot route a null PreparedTU");
+    if (active_) throw std::logic_error("C route already has one ACTIVE_TX");
+    if (next_rel_seq_.value == std::numeric_limits<uint64_t>::max())
+        throw std::overflow_error("REL_SEQ space exhausted");
+    try {
+        const p29::TuPlan& plan = matcher_->prepare(prepared->dense_regions);
+        authority_.publish_new_p29_blocks();
+        CActiveTx active;
+        active.prepared = prepared;
+        if (root_mode == P29RootMode::RouteHistory) {
+            active.root.reserve(plan.root.size());
+            for (const p29::Ref& ref : plan.root)
+                active.root.push_back(ref.kind == p29::RefKind::Region
+                                          ? authority_.dense_region_key(ref.id)
+                                          : authority_.block_key(ref.id));
+        } else if (root_mode == P29RootMode::HistoryIndependent) {
+            active.root = prepared->regions;
+        } else {
+            throw std::invalid_argument("unsupported P29 root mode");
+        }
+        active.manifest = authority_.transitive_manifest(active.root);
+        active.dict = encode_key_vector(active.manifest);
+        active.body = encode_key_vector(active.root);
+        active.begin.history_nonce = history_nonce_;
+        active.begin.rel_seq = next_rel_seq_;
+        active.begin.tu_seq = prepared->tu_seq;
+        active.begin.profile = ProfileId::P29;
+        active.begin.p29_root_mode = root_mode;
+        active.begin.pre_state_digest = state_digest_;
+        active.begin.dict = describe_component(kP29KeyVectorEncoding, active.dict,
+                                               active.manifest.size());
+        active.begin.body = describe_component(kP29KeyVectorEncoding, active.body,
+                                               active.root.size());
+        active.begin.raw_bytes = prepared->raw_bytes;
+        active.begin.raw_digest = prepared->raw_digest;
+        active.begin.transaction_digest = compute_transaction_digest(
+            active.begin, active.dict, active.body);
+        active_ = std::move(active);
+        record(ActionType::TX_BEGIN, *active_);
+    } catch (...) {
+        if (matcher_->has_pending()) matcher_->abort();
+        active_.reset();
+        throw;
+    }
+    return *active_;
+}
+
+std::vector<ImmutableObject> CRoute::build_fill(const Need& need) const {
+    if (!active_) throw std::logic_error("C route has no ACTIVE_TX");
+    if (need.history_nonce != active_->begin.history_nonce ||
+        need.rel_seq != active_->begin.rel_seq || need.tu_seq != active_->begin.tu_seq ||
+        need.transaction_digest != active_->begin.transaction_digest)
+        throw std::logic_error("Need does not identify C's ACTIVE_TX");
+    if (!std::is_sorted(need.missing.begin(), need.missing.end()) ||
+        std::adjacent_find(need.missing.begin(), need.missing.end()) != need.missing.end())
+        throw std::logic_error("Need is not an exact sorted set");
+    std::vector<ImmutableObject> result;
+    result.reserve(need.missing.size());
+    for (Key64 key : need.missing) {
+        if (!std::binary_search(active_->manifest.begin(), active_->manifest.end(), key))
+            throw std::logic_error("Need requests a key outside the manifest");
+        result.push_back(authority_.arena().object(key));
+    }
+    return result;
+}
+
+void CRoute::record(ActionType action, const CActiveTx& active) {
+    if (!trace_) return;
+    ActionRecord record;
+    record.action = action;
+    record.actor = ActorSide::C;
+    record.c_store_guid = authority_.guid();
+    record.f_store_guid = f_store_guid_;
+    record.history_nonce = active.begin.history_nonce;
+    record.rel_seq = active.begin.rel_seq;
+    record.tu_seq = active.begin.tu_seq;
+    record.transaction_digest = active.begin.transaction_digest;
+    record.raw_digest = active.begin.raw_digest;
+    record.state_digest =
+        action == ActionType::COMMIT_ACCEPTED ||
+                action == ActionType::LOST_COMMIT_ACCEPTED
+            ? compute_post_state_digest(active.begin.pre_state_digest,
+                                        active.begin.history_nonce,
+                                        active.begin.rel_seq,
+                                        active.begin.tu_seq,
+                                        active.begin.transaction_digest)
+            : active.begin.pre_state_digest;
+    trace_->record(std::move(record));
+}
+
+void CRoute::accept_commit(const TxCommit& committed, ActionType action) {
+    if (!active_) throw std::logic_error("C route has no ACTIVE_TX to commit");
+    if (action != ActionType::COMMIT_ACCEPTED &&
+        action != ActionType::LOST_COMMIT_ACCEPTED)
+        throw std::invalid_argument("invalid commit action");
+    if (!same_commit(committed, *active_))
+        throw std::logic_error("TX_COMMIT does not close C's ACTIVE_TX");
+    matcher_->commit();
+    state_digest_ = committed.post_state_digest;
+    record(action, *active_);
+    ++next_rel_seq_.value;
+    active_.reset();
+}
+
+void CRoute::abandon_active() {
+    if (!active_) return;
+    record(ActionType::TX_ABORTED, *active_);
+    matcher_->abort();
+    active_.reset();
+}
+
+void CRoute::reset_history(FStoreGuid f_store_guid, HistoryNonce history_nonce) {
+    if (history_nonce == history_nonce_)
+        throw std::invalid_argument("history reset requires a fresh HISTORY_NONCE");
+    abandon_active();
+    f_store_guid_ = f_store_guid;
+    history_nonce_ = history_nonce;
+    next_rel_seq_ = RelSeq{0};
+    state_digest_ = initial_route_digest(authority_.guid(), history_nonce_);
+    matcher_ = std::make_unique<p29::OnlineS1>(authority_.s1_config(),
+                                               authority_.block_catalogue());
+}
+
+struct FStore::Namespace {
+    struct FPending {
+        explicit FPending(TxBegin value) : begin(std::move(value)) {}
+        TxBegin begin;
+        std::vector<uint8_t> dict;
+        std::vector<uint8_t> body;
+        bool dict_complete = false;
+        bool body_complete = false;
+        std::vector<Key64> manifest;
+        std::vector<Key64> root;
+        std::set<Key64> requested;
+        std::set<Key64> remaining;
+        FillStreamDecoder partial_fill;
+        std::optional<std::vector<uint8_t>> materialized;
+    };
+
+    struct Route {
+        HistoryNonce history_nonce{};
+        RelSeq next_rel_seq{};
+        Digest128 state_digest{};
+        std::optional<TxCommit> last_commit;
+        std::optional<FPending> pending;
+    };
+
+    bool established = false;
+    uint64_t active_session_serial = 0;
+    ImmutableObjectStore objects;
+    std::optional<Route> route;
+};
+
+FStore::FStore(FStoreGuid guid, uint64_t first_session_serial, ActionTrace* trace)
+    : guid_(guid), next_session_serial_(first_session_serial), trace_(trace) {
+    if (first_session_serial == 0)
+        throw std::invalid_argument("first session serial must be nonzero");
+}
+
+FStore::~FStore() = default;
+
+void FStore::record(ActionType action, SessionHandle session, const TxBegin* begin,
+                    std::optional<Key64> key, Digest128 content_digest,
+                    uint64_t remaining_need,
+                    bool duplicate, std::span<const Key64> need_keys) {
+    if (!trace_) return;
+    ActionRecord record;
+    record.action = action;
+    record.actor = ActorSide::F;
+    record.c_store_guid = session.c_store_guid;
+    record.f_store_guid = guid_;
+    record.session_serial = session.serial;
+    record.key = key;
+    record.content_digest = content_digest;
+    record.need_keys.assign(need_keys.begin(), need_keys.end());
+    record.remaining_need = remaining_need;
+    record.duplicate = duplicate;
+    const auto position = namespaces_.find(session.c_store_guid);
+    if (position != namespaces_.end() && position->second->route) {
+        record.history_nonce = position->second->route->history_nonce;
+        record.rel_seq = position->second->route->next_rel_seq;
+        record.state_digest = position->second->route->state_digest;
+    }
+    if (begin) {
+        record.history_nonce = begin->history_nonce;
+        record.rel_seq = begin->rel_seq;
+        record.tu_seq = begin->tu_seq;
+        record.transaction_digest = begin->transaction_digest;
+        record.raw_digest = begin->raw_digest;
+        if (action != ActionType::INPUT_COMMITTED)
+            record.state_digest = begin->pre_state_digest;
+    }
+    trace_->record(std::move(record));
+}
+
+SessionHandle FStore::connect(CStoreGuid c_store_guid) {
+    if (session_serial_exhausted_)
+        throw std::overflow_error("session serial space exhausted until F store reset");
+    const uint64_t serial = next_session_serial_;
+    if (serial == std::numeric_limits<uint64_t>::max())
+        session_serial_exhausted_ = true;
+    else
+        ++next_session_serial_;
+    auto [position, inserted] = namespaces_.try_emplace(c_store_guid);
+    if (inserted) position->second = std::make_unique<Namespace>();
+    Namespace& space = *position->second;
+    const bool replaces = space.active_session_serial != 0;
+    if (space.route) space.route->pending.reset();
+    space.active_session_serial = serial;
+    const SessionHandle session{c_store_guid, guid_, serial};
+    record(replaces ? ActionType::SESSION_REPLACED : ActionType::SESSION_OPENED,
+           session, nullptr);
+    return session;
+}
+
+void FStore::disconnect(SessionHandle session) {
+    Namespace& space = require_namespace(session);
+    if (space.route) space.route->pending.reset();
+    record(ActionType::SESSION_DISCONNECTED, session, nullptr);
+    space.active_session_serial = 0;
+}
+
+SessionState FStore::resume(SessionHandle session) const {
+    const Namespace& space = require_namespace(session);
+    SessionState result;
+    result.f_store_guid = guid_;
+    result.namespace_present = space.established;
+    result.route_present = space.route.has_value();
+    if (space.route) {
+        result.history_nonce = space.route->history_nonce;
+        result.next_rel_seq = space.route->next_rel_seq;
+        result.state_digest = space.route->state_digest;
+        result.last_commit = space.route->last_commit;
+    }
+    return result;
+}
+
+void FStore::start_route(SessionHandle session, HistoryNonce history_nonce,
+                         Digest128 initial_state_digest) {
+    Namespace& space = require_namespace(session);
+    if (space.route) throw std::logic_error("F route already exists");
+    if (initial_state_digest !=
+        initial_route_digest(session.c_store_guid, history_nonce))
+        throw std::logic_error("HISTORY_RESET initial digest was not derived from its route");
+    space.established = true;
+    space.route = Namespace::Route{};
+    space.route->history_nonce = history_nonce;
+    space.route->state_digest = initial_state_digest;
+    record(ActionType::HISTORY_RESET, session, nullptr);
+}
+
+void FStore::begin(SessionHandle session, const TxBegin& begin, bool replay) {
+    Namespace& space = require_namespace(session);
+    if (!space.established || !space.route)
+        throw std::logic_error("F route has not been established");
+    Namespace::Route& route = *space.route;
+    if (begin.history_nonce != route.history_nonce || begin.rel_seq != route.next_rel_seq ||
+        begin.pre_state_digest != route.state_digest)
+        throw std::logic_error("TX_BEGIN does not match F's route cursor");
+    if (begin.profile != ProfileId::P29 ||
+        (begin.p29_root_mode != P29RootMode::RouteHistory &&
+         begin.p29_root_mode != P29RootMode::HistoryIndependent))
+        throw std::invalid_argument("TX_BEGIN profile/root mode is unsupported in M1");
+    if (begin.dict.encoding != kP29KeyVectorEncoding ||
+        begin.body.encoding != kP29KeyVectorEncoding)
+        throw std::invalid_argument("P29 DICT/BODY key-vector encoding is unsupported");
+    if (route.next_rel_seq.value == std::numeric_limits<uint64_t>::max())
+        throw std::overflow_error("F REL_SEQ space exhausted");
+    if (route.pending) {
+        if (!same_begin(route.pending->begin, begin))
+            throw std::logic_error("F route already has a different ACTIVE_TX");
+        return;
+    }
+    route.pending.emplace(begin);
+    record(replay ? ActionType::ACTIVE_REPLAYED : ActionType::TX_BEGIN,
+           session, &begin);
+    if (begin.dict.encoded_bytes == 0)
+        append_component(session, true, std::span<const uint8_t>{});
+    if (begin.body.encoded_bytes == 0)
+        append_component(session, false, std::span<const uint8_t>{});
+}
+
+void FStore::append_component(SessionHandle session, bool dict,
+                              std::span<const uint8_t> bytes) {
+    Namespace& space = require_namespace(session);
+    if (!space.route || !space.route->pending)
+        throw std::logic_error("component data has no F ACTIVE_TX");
+    Namespace::FPending& pending = *space.route->pending;
+    std::vector<uint8_t>& target = dict ? pending.dict : pending.body;
+    bool& complete = dict ? pending.dict_complete : pending.body_complete;
+    const ComponentDescriptor& descriptor = dict ? pending.begin.dict : pending.begin.body;
+    if (complete) {
+        if (!bytes.empty()) throw std::logic_error("component received bytes after completion");
+        return;
+    }
+    if (bytes.size() > descriptor.encoded_bytes - target.size())
+        throw std::length_error("component exceeds its declared byte count");
+    target.insert(target.end(), bytes.begin(), bytes.end());
+    if (target.size() != descriptor.encoded_bytes) return;
+    if (digest128(target) != descriptor.digest)
+        throw std::logic_error("component digest does not match TX_BEGIN");
+    complete = true;
+    if (dict) {
+        pending.manifest = decode_key_vector(target);
+        if (pending.manifest.size() != descriptor.decoded_bytes)
+            throw std::logic_error("DICT decoded count does not match its descriptor");
+        if (!std::is_sorted(pending.manifest.begin(), pending.manifest.end()) ||
+            std::adjacent_find(pending.manifest.begin(), pending.manifest.end()) !=
+                pending.manifest.end())
+            throw std::logic_error("DICT manifest is not an exact sorted set");
+        for (Key64 key : pending.manifest)
+            if (!space.objects.contains(key)) pending.requested.insert(key);
+        pending.remaining = pending.requested;
+        record(ActionType::DICT_COMPLETE, session, &pending.begin);
+        const std::vector<Key64> exact_need(pending.requested.begin(),
+                                            pending.requested.end());
+        record(ActionType::NEED_RECORDED, session, &pending.begin, std::nullopt,
+               {}, pending.remaining.size(), false, exact_need);
+    } else {
+        pending.root = decode_key_vector(target);
+        if (pending.root.size() != descriptor.decoded_bytes)
+            throw std::logic_error("BODY decoded count does not match its descriptor");
+        record(ActionType::BODY_COMPLETE, session, &pending.begin);
+    }
+    if (pending.dict_complete && pending.body_complete) {
+        if (compute_transaction_digest(pending.begin, pending.dict, pending.body) !=
+            pending.begin.transaction_digest)
+            throw std::logic_error("transaction digest does not match its exact components");
+        for (Key64 root : pending.root)
+            if (!std::binary_search(pending.manifest.begin(), pending.manifest.end(), root))
+                throw std::logic_error("BODY root is outside the DICT manifest");
+    }
+}
+
+void FStore::append_dict(SessionHandle session, std::span<const uint8_t> bytes) {
+    append_component(session, true, bytes);
+}
+
+void FStore::append_body(SessionHandle session, std::span<const uint8_t> bytes) {
+    append_component(session, false, bytes);
+}
+
+Need FStore::need(SessionHandle session) const {
+    const Namespace& space = require_namespace(session);
+    if (!space.route || !space.route->pending || !space.route->pending->dict_complete)
+        throw std::logic_error("Need is unavailable before the exact DICT");
+    const Namespace::FPending& pending = *space.route->pending;
+    return {pending.begin.history_nonce, pending.begin.rel_seq, pending.begin.tu_seq,
+            pending.begin.transaction_digest,
+            {pending.requested.begin(), pending.requested.end()}};
+}
+
+ObjectApplied FStore::apply_object(SessionHandle session,
+                                   const ImmutableObject& object) {
+    Namespace& space = require_namespace(session);
+    if (!space.route || !space.route->pending ||
+        !space.route->pending->dict_complete)
+        throw std::logic_error("object application has no exact active Need");
+    Namespace::FPending& pending = *space.route->pending;
+    if (!pending.requested.contains(object.key))
+        throw std::logic_error("object was not in F's recorded Need set");
+    const bool still_missing = pending.remaining.contains(object.key);
+    const ObjectApplyResult result = space.objects.apply(object);
+    if (still_missing) pending.remaining.erase(object.key);
+    if (!still_missing && result != ObjectApplyResult::Duplicate)
+        throw std::logic_error("closed Need key was unexpectedly absent");
+    record(ActionType::OBJECT_APPLIED, session, &pending.begin, object.key,
+           object.content_digest, pending.remaining.size(),
+           result == ObjectApplyResult::Duplicate);
+    return {object.key, object.content_digest, result};
+}
+
+std::vector<ObjectApplied> FStore::append_fill(SessionHandle session,
+                                               const FillMessage& message) {
+    Namespace& space = require_namespace(session);
+    if (!space.route || !space.route->pending)
+        throw std::logic_error("FILL has no F ACTIVE_TX");
+    const std::vector<FillRecord> records =
+        space.route->pending->partial_fill.push(message);
+    std::vector<ObjectApplied> result;
+    result.reserve(records.size());
+    for (const FillRecord& record : records)
+        result.push_back(apply_object(session, ImmutableObject::from_record(record)));
+    return result;
+}
+
+void FStore::finish_fill(SessionHandle session) const {
+    const Namespace& space = require_namespace(session);
+    if (!space.route || !space.route->pending)
+        throw std::logic_error("FILL has no F ACTIVE_TX");
+    space.route->pending->partial_fill.finish();
+}
+
+std::vector<uint8_t> FStore::materialize_and_verify(SessionHandle session) {
+    Namespace& space = require_namespace(session);
+    if (!space.route || !space.route->pending)
+        throw std::logic_error("F route has no ACTIVE_TX to materialize");
+    Namespace::FPending& pending = *space.route->pending;
+    if (!pending.dict_complete || !pending.body_complete || !pending.remaining.empty())
+        throw std::logic_error("input cannot materialize before DICT, BODY, and Need finish");
+    if (pending.materialized)
+        throw std::logic_error("input was already materialized for this transaction");
+    if (compute_transaction_digest(pending.begin, pending.dict, pending.body) !=
+        pending.begin.transaction_digest)
+        throw std::logic_error("transaction digest changed before materialization");
+    std::set<Key64> reached;
+    std::vector<uint8_t> result = materialize_objects(space.objects, pending.root, &reached);
+    if (!std::equal(reached.begin(), reached.end(), pending.manifest.begin(),
+                    pending.manifest.end()))
+        throw std::logic_error("DICT is not the exact transitive object closure");
+    if (result.size() != pending.begin.raw_bytes ||
+        digest128(result) != pending.begin.raw_digest)
+        throw std::logic_error("materialized input does not match TX_BEGIN exactly");
+    pending.materialized = result;
+    record(ActionType::INPUT_MATERIALIZED, session, &pending.begin);
+    return result;
+}
+
+TxCommit FStore::commit_input(SessionHandle session) {
+    Namespace& space = require_namespace(session);
+    if (!space.route || !space.route->pending ||
+        !space.route->pending->materialized)
+        throw std::logic_error("exact input has not materialized");
+    Namespace::Route& route = *space.route;
+    const TxBegin begin = route.pending->begin;
+    if (route.next_rel_seq.value == std::numeric_limits<uint64_t>::max())
+        throw std::overflow_error("F REL_SEQ space exhausted");
+    TxCommit commit{begin.history_nonce, begin.rel_seq, begin.tu_seq,
+                    begin.transaction_digest, begin.raw_digest,
+                    compute_post_state_digest(begin.pre_state_digest,
+                                              begin.history_nonce, begin.rel_seq,
+                                              begin.tu_seq,
+                                              begin.transaction_digest)};
+    route.state_digest = commit.post_state_digest;
+    ++route.next_rel_seq.value;
+    route.last_commit = commit;
+    record(ActionType::INPUT_COMMITTED, session, &begin);
+    route.pending.reset();
+    return commit;
+}
+
+void FStore::forget_route(SessionHandle session) {
+    Namespace& space = require_namespace(session);
+    if (space.route && space.route->pending)
+        throw std::logic_error("HISTORY_RESET is only legal outside ACTIVE_TX");
+    space.route.reset();
+    space.established = true;
+}
+
+void FStore::destructive_cache_reset(FStoreGuid new_guid) {
+    if (new_guid == guid_)
+        throw std::invalid_argument("F store reset requires a new F_STORE_GUID");
+    namespaces_.clear();
+    guid_ = new_guid;
+    next_session_serial_ = 1;
+    session_serial_exhausted_ = false;
+}
+
+size_t FStore::object_count(CStoreGuid c_store_guid) const {
+    const auto position = namespaces_.find(c_store_guid);
+    return position == namespaces_.end() ? 0 : position->second->objects.size();
+}
+
+bool FStore::contains(CStoreGuid c_store_guid, Key64 key) const {
+    const auto position = namespaces_.find(c_store_guid);
+    return position != namespaces_.end() && position->second->objects.contains(key);
+}
+
+FStore::Namespace& FStore::require_namespace(SessionHandle session) {
+    const auto position = namespaces_.find(session.c_store_guid);
+    if (session.f_store_guid != guid_ || position == namespaces_.end() ||
+        session.serial == 0 ||
+        position->second->active_session_serial != session.serial)
+        throw std::logic_error("stale or unknown F session");
+    return *position->second;
+}
+
+const FStore::Namespace& FStore::require_namespace(SessionHandle session) const {
+    const auto position = namespaces_.find(session.c_store_guid);
+    if (session.f_store_guid != guid_ || position == namespaces_.end() ||
+        session.serial == 0 ||
+        position->second->active_session_serial != session.serial)
+        throw std::logic_error("stale or unknown F session");
+    return *position->second;
+}
+
+ReconnectResult reconnect(CRoute& c_route, FStore& f_store,
+                          HistoryNonce fresh_history_nonce) {
+    ReconnectResult result;
+    result.session = f_store.connect(c_route.c_store_guid());
+    const SessionState state = f_store.resume(result.session);
+    if (state.f_store_guid != c_route.f_store_guid() || !state.namespace_present) {
+        const PreparedTUPtr retry = c_route.active_ ? c_route.active_->prepared : nullptr;
+        c_route.reset_history(state.f_store_guid, fresh_history_nonce);
+        if (state.route_present) f_store.forget_route(result.session);
+        f_store.start_route(result.session, c_route.history_nonce(),
+                            c_route.state_digest());
+        if (retry) c_route.begin(retry, P29RootMode::HistoryIndependent);
+        result.outcome = ReconnectOutcome::ColdFStore;
+        result.replay_active = c_route.active().has_value();
+        return result;
+    }
+    if (state.route_present && state.history_nonce == c_route.history_nonce() &&
+        state.next_rel_seq == c_route.next_rel_seq() &&
+        state.state_digest == c_route.state_digest()) {
+        result.outcome = ReconnectOutcome::ExactMatch;
+        result.replay_active = c_route.active().has_value();
+        return result;
+    }
+    if (state.route_present && c_route.active() && state.last_commit &&
+        state.history_nonce == c_route.history_nonce() &&
+        state.next_rel_seq.value == c_route.active()->begin.rel_seq.value + 1 &&
+        state.state_digest == state.last_commit->post_state_digest &&
+        same_commit(*state.last_commit, *c_route.active())) {
+        c_route.accept_commit(*state.last_commit, ActionType::LOST_COMMIT_ACCEPTED);
+        result.outcome = ReconnectOutcome::LostFinalAcknowledgement;
+        return result;
+    }
+    const PreparedTUPtr retry = c_route.active_ ? c_route.active_->prepared : nullptr;
+    c_route.reset_history(state.f_store_guid, fresh_history_nonce);
+    if (state.route_present) f_store.forget_route(result.session);
+    f_store.start_route(result.session, c_route.history_nonce(),
+                        c_route.state_digest());
+    if (retry) c_route.begin(retry, P29RootMode::HistoryIndependent);
+    result.outcome = ReconnectOutcome::RouteHistoryReset;
+    result.replay_active = c_route.active().has_value();
+    return result;
+}
+
+}  // namespace icecc::p50
