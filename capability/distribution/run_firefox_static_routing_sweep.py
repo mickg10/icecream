@@ -363,7 +363,10 @@ def verify_jsonl(
     expected_route_events = EXPECTED_JOBS if static else 0
     if route_bound != expected_route_events:
         raise RuntimeError(f"{path}: route-bound event count differs")
-    if flow_bytes != {
+    reconciled_flow_bytes = {
+        direction: flow_bytes[direction] for direction in ("c_to_f", "f_to_c")
+    }
+    if reconciled_flow_bytes != {
         "c_to_f": int(summary["c_to_f_bytes"]),
         "f_to_c": int(summary["f_to_c_bytes"]),
     }:
