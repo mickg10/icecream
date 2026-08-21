@@ -117,9 +117,7 @@ def assignment_routes(
         scenario, sim.CompileOnlyAdapter(), snapshot_interval_ns=10**30
     ).run()
     by_key = {
-        item.key: item
-        for items in scenario.work_items.values()
-        for item in items
+        item.key: item for items in scenario.work_items.values() for item in items
     }
     routes: dict[tuple[int, int], list[sim.WorkItem]] = defaultdict(list)
     identities: dict[tuple[str, int, int], tuple[int, int]] = {}
@@ -201,9 +199,13 @@ def build_route(
             or int(row["tu_hi"]) != expected + 1
             or row["closed_by"] != "tu"
         ):
-            raise RuntimeError(f"GRZ row {expected} is not one complete current-TU frame")
+            raise RuntimeError(
+                f"GRZ row {expected} is not one complete current-TU frame"
+            )
         if int(row["out_bytes"]) != items[expected].raw_bytes:
-            raise RuntimeError(f"GRZ row {expected} raw extent differs from the scenario")
+            raise RuntimeError(
+                f"GRZ row {expected} raw extent differs from the scenario"
+            )
         group_bytes.append(int(row["comp_bytes"]))
     header_bytes = container.stat().st_size - sum(group_bytes) - END_FRAME_BYTES
     if header_bytes <= 0:
@@ -239,7 +241,10 @@ def build_route(
         route_directory / "retry.stdout",
         route_directory / "retry.stderr",
     )
-    if sha256(retry) != sha256(container) or retry_curve.read_bytes() != curve_path.read_bytes():
+    if (
+        sha256(retry) != sha256(container)
+        or retry_curve.read_bytes() != curve_path.read_bytes()
+    ):
         raise RuntimeError("GRZ retry changed the physical container or frame curve")
 
     raw_offsets = [0]
@@ -370,9 +375,7 @@ def build_ledger(
                 "state_after": {
                     "route_commits": route_sequence + 1,
                     "cumulative_c_to_f_bytes": cumulative,
-                    "retained_history_bytes": min(
-                        cumulative_raw, 1024 * 1024 * 1024
-                    ),
+                    "retained_history_bytes": min(cumulative_raw, 1024 * 1024 * 1024),
                 },
                 "exact": True,
             }
@@ -390,7 +393,17 @@ def build_ledger(
         "scenario": scenario.document["name"],
         "scenario_sha256": sim.sha256(scenario.path),
         "workload_inputs": scenario.workload_inputs,
-        "assignment": "common simulator compile-only dispatch order, partitioned by (C,F)",
+        "assignment": (
+            "common simulator compile-only static route binding, partitioned by (C,F)"
+            if scenario.document["scheduler"]["placement_policy"] == "rendezvous"
+            else "common simulator compile-only dispatch order, partitioned by (C,F)"
+        ),
+        "routing": {
+            "placement_policy": scenario.document["scheduler"]["placement_policy"],
+            "dense_frontier_workers": scenario.document["scheduler"].get(
+                "dense_frontier_workers"
+            ),
+        },
         "dialogue_window_per_route": 1,
         "command_options": list(GRZ_OPTIONS) + extra_options,
         "codec_binary": str(binary.resolve()),

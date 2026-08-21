@@ -1,0 +1,63 @@
+{
+  "schema": "icecream-distribution-scenario-v1",
+  "name": "static-rendezvous-k2-real-codec-smoke",
+  "seed": 16,
+  "environments": {
+    "env_count": 1,
+    "job_selection": {
+      "mode": "explicit",
+      "jobs": [
+        {
+          "id": "static-routing-smoke",
+          "environment": 0,
+          "trace": "trace.tsv",
+          "corpus_root": ".",
+          "builds": 2,
+          "start_ns": 0,
+          "build_release": { "mode": "after-previous" },
+          "tu_release": { "mode": "all-at-zero" }
+        }
+      ]
+    }
+  },
+  "workers": {
+    "f_count": 4,
+    "template": {
+      "slots": 2,
+      "input_staging_slots": 2,
+      "compile_profile": "static-routing-smoke-v1",
+      "initial_cache": "cold"
+    }
+  },
+  "network": {
+    "c_to_f": {
+      "bits_per_second": 10000000000,
+      "per_environment_bits_per_second": 1000000000,
+      "per_worker_bits_per_second": 10000000000,
+      "fabric_bits_per_second": 10000000000,
+      "writer_quantum_bytes": 102400,
+      "max_priority_burst_quanta": 8,
+      "one_way_latency_ns": 100000,
+      "lanes_per_endpoint": 1
+    },
+    "f_to_c": {
+      "bits_per_second": 10000000000,
+      "per_environment_bits_per_second": 1000000000,
+      "per_worker_bits_per_second": 10000000000,
+      "fabric_bits_per_second": 10000000000,
+      "writer_quantum_bytes": 102400,
+      "max_priority_burst_quanta": 8,
+      "one_way_latency_ns": 100000,
+      "lanes_per_endpoint": 1
+    }
+  },
+  "scheduler": {
+    "ready_job_policy": "fifo-release",
+    "placement_policy": "rendezvous",
+    "dense_frontier_workers": 2
+  },
+  "experiment": {
+    "codecs": ["p29", "grz"],
+    "routing_mode": "replay"
+  }
+}

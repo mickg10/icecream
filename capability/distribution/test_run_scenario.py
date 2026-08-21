@@ -157,6 +157,134 @@ class SimulatorTest(unittest.TestCase):
             )
             self.assertEqual(result.summary["makespan_ns"], 4)
 
+    def test_static_rendezvous_reuses_tu_destinations_inside_dense_frontier(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            jobs = 20
+            path = write_fixture(
+                root,
+                [1 + (logical % 4) for logical in range(jobs)],
+                [1] * jobs,
+                workers=5,
+            )
+            document = json.loads(path.read_text())
+            document["environments"]["job_selection"]["jobs"][0]["builds"] = 2
+            document["scheduler"]["placement_policy"] = "rendezvous"
+            document["scheduler"]["dense_frontier_workers"] = 2
+            path.write_text(json.dumps(document))
+
+            result = sim.Simulator(
+                sim.load_scenario(path), sim.CompileOnlyAdapter()
+            ).run()
+            first = {
+                int(row["logical"]): int(row["worker"])
+                for row in result.assignments
+                if row["build"] == 0
+            }
+            second = {
+                int(row["logical"]): int(row["worker"])
+                for row in result.assignments
+                if row["build"] == 1
+            }
+            self.assertEqual(first, second)
+            routing = result.summary["routing"]
+            homes = set(routing["home_sets"][0]["workers"])
+            self.assertEqual(len(homes), 2)
+            self.assertLessEqual(set(first.values()), homes)
+            self.assertEqual(routing["algorithm"], "stable-rendezvous-v1")
+            self.assertEqual(routing["seed"], 1)
+            self.assertEqual(routing["binding"], "release-time-static")
+            self.assertFalse(routing["build_number_in_identity"])
+            by_identity = {
+                (int(row["build"]), int(row["logical"])): int(row["tu_seq"])
+                for row in result.assignments
+            }
+            self.assertEqual(
+                by_identity,
+                {
+                    (build, logical): build * jobs + logical
+                    for build in range(2)
+                    for logical in range(jobs)
+                },
+            )
+            route_events = [
+                row for row in result.events if row["event"] == "route-bound"
+            ]
+            self.assertEqual(len(route_events), jobs * 2)
+            self.assertEqual(
+                {
+                    (int(row["build"]), int(row["logical"])): int(row["worker"])
+                    for row in route_events
+                },
+                {
+                    (int(row["build"]), int(row["logical"])): int(row["worker"])
+                    for row in result.assignments
+                },
+            )
+            for worker in homes:
+                rel_seq = [
+                    int(row["rel_seq"])
+                    for row in result.assignments
+                    if row["worker"] == worker
+                ]
+                self.assertEqual(rel_seq, list(range(len(rel_seq))))
+
+    def test_tu_seq_is_preparation_order_not_static_route_dispatch_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_fixture(root, [10, 1, 5], [1, 1, 1], workers=1)
+            document = json.loads(path.read_text())
+            document["scheduler"]["ready_job_policy"] = "shortest-known"
+            document["scheduler"]["placement_policy"] = "rendezvous"
+            document["scheduler"]["dense_frontier_workers"] = 1
+            path.write_text(json.dumps(document))
+
+            result = sim.Simulator(
+                sim.load_scenario(path), sim.CompileOnlyAdapter()
+            ).run()
+            self.assertEqual(
+                [
+                    (row["logical"], row["tu_seq"], row["rel_seq"])
+                    for row in result.assignments
+                ],
+                [(1, 1, 0), (2, 2, 1), (0, 0, 2)],
+            )
+            self.assertEqual(
+                result.summary["relationship_ordering"],
+                "TU_SEQ is allocated in prepared-input release order per C; REL_SEQ is "
+                "allocated independently in route-local dispatch order",
+            )
+
+    def test_dense_frontier_validation_is_explicit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_fixture(root, [1], [1], workers=2)
+            document = json.loads(path.read_text())
+            document["scheduler"]["dense_frontier_workers"] = 1
+            path.write_text(json.dumps(document))
+            with self.assertRaisesRegex(ValueError, "requires rendezvous"):
+                sim.load_scenario(path)
+            document["scheduler"]["placement_policy"] = "rendezvous"
+            document["scheduler"]["dense_frontier_workers"] = 3
+            path.write_text(json.dumps(document))
+            with self.assertRaisesRegex(ValueError, "exceeds workers.f_count"):
+                sim.load_scenario(path)
+
+    def test_static_routing_seed_is_a_validated_nonnegative_integer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_fixture(root, [1], [1], workers=2)
+            document = json.loads(path.read_text())
+            document["scheduler"]["placement_policy"] = "rendezvous"
+            document["seed"] = "1"
+            path.write_text(json.dumps(document))
+            with self.assertRaisesRegex(
+                ValueError, "seed must be a non-negative integer"
+            ):
+                sim.load_scenario(path)
+
     def test_raw_protocol_uses_one_ordered_dialogue_per_f_relationship(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -212,9 +340,7 @@ class SimulatorTest(unittest.TestCase):
             path = write_fixture(root, [1, 1], [100, 100])
             document = json.loads(path.read_text())
             document["network"]["shared_fabric_bps"] = 1_600
-            document["network"]["c_to_f"][
-                "per_environment_bits_per_second"
-            ] = 800
+            document["network"]["c_to_f"]["per_environment_bits_per_second"] = 800
             path.write_text(json.dumps(document))
             result = sim.Simulator(sim.load_scenario(path), sim.RawAdapter()).run()
             self.assertEqual(
@@ -227,15 +353,11 @@ class SimulatorTest(unittest.TestCase):
                 if row["record"] == "snapshot" and row["metrics"]["routes"]
             ]
             self.assertEqual(
-                network_samples[0]["metrics"]["environments"][0][
-                    "c_to_f_average_bps"
-                ],
+                network_samples[0]["metrics"]["environments"][0]["c_to_f_average_bps"],
                 800.0,
             )
             self.assertEqual(
-                network_samples[0]["metrics"]["environments"][0][
-                    "c_to_f_utilization"
-                ],
+                network_samples[0]["metrics"]["environments"][0]["c_to_f_utilization"],
                 1.0,
             )
 
@@ -265,15 +387,11 @@ class SimulatorTest(unittest.TestCase):
                 if row["record"] == "snapshot" and row["metrics"]["routes"]
             ]
             self.assertEqual(
-                network_samples[0]["metrics"]["workers"][0][
-                    "c_to_f_average_bps"
-                ],
+                network_samples[0]["metrics"]["workers"][0]["c_to_f_average_bps"],
                 800.0,
             )
             self.assertEqual(
-                network_samples[0]["metrics"]["workers"][0][
-                    "c_to_f_utilization"
-                ],
+                network_samples[0]["metrics"]["workers"][0]["c_to_f_utilization"],
                 1.0,
             )
 
@@ -471,12 +589,8 @@ class SimulatorTest(unittest.TestCase):
                     return sim.TransactionPlan(
                         (
                             sim.DagNode("dict", "c_to_f", 100, (), 3),
-                            sim.DagNode(
-                                "need", "f_to_c", 100, ("dict:delivered",), 1
-                            ),
-                            sim.DagNode(
-                                "fill", "c_to_f", 100, ("need:delivered",), 2
-                            ),
+                            sim.DagNode("need", "f_to_c", 100, ("dict:delivered",), 1),
+                            sim.DagNode("fill", "c_to_f", 100, ("need:delivered",), 2),
                         ),
                         ("attachment:accepted",),
                         ("attachment:accepted", "fill:delivered"),
@@ -622,7 +736,10 @@ class SimulatorTest(unittest.TestCase):
             sim.write_result(scenario, result, output)
             self.assertFalse(spool.exists())
             self.assertFalse(event_spool.exists())
-            rows = [json.loads(line) for line in (output / "experiment.jsonl").read_text().splitlines()]
+            rows = [
+                json.loads(line)
+                for line in (output / "experiment.jsonl").read_text().splitlines()
+            ]
             self.assertEqual(rows[0]["record"], "experiment")
             self.assertEqual(rows[0]["clock"]["snapshot_interval_ns"], 10_000_000)
             self.assertEqual(
@@ -642,9 +759,7 @@ class SimulatorTest(unittest.TestCase):
             )
             self.assertEqual(rows[-1]["record"], "summary")
             event_sequences = [
-                event["sequence"]
-                for row in rows[1:-1]
-                for event in row["events"]
+                event["sequence"] for row in rows[1:-1] for event in row["events"]
             ]
             self.assertEqual(event_sequences, list(range(len(result.events))))
             report = (output / "report.html").read_text()
@@ -673,8 +788,7 @@ class SimulatorTest(unittest.TestCase):
 
     def test_report_compaction_keeps_boundaries_and_every_gap(self) -> None:
         timeline = [
-            {"record": "snapshot", "sequence": sequence}
-            for sequence in range(2_005)
+            {"record": "snapshot", "sequence": sequence} for sequence in range(2_005)
         ]
         timeline.insert(100, {"record": "gap", "sequence": 10_000})
         view, metadata = sim.compact_report_timeline(timeline, limit=2_000)
@@ -687,7 +801,9 @@ class SimulatorTest(unittest.TestCase):
         self.assertEqual(metadata["source_snapshots"], 2_005)
         self.assertEqual(metadata["embedded_snapshots"], 2_000)
 
-    def test_physical_ledger_runs_in_common_engine_with_committed_route_order(self) -> None:
+    def test_physical_ledger_runs_in_common_engine_with_committed_route_order(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             scenario_path = write_fixture(root, [1, 1], [10, 11], workers=1)
@@ -701,9 +817,7 @@ class SimulatorTest(unittest.TestCase):
             self.assertTrue(result.summary["physical_codec_result"])
             self.assertEqual(result.summary["c_to_f_bytes"], 19)
             self.assertEqual(result.summary["f_to_c_bytes"], 3)
-            starts = [
-                row for row in result.events if row["event"] == "dialogue-start"
-            ]
+            starts = [row for row in result.events if row["event"] == "dialogue-start"]
             finishes = [
                 row for row in result.events if row["event"] == "dialogue-finish"
             ]
@@ -793,7 +907,9 @@ class SimulatorTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "raw content digest"):
                 sim.PhysicalLedgerAdapter(ledger_path, scenario, "p29")
 
-    def test_compatible_ledger_reuse_requires_exact_inputs_and_runtime_order(self) -> None:
+    def test_compatible_ledger_reuse_requires_exact_inputs_and_runtime_order(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source_path = write_fixture(root, [1, 1], [10, 11], workers=1)

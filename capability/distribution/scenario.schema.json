@@ -150,6 +150,7 @@
         "ready_job_policy": {
           "enum": ["fifo-release", "environment-round-robin", "shortest-known", "trace"]
         },
+        "dense_frontier_workers": { "type": "integer", "minimum": 1 },
         "placement_policy": {
           "enum": [
             "round-robin",
@@ -162,7 +163,17 @@
             "trace"
           ]
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": { "required": ["dense_frontier_workers"] },
+          "then": {
+            "properties": {
+              "placement_policy": { "const": "rendezvous" }
+            }
+          }
+        }
+      ]
     },
     "experiment": {
       "type": "object",

@@ -1,0 +1,4 @@
+# 1 "j0.cpp"
+using word = unsigned long long;
+inline word mix(word value) { return value * 11400714819323198485ull; }
+word f0() { return mix(0); }

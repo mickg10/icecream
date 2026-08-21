@@ -95,7 +95,9 @@ def fake_codec_run(command: list[str], stdout_path: Path, stderr_path: Path) -> 
     worker_count = int(option("--route-s1"))
     route_lines = Path(option("--route-map")).read_text().splitlines()
     assignment = [int(value) for value in route_lines[1:]]
-    manifest = [Path(value) for value in Path(option("--manifest")).read_text().splitlines()]
+    manifest = [
+        Path(value) for value in Path(option("--manifest")).read_text().splitlines()
+    ]
     output_root = Path(option("--materialize-routes-dir"))
     populated = sorted(set(assignment))
     for worker in populated:
@@ -111,19 +113,13 @@ def fake_codec_run(command: list[str], stdout_path: Path, stderr_path: Path) -> 
         for tu, payload in enumerate(manifest):
             is_active = tu in active_set
             if is_active:
-                c_chunk = (
-                    frame(1, bytes([tu]))
-                    + frame(8, b"L")
-                    + frame(0xFE, b"")
-                )
+                c_chunk = frame(1, bytes([tu])) + frame(8, b"L") + frame(0xFE, b"")
                 f_chunk = frame(3, b"") + frame(0xFD, b"")
                 c_data.extend(c_chunk)
                 f_data.extend(f_chunk)
                 c_frames += 3
                 f_frames += 2
-                selector_rows.append(
-                    f"{tu}\t{rel_seq}\t{len(c_chunk)}\t0\tROUTE_S1\n"
-                )
+                selector_rows.append(f"{tu}\t{rel_seq}\t{len(c_chunk)}\t0\tROUTE_S1\n")
             curve_rows.append(
                 f"{tu + 1}\t{int(is_active)}\t{rel_seq if is_active else 0}\t"
                 f"{payload.stat().st_size if is_active else 0}\t{len(c_data)}\t"
@@ -268,6 +264,115 @@ class P29LedgerBuilderTest(unittest.TestCase):
                 ),
             )
 
+    def test_static_dense_routes_feed_exact_physical_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scenario_path = write_scenario(root, workers=4)
+            document = json.loads(scenario_path.read_text())
+            document["environments"]["job_selection"]["jobs"][0]["builds"] = 2
+            document["scheduler"]["placement_policy"] = "rendezvous"
+            document["scheduler"]["dense_frontier_workers"] = 2
+            scenario_path.write_text(json.dumps(document))
+
+            codec = root / "codec50-sink"
+            codec.write_bytes(b"")
+            output = root / "ledger.jsonl"
+            with mock.patch.object(builder, "checked_run", side_effect=fake_codec_run):
+                builder.build_ledger(
+                    scenario_path,
+                    codec,
+                    output,
+                    root / "work",
+                    [],
+                )
+
+            rows = [json.loads(line) for line in output.read_text().splitlines()]
+            descriptor, tu_rows, summary = rows[0], rows[1:-1], rows[-1]
+            self.assertEqual(
+                descriptor["assignment"],
+                "common simulator compile-only static route binding and route-local dispatch order",
+            )
+            self.assertEqual(
+                descriptor["routing"],
+                {
+                    "placement_policy": "rendezvous",
+                    "dense_frontier_workers": 2,
+                },
+            )
+            by_build = {
+                build: {
+                    int(row["logical"]): int(row["worker"])
+                    for row in tu_rows
+                    if row["build"] == build
+                }
+                for build in range(2)
+            }
+            self.assertEqual(by_build[0], by_build[1])
+            self.assertLessEqual(len(set(by_build[0].values())), 2)
+            self.assertEqual(
+                summary["totals"]["c_to_f_bytes"],
+                sum(
+                    int(phase["bytes"])
+                    for row in tu_rows
+                    for phase in row["phases"]
+                    if phase["direction"] == "c_to_f"
+                ),
+            )
+            self.assertEqual(
+                summary["totals"]["f_to_c_bytes"],
+                sum(
+                    int(phase["bytes"])
+                    for row in tu_rows
+                    for phase in row["phases"]
+                    if phase["direction"] == "f_to_c"
+                ),
+            )
+
+    def test_manifest_order_is_independent_of_prepared_tu_seq(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scenario_path = write_scenario(root, workers=2)
+            (root / "trace.tsv").write_text(
+                "logical\tjob_id\tii_relative\traw_bytes\tcompile_ns\tcompile_model\n"
+                "0\tj0\tj0.ii\t10\t4\ttest-model\n"
+                "1\tj1\tj1.ii\t11\t1\ttest-model\n"
+                "2\tj2\tj2.ii\t12\t3\ttest-model\n"
+                "3\tj3\tj3.ii\t13\t2\ttest-model\n"
+            )
+            document = json.loads(scenario_path.read_text())
+            document["scheduler"]["ready_job_policy"] = "shortest-known"
+            document["scheduler"]["placement_policy"] = "rendezvous"
+            document["scheduler"]["dense_frontier_workers"] = 1
+            scenario_path.write_text(json.dumps(document))
+            scenario = builder.sim.load_scenario(scenario_path)
+            assigned = builder.scenario_items(scenario)
+            self.assertEqual([entry.tu_seq for entry in assigned], [1, 3, 2, 0])
+            self.assertEqual(
+                [entry.manifest_ordinal for entry in assigned], list(range(4))
+            )
+            self.assertEqual([entry.rel_seq for entry in assigned], list(range(4)))
+
+            codec = root / "codec50-sink"
+            codec.write_bytes(b"")
+            output = root / "ledger.jsonl"
+            with mock.patch.object(builder, "checked_run", side_effect=fake_codec_run):
+                builder.build_ledger(
+                    scenario_path,
+                    codec,
+                    output,
+                    root / "work",
+                    [],
+                )
+            rows = [json.loads(line) for line in output.read_text().splitlines()]
+            self.assertEqual([row["tu_seq"] for row in rows[1:-1]], [1, 3, 2, 0])
+            result = builder.sim.Simulator(
+                scenario,
+                builder.sim.PhysicalLedgerAdapter(output, scenario, "p29"),
+            ).run()
+            self.assertEqual(
+                [row["tu_seq"] for row in result.assignments], [1, 3, 2, 0]
+            )
+
     def test_supervisor_materializes_only_populated_routes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -339,7 +444,9 @@ class P29LedgerBuilderTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "truncated"):
             builder.parse_frames(frame(1, b"abc")[:-1], 0, 7, "short")
 
-    def test_transaction_graph_forks_lines_from_sent_and_need_from_delivery(self) -> None:
+    def test_transaction_graph_forks_lines_from_sent_and_need_from_delivery(
+        self,
+    ) -> None:
         phases = [
             {"name": "p29-root", "direction": "c_to_f", "bytes": 10},
             {"name": "p29-need", "direction": "f_to_c", "bytes": 2},
@@ -373,9 +480,7 @@ class P29LedgerBuilderTest(unittest.TestCase):
             ]
         )
         by_name = {row["name"]: row for row in graph["phases"]}
-        self.assertEqual(
-            by_name["p29-close"]["depends_on"], ["p29-need:delivered"]
-        )
+        self.assertEqual(by_name["p29-close"]["depends_on"], ["p29-need:delivered"])
 
 
 if __name__ == "__main__":

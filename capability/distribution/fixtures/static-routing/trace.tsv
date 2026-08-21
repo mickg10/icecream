@@ -1,0 +1,5 @@
+logical	job_id	ii_relative	raw_bytes	compile_ns	compile_model
+0	static-j0	j0.ii	147	2000000	static-routing-smoke-v1
+1	static-j1	j1.ii	147	1000000	static-routing-smoke-v1
+2	static-j2	j2.ii	147	3000000	static-routing-smoke-v1
+3	static-j3	j3.ii	147	1500000	static-routing-smoke-v1

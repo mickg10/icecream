@@ -133,7 +133,9 @@ class TransactionPlan:
         if len(names) != len(set(names)):
             raise ValueError("transaction DAG repeats a node name")
         initial = set(self.initial_tokens)
-        if len(initial) != len(self.initial_tokens) or any(not token for token in initial):
+        if len(initial) != len(self.initial_tokens) or any(
+            not token for token in initial
+        ):
             raise ValueError("transaction DAG has empty or repeated initial tokens")
         allowed = initial | {
             f"{name}:{stage}" for name in names for stage in ("sent", "delivered")
@@ -146,7 +148,9 @@ class TransactionPlan:
                 raise ValueError(f"transaction DAG {label} is empty or repeated")
             unknown = set(tokens) - allowed
             if unknown:
-                raise ValueError(f"transaction DAG {label} has unknown tokens {unknown}")
+                raise ValueError(
+                    f"transaction DAG {label} has unknown tokens {unknown}"
+                )
         dependencies: dict[str, set[str]] = {}
         for node in self.nodes:
             unknown = set(node.dependencies) - allowed
@@ -180,9 +184,7 @@ class CodecAdapter:
     def begin(self, item: WorkItem, worker: int) -> Sequence[Phase]:
         raise NotImplementedError
 
-    def transaction_plan(
-        self, item: WorkItem, worker: int
-    ) -> TransactionPlan | None:
+    def transaction_plan(self, item: WorkItem, worker: int) -> TransactionPlan | None:
         """Return a fork/join plan, or ``None`` to use the linear phase adapter."""
         del item, worker
         return None
@@ -193,7 +195,7 @@ class CodecAdapter:
     def bind_route(
         self, item: WorkItem, worker: int, tu_seq: int, rel_seq: int
     ) -> None:
-        """Validate the global prepared identity and ordered F projection."""
+        """Validate the global prepared identity and independent ordered F route."""
         del item, worker, tu_seq, rel_seq
 
     def preview_c_to_f(self, item: WorkItem, worker: int) -> int:
@@ -212,9 +214,7 @@ class CodecAdapter:
         del environment
         return {}
 
-    def timeline_f_state(
-        self, environment: int, worker: int
-    ) -> dict[str, object]:
+    def timeline_f_state(self, environment: int, worker: int) -> dict[str, object]:
         """Return adapter-owned state for one (C authority, F) namespace."""
         del environment, worker
         return {}
@@ -297,9 +297,7 @@ class PhysicalLedgerAdapter(CodecAdapter):
         scenario: "LoadedScenario",
         expected_codec: str | None = None,
         allow_compatible_scenario: bool = False,
-        payload_digest_cache: dict[
-            Path, tuple[tuple[int, int, int, int, int], str]
-        ]
+        payload_digest_cache: dict[Path, tuple[tuple[int, int, int, int, int], str]]
         | None = None,
     ):
         self.path = path.resolve()
@@ -320,7 +318,10 @@ class PhysicalLedgerAdapter(CodecAdapter):
                 f"{self.path}: ledger codec {codec!r} differs from {expected_codec!r}"
             )
         reconstruction = descriptor.get("reconstruction")
-        if not isinstance(reconstruction, dict) or reconstruction.get("status") != "pass":
+        if (
+            not isinstance(reconstruction, dict)
+            or reconstruction.get("status") != "pass"
+        ):
             raise ValueError(f"{self.path}: reconstruction result is not pass")
         ledger_scenario_sha256 = descriptor.get("scenario_sha256")
         replay_scenario_sha256 = sha256(scenario.path)
@@ -344,9 +345,7 @@ class PhysicalLedgerAdapter(CodecAdapter):
         self.entries: dict[tuple[str, int, int], PhysicalLedgerEntry] = {}
         route_sequences: dict[tuple[int, int], list[int]] = defaultdict(list)
         tu_sequences: dict[int, list[int]] = defaultdict(list)
-        payload_digests: dict[
-            Path, tuple[tuple[int, int, int, int, int], str]
-        ] = (
+        payload_digests: dict[Path, tuple[tuple[int, int, int, int, int], str]] = (
             payload_digest_cache if payload_digest_cache is not None else {}
         )
         c_to_f_total = 0
@@ -360,9 +359,8 @@ class PhysicalLedgerAdapter(CodecAdapter):
             build = checked_nonnegative_int(row.get("build"), "ledger build")
             logical = checked_nonnegative_int(row.get("logical"), "ledger logical")
             scenario_key = (workload, build)
-            if (
-                scenario_key not in scenario.work_items
-                or logical >= len(scenario.work_items[scenario_key])
+            if scenario_key not in scenario.work_items or logical >= len(
+                scenario.work_items[scenario_key]
             ):
                 raise ValueError(
                     f"{self.path}:{row_number}: TU identity is outside the scenario"
@@ -370,7 +368,9 @@ class PhysicalLedgerAdapter(CodecAdapter):
             item = scenario.work_items[scenario_key][logical]
             worker = checked_nonnegative_int(row.get("worker"), "ledger worker")
             if worker >= int(scenario.document["workers"]["f_count"]):
-                raise ValueError(f"{self.path}:{row_number}: worker is outside scenario")
+                raise ValueError(
+                    f"{self.path}:{row_number}: worker is outside scenario"
+                )
             route_sequence = checked_nonnegative_int(
                 row.get("route_sequence"), "ledger route_sequence"
             )
@@ -394,7 +394,9 @@ class PhysicalLedgerAdapter(CodecAdapter):
                 or len(raw_sha256) != 64
                 or any(character not in "0123456789abcdef" for character in raw_sha256)
             ):
-                raise ValueError(f"{self.path}:{row_number}: raw_sha256 is not canonical")
+                raise ValueError(
+                    f"{self.path}:{row_number}: raw_sha256 is not canonical"
+                )
             phase_rows = row.get("phases")
             if not isinstance(phase_rows, list) or not phase_rows:
                 raise ValueError(f"{self.path}:{row_number}: phases are empty")
@@ -470,7 +472,9 @@ class PhysicalLedgerAdapter(CodecAdapter):
                 dag_nodes = []
                 previous: str | None = None
                 for phase in phases:
-                    dependencies = () if previous is None else (f"{previous}:delivered",)
+                    dependencies = (
+                        () if previous is None else (f"{previous}:delivered",)
+                    )
                     dag_nodes.append(
                         DagNode(
                             phase.name,
@@ -490,7 +494,9 @@ class PhysicalLedgerAdapter(CodecAdapter):
                 )
             state_after = row.get("state_after", {})
             if not isinstance(state_after, dict):
-                raise ValueError(f"{self.path}:{row_number}: state_after is not an object")
+                raise ValueError(
+                    f"{self.path}:{row_number}: state_after is not an object"
+                )
             entry = PhysicalLedgerEntry(
                 workload,
                 build,
@@ -506,7 +512,9 @@ class PhysicalLedgerAdapter(CodecAdapter):
             )
             key = (workload, build, logical)
             if key in self.entries:
-                raise ValueError(f"{self.path}:{row_number}: repeated TU identity {key}")
+                raise ValueError(
+                    f"{self.path}:{row_number}: repeated TU identity {key}"
+                )
             self.entries[key] = entry
             environment = item.environment
             route_sequences[(environment, worker)].append(route_sequence)
@@ -520,9 +528,7 @@ class PhysicalLedgerAdapter(CodecAdapter):
             )
 
         expected_items = {
-            item.key: item
-            for items in scenario.work_items.values()
-            for item in items
+            item.key: item for items in scenario.work_items.values() for item in items
         }
         if set(self.entries) != set(expected_items):
             missing = sorted(set(expected_items) - set(self.entries))
@@ -534,7 +540,9 @@ class PhysicalLedgerAdapter(CodecAdapter):
             if self.entries[key].raw_bytes != item.raw_bytes:
                 raise ValueError(f"{self.path}: raw byte count differs for {key}")
             if not item.payload.is_file():
-                raise ValueError(f"{self.path}: payload is absent for {key}: {item.payload}")
+                raise ValueError(
+                    f"{self.path}: payload is absent for {key}: {item.payload}"
+                )
             payload = item.payload.resolve()
             stat = payload.stat()
             identity = (
@@ -630,9 +638,7 @@ class PhysicalLedgerAdapter(CodecAdapter):
         entry = self._activate(item, worker)
         return entry.phases
 
-    def transaction_plan(
-        self, item: WorkItem, worker: int
-    ) -> TransactionPlan | None:
+    def transaction_plan(self, item: WorkItem, worker: int) -> TransactionPlan | None:
         return self._activate(item, worker).plan
 
     def commit(self, item: WorkItem, worker: int) -> None:
@@ -640,7 +646,10 @@ class PhysicalLedgerAdapter(CodecAdapter):
             raise RuntimeError(f"physical ledger TU {item.key} committed without begin")
         entry = self.entries[item.key]
         route = (item.environment, worker)
-        if entry.worker != worker or entry.route_sequence != self.committed_by_route[route]:
+        if (
+            entry.worker != worker
+            or entry.route_sequence != self.committed_by_route[route]
+        ):
             raise RuntimeError(f"physical ledger commit order changed for {item.key}")
         self.active.remove(item.key)
         self.committed_by_route[route] += 1
@@ -666,9 +675,7 @@ class PhysicalLedgerAdapter(CodecAdapter):
             "committed_c_to_f_bytes": self.committed_bytes_by_environment[environment],
         }
 
-    def timeline_f_state(
-        self, environment: int, worker: int
-    ) -> dict[str, object]:
+    def timeline_f_state(self, environment: int, worker: int) -> dict[str, object]:
         route = (environment, worker)
         state = {
             "committed_transactions": self.committed_by_route[route],
@@ -726,6 +733,7 @@ class Transaction:
     input_ready: bool = False
     transaction_committed: bool = False
     compile_completed: bool = False
+
 
 @dataclass
 class Flow:
@@ -1060,9 +1068,7 @@ class TimelineRecorder:
                 "average_reserved_slots": float(
                     self.reserved_slot_ns[worker] / duration
                 ),
-                "average_staging_slots": float(
-                    self.staging_slot_ns[worker] / duration
-                ),
+                "average_staging_slots": float(self.staging_slot_ns[worker] / duration),
             }
             for direction in DIRECTIONS:
                 average_bps = worker_rates[(direction, worker)]
@@ -1273,6 +1279,7 @@ def load_scenario(
         isinstance(value, dict) for value in (environments, workers, network, scheduler)
     ):
         raise ValueError(f"{path}: scenario lacks a required object")
+    checked_nonnegative_int(document.get("seed"), "seed")
     env_count = checked_positive_int(environments.get("env_count"), "env_count")
     f_count = checked_positive_int(workers.get("f_count"), "f_count")
     template = workers.get("template")
@@ -1313,8 +1320,7 @@ def load_scenario(
             network.get("shared_fabric_bps"), "network.shared_fabric_bps"
         )
     elif any(
-        "fabric_bits_per_second" not in network[direction]
-        for direction in DIRECTIONS
+        "fabric_bits_per_second" not in network[direction] for direction in DIRECTIONS
     ):
         raise ValueError(
             "network needs shared_fabric_bps or one fabric_bits_per_second per direction"
@@ -1337,6 +1343,17 @@ def load_scenario(
         "trace",
     }:
         raise ValueError("unknown placement policy")
+    dense_frontier_workers = scheduler.get("dense_frontier_workers")
+    if dense_frontier_workers is not None:
+        dense_frontier_workers = checked_positive_int(
+            dense_frontier_workers, "scheduler.dense_frontier_workers"
+        )
+        if scheduler.get("placement_policy") != "rendezvous":
+            raise ValueError(
+                "scheduler.dense_frontier_workers requires rendezvous placement"
+            )
+        if dense_frontier_workers > f_count:
+            raise ValueError("scheduler.dense_frontier_workers exceeds workers.f_count")
 
     selection = environments.get("job_selection")
     if not isinstance(selection, dict) or not isinstance(selection.get("jobs"), list):
@@ -1432,6 +1449,76 @@ def load_scenario(
     return LoadedScenario(document, path, work_items, workload_config, workload_inputs)
 
 
+def stable_rendezvous_score(*parts: object) -> int:
+    """Return one portable score without relying on Python's randomized hash."""
+    digest = hashlib.sha256(b"icecream-static-rendezvous-v1\0")
+    for part in parts:
+        encoded = str(part).encode("utf-8")
+        digest.update(len(encoded).to_bytes(4, "big"))
+        digest.update(encoded)
+    return int.from_bytes(digest.digest()[:8], "big")
+
+
+def static_rendezvous_routes(
+    scenario: LoadedScenario,
+) -> tuple[dict[int, int], dict[tuple[int, str], tuple[int, ...]]]:
+    """Bind every stable compile identity to one F in a dense home frontier.
+
+    A workload is the simulator's project/build-family identity.  Its home frontier excludes
+    the build number, and a TU uses ``source_job_id`` rather than chronological/logical order,
+    so unchanged compile identities return to the same F on later builds.  The scenario seed
+    makes the otherwise opaque placement reproducible.
+    """
+    document = scenario.document
+    scheduler = document["scheduler"]
+    if scheduler["placement_policy"] != "rendezvous":
+        raise ValueError("static rendezvous routes require rendezvous placement")
+    f_count = int(document["workers"]["f_count"])
+    frontier_width = int(scheduler.get("dense_frontier_workers", f_count))
+    profile = document["workers"]["template"]["compile_profile"]
+    seed = int(document["seed"])
+    home_sets: dict[tuple[int, str], tuple[int, ...]] = {}
+    bindings: dict[int, int] = {}
+    for items in scenario.work_items.values():
+        for item in items:
+            family = (item.environment, item.workload)
+            homes = home_sets.get(family)
+            if homes is None:
+                ranked = sorted(
+                    range(f_count),
+                    key=lambda worker: (
+                        -stable_rendezvous_score(
+                            seed,
+                            "home",
+                            item.environment,
+                            item.workload,
+                            profile,
+                            worker,
+                        ),
+                        worker,
+                    ),
+                )
+                homes = tuple(ranked[:frontier_width])
+                home_sets[family] = homes
+            worker = min(
+                homes,
+                key=lambda candidate: (
+                    -stable_rendezvous_score(
+                        seed,
+                        "tu",
+                        item.environment,
+                        item.workload,
+                        profile,
+                        item.source_job_id,
+                        candidate,
+                    ),
+                    candidate,
+                ),
+            )
+            bindings[item.ordinal] = worker
+    return bindings, home_sets
+
+
 class Simulator:
     def __init__(
         self,
@@ -1448,9 +1535,7 @@ class Simulator:
         self.env_count = int(document["environments"]["env_count"])
         self.f_count = int(worker_config["f_count"])
         self.slots_per_f = int(worker_config["template"]["slots"])
-        self.decoupled_staging = (
-            "input_staging_slots" in worker_config["template"]
-        )
+        self.decoupled_staging = "input_staging_slots" in worker_config["template"]
         self.input_staging_slots_per_f = int(
             worker_config["template"].get("input_staging_slots", self.slots_per_f)
         )
@@ -1461,6 +1546,20 @@ class Simulator:
         self.ready_heap: list[tuple[tuple[int, ...], int, WorkItem]] = []
         self.ready_by_environment: dict[int, deque[WorkItem]] = defaultdict(deque)
         self.ready_environment_cycle: deque[int] = deque()
+        self.static_routing = self.scheduler["placement_policy"] == "rendezvous"
+        self.static_route_workers: dict[int, int] = {}
+        self.static_home_sets: dict[tuple[int, str], tuple[int, ...]] = {}
+        if self.static_routing:
+            self.static_route_workers, self.static_home_sets = static_rendezvous_routes(
+                scenario
+            )
+        self._routing_metadata_cache: dict[str, object] | None = None
+        self.static_ready_heaps: dict[
+            int, list[tuple[tuple[int, ...], int, WorkItem]]
+        ] = defaultdict(list)
+        self.static_ready_by_environment_worker: dict[
+            tuple[int, int], deque[WorkItem]
+        ] = defaultdict(deque)
         self.compiler_slots: dict[int, SparseSlotPool] = {
             worker: SparseSlotPool(self.slots_per_f) for worker in range(self.f_count)
         }
@@ -1476,12 +1575,10 @@ class Simulator:
         self.active_flows: dict[int, Flow] = {}
         self.endpoint_queues: dict[
             tuple[str, int, int], list[tuple[int, int, Flow]]
-        ] = defaultdict(
-            list
+        ] = defaultdict(list)
+        self.endpoint_priority_overtakes: dict[tuple[str, int, int], int] = defaultdict(
+            int
         )
-        self.endpoint_priority_overtakes: dict[
-            tuple[str, int, int], int
-        ] = defaultdict(int)
         self.dialogue_active: dict[tuple[int, int], int] = defaultdict(int)
         self.dialogue_queues: dict[tuple[int, int], deque[Transaction]] = defaultdict(
             deque
@@ -1494,6 +1591,7 @@ class Simulator:
         self.flow_sequence = 0
         self.transaction_sequence = 0
         self.environment_next_tu_seq = [0] * self.env_count
+        self.prepared_tu_seq: dict[int, int] = {}
         self.round_robin_cursor = 0
         self.ready_environment_members: set[int] = set()
         self.completed = 0
@@ -1552,8 +1650,12 @@ class Simulator:
         item: WorkItem | None = None,
         flow: Flow | None = None,
         detail: str = "",
+        worker: int | None = None,
+        tu_seq: int | None = None,
     ) -> None:
         item = tx.item if tx is not None else item
+        event_worker = tx.worker if tx is not None else worker
+        event_tu_seq = tx.tu_seq if tx is not None else tu_seq
         self.events.append(
             {
                 "sequence": self.event_sequence,
@@ -1563,12 +1665,12 @@ class Simulator:
                 "workload": "" if item is None else item.workload,
                 "build": "" if item is None else item.build,
                 "logical": "" if item is None else item.logical,
-                "worker": "" if tx is None else tx.worker,
+                "worker": "" if event_worker is None else event_worker,
                 "slot": "" if tx is None else tx.slot,
                 "staging_slot": "" if tx is None else tx.staging_slot,
                 "compiler_slot": "" if tx is None else tx.compiler_slot,
                 "transaction": "" if tx is None else tx.sequence,
-                "tu_seq": "" if tx is None else tx.tu_seq,
+                "tu_seq": "" if event_tu_seq is None else event_tu_seq,
                 "rel_seq": "" if tx is None else tx.rel_seq,
                 "flow": "" if flow is None else flow.sequence,
                 "phase": "" if phase is None else phase.name,
@@ -1579,13 +1681,48 @@ class Simulator:
         )
         self.event_sequence += 1
 
+    def _ready_key(self, item: WorkItem) -> tuple[int, ...]:
+        policy = self.scheduler["ready_job_policy"]
+        if policy == "fifo-release":
+            return int(item.release_ns), item.ordinal
+        if policy == "shortest-known":
+            return item.compile_ns, int(item.release_ns), item.ordinal
+        if policy == "trace":
+            return (item.ordinal,)
+        raise RuntimeError(f"ready policy {policy!r} has no heap key")
+
     def _release_ready(self) -> None:
         while self.release_heap and self.release_heap[0][0] <= self.now:
             _, _, item = heapq.heappop(self.release_heap)
             self.env_unreleased[item.environment] -= 1
             self.env_ready[item.environment] += 1
-            self._event("release", item=item)
+            tu_seq = self.environment_next_tu_seq[item.environment]
+            self.environment_next_tu_seq[item.environment] += 1
+            self.prepared_tu_seq[item.ordinal] = tu_seq
+            self._event("release", item=item, tu_seq=tu_seq)
             policy = self.scheduler["ready_job_policy"]
+            if self.static_routing:
+                worker = self.static_route_workers[item.ordinal]
+                self._event(
+                    "route-bound",
+                    item=item,
+                    worker=worker,
+                    tu_seq=tu_seq,
+                    detail="stable-rendezvous",
+                )
+                if policy == "environment-round-robin":
+                    self.static_ready_by_environment_worker[
+                        (item.environment, worker)
+                    ].append(item)
+                    if item.environment not in self.ready_environment_members:
+                        self.ready_environment_cycle.append(item.environment)
+                        self.ready_environment_members.add(item.environment)
+                else:
+                    heapq.heappush(
+                        self.static_ready_heaps[worker],
+                        (self._ready_key(item), item.ordinal, item),
+                    )
+                continue
             if policy == "environment-round-robin":
                 queue = self.ready_by_environment[item.environment]
                 queue.append(item)
@@ -1593,22 +1730,35 @@ class Simulator:
                     self.ready_environment_cycle.append(item.environment)
                     self.ready_environment_members.add(item.environment)
                 continue
-            if policy == "fifo-release":
-                key = (int(item.release_ns), item.ordinal)
-            elif policy == "shortest-known":
-                key = (item.compile_ns, int(item.release_ns), item.ordinal)
-            elif policy == "trace":
-                key = (item.ordinal,)
-            else:
-                raise AssertionError(f"unvalidated ready-job policy {policy!r}")
+            key = self._ready_key(item)
             heapq.heappush(self.ready_heap, (key, item.ordinal, item))
 
     def _has_ready(self) -> bool:
+        if self.static_routing:
+            if self.scheduler["ready_job_policy"] == "environment-round-robin":
+                return bool(self.ready_environment_cycle)
+            return any(self.static_ready_heaps.values())
         if self.scheduler["ready_job_policy"] == "environment-round-robin":
             return bool(self.ready_environment_cycle)
         return bool(self.ready_heap)
 
+    def _has_dispatchable_ready(self) -> bool:
+        if not self._has_ready():
+            return False
+        if not self.static_routing:
+            return True
+        free_workers = set(self._free_workers())
+        if self.scheduler["ready_job_policy"] == "environment-round-robin":
+            return any(
+                self.static_ready_by_environment_worker[(environment, worker)]
+                for environment in self.ready_environment_cycle
+                for worker in free_workers
+            )
+        return any(self.static_ready_heaps[worker] for worker in free_workers)
+
     def _pop_ready(self) -> WorkItem:
+        if self.static_routing:
+            return self._pop_static_ready()
         if self.scheduler["ready_job_policy"] != "environment-round-robin":
             item = heapq.heappop(self.ready_heap)[2]
         else:
@@ -1622,6 +1772,51 @@ class Simulator:
         self.env_ready[item.environment] -= 1
         return item
 
+    def _pop_static_ready(self) -> WorkItem:
+        free_workers = set(self._free_workers())
+        if not free_workers:
+            raise RuntimeError("static ready selection without a free worker")
+        if self.scheduler["ready_job_policy"] != "environment-round-robin":
+            candidates = [
+                (queue[0][0], queue[0][1], worker)
+                for worker, queue in self.static_ready_heaps.items()
+                if worker in free_workers and queue
+            ]
+            if not candidates:
+                raise RuntimeError("static ready selection has no dispatchable TU")
+            _, _, worker = min(candidates)
+            item = heapq.heappop(self.static_ready_heaps[worker])[2]
+            self.env_ready[item.environment] -= 1
+            return item
+
+        cycle_length = len(self.ready_environment_cycle)
+        for _ in range(cycle_length):
+            environment = self.ready_environment_cycle.popleft()
+            candidates = [
+                (
+                    self.static_ready_by_environment_worker[(environment, worker)][
+                        0
+                    ].ordinal,
+                    worker,
+                )
+                for worker in free_workers
+                if self.static_ready_by_environment_worker[(environment, worker)]
+            ]
+            if not candidates:
+                self.ready_environment_cycle.append(environment)
+                continue
+            _, worker = min(candidates)
+            item = self.static_ready_by_environment_worker[
+                (environment, worker)
+            ].popleft()
+            self.env_ready[environment] -= 1
+            if self.env_ready[environment]:
+                self.ready_environment_cycle.append(environment)
+            else:
+                self.ready_environment_members.remove(environment)
+            return item
+        raise RuntimeError("static environment selection has no dispatchable TU")
+
     def _free_workers(self) -> list[int]:
         pool = self.staging_slots if self.decoupled_staging else self.compiler_slots
         return [worker for worker in range(self.f_count) if pool[worker]]
@@ -1629,13 +1824,9 @@ class Simulator:
     def _reserve_worker(self, worker: int) -> tuple[int, int, int | None]:
         staging_slot = self.staging_slots[worker].acquire()
         compiler_slot = (
-            None
-            if self.decoupled_staging
-            else self.compiler_slots[worker].acquire()
+            None if self.decoupled_staging else self.compiler_slots[worker].acquire()
         )
-        assignment_slot = (
-            staging_slot if compiler_slot is None else compiler_slot
-        )
+        assignment_slot = staging_slot if compiler_slot is None else compiler_slot
         return assignment_slot, staging_slot, compiler_slot
 
     def _select_slot(self, item: WorkItem) -> tuple[int, int, int, int | None]:
@@ -1643,6 +1834,12 @@ class Simulator:
         if not free_workers:
             raise RuntimeError("slot selection without a free worker")
         policy = self.scheduler["placement_policy"]
+        if policy == "rendezvous":
+            worker = self.static_route_workers[item.ordinal]
+            if worker not in free_workers:
+                raise RuntimeError("static rendezvous target has no free staging slot")
+            slot, staging_slot, compiler_slot = self._reserve_worker(worker)
+            return worker, slot, staging_slot, compiler_slot
         if policy == "round-robin":
             available = set(free_workers)
             for offset in range(self.f_count):
@@ -1667,12 +1864,11 @@ class Simulator:
         )
 
     def _dispatch(self) -> None:
-        while self._has_ready() and self._free_workers():
+        while self._has_dispatchable_ready() and self._free_workers():
             item = self._pop_ready()
             worker, slot, staging_slot, compiler_slot = self._select_slot(item)
             route = (item.environment, worker)
-            tu_seq = self.environment_next_tu_seq[item.environment]
-            self.environment_next_tu_seq[item.environment] += 1
+            tu_seq = self.prepared_tu_seq[item.ordinal]
             rel_seq = self.relationship_next_assigned[route]
             self.relationship_next_assigned[route] += 1
             tx = Transaction(
@@ -1783,7 +1979,9 @@ class Simulator:
         if not tx.compile_completed or not tx.transaction_committed:
             raise RuntimeError("transaction completed before compile and commit joined")
         if not tx.staging_released or not tx.compiler_slot_released:
-            raise RuntimeError("transaction completed while an F resource remained reserved")
+            raise RuntimeError(
+                "transaction completed while an F resource remained reserved"
+            )
         if tx.complete_ns is not None:
             raise RuntimeError("transaction completed twice")
         tx.complete_ns = self.now
@@ -1798,9 +1996,9 @@ class Simulator:
         if self.build_remaining[key] == 0:
             config = self.scenario.workload_config[tx.item.workload]
             next_build = tx.item.build + 1
-            if config["build_release"][
-                "mode"
-            ] == "after-previous" and next_build < int(config["builds"]):
+            if config["build_release"]["mode"] == "after-previous" and next_build < int(
+                config["builds"]
+            ):
                 gap_ns = int(config["build_release"].get("gap_ns", 0))
                 self._enqueue_build(
                     tx.item.workload,
@@ -1867,7 +2065,10 @@ class Simulator:
         if tx.plan is None:
             raise RuntimeError("DAG release requested for a linear transaction")
         for node in tx.plan.nodes:
-            if node.name in tx.dag_started or not set(node.dependencies) <= tx.dag_tokens:
+            if (
+                node.name in tx.dag_started
+                or not set(node.dependencies) <= tx.dag_tokens
+            ):
                 continue
             tx.dag_started.add(node.name)
             self._event(
@@ -1885,10 +2086,7 @@ class Simulator:
             raise RuntimeError("DAG join requested for a linear transaction")
         if not tx.input_ready and set(tx.plan.input_ready_after) <= tx.dag_tokens:
             self._start_compile(tx)
-        if (
-            not tx.transaction_committed
-            and set(tx.plan.commit_after) <= tx.dag_tokens
-        ):
+        if not tx.transaction_committed and set(tx.plan.commit_after) <= tx.dag_tokens:
             self._commit_transaction(tx)
 
     def _dag_token(self, tx: Transaction, token: str) -> None:
@@ -1910,20 +2108,15 @@ class Simulator:
     def _endpoint_lanes(self, endpoint: tuple[str, int, int]) -> int:
         return int(self.network[endpoint[0]]["lanes_per_endpoint"])
 
-    def _pop_endpoint_flow(
-        self, endpoint: tuple[str, int, int]
-    ) -> tuple[Flow, bool]:
+    def _pop_endpoint_flow(self, endpoint: tuple[str, int, int]) -> tuple[Flow, bool]:
         """Select by priority while bounding how often the oldest flow is overtaken."""
         queue = self.endpoint_queues[endpoint]
         if not queue:
             raise RuntimeError("endpoint selection from an empty queue")
         oldest_index = min(range(len(queue)), key=lambda index: queue[index][1])
-        limit = int(
-            self.network[endpoint[0]].get("max_priority_burst_quanta", 8)
-        )
+        limit = int(self.network[endpoint[0]].get("max_priority_burst_quanta", 8))
         forced_oldest = (
-            oldest_index != 0
-            and self.endpoint_priority_overtakes[endpoint] >= limit
+            oldest_index != 0 and self.endpoint_priority_overtakes[endpoint] >= limit
         )
         if forced_oldest:
             _, _, flow = queue[oldest_index]
@@ -2006,9 +2199,7 @@ class Simulator:
                 environment_resource = ("environment", direction, environment)
                 capacities.setdefault(
                     environment_resource,
-                    Fraction(
-                        int(link["per_environment_bits_per_second"]), NANOSECONDS
-                    ),
+                    Fraction(int(link["per_environment_bits_per_second"]), NANOSECONDS),
                 )
                 flow_resources.append(environment_resource)
             if "per_worker_bits_per_second" in link:
@@ -2109,13 +2300,9 @@ class Simulator:
         for flow in sorted((*finished, *yielded), key=lambda value: value.sequence):
             del self.active_flows[flow.sequence]
         for flow in sorted(finished, key=lambda value: value.sequence):
-            self._event(
-                "flow-sent", flow.transaction, flow.phase, flow=flow
-            )
+            self._event("flow-sent", flow.transaction, flow.phase, flow=flow)
             if flow.transaction.plan is not None:
-                self._dag_token(
-                    flow.transaction, f"{flow.phase.name}:sent"
-                )
+                self._dag_token(flow.transaction, f"{flow.phase.name}:sent")
             latency = int(self.network[flow.phase.direction]["one_way_latency_ns"])
             heapq.heappush(
                 self.delivery_heap,
@@ -2131,16 +2318,12 @@ class Simulator:
     def _finish_deliveries(self) -> None:
         while self.delivery_heap and self.delivery_heap[0][0] <= self.now:
             _, _, flow = heapq.heappop(self.delivery_heap)
-            self._event(
-                "flow-finish", flow.transaction, flow.phase, flow=flow
-            )
+            self._event("flow-finish", flow.transaction, flow.phase, flow=flow)
             if flow.transaction.plan is None:
                 flow.transaction.phase_index += 1
                 self._start_next_phase(flow.transaction)
             else:
-                self._dag_token(
-                    flow.transaction, f"{flow.phase.name}:delivered"
-                )
+                self._dag_token(flow.transaction, f"{flow.phase.name}:delivered")
 
     def _finish_compiles(self) -> None:
         refill_workers: set[int] = set()
@@ -2179,6 +2362,63 @@ class Simulator:
                 f"simulation stalled after {self.completed}/{self.total_items} jobs"
             )
         return min(future)
+
+    def routing_metadata(self) -> dict[str, object]:
+        if self._routing_metadata_cache is not None:
+            return self._routing_metadata_cache
+        metadata: dict[str, object] = {
+            "placement_policy": self.scheduler["placement_policy"],
+            "tu_seq_allocation": "prepared-input release order per C",
+            "rel_seq_allocation": "route-local dispatch order",
+            "binding": "release-time-static"
+            if self.static_routing
+            else "dispatch-time",
+        }
+        if self.static_routing:
+            assignment_counts: dict[tuple[int, str, int], int] = defaultdict(int)
+            for items in self.scenario.work_items.values():
+                for item in items:
+                    assignment_counts[
+                        (
+                            item.environment,
+                            item.workload,
+                            self.static_route_workers[item.ordinal],
+                        )
+                    ] += 1
+            metadata.update(
+                {
+                    "algorithm": "stable-rendezvous-v1",
+                    "seed": int(self.scenario.document["seed"]),
+                    "stable_tu_identity": "(environment, workload, source_job_id)",
+                    "build_number_in_identity": False,
+                    "dense_frontier_workers": int(
+                        self.scheduler.get("dense_frontier_workers", self.f_count)
+                    ),
+                    "home_sets": [
+                        {
+                            "environment": environment,
+                            "workload": workload,
+                            "workers": list(workers),
+                        }
+                        for (environment, workload), workers in sorted(
+                            self.static_home_sets.items()
+                        )
+                    ],
+                    "assignment_counts": [
+                        {
+                            "environment": environment,
+                            "workload": workload,
+                            "worker": worker,
+                            "tus": count,
+                        }
+                        for (environment, workload, worker), count in sorted(
+                            assignment_counts.items()
+                        )
+                    ],
+                }
+            )
+        self._routing_metadata_cache = metadata
+        return metadata
 
     def timeline_state(self) -> dict[str, object]:
         active_by_route: dict[tuple[str, int, int], int] = defaultdict(int)
@@ -2220,7 +2460,9 @@ class Simulator:
                         {
                             "worker": worker,
                             "next_rel_seq": self.relationship_next_assigned[route],
-                            "committed_rel_seq": self.relationship_next_committed[route],
+                            "committed_rel_seq": self.relationship_next_committed[
+                                route
+                            ],
                             "active_dialogues": active_dialogues,
                             "queued_dialogues": queued_dialogues,
                             "c_to_f_active_flows": forward_active,
@@ -2239,8 +2481,7 @@ class Simulator:
                     "active_tus": self.env_active[environment],
                     "completed_tus": self.env_completed[environment],
                     "admitted_tus": (
-                        self.env_active[environment]
-                        + self.env_completed[environment]
+                        self.env_active[environment] + self.env_completed[environment]
                     ),
                     "targets": targets,
                     "codec": self.adapter.timeline_c_state(environment),
@@ -2277,17 +2518,29 @@ class Simulator:
                     "completed_tus": self.worker_completed[worker],
                     "active_flows": sum(
                         value
-                        for (direction, environment, route_worker), value in active_by_route.items()
+                        for (
+                            direction,
+                            environment,
+                            route_worker,
+                        ), value in active_by_route.items()
                         if route_worker == worker
                     ),
                     "queued_flows": sum(
                         value
-                        for (direction, environment, route_worker), value in queued_by_route.items()
+                        for (
+                            direction,
+                            environment,
+                            route_worker,
+                        ), value in queued_by_route.items()
                         if route_worker == worker
                     ),
                     "in_propagation": sum(
                         value
-                        for (direction, environment, route_worker), value in delivery_by_route.items()
+                        for (
+                            direction,
+                            environment,
+                            route_worker,
+                        ), value in delivery_by_route.items()
                         if route_worker == worker
                     ),
                     "active_dialogues": sum(
@@ -2302,6 +2555,7 @@ class Simulator:
                 }
             )
 
+        routing_state = self.routing_metadata()
         return {
             "scheduler": {
                 "unreleased_tus": sum(self.env_unreleased),
@@ -2310,11 +2564,14 @@ class Simulator:
                 "completed_tus": self.completed,
                 "total_tus": self.total_items,
             },
+            "routing": routing_state,
             "c": c_state,
             "f": f_state,
             "network": {
                 "active_flows": len(self.active_flows),
-                "queued_flows": sum(len(queue) for queue in self.endpoint_queues.values()),
+                "queued_flows": sum(
+                    len(queue) for queue in self.endpoint_queues.values()
+                ),
                 "in_propagation": len(self.delivery_heap),
                 "active_dialogues": sum(self.dialogue_active.values()),
                 "queued_dialogues": sum(
@@ -2328,6 +2585,12 @@ class Simulator:
         failures = {
             "release_heap": len(self.release_heap),
             "ready_heap": len(self.ready_heap),
+            "static_ready_heaps": sum(
+                len(queue) for queue in self.static_ready_heaps.values()
+            ),
+            "static_ready_environment_queues": sum(
+                len(queue) for queue in self.static_ready_by_environment_worker.values()
+            ),
             "ready_environment_cycle": len(self.ready_environment_cycle),
             "ready_compiler_queues": sum(
                 len(queue) for queue in self.ready_compiler_queues.values()
@@ -2357,13 +2620,16 @@ class Simulator:
         nonzero = {name: value for name, value in failures.items() if value}
         if nonzero:
             raise RuntimeError(f"completed simulation retained active state: {nonzero}")
-        if self.completed != self.total_items or sum(self.env_completed) != self.total_items:
+        if (
+            self.completed != self.total_items
+            or sum(self.env_completed) != self.total_items
+        ):
             raise RuntimeError(
                 "completed simulation counters differ from the scenario TU count"
             )
 
-    def _assert_projection_order(self) -> None:
-        """Require every F relationship to be an order-preserving C projection."""
+    def _assert_relationship_order(self) -> None:
+        """Require complete C identities and contiguous route-local commit order."""
         by_environment: dict[int, list[Transaction]] = defaultdict(list)
         by_relationship: dict[tuple[int, int], list[Transaction]] = defaultdict(list)
         for tx in sorted(self.transactions, key=lambda value: value.sequence):
@@ -2371,36 +2637,29 @@ class Simulator:
             by_relationship[(tx.item.environment, tx.worker)].append(tx)
         for environment, transactions in by_environment.items():
             observed = [tx.tu_seq for tx in transactions]
-            if observed != list(range(len(transactions))):
+            if sorted(observed) != list(range(len(transactions))):
                 raise RuntimeError(
-                    f"C{environment} TU_SEQ admission order is not contiguous: {observed[:3]}"
+                    f"C{environment} TU_SEQ identity set is not contiguous: {observed[:3]}"
                 )
         for route, transactions in by_relationship.items():
             rel_seq = [tx.rel_seq for tx in transactions]
-            tu_seq = [tx.tu_seq for tx in transactions]
             if rel_seq != list(range(len(transactions))):
                 raise RuntimeError(
-                    f"relationship {route} REL_SEQ projection is not contiguous"
-                )
-            if tu_seq != sorted(tu_seq):
-                raise RuntimeError(
-                    f"relationship {route} changed the C admission order"
+                    f"relationship {route} REL_SEQ order is not contiguous"
                 )
             if self.relationship_next_assigned[route] != len(transactions):
                 raise RuntimeError(
-                    f"relationship {route} assignment cursor differs from its projection"
+                    f"relationship {route} assignment cursor differs from its route"
                 )
             if (
                 self.adapter.dialogue_window_per_route() is not None
                 and self.relationship_next_committed[route] != len(transactions)
             ):
                 raise RuntimeError(
-                    f"relationship {route} commit cursor differs from its projection"
+                    f"relationship {route} commit cursor differs from its route"
                 )
 
-    def _capacity_floors(
-        self, transactions: Sequence[Transaction]
-    ) -> dict[str, int]:
+    def _capacity_floors(self, transactions: Sequence[Transaction]) -> dict[str, int]:
         """Return optimistic C-to-F and compiler capacity lower bounds.
 
         These bounds intentionally omit release timing, propagation, codec CPU, dependency
@@ -2442,9 +2701,7 @@ class Simulator:
         )
         if "per_environment_bits_per_second" in c_to_f:
             network_candidates.extend(
-                byte_floor(
-                    byte_count, int(c_to_f["per_environment_bits_per_second"])
-                )
+                byte_floor(byte_count, int(c_to_f["per_environment_bits_per_second"]))
                 for byte_count in by_environment.values()
             )
         if "per_worker_bits_per_second" in c_to_f:
@@ -2492,7 +2749,7 @@ class Simulator:
         self.timeline.finish()
         self.events.finish()
         self._assert_terminal_state()
-        self._assert_projection_order()
+        self._assert_relationship_order()
 
         makespan_ns = ceil_fraction(self.now)
         assignments = []
@@ -2523,9 +2780,7 @@ class Simulator:
                     "transfer_done_ns": ceil_fraction(tx.transfer_done_ns),
                     "compile_start_ns": ceil_fraction(tx.compile_start_ns),
                     "compile_finish_ns": ceil_fraction(tx.compile_finish_ns),
-                    "transaction_commit_ns": ceil_fraction(
-                        tx.transaction_commit_ns
-                    ),
+                    "transaction_commit_ns": ceil_fraction(tx.transaction_commit_ns),
                     "complete_ns": ceil_fraction(tx.complete_ns),
                     "raw_bytes": tx.item.raw_bytes,
                     "compile_ns": tx.item.compile_ns,
@@ -2716,9 +2971,10 @@ class Simulator:
             "codec_metadata": self.adapter.result_metadata(),
             "dialogue_window_per_route": self.adapter.dialogue_window_per_route(),
             "relationship_ordering": (
-                "TU_SEQ is contiguous per C admission order; REL_SEQ is the contiguous "
-                "order-preserving projection on each (C,F) relationship"
+                "TU_SEQ is allocated in prepared-input release order per C; REL_SEQ is "
+                "allocated independently in route-local dispatch order"
             ),
+            "routing": self.routing_metadata(),
             "placement_policy": self.scheduler["placement_policy"],
             "ready_job_policy": self.scheduler["ready_job_policy"],
             "jobs": self.total_items,
@@ -2773,7 +3029,7 @@ class Simulator:
             "timeline_state_coverage": {
                 "modelled": [
                     "TU release and scheduler-ready queues",
-                    "per-C TU_SEQ admission and contiguous per-F REL_SEQ projections",
+                    "per-C prepared-input TU_SEQ identities and independent contiguous per-F REL_SEQ orders",
                     "C-to-F placement and independent F input-staging/compiler pools",
                     "fork/join dialogue release, serialization, and propagation",
                     "writer priority with bounded serialization quanta",
@@ -2925,9 +3181,7 @@ def experiment_descriptor(
         "physical_codec_result": result.summary["physical_codec_result"],
         "clock": {
             "unit": "nanosecond",
-            "snapshot_interval_ns": result.summary[
-                "timeline_snapshot_interval_ns"
-            ],
+            "snapshot_interval_ns": result.summary["timeline_snapshot_interval_ns"],
             "snapshot_axis": "active time",
             "gap_rule": (
                 "wall intervals with no compiler work and no network serialization "
@@ -2990,9 +3244,7 @@ def iter_event_timeline(result: SimulationResult) -> Iterator[dict[str, object]]
             event_count += 1
             event = next(events, None)
         record["events"] = attached
-        record["event_sequence_start"] = (
-            "" if not attached else attached[0]["sequence"]
-        )
+        record["event_sequence_start"] = "" if not attached else attached[0]["sequence"]
         record["event_sequence_end"] = "" if not attached else attached[-1]["sequence"]
         yield record
     if event is not None or event_count != len(result.events):
@@ -3139,7 +3391,7 @@ def render_report_html(
         },
         separators=(",", ":"),
     ).replace("</", "<\\/")
-    template = r'''<!doctype html>
+    template = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -3186,7 +3438,7 @@ function showDetail(){if(!S.length){$('detail').textContent='No active snapshots
 $('worker').onchange=draw;$('cursor').oninput=showDetail;window.onresize=draw;
 if(G.length){$('gaps').innerHTML='<table><thead><tr><th>Wall start</th><th>Duration</th><th>Reason</th></tr></thead><tbody>'+G.map(g=>'<tr><td>'+fmtT(g.wall_start_ns)+'</td><td>'+fmtT(g.wall_duration_ns)+'</td><td>'+g.reason+'</td></tr>').join('')+'</tbody></table>'}else $('gaps').textContent='No idle gaps.';
 $('definition').textContent=JSON.stringify(D,null,2);draw();
-</script></body></html>'''
+</script></body></html>"""
     return template.replace("__PAYLOAD__", payload)
 
 

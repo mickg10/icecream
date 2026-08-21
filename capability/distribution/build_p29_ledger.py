@@ -99,6 +99,7 @@ class AssignedItem:
     worker: int
     tu_seq: int
     rel_seq: int
+    manifest_ordinal: int
 
 
 def sha256(path: Path) -> str:
@@ -151,11 +152,7 @@ def phase_rows(c_frames: list[Frame], f_frames: list[Frame]) -> list[dict[str, o
     f_fallback_types = {30}
     f_ack_types = {0xFD, 0xFE, 0xFF}
     classified_c = (
-        initial_types
-        | lines_types
-        | definition_types
-        | close_types
-        | c_fallback_types
+        initial_types | lines_types | definition_types | close_types | c_fallback_types
     )
     classified_f = f_need_types | f_fallback_types | f_ack_types
     phases: list[dict[str, object]] = []
@@ -181,11 +178,15 @@ def phase_rows(c_frames: list[Frame], f_frames: list[Frame]) -> list[dict[str, o
     if sum(int(row["bytes"]) for row in phases if row["direction"] == "c_to_f") != sum(
         frame.bytes for frame in c_frames
     ):
-        raise AssertionError("C-to-F phase split does not tile its physical frame slice")
+        raise AssertionError(
+            "C-to-F phase split does not tile its physical frame slice"
+        )
     if sum(int(row["bytes"]) for row in phases if row["direction"] == "f_to_c") != sum(
         frame.bytes for frame in f_frames
     ):
-        raise AssertionError("F-to-C phase split does not tile its physical frame slice")
+        raise AssertionError(
+            "F-to-C phase split does not tile its physical frame slice"
+        )
     return phases
 
 
@@ -215,9 +216,7 @@ def transaction_graph(phases: list[dict[str, object]]) -> dict[str, object]:
             "p29-need:delivered" if "p29-need" in names else "p29-root:delivered"
         ]
     material = [
-        f"{name}:delivered"
-        for name in ("p29-lines", "p29-fill")
-        if name in names
+        f"{name}:delivered" for name in ("p29-lines", "p29-fill") if name in names
     ]
     if "p29-need" in names:
         material.append("p29-need:delivered")
@@ -226,9 +225,7 @@ def transaction_graph(phases: list[dict[str, object]]) -> dict[str, object]:
     if "p29-fallback-reply" in names:
         if "p29-fallback-request" not in names:
             raise ValueError("P29 fallback reply has no request")
-        dependencies["p29-fallback-reply"] = [
-            "p29-fallback-request:delivered"
-        ]
+        dependencies["p29-fallback-reply"] = ["p29-fallback-request:delivered"]
         material.append("p29-fallback-reply:delivered")
     dependencies["p29-close"] = material or ["p29-root:delivered"]
     if "p29-ack" in names:
@@ -265,26 +262,32 @@ def checked_run(command: list[str], stdout_path: Path, stderr_path: Path) -> Non
 
 def scenario_items(scenario: sim.LoadedScenario) -> list[AssignedItem]:
     if int(scenario.document["environments"]["env_count"]) != 1:
-        raise ValueError("P29 physical builder currently requires exactly one C authority")
+        raise ValueError(
+            "P29 physical builder currently requires exactly one C authority"
+        )
     diagnostic = sim.Simulator(
         scenario, sim.CompileOnlyAdapter(), snapshot_interval_ns=10**30
     ).run()
     by_key = {
-        item.key: item
-        for items in scenario.work_items.values()
-        for item in items
+        item.key: item for items in scenario.work_items.values() for item in items
     }
     assigned = []
-    for expected_tu_seq, row in enumerate(diagnostic.assignments):
+    for manifest_ordinal, row in enumerate(diagnostic.assignments):
         item = by_key[(row["workload"], int(row["build"]), int(row["logical"]))]
         tu_seq = int(row["tu_seq"])
-        if tu_seq != expected_tu_seq:
-            raise AssertionError("diagnostic assignment is not in contiguous TU_SEQ order")
         assigned.append(
-            AssignedItem(item, int(row["worker"]), tu_seq, int(row["rel_seq"]))
+            AssignedItem(
+                item,
+                int(row["worker"]),
+                tu_seq,
+                int(row["rel_seq"]),
+                manifest_ordinal,
+            )
         )
     if len(assigned) != len(by_key):
         raise AssertionError("diagnostic assignment did not cover every scenario TU")
+    if sorted(entry.tu_seq for entry in assigned) != list(range(len(assigned))):
+        raise AssertionError("diagnostic TU_SEQ identities are not contiguous")
     return assigned
 
 
@@ -296,7 +299,9 @@ def shared_plan_record(output: str) -> dict[str, object]:
         re.MULTILINE,
     )
     if len(matches) != 1:
-        raise RuntimeError("P29 output does not contain exactly one multi-route plan record")
+        raise RuntimeError(
+            "P29 output does not contain exactly one multi-route plan record"
+        )
     routes, target, active_tus, blocks, digest = matches[0]
     return {
         "routes": int(routes),
@@ -360,7 +365,7 @@ def build_ledger(
         by_worker[entry.worker].append(entry)
     for worker, route in by_worker.items():
         if [entry.rel_seq for entry in route] != list(range(len(route))):
-            raise AssertionError(f"P29 F{worker} projection is not contiguous")
+            raise AssertionError(f"P29 F{worker} route order is not contiguous")
 
     for worker in by_worker:
         (work / f"C0-F{worker}").mkdir(parents=True, exist_ok=True)
@@ -388,7 +393,9 @@ def build_ledger(
         or supervisor["completed"] != len(by_worker)
         or supervisor["status"] != "PASS"
     ):
-        raise RuntimeError("P29 encode supervisor did not complete every populated route")
+        raise RuntimeError(
+            "P29 encode supervisor did not complete every populated route"
+        )
     replay_supervisor_stdout = work / "replay-supervisor.stdout"
     replay_supervisor_stderr = work / "replay-supervisor.stderr"
     checked_run(
@@ -433,7 +440,7 @@ def build_ledger(
             or plan["target"] != worker
             or plan["active_tus"] != len(route)
         ):
-            raise RuntimeError(f"P29 F{worker} plan record differs from its projection")
+            raise RuntimeError(f"P29 F{worker} plan record differs from its route")
         if plan["digest"] != shared_digest or plan["blocks"] != shared_blocks:
             raise RuntimeError("P29 route child differs from its shared-C supervisor")
 
@@ -446,14 +453,9 @@ def build_ledger(
 
         curve_rows = [row for row in read_tsv(curve) if row["active"] == "1"]
         selector_rows = read_tsv(selector)
-        component_rows = [
-            row for row in read_tsv(components) if row["active"] == "1"
-        ]
+        component_rows = [row for row in read_tsv(components) if row["active"] == "1"]
         if not (
-            len(curve_rows)
-            == len(selector_rows)
-            == len(component_rows)
-            == len(route)
+            len(curve_rows) == len(selector_rows) == len(component_rows) == len(route)
         ):
             raise RuntimeError(f"P29 F{worker} per-TU row counts differ")
         c_data, f_data = c_sink.read_bytes(), f_sink.read_bytes()
@@ -465,16 +467,18 @@ def build_ledger(
             component_row,
         ) in enumerate(zip(route, curve_rows, selector_rows, component_rows)):
             item = entry.item
-            expected_tu = entry.tu_seq + 1
+            expected_tu = entry.manifest_ordinal + 1
             if (
                 int(curve_row["tu"]) != expected_tu
                 or int(component_row["tu"]) != expected_tu
-                or int(selector_row["tu"]) != entry.tu_seq
+                or int(selector_row["tu"]) != entry.manifest_ordinal
                 or int(curve_row["rel_seq"]) != route_sequence
                 or int(component_row["rel_seq"]) != route_sequence
                 or int(selector_row["rel_seq"]) != route_sequence
             ):
-                raise RuntimeError(f"P29 F{worker} order differs at TU_SEQ {entry.tu_seq}")
+                raise RuntimeError(
+                    f"P29 F{worker} order differs at TU_SEQ {entry.tu_seq}"
+                )
             if entry.rel_seq != route_sequence:
                 raise AssertionError("P29 route order differs from simulator REL_SEQ")
             c_end, f_end = int(curve_row["cf_offset"]), int(curve_row["fc_offset"])
@@ -488,9 +492,13 @@ def build_ledger(
             graph = transaction_graph(phases)
             c_delta, f_delta = c_end - c_prior, f_end - f_prior
             if int(selector_row["actual_delta"]) != c_delta:
-                raise RuntimeError(f"P29 selector bytes differ at TU_SEQ {entry.tu_seq}")
+                raise RuntimeError(
+                    f"P29 selector bytes differ at TU_SEQ {entry.tu_seq}"
+                )
             if component_row["exact"] != "true":
-                raise RuntimeError(f"P29 reconstruction is not exact at TU_SEQ {entry.tu_seq}")
+                raise RuntimeError(
+                    f"P29 reconstruction is not exact at TU_SEQ {entry.tu_seq}"
+                )
             if int(curve_row["raw_bytes"]) != item.raw_bytes:
                 raise RuntimeError(f"P29 raw bytes differ at TU_SEQ {entry.tu_seq}")
             emitted_blocks += int(selector_row["emitted_blockdefs"])
@@ -569,7 +577,17 @@ def build_ledger(
         "scenario": scenario.document["name"],
         "scenario_sha256": sim.sha256(scenario.path),
         "workload_inputs": scenario.workload_inputs,
-        "assignment": "common simulator compile-only dispatch order; ordered per-F projections",
+        "assignment": (
+            "common simulator compile-only static route binding and route-local dispatch order"
+            if scenario.document["scheduler"]["placement_policy"] == "rendezvous"
+            else "common simulator compile-only dispatch order; independent per-F route orders"
+        ),
+        "routing": {
+            "placement_policy": scenario.document["scheduler"]["placement_policy"],
+            "dense_frontier_workers": scenario.document["scheduler"].get(
+                "dense_frontier_workers"
+            ),
+        },
         "dialogue_window_per_route": 1,
         "command": command_display,
         "codec_binary": str(codec.resolve()),

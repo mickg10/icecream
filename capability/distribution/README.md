@@ -16,6 +16,9 @@ controls, and bounded-memory report measurements.
 full-corpus P29/GRZ results for the four primary C1F1 capacity/bandwidth points, exact byte-phase
 breakdowns, capacity distance, raw controls, and the wider independent-arena experiment.
 
+[`SIMULATOR-RULING-AUDIT.md`](SIMULATOR-RULING-AUDIT.md) audits the current engine against the
+ordered Issue 16 simulator additions and documents the first static stable/dense routing slice.
+
 The initial scenario is `firefox-1c-20f.json`: one C, one corrected Firefox build,
 twenty one-slot Fs, 1 Gbit/s per direction and a 10 Gbit/s shared fabric.  All TUs are
 released at time zero for the first comparison.  A measured C-preprocessor release trace
@@ -101,13 +104,46 @@ uplinks.  The first deployment does not model delegated egress or several produc
 one authority.  `per_environment_bits_per_second` is therefore the one aggregate uplink ceiling
 shared by all of that C's F relationships.
 
-Each dispatched TU receives a contiguous `TU_SEQ` in its C admission order.  Routing projects
-that order onto each destination F and assigns a contiguous `REL_SEQ`; every assignment and event
-records both.  A relationship with TU sequence `[0, 3, 7]` therefore carries REL sequence
-`[0, 1, 2]`.  Physical-ledger replay rejects a changed TU identity, destination, or projection.
+Each released prepared input receives a contiguous `TU_SEQ` in its C release order. Dispatch onto
+each destination F independently assigns a contiguous route-local `REL_SEQ`; every assignment and
+event records both. A relationship may carry TU sequence `[3, 0, 7]` with REL sequence
+`[0, 1, 2]`. Physical-ledger replay rejects a changed TU identity, destination, or route order.
 Whole-TU raw, P29, and GRZ use one active dialogue per `(C,F)` relationship while different Fs
 advance concurrently.  Once a TU's input commits, its compiler can continue while the next TU on
 that relationship transfers.
+
+### Static stable/dense routing
+
+Set `placement_policy` to `rendezvous` and choose the maximum number of F cache domains for each
+workload family with `dense_frontier_workers`:
+
+```json
+"scheduler": {
+  "ready_job_policy": "fifo-release",
+  "placement_policy": "rendezvous",
+  "dense_frontier_workers": 4
+}
+```
+
+The scenario seed and `(environment, workload, compiler profile)` choose a stable home frontier.
+Within it, `(environment, workload, source_job_id)` chooses one stable destination. Build number
+is excluded, so unchanged compile identities return to the same F on later builds. A selected TU
+waits for its bound F rather than spilling outside the frontier. `TU_SEQ` is assigned when the
+prepared input is released; `REL_SEQ` is independent route-local dispatch order.
+
+The P29 and GRZ physical builders consume this same static route map, bind it into their exact
+ledger, and the common simulator rejects replay drift. The tiny real-codec acceptance cell is:
+
+```bash
+python3 capability/distribution/run_static_routing_smoke.py \
+  --p29-codec /path/to/codec50-sink \
+  --grz-codec /path/to/grz2g \
+  --out /tmp/static-routing-smoke
+```
+
+It runs one cold and one unchanged warm build through a two-F frontier, verifies exact codec
+reconstruction and directional byte closure, checks stable destinations across builds, and keeps
+both canonical JSONL traces.
 
 `firefox-f-width-suite.json` is the corrected one-C routing-width gate.  It runs five zero-gap
 builds at F widths 1, 2, 3, 4, and 20, always with 200 compiler slots and 400 input-staging slots
@@ -166,8 +202,8 @@ python3 capability/distribution/run_scenario.py SCENARIO.json \
   --codec p29 --ledger /tmp/p29-ledger.jsonl --out /tmp/p29-simulation
 ```
 
-The P29 builder takes the common simulator assignment, admits the complete TU sequence into one
-logical C catalogue, and forms one ordered projection per populated F.  Every projection gets an
+The P29 builder takes the common simulator assignment, admits the complete transaction sequence
+into one logical C catalogue, and forms one ordered route per populated F. Every route gets an
 independent receiver store and contiguous `REL_SEQ`; canonical Block IDs and the global plan
 digest remain common.  One codec supervisor performs the immutable input load, interning, global
 admission, and all-route planning exactly once.  It then forks one populated route at a time from
