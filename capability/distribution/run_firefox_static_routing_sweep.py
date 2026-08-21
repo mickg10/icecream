@@ -321,6 +321,7 @@ def verify_jsonl(
     snapshot_count = 0
     active_ns = 0
     last_wall_end: int | None = None
+    last_active_end = 0
     events = 0
     next_event_sequence = 0
     route_bound = 0
@@ -340,10 +341,26 @@ def verify_jsonl(
             if record not in {"snapshot", "gap"}:
                 raise RuntimeError(f"{path}: unexpected timeline record {record!r}")
             interval_count += 1
-            last_wall_end = int(row["wall_end_ns"])
+            wall_start = int(row["wall_start_ns"])
+            wall_end = int(row["wall_end_ns"])
+            if last_wall_end is not None and wall_start != last_wall_end:
+                raise RuntimeError(f"{path}: wall intervals do not tile")
+            if int(row["wall_duration_ns"]) != wall_end - wall_start:
+                raise RuntimeError(f"{path}: wall interval duration differs")
+            last_wall_end = wall_end
             if record == "snapshot":
                 snapshot_count += 1
-                active_ns += int(row["active_duration_ns"])
+                active_start = int(row["active_start_ns"])
+                active_end = int(row["active_end_ns"])
+                if active_start != last_active_end:
+                    raise RuntimeError(f"{path}: active intervals do not tile")
+                active_duration = int(row["active_duration_ns"])
+                if active_duration != active_end - active_start:
+                    raise RuntimeError(f"{path}: active interval duration differs")
+                active_ns += active_duration
+                last_active_end = active_end
+            elif int(row["active_position_ns"]) != last_active_end:
+                raise RuntimeError(f"{path}: gap active position differs")
             for event in row["events"]:
                 if int(event["sequence"]) != next_event_sequence:
                     raise RuntimeError(f"{path}: event sequence is not contiguous")
@@ -360,6 +377,8 @@ def verify_jsonl(
         raise RuntimeError(f"{path}: wall intervals do not end at makespan")
     if active_ns != int(summary["timeline_active_ns"]):
         raise RuntimeError(f"{path}: active intervals do not reconcile")
+    if last_active_end != int(summary["timeline_active_ns"]):
+        raise RuntimeError(f"{path}: final active position does not reconcile")
     if events != int(final["event_count"]):
         raise RuntimeError(f"{path}: event count does not reconcile")
     expected_route_events = EXPECTED_JOBS if static else 0
