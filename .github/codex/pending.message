@@ -1,0 +1,25 @@
+tests: prove fairness backlog for every small-request interval
+
+Issue #4 fairness measurement closure.
+
+Capacity, target generations and cumulative admissions now come from one
+complete, strictly parsed `listcs summary` reply. The summary form preserves one
+row per connected daemon while omitting nested live-job rows, so observation
+cost is bounded by daemon population rather than the deliberately large queued
+job population. Legacy detailed `listcs` output remains unchanged.
+
+A nonzero compile-server port identifies an actual worker row; pure submitters
+contribute no physical capacity even while they own a large queued request
+backlog. Worker capacity is conservatively bounded by max(current,maxJobs), so
+a lowered advertised ceiling cannot make the proof easier.
+
+Each of the ten small requests is proven individually. With monotone admission
+and reply counters, admitted_before - replies_after is a lower bound throughout
+the request interval; requiring it above the shared farm-capacity bound excludes
+the endpoint-rebound gap. Topology, worker endpoints and target connection
+generations must remain stable.
+
+A pure arithmetic fixture retains the endpoint-rebound counterexample and checks
+worker-role capacity classification. The historical endpoint-only mutant must
+fail at its named trace. The integration gate reports maximum reply budgets and
+minimum proven margins.
