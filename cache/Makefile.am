@@ -16,6 +16,10 @@ EXTRA_DIST = \
 	key_layout_census.py \
 	formal/Protocol50.tla \
 	formal/Protocol50.cfg \
+	formal/Protocol50JobLifecycle.tla \
+	formal/Protocol50JobLifecycle.cfg \
+	formal/Protocol50JobLifecycle.md \
+	formal/run_tlc.sh \
 	formal/.gitignore \
 	formal/check_trace.py \
 	formal/README.md
