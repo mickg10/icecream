@@ -120,10 +120,10 @@ StartCompiler(a) ==
     /\ attemptEligible[a]
     /\ jobOpen
     /\ attemptF[a] \in Fs
-    /\ attemptEpoch[a] = fCacheEpoch[attemptF[a]]
     /\ environmentReady[attemptF[a]]
     /\ IF attemptMode[a] = P50Mode
-          THEN /\ inputLease[attemptF[a]]
+          THEN /\ attemptEpoch[a] = fCacheEpoch[attemptF[a]]
+               /\ inputLease[attemptF[a]]
                /\ inputCommitted[attemptF[a]]
                /\ inputDigest[attemptF[a]] = ExactDigest
           ELSE /\ attemptMode[a] = LegacyMode
