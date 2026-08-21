@@ -13,11 +13,12 @@ Compiler/job restart begins at INPUT_COMMITTED and is modeled separately in
 Protocol50JobLifecycle.tla.
 
 Callbacks carry an abstract operation identity:
-    <<F, HISTORY_NONCE, REL_SEQ, TU>>
-The production transaction digest additionally binds profile, component
-descriptors, raw digest, and route pre-state.  This bounded operation tuple is
-the smallest model value that distinguishes an earlier relationship operation
-from the current one on the same session.
+    <<F, HISTORY_NONCE, REL_SEQ, TU, TX_DIGEST_VARIANT>>
+The final field is a bounded representative of the production transaction
+digest, which additionally binds profile, component descriptors, raw digest,
+and route pre-state.  Only one cursor/TU tuple receives a second digest variant
+in this model, so the same-session abort/re-encode ABA case is explored without
+doubling the complete state space.
 ***************************************************************************)
 
 CONSTANTS F0, F1, T0, T1, O0, O1, V0, V1,
@@ -42,21 +43,24 @@ Values == {V0, V1}
 Tokens == {Tok0, Tok1}
 Nonces == 0..1
 Rels == 0..MaxRel
+DigestVariants == 0..1
 
 TuObjects(t) == IF t = T0 THEN {O0} ELSE {O0, O1}
 CanonicalContent(o) == IF o = O0 THEN V0 ELSE V1
 
-Op(f, n, r, t) == <<f, n, r, t>>
-NoOp == <<NoF, 2, MaxRel + 1, NoTU>>
-RealOps ==
-    {Op(f, n, r, t) :
-        f \in Fs, n \in Nonces, r \in Rels, t \in TUs}
+Op(f, n, r, t, d) == <<f, n, r, t, d>>
+NoOp == <<NoF, 2, MaxRel + 1, NoTU, 2>>
+BaseOps == Fs \X Nonces \X Rels \X TUs
+PrimaryOps == {Append(op, 0) : op \in BaseOps}
+RetryDigestOp == Op(F0, 1, 0, T0, 1)
+RealOps == PrimaryOps \cup {RetryDigestOp}
 Ops == RealOps \cup {NoOp}
 
 OpF(op) == op[1]
 OpNonce(op) == op[2]
 OpRel(op) == op[3]
 OpTu(op) == op[4]
+OpDigestVariant(op) == op[5]
 
 Present(st, f) == {o \in Objects : st.content[f][o] # NoContent}
 CurrentSession(st, f, tok) ==
@@ -163,10 +167,12 @@ HISTORY_RESET(f, tok) ==
                     !.cRel = 0,
                     !.commitDisconnected = FALSE]
 
-C_TX_BEGIN(f, t) ==
-    LET op == Op(f, s.cNonce, s.cRel, t)
+C_TX_BEGIN(f, t, d) ==
+    LET op == Op(f, s.cNonce, s.cRel, t, d)
     IN /\ f \in Fs
        /\ t \in TUs
+       /\ d \in DigestVariants
+       /\ op \in RealOps
        /\ s.session = f
        /\ s.cF = f
        /\ s.route[f]
@@ -369,7 +375,7 @@ Next ==
     \/ \E f \in Fs, tok \in Tokens : SESSION_DISCONNECTED(f, tok)
     \/ \E f \in Fs, tok \in Tokens : STALE_SESSION_CALLBACK(f, tok)
     \/ \E f \in Fs, tok \in Tokens : HISTORY_RESET(f, tok)
-    \/ \E f \in Fs, t \in TUs : C_TX_BEGIN(f, t)
+    \/ \E f \in Fs, t \in TUs, d \in DigestVariants : C_TX_BEGIN(f, t, d)
     \/ \E op \in RealOps : F_TX_BEGIN(op)
     \/ \E op \in RealOps : ACTIVE_REPLAYED(op)
     \/ \E op \in RealOps : TX_ABORTED(op)
