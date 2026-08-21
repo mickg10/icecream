@@ -15,9 +15,9 @@ Protocol50JobLifecycle.tla
     cache-sidecar restart, compiler authorization, and one-result arbitration
 
 Protocol50IncarnationBridge.tla
-    verified F_STORE_GUID replacement after a durable but unaccepted commit,
-    preservation of C retry identity, cold-route/history-independent replay,
-    and the job effects of that replacement
+    verified F_STORE_GUID replacement while an old transaction is in flight
+    or after a durable but unaccepted commit, preservation of C retry identity,
+    cold-route/history-independent replay, and the job effects of replacement
 ```
 
 The boundaries are:
@@ -26,7 +26,7 @@ The boundaries are:
 Protocol50 --INPUT_COMMITTED--> Protocol50JobLifecycle
 
 Protocol50 + Protocol50JobLifecycle
-    --verified F_STORE_GUID replacement in the unaccepted-commit window-->
+    --verified F_STORE_GUID replacement before acceptance-->
 Protocol50IncarnationBridge
 ```
 
@@ -51,9 +51,18 @@ The cache model includes:
 - rejection of `TX_ABORTED` in that durable-commit window;
 - rejection of `TX_BEGIN` at terminal bounded `REL_SEQ`;
 - session-token fencing and same-session operation identity
-  `(F, HISTORY_NONCE, REL_SEQ, TU)` for delayed callbacks.
+  `(F, HISTORY_NONCE, REL_SEQ, TU, TX_DIGEST_VARIANT)` for delayed callbacks.
 
-The production transaction digest binds more than the bounded operation tuple: profile, component descriptors, raw digest, and route pre-state. The bounded tuple exists only to distinguish an earlier operation from the current operation on the same session.
+The production transaction digest binds profile, component descriptors, raw digest, and route pre-state. The bounded model gives only one cursor/TU tuple a second digest variant. That is enough to exercise the same-session ABA case:
+
+```text
+transaction A starts at one route cursor
+A is explicitly aborted before durable commit
+transaction B re-encodes the same TU at the same cursor
+late callback from A arrives while B is pending
+```
+
+The callback must be rejected because its digest identity differs, even though F, nonce, `REL_SEQ`, and `TU_SEQ` match. Limiting the second variant to one tuple avoids doubling the full state space.
 
 The atomic Need/pin rule prevents:
 
@@ -83,20 +92,20 @@ The job model includes:
 
 ## F-incarnation bridge
 
-Ordinary abort is forbidden after F durably commits and before C accepts. There is one explicit exception:
+Ordinary abort is forbidden after F durably commits and before C accepts. Verified F-store replacement is the explicit exception. The same cold-retry rule also applies when the old transaction was still in flight and had not committed:
 
 ```text
 F proves a new F_STORE_GUID
-old durable commit is no longer reachable
+any old partial overlay or durable-but-unaccepted commit is unreachable
 C retains the immutable PreparedTU/retry identity
 waiting P50 attachment is cancelled
-already-authorized compiler remains valid
+already-authorized compiler, when one exists, remains valid
 new cold route is established
 same PreparedTU is reissued history-independently
 new commit is accepted
 ```
 
-The bridge model checks this exception and includes a scoped temporal property:
+The bridge model checks both pre-durable and post-durable replacement timing and includes a scoped temporal property:
 
 ```text
 under a stable new incarnation and weak fairness of
@@ -165,7 +174,7 @@ The C++ and Python trace checkers must reject:
 - abort while F still owns a pending overlay;
 - abort after durable F commit and before normal/lost acceptance;
 - F mutation from a stale session serial;
-- current-session callback carrying an earlier operation identity;
+- current-session callback carrying an earlier operation identity, including a different transaction digest at the same route cursor;
 - begin at exhausted `REL_SEQ`.
 
 ## Running TLC
