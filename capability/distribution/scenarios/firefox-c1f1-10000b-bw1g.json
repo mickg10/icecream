@@ -1,0 +1,62 @@
+{
+  "schema": "icecream-distribution-scenario-v1",
+  "name": "firefox-corrected-C1F1_10000B_BW1G",
+  "seed": 12345,
+  "environments": {
+    "env_count": 1,
+    "job_selection": {
+      "mode": "explicit",
+      "jobs": [
+        {
+          "id": "firefox-c0",
+          "environment": 0,
+          "trace": "../firefox-corrected.compile-trace.tsv",
+          "corpus_root": "/tanksmall/scratch/ictmp/corpus18",
+          "builds": 5,
+          "start_ns": 0,
+          "build_release": { "mode": "after-previous", "gap_ns": 0 },
+          "tu_release": { "mode": "all-at-zero" }
+        }
+      ]
+    }
+  },
+  "workers": {
+    "f_count": 1,
+    "template": {
+      "slots": 10000,
+      "input_staging_slots": 10000,
+      "compile_profile": "firefox-compile-v1-size-linear",
+      "initial_cache": "cold"
+    }
+  },
+  "network": {
+    "c_to_f": {
+      "bits_per_second": 1000000000,
+      "per_environment_bits_per_second": 1000000000,
+      "per_worker_bits_per_second": 1000000000,
+      "fabric_bits_per_second": 1000000000,
+      "writer_quantum_bytes": 102400,
+      "max_priority_burst_quanta": 8,
+      "one_way_latency_ns": 250000,
+      "lanes_per_endpoint": 1
+    },
+    "f_to_c": {
+      "bits_per_second": 1000000000,
+      "per_environment_bits_per_second": 1000000000,
+      "per_worker_bits_per_second": 1000000000,
+      "fabric_bits_per_second": 1000000000,
+      "writer_quantum_bytes": 102400,
+      "max_priority_burst_quanta": 8,
+      "one_way_latency_ns": 250000,
+      "lanes_per_endpoint": 1
+    }
+  },
+  "scheduler": {
+    "ready_job_policy": "fifo-release",
+    "placement_policy": "round-robin"
+  },
+  "experiment": {
+    "codecs": ["grz", "p29"],
+    "routing_mode": "online"
+  }
+}

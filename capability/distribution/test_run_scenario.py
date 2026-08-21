@@ -793,6 +793,49 @@ class SimulatorTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "raw content digest"):
                 sim.PhysicalLedgerAdapter(ledger_path, scenario, "p29")
 
+    def test_compatible_ledger_reuse_requires_exact_inputs_and_runtime_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_path = write_fixture(root, [1, 1], [10, 11], workers=1)
+            source_document = json.loads(source_path.read_text())
+            source_document["workers"]["template"]["slots"] = 2
+            source_path.write_text(json.dumps(source_document))
+            ledger_path = write_physical_ledger(root / "physical.jsonl", source_path)
+
+            timing_document = json.loads(source_path.read_text())
+            timing_document["name"] = "test-faster-link"
+            timing_document["network"]["c_to_f"]["bits_per_second"] = 1_600
+            timing_path = root / "timing-variant.json"
+            timing_path.write_text(json.dumps(timing_document))
+            timing_scenario = sim.load_scenario(timing_path)
+            with self.assertRaisesRegex(ValueError, "different scenario"):
+                sim.PhysicalLedgerAdapter(ledger_path, timing_scenario, "p29")
+
+            digest_cache = {}
+            adapter = sim.PhysicalLedgerAdapter(
+                ledger_path,
+                timing_scenario,
+                "p29",
+                allow_compatible_scenario=True,
+                payload_digest_cache=digest_cache,
+            )
+            self.assertEqual(len(digest_cache), 2)
+            result = sim.Simulator(timing_scenario, adapter).run()
+            self.assertEqual(result.summary["c_to_f_bytes"], 19)
+            self.assertEqual(
+                result.summary["codec_metadata"]["scenario_binding"],
+                "compatible-inputs-and-runtime-route-order",
+            )
+            (root / "j0.ii").write_bytes(b"q" * 10)
+            with self.assertRaisesRegex(ValueError, "raw content digest"):
+                sim.PhysicalLedgerAdapter(
+                    ledger_path,
+                    timing_scenario,
+                    "p29",
+                    allow_compatible_scenario=True,
+                    payload_digest_cache=digest_cache,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

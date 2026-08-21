@@ -181,6 +181,53 @@ requires full route reconstruction, an identical retry, and exact selected prefi
 The resulting current-TU frame is a one-node transaction graph and is then scheduled by the
 same event engine used by every other adapter.
 
+### One-command physical-codec suite
+
+`run_suite.py` also builds and replays P29 and GRZ directly; there is no second timing
+simulator. The builder produces a byte-exact physical ledger, and `PhysicalLedgerAdapter`
+feeds that ledger into the same `Simulator` used by `compile-only` and `raw`.
+
+The four primary one-C/one-F capacity and bandwidth points are collected in
+`firefox-c1f1-capacity-bandwidth-suite.json`:
+
+| scenario | compiler slots | C/F bandwidth |
+|---|---:|---:|
+| `C1F1_1000000B_BW1G` | 1,000,000 | 1 Gbit/s |
+| `C1F1_1000000B_BW10000G` | 1,000,000 | 10,000 Gbit/s |
+| `C1F1_10000B_BW1G` | 10,000 | 1 Gbit/s |
+| `C1F1_10000B_BW10G` | 10,000 | 10 Gbit/s |
+
+All four run one cold plus four immediately-following warm Firefox builds. Since every point
+has one F, at least 2,498 staging/compiler slots, and the same ordered TU stream, codec bytes are
+independent of the timing-only capacity changes. `--reuse-compatible-ledger` therefore builds
+one exact ledger per codec at the first point and reuses it at the other three. Reuse is
+explicit: every payload digest is rechecked and replay still refuses any worker, `TU_SEQ`, or
+`REL_SEQ` change.
+
+```bash
+python3 capability/distribution/run_suite.py \
+  capability/distribution/firefox-c1f1-capacity-bandwidth-suite.json \
+  --codec p29 --codec grz \
+  --codec-binary p29=/path/to/codec50-sink \
+  --codec-binary grz=/path/to/grz2g \
+  --reuse-compatible-ledger \
+  --corpus-root firefox-c0=/path/to/corpus18 \
+  --require-payload \
+  --out /path/to/results
+```
+
+Alternatively, `--physical-ledger p29=PATH` or `grz=PATH` replays a retained ledger. Add
+`--allow-compatible-ledger` only for a timing-only scenario variant with the same exact inputs
+and route order.
+
+The suite-level `matrix.tsv` includes cold/warm C-to-F bytes, raw/physical ratio, summed
+input-ready, compile-complete, transaction-commit and generation elapsed times, separate
+C-to-F/compiler/overlap capacity floors, excess time above the overlap floor, and floor
+efficiencies. `physical-phases.tsv` breaks exact bytes down by codec transaction phase;
+`runner-timings.tsv` separates host-side ledger construction from simulator runtime. Every
+scenario/codec directory retains the complete `builds.tsv`, `generations.tsv`, event/timeline
+JSONL, self-contained HTML report, builder logs, exact ledger, and codec work directory.
+
 Ledger generation currently starts from the compile-only assignment and replay refuses any
 placement drift.  That is exact for the primary `C1F20_200B1G` case because all 2,498 TUs fit in
 the 4,000 available slots at each build barrier.  Slot-constrained dynamic-placement studies need

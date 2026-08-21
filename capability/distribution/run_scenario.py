@@ -283,14 +283,24 @@ class PhysicalLedgerAdapter(CodecAdapter):
     """Replay exact per-TU codec transactions inside the common event engine.
 
     The producer of this ledger owns encoding and byte-exact reconstruction.  This class
-    rejects incomplete ledgers, mismatched scenarios, estimated rows, byte-total drift and
-    assignment drift before any result can carry the physical-result label.
+    rejects incomplete ledgers, estimated rows, byte-total drift and assignment drift before
+    any result can carry the physical-result label.  An explicit compatibility mode permits a
+    ledger to be reused for a timing-only scenario variant, but still checks every input byte
+    digest and refuses any destination, TU_SEQ, or REL_SEQ drift during replay.
     """
 
     physical = True
 
     def __init__(
-        self, path: Path, scenario: "LoadedScenario", expected_codec: str | None = None
+        self,
+        path: Path,
+        scenario: "LoadedScenario",
+        expected_codec: str | None = None,
+        allow_compatible_scenario: bool = False,
+        payload_digest_cache: dict[
+            Path, tuple[tuple[int, int, int, int, int], str]
+        ]
+        | None = None,
     ):
         self.path = path.resolve()
         rows = [json.loads(line) for line in self.path.read_text().splitlines() if line]
@@ -312,8 +322,20 @@ class PhysicalLedgerAdapter(CodecAdapter):
         reconstruction = descriptor.get("reconstruction")
         if not isinstance(reconstruction, dict) or reconstruction.get("status") != "pass":
             raise ValueError(f"{self.path}: reconstruction result is not pass")
-        if descriptor.get("scenario_sha256") != sha256(scenario.path):
+        ledger_scenario_sha256 = descriptor.get("scenario_sha256")
+        replay_scenario_sha256 = sha256(scenario.path)
+        if (
+            ledger_scenario_sha256 != replay_scenario_sha256
+            and not allow_compatible_scenario
+        ):
             raise ValueError(f"{self.path}: ledger belongs to a different scenario")
+        self.scenario_binding = (
+            "exact-scenario-sha256"
+            if ledger_scenario_sha256 == replay_scenario_sha256
+            else "compatible-inputs-and-runtime-route-order"
+        )
+        self.ledger_scenario_sha256 = ledger_scenario_sha256
+        self.replay_scenario_sha256 = replay_scenario_sha256
         if final.get("record") != "physical-summary":
             raise ValueError(f"{self.path}: physical ledger has no final summary")
         self.name = codec
@@ -322,7 +344,11 @@ class PhysicalLedgerAdapter(CodecAdapter):
         self.entries: dict[tuple[str, int, int], PhysicalLedgerEntry] = {}
         route_sequences: dict[tuple[int, int], list[int]] = defaultdict(list)
         tu_sequences: dict[int, list[int]] = defaultdict(list)
-        payload_digests: dict[Path, str] = {}
+        payload_digests: dict[
+            Path, tuple[tuple[int, int, int, int, int], str]
+        ] = (
+            payload_digest_cache if payload_digest_cache is not None else {}
+        )
         c_to_f_total = 0
         f_to_c_total = 0
         for row_number, row in enumerate(rows[1:-1], start=2):
@@ -510,10 +536,20 @@ class PhysicalLedgerAdapter(CodecAdapter):
             if not item.payload.is_file():
                 raise ValueError(f"{self.path}: payload is absent for {key}: {item.payload}")
             payload = item.payload.resolve()
-            digest = payload_digests.get(payload)
-            if digest is None:
+            stat = payload.stat()
+            identity = (
+                stat.st_dev,
+                stat.st_ino,
+                stat.st_size,
+                stat.st_mtime_ns,
+                stat.st_ctime_ns,
+            )
+            cached_digest = payload_digests.get(payload)
+            if cached_digest is None or cached_digest[0] != identity:
                 digest = sha256(payload)
-                payload_digests[payload] = digest
+                payload_digests[payload] = (identity, digest)
+            else:
+                digest = cached_digest[1]
             if self.entries[key].raw_sha256 != digest:
                 raise ValueError(f"{self.path}: raw content digest differs for {key}")
         for route, sequences in route_sequences.items():
@@ -653,6 +689,9 @@ class PhysicalLedgerAdapter(CodecAdapter):
         return {
             "ledger": str(self.path),
             "ledger_sha256": sha256(self.path),
+            "scenario_binding": self.scenario_binding,
+            "ledger_scenario_sha256": self.ledger_scenario_sha256,
+            "replay_scenario_sha256": self.replay_scenario_sha256,
             "descriptor": self.descriptor,
             "physical_summary": self.final,
         }
@@ -2603,6 +2642,10 @@ class Simulator:
             first_dispatch_ns = min(
                 ceil_fraction(tx.dispatch_ns) for tx in transactions
             )
+            last_input_ready_ns = max(
+                ceil_fraction(tx.transfer_done_ns)  # type: ignore[arg-type]
+                for tx in transactions
+            )
             last_compile_finish_ns = max(
                 ceil_fraction(tx.compile_finish_ns)  # type: ignore[arg-type]
                 for tx in transactions
@@ -2627,13 +2670,15 @@ class Simulator:
                     "jobs": len(transactions),
                     "start_ns": start_ns,
                     "first_dispatch_ns": first_dispatch_ns,
-                    "last_input_ready_ns": max(
-                        ceil_fraction(tx.transfer_done_ns)  # type: ignore[arg-type]
-                        for tx in transactions
-                    ),
+                    "last_input_ready_ns": last_input_ready_ns,
                     "last_compile_finish_ns": last_compile_finish_ns,
                     "last_transaction_commit_ns": last_transaction_commit_ns,
                     "stop_ns": stop_ns,
+                    "input_ready_elapsed_ns": last_input_ready_ns - start_ns,
+                    "compile_elapsed_ns": last_compile_finish_ns - start_ns,
+                    "transaction_commit_elapsed_ns": (
+                        last_transaction_commit_ns - start_ns
+                    ),
                     "duration_ns": duration_ns,
                     "raw_bytes": sum(tx.item.raw_bytes for tx in transactions),
                     "c_to_f_bytes": sum(tx.c_to_f_bytes for tx in transactions),
@@ -3183,6 +3228,14 @@ def main() -> int:
         help="required physical-ledger JSONL for p29/grz",
     )
     parser.add_argument(
+        "--allow-compatible-ledger",
+        action="store_true",
+        help=(
+            "allow a physical ledger from a different scenario file; exact payload digests "
+            "and runtime worker/TU_SEQ/REL_SEQ order are still required"
+        ),
+    )
+    parser.add_argument(
         "--corpus-root", action="append", default=[], metavar="WORKLOAD=PATH"
     )
     parser.add_argument("--require-payload", action="store_true")
@@ -3201,17 +3254,22 @@ def main() -> int:
                 f"{len(missing)} payloads are absent; first is {missing[0]}"
             )
     if args.codec == "compile-only":
-        if args.ledger is not None:
-            raise ValueError("compile-only does not accept --ledger")
+        if args.ledger is not None or args.allow_compatible_ledger:
+            raise ValueError("compile-only does not accept physical-ledger options")
         adapter: CodecAdapter = CompileOnlyAdapter()
     elif args.codec == "raw":
-        if args.ledger is not None:
-            raise ValueError("raw does not accept --ledger")
+        if args.ledger is not None or args.allow_compatible_ledger:
+            raise ValueError("raw does not accept physical-ledger options")
         adapter = RawAdapter()
     else:
         if args.ledger is None:
             raise ValueError(f"{args.codec} requires --ledger")
-        adapter = PhysicalLedgerAdapter(args.ledger, scenario, args.codec)
+        adapter = PhysicalLedgerAdapter(
+            args.ledger,
+            scenario,
+            args.codec,
+            allow_compatible_scenario=args.allow_compatible_ledger,
+        )
     args.out.mkdir(parents=True, exist_ok=True)
     result = Simulator(
         scenario,

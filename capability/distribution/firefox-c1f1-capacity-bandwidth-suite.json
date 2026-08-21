@@ -1,0 +1,11 @@
+{
+  "schema": "icecream-distribution-suite-v1",
+  "name": "firefox-c1f1-capacity-bandwidth",
+  "scenarios": [
+    "scenarios/firefox-c1f1-1000000b-bw1g.json",
+    "scenarios/firefox-c1f1-1000000b-bw10000g.json",
+    "scenarios/firefox-c1f1-10000b-bw1g.json",
+    "scenarios/firefox-c1f1-10000b-bw10g.json"
+  ],
+  "diagnostic_codecs": ["compile-only", "raw"]
+}

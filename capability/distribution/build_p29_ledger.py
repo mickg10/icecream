@@ -334,8 +334,9 @@ def build_ledger(
     output_path: Path,
     work: Path,
     extra_options: list[str],
+    payload_overrides: dict[str, Path] | None = None,
 ) -> None:
-    scenario = sim.load_scenario(scenario_path)
+    scenario = sim.load_scenario(scenario_path, payload_overrides)
     if not codec.is_file():
         raise ValueError(f"P29 codec binary is absent: {codec}")
     assigned = scenario_items(scenario)
@@ -567,6 +568,7 @@ def build_ledger(
         "codec": "p29",
         "scenario": scenario.document["name"],
         "scenario_sha256": sim.sha256(scenario.path),
+        "workload_inputs": scenario.workload_inputs,
         "assignment": "common simulator compile-only dispatch order; ordered per-F projections",
         "dialogue_window_per_route": 1,
         "command": command_display,
@@ -621,8 +623,18 @@ def main() -> int:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--work", type=Path, required=True)
     parser.add_argument("--codec-option", action="append", default=[])
+    parser.add_argument(
+        "--corpus-root", action="append", default=[], metavar="WORKLOAD=PATH"
+    )
     args = parser.parse_args()
-    build_ledger(args.scenario, args.codec, args.out, args.work, args.codec_option)
+    build_ledger(
+        args.scenario,
+        args.codec,
+        args.out,
+        args.work,
+        args.codec_option,
+        sim.payload_overrides(args.corpus_root),
+    )
     print(args.out)
     return 0
 

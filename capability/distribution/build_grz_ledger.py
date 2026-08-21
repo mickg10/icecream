@@ -305,8 +305,9 @@ def build_ledger(
     work: Path,
     extra_options: list[str],
     stride: int,
+    payload_overrides: dict[str, Path] | None = None,
 ) -> None:
-    scenario = sim.load_scenario(scenario_path)
+    scenario = sim.load_scenario(scenario_path, payload_overrides)
     if not binary.is_file():
         raise ValueError(f"GRZ binary is absent: {binary}")
     routes, identities = assignment_routes(scenario)
@@ -388,6 +389,7 @@ def build_ledger(
         "codec": "grz",
         "scenario": scenario.document["name"],
         "scenario_sha256": sim.sha256(scenario.path),
+        "workload_inputs": scenario.workload_inputs,
         "assignment": "common simulator compile-only dispatch order, partitioned by (C,F)",
         "dialogue_window_per_route": 1,
         "command_options": list(GRZ_OPTIONS) + extra_options,
@@ -426,6 +428,9 @@ def main() -> int:
     parser.add_argument("--work", type=Path, required=True)
     parser.add_argument("--prefix-stride", type=int, default=64)
     parser.add_argument("--codec-option", action="append", default=[])
+    parser.add_argument(
+        "--corpus-root", action="append", default=[], metavar="WORKLOAD=PATH"
+    )
     args = parser.parse_args()
     if args.prefix_stride <= 0:
         raise ValueError("--prefix-stride must be positive")
@@ -436,6 +441,7 @@ def main() -> int:
         args.work,
         args.codec_option,
         args.prefix_stride,
+        sim.payload_overrides(args.corpus_root),
     )
     print(args.out)
     return 0
