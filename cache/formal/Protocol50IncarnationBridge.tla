@@ -2,13 +2,14 @@
 EXTENDS Naturals, TLC
 
 (***************************************************************************
-Small composition model for the one cross-boundary recovery case that neither
-Protocol50.tla nor Protocol50JobLifecycle.tla should absorb:
+Small composition model for the cold-incarnation recovery boundary that
+neither Protocol50.tla nor Protocol50JobLifecycle.tla should absorb:
 
-    F durably committed exact input
-    C has not accepted that commit
-    F_STORE_GUID changes destructively
-    C retains the immutable PreparedTU and retries on the new incarnation
+    C retains one immutable PreparedTU / active transaction identity
+    F_STORE_GUID changes destructively either:
+      * while the old transaction is still in flight, or
+      * after F durably committed exact input but before C accepted it
+    C establishes a cold route and retries history-independently
 
 Verified F identity replacement is the explicit exception to the ordinary rule
 that a durable unaccepted commit may not be abandoned.  It is not represented
@@ -32,6 +33,7 @@ RecoveryPhases ==
 Acceptances == {"None", "Old", "Retry"}
 RetryPendingPhases ==
     {"NeedRoute", "ReadyToSend", "RetryInFlight", "RetryDurable"}
+ReplacementEligiblePhases == {"OldInFlight", "AwaitingOldAck"}
 
 VARIABLE s
 vars == <<s>>
@@ -84,12 +86,16 @@ AcceptOldCommit ==
                  !.recovery = "DoneOld"]
 
 F_STORE_INCAR_REPLACED ==
-    /\ s.recovery = "AwaitingOldAck"
-    /\ s.oldCommitDurable
+    /\ s.recovery \in ReplacementEligiblePhases
     /\ s.fGuid = OldGuid
     /\ s.cSeenGuid = OldGuid
     /\ s.cActive = TU
     /\ s.cacheAccepted = "None"
+    /\ IF s.recovery = "AwaitingOldAck"
+          THEN /\ s.oldCommitDurable
+               /\ s.oldInputPresent
+          ELSE /\ ~s.oldCommitDurable
+               /\ ~s.oldInputPresent
     /\ s' = [s EXCEPT
                  !.fGuid = NewGuid,
                  !.cSeenGuid = NewGuid,
@@ -198,6 +204,13 @@ ReplacementPreservesRetryIdentity ==
     s.recovery \notin RetryPendingPhases \/
         /\ s.prepared
         /\ s.cActive = TU
+        /\ s.fGuid = NewGuid
+        /\ s.cSeenGuid = NewGuid
+
+ReplacementClearsOldIncarnationState ==
+    s.replacementObserved =>
+        /\ ~s.oldCommitDurable
+        /\ ~s.oldInputPresent
         /\ s.fGuid = NewGuid
         /\ s.cSeenGuid = NewGuid
 
