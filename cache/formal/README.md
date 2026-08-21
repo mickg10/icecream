@@ -2,7 +2,7 @@
 
 This directory is the canonical formal home for Protocol 50 because it lives beside the product identities, executable state machine, action trace, and trace checker.
 
-There are three small models with different ownership boundaries:
+There are four small models with different ownership boundaries:
 
 ```text
 Protocol50.tla
@@ -14,15 +14,25 @@ Protocol50JobLifecycle.tla
     retained exact input, compiler/job restart, cache-versus-legacy attempts,
     cache-sidecar restart, compiler authorization, and one-result arbitration
 
+Protocol50Reconnect.tla
+    fail-closed classification of initial cold state, exact replay,
+    lost-final-ack reconciliation, F-store replacement, route mismatch,
+    same-GUID namespace loss, and the one-reset-per-session boundary
+
 Protocol50IncarnationBridge.tla
     verified F_STORE_GUID replacement while an old transaction is in flight
     or after a durable but unaccepted commit, preservation of C retry identity,
-    cold-route/history-independent replay, and the job effects of replacement
+    independently owned compiler input, cold replay, and scoped progress
 ```
 
 The boundaries are:
 
 ```text
+SESSION_STATE/reconnect report
+    -> Protocol50Reconnect
+    -> replay, witnessed lost-ack acceptance, verified cold replacement,
+       idle reset, or terminal protocol inconsistency
+
 Protocol50 --INPUT_COMMITTED--> Protocol50JobLifecycle
 
 Protocol50 + Protocol50JobLifecycle
@@ -30,7 +40,7 @@ Protocol50 + Protocol50JobLifecycle
 Protocol50IncarnationBridge
 ```
 
-This is one protocol design, not competing architectures. The split keeps the already-large cache state space from absorbing compiler-attempt and incarnation-recovery state.
+This is one protocol design, not competing architectures. The split keeps the already-large cache state space from absorbing compiler-attempt and reconnect-classification state.
 
 The older experimental model under `formal/protocol50/` on the capability branch is withdrawn. It contained the separate `ComputeNeed`/`PinClosure` race and did not implement the callback/restart semantics its review claimed.
 
@@ -73,11 +83,44 @@ X is evicted before materialization
 no Fill for X exists
 ```
 
-## History-nonce freshness
+## Reconnect decision table
+
+Reconnect is a decision boundary, not generic “reset on mismatch” logic:
+
+```text
+never established + namespace absent:
+    initial cold establishment
+
+same F_STORE_GUID + exact route cursor:
+    continue or replay the retained whole transaction
+
+same F_STORE_GUID + exact retained last commit one REL_SEQ ahead:
+    accept the witnessed lost final acknowledgement
+
+changed F_STORE_GUID:
+    verified destructive replacement; preserve PreparedTU and cold-reissue
+
+established + same F_STORE_GUID + namespace absent:
+    terminal protocol inconsistency; do not retire unresolved C state
+
+same-incarnation mismatch while C retains active or durable work:
+    terminal/reconnect; do not reset over the unresolved transaction
+
+idle same-incarnation mismatch:
+    one HISTORY_RESET may establish a fresh branch
+```
+
+`Protocol50Reconnect.tla` checks that cold retirement has GUID-change or initial-cold proof, that unresolved active work is not discarded, and that one reconciled session performs at most one reset. Mutants independently enable each unsafe shortcut.
+
+The practical rule is deliberately small: if a second reset seems necessary in one live session, close it and re-enter reconciliation. No history-repair log or frame-resume protocol is required.
+
+## History-nonce and session freshness
 
 A production `HISTORY_NONCE` is not merely “different from the current value.” It is a monotonic, non-reused u64 within one `(C_STORE_GUID, F_STORE_GUID)` incarnation. A route reset with a reused or lower nonce is rejected. Exhaustion requires an identity-incarnation change rather than wrap.
 
-This closes a same-session ABA case that operation digests alone cannot distinguish when an identical TU is encoded identically after an old history branch is recreated:
+Likewise, an F session serial is nonzero and strictly increasing within one F-store incarnation. Every asynchronous F mutation revalidates the current session serial and the complete operation identity before touching state.
+
+This closes two ABA cases:
 
 ```text
 branch N runs transaction X
@@ -87,14 +130,13 @@ identical X is created at REL_SEQ 0
 late callback from old branch N aliases new X
 ```
 
-The large cache model intentionally keeps `Nonces == 0..1` as an old/new-branch abstraction and does not attempt unbounded nonce allocation. M2/product gates must enforce the concrete monotonic rule and test:
+```text
+session S owns operation X
+session S2 replaces S
+late mutation from S arrives with an otherwise matching transaction identity
+```
 
-- equal nonce rejected;
-- lower/previously used nonce rejected;
-- next higher nonce accepted only outside an active transaction;
-- C_GUID or F_STORE_GUID replacement starts a new nonce domain.
-
-A history reset should be the first mutating route-control operation after session reconciliation. Further reset need closes the session and re-enters reconciliation rather than repeatedly recycling branch identity in place.
+The large cache model intentionally keeps `Nonces == 0..1` as an old/new-branch abstraction. Its `HISTORY_RESET` action composes with the reconnect model's one-reset-per-session gate; the core model alone is not an unbounded nonce-allocation proof. Product and trace gates enforce the concrete monotonic rule.
 
 ## Job-model rules
 
@@ -111,7 +153,18 @@ The job model includes:
 - late losing results observable but unable to win;
 - exactly one accepted result for the logical job.
 
-“Authorized” means the compiler owns an independent complete input source. A compiler still waiting for bytes through a sidecar-owned pipe is not restart-independent.
+“Authorized” is now an executable invariant, not only prose. It means the compiler owns an independent, complete, immutable input source. A compiler still waiting for bytes through a sidecar-owned pipe is not restart-independent. A direct mutant authorizes without ownership and must violate `AuthorizedCompilerOwnsIndependentInput`.
+
+A valid compiler restart therefore remains simple:
+
+```text
+attempt A dies before or after compiler authorization
+logical job remains open
+replacement attempt B receives a new independent read cursor
+B reads the same retained InputRecord
+no retransmission and no second cache-history commit
+only one result may be accepted
+```
 
 ## F-incarnation bridge
 
@@ -122,7 +175,7 @@ F proves a new F_STORE_GUID
 any old partial overlay or durable-but-unaccepted commit is unreachable
 C retains the immutable PreparedTU/retry identity
 waiting P50 attachment is cancelled
-already-authorized compiler, when one exists, remains valid
+already-authorized compiler survives only if it owns exact input independently
 new cold route is established
 same PreparedTU is reissued history-independently
 new commit is accepted
@@ -145,6 +198,8 @@ It does **not** claim unconditional liveness under infinitely recurring failures
 ## One shared C namespace
 
 The product topology for this effort is one shared C-side authority/GUID used by all local C producer processes. The formal cache model therefore has one C namespace and independent F replicas. A separate “two unrelated C GUIDs assign the same Key64 differently” model is not part of the current product contract. Executable namespace-isolation tests may remain as robustness tests.
+
+Local Prepare must be idempotent across a lost local reply. A producer-session/request token binds the raw length and digest: retrying the same token and identity returns the same PreparedTU/TU_SEQ; reusing the token for different input is rejected. This is local request replay, not a new remote P50 message.
 
 ## Implementation correspondence
 
@@ -192,14 +247,17 @@ ACCEPT_RETRY_COMMIT
 
 A large implementation trace need not contain every modeled action, but every mutating implementation event must refine one modeled transition.
 
-The C++ and Python trace checkers must reject:
+The executable trace gates reject:
 
 - abort while F still owns a pending overlay;
 - abort after durable F commit and before normal/lost acceptance;
 - F mutation from a stale session serial;
+- reused or non-increasing session serials;
+- a second `HISTORY_RESET` in one session;
 - current-session callback carrying an earlier operation identity, including a different transaction digest at the same route cursor;
 - reused or non-increasing `HISTORY_NONCE` in one C/F incarnation;
-- begin at exhausted `REL_SEQ`.
+- begin or commit at exhausted `REL_SEQ`;
+- loss of the durable-commit reconciliation witness.
 
 ## Running TLC
 
@@ -211,12 +269,17 @@ TLC_WORKERS=1 \
 make protocol50-formal
 ```
 
-`run_tlc.sh` requires:
+`run_tlc.sh` requires complete safety runs for the cache, job, reconnect, and incarnation models plus scoped incarnation progress. It also requires directly named invariant failure for:
 
-- the cache safety model to pass;
-- the job safety model to pass;
-- incarnation safety and scoped recovery progress to pass;
-- abort-after-commit, terminal-REL_SEQ, missing-input-lease, and lost-retry-identity mutants to fail through their named discriminating invariants.
+- abort after durable commit;
+- begin at terminal `REL_SEQ`;
+- same-cursor callback with the wrong transaction digest;
+- committed input without its logical-job lease;
+- same-GUID namespace loss incorrectly treated as cold replacement;
+- route reset that discards unresolved active work;
+- a second history reset in one session;
+- lost retry identity on F-store replacement;
+- compiler authorization without independent exact-input ownership.
 
 There is intentionally no hosted GitHub Actions gate. The cache model has previously required about 8 GiB and roughly 24 minutes on one reviewer host. Acceptance therefore requires local runs from the exact PR head, published generated/distinct/depth/runtime statistics, log hashes, and independent reproduction.
 
