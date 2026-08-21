@@ -1,0 +1,33 @@
+diff --git a/cache/p50_slice0.cpp b/cache/p50_slice0.cpp
+index aed64d9..FIXME 100644
+--- a/cache/p50_slice0.cpp
++++ b/cache/p50_slice0.cpp
+@@ -789,15 +789,24 @@ std::vector<ObjectApplied> FStore::append_fill(SessionHandle session,
+     if (!space.route || !space.route->pending)
+         throw std::logic_error("FILL has no F ACTIVE_TX");
+-    const std::vector<FillRecord> records =
+-        space.route->pending->partial_fill.push(message);
++    Namespace::FPending& pending = *space.route->pending;
++    const std::vector<FillRecord> records = pending.partial_fill.push(message);
+     std::vector<ObjectApplied> result;
+     result.reserve(records.size());
+     for (const FillRecord& record : records)
+         result.push_back(apply_object(session, ImmutableObject::from_record(record)));
++
++    // V1 defines FILL completion by closure of the exact requested set.  At
++    // that boundary no incomplete trailing record may be silently retained.
++    // Fully validated preceding objects remain installed if finish() rejects.
++    if (pending.remaining.empty()) pending.partial_fill.finish();
++
+     return result;
+ }
+@@ -815,6 +824,10 @@ std::vector<uint8_t> FStore::materialize_and_verify(SessionHandle session) {
+         throw std::logic_error("F route has no ACTIVE_TX to materialize");
+     Namespace::FPending& pending = *space.route->pending;
++
++    // Defensive binding gate: malformed trailing FILL bytes are not outside
++    // the transaction merely because the last requested object was complete.
++    pending.partial_fill.finish();
++
+     if (!pending.dict_complete || !pending.body_complete || !pending.remaining.empty())
+         throw std::logic_error("input cannot materialize before DICT, BODY, and Need finish");
