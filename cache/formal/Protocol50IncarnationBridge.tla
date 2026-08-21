@@ -201,13 +201,14 @@ TypeOK ==
     /\ s.cacheAccepted \in Acceptances
 
 DurableCommitHasReconciliationWitness ==
-    ~s.oldCommitDurable \/
-        /\ s.fGuid = OldGuid
-        /\ s.cSeenGuid = OldGuid
-        /\ s.prepared
-        /\ s.cActive = TU
-        /\ s.recovery = "AwaitingOldAck"
-        /\ s.cacheAccepted = "None"
+    \/ ~s.oldCommitDurable
+    \/ s.cacheAccepted # "None"
+    \/ /\ s.fGuid = OldGuid
+       /\ s.cSeenGuid = OldGuid
+       /\ s.prepared
+       /\ s.cActive = TU
+       /\ s.recovery = "AwaitingOldAck"
+       /\ s.cacheAccepted = "None"
 
 ReplacementPreservesRetryIdentity ==
     ~s.replacementObserved \/
