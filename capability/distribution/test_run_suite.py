@@ -254,6 +254,22 @@ class SuiteTest(unittest.TestCase):
                 self.assertEqual(link["per_worker_bits_per_second"], 40_000_000_000)
                 self.assertEqual(link["fabric_bits_per_second"], 40_000_000_000)
 
+    def test_c1f20_physical_suite_selects_exact_width_scenario(self) -> None:
+        root = Path(__file__).parent
+        suite_document, scenario_paths = suite.load_suite(
+            root / "firefox-c1f20-physical-suite.json"
+        )
+        self.assertEqual(suite_document["diagnostic_codecs"], ["compile-only"])
+        self.assertEqual(
+            scenario_paths,
+            [root / "scenarios" / "firefox-c1f20-200b1g.json"],
+        )
+        document = json.loads(scenario_paths[0].read_text())
+        self.assertEqual(document["workers"]["f_count"], 20)
+        self.assertEqual(document["workers"]["template"]["slots"], 200)
+        self.assertEqual(document["workers"]["template"]["input_staging_slots"], 400)
+        self.assertEqual(suite.sim.topology_label(document), "C1F20_200B1G")
+
     def test_requested_firefox_suite_shape(self) -> None:
         root = Path(__file__).parent
         suite_document, scenario_paths = suite.load_suite(

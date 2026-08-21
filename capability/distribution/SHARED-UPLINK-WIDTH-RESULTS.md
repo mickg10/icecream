@@ -87,24 +87,21 @@ builds, generations, JSONL, and HTML report rather than inferred from one makesp
 
 ## Physical codec controls
 
-Both physical adapters consume byte-exact ledgers produced by their real codec binaries and run
-inside the same scheduler/network engine.
+The original small physical controls have been superseded by full-corpus measurements in
+[`PHYSICAL-CODEC-DISTRIBUTION-RESULTS.md`](PHYSICAL-CODEC-DISTRIBUTION-RESULTS.md).  Both physical
+adapters consume byte-exact ledgers produced by their real codec binaries and run inside the same
+scheduler/network engine.
 
-| codec | relationships | raw bytes | C-to-F bytes | F-to-C bytes | makespan | verification |
-|---|---:|---:|---:|---:|---:|---|
-| P29 | 1 | 9,982,878 | 322,080 | 6,831 | 13.288534 ms | exact reconstruction and typed directional replay |
-| GRZ | 2 | 9,982,878 | 624,141 | 0 | 11.871302 ms | full route decode, identical retry, exact prefix cuts |
+P29 now performs one global immutable-input/catalogue preparation and projects that state onto
+twenty independent ordered F routes.  Encode and replay each prepare exactly once, fork one
+sequential route materializer per populated F, and require every child to report the same shared
+plan digest.  GRZ independently partitions the same common assignment into persistent per-route
+streams.  The full Firefox C1F20 gates contain 12,490 transactions and pass typed P29 replay or
+complete GRZ reconstruction, deterministic retry, and selected prefix decoding respectively.
 
-P29 retains its intra-TU fork/join graph. On logical TU 1, Root serialization completes at
-1.312200 ms and releases LINES; Root delivery at 1.562200 ms releases Need; Need delivery at
-1.860296 ms makes Fill ready; the ongoing LINES extent yields at 2.131400 ms and Fill immediately
-takes the next writer quantum. The relationship commits at 4.386456 ms while compilation
-continues to 10.668094 ms.
-
-The P29 materializer still supports only one F. Running independent P29 learners per F would
-duplicate C-global learning and is not an acceptable multi-F result. Its next codec milestone is
-one global admission/catalogue pass followed by ordered, independent per-F projections and one
-multi-route physical ledger. GRZ already materializes route projections independently.
+P29 retains its Root/LINES/Need/Fill/close/Ack dependency graph; GRZ retains one closed current-TU
+frame per transaction.  The full report compares their exact cold/warm bytes, phase times, and
+distance from the compiler-capacity floor at one and twenty independent F arenas.
 
 ## Exact-report scalability
 
@@ -132,16 +129,23 @@ and final reconciliation.
 The current host retains the main evidence under:
 
 ```text
+/tanksmall/scratch/ictmp/issue16-results/firefox-f-width-suite-1d06f95/
+/tanksmall/scratch/ictmp/issue16-results/c1f1-capacity-bandwidth-physical-1d06f95/
+/tanksmall/scratch/ictmp/issue16-results/c1f20-physical-1d06f95/
+/tanksmall/scratch/ictmp/issue16-results/p29-firefox-c1f20-canonical/
+/tanksmall/scratch/ictmp/issue16-results/grz-firefox-c1f20-canonical/
+
+Historical recorder gates:
 /tanksmall/scratch/ictmp/issue16-results/ordered-relationship-width-precommit/
 /tanksmall/scratch/ictmp/issue16-results/ordered-relationship-streaming-both-f20/
 /tanksmall/scratch/ictmp/issue16-results/ordered-relationship-physical-precommit/
 ```
 
-Binding physical-ledger SHA-256 values:
+Current binding physical-ledger SHA-256 values:
 
 ```text
-P29  1de0306aff30e4e3661df9a10f2936a6038360ff5c33cb0e426156fb64dcef04
-GRZ  a81a247670a40a03eb6f179b2c673a801bd407aa291be11508b8d715883364e2
+P29 C1F20  7207dc46ef15c61b7688b42a3abace7c8f09e78caf04ba161d6bc60dfb993033
+GRZ C1F20  52e133f3c4d9d109ff50f29367cf4d93b5448028cc39c24c1b40ff2f4670ab38
 ```
 
 ## What this closes and what remains
@@ -156,10 +160,11 @@ Closed by this gate:
 - P29 Need/LINES/Fill overlap and bounded writer priority remain executable;
 - exact long-run reports no longer retain every snapshot/event as Python objects;
 - F widths 1/2/3/4/20 have executable zero-gap controls and capacity-relative reports.
+- shared-C multi-F P29 materialization uses one global preparation and independent ordered route
+  projections.
 
-Still required before ranking cache codecs at farm width:
+Still required before a live-cluster ranking:
 
-- shared-C, multi-F P29 materialization from one global catalogue;
 - richer component/object ledgers so Need, Fill, residency, route-state digests, and codec CPU are
   generated dynamically by the common engine rather than only replayed as flattened exact bytes;
 - live cache-channel framing, compile-job reference bytes, CPU stages, local pipe delivery, cache

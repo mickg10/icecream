@@ -1,0 +1,8 @@
+{
+  "schema": "icecream-distribution-suite-v1",
+  "name": "firefox-corrected-c1f20-physical",
+  "scenarios": [
+    "scenarios/firefox-c1f20-200b1g.json"
+  ],
+  "diagnostic_codecs": ["compile-only"]
+}

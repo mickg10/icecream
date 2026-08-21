@@ -12,6 +12,10 @@ connections, A/Need/Fill dialogue, and compiler stdin pipe.
 1/2/3/4/20-F width gate, capacity-only lower bounds, raw and compile-only matrices, exact P29/GRZ
 controls, and bounded-memory report measurements.
 
+[`PHYSICAL-CODEC-DISTRIBUTION-RESULTS.md`](PHYSICAL-CODEC-DISTRIBUTION-RESULTS.md) records the
+full-corpus P29/GRZ results for the four primary C1F1 capacity/bandwidth points, exact byte-phase
+breakdowns, capacity distance, raw controls, and the wider independent-arena experiment.
+
 The initial scenario is `firefox-1c-20f.json`: one C, one corrected Firefox build,
 twenty one-slot Fs, 1 Gbit/s per direction and a 10 Gbit/s shared fabric.  All TUs are
 released at time zero for the first comparison.  A measured C-preprocessor release trace
@@ -116,6 +120,20 @@ python3 capability/distribution/run_suite.py \
   capability/distribution/firefox-f-width-suite.json \
   --codec compile-only --codec raw --require-payload \
   --out /tmp/firefox-f-width
+```
+
+`firefox-c1f20-physical-suite.json` is the corresponding exact-codec gate at the widest point.
+It replays P29 and GRZ over the same C1F20 assignment and writes one suite-level comparison page:
+
+```bash
+python3 capability/distribution/run_suite.py \
+  capability/distribution/firefox-c1f20-physical-suite.json \
+  --codec p29 --codec grz \
+  --physical-ledger p29=/path/to/p29-ledger.jsonl \
+  --physical-ledger grz=/path/to/grz-ledger.jsonl \
+  --corpus-root firefox-corrected=/path/to/corpus18 \
+  --require-payload \
+  --out /tmp/firefox-c1f20-physical
 ```
 
 Each build and generation row reports input-ready elapsed time, compile elapsed time, the
