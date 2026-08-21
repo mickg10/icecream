@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import html
 import importlib.util
 import json
 import subprocess
@@ -208,6 +209,125 @@ def matrix_row(result: object, codec: str) -> dict[str, object]:
         "wall_makespan_ns": result.summary["makespan_ns"],
         "wall_makespan_seconds": result.summary["makespan_seconds"],
     }
+
+
+def render_suite_report(
+    suite_name: str,
+    matrix: list[dict[str, object]],
+    generations: list[dict[str, object]],
+    phases: list[dict[str, object]],
+    runner_timings: list[dict[str, object]],
+) -> str:
+    def esc(value: object) -> str:
+        return html.escape(str(value))
+
+    def seconds(value: object) -> str:
+        return f"{int(value) / 1_000_000_000:.6f}"
+
+    def megabytes(value: object) -> str:
+        return f"{int(value) / 1_000_000:.3f}"
+
+    def ratio(value: object) -> str:
+        return "" if value == "" else f"{float(value):.4f}"
+
+    def percent(value: object) -> str:
+        return "" if value == "" else f"{100.0 * float(value):.3f}%"
+
+    matrix_rows = []
+    for row in matrix:
+        report_path = f"{row['scenario']}/{row['codec']}/report.html"
+        matrix_rows.append(
+            "<tr>"
+            f"<td>{esc(row['topology'])}</td>"
+            f"<td>{esc(row['codec'])}</td>"
+            f"<td>{esc(row['jobs'])}</td>"
+            f"<td>{megabytes(row['raw_bytes'])}</td>"
+            f"<td>{megabytes(row['c_to_f_bytes'])}</td>"
+            f"<td>{megabytes(row['cold_c_to_f_bytes'])}</td>"
+            f"<td>{megabytes(row['warm_c_to_f_bytes'])}</td>"
+            f"<td>{ratio(row['raw_per_c_to_f'])}</td>"
+            f"<td>{seconds(row['summed_input_ready_elapsed_ns'])}</td>"
+            f"<td>{seconds(row['summed_generation_ns'])}</td>"
+            f"<td>{seconds(row['summed_c_to_f_capacity_floor_ns'])}</td>"
+            f"<td>{seconds(row['summed_compiler_capacity_floor_ns'])}</td>"
+            f"<td>{seconds(row['summed_capacity_floor_ns'])}</td>"
+            f"<td>{seconds(row['excess_over_capacity_floor_ns'])}</td>"
+            f"<td>{percent(row['capacity_floor_efficiency'])}</td>"
+            f'<td><a href="{esc(report_path)}">timeline</a></td>'
+            "</tr>"
+        )
+
+    generation_rows = []
+    for row in generations:
+        generation_rows.append(
+            "<tr>"
+            f"<td>{esc(row['scenario'])}</td><td>{esc(row['codec'])}</td>"
+            f"<td>{esc(row['generation'])}</td><td>{esc(row['temperature'])}</td>"
+            f"<td>{megabytes(row['c_to_f_bytes'])}</td>"
+            f"<td>{seconds(row['input_ready_elapsed_ns'])}</td>"
+            f"<td>{seconds(row['compile_elapsed_ns'])}</td>"
+            f"<td>{seconds(row['transaction_commit_elapsed_ns'])}</td>"
+            f"<td>{seconds(row['duration_ns'])}</td>"
+            f"<td>{seconds(row['capacity_c_to_f_floor_ns'])}</td>"
+            f"<td>{seconds(row['capacity_compiler_floor_ns'])}</td>"
+            f"<td>{seconds(row['capacity_overlap_floor_ns'])}</td>"
+            f"<td>{percent(row['capacity_floor_efficiency'])}</td>"
+            "</tr>"
+        )
+
+    phase_rows = []
+    for row in phases:
+        phase_rows.append(
+            "<tr>"
+            f"<td>{esc(row['scenario'])}</td><td>{esc(row['codec'])}</td>"
+            f"<td>{esc(row['generation'])}</td><td>{esc(row['temperature'])}</td>"
+            f"<td>{esc(row['phase'])}</td><td>{esc(row['direction'])}</td>"
+            f"<td>{esc(row['transactions'])}</td><td>{megabytes(row['bytes'])}</td>"
+            "</tr>"
+        )
+
+    timing_rows = []
+    for row in runner_timings:
+        timing_rows.append(
+            "<tr>"
+            f"<td>{esc(row['scenario'])}</td><td>{esc(row['codec'])}</td>"
+            f"<td>{esc(row['ledger_source'])}</td>"
+            f"<td>{float(row['builder_wall_seconds']):.3f}</td>"
+            f"<td>{float(row['simulator_wall_seconds']):.3f}</td>"
+            f"<td>{float(row['total_runner_wall_seconds']):.3f}</td>"
+            "</tr>"
+        )
+
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{esc(suite_name)} — distribution results</title>
+<style>
+:root {{ color-scheme: dark; font-family: ui-sans-serif,system-ui,sans-serif; background:#08111f; color:#dbe7f5 }}
+body {{ margin:0 auto; max-width:1800px; padding:28px }} h1,h2 {{ color:#f5f9ff }}
+p {{ max-width:1100px; color:#9fb1c7 }} .table {{ overflow:auto; margin:12px 0 32px }}
+table {{ border-collapse:collapse; min-width:100%; font-variant-numeric:tabular-nums; font-size:13px }}
+th,td {{ border-bottom:1px solid #25354b; padding:7px 9px; text-align:right; white-space:nowrap }}
+th {{ position:sticky; top:0; background:#102039; color:#9bd4ff }} td:first-child,th:first-child {{ text-align:left }}
+a {{ color:#61d4ff }} code {{ color:#b9f6ca }}
+</style></head><body>
+<h1>{esc(suite_name)}</h1>
+<p>All active-generation times exclude configured idle gaps. Capacity floors are optimistic:
+they include configured link/compiler capacity but omit release timing, propagation, codec CPU,
+dependency round trips, and queue order. Exact machine-readable values remain in
+<code>matrix.tsv</code>, <code>generations.tsv</code>, <code>physical-phases.tsv</code>, and
+<code>suite-summary.json</code>.</p>
+<h2>Scenario × codec matrix</h2><div class="table"><table><thead><tr>
+<th>topology</th><th>codec</th><th>TUs</th><th>raw MB</th><th>C→F MB</th><th>cold MB</th><th>warm MB</th><th>raw/C→F</th><th>input-ready s</th><th>active s</th><th>link floor s</th><th>compiler floor s</th><th>overlap floor s</th><th>excess s</th><th>floor efficiency</th><th>detail</th>
+</tr></thead><tbody>{''.join(matrix_rows)}</tbody></table></div>
+<h2>Per generation</h2><div class="table"><table><thead><tr>
+<th>scenario</th><th>codec</th><th>generation</th><th>state</th><th>C→F MB</th><th>input-ready s</th><th>compile-complete s</th><th>commit s</th><th>active s</th><th>link floor s</th><th>compiler floor s</th><th>overlap floor s</th><th>floor efficiency</th>
+</tr></thead><tbody>{''.join(generation_rows)}</tbody></table></div>
+<h2>Exact physical phase bytes</h2><div class="table"><table><thead><tr>
+<th>scenario</th><th>codec</th><th>generation</th><th>state</th><th>phase</th><th>direction</th><th>transactions</th><th>MB</th>
+</tr></thead><tbody>{''.join(phase_rows) if phase_rows else '<tr><td colspan="8">No physical codec in this suite.</td></tr>'}</tbody></table></div>
+<h2>Harness runtime</h2><p>These are observed host-side measurement costs, not simulated transfer or compile time.</p>
+<div class="table"><table><thead><tr><th>scenario</th><th>codec</th><th>ledger source</th><th>builder s</th><th>simulator/output s</th><th>total s</th></tr></thead><tbody>{''.join(timing_rows)}</tbody></table></div>
+</body></html>"""
 
 
 def load_suite(path: Path) -> tuple[dict[str, object], list[Path]]:
@@ -447,6 +567,15 @@ def run_suite(
     }
     (output_directory / "suite-summary.json").write_text(
         json.dumps(suite_summary, indent=2) + "\n"
+    )
+    (output_directory / "report.html").write_text(
+        render_suite_report(
+            str(document["name"]),
+            matrix,
+            all_generations,
+            all_phases,
+            runner_timings,
+        )
     )
     print(
         f"SUITE PASS runs={len(matrix)} runner_s={time.perf_counter() - suite_start:.3f}",

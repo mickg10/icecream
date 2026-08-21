@@ -330,6 +330,7 @@ class SuiteTest(unittest.TestCase):
             self.assertTrue((output / "generations.tsv").is_file())
             self.assertTrue((output / "runner-timings.tsv").is_file())
             self.assertTrue((output / "suite-summary.json").is_file())
+            self.assertTrue((output / "report.html").is_file())
             self.assertTrue(
                 (output / "giant" / "compile-only" / "assignments.tsv").is_file()
             )
@@ -390,6 +391,9 @@ class SuiteTest(unittest.TestCase):
             self.assertTrue(
                 (output / "physical" / "p29" / "report.html").is_file()
             )
+            report = (output / "report.html").read_text()
+            self.assertIn("Scenario × codec matrix", report)
+            self.assertIn("p29-test", report)
 
 
 if __name__ == "__main__":

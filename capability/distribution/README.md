@@ -226,7 +226,9 @@ C-to-F/compiler/overlap capacity floors, excess time above the overlap floor, an
 efficiencies. `physical-phases.tsv` breaks exact bytes down by codec transaction phase;
 `runner-timings.tsv` separates host-side ledger construction from simulator runtime. Every
 scenario/codec directory retains the complete `builds.tsv`, `generations.tsv`, event/timeline
-JSONL, self-contained HTML report, builder logs, exact ledger, and codec work directory.
+JSONL, self-contained HTML report, builder logs, exact ledger, and codec work directory. The
+suite root also writes a compact `report.html` linking the full timelines and showing the
+scenario matrix, every generation, every physical phase, and observed harness costs.
 
 Ledger generation currently starts from the compile-only assignment and replay refuses any
 placement drift.  That is exact for the primary `C1F20_200B1G` case because all 2,498 TUs fit in
