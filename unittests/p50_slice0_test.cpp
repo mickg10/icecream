@@ -694,7 +694,51 @@ void test_canonical_action_trace() {
     if (const char* trace_path = std::getenv("P50_TRACE_PATH"))
         write_action_trace(trace, trace_path);
 
-    std::vector<ActionRecord> changed = trace.records();
+    const auto c_begin = std::find_if(
+        trace.records().begin(), trace.records().end(), [](const auto& record) {
+            return record.actor == ActorSide::C &&
+                   record.action == ActionType::TX_BEGIN;
+        });
+    const auto f_begin = std::find_if(
+        trace.records().begin(), trace.records().end(), [](const auto& record) {
+            return record.actor == ActorSide::F &&
+                   record.action == ActionType::TX_BEGIN;
+        });
+    require(c_begin != trace.records().end() && f_begin != trace.records().end(),
+            "trace fixture lacks C/F TX_BEGIN");
+    ActionRecord abort = *c_begin;
+    abort.action = ActionType::TX_ABORTED;
+
+    std::vector<ActionRecord> changed(trace.records().begin(), f_begin + 1);
+    changed.push_back(abort);
+    require(check_action_trace(changed).has_value(),
+            "trace checker accepted abort while F had a pending transaction");
+
+    changed.assign(trace.records().begin(), f_commit + 1);
+    changed.push_back(abort);
+    require(check_action_trace(changed).has_value(),
+            "trace checker accepted abort after F commit but before C acceptance");
+
+    constexpr std::array stale_session_actions{
+        ActionType::HISTORY_RESET, ActionType::TX_BEGIN,
+        ActionType::DICT_COMPLETE, ActionType::BODY_COMPLETE,
+        ActionType::NEED_RECORDED, ActionType::OBJECT_APPLIED,
+        ActionType::INPUT_MATERIALIZED, ActionType::INPUT_COMMITTED,
+    };
+    for (ActionType action : stale_session_actions) {
+        changed = trace.records();
+        const auto position = std::find_if(
+            changed.begin(), changed.end(), [action](const auto& record) {
+                return record.actor == ActorSide::F && record.action == action;
+            });
+        require(position != changed.end(),
+                "trace fixture lacks an F action for current-session checking");
+        ++position->session_serial;
+        require(check_action_trace(changed).has_value(),
+                "trace checker accepted an F action from a stale session");
+    }
+
+    changed = trace.records();
     const auto dict = std::find_if(changed.begin(), changed.end(), [](const auto& record) {
         return record.action == ActionType::DICT_COMPLETE;
     });
@@ -732,6 +776,16 @@ void test_canonical_action_trace() {
     finish(replay, *replay.route.active(), false, true, true);
     const auto replay_error = check_action_trace(replay_trace.records());
     require(!replay_error, replay_error ? *replay_error : "replay trace failed");
+    changed = replay_trace.records();
+    const auto replay_action = std::find_if(
+        changed.begin(), changed.end(), [](const auto& record) {
+            return record.actor == ActorSide::F &&
+                   record.action == ActionType::ACTIVE_REPLAYED;
+        });
+    require(replay_action != changed.end(), "replay trace lacks ACTIVE_REPLAYED");
+    ++replay_action->session_serial;
+    require(check_action_trace(changed).has_value(),
+            "trace checker accepted replay from a stale session");
 }
 
 }  // namespace

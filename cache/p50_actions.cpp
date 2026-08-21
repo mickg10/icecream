@@ -160,6 +160,10 @@ std::optional<std::string> check_action_trace(std::span<const ActionRecord> reco
                    std::string(action_name(record.action)) + "): " +
                    std::string(detail);
         };
+        const auto current_f_session = [&] {
+            return record.actor == ActorSide::F && f.connected &&
+                   record.session_serial == f.session_serial;
+        };
         switch (record.action) {
         case ActionType::SESSION_OPENED:
         case ActionType::SESSION_REPLACED:
@@ -176,15 +180,14 @@ std::optional<std::string> check_action_trace(std::span<const ActionRecord> reco
             clear_f_pending(f);
             break;
         case ActionType::SESSION_DISCONNECTED:
-            if (record.actor != ActorSide::F || !f.connected ||
-                record.session_serial != f.session_serial)
+            if (!current_f_session())
                 return error("disconnect does not name the current session");
             f.connected = false;
             if (f.commit_unacknowledged) f.commit_disconnected = true;
             clear_f_pending(f);
             break;
         case ActionType::HISTORY_RESET:
-            if (record.actor != ActorSide::F || !f.connected)
+            if (!current_f_session())
                 return error("history reset without a current F session");
             if (f.pending) return error("history reset while F has a pending transaction");
             if (c.active) return error("history reset while C has an active transaction");
@@ -218,7 +221,7 @@ std::optional<std::string> check_action_trace(std::span<const ActionRecord> reco
                 c.active = identity;
                 break;
             }
-            if (!f.connected || !f.route)
+            if (!current_f_session() || !f.route)
                 return error("F accepted TX_BEGIN without a current route");
             if (f.pending) return error("F accepted a second pending transaction");
             if (!c.active || *c.active != identity)
@@ -234,22 +237,26 @@ std::optional<std::string> check_action_trace(std::span<const ActionRecord> reco
             if (record.actor != ActorSide::C || !c.active ||
                 *c.active != tx_identity(record))
                 return error("abort does not name C's active transaction");
+            if (f.pending)
+                return error("C aborted while F had a pending transaction");
+            if (f.commit_unacknowledged)
+                return error("C aborted before accepting F's durable commit");
             c.active.reset();
             break;
         case ActionType::DICT_COMPLETE:
-            if (record.actor != ActorSide::F || !f.pending ||
+            if (!current_f_session() || !f.pending ||
                 *f.pending != tx_identity(record) || f.dict_complete)
                 return error("DICT completion does not name F's pending transaction");
             f.dict_complete = true;
             break;
         case ActionType::BODY_COMPLETE:
-            if (record.actor != ActorSide::F || !f.pending ||
+            if (!current_f_session() || !f.pending ||
                 *f.pending != tx_identity(record) || f.body_complete)
                 return error("BODY completion does not name F's pending transaction");
             f.body_complete = true;
             break;
         case ActionType::NEED_RECORDED:
-            if (record.actor != ActorSide::F || !f.pending ||
+            if (!current_f_session() || !f.pending ||
                 *f.pending != tx_identity(record) || !f.dict_complete ||
                 f.need_recorded)
                 return error("NEED was recorded before the exact DICT");
@@ -263,7 +270,7 @@ std::optional<std::string> check_action_trace(std::span<const ActionRecord> reco
             f.remaining = f.requested;
             break;
         case ActionType::OBJECT_APPLIED:
-            if (record.actor != ActorSide::F || !f.pending ||
+            if (!current_f_session() || !f.pending ||
                 *f.pending != tx_identity(record) || !f.need_recorded || !record.key ||
                 !f.requested.contains(*record.key))
                 return error("object application is outside the active Need");
@@ -284,7 +291,7 @@ std::optional<std::string> check_action_trace(std::span<const ActionRecord> reco
                 return error("object application changed the exact Need incorrectly");
             break;
         case ActionType::INPUT_MATERIALIZED:
-            if (record.actor != ActorSide::F || !f.pending ||
+            if (!current_f_session() || !f.pending ||
                 *f.pending != tx_identity(record) || !f.dict_complete ||
                 !f.body_complete || !f.need_recorded || !f.remaining.empty() ||
                 f.materialized)
@@ -292,7 +299,7 @@ std::optional<std::string> check_action_trace(std::span<const ActionRecord> reco
             f.materialized = true;
             break;
         case ActionType::INPUT_COMMITTED:
-            if (record.actor != ActorSide::F || !f.pending ||
+            if (!current_f_session() || !f.pending ||
                 *f.pending != tx_identity(record) || !f.materialized)
                 return error("F commit does not close its exactly materialized transaction");
             if (f.next_rel.value == std::numeric_limits<uint64_t>::max())
@@ -327,7 +334,7 @@ std::optional<std::string> check_action_trace(std::span<const ActionRecord> reco
             f.commit_disconnected = false;
             break;
         case ActionType::ACTIVE_REPLAYED:
-            if (record.actor != ActorSide::F || !f.connected || !f.route || f.pending ||
+            if (!current_f_session() || !f.route || f.pending ||
                 !c.active || *c.active != tx_identity(record))
                 return error("replay does not name C's retained active transaction");
             if (record.history_nonce != f.nonce || record.rel_seq != f.next_rel ||
