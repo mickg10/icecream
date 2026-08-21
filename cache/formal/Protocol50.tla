@@ -25,12 +25,14 @@ CONSTANTS F0, F1, T0, T1, O0, O1, V0, V1,
           Tok0, Tok1, NoF, NoTU, NoToken, NoContent,
           MaxRel,
           MutantAbortAfterCommit,
-          MutantBeginAtMaxRel
+          MutantBeginAtMaxRel,
+          MutantIgnoreTxDigest
 
 ASSUME /\ MaxRel \in Nat
        /\ MaxRel > 0
        /\ MutantAbortAfterCommit \in BOOLEAN
        /\ MutantBeginAtMaxRel \in BOOLEAN
+       /\ MutantIgnoreTxDigest \in BOOLEAN
        /\ F0 # F1
        /\ T0 # T1
        /\ O0 # O1
@@ -61,6 +63,15 @@ OpNonce(op) == op[2]
 OpRel(op) == op[3]
 OpTu(op) == op[4]
 OpDigestVariant(op) == op[5]
+
+SameCursorWithoutDigest(left, right) ==
+    /\ left \in RealOps
+    /\ right \in RealOps
+    /\ OpF(left) = OpF(right)
+    /\ OpNonce(left) = OpNonce(right)
+    /\ OpRel(left) = OpRel(right)
+    /\ OpTu(left) = OpTu(right)
+    /\ OpDigestVariant(left) # OpDigestVariant(right)
 
 Present(st, f) == {o \in Objects : st.content[f][o] # NoContent}
 CurrentSession(st, f, tok) ==
@@ -300,25 +311,30 @@ INPUT_MATERIALIZED(op) ==
        /\ ~s.materialized
        /\ s' = [s EXCEPT !.materialized = TRUE]
 
-INPUT_COMMITTED(op) ==
-    LET f == OpF(op)
+INPUT_COMMITTED(callbackOp) ==
+    LET current == s.pendingOp
+        f == OpF(current)
         base == ClearOverlay(s)
-    IN /\ op \in RealOps
-       /\ op = s.pendingOp
-       /\ op = s.cActiveOp
+    IN /\ callbackOp \in RealOps
+       /\ current \in RealOps
+       /\ (callbackOp = current \/
+             /\ MutantIgnoreTxDigest
+             /\ SameCursorWithoutDigest(callbackOp, current))
+       /\ current = s.cActiveOp
        /\ CurrentSession(s, f, s.pendingToken)
        /\ s.materialized
-       /\ OpNonce(op) = s.nonce[f]
-       /\ OpRel(op) = s.fRel[f]
-       /\ OpRel(op) = s.cRel
+       /\ OpNonce(current) = s.nonce[f]
+       /\ OpRel(current) = s.fRel[f]
+       /\ OpRel(current) = s.cRel
        /\ s.cRel < MaxRel
        /\ s' = [base EXCEPT
                     !.fRel[f] = s.fRel[f] + 1,
-                    !.lastCommitOp[f] = op,
+                    !.lastCommitOp[f] = current,
                     !.commitUnacked = TRUE,
                     !.commitDisconnected = FALSE,
                     !.badCommit =
                         s.badCommit \/
+                        callbackOp # current \/
                         ~(s.dictDone /\ s.needRecorded /\
                           s.bodyDone /\ s.missing = {} /\
                           s.materialized)]
