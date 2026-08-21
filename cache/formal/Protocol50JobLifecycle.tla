@@ -2,19 +2,23 @@
 EXTENDS Naturals, FiniteSets, TLC
 
 (***************************************************************************
-This is a deliberately small extension of Protocol50.tla.  Protocol50.tla
-models the cache transaction and lost-commit window.  This module models the
-orthogonal job-attempt layer that consumes an already exact input.
+Protocol-50 compiler-attempt and retained-input lifecycle.
 
-The important separation is:
+The cache-transaction model proves that INPUT_COMMITTED publishes exact input.
+This model starts at that boundary and deliberately does not duplicate
+DICT/NEED/FILL, route history, or object publication.
 
-  cache input identity:   (C_STORE_GUID, TU_SEQ) at one F
-  compile attempt:        one P50 or legacy consumer of that input
+Key separation:
 
-A restarted compiler job may attach again to the same committed input.  A
-cancelled or stale attempt may still return a late result, but it can never win
-result arbitration.  Restarting an F invalidates its committed input and all
-waiting/running attempts on that F; it does not affect another F.
+  retained input:  one exact TU at one F-cache incarnation
+  attempt:         one P50 or legacy compiler consumer
+  logical job:     owns result arbitration and the restart lease
+
+A compiler/clone restart after INPUT_COMMITTED creates a new attempt.  It does
+not create a second cache commit on the same F.  A cache-sidecar restart cancels
+waiting P50 attachments but does not invalidate a compiler that already owns an
+exact input.  A late result from a cancelled/losing attempt can arrive but
+cannot win.
 ***************************************************************************)
 
 CONSTANTS F0, F1, A0, A1,
@@ -31,153 +35,200 @@ AttemptStates == {New, Waiting, Running, Finished, Cancelled}
 Results == {NoResult, OkResult}
 Digests == {ExactDigest, NoDigest}
 
-AttachedP50(f) ==
-    \E a \in Attempts:
-        /\ attemptF[a] = f
-        /\ attemptMode[a] = P50Mode
-        /\ eligible[a]
-        /\ attemptState[a] \in {Waiting, Running}
-
-VARIABLES inputCommitted, inputDigest, fEpoch, environmentReady,
+VARIABLES inputCommitted, inputDigest, inputLease,
+          fCacheEpoch, environmentReady, jobOpen,
           attemptState, attemptMode, attemptF, attemptEpoch,
-          eligible, legacyInputReady, result, acceptedAttempt
+          attemptEligible, attemptAuthorized, legacyInputReady,
+          result, acceptedAttempt
 
-vars == <<inputCommitted, inputDigest, fEpoch, environmentReady,
+vars == <<inputCommitted, inputDigest, inputLease,
+          fCacheEpoch, environmentReady, jobOpen,
           attemptState, attemptMode, attemptF, attemptEpoch,
-          eligible, legacyInputReady, result, acceptedAttempt>>
+          attemptEligible, attemptAuthorized, legacyInputReady,
+          result, acceptedAttempt>>
 
 Init ==
     /\ inputCommitted = [f \in Fs |-> FALSE]
     /\ inputDigest = [f \in Fs |-> NoDigest]
-    /\ fEpoch = [f \in Fs |-> 0]
+    /\ inputLease = [f \in Fs |-> FALSE]
+    /\ fCacheEpoch = [f \in Fs |-> 0]
     /\ environmentReady = [f \in Fs |-> FALSE]
+    /\ jobOpen = TRUE
     /\ attemptState = [a \in Attempts |-> New]
     /\ attemptMode = [a \in Attempts |-> NoMode]
     /\ attemptF = [a \in Attempts |-> NoF]
     /\ attemptEpoch = [a \in Attempts |-> 0]
-    /\ eligible = [a \in Attempts |-> FALSE]
+    /\ attemptEligible = [a \in Attempts |-> FALSE]
+    /\ attemptAuthorized = {}
     /\ legacyInputReady = [a \in Attempts |-> FALSE]
     /\ result = [a \in Attempts |-> NoResult]
     /\ acceptedAttempt = NoAttempt
 
 CommitExactInput(f) ==
     /\ f \in Fs
+    /\ jobOpen
     /\ inputCommitted' = [inputCommitted EXCEPT ![f] = TRUE]
     /\ inputDigest' = [inputDigest EXCEPT ![f] = ExactDigest]
-    /\ UNCHANGED <<fEpoch, environmentReady,
+    /\ UNCHANGED <<inputLease, fCacheEpoch, environmentReady, jobOpen,
                     attemptState, attemptMode, attemptF, attemptEpoch,
-                    eligible, legacyInputReady, result, acceptedAttempt>>
+                    attemptEligible, attemptAuthorized, legacyInputReady,
+                    result, acceptedAttempt>>
 
 StartAttempt(a, f, mode) ==
     /\ a \in Attempts
     /\ f \in Fs
     /\ mode \in Modes
+    /\ jobOpen
+    /\ acceptedAttempt = NoAttempt
     /\ attemptState[a] = New
     /\ attemptState' = [attemptState EXCEPT ![a] = Waiting]
     /\ attemptMode' = [attemptMode EXCEPT ![a] = mode]
     /\ attemptF' = [attemptF EXCEPT ![a] = f]
-    /\ attemptEpoch' = [attemptEpoch EXCEPT ![a] = fEpoch[f]]
-    /\ eligible' = [eligible EXCEPT ![a] = TRUE]
-    /\ UNCHANGED <<inputCommitted, inputDigest, fEpoch, environmentReady,
+    /\ attemptEpoch' = [attemptEpoch EXCEPT ![a] = fCacheEpoch[f]]
+    /\ attemptEligible' = [attemptEligible EXCEPT ![a] = TRUE]
+    /\ inputLease' =
+        IF mode = P50Mode
+        THEN [inputLease EXCEPT ![f] = TRUE]
+        ELSE inputLease
+    /\ UNCHANGED <<inputCommitted, inputDigest, fCacheEpoch,
+                    environmentReady, jobOpen, attemptAuthorized,
                     legacyInputReady, result, acceptedAttempt>>
 
 MakeEnvironmentReady(f) ==
     /\ f \in Fs
+    /\ ~environmentReady[f]
     /\ environmentReady' = [environmentReady EXCEPT ![f] = TRUE]
-    /\ UNCHANGED <<inputCommitted, inputDigest, fEpoch,
-                    attemptState, attemptMode, attemptF, attemptEpoch,
-                    eligible, legacyInputReady, result, acceptedAttempt>>
+    /\ UNCHANGED <<inputCommitted, inputDigest, inputLease, fCacheEpoch,
+                    jobOpen, attemptState, attemptMode, attemptF,
+                    attemptEpoch, attemptEligible, attemptAuthorized,
+                    legacyInputReady, result, acceptedAttempt>>
 
 MakeLegacyInputReady(a) ==
     /\ a \in Attempts
     /\ attemptState[a] = Waiting
     /\ attemptMode[a] = LegacyMode
+    /\ attemptEligible[a]
     /\ legacyInputReady' = [legacyInputReady EXCEPT ![a] = TRUE]
-    /\ UNCHANGED <<inputCommitted, inputDigest, fEpoch, environmentReady,
-                    attemptState, attemptMode, attemptF, attemptEpoch,
-                    eligible, result, acceptedAttempt>>
+    /\ UNCHANGED <<inputCommitted, inputDigest, inputLease, fCacheEpoch,
+                    environmentReady, jobOpen, attemptState, attemptMode,
+                    attemptF, attemptEpoch, attemptEligible,
+                    attemptAuthorized, result, acceptedAttempt>>
 
 StartCompiler(a) ==
     /\ a \in Attempts
     /\ attemptState[a] = Waiting
-    /\ eligible[a]
+    /\ attemptEligible[a]
+    /\ jobOpen
     /\ attemptF[a] \in Fs
-    /\ attemptEpoch[a] = fEpoch[attemptF[a]]
+    /\ attemptEpoch[a] = fCacheEpoch[attemptF[a]]
     /\ environmentReady[attemptF[a]]
     /\ IF attemptMode[a] = P50Mode
-          THEN /\ inputCommitted[attemptF[a]]
+          THEN /\ inputLease[attemptF[a]]
+               /\ inputCommitted[attemptF[a]]
                /\ inputDigest[attemptF[a]] = ExactDigest
           ELSE /\ attemptMode[a] = LegacyMode
                /\ legacyInputReady[a]
     /\ attemptState' = [attemptState EXCEPT ![a] = Running]
-    /\ UNCHANGED <<inputCommitted, inputDigest, fEpoch, environmentReady,
-                    attemptMode, attemptF, attemptEpoch, eligible,
-                    legacyInputReady, result, acceptedAttempt>>
+    /\ attemptAuthorized' = attemptAuthorized \cup {a}
+    /\ UNCHANGED <<inputCommitted, inputDigest, inputLease, fCacheEpoch,
+                    environmentReady, jobOpen, attemptMode, attemptF,
+                    attemptEpoch, attemptEligible, legacyInputReady,
+                    result, acceptedAttempt>>
 
 FinishCompiler(a) ==
     /\ a \in Attempts
     /\ attemptState[a] = Running
+    /\ a \in attemptAuthorized
     /\ attemptState' = [attemptState EXCEPT ![a] = Finished]
     /\ result' = [result EXCEPT ![a] = OkResult]
-    /\ UNCHANGED <<inputCommitted, inputDigest, fEpoch, environmentReady,
-                    attemptMode, attemptF, attemptEpoch, eligible,
+    /\ UNCHANGED <<inputCommitted, inputDigest, inputLease, fCacheEpoch,
+                    environmentReady, jobOpen, attemptMode, attemptF,
+                    attemptEpoch, attemptEligible, attemptAuthorized,
                     legacyInputReady, acceptedAttempt>>
 
 CancelAttempt(a) ==
     /\ a \in Attempts
     /\ attemptState[a] \in {Waiting, Running}
     /\ attemptState' = [attemptState EXCEPT ![a] = Cancelled]
-    /\ eligible' = [eligible EXCEPT ![a] = FALSE]
-    /\ UNCHANGED <<inputCommitted, inputDigest, fEpoch, environmentReady,
-                    attemptMode, attemptF, attemptEpoch,
-                    legacyInputReady, result, acceptedAttempt>>
+    /\ attemptEligible' = [attemptEligible EXCEPT ![a] = FALSE]
+    /\ UNCHANGED <<inputCommitted, inputDigest, inputLease, fCacheEpoch,
+                    environmentReady, jobOpen, attemptMode, attemptF,
+                    attemptEpoch, attemptAuthorized, legacyInputReady,
+                    result, acceptedAttempt>>
 
 LateResult(a) ==
     /\ a \in Attempts
     /\ attemptState[a] = Cancelled
+    /\ a \in attemptAuthorized
     /\ result[a] = NoResult
     /\ result' = [result EXCEPT ![a] = OkResult]
-    /\ UNCHANGED <<inputCommitted, inputDigest, fEpoch, environmentReady,
-                    attemptState, attemptMode, attemptF, attemptEpoch,
-                    eligible, legacyInputReady, acceptedAttempt>>
+    /\ UNCHANGED <<inputCommitted, inputDigest, inputLease, fCacheEpoch,
+                    environmentReady, jobOpen, attemptState, attemptMode,
+                    attemptF, attemptEpoch, attemptEligible,
+                    attemptAuthorized, legacyInputReady, acceptedAttempt>>
 
 AcceptResult(a) ==
     /\ a \in Attempts
+    /\ jobOpen
     /\ acceptedAttempt = NoAttempt
     /\ attemptState[a] = Finished
-    /\ eligible[a]
+    /\ attemptEligible[a]
+    /\ a \in attemptAuthorized
     /\ result[a] = OkResult
     /\ acceptedAttempt' = a
-    /\ UNCHANGED <<inputCommitted, inputDigest, fEpoch, environmentReady,
-                    attemptState, attemptMode, attemptF, attemptEpoch,
-                    eligible, legacyInputReady, result>>
+    /\ jobOpen' = FALSE
+    /\ inputLease' = [f \in Fs |-> FALSE]
+    /\ attemptEligible' =
+        [x \in Attempts |-> IF x = a THEN TRUE ELSE FALSE]
+    /\ UNCHANGED <<inputCommitted, inputDigest, fCacheEpoch,
+                    environmentReady, attemptState, attemptMode, attemptF,
+                    attemptEpoch, attemptAuthorized, legacyInputReady, result>>
+
+CancelJob ==
+    /\ jobOpen
+    /\ acceptedAttempt = NoAttempt
+    /\ jobOpen' = FALSE
+    /\ inputLease' = [f \in Fs |-> FALSE]
+    /\ attemptState' =
+        [a \in Attempts |->
+            IF attemptState[a] \in {Waiting, Running}
+            THEN Cancelled ELSE attemptState[a]]
+    /\ attemptEligible' = [a \in Attempts |-> FALSE]
+    /\ UNCHANGED <<inputCommitted, inputDigest, fCacheEpoch,
+                    environmentReady, attemptMode, attemptF, attemptEpoch,
+                    attemptAuthorized, legacyInputReady, result,
+                    acceptedAttempt>>
 
 EvictCommittedInput(f) ==
     /\ f \in Fs
     /\ inputCommitted[f]
-    /\ ~AttachedP50(f)
+    /\ ~inputLease[f]
     /\ inputCommitted' = [inputCommitted EXCEPT ![f] = FALSE]
     /\ inputDigest' = [inputDigest EXCEPT ![f] = NoDigest]
-    /\ UNCHANGED <<fEpoch, environmentReady,
+    /\ UNCHANGED <<inputLease, fCacheEpoch, environmentReady, jobOpen,
                     attemptState, attemptMode, attemptF, attemptEpoch,
-                    eligible, legacyInputReady, result, acceptedAttempt>>
+                    attemptEligible, attemptAuthorized, legacyInputReady,
+                    result, acceptedAttempt>>
 
-RestartF(f) ==
+RestartFCache(f) ==
     /\ f \in Fs
-    /\ fEpoch' = [fEpoch EXCEPT ![f] = 1 - @]
+    /\ fCacheEpoch' = [fCacheEpoch EXCEPT ![f] = 1 - @]
     /\ inputCommitted' = [inputCommitted EXCEPT ![f] = FALSE]
     /\ inputDigest' = [inputDigest EXCEPT ![f] = NoDigest]
-    /\ environmentReady' = [environmentReady EXCEPT ![f] = FALSE]
+    /\ inputLease' = [inputLease EXCEPT ![f] = FALSE]
     /\ attemptState' =
         [a \in Attempts |->
-            IF attemptF[a] = f /\ attemptState[a] \in {Waiting, Running}
+            IF attemptF[a] = f /\ attemptMode[a] = P50Mode /\
+               attemptState[a] = Waiting
             THEN Cancelled ELSE attemptState[a]]
-    /\ eligible' =
+    /\ attemptEligible' =
         [a \in Attempts |->
-            IF attemptF[a] = f /\ attemptState[a] \in {Waiting, Running}
-            THEN FALSE ELSE eligible[a]]
-    /\ UNCHANGED <<attemptMode, attemptF, attemptEpoch,
-                    legacyInputReady, result, acceptedAttempt>>
+            IF attemptF[a] = f /\ attemptMode[a] = P50Mode /\
+               attemptState[a] = Waiting
+            THEN FALSE ELSE attemptEligible[a]]
+    /\ UNCHANGED <<environmentReady, jobOpen, attemptMode, attemptF,
+                    attemptEpoch, attemptAuthorized, legacyInputReady,
+                    result, acceptedAttempt>>
 
 Next ==
     \/ \E f \in Fs : CommitExactInput(f)
@@ -189,21 +240,25 @@ Next ==
     \/ \E a \in Attempts : CancelAttempt(a)
     \/ \E a \in Attempts : LateResult(a)
     \/ \E a \in Attempts : AcceptResult(a)
+    \/ CancelJob
     \/ \E f \in Fs : EvictCommittedInput(f)
-    \/ \E f \in Fs : RestartF(f)
+    \/ \E f \in Fs : RestartFCache(f)
 
 Spec == Init /\ [][Next]_vars
 
 TypeOK ==
     /\ inputCommitted \in [Fs -> BOOLEAN]
     /\ inputDigest \in [Fs -> Digests]
-    /\ fEpoch \in [Fs -> 0..1]
+    /\ inputLease \in [Fs -> BOOLEAN]
+    /\ fCacheEpoch \in [Fs -> 0..1]
     /\ environmentReady \in [Fs -> BOOLEAN]
+    /\ jobOpen \in BOOLEAN
     /\ attemptState \in [Attempts -> AttemptStates]
     /\ attemptMode \in [Attempts -> Modes \cup {NoMode}]
     /\ attemptF \in [Attempts -> Fs \cup {NoF}]
     /\ attemptEpoch \in [Attempts -> 0..1]
-    /\ eligible \in [Attempts -> BOOLEAN]
+    /\ attemptEligible \in [Attempts -> BOOLEAN]
+    /\ attemptAuthorized \subseteq Attempts
     /\ legacyInputReady \in [Attempts -> BOOLEAN]
     /\ result \in [Attempts -> Results]
     /\ acceptedAttempt \in Attempts \cup {NoAttempt}
@@ -216,29 +271,39 @@ AttemptIdentityIsImmutable ==
         IF attemptState[a] = New
         THEN /\ attemptMode[a] = NoMode
              /\ attemptF[a] = NoF
-             /\ ~eligible[a]
+             /\ ~attemptEligible[a]
+             /\ a \notin attemptAuthorized
         ELSE /\ attemptMode[a] \in Modes
              /\ attemptF[a] \in Fs
 
-CompilerUsesExactlyOneReadyInputMode ==
+AuthorizedAttemptIsWellFormed ==
+    \A a \in attemptAuthorized :
+        /\ attemptMode[a] \in Modes
+        /\ attemptF[a] \in Fs
+        /\ attemptState[a] \in {Running, Finished, Cancelled}
+
+RunningAndFinishedWereAuthorized ==
     \A a \in Attempts :
-        IF attemptState[a] = Running
-        THEN /\ eligible[a]
-             /\ attemptEpoch[a] = fEpoch[attemptF[a]]
-             /\ environmentReady[attemptF[a]]
-             /\ IF attemptMode[a] = P50Mode
-                   THEN /\ inputCommitted[attemptF[a]]
-                        /\ inputDigest[attemptF[a]] = ExactDigest
-                   ELSE /\ attemptMode[a] = LegacyMode
-                        /\ legacyInputReady[a]
+        attemptState[a] \in {Running, Finished} => a \in attemptAuthorized
+
+WaitingP50AttemptOwnsRestartLease ==
+    \A a \in Attempts :
+        IF attemptState[a] = Waiting /\ attemptEligible[a] /\
+           attemptMode[a] = P50Mode
+        THEN inputLease[attemptF[a]]
         ELSE TRUE
+
+InputLeaseBelongsToOpenJob ==
+    (\E f \in Fs : inputLease[f]) => jobOpen
 
 AcceptedResultIsUniqueAndValid ==
     IF acceptedAttempt = NoAttempt
     THEN TRUE
     ELSE /\ acceptedAttempt \in Attempts
+         /\ ~jobOpen
          /\ attemptState[acceptedAttempt] = Finished
-         /\ eligible[acceptedAttempt]
+         /\ attemptEligible[acceptedAttempt]
+         /\ acceptedAttempt \in attemptAuthorized
          /\ result[acceptedAttempt] = OkResult
 
 CancelledAttemptCannotWin ==
@@ -248,7 +313,10 @@ Invariants ==
     /\ TypeOK
     /\ CommittedInputIsExact
     /\ AttemptIdentityIsImmutable
-    /\ CompilerUsesExactlyOneReadyInputMode
+    /\ AuthorizedAttemptIsWellFormed
+    /\ RunningAndFinishedWereAuthorized
+    /\ WaitingP50AttemptOwnsRestartLease
+    /\ InputLeaseBelongsToOpenJob
     /\ AcceptedResultIsUniqueAndValid
     /\ CancelledAttemptCannotWin
 
