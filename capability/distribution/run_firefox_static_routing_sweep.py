@@ -6,9 +6,11 @@ policy: the existing round-robin control, then stable rendezvous frontiers of wi
 1, 2, 3, 4, 8, and 20.  Every policy is rebuilt separately with the real P29 and GRZ
 codec, then replayed by the common simulator.  No producer timing is introduced.
 
-The command is intentionally resumable at completed-cell granularity.  It refuses to
-reuse an incomplete cell directory because a partial physical-codec work tree is not
-evidence.  Start a fresh output root or move the incomplete cell aside before retrying.
+The command is intentionally resumable at completed-cell granularity.  ``run`` refuses
+to reuse an incomplete cell directory because a partial physical-codec work tree is not
+evidence.  ``replay`` is narrower: it requires an already-complete, scenario-bound physical
+ledger and refuses to overwrite any simulator output.  This permits a simulator-only
+correction to reuse expensive codec evidence without silently rebuilding or mutating it.
 """
 
 from __future__ import annotations
@@ -584,6 +586,81 @@ def run_cells(
                 raise
 
 
+def replay_cell(
+    output: Path,
+    policy: str,
+    codec: str,
+    binary: Path,
+) -> dict[str, object]:
+    """Replay one already-verified physical ledger with the current simulator."""
+
+    cell = output / "cells" / policy / codec
+    ledger = cell / "ledger.jsonl"
+    summary_path = cell / "cell-summary.json"
+    simulation = cell / "simulation"
+    simulator_prefix = cell / "simulator"
+    if summary_path.exists():
+        result = verify_cell(output, policy, codec, binary)
+        if json.loads(summary_path.read_text()) != result:
+            raise RuntimeError(f"{policy}/{codec}: retained cell summary differs")
+        print(f"SKIP verified {policy}/{codec}", flush=True)
+        return result
+    if not ledger.is_file():
+        raise RuntimeError(f"{policy}/{codec}: physical ledger is absent: {ledger}")
+    if simulation.exists() or any(
+        simulator_prefix.with_suffix(suffix).exists()
+        for suffix in (".command.json", ".time", ".stdout", ".stderr")
+    ):
+        raise RuntimeError(
+            f"{policy}/{codec}: refusing to overwrite an incomplete simulator replay"
+        )
+    verify_ledger(ledger, scenario_path(output, policy), codec, binary)
+    command = [
+        sys.executable,
+        str(HERE / "run_scenario.py"),
+        str(scenario_path(output, policy)),
+        "--codec",
+        codec,
+        "--ledger",
+        str(ledger),
+        "--require-payload",
+        "--out",
+        str(simulation),
+    ]
+    print(f"START simulator {policy}/{codec}", flush=True)
+    checked_timed_run(command, simulator_prefix)
+    result = verify_cell(output, policy, codec, binary)
+    write_once(summary_path, canonical_bytes(result))
+    print(
+        f"PASS {policy}/{codec} c_to_f={result['c_to_f_bytes']} "
+        f"f_to_c={result['f_to_c_bytes']} makespan_ns={result['makespan_ns']}",
+        flush=True,
+    )
+    return result
+
+
+def replay_cells(
+    output: Path,
+    policies: Iterable[str],
+    codec: str,
+    binary: Path,
+    jobs: int,
+) -> None:
+    selected = list(policies)
+    with ThreadPoolExecutor(max_workers=jobs) as executor:
+        futures = {
+            executor.submit(replay_cell, output, policy, codec, binary): policy
+            for policy in selected
+        }
+        for future in as_completed(futures):
+            policy = futures[future]
+            try:
+                future.result()
+            except Exception as error:
+                print(f"FAIL {policy}/{codec}: {error}", flush=True)
+                raise
+
+
 def decimal_mb(value: int) -> str:
     return f"{value / 1_000_000:.3f}"
 
@@ -743,6 +820,14 @@ def main() -> int:
     run_parser.add_argument(
         "--policy", action="append", choices=[name for name, _ in POLICIES]
     )
+    replay_parser = subparsers.add_parser(
+        "replay", help="simulate already-retained exact physical ledgers"
+    )
+    replay_parser.add_argument("--codec", choices=CODECS, required=True)
+    replay_parser.add_argument("--jobs", type=int, default=1)
+    replay_parser.add_argument(
+        "--policy", action="append", choices=[name for name, _ in POLICIES]
+    )
     subparsers.add_parser("report")
     args = parser.parse_args()
     output = args.out.resolve()
@@ -758,6 +843,11 @@ def main() -> int:
             raise ValueError("--jobs must be positive")
         selected = args.policy or [name for name, _ in POLICIES]
         run_cells(output, selected, args.codec, binaries[args.codec], args.jobs)
+    elif args.operation == "replay":
+        if args.jobs <= 0:
+            raise ValueError("--jobs must be positive")
+        selected = args.policy or [name for name, _ in POLICIES]
+        replay_cells(output, selected, args.codec, binaries[args.codec], args.jobs)
     else:
         report(output, binaries)
     return 0
