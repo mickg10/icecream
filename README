@@ -8,6 +8,7 @@ Required Libraries
 Note: The package name may vary by distro
 * C++23 compiler and standard library
 * Boost 1.74 or newer with Boost.Asio coroutine support
+* libxxhash-devel >= 0.8.0
 * libcap-ng-devel
 * libarchive-devel
 * lzo-devel
@@ -22,8 +23,12 @@ cd icecream
 make
 make install
 
-If Boost is installed outside the compiler's default include and library paths,
-pass `--with-boost=PREFIX` to configure.
+If Boost is installed under a non-default prefix, pass
+`--with-boost=/path/to/prefix`. `CC`, `CXX`, `CPPFLAGS`, and `LDFLAGS`
+retain their normal Autoconf meanings; `ICE_CXX_STANDARD_FLAG` may select a
+compiler-specific spelling of C++23 mode (for example `-std=c++2b`).
+For an xxHash installation outside the package-config search path, use
+`PKG_CONFIG_PATH` or the standard `XXHASH_CFLAGS` and `XXHASH_LIBS` overrides.
 
 WARNING: Make sure you specify a prefix, otherwise icecream
 might override your gcc installation! You will need to use this

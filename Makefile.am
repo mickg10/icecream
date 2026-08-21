@@ -19,6 +19,7 @@ AM_LIBTOOLFLAGS = --silent
 
 SUBDIRS = \
 	services \
+	cache \
 	daemon \
 	client \
 	doc \
