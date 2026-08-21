@@ -73,6 +73,29 @@ X is evicted before materialization
 no Fill for X exists
 ```
 
+## History-nonce freshness
+
+A production `HISTORY_NONCE` is not merely “different from the current value.” It is a monotonic, non-reused u64 within one `(C_STORE_GUID, F_STORE_GUID)` incarnation. A route reset with a reused or lower nonce is rejected. Exhaustion requires an identity-incarnation change rather than wrap.
+
+This closes a same-session ABA case that operation digests alone cannot distinguish when an identical TU is encoded identically after an old history branch is recreated:
+
+```text
+branch N runs transaction X
+branch changes away from N
+N is reused in the same C/F incarnation
+identical X is created at REL_SEQ 0
+late callback from old branch N aliases new X
+```
+
+The large cache model intentionally keeps `Nonces == 0..1` as an old/new-branch abstraction and does not attempt unbounded nonce allocation. M2/product gates must enforce the concrete monotonic rule and test:
+
+- equal nonce rejected;
+- lower/previously used nonce rejected;
+- next higher nonce accepted only outside an active transaction;
+- C_GUID or F_STORE_GUID replacement starts a new nonce domain.
+
+A history reset should be the first mutating route-control operation after session reconciliation. Further reset need closes the session and re-enters reconciliation rather than repeatedly recycling branch identity in place.
+
 ## Job-model rules
 
 The job model includes:
@@ -175,6 +198,7 @@ The C++ and Python trace checkers must reject:
 - abort after durable F commit and before normal/lost acceptance;
 - F mutation from a stale session serial;
 - current-session callback carrying an earlier operation identity, including a different transaction digest at the same route cursor;
+- reused or non-increasing `HISTORY_NONCE` in one C/F incarnation;
 - begin at exhausted `REL_SEQ`.
 
 ## Running TLC
