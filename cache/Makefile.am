@@ -4,7 +4,9 @@ libprotocol50_a_SOURCES = \
 	protocol50.cpp \
 	protocol50.h \
 	p50_actions.cpp \
-	p50_actions.h
+	p50_actions.h \
+	p50_slice0.cpp \
+	p50_slice0.h
 
 AM_CPPFLAGS = -I$(top_srcdir)
 

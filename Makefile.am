@@ -12,7 +12,8 @@ EXTRA_DIST = README.md \
 	package_builder \
 	tests/compose \
 	tests/stress \
-	tests/webgui
+	tests/webgui \
+	capability/grouprlz/p29_online_s1.h
 
 ACLOCAL_AMFLAGS = -I m4
 AM_LIBTOOLFLAGS = --silent
