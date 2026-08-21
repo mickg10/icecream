@@ -69,7 +69,8 @@ CommitExactInput(f) ==
     /\ jobOpen
     /\ inputCommitted' = [inputCommitted EXCEPT ![f] = TRUE]
     /\ inputDigest' = [inputDigest EXCEPT ![f] = ExactDigest]
-    /\ UNCHANGED <<inputLease, fCacheEpoch, environmentReady, jobOpen,
+    /\ inputLease' = [inputLease EXCEPT ![f] = TRUE]
+    /\ UNCHANGED <<fCacheEpoch, environmentReady, jobOpen,
                     attemptState, attemptMode, attemptF, attemptEpoch,
                     attemptEligible, attemptAuthorized, legacyInputReady,
                     result, acceptedAttempt>>
@@ -296,6 +297,10 @@ WaitingP50AttemptOwnsRestartLease ==
 InputLeaseBelongsToOpenJob ==
     (\E f \in Fs : inputLease[f]) => jobOpen
 
+CommittedInputForOpenJobKeepsLease ==
+    \A f \in Fs :
+        jobOpen /\ inputCommitted[f] => inputLease[f]
+
 AcceptedResultIsUniqueAndValid ==
     IF acceptedAttempt = NoAttempt
     THEN TRUE
@@ -317,6 +322,7 @@ Invariants ==
     /\ RunningAndFinishedWereAuthorized
     /\ WaitingP50AttemptOwnsRestartLease
     /\ InputLeaseBelongsToOpenJob
+    /\ CommittedInputForOpenJobKeepsLease
     /\ AcceptedResultIsUniqueAndValid
     /\ CancelledAttemptCannotWin
 
