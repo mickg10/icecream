@@ -191,7 +191,8 @@ md5_process(md5_state_t *pms, const md5_byte_t *data /*[64]*/)
     int i;
 
     for (i = 0; i < 16; ++i, xp += 4) {
-        X[i] = xp[0] + (xp[1] << 8) + (xp[2] << 16) + (xp[3] << 24);
+        X[i] = (md5_word_t)xp[0] + ((md5_word_t)xp[1] << 8) +
+               ((md5_word_t)xp[2] << 16) + ((md5_word_t)xp[3] << 24);
     }
 
 #else  /* !ARCH_IS_BIG_ENDIAN */

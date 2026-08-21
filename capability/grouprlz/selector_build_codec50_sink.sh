@@ -48,9 +48,9 @@ mkdir -p "$OUT"
 # added to the header but not to the format string produced a silently EMPTY column, and
 # separately a format slot with no argument once printed stack garbage as a byte count.  Both
 # are compile-time detectable, so they are now compile-time errors.
-CXXFLAGS_OPT="-O3 -march=native -std=c++17 -fopenmp -Wformat=2 -Werror=format -DWITH_BSC_GROUPS -DICE_LINE_CAP_LOG2=$LINE_CAP_LOG2"
+CXXFLAGS_OPT="-O3 -march=native ${ICE_CXX_STANDARD_FLAG:--std=c++23} -fopenmp -Wformat=2 -Werror=format -DWITH_BSC_GROUPS -DICE_LINE_CAP_LOG2=$LINE_CAP_LOG2"
 # and the sanitizer build used to verify the step-2b grow-on-demand change
-CXXFLAGS_SAN="-O1 -g -fsanitize=address,undefined -std=c++17 -fopenmp -Wformat=2 -Werror=format -DWITH_BSC_GROUPS -DICE_LINE_CAP_LOG2=$LINE_CAP_LOG2"
+CXXFLAGS_SAN="-O1 -g -fsanitize=address,undefined ${ICE_CXX_STANDARD_FLAG:--std=c++23} -fopenmp -Wformat=2 -Werror=format -DWITH_BSC_GROUPS -DICE_LINE_CAP_LOG2=$LINE_CAP_LOG2"
 
 build() { # build <flags> <output>
   g++ $1 -I"$HERE" -I"$LIBBSC_DIR/libbsc" "$HERE/codec50-sink.cpp" -o "$2" \

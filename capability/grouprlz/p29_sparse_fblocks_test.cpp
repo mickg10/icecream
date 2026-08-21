@@ -4,7 +4,7 @@
 // earlier version of this test reimplemented the store, so it would have stayed green while
 // a decoder path regressed: a gate guarding a copy of the code rather than the code.
 //
-//   g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror p29_sparse_fblocks_test.cpp -o t && ./t
+//   g++ -std=c++23 -O2 -Wall -Wextra -Wpedantic -Werror p29_sparse_fblocks_test.cpp -o t && ./t
 #include "p29_sparse_blocks.h"
 
 #include <cstdio>

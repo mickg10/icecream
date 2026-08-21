@@ -1,6 +1,6 @@
 // Phase-B deterministic two-F fixture.
 //
-//   g++ -std=c++17 -O2 -pthread -Wall -Wextra -Wpedantic -Werror
+//   g++ -std=c++23 -O2 -pthread -Wall -Wextra -Wpedantic -Werror
 //       p29_two_f_state_test.cpp -o t && ./t
 #include "p29_two_f_state.h"
 

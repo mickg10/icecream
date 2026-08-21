@@ -5,7 +5,7 @@
 // under one SourceGeneration while entropy state ends at every component boundary.
 // Persistent F mutations and C's receiver mirror advance only after a TU Ack.
 //
-// build: g++ -O3 -march=native -std=c++17 -DICE_LINE_CAP_LOG2=23
+// build: g++ -O3 -march=native -std=c++23 -DICE_LINE_CAP_LOG2=23
 //        cap_m4_main.cpp cap_codec.cpp -o cap_m4_main -lzstd
 #include "cap_codec.h"
 #include "cap_protocol.h"

@@ -13,6 +13,7 @@ import argparse
 import csv
 import hashlib
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -379,7 +380,7 @@ def build(source: Path, output: Path, cxx: str) -> tuple[Path, Path, list[list[s
         "-O3",
         "-DNDEBUG",
         "-march=native",
-        "-std=c++17",
+        os.environ.get("ICE_CXX_STANDARD_FLAG", "-std=c++23"),
         "-DICE_LINE_CAP_LOG2=23",
         "-Wall",
         "-Wextra",

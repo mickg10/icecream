@@ -57,7 +57,7 @@ anchor='          if(cTuJournal.active()){fprintf(stderr,"C active-TU journal re
 sed -i '/C active-TU journal remained active after freeze/a\          if(transactionSelftest&&getenv("P29_MUT_C_EARLY")&&!pendingF.prepared_c_state.apply(pathid,paths,mixedCLine,nextMixedPublic,fknownReg,fknownBlk)){fprintf(stderr,"mutation could not apply early C state\\n");return 2;}' "$src"
 
 cmp -s "$HERE/codec50-sink.cpp" "$src" && fail "source mutation changed nothing"
-g++ -O2 -std=c++17 -fopenmp -Wformat=2 -Werror=format -DWITH_BSC_GROUPS \
+g++ -O2 "${ICE_CXX_STANDARD_FLAG:--std=c++23}" -fopenmp -Wformat=2 -Werror=format -DWITH_BSC_GROUPS \
     -I"$HERE" -I"$LIBBSC_DIR/libbsc" "$src" -o "$exe" \
     "$LIBBSC_A" "$LIBZSTD_A" -lz -lpthread >"$WORK/build.out" 2>"$WORK/build.err" ||
   fail "mutated transaction source did not build"

@@ -13,7 +13,7 @@
 // the two produce the same plan and the same resulting state; gate 5 proves they cannot be
 // interleaved.
 //
-//   g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror p29_prepare_commit_test.cpp -o t && ./t
+//   g++ -std=c++23 -O2 -Wall -Wextra -Wpedantic -Werror p29_prepare_commit_test.cpp -o t && ./t
 #include "p29_online_s1.h"
 
 #include <cstdio>

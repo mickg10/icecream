@@ -185,7 +185,7 @@ heap and explicit Region/Block eviction as well as public-Line eviction.
 Warning-clean release builds use:
 
 ```sh
-g++ -O3 -march=native -std=c++17 -DICE_LINE_CAP_LOG2=23 \
+g++ -O3 -march=native -std=c++23 -DICE_LINE_CAP_LOG2=23 \
   -Wall -Wextra -Wpedantic -Werror \
   capability/cap_m4_main.cpp capability/cap_codec.cpp -lzstd
 ```

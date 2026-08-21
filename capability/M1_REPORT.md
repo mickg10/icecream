@@ -8,7 +8,7 @@ F-generated NEED), not a redesign.
 
 ## Canonical invocation (reproduces the documented target)
 ```
-build: g++ -O3 -std=c++17 -DICE_LINE_CAP_LOG2=23 codec50-m1.cpp -o codec50-m1 -lzstd
+build: g++ -O3 -std=c++23 -DICE_LINE_CAP_LOG2=23 codec50-m1.cpp -o codec50-m1 -lzstd
 run:   ./codec50-m1 --manifest <corpus>/manifest.txt --z 3 --mixed-regions --byte-array-lines --direct-ordinals
 ```
 `--byte-array-lines` and `-DICE_LINE_CAP_LOG2=23` are load-bearing — omitting either changes
@@ -64,7 +64,7 @@ whereas the virtual ledger charges their z3-compressed size. The category ledger
 codec accounting model and the byte-exact regression gate; the socket total is the literal transfer,
 reported separately. Independently rebuilt + re-run: bit-identical.
 Files: `cap_codec.{h,cpp}`, `cap_protocol.h`, `cap_main.cpp`.
-Build: `g++ -O3 -std=c++17 -DICE_LINE_CAP_LOG2=23 cap_main.cpp cap_codec.cpp -o cap_main -lzstd`.
+Build: `g++ -O3 -std=c++23 -DICE_LINE_CAP_LOG2=23 cap_main.cpp cap_codec.cpp -o cap_main -lzstd`.
 
 ## Next
 **M2** — public Lines enter typed NEED/FILL (restart / late-join / eviction; materialize immutable

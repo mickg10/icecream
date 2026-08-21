@@ -23,7 +23,7 @@
 //  * the anchor table stores absolute_position+1 so byte 0 is representable, and is sized
 //    from the configured retained-history budget, never from the total input length.
 //
-// build: g++ -O3 -march=native -std=c++17 -I<libbsc> -o grz3 grz3.cpp libbsc.a -lzstd -lpthread
+// build: g++ -O3 -march=native -std=c++23 -I<libbsc> -o grz3 grz3.cpp libbsc.a -lzstd -lpthread
 
 #include <cstdio>
 #include <cstdint>

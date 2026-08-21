@@ -49,9 +49,9 @@ MX=${MX:-$HOME/ictmp/ii-matrix}
 BIN=${BIN:-$HERE/build/codec50-sink}
 WORK=${WORK:-$(mktemp -d /tmp/selacc.XXXXXX)}
 CELL=${CELL:-fmt/debian-gcc}
-CXX_OPT=${CXX_OPT:--std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror}
-CXX_SAN=${CXX_SAN:--std=c++17 -O1 -g -fsanitize=address,undefined -Wall -Wextra -Wpedantic -Werror}
-CXX_TSAN=${CXX_TSAN:--std=c++17 -O1 -g -fsanitize=thread -fno-pie -no-pie -Wall -Wextra -Wpedantic -Werror}
+CXX_OPT=${CXX_OPT:-${ICE_CXX_STANDARD_FLAG:--std=c++23} -O2 -Wall -Wextra -Wpedantic -Werror}
+CXX_SAN=${CXX_SAN:-${ICE_CXX_STANDARD_FLAG:--std=c++23} -O1 -g -fsanitize=address,undefined -Wall -Wextra -Wpedantic -Werror}
+CXX_TSAN=${CXX_TSAN:-${ICE_CXX_STANDARD_FLAG:--std=c++23} -O1 -g -fsanitize=thread -fno-pie -no-pie -Wall -Wextra -Wpedantic -Werror}
 
 NAMES=(); STATUS=()
 
@@ -74,7 +74,7 @@ REF_COMMIT=749ca47c7ed21b1997cd87c81158e85d5bb4c653   # T_current step 1: on-dem
      $REF_COMMIT
    Build one with:
      git show $REF_COMMIT:capability/grouprlz/codec50-sink.cpp > <dir>/codec50-sink.cpp
-     cp $HERE/*.h <dir>/ && (cd <dir> && g++ -O3 -march=native -std=c++17 -fopenmp \\
+     cp $HERE/*.h <dir>/ && (cd <dir> && g++ -O3 -march=native -std=c++23 -fopenmp \\
         -DWITH_BSC_GROUPS -I. -I\$HOME/libbsc/libbsc codec50-sink.cpp -o codec50-sink \\
         \$HOME/grouprlz/libbsc.a /usr/lib/x86_64-linux-gnu/libzstd.a -lz -lpthread)"
 cmp -s "$REF_BIN" "$BIN" && die \

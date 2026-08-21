@@ -5,7 +5,7 @@ set -Eeuo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 WORK=${WORK:-$(mktemp -d /tmp/p29-shared-authority-mut.XXXXXX)}
-CXXFLAGS=${CXXFLAGS:--std=c++17 -O2 -pthread -Wall -Wextra -Wpedantic -Werror}
+CXXFLAGS=${CXXFLAGS:-${ICE_CXX_STANDARD_FLAG:--std=c++23} -O2 -pthread -Wall -Wextra -Wpedantic -Werror}
 
 fail(){ echo "SHARED AUTHORITY MUTATION FAIL: $*" >&2; exit 1; }
 trap 'rc=$?; [ "$rc" -eq 0 ] || echo "  evidence retained: $WORK" >&2' EXIT

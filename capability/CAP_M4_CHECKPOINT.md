@@ -10,7 +10,7 @@ It builds against the committed `cap_codec.{h,cpp}` + `cap_transport.h`; `cap_ma
 is unchanged alongside it.
 
 ## Result (byte-exact, independently re-verified)
-Build: `g++ -O3 -std=c++17 -DICE_LINE_CAP_LOG2=23 cap_main_m4.cpp cap_codec.cpp -o cap_main_m4 -lzstd`
+Build: `g++ -O3 -std=c++23 -DICE_LINE_CAP_LOG2=23 cap_main_m4.cpp cap_codec.cpp -o cap_main_m4 -lzstd`
 
 | corpus | M3 (shared window) | CAP-M4 (independent frames) | delta |
 |---|--:|--:|--:|

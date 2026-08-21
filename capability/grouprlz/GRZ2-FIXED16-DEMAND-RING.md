@@ -172,7 +172,7 @@ corrected decoder ledger SHA-256:
 Build:
 
 ```bash
-g++ -O3 -march=native -std=c++17 -Wall -Wextra -Wpedantic -Werror \
+g++ -O3 -march=native -std=c++23 -Wall -Wextra -Wpedantic -Werror \
     -I /home/ttuser/libbsc -c grz2g.cpp -o grz2g.o
 g++ grz2g.o /home/ttuser/grouprlz/libbsc.a -lzstd -lpthread -o grz2g
 ```

@@ -6,7 +6,7 @@
 // another route.  Conflating the two is exactly how a COPY against a source the selected F
 // never received would get emitted.
 //
-//   g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror p29_block_catalogue_test.cpp -o t && ./t
+//   g++ -std=c++23 -O2 -Wall -Wextra -Wpedantic -Werror p29_block_catalogue_test.cpp -o t && ./t
 #include "p29_online_s1.h"
 
 #include <algorithm>

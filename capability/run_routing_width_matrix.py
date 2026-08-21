@@ -12,6 +12,7 @@ import csv
 import hashlib
 import json
 import math
+import os
 import shlex
 import subprocess
 from dataclasses import dataclass
@@ -67,7 +68,7 @@ def build_binary(source: Path, output: Path, cxx: str) -> tuple[Path, list[str]]
         "-O3",
         "-DNDEBUG",
         "-march=native",
-        "-std=c++17",
+        os.environ.get("ICE_CXX_STANDARD_FLAG", "-std=c++23"),
         "-DICE_LINE_CAP_LOG2=23",
         "-Wall",
         "-Wextra",

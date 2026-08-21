@@ -28,7 +28,7 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # A fixed shared path plus `rm -rf` means two concurrent gate runs erase each other's
 # evidence -- and the loser reports on files the winner replaced.  Default to a private dir.
 WORK=${WORK:-$(mktemp -d /tmp/p29journalmut.XXXXXX)}
-CXXFLAGS=${CXXFLAGS:--std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror}
+CXXFLAGS=${CXXFLAGS:-${ICE_CXX_STANDARD_FLAG:--std=c++23} -O2 -Wall -Wextra -Wpedantic -Werror}
 
 mkdir -p "$WORK"
 build_and_run() { # build_and_run <dir> ; echoes PASS or FAIL

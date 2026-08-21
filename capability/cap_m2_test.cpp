@@ -7,7 +7,7 @@
 //       ROLLBACK          unchanged), then the ordinary path recovers on the next Fill.
 // Drives FStore::decode_fill directly with hand-built mixed control/literal streams.
 //
-// build: g++ -O3 -std=c++17 -DICE_LINE_CAP_LOG2=23 cap_m2_test.cpp cap_codec.cpp -o cap_m2_test -lzstd
+// build: g++ -O3 -std=c++23 -DICE_LINE_CAP_LOG2=23 cap_m2_test.cpp cap_codec.cpp -o cap_m2_test -lzstd
 #include "cap_codec.h"
 #include <cstdio>
 #include <string>

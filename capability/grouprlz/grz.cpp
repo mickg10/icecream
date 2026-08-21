@@ -8,7 +8,7 @@
 // Bytes covered by a COPY are never hashed, so on highly redundant corpora the rolling hash
 // is only paid on novel content and the parse runs at memcmp speed.
 //
-// build: g++ -O3 -march=native -std=c++17 -o grz grz.cpp libbsc.a -lzstd
+// build: g++ -O3 -march=native -std=c++23 -o grz grz.cpp libbsc.a -lzstd
 //
 //   grz enc <in> <out.grz> [K sbits tbits litbe tokbe mt]
 //   grz dec <in.grz> <out>

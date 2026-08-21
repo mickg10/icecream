@@ -518,7 +518,7 @@ long-window coder. Byte-exact throughout (all Phase-1 + Phase-2 cells reconstruc
 ## Build / run
 ```
 cd ~/capability
-g++ -O3 -std=c++17 -DICE_LINE_CAP_LOG2=23 material_lab.cpp cap_codec.cpp -o material_lab -lzstd
+g++ -O3 -std=c++23 -DICE_LINE_CAP_LOG2=23 material_lab.cpp cap_codec.cpp -o material_lab -lzstd
 ./material_lab ledger --manifest ~/ictmp/corpus3/manifest.txt --z 3 --mode m3          # gate 9,802,066
 ./material_lab residual-census --manifest ~/ictmp/corpus3/manifest.txt --z 3
 ./material_lab curve --manifest ~/ictmp/corpus3/manifest.txt --z 3 --test-mode o1 \

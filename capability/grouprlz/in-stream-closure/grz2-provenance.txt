@@ -6,7 +6,7 @@ grz2g_flush.cpp (corrected)  07f0713ebe57e029a1533bd30ea31c4d2d46e4c9740ce48d9a2
 grz2g-flush (binary)         ea04fd6b301930690c223c9f68d7f4fb167bee908384cdae5eb3650b16dd6be4
 
 -- exact build command --
-g++ -O3 -march=native -std=c++17 -I $HOME -I $HOME/libbsc -o grz2g-flush grz2g_flush.cpp $HOME/grouprlz/libbsc.a -lzstd -lpthread
+g++ -O3 -march=native -std=c++23 -I $HOME -I $HOME/libbsc -o grz2g-flush grz2g_flush.cpp $HOME/grouprlz/libbsc.a -lzstd -lpthread
 
 -- exact encode command (re2.debian-gcc, N=72) --
 grz2g-flush enc ii4 g4.grz -u tu4.map -m g2 -K 256 -s 6 -t 21 -l 4 -k 5 -b 8 --gtu 112 --graw 512 --gadd 128 --hist 1024 -j 8 --build-tus 72 --curve c4.tsv

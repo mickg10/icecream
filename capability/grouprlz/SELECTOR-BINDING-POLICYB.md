@@ -112,7 +112,7 @@ zstd        v1.4.8
 P29 was rebuilt independently rather than reusing local-oracle's binary:
 
 ```
-g++ -O3 -march=znver3 -std=c++17 -DWITH_BSC_GROUPS -I /home/ttuser/libbsc/libbsc \
+g++ -O3 -march=znver3 -std=c++23 -DWITH_BSC_GROUPS -I /home/ttuser/libbsc/libbsc \
     -o codec50-56c1744 codec50.cpp /home/ttuser/grouprlz/libbsc.a -lzstd -lz -lpthread
 ```
 

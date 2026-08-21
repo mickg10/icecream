@@ -41,7 +41,7 @@ measured binary sha256
 05c71c65d25afad331ac95d084639ea86489c3b31b440b94b95e3dc935f31621
 
 build
-g++ -O3 -march=native -std=c++17 -Wall -Wextra -Wpedantic -Werror \
+g++ -O3 -march=native -std=c++23 -Wall -Wextra -Wpedantic -Werror \
     -I "$HOME/libbsc" -c grz2g.cpp
 g++ grz2g.o "$HOME/grouprlz/libbsc.a" -lzstd -lpthread -o grz2g
 ```

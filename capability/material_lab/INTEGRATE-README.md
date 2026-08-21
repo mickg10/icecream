@@ -21,7 +21,7 @@ Currently **whole-build** (cold) and **fixed-prefix** (chronological, via `--max
 
 ## Build & reproduce
 ```
-g++ -O3 -std=c++17 -DICE_LINE_CAP_LOG2=23 material_lab.cpp cap_codec.cpp -o material_lab -lzstd
+g++ -O3 -std=c++23 -DICE_LINE_CAP_LOG2=23 material_lab.cpp cap_codec.cpp -o material_lab -lzstd
 ./material_lab integrate --manifest <corpus/manifest.txt> [--max-files N] [--wp19 W]
 ```
 The `INTEGRATE` row prints: manifest, TUs, raw, complete bytes, chosen residual tag, wp_z19, ×wp_z19, byte-exact (1/0). `--max-files 100/200` gives the causal-prefix chronological rows. Full record: `MATERIAL_LAB_PHASE1.md`.

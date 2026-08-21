@@ -6,6 +6,8 @@ form of process accounting in there.
 Required Libraries
 ==================
 Note: The package name may vary by distro
+* C++ compiler with C++23 mode
+* Boost >= 1.66 (Boost.Asio headers; Boost.System where required by that Boost build)
 * libcap-ng-devel
 * libarchive-devel
 * lzo-devel
@@ -19,6 +21,11 @@ cd icecream
 ./configure --prefix=/opt/icecream
 make
 make install
+
+If Boost is installed under a non-default prefix, pass
+`--with-boost=/path/to/prefix`. `CC`, `CXX`, `CPPFLAGS`, and `LDFLAGS`
+retain their normal Autoconf meanings; `ICE_CXX_STANDARD_FLAG` may select a
+compiler-specific spelling of C++23 mode (for example `-std=c++2b`).
 
 WARNING: Make sure you specify a prefix, otherwise icecream
 might override your gcc installation! You will need to use this

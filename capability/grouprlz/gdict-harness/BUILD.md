@@ -10,7 +10,7 @@ capacities overridable; nothing else is changed.
 curl -sL https://github.com/facebook/zstd/archive/refs/tags/v1.4.8.tar.gz | tar xz
 make -C zstd-1.4.8/lib -j16 ZSTD_MULTITHREAD=1 libzstd.a CFLAGS="-O3 -fPIC -DZSTD_MULTITHREAD"
 
-g++ -O3 -std=c++17 -march=znver3 \
+g++ -O3 -std=c++23 -march=znver3 \
     -DICE_LINE_CAP_LOG2=25 -DICE_SHORT_CAP_LOG2=23 -DICE_TINY_CAP_LOG2=16 \
     -DWITH_BSC_GROUPS -pthread \
     -I~/libbsc/libbsc -I zstd-1.4.8/lib \

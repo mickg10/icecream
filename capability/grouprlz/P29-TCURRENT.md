@@ -44,7 +44,7 @@ implementation. The corpus includes:
 Run:
 
 ```sh
-g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror \
+g++ -std=c++23 -O2 -Wall -Wextra -Wpedantic -Werror \
   capability/grouprlz/p29_online_s1_test.cpp -o /tmp/p29_online_s1_test
 /tmp/p29_online_s1_test
 ```

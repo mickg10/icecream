@@ -43,7 +43,7 @@ BASE=(--z 3 --mixed-regions --byte-array-lines --direct-ordinals --compressed-bl
       --blob-z 9 --blob-zstd-workers 4 --blob-zstd-job-mib 5 --blob-zstd-overlap-log 3
       --stable-root-tags --literal-ondemand --literal-group-skip-zstd10 --route-s1 1
       --transactional-tu --live-selector)
-CXXFLAGS=(-O2 -std=c++17 -fopenmp -Wformat=2 -Werror=format -DWITH_BSC_GROUPS
+CXXFLAGS=(-O2 "${ICE_CXX_STANDARD_FLAG:--std=c++23}" -fopenmp -Wformat=2 -Werror=format -DWITH_BSC_GROUPS
           -I"$HERE" -I"$LIBBSC_DIR/libbsc")
 
 run_codec() { # run_codec <tag> <executable>

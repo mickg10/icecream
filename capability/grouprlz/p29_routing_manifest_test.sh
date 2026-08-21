@@ -6,7 +6,7 @@ MANIFEST=${1:?usage: p29_routing_manifest_test.sh MANIFEST [WORK]}
 WORK=${2:-$(mktemp -d /tmp/p29-routing-manifest.XXXXXX)}
 mkdir -p "$WORK"
 
-g++ -O2 -std=c++17 -DICE_LINE_CAP_LOG2=23 -Wall -Wextra -Wpedantic -Werror \
+g++ -O2 "${ICE_CXX_STANDARD_FLAG:--std=c++23}" -DICE_LINE_CAP_LOG2=23 -Wall -Wextra -Wpedantic -Werror \
     -pthread "$HERE/p29_routing_manifest.cpp" "$HERE/../cap_codec.cpp" \
     -o "$WORK/p29-routing-manifest" -lzstd
 
@@ -37,7 +37,7 @@ awk 'NR==2 { first[0]=$2 } NR==3 { first[1]=$2 } NR==4 { first[2]=$2 } NR==5 { f
 head -n 3 "$WORK/r4-state.assignment" >"$WORK/r4-full.prefix"
 cmp "$WORK/r4-prefix.assignment" "$WORK/r4-full.prefix"
 
-g++ -O1 -g -fsanitize=address,undefined -std=c++17 -DICE_LINE_CAP_LOG2=23 \
+g++ -O1 -g -fsanitize=address,undefined "${ICE_CXX_STANDARD_FLAG:--std=c++23}" -DICE_LINE_CAP_LOG2=23 \
     -Wall -Wextra -Wpedantic -Werror -pthread \
     "$HERE/p29_routing_manifest.cpp" "$HERE/../cap_codec.cpp" \
     -o "$WORK/p29-routing-manifest.san" -lzstd

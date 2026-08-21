@@ -242,7 +242,7 @@ from the properly terminated encode; only the immutability reference is the open
 
 ```sh
 # the sink-instrumented P29 (verified byte-identical to codec50-refZ with the sinks off)
-g++ -O3 -march=native -std=c++17 -DWITH_BSC_GROUPS -I. -I$HOME/libbsc/libbsc \
+g++ -O3 -march=native -std=c++23 -DWITH_BSC_GROUPS -I. -I$HOME/libbsc/libbsc \
     codec50-sink.cpp -o codec50-sink \
     $HOME/grouprlz/libbsc.a /usr/lib/x86_64-linux-gnu/libzstd.a -lz -lpthread
 

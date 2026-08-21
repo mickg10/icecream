@@ -13,7 +13,7 @@
 // container at any segment boundary yields a wire that decodes standalone to exactly that
 // prefix of the corpus. -w W additionally bounds references to the last W TUs.
 //
-// build: g++ -O3 -march=native -std=c++17 -I<libbsc> -o grz grz.cpp libbsc.a -lzstd -lpthread
+// build: g++ -O3 -march=native -std=c++23 -I<libbsc> -o grz grz.cpp libbsc.a -lzstd -lpthread
 
 #include <cstdio>
 #include <cstdint>

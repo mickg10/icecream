@@ -406,7 +406,9 @@ static void dcc_daemon_terminate(int whichsig)
         unlink(pidFilePath.c_str());
     }
 
-    ++exit_main_loop;
+    // C++20 deprecated increment/decrement on volatile values. sig_atomic_t still provides
+    // the signal-handler communication required here; spell the read and write explicitly.
+    exit_main_loop = static_cast<sig_atomic_t>(exit_main_loop + 1);
 }
 
 void usage(const char *reason = nullptr)

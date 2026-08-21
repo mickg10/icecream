@@ -12,7 +12,7 @@ set -Eeuo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 WORK=${WORK:-$(mktemp -d /tmp/p29-unavailable-suffix.XXXXXX)}
-CXXFLAGS=${CXXFLAGS:--std=c++17 -O2 -pthread -Wall -Wextra -Wpedantic -Werror}
+CXXFLAGS=${CXXFLAGS:-${ICE_CXX_STANDARD_FLAG:--std=c++23} -O2 -pthread -Wall -Wextra -Wpedantic -Werror}
 
 fail() {
   echo "UNAVAILABLE-SUFFIX FAIL: $*" >&2

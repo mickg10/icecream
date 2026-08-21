@@ -10,7 +10,7 @@
 //   curve           — per-TU curve.tsv (raw / z19 / cold0(=RBASE-M3) / test(=O0 ceiling) + savings).
 //   export-events   — per-TU M3 opcode/event stream + per-line source-origin -> events.<corpus>.zst
 //
-// build: g++ -O3 -std=c++17 -DICE_LINE_CAP_LOG2=23 material_lab.cpp cap_codec.cpp -o material_lab -lzstd
+// build: g++ -O3 -std=c++23 -DICE_LINE_CAP_LOG2=23 material_lab.cpp cap_codec.cpp -o material_lab -lzstd
 #include "cap_codec.h"
 #include <chrono>
 #include <cmath>

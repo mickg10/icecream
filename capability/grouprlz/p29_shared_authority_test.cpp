@@ -1,6 +1,6 @@
 // Deterministic A2 fixture for one shared C authority and independent F replicas.
 //
-//   g++ -std=c++17 -O2 -pthread -Wall -Wextra -Wpedantic -Werror
+//   g++ -std=c++23 -O2 -pthread -Wall -Wextra -Wpedantic -Werror
 //       p29_shared_authority_test.cpp -o t && ./t
 #include "p29_shared_authority.h"
 

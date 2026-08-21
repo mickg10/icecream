@@ -31,14 +31,42 @@ AC_LANG([C++])
 AC_PROG_CC
 AC_PROG_CXX
 
-AC_MSG_CHECKING([for C++11 support (-std=c++11)])
-CXXFLAGS="$CXXFLAGS -std=c++11"
+AC_ARG_VAR([ICE_CXX_STANDARD_FLAG],
+    [compiler flag selecting C++23 mode (default: -std=c++23)])
+AS_IF([test -z "$ICE_CXX_STANDARD_FLAG"], [ICE_CXX_STANDARD_FLAG=-std=c++23])
+
+AC_MSG_CHECKING([for the required C++23 language and library features ($ICE_CXX_STANDARD_FLAG)])
+CXXFLAGS="$CXXFLAGS $ICE_CXX_STANDARD_FLAG"
 AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
-        constexpr int get_const() { return 5; }
+        #include <compare>
+        #include <cstddef>
+        #include <optional>
+        #include <span>
+        #include <variant>
+        #include <vector>
+
+        #if __cplusplus < 202100L
+        # error compiler is not in C++23 language mode
+        #endif
+
+        struct OrderedValue {
+            unsigned long long value = 0;
+            auto operator<=>(const OrderedValue&) const = default;
+        };
+
+        constexpr unsigned long long span_sum(std::span<const unsigned long long> values) {
+            unsigned long long result = 0;
+            for (unsigned long long value : values) result += value;
+            return result;
+        }
     ]], [[
+        const std::vector<unsigned long long> values{1, 2, 3};
+        const std::optional<OrderedValue> selected{OrderedValue{span_sum(values)}};
+        const std::variant<unsigned long long, OrderedValue> tagged{*selected};
+        return std::get<OrderedValue>(tagged).value == 6 ? 0 : 1;
     ]])],[
         AC_MSG_RESULT(yes)
-    ],[ AC_MSG_ERROR(no) 
+    ],[ AC_MSG_ERROR([a compiler with the required C++23 mode, std::span, std::optional, std::variant, and defaulted comparisons is required])
 ])
 
 if test "$GCC" = yes; then
@@ -90,6 +118,98 @@ AC_C_INLINE
 AC_DISABLE_SHARED
 AC_ENABLE_STATIC
 LT_INIT
+
+# Protocol 50 uses Boost.Asio's io_context, TCP sockets, and posted handlers.
+# Keep discovery central so future targets consume BOOST_CPPFLAGS/BOOST_LDFLAGS/BOOST_LIBS
+# rather than each inventing a different dependency probe.
+AC_ARG_WITH([boost],
+    [AS_HELP_STRING([--with-boost=PREFIX],
+        [use Boost installed under PREFIX (Boost >= 1.66 with Boost.Asio is required)])],
+    [boost_prefix="$withval"],
+    [boost_prefix=""])
+AS_IF([test "x$boost_prefix" = xno],
+    [AC_MSG_ERROR([Boost is a mandatory dependency and cannot be disabled])])
+
+BOOST_CPPFLAGS=
+BOOST_LDFLAGS=
+AS_IF([test -n "$boost_prefix" && test "x$boost_prefix" != xyes], [
+    AS_IF([test -f "$boost_prefix/boost/version.hpp"], [
+        BOOST_CPPFLAGS="-I$boost_prefix"
+    ], [test -f "$boost_prefix/include/boost/version.hpp"], [
+        BOOST_CPPFLAGS="-I$boost_prefix/include"
+    ], [
+        AC_MSG_ERROR([--with-boost=$boost_prefix does not contain boost/version.hpp])
+    ])
+    icecc_boost_multiarch=`$CXX -print-multiarch 2>/dev/null`
+    AS_IF([test -n "$icecc_boost_multiarch" &&
+           test -d "$boost_prefix/lib/$icecc_boost_multiarch"], [
+        BOOST_LDFLAGS="-L$boost_prefix/lib/$icecc_boost_multiarch"
+    ], [test -d "$boost_prefix/lib64"], [
+        BOOST_LDFLAGS="-L$boost_prefix/lib64"
+    ], [test -d "$boost_prefix/lib"], [
+        BOOST_LDFLAGS="-L$boost_prefix/lib"
+    ])
+])
+
+CPPFLAGS="$BOOST_CPPFLAGS $CPPFLAGS"
+LDFLAGS="$BOOST_LDFLAGS $LDFLAGS"
+
+AC_MSG_CHECKING([for Boost version 1.66 or newer])
+AC_COMPUTE_INT([icecc_boost_version], [BOOST_VERSION], [[
+    #include <boost/version.hpp>
+]], [AC_MSG_ERROR([Boost headers were not found; install Boost >= 1.66 or use --with-boost=PREFIX])])
+AS_IF([test "$icecc_boost_version" -lt 106600], [
+    AC_MSG_ERROR([Boost >= 1.66 is required; found BOOST_VERSION=$icecc_boost_version])
+])
+icecc_boost_major=`expr "$icecc_boost_version" / 100000`
+icecc_boost_minor=`expr \( "$icecc_boost_version" / 100 \) % 1000`
+icecc_boost_patch=`expr "$icecc_boost_version" % 100`
+AC_MSG_RESULT([$icecc_boost_major.$icecc_boost_minor.$icecc_boost_patch])
+
+AC_MSG_CHECKING([for required Boost.Asio io_context, TCP, and post APIs])
+icecc_save_LIBS="$LIBS"
+BOOST_LIBS=
+AC_LINK_IFELSE([AC_LANG_PROGRAM([[
+        #include <boost/asio/io_context.hpp>
+        #include <boost/asio/ip/tcp.hpp>
+        #include <boost/asio/post.hpp>
+    ]], [[
+        boost::asio::io_context context;
+        boost::asio::ip::tcp::socket socket(context);
+        boost::asio::post(context, [] {});
+        context.poll();
+        return socket.is_open() ? 1 : 0;
+    ]])], [
+        AC_MSG_RESULT([yes (header-only Boost.System)])
+    ], [
+        LIBS="-lboost_system $icecc_save_LIBS"
+        AC_LINK_IFELSE([AC_LANG_PROGRAM([[
+                #include <boost/asio/io_context.hpp>
+                #include <boost/asio/ip/tcp.hpp>
+                #include <boost/asio/post.hpp>
+            ]], [[
+                boost::asio::io_context context;
+                boost::asio::ip::tcp::socket socket(context);
+                boost::asio::post(context, [] {});
+                context.poll();
+                return socket.is_open() ? 1 : 0;
+            ]])], [
+                BOOST_LIBS=-lboost_system
+                AC_MSG_RESULT([yes (links Boost.System)])
+            ], [
+                AC_MSG_ERROR([Boost.Asio with io_context, TCP sockets, and post is required])
+            ])
+    ])
+LIBS="$icecc_save_LIBS"
+
+AC_DEFINE_UNQUOTED([ICECC_BOOST_VERSION], [$icecc_boost_version],
+    [Numeric Boost version used to build Icecream])
+AC_SUBST([BOOST_CPPFLAGS])
+AC_SUBST([BOOST_LDFLAGS])
+AC_SUBST([BOOST_LIBS])
+AC_SUBST([ICE_CXX_STANDARD_FLAG])
+AC_MSG_NOTICE([C++ language mode: $ICE_CXX_STANDARD_FLAG])
+AC_MSG_NOTICE([Boost: $icecc_boost_major.$icecc_boost_minor.$icecc_boost_patch; Asio link components: ${BOOST_LIBS:-none}])
 
 AS_CASE([$host], [*linux*], [LIBCAP_NG_DEFAULT=yes], [LIBCAP_NG_DEFAULT=auto])
 PKG_HAVE_DEFINE_WITH_MODULES([LIBCAP_NG], [libcap-ng], , $LIBCAP_NG_DEFAULT)
@@ -348,4 +468,3 @@ PKGLIBEXECDIR="$mylibexecdir/$PACKAGE"
 AC_SUBST(PKGLIBEXECDIR)
 
 AC_OUTPUT
-

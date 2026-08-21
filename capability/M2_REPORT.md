@@ -45,7 +45,7 @@ frame. Independently rebuilt + re-run (bit-identical).
 ## Files
 `cap_transport.h` (+`Rejoin=6`), `cap_header_test.cpp` (type 6 valid, 7 reserved), `cap_codec.{h,cpp}`,
 `cap_protocol.h`, `cap_main.cpp` (`--restart T | --latejoin T | --evict N`), `cap_m2_test.cpp`.
-Build: `g++ -O3 -std=c++17 -DICE_LINE_CAP_LOG2=23 cap_main.cpp cap_codec.cpp -o cap_main -lzstd`.
+Build: `g++ -O3 -std=c++23 -DICE_LINE_CAP_LOG2=23 cap_main.cpp cap_codec.cpp -o cap_main -lzstd`.
 One scoped future refinement noted in code: recovery-mode literal blocks persist for the remainder after a
 restart (chosen: persistent-simple); scoped COPY via an `freg_base` map is a later optimization.
 

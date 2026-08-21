@@ -12,7 +12,7 @@
 // codec, definition_codec.h) plugs into the line-definition leg when available. The real two-process
 // socketpair + throughput and the S0/S1/S3 structure planes build on this same serializer/decoder.
 //
-// build: g++ -O3 -march=native -std=c++17 codec50.cpp -o codec50 -lzstd
+// build: g++ -O3 -march=native -std=c++23 codec50.cpp -o codec50 -lzstd
 
 #include <algorithm>
 #include <array>

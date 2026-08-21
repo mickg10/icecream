@@ -11,7 +11,7 @@
 // Per-TU dialogue: C->Root[rootb|blockRaw] ; F->Need[missReg|drops] ; C->Fill[paths|mixed0..3].
 // M2 restart/late-join: F->Rejoin[resumeTU] ; C->Ack[nextPublic|pathTable] inserted before Root.
 //
-// build: g++ -O3 -std=c++17 -DICE_LINE_CAP_LOG2=23 cap_main.cpp cap_codec.cpp -o cap_main -lzstd
+// build: g++ -O3 -std=c++23 -DICE_LINE_CAP_LOG2=23 cap_main.cpp cap_codec.cpp -o cap_main -lzstd
 #include "cap_codec.h"
 #include "cap_protocol.h"
 #include "cap_transport.h"
