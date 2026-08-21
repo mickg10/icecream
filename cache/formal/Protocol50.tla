@@ -1,5 +1,5 @@
 ------------------------------ MODULE Protocol50 ------------------------------
-EXTENDS Naturals, FiniteSets, TLC
+EXTENDS Naturals, FiniteSets, Sequences, TLC
 
 (***************************************************************************
 Protocol-50 cache-transaction safety core.
