@@ -1,10 +1,14 @@
-EXTRA_DIST = README.md
+EXTRA_DIST = \
+	README.md \
+	capability/distribution/firefox-corrected.compile-trace.tsv \
+	capability/grouprlz/runway-census.tsv
 
 ACLOCAL_AMFLAGS = -I m4
 AM_LIBTOOLFLAGS = --silent
 
 SUBDIRS = \
 	services \
+	cache \
 	daemon \
 	client \
 	doc \

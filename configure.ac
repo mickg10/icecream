@@ -211,6 +211,47 @@ AC_SUBST([ICE_CXX_STANDARD_FLAG])
 AC_MSG_NOTICE([C++ language mode: $ICE_CXX_STANDARD_FLAG])
 AC_MSG_NOTICE([Boost: $icecc_boost_major.$icecc_boost_minor.$icecc_boost_patch; Asio link components: ${BOOST_LIBS:-none}])
 
+# Protocol-50's common 128-bit digest uses the stable XXH3 streaming and one-shot APIs.
+# This is an M0 dependency, separate from the B0 C++23/Boost baseline above.
+PKG_CHECK_MODULES([XXHASH], [libxxhash >= 0.8.0], [], [
+    AC_MSG_ERROR([libxxhash >= 0.8.0 with XXH3-128 support is required])
+])
+AC_MSG_CHECKING([for required XXH3-128 streaming APIs])
+icecc_save_CPPFLAGS="$CPPFLAGS"
+icecc_save_LIBS="$LIBS"
+CPPFLAGS="$XXHASH_CFLAGS $CPPFLAGS"
+LIBS="$XXHASH_LIBS $LIBS"
+AC_COMPUTE_INT([icecc_xxhash_version], [XXH_VERSION_NUMBER], [[
+    #include <xxhash.h>
+]], [AC_MSG_ERROR([xxhash.h does not expose XXH_VERSION_NUMBER])])
+AS_IF([test "$icecc_xxhash_version" -lt 800], [
+    AC_MSG_ERROR([libxxhash >= 0.8.0 is required; found XXH_VERSION_NUMBER=$icecc_xxhash_version])
+])
+icecc_xxhash_major=`expr "$icecc_xxhash_version" / 10000`
+icecc_xxhash_minor=`expr \( "$icecc_xxhash_version" / 100 \) % 100`
+icecc_xxhash_patch=`expr "$icecc_xxhash_version" % 100`
+XXHASH_VERSION="$icecc_xxhash_major.$icecc_xxhash_minor.$icecc_xxhash_patch"
+AC_LINK_IFELSE([AC_LANG_PROGRAM([[
+        #include <xxhash.h>
+    ]], [[
+        XXH3_state_t* state = XXH3_createState();
+        if (state == nullptr) return 1;
+        const char byte = 0;
+        if (XXH3_128bits_reset(state) != XXH_OK ||
+            XXH3_128bits_update(state, &byte, 1) != XXH_OK) return 2;
+        const XXH128_hash_t digest = XXH3_128bits_digest(state);
+        XXH3_freeState(state);
+        (void)digest;
+        return 0;
+    ]])], [
+        AC_MSG_RESULT([yes])
+    ], [
+        AC_MSG_ERROR([libxxhash is present but the XXH3-128 streaming API is unavailable])
+    ])
+CPPFLAGS="$icecc_save_CPPFLAGS"
+LIBS="$icecc_save_LIBS"
+AC_MSG_NOTICE([XXHash: $XXHASH_VERSION; link flags: $XXHASH_LIBS])
+
 AS_CASE([$host], [*linux*], [LIBCAP_NG_DEFAULT=yes], [LIBCAP_NG_DEFAULT=auto])
 PKG_HAVE_DEFINE_WITH_MODULES([LIBCAP_NG], [libcap-ng], , $LIBCAP_NG_DEFAULT)
 
@@ -435,6 +476,7 @@ AC_CONFIG_FILES([ daemon/Makefile ])
 AC_CONFIG_FILES([ doc/Makefile ])
 AC_CONFIG_FILES([ services/Makefile ])
 AC_CONFIG_FILES([ services/icecc.pc ])
+AC_CONFIG_FILES([ cache/Makefile ])
 AC_CONFIG_FILES([ suse/Makefile ])
 AC_CONFIG_FILES([ compilerwrapper/Makefile ])
 AC_CONFIG_FILES([ scheduler/Makefile ])
