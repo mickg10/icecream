@@ -18,14 +18,18 @@ as unrestricted TX_ABORTED.
 The bridge also records the job-side distinction:
 
   * a waiting P50 attachment is cancelled by cache-incarnation loss;
-  * a compiler already authorized with independent exact input may finish.
+  * a compiler already authorized with an independently owned exact input may
+    finish after the cache incarnation disappears.
 ***************************************************************************)
 
-CONSTANTS OldGuid, NewGuid, TU, NoTU, MutantLoseRetryOnReplacement
+CONSTANTS OldGuid, NewGuid, TU, NoTU,
+          MutantLoseRetryOnReplacement,
+          MutantAuthorizeWithoutOwnedInput
 
 ASSUME /\ OldGuid # NewGuid
        /\ TU # NoTU
        /\ MutantLoseRetryOnReplacement \in BOOLEAN
+       /\ MutantAuthorizeWithoutOwnedInput \in BOOLEAN
 
 RecoveryPhases ==
     {"OldInFlight", "AwaitingOldAck", "NeedRoute", "ReadyToSend",
@@ -47,6 +51,7 @@ Init ==
          oldInputPresent          |-> FALSE,
          waitingP50               |-> TRUE,
          compilerAuthorized       |-> FALSE,
+         compilerOwnsInput        |-> FALSE,
          compilerFinished         |-> FALSE,
          resultAccepted           |-> FALSE,
          replacementObserved      |-> FALSE,
@@ -72,6 +77,8 @@ AuthorizeCompiler ==
     /\ ~s.compilerAuthorized
     /\ s' = [s EXCEPT
                  !.compilerAuthorized = TRUE,
+                 !.compilerOwnsInput =
+                    IF MutantAuthorizeWithoutOwnedInput THEN FALSE ELSE TRUE,
                  !.waitingP50 = FALSE]
 
 AcceptOldCommit ==
@@ -149,11 +156,13 @@ ACCEPT_RETRY_COMMIT ==
 
 FinishAuthorizedCompiler ==
     /\ s.compilerAuthorized
+    /\ s.compilerOwnsInput
     /\ ~s.compilerFinished
     /\ s' = [s EXCEPT !.compilerFinished = TRUE]
 
 AcceptCompilerResult ==
     /\ s.compilerAuthorized
+    /\ s.compilerOwnsInput
     /\ s.compilerFinished
     /\ ~s.resultAccepted
     /\ s' = [s EXCEPT !.resultAccepted = TRUE]
@@ -181,6 +190,7 @@ TypeOK ==
     /\ s.oldInputPresent \in BOOLEAN
     /\ s.waitingP50 \in BOOLEAN
     /\ s.compilerAuthorized \in BOOLEAN
+    /\ s.compilerOwnsInput \in BOOLEAN
     /\ s.compilerFinished \in BOOLEAN
     /\ s.resultAccepted \in BOOLEAN
     /\ s.replacementObserved \in BOOLEAN
@@ -217,13 +227,18 @@ ReplacementClearsOldIncarnationState ==
 ReplacementCancelsWaitingP50 ==
     s.replacementObserved => ~s.waitingP50
 
+AuthorizedCompilerOwnsIndependentInput ==
+    s.compilerAuthorized => s.compilerOwnsInput
+
 AuthorizedCompilerSurvivesReplacement ==
     s.replacementObserved /\ s.authorizedAtReplacement =>
-        s.compilerAuthorized
+        /\ s.compilerAuthorized
+        /\ s.compilerOwnsInput
 
 AcceptedCompilerResultWasAuthorized ==
     s.resultAccepted =>
         /\ s.compilerAuthorized
+        /\ s.compilerOwnsInput
         /\ s.compilerFinished
 
 OldCommitCannotBeAcceptedAfterReplacement ==
@@ -251,6 +266,7 @@ RecoveryInit ==
          oldInputPresent          |-> FALSE,
          waitingP50               |-> FALSE,
          compilerAuthorized       |-> FALSE,
+         compilerOwnsInput        |-> FALSE,
          compilerFinished         |-> FALSE,
          resultAccepted           |-> FALSE,
          replacementObserved      |-> TRUE,
