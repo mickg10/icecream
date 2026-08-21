@@ -2,42 +2,39 @@
 set -eu
 
 : "${TLA2TOOLS_JAR:?set TLA2TOOLS_JAR to tla2tools.jar}"
-JAVA_BIN=${JAVA_BIN:-java}
 TLC_WORKERS=${TLC_WORKERS:-1}
-ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
-STATE_ROOT=${TLC_STATE_ROOT:-"${TMPDIR:-/tmp}/icecream-p50-tlc"}
+TLC_STATE_ROOT=${TLC_STATE_ROOT:-/tmp/icecream-p50-tlc}
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+TLC_MAIN="java -cp $TLA2TOOLS_JAR tlc2.TLC -workers $TLC_WORKERS"
 
 run_pass() {
     name=$1
-    config=$2
-    module=$3
-    state_dir="$STATE_ROOT/$name"
+    module=$2
+    config=$3
+    state_dir="$TLC_STATE_ROOT/$name"
+    log="$TLC_STATE_ROOT/$name.log"
     rm -rf "$state_dir"
     mkdir -p "$state_dir"
-    echo "=== PASS expected: $name ==="
-    "$JAVA_BIN" -XX:+UseParallelGC -jar "$TLA2TOOLS_JAR" \
-        -workers "$TLC_WORKERS" \
-        -metadir "$state_dir" \
-        -config "$config" \
-        "$module"
+    echo "== $name =="
+    (cd "$SCRIPT_DIR" &&
+        $TLC_MAIN -metadir "$state_dir" -config "$config" "$module") \
+        2>&1 | tee "$log"
 }
 
-run_mutant() {
+run_expected_failure() {
     name=$1
-    config=$2
-    module=$3
+    module=$2
+    config=$3
     invariant=$4
-    state_dir="$STATE_ROOT/$name"
-    log="$STATE_ROOT/$name.log"
+    state_dir="$TLC_STATE_ROOT/$name"
+    log="$TLC_STATE_ROOT/$name.log"
     rm -rf "$state_dir"
     mkdir -p "$state_dir"
-    echo "=== invariant failure expected: $name / $invariant ==="
+    echo "== $name (expected invariant failure: $invariant) =="
     set +e
-    "$JAVA_BIN" -XX:+UseParallelGC -jar "$TLA2TOOLS_JAR" \
-        -workers "$TLC_WORKERS" \
-        -metadir "$state_dir" \
-        -config "$config" \
-        "$module" >"$log" 2>&1
+    (cd "$SCRIPT_DIR" &&
+        $TLC_MAIN -metadir "$state_dir" -config "$config" "$module") \
+        >"$log" 2>&1
     rc=$?
     set -e
     cat "$log"
@@ -45,42 +42,24 @@ run_mutant() {
         echo "$name unexpectedly passed" >&2
         exit 1
     fi
-    if ! grep -F "$invariant" "$log" >/dev/null 2>&1 ||
-       ! grep -i 'violat' "$log" >/dev/null 2>&1; then
-        echo "$name failed, but not through invariant $invariant" >&2
+    grep -F "Invariant $invariant is violated" "$log" >/dev/null || {
+        echo "$name failed, but not through $invariant" >&2
         exit 1
-    fi
+    }
 }
 
-rm -rf "$STATE_ROOT"
-mkdir -p "$STATE_ROOT"
-
-run_pass core \
-    "$ROOT/cache/formal/Protocol50.cfg" \
-    "$ROOT/cache/formal/Protocol50.tla"
-run_pass job \
-    "$ROOT/cache/formal/Protocol50JobLifecycle.cfg" \
-    "$ROOT/cache/formal/Protocol50JobLifecycle.tla"
-run_pass incarnation-safety \
-    "$ROOT/cache/formal/Protocol50IncarnationBridge.cfg" \
-    "$ROOT/cache/formal/Protocol50IncarnationBridge.tla"
-run_pass incarnation-progress \
-    "$ROOT/cache/formal/Protocol50IncarnationProgress.cfg" \
-    "$ROOT/cache/formal/Protocol50IncarnationBridge.tla"
-
-run_mutant abort-after-commit \
-    "$ROOT/cache/formal/Protocol50AbortMutant.cfg" \
-    "$ROOT/cache/formal/Protocol50.tla" \
+mkdir -p "$TLC_STATE_ROOT"
+run_pass cache Protocol50.tla Protocol50.cfg
+run_pass job Protocol50JobLifecycle.tla Protocol50JobLifecycle.cfg
+run_pass incarnation Protocol50IncarnationBridge.tla Protocol50IncarnationBridge.cfg
+run_pass incarnation-progress Protocol50IncarnationBridge.tla Protocol50IncarnationProgress.cfg
+run_expected_failure abort-mutant Protocol50.tla Protocol50AbortMutant.cfg \
     CommitReconciliationWitness
-run_mutant terminal-rel-seq \
-    "$ROOT/cache/formal/Protocol50RelSeqMutant.cfg" \
-    "$ROOT/cache/formal/Protocol50.tla" \
+run_expected_failure relseq-mutant Protocol50.tla Protocol50RelSeqMutant.cfg \
     ActiveSequenceHasRoom
-run_mutant commit-without-input-lease \
-    "$ROOT/cache/formal/Protocol50JobLeaseMutant.cfg" \
-    "$ROOT/cache/formal/Protocol50JobLifecycle.tla" \
-    CommittedInputForOpenJobKeepsLease
-run_mutant lose-retry-on-f-replacement \
-    "$ROOT/cache/formal/Protocol50IncarnationMutant.cfg" \
-    "$ROOT/cache/formal/Protocol50IncarnationBridge.tla" \
-    ReplacementPreservesRetryIdentity
+run_expected_failure operation-digest-mutant Protocol50.tla \
+    Protocol50OperationDigestMutant.cfg CommitOnlyAfterExactMaterialization
+run_expected_failure job-lease-mutant Protocol50JobLifecycle.tla \
+    Protocol50JobLeaseMutant.cfg CommittedInputForOpenJobKeepsLease
+run_expected_failure incarnation-mutant Protocol50IncarnationBridge.tla \
+    Protocol50IncarnationMutant.cfg ReplacementPreservesRetryIdentity
