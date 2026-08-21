@@ -61,6 +61,12 @@ run_pass core \
 run_pass job \
     "$ROOT/cache/formal/Protocol50JobLifecycle.cfg" \
     "$ROOT/cache/formal/Protocol50JobLifecycle.tla"
+run_pass incarnation-safety \
+    "$ROOT/cache/formal/Protocol50IncarnationBridge.cfg" \
+    "$ROOT/cache/formal/Protocol50IncarnationBridge.tla"
+run_pass incarnation-progress \
+    "$ROOT/cache/formal/Protocol50IncarnationProgress.cfg" \
+    "$ROOT/cache/formal/Protocol50IncarnationBridge.tla"
 
 run_mutant abort-after-commit \
     "$ROOT/cache/formal/Protocol50AbortMutant.cfg" \
@@ -74,3 +80,7 @@ run_mutant commit-without-input-lease \
     "$ROOT/cache/formal/Protocol50JobLeaseMutant.cfg" \
     "$ROOT/cache/formal/Protocol50JobLifecycle.tla" \
     CommittedInputForOpenJobKeepsLease
+run_mutant lose-retry-on-f-replacement \
+    "$ROOT/cache/formal/Protocol50IncarnationMutant.cfg" \
+    "$ROOT/cache/formal/Protocol50IncarnationBridge.tla" \
+    ReplacementPreservesRetryIdentity
