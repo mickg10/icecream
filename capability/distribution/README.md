@@ -151,10 +151,11 @@ python3 capability/distribution/run_scenario.py SCENARIO.json \
 The P29 builder takes the common simulator assignment, admits the complete TU sequence into one
 logical C catalogue, and forms one ordered projection per populated F.  Every projection gets an
 independent receiver store and contiguous `REL_SEQ`; canonical Block IDs and the global plan
-digest remain common.  The capability harness currently repeats the deterministic global/route
-preparation for each output route and requires the resulting digest and Block count to agree
-before it combines any bytes.  This repeats host-side harness CPU, but it does not create separate
-logical learners or count shared state more than once.
+digest remain common.  One codec supervisor performs the immutable input load, interning, global
+admission, and all-route planning exactly once.  It then forks one populated route at a time from
+that prepared read-only state.  Sequential children bound peak harness RAM while giving each F an
+independent receiver store.  A second supervisor repeats the same preparation only for the
+independent typed-stream replay gate; its shared digest and Block count must match the encoder.
 
 For every F, the builder runs the real codec, parses the typed C-to-F and F-to-C streams into
 causal Root/Need/LINES/Fill/close/Ack extents, requires the selector and component ledgers to

@@ -92,68 +92,84 @@ def fake_codec_run(command: list[str], stdout_path: Path, stderr_path: Path) -> 
     def option(name: str) -> str:
         return command[command.index(name) + 1]
 
-    worker = int(option("--materialize-route"))
     worker_count = int(option("--route-s1"))
     route_lines = Path(option("--route-map")).read_text().splitlines()
     assignment = [int(value) for value in route_lines[1:]]
     manifest = [Path(value) for value in Path(option("--manifest")).read_text().splitlines()]
-    active = [tu for tu, route in enumerate(assignment) if route == worker]
-    active_set = set(active)
-    c_data = bytearray()
-    f_data = bytearray()
-    curve_rows = []
-    selector_rows = []
-    component_rows = []
-    rel_seq = 0
-    c_frames = f_frames = 0
-    for tu, payload in enumerate(manifest):
-        is_active = tu in active_set
-        if is_active:
-            c_chunk = frame(1, bytes([tu])) + frame(8, b"L") + frame(0xFE, b"")
-            f_chunk = frame(3, b"") + frame(0xFD, b"")
-            c_data.extend(c_chunk)
-            f_data.extend(f_chunk)
-            c_frames += 3
-            f_frames += 2
-            selector_rows.append(
-                f"{tu}\t{rel_seq}\t{len(c_chunk)}\t0\tROUTE_S1\n"
+    output_root = Path(option("--materialize-routes-dir"))
+    populated = sorted(set(assignment))
+    for worker in populated:
+        active = [tu for tu, route in enumerate(assignment) if route == worker]
+        active_set = set(active)
+        c_data = bytearray()
+        f_data = bytearray()
+        curve_rows = []
+        selector_rows = []
+        component_rows = []
+        rel_seq = 0
+        c_frames = f_frames = 0
+        for tu, payload in enumerate(manifest):
+            is_active = tu in active_set
+            if is_active:
+                c_chunk = (
+                    frame(1, bytes([tu]))
+                    + frame(8, b"L")
+                    + frame(0xFE, b"")
+                )
+                f_chunk = frame(3, b"") + frame(0xFD, b"")
+                c_data.extend(c_chunk)
+                f_data.extend(f_chunk)
+                c_frames += 3
+                f_frames += 2
+                selector_rows.append(
+                    f"{tu}\t{rel_seq}\t{len(c_chunk)}\t0\tROUTE_S1\n"
+                )
+            curve_rows.append(
+                f"{tu + 1}\t{int(is_active)}\t{rel_seq if is_active else 0}\t"
+                f"{payload.stat().st_size if is_active else 0}\t{len(c_data)}\t"
+                f"{len(f_data)}\t{c_frames}\t{f_frames}\t0\n"
             )
-        curve_rows.append(
-            f"{tu + 1}\t{int(is_active)}\t{rel_seq if is_active else 0}\t"
-            f"{payload.stat().st_size if is_active else 0}\t{len(c_data)}\t"
-            f"{len(f_data)}\t{c_frames}\t{f_frames}\t0\n"
-        )
-        component_rows.append(
-            f"{tu + 1}\t{int(is_active)}\t{rel_seq if is_active else 0}\t"
-            f"{'true' if is_active else 'false'}\n"
-        )
-        if is_active:
-            rel_seq += 1
+            component_rows.append(
+                f"{tu + 1}\t{int(is_active)}\t{rel_seq if is_active else 0}\t"
+                f"{'true' if is_active else 'false'}\n"
+            )
+            if is_active:
+                rel_seq += 1
 
-    Path(option("--cf-sink")).write_bytes(c_data)
-    Path(option("--fc-sink")).write_bytes(f_data)
-    Path(option("--sink-curve")).write_text(
-        "tu\tactive\trel_seq\traw_bytes\tcf_offset\tfc_offset\tcf_frames\tfc_frames\tbuild_close\n"
-        + "".join(curve_rows)
+        route_directory = output_root / f"C0-F{worker}"
+        route_directory.mkdir(parents=True, exist_ok=True)
+        (route_directory / "p29.c-to-f.bin").write_bytes(c_data)
+        (route_directory / "p29.f-to-c.bin").write_bytes(f_data)
+        (route_directory / "sink-curve.tsv").write_text(
+            "tu\tactive\trel_seq\traw_bytes\tcf_offset\tfc_offset\tcf_frames\tfc_frames\tbuild_close\n"
+            + "".join(curve_rows)
+        )
+        (route_directory / "selector.tsv").write_text(
+            "tu\trel_seq\tactual_delta\temitted_blockdefs\twinner\n"
+            + "".join(selector_rows)
+        )
+        (route_directory / "components.tsv").write_text(
+            "tu\tactive\trel_seq\texact\n" + "".join(component_rows)
+        )
+        markers = [
+            f"MULTIROUTE_PLAN routes={worker_count} target={worker} "
+            f"active_tus={len(active)} blocks=7 digest={'12' * 16}",
+            "byte-exact=OK",
+            "SELECTOR closure:",
+            "SELECTOR manifest:",
+            "SELECTOR full total:",
+        ]
+        if "--sink-replay" in command:
+            markers.append("SINK REPLAY OK:")
+        log_name = "replay.stdout" if "--sink-replay" in command else "encode.stdout"
+        (route_directory / log_name).write_text("\n".join(markers) + "\n")
+        error_name = "replay.stderr" if "--sink-replay" in command else "encode.stderr"
+        (route_directory / error_name).write_text("")
+
+    stdout_path.write_text(
+        f"MULTIROUTE_SUPERVISOR routes={worker_count} "
+        f"completed={len(populated)} blocks=7 digest={'12' * 16} status=PASS\n"
     )
-    Path(option("--selector-tsv")).write_text(
-        "tu\trel_seq\tactual_delta\temitted_blockdefs\twinner\n"
-        + "".join(selector_rows)
-    )
-    Path(option("--component-curve-tsv")).write_text(
-        "tu\tactive\trel_seq\texact\n" + "".join(component_rows)
-    )
-    markers = [
-        f"MULTIROUTE_PLAN routes={worker_count} target={worker} "
-        f"active_tus={len(active)} blocks=7 digest={'12' * 16}",
-        "byte-exact=OK",
-        "SELECTOR closure:",
-        "SELECTOR manifest:",
-        "SELECTOR full total:",
-    ]
-    if "--sink-replay" in command:
-        markers.append("SINK REPLAY OK:")
-    stdout_path.write_text("\n".join(markers) + "\n")
     stderr_path.write_text("")
 
 
@@ -178,6 +194,24 @@ class P29LedgerBuilderTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "exactly one"):
             builder.shared_plan_record(marker.replace("ab", "AB"))
 
+    def test_shared_supervisor_record_is_unique_and_exact(self) -> None:
+        marker = (
+            "MULTIROUTE_SUPERVISOR routes=20 completed=3 blocks=7 "
+            f"digest={'ab' * 16} status=PASS\n"
+        )
+        self.assertEqual(
+            builder.shared_supervisor_record(marker),
+            {
+                "routes": 20,
+                "completed": 3,
+                "blocks": 7,
+                "digest": "ab" * 16,
+                "status": "PASS",
+            },
+        )
+        with self.assertRaisesRegex(RuntimeError, "exactly one"):
+            builder.shared_supervisor_record(marker + marker)
+
     def test_multi_route_builder_preserves_global_and_relationship_order(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -191,7 +225,9 @@ class P29LedgerBuilderTest(unittest.TestCase):
             codec = root / "codec50-sink"
             codec.write_bytes(b"")
             output = root / "ledger.jsonl"
-            with mock.patch.object(builder, "checked_run", side_effect=fake_codec_run):
+            with mock.patch.object(
+                builder, "checked_run", side_effect=fake_codec_run
+            ) as checked:
                 builder.build_ledger(
                     scenario_path,
                     codec,
@@ -199,10 +235,23 @@ class P29LedgerBuilderTest(unittest.TestCase):
                     root / "work",
                     [],
                 )
+            self.assertEqual(checked.call_count, 2)
+            self.assertTrue(
+                all(
+                    "--materialize-routes-dir" in call.args[0]
+                    for call in checked.call_args_list
+                )
+            )
             rows = [json.loads(line) for line in output.read_text().splitlines()]
             descriptor, tu_rows, summary = rows[0], rows[1:-1], rows[-1]
             self.assertEqual(descriptor["shared_plan_digest"], "12" * 16)
             self.assertEqual(descriptor["shared_block_count"], 7)
+            self.assertEqual(
+                descriptor["materializer"]["encode_shared_preparations"], 1
+            )
+            self.assertEqual(
+                descriptor["materializer"]["populated_route_children_per_pass"], 2
+            )
             self.assertEqual(sorted(descriptor["routes"]), ["C0-F0", "C0-F1"])
             self.assertEqual([row["tu_seq"] for row in tu_rows], list(range(4)))
             self.assertEqual([row["worker"] for row in tu_rows], [0, 1, 0, 1])
@@ -217,6 +266,30 @@ class P29LedgerBuilderTest(unittest.TestCase):
                     for phase in row["phases"]
                     if phase["direction"] == "c_to_f"
                 ),
+            )
+
+    def test_supervisor_materializes_only_populated_routes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scenario_path = write_scenario(root, workers=6)
+            codec = root / "codec50-sink"
+            codec.write_bytes(b"")
+            output = root / "ledger.jsonl"
+            with mock.patch.object(
+                builder, "checked_run", side_effect=fake_codec_run
+            ) as checked:
+                builder.build_ledger(
+                    scenario_path,
+                    codec,
+                    output,
+                    root / "work",
+                    [],
+                )
+            self.assertEqual(checked.call_count, 2)
+            descriptor = json.loads(output.read_text().splitlines()[0])
+            self.assertEqual(
+                sorted(descriptor["routes"]),
+                ["C0-F0", "C0-F1", "C0-F2", "C0-F3"],
             )
 
     def test_frame_slices_map_to_causal_dialogue_and_tile_each_direction(self) -> None:

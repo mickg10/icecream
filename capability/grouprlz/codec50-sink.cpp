@@ -32,9 +32,11 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <cerrno>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
 #include <immintrin.h>
@@ -1151,7 +1153,7 @@ static constexpr std::array<const char*,8> componentRawNames={
 };
 
 int main(int argc,char**argv){
-    const char* manifest=nullptr;const char*residualDumpPath=nullptr;const char*mixedDumpPrefix=nullptr;const char*curveTsvPath=nullptr;const char*literalGroupPrefix=nullptr;const char*literalGroupWirePath=nullptr;const char*cfSinkPath=nullptr;const char*fcSinkPath=nullptr;const char*sinkCurvePath=nullptr;const char*routeMapPath=nullptr; size_t sinkBuildTus=0; bool sinkReplay=false,literalOnDemand=false,selftestTags=false,selftestBadRoot=false,liveSelector=false,transactionalTu=false; size_t transactionSelftestTu=SIZE_MAX; size_t routeCount=0,materializeRoute=SIZE_MAX; const char*selectorTsvPath=nullptr; size_t max_files=SIZE_MAX,entropyRestartTus=0,replayRepetitions=1,literalGroupTus=0,literalGroupWorkers=1; int zlevel=3,literalZLevel=-1,arrayZLevel=-1,blobZLevel=-1,halfColdBit=-1,blobCanonicalLevel=9; uint32_t sourceAdmitRatio=6,blobThreads=4,blobZstdWorkers=0,blobZstdJobMiB=0,blobZstdOverlapLog=0,blobFallbackEvery=0,s1MinMatch=3,s1MaxChain=1024; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, usePriorRoot=false,useSortedLines=false,useByteArrayLines=false,useMixedRegions=false,useProjectSource=false,useKeyMap=false,useDirectOrdinals=false,useCompressedBlobs=false,useBlobEagerPatches=true,useMoFactor=false,traceMo=false,useAlphaLines=false,useResidualLdm=false,splitControlCeiling=false,structureCeiling=false,literalGroupEvaluateZstd10=true,stableRootTags=false,openFinalEntropy=false;
+    const char* manifest=nullptr;const char*residualDumpPath=nullptr;const char*mixedDumpPrefix=nullptr;const char*curveTsvPath=nullptr;const char*literalGroupPrefix=nullptr;const char*literalGroupWirePath=nullptr;const char*cfSinkPath=nullptr;const char*fcSinkPath=nullptr;const char*sinkCurvePath=nullptr;const char*routeMapPath=nullptr;const char*materializeRoutesDirPath=nullptr; size_t sinkBuildTus=0; bool sinkReplay=false,literalOnDemand=false,selftestTags=false,selftestBadRoot=false,liveSelector=false,transactionalTu=false; size_t transactionSelftestTu=SIZE_MAX; size_t routeCount=0,materializeRoute=SIZE_MAX; const char*selectorTsvPath=nullptr; size_t max_files=SIZE_MAX,entropyRestartTus=0,replayRepetitions=1,literalGroupTus=0,literalGroupWorkers=1; int zlevel=3,literalZLevel=-1,arrayZLevel=-1,blobZLevel=-1,halfColdBit=-1,blobCanonicalLevel=9; uint32_t sourceAdmitRatio=6,blobThreads=4,blobZstdWorkers=0,blobZstdJobMiB=0,blobZstdOverlapLog=0,blobFallbackEvery=0,s1MinMatch=3,s1MaxChain=1024; bool useD1=true, useD2=false, useS1=true, useD2mine=false, deep=false, warm=false, usePriorRoot=false,useSortedLines=false,useByteArrayLines=false,useMixedRegions=false,useProjectSource=false,useKeyMap=false,useDirectOrdinals=false,useCompressedBlobs=false,useBlobEagerPatches=true,useMoFactor=false,traceMo=false,useAlphaLines=false,useResidualLdm=false,splitControlCeiling=false,structureCeiling=false,literalGroupEvaluateZstd10=true,stableRootTags=false,openFinalEntropy=false;
     const char*blobDumpPath=nullptr;const char*componentCurveTsvPath=nullptr;
     for(int i=1;i<argc;++i){ if(!strcmp(argv[i],"--manifest")&&i+1<argc)manifest=argv[++i];
         else if(!strcmp(argv[i],"--z")&&i+1<argc)zlevel=atoi(argv[++i]);
@@ -1188,6 +1190,7 @@ int main(int argc,char**argv){
             routeCount=size_t(v);}
         else if(!strcmp(argv[i],"--route-map")&&i+1<argc)routeMapPath=argv[++i];
         else if(!strcmp(argv[i],"--materialize-route")&&i+1<argc){char*e=nullptr;unsigned long long v=strtoull(argv[++i],&e,10);if(!e||*e||v>SIZE_MAX){fprintf(stderr,"bad materialized route\n");return 2;}materializeRoute=size_t(v);}
+        else if(!strcmp(argv[i],"--materialize-routes-dir")&&i+1<argc)materializeRoutesDirPath=argv[++i];
         else if(!strcmp(argv[i],"--selector-tsv")&&i+1<argc)selectorTsvPath=argv[++i];
         else if(!strcmp(argv[i],"--live-selector"))liveSelector=true;
         else if(!strcmp(argv[i],"--transactional-tu"))transactionalTu=true;
@@ -1257,7 +1260,7 @@ int main(int argc,char**argv){
         printf("selftest-tags: %s\n",bad?"FAIL":"PASS");
         return bad?1:0;
     }
-    if(!manifest){ fprintf(stderr,"usage: %s --manifest F [--z LEVEL] [--literal-z 1..9] [--array-z 1..9] [--blob-z 1..9] [--no-d1] [--d2] [--prior-root] [--structure-ceiling] [--s1-min-match N] [--s1-max-chain N] [--sorted-lines|--byte-array-lines|--mixed-regions [--alpha-lines|--residual-ldm] [--residual-dump PATH] [--mixed-dump-prefix PATH] [--literal-group-prefix PREFIX --literal-group-tus N [--literal-group-workers N] [--literal-group-skip-zstd10] [--literal-group-wire PATH]] [--split-control-ceiling] [--compressed-blobs [--mo-factor [--mo-trace]] [--blob-threads N] [--blob-zstd-workers N --blob-zstd-job-mib N --blob-zstd-overlap-log N] [--blob-fallback-every N] [--blob-lazy-fallback] [--blob-canonical-level 1..9] [--blob-dump PATH]] [--key-map|--direct-ordinals|--half-cold-bit 0|1] [--source-package [--source-admit-ratio N]]] [--max-files N] [--replay-repetitions N] [--entropy-restart-tus N] [--stable-root-tags] [--open-final-entropy] [--route-s1 N [--route-map F --materialize-route R]] [--cf-sink F --fc-sink F [--transactional-tu [--selftest-transaction-reject-once TU]]] [--curve-tsv PATH] [--component-curve-tsv PATH]\n",argv[0]); return 2; }
+    if(!manifest){ fprintf(stderr,"usage: %s --manifest F [--z LEVEL] [--literal-z 1..9] [--array-z 1..9] [--blob-z 1..9] [--no-d1] [--d2] [--prior-root] [--structure-ceiling] [--s1-min-match N] [--s1-max-chain N] [--sorted-lines|--byte-array-lines|--mixed-regions [--alpha-lines|--residual-ldm] [--residual-dump PATH] [--mixed-dump-prefix PATH] [--literal-group-prefix PREFIX --literal-group-tus N [--literal-group-workers N] [--literal-group-skip-zstd10] [--literal-group-wire PATH]] [--split-control-ceiling] [--compressed-blobs [--mo-factor [--mo-trace]] [--blob-threads N] [--blob-zstd-workers N --blob-zstd-job-mib N --blob-zstd-overlap-log N] [--blob-fallback-every N] [--blob-lazy-fallback] [--blob-canonical-level 1..9] [--blob-dump PATH]] [--key-map|--direct-ordinals|--half-cold-bit 0|1] [--source-package [--source-admit-ratio N]]] [--max-files N] [--replay-repetitions N] [--entropy-restart-tus N] [--stable-root-tags] [--open-final-entropy] [--route-s1 N [--route-map F (--materialize-route R|--materialize-routes-dir DIR)]] [--cf-sink F --fc-sink F [--transactional-tu [--selftest-transaction-reject-once TU]]] [--curve-tsv PATH] [--component-curve-tsv PATH]\n",argv[0]); return 2; }
     if(useProjectSource&&!useMixedRegions){fprintf(stderr,"--source-package requires --mixed-regions\n");return 2;}
     if(useKeyMap&&!useMixedRegions){fprintf(stderr,"--key-map and --half-cold-bit require --mixed-regions\n");return 2;}
     if(useCompressedBlobs&&(!useMixedRegions||!useByteArrayLines)){fprintf(stderr,"--compressed-blobs requires --mixed-regions --byte-array-lines\n");return 2;}
@@ -1278,25 +1281,31 @@ int main(int argc,char**argv){
     if(literalGroupWirePath&&!literalGroupPrefix){fprintf(stderr,"--literal-group-wire requires --literal-group-prefix\n");return 2;}
     // Sinks are only meaningful for the message-based path this binding uses; refusing the
     // other paths is better than silently emitting a stream that omits their traffic.
-    if((cfSinkPath||fcSinkPath)&&!(useMixedRegions&&useKeyMap&&useDirectOrdinals)){fprintf(stderr,"the wire sinks require --mixed-regions with --direct-ordinals\n");return 2;}
-    if(sinkCurvePath&&!cfSinkPath){fprintf(stderr,"--sink-curve requires --cf-sink\n");return 2;}
+    const bool materializeAllRoutes=materializeRoutesDirPath!=nullptr;
+    const bool mappedRoutes=routeMapPath!=nullptr;
+    const bool singleMappedRoute=materializeRoute!=SIZE_MAX;
+    if(materializeAllRoutes&&(cfSinkPath||fcSinkPath||sinkCurvePath||selectorTsvPath||curveTsvPath||componentCurveTsvPath)){
+      fprintf(stderr,"--materialize-routes-dir owns every per-route sink and curve pathname\n");return 2;}
+    if((singleMappedRoute||materializeAllRoutes)!=mappedRoutes||(singleMappedRoute&&materializeAllRoutes)){
+      fprintf(stderr,"--route-map requires exactly one of --materialize-route or --materialize-routes-dir\n");return 2;}
+    if(mappedRoutes&&(!routeCount||(singleMappedRoute&&materializeRoute>=routeCount))){fprintf(stderr,"mapped materialization requires --route-s1 N and valid target(s)\n");return 2;}
+    const bool routeSinks=cfSinkPath!=nullptr||materializeAllRoutes;
+    if((cfSinkPath||fcSinkPath||materializeAllRoutes)&&!(useMixedRegions&&useKeyMap&&useDirectOrdinals)){fprintf(stderr,"the wire sinks require --mixed-regions with --direct-ordinals\n");return 2;}
+    if(sinkCurvePath&&!routeSinks){fprintf(stderr,"--sink-curve requires a C-to-F sink\n");return 2;}
     // The full-total closure is measured off the physical stream, so the sinks are not
     // optional in this mode -- without them there is nothing to check the costing against.
-    if(selectorTsvPath&&!cfSinkPath){fprintf(stderr,"--selector-tsv requires --cf-sink/--fc-sink: the totals are measured from the physical stream\n");return 2;}
+    if(selectorTsvPath&&!routeSinks){fprintf(stderr,"--selector-tsv requires physical route sinks: the totals are measured from the physical stream\n");return 2;}
     // Live selection changes the WIRE, so it must never be reachable without the physical
     // streams and the per-TU record that report it.  Without this flag the codec is
     // byte-identical to before, which is what keeps the equivalence gates meaningful.
-    if(liveSelector&&!selectorTsvPath){fprintf(stderr,"--live-selector requires --selector-tsv: a selection nobody records is not a measurement\n");return 2;}
+    if(liveSelector&&!selectorTsvPath&&!materializeAllRoutes){fprintf(stderr,"--live-selector requires a recorded per-route selector curve\n");return 2;}
     if(liveSelector&&!transactionalTu){fprintf(stderr,"--live-selector requires --transactional-tu: selected route state may advance only through close/Ack\n");return 2;}
     if(liveSelector&&usePriorRoot){fprintf(stderr,"--live-selector is incompatible with the prior-Root path\n");return 2;}
     // "Live selection" with no selected-route matcher would be the wrong mode wearing the
     // right name: the transaction that Acks the choice belongs to the route.
-    const bool mappedRoutes=routeMapPath!=nullptr||materializeRoute!=SIZE_MAX;
-    if((routeMapPath==nullptr)!=(materializeRoute==SIZE_MAX)){fprintf(stderr,"--route-map and --materialize-route must be supplied together\n");return 2;}
-    if(mappedRoutes&&(!routeCount||materializeRoute>=routeCount)){fprintf(stderr,"mapped materialization requires --route-s1 N and a target below N\n");return 2;}
-    if(routeCount>1&&!mappedRoutes){fprintf(stderr,"multi-route S1 requires --route-map and --materialize-route\n");return 2;}
+    if(routeCount>1&&!mappedRoutes){fprintf(stderr,"multi-route S1 requires a route map and materializer\n");return 2;}
     if(liveSelector&&routeCount!=1&&!mappedRoutes){fprintf(stderr,"--live-selector requires a materialized selected route\n");return 2;}
-    if(transactionalTu&&(!cfSinkPath||!fcSinkPath)){fprintf(stderr,"--transactional-tu requires both physical wire sinks\n");return 2;}
+    if(transactionalTu&&(!materializeAllRoutes&&(!cfSinkPath||!fcSinkPath))){fprintf(stderr,"--transactional-tu requires both physical wire sinks\n");return 2;}
     if(transactionalTu&&(!useS1||!routeCount||(!mappedRoutes&&routeCount!=1)||!useMixedRegions||!useByteArrayLines||!useDirectOrdinals||
                          !useCompressedBlobs||!useMoFactor||useBlobEagerPatches||!literalOnDemand||!stableRootTags)){
         fprintf(stderr,"--transactional-tu currently binds the measured S1/mixed/direct/BLOB+MO/literal-on-demand active profile\n");return 2;}
@@ -1309,12 +1318,13 @@ int main(int argc,char**argv){
         fprintf(stderr,"the transaction reject/retry selftest is a focused gate, not a selector/replay/build-cost run\n");return 2;}
     if(transactionSelftestTu!=SIZE_MAX&&mappedRoutes){fprintf(stderr,"the transaction reject/retry selftest uses the live one-route matcher\n");return 2;}
     if(sinkBuildTus&&mappedRoutes){fprintf(stderr,"--sink-build-tus is not defined over a sparse route projection\n");return 2;}
-    if(sinkBuildTus&&!cfSinkPath){fprintf(stderr,"--sink-build-tus requires --cf-sink\n");return 2;}
+    if(sinkBuildTus&&!routeSinks){fprintf(stderr,"--sink-build-tus requires a C-to-F sink\n");return 2;}
     if(cfSinkPath&&!fcSinkPath){fprintf(stderr,"--cf-sink requires --fc-sink: the reverse direction is reported, never dropped\n");return 2;}
+    if(fcSinkPath&&!cfSinkPath){fprintf(stderr,"--fc-sink requires --cf-sink: both directions are retained\n");return 2;}
     // Without S1 there are no Blocks and no route matcher, so --route-s1 would exit 0 having
     // gated nothing -- a silent no-op is worse than a refusal.
     if(routeCount&&!useS1){fprintf(stderr,"--route-s1 requires S1; --v1 has no Blocks to share\n");return 2;}
-    if(cfSinkPath&&(warm||replayRepetitions!=1)){fprintf(stderr,"the wire sinks require a single measured pass (no --warm/--replay-repetitions)\n");return 2;}
+    if(routeSinks&&(warm||replayRepetitions!=1)){fprintf(stderr,"the wire sinks require a single measured pass (no --warm/--replay-repetitions)\n");return 2;}
     if(literalGroupWorkers!=1&&!literalGroupPrefix){fprintf(stderr,"--literal-group-workers requires --literal-group-prefix\n");return 2;}
     if(literalGroupPrefix&&(!useMixedRegions||useAlphaLines||useResidualLdm)){fprintf(stderr,"literal groups require ordinary --mixed-regions literal coding\n");return 2;}
     if(stableRootTags&&!useDirectOrdinals){fprintf(stderr,"--stable-root-tags requires --direct-ordinals\n");return 2;}
@@ -1381,22 +1391,33 @@ int main(int argc,char**argv){
     std::vector<size_t>routeForTu;
     std::vector<uint8_t>routeActive(TUs,mappedRoutes?0:1);
     std::vector<uint64_t>routeOrdinal(TUs,0);
+    std::vector<size_t>routeTus(routeCount,0),routeLastTu(routeCount,SIZE_MAX);
+    std::vector<uint64_t>routeRaw(routeCount,0);
     size_t materializedTus=TUs,lastMaterializedTu=TUs?TUs-1:0;
     uint64_t materializedRaw=corpus.raw;
     if(mappedRoutes){
       std::ifstream input(routeMapPath);std::string magic;size_t declaredRoutes=0,declaredTus=0;
       if(!(input>>magic>>declaredRoutes>>declaredTus)||magic!="p29-route-map-v1"||declaredRoutes!=routeCount||declaredTus!=TUs){
         fprintf(stderr,"route map header differs: expected p29-route-map-v1 %zu %zu\n",routeCount,TUs);return 2;}
-      routeForTu.resize(TUs);materializedTus=0;materializedRaw=0;
+      routeForTu.resize(TUs);std::vector<uint64_t>nextOrdinal(routeCount,0);
       for(size_t t=0;t<TUs;++t){
         if(!(input>>routeForTu[t])||routeForTu[t]>=routeCount){fprintf(stderr,"bad route map entry at TU=%zu\n",t);return 2;}
-        if(routeForTu[t]==materializeRoute){routeActive[t]=1;routeOrdinal[t]=materializedTus++;materializedRaw+=corpus.files[t%physicalTUs].len;lastMaterializedTu=t;}
+        const size_t route=routeForTu[t];routeOrdinal[t]=nextOrdinal[route]++;++routeTus[route];
+        routeRaw[route]+=corpus.files[t%physicalTUs].len;routeLastTu[route]=t;
       }
       std::string trailing;if(input>>trailing){fprintf(stderr,"route map has trailing data\n");return 2;}
-      if(!materializedTus){fprintf(stderr,"materialized route %zu has no TUs\n",materializeRoute);return 2;}
+      if(singleMappedRoute){
+        materializedTus=routeTus[materializeRoute];materializedRaw=routeRaw[materializeRoute];lastMaterializedTu=routeLastTu[materializeRoute];
+        if(!materializedTus){fprintf(stderr,"materialized route %zu has no TUs\n",materializeRoute);return 2;}
+        for(size_t t=0;t<TUs;++t)if(routeForTu[t]==materializeRoute)routeActive[t]=1;
+      }else{materializedTus=0;materializedRaw=0;lastMaterializedTu=SIZE_MAX;}
     }
     fprintf(stderr,"loaded+interned %.1fs TUs=%zu raw=%llu physical_tus=%zu physical_raw=%llu unique_tus=%u unique_raw=%llu replay_repetitions=%zu regions=%u region_occ=%zu distinct_lines=%u\n",secs(t0),TUs,(unsigned long long)corpus.raw,physicalTUs,(unsigned long long)physicalRaw,corpus.unique_files,(unsigned long long)corpus.unique_raw,replayRepetitions,NREG,allreg.size(),dict.distinct());
-    if(mappedRoutes)fprintf(stderr,"multi-route projection: routes=%zu target=%zu target_tus=%zu target_raw=%llu\n",routeCount,materializeRoute,materializedTus,(unsigned long long)materializedRaw);
+    if(singleMappedRoute)fprintf(stderr,"multi-route projection: routes=%zu target=%zu target_tus=%zu target_raw=%llu\n",routeCount,materializeRoute,materializedTus,(unsigned long long)materializedRaw);
+    else if(materializeAllRoutes){
+      size_t populated=0;for(size_t count:routeTus)if(count)++populated;
+      fprintf(stderr,"multi-route supervisor: routes=%zu populated=%zu logical_tus=%zu logical_raw=%llu\n",routeCount,populated,TUs,(unsigned long long)corpus.raw);
+    }
     if(entropyRestartTus)fprintf(stderr,"experimental entropy restarts: TUs/segment=%zu segments=%zu (not a product build signal)\n",entropyRestartTus,TUs/entropyRestartTus);
     if(stableRootTags)fprintf(stderr,"stable Root tags: region=2*r block=2*k+1\n");
     if(openFinalEntropy)fprintf(stderr,"open final entropy streams: diagnostic prefix mode (no END bytes)\n");
@@ -1464,7 +1485,7 @@ int main(int argc,char**argv){
             digestPlan(0,t,routeForTu[t],globalPlan);
             const p29::TuPlan routePlan=routes[routeForTu[t]]->admit(regions);
             digestPlan(1,t,routeForTu[t],routePlan);
-            if(routeActive[t])mappedRoutePlans[t]=routePlan;
+            mappedRoutePlans[t]=routePlan;
             if(blockCatalogue.size()>kTagIdLimit){fprintf(stderr,"multi-route Block space exceeds typed tag range at TU=%zu\n",t);return 2;}
             blocksAfterTu[t]=uint32_t(blockCatalogue.size());
           }
@@ -1481,9 +1502,6 @@ int main(int argc,char**argv){
           }
           mappedPlanDigestLo=mix64(mappedPlanDigestLo^TUs^blockCatalogue.size());
           mappedPlanDigestHi=mix64(mappedPlanDigestHi^mappedPlanDigestLo^routeCount);
-          printf("MULTIROUTE_PLAN routes=%zu target=%zu active_tus=%zu blocks=%zu digest=%016llx%016llx\n",
-              routeCount,materializeRoute,materializedTus,blockCatalogue.size(),
-              (unsigned long long)mappedPlanDigestHi,(unsigned long long)mappedPlanDigestLo);
           globalS1.reset();
         }else{
           if(routeCount) routeS1.reset(new p29::OnlineS1(s1cfg,blockCatalogue));
@@ -1499,6 +1517,69 @@ int main(int argc,char**argv){
         blocksAfterTu.assign(TUs,0);   // no S1 means no Blocks at any TU
     }
     if(blocksAfterTu.size()!=TUs||regionsAfterTu.size()!=TUs){fprintf(stderr,"per-TU id-space sizes are incomplete\n");return 2;}
+
+    // The capability runner needs every independent F projection, but repeating the complete
+    // load/interner/global/all-route preparation once per F is neither the deployed topology nor
+    // computationally practical for Firefox.  Prepare once above, then fork one populated route
+    // at a time.  Each child inherits the immutable catalogue and TuPlans read-only through COW,
+    // creates fresh receiver state below, writes only its own files, and exits before the next
+    // route starts.  Sequential children bound peak RAM without changing any physical stream.
+    std::string childRouteDir,childCfSink,childFcSink,childSinkCurve,childSelector,childComponents,childStdout,childStderr;
+    if(materializeAllRoutes){
+      auto ensureDirectory=[](const std::string&path){
+        if(mkdir(path.c_str(),0777)==0)return true;
+        if(errno!=EEXIST){perror(path.c_str());return false;}
+        struct stat st{};if(stat(path.c_str(),&st)!=0||!S_ISDIR(st.st_mode)){fprintf(stderr,"route output path is not a directory: %s\n",path.c_str());return false;}
+        return true;
+      };
+      if(!ensureDirectory(materializeRoutesDirPath))return 2;
+      for(size_t route=0;route<routeCount;++route)if(routeTus[route]){
+        const std::string directory=std::string(materializeRoutesDirPath)+"/C0-F"+std::to_string(route);
+        if(!ensureDirectory(directory))return 2;
+      }
+      bool routeChild=false;size_t completedRoutes=0;int childFailures=0;
+      for(size_t route=0;route<routeCount;++route){
+        if(!routeTus[route])continue;
+        fflush(nullptr);
+        const pid_t child=fork();
+        if(child<0){perror("fork route materializer");childFailures=1;break;}
+        if(child==0){
+          routeChild=true;materializeRoute=route;materializedTus=routeTus[route];materializedRaw=routeRaw[route];lastMaterializedTu=routeLastTu[route];
+          routeActive.assign(TUs,0);for(size_t t=0;t<TUs;++t)if(routeForTu[t]==route)routeActive[t]=1;
+          childRouteDir=std::string(materializeRoutesDirPath)+"/C0-F"+std::to_string(route);
+          childCfSink=childRouteDir+"/p29.c-to-f.bin";childFcSink=childRouteDir+"/p29.f-to-c.bin";
+          childSinkCurve=childRouteDir+"/sink-curve.tsv";childSelector=childRouteDir+"/selector.tsv";
+          childComponents=childRouteDir+"/components.tsv";
+          childStdout=childRouteDir+(sinkReplay?"/replay.stdout":"/encode.stdout");
+          childStderr=childRouteDir+(sinkReplay?"/replay.stderr":"/encode.stderr");
+          if(!freopen(childStdout.c_str(),"w",stdout)){perror(childStdout.c_str());_exit(2);}
+          if(!freopen(childStderr.c_str(),"w",stderr)){perror(childStderr.c_str());_exit(2);}
+          cfSinkPath=childCfSink.c_str();fcSinkPath=childFcSink.c_str();sinkCurvePath=childSinkCurve.c_str();
+          selectorTsvPath=childSelector.c_str();componentCurveTsvPath=childComponents.c_str();
+          fprintf(stderr,"multi-route projection: routes=%zu target=%zu target_tus=%zu target_raw=%llu shared_preparation=parent\n",routeCount,materializeRoute,materializedTus,(unsigned long long)materializedRaw);
+          break;
+        }
+        int status=0;pid_t waited;
+        do{waited=waitpid(child,&status,0);}while(waited<0&&errno==EINTR);
+        if(waited!=child){perror("waitpid route materializer");childFailures=1;break;}
+        ++completedRoutes;
+        if(!WIFEXITED(status)||WEXITSTATUS(status)!=0){
+          if(WIFSIGNALED(status))fprintf(stderr,"route %zu materializer ended on signal %d\n",route,WTERMSIG(status));
+          else fprintf(stderr,"route %zu materializer exited %d\n",route,WEXITSTATUS(status));
+          childFailures=1;
+        }
+      }
+      if(!routeChild){
+        printf("MULTIROUTE_SUPERVISOR routes=%zu completed=%zu blocks=%zu digest=%016llx%016llx status=%s\n",
+            routeCount,completedRoutes,blockCatalogue.size(),
+            (unsigned long long)mappedPlanDigestHi,(unsigned long long)mappedPlanDigestLo,
+            childFailures?"FAIL":"PASS");
+        return childFailures?2:0;
+      }
+    }
+    if(mappedRoutes)printf("MULTIROUTE_PLAN routes=%zu target=%zu active_tus=%zu blocks=%zu digest=%016llx%016llx\n",
+        routeCount,materializeRoute,materializedTus,blockCatalogue.size(),
+        (unsigned long long)mappedPlanDigestHi,(unsigned long long)mappedPlanDigestLo);
 
     // ===== ENCODER (C) + DECODER (F): one cold chronological pass, PULL protocol (root -> MISSING -> FILL) =====
     // C tracks F's known sets (single F) so it computes exactly the missing closure. Every wire byte is

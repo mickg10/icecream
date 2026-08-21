@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Build an exact shared-C P29 physical-ledger JSONL for a multi-F scenario.
 
-Every route run reads the same complete manifest and TU-to-F map, deterministically replays
-one global catalogue plus every ordered route plan, and then materializes only its selected F
-receiver.  The builder requires the global plan digest to match across runs before combining
-their typed directional streams.  Resulting frame slices become the Root/Need/Fill/fallback/
-close/Ack dialogues consumed by ``run_scenario.py``.
+One supervisor reads the complete manifest and TU-to-F map and prepares one global catalogue
+plus every ordered route plan.  It then forks sequential independent F materializers from that
+read-only prepared state.  A second supervisor replays every typed directional stream.  Resulting
+frame slices become the Root/Need/Fill/fallback/close/Ack dialogues consumed by
+``run_scenario.py``.
 """
 
 from __future__ import annotations
@@ -307,6 +307,27 @@ def shared_plan_record(output: str) -> dict[str, object]:
     }
 
 
+def shared_supervisor_record(output: str) -> dict[str, object]:
+    matches = re.findall(
+        r"^MULTIROUTE_SUPERVISOR routes=(\d+) completed=(\d+) blocks=(\d+) "
+        r"digest=([0-9a-f]{32}) status=(PASS|FAIL)$",
+        output,
+        re.MULTILINE,
+    )
+    if len(matches) != 1:
+        raise RuntimeError(
+            "P29 output does not contain exactly one multi-route supervisor record"
+        )
+    routes, completed, blocks, digest, status = matches[0]
+    return {
+        "routes": int(routes),
+        "completed": int(completed),
+        "blocks": int(blocks),
+        "digest": digest,
+        "status": status,
+    }
+
+
 def build_ledger(
     scenario_path: Path,
     codec: Path,
@@ -340,8 +361,48 @@ def build_ledger(
         if [entry.rel_seq for entry in route] != list(range(len(route))):
             raise AssertionError(f"P29 F{worker} projection is not contiguous")
 
-    shared_digest: str | None = None
-    shared_blocks: int | None = None
+    for worker in by_worker:
+        (work / f"C0-F{worker}").mkdir(parents=True, exist_ok=True)
+    common = [
+        str(codec.resolve()),
+        "--manifest",
+        str(manifest),
+        *P29_OPTIONS,
+        "--route-s1",
+        str(worker_count),
+        "--route-map",
+        str(route_map),
+        "--materialize-routes-dir",
+        str(work),
+        *extra_options,
+    ]
+    encode_supervisor_stdout = work / "encode-supervisor.stdout"
+    encode_supervisor_stderr = work / "encode-supervisor.stderr"
+    checked_run(common, encode_supervisor_stdout, encode_supervisor_stderr)
+    supervisor = shared_supervisor_record(
+        encode_supervisor_stdout.read_text(errors="replace")
+    )
+    if (
+        supervisor["routes"] != worker_count
+        or supervisor["completed"] != len(by_worker)
+        or supervisor["status"] != "PASS"
+    ):
+        raise RuntimeError("P29 encode supervisor did not complete every populated route")
+    replay_supervisor_stdout = work / "replay-supervisor.stdout"
+    replay_supervisor_stderr = work / "replay-supervisor.stderr"
+    checked_run(
+        [*common, "--sink-replay"],
+        replay_supervisor_stdout,
+        replay_supervisor_stderr,
+    )
+    replay_supervisor = shared_supervisor_record(
+        replay_supervisor_stdout.read_text(errors="replace")
+    )
+    if replay_supervisor != supervisor:
+        raise RuntimeError("P29 replay supervisor changed the shared-C plan")
+
+    shared_digest = str(supervisor["digest"])
+    shared_blocks = int(supervisor["blocks"])
     route_metadata: dict[str, object] = {}
     ledger_by_item: dict[tuple[str, int, int], dict[str, object]] = {}
     payload_digests: dict[Path, str] = {}
@@ -355,38 +416,12 @@ def build_ledger(
     for worker, route in sorted(by_worker.items()):
         route_name = f"C0-F{worker}"
         route_directory = work / route_name
-        route_directory.mkdir(parents=True, exist_ok=True)
         c_sink = route_directory / "p29.c-to-f.bin"
         f_sink = route_directory / "p29.f-to-c.bin"
         curve = route_directory / "sink-curve.tsv"
         selector = route_directory / "selector.tsv"
         components = route_directory / "components.tsv"
-        common = [
-            str(codec.resolve()),
-            "--manifest",
-            str(manifest),
-            *P29_OPTIONS,
-            "--route-s1",
-            str(worker_count),
-            "--route-map",
-            str(route_map),
-            "--materialize-route",
-            str(worker),
-            *extra_options,
-            "--selector-tsv",
-            str(selector),
-            "--sink-curve",
-            str(curve),
-            "--component-curve-tsv",
-            str(components),
-            "--cf-sink",
-            str(c_sink),
-            "--fc-sink",
-            str(f_sink),
-        ]
         encode_stdout = route_directory / "encode.stdout"
-        encode_stderr = route_directory / "encode.stderr"
-        checked_run(common, encode_stdout, encode_stderr)
         encode_text = encode_stdout.read_text(errors="replace")
         for marker in required_markers:
             if marker not in encode_text:
@@ -398,15 +433,10 @@ def build_ledger(
             or plan["active_tus"] != len(route)
         ):
             raise RuntimeError(f"P29 F{worker} plan record differs from its projection")
-        if shared_digest is None:
-            shared_digest = str(plan["digest"])
-            shared_blocks = int(plan["blocks"])
-        elif plan["digest"] != shared_digest or plan["blocks"] != shared_blocks:
-            raise RuntimeError("P29 route runs produced different shared-C plans")
+        if plan["digest"] != shared_digest or plan["blocks"] != shared_blocks:
+            raise RuntimeError("P29 route child differs from its shared-C supervisor")
 
         replay_stdout = route_directory / "replay.stdout"
-        replay_stderr = route_directory / "replay.stderr"
-        checked_run([*common, "--sink-replay"], replay_stdout, replay_stderr)
         replay_text = replay_stdout.read_text(errors="replace")
         if "SINK REPLAY OK:" not in replay_text or "byte-exact=OK" not in replay_text:
             raise RuntimeError(f"P29 F{worker} directional replay was not exact")
@@ -527,8 +557,8 @@ def build_ledger(
         str(worker_count),
         "--route-map",
         str(route_map),
-        "--materialize-route",
-        "F",
+        "--materialize-routes-dir",
+        str(work),
         *extra_options,
     ]
     descriptor = {
@@ -546,6 +576,14 @@ def build_ledger(
         "route_map_sha256": sha256(route_map),
         "shared_plan_digest": shared_digest,
         "shared_block_count": shared_blocks,
+        "materializer": {
+            "encode_shared_preparations": 1,
+            "replay_shared_preparations": 1,
+            "populated_route_children_per_pass": len(by_worker),
+            "route_execution": "sequential fork children from read-only prepared state",
+            "encode_supervisor_stdout_sha256": sha256(encode_supervisor_stdout),
+            "replay_supervisor_stdout_sha256": sha256(replay_supervisor_stdout),
+        },
         "directional_streams": {
             "c_to_f": {"bytes": c_total},
             "f_to_c": {"bytes": f_total},
@@ -555,10 +593,10 @@ def build_ledger(
             "status": "pass",
             "method": "per-route codec byte comparison plus typed directional sink replay; shared plan digests equal",
         },
-        "codec_cpu": "measured by route materializer runs, not scheduled in this ledger revision",
+        "codec_cpu": "measured by one preparation supervisor plus sequential route children, not scheduled in this ledger revision",
         "limitations": [
             "one C authority",
-            "the deterministic shared catalogue/plan preparation is replayed per output route and digest-checked; its bytes and state are counted once logically",
+            "encode and replay each prepare one physical shared catalogue/all-route plan, then fork sequential independent route materializers",
             "route dialogue window fixed at one committed transaction",
         ],
     }
