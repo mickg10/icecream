@@ -36,4 +36,5 @@ EXTRA_DIST = \
 	iceccd.adoc \
 	icecc-scheduler.adoc \
 	icecc-create-env.adoc \
-	icecream.adoc
+	icecream.adoc \
+	issue16-strategic-plan.md
