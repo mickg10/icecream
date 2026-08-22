@@ -1074,6 +1074,148 @@ void test_normal_zero_and_completion_stamps() {
     require_trace(actions, "normal/zero completion trace");
 }
 
+enum class CompletionStampField {
+    Actor,
+    Operation,
+    CStoreGuid,
+    FStoreGuid,
+    SessionSerial,
+    HistoryNonce,
+    RelSeq,
+    TuSeq,
+    TransactionDigest,
+    RawDigest,
+    TransactionBound,
+};
+
+void change_completion_field(CompletionStamp& stamp, CompletionStampField field) {
+    switch (field) {
+    case CompletionStampField::Actor:
+        stamp.actor = stamp.actor == ActorSide::C ? ActorSide::F : ActorSide::C;
+        break;
+    case CompletionStampField::Operation:
+        stamp.operation = stamp.operation == AsyncOperationKind::WriteFragment
+                              ? AsyncOperationKind::ReadPayload
+                              : AsyncOperationKind::WriteFragment;
+        break;
+    case CompletionStampField::CStoreGuid:
+        stamp.c_store_guid.bytes[0] ^= 0x80;
+        break;
+    case CompletionStampField::FStoreGuid:
+        stamp.f_store_guid.bytes[0] ^= 0x80;
+        break;
+    case CompletionStampField::SessionSerial:
+        ++stamp.session_serial;
+        break;
+    case CompletionStampField::HistoryNonce:
+        ++stamp.history_nonce.value;
+        break;
+    case CompletionStampField::RelSeq:
+        ++stamp.rel_seq.value;
+        break;
+    case CompletionStampField::TuSeq:
+        ++stamp.tu_seq.value;
+        break;
+    case CompletionStampField::TransactionDigest:
+        stamp.transaction_digest.bytes[0] ^= 0x80;
+        break;
+    case CompletionStampField::RawDigest:
+        stamp.raw_digest.bytes[0] ^= 0x80;
+        break;
+    case CompletionStampField::TransactionBound:
+        stamp.transaction_bound = !stamp.transaction_bound;
+        break;
+    }
+}
+
+void test_completion_stamp_correspondence() {
+    const std::array fields{
+        std::pair{CompletionStampField::Actor, "actor"},
+        std::pair{CompletionStampField::Operation, "operation"},
+        std::pair{CompletionStampField::CStoreGuid, "C_STORE_GUID"},
+        std::pair{CompletionStampField::FStoreGuid, "F_STORE_GUID"},
+        std::pair{CompletionStampField::SessionSerial, "session serial"},
+        std::pair{CompletionStampField::HistoryNonce, "HISTORY_NONCE"},
+        std::pair{CompletionStampField::RelSeq, "REL_SEQ"},
+        std::pair{CompletionStampField::TuSeq, "TU_SEQ"},
+        std::pair{CompletionStampField::TransactionDigest, "transaction digest"},
+        std::pair{CompletionStampField::RawDigest, "raw digest"},
+        std::pair{CompletionStampField::TransactionBound, "transaction-bound flag"},
+    };
+
+    uint64_t identity = 3000;
+    for (const ActorSide actor : {ActorSide::C, ActorSide::F}) {
+        const AsyncOperationKind target = actor == ActorSide::C
+                                              ? AsyncOperationKind::WriteFragment
+                                              : AsyncOperationKind::ReadPayload;
+        for (const auto& [field, name] : fields) {
+            const CompletionStampField selected_field = field;
+            const std::string_view field_name = name;
+            P50ServerEndpoint server(Id128::from_u64(identity++));
+            TestClient client(Id128::from_u64(identity++));
+            const std::vector<uint8_t> input = pseudo_random_bytes(4096);
+            bool changed = false;
+            EndpointIoControl client_control;
+            EndpointIoControl server_control;
+            EndpointIoControl& selected =
+                actor == ActorSide::C ? client_control : server_control;
+            selected.before_completion_check = [&](CompletionStamp& observed) {
+                if (changed || observed.actor != actor ||
+                    observed.operation != target || !observed.transaction_bound)
+                    return;
+                change_completion_field(observed, selected_field);
+                changed = true;
+            };
+
+            const PairResult rejected = run_pair(client, server, admit(client, input),
+                                                 client_control, server_control);
+            std::string context = actor == ActorSide::C ? "C " : "F ";
+            context.append(field_name);
+            require(changed, context + " completion mutation did not run");
+            require(rejected.client.status == ClientRunStatus::Disconnected &&
+                        rejected.server.status == ServerRunStatus::Disconnected &&
+                        client.has_active_transaction() &&
+                        !server.committed_input(client.c_store_guid()),
+                    context + " completion mutation was not rejected exactly");
+
+            const PairResult replayed = run_pair(client, server);
+            require(replayed.client.status == ClientRunStatus::Committed &&
+                        replayed.server.status == ServerRunStatus::Completed &&
+                        replayed.client.reconnect == EndpointReconnectOutcome::ExactMatch &&
+                        !client.has_active_transaction() &&
+                        server.committed_input(client.c_store_guid()) == input,
+                    context + " completion rejection did not permit exact follow-up");
+        }
+    }
+
+    P50ServerEndpoint server(Id128::from_u64(identity++));
+    TestClient client(Id128::from_u64(identity++));
+    bool saw_unbound_c = false;
+    bool saw_unbound_f = false;
+    EndpointIoControl client_control;
+    EndpointIoControl server_control;
+    client_control.before_completion_check = [&](CompletionStamp& observed) {
+        saw_unbound_c = saw_unbound_c ||
+                        (observed.actor == ActorSide::C && !observed.transaction_bound);
+    };
+    server_control.before_completion_check = [&](CompletionStamp& observed) {
+        saw_unbound_f = saw_unbound_f ||
+                        (observed.actor == ActorSide::F && !observed.transaction_bound);
+    };
+    const std::vector<uint8_t> first_input = pseudo_random_bytes(1024);
+    const PairResult first = run_pair(client, server, admit(client, first_input),
+                                      client_control, server_control);
+    require(first.client.status == ClientRunStatus::Committed && saw_unbound_c && saw_unbound_f,
+            "legal non-transaction completions did not complete on both endpoints");
+    const std::vector<uint8_t> second_input = pseudo_random_bytes(1536);
+    const PairResult follow_up = run_pair(client, server, admit(client, second_input));
+    require(follow_up.client.status == ClientRunStatus::Committed &&
+                follow_up.server.status == ServerRunStatus::Completed &&
+                follow_up.client.reconnect == EndpointReconnectOutcome::ExactMatch &&
+                server.committed_input(client.c_store_guid()) == second_input,
+            "legal non-transaction completions did not preserve exact follow-up");
+}
+
 void test_idempotent_prepare_admission() {
     TestClient client(Id128::from_u64(150));
     const PrepareRequestKey request{7, 91};
@@ -2285,6 +2427,7 @@ int main(int argc, char** argv) {
     if (argc > 2 || (argc == 2 && !performance_gate))
         fail("usage: p50endpoint [--performance]");
     test_normal_zero_and_completion_stamps();
+    test_completion_stamp_correspondence();
     test_idempotent_prepare_admission();
     test_fragmentation_at_every_control_and_body_boundary();
     test_exact_replay_and_lost_final();

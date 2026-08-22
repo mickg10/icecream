@@ -77,7 +77,9 @@ struct EndpointIoControl {
     std::optional<MessageType> close_after_write;
     std::optional<AsyncOperationKind> wrong_digest_completion;
     std::optional<AsyncOperationKind> wrong_raw_digest_completion;
-    std::function<void(const CompletionStamp&)> before_completion_check;
+    // Receives only the observed test copy; the endpoint retains and checks
+    // its independently frozen pre-await completion stamp.
+    std::function<void(CompletionStamp&)> before_completion_check;
 };
 
 struct PrepareRequestKey {
