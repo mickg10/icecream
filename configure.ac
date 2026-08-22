@@ -214,6 +214,11 @@ AC_LINK_IFELSE([AC_LANG_PROGRAM([[
         context.poll();
         return 0;
     ]])], [
+        # No Boost archive participates in product links on the header-only
+        # Boost.System path.  Keep the prefix library directory confined to
+        # this feature probe so it cannot redirect unrelated dependencies of
+        # a target that consumes only the Boost headers.
+        BOOST_LDFLAGS=
         AC_MSG_RESULT([yes (header-only Boost.System)])
     ], [
         LIBS="-lboost_system $icecc_boost_save_LIBS"

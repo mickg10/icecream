@@ -119,12 +119,13 @@ done
         --with-boost="$icecc_test_prefix"
 )
 
-# BOOST_LDFLAGS must remember the explicit prefix for a future target, while
-# the ordinary CPPFLAGS and LDFLAGS contracts must not inherit it.
+# This probe selects header-only Boost.System, so only BOOST_CPPFLAGS may retain
+# the explicit prefix.  No product link needs the Boost library directory.
 grep -F "BOOST_CPPFLAGS='-isystem $icecc_test_prefix/include " \
     "$icecc_test_build/config.log" >/dev/null
-grep -F "BOOST_LDFLAGS='-L$icecc_test_prefix/lib'" \
+grep -F "BOOST_LDFLAGS=''" \
     "$icecc_test_build/config.log" >/dev/null
+grep -F "BOOST_LIBS=''" "$icecc_test_build/config.log" >/dev/null
 if grep "^CPPFLAGS='.*-isystem $icecc_test_prefix/include" \
         "$icecc_test_build/config.log" >/dev/null; then
     echo "ordinary CPPFLAGS inherited the Boost prefix" >&2
@@ -141,14 +142,6 @@ if ! icecc_run_make -C "$icecc_test_build" -j2 V=1 all \
     cat "$icecc_test_root/build.log" >&2
     exit 1
 fi
-# The full product build above has already proved that ordinary targets do not
-# resolve lzo or Zstd through the Boost prefix.  The endpoint test deliberately
-# does receive BOOST_LDFLAGS and also links those two real dependencies, so its
-# intended link would otherwise select the incomplete probe archives.  Retain
-# the unrelated libarchive probe and remove only the endpoint's dependencies
-# before checking the endpoint-specific Boost path.
-rm -f "$icecc_test_prefix/lib/liblzo2.a" \
-    "$icecc_test_prefix/lib/libzstd.a"
 if ! icecc_run_make -C "$icecc_test_build/unittests" -j2 V=1 p50endpoint \
         >> "$icecc_test_root/build.log" 2>&1; then
     cat "$icecc_test_root/build.log" >&2
@@ -160,16 +153,11 @@ if ! grep -F -- "-isystem $icecc_test_prefix/include" \
     echo "the P50 endpoint consumers did not receive BOOST_CPPFLAGS" >&2
     exit 1
 fi
-if ! grep -F -- "-L$icecc_test_prefix/lib" \
-        "$icecc_test_root/build.log" | grep -F 'p50endpoint' >/dev/null; then
-    echo "the P50 endpoint link did not receive BOOST_LDFLAGS" >&2
-    exit 1
-fi
 if grep -F -- "-isystem $icecc_test_prefix/include" \
         "$icecc_test_root/build.log" | grep -Ev \
         'libp50endpoint_a-|p50endpoint-p50_endpoint_test' >/dev/null || \
         grep -F -- "-L$icecc_test_prefix/lib" \
-        "$icecc_test_root/build.log" | grep -Fv 'p50endpoint' >/dev/null; then
-    echo "a non-endpoint build target inherited the Boost prefix" >&2
+        "$icecc_test_root/build.log" >/dev/null; then
+    echo "a build target inherited the unused Boost library prefix" >&2
     exit 1
 fi
