@@ -58,6 +58,54 @@ CompletionStamp completion_for_test(CompletionStamp stamp, EndpointIoControl& co
     return stamp;
 }
 
+void bind_live_identity(CompletionLiveIdentity& identity, const TxBegin& begin) {
+    identity.history_nonce = begin.history_nonce;
+    identity.rel_seq = begin.rel_seq;
+    identity.tu_seq = begin.tu_seq;
+    identity.transaction_digest = begin.transaction_digest;
+    identity.raw_digest = begin.raw_digest;
+    identity.transaction_bound = true;
+}
+
+void bind_live_identity(CompletionLiveIdentity& identity, const TxCommit& commit) {
+    identity.history_nonce = commit.history_nonce;
+    identity.rel_seq = commit.rel_seq;
+    identity.tu_seq = commit.tu_seq;
+    identity.transaction_digest = commit.transaction_digest;
+    identity.raw_digest = commit.raw_digest;
+    identity.transaction_bound = true;
+}
+
+void require_observed_completion(const CompletionStamp& expected,
+                                 const CompletionStamp& observed) {
+    if (observed != expected)
+        throw StaleCompletion();
+}
+
+void require_live_completion(const CompletionStamp& expected,
+                             const CompletionLiveIdentity& live) {
+    if (expected.actor != live.actor)
+        throw StaleCompletion();
+    if (expected.c_store_guid != live.c_store_guid)
+        throw StaleCompletion();
+    if (expected.f_store_guid != live.f_store_guid)
+        throw StaleCompletion();
+    if (expected.session_serial != live.session_serial)
+        throw StaleCompletion();
+    if (expected.history_nonce != live.history_nonce)
+        throw StaleCompletion();
+    if (expected.rel_seq != live.rel_seq)
+        throw StaleCompletion();
+    if (expected.tu_seq != live.tu_seq)
+        throw StaleCompletion();
+    if (expected.transaction_digest != live.transaction_digest)
+        throw StaleCompletion();
+    if (expected.raw_digest != live.raw_digest)
+        throw StaleCompletion();
+    if (expected.transaction_bound != live.transaction_bound)
+        throw StaleCompletion();
+}
+
 ErrorMessage bounded_error(uint16_t code, std::string_view detail, uint32_t payload_cap) {
     if (payload_cap < 6)
         throw std::invalid_argument("ERROR frame cap cannot carry its fixed fields");
@@ -591,34 +639,22 @@ struct P50ClientEndpoint::Impl {
         return result;
     }
 
-    void require_completion(const Session& session, const CompletionStamp& expected,
-                            const CompletionStamp& observed) const {
-        if (observed != expected)
-            throw StaleCompletion();
-        const CompletionStamp& completion = expected;
-        if (completion.actor != ActorSide::C || completion.c_store_guid != c_guid ||
-            active_session != completion.session_serial ||
-            completion.session_serial != session.serial)
-            throw StaleCompletion();
-        if (completion.f_store_guid != session.f_guid.value_or(FStoreGuid{}))
-            throw StaleCompletion();
-        if (completion.transaction_bound) {
-            if (!active || completion.history_nonce != active->begin.history_nonce ||
-                completion.rel_seq != active->begin.rel_seq ||
-                completion.tu_seq != active->begin.tu_seq ||
-                completion.transaction_digest != active->begin.transaction_digest ||
-                completion.raw_digest != active->begin.raw_digest)
-                throw StaleCompletion();
-        } else if (completion.history_nonce.value != 0) {
-            if (session.provisional_nonce) {
-                if (completion.history_nonce != *session.provisional_nonce ||
-                    completion.rel_seq != session.provisional_rel)
-                    throw StaleCompletion();
-            } else if (!route_known || completion.history_nonce != history_nonce ||
-                       completion.rel_seq != next_rel) {
-                throw StaleCompletion();
-            }
+    CompletionLiveIdentity live_identity(const Session& session) const {
+        CompletionLiveIdentity result;
+        result.actor = ActorSide::C;
+        result.c_store_guid = c_guid;
+        result.f_store_guid = session.f_guid.value_or(FStoreGuid{});
+        result.session_serial = active_session;
+        if (session.provisional_nonce) {
+            result.history_nonce = *session.provisional_nonce;
+            result.rel_seq = session.provisional_rel;
+        } else if (active) {
+            bind_live_identity(result, active->begin);
+        } else if (route_known) {
+            result.history_nonce = history_nonce;
+            result.rel_seq = next_rel;
         }
+        return result;
     }
 
     void record(ActionType action, const TxBegin& begin, uint64_t serial,
@@ -850,62 +886,40 @@ struct P50ServerEndpoint::Impl {
         return result;
     }
 
-    void require_completion(const CompletionStamp& expected,
-                            const CompletionStamp& observed) const {
-        if (observed != expected)
-            throw StaleCompletion();
-        const CompletionStamp& completion = expected;
-        if (completion.actor != ActorSide::F || completion.f_store_guid != f_guid)
-            throw StaleCompletion();
-        const auto live = live_sessions.find(completion.session_serial);
-        if (live == live_sessions.end() || live->second.f_guid != completion.f_store_guid)
-            throw StaleCompletion();
-        const LiveSession& current = live->second;
-        if (completion.c_store_guid == CStoreGuid{}) {
-            if (current.c_guid || completion.transaction_bound ||
-                completion.history_nonce.value != 0)
-                throw StaleCompletion();
-            return;
-        }
-        if (!current.c_guid || completion.c_store_guid != *current.c_guid)
-            throw StaleCompletion();
+    CompletionLiveIdentity live_identity(const Session& session,
+                                         const CompletionStamp& expected) const {
+        require_incarnation(session);
+        const LiveSession& current = live_sessions.at(session.serial);
+        CompletionLiveIdentity result;
+        result.actor = ActorSide::F;
+        result.c_store_guid = current.c_guid.value_or(CStoreGuid{});
+        result.f_store_guid = f_guid;
+        result.session_serial = session.serial;
+        if (!current.c_guid)
+            return result;
         if (!current.activated) {
-            const auto revision = revisions.find(completion.c_store_guid);
+            const auto revision = revisions.find(*current.c_guid);
             if (revision == revisions.end() || revision->second.exhausted ||
-                revision->second.value != current.candidate_revision ||
-                completion.transaction_bound ||
-                completion.history_nonce != current.candidate_nonce ||
-                completion.rel_seq != current.candidate_rel)
+                revision->second.value != current.candidate_revision)
                 throw StaleCompletion();
-            return;
+            result.history_nonce = current.candidate_nonce;
+            result.rel_seq = current.candidate_rel;
+            return result;
         }
-        const auto position = namespaces.find(completion.c_store_guid);
-        if (position == namespaces.end() ||
-            position->second.active_session != completion.session_serial)
+        if (!session.c_guid || *session.c_guid != *current.c_guid || !session.activated)
             throw StaleCompletion();
-        const Namespace& space = position->second;
-        if (completion.transaction_bound) {
-            const TxBegin* begin = nullptr;
-            if (space.route && space.route->pending)
-                begin = &space.route->pending->begin;
-            if (!begin && space.route && space.route->last_commit) {
-                const TxCommit& commit = *space.route->last_commit;
-                if (commit.history_nonce == completion.history_nonce &&
-                    commit.rel_seq == completion.rel_seq && commit.tu_seq == completion.tu_seq &&
-                    commit.transaction_digest == completion.transaction_digest &&
-                    commit.raw_digest == completion.raw_digest)
-                    return;
-            }
-            if (!begin || begin->history_nonce != completion.history_nonce ||
-                begin->rel_seq != completion.rel_seq || begin->tu_seq != completion.tu_seq ||
-                begin->transaction_digest != completion.transaction_digest ||
-                begin->raw_digest != completion.raw_digest)
-                throw StaleCompletion();
-        } else if (completion.history_nonce.value != 0 &&
-                   (!space.route || space.route->nonce != completion.history_nonce ||
-                    space.route->next_rel != completion.rel_seq)) {
-            throw StaleCompletion();
+        const Namespace& space = require(session);
+        if (!space.route)
+            return result;
+        const Route& route = *space.route;
+        result.history_nonce = route.nonce;
+        result.rel_seq = route.next_rel;
+        if (route.pending) {
+            bind_live_identity(result, route.pending->begin);
+        } else if (expected.transaction_bound && route.last_commit) {
+            bind_live_identity(result, *route.last_commit);
         }
+        return result;
     }
 
     void record(ActionType action, const Session& session, const TxBegin* begin = nullptr,
@@ -1287,7 +1301,11 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run(tcp::endpoint rem
         if (control.before_completion_check)
             control.before_completion_check(observed);
         observed = completion_for_test(observed, control);
-        impl_->require_completion(session, expected, observed);
+        require_observed_completion(expected, observed);
+        CompletionLiveIdentity live = impl_->live_identity(session);
+        if (control.before_live_identity_check)
+            control.before_live_identity_check(expected, live);
+        require_live_completion(expected, live);
     };
     try {
         co_await async_connect(socket, remote, impl_->stamp(session, AsyncOperationKind::Connect),
@@ -1508,7 +1526,11 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::accept_one(tcp::accep
         if (control.before_completion_check)
             control.before_completion_check(observed);
         observed = completion_for_test(observed, control);
-        impl_->require_completion(expected, observed);
+        require_observed_completion(expected, observed);
+        CompletionLiveIdentity live = impl_->live_identity(session, expected);
+        if (control.before_live_identity_check)
+            control.before_live_identity_check(expected, live);
+        require_live_completion(expected, live);
     };
     std::optional<ErrorMessage> terminal_error;
     try {

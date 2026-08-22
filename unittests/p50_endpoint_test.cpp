@@ -1128,6 +1128,44 @@ void change_completion_field(CompletionStamp& stamp, CompletionStampField field)
     }
 }
 
+void change_live_identity_field(CompletionLiveIdentity& identity,
+                                CompletionStampField field) {
+    switch (field) {
+    case CompletionStampField::Actor:
+        identity.actor = identity.actor == ActorSide::C ? ActorSide::F : ActorSide::C;
+        break;
+    case CompletionStampField::Operation:
+        fail("operation is not part of the live endpoint identity");
+    case CompletionStampField::CStoreGuid:
+        identity.c_store_guid.bytes[0] ^= 0x80;
+        break;
+    case CompletionStampField::FStoreGuid:
+        identity.f_store_guid.bytes[0] ^= 0x80;
+        break;
+    case CompletionStampField::SessionSerial:
+        ++identity.session_serial;
+        break;
+    case CompletionStampField::HistoryNonce:
+        ++identity.history_nonce.value;
+        break;
+    case CompletionStampField::RelSeq:
+        ++identity.rel_seq.value;
+        break;
+    case CompletionStampField::TuSeq:
+        ++identity.tu_seq.value;
+        break;
+    case CompletionStampField::TransactionDigest:
+        identity.transaction_digest.bytes[0] ^= 0x80;
+        break;
+    case CompletionStampField::RawDigest:
+        identity.raw_digest.bytes[0] ^= 0x80;
+        break;
+    case CompletionStampField::TransactionBound:
+        identity.transaction_bound = !identity.transaction_bound;
+        break;
+    }
+}
+
 void test_completion_stamp_correspondence() {
     const std::array fields{
         std::pair{CompletionStampField::Actor, "actor"},
@@ -1214,6 +1252,107 @@ void test_completion_stamp_correspondence() {
                 follow_up.client.reconnect == EndpointReconnectOutcome::ExactMatch &&
                 server.committed_input(client.c_store_guid()) == second_input,
             "legal non-transaction completions did not preserve exact follow-up");
+}
+
+void test_completion_live_identity_correspondence() {
+    const std::array fields{
+        std::pair{CompletionStampField::Actor, "actor"},
+        std::pair{CompletionStampField::CStoreGuid, "C_STORE_GUID"},
+        std::pair{CompletionStampField::FStoreGuid, "F_STORE_GUID"},
+        std::pair{CompletionStampField::SessionSerial, "session serial"},
+        std::pair{CompletionStampField::HistoryNonce, "HISTORY_NONCE"},
+        std::pair{CompletionStampField::RelSeq, "REL_SEQ"},
+        std::pair{CompletionStampField::TuSeq, "TU_SEQ"},
+        std::pair{CompletionStampField::TransactionDigest, "transaction digest"},
+        std::pair{CompletionStampField::RawDigest, "raw digest"},
+        std::pair{CompletionStampField::TransactionBound, "transaction-bound state"},
+    };
+
+    uint64_t identity = 4000;
+    size_t rejection_gaps = 0;
+    for (const ActorSide actor : {ActorSide::C, ActorSide::F}) {
+        const AsyncOperationKind target = actor == ActorSide::C
+                                              ? AsyncOperationKind::WriteFragment
+                                              : AsyncOperationKind::ReadPayload;
+        for (const auto& [field, name] : fields) {
+            const CompletionStampField selected_field = field;
+            const std::string_view field_name = name;
+            P50ServerEndpoint server(Id128::from_u64(identity++));
+            TestClient client(Id128::from_u64(identity++));
+            const std::vector<uint8_t> input = pseudo_random_bytes(4096);
+            bool changed = false;
+            EndpointIoControl client_control;
+            EndpointIoControl server_control;
+            EndpointIoControl& selected =
+                actor == ActorSide::C ? client_control : server_control;
+            selected.before_live_identity_check =
+                [&](const CompletionStamp& expected, CompletionLiveIdentity& live) {
+                    if (changed || expected.actor != actor ||
+                        expected.operation != target || !expected.transaction_bound)
+                        return;
+                    change_live_identity_field(live, selected_field);
+                    changed = true;
+                };
+
+            const PairResult rejected = run_pair(client, server, admit(client, input),
+                                                 client_control, server_control);
+            std::string context = actor == ActorSide::C ? "C live " : "F live ";
+            context.append(field_name);
+            require(changed, context + " mutation did not run");
+            const bool rejected_exactly =
+                rejected.client.status == ClientRunStatus::Disconnected &&
+                rejected.server.status == ServerRunStatus::Disconnected &&
+                client.has_active_transaction() &&
+                !server.committed_input(client.c_store_guid());
+            if (!rejected_exactly) {
+                std::cerr << "p50_endpoint_test: " << context
+                          << " mutation was not rejected exactly\n";
+                ++rejection_gaps;
+                continue;
+            }
+
+            const PairResult replayed = run_pair(client, server);
+            require(replayed.client.status == ClientRunStatus::Committed &&
+                        replayed.server.status == ServerRunStatus::Completed &&
+                        replayed.client.reconnect == EndpointReconnectOutcome::ExactMatch &&
+                        !client.has_active_transaction() &&
+                        server.committed_input(client.c_store_guid()) == input,
+                    context + " rejection did not permit exact follow-up");
+        }
+    }
+    require(rejection_gaps == 0,
+            "one or more live identity mutations were not rejected exactly");
+
+    P50ServerEndpoint server(Id128::from_u64(identity++));
+    TestClient client(Id128::from_u64(identity++));
+    bool saw_unbound_c = false;
+    bool saw_unbound_f = false;
+    EndpointIoControl client_control;
+    EndpointIoControl server_control;
+    client_control.before_live_identity_check =
+        [&](const CompletionStamp& expected, CompletionLiveIdentity& live) {
+            saw_unbound_c = saw_unbound_c ||
+                            (expected.actor == ActorSide::C &&
+                             !expected.transaction_bound && !live.transaction_bound);
+        };
+    server_control.before_live_identity_check =
+        [&](const CompletionStamp& expected, CompletionLiveIdentity& live) {
+            saw_unbound_f = saw_unbound_f ||
+                            (expected.actor == ActorSide::F &&
+                             !expected.transaction_bound && !live.transaction_bound);
+        };
+    const std::vector<uint8_t> first_input = pseudo_random_bytes(1024);
+    const PairResult first = run_pair(client, server, admit(client, first_input),
+                                      client_control, server_control);
+    require(first.client.status == ClientRunStatus::Committed && saw_unbound_c && saw_unbound_f,
+            "legal unbound live identities did not complete on both endpoints");
+    const std::vector<uint8_t> second_input = pseudo_random_bytes(1536);
+    const PairResult follow_up = run_pair(client, server, admit(client, second_input));
+    require(follow_up.client.status == ClientRunStatus::Committed &&
+                follow_up.server.status == ServerRunStatus::Completed &&
+                follow_up.client.reconnect == EndpointReconnectOutcome::ExactMatch &&
+                server.committed_input(client.c_store_guid()) == second_input,
+            "legal unbound live identities did not preserve exact follow-up");
 }
 
 void test_idempotent_prepare_admission() {
@@ -2428,6 +2567,7 @@ int main(int argc, char** argv) {
         fail("usage: p50endpoint [--performance]");
     test_normal_zero_and_completion_stamps();
     test_completion_stamp_correspondence();
+    test_completion_live_identity_correspondence();
     test_idempotent_prepare_admission();
     test_fragmentation_at_every_control_and_body_boundary();
     test_exact_replay_and_lost_final();
