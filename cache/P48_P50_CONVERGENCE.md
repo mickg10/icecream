@@ -35,7 +35,8 @@ merge base, so every transplanted layer and resolution is recorded below.
 | convergence-only | `35a1608a` | endpoint-target Boost flags and P48 scope-gate registration |
 | convergence-only | `f28822bc` | nested package-discovery forwarding for the P48 scope gate |
 | convergence-only | `5be4a497` | preserve default pkg-config directories in the nested scope gate |
-| convergence-only | `563683e8` | separate endpoint dependency links from completed scope decoys |
+| convergence-only | `563683e8` | intermediate endpoint/scope interaction diagnosis, superseded below |
+| convergence-only | `3d13542a` | omit an unused Boost library path on the header-only endpoint path |
 
 The M1 core consumes the header-only OnlineS1 implementation, and the M0 layout census reads
 two retained measurement inputs. Only these missing dependencies came from the source tree:
@@ -59,15 +60,17 @@ was retained.
 
 Boost does not leak into global build flags. `p50_endpoint.cpp` lives in the separate
 `libp50endpoint.a` target and alone receives `BOOST_CPPFLAGS`. The `p50endpoint` test receives
-`BOOST_CPPFLAGS`, `BOOST_LDFLAGS`, and `BOOST_LIBS`; other product and Protocol-50 targets do
-not. The existing P48 prefix-scope gate was minimally extended to build those consumers,
+`BOOST_CPPFLAGS` plus only the `BOOST_LDFLAGS` and `BOOST_LIBS` required by the selected Boost
+link mode; other product and Protocol-50 targets do not. On the selected header-only
+Boost.System path both linker variables are empty. The existing P48 prefix-scope gate was
+minimally extended to build those consumers,
 prove that they receive the prefix, reject its appearance on any other target, and forward
 the now-mandatory M0 xxHash dependency into its nested configure. The nested gate forwards
 an explicitly configured `PKG_CONFIG_LIBDIR`, but does not turn an absent directory override
-into an empty override that would hide pkg-config's ordinary system directories.
-The gate keeps its incomplete dependency archives through the complete ordinary product
-build, then removes only the lzo and Zstd decoys before linking the intended Boost consumer;
-that endpoint requires both real libraries and is expected to receive the Boost library path.
+into an empty override that would hide pkg-config's ordinary system directories. The gate
+keeps all incomplete lzo, Zstd, and libarchive decoys present through the actual endpoint
+link. On the header-only path, that link must consume the Boost include path without receiving
+the unused Boost library path, so its intentional dependencies cannot be redirected.
 
 All other conflicts were additive build/package-list unions:
 
