@@ -155,16 +155,23 @@ void test_session_negotiation() {
     const SessionSelection selected = negotiate_session(
         hello, 50, 52, profile_bit(ProfileId::ZSTD_TU),
         SessionLimits{128 * 1024, 16 * 1024 * 1024});
-    require(selected.protocol == 51 && selected.profile == ProfileId::ZSTD_TU &&
+    require(selected.protocol == kProtocolVersion &&
+                selected.profile == ProfileId::ZSTD_TU &&
                 selected.limits.max_frame_payload == 128 * 1024 &&
                 selected.limits.max_fill_record_bytes == 8 * 1024 * 1024,
-            "session did not select the overlap and smaller offered limits");
+            "session did not select implemented Protocol 50 and smaller limits");
 
     SessionHello no_version = hello;
     no_version.max_protocol = 49;
     require_throws<std::invalid_argument>(
         [&] { (void)negotiate_session(no_version); },
-        "disjoint protocol ranges negotiated");
+        "client range without Protocol 50 negotiated");
+    require_throws<std::invalid_argument>(
+        [&] {
+            (void)negotiate_session(
+                hello, 51, 52, profile_bit(ProfileId::ZSTD_TU));
+        },
+        "server range without Protocol 50 negotiated");
     require_throws<std::invalid_argument>(
         [&] {
             (void)negotiate_session(
@@ -210,7 +217,7 @@ void test_received_session_state_validation() {
 
     const Digest128 post_state = digest("retained post state");
     SessionState state;
-    state.selected_protocol = kProtocolVersion + 1;
+    state.selected_protocol = kProtocolVersion;
     state.selected_profile = ProfileId::P29;
     state.limits = {64 * 1024, 4 * 1024 * 1024};
     state.f_store_guid = Id128::from_u64(71);
@@ -231,20 +238,39 @@ void test_received_session_state_validation() {
     fresh_route.last_commit.reset();
     validate_session_state(hello, receive_session_state(fresh_route));
 
+    SessionState absent;
+    absent.selected_protocol = kProtocolVersion;
+    absent.selected_profile = ProfileId::P29;
+    absent.limits = state.limits;
+    absent.f_store_guid = state.f_store_guid;
+    validate_session_state(hello, receive_session_state(absent));
+
+    SessionState absent_namespace_with_route_data = absent;
+    absent_namespace_with_route_data.history_nonce = {1};
+    require_throws<std::invalid_argument>(
+        [&] { (void)receive_session_state(absent_namespace_with_route_data); },
+        "absent namespace encoded noncanonical route data");
+    SessionState absent_route_with_digest = absent;
+    absent_route_with_digest.namespace_present = true;
+    absent_route_with_digest.state_digest = digest("stale route");
+    require_throws<std::invalid_argument>(
+        [&] { (void)receive_session_state(absent_route_with_digest); },
+        "absent route encoded a stale state digest");
+
     const auto validate_received = [&](const SessionState& candidate) {
         validate_session_state(hello, receive_session_state(candidate));
     };
 
     SessionState rejected = state;
-    rejected.selected_protocol = hello.min_protocol - 1;
+    rejected.selected_protocol = kProtocolVersion - 1;
     require_throws<std::invalid_argument>(
         [&] { validate_received(rejected); },
-        "SESSION_STATE selected a protocol below the client offer");
+        "SESSION_STATE selected an unimplemented lower protocol");
     rejected = state;
-    rejected.selected_protocol = hello.max_protocol + 1;
+    rejected.selected_protocol = kProtocolVersion + 1;
     require_throws<std::invalid_argument>(
         [&] { validate_received(rejected); },
-        "SESSION_STATE selected a protocol above the client offer");
+        "SESSION_STATE selected an unimplemented higher protocol");
     rejected = state;
     rejected.selected_profile = ProfileId::GRZ;
     require_throws<std::invalid_argument>(
