@@ -34,6 +34,7 @@ merge base, so every transplanted layer and resolution is recorded below.
 | `c5575dc8` | `89bede78` | exact asynchronous completion correspondence |
 | convergence-only | `35a1608a` | endpoint-target Boost flags and P48 scope-gate registration |
 | convergence-only | `f28822bc` | nested package-discovery forwarding for the P48 scope gate |
+| convergence-only | `5be4a497` | preserve default pkg-config directories in the nested scope gate |
 
 The M1 core consumes the header-only OnlineS1 implementation, and the M0 layout census reads
 two retained measurement inputs. Only these missing dependencies came from the source tree:
@@ -60,7 +61,9 @@ Boost does not leak into global build flags. `p50_endpoint.cpp` lives in the sep
 `BOOST_CPPFLAGS`, `BOOST_LDFLAGS`, and `BOOST_LIBS`; other product and Protocol-50 targets do
 not. The existing P48 prefix-scope gate was minimally extended to build those consumers,
 prove that they receive the prefix, reject its appearance on any other target, and forward
-the now-mandatory M0 xxHash dependency into its nested configure.
+the now-mandatory M0 xxHash dependency into its nested configure. The nested gate forwards
+an explicitly configured `PKG_CONFIG_LIBDIR`, but does not turn an absent directory override
+into an empty override that would hide pkg-config's ordinary system directories.
 
 All other conflicts were additive build/package-list unions:
 
