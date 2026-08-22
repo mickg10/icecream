@@ -126,6 +126,22 @@ run_expected_failure claimed-settlement-witness \
     Protocol50AssignmentIdentitySettlementWitness.cfg \
     NoClaimedOrdinarySettlementWitness
 
+run_expected_failure reject-stale-epoch-witness \
+    Protocol50AssignmentIdentityRejectStaleEpochWitness.cfg \
+    NoRejectedInvalidIdentityWitness
+run_expected_failure reject-stale-wire-witness \
+    Protocol50AssignmentIdentityRejectStaleWireWitness.cfg \
+    NoRejectedInvalidIdentityWitness
+run_expected_failure reject-stale-nonce-witness \
+    Protocol50AssignmentIdentityRejectStaleNonceWitness.cfg \
+    NoRejectedInvalidIdentityWitness
+run_expected_failure reject-epoch-only-witness \
+    Protocol50AssignmentIdentityRejectEpochOnlyWitness.cfg \
+    NoRejectedInvalidIdentityWitness
+run_expected_failure reject-nonce-only-witness \
+    Protocol50AssignmentIdentityRejectNonceOnlyWitness.cfg \
+    NoRejectedInvalidIdentityWitness
+
 run_expected_failure stale-epoch-mutant \
     Protocol50AssignmentIdentityStaleEpochMutant.cfg \
     StaleIdentityRejected

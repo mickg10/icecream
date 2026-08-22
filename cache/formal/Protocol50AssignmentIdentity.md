@@ -126,6 +126,8 @@ EXPECTED REACHABILITY
     exact claim after reconnect
     matching Revoked release
     ClaimedOrLater ordinary settlement
+    stale epoch, wire, or nonce rejected normally
+    epoch-only or nonce-only identity rejected normally
 
 EXPECTED MUTANT FAILURE
     stale epoch, wire, or nonce accepted
@@ -135,6 +137,13 @@ EXPECTED MUTANT FAILURE
     reconnect drops the exact token
     ClaimedOrLater releases before ordinary settlement
 ```
+
+The five normal malformed-identity witnesses do not enable the corresponding
+acceptance mutants. Each must reach `Rejected` with a non-acceptable stale or
+partial identity. Consequently, deleting `RejectRemoteClaim` or removing it
+from `Next` makes the runner fail instead of passing vacuously. The separate
+mutant rows continue to prove that accepting the same five malformed shapes
+violates the admission invariants.
 
 Run with a pinned TLA+ tools jar:
 

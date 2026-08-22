@@ -89,6 +89,11 @@ EXTRA_DIST = \
 	formal/Protocol50AssignmentIdentityReconnectWitness.cfg \
 	formal/Protocol50AssignmentIdentityRevokedWitness.cfg \
 	formal/Protocol50AssignmentIdentitySettlementWitness.cfg \
+	formal/Protocol50AssignmentIdentityRejectStaleEpochWitness.cfg \
+	formal/Protocol50AssignmentIdentityRejectStaleWireWitness.cfg \
+	formal/Protocol50AssignmentIdentityRejectStaleNonceWitness.cfg \
+	formal/Protocol50AssignmentIdentityRejectEpochOnlyWitness.cfg \
+	formal/Protocol50AssignmentIdentityRejectNonceOnlyWitness.cfg \
 	formal/Protocol50AssignmentIdentityStaleEpochMutant.cfg \
 	formal/Protocol50AssignmentIdentityStaleWireMutant.cfg \
 	formal/Protocol50AssignmentIdentityStaleNonceMutant.cfg \

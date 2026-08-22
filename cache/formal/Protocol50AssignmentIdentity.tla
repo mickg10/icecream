@@ -33,6 +33,8 @@ Scenarios == {
     "Normal",
     "StaleEpoch", "StaleWire", "StaleNonce",
     "EpochOnly", "NonceOnly",
+    "RejectStaleEpoch", "RejectStaleWire", "RejectStaleNonce",
+    "RejectEpochOnly", "RejectNonceOnly",
     "DropP50Identity", "StrictAbsent",
     "DropOnReconnect", "ReleaseClaimed"
 }
@@ -176,11 +178,16 @@ RelayedIdentity ==
     ELSE LegacyEnvelope
 
 ScenarioIdentity(i) ==
-    IF Scenario = "StaleEpoch" THEN StaleEpochIdentity
-    ELSE IF Scenario = "StaleWire" THEN StaleWireIdentity
-    ELSE IF Scenario = "StaleNonce" THEN StaleNonceIdentity
-    ELSE IF Scenario = "EpochOnly" THEN EpochOnlyIdentity
-    ELSE IF Scenario = "NonceOnly" THEN NonceOnlyIdentity
+    IF Scenario \in {"StaleEpoch", "RejectStaleEpoch"}
+        THEN StaleEpochIdentity
+    ELSE IF Scenario \in {"StaleWire", "RejectStaleWire"}
+        THEN StaleWireIdentity
+    ELSE IF Scenario \in {"StaleNonce", "RejectStaleNonce"}
+        THEN StaleNonceIdentity
+    ELSE IF Scenario \in {"EpochOnly", "RejectEpochOnly"}
+        THEN EpochOnlyIdentity
+    ELSE IF Scenario \in {"NonceOnly", "RejectNonceOnly"}
+        THEN NonceOnlyIdentity
     ELSE i
 
 RelayCompileFile ==
@@ -499,6 +506,17 @@ ClaimedOrdinarySettlementReached ==
     /\ released
     /\ RemoteClaimAccepted
 
+RejectedInvalidIdentityReached ==
+    /\ Scenario \in {
+           "RejectStaleEpoch", "RejectStaleWire", "RejectStaleNonce",
+           "RejectEpochOnly", "RejectNonceOnly"
+       }
+    /\ phase = "Rejected"
+    /\ admission = "Rejected"
+    /\ compileFileSent
+    /\ (StaleIdentity(workerIdentity) \/ PartialIdentity(workerIdentity))
+    /\ ~ClaimAcceptable(workerIdentity)
+
 NoExpectedCellOutcome == ~ExpectedCellOutcomeReached
 NoStrictExactClaimWitness == ~StrictExactClaimReached
 NoStrictMixedRefusalWitness == ~StrictMixedRefusalReached
@@ -506,5 +524,6 @@ NoLocalExemptionWitness == ~LocalExemptionReached
 NoReconnectExactClaimWitness == ~ReconnectExactClaimReached
 NoRevokedReleaseWitness == ~RevokedReleaseReached
 NoClaimedOrdinarySettlementWitness == ~ClaimedOrdinarySettlementReached
+NoRejectedInvalidIdentityWitness == ~RejectedInvalidIdentityReached
 
 =============================================================================
