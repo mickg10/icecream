@@ -1,4 +1,4 @@
-TESTS = testargs p50wire p50slice0 p50zstd p50endpoint digest128bench p50_trace_check.sh
+TESTS = testargs p50wire p50slice0 p50zstd p50zstdwindow p50endpoint digest128bench p50_trace_check.sh
 TEST_EXTENSIONS = .sh
 SH_LOG_COMPILER = $(SHELL)
 
@@ -8,16 +8,18 @@ testargs_LDADD = ../client/libclient.a ../services/libicecc.la
 p50wire_LDADD = ../cache/libprotocol50.a ../services/libicecc.la
 p50slice0_LDADD = ../cache/libprotocol50.a ../services/libicecc.la
 p50zstd_LDADD = ../cache/libprotocol50.a ../services/libicecc.la $(LIBZSTD_LIBS)
+p50zstdwindow_LDADD = ../cache/libprotocol50.a ../services/libicecc.la $(LIBZSTD_LIBS)
 p50endpoint_LDADD = ../cache/libprotocol50.a ../services/libicecc.la \
 	$(LIBZSTD_LIBS) $(BOOST_LIBS)
 digest128bench_LDADD = ../services/libicecc.la
 
-check_PROGRAMS = testargs p50wire p50slice0 p50zstd p50endpoint digest128bench
+check_PROGRAMS = testargs p50wire p50slice0 p50zstd p50zstdwindow p50endpoint digest128bench
 testargs_SOURCES = args.cpp
 p50wire_SOURCES = p50_wire_test.cpp
 p50slice0_SOURCES = \
 	p50_slice0_test.cpp
 p50zstd_SOURCES = p50_zstd_test.cpp
+p50zstdwindow_SOURCES = p50_zstd_window_test.cpp
 p50endpoint_SOURCES = p50_endpoint_test.cpp
 digest128bench_SOURCES = digest128_bench.cpp
 
