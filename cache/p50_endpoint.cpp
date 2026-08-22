@@ -26,6 +26,11 @@ public:
     const char* what() const noexcept override { return "stale endpoint completion"; }
 };
 
+class PrecommitPublicationFailure final : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
 void validate_caps(const EndpointCaps& caps) {
     if (caps.wire.max_frame_payload < kMandatoryControlFramePayload ||
         caps.wire.max_frame_payload > kInitialMaxFramePayload)
@@ -321,6 +326,8 @@ struct P50PreparationAuthority::Impl {
         : c_guid(c_store_guid_value), zstd_limits(zstd_limits_value),
           authority_limits(authority_limits_value), codec(compression_level),
           identity(std::make_shared<const uint8_t>(0)) {
+        if (c_guid == CStoreGuid{})
+            throw std::invalid_argument("C preparation authority GUID zero is reserved");
         if (zstd_limits.max_encoded_body_bytes == 0 ||
             zstd_limits.max_raw_bytes == 0)
             throw std::invalid_argument("preparation ZSTD_TU limits must be nonzero");
@@ -730,9 +737,13 @@ struct P50ServerEndpoint::Impl {
     };
 
     Impl(FStoreGuid f_guid_value, EndpointCaps cap_value, CompletionLog* completion_log,
-         ActionTrace* action_trace)
+         ActionTrace* action_trace, P50ServerEndpointConfig config_value)
         : f_guid(f_guid_value), caps(cap_value), completions(completion_log),
-          actions(action_trace) {
+          actions(action_trace), config(std::move(config_value)) {
+        if (f_guid == FStoreGuid{})
+            throw std::invalid_argument("F endpoint GUID zero is reserved");
+        if (config.protocol_error_code == 0)
+            throw std::invalid_argument("F endpoint ERROR code zero is reserved");
         validate_caps(caps);
     }
 
@@ -910,7 +921,7 @@ struct P50ServerEndpoint::Impl {
         return revision.value;
     }
 
-    void advance_revision(CStoreGuid c_guid) {
+    Revision& require_revision_advance(CStoreGuid c_guid) {
         Revision& revision = revisions[c_guid];
         if (revision.exhausted ||
             revision.value == std::numeric_limits<uint64_t>::max()) {
@@ -918,9 +929,18 @@ struct P50ServerEndpoint::Impl {
             throw std::overflow_error(
                 "candidate revision requires F_STORE_GUID replacement");
         }
+        return revision;
+    }
+
+    static void advance_revision(Revision& revision) noexcept {
         ++revision.value;
         if (revision.value == std::numeric_limits<uint64_t>::max())
             revision.exhausted = true;
+    }
+
+    void advance_revision(CStoreGuid c_guid) {
+        Revision& revision = require_revision_advance(c_guid);
+        advance_revision(revision);
     }
 
     void advance_revision_on_disconnect(CStoreGuid c_guid) noexcept {
@@ -1092,8 +1112,11 @@ struct P50ServerEndpoint::Impl {
             throw std::invalid_argument("TX_BEGIN profile was not negotiated");
         if (route.pending)
             throw std::logic_error("F endpoint already has one active transaction");
+        if (route.interrupted && *route.interrupted != begin)
+            throw std::logic_error(
+                "TX_BEGIN differs from the interrupted transaction identity");
         PreparedBegin result;
-        result.replay = route.interrupted && *route.interrupted == begin;
+        result.replay = route.interrupted.has_value();
         result.pending.begin = begin;
         result.pending.dialogue =
             std::make_unique<ZstdTuDialogue>(negotiated_profiles, caps.zstd);
@@ -1117,6 +1140,8 @@ struct P50ServerEndpoint::Impl {
         Route& route = *space.route;
         if (route.pending)
             throw std::logic_error("F endpoint already has one active transaction");
+        if (route.interrupted && route.interrupted != prepared.pending.begin)
+            throw StaleCompletion();
         const TxBegin begin = prepared.pending.begin;
         const bool replay = prepared.replay;
         route.interrupted.reset();
@@ -1171,13 +1196,23 @@ struct P50ServerEndpoint::Impl {
                                                   pending.begin.history_nonce,
                                                   pending.begin.rel_seq, pending.begin.tu_seq,
                                                   pending.begin.transaction_digest)};
+        Revision& revision = require_revision_advance(*session.c_guid);
+        if (config.precommit_publish) {
+            try {
+                config.precommit_publish(*session.c_guid, pending.begin, commit, exact);
+            } catch (...) {
+                throw PrecommitPublicationFailure(
+                    "exact input publication failed before route commit");
+            }
+        }
+        space.committed = std::move(exact);
+        advance_revision(revision);
         route.state = commit.post_state_digest;
         ++route.next_rel.value;
         route.last_commit = commit;
         route.interrupted.reset();
         pending.dialogue->commit_visible();
         route.pending.reset();
-        space.committed = std::move(exact);
         record(ActionType::INPUT_COMMITTED, session, &committed_begin, commit.post_state_digest);
         return commit;
     }
@@ -1191,6 +1226,7 @@ struct P50ServerEndpoint::Impl {
     std::map<CStoreGuid, Revision> revisions;
     CompletionLog* completions = nullptr;
     ActionTrace* actions = nullptr;
+    P50ServerEndpointConfig config{};
 };
 
 P50ClientEndpoint::P50ClientEndpoint(std::shared_ptr<P50PreparationAuthority> preparation,
@@ -1432,8 +1468,10 @@ RelSeq P50ClientEndpoint::next_rel_seq() const { return impl_->next_rel; }
 Digest128 P50ClientEndpoint::state_digest() const { return impl_->state; }
 
 P50ServerEndpoint::P50ServerEndpoint(FStoreGuid f_store_guid, EndpointCaps caps,
-                                     CompletionLog* completions, ActionTrace* actions)
-    : impl_(std::make_unique<Impl>(f_store_guid, caps, completions, actions)) {}
+                                     CompletionLog* completions, ActionTrace* actions,
+                                     P50ServerEndpointConfig config)
+    : impl_(std::make_unique<Impl>(f_store_guid, caps, completions, actions,
+                                   std::move(config))) {}
 
 P50ServerEndpoint::~P50ServerEndpoint() = default;
 
@@ -1451,6 +1489,7 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::accept_one(tcp::accep
         impl_->require_completion(completion_for_test(completion, control));
     };
     std::optional<ErrorMessage> terminal_error;
+    bool retain_interrupted_on_terminal = false;
     try {
         co_await async_accept(acceptor, socket, impl_->stamp(session, AsyncOperationKind::Accept),
                               impl_->completions, verify);
@@ -1526,8 +1565,13 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::accept_one(tcp::accep
         impl_->release_session(session);
         result.status = ServerRunStatus::Disconnected;
         co_return result;
+    } catch (const PrecommitPublicationFailure& error) {
+        retain_interrupted_on_terminal = true;
+        terminal_error = bounded_error(impl_->config.protocol_error_code,
+                                       error.what(), reply_cap);
     } catch (const std::exception& error) {
-        terminal_error = bounded_error(1, error.what(), reply_cap);
+        terminal_error = bounded_error(impl_->config.protocol_error_code,
+                                       error.what(), reply_cap);
     }
 
     // C++ forbids a coroutine suspension directly inside an exception handler.
@@ -1539,7 +1583,7 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::accept_one(tcp::accep
     } catch (...) {
     }
     close_now(socket);
-    impl_->disconnect(session, false);
+    impl_->disconnect(session, retain_interrupted_on_terminal);
     impl_->release_session(session);
     result.status = ServerRunStatus::TerminalError;
     result.terminal_error = std::move(*terminal_error);
@@ -1547,6 +1591,8 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::accept_one(tcp::accep
 }
 
 void P50ServerEndpoint::reset_store(FStoreGuid new_guid) {
+    if (new_guid == FStoreGuid{})
+        throw std::invalid_argument("F store reset GUID zero is reserved");
     if (new_guid == impl_->f_guid)
         throw std::invalid_argument("F store reset requires a fresh GUID");
     for (const auto& [guid, space] : impl_->namespaces) {

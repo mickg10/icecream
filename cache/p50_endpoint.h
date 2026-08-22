@@ -179,6 +179,17 @@ struct ServerRunResult {
     std::optional<ErrorMessage> terminal_error;
 };
 
+// Runs synchronously after exact materialization and before either the retained
+// input or route cursor becomes visible.  Throwing leaves the transaction
+// identity available for exact replay.
+using PrecommitInputPublisher = std::function<void(
+    CStoreGuid, const TxBegin&, const TxCommit&, std::span<const uint8_t>)>;
+
+struct P50ServerEndpointConfig {
+    uint16_t protocol_error_code = 1;
+    PrecommitInputPublisher precommit_publish;
+};
+
 class P50ClientEndpoint {
 public:
     explicit P50ClientEndpoint(std::shared_ptr<P50PreparationAuthority> preparation,
@@ -210,7 +221,8 @@ class P50ServerEndpoint {
 public:
     explicit P50ServerEndpoint(FStoreGuid f_store_guid, EndpointCaps caps = {},
                                CompletionLog* completions = nullptr,
-                               ActionTrace* actions = nullptr);
+                               ActionTrace* actions = nullptr,
+                               P50ServerEndpointConfig config = {});
     ~P50ServerEndpoint();
     P50ServerEndpoint(const P50ServerEndpoint&) = delete;
     P50ServerEndpoint& operator=(const P50ServerEndpoint&) = delete;
