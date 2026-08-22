@@ -70,6 +70,19 @@ void InputRecordStore::validate_commit(
             "InputRecord exact input digest differs from TX_BEGIN");
 }
 
+void InputRecordStore::validate_existing(
+    const Entry& entry, const TxBegin& begin,
+    std::span<const uint8_t> exact_input) {
+    if (entry.raw_bytes != begin.raw_bytes ||
+        entry.raw_digest != begin.raw_digest ||
+        !entry.backing ||
+        entry.backing->size() != exact_input.size() ||
+        !std::equal(entry.backing->begin(), entry.backing->end(),
+                    exact_input.begin()))
+        throw std::logic_error(
+            "one InputRecord key was assigned conflicting exact input");
+}
+
 InputPublishResult InputRecordStore::publish(
     CStoreGuid c_store_guid, const TxBegin& begin, const TxCommit& commit,
     std::vector<uint8_t> exact_input) {
@@ -80,12 +93,7 @@ InputPublishResult InputRecordStore::publish(
     const InputRecordKey key{c_store_guid, begin.tu_seq};
     const auto existing = records_.find(key);
     if (existing != records_.end()) {
-        const Entry& entry = existing->second;
-        if (entry.raw_bytes != begin.raw_bytes ||
-            entry.raw_digest != begin.raw_digest ||
-            !entry.backing || *entry.backing != exact_input)
-            throw std::logic_error(
-                "one InputRecord key was assigned conflicting exact input");
+        validate_existing(existing->second, begin, exact_input);
         // While retained, an exact duplicate preserves the existing job-open
         // state and therefore cannot reopen a closed job. Stale commit/cursor
         // rejection after this record is collected remains the R_f route
@@ -109,6 +117,23 @@ InputPublishResult InputRecordStore::publish(
         throw std::logic_error("InputRecordStore insertion lost key ownership");
     retained_bytes_ += begin.raw_bytes;
     return InputPublishResult::Published;
+}
+
+InputPublishResult InputRecordStore::observe_closed_job_commit(
+    CStoreGuid c_store_guid, const TxBegin& begin, const TxCommit& commit,
+    std::span<const uint8_t> exact_input) {
+    if (c_store_guid == CStoreGuid{})
+        throw std::invalid_argument("InputRecord C_STORE_GUID zero is reserved");
+
+    validate_commit(begin, commit, exact_input);
+    const InputRecordKey key{c_store_guid, begin.tu_seq};
+    const auto existing = records_.find(key);
+    if (existing == records_.end())
+        return InputPublishResult::NotRetainedJobClosed;
+
+    validate_existing(existing->second, begin, exact_input);
+    existing->second.logical_job_open = false;
+    return InputPublishResult::Existing;
 }
 
 InputCursor InputRecordStore::attach(InputRecordKey key) const {
