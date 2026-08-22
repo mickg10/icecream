@@ -44,7 +44,7 @@ skip() {
 }
 
 dir=$(cd "$(dirname "$0")" && pwd)
-top=$(cd "$dir/.." && pwd)
+top=${ICECC_TEST_TOP_BUILDDIR:-$(cd "$dir/.." && pwd)}
 
 # Short socket dir: sun_path is limited to ~107 bytes and distcheck build
 # trees exceed it.

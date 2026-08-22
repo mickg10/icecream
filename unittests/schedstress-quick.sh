@@ -67,18 +67,20 @@
 # the same turn is accepted (the handler's same-turn recheck), not timed
 # out (issue #4 round-3 internals gap #1; deterministic via a tick-promote
 # test knob; red/green).
-dir=$(dirname "$0")
-"$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 promotion 1 || exit 1
-"$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 heterogeneous 1 || exit 1
-"$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 50 5 stallcredit || exit 1
-"$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 clientstall || exit 1
-"$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 teardown || exit 1
-"$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 internalsuaf || exit 1
-"$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 duplocal || exit 1
-"$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 exhaust || exit 1
-"$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 internalsrace || exit 1
-"$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 internalsguard || exit 1
-"$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 internalspreflight || exit 1
-"$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 retention || exit 1
-"$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 noreader || exit 1
-exec "$dir/schedbp" "$dir/../scheduler/icecc-scheduler" "$dir/sndbuf_shim.so" 10 5 leastbusy 2
+src_dir=$(dirname "$0")
+build_dir=${ICECC_TEST_BUILDDIR:-$src_dir}
+top_build_dir=${ICECC_TEST_TOP_BUILDDIR:-$build_dir/..}
+"$build_dir/schedbp" "$top_build_dir/scheduler/icecc-scheduler" "$build_dir/sndbuf_shim.so" 10 5 promotion 1 || exit 1
+"$build_dir/schedbp" "$top_build_dir/scheduler/icecc-scheduler" "$build_dir/sndbuf_shim.so" 10 5 heterogeneous 1 || exit 1
+"$build_dir/schedbp" "$top_build_dir/scheduler/icecc-scheduler" "$build_dir/sndbuf_shim.so" 50 5 stallcredit || exit 1
+"$build_dir/schedbp" "$top_build_dir/scheduler/icecc-scheduler" "$build_dir/sndbuf_shim.so" 10 5 clientstall || exit 1
+"$build_dir/schedbp" "$top_build_dir/scheduler/icecc-scheduler" "$build_dir/sndbuf_shim.so" 10 5 teardown || exit 1
+"$build_dir/schedbp" "$top_build_dir/scheduler/icecc-scheduler" "$build_dir/sndbuf_shim.so" 10 5 internalsuaf || exit 1
+"$build_dir/schedbp" "$top_build_dir/scheduler/icecc-scheduler" "$build_dir/sndbuf_shim.so" 10 5 duplocal || exit 1
+"$build_dir/schedbp" "$top_build_dir/scheduler/icecc-scheduler" "$build_dir/sndbuf_shim.so" 10 5 exhaust || exit 1
+"$build_dir/schedbp" "$top_build_dir/scheduler/icecc-scheduler" "$build_dir/sndbuf_shim.so" 10 5 internalsrace || exit 1
+"$build_dir/schedbp" "$top_build_dir/scheduler/icecc-scheduler" "$build_dir/sndbuf_shim.so" 10 5 internalsguard || exit 1
+"$build_dir/schedbp" "$top_build_dir/scheduler/icecc-scheduler" "$build_dir/sndbuf_shim.so" 10 5 internalspreflight || exit 1
+"$build_dir/schedbp" "$top_build_dir/scheduler/icecc-scheduler" "$build_dir/sndbuf_shim.so" 10 5 retention || exit 1
+"$build_dir/schedbp" "$top_build_dir/scheduler/icecc-scheduler" "$build_dir/sndbuf_shim.so" 10 5 noreader || exit 1
+exec "$build_dir/schedbp" "$top_build_dir/scheduler/icecc-scheduler" "$build_dir/sndbuf_shim.so" 10 5 leastbusy 2

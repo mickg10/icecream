@@ -9,5 +9,7 @@
 # loss cleans up exactly once, and bounded shutdown exits cleanly.
 #
 # RED at a7eb908 (GetCS observed before ConfCS); GREEN at cea7c5f.
-dir=$(dirname "$0")
-exec "$dir/daemonlogin" "$dir/../daemon/iceccd"
+src_dir=$(dirname "$0")
+build_dir=${ICECC_TEST_BUILDDIR:-$src_dir}
+top_build_dir=${ICECC_TEST_TOP_BUILDDIR:-$build_dir/..}
+exec "$build_dir/daemonlogin" "$top_build_dir/daemon/iceccd"

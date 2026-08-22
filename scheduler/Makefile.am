@@ -7,7 +7,10 @@ AM_LIBTOOLFLAGS = --silent
 
 noinst_HEADERS = \
     compileserver.h \
+    fastest.h \
+    hallflow.h \
     job.h \
+    jobidallocator.h \
     jobstat.h \
     scheduler.h \
     selection.h
