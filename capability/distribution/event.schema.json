@@ -127,8 +127,8 @@
     "byte_account": { "enum": ["source", "environment", "result"] },
     "c_to_f_byte_delta": { "$ref": "#/$defs/nonnegative" },
     "f_to_c_byte_delta": { "$ref": "#/$defs/nonnegative" },
-    "resource_byte_delta": { "$ref": "#/$defs/deltas" },
-    "queue_byte_delta": { "$ref": "#/$defs/deltas" }
+    "resource_byte_delta": { "$ref": "#/$defs/resourceDeltas" },
+    "queue_byte_delta": { "$ref": "#/$defs/queueDeltas" }
   },
   "$defs": {
     "nonnegative": { "type": "integer", "minimum": 0 },
@@ -149,9 +149,26 @@
       ]
     },
     "provenance": { "enum": ["observed", "modeled", "derived"] },
-    "deltas": {
+    "resourceDeltas": {
       "type": "object",
-      "additionalProperties": { "type": "integer" }
+      "additionalProperties": false,
+      "properties": {
+        "prepared_input_bytes": { "type": "integer" },
+        "input_record_bytes": { "type": "integer" },
+        "network_c_to_f_propagating_bytes": { "type": "integer" },
+        "network_f_to_c_propagating_bytes": { "type": "integer" }
+      }
+    },
+    "queueDeltas": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "scheduler_ready_bytes": { "type": "integer" },
+        "route_input_pending_bytes": { "type": "integer" },
+        "compiler_input_bytes": { "type": "integer" },
+        "network_c_to_f_outstanding_bytes": { "type": "integer" },
+        "network_f_to_c_outstanding_bytes": { "type": "integer" }
+      }
     }
   }
 }

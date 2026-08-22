@@ -1513,6 +1513,199 @@ class SimulatorTest(unittest.TestCase):
                 sim.validate_experiment_jsonl(output / "experiment.jsonl")
             retained_ledger.write_bytes(retained_bytes)
 
+    def test_v2_validator_joins_physical_ledger_dag_and_route_contracts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_v2_fixture(root, [30, 20], [10, 11], workers=1)
+            document = json.loads(path.read_text())
+            document["capabilities"] = {"cache_wire": "v1", "codec_profile": "p29"}
+            document["expected"]["selected_codec_profile"] = "p29"
+            path.write_text(json.dumps(document, indent=2) + "\n")
+            scenario = sim.load_scenario(path)
+            ledger_path = write_physical_ledger(root / "physical.jsonl", path)
+            ledger_rows = [
+                json.loads(line) for line in ledger_path.read_text().splitlines()
+            ]
+            ledger_rows[0]["scenario_sha256"] = scenario.scenario_digest
+            ledger_path.write_text(
+                "".join(json.dumps(row) + "\n" for row in ledger_rows)
+            )
+            output = root / "out"
+            sim.write_result(
+                scenario,
+                sim.Simulator(
+                    scenario,
+                    sim.PhysicalLedgerAdapter(
+                        ledger_path, scenario, "p29", assignment_closure="aggregate"
+                    ),
+                ).run(),
+                output,
+                execution_for(path),
+            )
+            stream_path = output / "experiment.jsonl"
+            retained_ledger = output / "physical-ledger.jsonl"
+            original_stream = [
+                json.loads(line) for line in stream_path.read_text().splitlines()
+            ]
+            original_ledger = retained_ledger.read_bytes()
+            self.assertEqual(
+                sim.validate_experiment_jsonl(stream_path)["c_to_f_bytes"], 19
+            )
+
+            def write_candidate(
+                label: str,
+                rows: list[dict[str, object]],
+                pattern: str,
+                ledger: list[dict[str, object]] | None = None,
+            ) -> None:
+                if ledger is None:
+                    retained_ledger.write_bytes(original_ledger)
+                else:
+                    retained_ledger.write_text(
+                        "".join(json.dumps(row) + "\n" for row in ledger)
+                    )
+                    digest = sim.sha256(retained_ledger)
+                    rows[0]["physical_ledger_evidence"]["sha256"] = digest
+                    rows[0]["expected_summary"]["codec_metadata"][
+                        "ledger_sha256"
+                    ] = digest
+                    rows[-1]["summary"]["codec_metadata"]["ledger_sha256"] = digest
+                candidate = output / f"rereview-{label}.jsonl"
+                candidate.write_text("".join(json.dumps(row) + "\n" for row in rows))
+                with self.subTest(label=label), self.assertRaisesRegex(
+                    ValueError, pattern
+                ):
+                    sim.validate_experiment_jsonl(candidate)
+
+            malformed_ledger = [
+                json.loads(line) for line in original_ledger.decode().splitlines()
+            ]
+            malformed_ledger[1]["worker"] = 999
+            write_candidate(
+                "physical-worker",
+                copy.deepcopy(original_stream),
+                "worker is outside topology|schema error",
+                malformed_ledger,
+            )
+
+            malformed_ledger = [
+                json.loads(line) for line in original_ledger.decode().splitlines()
+            ]
+            malformed_ledger[1]["invented"] = 1
+            write_candidate(
+                "physical-row-shape",
+                copy.deepcopy(original_stream),
+                "physical-ledger.*schema error",
+                malformed_ledger,
+            )
+
+            token_rows = copy.deepcopy(original_stream)
+            token = next(
+                event
+                for timeline in token_rows[1:-1]
+                for event in timeline["events"]
+                if event["event"] == "dag-token"
+            )
+            token["detail"] = "invented-token"
+            write_candidate("physical-token", token_rows, "DAG token detail set")
+
+            ready_rows = copy.deepcopy(original_stream)
+            ready = next(
+                event
+                for timeline in ready_rows[1:-1]
+                for event in timeline["events"]
+                if event["event"] == "dag-node-ready"
+            )
+            ready["bytes"] += 1
+            write_candidate("physical-ready", ready_rows, "DAG ready extent")
+            retained_ledger.write_bytes(original_ledger)
+
+    def test_v2_validator_derives_exact_physical_assignment_closure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_v2_fixture(root, [30, 20], [10, 11], workers=2)
+            document = json.loads(path.read_text())
+            document["capabilities"] = {"cache_wire": "v1", "codec_profile": "p29"}
+            document["expected"]["selected_codec_profile"] = "p29"
+            path.write_text(json.dumps(document, indent=2) + "\n")
+            route_path = add_route_trace(path, [0, 0], [10, 11])
+            route_rows = [
+                json.loads(line) for line in route_path.read_text().splitlines()
+            ]
+            route_rows[0]["codec_profile"] = "p29"
+            route_rows[1]["c_to_f_bytes"] = 13
+            route_rows[1]["f_to_c_bytes"] = 2
+            route_rows[2]["c_to_f_bytes"] = 6
+            route_rows[2]["f_to_c_bytes"] = 1
+            route_rows[-1]["c_to_f_bytes"] = 19
+            route_rows[-1]["f_to_c_bytes"] = 3
+            route_path.write_text("".join(json.dumps(row) + "\n" for row in route_rows))
+            scenario = sim.load_scenario(path)
+            ledger_path = write_physical_ledger(root / "physical.jsonl", path)
+            ledger_rows = [
+                json.loads(line) for line in ledger_path.read_text().splitlines()
+            ]
+            ledger_rows[0]["scenario_sha256"] = scenario.scenario_digest
+            ledger_path.write_text(
+                "".join(json.dumps(row) + "\n" for row in ledger_rows)
+            )
+            output = root / "out"
+            sim.write_result(
+                scenario,
+                sim.Simulator(
+                    scenario,
+                    sim.PhysicalLedgerAdapter(ledger_path, scenario, "p29"),
+                ).run(),
+                output,
+                execution_for(path),
+            )
+            stream_path = output / "experiment.jsonl"
+            retained_ledger = output / "physical-ledger.jsonl"
+            original_stream = [
+                json.loads(line) for line in stream_path.read_text().splitlines()
+            ]
+            original_ledger = retained_ledger.read_bytes()
+            self.assertEqual(
+                sim.validate_experiment_jsonl(stream_path)["c_to_f_bytes"], 19
+            )
+
+            closure_rows = copy.deepcopy(original_stream)
+            for summary in (
+                closure_rows[0]["expected_summary"],
+                closure_rows[-1]["summary"],
+            ):
+                summary["codec_metadata"]["assignment_closure"] = "aggregate"
+            closure_candidate = output / "rereview-assignment-closure.jsonl"
+            closure_candidate.write_text(
+                "".join(json.dumps(row) + "\n" for row in closure_rows)
+            )
+            with self.assertRaisesRegex(ValueError, "scenario binding differs"):
+                sim.validate_experiment_jsonl(closure_candidate)
+
+            rerouted_ledger = [
+                json.loads(line) for line in original_ledger.decode().splitlines()
+            ]
+            rerouted_ledger[1]["worker"] = 1
+            rerouted_ledger[2]["rel_seq"] = 0
+            rerouted_ledger[2]["route_sequence"] = 0
+            retained_ledger.write_text(
+                "".join(json.dumps(row) + "\n" for row in rerouted_ledger)
+            )
+            rerouted_rows = copy.deepcopy(original_stream)
+            digest = sim.sha256(retained_ledger)
+            rerouted_rows[0]["physical_ledger_evidence"]["sha256"] = digest
+            rerouted_rows[0]["expected_summary"]["codec_metadata"][
+                "ledger_sha256"
+            ] = digest
+            rerouted_rows[-1]["summary"]["codec_metadata"]["ledger_sha256"] = digest
+            rerouted_candidate = output / "rereview-exact-route.jsonl"
+            rerouted_candidate.write_text(
+                "".join(json.dumps(row) + "\n" for row in rerouted_rows)
+            )
+            with self.assertRaisesRegex(ValueError, "route/order differs"):
+                sim.validate_experiment_jsonl(rerouted_candidate)
+            retained_ledger.write_bytes(original_ledger)
+
     def test_retained_stream_validator_rejects_each_independent_drift(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1646,7 +1839,7 @@ class SimulatorTest(unittest.TestCase):
             def drift_profile(rows: list[dict[str, object]]) -> None:
                 first_event(rows, "release")["negotiated_profiles"] = ["invented"]
 
-            reject("selected-profile", drift_profile, "profiles omit")
+            reject("selected-profile", drift_profile, "not a subset|profiles omit")
 
             def drift_transaction_digest(rows: list[dict[str, object]]) -> None:
                 target = first_event(rows, "dispatch")["logical_job_id"]
@@ -1706,14 +1899,18 @@ class SimulatorTest(unittest.TestCase):
             reject(
                 "route-identity-vs-trace",
                 forge_route_identity,
-                "retained route trace|route identity drifted",
+                "route-less event identity|retained route trace|route identity drifted",
                 synchronize_summary=True,
             )
 
             def drift_phase_extent(rows: list[dict[str, object]]) -> None:
                 first_event(rows, "flow-sent")["bytes"] += 1
 
-            reject("phase-byte-extent", drift_phase_extent, "phase bytes differ")
+            reject(
+                "phase-byte-extent",
+                drift_phase_extent,
+                "delta signature|phase bytes differ",
+            )
 
             def remove_completion(rows: list[dict[str, object]]) -> None:
                 for timeline in rows[1:-1]:
@@ -1952,7 +2149,11 @@ class SimulatorTest(unittest.TestCase):
                         digest, event["raw_digest"]
                     )
 
-            reject("route-profiles", drift_profiles_coherently, "relationship profiles")
+            reject(
+                "route-profiles",
+                drift_profiles_coherently,
+                "not a subset|relationship profiles",
+            )
 
             def forge_physical_claim(rows: list[dict[str, object]]) -> None:
                 rows[0]["physical_codec_result"] = True
@@ -2235,6 +2436,292 @@ class SimulatorTest(unittest.TestCase):
                 sim.write_result(scenario, result, output, execution_for(path))
                 streams.append((output / "experiment.jsonl").read_bytes())
             self.assertEqual(streams[0], streams[1])
+
+    def test_v2_validator_rejects_final_rereview_event_mutations(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_v2_fixture(root, [30, 20], [15, 22], workers=1)
+            scenario = sim.load_scenario(path)
+            output = root / "out"
+            sim.write_result(
+                scenario,
+                sim.Simulator(scenario, sim.RawAdapter()).run(),
+                output,
+                execution_for(path),
+            )
+            original = [
+                json.loads(line)
+                for line in (output / "experiment.jsonl").read_text().splitlines()
+            ]
+
+            def all_events(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+                return [event for row in rows[1:-1] for event in row["events"]]
+
+            def first_event(
+                rows: list[dict[str, object]], name: str, logical: int = 0
+            ) -> dict[str, object]:
+                return next(
+                    event
+                    for event in all_events(rows)
+                    if event["event"] == name and event["logical"] == logical
+                )
+
+            def reindex_events(rows: list[dict[str, object]]) -> None:
+                sequence = 0
+                for timeline in rows[1:-1]:
+                    for event in timeline["events"]:
+                        event["sequence"] = sequence
+                        sequence += 1
+                    timeline["event_sequence_start"] = (
+                        ""
+                        if not timeline["events"]
+                        else timeline["events"][0]["sequence"]
+                    )
+                    timeline["event_sequence_end"] = (
+                        ""
+                        if not timeline["events"]
+                        else timeline["events"][-1]["sequence"]
+                    )
+                rows[-1]["event_count"] = sequence
+
+            def reject(label: str, mutate: object, pattern: str) -> None:
+                rows = copy.deepcopy(original)
+                mutate(rows)
+                candidate = output / f"rereview-{label}.jsonl"
+                candidate.write_text("".join(json.dumps(row) + "\n" for row in rows))
+                with self.subTest(label=label), self.assertRaisesRegex(
+                    ValueError, pattern
+                ):
+                    sim.validate_experiment_jsonl(candidate)
+
+            reject(
+                "transaction",
+                lambda rows: first_event(rows, "dialogue-start").__setitem__(
+                    "transaction", 999
+                ),
+                "transaction sequence drifted",
+            )
+            reject(
+                "compiler-slot",
+                lambda rows: first_event(rows, "compile-start").__setitem__(
+                    "compiler_slot", 999
+                ),
+                "compiler slot is outside topology",
+            )
+            reject(
+                "staging-slot",
+                lambda rows: first_event(rows, "compile-start").__setitem__(
+                    "staging_slot", 999
+                ),
+                "staging slot is outside topology",
+            )
+            reject(
+                "route-less-provenance",
+                lambda rows: first_event(rows, "release")["provenance"].__setitem__(
+                    "route_identity", "observed"
+                ),
+                "route-less event provenance",
+            )
+
+            def invent_resource(rows: list[dict[str, object]]) -> None:
+                first_event(rows, "release")["resource_byte_delta"][
+                    "invented_buffer_bytes"
+                ] = 1
+                first_event(rows, "transaction-complete")["resource_byte_delta"][
+                    "invented_buffer_bytes"
+                ] = -1
+
+            reject("resource-account", invent_resource, "schema error|delta signature")
+
+            def omit_compiler_queue(rows: list[dict[str, object]]) -> None:
+                for timeline in rows[1:-1]:
+                    for index, event in enumerate(timeline["events"]):
+                        if (
+                            event["event"] == "compiler-queued"
+                            and event["logical"] == 0
+                        ):
+                            del timeline["events"][index]
+                            reindex_events(rows)
+                            return
+
+            reject("compiler-queue-omitted", omit_compiler_queue, "queue cardinality")
+
+            def duplicate_compiler_queue(rows: list[dict[str, object]]) -> None:
+                for timeline in rows[1:-1]:
+                    for index, event in enumerate(timeline["events"]):
+                        if (
+                            event["event"] == "compiler-queued"
+                            and event["logical"] == 0
+                        ):
+                            timeline["events"].insert(index + 1, copy.deepcopy(event))
+                            reindex_events(rows)
+                            return
+
+            reject(
+                "compiler-queue-duplicate",
+                duplicate_compiler_queue,
+                "queue cardinality",
+            )
+
+            def drift_raw_flow_name(rows: list[dict[str, object]]) -> None:
+                flow = first_event(rows, "flow-queued")["flow"]
+                for event in all_events(rows):
+                    if event["flow"] == flow:
+                        event["phase"] = "not-raw-tu"
+
+            reject("raw-flow", drift_raw_flow_name, "raw adapter source flow")
+
+            def append_trailing_gap(rows: list[dict[str, object]]) -> None:
+                summary_record = rows.pop()
+                summary = summary_record["summary"]
+                old_end = summary["makespan_ns"]
+                rows.append(
+                    {
+                        "record": "gap",
+                        "sequence": len(rows) - 1,
+                        "wall_start_ns": old_end,
+                        "wall_end_ns": old_end + 17,
+                        "wall_duration_ns": 17,
+                        "active_position_ns": summary["timeline_active_ns"],
+                        "reason": "timer",
+                        "noncanonical_display": {
+                            "state": copy.deepcopy(
+                                rows[-1]["noncanonical_display"]["state"]
+                            )
+                        },
+                        "events": [],
+                        "event_sequence_start": "",
+                        "event_sequence_end": "",
+                    }
+                )
+                summary["makespan_ns"] = old_end + 17
+                summary["makespan_seconds"] = (old_end + 17) / sim.NANOSECONDS
+                summary["wall_minus_summed_generation_ns"] += 17
+                summary["timeline_records"] += 1
+                summary["timeline_gaps"] += 1
+                summary_record["timeline_records"] += 1
+                rows[0]["expected_summary"] = copy.deepcopy(summary)
+                rows.append(summary_record)
+
+            reject("trailing-gap", append_trailing_gap, "final canonical transaction")
+
+    def test_v2_validator_rejects_first_tu_profile_superset(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_v2_fixture(root, [10], [15], workers=1)
+            scenario = sim.load_scenario(path)
+            output = root / "out"
+            sim.write_result(
+                scenario,
+                sim.Simulator(scenario, sim.RawAdapter()).run(),
+                output,
+                execution_for(path),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "experiment.jsonl").read_text().splitlines()
+            ]
+            for timeline in rows[1:-1]:
+                for event in timeline["events"]:
+                    event["route_state_profiles"] = ["legacy", "retained-window-v2"]
+                    if event["transaction_digest"] is None:
+                        continue
+                    digest = sim.transaction_identity_digest(
+                        rows[0]["scenario_digest"],
+                        event["logical_job_id"],
+                        event["attempt_id"],
+                        event["C_STORE_GUID"],
+                        event["F_STORE_GUID"],
+                        event["HISTORY_NONCE"],
+                        event["TU_SEQ"],
+                        event["REL_SEQ"],
+                        event["raw_digest"],
+                        event["negotiated_profiles"],
+                        event["route_state_profiles"],
+                    )
+                    event["transaction_digest"] = digest
+                    event["InputRecord_identity"] = sim.input_record_identity(
+                        digest, event["raw_digest"]
+                    )
+            candidate = output / "rereview-profile-superset.jsonl"
+            candidate.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            with self.assertRaisesRegex(ValueError, "not a subset"):
+                sim.validate_experiment_jsonl(candidate)
+
+    def test_generation_duration_must_meet_derived_capacity_floor(self) -> None:
+        with self.assertRaisesRegex(ValueError, "below its capacity floor"):
+            sim._require_generation_capacity_floor(Path("malformed.jsonl"), 3, 9, 10)
+        sim._require_generation_capacity_floor(Path("valid.jsonl"), 3, 10, 10)
+
+    def test_v2_validator_rejects_source_flow_for_compile_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_v2_fixture(root, [10], [15], workers=1)
+            document = json.loads(path.read_text())
+            document["capabilities"]["experiment_control"] = "compile_only"
+            path.write_text(json.dumps(document, indent=2) + "\n")
+            scenario = sim.load_scenario(path)
+            output = root / "out"
+            sim.write_result(
+                scenario,
+                sim.Simulator(scenario, sim.CompileOnlyAdapter()).run(),
+                output,
+                execution_for(path),
+            )
+            stream_path = output / "experiment.jsonl"
+            self.assertEqual(
+                sim.validate_experiment_jsonl(stream_path)["c_to_f_bytes"], 0
+            )
+            rows = [json.loads(line) for line in stream_path.read_text().splitlines()]
+            timeline = next(
+                row
+                for row in rows[1:-1]
+                if any(event["event"] == "dialogue-start" for event in row["events"])
+            )
+            insertion = next(
+                index + 1
+                for index, event in enumerate(timeline["events"])
+                if event["event"] == "dialogue-start"
+            )
+            identity = copy.deepcopy(timeline["events"][insertion - 1])
+            fabricated = []
+            for name in ("flow-queued", "flow-start", "flow-sent", "flow-finish"):
+                event = copy.deepcopy(identity)
+                event.update(
+                    {
+                        "event": name,
+                        "stage": sim.EVENT_SEMANTICS[name]["stage"],
+                        "actor": "C_cache",
+                        "flow": 0,
+                        "phase": "fabricated-source",
+                        "direction": "c_to_f",
+                        "bytes": 0,
+                        "byte_account": "source",
+                        "detail": "",
+                        "c_to_f_byte_delta": 0,
+                        "f_to_c_byte_delta": 0,
+                        "resource_byte_delta": {},
+                        "queue_byte_delta": {},
+                    }
+                )
+                fabricated.append(event)
+            timeline["events"][insertion:insertion] = fabricated
+            sequence = 0
+            for row in rows[1:-1]:
+                for event in row["events"]:
+                    event["sequence"] = sequence
+                    sequence += 1
+                row["event_sequence_start"] = (
+                    "" if not row["events"] else row["events"][0]["sequence"]
+                )
+                row["event_sequence_end"] = (
+                    "" if not row["events"] else row["events"][-1]["sequence"]
+                )
+            rows[-1]["event_count"] = sequence
+            candidate = output / "rereview-compile-only-source-flow.jsonl"
+            candidate.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            with self.assertRaisesRegex(ValueError, "compile-only adapter carries"):
+                sim.validate_experiment_jsonl(candidate)
 
     def test_transaction_digest_binds_route_state_profiles(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

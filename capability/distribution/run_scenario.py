@@ -502,6 +502,12 @@ class PhysicalLedgerAdapter(CodecAdapter):
         rows = [json.loads(line) for line in self.path.read_text().splitlines() if line]
         if len(rows) < 3:
             raise ValueError(f"{self.path}: physical ledger is incomplete")
+        for row_number, row in enumerate(rows, start=1):
+            validate_json_schema(
+                row,
+                "physical-ledger.schema.json",
+                f"{self.path}:{row_number}",
+            )
         descriptor, final = rows[0], rows[-1]
         if (
             descriptor.get("record") != "physical-ledger"
@@ -5344,6 +5350,351 @@ def write_route_trace(
             output.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
 
 
+@dataclass(frozen=True)
+class RetainedPhysicalEntry:
+    """Validated transaction contract recovered from one retained physical row."""
+
+    row_number: int
+    worker: int
+    tu_seq: int
+    rel_seq: int
+    route_sequence: int
+    phases: tuple[DagNode, ...]
+    plan: TransactionPlan
+    row: Mapping[str, object]
+
+
+def _validate_retained_physical_ledger(
+    path: Path,
+    rows: Sequence[Mapping[str, object]],
+    codec: str,
+    expected_tus: Mapping[tuple[str, int, int], Mapping[str, object]],
+    f_count: int,
+) -> dict[tuple[str, int, int], RetainedPhysicalEntry]:
+    """Validate every retained ledger row and recover its exact transaction DAG."""
+    if len(rows) < 3:
+        raise ValueError(f"{path}: retained physical ledger is incomplete")
+    for row_number, row in enumerate(rows, start=1):
+        validate_json_schema(
+            row,
+            "physical-ledger.schema.json",
+            f"{path}:physical-ledger:{row_number}",
+        )
+    descriptor = rows[0]
+    summary = rows[-1]
+    if descriptor["codec"] != codec:
+        raise ValueError(f"{path}: retained physical ledger codec differs")
+
+    entries: dict[tuple[str, int, int], RetainedPhysicalEntry] = {}
+    route_sequences: dict[tuple[int, int], list[int]] = defaultdict(list)
+    tu_sequences: dict[int, list[int]] = defaultdict(list)
+    c_to_f_total = 0
+    f_to_c_total = 0
+    for row_number, row in enumerate(rows[1:-1], start=2):
+        key = (str(row["workload"]), int(row["build"]), int(row["logical"]))
+        expected = expected_tus.get(key)
+        if expected is None or key in entries:
+            raise ValueError(
+                f"{path}: retained physical ledger has unknown or repeated TU {key}"
+            )
+        content = expected["content"]
+        assert isinstance(content, Mapping)
+        if (
+            row["raw_bytes"] != content["raw_bytes"]
+            or row["raw_sha256"] != content["raw_sha256"]
+        ):
+            raise ValueError(f"{path}: retained physical TU input differs for {key}")
+        worker = checked_nonnegative_int(row["worker"], "physical ledger worker")
+        if worker >= f_count:
+            raise ValueError(f"{path}: retained physical TU worker is outside topology")
+        tu_seq = checked_nonnegative_int(row["tu_seq"], "physical ledger TU_SEQ")
+        rel_seq = checked_nonnegative_int(row["rel_seq"], "physical ledger REL_SEQ")
+        route_sequence = checked_nonnegative_int(
+            row["route_sequence"], "physical ledger route_sequence"
+        )
+        if rel_seq != route_sequence:
+            raise ValueError(
+                f"{path}: retained physical REL_SEQ differs from route_sequence"
+            )
+
+        phase_rows = row["phases"]
+        assert isinstance(phase_rows, list)
+        graph_declared = "initial_tokens" in row
+        graph_fields = {"priority", "depends_on"}
+        for phase_index, phase_row in enumerate(phase_rows):
+            assert isinstance(phase_row, Mapping)
+            present = graph_fields & set(phase_row)
+            if graph_declared and present != graph_fields:
+                raise ValueError(
+                    f"{path}: retained physical phase {phase_index} has an incomplete DAG shape"
+                )
+            if not graph_declared and present:
+                raise ValueError(
+                    f"{path}: retained physical linear phase {phase_index} carries DAG fields"
+                )
+        if graph_declared:
+            nodes = tuple(
+                DagNode(
+                    str(phase["name"]),
+                    str(phase["direction"]),
+                    int(phase["bytes"]),
+                    tuple(str(token) for token in phase["depends_on"]),
+                    int(phase["priority"]),
+                )
+                for phase in phase_rows
+            )
+            plan = TransactionPlan(
+                nodes,
+                tuple(str(token) for token in row["initial_tokens"]),
+                tuple(str(token) for token in row["input_ready_after"]),
+                tuple(str(token) for token in row["commit_after"]),
+            )
+        else:
+            nodes_list: list[DagNode] = []
+            previous: str | None = None
+            for phase in phase_rows:
+                dependencies = () if previous is None else (f"{previous}:delivered",)
+                node = DagNode(
+                    str(phase["name"]),
+                    str(phase["direction"]),
+                    int(phase["bytes"]),
+                    dependencies,
+                    3,
+                )
+                nodes_list.append(node)
+                previous = node.name
+            nodes = tuple(nodes_list)
+            final_token = f"{nodes[-1].name}:delivered"
+            plan = TransactionPlan(
+                nodes,
+                ("attachment:accepted",),
+                ("attachment:accepted", final_token),
+                (final_token,),
+            )
+
+        if "frame_bytes" in row:
+            frame_bytes = row["frame_bytes"]
+            assert isinstance(frame_bytes, Mapping)
+            framed = {direction: 0 for direction in DIRECTIONS}
+            for name, byte_count in frame_bytes.items():
+                direction = str(name).split(":", 1)[0]
+                framed[direction] += int(byte_count)
+            phase_totals = {
+                direction: sum(
+                    node.byte_count for node in nodes if node.direction == direction
+                )
+                for direction in DIRECTIONS
+            }
+            if framed != phase_totals:
+                raise ValueError(
+                    f"{path}: retained physical frame bytes differ from phase bytes"
+                )
+
+        environment = int(expected["environment"])
+        route_sequences[(environment, worker)].append(route_sequence)
+        tu_sequences[environment].append(tu_seq)
+        c_to_f_total += sum(
+            node.byte_count for node in nodes if node.direction == "c_to_f"
+        )
+        f_to_c_total += sum(
+            node.byte_count for node in nodes if node.direction == "f_to_c"
+        )
+        entries[key] = RetainedPhysicalEntry(
+            row_number,
+            worker,
+            tu_seq,
+            rel_seq,
+            route_sequence,
+            nodes,
+            plan,
+            row,
+        )
+
+    if set(entries) != set(expected_tus):
+        raise ValueError(f"{path}: retained physical TU set differs")
+    for route, sequences in route_sequences.items():
+        if sequences != list(range(len(sequences))):
+            raise ValueError(
+                f"{path}: retained physical route {route} order is not contiguous"
+            )
+    for environment, sequences in tu_sequences.items():
+        expected_count = sum(
+            int(details["environment"]) == environment
+            for details in expected_tus.values()
+        )
+        if sorted(sequences) != list(range(expected_count)):
+            raise ValueError(
+                f"{path}: retained physical C{environment} TU_SEQ set is not contiguous"
+            )
+    expected_totals = {
+        "tus": len(entries),
+        "c_to_f_bytes": c_to_f_total,
+        "f_to_c_bytes": f_to_c_total,
+    }
+    if summary["totals"] != expected_totals:
+        raise ValueError(f"{path}: retained physical summary totals differ")
+    return entries
+
+
+def _validate_physical_event_graph(
+    path: Path,
+    key: tuple[str, int, int],
+    entry: RetainedPhysicalEntry,
+    events: Sequence[Mapping[str, object]],
+) -> None:
+    """Join a retained phase/token DAG to the exact events emitted for one TU."""
+    ready_events = [event for event in events if event["event"] == "dag-node-ready"]
+    token_events = [event for event in events if event["event"] == "dag-token"]
+    source_flow_events = [
+        event
+        for event in events
+        if event["event"] in FLOW_EVENT_NAMES and event["byte_account"] == "source"
+    ]
+    nodes = {node.name: node for node in entry.phases}
+    if len(ready_events) != len(nodes) or {
+        str(event["phase"]) for event in ready_events
+    } != set(nodes):
+        raise ValueError(f"{path}: TU {key} DAG ready-node set differs from ledger")
+    ready_by_name = {str(event["phase"]): event for event in ready_events}
+    flows_by_name: dict[str, set[int]] = defaultdict(set)
+    flow_events_by_id: dict[int, list[Mapping[str, object]]] = defaultdict(list)
+    for event in source_flow_events:
+        phase_name = str(event["phase"])
+        if phase_name not in nodes:
+            raise ValueError(f"{path}: TU {key} source flow is absent from ledger DAG")
+        flow_id = int(event["flow"])
+        flows_by_name[phase_name].add(flow_id)
+        flow_events_by_id[flow_id].append(event)
+    if any(len(flows_by_name[name]) != 1 for name in nodes) or set(
+        flows_by_name
+    ) != set(nodes):
+        raise ValueError(f"{path}: TU {key} phase-to-flow cardinality differs")
+
+    expected_token_details = {
+        f"{node.name}:{stage}"
+        for node in entry.phases
+        for stage in ("sent", "delivered")
+    }
+    details = [str(event["detail"]) for event in token_events]
+    if (
+        len(details) != len(expected_token_details)
+        or set(details) != expected_token_details
+    ):
+        raise ValueError(f"{path}: TU {key} DAG token detail set differs from ledger")
+    token_by_detail = {str(event["detail"]): event for event in token_events}
+    dialogue_start = next(
+        event for event in events if event["event"] == "dialogue-start"
+    )
+    for node in entry.phases:
+        ready = ready_by_name[node.name]
+        if (
+            ready["direction"] != node.direction
+            or ready["bytes"] != node.byte_count
+            or ready["byte_account"] != "source"
+        ):
+            raise ValueError(
+                f"{path}: TU {key} DAG ready extent differs for {node.name}"
+            )
+        if int(ready["sequence"]) <= int(dialogue_start["sequence"]):
+            raise ValueError(f"{path}: TU {key} DAG node became ready before dialogue")
+        for token in node.dependencies:
+            if token in entry.plan.initial_tokens:
+                continue
+            produced = token_by_detail.get(token)
+            if produced is None or int(produced["sequence"]) >= int(ready["sequence"]):
+                raise ValueError(
+                    f"{path}: TU {key} DAG dependency was not ready for {node.name}"
+                )
+        flow_id = next(iter(flows_by_name[node.name]))
+        phase_events = flow_events_by_id[flow_id]
+        for event in phase_events:
+            if (
+                event["direction"] != node.direction
+                or event["bytes"] != node.byte_count
+                or event["phase"] != node.name
+            ):
+                raise ValueError(
+                    f"{path}: TU {key} flow extent differs for {node.name}"
+                )
+        sent = next(event for event in phase_events if event["event"] == "flow-sent")
+        finish = next(
+            event for event in phase_events if event["event"] == "flow-finish"
+        )
+        sent_token = token_by_detail[f"{node.name}:sent"]
+        delivered_token = token_by_detail[f"{node.name}:delivered"]
+        if not (
+            int(sent["sequence"])
+            < int(sent_token["sequence"])
+            < int(finish["sequence"])
+            < int(delivered_token["sequence"])
+        ):
+            raise ValueError(f"{path}: TU {key} DAG token/flow order differs")
+
+    for event_name, required_tokens in (
+        ("input-ready", entry.plan.input_ready_after),
+        ("transaction-commit", entry.plan.commit_after),
+    ):
+        join = next(event for event in events if event["event"] == event_name)
+        for token in required_tokens:
+            if token in entry.plan.initial_tokens:
+                continue
+            produced = token_by_detail.get(token)
+            if produced is None or int(produced["sequence"]) >= int(join["sequence"]):
+                raise ValueError(
+                    f"{path}: TU {key} {event_name} precedes its DAG token join"
+                )
+
+
+def _expected_event_deltas(
+    event: Mapping[str, object], raw_bytes: int
+) -> tuple[dict[str, int], dict[str, int]]:
+    """Return the one canonical resource/queue delta signature for an event."""
+    name = str(event["event"])
+    byte_count = int(event["bytes"]) if event["bytes"] != "" else 0
+    direction = str(event["direction"])
+    resources: dict[str, int] = {}
+    queues: dict[str, int] = {}
+    if name == "release":
+        resources["prepared_input_bytes"] = raw_bytes
+        queues["scheduler_ready_bytes"] = raw_bytes
+    elif name == "dispatch":
+        queues = {
+            "scheduler_ready_bytes": -raw_bytes,
+            "route_input_pending_bytes": raw_bytes,
+        }
+    elif name == "input-ready":
+        resources["input_record_bytes"] = raw_bytes
+        queues = {
+            "route_input_pending_bytes": -raw_bytes,
+            "compiler_input_bytes": raw_bytes,
+        }
+    elif name == "compile-start":
+        queues["compiler_input_bytes"] = -raw_bytes
+    elif name == "transaction-complete":
+        resources = {
+            "prepared_input_bytes": -raw_bytes,
+            "input_record_bytes": -raw_bytes,
+        }
+    elif name == "flow-queued" and byte_count:
+        queues[f"network_{direction}_outstanding_bytes"] = byte_count
+    elif name == "flow-sent" and byte_count:
+        resources[f"network_{direction}_propagating_bytes"] = byte_count
+        queues[f"network_{direction}_outstanding_bytes"] = -byte_count
+    elif name == "flow-finish" and byte_count:
+        resources[f"network_{direction}_propagating_bytes"] = -byte_count
+    return resources, queues
+
+
+def _require_generation_capacity_floor(
+    path: Path, generation: int, duration_ns: int, capacity_floor_ns: int
+) -> None:
+    """Reject a claimed generation duration below its independently derived floor."""
+    if duration_ns < capacity_floor_ns:
+        raise ValueError(
+            f"{path}: generation {generation} duration is below its capacity floor"
+        )
+
+
 def _validate_tu_lifecycle(
     path: Path,
     key: tuple[str, int, int],
@@ -5668,11 +6019,33 @@ def _validate_event_semantics(
         raise ValueError(
             f"{path}: event {event_index} actor differs from semantic table"
         )
+    detail = event["detail"]
+    allowed_details: tuple[str, ...] | None
+    if name == "route-bound":
+        allowed_details = ("physical-route-trace", "stable-rendezvous")
+    elif name == "compiler-queued":
+        allowed_details = ("", "waiting-for-environment")
+    elif name in {"flow-start", "flow-resume"}:
+        allowed_details = ("", "bounded-priority-turn")
+    elif name == "dag-token":
+        allowed_details = None
+        if not isinstance(detail, str) or not detail:
+            raise ValueError(f"{path}: event {event_index} DAG token detail is empty")
+    else:
+        allowed_details = ("",)
+    if allowed_details is not None and detail not in allowed_details:
+        raise ValueError(
+            f"{path}: event {event_index} detail differs from semantic table"
+        )
     transaction_free = name in {"release", "route-bound"}
     if transaction_free:
         if event["transaction"] != "":
             raise ValueError(
                 f"{path}: event {event_index} unexpectedly has a transaction"
+            )
+        if any(event[name] != "" for name in ("slot", "staging_slot", "compiler_slot")):
+            raise ValueError(
+                f"{path}: event {event_index} transaction-free slot shape differs"
             )
     elif not isinstance(event["transaction"], int):
         raise ValueError(f"{path}: event {event_index} lacks a transaction")
@@ -5953,6 +6326,7 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
         raise ValueError(f"{path}: physical codec claim differs from selected adapter")
     codec_metadata = final_summary.get("codec_metadata")
     physical_ledger_rows: list[dict[str, object]] = []
+    physical_entries: dict[tuple[str, int, int], RetainedPhysicalEntry] = {}
     if not expected_physical_result and codec_metadata != {}:
         raise ValueError(f"{path}: diagnostic adapter carries physical codec metadata")
     if not expected_physical_result and "physical_ledger_evidence" in header:
@@ -6010,6 +6384,13 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
             raise ValueError(
                 f"{path}: physical codec metadata differs from retained ledger"
             )
+        physical_entries = _validate_retained_physical_ledger(
+            path,
+            physical_ledger_rows,
+            selected_adapter,
+            expected_tus,
+            int(manifest["topology"]["f_count"]),
+        )
     routing = final_summary.get("routing", {})
     scheduler_policy = manifest["topology"]["scheduler_policy"]
     trace_assignment = manifest["topology"]["assignment_source"] == "route_trace"
@@ -6229,6 +6610,11 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
     )
     release_times: dict[tuple[str, int, int], int] = {}
     completion_times: dict[tuple[str, int, int], int] = {}
+    dispatch_events_by_tu: dict[tuple[str, int, int], Mapping[str, object]] = {}
+    transaction_sequences_by_tu: dict[tuple[str, int, int], set[int]] = defaultdict(set)
+    assignment_slots_by_tu: dict[tuple[str, int, int], set[int]] = defaultdict(set)
+    staging_slots_by_tu: dict[tuple[str, int, int], set[int]] = defaultdict(set)
+    compiler_slots_by_tu: dict[tuple[str, int, int], set[int]] = defaultdict(set)
     tu_sequences: dict[tuple[str, int, int], int] = {}
     dispatch_tu_sequences_by_environment: dict[int, list[int]] = defaultdict(list)
     dispatch_rel_sequences_by_route: dict[tuple[int, int], list[int]] = defaultdict(
@@ -6249,7 +6635,9 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
     profiles_by_relationship: dict[
         tuple[object, object, object], tuple[tuple[str, ...], tuple[str, ...]]
     ] = {}
-    environment_ready_by_route: dict[tuple[int, int], list[int]] = defaultdict(list)
+    environment_ready_by_route: dict[tuple[int, int], list[Mapping[str, object]]] = (
+        defaultdict(list)
+    )
 
     def apply_history(
         deltas: Mapping[str, object],
@@ -6334,6 +6722,10 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
                 tuple(event["negotiated_profiles"]),
                 tuple(event["route_state_profiles"]),
             )
+            if not set(event_profiles[1]) <= set(event_profiles[0]):
+                raise ValueError(
+                    f"{path}: route-state profiles are not a subset of negotiated profiles"
+                )
             established_profiles = profiles_by_tu.setdefault(tu_key, event_profiles)
             if established_profiles != event_profiles:
                 raise ValueError(f"{path}: TU profiles drifted within one transaction")
@@ -6358,8 +6750,20 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
                 release_times[tu_key] = event["time_ns"]
             if event["event"] == "transaction-complete":
                 completion_times[tu_key] = event["time_ns"]
+            expected_resources, expected_queues = _expected_event_deltas(
+                event, int(content["raw_bytes"])
+            )
+            if (
+                event["resource_byte_delta"] != expected_resources
+                or event["queue_byte_delta"] != expected_queues
+            ):
+                raise ValueError(
+                    f"{path}: event {event_index} resource/queue delta signature differs"
+                )
         elif event["raw_digest"] is not None:
             raise ValueError(f"{path}: non-TU event carries a raw digest")
+        elif event["resource_byte_delta"] or event["queue_byte_delta"]:
+            raise ValueError(f"{path}: non-TU event carries resource/queue deltas")
         if event["provenance"]["timing"] != "modeled":
             raise ValueError(f"{path}: simulated event timing is not marked modeled")
 
@@ -6369,6 +6773,11 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
             or selected_profile not in event["route_state_profiles"]
         ):
             raise ValueError(f"{path}: event profiles omit the selected codec")
+        expected_account = (
+            "environment" if event["phase"] == "environment-image" else "source"
+        )
+        if event["byte_account"] != expected_account:
+            raise ValueError(f"{path}: event byte account differs from its phase")
         if event["phase"] == "":
             if event["direction"] != "" or event["bytes"] != "":
                 raise ValueError(f"{path}: non-flow event carries a phase extent")
@@ -6571,6 +6980,23 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
             or event["InputRecord_identity"] is not None
         ):
             raise ValueError(f"{path}: C-only event carries a transaction identity")
+        if event["worker"] == "":
+            if event["event"] != "release" or any(
+                event[name] is not None
+                for name in (
+                    "physical_endpoint",
+                    "RouteLaneId",
+                    "F_STORE_GUID",
+                    "session_serial",
+                    "HISTORY_NONCE",
+                    "REL_SEQ",
+                    "transaction_digest",
+                    "InputRecord_identity",
+                )
+            ):
+                raise ValueError(f"{path}: route-less event identity is not canonical")
+            if event["provenance"]["route_identity"] != "derived":
+                raise ValueError(f"{path}: route-less event provenance is not derived")
         if event["tu_seq"] != "" and event["tu_seq"] != event["TU_SEQ"]:
             raise ValueError(f"{path}: TU_SEQ aliases differ")
         if event["rel_seq"] != "" and event["rel_seq"] != event["REL_SEQ"]:
@@ -6583,6 +7009,9 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
         ):
             raise ValueError(f"{path}: transaction event lacks its digest")
         if event["event"] == "dispatch":
+            if tu_key in dispatch_events_by_tu:
+                raise ValueError(f"{path}: TU was dispatched more than once")
+            dispatch_events_by_tu[tu_key] = event
             worker_by_tu[tu_key] = int(event["worker"])
             dispatches_by_route[(event["environment"], event["worker"])] += 1
             assignment_counts[
@@ -6595,9 +7024,43 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
                 (event["environment"], event["worker"])
             ].append(event["REL_SEQ"])
             dispatch_transaction_sequences.append(event["transaction"])
+        if event["event"] not in {"release", "route-bound"}:
+            transaction_sequences_by_tu[tu_key].add(int(event["transaction"]))
+            if not isinstance(event["slot"], int) or not isinstance(
+                event["staging_slot"], int
+            ):
+                raise ValueError(f"{path}: transaction event lacks stable F slots")
+            if not (
+                0
+                <= int(event["slot"])
+                < manifest["topology"].get(
+                    "input_staging_slots", manifest["topology"]["f_slots"]
+                )
+                and 0
+                <= int(event["staging_slot"])
+                < manifest["topology"].get(
+                    "input_staging_slots", manifest["topology"]["f_slots"]
+                )
+            ):
+                raise ValueError(
+                    f"{path}: transaction staging slot is outside topology"
+                )
+            if event["slot"] != event["staging_slot"]:
+                raise ValueError(f"{path}: assignment/staging slot aliases differ")
+            assignment_slots_by_tu[tu_key].add(int(event["slot"]))
+            staging_slots_by_tu[tu_key].add(int(event["staging_slot"]))
+            compiler_slot = event["compiler_slot"]
+            if compiler_slot is not None:
+                if (
+                    not isinstance(compiler_slot, int)
+                    or isinstance(compiler_slot, bool)
+                    or not 0 <= compiler_slot < manifest["topology"]["f_slots"]
+                ):
+                    raise ValueError(f"{path}: compiler slot is outside topology")
+                compiler_slots_by_tu[tu_key].add(compiler_slot)
         if event["event"] == "environment_ready":
             environment_ready_by_route[(event["environment"], event["worker"])].append(
-                int(event["time_ns"])
+                event
             )
         if event["event"] in FLOW_EVENT_NAMES:
             flow_id = int(event["flow"])
@@ -6657,6 +7120,44 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
         if flow_finish_times[flow_id] - flow_sent_times[flow_id] != expected_latency:
             raise ValueError(f"{path}: flow {flow_id} propagation seam differs")
     expected_tu_keys = set(expected_tus)
+    source_flows_by_tu: dict[tuple[str, int, int], list[Mapping[str, object]]] = (
+        defaultdict(list)
+    )
+    for descriptor_text in flow_descriptors.values():
+        descriptor = json.loads(descriptor_text)
+        if descriptor["byte_account"] != "source":
+            continue
+        key = (
+            str(descriptor["workload"]),
+            int(descriptor["build"]),
+            int(descriptor["logical"]),
+        )
+        source_flows_by_tu[key].append(descriptor)
+    if selected_adapter == "compile-only" and source_flows_by_tu:
+        raise ValueError(f"{path}: compile-only adapter carries source flows")
+    if selected_adapter == "raw":
+        for key in expected_tu_keys:
+            flows = source_flows_by_tu.get(key, [])
+            content = expected_tus[key]["content"]
+            assert isinstance(content, Mapping)
+            if len(flows) != 1:
+                raise ValueError(
+                    f"{path}: raw adapter source flow differs from the manifest TU"
+                )
+            flow = flows[0]
+            if (
+                flow["phase"] != "raw-tu"
+                or flow["direction"] != "c_to_f"
+                or flow["bytes"] != content["raw_bytes"]
+                or flow["byte_account"] != "source"
+            ):
+                raise ValueError(
+                    f"{path}: raw adapter source flow differs from the manifest TU"
+                )
+    if not expected_physical_result and any(
+        event["event"] in {"dag-node-ready", "dag-token"} for event in events
+    ):
+        raise ValueError(f"{path}: diagnostic adapter carries a physical DAG")
     if set(lifecycle_events) != expected_tu_keys:
         raise ValueError(f"{path}: event TU set differs from workload manifest")
     for key in sorted(expected_tu_keys):
@@ -6670,11 +7171,48 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
             int(content["compile_ns"]),
             expected_route_bindings,
         )
+        dispatch = dispatch_events_by_tu.get(key)
+        if dispatch is None:
+            raise ValueError(f"{path}: TU {key} has no dispatch event")
+        if transaction_sequences_by_tu[key] != {int(dispatch["transaction"])}:
+            raise ValueError(f"{path}: TU {key} transaction sequence drifted")
+        if len(assignment_slots_by_tu[key]) != 1 or len(staging_slots_by_tu[key]) != 1:
+            raise ValueError(f"{path}: TU {key} F staging slots drifted")
+        if len(compiler_slots_by_tu[key]) != 1:
+            raise ValueError(f"{path}: TU {key} compiler slot drifted or is absent")
+        compile_start = next(
+            event
+            for event in lifecycle_events[key]
+            if event["event"] == "compile-start"
+        )
+        compile_start_sequence = int(compile_start["sequence"])
+        established_compiler_slot = next(iter(compiler_slots_by_tu[key]))
+        for event in lifecycle_events[key]:
+            if event["event"] in {"release", "route-bound"}:
+                continue
+            before_compile = int(event["sequence"]) < compile_start_sequence
+            expected_slot: int | None = (
+                None if before_compile else established_compiler_slot
+            )
+            if event["compiler_slot"] != expected_slot:
+                raise ValueError(f"{path}: TU {key} compiler slot lifetime differs")
+        if expected_physical_result:
+            _validate_physical_event_graph(
+                path, key, physical_entries[key], lifecycle_events[key]
+            )
     if (
         set(release_times) != expected_tu_keys
         or set(completion_times) != expected_tu_keys
     ):
         raise ValueError(f"{path}: TU release/completion cardinality differs")
+    canonical_makespan_ns = max(completion_times.values())
+    if (
+        final_summary.get("makespan_ns") != canonical_makespan_ns
+        or previous_wall_end != canonical_makespan_ns
+    ):
+        raise ValueError(
+            f"{path}: makespan does not equal the final canonical transaction completion"
+        )
     environment_manifest = manifest["environment"]
     used_routes = set(dispatches_by_route)
     if environment_manifest["initial_state"] == "resident":
@@ -6694,13 +7232,38 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
             compile_start = next(
                 event for event in tu_events if event["event"] == "compile-start"
             )
-            ready_ns = environment_ready_by_route[
+            ready_event = environment_ready_by_route[
                 (int(dispatch["environment"]), int(dispatch["worker"]))
             ][0]
+            ready_ns = int(ready_event["time_ns"])
             if int(compile_start["time_ns"]) < ready_ns:
                 raise ValueError(
                     f"{path}: TU {key} compiled before its absent environment was ready"
                 )
+
+    for key, tu_events in lifecycle_events.items():
+        dispatch = dispatch_events_by_tu[key]
+        route = (int(dispatch["environment"]), int(dispatch["worker"]))
+        queued = [event for event in tu_events if event["event"] == "compiler-queued"]
+        normal = [event for event in queued if event["detail"] == ""]
+        waiting = [
+            event for event in queued if event["detail"] == "waiting-for-environment"
+        ]
+        if len(normal) != 1:
+            raise ValueError(f"{path}: TU {key} compiler queue cardinality differs")
+        expected_waiting = 0
+        if environment_manifest["initial_state"] == "absent":
+            ready_event = environment_ready_by_route[route][0]
+            input_ready = next(
+                event for event in tu_events if event["event"] == "input-ready"
+            )
+            expected_waiting = int(input_ready["sequence"] < ready_event["sequence"])
+            if int(normal[0]["sequence"]) <= int(ready_event["sequence"]):
+                raise ValueError(
+                    f"{path}: TU {key} entered the compiler queue before environment readiness"
+                )
+        if len(waiting) != expected_waiting or len(queued) != 1 + expected_waiting:
+            raise ValueError(f"{path}: TU {key} compiler queue detail differs")
 
     for job in manifest["workload"]["jobs"]:
         workload = job["id"]
@@ -6868,6 +7431,9 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
             - min(release_times[key] for key in keys)
         )
         generation_floors.append(generation_capacity_floor(keys))
+        _require_generation_capacity_floor(
+            path, generation, generation_durations[-1], generation_floors[-1]
+        )
     summed_generation_ns = sum(generation_durations)
     summed_capacity_floor_ns = sum(generation_floors)
     derived_times = {
@@ -7125,13 +7691,44 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
             if descriptor_scenario == scenario_digest
             else "compatible-inputs-and-runtime-route-order"
         )
+        expected_assignment_closure = "exact_route" if trace_assignment else "aggregate"
         if (
             codec_metadata["scenario_binding"] != expected_binding_claim
             or codec_metadata["ledger_scenario_sha256"] != descriptor_scenario
             or codec_metadata["replay_scenario_sha256"] != scenario_digest
-            or codec_metadata["assignment_closure"] not in {"exact_route", "aggregate"}
+            or codec_metadata["assignment_closure"] != expected_assignment_closure
         ):
             raise ValueError(f"{path}: physical codec scenario binding differs")
+        for key, entry in physical_entries.items():
+            dispatch = dispatch_events_by_tu[key]
+            if entry.tu_seq != dispatch["TU_SEQ"]:
+                raise ValueError(
+                    f"{path}: retained physical TU_SEQ differs from dispatch"
+                )
+            if expected_assignment_closure == "exact_route":
+                if (
+                    entry.worker != dispatch["worker"]
+                    or entry.rel_seq != dispatch["REL_SEQ"]
+                    or entry.route_sequence != dispatch["REL_SEQ"]
+                ):
+                    raise ValueError(
+                        f"{path}: retained physical route/order differs from dispatch"
+                    )
+                trace_entry = trace_entries.get(key)
+                if trace_entry is None or (
+                    entry.worker,
+                    entry.tu_seq,
+                    entry.rel_seq,
+                    entry.route_sequence,
+                ) != (
+                    trace_entry.worker,
+                    trace_entry.tu_seq,
+                    trace_entry.rel_seq,
+                    trace_entry.rel_seq,
+                ):
+                    raise ValueError(
+                        f"{path}: retained physical route/order differs from exact trace"
+                    )
         ledger_tus: dict[tuple[str, int, int], dict[str, object]] = {}
         for row in physical_ledger_rows[1:-1]:
             if row.get("record") != "tu" or row.get("exact") is not True:

@@ -1,0 +1,155 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "icecream-physical-codec-ledger-v1",
+  "title": "Icecream physical codec ledger record",
+  "oneOf": [
+    { "$ref": "#/$defs/descriptor" },
+    { "$ref": "#/$defs/tu" },
+    { "$ref": "#/$defs/summary" }
+  ],
+  "$defs": {
+    "nonnegative": { "type": "integer", "minimum": 0 },
+    "positive": { "type": "integer", "minimum": 1 },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "reconstruction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "method"],
+      "properties": {
+        "status": { "type": "string", "minLength": 1 },
+        "method": { "type": "string", "minLength": 1 }
+      }
+    },
+    "descriptor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["record", "schema", "codec", "scenario_sha256", "reconstruction"],
+      "properties": {
+        "record": { "const": "physical-ledger" },
+        "schema": { "const": "icecream-physical-codec-ledger-v1" },
+        "codec": { "enum": ["p29", "grz"] },
+        "scenario": { "type": "string", "minLength": 1 },
+        "scenario_sha256": { "$ref": "#/$defs/sha256" },
+        "reconstruction": { "$ref": "#/$defs/reconstruction" },
+        "workload_inputs": { "type": "object" },
+        "assignment": { "type": "string", "minLength": 1 },
+        "routing": { "type": "object" },
+        "dialogue_window_per_route": { "const": 1 },
+        "command": { "type": "array", "items": { "type": "string" } },
+        "command_options": { "type": "array", "items": { "type": "string" } },
+        "codec_binary": { "type": "string", "minLength": 1 },
+        "codec_binary_sha256": { "$ref": "#/$defs/sha256" },
+        "manifest_sha256": { "$ref": "#/$defs/sha256" },
+        "route_map_sha256": { "$ref": "#/$defs/sha256" },
+        "shared_plan_digest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}([0-9a-f]{32})?$"
+        },
+        "shared_block_count": { "$ref": "#/$defs/nonnegative" },
+        "materializer": { "type": "object" },
+        "directional_streams": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["c_to_f", "f_to_c"],
+          "properties": {
+            "c_to_f": { "$ref": "#/$defs/byteTotal" },
+            "f_to_c": { "$ref": "#/$defs/byteTotal" }
+          }
+        },
+        "routes": { "type": "object" },
+        "codec_cpu": { "type": "string", "minLength": 1 },
+        "limitations": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "byteTotal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bytes"],
+      "properties": { "bytes": { "$ref": "#/$defs/nonnegative" } }
+    },
+    "phase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "direction", "bytes"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "pattern": "^[^:]+$" },
+        "direction": { "enum": ["c_to_f", "f_to_c"] },
+        "bytes": { "$ref": "#/$defs/positive" },
+        "priority": { "$ref": "#/$defs/nonnegative" },
+        "depends_on": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "tokens": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "tu": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "record", "workload", "build", "logical", "worker", "tu_seq",
+        "rel_seq", "route_sequence", "raw_bytes", "raw_sha256", "phases",
+        "state_after", "exact"
+      ],
+      "dependentRequired": {
+        "initial_tokens": ["input_ready_after", "commit_after"],
+        "input_ready_after": ["initial_tokens", "commit_after"],
+        "commit_after": ["initial_tokens", "input_ready_after"]
+      },
+      "properties": {
+        "record": { "const": "tu" },
+        "workload": { "type": "string", "minLength": 1 },
+        "build": { "$ref": "#/$defs/nonnegative" },
+        "logical": { "$ref": "#/$defs/nonnegative" },
+        "worker": { "$ref": "#/$defs/nonnegative" },
+        "tu_seq": { "$ref": "#/$defs/nonnegative" },
+        "rel_seq": { "$ref": "#/$defs/nonnegative" },
+        "route_sequence": { "$ref": "#/$defs/nonnegative" },
+        "raw_bytes": { "$ref": "#/$defs/positive" },
+        "raw_sha256": { "$ref": "#/$defs/sha256" },
+        "phases": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/phase" }
+        },
+        "initial_tokens": { "$ref": "#/$defs/tokens" },
+        "input_ready_after": { "$ref": "#/$defs/tokens" },
+        "commit_after": { "$ref": "#/$defs/tokens" },
+        "frame_bytes": {
+          "type": "object",
+          "propertyNames": { "pattern": "^(c_to_f|f_to_c):[^:]+$" },
+          "additionalProperties": { "$ref": "#/$defs/nonnegative" }
+        },
+        "state_after": { "type": "object" },
+        "exact": { "const": true }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["record", "totals"],
+      "properties": {
+        "record": { "const": "physical-summary" },
+        "totals": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["tus", "c_to_f_bytes", "f_to_c_bytes"],
+          "properties": {
+            "tus": { "$ref": "#/$defs/nonnegative" },
+            "c_to_f_bytes": { "$ref": "#/$defs/nonnegative" },
+            "f_to_c_bytes": { "$ref": "#/$defs/nonnegative" }
+          }
+        }
+      }
+    }
+  }
+}
