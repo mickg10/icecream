@@ -86,8 +86,10 @@ InputPublishResult InputRecordStore::publish(
             !entry.backing || *entry.backing != exact_input)
             throw std::logic_error(
                 "one InputRecord key was assigned conflicting exact input");
-        // A duplicate cache observation never reopens a logical job that was
-        // already closed by result acceptance or definitive cancellation.
+        // While retained, an exact duplicate preserves the existing job-open
+        // state and therefore cannot reopen a closed job. Stale commit/cursor
+        // rejection after this record is collected remains the R_f route
+        // owner's responsibility; this store is not a second commit ledger.
         return InputPublishResult::Existing;
     }
 
@@ -96,8 +98,10 @@ InputPublishResult InputRecordStore::publish(
     if (begin.raw_bytes > max_retained_bytes_ - retained_bytes_)
         throw std::length_error("InputRecordStore byte limit exceeded");
 
-    auto backing =
-        std::make_shared<const std::vector<uint8_t>>(std::move(exact_input));
+    auto mutable_backing =
+        std::make_shared<std::vector<uint8_t>>(std::move(exact_input));
+    std::shared_ptr<const std::vector<uint8_t>> backing =
+        std::move(mutable_backing);
     Entry entry{begin.raw_bytes, begin.raw_digest, std::move(backing), true};
     const auto [position, inserted] = records_.emplace(key, std::move(entry));
     (void)position;
