@@ -30,6 +30,7 @@ CONSTANTS Assignments, Epochs, WireIds, Nonces,
           EpochOf, WireOf, NonceOf, AssignmentAt,
           MutantAllowStrictLegacy,
           MutantPublishBeforeReady,
+          MutantPublishAfterRevoke,
           MutantReleaseWithoutRevoke,
           MutantPrepareOverTombstone,
           MutantReuseEpochAfterLoss
@@ -83,6 +84,7 @@ ASSUME /\ Assignments # {}
               => a = b
        /\ MutantAllowStrictLegacy \in BOOLEAN
        /\ MutantPublishBeforeReady \in BOOLEAN
+       /\ MutantPublishAfterRevoke \in BOOLEAN
        /\ MutantReleaseWithoutRevoke \in BOOLEAN
        /\ MutantPrepareOverTombstone \in BOOLEAN
        /\ MutantReuseEpochAfterLoss \in BOOLEAN
@@ -194,11 +196,17 @@ Prepare(a) ==
        /\ EpochOf[a] = currentEpoch
        /\ AssignmentAt[currentEpoch][w] = a
        /\ mode \in {"Advisory", "EnforcingCompat", "StrictNonce"}
-       /\ record[w] = NoAssignment
-       /\ phase[w] = "Absent"
        /\ (a \notin tombstone \/ MutantPrepareOverTombstone)
-       /\ record' = [record EXCEPT ![w] = a]
-       /\ phase' = [phase EXCEPT ![w] = "Reserved"]
+       /\ \/ /\ record[w] = NoAssignment
+              /\ phase[w] = "Absent"
+              /\ record' = [record EXCEPT ![w] = a]
+              /\ phase' = [phase EXCEPT ![w] = "Reserved"]
+          \/ /\ mode = "Advisory"
+              /\ record[w] = a
+              /\ phase[w] \in LiveClaimPhases
+              /\ a \notin prepared
+              /\ record' = record
+              /\ phase' = phase
        /\ prepared' = prepared \cup {a}
        /\ UNCHANGED <<currentEpoch, usedEpochs, workerEpoch, mode,
                        claimant, claimKind, ready, published, tombstone,
@@ -209,7 +217,8 @@ Prepare(a) ==
 Ready(a) ==
     LET w == WireOf[a]
     IN /\ record[w] = a
-       /\ phase[w] = "Reserved"
+       /\ (phase[w] = "Reserved" \/
+           (mode = "Advisory" /\ phase[w] \in LiveClaimPhases))
        /\ a \in prepared
        /\ ready' = ready \cup {a}
        /\ UNCHANGED <<currentEpoch, usedEpochs, workerEpoch, mode,
@@ -222,12 +231,14 @@ PublishUseCS(a) ==
     /\ workerEpoch = currentEpoch
     /\ EpochOf[a] = currentEpoch
     /\ AssignmentAt[currentEpoch][WireOf[a]] = a
+    /\ (a \notin tombstone \/ MutantPublishAfterRevoke)
     /\ (mode \notin {"EnforcingCompat", "StrictNonce"} \/
         a \in ready \/ MutantPublishBeforeReady)
     /\ published' = published \cup {a}
     /\ badPublish' =
            (badPublish \/
-            (mode \in {"EnforcingCompat", "StrictNonce"} /\ a \notin ready))
+            (mode \in {"EnforcingCompat", "StrictNonce"} /\ a \notin ready) \/
+            a \in tombstone)
     /\ UNCHANGED <<currentEpoch, usedEpochs, workerEpoch, mode,
                     record, phase, claimant, claimKind, prepared,
                     ready, tombstone, revokeResult, released,

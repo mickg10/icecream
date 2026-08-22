@@ -147,6 +147,9 @@ run_expected_failure assignment-strict-legacy-mutant Protocol50Assignment.tla \
     Protocol50AssignmentStrictLegacyMutant.cfg StrictClaimsExact
 run_expected_failure assignment-ready-mutant Protocol50Assignment.tla \
     Protocol50AssignmentReadyMutant.cfg ReadyGate
+run_expected_failure assignment-cancelled-publish-mutant \
+    Protocol50Assignment.tla \
+    Protocol50AssignmentCancelledPublishMutant.cfg ReadyGate
 run_expected_failure assignment-release-mutant Protocol50Assignment.tla \
     Protocol50AssignmentReleaseMutant.cfg ReleaseHasRevocationProof
 run_expected_failure assignment-tombstone-mutant Protocol50Assignment.tla \

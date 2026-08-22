@@ -48,6 +48,11 @@ Selecting `STRICT_NONCE` on a protocol-49-only path must be refused.  Protocol
 50 makes the already-modeled strict transition operational by carrying the
 full assignment identity through `UseCS` and `CompileFile`.
 
+In `ADVISORY`, a client claim may arrive before `ASSIGN_PREPARE`.  The worker
+installs a claimed placeholder; a later matching PREPARE binds that record and
+may produce READY without moving the record back to RESERVED.  Once revocation
+has begun, READY cannot publish a new UseCS in any mode.
+
 The critical distinction is:
 
 ```text
@@ -173,6 +178,7 @@ EXPECTED COUNTEREXAMPLE
 EXPECTED MUTANT FAILURES
     STRICT_NONCE accepts a legacy claim        -> StrictClaimsExact
     UseCS is published before READY             -> ReadyGate
+    UseCS is published after revocation begins  -> ReadyGate
     scheduler releases without REVOKED proof    -> ReleaseHasRevocationProof
     prepare resurrects an epoch tombstone       -> TombstoneIsNotLive
     link loss reuses the retired scheduler epoch -> SameEpochRevocationSafety
@@ -203,4 +209,4 @@ No TLC success is claimed for a changed model until `make protocol50-formal`
 is run from the exact branch head with a pinned `tla2tools.jar`, retained
 module/config/log hashes, state counts, depth, runtime, and an independent
 reproduction.  The fail-closed runner requires both positive rows to pass and
-all six counterexample/mutant rows to fail through their named invariant.
+all seven counterexample/mutant rows to fail through their named invariant.

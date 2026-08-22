@@ -51,6 +51,7 @@ EXTRA_DIST = \
 	formal/Protocol50AssignmentMixedCompat.cfg \
 	formal/Protocol50AssignmentStrictLegacyMutant.cfg \
 	formal/Protocol50AssignmentReadyMutant.cfg \
+	formal/Protocol50AssignmentCancelledPublishMutant.cfg \
 	formal/Protocol50AssignmentReleaseMutant.cfg \
 	formal/Protocol50AssignmentTombstoneMutant.cfg \
 	formal/Protocol50AssignmentEpochReuseMutant.cfg \
