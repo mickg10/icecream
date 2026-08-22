@@ -72,8 +72,12 @@ public:
     InputRecordStore(size_t max_records, uint64_t max_retained_bytes);
 
     // For an open logical job, call this before making the corresponding route
-    // commit/TX_COMMIT visible. Failure leaves this store unchanged. The caller
-    // is responsible for committing route state only after this call succeeds.
+    // commit/TX_COMMIT visible. Failure leaves this store unchanged. An exact
+    // retained duplicate is accepted only while its logical-job lease remains
+    // open; naming an already-closed record through this API is a stale owner
+    // decision and fails closed. Closed-job route completions must use
+    // observe_closed_job_commit(). The caller commits route state only after
+    // this call succeeds.
     InputPublishResult publish(CStoreGuid c_store_guid,
                                const TxBegin& begin,
                                const TxCommit& commit,

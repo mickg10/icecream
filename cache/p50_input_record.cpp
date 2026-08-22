@@ -94,10 +94,9 @@ InputPublishResult InputRecordStore::publish(
     const auto existing = records_.find(key);
     if (existing != records_.end()) {
         validate_existing(existing->second, begin, exact_input);
-        // While retained, an exact duplicate preserves the existing job-open
-        // state and therefore cannot reopen a closed job. Stale commit/cursor
-        // rejection after this record is collected remains the R_f route
-        // owner's responsibility; this store is not a second commit ledger.
+        if (!existing->second.logical_job_open)
+            throw std::logic_error(
+                "open logical job named an already-closed InputRecord");
         return InputPublishResult::Existing;
     }
 
