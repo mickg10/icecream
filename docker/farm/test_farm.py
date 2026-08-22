@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import argparse
 import copy
 import hashlib
 import importlib.util
@@ -166,7 +167,30 @@ class PlanTests(unittest.TestCase):
         changed = self.plan(label="gate-b")
         self.assertEqual(first["run_id"], second["run_id"])
         self.assertNotEqual(first["run_id"], changed["run_id"])
-        self.assertRegex(first["run_id"], r"^p50-c1f4-[0-9a-f]{12}$")
+        self.assertRegex(
+            first["run_id"], r"^binary-accepted-current-c1f4-[0-9a-f]{12}$"
+        )
+        self.assertNotIn("p50", first["run_id"])
+        self.assertTrue(
+            all("p50" not in record["container"] for record in [
+                first["scheduler"], *first["submitters"], *first["workers"]
+            ])
+        )
+        for host_name in farm.plan_hosts(first):
+            compose = farm.render_compose(self.manifest, first, host_name)
+            self.assertNotIn("p50", compose["name"])
+            for service in compose["services"].values():
+                self.assertNotIn(
+                    "p50", service["labels"]["org.icecream.farm.run_id"]
+                )
+        self.assertEqual(
+            {role: item["name"] for role, item in first["selected_binary_sets"].items()},
+            {
+                "scheduler": "accepted-current",
+                "submitter": "accepted-current",
+                "worker": "accepted-current",
+            },
+        )
         two_submitters = farm.build_plan(
             self.manifest,
             "conservative_nas_submitter",
@@ -176,6 +200,41 @@ class PlanTests(unittest.TestCase):
             ["nas642", "nas642"],
         )
         self.assertNotEqual(first["run_id"], two_submitters["run_id"])
+
+    def test_run_identity_claims_protocol_only_for_exact_available_binary_sets(self):
+        candidate = copy.deepcopy(self.manifest)
+        for name in ("p43", "p50"):
+            candidate["component_binary_sets"][name].update(
+                {
+                    "available": True,
+                    "runtime_path_key": "runtime_prefix",
+                    "runtime_image_class": "test-only-exact-artifact",
+                }
+            )
+        p50 = farm.build_plan(
+            candidate,
+            "conservative_nas_submitter",
+            "c1f1",
+            "debian-gcc",
+            "truthful-p50",
+            component_version_overrides={
+                "scheduler": "p50", "submitter": "p50", "worker": "p50"
+            },
+        )
+        self.assertRegex(p50["run_id"], r"^p50-c1f1-[0-9a-f]{12}$")
+        mixed = farm.build_plan(
+            candidate,
+            "conservative_nas_submitter",
+            "c1f1",
+            "debian-gcc",
+            "truthful-mixed",
+            component_version_overrides={
+                "scheduler": "p43", "submitter": "p50", "worker": "p50"
+            },
+        )
+        self.assertRegex(mixed["run_id"], r"^mixed-s-p43-c-p50-f-p50-c1f1-")
+        self.assertEqual(mixed["selected_binary_sets"]["scheduler"]["protocol"], 43)
+        self.assertEqual(mixed["selected_binary_sets"]["worker"]["protocol"], 50)
 
     def test_c1f_counts_are_physical_daemon_counts_not_slot_counts(self):
         self.assertEqual(len(self.plan("c1f1")["workers"]), 1)
@@ -519,6 +578,77 @@ class PlanTests(unittest.TestCase):
             )
         )
 
+    def test_every_c_f_pair_requires_both_explicit_lan_routes(self):
+        plan = self.plan("c1f4")
+        address_to_name = {
+            host["address"]: name for name, host in self.manifest["hosts"].items()
+        }
+
+        def route(self_runner, argv, **_kwargs):
+            target_address = argv[-1]
+            self.assertIn(target_address, address_to_name)
+            host = self.manifest["hosts"][self_runner.name]
+            output = (
+                f"{target_address} via 10.0.27.1 dev {host['interface']} "
+                f"src {host['address']} uid 1000\n"
+            ).encode()
+            return subprocess_result(0, stdout=output)
+
+        with mock.patch.object(farm.HostRunner, "run", autospec=True, side_effect=route):
+            snapshot = farm.peer_route_snapshot(self.manifest, plan)
+        self.assertEqual(len(snapshot["routes"]), 8)
+        self.assertEqual(
+            {(row["direction"], row["source_host"], row["target_host"])
+             for row in snapshot["routes"]},
+            {
+                (direction, source, target)
+                for worker in plan["workers"]
+                for direction, source, target in (
+                    ("c-to-f", "nas642", worker["host"]),
+                    ("f-to-c", worker["host"], "nas642"),
+                )
+            },
+        )
+
+    def test_peer_route_snapshot_refuses_wrong_interface_before_acceptance(self):
+        plan = self.plan("c1f1")
+
+        def route(self_runner, argv, **_kwargs):
+            target_address = argv[-1]
+            host = self.manifest["hosts"][self_runner.name]
+            interface = "tailscale0" if self_runner.name == "nas642" else host["interface"]
+            source = "100.88.1.2" if self_runner.name == "nas642" else host["address"]
+            return subprocess_result(
+                0,
+                stdout=(
+                    f"{target_address} dev {interface} src {source} uid 1000\n"
+                ).encode(),
+            )
+
+        with mock.patch.object(farm.HostRunner, "run", autospec=True, side_effect=route):
+            with self.assertRaisesRegex(farm.FarmError, "c-to-f.*LAN route failed"):
+                farm.peer_route_snapshot(self.manifest, plan)
+
+    def test_preflight_cannot_pass_when_a_c_f_route_fails(self):
+        plan = self.plan("c1f1")
+        host_report = {
+            "ok": True,
+            "errors": [],
+            "facts": {"online_cpus": "32", "load": "0 0 0"},
+            "images": [],
+            "runtime_binaries": {},
+        }
+        with mock.patch.object(farm, "inspect_host", return_value=host_report):
+            with mock.patch.object(
+                farm,
+                "peer_route_snapshot",
+                side_effect=farm.FarmError("c-to-f LAN route failed"),
+            ):
+                report = farm.preflight(self.manifest, plan)
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["peer_routes"]["status"], "failed")
+        self.assertIn("c-to-f LAN route failed", report["errors"])
+
     def test_directional_network_ledger_keeps_capacity_provenance(self):
         plan = self.plan("c1f1")
         before = {
@@ -537,8 +667,16 @@ class PlanTests(unittest.TestCase):
                 "quietbox2": {"rx_bytes": 370, "tx_bytes": 490},
             },
         }
+        route_snapshot = {
+            "checked_at": "route-check",
+            "network_mode": "local-lan",
+            "routes": [
+                {"direction": "c-to-f", "ok": True},
+                {"direction": "f-to-c", "ok": True},
+            ],
+        }
         ledger = farm.directional_network_ledger(
-            self.manifest, plan, before, after
+            self.manifest, plan, before, after, route_snapshot, route_snapshot
         )
         self.assertEqual(ledger["elapsed_ns"], 2_000_000_000)
         self.assertEqual(ledger["routes"][0]["c_to_f"]["c_interface_tx"], 50)
@@ -548,6 +686,13 @@ class PlanTests(unittest.TestCase):
             "naturally-bandwidth-limited",
         )
         self.assertIn("not per-flow", ledger["attribution"])
+        self.assertEqual(len(ledger["route_checks"]["before"]["routes"]), 2)
+        broken_routes = copy.deepcopy(route_snapshot)
+        broken_routes["routes"][0]["ok"] = False
+        with self.assertRaisesRegex(farm.FarmError, "refuses"):
+            farm.directional_network_ledger(
+                self.manifest, plan, before, after, broken_routes, route_snapshot
+            )
 
     def test_absent_container_requires_reachable_docker_engine(self):
         runner = farm.HostRunner("nas642", self.manifest["hosts"]["nas642"])
@@ -586,6 +731,37 @@ class PlanTests(unittest.TestCase):
             ]
         ):
             self.assertEqual(farm.inspect_run_state(run)["state"], "absent")
+
+    def test_reconcile_absent_run_records_down_without_removing_anything(self):
+        plan = self.plan("c1f1")
+        run = {"manifest": self.manifest, "plan": plan, "status": "ready"}
+        absent = {
+            "checked_at": "now",
+            "run_id": plan["run_id"],
+            "state": "absent",
+            "containers": [],
+            "scheduler_snapshot": None,
+            "missing_registrations": [],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory) / plan["run_id"]
+            run_dir.mkdir()
+            args = argparse.Namespace(
+                run_dir=str(run_dir), desired="down", no_collect=False
+            )
+            with mock.patch.object(farm, "load_run", return_value=run):
+                with mock.patch.object(farm, "inspect_run_state", return_value=absent):
+                    with mock.patch.object(farm, "teardown_run") as teardown:
+                        with mock.patch.object(farm, "exact_remove_container") as remove:
+                            self.assertEqual(farm.command_reconcile(args), 0)
+            teardown.assert_not_called()
+            remove.assert_not_called()
+            persisted = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+            self.assertEqual(persisted["status"], "down")
+            self.assertEqual(persisted["reconciliation"]["observed"], "absent")
+            self.assertFalse(
+                persisted["reconciliation"]["unrelated_resources_touched"]
+            )
 
 
 class ArtifactTests(unittest.TestCase):

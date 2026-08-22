@@ -85,7 +85,9 @@ readiness verifies the exact endpoint and the `jobs=*/SLOTS` value reported by `
 `nas642` is intentionally retained as the naturally bandwidth-limited C experiment point.
 `quietbox2` is the faster-C comparison. A live acceptance captures before/after byte counters on each
 explicit LAN interface and compile elapsed time in `network-ledger.json`, producing C→F and F→C
-directional provenance. These are host-interface aggregate observations, not per-flow attribution.
+directional provenance. The ledger is emitted only when both route snapshots pass; a peer route
+that no longer uses its inventoried LAN source/interface fails acceptance. These are host-interface
+aggregate observations, not per-flow attribution.
 
 ## Image classes
 
@@ -224,9 +226,13 @@ Repeat for the other three environments before the four-profile matrix.
 
 ## Planning and read-only gates
 
-Commands are run from the repository root. A run label is explicit input; the run ID is a stable
-hash of label, manifest, profile, scenario, and environment. Reusing all inputs produces the same ID,
-and `up` refuses to overwrite an existing controller run directory.
+Commands are run from the repository root. A run label is explicit input; the run ID starts with the
+truthful selected binary-set identity and ends with a stable hash of label, manifest, profile,
+scenario, environment, and exact component selections. The default is therefore
+`binary-accepted-current-...`, not a guessed protocol number. A homogeneous exact P43 or P50 set may
+use `p43-...` or `p50-...`; mixed roles receive a role-qualified mixed label. The plan retains the
+complete scheduler/C/F binary-set provenance behind that label. Reusing all inputs produces the same
+ID, and `up` refuses to overwrite an existing controller run directory.
 
 ```sh
 docker/farm/farm.py validate
@@ -272,6 +278,8 @@ Preflight verifies, for every selected host:
 - absence of every exact deterministic container name before launch
 - absence of listeners only on ports opened by the plan: scheduler/control and F worker ports;
   submit-only C daemons do not reserve a listening port
+- both directions of every actual C↔selected-F route, requiring the exact peer LAN IP, source LAN
+  IP, and inventoried interface; acceptance repeats these route checks before and after compilation
 
 No readiness check is a fixed sleep. Container health and controller readiness both issue `listcs`
 and `quit` over the scheduler's line-oriented control port; they never make an unframed connection
@@ -322,19 +330,21 @@ docker/farm/farm.py up \
   --scenario c1f1 --run-label inspect-01 \
   --controller-output /tanksmall/scratch/ictmp/icecream-farm/controller-results
 
-docker/farm/farm.py accept --run-dir /absolute/controller/results/p50-c1f1-RUNHASH
-docker/farm/farm.py collect --run-dir /absolute/controller/results/p50-c1f1-RUNHASH
-docker/farm/farm.py down --run-dir /absolute/controller/results/p50-c1f1-RUNHASH
-docker/farm/farm.py status --run-dir /absolute/controller/results/p50-c1f1-RUNHASH
+docker/farm/farm.py accept --run-dir /absolute/controller/results/binary-accepted-current-c1f1-RUNHASH
+docker/farm/farm.py collect --run-dir /absolute/controller/results/binary-accepted-current-c1f1-RUNHASH
+docker/farm/farm.py down --run-dir /absolute/controller/results/binary-accepted-current-c1f1-RUNHASH
+docker/farm/farm.py status --run-dir /absolute/controller/results/binary-accepted-current-c1f1-RUNHASH
 docker/farm/farm.py reconcile --desired down \
-  --run-dir /absolute/controller/results/p50-c1f1-RUNHASH
+  --run-dir /absolute/controller/results/binary-accepted-current-c1f1-RUNHASH
 ```
 
 `down` reads the retained run manifest, checks each container's exact
 `org.icecream.farm.run_id` label, and removes only those named containers. It does not remove images,
 source, corpus, state, build, result directories, the host Docker engine, or unrelated containers.
 Repeated `up` reuses an already-ready exact run; repeated `run` reuses an accepted-and-down run;
-repeated `down` reports the exact containers absent. A partial run must be brought down before a new
+repeated `down` reports the exact containers absent. `reconcile --desired down` records `status=down`
+when those exact containers are already absent and does not invoke removal or touch unrelated resources.
+A partial run must be brought down before a new
 label is launched, preserving the prior evidence rather than overwriting it.
 
 Run all four accepted build environments from one submitter:
@@ -371,8 +381,8 @@ its manifest path. Teardown is recorded in `run.json`.
 This launcher measures orchestration and real compilation behavior. It does not claim protocol
 properties from the formal models, and it does not embed unfinished networking or later cache work.
 
-The retained C1F1 proof is run `p50-c1f1-15d4bf7c3fbf`, scheduler and C on nas642 and F on
-quietbox2 (`10.0.27.212:12000`). It records scheduler Job ID 1, successful compile/link/run output
+The retained historical C1F1 proof used scheduler and C on nas642 and F on quietbox2
+(`10.0.27.212:12000`). It records scheduler Job ID 1, successful compile/link/run output
 `icecream-farm-ok 42`, object and executable digests, per-node logs, and removal of all three exact
 run-labelled containers. Its compact summary and full evidence hash ledger are retained outside the
 source tree at:

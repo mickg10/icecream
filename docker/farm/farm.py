@@ -330,6 +330,34 @@ def validate_manifest(manifest: Mapping[str, Any]) -> None:
         raise FarmError("manifest validation failed:\n- " + "\n- ".join(errors))
 
 
+def binary_set_run_label(manifest: Mapping[str, Any],
+                         dimensions: Mapping[str, Any]) -> str:
+    versions = dimensions["component_versions"]
+    selected = {
+        role: manifest["component_binary_sets"][versions[role]]
+        for role in ("scheduler", "submitter", "worker")
+    }
+    protocols = [selected[role]["protocol"] for role in selected]
+    names = [versions[role] for role in selected]
+    if len(set(protocols)) == 1 and isinstance(protocols[0], int):
+        return f"p{protocols[0]}"
+    if len(set(names)) == 1:
+        name = re.sub(r"[^a-z0-9_.-]+", "-", names[0].lower()).strip("-.")
+        return f"binary-{name or 'unnamed'}"
+    role_tokens = []
+    role_codes = {"scheduler": "s", "submitter": "c", "worker": "f"}
+    for role in ("scheduler", "submitter", "worker"):
+        protocol = selected[role]["protocol"]
+        token = f"p{protocol}" if isinstance(protocol, int) else versions[role]
+        token = re.sub(r"[^a-z0-9_.-]+", "-", token.lower()).strip("-.")
+        role_tokens.append(f"{role_codes[role]}-{token or 'unnamed'}")
+    label = "mixed-" + "-".join(role_tokens)
+    if len(label) > 56:
+        digest = hashlib.sha256(canonical_json(versions)).hexdigest()[:10]
+        label = f"mixed-binary-sets-{digest}"
+    return label
+
+
 def derive_run_id(manifest: Mapping[str, Any], profile: str, scenario: str,
                   environment: str, run_label: str,
                   submitters: Sequence[str],
@@ -338,6 +366,7 @@ def derive_run_id(manifest: Mapping[str, Any], profile: str, scenario: str,
         raise FarmError(
             "run label must use 1-64 lowercase letters, digits, '.', '_' or '-'"
         )
+    selected_dimensions = dimensions or manifest.get("scenario_dimensions", {})
     identity = {
         "manifest": manifest,
         "profile": profile,
@@ -345,10 +374,10 @@ def derive_run_id(manifest: Mapping[str, Any], profile: str, scenario: str,
         "environment": environment,
         "run_label": run_label,
         "submitters": list(submitters),
-        "dimensions": dimensions or manifest.get("scenario_dimensions", {}),
+        "dimensions": selected_dimensions,
     }
     digest = hashlib.sha256(canonical_json(identity)).hexdigest()[:12]
-    return f"p50-{scenario}-{digest}"
+    return f"{binary_set_run_label(manifest, selected_dimensions)}-{scenario}-{digest}"
 
 
 def select_f_hosts(profile: Mapping[str, Any], count: int) -> dict[str, int]:
@@ -410,6 +439,13 @@ def build_plan(manifest: Mapping[str, Any], profile_name: str, scenario_name: st
                 f"{binary_set['provenance']}"
             )
     dimensions["component_versions"] = versions
+    selected_binary_sets = {
+        role: {
+            "name": version_name,
+            **manifest["component_binary_sets"][version_name],
+        }
+        for role, version_name in versions.items()
+    }
     submitter_capacity = [
         manifest["hosts"][host_name].get(
             "client_capacity",
@@ -502,6 +538,7 @@ def build_plan(manifest: Mapping[str, Any], profile_name: str, scenario_name: st
         "scenario": scenario_name,
         "environment": environment_name,
         "dimensions": dimensions,
+        "selected_binary_sets": selected_binary_sets,
         "artifact_identities": artifact_identities,
         "client_capacity": submitter_capacity,
         "network_mode": "local-lan",
@@ -756,7 +793,17 @@ def interface_counter_snapshot(manifest: Mapping[str, Any],
 
 def directional_network_ledger(manifest: Mapping[str, Any], plan: Mapping[str, Any],
                                before: Mapping[str, Any],
-                               after: Mapping[str, Any]) -> dict[str, Any]:
+                               after: Mapping[str, Any],
+                               routes_before: Mapping[str, Any],
+                               routes_after: Mapping[str, Any]) -> dict[str, Any]:
+    if not routes_before.get("routes") or not routes_after.get("routes"):
+        raise FarmError("network ledger requires verified C/F routes before and after acceptance")
+    if any(
+        not record.get("ok")
+        for snapshot in (routes_before, routes_after)
+        for record in snapshot["routes"]
+    ):
+        raise FarmError("network ledger refuses an unverified C/F route")
     elapsed_ns = int(after["monotonic_ns"]) - int(before["monotonic_ns"])
     if elapsed_ns <= 0:
         raise FarmError("network observation elapsed time must be positive")
@@ -810,6 +857,10 @@ def directional_network_ledger(manifest: Mapping[str, Any], plan: Mapping[str, A
         "client_capacity": plan["client_capacity"],
         "host_deltas": host_deltas,
         "routes": routes,
+        "route_checks": {
+            "before": routes_before,
+            "after": routes_after,
+        },
         "before": before,
         "after": after,
     }
@@ -894,11 +945,26 @@ def verify_transport_identity(manifest: Mapping[str, Any], host_name: str) -> di
 
 def scheduler_route_error(route_text: str, interface: str, source_address: str,
                           *, scheduler_is_local: bool) -> str | None:
+    tokens = route_text.split()
+    target_address = ""
+    if tokens:
+        target_address = tokens[1] if tokens[0] == "local" and len(tokens) > 1 else tokens[0]
+    return lan_route_error(
+        route_text,
+        interface,
+        source_address,
+        target_address,
+        target_is_local=scheduler_is_local,
+    )
+
+
+def lan_route_error(route_text: str, interface: str, source_address: str,
+                    target_address: str, *, target_is_local: bool) -> str | None:
     if not route_text:
-        return "scheduler route is unavailable"
+        return f"route to {target_address} is unavailable"
     tokens = route_text.split()
     if any("tailscale" in token.lower() for token in tokens):
-        return "scheduler route uses an overlay interface"
+        return f"route to {target_address} uses an overlay interface"
     overlay = ipaddress.ip_network("100.64.0.0/10")
     for token in tokens:
         try:
@@ -906,23 +972,85 @@ def scheduler_route_error(route_text: str, interface: str, source_address: str,
         except ValueError:
             continue
         if address in overlay:
-            return "scheduler route uses an overlay address"
+            return f"route to {target_address} uses an overlay address"
+    if target_address not in tokens:
+        return f"route output does not name exact target {target_address}"
     try:
         route_interface = tokens[tokens.index("dev") + 1]
         route_source = tokens[tokens.index("src") + 1]
     except (ValueError, IndexError):
-        return "scheduler route lacks an exact device or source address"
-    allowed_interfaces = {interface, "lo"} if scheduler_is_local else {interface}
+        return f"route to {target_address} lacks an exact device or source address"
+    allowed_interfaces = {interface, "lo"} if target_is_local else {interface}
     if route_interface not in allowed_interfaces:
         return (
-            f"scheduler route uses device {route_interface!r}, expected "
+            f"route to {target_address} uses device {route_interface!r}, expected "
             f"{sorted(allowed_interfaces)}"
         )
     if route_source != source_address:
         return (
-            f"scheduler route uses source {route_source!r}, expected {source_address!r}"
+            f"route to {target_address} uses source {route_source!r}, "
+            f"expected {source_address!r}"
         )
     return None
+
+
+def peer_route_snapshot(manifest: Mapping[str, Any],
+                        plan: Mapping[str, Any]) -> dict[str, Any]:
+    """Verify both directions of every selected C/F pair on explicit LAN identities."""
+    records = []
+    seen: set[tuple[str, str]] = set()
+    for submitter in plan["submitters"]:
+        c_host = submitter["host"]
+        for worker in plan["workers"]:
+            f_host = worker["host"]
+            for direction, source_name, target_name in (
+                ("c-to-f", c_host, f_host),
+                ("f-to-c", f_host, c_host),
+            ):
+                key = (source_name, target_name)
+                if key in seen:
+                    continue
+                seen.add(key)
+                source = manifest["hosts"][source_name]
+                target = manifest["hosts"][target_name]
+                runner = HostRunner(source_name, source)
+                result = runner.run(
+                    ["ip", "-o", "route", "get", target["address"]], timeout=10
+                )
+                route_text = result.stdout.decode("utf-8", "replace").strip()
+                error = None
+                if result.returncode != 0:
+                    error = f"route command exited {result.returncode}"
+                else:
+                    error = lan_route_error(
+                        route_text,
+                        source["interface"],
+                        source["address"],
+                        target["address"],
+                        target_is_local=source_name == target_name,
+                    )
+                record = {
+                    "direction": direction,
+                    "source_host": source_name,
+                    "source_address": source["address"],
+                    "source_interface": source["interface"],
+                    "target_host": target_name,
+                    "target_address": target["address"],
+                    "route": route_text,
+                    "ok": error is None,
+                }
+                if error:
+                    record["error"] = error
+                    raise FarmError(
+                        f"{direction} {source_name}->{target_name} LAN route failed: {error}; "
+                        f"observed {route_text!r}"
+                    )
+                records.append(record)
+    return {
+        "checked_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "network_mode": "local-lan",
+        "routes": records,
+    }
 
 
 def inspect_host(manifest: Mapping[str, Any], plan: Mapping[str, Any],
@@ -1209,6 +1337,21 @@ def preflight(manifest: Mapping[str, Any], plan: Mapping[str, Any]) -> dict[str,
             for host_name in host_hashes:
                 hosts[host_name]["errors"].append(message)
                 hosts[host_name]["ok"] = False
+    peer_routes: dict[str, Any] = {
+        "checked_at": None,
+        "network_mode": "local-lan",
+        "routes": [],
+        "status": "skipped-due-to-host-preflight-errors",
+    }
+    peer_route_errors: list[str] = []
+    if all(host.get("ok") for host in hosts.values()):
+        try:
+            peer_routes = peer_route_snapshot(manifest, plan)
+            peer_routes["status"] = "verified"
+        except FarmError as exc:
+            peer_route_errors.append(str(exc))
+            peer_routes["status"] = "failed"
+            peer_routes["error"] = str(exc)
     group_measurements: dict[str, Any] = {}
     for group_name, group in manifest["resource_groups"].items():
         selected = [name for name in group["members"] if name in hosts]
@@ -1238,6 +1381,8 @@ def preflight(manifest: Mapping[str, Any], plan: Mapping[str, Any]) -> dict[str,
         "network_mode": "local-lan",
         "wan_hosts": [],
         "hosts": hosts,
+        "peer_routes": peer_routes,
+        "errors": peer_route_errors,
         "runtime_image_engine_ids": sorted({
             item.get("actual_id")
             for host in hosts.values()
@@ -1247,7 +1392,7 @@ def preflight(manifest: Mapping[str, Any], plan: Mapping[str, Any]) -> dict[str,
         "runtime_image_fingerprints": sorted(runtime_fingerprints),
         "runtime_binary_hashes": binary_hashes,
         "resource_groups": group_measurements,
-        "ok": all(item["ok"] for item in hosts.values()),
+        "ok": all(item["ok"] for item in hosts.values()) and not peer_route_errors,
     }
 
 
@@ -1824,7 +1969,7 @@ def launch_run(manifest: dict[str, Any], plan: dict[str, Any], controller_output
         )
     report = preflight(manifest, plan)
     if not report["ok"]:
-        details = []
+        details = list(report.get("errors", []))
         for host_name, host in report["hosts"].items():
             if host["errors"]:
                 details.append(f"{host_name}: " + "; ".join(host["errors"]))
@@ -1935,6 +2080,9 @@ def run_acceptance(run_dir: Path, run: dict[str, Any], submitter_index: int = 0)
     build = f"/farm/build/acceptance-{plan['environment']}"
     results = "/farm/results"
     script = (HERE / "acceptance.sh").read_bytes()
+    stdout_path = run_dir / "acceptance.stdout"
+    stderr_path = run_dir / "acceptance.stderr"
+    routes_before = peer_route_snapshot(manifest, plan)
     counters_before = interface_counter_snapshot(manifest, plan)
     result = docker_command(
         runner,
@@ -1946,16 +2094,15 @@ def run_acceptance(run_dir: Path, run: dict[str, Any], submitter_index: int = 0)
         input_bytes=script,
         timeout=300,
     )
+    stdout_path.write_bytes(result.stdout)
+    stderr_path.write_bytes(result.stderr)
+    routes_after = peer_route_snapshot(manifest, plan)
     counters_after = interface_counter_snapshot(manifest, plan)
     network_ledger = directional_network_ledger(
-        manifest, plan, counters_before, counters_after
+        manifest, plan, counters_before, counters_after, routes_before, routes_after
     )
     network_ledger_path = run_dir / "network-ledger.json"
     write_json(network_ledger_path, network_ledger)
-    stdout_path = run_dir / "acceptance.stdout"
-    stderr_path = run_dir / "acceptance.stderr"
-    stdout_path.write_bytes(result.stdout)
-    stderr_path.write_bytes(result.stderr)
     if result.returncode != 0:
         raise FarmError(
             f"acceptance compile exited {result.returncode}; retained {stdout_path} and {stderr_path}"
@@ -2124,18 +2271,34 @@ def command_collect(args: argparse.Namespace) -> int:
     return 0
 
 
+def record_absent_run_down(run_dir: Path, run: dict[str, Any],
+                           status: Mapping[str, Any], source: str) -> list[dict[str, Any]]:
+    if status.get("state") != "absent":
+        raise FarmError("only an exactly absent run may be recorded down without teardown")
+    outcomes = [
+        {"host": record["host"], "container": record["container"], "result": "absent"}
+        for record in [*run["plan"]["submitters"], *run["plan"]["workers"], run["plan"]["scheduler"]]
+    ]
+    run["status"] = "down"
+    run["last_status"] = dict(status)
+    run["reconciliation"] = {
+        "completed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "source": source,
+        "desired": "down",
+        "observed": "absent",
+        "containers": outcomes,
+        "unrelated_resources_touched": False,
+    }
+    write_json(run_dir / "run.json", run)
+    return outcomes
+
+
 def command_down(args: argparse.Namespace) -> int:
     run_dir = Path(args.run_dir).resolve()
     run = load_run(run_dir)
     status = inspect_run_state(run)
     if status["state"] == "absent":
-        run["status"] = "down"
-        run["last_status"] = status
-        write_json(run_dir / "run.json", run)
-        outcomes = [
-            {"host": record["host"], "container": record["container"], "result": "absent"}
-            for record in [*run["plan"]["submitters"], *run["plan"]["workers"], run["plan"]["scheduler"]]
-        ]
+        outcomes = record_absent_run_down(run_dir, run, status, "down")
     else:
         outcomes = teardown_run(run_dir, run, collect_first=not args.no_collect)
     print(json.dumps(outcomes, indent=2, sort_keys=True))
@@ -2155,7 +2318,9 @@ def command_reconcile(args: argparse.Namespace) -> int:
     run = load_run(run_dir)
     status = inspect_run_state(run)
     if args.desired == "down":
-        if status["state"] != "absent":
+        if status["state"] == "absent":
+            record_absent_run_down(run_dir, run, status, "reconcile")
+        else:
             teardown_run(run_dir, run, collect_first=not args.no_collect)
         print(json.dumps({"desired": "down", "state": "absent"}, indent=2))
         return 0
