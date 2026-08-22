@@ -1,4 +1,4 @@
-TESTS = testargs p50wire p50slice0 p50zstd p50zstdwindow p50loopback p50inputrecord p50inputrecordlate digest128bench p50_trace_check.sh
+TESTS = testargs p50wire p50slice0 p50zstd p50zstdwindow p50loopback p50inputrecord p50inputrecordlate p50inputrecordendpoint digest128bench p50_trace_check.sh
 TEST_EXTENSIONS = .sh
 SH_LOG_COMPILER = $(SHELL)
 
@@ -11,9 +11,10 @@ p50zstdwindow_LDADD = ../cache/libprotocol50.a ../services/libicecc.la $(LIBZSTD
 p50loopback_LDADD = ../cache/libprotocol50.a ../services/libicecc.la $(BOOST_LIBS) $(LIBZSTD_LIBS)
 p50inputrecord_LDADD = ../cache/libprotocol50.a ../services/libicecc.la
 p50inputrecordlate_LDADD = ../cache/libprotocol50.a ../services/libicecc.la
+p50inputrecordendpoint_LDADD = ../cache/libprotocol50.a ../services/libicecc.la $(BOOST_LIBS) $(LIBZSTD_LIBS)
 digest128bench_LDADD = ../services/libicecc.la
 
-check_PROGRAMS = testargs p50wire p50slice0 p50zstd p50zstdwindow p50loopback p50inputrecord p50inputrecordlate digest128bench
+check_PROGRAMS = testargs p50wire p50slice0 p50zstd p50zstdwindow p50loopback p50inputrecord p50inputrecordlate p50inputrecordendpoint digest128bench
 testargs_SOURCES = args.cpp
 p50wire_SOURCES = p50_wire_test.cpp
 p50slice0_SOURCES = \
@@ -25,6 +26,9 @@ p50loopback_CXXFLAGS = $(BOOST_CPPFLAGS) -pthread
 p50loopback_LDFLAGS = $(BOOST_LDFLAGS) -pthread
 p50inputrecord_SOURCES = p50_input_record_test.cpp
 p50inputrecordlate_SOURCES = p50_input_record_late_commit_test.cpp
+p50inputrecordendpoint_SOURCES = p50_input_record_endpoint_test.cpp
+p50inputrecordendpoint_CXXFLAGS = $(BOOST_CPPFLAGS) -pthread
+p50inputrecordendpoint_LDFLAGS = $(BOOST_LDFLAGS) -pthread
 digest128bench_SOURCES = digest128_bench.cpp
 
 EXTRA_DIST = p50_trace_check.sh
