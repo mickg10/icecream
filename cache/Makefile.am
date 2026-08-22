@@ -69,6 +69,8 @@ EXTRA_DIST = \
 	formal/Protocol50AssignmentRevokeRequestWireMutant.cfg \
 	formal/Protocol50AssignmentRevokeResultWireMutant.cfg \
 	formal/Protocol50AssignmentLatePrepareMutant.cfg \
+	formal/Protocol50AssignmentRevokeClaimCrossingWitness.cfg \
+	formal/Protocol50AssignmentStaleRevokeResultWitness.cfg \
 	formal/Protocol50AssignmentDelivery.md \
 	formal/run_assignment_delivery_tlc.sh \
 	formal/run_tlc.sh \

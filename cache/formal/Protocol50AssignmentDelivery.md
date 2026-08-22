@@ -49,6 +49,24 @@ The late PREPARE validates/enriches the existing claim and may produce READY,
 but it cannot change the phase from CLAIMED back to RESERVED. A subsequent
 REVOKE must still return `CLAIMED_OR_LATER`.
 
+The revoke decision belongs to the worker's single assignment-record owner and
+is made when that owner consumes the request, not when the scheduler queues it.
+`Absent` or `Reserved` may advance to `Revoked` and return `Revoked` as a
+positive pre-claim proof. `Claimed`, `Started`, or `Terminal` is preserved and
+returns `ClaimedOrLater`. The scheduler releases immediately only for the
+matching `Revoked` result. A matching `ClaimedOrLater` result retains ownership
+until the ordinary terminal settlement.
+
+This distinction covers the positive crossing
+
+```text
+SendRevoke -> AdvisoryClaim -> DeliverRevokeRequest
+```
+
+where the claim wins even though the revoke was queued first. It aligns this
+focused delivery refinement with `Protocol50AssignmentOrdering.tla` and the
+product behavior at `e05f6d0a`.
+
 ## Checked invariants
 
 ```text
@@ -56,14 +74,36 @@ PublishedHasMatchingPrepare
     UseCS publication is backed by READY for that exact assignment.
 
 RevocationTargetsSentAssignment
-    worker tombstone/revocation applies to the assignment named by S.
+    worker revocation or claimed/later proof applies to the assignment named
+    by S.
 
-ReleaseHasMatchingWorkerProof
-    scheduler release uses the exact assignment proved REVOKED by F.
+RevokeResultHasMatchingWorkerProof
+    scheduler release/retention uses the exact assignment and result proved by
+    F.
+
+ReleaseHasMatchingSettlement
+    immediate release is backed by Revoked; a claimed assignment is released
+    only by ordinary settlement.
+
+RevokedHasNoClaimEvidence
+    a claim observed before revoke delivery can never become Revoked.
+
+ClaimedOrLaterPreservesWorkerState / CrossedClaimWinsRevoke
+    revoke delivery preserves Claimed, Started, or Terminal, including the
+    send-before-claim crossing.
+
+StaleNonceResultDoesNotReleaseCurrent
+    a delayed result for the old nonce cannot release the same-wire current
+    assignment.
 
 ClaimedPhaseNeverRegresses
     late PREPARE cannot move an accepted advisory claim backward.
 ```
+
+Two reachability configurations require TLC to exhibit the send-before-claim
+crossing through `ClaimedOrLater` retention and a delayed old-nonce `Revoked`
+result that releases only the old assignment. They fail their intentionally
+negated witness predicates only when the discriminating states are reached.
 
 ## Mutants
 
@@ -76,6 +116,11 @@ REVOKE request resolved by current wire id rather than nonce
 REVOKE result resolved by current wire id rather than nonce
 late advisory PREPARE regresses CLAIMED to RESERVED
 ```
+
+Every variant still transports the complete assignment identity. The three
+wire mutants change only the record selected at delivery, deliberately
+modeling an implementation that ignores the transported nonce during lookup;
+they do not abbreviate or rewrite the control message.
 
 Run:
 

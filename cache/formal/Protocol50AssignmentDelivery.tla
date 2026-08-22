@@ -34,22 +34,34 @@ ASSUME /\ OldA # NewA
 Assignments == {OldA, NewA}
 Phases == {"Absent", "Reserved", "Claimed", "Started", "Terminal", "Revoked"}
 ClaimKinds == {"None", "Unfenced", "Nonce"}
+RevokeResults == {"Revoked", "ClaimedOrLater"}
+NoResult == "NoResult"
 
 VARIABLES current,
           phase, claimKind,
-          workerPrepared, workerRevoked,
+          workerPrepared, workerRevoked, workerClaimedOrLater,
           schedulerRevokeSent,
           readyInFlight, readyAccepted,
-          revokeRequestInFlight, revokeResultInFlight,
-          published, released
+          revokeRequestInFlight,
+          revokeResultInFlight, revokeResultKind,
+          revokeResultsDelivered,
+          claimCrossedRevoke,
+          published,
+          revokedReleased, claimedRetained,
+          ordinarySettled, released
 
 vars == <<current,
           phase, claimKind,
-          workerPrepared, workerRevoked,
+          workerPrepared, workerRevoked, workerClaimedOrLater,
           schedulerRevokeSent,
           readyInFlight, readyAccepted,
-          revokeRequestInFlight, revokeResultInFlight,
-          published, released>>
+          revokeRequestInFlight,
+          revokeResultInFlight, revokeResultKind,
+          revokeResultsDelivered,
+          claimCrossedRevoke,
+          published,
+          revokedReleased, claimedRetained,
+          ordinarySettled, released>>
 
 Init ==
     /\ current = OldA
@@ -57,12 +69,19 @@ Init ==
     /\ claimKind = [a \in Assignments |-> "None"]
     /\ workerPrepared = {}
     /\ workerRevoked = {}
+    /\ workerClaimedOrLater = {}
     /\ schedulerRevokeSent = {}
     /\ readyInFlight = NoA
     /\ readyAccepted = NoA
     /\ revokeRequestInFlight = NoA
     /\ revokeResultInFlight = NoA
+    /\ revokeResultKind = NoResult
+    /\ revokeResultsDelivered = {}
+    /\ claimCrossedRevoke = {}
     /\ published = {}
+    /\ revokedReleased = {}
+    /\ claimedRetained = {}
+    /\ ordinarySettled = {}
     /\ released = {}
 
 PrepareCurrent ==
@@ -73,20 +92,32 @@ PrepareCurrent ==
        /\ phase' = [phase EXCEPT ![a] = "Reserved"]
        /\ workerPrepared' = workerPrepared \cup {a}
        /\ readyInFlight' = a
-       /\ UNCHANGED <<current, claimKind, workerRevoked,
+       /\ UNCHANGED <<current, claimKind,
+                       workerRevoked, workerClaimedOrLater,
                        schedulerRevokeSent, readyAccepted,
-                       revokeRequestInFlight, revokeResultInFlight,
-                       published, released>>
+                       revokeRequestInFlight,
+                       revokeResultInFlight, revokeResultKind,
+                       revokeResultsDelivered, claimCrossedRevoke,
+                       published, revokedReleased, claimedRetained,
+                       ordinarySettled, released>>
 
 AdvisoryClaimCurrent ==
     LET a == current
     IN /\ phase[a] = "Absent"
        /\ phase' = [phase EXCEPT ![a] = "Claimed"]
        /\ claimKind' = [claimKind EXCEPT ![a] = "Unfenced"]
-       /\ UNCHANGED <<current, workerPrepared, workerRevoked,
+       /\ claimCrossedRevoke' =
+              IF revokeRequestInFlight = a
+              THEN claimCrossedRevoke \cup {a}
+              ELSE claimCrossedRevoke
+       /\ UNCHANGED <<current, workerPrepared,
+                       workerRevoked, workerClaimedOrLater,
                        schedulerRevokeSent, readyInFlight, readyAccepted,
-                       revokeRequestInFlight, revokeResultInFlight,
-                       published, released>>
+                       revokeRequestInFlight,
+                       revokeResultInFlight, revokeResultKind,
+                       revokeResultsDelivered,
+                       published, revokedReleased, claimedRetained,
+                       ordinarySettled, released>>
 
 PrepareAfterUnfencedClaim(a) ==
     /\ a \in Assignments
@@ -99,18 +130,26 @@ PrepareAfterUnfencedClaim(a) ==
     /\ phase' = [phase EXCEPT
                     ![a] = IF MutantLatePrepareRegresses
                            THEN "Reserved" ELSE @]
-    /\ UNCHANGED <<current, claimKind, workerRevoked,
+    /\ UNCHANGED <<current, claimKind,
+                    workerRevoked, workerClaimedOrLater,
                     schedulerRevokeSent, readyAccepted,
-                    revokeRequestInFlight, revokeResultInFlight,
-                    published, released>>
+                    revokeRequestInFlight,
+                    revokeResultInFlight, revokeResultKind,
+                    revokeResultsDelivered, claimCrossedRevoke,
+                    published, revokedReleased, claimedRetained,
+                    ordinarySettled, released>>
 
 SwitchToNew ==
     /\ current = OldA
     /\ current' = NewA
-    /\ UNCHANGED <<phase, claimKind, workerPrepared, workerRevoked,
+    /\ UNCHANGED <<phase, claimKind, workerPrepared,
+                    workerRevoked, workerClaimedOrLater,
                     schedulerRevokeSent, readyInFlight, readyAccepted,
-                    revokeRequestInFlight, revokeResultInFlight,
-                    published, released>>
+                    revokeRequestInFlight,
+                    revokeResultInFlight, revokeResultKind,
+                    revokeResultsDelivered, claimCrossedRevoke,
+                    published, revokedReleased, claimedRetained,
+                    ordinarySettled, released>>
 
 DeliverReady ==
     LET origin == readyInFlight
@@ -121,20 +160,28 @@ DeliverReady ==
        /\ readyInFlight' = NoA
        /\ readyAccepted' = accepted
        /\ UNCHANGED <<current, phase, claimKind,
-                       workerPrepared, workerRevoked,
+                       workerPrepared,
+                       workerRevoked, workerClaimedOrLater,
                        schedulerRevokeSent,
-                       revokeRequestInFlight, revokeResultInFlight,
-                       published, released>>
+                       revokeRequestInFlight,
+                       revokeResultInFlight, revokeResultKind,
+                       revokeResultsDelivered, claimCrossedRevoke,
+                       published, revokedReleased, claimedRetained,
+                       ordinarySettled, released>>
 
 PublishCurrent ==
     /\ readyAccepted = current
     /\ published' = published \cup {current}
     /\ UNCHANGED <<current, phase, claimKind,
-                    workerPrepared, workerRevoked,
+                    workerPrepared,
+                    workerRevoked, workerClaimedOrLater,
                     schedulerRevokeSent,
                     readyInFlight, readyAccepted,
-                    revokeRequestInFlight, revokeResultInFlight,
-                    released>>
+                    revokeRequestInFlight,
+                    revokeResultInFlight, revokeResultKind,
+                    revokeResultsDelivered, claimCrossedRevoke,
+                    revokedReleased, claimedRetained,
+                    ordinarySettled, released>>
 
 SendRevokeCurrent ==
     /\ revokeRequestInFlight = NoA
@@ -142,33 +189,111 @@ SendRevokeCurrent ==
     /\ schedulerRevokeSent' = schedulerRevokeSent \cup {current}
     /\ revokeRequestInFlight' = current
     /\ UNCHANGED <<current, phase, claimKind,
-                    workerPrepared, workerRevoked,
+                    workerPrepared,
+                    workerRevoked, workerClaimedOrLater,
                     readyInFlight, readyAccepted,
-                    revokeResultInFlight, published, released>>
+                    revokeResultInFlight, revokeResultKind,
+                    revokeResultsDelivered, claimCrossedRevoke,
+                    published, revokedReleased, claimedRetained,
+                    ordinarySettled, released>>
 
 DeliverRevokeRequest ==
     LET origin == revokeRequestInFlight
         target == IF MutantRevokeRequestByWireOnly THEN current ELSE origin
+        claimWon == phase[target] \in {"Claimed", "Started", "Terminal"}
+        alreadyRevoked == phase[target] = "Revoked"
+        result == IF claimWon THEN "ClaimedOrLater" ELSE "Revoked"
     IN /\ origin \in Assignments
        /\ revokeResultInFlight = NoA
-       /\ workerRevoked' = workerRevoked \cup {target}
-       /\ phase' = [phase EXCEPT ![target] = "Revoked"]
+       /\ workerRevoked' =
+              IF claimWon THEN workerRevoked
+              ELSE workerRevoked \cup {target}
+       /\ workerClaimedOrLater' =
+              IF claimWon
+              THEN workerClaimedOrLater \cup {target}
+              ELSE workerClaimedOrLater
+       /\ phase' = [phase EXCEPT
+                       ![target] = IF claimWon \/ alreadyRevoked
+                                  THEN @ ELSE "Revoked"]
        /\ revokeRequestInFlight' = NoA
-       /\ revokeResultInFlight' = target
+       \* The result echoes the request's full identity.  A wire-only mutant
+       \* may select the wrong record, but it does not erase the nonce carried
+       \* by the control message.
+       /\ revokeResultInFlight' = origin
+       /\ revokeResultKind' = result
        /\ UNCHANGED <<current, claimKind, workerPrepared,
                        schedulerRevokeSent, readyInFlight, readyAccepted,
-                       published, released>>
+                       revokeResultsDelivered, claimCrossedRevoke,
+                       published, revokedReleased, claimedRetained,
+                       ordinarySettled, released>>
 
 DeliverRevokeResult ==
     LET origin == revokeResultInFlight
         accepted == IF MutantRevokeResultByWireOnly THEN current ELSE origin
+        result == revokeResultKind
     IN /\ origin \in Assignments
-       /\ released' = released \cup {accepted}
+       /\ result \in RevokeResults
        /\ revokeResultInFlight' = NoA
+       /\ revokeResultKind' = NoResult
+       /\ revokeResultsDelivered' = revokeResultsDelivered \cup {origin}
+       /\ revokedReleased' =
+              IF result = "Revoked"
+              THEN revokedReleased \cup {accepted}
+              ELSE revokedReleased
+       /\ claimedRetained' =
+              IF result = "ClaimedOrLater"
+              THEN claimedRetained \cup {accepted}
+              ELSE claimedRetained
+       /\ released' =
+              IF result = "Revoked"
+              THEN released \cup {accepted}
+              ELSE released
        /\ UNCHANGED <<current, phase, claimKind,
-                       workerPrepared, workerRevoked,
+                       workerPrepared,
+                       workerRevoked, workerClaimedOrLater,
                        schedulerRevokeSent, readyInFlight, readyAccepted,
-                       revokeRequestInFlight, published>>
+                       revokeRequestInFlight, claimCrossedRevoke,
+                       published, ordinarySettled>>
+
+Start(a) ==
+    /\ a \in Assignments
+    /\ phase[a] = "Claimed"
+    /\ phase' = [phase EXCEPT ![a] = "Started"]
+    /\ UNCHANGED <<current, claimKind, workerPrepared,
+                    workerRevoked, workerClaimedOrLater,
+                    schedulerRevokeSent, readyInFlight, readyAccepted,
+                    revokeRequestInFlight,
+                    revokeResultInFlight, revokeResultKind,
+                    revokeResultsDelivered, claimCrossedRevoke,
+                    published, revokedReleased, claimedRetained,
+                    ordinarySettled, released>>
+
+Finish(a) ==
+    /\ a \in Assignments
+    /\ phase[a] = "Started"
+    /\ phase' = [phase EXCEPT ![a] = "Terminal"]
+    /\ UNCHANGED <<current, claimKind, workerPrepared,
+                    workerRevoked, workerClaimedOrLater,
+                    schedulerRevokeSent, readyInFlight, readyAccepted,
+                    revokeRequestInFlight,
+                    revokeResultInFlight, revokeResultKind,
+                    revokeResultsDelivered, claimCrossedRevoke,
+                    published, revokedReleased, claimedRetained,
+                    ordinarySettled, released>>
+
+OrdinarySettle(a) ==
+    /\ a \in claimedRetained
+    /\ phase[a] = "Terminal"
+    /\ claimedRetained' = claimedRetained \ {a}
+    /\ ordinarySettled' = ordinarySettled \cup {a}
+    /\ released' = released \cup {a}
+    /\ UNCHANGED <<current, phase, claimKind, workerPrepared,
+                    workerRevoked, workerClaimedOrLater,
+                    schedulerRevokeSent, readyInFlight, readyAccepted,
+                    revokeRequestInFlight,
+                    revokeResultInFlight, revokeResultKind,
+                    revokeResultsDelivered, claimCrossedRevoke,
+                    published, revokedReleased>>
 
 Next ==
     \/ PrepareCurrent
@@ -180,6 +305,9 @@ Next ==
     \/ SendRevokeCurrent
     \/ DeliverRevokeRequest
     \/ DeliverRevokeResult
+    \/ \E a \in Assignments : Start(a)
+    \/ \E a \in Assignments : Finish(a)
+    \/ \E a \in Assignments : OrdinarySettle(a)
 
 Spec == Init /\ [][Next]_vars
 
@@ -189,26 +317,77 @@ TypeOK ==
     /\ claimKind \in [Assignments -> ClaimKinds]
     /\ workerPrepared \subseteq Assignments
     /\ workerRevoked \subseteq Assignments
+    /\ workerClaimedOrLater \subseteq Assignments
     /\ schedulerRevokeSent \subseteq Assignments
     /\ readyInFlight \in Assignments \cup {NoA}
     /\ readyAccepted \in Assignments \cup {NoA}
     /\ revokeRequestInFlight \in Assignments \cup {NoA}
     /\ revokeResultInFlight \in Assignments \cup {NoA}
+    /\ revokeResultKind \in RevokeResults \cup {NoResult}
+    /\ ((revokeResultInFlight = NoA) = (revokeResultKind = NoResult))
+    /\ revokeResultsDelivered \subseteq Assignments
+    /\ claimCrossedRevoke \subseteq Assignments
     /\ published \subseteq Assignments
+    /\ revokedReleased \subseteq Assignments
+    /\ claimedRetained \subseteq Assignments
+    /\ ordinarySettled \subseteq Assignments
     /\ released \subseteq Assignments
 
 PublishedHasMatchingPrepare ==
     published \subseteq workerPrepared
 
 RevocationTargetsSentAssignment ==
-    workerRevoked \subseteq schedulerRevokeSent
+    (workerRevoked \cup workerClaimedOrLater) \subseteq schedulerRevokeSent
 
-ReleaseHasMatchingWorkerProof ==
-    released \subseteq workerRevoked
+RevokeResultHasMatchingWorkerProof ==
+    /\ revokedReleased \subseteq workerRevoked
+    /\ (claimedRetained \cup ordinarySettled) \subseteq
+          workerClaimedOrLater
+
+ReleaseHasMatchingSettlement ==
+    /\ released = revokedReleased \cup ordinarySettled
+    /\ revokedReleased \cap ordinarySettled = {}
+
+RevokedHasNoClaimEvidence ==
+    \A a \in workerRevoked :
+        /\ claimKind[a] = "None"
+        /\ phase[a] = "Revoked"
+
+ClaimedOrLaterPreservesWorkerState ==
+    \A a \in workerClaimedOrLater :
+        phase[a] \in {"Claimed", "Started", "Terminal"}
+
+CrossedClaimWinsRevoke ==
+    \A a \in claimCrossedRevoke :
+        /\ a \notin workerRevoked
+        /\ phase[a] \in {"Claimed", "Started", "Terminal"}
+
+StaleNonceResultDoesNotReleaseCurrent ==
+    (current = NewA
+     /\ OldA \in revokeResultsDelivered
+     /\ NewA \notin workerRevoked) =>
+        NewA \notin revokedReleased
 
 ClaimedPhaseNeverRegresses ==
     \A a \in Assignments :
         claimKind[a] # "None" =>
             phase[a] \in {"Claimed", "Started", "Terminal"}
+
+RevokeClaimCrossingCompleted ==
+    \E a \in Assignments :
+        /\ a \in claimCrossedRevoke
+        /\ a \in workerClaimedOrLater
+        /\ a \in claimedRetained
+        /\ a \notin released
+        /\ phase[a] \in {"Claimed", "Started", "Terminal"}
+
+StaleNonceResultDelivered ==
+    /\ current = NewA
+    /\ OldA \in revokeResultsDelivered
+    /\ OldA \in revokedReleased
+    /\ NewA \notin released
+
+NoRevokeClaimCrossingWitness == ~RevokeClaimCrossingCompleted
+NoStaleNonceResultWitness == ~StaleNonceResultDelivered
 
 =============================================================================
