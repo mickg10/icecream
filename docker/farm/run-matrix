@@ -12,10 +12,12 @@ shift 2
 
 case "$submitter" in
     nas642)
-        profile=local_80_nas_submitter
+        profile=conservative_nas_submitter
+        scenario=c1f4
         ;;
     quietbox2)
-        profile=local_56_q2_submitter
+        profile=conservative_q2_submitter
+        scenario=c1f3
         ;;
     *)
         echo "submitter must be nas642 or quietbox2" >&2
@@ -25,7 +27,7 @@ esac
 
 for environment in debian-gcc fedora-clang-libcxx linuxbrew conan-gcc; do
     "$(dirname "$0")/farm.py" run \
-        --scenario c1f1 \
+        --scenario "$scenario" \
         --profile "$profile" \
         --environment "$environment" \
         --run-label "${label_prefix}-${submitter}-${environment}" \

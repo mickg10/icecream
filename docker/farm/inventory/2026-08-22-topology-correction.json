@@ -1,0 +1,38 @@
+{
+  "schema": 1,
+  "recorded_date": "2026-08-22",
+  "provenance": "owner topology clarification",
+  "physical_f_endpoints": [
+    "research6",
+    "research7",
+    "quietbox2",
+    "quietbox3"
+  ],
+  "f_semantics": "one Icecream daemon/container/route identity/cache identity owner per selected physical host",
+  "slot_semantics": "each F advertises one independently configurable iceccd -m value in the range 1..32",
+  "conservative_slots": {
+    "research6": 16,
+    "research7": 16,
+    "quietbox2": 24,
+    "quietbox3": 24
+  },
+  "maximum_configurable_slots": {
+    "research6": 32,
+    "research7": 32,
+    "quietbox2": 32,
+    "quietbox3": 32
+  },
+  "client_comparison": {
+    "nas642": {
+      "class": "naturally-bandwidth-limited",
+      "measured_rate": null,
+      "provenance": "owner-observed experiment condition; retain it as a named C1F4 profile"
+    },
+    "quietbox2": {
+      "class": "faster-lan-comparison",
+      "measured_rate": null,
+      "provenance": "owner-selected comparison; exclude quietbox2 F and retain a named C1F3 profile"
+    }
+  },
+  "live_measurement_contract": "record exact LAN interfaces and addresses, before/after RX/TX counters, elapsed compile time, and C-to-F/F-to-C route rows without inventing an unmeasured link rate"
+}

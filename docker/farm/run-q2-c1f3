@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+exec "$(dirname "$0")/farm.py" run \
+    --scenario c1f3 --profile conservative_q2_submitter "$@"

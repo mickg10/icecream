@@ -125,8 +125,8 @@ def load_manifest(path: Path, mounts_path: Path | None = None,
 
 def validate_manifest(manifest: Mapping[str, Any]) -> None:
     errors: list[str] = []
-    if manifest.get("schema") != 1:
-        errors.append("schema must be 1")
+    if manifest.get("schema") != 2:
+        errors.append("schema must be 2")
 
     network = manifest.get("network", {})
     if network.get("mode") != "local-lan":
@@ -232,8 +232,11 @@ def validate_manifest(manifest: Mapping[str, Any]) -> None:
         slots = profile.get("worker_slots", {})
         if set(slots) - set(hosts):
             errors.append(f"profile {profile_name} names unknown worker hosts")
-        if any(not isinstance(value, int) or value < 0 for value in slots.values()):
-            errors.append(f"profile {profile_name} worker slots must be non-negative integers")
+        if any(not isinstance(value, int) or value < 0 or value > 32
+               for value in slots.values()):
+            errors.append(
+                f"profile {profile_name} worker slots must be integers in the range 0..32"
+            )
         total = sum(slots.values())
         if total != profile.get("advertised_worker_slots"):
             errors.append(
@@ -264,9 +267,40 @@ def validate_manifest(manifest: Mapping[str, Any]) -> None:
     for scenario_name, scenario in scenarios.items():
         if not SAFE_NAME_RE.fullmatch(scenario_name):
             errors.append(f"unsafe scenario name {scenario_name!r}")
-        for key in ("submitter_count", "worker_count"):
+        for key in ("submitter_count", "f_count"):
             if not isinstance(scenario.get(key), int) or scenario[key] <= 0:
                 errors.append(f"scenario {scenario_name} {key} must be positive")
+        if isinstance(scenario.get("f_count"), int) and scenario["f_count"] > 4:
+            errors.append(f"scenario {scenario_name} cannot select more than four physical Fs")
+
+    dimensions = manifest.get("scenario_dimensions", {})
+    expected_dimensions = {
+        "component_versions", "workload", "routing_policy", "codec_policy",
+        "event_schedule",
+    }
+    if set(dimensions) != expected_dimensions:
+        errors.append(
+            "scenario_dimensions must contain exactly " + str(sorted(expected_dimensions))
+        )
+    binary_sets = manifest.get("component_binary_sets", {})
+    versions = dimensions.get("component_versions", {})
+    if set(versions) != {"scheduler", "submitter", "worker"}:
+        errors.append("component_versions must select scheduler, submitter, and worker")
+    for role, version_name in versions.items():
+        if version_name not in binary_sets:
+            errors.append(f"{role} selects unknown component binary set {version_name!r}")
+    for name, item in binary_sets.items():
+        if not SAFE_NAME_RE.fullmatch(name):
+            errors.append(f"unsafe component binary set name {name!r}")
+        if not isinstance(item.get("available"), bool):
+            errors.append(f"component binary set {name} must declare available")
+        if item.get("available") and item.get("runtime_path_key") not in PATH_KEYS:
+            errors.append(f"available component binary set {name} lacks a runtime path key")
+        if not item.get("available") and (
+            item.get("runtime_path_key") is not None
+            or item.get("runtime_image_class") is not None
+        ):
+            errors.append(f"unavailable component binary set {name} must not name artifacts")
 
     environments = manifest.get("environment_classes", {})
     if len(environments) != 4:
@@ -298,7 +332,8 @@ def validate_manifest(manifest: Mapping[str, Any]) -> None:
 
 def derive_run_id(manifest: Mapping[str, Any], profile: str, scenario: str,
                   environment: str, run_label: str,
-                  submitters: Sequence[str]) -> str:
+                  submitters: Sequence[str],
+                  dimensions: Mapping[str, Any] | None = None) -> str:
     if not RUN_LABEL_RE.fullmatch(run_label):
         raise FarmError(
             "run label must use 1-64 lowercase letters, digits, '.', '_' or '-'"
@@ -310,33 +345,28 @@ def derive_run_id(manifest: Mapping[str, Any], profile: str, scenario: str,
         "environment": environment,
         "run_label": run_label,
         "submitters": list(submitters),
+        "dimensions": dimensions or manifest.get("scenario_dimensions", {}),
     }
     digest = hashlib.sha256(canonical_json(identity)).hexdigest()[:12]
     return f"p50-{scenario}-{digest}"
 
 
-def allocate_workers(profile: Mapping[str, Any], count: int) -> dict[str, int]:
-    slots = dict(profile["worker_slots"])
-    if count > sum(slots.values()):
-        raise FarmError(f"scenario requests {count} workers but profile has {sum(slots.values())}")
-    result = {name: 0 for name in slots}
-    order = profile["worker_order"]
-    while sum(result.values()) < count:
-        progressed = False
-        for host_name in order:
-            if result[host_name] < slots[host_name]:
-                result[host_name] += 1
-                progressed = True
-                if sum(result.values()) == count:
-                    break
-        if not progressed:
-            raise FarmError("worker allocation made no progress")
-    return {name: value for name, value in result.items() if value}
+def select_f_hosts(profile: Mapping[str, Any], count: int) -> dict[str, int]:
+    """Select physical F endpoints; the returned values are slots, not daemon counts."""
+    order = list(profile["worker_order"])
+    if count > len(order):
+        raise FarmError(
+            f"scenario requests {count} F endpoints but profile has {len(order)} physical Fs"
+        )
+    selected = order[:count]
+    slots = profile["worker_slots"]
+    return {host_name: slots[host_name] for host_name in selected}
 
 
 def build_plan(manifest: Mapping[str, Any], profile_name: str, scenario_name: str,
                environment_name: str, run_label: str,
-               submitter_overrides: Sequence[str] | None = None) -> dict[str, Any]:
+               submitter_overrides: Sequence[str] | None = None,
+               component_version_overrides: Mapping[str, str] | None = None) -> dict[str, Any]:
     try:
         profile = manifest["profiles"][profile_name]
     except KeyError as exc:
@@ -363,30 +393,69 @@ def build_plan(manifest: Mapping[str, Any], profile_name: str, scenario_name: st
                 f"submitter {host_name} retains worker slots; select a profile that excludes them"
             )
 
-    worker_counts = allocate_workers(profile, scenario["worker_count"])
+    slots_by_f_host = select_f_hosts(profile, scenario["f_count"])
+    dimensions = dict(manifest["scenario_dimensions"])
+    versions = dict(dimensions["component_versions"])
+    versions.update(component_version_overrides or {})
+    if set(versions) != {"scheduler", "submitter", "worker"}:
+        raise FarmError("component version overrides may name only scheduler, submitter, and worker")
+    for role, version_name in versions.items():
+        try:
+            binary_set = manifest["component_binary_sets"][version_name]
+        except KeyError as exc:
+            raise FarmError(f"{role} selects unknown component binary set {version_name!r}") from exc
+        if not binary_set["available"]:
+            raise FarmError(
+                f"{role} component binary set {version_name!r} is declared but unavailable: "
+                f"{binary_set['provenance']}"
+            )
+    dimensions["component_versions"] = versions
+    submitter_capacity = [
+        manifest["hosts"][host_name].get(
+            "client_capacity",
+            {
+                "class": "not-a-client-profile",
+                "provenance": "no client capacity class declared",
+                "measured_rate": None,
+                "measurement_status": "not applicable",
+            },
+        )
+        for host_name in submitters
+    ]
+    artifact_identities = {
+        "controller_source_git_head": git_head(HERE),
+        "runtime_image_fingerprint": manifest["runtime_image"]["expected_fingerprint"],
+        "environment_image_fingerprint": manifest["environment_classes"][environment_name][
+            "expected_fingerprint"
+        ],
+    }
+    identity_dimensions = {**dimensions, "artifact_identities": artifact_identities}
     run_id = derive_run_id(
-        manifest, profile_name, scenario_name, environment_name, run_label, submitters
+        manifest, profile_name, scenario_name, environment_name, run_label, submitters,
+        identity_dimensions,
     )
     network = manifest["network"]
 
     workers: list[dict[str, Any]] = []
-    ordinal = 0
-    for host_name in profile["worker_order"]:
-        for host_index in range(worker_counts.get(host_name, 0)):
-            workers.append(
-                {
-                    "role": "worker",
-                    "host": host_name,
-                    "ordinal": ordinal,
-                    "host_index": host_index,
-                    "port": network["worker_port_base"] + host_index,
-                    "node_name": f"f-{host_name}-{host_index:02d}",
-                    "service": f"f{ordinal:02d}",
-                    "container": f"icefarm-{run_id}-f{ordinal:02d}",
-                    "log_file": f"f{ordinal:02d}-{host_name}.log",
-                }
-            )
-            ordinal += 1
+    for ordinal, (host_name, slots) in enumerate(slots_by_f_host.items()):
+        address = manifest["hosts"][host_name]["address"]
+        port = network["worker_port_base"]
+        workers.append(
+            {
+                "role": "worker",
+                "host": host_name,
+                "ordinal": ordinal,
+                "host_index": 0,
+                "slots": slots,
+                "port": port,
+                "route_identity": f"{address}:{port}",
+                "cache_identity_owner": host_name,
+                "node_name": f"f-{host_name}",
+                "service": f"f{ordinal:02d}",
+                "container": f"icefarm-{run_id}-f{ordinal:02d}",
+                "log_file": f"f{ordinal:02d}-{host_name}.log",
+            }
+        )
 
     submitter_records: list[dict[str, Any]] = []
     per_host_submitter_count: dict[str, int] = {}
@@ -418,18 +487,23 @@ def build_plan(manifest: Mapping[str, Any], profile_name: str, scenario_name: st
         "port": network["scheduler_port"],
         "log_file": "scheduler.log",
     }
-    group_worker_counts: dict[str, int] = {}
-    for host_name, count_for_host in worker_counts.items():
+    group_slots: dict[str, int] = {}
+    group_f_counts: dict[str, int] = {}
+    for host_name, slots in slots_by_f_host.items():
         group = manifest["hosts"][host_name]["resource_group"]
-        group_worker_counts[group] = group_worker_counts.get(group, 0) + count_for_host
+        group_slots[group] = group_slots.get(group, 0) + slots
+        group_f_counts[group] = group_f_counts.get(group, 0) + 1
 
     return {
-        "schema": 1,
+        "schema": 2,
         "run_id": run_id,
         "run_label": run_label,
         "profile": profile_name,
         "scenario": scenario_name,
         "environment": environment_name,
+        "dimensions": dimensions,
+        "artifact_identities": artifact_identities,
+        "client_capacity": submitter_capacity,
         "network_mode": "local-lan",
         "netname": run_id,
         "scheduler": scheduler,
@@ -437,11 +511,18 @@ def build_plan(manifest: Mapping[str, Any], profile_name: str, scenario_name: st
         "workers": workers,
         "accounting": {
             "advertised_profile_worker_slots": profile["advertised_worker_slots"],
-            "scenario_worker_containers": len(workers),
-            "worker_host_identities": len(worker_counts),
-            "independent_resource_groups": len(group_worker_counts),
-            "worker_containers_by_host": worker_counts,
-            "worker_containers_by_resource_group": group_worker_counts,
+            "selected_compile_slots": sum(slots_by_f_host.values()),
+            "f_daemon_containers": len(workers),
+            "f_host_identities": len(slots_by_f_host),
+            "route_identity_count": len({worker["route_identity"] for worker in workers}),
+            "cache_identity_owner_count": len(
+                {worker["cache_identity_owner"] for worker in workers}
+            ),
+            "independent_resource_groups": len(group_slots),
+            "slots_by_f_host": slots_by_f_host,
+            "f_daemons_by_host": {host_name: 1 for host_name in slots_by_f_host},
+            "slots_by_resource_group": group_slots,
+            "f_daemons_by_resource_group": group_f_counts,
             "scheduler_resource_group": manifest["hosts"][scheduler_host]["resource_group"],
             "scheduler_and_submitter_load_is_additional": True,
         },
@@ -474,6 +555,20 @@ def expected_registrations(manifest: Mapping[str, Any],
     return result
 
 
+def registration_matches(manifest: Mapping[str, Any], record: Mapping[str, Any],
+                         snapshot: str) -> bool:
+    address = manifest["hosts"][record["host"]]["address"]
+    port = record.get("registration_port", record.get("port"))
+    identity = re.escape(f"{record['node_name']} ({address}:{port})")
+    if record["role"] == "worker":
+        # listcs reports current/max jobs. Requiring the configured maximum proves
+        # that one daemon advertised its slot budget, rather than N one-slot daemons.
+        suffix = rf"[^\n]*\bjobs=[0-9]+/{record['slots']}\b"
+    else:
+        suffix = r"[^\n]*\bjobs=[0-9]+/0\b"
+    return re.search(identity + suffix, snapshot) is not None
+
+
 def required_listener_ports(manifest: Mapping[str, Any],
                             plan: Mapping[str, Any], host_name: str) -> list[int]:
     """Return only ports opened by services in this plan on one host."""
@@ -489,11 +584,17 @@ def required_listener_ports(manifest: Mapping[str, Any],
 
 def missing_registrations(manifest: Mapping[str, Any], plan: Mapping[str, Any],
                           snapshot: str) -> list[str]:
-    return [
-        registration
-        for registration in expected_registrations(manifest, plan)
-        if registration not in snapshot
-    ]
+    missing = []
+    for record in [*plan["submitters"], *plan["workers"]]:
+        if registration_matches(manifest, record, snapshot):
+            continue
+        expected = expected_registrations(manifest, {**plan, "submitters": [], "workers": [record]})[0]
+        if record["role"] == "worker":
+            expected += f" jobs=*/{record['slots']}"
+        else:
+            expected += " jobs=*/0"
+        missing.append(expected)
+    return missing
 
 
 def planned_container_status(runner: "HostRunner",
@@ -621,6 +722,97 @@ class HostRunner:
                 f"{self.name}: {shlex.join(argv)} exited {result.returncode}: {stderr}"
             )
         return result
+
+
+def interface_counter_snapshot(manifest: Mapping[str, Any],
+                               plan: Mapping[str, Any]) -> dict[str, Any]:
+    """Capture read-only host-interface byte counters for the exact LAN interfaces."""
+    captured: dict[str, Any] = {
+        "captured_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "monotonic_ns": time.monotonic_ns(),
+        "hosts": {},
+    }
+    for host_name in sorted(plan_hosts(plan)):
+        host = manifest["hosts"][host_name]
+        interface = host["interface"]
+        runner = HostRunner(host_name, host)
+        values: dict[str, int] = {}
+        for direction in ("rx", "tx"):
+            path = f"/sys/class/net/{interface}/statistics/{direction}_bytes"
+            result = runner.run(["cat", "--", path], timeout=10)
+            text_value = result.stdout.decode("ascii", "replace").strip()
+            if result.returncode != 0 or not text_value.isdigit():
+                raise FarmError(
+                    f"{host_name}: cannot read exact LAN {direction} counter from {path}"
+                )
+            values[f"{direction}_bytes"] = int(text_value)
+        captured["hosts"][host_name] = {
+            "address": host["address"],
+            "interface": interface,
+            **values,
+        }
+    return captured
+
+
+def directional_network_ledger(manifest: Mapping[str, Any], plan: Mapping[str, Any],
+                               before: Mapping[str, Any],
+                               after: Mapping[str, Any]) -> dict[str, Any]:
+    elapsed_ns = int(after["monotonic_ns"]) - int(before["monotonic_ns"])
+    if elapsed_ns <= 0:
+        raise FarmError("network observation elapsed time must be positive")
+    elapsed_seconds = elapsed_ns / 1_000_000_000
+    host_deltas: dict[str, Any] = {}
+    for host_name in sorted(plan_hosts(plan)):
+        first = before["hosts"][host_name]
+        last = after["hosts"][host_name]
+        rx_delta = int(last["rx_bytes"]) - int(first["rx_bytes"])
+        tx_delta = int(last["tx_bytes"]) - int(first["tx_bytes"])
+        if rx_delta < 0 or tx_delta < 0:
+            raise FarmError(f"{host_name}: LAN interface counters moved backwards")
+        host_deltas[host_name] = {
+            "address": manifest["hosts"][host_name]["address"],
+            "interface": manifest["hosts"][host_name]["interface"],
+            "rx_bytes": rx_delta,
+            "tx_bytes": tx_delta,
+            "rx_bits_per_second": round(rx_delta * 8 / elapsed_seconds, 3),
+            "tx_bits_per_second": round(tx_delta * 8 / elapsed_seconds, 3),
+        }
+    routes = []
+    for submitter in plan["submitters"]:
+        c_host = submitter["host"]
+        for worker in plan["workers"]:
+            f_host = worker["host"]
+            routes.append(
+                {
+                    "c_host": c_host,
+                    "c_address": manifest["hosts"][c_host]["address"],
+                    "f_host": f_host,
+                    "f_address": manifest["hosts"][f_host]["address"],
+                    "f_route_identity": worker["route_identity"],
+                    "c_to_f": {
+                        "c_interface_tx": host_deltas[c_host]["tx_bytes"],
+                        "f_interface_rx": host_deltas[f_host]["rx_bytes"],
+                    },
+                    "f_to_c": {
+                        "f_interface_tx": host_deltas[f_host]["tx_bytes"],
+                        "c_interface_rx": host_deltas[c_host]["rx_bytes"],
+                    },
+                }
+            )
+    return {
+        "schema": 2,
+        "measurement": "host LAN-interface aggregate counters during acceptance",
+        "attribution": (
+            "directional provenance, not per-flow byte attribution; shared-interface traffic "
+            "may contribute to the observed deltas"
+        ),
+        "elapsed_ns": elapsed_ns,
+        "client_capacity": plan["client_capacity"],
+        "host_deltas": host_deltas,
+        "routes": routes,
+        "before": before,
+        "after": after,
+    }
 
 
 def parse_key_values(output: bytes) -> dict[str, str]:
@@ -975,10 +1167,10 @@ def inspect_host(manifest: Mapping[str, Any], plan: Mapping[str, Any],
     report["images"] = image_report
 
     visible = facts.get("online_cpus")
-    declared = plan["accounting"]["worker_containers_by_host"].get(host_name, 0)
+    declared = plan["accounting"]["slots_by_f_host"].get(host_name, 0)
     if declared and visible and int(visible) < declared:
         report["warnings"].append(
-            f"declared worker allocation {declared} exceeds current visible CPU count {visible}; "
+            f"declared compile-slot allocation {declared} exceeds current visible CPU count {visible}; "
             "owner allocation is retained and the ratio is recorded"
         )
 
@@ -1025,7 +1217,10 @@ def preflight(manifest: Mapping[str, Any], plan: Mapping[str, Any]) -> dict[str,
         group_measurements[group_name] = {
             "selected_hosts": selected,
             "aggregate_worker_cap": group["aggregate_worker_cap"],
-            "planned_workers": plan["accounting"]["worker_containers_by_resource_group"].get(
+            "planned_f_daemons": plan["accounting"]["f_daemons_by_resource_group"].get(
+                group_name, 0
+            ),
+            "planned_compile_slots": plan["accounting"]["slots_by_resource_group"].get(
                 group_name, 0
             ),
             "visible_cpu_views": {
@@ -1037,7 +1232,7 @@ def preflight(manifest: Mapping[str, Any], plan: Mapping[str, Any]) -> dict[str,
             "do_not_interpret_visible_cpu_sum_as_independent_capacity": len(group["members"]) > 1,
         }
     return {
-        "schema": 1,
+        "schema": 2,
         "checked_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "run_id": plan["run_id"],
         "network_mode": "local-lan",
@@ -1158,7 +1353,7 @@ def render_compose(manifest: Mapping[str, Any], plan: Mapping[str, Any],
                         [
                         "-n", plan["netname"],
                         "-N", record["node_name"],
-                        "-m", "1",
+                        "-m", str(record["slots"]),
                         "-p", str(record["port"]),
                         "-s", scheduler_endpoint,
                         "-i", host["interface"],
@@ -1453,9 +1648,108 @@ def collect_run(run_dir: Path, run: dict[str, Any]) -> dict[str, Any]:
         "sha256": hashlib.sha256(snapshot_path.read_bytes()).hexdigest(),
     }
     write_json(log_root / "collection.json", collection)
+    ledger_path = run_dir / "evidence-hashes.sha256"
+    ledger_rows = []
+    for path in sorted(run_dir.rglob("*")):
+        if not path.is_file() or path in {run_dir / "run.json", ledger_path}:
+            continue
+        ledger_rows.append(
+            f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.relative_to(run_dir)}"
+        )
+    ledger_path.write_text("\n".join(ledger_rows) + "\n", encoding="ascii")
+    collection["hash_ledger"] = {
+        "path": str(ledger_path),
+        "sha256": hashlib.sha256(ledger_path.read_bytes()).hexdigest(),
+        "entries": len(ledger_rows),
+    }
     run["last_collection"] = collection
     write_json(run_dir / "run.json", run)
     return collection
+
+
+def inspect_run_state(run: Mapping[str, Any]) -> dict[str, Any]:
+    """Read exact run-labelled container and registration state without mutation."""
+    manifest = run["manifest"]
+    plan = run["plan"]
+    containers: list[dict[str, Any]] = []
+    all_running = True
+    any_present = False
+    for record in [plan["scheduler"], *plan["submitters"], *plan["workers"]]:
+        runner = HostRunner(record["host"], manifest["hosts"][record["host"]])
+        result = docker_command(
+            runner,
+            [
+                "inspect", "--format",
+                "{{index .Config.Labels \"org.icecream.farm.run_id\"}}|{{.State.Status}}",
+                record["container"],
+            ],
+            timeout=15,
+        )
+        value = result.stdout.decode("utf-8", "replace").strip()
+        if result.returncode != 0:
+            probe = docker_command(
+                runner,
+                [
+                    "container", "ls", "--all",
+                    "--filter", f"name=^/{record['container']}$",
+                    "--format", "{{.Names}}",
+                ],
+                timeout=15,
+            )
+            if probe.returncode != 0:
+                item = {
+                    **record,
+                    "present": None,
+                    "state": "unavailable",
+                    "error": (probe.stderr or result.stderr).decode(
+                        "utf-8", "replace"
+                    ).strip(),
+                }
+                any_present = True
+            else:
+                names = probe.stdout.decode("utf-8", "replace").splitlines()
+                present = record["container"] in names
+                item = {
+                    **record,
+                    "present": present,
+                    "state": "uninspectable" if present else "absent",
+                }
+                any_present = any_present or present
+            all_running = False
+        else:
+            any_present = True
+            label, separator, state = value.partition("|")
+            item = {
+                **record,
+                "present": True,
+                "state": state if separator else "unknown",
+                "label_matches": label == plan["run_id"],
+            }
+            if not separator or label != plan["run_id"] or state != "running":
+                all_running = False
+        containers.append(item)
+    snapshot = None
+    missing: list[str] = []
+    if all_running:
+        try:
+            snapshot = scheduler_snapshot(manifest, plan)
+            missing = missing_registrations(manifest, plan, snapshot)
+        except FarmError as exc:
+            missing = [str(exc)]
+    if all_running and not missing:
+        state = "ready"
+    elif any_present:
+        state = "partial"
+    else:
+        state = "absent"
+    return {
+        "checked_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "run_id": plan["run_id"],
+        "state": state,
+        "containers": containers,
+        "scheduler_snapshot": snapshot,
+        "missing_registrations": missing,
+    }
 
 
 def teardown_run(run_dir: Path, run: dict[str, Any], *, collect_first: bool = True) -> list[dict[str, Any]]:
@@ -1512,6 +1806,22 @@ def new_run_directory(controller_output: Path, run_id: str) -> Path:
 
 def launch_run(manifest: dict[str, Any], plan: dict[str, Any], controller_output: Path,
                readiness_timeout: int) -> tuple[Path, dict[str, Any]]:
+    existing_dir = controller_output.resolve() / plan["run_id"]
+    if existing_dir.is_dir():
+        existing = load_run(existing_dir)
+        if existing["manifest"] != manifest or existing["plan"] != plan:
+            raise FarmError(
+                f"existing deterministic run {existing_dir} does not match the requested plan"
+            )
+        status = inspect_run_state(existing)
+        if status["state"] == "ready":
+            existing["last_status"] = status
+            write_json(existing_dir / "run.json", existing)
+            return existing_dir, existing
+        raise FarmError(
+            f"existing deterministic run {existing_dir} is {status['state']}; "
+            "use status/down to reconcile it or choose a new run label"
+        )
     report = preflight(manifest, plan)
     if not report["ok"]:
         details = []
@@ -1524,7 +1834,7 @@ def launch_run(manifest: dict[str, Any], plan: dict[str, Any], controller_output
         )
     run_dir = new_run_directory(controller_output, plan["run_id"])
     run: dict[str, Any] = {
-        "schema": 1,
+        "schema": 2,
         "status": "preparing",
         "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "controller_hostname": socket.getfqdn(),
@@ -1582,6 +1892,13 @@ def launch_run(manifest: dict[str, Any], plan: dict[str, Any], controller_output
                 record["node_name"] for record in [*plan["submitters"], *plan["workers"]]
             ],
             "expected_registrations": expected_registrations(manifest, plan),
+            "expected_f_slots": {
+                record["node_name"]: record["slots"] for record in plan["workers"]
+            },
+            "route_identities": [record["route_identity"] for record in plan["workers"]],
+            "cache_identity_owners": [
+                record["cache_identity_owner"] for record in plan["workers"]
+            ],
         }
         run["status"] = "ready"
         write_json(run_dir / "run.json", run)
@@ -1618,6 +1935,7 @@ def run_acceptance(run_dir: Path, run: dict[str, Any], submitter_index: int = 0)
     build = f"/farm/build/acceptance-{plan['environment']}"
     results = "/farm/results"
     script = (HERE / "acceptance.sh").read_bytes()
+    counters_before = interface_counter_snapshot(manifest, plan)
     result = docker_command(
         runner,
         [
@@ -1628,6 +1946,12 @@ def run_acceptance(run_dir: Path, run: dict[str, Any], submitter_index: int = 0)
         input_bytes=script,
         timeout=300,
     )
+    counters_after = interface_counter_snapshot(manifest, plan)
+    network_ledger = directional_network_ledger(
+        manifest, plan, counters_before, counters_after
+    )
+    network_ledger_path = run_dir / "network-ledger.json"
+    write_json(network_ledger_path, network_ledger)
     stdout_path = run_dir / "acceptance.stdout"
     stderr_path = run_dir / "acceptance.stderr"
     stdout_path.write_bytes(result.stdout)
@@ -1661,6 +1985,8 @@ def run_acceptance(run_dir: Path, run: dict[str, Any], submitter_index: int = 0)
         "stderr": str(stderr_path),
         "provenance": str(provenance_path),
         "provenance_sha256": hashlib.sha256(provenance.stdout).hexdigest(),
+        "network_ledger": str(network_ledger_path),
+        "network_ledger_sha256": hashlib.sha256(network_ledger_path.read_bytes()).hexdigest(),
         "verified_program_output": "icecream-farm-ok 42",
         "remote_assignment_required": True,
     }
@@ -1691,6 +2017,15 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
         getattr(args, "node_image_fingerprint", None),
         getattr(args, "scheduler_port", None),
     )
+    version_overrides = {
+        role: value
+        for role, value in {
+            "scheduler": getattr(args, "scheduler_version", None),
+            "submitter": getattr(args, "submitter_version", None),
+            "worker": getattr(args, "worker_version", None),
+        }.items()
+        if value is not None
+    }
     plan = build_plan(
         manifest,
         args.profile,
@@ -1698,6 +2033,7 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
         args.environment,
         args.run_label,
         getattr(args, "submitter", None),
+        version_overrides,
     )
     return manifest, plan
 
@@ -1791,13 +2127,56 @@ def command_collect(args: argparse.Namespace) -> int:
 def command_down(args: argparse.Namespace) -> int:
     run_dir = Path(args.run_dir).resolve()
     run = load_run(run_dir)
-    outcomes = teardown_run(run_dir, run, collect_first=not args.no_collect)
+    status = inspect_run_state(run)
+    if status["state"] == "absent":
+        run["status"] = "down"
+        run["last_status"] = status
+        write_json(run_dir / "run.json", run)
+        outcomes = [
+            {"host": record["host"], "container": record["container"], "result": "absent"}
+            for record in [*run["plan"]["submitters"], *run["plan"]["workers"], run["plan"]["scheduler"]]
+        ]
+    else:
+        outcomes = teardown_run(run_dir, run, collect_first=not args.no_collect)
     print(json.dumps(outcomes, indent=2, sort_keys=True))
+    return 0
+
+
+def command_status(args: argparse.Namespace) -> int:
+    run_dir = Path(args.run_dir).resolve()
+    run = load_run(run_dir)
+    status = inspect_run_state(run)
+    print(json.dumps(status, indent=2, sort_keys=True))
+    return 0 if status["state"] in {"ready", "absent"} else 1
+
+
+def command_reconcile(args: argparse.Namespace) -> int:
+    run_dir = Path(args.run_dir).resolve()
+    run = load_run(run_dir)
+    status = inspect_run_state(run)
+    if args.desired == "down":
+        if status["state"] != "absent":
+            teardown_run(run_dir, run, collect_first=not args.no_collect)
+        print(json.dumps({"desired": "down", "state": "absent"}, indent=2))
+        return 0
+    if status["state"] != "ready":
+        raise FarmError(
+            f"cannot reconcile {run['plan']['run_id']} to up from {status['state']} "
+            "without replacing retained evidence; run exact down, then choose a new run label"
+        )
+    print(json.dumps({"desired": "up", "state": "ready"}, indent=2))
     return 0
 
 
 def command_run(args: argparse.Namespace) -> int:
     manifest, plan = prepare(args)
+    existing_dir = Path(args.controller_output).resolve() / plan["run_id"]
+    if existing_dir.is_dir():
+        existing = load_run(existing_dir)
+        if existing["manifest"] == manifest and existing["plan"] == plan:
+            if existing.get("status") == "down" and existing.get("acceptance"):
+                print(existing_dir)
+                return 0
     run_dir: Path | None = None
     run: dict[str, Any] | None = None
     failure: BaseException | None = None
@@ -1960,7 +2339,7 @@ def add_manifest_args(parser: argparse.ArgumentParser) -> None:
 
 def add_plan_args(parser: argparse.ArgumentParser) -> None:
     add_manifest_args(parser)
-    parser.add_argument("--profile", default="local_80_nas_submitter")
+    parser.add_argument("--profile", default="conservative_nas_submitter")
     parser.add_argument("--scenario", required=True)
     parser.add_argument("--environment", default="debian-gcc")
     parser.add_argument("--run-label", required=True)
@@ -1971,6 +2350,9 @@ def add_plan_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--node-image-ref")
     parser.add_argument("--node-image-fingerprint")
+    parser.add_argument("--scheduler-version")
+    parser.add_argument("--submitter-version")
+    parser.add_argument("--worker-version")
     parser.add_argument(
         "--scheduler-port",
         type=int,
@@ -2022,6 +2404,20 @@ def build_parser() -> argparse.ArgumentParser:
     down.add_argument("--run-dir", required=True)
     down.add_argument("--no-collect", action="store_true")
     down.set_defaults(handler=command_down)
+
+    status = subparsers.add_parser(
+        "status", help="read exact run-labelled container and scheduler state"
+    )
+    status.add_argument("--run-dir", required=True)
+    status.set_defaults(handler=command_status)
+
+    reconcile = subparsers.add_parser(
+        "reconcile", help="idempotently verify up or converge exact run containers to down"
+    )
+    reconcile.add_argument("--run-dir", required=True)
+    reconcile.add_argument("--desired", choices=["up", "down"], required=True)
+    reconcile.add_argument("--no-collect", action="store_true")
+    reconcile.set_defaults(handler=command_reconcile)
 
     run = subparsers.add_parser(
         "run", help="launch, accept, collect and always perform exact container teardown"

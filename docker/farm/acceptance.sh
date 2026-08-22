@@ -32,7 +32,7 @@ export ICECC_LOGFILE="$compile_log"
 export ICECC_SCHEDULER="$scheduler"
 export ICECC_TEST_REMOTEBUILD=1
 
-/opt/icecream/bin/icecc "${CXX:-c++}" -std=c++17 -O2 -Wall -Wextra -Werror \
+/opt/icecream/bin/icecc "${CXX:-c++}" -std=c++23 -O2 -Wall -Wextra -Werror \
     -c "$source_file" -o "$object_file"
 "${CXX:-c++}" "$object_file" -o "$executable_file"
 "$executable_file" >"$program_output_file"

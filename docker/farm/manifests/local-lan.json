@@ -1,5 +1,5 @@
 {
-  "schema": 1,
+  "schema": 2,
   "farm_name": "p50-local-lan",
   "network": {
     "mode": "local-lan",
@@ -19,6 +19,29 @@
     "expected_id": "sha256:fe001a6138f017608b8846b43bf268a76a9d7a5b66c3364ba3f881da2ff0c54b",
     "expected_fingerprint": "sha256:86fc3f4ba688614d99ca772efa153a9c3b1afef7a1496965362d794d7fa15fc2",
     "dockerfile": "docker/farm/Dockerfile.node"
+  },
+  "component_binary_sets": {
+    "accepted-current": {
+      "available": true,
+      "protocol": "runtime-discovered",
+      "runtime_path_key": "runtime_prefix",
+      "runtime_image_class": "ubuntu22-gcc11-boost174-daemon-runtime",
+      "provenance": "the exact staged runtime prefix and image fingerprints verified by preflight"
+    },
+    "p43": {
+      "available": false,
+      "protocol": 43,
+      "runtime_path_key": null,
+      "runtime_image_class": null,
+      "provenance": "selection seam only; no P43 runtime artifact is declared in this manifest"
+    },
+    "p50": {
+      "available": false,
+      "protocol": 50,
+      "runtime_path_key": null,
+      "runtime_image_class": null,
+      "provenance": "selection seam only; no accepted P50 runtime artifact is declared in this manifest"
+    }
   },
   "environment_classes": {
     "debian-gcc": {
@@ -75,16 +98,16 @@
       ],
       "failure_domain": "shared-physical-machine",
       "owner_estimated_physical_cpus": 64,
-      "aggregate_worker_cap": 32,
-      "measurement": "aggregate all three daemon identities and charge nas642 scheduler/submitter load to this group",
-      "headroom": "approximately 32 owner-estimated CPUs remain outside the declared r6+r7 worker allocation"
+      "aggregate_worker_cap": 64,
+      "measurement": "research6 and research7 are separate F daemons with up to 32 slots each; charge nas642 scheduler/submitter load to the shared physical group",
+      "headroom": "conservative profile declares 16 slots on each F; the up-to-32 profile reaches the owner-stated 64-slot group ceiling"
     },
     "quietbox2-physical": {
       "members": [
         "quietbox2"
       ],
       "failure_domain": "quietbox2",
-      "aggregate_worker_cap": 24,
+      "aggregate_worker_cap": 32,
       "measurement": "host-local",
       "headroom": "8 visible hardware threads under the current 32-thread view"
     },
@@ -93,7 +116,7 @@
         "quietbox3"
       ],
       "failure_domain": "quietbox3",
-      "aggregate_worker_cap": 24,
+      "aggregate_worker_cap": 32,
       "measurement": "host-local",
       "headroom": "8 visible hardware threads under the current 32-thread view"
     }
@@ -105,6 +128,12 @@
       "launch_enabled": true,
       "launch_block": null,
       "resource_group": "nas-r6-r7-shared",
+      "client_capacity": {
+        "class": "naturally-bandwidth-limited",
+        "provenance": "owner-observed experiment condition; retain rather than normalize",
+        "measured_rate": null,
+        "measurement_status": "capture live interface counters and compile elapsed time in each run"
+      },
       "transport": {
         "mode": "local",
         "expected_hostname": "nas642.mickg.net"
@@ -166,6 +195,12 @@
       "launch_enabled": true,
       "launch_block": null,
       "resource_group": "quietbox2-physical",
+      "client_capacity": {
+        "class": "faster-lan-comparison",
+        "provenance": "owner-selected comparison submitter",
+        "measured_rate": null,
+        "measurement_status": "capture live interface counters and compile elapsed time in each run"
+      },
       "transport": {
         "mode": "ssh",
         "alias": "tt-quietbox2",
@@ -204,7 +239,7 @@
     }
   },
   "profiles": {
-    "local_16_r6_smoke": {
+    "r6_recovery_nas_submitter": {
       "label": "targeted research6 recovery gate; currently launch-disabled",
       "submitters": [
         "nas642"
@@ -221,8 +256,8 @@
       "advertised_worker_slots": 16,
       "allow_submitter_worker_overlap": false
     },
-    "local_80_nas_submitter": {
-      "label": "owner-proposed local 80-slot baseline",
+    "conservative_nas_submitter": {
+      "label": "nas642 limited-C comparison with four physical F daemons and conservative slots",
       "submitters": [
         "nas642"
       ],
@@ -241,8 +276,8 @@
       "advertised_worker_slots": 80,
       "allow_submitter_worker_overlap": false
     },
-    "local_56_q2_submitter": {
-      "label": "quietbox2 submitter with its worker allocation excluded",
+    "conservative_q2_submitter": {
+      "label": "quietbox2 faster-C comparison with its own F daemon excluded",
       "submitters": [
         "quietbox2"
       ],
@@ -259,24 +294,74 @@
       ],
       "advertised_worker_slots": 56,
       "allow_submitter_worker_overlap": false
+    },
+    "max32_nas_submitter": {
+      "label": "nas642 limited-C comparison with all four F daemons at the configurable 32-slot ceiling",
+      "submitters": [
+        "nas642"
+      ],
+      "worker_slots": {
+        "research6": 32,
+        "research7": 32,
+        "quietbox2": 32,
+        "quietbox3": 32
+      },
+      "worker_order": [
+        "quietbox2",
+        "research6",
+        "quietbox3",
+        "research7"
+      ],
+      "advertised_worker_slots": 128,
+      "allow_submitter_worker_overlap": false
+    },
+    "max32_q2_submitter": {
+      "label": "quietbox2 faster-C comparison with the other three F daemons at the 32-slot ceiling",
+      "submitters": [
+        "quietbox2"
+      ],
+      "worker_slots": {
+        "research6": 32,
+        "research7": 32,
+        "quietbox2": 0,
+        "quietbox3": 32
+      },
+      "worker_order": [
+        "research6",
+        "quietbox3",
+        "research7"
+      ],
+      "advertised_worker_slots": 96,
+      "allow_submitter_worker_overlap": false
     }
   },
   "scenarios": {
     "c1f1": {
       "submitter_count": 1,
-      "worker_count": 1
+      "f_count": 1
     },
     "c1f2": {
       "submitter_count": 1,
-      "worker_count": 2
+      "f_count": 2
     },
-    "c1f20": {
+    "c1f3": {
       "submitter_count": 1,
-      "worker_count": 20
+      "f_count": 3
     },
-    "c1f80": {
+    "c1f4": {
       "submitter_count": 1,
-      "worker_count": 80
+      "f_count": 4
     }
+  },
+  "scenario_dimensions": {
+    "component_versions": {
+      "scheduler": "accepted-current",
+      "submitter": "accepted-current",
+      "worker": "accepted-current"
+    },
+    "workload": "tiny-compile-link-run",
+    "routing_policy": "explicit-local-lan",
+    "codec_policy": "runtime-default",
+    "event_schedule": "steady-state"
   }
 }

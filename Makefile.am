@@ -16,10 +16,19 @@ EXTRA_DIST = \
 	docker/farm/farm.py \
 	docker/farm/inventory/2026-08-21-local-lan.json \
 	docker/farm/inventory/2026-08-22-p50-dependencies.json \
+	docker/farm/inventory/2026-08-22-topology-correction.json \
 	docker/farm/manifests/local-lan.json \
 	docker/farm/run-c1f1 \
 	docker/farm/run-c1f2 \
-	docker/farm/run-c1f20 \
+	docker/farm/run-c1f4 \
+	docker/farm/run-nas-c1f1 \
+	docker/farm/run-nas-c1f2 \
+	docker/farm/run-nas-c1f4 \
+	docker/farm/run-nas-c1f4-max32 \
+	docker/farm/run-q2-c1f1 \
+	docker/farm/run-q2-c1f2 \
+	docker/farm/run-q2-c1f3 \
+	docker/farm/run-q2-c1f3-max32 \
 	docker/farm/run-matrix \
 	docker/farm/test_farm.py
 

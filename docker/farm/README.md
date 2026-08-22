@@ -24,6 +24,10 @@ The retained read-only snapshot is
 `research6`, `research7`, and `quietbox2`, every explicit LAN target answered ICMP and TCP/22.
 The dependency and quietbox3 follow-up is retained separately in
 [`inventory/2026-08-22-p50-dependencies.json`](inventory/2026-08-22-p50-dependencies.json).
+The later F/slot and client-capacity clarification is retained in
+[`inventory/2026-08-22-topology-correction.json`](inventory/2026-08-22-topology-correction.json);
+it supersedes the older snapshot's interpretation of one container per slot without rewriting the
+historical inventory.
 Current launch blockers are represented as preflight failures rather than guesses:
 
 - `quietbox3` is inventoried at `10.0.27.101` as `mickg10`, with interface
@@ -46,36 +50,42 @@ creating any directory or container.
 
 ## Capacity accounting
 
-`local_80_nas_submitter` is the named owner-proposed profile:
+An F is a physical daemon endpoint, never a slot. The conservative nas642 profile is:
 
-| worker identity | declared F containers/slots | resource group |
-|---|---:|---|
-| research6 | 16 | `nas-r6-r7-shared` |
-| research7 | 16 | `nas-r6-r7-shared` |
-| quietbox2 | 24 | `quietbox2-physical` |
-| quietbox3 | 24 | `quietbox3-physical` |
-| total | 80 | three independent resource groups |
+| F host | daemon containers | compile slots (`iceccd -m`) | resource group |
+|---|---:|---:|---|
+| research6 | 1 | 16 | `nas-r6-r7-shared` |
+| research7 | 1 | 16 | `nas-r6-r7-shared` |
+| quietbox2 | 1 | 24 | `quietbox2-physical` |
+| quietbox3 | 1 | 24 | `quietbox3-physical` |
+| total | 4 | 80 | three resource groups |
 
 The research6 and research7 allocations are additive, but they and `nas642` share the same
 owner-described physical machine. Their current guest views are 20, 12, and 16 CPUs respectively;
 the launcher records those views and group load without summing them as independent physical
-capacity. The shared group has a 32-worker aggregate cap. Scheduler and primary-submitter load on
+capacity. The shared group has a 64-slot ceiling: research6 and research7 are independent F daemons
+that may each advertise up to 32 slots. Scheduler and primary-submitter load on
 `nas642` remains charged to that group.
 
-`local_56_q2_submitter` makes `quietbox2` the submitter and assigns it zero workers. This prevents
-submitter preprocessing from being hidden behind 24 worker slots. Its F allocation is research6=16,
-research7=16, quietbox3=24.
+`conservative_nas_submitter` is C1F4 with 80 slots. `max32_nas_submitter` keeps those same four F
+identities and advertises 32 slots per F, for 128 slots. `conservative_q2_submitter` makes
+`quietbox2` C and excludes its F daemon, producing C1F3 with 56 slots; `max32_q2_submitter` keeps the
+same three F identities at 32 slots each, for 96 slots.
 
-`local_16_r6_smoke` is a targeted research6 recovery gate: scheduler and C on `nas642`, with F
-containers only on `research6`. It is intentionally launch-disabled in the checked manifest until
+`r6_recovery_nas_submitter` is a targeted research6 recovery gate: scheduler and C on `nas642`, with
+one F daemon on `research6` advertising 16 slots. It is launch-disabled in the checked manifest until
 the recorded Docker session-health failure is corrected and re-inventoried. The proven small path
-uses `local_80_nas_submitter` with C1F1, whose deterministic first allocation is quietbox2. Neither
-path changes or waits for quietbox3 access or research7 Docker permission, and neither replaces the
-named 80-slot capacity profile.
+uses `conservative_nas_submitter` with C1F1, whose deterministic F is quietbox2.
 
-Each F in C1F1, C1F2, and C1F20 is a distinct container running `iceccd -m 1`. Allocation is
-deterministic round-robin over the profile's host order. The plan records container count, daemon
-host identities, and independent resource-group count separately.
+C1F1, C1F2, C1F3, and C1F4 select the first one through four physical hosts in the profile's declared
+order. Each selected host receives exactly one container, one daemon node name, one LAN route
+identity, and one cache-identity owner. The plan records those counts separately from compile slots;
+readiness verifies the exact endpoint and the `jobs=*/SLOTS` value reported by `listcs`.
+
+`nas642` is intentionally retained as the naturally bandwidth-limited C experiment point.
+`quietbox2` is the faster-C comparison. A live acceptance captures before/after byte counters on each
+explicit LAN interface and compile elapsed time in `network-ledger.json`, producing C→F and F→C
+directional provenance. These are host-interface aggregate observations, not per-flow attribution.
 
 ## Image classes
 
@@ -104,6 +114,13 @@ remain run provenance. The 44-cell evidence is 11 projects by all four profiles.
 `~/icecream-ii-matrix/compression-research/ii-matrix/produce_cell.sh`; its Dockerfiles and manifests
 were not present under the inventoried quietbox2 roots, so this work does not reconstruct or replace
 them. It reuses the retained images.
+
+Scheduler, C, and F binary-set selection is a separate matrix dimension. The checked manifest has
+one available set, `accepted-current`, whose paths and image content are verified by preflight. It
+also declares `p43` and `p50` as unavailable selection seams with no artifact path or image. Passing
+`--scheduler-version p43`, `--submitter-version p50`, or the corresponding worker option therefore
+fails during plan construction until an exact reviewed artifact is added; the launcher never labels
+the current binary as a missing protocol version.
 
 ## Host-local mount contract
 
@@ -215,14 +232,14 @@ and `up` refuses to overwrite an existing controller run directory.
 docker/farm/farm.py validate
 
 docker/farm/farm.py plan \
-  --scenario c1f20 \
-  --profile local_80_nas_submitter \
+  --scenario c1f4 \
+  --profile conservative_nas_submitter \
   --environment debian-gcc \
   --run-label baseline-01
 
 docker/farm/farm.py preflight \
   --scenario c1f1 \
-  --profile local_80_nas_submitter \
+  --profile conservative_nas_submitter \
   --environment debian-gcc \
   --run-label baseline-01 \
   --output /tanksmall/scratch/ictmp/farm-preflight-baseline-01.json
@@ -234,7 +251,7 @@ control port is always the following port, and both values become part of the de
 ```sh
 docker/farm/farm.py preflight \
   --scenario c1f1 \
-  --profile local_16_r6_smoke \
+  --profile r6_recovery_nas_submitter \
   --scheduler-port 18765 \
   --environment debian-gcc \
   --run-label lan-smoke-01
@@ -265,26 +282,38 @@ unused nominal port such as `14000` does not satisfy readiness.
 
 ## Scenario entrypoints
 
-The foreground entrypoints launch, run acceptance, collect, and always tear down exact run-labelled
-containers:
+Every named foreground entrypoint performs read-only preflight, exact per-host Compose bring-up,
+scheduler/`listcs` readiness including the advertised slot check, compile/link/run acceptance,
+evidence collection, and exact labelled teardown:
 
 ```sh
-docker/farm/run-c1f1 \
+docker/farm/run-nas-c1f1 \
   --run-label baseline-c1f1 \
   --controller-output /tanksmall/scratch/ictmp/icecream-farm/controller-results
 
-docker/farm/run-c1f2 \
+docker/farm/run-nas-c1f2 \
   --run-label baseline-c1f2 \
   --controller-output /tanksmall/scratch/ictmp/icecream-farm/controller-results
 
-docker/farm/run-c1f20 \
-  --run-label baseline-c1f20 \
+docker/farm/run-nas-c1f4 \
+  --run-label baseline-nas-c1f4 \
+  --controller-output /tanksmall/scratch/ictmp/icecream-farm/controller-results
+
+docker/farm/run-q2-c1f1 \
+  --run-label baseline-q2-c1f1 \
+  --controller-output /tanksmall/scratch/ictmp/icecream-farm/controller-results
+
+docker/farm/run-q2-c1f2 \
+  --run-label baseline-q2-c1f2 \
+  --controller-output /tanksmall/scratch/ictmp/icecream-farm/controller-results
+
+docker/farm/run-q2-c1f3 \
+  --run-label baseline-q2-c1f3 \
   --controller-output /tanksmall/scratch/ictmp/icecream-farm/controller-results
 ```
 
-Use `--profile local_56_q2_submitter` for quietbox2 submission. The profile selects quietbox2 as C
-and removes its F allocation; an attempt to override C onto a host that still has worker slots is
-rejected.
+The explicit upper-bound commands are `run-nas-c1f4-max32` and `run-q2-c1f3-max32`. They change only
+slot budgets; F container, route-identity, and cache-identity-owner counts remain four and three.
 
 For a manually inspected run:
 
@@ -296,11 +325,17 @@ docker/farm/farm.py up \
 docker/farm/farm.py accept --run-dir /absolute/controller/results/p50-c1f1-RUNHASH
 docker/farm/farm.py collect --run-dir /absolute/controller/results/p50-c1f1-RUNHASH
 docker/farm/farm.py down --run-dir /absolute/controller/results/p50-c1f1-RUNHASH
+docker/farm/farm.py status --run-dir /absolute/controller/results/p50-c1f1-RUNHASH
+docker/farm/farm.py reconcile --desired down \
+  --run-dir /absolute/controller/results/p50-c1f1-RUNHASH
 ```
 
 `down` reads the retained run manifest, checks each container's exact
 `org.icecream.farm.run_id` label, and removes only those named containers. It does not remove images,
-source, corpus, state, build, or result directories.
+source, corpus, state, build, result directories, the host Docker engine, or unrelated containers.
+Repeated `up` reuses an already-ready exact run; repeated `run` reuses an accepted-and-down run;
+repeated `down` reports the exact containers absent. A partial run must be brought down before a new
+label is launched, preserving the prior evidence rather than overwriting it.
 
 Run all four accepted build environments from one submitter:
 
@@ -324,10 +359,13 @@ Job ID and an exact endpoint from the planned F set. Provenance records:
 - object file description
 - allowed and selected F endpoint plus remote completion identity from the client trace
 - exact program output
+- selected F host identities and advertised compile slots from `listcs`
+- nas642-limited or quietbox2-faster client-capacity provenance and live C→F/F→C LAN-interface
+  counter deltas with elapsed time
 
 Controller evidence is retained under `CONTROLLER_OUTPUT/RUN_ID/`: plan/manifest snapshot, preflight,
 per-host Compose JSON, readiness `listcs`, acceptance stdout/stderr/provenance, Docker inspect/stats/logs,
-per-node service logs, and collection hashes. Each host also retains its bound results and state under
+per-node service logs, `network-ledger.json`, and `evidence-hashes.sha256`. Each host also retains its bound results and state under
 its manifest path. Teardown is recorded in `run.json`.
 
 This launcher measures orchestration and real compilation behavior. It does not claim protocol

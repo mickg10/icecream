@@ -77,14 +77,25 @@ class ManifestTests(unittest.TestCase):
         with self.assertRaisesRegex(farm.FarmError, "wan_hosts"):
             farm.validate_manifest(candidate)
 
-    def test_shared_group_capacity_is_not_tripled(self):
-        profile = self.manifest["profiles"]["local_80_nas_submitter"]
+    def test_conservative_and_max32_capacity_are_separate(self):
+        profile = self.manifest["profiles"]["conservative_nas_submitter"]
         self.assertEqual(profile["advertised_worker_slots"], 80)
         self.assertEqual(profile["worker_slots"]["research6"], 16)
         self.assertEqual(profile["worker_slots"]["research7"], 16)
         shared = self.manifest["resource_groups"]["nas-r6-r7-shared"]
-        self.assertEqual(shared["aggregate_worker_cap"], 32)
+        self.assertEqual(shared["aggregate_worker_cap"], 64)
         self.assertEqual(shared["owner_estimated_physical_cpus"], 64)
+        maximum = self.manifest["profiles"]["max32_nas_submitter"]
+        self.assertEqual(maximum["advertised_worker_slots"], 128)
+        self.assertTrue(all(value == 32 for value in maximum["worker_slots"].values()))
+
+    def test_p43_p50_are_selection_seams_without_fabricated_artifacts(self):
+        binary_sets = self.manifest["component_binary_sets"]
+        self.assertTrue(binary_sets["accepted-current"]["available"])
+        for name in ("p43", "p50"):
+            self.assertFalse(binary_sets[name]["available"])
+            self.assertIsNone(binary_sets[name]["runtime_path_key"])
+            self.assertIsNone(binary_sets[name]["runtime_image_class"])
 
     def test_mount_override_is_narrow(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -144,7 +155,7 @@ class PlanTests(unittest.TestCase):
     def setUp(self):
         self.manifest = farm.load_manifest(farm.DEFAULT_MANIFEST)
 
-    def plan(self, scenario="c1f20", profile="local_80_nas_submitter", label="gate-a"):
+    def plan(self, scenario="c1f4", profile="conservative_nas_submitter", label="gate-a"):
         return farm.build_plan(
             self.manifest, profile, scenario, "debian-gcc", label
         )
@@ -155,56 +166,85 @@ class PlanTests(unittest.TestCase):
         changed = self.plan(label="gate-b")
         self.assertEqual(first["run_id"], second["run_id"])
         self.assertNotEqual(first["run_id"], changed["run_id"])
-        self.assertRegex(first["run_id"], r"^p50-c1f20-[0-9a-f]{12}$")
+        self.assertRegex(first["run_id"], r"^p50-c1f4-[0-9a-f]{12}$")
         two_submitters = farm.build_plan(
             self.manifest,
-            "local_80_nas_submitter",
-            "c1f20",
+            "conservative_nas_submitter",
+            "c1f4",
             "debian-gcc",
             "gate-a",
             ["nas642", "nas642"],
         )
         self.assertNotEqual(first["run_id"], two_submitters["run_id"])
 
-    def test_c1f1_c1f2_c1f20_counts(self):
+    def test_c1f_counts_are_physical_daemon_counts_not_slot_counts(self):
         self.assertEqual(len(self.plan("c1f1")["workers"]), 1)
         self.assertEqual(len(self.plan("c1f2")["workers"]), 2)
-        plan20 = self.plan("c1f20")
-        self.assertEqual(len(plan20["workers"]), 20)
+        plan4 = self.plan("c1f4")
+        self.assertEqual(len(plan4["workers"]), 4)
         self.assertEqual(
-            plan20["accounting"]["worker_containers_by_host"],
-            {"quietbox2": 5, "research6": 5, "quietbox3": 5, "research7": 5},
+            plan4["accounting"]["f_daemons_by_host"],
+            {"quietbox2": 1, "research6": 1, "quietbox3": 1, "research7": 1},
         )
-        self.assertEqual(plan20["accounting"]["independent_resource_groups"], 3)
+        self.assertEqual(plan4["accounting"]["selected_compile_slots"], 80)
+        self.assertNotEqual(
+            plan4["accounting"]["f_daemon_containers"],
+            plan4["accounting"]["selected_compile_slots"],
+        )
+        self.assertEqual(plan4["accounting"]["route_identity_count"], 4)
+        self.assertEqual(plan4["accounting"]["cache_identity_owner_count"], 4)
+        self.assertEqual(plan4["accounting"]["independent_resource_groups"], 3)
 
-    def test_full_profile_keeps_declared_80(self):
-        plan = self.plan("c1f80")
-        self.assertEqual(len(plan["workers"]), 80)
+    def test_conservative_profile_is_four_daemons_advertising_80_slots(self):
+        plan = self.plan("c1f4")
+        self.assertEqual(len(plan["workers"]), 4)
         self.assertEqual(
-            plan["accounting"]["worker_containers_by_host"],
+            plan["accounting"]["slots_by_f_host"],
             {"quietbox2": 24, "research6": 16, "quietbox3": 24, "research7": 16},
         )
         self.assertEqual(
-            plan["accounting"]["worker_containers_by_resource_group"]["nas-r6-r7-shared"],
+            plan["accounting"]["slots_by_resource_group"]["nas-r6-r7-shared"],
             32,
         )
 
+    def test_max32_profile_is_four_daemons_advertising_128_slots(self):
+        plan = self.plan("c1f4", "max32_nas_submitter")
+        self.assertEqual(len(plan["workers"]), 4)
+        self.assertEqual(plan["accounting"]["selected_compile_slots"], 128)
+        self.assertEqual({record["slots"] for record in plan["workers"]}, {32})
+
+    def test_unavailable_protocol_binary_selection_fails_before_a_plan(self):
+        for role in ("scheduler", "submitter", "worker"):
+            with self.subTest(role=role):
+                with self.assertRaisesRegex(farm.FarmError, "declared but unavailable"):
+                    farm.build_plan(
+                        self.manifest,
+                        "conservative_nas_submitter",
+                        "c1f1",
+                        "debian-gcc",
+                        "versions",
+                        component_version_overrides={role: "p50"},
+                    )
+
     def test_q2_submitter_profile_excludes_q2_workers(self):
-        plan = self.plan("c1f20", "local_56_q2_submitter")
+        plan = self.plan("c1f3", "conservative_q2_submitter")
         self.assertEqual(plan["submitters"][0]["host"], "quietbox2")
-        self.assertNotIn("quietbox2", plan["accounting"]["worker_containers_by_host"])
+        self.assertNotIn("quietbox2", plan["accounting"]["slots_by_f_host"])
         self.assertEqual(plan["accounting"]["advertised_profile_worker_slots"], 56)
+        self.assertEqual(plan["accounting"]["f_daemon_containers"], 3)
+        self.assertEqual(plan["client_capacity"][0]["class"], "faster-lan-comparison")
 
     def test_research6_recovery_profile_uses_research6_only(self):
-        plan = self.plan("c1f1", "local_16_r6_smoke")
+        plan = self.plan("c1f1", "r6_recovery_nas_submitter")
         self.assertEqual(plan["submitters"][0]["host"], "nas642")
-        self.assertEqual(plan["accounting"]["worker_containers_by_host"], {"research6": 1})
+        self.assertEqual(plan["accounting"]["f_daemons_by_host"], {"research6": 1})
+        self.assertEqual(plan["accounting"]["slots_by_f_host"], {"research6": 16})
 
     def test_submitter_override_cannot_hide_q2_double_duty(self):
         with self.assertRaisesRegex(farm.FarmError, "retains worker slots"):
             farm.build_plan(
                 self.manifest,
-                "local_80_nas_submitter",
+                "conservative_nas_submitter",
                 "c1f1",
                 "debian-gcc",
                 "override",
@@ -214,7 +254,7 @@ class PlanTests(unittest.TestCase):
     def test_multiple_submitters_are_explicit(self):
         plan = farm.build_plan(
             self.manifest,
-            "local_80_nas_submitter",
+            "conservative_nas_submitter",
             "c1f1",
             "debian-gcc",
             "two-c",
@@ -262,6 +302,9 @@ class PlanTests(unittest.TestCase):
             "chown 65534:65534 /farm/results /var/lib/icecc",
             q2["services"]["f00"]["command"][0],
         )
+        worker_command = q2["services"]["f00"]["command"]
+        self.assertEqual(worker_command[worker_command.index("-m") + 1], "24")
+        self.assertEqual(len(q2["services"]), 1)
         scheduler_health = nas["services"]["scheduler"]["healthcheck"]["test"][-1]
         worker_health = q2["services"]["f00"]["healthcheck"]["test"][-1]
         self.assertIn(" 8766", scheduler_health)
@@ -282,7 +325,7 @@ class PlanTests(unittest.TestCase):
             [8765, 8766],
         )
 
-        q2_submitter = self.plan("c1f1", "local_56_q2_submitter")
+        q2_submitter = self.plan("c1f1", "conservative_q2_submitter")
         self.assertEqual(
             farm.required_listener_ports(self.manifest, q2_submitter, "quietbox2"),
             [],
@@ -293,15 +336,15 @@ class PlanTests(unittest.TestCase):
         retained_snapshot = (
             " c-nas642-00 (10.0.27.127:0) [x86_64] "
             "speed=0.00 jobs=0/0 load=408\n"
-            " f-quietbox2-00 (10.0.27.212:12000) [x86_64] "
-            "speed=0.00 jobs=0/1 load=1000\n"
+            " f-quietbox2 (10.0.27.212:12000) [x86_64] "
+            "speed=0.00 jobs=0/24 load=1000\n"
             "200 done\n"
         )
         self.assertEqual(
             farm.expected_registrations(self.manifest, plan),
             [
                 "c-nas642-00 (10.0.27.127:0)",
-                "f-quietbox2-00 (10.0.27.212:12000)",
+                "f-quietbox2 (10.0.27.212:12000)",
             ],
         )
         self.assertEqual(
@@ -310,15 +353,21 @@ class PlanTests(unittest.TestCase):
         misleading_submitter_port = (
             " c-nas642-00 (10.0.27.127:14000) [x86_64] "
             "speed=0.00 jobs=0/0 load=408\n"
-            " f-quietbox2-00 (10.0.27.212:12000) [x86_64] "
-            "speed=0.00 jobs=0/1 load=1000\n"
+            " f-quietbox2 (10.0.27.212:12000) [x86_64] "
+            "speed=0.00 jobs=0/24 load=1000\n"
             "200 done\n"
         )
         self.assertEqual(
             farm.missing_registrations(
                 self.manifest, plan, misleading_submitter_port
             ),
-            ["c-nas642-00 (10.0.27.127:0)"],
+            ["c-nas642-00 (10.0.27.127:0) jobs=*/0"],
+        )
+
+        wrong_slot_snapshot = retained_snapshot.replace("jobs=0/24", "jobs=0/1")
+        self.assertEqual(
+            farm.missing_registrations(self.manifest, plan, wrong_slot_snapshot),
+            ["f-quietbox2 (10.0.27.212:12000) jobs=*/24"],
         )
 
     def test_planned_container_collision_is_a_preflight_error(self):
@@ -470,6 +519,36 @@ class PlanTests(unittest.TestCase):
             )
         )
 
+    def test_directional_network_ledger_keeps_capacity_provenance(self):
+        plan = self.plan("c1f1")
+        before = {
+            "captured_at": "before",
+            "monotonic_ns": 1_000_000_000,
+            "hosts": {
+                "nas642": {"rx_bytes": 100, "tx_bytes": 200},
+                "quietbox2": {"rx_bytes": 300, "tx_bytes": 400},
+            },
+        }
+        after = {
+            "captured_at": "after",
+            "monotonic_ns": 3_000_000_000,
+            "hosts": {
+                "nas642": {"rx_bytes": 130, "tx_bytes": 250},
+                "quietbox2": {"rx_bytes": 370, "tx_bytes": 490},
+            },
+        }
+        ledger = farm.directional_network_ledger(
+            self.manifest, plan, before, after
+        )
+        self.assertEqual(ledger["elapsed_ns"], 2_000_000_000)
+        self.assertEqual(ledger["routes"][0]["c_to_f"]["c_interface_tx"], 50)
+        self.assertEqual(ledger["routes"][0]["f_to_c"]["f_interface_tx"], 90)
+        self.assertEqual(
+            ledger["client_capacity"][0]["class"],
+            "naturally-bandwidth-limited",
+        )
+        self.assertIn("not per-flow", ledger["attribution"])
+
     def test_absent_container_requires_reachable_docker_engine(self):
         runner = farm.HostRunner("nas642", self.manifest["hosts"]["nas642"])
         failed = subprocess_result(1, stderr=b"cannot connect")
@@ -482,6 +561,31 @@ class PlanTests(unittest.TestCase):
                 farm.exact_remove_container(runner, "run-a", "container-a")["result"],
                 "absent",
             )
+
+    def test_run_state_is_idempotently_ready_or_absent(self):
+        plan = self.plan("c1f1")
+        run = {"manifest": self.manifest, "plan": plan}
+        running = subprocess_result(
+            0, stdout=f"{plan['run_id']}|running\n".encode()
+        )
+        snapshot = (
+            " c-nas642-00 (10.0.27.127:0) jobs=0/0\n"
+            " f-quietbox2 (10.0.27.212:12000) jobs=0/24\n200 done\n"
+        )
+        with mock.patch.object(farm, "docker_command", return_value=running):
+            with mock.patch.object(farm, "scheduler_snapshot", return_value=snapshot):
+                self.assertEqual(farm.inspect_run_state(run)["state"], "ready")
+
+        absent_inspect = subprocess_result(1, stderr=b"No such container")
+        absent_probe = subprocess_result(0, stdout=b"")
+        with mock.patch.object(
+            farm, "docker_command", side_effect=[
+                absent_inspect, absent_probe,
+                absent_inspect, absent_probe,
+                absent_inspect, absent_probe,
+            ]
+        ):
+            self.assertEqual(farm.inspect_run_state(run)["state"], "absent")
 
 
 class ArtifactTests(unittest.TestCase):
@@ -499,6 +603,25 @@ class ArtifactTests(unittest.TestCase):
         self.assertIn("object_sha256", script)
         self.assertIn("executable_sha256", script)
         self.assertIn("selected_worker_endpoint", script)
+        self.assertIn("-std=c++23", script)
+
+    def test_named_topology_entrypoints_cover_both_clients_and_slot_profiles(self):
+        expected = {
+            "run-nas-c1f1": ("c1f1", "conservative_nas_submitter"),
+            "run-nas-c1f2": ("c1f2", "conservative_nas_submitter"),
+            "run-nas-c1f4": ("c1f4", "conservative_nas_submitter"),
+            "run-q2-c1f1": ("c1f1", "conservative_q2_submitter"),
+            "run-q2-c1f2": ("c1f2", "conservative_q2_submitter"),
+            "run-q2-c1f3": ("c1f3", "conservative_q2_submitter"),
+            "run-nas-c1f4-max32": ("c1f4", "max32_nas_submitter"),
+            "run-q2-c1f3-max32": ("c1f3", "max32_q2_submitter"),
+        }
+        for name, (scenario, profile) in expected.items():
+            with self.subTest(name=name):
+                script = (HERE / name).read_text(encoding="utf-8")
+                self.assertIn(f"--scenario {scenario}", script)
+                self.assertIn(f"--profile {profile}", script)
+        self.assertFalse((HERE / "run-c1f20").exists())
 
     def test_inventory_records_current_blocks(self):
         inventory = json.loads(
