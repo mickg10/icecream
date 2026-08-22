@@ -100,6 +100,8 @@ done
         LIBARCHIVE_LIBS="${ICECC_TEST_LIBARCHIVE_LIBS:-}" \
         LIBZSTD_CFLAGS="${ICECC_TEST_LIBZSTD_CFLAGS:-}" \
         LIBZSTD_LIBS="${ICECC_TEST_LIBZSTD_LIBS:-}" \
+        XXHASH_CFLAGS="${ICECC_TEST_XXHASH_CFLAGS:-}" \
+        XXHASH_LIBS="${ICECC_TEST_XXHASH_LIBS:-}" \
         "$icecc_test_source/configure" \
         --without-man --without-libcap-ng \
         --with-boost="$icecc_test_prefix"
@@ -127,10 +129,27 @@ if ! icecc_run_make -C "$icecc_test_build" -j2 V=1 all \
     cat "$icecc_test_root/build.log" >&2
     exit 1
 fi
+if ! icecc_run_make -C "$icecc_test_build/unittests" -j2 V=1 p50endpoint \
+        >> "$icecc_test_root/build.log" 2>&1; then
+    cat "$icecc_test_root/build.log" >&2
+    exit 1
+fi
+if ! grep -F -- "-isystem $icecc_test_prefix/include" \
+        "$icecc_test_root/build.log" | grep -E \
+        'libp50endpoint_a-|p50endpoint-p50_endpoint_test' >/dev/null; then
+    echo "the P50 endpoint consumers did not receive BOOST_CPPFLAGS" >&2
+    exit 1
+fi
+if ! grep -F -- "-L$icecc_test_prefix/lib" \
+        "$icecc_test_root/build.log" | grep -F 'p50endpoint' >/dev/null; then
+    echo "the P50 endpoint link did not receive BOOST_LDFLAGS" >&2
+    exit 1
+fi
 if grep -F -- "-isystem $icecc_test_prefix/include" \
-        "$icecc_test_root/build.log" >/dev/null || \
+        "$icecc_test_root/build.log" | grep -Ev \
+        'libp50endpoint_a-|p50endpoint-p50_endpoint_test' >/dev/null || \
         grep -F -- "-L$icecc_test_prefix/lib" \
-        "$icecc_test_root/build.log" >/dev/null; then
-    echo "a non-Boost build target inherited the Boost prefix" >&2
+        "$icecc_test_root/build.log" | grep -Fv 'p50endpoint' >/dev/null; then
+    echo "a non-endpoint build target inherited the Boost prefix" >&2
     exit 1
 fi

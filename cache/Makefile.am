@@ -1,18 +1,18 @@
-noinst_LIBRARIES = libprotocol50.a
+noinst_LIBRARIES = libprotocol50.a libp50endpoint.a
 
 libprotocol50_a_SOURCES = \
 	protocol50.cpp \
 	protocol50.h \
 	p50_actions.cpp \
 	p50_actions.h \
-	p50_endpoint.cpp \
-	p50_endpoint.h \
 	p50_slice0.cpp \
 	p50_slice0.h \
 	p50_zstd.cpp \
 	p50_zstd.h
 
 AM_CPPFLAGS = -I$(top_srcdir) $(LIBZSTD_CFLAGS)
+libp50endpoint_a_SOURCES = p50_endpoint.cpp p50_endpoint.h
+libp50endpoint_a_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
 
 EXTRA_DIST = \
 	README.md \

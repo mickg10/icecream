@@ -21,7 +21,9 @@ AM_TESTS_ENVIRONMENT = \
 	ICECC_TEST_LIBARCHIVE_CFLAGS='$(LIBARCHIVE_CFLAGS)'; export ICECC_TEST_LIBARCHIVE_CFLAGS; \
 	ICECC_TEST_LIBARCHIVE_LIBS='$(LIBARCHIVE_LIBS)'; export ICECC_TEST_LIBARCHIVE_LIBS; \
 	ICECC_TEST_LIBZSTD_CFLAGS='$(LIBZSTD_CFLAGS)'; export ICECC_TEST_LIBZSTD_CFLAGS; \
-	ICECC_TEST_LIBZSTD_LIBS='$(LIBZSTD_LIBS)'; export ICECC_TEST_LIBZSTD_LIBS;
+	ICECC_TEST_LIBZSTD_LIBS='$(LIBZSTD_LIBS)'; export ICECC_TEST_LIBZSTD_LIBS; \
+	ICECC_TEST_XXHASH_CFLAGS='$(XXHASH_CFLAGS)'; export ICECC_TEST_XXHASH_CFLAGS; \
+	ICECC_TEST_XXHASH_LIBS='$(XXHASH_LIBS)'; export ICECC_TEST_XXHASH_LIBS;
 TEST_EXTENSIONS = .sh
 SH_LOG_COMPILER = $(SHELL)
 
@@ -32,8 +34,10 @@ p50wire_LDADD = ../cache/libprotocol50.a ../services/libicecc.la
 p50slice0_LDADD = ../cache/libprotocol50.a ../services/libicecc.la
 p50zstd_LDADD = ../cache/libprotocol50.a ../services/libicecc.la $(LIBZSTD_LIBS)
 p50zstdwindow_LDADD = ../cache/libprotocol50.a ../services/libicecc.la $(LIBZSTD_LIBS)
+p50endpoint_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
 p50endpoint_LDFLAGS = $(BOOST_LDFLAGS)
-p50endpoint_LDADD = ../cache/libprotocol50.a ../services/libicecc.la \
+p50endpoint_LDADD = ../cache/libp50endpoint.a ../cache/libprotocol50.a \
+	../services/libicecc.la \
 	$(LIBZSTD_LIBS) $(BOOST_LIBS)
 digest128bench_LDADD = ../services/libicecc.la
 
