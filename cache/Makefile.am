@@ -21,7 +21,10 @@ EXTRA_DIST = \
 	formal/Protocol50OperationDigestMutant.cfg \
 	formal/Protocol50JobLifecycle.tla \
 	formal/Protocol50JobLifecycle.cfg \
+	formal/Protocol50JobRestartProgress.cfg \
 	formal/Protocol50JobLeaseMutant.cfg \
+	formal/Protocol50JobCancelLeaseMutant.cfg \
+	formal/Protocol50JobOwnershipMutant.cfg \
 	formal/Protocol50JobLifecycle.md \
 	formal/Protocol50Reconnect.tla \
 	formal/Protocol50Reconnect.cfg \
