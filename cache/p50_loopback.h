@@ -115,6 +115,7 @@ private:
                         uint64_t session_serial,
                         const SessionSelection& selection);
 
+    boost::asio::io_context& context_;
     ZstdLoopbackConfig config_;
     CStoreGuid expected_c_store_guid_{};
     PublishExactInput publish_exact_input_;
