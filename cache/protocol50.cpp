@@ -52,11 +52,18 @@ void validate_hello(const SessionHello& hello) {
 }
 
 void validate_session_state_intrinsic(const SessionState& state) {
-    if (state.selected_protocol == 0 || !known_profile(state.selected_profile))
-        throw std::invalid_argument("SESSION_STATE selection is invalid");
+    if (state.selected_protocol != kProtocolVersion ||
+        !known_profile(state.selected_profile))
+        throw std::invalid_argument(
+            "SESSION_STATE selected an unimplemented protocol or profile");
     validate_limits(state.limits);
     if (state.route_present && !state.namespace_present)
         throw std::invalid_argument("SESSION_STATE route lacks its C namespace");
+    if (!state.route_present &&
+        (state.history_nonce.value != 0 || state.next_rel_seq.value != 0 ||
+         state.state_digest != Digest128{} || state.last_commit))
+        throw std::invalid_argument(
+            "SESSION_STATE absent route did not use the canonical zero form");
     if (state.last_commit && !state.route_present)
         throw std::invalid_argument("SESSION_STATE commit lacks route state");
     if (state.last_commit) {
@@ -260,10 +267,11 @@ void validate_session_state(const SessionHello& hello,
                             const SessionState& received_state) {
     validate_hello(hello);
     validate_session_state_intrinsic(received_state);
-    if (received_state.selected_protocol < hello.min_protocol ||
-        received_state.selected_protocol > hello.max_protocol)
+    if (received_state.selected_protocol != kProtocolVersion ||
+        hello.min_protocol > kProtocolVersion ||
+        hello.max_protocol < kProtocolVersion)
         throw std::invalid_argument(
-            "SESSION_STATE protocol was outside the client offer");
+            "SESSION_STATE did not select implemented Protocol 50");
     if ((hello.supported_profiles &
          profile_bit(received_state.selected_profile)) == 0)
         throw std::invalid_argument(
@@ -287,10 +295,12 @@ SessionSelection negotiate_session(const SessionHello& hello,
     if (server_min_protocol == 0 || server_min_protocol > server_max_protocol)
         throw std::invalid_argument("session protocol range is reversed");
     validate_limits(server_limits);
-    const uint16_t minimum = std::max(hello.min_protocol, server_min_protocol);
-    const uint16_t maximum = std::min(hello.max_protocol, server_max_protocol);
-    if (minimum > maximum)
-        throw std::invalid_argument("session protocol ranges do not overlap");
+    if (hello.min_protocol > kProtocolVersion ||
+        hello.max_protocol < kProtocolVersion ||
+        server_min_protocol > kProtocolVersion ||
+        server_max_protocol < kProtocolVersion)
+        throw std::invalid_argument(
+            "peers do not both implement Protocol 50");
 
     const uint32_t common = hello.supported_profiles & server_profiles;
     ProfileId selected{};
@@ -304,7 +314,7 @@ SessionSelection negotiate_session(const SessionHello& hello,
         }
     }
     if (!found) throw std::invalid_argument("session profiles do not overlap");
-    return {maximum, selected,
+    return {kProtocolVersion, selected,
             {std::min(hello.limits.max_frame_payload,
                       server_limits.max_frame_payload),
              std::min(hello.limits.max_fill_record_bytes,
