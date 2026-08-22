@@ -59,7 +59,7 @@
         "c_index": 0,
         "trace": "trace.tsv",
         "corpus_root": ".",
-        "manifest_digest": "78a817af7897241cd90f54201db539967f8250ecabbe03bcbf480d00148e9d8d",
+        "manifest_digest": "5cb0ecacfd3f84e48ff80aff99738d2232964c797b583caa586582de5b9f5636",
         "compile_profile": "r4-fixture-compiler",
         "build_epochs": 1,
         "build_release": {

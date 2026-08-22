@@ -8,7 +8,8 @@ This slice starts from the accepted simulator/research head
 `e45e5bd92924c05426a27e262d0fa7434fa40261` and implements the minimum
 experiment contract reviewed in `doc/issue16-strategic-plan.md` at
 `b759daf7aa9010c7156d9e307a568da66f23f501`. The first implementation commit is
-`bd62cf81224ce5ba69ea27bb0e19beb930a6ecf2`.
+`bd62cf81224ce5ba69ea27bb0e19beb930a6ecf2`; the independent-closure correction
+core is `15bb47d47ba96e66d61a7c55ac023b26c4dc9631`.
 
 Those two source heads diverge after `c697107e`. This branch deliberately keeps
 the accepted simulator lineage and does not import the product/cache endpoint
@@ -34,12 +35,23 @@ The checked schemas are:
 
 - `experiment.schema.json`: mode-neutral scenario;
 - `execution.schema.json`: one execution realization;
+- `workload-input.schema.json`: canonical per-TU content and timing inputs;
+- `event.schema.json`: one lifecycle event and its field-level provenance;
 - `route-trace.schema.json`: physical assignment/route trace rows.
 
 `z3_long` and `z3_shared_long` are valid future product profile names.
 `z3_shared_long_b1` exists only in `experiment_control`; it is the prebuilt
 prefix comparison label, not a product profile. No codec for these three labels
-is implemented in this R4 slice.
+is implemented in this R4 slice. The obsolete placeholder labels `stream_a` and
+`stream_b` are not product profiles and are rejected.
+
+Every v2 trace row declares `raw_sha256` and whether its compile duration is
+`observed` or `modeled`. The workload digest is the canonical digest of all
+parsed row identities, relative payload names, sizes, content digests, compile
+durations, compile models, and duration provenance. Loading recomputes every
+payload digest and that complete manifest. The execution header must name
+exactly the same input-manifest digest set. Changing a payload without changing
+its length therefore still refuses the run.
 
 ## Scored-release and environment rules
 
@@ -68,7 +80,7 @@ logical_job_id, attempt_id
 C_STORE_GUID, physical_endpoint, RouteLaneId, F_STORE_GUID, session_serial
 HISTORY_NONCE, REL_SEQ, TU_SEQ, transaction_digest, raw_digest
 negotiated_profiles, route_state_profiles, InputRecord_identity
-actor, start_ns, end_ns, duration_ns, provenance
+actor, start_ns, end_ns, duration_ns, field-level provenance, byte_account
 c_to_f_byte_delta, f_to_c_byte_delta
 resource_byte_delta, queue_byte_delta
 ```
@@ -77,7 +89,10 @@ The stable simulated identifiers are domain-separated hashes of the scenario,
 logical input, C/F route, sequence numbers, raw digest, and selected profile.
 Trace replay preserves the physical C/F/session/route identities instead.
 Legacy event names remain for v1 readers; the additive `stage` field carries the
-canonical lifecycle vocabulary.
+canonical lifecycle vocabulary. Provenance is not one blanket label: timing,
+byte delta, route identity, raw digest, compile-duration input, and derived
+resource/queue deltas are classified independently. Simulator event timing is
+always modeled even when a physical codec supplied observed byte counts.
 
 ## Exact ledgers
 
@@ -95,9 +110,11 @@ queues: scheduler-ready, route-input-pending, compiler-input, network-outstandin
 
 A debit may never make a balance negative. Every transient balance must be zero
 at completion. The engine validates closure before returning a result, and
-`validate_experiment_jsonl()` independently recomputes event sequence,
-directional totals, nonnegative balances, final zero balances, scenario digest,
-and replay status from the retained stream.
+`validate_experiment_jsonl()` validates the emitted execution and event schemas,
+recomputes the embedded scenario and workload digests, reconciles execution
+inputs and selected outcomes, and independently replays event count, per-account
+and per-route directional totals, every credited/debited/peak/final transient
+summary, route identities, and replay totals.
 
 ## Assignment replay
 
@@ -105,7 +122,11 @@ and replay status from the retained stream.
 Every logical job and attempt must occur exactly once. `TU_SEQ` is contiguous per
 C, `REL_SEQ` is contiguous per C/F relationship, and worker, route lane,
 physical endpoint, session, per-TU C-to-F bytes, and per-TU F-to-C bytes must all
-match. The final report closes each route exactly.
+match. A trace header must name the selected codec and observed/modeled route
+provenance. C, F, lane, session, and nonce identities cannot drift on an existing
+route because this minimum schema contains no identity-transition record. The
+final report closes each route exactly, including environment traffic; the
+source score remains a separate account.
 
 `assignment_source=policy` deliberately reruns the named scheduling policy. When
 an exact physical codec ledger is supplied, TU reconstruction and aggregate
@@ -113,21 +134,27 @@ directional bytes remain exact, but a small timing change may choose another F.
 The report therefore claims aggregate directional closure only; it does not
 mislabel a different assignment as an exact route replay.
 
-Every v2 run writes its realized `route-trace.jsonl`, which can become the input
-to a scenario whose manifest explicitly selects route-trace replay.
+Every v2 run writes its realized `route-trace.jsonl` as retained assignment
+evidence. An exact replay input must carry the digest of the already-frozen
+route-trace scenario and its selected codec.
 
 ## Retained acceptance fixture
 
 `samples/r4-minimum/` contains a two-TU, C1F2 exact-route replay:
 
 - scenario digest:
-  `fea4a8cf61c0286bbbc3f3a2ff1f54a20d50b78b9fea4b088881aa14933f49a7`;
+  `9411bba01333a1ff6340d8a5de141e0e246467c7e9a8c3ae90d156587abafa51`;
+- workload content-manifest digest:
+  `5cb0ecacfd3f84e48ff80aff99738d2232964c797b583caa586582de5b9f5636`;
 - input route-trace SHA-256:
-  `e4691f3ed450db07822e552ff4f01168682d3182739e3f9a562f18bdac63a01b`;
+  `340ef69297e1c8b05cfa3eb6adcb7191b0cab7085017e470cbef0658df639c3d`;
 - retained `sample-experiment.jsonl` SHA-256:
-  `93794082090c3c7180b7b0b548da577ccf912d76e21b96e9c6e6ab45e3cabce9`;
+  `7128ef3ce2384f7f58bce83cf5a9793e2d7bab5e2ff33a0cc8cde5a70b257824`;
 - closure: 30 events, 37 source C-to-F bytes, zero F-to-C bytes, two exact
   routes, and every resource/queue balance returned to zero.
+
+The retained JSONL stores only manifest-relative/logical input identities; two
+otherwise identical checkout roots reproduce the same bytes.
 
 Reproduce it from the repository root:
 

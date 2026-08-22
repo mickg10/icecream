@@ -1,15 +1,15 @@
 {
   "schema": "icecream-execution-v2",
-  "scenario_digest": "fea4a8cf61c0286bbbc3f3a2ff1f54a20d50b78b9fea4b088881aa14933f49a7",
+  "scenario_digest": "9411bba01333a1ff6340d8a5de141e0e246467c7e9a8c3ae90d156587abafa51",
   "mode": "simulated",
-  "runner_commit": "bd62cf81224ce5ba69ea27bb0e19beb930a6ecf2",
+  "runner_commit": "15bb47d47ba96e66d61a7c55ac023b26c4dc9631",
   "host_manifest": "594d5ddd35aedb47f00d9c34d140017907a5b9f93c975aba125fc924daac5c07",
   "started_at": "2026-08-22T00:43:03-04:00",
-  "source_commit": "bd62cf81224ce5ba69ea27bb0e19beb930a6ecf2",
-  "simulator_commit": "bd62cf81224ce5ba69ea27bb0e19beb930a6ecf2",
-  "codec_executable_digest": "417fbf69c87af3f58465b1d442e4fe2f1e067987621a058e90f8a7de7593696a",
+  "source_commit": "15bb47d47ba96e66d61a7c55ac023b26c4dc9631",
+  "simulator_commit": "15bb47d47ba96e66d61a7c55ac023b26c4dc9631",
+  "codec_executable_digest": "b95e6ce8045cda4015921b16d999d2ba4a87465a45fb18344a6f7342aeb3ecdb",
   "input_manifest_digests": [
-    "78a817af7897241cd90f54201db539967f8250ecabbe03bcbf480d00148e9d8d"
+    "5cb0ecacfd3f84e48ff80aff99738d2232964c797b583caa586582de5b9f5636"
   ],
   "image_identifiers": [
     "resident-fixture@sha256:2222222222222222222222222222222222222222222222222222222222222222"

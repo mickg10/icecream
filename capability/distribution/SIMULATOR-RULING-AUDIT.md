@@ -34,6 +34,12 @@ fields, replay closure, and explicit environment stress path without claiming th
 stage item 2 or result-return item 3 is complete. It does not introduce an online receiver-state
 selector, a spill heuristic, or restart behavior.
 
+The corrected R4 closure gate binds scenario workload identities to actual per-TU content,
+requires stable codec/session/nonce route identity, includes environment bytes in exact-route
+network totals while retaining the source score separately, and independently replays the
+retained event/resource/queue summaries. These are experiment-contract corrections; they do not
+advance the ordered simulator stages above.
+
 ## Static routing contract
 
 A scenario selects the policy with:
