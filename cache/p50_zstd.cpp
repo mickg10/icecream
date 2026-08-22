@@ -17,20 +17,13 @@
 namespace icecc::p50 {
 namespace {
 
-void validate_limits(ZstdTuLimits limits) {
-    if (limits.max_encoded_body_bytes == 0 || limits.max_raw_bytes == 0)
-        throw std::invalid_argument("ZSTD_TU byte limits must be nonzero");
-    if (limits.max_window_log < 10 || limits.max_window_log > 31)
-        throw std::invalid_argument("ZSTD_TU window-log cap is outside [10,31]");
-}
-
 ComponentDescriptor empty_dict_descriptor() {
     return describe_component(kZstdTuNoDictionaryEncoding,
                               std::span<const uint8_t>{}, 0);
 }
 
 void validate_begin_shape(const TxBegin& begin, ZstdTuLimits limits) {
-    validate_limits(limits);
+    validate_zstd_tu_limits(limits);
     if (begin.profile != ProfileId::ZSTD_TU ||
         begin.p29_root_mode != P29RootMode::NotApplicable)
         throw std::invalid_argument("transaction is not a ZSTD_TU profile");
@@ -66,6 +59,13 @@ const void* readable_data(std::span<const uint8_t> bytes,
 
 }  // namespace
 
+void validate_zstd_tu_limits(ZstdTuLimits limits) {
+    if (limits.max_encoded_body_bytes == 0 || limits.max_raw_bytes == 0)
+        throw std::invalid_argument("ZSTD_TU byte limits must be nonzero");
+    if (limits.max_window_log < 10 || limits.max_window_log > 31)
+        throw std::invalid_argument("ZSTD_TU window-log cap is outside [10,31]");
+}
+
 struct ZstdTuCodec::Contexts {
     Contexts() : compress(ZSTD_createCCtx()), decompress(ZSTD_createDCtx()) {
         if (!compress || !decompress) {
@@ -97,7 +97,7 @@ ZstdTuEnvelope ZstdTuCodec::encode(HistoryNonce history_nonce, RelSeq rel_seq,
                                    TuSeq tu_seq, Digest128 pre_state_digest,
                                    std::span<const uint8_t> exact_input,
                                    ZstdTuLimits limits) {
-    validate_limits(limits);
+    validate_zstd_tu_limits(limits);
     if (rel_seq.value == std::numeric_limits<uint64_t>::max())
         throw std::overflow_error("ZSTD_TU cannot encode terminal REL_SEQ");
     if (exact_input.size() > limits.max_raw_bytes)
@@ -112,10 +112,22 @@ ZstdTuEnvelope ZstdTuCodec::encode(HistoryNonce history_nonce, RelSeq rel_seq,
                    std::numeric_limits<size_t>::max())));
     std::vector<uint8_t> encoded(capacity);
     const uint8_t scratch = 0;
-    const size_t compressed = ZSTD_compressCCtx(
+    const size_t reset = ZSTD_CCtx_reset(
+        contexts_->compress, ZSTD_reset_session_and_parameters);
+    if (ZSTD_isError(reset))
+        throw_zstd("ZSTD_CCtx_reset", reset);
+    const size_t level_result = ZSTD_CCtx_setParameter(
+        contexts_->compress, ZSTD_c_compressionLevel, compression_level_);
+    if (ZSTD_isError(level_result))
+        throw_zstd("ZSTD_CCtx_setParameter(compressionLevel)", level_result);
+    const size_t window_result = ZSTD_CCtx_setParameter(
+        contexts_->compress, ZSTD_c_windowLog, limits.max_window_log);
+    if (ZSTD_isError(window_result))
+        throw_zstd("ZSTD_CCtx_setParameter(windowLog)", window_result);
+    const size_t compressed = ZSTD_compress2(
         contexts_->compress,
         encoded.data(), encoded.size(), readable_data(exact_input, scratch),
-        exact_input.size(), compression_level_);
+        exact_input.size());
     if (ZSTD_isError(compressed)) {
         if (bound > limits.max_encoded_body_bytes)
             throw std::length_error("ZSTD_TU encoded BODY exceeds the local cap");
@@ -221,7 +233,7 @@ std::vector<uint8_t> decode_zstd_tu(const TxBegin& begin,
 ZstdTuDialogue::ZstdTuDialogue(uint32_t negotiated_profiles,
                                ZstdTuLimits limits)
     : negotiated_profiles_(negotiated_profiles), limits_(limits) {
-    validate_limits(limits_);
+    validate_zstd_tu_limits(limits_);
     if (negotiated_profiles_ == 0)
         throw std::invalid_argument("message session negotiated no profiles");
 }

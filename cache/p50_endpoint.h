@@ -47,6 +47,7 @@ struct CompletionStamp {
     RelSeq rel_seq{};
     TuSeq tu_seq{};
     Digest128 transaction_digest{};
+    Digest128 raw_digest{};
     bool transaction_bound = false;
     auto operator<=>(const CompletionStamp&) const = default;
 };
@@ -75,6 +76,7 @@ struct EndpointIoControl {
     std::optional<MessageType> close_before_write;
     std::optional<MessageType> close_after_write;
     std::optional<AsyncOperationKind> wrong_digest_completion;
+    std::optional<AsyncOperationKind> wrong_raw_digest_completion;
     std::function<void(const CompletionStamp&)> before_completion_check;
 };
 

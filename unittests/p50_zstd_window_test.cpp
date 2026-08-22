@@ -123,8 +123,29 @@ int main() {
                                     {1, 1, 32}); },
         "window log above the portable maximum was accepted");
 
+    std::vector<uint8_t> cap10_input(1U << 20);
+    for (size_t index = 0; index != cap10_input.size(); ++index)
+        cap10_input[index] = static_cast<uint8_t>(
+            (index * 29 + index / 257 + (index >> 11)) & 0xff);
+    const ZstdTuLimits cap10_limits{uint64_t{2} << 20,
+                                    cap10_input.size(), 10};
+    ZstdTuCodec capped_codec;
+    const ZstdTuEnvelope cap10 = capped_codec.encode(
+        HistoryNonce{2}, RelSeq{0}, TuSeq{2}, icecc::digest128("cap10 pre"),
+        cap10_input, cap10_limits);
+    ZSTD_frameHeader cap10_header{};
+    const size_t cap10_parsed = ZSTD_getFrameHeader(
+        &cap10_header, cap10.body.data(), cap10.body.size());
+    require(cap10_parsed == 0 &&
+                cap10_header.windowSize <= (uint64_t{1} << 10),
+            "encoder produced a frame above its configured window cap");
+    require(capped_codec.decode(cap10.begin, cap10.body, cap10_limits) ==
+                cap10_input,
+            "cap=10 encoder output was rejected by the same bounded codec");
+
     std::cout << "p50_zstd_window_test: declared_window="
               << header.windowSize << " encoded_bytes=" << frame.size()
+              << " cap10_window=" << cap10_header.windowSize
               << " strict reused-context bound is live\n";
     return 0;
 }
