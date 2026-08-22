@@ -14,11 +14,12 @@ The independent retained-evidence/cardinality correction is
 `12a0fa6d934b3fee4037cb8ed9ebb049b29e34ef`; its static-policy closure follow-up
 is `4c2b184d77bfc10c51b8ca1d189d36cc21d4f94a`.
 The closed retained-stream validator source is
-`4920b68995599eed94d8910930a803bd477b4803`; retained evidence records that
-exact commit and the SHA-256 of its `run_scenario.py` blob. The subsequently
-committed `simulator-source.json` sidecar preserves that binding in source
-archives without a `.git` object database; worktrees additionally compare the
-declared commit to the literal Git blob.
+`35e96aa6734f361bb5143ad3dfb4b34e38e61e11`; retained evidence records that
+exact commit and its `run_scenario.py` SHA-256,
+`22da58359d1267582125d47b5584791a98cffcfb8a3c7884e9bf5d9d42d8898d`.
+The subsequently committed `simulator-source.json` sidecar preserves that
+binding in source archives without a `.git` object database; worktrees
+additionally compare the declared commit to the literal Git blob.
 
 Those two source heads diverge after `c697107e`. This branch deliberately keeps
 the accepted simulator lineage and does not import the product/cache endpoint
@@ -46,6 +47,8 @@ The checked schemas are:
 - `execution.schema.json`: one execution realization;
 - `workload-input.schema.json`: canonical per-TU content and timing inputs;
 - `event.schema.json`: one lifecycle event and its field-level provenance;
+- `physical-ledger.schema.json`: every physical codec descriptor, exact TU
+  transaction row, and final total;
 - `timeline.schema.json`: the exact canonical snapshot/gap envelope;
 - `summary.schema.json`: the exact canonical v2 result field set;
 - `route-trace.schema.json`: physical assignment/route trace rows.
@@ -111,6 +114,14 @@ instant-event shapes. Provenance is not one blanket label: timing,
 byte delta, route identity, raw digest, compile-duration input, and derived
 resource/queue deltas are classified independently. Simulator event timing is
 always modeled even when a physical codec supplied observed byte counts.
+The selected profile must be in both advertised sets, route-state profiles must
+be a subset of negotiated profiles from the first TU onward, and both sets are
+frozen for each `(C_STORE_GUID,F_STORE_GUID,HISTORY_NONCE)` relationship. Every
+post-dispatch event for a TU retains one transaction number, one input-staging
+slot, and—after compiler admission—one in-range compiler slot. Compiler queue
+events have derived cardinality: one ordinary admission plus exactly one
+`waiting-for-environment` observation only when input wins the absent-environment
+race.
 
 ## Exact ledgers
 
@@ -122,6 +133,11 @@ Flow IDs are globally allocated exactly once as a contiguous range. Their full
 transaction, route, profile, phase, direction, size, and account descriptor is
 immutable from queue through delivery; only the matching `flow-sent` event may
 charge its exact directional byte extent.
+The diagnostic contracts are closed as well: `compile-only` emits no source
+flow and charges zero source bytes, while `raw` emits exactly one C-to-F
+`raw-tu` source flow per TU whose size equals the content manifest, and emits no
+source reverse flow. Each build-generation duration must be at least its
+independently derived transfer/compile capacity floor.
 
 The engine also records byte credits and debits for:
 
@@ -160,6 +176,8 @@ allows arbitrary cross-TU interleaving and fork/join transfer overlap without
 allowing a single TU to skip, repeat, or reverse a represented stage. `input-ready`
 is the current materialization boundary; the minimum core does not invent separate
 source decode/install CPU stages that the simulator does not yet model.
+The final makespan and final canonical wall endpoint are exactly the maximum
+transaction-complete timestamp; a later canonical interval is invalid.
 
 ## Assignment replay
 
@@ -189,11 +207,14 @@ An exact replay input must carry the digest of the already-frozen route-trace
 scenario and its selected codec.
 
 A physical codec result also retains `physical-ledger.jsonl`. The execution
-record binds its literal digest; validation compares its descriptor and summary
-with codec metadata, checks every exact TU row against the workload content
-manifest, and reconciles each TU's directional phase bytes with the event
-ledger. Diagnostic adapters cannot carry this evidence or claim a physical
-result.
+record binds its literal digest. Validation applies the closed physical-ledger
+schema to every row; derives totals and assignment-closure mode; joins worker,
+`TU_SEQ`, `REL_SEQ`, route sequence, and order to dispatch plus the retained
+route trace for exact replay; and reconstructs every declared phase/token DAG.
+Each phase has exactly one flow, node-ready bytes match the ledger, dependency
+tokens precede readiness, sent/delivered token details and order match the
+flow lifecycle, and input/commit joins wait for their declared tokens.
+Diagnostic adapters cannot carry this evidence or claim a physical result.
 
 ## Retained acceptance fixture
 
@@ -208,7 +229,7 @@ result.
 - retained route evidence: `route-trace.jsonl`, byte-identical to the input
   trace above;
 - retained `sample-experiment.jsonl` SHA-256:
-  `14797f57983bb9f2cdaaa639753a63413f8cf90f191aabd755c8cfa363b898fd`;
+  `c8a909c4c2db10b5461c9ab485ec95761ed5ed9c110cb19190cc2099338489c5`;
 - closure: 30 events, 37 source C-to-F bytes, zero F-to-C bytes, two exact
   routes, and every resource/queue balance returned to zero.
 
