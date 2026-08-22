@@ -1496,6 +1496,22 @@ class SimulatorTest(unittest.TestCase):
             self.assertTrue(
                 all(event["provenance"]["timing"] == "modeled" for event in byte_events)
             )
+            output = root / "out"
+            sim.write_result(scenario, result, output, execution_for(path))
+            self.assertEqual(
+                sim.sha256(output / "physical-ledger.jsonl"),
+                sim.sha256(ledger_path),
+            )
+            self.assertEqual(
+                sim.validate_experiment_jsonl(output / "experiment.jsonl")["events"],
+                result.events.count,
+            )
+            retained_ledger = output / "physical-ledger.jsonl"
+            retained_bytes = retained_ledger.read_bytes()
+            retained_ledger.write_bytes(retained_bytes + b"\n")
+            with self.assertRaisesRegex(ValueError, "physical codec ledger digest"):
+                sim.validate_experiment_jsonl(output / "experiment.jsonl")
+            retained_ledger.write_bytes(retained_bytes)
 
     def test_retained_stream_validator_rejects_each_independent_drift(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1766,9 +1782,252 @@ class SimulatorTest(unittest.TestCase):
             candidate.write_text("".join(json.dumps(row) + "\n" for row in rows))
             with self.assertRaisesRegex(
                 ValueError,
-                "lifecycle order requires compile-start before compile-finish",
+                "stage differs from semantic table|lifecycle order requires "
+                "compile-start before compile-finish",
             ):
                 sim.validate_experiment_jsonl(candidate)
+
+    def test_v2_validator_rejects_final_review_malformed_records(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_v2_fixture(root, [30, 20], [15, 22], workers=1)
+            add_route_trace(path, [0, 0], [15, 22])
+            scenario = sim.load_scenario(path)
+            output = root / "out"
+            sim.write_result(
+                scenario,
+                sim.Simulator(scenario, sim.RawAdapter()).run(),
+                output,
+                execution_for(path),
+            )
+            original = [
+                json.loads(line)
+                for line in (output / "experiment.jsonl").read_text().splitlines()
+            ]
+
+            def all_events(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+                return [event for row in rows[1:-1] for event in row["events"]]
+
+            def first_event(
+                rows: list[dict[str, object]], name: str, logical: int | None = None
+            ) -> dict[str, object]:
+                return next(
+                    event
+                    for event in all_events(rows)
+                    if event["event"] == name
+                    and (logical is None or event["logical"] == logical)
+                )
+
+            def reject(
+                label: str,
+                mutate: object,
+                pattern: str,
+                *,
+                synchronize_summary: bool = False,
+            ) -> None:
+                rows = copy.deepcopy(original)
+                mutate(rows)
+                if synchronize_summary:
+                    rows[0]["expected_summary"] = copy.deepcopy(rows[-1]["summary"])
+                candidate = output / f"malformed-{label}.jsonl"
+                candidate.write_text("".join(json.dumps(row) + "\n" for row in rows))
+                with self.subTest(label=label), self.assertRaisesRegex(
+                    ValueError, pattern
+                ):
+                    sim.validate_experiment_jsonl(candidate)
+
+            reject(
+                "unknown-event",
+                lambda rows: first_event(rows, "compiler-queued").__setitem__(
+                    "event", "made-up-event"
+                ),
+                "schema error|unknown semantic",
+            )
+            reject(
+                "stage",
+                lambda rows: first_event(rows, "compile-finish").__setitem__(
+                    "stage", "job_finish"
+                ),
+                "stage differs",
+            )
+            reject(
+                "actor",
+                lambda rows: first_event(rows, "compile-finish").__setitem__(
+                    "actor", "C_authority"
+                ),
+                "actor differs",
+            )
+
+            def make_instant_event_durational(rows: list[dict[str, object]]) -> None:
+                event = first_event(rows, "compile-finish")
+                event["start_ns"] -= 1
+                event["duration_ns"] = 1
+
+            reject("instant-duration", make_instant_event_durational, "instant shape")
+
+            def drift_flow_descriptor(rows: list[dict[str, object]]) -> None:
+                event = first_event(rows, "flow-start")
+                event["phase"] = "different-phase"
+                event["direction"] = "f_to_c"
+                event["bytes"] = 999999
+
+            reject(
+                "flow-descriptor",
+                drift_flow_descriptor,
+                "actor differs|descriptor drifted",
+            )
+
+            def duplicate_flow_identity(rows: list[dict[str, object]]) -> None:
+                events = all_events(rows)
+                flows = sorted(
+                    {event["flow"] for event in events if event["flow"] != ""}
+                )
+                for event in events:
+                    if event["flow"] == flows[1]:
+                        event["flow"] = flows[0]
+
+            reject(
+                "duplicate-flow",
+                duplicate_flow_identity,
+                "descriptor drifted|unique and contiguous",
+            )
+
+            def move_byte_charge(rows: list[dict[str, object]]) -> None:
+                sent = first_event(rows, "flow-sent")
+                byte_count = sent["c_to_f_byte_delta"]
+                sent["c_to_f_byte_delta"] = 0
+                first_event(rows, "input-ready")["c_to_f_byte_delta"] = byte_count
+
+            reject("byte-charge", move_byte_charge, "phase bytes differ|non-sent")
+
+            def put_input_before_flow_finish(rows: list[dict[str, object]]) -> None:
+                finish = first_event(rows, "flow-finish", 0)
+                ready = first_event(rows, "input-ready", 0)
+                time_fields = (
+                    "sequence",
+                    "time_ns",
+                    "start_ns",
+                    "end_ns",
+                    "duration_ns",
+                )
+                finish_time = {name: finish[name] for name in time_fields}
+                ready_time = {name: ready[name] for name in time_fields}
+                finish_payload = copy.deepcopy(finish)
+                ready_payload = copy.deepcopy(ready)
+                finish.clear()
+                finish.update(ready_payload)
+                finish.update(finish_time)
+                ready.clear()
+                ready.update(finish_payload)
+                ready.update(ready_time)
+
+            reject(
+                "input-before-source-flow",
+                put_input_before_flow_finish,
+                "input became ready before a contributing source flow",
+            )
+
+            def drift_profiles_coherently(rows: list[dict[str, object]]) -> None:
+                for event in all_events(rows):
+                    if event["logical"] != 1:
+                        continue
+                    event["route_state_profiles"] = ["legacy", "retained-window-v2"]
+                    if event["transaction_digest"] is None:
+                        continue
+                    digest = sim.transaction_identity_digest(
+                        rows[0]["scenario_digest"],
+                        event["logical_job_id"],
+                        event["attempt_id"],
+                        event["C_STORE_GUID"],
+                        event["F_STORE_GUID"],
+                        event["HISTORY_NONCE"],
+                        event["TU_SEQ"],
+                        event["REL_SEQ"],
+                        event["raw_digest"],
+                        event["negotiated_profiles"],
+                        event["route_state_profiles"],
+                    )
+                    event["transaction_digest"] = digest
+                    event["InputRecord_identity"] = sim.input_record_identity(
+                        digest, event["raw_digest"]
+                    )
+
+            reject("route-profiles", drift_profiles_coherently, "relationship profiles")
+
+            def forge_physical_claim(rows: list[dict[str, object]]) -> None:
+                rows[0]["physical_codec_result"] = True
+                rows[-1]["summary"]["physical_codec_result"] = True
+
+            reject(
+                "physical-claim",
+                forge_physical_claim,
+                "physical codec claim",
+                synchronize_summary=True,
+            )
+
+            def add_canonical_snapshot_state(rows: list[dict[str, object]]) -> None:
+                snapshot = next(
+                    row for row in rows[1:-1] if row["record"] == "snapshot"
+                )
+                snapshot["state"] = copy.deepcopy(
+                    snapshot["noncanonical_display"]["state"]
+                )
+
+            reject(
+                "snapshot-state", add_canonical_snapshot_state, "timeline: schema error"
+            )
+
+            def add_unbound_trace_digest(rows: list[dict[str, object]]) -> None:
+                for container in (
+                    rows[0]["workload_inputs"],
+                    rows[-1]["summary"]["workload_inputs"],
+                ):
+                    container["test"]["trace_sha256"] = "f" * 64
+
+            reject(
+                "trace-digest",
+                add_unbound_trace_digest,
+                "retained fields are not canonical",
+                synchronize_summary=True,
+            )
+
+            def forge_summary(rows: list[dict[str, object]]) -> None:
+                summary = rows[-1]["summary"]
+                summary["makespan_seconds"] += 1
+                summary["summed_generation_ns"] += 1
+                summary["summed_generation_seconds"] += 1
+                summary["scenario_path"] = "invented.json"
+
+            reject(
+                "summary",
+                forge_summary,
+                "summary: schema error|event-derived timing",
+                synchronize_summary=True,
+            )
+
+            def drift_source_commit(rows: list[dict[str, object]]) -> None:
+                rows[0]["simulator"]["source_commit"] = "f" * 40
+
+            reject("source-commit", drift_source_commit, "source identity/commit")
+
+            lifecycle = [
+                copy.deepcopy(event)
+                for event in all_events(original)
+                if event["logical"] == 0
+            ]
+            complete = next(
+                event for event in lifecycle if event["event"] == "transaction-complete"
+            )
+            for field in ("time_ns", "start_ns", "end_ns"):
+                complete[field] += 1
+            with self.assertRaisesRegex(ValueError, "does not equal its exact join"):
+                sim._validate_tu_lifecycle(
+                    output / "malformed-transaction-join.jsonl",
+                    ("test", 0, 0),
+                    lifecycle,
+                    30,
+                    1,
+                )
 
     def test_v2_validator_rejects_short_and_long_tu_compile_durations(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1823,6 +2082,71 @@ class SimulatorTest(unittest.TestCase):
                 ):
                     sim.validate_experiment_jsonl(candidate)
 
+    def test_v2_validator_rejects_policy_provenance_and_environment_seam(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_v2_fixture(root, [30, 20], [15, 22], workers=1)
+            scenario = sim.load_scenario(path)
+            output = root / "policy"
+            sim.write_result(
+                scenario,
+                sim.Simulator(scenario, sim.RawAdapter()).run(),
+                output,
+                execution_for(path),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "experiment.jsonl").read_text().splitlines()
+            ]
+            dispatch = next(
+                event
+                for row in rows[1:-1]
+                for event in row["events"]
+                if event["event"] == "dispatch"
+            )
+            dispatch["provenance"]["route_identity"] = "observed"
+            candidate = output / "malformed-policy-provenance.jsonl"
+            candidate.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            with self.assertRaisesRegex(ValueError, "policy route provenance"):
+                sim.validate_experiment_jsonl(candidate)
+
+            absent_root = root / "absent"
+            absent_root.mkdir()
+            absent_path = write_v2_fixture(
+                absent_root,
+                [30, 20],
+                [15, 22],
+                workers=1,
+                environment_state="absent",
+            )
+            absent = sim.load_scenario(absent_path)
+            absent_output = root / "absent-out"
+            sim.write_result(
+                absent,
+                sim.Simulator(absent, sim.RawAdapter()).run(),
+                absent_output,
+                execution_for(absent_path),
+            )
+            absent_rows = [
+                json.loads(line)
+                for line in (absent_output / "experiment.jsonl")
+                .read_text()
+                .splitlines()
+            ]
+            install_finish = next(
+                event
+                for row in absent_rows[1:-1]
+                for event in row["events"]
+                if event["event"] == "env_install_verify"
+                and event["transition"] == "finish"
+            )
+            install_finish["start_ns"] += 1
+            install_finish["duration_ns"] -= 1
+            candidate = absent_output / "malformed-environment-seam.jsonl"
+            candidate.write_text("".join(json.dumps(row) + "\n" for row in absent_rows))
+            with self.assertRaisesRegex(ValueError, "environment interval seams"):
+                sim.validate_experiment_jsonl(candidate)
+
     def test_v2_validator_rejects_duplicate_and_skipped_terminal_events(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1860,7 +2184,8 @@ class SimulatorTest(unittest.TestCase):
                 candidate.write_text("".join(json.dumps(row) + "\n" for row in rows))
                 with self.subTest(label=label), self.assertRaisesRegex(
                     ValueError,
-                    rf"has {expected_count} transaction-complete events",
+                    rf"stage differs from semantic table|has {expected_count} "
+                    "transaction-complete events",
                 ):
                     sim.validate_experiment_jsonl(candidate)
 
@@ -1971,7 +2296,7 @@ class SimulatorTest(unittest.TestCase):
         )
         self.assertEqual(
             sim.sha256(root / "sample-experiment.jsonl"),
-            "9aab24683c1dd5cc6ea95539737526ace41442421e2a64afc973550bc36cb77a",
+            "015ae16313e495dd2442b6fc434b951b8effc094ebe838908cd7796cda0784ac",
         )
 
 

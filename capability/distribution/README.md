@@ -98,6 +98,9 @@ rows are 10-ms snapshots of scheduler, C, F, codec, and network state.  An idle 
 represented by one explicit gap row rather than thousands of empty samples.  The final row
 contains the complete result summary.  Exact events are attached to the first snapshot or gap
 whose boundary contains them, so no transition is lost when the view is sampled.
+Snapshot state and rate metrics are emitted under `noncanonical_display`: they are a browser
+aid, while lifecycle events, interval envelopes, exact ledgers, and the final result are the
+validated canonical record.
 
 `experiment.jsonl` always retains the complete 10-ms stream.  To keep a large self-contained
 HTML file responsive, `report.html` embeds at most 2,000 evenly spaced active snapshots plus

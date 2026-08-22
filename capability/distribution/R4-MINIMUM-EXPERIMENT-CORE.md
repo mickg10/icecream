@@ -13,6 +13,9 @@ core is `15bb47d47ba96e66d61a7c55ac023b26c4dc9631`.
 The independent retained-evidence/cardinality correction is
 `12a0fa6d934b3fee4037cb8ed9ebb049b29e34ef`; its static-policy closure follow-up
 is `4c2b184d77bfc10c51b8ca1d189d36cc21d4f94a`.
+The closed retained-stream validator source is
+`328520974a22fca08ff88568fe287435c5e77523`; retained evidence records that
+exact commit and the SHA-256 of its `run_scenario.py` blob.
 
 Those two source heads diverge after `c697107e`. This branch deliberately keeps
 the accepted simulator lineage and does not import the product/cache endpoint
@@ -40,6 +43,8 @@ The checked schemas are:
 - `execution.schema.json`: one execution realization;
 - `workload-input.schema.json`: canonical per-TU content and timing inputs;
 - `event.schema.json`: one lifecycle event and its field-level provenance;
+- `timeline.schema.json`: the exact canonical snapshot/gap envelope;
+- `summary.schema.json`: the exact canonical v2 result field set;
 - `route-trace.schema.json`: physical assignment/route trace rows.
 
 `z3_long` and `z3_shared_long` are valid future product profile names.
@@ -55,6 +60,9 @@ durations, compile models, and duration provenance. Loading recomputes every
 payload digest and that complete manifest. The execution header must name
 exactly the same input-manifest digest set. Changing a payload without changing
 its length therefore still refuses the run.
+The parsed content manifest is the retained trace claim: v2 does not publish a
+second checksum for an external trace pathname whose literal bytes are not in
+the retained result bundle.
 
 ## Scored-release and environment rules
 
@@ -94,7 +102,9 @@ route-state profiles. `InputRecord_identity` is independently recomputed from
 that transaction digest and the raw-content digest.
 Trace replay preserves the physical C/F/session/route identities instead.
 Legacy event names remain for v1 readers; the additive `stage` field carries the
-canonical lifecycle vocabulary. Provenance is not one blanket label: timing,
+canonical lifecycle vocabulary. A single closed event table drives both the
+producer and validator, including event/stage/actor/transition/phase and exact
+instant-event shapes. Provenance is not one blanket label: timing,
 byte delta, route identity, raw digest, compile-duration input, and derived
 resource/queue deltas are classified independently. Simulator event timing is
 always modeled even when a physical codec supplied observed byte counts.
@@ -105,6 +115,10 @@ Directional bytes are charged once, at completed serialization, by direction,
 route, and account (`source`, `environment`, or future `result`). Source C-to-F
 bytes remain the score. Environment C-to-F and all F-to-C bytes are reported
 separately and enter network time.
+Flow IDs are globally allocated exactly once as a contiguous range. Their full
+transaction, route, profile, phase, direction, size, and account descriptor is
+immutable from queue through delivery; only the matching `flow-sent` event may
+charge its exact directional byte extent.
 
 The engine also records byte credits and debits for:
 
@@ -133,7 +147,12 @@ compiler finish, and dialogue/relationship commit/dialogue finish. Both must joi
 exactly once at transaction completion, which must be that TU's final event. The
 compiler-finish timestamp minus compiler-start timestamp must equal that TU's
 manifest `compile_ns` exactly. Optional environment transfer/install/ready events
-form their own ordered sub-lifecycle and must finish before compile starts. This
+form their own ordered sub-lifecycle with exact interval seams. Every TU waiting
+on an initially absent route must start compilation after that route's single
+readiness event. Every input-contributing C-to-F source flow must be delivered
+before input readiness, every source flow must be delivered before relationship
+commit/dialogue finish, and transaction completion is exactly the maximum of
+compiler finish and transaction commit. This
 allows arbitrary cross-TU interleaving and fork/join transfer overlap without
 allowing a single TU to skip, repeat, or reverse a represented stage. `input-ready`
 is the current materialization boundary; the minimum core does not invent separate
@@ -166,6 +185,13 @@ route-summary identity and source-byte total directly with the retained rows.
 An exact replay input must carry the digest of the already-frozen route-trace
 scenario and its selected codec.
 
+A physical codec result also retains `physical-ledger.jsonl`. The execution
+record binds its literal digest; validation compares its descriptor and summary
+with codec metadata, checks every exact TU row against the workload content
+manifest, and reconciles each TU's directional phase bytes with the event
+ledger. Diagnostic adapters cannot carry this evidence or claim a physical
+result.
+
 ## Retained acceptance fixture
 
 `samples/r4-minimum/` contains a two-TU, C1F2 exact-route replay:
@@ -179,12 +205,14 @@ scenario and its selected codec.
 - retained route evidence: `route-trace.jsonl`, byte-identical to the input
   trace above;
 - retained `sample-experiment.jsonl` SHA-256:
-  `9aab24683c1dd5cc6ea95539737526ace41442421e2a64afc973550bc36cb77a`;
+  `015ae16313e495dd2442b6fc434b951b8effc094ebe838908cd7796cda0784ac`;
 - closure: 30 events, 37 source C-to-F bytes, zero F-to-C bytes, two exact
   routes, and every resource/queue balance returned to zero.
 
 The retained JSONL stores only manifest-relative/logical input identities; two
-otherwise identical checkout roots reproduce the same bytes.
+otherwise identical checkout roots reproduce the same bytes. Snapshot state and
+rate metrics live under `noncanonical_display`: they remain available to the
+HTML report but are explicitly outside the canonical event/accounting result.
 
 Reproduce it from the repository root:
 
