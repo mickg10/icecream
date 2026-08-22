@@ -16,7 +16,7 @@ libp50endpoint_a_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
 
 EXTRA_DIST = \
 	README.md \
-	P48_P50_CONVERGENCE_DRY_RUN.md \
+	P48_P50_CONVERGENCE.md \
 	KEY_LAYOUT_V1_CENSUS.md \
 	key_layout_census.py \
 	formal/Protocol50.tla \
