@@ -1,20 +1,28 @@
 #!/usr/bin/env python3
 """Offline dashboard renderer for icecream distribution experiment JSONL.
 
-The JSONL stream is the source of truth.  This module deliberately has no runtime
-dependencies beyond the Python standard library and emits a file://-safe report.
+The JSONL stream is the source of truth. This module uses the repository's R4
+validator (and its jsonschema dependency) and emits a file://-safe report with
+no browser-time dependency.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
+import sys
 from collections import deque
 from pathlib import Path
 from typing import Iterable
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from run_scenario import validate_experiment_jsonl  # noqa: E402
+
 
 MAX_REPORT_SNAPSHOTS = 2_000
+TARGET_TIMELINE_BYTES = 2_000_000
+MAX_OPTIONAL_STATE_BYTES = 512
 
 
 class EventAccumulator:
@@ -35,23 +43,75 @@ class EventAccumulator:
             self.first.append(event)
         else:
             self.last.append(event)
-        phase = str(event.get("phase") or "(none)") + " / " + str(event.get("direction") or "")
-        p = self.phases.setdefault(phase, {"phase": phase, "filter_phase": str(event.get("phase") or ""), "events": 0, "bytes": 0, "semantics": "flow-queued phase extents"})
+        phase = (
+            str(event.get("phase") or "(none)")
+            + " / "
+            + str(event.get("direction") or "")
+        )
+        p = self.phases.setdefault(
+            phase,
+            {
+                "phase": phase,
+                "filter_phase": str(event.get("phase") or ""),
+                "events": 0,
+                "bytes": 0,
+                "semantics": "flow-queued phase extents",
+            },
+        )
         if event.get("event") == "flow-queued":
             p["events"] += 1
             p["bytes"] += int(event.get("bytes") or 0)
         build = str(event.get("build") if event.get("build") != "" else "(none)")
-        b = self.builds.setdefault(build, {"build": build, "events": 0, "first": int(event.get("time_ns") or 0), "last": int(event.get("time_ns") or 0)})
+        b = self.builds.setdefault(
+            build,
+            {
+                "build": build,
+                "events": 0,
+                "first": int(event.get("time_ns") or 0),
+                "last": int(event.get("time_ns") or 0),
+            },
+        )
         b["events"] += 1
         b["first"] = min(b["first"], int(event.get("time_ns") or 0))
         b["last"] = max(b["last"], int(event.get("time_ns") or 0))
-        endpoint = build + " / " + ("C" if event.get("worker") == "" else "F" + str(int(event.get("worker")) + 1))
-        if endpoint not in self.terminals or int(event.get("time_ns") or 0) >= self.terminals[endpoint]["time"]:
-            self.terminals[endpoint] = {"endpoint": endpoint, "time": int(event.get("time_ns") or 0), "event": event.get("event", ""), "phase": event.get("phase", ""), "detail": event.get("detail", "")}
+        endpoint = (
+            build
+            + " / "
+            + (
+                "C"
+                if event.get("worker") == ""
+                else "F" + str(int(event.get("worker")) + 1)
+            )
+        )
+        if (
+            endpoint not in self.terminals
+            or int(event.get("time_ns") or 0) >= self.terminals[endpoint]["time"]
+        ):
+            self.terminals[endpoint] = {
+                "endpoint": endpoint,
+                "time": int(event.get("time_ns") or 0),
+                "event": event.get("event", ""),
+                "phase": event.get("phase", ""),
+                "detail": event.get("detail", ""),
+            }
 
     def finish(self) -> dict[str, object]:
         sampled = self.first + list(self.last)
-        return {"event_count": self.event_count, "phases": list(self.phases.values()), "builds": list(self.builds.values()), "terminals": list(self.terminals.values()), "events": sampled, "sampled_events": len(sampled), "event_sample_limit": self.sample_limit * 2, "source_event_count": self.event_count, "event_sampling": "first and last bounded event sample" if self.event_count > len(sampled) else "all retained events"}
+        return {
+            "event_count": self.event_count,
+            "phases": list(self.phases.values()),
+            "builds": list(self.builds.values()),
+            "terminals": list(self.terminals.values()),
+            "events": sampled,
+            "sampled_events": len(sampled),
+            "event_sample_limit": self.sample_limit * 2,
+            "source_event_count": self.event_count,
+            "event_sampling": (
+                "first and last bounded event sample"
+                if self.event_count > len(sampled)
+                else "all retained events"
+            ),
+        }
 
 
 def _selected_ordinals(count: int, limit: int) -> set[int]:
@@ -62,18 +122,39 @@ def _selected_ordinals(count: int, limit: int) -> set[int]:
     return {i * (count - 1) // (limit - 1) for i in range(limit)}
 
 
-def compact_timeline(rows: list[dict[str, object]], limit: int = MAX_REPORT_SNAPSHOTS) -> tuple[list[dict[str, object]], dict[str, object]]:
+def _adaptive_limit(descriptor: dict[str, object], count: int, requested: int) -> int:
+    if count == 0:
+        return 0
+    dimensions = descriptor.get("topology_dimensions")
+    dimensions = dimensions if isinstance(dimensions, dict) else {}
+    c_count = int(dimensions.get("logical_c_authorities") or 1)
+    f_count = int(dimensions.get("f_stores") or 1)
+    estimated = 420 + c_count * 140 + f_count * 260 + c_count * f_count * 180
+    return min(count, requested, max(16, TARGET_TIMELINE_BYTES // max(1, estimated)))
+
+
+def compact_timeline(
+    rows: list[dict[str, object]], limit: int = MAX_REPORT_SNAPSHOTS
+) -> tuple[list[dict[str, object]], dict[str, object]]:
     """Bound snapshots for HTML, retaining every explicit idle gap."""
     positions = [i for i, row in enumerate(rows) if row.get("record") == "snapshot"]
     selected = _selected_ordinals(len(positions), limit)
     chosen = {positions[i] for i in selected}
-    view = [_slim_row(row) for i, row in enumerate(rows) if row.get("record") == "gap" or i in chosen]
+    view = [
+        _slim_row(row)
+        for i, row in enumerate(rows)
+        if row.get("record") == "gap" or i in chosen
+    ]
     return view, {
         "source_records": len(rows),
         "source_snapshots": len(positions),
         "embedded_records": len(view),
         "embedded_snapshots": len(selected),
-        "snapshot_selection": "all" if len(positions) <= limit else "evenly spaced including first and last",
+        "snapshot_selection": (
+            "all"
+            if len(positions) <= limit
+            else "evenly spaced including first and last"
+        ),
         "all_gap_records_embedded": True,
         "canonical_detail": "experiment.jsonl retains every active-time snapshot and event",
     }
@@ -82,27 +163,157 @@ def compact_timeline(rows: list[dict[str, object]], limit: int = MAX_REPORT_SNAP
 def _slim_row(row: dict[str, object]) -> dict[str, object]:
     """Project a snapshot to fields used by the browser; codec state is intentionally omitted."""
     if row.get("record") != "snapshot":
-        return {k: row.get(k) for k in ("record", "sequence", "wall_start_ns", "wall_end_ns", "wall_duration_ns", "active_position_ns", "reason") if k in row}
-    display = row.get("noncanonical_display") if isinstance(row.get("noncanonical_display"), dict) else row
+        return {
+            k: row.get(k)
+            for k in (
+                "record",
+                "sequence",
+                "wall_start_ns",
+                "wall_end_ns",
+                "wall_duration_ns",
+                "active_position_ns",
+                "reason",
+            )
+            if k in row
+        }
+    display = (
+        row.get("noncanonical_display")
+        if isinstance(row.get("noncanonical_display"), dict)
+        else row
+    )
     metrics = display.get("metrics") if isinstance(display.get("metrics"), dict) else {}
     state = display.get("state") if isinstance(display.get("state"), dict) else {}
+
+    def select(item: object, keys: tuple[str, ...]) -> dict[str, object]:
+        return (
+            {key: item[key] for key in keys if key in item}
+            if isinstance(item, dict)
+            else {}
+        )
+
+    def optional_state(item: dict[str, object]) -> dict[str, object]:
+        projected: dict[str, object] = {}
+        used = 0
+        truncated = False
+        for key in sorted(item):
+            if not any(token in key.lower() for token in ("cache", "lease", "cursor")):
+                continue
+            value = item[key]
+            size = len(key) + len(json.dumps(value, separators=(",", ":")))
+            if used + size <= MAX_OPTIONAL_STATE_BYTES:
+                projected[key] = value
+                used += size
+            else:
+                truncated = True
+        if truncated:
+            projected["state_projection_truncated"] = True
+        return projected
+
     keep_state = {
-        "scheduler": state.get("scheduler", {}),
-        "network": state.get("network", {}),
+        "scheduler": select(
+            state.get("scheduler"),
+            ("ready_tus", "active_tus", "completed_tus", "unreleased_tus", "total_tus"),
+        ),
+        "network": select(
+            state.get("network"),
+            (
+                "active_dialogues",
+                "active_flows",
+                "in_propagation",
+                "queued_dialogues",
+                "queued_flows",
+            ),
+        ),
         "c": [
-            {k: item.get(k) for k in ("environment", "unreleased_tus", "ready_tus", "active_tus", "completed_tus", "admitted_tus", "targets")}
-            for item in state.get("c", []) if isinstance(item, dict)
+            select(
+                item,
+                (
+                    "environment",
+                    "unreleased_tus",
+                    "ready_tus",
+                    "active_tus",
+                    "completed_tus",
+                    "admitted_tus",
+                ),
+            )
+            for item in state.get("c", [])
+            if isinstance(item, dict)
         ],
         "f": [
-            {k: item.get(k) for k in ("worker", "slots", "free_slots", "reserved_slots", "input_staging_slots", "free_input_staging_slots", "occupied_input_staging_slots", "input_wait_slots", "ready_input_slots", "compiling_slots", "commit_wait_slots", "dispatched_tus", "completed_tus", "active_flows", "queued_flows", "in_propagation", "active_dialogues", "queued_dialogues")}
-            for item in state.get("f", []) if isinstance(item, dict)
+            {"worker": item.get("worker"), **optional_state(item)}
+            for item in state.get("f", [])
+            if isinstance(item, dict)
+            and any(
+                token in key.lower()
+                for key in item
+                for token in ("cache", "lease", "cursor")
+            )
         ],
     }
-    keep_metrics = {k: metrics.get(k) for k in ("fabric_average_bps", "fabric_capacity_bps", "fabric_utilization", "direction_fabrics", "routes", "environments", "workers") if k in metrics}
-    return {k: row.get(k) for k in ("record", "sequence", "wall_start_ns", "wall_end_ns", "wall_duration_ns", "active_start_ns", "active_end_ns", "active_duration_ns", "event_sequence_start", "event_sequence_end") if k in row} | {"state": keep_state, "metrics": keep_metrics, "events": []}
+    route_totals: dict[tuple[int, int, str], float] = {}
+    for item in metrics.get("routes", []):
+        if not isinstance(item, dict):
+            continue
+        key = (
+            int(item.get("environment") or 0),
+            int(item.get("worker") or 0),
+            str(item.get("direction") or ""),
+        )
+        route_totals[key] = route_totals.get(key, 0.0) + float(
+            item.get("average_bps") or 0.0
+        )
+    routes = [
+        {
+            "environment": environment,
+            "worker": worker,
+            "direction": direction,
+            "average_bps": average_bps,
+        }
+        for (environment, worker, direction), average_bps in sorted(
+            route_totals.items()
+        )
+    ]
+    workers = [
+        select(
+            item,
+            (
+                "worker",
+                "average_compiling_slots",
+                "average_input_wait_slots",
+                "average_ready_input_slots",
+                "average_commit_wait_slots",
+                "average_staging_slots",
+            ),
+        )
+        for item in metrics.get("workers", [])
+        if isinstance(item, dict)
+    ]
+    keep_metrics = {
+        "direction_fabrics": metrics.get("direction_fabrics", []),
+        "routes": routes,
+        "workers": workers,
+    }
+    return {
+        k: row.get(k)
+        for k in (
+            "record",
+            "sequence",
+            "wall_start_ns",
+            "wall_end_ns",
+            "wall_duration_ns",
+            "active_start_ns",
+            "active_end_ns",
+            "active_duration_ns",
+            "event_sequence_start",
+            "event_sequence_end",
+        )
+        if k in row
+    } | {"state": keep_state, "metrics": keep_metrics, "events": []}
 
 
-def read_experiment(path: Path, limit: int = MAX_REPORT_SNAPSHOTS) -> tuple[dict[str, object], list[dict[str, object]], dict[str, object]]:
+def read_experiment(
+    path: Path, limit: int = MAX_REPORT_SNAPSHOTS
+) -> tuple[dict[str, object], list[dict[str, object]], dict[str, object]]:
     """Stream an existing canonical JSONL twice; never materialize its full timeline."""
     descriptor: dict[str, object] | None = None
     final: dict[str, object] | None = None
@@ -135,7 +346,8 @@ def read_experiment(path: Path, limit: int = MAX_REPORT_SNAPSHOTS) -> tuple[dict
                 raise ValueError(f"{path}:{line_number}: unknown record {record!r}")
     if descriptor is None or final is None:
         raise ValueError(f"{path}: expected experiment descriptor and summary rows")
-    selected = _selected_ordinals(snapshot_count, limit)
+    adaptive_limit = _adaptive_limit(descriptor, snapshot_count, limit)
+    selected = _selected_ordinals(snapshot_count, adaptive_limit)
     view: list[dict[str, object]] = []
     ordinal = 0
     with path.open(encoding="utf-8") as source:
@@ -143,7 +355,11 @@ def read_experiment(path: Path, limit: int = MAX_REPORT_SNAPSHOTS) -> tuple[dict
             if not line.strip():
                 continue
             row = json.loads(line)
-            if row.get("record") == "gap" or row.get("record") == "snapshot" and ordinal in selected:
+            if (
+                row.get("record") == "gap"
+                or row.get("record") == "snapshot"
+                and ordinal in selected
+            ):
                 view.append(_slim_row(row))
             if row.get("record") == "snapshot":
                 ordinal += 1
@@ -152,12 +368,23 @@ def read_experiment(path: Path, limit: int = MAX_REPORT_SNAPSHOTS) -> tuple[dict
         "source_snapshots": snapshot_count,
         "embedded_records": len(view),
         "embedded_snapshots": len(selected),
-        "snapshot_selection": "all" if snapshot_count <= limit else "evenly spaced including first and last",
+        "requested_max_snapshots": limit,
+        "projection_target_bytes": TARGET_TIMELINE_BYTES,
+        "snapshot_selection": (
+            "all"
+            if snapshot_count <= adaptive_limit
+            else "adaptive evenly spaced selection including first and last"
+        ),
+        "projection_fidelity": "chart-used interval fields plus bounded optional cache/lease/cursor state; exact events, totals, and full state remain in canonical JSONL",
         "all_gap_records_embedded": True,
         "canonical_detail": "experiment.jsonl retains every active-time snapshot and event",
         "source_event_count": accumulator.event_count,
         "embedded_event_count": accumulator.finish()["sampled_events"],
-        "event_sampling": "first and last 250 events" if accumulator.event_count > len(accumulator.first) else "all retained events",
+        "event_sampling": (
+            "first and last 250 events"
+            if accumulator.event_count > len(accumulator.first)
+            else "all retained events"
+        ),
     }
     report_descriptor = json.loads(json.dumps(descriptor))
     report_descriptor["report_view"] = metadata
@@ -165,24 +392,53 @@ def read_experiment(path: Path, limit: int = MAX_REPORT_SNAPSHOTS) -> tuple[dict
     return report_descriptor, view, final
 
 
-def _payload(descriptor: dict[str, object], timeline: Iterable[dict[str, object]], final: dict[str, object]) -> str:
+def _payload(
+    descriptor: dict[str, object],
+    timeline: Iterable[dict[str, object]],
+    final: dict[str, object],
+) -> str:
     payload_descriptor = json.loads(json.dumps(descriptor))
     aggregates = payload_descriptor.pop("dashboard_aggregates", {})
     events = aggregates.pop("events", []) if isinstance(aggregates, dict) else []
-    return json.dumps({"descriptor": payload_descriptor, "timeline": list(timeline), "final": final, "events": events, "aggregates": aggregates}, separators=(",", ":")).replace("</", "<\\/")
+    return json.dumps(
+        {
+            "descriptor": payload_descriptor,
+            "timeline": list(timeline),
+            "final": final,
+            "events": events,
+            "aggregates": aggregates,
+        },
+        separators=(",", ":"),
+    ).replace("</", "<\\/")
 
 
-def render_experiment_html(descriptor: dict[str, object], timeline: list[dict[str, object]], final: dict[str, object], *, compact: bool = True) -> str:
+def render_experiment_html(
+    descriptor: dict[str, object],
+    timeline: list[dict[str, object]],
+    final: dict[str, object],
+    *,
+    compact: bool = True,
+) -> str:
     """Render a rich, self-contained experiment report.
 
     ``timeline`` may already be the bounded writer view.  Direct callers can set
     ``compact=True`` to apply the same bound while preserving all gaps.
     """
     if compact and not descriptor.get("report_view"):
-        events = [event for row in timeline for event in row.get("events", []) if isinstance(event, dict)]
+        events = [
+            event
+            for row in timeline
+            for event in row.get("events", [])
+            if isinstance(event, dict)
+        ]
         sample = events if len(events) <= 250 else events[:250] + events[-250:]
         descriptor = json.loads(json.dumps(descriptor))
-        descriptor["dashboard_aggregates"] = {"event_count": len(events), "events": sample, "sampled_events": len(sample), "event_sample_limit": 500}
+        descriptor["dashboard_aggregates"] = {
+            "event_count": len(events),
+            "events": sample,
+            "sampled_events": len(sample),
+            "event_sample_limit": 500,
+        }
         timeline, report_view = compact_timeline(timeline)
         descriptor["report_view"] = report_view
     elif descriptor.get("report_view"):
@@ -190,34 +446,74 @@ def render_experiment_html(descriptor: dict[str, object], timeline: list[dict[st
         # simulator state, so project it here without reparsing the canonical stream.
         descriptor = json.loads(json.dumps(descriptor))
         if not descriptor.get("dashboard_aggregates"):
-            events = [event for row in timeline for event in row.get("events", []) if isinstance(event, dict)]
+            events = [
+                event
+                for row in timeline
+                for event in row.get("events", [])
+                if isinstance(event, dict)
+            ]
             canonical_event_count = int(final.get("event_count") or len(events))
             sample = events if len(events) <= 250 else events[:250] + events[-250:]
-            descriptor["dashboard_aggregates"] = {"event_count": canonical_event_count, "source_event_count": canonical_event_count, "events": sample, "sampled_events": len(sample), "event_sample_limit": 500, "event_sampling": "embedded report-view events only; regenerate from experiment.jsonl for complete aggregates"}
-            descriptor["report_view"] = {**descriptor.get("report_view", {}), "source_event_count": canonical_event_count, "embedded_event_count": min(len(events), 500), "event_sampling": "embedded report-view events only; regenerate from experiment.jsonl for complete aggregates"}
+            descriptor["dashboard_aggregates"] = {
+                "event_count": canonical_event_count,
+                "source_event_count": canonical_event_count,
+                "events": sample,
+                "sampled_events": len(sample),
+                "event_sample_limit": 500,
+                "event_sampling": "embedded report-view events only; regenerate from experiment.jsonl for complete aggregates",
+            }
+            descriptor["report_view"] = {
+                **descriptor.get("report_view", {}),
+                "source_event_count": canonical_event_count,
+                "embedded_event_count": min(len(events), 500),
+                "event_sampling": "embedded report-view events only; regenerate from experiment.jsonl for complete aggregates",
+            }
         timeline = [_slim_row(row) for row in timeline]
     payload = _payload(descriptor, timeline, final)
     return _template().replace("__PAYLOAD__", payload)
 
 
-def render_experiment_file(source: Path, output: Path, limit: int = MAX_REPORT_SNAPSHOTS) -> None:
+def render_experiment_file(
+    source: Path, output: Path, limit: int = MAX_REPORT_SNAPSHOTS
+) -> None:
+    if not source.is_file():
+        raise ValueError(f"input does not exist or is not a file: {source}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if output.exists() and os.path.samefile(source, output):
+        raise ValueError(f"--out must not alias canonical input {source}")
+    if not output.exists() and source.resolve() == output.resolve():
+        raise ValueError(f"--out must not alias canonical input {source}")
+    validate_experiment_jsonl(source)
     descriptor, timeline, final = read_experiment(source, limit)
-    output.write_text(render_experiment_html(descriptor, timeline, final, compact=False), encoding="utf-8")
+    html = render_experiment_html(descriptor, timeline, final, compact=False)
+    temporary = output.with_name(f".{output.name}.tmp-{os.getpid()}")
+    try:
+        temporary.write_text(html, encoding="utf-8")
+        os.replace(temporary, output)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def _template() -> str:
-    return Path(__file__).with_name("dashboard_template.html").read_text(encoding="utf-8")
+    return (
+        Path(__file__).with_name("dashboard_template.html").read_text(encoding="utf-8")
+    )
+
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Render an offline dashboard from experiment.jsonl")
+    parser = argparse.ArgumentParser(
+        description="Render an offline dashboard from experiment.jsonl"
+    )
     parser.add_argument("experiment_jsonl", type=Path)
-    parser.add_argument("--out", type=Path, help="HTML output (default: alongside JSONL as report.html)")
+    parser.add_argument(
+        "--out", type=Path, help="HTML output (default: alongside JSONL as report.html)"
+    )
     parser.add_argument("--max-snapshots", type=int, default=MAX_REPORT_SNAPSHOTS)
     args = parser.parse_args(argv)
     if args.max_snapshots <= 0:
         parser.error("--max-snapshots must be positive")
     output = args.out or args.experiment_jsonl.with_name("report.html")
-    output.parent.mkdir(parents=True, exist_ok=True)
     render_experiment_file(args.experiment_jsonl, output, args.max_snapshots)
     print(output)
     return 0

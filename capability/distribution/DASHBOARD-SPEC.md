@@ -10,9 +10,11 @@ active-time snapshots and explicit idle gaps, followed by the final summary.
 It has no CDN, fetch, server, or browser extension dependency and works from
 `file://`.
 
-Both implementations use the single checked-in [dashboard_template.html](dashboard_template.html)
-asset.  The Rust crate embeds that asset at build time; the Python simulator path reads the same
-asset at runtime.
+The standalone Rust and Python renderers use the single checked-in
+[dashboard_template.html](dashboard_template.html) asset. The Rust crate embeds
+it at build time and `dashboard.py` reads it at runtime. `run_scenario.py` still
+has its older inline convenience report; use the standalone launcher when a
+canonical bounded dashboard is required.
 
 The canonical standalone regeneration command is the Rust launcher:
 
@@ -29,14 +31,15 @@ compare simulated.jsonl physical.jsonl --out comparison.html
 index   results-root --out index.html
 ```
 
-Each source is contract-checked before output.  Comparison and index pages retain
+Each source is checked by the accepted R4 `validate_experiment.py` boundary
+before output. Comparison and index pages retain
 missing fields as `(missing)` or `not rendered`; they do not estimate values from
 unrelated fields.
 
-The Rust reader uses line-by-line `serde_json`, bounded two-pass selection, and atomic-ish
-temp/rename output.  The Python module is retained for the simulator-integrated path and tests;
-it is not the preferred reader for multi-gigabyte Firefox traces.  The simulator's normal writer
-uses the same renderer without rereading its canonical stream.
+The Rust reader uses line-by-line `serde_json`, bounded two-pass selection, and
+atomic temp/rename output. The Python module is retained as a compatible
+standalone path and for tests; it is not the preferred reader for multi-gigabyte
+Firefox traces.
 
 ## Canonical record contract
 
@@ -58,10 +61,13 @@ those omissions and show the canonical path.
 
 ## Browser projection and fidelity
 
-The HTML embeds at most 2,000 evenly spaced snapshots, always including the first
-and last snapshot, plus every gap.  Snapshot projection retains chart fields,
+The HTML embeds an adaptive, evenly spaced subset of at most 2,000 snapshots,
+always including the first and last snapshot, plus every gap. The adaptive cap
+uses the C/F dimensions and a conservative two-megabyte timeline budget. Snapshot projection retains chart fields,
 worker occupancy, C scheduler counters, route/environment rates and interval
-boundaries; large codec namespace objects are not embedded.  Events are sampled
+boundaries. Optional per-F cache/lease/cursor state is capped at 512 encoded
+bytes per selected F point and carries an explicit truncation marker; large codec
+namespace objects are not embedded. Events are sampled
 as first/last bounded samples (currently 250 each) and the page exposes source and
 embedded counts.  Standalone generation computes complete phase, build and
 terminal aggregates while streaming; these aggregates are not inferred from the
@@ -131,20 +137,22 @@ low single-digit megabytes, not proportional to the 2+ GB JSONL).
 6. Suite report links remain relative and valid.
 7. `cargo test --manifest-path capability/distribution/dashboard-rs/Cargo.toml` passes.
 
-## Rust Firefox benchmark
+## Rust C1F20 projection benchmark
 
-On the retained 2,193,342,979-byte Firefox C1F20 raw trace, using the already-built release
-binary and `--max-snapshots 2000`:
+The independent review's deterministic 227,459,255-byte C1F20 shape has 10,000
+realistic snapshots, 20 F state rows, 20 worker metric rows, and both route
+directions for every F. The corrected release projection measured:
 
 ```text
-wall:       27.70 s
-throughput: 79.2 MB/s (decimal input bytes / wall time)
-max RSS:    168,640 KB (approximately 164.7 MiB)
-HTML:       46,521,169 bytes
-events:     1,663,080 aggregated
+wall:                 3.79 s
+maximum RSS:          6,356 KiB
+embedded snapshots:  213 / 10,000
+HTML:                 1,551,730 bytes
+SHA-256:              543f0f4a8587b90f9533cd0bce41a47293fee6ba5f4b4306c7a3674dc27ec2f6
 ```
 
-The measurement used `/usr/bin/time -v`; release compilation was performed separately and is not
-included in the wall time.  The renderer projects only bounded state and route-rate points;
-the canonical JSONL remains unchanged.  The retained R4 fixture renders below 100 KB and the
-large-stream gate requires projected HTML to remain below 5 MB.
+The measurement ran the already-built release test executable under
+`/usr/bin/time -v`; compilation was excluded. This synthetic shape exercises
+projection size only and is not accepted as canonical experiment evidence. The
+normal CLI separately requires the authoritative R4 validator. The retained R4
+fixture renders to 84,554 bytes, and the large-stream gate is five megabytes.
