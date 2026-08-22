@@ -114,6 +114,13 @@ CompilerInputWriteResult LegacyChunkSource::write_pending(int compiler_stdin_fd)
         discard_pending();
         return CompilerInputWriteResult::Failed;
     }
+    if (bytes == 0) {
+        // A nonempty pending chunk must make progress or fail.  Returning
+        // Pending here would leave work_it in a writable-poll busy loop with
+        // an unchanged offset.
+        discard_pending();
+        return CompilerInputWriteResult::Failed;
+    }
 
     offset_ += static_cast<std::size_t>(bytes);
     if (offset_ == pending_->len) {

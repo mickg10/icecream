@@ -215,10 +215,49 @@ void test_send_error_closes_fd()
         REQUIRE(false, "closed peer raises client_error");
     } catch (const client_error &error) {
         REQUIRE(error.errorCode == 15, "send error retains legacy error code 15");
+        REQUIRE(errno == EPIPE, "ordinary send error retains the write errno");
     }
     REQUIRE(fcntl(fd, F_GETFD) == -1 && errno == EBADF,
             "send error retains legacy descriptor closure");
+    REQUIRE(!pair.sender->take_error_status(),
+            "ordinary send error does not invent a terminal status");
     delete pair.sender;
+}
+
+void test_status_response_during_send_failure_closes_fd(const std::string &status)
+{
+    ChannelPair pair = make_channel_pair();
+    REQUIRE(pair.receiver->send_msg(StatusTextMsg(status)),
+            "peer queues a terminal STATUS_TEXT before refusing source bytes");
+    REQUIRE(shutdown(pair.receiver->fd, SHUT_RD) == 0,
+            "peer refuses subsequent source bytes while retaining its response stream");
+
+    LegacyRemoteSink sink(pair.sender);
+    const int fd = input_fd(input_bytes(1));
+    try {
+        sink.send_fd(fd);
+        REQUIRE(false, "terminal STATUS_TEXT raises client_error");
+    } catch (const client_error &error) {
+        REQUIRE(error.errorCode == 23,
+                "terminal STATUS_TEXT retains legacy remote-status error code 23");
+        const std::string expected = "Error 23 - Remote status (compiled on "
+                                     + pair.sender->name + ")\n" + status;
+        REQUIRE(error.what() == expected,
+                "terminal STATUS_TEXT preserves its exact text");
+    }
+    REQUIRE(fcntl(fd, F_GETFD) == -1 && errno == EBADF,
+            "terminal STATUS_TEXT cannot bypass owned descriptor closure");
+    REQUIRE(!pair.sender->take_error_status(),
+            "legacy sink consumes the retained terminal status exactly once");
+
+    delete pair.sender;
+    delete pair.receiver;
+}
+
+void test_status_responses_during_send_failure()
+{
+    test_status_response_during_send_failure_closes_fd("remote rejected source");
+    test_status_response_during_send_failure_closes_fd("");
 }
 
 }
@@ -228,5 +267,6 @@ int main()
     test_boundaries_and_empty_input();
     test_read_error_closes_fd();
     test_send_error_closes_fd();
+    test_status_responses_during_send_failure();
     return failures == 0 ? 0 : 1;
 }
