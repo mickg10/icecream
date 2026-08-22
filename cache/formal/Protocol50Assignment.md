@@ -111,6 +111,12 @@ proof and let a released assignment claim again.  The epoch-reuse mutant keeps
 the old epoch across link loss and is required to violate
 `SameEpochRevocationSafety`.
 
+`LoseSchedulerLink` is specifically the destructive-retirement transition.
+A product transport reconnect that preserves the complete bounded assignment,
+tombstone, and outcome table is a stuttering/rebind refinement and may retain
+the same epoch.  If any of that table is cleared, the epoch must be retired and
+the next configuration must use a different nonzero epoch.
+
 Accepted results and their per-assignment attempt counts outlive scheduler-link
 loss together.  Resetting only the count would leave an accepted result without
 the authorization history that justifies it.
