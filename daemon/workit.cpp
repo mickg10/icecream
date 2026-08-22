@@ -23,6 +23,7 @@
 
 #include "config.h"
 #include "workit.h"
+#include "compiler_input.h"
 #include "tempfile.h"
 #include "assert.h"
 #include "exitcode.h"
@@ -429,62 +430,48 @@ int work_it(CompileJob &j, unsigned int job_stat[], MsgChannel *client, CompileR
     gettimeofday(&starttv, nullptr);
 
     int return_value = 0;
-    // Got EOF for preprocessed input. stdout send may be still pending.
-    bool input_complete = false;
-    // Pending data to send to stdin
-    FileChunkMsg *fcmsg = nullptr;
-    size_t off = 0;
+    // R6 deliberately selects only the legacy FileChunk/End source.  Compiler
+    // process, result, and output lifecycles remain in this single loop.
+    LegacyChunkSource legacy_input(client, client_fd);
+    CompilerInputSource &input = legacy_input;
 
     log_block parent_wait("parent, waiting");
 
     for (;;) {
-        if (client_fd >= 0 && !fcmsg) {
-            if (Msg *msg = client->get_msg(0, true)) {
-                if (input_complete) {
-                    rmsg.err.append("client cancelled\n");
-                    return_value = EXIT_CLIENT_KILLED;
-                    client_fd = -1;
-                    kill(pid, SIGTERM);
-                    delete fcmsg;
-                    fcmsg = nullptr;
-                    delete msg;
-                } else {
-                    if (*msg == Msg::END) {
-                        input_complete = true;
-
-                        if (!fcmsg && sock_in[1] != -1) {
-                            if (-1 == close(sock_in[1])){
-                                log_perror("close failed");
-                            }
-                            sock_in[1] = -1;
-                        }
-
-                        delete msg;
-                    } else if (*msg == Msg::FILE_CHUNK) {
-                        fcmsg = static_cast<FileChunkMsg*>(msg);
-                        off = 0;
-
-                        job_stat[JobStatistics::in_uncompressed] += fcmsg->len;
-                        job_stat[JobStatistics::in_compressed] += fcmsg->compressed;
-                    } else {
-                        log_error() << "protocol error while reading preprocessed file" << endl;
-                        input_complete = true;
-                        return_value = EXIT_IO_ERROR;
-                        client_fd = -1;
-                        kill(pid, SIGTERM);
-                        delete fcmsg;
-                        fcmsg = nullptr;
-                        delete msg;
-                    }
-                }
-            } else if (client->at_eof()) {
-                log_warning() << "unexpected EOF while reading preprocessed file" << endl;
-                input_complete = true;
-                return_value = EXIT_IO_ERROR;
-                client_fd = -1;
+        if (input.poll_fd() >= 0 && !input.has_pending()) {
+            switch (input.read_next(job_stat)) {
+            case CompilerInputReadResult::MessageAfterEnd:
+                rmsg.err.append("client cancelled\n");
+                return_value = EXIT_CLIENT_KILLED;
+                input.disable();
                 kill(pid, SIGTERM);
-                delete fcmsg;
-                fcmsg = nullptr;
+                input.discard_pending();
+                break;
+            case CompilerInputReadResult::End:
+                if (!input.has_pending() && sock_in[1] != -1) {
+                    if (-1 == close(sock_in[1])) {
+                        log_perror("close failed");
+                    }
+                    sock_in[1] = -1;
+                }
+                break;
+            case CompilerInputReadResult::UnexpectedMessage:
+                log_error() << "protocol error while reading preprocessed file" << endl;
+                return_value = EXIT_IO_ERROR;
+                input.disable();
+                kill(pid, SIGTERM);
+                input.discard_pending();
+                break;
+            case CompilerInputReadResult::UnexpectedEof:
+                log_warning() << "unexpected EOF while reading preprocessed file" << endl;
+                return_value = EXIT_IO_ERROR;
+                input.disable();
+                kill(pid, SIGTERM);
+                input.discard_pending();
+                break;
+            case CompilerInputReadResult::Chunk:
+            case CompilerInputReadResult::NoMessage:
+                break;
             }
         }
 
@@ -503,18 +490,17 @@ int work_it(CompileJob &j, unsigned int job_stat[], MsgChannel *client, CompileR
             pollfds.push_back(pfd);
         }
 
-        if (sock_in[1] == -1 && fcmsg) {
+        if (sock_in[1] == -1 && input.has_pending()) {
             // This state can occur when the compiler has terminated before
             // all file input is received from the client.  The daemon must continue
             // reading all file input from the client because the client expects it to.
             // Deleting the file chunk message here tricks the poll() below to continue
             // listening for more file data from the client even though it is being
             // thrown away.
-            delete fcmsg;
-            fcmsg = nullptr;
+            input.discard_pending();
         }
-        if (client_fd >= 0 && !fcmsg) {
-            pfd.fd = client_fd;
+        if (input.poll_fd() >= 0 && !input.has_pending()) {
+            pfd.fd = input.poll_fd();
             pfd.events = POLLIN;
             pollfds.push_back(pfd);
             // Note that we don't actually query the status of this fd -
@@ -528,7 +514,7 @@ int work_it(CompileJob &j, unsigned int job_stat[], MsgChannel *client, CompileR
         // client had time to write all of the file data and wait for a response.
         // The client isn't coded to properly handle the closing of the socket while
         // sending all file data to the daemon.
-        if (input_complete) {
+        if (input.complete()) {
             pfd.fd = death_pipe[0];
             pfd.events = POLLIN;
             pollfds.push_back(pfd);
@@ -536,25 +522,24 @@ int work_it(CompileJob &j, unsigned int job_stat[], MsgChannel *client, CompileR
 
         // Don't try to write to sock_in it if was already closed because
         // the compile terminated before reading all of the file data.
-        if (fcmsg && sock_in[1] != -1) {
+        if (input.has_pending() && sock_in[1] != -1) {
             pfd.fd = sock_in[1];
             pfd.events = POLLOUT;
             pollfds.push_back(pfd);
         }
 
-        int timeout = input_complete ? -1 : 60 * 1000;
+        int timeout = input.complete() ? -1 : 60 * 1000;
 
         switch (poll(pollfds.data(), pollfds.size(), timeout)) {
         case 0:
 
-            if (!input_complete) {
+            if (!input.complete()) {
                 log_warning() << "timeout while reading preprocessed file" << endl;
                 kill(pid, SIGTERM); // Won't need it any more ...
                 return_value = EXIT_IO_ERROR;
-                client_fd = -1;
-                input_complete = true;
-                delete fcmsg;
-                fcmsg = nullptr;
+                input.disable();
+                input.mark_complete();
+                input.discard_pending();
                 continue;
             }
 
@@ -572,39 +557,28 @@ int work_it(CompileJob &j, unsigned int job_stat[], MsgChannel *client, CompileR
             return EXIT_DISTCC_FAILED;
         default:
 
-            if (fcmsg && pollfd_is_set(pollfds, sock_in[1], POLLOUT)) {
-                ssize_t bytes = write(sock_in[1], fcmsg->buffer + off, fcmsg->len - off);
-
-                if (bytes < 0) {
-                    if (errno == EINTR) {
-                        continue;
-                    }
-
+            if (input.has_pending() && pollfd_is_set(pollfds, sock_in[1], POLLOUT)) {
+                const CompilerInputWriteResult write_result = input.write_pending(sock_in[1]);
+                if (write_result == CompilerInputWriteResult::Interrupted) {
+                    continue;
+                }
+                if (write_result == CompilerInputWriteResult::Failed) {
                     kill(pid, SIGTERM); // Most likely crashed anyway ...
-                    if (input_complete) {
+                    if (input.complete()) {
                         return_value = EXIT_COMPILER_CRASHED;
                     }
-                    delete fcmsg;
-                    fcmsg = nullptr;
-                    if (-1 == close(sock_in[1])){
+                    if (-1 == close(sock_in[1])) {
                         log_perror("close failed");
                     }
                     sock_in[1] = -1;
                     continue;
                 }
-
-                off += bytes;
-
-                if (off == fcmsg->len) {
-                    delete fcmsg;
-                    fcmsg = nullptr;
-
-                    if (input_complete) {
-                        if (-1 == close(sock_in[1])){
-                            log_perror("close failed");
-                        }
-                        sock_in[1] = -1;
+                if (write_result == CompilerInputWriteResult::ChunkComplete
+                        && input.complete()) {
+                    if (-1 == close(sock_in[1])) {
+                        log_perror("close failed");
                     }
+                    sock_in[1] = -1;
                 }
             }
 

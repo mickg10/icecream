@@ -35,7 +35,9 @@
 
 #include "job.h"
 #include <deque>
+#include <optional>
 #include <stdint.h>
+#include <string>
 
 // if you increase the PROTOCOL_VERSION, add a macro below and use that
 #define PROTOCOL_VERSION 50
@@ -304,6 +306,12 @@ public:
     // false <--> error (msg not send)
     bool send_msg(const Msg &, int SendFlags = SendBlocking);
 
+    // Consume the one terminal STATUS_TEXT, if any, that set_error() fetched
+    // while the channel was still readable.  Presence is independent of the
+    // text being nonempty.  This moves a bounded value out of the channel,
+    // clears the slot, and never reads from or changes the ERROR channel.
+    std::optional<std::string> take_error_status();
+
     // True if a previous send left bytes queued in the write buffer (a
     // SendDeferrable send that ran into backpressure, or a message so far only
     // collected by SendBulkOnly).
@@ -470,6 +478,7 @@ private:
     struct sockaddr *addr;
     socklen_t addr_len;
     bool set_error_recursion;
+    std::optional<std::string> error_status;
 };
 
 // just convenient functions to create MsgChannels

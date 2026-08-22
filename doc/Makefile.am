@@ -39,4 +39,6 @@ EXTRA_DIST = \
 	icecream.adoc \
 	p49-assignment-fence.md \
 	issue16-p50-assignment-convergence.md \
-	p50-assignment-identity.md
+	issue16-foundations-convergence.md \
+	p50-assignment-identity.md \
+	r6-input-attachment-seams.md
