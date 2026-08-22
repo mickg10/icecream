@@ -21,12 +21,50 @@
 
 #include <cerrno>
 #include <cstddef>
+#include <memory>
 #include <unistd.h>
 
 namespace
 {
 
 constexpr std::size_t LegacyChunkSize = 100000;
+
+class OwnedInputFd
+{
+public:
+    explicit OwnedInputFd(int fd)
+        : fd_(fd)
+    {
+    }
+
+    ~OwnedInputFd()
+    {
+        close_now();
+    }
+
+    OwnedInputFd(const OwnedInputFd &) = delete;
+    OwnedInputFd &operator=(const OwnedInputFd &) = delete;
+
+    int get() const
+    {
+        return fd_;
+    }
+
+    void close_now()
+    {
+        if (fd_ < 0) {
+            return;
+        }
+        const int fd = fd_;
+        fd_ = -1;
+        if (close(fd) == -1 && errno != EBADF) {
+            log_perror("close failed");
+        }
+    }
+
+private:
+    int fd_;
+};
 
 void check_for_failure(Msg *msg, MsgChannel *channel)
 {
@@ -47,6 +85,7 @@ LegacyRemoteSink::LegacyRemoteSink(MsgChannel *channel)
 
 void LegacyRemoteSink::send_fd(int fd)
 {
+    OwnedInputFd input(fd);
     unsigned char buffer[LegacyChunkSize];
     off_t offset = 0;
     std::size_t uncompressed = 0;
@@ -56,7 +95,7 @@ void LegacyRemoteSink::send_fd(int fd)
         ssize_t bytes;
 
         do {
-            bytes = read(fd, buffer + offset, sizeof(buffer) - offset);
+            bytes = read(input.get(), buffer + offset, sizeof(buffer) - offset);
 
             if (bytes < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
                 continue;
@@ -64,7 +103,6 @@ void LegacyRemoteSink::send_fd(int fd)
 
             if (bytes < 0) {
                 log_perror("write_fd_to_server() reading from fd");
-                close(fd);
                 throw client_error(16, "Error 16 - error reading local file");
             }
 
@@ -78,13 +116,14 @@ void LegacyRemoteSink::send_fd(int fd)
                 FileChunkMsg fcmsg(buffer, offset);
 
                 if (!channel_->send_msg(fcmsg)) {
-                    Msg *m = channel_->get_msg(2);
-                    check_for_failure(m, channel_);
+                    const int send_errno = errno;
+                    std::unique_ptr<Msg> response(channel_->get_msg(2));
+                    check_for_failure(response.get(), channel_);
 
+                    errno = send_errno;
                     log_error() << "write of source chunk to host "
                                 << channel_->name.c_str() << std::endl;
                     log_perror("failed ");
-                    close(fd);
                     throw client_error(15, "Error 15 - write to host failed");
                 }
 
@@ -102,10 +141,6 @@ void LegacyRemoteSink::send_fd(int fd)
     if (compressed) {
         trace() << "sent " << compressed << " bytes (" << (compressed * 100 / uncompressed)
                 << "%)" << std::endl;
-    }
-
-    if ((-1 == close(fd)) && (errno != EBADF)) {
-        log_perror("close failed");
     }
 }
 
