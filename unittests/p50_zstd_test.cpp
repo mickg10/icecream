@@ -127,7 +127,22 @@ void test_single_frame_exactness() {
         [&] {
             (void)decode_zstd_tu(concatenated_begin, concatenated, limits());
         },
-        "concatenated second Zstd frame was accepted");
+        "concatenated empty Zstd frame was accepted");
+
+    const ZstdTuEnvelope nonempty_frame = encode_zstd_tu(
+        HistoryNonce{1}, RelSeq{2}, TuSeq{4}, icecc::digest128("pre3"),
+        std::array<uint8_t, 1>{0x5a});
+    concatenated = envelope.body;
+    concatenated.insert(concatenated.end(), nonempty_frame.body.begin(),
+                        nonempty_frame.body.end());
+    const TxBegin nonempty_concatenated_begin =
+        describe_modified_body(envelope.begin, concatenated);
+    require_throws<std::invalid_argument>(
+        [&] {
+            (void)decode_zstd_tu(nonempty_concatenated_begin, concatenated,
+                                 limits());
+        },
+        "concatenated nonempty Zstd frame was accepted");
 
     std::vector<uint8_t> malformed{1, 2, 3, 4, 5, 6};
     const TxBegin malformed_begin =

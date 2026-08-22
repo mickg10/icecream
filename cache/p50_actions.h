@@ -26,6 +26,7 @@ enum class ActionType : uint8_t {
     COMMIT_ACCEPTED,
     ACTIVE_REPLAYED,
     LOST_COMMIT_ACCEPTED,
+    F_STORE_INCAR_REPLACED,
 };
 
 std::string_view action_name(ActionType action);
@@ -38,6 +39,7 @@ struct ActionRecord {
     ActorSide actor = ActorSide::F;
     CStoreGuid c_store_guid{};
     FStoreGuid f_store_guid{};
+    FStoreGuid previous_f_store_guid{};
     uint64_t session_serial = 0;
     HistoryNonce history_nonce{};
     RelSeq rel_seq{};

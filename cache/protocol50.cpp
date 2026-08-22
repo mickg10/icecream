@@ -36,9 +36,10 @@ bool valid_root_mode(ProfileId profile, P29RootMode mode) {
 }
 
 void validate_limits(const SessionLimits& limits) {
-    if (limits.max_frame_payload == 0 ||
+    if (limits.max_frame_payload < kMandatoryControlFramePayload ||
         limits.max_frame_payload > kInitialMaxFramePayload)
-        throw std::invalid_argument("session frame cap is outside the V1 range");
+        throw std::invalid_argument(
+            "session frame cap cannot carry every mandatory V1 control frame");
     if (limits.max_fill_record_bytes < 32)
         throw std::invalid_argument("session FILL-record cap is smaller than its prefix");
 }
@@ -52,10 +53,10 @@ void validate_hello(const SessionHello& hello) {
 }
 
 void validate_session_state_intrinsic(const SessionState& state) {
-    if (state.selected_protocol != kProtocolVersion ||
-        !known_profile(state.selected_profile))
+    if (state.selected_protocol != kProtocolVersion || state.negotiated_profiles == 0 ||
+        (state.negotiated_profiles & ~kKnownProfileMask) != 0)
         throw std::invalid_argument(
-            "SESSION_STATE selected an unimplemented protocol or profile");
+            "SESSION_STATE selected an unimplemented protocol or profile mask");
     validate_limits(state.limits);
     if (state.route_present && !state.namespace_present)
         throw std::invalid_argument("SESSION_STATE route lacks its C namespace");
@@ -272,10 +273,10 @@ void validate_session_state(const SessionHello& hello,
         hello.max_protocol < kProtocolVersion)
         throw std::invalid_argument(
             "SESSION_STATE did not select implemented Protocol 50");
-    if ((hello.supported_profiles &
-         profile_bit(received_state.selected_profile)) == 0)
+    if ((received_state.negotiated_profiles & hello.supported_profiles) !=
+        received_state.negotiated_profiles)
         throw std::invalid_argument(
-            "SESSION_STATE profile was outside the client offer");
+            "SESSION_STATE profiles were outside the client offer");
     if (received_state.limits.max_frame_payload >
         hello.limits.max_frame_payload)
         throw std::invalid_argument(
@@ -302,19 +303,9 @@ SessionSelection negotiate_session(const SessionHello& hello,
         throw std::invalid_argument(
             "peers do not both implement Protocol 50");
 
-    const uint32_t common = hello.supported_profiles & server_profiles;
-    ProfileId selected{};
-    bool found = false;
-    for (ProfileId candidate : {ProfileId::P29, ProfileId::ZSTD_TU,
-                                ProfileId::GRZ}) {
-        if (common & profile_bit(candidate)) {
-            selected = candidate;
-            found = true;
-            break;
-        }
-    }
-    if (!found) throw std::invalid_argument("session profiles do not overlap");
-    return {kProtocolVersion, selected,
+    const uint32_t common = hello.supported_profiles & server_profiles & kKnownProfileMask;
+    if (common == 0) throw std::invalid_argument("session profiles do not overlap");
+    return {kProtocolVersion, common,
             {std::min(hello.limits.max_frame_payload,
                       server_limits.max_frame_payload),
              std::min(hello.limits.max_fill_record_bytes,
@@ -407,7 +398,7 @@ std::vector<uint8_t> encode_payload(const Message& message) {
         } else if constexpr (std::is_same_v<T, SessionState>) {
             validate_session_state_intrinsic(value);
             out.u16(value.selected_protocol);
-            out.u16(static_cast<uint16_t>(value.selected_profile));
+            out.u32(value.negotiated_profiles);
             out.u32(value.limits.max_frame_payload);
             out.u64(value.limits.max_fill_record_bytes);
             out.id(value.f_store_guid);
@@ -469,7 +460,7 @@ Message decode_payload(MessageType type, std::span<const uint8_t> payload) {
     case MessageType::SESSION_STATE: {
         SessionState value;
         value.selected_protocol = in.u16();
-        value.selected_profile = static_cast<ProfileId>(in.u16());
+        value.negotiated_profiles = in.u32();
         value.limits.max_frame_payload = in.u32();
         value.limits.max_fill_record_bytes = in.u64();
         value.f_store_guid = in.id();
@@ -539,6 +530,23 @@ std::array<uint8_t, 4> encode_frame_header(MessageType type, uint32_t payload_by
             static_cast<uint8_t>(word >> 8), static_cast<uint8_t>(word)};
 }
 
+FrameHeader decode_frame_header(std::span<const uint8_t> header,
+                                uint32_t max_payload) {
+    if (header.size() != 4)
+        throw std::invalid_argument("Protocol-50 frame header is not four bytes");
+    if (max_payload == 0 || max_payload > kInitialMaxFramePayload)
+        throw std::invalid_argument("frame cap is outside the initial Protocol-50 range");
+    const uint32_t word = (uint32_t(header[0]) << 24) |
+                          (uint32_t(header[1]) << 16) |
+                          (uint32_t(header[2]) << 8) | uint32_t(header[3]);
+    const MessageType type = static_cast<MessageType>(word >> 24);
+    const uint32_t payload_bytes = word & 0x00ffffffU;
+    if (!known_message_type(type)) throw std::invalid_argument("unknown frame type");
+    if (payload_bytes > max_payload)
+        throw std::length_error("frame payload exceeds configured cap");
+    return {type, payload_bytes};
+}
+
 std::vector<uint8_t> encode_frame(const Message& message) {
     std::vector<uint8_t> payload = encode_payload(message);
     if (payload.size() > std::numeric_limits<uint32_t>::max())
@@ -563,18 +571,11 @@ std::vector<Frame> FrameParser::feed(std::span<const uint8_t> bytes) {
     std::vector<Frame> frames;
     size_t consumed = 0;
     while (buffer_.size() - consumed >= 4) {
-        const uint32_t word = (uint32_t(buffer_[consumed]) << 24) |
-                              (uint32_t(buffer_[consumed + 1]) << 16) |
-                              (uint32_t(buffer_[consumed + 2]) << 8) |
-                              uint32_t(buffer_[consumed + 3]);
-        const MessageType type = static_cast<MessageType>(word >> 24);
-        const uint32_t payload_size = word & 0x00ffffffU;
-        if (!known_message_type(type)) throw std::invalid_argument("unknown frame type");
-        if (payload_size > max_payload_)
-            throw std::length_error("frame payload exceeds configured cap");
-        const size_t frame_size = 4 + static_cast<size_t>(payload_size);
+        const FrameHeader header = decode_frame_header(
+            std::span<const uint8_t>(buffer_).subspan(consumed, 4), max_payload_);
+        const size_t frame_size = 4 + static_cast<size_t>(header.payload_bytes);
         if (buffer_.size() - consumed < frame_size) break;
-        frames.push_back({type,
+        frames.push_back({header.type,
                           std::vector<uint8_t>(buffer_.begin() + consumed + 4,
                                                buffer_.begin() + consumed + frame_size)});
         consumed += frame_size;

@@ -60,22 +60,63 @@ const void* readable_data(std::span<const uint8_t> bytes,
 
 }  // namespace
 
-ZstdTuEnvelope encode_zstd_tu(HistoryNonce history_nonce, RelSeq rel_seq,
-                              TuSeq tu_seq, Digest128 pre_state_digest,
-                              std::span<const uint8_t> exact_input,
-                              int compression_level) {
+struct ZstdTuCodec::Contexts {
+    Contexts() : compress(ZSTD_createCCtx()), decompress(ZSTD_createDCtx()) {
+        if (!compress || !decompress) {
+            ZSTD_freeCCtx(compress);
+            ZSTD_freeDCtx(decompress);
+            throw std::bad_alloc();
+        }
+    }
+
+    ~Contexts() {
+        ZSTD_freeCCtx(compress);
+        ZSTD_freeDCtx(decompress);
+    }
+
+    ZSTD_CCtx* compress = nullptr;
+    ZSTD_DCtx* decompress = nullptr;
+};
+
+ZstdTuCodec::ZstdTuCodec(int compression_level)
+    : compression_level_(compression_level), contexts_(std::make_unique<Contexts>()) {
+    if (compression_level < ZSTD_minCLevel() ||
+        compression_level > ZSTD_maxCLevel())
+        throw std::invalid_argument("ZSTD_TU compression level is outside Zstd's range");
+}
+
+ZstdTuCodec::~ZstdTuCodec() = default;
+
+ZstdTuEnvelope ZstdTuCodec::encode(HistoryNonce history_nonce, RelSeq rel_seq,
+                                   TuSeq tu_seq, Digest128 pre_state_digest,
+                                   std::span<const uint8_t> exact_input,
+                                   ZstdTuLimits limits) {
+    validate_limits(limits);
     if (rel_seq.value == std::numeric_limits<uint64_t>::max())
         throw std::overflow_error("ZSTD_TU cannot encode terminal REL_SEQ");
+    if (exact_input.size() > limits.max_raw_bytes)
+        throw std::length_error("ZSTD_TU raw input exceeds the local cap");
 
     const size_t bound = ZSTD_compressBound(exact_input.size());
     if (ZSTD_isError(bound)) throw_zstd("ZSTD_compressBound", bound);
 
-    std::vector<uint8_t> encoded(bound);
+    const size_t capacity = std::min(
+        bound, static_cast<size_t>(std::min<uint64_t>(
+                   limits.max_encoded_body_bytes,
+                   std::numeric_limits<size_t>::max())));
+    std::vector<uint8_t> encoded(capacity);
     const uint8_t scratch = 0;
-    const size_t compressed = ZSTD_compress(
+    const size_t compressed = ZSTD_compressCCtx(
+        contexts_->compress,
         encoded.data(), encoded.size(), readable_data(exact_input, scratch),
-        exact_input.size(), compression_level);
-    if (ZSTD_isError(compressed)) throw_zstd("ZSTD_compress", compressed);
+        exact_input.size(), compression_level_);
+    if (ZSTD_isError(compressed)) {
+        if (bound > limits.max_encoded_body_bytes)
+            throw std::length_error("ZSTD_TU encoded BODY exceeds the local cap");
+        throw_zstd("ZSTD_compress", compressed);
+    }
+    if (compressed > limits.max_encoded_body_bytes)
+        throw std::length_error("ZSTD_TU encoded BODY exceeds the local cap");
     encoded.resize(compressed);
 
     ZstdTuEnvelope result;
@@ -96,9 +137,22 @@ ZstdTuEnvelope encode_zstd_tu(HistoryNonce history_nonce, RelSeq rel_seq,
     return result;
 }
 
-std::vector<uint8_t> decode_zstd_tu(const TxBegin& begin,
-                                    std::span<const uint8_t> encoded_body,
-                                    ZstdTuLimits limits) {
+ZstdTuEnvelope encode_zstd_tu(HistoryNonce history_nonce, RelSeq rel_seq,
+                              TuSeq tu_seq, Digest128 pre_state_digest,
+                              std::span<const uint8_t> exact_input,
+                              int compression_level, ZstdTuLimits limits) {
+    ZstdTuCodec codec(compression_level);
+    return codec.encode(history_nonce, rel_seq, tu_seq, pre_state_digest,
+                        exact_input, limits);
+}
+
+void validate_zstd_tu_begin(const TxBegin& begin, ZstdTuLimits limits) {
+    validate_begin_shape(begin, limits);
+}
+
+std::vector<uint8_t> ZstdTuCodec::decode(const TxBegin& begin,
+                                         std::span<const uint8_t> encoded_body,
+                                         ZstdTuLimits limits) {
     validate_begin_shape(begin, limits);
     if (encoded_body.size() != begin.body.encoded_bytes)
         throw std::invalid_argument("ZSTD_TU BODY length differs from TX_BEGIN");
@@ -108,9 +162,9 @@ std::vector<uint8_t> decode_zstd_tu(const TxBegin& begin,
                                    encoded_body) != begin.transaction_digest)
         throw std::invalid_argument("ZSTD_TU transaction digest differs");
 
-    using DctxPtr = std::unique_ptr<ZSTD_DCtx, decltype(&ZSTD_freeDCtx)>;
-    DctxPtr dctx(ZSTD_createDCtx(), &ZSTD_freeDCtx);
-    if (!dctx) throw std::bad_alloc();
+    const size_t initialized = ZSTD_initDStream(contexts_->decompress);
+    if (ZSTD_isError(initialized))
+        throw_zstd("ZSTD_initDStream", initialized);
 
     std::vector<uint8_t> output(static_cast<size_t>(begin.raw_bytes));
     uint8_t output_scratch = 0;
@@ -126,7 +180,7 @@ std::vector<uint8_t> decode_zstd_tu(const TxBegin& begin,
         const size_t previous_input = input_buffer.pos;
         const size_t previous_output = output_buffer.pos;
         remaining = ZSTD_decompressStream(
-            dctx.get(), &output_buffer, &input_buffer);
+            contexts_->decompress, &output_buffer, &input_buffer);
         if (ZSTD_isError(remaining))
             throw_zstd("ZSTD_decompressStream", remaining);
         if (remaining != 0 && output_buffer.pos == output_buffer.size)
@@ -145,6 +199,13 @@ std::vector<uint8_t> decode_zstd_tu(const TxBegin& begin,
     if (icecc::digest128(output) != begin.raw_digest)
         throw std::invalid_argument("ZSTD_TU raw input digest differs");
     return output;
+}
+
+std::vector<uint8_t> decode_zstd_tu(const TxBegin& begin,
+                                    std::span<const uint8_t> encoded_body,
+                                    ZstdTuLimits limits) {
+    ZstdTuCodec codec;
+    return codec.decode(begin, encoded_body, limits);
 }
 
 ZstdTuDialogue::ZstdTuDialogue(uint32_t negotiated_profiles,
@@ -207,7 +268,7 @@ std::vector<uint8_t> ZstdTuDialogue::materialize() {
     if (state_ != State::BodyClosed || !active_)
         throw std::logic_error("ZSTD_TU materialized before BODY closure");
     try {
-        std::vector<uint8_t> result = decode_zstd_tu(*active_, body_, limits_);
+        std::vector<uint8_t> result = codec_.decode(*active_, body_, limits_);
         state_ = State::Materialized;
         return result;
     } catch (...) {

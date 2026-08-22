@@ -4,6 +4,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
+#include <memory>
 #include <optional>
 #include <span>
 #include <vector>
@@ -26,10 +28,36 @@ struct ZstdTuEnvelope {
     auto operator<=>(const ZstdTuEnvelope&) const = default;
 };
 
+class ZstdTuCodec {
+public:
+    explicit ZstdTuCodec(int compression_level = 1);
+    ~ZstdTuCodec();
+    ZstdTuCodec(const ZstdTuCodec&) = delete;
+    ZstdTuCodec& operator=(const ZstdTuCodec&) = delete;
+
+    ZstdTuEnvelope encode(HistoryNonce history_nonce, RelSeq rel_seq,
+                          TuSeq tu_seq, Digest128 pre_state_digest,
+                          std::span<const uint8_t> exact_input,
+                          ZstdTuLimits limits);
+    std::vector<uint8_t> decode(const TxBegin& begin,
+                                std::span<const uint8_t> encoded_body,
+                                ZstdTuLimits limits);
+
+private:
+    struct Contexts;
+    int compression_level_ = 1;
+    std::unique_ptr<Contexts> contexts_;
+};
+
 ZstdTuEnvelope encode_zstd_tu(HistoryNonce history_nonce, RelSeq rel_seq,
                               TuSeq tu_seq, Digest128 pre_state_digest,
                               std::span<const uint8_t> exact_input,
-                              int compression_level = 1);
+                              int compression_level = 1,
+                              ZstdTuLimits limits = {
+                                  std::numeric_limits<uint64_t>::max(),
+                                  std::numeric_limits<uint64_t>::max()});
+
+void validate_zstd_tu_begin(const TxBegin& begin, ZstdTuLimits limits);
 
 std::vector<uint8_t> decode_zstd_tu(const TxBegin& begin,
                                     std::span<const uint8_t> encoded_body,
@@ -83,6 +111,7 @@ private:
 
     uint32_t negotiated_profiles_ = 0;
     ZstdTuLimits limits_{};
+    ZstdTuCodec codec_{};
     State state_ = State::Idle;
     std::optional<TxBegin> active_;
     std::vector<uint8_t> body_;
