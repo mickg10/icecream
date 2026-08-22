@@ -14,6 +14,12 @@ libprotocol50_a_SOURCES = \
 
 AM_CPPFLAGS = -I$(top_srcdir) $(LIBZSTD_CFLAGS)
 
+# The accepted P48 baseline restores global CPPFLAGS after its Boost probe.
+# Protocol 50 is an actual Boost.Asio consumer and must therefore request the
+# scoped Boost include/coroutine-selection flags explicitly.  Do not rely on
+# configure-time flag leakage.
+libprotocol50_a_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
+
 EXTRA_DIST = \
 	README.md \
 	KEY_LAYOUT_V1_CENSUS.md \
