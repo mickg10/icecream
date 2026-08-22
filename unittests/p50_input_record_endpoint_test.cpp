@@ -4,6 +4,7 @@
 #include <boost/asio/ip/address_v4.hpp>
 #include <boost/asio/ip/tcp.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <exception>
