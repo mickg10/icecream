@@ -29,7 +29,8 @@ ASSUME /\ MutantRegressClaimOnPrepare \in BOOLEAN
        /\ MutantPublishAfterCancel \in BOOLEAN
        /\ MutantRevokeClaimAsRevoked \in BOOLEAN
 
-Modes == {"Advisory", "Enforcing"}
+Modes == {"Advisory", "EnforcingCompat", "StrictNonce"}
+ReadyGatedModes == {"EnforcingCompat", "StrictNonce"}
 SPhases == {"Idle", "PrepareQueued", "Ready", "Cancelling",
             "Released", "Owned"}
 FPhases == {"Absent", "Reserved", "Claimed", "Revoked"}
@@ -81,7 +82,7 @@ PublishUseCS ==
     /\ ~usecsPublished
     /\ \/ /\ mode = "Advisory"
            /\ sPhase \in {"PrepareQueued", "Ready"}
-       \/ /\ mode = "Enforcing"
+       \/ /\ mode \in ReadyGatedModes
            /\ sPhase = "Ready"
        \/ /\ MutantPublishAfterCancel
            /\ sPhase = "Cancelling"
@@ -252,10 +253,10 @@ OwnedHasClaim ==
         /\ fPhase = "Claimed"
 
 EnforcingPublicationObservedReady ==
-    mode # "Enforcing" \/ ~usecsPublished \/ readyObserved
+    mode \notin ReadyGatedModes \/ ~usecsPublished \/ readyObserved
 
 EarlyCancelCompleted ==
-    /\ mode = "Enforcing"
+    /\ mode = "EnforcingCompat"
     /\ sPhase = "Released"
     /\ prepareConsumed
     /\ readyObserved
