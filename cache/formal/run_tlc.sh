@@ -151,3 +151,5 @@ run_expected_failure assignment-release-mutant Protocol50Assignment.tla \
     Protocol50AssignmentReleaseMutant.cfg ReleaseHasRevocationProof
 run_expected_failure assignment-tombstone-mutant Protocol50Assignment.tla \
     Protocol50AssignmentTombstoneMutant.cfg TombstoneIsNotLive
+run_expected_failure assignment-epoch-reuse-mutant Protocol50Assignment.tla \
+    Protocol50AssignmentEpochReuseMutant.cfg SameEpochRevocationSafety

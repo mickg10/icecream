@@ -15,9 +15,9 @@ It separates:
 The model is intentionally not a scheduler, capacity, or timing model.  It
 answers the protocol questions that otherwise cause ABA and restart bugs:
 
-  * ENFORCING requires an F-installed prepare but legacy claims remain only
+  * ENFORCING_COMPAT requires an F-installed prepare but legacy claims remain only
     compatibility-safe, not generation-exact;
-  * STRICT requires the nonce-bearing claim and is generation-exact;
+  * STRICT_NONCE requires the nonce-bearing claim and is generation-exact;
   * a REVOKED result is a release proof only while its epoch-scoped tombstone
     remains installed;
   * CLAIMED_OR_LATER includes claimed-but-not-yet-running work, so a compiler
@@ -26,11 +26,26 @@ answers the protocol questions that otherwise cause ABA and restart bugs:
 
 CONSTANTS Assignments, Epochs, WireIds, Nonces,
           NoAssignment, NoEpoch, InitEpoch, RestartAssignment,
+          A0, A1, E0, E1, W0, N0, N1,
           EpochOf, WireOf, NonceOf, AssignmentAt,
           MutantAllowStrictLegacy,
           MutantPublishBeforeReady,
           MutantReleaseWithoutRevoke,
-          MutantPrepareOverTombstone
+          MutantPrepareOverTombstone,
+          MutantReuseEpochAfterLoss
+
+EpochOfDef ==
+    [a \in Assignments |-> IF a = A0 THEN E0 ELSE E1]
+
+WireOfDef ==
+    [a \in Assignments |-> W0]
+
+NonceOfDef ==
+    [a \in Assignments |-> IF a = A0 THEN N0 ELSE N1]
+
+AssignmentAtDef ==
+    [e \in Epochs |->
+        [w \in WireIds |-> IF e = E0 THEN A0 ELSE A1]]
 
 ASSUME /\ Assignments # {}
        /\ Epochs # {}
@@ -40,6 +55,16 @@ ASSUME /\ Assignments # {}
        /\ NoEpoch \notin Epochs
        /\ InitEpoch \in Epochs
        /\ RestartAssignment \in Assignments
+       /\ A0 \in Assignments
+       /\ A1 \in Assignments
+       /\ A0 # A1
+       /\ E0 \in Epochs
+       /\ E1 \in Epochs
+       /\ E0 # E1
+       /\ W0 \in WireIds
+       /\ N0 \in Nonces
+       /\ N1 \in Nonces
+       /\ N0 # N1
        /\ EpochOf \in [Assignments -> Epochs]
        /\ WireOf \in [Assignments -> WireIds]
        /\ NonceOf \in [Assignments -> Nonces]
@@ -60,8 +85,9 @@ ASSUME /\ Assignments # {}
        /\ MutantPublishBeforeReady \in BOOLEAN
        /\ MutantReleaseWithoutRevoke \in BOOLEAN
        /\ MutantPrepareOverTombstone \in BOOLEAN
+       /\ MutantReuseEpochAfterLoss \in BOOLEAN
 
-Modes == {"Legacy", "Advisory", "Enforcing", "Strict"}
+Modes == {"Legacy", "Advisory", "EnforcingCompat", "StrictNonce"}
 Phases == {"Absent", "Reserved", "Claimed", "Started", "Terminal"}
 ClaimKinds == {"None", "Unfenced", "Legacy", "Nonce"}
 RevokeResults == {"None", "Revoked", "ClaimedOrLater"}
@@ -116,6 +142,7 @@ Init ==
 
 Configure(m) ==
     /\ workerEpoch = NoEpoch
+    /\ currentEpoch # NoEpoch
     /\ m \in Modes
     /\ workerEpoch' = currentEpoch
     /\ mode' = m
@@ -126,14 +153,15 @@ Configure(m) ==
     /\ prepared' = {}
     /\ ready' = {}
     /\ tombstone' = {}
-    /\ attemptCount' = EmptyAttemptCount
     /\ attemptRunning' = {}
     /\ UNCHANGED <<currentEpoch, usedEpochs, published,
                     revokeResult, released, authorized,
-                    resultAccepted, badPublish>>
+                    attemptCount, resultAccepted, badPublish>>
 
 LoseSchedulerLink ==
     /\ workerEpoch # NoEpoch
+    /\ currentEpoch' =
+           IF MutantReuseEpochAfterLoss THEN currentEpoch ELSE NoEpoch
     /\ workerEpoch' = NoEpoch
     /\ mode' = "Legacy"
     /\ record' = EmptyRecord
@@ -143,11 +171,10 @@ LoseSchedulerLink ==
     /\ prepared' = {}
     /\ ready' = {}
     /\ tombstone' = {}
-    /\ attemptCount' = EmptyAttemptCount
     /\ attemptRunning' = {}
-    /\ UNCHANGED <<currentEpoch, usedEpochs, published,
-                    revokeResult, released, authorized,
-                    resultAccepted, badPublish>>
+    /\ UNCHANGED <<usedEpochs, published, revokeResult,
+                    released, authorized,
+                    attemptCount, resultAccepted, badPublish>>
 
 RestartScheduler(e) ==
     /\ workerEpoch = NoEpoch
@@ -166,7 +193,7 @@ Prepare(a) ==
     IN /\ workerEpoch = currentEpoch
        /\ EpochOf[a] = currentEpoch
        /\ AssignmentAt[currentEpoch][w] = a
-       /\ mode \in {"Advisory", "Enforcing", "Strict"}
+       /\ mode \in {"Advisory", "EnforcingCompat", "StrictNonce"}
        /\ record[w] = NoAssignment
        /\ phase[w] = "Absent"
        /\ (a \notin tombstone \/ MutantPrepareOverTombstone)
@@ -195,12 +222,12 @@ PublishUseCS(a) ==
     /\ workerEpoch = currentEpoch
     /\ EpochOf[a] = currentEpoch
     /\ AssignmentAt[currentEpoch][WireOf[a]] = a
-    /\ (mode \notin {"Enforcing", "Strict"} \/
+    /\ (mode \notin {"EnforcingCompat", "StrictNonce"} \/
         a \in ready \/ MutantPublishBeforeReady)
     /\ published' = published \cup {a}
     /\ badPublish' =
-           badPublish \/
-           (mode \in {"Enforcing", "Strict"} /\ a \notin ready)
+           (badPublish \/
+            (mode \in {"EnforcingCompat", "StrictNonce"} /\ a \notin ready))
     /\ UNCHANGED <<currentEpoch, usedEpochs, workerEpoch, mode,
                     record, phase, claimant, claimKind, prepared,
                     ready, tombstone, revokeResult, released,
@@ -241,8 +268,8 @@ KnownLegacyClaim(arriving) ==
        /\ phase[w] = "Reserved"
        /\ WireOf[target] = WireOf[arriving]
        /\ target \notin tombstone
-       /\ (mode \in {"Advisory", "Enforcing"} \/
-           (mode = "Strict" /\ MutantAllowStrictLegacy))
+       /\ (mode \in {"Advisory", "EnforcingCompat"} \/
+           (mode = "StrictNonce" /\ MutantAllowStrictLegacy))
        /\ phase' = [phase EXCEPT ![w] = "Claimed"]
        /\ claimant' = [claimant EXCEPT ![w] = arriving]
        /\ claimKind' = [claimKind EXCEPT ![w] = "Legacy"]
@@ -256,7 +283,7 @@ KnownNonceClaim(arriving) ==
     LET w == WireOf[arriving]
         target == record[w]
     IN /\ workerEpoch # NoEpoch
-       /\ mode \in {"Advisory", "Enforcing", "Strict"}
+       /\ mode \in {"Advisory", "EnforcingCompat", "StrictNonce"}
        /\ arriving \in published
        /\ target # NoAssignment
        /\ phase[w] = "Reserved"
@@ -384,7 +411,7 @@ Next ==
 Spec == Init /\ [][Next]_vars
 
 TypeOK ==
-    /\ currentEpoch \in Epochs
+    /\ currentEpoch \in Epochs \cup {NoEpoch}
     /\ usedEpochs \subseteq Epochs
     /\ workerEpoch \in Epochs \cup {NoEpoch}
     /\ mode \in Modes
@@ -444,7 +471,7 @@ ReadySubsetPrepared == ready \subseteq prepared
 
 EnforcingClaimsWerePrepared ==
     \A w \in WireIds :
-        mode \in {"Enforcing", "Strict"} /\
+        mode \in {"EnforcingCompat", "StrictNonce"} /\
         phase[w] \in LiveClaimPhases => record[w] \in prepared
 
 NonceClaimsExact ==
@@ -454,7 +481,7 @@ NonceClaimsExact ==
 
 StrictClaimsExact ==
     \A w \in WireIds :
-        mode = "Strict" /\ phase[w] \in LiveClaimPhases =>
+        mode = "StrictNonce" /\ phase[w] \in LiveClaimPhases =>
             /\ claimKind[w] = "Nonce"
             /\ claimant[w] = record[w]
 
@@ -465,7 +492,7 @@ the current prepared assignment when the claim carries no nonce.
 ***************************************************************************)
 EnforcingCompatClaimsExact ==
     \A w \in WireIds :
-        mode = "Enforcing" /\ phase[w] \in LiveClaimPhases =>
+        mode = "EnforcingCompat" /\ phase[w] \in LiveClaimPhases =>
             claimant[w] = record[w]
 
 AllClaimsExact ==
@@ -487,7 +514,7 @@ SameEpochRevocationSafety ==
                 claimant[w] # a \/ phase[w] \notin LiveClaimPhases
 
 StrictRevocationSafety ==
-    mode # "Strict" \/
+    mode # "StrictNonce" \/
         \A w \in WireIds :
             claimant[w] \notin released \/
             phase[w] \notin LiveClaimPhases
@@ -535,7 +562,7 @@ RestartInit ==
     IN /\ currentEpoch = EpochOf[a]
        /\ usedEpochs = {EpochOf[a]}
        /\ workerEpoch = EpochOf[a]
-       /\ mode = "Strict"
+       /\ mode = "StrictNonce"
        /\ record = [x \in WireIds |-> IF x = w THEN a ELSE NoAssignment]
        /\ phase = [x \in WireIds |-> IF x = w THEN "Started" ELSE "Absent"]
        /\ claimant = [x \in WireIds |-> IF x = w THEN a ELSE NoAssignment]

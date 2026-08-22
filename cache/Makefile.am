@@ -53,6 +53,7 @@ EXTRA_DIST = \
 	formal/Protocol50AssignmentReadyMutant.cfg \
 	formal/Protocol50AssignmentReleaseMutant.cfg \
 	formal/Protocol50AssignmentTombstoneMutant.cfg \
+	formal/Protocol50AssignmentEpochReuseMutant.cfg \
 	formal/Protocol50Assignment.md \
 	formal/run_tlc.sh \
 	formal/.gitignore \
