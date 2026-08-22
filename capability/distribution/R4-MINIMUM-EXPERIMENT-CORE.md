@@ -14,9 +14,9 @@ The independent retained-evidence/cardinality correction is
 `12a0fa6d934b3fee4037cb8ed9ebb049b29e34ef`; its static-policy closure follow-up
 is `4c2b184d77bfc10c51b8ca1d189d36cc21d4f94a`.
 The closed retained-stream validator source is
-`43ee6c5e222b6ed640bc9503b2a746b9c843eea2`; retained evidence records that
+`e6f82665d47afea3b723cb598bbfb76785573b37`; retained evidence records that
 exact commit and its `run_scenario.py` SHA-256,
-`60499ef01350265a837ca62c8ab9134bfa5d0f181b6149c275d3f81d17757adf`.
+`63915707e2c5b42dedfaff9f644904276dfad1f5a7aceba2f4d82e53f29dd8cd`.
 The subsequently committed `simulator-source.json` sidecar preserves that
 binding in source archives without a `.git` object database; worktrees
 additionally compare the declared commit to the literal Git blob.
@@ -253,7 +253,7 @@ adapters cannot carry this evidence or claim a physical result.
 - retained route evidence: `route-trace.jsonl`, byte-identical to the input
   trace above;
 - retained `sample-experiment.jsonl` SHA-256:
-  `10938ef185baf23a29ae41534c75e376aefa19cd3723d756f4c3ceba864a0ff5`;
+  `9cacd51efc91aef48c8b70e35973be1341b47d3dbb2e040c4c117fea728ec288`;
 - closure: 30 events, 37 source C-to-F bytes, zero F-to-C bytes, two exact
   routes, and every resource/queue balance returned to zero.
 

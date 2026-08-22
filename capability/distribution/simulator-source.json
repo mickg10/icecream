@@ -1,6 +1,6 @@
 {
   "schema": "icecream-simulator-source-v1",
   "source": "capability/distribution/run_scenario.py",
-  "source_commit": "43ee6c5e222b6ed640bc9503b2a746b9c843eea2",
-  "source_sha256": "60499ef01350265a837ca62c8ab9134bfa5d0f181b6149c275d3f81d17757adf"
+  "source_commit": "e6f82665d47afea3b723cb598bbfb76785573b37",
+  "source_sha256": "63915707e2c5b42dedfaff9f644904276dfad1f5a7aceba2f4d82e53f29dd8cd"
 }
