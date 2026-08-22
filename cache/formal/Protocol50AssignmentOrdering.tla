@@ -94,15 +94,16 @@ PublishUseCS ==
                     badRegression, badRevoked>>
 
 QueueCancel ==
-    /\ sPhase \in {"PrepareQueued", "Ready"}
-    /\ sPhase' = "Cancelling"
-    /\ s2f' = Append(s2f, "Revoke")
-    /\ cancelBeforePublication' =
-           cancelBeforePublication \/ ~usecsPublished
-    /\ UNCHANGED <<mode, fPhase, f2s, usecsPublished,
-                    claimAccepted, claimRejected, prepareConsumed,
-                    readyObserved, revokeConsumed, releaseProof,
-                    badRegression, badPublish, badRevoked>>
+    LET cancelledBeforePublish ==
+            cancelBeforePublication \/ ~usecsPublished
+    IN /\ sPhase \in {"PrepareQueued", "Ready"}
+       /\ sPhase' = "Cancelling"
+       /\ s2f' = Append(s2f, "Revoke")
+       /\ cancelBeforePublication' = cancelledBeforePublish
+       /\ UNCHANGED <<mode, fPhase, f2s, usecsPublished,
+                       claimAccepted, claimRejected, prepareConsumed,
+                       readyObserved, revokeConsumed, releaseProof,
+                       badRegression, badPublish, badRevoked>>
 
 ConsumePrepare ==
     LET regresses == fPhase = "Claimed" /\ MutantRegressClaimOnPrepare
