@@ -8,7 +8,9 @@ libprotocol50_a_SOURCES = \
 	p50_slice0.cpp \
 	p50_slice0.h \
 	p50_zstd.cpp \
-	p50_zstd.h
+	p50_zstd.h \
+	p50_session_continuity.cpp \
+	p50_session_continuity.h
 
 AM_CPPFLAGS = -I$(top_srcdir) $(LIBZSTD_CFLAGS)
 
