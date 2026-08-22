@@ -17,11 +17,6 @@ constexpr uint16_t kZstdTuBodyEncoding = 1;
 struct ZstdTuLimits {
     uint64_t max_encoded_body_bytes = 0;
     uint64_t max_raw_bytes = 0;
-
-    // Zero keeps the library default. A nonzero value is passed to
-    // ZSTD_d_windowLogMax when the linked libzstd exposes that stable API.
-    int max_window_log = 0;
-
     auto operator<=>(const ZstdTuLimits&) const = default;
 };
 
