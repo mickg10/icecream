@@ -37,3 +37,5 @@ EXTRA_DIST = \
 	icecc-scheduler.adoc \
 	icecc-create-env.adoc \
 	icecream.adoc
+
+EXTRA_DIST += r6-input-attachment-seams.md

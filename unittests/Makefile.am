@@ -1,4 +1,4 @@
-TESTS = testargs lockexec backpressure schedpolicy utf8test statewritertest fastesttest hallflowtest jobidalloctest inputpump connectivity-run.sh schedbp-quick.sh schedstress-quick.sh remoteice-quick.sh daemonlogin-run.sh daemonbatch-run.sh boost-prefix-scope.sh p50wire p50slice0 p50zstd p50zstdwindow p50endpoint digest128bench p50_trace_check.sh
+TESTS = testargs lockexec backpressure schedpolicy utf8test statewritertest fastesttest hallflowtest jobidalloctest inputpump compilerinput connectivity-run.sh schedbp-quick.sh schedstress-quick.sh remoteice-quick.sh daemonlogin-run.sh daemonbatch-run.sh boost-prefix-scope.sh p50wire p50slice0 p50zstd p50zstdwindow p50endpoint digest128bench p50_trace_check.sh
 
 AM_TESTS_ENVIRONMENT = \
 	ICECC_TEST_BUILDDIR='$(abs_builddir)'; export ICECC_TEST_BUILDDIR; \
@@ -44,7 +44,7 @@ p50endpoint_LDADD = ../cache/libp50endpoint.a ../cache/libprotocol50.a \
 	$(LIBZSTD_LIBS) $(BOOST_LIBS)
 digest128bench_LDADD = ../services/libicecc.la
 
-check_PROGRAMS = testargs lockexec backpressure schedpolicy utf8test statewritertest schedbp daemonlogin daemonbatch connectivity fastesttest hallflowtest jobidalloctest inputpump p50wire p50slice0 p50zstd p50zstdwindow p50endpoint digest128bench
+check_PROGRAMS = testargs lockexec backpressure schedpolicy utf8test statewritertest schedbp daemonlogin daemonbatch connectivity fastesttest hallflowtest jobidalloctest inputpump compilerinput p50wire p50slice0 p50zstd p50zstdwindow p50endpoint digest128bench
 testargs_SOURCES = args.cpp
 p50wire_SOURCES = p50_wire_test.cpp
 p50slice0_SOURCES = \
@@ -93,7 +93,14 @@ hallflowtest_SOURCES = hallflowtest.cpp
 
 jobidalloctest_SOURCES = jobidalloctest.cpp
 inputpump_SOURCES = input_pump_test.cpp
+inputpump_CXXFLAGS = -pthread
+inputpump_LDFLAGS = -pthread
 inputpump_LDADD = ../client/libclient.a ../services/libicecc.la
+compilerinput_SOURCES = compiler_input_test.cpp ../daemon/compiler_input.cpp
+compilerinput_CPPFLAGS = $(AM_CPPFLAGS) -I$(top_srcdir)/daemon
+compilerinput_CXXFLAGS = -pthread
+compilerinput_LDFLAGS = -pthread
+compilerinput_LDADD = ../services/libicecc.la
 schedbp_CXXFLAGS = -pthread
 schedbp_LDFLAGS = -pthread
 schedbp_LDADD = ../services/libicecc.la

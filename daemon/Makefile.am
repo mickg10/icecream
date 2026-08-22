@@ -3,6 +3,7 @@ sbin_PROGRAMS = iceccd
 iceccd_SOURCES = \
 	main.cpp \
 	serve.cpp \
+	compiler_input.cpp \
 	workit.cpp \
 	environment.cpp \
 	load.cpp \
@@ -22,6 +23,7 @@ AM_CPPFLAGS = \
 AM_LIBTOOLFLAGS = --silent
 
 noinst_HEADERS = \
+	compiler_input.h \
 	statewriter.h \
 	environment.h \
 	load.h \
