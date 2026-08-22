@@ -66,6 +66,7 @@ EVENT_IDENTITY_FIELDS = (
 )
 
 SIMULATOR_SOURCE_IDENTITY = "capability/distribution/run_scenario.py"
+SIMULATOR_EVIDENCE_IDENTITY = "capability/distribution/simulator-source.json"
 RELATIONSHIP_ORDERING = (
     "TU_SEQ is allocated in prepared-input release order per C; REL_SEQ is "
     "allocated independently in route-local dispatch order"
@@ -1839,11 +1840,8 @@ def load_execution(path: Path, scenario: LoadedScenario) -> dict[str, object]:
         )
     if document["mode"] != "simulated":
         raise ValueError(f"{path}: run_scenario requires execution mode 'simulated'")
-    current_digest = sha256(Path(__file__).resolve())
-    if (
-        document["simulator_commit"] != simulator_source_commit()
-        or _source_blob_sha256(str(document["simulator_commit"])) != current_digest
-    ):
+    source_evidence = simulator_source_evidence()
+    if document["simulator_commit"] != source_evidence["source_commit"]:
         raise ValueError(
             f"{path}: simulator_commit does not contain the current simulator source"
         )
@@ -5702,8 +5700,8 @@ def _source_blob_sha256(commit: str) -> str:
     return hashlib.sha256(blob).hexdigest()
 
 
-def simulator_source_commit() -> str:
-    """Return the latest commit which contains the exact current simulator source."""
+def _git_source_commit() -> str:
+    """Return the latest Git commit which contains the simulator source."""
     source_path = Path(__file__).resolve()
     try:
         root = subprocess.run(
@@ -5734,6 +5732,62 @@ def simulator_source_commit() -> str:
         raise ValueError("cannot resolve simulator source commit") from error
 
 
+def simulator_source_evidence() -> dict[str, str]:
+    """Bind the running source to one committed blob, including in source archives.
+
+    The sidecar is deliberately committed only after the source commit it names.  A normal
+    worktree checks both it and the corresponding Git blob; an archive, which has no object
+    database, still checks the sidecar's exact source identity and digest against its bytes.
+    """
+    source_path = Path(__file__).resolve()
+    current_digest = sha256(source_path)
+    sidecar = source_path.with_name("simulator-source.json")
+    if sidecar.is_file():
+        document = json.loads(sidecar.read_text())
+        if (
+            not isinstance(document, dict)
+            or set(document) != {"schema", "source", "source_commit", "source_sha256"}
+            or document.get("schema") != "icecream-simulator-source-v1"
+            or document.get("source") != SIMULATOR_SOURCE_IDENTITY
+            or re.fullmatch(r"[0-9a-f]{40}", str(document.get("source_commit"))) is None
+            or document.get("source_sha256") != current_digest
+        ):
+            raise ValueError("simulator source sidecar differs from current source")
+        try:
+            subprocess.run(
+                ["git", "-C", str(source_path.parent), "rev-parse", "--show-toplevel"],
+                check=True,
+                capture_output=True,
+            )
+            has_git_worktree = True
+        except (OSError, subprocess.CalledProcessError):
+            has_git_worktree = False
+        committed_digest = (
+            _source_blob_sha256(str(document["source_commit"]))
+            if has_git_worktree
+            else current_digest
+        )
+        if committed_digest != current_digest:
+            raise ValueError("simulator source sidecar differs from committed source")
+        return {
+            "source": str(document["source"]),
+            "source_commit": str(document["source_commit"]),
+            "source_sha256": str(document["source_sha256"]),
+        }
+    commit = _git_source_commit()
+    if _source_blob_sha256(commit) != current_digest:
+        raise ValueError("current simulator source differs from its latest commit")
+    return {
+        "source": SIMULATOR_SOURCE_IDENTITY,
+        "source_commit": commit,
+        "source_sha256": current_digest,
+    }
+
+
+def simulator_source_commit() -> str:
+    return simulator_source_evidence()["source_commit"]
+
+
 def validate_experiment_jsonl(path: Path) -> dict[str, int]:
     """Independently replay every v2 identity and accounting claim in a stream."""
     rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
@@ -5747,14 +5801,9 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
         or simulator_evidence["source_commit"] != header["simulator_commit"]
     ):
         raise ValueError(f"{path}: simulator source identity/commit differs")
-    current_source_digest = sha256(Path(__file__).resolve())
-    if simulator_evidence["source_sha256"] != current_source_digest:
-        raise ValueError(f"{path}: simulator source digest differs from validator")
-    if (
-        _source_blob_sha256(str(simulator_evidence["source_commit"]))
-        != current_source_digest
-    ):
-        raise ValueError(f"{path}: declared simulator commit contains different source")
+    current_source_evidence = simulator_source_evidence()
+    if simulator_evidence != current_source_evidence:
+        raise ValueError(f"{path}: simulator source evidence differs from validator")
     manifest = header["scenario_manifest"]
     validate_json_schema(
         manifest, "experiment.schema.json", f"{path}:embedded scenario_manifest"
