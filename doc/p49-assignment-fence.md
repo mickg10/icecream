@@ -110,6 +110,13 @@ it does not assert that a compiler process has already begun.  Detaching a
 submitter discharges its local dispatch credit before its pointer can vanish,
 but does not release the separately owned worker assignment.
 
+`JobBegin` is positive claim evidence even when it crosses an outstanding
+revoke.  Once observed, a contradictory delayed `Revoked` cannot release the
+assignment; the worker's ordinary completion remains the terminal boundary.
+Likewise, a READY exposure failure can recursively tear down the current
+worker if its ordered revoke also fails, so the handler reports that deletion
+to the connection drain instead of returning a live-pointer indication.
+
 Normal `READY` and terminal lookup is expected O(1) through a full-identity
 hash index.  The ordinary control handlers do not scan all jobs or daemons.
 
@@ -179,5 +186,6 @@ StrictNonce refusal, debit-at-PREPARE, the deferred-output worker gate,
 revoke-first and claim-first races, cancellation versus delayed READY, stale
 and duplicate controls, same-wire-id reuse, no early id release, late-claim
 rejection, submitter and link teardown, retained same-epoch rebind,
-clear-then-old-epoch refusal, epoch-lifetime records, bounded exhaustion, and
-default-disabled inheritance.
+clear-then-old-epoch refusal, claim evidence versus a delayed contradictory
+result, current-channel deletion during READY failure, epoch-lifetime records,
+bounded exhaustion, and default-disabled inheritance.

@@ -245,16 +245,31 @@ static bool no_type(MsgChannel *channel, Msg::Value unwanted, int timeout_msec)
     return true;
 }
 
+static bool wait_eof(MsgChannel *channel, int timeout_msec)
+{
+    const auto deadline = Clock::now() + std::chrono::milliseconds(timeout_msec);
+    while (channel && Clock::now() < deadline) {
+        Msg *msg = next_message(channel, 100);
+        delete msg;
+        if (channel->at_eof()) return true;
+    }
+    return channel && channel->at_eof();
+}
+
 static pid_t start_scheduler(const std::string &binary, int port,
                              const char *mode, const std::string &log_path,
                              unsigned int job_domain = 1,
                              unsigned int max_outstanding = 32,
-                             bool shrink_send_buffer = false)
+                             bool shrink_send_buffer = false,
+                             bool force_ready_nested_teardown = false)
 {
     pid_t child = fork();
     if (child != 0) return child;
     signal(SIGPIPE, SIG_DFL);
     setenv("ICECC_TESTS", "1", 1);
+    if (force_ready_nested_teardown) {
+        setenv("ICECC_TEST_P49_READY_NESTED_TEARDOWN", "1", 1);
+    }
     if (shrink_send_buffer) {
         const std::string marker = "/scheduler/";
         const std::string::size_type split = binary.rfind(marker);
@@ -457,24 +472,53 @@ static void run_enforcing(const std::string &binary,
     REQUIRE(no_type(worker, Msg::ASSIGN_PREPARE, 350),
             "stale terminal does not release the live reservation");
     delete probe;
+    probe = nullptr;
 
     if (first_revoke) {
+        worker->send_msg(JobBeginMsg(first_revoke->wire_id, 0));
         worker->send_msg(RevokeResultMsg(first_revoke->epoch(),
                                          first_revoke->wire_id,
                                          first_revoke->nonce(),
                                          RevokeResultMsg::Revoked));
     }
-    usleep(100 * 1000);
+    ConfCSMsg *revoked_probe_conf = nullptr;
+    MsgChannel *revoked_probe = login_host(
+        port, "p49-revoked-probe", false, 0, &revoked_probe_conf);
+    delete revoked_probe_conf;
+    REQUIRE(revoked_probe && request_job(revoked_probe, 1003),
+            "allocator probe submitted after contradictory Revoked");
+    REQUIRE(no_type(worker, Msg::ASSIGN_PREPARE, 350),
+            "Revoked after JobBegin cannot release claimed ownership");
+    delete revoked_probe;
+    if (first_revoke) {
+        worker->send_msg(RevokeResultMsg(first_revoke->epoch(),
+                                         first_revoke->wire_id,
+                                         first_revoke->nonce(),
+                                         RevokeResultMsg::ClaimedOrLater));
+    }
+    ConfCSMsg *claimed_probe_conf = nullptr;
+    MsgChannel *claimed_probe = login_host(
+        port, "p49-claimed-probe", false, 0, &claimed_probe_conf);
+    delete claimed_probe_conf;
+    REQUIRE(claimed_probe && request_job(claimed_probe, 1004),
+            "allocator probe submitted after claim outcome");
+    REQUIRE(no_type(worker, Msg::ASSIGN_PREPARE, 350),
+            "claim outcome retains ownership until ordinary completion");
+    delete claimed_probe;
+    if (first_revoke) {
+        worker->send_msg(JobDoneMsg(first_revoke->wire_id, 0,
+                                    JobDoneMsg::FROM_SERVER));
+    }
 
     ConfCSMsg *reuse_conf = nullptr;
     MsgChannel *reuse = login_host(port, "p49-submit-b", false, 0, &reuse_conf);
     delete reuse_conf;
-    REQUIRE(reuse && request_job(reuse, 1003),
-            "second assignment requested after matching terminal");
+    REQUIRE(reuse && request_job(reuse, 1005),
+            "assignment requested after ordinary completion");
     AssignPrepareMsg *second = wait_prepare(worker);
     REQUIRE(first && second && second->wire_id == first->wire_id
                 && second->nonce() != first->nonce(),
-            "wire id reuse receives a fresh immutable nonce");
+            "ordinary completion permits reuse with a fresh immutable nonce");
     if (first) {
         worker->send_msg(AssignReadyMsg(first->epoch(), first->wire_id,
                                         first->nonce()));
@@ -675,6 +719,77 @@ static void run_prepare_credit(const std::string &binary,
     if (worker_listener >= 0) close(worker_listener);
     REQUIRE(stop_scheduler(scheduler),
             "prepare-credit scheduler stopped cleanly");
+}
+
+static void run_ready_nested_teardown(const std::string &binary,
+                                      const std::string &directory)
+{
+    const int port = reserve_port_pair();
+    const std::string log = directory + "/ready-nested-teardown.log";
+    pid_t scheduler = start_scheduler(binary, port, "enforcing-compat", log,
+                                      16, 16, false, true);
+    REQUIRE(port != 0 && scheduler > 0,
+            "READY nested-teardown scheduler process launched");
+
+    int worker_port = 0;
+    int worker_listener = bind_port(0, &worker_port);
+    if (worker_listener >= 0) listen(worker_listener, 16);
+    ConfCSMsg *worker_conf = nullptr;
+    MsgChannel *worker = login_host(port, "nested-worker", true, worker_port,
+                                    &worker_conf);
+    delete worker_conf;
+    ConfCSMsg *submitter_conf = nullptr;
+    MsgChannel *submitter = login_host(port, "nested-submit", false, 0,
+                                       &submitter_conf);
+    delete submitter_conf;
+    REQUIRE(worker && submitter && request_job(submitter, 4401),
+            "nested-teardown assignment requested");
+    AssignPrepareMsg *prepare = wait_prepare(worker);
+    REQUIRE(prepare != nullptr,
+            "nested-teardown assignment reaches PREPARE");
+    if (prepare) {
+        worker->send_msg(AssignReadyMsg(prepare->epoch(), prepare->wire_id,
+                                        prepare->nonce()));
+    }
+    REQUIRE(wait_eof(worker, 8000),
+            "failed ordered revoke tears down the same worker");
+    REQUIRE(wait_eof(submitter, 1000),
+            "forced UseCS failure tears down the submitter");
+
+    ConfCSMsg *replacement_conf = nullptr;
+    MsgChannel *replacement = login_host(port, "nested-replacement", true,
+                                         worker_port, &replacement_conf);
+    delete replacement_conf;
+    ConfCSMsg *recovery_conf = nullptr;
+    MsgChannel *recovery = login_host(port, "nested-recovery", false, 0,
+                                      &recovery_conf);
+    delete recovery_conf;
+    REQUIRE(replacement && recovery && request_job(recovery, 4402),
+            "scheduler remains live after nested worker deletion");
+    AssignPrepareMsg *recovered = wait_prepare(replacement);
+    REQUIRE(recovered != nullptr,
+            "post-teardown assignment reaches the replacement worker");
+    REQUIRE(file_contains(log,
+                          "READY teardown deleted current worker; stopping drain"),
+            "READY handler returns current-channel deletion to its drain caller");
+
+    delete recovery;
+    RevokeBeforeStartMsg *revoke = dynamic_cast<RevokeBeforeStartMsg *>(
+        wait_type(replacement, Msg::REVOKE_BEFORE_START, 3000));
+    if (revoke) {
+        replacement->send_msg(RevokeResultMsg(
+            revoke->epoch(), revoke->wire_id, revoke->nonce(),
+            RevokeResultMsg::Revoked));
+    }
+    delete revoke;
+    delete recovered;
+    delete replacement;
+    delete submitter;
+    delete worker;
+    delete prepare;
+    if (worker_listener >= 0) close(worker_listener);
+    REQUIRE(stop_scheduler(scheduler),
+            "READY nested-teardown scheduler stopped cleanly");
 }
 
 static void run_advisory(const std::string &binary,
@@ -893,6 +1008,7 @@ int main(int argc, char **argv)
     signal(SIGPIPE, SIG_IGN);
     run_enforcing(argv[1], directory);
     run_prepare_credit(argv[1], directory);
+    run_ready_nested_teardown(argv[1], directory);
     run_advisory(argv[1], directory);
     run_prepare_backlog(argv[1], directory);
     run_strict_nonce_refusal(argv[1], directory);

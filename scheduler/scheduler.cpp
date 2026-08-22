@@ -2927,9 +2927,34 @@ static bool handle_assignment_ready(CompileServer *cs, Msg *_m)
 
     job->setAssignmentPhase(Job::ASSIGNMENT_READY);
     ++assignment_ready_accepted;
+    if (job->assignmentReadyGated()
+            && getenv("ICECC_TESTS")
+            && getenv("ICECC_TEST_P49_READY_NESTED_TEARDOWN")) {
+        /* Deterministic integration seam for the double-failure boundary:
+           UseCS fails, then the ordered REVOKE fails on this worker.  Both
+           cuts are one-shot and reachable only in an explicitly armed test
+           scheduler. */
+        job->submitter()->testCutNextFlushAfter(0);
+        job->server()->testCutNextFlushAfter(0);
+    }
     if (job->assignmentReadyGated() && !send_remote_dispatch_reply(job)) {
         trace() << "failed to expose ready assignment " << job->id() << endl;
+        const int worker_fd = cs->fd;
+        const unsigned int worker_generation = cs->connectionGeneration();
         handle_end(job->submitter(), nullptr);
+        /* Submitter teardown requests an ordered revoke.  If that send also
+           fails, handle_end() recursively destroys this exact worker.  Tell
+           drain_connection() that its pointer is gone; returning true here
+           would make it dereference freed `cs` on the next drain iteration. */
+        const auto live = fd2cs.find(worker_fd);
+        const bool worker_still_live = live != fd2cs.end()
+            && live->second == cs
+            && live->second->connectionGeneration() == worker_generation;
+        if (!worker_still_live) {
+            trace() << "READY teardown deleted current worker; stopping drain"
+                    << endl;
+        }
+        return worker_still_live;
     }
     return true;
 }
@@ -2955,15 +2980,25 @@ static bool handle_assignment_terminal(CompileServer *cs, Msg *_m)
         return true;
     }
 
-    ++assignment_terminal_accepted;
     if (m->result == RevokeResultMsg::ClaimedOrLater) {
         /* The claim won at F.  JobBegin may already have advanced the product
            state, or may follow once a claimed request reaches the load gate.
            Either way ownership remains until the worker's ordinary JobDone. */
+        ++assignment_terminal_accepted;
         job->setAssignmentPhase(Job::ASSIGNMENT_CLAIMED_OR_LATER);
         return true;
     }
 
+    /* Revoked is a release witness only while the assignment still has no
+       scheduler-side claim evidence.  A JobBegin that crossed the ordered
+       revoke is stronger evidence than a contradictory delayed result and
+       leaves ownership to the ordinary worker completion boundary. */
+    if (job->state() != Job::WAITINGFORCS) {
+        ++assignment_terminal_ignored;
+        return true;
+    }
+
+    ++assignment_terminal_accepted;
     job->setAssignmentPhase(Job::ASSIGNMENT_TERMINAL);
     if (job->server()) {
         job->server()->removeJob(job);
