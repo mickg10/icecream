@@ -14,9 +14,9 @@ The independent retained-evidence/cardinality correction is
 `12a0fa6d934b3fee4037cb8ed9ebb049b29e34ef`; its static-policy closure follow-up
 is `4c2b184d77bfc10c51b8ca1d189d36cc21d4f94a`.
 The closed retained-stream validator source is
-`35e96aa6734f361bb5143ad3dfb4b34e38e61e11`; retained evidence records that
+`259b689270a12e472c76a05e8caf65092de8ffe0`; retained evidence records that
 exact commit and its `run_scenario.py` SHA-256,
-`22da58359d1267582125d47b5584791a98cffcfb8a3c7884e9bf5d9d42d8898d`.
+`89224f2960a3c6b2092cd675d2445bb309318a587cec92b1b084a403fdd07f6b`.
 The subsequently committed `simulator-source.json` sidecar preserves that
 binding in source archives without a `.git` object database; worktrees
 additionally compare the declared commit to the literal Git blob.
@@ -214,7 +214,9 @@ route trace for exact replay; and reconstructs every declared phase/token DAG.
 Each phase has exactly one flow, node-ready bytes match the ledger, dependency
 tokens precede readiness, sent/delivered token details and order match the
 flow lifecycle, and input/commit joins wait for their declared tokens.
-Diagnostic adapters cannot carry this evidence or claim a physical result.
+The closed row schema is a v2 retained-experiment contract; legacy v1 adapter
+inputs retain their prior optional `tu_seq`/`rel_seq` behavior. Diagnostic
+adapters cannot carry this evidence or claim a physical result.
 
 ## Retained acceptance fixture
 
@@ -229,7 +231,7 @@ Diagnostic adapters cannot carry this evidence or claim a physical result.
 - retained route evidence: `route-trace.jsonl`, byte-identical to the input
   trace above;
 - retained `sample-experiment.jsonl` SHA-256:
-  `c8a909c4c2db10b5461c9ab485ec95761ed5ed9c110cb19190cc2099338489c5`;
+  `2713ed1e3f23ce242899960a578b3e12f2b236129a19d55413881ed819c3271b`;
 - closure: 30 events, 37 source C-to-F bytes, zero F-to-C bytes, two exact
   routes, and every resource/queue balance returned to zero.
 
