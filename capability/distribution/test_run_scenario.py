@@ -3090,6 +3090,197 @@ class SimulatorTest(unittest.TestCase):
                 result.events.count,
             )
 
+    def test_v2_validator_replays_full_round_robin_stream(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_v2_fixture(root, [30, 20], [15, 22], workers=2)
+            scenario = sim.load_scenario(path)
+            output = root / "out"
+            sim.write_result(
+                scenario,
+                sim.Simulator(scenario, sim.RawAdapter()).run(),
+                output,
+                execution_for(path),
+            )
+            stream_rows = [
+                json.loads(line)
+                for line in (output / "experiment.jsonl").read_text().splitlines()
+            ]
+            trace_path = output / "route-trace.jsonl"
+            trace_rows = [
+                json.loads(line) for line in trace_path.read_text().splitlines()
+            ]
+            scenario_digest = stream_rows[0]["scenario_digest"]
+
+            for event in (
+                event
+                for row in stream_rows[1:-1]
+                for event in row["events"]
+                if isinstance(event["worker"], int)
+            ):
+                worker = 1 - event["worker"]
+                environment = event["environment"]
+                event["worker"] = worker
+                event["physical_endpoint"] = f"F{worker}"
+                event["RouteLaneId"] = f"C{environment}_F{worker}"
+                event["F_STORE_GUID"] = sim.stable_hex(
+                    "f-store", scenario_digest, worker, digits=32
+                )
+                event["HISTORY_NONCE"] = int(
+                    sim.stable_hex(
+                        "history-nonce",
+                        scenario_digest,
+                        environment,
+                        worker,
+                        digits=16,
+                    ),
+                    16,
+                )
+                if event["transaction_digest"] is not None:
+                    digest = sim.transaction_identity_digest(
+                        scenario_digest,
+                        event["logical_job_id"],
+                        event["attempt_id"],
+                        event["C_STORE_GUID"],
+                        event["F_STORE_GUID"],
+                        event["HISTORY_NONCE"],
+                        event["TU_SEQ"],
+                        event["REL_SEQ"],
+                        event["raw_digest"],
+                        event["negotiated_profiles"],
+                        event["route_state_profiles"],
+                    )
+                    event["transaction_digest"] = digest
+                    event["InputRecord_identity"] = sim.input_record_identity(
+                        digest, event["raw_digest"]
+                    )
+            for row in trace_rows[1:-1]:
+                worker = 1 - row["worker"]
+                environment = int(row["RouteLaneId"].split("_")[0][1:])
+                row["worker"] = worker
+                row["physical_endpoint"] = f"F{worker}"
+                row["RouteLaneId"] = f"C{environment}_F{worker}"
+                row["F_STORE_GUID"] = sim.stable_hex(
+                    "f-store", scenario_digest, worker, digits=32
+                )
+                row["HISTORY_NONCE"] = int(
+                    sim.stable_hex(
+                        "history-nonce",
+                        scenario_digest,
+                        environment,
+                        worker,
+                        digits=16,
+                    ),
+                    16,
+                )
+            trace_path.write_text(
+                "".join(
+                    json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"
+                    for row in trace_rows
+                )
+            )
+            stream_rows[0]["route_trace_evidence"]["sha256"] = sim.sha256(trace_path)
+            candidate = output / "round-robin-route-swap.jsonl"
+            candidate.write_text("".join(json.dumps(row) + "\n" for row in stream_rows))
+            with self.assertRaisesRegex(ValueError, "round-robin dispatch"):
+                sim.validate_experiment_jsonl(candidate)
+
+    def test_v2_validator_enforces_global_slots_on_full_stream(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_v2_fixture(
+                root,
+                [1_000_000_000, 1_000_000_000],
+                [15, 22],
+                workers=1,
+            )
+            scenario = sim.load_scenario(path)
+            output = root / "out"
+            sim.write_result(
+                scenario,
+                sim.Simulator(scenario, sim.RawAdapter()).run(),
+                output,
+                execution_for(path),
+            )
+            original = [
+                json.loads(line)
+                for line in (output / "experiment.jsonl").read_text().splitlines()
+            ]
+
+            compiler_rows = copy.deepcopy(original)
+            compiler_events = [
+                event for row in compiler_rows[1:-1] for event in row["events"]
+            ]
+            first_slot = next(
+                event["compiler_slot"]
+                for event in compiler_events
+                if event["logical"] == 0 and event["event"] == "compile-start"
+            )
+            second_start = next(
+                event["sequence"]
+                for event in compiler_events
+                if event["logical"] == 1 and event["event"] == "compile-start"
+            )
+            for event in compiler_events:
+                if event["logical"] == 1 and event["sequence"] >= second_start:
+                    event["compiler_slot"] = first_slot
+            compiler_path = output / "compiler-slot-overlap.jsonl"
+            compiler_path.write_text(
+                "".join(json.dumps(row) + "\n" for row in compiler_rows)
+            )
+            with self.assertRaisesRegex(ValueError, "compiler slot ownership overlaps"):
+                sim.validate_experiment_jsonl(compiler_path)
+
+            staging_rows = copy.deepcopy(original)
+            staging_events = [
+                event for row in staging_rows[1:-1] for event in row["events"]
+            ]
+            first_staging = next(
+                event["staging_slot"]
+                for event in staging_events
+                if event["logical"] == 0 and event["event"] == "dispatch"
+            )
+            for event in staging_events:
+                if event["logical"] == 1 and isinstance(event["staging_slot"], int):
+                    event["slot"] = first_staging
+                    event["staging_slot"] = first_staging
+            staging_path = output / "staging-slot-overlap.jsonl"
+            staging_path.write_text(
+                "".join(json.dumps(row) + "\n" for row in staging_rows)
+            )
+            with self.assertRaisesRegex(
+                ValueError, "input-staging slot ownership overlaps"
+            ):
+                sim.validate_experiment_jsonl(staging_path)
+
+    def test_v2_validator_rejects_out_of_range_worker_in_full_stream(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_v2_fixture(root, [30], [15], workers=1)
+            scenario = sim.load_scenario(path)
+            output = root / "out"
+            sim.write_result(
+                scenario,
+                sim.Simulator(scenario, sim.RawAdapter()).run(),
+                output,
+                execution_for(path),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "experiment.jsonl").read_text().splitlines()
+            ]
+            dispatch = next(
+                event
+                for row in rows[1:-1]
+                for event in row["events"]
+                if event["event"] == "dispatch"
+            )
+            dispatch["worker"] = 1
+            candidate = output / "worker-outside-topology.jsonl"
+            candidate.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            with self.assertRaisesRegex(ValueError, "worker is outside topology"):
+                sim.validate_experiment_jsonl(candidate)
+
     def test_retained_r4_sample_validates_and_replays(self) -> None:
         root = MODULE_PATH.parent / "samples" / "r4-minimum"
         scenario = sim.load_scenario(root / "experiment.json")
