@@ -15,9 +15,9 @@
 
 namespace icecc::p50 {
 
-// TX_BEGIN is the largest fixed-size V1 control payload (152 bytes). A peer
-// offering less cannot carry the protocol even if data frames are otherwise
-// bounded correctly.
+// TX_BEGIN is the largest fixed V1 control payload (152 bytes). A negotiated
+// frame cap smaller than this can never carry a transaction and is rejected at
+// candidate staging instead of failing after session installation.
 constexpr uint32_t kM2MinimumControlPayload = 152;
 
 struct CandidateSession {
@@ -75,10 +75,11 @@ struct ZstdLoopbackConfig {
     uint16_t protocol_error_code = 1;
 };
 
-// The endpoint derives the only legal TxCommit. This callback must atomically
-// publish the exact InputRecord (when job_open) before it returns; throwing
-// leaves the relationship cursor unadvanced and terminates the session. The
-// endpoint owner advances its route state immediately after callback success.
+// This is a private M2 precommit staging hook, not yet the job-visible
+// InputRecord store. It may retain the exact bytes privately or throw to inject
+// an allocation failure. The endpoint advances its route only after this hook
+// returns. M3 replaces this seam with one owner transition that publishes the
+// restartable InputRecord and route commit atomically.
 using PublishExactInput = std::function<void(
     const TxBegin&, const TxCommit&, std::vector<uint8_t>)>;
 
