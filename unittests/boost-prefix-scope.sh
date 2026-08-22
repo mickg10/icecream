@@ -86,6 +86,16 @@ done
 
 (
     cd "$icecc_test_build"
+    # An empty PKG_CONFIG_LIBDIR is not equivalent to an absent one: exporting
+    # it suppresses pkg-config's compiled-in system directories.  Preserve an
+    # explicitly configured directory list, but otherwise let the nested
+    # configure retain the ordinary system search after PKG_CONFIG_PATH.
+    if test -n "${ICECC_TEST_PKG_CONFIG_LIBDIR:-}"; then
+        PKG_CONFIG_LIBDIR=$ICECC_TEST_PKG_CONFIG_LIBDIR
+        export PKG_CONFIG_LIBDIR
+    else
+        unset PKG_CONFIG_LIBDIR
+    fi
     CPPFLAGS="${ICECC_TEST_BOOST_CPPFLAGS:-} ${ICECC_TEST_CPPFLAGS:-}" \
         CFLAGS="${ICECC_TEST_CFLAGS:-}" \
         CXXFLAGS="${ICECC_TEST_CXXFLAGS:-}" \
@@ -93,7 +103,6 @@ done
         LIBS="${ICECC_TEST_LIBS:-}" \
         PKG_CONFIG="${ICECC_TEST_PKG_CONFIG:-pkg-config}" \
         PKG_CONFIG_PATH="${ICECC_TEST_PKG_CONFIG_PATH:-}" \
-        PKG_CONFIG_LIBDIR="${ICECC_TEST_PKG_CONFIG_LIBDIR:-}" \
         CC="$icecc_test_cc" CXX="$icecc_test_cxx" \
         AR="$icecc_test_ar" RANLIB="$icecc_test_ranlib" \
         ICE_CXX_STANDARD_FLAG="${ICECC_TEST_CXX_STANDARD_FLAG:-}" \
