@@ -37,4 +37,5 @@ EXTRA_DIST = \
 	icecc-scheduler.adoc \
 	icecc-create-env.adoc \
 	icecream.adoc \
-	p49-assignment-fence.md
+	p49-assignment-fence.md \
+	issue16-p50-assignment-convergence.md
