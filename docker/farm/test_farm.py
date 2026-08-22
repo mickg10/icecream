@@ -236,7 +236,7 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(set(nas["services"]), {"scheduler", "c00"})
         self.assertEqual(set(q2["services"]), {"f00"})
         self.assertEqual(set(r6["services"]), {"f01"})
-        self.assertEqual(nas["services"]["c00"]["image"], "ice-ii/debian-gcc:v2")
+        self.assertEqual(nas["services"]["c00"]["image"], "ice-ii/debian-gcc:v2-p50")
         for compose in (nas, q2, r6):
             json.loads(json.dumps(compose))
             for service in compose["services"].values():
@@ -366,9 +366,14 @@ class PlanTests(unittest.TestCase):
         self.assertFalse(report["ok"])
         self.assertRegex(report["errors"][0], "launch disabled")
 
-    def test_uninventoried_q3_transport_is_unavailable(self):
+    def test_q3_transport_is_lan_inventoried_but_mount_staging_is_blocked(self):
         host = self.manifest["hosts"]["quietbox3"]
-        self.assertEqual(farm.HostRunner("quietbox3", host).available()[0], False)
+        runner = farm.HostRunner("quietbox3", host)
+        self.assertTrue(runner.available()[0])
+        self.assertIn("HostName=10.0.27.101", runner.prefix())
+        self.assertIn("HostKeyAlias=tt-quietbox3", runner.prefix())
+        self.assertFalse(host["launch_enabled"])
+        self.assertRegex(host["launch_block"], "mount roots")
 
     def test_ssh_uses_lan_override_with_existing_alias_host_key(self):
         host = self.manifest["hosts"]["research6"]

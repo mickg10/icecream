@@ -6,10 +6,16 @@ EXTRA_DIST = \
 	docker/farm/README.md \
 	docker/farm/.gitignore \
 	docker/farm/Dockerfile.node \
+	docker/farm/environments/README.md \
+	docker/farm/environments/Dockerfile.conan-gcc-p50 \
+	docker/farm/environments/Dockerfile.debian-gcc-p50 \
+	docker/farm/environments/Dockerfile.fedora-clang-libcxx-p50 \
+	docker/farm/environments/Dockerfile.linuxbrew-p50 \
 	docker/farm/acceptance.sh \
 	docker/farm/acceptance/tiny.cpp \
 	docker/farm/farm.py \
 	docker/farm/inventory/2026-08-21-local-lan.json \
+	docker/farm/inventory/2026-08-22-p50-dependencies.json \
 	docker/farm/manifests/local-lan.json \
 	docker/farm/run-c1f1 \
 	docker/farm/run-c1f2 \

@@ -22,40 +22,44 @@
   },
   "environment_classes": {
     "debian-gcc": {
-      "image": "ice-ii/debian-gcc@sha256:398be28069403cb51309015248551da98300b964b48303a64e7c31f2ae32719a",
-      "tag": "ice-ii/debian-gcc:v2",
-      "expected_id": "sha256:398be28069403cb51309015248551da98300b964b48303a64e7c31f2ae32719a",
-      "expected_fingerprint": "sha256:3c4d1d13b03fdb0d74084b714fd8fa7f2a7dc5810b2df18e73897ee13270ff69",
+      "image": "ice-ii/debian-gcc@sha256:6ffc19cb366ce13373709b7980370684f9e77559c8695b300a8b8676856bd518",
+      "tag": "ice-ii/debian-gcc:v2-p50",
+      "expected_id": "sha256:6ffc19cb366ce13373709b7980370684f9e77559c8695b300a8b8676856bd518",
+      "expected_fingerprint": "sha256:a1b038223f2de802aa218d08374df6b0df4c3c18cbf8d595c6d10ad7908d8b03",
+      "dockerfile": "docker/farm/environments/Dockerfile.debian-gcc-p50",
       "base_os": "Debian 12 (bookworm)",
       "compiler": "gcc 12.2.0",
       "stdlib": "libstdc++ 12",
       "corpus_cells": 11
     },
     "fedora-clang-libcxx": {
-      "image": "ice-ii/fedora-clang-libcxx@sha256:b8b26823d8ed63c96e349427b9b5f8fc5d676f76f4f621cc1cc2a95c38c54c8e",
-      "tag": "ice-ii/fedora-clang-libcxx:v2",
-      "expected_id": "sha256:b8b26823d8ed63c96e349427b9b5f8fc5d676f76f4f621cc1cc2a95c38c54c8e",
-      "expected_fingerprint": "sha256:b43a9f4ad6f3604e73c78d56bc84d5f5f9d3a8337e71c75b029c6685eea7c911",
+      "image": "ice-ii/fedora-clang-libcxx@sha256:b6a3824ee3e7928c588d558137538b2a23574395b04e5372f4e8011b607d1660",
+      "tag": "ice-ii/fedora-clang-libcxx:v2-p50",
+      "expected_id": "sha256:b6a3824ee3e7928c588d558137538b2a23574395b04e5372f4e8011b607d1660",
+      "expected_fingerprint": "sha256:f43d9aebdfa46de6c5da830b4785dbc264ff24f9f1fa2e36cddfcbd3149300dd",
+      "dockerfile": "docker/farm/environments/Dockerfile.fedora-clang-libcxx-p50",
       "base_os": "Fedora 42",
       "compiler": "clang 20.1.8",
       "stdlib": "libc++",
       "corpus_cells": 11
     },
     "linuxbrew": {
-      "image": "ice-ii/linuxbrew@sha256:bb6bc116c44aaefb7e1d28abcf82e4eceed30d1511bff695d4a8b5d482f17f12",
-      "tag": "ice-ii/linuxbrew:v2",
-      "expected_id": "sha256:bb6bc116c44aaefb7e1d28abcf82e4eceed30d1511bff695d4a8b5d482f17f12",
-      "expected_fingerprint": "sha256:c17f64c6fa5a5f6c5c25993f04ef01315e862790ccafdd7dd56bb1c047988994",
+      "image": "ice-ii/linuxbrew@sha256:6fb8cd2fcc6385b6e0e0496893b0dbe3cc47ccbd739d151abdbef632f0591081",
+      "tag": "ice-ii/linuxbrew:v2-p50",
+      "expected_id": "sha256:6fb8cd2fcc6385b6e0e0496893b0dbe3cc47ccbd739d151abdbef632f0591081",
+      "expected_fingerprint": "sha256:3b365bc220e628d9919d3b230bede12a2e30a7664c981f5811987d576757f7f3",
+      "dockerfile": "docker/farm/environments/Dockerfile.linuxbrew-p50",
       "base_os": "Ubuntu 22.04 with Linuxbrew LLVM",
       "compiler": "clang 22.1.8",
       "stdlib": "libstdc++ 12",
       "corpus_cells": 11
     },
     "conan-gcc": {
-      "image": "ice-ii/conan-gcc@sha256:1aa1f9d819b6e635ac3eee2ec4c69bffeb71c2082331c9c7a59c24730e3ac0be",
-      "tag": "ice-ii/conan-gcc:v2",
-      "expected_id": "sha256:1aa1f9d819b6e635ac3eee2ec4c69bffeb71c2082331c9c7a59c24730e3ac0be",
-      "expected_fingerprint": "sha256:78f8295096b61e11f26d79006577af7a52fbc08a1d770abdef6480d637a550f1",
+      "image": "ice-ii/conan-gcc@sha256:ed6125708a1fbf688480405cf6e86a1d79ca1a806dde2e31ec8de203637326df",
+      "tag": "ice-ii/conan-gcc:v2-p50",
+      "expected_id": "sha256:ed6125708a1fbf688480405cf6e86a1d79ca1a806dde2e31ec8de203637326df",
+      "expected_fingerprint": "sha256:b98dca7a80f4f2f465bbc8e6c123017cc06f51ebd167a8f4a104866e8e60abde",
+      "dockerfile": "docker/farm/environments/Dockerfile.conan-gcc-p50",
       "base_os": "Debian trixie with Conan",
       "compiler": "gcc 14.2.0",
       "stdlib": "libstdc++ 14",
@@ -90,8 +94,8 @@
       ],
       "failure_domain": "quietbox3",
       "aggregate_worker_cap": 24,
-      "measurement": "host-local once SSH inventory is available",
-      "headroom": "unverified"
+      "measurement": "host-local",
+      "headroom": "8 visible hardware threads under the current 32-thread view"
     }
   },
   "hosts": {
@@ -179,23 +183,23 @@
     },
     "quietbox3": {
       "address": "10.0.27.101",
-      "interface": null,
+      "interface": "enp10s0f1np1",
       "launch_enabled": false,
-      "launch_block": "SSH account, LAN interface, Docker runtime, and host-local mounts are not inventoried",
+      "launch_block": "host-local runtime, source, and corpus mount roots are not staged yet",
       "resource_group": "quietbox3-physical",
       "transport": {
         "mode": "ssh",
-        "alias": null,
+        "alias": "tt-quietbox3",
         "host_override": "10.0.27.101",
-        "expected_hostname": null
+        "expected_hostname": "tt-quietbox3"
       },
       "paths": {
-        "runtime_prefix": null,
-        "source_root": null,
-        "corpus_root": null,
-        "build_root": null,
-        "results_root": null,
-        "state_root": null
+        "runtime_prefix": "/home/mickg10/icecream-farm/runtime/opt/icecream",
+        "source_root": "/home/mickg10/icecream-farm/source",
+        "corpus_root": "/home/mickg10/icecream-farm/corpus",
+        "build_root": "/home/mickg10/icecream-farm/build",
+        "results_root": "/home/mickg10/icecream-farm/results",
+        "state_root": "/home/mickg10/icecream-farm/state"
       }
     }
   },

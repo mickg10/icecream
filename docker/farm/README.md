@@ -22,9 +22,14 @@ manifest and is not enabled by this launcher.
 The retained read-only snapshot is
 [`inventory/2026-08-21-local-lan.json`](inventory/2026-08-21-local-lan.json). From `nas642`,
 `research6`, `research7`, and `quietbox2`, every explicit LAN target answered ICMP and TCP/22.
+The dependency and quietbox3 follow-up is retained separately in
+[`inventory/2026-08-22-p50-dependencies.json`](inventory/2026-08-22-p50-dependencies.json).
 Current launch blockers are represented as preflight failures rather than guesses:
 
-- `quietbox3` answers on the LAN, but its SSH account/interface/Docker facts are not available.
+- `quietbox3` is inventoried at `10.0.27.101` as `mickg10`, with interface
+  `enp10s0f1np1`, 32 visible CPUs, passwordless administrative access, and a working Docker engine.
+  Its exact runtime/compiler images are staged; launch remains disabled only until its host-local
+  runtime, source, and corpus mount roots are populated.
 - `research7` is reachable, but the inventoried account cannot use Docker.
 - `research6` accepts Docker metadata operations, but the live gate could not start even a bounded
   `true` container from the unpacked runtime image; the daemon reported a fatal session-health error.
@@ -32,8 +37,9 @@ Current launch blockers are represented as preflight failures rather than guesse
   `quietbox2`; research6 remains launch-disabled because its engine could not start a bounded
   container.
 - submitter-specific source, corpus, build, and result roots are not yet present on every submitter.
-- all four build-environment images exist on `quietbox2`; the Debian image is also staged on
-  `nas642` for the retained smoke attempt.
+- P50-capable derivatives of all four build-environment images are staged identically on
+  `quietbox2`, `quietbox3`, and the default submitter `nas642`. The original
+  corpus-producing `v2` images remain unchanged.
 
 `preflight` is read-only and reports all selected-host failures. `up` performs that same check before
 creating any directory or container.
@@ -83,12 +89,14 @@ There are two separate concepts:
 
 | environment | exact tag | compiler / standard library | verified corpus cells |
 |---|---|---|---:|
-| `debian-gcc` | `ice-ii/debian-gcc:v2` | GCC 12.2 / libstdc++ 12 | 11 |
-| `fedora-clang-libcxx` | `ice-ii/fedora-clang-libcxx:v2` | Clang 20.1.8 / libc++ | 11 |
-| `linuxbrew` | `ice-ii/linuxbrew:v2` | Clang 22.1.8 / libstdc++ 12 | 11 |
-| `conan-gcc` | `ice-ii/conan-gcc:v2` | GCC 14.2 / libstdc++ 14 | 11 |
+| `debian-gcc` | `ice-ii/debian-gcc:v2-p50` | GCC 12.2 / libstdc++ 12 | 11 |
+| `fedora-clang-libcxx` | `ice-ii/fedora-clang-libcxx:v2-p50` | Clang 20.1.8 / libc++ | 11 |
+| `linuxbrew` | `ice-ii/linuxbrew:v2-p50` | Clang 22.1.8 / libstdc++ 12 | 11 |
+| `conan-gcc` | `ice-ii/conan-gcc:v2-p50` | GCC 14.2 / libstdc++ 14 | 11 |
 
-The manifest retains the inventoried engine IDs and local content-addressed RepoDigests and pins a
+The original `v2` tags are the corpus provenance; the separate `v2-p50` derivatives add only the
+libraries needed to build the current tree. Their Dockerfiles are retained under
+`docker/farm/environments/`. The manifest retains the inventoried engine IDs and pins a
 portable fingerprint over OS, architecture, runtime config, and uncompressed layer
 hashes. Docker engines using legacy and containerd stores can report different `.Id` values for the
 same saved image; the portable fingerprint is the cross-engine launch gate, while both native IDs

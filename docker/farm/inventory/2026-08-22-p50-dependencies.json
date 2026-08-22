@@ -1,0 +1,95 @@
+{
+  "schema": 1,
+  "collected_date": "2026-08-22",
+  "controller": "nas642",
+  "network": "10.0.27.0/24 local LAN",
+  "host_dependencies": {
+    "package_set": [
+      "Boost >= 1.74",
+      "xxHash >= 0.8.0",
+      "Zstandard >= 1.4.0",
+      "LZO 2",
+      "libarchive",
+      "libcap-ng"
+    ],
+    "nas642": {
+      "mode": "user-owned unpacked Ubuntu 22.04 prefix",
+      "prefix": "/tanksmall/MICKG2/mickg/src/mickg10/icecream-deps/ubuntu22-p50-root",
+      "cxx23_link_run_probe": "pass"
+    },
+    "research6": {
+      "mode": "user-owned unpacked Ubuntu 22.04 prefix",
+      "prefix": "/home/mickg/icecream-deps/ubuntu22-p50-root",
+      "cxx23_link_run_probe": "pass"
+    },
+    "research7": {
+      "mode": "user-owned unpacked Ubuntu 22.04 prefix",
+      "prefix": "/home/mickg/icecream-deps/ubuntu22-p50-root",
+      "cxx23_link_run_probe": "pass"
+    },
+    "quietbox2": {
+      "mode": "Ubuntu 22.04 system development packages",
+      "cxx23_link_run_probe": "pass"
+    },
+    "quietbox3": {
+      "mode": "Ubuntu 22.04 system development packages",
+      "hostname": "tt-quietbox3",
+      "address": "10.0.27.101",
+      "ssh_user": "mickg10",
+      "interface": "enp10s0f1np1",
+      "visible_cpus": 32,
+      "memory_gib": 503,
+      "docker": "29.7.2",
+      "compose": "5.5.0",
+      "docker_permission": true,
+      "cxx23_link_run_probe": "pass"
+    }
+  },
+  "runtime_image": {
+    "tag": "icecream/farm-node:ubuntu22-gcc11-boost174",
+    "portable_content_fingerprint": "sha256:86fc3f4ba688614d99ca772efa153a9c3b1afef7a1496965362d794d7fa15fc2",
+    "quietbox2_engine_id": "sha256:bdb55d4287a473e3ebfbaa7715a50ee670659777278b8d84c350724e6fa8de58",
+    "quietbox3_engine_id": "sha256:bdb55d4287a473e3ebfbaa7715a50ee670659777278b8d84c350724e6fa8de58"
+  },
+  "p50_environment_images": {
+    "debian-gcc": {
+      "tag": "ice-ii/debian-gcc:v2-p50",
+      "engine_id": "sha256:6ffc19cb366ce13373709b7980370684f9e77559c8695b300a8b8676856bd518",
+      "portable_content_fingerprint": "sha256:a1b038223f2de802aa218d08374df6b0df4c3c18cbf8d595c6d10ad7908d8b03",
+      "cxx23_link_run_probe": "pass"
+    },
+    "conan-gcc": {
+      "tag": "ice-ii/conan-gcc:v2-p50",
+      "engine_id": "sha256:ed6125708a1fbf688480405cf6e86a1d79ca1a806dde2e31ec8de203637326df",
+      "portable_content_fingerprint": "sha256:b98dca7a80f4f2f465bbc8e6c123017cc06f51ebd167a8f4a104866e8e60abde",
+      "cxx23_link_run_probe": "pass"
+    },
+    "fedora-clang-libcxx": {
+      "tag": "ice-ii/fedora-clang-libcxx:v2-p50",
+      "engine_id": "sha256:b6a3824ee3e7928c588d558137538b2a23574395b04e5372f4e8011b607d1660",
+      "portable_content_fingerprint": "sha256:f43d9aebdfa46de6c5da830b4785dbc264ff24f9f1fa2e36cddfcbd3149300dd",
+      "cxx23_link_run_probe": "pass"
+    },
+    "linuxbrew": {
+      "tag": "ice-ii/linuxbrew:v2-p50",
+      "engine_id": "sha256:6fb8cd2fcc6385b6e0e0496893b0dbe3cc47ccbd739d151abdbef632f0591081",
+      "portable_content_fingerprint": "sha256:3b365bc220e628d9919d3b230bede12a2e30a7664c981f5811987d576757f7f3",
+      "cxx23_link_run_probe": "pass"
+    }
+  },
+  "image_distribution": {
+    "quietbox2": "all five exact images present",
+    "quietbox3": "all five exact images present and fingerprint-identical to quietbox2",
+    "nas642": {
+      "status": "all four P50 environment images present and fingerprint-identical to both quietboxes",
+      "engine_ids": {
+        "debian-gcc": "sha256:bf56e3397c20fc68260df088edaeaf9974c08bea93c2a1f48d266736663607e2",
+        "conan-gcc": "sha256:73c0d2615acbdac51a124ca3a2a80c844e77383e67c497c7c2dd4c04fa74c60c",
+        "fedora-clang-libcxx": "sha256:eb4a1219832900a5b9d7e5189dbfa277699550906c6b70b26020c7dbfabf5f96",
+        "linuxbrew": "sha256:372ce4991b5f35082fff0fbfe7711718572410120a2d35adf91248092399c84d"
+      }
+    }
+  },
+  "original_environment_images": "the four v2 corpus-producing tags remain unchanged",
+  "remaining_launch_boundary": "stage one accepted unified source tree, its installed runtime prefix, and corpus roots before enabling quietbox3"
+}
