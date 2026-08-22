@@ -4258,6 +4258,14 @@ static void close_assignment_transport_session()
 static bool authorize_assignment_claim(const CompileJob &job, uint32_t claimant)
 {
     const uint32_t wire_id = job.jobID();
+    /* A remote claim never has authority without the scheduler-assigned wire
+       identity.  CompileFile's wholly-absent P50 identity is frame-valid for
+       the local CLIENTWORK path, but that path bypasses this function.  Reject
+       wire zero here, before even ADVISORY can create a live placeholder. */
+    if (wire_id == 0) {
+        ++assignment_claim_rejects;
+        return false;
+    }
     if (assignment_fence_mode == ConfCSMsg::Legacy) {
         return true;   // exact protocol-48/default-disabled behavior
     }

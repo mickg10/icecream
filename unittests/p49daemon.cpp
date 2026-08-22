@@ -432,12 +432,35 @@ int main(int argc, char **argv)
                 ConfCSMsg(advisory_epoch, ConfCSMsg::Advisory)),
             "fresh ADVISORY epoch resets the bounded table");
 
+    MsgChannel *zero_claim = connect_daemon(socket_path);
+    REQUIRE(zero_claim && send_claim(zero_claim, 0),
+            "remote ADVISORY claim with wholly absent identity sent");
+    Msg *zero_end = wait_type(zero_claim, Msg::END, 3000);
+    REQUIRE(zero_end || (zero_claim && zero_claim->at_eof()),
+            "remote zero-wire claim is rejected before admission");
+    delete zero_end;
+    delete zero_claim;
+    REQUIRE(no_type(scheduler, Msg::JOB_BEGIN, 400),
+            "remote zero-wire rejection emits no JobBegin(0)");
+    const std::string after_zero_claim = request_internals(socket_path);
+    const std::string empty_advisory_epoch =
+        "Assignment fence: mode=1 epoch=" + std::to_string(advisory_epoch)
+        + " live=0 retained=0 closed=0";
+    REQUIRE(after_zero_claim.find(empty_advisory_epoch) != std::string::npos,
+            "remote zero-wire rejection creates no live assignment entry");
+
     const uint32_t advisory_id = 1201;
     const uint64_t advisory_nonce = UINT64_C(0x8100000000001201);
     MsgChannel *advisory_claim = connect_daemon(socket_path);
     REQUIRE(advisory_claim && send_claim(advisory_claim, advisory_id),
-            "ADVISORY admits an unknown nonce-less legacy claim");
-    usleep(100 * 1000);
+            "legitimate nonzero ADVISORY claim follows zero rejection");
+    Msg *advisory_begin = wait_type(scheduler, Msg::JOB_BEGIN, 3000);
+    JobBeginMsg *advisory_begin_typed =
+        dynamic_cast<JobBeginMsg *>(advisory_begin);
+    REQUIRE(advisory_begin_typed
+                && advisory_begin_typed->job_id == advisory_id,
+            "legitimate nonzero claim still reaches real daemon admission");
+    delete advisory_begin;
     REQUIRE(scheduler->send_msg(AssignPrepareMsg(
                 advisory_epoch, advisory_id, advisory_nonce, 9)),
             "late PREPARE binds the Advisory claim identity");

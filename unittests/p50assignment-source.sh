@@ -28,6 +28,8 @@ require_count 1 'record.key.epoch == job.assignmentEpoch()' daemon/main.cpp \
     'fulfillment admission compares the complete epoch'
 require_count 1 'record.key.nonce == job.assignmentNonce()' daemon/main.cpp \
     'fulfillment admission compares the complete nonce'
+require_count 1 'if (wire_id == 0)' daemon/main.cpp \
+    'remote claim authority rejects the absent wire identity before admission'
 require_count 1 'export ICECC_TEST_ASSIGNMENT_FENCE_MODE=strict-nonce' \
     unittests/p50assignment-remote.sh \
     'strict production client row remains selected independently'
