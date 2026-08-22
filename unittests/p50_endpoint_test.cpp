@@ -23,6 +23,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -99,6 +100,31 @@ std::vector<uint8_t> pseudo_random_bytes(size_t count) {
     return result;
 }
 
+std::vector<uint8_t> drain_input(InputCursor& cursor, size_t chunk_size = 113) {
+    std::vector<uint8_t> result;
+    std::vector<uint8_t> chunk(chunk_size);
+    while (!cursor.eof()) {
+        const size_t count = cursor.read(chunk);
+        require(count != 0, "non-EOF InputRecord cursor made no progress");
+        result.insert(result.end(), chunk.begin(), chunk.begin() + count);
+    }
+    return result;
+}
+
+std::optional<std::vector<uint8_t>> copy_input(P50ServerEndpoint& server,
+                                                CStoreGuid c_store_guid) {
+    const std::optional<InputRecordKey> key =
+        server.last_committed_input(c_store_guid);
+    if (!key)
+        return std::nullopt;
+    try {
+        InputCursor cursor = server.attach_input(*key);
+        return drain_input(cursor);
+    } catch (const std::logic_error&) {
+        return std::nullopt;
+    }
+}
+
 std::vector<uint8_t> standalone_zstd_frame(std::span<const uint8_t> input) {
     std::vector<uint8_t> result(ZSTD_compressBound(input.size()));
     const size_t encoded =
@@ -119,6 +145,14 @@ struct PairResult {
     ServerRunResult server;
 };
 
+struct CompetingPairResult {
+    ClientRunResult first_client;
+    ClientRunResult second_client;
+    ServerRunResult first_server;
+    ServerRunResult second_server;
+    P50ServerOwnerUsage usage;
+};
+
 PairResult run_pair(P50ClientEndpoint& client, P50ServerEndpoint& server,
                     PreparedTuHandle prepared = {}, EndpointIoControl client_control = {},
                     EndpointIoControl server_control = {}) {
@@ -131,6 +165,42 @@ PairResult run_pair(P50ClientEndpoint& client, P50ServerEndpoint& server,
         asio::use_future);
     context.run();
     return {client_result.get(), server_result.get()};
+}
+
+CompetingPairResult run_competing_pair(P50ServerEndpointConfig config,
+                                        uint64_t identity_base,
+                                        size_t first_raw_bytes,
+                                        size_t second_raw_bytes) {
+    P50ServerEndpoint server(Id128::from_u64(identity_base), {}, nullptr, nullptr,
+                             std::move(config));
+    TestClient first(Id128::from_u64(identity_base + 1));
+    TestClient second(Id128::from_u64(identity_base + 2));
+    const PreparedTuHandle first_prepared =
+        admit(first, pseudo_random_bytes(first_raw_bytes));
+    const PreparedTuHandle second_prepared =
+        admit(second, pseudo_random_bytes(second_raw_bytes));
+    EndpointIoControl first_control;
+    first_control.max_write_fragment = 1;
+    EndpointIoControl second_control;
+    second_control.max_write_fragment = 1;
+
+    asio::io_context context;
+    tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    std::future<ServerRunResult> first_server =
+        asio::co_spawn(context, server.accept_one(acceptor), asio::use_future);
+    std::future<ServerRunResult> second_server =
+        asio::co_spawn(context, server.accept_one(acceptor), asio::use_future);
+    std::future<ClientRunResult> first_client = asio::co_spawn(
+        context,
+        first.endpoint.run(acceptor.local_endpoint(), first_prepared, first_control),
+        asio::use_future);
+    std::future<ClientRunResult> second_client = asio::co_spawn(
+        context,
+        second.endpoint.run(acceptor.local_endpoint(), second_prepared, second_control),
+        asio::use_future);
+    context.run();
+    return {first_client.get(), second_client.get(), first_server.get(),
+            second_server.get(), server.owner_usage()};
 }
 
 void require_trace(const ActionTrace& trace, std::string_view context) {
@@ -1042,7 +1112,7 @@ void test_normal_zero_and_completion_stamps() {
             "normal loopback did not complete");
     require(first.client.reconnect == EndpointReconnectOutcome::ColdFStore,
             "first loopback did not take the explicit cold-F path");
-    require(server.committed_input(client.c_store_guid()) == input,
+    require(copy_input(server, client.c_store_guid()) == input,
             "normal loopback did not retain exact input");
 
     const std::vector<uint8_t> empty;
@@ -1050,7 +1120,7 @@ void test_normal_zero_and_completion_stamps() {
     require(second.client.status == ClientRunStatus::Committed &&
                 second.client.reconnect == EndpointReconnectOutcome::ExactMatch,
             "zero-length component transaction did not complete on the exact route");
-    require(server.committed_input(client.c_store_guid()) == empty,
+    require(copy_input(server, client.c_store_guid()) == empty,
             "zero-length ZSTD_TU did not materialize exactly");
 
     size_t bound_c = 0;
@@ -1213,7 +1283,7 @@ void test_completion_stamp_correspondence() {
             require(rejected.client.status == ClientRunStatus::Disconnected &&
                         rejected.server.status == ServerRunStatus::Disconnected &&
                         client.has_active_transaction() &&
-                        !server.committed_input(client.c_store_guid()),
+                        !copy_input(server, client.c_store_guid()),
                     context + " completion mutation was not rejected exactly");
 
             const PairResult replayed = run_pair(client, server);
@@ -1221,7 +1291,7 @@ void test_completion_stamp_correspondence() {
                         replayed.server.status == ServerRunStatus::Completed &&
                         replayed.client.reconnect == EndpointReconnectOutcome::ExactMatch &&
                         !client.has_active_transaction() &&
-                        server.committed_input(client.c_store_guid()) == input,
+                        copy_input(server, client.c_store_guid()) == input,
                     context + " completion rejection did not permit exact follow-up");
         }
     }
@@ -1250,7 +1320,7 @@ void test_completion_stamp_correspondence() {
     require(follow_up.client.status == ClientRunStatus::Committed &&
                 follow_up.server.status == ServerRunStatus::Completed &&
                 follow_up.client.reconnect == EndpointReconnectOutcome::ExactMatch &&
-                server.committed_input(client.c_store_guid()) == second_input,
+                copy_input(server, client.c_store_guid()) == second_input,
             "legal non-transaction completions did not preserve exact follow-up");
 }
 
@@ -1303,7 +1373,7 @@ void test_completion_live_identity_correspondence() {
                 rejected.client.status == ClientRunStatus::Disconnected &&
                 rejected.server.status == ServerRunStatus::Disconnected &&
                 client.has_active_transaction() &&
-                !server.committed_input(client.c_store_guid());
+                !copy_input(server, client.c_store_guid());
             if (!rejected_exactly) {
                 std::cerr << "p50_endpoint_test: " << context
                           << " mutation was not rejected exactly\n";
@@ -1316,7 +1386,7 @@ void test_completion_live_identity_correspondence() {
                         replayed.server.status == ServerRunStatus::Completed &&
                         replayed.client.reconnect == EndpointReconnectOutcome::ExactMatch &&
                         !client.has_active_transaction() &&
-                        server.committed_input(client.c_store_guid()) == input,
+                        copy_input(server, client.c_store_guid()) == input,
                     context + " rejection did not permit exact follow-up");
         }
     }
@@ -1351,7 +1421,7 @@ void test_completion_live_identity_correspondence() {
     require(follow_up.client.status == ClientRunStatus::Committed &&
                 follow_up.server.status == ServerRunStatus::Completed &&
                 follow_up.client.reconnect == EndpointReconnectOutcome::ExactMatch &&
-                server.committed_input(client.c_store_guid()) == second_input,
+                copy_input(server, client.c_store_guid()) == second_input,
             "legal unbound live identities did not preserve exact follow-up");
 }
 
@@ -1364,21 +1434,28 @@ void test_idempotent_prepare_admission() {
     require(first == replay && client.authority->live_entry_count() == 1 &&
                 client.authority->retained_encoded_bytes() != 0,
             "same prepare key/input did not return one retained authority entry");
+    std::vector<uint8_t> same_length_different = input;
+    same_length_different[same_length_different.size() / 2] ^= 1;
     require_throws<std::invalid_argument>(
-        [&] { (void)client.prepare(request, bytes("different bytes\n")); },
-        "prepare key was rebound to different input");
+        [&] { (void)client.prepare(request, same_length_different); },
+        "prepare key was rebound to different same-length input");
 
     auto other_authority =
         std::make_shared<P50PreparationAuthority>(Id128::from_u64(149));
     require_throws<std::invalid_argument>([&] { (void)other_authority->retain(first); },
                                           "foreign preparation handle was accepted");
-    require(client.authority->release(replay) == 1 &&
-                client.authority->release(first) == 0 &&
+    require(client.authority->release(replay) == 0 &&
                 client.authority->live_entry_count() == 0 &&
                 client.authority->retained_encoded_bytes() == 0,
-            "explicit preparation release did not reach exact zero");
+            "idempotent replay acquired an additional reference");
     require_throws<std::invalid_argument>([&] { (void)client.authority->release(first); },
                                           "zero-reference handle was released twice");
+
+    const PreparedTuHandle retained = client.prepare({7, 92}, input);
+    require(client.authority->retain(retained) == 2 &&
+                client.authority->release(retained) == 1 &&
+                client.authority->release(retained) == 0,
+            "explicit retain did not represent one additional owner");
 
     PreparationAuthorityLimits one_entry;
     one_entry.max_live_entries = 1;
@@ -1393,8 +1470,11 @@ void test_idempotent_prepare_admission() {
     require_throws<std::length_error>(
         [&] { (void)bounded->prepare(PrepareRequestKey{9, 2}, bytes("bounded second\n")); },
         "preparation authority exceeded its live-entry bound");
-    require(bounded->release(bounded_replay) == 1 && bounded->release(bounded_first) == 0,
-            "bounded replay references did not release to zero");
+    require(bounded->release(bounded_replay) == 0,
+            "bounded replay acquired an additional reference");
+    require_throws<std::invalid_argument>(
+        [&] { (void)bounded->release(bounded_first); },
+        "bounded replay retained an invisible owner");
 
     PreparationAuthorityLimits one_byte;
     one_byte.max_retained_encoded_bytes = 1;
@@ -1436,6 +1516,12 @@ void test_idempotent_prepare_admission() {
         [&] { P50PreparationAuthority rejected(CStoreGuid{}); },
         "zero C_STORE_GUID was accepted by the preparation authority");
     require_throws<std::invalid_argument>(
+        [&] { (void)client.prepare({0, 1}, input); },
+        "zero producer session was accepted by the preparation authority");
+    require_throws<std::invalid_argument>(
+        [&] { (void)client.prepare({1, 0}, input); },
+        "zero request token was accepted by the preparation authority");
+    require_throws<std::invalid_argument>(
         [&] { P50ServerEndpoint rejected(FStoreGuid{}); },
         "zero F_STORE_GUID was accepted by the endpoint");
     P50ServerEndpointConfig zero_error;
@@ -1469,6 +1555,409 @@ void test_idempotent_prepare_admission() {
         require_throws<std::invalid_argument>(
             [&] { P50ServerEndpoint rejected(Id128::from_u64(157), invalid); },
             "server endpoint accepted an out-of-range Zstd window log");
+    }
+}
+
+void test_candidate_stage_has_no_revision_residue() {
+    P50ServerEndpoint server(Id128::from_u64(154));
+    for (uint64_t index = 1; index != 17; ++index) {
+        TestClient candidate(Id128::from_u64(154 + index));
+        EndpointIoControl stop_after_hello;
+        stop_after_hello.close_after_write = MessageType::SESSION_HELLO;
+        const PairResult stopped = run_pair(
+            candidate, server, admit(candidate, bytes("candidate-only input\n")),
+            stop_after_hello);
+        require(stopped.client.status == ClientRunStatus::Disconnected &&
+                    stopped.server.status == ServerRunStatus::Disconnected &&
+                    server.namespace_count() == 0 && server.revision_count() == 0 &&
+                    server.live_session_count() == 0,
+                "unactivated candidate retained namespace, revision, or live-session state");
+    }
+
+    TestClient active(Id128::from_u64(171));
+    const PairResult committed =
+        run_pair(active, server, admit(active, bytes("activated input\n")));
+    require(committed.client.status == ClientRunStatus::Committed &&
+                committed.server.status == ServerRunStatus::Completed &&
+                server.namespace_count() == 1 && server.revision_count() == 1 &&
+                server.live_session_count() == 0,
+            "activated namespace did not acquire exactly one revision owner");
+}
+
+void test_input_record_owner_and_aggregate_limits() {
+    {
+        P50ServerEndpoint server(Id128::from_u64(172));
+        TestClient client(Id128::from_u64(173));
+        const std::vector<uint8_t> input = pseudo_random_bytes(32 * 1024);
+        const PairResult completed = run_pair(client, server, admit(client, input));
+        require(completed.client.status == ClientRunStatus::Committed &&
+                    completed.server.status == ServerRunStatus::Completed &&
+                    completed.server.committed_input.has_value() &&
+                    completed.server.committed_input ==
+                        server.last_committed_input(client.c_store_guid()) &&
+                    server.owner_usage().retained_input_records == 1 &&
+                    server.owner_usage().retained_input_bytes == input.size(),
+                "route commit did not atomically publish one InputRecord key");
+
+        InputCursor authorized = server.attach_input(*completed.server.committed_input);
+        std::array<uint8_t, 257> prefix{};
+        require(authorized.read(prefix) == prefix.size() &&
+                    std::equal(prefix.begin(), prefix.end(), input.begin()),
+                "authorized InputRecord cursor read the wrong prefix");
+        server.close_input_job(*completed.server.committed_input);
+        require_throws<std::logic_error>(
+            [&] { (void)server.attach_input(*completed.server.committed_input); },
+            "closed logical job accepted a new InputRecord attachment");
+        server.collect_input_garbage();
+        require(server.owner_usage().retained_input_records == 1,
+                "job close reclaimed input owned by an authorized cursor");
+        std::vector<uint8_t> reconstructed(prefix.begin(), prefix.end());
+        std::vector<uint8_t> remainder = drain_input(authorized);
+        reconstructed.insert(reconstructed.end(), remainder.begin(), remainder.end());
+        require(reconstructed == input,
+                "authorized cursor lost exact input after logical-job close");
+        authorized = InputCursor{};
+        server.collect_input_garbage();
+        require(server.owner_usage().retained_input_records == 0 &&
+                    server.owner_usage().retained_input_bytes == 0,
+                "closed InputRecord did not collect after its final cursor");
+    }
+
+    {
+        P50ServerEndpointConfig config;
+        config.input_job_state =
+            [](CStoreGuid, const TxBegin&, const TxCommit&, std::span<const uint8_t>) {
+                return InputJobState::Closed;
+            };
+        P50ServerEndpoint server(Id128::from_u64(174), {}, nullptr, nullptr,
+                                 std::move(config));
+        TestClient client(Id128::from_u64(175));
+        const PairResult completed =
+            run_pair(client, server, admit(client, bytes("late closed job input\n")));
+        require(completed.client.status == ClientRunStatus::Committed &&
+                    completed.server.status == ServerRunStatus::Completed &&
+                    !completed.server.committed_input &&
+                    server.owner_usage().retained_input_records == 0 &&
+                    server.owner_usage().retained_input_bytes == 0,
+                "closed-before-commit job created a compiler-visible lease");
+    }
+
+    {
+        P50ServerEndpoint server(Id128::from_u64(188));
+        TestClient client(Id128::from_u64(189));
+        const std::vector<uint8_t> input = pseudo_random_bytes(8192);
+        const PairResult completed = run_pair(client, server, admit(client, input));
+        require(completed.server.committed_input.has_value(),
+                "store-reset fixture did not publish an InputRecord");
+        InputCursor authorized = server.attach_input(*completed.server.committed_input);
+        server.reset_store(Id128::from_u64(190));
+        const P50ServerOwnerUsage reset_usage = server.owner_usage();
+        require(reset_usage.live_sessions == 0 && reset_usage.namespaces == 0 &&
+                    reset_usage.revisions == 0 && reset_usage.pending_encoded_bytes == 0 &&
+                    reset_usage.pending_raw_bytes == 0 &&
+                    reset_usage.decoder_window_bytes == 0 &&
+                    reset_usage.retained_input_records == 0 &&
+                    reset_usage.retained_input_bytes == 0 &&
+                    drain_input(authorized) == input,
+                "F-store replacement lost an authorized cursor or retained owner state");
+    }
+
+    {
+        P50ServerEndpointConfig config;
+        config.owner_limits.max_namespaces = 1;
+        P50ServerEndpoint server(Id128::from_u64(176), {}, nullptr, nullptr,
+                                 std::move(config));
+        TestClient first(Id128::from_u64(177));
+        TestClient second(Id128::from_u64(178));
+        require(run_pair(first, server, admit(first, bytes("first namespace\n")))
+                        .client.status == ClientRunStatus::Committed,
+                "first namespace did not fit its aggregate bound");
+        const PairResult rejected =
+            run_pair(second, server, admit(second, bytes("second namespace\n")));
+        require(rejected.client.status == ClientRunStatus::TerminalError &&
+                    rejected.server.status == ServerRunStatus::TerminalError &&
+                    server.owner_usage().namespaces == 1 &&
+                    server.owner_usage().revisions == 1,
+                "namespace-cap failure changed aggregate owner state");
+    }
+
+    {
+        P50ServerEndpointConfig config;
+        config.owner_limits.max_pending_encoded_bytes = 1;
+        P50ServerEndpoint server(Id128::from_u64(179), {}, nullptr, nullptr,
+                                 std::move(config));
+        TestClient client(Id128::from_u64(180));
+        const PairResult rejected =
+            run_pair(client, server, admit(client, pseudo_random_bytes(4096)));
+        const P50ServerOwnerUsage usage = server.owner_usage();
+        require(rejected.client.status == ClientRunStatus::TerminalError &&
+                    rejected.server.status == ServerRunStatus::TerminalError &&
+                    client.has_active_transaction() &&
+                    usage.pending_encoded_bytes == 0 && usage.pending_raw_bytes == 0 &&
+                    usage.decoder_window_bytes == 0 && usage.retained_input_records == 0,
+                "pending-input cap failure leaked an aggregate reservation");
+    }
+
+    {
+        P50ServerEndpointConfig config;
+        config.owner_limits.max_pending_encoded_bytes = 4096;
+        config.owner_limits.max_decoder_window_bytes =
+            uint64_t{2} << EndpointCaps{}.zstd.max_window_log;
+        const CompetingPairResult result =
+            run_competing_pair(std::move(config), 196, 3000, 3001);
+        const size_t committed =
+            static_cast<size_t>(result.first_client.status ==
+                                ClientRunStatus::Committed) +
+            static_cast<size_t>(result.second_client.status ==
+                                ClientRunStatus::Committed);
+        const size_t completed =
+            static_cast<size_t>(result.first_server.status ==
+                                ServerRunStatus::Completed) +
+            static_cast<size_t>(result.second_server.status ==
+                                ServerRunStatus::Completed);
+        const size_t terminal =
+            static_cast<size_t>(result.first_server.status ==
+                                ServerRunStatus::TerminalError) +
+            static_cast<size_t>(result.second_server.status ==
+                                ServerRunStatus::TerminalError);
+        require(committed == 1 && completed == 1 && terminal == 1 &&
+                    result.usage.pending_encoded_bytes == 0 &&
+                    result.usage.pending_raw_bytes == 0 &&
+                    result.usage.decoder_window_bytes == 0 &&
+                    result.usage.retained_input_records == 1,
+                "aggregate encoded-byte budget admitted overlapping dialogues");
+    }
+
+    {
+        P50ServerEndpointConfig config;
+        config.owner_limits.max_pending_encoded_bytes = 8192;
+        config.owner_limits.max_pending_raw_bytes = 4096;
+        config.owner_limits.max_decoder_window_bytes =
+            uint64_t{2} << EndpointCaps{}.zstd.max_window_log;
+        const CompetingPairResult result =
+            run_competing_pair(std::move(config), 199, 3000, 3001);
+        const size_t committed =
+            static_cast<size_t>(result.first_client.status ==
+                                ClientRunStatus::Committed) +
+            static_cast<size_t>(result.second_client.status ==
+                                ClientRunStatus::Committed);
+        const size_t completed =
+            static_cast<size_t>(result.first_server.status ==
+                                ServerRunStatus::Completed) +
+            static_cast<size_t>(result.second_server.status ==
+                                ServerRunStatus::Completed);
+        const size_t terminal =
+            static_cast<size_t>(result.first_server.status ==
+                                ServerRunStatus::TerminalError) +
+            static_cast<size_t>(result.second_server.status ==
+                                ServerRunStatus::TerminalError);
+        require(committed == 1 && completed == 1 && terminal == 1 &&
+                    result.usage.pending_encoded_bytes == 0 &&
+                    result.usage.pending_raw_bytes == 0 &&
+                    result.usage.decoder_window_bytes == 0 &&
+                    result.usage.retained_input_records == 1,
+                "aggregate raw-byte budget admitted overlapping dialogues");
+    }
+
+    {
+        P50ServerEndpointConfig config;
+        config.owner_limits.max_retained_input_bytes = 8;
+        P50ServerEndpoint server(Id128::from_u64(181), {}, nullptr, nullptr,
+                                 std::move(config));
+        TestClient client(Id128::from_u64(182));
+        const PairResult rejected =
+            run_pair(client, server, admit(client, bytes("larger than eight bytes")));
+        const P50ServerOwnerUsage usage = server.owner_usage();
+        require(rejected.client.status == ClientRunStatus::TerminalError &&
+                    rejected.server.status == ServerRunStatus::TerminalError &&
+                    client.has_active_transaction() && usage.retained_input_records == 0 &&
+                    usage.retained_input_bytes == 0 && usage.pending_encoded_bytes == 0 &&
+                    usage.pending_raw_bytes == 0 && usage.decoder_window_bytes == 0,
+                "InputRecord-cap failure committed or leaked owner resources");
+    }
+
+    {
+        P50ServerEndpointConfig config;
+        config.owner_limits.max_retained_input_records = 1;
+        P50ServerEndpoint server(Id128::from_u64(202), {}, nullptr, nullptr,
+                                 std::move(config));
+        TestClient client(Id128::from_u64(203));
+        const PairResult first =
+            run_pair(client, server, admit(client, bytes("first retained input\n")));
+        const PairResult second =
+            run_pair(client, server, admit(client, bytes("second retained input\n")));
+        const P50ServerOwnerUsage usage = server.owner_usage();
+        require(first.client.status == ClientRunStatus::Committed &&
+                    first.server.status == ServerRunStatus::Completed &&
+                    second.client.status == ClientRunStatus::TerminalError &&
+                    second.server.status == ServerRunStatus::TerminalError &&
+                    usage.retained_input_records == 1 &&
+                    usage.pending_encoded_bytes == 0 &&
+                    usage.pending_raw_bytes == 0 &&
+                    usage.decoder_window_bytes == 0,
+                "InputRecord-count bound admitted a second retained input");
+    }
+
+    {
+        CompletionLog completions(0);
+        ActionTrace actions(0);
+        P50ServerEndpoint server(Id128::from_u64(183), {}, &completions, &actions);
+        TestClient client(Id128::from_u64(184), {}, HistoryNonce{1}, &completions,
+                          &actions);
+        const PairResult completed =
+            run_pair(client, server, admit(client, bytes("diagnostic loss is not state\n")));
+        require(completed.client.status == ClientRunStatus::Committed &&
+                    completed.server.status == ServerRunStatus::Completed &&
+                    !completions.valid() && completions.completions().empty() &&
+                    !actions.valid() && actions.records().empty() &&
+                    server.owner_usage().retained_input_records == 1,
+                "bounded diagnostic loss changed the durable protocol result");
+    }
+
+    {
+        P50ServerEndpointConfig config;
+        config.owner_limits.max_live_sessions = 1;
+        P50ServerEndpoint server(Id128::from_u64(191), {}, nullptr, nullptr,
+                                 std::move(config));
+        TestClient client(Id128::from_u64(192));
+        const PreparedTuHandle prepared =
+            admit(client, bytes("one accepted live session\n"));
+        asio::io_context context;
+        tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+        std::future<ServerRunResult> accepted =
+            asio::co_spawn(context, server.accept_one(acceptor), asio::use_future);
+        std::future<ServerRunResult> excess =
+            asio::co_spawn(context, server.accept_one(acceptor), asio::use_future);
+        std::future<ClientRunResult> client_result = asio::co_spawn(
+            context, client.endpoint.run(acceptor.local_endpoint(), prepared),
+            asio::use_future);
+        context.run();
+        require(client_result.get().status == ClientRunStatus::Committed &&
+                    accepted.get().status == ServerRunStatus::Completed,
+                "live-session bound rejected its admitted dialogue");
+        require_throws<std::length_error>(
+            [&] { (void)excess.get(); },
+            "live-session aggregate bound admitted an extra dialogue");
+        require(server.owner_usage().live_sessions == 0,
+                "live-session bound retained a completed session");
+    }
+
+    {
+        P50ServerEndpointConfig config;
+        config.owner_limits.max_decoder_window_bytes =
+            uint64_t{1} << EndpointCaps{}.zstd.max_window_log;
+        P50ServerEndpoint server(Id128::from_u64(193), {}, nullptr, nullptr,
+                                 std::move(config));
+        TestClient first(Id128::from_u64(194));
+        TestClient second(Id128::from_u64(195));
+        const PreparedTuHandle first_prepared =
+            admit(first, pseudo_random_bytes(4096));
+        const PreparedTuHandle second_prepared =
+            admit(second, pseudo_random_bytes(4097));
+        EndpointIoControl fragment_first;
+        fragment_first.max_write_fragment = 1;
+        EndpointIoControl fragment_second;
+        fragment_second.max_write_fragment = 1;
+        asio::io_context context;
+        tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+        std::future<ServerRunResult> first_server =
+            asio::co_spawn(context, server.accept_one(acceptor), asio::use_future);
+        std::future<ServerRunResult> second_server =
+            asio::co_spawn(context, server.accept_one(acceptor), asio::use_future);
+        std::future<ClientRunResult> first_client = asio::co_spawn(
+            context,
+            first.endpoint.run(acceptor.local_endpoint(), first_prepared,
+                               fragment_first),
+            asio::use_future);
+        std::future<ClientRunResult> second_client = asio::co_spawn(
+            context,
+            second.endpoint.run(acceptor.local_endpoint(), second_prepared,
+                                fragment_second),
+            asio::use_future);
+        context.run();
+        const ClientRunResult first_client_result = first_client.get();
+        const ClientRunResult second_client_result = second_client.get();
+        const ServerRunResult first_server_result = first_server.get();
+        const ServerRunResult second_server_result = second_server.get();
+        const size_t committed_clients =
+            static_cast<size_t>(first_client_result.status == ClientRunStatus::Committed) +
+            static_cast<size_t>(second_client_result.status == ClientRunStatus::Committed);
+        const size_t completed_servers =
+            static_cast<size_t>(first_server_result.status == ServerRunStatus::Completed) +
+            static_cast<size_t>(second_server_result.status == ServerRunStatus::Completed);
+        const size_t terminal_servers =
+            static_cast<size_t>(first_server_result.status == ServerRunStatus::TerminalError) +
+            static_cast<size_t>(second_server_result.status == ServerRunStatus::TerminalError);
+        const P50ServerOwnerUsage usage = server.owner_usage();
+        require(committed_clients == 1 && completed_servers == 1 && terminal_servers == 1 &&
+                    usage.pending_encoded_bytes == 0 && usage.pending_raw_bytes == 0 &&
+                    usage.decoder_window_bytes == 0 &&
+                    usage.retained_input_records == 1,
+                "aggregate decoder-window budget admitted overlapping dialogues");
+    }
+
+    {
+        auto authority =
+            std::make_shared<P50PreparationAuthority>(Id128::from_u64(185));
+        const PreparedTuHandle prepared =
+            authority->prepare({1, 1}, bytes("single owner thread\n"));
+        bool rejected = false;
+        std::thread other([&] {
+            try {
+                (void)authority->retain(prepared);
+            } catch (const std::logic_error&) {
+                rejected = true;
+            }
+        });
+        other.join();
+        require(rejected && authority->release(prepared) == 0,
+                "mutable preparation state crossed its established owner thread");
+    }
+
+    {
+        P50ServerEndpoint server(Id128::from_u64(204));
+        TestClient client(Id128::from_u64(205));
+        require(run_pair(client, server,
+                         admit(client, bytes("endpoint owner thread\n")))
+                        .client.status == ClientRunStatus::Committed,
+                "endpoint thread-owner fixture did not commit");
+        bool client_rejected = false;
+        bool server_rejected = false;
+        std::thread other([&] {
+            try {
+                (void)client.endpoint.next_rel_seq();
+            } catch (const std::logic_error&) {
+                client_rejected = true;
+            }
+            try {
+                server.collect_input_garbage();
+            } catch (const std::logic_error&) {
+                server_rejected = true;
+            }
+        });
+        other.join();
+        require(client_rejected && server_rejected,
+                "client or server mutable state crossed its established owner thread");
+    }
+
+    {
+        P50ServerEndpointConfig invalid;
+        invalid.owner_limits.max_live_sessions = 0;
+        require_throws<std::invalid_argument>(
+            [&] {
+                P50ServerEndpoint rejected(Id128::from_u64(186), {}, nullptr, nullptr,
+                                           invalid);
+            },
+            "zero aggregate live-session bound was accepted");
+        invalid = {};
+        invalid.owner_limits.max_decoder_window_bytes =
+            (uint64_t{1} << EndpointCaps{}.zstd.max_window_log) - 1;
+        require_throws<std::invalid_argument>(
+            [&] {
+                P50ServerEndpoint rejected(Id128::from_u64(187), {}, nullptr, nullptr,
+                                           invalid);
+            },
+            "decoder-window aggregate bound admitted no complete dialogue");
     }
 }
 
@@ -1510,7 +1999,7 @@ void test_exact_replay_and_lost_final() {
         require(replayed.client.status == ClientRunStatus::Committed &&
                     replayed.client.reconnect == EndpointReconnectOutcome::ExactMatch,
                 "exact replay did not commit on the unchanged route");
-        require(server.committed_input(client.c_store_guid()) == input,
+        require(copy_input(server, client.c_store_guid()) == input,
                 "exact replay materialized different bytes");
         require(std::any_of(actions.records().begin(), actions.records().end(),
                             [](const ActionRecord& record) {
@@ -1532,7 +2021,7 @@ void test_exact_replay_and_lost_final() {
         require(interrupted.client.status == ClientRunStatus::Disconnected &&
                     client.has_active_transaction(),
                 "lost-final window did not retain C active state");
-        require(server.committed_input(client.c_store_guid()) == input,
+        require(copy_input(server, client.c_store_guid()) == input,
                 "F did not retain its completed input before final-message loss");
         const PairResult reconciled = run_pair(client, server);
         require(reconciled.client.status == ClientRunStatus::Committed &&
@@ -1549,7 +2038,7 @@ void test_exact_replay_and_lost_final() {
         const std::vector<uint8_t> input =
             bytes("publication must precede route commit\n");
         P50ServerEndpointConfig config;
-        config.precommit_publish =
+        config.input_job_state =
             [&](CStoreGuid published_guid, const TxBegin& begin,
                 const TxCommit& commit, std::span<const uint8_t> exact) {
                 ++publication_attempts;
@@ -1563,6 +2052,7 @@ void test_exact_replay_and_lost_final() {
                         "precommit publisher received the wrong exact tuple or bytes");
                 if (publication_attempts == 1)
                     throw std::bad_alloc();
+                return InputJobState::Open;
             };
         P50ServerEndpoint server(Id128::from_u64(410), {}, nullptr, &actions,
                                  std::move(config));
@@ -1574,13 +2064,13 @@ void test_exact_replay_and_lost_final() {
                     rejected.client.whole_new_attempt &&
                     rejected.server.status == ServerRunStatus::TerminalError &&
                     client.has_active_transaction() &&
-                    !server.committed_input(client.c_store_guid()) &&
+                    !copy_input(server, client.c_store_guid()) &&
                     publication_attempts == 1,
                 "failed precommit publication advanced or discarded the transaction");
         const PairResult replayed = run_pair(client, server);
         require(replayed.client.status == ClientRunStatus::Committed &&
                     replayed.client.reconnect == EndpointReconnectOutcome::ExactMatch &&
-                    server.committed_input(client.c_store_guid()) == input &&
+                    copy_input(server, client.c_store_guid()) == input &&
                     publication_attempts == 2,
                 "allocation-failure transaction did not replay and publish exactly");
         require(std::any_of(actions.records().begin(), actions.records().end(),
@@ -1604,11 +2094,11 @@ void test_completion_identity_and_store_replacement() {
         const PairResult rejected = run_pair(client, server, admit(client, input), wrong);
         require(rejected.client.status == ClientRunStatus::Disconnected &&
                     client.has_active_transaction() &&
-                    !server.committed_input(client.c_store_guid()),
+                    !copy_input(server, client.c_store_guid()),
                 "wrong-digest completion changed endpoint state");
         const PairResult replayed = run_pair(client, server);
         require(replayed.client.status == ClientRunStatus::Committed &&
-                    server.committed_input(client.c_store_guid()) == input,
+                    copy_input(server, client.c_store_guid()) == input,
                 "wrong-digest completion was not recoverable by exact replay");
         require_trace(actions, "wrong-digest completion trace");
     }
@@ -1627,13 +2117,13 @@ void test_completion_identity_and_store_replacement() {
         require(rejected.server.status == ServerRunStatus::Disconnected &&
                     rejected.client.status == ClientRunStatus::Disconnected &&
                     client.has_active_transaction() &&
-                    !server.committed_input(client.c_store_guid()),
+                    !copy_input(server, client.c_store_guid()),
                 alter_raw_digest
                     ? "late raw-digest completion changed endpoint state"
                     : "late transaction-digest completion changed endpoint state");
         const PairResult replayed = run_pair(client, server);
         require(replayed.client.status == ClientRunStatus::Committed &&
-                    server.committed_input(client.c_store_guid()) == input,
+                    copy_input(server, client.c_store_guid()) == input,
                 alter_raw_digest
                     ? "late raw-digest completion did not permit exact replay"
                     : "late transaction-digest completion did not permit exact replay");
@@ -1662,14 +2152,14 @@ void test_completion_identity_and_store_replacement() {
         require(reset_done && invalidated.server.status == ServerRunStatus::Disconnected &&
                     invalidated.client.status == ClientRunStatus::Disconnected &&
                     client.has_active_transaction() && server.f_store_guid() == second_guid &&
-                    !server.committed_input(client.c_store_guid()),
+                    !copy_input(server, client.c_store_guid()),
                 "F reset did not fence its old in-flight completion");
         const PairResult replaced = run_pair(client, server);
         require(replaced.client.status == ClientRunStatus::Committed &&
                     replaced.client.reconnect == EndpointReconnectOutcome::ColdFStore &&
                     replaced.client.whole_new_attempt &&
                     replaced.server.session_serial > invalidated.server.session_serial &&
-                    server.committed_input(client.c_store_guid()) == input,
+                    copy_input(server, client.c_store_guid()) == input,
                 "precommit F-incarnation replacement did not preserve exact prepared work");
         require(std::any_of(actions.records().begin(), actions.records().end(),
                             [](const ActionRecord& record) {
@@ -1703,14 +2193,14 @@ void test_completion_identity_and_store_replacement() {
             run_pair(client, server, admit(client, input), {}, lose_final);
         require(durable.client.status == ClientRunStatus::Disconnected &&
                     client.has_active_transaction() &&
-                    server.committed_input(client.c_store_guid()) == input,
+                    copy_input(server, client.c_store_guid()) == input,
                 "postcommit/pre-ack replacement fixture did not reach its durable window");
         server.reset_store(Id128::from_u64(472));
         const PairResult replaced = run_pair(client, server);
         require(replaced.client.status == ClientRunStatus::Committed &&
                     replaced.client.reconnect == EndpointReconnectOutcome::ColdFStore &&
                     replaced.client.whole_new_attempt &&
-                    server.committed_input(client.c_store_guid()) == input,
+                    copy_input(server, client.c_store_guid()) == input,
                 "postcommit/pre-ack F replacement did not replay exact prepared work");
         require_trace(actions, "postcommit/pre-ack F replacement trace");
     }
@@ -1735,7 +2225,7 @@ void test_same_f_route_reset() {
         require(repaired.client.status == ClientRunStatus::Committed &&
                     repaired.client.reconnect == EndpointReconnectOutcome::RouteHistoryReset,
                 "same-F route mismatch did not take the history-reset outcome");
-        require(server.committed_input(client.c_store_guid()) == input,
+        require(copy_input(server, client.c_store_guid()) == input,
                 "route-reset retry did not materialize exact input");
         require_trace(actions, "route-history-reset trace");
     }
@@ -1762,7 +2252,7 @@ void test_reset_ack_equality_and_terminal_result() {
         P50ServerEndpoint good(f_guid);
         const PairResult recovered = run_pair(client, good);
         require(recovered.client.status == ClientRunStatus::Committed &&
-                    good.committed_input(client.c_store_guid()) == input,
+                    copy_input(good, client.c_store_guid()) == input,
                 "bad HISTORY_RESET acknowledgement changed the queued PreparedTU");
     }
 
@@ -1784,7 +2274,7 @@ void test_reset_ack_equality_and_terminal_result() {
                 "cap-sized peer ERROR did not use the bounded terminal-result path");
         P50ServerEndpoint good(Id128::from_u64(581), exact_cap);
         require(run_pair(client, good).client.status == ClientRunStatus::Committed &&
-                    good.committed_input(client.c_store_guid()) == input,
+                    copy_input(good, client.c_store_guid()) == input,
                 "terminal peer ERROR changed the queued PreparedTU");
     }
 
@@ -1801,7 +2291,7 @@ void test_reset_ack_equality_and_terminal_result() {
                 "client framing failure bypassed the bounded terminal-result path");
         P50ServerEndpoint good(Id128::from_u64(586));
         require(run_pair(client, good).client.status == ClientRunStatus::Committed &&
-                    good.committed_input(client.c_store_guid()) == input,
+                    copy_input(good, client.c_store_guid()) == input,
                 "client framing failure changed the queued PreparedTU");
     }
 
@@ -1849,7 +2339,7 @@ void test_reset_ack_equality_and_terminal_result() {
         const PairResult recovered = run_pair(client, established);
         require(recovered.client.status == ClientRunStatus::Committed &&
                     recovered.client.reconnect == EndpointReconnectOutcome::ExactMatch &&
-                    established.committed_input(client.c_store_guid()) == input,
+                    copy_input(established, client.c_store_guid()) == input,
                 "terminal route-ack error changed exact replay identity");
         const auto replay_position = std::find_if(
             actions.records().begin(), actions.records().end(),
@@ -1920,7 +2410,7 @@ void test_handshake_binding_and_namespace_rules() {
         const ServerRunResult second = second_server.get();
         require(first.status == ServerRunStatus::Completed &&
                     second.status == ServerRunStatus::TerminalError &&
-                    server.committed_input(c_guid) == input,
+                    copy_input(server, c_guid) == input,
                 "incompatible HELLO bound or changed the live namespace");
     }
 
@@ -1950,7 +2440,7 @@ void test_handshake_binding_and_namespace_rules() {
         require(first.status == ServerRunStatus::Completed &&
                     second.status == ServerRunStatus::TerminalError &&
                     server.namespace_count() == 1 &&
-                    server.committed_input(c_guid) == input,
+                    copy_input(server, c_guid) == input,
                 "invalid compatible candidate installed or replaced the live namespace");
     }
 
@@ -1968,7 +2458,7 @@ void test_handshake_binding_and_namespace_rules() {
         context.run();
         peer_result.get();
         require(server_result.get().status == ServerRunStatus::TerminalError &&
-                    server.namespace_count() == 0 && !server.committed_input(c_guid),
+                    server.namespace_count() == 0 && !copy_input(server, c_guid),
                 "cold compatible candidate installed a namespace before validation");
     }
 
@@ -2000,7 +2490,7 @@ void test_handshake_binding_and_namespace_rules() {
         require(first_server.get().status == ServerRunStatus::Disconnected &&
                     second_server.get().status == ServerRunStatus::Completed &&
                     server.namespace_count() == 1 &&
-                    server.committed_input(c_guid) == input,
+                    copy_input(server, c_guid) == input,
                 "stale candidate replaced state from the newer activated session");
     }
 
@@ -2021,12 +2511,12 @@ void test_handshake_binding_and_namespace_rules() {
         const PairResult refused = run_pair(client, inconsistent);
         require(refused.client.status == ClientRunStatus::TerminalError &&
                     client.has_active_transaction() &&
-                    !inconsistent.committed_input(client.c_store_guid()),
+                    !copy_input(inconsistent, client.c_store_guid()),
                 "same GUID with an absent established namespace was treated as cold");
 
         const PairResult recovered = run_pair(client, established);
         require(recovered.client.status == ClientRunStatus::Committed &&
-                    established.committed_input(client.c_store_guid()) == input,
+                    copy_input(established, client.c_store_guid()) == input,
                 "same-GUID inconsistency changed the retained retry identity");
     }
 
@@ -2070,7 +2560,7 @@ void test_reserved_zero_endpoint_values() {
             bytes("valid relationship after reserved zero C GUID\n");
         require(run_pair(recovered, server, admit(recovered, input))
                             .client.status == ClientRunStatus::Committed &&
-                    server.committed_input(recovered.c_store_guid()) == input,
+                    copy_input(server, recovered.c_store_guid()) == input,
                 "zero C_STORE_GUID changed the subsequent cold relationship");
     }
 
@@ -2091,7 +2581,7 @@ void test_reserved_zero_endpoint_values() {
         peer_result.get();
         require(server_result.get().status == ServerRunStatus::TerminalError &&
                     server.namespace_count() == 0 &&
-                    !server.committed_input(c_guid),
+                    !copy_input(server, c_guid),
                 "zero HISTORY_NONCE left an F namespace or route");
 
         TestClient recovered(c_guid);
@@ -2099,7 +2589,7 @@ void test_reserved_zero_endpoint_values() {
             bytes("valid reset after reserved zero nonce\n");
         require(run_pair(recovered, server, admit(recovered, input))
                             .client.status == ClientRunStatus::Committed &&
-                    server.committed_input(c_guid) == input,
+                    copy_input(server, c_guid) == input,
                 "zero HISTORY_NONCE changed the subsequent cold relationship");
     }
 
@@ -2122,7 +2612,7 @@ void test_reserved_zero_endpoint_values() {
         P50ServerEndpoint good(Id128::from_u64(635));
         require(run_pair(client, good).client.status ==
                         ClientRunStatus::Committed &&
-                    good.committed_input(client.c_store_guid()) == input,
+                    copy_input(good, client.c_store_guid()) == input,
                 "zero F_STORE_GUID changed queued retry work");
     }
 
@@ -2145,7 +2635,7 @@ void test_reserved_zero_endpoint_values() {
         P50ServerEndpoint good(Id128::from_u64(637));
         require(run_pair(client, good).client.status ==
                         ClientRunStatus::Committed &&
-                    good.committed_input(client.c_store_guid()) == input,
+                    copy_input(good, client.c_store_guid()) == input,
                 "zero ERROR code changed queued retry work");
     }
 }
@@ -2169,7 +2659,7 @@ void test_interrupted_begin_identity() {
         context.run();
         interrupted = peer_result.get();
         require(server_result.get().status == ServerRunStatus::Disconnected &&
-                    !server.committed_input(c_guid),
+                    !copy_input(server, c_guid),
                 "partial BODY disconnect materialized or committed input");
     }
 
@@ -2186,7 +2676,7 @@ void test_interrupted_begin_identity() {
         context.run();
         peer_result.get();
         require(server_result.get().status == ServerRunStatus::TerminalError &&
-                    !server.committed_input(c_guid),
+                    !copy_input(server, c_guid),
                 "different begin at the interrupted cursor replaced retained identity");
     }
 
@@ -2202,7 +2692,7 @@ void test_interrupted_begin_identity() {
         context.run();
         peer_result.get();
         require(server_result.get().status == ServerRunStatus::Completed &&
-                    server.committed_input(c_guid) == input,
+                    copy_input(server, c_guid) == input,
                 "exact whole-TU replay did not commit after partial BODY disconnect");
     }
 
@@ -2234,7 +2724,7 @@ void test_terminal_body_failure_identity() {
         InterruptedRawTu interrupted = std::move(failure.first);
         ServerRunResult terminal = std::move(failure.second);
         require(terminal.status == ServerRunStatus::TerminalError &&
-                    !server.committed_input(c_guid),
+                    !copy_input(server, c_guid),
                 std::string(label) +
                     " failure materialized or committed input");
         require(std::any_of(
@@ -2260,12 +2750,12 @@ void test_terminal_body_failure_identity() {
         require(force_different_begin_rejected(server, c_guid,
                                                interrupted.begin)
                         .status == ServerRunStatus::TerminalError &&
-                    !server.committed_input(c_guid),
+                    !copy_input(server, c_guid),
                 std::string(label) +
                     " failure did not retain the exact TX_BEGIN identity");
         require(force_exact_whole_tu_replay(server, c_guid, interrupted, true)
                             .status == ServerRunStatus::Completed &&
-                    server.committed_input(c_guid) == input,
+                    copy_input(server, c_guid) == input,
                 std::string(label) +
                     " failure did not accept exact whole-TU replay");
     }
@@ -2276,11 +2766,11 @@ void test_terminal_body_failure_identity() {
         const auto [interrupted, terminal] = force_terminal_body_failure(
             server, c_guid, input, TerminalBodyFailure::ZeroProgress, false);
         require(terminal.status == ServerRunStatus::TerminalError &&
-                    !server.committed_input(c_guid),
+                    !copy_input(server, c_guid),
                 "lost terminal report changed the interrupted transaction");
         require(force_exact_whole_tu_replay(server, c_guid, interrupted, true)
                             .status == ServerRunStatus::Completed &&
-                    server.committed_input(c_guid) == input,
+                    copy_input(server, c_guid) == input,
                 "lost terminal report did not permit exact whole-TU replay");
     }
 
@@ -2294,7 +2784,7 @@ void test_terminal_body_failure_identity() {
         const auto [interrupted, terminal] = force_terminal_body_failure(
             server, c_guid, input, scenario);
         require(terminal.status == ServerRunStatus::TerminalError &&
-                    !server.committed_input(c_guid),
+                    !copy_input(server, c_guid),
                 std::string(label) +
                     " failure materialized or committed input");
         require(force_different_begin_rejected(server, c_guid,
@@ -2304,7 +2794,7 @@ void test_terminal_body_failure_identity() {
                     " failure accepted a different TX_BEGIN at the retained cursor");
         require(force_exact_whole_tu_replay(server, c_guid, interrupted, false)
                             .status == ServerRunStatus::TerminalError &&
-                    !server.committed_input(c_guid),
+                    !copy_input(server, c_guid),
                 std::string(label) +
                     " failure did not retain its deterministic exact identity");
     }
@@ -2329,7 +2819,7 @@ void test_disconnect_at_each_message_boundary() {
                     "uncertain client boundary erased active identity");
         const PairResult recovered = run_pair(client, server);
         require(recovered.client.status == ClientRunStatus::Committed &&
-                    server.committed_input(client.c_store_guid()) == input,
+                    copy_input(server, client.c_store_guid()) == input,
                 "client message-boundary reconnect did not commit exact input");
     }
 
@@ -2345,7 +2835,7 @@ void test_disconnect_at_each_message_boundary() {
                 "server message-boundary close did not stop the dialogue");
         const PairResult recovered = run_pair(client, server);
         require(recovered.client.status == ClientRunStatus::Committed &&
-                    server.committed_input(client.c_store_guid()) == input,
+                    copy_input(server, client.c_store_guid()) == input,
                 "server message-boundary reconnect did not commit exact input");
     }
 
@@ -2357,7 +2847,7 @@ void test_disconnect_at_each_message_boundary() {
         const std::vector<uint8_t> input = bytes("close after final commit frame\n");
         const PairResult result = run_pair(client, server, admit(client, input), {}, stop);
         require(result.client.status == ClientRunStatus::Committed &&
-                    server.committed_input(client.c_store_guid()) == input,
+                    copy_input(server, client.c_store_guid()) == input,
                 "close after the complete TX_COMMIT changed the committed result");
     }
 }
@@ -2441,7 +2931,7 @@ void test_component_and_allocation_caps() {
         const std::vector<uint8_t> input = pseudo_random_bytes(4096);
         const PairResult result = run_pair(client, server, admit(client, input));
         require(result.client.status == ClientRunStatus::Committed &&
-                    server.committed_input(client.c_store_guid()) == input,
+                    copy_input(server, client.c_store_guid()) == input,
                 "asymmetric exact-152-byte negotiation did not complete");
     }
 }
@@ -2480,8 +2970,8 @@ void test_two_client_one_server_isolation() {
                 first_server.get().status == ServerRunStatus::Completed &&
                 second_server.get().status == ServerRunStatus::Completed &&
                 server.namespace_count() == 2 &&
-                server.committed_input(first.c_store_guid()) == first_input &&
-                server.committed_input(second.c_store_guid()) == second_input &&
+                copy_input(server, first.c_store_guid()) == first_input &&
+                copy_input(server, second.c_store_guid()) == second_input &&
                 first.endpoint.next_rel_seq() == RelSeq{1} &&
                 second.endpoint.next_rel_seq() == RelSeq{1},
             "concurrent C2F1 dialogues crossed namespace or route state");
@@ -2492,8 +2982,8 @@ void test_two_client_one_server_isolation() {
         run_pair(first, server, admit(first, first_followup));
     require(advanced.client.status == ClientRunStatus::Committed &&
                 server.namespace_count() == 2 &&
-                server.committed_input(first.c_store_guid()) == first_followup &&
-                server.committed_input(second.c_store_guid()) == second_input &&
+                copy_input(server, first.c_store_guid()) == first_followup &&
+                copy_input(server, second.c_store_guid()) == second_input &&
                 first.endpoint.next_rel_seq() == RelSeq{2} &&
                 second.endpoint.next_rel_seq() == RelSeq{1},
             "one C route advance changed the other C namespace");
@@ -2569,6 +3059,8 @@ int main(int argc, char** argv) {
     test_completion_stamp_correspondence();
     test_completion_live_identity_correspondence();
     test_idempotent_prepare_admission();
+    test_candidate_stage_has_no_revision_residue();
+    test_input_record_owner_and_aggregate_limits();
     test_fragmentation_at_every_control_and_body_boundary();
     test_exact_replay_and_lost_final();
     test_completion_identity_and_store_replacement();

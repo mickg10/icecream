@@ -1,6 +1,7 @@
 #pragma once
 
 #include "p50_actions.h"
+#include "p50_input_record.h"
 #include "p50_zstd.h"
 
 #include <utility>
@@ -78,11 +79,32 @@ struct AsyncCompletion {
 
 class CompletionLog {
 public:
-    void record(AsyncCompletion completion) { completions_.push_back(std::move(completion)); }
+    explicit CompletionLog(size_t max_records = std::numeric_limits<size_t>::max())
+        : max_records_(max_records) {}
+
+    void record(AsyncCompletion completion) noexcept {
+        if (!valid_)
+            return;
+        if (completions_.size() >= max_records_) {
+            valid_ = false;
+            return;
+        }
+        try {
+            completions_.push_back(std::move(completion));
+        } catch (...) {
+            valid_ = false;
+        }
+    }
     [[nodiscard]] const std::vector<AsyncCompletion>& completions() const { return completions_; }
-    void clear() { completions_.clear(); }
+    [[nodiscard]] bool valid() const { return valid_; }
+    void clear() {
+        completions_.clear();
+        valid_ = true;
+    }
 
 private:
+    size_t max_records_ = std::numeric_limits<size_t>::max();
+    bool valid_ = true;
     std::vector<AsyncCompletion> completions_;
 };
 
@@ -201,18 +223,48 @@ struct ServerRunResult {
     ServerRunStatus status = ServerRunStatus::Disconnected;
     uint64_t session_serial = 0;
     std::optional<CStoreGuid> c_store_guid;
+    std::optional<InputRecordKey> committed_input;
     std::optional<ErrorMessage> terminal_error;
 };
 
-// Runs synchronously after exact materialization and before either the retained
-// input or route cursor becomes visible.  Throwing leaves the transaction
-// identity available for exact replay.
-using PrecommitInputPublisher = std::function<void(
+enum class InputJobState : uint8_t {
+    Open,
+    Closed,
+};
+
+// Runs on the endpoint state owner after exact materialization and before
+// InputRecord publication or route visibility. Throwing leaves the exact
+// transaction identity available for replay.
+using InputJobStateSelector = std::function<InputJobState(
     CStoreGuid, const TxBegin&, const TxCommit&, std::span<const uint8_t>)>;
+
+struct P50ServerOwnerLimits {
+    size_t max_live_sessions = 64;
+    size_t max_namespaces = 4096;
+    uint64_t max_pending_encoded_bytes = uint64_t{512} << 20;
+    uint64_t max_pending_raw_bytes = uint64_t{8} << 30;
+    uint64_t max_decoder_window_bytes = uint64_t{8} << 30;
+    size_t max_retained_input_records = 4096;
+    uint64_t max_retained_input_bytes = uint64_t{8} << 30;
+    auto operator<=>(const P50ServerOwnerLimits&) const = default;
+};
+
+struct P50ServerOwnerUsage {
+    size_t live_sessions = 0;
+    size_t namespaces = 0;
+    size_t revisions = 0;
+    uint64_t pending_encoded_bytes = 0;
+    uint64_t pending_raw_bytes = 0;
+    uint64_t decoder_window_bytes = 0;
+    size_t retained_input_records = 0;
+    uint64_t retained_input_bytes = 0;
+    auto operator<=>(const P50ServerOwnerUsage&) const = default;
+};
 
 struct P50ServerEndpointConfig {
     uint16_t protocol_error_code = 1;
-    PrecommitInputPublisher precommit_publish;
+    P50ServerOwnerLimits owner_limits{};
+    InputJobStateSelector input_job_state;
 };
 
 class P50ClientEndpoint {
@@ -256,10 +308,16 @@ public:
                                                        EndpointIoControl control = {});
 
     void reset_store(FStoreGuid new_guid);
+    [[nodiscard]] InputCursor attach_input(InputRecordKey key) const;
+    void close_input_job(InputRecordKey key);
+    void collect_input_garbage();
     [[nodiscard]] FStoreGuid f_store_guid() const;
     [[nodiscard]] size_t namespace_count() const;
-    [[nodiscard]] std::optional<std::vector<uint8_t>>
-    committed_input(CStoreGuid c_store_guid) const;
+    [[nodiscard]] size_t revision_count() const;
+    [[nodiscard]] size_t live_session_count() const;
+    [[nodiscard]] P50ServerOwnerUsage owner_usage() const;
+    [[nodiscard]] std::optional<InputRecordKey>
+    last_committed_input(CStoreGuid c_store_guid) const;
 
 private:
     struct Impl;

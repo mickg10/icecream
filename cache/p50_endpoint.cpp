@@ -12,7 +12,10 @@
 #include <array>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <stdexcept>
+#include <thread>
+#include <tuple>
 
 namespace icecc::p50 {
 namespace {
@@ -21,14 +24,34 @@ namespace asio = boost::asio;
 using tcp = asio::ip::tcp;
 using PreparedZstdTUPtr = std::shared_ptr<const ZstdTuEnvelope>;
 
+class SingleThreadOwner {
+public:
+    void require() const {
+        const std::thread::id current = std::this_thread::get_id();
+        std::lock_guard lock(mutex_);
+        if (!thread_) {
+            thread_ = current;
+            return;
+        }
+        if (*thread_ != current)
+            throw std::logic_error("mutable Protocol-50 state crossed its owner thread");
+    }
+
+    void check() const {
+        const std::thread::id current = std::this_thread::get_id();
+        std::lock_guard lock(mutex_);
+        if (thread_ && *thread_ != current)
+            throw std::logic_error("Protocol-50 state was read outside its owner thread");
+    }
+
+private:
+    mutable std::mutex mutex_;
+    mutable std::optional<std::thread::id> thread_;
+};
+
 class StaleCompletion final : public std::exception {
 public:
     const char* what() const noexcept override { return "stale endpoint completion"; }
-};
-
-class PrecommitPublicationFailure final : public std::runtime_error {
-public:
-    using std::runtime_error::runtime_error;
 };
 
 void validate_caps(const EndpointCaps& caps) {
@@ -419,6 +442,7 @@ struct P50PreparationAuthority::Impl {
     ZstdTuLimits zstd_limits{};
     PreparationAuthorityLimits authority_limits{};
     ZstdTuCodec codec;
+    SingleThreadOwner owner;
     std::shared_ptr<const void> identity;
     uint64_t next_tu = 0;
     bool tu_exhausted = false;
@@ -439,6 +463,9 @@ P50PreparationAuthority::~P50PreparationAuthority() = default;
 
 PreparedTuHandle P50PreparationAuthority::prepare(PrepareRequestKey request,
                                                    std::span<const uint8_t> exact_input) {
+    impl_->owner.require();
+    if (request.producer_session == 0 || request.request_token == 0)
+        throw std::invalid_argument("PrepareRequestKey zero fields are reserved");
     if (exact_input.size() > impl_->zstd_limits.max_raw_bytes)
         throw std::length_error("ZSTD_TU raw input exceeds the local cap");
     const Digest128 raw_digest = digest128(exact_input);
@@ -448,11 +475,12 @@ PreparedTuHandle P50PreparationAuthority::prepare(PrepareRequestKey request,
         if (entry_position == impl_->entries.end())
             throw std::logic_error("preparation request index lost its retained entry");
         Impl::Entry& entry = entry_position->second;
-        if (entry.raw_bytes != exact_input.size() || entry.raw_digest != raw_digest)
+        if (entry.raw_bytes != exact_input.size())
             throw std::invalid_argument("PrepareRequestKey was reused for different input");
-        if (entry.references == std::numeric_limits<uint64_t>::max())
-            throw std::overflow_error("prepared-TU reference count exhausted");
-        ++entry.references;
+        const std::vector<uint8_t> retained = impl_->codec.decode(
+            entry.prepared->begin, entry.prepared->body, impl_->zstd_limits);
+        if (!std::equal(retained.begin(), retained.end(), exact_input.begin()))
+            throw std::invalid_argument("PrepareRequestKey was reused for different input");
         return PreparedTuHandle(impl_->identity, entry_position->first);
     }
 
@@ -497,6 +525,7 @@ PreparedTuHandle P50PreparationAuthority::prepare(PrepareRequestKey request,
 }
 
 uint64_t P50PreparationAuthority::retain(PreparedTuHandle handle) {
+    impl_->owner.require();
     if (handle.authority_.lock() != impl_->identity || handle.entry_id_ == 0)
         throw std::invalid_argument("prepared-TU handle does not belong to this C authority");
     const auto position = impl_->entries.find(handle.entry_id_);
@@ -508,6 +537,7 @@ uint64_t P50PreparationAuthority::retain(PreparedTuHandle handle) {
 }
 
 uint64_t P50PreparationAuthority::release(PreparedTuHandle handle) {
+    impl_->owner.require();
     if (handle.authority_.lock() != impl_->identity || handle.entry_id_ == 0)
         throw std::invalid_argument("prepared-TU handle does not belong to this C authority");
     const auto position = impl_->entries.find(handle.entry_id_);
@@ -523,23 +553,35 @@ uint64_t P50PreparationAuthority::release(PreparedTuHandle handle) {
     return 0;
 }
 
-CStoreGuid P50PreparationAuthority::c_store_guid() const { return impl_->c_guid; }
+CStoreGuid P50PreparationAuthority::c_store_guid() const {
+    impl_->owner.check();
+    return impl_->c_guid;
+}
 
-ZstdTuLimits P50PreparationAuthority::zstd_limits() const { return impl_->zstd_limits; }
+ZstdTuLimits P50PreparationAuthority::zstd_limits() const {
+    impl_->owner.check();
+    return impl_->zstd_limits;
+}
 
 bool P50PreparationAuthority::contains(PreparedTuHandle handle) const {
+    impl_->owner.check();
     return handle.authority_.lock() == impl_->identity && handle.entry_id_ != 0 &&
            impl_->entries.contains(handle.entry_id_);
 }
 
-size_t P50PreparationAuthority::live_entry_count() const { return impl_->entries.size(); }
+size_t P50PreparationAuthority::live_entry_count() const {
+    impl_->owner.check();
+    return impl_->entries.size();
+}
 
 uint64_t P50PreparationAuthority::retained_encoded_bytes() const {
+    impl_->owner.check();
     return impl_->retained_bytes;
 }
 
 std::shared_ptr<const ZstdTuEnvelope>
 P50PreparationAuthority::resolve(PreparedTuHandle handle) const {
+    impl_->owner.require();
     if (handle.authority_.lock() != impl_->identity || handle.entry_id_ == 0)
         throw std::invalid_argument("prepared-TU handle does not belong to this C authority");
     const auto position = impl_->entries.find(handle.entry_id_);
@@ -549,6 +591,7 @@ P50PreparationAuthority::resolve(PreparedTuHandle handle) const {
 }
 
 void P50PreparationAuthority::validate_begin(const TxBegin& begin) const {
+    impl_->owner.require();
     validate_zstd_tu_begin(begin, impl_->zstd_limits);
 }
 
@@ -715,6 +758,7 @@ struct P50ClientEndpoint::Impl {
 
     CStoreGuid c_guid{};
     std::shared_ptr<P50PreparationAuthority> preparation;
+    SingleThreadOwner owner;
     EndpointCaps caps{};
     uint64_t next_session = 1;
     bool session_exhausted = false;
@@ -736,6 +780,9 @@ struct P50ServerEndpoint::Impl {
     struct Pending {
         TxBegin begin;
         std::unique_ptr<ZstdTuDialogue> dialogue;
+        uint64_t reserved_encoded_bytes = 0;
+        uint64_t reserved_raw_bytes = 0;
+        uint64_t reserved_window_bytes = 0;
     };
 
     struct PreparedBegin {
@@ -757,7 +804,7 @@ struct P50ServerEndpoint::Impl {
         uint64_t active_session = 0;
         std::optional<HistoryNonce> nonce_high_water;
         std::optional<Route> route;
-        std::optional<std::vector<uint8_t>> committed;
+        std::optional<InputRecordKey> last_input;
     };
 
     struct Revision {
@@ -786,15 +833,29 @@ struct P50ServerEndpoint::Impl {
     Impl(FStoreGuid f_guid_value, EndpointCaps cap_value, CompletionLog* completion_log,
          ActionTrace* action_trace, P50ServerEndpointConfig config_value)
         : f_guid(f_guid_value), caps(cap_value), completions(completion_log),
-          actions(action_trace), config(std::move(config_value)) {
+          actions(action_trace),
+          input_records(config_value.owner_limits.max_retained_input_records,
+                        config_value.owner_limits.max_retained_input_bytes),
+          config(std::move(config_value)) {
         if (f_guid == FStoreGuid{})
             throw std::invalid_argument("F endpoint GUID zero is reserved");
         if (config.protocol_error_code == 0)
             throw std::invalid_argument("F endpoint ERROR code zero is reserved");
         validate_caps(caps);
+        const P50ServerOwnerLimits& limits = config.owner_limits;
+        if (limits.max_live_sessions == 0 || limits.max_namespaces == 0 ||
+            limits.max_pending_encoded_bytes == 0 || limits.max_pending_raw_bytes == 0 ||
+            limits.max_decoder_window_bytes == 0)
+            throw std::invalid_argument("F endpoint aggregate owner limits must be nonzero");
+        const uint64_t one_decoder_window = uint64_t{1} << caps.zstd.max_window_log;
+        if (limits.max_decoder_window_bytes < one_decoder_window)
+            throw std::invalid_argument(
+                "F endpoint aggregate decoder-window limit admits no dialogue");
     }
 
     Session allocate_session() {
+        if (live_sessions.size() >= config.owner_limits.max_live_sessions)
+            throw std::length_error("F endpoint reached its live-session bound");
         if (session_exhausted)
             throw std::overflow_error("F endpoint session serial space exhausted");
         const uint64_t result = next_session;
@@ -830,6 +891,40 @@ struct P50ServerEndpoint::Impl {
         const auto position = live_sessions.find(session.serial);
         if (position != live_sessions.end() && position->second.f_guid == session.f_guid)
             live_sessions.erase(position);
+    }
+
+    static bool exceeds(uint64_t current, uint64_t addition, uint64_t limit) {
+        return addition > limit || current > limit - addition;
+    }
+
+    void reserve_pending(Pending& pending) {
+        pending.reserved_encoded_bytes = pending.begin.body.encoded_bytes;
+        pending.reserved_raw_bytes = pending.begin.raw_bytes;
+        pending.reserved_window_bytes = uint64_t{1} << caps.zstd.max_window_log;
+        const P50ServerOwnerLimits& limits = config.owner_limits;
+        if (exceeds(pending_encoded_bytes, pending.reserved_encoded_bytes,
+                    limits.max_pending_encoded_bytes) ||
+            exceeds(pending_raw_bytes, pending.reserved_raw_bytes,
+                    limits.max_pending_raw_bytes) ||
+            exceeds(decoder_window_bytes, pending.reserved_window_bytes,
+                    limits.max_decoder_window_bytes))
+            throw std::length_error("F endpoint reached an aggregate pending-input bound");
+        pending_encoded_bytes += pending.reserved_encoded_bytes;
+        pending_raw_bytes += pending.reserved_raw_bytes;
+        decoder_window_bytes += pending.reserved_window_bytes;
+    }
+
+    void release_pending(Pending& pending) {
+        if (pending.reserved_encoded_bytes > pending_encoded_bytes ||
+            pending.reserved_raw_bytes > pending_raw_bytes ||
+            pending.reserved_window_bytes > decoder_window_bytes)
+            throw std::logic_error("F endpoint pending-input accounting underflow");
+        pending_encoded_bytes -= pending.reserved_encoded_bytes;
+        pending_raw_bytes -= pending.reserved_raw_bytes;
+        decoder_window_bytes -= pending.reserved_window_bytes;
+        pending.reserved_encoded_bytes = 0;
+        pending.reserved_raw_bytes = 0;
+        pending.reserved_window_bytes = 0;
     }
 
     Namespace& require(const Session& session) {
@@ -899,8 +994,12 @@ struct P50ServerEndpoint::Impl {
             return result;
         if (!current.activated) {
             const auto revision = revisions.find(*current.c_guid);
-            if (revision == revisions.end() || revision->second.exhausted ||
-                revision->second.value != current.candidate_revision)
+            const bool absent_revision_is_zero =
+                revision == revisions.end() && current.candidate_revision == 0;
+            const bool matching_revision =
+                revision != revisions.end() && !revision->second.exhausted &&
+                revision->second.value == current.candidate_revision;
+            if (!absent_revision_is_zero && !matching_revision)
                 throw StaleCompletion();
             result.history_nonce = current.candidate_nonce;
             result.rel_seq = current.candidate_rel;
@@ -945,8 +1044,11 @@ struct P50ServerEndpoint::Impl {
         actions->record(std::move(value));
     }
 
-    uint64_t current_revision(CStoreGuid c_guid) {
-        Revision& revision = revisions[c_guid];
+    uint64_t current_revision(CStoreGuid c_guid) const {
+        const auto position = revisions.find(c_guid);
+        if (position == revisions.end())
+            return 0;
+        const Revision& revision = position->second;
         if (revision.exhausted)
             throw std::overflow_error(
                 "candidate revision requires F_STORE_GUID replacement");
@@ -1031,18 +1133,36 @@ struct P50ServerEndpoint::Impl {
         if (!session.c_guid || !session.candidate_state || session.activated)
             throw std::logic_error("F endpoint candidate cannot activate");
         LiveSession& live = live_sessions.at(session.serial);
-        const auto revision = revisions.find(*session.c_guid);
-        if (!live.c_guid || *live.c_guid != *session.c_guid || live.activated ||
-            revision == revisions.end() || revision->second.exhausted ||
-            revision->second.value != session.candidate_revision)
+        if (!live.c_guid || *live.c_guid != *session.c_guid || live.activated)
             throw StaleCompletion();
-        advance_revision(*session.c_guid);
+        const bool new_namespace = !namespaces.contains(*session.c_guid);
+        if (new_namespace && namespaces.size() >= config.owner_limits.max_namespaces)
+            throw std::length_error("F endpoint reached its C-namespace bound");
+        auto [position, namespace_inserted] = namespaces.try_emplace(*session.c_guid);
+        std::map<CStoreGuid, Revision>::iterator revision;
+        bool revision_inserted = false;
+        try {
+            std::tie(revision, revision_inserted) = revisions.try_emplace(*session.c_guid);
+        } catch (...) {
+            if (namespace_inserted)
+                namespaces.erase(position);
+            throw;
+        }
+        if (revision->second.exhausted ||
+            revision->second.value != session.candidate_revision) {
+            if (revision_inserted)
+                revisions.erase(revision);
+            if (namespace_inserted)
+                namespaces.erase(position);
+            throw StaleCompletion();
+        }
+        advance_revision(revision->second);
 
-        auto [position, inserted] = namespaces.try_emplace(*session.c_guid);
         Namespace& space = position->second;
-        const bool replaced = !inserted && space.active_session != 0;
+        const bool replaced = !namespace_inserted && space.active_session != 0;
         if (space.route && space.route->pending) {
             space.route->interrupted = space.route->pending->begin;
+            release_pending(*space.route->pending);
             space.route->pending.reset();
         }
         space.active_session = session.serial;
@@ -1064,6 +1184,7 @@ struct P50ServerEndpoint::Impl {
                 space.route->interrupted = space.route->pending->begin;
             else
                 space.route->interrupted.reset();
+            release_pending(*space.route->pending);
             space.route->pending.reset();
         }
         record(ActionType::SESSION_DISCONNECTED, session);
@@ -1176,6 +1297,7 @@ struct P50ServerEndpoint::Impl {
             throw StaleCompletion();
         const TxBegin begin = prepared.pending.begin;
         const bool replay = prepared.replay;
+        reserve_pending(prepared.pending);
         route.interrupted.reset();
         route.pending = std::move(prepared.pending);
         record(replay ? ActionType::ACTIVE_REPLAYED : ActionType::TX_BEGIN, session, &begin);
@@ -1208,7 +1330,8 @@ struct P50ServerEndpoint::Impl {
                ZstdTuDialogue::State::BodyClosed;
     }
 
-    TxCommit materialize_and_commit(const Session& session, TxBegin& committed_begin) {
+    TxCommit materialize_and_commit(const Session& session, TxBegin& committed_begin,
+                                    std::optional<InputRecordKey>& committed_input) {
         Namespace& space = require(session);
         if (!space.route || !space.route->pending)
             throw std::logic_error("F endpoint has no active transaction");
@@ -1229,21 +1352,32 @@ struct P50ServerEndpoint::Impl {
                                                   pending.begin.rel_seq, pending.begin.tu_seq,
                                                   pending.begin.transaction_digest)};
         Revision& revision = require_revision_advance(*session.c_guid);
-        if (config.precommit_publish) {
-            try {
-                config.precommit_publish(*session.c_guid, pending.begin, commit, exact);
-            } catch (...) {
-                throw PrecommitPublicationFailure(
-                    "exact input publication failed before route commit");
-            }
+        const InputJobState job_state = config.input_job_state
+                                            ? config.input_job_state(*session.c_guid,
+                                                                     pending.begin, commit, exact)
+                                            : InputJobState::Open;
+        const InputRecordKey input_key{*session.c_guid, pending.begin.tu_seq};
+        const InputPublishResult publication =
+            job_state == InputJobState::Open
+                ? input_records.publish(*session.c_guid, pending.begin, commit,
+                                        std::move(exact))
+                : input_records.observe_closed_job_commit(
+                      *session.c_guid, pending.begin, commit, exact);
+        if (job_state == InputJobState::Open &&
+            publication != InputPublishResult::NotRetainedJobClosed &&
+            input_records.job_open(input_key)) {
+            space.last_input = input_key;
+            committed_input = input_key;
+        } else {
+            space.last_input.reset();
         }
-        space.committed = std::move(exact);
         advance_revision(revision);
         route.state = commit.post_state_digest;
         ++route.next_rel.value;
         route.last_commit = commit;
         route.interrupted.reset();
         pending.dialogue->commit_visible();
+        release_pending(pending);
         route.pending.reset();
         record(ActionType::INPUT_COMMITTED, session, &committed_begin, commit.post_state_digest);
         return commit;
@@ -1251,13 +1385,18 @@ struct P50ServerEndpoint::Impl {
 
     FStoreGuid f_guid{};
     EndpointCaps caps{};
+    SingleThreadOwner owner;
     uint64_t next_session = 1;
     bool session_exhausted = false;
     std::map<uint64_t, LiveSession> live_sessions;
     std::map<CStoreGuid, Namespace> namespaces;
     std::map<CStoreGuid, Revision> revisions;
+    uint64_t pending_encoded_bytes = 0;
+    uint64_t pending_raw_bytes = 0;
+    uint64_t decoder_window_bytes = 0;
     CompletionLog* completions = nullptr;
     ActionTrace* actions = nullptr;
+    InputRecordStore input_records;
     P50ServerEndpointConfig config{};
 };
 
@@ -1272,6 +1411,7 @@ P50ClientEndpoint::~P50ClientEndpoint() = default;
 boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run(tcp::endpoint remote,
                                                                PreparedTuHandle prepared,
                                                                EndpointIoControl control) {
+    impl_->owner.require();
     if (impl_->active_session != 0)
         throw std::logic_error("C endpoint already has one active dialogue");
     PreparedZstdTUPtr admitted;
@@ -1297,6 +1437,7 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run(tcp::endpoint rem
     ClientRunResult result;
     uint32_t terminal_cap = impl_->caps.wire.max_frame_payload;
     const auto verify = [&](const CompletionStamp& expected) {
+        impl_->owner.require();
         CompletionStamp observed = expected;
         if (control.before_completion_check)
             control.before_completion_check(observed);
@@ -1491,19 +1632,35 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run(tcp::endpoint rem
     co_return result;
 }
 
-CStoreGuid P50ClientEndpoint::c_store_guid() const { return impl_->c_guid; }
+CStoreGuid P50ClientEndpoint::c_store_guid() const {
+    impl_->owner.check();
+    return impl_->c_guid;
+}
 
-std::optional<FStoreGuid> P50ClientEndpoint::f_store_guid() const { return impl_->f_guid; }
+std::optional<FStoreGuid> P50ClientEndpoint::f_store_guid() const {
+    impl_->owner.check();
+    return impl_->f_guid;
+}
 
-bool P50ClientEndpoint::has_active_transaction() const { return impl_->active.has_value(); }
+bool P50ClientEndpoint::has_active_transaction() const {
+    impl_->owner.check();
+    return impl_->active.has_value();
+}
 
 bool P50ClientEndpoint::has_reconciliation_work() const {
+    impl_->owner.check();
     return impl_->active.has_value() || static_cast<bool>(impl_->queued);
 }
 
-RelSeq P50ClientEndpoint::next_rel_seq() const { return impl_->next_rel; }
+RelSeq P50ClientEndpoint::next_rel_seq() const {
+    impl_->owner.check();
+    return impl_->next_rel;
+}
 
-Digest128 P50ClientEndpoint::state_digest() const { return impl_->state; }
+Digest128 P50ClientEndpoint::state_digest() const {
+    impl_->owner.check();
+    return impl_->state;
+}
 
 P50ServerEndpoint::P50ServerEndpoint(FStoreGuid f_store_guid, EndpointCaps caps,
                                      CompletionLog* completions, ActionTrace* actions,
@@ -1515,6 +1672,7 @@ P50ServerEndpoint::~P50ServerEndpoint() = default;
 
 boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::accept_one(tcp::acceptor& acceptor,
                                                                       EndpointIoControl control) {
+    impl_->owner.require();
     Impl::Session session = impl_->allocate_session();
     ServerRunResult result;
     result.session_serial = session.serial;
@@ -1522,6 +1680,7 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::accept_one(tcp::accep
     tcp::socket socket(executor);
     uint32_t reply_cap = impl_->caps.wire.max_frame_payload;
     const auto verify = [&](const CompletionStamp& expected) {
+        impl_->owner.require();
         CompletionStamp observed = expected;
         if (control.before_completion_check)
             control.before_completion_check(observed);
@@ -1583,7 +1742,9 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::accept_one(tcp::accep
         } while (!impl_->body_complete(session));
 
         TxBegin committed_begin;
-        const TxCommit commit = impl_->materialize_and_commit(session, committed_begin);
+        const TxCommit commit =
+            impl_->materialize_and_commit(session, committed_begin,
+                                          result.committed_input);
         co_await async_write_message(
             socket, commit, selection.limits.max_frame_payload,
             impl_->stamp(session, AsyncOperationKind::WriteFragment, &committed_begin),
@@ -1608,9 +1769,6 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::accept_one(tcp::accep
         impl_->release_session(session);
         result.status = ServerRunStatus::Disconnected;
         co_return result;
-    } catch (const PrecommitPublicationFailure& error) {
-        terminal_error = bounded_error(impl_->config.protocol_error_code,
-                                       error.what(), reply_cap);
     } catch (const std::exception& error) {
         terminal_error = bounded_error(impl_->config.protocol_error_code,
                                        error.what(), reply_cap);
@@ -1635,11 +1793,14 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::accept_one(tcp::accep
 }
 
 void P50ServerEndpoint::reset_store(FStoreGuid new_guid) {
+    impl_->owner.require();
     if (new_guid == FStoreGuid{})
         throw std::invalid_argument("F store reset GUID zero is reserved");
     if (new_guid == impl_->f_guid)
         throw std::invalid_argument("F store reset requires a fresh GUID");
-    for (const auto& [guid, space] : impl_->namespaces) {
+    for (auto& [guid, space] : impl_->namespaces) {
+        if (space.route && space.route->pending)
+            impl_->release_pending(*space.route->pending);
         if (space.active_session != 0) {
             Impl::Session invalidated{.serial = space.active_session,
                                       .f_guid = impl_->f_guid,
@@ -1653,17 +1814,63 @@ void P50ServerEndpoint::reset_store(FStoreGuid new_guid) {
     impl_->live_sessions.clear();
     impl_->namespaces.clear();
     impl_->revisions.clear();
+    impl_->input_records.clear();
     impl_->f_guid = new_guid;
 }
 
-FStoreGuid P50ServerEndpoint::f_store_guid() const { return impl_->f_guid; }
+FStoreGuid P50ServerEndpoint::f_store_guid() const {
+    impl_->owner.check();
+    return impl_->f_guid;
+}
 
-size_t P50ServerEndpoint::namespace_count() const { return impl_->namespaces.size(); }
+size_t P50ServerEndpoint::namespace_count() const {
+    impl_->owner.check();
+    return impl_->namespaces.size();
+}
 
-std::optional<std::vector<uint8_t>>
-P50ServerEndpoint::committed_input(CStoreGuid c_store_guid) const {
+size_t P50ServerEndpoint::revision_count() const {
+    impl_->owner.check();
+    return impl_->revisions.size();
+}
+
+size_t P50ServerEndpoint::live_session_count() const {
+    impl_->owner.check();
+    return impl_->live_sessions.size();
+}
+
+InputCursor P50ServerEndpoint::attach_input(InputRecordKey key) const {
+    impl_->owner.require();
+    return impl_->input_records.attach(key);
+}
+
+void P50ServerEndpoint::close_input_job(InputRecordKey key) {
+    impl_->owner.require();
+    impl_->input_records.close_job(key);
+}
+
+void P50ServerEndpoint::collect_input_garbage() {
+    impl_->owner.require();
+    impl_->input_records.collect_garbage();
+}
+
+P50ServerOwnerUsage P50ServerEndpoint::owner_usage() const {
+    impl_->owner.check();
+    return {.live_sessions = impl_->live_sessions.size(),
+            .namespaces = impl_->namespaces.size(),
+            .revisions = impl_->revisions.size(),
+            .pending_encoded_bytes = impl_->pending_encoded_bytes,
+            .pending_raw_bytes = impl_->pending_raw_bytes,
+            .decoder_window_bytes = impl_->decoder_window_bytes,
+            .retained_input_records = impl_->input_records.record_count(),
+            .retained_input_bytes = impl_->input_records.retained_bytes()};
+}
+
+std::optional<InputRecordKey>
+P50ServerEndpoint::last_committed_input(CStoreGuid c_store_guid) const {
+    impl_->owner.check();
     const auto position = impl_->namespaces.find(c_store_guid);
-    return position == impl_->namespaces.end() ? std::nullopt : position->second.committed;
+    return position == impl_->namespaces.end() ? std::nullopt
+                                               : position->second.last_input;
 }
 
 } // namespace icecc::p50

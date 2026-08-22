@@ -8,7 +8,9 @@ libprotocol50_a_SOURCES = \
 	p50_slice0.cpp \
 	p50_slice0.h \
 	p50_zstd.cpp \
-	p50_zstd.h
+	p50_zstd.h \
+	p50_input_record.cpp \
+	p50_input_record.h
 
 AM_CPPFLAGS = -I$(top_srcdir) $(LIBZSTD_CFLAGS)
 libp50endpoint_a_SOURCES = p50_endpoint.cpp p50_endpoint.h

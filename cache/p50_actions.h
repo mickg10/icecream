@@ -2,6 +2,7 @@
 
 #include "protocol50.h"
 
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -56,11 +57,32 @@ struct ActionRecord {
 
 class ActionTrace {
 public:
-    void record(ActionRecord record) { records_.push_back(std::move(record)); }
+    explicit ActionTrace(size_t max_records = std::numeric_limits<size_t>::max())
+        : max_records_(max_records) {}
+
+    void record(ActionRecord record) noexcept {
+        if (!valid_)
+            return;
+        if (records_.size() >= max_records_) {
+            valid_ = false;
+            return;
+        }
+        try {
+            records_.push_back(std::move(record));
+        } catch (...) {
+            valid_ = false;
+        }
+    }
     [[nodiscard]] const std::vector<ActionRecord>& records() const { return records_; }
-    void clear() { records_.clear(); }
+    [[nodiscard]] bool valid() const { return valid_; }
+    void clear() {
+        records_.clear();
+        valid_ = true;
+    }
 
 private:
+    size_t max_records_ = std::numeric_limits<size_t>::max();
+    bool valid_ = true;
     std::vector<ActionRecord> records_;
 };
 

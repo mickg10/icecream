@@ -138,6 +138,7 @@ M2 keeps codec mechanics and dialogue state as two blocks with a narrow join:
 | F store GUID and map keyed by C store GUID | `P50ServerEndpoint` | F-store incarnation |
 | F route cursor, retained last commit, interrupted-begin identity | one F namespace | C-store/F-store relationship |
 | exact component accumulation and copied `TxBegin` | F pending overlay | one active dialogue transaction |
+| immutable exact bytes keyed by `(C_STORE_GUID, TU_SEQ)`, job-open state, and independent cursors | `InputRecordStore` | cache commit through logical-job close and final cursor release |
 | socket, negotiated profile mask/limits, current non-reused session serial | client/server coroutine | one connection |
 
 `p50_zstd.*` has no store GUID, session, route, reconnect, or commit logic. It prepares,
@@ -191,17 +192,31 @@ identity. A changed F GUID is the separate verified-incarnation transition.
 
 One C-wide `P50PreparationAuthority` owns preparation. Callers receive opaque handles which
 are accepted only by their issuing authority. Preparation is idempotent over `(producer
-session, request token)` bound to raw length and digest. An exact retry returns the same
-immutable `PreparedZstdTU` and `TU_SEQ`; a different input under the same key is rejected. Live
-entry count and retained encoded bytes are bounded. Every preparation/replay increments the
-entry reference count and explicit `release()` removes the replay entry and bytes exactly at
-zero. A failed preparation or cap check consumes neither `TU_SEQ` nor a handle ID. F retains a
-monotonic `HISTORY_NONCE` high-water per C namespace and rejects equal or lower resets.
+session, request token)` bound to the exact input bytes. An exact retry decodes and compares the
+retained immutable body, returns the same handle and `TU_SEQ`, and does not create another
+owner. Only explicit `retain()` creates another owner; `release()` removes the entry and bytes
+exactly when that count reaches zero. A different input under the same request key is rejected,
+including a same-length change. Zero request-key fields are reserved. Live entry count and
+retained encoded bytes are bounded, and a failed preparation or cap check consumes neither
+`TU_SEQ` nor a handle ID. F retains a monotonic `HISTORY_NONCE` high-water per C namespace and
+rejects equal or lower resets.
 
-M2 endpoint objects, their codec contexts, completion log, and action trace are driven by one
-executor thread. Multiple C namespaces may interleave on that executor, but multi-threaded
-dispatch/stranding is a later sidecar concern rather than an implicit promise of this loopback
-slice.
+After exact materialization, the F state owner synchronously selects whether the logical job is
+still open or already closed, before advancing the route. An open job publishes one immutable
+`InputRecord`; a closed job validates the same commit without creating a compiler-visible key.
+Each attachment gets an independent byte-zero cursor. Closing the job blocks new attachments,
+while already-authorized cursors survive until release; collection then removes the record.
+Replacing the F-store incarnation drops store-owned records and route state without invalidating
+an already-authorized cursor. The endpoint no longer exposes a copied raw-input vector.
+
+Mutable preparation, C relationship, F namespace, InputRecord, attach/close/collect, and reset
+operations are owned by one executor thread. Multiple C namespaces may interleave on that
+thread, but cross-thread calls are rejected. F admission applies aggregate bounds to live
+sessions, namespaces, simultaneous encoded bytes, raw bytes, decoder-window budgets, retained
+InputRecord count, and retained exact bytes. Reservations are acquired at `TX_BEGIN` and released
+on commit, disconnect, replacement, or store reset. Completion/action diagnostics are separately
+bounded; loss of diagnostic capacity marks that evidence incomplete without changing the
+protocol result.
 
 ### Endpoint mutation to canonical action mapping
 
