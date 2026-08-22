@@ -170,7 +170,7 @@
         "mode": "ssh",
         "alias": "tt-quietbox2",
         "host_override": "10.0.27.212",
-        "expected_hostname": "tt-quietbox"
+        "expected_hostname": "tt-quietbox2"
       },
       "paths": {
         "runtime_prefix": "/home/mickg10/icecream-farm/runtime/opt/icecream",
@@ -191,7 +191,7 @@
         "mode": "ssh",
         "alias": "tt-quietbox3",
         "host_override": "10.0.27.101",
-        "expected_hostname": "tt-quietbox3"
+        "expected_hostname": "tt-quietbox3.taildebf6.ts.net"
       },
       "paths": {
         "runtime_prefix": "/home/mickg10/icecream-farm/runtime/opt/icecream",

@@ -375,6 +375,38 @@ class PlanTests(unittest.TestCase):
         self.assertFalse(host["launch_enabled"])
         self.assertRegex(host["launch_block"], "mount roots")
 
+    def test_quietbox_live_fqdn_identity_matches_exact_manifest(self):
+        cases = {
+            "quietbox2": "tt-quietbox2",
+            "quietbox3": "tt-quietbox3.taildebf6.ts.net",
+        }
+        for host_name, live_hostname in cases.items():
+            host = self.manifest["hosts"][host_name]
+            interface = host["interface"]
+            interface_row = (
+                f"2: {interface} inet {host['address']}/24 brd 10.0.27.255 scope global"
+            ).encode()
+            facts = {
+                "ok": True,
+                "hostname": live_hostname,
+                "docker_permission": "yes",
+            }
+            with self.subTest(host=host_name):
+                with mock.patch.object(farm, "basic_inventory", return_value=facts):
+                    with mock.patch.object(
+                        farm.HostRunner,
+                        "run",
+                        return_value=subprocess_result(0, stdout=interface_row),
+                    ):
+                        self.assertEqual(
+                            farm.verify_transport_identity(self.manifest, host_name), facts
+                        )
+
+                wrong = dict(facts, hostname=f"{live_hostname}.wrong")
+                with mock.patch.object(farm, "basic_inventory", return_value=wrong):
+                    with self.assertRaisesRegex(farm.FarmError, "expected hostname"):
+                        farm.verify_transport_identity(self.manifest, host_name)
+
     def test_ssh_uses_lan_override_with_existing_alias_host_key(self):
         host = self.manifest["hosts"]["research6"]
         prefix = farm.HostRunner("research6", host).prefix()
