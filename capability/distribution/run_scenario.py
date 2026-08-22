@@ -1536,6 +1536,43 @@ def stable_hex(label: str, *parts: object, digits: int = 64) -> str:
     return digest.hexdigest()[:digits]
 
 
+def transaction_identity_digest(
+    scenario_digest: str,
+    logical_job_id: str,
+    attempt_id: str,
+    c_store_guid: str,
+    f_store_guid: str,
+    history_nonce: int,
+    tu_seq: int,
+    rel_seq: int,
+    raw_digest: str,
+    negotiated_profiles: Sequence[str],
+    route_state_profiles: Sequence[str],
+) -> str:
+    """Return the domain-separated digest for one prepared-input transaction."""
+    return stable_hex(
+        "transaction",
+        scenario_digest,
+        logical_job_id,
+        attempt_id,
+        c_store_guid,
+        f_store_guid,
+        history_nonce,
+        tu_seq,
+        rel_seq,
+        raw_digest,
+        ",".join(negotiated_profiles),
+        ",".join(route_state_profiles),
+    )
+
+
+def input_record_identity(transaction_digest: str, raw_digest: str) -> str:
+    """Return the stable immutable-input identity for a transaction."""
+    return "input-" + stable_hex(
+        "input-record", transaction_digest, raw_digest, digits=32
+    )
+
+
 def logical_job_identity(scenario_digest: str, item: WorkItem) -> str:
     return "job-" + stable_hex(
         "logical-job",
@@ -3000,8 +3037,7 @@ class Simulator:
                     16,
                 )
             )
-            tx.transaction_digest = stable_hex(
-                "transaction",
+            tx.transaction_digest = transaction_identity_digest(
                 self.scenario.scenario_digest,
                 tx.logical_job_id,
                 tx.attempt_id,
@@ -3011,13 +3047,12 @@ class Simulator:
                 tx.tu_seq,
                 tx.rel_seq,
                 item.raw_digest or "unavailable",
-                ",".join(self.negotiated_profiles),
+                self.negotiated_profiles,
+                self.route_state_profiles,
             )
-            tx.input_record_identity = "input-" + stable_hex(
-                "input-record",
+            tx.input_record_identity = input_record_identity(
                 tx.transaction_digest,
                 item.raw_digest or "unavailable",
-                digits=32,
             )
             self.adapter.bind_route(item, worker, tx.tu_seq, tx.rel_seq)
             self.transaction_sequence += 1
@@ -4875,6 +4910,11 @@ def experiment_descriptor(
             },
             "expected_summary": result.summary,
         }
+        if scenario.route_trace:
+            descriptor["route_trace_evidence"] = {
+                "path": "route-trace.jsonl",
+                "sha256": scenario.route_trace_sha256,
+            }
     return descriptor
 
 
@@ -5183,6 +5223,8 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
         raise ValueError(f"{path}: execution/final workload inputs differ")
 
     manifest_jobs = {job["id"]: job for job in manifest["workload"]["jobs"]}
+    if len(manifest_jobs) != len(manifest["workload"]["jobs"]):
+        raise ValueError(f"{path}: embedded manifest repeats a workload identity")
     workload_inputs = header["workload_inputs"]
     if set(workload_inputs) != set(manifest_jobs):
         raise ValueError(f"{path}: embedded workload set differs from manifest")
@@ -5236,6 +5278,40 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
     if sorted(header["input_manifest_digests"]) != sorted(set(input_manifest_digests)):
         raise ValueError(f"{path}: execution input manifest digests do not reconcile")
 
+    expected_tus: dict[tuple[str, int, int], dict[str, object]] = {}
+    retained_work_items: dict[tuple[str, int], list[WorkItem]] = {}
+    ordinal_to_key: dict[int, tuple[str, int, int]] = {}
+    ordinal = 0
+    for job in manifest["workload"]["jobs"]:
+        workload = job["id"]
+        rows_for_workload = workload_inputs[workload]["content_manifest"]["rows"]
+        for build in range(job["build_epochs"]):
+            items: list[WorkItem] = []
+            for content in rows_for_workload:
+                key = (workload, build, content["logical"])
+                expected_tus[key] = {
+                    "environment": job["c_index"],
+                    "content": content,
+                }
+                item = WorkItem(
+                    ordinal,
+                    job["c_index"],
+                    workload,
+                    build,
+                    content["logical"],
+                    content["job_id"],
+                    Path(content["ii_relative"]),
+                    content["raw_bytes"],
+                    content["compile_ns"],
+                    0,
+                    content["raw_sha256"],
+                    content["compile_provenance"],
+                )
+                items.append(item)
+                ordinal_to_key[ordinal] = key
+                ordinal += 1
+            retained_work_items[(workload, build)] = items
+
     selected_main_protocol = min(
         component["main_protocol"] for component in manifest["components"].values()
     )
@@ -5257,6 +5333,31 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
     if final_summary.get("codec_adapter") != selected_adapter:
         raise ValueError(f"{path}: final codec adapter differs from manifest")
     routing = final_summary.get("routing", {})
+    scheduler_policy = manifest["topology"]["scheduler_policy"]
+    trace_assignment = manifest["topology"]["assignment_source"] == "route_trace"
+    expected_placement = (
+        "trace"
+        if trace_assignment
+        else {
+            "round_robin": "round-robin",
+            "rendezvous": "rendezvous",
+            "dense_frontier": "rendezvous",
+        }[scheduler_policy]
+    )
+    expected_binding = (
+        "release-time-static"
+        if trace_assignment or scheduler_policy in {"rendezvous", "dense_frontier"}
+        else "dispatch-time"
+    )
+    if (
+        routing.get("placement_policy") != expected_placement
+        or routing.get("binding") != expected_binding
+        or final_summary.get("placement_policy") != expected_placement
+    ):
+        raise ValueError(f"{path}: routing policy metadata differs from manifest")
+    trace_entries: dict[tuple[str, int, int], RouteTraceEntry] = {}
+    trace_digest: str | None = None
+    trace_provenance: str | None = None
     if manifest["topology"]["assignment_source"] == "route_trace":
         if routing.get("route_trace") != manifest["topology"]["route_trace"]:
             raise ValueError(f"{path}: route-trace logical identity differs")
@@ -5264,6 +5365,45 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
             raise ValueError(f"{path}: route-trace codec differs from selected adapter")
         if routing.get("route_trace_provenance") not in {"observed", "modeled"}:
             raise ValueError(f"{path}: route-trace provenance is invalid")
+        evidence = header.get("route_trace_evidence")
+        if not isinstance(evidence, dict):
+            raise ValueError(
+                f"{path}: exact replay has no retained route-trace evidence"
+            )
+        evidence_identity = canonical_relative_identity(
+            evidence.get("path", ""), "route_trace_evidence.path"
+        )
+        evidence_path = (path.parent / evidence_identity).resolve()
+        if not evidence_path.is_file():
+            raise ValueError(f"{path}: retained route-trace evidence is absent")
+        entries_by_ordinal, trace_digest, trace_provenance = load_route_trace(
+            evidence_path,
+            scenario_digest,
+            retained_work_items,
+            manifest["topology"]["f_count"],
+            selected_adapter,
+        )
+        trace_entries = {
+            ordinal_to_key[item_ordinal]: entry
+            for item_ordinal, entry in entries_by_ordinal.items()
+        }
+        replay_claim = final_summary.get("replay_closure", {})
+        claimed_digests = {
+            evidence.get("sha256"),
+            routing.get("route_trace_sha256"),
+            replay_claim.get("route_trace_sha256"),
+        }
+        if claimed_digests != {trace_digest}:
+            raise ValueError(
+                f"{path}: retained route-trace digest differs from exact bytes"
+            )
+        if (
+            routing.get("route_trace_provenance") != trace_provenance
+            or replay_claim.get("route_trace") != manifest["topology"]["route_trace"]
+        ):
+            raise ValueError(f"{path}: retained route-trace metadata differs")
+    elif "route_trace_evidence" in header:
+        raise ValueError(f"{path}: policy replay carries exact-route evidence")
 
     timeline_rows = rows[1:-1]
     if rows[-1].get("timeline_records") != len(timeline_rows):
@@ -5271,17 +5411,112 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
     if final_summary.get("timeline_records") != len(timeline_rows):
         raise ValueError(f"{path}: summary timeline record count differs")
     events: list[dict[str, object]] = []
+    previous_wall_end: int | None = None
+    active_position = 0
+    snapshot_count = 0
+    gap_count = 0
     for row_number, row in enumerate(timeline_rows, start=2):
         if row.get("record") not in {"snapshot", "gap"}:
             raise ValueError(f"{path}:{row_number}: unknown timeline record")
+        row_sequence = checked_nonnegative_int(
+            row.get("sequence"), f"{path}:{row_number} timeline sequence"
+        )
+        if row_sequence != row_number - 2:
+            raise ValueError(
+                f"{path}:{row_number}: timeline sequence is not contiguous"
+            )
+        wall_start = checked_nonnegative_int(
+            row.get("wall_start_ns"), f"{path}:{row_number} wall_start_ns"
+        )
+        wall_end = checked_nonnegative_int(
+            row.get("wall_end_ns"), f"{path}:{row_number} wall_end_ns"
+        )
+        if (
+            wall_end < wall_start
+            or row.get("wall_duration_ns") != wall_end - wall_start
+        ):
+            raise ValueError(f"{path}:{row_number}: timeline wall interval differs")
+        if previous_wall_end is None:
+            if wall_start != 0:
+                raise ValueError(
+                    f"{path}:{row_number}: timeline does not start at zero"
+                )
+        elif wall_start != previous_wall_end:
+            raise ValueError(
+                f"{path}:{row_number}: timeline wall intervals are not contiguous"
+            )
+        if row["record"] == "snapshot":
+            active_start = checked_nonnegative_int(
+                row.get("active_start_ns"), f"{path}:{row_number} active_start_ns"
+            )
+            active_end = checked_nonnegative_int(
+                row.get("active_end_ns"), f"{path}:{row_number} active_end_ns"
+            )
+            if (
+                active_start != active_position
+                or active_end < active_start
+                or row.get("active_duration_ns") != active_end - active_start
+                or active_end - active_start != wall_end - wall_start
+            ):
+                raise ValueError(
+                    f"{path}:{row_number}: active timeline interval differs"
+                )
+            active_position = active_end
+            snapshot_count += 1
+        else:
+            if row.get("active_position_ns") != active_position:
+                raise ValueError(f"{path}:{row_number}: gap active position differs")
+            gap_count += 1
         event_rows = row.get("events")
         if not isinstance(event_rows, list):
             raise ValueError(f"{path}:{row_number}: timeline events are not an array")
+        expected_start = "" if not event_rows else event_rows[0].get("sequence")
+        expected_end = "" if not event_rows else event_rows[-1].get("sequence")
+        if (
+            row.get("event_sequence_start") != expected_start
+            or row.get("event_sequence_end") != expected_end
+        ):
+            raise ValueError(f"{path}:{row_number}: timeline event extent differs")
+        for event in event_rows:
+            event_start = event.get("start_ns")
+            event_end = event.get("end_ns")
+            event_time = event.get("time_ns")
+            if not all(
+                isinstance(value, int) and not isinstance(value, bool)
+                for value in (event_start, event_end, event_time)
+            ):
+                raise ValueError(f"{path}:{row_number}: event time is not integral")
+            lower_closed = previous_wall_end is None
+            if (
+                event_start < 0
+                or event_end > wall_end
+                or event_time > wall_end
+                or (
+                    event_time < wall_start
+                    if lower_closed
+                    else event_time <= wall_start
+                )
+            ):
+                raise ValueError(
+                    f"{path}:{row_number}: event falls outside its timeline interval"
+                )
         events.extend(event_rows)
+        previous_wall_end = wall_end
     if [event.get("sequence") for event in events] != list(range(len(events))):
         raise ValueError(f"{path}: event sequence is not contiguous")
+    event_times = [event.get("time_ns") for event in events]
+    if event_times != sorted(event_times):
+        raise ValueError(f"{path}: event times move backwards")
     if rows[-1].get("event_count") != len(events):
         raise ValueError(f"{path}: final event count differs")
+    if previous_wall_end != final_summary.get("makespan_ns"):
+        raise ValueError(f"{path}: timeline wall extent differs from makespan")
+    if (
+        final_summary.get("timeline_active_ns") != active_position
+        or final_summary.get("timeline_snapshots") != snapshot_count
+        or final_summary.get("timeline_gaps") != gap_count
+    ):
+        raise ValueError(f"{path}: timeline summary counts differ")
 
     try:
         import jsonschema
@@ -5307,6 +5542,21 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
     transaction_identities: dict[tuple[str, str], tuple[object, ...]] = {}
     transaction_digests: dict[tuple[str, str], tuple[object, object]] = {}
     dispatches_by_route: dict[tuple[int, int], int] = defaultdict(int)
+    assignment_counts: dict[tuple[int, str, int], int] = defaultdict(int)
+    lifecycle_counts: dict[tuple[str, int, int], dict[str, int]] = defaultdict(
+        lambda: defaultdict(int)
+    )
+    release_times: dict[tuple[str, int, int], int] = {}
+    completion_times: dict[tuple[str, int, int], int] = {}
+    tu_sequences: dict[tuple[str, int, int], int] = {}
+    dispatch_tu_sequences_by_environment: dict[int, list[int]] = defaultdict(list)
+    dispatch_rel_sequences_by_route: dict[tuple[int, int], list[int]] = defaultdict(
+        list
+    )
+    dispatch_transaction_sequences: list[int] = []
+    source_bytes_by_tu: dict[tuple[str, int, int], dict[str, int]] = defaultdict(
+        lambda: defaultdict(int)
+    )
 
     def apply_history(
         deltas: Mapping[str, object],
@@ -5349,9 +5599,12 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
         workload = event["workload"]
         logical = event["logical"]
         if workload != "":
-            content = content_rows.get((workload, logical))
-            if content is None:
+            tu_key = (workload, event["build"], logical)
+            expected_tu = expected_tus.get(tu_key)
+            if expected_tu is None:
                 raise ValueError(f"{path}: event refers to unknown workload TU")
+            content = expected_tu["content"]
+            assert isinstance(content, dict)
             if event["raw_digest"] != content["raw_sha256"]:
                 raise ValueError(
                     f"{path}: event raw digest differs from input manifest"
@@ -5366,6 +5619,8 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
                     f"{path}: event compile-duration provenance differs from input"
                 )
             job = manifest_jobs[workload]
+            if event["environment"] != job["c_index"]:
+                raise ValueError(f"{path}: event C environment differs from manifest")
             expected_logical_job_id = "job-" + stable_hex(
                 "logical-job",
                 scenario_digest,
@@ -5380,10 +5635,62 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
                 or event["attempt_id"] != f"{expected_logical_job_id}:attempt-0"
             ):
                 raise ValueError(f"{path}: event logical/attempt identity differs")
+            lifecycle_counts[tu_key][event["event"]] += 1
+            if not isinstance(event["TU_SEQ"], int):
+                raise ValueError(f"{path}: TU event lacks TU_SEQ")
+            established_tu_seq = tu_sequences.setdefault(tu_key, event["TU_SEQ"])
+            if established_tu_seq != event["TU_SEQ"]:
+                raise ValueError(f"{path}: TU_SEQ drifted within one TU")
+            trace_entry = trace_entries.get(tu_key)
+            expected_c_store = (
+                trace_entry.c_store_guid
+                if trace_entry is not None
+                else stable_hex("c-store", scenario_digest, job["c_index"], digits=32)
+            )
+            if event["C_STORE_GUID"] != expected_c_store:
+                raise ValueError(f"{path}: event C identity differs from manifest")
+            if trace_entry is not None and event["TU_SEQ"] != trace_entry.tu_seq:
+                raise ValueError(f"{path}: event TU_SEQ differs from route trace")
+            if event["event"] == "release":
+                if event["start_ns"] != event["end_ns"]:
+                    raise ValueError(f"{path}: TU release is not instantaneous")
+                release_times[tu_key] = event["time_ns"]
+            if event["event"] == "transaction-complete":
+                completion_times[tu_key] = event["time_ns"]
         elif event["raw_digest"] is not None:
             raise ValueError(f"{path}: non-TU event carries a raw digest")
         if event["provenance"]["timing"] != "modeled":
             raise ValueError(f"{path}: simulated event timing is not marked modeled")
+
+        selected_profile = manifest["capabilities"]["codec_profile"]
+        if (
+            selected_profile not in event["negotiated_profiles"]
+            or selected_profile not in event["route_state_profiles"]
+        ):
+            raise ValueError(f"{path}: event profiles omit the selected codec")
+        if event["phase"] == "":
+            if event["direction"] != "" or event["bytes"] != "":
+                raise ValueError(f"{path}: non-flow event carries a phase extent")
+        else:
+            if event["direction"] not in DIRECTIONS or not isinstance(
+                event["bytes"], int
+            ):
+                raise ValueError(f"{path}: flow event phase extent is incomplete")
+            expected_c_to_f_delta = (
+                event["bytes"]
+                if event["event"] == "flow-sent" and event["direction"] == "c_to_f"
+                else 0
+            )
+            expected_f_to_c_delta = (
+                event["bytes"]
+                if event["event"] == "flow-sent" and event["direction"] == "f_to_c"
+                else 0
+            )
+            if (
+                event["c_to_f_byte_delta"] != expected_c_to_f_delta
+                or event["f_to_c_byte_delta"] != expected_f_to_c_delta
+            ):
+                raise ValueError(f"{path}: flow phase bytes differ from byte delta")
 
         c_to_f = checked_nonnegative_int(
             event["c_to_f_byte_delta"], "event c_to_f_byte_delta"
@@ -5410,6 +5717,9 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
             raise ValueError(f"{path}: event resource/queue provenance differs")
         directional["c_to_f"][account] += c_to_f
         directional["f_to_c"][account] += f_to_c
+        if workload != "" and account == "source":
+            source_bytes_by_tu[tu_key]["c_to_f"] += c_to_f
+            source_bytes_by_tu[tu_key]["f_to_c"] += f_to_c
         if c_to_f or f_to_c:
             if not isinstance(event["environment"], int) or not isinstance(
                 event["worker"], int
@@ -5441,6 +5751,47 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
                 raise ValueError(
                     f"{path}: event route identity drifted without transition"
                 )
+            trace_entry = trace_entries.get(tu_key) if workload != "" else None
+            if trace_entry is not None:
+                expected_trace_identity = (
+                    trace_entry.c_store_guid,
+                    trace_entry.physical_endpoint,
+                    trace_entry.route_lane_id,
+                    trace_entry.f_store_guid,
+                    trace_entry.session_serial,
+                    trace_entry.history_nonce,
+                )
+                if (
+                    event["worker"] != trace_entry.worker
+                    or identity != expected_trace_identity
+                    or event["REL_SEQ"] != trace_entry.rel_seq
+                    or event["TU_SEQ"] != trace_entry.tu_seq
+                ):
+                    raise ValueError(
+                        f"{path}: event physical route differs from retained route trace"
+                    )
+            elif workload != "":
+                expected_policy_identity = (
+                    stable_hex(
+                        "c-store", scenario_digest, event["environment"], digits=32
+                    ),
+                    f"F{event['worker']}",
+                    f"C{event['environment']}_F{event['worker']}",
+                    stable_hex("f-store", scenario_digest, event["worker"], digits=32),
+                    1,
+                    int(
+                        stable_hex(
+                            "history-nonce",
+                            scenario_digest,
+                            event["environment"],
+                            event["worker"],
+                            digits=16,
+                        ),
+                        16,
+                    ),
+                )
+                if identity != expected_policy_identity:
+                    raise ValueError(f"{path}: event policy route identity differs")
             transaction_key = (event["logical_job_id"], event["attempt_id"])
             transaction_identity = identity + (event["REL_SEQ"], event["TU_SEQ"])
             established_transaction = transaction_identities.setdefault(
@@ -5449,6 +5800,29 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
             if established_transaction != transaction_identity:
                 raise ValueError(f"{path}: event transaction route identity drifted")
             if event["transaction_digest"] is not None:
+                recomputed_digest = transaction_identity_digest(
+                    scenario_digest,
+                    event["logical_job_id"],
+                    event["attempt_id"],
+                    event["C_STORE_GUID"],
+                    event["F_STORE_GUID"],
+                    event["HISTORY_NONCE"],
+                    event["TU_SEQ"],
+                    event["REL_SEQ"],
+                    event["raw_digest"] or "unavailable",
+                    event["negotiated_profiles"],
+                    event["route_state_profiles"],
+                )
+                recomputed_input = input_record_identity(
+                    recomputed_digest, event["raw_digest"] or "unavailable"
+                )
+                if (
+                    event["transaction_digest"] != recomputed_digest
+                    or event["InputRecord_identity"] != recomputed_input
+                ):
+                    raise ValueError(
+                        f"{path}: event transaction/InputRecord digest differs"
+                    )
                 digest_identity = (
                     event["transaction_digest"],
                     event["InputRecord_identity"],
@@ -5470,8 +5844,34 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
                     raise ValueError(
                         f"{path}: route identity provenance differs from trace"
                     )
+        elif (
+            event["transaction_digest"] is not None
+            or event["InputRecord_identity"] is not None
+        ):
+            raise ValueError(f"{path}: C-only event carries a transaction identity")
+        if event["tu_seq"] != "" and event["tu_seq"] != event["TU_SEQ"]:
+            raise ValueError(f"{path}: TU_SEQ aliases differ")
+        if event["rel_seq"] != "" and event["rel_seq"] != event["REL_SEQ"]:
+            raise ValueError(f"{path}: REL_SEQ aliases differ")
+        if (
+            isinstance(event["worker"], int)
+            and workload != ""
+            and event["event"] != "route-bound"
+            and event["transaction_digest"] is None
+        ):
+            raise ValueError(f"{path}: transaction event lacks its digest")
         if event["event"] == "dispatch":
             dispatches_by_route[(event["environment"], event["worker"])] += 1
+            assignment_counts[
+                (event["environment"], event["workload"], event["worker"])
+            ] += 1
+            dispatch_tu_sequences_by_environment[event["environment"]].append(
+                event["TU_SEQ"]
+            )
+            dispatch_rel_sequences_by_route[
+                (event["environment"], event["worker"])
+            ].append(event["REL_SEQ"])
+            dispatch_transaction_sequences.append(event["transaction"])
         apply_history(
             event["resource_byte_delta"],
             resources,
@@ -5490,6 +5890,137 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
             queue_names,
             "queue",
         )
+    expected_tu_keys = set(expected_tus)
+    if set(lifecycle_counts) != expected_tu_keys:
+        raise ValueError(f"{path}: event TU set differs from workload manifest")
+    required_lifecycle = (
+        "release",
+        "dispatch",
+        "compile-start",
+        "compile-finish",
+        "transaction-commit",
+        "transaction-complete",
+    )
+    for key in sorted(expected_tu_keys):
+        counts = lifecycle_counts[key]
+        for name in required_lifecycle:
+            if counts.get(name, 0) != 1:
+                raise ValueError(
+                    f"{path}: TU {key} has {counts.get(name, 0)} {name} events"
+                )
+        expected_route_bindings = 1 if expected_binding == "release-time-static" else 0
+        if counts.get("route-bound", 0) != expected_route_bindings:
+            raise ValueError(
+                f"{path}: TU {key} route-binding count differs from routing mode"
+            )
+    if (
+        set(release_times) != expected_tu_keys
+        or set(completion_times) != expected_tu_keys
+    ):
+        raise ValueError(f"{path}: TU release/completion cardinality differs")
+
+    for job in manifest["workload"]["jobs"]:
+        workload = job["id"]
+        mode = job["build_release"]["mode"]
+        previous_finish: int | None = None
+        for build in range(job["build_epochs"]):
+            build_keys = {
+                key
+                for key in expected_tu_keys
+                if key[0] == workload and key[1] == build
+            }
+            if mode == "concurrent":
+                boundary = 0
+            elif mode == "fixed-interval":
+                boundary = build * job["build_release"]["interval_ns"]
+            elif build == 0:
+                boundary = 0
+            else:
+                assert previous_finish is not None
+                boundary = previous_finish + job["build_release"].get("gap_ns", 0)
+            if {release_times[key] for key in build_keys} != {boundary}:
+                raise ValueError(
+                    f"{path}: v2 TU release is not at build {workload}/{build} boundary"
+                )
+            previous_finish = max(completion_times[key] for key in build_keys)
+
+    if dispatch_transaction_sequences != list(range(len(expected_tu_keys))):
+        raise ValueError(f"{path}: dispatch transaction sequence is not contiguous")
+    if (
+        len(transaction_identities) != len(expected_tu_keys)
+        or len(transaction_digests) != len(expected_tu_keys)
+        or set(route_identities) != set(dispatches_by_route)
+    ):
+        raise ValueError(f"{path}: transaction/relationship cardinality differs")
+    for environment, values in dispatch_tu_sequences_by_environment.items():
+        if sorted(values) != list(range(len(values))):
+            raise ValueError(f"{path}: C{environment} TU_SEQ set is not contiguous")
+    for route, values in dispatch_rel_sequences_by_route.items():
+        if values != list(range(len(values))):
+            raise ValueError(
+                f"{path}: relationship {route} REL_SEQ order is not contiguous"
+            )
+
+    if trace_entries:
+        for key, entry in trace_entries.items():
+            observed = source_bytes_by_tu[key]
+            if (
+                observed.get("c_to_f", 0) != entry.c_to_f_bytes
+                or observed.get("f_to_c", 0) != entry.f_to_c_bytes
+            ):
+                raise ValueError(
+                    f"{path}: TU source bytes differ from retained route trace"
+                )
+
+    expected_job_count = len(expected_tu_keys)
+    expected_build_count = sum(
+        job["build_epochs"] for job in manifest["workload"]["jobs"]
+    )
+    expected_raw_bytes = sum(
+        int(details["content"]["raw_bytes"]) for details in expected_tus.values()
+    )
+    expected_compile_ns = sum(
+        int(details["content"]["compile_ns"]) for details in expected_tus.values()
+    )
+    derived_counts = {
+        "jobs": expected_job_count,
+        "build_epochs": expected_build_count,
+        "cold_builds": len(manifest["workload"]["jobs"]),
+        "warm_builds": expected_build_count - len(manifest["workload"]["jobs"]),
+        "environments": manifest["topology"]["c_count"],
+        "workers": manifest["topology"]["f_count"],
+        "slots_per_worker": manifest["topology"]["f_slots"],
+        "input_staging_slots_per_worker": manifest["topology"].get(
+            "input_staging_slots", manifest["topology"]["f_slots"]
+        ),
+        "total_worker_slots": manifest["topology"]["f_count"]
+        * manifest["topology"]["f_slots"],
+        "raw_bytes": expected_raw_bytes,
+        "compiler_work_ns": expected_compile_ns,
+    }
+    for name, expected_value in derived_counts.items():
+        if final_summary.get(name) != expected_value:
+            raise ValueError(f"{path}: final {name} differs from manifest/events")
+
+    expected_assignment_counts = [
+        {
+            "environment": environment,
+            "workload": workload,
+            "worker": worker,
+            "tus": count,
+        }
+        for (environment, workload, worker), count in sorted(assignment_counts.items())
+    ]
+    if (
+        "assignment_counts" in routing
+        and routing.get("assignment_counts") != expected_assignment_counts
+    ):
+        raise ValueError(f"{path}: routing assignment counts differ from events")
+    if (
+        manifest["topology"]["assignment_source"] == "route_trace"
+        and "assignment_counts" not in routing
+    ):
+        raise ValueError(f"{path}: exact routing assignment counts are absent")
     if any(resources.values()) or any(queues.values()):
         raise ValueError(f"{path}: resource or queue byte ledger remains open")
     ledger = final_summary.get("exact_byte_ledger", {})
@@ -5580,6 +6111,10 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
         replay_routes = replay.get("routes")
         if not isinstance(replay_routes, list):
             raise ValueError(f"{path}: exact replay routes are absent")
+        trace_routes: dict[tuple[int, int], list[RouteTraceEntry]] = defaultdict(list)
+        for key, entry in trace_entries.items():
+            environment = int(expected_tus[key]["environment"])
+            trace_routes[(environment, entry.worker)].append(entry)
         seen_routes: set[tuple[int, int]] = set()
         replay_c_to_f = 0
         replay_f_to_c = 0
@@ -5605,6 +6140,35 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
                 != identity
             ):
                 raise ValueError(f"{path}: exact replay route identity differs")
+            retained_entries = trace_routes.get(route, [])
+            if not retained_entries:
+                raise ValueError(f"{path}: exact replay route is absent from trace")
+            retained = retained_entries[0]
+            retained_identity = (
+                retained.c_store_guid,
+                retained.physical_endpoint,
+                retained.route_lane_id,
+                retained.f_store_guid,
+                retained.session_serial,
+                retained.history_nonce,
+            )
+            if (
+                tuple(
+                    row[name]
+                    for name in (
+                        "C_STORE_GUID",
+                        "physical_endpoint",
+                        "RouteLaneId",
+                        "F_STORE_GUID",
+                        "session_serial",
+                        "HISTORY_NONCE",
+                    )
+                )
+                != retained_identity
+            ):
+                raise ValueError(
+                    f"{path}: exact replay summary identity differs from route trace"
+                )
             accounts = {
                 account: {
                     "c_to_f_bytes": directional_by_route.get(
@@ -5622,16 +6186,27 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
             route_f_to_c = sum(value["f_to_c_bytes"] for value in accounts.values())
             if row.get("accounts") != accounts:
                 raise ValueError(f"{path}: exact replay route accounts differ")
+            retained_c_to_f = sum(entry.c_to_f_bytes for entry in retained_entries)
+            retained_f_to_c = sum(entry.f_to_c_bytes for entry in retained_entries)
+            if accounts.get("source", {"c_to_f_bytes": 0, "f_to_c_bytes": 0}) != {
+                "c_to_f_bytes": retained_c_to_f,
+                "f_to_c_bytes": retained_f_to_c,
+            }:
+                raise ValueError(
+                    f"{path}: exact replay source totals differ from route trace"
+                )
             if (
                 row.get("c_to_f_bytes") != route_c_to_f
                 or row.get("f_to_c_bytes") != route_f_to_c
             ):
                 raise ValueError(f"{path}: exact replay route totals differ")
-            if row.get("tus") != dispatches_by_route.get(route, 0):
+            if row.get("tus") != dispatches_by_route.get(route, 0) or row.get(
+                "tus"
+            ) != len(retained_entries):
                 raise ValueError(f"{path}: exact replay route TU count differs")
             replay_c_to_f += route_c_to_f
             replay_f_to_c += route_f_to_c
-        if seen_routes != set(dispatches_by_route):
+        if seen_routes != set(dispatches_by_route) or seen_routes != set(trace_routes):
             raise ValueError(f"{path}: exact replay route set differs")
         if (
             replay_c_to_f != direction_totals["c_to_f"]
@@ -5684,7 +6259,11 @@ def write_result(
     write_tsv(output_directory / "builds.tsv", result.builds)
     write_tsv(output_directory / "generations.tsv", result.generations)
     if scenario.is_v2:
-        write_route_trace(output_directory / "route-trace.jsonl", scenario, result)
+        retained_route_trace = output_directory / "route-trace.jsonl"
+        if scenario.route_trace_path is not None:
+            retained_route_trace.write_bytes(scenario.route_trace_path.read_bytes())
+        else:
+            write_route_trace(retained_route_trace, scenario, result)
     descriptor, timeline, final = write_experiment_stream(
         output_directory / "experiment.jsonl", scenario, result, execution
     )

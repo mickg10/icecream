@@ -1502,7 +1502,7 @@ class SimulatorTest(unittest.TestCase):
                     candidate[0]["expected_summary"] = copy.deepcopy(
                         candidate[-1]["summary"]
                     )
-                candidate_path = root / f"bad-{label}.jsonl"
+                candidate_path = output / f"bad-{label}.jsonl"
                 candidate_path.write_text(
                     "".join(json.dumps(row) + "\n" for row in candidate)
                 )
@@ -1572,6 +1572,130 @@ class SimulatorTest(unittest.TestCase):
                 synchronize_summary=True,
             )
 
+            def first_event(
+                rows: list[dict[str, object]], name: str
+            ) -> dict[str, object]:
+                return next(
+                    event
+                    for timeline in rows[1:-1]
+                    for event in timeline["events"]
+                    if event["event"] == name
+                )
+
+            def move_event_outside_interval(rows: list[dict[str, object]]) -> None:
+                event = rows[1]["events"][0]
+                value = rows[1]["wall_end_ns"] + 1
+                event["start_ns"] = value
+                event["end_ns"] = value
+                event["time_ns"] = value
+
+            reject(
+                "event-containment",
+                move_event_outside_interval,
+                "outside its timeline interval",
+            )
+            reject(
+                "timeline-sequence",
+                lambda rows: rows[1].__setitem__("sequence", 7),
+                "timeline sequence",
+            )
+
+            def drift_release_c(rows: list[dict[str, object]]) -> None:
+                first_event(rows, "release")["C_STORE_GUID"] = "a" * 32
+
+            reject("release-c", drift_release_c, "C identity differs")
+
+            def drift_profile(rows: list[dict[str, object]]) -> None:
+                first_event(rows, "release")["negotiated_profiles"] = ["invented"]
+
+            reject("selected-profile", drift_profile, "profiles omit")
+
+            def drift_transaction_digest(rows: list[dict[str, object]]) -> None:
+                target = first_event(rows, "dispatch")["logical_job_id"]
+                for timeline in rows[1:-1]:
+                    for event in timeline["events"]:
+                        if (
+                            event["logical_job_id"] == target
+                            and event["transaction_digest"] is not None
+                        ):
+                            event["transaction_digest"] = "f" * 64
+                            event["InputRecord_identity"] = "input-forged"
+
+            reject(
+                "transaction-digest",
+                drift_transaction_digest,
+                "transaction/InputRecord digest",
+            )
+
+            def forge_job_count(rows: list[dict[str, object]]) -> None:
+                rows[-1]["summary"]["jobs"] = 999
+
+            reject(
+                "job-cardinality",
+                forge_job_count,
+                "final jobs differs",
+                synchronize_summary=True,
+            )
+
+            def forge_trace_sha(rows: list[dict[str, object]]) -> None:
+                forged = "f" * 64
+                rows[0]["route_trace_evidence"]["sha256"] = forged
+                rows[-1]["summary"]["routing"]["route_trace_sha256"] = forged
+                rows[-1]["summary"]["replay_closure"]["route_trace_sha256"] = forged
+
+            reject(
+                "route-trace-digest",
+                forge_trace_sha,
+                "digest differs from exact bytes",
+                synchronize_summary=True,
+            )
+
+            def forge_route_identity(rows: list[dict[str, object]]) -> None:
+                target = first_event(rows, "dispatch")["logical_job_id"]
+                forged_f = "a" * 32
+                for timeline in rows[1:-1]:
+                    for event in timeline["events"]:
+                        if event["logical_job_id"] == target:
+                            event["F_STORE_GUID"] = forged_f
+                            event["physical_endpoint"] = "forged-F"
+                            event["RouteLaneId"] = "forged-lane"
+                for route in rows[-1]["summary"]["replay_closure"]["routes"]:
+                    if route["worker"] == first_event(rows, "dispatch")["worker"]:
+                        route["F_STORE_GUID"] = forged_f
+                        route["physical_endpoint"] = "forged-F"
+                        route["RouteLaneId"] = "forged-lane"
+
+            reject(
+                "route-identity-vs-trace",
+                forge_route_identity,
+                "retained route trace|route identity drifted",
+                synchronize_summary=True,
+            )
+
+            def drift_phase_extent(rows: list[dict[str, object]]) -> None:
+                first_event(rows, "flow-sent")["bytes"] += 1
+
+            reject("phase-byte-extent", drift_phase_extent, "phase bytes differ")
+
+            def remove_completion(rows: list[dict[str, object]]) -> None:
+                for timeline in rows[1:-1]:
+                    for index, event in enumerate(timeline["events"]):
+                        if event["event"] == "transaction-complete":
+                            del timeline["events"][index]
+                            for later in rows[1:-1]:
+                                for candidate in later["events"]:
+                                    if candidate["sequence"] > event["sequence"]:
+                                        candidate["sequence"] -= 1
+                            timeline["event_sequence_end"] -= 1
+                            rows[-1]["event_count"] -= 1
+                            return
+
+            reject(
+                "tu-completion-cardinality",
+                remove_completion,
+                "event extent|transaction-complete|event sequence",
+            )
+
     def test_v2_stream_is_identical_in_two_checkout_roots(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             parent = Path(directory)
@@ -1586,6 +1710,52 @@ class SimulatorTest(unittest.TestCase):
                 sim.write_result(scenario, result, output, execution_for(path))
                 streams.append((output / "experiment.jsonl").read_bytes())
             self.assertEqual(streams[0], streams[1])
+
+    def test_transaction_digest_binds_route_state_profiles(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_v2_fixture(root, [3], [10], workers=1)
+            scenario = sim.load_scenario(path)
+            baseline = sim.Simulator(scenario, sim.RawAdapter()).run()
+            changed_simulator = sim.Simulator(scenario, sim.RawAdapter())
+            changed_simulator.route_state_profiles.append("retained-window-v2")
+            changed = changed_simulator.run()
+            self.assertNotEqual(
+                baseline.assignments[0]["transaction_digest"],
+                changed.assignments[0]["transaction_digest"],
+            )
+
+    def test_v2_validator_rejects_nonzero_release_offset_at_build_boundary(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_v2_fixture(root, [3, 2], [10, 11], workers=2)
+            scenario = sim.load_scenario(path)
+            output = root / "out"
+            sim.write_result(
+                scenario,
+                sim.Simulator(scenario, sim.RawAdapter()).run(),
+                output,
+                execution_for(path),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "experiment.jsonl").read_text().splitlines()
+            ]
+            release = next(
+                event
+                for timeline in rows[1:-1]
+                for event in timeline["events"]
+                if event["event"] == "release"
+            )
+            release["start_ns"] = 1
+            release["end_ns"] = 1
+            release["time_ns"] = 1
+            candidate = output / "bad-release-offset.jsonl"
+            candidate.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            with self.assertRaisesRegex(ValueError, "event times|build .* boundary"):
+                sim.validate_experiment_jsonl(candidate)
 
     def test_retained_r4_sample_validates_and_replays(self) -> None:
         root = MODULE_PATH.parent / "samples" / "r4-minimum"

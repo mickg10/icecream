@@ -86,7 +86,9 @@ resource_byte_delta, queue_byte_delta
 ```
 
 The stable simulated identifiers are domain-separated hashes of the scenario,
-logical input, C/F route, sequence numbers, raw digest, and selected profile.
+logical input, C/F route, sequence numbers, raw digest, negotiated profiles, and
+route-state profiles. `InputRecord_identity` is independently recomputed from
+that transaction digest and the raw-content digest.
 Trace replay preserves the physical C/F/session/route identities instead.
 Legacy event names remain for v1 readers; the additive `stage` field carries the
 canonical lifecycle vocabulary. Provenance is not one blanket label: timing,
@@ -114,7 +116,11 @@ at completion. The engine validates closure before returning a result, and
 recomputes the embedded scenario and workload digests, reconciles execution
 inputs and selected outcomes, and independently replays event count, per-account
 and per-route directional totals, every credited/debited/peak/final transient
-summary, route identities, and replay totals.
+summary, route identities, and replay totals. It also derives TU, build, job,
+route, and relationship cardinalities from the manifest, workload rows, and
+events; checks contiguous wall/active timeline records and chronological event
+containment; and proves that every v2 TU release has zero offset from its
+derived build boundary.
 
 ## Assignment replay
 
@@ -134,9 +140,14 @@ directional bytes remain exact, but a small timing change may choose another F.
 The report therefore claims aggregate directional closure only; it does not
 mislabel a different assignment as an exact route replay.
 
-Every v2 run writes its realized `route-trace.jsonl` as retained assignment
-evidence. An exact replay input must carry the digest of the already-frozen
-route-trace scenario and its selected codec.
+Every v2 run writes `route-trace.jsonl` as retained assignment evidence. Policy
+runs write the realized route trace. Exact replay runs retain the input trace
+byte-for-byte, and the execution record names its relative path and SHA-256.
+Validation reloads those literal bytes, recomputes their SHA-256, validates the
+trace header/assignments/summary, and compares every applicable event and exact
+route-summary identity and source-byte total directly with the retained rows.
+An exact replay input must carry the digest of the already-frozen route-trace
+scenario and its selected codec.
 
 ## Retained acceptance fixture
 
@@ -148,6 +159,8 @@ route-trace scenario and its selected codec.
   `5cb0ecacfd3f84e48ff80aff99738d2232964c797b583caa586582de5b9f5636`;
 - input route-trace SHA-256:
   `340ef69297e1c8b05cfa3eb6adcb7191b0cab7085017e470cbef0658df639c3d`;
+- retained route evidence: `route-trace.jsonl`, byte-identical to the input
+  trace above;
 - retained `sample-experiment.jsonl` SHA-256:
   `7128ef3ce2384f7f58bce83cf5a9793e2d7bab5e2ff33a0cc8cde5a70b257824`;
 - closure: 30 events, 37 source C-to-F bytes, zero F-to-C bytes, two exact

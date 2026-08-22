@@ -9,7 +9,9 @@ scheduler simulations.
 exact directional/resource ledgers, resident/explicit environment behavior, and physical
 route-trace versus policy-only replay closure. Its corrected validator also binds each workload
 digest to per-TU content, validates field-level event provenance, and replays route and transient
-ledger summaries independently. Existing v1 scenarios remain supported.
+ledger summaries independently. Exact replay additionally reloads the retained route-trace bytes
+and closes direct identities, source bytes, chronology, build-boundary releases, and independently
+derived TU/build/route cardinalities. Existing v1 scenarios remain supported.
 
 [`ICECREAM-REAL-TRANSFER-ARCHITECTURE.md`](ICECREAM-REAL-TRANSFER-ARCHITECTURE.md)
 maps the simulator onto the actual C client, C/F daemons, persistent stores, per-job TCP
