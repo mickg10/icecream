@@ -103,7 +103,7 @@ RetireVerifiedIncarnation(f) ==
 
 StartCompiler(f) ==
     /\ f \in Fs
-    /\ s.route[f] = "Durable"
+    /\ s.route[f] \in {"Durable", "Resolved"}
     /\ s.attempt[f] = "None"
     /\ s' = [s EXCEPT !.attempt[f] = "Running"]
 
