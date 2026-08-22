@@ -33,6 +33,7 @@ merge base, so every transplanted layer and resolution is recorded below.
 | `00190466` | `835dbb1d` | R2 endpoint validation corrections |
 | `c5575dc8` | `89bede78` | exact asynchronous completion correspondence |
 | convergence-only | `35a1608a` | endpoint-target Boost flags and P48 scope-gate registration |
+| convergence-only | `f28822bc` | nested package-discovery forwarding for the P48 scope gate |
 
 The M1 core consumes the header-only OnlineS1 implementation, and the M0 layout census reads
 two retained measurement inputs. Only these missing dependencies came from the source tree:
