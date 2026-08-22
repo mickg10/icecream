@@ -1,6 +1,6 @@
 # Issue 16 strategic delivery plan
 
-Status: proposed plan for BigOracle and Deep Reviewer review
+Status: reviewed plan with BigOracle and Deep Reviewer corrections incorporated
 
 Scope: unified P50 product, P43 compatibility, simulation, physical farm, codec research, and experiment reporting
 
@@ -75,9 +75,10 @@ cache_wire    = off | v1
 codec_profile = legacy | zstd_tu | stream_a | stream_b | p29 | grz
 ```
 
-Whether source files retain the historical `protocol50` name is a mechanical
-decision. The externally visible experiment vocabulary must use the namespaced
-fields above.
+Historical source files may retain the `protocol50` name. Renaming them does not
+justify an epoch or delay product work. Emitted manifests, logs, traces, and
+reports must never contain an unqualified `protocol=50`; they must use
+`main_protocol=50` or `cache_wire=v1` as appropriate.
 
 ## 3. Product ownership model
 
@@ -86,9 +87,9 @@ The implementation and simulator must share the same ownership boundaries.
 ```mermaid
 flowchart LR
     PP[icecc wrapper\npreprocessor pipe]
-    CA[C authority\nC GUID + TU sequence\nglobal learner + object arena]
+    CA[C authority\nC GUID + TU sequence\ncanonical admission]
     RF[per-F C route\nrelationship cursor + route learner]
-    FC[F cache service\nper-C namespace + immutable objects]
+    FC[F cache service\nper-C namespace + O_c_f object arena]
     IR[leased InputRecord\ntransaction keyed]
     CC[compiler child\nstdin pipe]
     OUT[result/object path]
@@ -101,29 +102,40 @@ flowchart LR
     CC --> OUT
 ```
 
-Three clocks remain distinct:
+The model has three clocks and one non-clock residency plane:
 
 ```text
-A      shared-C canonical admission
-R_f    committed state for one C/F relationship
-J      logical compile attempts and one accepted result
+A          shared-C canonical admission
+O_{c,f}    F-resident immutable objects for C_STORE_GUID c
+R_f        committed state for one C/F relationship
+J          logical compile attempts and one accepted result
 ```
+
+`A`, `R_f`, and `J` advance. `O_{c,f}` is durable content residency, not a
+cursor: objects may survive transaction/session failure and history reset, and
+capacity eviction changes residency without changing relationship history.
 
 Rules:
 
 1. A local Prepare request receives one immutable `PreparedTU` and advances `A`
    exactly once. A lost local reply, reconnect, reroute, or compiler retry does
    not teach the global learner again.
-2. Each F has an independent `CRoute`; rerouting to F1 never moves or erases the
+2. `OBJECT_APPLIED` installs immutable content into `O_{c,f}`. Pins temporarily
+   connect that content to an `R_f` transaction; `Need` repairs missing objects
+   after eviction.
+3. Each F has an independent `CRoute`; rerouting to F1 never moves or erases the
    outstanding state for F0.
-3. `GLOBAL_S1` belongs to the C-wide authority and is identical for every route
-   attempt of one PreparedTU.
-4. `ROUTE_S1` and GRZ history belong to `R_f` and advance only after exact F
+4. When enabled, `GLOBAL_S1` belongs to the C-wide authority and is identical for
+   every route attempt of one PreparedTU. It is not required to close M2.
+5. `ROUTE_S1` and GRZ history belong to `R_f` and advance only after exact F
    input commit and C reconciliation.
-5. Logical result selection never retires unresolved cache-route state.
-6. For an open logical job, exact input commit atomically publishes a restartable,
+6. Logical result selection never retires unresolved cache-route state.
+7. For an open logical job, exact input commit atomically publishes a restartable,
    immutable InputRecord lease. Compiler attachment may occur before or after
    publication.
+
+The compact ownership theory is therefore `A + O_{c,f} + R_f + J`, with only
+`A`, `R_f`, and `J` acting as clocks.
 
 ## 4. Three synchronized workstreams
 
@@ -140,12 +152,12 @@ same scenario definition and normalized output schema.
 
 ## 5. Common experiment contract
 
-One immutable experiment manifest must drive either a simulation or a physical
-Docker/LAN run.
+One immutable, mode-neutral scenario manifest must drive either a simulation or
+a physical Docker/LAN run. Execution mode belongs in the execution header, so
+both runners consume the same scenario digest.
 
 ```yaml
 schema: icecream-experiment-v2
-mode: simulated | physical
 components:
   scheduler: {release: 1.4.0|1.5.90, main_protocol: 43|50, commit: SHA}
   wrapper:   {release: 1.4.0|1.5.90, main_protocol: 43|50, commit: SHA}
@@ -160,10 +172,16 @@ topology:
   f_slots: N
   bandwidth: per-link and shared-fabric values
   scheduler_policy: round_robin|rendezvous|dense_frontier|home_spill
+  assignment_source: policy|route_trace
 workload:
   corpus: name and immutable manifest digest
   build_epochs: N
-  release_policy: trace|all_at_once|measured_preprocessor
+  release_policy: all_at_once
+environment:
+  initial_state: resident|absent
+  image_digest: SHA
+  transfer_bytes: N
+  install_verify_ns: N
 cache:
   initial_state: cold|warm|snapshot
   capacity_bytes: N
@@ -175,40 +193,83 @@ expected:
   compile_result: exact outcome
 ```
 
-The descriptor must additionally retain image identifiers, compiler and library
-versions, host identities, source commit, simulator commit, codec executable
-digest, and every input manifest digest.
+The execution header adds facts about one realization without changing the
+scenario identity:
+
+```yaml
+schema: icecream-execution-v2
+scenario_digest: SHA
+mode: simulated|physical
+runner_commit: SHA
+host_manifest: SHA
+started_at: timestamp
+```
+
+The execution descriptor must additionally retain image identifiers, compiler
+and library versions, host identities, source commit, simulator commit, codec
+executable digest, and every input manifest digest.
 
 Both execution modes emit the same JSONL structure:
 
 ```text
-experiment descriptor                 first row
+execution header + scenario digest    first row
 events / snapshots / inactive gaps    chronological rows
 summary                               final row
 ```
 
-Canonical event stages are:
+Every transaction/event row in the minimum M3 schema carries the applicable
+subset of these identity and accounting fields:
+
+```text
+logical_job_id, attempt_id
+C_STORE_GUID, physical_endpoint, RouteLaneId, F_STORE_GUID, session_serial
+HISTORY_NONCE, REL_SEQ, TU_SEQ, transaction_digest, raw_digest
+negotiated_profiles, route_state_profiles, InputRecord_identity
+actor, start_ns/end_ns or duration_ns
+observed|modeled|derived provenance
+per-link C-to-F and F-to-C byte delta
+resource and queue byte delta
+```
+
+Canonical event stages and lifecycle transitions are:
 
 ```text
 job_release
 scheduler_select
-preprocess
 canonical_prepare
 route_prepare
+session_open / session_replaced / session_disconnected
 c_queue
 dict_or_manifest
 need
 fill
+object_applied / pin_acquire / pin_release
 f_decode_install
 materialize_verify
-input_publish
+input_commit_visible
+input_record_retain / input_record_release
 compiler_pipe
+compiler_authorized / attempt_cancel
 compile
 result_return
 result_accept
-route_reconcile
+route_reconcile / history_reset / incarnation_replaced
 job_finish
 ```
+
+For scored source-transfer and makespan rows, all preprocessed TUs are available
+at time zero. Physical traces may retain an unscored diagnostic timestamp for
+preprocessor output, but preprocessing is outside the simulator score. Primary
+rows begin with the compiler environment resident. One explicit stress row may
+emit `env_transfer`, `env_install_verify`, and `environment_ready`; its compile
+may begin only when both `ENV_READY` and `INPUT_VERIFIED_READY` hold. Environment
+bytes enter the total network ledger, never the source-codec compression ratio.
+
+A scheduler assignment/route trace can be recorded by the physical run and
+replayed by the simulator. Under route-trace replay, route-by-route and
+directional byte closure is exact. Under a load-driven policy replay without an
+assignment trace, only aggregate directional byte closure is required because
+small timing changes may legitimately select different workers.
 
 Exact gates for every run:
 
@@ -234,6 +295,10 @@ reported separately and included in makespan and fabric utilization.
   declared dataset.
 - Preserve compatibility symlinks for already-published artifact paths.
 
+Repository hygiene and artifact cataloguing run in parallel with endpoint work.
+They do not block M2 or M3 unless required source exists only in a disposable
+checkout; that condition must be corrected immediately.
+
 ### Exit gate
 
 - every active branch and dirty file has an owner and recorded path;
@@ -247,52 +312,62 @@ reported separately and included in makespan and fabric utilization.
 M2 remains a standalone C1F1 endpoint/library boundary. It does not attach to the
 Icecream daemons yet.
 
-### Required corrections from the current independent review
+### Blocking M2 boundary
 
 1. Introduce one C-wide preparation authority with opaque admitted handles.
    `P50ClientEndpoint::run` may accept only handles issued by that authority.
-2. Give Prepare entries an explicit release rule tied to the logical job/retry
-   window so compressed bodies do not live until endpoint destruction.
+2. Make local Prepare replay bounded and idempotent, and give every admitted
+   entry an explicit release rule tied to the logical job/retry window.
 3. Enforce exactly one self-contained Zstd frame for `ZSTD_TU`; reject trailing
-   bytes and appended empty or nonempty frames.
-4. Require a history-reset acknowledgement to match the complete negotiated
-   protocol, profile mask, and limits.
-5. Route every client-detected terminal dialogue outcome through one result path
-   that retains reconciliation identity and classifies the next whole-attempt
-   decision.
-6. Select only the protocol version actually implemented. An overlap containing
-   versions 50 and 51 selects 50, not an unimplemented 51.
-7. Split same-endpoint reconciliation from scheduler reroute. Reroute creates or
-   uses the destination F's independent route.
-8. Add the C-wide `GLOBAL_S1` learner and immutable global plan, admitted exactly
-   once per PreparedTU. Route-local plans remain independent.
-9. Mark M1 reconnect tables as historical capability behavior where the checked
-   M2 decision table supersedes them.
+   bytes and appended empty or nonempty frames, and verify exact output size and
+   digest.
+4. Negotiate only implemented versions and a profile mask. An overlap containing
+   versions 50 and 51 selects 50, never an unimplemented 51.
+5. Stage a candidate session until HELLO and state validation succeed; an
+   incompatible candidate must not replace a live relationship.
+6. Require history-reset acknowledgement to match negotiated version, profile
+   mask, limits, GUID provenance, and route state.
+7. Allow one active dialogue per relationship, with explicit local caps and
+   terminal session-error behavior.
+8. Classify same-endpoint reconnect outcomes without performing scheduler
+   reroute. Whole-transaction replay retains its exact reconciliation identity.
+9. Emit and check an exact action trace for every state-changing operation, and
+   mark the older M1 reconnect table as historical capability behavior where the
+   checked M2 decision table supersedes it.
 
 ### Required tests
 
-- lost local Prepare reply returns the same TU sequence and global plan;
+- lost local Prepare reply returns the same admitted handle and TU sequence;
 - arbitrary Prepared pointer or duplicate TU sequence is rejected;
 - Prepare release returns retained bytes and item counts to zero;
-- one PreparedTU can be routed to F0 and F1 with one global admission;
-- F0 route failure does not remove the global plan or F1 route;
 - exact frame consumption negatives;
 - inconsistent reset acknowledgement;
+- unsupported future version never becomes selected;
+- incompatible HELLO leaves the established relationship unchanged;
 - same-session duplicate begin;
 - same-GUID missing namespace after establishment;
 - F incarnation replacement before commit and after commit-before-ack;
 - all dialogue boundary disconnect/reconnect cases;
 - terminal outcome and whole-attempt classification.
 
-### Gates
+### Blocking acceptance gates
 
 - clean GCC and Clang build/check;
 - strict warnings;
 - ASan and UBSan focused suites;
-- Zstd prefix override build;
-- complete distribution archive check;
-- quietbox single-thread `ZSTD_TU` encode rate at least 0.5 GB/s;
 - exact trace checker closure.
+
+The Zstd prefix build, distribution archive check, and retained quietbox
+single-thread `ZSTD_TU` rate measurement continue in parallel and must be green
+before M2 is merged. They are evidence/package gates, not reasons to expand M2's
+state-machine scope.
+
+### Explicitly deferred from M2
+
+- the transactional shared-C `GLOBAL_S1` learner/candidate, required before P29
+  is enabled;
+- actual scheduler reroute and C1F2 behavior, introduced in M4;
+- codec selection beyond `ZSTD_TU`, introduced behind the M5 codec boundary.
 
 ### Exit gate
 
@@ -301,7 +376,9 @@ contains no daemon, scheduler, wrapper, or farm integration.
 
 ## 8. Epoch 2 / M2.5: converge P50 work onto P48
 
-This is a separate, reviewable sequence of commits before M3.
+This is a separate, reviewable sequence of commits before M3. A dry-run
+convergence branch may expose conflicts while M2 is closing, but no M3 work may
+start on it until corrected M2 and the core inheritance gate are present.
 
 ### Ordered integration
 
@@ -309,17 +386,28 @@ This is a separate, reviewable sequence of commits before M3.
 2. Apply the C++23 and mandatory Boost baseline.
 3. Apply accepted M0 and M1 commits.
 4. Apply the corrected M2 endpoint commits.
-5. Apply P49 scheduler-to-worker assignment preparation/revocation.
-6. Apply P50 end-to-end assignment identity.
-7. Add cache-endpoint capability advertisement without enabling cache input.
+5. Apply P49 scheduler-to-worker assignment preparation/revocation as its own
+   commit.
+6. Apply P50 end-to-end assignment identity as its own commit.
+7. Add inert cache-endpoint capability advertisement as its own commit, without
+   enabling cache input.
 8. Set the development release identity to 1.5.90 only after the merged branch
    builds and reports its intended protocol accurately.
 
-### Inheritance gate
+### Core inheritance gate before M3
+
+With every new capability disabled, the unified branch must build cleanly,
+exercise the corrected scheduler/daemon assignment core, and pass the focused
+P43 legacy compatibility path. This is the gate that blocks the first M3
+vertical.
+
+### Full P48 inheritance gate
 
 With every new capability disabled, the unified branch must reproduce the P48
 behavior and pass its complete scheduler, daemon, webgui, stress, and integration
-suite. Every link to a P43 peer negotiates and executes the legacy path.
+suite. This suite runs in parallel after the core inheritance gate and must close
+before distributed M4 and compatibility/release M6 work. Every link to a P43 peer
+negotiates and executes the legacy path.
 
 ### Exit gate
 
@@ -337,16 +425,19 @@ M3 is the smallest actual product vertical.
 ### C side
 
 - long-lived C cache service owns C GUID, global TU sequence, idempotent local
-  Prepare requests, global learner, object arena, and PreparedTU retention;
+  Prepare requests, immutable candidates, object arena, and PreparedTU retention;
 - wrapper keeps its existing preprocessor pipe and selects a legacy sink or local
   cache Prepare sink before bytes flow;
 - per-F endpoint owns only relationship/session/route state;
+- the authority exposes the future transactional `GLOBAL_S1` extension point but
+  M3 does not require a learner;
 - local protocol carries opaque handles and references only after the relevant
   InputRecord/PreparedTU identity is frozen.
 
 ### F side
 
-- one long-lived F cache service accepts multiple C namespaces;
+- one long-lived F cache service keys storage by C GUID; the M3 gate exercises
+  exactly one C namespace;
 - exact materialization atomically publishes a transaction-keyed, immutable,
   leased InputRecord;
 - job child opens its own local attachment session after fork;
@@ -374,9 +465,17 @@ input arrives before job descriptor
 job descriptor arrives before input
 cache-required with unavailable endpoint
 auto mode with unavailable endpoint -> legacy attempt
+bounded allocation failure before input-mode commitment
 compiler restart from retained InputRecord
 same-F reconnect and lost final acknowledgement
 ```
+
+### Minimum experiment-core gate
+
+Before the first M3 run, freeze only the mode-neutral manifest digest, execution
+header, identity/accounting fields, lifecycle transitions, exact byte ledger, and
+route-trace replay described in Section 5. The full catalog schema and GUI are
+additive follow-ups and do not block this vertical.
 
 ### Exit gate
 
@@ -391,12 +490,15 @@ Expand the same design without changing M3 ownership.
 
 ### Topologies
 
-- C1F2;
-- C1F20 with 200 slots per F;
-- multiple simultaneous C authorities;
-- local-80 profile: research6 16, research7 16, quietbox2 24, quietbox3 24;
-- submit from nas642 and quietbox2 with submitter-local worker capacity excluded or
-  reduced as declared by the scenario.
+The blocking ownership gate is C1F2: one C authority, two independent route
+relationships, and competing/retried attempts. All local producers in one
+submitter cohort share one authority and one C GUID.
+
+After that evidence closes, M4.5 adds one focused row in which one F hosts
+separate namespaces from two independent submitter cohorts. Broad multi-C
+throughput is deliberately later. C1F20 with 200 slots per F and the local-80
+profile (research6 16, research7 16, quietbox2 24, quietbox3 24) are scale tiers,
+not prerequisites for proving the C1F2 ownership model.
 
 ### Required product behavior
 
@@ -407,29 +509,47 @@ Expand the same design without changing M3 ownership.
 - late F0 commit/result reconciliation after F1 wins;
 - byte-bounded prepared, encoded, fill-reserve, F transaction, materialized-input,
   object, and pin accounting;
-- F cache generation replacement, C reconnect, eviction, and lease release;
-- one F accepting multiple independent C namespaces;
+- `O_{c,f}` object reuse across session/history reset, exact `Need` repair after
+  forced eviction, and balanced pin acquire/release;
+- F cache generation replacement, C reconnect, forced eviction, and lease
+  release;
+- one focused F multi-namespace row after the C1F2 gate;
 - environment transfer and result-return traffic measured explicitly.
+
+ARC policy tuning and sustained cache rotation are scale/release work. M4 must
+prove bounded accounting and forced-eviction behavior, not select the final
+eviction policy.
 
 ### Simulator additions
 
-- measured preprocessor release distribution rather than all TUs at time zero;
+- all TUs immediately available at time zero for scored runs;
 - scheduled C preparation/codec CPU;
 - F decode/install/materialize/copy/pipe CPU;
 - compiler result bytes and return path;
-- compiler environment residency/transfer;
+- resident compiler environments for primary rows, plus one explicit
+  transfer/install/verify stress row in which environment work overlaps P50 input
+  and compile waits for `ENV_READY && INPUT_VERIFIED_READY`;
 - byte capacities and backlogs, not only slot counts;
-- lifecycle events for join, restart, disconnect, cache rotation, and eviction.
+- lifecycle events for join, restart, disconnect, cache rotation, and eviction;
+- physical assignment-trace replay for exact route closure; policy-only replays
+  compare aggregate directional bytes when timing changes routing.
 
 ### Exit gate
 
-Exact physical ledgers replay through the simulator with identical directional
-bytes, route/TU counts, and event closure. Timing error is published per stage and
-topology; no global timing claim is made outside calibrated regimes.
+C1F2 completes with exact reconstruction, ownership, bounded-resource, restart,
+result, and byte closure. Physical ledgers replay through the simulator with
+identical route/TU counts and directional bytes when an assignment trace is
+provided; policy-only runs close aggregate bytes. Timing error is published per
+stage and topology; no global timing claim is made outside calibrated regimes.
 
 ## 11. Epoch 5 / M5: codec profile integration and research
 
 All codecs use one transport, transaction, experiment, and reporting interface.
+Before P29 is enabled, the C authority gains a transactional shared-C
+`GLOBAL_S1` learner/candidate: prepare exact candidate state, reuse it across
+routes, commit it exactly once from exact committed input, and abort prepared
+state on failed work. This may land during M3 preparation or as the first M5
+slice; it is not an M2 requirement.
 
 | Profile | State model | Initial role |
 |---|---|---|
@@ -450,6 +570,21 @@ The simple streaming models follow `simple_compression_models.md`:
 - B2 learns online; no universal `.ii` package is assumed.
 - Independent `ZSTD_TU` remains the simple first product profile even though it
   intentionally gives up cross-TU entropy history.
+
+Every profile snaps into the same narrow codec boundary:
+
+1. prepare an exact immutable candidate;
+2. emit declared DICT, BODY, and Fill components;
+3. reconstruct and verify the exact input;
+4. deterministically derive the next route state;
+5. commit every enabled state component from exact committed input; or
+6. abort all prepared state on failure.
+
+`route_state_profiles` is frozen when a `HISTORY_NONCE` branch is created and is
+included in the initial transaction digest. The selected codec profile must be a
+member of both `negotiated_profiles` and `route_state_profiles`. P29 alone uses
+the C-wide `GLOBAL_S1`; P29 route state and GRZ history remain
+relationship-local. No codec may redefine endpoint or logical-job lifecycle.
 
 ### Research gates
 
@@ -499,6 +634,10 @@ Every tuple must have an explicit expected negotiated protocol, assignment mode,
 cache-wire selection, codec, and compile outcome. An unsupported cache path must
 select legacy before input-mode commitment or produce the scenario's explicit
 cache-required outcome.
+
+The permanent matrix has sixteen component-version rows; it is not multiplied by
+every research codec. Each row declares its expected cache/profile outcome, and
+focused companion rows cover cache unavailable and cache-required behavior.
 
 ### Mixed-fleet and rolling sequences
 
@@ -567,8 +706,9 @@ After this gate, publish 1.5.0 and retire P48 as a standalone development line.
 
 ## 14. Report GUI plan
 
-The existing Rust renderer is a useful single-run prototype. It should be landed
-after the v2 experiment schema is frozen and extended into three operations:
+The existing Rust renderer is a useful single-run prototype. It can land after
+the minimum M3 experiment core is frozen and then grow additively into three
+operations:
 
 ```text
 icecream-dashboard render  experiment.jsonl --out report.html
@@ -594,52 +734,69 @@ icecream-dashboard index   results-root --out index.html
 10. Direct links to manifests, JSONL, logs, binaries, checksums, and source commits.
 
 The first release remains standalone HTML generated from immutable result trees.
-No long-running report service is required.
+No long-running report service is required. GUI progress never blocks the first
+M3 compile; only the mode-neutral manifest, exact ledger, trace, and retained
+artifact contract do.
 
 ## 15. Parallel execution and dependencies
 
 ```mermaid
 flowchart TD
     E0[Epoch 0\nrepository/evidence]
+    PR20[PR 20\nversion + absent-state correction]
     M2[M2 endpoint close]
-    V2[Experiment schema v2]
+    CORE[Minimum mode-neutral\nexperiment core]
     GUI0[Land Rust renderer]
-    CONV[P48 to P50 convergence]
+    CONV[P48 to P50\ncore convergence]
+    P48FULL[Full P48 inheritance suite]
     M3[M3 real C1F1]
     SIM3[physical/simulator correspondence]
-    M4[M4 distributed operation]
+    M4[M4 C1F2 ownership]
+    GLOBAL[Transactional GLOBAL_S1]
     M5[M5 codec profiles]
     M6[M6 P43/P50 matrix]
     M7[M7 sustained farm/release]
 
-    E0 --> M2
-    E0 --> V2
-    V2 --> GUI0
+    PR20 --> M2
+    CORE --> GUI0
     M2 --> CONV
     CONV --> M3
-    V2 --> SIM3
+    CONV --> P48FULL
+    CORE --> M3
     M3 --> SIM3
     SIM3 --> M4
-    M4 --> M5
+    P48FULL --> M4
+    P48FULL --> M6
+    M4 --> GLOBAL
+    GLOBAL --> M5
     M4 --> M6
-    GUI0 --> M6
+    E0 --> M7
+    GUI0 --> M7
     M5 --> M7
     M6 --> M7
 ```
 
 Codec research and GUI work may proceed while M2/P48 convergence is active because
 they operate behind the common manifest/ledger boundaries. M3 daemon integration
-must wait for corrected M2 and P48 convergence. M6 compatibility requires an
+waits only for PR #20, corrected bounded M2, the core P48/P43 inheritance gate,
+and the minimum experiment core. The full P48 stress/webgui/integration suite
+runs in parallel and blocks M4/M6, not the first M3 compile. M6 requires an
 actual M3 path, but its simulator matrix and Docker image preparation can begin
-earlier.
+earlier. Repository/evidence cleanup remains parallel subject to the hard
+required-source rule in Epoch 0.
 
 ## 16. Current evidence and immediate ordered work
 
 Current evidence:
 
 - accepted M1 product head: `6c6c6f3fccd3863aeda35c5636fd1d9e06f36da7`;
-- formal lane: Deep Reviewer signed off five safety bases, two scoped progress
-  rows, and thirteen discriminating mutants at `8eec6e43`;
+- formal lane merged as `8247176df8fc4835db2929cc52a5a79299382762`:
+  five safety bases, two scoped progress rows, and thirteen discriminating
+  mutants are signed off; new formal work is triggered only by a new ownership
+  seam;
+- PR #20 merged as `bdbdc23dfe2df86888fd26e257679250ae1980d9`
+  (final head `f73942636e2b26db700e75aea4466341f8b01f61`), correcting
+  implemented-version selection and canonical absent route/namespace state;
 - M2: broad functional and performance gates pass, with the review corrections in
   Epoch 1 still required before acceptance;
 - simulator: exact Firefox static-routing sweep complete; P29 k8 is the best P29
@@ -650,47 +807,50 @@ Current evidence:
 Immediate order:
 
 ```text
-1. Finish repository/artifact normalization.
-2. Merge the signed-off formal lane after exact-head branch verification.
-3. Implement and independently review the remaining M2 corrections.
-4. Commit M2 as coherent library/endpoint slices.
-5. Freeze experiment schema v2 and land the Rust single-run renderer.
-6. Create the P48-to-P50 convergence branch and run the inheritance gate.
-7. Begin M3 only on that unified branch.
-8. Run the first paired simulated/physical C1F1 P50 scenario.
-9. Expand to M4 topologies while codec profiles run through the same interface.
-10. Complete M6 compatibility before release-scale M7 runs.
+0. Continue repository/artifact normalization in parallel.
+1. DONE: build, test, and land PR #20.
+2. Close and independently accept the small C1F1 ZSTD_TU M2 boundary.
+3. Converge corrected M2 onto P48 with P49, P50 identity, and inert cache
+   advertisement kept as separate commits; pass the core inheritance gate.
+4. Land the minimum mode-neutral experiment core.
+5. Run the first real and simulated M3 C1F1 P50 compile.
+6. Add transactional shared-C GLOBAL_S1 before enabling P29.
+7. Close C1F2 ownership, restart, eviction/accounting, and one-result behavior.
+8. Add further codec profiles, eviction policy, F20/local-80 scale,
+   P43/P50 compatibility, GUI catalog completion, and release gates.
 ```
 
-## 17. Questions for BigOracle and Deep Reviewer
+## 17. Review resolution
 
-Please review this plan with emphasis on simplification and dependency ordering:
+BigOracle and Deep Reviewer accepted the strategic spine and reconciled their
+comments into the plan above. The incorporated rulings are:
 
-1. Is P48-to-P50 convergence placed at the correct boundary—after bounded M2, but
-   before all daemon/scheduler/wrapper M3 work?
-2. Should P49 assignment preparation/revocation and P50 end-to-end assignment
-   identity land before cache-endpoint advertisement, or may those independent
-   commits share one convergence epoch?
-3. Is `main_protocol=50` plus `cache_wire=v1` the clearest resolution of the two
-   existing uses of “Protocol 50,” or should source-level names change before M3?
-4. Are the A / R_f / J clocks and the shared-C `GLOBAL_S1` exactly-once rule
-   sufficient to keep M3-M5 components independent?
-5. Is any M4 lifecycle mechanism unnecessarily early and better deferred until a
-   measured C1F2/F20 need appears?
-6. Is the exhaustive sixteen-row physical P43/P50 `(S,W,D,F)` matrix the right
-   permanent compatibility gate, with P48 retained only as a one-time inheritance
-   suite?
-7. Does the common experiment contract omit any state needed to compare simulator
-   output with physical farm output without adding packet-level detail?
-8. Are the M5 codec boundaries sufficiently modular that Stream A/B, P29, and GRZ
-   can compete without changing endpoint or job lifecycle semantics?
-9. Which exit gate should be strengthened, removed, or moved to keep the path to a
-   testable M3 vertical short?
+1. bounded M2 precedes P48 convergence; M3 starts only after the core inheritance
+   gate, while the full P48 suite runs in parallel and blocks M4/M6;
+2. P49 preparation/revocation, P50 assignment identity, and inert cache endpoint
+   advertisement remain separate convergence commits;
+3. historical source names stay, while all emitted vocabulary qualifies
+   `main_protocol` and `cache_wire`;
+4. ownership is `A + O_{c,f} + R_f + J`, with the object arena modeled as
+   residency rather than a fourth clock;
+5. M2 excludes GLOBAL_S1, actual second-F reroute, and codec selection beyond
+   ZSTD_TU;
+6. scored simulation makes all TUs available at time zero and treats environment
+   setup as resident except for one explicit network/accounting stress row;
+7. C1F2 is the distributed ownership gate; multi-C and large-farm throughput are
+   later tiers;
+8. all sixteen `(S,W,D,F)` P43/P50 rows remain permanent, without multiplying the
+   matrix by every research codec;
+9. the scenario is mode-neutral, execution mode moves to the execution header,
+   and assignment-trace replay provides exact route correspondence;
+10. the minimum M3 schema is frozen first; the full GUI/catalog schema grows
+    additively and does not block M3;
+11. transactional GLOBAL_S1 is required before P29, behind the common codec
+    prepare/reconstruct/commit-or-abort boundary.
 
-The requested review outcome is one corrected ordered plan, not additional layers:
+Review trail:
 
-```text
-accept as written
-or
-return a minimal set of reordered/removed/strengthened items with reasons
-```
+- initial review request: <https://github.com/mickg10/icecream/issues/16#issuecomment-5377627855>;
+- BigOracle strategic verdict: <https://github.com/mickg10/icecream/issues/16#issuecomment-5377672905>;
+- Deep Reviewer detailed review: <https://github.com/mickg10/icecream/issues/16#issuecomment-5377667775>;
+- reconciled Deep Reviewer response: <https://github.com/mickg10/icecream/issues/16#issuecomment-5377683654>.
