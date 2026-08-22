@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "icecream-route-trace-v1-record",
+  "title": "One Icecream physical assignment trace record",
+  "oneOf": [
+    {
+      "type": "object", "additionalProperties": false,
+      "required": ["record", "schema", "scenario_digest", "codec_profile"],
+      "properties": {
+        "record": { "const": "route_trace" },
+        "schema": { "const": "icecream-route-trace-v1" },
+        "scenario_digest": { "$ref": "#/$defs/sha256" },
+        "codec_profile": { "type": "string", "minLength": 1 }
+      }
+    },
+    {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "record", "logical_job_id", "attempt_id", "workload", "build", "logical",
+        "worker", "C_STORE_GUID", "physical_endpoint", "RouteLaneId", "F_STORE_GUID",
+        "session_serial", "HISTORY_NONCE", "TU_SEQ", "REL_SEQ", "c_to_f_bytes",
+        "f_to_c_bytes"
+      ],
+      "properties": {
+        "record": { "const": "assignment" },
+        "logical_job_id": { "type": "string", "minLength": 1 },
+        "attempt_id": { "type": "string", "minLength": 1 },
+        "workload": { "type": "string", "minLength": 1 },
+        "build": { "type": "integer", "minimum": 0 },
+        "logical": { "type": "integer", "minimum": 0 },
+        "worker": { "type": "integer", "minimum": 0 },
+        "C_STORE_GUID": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+        "physical_endpoint": { "type": "string", "minLength": 1 },
+        "RouteLaneId": { "type": "string", "minLength": 1 },
+        "F_STORE_GUID": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+        "session_serial": { "type": "integer", "minimum": 1 },
+        "HISTORY_NONCE": { "type": "integer", "minimum": 0 },
+        "TU_SEQ": { "type": "integer", "minimum": 0 },
+        "REL_SEQ": { "type": "integer", "minimum": 0 },
+        "c_to_f_bytes": { "type": "integer", "minimum": 0 },
+        "f_to_c_bytes": { "type": "integer", "minimum": 0 }
+      }
+    },
+    {
+      "type": "object", "additionalProperties": false,
+      "required": ["record", "assignments", "c_to_f_bytes", "f_to_c_bytes"],
+      "properties": {
+        "record": { "const": "route_summary" },
+        "assignments": { "type": "integer", "minimum": 1 },
+        "c_to_f_bytes": { "type": "integer", "minimum": 0 },
+        "f_to_c_bytes": { "type": "integer", "minimum": 0 }
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+  }
+}

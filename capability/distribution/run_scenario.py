@@ -22,17 +22,45 @@ import csv
 import hashlib
 import heapq
 import json
+import re
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
-from typing import Iterable, Iterator, Sequence
+from typing import Iterable, Iterator, Mapping, Sequence
 
 
 NANOSECONDS = 1_000_000_000
 DIRECTIONS = ("c_to_f", "f_to_c")
 DEFAULT_SNAPSHOT_NS = 10_000_000
 MAX_REPORT_SNAPSHOTS = 2_000
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+EVENT_IDENTITY_FIELDS = (
+    "logical_job_id",
+    "attempt_id",
+    "C_STORE_GUID",
+    "physical_endpoint",
+    "RouteLaneId",
+    "F_STORE_GUID",
+    "session_serial",
+    "HISTORY_NONCE",
+    "REL_SEQ",
+    "TU_SEQ",
+    "transaction_digest",
+    "raw_digest",
+    "negotiated_profiles",
+    "route_state_profiles",
+    "InputRecord_identity",
+    "actor",
+    "start_ns",
+    "end_ns",
+    "duration_ns",
+    "provenance",
+    "c_to_f_byte_delta",
+    "f_to_c_byte_delta",
+    "resource_byte_delta",
+    "queue_byte_delta",
+)
 
 
 def ceil_fraction(value: Fraction) -> int:
@@ -62,6 +90,7 @@ class TraceRow:
     raw_bytes: int
     compile_ns: int
     compile_model: str
+    raw_sha256: str | None = None
 
 
 @dataclass
@@ -76,6 +105,7 @@ class WorkItem:
     raw_bytes: int
     compile_ns: int
     release_offset_ns: int
+    raw_digest: str | None = None
     release_ns: int | None = None
 
     @property
@@ -89,6 +119,7 @@ class Phase:
     direction: str
     byte_count: int
     priority: int = 3
+    account: str = "source"
 
     def __post_init__(self) -> None:
         if self.direction not in DIRECTIONS:
@@ -96,6 +127,8 @@ class Phase:
         if self.byte_count < 0:
             raise ValueError("phase byte count is negative")
         checked_nonnegative_int(self.priority, "phase priority")
+        if self.account not in {"source", "environment", "result"}:
+            raise ValueError(f"unknown phase account {self.account!r}")
 
 
 @dataclass(frozen=True)
@@ -297,9 +330,14 @@ class PhysicalLedgerAdapter(CodecAdapter):
         scenario: "LoadedScenario",
         expected_codec: str | None = None,
         allow_compatible_scenario: bool = False,
-        payload_digest_cache: dict[Path, tuple[tuple[int, int, int, int, int], str]]
-        | None = None,
+        payload_digest_cache: (
+            dict[Path, tuple[tuple[int, int, int, int, int], str]] | None
+        ) = None,
+        assignment_closure: str = "exact_route",
     ):
+        if assignment_closure not in {"exact_route", "aggregate"}:
+            raise ValueError("assignment_closure must be exact_route or aggregate")
+        self.assignment_closure = assignment_closure
         self.path = path.resolve()
         rows = [json.loads(line) for line in self.path.read_text().splitlines() if line]
         if len(rows) < 3:
@@ -324,7 +362,7 @@ class PhysicalLedgerAdapter(CodecAdapter):
         ):
             raise ValueError(f"{self.path}: reconstruction result is not pass")
         ledger_scenario_sha256 = descriptor.get("scenario_sha256")
-        replay_scenario_sha256 = sha256(scenario.path)
+        replay_scenario_sha256 = scenario.scenario_digest
         if (
             ledger_scenario_sha256 != replay_scenario_sha256
             and not allow_compatible_scenario
@@ -602,12 +640,15 @@ class PhysicalLedgerAdapter(CodecAdapter):
 
     def _activate(self, item: WorkItem, worker: int) -> PhysicalLedgerEntry:
         entry = self.entries[item.key]
-        if entry.worker != worker:
+        if self.assignment_closure == "exact_route" and entry.worker != worker:
             raise RuntimeError(
                 f"physical ledger assigned {item.key} to F{entry.worker}, simulator chose F{worker}"
             )
         route = (item.environment, worker)
-        if entry.route_sequence != self.committed_by_route[route]:
+        if (
+            self.assignment_closure == "exact_route"
+            and entry.route_sequence != self.committed_by_route[route]
+        ):
             raise RuntimeError(
                 f"physical ledger route {route} expected sequence {entry.route_sequence}, "
                 f"committed {self.committed_by_route[route]}"
@@ -621,6 +662,8 @@ class PhysicalLedgerAdapter(CodecAdapter):
         self, item: WorkItem, worker: int, tu_seq: int, rel_seq: int
     ) -> None:
         entry = self.entries[item.key]
+        if self.assignment_closure == "aggregate":
+            return
         if entry.worker != worker:
             raise RuntimeError(
                 f"physical ledger assigned {item.key} to F{entry.worker}, simulator chose F{worker}"
@@ -646,7 +689,7 @@ class PhysicalLedgerAdapter(CodecAdapter):
             raise RuntimeError(f"physical ledger TU {item.key} committed without begin")
         entry = self.entries[item.key]
         route = (item.environment, worker)
-        if (
+        if self.assignment_closure == "exact_route" and (
             entry.worker != worker
             or entry.route_sequence != self.committed_by_route[route]
         ):
@@ -663,7 +706,7 @@ class PhysicalLedgerAdapter(CodecAdapter):
 
     def preview_c_to_f(self, item: WorkItem, worker: int) -> int:
         entry = self.entries[item.key]
-        if entry.worker != worker:
+        if self.assignment_closure == "exact_route" and entry.worker != worker:
             return 1 << 62
         return sum(
             phase.byte_count for phase in entry.phases if phase.direction == "c_to_f"
@@ -697,6 +740,7 @@ class PhysicalLedgerAdapter(CodecAdapter):
             "ledger": str(self.path),
             "ledger_sha256": sha256(self.path),
             "scenario_binding": self.scenario_binding,
+            "assignment_closure": self.assignment_closure,
             "ledger_scenario_sha256": self.ledger_scenario_sha256,
             "replay_scenario_sha256": self.replay_scenario_sha256,
             "descriptor": self.descriptor,
@@ -726,6 +770,16 @@ class Transaction:
     complete_ns: Fraction | None = None
     c_to_f_bytes: int = 0
     f_to_c_bytes: int = 0
+    logical_job_id: str = ""
+    attempt_id: str = ""
+    c_store_guid: str = ""
+    physical_endpoint: str = ""
+    route_lane_id: str = ""
+    f_store_guid: str = ""
+    session_serial: int = 1
+    history_nonce: int = 0
+    transaction_digest: str = ""
+    input_record_identity: str = ""
     dialogue_started: bool = False
     plan: TransactionPlan | None = None
     dag_tokens: set[str] = field(default_factory=set)
@@ -733,6 +787,17 @@ class Transaction:
     input_ready: bool = False
     transaction_committed: bool = False
     compile_completed: bool = False
+
+
+@dataclass
+class EnvironmentEnsure:
+    environment: int
+    worker: int
+    owner: Transaction
+    start_ns: Fraction
+    transfer_done_ns: Fraction | None = None
+    install_start_ns: Fraction | None = None
+    ready_ns: Fraction | None = None
 
 
 @dataclass
@@ -857,10 +922,187 @@ class SparseSlotPool:
 @dataclass
 class LoadedScenario:
     document: dict[str, object]
+    manifest: dict[str, object]
     path: Path
+    scenario_digest: str
     work_items: dict[tuple[str, int], list[WorkItem]]
     workload_config: dict[str, dict[str, object]]
     workload_inputs: dict[str, dict[str, object]]
+    route_trace: dict[int, "RouteTraceEntry"] = field(default_factory=dict)
+    route_trace_path: Path | None = None
+    route_trace_sha256: str | None = None
+
+    @property
+    def is_v2(self) -> bool:
+        return self.manifest.get("schema") == "icecream-experiment-v2"
+
+
+@dataclass(frozen=True)
+class RouteTraceEntry:
+    logical_job_id: str
+    attempt_id: str
+    worker: int
+    tu_seq: int
+    rel_seq: int
+    c_store_guid: str
+    physical_endpoint: str
+    route_lane_id: str
+    f_store_guid: str
+    session_serial: int
+    history_nonce: int
+    c_to_f_bytes: int
+    f_to_c_bytes: int
+
+
+class ExactLedger:
+    """Exact directional and transient-byte accounting for one simulator run."""
+
+    def __init__(self) -> None:
+        self.directional: dict[str, dict[str, int]] = {
+            direction: defaultdict(int) for direction in DIRECTIONS
+        }
+        self.directional_by_route: dict[tuple[str, int, int, str], int] = defaultdict(
+            int
+        )
+        self.resource_balance: dict[str, int] = defaultdict(int)
+        self.resource_credited: dict[str, int] = defaultdict(int)
+        self.resource_debited: dict[str, int] = defaultdict(int)
+        self.resource_peak: dict[str, int] = defaultdict(int)
+        self.queue_balance: dict[str, int] = defaultdict(int)
+        self.queue_credited: dict[str, int] = defaultdict(int)
+        self.queue_debited: dict[str, int] = defaultdict(int)
+        self.queue_peak: dict[str, int] = defaultdict(int)
+
+    @staticmethod
+    def _apply_balance(
+        balances: dict[str, int],
+        credited: dict[str, int],
+        debited: dict[str, int],
+        peaks: dict[str, int],
+        deltas: Mapping[str, int],
+        kind: str,
+    ) -> None:
+        for name, delta in deltas.items():
+            if not isinstance(name, str) or not name:
+                raise ValueError(f"{kind} byte-delta name is empty")
+            if not isinstance(delta, int) or isinstance(delta, bool):
+                raise ValueError(f"{kind} byte delta {name!r} is not an integer")
+            balances[name] += delta
+            if balances[name] < 0:
+                raise RuntimeError(
+                    f"{kind} byte balance {name!r} became negative: {balances[name]}"
+                )
+            if delta >= 0:
+                credited[name] += delta
+            else:
+                debited[name] -= delta
+            peaks[name] = max(peaks[name], balances[name])
+
+    def apply(
+        self,
+        *,
+        c_to_f: int = 0,
+        f_to_c: int = 0,
+        account: str = "source",
+        route: tuple[int, int] | None = None,
+        resource: Mapping[str, int] | None = None,
+        queue: Mapping[str, int] | None = None,
+    ) -> None:
+        for direction, value in (("c_to_f", c_to_f), ("f_to_c", f_to_c)):
+            checked_nonnegative_int(value, f"{direction} byte delta")
+            if not value:
+                continue
+            self.directional[direction][account] += value
+            if route is not None:
+                self.directional_by_route[
+                    (direction, route[0], route[1], account)
+                ] += value
+        self._apply_balance(
+            self.resource_balance,
+            self.resource_credited,
+            self.resource_debited,
+            self.resource_peak,
+            resource or {},
+            "resource",
+        )
+        self._apply_balance(
+            self.queue_balance,
+            self.queue_credited,
+            self.queue_debited,
+            self.queue_peak,
+            queue or {},
+            "queue",
+        )
+
+    def assert_closed(self) -> None:
+        open_resources = {
+            name: value for name, value in self.resource_balance.items() if value
+        }
+        open_queues = {
+            name: value for name, value in self.queue_balance.items() if value
+        }
+        if open_resources or open_queues:
+            raise RuntimeError(
+                "exact byte ledger did not close: "
+                f"resources={open_resources}, queues={open_queues}"
+            )
+
+    @staticmethod
+    def _balance_rows(
+        balances: Mapping[str, int],
+        credited: Mapping[str, int],
+        debited: Mapping[str, int],
+        peaks: Mapping[str, int],
+    ) -> list[dict[str, object]]:
+        names = sorted(set(balances) | set(credited) | set(debited) | set(peaks))
+        return [
+            {
+                "name": name,
+                "credited_bytes": credited.get(name, 0),
+                "debited_bytes": debited.get(name, 0),
+                "peak_bytes": peaks.get(name, 0),
+                "final_bytes": balances.get(name, 0),
+            }
+            for name in names
+        ]
+
+    def summary(self) -> dict[str, object]:
+        directions = {}
+        for direction in DIRECTIONS:
+            accounts = dict(sorted(self.directional[direction].items()))
+            directions[direction] = {
+                "accounts": accounts,
+                "total_bytes": sum(accounts.values()),
+            }
+        routes = [
+            {
+                "direction": direction,
+                "environment": environment,
+                "worker": worker,
+                "account": account,
+                "bytes": byte_count,
+            }
+            for (direction, environment, worker, account), byte_count in sorted(
+                self.directional_by_route.items()
+            )
+        ]
+        return {
+            "closure": "pass",
+            "directions": directions,
+            "routes": routes,
+            "resources": self._balance_rows(
+                self.resource_balance,
+                self.resource_credited,
+                self.resource_debited,
+                self.resource_peak,
+            ),
+            "queues": self._balance_rows(
+                self.queue_balance,
+                self.queue_credited,
+                self.queue_debited,
+                self.queue_peak,
+            ),
+        }
 
 
 class TimelineRecorder:
@@ -900,6 +1142,7 @@ class TimelineRecorder:
         self.input_wait_slot_ns = [Fraction(0) for _ in range(workers)]
         self.ready_input_slot_ns = [Fraction(0) for _ in range(workers)]
         self.commit_wait_slot_ns = [Fraction(0) for _ in range(workers)]
+        self.environment_wait_slot_ns = [Fraction(0) for _ in range(workers)]
         self.reserved_slot_ns = [Fraction(0) for _ in range(workers)]
         self.staging_slot_ns = [Fraction(0) for _ in range(workers)]
         self.snapshot_due = False
@@ -986,6 +1229,9 @@ class TimelineRecorder:
             self.commit_wait_slot_ns[worker] += (
                 simulator.worker_commit_wait[worker] * elapsed_ns
             )
+            self.environment_wait_slot_ns[worker] += (
+                simulator.worker_environment_wait[worker] * elapsed_ns
+            )
             self.reserved_slot_ns[worker] += (
                 len(simulator.compiler_slots[worker].in_use) * elapsed_ns
             )
@@ -1069,6 +1315,9 @@ class TimelineRecorder:
                 "average_commit_wait_slots": float(
                     self.commit_wait_slot_ns[worker] / duration
                 ),
+                "average_environment_wait_slots": float(
+                    self.environment_wait_slot_ns[worker] / duration
+                ),
                 "average_reserved_slots": float(
                     self.reserved_slot_ns[worker] / duration
                 ),
@@ -1147,6 +1396,7 @@ class TimelineRecorder:
         self.input_wait_slot_ns = [Fraction(0) for _ in range(self.workers)]
         self.ready_input_slot_ns = [Fraction(0) for _ in range(self.workers)]
         self.commit_wait_slot_ns = [Fraction(0) for _ in range(self.workers)]
+        self.environment_wait_slot_ns = [Fraction(0) for _ in range(self.workers)]
         self.reserved_slot_ns = [Fraction(0) for _ in range(self.workers)]
         self.staging_slot_ns = [Fraction(0) for _ in range(self.workers)]
         self.snapshot_due = False
@@ -1158,6 +1408,8 @@ class TimelineRecorder:
             raise ValueError("timeline gap must have positive duration")
         if simulator.delivery_heap:
             reason = "network-propagation"
+        elif simulator.environment_install_heap:
+            reason = "environment-install-verify"
         elif simulator.release_heap:
             reason = "workload-release"
         else:
@@ -1185,6 +1437,157 @@ def sha256(path: Path) -> str:
         for block in iter(lambda: source.read(1 << 22), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def canonical_json_sha256(document: object) -> str:
+    encoded = json.dumps(
+        document, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def validate_json_schema(
+    document: object, schema_name: str, source: Path | str
+) -> None:
+    """Validate a v2 contract with the checked-in Draft 2020-12 schema."""
+    try:
+        import jsonschema
+    except ImportError as error:  # pragma: no cover - packaging/environment diagnostic
+        raise RuntimeError(
+            "v2 experiment validation requires the Python jsonschema package"
+        ) from error
+    schema_path = Path(__file__).with_name(schema_name)
+    schema = json.loads(schema_path.read_text())
+    validator = jsonschema.Draft202012Validator(schema)
+    failures = sorted(validator.iter_errors(document), key=lambda item: list(item.path))
+    if not failures:
+        return
+    failure = failures[0]
+    location = ".".join(str(part) for part in failure.absolute_path) or "<root>"
+    raise ValueError(f"{source}: schema error at {location}: {failure.message}")
+
+
+def stable_hex(label: str, *parts: object, digits: int = 64) -> str:
+    digest = hashlib.sha256(f"icecream-{label}-v1\0".encode("ascii"))
+    for part in parts:
+        encoded = str(part).encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return digest.hexdigest()[:digits]
+
+
+def logical_job_identity(scenario_digest: str, item: WorkItem) -> str:
+    return "job-" + stable_hex(
+        "logical-job",
+        scenario_digest,
+        item.environment,
+        item.workload,
+        item.build,
+        item.source_job_id,
+        digits=32,
+    )
+
+
+def normalize_v2_manifest(manifest: dict[str, object]) -> dict[str, object]:
+    """Translate the mode-neutral v2 contract into the established event engine shape."""
+    topology = manifest["topology"]
+    workload = manifest["workload"]
+    capabilities = manifest["capabilities"]
+    environment = manifest["environment"]
+    cache = manifest["cache"]
+    assert isinstance(topology, dict)
+    assert isinstance(workload, dict)
+    assert isinstance(capabilities, dict)
+    assert isinstance(environment, dict)
+    assert isinstance(cache, dict)
+    scheduler_policy = topology["scheduler_policy"]
+    placement = {
+        "round_robin": "round-robin",
+        "rendezvous": "rendezvous",
+        "dense_frontier": "rendezvous",
+    }[scheduler_policy]
+    if topology["assignment_source"] == "route_trace":
+        placement = "trace"
+    scheduler: dict[str, object] = {
+        "ready_job_policy": (
+            "trace"
+            if topology["assignment_source"] == "route_trace"
+            else "fifo-release"
+        ),
+        "placement_policy": placement,
+    }
+    if scheduler_policy == "dense_frontier" and placement == "rendezvous":
+        scheduler["dense_frontier_workers"] = topology["dense_frontier_workers"]
+    elif scheduler_policy == "rendezvous" and placement == "rendezvous":
+        scheduler["dense_frontier_workers"] = topology["f_count"]
+    jobs = []
+    for source in workload["jobs"]:
+        assert isinstance(source, dict)
+        jobs.append(
+            {
+                "id": source["id"],
+                "environment": source["c_index"],
+                "trace": source["trace"],
+                "corpus_root": source["corpus_root"],
+                "manifest_digest": source["manifest_digest"],
+                "compile_profile": source["compile_profile"],
+                "builds": source["build_epochs"],
+                "start_ns": 0,
+                "build_release": source["build_release"],
+                "tu_release": {"mode": "all-at-zero"},
+            }
+        )
+    compile_profiles = {str(job["compile_profile"]) for job in jobs}
+    worker_compile_profile = (
+        next(iter(compile_profiles)) if len(compile_profiles) == 1 else "per-workload"
+    )
+    worker_template: dict[str, object] = {
+        "slots": topology["f_slots"],
+        "input_staging_slots": topology.get("input_staging_slots", topology["f_slots"]),
+        "compile_profile": worker_compile_profile,
+        "initial_cache": ("cold" if cache["initial_state"] == "cold" else "retained"),
+    }
+    normalized = {
+        "schema": "icecream-distribution-scenario-v1",
+        "name": manifest["name"],
+        "seed": manifest["seed"],
+        "environments": {
+            "env_count": topology["c_count"],
+            "job_selection": {"mode": "explicit", "jobs": jobs},
+        },
+        "workers": {"f_count": topology["f_count"], "template": worker_template},
+        "network": topology["bandwidth"],
+        "scheduler": scheduler,
+        "experiment": {
+            "codecs": [capabilities["codec_profile"]],
+            "routing_mode": (
+                "replay" if topology["assignment_source"] == "route_trace" else "online"
+            ),
+        },
+        "v2_runtime": {
+            "assignment_source": topology["assignment_source"],
+            "route_trace": topology.get("route_trace"),
+            "release_policy": workload["release_policy"],
+            "environment": environment,
+            "cache": cache,
+            "capabilities": capabilities,
+            "expected": manifest["expected"],
+        },
+    }
+    return normalized
+
+
+def load_execution(path: Path, scenario_digest: str) -> dict[str, object]:
+    path = path.resolve()
+    document = json.loads(path.read_text())
+    validate_json_schema(document, "execution.schema.json", path)
+    if document["scenario_digest"] != scenario_digest:
+        raise ValueError(
+            f"{path}: execution scenario_digest differs from the loaded manifest"
+        )
+    if document["mode"] != "simulated":
+        raise ValueError(f"{path}: run_scenario requires execution mode 'simulated'")
+    return document
 
 
 def read_trace(path: Path) -> list[TraceRow]:
@@ -1215,6 +1618,9 @@ def read_trace(path: Path) -> list[TraceRow]:
                 raise ValueError(
                     f"{path}: trace row {logical} has an empty identity field"
                 )
+            raw_sha256 = row.get("raw_sha256") or None
+            if raw_sha256 is not None and SHA256_RE.fullmatch(raw_sha256) is None:
+                raise ValueError(f"{path}: trace row {logical} has invalid raw_sha256")
             rows.append(
                 TraceRow(
                     logical,
@@ -1223,6 +1629,7 @@ def read_trace(path: Path) -> list[TraceRow]:
                     raw_bytes,
                     compile_ns,
                     row["compile_model"],
+                    raw_sha256,
                 )
             )
     if not rows:
@@ -1265,15 +1672,129 @@ def read_release_offsets(
     return result
 
 
+def load_route_trace(
+    path: Path,
+    scenario_digest: str,
+    work_items: Mapping[tuple[str, int], Sequence[WorkItem]],
+    f_count: int,
+) -> tuple[dict[int, RouteTraceEntry], str]:
+    path = path.resolve()
+    rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    if len(rows) < 3:
+        raise ValueError(f"{path}: route trace is incomplete")
+    for index, row in enumerate(rows, start=1):
+        validate_json_schema(row, "route-trace.schema.json", f"{path}:{index}")
+    header, summary = rows[0], rows[-1]
+    if header["record"] != "route_trace" or summary["record"] != "route_summary":
+        raise ValueError(f"{path}: route trace boundary records are invalid")
+    if header["scenario_digest"] != scenario_digest:
+        raise ValueError(f"{path}: route trace belongs to a different scenario")
+    expected_items = {item.key: item for items in work_items.values() for item in items}
+    entries: dict[int, RouteTraceEntry] = {}
+    seen_keys: set[tuple[str, int, int]] = set()
+    by_environment: dict[int, list[int]] = defaultdict(list)
+    by_route: dict[tuple[int, int], list[int]] = defaultdict(list)
+    c_to_f_total = 0
+    f_to_c_total = 0
+    for row_number, row in enumerate(rows[1:-1], start=2):
+        if row["record"] != "assignment":
+            raise ValueError(f"{path}:{row_number}: expected assignment record")
+        key = (row["workload"], row["build"], row["logical"])
+        item = expected_items.get(key)
+        if item is None or key in seen_keys:
+            raise ValueError(f"{path}:{row_number}: unknown or repeated TU {key}")
+        seen_keys.add(key)
+        expected_job_id = logical_job_identity(scenario_digest, item)
+        if row["logical_job_id"] != expected_job_id:
+            raise ValueError(f"{path}:{row_number}: logical_job_id differs for {key}")
+        expected_attempt = f"{expected_job_id}:attempt-0"
+        if row["attempt_id"] != expected_attempt:
+            raise ValueError(f"{path}:{row_number}: attempt_id differs for {key}")
+        worker = checked_nonnegative_int(row["worker"], "route-trace worker")
+        if worker >= f_count:
+            raise ValueError(f"{path}:{row_number}: worker is outside topology")
+        tu_seq = checked_nonnegative_int(row["TU_SEQ"], "route-trace TU_SEQ")
+        rel_seq = checked_nonnegative_int(row["REL_SEQ"], "route-trace REL_SEQ")
+        entry = RouteTraceEntry(
+            row["logical_job_id"],
+            row["attempt_id"],
+            worker,
+            tu_seq,
+            rel_seq,
+            row["C_STORE_GUID"],
+            row["physical_endpoint"],
+            row["RouteLaneId"],
+            row["F_STORE_GUID"],
+            checked_positive_int(row["session_serial"], "route-trace session_serial"),
+            checked_nonnegative_int(row["HISTORY_NONCE"], "route-trace HISTORY_NONCE"),
+            checked_nonnegative_int(row["c_to_f_bytes"], "route-trace c_to_f_bytes"),
+            checked_nonnegative_int(row["f_to_c_bytes"], "route-trace f_to_c_bytes"),
+        )
+        entries[item.ordinal] = entry
+        by_environment[item.environment].append(tu_seq)
+        by_route[(item.environment, worker)].append(rel_seq)
+        c_to_f_total += entry.c_to_f_bytes
+        f_to_c_total += entry.f_to_c_bytes
+    if seen_keys != set(expected_items):
+        missing = sorted(set(expected_items) - seen_keys)
+        raise ValueError(f"{path}: route trace misses TU {missing[:1]}")
+    for environment, values in by_environment.items():
+        if sorted(values) != list(range(len(values))):
+            raise ValueError(f"{path}: C{environment} TU_SEQ set is not contiguous")
+    for route, values in by_route.items():
+        if sorted(values) != list(range(len(values))):
+            raise ValueError(f"{path}: route {route} REL_SEQ set is not contiguous")
+    expected_summary = {
+        "record": "route_summary",
+        "assignments": len(entries),
+        "c_to_f_bytes": c_to_f_total,
+        "f_to_c_bytes": f_to_c_total,
+    }
+    if summary != expected_summary:
+        raise ValueError(
+            f"{path}: route summary {summary!r} differs from {expected_summary!r}"
+        )
+    return entries, sha256(path)
+
+
 def load_scenario(
     path: Path, payload_overrides: dict[str, Path] | None = None
 ) -> LoadedScenario:
     path = path.resolve()
-    document = json.loads(path.read_text())
-    if (
-        not isinstance(document, dict)
-        or document.get("schema") != "icecream-distribution-scenario-v1"
-    ):
+    source_document = json.loads(path.read_text())
+    if not isinstance(source_document, dict):
+        raise ValueError(f"{path}: scenario must be an object")
+    schema = source_document.get("schema")
+    if schema == "icecream-experiment-v2":
+        validate_json_schema(source_document, "experiment.schema.json", path)
+        manifest = source_document
+        capabilities = manifest["capabilities"]
+        expected = manifest["expected"]
+        assert isinstance(capabilities, dict) and isinstance(expected, dict)
+        if expected["selected_cache_wire"] != capabilities["cache_wire"]:
+            raise ValueError(f"{path}: selected_cache_wire differs from capability")
+        if expected["selected_codec_profile"] != capabilities["codec_profile"]:
+            raise ValueError(f"{path}: selected_codec_profile differs from capability")
+        control = capabilities.get("experiment_control")
+        if (
+            control in {"compile_only", "raw"}
+            and capabilities["codec_profile"] != "legacy"
+        ):
+            raise ValueError(f"{path}: basic controls require the legacy profile label")
+        if (
+            control == "z3_shared_long_b1"
+            and capabilities["codec_profile"] != "z3_shared_long"
+        ):
+            raise ValueError(
+                f"{path}: z3_shared_long_b1 control requires z3_shared_long"
+            )
+        scenario_digest = canonical_json_sha256(manifest)
+        document = normalize_v2_manifest(manifest)
+    elif schema == "icecream-distribution-scenario-v1":
+        manifest = source_document
+        scenario_digest = sha256(path)
+        document = source_document
+    else:
         raise ValueError(f"{path}: unknown scenario schema")
     environments = document.get("environments")
     workers = document.get("workers")
@@ -1393,13 +1914,22 @@ def load_scenario(
         if not corpus_root.is_absolute():
             corpus_root = (path.parent / corpus_root).resolve()
         trace_rows = read_trace(trace_path)
-        workload_inputs[workload] = {
+        manifest_digest = job.get("manifest_digest")
+        if manifest_digest is not None and (
+            not isinstance(manifest_digest, str)
+            or SHA256_RE.fullmatch(manifest_digest) is None
+        ):
+            raise ValueError(f"{workload}: manifest_digest is not canonical SHA-256")
+        workload_input: dict[str, object] = {
             "trace": str(trace_path),
             "trace_sha256": sha256(trace_path),
             "corpus_root": str(corpus_root),
             "trace_rows": len(trace_rows),
         }
-        expected_model = template.get("compile_profile")
+        if manifest_digest is not None:
+            workload_input["manifest_digest"] = manifest_digest
+        workload_inputs[workload] = workload_input
+        expected_model = job.get("compile_profile", template.get("compile_profile"))
         models = {row.compile_model for row in trace_rows}
         if models != {expected_model}:
             raise ValueError(
@@ -1431,6 +1961,23 @@ def load_scenario(
         for build in range(builds):
             items: list[WorkItem] = []
             for row, release_offset in zip(trace_rows, release_offsets):
+                payload = corpus_root / row.ii_relative
+                raw_digest = row.raw_sha256
+                if schema == "icecream-experiment-v2":
+                    if not payload.is_file():
+                        raise ValueError(
+                            f"{workload}: v2 payload is absent for TU {row.logical}: {payload}"
+                        )
+                    if payload.stat().st_size != row.raw_bytes:
+                        raise ValueError(
+                            f"{workload}: payload size differs for TU {row.logical}"
+                        )
+                    observed_digest = sha256(payload)
+                    if raw_digest is not None and raw_digest != observed_digest:
+                        raise ValueError(
+                            f"{workload}: payload digest differs for TU {row.logical}"
+                        )
+                    raw_digest = observed_digest
                 items.append(
                     WorkItem(
                         next_ordinal,
@@ -1439,10 +1986,11 @@ def load_scenario(
                         build,
                         row.logical,
                         row.job_id,
-                        corpus_root / row.ii_relative,
+                        payload,
                         row.raw_bytes,
                         row.compile_ns,
                         release_offset,
+                        raw_digest,
                     )
                 )
                 next_ordinal += 1
@@ -1450,7 +1998,32 @@ def load_scenario(
         workload_config[workload] = {**job, "start_ns": start_ns, "builds": builds}
     if f_count < 1:
         raise AssertionError("validated f_count became empty")
-    return LoadedScenario(document, path, work_items, workload_config, workload_inputs)
+    route_trace: dict[int, RouteTraceEntry] = {}
+    route_trace_path: Path | None = None
+    route_trace_digest: str | None = None
+    runtime = document.get("v2_runtime", {})
+    if isinstance(runtime, dict) and runtime.get("assignment_source") == "route_trace":
+        route_value = runtime.get("route_trace")
+        if not isinstance(route_value, str) or not route_value:
+            raise ValueError("route_trace assignment requires topology.route_trace")
+        route_trace_path = Path(route_value)
+        if not route_trace_path.is_absolute():
+            route_trace_path = (path.parent / route_trace_path).resolve()
+        route_trace, route_trace_digest = load_route_trace(
+            route_trace_path, scenario_digest, work_items, f_count
+        )
+    return LoadedScenario(
+        document,
+        manifest,
+        path,
+        scenario_digest,
+        work_items,
+        workload_config,
+        workload_inputs,
+        route_trace,
+        route_trace_path,
+        route_trace_digest,
+    )
 
 
 def stable_rendezvous_score(*parts: object) -> int:
@@ -1545,15 +2118,54 @@ class Simulator:
         )
         self.network = document["network"]
         self.scheduler = document["scheduler"]
+        runtime = document.get("v2_runtime", {})
+        self.v2_runtime = runtime if isinstance(runtime, dict) else {}
+        capability_config = self.v2_runtime.get("capabilities", {})
+        if not isinstance(capability_config, dict):
+            capability_config = {}
+        profile = str(capability_config.get("codec_profile", adapter.name))
+        self.negotiated_profiles = [profile]
+        self.route_state_profiles = [profile]
+        environment_config = self.v2_runtime.get(
+            "environment",
+            {
+                "initial_state": "resident",
+                "image_digest": "",
+                "transfer_bytes": 0,
+                "install_verify_ns": 0,
+            },
+        )
+        if not isinstance(environment_config, dict):
+            raise ValueError("v2_runtime.environment is not an object")
+        self.environment_config = environment_config
+        self.environment_initial_state = str(
+            environment_config.get("initial_state", "resident")
+        )
+        self.environment_transfer_bytes = int(
+            environment_config.get("transfer_bytes", 0)
+        )
+        self.environment_install_verify_ns = int(
+            environment_config.get("install_verify_ns", 0)
+        )
         self.now = Fraction(0)
         self.release_heap: list[tuple[int, int, WorkItem]] = []
         self.ready_heap: list[tuple[tuple[int, ...], int, WorkItem]] = []
         self.ready_by_environment: dict[int, deque[WorkItem]] = defaultdict(deque)
         self.ready_environment_cycle: deque[int] = deque()
-        self.static_routing = self.scheduler["placement_policy"] == "rendezvous"
+        self.trace_routing = self.scheduler["placement_policy"] == "trace"
+        self.static_routing = self.scheduler["placement_policy"] in {
+            "rendezvous",
+            "trace",
+        }
         self.static_route_workers: dict[int, int] = {}
         self.static_home_sets: dict[tuple[int, str], tuple[int, ...]] = {}
-        if self.static_routing:
+        if self.trace_routing:
+            if not scenario.route_trace:
+                raise ValueError("trace placement has no loaded route trace")
+            self.static_route_workers = {
+                ordinal: entry.worker for ordinal, entry in scenario.route_trace.items()
+            }
+        elif self.static_routing:
             self.static_route_workers, self.static_home_sets = static_rendezvous_routes(
                 scenario
             )
@@ -1575,6 +2187,9 @@ class Simulator:
         }
         self.ready_compiler_queues: dict[int, deque[Transaction]] = defaultdict(deque)
         self.compile_heap: list[tuple[Fraction, int, Transaction]] = []
+        self.environment_install_heap: list[
+            tuple[Fraction, int, int, EnvironmentEnsure]
+        ] = []
         self.delivery_heap: list[tuple[Fraction, int, Flow]] = []
         self.active_flows: dict[int, Flow] = {}
         self.endpoint_queues: dict[
@@ -1590,6 +2205,7 @@ class Simulator:
         self.relationship_next_assigned: dict[tuple[int, int], int] = defaultdict(int)
         self.relationship_next_committed: dict[tuple[int, int], int] = defaultdict(int)
         self.transactions: list[Transaction] = []
+        self.ledger = ExactLedger()
         self.events = EventRecorder(event_spool_path)
         self.event_sequence = 0
         self.flow_sequence = 0
@@ -1608,6 +2224,7 @@ class Simulator:
         self.worker_raw_bytes = [0] * self.f_count
         self.worker_c_to_f = [0] * self.f_count
         self.worker_f_to_c = [0] * self.f_count
+        self.worker_environment_c_to_f = [0] * self.f_count
         self.env_unreleased = [0] * self.env_count
         for items in scenario.work_items.values():
             for item in items:
@@ -1619,8 +2236,26 @@ class Simulator:
         self.worker_ready_input = [0] * self.f_count
         self.worker_compiling = [0] * self.f_count
         self.worker_commit_wait = [0] * self.f_count
+        self.worker_environment_wait = [0] * self.f_count
         self.worker_dispatched = [0] * self.f_count
         self.worker_completed = [0] * self.f_count
+        self.environment_status: dict[tuple[int, int], str] = {
+            (environment, worker): self.environment_initial_state
+            for environment in range(self.env_count)
+            for worker in range(self.f_count)
+        }
+        self.environment_ensures: dict[tuple[int, int], EnvironmentEnsure] = {}
+        self.environment_waiters: dict[tuple[int, int], deque[Transaction]] = (
+            defaultdict(deque)
+        )
+        self.c_store_guids = [
+            stable_hex("c-store", scenario.scenario_digest, environment, digits=32)
+            for environment in range(self.env_count)
+        ]
+        self.f_store_guids = [
+            stable_hex("f-store", scenario.scenario_digest, worker, digits=32)
+            for worker in range(self.f_count)
+        ]
         self.timeline = TimelineRecorder(
             snapshot_interval_ns,
             self.f_count,
@@ -1646,6 +2281,39 @@ class Simulator:
             item.release_ns = base_ns + item.release_offset_ns
             heapq.heappush(self.release_heap, (item.release_ns, item.ordinal, item))
 
+    def _actor_for_event(self, name: str, phase: Phase | None) -> str:
+        if name in {"release", "route-bound"}:
+            return "C_authority" if name == "release" else "scheduler"
+        if name in {"dispatch", "compiler-queued"}:
+            return "scheduler"
+        if name.startswith("compile") or name == "transaction-complete":
+            return "F_compiler"
+        if name.startswith("env_") or name == "environment_ready":
+            return "F_environment_store"
+        if phase is not None:
+            return "C_cache" if phase.direction == "c_to_f" else "F_cache"
+        if name in {"input-ready", "transaction-commit", "dialogue-finish"}:
+            return "F_cache"
+        return "simulator"
+
+    @staticmethod
+    def _canonical_stage(name: str) -> str:
+        return {
+            "release": "job_release",
+            "route-bound": "scheduler_select",
+            "dispatch": "route_prepare",
+            "dialogue-start": "c_queue",
+            "input-ready": "input_commit_visible",
+            "compiler-queued": "compiler_pipe",
+            "compile-start": "compile",
+            "compile-finish": "compile",
+            "transaction-commit": "route_reconcile",
+            "transaction-complete": "job_finish",
+            "env_transfer": "env_transfer",
+            "env_install_verify": "env_install_verify",
+            "environment_ready": "environment_ready",
+        }.get(name, name.replace("-", "_"))
+
     def _event(
         self,
         name: str,
@@ -1656,10 +2324,124 @@ class Simulator:
         detail: str = "",
         worker: int | None = None,
         tu_seq: int | None = None,
+        c_to_f_byte_delta: int = 0,
+        f_to_c_byte_delta: int = 0,
+        resource_byte_delta: Mapping[str, int] | None = None,
+        queue_byte_delta: Mapping[str, int] | None = None,
+        start_ns: Fraction | int | None = None,
+        end_ns: Fraction | int | None = None,
+        transition: str = "instant",
+        provenance: str | None = None,
     ) -> None:
         item = tx.item if tx is not None else item
         event_worker = tx.worker if tx is not None else worker
         event_tu_seq = tx.tu_seq if tx is not None else tu_seq
+        route = (
+            None
+            if item is None or event_worker is None
+            else (item.environment, event_worker)
+        )
+        account = "source" if phase is None else phase.account
+        self.ledger.apply(
+            c_to_f=c_to_f_byte_delta,
+            f_to_c=f_to_c_byte_delta,
+            account=account,
+            route=route,
+            resource=resource_byte_delta,
+            queue=queue_byte_delta,
+        )
+        now_ns = ceil_fraction(self.now)
+        start_value = now_ns if start_ns is None else ceil_fraction(Fraction(start_ns))
+        end_value = now_ns if end_ns is None else ceil_fraction(Fraction(end_ns))
+        if end_value < start_value:
+            raise RuntimeError("event interval moves backwards")
+        trace_entry = (
+            None if item is None else self.scenario.route_trace.get(item.ordinal)
+        )
+        logical_job_id = (
+            None
+            if item is None
+            else logical_job_identity(self.scenario.scenario_digest, item)
+        )
+        attempt_id = None if logical_job_id is None else f"{logical_job_id}:attempt-0"
+        if tx is not None:
+            identity = {
+                "logical_job_id": tx.logical_job_id,
+                "attempt_id": tx.attempt_id,
+                "C_STORE_GUID": tx.c_store_guid,
+                "physical_endpoint": tx.physical_endpoint,
+                "RouteLaneId": tx.route_lane_id,
+                "F_STORE_GUID": tx.f_store_guid,
+                "session_serial": tx.session_serial,
+                "HISTORY_NONCE": tx.history_nonce,
+                "REL_SEQ": tx.rel_seq,
+                "TU_SEQ": tx.tu_seq,
+                "transaction_digest": tx.transaction_digest,
+                "InputRecord_identity": tx.input_record_identity,
+            }
+        else:
+            identity = {
+                "logical_job_id": logical_job_id,
+                "attempt_id": attempt_id,
+                "C_STORE_GUID": (
+                    None
+                    if item is None
+                    else (
+                        trace_entry.c_store_guid
+                        if trace_entry is not None
+                        else self.c_store_guids[item.environment]
+                    )
+                ),
+                "physical_endpoint": (
+                    None
+                    if event_worker is None
+                    else (
+                        trace_entry.physical_endpoint
+                        if trace_entry is not None
+                        else f"F{event_worker}"
+                    )
+                ),
+                "RouteLaneId": (
+                    None
+                    if item is None or event_worker is None
+                    else (
+                        trace_entry.route_lane_id
+                        if trace_entry is not None
+                        else f"C{item.environment}_F{event_worker}"
+                    )
+                ),
+                "F_STORE_GUID": (
+                    None
+                    if event_worker is None
+                    else (
+                        trace_entry.f_store_guid
+                        if trace_entry is not None
+                        else self.f_store_guids[event_worker]
+                    )
+                ),
+                "session_serial": None if event_worker is None else 1,
+                "HISTORY_NONCE": (
+                    None
+                    if item is None or event_worker is None
+                    else int(
+                        stable_hex(
+                            "history-nonce",
+                            self.scenario.scenario_digest,
+                            item.environment,
+                            event_worker,
+                            digits=16,
+                        ),
+                        16,
+                    )
+                ),
+                "REL_SEQ": None,
+                "TU_SEQ": event_tu_seq,
+                "transaction_digest": None,
+                "InputRecord_identity": None,
+            }
+        event_provenance = provenance or (
+            "observed" if phase is not None and self.adapter.physical else "modeled"
+        )
         self.events.append(
             {
                 "sequence": self.event_sequence,
@@ -1681,6 +2463,23 @@ class Simulator:
                 "direction": "" if phase is None else phase.direction,
                 "bytes": "" if phase is None else phase.byte_count,
                 "detail": detail,
+                "stage": self._canonical_stage(name),
+                "transition": transition,
+                **identity,
+                "raw_digest": None if item is None else item.raw_digest,
+                "negotiated_profiles": list(self.negotiated_profiles),
+                "route_state_profiles": list(self.route_state_profiles),
+                "actor": self._actor_for_event(name, phase),
+                "start_ns": start_value,
+                "end_ns": end_value,
+                "duration_ns": end_value - start_value,
+                "provenance": event_provenance,
+                "c_to_f_byte_delta": c_to_f_byte_delta,
+                "f_to_c_byte_delta": f_to_c_byte_delta,
+                "resource_byte_delta": dict(
+                    sorted((resource_byte_delta or {}).items())
+                ),
+                "queue_byte_delta": dict(sorted((queue_byte_delta or {}).items())),
             }
         )
         self.event_sequence += 1
@@ -1692,6 +2491,8 @@ class Simulator:
         if policy == "shortest-known":
             return item.compile_ns, int(item.release_ns), item.ordinal
         if policy == "trace":
+            if self.trace_routing:
+                return (self.scenario.route_trace[item.ordinal].rel_seq, item.ordinal)
             return (item.ordinal,)
         raise RuntimeError(f"ready policy {policy!r} has no heap key")
 
@@ -1700,10 +2501,21 @@ class Simulator:
             _, _, item = heapq.heappop(self.release_heap)
             self.env_unreleased[item.environment] -= 1
             self.env_ready[item.environment] += 1
-            tu_seq = self.environment_next_tu_seq[item.environment]
+            trace_entry = self.scenario.route_trace.get(item.ordinal)
+            tu_seq = (
+                trace_entry.tu_seq
+                if trace_entry is not None
+                else self.environment_next_tu_seq[item.environment]
+            )
             self.environment_next_tu_seq[item.environment] += 1
             self.prepared_tu_seq[item.ordinal] = tu_seq
-            self._event("release", item=item, tu_seq=tu_seq)
+            self._event(
+                "release",
+                item=item,
+                tu_seq=tu_seq,
+                resource_byte_delta={"prepared_input_bytes": item.raw_bytes},
+                queue_byte_delta={"scheduler_ready_bytes": item.raw_bytes},
+            )
             policy = self.scheduler["ready_job_policy"]
             if self.static_routing:
                 worker = self.static_route_workers[item.ordinal]
@@ -1712,7 +2524,11 @@ class Simulator:
                     item=item,
                     worker=worker,
                     tu_seq=tu_seq,
-                    detail="stable-rendezvous",
+                    detail=(
+                        "physical-route-trace"
+                        if self.trace_routing
+                        else "stable-rendezvous"
+                    ),
                 )
                 if policy == "environment-round-robin":
                     self.static_ready_by_environment_worker[
@@ -1838,7 +2654,7 @@ class Simulator:
         if not free_workers:
             raise RuntimeError("slot selection without a free worker")
         policy = self.scheduler["placement_policy"]
-        if policy == "rendezvous":
+        if policy in {"rendezvous", "trace"}:
             worker = self.static_route_workers[item.ordinal]
             if worker not in free_workers:
                 raise RuntimeError("static rendezvous target has no free staging slot")
@@ -1873,7 +2689,17 @@ class Simulator:
             worker, slot, staging_slot, compiler_slot = self._select_slot(item)
             route = (item.environment, worker)
             tu_seq = self.prepared_tu_seq[item.ordinal]
-            rel_seq = self.relationship_next_assigned[route]
+            trace_entry = self.scenario.route_trace.get(item.ordinal)
+            rel_seq = (
+                trace_entry.rel_seq
+                if trace_entry is not None
+                else self.relationship_next_assigned[route]
+            )
+            if rel_seq != self.relationship_next_assigned[route]:
+                raise RuntimeError(
+                    f"route trace dispatched REL_SEQ {rel_seq} before "
+                    f"{self.relationship_next_assigned[route]} on {route}"
+                )
             self.relationship_next_assigned[route] += 1
             tx = Transaction(
                 self.transaction_sequence,
@@ -1887,6 +2713,66 @@ class Simulator:
                 compiler_slot=compiler_slot,
                 dispatch_ns=self.now,
             )
+            tx.logical_job_id = logical_job_identity(
+                self.scenario.scenario_digest, item
+            )
+            tx.attempt_id = f"{tx.logical_job_id}:attempt-0"
+            tx.c_store_guid = (
+                trace_entry.c_store_guid
+                if trace_entry is not None
+                else self.c_store_guids[item.environment]
+            )
+            tx.physical_endpoint = (
+                trace_entry.physical_endpoint
+                if trace_entry is not None
+                else f"F{worker}"
+            )
+            tx.route_lane_id = (
+                trace_entry.route_lane_id
+                if trace_entry is not None
+                else f"C{item.environment}_F{worker}"
+            )
+            tx.f_store_guid = (
+                trace_entry.f_store_guid
+                if trace_entry is not None
+                else self.f_store_guids[worker]
+            )
+            tx.session_serial = (
+                trace_entry.session_serial if trace_entry is not None else 1
+            )
+            tx.history_nonce = (
+                trace_entry.history_nonce
+                if trace_entry is not None
+                else int(
+                    stable_hex(
+                        "history-nonce",
+                        self.scenario.scenario_digest,
+                        item.environment,
+                        worker,
+                        digits=16,
+                    ),
+                    16,
+                )
+            )
+            tx.transaction_digest = stable_hex(
+                "transaction",
+                self.scenario.scenario_digest,
+                tx.logical_job_id,
+                tx.attempt_id,
+                tx.c_store_guid,
+                tx.f_store_guid,
+                tx.history_nonce,
+                tx.tu_seq,
+                tx.rel_seq,
+                item.raw_digest or "unavailable",
+                ",".join(self.negotiated_profiles),
+            )
+            tx.input_record_identity = "input-" + stable_hex(
+                "input-record",
+                tx.transaction_digest,
+                item.raw_digest or "unavailable",
+                digits=32,
+            )
             self.adapter.bind_route(item, worker, tx.tu_seq, tx.rel_seq)
             self.transaction_sequence += 1
             self.transactions.append(tx)
@@ -1894,8 +2780,114 @@ class Simulator:
             self.env_active[item.environment] += 1
             self.worker_input_wait[worker] += 1
             self.worker_dispatched[worker] += 1
-            self._event("dispatch", tx)
+            self._event(
+                "dispatch",
+                tx,
+                queue_byte_delta={
+                    "scheduler_ready_bytes": -item.raw_bytes,
+                    "route_input_pending_bytes": item.raw_bytes,
+                },
+            )
+            self._ensure_environment(tx)
             self._queue_or_start_dialogue(tx)
+
+    def _ensure_environment(self, tx: Transaction) -> None:
+        route = (tx.item.environment, tx.worker)
+        status = self.environment_status[route]
+        if status == "resident":
+            return
+        if status in {"transferring", "installing"}:
+            return
+        if status != "absent":
+            raise RuntimeError(f"unknown environment state {status!r} on {route}")
+        ensure = EnvironmentEnsure(route[0], route[1], tx, self.now)
+        self.environment_ensures[route] = ensure
+        self.environment_status[route] = "transferring"
+        phase = Phase(
+            "environment-image",
+            "c_to_f",
+            self.environment_transfer_bytes,
+            priority=0,
+            account="environment",
+        )
+        self._event(
+            "env_transfer",
+            tx,
+            phase,
+            transition="start",
+            provenance="modeled",
+        )
+        self._start_flow(tx, phase)
+
+    def _finish_environment_transfer(self, flow: Flow) -> None:
+        route = (flow.transaction.item.environment, flow.transaction.worker)
+        ensure = self.environment_ensures.get(route)
+        if ensure is None or self.environment_status[route] != "transferring":
+            raise RuntimeError(
+                f"environment transfer finished without owner on {route}"
+            )
+        ensure.transfer_done_ns = self.now
+        self._event(
+            "env_transfer",
+            ensure.owner,
+            flow.phase,
+            flow=flow,
+            start_ns=ensure.start_ns,
+            end_ns=self.now,
+            transition="finish",
+            provenance="modeled",
+        )
+        ensure.install_start_ns = self.now
+        self.environment_status[route] = "installing"
+        self._event(
+            "env_install_verify",
+            ensure.owner,
+            transition="start",
+            provenance="modeled",
+        )
+        ready_at = self.now + self.environment_install_verify_ns
+        if ready_at == self.now:
+            self._finish_environment_install(ensure)
+        else:
+            heapq.heappush(
+                self.environment_install_heap,
+                (ready_at, route[0], route[1], ensure),
+            )
+
+    def _finish_environment_install(self, ensure: EnvironmentEnsure) -> None:
+        route = (ensure.environment, ensure.worker)
+        if self.environment_status[route] != "installing":
+            raise RuntimeError(
+                f"environment install finished in wrong state on {route}"
+            )
+        ensure.ready_ns = self.now
+        self._event(
+            "env_install_verify",
+            ensure.owner,
+            start_ns=ensure.install_start_ns,
+            end_ns=self.now,
+            transition="finish",
+            provenance="modeled",
+        )
+        self.environment_status[route] = "resident"
+        self._event(
+            "environment_ready",
+            ensure.owner,
+            provenance="modeled",
+        )
+        waiters = self.environment_waiters[route]
+        while waiters:
+            tx = waiters.popleft()
+            self.worker_environment_wait[tx.worker] -= 1
+            self._queue_or_begin_compile(tx)
+
+    def _finish_environment_installs(self) -> None:
+        while (
+            self.environment_install_heap
+            and self.environment_install_heap[0][0] <= self.now
+        ):
+            _, _, _, ensure = heapq.heappop(self.environment_install_heap)
+            self._finish_environment_install(ensure)
 
     def _queue_or_start_dialogue(self, tx: Transaction) -> None:
         window = self.adapter.dialogue_window_per_route()
@@ -1945,7 +2937,24 @@ class Simulator:
         tx.input_ready = True
         tx.transfer_done_ns = self.now
         self.worker_input_wait[tx.worker] -= 1
-        self._event("input-ready", tx)
+        self._event(
+            "input-ready",
+            tx,
+            resource_byte_delta={"input_record_bytes": tx.item.raw_bytes},
+            queue_byte_delta={
+                "route_input_pending_bytes": -tx.item.raw_bytes,
+                "compiler_input_bytes": tx.item.raw_bytes,
+            },
+        )
+        route = (tx.item.environment, tx.worker)
+        if self.environment_status[route] != "resident":
+            self.environment_waiters[route].append(tx)
+            self.worker_environment_wait[tx.worker] += 1
+            self._event("compiler-queued", tx, detail="waiting-for-environment")
+            return
+        self._queue_or_begin_compile(tx)
+
+    def _queue_or_begin_compile(self, tx: Transaction) -> None:
         if tx.compiler_slot is not None:
             self._begin_compile(tx)
             return
@@ -1968,7 +2977,11 @@ class Simulator:
         tx.compile_finish_ns = self.now + tx.item.compile_ns
         self.worker_compile_ns[tx.worker] += tx.item.compile_ns
         self.worker_compiling[tx.worker] += 1
-        self._event("compile-start", tx)
+        self._event(
+            "compile-start",
+            tx,
+            queue_byte_delta={"compiler_input_bytes": -tx.item.raw_bytes},
+        )
         heapq.heappush(self.compile_heap, (tx.compile_finish_ns, tx.sequence, tx))
 
     def _start_ready_compiles(self, worker: int) -> None:
@@ -1989,7 +3002,14 @@ class Simulator:
         if tx.complete_ns is not None:
             raise RuntimeError("transaction completed twice")
         tx.complete_ns = self.now
-        self._event("transaction-complete", tx)
+        self._event(
+            "transaction-complete",
+            tx,
+            resource_byte_delta={
+                "prepared_input_bytes": -tx.item.raw_bytes,
+                "input_record_bytes": -tx.item.raw_bytes,
+            },
+        )
         self.worker_reserved_ns[tx.worker] += self.now - tx.dispatch_ns
         self.completed += 1
         self.env_active[tx.item.environment] -= 1
@@ -2033,16 +3053,27 @@ class Simulator:
             self._complete_transaction(tx)
 
     def _start_flow(self, tx: Transaction, phase: Phase) -> None:
-        if phase.direction == "c_to_f":
+        if phase.account == "source" and phase.direction == "c_to_f":
             tx.c_to_f_bytes += phase.byte_count
             self.worker_c_to_f[tx.worker] += phase.byte_count
-        else:
+        elif phase.account == "source":
             tx.f_to_c_bytes += phase.byte_count
             self.worker_f_to_c[tx.worker] += phase.byte_count
+        elif phase.account == "environment":
+            if phase.direction != "c_to_f":
+                raise RuntimeError("environment transfer must be C-to-F")
+            self.worker_environment_c_to_f[tx.worker] += phase.byte_count
         flow = Flow(self.flow_sequence, tx, phase, Fraction(phase.byte_count * 8))
         self.flow_sequence += 1
+        queue_delta = (
+            {}
+            if phase.byte_count == 0
+            else {f"network_{phase.direction}_outstanding_bytes": phase.byte_count}
+        )
         if phase.byte_count == 0:
-            self._event("flow-queued", tx, phase, flow=flow)
+            self._event(
+                "flow-queued", tx, phase, flow=flow, queue_byte_delta=queue_delta
+            )
             self._event("flow-start", tx, phase, flow=flow)
             latency = int(self.network[phase.direction]["one_way_latency_ns"])
             self._event("flow-sent", tx, phase, flow=flow)
@@ -2052,14 +3083,22 @@ class Simulator:
                 )
             else:
                 self._event("flow-finish", tx, phase, flow=flow)
-                if tx.plan is None:
+                if phase.account == "environment":
+                    self._finish_environment_transfer(flow)
+                elif tx.plan is None:
                     tx.phase_index += 1
                     self._start_next_phase(tx)
                 else:
                     self._dag_token(tx, f"{phase.name}:sent")
                     self._dag_token(tx, f"{phase.name}:delivered")
             return
-        self._event("flow-queued", tx, phase, flow=flow)
+        self._event(
+            "flow-queued",
+            tx,
+            phase,
+            flow=flow,
+            queue_byte_delta=queue_delta,
+        )
         heapq.heappush(
             self.endpoint_queues[flow.endpoint],
             (phase.priority, flow.sequence, flow),
@@ -2256,9 +3295,11 @@ class Simulator:
         return self.now + min(
             min(
                 flow.remaining_bits,
-                flow.quantum_remaining_bits
-                if flow.quantum_remaining_bits is not None
-                else flow.remaining_bits,
+                (
+                    flow.quantum_remaining_bits
+                    if flow.quantum_remaining_bits is not None
+                    else flow.remaining_bits
+                ),
             )
             / rates[sequence]
             for sequence, flow in self.active_flows.items()
@@ -2304,8 +3345,29 @@ class Simulator:
         for flow in sorted((*finished, *yielded), key=lambda value: value.sequence):
             del self.active_flows[flow.sequence]
         for flow in sorted(finished, key=lambda value: value.sequence):
-            self._event("flow-sent", flow.transaction, flow.phase, flow=flow)
-            if flow.transaction.plan is not None:
+            byte_count = flow.phase.byte_count
+            self._event(
+                "flow-sent",
+                flow.transaction,
+                flow.phase,
+                flow=flow,
+                c_to_f_byte_delta=(
+                    byte_count if flow.phase.direction == "c_to_f" else 0
+                ),
+                f_to_c_byte_delta=(
+                    byte_count if flow.phase.direction == "f_to_c" else 0
+                ),
+                resource_byte_delta={
+                    f"network_{flow.phase.direction}_propagating_bytes": byte_count
+                },
+                queue_byte_delta={
+                    f"network_{flow.phase.direction}_outstanding_bytes": -byte_count
+                },
+            )
+            if (
+                flow.phase.account != "environment"
+                and flow.transaction.plan is not None
+            ):
                 self._dag_token(flow.transaction, f"{flow.phase.name}:sent")
             latency = int(self.network[flow.phase.direction]["one_way_latency_ns"])
             heapq.heappush(
@@ -2322,8 +3384,23 @@ class Simulator:
     def _finish_deliveries(self) -> None:
         while self.delivery_heap and self.delivery_heap[0][0] <= self.now:
             _, _, flow = heapq.heappop(self.delivery_heap)
-            self._event("flow-finish", flow.transaction, flow.phase, flow=flow)
-            if flow.transaction.plan is None:
+            resource_delta = (
+                {}
+                if flow.phase.byte_count == 0
+                else {
+                    f"network_{flow.phase.direction}_propagating_bytes": -flow.phase.byte_count
+                }
+            )
+            self._event(
+                "flow-finish",
+                flow.transaction,
+                flow.phase,
+                flow=flow,
+                resource_byte_delta=resource_delta,
+            )
+            if flow.phase.account == "environment":
+                self._finish_environment_transfer(flow)
+            elif flow.transaction.plan is None:
                 flow.transaction.phase_index += 1
                 self._start_next_phase(flow.transaction)
             else:
@@ -2357,6 +3434,8 @@ class Simulator:
             candidates.append(self.compile_heap[0][0])
         if self.delivery_heap:
             candidates.append(self.delivery_heap[0][0])
+        if self.environment_install_heap:
+            candidates.append(self.environment_install_heap[0][0])
         network_finish = self._network_finish_time()
         if network_finish is not None:
             candidates.append(network_finish)
@@ -2372,11 +3451,19 @@ class Simulator:
             return self._routing_metadata_cache
         metadata: dict[str, object] = {
             "placement_policy": self.scheduler["placement_policy"],
-            "tu_seq_allocation": "prepared-input release order per C",
-            "rel_seq_allocation": "route-local dispatch order",
-            "binding": "release-time-static"
-            if self.static_routing
-            else "dispatch-time",
+            "tu_seq_allocation": (
+                "physical assignment trace"
+                if self.trace_routing
+                else "prepared-input release order per C"
+            ),
+            "rel_seq_allocation": (
+                "physical assignment trace"
+                if self.trace_routing
+                else "route-local dispatch order"
+            ),
+            "binding": (
+                "release-time-static" if self.static_routing else "dispatch-time"
+            ),
         }
         if self.static_routing:
             assignment_counts: dict[tuple[int, str, int], int] = defaultdict(int)
@@ -2389,38 +3476,57 @@ class Simulator:
                             self.static_route_workers[item.ordinal],
                         )
                     ] += 1
-            metadata.update(
-                {
-                    "algorithm": "stable-rendezvous-v1",
-                    "seed": int(self.scenario.document["seed"]),
-                    "stable_tu_identity": "(environment, workload, source_job_id)",
-                    "build_number_in_identity": False,
-                    "dense_frontier_workers": int(
-                        self.scheduler.get("dense_frontier_workers", self.f_count)
-                    ),
-                    "home_sets": [
-                        {
-                            "environment": environment,
-                            "workload": workload,
-                            "workers": list(workers),
-                        }
-                        for (environment, workload), workers in sorted(
-                            self.static_home_sets.items()
-                        )
-                    ],
-                    "assignment_counts": [
-                        {
-                            "environment": environment,
-                            "workload": workload,
-                            "worker": worker,
-                            "tus": count,
-                        }
-                        for (environment, workload, worker), count in sorted(
-                            assignment_counts.items()
-                        )
-                    ],
-                }
-            )
+            static_metadata: dict[str, object] = {
+                "algorithm": (
+                    "physical-route-trace-v1"
+                    if self.trace_routing
+                    else "stable-rendezvous-v1"
+                ),
+                "assignment_source": (
+                    "route_trace" if self.trace_routing else "policy"
+                ),
+                "assignment_counts": [
+                    {
+                        "environment": environment,
+                        "workload": workload,
+                        "worker": worker,
+                        "tus": count,
+                    }
+                    for (environment, workload, worker), count in sorted(
+                        assignment_counts.items()
+                    )
+                ],
+            }
+            if not self.trace_routing:
+                static_metadata.update(
+                    {
+                        "algorithm": "stable-rendezvous-v1",
+                        "seed": int(self.scenario.document["seed"]),
+                        "stable_tu_identity": "(environment, workload, source_job_id)",
+                        "build_number_in_identity": False,
+                        "dense_frontier_workers": int(
+                            self.scheduler.get("dense_frontier_workers", self.f_count)
+                        ),
+                        "home_sets": [
+                            {
+                                "environment": environment,
+                                "workload": workload,
+                                "workers": list(workers),
+                            }
+                            for (environment, workload), workers in sorted(
+                                self.static_home_sets.items()
+                            )
+                        ],
+                    }
+                )
+            else:
+                static_metadata.update(
+                    {
+                        "route_trace": str(self.scenario.route_trace_path),
+                        "route_trace_sha256": self.scenario.route_trace_sha256,
+                    }
+                )
+            metadata.update(static_metadata)
         self._routing_metadata_cache = metadata
         return metadata
 
@@ -2518,6 +3624,14 @@ class Simulator:
                     "ready_input_slots": self.worker_ready_input[worker],
                     "compiling_slots": self.worker_compiling[worker],
                     "commit_wait_slots": self.worker_commit_wait[worker],
+                    "environment_wait_slots": self.worker_environment_wait[worker],
+                    "environment_states": [
+                        {
+                            "environment": environment,
+                            "state": self.environment_status[(environment, worker)],
+                        }
+                        for environment in range(self.env_count)
+                    ],
                     "dispatched_tus": self.worker_dispatched[worker],
                     "completed_tus": self.worker_completed[worker],
                     "active_flows": sum(
@@ -2602,6 +3716,10 @@ class Simulator:
             "active_flows": len(self.active_flows),
             "queued_flows": sum(len(queue) for queue in self.endpoint_queues.values()),
             "deliveries": len(self.delivery_heap),
+            "environment_installs": len(self.environment_install_heap),
+            "environment_waiters": sum(
+                len(queue) for queue in self.environment_waiters.values()
+            ),
             "compiles": len(self.compile_heap),
             "active_dialogues": sum(self.dialogue_active.values()),
             "queued_dialogues": sum(
@@ -2614,6 +3732,7 @@ class Simulator:
             "worker_ready_input": sum(self.worker_ready_input),
             "worker_compiling": sum(self.worker_compiling),
             "worker_commit_wait": sum(self.worker_commit_wait),
+            "worker_environment_wait": sum(self.worker_environment_wait),
             "reserved_compiler_slots": sum(
                 len(pool.in_use) for pool in self.compiler_slots.values()
             ),
@@ -2631,6 +3750,7 @@ class Simulator:
             raise RuntimeError(
                 "completed simulation counters differ from the scenario TU count"
             )
+        self.ledger.assert_closed()
 
     def _assert_relationship_order(self) -> None:
         """Require complete C identities and contiguous route-local commit order."""
@@ -2662,6 +3782,105 @@ class Simulator:
                 raise RuntimeError(
                     f"relationship {route} commit cursor differs from its route"
                 )
+
+    def _assert_event_contract(self) -> None:
+        expected_sequence = 0
+        c_to_f = 0
+        f_to_c = 0
+        resources: dict[str, int] = defaultdict(int)
+        queues: dict[str, int] = defaultdict(int)
+        for event in self.events:
+            if event.get("sequence") != expected_sequence:
+                raise RuntimeError("event sequence is not contiguous")
+            expected_sequence += 1
+            missing = [field for field in EVENT_IDENTITY_FIELDS if field not in event]
+            if missing:
+                raise RuntimeError(f"event lacks M3 fields {missing}")
+            c_to_f += int(event["c_to_f_byte_delta"])
+            f_to_c += int(event["f_to_c_byte_delta"])
+            for name, delta in event["resource_byte_delta"].items():
+                resources[name] += int(delta)
+            for name, delta in event["queue_byte_delta"].items():
+                queues[name] += int(delta)
+        ledger_summary = self.ledger.summary()
+        if c_to_f != ledger_summary["directions"]["c_to_f"]["total_bytes"]:
+            raise RuntimeError("event C-to-F bytes differ from exact ledger")
+        if f_to_c != ledger_summary["directions"]["f_to_c"]["total_bytes"]:
+            raise RuntimeError("event F-to-C bytes differ from exact ledger")
+        if any(resources.values()) or any(queues.values()):
+            raise RuntimeError(
+                f"event byte deltas do not close: resources={dict(resources)}, queues={dict(queues)}"
+            )
+
+    def _replay_closure(self) -> dict[str, object]:
+        assignment_source = str(self.v2_runtime.get("assignment_source", "policy"))
+        if assignment_source == "route_trace":
+            expected_routes: dict[tuple[int, int, str], list[int]] = defaultdict(
+                lambda: [0, 0, 0]
+            )
+            observed_routes: dict[tuple[int, int, str], list[int]] = defaultdict(
+                lambda: [0, 0, 0]
+            )
+            for tx in self.transactions:
+                entry = self.scenario.route_trace[tx.item.ordinal]
+                if (
+                    tx.worker != entry.worker
+                    or tx.tu_seq != entry.tu_seq
+                    or tx.rel_seq != entry.rel_seq
+                    or tx.c_to_f_bytes != entry.c_to_f_bytes
+                    or tx.f_to_c_bytes != entry.f_to_c_bytes
+                ):
+                    raise RuntimeError(f"route-trace closure differs for {tx.item.key}")
+                expected = expected_routes[
+                    (tx.item.environment, entry.worker, entry.route_lane_id)
+                ]
+                expected[0] += 1
+                expected[1] += entry.c_to_f_bytes
+                expected[2] += entry.f_to_c_bytes
+                observed = observed_routes[
+                    (tx.item.environment, tx.worker, tx.route_lane_id)
+                ]
+                observed[0] += 1
+                observed[1] += tx.c_to_f_bytes
+                observed[2] += tx.f_to_c_bytes
+            if expected_routes != observed_routes:
+                raise RuntimeError("route-trace aggregate routes differ")
+            return {
+                "status": "pass",
+                "semantics": "exact-route",
+                "assignment_source": "route_trace",
+                "route_trace": str(self.scenario.route_trace_path),
+                "route_trace_sha256": self.scenario.route_trace_sha256,
+                "routes": [
+                    {
+                        "environment": key[0],
+                        "worker": key[1],
+                        "RouteLaneId": key[2],
+                        "tus": values[0],
+                        "c_to_f_bytes": values[1],
+                        "f_to_c_bytes": values[2],
+                    }
+                    for key, values in sorted(observed_routes.items())
+                ],
+            }
+        expected_c_to_f = sum(tx.c_to_f_bytes for tx in self.transactions)
+        expected_f_to_c = sum(tx.f_to_c_bytes for tx in self.transactions)
+        if isinstance(self.adapter, PhysicalLedgerAdapter):
+            physical_totals = self.adapter.final["totals"]
+            if (
+                expected_c_to_f != physical_totals["c_to_f_bytes"]
+                or expected_f_to_c != physical_totals["f_to_c_bytes"]
+            ):
+                raise RuntimeError(
+                    "policy replay aggregate bytes differ from physical ledger"
+                )
+        return {
+            "status": "pass",
+            "semantics": "aggregate-directional",
+            "assignment_source": "policy",
+            "c_to_f_bytes": expected_c_to_f,
+            "f_to_c_bytes": expected_f_to_c,
+        }
 
     def _capacity_floors(self, transactions: Sequence[Transaction]) -> dict[str, int]:
         """Return optimistic C-to-F and compiler capacity lower bounds.
@@ -2737,6 +3956,7 @@ class Simulator:
             self._release_ready()
             self._finish_serializations()
             self._finish_deliveries()
+            self._finish_environment_installs()
             self._finish_compiles()
             self._release_ready()
             self._dispatch()
@@ -2754,6 +3974,7 @@ class Simulator:
         self.events.finish()
         self._assert_terminal_state()
         self._assert_relationship_order()
+        self._assert_event_contract()
 
         makespan_ns = ceil_fraction(self.now)
         assignments = []
@@ -2769,6 +3990,19 @@ class Simulator:
             assignments.append(
                 {
                     "dispatch_order": tx.sequence,
+                    "logical_job_id": tx.logical_job_id,
+                    "attempt_id": tx.attempt_id,
+                    "C_STORE_GUID": tx.c_store_guid,
+                    "physical_endpoint": tx.physical_endpoint,
+                    "RouteLaneId": tx.route_lane_id,
+                    "F_STORE_GUID": tx.f_store_guid,
+                    "session_serial": tx.session_serial,
+                    "HISTORY_NONCE": tx.history_nonce,
+                    "transaction_digest": tx.transaction_digest,
+                    "raw_digest": tx.item.raw_digest,
+                    "negotiated_profiles": ",".join(self.negotiated_profiles),
+                    "route_state_profiles": ",".join(self.route_state_profiles),
+                    "InputRecord_identity": tx.input_record_identity,
                     "tu_seq": tx.tu_seq,
                     "rel_seq": tx.rel_seq,
                     "environment": tx.item.environment,
@@ -2801,6 +4035,7 @@ class Simulator:
                     "raw_bytes": self.worker_raw_bytes[worker],
                     "c_to_f_bytes": self.worker_c_to_f[worker],
                     "f_to_c_bytes": self.worker_f_to_c[worker],
+                    "environment_c_to_f_bytes": self.worker_environment_c_to_f[worker],
                     "compile_busy_ns": self.worker_compile_ns[worker],
                     "slot_reserved_ns": ceil_fraction(self.worker_reserved_ns[worker]),
                     "compile_utilization": (
@@ -2964,11 +4199,29 @@ class Simulator:
         )
         c_to_f = sum(tx.c_to_f_bytes for tx in self.transactions)
         f_to_c = sum(tx.f_to_c_bytes for tx in self.transactions)
+        environment_c_to_f = sum(self.worker_environment_c_to_f)
+        ledger_summary = self.ledger.summary()
+        replay_closure = self._replay_closure()
+        if (
+            ledger_summary["directions"]["c_to_f"]["accounts"].get("source", 0)
+            != c_to_f
+        ):
+            raise RuntimeError("source C-to-F score differs from exact ledger")
+        if (
+            ledger_summary["directions"]["f_to_c"]["accounts"].get("source", 0)
+            != f_to_c
+        ):
+            raise RuntimeError("source F-to-C total differs from exact ledger")
         summary = {
-            "schema": "icecream-distribution-result-v1",
+            "schema": (
+                "icecream-experiment-result-v2"
+                if self.scenario.is_v2
+                else "icecream-distribution-result-v1"
+            ),
             "scenario": self.scenario.document["name"],
             "scenario_path": str(self.scenario.path),
-            "scenario_sha256": sha256(self.scenario.path),
+            "scenario_sha256": self.scenario.scenario_digest,
+            "scenario_digest": self.scenario.scenario_digest,
             "workload_inputs": self.scenario.workload_inputs,
             "codec_adapter": self.adapter.name,
             "physical_codec_result": self.adapter.physical,
@@ -3002,7 +4255,35 @@ class Simulator:
             ),
             "c_to_f_bytes": c_to_f,
             "f_to_c_bytes": f_to_c,
+            "environment_c_to_f_bytes": environment_c_to_f,
+            "network_c_to_f_bytes": c_to_f + environment_c_to_f,
+            "network_f_to_c_bytes": f_to_c,
             "scored_outgoing_bytes": c_to_f,
+            "source_transfer_score_excludes_environment": True,
+            "tu_availability": (
+                "all-at-zero-at-each-build-release"
+                if self.scenario.is_v2
+                else "scenario-defined"
+            ),
+            "preprocessing_in_score": False,
+            "environment": {
+                "initial_state": self.environment_initial_state,
+                "transfer_bytes_per_used_route": self.environment_transfer_bytes,
+                "install_verify_ns": self.environment_install_verify_ns,
+                "ensured_routes": len(self.environment_ensures),
+                "final_states": [
+                    {
+                        "environment": environment,
+                        "worker": worker,
+                        "state": state,
+                    }
+                    for (environment, worker), state in sorted(
+                        self.environment_status.items()
+                    )
+                ],
+            },
+            "exact_byte_ledger": ledger_summary,
+            "replay_closure": replay_closure,
             "makespan_ns": makespan_ns,
             "makespan_seconds": makespan_ns / NANOSECONDS,
             "summed_generation_ns": summed_generation_ns,
@@ -3041,6 +4322,9 @@ class Simulator:
                     "F input-wait, ready-input, compiler, and commit-wait occupancy",
                     "build barriers and workload release gaps",
                     "exact C-to-F and F-to-C byte events",
+                    "exact transient resource/queue byte credits and final closure",
+                    "resident environments plus explicit single-flight environment stress",
+                    "exact route-trace or aggregate policy replay closure",
                 ],
                 "adapter": self.adapter.timeline_coverage(),
                 "not_modelled": [
@@ -3090,6 +4374,8 @@ def payload_overrides(values: list[str]) -> dict[str, Path]:
 
 
 def resolved_scenario_document(scenario: LoadedScenario) -> dict[str, object]:
+    if scenario.is_v2:
+        return json.loads(json.dumps(scenario.manifest))
     document = json.loads(json.dumps(scenario.document))
     for job in document["environments"]["job_selection"]["jobs"]:
         job["corpus_root"] = scenario.workload_inputs[job["id"]]["corpus_root"]
@@ -3140,25 +4426,28 @@ def topology_label(document: dict[str, object]) -> str:
 
 
 def experiment_descriptor(
-    scenario: LoadedScenario, result: SimulationResult
+    scenario: LoadedScenario,
+    result: SimulationResult,
+    execution: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Build the deterministic descriptor which heads an experiment stream."""
     resolved = resolved_scenario_document(scenario)
+    engine_document = scenario.document
     allocation_resources = ["direction/environment/F route"]
-    if "shared_fabric_bps" in resolved["network"]:
+    if "shared_fabric_bps" in engine_document["network"]:
         allocation_resources.append("optional common fabric")
     if any(
-        "fabric_bits_per_second" in resolved["network"][direction]
+        "fabric_bits_per_second" in engine_document["network"][direction]
         for direction in DIRECTIONS
     ):
         allocation_resources.append("per-direction fabric")
     if any(
-        "per_environment_bits_per_second" in resolved["network"][direction]
+        "per_environment_bits_per_second" in engine_document["network"][direction]
         for direction in DIRECTIONS
     ):
         allocation_resources.append("per-direction C-authority aggregate")
     if any(
-        "per_worker_bits_per_second" in resolved["network"][direction]
+        "per_worker_bits_per_second" in engine_document["network"][direction]
         for direction in DIRECTIONS
     ):
         allocation_resources.append("per-direction F aggregate")
@@ -3166,7 +4455,7 @@ def experiment_descriptor(
         "record": "experiment",
         "schema": "icecream-distribution-timeline-v1",
         "scenario": result.summary["scenario"],
-        "topology": topology_label(resolved),
+        "topology": topology_label(engine_document),
         "topology_dimensions": {
             "schema_semantics": (
                 "v1 maps one producer agent, one logical C authority, and one C egress "
@@ -3231,6 +4520,46 @@ def experiment_descriptor(
         },
         "expected_summary": result.summary,
     }
+    if scenario.is_v2:
+        if execution is None:
+            raise ValueError(
+                "v2 experiment output requires a separate execution header"
+            )
+        descriptor = {
+            "record": "execution",
+            **execution,
+            "schema": "icecream-execution-v2",
+            "scenario_digest": scenario.scenario_digest,
+            "scenario": result.summary["scenario"],
+            "topology": topology_label(engine_document),
+            "topology_dimensions": descriptor["topology_dimensions"],
+            "codec_adapter": result.summary["codec_adapter"],
+            "physical_codec_result": result.summary["physical_codec_result"],
+            "clock": descriptor["clock"],
+            "score": descriptor["score"],
+            "network_allocation": descriptor["network_allocation"],
+            "record_order": [
+                "execution header with scenario digest",
+                "active snapshots and compressed inactive gaps",
+                "final reconciliation summary",
+            ],
+            "snapshot_semantics": descriptor["snapshot_semantics"],
+            "state_coverage": descriptor["state_coverage"],
+            "manifest_schema": scenario.manifest["schema"],
+            "scenario_manifest": resolved,
+            "workload_inputs": result.summary["workload_inputs"],
+            "identity_contract": list(EVENT_IDENTITY_FIELDS),
+            "ledger_contract": {
+                "directional": "exact per-link deltas",
+                "resource_and_queue": "non-negative during run and zero at closure",
+                "route_replay": result.summary["replay_closure"]["semantics"],
+            },
+            "simulator": {
+                "source": str(Path(__file__).resolve()),
+                "source_sha256": sha256(Path(__file__).resolve()),
+            },
+            "expected_summary": result.summary,
+        }
     return descriptor
 
 
@@ -3260,7 +4589,11 @@ def iter_event_timeline(result: SimulationResult) -> Iterator[dict[str, object]]
 def experiment_final(result: SimulationResult) -> dict[str, object]:
     return {
         "record": "summary",
-        "schema": "icecream-distribution-timeline-summary-v1",
+        "schema": (
+            "icecream-experiment-summary-v2"
+            if result.summary["schema"] == "icecream-experiment-result-v2"
+            else "icecream-distribution-timeline-summary-v1"
+        ),
         "timeline_records": len(result.timeline),
         "event_count": len(result.events),
         "summary": result.summary,
@@ -3268,10 +4601,12 @@ def experiment_final(result: SimulationResult) -> dict[str, object]:
 
 
 def experiment_records(
-    scenario: LoadedScenario, result: SimulationResult
+    scenario: LoadedScenario,
+    result: SimulationResult,
+    execution: dict[str, object] | None = None,
 ) -> tuple[dict[str, object], list[dict[str, object]], dict[str, object]]:
     """Materialize an experiment stream for small callers and focused tests."""
-    descriptor = experiment_descriptor(scenario, result)
+    descriptor = experiment_descriptor(scenario, result, execution)
     timeline = list(iter_event_timeline(result))
     final = experiment_final(result)
     return descriptor, timeline, final
@@ -3304,10 +4639,11 @@ def write_experiment_stream(
     path: Path,
     scenario: LoadedScenario,
     result: SimulationResult,
+    execution: dict[str, object] | None = None,
     report_limit: int = MAX_REPORT_SNAPSHOTS,
 ) -> tuple[dict[str, object], list[dict[str, object]], dict[str, object]]:
     """Write the canonical stream while retaining only the bounded browser view."""
-    descriptor = experiment_descriptor(scenario, result)
+    descriptor = experiment_descriptor(scenario, result, execution)
     final = experiment_final(result)
     selected, selection = selected_snapshot_ordinals(
         result.timeline.snapshot_count, report_limit
@@ -3446,8 +4782,115 @@ $('definition').textContent=JSON.stringify(D,null,2);draw();
     return template.replace("__PAYLOAD__", payload)
 
 
+def write_route_trace(
+    path: Path, scenario: LoadedScenario, result: SimulationResult
+) -> None:
+    profile = result.summary["codec_adapter"]
+    rows: list[dict[str, object]] = [
+        {
+            "record": "route_trace",
+            "schema": "icecream-route-trace-v1",
+            "scenario_digest": scenario.scenario_digest,
+            "codec_profile": profile,
+        }
+    ]
+    c_to_f = 0
+    f_to_c = 0
+    for assignment in result.assignments:
+        row = {
+            "record": "assignment",
+            "logical_job_id": assignment["logical_job_id"],
+            "attempt_id": assignment["attempt_id"],
+            "workload": assignment["workload"],
+            "build": assignment["build"],
+            "logical": assignment["logical"],
+            "worker": assignment["worker"],
+            "C_STORE_GUID": assignment["C_STORE_GUID"],
+            "physical_endpoint": assignment["physical_endpoint"],
+            "RouteLaneId": assignment["RouteLaneId"],
+            "F_STORE_GUID": assignment["F_STORE_GUID"],
+            "session_serial": assignment["session_serial"],
+            "HISTORY_NONCE": assignment["HISTORY_NONCE"],
+            "TU_SEQ": assignment["tu_seq"],
+            "REL_SEQ": assignment["rel_seq"],
+            "c_to_f_bytes": assignment["c_to_f_bytes"],
+            "f_to_c_bytes": assignment["f_to_c_bytes"],
+        }
+        c_to_f += int(assignment["c_to_f_bytes"])
+        f_to_c += int(assignment["f_to_c_bytes"])
+        rows.append(row)
+    rows.append(
+        {
+            "record": "route_summary",
+            "assignments": len(result.assignments),
+            "c_to_f_bytes": c_to_f,
+            "f_to_c_bytes": f_to_c,
+        }
+    )
+    for index, row in enumerate(rows, start=1):
+        validate_json_schema(row, "route-trace.schema.json", f"{path}:{index}")
+    with path.open("w") as output:
+        for row in rows:
+            output.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
+
+
+def validate_experiment_jsonl(path: Path) -> dict[str, int]:
+    """Recompute the minimum v2 stream closure independently from its summary."""
+    rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    if len(rows) < 3 or rows[0].get("record") != "execution":
+        raise ValueError(f"{path}: v2 stream lacks its execution header")
+    if rows[0].get("schema") != "icecream-execution-v2":
+        raise ValueError(f"{path}: v2 stream has an unknown execution schema")
+    if rows[-1].get("record") != "summary":
+        raise ValueError(f"{path}: v2 stream lacks its final summary")
+    final_summary = rows[-1].get("summary")
+    if not isinstance(final_summary, dict):
+        raise ValueError(f"{path}: final summary is not an object")
+    if rows[0].get("scenario_digest") != final_summary.get("scenario_digest"):
+        raise ValueError(f"{path}: execution/scenario digest mismatch")
+    events = [event for row in rows[1:-1] for event in row.get("events", [])]
+    if [event.get("sequence") for event in events] != list(range(len(events))):
+        raise ValueError(f"{path}: event sequence is not contiguous")
+    c_to_f = 0
+    f_to_c = 0
+    resources: dict[str, int] = defaultdict(int)
+    queues: dict[str, int] = defaultdict(int)
+    for event in events:
+        missing = [field for field in EVENT_IDENTITY_FIELDS if field not in event]
+        if missing:
+            raise ValueError(f"{path}: event lacks M3 fields {missing}")
+        c_to_f += checked_nonnegative_int(
+            event["c_to_f_byte_delta"], "event c_to_f_byte_delta"
+        )
+        f_to_c += checked_nonnegative_int(
+            event["f_to_c_byte_delta"], "event f_to_c_byte_delta"
+        )
+        for name, delta in event["resource_byte_delta"].items():
+            resources[name] += int(delta)
+            if resources[name] < 0:
+                raise ValueError(f"{path}: resource {name} became negative")
+        for name, delta in event["queue_byte_delta"].items():
+            queues[name] += int(delta)
+            if queues[name] < 0:
+                raise ValueError(f"{path}: queue {name} became negative")
+    if any(resources.values()) or any(queues.values()):
+        raise ValueError(f"{path}: resource or queue byte ledger remains open")
+    ledger = final_summary.get("exact_byte_ledger", {})
+    directions = ledger.get("directions", {}) if isinstance(ledger, dict) else {}
+    if c_to_f != directions.get("c_to_f", {}).get("total_bytes"):
+        raise ValueError(f"{path}: C-to-F byte ledger does not reconcile")
+    if f_to_c != directions.get("f_to_c", {}).get("total_bytes"):
+        raise ValueError(f"{path}: F-to-C byte ledger does not reconcile")
+    if final_summary.get("replay_closure", {}).get("status") != "pass":
+        raise ValueError(f"{path}: route replay did not close")
+    return {"events": len(events), "c_to_f_bytes": c_to_f, "f_to_c_bytes": f_to_c}
+
+
 def write_result(
-    scenario: LoadedScenario, result: SimulationResult, output_directory: Path
+    scenario: LoadedScenario,
+    result: SimulationResult,
+    output_directory: Path,
+    execution: dict[str, object] | None = None,
 ) -> None:
     output_directory.mkdir(parents=True, exist_ok=True)
     resolved_document = resolved_scenario_document(scenario)
@@ -3457,19 +4900,29 @@ def write_result(
     (output_directory / "summary.json").write_text(
         json.dumps(result.summary, indent=2) + "\n"
     )
+    if scenario.is_v2:
+        if execution is None:
+            raise ValueError("v2 result requires execution metadata")
+        (output_directory / "execution-header.json").write_text(
+            json.dumps(execution, indent=2, sort_keys=True) + "\n"
+        )
     write_tsv(output_directory / "assignments.tsv", result.assignments)
     write_tsv(output_directory / "events.tsv", result.events)
     write_tsv(output_directory / "workers.tsv", result.workers)
     write_tsv(output_directory / "builds.tsv", result.builds)
     write_tsv(output_directory / "generations.tsv", result.generations)
+    if scenario.is_v2:
+        write_route_trace(output_directory / "route-trace.jsonl", scenario, result)
     descriptor, timeline, final = write_experiment_stream(
-        output_directory / "experiment.jsonl", scenario, result
+        output_directory / "experiment.jsonl", scenario, result, execution
     )
     (output_directory / "report.html").write_text(
         render_report_html(descriptor, timeline, final)
     )
     result.timeline.discard_spool()
     result.events.discard_spool()
+    if scenario.is_v2:
+        validate_experiment_jsonl(output_directory / "experiment.jsonl")
 
 
 def main() -> int:
@@ -3494,10 +4947,38 @@ def main() -> int:
     parser.add_argument(
         "--corpus-root", action="append", default=[], metavar="WORKLOAD=PATH"
     )
+    parser.add_argument(
+        "--execution",
+        type=Path,
+        help="separate icecream-execution-v2 header (required by v2 manifests)",
+    )
     parser.add_argument("--require-payload", action="store_true")
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
     scenario = load_scenario(args.scenario, payload_overrides(args.corpus_root))
+    execution: dict[str, object] | None = None
+    if scenario.is_v2:
+        if args.execution is None:
+            raise ValueError("icecream-experiment-v2 requires --execution")
+        execution = load_execution(args.execution, scenario.scenario_digest)
+        capabilities = scenario.manifest["capabilities"]
+        assert isinstance(capabilities, dict)
+        control = capabilities.get("experiment_control")
+        expected_adapter = {
+            "compile_only": "compile-only",
+            "raw": "raw",
+            "z3_shared_long_b1": None,
+        }.get(control, capabilities["codec_profile"])
+        if expected_adapter is None:
+            raise ValueError(
+                f"experiment control {control!r} is a declared future control, not an R4 codec"
+            )
+        if args.codec != expected_adapter:
+            raise ValueError(
+                f"manifest selects adapter {expected_adapter!r}, command selected {args.codec!r}"
+            )
+    elif args.execution is not None:
+        raise ValueError("--execution is valid only with icecream-experiment-v2")
     if args.require_payload:
         missing = [
             str(item.payload)
@@ -3525,6 +5006,11 @@ def main() -> int:
             scenario,
             args.codec,
             allow_compatible_scenario=args.allow_compatible_ledger,
+            assignment_closure=(
+                "exact_route"
+                if scenario.route_trace
+                else "aggregate" if scenario.is_v2 else "exact_route"
+            ),
         )
     args.out.mkdir(parents=True, exist_ok=True)
     result = Simulator(
@@ -3533,7 +5019,7 @@ def main() -> int:
         timeline_spool_path=args.out / ".timeline-spool.jsonl",
         event_spool_path=args.out / ".event-spool.jsonl",
     ).run()
-    write_result(scenario, result, args.out)
+    write_result(scenario, result, args.out, execution)
     print(json.dumps(result.summary, indent=2))
     return 0
 

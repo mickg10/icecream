@@ -391,7 +391,7 @@ def build_ledger(
         "schema": "icecream-physical-codec-ledger-v1",
         "codec": "grz",
         "scenario": scenario.document["name"],
-        "scenario_sha256": sim.sha256(scenario.path),
+        "scenario_sha256": scenario.scenario_digest,
         "workload_inputs": scenario.workload_inputs,
         "assignment": (
             "common simulator compile-only static route binding, partitioned by (C,F)"
