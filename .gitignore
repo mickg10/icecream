@@ -57,3 +57,6 @@ compile_commands.json
 .vs*
 __pycache__/
 *.pyc
+
+# Local build output for the bounded offline report renderer.
+/capability/distribution/dashboard-rs/target/

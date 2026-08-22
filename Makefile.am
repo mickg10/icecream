@@ -1,4 +1,13 @@
 EXTRA_DIST = README.md
+EXTRA_DIST += \
+	capability/distribution/DASHBOARD-SPEC.md \
+	capability/distribution/dashboard.py \
+	capability/distribution/dashboard_template.html \
+	capability/distribution/render_dashboard.sh \
+	capability/distribution/test_dashboard.py \
+	capability/distribution/dashboard-rs/Cargo.toml \
+	capability/distribution/dashboard-rs/Cargo.lock \
+	capability/distribution/dashboard-rs/src/main.rs
 
 ACLOCAL_AMFLAGS = -I m4
 AM_LIBTOOLFLAGS = --silent
@@ -31,5 +40,7 @@ integration_tests:
 		capability/distribution/test_run_scenario.py \
 		capability/distribution/test_build_p29_ledger.py \
 		capability/distribution/test_build_grz_ledger.py \
-		capability/distribution/test_run_suite.py
+		capability/distribution/test_run_suite.py \
+		capability/distribution/test_dashboard.py
 	python3 -m compileall -q capability/distribution
+	cargo test --manifest-path capability/distribution/dashboard-rs/Cargo.toml
