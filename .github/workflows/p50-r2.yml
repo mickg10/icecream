@@ -1,0 +1,65 @@
+name: Protocol 50 R2 gate
+
+on:
+  push:
+    branches:
+      - bigoracle/issue16-p50-m2-loopback-endpoint
+  pull_request:
+    paths:
+      - 'cache/**'
+      - 'services/digest128.*'
+      - 'unittests/p50*'
+      - 'unittests/Makefile.am'
+      - 'configure.ac'
+      - '.github/workflows/p50-r2.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf automake libtool pkg-config make \
+            g++ clang \
+            libboost-system-dev libzstd-dev libxxhash-dev \
+            liblzo2-dev libarchive-dev libcap-ng-dev
+
+      - name: Configure
+        env:
+          CC: ${{ matrix.compiler == 'gcc' && 'gcc' || 'clang' }}
+          CXX: ${{ matrix.compiler == 'gcc' && 'g++' || 'clang++' }}
+        run: |
+          ./autogen.sh
+          ./configure --without-man
+
+      - name: Build focused P50 tests
+        run: |
+          make -j2
+          make -C unittests -j2 \
+            p50wire p50slice0 p50zstd p50zstdwindow p50loopback
+
+      - name: Run focused P50 tests
+        run: |
+          ./unittests/p50wire
+          ./unittests/p50slice0
+          ./unittests/p50zstd
+          ./unittests/p50zstdwindow
+          ./unittests/p50loopback
+          (cd unittests && srcdir=. ./p50_trace_check.sh)
+
+      - name: Run repository check suite
+        run: make -j2 check
