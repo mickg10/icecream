@@ -168,13 +168,26 @@ void test_duplicate_and_conflicting_publication() {
                                  conflict.commit, changed); },
         "same InputRecord key accepted conflicting exact bytes");
 
+    InputCursor existing = store.attach(key);
     store.close_job(key);
-    require(store.publish(c_guid, tx.begin, tx.commit, input) ==
-                InputPublishResult::Existing && !store.job_open(key),
-            "late duplicate reopened a closed logical job");
+    const size_t closed_record_count = store.record_count();
+    const uint64_t closed_retained_bytes = store.retained_bytes();
+    require(!store.job_open(key) && closed_record_count == 1 &&
+                closed_retained_bytes == input.size(),
+            "closed InputRecord accounting is wrong");
+    require_throws<std::logic_error>(
+        [&] { (void)store.publish(c_guid, tx.begin, tx.commit, input); },
+        "late open publication accepted a retained closed InputRecord");
+    require(!store.job_open(key) &&
+                store.record_count() == closed_record_count &&
+                store.retained_bytes() == closed_retained_bytes,
+            "rejected closed InputRecord publication changed state or accounting");
     require_throws<std::logic_error>(
         [&] { (void)store.attach(key); },
         "closed logical job accepted a new compiler attachment");
+    require(drain(existing, 127) == input,
+            "rejected publication changed an existing cursor's exact input");
+    existing = InputCursor{};
     store.collect_garbage();
     require(store.record_count() == 0 && store.retained_bytes() == 0,
             "closed duplicate left unreferenced input retained");
