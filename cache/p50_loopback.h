@@ -15,6 +15,11 @@
 
 namespace icecc::p50 {
 
+// TX_BEGIN is the largest fixed-size V1 control payload (152 bytes). A peer
+// offering less cannot carry the protocol even if data frames are otherwise
+// bounded correctly.
+constexpr uint32_t kM2MinimumControlPayload = 152;
+
 struct CandidateSession {
     uint64_t id = 0;
     uint64_t state_revision = 0;
@@ -37,7 +42,7 @@ public:
     uint64_t activate(uint64_t candidate_id);
     void reject(uint64_t candidate_id);
     void note_state_change();
-    void disconnect(uint64_t session_serial);
+    void disconnect(uint64_t session_serial) noexcept;
 
     [[nodiscard]] uint64_t state_revision() const { return state_revision_; }
     [[nodiscard]] uint64_t current_session_serial() const {
@@ -71,9 +76,9 @@ struct ZstdLoopbackConfig {
 };
 
 // The endpoint derives the only legal TxCommit. This callback must atomically
-// publish the exact InputRecord (when job_open) and matching route state before
-// it returns; throwing leaves the transaction uncommitted and terminates the
-// session.
+// publish the exact InputRecord (when job_open) before it returns; throwing
+// leaves the relationship cursor unadvanced and terminates the session. The
+// endpoint owner advances its route state immediately after callback success.
 using PublishExactInput = std::function<void(
     const TxBegin&, const TxCommit&, std::vector<uint8_t>)>;
 
@@ -110,7 +115,6 @@ private:
                         uint64_t session_serial,
                         const SessionSelection& selection);
 
-    boost::asio::io_context& context_;
     ZstdLoopbackConfig config_;
     CStoreGuid expected_c_store_guid_{};
     PublishExactInput publish_exact_input_;
@@ -146,7 +150,6 @@ public:
     void close();
 
 private:
-    boost::asio::io_context& context_;
     tcp::socket socket_;
     SessionHello hello_{};
     SessionState state_{};
