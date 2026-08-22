@@ -2,7 +2,7 @@
 
 This directory is the canonical formal home for Protocol 50 because it lives beside the product identities, executable state machine, action trace, and trace checker.
 
-There are four small models with different ownership boundaries:
+There are five small models with different ownership boundaries:
 
 ```text
 Protocol50.tla
@@ -18,6 +18,11 @@ Protocol50Reconnect.tla
     fail-closed classification of initial cold state, exact replay,
     lost-final-ack reconciliation, F-store replacement, route mismatch,
     same-GUID namespace loss, and the one-reset-per-session boundary
+
+Protocol50MultiRoute.tla
+    the same PreparedTU attempted on two independent F relationships,
+    preservation of the source route's pending/durable liability,
+    and separation of result acceptance from cache-route reconciliation
 
 Protocol50IncarnationBridge.tla
     verified F_STORE_GUID replacement while an old transaction is in flight
@@ -35,12 +40,17 @@ SESSION_STATE/reconnect report
 
 Protocol50 --INPUT_COMMITTED--> Protocol50JobLifecycle
 
+scheduler replacement to another independent F
+    -> Protocol50MultiRoute
+    -> fork the same PreparedTU onto a second CRoute
+       without retiring the first route's liability
+
 Protocol50 + Protocol50JobLifecycle
     --verified F_STORE_GUID replacement before acceptance-->
 Protocol50IncarnationBridge
 ```
 
-This is one protocol design, not competing architectures. The split keeps the already-large cache state space from absorbing compiler-attempt and reconnect-classification state.
+This is one protocol design, not competing architectures. The split keeps the already-large cache state space from absorbing compiler-attempt, reconnect-classification, and multi-route ownership state.
 
 The older experimental model under `formal/protocol50/` on the capability branch is withdrawn. It contained the separate `ComputeNeed`/`PinClosure` race and did not implement the callback/restart semantics its review claimed.
 
@@ -166,6 +176,27 @@ no retransmission and no second cache-history commit
 only one result may be accepted
 ```
 
+## Multi-route bridge
+
+A scheduler replacement on another F is not an F-store incarnation change. The route map is keyed by physical endpoint/lane identity; the `F_STORE_GUID` is the incarnation token returned by that endpoint.
+
+```text
+PreparedTU T
+    -> CRoute(F0), possibly active or durable/unacknowledged
+    -> CRoute(F1), a new independent transaction for the same TU_SEQ
+```
+
+Starting F1 must not mutate F0's cursor, matcher, transaction, or reconciliation witness. A compiler result from either F may win the logical job, but result acceptance does not resolve either cache relationship. Each route is cleared only by its own normal/lost commit acceptance, explicit pre-durable abort, or verified same-endpoint incarnation replacement.
+
+`Protocol50MultiRoute.tla` checks that every started route remains bound to the same immutable PreparedTU, every unresolved route retains exactly one liability, retirement has incarnation proof, and at most one result is accepted. Two direct mutants deliberately:
+
+```text
+move the source CRoute to F1 instead of forking an F1 CRoute
+accept a compiler result and clear all outstanding cache liabilities
+```
+
+Both must violate their named invariants. This bridge models ownership only; it does not model scheduler policy, queueing, or bandwidth.
+
 ## F-incarnation bridge
 
 Ordinary abort is forbidden after F durably commits and before C accepts. Verified F-store replacement is the explicit exception. The same cold-retry rule also applies when the old transaction was still in flight and had not committed:
@@ -238,6 +269,7 @@ JOB_CANCELLED
 COMMITTED_INPUT_EVICTED
 F_CACHE_RESTARTED
 
+ROUTE_FORKED
 F_STORE_INCAR_REPLACED
 ESTABLISH_COLD_ROUTE
 REISSUE_HISTORY_INDEPENDENT
@@ -269,17 +301,21 @@ TLC_WORKERS=1 \
 make protocol50-formal
 ```
 
-`run_tlc.sh` requires complete safety runs for the cache, job, reconnect, and incarnation models plus scoped incarnation progress. It also requires directly named invariant failure for:
+`run_tlc.sh` prints the jar/module/config hashes and exact Java command for every row. It requires complete safety runs for the cache, job, reconnect, multi-route, and incarnation models plus both scoped progress rows. It also requires directly named invariant failure for:
 
 - abort after durable commit;
 - begin at terminal `REL_SEQ`;
 - same-cursor callback with the wrong transaction digest;
 - committed input without its logical-job lease;
+- attempt cancellation releasing that lease while the job remains open;
+- compiler authorization without independent input ownership;
 - same-GUID namespace loss incorrectly treated as cold replacement;
 - route reset that discards unresolved active work;
 - a second history reset in one session;
+- scheduler replacement moving rather than forking an independent CRoute;
+- result acceptance discarding unresolved cache liabilities;
 - lost retry identity on F-store replacement;
-- compiler authorization without independent exact-input ownership.
+- compiler authorization without independent exact-input ownership after replacement.
 
 There is intentionally no hosted GitHub Actions gate. The cache model has previously required about 8 GiB and roughly 24 minutes on one reviewer host. Acceptance therefore requires local runs from the exact PR head, published generated/distinct/depth/runtime statistics, log hashes, and independent reproduction.
 
