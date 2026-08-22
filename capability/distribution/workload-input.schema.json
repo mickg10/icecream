@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "icecream-workload-input-v1",
+  "title": "Canonical workload content and compile-duration input manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "rows"],
+  "properties": {
+    "schema": { "const": "icecream-workload-input-v1" },
+    "rows": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "logical", "job_id", "ii_relative", "raw_bytes", "raw_sha256",
+          "compile_ns", "compile_model", "compile_provenance"
+        ],
+        "properties": {
+          "logical": { "type": "integer", "minimum": 0 },
+          "job_id": { "type": "string", "minLength": 1 },
+          "ii_relative": { "type": "string", "minLength": 1 },
+          "raw_bytes": { "type": "integer", "minimum": 1 },
+          "raw_sha256": {
+            "type": "string", "pattern": "^[0-9a-f]{64}$"
+          },
+          "compile_ns": { "type": "integer", "minimum": 1 },
+          "compile_model": { "type": "string", "minLength": 1 },
+          "compile_provenance": { "enum": ["observed", "modeled"] }
+        }
+      }
+    }
+  }
+}

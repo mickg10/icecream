@@ -1,0 +1,138 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "icecream-experiment-event-v2",
+  "title": "Icecream experiment lifecycle event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "sequence", "time_ns", "event", "environment", "workload", "build",
+    "logical", "worker", "slot", "staging_slot", "compiler_slot",
+    "transaction", "tu_seq", "rel_seq", "flow", "phase", "direction",
+    "bytes", "detail", "stage", "transition", "logical_job_id", "attempt_id",
+    "C_STORE_GUID", "physical_endpoint", "RouteLaneId", "F_STORE_GUID",
+    "session_serial", "HISTORY_NONCE", "REL_SEQ", "TU_SEQ",
+    "transaction_digest", "InputRecord_identity", "raw_digest",
+    "negotiated_profiles", "route_state_profiles", "actor", "start_ns",
+    "end_ns", "duration_ns", "provenance", "byte_account",
+    "c_to_f_byte_delta", "f_to_c_byte_delta", "resource_byte_delta",
+    "queue_byte_delta"
+  ],
+  "properties": {
+    "sequence": { "$ref": "#/$defs/nonnegative" },
+    "time_ns": { "$ref": "#/$defs/nonnegative" },
+    "event": { "type": "string", "minLength": 1 },
+    "environment": { "$ref": "#/$defs/indexOrEmpty" },
+    "workload": { "type": "string" },
+    "build": { "$ref": "#/$defs/indexOrEmpty" },
+    "logical": { "$ref": "#/$defs/indexOrEmpty" },
+    "worker": { "$ref": "#/$defs/indexOrEmpty" },
+    "slot": { "$ref": "#/$defs/indexOrEmpty" },
+    "staging_slot": { "$ref": "#/$defs/indexOrEmpty" },
+    "compiler_slot": {
+      "oneOf": [
+        { "$ref": "#/$defs/nonnegative" },
+        { "const": "" },
+        { "type": "null" }
+      ]
+    },
+    "transaction": { "$ref": "#/$defs/indexOrEmpty" },
+    "tu_seq": { "$ref": "#/$defs/indexOrEmpty" },
+    "rel_seq": { "$ref": "#/$defs/indexOrEmpty" },
+    "flow": { "$ref": "#/$defs/indexOrEmpty" },
+    "phase": { "type": "string" },
+    "direction": { "enum": ["", "c_to_f", "f_to_c"] },
+    "bytes": {
+      "oneOf": [
+        { "$ref": "#/$defs/nonnegative" },
+        { "const": "" }
+      ]
+    },
+    "detail": { "type": "string" },
+    "stage": { "type": "string", "minLength": 1 },
+    "transition": { "type": "string", "minLength": 1 },
+    "logical_job_id": { "type": ["string", "null"] },
+    "attempt_id": { "type": ["string", "null"] },
+    "C_STORE_GUID": { "$ref": "#/$defs/guidOrNull" },
+    "physical_endpoint": { "type": ["string", "null"] },
+    "RouteLaneId": { "type": ["string", "null"] },
+    "F_STORE_GUID": { "$ref": "#/$defs/guidOrNull" },
+    "session_serial": {
+      "oneOf": [{ "$ref": "#/$defs/positive" }, { "type": "null" }]
+    },
+    "HISTORY_NONCE": {
+      "oneOf": [{ "$ref": "#/$defs/nonnegative" }, { "type": "null" }]
+    },
+    "REL_SEQ": {
+      "oneOf": [{ "$ref": "#/$defs/nonnegative" }, { "type": "null" }]
+    },
+    "TU_SEQ": {
+      "oneOf": [{ "$ref": "#/$defs/nonnegative" }, { "type": "null" }]
+    },
+    "transaction_digest": { "$ref": "#/$defs/shaOrNull" },
+    "InputRecord_identity": { "type": ["string", "null"] },
+    "raw_digest": { "$ref": "#/$defs/shaOrNull" },
+    "negotiated_profiles": {
+      "type": "array", "minItems": 1, "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "route_state_profiles": {
+      "type": "array", "minItems": 1, "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "actor": {
+      "enum": [
+        "C_authority", "scheduler", "F_compiler", "F_environment_store",
+        "C_cache", "F_cache", "simulator"
+      ]
+    },
+    "start_ns": { "$ref": "#/$defs/nonnegative" },
+    "end_ns": { "$ref": "#/$defs/nonnegative" },
+    "duration_ns": { "$ref": "#/$defs/nonnegative" },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "timing", "byte_delta", "route_identity", "raw_digest",
+        "compile_duration_input", "resource_delta", "queue_delta"
+      ],
+      "properties": {
+        "timing": { "$ref": "#/$defs/provenance" },
+        "byte_delta": { "$ref": "#/$defs/provenance" },
+        "route_identity": { "$ref": "#/$defs/provenance" },
+        "raw_digest": { "$ref": "#/$defs/provenance" },
+        "compile_duration_input": { "$ref": "#/$defs/provenance" },
+        "resource_delta": { "$ref": "#/$defs/provenance" },
+        "queue_delta": { "$ref": "#/$defs/provenance" }
+      }
+    },
+    "byte_account": { "enum": ["source", "environment", "result"] },
+    "c_to_f_byte_delta": { "$ref": "#/$defs/nonnegative" },
+    "f_to_c_byte_delta": { "$ref": "#/$defs/nonnegative" },
+    "resource_byte_delta": { "$ref": "#/$defs/deltas" },
+    "queue_byte_delta": { "$ref": "#/$defs/deltas" }
+  },
+  "$defs": {
+    "nonnegative": { "type": "integer", "minimum": 0 },
+    "positive": { "type": "integer", "minimum": 1 },
+    "indexOrEmpty": {
+      "oneOf": [{ "$ref": "#/$defs/nonnegative" }, { "const": "" }]
+    },
+    "guidOrNull": {
+      "oneOf": [
+        { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+        { "type": "null" }
+      ]
+    },
+    "shaOrNull": {
+      "oneOf": [
+        { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        { "type": "null" }
+      ]
+    },
+    "provenance": { "enum": ["observed", "modeled", "derived"] },
+    "deltas": {
+      "type": "object",
+      "additionalProperties": { "type": "integer" }
+    }
+  }
+}

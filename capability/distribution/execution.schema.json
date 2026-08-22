@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "icecream-execution-v2-input",
+  "$id": "icecream-execution-v2",
   "title": "Icecream execution realization header",
   "type": "object",
   "additionalProperties": false,
@@ -11,6 +11,7 @@
     "library_versions", "host_identities"
   ],
   "properties": {
+    "record": { "const": "execution" },
     "schema": { "const": "icecream-execution-v2" },
     "scenario_digest": { "$ref": "#/$defs/sha256" },
     "mode": { "enum": ["simulated", "physical"] },
@@ -39,8 +40,54 @@
     "host_identities": {
       "type": "array", "minItems": 1, "uniqueItems": true,
       "items": { "type": "string", "minLength": 1 }
-    }
+    },
+    "scenario": { "type": "string", "minLength": 1 },
+    "topology": { "type": "string", "minLength": 1 },
+    "topology_dimensions": { "type": "object" },
+    "codec_adapter": { "type": "string", "minLength": 1 },
+    "physical_codec_result": { "type": "boolean" },
+    "clock": { "type": "object" },
+    "score": { "type": "object" },
+    "network_allocation": { "type": "object" },
+    "record_order": {
+      "type": "array", "minItems": 3,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "snapshot_semantics": { "type": "object" },
+    "state_coverage": { "type": "object" },
+    "manifest_schema": { "const": "icecream-experiment-v2" },
+    "scenario_manifest": { "type": "object" },
+    "workload_inputs": { "type": "object", "minProperties": 1 },
+    "identity_contract": {
+      "type": "array", "minItems": 1, "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "ledger_contract": { "type": "object" },
+    "simulator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "source_sha256"],
+      "properties": {
+        "source": { "type": "string", "minLength": 1 },
+        "source_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "expected_summary": { "type": "object" }
   },
+  "allOf": [
+    {
+      "if": { "required": ["record"] },
+      "then": {
+        "required": [
+          "scenario", "topology", "topology_dimensions", "codec_adapter",
+          "physical_codec_result", "clock", "score", "network_allocation",
+          "record_order", "snapshot_semantics", "state_coverage", "manifest_schema",
+          "scenario_manifest", "workload_inputs", "identity_contract",
+          "ledger_contract", "simulator", "expected_summary"
+        ]
+      }
+    }
+  ],
   "$defs": {
     "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
     "commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" }

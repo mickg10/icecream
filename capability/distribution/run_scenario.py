@@ -26,7 +26,7 @@ import re
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from fractions import Fraction
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Iterable, Iterator, Mapping, Sequence
 
 
@@ -56,6 +56,7 @@ EVENT_IDENTITY_FIELDS = (
     "end_ns",
     "duration_ns",
     "provenance",
+    "byte_account",
     "c_to_f_byte_delta",
     "f_to_c_byte_delta",
     "resource_byte_delta",
@@ -91,6 +92,7 @@ class TraceRow:
     compile_ns: int
     compile_model: str
     raw_sha256: str | None = None
+    compile_provenance: str = "observed"
 
 
 @dataclass
@@ -106,6 +108,7 @@ class WorkItem:
     compile_ns: int
     release_offset_ns: int
     raw_digest: str | None = None
+    compile_provenance: str = "observed"
     release_ns: int | None = None
 
     @property
@@ -339,6 +342,7 @@ class PhysicalLedgerAdapter(CodecAdapter):
             raise ValueError("assignment_closure must be exact_route or aggregate")
         self.assignment_closure = assignment_closure
         self.path = path.resolve()
+        self.ledger_identity = self.path.name if scenario.is_v2 else str(self.path)
         rows = [json.loads(line) for line in self.path.read_text().splitlines() if line]
         if len(rows) < 3:
             raise ValueError(f"{self.path}: physical ledger is incomplete")
@@ -737,7 +741,7 @@ class PhysicalLedgerAdapter(CodecAdapter):
 
     def result_metadata(self) -> dict[str, object]:
         return {
-            "ledger": str(self.path),
+            "ledger": self.ledger_identity,
             "ledger_sha256": sha256(self.path),
             "scenario_binding": self.scenario_binding,
             "assignment_closure": self.assignment_closure,
@@ -931,6 +935,9 @@ class LoadedScenario:
     route_trace: dict[int, "RouteTraceEntry"] = field(default_factory=dict)
     route_trace_path: Path | None = None
     route_trace_sha256: str | None = None
+    route_trace_identity: str | None = None
+    route_trace_codec: str | None = None
+    route_trace_provenance: str | None = None
 
     @property
     def is_v2(self) -> bool:
@@ -1446,6 +1453,59 @@ def canonical_json_sha256(document: object) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def canonical_relative_identity(
+    value: str, name: str, *, allow_dot: bool = False
+) -> str:
+    """Return one checkout-independent POSIX identity for a v2 input path."""
+    if not value or "\\" in value:
+        raise ValueError(f"{name} must be a nonempty POSIX relative path")
+    if value == "." and allow_dot:
+        return value
+    candidate = PurePosixPath(value)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        raise ValueError(f"{name} must stay inside its declared checkout root")
+    normalized = candidate.as_posix()
+    if normalized in {"", "."}:
+        raise ValueError(f"{name} must name a relative path")
+    return normalized
+
+
+def trace_row_manifest(row: TraceRow) -> dict[str, object]:
+    if row.raw_sha256 is None:
+        raise ValueError(f"trace row {row.logical} has no raw_sha256")
+    return {
+        "logical": row.logical,
+        "job_id": row.job_id,
+        "ii_relative": canonical_relative_identity(
+            row.ii_relative, f"trace row {row.logical} ii_relative"
+        ),
+        "raw_bytes": row.raw_bytes,
+        "raw_sha256": row.raw_sha256,
+        "compile_ns": row.compile_ns,
+        "compile_model": row.compile_model,
+        "compile_provenance": row.compile_provenance,
+    }
+
+
+def workload_content_manifest(rows: Sequence[TraceRow]) -> dict[str, object]:
+    """Canonical content-and-timing manifest used by scenarios and executions."""
+    return {
+        "schema": "icecream-workload-input-v1",
+        "rows": [trace_row_manifest(row) for row in rows],
+    }
+
+
+def selected_v2_adapter(manifest: Mapping[str, object]) -> str | None:
+    capabilities = manifest["capabilities"]
+    assert isinstance(capabilities, Mapping)
+    control = capabilities.get("experiment_control")
+    return {
+        "compile_only": "compile-only",
+        "raw": "raw",
+        "z3_shared_long_b1": None,
+    }.get(control, str(capabilities["codec_profile"]))
+
+
 def validate_json_schema(
     document: object, schema_name: str, source: Path | str
 ) -> None:
@@ -1577,20 +1637,30 @@ def normalize_v2_manifest(manifest: dict[str, object]) -> dict[str, object]:
     return normalized
 
 
-def load_execution(path: Path, scenario_digest: str) -> dict[str, object]:
+def load_execution(path: Path, scenario: LoadedScenario) -> dict[str, object]:
     path = path.resolve()
     document = json.loads(path.read_text())
     validate_json_schema(document, "execution.schema.json", path)
-    if document["scenario_digest"] != scenario_digest:
+    if document["scenario_digest"] != scenario.scenario_digest:
         raise ValueError(
             f"{path}: execution scenario_digest differs from the loaded manifest"
         )
     if document["mode"] != "simulated":
         raise ValueError(f"{path}: run_scenario requires execution mode 'simulated'")
+    expected_inputs = sorted(
+        {
+            str(workload["manifest_digest"])
+            for workload in scenario.workload_inputs.values()
+        }
+    )
+    if sorted(document["input_manifest_digests"]) != expected_inputs:
+        raise ValueError(
+            f"{path}: execution input_manifest_digests differ from loaded workload content"
+        )
     return document
 
 
-def read_trace(path: Path) -> list[TraceRow]:
+def read_trace(path: Path, *, require_content_identity: bool = False) -> list[TraceRow]:
     rows: list[TraceRow] = []
     with path.open(newline="") as source:
         reader = csv.DictReader(source, delimiter="\t")
@@ -1621,6 +1691,22 @@ def read_trace(path: Path) -> list[TraceRow]:
             raw_sha256 = row.get("raw_sha256") or None
             if raw_sha256 is not None and SHA256_RE.fullmatch(raw_sha256) is None:
                 raise ValueError(f"{path}: trace row {logical} has invalid raw_sha256")
+            if require_content_identity and raw_sha256 is None:
+                raise ValueError(f"{path}: trace row {logical} lacks raw_sha256")
+            compile_provenance = row.get("compile_provenance") or None
+            if require_content_identity and compile_provenance not in {
+                "observed",
+                "modeled",
+            }:
+                raise ValueError(
+                    f"{path}: trace row {logical} lacks observed/modeled compile_provenance"
+                )
+            if compile_provenance is None:
+                compile_provenance = "observed"
+            elif compile_provenance not in {"observed", "modeled"}:
+                raise ValueError(
+                    f"{path}: trace row {logical} has invalid compile_provenance"
+                )
             rows.append(
                 TraceRow(
                     logical,
@@ -1630,6 +1716,7 @@ def read_trace(path: Path) -> list[TraceRow]:
                     compile_ns,
                     row["compile_model"],
                     raw_sha256,
+                    compile_provenance,
                 )
             )
     if not rows:
@@ -1677,7 +1764,8 @@ def load_route_trace(
     scenario_digest: str,
     work_items: Mapping[tuple[str, int], Sequence[WorkItem]],
     f_count: int,
-) -> tuple[dict[int, RouteTraceEntry], str]:
+    expected_codec: str,
+) -> tuple[dict[int, RouteTraceEntry], str, str]:
     path = path.resolve()
     rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
     if len(rows) < 3:
@@ -1689,11 +1777,19 @@ def load_route_trace(
         raise ValueError(f"{path}: route trace boundary records are invalid")
     if header["scenario_digest"] != scenario_digest:
         raise ValueError(f"{path}: route trace belongs to a different scenario")
+    if header["codec_profile"] != expected_codec:
+        raise ValueError(
+            f"{path}: route trace codec {header['codec_profile']!r} differs from "
+            f"selected adapter {expected_codec!r}"
+        )
     expected_items = {item.key: item for items in work_items.values() for item in items}
     entries: dict[int, RouteTraceEntry] = {}
     seen_keys: set[tuple[str, int, int]] = set()
     by_environment: dict[int, list[int]] = defaultdict(list)
     by_route: dict[tuple[int, int], list[int]] = defaultdict(list)
+    c_identity_by_environment: dict[int, str] = {}
+    f_identity_by_worker: dict[int, tuple[str, str]] = {}
+    identity_by_route: dict[tuple[int, int], tuple[object, ...]] = {}
     c_to_f_total = 0
     f_to_c_total = 0
     for row_number, row in enumerate(rows[1:-1], start=2):
@@ -1732,7 +1828,36 @@ def load_route_trace(
         )
         entries[item.ordinal] = entry
         by_environment[item.environment].append(tu_seq)
-        by_route[(item.environment, worker)].append(rel_seq)
+        route = (item.environment, worker)
+        by_route[route].append(rel_seq)
+        c_identity = c_identity_by_environment.setdefault(
+            item.environment, entry.c_store_guid
+        )
+        if c_identity != entry.c_store_guid:
+            raise ValueError(
+                f"{path}:{row_number}: C identity drifted in environment {item.environment}"
+            )
+        f_identity = f_identity_by_worker.setdefault(
+            worker, (entry.physical_endpoint, entry.f_store_guid)
+        )
+        if f_identity != (entry.physical_endpoint, entry.f_store_guid):
+            raise ValueError(
+                f"{path}:{row_number}: F identity drifted for worker {worker}"
+            )
+        route_identity = (
+            entry.c_store_guid,
+            entry.physical_endpoint,
+            entry.route_lane_id,
+            entry.f_store_guid,
+            entry.session_serial,
+            entry.history_nonce,
+        )
+        established = identity_by_route.setdefault(route, route_identity)
+        if established != route_identity:
+            raise ValueError(
+                f"{path}:{row_number}: route identity drifted on {route}; "
+                "this trace declares no identity transition"
+            )
         c_to_f_total += entry.c_to_f_bytes
         f_to_c_total += entry.f_to_c_bytes
     if seen_keys != set(expected_items):
@@ -1754,7 +1879,7 @@ def load_route_trace(
         raise ValueError(
             f"{path}: route summary {summary!r} differs from {expected_summary!r}"
         )
-    return entries, sha256(path)
+    return entries, sha256(path), str(header["provenance"])
 
 
 def load_scenario(
@@ -1765,6 +1890,7 @@ def load_scenario(
     if not isinstance(source_document, dict):
         raise ValueError(f"{path}: scenario must be an object")
     schema = source_document.get("schema")
+    selected_adapter: str | None = None
     if schema == "icecream-experiment-v2":
         validate_json_schema(source_document, "experiment.schema.json", path)
         manifest = source_document
@@ -1775,6 +1901,20 @@ def load_scenario(
             raise ValueError(f"{path}: selected_cache_wire differs from capability")
         if expected["selected_codec_profile"] != capabilities["codec_profile"]:
             raise ValueError(f"{path}: selected_codec_profile differs from capability")
+        component_protocols = [
+            int(component["main_protocol"])
+            for component in manifest["components"].values()
+        ]
+        negotiated_main_protocol = min(component_protocols)
+        if expected["selected_main_protocol"] != negotiated_main_protocol:
+            raise ValueError(
+                f"{path}: selected_main_protocol differs from component negotiation "
+                f"({negotiated_main_protocol})"
+            )
+        if expected["compile_result"] != "pass":
+            raise ValueError(
+                f"{path}: this simulator models successful compile completion only"
+            )
         control = capabilities.get("experiment_control")
         if (
             control in {"compile_only", "raw"}
@@ -1788,6 +1928,7 @@ def load_scenario(
             raise ValueError(
                 f"{path}: z3_shared_long_b1 control requires z3_shared_long"
             )
+        selected_adapter = selected_v2_adapter(manifest)
         scenario_digest = canonical_json_sha256(manifest)
         document = normalize_v2_manifest(manifest)
     elif schema == "icecream-distribution-scenario-v1":
@@ -1909,25 +2050,81 @@ def load_scenario(
         root_value = job.get("corpus_root")
         if not isinstance(trace_value, str) or not isinstance(root_value, str):
             raise ValueError(f"{workload}: trace/corpus_root must be strings")
+        if schema == "icecream-experiment-v2":
+            trace_identity = canonical_relative_identity(
+                trace_value, f"{workload}.trace"
+            )
+            corpus_identity = canonical_relative_identity(
+                root_value, f"{workload}.corpus_root", allow_dot=True
+            )
+        else:
+            trace_identity = trace_value
+            corpus_identity = root_value
         trace_path = (path.parent / trace_value).resolve()
         corpus_root = overrides.get(workload, Path(root_value))
         if not corpus_root.is_absolute():
             corpus_root = (path.parent / corpus_root).resolve()
-        trace_rows = read_trace(trace_path)
+        trace_rows = read_trace(
+            trace_path, require_content_identity=schema == "icecream-experiment-v2"
+        )
         manifest_digest = job.get("manifest_digest")
         if manifest_digest is not None and (
             not isinstance(manifest_digest, str)
             or SHA256_RE.fullmatch(manifest_digest) is None
         ):
             raise ValueError(f"{workload}: manifest_digest is not canonical SHA-256")
+        verified_digests: dict[int, str] = {}
+        if schema == "icecream-experiment-v2":
+            for row in trace_rows:
+                relative = canonical_relative_identity(
+                    row.ii_relative, f"{workload} trace row {row.logical} ii_relative"
+                )
+                payload = corpus_root / relative
+                if not payload.is_file():
+                    raise ValueError(
+                        f"{workload}: v2 payload is absent for TU {row.logical}: {relative}"
+                    )
+                if payload.stat().st_size != row.raw_bytes:
+                    raise ValueError(
+                        f"{workload}: payload size differs for TU {row.logical}"
+                    )
+                observed_digest = sha256(payload)
+                if row.raw_sha256 != observed_digest:
+                    raise ValueError(
+                        f"{workload}: payload digest differs for TU {row.logical}"
+                    )
+                verified_digests[row.logical] = observed_digest
+            content_manifest = workload_content_manifest(trace_rows)
+            validate_json_schema(
+                content_manifest,
+                "workload-input.schema.json",
+                f"{workload} canonical workload content",
+            )
+            observed_manifest_digest = canonical_json_sha256(content_manifest)
+            if manifest_digest != observed_manifest_digest:
+                raise ValueError(
+                    f"{workload}: manifest_digest differs from canonical workload content"
+                )
+        else:
+            content_manifest = None
         workload_input: dict[str, object] = {
-            "trace": str(trace_path),
+            "trace": (
+                trace_identity
+                if schema == "icecream-experiment-v2"
+                else str(trace_path)
+            ),
             "trace_sha256": sha256(trace_path),
-            "corpus_root": str(corpus_root),
+            "corpus_root": (
+                corpus_identity
+                if schema == "icecream-experiment-v2"
+                else str(corpus_root)
+            ),
             "trace_rows": len(trace_rows),
         }
         if manifest_digest is not None:
             workload_input["manifest_digest"] = manifest_digest
+        if content_manifest is not None:
+            workload_input["content_manifest"] = content_manifest
         workload_inputs[workload] = workload_input
         expected_model = job.get("compile_profile", template.get("compile_profile"))
         models = {row.compile_model for row in trace_rows}
@@ -1964,20 +2161,7 @@ def load_scenario(
                 payload = corpus_root / row.ii_relative
                 raw_digest = row.raw_sha256
                 if schema == "icecream-experiment-v2":
-                    if not payload.is_file():
-                        raise ValueError(
-                            f"{workload}: v2 payload is absent for TU {row.logical}: {payload}"
-                        )
-                    if payload.stat().st_size != row.raw_bytes:
-                        raise ValueError(
-                            f"{workload}: payload size differs for TU {row.logical}"
-                        )
-                    observed_digest = sha256(payload)
-                    if raw_digest is not None and raw_digest != observed_digest:
-                        raise ValueError(
-                            f"{workload}: payload digest differs for TU {row.logical}"
-                        )
-                    raw_digest = observed_digest
+                    raw_digest = verified_digests[row.logical]
                 items.append(
                     WorkItem(
                         next_ordinal,
@@ -1991,6 +2175,7 @@ def load_scenario(
                         row.compile_ns,
                         release_offset,
                         raw_digest,
+                        row.compile_provenance,
                     )
                 )
                 next_ordinal += 1
@@ -2001,17 +2186,26 @@ def load_scenario(
     route_trace: dict[int, RouteTraceEntry] = {}
     route_trace_path: Path | None = None
     route_trace_digest: str | None = None
+    route_trace_identity: str | None = None
+    route_trace_codec: str | None = None
+    route_trace_provenance: str | None = None
     runtime = document.get("v2_runtime", {})
     if isinstance(runtime, dict) and runtime.get("assignment_source") == "route_trace":
         route_value = runtime.get("route_trace")
         if not isinstance(route_value, str) or not route_value:
             raise ValueError("route_trace assignment requires topology.route_trace")
+        route_trace_identity = canonical_relative_identity(
+            route_value, "topology.route_trace"
+        )
+        if selected_adapter is None:
+            raise ValueError("route_trace requires an implemented selected adapter")
         route_trace_path = Path(route_value)
         if not route_trace_path.is_absolute():
             route_trace_path = (path.parent / route_trace_path).resolve()
-        route_trace, route_trace_digest = load_route_trace(
-            route_trace_path, scenario_digest, work_items, f_count
+        route_trace, route_trace_digest, route_trace_provenance = load_route_trace(
+            route_trace_path, scenario_digest, work_items, f_count, selected_adapter
         )
+        route_trace_codec = selected_adapter
     return LoadedScenario(
         document,
         manifest,
@@ -2023,6 +2217,9 @@ def load_scenario(
         route_trace,
         route_trace_path,
         route_trace_digest,
+        route_trace_identity,
+        route_trace_codec,
+        route_trace_provenance,
     )
 
 
@@ -2331,7 +2528,7 @@ class Simulator:
         start_ns: Fraction | int | None = None,
         end_ns: Fraction | int | None = None,
         transition: str = "instant",
-        provenance: str | None = None,
+        provenance: Mapping[str, str] | None = None,
     ) -> None:
         item = tx.item if tx is not None else item
         event_worker = tx.worker if tx is not None else worker
@@ -2358,6 +2555,12 @@ class Simulator:
         trace_entry = (
             None if item is None else self.scenario.route_trace.get(item.ordinal)
         )
+        if (
+            trace_entry is not None
+            and event_worker is not None
+            and trace_entry.worker != event_worker
+        ):
+            raise RuntimeError("route event worker differs from its trace identity")
         logical_job_id = (
             None
             if item is None
@@ -2419,29 +2622,71 @@ class Simulator:
                         else self.f_store_guids[event_worker]
                     )
                 ),
-                "session_serial": None if event_worker is None else 1,
+                "session_serial": (
+                    None
+                    if event_worker is None
+                    else (trace_entry.session_serial if trace_entry is not None else 1)
+                ),
                 "HISTORY_NONCE": (
                     None
                     if item is None or event_worker is None
-                    else int(
-                        stable_hex(
-                            "history-nonce",
-                            self.scenario.scenario_digest,
-                            item.environment,
-                            event_worker,
-                            digits=16,
-                        ),
-                        16,
+                    else (
+                        trace_entry.history_nonce
+                        if trace_entry is not None
+                        else int(
+                            stable_hex(
+                                "history-nonce",
+                                self.scenario.scenario_digest,
+                                item.environment,
+                                event_worker,
+                                digits=16,
+                            ),
+                            16,
+                        )
                     )
                 ),
-                "REL_SEQ": None,
+                "REL_SEQ": (
+                    trace_entry.rel_seq
+                    if trace_entry is not None and event_worker is not None
+                    else None
+                ),
                 "TU_SEQ": event_tu_seq,
                 "transaction_digest": None,
                 "InputRecord_identity": None,
             }
-        event_provenance = provenance or (
-            "observed" if phase is not None and self.adapter.physical else "modeled"
-        )
+        event_provenance = {
+            "timing": "modeled",
+            "byte_delta": (
+                "modeled"
+                if phase is not None and phase.account == "environment"
+                else (
+                    "observed"
+                    if phase is not None
+                    and self.adapter.physical
+                    and (c_to_f_byte_delta or f_to_c_byte_delta)
+                    else "derived"
+                )
+            ),
+            "route_identity": (
+                str(self.scenario.route_trace_provenance)
+                if trace_entry is not None
+                and event_worker is not None
+                and self.scenario.route_trace_provenance is not None
+                else "derived"
+            ),
+            "raw_digest": (
+                "observed"
+                if item is not None and item.raw_digest is not None
+                else "derived"
+            ),
+            "compile_duration_input": (
+                item.compile_provenance if item is not None else "derived"
+            ),
+            "resource_delta": "derived",
+            "queue_delta": "derived",
+        }
+        if provenance is not None:
+            event_provenance.update(provenance)
         self.events.append(
             {
                 "sequence": self.event_sequence,
@@ -2474,6 +2719,7 @@ class Simulator:
                 "end_ns": end_value,
                 "duration_ns": end_value - start_value,
                 "provenance": event_provenance,
+                "byte_account": account,
                 "c_to_f_byte_delta": c_to_f_byte_delta,
                 "f_to_c_byte_delta": f_to_c_byte_delta,
                 "resource_byte_delta": dict(
@@ -2815,7 +3061,6 @@ class Simulator:
             tx,
             phase,
             transition="start",
-            provenance="modeled",
         )
         self._start_flow(tx, phase)
 
@@ -2835,7 +3080,6 @@ class Simulator:
             start_ns=ensure.start_ns,
             end_ns=self.now,
             transition="finish",
-            provenance="modeled",
         )
         ensure.install_start_ns = self.now
         self.environment_status[route] = "installing"
@@ -2843,7 +3087,6 @@ class Simulator:
             "env_install_verify",
             ensure.owner,
             transition="start",
-            provenance="modeled",
         )
         ready_at = self.now + self.environment_install_verify_ns
         if ready_at == self.now:
@@ -2867,13 +3110,11 @@ class Simulator:
             start_ns=ensure.install_start_ns,
             end_ns=self.now,
             transition="finish",
-            provenance="modeled",
         )
         self.environment_status[route] = "resident"
         self._event(
             "environment_ready",
             ensure.owner,
-            provenance="modeled",
         )
         waiters = self.environment_waiters[route]
         while waiters:
@@ -3522,8 +3763,10 @@ class Simulator:
             else:
                 static_metadata.update(
                     {
-                        "route_trace": str(self.scenario.route_trace_path),
+                        "route_trace": self.scenario.route_trace_identity,
                         "route_trace_sha256": self.scenario.route_trace_sha256,
+                        "route_trace_codec": self.scenario.route_trace_codec,
+                        "route_trace_provenance": self.scenario.route_trace_provenance,
                     }
                 )
             metadata.update(static_metadata)
@@ -3814,6 +4057,7 @@ class Simulator:
 
     def _replay_closure(self) -> dict[str, object]:
         assignment_source = str(self.v2_runtime.get("assignment_source", "policy"))
+        ledger_summary = self.ledger.summary()
         if assignment_source == "route_trace":
             expected_routes: dict[tuple[int, int, str], list[int]] = defaultdict(
                 lambda: [0, 0, 0]
@@ -3824,9 +4068,17 @@ class Simulator:
             for tx in self.transactions:
                 entry = self.scenario.route_trace[tx.item.ordinal]
                 if (
-                    tx.worker != entry.worker
+                    tx.logical_job_id != entry.logical_job_id
+                    or tx.attempt_id != entry.attempt_id
+                    or tx.worker != entry.worker
                     or tx.tu_seq != entry.tu_seq
                     or tx.rel_seq != entry.rel_seq
+                    or tx.c_store_guid != entry.c_store_guid
+                    or tx.physical_endpoint != entry.physical_endpoint
+                    or tx.route_lane_id != entry.route_lane_id
+                    or tx.f_store_guid != entry.f_store_guid
+                    or tx.session_serial != entry.session_serial
+                    or tx.history_nonce != entry.history_nonce
                     or tx.c_to_f_bytes != entry.c_to_f_bytes
                     or tx.f_to_c_bytes != entry.f_to_c_bytes
                 ):
@@ -3845,23 +4097,70 @@ class Simulator:
                 observed[2] += tx.f_to_c_bytes
             if expected_routes != observed_routes:
                 raise RuntimeError("route-trace aggregate routes differ")
+            ledger_routes: dict[tuple[int, int], dict[str, dict[str, int]]] = (
+                defaultdict(
+                    lambda: {direction: defaultdict(int) for direction in DIRECTIONS}
+                )
+            )
+            for row in ledger_summary["routes"]:
+                ledger_routes[(row["environment"], row["worker"])][row["direction"]][
+                    row["account"]
+                ] += row["bytes"]
+            route_rows = []
+            for key, values in sorted(observed_routes.items()):
+                environment, worker, route_lane_id = key
+                entry = next(
+                    trace
+                    for tx in self.transactions
+                    if tx.item.environment == environment and tx.worker == worker
+                    for trace in (self.scenario.route_trace[tx.item.ordinal],)
+                    if trace.route_lane_id == route_lane_id
+                )
+                accounts = {
+                    account: {
+                        "c_to_f_bytes": ledger_routes[(environment, worker)][
+                            "c_to_f"
+                        ].get(account, 0),
+                        "f_to_c_bytes": ledger_routes[(environment, worker)][
+                            "f_to_c"
+                        ].get(account, 0),
+                    }
+                    for account in ("source", "environment", "result")
+                    if ledger_routes[(environment, worker)]["c_to_f"].get(account, 0)
+                    or ledger_routes[(environment, worker)]["f_to_c"].get(account, 0)
+                }
+                if (
+                    accounts.get("source", {}).get("c_to_f_bytes", 0) != values[1]
+                    or accounts.get("source", {}).get("f_to_c_bytes", 0) != values[2]
+                ):
+                    raise RuntimeError("route source totals differ from exact ledger")
+                route_rows.append(
+                    {
+                        "environment": environment,
+                        "worker": worker,
+                        "C_STORE_GUID": entry.c_store_guid,
+                        "physical_endpoint": entry.physical_endpoint,
+                        "RouteLaneId": route_lane_id,
+                        "F_STORE_GUID": entry.f_store_guid,
+                        "session_serial": entry.session_serial,
+                        "HISTORY_NONCE": entry.history_nonce,
+                        "tus": values[0],
+                        "accounts": accounts,
+                        "c_to_f_bytes": sum(
+                            account["c_to_f_bytes"] for account in accounts.values()
+                        ),
+                        "f_to_c_bytes": sum(
+                            account["f_to_c_bytes"] for account in accounts.values()
+                        ),
+                    }
+                )
             return {
                 "status": "pass",
                 "semantics": "exact-route",
                 "assignment_source": "route_trace",
-                "route_trace": str(self.scenario.route_trace_path),
+                "route_trace": self.scenario.route_trace_identity,
                 "route_trace_sha256": self.scenario.route_trace_sha256,
-                "routes": [
-                    {
-                        "environment": key[0],
-                        "worker": key[1],
-                        "RouteLaneId": key[2],
-                        "tus": values[0],
-                        "c_to_f_bytes": values[1],
-                        "f_to_c_bytes": values[2],
-                    }
-                    for key, values in sorted(observed_routes.items())
-                ],
+                "routes": route_rows,
             }
         expected_c_to_f = sum(tx.c_to_f_bytes for tx in self.transactions)
         expected_f_to_c = sum(tx.f_to_c_bytes for tx in self.transactions)
@@ -3878,8 +4177,10 @@ class Simulator:
             "status": "pass",
             "semantics": "aggregate-directional",
             "assignment_source": "policy",
-            "c_to_f_bytes": expected_c_to_f,
-            "f_to_c_bytes": expected_f_to_c,
+            "source_c_to_f_bytes": expected_c_to_f,
+            "source_f_to_c_bytes": expected_f_to_c,
+            "c_to_f_bytes": ledger_summary["directions"]["c_to_f"]["total_bytes"],
+            "f_to_c_bytes": ledger_summary["directions"]["f_to_c"]["total_bytes"],
         }
 
     def _capacity_floors(self, transactions: Sequence[Transaction]) -> dict[str, int]:
@@ -4219,7 +4520,11 @@ class Simulator:
                 else "icecream-distribution-result-v1"
             ),
             "scenario": self.scenario.document["name"],
-            "scenario_path": str(self.scenario.path),
+            "scenario_path": (
+                self.scenario.path.name
+                if self.scenario.is_v2
+                else str(self.scenario.path)
+            ),
             "scenario_sha256": self.scenario.scenario_digest,
             "scenario_digest": self.scenario.scenario_digest,
             "workload_inputs": self.scenario.workload_inputs,
@@ -4336,6 +4641,16 @@ class Simulator:
                 ],
             },
         }
+        if self.scenario.is_v2:
+            expected = self.v2_runtime["expected"]
+            summary.update(
+                {
+                    "selected_main_protocol": expected["selected_main_protocol"],
+                    "selected_cache_wire": expected["selected_cache_wire"],
+                    "selected_codec_profile": expected["selected_codec_profile"],
+                    "compile_result": "pass",
+                }
+            )
         return SimulationResult(
             summary,
             assignments,
@@ -4515,7 +4830,7 @@ def experiment_descriptor(
         "resolved_scenario": resolved,
         "workload_inputs": result.summary["workload_inputs"],
         "simulator": {
-            "source": str(Path(__file__).resolve()),
+            "source": "capability/distribution/run_scenario.py",
             "source_sha256": sha256(Path(__file__).resolve()),
         },
         "expected_summary": result.summary,
@@ -4555,7 +4870,7 @@ def experiment_descriptor(
                 "route_replay": result.summary["replay_closure"]["semantics"],
             },
             "simulator": {
-                "source": str(Path(__file__).resolve()),
+                "source": "capability/distribution/run_scenario.py",
                 "source_sha256": sha256(Path(__file__).resolve()),
             },
             "expected_summary": result.summary,
@@ -4792,6 +5107,7 @@ def write_route_trace(
             "schema": "icecream-route-trace-v1",
             "scenario_digest": scenario.scenario_digest,
             "codec_profile": profile,
+            "provenance": "modeled",
         }
     ]
     c_to_f = 0
@@ -4835,55 +5151,511 @@ def write_route_trace(
 
 
 def validate_experiment_jsonl(path: Path) -> dict[str, int]:
-    """Recompute the minimum v2 stream closure independently from its summary."""
+    """Independently replay every v2 identity and accounting claim in a stream."""
     rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
     if len(rows) < 3 or rows[0].get("record") != "execution":
         raise ValueError(f"{path}: v2 stream lacks its execution header")
-    if rows[0].get("schema") != "icecream-execution-v2":
-        raise ValueError(f"{path}: v2 stream has an unknown execution schema")
+    header = rows[0]
+    validate_json_schema(header, "execution.schema.json", f"{path}:execution")
+    manifest = header["scenario_manifest"]
+    validate_json_schema(
+        manifest, "experiment.schema.json", f"{path}:embedded scenario_manifest"
+    )
+    scenario_digest = canonical_json_sha256(manifest)
+    if header["scenario_digest"] != scenario_digest:
+        raise ValueError(f"{path}: embedded scenario manifest digest differs")
     if rows[-1].get("record") != "summary":
         raise ValueError(f"{path}: v2 stream lacks its final summary")
+    if rows[-1].get("schema") != "icecream-experiment-summary-v2":
+        raise ValueError(f"{path}: v2 stream has an unknown summary schema")
     final_summary = rows[-1].get("summary")
     if not isinstance(final_summary, dict):
         raise ValueError(f"{path}: final summary is not an object")
-    if rows[0].get("scenario_digest") != final_summary.get("scenario_digest"):
+    if scenario_digest != final_summary.get("scenario_digest"):
         raise ValueError(f"{path}: execution/scenario digest mismatch")
-    events = [event for row in rows[1:-1] for event in row.get("events", [])]
+    if header["expected_summary"] != final_summary:
+        raise ValueError(
+            f"{path}: execution expected_summary differs from final summary"
+        )
+    if header["identity_contract"] != list(EVENT_IDENTITY_FIELDS):
+        raise ValueError(f"{path}: execution identity contract differs from validator")
+    if header["workload_inputs"] != final_summary.get("workload_inputs"):
+        raise ValueError(f"{path}: execution/final workload inputs differ")
+
+    manifest_jobs = {job["id"]: job for job in manifest["workload"]["jobs"]}
+    workload_inputs = header["workload_inputs"]
+    if set(workload_inputs) != set(manifest_jobs):
+        raise ValueError(f"{path}: embedded workload set differs from manifest")
+    content_rows: dict[tuple[str, int], dict[str, object]] = {}
+    input_manifest_digests = []
+    for workload, job in manifest_jobs.items():
+        embedded = workload_inputs[workload]
+        if not isinstance(embedded, dict):
+            raise ValueError(f"{path}: workload input {workload!r} is not an object")
+        content_manifest = embedded.get("content_manifest")
+        validate_json_schema(
+            content_manifest,
+            "workload-input.schema.json",
+            f"{path}:workload {workload}",
+        )
+        digest = canonical_json_sha256(content_manifest)
+        if digest != job["manifest_digest"] or digest != embedded.get(
+            "manifest_digest"
+        ):
+            raise ValueError(f"{path}: workload {workload!r} content digest differs")
+        if (
+            embedded.get("trace") != job["trace"]
+            or embedded.get("corpus_root") != job["corpus_root"]
+        ):
+            raise ValueError(f"{path}: workload {workload!r} logical paths differ")
+        canonical_relative_identity(job["trace"], f"{workload}.trace")
+        canonical_relative_identity(
+            job["corpus_root"], f"{workload}.corpus_root", allow_dot=True
+        )
+        input_rows = content_manifest["rows"]
+        if embedded.get("trace_rows") != len(input_rows):
+            raise ValueError(f"{path}: workload {workload!r} trace row count differs")
+        if (
+            not isinstance(embedded.get("trace_sha256"), str)
+            or SHA256_RE.fullmatch(embedded["trace_sha256"]) is None
+        ):
+            raise ValueError(f"{path}: workload {workload!r} trace digest is invalid")
+        if [row["logical"] for row in input_rows] != list(range(len(input_rows))):
+            raise ValueError(
+                f"{path}: workload {workload!r} logical rows are not contiguous"
+            )
+        if len({row["job_id"] for row in input_rows}) != len(input_rows):
+            raise ValueError(f"{path}: workload {workload!r} repeats job identity")
+        for row in input_rows:
+            canonical_relative_identity(
+                row["ii_relative"],
+                f"{workload} trace row {row['logical']} ii_relative",
+            )
+            content_rows[(workload, row["logical"])] = row
+        input_manifest_digests.append(digest)
+    if sorted(header["input_manifest_digests"]) != sorted(set(input_manifest_digests)):
+        raise ValueError(f"{path}: execution input manifest digests do not reconcile")
+
+    selected_main_protocol = min(
+        component["main_protocol"] for component in manifest["components"].values()
+    )
+    expected = manifest["expected"]
+    selected_claims = {
+        "selected_main_protocol": selected_main_protocol,
+        "selected_cache_wire": manifest["capabilities"]["cache_wire"],
+        "selected_codec_profile": manifest["capabilities"]["codec_profile"],
+        "compile_result": "pass",
+    }
+    if expected != selected_claims:
+        raise ValueError(f"{path}: manifest expected outcome does not reconcile")
+    for name, value in selected_claims.items():
+        if final_summary.get(name) != value:
+            raise ValueError(f"{path}: final {name} differs from selected outcome")
+    selected_adapter = selected_v2_adapter(manifest)
+    if selected_adapter is None or header["codec_adapter"] != selected_adapter:
+        raise ValueError(f"{path}: execution codec adapter differs from manifest")
+    if final_summary.get("codec_adapter") != selected_adapter:
+        raise ValueError(f"{path}: final codec adapter differs from manifest")
+    routing = final_summary.get("routing", {})
+    if manifest["topology"]["assignment_source"] == "route_trace":
+        if routing.get("route_trace") != manifest["topology"]["route_trace"]:
+            raise ValueError(f"{path}: route-trace logical identity differs")
+        if routing.get("route_trace_codec") != selected_adapter:
+            raise ValueError(f"{path}: route-trace codec differs from selected adapter")
+        if routing.get("route_trace_provenance") not in {"observed", "modeled"}:
+            raise ValueError(f"{path}: route-trace provenance is invalid")
+
+    timeline_rows = rows[1:-1]
+    if rows[-1].get("timeline_records") != len(timeline_rows):
+        raise ValueError(f"{path}: final timeline record count differs")
+    if final_summary.get("timeline_records") != len(timeline_rows):
+        raise ValueError(f"{path}: summary timeline record count differs")
+    events: list[dict[str, object]] = []
+    for row_number, row in enumerate(timeline_rows, start=2):
+        if row.get("record") not in {"snapshot", "gap"}:
+            raise ValueError(f"{path}:{row_number}: unknown timeline record")
+        event_rows = row.get("events")
+        if not isinstance(event_rows, list):
+            raise ValueError(f"{path}:{row_number}: timeline events are not an array")
+        events.extend(event_rows)
     if [event.get("sequence") for event in events] != list(range(len(events))):
         raise ValueError(f"{path}: event sequence is not contiguous")
-    c_to_f = 0
-    f_to_c = 0
+    if rows[-1].get("event_count") != len(events):
+        raise ValueError(f"{path}: final event count differs")
+
+    try:
+        import jsonschema
+    except ImportError as error:  # pragma: no cover - packaging/environment diagnostic
+        raise RuntimeError("v2 validation requires Python jsonschema") from error
+    event_schema = json.loads(Path(__file__).with_name("event.schema.json").read_text())
+    event_validator = jsonschema.Draft202012Validator(event_schema)
+    directional: dict[str, dict[str, int]] = {
+        direction: defaultdict(int) for direction in DIRECTIONS
+    }
+    directional_by_route: dict[tuple[str, int, int, str], int] = defaultdict(int)
     resources: dict[str, int] = defaultdict(int)
+    resource_credited: dict[str, int] = defaultdict(int)
+    resource_debited: dict[str, int] = defaultdict(int)
+    resource_peak: dict[str, int] = defaultdict(int)
     queues: dict[str, int] = defaultdict(int)
-    for event in events:
+    queue_credited: dict[str, int] = defaultdict(int)
+    queue_debited: dict[str, int] = defaultdict(int)
+    queue_peak: dict[str, int] = defaultdict(int)
+    resource_names: set[str] = set()
+    queue_names: set[str] = set()
+    route_identities: dict[tuple[int, int], tuple[object, ...]] = {}
+    transaction_identities: dict[tuple[str, str], tuple[object, ...]] = {}
+    transaction_digests: dict[tuple[str, str], tuple[object, object]] = {}
+    dispatches_by_route: dict[tuple[int, int], int] = defaultdict(int)
+
+    def apply_history(
+        deltas: Mapping[str, object],
+        balances: dict[str, int],
+        credited: dict[str, int],
+        debited: dict[str, int],
+        peaks: dict[str, int],
+        names: set[str],
+        kind: str,
+    ) -> None:
+        for name, raw_delta in deltas.items():
+            delta = int(raw_delta)
+            names.add(name)
+            balances[name] += delta
+            if balances[name] < 0:
+                raise ValueError(f"{path}: {kind} {name} became negative")
+            if delta >= 0:
+                credited[name] += delta
+            else:
+                debited[name] -= delta
+            peaks[name] = max(peaks[name], balances[name])
+
+    for event_index, event in enumerate(events):
+        failures = sorted(
+            event_validator.iter_errors(event), key=lambda failure: list(failure.path)
+        )
+        if failures:
+            failure = failures[0]
+            location = ".".join(str(part) for part in failure.absolute_path) or "<root>"
+            raise ValueError(
+                f"{path}:event {event_index} schema error at {location}: {failure.message}"
+            )
         missing = [field for field in EVENT_IDENTITY_FIELDS if field not in event]
         if missing:
             raise ValueError(f"{path}: event lacks M3 fields {missing}")
-        c_to_f += checked_nonnegative_int(
+        if event["end_ns"] - event["start_ns"] != event["duration_ns"]:
+            raise ValueError(f"{path}: event {event_index} duration does not reconcile")
+        if event["time_ns"] != event["end_ns"]:
+            raise ValueError(f"{path}: event {event_index} time/end differ")
+        workload = event["workload"]
+        logical = event["logical"]
+        if workload != "":
+            content = content_rows.get((workload, logical))
+            if content is None:
+                raise ValueError(f"{path}: event refers to unknown workload TU")
+            if event["raw_digest"] != content["raw_sha256"]:
+                raise ValueError(
+                    f"{path}: event raw digest differs from input manifest"
+                )
+            if event["provenance"]["raw_digest"] != "observed":
+                raise ValueError(f"{path}: event raw digest provenance is not observed")
+            if (
+                event["provenance"]["compile_duration_input"]
+                != content["compile_provenance"]
+            ):
+                raise ValueError(
+                    f"{path}: event compile-duration provenance differs from input"
+                )
+            job = manifest_jobs[workload]
+            expected_logical_job_id = "job-" + stable_hex(
+                "logical-job",
+                scenario_digest,
+                job["c_index"],
+                workload,
+                event["build"],
+                content["job_id"],
+                digits=32,
+            )
+            if (
+                event["logical_job_id"] != expected_logical_job_id
+                or event["attempt_id"] != f"{expected_logical_job_id}:attempt-0"
+            ):
+                raise ValueError(f"{path}: event logical/attempt identity differs")
+        elif event["raw_digest"] is not None:
+            raise ValueError(f"{path}: non-TU event carries a raw digest")
+        if event["provenance"]["timing"] != "modeled":
+            raise ValueError(f"{path}: simulated event timing is not marked modeled")
+
+        c_to_f = checked_nonnegative_int(
             event["c_to_f_byte_delta"], "event c_to_f_byte_delta"
         )
-        f_to_c += checked_nonnegative_int(
+        f_to_c = checked_nonnegative_int(
             event["f_to_c_byte_delta"], "event f_to_c_byte_delta"
         )
-        for name, delta in event["resource_byte_delta"].items():
-            resources[name] += int(delta)
-            if resources[name] < 0:
-                raise ValueError(f"{path}: resource {name} became negative")
-        for name, delta in event["queue_byte_delta"].items():
-            queues[name] += int(delta)
-            if queues[name] < 0:
-                raise ValueError(f"{path}: queue {name} became negative")
+        account = event["byte_account"]
+        expected_byte_provenance = (
+            "modeled"
+            if event["phase"] != "" and account == "environment"
+            else (
+                "observed"
+                if (c_to_f or f_to_c) and header["physical_codec_result"]
+                else "derived"
+            )
+        )
+        if event["provenance"]["byte_delta"] != expected_byte_provenance:
+            raise ValueError(f"{path}: event byte provenance differs")
+        if (
+            event["provenance"]["resource_delta"] != "derived"
+            or event["provenance"]["queue_delta"] != "derived"
+        ):
+            raise ValueError(f"{path}: event resource/queue provenance differs")
+        directional["c_to_f"][account] += c_to_f
+        directional["f_to_c"][account] += f_to_c
+        if c_to_f or f_to_c:
+            if not isinstance(event["environment"], int) or not isinstance(
+                event["worker"], int
+            ):
+                raise ValueError(f"{path}: directional event has no physical route")
+            directional_by_route[
+                ("c_to_f", event["environment"], event["worker"], account)
+            ] += c_to_f
+            directional_by_route[
+                ("f_to_c", event["environment"], event["worker"], account)
+            ] += f_to_c
+        if isinstance(event["worker"], int):
+            route = (event["environment"], event["worker"])
+            identity = tuple(
+                event[name]
+                for name in (
+                    "C_STORE_GUID",
+                    "physical_endpoint",
+                    "RouteLaneId",
+                    "F_STORE_GUID",
+                    "session_serial",
+                    "HISTORY_NONCE",
+                )
+            )
+            if any(value is None for value in identity):
+                raise ValueError(f"{path}: route event has incomplete identity")
+            established = route_identities.setdefault(route, identity)
+            if established != identity:
+                raise ValueError(
+                    f"{path}: event route identity drifted without transition"
+                )
+            transaction_key = (event["logical_job_id"], event["attempt_id"])
+            transaction_identity = identity + (event["REL_SEQ"], event["TU_SEQ"])
+            established_transaction = transaction_identities.setdefault(
+                transaction_key, transaction_identity
+            )
+            if established_transaction != transaction_identity:
+                raise ValueError(f"{path}: event transaction route identity drifted")
+            if event["transaction_digest"] is not None:
+                digest_identity = (
+                    event["transaction_digest"],
+                    event["InputRecord_identity"],
+                )
+                established_digest = transaction_digests.setdefault(
+                    transaction_key, digest_identity
+                )
+                if established_digest != digest_identity:
+                    raise ValueError(
+                        f"{path}: event transaction digest identity drifted"
+                    )
+            if manifest["topology"]["assignment_source"] == "route_trace":
+                if event["REL_SEQ"] is None:
+                    raise ValueError(f"{path}: route-trace event lacks REL_SEQ")
+                expected_route_provenance = final_summary["routing"].get(
+                    "route_trace_provenance"
+                )
+                if event["provenance"]["route_identity"] != expected_route_provenance:
+                    raise ValueError(
+                        f"{path}: route identity provenance differs from trace"
+                    )
+        if event["event"] == "dispatch":
+            dispatches_by_route[(event["environment"], event["worker"])] += 1
+        apply_history(
+            event["resource_byte_delta"],
+            resources,
+            resource_credited,
+            resource_debited,
+            resource_peak,
+            resource_names,
+            "resource",
+        )
+        apply_history(
+            event["queue_byte_delta"],
+            queues,
+            queue_credited,
+            queue_debited,
+            queue_peak,
+            queue_names,
+            "queue",
+        )
     if any(resources.values()) or any(queues.values()):
         raise ValueError(f"{path}: resource or queue byte ledger remains open")
     ledger = final_summary.get("exact_byte_ledger", {})
-    directions = ledger.get("directions", {}) if isinstance(ledger, dict) else {}
-    if c_to_f != directions.get("c_to_f", {}).get("total_bytes"):
-        raise ValueError(f"{path}: C-to-F byte ledger does not reconcile")
-    if f_to_c != directions.get("f_to_c", {}).get("total_bytes"):
-        raise ValueError(f"{path}: F-to-C byte ledger does not reconcile")
-    if final_summary.get("replay_closure", {}).get("status") != "pass":
+    if not isinstance(ledger, dict) or ledger.get("closure") != "pass":
+        raise ValueError(f"{path}: exact byte ledger does not claim closure")
+    directions = ledger.get("directions", {})
+    direction_totals: dict[str, int] = {}
+    for direction in DIRECTIONS:
+        accounts = {
+            name: count
+            for name, count in sorted(directional[direction].items())
+            if count
+        }
+        total = sum(accounts.values())
+        if directions.get(direction) != {
+            "accounts": accounts,
+            "total_bytes": total,
+        }:
+            raise ValueError(f"{path}: {direction} account summary does not reconcile")
+        direction_totals[direction] = total
+    expected_route_rows = [
+        {
+            "direction": direction,
+            "environment": environment,
+            "worker": worker,
+            "account": account,
+            "bytes": byte_count,
+        }
+        for (direction, environment, worker, account), byte_count in sorted(
+            directional_by_route.items()
+        )
+        if byte_count
+    ]
+    if ledger.get("routes") != expected_route_rows:
+        raise ValueError(f"{path}: per-route directional ledger does not reconcile")
+
+    def expected_balance_rows(
+        names: set[str],
+        balances: Mapping[str, int],
+        credited: Mapping[str, int],
+        debited: Mapping[str, int],
+        peaks: Mapping[str, int],
+    ) -> list[dict[str, object]]:
+        return [
+            {
+                "name": name,
+                "credited_bytes": credited.get(name, 0),
+                "debited_bytes": debited.get(name, 0),
+                "peak_bytes": peaks.get(name, 0),
+                "final_bytes": balances.get(name, 0),
+            }
+            for name in sorted(names)
+        ]
+
+    if ledger.get("resources") != expected_balance_rows(
+        resource_names,
+        resources,
+        resource_credited,
+        resource_debited,
+        resource_peak,
+    ):
+        raise ValueError(f"{path}: resource history summary does not reconcile")
+    if ledger.get("queues") != expected_balance_rows(
+        queue_names, queues, queue_credited, queue_debited, queue_peak
+    ):
+        raise ValueError(f"{path}: queue history summary does not reconcile")
+
+    source_c_to_f = directional["c_to_f"].get("source", 0)
+    source_f_to_c = directional["f_to_c"].get("source", 0)
+    environment_c_to_f = directional["c_to_f"].get("environment", 0)
+    if final_summary.get("c_to_f_bytes") != source_c_to_f:
+        raise ValueError(f"{path}: source C-to-F summary differs")
+    if final_summary.get("f_to_c_bytes") != source_f_to_c:
+        raise ValueError(f"{path}: source F-to-C summary differs")
+    if final_summary.get("scored_outgoing_bytes") != source_c_to_f:
+        raise ValueError(f"{path}: scored outgoing bytes differ")
+    if final_summary.get("environment_c_to_f_bytes") != environment_c_to_f:
+        raise ValueError(f"{path}: environment C-to-F summary differs")
+    if final_summary.get("network_c_to_f_bytes") != direction_totals["c_to_f"]:
+        raise ValueError(f"{path}: network C-to-F summary differs")
+    if final_summary.get("network_f_to_c_bytes") != direction_totals["f_to_c"]:
+        raise ValueError(f"{path}: network F-to-C summary differs")
+
+    replay = final_summary.get("replay_closure", {})
+    if replay.get("status") != "pass":
         raise ValueError(f"{path}: route replay did not close")
-    return {"events": len(events), "c_to_f_bytes": c_to_f, "f_to_c_bytes": f_to_c}
+    if replay.get("semantics") == "exact-route":
+        replay_routes = replay.get("routes")
+        if not isinstance(replay_routes, list):
+            raise ValueError(f"{path}: exact replay routes are absent")
+        seen_routes: set[tuple[int, int]] = set()
+        replay_c_to_f = 0
+        replay_f_to_c = 0
+        for row in replay_routes:
+            route = (row["environment"], row["worker"])
+            if route in seen_routes:
+                raise ValueError(f"{path}: exact replay repeats a route")
+            seen_routes.add(route)
+            identity = route_identities.get(route)
+            if (
+                identity is None
+                or tuple(
+                    row[name]
+                    for name in (
+                        "C_STORE_GUID",
+                        "physical_endpoint",
+                        "RouteLaneId",
+                        "F_STORE_GUID",
+                        "session_serial",
+                        "HISTORY_NONCE",
+                    )
+                )
+                != identity
+            ):
+                raise ValueError(f"{path}: exact replay route identity differs")
+            accounts = {
+                account: {
+                    "c_to_f_bytes": directional_by_route.get(
+                        ("c_to_f", route[0], route[1], account), 0
+                    ),
+                    "f_to_c_bytes": directional_by_route.get(
+                        ("f_to_c", route[0], route[1], account), 0
+                    ),
+                }
+                for account in ("source", "environment", "result")
+                if directional_by_route.get(("c_to_f", route[0], route[1], account), 0)
+                or directional_by_route.get(("f_to_c", route[0], route[1], account), 0)
+            }
+            route_c_to_f = sum(value["c_to_f_bytes"] for value in accounts.values())
+            route_f_to_c = sum(value["f_to_c_bytes"] for value in accounts.values())
+            if row.get("accounts") != accounts:
+                raise ValueError(f"{path}: exact replay route accounts differ")
+            if (
+                row.get("c_to_f_bytes") != route_c_to_f
+                or row.get("f_to_c_bytes") != route_f_to_c
+            ):
+                raise ValueError(f"{path}: exact replay route totals differ")
+            if row.get("tus") != dispatches_by_route.get(route, 0):
+                raise ValueError(f"{path}: exact replay route TU count differs")
+            replay_c_to_f += route_c_to_f
+            replay_f_to_c += route_f_to_c
+        if seen_routes != set(dispatches_by_route):
+            raise ValueError(f"{path}: exact replay route set differs")
+        if (
+            replay_c_to_f != direction_totals["c_to_f"]
+            or replay_f_to_c != direction_totals["f_to_c"]
+        ):
+            raise ValueError(f"{path}: exact replay aggregate totals differ")
+    elif replay.get("semantics") == "aggregate-directional":
+        if (
+            replay.get("source_c_to_f_bytes") != source_c_to_f
+            or replay.get("source_f_to_c_bytes") != source_f_to_c
+        ):
+            raise ValueError(f"{path}: policy replay source totals differ")
+        if (
+            replay.get("c_to_f_bytes") != direction_totals["c_to_f"]
+            or replay.get("f_to_c_bytes") != direction_totals["f_to_c"]
+        ):
+            raise ValueError(f"{path}: policy replay directional totals differ")
+    else:
+        raise ValueError(f"{path}: replay closure semantics are unknown")
+    return {
+        "events": len(events),
+        "c_to_f_bytes": direction_totals["c_to_f"],
+        "f_to_c_bytes": direction_totals["f_to_c"],
+    }
 
 
 def write_result(
@@ -4960,15 +5732,11 @@ def main() -> int:
     if scenario.is_v2:
         if args.execution is None:
             raise ValueError("icecream-experiment-v2 requires --execution")
-        execution = load_execution(args.execution, scenario.scenario_digest)
+        execution = load_execution(args.execution, scenario)
         capabilities = scenario.manifest["capabilities"]
         assert isinstance(capabilities, dict)
         control = capabilities.get("experiment_control")
-        expected_adapter = {
-            "compile_only": "compile-only",
-            "raw": "raw",
-            "z3_shared_long_b1": None,
-        }.get(control, capabilities["codec_profile"])
+        expected_adapter = selected_v2_adapter(scenario.manifest)
         if expected_adapter is None:
             raise ValueError(
                 f"experiment control {control!r} is a declared future control, not an R4 codec"

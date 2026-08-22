@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import copy
 import importlib.util
 import json
 import sys
@@ -153,6 +154,18 @@ def write_v2_fixture(
 ) -> Path:
     legacy_path = write_fixture(root, durations, sizes, workers)
     legacy = json.loads(legacy_path.read_text())
+    (root / "trace.tsv").write_text(
+        "logical\tjob_id\tii_relative\traw_bytes\tcompile_ns\tcompile_model\t"
+        "raw_sha256\tcompile_provenance\n"
+        + "".join(
+            f"{logical}\tj{logical}\tj{logical}.ii\t{size}\t{duration}\ttest-model\t"
+            f"{sim.sha256(root / f'j{logical}.ii')}\tmodeled\n"
+            for logical, (duration, size) in enumerate(zip(durations, sizes))
+        )
+    )
+    content_manifest = sim.workload_content_manifest(
+        sim.read_trace(root / "trace.tsv", require_content_identity=True)
+    )
     document = {
         "schema": "icecream-experiment-v2",
         "name": "v2-test",
@@ -182,8 +195,8 @@ def write_v2_fixture(
                     "id": "test",
                     "c_index": 0,
                     "trace": "trace.tsv",
-                    "corpus_root": str(root),
-                    "manifest_digest": sim.sha256(root / "trace.tsv"),
+                    "corpus_root": ".",
+                    "manifest_digest": sim.canonical_json_sha256(content_manifest),
                     "compile_profile": "test-model",
                     "build_epochs": 1,
                     "build_release": {"mode": "after-previous"},
@@ -225,7 +238,7 @@ def execution_for(path: Path) -> dict[str, object]:
         "source_commit": "5" * 40,
         "simulator_commit": "6" * 40,
         "codec_executable_digest": "7" * 64,
-        "input_manifest_digests": [sim.sha256(path.parent / "trace.tsv")],
+        "input_manifest_digests": [scenario["workload"]["jobs"][0]["manifest_digest"]],
         "image_identifiers": ["test-image@sha256:" + "2" * 64],
         "compiler_versions": ["test-compiler 1"],
         "library_versions": [],
@@ -246,6 +259,7 @@ def add_route_trace(path: Path, workers: list[int], sizes: list[int]) -> Path:
             "schema": "icecream-route-trace-v1",
             "scenario_digest": digest,
             "codec_profile": "raw",
+            "provenance": "modeled",
         }
     ]
     for logical, (worker, size) in enumerate(zip(workers, sizes)):
@@ -1296,12 +1310,281 @@ class SimulatorTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "schema error"):
                 sim.validate_json_schema(document, "experiment.schema.json", "bad-mode")
 
+    def test_v2_schema_rejects_obsolete_stream_labels(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_v2_fixture(root, [1], [1], workers=1)
+            for profile in ("stream_a", "stream_b"):
+                document = json.loads(path.read_text())
+                document["capabilities"].pop("experiment_control", None)
+                document["capabilities"]["codec_profile"] = profile
+                document["expected"]["selected_codec_profile"] = profile
+                with self.subTest(profile=profile), self.assertRaisesRegex(
+                    ValueError, "schema error"
+                ):
+                    sim.validate_json_schema(
+                        document, "experiment.schema.json", f"obsolete-{profile}"
+                    )
+
+    def test_v2_content_manifest_and_execution_bind_actual_payloads(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_v2_fixture(root, [1, 1], [4, 4], workers=1)
+            scenario = sim.load_scenario(path)
+            execution = execution_for(path)
+            execution["input_manifest_digests"] = ["f" * 64]
+            execution_path = root / "execution.json"
+            execution_path.write_text(json.dumps(execution))
+            with self.assertRaisesRegex(ValueError, "input_manifest_digests"):
+                sim.load_execution(execution_path, scenario)
+
+            original = (root / "j0.ii").read_bytes()
+            (root / "j0.ii").write_bytes(b"z" * len(original))
+            with self.assertRaisesRegex(ValueError, "payload digest"):
+                sim.load_scenario(path)
+
+            trace_rows = (root / "trace.tsv").read_text().splitlines()
+            fields = trace_rows[1].split("\t")
+            fields[-2] = sim.sha256(root / "j0.ii")
+            trace_rows[1] = "\t".join(fields)
+            (root / "trace.tsv").write_text("\n".join(trace_rows) + "\n")
+            with self.assertRaisesRegex(ValueError, "manifest_digest"):
+                sim.load_scenario(path)
+
+            fields[-2] = ""
+            trace_rows[1] = "\t".join(fields)
+            (root / "trace.tsv").write_text("\n".join(trace_rows) + "\n")
+            with self.assertRaisesRegex(ValueError, "lacks raw_sha256"):
+                sim.load_scenario(path)
+
+    def test_v2_expected_selection_and_compile_outcome_are_reconciled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_v2_fixture(root, [1], [1], workers=1)
+            document = json.loads(path.read_text())
+            document["expected"]["selected_main_protocol"] = 43
+            path.write_text(json.dumps(document))
+            with self.assertRaisesRegex(ValueError, "selected_main_protocol"):
+                sim.load_scenario(path)
+            document["expected"]["selected_main_protocol"] = 50
+            document["expected"]["compile_result"] = "definitive-failure"
+            path.write_text(json.dumps(document))
+            with self.assertRaisesRegex(ValueError, "schema error"):
+                sim.load_scenario(path)
+
+    def test_route_trace_binds_codec_and_stable_route_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_v2_fixture(root, [1, 1], [2, 3], workers=1)
+            route_path = add_route_trace(path, [0, 0], [2, 3])
+            rows = [json.loads(line) for line in route_path.read_text().splitlines()]
+            rows[0]["codec_profile"] = "p29"
+            route_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            with self.assertRaisesRegex(ValueError, "route trace codec"):
+                sim.load_scenario(path)
+
+            rows[0]["codec_profile"] = "raw"
+            rows[2]["session_serial"] += 1
+            route_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            with self.assertRaisesRegex(ValueError, "route identity drifted"):
+                sim.load_scenario(path)
+
+    def test_transaction_free_route_event_uses_trace_session_nonce_and_rel(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_v2_fixture(root, [1, 1], [2, 3], workers=1)
+            add_route_trace(path, [0, 0], [2, 3])
+            scenario = sim.load_scenario(path)
+            result = sim.Simulator(scenario, sim.RawAdapter()).run()
+            for event in result.events:
+                if event["event"] != "route-bound":
+                    continue
+                entry = scenario.route_trace[event["logical"]]
+                self.assertEqual(event["session_serial"], entry.session_serial)
+                self.assertEqual(event["HISTORY_NONCE"], entry.history_nonce)
+                self.assertEqual(event["REL_SEQ"], entry.rel_seq)
+                self.assertEqual(event["RouteLaneId"], entry.route_lane_id)
+
+    def test_exact_route_replay_includes_environment_but_not_source_score(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_v2_fixture(
+                root, [1, 1], [1, 1], workers=1, environment_state="absent"
+            )
+            document = json.loads(path.read_text())
+            document["topology"]["bandwidth"]["c_to_f"]["lanes_per_endpoint"] = 2
+            document["topology"]["bandwidth"]["shared_fabric_bps"] = 1_600
+            path.write_text(json.dumps(document, indent=2) + "\n")
+            add_route_trace(path, [0, 0], [1, 1])
+            scenario = sim.load_scenario(path)
+            result = sim.Simulator(scenario, sim.RawAdapter()).run()
+            route = result.summary["replay_closure"]["routes"][0]
+            self.assertEqual(route["accounts"]["source"]["c_to_f_bytes"], 2)
+            self.assertEqual(route["accounts"]["environment"]["c_to_f_bytes"], 100)
+            self.assertEqual(route["c_to_f_bytes"], 102)
+            self.assertEqual(result.summary["scored_outgoing_bytes"], 2)
+            self.assertEqual(result.summary["network_c_to_f_bytes"], 102)
+
+    def test_physical_byte_provenance_keeps_simulated_timing_separate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_v2_fixture(root, [1, 1], [10, 11], workers=1)
+            document = json.loads(path.read_text())
+            document["capabilities"] = {
+                "cache_wire": "v1",
+                "codec_profile": "p29",
+            }
+            document["expected"]["selected_codec_profile"] = "p29"
+            path.write_text(json.dumps(document, indent=2) + "\n")
+            scenario = sim.load_scenario(path)
+            ledger_path = write_physical_ledger(root / "physical.jsonl", path)
+            ledger_rows = [
+                json.loads(line) for line in ledger_path.read_text().splitlines()
+            ]
+            ledger_rows[0]["scenario_sha256"] = scenario.scenario_digest
+            ledger_path.write_text(
+                "".join(json.dumps(row) + "\n" for row in ledger_rows)
+            )
+            result = sim.Simulator(
+                scenario,
+                sim.PhysicalLedgerAdapter(
+                    ledger_path, scenario, "p29", assignment_closure="aggregate"
+                ),
+            ).run()
+            byte_events = [
+                event
+                for event in result.events
+                if event["c_to_f_byte_delta"] or event["f_to_c_byte_delta"]
+            ]
+            self.assertTrue(byte_events)
+            self.assertTrue(
+                all(
+                    event["provenance"]["byte_delta"] == "observed"
+                    for event in byte_events
+                )
+            )
+            self.assertTrue(
+                all(event["provenance"]["timing"] == "modeled" for event in byte_events)
+            )
+
+    def test_retained_stream_validator_rejects_each_independent_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_v2_fixture(root, [3, 2], [10, 11], workers=2)
+            add_route_trace(path, [1, 0], [10, 11])
+            scenario = sim.load_scenario(path)
+            result = sim.Simulator(scenario, sim.RawAdapter()).run()
+            output = root / "out"
+            sim.write_result(scenario, result, output, execution_for(path))
+            original = [
+                json.loads(line)
+                for line in (output / "experiment.jsonl").read_text().splitlines()
+            ]
+
+            def reject(
+                label: str,
+                mutate: object,
+                pattern: str,
+                *,
+                synchronize_summary: bool = False,
+            ) -> None:
+                candidate = copy.deepcopy(original)
+                mutate(candidate)
+                if synchronize_summary:
+                    candidate[0]["expected_summary"] = copy.deepcopy(
+                        candidate[-1]["summary"]
+                    )
+                candidate_path = root / f"bad-{label}.jsonl"
+                candidate_path.write_text(
+                    "".join(json.dumps(row) + "\n" for row in candidate)
+                )
+                with self.subTest(label=label), self.assertRaisesRegex(
+                    ValueError, pattern
+                ):
+                    sim.validate_experiment_jsonl(candidate_path)
+
+            reject(
+                "manifest",
+                lambda rows: rows[0]["scenario_manifest"].__setitem__(
+                    "name", "changed"
+                ),
+                "embedded scenario manifest digest",
+            )
+            reject(
+                "scenario-digest",
+                lambda rows: rows[0].__setitem__("scenario_digest", "f" * 64),
+                "embedded scenario manifest digest",
+            )
+            reject(
+                "input-digests",
+                lambda rows: rows[0].__setitem__("input_manifest_digests", ["f" * 64]),
+                "input manifest digests",
+            )
+
+            def mutate_provenance(rows: list[dict[str, object]]) -> None:
+                rows[1]["events"][0]["provenance"]["timing"] = "invalid"
+
+            reject("provenance", mutate_provenance, "schema error")
+
+            def reroute_byte(rows: list[dict[str, object]]) -> None:
+                for timeline in rows[1:-1]:
+                    for event in timeline["events"]:
+                        if event["c_to_f_byte_delta"]:
+                            event["worker"] = 1 - event["worker"]
+                            return
+
+            reject("direction-route", reroute_byte, "route identity|per-route")
+
+            def drift_resource(rows: list[dict[str, object]]) -> None:
+                rows[-1]["summary"]["exact_byte_ledger"]["resources"][0][
+                    "peak_bytes"
+                ] += 1
+
+            reject(
+                "resource-history",
+                drift_resource,
+                "resource history summary",
+                synchronize_summary=True,
+            )
+            reject(
+                "event-count",
+                lambda rows: rows[-1].__setitem__(
+                    "event_count", rows[-1]["event_count"] + 1
+                ),
+                "event count",
+            )
+
+            def drift_replay(rows: list[dict[str, object]]) -> None:
+                rows[-1]["summary"]["replay_closure"]["routes"][0]["c_to_f_bytes"] += 1
+
+            reject(
+                "replay-route",
+                drift_replay,
+                "exact replay route totals",
+                synchronize_summary=True,
+            )
+
+    def test_v2_stream_is_identical_in_two_checkout_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            streams = []
+            for checkout in (parent / "checkout-a", parent / "checkout-b"):
+                checkout.mkdir()
+                path = write_v2_fixture(checkout, [3, 2], [10, 11], workers=2)
+                add_route_trace(path, [1, 0], [10, 11])
+                scenario = sim.load_scenario(path)
+                result = sim.Simulator(scenario, sim.RawAdapter()).run()
+                output = checkout / "out"
+                sim.write_result(scenario, result, output, execution_for(path))
+                streams.append((output / "experiment.jsonl").read_bytes())
+            self.assertEqual(streams[0], streams[1])
+
     def test_retained_r4_sample_validates_and_replays(self) -> None:
         root = MODULE_PATH.parent / "samples" / "r4-minimum"
         scenario = sim.load_scenario(root / "experiment.json")
-        execution = sim.load_execution(
-            root / "execution.json", scenario.scenario_digest
-        )
+        execution = sim.load_execution(root / "execution.json", scenario)
         self.assertEqual(execution["mode"], "simulated")
         result = sim.Simulator(scenario, sim.RawAdapter()).run()
         self.assertEqual(result.summary["replay_closure"]["semantics"], "exact-route")

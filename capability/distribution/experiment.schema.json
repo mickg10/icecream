@@ -31,8 +31,7 @@
         "cache_wire": { "enum": ["off", "v1"] },
         "codec_profile": {
           "enum": [
-            "legacy", "zstd_tu", "stream_a", "stream_b", "p29", "grz",
-            "z3_long", "z3_shared_long"
+            "legacy", "zstd_tu", "p29", "grz", "z3_long", "z3_shared_long"
           ]
         },
         "experiment_control": {
@@ -148,7 +147,7 @@
         "selected_main_protocol": { "enum": [43, 50] },
         "selected_cache_wire": { "enum": ["off", "v1"] },
         "selected_codec_profile": { "$ref": "#/$defs/codec" },
-        "compile_result": { "type": "string", "minLength": 1 }
+        "compile_result": { "const": "pass" }
       }
     }
   },
@@ -157,8 +156,7 @@
     "commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
     "codec": {
       "enum": [
-        "legacy", "zstd_tu", "stream_a", "stream_b", "p29", "grz",
-        "z3_long", "z3_shared_long"
+        "legacy", "zstd_tu", "p29", "grz", "z3_long", "z3_shared_long"
       ]
     },
     "component": {

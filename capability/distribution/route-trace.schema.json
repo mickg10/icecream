@@ -5,12 +5,15 @@
   "oneOf": [
     {
       "type": "object", "additionalProperties": false,
-      "required": ["record", "schema", "scenario_digest", "codec_profile"],
+      "required": [
+        "record", "schema", "scenario_digest", "codec_profile", "provenance"
+      ],
       "properties": {
         "record": { "const": "route_trace" },
         "schema": { "const": "icecream-route-trace-v1" },
         "scenario_digest": { "$ref": "#/$defs/sha256" },
-        "codec_profile": { "type": "string", "minLength": 1 }
+        "codec_profile": { "type": "string", "minLength": 1 },
+        "provenance": { "enum": ["observed", "modeled"] }
       }
     },
     {
