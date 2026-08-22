@@ -6,6 +6,8 @@ form of process accounting in there.
 Required Libraries
 ==================
 Note: The package name may vary by distro
+* C++23 compiler and standard library
+* Boost 1.74 or newer with Boost.Asio coroutine support
 * libcap-ng-devel
 * libarchive-devel
 * lzo-devel
@@ -19,6 +21,9 @@ cd icecream
 ./configure --prefix=/opt/icecream
 make
 make install
+
+If Boost is installed outside the compiler's default include and library paths,
+pass `--with-boost=PREFIX` to configure.
 
 WARNING: Make sure you specify a prefix, otherwise icecream
 might override your gcc installation! You will need to use this
