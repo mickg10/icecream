@@ -1,9 +1,9 @@
 # P48 to Protocol-50 product convergence
 
-This branch is the final standalone Protocol-50 endpoint convergence onto the accepted P48
-product. It deliberately does not attach that endpoint to scheduler, daemon, wrapper, or
-compiler-pipe paths; those connections are M3. The P48 and R2 source histories have no Git
-merge base, so every transplanted layer and resolution is recorded below.
+This branch is the standalone Protocol-50 endpoint/core convergence substep onto the accepted
+P48 product. It does not complete Epoch 2 / M2.5 and does not attach the endpoint to scheduler,
+daemon, wrapper, or compiler-pipe paths. The P48 and R2 source histories have no Git merge
+base, so every transplanted layer and resolution is recorded below.
 
 ## Fixed accepted inputs
 
@@ -108,11 +108,28 @@ Every pre-existing P48 file under `scheduler/`, `daemon/`, `client/`, `compilerw
 Top-level and subdirectory Automake/configure inputs differ only where the new standalone
 cache library, dependencies, tests, and distribution inventory require registration.
 
+## Remaining Epoch 2 / M2.5 sequence
+
+This head stops after placing the corrected M2 endpoint/core on the P48 product base. Four
+ordered, separately reviewable product commits still precede M3:
+
+1. add P49 scheduler-to-worker assignment preparation/revocation and bump the negotiated main
+   protocol from 48 to 49 in that same commit;
+2. add P50 end-to-end assignment identity and bump the negotiated main protocol from 49 to 50
+   in that same commit;
+3. add inert cache-endpoint capability advertisement, gated on negotiated main protocol 50,
+   without enabling cache-input selection; and
+4. set the development package identity to 1.5.90 only after the preceding unified product
+   commits and their core-inheritance gates pass.
+
+The main-protocol bumps travel with the behavior they gate so each intermediate commit can
+negotiate and test its own wire contract. The package-version change remains last.
+
 ## M3 boundary
 
-This head provides a standalone, tested loopback endpoint. M3 still owns assignment identity,
-cache advertisement and selection, daemon/wrapper attachment, compiler input piping,
-compiled-result attachment, endpoint process lifetime, fallback selection, persistence,
+M3 begins only after the remaining Epoch 2 / M2.5 sequence and its core-inheritance gate pass.
+M3 then owns daemon/wrapper attachment, compiler input piping, compiled-result attachment,
+endpoint process lifetime, cache capability selection, fallback selection, persistence,
 eviction, restart, and reroute integration. None of those product paths is implemented here.
 
 ## Required convergence gates
