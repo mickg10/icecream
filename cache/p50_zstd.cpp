@@ -2,6 +2,10 @@
 
 #include <zstd.h>
 
+#if ZSTD_VERSION_NUMBER < 10400
+#error "Protocol-50 ZSTD_TU requires libzstd >= 1.4.0 for streaming window bounds"
+#endif
+
 #include <algorithm>
 #include <array>
 #include <limits>
@@ -15,7 +19,9 @@ namespace {
 
 void validate_limits(ZstdTuLimits limits) {
     if (limits.max_encoded_body_bytes == 0 || limits.max_raw_bytes == 0)
-        throw std::invalid_argument("ZSTD_TU limits must be nonzero");
+        throw std::invalid_argument("ZSTD_TU byte limits must be nonzero");
+    if (limits.max_window_log < 10 || limits.max_window_log > 31)
+        throw std::invalid_argument("ZSTD_TU window-log cap is outside [10,31]");
 }
 
 ComponentDescriptor empty_dict_descriptor() {
@@ -165,6 +171,10 @@ std::vector<uint8_t> ZstdTuCodec::decode(const TxBegin& begin,
     const size_t initialized = ZSTD_initDStream(contexts_->decompress);
     if (ZSTD_isError(initialized))
         throw_zstd("ZSTD_initDStream", initialized);
+    const size_t window_result = ZSTD_DCtx_setParameter(
+        contexts_->decompress, ZSTD_d_windowLogMax, limits.max_window_log);
+    if (ZSTD_isError(window_result))
+        throw_zstd("ZSTD_DCtx_setParameter(windowLogMax)", window_result);
 
     std::vector<uint8_t> output(static_cast<size_t>(begin.raw_bytes));
     uint8_t output_scratch = 0;

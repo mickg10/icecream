@@ -430,7 +430,7 @@ AC_CHECK_LIB(lzo2, lzo1x_1_compress, LZO_LDADD=-llzo2,
 	AC_MSG_ERROR([Could not find lzo2 library - please install lzo-devel]))
 AC_SUBST(LZO_LDADD)
 
-PKG_CHECK_MODULES([LIBZSTD], [libzstd])
+PKG_CHECK_MODULES([LIBZSTD], [libzstd >= 1.4.0])
 
 AC_CHECK_LIB([dl], [dlsym], [DL_LDADD=-ldl])
 AC_SUBST([DL_LDADD])
