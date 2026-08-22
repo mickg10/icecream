@@ -72,6 +72,10 @@ void test_exact_acknowledgement_passes() {
     const HistoryReset reset = requested(hello);
     const SessionState ack = acknowledgement(staged, reset);
 
+    require(ack.f_store_guid == staged.f_store_guid &&
+                ack.selected_profile == staged.selected_profile &&
+                ack.limits == staged.limits,
+            "valid acknowledgement fixture changed session identity");
     validate_initial_history_reset_ack(hello, staged, reset, ack);
 }
 
