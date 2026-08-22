@@ -217,10 +217,11 @@ ZstdLoopbackServer::ZstdLoopbackServer(
     boost::asio::io_context& context, ZstdLoopbackConfig config,
     CStoreGuid expected_c_store_guid,
     PublishExactInput publish_exact_input)
-    : config_(std::move(config)),
+    : context_(context),
+      config_(std::move(config)),
       expected_c_store_guid_(expected_c_store_guid),
       publish_exact_input_(std::move(publish_exact_input)),
-      acceptor_(context, tcp::endpoint(
+      acceptor_(context_, tcp::endpoint(
           boost::asio::ip::address_v4::loopback(), 0)),
       gate_(config_.supported_profiles, config_.session_limits,
             config_.max_staged_candidates) {
@@ -344,7 +345,7 @@ void ZstdLoopbackServer::publish_commit(
 }
 
 void ZstdLoopbackServer::serve_one_connection() {
-    tcp::socket socket(acceptor_.get_executor());
+    tcp::socket socket(context_);
     acceptor_.accept(socket);
 
     std::optional<uint64_t> candidate_id;
