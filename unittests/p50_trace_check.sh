@@ -121,13 +121,13 @@ digest_rows[digest_index]["transaction_digest"] = flip_hex(
 write("wrong-operation-digest.jsonl", digest_rows)
 
 cursor_rows = copy.deepcopy(rows)
-old_begin = next(row for row in cursor_rows
-                 if row["action"] == "TX_BEGIN" and row["actor"] == "C")
-reused_begin = dict(old_begin)
-reused_begin["tu_seq"] += 1
-reused_begin["transaction_digest"] = flip_hex(old_begin["transaction_digest"])
-reused_begin["raw_digest"] = flip_hex(old_begin["raw_digest"])
-cursor_rows.append(reused_begin)
+relations = {}
+for index, row in enumerate(cursor_rows):
+    if row["action"] == "TX_BEGIN" and row["actor"] == "C":
+        key = (row["c_store_guid"], row["f_store_guid"])
+        relations.setdefault(key, []).append(index)
+selected = next(indices for indices in relations.values() if len(indices) >= 2)
+cursor_rows[selected[1]]["rel_seq"] = cursor_rows[selected[0]]["rel_seq"]
 write("cursor-reuse.jsonl", cursor_rows)
 
 relseq_rows = copy.deepcopy(rows)
