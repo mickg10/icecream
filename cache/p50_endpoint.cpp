@@ -115,11 +115,11 @@ void close_now(tcp::socket& socket) {
 template <class Verify>
 asio::awaitable<void> async_connect(tcp::socket& socket, const tcp::endpoint& remote,
                                     CompletionStamp stamp, CompletionLog* log, Verify verify) {
+    const CompletionStamp expected = with_operation(stamp, AsyncOperationKind::Connect);
     boost::system::error_code error;
     co_await socket.async_connect(remote, asio::redirect_error(asio::use_awaitable, error));
-    stamp = with_operation(stamp, AsyncOperationKind::Connect);
-    record_completion(log, stamp, 0, error);
-    verify(stamp);
+    record_completion(log, expected, 0, error);
+    verify(expected);
     if (error)
         throw boost::system::system_error(error);
 }
@@ -127,11 +127,11 @@ asio::awaitable<void> async_connect(tcp::socket& socket, const tcp::endpoint& re
 template <class Verify>
 asio::awaitable<void> async_accept(tcp::acceptor& acceptor, tcp::socket& socket,
                                    CompletionStamp stamp, CompletionLog* log, Verify verify) {
+    const CompletionStamp expected = with_operation(stamp, AsyncOperationKind::Accept);
     boost::system::error_code error;
     co_await acceptor.async_accept(socket, asio::redirect_error(asio::use_awaitable, error));
-    stamp = with_operation(stamp, AsyncOperationKind::Accept);
-    record_completion(log, stamp, 0, error);
-    verify(stamp);
+    record_completion(log, expected, 0, error);
+    verify(expected);
     if (error)
         throw boost::system::system_error(error);
 }
@@ -155,14 +155,14 @@ asio::awaitable<void> async_write_message(tcp::socket& socket, Message message,
     size_t offset = 0;
     while (offset != frame.size()) {
         const size_t count = std::min(control.max_write_fragment, frame.size() - offset);
+        const CompletionStamp expected =
+            with_operation(stamp, AsyncOperationKind::WriteFragment);
         boost::system::error_code error;
         const size_t written =
             co_await asio::async_write(socket, asio::buffer(frame.data() + offset, count),
                                        asio::redirect_error(asio::use_awaitable, error));
-        CompletionStamp fragment_stamp =
-            with_operation(stamp, AsyncOperationKind::WriteFragment);
-        record_completion(log, fragment_stamp, written, error);
-        verify(fragment_stamp);
+        record_completion(log, expected, written, error);
+        verify(expected);
         if (error)
             throw boost::system::system_error(error);
         offset += written;
@@ -195,23 +195,25 @@ asio::awaitable<Frame> async_read_frame(tcp::socket& socket, uint32_t max_payloa
                                         CompletionStamp stamp, CompletionLog* log,
                                         Verify verify) {
     std::array<uint8_t, 4> raw_header{};
+    const CompletionStamp expected_header =
+        with_operation(stamp, AsyncOperationKind::ReadHeader);
     boost::system::error_code error;
     const size_t header_bytes = co_await asio::async_read(
         socket, asio::buffer(raw_header), asio::redirect_error(asio::use_awaitable, error));
-    CompletionStamp header_stamp = with_operation(stamp, AsyncOperationKind::ReadHeader);
-    record_completion(log, header_stamp, header_bytes, error);
-    verify(header_stamp);
+    record_completion(log, expected_header, header_bytes, error);
+    verify(expected_header);
     if (error)
         throw boost::system::system_error(error);
     const FrameHeader header = decode_frame_header(raw_header, max_payload);
     Frame frame{header.type, std::vector<uint8_t>(header.payload_bytes)};
     if (!frame.payload.empty()) {
+        const CompletionStamp expected_payload =
+            with_operation(stamp, AsyncOperationKind::ReadPayload);
         error.clear();
         const size_t payload_bytes = co_await asio::async_read(
             socket, asio::buffer(frame.payload), asio::redirect_error(asio::use_awaitable, error));
-        CompletionStamp payload_stamp = with_operation(stamp, AsyncOperationKind::ReadPayload);
-        record_completion(log, payload_stamp, payload_bytes, error);
-        verify(payload_stamp);
+        record_completion(log, expected_payload, payload_bytes, error);
+        verify(expected_payload);
         if (error)
             throw boost::system::system_error(error);
     }
@@ -222,12 +224,13 @@ template <class Verify>
 asio::awaitable<void> async_wait_peer_close(tcp::socket& socket, CompletionStamp stamp,
                                             CompletionLog* log, Verify verify) {
     std::array<uint8_t, 1> unexpected{};
+    const CompletionStamp expected =
+        with_operation(stamp, AsyncOperationKind::WaitPeerClose);
     boost::system::error_code error;
     const size_t bytes = co_await socket.async_read_some(
         asio::buffer(unexpected), asio::redirect_error(asio::use_awaitable, error));
-    stamp = with_operation(stamp, AsyncOperationKind::WaitPeerClose);
-    record_completion(log, stamp, bytes, error);
-    verify(stamp);
+    record_completion(log, expected, bytes, error);
+    verify(expected);
     if (!error && bytes != 0)
         throw std::invalid_argument("message arrived after final TX_COMMIT");
     if (error != asio::error::eof && error != asio::error::connection_reset)
@@ -588,7 +591,11 @@ struct P50ClientEndpoint::Impl {
         return result;
     }
 
-    void require_completion(const Session& session, const CompletionStamp& completion) const {
+    void require_completion(const Session& session, const CompletionStamp& expected,
+                            const CompletionStamp& observed) const {
+        if (observed != expected)
+            throw StaleCompletion();
+        const CompletionStamp& completion = expected;
         if (completion.actor != ActorSide::C || completion.c_store_guid != c_guid ||
             active_session != completion.session_serial ||
             completion.session_serial != session.serial)
@@ -843,7 +850,11 @@ struct P50ServerEndpoint::Impl {
         return result;
     }
 
-    void require_completion(const CompletionStamp& completion) const {
+    void require_completion(const CompletionStamp& expected,
+                            const CompletionStamp& observed) const {
+        if (observed != expected)
+            throw StaleCompletion();
+        const CompletionStamp& completion = expected;
         if (completion.actor != ActorSide::F || completion.f_store_guid != f_guid)
             throw StaleCompletion();
         const auto live = live_sessions.find(completion.session_serial);
@@ -1271,10 +1282,12 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run(tcp::endpoint rem
     tcp::socket socket(executor);
     ClientRunResult result;
     uint32_t terminal_cap = impl_->caps.wire.max_frame_payload;
-    const auto verify = [&](CompletionStamp completion) {
+    const auto verify = [&](const CompletionStamp& expected) {
+        CompletionStamp observed = expected;
         if (control.before_completion_check)
-            control.before_completion_check(completion);
-        impl_->require_completion(session, completion_for_test(completion, control));
+            control.before_completion_check(observed);
+        observed = completion_for_test(observed, control);
+        impl_->require_completion(session, expected, observed);
     };
     try {
         co_await async_connect(socket, remote, impl_->stamp(session, AsyncOperationKind::Connect),
@@ -1490,10 +1503,12 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::accept_one(tcp::accep
     const auto executor = co_await asio::this_coro::executor;
     tcp::socket socket(executor);
     uint32_t reply_cap = impl_->caps.wire.max_frame_payload;
-    const auto verify = [&](CompletionStamp completion) {
+    const auto verify = [&](const CompletionStamp& expected) {
+        CompletionStamp observed = expected;
         if (control.before_completion_check)
-            control.before_completion_check(completion);
-        impl_->require_completion(completion_for_test(completion, control));
+            control.before_completion_check(observed);
+        observed = completion_for_test(observed, control);
+        impl_->require_completion(expected, observed);
     };
     std::optional<ErrorMessage> terminal_error;
     try {
