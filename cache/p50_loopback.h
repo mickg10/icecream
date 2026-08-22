@@ -70,8 +70,12 @@ struct ZstdLoopbackConfig {
     uint16_t protocol_error_code = 1;
 };
 
-using PublishExactInput =
-    std::function<TxCommit(const TxBegin&, std::vector<uint8_t>)>;
+// The endpoint derives the only legal TxCommit. This callback must atomically
+// publish the exact InputRecord (when job_open) and matching route state before
+// it returns; throwing leaves the transaction uncommitted and terminates the
+// session.
+using PublishExactInput = std::function<void(
+    const TxBegin&, const TxCommit&, std::vector<uint8_t>)>;
 
 // A bounded C1F1 transport slice. It intentionally serves one TCP connection
 // at a time; daemon accept-loop concurrency and scheduler integration remain
