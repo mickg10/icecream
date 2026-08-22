@@ -340,3 +340,4 @@ int main() {
     test_empty_input();
     std::cout << "p50_input_record_test: exact retained-input restart gates passed\n";
     return 0;
+}
