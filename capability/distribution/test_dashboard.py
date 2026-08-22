@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -15,6 +16,11 @@ assert SPEC is not None and SPEC.loader is not None
 dashboard = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = dashboard
 SPEC.loader.exec_module(dashboard)
+
+from run_scenario import validate_experiment_jsonl as eager_validate  # noqa: E402
+from stream_validate_experiment import (  # noqa: E402
+    validate_experiment_jsonl as streaming_validate,
+)
 
 
 def descriptor() -> dict[str, object]:
@@ -63,6 +69,12 @@ def snapshot(
 
 
 class DashboardTest(unittest.TestCase):
+    def test_streaming_validator_matches_accepted_fixture(self) -> None:
+        fixture = (
+            MODULE_PATH.with_name("samples") / "r4-minimum" / "sample-experiment.jsonl"
+        )
+        self.assertEqual(streaming_validate(fixture), eager_validate(fixture))
+
     def test_streaming_projection_is_bounded_and_retains_gaps(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "experiment.jsonl"
@@ -190,7 +202,15 @@ class DashboardTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "report.html"
             dashboard.render_experiment_file(fixture, output)
-            self.assertIn("icecream-execution-v2", output.read_text())
+            html = output.read_text()
+            self.assertIn("icecream-execution-v2", html)
+            canonical = fixture.parent / "route-trace.jsonl"
+            expected_href = Path(
+                os.path.relpath(canonical.resolve(), output.parent.resolve())
+            ).as_posix()
+            self.assertIn('"path":"route-trace.jsonl"', html)
+            self.assertIn(f'"report_href":"{expected_href}"', html)
+            self.assertTrue((output.parent / expected_href).is_file())
         before = fixture.read_bytes()
         with self.assertRaises(ValueError):
             dashboard.render_experiment_file(fixture, fixture)

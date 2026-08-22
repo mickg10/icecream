@@ -7,7 +7,7 @@ import argparse
 import json
 from pathlib import Path
 
-from run_scenario import validate_experiment_jsonl
+from stream_validate_experiment import validate_experiment_jsonl
 
 
 def main() -> int:

@@ -39,6 +39,7 @@ EXTRA_DIST += \
 	capability/distribution/route-trace.schema.json \
 	capability/distribution/run_firefox_static_routing_sweep.py \
 	capability/distribution/run_scenario.py \
+	capability/distribution/stream_validate_experiment.py \
 	capability/distribution/run_static_routing_smoke.py \
 	capability/distribution/run_suite.py \
 	capability/distribution/samples/r4-minimum/alpha.ii \

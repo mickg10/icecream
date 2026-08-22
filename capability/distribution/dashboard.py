@@ -17,11 +17,12 @@ from pathlib import Path
 from typing import Iterable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from run_scenario import validate_experiment_jsonl  # noqa: E402
+from stream_validate_experiment import validate_experiment_jsonl  # noqa: E402
 
 
 MAX_REPORT_SNAPSHOTS = 2_000
 TARGET_TIMELINE_BYTES = 2_000_000
+MAX_REPORT_BYTES = 5_000_000
 MAX_OPTIONAL_STATE_BYTES = 512
 
 
@@ -122,15 +123,12 @@ def _selected_ordinals(count: int, limit: int) -> set[int]:
     return {i * (count - 1) // (limit - 1) for i in range(limit)}
 
 
-def _adaptive_limit(descriptor: dict[str, object], count: int, requested: int) -> int:
+def _adaptive_limit(count: int, requested: int, projected_bytes: int) -> int:
     if count == 0:
         return 0
-    dimensions = descriptor.get("topology_dimensions")
-    dimensions = dimensions if isinstance(dimensions, dict) else {}
-    c_count = int(dimensions.get("logical_c_authorities") or 1)
-    f_count = int(dimensions.get("f_stores") or 1)
-    estimated = 420 + c_count * 140 + f_count * 260 + c_count * f_count * 180
-    return min(count, requested, max(16, TARGET_TIMELINE_BYTES // max(1, estimated)))
+    average = (projected_bytes + count - 1) // count
+    floor = 2 if count > 1 else 1
+    return min(count, requested, max(floor, TARGET_TIMELINE_BYTES // max(1, average)))
 
 
 def compact_timeline(
@@ -318,6 +316,7 @@ def read_experiment(
     descriptor: dict[str, object] | None = None
     final: dict[str, object] | None = None
     snapshot_count = 0
+    projected_snapshot_bytes = 0
     gap_count = 0
     accumulator = EventAccumulator()
     with path.open(encoding="utf-8") as source:
@@ -337,6 +336,9 @@ def read_experiment(
             elif record in ("snapshot", "gap"):
                 if record == "snapshot":
                     snapshot_count += 1
+                    projected_snapshot_bytes += (
+                        len(json.dumps(_slim_row(row), separators=(",", ":"))) + 1
+                    )
                 else:
                     gap_count += 1
                 for event in row.get("events", []):
@@ -346,7 +348,7 @@ def read_experiment(
                 raise ValueError(f"{path}:{line_number}: unknown record {record!r}")
     if descriptor is None or final is None:
         raise ValueError(f"{path}: expected experiment descriptor and summary rows")
-    adaptive_limit = _adaptive_limit(descriptor, snapshot_count, limit)
+    adaptive_limit = _adaptive_limit(snapshot_count, limit, projected_snapshot_bytes)
     selected = _selected_ordinals(snapshot_count, adaptive_limit)
     view: list[dict[str, object]] = []
     ordinal = 0
@@ -370,6 +372,12 @@ def read_experiment(
         "embedded_snapshots": len(selected),
         "requested_max_snapshots": limit,
         "projection_target_bytes": TARGET_TIMELINE_BYTES,
+        "report_max_bytes": MAX_REPORT_BYTES,
+        "projected_snapshot_mean_bytes": (
+            (projected_snapshot_bytes + snapshot_count - 1) // snapshot_count
+            if snapshot_count
+            else 0
+        ),
         "snapshot_selection": (
             "all"
             if snapshot_count <= adaptive_limit
@@ -484,15 +492,51 @@ def render_experiment_file(
     if not output.exists() and source.resolve() == output.resolve():
         raise ValueError(f"--out must not alias canonical input {source}")
     validate_experiment_jsonl(source)
-    descriptor, timeline, final = read_experiment(source, limit)
-    html = render_experiment_html(descriptor, timeline, final, compact=False)
+    current_limit = limit
+    while True:
+        descriptor, timeline, final = read_experiment(source, current_limit)
+        _rebase_evidence_hrefs(descriptor, source, output)
+        html = render_experiment_html(descriptor, timeline, final, compact=False)
+        encoded = html.encode("utf-8")
+        if len(encoded) <= MAX_REPORT_BYTES:
+            break
+        report_view = descriptor.get("report_view", {})
+        embedded = (
+            int(report_view.get("embedded_snapshots") or 0)
+            if isinstance(report_view, dict)
+            else 0
+        )
+        if embedded <= 1:
+            raise ValueError(
+                f"report projection cannot fit the {MAX_REPORT_BYTES}-byte limit"
+            )
+        current_limit = max(
+            1,
+            min(
+                embedded - 1,
+                embedded * MAX_REPORT_BYTES * 95 // len(encoded) // 100,
+            ),
+        )
     temporary = output.with_name(f".{output.name}.tmp-{os.getpid()}")
     try:
-        temporary.write_text(html, encoding="utf-8")
+        temporary.write_bytes(encoded)
         os.replace(temporary, output)
     finally:
         if temporary.exists():
             temporary.unlink()
+
+
+def _rebase_evidence_hrefs(
+    descriptor: dict[str, object], source: Path, output: Path
+) -> None:
+    """Add report-relative links without changing canonical evidence paths."""
+    for field in ("route_trace_evidence", "physical_ledger_evidence"):
+        evidence = descriptor.get(field)
+        if not isinstance(evidence, dict) or not isinstance(evidence.get("path"), str):
+            continue
+        target = (source.parent / evidence["path"]).resolve()
+        relative = Path(os.path.relpath(target, output.parent.resolve()))
+        evidence["report_href"] = relative.as_posix()
 
 
 def _template() -> str:

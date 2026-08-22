@@ -10,6 +10,7 @@ use std::process::Command;
 
 const MAX_REPORT_SNAPSHOTS: usize = 2_000;
 const TARGET_TIMELINE_BYTES: usize = 2_000_000;
+const MAX_REPORT_BYTES: usize = 5_000_000;
 const MAX_OPTIONAL_STATE_BYTES: usize = 512;
 const TEMPLATE: &str = include_str!("../../dashboard_template.html");
 
@@ -194,13 +195,19 @@ fn normalized_path(path: &Path) -> Result<PathBuf, String> {
     if path.exists() {
         return fs::canonicalize(path).map_err(|error| format!("{}: {error}", path.display()));
     }
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = parent_directory(path);
     let parent =
         fs::canonicalize(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
     Ok(parent.join(
         path.file_name()
             .ok_or_else(|| format!("output has no file name: {}", path.display()))?,
     ))
+}
+
+fn parent_directory(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
 }
 
 fn paths_alias(left: &Path, right: &Path) -> Result<bool, String> {
@@ -240,30 +247,16 @@ fn selected_ordinals(count: usize, limit: usize) -> Vec<usize> {
     (0..limit).map(|i| i * (count - 1) / (limit - 1)).collect()
 }
 
-fn adaptive_snapshot_limit(descriptor: &Value, count: usize, requested: usize) -> usize {
+fn adaptive_snapshot_limit(count: usize, requested: usize, projected_bytes: usize) -> usize {
     if count == 0 {
         return 0;
     }
-    let dimensions = descriptor
-        .get("topology_dimensions")
-        .and_then(Value::as_object);
-    let c = dimensions
-        .and_then(|value| value.get("logical_c_authorities"))
-        .and_then(Value::as_u64)
-        .unwrap_or(1) as usize;
-    let f = dimensions
-        .and_then(|value| value.get("f_stores"))
-        .and_then(Value::as_u64)
-        .unwrap_or(1) as usize;
-    // A selected point carries time/scheduler data, six C counters, six worker
-    // metrics per F, and two coalesced directional route rates per C/F.  Cap
-    // the projection by this conservative estimate; the retained JSONL keeps
-    // every exact interval and event.
-    let estimated_point_bytes = 420usize
-        .saturating_add(c.saturating_mul(140))
-        .saturating_add(f.saturating_mul(260))
-        .saturating_add(c.saturating_mul(f).saturating_mul(180));
-    let budget_limit = (TARGET_TIMELINE_BYTES / estimated_point_bytes.max(1)).max(16);
+    // Measure the actual projected shape instead of trusting descriptor
+    // dimensions: a retained display may legitimately expose more workers or
+    // C authorities than a compact scenario label suggests.
+    let average = projected_bytes.saturating_add(count - 1) / count;
+    let floor = if count > 1 { 2 } else { 1 };
+    let budget_limit = (TARGET_TIMELINE_BYTES / average.max(1)).max(floor);
     requested.min(budget_limit).min(count)
 }
 
@@ -294,11 +287,14 @@ fn record_hint(line: &str) -> Result<&str, String> {
     Ok(&value[1..end])
 }
 
-fn first_pass(path: &Path) -> Result<(Value, Value, usize, usize, EventAccumulator), String> {
+fn first_pass(
+    path: &Path,
+) -> Result<(Value, Value, usize, usize, usize, EventAccumulator), String> {
     let file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut descriptor = None;
     let mut final_row = None;
     let mut snapshots = 0;
+    let mut projected_snapshot_bytes = 0usize;
     let mut gaps = 0;
     let mut events = EventAccumulator::new();
     let mut saw_summary = false;
@@ -363,6 +359,12 @@ fn first_pass(path: &Path) -> Result<(Value, Value, usize, usize, EventAccumulat
                         index + 1
                     ));
                 }
+                projected_snapshot_bytes = projected_snapshot_bytes.saturating_add(
+                    serde_json::to_string(&slim_snapshot(&row))
+                        .map_err(|error| error.to_string())?
+                        .len()
+                        .saturating_add(1),
+                );
                 snapshots += 1;
                 if let Some(list) = row.get("events").and_then(Value::as_array) {
                     for event in list {
@@ -453,7 +455,7 @@ fn first_pass(path: &Path) -> Result<(Value, Value, usize, usize, EventAccumulat
                     ));
                 }
             }
-            Ok((d, f, snapshots, gaps, events))
+            Ok((d, f, snapshots, gaps, projected_snapshot_bytes, events))
         }
         _ => Err("JSONL requires experiment descriptor and summary rows".into()),
     }
@@ -691,6 +693,30 @@ fn second_pass(path: &Path, selected: &[usize]) -> Result<(String, usize), Strin
     Ok((output, output_count))
 }
 
+fn rebase_evidence_hrefs(
+    descriptor: &mut Value,
+    input: &Path,
+    output: &Path,
+) -> Result<(), String> {
+    let output_directory = parent_directory(output);
+    let input_directory = input.parent().unwrap_or_else(|| Path::new("."));
+    for field in ["route_trace_evidence", "physical_ledger_evidence"] {
+        let Some(evidence) = descriptor.get_mut(field).and_then(Value::as_object_mut) else {
+            continue;
+        };
+        let Some(canonical_path) = evidence.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        let target = input_directory.join(canonical_path);
+        let report_href = relative_link(output_directory, &target)?;
+        evidence.insert(
+            "report_href".into(),
+            Value::String(report_href.to_string_lossy().into_owned()),
+        );
+    }
+    Ok(())
+}
+
 fn render_projected(
     input: &Path,
     output: &Path,
@@ -699,10 +725,17 @@ fn render_projected(
     if max_snapshots == 0 {
         return Err("--max-snapshots must be positive".into());
     }
-    let (mut descriptor, final_row, snapshot_count, gap_count, accumulator) = first_pass(input)?;
-    let adaptive_limit = adaptive_snapshot_limit(&descriptor, snapshot_count, max_snapshots);
-    let selected = selected_ordinals(snapshot_count, adaptive_limit);
-    let (timeline_json, embedded_records) = second_pass(input, &selected)?;
+    let (
+        mut descriptor,
+        final_row,
+        snapshot_count,
+        gap_count,
+        projected_snapshot_bytes,
+        accumulator,
+    ) = first_pass(input)?;
+    rebase_evidence_hrefs(&mut descriptor, input, output)?;
+    let mut adaptive_limit =
+        adaptive_snapshot_limit(snapshot_count, max_snapshots, projected_snapshot_bytes);
     let mut aggregates = accumulator.value();
     let events = aggregates
         .get_mut("events")
@@ -711,15 +744,54 @@ fn render_projected(
     if let Some(object) = aggregates.as_object_mut() {
         object.remove("events");
     }
-    let report_view = json!({"source_records": snapshot_count + gap_count, "source_snapshots": snapshot_count, "embedded_records": embedded_records, "embedded_snapshots": selected.len(), "requested_max_snapshots": max_snapshots, "projection_target_bytes": TARGET_TIMELINE_BYTES, "snapshot_selection": if snapshot_count <= adaptive_limit { "all" } else { "adaptive evenly spaced selection including first and last" }, "projection_fidelity": "chart-used interval fields plus bounded optional cache/lease/cursor state; exact events, totals, and full state remain in canonical JSONL", "all_gap_records_embedded": true, "canonical_detail": "experiment.jsonl retains every exact interval, state, and event", "source_event_count": accumulator.count, "embedded_event_count": aggregates.get("sampled_events"), "event_sampling": aggregates.get("event_sampling")});
-    descriptor["report_view"] = report_view;
-    descriptor["dashboard_aggregates"] = aggregates.clone();
-    let mut payload_descriptor = descriptor;
-    if let Some(object) = payload_descriptor.as_object_mut() {
-        object.remove("dashboard_aggregates");
-    }
-    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    let parent = parent_directory(output);
     fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    let final_json = serde_json::to_string(&final_row).map_err(|e| e.to_string())?;
+    let events_json = serde_json::to_string(&events).map_err(|e| e.to_string())?;
+    let aggregates_json = serde_json::to_string(&aggregates).map_err(|e| e.to_string())?;
+    let marker = "__PAYLOAD__";
+    let marker_position = TEMPLATE
+        .find(marker)
+        .ok_or_else(|| "dashboard template has no __PAYLOAD__ marker".to_string())?;
+    let average_projected_snapshot_bytes = projected_snapshot_bytes
+        .saturating_add(snapshot_count.saturating_sub(1))
+        .checked_div(snapshot_count)
+        .unwrap_or(0);
+    let (payload_prefix, final_size) = loop {
+        let selected = selected_ordinals(snapshot_count, adaptive_limit);
+        let (timeline_json, embedded_records) = second_pass(input, &selected)?;
+        let report_view = json!({"source_records": snapshot_count + gap_count, "source_snapshots": snapshot_count, "embedded_records": embedded_records, "embedded_snapshots": selected.len(), "requested_max_snapshots": max_snapshots, "projection_target_bytes": TARGET_TIMELINE_BYTES, "report_max_bytes": MAX_REPORT_BYTES, "projected_snapshot_mean_bytes": average_projected_snapshot_bytes, "snapshot_selection": if snapshot_count <= adaptive_limit { "all" } else { "adaptive evenly spaced selection including first and last" }, "projection_fidelity": "chart-used interval fields plus bounded optional cache/lease/cursor state; exact events, totals, provenance, and full state remain in canonical JSONL", "all_gap_records_embedded": true, "canonical_detail": "experiment.jsonl retains every exact interval, state, and event", "source_event_count": accumulator.count, "embedded_event_count": aggregates.get("sampled_events"), "event_sampling": aggregates.get("event_sampling")});
+        let mut payload_descriptor = descriptor.clone();
+        payload_descriptor["report_view"] = report_view;
+        if let Some(object) = payload_descriptor.as_object_mut() {
+            object.remove("dashboard_aggregates");
+        }
+        let descriptor_json =
+            serde_json::to_string(&payload_descriptor).map_err(|e| e.to_string())?;
+        let payload = format!("{{\"descriptor\":{descriptor_json},\"timeline\":{timeline_json},\"final\":{final_json},\"events\":{events_json},\"aggregates\":{aggregates_json}}}").replace("</", "<\\/");
+        let html_size = TEMPLATE
+            .len()
+            .saturating_sub(marker.len())
+            .saturating_add(payload.len());
+        if html_size <= MAX_REPORT_BYTES {
+            break (payload, html_size);
+        }
+        if adaptive_limit <= 1 || timeline_json.len() <= 2 {
+            return Err(format!(
+                "report projection cannot fit the {MAX_REPORT_BYTES}-byte limit; fixed metadata and retained gaps require {html_size} bytes"
+            ));
+        }
+        let fixed_bytes = html_size.saturating_sub(timeline_json.len());
+        if fixed_bytes >= MAX_REPORT_BYTES {
+            adaptive_limit = 1;
+            continue;
+        }
+        let available = MAX_REPORT_BYTES - fixed_bytes;
+        let proportional = adaptive_limit.saturating_mul(available).saturating_mul(95)
+            / timeline_json.len().max(1)
+            / 100;
+        adaptive_limit = proportional.max(1).min(adaptive_limit - 1);
+    };
     let temp = parent.join(format!(
         ".{}.tmp-{}",
         output
@@ -728,15 +800,6 @@ fn render_projected(
             .unwrap_or("report.html"),
         std::process::id()
     ));
-    let descriptor_json = serde_json::to_string(&payload_descriptor).map_err(|e| e.to_string())?;
-    let final_json = serde_json::to_string(&final_row).map_err(|e| e.to_string())?;
-    let events_json = serde_json::to_string(&events).map_err(|e| e.to_string())?;
-    let aggregates_json = serde_json::to_string(&aggregates).map_err(|e| e.to_string())?;
-    let marker = "__PAYLOAD__";
-    let marker_position = TEMPLATE
-        .find(marker)
-        .ok_or_else(|| "dashboard template has no __PAYLOAD__ marker".to_string())?;
-    let payload_prefix = format!("{{\"descriptor\":{descriptor_json},\"timeline\":{timeline_json},\"final\":{final_json},\"events\":{events_json},\"aggregates\":{aggregates_json}}}").replace("</", "<\\/");
     let mut file = File::create(&temp).map_err(|e| format!("{}: {e}", temp.display()))?;
     file.write_all(&TEMPLATE.as_bytes()[..marker_position])
         .map_err(|e| e.to_string())?;
@@ -745,15 +808,20 @@ fn render_projected(
     file.write_all(&TEMPLATE.as_bytes()[marker_position + marker.len()..])
         .map_err(|e| e.to_string())?;
     file.sync_all().ok();
+    drop(file);
+    let written = fs::metadata(&temp).map_err(|e| e.to_string())?.len();
+    if written != final_size as u64 || written > MAX_REPORT_BYTES as u64 {
+        let _ = fs::remove_file(&temp);
+        return Err(format!(
+            "written report size {written} differs from bounded projection"
+        ));
+    }
     fs::rename(&temp, output).map_err(|e| format!("{}: {e}", output.display()))?;
-    Ok((
-        fs::metadata(output).map_err(|e| e.to_string())?.len(),
-        accumulator.count,
-    ))
+    Ok((written, accumulator.count))
 }
 
 fn render(input: &Path, output: &Path, max_snapshots: usize) -> Result<(u64, u64), String> {
-    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    let parent = parent_directory(output);
     fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
     refuse_output_alias(output, &[input])?;
     validate_authoritative(input)?;
@@ -780,7 +848,7 @@ fn summary_value(summary: &Value, key: &str) -> String {
 }
 
 fn atomic_html(output: &Path, html: &str) -> Result<u64, String> {
-    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    let parent = parent_directory(output);
     fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
     let temp = parent.join(format!(
         ".{}.tmp-{}",
@@ -797,14 +865,48 @@ fn atomic_html(output: &Path, html: &str) -> Result<u64, String> {
     Ok(html.len() as u64)
 }
 
+fn comparison_modes_and_identity<'a>(
+    simulated: &'a Value,
+    physical: &'a Value,
+) -> Result<(&'a str, &'a str), String> {
+    let simulated_mode = simulated
+        .get("mode")
+        .and_then(Value::as_str)
+        .ok_or("first comparison stream has no execution mode")?;
+    let physical_mode = physical
+        .get("mode")
+        .and_then(Value::as_str)
+        .ok_or("second comparison stream has no execution mode")?;
+    if simulated_mode != "simulated" || physical_mode != "physical" {
+        return Err(format!(
+            "compare requires SIMULATED_JSONL then PHYSICAL_JSONL; received {simulated_mode:?} then {physical_mode:?}"
+        ));
+    }
+    for field in [
+        "scenario",
+        "scenario_digest",
+        "scenario_manifest",
+        "input_manifest_digests",
+        "workload_inputs",
+    ] {
+        if simulated.get(field) != physical.get(field) {
+            return Err(format!(
+                "comparison streams have different canonical {field} identities"
+            ));
+        }
+    }
+    Ok((simulated_mode, physical_mode))
+}
+
 fn compare(input_a: &Path, input_b: &Path, output: &Path) -> Result<u64, String> {
-    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    let parent = parent_directory(output);
     fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
     refuse_output_alias(output, &[input_a, input_b])?;
     validate_authoritative(input_a)?;
     validate_authoritative(input_b)?;
-    let (_a, a_final, a_snapshots, a_gaps, a_events) = first_pass(input_a)?;
-    let (_b, b_final, b_snapshots, b_gaps, b_events) = first_pass(input_b)?;
+    let (a, a_final, a_snapshots, a_gaps, _a_projected_bytes, a_events) = first_pass(input_a)?;
+    let (b, b_final, b_snapshots, b_gaps, _b_projected_bytes, b_events) = first_pass(input_b)?;
+    let (a_mode, b_mode) = comparison_modes_and_identity(&a, &b)?;
     let sa = a_final
         .get("summary")
         .ok_or("first comparison stream has no summary")?;
@@ -837,11 +939,13 @@ fn compare(input_a: &Path, input_b: &Path, output: &Path) -> Result<u64, String>
     let html = format!(
         r#"<!doctype html><meta charset="utf-8"><title>Icecream comparison</title>
 <style>body{{font:14px system-ui;background:#101820;color:#e8eef5;margin:2rem;max-width:1100px}}h1{{font-size:1.5rem}}table{{border-collapse:collapse;width:100%;background:#172432}}th,td{{padding:.55rem;border:1px solid #33485d;text-align:left}}th{{color:#b9c9d8}}.note{{color:#b9c9d8}}code{{overflow-wrap:anywhere}}</style>
-<h1>Simulated versus physical experiment</h1><p class="note">Validated source streams; values are retained summary fields, with source paths shown below. Missing values are not inferred.</p>
-<table><thead><tr><th>metric</th><th>simulated</th><th>physical</th></tr></thead><tbody>{rows}</tbody></table>
-<h2>Sources and coverage</h2><ul><li>simulated: <code>{pa}</code>; {asnap} snapshots, {agap} gaps, {aevent} events</li><li>physical: <code>{pb}</code>; {bsnap} snapshots, {bgap} gaps, {bevent} events</li></ul>
+<h1>{a_mode} versus {b_mode} experiment</h1><p class="note">Validated source streams with identical canonical scenario and workload identities; values are retained summary fields, with source paths shown below. Missing values are not inferred.</p>
+<table><thead><tr><th>metric</th><th>{a_mode}</th><th>{b_mode}</th></tr></thead><tbody>{rows}</tbody></table>
+<h2>Sources and coverage</h2><ul><li>{a_mode}: <code>{pa}</code>; {asnap} snapshots, {agap} gaps, {aevent} events</li><li>{b_mode}: <code>{pb}</code>; {bsnap} snapshots, {bgap} gaps, {bevent} events</li></ul>
 <p class="note">Open each source JSONL with the canonical retained-stream tools for full event, codec, cache, lease, cursor, and provenance detail.</p>"#,
         rows = rows,
+        a_mode = html_escape(a_mode),
+        b_mode = html_escape(b_mode),
         pa = html_escape(&input_a.display().to_string()),
         pb = html_escape(&input_b.display().to_string()),
         asnap = a_snapshots,
@@ -912,7 +1016,7 @@ fn index(root: &Path, output: &Path) -> Result<u64, String> {
     let mut files = Vec::new();
     collect_experiments(root, &mut files)?;
     files.sort();
-    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    let parent = parent_directory(output);
     fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
     let inputs: Vec<&Path> = files.iter().map(PathBuf::as_path).collect();
     refuse_output_alias(output, &inputs)?;
@@ -920,7 +1024,7 @@ fn index(root: &Path, output: &Path) -> Result<u64, String> {
     for path in files {
         validate_authoritative(&path)?;
         let relative = path.strip_prefix(root).unwrap_or(&path);
-        let (header, final_row, snapshots, gaps, _events) = first_pass(&path)?;
+        let (header, final_row, snapshots, gaps, _projected_bytes, _events) = first_pass(&path)?;
         let summary = final_row
             .get("summary")
             .cloned()
@@ -1095,6 +1199,20 @@ mod tests {
         copied
     }
 
+    fn set_execution_mode(path: &Path, mode: &str) {
+        let source = fs::read_to_string(path).unwrap();
+        let mut lines = source.lines();
+        let mut header: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        header["mode"] = json!(mode);
+        let mut encoded = serde_json::to_string(&header).unwrap();
+        encoded.push('\n');
+        for line in lines {
+            encoded.push_str(line);
+            encoded.push('\n');
+        }
+        fs::write(path, encoded).unwrap();
+    }
+
     fn mutate_fixture(path: &Path, case: &str) {
         let source = fs::read_to_string(path).unwrap();
         let mut rows: Vec<Value> = source
@@ -1143,6 +1261,15 @@ mod tests {
     fn selection_keeps_boundaries() {
         assert_eq!(selected_ordinals(10_000, 3), vec![0, 4999, 9999]);
         assert_eq!(selected_ordinals(2, 2000), vec![0, 1]);
+        assert_eq!(parent_directory(Path::new("report.html")), Path::new("."));
+        let bare = PathBuf::from(format!(
+            "nonexistent-dashboard-output-{}",
+            std::process::id()
+        ));
+        assert_eq!(
+            normalized_path(&bare).unwrap(),
+            fs::canonicalize(".").unwrap().join(&bare)
+        );
     }
     #[test]
     fn accumulator_does_not_duplicate_small_trace() {
@@ -1189,6 +1316,7 @@ mod tests {
         ));
         fs::create_dir_all(root.join("runs")).unwrap();
         let copied = copy_fixture(&root.join("runs"));
+        set_execution_mode(&copied, "physical");
         let one = root.join("one.html");
         let two = root.join("two.html");
         render(&source, &one, MAX_REPORT_SNAPSHOTS).unwrap();
@@ -1205,7 +1333,7 @@ mod tests {
         index(&root.join("runs"), &catalog).unwrap();
         assert!(fs::read_to_string(root.join("compare.html"))
             .unwrap()
-            .contains("Simulated versus physical"));
+            .contains("simulated versus physical"));
         let index_html = fs::read_to_string(&catalog).unwrap();
         assert!(index_html.contains("experiment.jsonl"));
         assert!(!index_html.contains("route-trace.jsonl"));
@@ -1213,6 +1341,66 @@ mod tests {
         assert!(root.join("catalog/../runs/report.html").is_file());
         let html = fs::read_to_string(one).unwrap();
         assert!(!html.contains("http://") && !html.contains("https://"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn compare_refuses_wrong_modes_and_mismatched_identity() {
+        let root = std::env::temp_dir().join(format!(
+            "icecream-dashboard-compare-contract-{}",
+            std::process::id()
+        ));
+        let first = copy_fixture(&root.join("first"));
+        let second = copy_fixture(&root.join("second"));
+        let output = root.join("comparison.html");
+        let error = compare(&first, &second, &output).unwrap_err();
+        assert!(error.contains("SIMULATED_JSONL then PHYSICAL_JSONL"));
+        assert!(!output.exists());
+
+        let simulated: Value =
+            serde_json::from_str(fs::read_to_string(&first).unwrap().lines().next().unwrap())
+                .unwrap();
+        let mut physical = simulated.clone();
+        physical["mode"] = json!("physical");
+        physical["scenario_digest"] = json!("different");
+        let identity_error = comparison_modes_and_identity(&simulated, &physical).unwrap_err();
+        assert!(identity_error.contains("scenario_digest"));
+        let mut workload_mismatch = simulated.clone();
+        workload_mismatch["mode"] = json!("physical");
+        workload_mismatch["workload_inputs"] = json!({});
+        let workload_error =
+            comparison_modes_and_identity(&simulated, &workload_mismatch).unwrap_err();
+        assert!(workload_error.contains("workload_inputs"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn evidence_links_are_rebased_and_canonical_paths_are_preserved() {
+        let root = std::env::temp_dir().join(format!(
+            "icecream-dashboard-evidence-links-{}",
+            std::process::id()
+        ));
+        let input = copy_fixture(&root.join("run"));
+        let sibling = root.join("sibling/report.html");
+        render(&input, &sibling, MAX_REPORT_SNAPSHOTS).unwrap();
+        let sibling_html = fs::read_to_string(&sibling).unwrap();
+        assert!(sibling_html.contains("\"path\":\"route-trace.jsonl\""));
+        assert!(sibling_html.contains("\"report_href\":\"../run/route-trace.jsonl\""));
+        assert!(sibling
+            .parent()
+            .unwrap()
+            .join("../run/route-trace.jsonl")
+            .is_file());
+
+        let external = root.join("reports/nested/report.html");
+        render(&input, &external, MAX_REPORT_SNAPSHOTS).unwrap();
+        let external_html = fs::read_to_string(&external).unwrap();
+        assert!(external_html.contains("\"report_href\":\"../../run/route-trace.jsonl\""));
+        assert!(external
+            .parent()
+            .unwrap()
+            .join("../../run/route-trace.jsonl")
+            .is_file());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1328,7 +1516,7 @@ mod tests {
     fn external_projection_benchmark() {
         let input = PathBuf::from(env::var_os("ICECREAM_DASHBOARD_STRESS").unwrap());
         let output = PathBuf::from(env::var_os("ICECREAM_DASHBOARD_STRESS_OUT").unwrap());
-        let (bytes, events) = render_projected(&input, &output, MAX_REPORT_SNAPSHOTS).unwrap();
+        let (bytes, events) = render(&input, &output, MAX_REPORT_SNAPSHOTS).unwrap();
         eprintln!("external stress: {bytes} HTML bytes, {events} events");
         assert!(bytes <= 5_000_000);
     }
