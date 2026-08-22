@@ -44,6 +44,8 @@
 #include <errno.h>
 #include <string>
 #include <iostream>
+#include <memory>
+#include <utility>
 #include <assert.h>
 #include <lzo/lzo1x.h>
 #include <zstd.h>
@@ -858,20 +860,29 @@ void MsgChannel::set_error(bool silent)
     if( instate == ERROR ) {
         return;
     }
+    const int saved_errno = errno;
     if( !silent && !set_error_recursion ) {
         trace() << "setting error state for channel " << dump() << endl;
         // After the state is set to error, get_msg() will not return anything anymore,
         // so try to fetch last status from the other side, if available.
         set_error_recursion = true;
-        Msg* msg = get_msg( 2, true );
+        std::unique_ptr<Msg> msg(get_msg( 2, true ));
         if (msg && *msg == Msg::STATUS_TEXT) {
-            log_error() << "remote status: "
-                << static_cast<StatusTextMsg*>(msg)->text << endl;
+            error_status = std::move(static_cast<StatusTextMsg*>(msg.get())->text);
+            log_error() << "remote status: " << *error_status << endl;
         }
         set_error_recursion = false;
     }
     instate = ERROR;
     eof = true;
+    errno = saved_errno;
+}
+
+std::optional<std::string> MsgChannel::take_error_status()
+{
+    std::optional<std::string> result = std::move(error_status);
+    error_status.reset();
+    return result;
 }
 
 static int prepare_connect(const string &hostname, unsigned short p,

@@ -21,7 +21,6 @@
 
 #include <cerrno>
 #include <cstddef>
-#include <memory>
 #include <unistd.h>
 
 namespace
@@ -66,14 +65,12 @@ private:
     int fd_;
 };
 
-void check_for_failure(Msg *msg, MsgChannel *channel)
+void throw_remote_status(const std::string &status, MsgChannel *channel)
 {
-    if (msg && *msg == Msg::STATUS_TEXT) {
-        log_error() << "Remote status (compiled on " << channel->name << "): "
-                    << static_cast<StatusTextMsg *>(msg)->text << std::endl;
-        throw client_error(23, "Error 23 - Remote status (compiled on " + channel->name
-                                   + ")\n" + static_cast<StatusTextMsg *>(msg)->text);
-    }
+    log_error() << "Remote status (compiled on " << channel->name << "): "
+                << status << std::endl;
+    throw client_error(23, "Error 23 - Remote status (compiled on " + channel->name
+                               + ")\n" + status);
 }
 
 }
@@ -117,8 +114,9 @@ void LegacyRemoteSink::send_fd(int fd)
 
                 if (!channel_->send_msg(fcmsg)) {
                     const int send_errno = errno;
-                    std::unique_ptr<Msg> response(channel_->get_msg(2));
-                    check_for_failure(response.get(), channel_);
+                    if (std::optional<std::string> status = channel_->take_error_status()) {
+                        throw_remote_status(*status, channel_);
+                    }
 
                     errno = send_errno;
                     log_error() << "write of source chunk to host "
