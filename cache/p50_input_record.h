@@ -58,7 +58,11 @@ private:
     Digest128 raw_digest_{};
 };
 
-enum class InputPublishResult { Published, Existing };
+enum class InputPublishResult {
+    Published,
+    Existing,
+    NotRetainedJobClosed,
+};
 
 // This store owns the logical-job retention lease for exact committed input.
 // Route reconciliation remains a separate owner: closing a job/input lease must
@@ -75,6 +79,22 @@ public:
                                const TxCommit& commit,
                                std::vector<uint8_t> exact_input);
 
+    // A losing route may finish after RESULT_ACCEPTED or definitive job
+    // cancellation. The route owner must still validate/commit its exact cache
+    // transaction, but it must not recreate a compiler-visible lease. Call this
+    // transition when the serialized logical-job state is already closed.
+    //
+    // If the same exact record is still retained, it is closed idempotently and
+    // any already-authorized cursor remains valid. If no record exists, the
+    // exact bytes are validated but not retained. This store deliberately keeps
+    // no tombstone: the logical-job owner must select this transition for every
+    // late commit after closure.
+    InputPublishResult observe_closed_job_commit(
+        CStoreGuid c_store_guid,
+        const TxBegin& begin,
+        const TxCommit& commit,
+        std::span<const uint8_t> exact_input);
+
     // Every attachment begins at byte zero and receives an independent cursor.
     // New attachments are rejected after the logical job closes, while already
     // attached cursors continue to own and consume their immutable input.
@@ -82,7 +102,9 @@ public:
 
     // Idempotently close the logical-job lease after one result is accepted or
     // the logical job is definitively cancelled. This does not invalidate any
-    // cursor already handed to an authorized compiler attempt.
+    // cursor already handed to an authorized compiler attempt. Callers that
+    // close before an InputRecord exists retain that state in the logical-job
+    // owner and use observe_closed_job_commit() if a route commits later.
     void close_job(InputRecordKey key);
 
     // Release closed records only after every outstanding cursor is gone.
@@ -108,6 +130,9 @@ private:
     static void validate_commit(const TxBegin& begin,
                                 const TxCommit& commit,
                                 std::span<const uint8_t> exact_input);
+    static void validate_existing(const Entry& entry,
+                                  const TxBegin& begin,
+                                  std::span<const uint8_t> exact_input);
 
     size_t max_records_ = 0;
     uint64_t max_retained_bytes_ = 0;
