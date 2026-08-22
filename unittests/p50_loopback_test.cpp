@@ -10,6 +10,7 @@
 #include <exception>
 #include <iostream>
 #include <limits>
+#include <new>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -178,6 +179,11 @@ void test_candidate_staging_and_stale_close_fence() {
     wrong_profile.supported_profiles = profile_bit(ProfileId::P29);
     require_throws<std::invalid_argument>([&] { (void)gate.stage(wrong_profile); },
                                           "candidate with no common profile staged");
+
+    SessionHello undersized = valid;
+    undersized.limits.max_frame_payload = kM2MinimumControlPayload - 1;
+    require_throws<std::invalid_argument>([&] { (void)gate.stage(undersized); },
+                                          "candidate unable to carry TX_BEGIN staged");
 }
 
 void test_persistent_cold_then_warm_transfer() {
@@ -341,6 +347,67 @@ void test_mid_body_disconnect_replays_whole_transaction() {
             "whole-transaction replay did not publish exactly once");
 }
 
+void test_publish_failure_does_not_advance_route() {
+    boost::asio::io_context server_context;
+    const CStoreGuid c_guid = Id128::from_u64(500);
+    const SessionLimits session_limits{4096, 1U << 20};
+    ZstdLoopbackConfig config;
+    config.f_store_guid = Id128::from_u64(501);
+    config.session_limits = session_limits;
+    config.zstd_limits = {1U << 20, 1U << 20};
+
+    size_t publish_attempts = 0;
+    std::vector<std::vector<uint8_t>> published;
+    ZstdLoopbackServer server(
+        server_context, config, c_guid,
+        [&](const TxBegin&, const TxCommit&, std::vector<uint8_t> exact) {
+            ++publish_attempts;
+            if (publish_attempts == 1) throw std::bad_alloc();
+            published.push_back(std::move(exact));
+        });
+
+    const std::vector<uint8_t> input = input_bytes(96 * 1024, 123);
+    ZstdTuEnvelope transaction;
+    {
+        boost::asio::io_context first_context;
+        ServerThread first_server(server);
+        ZstdLoopbackClient first(
+            first_context,
+            tcp::endpoint(boost::asio::ip::address_v4::loopback(), server.port()),
+            hello(c_guid, session_limits), 2);
+        first.establish_initial_route(HistoryNonce{91});
+        transaction = envelope_for(first.state(), TuSeq{12}, input);
+        require_throws<std::runtime_error>(
+            [&] { (void)first.transfer(transaction, 41); },
+            "failed InputRecord publication was exposed as TX_COMMIT");
+        first.close();
+        first_server.require_failure<std::bad_alloc>();
+    }
+
+    const SessionState failed = server.route_snapshot();
+    require(publish_attempts == 1 && published.empty() &&
+                failed.route_present && failed.next_rel_seq.value == 0 &&
+                !failed.last_commit,
+            "failed publication advanced the route or retained input");
+
+    boost::asio::io_context retry_context;
+    ServerThread retry_server(server);
+    ZstdLoopbackClient retry(
+        retry_context,
+        tcp::endpoint(boost::asio::ip::address_v4::loopback(), server.port()),
+        hello(c_guid, session_limits), 5);
+    require(retry.state().history_nonce == transaction.begin.history_nonce &&
+                retry.state().next_rel_seq == transaction.begin.rel_seq &&
+                retry.state().state_digest == transaction.begin.pre_state_digest,
+            "publication failure did not retain the exact retry cursor");
+    const TxCommit committed = retry.transfer(transaction, 47);
+    retry.close();
+    retry_server.require_success();
+    require(publish_attempts == 2 && published.size() == 1 &&
+                published.front() == input && committed.rel_seq.value == 0,
+            "retry after publication failure did not commit exactly once");
+}
+
 }  // namespace
 
 int main() {
@@ -348,6 +415,7 @@ int main() {
     test_persistent_cold_then_warm_transfer();
     test_invalid_candidate_does_not_install();
     test_mid_body_disconnect_replays_whole_transaction();
+    test_publish_failure_does_not_advance_route();
     std::cout << "p50_loopback_test: all staged loopback endpoint gates passed\n";
     return 0;
 }
