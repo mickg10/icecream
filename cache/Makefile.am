@@ -31,6 +31,10 @@ EXTRA_DIST = \
 	formal/Protocol50ReconnectSameGuidMutant.cfg \
 	formal/Protocol50ReconnectActiveResetMutant.cfg \
 	formal/Protocol50ReconnectRepeatResetMutant.cfg \
+	formal/Protocol50MultiRoute.tla \
+	formal/Protocol50MultiRoute.cfg \
+	formal/Protocol50MultiRouteMoveMutant.cfg \
+	formal/Protocol50MultiRouteResultMutant.cfg \
 	formal/Protocol50IncarnationBridge.tla \
 	formal/Protocol50IncarnationBridge.cfg \
 	formal/Protocol50IncarnationProgress.cfg \
