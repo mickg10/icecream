@@ -10,7 +10,9 @@ libprotocol50_a_SOURCES = \
 	p50_zstd.cpp \
 	p50_zstd.h \
 	p50_loopback.cpp \
-	p50_loopback.h
+	p50_loopback.h \
+	p50_input_record.cpp \
+	p50_input_record.h
 
 AM_CPPFLAGS = -I$(top_srcdir) $(BOOST_CPPFLAGS) $(LIBZSTD_CFLAGS)
 
