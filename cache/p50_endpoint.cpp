@@ -684,6 +684,11 @@ struct P50ServerEndpoint::Impl {
         std::unique_ptr<ZstdTuDialogue> dialogue;
     };
 
+    struct PreparedBegin {
+        Pending pending;
+        bool replay = false;
+    };
+
     struct Route {
         HistoryNonce nonce{};
         RelSeq next_rel{};
@@ -701,10 +706,27 @@ struct P50ServerEndpoint::Impl {
         std::optional<std::vector<uint8_t>> committed;
     };
 
+    struct Revision {
+        uint64_t value = 0;
+        bool exhausted = false;
+    };
+
+    struct LiveSession {
+        FStoreGuid f_guid{};
+        std::optional<CStoreGuid> c_guid;
+        uint64_t candidate_revision = 0;
+        HistoryNonce candidate_nonce{};
+        RelSeq candidate_rel{};
+        bool activated = false;
+    };
+
     struct Session {
         uint64_t serial = 0;
         FStoreGuid f_guid{};
         std::optional<CStoreGuid> c_guid;
+        uint64_t candidate_revision = 0;
+        std::optional<SessionState> candidate_state;
+        bool activated = false;
     };
 
     Impl(FStoreGuid f_guid_value, EndpointCaps cap_value, CompletionLog* completion_log,
@@ -722,28 +744,39 @@ struct P50ServerEndpoint::Impl {
             session_exhausted = true;
         else
             ++next_session;
-        const auto inserted = live_sessions.emplace(result, f_guid);
+        const auto inserted = live_sessions.emplace(
+            result, LiveSession{.f_guid = f_guid,
+                                .c_guid = std::nullopt,
+                                .candidate_revision = 0,
+                                .candidate_nonce = HistoryNonce{},
+                                .candidate_rel = RelSeq{},
+                                .activated = false});
         if (!inserted.second)
             throw std::logic_error("F endpoint reused a live session serial");
-        return Session{result, f_guid, std::nullopt};
+        return Session{.serial = result,
+                       .f_guid = f_guid,
+                       .c_guid = std::nullopt,
+                       .candidate_revision = 0,
+                       .candidate_state = std::nullopt,
+                       .activated = false};
     }
 
     void require_incarnation(const Session& session) const {
         const auto position = live_sessions.find(session.serial);
         if (session.serial == 0 || session.f_guid != f_guid ||
-            position == live_sessions.end() || position->second != session.f_guid)
+            position == live_sessions.end() || position->second.f_guid != session.f_guid)
             throw StaleCompletion();
     }
 
     void release_session(const Session& session) {
         const auto position = live_sessions.find(session.serial);
-        if (position != live_sessions.end() && position->second == session.f_guid)
+        if (position != live_sessions.end() && position->second.f_guid == session.f_guid)
             live_sessions.erase(position);
     }
 
     Namespace& require(const Session& session) {
         require_incarnation(session);
-        if (!session.c_guid)
+        if (!session.c_guid || !session.activated)
             throw StaleCompletion();
         auto position = namespaces.find(*session.c_guid);
         if (position == namespaces.end() || position->second.active_session != session.serial)
@@ -753,7 +786,7 @@ struct P50ServerEndpoint::Impl {
 
     const Namespace& require(const Session& session) const {
         require_incarnation(session);
-        if (!session.c_guid)
+        if (!session.c_guid || !session.activated)
             throw StaleCompletion();
         const auto position = namespaces.find(*session.c_guid);
         if (position == namespaces.end() || position->second.active_session != session.serial)
@@ -770,7 +803,7 @@ struct P50ServerEndpoint::Impl {
         result.f_store_guid = session.f_guid;
         result.session_serial = session.serial;
         const TxBegin* begin = explicit_begin;
-        if (!begin && session.c_guid) {
+        if (!begin && session.activated && session.c_guid) {
             const auto position = namespaces.find(*session.c_guid);
             if (position != namespaces.end() && position->second.route) {
                 const Route& route = *position->second.route;
@@ -779,6 +812,10 @@ struct P50ServerEndpoint::Impl {
                 if (route.pending)
                     begin = &route.pending->begin;
             }
+        } else if (!begin && session.candidate_state &&
+                   session.candidate_state->route_present) {
+            result.history_nonce = session.candidate_state->history_nonce;
+            result.rel_seq = session.candidate_state->next_rel_seq;
         }
         if (begin) {
             result.history_nonce = begin->history_nonce;
@@ -794,10 +831,24 @@ struct P50ServerEndpoint::Impl {
         if (completion.actor != ActorSide::F || completion.f_store_guid != f_guid)
             throw StaleCompletion();
         const auto live = live_sessions.find(completion.session_serial);
-        if (live == live_sessions.end() || live->second != completion.f_store_guid)
+        if (live == live_sessions.end() || live->second.f_guid != completion.f_store_guid)
             throw StaleCompletion();
+        const LiveSession& current = live->second;
         if (completion.c_store_guid == CStoreGuid{}) {
-            if (completion.transaction_bound || completion.history_nonce.value != 0)
+            if (current.c_guid || completion.transaction_bound ||
+                completion.history_nonce.value != 0)
+                throw StaleCompletion();
+            return;
+        }
+        if (!current.c_guid || completion.c_store_guid != *current.c_guid)
+            throw StaleCompletion();
+        if (!current.activated) {
+            const auto revision = revisions.find(completion.c_store_guid);
+            if (revision == revisions.end() || revision->second.exhausted ||
+                revision->second.value != current.candidate_revision ||
+                completion.transaction_bound ||
+                completion.history_nonce != current.candidate_nonce ||
+                completion.rel_seq != current.candidate_rel)
                 throw StaleCompletion();
             return;
         }
@@ -851,9 +902,91 @@ struct P50ServerEndpoint::Impl {
         actions->record(std::move(value));
     }
 
-    void bind(Session& session, CStoreGuid c_guid) {
+    uint64_t current_revision(CStoreGuid c_guid) {
+        Revision& revision = revisions[c_guid];
+        if (revision.exhausted)
+            throw std::overflow_error(
+                "candidate revision requires F_STORE_GUID replacement");
+        return revision.value;
+    }
+
+    void advance_revision(CStoreGuid c_guid) {
+        Revision& revision = revisions[c_guid];
+        if (revision.exhausted ||
+            revision.value == std::numeric_limits<uint64_t>::max()) {
+            revision.exhausted = true;
+            throw std::overflow_error(
+                "candidate revision requires F_STORE_GUID replacement");
+        }
+        ++revision.value;
+        if (revision.value == std::numeric_limits<uint64_t>::max())
+            revision.exhausted = true;
+    }
+
+    void advance_revision_on_disconnect(CStoreGuid c_guid) noexcept {
+        Revision& revision = revisions[c_guid];
+        if (revision.exhausted)
+            return;
+        if (revision.value == std::numeric_limits<uint64_t>::max())
+            revision.exhausted = true;
+        else
+            ++revision.value;
+    }
+
+    SessionState snapshot(CStoreGuid c_guid, SessionSelection selection) const {
+        SessionState result;
+        result.selected_protocol = selection.protocol;
+        result.negotiated_profiles = selection.negotiated_profiles;
+        result.limits = selection.limits;
+        result.f_store_guid = f_guid;
+        const auto position = namespaces.find(c_guid);
+        if (position == namespaces.end())
+            return result;
+        const Namespace& space = position->second;
+        result.namespace_present = space.established;
+        result.route_present = space.route.has_value();
+        if (space.route) {
+            result.history_nonce = space.route->nonce;
+            result.next_rel_seq = space.route->next_rel;
+            result.state_digest = space.route->state;
+            result.last_commit = space.route->last_commit;
+        }
+        return result;
+    }
+
+    SessionState stage(Session& session, CStoreGuid c_guid,
+                       SessionSelection selection) {
         require_incarnation(session);
-        auto [position, inserted] = namespaces.try_emplace(c_guid);
+        if (c_guid == CStoreGuid{})
+            throw std::invalid_argument("SESSION_HELLO C_STORE_GUID zero is reserved");
+        const uint64_t revision = current_revision(c_guid);
+        SessionState state = snapshot(c_guid, selection);
+        session.c_guid = c_guid;
+        session.candidate_revision = revision;
+        session.candidate_state = state;
+        LiveSession& live = live_sessions.at(session.serial);
+        live.c_guid = c_guid;
+        live.candidate_revision = revision;
+        if (state.route_present) {
+            live.candidate_nonce = state.history_nonce;
+            live.candidate_rel = state.next_rel_seq;
+        }
+        return state;
+    }
+
+    void activate(Session& session) {
+        require_incarnation(session);
+        if (!session.c_guid || !session.candidate_state || session.activated)
+            throw std::logic_error("F endpoint candidate cannot activate");
+        LiveSession& live = live_sessions.at(session.serial);
+        const auto revision = revisions.find(*session.c_guid);
+        if (!live.c_guid || *live.c_guid != *session.c_guid || live.activated ||
+            revision == revisions.end() || revision->second.exhausted ||
+            revision->second.value != session.candidate_revision)
+            throw StaleCompletion();
+        advance_revision(*session.c_guid);
+
+        auto [position, inserted] = namespaces.try_emplace(*session.c_guid);
         Namespace& space = position->second;
         const bool replaced = !inserted && space.active_session != 0;
         if (space.route && space.route->pending) {
@@ -861,7 +994,9 @@ struct P50ServerEndpoint::Impl {
             space.route->pending.reset();
         }
         space.active_session = session.serial;
-        session.c_guid = c_guid;
+        session.activated = true;
+        live.activated = true;
+        session.candidate_state.reset();
         record(replaced ? ActionType::SESSION_REPLACED : ActionType::SESSION_OPENED, session);
     }
 
@@ -881,6 +1016,7 @@ struct P50ServerEndpoint::Impl {
         }
         record(ActionType::SESSION_DISCONNECTED, session);
         space.active_session = 0;
+        advance_revision_on_disconnect(*session.c_guid);
     }
 
     SessionState session_state(const Session& session, SessionSelection selection) const {
@@ -901,16 +1037,34 @@ struct P50ServerEndpoint::Impl {
         return result;
     }
 
-    void reset_history(const Session& session, const HistoryReset& reset) {
-        Namespace& space = require(session);
-        if (space.route && (space.route->pending || space.route->interrupted))
+    void validate_history_reset(CStoreGuid c_guid, const Namespace* space,
+                                const HistoryReset& reset) const {
+        if (space && space->route &&
+            (space->route->pending || space->route->interrupted))
             throw std::logic_error(
                 "HISTORY_RESET arrived while F retained transaction identity");
         if (reset.initial_state_digest !=
-            initial_route_digest(*session.c_guid, reset.history_nonce))
+            initial_route_digest(c_guid, reset.history_nonce))
             throw std::invalid_argument("HISTORY_RESET digest was not derived locally");
-        if (space.nonce_high_water && reset.history_nonce.value <= space.nonce_high_water->value)
+        if (space && space->nonce_high_water &&
+            reset.history_nonce.value <= space->nonce_high_water->value)
             throw std::invalid_argument("HISTORY_RESET nonce did not advance monotonically");
+    }
+
+    void validate_history_reset_candidate(const Session& session,
+                                          const HistoryReset& reset) const {
+        require_incarnation(session);
+        if (!session.c_guid || session.activated)
+            throw StaleCompletion();
+        const auto position = namespaces.find(*session.c_guid);
+        validate_history_reset(*session.c_guid,
+                               position == namespaces.end() ? nullptr : &position->second,
+                               reset);
+    }
+
+    void reset_history(const Session& session, const HistoryReset& reset) {
+        Namespace& space = require(session);
+        validate_history_reset(*session.c_guid, &space, reset);
         space.established = true;
         space.nonce_high_water = reset.history_nonce;
         space.route = Route{.nonce = reset.history_nonce,
@@ -922,11 +1076,11 @@ struct P50ServerEndpoint::Impl {
         record(ActionType::HISTORY_RESET, session);
     }
 
-    bool begin(const Session& session, const TxBegin& begin, uint32_t negotiated_profiles) {
-        Namespace& space = require(session);
+    PreparedBegin prepare_begin(const Namespace& space, const TxBegin& begin,
+                                uint32_t negotiated_profiles) const {
         if (!space.route)
             throw std::logic_error("TX_BEGIN arrived before HISTORY_RESET");
-        Route& route = *space.route;
+        const Route& route = *space.route;
         if (begin.history_nonce != route.nonce || begin.rel_seq != route.next_rel ||
             begin.pre_state_digest != route.state)
             throw std::logic_error("TX_BEGIN differs from the F route cursor");
@@ -938,17 +1092,45 @@ struct P50ServerEndpoint::Impl {
             throw std::invalid_argument("TX_BEGIN profile was not negotiated");
         if (route.pending)
             throw std::logic_error("F endpoint already has one active transaction");
-        const bool replay = route.interrupted && *route.interrupted == begin;
+        PreparedBegin result;
+        result.replay = route.interrupted && *route.interrupted == begin;
+        result.pending.begin = begin;
+        result.pending.dialogue =
+            std::make_unique<ZstdTuDialogue>(negotiated_profiles, caps.zstd);
+        result.pending.dialogue->begin(begin);
+        return result;
+    }
+
+    PreparedBegin prepare_begin_candidate(const Session& session, const TxBegin& begin,
+                                          uint32_t negotiated_profiles) const {
+        require_incarnation(session);
+        if (!session.c_guid || session.activated)
+            throw StaleCompletion();
+        const auto position = namespaces.find(*session.c_guid);
+        if (position == namespaces.end())
+            throw std::logic_error("TX_BEGIN arrived before HISTORY_RESET");
+        return prepare_begin(position->second, begin, negotiated_profiles);
+    }
+
+    bool install_begin(const Session& session, PreparedBegin prepared) {
+        Namespace& space = require(session);
+        Route& route = *space.route;
+        if (route.pending)
+            throw std::logic_error("F endpoint already has one active transaction");
+        const TxBegin begin = prepared.pending.begin;
+        const bool replay = prepared.replay;
         route.interrupted.reset();
-        Pending pending;
-        pending.begin = begin;
-        pending.dialogue = std::make_unique<ZstdTuDialogue>(negotiated_profiles, caps.zstd);
-        pending.dialogue->begin(begin);
-        route.pending = std::move(pending);
+        route.pending = std::move(prepared.pending);
         record(replay ? ActionType::ACTIVE_REPLAYED : ActionType::TX_BEGIN, session, &begin);
         record(ActionType::DICT_COMPLETE, session, &begin);
         record(ActionType::NEED_RECORDED, session, &begin);
         return replay;
+    }
+
+    bool begin(const Session& session, const TxBegin& begin,
+               uint32_t negotiated_profiles) {
+        const Namespace& space = require(session);
+        return install_begin(session, prepare_begin(space, begin, negotiated_profiles));
     }
 
     void append_body(const Session& session, BodyMessage message) {
@@ -1004,8 +1186,9 @@ struct P50ServerEndpoint::Impl {
     EndpointCaps caps{};
     uint64_t next_session = 1;
     bool session_exhausted = false;
-    std::map<uint64_t, FStoreGuid> live_sessions;
+    std::map<uint64_t, LiveSession> live_sessions;
     std::map<CStoreGuid, Namespace> namespaces;
+    std::map<CStoreGuid, Revision> revisions;
     CompletionLog* completions = nullptr;
     ActionTrace* actions = nullptr;
 };
@@ -1280,8 +1463,7 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::accept_one(tcp::accep
         const SessionSelection selection =
             negotiate_session(hello, kProtocolVersion, kProtocolVersion,
                               profile_bit(ProfileId::ZSTD_TU), impl_->caps.wire);
-        impl_->bind(session, hello.c_store_guid);
-        SessionState state = impl_->session_state(session, selection);
+        SessionState state = impl_->stage(session, hello.c_store_guid, selection);
         co_await async_write_message(socket, state, selection.limits.max_frame_payload,
                                      impl_->stamp(session, AsyncOperationKind::WriteFragment),
                                      impl_->completions, control, verify);
@@ -1290,7 +1472,10 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::accept_one(tcp::accep
             socket, selection.limits.max_frame_payload,
             impl_->stamp(session, AsyncOperationKind::ReadHeader), impl_->completions, verify);
         if (next.type == MessageType::HISTORY_RESET) {
-            impl_->reset_history(session, decode_as<HistoryReset>(next));
+            const HistoryReset reset = decode_as<HistoryReset>(next);
+            impl_->validate_history_reset_candidate(session, reset);
+            impl_->activate(session);
+            impl_->reset_history(session, reset);
             SessionState reset_ack = impl_->session_state(session, selection);
             co_await async_write_message(socket, reset_ack, selection.limits.max_frame_payload,
                                          impl_->stamp(session, AsyncOperationKind::WriteFragment),
@@ -1298,9 +1483,15 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::accept_one(tcp::accep
             next = co_await async_read_frame(socket, selection.limits.max_frame_payload,
                                              impl_->stamp(session, AsyncOperationKind::ReadHeader),
                                              impl_->completions, verify);
+            const TxBegin begin = decode_as<TxBegin>(next);
+            impl_->begin(session, begin, selection.negotiated_profiles);
+        } else {
+            const TxBegin begin = decode_as<TxBegin>(next);
+            Impl::PreparedBegin prepared = impl_->prepare_begin_candidate(
+                session, begin, selection.negotiated_profiles);
+            impl_->activate(session);
+            impl_->install_begin(session, std::move(prepared));
         }
-        const TxBegin begin = decode_as<TxBegin>(next);
-        impl_->begin(session, begin, selection.negotiated_profiles);
 
         do {
             Frame component = co_await async_read_frame(
@@ -1360,12 +1551,18 @@ void P50ServerEndpoint::reset_store(FStoreGuid new_guid) {
         throw std::invalid_argument("F store reset requires a fresh GUID");
     for (const auto& [guid, space] : impl_->namespaces) {
         if (space.active_session != 0) {
-            Impl::Session invalidated{space.active_session, impl_->f_guid, guid};
+            Impl::Session invalidated{.serial = space.active_session,
+                                      .f_guid = impl_->f_guid,
+                                      .c_guid = guid,
+                                      .candidate_revision = 0,
+                                      .candidate_state = std::nullopt,
+                                      .activated = true};
             impl_->record(ActionType::SESSION_DISCONNECTED, invalidated);
         }
     }
     impl_->live_sessions.clear();
     impl_->namespaces.clear();
+    impl_->revisions.clear();
     impl_->f_guid = new_guid;
 }
 
