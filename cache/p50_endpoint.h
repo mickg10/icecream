@@ -52,6 +52,23 @@ struct CompletionStamp {
     auto operator<=>(const CompletionStamp&) const = default;
 };
 
+// The endpoint identity derived from current product state after an asynchronous
+// operation completes.  It intentionally excludes the operation kind: that is
+// frozen in CompletionStamp and checked on the observed-completion path.
+struct CompletionLiveIdentity {
+    ActorSide actor = ActorSide::C;
+    CStoreGuid c_store_guid{};
+    FStoreGuid f_store_guid{};
+    uint64_t session_serial = 0;
+    HistoryNonce history_nonce{};
+    RelSeq rel_seq{};
+    TuSeq tu_seq{};
+    Digest128 transaction_digest{};
+    Digest128 raw_digest{};
+    bool transaction_bound = false;
+    auto operator<=>(const CompletionLiveIdentity&) const = default;
+};
+
 struct AsyncCompletion {
     CompletionStamp stamp{};
     uint64_t transferred_bytes = 0;
@@ -80,6 +97,10 @@ struct EndpointIoControl {
     // Receives only the observed test copy; the endpoint retains and checks
     // its independently frozen pre-await completion stamp.
     std::function<void(CompletionStamp&)> before_completion_check;
+    // Receives only a derived live-identity copy. Product endpoint state stays
+    // private, and both endpoints use the same field-by-field validator.
+    std::function<void(const CompletionStamp&, CompletionLiveIdentity&)>
+        before_live_identity_check;
 };
 
 struct PrepareRequestKey {
