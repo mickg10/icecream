@@ -86,7 +86,7 @@ PublishUseCS ==
        \/ /\ MutantPublishAfterCancel
            /\ sPhase = "Cancelling"
     /\ usecsPublished' = TRUE
-    /\ badPublish' = badPublish \/ cancelBeforePublication
+    /\ badPublish' = (badPublish \/ cancelBeforePublication)
     /\ UNCHANGED <<mode, sPhase, fPhase, s2f, f2s,
                     claimAccepted, claimRejected,
                     cancelBeforePublication, prepareConsumed,
@@ -98,7 +98,7 @@ QueueCancel ==
     /\ sPhase' = "Cancelling"
     /\ s2f' = Append(s2f, "Revoke")
     /\ cancelBeforePublication' =
-           cancelBeforePublication \/ ~usecsPublished
+           (cancelBeforePublication \/ ~usecsPublished)
     /\ UNCHANGED <<mode, fPhase, f2s, usecsPublished,
                     claimAccepted, claimRejected, prepareConsumed,
                     readyObserved, revokeConsumed, releaseProof,
@@ -116,7 +116,7 @@ ConsumePrepare ==
        /\ f2s' = Append(f2s, "Ready")
        /\ fPhase' = nextF
        /\ prepareConsumed' = TRUE
-       /\ badRegression' = badRegression \/ regresses
+       /\ badRegression' = (badRegression \/ regresses)
        /\ UNCHANGED <<mode, sPhase, usecsPublished,
                        claimAccepted, claimRejected,
                        cancelBeforePublication, readyObserved,
@@ -174,7 +174,7 @@ ConsumeRevoke ==
        /\ f2s' = Append(f2s, reply)
        /\ fPhase' = nextF
        /\ revokeConsumed' = TRUE
-       /\ badRevoked' = badRevoked \/ wrongRevoked
+       /\ badRevoked' = (badRevoked \/ wrongRevoked)
        /\ UNCHANGED <<mode, sPhase, usecsPublished,
                        claimAccepted, claimRejected,
                        cancelBeforePublication, prepareConsumed,
