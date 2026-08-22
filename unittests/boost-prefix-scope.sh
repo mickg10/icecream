@@ -91,6 +91,9 @@ done
         CXXFLAGS="${ICECC_TEST_CXXFLAGS:-}" \
         LDFLAGS="${ICECC_TEST_LDFLAGS:-}" \
         LIBS="${ICECC_TEST_LIBS:-}" \
+        PKG_CONFIG="${ICECC_TEST_PKG_CONFIG:-pkg-config}" \
+        PKG_CONFIG_PATH="${ICECC_TEST_PKG_CONFIG_PATH:-}" \
+        PKG_CONFIG_LIBDIR="${ICECC_TEST_PKG_CONFIG_LIBDIR:-}" \
         CC="$icecc_test_cc" CXX="$icecc_test_cxx" \
         AR="$icecc_test_ar" RANLIB="$icecc_test_ranlib" \
         ICE_CXX_STANDARD_FLAG="${ICECC_TEST_CXX_STANDARD_FLAG:-}" \
