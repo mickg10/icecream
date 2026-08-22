@@ -432,6 +432,42 @@ AC_SUBST(LZO_LDADD)
 
 PKG_CHECK_MODULES([LIBZSTD], [libzstd >= 1.4.0])
 
+dnl Protocol-50 bounds decompression before allocation with this exact API.
+dnl Check the selected header and library together: a version string alone does
+dnl not prove that the enum and entry point are available in both.
+icecc_save_CPPFLAGS="$CPPFLAGS"
+icecc_save_LIBS="$LIBS"
+CPPFLAGS="$LIBZSTD_CFLAGS $CPPFLAGS"
+LIBS="$LIBZSTD_LIBS $LIBS"
+AC_MSG_CHECKING([for required bounded Zstd context APIs])
+AC_LINK_IFELSE([AC_LANG_PROGRAM([[
+    #include <zstd.h>
+    ]], [[
+        ZSTD_CCtx *compress = ZSTD_createCCtx();
+        ZSTD_DCtx *decompress = ZSTD_createDCtx();
+        if (compress == nullptr || decompress == nullptr)
+            return 1;
+        size_t result = ZSTD_CCtx_reset(
+            compress, ZSTD_reset_session_and_parameters);
+        result |= ZSTD_CCtx_setParameter(
+            compress, ZSTD_c_compressionLevel, 1);
+        result |= ZSTD_CCtx_setParameter(compress, ZSTD_c_windowLog, 10);
+        char encoded[64];
+        result |= ZSTD_compress2(compress, encoded, sizeof(encoded), "", 0);
+        result |= ZSTD_DCtx_setParameter(
+            decompress, ZSTD_d_windowLogMax, 10);
+        ZSTD_freeCCtx(compress);
+        ZSTD_freeDCtx(decompress);
+        return ZSTD_isError(result) ? 1 : 0;
+    ]])], [
+        AC_MSG_RESULT([yes])
+    ], [
+        AC_MSG_RESULT([no])
+        AC_MSG_ERROR([libzstd headers and library must provide ZSTD context reset, parameter, bounded-window, and compress2 APIs])
+    ])
+CPPFLAGS="$icecc_save_CPPFLAGS"
+LIBS="$icecc_save_LIBS"
+
 AC_CHECK_LIB([dl], [dlsym], [DL_LDADD=-ldl])
 AC_SUBST([DL_LDADD])
 

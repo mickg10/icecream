@@ -351,6 +351,14 @@ struct InterruptedRawTu {
     std::vector<uint8_t> body;
 };
 
+enum class TerminalBodyFailure {
+    ZeroProgress,
+    Excess,
+    ComponentDigest,
+    ZstdDecode,
+    RawDigest,
+};
+
 asio::awaitable<InterruptedRawTu> raw_partial_body_disconnect(
     tcp::endpoint remote, CStoreGuid c_guid, std::span<const uint8_t> input) {
     const auto executor = co_await asio::this_coro::executor;
@@ -373,6 +381,66 @@ asio::awaitable<InterruptedRawTu> raw_partial_body_disconnect(
     co_await raw_write(socket, std::move(partial_message));
     boost::system::error_code ignored;
     socket.close(ignored);
+    co_return InterruptedRawTu{std::move(begin), std::move(prepared.body)};
+}
+
+asio::awaitable<InterruptedRawTu> raw_terminal_body_failure(
+    tcp::endpoint remote, CStoreGuid c_guid, std::span<const uint8_t> input,
+    TerminalBodyFailure scenario, bool receive_terminal = true) {
+    const auto executor = co_await asio::this_coro::executor;
+    tcp::socket socket(executor);
+    RawRoute open = co_await raw_open(socket, remote, c_guid);
+    SessionState route = open.state;
+    if (!route.route_present)
+        route = co_await raw_reset(socket, open, HistoryNonce{701});
+    ZstdTuEnvelope prepared = encode_zstd_tu(
+        HistoryNonce{1}, RelSeq{0}, TuSeq{81}, Digest128{}, input);
+    TxBegin begin = make_begin(prepared, route.history_nonce,
+                               route.state_digest, route.next_rel_seq);
+    std::vector<uint8_t> sent_body = prepared.body;
+    if (scenario == TerminalBodyFailure::ZstdDecode) {
+        std::fill(sent_body.begin(), sent_body.end(), uint8_t{0});
+        begin.body = describe_component(kZstdTuBodyEncoding, sent_body,
+                                        begin.raw_bytes);
+        begin.transaction_digest = compute_transaction_digest(
+            begin, std::span<const uint8_t>{}, sent_body);
+        prepared.body = sent_body;
+    } else if (scenario == TerminalBodyFailure::RawDigest) {
+        begin.raw_digest.bytes[0] ^= 0x80;
+        begin.transaction_digest = compute_transaction_digest(
+            begin, std::span<const uint8_t>{}, sent_body);
+    }
+
+    co_await raw_write(socket, begin);
+    switch (scenario) {
+    case TerminalBodyFailure::ZeroProgress:
+        sent_body.clear();
+        break;
+    case TerminalBodyFailure::Excess:
+        sent_body.push_back(0xff);
+        break;
+    case TerminalBodyFailure::ComponentDigest:
+        if (sent_body.empty())
+            throw std::logic_error("component-digest fixture encoded an empty BODY");
+        sent_body.front() ^= 0x80;
+        break;
+    case TerminalBodyFailure::ZstdDecode:
+    case TerminalBodyFailure::RawDigest:
+        break;
+    }
+    Message body_message = BodyMessage{std::move(sent_body)};
+    co_await raw_write(socket, std::move(body_message));
+    if (!receive_terminal) {
+        boost::system::error_code ignored;
+        socket.close(ignored);
+        co_return InterruptedRawTu{std::move(begin), std::move(prepared.body)};
+    }
+    const Frame terminal =
+        co_await raw_read(socket, route.limits.max_frame_payload);
+    if (terminal.type != MessageType::ERROR)
+        throw std::logic_error("terminal BODY fixture did not receive ERROR");
+    (void)raw_decode<ErrorMessage>(terminal);
+    co_await raw_wait_for_close(socket);
     co_return InterruptedRawTu{std::move(begin), std::move(prepared.body)};
 }
 
@@ -419,6 +487,29 @@ asio::awaitable<void> raw_exact_whole_tu_replay(
         throw std::logic_error("exact replay received a different commit identity");
     boost::system::error_code ignored;
     socket.close(ignored);
+}
+
+asio::awaitable<void> raw_exact_whole_tu_rejected(
+    tcp::endpoint remote, CStoreGuid c_guid,
+    const InterruptedRawTu& interrupted) {
+    const auto executor = co_await asio::this_coro::executor;
+    tcp::socket socket(executor);
+    const RawRoute open = co_await raw_open(socket, remote, c_guid);
+    if (open.state.history_nonce != interrupted.begin.history_nonce ||
+        open.state.next_rel_seq != interrupted.begin.rel_seq ||
+        open.state.state_digest != interrupted.begin.pre_state_digest)
+        throw std::logic_error(
+            "deterministic-failure route cursor changed before exact replay");
+    co_await raw_write(socket, interrupted.begin);
+    Message body_message = BodyMessage{interrupted.body};
+    co_await raw_write(socket, std::move(body_message));
+    const Frame terminal =
+        co_await raw_read(socket, open.state.limits.max_frame_payload);
+    if (terminal.type != MessageType::ERROR)
+        throw std::logic_error(
+            "deterministic-failure exact replay did not receive ERROR");
+    (void)raw_decode<ErrorMessage>(terminal);
+    co_await raw_wait_for_close(socket);
 }
 
 asio::awaitable<RawRoute> raw_open(tcp::socket& socket, const tcp::endpoint& remote,
@@ -594,6 +685,79 @@ asio::awaitable<void> raw_route_mismatch_peer(tcp::acceptor& acceptor,
         if (terminal.code == 0)
             throw std::logic_error("route mismatch received a zero-code ERROR");
     }
+    co_await raw_wait_for_close(socket);
+}
+
+asio::awaitable<void> raw_zero_f_store_state_peer(tcp::acceptor& acceptor) {
+    const auto executor = co_await asio::this_coro::executor;
+    tcp::socket socket(executor);
+    co_await acceptor.async_accept(socket, asio::use_awaitable);
+    const SessionHello hello = raw_decode<SessionHello>(
+        co_await raw_read(socket, kInitialMaxFramePayload));
+
+    SessionState state;
+    state.selected_protocol = kProtocolVersion;
+    state.negotiated_profiles = profile_bit(ProfileId::ZSTD_TU);
+    state.limits = hello.limits;
+    state.f_store_guid = Id128::from_u64(6000);
+    std::vector<uint8_t> frame = encode_frame(Message{state});
+    constexpr size_t frame_header_bytes = 4;
+    constexpr size_t f_guid_payload_offset = 2 + 4 + 4 + 8;
+    std::fill_n(frame.begin() + frame_header_bytes + f_guid_payload_offset,
+                16, uint8_t{0});
+    co_await raw_write_bytes(socket, frame);
+    co_await raw_wait_for_close(socket);
+}
+
+asio::awaitable<void> raw_zero_c_store_hello(tcp::endpoint remote) {
+    const auto executor = co_await asio::this_coro::executor;
+    tcp::socket socket(executor);
+    co_await socket.async_connect(remote, asio::use_awaitable);
+    SessionHello hello;
+    hello.c_store_guid = Id128::from_u64(6001);
+    hello.supported_profiles = profile_bit(ProfileId::ZSTD_TU);
+    std::vector<uint8_t> frame = encode_frame(Message{hello});
+    constexpr size_t frame_header_bytes = 4;
+    constexpr size_t c_guid_payload_offset = 2 + 2;
+    std::fill_n(frame.begin() + frame_header_bytes + c_guid_payload_offset,
+                16, uint8_t{0});
+    co_await raw_write_bytes(socket, frame);
+    const ErrorMessage terminal = raw_decode<ErrorMessage>(
+        co_await raw_read(socket, kInitialMaxFramePayload));
+    if (terminal.code == 0)
+        throw std::logic_error("zero C_STORE_GUID received a zero-code ERROR");
+    co_await raw_wait_for_close(socket);
+}
+
+asio::awaitable<void> raw_zero_error_code_peer(tcp::acceptor& acceptor) {
+    const auto executor = co_await asio::this_coro::executor;
+    tcp::socket socket(executor);
+    co_await acceptor.async_accept(socket, asio::use_awaitable);
+    (void)raw_decode<SessionHello>(
+        co_await raw_read(socket, kInitialMaxFramePayload));
+
+    std::vector<uint8_t> frame =
+        encode_frame(Message{ErrorMessage{1, "reserved-code fixture"}});
+    frame[4] = 0;
+    frame[5] = 0;
+    co_await raw_write_bytes(socket, frame);
+    co_await raw_wait_for_close(socket);
+}
+
+asio::awaitable<void> raw_zero_history_reset(tcp::endpoint remote,
+                                              CStoreGuid c_guid) {
+    const auto executor = co_await asio::this_coro::executor;
+    tcp::socket socket(executor);
+    const RawRoute open = co_await raw_open(socket, remote, c_guid);
+    const HistoryReset valid{
+        HistoryNonce{1}, initial_route_digest(c_guid, HistoryNonce{1})};
+    std::vector<uint8_t> frame = encode_frame(Message{valid});
+    std::fill_n(frame.begin() + 4, sizeof(uint64_t), uint8_t{0});
+    co_await raw_write_bytes(socket, frame);
+    const ErrorMessage terminal = raw_decode<ErrorMessage>(
+        co_await raw_read(socket, open.state.limits.max_frame_payload));
+    if (terminal.code == 0)
+        throw std::logic_error("zero HISTORY_NONCE received a zero-code ERROR");
     co_await raw_wait_for_close(socket);
 }
 
@@ -806,6 +970,66 @@ bool force_rejected_route_reset(P50ServerEndpoint& server, CStoreGuid c_guid,
     return rejected;
 }
 
+std::pair<InterruptedRawTu, ServerRunResult> force_terminal_body_failure(
+    P50ServerEndpoint& server, CStoreGuid c_guid,
+    std::span<const uint8_t> input, TerminalBodyFailure scenario,
+    bool receive_terminal = true) {
+    asio::io_context context;
+    tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    std::future<ServerRunResult> server_future =
+        asio::co_spawn(context, server.accept_one(acceptor), asio::use_future);
+    std::future<InterruptedRawTu> peer_future = asio::co_spawn(
+        context,
+        raw_terminal_body_failure(acceptor.local_endpoint(), c_guid, input,
+                                  scenario, receive_terminal),
+        asio::use_future);
+    context.run();
+    InterruptedRawTu interrupted = peer_future.get();
+    return {std::move(interrupted), server_future.get()};
+}
+
+ServerRunResult force_different_begin_rejected(
+    P50ServerEndpoint& server, CStoreGuid c_guid, const TxBegin& interrupted) {
+    asio::io_context context;
+    tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    std::future<ServerRunResult> server_future =
+        asio::co_spawn(context, server.accept_one(acceptor), asio::use_future);
+    std::future<void> peer_future = asio::co_spawn(
+        context,
+        raw_different_begin_rejected(acceptor.local_endpoint(), c_guid,
+                                     interrupted),
+        asio::use_future);
+    context.run();
+    peer_future.get();
+    return server_future.get();
+}
+
+ServerRunResult force_exact_whole_tu_replay(
+    P50ServerEndpoint& server, CStoreGuid c_guid,
+    const InterruptedRawTu& interrupted, bool expect_commit) {
+    asio::io_context context;
+    tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    std::future<ServerRunResult> server_future =
+        asio::co_spawn(context, server.accept_one(acceptor), asio::use_future);
+    std::future<void> peer_future;
+    if (expect_commit) {
+        peer_future = asio::co_spawn(
+            context,
+            raw_exact_whole_tu_replay(acceptor.local_endpoint(), c_guid,
+                                      interrupted),
+            asio::use_future);
+    } else {
+        peer_future = asio::co_spawn(
+            context,
+            raw_exact_whole_tu_rejected(acceptor.local_endpoint(), c_guid,
+                                        interrupted),
+            asio::use_future);
+    }
+    context.run();
+    peer_future.get();
+    return server_future.get();
+}
+
 void test_normal_zero_and_completion_stamps() {
     CompletionLog completions;
     ActionTrace actions;
@@ -945,6 +1169,26 @@ void test_idempotent_prepare_admission() {
     require_throws<std::invalid_argument>(
         [&] { reset_target.reset_store(FStoreGuid{}); },
         "zero F_STORE_GUID was accepted as an incarnation replacement");
+
+    for (const int invalid_window_log : {9, 32}) {
+        EndpointCaps invalid;
+        invalid.zstd.max_window_log = invalid_window_log;
+        require_throws<std::invalid_argument>(
+            [&] {
+                P50PreparationAuthority rejected(Id128::from_u64(155),
+                                                 invalid.zstd);
+            },
+            "preparation authority accepted an out-of-range Zstd window log");
+
+        auto valid_authority = std::make_shared<P50PreparationAuthority>(
+            Id128::from_u64(156));
+        require_throws<std::invalid_argument>(
+            [&] { P50ClientEndpoint rejected(valid_authority, invalid); },
+            "client endpoint accepted an out-of-range Zstd window log");
+        require_throws<std::invalid_argument>(
+            [&] { P50ServerEndpoint rejected(Id128::from_u64(157), invalid); },
+            "server endpoint accepted an out-of-range Zstd window log");
+    }
 }
 
 void test_fragmentation_at_every_control_and_body_boundary() {
@@ -1086,6 +1330,32 @@ void test_completion_identity_and_store_replacement() {
                     server.committed_input(client.c_store_guid()) == input,
                 "wrong-digest completion was not recoverable by exact replay");
         require_trace(actions, "wrong-digest completion trace");
+    }
+
+    for (bool alter_raw_digest : {false, true}) {
+        P50ServerEndpoint server(Id128::from_u64(alter_raw_digest ? 455 : 453));
+        TestClient client(Id128::from_u64(alter_raw_digest ? 456 : 454));
+        EndpointIoControl wrong;
+        if (alter_raw_digest)
+            wrong.wrong_raw_digest_completion = AsyncOperationKind::ReadPayload;
+        else
+            wrong.wrong_digest_completion = AsyncOperationKind::ReadPayload;
+        const std::vector<uint8_t> input = pseudo_random_bytes(3072);
+        const PairResult rejected =
+            run_pair(client, server, admit(client, input), {}, wrong);
+        require(rejected.server.status == ServerRunStatus::Disconnected &&
+                    rejected.client.status == ClientRunStatus::Disconnected &&
+                    client.has_active_transaction() &&
+                    !server.committed_input(client.c_store_guid()),
+                alter_raw_digest
+                    ? "late raw-digest completion changed endpoint state"
+                    : "late transaction-digest completion changed endpoint state");
+        const PairResult replayed = run_pair(client, server);
+        require(replayed.client.status == ClientRunStatus::Committed &&
+                    server.committed_input(client.c_store_guid()) == input,
+                alter_raw_digest
+                    ? "late raw-digest completion did not permit exact replay"
+                    : "late transaction-digest completion did not permit exact replay");
     }
 
     {
@@ -1495,6 +1765,110 @@ void test_handshake_binding_and_namespace_rules() {
     }
 }
 
+void test_reserved_zero_endpoint_values() {
+    {
+        P50ServerEndpoint server(Id128::from_u64(628));
+        asio::io_context context;
+        tcp::acceptor acceptor(context,
+                               {asio::ip::address_v4::loopback(), 0});
+        std::future<ServerRunResult> server_result =
+            asio::co_spawn(context, server.accept_one(acceptor),
+                           asio::use_future);
+        std::future<void> peer_result = asio::co_spawn(
+            context,
+            raw_zero_c_store_hello(acceptor.local_endpoint()),
+            asio::use_future);
+        context.run();
+        peer_result.get();
+        require(server_result.get().status == ServerRunStatus::TerminalError &&
+                    server.namespace_count() == 0,
+                "zero C_STORE_GUID left an F namespace or route");
+
+        TestClient recovered(Id128::from_u64(629));
+        const std::vector<uint8_t> input =
+            bytes("valid relationship after reserved zero C GUID\n");
+        require(run_pair(recovered, server, admit(recovered, input))
+                            .client.status == ClientRunStatus::Committed &&
+                    server.committed_input(recovered.c_store_guid()) == input,
+                "zero C_STORE_GUID changed the subsequent cold relationship");
+    }
+
+    {
+        P50ServerEndpoint server(Id128::from_u64(632));
+        const CStoreGuid c_guid = Id128::from_u64(633);
+        asio::io_context context;
+        tcp::acceptor acceptor(context,
+                               {asio::ip::address_v4::loopback(), 0});
+        std::future<ServerRunResult> server_result =
+            asio::co_spawn(context, server.accept_one(acceptor),
+                           asio::use_future);
+        std::future<void> peer_result = asio::co_spawn(
+            context,
+            raw_zero_history_reset(acceptor.local_endpoint(), c_guid),
+            asio::use_future);
+        context.run();
+        peer_result.get();
+        require(server_result.get().status == ServerRunStatus::TerminalError &&
+                    server.namespace_count() == 0 &&
+                    !server.committed_input(c_guid),
+                "zero HISTORY_NONCE left an F namespace or route");
+
+        TestClient recovered(c_guid);
+        const std::vector<uint8_t> input =
+            bytes("valid reset after reserved zero nonce\n");
+        require(run_pair(recovered, server, admit(recovered, input))
+                            .client.status == ClientRunStatus::Committed &&
+                    server.committed_input(c_guid) == input,
+                "zero HISTORY_NONCE changed the subsequent cold relationship");
+    }
+
+    {
+        TestClient client(Id128::from_u64(634));
+        const std::vector<uint8_t> input =
+            bytes("reserved zero F_STORE_GUID\n");
+        const ClientRunResult terminal = run_client_with_raw_peer(
+            client, admit(client, input), [](tcp::acceptor& acceptor) {
+                return raw_zero_f_store_state_peer(acceptor);
+            });
+        require(terminal.status == ClientRunStatus::TerminalError &&
+                    terminal.whole_new_attempt &&
+                    client.has_reconciliation_work() &&
+                    !client.has_active_transaction() &&
+                    !client.endpoint.f_store_guid() &&
+                    client.endpoint.next_rel_seq() == RelSeq{0} &&
+                    client.endpoint.state_digest() == Digest128{},
+                "zero F_STORE_GUID left C relationship state");
+        P50ServerEndpoint good(Id128::from_u64(635));
+        require(run_pair(client, good).client.status ==
+                        ClientRunStatus::Committed &&
+                    good.committed_input(client.c_store_guid()) == input,
+                "zero F_STORE_GUID changed queued retry work");
+    }
+
+    {
+        TestClient client(Id128::from_u64(636));
+        const std::vector<uint8_t> input = bytes("reserved zero ERROR code\n");
+        const ClientRunResult terminal = run_client_with_raw_peer(
+            client, admit(client, input), [](tcp::acceptor& acceptor) {
+                return raw_zero_error_code_peer(acceptor);
+            });
+        require(terminal.status == ClientRunStatus::TerminalError &&
+                    terminal.whole_new_attempt && terminal.terminal_error &&
+                    terminal.terminal_error->code != 0 &&
+                    client.has_reconciliation_work() &&
+                    !client.has_active_transaction() &&
+                    !client.endpoint.f_store_guid() &&
+                    client.endpoint.next_rel_seq() == RelSeq{0} &&
+                    client.endpoint.state_digest() == Digest128{},
+                "zero ERROR code left C relationship state");
+        P50ServerEndpoint good(Id128::from_u64(637));
+        require(run_pair(client, good).client.status ==
+                        ClientRunStatus::Committed &&
+                    good.committed_input(client.c_store_guid()) == input,
+                "zero ERROR code changed queued retry work");
+    }
+}
+
 void test_interrupted_begin_identity() {
     ActionTrace actions;
     P50ServerEndpoint server(Id128::from_u64(640), {}, nullptr, &actions);
@@ -1559,6 +1933,100 @@ void test_interrupted_begin_identity() {
                                        interrupted.begin.transaction_digest;
                         }),
             "exact whole-TU replay omitted the retained transaction identity");
+}
+
+void test_terminal_body_failure_identity() {
+    const std::vector<uint8_t> input = pseudo_random_bytes(8192);
+    uint64_t identity = 650;
+    for (const auto& [scenario, label] :
+         std::array{std::pair{TerminalBodyFailure::ZeroProgress,
+                              "zero-progress BODY"},
+                    std::pair{TerminalBodyFailure::Excess,
+                              "excess BODY"},
+                    std::pair{TerminalBodyFailure::ComponentDigest,
+                              "component digest"}}) {
+        const FStoreGuid f_guid = Id128::from_u64(identity++);
+        CompletionLog completions;
+        P50ServerEndpoint server(f_guid, {}, &completions);
+        const CStoreGuid c_guid = Id128::from_u64(identity++);
+        auto failure = force_terminal_body_failure(server, c_guid, input, scenario);
+        InterruptedRawTu interrupted = std::move(failure.first);
+        ServerRunResult terminal = std::move(failure.second);
+        require(terminal.status == ServerRunStatus::TerminalError &&
+                    !server.committed_input(c_guid),
+                std::string(label) +
+                    " failure materialized or committed input");
+        require(std::any_of(
+                    completions.completions().begin(),
+                    completions.completions().end(),
+                    [&](const AsyncCompletion& completion) {
+                        const CompletionStamp& stamp = completion.stamp;
+                        return stamp.actor == ActorSide::F &&
+                               stamp.operation == AsyncOperationKind::WriteFragment &&
+                               stamp.c_store_guid == c_guid &&
+                               stamp.f_store_guid == f_guid &&
+                               stamp.session_serial == terminal.session_serial &&
+                               stamp.history_nonce == interrupted.begin.history_nonce &&
+                               stamp.rel_seq == interrupted.begin.rel_seq &&
+                               stamp.tu_seq == interrupted.begin.tu_seq &&
+                               stamp.transaction_digest ==
+                                   interrupted.begin.transaction_digest &&
+                               stamp.raw_digest == interrupted.begin.raw_digest &&
+                               stamp.transaction_bound;
+                    }),
+                std::string(label) +
+                    " terminal completion lost the installed operation identity");
+        require(force_different_begin_rejected(server, c_guid,
+                                               interrupted.begin)
+                        .status == ServerRunStatus::TerminalError &&
+                    !server.committed_input(c_guid),
+                std::string(label) +
+                    " failure did not retain the exact TX_BEGIN identity");
+        require(force_exact_whole_tu_replay(server, c_guid, interrupted, true)
+                            .status == ServerRunStatus::Completed &&
+                    server.committed_input(c_guid) == input,
+                std::string(label) +
+                    " failure did not accept exact whole-TU replay");
+    }
+
+    {
+        P50ServerEndpoint server(Id128::from_u64(identity++));
+        const CStoreGuid c_guid = Id128::from_u64(identity++);
+        const auto [interrupted, terminal] = force_terminal_body_failure(
+            server, c_guid, input, TerminalBodyFailure::ZeroProgress, false);
+        require(terminal.status == ServerRunStatus::TerminalError &&
+                    !server.committed_input(c_guid),
+                "lost terminal report changed the interrupted transaction");
+        require(force_exact_whole_tu_replay(server, c_guid, interrupted, true)
+                            .status == ServerRunStatus::Completed &&
+                    server.committed_input(c_guid) == input,
+                "lost terminal report did not permit exact whole-TU replay");
+    }
+
+    for (const auto& [scenario, label] :
+         std::array{std::pair{TerminalBodyFailure::ZstdDecode,
+                              "Zstd decode"},
+                    std::pair{TerminalBodyFailure::RawDigest,
+                              "raw digest"}}) {
+        P50ServerEndpoint server(Id128::from_u64(identity++));
+        const CStoreGuid c_guid = Id128::from_u64(identity++);
+        const auto [interrupted, terminal] = force_terminal_body_failure(
+            server, c_guid, input, scenario);
+        require(terminal.status == ServerRunStatus::TerminalError &&
+                    !server.committed_input(c_guid),
+                std::string(label) +
+                    " failure materialized or committed input");
+        require(force_different_begin_rejected(server, c_guid,
+                                               interrupted.begin)
+                        .status == ServerRunStatus::TerminalError,
+                std::string(label) +
+                    " failure accepted a different TX_BEGIN at the retained cursor");
+        require(force_exact_whole_tu_replay(server, c_guid, interrupted, false)
+                            .status == ServerRunStatus::TerminalError &&
+                    !server.committed_input(c_guid),
+                std::string(label) +
+                    " failure did not retain its deterministic exact identity");
+    }
 }
 
 void test_disconnect_at_each_message_boundary() {
@@ -1824,7 +2292,9 @@ int main(int argc, char** argv) {
     test_same_f_route_reset();
     test_reset_ack_equality_and_terminal_result();
     test_handshake_binding_and_namespace_rules();
+    test_reserved_zero_endpoint_values();
     test_interrupted_begin_identity();
+    test_terminal_body_failure_identity();
     test_disconnect_at_each_message_boundary();
     test_component_and_allocation_caps();
     test_two_client_one_server_isolation();

@@ -34,6 +34,10 @@ struct ZstdTuEnvelope {
     auto operator<=>(const ZstdTuEnvelope&) const = default;
 };
 
+// One validation authority for every object that owns ZSTD_TU limits. Keep
+// endpoint construction and codec execution on the same accepted range.
+void validate_zstd_tu_limits(ZstdTuLimits limits);
+
 class ZstdTuCodec {
 public:
     explicit ZstdTuCodec(int compression_level = 1);

@@ -200,6 +200,7 @@ void test_session_negotiation() {
             "152-byte asymmetric control cap did not preserve the profile intersection");
 
     TxBegin zstd;
+    zstd.history_nonce = HistoryNonce{1};
     zstd.profile = ProfileId::ZSTD_TU;
     zstd.p29_root_mode = P29RootMode::NotApplicable;
     const std::vector<uint8_t> empty;
@@ -349,6 +350,185 @@ void test_received_session_state_validation() {
     require_throws<std::invalid_argument>(
         [&] { validate_session_state(hello, rejected); },
         "SESSION_STATE omitted the latest commit for an advanced route");
+}
+
+void test_reserved_zero_wire_values() {
+    SessionHello hello;
+    hello.c_store_guid = Id128::from_u64(79);
+    const std::vector<uint8_t> hello_payload =
+        encode_payload(Message{hello});
+    SessionHello zero_c = hello;
+    zero_c.c_store_guid = CStoreGuid{};
+    require_throws<std::invalid_argument>(
+        [&] { (void)encode_payload(Message{zero_c}); },
+        "SESSION_HELLO encoded reserved zero C_STORE_GUID");
+    std::vector<uint8_t> zero_c_payload = hello_payload;
+    constexpr size_t c_guid_offset = 2 + 2;
+    std::fill_n(zero_c_payload.begin() + c_guid_offset, 16, uint8_t{0});
+    require_throws<std::invalid_argument>(
+        [&] {
+            (void)decode_payload(MessageType::SESSION_HELLO,
+                                 zero_c_payload);
+        },
+        "SESSION_HELLO decoded reserved zero C_STORE_GUID");
+
+    SessionState state;
+    state.selected_protocol = kProtocolVersion;
+    state.negotiated_profiles = profile_bit(ProfileId::ZSTD_TU);
+    state.f_store_guid = Id128::from_u64(80);
+
+    const SessionState absent_round_trip = std::get<SessionState>(decode_payload(
+        MessageType::SESSION_STATE, encode_payload(Message{state})));
+    require(absent_round_trip == state &&
+                absent_round_trip.history_nonce == HistoryNonce{0} &&
+                absent_round_trip.next_rel_seq == RelSeq{0} &&
+                absent_round_trip.state_digest == Digest128{},
+            "canonical absent route did not preserve its legal zero values");
+
+    SessionState present_zero_digest = state;
+    present_zero_digest.namespace_present = true;
+    present_zero_digest.route_present = true;
+    present_zero_digest.history_nonce = HistoryNonce{1};
+    const std::vector<uint8_t> present_payload =
+        encode_payload(Message{present_zero_digest});
+    require(std::get<SessionState>(decode_payload(
+                MessageType::SESSION_STATE, present_payload)) == present_zero_digest,
+            "present route rejected legal REL_SEQ zero or all-zero state digest");
+
+    SessionState zero_route_nonce = present_zero_digest;
+    zero_route_nonce.history_nonce = HistoryNonce{0};
+    require_throws<std::invalid_argument>(
+        [&] { (void)encode_payload(Message{zero_route_nonce}); },
+        "SESSION_STATE encoded a present route with zero HISTORY_NONCE");
+    std::vector<uint8_t> zero_route_payload = present_payload;
+    constexpr size_t state_nonce_offset = 2 + 4 + 4 + 8 + 16 + 1;
+    std::fill_n(zero_route_payload.begin() + state_nonce_offset,
+                sizeof(uint64_t), uint8_t{0});
+    require_throws<std::invalid_argument>(
+        [&] {
+            (void)decode_payload(MessageType::SESSION_STATE,
+                                 zero_route_payload);
+        },
+        "SESSION_STATE decoded a present route with zero HISTORY_NONCE");
+
+    TxBegin legal_zeros;
+    legal_zeros.history_nonce = HistoryNonce{1};
+    legal_zeros.rel_seq = RelSeq{0};
+    legal_zeros.tu_seq = TuSeq{0};
+    legal_zeros.profile = ProfileId::P29;
+    legal_zeros.p29_root_mode = P29RootMode::RouteHistory;
+    legal_zeros.pre_state_digest = Digest128{};
+    legal_zeros.dict = ComponentDescriptor{};
+    legal_zeros.body = ComponentDescriptor{};
+    legal_zeros.raw_bytes = 0;
+    legal_zeros.raw_digest = Digest128{};
+    legal_zeros.transaction_digest = Digest128{};
+    const std::vector<uint8_t> legal_zero_begin_payload =
+        encode_payload(Message{legal_zeros});
+    require(std::get<TxBegin>(decode_payload(
+                MessageType::TX_BEGIN, legal_zero_begin_payload)) == legal_zeros,
+            "TX_BEGIN rejected legal zero cursor, empty input, or zero digest bits");
+    TxBegin zero_begin_nonce = legal_zeros;
+    zero_begin_nonce.history_nonce = HistoryNonce{0};
+    require_throws<std::invalid_argument>(
+        [&] { (void)encode_payload(Message{zero_begin_nonce}); },
+        "TX_BEGIN encoded reserved zero HISTORY_NONCE");
+    std::vector<uint8_t> zero_begin_payload = legal_zero_begin_payload;
+    std::fill_n(zero_begin_payload.begin(), sizeof(uint64_t), uint8_t{0});
+    require_throws<std::invalid_argument>(
+        [&] { (void)decode_payload(MessageType::TX_BEGIN, zero_begin_payload); },
+        "TX_BEGIN decoded reserved zero HISTORY_NONCE");
+
+    const TxCommit legal_zero_commit{HistoryNonce{1}, RelSeq{0}, TuSeq{0},
+                                     Digest128{}, Digest128{}, Digest128{}};
+    const std::vector<uint8_t> legal_zero_commit_payload =
+        encode_payload(Message{legal_zero_commit});
+    require(std::get<TxCommit>(decode_payload(
+                MessageType::TX_COMMIT, legal_zero_commit_payload)) ==
+                legal_zero_commit,
+            "TX_COMMIT rejected legal zero cursor or digest fields");
+    TxCommit zero_commit_nonce = legal_zero_commit;
+    zero_commit_nonce.history_nonce = HistoryNonce{0};
+    require_throws<std::invalid_argument>(
+        [&] { (void)encode_payload(Message{zero_commit_nonce}); },
+        "TX_COMMIT encoded reserved zero HISTORY_NONCE");
+    std::vector<uint8_t> zero_commit_payload = legal_zero_commit_payload;
+    std::fill_n(zero_commit_payload.begin(), sizeof(uint64_t), uint8_t{0});
+    require_throws<std::invalid_argument>(
+        [&] {
+            (void)decode_payload(MessageType::TX_COMMIT,
+                                 zero_commit_payload);
+        },
+        "TX_COMMIT decoded reserved zero HISTORY_NONCE");
+
+    SessionState retained_zero_digests = present_zero_digest;
+    retained_zero_digests.next_rel_seq = RelSeq{1};
+    retained_zero_digests.last_commit = legal_zero_commit;
+    const std::vector<uint8_t> retained_payload =
+        encode_payload(Message{retained_zero_digests});
+    require(std::get<SessionState>(decode_payload(
+                MessageType::SESSION_STATE, retained_payload)) ==
+                retained_zero_digests,
+            "retained commit rejected legal zero TU_SEQ or digest fields");
+    SessionState retained_zero_nonce = retained_zero_digests;
+    retained_zero_nonce.last_commit->history_nonce = HistoryNonce{0};
+    require_throws<std::invalid_argument>(
+        [&] { (void)encode_payload(Message{retained_zero_nonce}); },
+        "SESSION_STATE encoded a retained commit with zero HISTORY_NONCE");
+    std::vector<uint8_t> retained_zero_nonce_payload = retained_payload;
+    constexpr size_t retained_commit_nonce_offset =
+        state_nonce_offset + 8 + 8 + 16;
+    std::fill_n(retained_zero_nonce_payload.begin() + retained_commit_nonce_offset,
+                sizeof(uint64_t), uint8_t{0});
+    require_throws<std::invalid_argument>(
+        [&] {
+            (void)decode_payload(MessageType::SESSION_STATE,
+                                 retained_zero_nonce_payload);
+        },
+        "SESSION_STATE decoded a retained commit with zero HISTORY_NONCE");
+
+    SessionState zero_f = state;
+    zero_f.f_store_guid = FStoreGuid{};
+    require_throws<std::invalid_argument>(
+        [&] { (void)encode_payload(Message{zero_f}); },
+        "SESSION_STATE encoded reserved zero F_STORE_GUID");
+
+    std::vector<uint8_t> state_payload = encode_payload(Message{state});
+    constexpr size_t f_guid_offset = 2 + 4 + 4 + 8;
+    require(state_payload.size() >= f_guid_offset + 16,
+            "SESSION_STATE zero-GUID fixture is too short");
+    std::fill_n(state_payload.begin() + f_guid_offset, 16, uint8_t{0});
+    require_throws<std::invalid_argument>(
+        [&] {
+            (void)decode_payload(MessageType::SESSION_STATE, state_payload);
+        },
+        "SESSION_STATE decoded reserved zero F_STORE_GUID");
+
+    const HistoryReset reset{HistoryNonce{1}, digest("initial state")};
+    require_throws<std::invalid_argument>(
+        [&] {
+            (void)encode_payload(
+                Message{HistoryReset{HistoryNonce{0}, reset.initial_state_digest}});
+        },
+        "HISTORY_RESET encoded reserved zero nonce");
+    std::vector<uint8_t> reset_payload = encode_payload(Message{reset});
+    std::fill_n(reset_payload.begin(), sizeof(uint64_t), uint8_t{0});
+    require_throws<std::invalid_argument>(
+        [&] {
+            (void)decode_payload(MessageType::HISTORY_RESET, reset_payload);
+        },
+        "HISTORY_RESET decoded reserved zero nonce");
+
+    require_throws<std::invalid_argument>(
+        [&] { (void)encode_payload(Message{ErrorMessage{0, "reserved"}}); },
+        "ERROR encoded reserved zero code");
+    std::vector<uint8_t> error_payload =
+        encode_payload(Message{ErrorMessage{1, "bounded"}});
+    error_payload[0] = 0;
+    error_payload[1] = 0;
+    require_throws<std::invalid_argument>(
+        [&] { (void)decode_payload(MessageType::ERROR, error_payload); },
+        "ERROR decoded reserved zero code");
 }
 
 void test_ten_messages_and_four_byte_parser() {
@@ -524,6 +704,7 @@ int main() {
     test_key_layout_v1();
     test_session_negotiation();
     test_received_session_state_validation();
+    test_reserved_zero_wire_values();
     test_ten_messages_and_four_byte_parser();
     test_need_delta_stream();
     test_fill_records_cross_every_boundary();

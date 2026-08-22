@@ -37,8 +37,7 @@ void validate_caps(const EndpointCaps& caps) {
         throw std::invalid_argument("endpoint frame cap is outside the Protocol-50 range");
     if (caps.wire.max_fill_record_bytes < 32)
         throw std::invalid_argument("endpoint FILL-record cap is too small");
-    if (caps.zstd.max_encoded_body_bytes == 0 || caps.zstd.max_raw_bytes == 0)
-        throw std::invalid_argument("endpoint ZSTD_TU caps must be nonzero");
+    validate_zstd_tu_limits(caps.zstd);
 }
 
 CompletionStamp with_operation(CompletionStamp stamp, AsyncOperationKind operation) {
@@ -50,6 +49,11 @@ CompletionStamp completion_for_test(CompletionStamp stamp, EndpointIoControl& co
     if (control.wrong_digest_completion == stamp.operation && stamp.transaction_bound) {
         control.wrong_digest_completion.reset();
         stamp.transaction_digest.bytes[0] ^= 0x80;
+    }
+    if (control.wrong_raw_digest_completion == stamp.operation &&
+        stamp.transaction_bound) {
+        control.wrong_raw_digest_completion.reset();
+        stamp.raw_digest.bytes[0] ^= 0x80;
     }
     return stamp;
 }
@@ -328,9 +332,7 @@ struct P50PreparationAuthority::Impl {
           identity(std::make_shared<const uint8_t>(0)) {
         if (c_guid == CStoreGuid{})
             throw std::invalid_argument("C preparation authority GUID zero is reserved");
-        if (zstd_limits.max_encoded_body_bytes == 0 ||
-            zstd_limits.max_raw_bytes == 0)
-            throw std::invalid_argument("preparation ZSTD_TU limits must be nonzero");
+        validate_zstd_tu_limits(zstd_limits);
         if (authority_limits.max_live_entries == 0 ||
             authority_limits.max_retained_encoded_bytes == 0)
             throw std::invalid_argument("preparation-authority limits must be nonzero");
@@ -577,6 +579,7 @@ struct P50ClientEndpoint::Impl {
             result.rel_seq = active->begin.rel_seq;
             result.tu_seq = active->begin.tu_seq;
             result.transaction_digest = active->begin.transaction_digest;
+            result.raw_digest = active->begin.raw_digest;
             result.transaction_bound = true;
         } else if (route_known) {
             result.history_nonce = history_nonce;
@@ -596,7 +599,8 @@ struct P50ClientEndpoint::Impl {
             if (!active || completion.history_nonce != active->begin.history_nonce ||
                 completion.rel_seq != active->begin.rel_seq ||
                 completion.tu_seq != active->begin.tu_seq ||
-                completion.transaction_digest != active->begin.transaction_digest)
+                completion.transaction_digest != active->begin.transaction_digest ||
+                completion.raw_digest != active->begin.raw_digest)
                 throw StaleCompletion();
         } else if (completion.history_nonce.value != 0) {
             if (session.provisional_nonce) {
@@ -833,6 +837,7 @@ struct P50ServerEndpoint::Impl {
             result.rel_seq = begin->rel_seq;
             result.tu_seq = begin->tu_seq;
             result.transaction_digest = begin->transaction_digest;
+            result.raw_digest = begin->raw_digest;
             result.transaction_bound = true;
         }
         return result;
@@ -876,12 +881,14 @@ struct P50ServerEndpoint::Impl {
                 const TxCommit& commit = *space.route->last_commit;
                 if (commit.history_nonce == completion.history_nonce &&
                     commit.rel_seq == completion.rel_seq && commit.tu_seq == completion.tu_seq &&
-                    commit.transaction_digest == completion.transaction_digest)
+                    commit.transaction_digest == completion.transaction_digest &&
+                    commit.raw_digest == completion.raw_digest)
                     return;
             }
             if (!begin || begin->history_nonce != completion.history_nonce ||
                 begin->rel_seq != completion.rel_seq || begin->tu_seq != completion.tu_seq ||
-                begin->transaction_digest != completion.transaction_digest)
+                begin->transaction_digest != completion.transaction_digest ||
+                begin->raw_digest != completion.raw_digest)
                 throw StaleCompletion();
         } else if (completion.history_nonce.value != 0 &&
                    (!space.route || space.route->nonce != completion.history_nonce ||
@@ -1489,7 +1496,6 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::accept_one(tcp::accep
         impl_->require_completion(completion_for_test(completion, control));
     };
     std::optional<ErrorMessage> terminal_error;
-    bool retain_interrupted_on_terminal = false;
     try {
         co_await async_accept(acceptor, socket, impl_->stamp(session, AsyncOperationKind::Accept),
                               impl_->completions, verify);
@@ -1566,7 +1572,6 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::accept_one(tcp::accep
         result.status = ServerRunStatus::Disconnected;
         co_return result;
     } catch (const PrecommitPublicationFailure& error) {
-        retain_interrupted_on_terminal = true;
         terminal_error = bounded_error(impl_->config.protocol_error_code,
                                        error.what(), reply_cap);
     } catch (const std::exception& error) {
@@ -1583,7 +1588,9 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::accept_one(tcp::accep
     } catch (...) {
     }
     close_now(socket);
-    impl_->disconnect(session, retain_interrupted_on_terminal);
+    // A terminal reply ends this dialogue and discards its component overlay,
+    // but an installed TX_BEGIN remains the exact retry/reconciliation identity.
+    impl_->disconnect(session, true);
     impl_->release_session(session);
     result.status = ServerRunStatus::TerminalError;
     result.terminal_error = std::move(*terminal_error);

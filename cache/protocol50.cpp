@@ -47,9 +47,23 @@ void validate_limits(const SessionLimits& limits) {
 void validate_hello(const SessionHello& hello) {
     if (hello.min_protocol == 0 || hello.min_protocol > hello.max_protocol)
         throw std::invalid_argument("session protocol range is invalid");
+    if (hello.c_store_guid == CStoreGuid{})
+        throw std::invalid_argument("SESSION_HELLO C_STORE_GUID zero is reserved");
     if (hello.supported_profiles == 0)
         throw std::invalid_argument("session has no supported profile");
     validate_limits(hello.limits);
+}
+
+void validate_commit(const TxCommit& commit) {
+    if (commit.history_nonce.value == 0)
+        throw std::invalid_argument("TX_COMMIT HISTORY_NONCE zero is reserved");
+}
+
+void validate_tx_begin_intrinsic(const TxBegin& begin) {
+    if (begin.history_nonce.value == 0)
+        throw std::invalid_argument("TX_BEGIN HISTORY_NONCE zero is reserved");
+    if (!valid_root_mode(begin.profile, begin.p29_root_mode))
+        throw std::invalid_argument("TX_BEGIN profile/root mode is invalid");
 }
 
 void validate_session_state_intrinsic(const SessionState& state) {
@@ -57,9 +71,14 @@ void validate_session_state_intrinsic(const SessionState& state) {
         (state.negotiated_profiles & ~kKnownProfileMask) != 0)
         throw std::invalid_argument(
             "SESSION_STATE selected an unimplemented protocol or profile mask");
+    if (state.f_store_guid == FStoreGuid{})
+        throw std::invalid_argument("SESSION_STATE F_STORE_GUID zero is reserved");
     validate_limits(state.limits);
     if (state.route_present && !state.namespace_present)
         throw std::invalid_argument("SESSION_STATE route lacks its C namespace");
+    if (state.route_present && state.history_nonce.value == 0)
+        throw std::invalid_argument(
+            "SESSION_STATE present route has reserved zero HISTORY_NONCE");
     if (!state.route_present &&
         (state.history_nonce.value != 0 || state.next_rel_seq.value != 0 ||
          state.state_digest != Digest128{} || state.last_commit))
@@ -69,6 +88,7 @@ void validate_session_state_intrinsic(const SessionState& state) {
         throw std::invalid_argument("SESSION_STATE commit lacks route state");
     if (state.last_commit) {
         const TxCommit& commit = *state.last_commit;
+        validate_commit(commit);
         if (commit.history_nonce != state.history_nonce)
             throw std::invalid_argument(
                 "SESSION_STATE retained commit nonce differs from its route");
@@ -83,6 +103,16 @@ void validate_session_state_intrinsic(const SessionState& state) {
         throw std::invalid_argument(
             "SESSION_STATE advanced route lacks its latest commit");
     }
+}
+
+void validate_history_reset(const HistoryReset& reset) {
+    if (reset.history_nonce.value == 0)
+        throw std::invalid_argument("HISTORY_RESET nonce zero is reserved");
+}
+
+void validate_error(const ErrorMessage& error) {
+    if (error.code == 0)
+        throw std::invalid_argument("ERROR code zero is reserved");
 }
 
 class Encoder {
@@ -204,6 +234,7 @@ ComponentDescriptor decode_descriptor(Decoder& in) {
 }
 
 void encode_commit(Encoder& out, const TxCommit& commit) {
+    validate_commit(commit);
     out.u64(commit.history_nonce.value);
     out.u64(commit.rel_seq.value);
     out.u64(commit.tu_seq.value);
@@ -220,6 +251,7 @@ TxCommit decode_commit(Decoder& in) {
     result.transaction_digest = in.digest();
     result.raw_digest = in.digest();
     result.post_state_digest = in.digest();
+    validate_commit(result);
     return result;
 }
 
@@ -410,14 +442,15 @@ std::vector<uint8_t> encode_payload(const Message& message) {
             out.digest(value.state_digest);
             if (value.last_commit) encode_commit(out, *value.last_commit);
         } else if constexpr (std::is_same_v<T, HistoryReset>) {
+            validate_history_reset(value);
             out.u64(value.history_nonce.value);
             out.digest(value.initial_state_digest);
         } else if constexpr (std::is_same_v<T, ErrorMessage>) {
+            validate_error(value);
             out.u16(value.code);
             out.string(value.detail);
         } else if constexpr (std::is_same_v<T, TxBegin>) {
-            if (!valid_root_mode(value.profile, value.p29_root_mode))
-                throw std::invalid_argument("TX_BEGIN profile/root mode is invalid");
+            validate_tx_begin_intrinsic(value);
             out.u64(value.history_nonce.value);
             out.u64(value.rel_seq.value);
             out.u64(value.tu_seq.value);
@@ -481,6 +514,7 @@ Message decode_payload(MessageType type, std::span<const uint8_t> payload) {
         value.history_nonce.value = in.u64();
         value.initial_state_digest = in.digest();
         in.exact_end();
+        validate_history_reset(value);
         return value;
     }
     case MessageType::ERROR: {
@@ -488,6 +522,7 @@ Message decode_payload(MessageType type, std::span<const uint8_t> payload) {
         value.code = in.u16();
         value.detail = in.string();
         in.exact_end();
+        validate_error(value);
         return value;
     }
     case MessageType::TX_BEGIN: {
@@ -497,8 +532,6 @@ Message decode_payload(MessageType type, std::span<const uint8_t> payload) {
         value.tu_seq.value = in.u64();
         value.profile = static_cast<ProfileId>(in.u16());
         value.p29_root_mode = static_cast<P29RootMode>(in.u16());
-        if (!valid_root_mode(value.profile, value.p29_root_mode))
-            throw std::invalid_argument("TX_BEGIN profile/root mode is invalid");
         value.pre_state_digest = in.digest();
         value.dict = decode_descriptor(in);
         value.body = decode_descriptor(in);
@@ -506,6 +539,7 @@ Message decode_payload(MessageType type, std::span<const uint8_t> payload) {
         value.raw_digest = in.digest();
         value.transaction_digest = in.digest();
         in.exact_end();
+        validate_tx_begin_intrinsic(value);
         return value;
     }
     case MessageType::DICT: return DictMessage{in.bytes(in.remaining())};
