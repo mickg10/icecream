@@ -10,6 +10,8 @@ experiment contract reviewed in `doc/issue16-strategic-plan.md` at
 `b759daf7aa9010c7156d9e307a568da66f23f501`. The first implementation commit is
 `bd62cf81224ce5ba69ea27bb0e19beb930a6ecf2`; the independent-closure correction
 core is `15bb47d47ba96e66d61a7c55ac023b26c4dc9631`.
+The independent retained-evidence/cardinality correction is
+`12a0fa6d934b3fee4037cb8ed9ebb049b29e34ef`.
 
 Those two source heads diverge after `c697107e`. This branch deliberately keeps
 the accepted simulator lineage and does not import the product/cache endpoint
@@ -162,7 +164,7 @@ scenario and its selected codec.
 - retained route evidence: `route-trace.jsonl`, byte-identical to the input
   trace above;
 - retained `sample-experiment.jsonl` SHA-256:
-  `7128ef3ce2384f7f58bce83cf5a9793e2d7bab5e2ff33a0cc8cde5a70b257824`;
+  `9a23a42bddf43ff2606472594bfd98126f8c550cda92e65407b265e049d99071`;
 - closure: 30 events, 37 source C-to-F bytes, zero F-to-C bytes, two exact
   routes, and every resource/queue balance returned to zero.
 

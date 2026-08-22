@@ -2,12 +2,12 @@
   "schema": "icecream-execution-v2",
   "scenario_digest": "9411bba01333a1ff6340d8a5de141e0e246467c7e9a8c3ae90d156587abafa51",
   "mode": "simulated",
-  "runner_commit": "15bb47d47ba96e66d61a7c55ac023b26c4dc9631",
+  "runner_commit": "12a0fa6d934b3fee4037cb8ed9ebb049b29e34ef",
   "host_manifest": "594d5ddd35aedb47f00d9c34d140017907a5b9f93c975aba125fc924daac5c07",
   "started_at": "2026-08-22T00:43:03-04:00",
-  "source_commit": "15bb47d47ba96e66d61a7c55ac023b26c4dc9631",
-  "simulator_commit": "15bb47d47ba96e66d61a7c55ac023b26c4dc9631",
-  "codec_executable_digest": "b95e6ce8045cda4015921b16d999d2ba4a87465a45fb18344a6f7342aeb3ecdb",
+  "source_commit": "12a0fa6d934b3fee4037cb8ed9ebb049b29e34ef",
+  "simulator_commit": "12a0fa6d934b3fee4037cb8ed9ebb049b29e34ef",
+  "codec_executable_digest": "7f7df5f288223170f1e3abe56fb228d09c8c34b11f44eb7cd7c5cd82806266a0",
   "input_manifest_digests": [
     "5cb0ecacfd3f84e48ff80aff99738d2232964c797b583caa586582de5b9f5636"
   ],
