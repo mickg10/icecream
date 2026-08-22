@@ -1,7 +1,6 @@
 #include "p50_loopback.h"
 
 #include <boost/asio/buffer.hpp>
-#include <boost/asio/connect.hpp>
 #include <boost/asio/read.hpp>
 #include <boost/asio/write.hpp>
 #include <boost/system/error_code.hpp>
@@ -121,6 +120,9 @@ CandidateSessionGate::CandidateSessionGate(
       next_session_serial_(first_session_serial) {
     if (server_profiles_ == 0)
         throw std::invalid_argument("candidate gate has no server profile");
+    if (server_limits_.max_frame_payload < kM2MinimumControlPayload)
+        throw std::invalid_argument(
+            "server frame cap cannot carry fixed CacheWire control messages");
     if (max_staged_candidates_ == 0)
         throw std::invalid_argument("candidate gate cannot stage zero candidates");
     if (next_candidate_id_ == 0 || next_session_serial_ == 0)
@@ -133,6 +135,12 @@ CandidateSessionGate::CandidateSessionGate(
 }
 
 CandidateSession CandidateSessionGate::stage(const SessionHello& hello) {
+    if (state_revision_exhausted_)
+        throw std::overflow_error(
+            "candidate revision space requires F_STORE_GUID replacement");
+    if (hello.limits.max_frame_payload < kM2MinimumControlPayload)
+        throw std::invalid_argument(
+            "client frame cap cannot carry fixed CacheWire control messages");
     if (staged_.size() >= max_staged_candidates_)
         throw std::length_error("too many staged CacheWire candidates");
     if (candidate_id_exhausted_)
@@ -162,6 +170,7 @@ uint64_t CandidateSessionGate::activate(uint64_t candidate_id) {
         throw std::overflow_error("session serial space exhausted");
 
     const uint64_t serial = next_session_serial_;
+    advance_revision();  // fail before installing or clearing any session state
     if (serial == std::numeric_limits<uint64_t>::max())
         session_serial_exhausted_ = true;
     else
@@ -169,7 +178,6 @@ uint64_t CandidateSessionGate::activate(uint64_t candidate_id) {
 
     current_session_serial_ = serial;
     staged_.clear();
-    advance_revision();
     return serial;
 }
 
@@ -181,32 +189,38 @@ void CandidateSessionGate::note_state_change() {
     advance_revision();
 }
 
-void CandidateSessionGate::disconnect(uint64_t session_serial) {
+void CandidateSessionGate::disconnect(uint64_t session_serial) noexcept {
     if (session_serial == 0 || session_serial != current_session_serial_)
         return;
     current_session_serial_ = 0;
-    advance_revision();
+    if (!state_revision_exhausted_) {
+        if (state_revision_ == std::numeric_limits<uint64_t>::max())
+            state_revision_exhausted_ = true;
+        else
+            ++state_revision_;
+    }
 }
 
 void CandidateSessionGate::advance_revision() {
-    if (state_revision_exhausted_)
-        throw std::overflow_error("candidate state revision space exhausted");
-    if (state_revision_ == std::numeric_limits<uint64_t>::max()) {
+    if (state_revision_exhausted_ ||
+        state_revision_ == std::numeric_limits<uint64_t>::max()) {
         state_revision_exhausted_ = true;
-        throw std::overflow_error("candidate state revision requires F GUID replacement");
+        throw std::overflow_error(
+            "candidate state revision requires F_STORE_GUID replacement");
     }
     ++state_revision_;
+    if (state_revision_ == std::numeric_limits<uint64_t>::max())
+        state_revision_exhausted_ = true;
 }
 
 ZstdLoopbackServer::ZstdLoopbackServer(
     boost::asio::io_context& context, ZstdLoopbackConfig config,
     CStoreGuid expected_c_store_guid,
     PublishExactInput publish_exact_input)
-    : context_(context),
-      config_(std::move(config)),
+    : config_(std::move(config)),
       expected_c_store_guid_(expected_c_store_guid),
       publish_exact_input_(std::move(publish_exact_input)),
-      acceptor_(context_, tcp::endpoint(
+      acceptor_(context, tcp::endpoint(
           boost::asio::ip::address_v4::loopback(), 0)),
       gate_(config_.supported_profiles, config_.session_limits,
             config_.max_staged_candidates) {
@@ -262,6 +276,8 @@ void ZstdLoopbackServer::validate_history_reset(
 
 void ZstdLoopbackServer::apply_history_reset(
     const HistoryReset& reset) {
+    // Candidate activation and the first validated mutation are one installed
+    // transition, so activate() already advanced the route-state revision.
     namespace_present_ = true;
     route_present_ = true;
     history_nonce_ = reset.history_nonce;
@@ -269,7 +285,6 @@ void ZstdLoopbackServer::apply_history_reset(
     state_digest_ = reset.initial_state_digest;
     last_commit_.reset();
     history_nonce_high_water_ = reset.history_nonce.value;
-    gate_.note_state_change();
 }
 
 void ZstdLoopbackServer::validate_begin_cursor(
@@ -308,15 +323,19 @@ void ZstdLoopbackServer::publish_commit(
                                   begin.rel_seq, begin.tu_seq,
                                   begin.transaction_digest)};
 
-    // The callback is the atomic InputRecord + route publication boundary. If
-    // it throws, no CacheWire commit is made visible and the session terminates.
+    // Reserve the state transition before either external publication or route
+    // mutation. A revision-overflow failure therefore cannot leave partial
+    // committed state.
+    gate_.note_state_change();
+
+    // The callback is the atomic InputRecord publication boundary. If it
+    // throws, no CacheWire route commit is made visible and the session closes.
     publish_exact_input_(begin, commit, std::move(exact_input));
 
     history_nonce_ = commit.history_nonce;
     next_rel_seq_ = RelSeq{commit.rel_seq.value + 1};
     state_digest_ = commit.post_state_digest;
     last_commit_ = commit;
-    gate_.note_state_change();
     dialogue.commit_visible();
 
     // Route state is already durable here. A write failure is therefore a lost
@@ -325,7 +344,7 @@ void ZstdLoopbackServer::publish_commit(
 }
 
 void ZstdLoopbackServer::serve_one_connection() {
-    tcp::socket socket(context_);
+    tcp::socket socket(acceptor_.get_executor());
     acceptor_.accept(socket);
 
     std::optional<uint64_t> candidate_id;
@@ -381,6 +400,9 @@ void ZstdLoopbackServer::serve_one_connection() {
 
             if (const auto* begin = std::get_if<TxBegin>(&*incoming)) {
                 validate_begin_cursor(*begin, candidate.selection);
+                // Starting a current-session transaction invalidates candidates
+                // staged from the preceding idle route snapshot.
+                gate_.note_state_change();
                 dialogue->begin(*begin);
             } else if (const auto* body = std::get_if<BodyMessage>(&*incoming)) {
                 dialogue->append_body(*body);
@@ -424,8 +446,7 @@ void ZstdLoopbackServer::serve_one_connection() {
 ZstdLoopbackClient::ZstdLoopbackClient(
     boost::asio::io_context& context, const tcp::endpoint& endpoint,
     SessionHello hello, size_t wire_fragment_bytes)
-    : context_(context),
-      socket_(context_),
+    : socket_(context),
       hello_(std::move(hello)),
       wire_fragment_bytes_(wire_fragment_bytes) {
     socket_.connect(endpoint);
