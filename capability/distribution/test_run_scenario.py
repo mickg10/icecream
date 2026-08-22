@@ -968,6 +968,19 @@ class SimulatorTest(unittest.TestCase):
                 )
             )
 
+    def test_v1_positional_report_limit_call_remains_compatible(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scenario = sim.load_scenario(
+                write_fixture(root, [25_000_000], [1], workers=1)
+            )
+            result = sim.Simulator(scenario, sim.CompileOnlyAdapter()).run()
+            descriptor, timeline, _ = sim.write_experiment_stream(
+                root / "experiment.jsonl", scenario, result, None, 1
+            )
+            self.assertEqual(descriptor["report_view"]["embedded_snapshots"], 1)
+            self.assertEqual(sum(row["record"] == "snapshot" for row in timeline), 1)
+
     def test_timeline_integrates_route_and_fabric_rate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

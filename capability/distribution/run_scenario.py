@@ -5186,8 +5186,8 @@ def write_experiment_stream(
     scenario: LoadedScenario,
     result: SimulationResult,
     execution: dict[str, object] | None = None,
-    route_trace_evidence: Mapping[str, str] | None = None,
     report_limit: int = MAX_REPORT_SNAPSHOTS,
+    route_trace_evidence: Mapping[str, str] | None = None,
 ) -> tuple[dict[str, object], list[dict[str, object]], dict[str, object]]:
     """Write the canonical stream while retaining only the bounded browser view."""
     descriptor = experiment_descriptor(
