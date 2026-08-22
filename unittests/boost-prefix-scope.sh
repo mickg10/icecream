@@ -141,6 +141,14 @@ if ! icecc_run_make -C "$icecc_test_build" -j2 V=1 all \
     cat "$icecc_test_root/build.log" >&2
     exit 1
 fi
+# The full product build above has already proved that ordinary targets do not
+# resolve lzo or Zstd through the Boost prefix.  The endpoint test deliberately
+# does receive BOOST_LDFLAGS and also links those two real dependencies, so its
+# intended link would otherwise select the incomplete probe archives.  Retain
+# the unrelated libarchive probe and remove only the endpoint's dependencies
+# before checking the endpoint-specific Boost path.
+rm -f "$icecc_test_prefix/lib/liblzo2.a" \
+    "$icecc_test_prefix/lib/libzstd.a"
 if ! icecc_run_make -C "$icecc_test_build/unittests" -j2 V=1 p50endpoint \
         >> "$icecc_test_root/build.log" 2>&1; then
     cat "$icecc_test_root/build.log" >&2
