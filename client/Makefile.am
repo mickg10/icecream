@@ -7,6 +7,7 @@ libclient_a_SOURCES = \
         argv.c \
         cpp.cpp \
         invocation_timing.cpp \
+	input_pump.cpp \
         local.cpp \
         remote.cpp \
         util.cpp \
@@ -22,6 +23,7 @@ icecc_LDADD = \
 noinst_HEADERS = \
 	argv.h \
 	client.h \
+	input_pump.h \
 	md5.h \
 	util.h
 AM_CPPFLAGS = \

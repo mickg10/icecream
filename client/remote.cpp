@@ -53,6 +53,7 @@
 #include "tempfile.h"
 #include "md5.h"
 #include "util.h"
+#include "input_pump.h"
 #include "services/util.h"
 #include "pipes.h"
 
@@ -268,71 +269,6 @@ static void check_for_failure(Msg *msg, MsgChannel *cserver)
     }
 }
 
-// 'unlock_sending' = dcc_lock_host() is held when this is called, temporarily yield the lock
-// while doing network transfers
-static void write_fd_to_server(int fd, MsgChannel *cserver)
-{
-    unsigned char buffer[100000]; // some random but huge number
-    off_t offset = 0;
-    size_t uncompressed = 0;
-    size_t compressed = 0;
-
-    do {
-        ssize_t bytes;
-
-        do {
-            bytes = read(fd, buffer + offset, sizeof(buffer) - offset);
-
-            if (bytes < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
-                continue;
-            }
-
-            if (bytes < 0) {
-                log_perror("write_fd_to_server() reading from fd");
-                close(fd);
-                throw client_error(16, "Error 16 - error reading local file");
-            }
-
-            break;
-        } while (1);
-
-        offset += bytes;
-
-        if (!bytes || offset == sizeof(buffer)) {
-            if (offset) {
-                FileChunkMsg fcmsg(buffer, offset);
-
-                if (!cserver->send_msg(fcmsg)) {
-                    Msg *m = cserver->get_msg(2);
-                    check_for_failure(m, cserver);
-
-                    log_error() << "write of source chunk to host "
-                                << cserver->name.c_str() << endl;
-                    log_perror("failed ");
-                    close(fd);
-                    throw client_error(15, "Error 15 - write to host failed");
-                }
-
-                uncompressed += fcmsg.len;
-                compressed += fcmsg.compressed;
-                offset = 0;
-            }
-
-            if (!bytes) {
-                break;
-            }
-        }
-    } while (1);
-
-    if (compressed)
-        trace() << "sent " << compressed << " bytes (" << (compressed * 100 / uncompressed) <<
-                "%)" << endl;
-
-    if ((-1 == close(fd)) && (errno != EBADF)){
-        log_perror("close failed");
-    }
-}
-
 static void receive_file(const string& output_file, MsgChannel* cserver)
 {
     string tmp_file = output_file + "_icetmp";
@@ -438,6 +374,10 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
             throw client_error(2, "Error 2 - no server found at " + hostname);
         }
 
+        // R6 deliberately selects only the existing wire path.  A future
+        // attachment mode can replace this selection after its product gates.
+        LegacyRemoteSink input_sink(cserver);
+
         if (!got_env) {
             log_block b("Transfer Environment");
             // transfer env
@@ -465,9 +405,9 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
                 throw client_error(5, "Error 5 - unable to open version file:\n\t" + version_file);
             }
 
-            write_fd_to_server(env_fd, cserver);
+            input_sink.send_fd(env_fd);
 
-            if (!cserver->send_msg(EndMsg())) {
+            if (!input_sink.send_end()) {
                 log_error() << "write of environment failed" << endl;
                 throw client_error(8, "Error 8 - write environment to remote failed");
             }
@@ -556,7 +496,7 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
 
             try {
                 log_block bl2("write_fd_to_server from cpp");
-                write_fd_to_server(sockets[0], cserver);
+                input_sink.send_fd(sockets[0]);
             } catch (...) {
                 kill(cpp_pid, SIGTERM);
                 throw;
@@ -588,10 +528,10 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
             }
 
             log_block cpp_block("write_fd_to_server preprocessed");
-            write_fd_to_server(cpp_fd, cserver);
+            input_sink.send_fd(cpp_fd);
         }
 
-        if (!cserver->send_msg(EndMsg())) {
+        if (!input_sink.send_end()) {
             log_warning() << "write of end failed" << endl;
             throw client_error(12, "Error 12 - failed to send file to remote");
         }
