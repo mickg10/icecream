@@ -882,25 +882,103 @@ static void run_prepare_backlog(const std::string &binary,
             "scheduler records the deferred-PREPARE eligibility boundary");
 }
 
-static void run_strict_nonce_refusal(const std::string &binary,
-                                     const std::string &directory)
+static void run_strict_nonce(const std::string &binary,
+                             const std::string &directory)
 {
     const int port = reserve_port_pair();
-    const std::string log = directory + "/strict-nonce-refusal.log";
+    const std::string log = directory + "/strict-nonce.log";
     pid_t scheduler = start_scheduler(binary, port, "strict-nonce", log);
-    int status = 0;
-    const auto deadline = Clock::now() + std::chrono::seconds(5);
-    pid_t waited = 0;
-    while (Clock::now() < deadline
-            && (waited = waitpid(scheduler, &status, WNOHANG)) == 0) {
-        usleep(20 * 1000);
+    REQUIRE(port != 0 && scheduler > 0,
+            "explicit STRICT_NONCE scheduler launched");
+
+    int worker_port = 0;
+    int worker_listener = bind_port(0, &worker_port);
+    if (worker_listener >= 0) listen(worker_listener, 16);
+    ConfCSMsg *worker_conf = nullptr;
+    MsgChannel *worker = login_host(port, "strict-worker", true, worker_port,
+                                    &worker_conf);
+    REQUIRE(worker && worker_conf
+                && worker_conf->fence_mode == ConfCSMsg::StrictNonce
+                && worker_conf->epoch() != 0,
+            "P50 worker receives explicitly selected STRICT_NONCE");
+    const uint64_t epoch = worker_conf ? worker_conf->epoch() : 0;
+    delete worker_conf;
+
+    ConfCSMsg *submitter_conf = nullptr;
+    MsgChannel *submitter = login_host(port, "strict-submit", false, 0,
+                                       &submitter_conf);
+    REQUIRE(submitter && submitter_conf
+                && submitter_conf->fence_mode == ConfCSMsg::StrictNonce
+                && submitter_conf->epoch() == epoch,
+            "P50 submitter receives the same explicit strict epoch");
+    delete submitter_conf;
+    REQUIRE(submitter && request_job(submitter, 4901),
+            "all-P50 strict assignment requested");
+    Msg *prepare_wire = wait_type(worker, Msg::ASSIGN_PREPARE, 3000);
+    AssignPrepareMsg *prepare = dynamic_cast<AssignPrepareMsg *>(prepare_wire);
+    REQUIRE(prepare && prepare->epoch() == epoch && prepare->wire_id != 0
+                && prepare->nonce() != 0,
+            "strict scheduler prepares a complete nonzero identity");
+    REQUIRE(no_type(submitter, Msg::USE_CS, 300),
+            "strict scheduler does not expose UseCS before READY");
+    if (prepare) {
+        worker->send_msg(AssignReadyMsg(
+            prepare->epoch(), prepare->wire_id, prepare->nonce()));
     }
-    REQUIRE(waited == scheduler && WIFEXITED(status)
-                && WEXITSTATUS(status) != 0,
-            "P49 scheduler deterministically refuses STRICT_NONCE");
-    REQUIRE(file_contains(log,
-                "requires protocol 50 nonce-bearing client claims"),
-            "STRICT_NONCE refusal identifies its protocol-50 dependency");
+    UseCSMsg *use = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 3000));
+    REQUIRE(use && prepare && use->job_id == prepare->wire_id
+                && use->assignmentEpoch() == prepare->epoch()
+                && use->assignmentNonce() == prepare->nonce(),
+            "strict UseCS carries the already-authorized full tuple");
+    if (use) {
+        worker->send_msg(JobBeginMsg(use->job_id, 0));
+        worker->send_msg(JobDoneMsg(use->job_id, 0, JobDoneMsg::FROM_SERVER));
+    }
+    delete use;
+    delete prepare_wire;
+    delete submitter;
+    delete worker;
+    if (worker_listener >= 0) close(worker_listener);
+
+    /* Link versions only exclude an incompatible path; they never choose or
+       weaken the operator's global mode.  The old worker receives a LEGACY
+       projection but cannot receive strict remote work. */
+    int proxy_port = 0;
+    pid_t proxy = start_p48_proxy(port, &proxy_port);
+    MsgChannel *p48_channel = connect_scheduler(proxy_port);
+    int old_worker_port = 0;
+    int old_worker_listener = bind_port(0, &old_worker_port);
+    if (old_worker_listener >= 0) listen(old_worker_listener, 16);
+    worker_conf = nullptr;
+    MsgChannel *old_worker = login_host(
+        port, "strict-p48-worker", true, old_worker_port, &worker_conf,
+        p48_channel);
+    REQUIRE(old_worker && worker_conf
+                && worker_conf->fence_mode == ConfCSMsg::Legacy
+                && worker_conf->epoch() == 0,
+            "strict scheduler projects Legacy configuration to P48 worker");
+    delete worker_conf;
+    submitter_conf = nullptr;
+    MsgChannel *modern_submitter = login_host(
+        port, "strict-modern-submit", false, 0, &submitter_conf);
+    REQUIRE(modern_submitter && submitter_conf
+                && submitter_conf->fence_mode == ConfCSMsg::StrictNonce,
+            "global operator mode remains strict for compatible peer");
+    delete submitter_conf;
+    REQUIRE(modern_submitter && request_job(modern_submitter, 4902),
+            "mixed strict remote assignment requested");
+    REQUIRE(no_type(modern_submitter, Msg::USE_CS, 600)
+                && no_type(modern_submitter, Msg::NO_CS, 200),
+            "mixed strict remote path is refused rather than downgraded");
+    REQUIRE(no_type(old_worker, Msg::ASSIGN_PREPARE, 300),
+            "P48 worker receives no strict PREPARE");
+
+    delete modern_submitter;
+    delete old_worker;
+    if (old_worker_listener >= 0) close(old_worker_listener);
+    REQUIRE(stop_scheduler(proxy), "protocol-48 strict relay stopped cleanly");
+    REQUIRE(stop_scheduler(scheduler), "STRICT_NONCE scheduler stopped cleanly");
 }
 
 static void run_disabled(const std::string &binary, const std::string &directory)
@@ -1011,7 +1089,7 @@ int main(int argc, char **argv)
     run_ready_nested_teardown(argv[1], directory);
     run_advisory(argv[1], directory);
     run_prepare_backlog(argv[1], directory);
-    run_strict_nonce_refusal(argv[1], directory);
+    run_strict_nonce(argv[1], directory);
     run_disabled(argv[1], directory);
     run_old_peer(argv[1], directory);
     std::fprintf(stderr, "%s: %d failure(s)\n",

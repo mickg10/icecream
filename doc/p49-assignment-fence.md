@@ -3,9 +3,9 @@
 Protocol 49 adds a disabled-by-default ordered assignment contract on the
 persistent scheduler-to-worker connection.  It closes the
 dispatched-but-not-claimed ownership gap without changing the client-facing
-assignment shape.  Protocol 50 remains a separate step: it will carry the
-assignment identity through `UseCS` and `CompileFile` so a new client can make
-an exact nonce-bearing claim.
+assignment shape. Protocol 50 is the separate successor which carries the
+same identity through `UseCS` and `CompileFile`; see
+`p50-assignment-identity.md`.
 
 ## Activation and the four modes
 
@@ -22,9 +22,11 @@ scheduler epoch and sends it in `ConfCSMsg`:
   sending `UseCS`.  A nonce-less legacy claim is admitted only through the
   current live prepared wire-id record.  The older
   `--assignment-fence-strict` spelling is an alias for this mode.
-- `strict-nonce` / `StrictNonce` (3) is reserved for nonce-bearing client
-  claims.  A protocol-49 scheduler or daemon deterministically refuses to
-  activate it.  Protocol 50 will supply the missing client fields.
+- `strict-nonce` / `StrictNonce` (3) is reserved by Protocol 49 and becomes
+  operational only on an explicitly selected all-Protocol-50 remote path. A
+  daemon whose scheduler link is below 50 refuses it; a Protocol-50 scheduler
+  projects Legacy configuration to that old peer and excludes it from strict
+  remote assignments.
 
 Local assignments remain on the existing `NoCS`/local path.  A remote choice
 whose worker link negotiated protocol 48 also uses the exact legacy path,
@@ -83,7 +85,8 @@ that retains the complete bounded table is a state-preserving rebind.
 
 ## Scheduler state machine
 
-For a remote protocol-49 assignment in Advisory or EnforcingCompat, the
+For a remote prepared assignment in Advisory, EnforcingCompat, or the
+Protocol-50 StrictNonce mode, the
 scheduler:
 
 1. selects and freezes the worker, legacy `UseCS` projection, policy, epoch,
@@ -96,8 +99,8 @@ scheduler:
 5. accepts `READY` only from that worker and only for the exact tuple in
    `Prepared` phase.
 
-Advisory sends the frozen `UseCS` immediately after step 3.  EnforcingCompat
-sends it only after step 5.  A stale, duplicate, wrong-worker, wrong-phase,
+Advisory sends the frozen `UseCS` immediately after step 3. EnforcingCompat
+and StrictNonce send it only after step 5. A stale, duplicate, wrong-worker, wrong-phase,
 zero, or post-reuse `READY` is a bounded no-op.  In particular, a matching
 `READY` received after cancellation cannot publish `UseCS`.
 
@@ -182,7 +185,7 @@ The focused gates use the production message classes and real scheduler and
 daemon processes.  They cover literal protocol-48 bytes, negotiated-P48
 behavior, all four mode values, Advisory immediate exposure and
 claim-before-PREPARE, EnforcingCompat `PREPARE -> READY -> UseCS`, deterministic
-StrictNonce refusal, debit-at-PREPARE, the deferred-output worker gate,
+StrictNonce activation and mixed-path refusal, debit-at-PREPARE, the deferred-output worker gate,
 revoke-first and claim-first races, cancellation versus delayed READY, stale
 and duplicate controls, same-wire-id reuse, no early id release, late-claim
 rejection, submitter and link teardown, retained same-epoch rebind,

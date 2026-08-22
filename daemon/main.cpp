@@ -4255,8 +4255,9 @@ static void close_assignment_transport_session()
     }
 }
 
-static bool authorize_assignment_claim(uint32_t wire_id, uint32_t claimant)
+static bool authorize_assignment_claim(const CompileJob &job, uint32_t claimant)
 {
+    const uint32_t wire_id = job.jobID();
     if (assignment_fence_mode == ConfCSMsg::Legacy) {
         return true;   // exact protocol-48/default-disabled behavior
     }
@@ -4267,8 +4268,15 @@ static bool authorize_assignment_claim(uint32_t wire_id, uint32_t claimant)
     auto live = live_assignments.find(wire_id);
     if (live != live_assignments.end()) {
         WorkerAssignment &record = live->second;
+        const bool full_identity = job.hasAssignmentIdentity();
+        const bool identity_matches = full_identity
+            && record.key.epoch == job.assignmentEpoch()
+            && record.key.nonce == job.assignmentNonce();
+        const bool legacy_compat_claim = !full_identity
+            && assignment_fence_mode != ConfCSMsg::StrictNonce;
         if (record.key.epoch != assignment_scheduler_epoch
-                || record.phase != WorkerAssignment::Reserved) {
+                || record.phase != WorkerAssignment::Reserved
+                || (!identity_matches && !legacy_compat_claim)) {
             ++assignment_claim_rejects;
             return false;
         }
@@ -4289,6 +4297,12 @@ static bool authorize_assignment_claim(uint32_t wire_id, uint32_t claimant)
         return false;
     }
 
+    if (job.hasAssignmentIdentity()
+            && job.assignmentEpoch() != assignment_scheduler_epoch) {
+        ++assignment_claim_rejects;
+        return false;
+    }
+
     /* ADVISORY admits an unknown nonce-less claim, but records ownership.
        A later PREPARE binds the nonce into this same record without changing
        Claimed/ClaimedOrLater back to Reserved. */
@@ -4301,7 +4315,7 @@ static bool authorize_assignment_claim(uint32_t wire_id, uint32_t claimant)
     WorkerAssignment placeholder;
     placeholder.phase = WorkerAssignment::Claimed;
     placeholder.key = AssignmentKey {
-        assignment_scheduler_epoch, wire_id, 0
+        assignment_scheduler_epoch, wire_id, job.assignmentNonce()
     };
     placeholder.claimant = claimant;
     live_assignments.emplace(wire_id, placeholder);
@@ -5415,11 +5429,13 @@ int Daemon::scheduler_use_cs(UseCSMsg *msg)
 
     if (msg->hostname == remote_name && int(msg->port) == daemon_port) {
         c->usecsmsg = new UseCSMsg(msg->host_platform, "127.0.0.1", daemon_port, msg->job_id, true, 1,
-                                   msg->matched_job_id);
+                                   msg->matched_job_id, msg->assignmentEpoch(),
+                                   msg->assignmentNonce());
         c->set_status(Client::PENDING_USE_CS, "scheduler_use_cs: local compile");
     } else {
         c->usecsmsg = new UseCSMsg(msg->host_platform, msg->hostname, msg->port,
-                                   msg->job_id, true, 1, msg->matched_job_id);
+                                   msg->job_id, true, 1, msg->matched_job_id,
+                                   msg->assignmentEpoch(), msg->assignmentNonce());
 
         /* EXACT identity is persisted BEFORE the framed write starts, and
            the client is moved to an explicit handoff phase.  If the write
@@ -6348,7 +6364,7 @@ bool Daemon::handle_compile_file(Client *client, Msg *msg)
     assert(client);
     assert(job);
     if (client->status != Client::CLIENTWORK
-            && !authorize_assignment_claim(job->jobID(), client->client_id)) {
+            && !authorize_assignment_claim(*job, client->client_id)) {
         /* Authorization is resolved before the job is attached to a client,
            queued, touches an environment, or can start a compiler. */
         trace() << "rejecting unprepared/revoked assignment claim "
@@ -6728,7 +6744,6 @@ int Daemon::handle_assign_prepare(AssignPrepareMsg *msg)
 {
     if (!scheduler_session_active
             || !assignment_mode_prepares(assignment_fence_mode)
-            || assignment_fence_mode == ConfCSMsg::StrictNonce
             || assignment_table_exhausted
             || msg->epoch() == 0 || msg->wire_id == 0 || msg->nonce() == 0
             || msg->flags != 0 || msg->epoch() != assignment_scheduler_epoch) {
@@ -6797,7 +6812,6 @@ int Daemon::handle_revoke_before_start(RevokeBeforeStartMsg *msg)
 {
     if (!scheduler_session_active
             || !assignment_mode_prepares(assignment_fence_mode)
-            || assignment_fence_mode == ConfCSMsg::StrictNonce
             || assignment_table_exhausted
             || msg->epoch() == 0 || msg->wire_id == 0 || msg->nonce() == 0
             || msg->epoch() != assignment_scheduler_epoch) {
@@ -6873,7 +6887,9 @@ int Daemon::handle_cs_conf(ConfCSMsg *msg)
                 }
                 const ConfCSMsg::FenceMode requested =
                     static_cast<ConfCSMsg::FenceMode>(msg->fence_mode);
-                if (requested == ConfCSMsg::StrictNonce) {
+                if (requested == ConfCSMsg::StrictNonce
+                        && !IS_PROTOCOL_VERSION(
+                            PROTOCOL_VERSION_ASSIGNMENT_IDENTITY, scheduler)) {
                     log_error() << "strict-nonce requires protocol 50 nonce-bearing client claims" << endl;
                     return 1;
                 }

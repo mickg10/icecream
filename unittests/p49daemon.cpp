@@ -100,13 +100,16 @@ static MsgChannel *connect_daemon(const std::string &path)
     return nullptr;
 }
 
-static bool send_claim(MsgChannel *client, uint32_t wire_id)
+static bool send_claim(MsgChannel *client, uint32_t wire_id,
+                       uint64_t epoch = 0, uint64_t nonce = 0,
+                       const char *environment = "p49-test-environment")
 {
     CompileJob job;
     job.setJobID(wire_id);
+    job.setAssignmentIdentity(epoch, nonce);
     job.setCompilerName("g++");
     job.setLanguage(CompileJob::Lang_CXX);
-    job.setEnvironmentVersion("p49-test-environment");
+    job.setEnvironmentVersion(environment);
     job.setTargetPlatform("x86_64");
     job.setInputFile("p49-test.ii");
     job.setOutputFile("p49-test.o");
@@ -455,6 +458,39 @@ int main(int argc, char **argv)
     delete terminal_wire;
     delete advisory_claim;
 
+    const uint32_t advisory_full_id = 1211;
+    const uint64_t advisory_full_nonce = UINT64_C(0x8100000000001211);
+    MsgChannel *advisory_full_claim = connect_daemon(socket_path);
+    REQUIRE(advisory_full_claim && send_claim(
+                advisory_full_claim, advisory_full_id, advisory_epoch,
+                advisory_full_nonce),
+            "ADVISORY admits an unknown full P50 claim before PREPARE");
+    Msg *advisory_full_begin = wait_type(scheduler, Msg::JOB_BEGIN, 3000);
+    JobBeginMsg *advisory_full_begin_typed =
+        dynamic_cast<JobBeginMsg *>(advisory_full_begin);
+    REQUIRE(advisory_full_begin_typed
+                && advisory_full_begin_typed->job_id == advisory_full_id,
+            "full Advisory claim reaches admission before delayed PREPARE");
+    delete advisory_full_begin;
+    REQUIRE(scheduler->send_msg(AssignPrepareMsg(
+                advisory_epoch, advisory_full_id, advisory_full_nonce, 9)),
+            "late PREPARE matches the already consumed full Advisory claim");
+    ready_wire = wait_type(scheduler, Msg::ASSIGN_READY, 3000);
+    ready = dynamic_cast<AssignReadyMsg *>(ready_wire);
+    REQUIRE(ready && ready->wire_id == advisory_full_id
+                && ready->nonce() == advisory_full_nonce,
+            "late exact PREPARE preserves full Advisory claim ownership");
+    delete ready_wire;
+    REQUIRE(scheduler->send_msg(RevokeBeforeStartMsg(
+                advisory_epoch, advisory_full_id, advisory_full_nonce)),
+            "full Advisory claim/revoke outcome requested");
+    terminal_wire = wait_type(scheduler, Msg::REVOKE_RESULT, 3000);
+    terminal = dynamic_cast<RevokeResultMsg *>(terminal_wire);
+    REQUIRE(terminal && terminal->result == RevokeResultMsg::ClaimedOrLater,
+            "full Advisory claim cannot regress to Revoked");
+    delete terminal_wire;
+    delete advisory_full_claim;
+
     const uint32_t cancel_id = 1202;
     const uint64_t cancel_nonce = UINT64_C(0x8100000000001202);
     REQUIRE(scheduler->send_msg(RevokeBeforeStartMsg(
@@ -509,12 +545,191 @@ int main(int argc, char **argv)
     login = wait_type(scheduler, Msg::LOGIN, 5000);
     REQUIRE(scheduler && login, "daemon reconnects for STRICT_NONCE probe");
     delete login;
-    REQUIRE(scheduler && scheduler->send_msg(ConfCSMsg(
-                advisory_epoch + 1, ConfCSMsg::StrictNonce)),
-            "STRICT_NONCE configuration delivered to P49 daemon");
-    no_type(scheduler, Msg::STATUS_TEXT, 1000);
-    REQUIRE(scheduler->at_eof(),
-            "P49 daemon deterministically refuses STRICT_NONCE activation");
+    const uint64_t strict_epoch = advisory_epoch + 1;
+    REQUIRE(scheduler && scheduler->send_msg(
+                ConfCSMsg(strict_epoch, ConfCSMsg::StrictNonce)),
+            "explicit STRICT_NONCE configuration activates on P50");
+
+    auto prepare_strict = [&](uint32_t id, uint64_t nonce) {
+        if (!scheduler->send_msg(AssignPrepareMsg(
+                strict_epoch, id, nonce, 17))) return false;
+        Msg *wire = wait_type(scheduler, Msg::ASSIGN_READY, 3000);
+        AssignReadyMsg *strict_ready = dynamic_cast<AssignReadyMsg *>(wire);
+        const bool exact = strict_ready && strict_ready->epoch() == strict_epoch
+            && strict_ready->wire_id == id && strict_ready->nonce() == nonce;
+        delete wire;
+        return exact;
+    };
+    auto rejected_claim = [&](uint32_t id, uint64_t claim_epoch,
+                              uint64_t claim_nonce, const char *label) {
+        MsgChannel *client = connect_daemon(socket_path);
+        const bool sent = client && send_claim(
+            client, id, claim_epoch, claim_nonce);
+        Msg *end = sent ? wait_type(client, Msg::END, 3000) : nullptr;
+        const bool rejected = sent && (end || (client && client->at_eof()));
+        delete end;
+        delete client;
+        REQUIRE(rejected, label);
+        REQUIRE(no_type(scheduler, Msg::JOB_BEGIN, 300),
+                "rejected strict claim creates no JobBegin residue");
+        return rejected;
+    };
+    auto admitted_claim = [&](uint32_t id, uint64_t nonce,
+                              const char *label) {
+        MsgChannel *client = connect_daemon(socket_path);
+        const bool sent = client && send_claim(
+            client, id, strict_epoch, nonce);
+        Msg *begin = sent ? wait_type(scheduler, Msg::JOB_BEGIN, 3000) : nullptr;
+        JobBeginMsg *typed = dynamic_cast<JobBeginMsg *>(begin);
+        const bool admitted = typed && typed->job_id == id;
+        delete begin;
+        delete client;
+        REQUIRE(admitted, label);
+        return admitted;
+    };
+
+    const uint32_t absent_id = 1401;
+    const uint64_t absent_nonce = UINT64_C(0x9200000000001401);
+    REQUIRE(prepare_strict(absent_id, absent_nonce),
+            "strict assignment installed for absent-identity probe");
+    rejected_claim(absent_id, 0, 0,
+                   "STRICT_NONCE rejects nonce-less remote claim");
+    admitted_claim(absent_id, absent_nonce,
+                   "exact claim is admitted after absent rejection (no residue)");
+
+    const uint32_t nonce_id = 1402;
+    const uint64_t nonce = UINT64_C(0x9200000000001402);
+    REQUIRE(prepare_strict(nonce_id, nonce),
+            "strict assignment installed for stale-nonce probe");
+    rejected_claim(nonce_id, strict_epoch, nonce ^ 1,
+                   "STRICT_NONCE rejects stale nonce");
+    admitted_claim(nonce_id, nonce,
+                   "exact claim is admitted after stale nonce (no residue)");
+
+    const uint32_t epoch_id = 1403;
+    const uint64_t epoch_nonce = UINT64_C(0x9200000000001403);
+    REQUIRE(prepare_strict(epoch_id, epoch_nonce),
+            "strict assignment installed for stale-epoch probe");
+    rejected_claim(epoch_id, strict_epoch - 1, epoch_nonce,
+                   "STRICT_NONCE rejects stale epoch");
+    admitted_claim(epoch_id, epoch_nonce,
+                   "exact claim is admitted after stale epoch (no residue)");
+
+    const uint32_t wire_id = 1404;
+    const uint64_t wire_nonce = UINT64_C(0x9200000000001404);
+    REQUIRE(prepare_strict(wire_id, wire_nonce),
+            "strict assignment installed for stale-wire probe");
+    rejected_claim(wire_id + 100, strict_epoch, wire_nonce,
+                   "STRICT_NONCE rejects stale wire id");
+    admitted_claim(wire_id, wire_nonce,
+                   "exact claim is admitted after stale wire id (no residue)");
+
+    /* Exercise the real submitter-daemon relay, not only the codec unit. */
+    MsgChannel *relay_client = connect_daemon(socket_path);
+    GetCSMsg relay_request(
+        Environments { std::make_pair(std::string("x86_64"),
+                                      std::string("relay-env")) },
+        "relay.cpp", CompileJob::Lang_CXX, 1, "x86_64", 0, "",
+        MIN_PROTOCOL_VERSION, 0, 0);
+    REQUIRE(relay_client && relay_client->send_msg(relay_request),
+            "real-daemon relay GetCS sent in strict mode");
+    Msg *relay_get_wire = wait_type(scheduler, Msg::GET_CS, 3000);
+    GetCSMsg *relay_get = dynamic_cast<GetCSMsg *>(relay_get_wire);
+    const uint32_t relay_client_id = relay_get ? relay_get->client_id : 0;
+    const uint32_t relay_wire_id = 1490;
+    const uint64_t relay_nonce = UINT64_C(0x9200000000001490);
+    REQUIRE(relay_get && scheduler->send_msg(UseCSMsg(
+                "x86_64", "127.0.0.2", 10246, relay_wire_id, true,
+                relay_client_id, 0, strict_epoch, relay_nonce)),
+            "full strict UseCS delivered to the real submitter daemon");
+    delete relay_get_wire;
+    Msg *relayed_wire = wait_type(relay_client, Msg::USE_CS, 3000);
+    UseCSMsg *relayed = dynamic_cast<UseCSMsg *>(relayed_wire);
+    REQUIRE(relayed && relayed->job_id == relay_wire_id
+                && relayed->assignmentEpoch() == strict_epoch
+                && relayed->assignmentNonce() == relay_nonce,
+            "real submitter daemon preserves full identity through relay");
+    delete relayed_wire;
+    delete relay_client;
+
+    /* A local NoCS decision never uses a fulfillment daemon and therefore
+       remains exempt even while the operator-selected fleet mode is strict. */
+    MsgChannel *local = connect_daemon(socket_path);
+    Environments local_envs;
+    local_envs.push_back(std::make_pair(std::string("x86_64"),
+                                        std::string("local-env")));
+    GetCSMsg local_request(local_envs, "local.cpp", CompileJob::Lang_CXX,
+                           1, "x86_64", 0, "", MIN_PROTOCOL_VERSION,
+                           0, 0);
+    REQUIRE(local && local->send_msg(local_request),
+            "local-exemption GetCS sent in strict mode");
+    Msg *get_wire = wait_type(scheduler, Msg::GET_CS, 3000);
+    GetCSMsg *get = dynamic_cast<GetCSMsg *>(get_wire);
+    const uint32_t local_client_id = get ? get->client_id : 0;
+    REQUIRE(get && scheduler->send_msg(NoCSMsg(1501, local_client_id)),
+            "scheduler selects local NoCS in strict mode");
+    delete get_wire;
+    Msg *use_wire = wait_type(local, Msg::USE_CS, 3000);
+    UseCSMsg *local_use = dynamic_cast<UseCSMsg *>(use_wire);
+    REQUIRE(local_use && !local_use->hasAssignmentIdentity(),
+            "local decision carries wholly absent assignment identity");
+    const bool local_sent = local_use
+        && send_claim(local, local_use->job_id, 0, 0, "__client");
+    delete use_wire;
+    Msg *local_begin = local_sent
+        ? wait_type(scheduler, Msg::JOB_BEGIN, 3000) : nullptr;
+    JobBeginMsg *local_begin_typed = dynamic_cast<JobBeginMsg *>(local_begin);
+    REQUIRE(local_begin_typed && local_begin_typed->job_id == 1501,
+            "strict mode leaves local CLIENTWORK admission exempt");
+    delete local_begin;
+    delete local;
+
+    /* A fresh session demonstrates EnforcingCompat's intentional dual
+       admission: nonce-less legacy claims and exact P50 claims. */
+    delete scheduler;
+    scheduler = nullptr;
+    scheduler = accept_channel(listener, 8000);
+    login = wait_type(scheduler, Msg::LOGIN, 5000);
+    REQUIRE(scheduler && login,
+            "daemon reconnects for EnforcingCompat dual-admission probe");
+    delete login;
+    const uint64_t compat_epoch = strict_epoch + 1;
+    REQUIRE(scheduler && scheduler->send_msg(
+                ConfCSMsg(compat_epoch, ConfCSMsg::EnforcingCompat)),
+            "fresh EnforcingCompat epoch activated");
+    const uint32_t compat_legacy_id = 1601;
+    const uint64_t compat_legacy_nonce = UINT64_C(0x9300000000001601);
+    REQUIRE(scheduler->send_msg(AssignPrepareMsg(
+                compat_epoch, compat_legacy_id, compat_legacy_nonce, 19)),
+            "compat assignment prepared for nonce-less claim");
+    delete wait_type(scheduler, Msg::ASSIGN_READY, 3000);
+    MsgChannel *compat_legacy = connect_daemon(socket_path);
+    REQUIRE(compat_legacy && send_claim(compat_legacy, compat_legacy_id),
+            "EnforcingCompat nonce-less claim sent");
+    Msg *compat_begin = wait_type(scheduler, Msg::JOB_BEGIN, 3000);
+    JobBeginMsg *compat_begin_typed = dynamic_cast<JobBeginMsg *>(compat_begin);
+    REQUIRE(compat_begin_typed
+                && compat_begin_typed->job_id == compat_legacy_id,
+            "EnforcingCompat admits prepared nonce-less claim");
+    delete compat_begin;
+    delete compat_legacy;
+
+    const uint32_t compat_full_id = 1602;
+    const uint64_t compat_full_nonce = UINT64_C(0x9300000000001602);
+    REQUIRE(scheduler->send_msg(AssignPrepareMsg(
+                compat_epoch, compat_full_id, compat_full_nonce, 19)),
+            "compat assignment prepared for full claim");
+    delete wait_type(scheduler, Msg::ASSIGN_READY, 3000);
+    MsgChannel *compat_full = connect_daemon(socket_path);
+    REQUIRE(compat_full && send_claim(
+                compat_full, compat_full_id, compat_epoch, compat_full_nonce),
+            "EnforcingCompat full claim sent");
+    compat_begin = wait_type(scheduler, Msg::JOB_BEGIN, 3000);
+    compat_begin_typed = dynamic_cast<JobBeginMsg *>(compat_begin);
+    REQUIRE(compat_begin_typed && compat_begin_typed->job_id == compat_full_id,
+            "EnforcingCompat admits exact nonce-bearing claim");
+    delete compat_begin;
+    delete compat_full;
     delete scheduler;
     scheduler = nullptr;
 

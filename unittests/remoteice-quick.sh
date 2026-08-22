@@ -18,6 +18,11 @@
 #      payload (out=...) attributed to the worker;
 #   4. the object file is nonempty and contains the expected symbol.
 #
+# With ICECC_TEST_ASSIGNMENT_FENCE_MODE=strict-nonce this is also the
+# deletion-sensitive production-path gate for Protocol-50 assignment identity:
+# removing the scheduler stamp, submitter-daemon relay, client build_remote_int
+# copy, or fulfillment comparison makes the strict worker reject CompileFile.
+# The default remains the permanent legacy remote-compile reference.
 # This is the regression gate for the compile child's descriptor sweep: a
 # sweep that closes the client channel fd makes the compile hang at the
 # client's result wait (no FIN is ever sent, because the parent daemon still
@@ -56,6 +61,12 @@ work=$(mktemp -d "${TMPDIR:-/tmp}/iceremote.XXXXXX") || exit 99
 SCHED_PORT=${ICECC_TEST_SCHED_PORT:-$((21000 + $$ % 9000))}
 REMOTE_PORT=${ICECC_TEST_REMOTE_PORT:-$((11000 + $$ % 9000))}
 NETNAME=remoteq$$
+ASSIGNMENT_FENCE_MODE=${ICECC_TEST_ASSIGNMENT_FENCE_MODE:-legacy}
+case "$ASSIGNMENT_FENCE_MODE" in
+    legacy) ;;
+    strict-nonce) ;;
+    *) echo "FAIL: unsupported assignment fence mode $ASSIGNMENT_FENCE_MODE" >&2; exit 1 ;;
+esac
 
 fail() {
     echo "FAIL: $1" >&2
@@ -107,8 +118,13 @@ fi
 ENVTAR=$(ls "$work"/env/*.tar.gz 2>/dev/null | head -1)
 [ -n "$ENVTAR" ] || skip "icecc-create-env produced no tarball (see $work/create-env.log)"
 
-"$top/scheduler/icecc-scheduler" -p "$SCHED_PORT" -n "$NETNAME" \
-    -l "$work/sched.log" -vvv &
+if [ "$ASSIGNMENT_FENCE_MODE" = strict-nonce ]; then
+    "$top/scheduler/icecc-scheduler" -p "$SCHED_PORT" -n "$NETNAME" \
+        --assignment-fence-mode strict-nonce -l "$work/sched.log" -vvv &
+else
+    "$top/scheduler/icecc-scheduler" -p "$SCHED_PORT" -n "$NETNAME" \
+        -l "$work/sched.log" -vvv &
+fi
 SCHED_PID=$!
 
 ICECC_TEST_SOCKET="$sockdir/remote" \
@@ -131,6 +147,10 @@ for _ in $(seq 1 60); do
     sleep 0.5
 done
 [ "${logins:-0}" -ge 2 ] || fail "daemons never registered with the scheduler"
+if [ "$ASSIGNMENT_FENCE_MODE" = strict-nonce ]; then
+    grep -q "assignment fence: strict-nonce" "$work/sched.log" \
+        || fail "scheduler did not activate explicit STRICT_NONCE mode"
+fi
 
 # Accepting remote jobs needs CAP_SYS_CHROOT (tests/Makefile.am test-prepare
 # grants it with setcap; containers running as root have it).  Without it the
@@ -179,5 +199,9 @@ sleep 1   # let the worker's JobDone reach the scheduler
 grep -qE "END [0-9]+ status=0 .*out=[1-9].* server=remoteq" "$work/sched.log" \
     || fail "scheduler never recorded a successful JobDone from the worker with a result payload"
 
-echo "OK: remote compile on second daemon, result streamed back, JobDone recorded"
+if [ "$ASSIGNMENT_FENCE_MODE" = strict-nonce ]; then
+    echo "OK: strict P50 remote compile crossed scheduler, relay, client, and fulfillment admission"
+else
+    echo "OK: remote compile on second daemon, result streamed back, JobDone recorded"
+fi
 exit 0

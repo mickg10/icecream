@@ -24,6 +24,7 @@
 #define ICECREAM_COMPILE_JOB_H
 
 #include <list>
+#include <cstdint>
 #include <string>
 #include <iostream>
 #include <sstream>
@@ -64,6 +65,8 @@ public:
 
     CompileJob()
         : m_id(0)
+        , m_assignment_epoch(0)
+        , m_assignment_nonce(0)
         , m_dwarf_fission(false)
         , m_block_rewrite_includes(false)
     {
@@ -176,6 +179,35 @@ public:
         return m_id;
     }
 
+    void setAssignmentIdentity(uint64_t epoch, uint64_t nonce)
+    {
+        m_assignment_epoch = epoch;
+        m_assignment_nonce = nonce;
+    }
+
+    uint64_t assignmentEpoch() const
+    {
+        return m_assignment_epoch;
+    }
+
+    uint64_t assignmentNonce() const
+    {
+        return m_assignment_nonce;
+    }
+
+    bool hasAssignmentIdentity() const
+    {
+        return m_assignment_epoch != 0 && m_assignment_nonce != 0;
+    }
+
+    bool assignmentIdentityValid() const
+    {
+        const bool absent = m_assignment_epoch == 0 && m_assignment_nonce == 0;
+        const bool complete = m_assignment_epoch != 0 && m_assignment_nonce != 0
+            && m_id != 0;
+        return absent || complete;
+    }
+
     void appendFlag(std::string arg, Argument_Type argumentType)
     {
         m_flags.append(arg, argumentType);
@@ -208,6 +240,8 @@ private:
     void setTargetPlatform();
 
     unsigned int m_id;
+    uint64_t m_assignment_epoch;
+    uint64_t m_assignment_nonce;
     Language m_language;
     std::string m_compiler_pathname;
     std::string m_compiler_name;

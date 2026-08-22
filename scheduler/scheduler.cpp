@@ -144,16 +144,16 @@ struct SchedulerAssignmentKeyHash {
 static std::unordered_map<SchedulerAssignmentKey, Job *,
                           SchedulerAssignmentKeyHash> fenced_assignments;
 
-/* Protocol-49 assignment fencing is an explicit scheduler policy and stays
-   LEGACY by default.  STRICT_NONCE is reserved here but cannot be activated
-   until protocol 50 carries the identity through the client path. */
+/* Assignment fencing is an explicit scheduler policy and stays LEGACY by
+   default.  Link versions constrain eligibility but never select a mode. */
 static ConfCSMsg::FenceMode assignment_fence_mode = ConfCSMsg::Legacy;
 static uint64_t scheduler_assignment_epoch = 0;
 
 static bool assignment_mode_prepares()
 {
     return assignment_fence_mode == ConfCSMsg::Advisory
-        || assignment_fence_mode == ConfCSMsg::EnforcingCompat;
+        || assignment_fence_mode == ConfCSMsg::EnforcingCompat
+        || assignment_fence_mode == ConfCSMsg::StrictNonce;
 }
 
 static uint64_t fresh_assignment_word()
@@ -190,9 +190,18 @@ static uint64_t fresh_assignment_nonce()
     return cursor;
 }
 
-static ConfCSMsg scheduler_conf_message()
+static ConfCSMsg scheduler_conf_message(const CompileServer *peer)
 {
-    return ConfCSMsg(scheduler_assignment_epoch, assignment_fence_mode);
+    /* A mixed fleet remains connectable in explicit STRICT_NONCE mode, but
+       protocol-49 daemons cannot accept that configuration and are never
+       eligible for its remote assignments.  Project LEGACY to those peers;
+       this is compatibility, not mode inference. */
+    const ConfCSMsg::FenceMode projected =
+        assignment_fence_mode == ConfCSMsg::StrictNonce
+            && !IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_IDENTITY, peer)
+        ? ConfCSMsg::Legacy
+        : assignment_fence_mode;
+    return ConfCSMsg(scheduler_assignment_epoch, projected);
 }
 
 static const char *assignment_mode_name(ConfCSMsg::FenceMode mode)
@@ -1431,7 +1440,8 @@ static bool send_remote_dispatch_reply(Job *job)
     UseCSMsg reply(job->dispatchPlatform(), job->server()->name,
                    job->server()->remotePort(), job->id(),
                    job->dispatchGotEnv(), job->localClientId(),
-                   job->dispatchMatchedJobId());
+                   job->dispatchMatchedJobId(), job->assignmentEpoch(),
+                   job->assignmentNonce());
     return job->submitter()->send_msg(
         reply, MsgChannel::SendNonBlocking | MsgChannel::SendDeferrable);
 }
@@ -1966,6 +1976,13 @@ static list<CompileServer *> filter_ineligible_servers(Job *job)
         css.end(),
         std::back_inserter(eligible),
         [=](CompileServer* cs) {
+            if (cs != job->submitter()
+                    && assignment_fence_mode == ConfCSMsg::StrictNonce
+                    && (!IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_IDENTITY, cs)
+                        || !IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_IDENTITY,
+                                                job->submitter()))) {
+                return false;
+            }
             /* PREPARE is admitted only onto an empty S->F userspace queue.
                Appending another assignment behind deferred output would make
                an already bounded backlog the admission path for new work. */
@@ -2252,8 +2269,13 @@ static CompileServer *pick_server(Job *job, SchedulerAlgorithmName schedulerAlgo
                 && assignment_mode_prepares()
                 && IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_FENCE, cs)
                 && cs->has_pending_write();
+            const bool strict_incompatible = cs != job->submitter()
+                && assignment_fence_mode == ConfCSMsg::StrictNonce
+                && (!IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_IDENTITY, cs)
+                    || !IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_IDENTITY,
+                                            job->submitter()));
             if (cs->matches(job->preferredHost()) && cs->is_eligible_now(job)
-                    && !prepare_backlogged) {
+                    && !prepare_backlogged && !strict_incompatible) {
 #if DEBUG_SCHEDULER > 1
                 trace() << "taking preferred " << cs->nodeName() << " " <<  server_speed(cs, job, true) << endl;
 #endif
@@ -2683,17 +2705,40 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
     job->setDispatchProjection(host_platform, gotit, matched_job_id);
 
     /* The policy is frozen per assignment before either peer can observe it.
-       Prepared P49 is selected only for a remote decision on a worker link
-       that negotiated the complete vocabulary.  Legacy mode and old workers take
-       the exact legacy path below: no PREPARE, no READY wait, no REVOKE. */
+       STRICT_NONCE additionally requires the complete P50 path, S->C and
+       S->F; local decisions use neither a worker assignment nor this carrier. */
+    const bool strict_path_eligible = assignment_fence_mode != ConfCSMsg::StrictNonce
+        || (IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_IDENTITY, use_cs)
+            && IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_IDENTITY,
+                                   job->submitter()));
+    if (!local_decision && !strict_path_eligible) {
+        /* Selection filters make this unreachable in normal operation.  If a
+           future selector violates that invariant, close the request instead
+           of silently exposing a legacy remote assignment in strict mode. */
+        log_error() << "refusing incompatible remote strict assignment "
+                    << job->id() << endl;
+        handle_end(job->submitter(), nullptr);
+        return true;
+    }
     const bool prepared_assignment = !local_decision
         && assignment_mode_prepares()
-        && IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_FENCE, use_cs);
+        && IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_FENCE, use_cs)
+        && strict_path_eligible;
     if (prepared_assignment) {
-        job->setAssignmentPolicy(
-            assignment_fence_mode == ConfCSMsg::Advisory
-                ? Job::ASSIGNMENT_ADVISORY
-                : Job::ASSIGNMENT_ENFORCING_COMPAT);
+        switch (assignment_fence_mode) {
+        case ConfCSMsg::Advisory:
+            job->setAssignmentPolicy(Job::ASSIGNMENT_ADVISORY);
+            break;
+        case ConfCSMsg::EnforcingCompat:
+            job->setAssignmentPolicy(Job::ASSIGNMENT_ENFORCING_COMPAT);
+            break;
+        case ConfCSMsg::StrictNonce:
+            job->setAssignmentPolicy(Job::ASSIGNMENT_STRICT_NONCE);
+            break;
+        case ConfCSMsg::Legacy:
+            assert(false);
+            break;
+        }
         job->setAssignmentIdentity(scheduler_assignment_epoch,
                                    fresh_assignment_nonce());
         job->setAssignmentPhase(Job::ASSIGNMENT_PREPARED);
@@ -2843,7 +2888,7 @@ static bool handle_login(CompileServer *cs, Msg *_m)
 
     /* Configure the daemon */
     if (IS_PROTOCOL_VERSION(24, cs)) {
-        cs->send_msg(scheduler_conf_message());
+        cs->send_msg(scheduler_conf_message(cs));
     }
 
     return true;
@@ -2872,7 +2917,7 @@ static bool handle_relogin(MsgChannel *mc, Msg *_m)
 
     /* Configure the daemon */
     if (IS_PROTOCOL_VERSION(24, cs)) {
-        cs->send_msg(scheduler_conf_message());
+        cs->send_msg(scheduler_conf_message(cs));
     }
 
     return false;
@@ -4727,7 +4772,7 @@ int main(int argc, char *argv[])
             } else if (mode == "enforcing-compat") {
                 assignment_fence_mode = ConfCSMsg::EnforcingCompat;
             } else if (mode == "strict-nonce") {
-                usage("Error: strict-nonce requires protocol 50 nonce-bearing client claims");
+                assignment_fence_mode = ConfCSMsg::StrictNonce;
             } else {
                 usage("Error: unknown --assignment-fence-mode: " + mode);
             }

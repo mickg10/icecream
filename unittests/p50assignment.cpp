@@ -1,0 +1,214 @@
+/* Protocol-50 assignment-identity carrier gate using production codecs. */
+#include "comm.h"
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <thread>
+#include <vector>
+
+static int failures;
+#define REQUIRE(c, t) do { const bool ok_ = (c); std::fprintf(stderr, "%s - %s\n", ok_ ? "ok    " : "FAILED", t); if (!ok_) ++failures; } while (0)
+
+struct Pair {
+    MsgChannel *left = nullptr;
+    MsgChannel *right = nullptr;
+    Pair() = default;
+    Pair(const Pair &) = delete;
+    Pair &operator=(const Pair &) = delete;
+    Pair(Pair &&o) noexcept : left(o.left), right(o.right) { o.left = o.right = nullptr; }
+    ~Pair() { delete left; delete right; }
+};
+
+static Pair make_pair(int protocol)
+{
+    int fds[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds)) std::exit(2);
+    sockaddr_un address {};
+    address.sun_family = AF_UNIX;
+    Pair p;
+    std::thread a([&] { p.left = Service::createChannel(fds[0], reinterpret_cast<sockaddr *>(&address), sizeof(address)); });
+    std::thread b([&] { p.right = Service::createChannel(fds[1], reinterpret_cast<sockaddr *>(&address), sizeof(address)); });
+    a.join(); b.join();
+    if (!p.left || !p.right) std::exit(2);
+    p.left->protocol = p.right->protocol = protocol;
+    return p;
+}
+
+template<typename T>
+static T *round_trip(Pair &p, const T &sent, Msg::Value type)
+{
+    if (!p.left->send_msg(sent)) return nullptr;
+    Msg *m = p.right->get_msg(2, true);
+    if (!m || *m != type) { delete m; return nullptr; }
+    T *typed = dynamic_cast<T *>(m);
+    if (!typed) delete m;
+    return typed;
+}
+
+static CompileJob make_job(uint32_t id, uint64_t epoch, uint64_t nonce)
+{
+    CompileJob j;
+    j.setLanguage(CompileJob::Lang_CXX);
+    j.setJobID(id);
+    j.setAssignmentIdentity(epoch, nonce);
+    j.setEnvironmentVersion("env");
+    j.setTargetPlatform("x86_64");
+    j.setCompilerName("g++");
+    j.setInputFile("in.ii");
+    j.setWorkingDirectory("/tmp");
+    j.setOutputFile("out.o");
+    j.appendFlag("-O2", Arg_Remote);
+    return j;
+}
+
+static void test_eight_cells()
+{
+    const uint32_t wire = UINT32_C(0x12345678);
+    const uint64_t epoch = UINT64_C(0x1020304050607080);
+    const uint64_t nonce = UINT64_C(0x8877665544332211);
+    for (int sn = 0; sn != 2; ++sn) for (int cn = 0; cn != 2; ++cn) for (int fn = 0; fn != 2; ++fn) {
+        const int sv = sn ? 50 : 43, cv = cn ? 50 : 43, fv = fn ? 50 : 43;
+        const bool all50 = sn && cn && fn;
+        UseCSMsg scheduled("x86_64", "worker", 10245, wire, true, 7, 9, epoch, nonce);
+        Pair sd = make_pair(std::min(sv, cv));
+        UseCSMsg *at_daemon = round_trip(sd, scheduled, Msg::USE_CS);
+        Pair dc = make_pair(cv);
+        UseCSMsg *at_client = at_daemon ? round_trip(dc, *at_daemon, Msg::USE_CS) : nullptr;
+        delete at_daemon;
+        CompileJob claim = make_job(1, 0, 0);
+        const bool copied = at_client && at_client->applyAssignmentTo(&claim);
+        delete at_client;
+        Pair cf = make_pair(std::min(cv, fv));
+        CompileFileMsg outbound(&claim);
+        CompileFileMsg *received = copied ? round_trip(cf, outbound, Msg::COMPILE_FILE) : nullptr;
+        CompileJob *admitted = received ? received->takeJob() : nullptr;
+        delete received;
+        const bool exact = admitted && admitted->jobID() == wire
+            && admitted->assignmentEpoch() == (all50 ? epoch : 0)
+            && admitted->assignmentNonce() == (all50 ? nonce : 0);
+        char label[128];
+        std::snprintf(label, sizeof(label), "8-cell S%d/C%d/F%d: one wire id, identity %s", sv, cv, fv, all50 ? "exact" : "absent");
+        REQUIRE(copied && exact, label);
+        delete admitted;
+    }
+}
+
+using Bytes = std::vector<unsigned char>;
+template<typename T>
+static Bytes encode_frame(int protocol, const T &msg)
+{
+    Pair p = make_pair(protocol);
+    if (!p.left->send_msg(msg)) return {};
+    uint32_t netlen;
+    if (recv(p.right->fd, &netlen, 4, MSG_WAITALL) != 4) return {};
+    const uint32_t len = ntohl(netlen);
+    Bytes bytes(4 + len);
+    std::memcpy(bytes.data(), &netlen, 4);
+    if (recv(p.right->fd, bytes.data() + 4, len, MSG_WAITALL) != ssize_t(len)) return {};
+    return bytes;
+}
+
+static Bytes encoded_usecs(int protocol)
+{
+    UseCSMsg m("p", "h", 10245, UINT32_C(0x01020304), true,
+               UINT32_C(0xa0b0c0d0), UINT32_C(0x0a0b0c0d),
+               UINT64_C(0x1122334455667788), UINT64_C(0x8877665544332211));
+    return encode_frame(protocol, m);
+}
+
+static Bytes encoded_compile(int protocol)
+{
+    CompileJob j = make_job(UINT32_C(0x01020304), UINT64_C(0x1122334455667788), UINT64_C(0x8877665544332211));
+    CompileFileMsg m(&j);
+    return encode_frame(protocol, m);
+}
+
+static bool appended_four_words(const Bytes &oldf, const Bytes &newf)
+{
+    return newf.size() == oldf.size() + 16
+        && std::equal(oldf.begin() + 4, oldf.end(), newf.begin() + 4);
+}
+
+static uint64_t fnv1a(const Bytes &bytes)
+{
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (unsigned char byte : bytes) {
+        hash ^= byte;
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static void test_bytes()
+{
+    const Bytes u43 = encoded_usecs(43), u48 = encoded_usecs(48), u49 = encoded_usecs(49), u50 = encoded_usecs(50);
+    REQUIRE(!u43.empty() && fnv1a(u43) == UINT64_C(0xe556229af116ee8d),
+            "P43 UseCS matches its retained byte fixture");
+    REQUIRE(!u48.empty() && fnv1a(u48) == UINT64_C(0xe556229af116ee8d),
+            "P48 UseCS matches its retained byte fixture");
+    REQUIRE(!u49.empty() && fnv1a(u49) == UINT64_C(0xe556229af116ee8d),
+            "P49 UseCS matches its retained byte fixture");
+    REQUIRE(appended_four_words(u49, u50), "P50 UseCS appends only four identity words");
+    const Bytes f43 = encoded_compile(43), f48 = encoded_compile(48), f49 = encoded_compile(49), f50 = encoded_compile(50);
+    REQUIRE(!f43.empty() && fnv1a(f43) == UINT64_C(0x1d040038613f174d),
+            "P43 CompileFile matches its retained byte fixture");
+    REQUIRE(!f48.empty() && fnv1a(f48) == UINT64_C(0x1d040038613f174d),
+            "P48 CompileFile matches its retained byte fixture");
+    REQUIRE(!f49.empty() && fnv1a(f49) == UINT64_C(0x1d040038613f174d),
+            "P49 CompileFile matches its retained byte fixture");
+    REQUIRE(appended_four_words(f49, f50), "P50 CompileFile appends only four identity words");
+}
+
+static void test_invalid()
+{
+    { Pair p = make_pair(50); UseCSMsg m("p", "h", 1, 7, true, 1, 0); m.assignment_epoch_lo = 1;
+      REQUIRE(!p.left->send_msg(m), "UseCS refuses partial identity"); }
+    { Pair p = make_pair(50); UseCSMsg m("p", "h", 1, 0, true, 1, 0, 3, 5);
+      REQUIRE(!p.left->send_msg(m), "UseCS refuses full identity with zero wire id"); }
+    { Pair p = make_pair(50); CompileJob j = make_job(7, 3, 0); CompileFileMsg m(&j);
+      REQUIRE(!p.left->send_msg(m), "CompileFile refuses partial identity"); }
+    { Pair p = make_pair(50); CompileJob j = make_job(0, 3, 5); CompileFileMsg m(&j);
+      REQUIRE(!p.left->send_msg(m), "CompileFile refuses full identity with zero wire id"); }
+
+    auto rejected_by_decoder = [](const Bytes &bytes) {
+        Pair p = make_pair(50);
+        const bool wrote = !bytes.empty()
+            && send(p.left->fd, bytes.data(), bytes.size(), 0)
+                == ssize_t(bytes.size());
+        Msg *decoded = wrote ? p.right->get_msg(2, true) : nullptr;
+        const bool rejected = wrote && !decoded;
+        delete decoded;
+        return rejected;
+    };
+
+    Bytes use_partial = encoded_usecs(50);
+    if (use_partial.size() >= 8) std::fill(use_partial.end() - 8, use_partial.end(), 0);
+    REQUIRE(rejected_by_decoder(use_partial),
+            "production decoder rejects partial UseCS identity");
+    Bytes use_zero_wire = encoded_usecs(50);
+    if (use_zero_wire.size() >= 12) std::fill(use_zero_wire.begin() + 8, use_zero_wire.begin() + 12, 0);
+    REQUIRE(rejected_by_decoder(use_zero_wire),
+            "production decoder rejects full UseCS identity with zero wire id");
+
+    Bytes compile_partial = encoded_compile(50);
+    if (compile_partial.size() >= 8) std::fill(compile_partial.end() - 8, compile_partial.end(), 0);
+    REQUIRE(rejected_by_decoder(compile_partial),
+            "production decoder rejects partial CompileFile identity");
+    Bytes compile_zero_wire = encoded_compile(50);
+    if (compile_zero_wire.size() >= 16) std::fill(compile_zero_wire.begin() + 12, compile_zero_wire.begin() + 16, 0);
+    REQUIRE(rejected_by_decoder(compile_zero_wire),
+            "production decoder rejects full CompileFile identity with zero wire id");
+}
+
+int main()
+{
+    test_eight_cells();
+    test_bytes();
+    test_invalid();
+    return failures ? 1 : 0;
+}

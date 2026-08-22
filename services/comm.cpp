@@ -1478,6 +1478,13 @@ Msg *MsgChannel::get_msg(int timeout, bool eofAllowed)
 
     m->fill_from_channel(this);
 
+    if (!m->valid_payload()) {
+        log_error() << "invalid message payload (" << m->to_string() << ")" << endl;
+        delete m;
+        set_error();
+        return nullptr;
+    }
+
     if (!text_based) {
         if( intogo - intogo_old != inmsglen ) {
             log_error() << "internal error - message (" << m->to_string() << ") not read correctly, message size " << inmsglen
@@ -1496,6 +1503,11 @@ Msg *MsgChannel::get_msg(int timeout, bool eofAllowed)
 
 bool MsgChannel::send_msg(const Msg &m, int flags)
 {
+    if (!m.valid_payload()) {
+        log_error() << "refusing invalid message payload (" << m.to_string() << ")" << endl;
+        set_error();
+        return false;
+    }
     if (instate == ERROR) {
         return false;
     }
@@ -2268,6 +2280,15 @@ void UseCSMsg::fill_from_channel(MsgChannel *c)
     } else {
         matched_job_id = 0;
     }
+    if (IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_IDENTITY, c)) {
+        *c >> assignment_epoch_hi;
+        *c >> assignment_epoch_lo;
+        *c >> assignment_nonce_hi;
+        *c >> assignment_nonce_lo;
+    } else {
+        assignment_epoch_hi = assignment_epoch_lo = 0;
+        assignment_nonce_hi = assignment_nonce_lo = 0;
+    }
 }
 
 void UseCSMsg::send_to_channel(MsgChannel *c) const
@@ -2283,6 +2304,30 @@ void UseCSMsg::send_to_channel(MsgChannel *c) const
     if (IS_PROTOCOL_VERSION(28, c)) {
         *c << matched_job_id;
     }
+    if (IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_IDENTITY, c)) {
+        *c << assignment_epoch_hi;
+        *c << assignment_epoch_lo;
+        *c << assignment_nonce_hi;
+        *c << assignment_nonce_lo;
+    }
+}
+
+bool UseCSMsg::valid_payload() const
+{
+    const bool epoch_present = assignmentEpoch() != 0;
+    const bool nonce_present = assignmentNonce() != 0;
+    return (!epoch_present && !nonce_present)
+        || (epoch_present && nonce_present && job_id != 0);
+}
+
+bool UseCSMsg::applyAssignmentTo(CompileJob *job) const
+{
+    if (!job || !valid_payload()) {
+        return false;
+    }
+    job->setJobID(job_id);
+    job->setAssignmentIdentity(assignmentEpoch(), assignmentNonce());
+    return true;
 }
 
 void NoCSMsg::fill_from_channel(MsgChannel *c)
@@ -2356,6 +2401,18 @@ void CompileFileMsg::fill_from_channel(MsgChannel *c)
         job->setOutputFile(outputFile);
         job->setDwarfFissionEnabled(dwarfFissionEnabled);
     }
+    if (IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_IDENTITY, c)) {
+        uint32_t epoch_hi, epoch_lo, nonce_hi, nonce_lo;
+        *c >> epoch_hi;
+        *c >> epoch_lo;
+        *c >> nonce_hi;
+        *c >> nonce_lo;
+        job->setAssignmentIdentity(
+            (uint64_t(epoch_hi) << 32) | epoch_lo,
+            (uint64_t(nonce_hi) << 32) | nonce_lo);
+    } else {
+        job->setAssignmentIdentity(0, 0);
+    }
 }
 
 void CompileFileMsg::send_to_channel(MsgChannel *c) const
@@ -2398,6 +2455,12 @@ void CompileFileMsg::send_to_channel(MsgChannel *c) const
     if (IS_PROTOCOL_VERSION(35, c)) {
         *c << job->outputFile();
         *c << (uint32_t) job->dwarfFissionEnabled();
+    }
+    if (IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_IDENTITY, c)) {
+        *c << uint32_t(job->assignmentEpoch() >> 32);
+        *c << uint32_t(job->assignmentEpoch());
+        *c << uint32_t(job->assignmentNonce() >> 32);
+        *c << uint32_t(job->assignmentNonce());
     }
 }
 

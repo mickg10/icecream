@@ -38,4 +38,5 @@ EXTRA_DIST = \
 	icecc-create-env.adoc \
 	icecream.adoc \
 	p49-assignment-fence.md \
-	issue16-p50-assignment-convergence.md
+	issue16-p50-assignment-convergence.md \
+	p50-assignment-identity.md

@@ -417,7 +417,9 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
     int job_id = usecs->job_id;
     bool got_env = usecs->got_env;
     invocation_timing_set_compile_job_id(job_id);
-    job.setJobID(job_id);
+    if (!usecs->applyAssignmentTo(&job)) {
+        throw client_error(9, "Error 9 - malformed assignment identity");
+    }
     job.setEnvironmentVersion(environment);   // hoping on the scheduler's wisdom
     trace() << "Have to use host " << hostname << ":" << port << " - Job ID: "
             << job.jobID() << " - env: " << usecs->host_platform
@@ -743,7 +745,9 @@ maybe_build_local(MsgChannel *local_daemon, UseCSMsg *usecs, CompileJob &job,
         int job_id = usecs->job_id;
         invocation_timing_set_scheduler_job_id(job_id);
         invocation_timing_set_compile_job_id(job_id);
-        job.setJobID(job_id);
+        if (!usecs->applyAssignmentTo(&job)) {
+            throw client_error(29, "Error 29 - malformed assignment identity");
+        }
         job.setEnvironmentVersion("__client");
         CompileFileMsg compile_file(&job);
 

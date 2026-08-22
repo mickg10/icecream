@@ -38,12 +38,13 @@
 #include <stdint.h>
 
 // if you increase the PROTOCOL_VERSION, add a macro below and use that
-#define PROTOCOL_VERSION 49
+#define PROTOCOL_VERSION 50
 // if you increase the MIN_PROTOCOL_VERSION, comment out macros below and clean up the code
 #define MIN_PROTOCOL_VERSION 21
 #define PROTOCOL_VERSION_JOB_TIMING 47
 #define PROTOCOL_VERSION_JOB_LOCAL_FLAGS 48
 #define PROTOCOL_VERSION_ASSIGNMENT_FENCE 49
+#define PROTOCOL_VERSION_ASSIGNMENT_IDENTITY 50
 
 #define MAX_SCHEDULER_PONG 3
 // MAX_SCHEDULER_PING must be multiple of MAX_SCHEDULER_PONG
@@ -154,6 +155,10 @@ public:
 
     constexpr operator Value() const { return value_; }
     explicit operator bool() = delete;
+
+    /* Payload invariants which cannot be expressed by the frame length alone.
+       The default keeps all historical message classes unchanged. */
+    virtual bool valid_payload() const { return true; }
 
     std::basic_string<char> to_string() const {
         switch (value_) {
@@ -637,9 +642,19 @@ class UseCSMsg : public Msg
 {
 public:
     UseCSMsg()
-        : Msg(Msg::USE_CS) {}
+        : Msg(Msg::USE_CS)
+        , job_id(0)
+        , port(0)
+        , got_env(0)
+        , client_id(0)
+        , matched_job_id(0)
+        , assignment_epoch_hi(0)
+        , assignment_epoch_lo(0)
+        , assignment_nonce_hi(0)
+        , assignment_nonce_lo(0) {}
     UseCSMsg(std::string platform, std::string host, unsigned int p, unsigned int id, bool gotit,
-             unsigned int _client_id, unsigned int matched_host_jobs)
+             unsigned int _client_id, unsigned int matched_host_jobs,
+             uint64_t assignment_epoch = 0, uint64_t assignment_nonce = 0)
         : Msg(Msg::USE_CS),
           job_id(id),
           hostname(host),
@@ -647,10 +662,29 @@ public:
           host_platform(platform),
           got_env(gotit),
           client_id(_client_id),
-          matched_job_id(matched_host_jobs) {}
+          matched_job_id(matched_host_jobs),
+          assignment_epoch_hi(uint32_t(assignment_epoch >> 32)),
+          assignment_epoch_lo(uint32_t(assignment_epoch)),
+          assignment_nonce_hi(uint32_t(assignment_nonce >> 32)),
+          assignment_nonce_lo(uint32_t(assignment_nonce)) {}
 
     virtual void fill_from_channel(MsgChannel *c);
     virtual void send_to_channel(MsgChannel *c) const;
+    virtual bool valid_payload() const;
+
+    uint64_t assignmentEpoch() const
+    {
+        return (uint64_t(assignment_epoch_hi) << 32) | assignment_epoch_lo;
+    }
+    uint64_t assignmentNonce() const
+    {
+        return (uint64_t(assignment_nonce_hi) << 32) | assignment_nonce_lo;
+    }
+    bool hasAssignmentIdentity() const
+    {
+        return assignmentEpoch() != 0 && assignmentNonce() != 0;
+    }
+    bool applyAssignmentTo(CompileJob *job) const;
 
     uint32_t job_id;
     std::string hostname;
@@ -659,6 +693,12 @@ public:
     uint32_t got_env;
     uint32_t client_id;
     uint32_t matched_job_id;
+    /* Protocol 50 appends exactly these four words.  job_id above remains the
+       sole serialized wire id. */
+    uint32_t assignment_epoch_hi;
+    uint32_t assignment_epoch_lo;
+    uint32_t assignment_nonce_hi;
+    uint32_t assignment_nonce_lo;
 };
 
 class NoCSMsg : public Msg
@@ -733,6 +773,10 @@ public:
 
     virtual void fill_from_channel(MsgChannel *c);
     virtual void send_to_channel(MsgChannel *c) const;
+    virtual bool valid_payload() const
+    {
+        return job != nullptr && job->assignmentIdentityValid();
+    }
     CompileJob *takeJob();
 
 private:
