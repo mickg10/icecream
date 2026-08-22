@@ -291,6 +291,17 @@ The executable trace gates reject:
 - begin or commit at exhausted `REL_SEQ`;
 - loss of the durable-commit reconciliation witness.
 
+## P50 assignment identity through the client
+
+`Protocol50AssignmentIdentity.tla` refines the accepted assignment and
+delivery models across the existing S -> C -> F claimant path. It treats
+`job_id` as the established wire id, carries epoch and nonce only when every
+corresponding hop is P50, rejects partial identities, and checks the explicit
+P43/P50 compatibility matrix, StrictNonce promise, local exemption,
+reconnect, revoke, and ordinary-settlement suffix. See
+`Protocol50AssignmentIdentity.md` and run its focused fail-closed matrix with
+`run_assignment_identity_tlc.sh`.
+
 ## Running TLC
 
 Use a pinned TLA+ tools version and record the exact version and jar hash. The canonical command is:

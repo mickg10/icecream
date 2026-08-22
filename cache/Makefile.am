@@ -73,6 +73,33 @@ EXTRA_DIST = \
 	formal/Protocol50AssignmentStaleRevokeResultWitness.cfg \
 	formal/Protocol50AssignmentDelivery.md \
 	formal/run_assignment_delivery_tlc.sh \
+	formal/Protocol50AssignmentIdentity.tla \
+	formal/Protocol50AssignmentIdentity.cfg \
+	formal/Protocol50AssignmentIdentityCell43_43_43.cfg \
+	formal/Protocol50AssignmentIdentityCell43_43_50.cfg \
+	formal/Protocol50AssignmentIdentityCell43_50_43.cfg \
+	formal/Protocol50AssignmentIdentityCell43_50_50.cfg \
+	formal/Protocol50AssignmentIdentityCell50_43_43.cfg \
+	formal/Protocol50AssignmentIdentityCell50_43_50.cfg \
+	formal/Protocol50AssignmentIdentityCell50_50_43.cfg \
+	formal/Protocol50AssignmentIdentityCell50_50_50.cfg \
+	formal/Protocol50AssignmentIdentityStrictWitness.cfg \
+	formal/Protocol50AssignmentIdentityStrictMixedWitness.cfg \
+	formal/Protocol50AssignmentIdentityLocalWitness.cfg \
+	formal/Protocol50AssignmentIdentityReconnectWitness.cfg \
+	formal/Protocol50AssignmentIdentityRevokedWitness.cfg \
+	formal/Protocol50AssignmentIdentitySettlementWitness.cfg \
+	formal/Protocol50AssignmentIdentityStaleEpochMutant.cfg \
+	formal/Protocol50AssignmentIdentityStaleWireMutant.cfg \
+	formal/Protocol50AssignmentIdentityStaleNonceMutant.cfg \
+	formal/Protocol50AssignmentIdentityEpochOnlyMutant.cfg \
+	formal/Protocol50AssignmentIdentityNonceOnlyMutant.cfg \
+	formal/Protocol50AssignmentIdentityDropMutant.cfg \
+	formal/Protocol50AssignmentIdentityStrictAbsentMutant.cfg \
+	formal/Protocol50AssignmentIdentityReconnectDropMutant.cfg \
+	formal/Protocol50AssignmentIdentityReleaseClaimedMutant.cfg \
+	formal/Protocol50AssignmentIdentity.md \
+	formal/run_assignment_identity_tlc.sh \
 	formal/run_tlc.sh \
 	formal/.gitignore \
 	formal/check_trace.py \
