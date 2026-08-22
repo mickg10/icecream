@@ -94,7 +94,7 @@ connectivity_DEPENDENCIES = conn_shim.so
 CLEANFILES = sndbuf_shim.so conn_shim.so schedbp-scheduler-*.log
 EXTRA_DIST = sndbuf_shim.c conn_shim.c connectivity-run.sh schedbp-quick.sh schedstress-quick.sh remoteice-quick.sh daemonlogin-run.sh daemonbatch-run.sh boost-prefix-scope.sh
 
-EXTRA_DIST = p50_trace_check.sh
+EXTRA_DIST += p50_trace_check.sh
 
 # Make the tests also print the test log if they fail.
 check: export VERBOSE=1

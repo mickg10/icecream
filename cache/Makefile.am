@@ -14,6 +14,7 @@ AM_CPPFLAGS = -I$(top_srcdir) $(LIBZSTD_CFLAGS)
 
 EXTRA_DIST = \
 	README.md \
+	P48_P50_CONVERGENCE_DRY_RUN.md \
 	KEY_LAYOUT_V1_CENSUS.md \
 	key_layout_census.py \
 	formal/Protocol50.tla \
