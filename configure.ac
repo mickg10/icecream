@@ -132,6 +132,7 @@ AS_IF([test "x$boost_prefix" = xno],
 
 BOOST_CPPFLAGS=
 BOOST_LDFLAGS=
+icecc_boost_probe_ldflags=
 AS_IF([test -n "$boost_prefix" && test "x$boost_prefix" != xyes], [
     AS_IF([test -f "$boost_prefix/boost/version.hpp"], [
         BOOST_CPPFLAGS="-isystem $boost_prefix"
@@ -143,11 +144,11 @@ AS_IF([test -n "$boost_prefix" && test "x$boost_prefix" != xyes], [
     icecc_boost_multiarch=`$CXX -print-multiarch 2>/dev/null`
     AS_IF([test -n "$icecc_boost_multiarch" &&
            test -d "$boost_prefix/lib/$icecc_boost_multiarch"], [
-        BOOST_LDFLAGS="-L$boost_prefix/lib/$icecc_boost_multiarch"
+        icecc_boost_probe_ldflags="-L$boost_prefix/lib/$icecc_boost_multiarch"
     ], [test -d "$boost_prefix/lib64"], [
-        BOOST_LDFLAGS="-L$boost_prefix/lib64"
+        icecc_boost_probe_ldflags="-L$boost_prefix/lib64"
     ], [test -d "$boost_prefix/lib"], [
-        BOOST_LDFLAGS="-L$boost_prefix/lib"
+        icecc_boost_probe_ldflags="-L$boost_prefix/lib"
     ])
 ])
 
@@ -159,7 +160,6 @@ AS_IF([test -n "$boost_prefix" && test "x$boost_prefix" != xyes], [
 BOOST_CPPFLAGS="$BOOST_CPPFLAGS -DBOOST_ASIO_HAS_CO_AWAIT=1 -DBOOST_ASIO_HAS_STD_COROUTINE=1"
 
 CPPFLAGS="$BOOST_CPPFLAGS $CPPFLAGS"
-LDFLAGS="$BOOST_LDFLAGS $LDFLAGS"
 
 AC_MSG_CHECKING([for Boost version 1.74 or newer])
 AC_COMPUTE_INT([icecc_boost_version], [BOOST_VERSION], [[
@@ -175,6 +175,8 @@ AC_MSG_RESULT([$icecc_boost_major.$icecc_boost_minor.$icecc_boost_patch])
 
 AC_MSG_CHECKING([for required Boost.Asio coroutine and asynchronous TCP APIs])
 icecc_save_LIBS="$LIBS"
+icecc_save_LDFLAGS="$LDFLAGS"
+LDFLAGS="$icecc_boost_probe_ldflags $LDFLAGS"
 BOOST_LIBS=
 AC_LINK_IFELSE([AC_LANG_PROGRAM([[
         #include <array>
@@ -243,6 +245,7 @@ AC_LINK_IFELSE([AC_LANG_PROGRAM([[
                 context.poll();
                 return 0;
             ]])], [
+                BOOST_LDFLAGS="$icecc_boost_probe_ldflags"
                 BOOST_LIBS=-lboost_system
                 AC_MSG_RESULT([yes (links Boost.System)])
             ], [
@@ -250,6 +253,7 @@ AC_LINK_IFELSE([AC_LANG_PROGRAM([[
             ])
     ])
 LIBS="$icecc_save_LIBS"
+LDFLAGS="$icecc_save_LDFLAGS"
 
 AC_DEFINE_UNQUOTED([ICECC_BOOST_VERSION], [$icecc_boost_version],
     [Numeric Boost version used to build Icecream])
