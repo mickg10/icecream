@@ -224,7 +224,7 @@ void test_discard_continues_buffered_input()
     delete pair.receiver;
 }
 
-void test_interrupted_and_failed_writes()
+void test_interrupted_failed_and_zero_progress_writes()
 {
     ChannelPair pair = make_channel_pair();
     send_chunk(pair.sender, "write failure");
@@ -246,6 +246,15 @@ void test_interrupted_and_failed_writes()
             "non-EINTR compiler-stdin error retains the legacy failure result");
     REQUIRE(!source.has_pending() && source.pending_offset() == 0,
             "compiler-stdin error discards the pending legacy chunk");
+
+    send_chunk(pair.sender, "zero progress");
+    REQUIRE(wait_for_read(source, stats, CompilerInputReadResult::Chunk),
+            "zero-progress case receives another chunk");
+    source.actions.push_back({ 0, 0 });
+    REQUIRE(source.write_pending(-1) == CompilerInputWriteResult::Failed,
+            "zero-byte write for nonempty compiler input is terminal");
+    REQUIRE(!source.has_pending() && source.pending_offset() == 0,
+            "zero-progress failure cannot leave a busy-looping pending chunk");
 
     delete pair.sender;
     delete pair.receiver;
@@ -287,7 +296,7 @@ int main()
     test_buffering_short_writes_end_and_accounting();
     test_empty_and_post_end_message();
     test_discard_continues_buffered_input();
-    test_interrupted_and_failed_writes();
+    test_interrupted_failed_and_zero_progress_writes();
     test_unexpected_message_and_eof();
     return failures == 0 ? 0 : 1;
 }
