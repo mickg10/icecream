@@ -8,7 +8,7 @@ p50wire_LDADD = ../cache/libprotocol50.a ../services/libicecc.la
 p50slice0_LDADD = ../cache/libprotocol50.a ../services/libicecc.la
 p50zstd_LDADD = ../cache/libprotocol50.a ../services/libicecc.la $(LIBZSTD_LIBS)
 p50zstdwindow_LDADD = ../cache/libprotocol50.a ../services/libicecc.la $(LIBZSTD_LIBS)
-p50loopback_LDADD = ../cache/libprotocol50.a ../services/libicecc.la $(BOOST_LIBS) $(LIBZSTD_LIBS) -pthread
+p50loopback_LDADD = ../cache/libprotocol50.a ../services/libicecc.la $(BOOST_LIBS) $(LIBZSTD_LIBS)
 digest128bench_LDADD = ../services/libicecc.la
 
 check_PROGRAMS = testargs p50wire p50slice0 p50zstd p50zstdwindow p50loopback digest128bench
