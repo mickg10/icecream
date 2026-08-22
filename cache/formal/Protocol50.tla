@@ -1,356 +1,514 @@
 ------------------------------ MODULE Protocol50 ------------------------------
-EXTENDS Naturals, FiniteSets, TLC
+EXTENDS Naturals, FiniteSets, Sequences, TLC
+
+(***************************************************************************
+Protocol-50 cache-transaction safety core.
+
+The model deliberately has one C-side active transaction and one F-side
+pending overlay.  It covers the states that must stay exact across immutable
+object publication, eviction, session replacement, replay, and the
+F-durable/C-unacknowledged commit window.
+
+Compiler/job restart begins at INPUT_COMMITTED and is modeled separately in
+Protocol50JobLifecycle.tla.
+
+Callbacks carry an abstract operation identity:
+    <<F, HISTORY_NONCE, REL_SEQ, TU, TX_DIGEST_VARIANT>>
+The final field is a bounded representative of the production transaction
+digest, which additionally binds profile, component descriptors, raw digest,
+and route pre-state.  Only one cursor/TU tuple receives a second digest variant
+in this model, so the same-session abort/re-encode ABA case is explored without
+doubling the complete state space.
+***************************************************************************)
 
 CONSTANTS F0, F1, T0, T1, O0, O1, V0, V1,
           Tok0, Tok1, NoF, NoTU, NoToken, NoContent,
-          CActor, FActor, MaxRel
+          MaxRel,
+          MutantAbortAfterCommit,
+          MutantBeginAtMaxRel,
+          MutantIgnoreTxDigest
+
+ASSUME /\ MaxRel \in Nat
+       /\ MaxRel > 0
+       /\ MutantAbortAfterCommit \in BOOLEAN
+       /\ MutantBeginAtMaxRel \in BOOLEAN
+       /\ MutantIgnoreTxDigest \in BOOLEAN
+       /\ F0 # F1
+       /\ T0 # T1
+       /\ O0 # O1
+       /\ V0 # V1
 
 Fs == {F0, F1}
 TUs == {T0, T1}
 Objects == {O0, O1}
 Values == {V0, V1}
 Tokens == {Tok0, Tok1}
-Actors == {CActor, FActor}
+Nonces == 0..1
+Rels == 0..MaxRel
+DigestVariants == 0..1
 
 TuObjects(t) == IF t = T0 THEN {O0} ELSE {O0, O1}
 CanonicalContent(o) == IF o = O0 THEN V0 ELSE V1
-Present(contentMap) == {o \in Objects : contentMap[o] # NoContent}
 
-VARIABLES session, sessionToken, usedTokens,
-          route, nonce, fRel, content, lastCommit,
-          cF, cNonce, cRel, cActive,
-          pending, pendingToken, dictDone, needRecorded, requested, missing,
-          bodyDone, materialized,
-          commitUnacked, commitDisconnected, badCommit, staleSeen
+Op(f, n, r, t, d) == <<f, n, r, t, d>>
+NoOp == <<NoF, 2, MaxRel + 1, NoTU, 2>>
+BaseOps == Fs \X Nonces \X Rels \X TUs
+PrimaryOps == {Append(op, 0) : op \in BaseOps}
+RetryDigestOp == Op(F0, 1, 0, T0, 1)
+RealOps == PrimaryOps \cup {RetryDigestOp}
+Ops == RealOps \cup {NoOp}
 
-vars == <<session, sessionToken, usedTokens,
-          route, nonce, fRel, content, lastCommit,
-          cF, cNonce, cRel, cActive,
-          pending, pendingToken, dictDone, needRecorded, requested, missing,
-          bodyDone, materialized,
-          commitUnacked, commitDisconnected, badCommit, staleSeen>>
+OpF(op) == op[1]
+OpNonce(op) == op[2]
+OpRel(op) == op[3]
+OpTu(op) == op[4]
+OpDigestVariant(op) == op[5]
+
+SameCursorWithoutDigest(left, right) ==
+    /\ left \in RealOps
+    /\ right \in RealOps
+    /\ OpF(left) = OpF(right)
+    /\ OpNonce(left) = OpNonce(right)
+    /\ OpRel(left) = OpRel(right)
+    /\ OpTu(left) = OpTu(right)
+    /\ OpDigestVariant(left) # OpDigestVariant(right)
+
+Present(st, f) == {o \in Objects : st.content[f][o] # NoContent}
+CurrentSession(st, f, tok) ==
+    /\ st.session = f
+    /\ st.sessionToken = tok
+
+ClearOverlay(st) ==
+    [st EXCEPT
+        !.pendingOp = NoOp,
+        !.pendingToken = NoToken,
+        !.dictDone = FALSE,
+        !.needRecorded = FALSE,
+        !.requested = {},
+        !.missing = {},
+        !.pinned = {},
+        !.bodyDone = FALSE,
+        !.materialized = FALSE]
+
+VARIABLE s
+vars == <<s>>
 
 Init ==
-    /\ session = NoF
-    /\ sessionToken = NoToken
-    /\ usedTokens = [f \in Fs |-> {}]
-    /\ route = [f \in Fs |-> FALSE]
-    /\ nonce = [f \in Fs |-> 0]
-    /\ fRel = [f \in Fs |-> 0]
-    /\ content = [f \in Fs |-> [o \in Objects |-> NoContent]]
-    /\ lastCommit = [f \in Fs |-> NoTU]
-    /\ cF = NoF
-    /\ cNonce = 0
-    /\ cRel = 0
-    /\ cActive = NoTU
-    /\ pending = NoTU
-    /\ pendingToken = NoToken
-    /\ dictDone = FALSE
-    /\ needRecorded = FALSE
-    /\ requested = {}
-    /\ missing = {}
-    /\ bodyDone = FALSE
-    /\ materialized = FALSE
-    /\ commitUnacked = FALSE
-    /\ commitDisconnected = FALSE
-    /\ badCommit = FALSE
-    /\ staleSeen = FALSE
-
-ClearFOverlay ==
-    /\ pending' = NoTU
-    /\ pendingToken' = NoToken
-    /\ dictDone' = FALSE
-    /\ needRecorded' = FALSE
-    /\ requested' = {}
-    /\ missing' = {}
-    /\ bodyDone' = FALSE
-    /\ materialized' = FALSE
+    s = [session             |-> NoF,
+         sessionToken        |-> NoToken,
+         usedTokens          |-> [f \in Fs |-> {}],
+         route               |-> [f \in Fs |-> FALSE],
+         nonce               |-> [f \in Fs |-> 0],
+         fRel                |-> [f \in Fs |-> 0],
+         content             |-> [f \in Fs |->
+                                     [o \in Objects |-> NoContent]],
+         lastCommitOp        |-> [f \in Fs |-> NoOp],
+         cF                  |-> NoF,
+         cNonce              |-> 0,
+         cRel                |-> 0,
+         cActiveOp           |-> NoOp,
+         pendingOp           |-> NoOp,
+         pendingToken        |-> NoToken,
+         dictDone            |-> FALSE,
+         needRecorded        |-> FALSE,
+         requested           |-> {},
+         missing             |-> {},
+         pinned              |-> {},
+         bodyDone            |-> FALSE,
+         materialized        |-> FALSE,
+         commitUnacked       |-> FALSE,
+         commitDisconnected  |-> FALSE,
+         badCommit           |-> FALSE,
+         staleSessionSeen    |-> FALSE,
+         staleOperationSeen  |-> FALSE]
 
 SESSION_OPENED(f, tok) ==
-    /\ f \in Fs
-    /\ tok \in Tokens \ usedTokens[f]
-    /\ session = NoF
-    /\ session' = f
-    /\ sessionToken' = tok
-    /\ usedTokens' = [usedTokens EXCEPT ![f] = @ \cup {tok}]
-    /\ ClearFOverlay
-    /\ UNCHANGED <<route, nonce, fRel, content, lastCommit,
-                    cF, cNonce, cRel, cActive,
-                    commitUnacked, commitDisconnected, badCommit, staleSeen>>
+    LET base == ClearOverlay(s)
+    IN /\ f \in Fs
+       /\ tok \in Tokens \ s.usedTokens[f]
+       /\ s.session = NoF
+       /\ s' = [base EXCEPT
+                    !.session = f,
+                    !.sessionToken = tok,
+                    !.usedTokens[f] = s.usedTokens[f] \cup {tok}]
 
 SESSION_REPLACED(f, tok) ==
+    LET base == ClearOverlay(s)
+    IN /\ f \in Fs
+       /\ tok \in Tokens \ s.usedTokens[f]
+       /\ s.session = f
+       /\ s' = [base EXCEPT
+                    !.sessionToken = tok,
+                    !.usedTokens[f] = s.usedTokens[f] \cup {tok},
+                    !.commitDisconnected =
+                        s.commitDisconnected \/ s.commitUnacked]
+
+SESSION_DISCONNECTED(f, tok) ==
+    LET base == ClearOverlay(s)
+    IN /\ f \in Fs
+       /\ tok \in Tokens
+       /\ CurrentSession(s, f, tok)
+       /\ s' = [base EXCEPT
+                    !.session = NoF,
+                    !.sessionToken = NoToken,
+                    !.commitDisconnected =
+                        s.commitDisconnected \/ s.commitUnacked]
+
+STALE_SESSION_CALLBACK(f, tok) ==
     /\ f \in Fs
-    /\ tok \in Tokens \ usedTokens[f]
-    /\ session = f
-    /\ session' = f
-    /\ sessionToken' = tok
-    /\ usedTokens' = [usedTokens EXCEPT ![f] = @ \cup {tok}]
-    /\ ClearFOverlay
-    /\ commitDisconnected' = (commitDisconnected \/ commitUnacked)
-    /\ UNCHANGED <<route, nonce, fRel, content, lastCommit,
-                    cF, cNonce, cRel, cActive, commitUnacked,
-                    badCommit, staleSeen>>
+    /\ tok \in s.usedTokens[f]
+    /\ ~CurrentSession(s, f, tok)
+    /\ s' = [s EXCEPT !.staleSessionSeen = TRUE]
 
-SESSION_DISCONNECTED ==
-    /\ session # NoF
-    /\ session' = NoF
-    /\ sessionToken' = NoToken
-    /\ ClearFOverlay
-    /\ commitDisconnected' = (commitDisconnected \/ commitUnacked)
-    /\ UNCHANGED <<usedTokens, route, nonce, fRel, content, lastCommit,
-                    cF, cNonce, cRel, cActive, commitUnacked,
-                    badCommit, staleSeen>>
+HISTORY_RESET(f, tok) ==
+    LET nextNonce == 1 - s.nonce[f]
+    IN /\ f \in Fs
+       /\ tok \in Tokens
+       /\ CurrentSession(s, f, tok)
+       /\ s.cActiveOp = NoOp
+       /\ s.pendingOp = NoOp
+       /\ ~s.commitUnacked
+       /\ s' = [s EXCEPT
+                    !.route[f] = TRUE,
+                    !.nonce[f] = nextNonce,
+                    !.fRel[f] = 0,
+                    !.lastCommitOp[f] = NoOp,
+                    !.cF = f,
+                    !.cNonce = nextNonce,
+                    !.cRel = 0,
+                    !.commitDisconnected = FALSE]
 
-HISTORY_RESET ==
-    \E f \in Fs:
-        /\ session = f
-        /\ cActive = NoTU
-        /\ pending = NoTU
-        /\ ~commitUnacked
-        /\ route' = [route EXCEPT ![f] = TRUE]
-        /\ nonce' = [nonce EXCEPT ![f] = 1 - @]
-        /\ fRel' = [fRel EXCEPT ![f] = 0]
-        /\ lastCommit' = [lastCommit EXCEPT ![f] = NoTU]
-        /\ cF' = f
-        /\ cNonce' = 1 - nonce[f]
-        /\ cRel' = 0
-        /\ commitDisconnected' = FALSE
-        /\ UNCHANGED <<session, sessionToken, usedTokens, content, cActive,
-                        pending, pendingToken, dictDone, needRecorded,
-                        requested, missing, bodyDone, materialized,
-                        commitUnacked, badCommit, staleSeen>>
+C_TX_BEGIN(f, t, d) ==
+    LET op == Op(f, s.cNonce, s.cRel, t, d)
+    IN /\ f \in Fs
+       /\ t \in TUs
+       /\ d \in DigestVariants
+       /\ op \in RealOps
+       /\ s.session = f
+       /\ s.cF = f
+       /\ s.route[f]
+       /\ s.nonce[f] = s.cNonce
+       /\ s.fRel[f] = s.cRel
+       /\ s.cActiveOp = NoOp
+       /\ ~s.commitUnacked
+       /\ (MutantBeginAtMaxRel \/ s.cRel < MaxRel)
+       /\ s' = [s EXCEPT !.cActiveOp = op]
 
-C_TX_BEGIN ==
-    \E t \in TUs, f \in Fs:
-        /\ session = f
-        /\ cF = f
-        /\ route[f]
-        /\ nonce[f] = cNonce
-        /\ fRel[f] = cRel
-        /\ cActive = NoTU
-        /\ ~commitUnacked
-        /\ cActive' = t
-        /\ UNCHANGED <<session, sessionToken, usedTokens,
-                        route, nonce, fRel, content, lastCommit,
-                        cF, cNonce, cRel, pending, pendingToken,
-                        dictDone, needRecorded, requested, missing,
-                        bodyDone, materialized, commitUnacked,
-                        commitDisconnected, badCommit, staleSeen>>
+F_TX_BEGIN(op) ==
+    LET f == OpF(op)
+    IN /\ op \in RealOps
+       /\ op = s.cActiveOp
+       /\ s.pendingOp = NoOp
+       /\ s.session = f
+       /\ s.route[f]
+       /\ OpNonce(op) = s.nonce[f]
+       /\ OpRel(op) = s.fRel[f]
+       /\ s' = [s EXCEPT
+                    !.pendingOp = op,
+                    !.pendingToken = s.sessionToken,
+                    !.dictDone = FALSE,
+                    !.needRecorded = FALSE,
+                    !.requested = {},
+                    !.missing = {},
+                    !.pinned = {},
+                    !.bodyDone = FALSE,
+                    !.materialized = FALSE]
 
-F_TX_BEGIN ==
-    \E f \in Fs:
-        /\ session = f
-        /\ cF = f
-        /\ route[f]
-        /\ nonce[f] = cNonce
-        /\ fRel[f] = cRel
-        /\ cActive \in TUs
-        /\ pending = NoTU
-        /\ pending' = cActive
-        /\ pendingToken' = sessionToken
-        /\ dictDone' = FALSE
-        /\ needRecorded' = FALSE
-        /\ requested' = {}
-        /\ missing' = {}
-        /\ bodyDone' = FALSE
-        /\ materialized' = FALSE
-        /\ UNCHANGED <<session, sessionToken, usedTokens,
-                        route, nonce, fRel, content, lastCommit,
-                        cF, cNonce, cRel, cActive,
-                        commitUnacked, commitDisconnected, badCommit, staleSeen>>
+ACTIVE_REPLAYED(op) == F_TX_BEGIN(op)
 
-TX_BEGIN(actor) ==
-    /\ actor \in Actors
-    /\ IF actor = CActor THEN C_TX_BEGIN ELSE F_TX_BEGIN
+TX_ABORTED(op) ==
+    /\ op \in RealOps
+    /\ op = s.cActiveOp
+    /\ s.pendingOp = NoOp
+    /\ (MutantAbortAfterCommit \/ ~s.commitUnacked)
+    /\ s' = [s EXCEPT !.cActiveOp = NoOp]
 
-ACTIVE_REPLAYED == F_TX_BEGIN
+DICT_COMPLETE(op) ==
+    /\ op \in RealOps
+    /\ op = s.pendingOp
+    /\ CurrentSession(s, OpF(op), s.pendingToken)
+    /\ ~s.dictDone
+    /\ s' = [s EXCEPT !.dictDone = TRUE]
 
-TX_ABORTED ==
-    /\ cActive \in TUs
-    /\ pending = NoTU
-    /\ cActive' = NoTU
-    /\ UNCHANGED <<session, sessionToken, usedTokens,
-                    route, nonce, fRel, content, lastCommit,
-                    cF, cNonce, cRel, pending, pendingToken,
-                    dictDone, needRecorded, requested, missing,
-                    bodyDone, materialized, commitUnacked,
-                    commitDisconnected, badCommit, staleSeen>>
+NEED_RECORDED(op) ==
+    LET f == OpF(op)
+        required == TuObjects(OpTu(op))
+        present == Present(s, f)
+    IN /\ op \in RealOps
+       /\ op = s.pendingOp
+       /\ CurrentSession(s, f, s.pendingToken)
+       /\ s.dictDone
+       /\ ~s.needRecorded
+       /\ s' = [s EXCEPT
+                    !.needRecorded = TRUE,
+                    !.requested = required \ present,
+                    !.missing = required \ present,
+                    !.pinned = required \cap present]
 
-DICT_COMPLETE ==
-    /\ pending \in TUs
-    /\ ~dictDone
-    /\ dictDone' = TRUE
-    /\ UNCHANGED <<session, sessionToken, usedTokens,
-                    route, nonce, fRel, content, lastCommit,
-                    cF, cNonce, cRel, cActive, pending, pendingToken,
-                    needRecorded, requested, missing, bodyDone, materialized,
-                    commitUnacked, commitDisconnected, badCommit, staleSeen>>
+BODY_COMPLETE(op) ==
+    /\ op \in RealOps
+    /\ op = s.pendingOp
+    /\ CurrentSession(s, OpF(op), s.pendingToken)
+    /\ ~s.bodyDone
+    /\ s' = [s EXCEPT !.bodyDone = TRUE]
 
-NEED_RECORDED ==
-    \E f \in Fs, t \in TUs:
-        /\ session = f
-        /\ pending = t
-        /\ pendingToken = sessionToken
-        /\ dictDone
-        /\ ~needRecorded
-        /\ needRecorded' = TRUE
-        /\ requested' = TuObjects(t) \ Present(content[f])
-        /\ missing' = TuObjects(t) \ Present(content[f])
-        /\ UNCHANGED <<session, sessionToken, usedTokens,
-                        route, nonce, fRel, content, lastCommit,
-                        cF, cNonce, cRel, cActive, pending, pendingToken,
-                        dictDone, bodyDone, materialized,
-                        commitUnacked, commitDisconnected, badCommit, staleSeen>>
+OBJECT_APPLIED(op, o) ==
+    LET f == OpF(op)
+    IN /\ op \in RealOps
+       /\ op = s.pendingOp
+       /\ o \in Objects
+       /\ CurrentSession(s, f, s.pendingToken)
+       /\ s.needRecorded
+       /\ o \in s.requested
+       /\ s.content[f][o] \in {NoContent, CanonicalContent(o)}
+       /\ s' = [s EXCEPT
+                    !.content[f][o] = CanonicalContent(o),
+                    !.missing = @ \ {o},
+                    !.pinned = @ \cup {o}]
 
-OBJECT_APPLIED(o) ==
-    \E f \in Fs:
-        /\ session = f
-        /\ pending \in TUs
-        /\ pendingToken = sessionToken
-        /\ needRecorded
-        /\ o \in requested
-        /\ content' = [content EXCEPT ![f][o] = CanonicalContent(o)]
-        /\ missing' = missing \ {o}
-        /\ UNCHANGED <<session, sessionToken, usedTokens,
-                        route, nonce, fRel, lastCommit,
-                        cF, cNonce, cRel, cActive, pending, pendingToken,
-                        dictDone, needRecorded, requested, bodyDone, materialized,
-                        commitUnacked, commitDisconnected, badCommit, staleSeen>>
+REJECT_CONFLICTING_OBJECT(op, o, value) ==
+    LET f == OpF(op)
+        base == ClearOverlay(s)
+    IN /\ op \in RealOps
+       /\ op = s.pendingOp
+       /\ o \in Objects
+       /\ value \in Values
+       /\ value # CanonicalContent(o)
+       /\ CurrentSession(s, f, s.pendingToken)
+       /\ s' = [base EXCEPT
+                    !.session = NoF,
+                    !.sessionToken = NoToken]
 
-STALE_OBJECT_CALLBACK(f, tok, o) ==
+STALE_OPERATION_CALLBACK(f, tok, op) ==
     /\ f \in Fs
-    /\ tok \in usedTokens[f]
+    /\ tok \in Tokens
+    /\ op \in RealOps
+    /\ CurrentSession(s, f, tok)
+    /\ op # s.pendingOp
+    /\ s' = [s EXCEPT !.staleOperationSeen = TRUE]
+
+EVICT_OBJECT(f, o) ==
+    /\ f \in Fs
     /\ o \in Objects
-    /\ \/ session # f
-       \/ sessionToken # tok
-    /\ staleSeen' = TRUE
-    /\ UNCHANGED <<session, sessionToken, usedTokens,
-                    route, nonce, fRel, content, lastCommit,
-                    cF, cNonce, cRel, cActive, pending, pendingToken,
-                    dictDone, needRecorded, requested, missing,
-                    bodyDone, materialized, commitUnacked,
-                    commitDisconnected, badCommit>>
+    /\ s.content[f][o] # NoContent
+    /\ IF s.pendingOp # NoOp /\ OpF(s.pendingOp) = f
+          THEN o \notin s.pinned
+          ELSE TRUE
+    /\ s' = [s EXCEPT !.content[f][o] = NoContent]
 
-BODY_COMPLETE ==
-    /\ pending \in TUs
-    /\ ~bodyDone
-    /\ bodyDone' = TRUE
-    /\ UNCHANGED <<session, sessionToken, usedTokens,
-                    route, nonce, fRel, content, lastCommit,
-                    cF, cNonce, cRel, cActive, pending, pendingToken,
-                    dictDone, needRecorded, requested, missing, materialized,
-                    commitUnacked, commitDisconnected, badCommit, staleSeen>>
+INPUT_MATERIALIZED(op) ==
+    LET f == OpF(op)
+        required == TuObjects(OpTu(op))
+    IN /\ op \in RealOps
+       /\ op = s.pendingOp
+       /\ CurrentSession(s, f, s.pendingToken)
+       /\ s.dictDone
+       /\ s.needRecorded
+       /\ s.bodyDone
+       /\ s.missing = {}
+       /\ s.pinned = required
+       /\ required \subseteq Present(s, f)
+       /\ ~s.materialized
+       /\ s' = [s EXCEPT !.materialized = TRUE]
 
-INPUT_MATERIALIZED ==
-    /\ pending \in TUs
-    /\ dictDone /\ needRecorded /\ missing = {} /\ bodyDone
-    /\ ~materialized
-    /\ materialized' = TRUE
-    /\ UNCHANGED <<session, sessionToken, usedTokens,
-                    route, nonce, fRel, content, lastCommit,
-                    cF, cNonce, cRel, cActive, pending, pendingToken,
-                    dictDone, needRecorded, requested, missing, bodyDone,
-                    commitUnacked, commitDisconnected, badCommit, staleSeen>>
+INPUT_COMMITTED(callbackOp) ==
+    LET current == s.pendingOp
+        f == OpF(current)
+        base == ClearOverlay(s)
+    IN /\ callbackOp \in RealOps
+       /\ current \in RealOps
+       /\ (callbackOp = current \/
+             /\ MutantIgnoreTxDigest
+             /\ SameCursorWithoutDigest(callbackOp, current))
+       /\ current = s.cActiveOp
+       /\ CurrentSession(s, f, s.pendingToken)
+       /\ s.materialized
+       /\ OpNonce(current) = s.nonce[f]
+       /\ OpRel(current) = s.fRel[f]
+       /\ OpRel(current) = s.cRel
+       /\ s.cRel < MaxRel
+       /\ s' = [base EXCEPT
+                    !.fRel[f] = s.fRel[f] + 1,
+                    !.lastCommitOp[f] = current,
+                    !.commitUnacked = TRUE,
+                    !.commitDisconnected = FALSE,
+                    !.badCommit =
+                        s.badCommit \/
+                        callbackOp # current \/
+                        ~(s.dictDone /\ s.needRecorded /\
+                          s.bodyDone /\ s.missing = {} /\
+                          s.materialized)]
 
-INPUT_COMMITTED ==
-    \E f \in Fs, t \in TUs:
-        /\ session = f
-        /\ pending = t
-        /\ cActive = t
-        /\ materialized
-        /\ fRel[f] = cRel
-        /\ cRel < MaxRel
-        /\ fRel' = [fRel EXCEPT ![f] = @ + 1]
-        /\ lastCommit' = [lastCommit EXCEPT ![f] = t]
-        /\ badCommit' = badCommit \/
-                         ~(dictDone /\ needRecorded /\ missing = {} /\ bodyDone)
-        /\ ClearFOverlay
-        /\ commitUnacked' = TRUE
-        /\ commitDisconnected' = FALSE
-        /\ UNCHANGED <<session, sessionToken, usedTokens,
-                        route, nonce, content, cF, cNonce, cRel, cActive,
-                        staleSeen>>
+COMMIT_ACCEPTED(f, tok, op) ==
+    /\ f \in Fs
+    /\ tok \in Tokens
+    /\ op \in RealOps
+    /\ CurrentSession(s, f, tok)
+    /\ op = s.cActiveOp
+    /\ op = s.lastCommitOp[f]
+    /\ OpF(op) = s.cF
+    /\ OpNonce(op) = s.cNonce
+    /\ OpRel(op) = s.cRel
+    /\ s.fRel[f] = s.cRel + 1
+    /\ s.commitUnacked
+    /\ ~s.commitDisconnected
+    /\ s' = [s EXCEPT
+                 !.cRel = @ + 1,
+                 !.cActiveOp = NoOp,
+                 !.commitUnacked = FALSE,
+                 !.commitDisconnected = FALSE]
 
-AcceptCommit ==
-    \E f \in Fs, t \in TUs:
-        /\ cF = f
-        /\ cActive = t
-        /\ lastCommit[f] = t
-        /\ fRel[f] = cRel + 1
-        /\ commitUnacked
-        /\ cRel' = cRel + 1
-        /\ cActive' = NoTU
-        /\ commitUnacked' = FALSE
-        /\ commitDisconnected' = FALSE
-        /\ UNCHANGED <<session, sessionToken, usedTokens,
-                        route, nonce, fRel, content, lastCommit,
-                        cF, cNonce, pending, pendingToken,
-                        dictDone, needRecorded, requested, missing,
-                        bodyDone, materialized, badCommit, staleSeen>>
+LOST_COMMIT_ACCEPTED(f, tok, op) ==
+    /\ f \in Fs
+    /\ tok \in Tokens
+    /\ op \in RealOps
+    /\ CurrentSession(s, f, tok)
+    /\ op = s.cActiveOp
+    /\ op = s.lastCommitOp[f]
+    /\ OpF(op) = s.cF
+    /\ OpNonce(op) = s.cNonce
+    /\ OpRel(op) = s.cRel
+    /\ s.fRel[f] = s.cRel + 1
+    /\ s.commitUnacked
+    /\ s.commitDisconnected
+    /\ s' = [s EXCEPT
+                 !.cRel = @ + 1,
+                 !.cActiveOp = NoOp,
+                 !.commitUnacked = FALSE,
+                 !.commitDisconnected = FALSE]
 
-COMMIT_ACCEPTED ==
-    /\ ~commitDisconnected
-    /\ AcceptCommit
-
-LOST_COMMIT_ACCEPTED ==
-    /\ commitDisconnected
-    /\ session = cF
-    /\ AcceptCommit
+STALE_ACK_CALLBACK(f, tok, op) ==
+    /\ f \in Fs
+    /\ tok \in Tokens
+    /\ op \in RealOps
+    /\ CurrentSession(s, f, tok)
+    /\ (op # s.cActiveOp \/ op # s.lastCommitOp[f])
+    /\ s' = [s EXCEPT !.staleOperationSeen = TRUE]
 
 Next ==
     \/ \E f \in Fs, tok \in Tokens : SESSION_OPENED(f, tok)
     \/ \E f \in Fs, tok \in Tokens : SESSION_REPLACED(f, tok)
-    \/ SESSION_DISCONNECTED
-    \/ HISTORY_RESET
-    \/ \E actor \in Actors : TX_BEGIN(actor)
-    \/ ACTIVE_REPLAYED
-    \/ TX_ABORTED
-    \/ DICT_COMPLETE
-    \/ NEED_RECORDED
-    \/ \E o \in Objects : OBJECT_APPLIED(o)
-    \/ \E f \in Fs, tok \in Tokens, o \in Objects :
-           STALE_OBJECT_CALLBACK(f, tok, o)
-    \/ BODY_COMPLETE
-    \/ INPUT_MATERIALIZED
-    \/ INPUT_COMMITTED
-    \/ COMMIT_ACCEPTED
-    \/ LOST_COMMIT_ACCEPTED
+    \/ \E f \in Fs, tok \in Tokens : SESSION_DISCONNECTED(f, tok)
+    \/ \E f \in Fs, tok \in Tokens : STALE_SESSION_CALLBACK(f, tok)
+    \/ \E f \in Fs, tok \in Tokens : HISTORY_RESET(f, tok)
+    \/ \E f \in Fs, t \in TUs, d \in DigestVariants : C_TX_BEGIN(f, t, d)
+    \/ \E op \in RealOps : F_TX_BEGIN(op)
+    \/ \E op \in RealOps : ACTIVE_REPLAYED(op)
+    \/ \E op \in RealOps : TX_ABORTED(op)
+    \/ \E op \in RealOps : DICT_COMPLETE(op)
+    \/ \E op \in RealOps : NEED_RECORDED(op)
+    \/ \E op \in RealOps : BODY_COMPLETE(op)
+    \/ \E op \in RealOps, o \in Objects : OBJECT_APPLIED(op, o)
+    \/ \E op \in RealOps, o \in Objects, v \in Values :
+           REJECT_CONFLICTING_OBJECT(op, o, v)
+    \/ \E f \in Fs, tok \in Tokens, op \in RealOps :
+           STALE_OPERATION_CALLBACK(f, tok, op)
+    \/ \E f \in Fs, o \in Objects : EVICT_OBJECT(f, o)
+    \/ \E op \in RealOps : INPUT_MATERIALIZED(op)
+    \/ \E op \in RealOps : INPUT_COMMITTED(op)
+    \/ \E f \in Fs, tok \in Tokens, op \in RealOps :
+           COMMIT_ACCEPTED(f, tok, op)
+    \/ \E f \in Fs, tok \in Tokens, op \in RealOps :
+           LOST_COMMIT_ACCEPTED(f, tok, op)
+    \/ \E f \in Fs, tok \in Tokens, op \in RealOps :
+           STALE_ACK_CALLBACK(f, tok, op)
 
 Spec == Init /\ [][Next]_vars
 
 TypeOK ==
-    /\ session \in Fs \cup {NoF}
-    /\ sessionToken \in Tokens \cup {NoToken}
-    /\ usedTokens \in [Fs -> SUBSET Tokens]
-    /\ route \in [Fs -> BOOLEAN]
-    /\ nonce \in [Fs -> 0..1]
-    /\ fRel \in [Fs -> 0..MaxRel]
-    /\ content \in [Fs -> [Objects -> Values \cup {NoContent}]]
-    /\ lastCommit \in [Fs -> TUs \cup {NoTU}]
-    /\ cF \in Fs \cup {NoF}
-    /\ cNonce \in 0..1
-    /\ cRel \in 0..MaxRel
-    /\ cActive \in TUs \cup {NoTU}
-    /\ pending \in TUs \cup {NoTU}
-    /\ pendingToken \in Tokens \cup {NoToken}
-    /\ requested \subseteq Objects
-    /\ missing \subseteq Objects
+    /\ s.session \in Fs \cup {NoF}
+    /\ s.sessionToken \in Tokens \cup {NoToken}
+    /\ s.usedTokens \in [Fs -> SUBSET Tokens]
+    /\ s.route \in [Fs -> BOOLEAN]
+    /\ s.nonce \in [Fs -> Nonces]
+    /\ s.fRel \in [Fs -> Rels]
+    /\ s.content \in [Fs -> [Objects -> Values \cup {NoContent}]]
+    /\ s.lastCommitOp \in [Fs -> Ops]
+    /\ s.cF \in Fs \cup {NoF}
+    /\ s.cNonce \in Nonces
+    /\ s.cRel \in Rels
+    /\ s.cActiveOp \in Ops
+    /\ s.pendingOp \in Ops
+    /\ s.pendingToken \in Tokens \cup {NoToken}
+    /\ s.dictDone \in BOOLEAN
+    /\ s.needRecorded \in BOOLEAN
+    /\ s.requested \subseteq Objects
+    /\ s.missing \subseteq Objects
+    /\ s.pinned \subseteq Objects
+    /\ s.bodyDone \in BOOLEAN
+    /\ s.materialized \in BOOLEAN
+    /\ s.commitUnacked \in BOOLEAN
+    /\ s.commitDisconnected \in BOOLEAN
+    /\ s.badCommit \in BOOLEAN
+    /\ s.staleSessionSeen \in BOOLEAN
+    /\ s.staleOperationSeen \in BOOLEAN
 
-OneActive == pending = NoTU \/ pending = cActive
-SessionFence == pending = NoTU \/
-                (session = cF /\ pendingToken = sessionToken /\
-                 sessionToken \in usedTokens[session])
 InstalledContentExact ==
     \A f \in Fs, o \in Objects :
-        content[f][o] = NoContent \/ content[f][o] = CanonicalContent(o)
+        s.content[f][o] \in {NoContent, CanonicalContent(o)}
+
+OneActive ==
+    s.pendingOp = NoOp \/ s.pendingOp = s.cActiveOp
+
+SessionFence ==
+    s.pendingOp = NoOp \/
+        CurrentSession(s, OpF(s.pendingOp), s.pendingToken)
+
+ActiveOperationMatchesCursor ==
+    s.cActiveOp = NoOp \/
+        /\ OpF(s.cActiveOp) = s.cF
+        /\ OpNonce(s.cActiveOp) = s.cNonce
+        /\ OpRel(s.cActiveOp) = s.cRel
+
+PendingOperationMatchesRoute ==
+    s.pendingOp = NoOp \/
+        /\ s.pendingOp = s.cActiveOp
+        /\ s.route[OpF(s.pendingOp)]
+        /\ OpNonce(s.pendingOp) = s.nonce[OpF(s.pendingOp)]
+        /\ OpRel(s.pendingOp) = s.fRel[OpF(s.pendingOp)]
+
 NeedIsExact ==
-    IF pending \in TUs /\ needRecorded
-    THEN /\ requested \subseteq TuObjects(pending)
-         /\ missing = requested \ Present(content[session])
-    ELSE requested = {} /\ missing = {}
-CommitOnlyAfterExactMaterialization == badCommit = FALSE
-AtMostOneAhead == IF cF \in Fs
-                  THEN ~route[cF] \/ fRel[cF] = cRel \/ fRel[cF] = cRel + 1
-                  ELSE TRUE
+    IF s.pendingOp # NoOp /\ s.needRecorded
+    THEN LET required == TuObjects(OpTu(s.pendingOp))
+         IN /\ s.requested \subseteq required
+            /\ s.missing \subseteq s.requested
+            /\ s.pinned = required \ s.missing
+    ELSE /\ s.requested = {}
+         /\ s.missing = {}
+         /\ s.pinned = {}
+
+PinnedObjectsPresent ==
+    s.pendingOp = NoOp \/
+        s.pinned \subseteq Present(s, OpF(s.pendingOp))
+
+CommitOnlyAfterExactMaterialization ==
+    s.badCommit = FALSE
+
+AtMostOneAhead ==
+    IF s.cF \in Fs /\ s.route[s.cF] /\ s.cNonce = s.nonce[s.cF]
+    THEN s.fRel[s.cF] = s.cRel \/ s.fRel[s.cF] = s.cRel + 1
+    ELSE TRUE
+
+CommitReconciliationWitness ==
+    ~s.commitUnacked \/
+        /\ s.cF \in Fs
+        /\ s.cActiveOp \in RealOps
+        /\ s.pendingOp = NoOp
+        /\ s.lastCommitOp[s.cF] = s.cActiveOp
+        /\ OpF(s.cActiveOp) = s.cF
+        /\ OpNonce(s.cActiveOp) = s.cNonce
+        /\ OpRel(s.cActiveOp) = s.cRel
+        /\ s.nonce[s.cF] = s.cNonce
+        /\ s.fRel[s.cF] = s.cRel + 1
+
+ActiveSequenceHasRoom ==
+    /\ (s.cActiveOp # NoOp => s.cRel < MaxRel)
+    /\ (s.pendingOp # NoOp => OpRel(s.pendingOp) < MaxRel)
+
+LastCommitOperationWellFormed ==
+    \A f \in Fs :
+        s.lastCommitOp[f] = NoOp \/
+            /\ OpF(s.lastCommitOp[f]) = f
+            /\ OpRel(s.lastCommitOp[f]) + 1 = s.fRel[f]
 
 =============================================================================
