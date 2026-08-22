@@ -1028,6 +1028,21 @@ class SimulatorTest(unittest.TestCase):
             self.assertEqual(adapter.committed_by_route[(0, 0)], 2)
             self.assertEqual(adapter.last_route_state[(0, 0)]["known_objects"], 5)
 
+            legacy_rows = [
+                json.loads(line) for line in ledger_path.read_text().splitlines()
+            ]
+            for row in legacy_rows[1:-1]:
+                row.pop("tu_seq")
+                row.pop("rel_seq")
+            legacy_path = root / "legacy-physical.jsonl"
+            legacy_path.write_text(
+                "".join(json.dumps(row) + "\n" for row in legacy_rows)
+            )
+            legacy_adapter = sim.PhysicalLedgerAdapter(legacy_path, scenario, "p29")
+            legacy_result = sim.Simulator(scenario, legacy_adapter).run()
+            self.assertEqual(legacy_result.summary["c_to_f_bytes"], 19)
+            self.assertEqual(legacy_result.summary["f_to_c_bytes"], 3)
+
     def test_multi_f_ledger_may_group_sparse_tu_seq_by_relationship(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

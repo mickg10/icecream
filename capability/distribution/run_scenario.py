@@ -502,12 +502,13 @@ class PhysicalLedgerAdapter(CodecAdapter):
         rows = [json.loads(line) for line in self.path.read_text().splitlines() if line]
         if len(rows) < 3:
             raise ValueError(f"{self.path}: physical ledger is incomplete")
-        for row_number, row in enumerate(rows, start=1):
-            validate_json_schema(
-                row,
-                "physical-ledger.schema.json",
-                f"{self.path}:{row_number}",
-            )
+        if scenario.is_v2:
+            for row_number, row in enumerate(rows, start=1):
+                validate_json_schema(
+                    row,
+                    "physical-ledger.schema.json",
+                    f"{self.path}:{row_number}",
+                )
         descriptor, final = rows[0], rows[-1]
         if (
             descriptor.get("record") != "physical-ledger"
