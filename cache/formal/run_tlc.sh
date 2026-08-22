@@ -110,6 +110,9 @@ run_pass job-restart-progress Protocol50JobLifecycle.tla \
 run_pass incarnation Protocol50IncarnationBridge.tla Protocol50IncarnationBridge.cfg
 run_pass incarnation-progress Protocol50IncarnationBridge.tla \
     Protocol50IncarnationProgress.cfg progress
+run_pass assignment Protocol50Assignment.tla Protocol50Assignment.cfg
+run_pass assignment-restart-progress Protocol50Assignment.tla \
+    Protocol50AssignmentRestart.cfg progress
 
 run_expected_failure abort-mutant Protocol50.tla Protocol50AbortMutant.cfg \
     CommitReconciliationWitness
@@ -138,3 +141,13 @@ run_expected_failure incarnation-mutant Protocol50IncarnationBridge.tla \
 run_expected_failure incarnation-ownership-mutant Protocol50IncarnationBridge.tla \
     Protocol50IncarnationOwnershipMutant.cfg \
     AuthorizedCompilerOwnsIndependentInput
+run_expected_failure assignment-mixed-compat Protocol50Assignment.tla \
+    Protocol50AssignmentMixedCompat.cfg EnforcingCompatClaimsExact
+run_expected_failure assignment-strict-legacy-mutant Protocol50Assignment.tla \
+    Protocol50AssignmentStrictLegacyMutant.cfg StrictClaimsExact
+run_expected_failure assignment-ready-mutant Protocol50Assignment.tla \
+    Protocol50AssignmentReadyMutant.cfg ReadyGate
+run_expected_failure assignment-release-mutant Protocol50Assignment.tla \
+    Protocol50AssignmentReleaseMutant.cfg ReleaseHasRevocationProof
+run_expected_failure assignment-tombstone-mutant Protocol50Assignment.tla \
+    Protocol50AssignmentTombstoneMutant.cfg TombstoneIsNotLive
