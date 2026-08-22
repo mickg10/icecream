@@ -1244,6 +1244,124 @@ class SimulatorTest(unittest.TestCase):
                 result.events.count,
             )
 
+    def test_v2_dense_frontier_width_rejects_source_and_retained_boundaries(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_v2_fixture(root, [3, 2], [10, 11], workers=2)
+            valid_manifest = json.loads(path.read_text())
+            valid_manifest["topology"]["scheduler_policy"] = "dense_frontier"
+            valid_manifest["topology"]["dense_frontier_workers"] = 2
+            path.write_text(json.dumps(valid_manifest, indent=2) + "\n")
+            scenario = sim.load_scenario(path)
+            output = root / "out"
+            sim.write_result(
+                scenario,
+                sim.Simulator(scenario, sim.RawAdapter()).run(),
+                output,
+                execution_for(path),
+            )
+            retained_rows = [
+                json.loads(line)
+                for line in (output / "experiment.jsonl").read_text().splitlines()
+            ]
+
+            def source_failure(width: int) -> str:
+                candidate_manifest = copy.deepcopy(valid_manifest)
+                candidate_manifest["topology"]["dense_frontier_workers"] = width
+                candidate = root / f"source-width-{width}.json"
+                candidate.write_text(json.dumps(candidate_manifest, indent=2) + "\n")
+                with self.assertRaises(ValueError) as caught:
+                    sim.load_scenario(candidate)
+                return str(caught.exception)
+
+            def retained_failure(width: int) -> str:
+                candidate_rows = copy.deepcopy(retained_rows)
+                candidate_rows[0]["scenario_manifest"]["topology"][
+                    "dense_frontier_workers"
+                ] = width
+                candidate = output / f"retained-width-{width}.jsonl"
+                candidate.write_text(
+                    "".join(json.dumps(row) + "\n" for row in candidate_rows)
+                )
+                with self.assertRaises(ValueError) as caught:
+                    sim.validate_experiment_jsonl(candidate)
+                return str(caught.exception)
+
+            source_upper = source_failure(3)
+            retained_upper = retained_failure(3)
+            upper_marker = "topology.dense_frontier_workers"
+            self.assertEqual(
+                source_upper[source_upper.index(upper_marker) :],
+                retained_upper[retained_upper.index(upper_marker) :],
+            )
+            self.assertTrue(
+                source_upper.endswith(
+                    "topology.dense_frontier_workers 3 is outside f_count 2"
+                )
+            )
+
+            source_lower = source_failure(0)
+            retained_lower = retained_failure(0)
+            lower_marker = "schema error at topology.dense_frontier_workers"
+            self.assertEqual(
+                source_lower[source_lower.index(lower_marker) :],
+                retained_lower[retained_lower.index(lower_marker) :],
+            )
+
+    def test_v2_dense_frontier_accepts_single_worker_and_full_width(self) -> None:
+        for f_count in (1, 3):
+            with self.subTest(
+                f_count=f_count
+            ), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                path = write_v2_fixture(root, [3, 2], [10, 11], workers=f_count)
+                document = json.loads(path.read_text())
+                document["topology"]["scheduler_policy"] = "dense_frontier"
+                document["topology"]["dense_frontier_workers"] = f_count
+                path.write_text(json.dumps(document, indent=2) + "\n")
+                scenario = sim.load_scenario(path)
+                self.assertEqual(
+                    scenario.document["scheduler"]["dense_frontier_workers"], f_count
+                )
+                output = root / "out"
+                result = sim.Simulator(scenario, sim.RawAdapter()).run()
+                sim.write_result(scenario, result, output, execution_for(path))
+                self.assertEqual(
+                    sim.validate_experiment_jsonl(output / "experiment.jsonl")[
+                        "events"
+                    ],
+                    result.events.count,
+                )
+
+    def test_v2_round_robin_and_rendezvous_topologies_are_unchanged(self) -> None:
+        for policy in ("round_robin", "rendezvous"):
+            with self.subTest(
+                policy=policy
+            ), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                path = write_v2_fixture(root, [3, 2], [10, 11], workers=2)
+                document = json.loads(path.read_text())
+                document["topology"]["scheduler_policy"] = policy
+                path.write_text(json.dumps(document, indent=2) + "\n")
+                scenario = sim.load_scenario(path)
+                expected_placement = (
+                    "round-robin" if policy == "round_robin" else "rendezvous"
+                )
+                self.assertEqual(
+                    scenario.document["scheduler"]["placement_policy"],
+                    expected_placement,
+                )
+                if policy == "round_robin":
+                    self.assertNotIn(
+                        "dense_frontier_workers", scenario.document["scheduler"]
+                    )
+                else:
+                    self.assertEqual(
+                        scenario.document["scheduler"]["dense_frontier_workers"], 2
+                    )
+
     def test_v2_absent_environment_is_single_flight_and_not_in_source_score(
         self,
     ) -> None:

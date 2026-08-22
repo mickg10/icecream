@@ -1748,15 +1748,26 @@ def logical_job_identity(scenario_digest: str, item: WorkItem) -> str:
     )
 
 
-def validate_v2_manifest_indices(
+def validate_v2_manifest_topology(
     manifest: Mapping[str, object], context: object
 ) -> None:
-    """Reject workload C indices outside the declared topology before identity use."""
+    """Validate v2 fields whose bounds depend on the declared topology."""
     topology = manifest["topology"]
     workload = manifest["workload"]
     assert isinstance(topology, Mapping)
     assert isinstance(workload, Mapping)
     c_count = checked_positive_int(topology["c_count"], "topology.c_count")
+    f_count = checked_positive_int(topology["f_count"], "topology.f_count")
+    if topology["scheduler_policy"] == "dense_frontier":
+        frontier_width = checked_positive_int(
+            topology["dense_frontier_workers"],
+            f"{context}: topology.dense_frontier_workers",
+        )
+        if frontier_width > f_count:
+            raise ValueError(
+                f"{context}: topology.dense_frontier_workers {frontier_width} "
+                f"is outside f_count {f_count}"
+            )
     jobs = workload["jobs"]
     assert isinstance(jobs, list)
     for ordinal, job in enumerate(jobs):
@@ -1773,7 +1784,7 @@ def validate_v2_manifest_indices(
 
 def normalize_v2_manifest(manifest: dict[str, object]) -> dict[str, object]:
     """Translate the mode-neutral v2 contract into the established event engine shape."""
-    validate_v2_manifest_indices(manifest, "v2 manifest")
+    validate_v2_manifest_topology(manifest, "v2 manifest")
     topology = manifest["topology"]
     workload = manifest["workload"]
     capabilities = manifest["capabilities"]
@@ -2124,7 +2135,7 @@ def load_scenario(
     if schema == "icecream-experiment-v2":
         validate_json_schema(source_document, "experiment.schema.json", path)
         manifest = source_document
-        validate_v2_manifest_indices(manifest, path)
+        validate_v2_manifest_topology(manifest, path)
         capabilities = manifest["capabilities"]
         expected = manifest["expected"]
         assert isinstance(capabilities, dict) and isinstance(expected, dict)
@@ -6339,7 +6350,7 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
     validate_json_schema(
         manifest, "experiment.schema.json", f"{path}:embedded scenario_manifest"
     )
-    validate_v2_manifest_indices(manifest, f"{path}:embedded scenario_manifest")
+    validate_v2_manifest_topology(manifest, f"{path}:embedded scenario_manifest")
     scenario_digest = canonical_json_sha256(manifest)
     if header["scenario_digest"] != scenario_digest:
         raise ValueError(f"{path}: embedded scenario manifest digest differs")
