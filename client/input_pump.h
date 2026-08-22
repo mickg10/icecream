@@ -23,7 +23,7 @@ class RemoteInputSink
 public:
     virtual ~RemoteInputSink() = default;
 
-    // Takes ownership of fd and closes it on success and every error path.
+    // Takes responsibility for fd while retaining the legacy close/error contract.
     virtual void send_fd(int fd) = 0;
     virtual bool send_end() = 0;
 };
