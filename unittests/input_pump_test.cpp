@@ -221,6 +221,30 @@ void test_send_error_closes_fd()
     delete pair.sender;
 }
 
+void test_status_response_during_send_failure_closes_fd()
+{
+    ChannelPair pair = make_channel_pair();
+    REQUIRE(pair.receiver->send_msg(StatusTextMsg("remote rejected source")),
+            "peer queues a terminal STATUS_TEXT before refusing source bytes");
+    REQUIRE(shutdown(pair.receiver->fd, SHUT_RD) == 0,
+            "peer refuses subsequent source bytes while retaining its response stream");
+
+    LegacyRemoteSink sink(pair.sender);
+    const int fd = input_fd(input_bytes(1));
+    try {
+        sink.send_fd(fd);
+        REQUIRE(false, "terminal STATUS_TEXT raises client_error");
+    } catch (const client_error &error) {
+        REQUIRE(error.errorCode == 23,
+                "terminal STATUS_TEXT retains legacy remote-status error code 23");
+    }
+    REQUIRE(fcntl(fd, F_GETFD) == -1 && errno == EBADF,
+            "terminal STATUS_TEXT cannot bypass owned descriptor closure");
+
+    delete pair.sender;
+    delete pair.receiver;
+}
+
 }
 
 int main()
@@ -228,5 +252,6 @@ int main()
     test_boundaries_and_empty_input();
     test_read_error_closes_fd();
     test_send_error_closes_fd();
+    test_status_response_during_send_failure_closes_fd();
     return failures == 0 ? 0 : 1;
 }
