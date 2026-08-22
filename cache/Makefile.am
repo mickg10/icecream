@@ -46,6 +46,7 @@ EXTRA_DIST = \
 	formal/Protocol50IncarnationMutant.cfg \
 	formal/Protocol50IncarnationOwnershipMutant.cfg \
 	formal/Protocol50Assignment.tla \
+	formal/Protocol50AssignmentConfig.tla \
 	formal/Protocol50Assignment.cfg \
 	formal/Protocol50AssignmentRestart.cfg \
 	formal/Protocol50AssignmentMixedCompat.cfg \
@@ -61,6 +62,13 @@ EXTRA_DIST = \
 	formal/Protocol50AssignmentOrderingPrepareMutant.cfg \
 	formal/Protocol50AssignmentOrderingReadyMutant.cfg \
 	formal/Protocol50AssignmentOrderingRevokeMutant.cfg \
+	formal/Protocol50AssignmentDelivery.tla \
+	formal/Protocol50AssignmentDelivery.cfg \
+	formal/Protocol50AssignmentReadyWireMutant.cfg \
+	formal/Protocol50AssignmentRevokeRequestWireMutant.cfg \
+	formal/Protocol50AssignmentRevokeResultWireMutant.cfg \
+	formal/Protocol50AssignmentLatePrepareMutant.cfg \
+	formal/Protocol50AssignmentDelivery.md \
 	formal/run_tlc.sh \
 	formal/.gitignore \
 	formal/check_trace.py \
