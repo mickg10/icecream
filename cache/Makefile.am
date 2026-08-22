@@ -56,6 +56,13 @@ EXTRA_DIST = \
 	formal/Protocol50AssignmentTombstoneMutant.cfg \
 	formal/Protocol50AssignmentEpochReuseMutant.cfg \
 	formal/Protocol50Assignment.md \
+	formal/Protocol50AssignmentOrdering.tla \
+	formal/Protocol50AssignmentOrdering.cfg \
+	formal/Protocol50AssignmentOrderingEarlyCancelWitness.cfg \
+	formal/Protocol50AssignmentOrderingAdvisoryWitness.cfg \
+	formal/Protocol50AssignmentOrderingPrepareMutant.cfg \
+	formal/Protocol50AssignmentOrderingReadyMutant.cfg \
+	formal/Protocol50AssignmentOrderingRevokeMutant.cfg \
 	formal/run_tlc.sh \
 	formal/.gitignore \
 	formal/check_trace.py \
