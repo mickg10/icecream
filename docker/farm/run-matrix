@@ -1,0 +1,33 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -lt 2 ]; then
+    echo "usage: run-matrix RUN_LABEL_PREFIX {nas642|quietbox2} [farm.py options]" >&2
+    exit 64
+fi
+
+label_prefix=$1
+submitter=$2
+shift 2
+
+case "$submitter" in
+    nas642)
+        profile=local_80_nas_submitter
+        ;;
+    quietbox2)
+        profile=local_56_q2_submitter
+        ;;
+    *)
+        echo "submitter must be nas642 or quietbox2" >&2
+        exit 64
+        ;;
+esac
+
+for environment in debian-gcc fedora-clang-libcxx linuxbrew conan-gcc; do
+    "$(dirname "$0")/farm.py" run \
+        --scenario c1f1 \
+        --profile "$profile" \
+        --environment "$environment" \
+        --run-label "${label_prefix}-${submitter}-${environment}" \
+        "$@"
+done

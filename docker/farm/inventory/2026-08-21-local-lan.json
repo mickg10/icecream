@@ -1,0 +1,273 @@
+{
+  "schema": 1,
+  "collected_date": "2026-08-21",
+  "inventory_mode": "read-only",
+  "controller": "nas642",
+  "default_network": "10.0.27.0/24",
+  "lan_probe": {
+    "origins": [
+      "nas642",
+      "research6",
+      "research7",
+      "quietbox2"
+    ],
+    "targets": {
+      "nas642": "10.0.27.127",
+      "research6": "10.0.27.56",
+      "research7": "10.0.27.58",
+      "quietbox2": "10.0.27.212",
+      "quietbox3": "10.0.27.101"
+    },
+    "result": "all 20 explicit-address pairs answered ICMP and TCP/22",
+    "name_resolution_policy": "not accepted for launch; at least one peer name resolved through Tailscale during inventory"
+  },
+  "hosts": {
+    "nas642": {
+      "hostname": "nas642.mickg.net",
+      "lan": "10.0.27.127/24",
+      "lan_interface": "ens160",
+      "architecture": "x86_64",
+      "visible_cpus": 16,
+      "nproc_effective_during_gate": 12,
+      "nproc_environment_note": "controller OMP_NUM_THREADS=12; online/cpuset view remains 16",
+      "effective_cpuset": "0-15",
+      "cpu_quota": "cgroup-v1/no cpu.max file",
+      "observed_load_1m_5m_15m": "6.06 5.73 5.92",
+      "cpu_model": "Intel Xeon Gold 6136",
+      "virtualization": "vmware",
+      "memory_kib": 82454644,
+      "os": "Ubuntu 22.04",
+      "kernel": "5.15.0-187-generic",
+      "gcc": "11.4.0",
+      "host_boost": "1.55",
+      "docker": "29.6.0",
+      "compose": "5.1.4",
+      "docker_permission": true,
+      "storage_driver": "zfs",
+      "verified_paths": {
+        "/tanksmall/scratch/ictmp": "read-write; 665653888 KiB available",
+        "/tanksmall/MICKG2/mickg/src/mickgvirtu/icecream": "read-write",
+        "/tanksmall/scratch/ictmp/corpus-snapshots": "readable",
+        "/dev/shm": "read-write; 41227196 KiB available"
+      }
+    },
+    "research6": {
+      "hostname": "research6",
+      "lan": "10.0.27.56/24",
+      "lan_interface": "ens34",
+      "architecture": "x86_64",
+      "visible_cpus": 20,
+      "effective_cpuset": "0-19",
+      "cpu_quota": "cgroup-v1/no cpu.max file",
+      "observed_load_1m_5m_15m": "14.74 17.51 17.93",
+      "cpu_model": "Intel Xeon Gold 6136",
+      "virtualization": "vmware",
+      "memory_kib": 396239260,
+      "os": "Ubuntu 22.04",
+      "kernel": "5.15.0-187-generic",
+      "gcc": "11.4.0",
+      "host_boost": "absent",
+      "docker": "29.6.1",
+      "compose": "5.3.1",
+      "docker_permission": true,
+      "storage_driver": "overlayfs",
+      "container_start_gate": "failed 2026-08-21: bounded docker run of the unpacked pinned runtime image returned 124; daemon logged fatal session health, only one connection allowed",
+      "verified_paths": {
+        "/home/mickg": "read-write; 62355584 KiB available; no farm source or corpus discovered",
+        "/dev/shm": "read-write; 198067100 KiB available"
+      }
+    },
+    "research7": {
+      "hostname": "research7",
+      "lan": "10.0.27.58/24",
+      "lan_interface": "ens34",
+      "architecture": "x86_64",
+      "visible_cpus": 12,
+      "effective_cpuset": "0-11",
+      "cpu_quota": "cgroup-v1/no cpu.max file",
+      "observed_load_1m_5m_15m": "0.13 0.14 0.16",
+      "cpu_model": "Intel Xeon Gold 6136",
+      "virtualization": "vmware",
+      "memory_kib": 49326876,
+      "os": "Ubuntu 22.04",
+      "kernel": "5.15.0-187-generic",
+      "gcc": "11.4.0",
+      "host_boost": "absent",
+      "docker_client": "29.6.1",
+      "compose": "5.3.1",
+      "docker_permission": false,
+      "verified_paths": {
+        "/home/mickg": "read-write; 1009220 KiB available; no farm source or corpus discovered",
+        "/dev/shm": "read-write; 24663436 KiB available"
+      },
+      "capacity_note": "owner allocation is 16 worker slots; retain that declared allocation and record the current 12-CPU guest view in every run"
+    },
+    "quietbox2": {
+      "hostname": "tt-quietbox",
+      "lan": "10.0.27.212/24",
+      "lan_interface": "enp10s0f0np0",
+      "architecture": "x86_64",
+      "visible_cpus": 32,
+      "effective_cpuset": "0-31",
+      "cpu_quota": "cgroup-v1/no cpu.max file",
+      "observed_load_1m_5m_15m": "3.32 3.19 2.50",
+      "cpu_model": "AMD EPYC 8124P",
+      "threads_per_core": 2,
+      "virtualization": "none reported",
+      "memory_kib": 527905120,
+      "os": "Ubuntu 22.04",
+      "kernel": "6.8.0-124-generic",
+      "gcc": "11.4.0",
+      "host_boost": "absent",
+      "docker": "29.6.2",
+      "compose": "5.3.1",
+      "docker_permission": true,
+      "storage_driver": "overlayfs",
+      "verified_paths": {
+        "/home/mickg10": "read-write; 1280061832 KiB available; no current farm source or corpus discovered",
+        "/dev/shm": "read-write; 263952156 KiB available"
+      }
+    },
+    "quietbox3": {
+      "lan_address": "10.0.27.101",
+      "lan_reachability": "ICMP and TCP/22 from all four inventoried LAN origins",
+      "ssh": "authentication rejected for both available plausible accounts",
+      "lan_interface": "unverified",
+      "docker": "unverified",
+      "capacity": "owner-proposed 24 worker slots; live facts unavailable"
+    }
+  },
+  "resource_groups": {
+    "nas-r6-r7-shared": {
+      "members": [
+        "nas642",
+        "research6",
+        "research7"
+      ],
+      "owner_estimated_physical_cpus": 64,
+      "declared_worker_slots": 32,
+      "accounting": "research6 16 plus research7 16 are additive; scheduler and nas642 submitter load remains charged to the same group"
+    },
+    "quietbox2-physical": {
+      "members": [
+        "quietbox2"
+      ],
+      "declared_worker_slots": 24
+    },
+    "quietbox3-physical": {
+      "members": [
+        "quietbox3"
+      ],
+      "declared_worker_slots": 24,
+      "status": "unverified"
+    }
+  },
+  "daemon_runtime_image": {
+    "location_at_build_gate": "nas642 Docker engine",
+    "tag": "icecream/farm-node:ubuntu22-gcc11-boost174",
+    "inventoried_engine_id": "sha256:fe001a6138f017608b8846b43bf268a76a9d7a5b66c3364ba3f881da2ff0c54b",
+    "portable_content_fingerprint": "sha256:86fc3f4ba688614d99ca772efa153a9c3b1afef7a1496965362d794d7fa15fc2",
+    "base_os": "Ubuntu 22.04",
+    "toolchain": "gcc 11.4.0 with Boost 1.74",
+    "role": "scheduler/F runtime and Icecream staging; not a corpus environment"
+  },
+  "environment_classes": {
+    "location": "quietbox2 Docker engine only",
+    "source_harness_expected": "~/icecream-ii-matrix/compression-research/ii-matrix/produce_cell.sh",
+    "source_harness_inventory": "not present under inventoried quietbox2 home roots",
+    "verified_cells": "44 total: 11 projects by 4 profiles",
+    "projects": [
+      "catch2",
+      "cereal",
+      "eigen",
+      "fmt",
+      "leveldb",
+      "nlohmann-json",
+      "opencv",
+      "range-v3",
+      "re2",
+      "rocksdb",
+      "spdlog"
+    ],
+    "images": {
+      "debian-gcc": {
+        "tag": "ice-ii/debian-gcc:v2",
+        "id": "sha256:398be28069403cb51309015248551da98300b964b48303a64e7c31f2ae32719a",
+        "repo_digest": "ice-ii/debian-gcc@sha256:398be28069403cb51309015248551da98300b964b48303a64e7c31f2ae32719a",
+        "portable_content_fingerprint": "sha256:3c4d1d13b03fdb0d74084b714fd8fa7f2a7dc5810b2df18e73897ee13270ff69",
+        "base_os": "Debian 12",
+        "toolchain": "gcc 12.2.0 with libstdc++ 12"
+      },
+      "conan-gcc": {
+        "tag": "ice-ii/conan-gcc:v2",
+        "id": "sha256:1aa1f9d819b6e635ac3eee2ec4c69bffeb71c2082331c9c7a59c24730e3ac0be",
+        "repo_digest": "ice-ii/conan-gcc@sha256:1aa1f9d819b6e635ac3eee2ec4c69bffeb71c2082331c9c7a59c24730e3ac0be",
+        "portable_content_fingerprint": "sha256:78f8295096b61e11f26d79006577af7a52fbc08a1d770abdef6480d637a550f1",
+        "base_os": "Debian trixie with Conan",
+        "toolchain": "gcc 14.2.0 with libstdc++ 14"
+      },
+      "fedora-clang-libcxx": {
+        "tag": "ice-ii/fedora-clang-libcxx:v2",
+        "id": "sha256:b8b26823d8ed63c96e349427b9b5f8fc5d676f76f4f621cc1cc2a95c38c54c8e",
+        "repo_digest": "ice-ii/fedora-clang-libcxx@sha256:b8b26823d8ed63c96e349427b9b5f8fc5d676f76f4f621cc1cc2a95c38c54c8e",
+        "portable_content_fingerprint": "sha256:b43a9f4ad6f3604e73c78d56bc84d5f5f9d3a8337e71c75b029c6685eea7c911",
+        "base_os": "Fedora 42",
+        "toolchain": "clang 20.1.8 with libc++"
+      },
+      "linuxbrew": {
+        "tag": "ice-ii/linuxbrew:v2",
+        "id": "sha256:bb6bc116c44aaefb7e1d28abcf82e4eceed30d1511bff695d4a8b5d482f17f12",
+        "repo_digest": "ice-ii/linuxbrew@sha256:bb6bc116c44aaefb7e1d28abcf82e4eceed30d1511bff695d4a8b5d482f17f12",
+        "portable_content_fingerprint": "sha256:c17f64c6fa5a5f6c5c25993f04ef01315e862790ccafdd7dd56bb1c047988994",
+        "base_os": "Ubuntu 22.04 with Linuxbrew LLVM",
+        "toolchain": "clang 22.1.8 with libstdc++ 12"
+      }
+    }
+  },
+  "wan_exclusions": {
+    "research4": {
+      "controller_route": "Tailscale 100.98.29.73 only; excluded from default",
+      "hostname": "research4",
+      "remote_site_lan": "192.168.17.187/24 on ens34",
+      "architecture": "x86_64",
+      "visible_cpus": 44,
+      "cpu_model": "Intel Xeon Platinum 8260",
+      "memory_kib": 264110316,
+      "virtualization": "vmware",
+      "os": "Ubuntu 22.04",
+      "kernel": "5.15.0-171-generic",
+      "gcc": "11.4.0",
+      "host_boost": "absent",
+      "docker_client": "28.1.1",
+      "docker_permission": false,
+      "compose": "2.35.1",
+      "paths": "/scratch readable but not writable; /var/tmp read-write"
+    },
+    "nas64tail": {
+      "controller_route": "Tailscale 100.83.144.87 only; excluded from default",
+      "hostname": "nas64.mickg.net",
+      "remote_site_lan": "192.168.17.3/24 on ens160",
+      "architecture": "x86_64",
+      "visible_cpus": 12,
+      "memory_kib": 98999152,
+      "virtualization": "vmware",
+      "os": "Ubuntu 18.04",
+      "kernel": "4.15.0-213-generic",
+      "gcc": "7.5.0",
+      "host_boost": "1.55",
+      "docker": "20.10.21",
+      "docker_permission": true,
+      "compose": "absent",
+      "paths": "/tanksmall readable/not writable with 6380237952 KiB available; /var/tmp read-write with 18311296 KiB available"
+    },
+    "default_manifest_wan_hosts": []
+  },
+  "current_launch_blocks": [
+    "quietbox3 SSH authentication and interface inventory",
+    "research7 Docker permission",
+    "research6 Docker engine container-start/session health",
+    "daemon runtime prefix and runtime image provisioning beyond nas642/research6",
+    "source/corpus/build/result mount provisioning for each selected submitter",
+    "environment image distribution to the selected submitter"
+  ]
+}

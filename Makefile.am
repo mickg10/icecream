@@ -2,7 +2,20 @@ EXTRA_DIST = \
 	README.md \
 	capability/distribution/firefox-corrected.compile-trace.tsv \
 	capability/grouprlz/p29_online_s1.h \
-	capability/grouprlz/runway-census.tsv
+	capability/grouprlz/runway-census.tsv \
+	docker/farm/README.md \
+	docker/farm/.gitignore \
+	docker/farm/Dockerfile.node \
+	docker/farm/acceptance.sh \
+	docker/farm/acceptance/tiny.cpp \
+	docker/farm/farm.py \
+	docker/farm/inventory/2026-08-21-local-lan.json \
+	docker/farm/manifests/local-lan.json \
+	docker/farm/run-c1f1 \
+	docker/farm/run-c1f2 \
+	docker/farm/run-c1f20 \
+	docker/farm/run-matrix \
+	docker/farm/test_farm.py
 
 ACLOCAL_AMFLAGS = -I m4
 AM_LIBTOOLFLAGS = --silent
@@ -32,9 +45,14 @@ test-strict: install
 
 .PHONY: integration_tests
 integration_tests:
+	python3 $(top_srcdir)/docker/farm/test_farm.py
 	python3 -m unittest \
 		capability/distribution/test_run_scenario.py \
 		capability/distribution/test_build_p29_ledger.py \
 		capability/distribution/test_build_grz_ledger.py \
 		capability/distribution/test_run_suite.py
 	python3 -m compileall -q capability/distribution
+
+.PHONY: farm-check
+farm-check:
+	python3 $(top_srcdir)/docker/farm/test_farm.py
