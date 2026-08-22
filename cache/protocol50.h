@@ -97,6 +97,8 @@ struct Key64Hash {
 
 constexpr uint16_t kProtocolVersion = 50;
 constexpr uint32_t kInitialMaxFramePayload = 1U << 20;
+// TX_BEGIN is the largest fixed-size mandatory V1 control payload.
+constexpr uint32_t kMandatoryControlFramePayload = 152;
 constexpr uint64_t kInitialMaxFillRecordBytes = uint64_t{1} << 32;
 
 enum class MessageType : uint8_t {
@@ -128,6 +130,9 @@ constexpr uint32_t profile_bit(ProfileId profile) {
 }
 
 constexpr uint32_t kM1SupportedProfiles = profile_bit(ProfileId::P29);
+constexpr uint32_t kKnownProfileMask = profile_bit(ProfileId::P29) |
+                                       profile_bit(ProfileId::ZSTD_TU) |
+                                       profile_bit(ProfileId::GRZ);
 
 enum class P29RootMode : uint16_t {
     NotApplicable = 0,
@@ -143,7 +148,7 @@ struct SessionLimits {
 
 struct SessionSelection {
     uint16_t protocol = kProtocolVersion;
-    ProfileId profile = ProfileId::P29;
+    uint32_t negotiated_profiles = kM1SupportedProfiles;
     SessionLimits limits{};
     auto operator<=>(const SessionSelection&) const = default;
 };
@@ -169,7 +174,7 @@ struct SessionHello {
 
 struct SessionState {
     uint16_t selected_protocol = kProtocolVersion;
-    ProfileId selected_profile = ProfileId::P29;
+    uint32_t negotiated_profiles = kM1SupportedProfiles;
     SessionLimits limits{};
     FStoreGuid f_store_guid{};
     bool namespace_present = false;
@@ -208,7 +213,7 @@ struct TxBegin {
     auto operator<=>(const TxBegin&) const = default;
 };
 
-// Client receive gate for a SESSION_STATE selected from the original offer.
+// Client receive gate for a SESSION_STATE negotiated from the original offer.
 void validate_session_state(const SessionHello& hello,
                             const SessionState& received_state);
 
@@ -249,10 +254,18 @@ struct Frame {
     auto operator<=>(const Frame&) const = default;
 };
 
+struct FrameHeader {
+    MessageType type = MessageType::ERROR;
+    uint32_t payload_bytes = 0;
+    auto operator<=>(const FrameHeader&) const = default;
+};
+
 MessageType message_type(const Message& message);
 std::vector<uint8_t> encode_payload(const Message& message);
 Message decode_payload(MessageType type, std::span<const uint8_t> payload);
 std::array<uint8_t, 4> encode_frame_header(MessageType type, uint32_t payload_bytes);
+FrameHeader decode_frame_header(std::span<const uint8_t> header,
+                                uint32_t max_payload = kInitialMaxFramePayload);
 std::vector<uint8_t> encode_frame(const Message& message);
 
 class FrameParser {

@@ -102,7 +102,8 @@ std::vector<Message> all_messages() {
     TxCommit commit{{99}, {4}, {7}, digest("tx"), digest("raw"), digest("post")};
     SessionState state;
     state.selected_protocol = kProtocolVersion;
-    state.selected_profile = ProfileId::P29;
+    state.negotiated_profiles = profile_bit(ProfileId::P29) |
+                                profile_bit(ProfileId::ZSTD_TU);
     state.limits = {65536, 1U << 24};
     state.f_store_guid = Id128::from_u64(2);
     state.namespace_present = true;
@@ -156,7 +157,7 @@ void test_session_negotiation() {
         hello, 50, 52, profile_bit(ProfileId::ZSTD_TU),
         SessionLimits{128 * 1024, 16 * 1024 * 1024});
     require(selected.protocol == kProtocolVersion &&
-                selected.profile == ProfileId::ZSTD_TU &&
+                selected.negotiated_profiles == profile_bit(ProfileId::ZSTD_TU) &&
                 selected.limits.max_frame_payload == 128 * 1024 &&
                 selected.limits.max_fill_record_bytes == 8 * 1024 * 1024,
             "session did not select implemented Protocol 50 and smaller limits");
@@ -183,6 +184,20 @@ void test_session_negotiation() {
     require_throws<std::invalid_argument>(
         [&] { (void)encode_frame(Message{bad_limit}); },
         "SESSION_HELLO accepted a frame cap above the V1 bound");
+    bad_limit = hello;
+    bad_limit.limits.max_frame_payload = kMandatoryControlFramePayload - 1;
+    require_throws<std::invalid_argument>(
+        [&] { (void)encode_frame(Message{bad_limit}); },
+        "SESSION_HELLO accepted a frame cap too small for TX_BEGIN");
+    SessionHello exact_control_cap = hello;
+    exact_control_cap.limits.max_frame_payload = kMandatoryControlFramePayload;
+    const SessionSelection exact_selection = negotiate_session(
+        exact_control_cap, kProtocolVersion, kProtocolVersion,
+        profile_bit(ProfileId::P29) | profile_bit(ProfileId::ZSTD_TU),
+        SessionLimits{kInitialMaxFramePayload, kInitialMaxFillRecordBytes});
+    require(exact_selection.limits.max_frame_payload == kMandatoryControlFramePayload &&
+                exact_selection.negotiated_profiles == exact_control_cap.supported_profiles,
+            "152-byte asymmetric control cap did not preserve the profile intersection");
 
     TxBegin zstd;
     zstd.profile = ProfileId::ZSTD_TU;
@@ -193,6 +208,8 @@ void test_session_negotiation() {
     zstd.raw_digest = icecc::digest128(empty);
     zstd.transaction_digest = compute_transaction_digest(zstd, empty, empty);
     const auto encoded = encode_frame(Message{zstd});
+    require(encoded.size() == 4 + kMandatoryControlFramePayload,
+            "TX_BEGIN no longer defines the mandatory control-frame minimum");
     FrameParser parser;
     const auto frames = parser.feed(encoded);
     require(frames.size() == 1 &&
@@ -218,7 +235,8 @@ void test_received_session_state_validation() {
     const Digest128 post_state = digest("retained post state");
     SessionState state;
     state.selected_protocol = kProtocolVersion;
-    state.selected_profile = ProfileId::P29;
+    state.negotiated_profiles = profile_bit(ProfileId::P29) |
+                                profile_bit(ProfileId::ZSTD_TU);
     state.limits = {64 * 1024, 4 * 1024 * 1024};
     state.f_store_guid = Id128::from_u64(71);
     state.namespace_present = true;
@@ -240,7 +258,7 @@ void test_received_session_state_validation() {
 
     SessionState absent;
     absent.selected_protocol = kProtocolVersion;
-    absent.selected_profile = ProfileId::P29;
+    absent.negotiated_profiles = profile_bit(ProfileId::P29);
     absent.limits = state.limits;
     absent.f_store_guid = state.f_store_guid;
     validate_session_state(hello, receive_session_state(absent));
@@ -272,10 +290,21 @@ void test_received_session_state_validation() {
         [&] { validate_received(rejected); },
         "SESSION_STATE selected an unimplemented higher protocol");
     rejected = state;
-    rejected.selected_profile = ProfileId::GRZ;
+    rejected.negotiated_profiles = profile_bit(ProfileId::GRZ);
     require_throws<std::invalid_argument>(
         [&] { validate_received(rejected); },
-        "SESSION_STATE selected a profile outside the client offer");
+        "SESSION_STATE negotiated a profile outside the client offer");
+    rejected = state;
+    rejected.negotiated_profiles = 0;
+    require_throws<std::invalid_argument>(
+        [&] { validate_received(rejected); },
+        "SESSION_STATE negotiated an empty profile set");
+    rejected = state;
+    rejected.negotiated_profiles = profile_bit(ProfileId::P29) |
+                                   profile_bit(static_cast<ProfileId>(32));
+    require_throws<std::invalid_argument>(
+        [&] { validate_received(rejected); },
+        "SESSION_STATE negotiated an unknown profile bit");
     rejected = state;
     rejected.limits.max_frame_payload = hello.limits.max_frame_payload + 1;
     require_throws<std::invalid_argument>(

@@ -101,6 +101,7 @@ std::string_view action_name(ActionType action) {
     case ActionType::COMMIT_ACCEPTED: return "COMMIT_ACCEPTED";
     case ActionType::ACTIVE_REPLAYED: return "ACTIVE_REPLAYED";
     case ActionType::LOST_COMMIT_ACCEPTED: return "LOST_COMMIT_ACCEPTED";
+    case ActionType::F_STORE_INCAR_REPLACED: return "F_STORE_INCAR_REPLACED";
     }
     throw std::logic_error("unknown Protocol-50 action");
 }
@@ -119,6 +120,8 @@ std::string action_jsonl(const ActionRecord& record) {
         << "\",\"actor\":\"" << actor_name(record.actor)
         << "\",\"c_store_guid\":\"" << bytes_hex(record.c_store_guid.bytes)
         << "\",\"f_store_guid\":\"" << bytes_hex(record.f_store_guid.bytes)
+        << "\",\"previous_f_store_guid\":\""
+        << bytes_hex(record.previous_f_store_guid.bytes)
         << "\",\"session_serial\":" << record.session_serial
         << ",\"history_nonce\":" << record.history_nonce.value
         << ",\"rel_seq\":" << record.rel_seq.value
@@ -194,6 +197,27 @@ std::optional<std::string> check_action_trace(std::span<const ActionRecord> reco
             if (f.commit_unacknowledged) f.commit_disconnected = true;
             clear_f_pending(f);
             break;
+        case ActionType::F_STORE_INCAR_REPLACED: {
+            if (record.actor != ActorSide::C ||
+                record.previous_f_store_guid == FStoreGuid{} ||
+                record.previous_f_store_guid == record.f_store_guid)
+                return error("incarnation replacement lacks distinct old/new F identities");
+            const auto old_position = relationships.find(
+                {record.c_store_guid, record.previous_f_store_guid});
+            if (old_position == relationships.end() ||
+                !old_position->second.c.active ||
+                *old_position->second.c.active != tx_identity(record))
+                return error("incarnation replacement lost its retained C transaction");
+            if (old_position->second.f.connected)
+                return error("incarnation replacement occurred while the old F session was live");
+            if (!f.connected)
+                return error("incarnation replacement lacks the observed new F session");
+            old_position->second.c.active.reset();
+            clear_f_pending(old_position->second.f);
+            old_position->second.f.commit_unacknowledged = false;
+            old_position->second.f.commit_disconnected = false;
+            break;
+        }
         case ActionType::HISTORY_RESET:
             if (!current_f_session())
                 return error("history reset without a current F session");
