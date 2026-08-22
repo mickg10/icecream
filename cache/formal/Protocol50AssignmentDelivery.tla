@@ -10,7 +10,8 @@ by Protocol50Assignment.tla:
      bound to the exact assignment, not looked up by wire id at delivery time;
   2. in ADVISORY mode a legacy claim may win before PREPARE arrives. The late
      PREPARE may enrich and acknowledge that claim but may never regress it to
-     RESERVED.
+     RESERVED. A later REVOKE returns CLAIMED_OR_LATER and cannot release the
+     accepted assignment.
 
 OldA and NewA represent two generations with the same epoch and wire id but
 distinct nonces. Therefore PREPARE, READY, REVOKE request, and REVOKE result
@@ -34,13 +35,15 @@ ASSUME /\ OldA # NewA
 Assignments == {OldA, NewA}
 Phases == {"Absent", "Reserved", "Claimed", "Started", "Terminal", "Revoked"}
 ClaimKinds == {"None", "Unfenced", "Nonce"}
+RevokeResultKinds == {"None", "Revoked", "ClaimedOrLater"}
+LiveClaimPhases == {"Claimed", "Started", "Terminal"}
 
 VARIABLES current,
           phase, claimKind,
           workerPrepared, workerRevoked,
           schedulerRevokeSent,
           readyInFlight, readyAccepted,
-          revokeRequestInFlight, revokeResultInFlight,
+          revokeRequestInFlight, revokeResultInFlight, revokeResultKind,
           published, released
 
 vars == <<current,
@@ -48,7 +51,7 @@ vars == <<current,
           workerPrepared, workerRevoked,
           schedulerRevokeSent,
           readyInFlight, readyAccepted,
-          revokeRequestInFlight, revokeResultInFlight,
+          revokeRequestInFlight, revokeResultInFlight, revokeResultKind,
           published, released>>
 
 Init ==
@@ -62,6 +65,7 @@ Init ==
     /\ readyAccepted = NoA
     /\ revokeRequestInFlight = NoA
     /\ revokeResultInFlight = NoA
+    /\ revokeResultKind = "None"
     /\ published = {}
     /\ released = {}
 
@@ -76,7 +80,7 @@ PrepareCurrent ==
        /\ UNCHANGED <<current, claimKind, workerRevoked,
                        schedulerRevokeSent, readyAccepted,
                        revokeRequestInFlight, revokeResultInFlight,
-                       published, released>>
+                       revokeResultKind, published, released>>
 
 AdvisoryClaimCurrent ==
     LET a == current
@@ -86,7 +90,7 @@ AdvisoryClaimCurrent ==
        /\ UNCHANGED <<current, workerPrepared, workerRevoked,
                        schedulerRevokeSent, readyInFlight, readyAccepted,
                        revokeRequestInFlight, revokeResultInFlight,
-                       published, released>>
+                       revokeResultKind, published, released>>
 
 PrepareAfterUnfencedClaim(a) ==
     /\ a \in Assignments
@@ -102,7 +106,7 @@ PrepareAfterUnfencedClaim(a) ==
     /\ UNCHANGED <<current, claimKind, workerRevoked,
                     schedulerRevokeSent, readyAccepted,
                     revokeRequestInFlight, revokeResultInFlight,
-                    published, released>>
+                    revokeResultKind, published, released>>
 
 SwitchToNew ==
     /\ current = OldA
@@ -110,7 +114,7 @@ SwitchToNew ==
     /\ UNCHANGED <<phase, claimKind, workerPrepared, workerRevoked,
                     schedulerRevokeSent, readyInFlight, readyAccepted,
                     revokeRequestInFlight, revokeResultInFlight,
-                    published, released>>
+                    revokeResultKind, published, released>>
 
 DeliverReady ==
     LET origin == readyInFlight
@@ -124,7 +128,7 @@ DeliverReady ==
                        workerPrepared, workerRevoked,
                        schedulerRevokeSent,
                        revokeRequestInFlight, revokeResultInFlight,
-                       published, released>>
+                       revokeResultKind, published, released>>
 
 PublishCurrent ==
     /\ readyAccepted = current
@@ -134,7 +138,7 @@ PublishCurrent ==
                     schedulerRevokeSent,
                     readyInFlight, readyAccepted,
                     revokeRequestInFlight, revokeResultInFlight,
-                    released>>
+                    revokeResultKind, released>>
 
 SendRevokeCurrent ==
     /\ revokeRequestInFlight = NoA
@@ -144,17 +148,26 @@ SendRevokeCurrent ==
     /\ UNCHANGED <<current, phase, claimKind,
                     workerPrepared, workerRevoked,
                     readyInFlight, readyAccepted,
-                    revokeResultInFlight, published, released>>
+                    revokeResultInFlight, revokeResultKind,
+                    published, released>>
 
 DeliverRevokeRequest ==
     LET origin == revokeRequestInFlight
         target == IF MutantRevokeRequestByWireOnly THEN current ELSE origin
+        claimWon == claimKind[target] # "None" /\ phase[target] \in LiveClaimPhases
+        resultKind == IF claimWon THEN "ClaimedOrLater" ELSE "Revoked"
     IN /\ origin \in Assignments
        /\ revokeResultInFlight = NoA
-       /\ workerRevoked' = workerRevoked \cup {target}
-       /\ phase' = [phase EXCEPT ![target] = "Revoked"]
+       /\ revokeResultKind = "None"
+       /\ workerRevoked' =
+              IF claimWon THEN workerRevoked
+              ELSE workerRevoked \cup {target}
+       /\ phase' =
+              IF claimWon THEN phase
+              ELSE [phase EXCEPT ![target] = "Revoked"]
        /\ revokeRequestInFlight' = NoA
        /\ revokeResultInFlight' = target
+       /\ revokeResultKind' = resultKind
        /\ UNCHANGED <<current, claimKind, workerPrepared,
                        schedulerRevokeSent, readyInFlight, readyAccepted,
                        published, released>>
@@ -163,8 +176,13 @@ DeliverRevokeResult ==
     LET origin == revokeResultInFlight
         accepted == IF MutantRevokeResultByWireOnly THEN current ELSE origin
     IN /\ origin \in Assignments
-       /\ released' = released \cup {accepted}
+       /\ revokeResultKind \in {"Revoked", "ClaimedOrLater"}
+       /\ released' =
+              IF revokeResultKind = "Revoked"
+              THEN released \cup {accepted}
+              ELSE released
        /\ revokeResultInFlight' = NoA
+       /\ revokeResultKind' = "None"
        /\ UNCHANGED <<current, phase, claimKind,
                        workerPrepared, workerRevoked,
                        schedulerRevokeSent, readyInFlight, readyAccepted,
@@ -194,6 +212,7 @@ TypeOK ==
     /\ readyAccepted \in Assignments \cup {NoA}
     /\ revokeRequestInFlight \in Assignments \cup {NoA}
     /\ revokeResultInFlight \in Assignments \cup {NoA}
+    /\ revokeResultKind \in RevokeResultKinds
     /\ published \subseteq Assignments
     /\ released \subseteq Assignments
 
@@ -208,7 +227,10 @@ ReleaseHasMatchingWorkerProof ==
 
 ClaimedPhaseNeverRegresses ==
     \A a \in Assignments :
-        claimKind[a] # "None" =>
-            phase[a] \in {"Claimed", "Started", "Terminal"}
+        claimKind[a] # "None" => phase[a] \in LiveClaimPhases
+
+ClaimedAssignmentNeverReleased ==
+    \A a \in Assignments :
+        claimKind[a] # "None" => a \notin released
 
 =============================================================================
