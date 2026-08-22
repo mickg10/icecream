@@ -1717,6 +1717,184 @@ class SimulatorTest(unittest.TestCase):
                 "event extent|transaction-complete|event sequence",
             )
 
+    def test_v2_validator_rejects_finish_before_its_own_start(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_v2_fixture(
+                root,
+                [200_000_321, 100_000_123],
+                [15, 22],
+                workers=1,
+            )
+            scenario = sim.load_scenario(path)
+            output = root / "out"
+            sim.write_result(
+                scenario,
+                sim.Simulator(scenario, sim.RawAdapter()).run(),
+                output,
+                execution_for(path),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "experiment.jsonl").read_text().splitlines()
+            ]
+            events = [event for row in rows[1:-1] for event in row["events"]]
+            dialogue_queued = next(
+                event
+                for event in events
+                if event["logical"] == 1 and event["event"] == "dialogue-queued"
+            )
+            compile_start = next(
+                event
+                for event in events
+                if event["logical"] == 1 and event["event"] == "compile-start"
+            )
+            compile_finish = next(
+                event
+                for event in events
+                if event["logical"] == 1 and event["event"] == "compile-finish"
+            )
+            dialogue_queued["event"] = "compile-finish"
+            compile_finish["event"] = "dialogue-queued"
+            self.assertLess(dialogue_queued["time_ns"], compile_start["time_ns"])
+            self.assertEqual(
+                [event["time_ns"] for event in events],
+                sorted(event["time_ns"] for event in events),
+            )
+            candidate = output / "bad-finish-before-own-start.jsonl"
+            candidate.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            with self.assertRaisesRegex(
+                ValueError,
+                "lifecycle order requires compile-start before compile-finish",
+            ):
+                sim.validate_experiment_jsonl(candidate)
+
+    def test_v2_validator_rejects_short_and_long_tu_compile_durations(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_v2_fixture(
+                root,
+                [200_000_321, 100_000_123],
+                [15, 22],
+                workers=2,
+            )
+            scenario = sim.load_scenario(path)
+            output = root / "out"
+            sim.write_result(
+                scenario,
+                sim.Simulator(scenario, sim.RawAdapter()).run(),
+                output,
+                execution_for(path),
+            )
+            original = [
+                json.loads(line)
+                for line in (output / "experiment.jsonl").read_text().splitlines()
+            ]
+
+            def shift_finish(rows: list[dict[str, object]], delta: int) -> None:
+                events = [event for row in rows[1:-1] for event in row["events"]]
+                finish = next(
+                    event
+                    for event in events
+                    if event["logical"] == 1 and event["event"] == "compile-finish"
+                )
+                for field in ("start_ns", "end_ns", "time_ns"):
+                    finish[field] += delta
+                if delta > 0:
+                    complete = next(
+                        event
+                        for event in events
+                        if event["logical"] == 1
+                        and event["event"] == "transaction-complete"
+                    )
+                    for field in ("start_ns", "end_ns", "time_ns"):
+                        complete[field] += delta
+
+            for label, delta in (("short", -1), ("long", 1)):
+                candidate_rows = copy.deepcopy(original)
+                shift_finish(candidate_rows, delta)
+                candidate = output / f"bad-compile-duration-{label}.jsonl"
+                candidate.write_text(
+                    "".join(json.dumps(row) + "\n" for row in candidate_rows)
+                )
+                with self.subTest(label=label), self.assertRaisesRegex(
+                    ValueError, "compile duration .* differs from manifest"
+                ):
+                    sim.validate_experiment_jsonl(candidate)
+
+    def test_v2_validator_rejects_duplicate_and_skipped_terminal_events(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_v2_fixture(root, [20, 10], [15, 22], workers=2)
+            scenario = sim.load_scenario(path)
+            output = root / "out"
+            sim.write_result(
+                scenario,
+                sim.Simulator(scenario, sim.RawAdapter()).run(),
+                output,
+                execution_for(path),
+            )
+            original = [
+                json.loads(line)
+                for line in (output / "experiment.jsonl").read_text().splitlines()
+            ]
+            for label, replacement, expected_count in (
+                ("duplicate", "transaction-complete", 2),
+                ("skipped", "compiler-queued", 0),
+            ):
+                rows = copy.deepcopy(original)
+                events = [event for row in rows[1:-1] for event in row["events"]]
+                target_name = (
+                    "compiler-queued"
+                    if label == "duplicate"
+                    else "transaction-complete"
+                )
+                target = next(
+                    event
+                    for event in events
+                    if event["logical"] == 1 and event["event"] == target_name
+                )
+                target["event"] = replacement
+                candidate = output / f"bad-terminal-{label}.jsonl"
+                candidate.write_text("".join(json.dumps(row) + "\n" for row in rows))
+                with self.subTest(label=label), self.assertRaisesRegex(
+                    ValueError,
+                    rf"has {expected_count} transaction-complete events",
+                ):
+                    sim.validate_experiment_jsonl(candidate)
+
+    def test_v2_validator_accepts_cross_tu_lifecycle_interleaving(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_v2_fixture(
+                root,
+                [200_000_321, 100_000_123],
+                [15, 22],
+                workers=2,
+            )
+            scenario = sim.load_scenario(path)
+            output = root / "out"
+            result = sim.Simulator(scenario, sim.RawAdapter()).run()
+            sim.write_result(scenario, result, output, execution_for(path))
+            lifecycle = [
+                (event["logical"], event["event"])
+                for event in result.events
+                if event["event"] in {"compile-start", "compile-finish"}
+            ]
+            self.assertEqual(
+                lifecycle,
+                [
+                    (0, "compile-start"),
+                    (1, "compile-start"),
+                    (1, "compile-finish"),
+                    (0, "compile-finish"),
+                ],
+            )
+            self.assertEqual(
+                sim.validate_experiment_jsonl(output / "experiment.jsonl")["events"],
+                result.events.count,
+            )
+
     def test_v2_stream_is_identical_in_two_checkout_roots(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             parent = Path(directory)

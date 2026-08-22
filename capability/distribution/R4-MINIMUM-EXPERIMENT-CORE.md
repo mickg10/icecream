@@ -125,6 +125,20 @@ events; checks contiguous wall/active timeline records and chronological event
 containment; and proves that every v2 TU release has zero offset from its
 derived build boundary.
 
+Global chronology is not treated as a substitute for TU-local causality. The
+validator independently groups every event by TU, validates each network flow's
+queued/start/yield/resume/sent/finish state machine, and enforces two partially
+ordered lifecycle chains: release/assignment/dialogue/input-ready/compiler start/
+compiler finish, and dialogue/relationship commit/dialogue finish. Both must join
+exactly once at transaction completion, which must be that TU's final event. The
+compiler-finish timestamp minus compiler-start timestamp must equal that TU's
+manifest `compile_ns` exactly. Optional environment transfer/install/ready events
+form their own ordered sub-lifecycle and must finish before compile starts. This
+allows arbitrary cross-TU interleaving and fork/join transfer overlap without
+allowing a single TU to skip, repeat, or reverse a represented stage. `input-ready`
+is the current materialization boundary; the minimum core does not invent separate
+source decode/install CPU stages that the simulator does not yet model.
+
 ## Assignment replay
 
 `topology.assignment_source=route_trace` requires a complete physical trace.

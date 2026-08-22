@@ -5190,6 +5190,228 @@ def write_route_trace(
             output.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
 
 
+def _validate_tu_lifecycle(
+    path: Path,
+    key: tuple[str, int, int],
+    events: Sequence[Mapping[str, object]],
+    expected_compile_ns: int,
+    expected_route_bindings: int,
+) -> None:
+    """Validate one TU's represented lifecycle independently of global ordering.
+
+    Transactions are intentionally a partial order: a fork/join codec may make the
+    compiler input visible before its final relationship commit.  The two legal chains
+    join only at ``transaction-complete``::
+
+        release -> [route-bound] -> dispatch -> dialogue-start
+              dialogue-start -> input-ready -> compile-start -> compile-finish --+
+              dialogue-start -> transaction-commit -> dialogue-finish -----------+-> complete
+
+    Source-flow and optional environment-install events are validated as subordinate
+    state machines.  This keeps cross-TU interleaving legal while rejecting a globally
+    chronological stream whose events are impossible for one particular TU.
+    """
+    by_name: dict[str, list[Mapping[str, object]]] = defaultdict(list)
+    for event in events:
+        by_name[str(event["event"])].append(event)
+
+    required_once = (
+        "release",
+        "dispatch",
+        "dialogue-start",
+        "input-ready",
+        "compile-start",
+        "compile-finish",
+        "transaction-commit",
+        "dialogue-finish",
+        "transaction-complete",
+    )
+    for name in required_once:
+        count = len(by_name[name])
+        if count != 1:
+            raise ValueError(f"{path}: TU {key} has {count} {name} events")
+    if len(by_name["route-bound"]) != expected_route_bindings:
+        raise ValueError(
+            f"{path}: TU {key} route-binding count differs from routing mode"
+        )
+
+    def only(name: str) -> Mapping[str, object]:
+        return by_name[name][0]
+
+    def require_before(left: str, right: str) -> None:
+        if int(only(left)["sequence"]) >= int(only(right)["sequence"]):
+            raise ValueError(
+                f"{path}: TU {key} lifecycle order requires {left} before {right}"
+            )
+
+    if str(events[0]["event"]) != "release":
+        raise ValueError(f"{path}: TU {key} lifecycle does not begin with release")
+    if str(events[-1]["event"]) != "transaction-complete":
+        raise ValueError(
+            f"{path}: TU {key} lifecycle does not end with transaction-complete"
+        )
+    for name in required_once:
+        if only(name)["transition"] != "instant":
+            raise ValueError(f"{path}: TU {key} {name} transition is not instant")
+
+    if expected_route_bindings:
+        require_before("release", "route-bound")
+        require_before("route-bound", "dispatch")
+    else:
+        require_before("release", "dispatch")
+    require_before("dispatch", "dialogue-start")
+    require_before("dialogue-start", "input-ready")
+    require_before("input-ready", "compile-start")
+    require_before("compile-start", "compile-finish")
+    require_before("compile-finish", "transaction-complete")
+    require_before("dialogue-start", "transaction-commit")
+    require_before("transaction-commit", "dialogue-finish")
+    require_before("dialogue-finish", "transaction-complete")
+
+    compile_start_ns = int(only("compile-start")["time_ns"])
+    compile_finish_ns = int(only("compile-finish")["time_ns"])
+    observed_compile_ns = compile_finish_ns - compile_start_ns
+    if observed_compile_ns != expected_compile_ns:
+        raise ValueError(
+            f"{path}: TU {key} compile duration {observed_compile_ns} differs "
+            f"from manifest {expected_compile_ns}"
+        )
+
+    dialogue_queued = by_name["dialogue-queued"]
+    if len(dialogue_queued) > 1:
+        raise ValueError(f"{path}: TU {key} dialogue was queued more than once")
+    if dialogue_queued:
+        queued_sequence = int(dialogue_queued[0]["sequence"])
+        if not (
+            int(only("dispatch")["sequence"])
+            < queued_sequence
+            < int(only("dialogue-start")["sequence"])
+        ):
+            raise ValueError(f"{path}: TU {key} dialogue queue event is out of order")
+
+    input_sequence = int(only("input-ready")["sequence"])
+    compile_start_sequence = int(only("compile-start")["sequence"])
+    if any(
+        not (input_sequence < int(event["sequence"]) < compile_start_sequence)
+        for event in by_name["compiler-queued"]
+    ):
+        raise ValueError(f"{path}: TU {key} compiler queue event is out of order")
+
+    await_commit = by_name["compile-await-commit"]
+    if len(await_commit) > 1:
+        raise ValueError(f"{path}: TU {key} waited for commit more than once")
+    if await_commit:
+        await_sequence = int(await_commit[0]["sequence"])
+        if not (
+            int(only("compile-finish")["sequence"])
+            < await_sequence
+            < int(only("transaction-commit")["sequence"])
+        ):
+            raise ValueError(f"{path}: TU {key} commit wait event is out of order")
+
+    flow_states: dict[int, str] = {}
+    dispatch_sequence = int(only("dispatch")["sequence"])
+    dialogue_start_sequence = int(only("dialogue-start")["sequence"])
+    compile_finish_sequence = int(only("compile-finish")["sequence"])
+    flow_transitions = {
+        "flow-queued": (None, "queued"),
+        "flow-start": ("queued", "active"),
+        "flow-yield": ("active", "yielded"),
+        "flow-resume": ("yielded", "active"),
+        "flow-sent": ("active", "sent"),
+        "flow-finish": ("sent", "finished"),
+    }
+    for event in events:
+        event_name = str(event["event"])
+        transition = flow_transitions.get(event_name)
+        if transition is None:
+            continue
+        flow = event["flow"]
+        if not isinstance(flow, int) or isinstance(flow, bool):
+            raise ValueError(f"{path}: TU {key} {event_name} has no flow identity")
+        event_sequence = int(event["sequence"])
+        if event_sequence <= dispatch_sequence:
+            raise ValueError(f"{path}: TU {key} flow began before assignment")
+        if (
+            event["byte_account"] == "source"
+            and event_sequence <= dialogue_start_sequence
+        ):
+            raise ValueError(f"{path}: TU {key} source flow began before its dialogue")
+        if (
+            event["byte_account"] == "result"
+            and event_sequence <= compile_finish_sequence
+        ):
+            raise ValueError(
+                f"{path}: TU {key} result flow began before compile finish"
+            )
+        required_state, next_state = transition
+        current_state = flow_states.get(flow)
+        if current_state != required_state:
+            raise ValueError(
+                f"{path}: TU {key} flow {flow} cannot enter {event_name} "
+                f"from {current_state or 'new'}"
+            )
+        flow_states[flow] = next_state
+    unfinished_flows = sorted(
+        flow for flow, state in flow_states.items() if state != "finished"
+    )
+    if unfinished_flows:
+        raise ValueError(
+            f"{path}: TU {key} flow lifecycle is incomplete for {unfinished_flows[:1]}"
+        )
+
+    environment_names = {
+        "env_transfer",
+        "env_install_verify",
+        "environment_ready",
+    }
+    if any(by_name[name] for name in environment_names):
+        transfer_start = [
+            event for event in by_name["env_transfer"] if event["transition"] == "start"
+        ]
+        transfer_finish = [
+            event
+            for event in by_name["env_transfer"]
+            if event["transition"] == "finish"
+        ]
+        install_start = [
+            event
+            for event in by_name["env_install_verify"]
+            if event["transition"] == "start"
+        ]
+        install_finish = [
+            event
+            for event in by_name["env_install_verify"]
+            if event["transition"] == "finish"
+        ]
+        ready = by_name["environment_ready"]
+        if not all(
+            len(group) == 1
+            for group in (
+                transfer_start,
+                transfer_finish,
+                install_start,
+                install_finish,
+                ready,
+            )
+        ):
+            raise ValueError(f"{path}: TU {key} environment lifecycle is incomplete")
+        environment_order = (
+            only("dispatch"),
+            transfer_start[0],
+            transfer_finish[0],
+            install_start[0],
+            install_finish[0],
+            ready[0],
+            only("compile-start"),
+        )
+        if any(
+            int(left["sequence"]) >= int(right["sequence"])
+            for left, right in zip(environment_order, environment_order[1:])
+        ):
+            raise ValueError(f"{path}: TU {key} environment lifecycle is out of order")
+
+
 def validate_experiment_jsonl(path: Path) -> dict[str, int]:
     """Independently replay every v2 identity and accounting claim in a stream."""
     rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
@@ -5543,8 +5765,8 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
     transaction_digests: dict[tuple[str, str], tuple[object, object]] = {}
     dispatches_by_route: dict[tuple[int, int], int] = defaultdict(int)
     assignment_counts: dict[tuple[int, str, int], int] = defaultdict(int)
-    lifecycle_counts: dict[tuple[str, int, int], dict[str, int]] = defaultdict(
-        lambda: defaultdict(int)
+    lifecycle_events: dict[tuple[str, int, int], list[Mapping[str, object]]] = (
+        defaultdict(list)
     )
     release_times: dict[tuple[str, int, int], int] = {}
     completion_times: dict[tuple[str, int, int], int] = {}
@@ -5635,7 +5857,7 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
                 or event["attempt_id"] != f"{expected_logical_job_id}:attempt-0"
             ):
                 raise ValueError(f"{path}: event logical/attempt identity differs")
-            lifecycle_counts[tu_key][event["event"]] += 1
+            lifecycle_events[tu_key].append(event)
             if not isinstance(event["TU_SEQ"], int):
                 raise ValueError(f"{path}: TU event lacks TU_SEQ")
             established_tu_seq = tu_sequences.setdefault(tu_key, event["TU_SEQ"])
@@ -5894,28 +6116,19 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
             "queue",
         )
     expected_tu_keys = set(expected_tus)
-    if set(lifecycle_counts) != expected_tu_keys:
+    if set(lifecycle_events) != expected_tu_keys:
         raise ValueError(f"{path}: event TU set differs from workload manifest")
-    required_lifecycle = (
-        "release",
-        "dispatch",
-        "compile-start",
-        "compile-finish",
-        "transaction-commit",
-        "transaction-complete",
-    )
     for key in sorted(expected_tu_keys):
-        counts = lifecycle_counts[key]
-        for name in required_lifecycle:
-            if counts.get(name, 0) != 1:
-                raise ValueError(
-                    f"{path}: TU {key} has {counts.get(name, 0)} {name} events"
-                )
         expected_route_bindings = 1 if expected_binding == "release-time-static" else 0
-        if counts.get("route-bound", 0) != expected_route_bindings:
-            raise ValueError(
-                f"{path}: TU {key} route-binding count differs from routing mode"
-            )
+        content = expected_tus[key]["content"]
+        assert isinstance(content, dict)
+        _validate_tu_lifecycle(
+            path,
+            key,
+            lifecycle_events[key],
+            int(content["compile_ns"]),
+            expected_route_bindings,
+        )
     if (
         set(release_times) != expected_tu_keys
         or set(completion_times) != expected_tu_keys
