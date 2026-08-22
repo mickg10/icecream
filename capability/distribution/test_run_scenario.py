@@ -1296,6 +1296,25 @@ class SimulatorTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "schema error"):
                 sim.validate_json_schema(document, "experiment.schema.json", "bad-mode")
 
+    def test_retained_r4_sample_validates_and_replays(self) -> None:
+        root = MODULE_PATH.parent / "samples" / "r4-minimum"
+        scenario = sim.load_scenario(root / "experiment.json")
+        execution = sim.load_execution(
+            root / "execution.json", scenario.scenario_digest
+        )
+        self.assertEqual(execution["mode"], "simulated")
+        result = sim.Simulator(scenario, sim.RawAdapter()).run()
+        self.assertEqual(result.summary["replay_closure"]["semantics"], "exact-route")
+        self.assertEqual(result.summary["scored_outgoing_bytes"], 37)
+        self.assertEqual(
+            sim.validate_experiment_jsonl(root / "sample-experiment.jsonl"),
+            {"events": 30, "c_to_f_bytes": 37, "f_to_c_bytes": 0},
+        )
+        self.assertEqual(
+            sim.sha256(root / "sample-experiment.jsonl"),
+            "93794082090c3c7180b7b0b548da577ccf912d76e21b96e9c6e6ab45e3cabce9",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,88 @@
+{
+  "schema": "icecream-experiment-v2",
+  "name": "r4-minimum-route-replay-fixture",
+  "seed": 16,
+  "components": {
+    "scheduler": {
+      "release": "1.5.90",
+      "main_protocol": 50,
+      "commit": "bd62cf81224ce5ba69ea27bb0e19beb930a6ecf2"
+    },
+    "wrapper": {
+      "release": "1.5.90",
+      "main_protocol": 50,
+      "commit": "bd62cf81224ce5ba69ea27bb0e19beb930a6ecf2"
+    },
+    "c_daemon": {
+      "release": "1.5.90",
+      "main_protocol": 50,
+      "commit": "bd62cf81224ce5ba69ea27bb0e19beb930a6ecf2"
+    },
+    "f_daemon": {
+      "release": "1.5.90",
+      "main_protocol": 50,
+      "commit": "bd62cf81224ce5ba69ea27bb0e19beb930a6ecf2"
+    }
+  },
+  "capabilities": {
+    "cache_wire": "v1",
+    "codec_profile": "legacy",
+    "experiment_control": "raw"
+  },
+  "topology": {
+    "c_count": 1,
+    "f_count": 2,
+    "f_slots": 2,
+    "input_staging_slots": 2,
+    "bandwidth": {
+      "c_to_f": {
+        "bits_per_second": 1000000000,
+        "one_way_latency_ns": 250000,
+        "lanes_per_endpoint": 1
+      },
+      "f_to_c": {
+        "bits_per_second": 1000000000,
+        "one_way_latency_ns": 250000,
+        "lanes_per_endpoint": 1
+      },
+      "shared_fabric_bps": 1000000000
+    },
+    "scheduler_policy": "round_robin",
+    "assignment_source": "route_trace",
+    "route_trace": "input-route-trace.jsonl"
+  },
+  "workload": {
+    "release_policy": "all_at_once",
+    "jobs": [
+      {
+        "id": "fixture",
+        "c_index": 0,
+        "trace": "trace.tsv",
+        "corpus_root": ".",
+        "manifest_digest": "78a817af7897241cd90f54201db539967f8250ecabbe03bcbf480d00148e9d8d",
+        "compile_profile": "r4-fixture-compiler",
+        "build_epochs": 1,
+        "build_release": {
+          "mode": "after-previous"
+        }
+      }
+    ]
+  },
+  "environment": {
+    "initial_state": "resident",
+    "image_digest": "2222222222222222222222222222222222222222222222222222222222222222",
+    "transfer_bytes": 4096,
+    "install_verify_ns": 1000000
+  },
+  "cache": {
+    "initial_state": "cold",
+    "capacity_bytes": 1048576,
+    "lifecycle_events": []
+  },
+  "expected": {
+    "selected_main_protocol": 50,
+    "selected_cache_wire": "v1",
+    "selected_codec_profile": "legacy",
+    "compile_result": "pass"
+  }
+}

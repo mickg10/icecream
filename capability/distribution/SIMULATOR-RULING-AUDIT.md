@@ -25,11 +25,14 @@ Producer timing is not part of this model.
 | 1 | static stable/dense routing with exact P29/GRZ bytes | Physical ledgers were exact, but their route map came only from a compile-only dynamic assignment. The schema named `rendezvous` without implementing it. | Complete. A stable compile identity is bound to one F inside a configurable dense home frontier. Both physical builders consume that route map, and replay refuses drift. The real-codec smoke and the full corrected Firefox round-robin/`k1`/`k2`/`k3`/`k4`/`k8`/`k20` sweep pass. See `FIREFOX-STATIC-ROUTING-SWEEP-RESULTS.md`. |
 | 2 | F decode/install/materialize/verify and compiler-pipe stages | Missing. P29 close delivery and GRZ frame delivery immediately meant input ready. | Still missing; this is the next simulator implementation slice after the exact width sweep. |
 | 3 | compiled-result return traffic | Missing. | Still missing. Add measured per-TU result bytes only after the F input stages are explicit. |
-| 4 | optional `ENV_ENSURE` | Missing, and the primary rows correctly assume resident environments. | Still missing. It remains an optional single-flight stress row and its bytes must stay separate from source bytes. |
+| 4 | optional `ENV_ENSURE` | Missing, and the primary rows correctly assume resident environments. | Complete in the additive R4 minimum experiment core. Primary rows remain resident. The explicit absent-environment stress path is single-flight per C/F route, overlaps input traffic, gates compile on environment plus input readiness, and keeps environment bytes outside the source score. |
 | 5 | restart, eviction, and reroute | Missing. | Still missing. Add only after stable routing and explicit F stages close. |
 
-The implementation intentionally stops at the earliest missing slice. It does not introduce
-an online receiver-state selector, a spill heuristic, environment traffic, or restart behavior.
+The static-routing branch originally stopped at the earliest missing slice. The later R4 minimum
+experiment-core work freezes the mode-neutral manifest, execution header, identity/accounting
+fields, replay closure, and explicit environment stress path without claiming that ordered F
+stage item 2 or result-return item 3 is complete. It does not introduce an online receiver-state
+selector, a spill heuristic, or restart behavior.
 
 ## Static routing contract
 

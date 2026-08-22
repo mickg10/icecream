@@ -4,6 +4,11 @@ One scenario document owns the workload, C/F topology, timing, network and sched
 GRZ and P29 are codec adapters beneath that common experiment; they do not own separate
 scheduler simulations.
 
+[`R4-MINIMUM-EXPERIMENT-CORE.md`](R4-MINIMUM-EXPERIMENT-CORE.md) freezes the additive
+`icecream-experiment-v2` mode-neutral manifest, separate execution header, M3 event identity,
+exact directional/resource ledgers, resident/explicit environment behavior, and physical
+route-trace versus policy-only replay closure. Existing v1 scenarios remain supported.
+
 [`ICECREAM-REAL-TRANSFER-ARCHITECTURE.md`](ICECREAM-REAL-TRANSFER-ARCHITECTURE.md)
 maps the simulator onto the actual C client, C/F daemons, persistent stores, per-job TCP
 connections, A/Need/Fill dialogue, and compiler stdin pipe.

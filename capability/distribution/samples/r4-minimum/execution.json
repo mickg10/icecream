@@ -1,0 +1,26 @@
+{
+  "schema": "icecream-execution-v2",
+  "scenario_digest": "fea4a8cf61c0286bbbc3f3a2ff1f54a20d50b78b9fea4b088881aa14933f49a7",
+  "mode": "simulated",
+  "runner_commit": "bd62cf81224ce5ba69ea27bb0e19beb930a6ecf2",
+  "host_manifest": "594d5ddd35aedb47f00d9c34d140017907a5b9f93c975aba125fc924daac5c07",
+  "started_at": "2026-08-22T00:43:03-04:00",
+  "source_commit": "bd62cf81224ce5ba69ea27bb0e19beb930a6ecf2",
+  "simulator_commit": "bd62cf81224ce5ba69ea27bb0e19beb930a6ecf2",
+  "codec_executable_digest": "417fbf69c87af3f58465b1d442e4fe2f1e067987621a058e90f8a7de7593696a",
+  "input_manifest_digests": [
+    "78a817af7897241cd90f54201db539967f8250ecabbe03bcbf480d00148e9d8d"
+  ],
+  "image_identifiers": [
+    "resident-fixture@sha256:2222222222222222222222222222222222222222222222222222222222222222"
+  ],
+  "compiler_versions": [
+    "r4-fixture-compiler (modeled)"
+  ],
+  "library_versions": [
+    "python-jsonschema 4.26.0"
+  ],
+  "host_identities": [
+    "retained-r4-fixture"
+  ]
+}
