@@ -79,10 +79,13 @@ dnf_cmd -y makecache
 
 dnf_cmd -y install \
     asciidoc \
+    boost-devel \
     ca-certificates \
     dnf-plugins-core \
     libarchive-devel \
+    lzo-devel \
     libzstd-devel \
+    xxhash-devel \
     rpm-build \
     rpmdevtools \
     git \
@@ -107,6 +110,9 @@ dnf_cmd -y install \
 # Version metadata comes from the COMMITTED revision -- a local
 # configure.ac edit must not relabel committed source.
 SRC_REV=$(git -c "safe.directory=$SRC_DIR" -C "$SRC_DIR" rev-parse HEAD)
+BUILD_REQUIREMENTS="$(git -c "safe.directory=$SRC_DIR" -C "$SRC_DIR" show \
+    "$SRC_REV:package_builder/probe_build_requirements.sh" | bash)"
+echo "$BUILD_REQUIREMENTS"
 git -c "safe.directory=$SRC_DIR" -C "$SRC_DIR" show "$SRC_REV:configure.ac" > ./configure.ac.committed
 UPSTREAM_VERSION="$(parse_upstream_version ./configure.ac.committed)"
 
@@ -187,11 +193,13 @@ trap 'rm -rf "$STAGE"' EXIT
 # tree could ship stale generated files and host-built executables.
 # Bootstrapping at staging time also serves build roots whose own
 # Autotools are too old to bootstrap (Fedora 28).
+RELEASE_TARBALL_SHA256="git-${SRC_REV}"
 if [ -n "${RELEASE_TARBALL:-}" ]; then
     # THE release artifact (single Source0 across all distributions).
     ( cd "$(dirname "$RELEASE_TARBALL")" \
         && sha256sum -c --status "$(basename "$RELEASE_TARBALL").sha256" ) \
         || { echo "ERROR: release tarball digest mismatch" >&2; exit 1; }
+    RELEASE_TARBALL_SHA256="$(sha256sum "$RELEASE_TARBALL" | cut -d" " -f1)"
     mkdir "$STAGE/extract-src"
     tar -C "$STAGE/extract-src" -xf "$RELEASE_TARBALL"
     mv "$STAGE"/extract-src/icecream-* "$STAGE/icecream-${UPSTREAM_VERSION}"
@@ -221,6 +229,8 @@ find "${HOME}/rpmbuild/RPMS" "${HOME}/rpmbuild/SRPMS" -type f -name '*.rpm' -pri
     echo "revision=$SRC_REV"
     echo "version=$UPSTREAM_VERSION"
     echo "builder=$(basename "$(cd "$(dirname "$0")" && pwd)")-$(. /etc/os-release; echo "$ID-$VERSION_ID")"
+    echo "release_tarball_sha256=$RELEASE_TARBALL_SHA256"
+    echo "$BUILD_REQUIREMENTS"
     echo "source0_sha256=$(sha256sum "$SOURCE0_PATH" | cut -d" " -f1)"
     while IFS= read -r f; do
         echo "sha256 $f=$(sha256sum "$OUT_DIR/$f" | cut -d" " -f1)"

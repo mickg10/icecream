@@ -20,6 +20,20 @@ Outputs are written to each builder directory's `out/` folder.
 - The verifiers prove the *services*, not just an object file: process
   liveness, scheduler registration, and the compile reaching the scheduler
   (`NEW <id> client=`), with logs dumped on failure.
+- Supported builders explicitly install the current product baseline instead
+  of assuming the distro's historical `icecc` build dependencies are still
+  sufficient: C++23, Boost 1.74 or newer, xxHash, Zstd, LZO, and libarchive.
+  Before source staging, the committed `probe_build_requirements.sh` compiles,
+  links, and runs a small feature probe. Its compiler and library versions are
+  written to `manifest.meta` beside the package digests.
+- When `RELEASE_TARBALL` is set, every supported builder verifies its sidecar
+  digest and records the same `release_tarball_sha256` in `manifest.meta`.
+
+The deletion-sensitive package contract can be checked without a container:
+
+```bash
+./package_builder/test-build-requirements.sh
+```
 
 ## Proxies / TLS
 
@@ -53,14 +67,12 @@ docker compose run --rm --build verify
 ls -lh out/
 ```
 
-## Fedora 28 (rpm)
+## Fedora 28 (unsupported)
 
-```bash
-cd package_builder/fedora28
-docker compose run --rm --build rpm
-docker compose run --rm --build verify
-ls -lh out/
-```
+Fedora 28's archived repositories provide GCC 8 and Boost 1.66. They cannot
+satisfy this line's C++23 and Boost 1.74 baseline. Both the build and verify
+commands therefore refuse deterministically with exit status 78; the builder
+does not download an unpinned replacement toolchain.
 
 ## Fedora (latest) (rpm)
 

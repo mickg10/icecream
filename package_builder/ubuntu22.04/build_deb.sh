@@ -82,7 +82,12 @@ apt-get install -y --no-install-recommends \
     git \
     autoconf \
     automake \
+    libarchive-dev \
+    libboost-dev \
     libtool \
+    liblzo2-dev \
+    libxxhash-dev \
+    libzstd-dev \
     rsync \
     xmlto \
     build-essential
@@ -92,6 +97,9 @@ apt-get build-dep -y icecc
 # Version metadata comes from the COMMITTED revision -- a local
 # configure.ac edit must not relabel committed source.
 SRC_REV=$(git -c "safe.directory=$SRC_DIR" -C "$SRC_DIR" rev-parse HEAD)
+BUILD_REQUIREMENTS="$(git -c "safe.directory=$SRC_DIR" -C "$SRC_DIR" show \
+    "$SRC_REV:package_builder/probe_build_requirements.sh" | bash)"
+echo "$BUILD_REQUIREMENTS"
 git -c "safe.directory=$SRC_DIR" -C "$SRC_DIR" show "$SRC_REV:configure.ac" > ./configure.ac.committed
 UPSTREAM_VERSION="$(parse_upstream_version ./configure.ac.committed)"
 DEB_VERSION="${UPSTREAM_VERSION}-0obs1~${DEB_DIST}1"
@@ -125,12 +133,14 @@ fi
 rm -rf ./debian-packaging
 mv "$NEW_DIR/debian" ./debian-packaging
 rm -rf "$NEW_DIR"
+RELEASE_TARBALL_SHA256="git-${SRC_REV}"
 if [ -n "${RELEASE_TARBALL:-}" ]; then
     # THE release artifact: every distribution builds from this exact
     # bootstrapped tree (single Source0; see make_release_tarball.sh).
     ( cd "$(dirname "$RELEASE_TARBALL")" \
         && sha256sum -c --status "$(basename "$RELEASE_TARBALL").sha256" ) \
         || { echo "ERROR: release tarball digest mismatch" >&2; exit 1; }
+    RELEASE_TARBALL_SHA256="$(sha256sum "$RELEASE_TARBALL" | cut -d" " -f1)"
     mkdir extract-src
     tar -C extract-src -xf "$RELEASE_TARBALL"
     mv extract-src/icecream-* "$NEW_DIR"
@@ -164,6 +174,8 @@ cp -av ./*.deb ./*.ddeb ./*.changes ./*.buildinfo "$OUT_DIR"/ 2>/dev/null || tru
     echo "revision=$SRC_REV"
     echo "version=$UPSTREAM_VERSION"
     echo "builder=$(basename "$(cd "$(dirname "$0")" && pwd)")-$(. /etc/os-release; echo "$ID-$VERSION_ID")"
+    echo "release_tarball_sha256=$RELEASE_TARBALL_SHA256"
+    echo "$BUILD_REQUIREMENTS"
     while IFS= read -r f; do
         echo "sha256 $f=$(sha256sum "$OUT_DIR/$f" | cut -d" " -f1)"
     done < "$OUT_DIR/manifest.txt"
