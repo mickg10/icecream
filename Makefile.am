@@ -13,7 +13,9 @@ EXTRA_DIST = README.md \
 	tests/compose \
 	tests/stress \
 	tests/webgui \
-	capability/grouprlz/p29_online_s1.h
+	capability/grouprlz/p29_online_s1.h \
+	capability/grouprlz/runway-census.tsv \
+	capability/distribution/firefox-corrected.compile-trace.tsv
 
 ACLOCAL_AMFLAGS = -I m4
 AM_LIBTOOLFLAGS = --silent

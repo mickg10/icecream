@@ -25,10 +25,18 @@ Git merge base, so every imported layer is recorded explicitly.
   `64f58600f3b4b36ad539a214b5754767cdef58a9`. This remains the final product layer so a
   reviewed replacement can be replayed from the preceding convergence commit.
 
-The M1 core consumes the header-only OnlineS1 implementation. The destination did not contain
-the research tree, so only
-`capability/grouprlz/p29_online_s1.h` was copied from the accepted M0/M1 tree. Its Git blob is
-`bde2fcc10e0892476f1f1954b1a02e7b6ea0690c`; no other research harness was transplanted.
+The M1 core consumes the header-only OnlineS1 implementation, and the M0 layout census reads
+two retained measurement inputs. The destination did not contain the research tree, so only
+these three required data/code artifacts were copied from the accepted M0/M1 tree:
+
+- `capability/grouprlz/p29_online_s1.h`, blob
+  `bde2fcc10e0892476f1f1954b1a02e7b6ea0690c`;
+- `capability/grouprlz/runway-census.tsv`, blob
+  `b333fbd8a83bf8580f8ffa9acc21b5d5d2602cfa`;
+- `capability/distribution/firefox-corrected.compile-trace.tsv`, blob
+  `46de69faa54bd7d565d40e72907d62549f9c9c8b`.
+
+No simulator code or broader research harness was transplanted.
 
 ## Baseline handling and conflict resolutions
 
@@ -41,10 +49,9 @@ xxHash dependency probe to that existing baseline.
 All textual conflicts were build-list or package-list unions:
 
 - Top-level `Makefile.am` retains every P48 document, package tool, web GUI test, stress test,
-  and compose test. It adds the `cache` subdirectory, the one OnlineS1 header needed by M1,
-  and the Protocol-50 formal target. Distribution-simulator inputs and the simulator-wide
-  `integration_tests` target were omitted because those files do not exist in the P48 tree and
-  are not part of this product transplant.
+  and compose test. It adds the `cache` subdirectory, the three exact inputs required by M0/M1,
+  and the Protocol-50 formal target. The simulator-wide `integration_tests` target and all
+  simulator code were omitted because they are not part of this product transplant.
 - `README` retains the P48 Boost 1.74 requirement and adds the M0 xxHash requirement and
   standard override instructions.
 - `unittests/Makefile.am` keeps every P48 scheduler/daemon/web GUI-adjacent gate and its
