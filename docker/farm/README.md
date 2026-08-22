@@ -245,11 +245,15 @@ Preflight verifies, for every selected host:
 - pinned portable content fingerprints for the node runtime and build-environment images, retaining
   each engine's native image ID as provenance
 - absence of every exact deterministic container name before launch
+- absence of listeners only on ports opened by the plan: scheduler/control and F worker ports;
+  submit-only C daemons do not reserve a listening port
 
 No readiness check is a fixed sleep. Container health and controller readiness both issue `listcs`
 and `quit` over the scheduler's line-oriented control port; they never make an unframed connection
 to the binary daemon port. Launch then requires every C/F node name together with its exact planned
-LAN address and port to appear in `listcs`.
+LAN address and registration port to appear in `listcs`. Each `--no-remote` C daemon must register
+with port `0`; each F must register its exact planned listening port. A C daemon reported at an
+unused nominal port such as `14000` does not satisfy readiness.
 
 ## Scenario entrypoints
 

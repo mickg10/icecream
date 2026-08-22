@@ -221,7 +221,12 @@ class PlanTests(unittest.TestCase):
             ["nas642", "nas642"],
         )
         self.assertEqual(len(plan["submitters"]), 2)
-        self.assertEqual({item["port"] for item in plan["submitters"]}, {14000, 14001})
+        self.assertEqual(
+            {item["registration_port"] for item in plan["submitters"]}, {0}
+        )
+        self.assertTrue(
+            all(not item["accepts_remote_jobs"] for item in plan["submitters"])
+        )
 
     def test_compose_is_per_host_and_host_networked(self):
         plan = self.plan("c1f2")
@@ -245,6 +250,7 @@ class PlanTests(unittest.TestCase):
         self.assertIn("/corpus", c_mounts)
         self.assertNotIn("/workspace", f_mounts)
         scheduler_command = nas["services"]["scheduler"]["command"]
+        submitter_command = nas["services"]["c00"]["command"]
         self.assertEqual(nas["services"]["scheduler"]["entrypoint"], ["/bin/sh", "-ec"])
         self.assertIn("chown 65534:65534 /farm/results", scheduler_command[0])
         self.assertIn("exec /opt/icecream/sbin/icecc-scheduler \"$@\"", scheduler_command[0])
@@ -268,19 +274,52 @@ class PlanTests(unittest.TestCase):
             self.assertIn("200 done", health)
             self.assertNotIn("nc -z", health)
         self.assertEqual(scheduler_command[scheduler_command.index("-u") + 1], "nobody")
+        self.assertIn("--no-remote", submitter_command)
+        self.assertNotIn("-p", submitter_command)
+        self.assertNotIn("14000", submitter_command)
+        self.assertEqual(
+            farm.required_listener_ports(self.manifest, plan, "nas642"),
+            [8765, 8766],
+        )
+
+        q2_submitter = self.plan("c1f1", "local_56_q2_submitter")
+        self.assertEqual(
+            farm.required_listener_ports(self.manifest, q2_submitter, "quietbox2"),
+            [],
+        )
 
     def test_cluster_registration_requires_exact_planned_endpoint(self):
-        plan = self.plan("c1f2")
-        expected = farm.expected_registrations(self.manifest, plan)
-        exact_snapshot = "\n".join(f" {item} []" for item in expected)
+        plan = self.plan("c1f1")
+        retained_snapshot = (
+            " c-nas642-00 (10.0.27.127:0) [x86_64] "
+            "speed=0.00 jobs=0/0 load=408\n"
+            " f-quietbox2-00 (10.0.27.212:12000) [x86_64] "
+            "speed=0.00 jobs=0/1 load=1000\n"
+            "200 done\n"
+        )
         self.assertEqual(
-            farm.missing_registrations(self.manifest, plan, exact_snapshot), []
+            farm.expected_registrations(self.manifest, plan),
+            [
+                "c-nas642-00 (10.0.27.127:0)",
+                "f-quietbox2-00 (10.0.27.212:12000)",
+            ],
         )
-        wrong_endpoint = exact_snapshot.replace(
-            "10.0.27.212:12000", "10.0.27.212:12999"
+        self.assertEqual(
+            farm.missing_registrations(self.manifest, plan, retained_snapshot), []
         )
-        missing = farm.missing_registrations(self.manifest, plan, wrong_endpoint)
-        self.assertEqual(missing, ["f-quietbox2-00 (10.0.27.212:12000)"])
+        misleading_submitter_port = (
+            " c-nas642-00 (10.0.27.127:14000) [x86_64] "
+            "speed=0.00 jobs=0/0 load=408\n"
+            " f-quietbox2-00 (10.0.27.212:12000) [x86_64] "
+            "speed=0.00 jobs=0/1 load=1000\n"
+            "200 done\n"
+        )
+        self.assertEqual(
+            farm.missing_registrations(
+                self.manifest, plan, misleading_submitter_port
+            ),
+            ["c-nas642-00 (10.0.27.127:0)"],
+        )
 
     def test_planned_container_collision_is_a_preflight_error(self):
         runner = mock.MagicMock()
@@ -356,7 +395,7 @@ class PlanTests(unittest.TestCase):
         connection.recv.side_effect = [
             b"200-ICECC 1.4.90: 0s uptime\n200 Use 'help'",
             b" for help and 'quit' to quit.\n",
-            b" c-nas642-00 (10.0.27.127:14000) []\n",
+            b" c-nas642-00 (10.0.27.127:0) []\n",
             b" f-quietbox2-00 (10.0.27.212:12000) []\n200 done\n",
         ]
         with mock.patch.object(farm.socket, "create_connection", return_value=connection) as connect:

@@ -9,8 +9,7 @@
     ],
     "scheduler_port": 8765,
     "scheduler_control_port": 8766,
-    "worker_port_base": 12000,
-    "submitter_port_base": 14000
+    "worker_port_base": 12000
   },
   "scheduler_host": "nas642",
   "wan_hosts": [],

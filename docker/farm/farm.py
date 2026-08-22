@@ -150,7 +150,6 @@ def validate_manifest(manifest: Mapping[str, Any]) -> None:
             "scheduler_port",
             "scheduler_control_port",
             "worker_port_base",
-            "submitter_port_base",
         )
     }
     if any(not isinstance(value, int) or value < 1024 or value > 65535
@@ -400,7 +399,8 @@ def build_plan(manifest: Mapping[str, Any], profile_name: str, scenario_name: st
                 "host": host_name,
                 "ordinal": ordinal,
                 "host_index": host_index,
-                "port": network["submitter_port_base"] + host_index,
+                "accepts_remote_jobs": False,
+                "registration_port": 0,
                 "node_name": f"c-{host_name}-{host_index:02d}",
                 "service": f"c{ordinal:02d}",
                 "container": f"icefarm-{run_id}-c{ordinal:02d}",
@@ -465,8 +465,26 @@ def expected_registrations(manifest: Mapping[str, Any],
     result = []
     for record in [*plan["submitters"], *plan["workers"]]:
         address = manifest["hosts"][record["host"]]["address"]
-        result.append(f"{record['node_name']} ({address}:{record['port']})")
+        port = (
+            record["registration_port"]
+            if record["role"] == "submitter"
+            else record["port"]
+        )
+        result.append(f"{record['node_name']} ({address}:{port})")
     return result
+
+
+def required_listener_ports(manifest: Mapping[str, Any],
+                            plan: Mapping[str, Any], host_name: str) -> list[int]:
+    """Return only ports opened by services in this plan on one host."""
+    ports = {
+        record["port"]
+        for record in records_for_host(plan, host_name)
+        if record["role"] in {"scheduler", "worker"}
+    }
+    if plan["scheduler"]["host"] == host_name:
+        ports.add(manifest["network"]["scheduler_control_port"])
+    return sorted(ports)
 
 
 def missing_registrations(manifest: Mapping[str, Any], plan: Mapping[str, Any],
@@ -792,16 +810,14 @@ def inspect_host(manifest: Mapping[str, Any], plan: Mapping[str, Any],
     if route_error:
         report["errors"].append(route_error)
 
-    selected_ports = {record["port"] for record in records_for_host(plan, host_name)}
-    if "scheduler" in roles:
-        selected_ports.add(manifest["network"]["scheduler_control_port"])
+    selected_ports = required_listener_ports(manifest, plan, host_name)
     listeners = runner.run(["ss", "-H", "-ltn"], timeout=10)
     listener_lines = listeners.stdout.decode("utf-8", "replace").splitlines()
     occupied: dict[int, list[str]] = {}
     if listeners.returncode != 0:
         report["errors"].append("cannot inspect existing TCP listeners")
     else:
-        for port in sorted(selected_ports):
+        for port in selected_ports:
             matching = [
                 line for line in listener_lines
                 if any(token.rsplit(":", 1)[-1] == str(port) for token in line.split())
@@ -810,7 +826,7 @@ def inspect_host(manifest: Mapping[str, Any], plan: Mapping[str, Any],
                 occupied[port] = matching
                 report["errors"].append(f"required TCP port {port} is already listening")
     report["tcp_ports"] = {
-        "required": sorted(selected_ports),
+        "required": selected_ports,
         "occupied": occupied,
     }
 
@@ -1196,7 +1212,6 @@ def render_compose(manifest: Mapping[str, Any], plan: Mapping[str, Any],
                         "-N", record["node_name"],
                         "--no-remote",
                         "-m", "0",
-                        "-p", str(record["port"]),
                         "-s", scheduler_endpoint,
                         "-i", host["interface"],
                         "-b", "/var/lib/icecc",
