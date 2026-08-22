@@ -16,8 +16,6 @@ namespace {
 void validate_limits(ZstdTuLimits limits) {
     if (limits.max_encoded_body_bytes == 0 || limits.max_raw_bytes == 0)
         throw std::invalid_argument("ZSTD_TU limits must be nonzero");
-    if (limits.max_window_log < 0)
-        throw std::invalid_argument("ZSTD_TU window-log limit is negative");
 }
 
 ComponentDescriptor empty_dict_descriptor() {
@@ -133,29 +131,35 @@ std::vector<uint8_t> decode_zstd_tu(const TxBegin& begin,
     DctxPtr dctx(ZSTD_createDCtx(), &ZSTD_freeDCtx);
     if (!dctx) throw std::bad_alloc();
 
-    if (limits.max_window_log != 0) {
-#if ZSTD_VERSION_NUMBER >= 10400
-        const size_t set_window = ZSTD_DCtx_setParameter(
-            dctx.get(), ZSTD_d_windowLogMax, limits.max_window_log);
-        if (ZSTD_isError(set_window))
-            throw_zstd("ZSTD_DCtx_setParameter(windowLogMax)", set_window);
-#else
-        throw std::invalid_argument(
-            "linked libzstd cannot enforce the configured window cap");
-#endif
-    }
-
     std::vector<uint8_t> output(static_cast<size_t>(begin.raw_bytes));
     uint8_t output_scratch = 0;
     void* destination = output.empty() ? static_cast<void*>(&output_scratch)
                                        : static_cast<void*>(output.data());
     const uint8_t input_scratch = 0;
-    const size_t decoded = ZSTD_decompressDCtx(
-        dctx.get(), destination, output.size(),
-        readable_data(encoded_body, input_scratch), encoded_body.size());
-    if (ZSTD_isError(decoded)) throw_zstd("ZSTD_decompressDCtx", decoded);
-    if (decoded != output.size())
-        throw std::invalid_argument("ZSTD_TU decoder produced the wrong byte count");
+    ZSTD_inBuffer input_buffer{
+        readable_data(encoded_body, input_scratch), encoded_body.size(), 0};
+    ZSTD_outBuffer output_buffer{destination, output.size(), 0};
+
+    size_t remaining = 1;
+    while (remaining != 0) {
+        const size_t previous_input = input_buffer.pos;
+        const size_t previous_output = output_buffer.pos;
+        remaining = ZSTD_decompressStream(
+            dctx.get(), &output_buffer, &input_buffer);
+        if (ZSTD_isError(remaining))
+            throw_zstd("ZSTD_decompressStream", remaining);
+        if (remaining != 0 && output_buffer.pos == output_buffer.size)
+            throw std::invalid_argument(
+                "ZSTD_TU decoder exceeded the declared raw byte count");
+        if (remaining != 0 && input_buffer.pos == previous_input &&
+            output_buffer.pos == previous_output)
+            throw std::invalid_argument("ZSTD_TU decoder made no progress");
+    }
+    if (input_buffer.pos != input_buffer.size)
+        throw std::invalid_argument("ZSTD_TU decoder did not consume the frame");
+    if (output_buffer.pos != output.size())
+        throw std::invalid_argument(
+            "ZSTD_TU decoder produced the wrong byte count");
     if (icecc::digest128(output) != begin.raw_digest)
         throw std::invalid_argument("ZSTD_TU raw input digest differs");
     return output;
@@ -233,7 +237,8 @@ std::vector<uint8_t> ZstdTuDialogue::materialize() {
 
 void ZstdTuDialogue::commit_visible() {
     if (state_ != State::Materialized)
-        throw std::logic_error("ZSTD_TU commit became visible before materialization");
+        throw std::logic_error(
+            "ZSTD_TU commit became visible before materialization");
     clear_active();
     state_ = State::Idle;
 }
