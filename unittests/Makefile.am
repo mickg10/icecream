@@ -32,6 +32,7 @@ p50wire_LDADD = ../cache/libprotocol50.a ../services/libicecc.la
 p50slice0_LDADD = ../cache/libprotocol50.a ../services/libicecc.la
 p50zstd_LDADD = ../cache/libprotocol50.a ../services/libicecc.la $(LIBZSTD_LIBS)
 p50zstdwindow_LDADD = ../cache/libprotocol50.a ../services/libicecc.la $(LIBZSTD_LIBS)
+p50endpoint_LDFLAGS = $(BOOST_LDFLAGS)
 p50endpoint_LDADD = ../cache/libprotocol50.a ../services/libicecc.la \
 	$(LIBZSTD_LIBS) $(BOOST_LIBS)
 digest128bench_LDADD = ../services/libicecc.la
