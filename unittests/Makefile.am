@@ -1,8 +1,22 @@
-TESTS = testargs lockexec backpressure schedpolicy utf8test statewritertest fastesttest hallflowtest jobidalloctest connectivity-run.sh schedbp-quick.sh schedstress-quick.sh remoteice-quick.sh daemonlogin-run.sh daemonbatch-run.sh
+TESTS = testargs lockexec backpressure schedpolicy utf8test statewritertest fastesttest hallflowtest jobidalloctest connectivity-run.sh schedbp-quick.sh schedstress-quick.sh remoteice-quick.sh daemonlogin-run.sh daemonbatch-run.sh boost-prefix-scope.sh
 
 AM_TESTS_ENVIRONMENT = \
 	ICECC_TEST_BUILDDIR='$(abs_builddir)'; export ICECC_TEST_BUILDDIR; \
-	ICECC_TEST_TOP_BUILDDIR='$(abs_top_builddir)'; export ICECC_TEST_TOP_BUILDDIR;
+	ICECC_TEST_TOP_BUILDDIR='$(abs_top_builddir)'; export ICECC_TEST_TOP_BUILDDIR; \
+	ICECC_TEST_TOP_SRCDIR='$(abs_top_srcdir)'; export ICECC_TEST_TOP_SRCDIR; \
+	ICECC_TEST_CC='$(CC)'; export ICECC_TEST_CC; \
+	ICECC_TEST_CXX='$(CXX)'; export ICECC_TEST_CXX; \
+	ICECC_TEST_AR='$(AR)'; export ICECC_TEST_AR; \
+	ICECC_TEST_CXX_STANDARD_FLAG='$(ICE_CXX_STANDARD_FLAG)'; export ICECC_TEST_CXX_STANDARD_FLAG; \
+	ICECC_TEST_CPPFLAGS='$(CPPFLAGS)'; export ICECC_TEST_CPPFLAGS; \
+	ICECC_TEST_LDFLAGS='$(LDFLAGS)'; export ICECC_TEST_LDFLAGS; \
+	ICECC_TEST_BOOST_CPPFLAGS='$(BOOST_CPPFLAGS)'; export ICECC_TEST_BOOST_CPPFLAGS; \
+	ICECC_TEST_LIBCAP_NG_CFLAGS='$(LIBCAP_NG_CFLAGS)'; export ICECC_TEST_LIBCAP_NG_CFLAGS; \
+	ICECC_TEST_LIBCAP_NG_LIBS='$(LIBCAP_NG_LIBS)'; export ICECC_TEST_LIBCAP_NG_LIBS; \
+	ICECC_TEST_LIBARCHIVE_CFLAGS='$(LIBARCHIVE_CFLAGS)'; export ICECC_TEST_LIBARCHIVE_CFLAGS; \
+	ICECC_TEST_LIBARCHIVE_LIBS='$(LIBARCHIVE_LIBS)'; export ICECC_TEST_LIBARCHIVE_LIBS; \
+	ICECC_TEST_LIBZSTD_CFLAGS='$(LIBZSTD_CFLAGS)'; export ICECC_TEST_LIBZSTD_CFLAGS; \
+	ICECC_TEST_LIBZSTD_LIBS='$(LIBZSTD_LIBS)'; export ICECC_TEST_LIBZSTD_LIBS;
 
 AM_CPPFLAGS = -I$(top_srcdir)/client -I$(top_srcdir)/services -I$(top_srcdir)/
 testargs_LDADD = ../client/libclient.a ../services/libicecc.la
@@ -61,7 +75,7 @@ conn_shim.so: $(srcdir)/conn_shim.c
 connectivity_DEPENDENCIES = conn_shim.so
 
 CLEANFILES = sndbuf_shim.so conn_shim.so schedbp-scheduler-*.log
-EXTRA_DIST = sndbuf_shim.c conn_shim.c connectivity-run.sh schedbp-quick.sh schedstress-quick.sh remoteice-quick.sh daemonlogin-run.sh daemonbatch-run.sh
+EXTRA_DIST = sndbuf_shim.c conn_shim.c connectivity-run.sh schedbp-quick.sh schedstress-quick.sh remoteice-quick.sh daemonlogin-run.sh daemonbatch-run.sh boost-prefix-scope.sh
 
 # Make the tests also print the test log if they fail.
 check: export VERBOSE=1

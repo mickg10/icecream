@@ -157,8 +157,16 @@ AS_IF([test -n "$boost_prefix" && test "x$boost_prefix" != xyes], [
 # centrally for every target.
 BOOST_CPPFLAGS="$BOOST_CPPFLAGS -DBOOST_ASIO_HAS_CO_AWAIT=1 -DBOOST_ASIO_HAS_STD_COROUTINE=1"
 
-CPPFLAGS="$BOOST_CPPFLAGS $CPPFLAGS"
-LDFLAGS="$BOOST_LDFLAGS $LDFLAGS"
+# The Boost prefix belongs only to the Boost feature probes below.  In
+# particular, do not make its library directory part of the global search
+# path: later lzo, zstd, libarchive and platform probes must keep using their
+# own dependency contracts.  Future Boost-using targets opt in through the
+# substituted BOOST_* variables.
+icecc_boost_save_CPPFLAGS="$CPPFLAGS"
+icecc_boost_save_LDFLAGS="$LDFLAGS"
+icecc_boost_save_LIBS="$LIBS"
+CPPFLAGS="$BOOST_CPPFLAGS $icecc_boost_save_CPPFLAGS"
+LDFLAGS="$BOOST_LDFLAGS $icecc_boost_save_LDFLAGS"
 
 AC_MSG_CHECKING([for Boost version 1.74 or newer])
 AC_COMPUTE_INT([icecc_boost_version], [BOOST_VERSION], [[
@@ -173,7 +181,6 @@ icecc_boost_patch=`expr "$icecc_boost_version" % 100`
 AC_MSG_RESULT([$icecc_boost_major.$icecc_boost_minor.$icecc_boost_patch])
 
 AC_MSG_CHECKING([for required Boost.Asio coroutine and asynchronous TCP APIs])
-icecc_save_LIBS="$LIBS"
 BOOST_LIBS=
 AC_LINK_IFELSE([AC_LANG_PROGRAM([[
         #include <array>
@@ -209,7 +216,7 @@ AC_LINK_IFELSE([AC_LANG_PROGRAM([[
     ]])], [
         AC_MSG_RESULT([yes (header-only Boost.System)])
     ], [
-        LIBS="-lboost_system $icecc_save_LIBS"
+        LIBS="-lboost_system $icecc_boost_save_LIBS"
         AC_LINK_IFELSE([AC_LANG_PROGRAM([[
                 #include <array>
                 #include <utility>
@@ -248,7 +255,9 @@ AC_LINK_IFELSE([AC_LANG_PROGRAM([[
                 AC_MSG_ERROR([Boost.Asio awaitable, co_spawn, use_awaitable, and asynchronous TCP read/write/accept/connect APIs are required])
             ])
     ])
-LIBS="$icecc_save_LIBS"
+CPPFLAGS="$icecc_boost_save_CPPFLAGS"
+LDFLAGS="$icecc_boost_save_LDFLAGS"
+LIBS="$icecc_boost_save_LIBS"
 
 AC_DEFINE_UNQUOTED([ICECC_BOOST_VERSION], [$icecc_boost_version],
     [Numeric Boost version used to build Icecream])
