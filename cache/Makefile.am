@@ -45,6 +45,15 @@ EXTRA_DIST = \
 	formal/Protocol50IncarnationProgress.cfg \
 	formal/Protocol50IncarnationMutant.cfg \
 	formal/Protocol50IncarnationOwnershipMutant.cfg \
+	formal/Protocol50Assignment.tla \
+	formal/Protocol50Assignment.cfg \
+	formal/Protocol50AssignmentRestart.cfg \
+	formal/Protocol50AssignmentMixedCompat.cfg \
+	formal/Protocol50AssignmentStrictLegacyMutant.cfg \
+	formal/Protocol50AssignmentReadyMutant.cfg \
+	formal/Protocol50AssignmentReleaseMutant.cfg \
+	formal/Protocol50AssignmentTombstoneMutant.cfg \
+	formal/Protocol50Assignment.md \
 	formal/run_tlc.sh \
 	formal/.gitignore \
 	formal/check_trace.py \
