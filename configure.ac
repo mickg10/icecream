@@ -119,12 +119,12 @@ AC_DISABLE_SHARED
 AC_ENABLE_STATIC
 LT_INIT
 
-# Protocol 50 uses Boost.Asio's io_context, TCP sockets, and posted handlers.
+# Protocol 50 uses Boost.Asio's C++20 coroutine and TCP APIs.
 # Keep discovery central so future targets consume BOOST_CPPFLAGS/BOOST_LDFLAGS/BOOST_LIBS
 # rather than each inventing a different dependency probe.
 AC_ARG_WITH([boost],
     [AS_HELP_STRING([--with-boost=PREFIX],
-        [use Boost installed under PREFIX (Boost >= 1.66 with Boost.Asio is required)])],
+        [use Boost installed under PREFIX (Boost >= 1.74 with Boost.Asio coroutine support is required)])],
     [boost_prefix="$withval"],
     [boost_prefix=""])
 AS_IF([test "x$boost_prefix" = xno],
@@ -134,9 +134,9 @@ BOOST_CPPFLAGS=
 BOOST_LDFLAGS=
 AS_IF([test -n "$boost_prefix" && test "x$boost_prefix" != xyes], [
     AS_IF([test -f "$boost_prefix/boost/version.hpp"], [
-        BOOST_CPPFLAGS="-I$boost_prefix"
+        BOOST_CPPFLAGS="-isystem $boost_prefix"
     ], [test -f "$boost_prefix/include/boost/version.hpp"], [
-        BOOST_CPPFLAGS="-I$boost_prefix/include"
+        BOOST_CPPFLAGS="-isystem $boost_prefix/include"
     ], [
         AC_MSG_ERROR([--with-boost=$boost_prefix does not contain boost/version.hpp])
     ])
@@ -151,53 +151,102 @@ AS_IF([test -n "$boost_prefix" && test "x$boost_prefix" != xyes], [
     ])
 ])
 
+# Boost 1.74's Clang feature detection still looks for the Coroutines TS
+# header even when the compiler and standard library provide C++20
+# <coroutine>.  The repository requires C++23 and the link probe below uses
+# the exact standard-coroutine APIs, so select that supported Asio path
+# centrally for every target.
+BOOST_CPPFLAGS="$BOOST_CPPFLAGS -DBOOST_ASIO_HAS_CO_AWAIT=1 -DBOOST_ASIO_HAS_STD_COROUTINE=1"
+
 CPPFLAGS="$BOOST_CPPFLAGS $CPPFLAGS"
 LDFLAGS="$BOOST_LDFLAGS $LDFLAGS"
 
-AC_MSG_CHECKING([for Boost version 1.66 or newer])
+AC_MSG_CHECKING([for Boost version 1.74 or newer])
 AC_COMPUTE_INT([icecc_boost_version], [BOOST_VERSION], [[
     #include <boost/version.hpp>
-]], [AC_MSG_ERROR([Boost headers were not found; install Boost >= 1.66 or use --with-boost=PREFIX])])
-AS_IF([test "$icecc_boost_version" -lt 106600], [
-    AC_MSG_ERROR([Boost >= 1.66 is required; found BOOST_VERSION=$icecc_boost_version])
+]], [AC_MSG_ERROR([Boost headers were not found; install Boost >= 1.74 or use --with-boost=PREFIX])])
+AS_IF([test "$icecc_boost_version" -lt 107400], [
+    AC_MSG_ERROR([Boost >= 1.74 is required; found BOOST_VERSION=$icecc_boost_version])
 ])
 icecc_boost_major=`expr "$icecc_boost_version" / 100000`
 icecc_boost_minor=`expr \( "$icecc_boost_version" / 100 \) % 1000`
 icecc_boost_patch=`expr "$icecc_boost_version" % 100`
 AC_MSG_RESULT([$icecc_boost_major.$icecc_boost_minor.$icecc_boost_patch])
 
-AC_MSG_CHECKING([for required Boost.Asio io_context, TCP, and post APIs])
+AC_MSG_CHECKING([for required Boost.Asio coroutine and asynchronous TCP APIs])
 icecc_save_LIBS="$LIBS"
 BOOST_LIBS=
 AC_LINK_IFELSE([AC_LANG_PROGRAM([[
+        #include <array>
+        #include <utility>
+        #include <boost/asio/awaitable.hpp>
+        #include <boost/asio/co_spawn.hpp>
+        #include <boost/asio/detached.hpp>
         #include <boost/asio/io_context.hpp>
         #include <boost/asio/ip/tcp.hpp>
-        #include <boost/asio/post.hpp>
+        #include <boost/asio/read.hpp>
+        #include <boost/asio/use_awaitable.hpp>
+        #include <boost/asio/write.hpp>
+
+        namespace asio = boost::asio;
+        using tcp = asio::ip::tcp;
+
+        asio::awaitable<void> icecc_asio_probe(tcp::acceptor& acceptor,
+                                               tcp::socket& socket) {
+            std::array<unsigned char, 1> byte{};
+            co_await acceptor.async_accept(socket, asio::use_awaitable);
+            co_await socket.async_connect(tcp::endpoint{}, asio::use_awaitable);
+            co_await asio::async_read(socket, asio::buffer(byte), asio::use_awaitable);
+            co_await asio::async_write(socket, asio::buffer(byte), asio::use_awaitable);
+        }
     ]], [[
         boost::asio::io_context context;
+        boost::asio::ip::tcp::acceptor acceptor(context);
         boost::asio::ip::tcp::socket socket(context);
-        boost::asio::post(context, [] {});
+        boost::asio::co_spawn(context, icecc_asio_probe(acceptor, socket),
+                              boost::asio::detached);
         context.poll();
-        return socket.is_open() ? 1 : 0;
+        return 0;
     ]])], [
         AC_MSG_RESULT([yes (header-only Boost.System)])
     ], [
         LIBS="-lboost_system $icecc_save_LIBS"
         AC_LINK_IFELSE([AC_LANG_PROGRAM([[
+                #include <array>
+                #include <utility>
+                #include <boost/asio/awaitable.hpp>
+                #include <boost/asio/co_spawn.hpp>
+                #include <boost/asio/detached.hpp>
                 #include <boost/asio/io_context.hpp>
                 #include <boost/asio/ip/tcp.hpp>
-                #include <boost/asio/post.hpp>
+                #include <boost/asio/read.hpp>
+                #include <boost/asio/use_awaitable.hpp>
+                #include <boost/asio/write.hpp>
+
+                namespace asio = boost::asio;
+                using tcp = asio::ip::tcp;
+
+                asio::awaitable<void> icecc_asio_probe(tcp::acceptor& acceptor,
+                                                       tcp::socket& socket) {
+                    std::array<unsigned char, 1> byte{};
+                    co_await acceptor.async_accept(socket, asio::use_awaitable);
+                    co_await socket.async_connect(tcp::endpoint{}, asio::use_awaitable);
+                    co_await asio::async_read(socket, asio::buffer(byte), asio::use_awaitable);
+                    co_await asio::async_write(socket, asio::buffer(byte), asio::use_awaitable);
+                }
             ]], [[
                 boost::asio::io_context context;
+                boost::asio::ip::tcp::acceptor acceptor(context);
                 boost::asio::ip::tcp::socket socket(context);
-                boost::asio::post(context, [] {});
+                boost::asio::co_spawn(context, icecc_asio_probe(acceptor, socket),
+                                      boost::asio::detached);
                 context.poll();
-                return socket.is_open() ? 1 : 0;
+                return 0;
             ]])], [
                 BOOST_LIBS=-lboost_system
                 AC_MSG_RESULT([yes (links Boost.System)])
             ], [
-                AC_MSG_ERROR([Boost.Asio with io_context, TCP sockets, and post is required])
+                AC_MSG_ERROR([Boost.Asio awaitable, co_spawn, use_awaitable, and asynchronous TCP read/write/accept/connect APIs are required])
             ])
     ])
 LIBS="$icecc_save_LIBS"
@@ -209,7 +258,7 @@ AC_SUBST([BOOST_LDFLAGS])
 AC_SUBST([BOOST_LIBS])
 AC_SUBST([ICE_CXX_STANDARD_FLAG])
 AC_MSG_NOTICE([C++ language mode: $ICE_CXX_STANDARD_FLAG])
-AC_MSG_NOTICE([Boost: $icecc_boost_major.$icecc_boost_minor.$icecc_boost_patch; Asio link components: ${BOOST_LIBS:-none}])
+AC_MSG_NOTICE([Boost: $icecc_boost_major.$icecc_boost_minor.$icecc_boost_patch; Asio coroutine/TCP APIs: yes; link components: ${BOOST_LIBS:-none}])
 
 # Protocol-50's common 128-bit digest uses the stable XXH3 streaming and one-shot APIs.
 # This is an M0 dependency, separate from the B0 C++23/Boost baseline above.
