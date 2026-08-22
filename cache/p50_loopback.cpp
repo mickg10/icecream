@@ -228,8 +228,19 @@ ZstdLoopbackServer::ZstdLoopbackServer(
     if (config_.supported_profiles != profile_bit(ProfileId::ZSTD_TU))
         throw std::invalid_argument(
             "the bounded loopback endpoint supports only ZSTD_TU");
+    if (config_.f_store_guid == FStoreGuid{} ||
+        expected_c_store_guid_ == CStoreGuid{})
+        throw std::invalid_argument("loopback endpoint GUID zero is reserved");
+    if (config_.protocol_error_code == 0)
+        throw std::invalid_argument("loopback endpoint ERROR code zero is reserved");
     if (!publish_exact_input_)
         throw std::invalid_argument("loopback endpoint has no publish callback");
+
+    // Validate every receiver allocation bound before accepting a candidate.
+    // A malformed local configuration must not establish a route and fail only
+    // when the first transaction arrives.
+    (void)ZstdTuDialogue(profile_bit(ProfileId::ZSTD_TU),
+                         config_.zstd_limits);
 }
 
 uint16_t ZstdLoopbackServer::port() const {
@@ -324,13 +335,15 @@ void ZstdLoopbackServer::publish_commit(
                                   begin.rel_seq, begin.tu_seq,
                                   begin.transaction_digest)};
 
-    // Reserve the state transition before either external publication or route
+    // Reserve the state transition before private input staging or route
     // mutation. A revision-overflow failure therefore cannot leave partial
     // committed state.
     gate_.note_state_change();
 
-    // The callback is the atomic InputRecord publication boundary. If it
-    // throws, no CacheWire route commit is made visible and the session closes.
+    // M2 has no job-visible InputRecord store. This callback may stage the exact
+    // bytes privately and inject allocation failure, but it must not expose them
+    // to a compiler. M3 replaces this seam with one owner transition that makes
+    // the InputRecord and route commit visible atomically.
     publish_exact_input_(begin, commit, std::move(exact_input));
 
     history_nonce_ = commit.history_nonce;
@@ -501,6 +514,14 @@ TxCommit ZstdLoopbackClient::transfer(
         envelope.begin.rel_seq != state_.next_rel_seq ||
         envelope.begin.pre_state_digest != state_.state_digest)
         throw std::logic_error("client envelope does not match SESSION_STATE cursor");
+    if (envelope.body.empty() ||
+        envelope.body.size() != envelope.begin.body.encoded_bytes ||
+        icecc::digest128(envelope.body) != envelope.begin.body.digest ||
+        compute_transaction_digest(envelope.begin, std::span<const uint8_t>{},
+                                   envelope.body) !=
+            envelope.begin.transaction_digest)
+        throw std::invalid_argument(
+            "client ZSTD_TU envelope is not a closed exact transaction");
     if (body_message_bytes == 0)
         body_message_bytes = state_.limits.max_frame_payload;
     if (body_message_bytes == 0 ||
