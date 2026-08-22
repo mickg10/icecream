@@ -5793,12 +5793,15 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
                 if identity != expected_policy_identity:
                     raise ValueError(f"{path}: event policy route identity differs")
             transaction_key = (event["logical_job_id"], event["attempt_id"])
-            transaction_identity = identity + (event["REL_SEQ"], event["TU_SEQ"])
-            established_transaction = transaction_identities.setdefault(
-                transaction_key, transaction_identity
-            )
-            if established_transaction != transaction_identity:
-                raise ValueError(f"{path}: event transaction route identity drifted")
+            if event["REL_SEQ"] is not None:
+                transaction_identity = identity + (event["REL_SEQ"], event["TU_SEQ"])
+                established_transaction = transaction_identities.setdefault(
+                    transaction_key, transaction_identity
+                )
+                if established_transaction != transaction_identity:
+                    raise ValueError(
+                        f"{path}: event transaction route identity drifted"
+                    )
             if event["transaction_digest"] is not None:
                 recomputed_digest = transaction_identity_digest(
                     scenario_digest,

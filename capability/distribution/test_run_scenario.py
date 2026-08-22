@@ -1194,6 +1194,27 @@ class SimulatorTest(unittest.TestCase):
             )
             self.assertTrue((output / "route-trace.jsonl").is_file())
 
+    def test_v2_static_policy_retains_transaction_free_route_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_v2_fixture(root, [3, 2, 1], [10, 11, 12], workers=2)
+            document = json.loads(path.read_text())
+            document["topology"]["scheduler_policy"] = "rendezvous"
+            path.write_text(json.dumps(document, indent=2) + "\n")
+            scenario = sim.load_scenario(path)
+            result = sim.Simulator(scenario, sim.RawAdapter()).run()
+            route_bound = [
+                event for event in result.events if event["event"] == "route-bound"
+            ]
+            self.assertEqual(len(route_bound), 3)
+            self.assertTrue(all(event["REL_SEQ"] is None for event in route_bound))
+            output = root / "out"
+            sim.write_result(scenario, result, output, execution_for(path))
+            self.assertEqual(
+                sim.validate_experiment_jsonl(output / "experiment.jsonl")["events"],
+                result.events.count,
+            )
+
     def test_v2_absent_environment_is_single_flight_and_not_in_source_score(
         self,
     ) -> None:
