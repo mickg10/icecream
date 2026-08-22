@@ -108,25 +108,6 @@ std::vector<uint8_t> decode_zstd_tu(const TxBegin& begin,
                                    encoded_body) != begin.transaction_digest)
         throw std::invalid_argument("ZSTD_TU transaction digest differs");
 
-    const size_t frame_bytes =
-        ZSTD_findFrameCompressedSize(encoded_body.data(), encoded_body.size());
-    if (ZSTD_isError(frame_bytes))
-        throw_zstd("ZSTD_findFrameCompressedSize", frame_bytes);
-    if (frame_bytes != encoded_body.size())
-        throw std::invalid_argument(
-            "ZSTD_TU BODY contains trailing or concatenated frame data");
-
-    const unsigned long long frame_content_size =
-        ZSTD_getFrameContentSize(encoded_body.data(), encoded_body.size());
-    if (frame_content_size == ZSTD_CONTENTSIZE_ERROR)
-        throw std::invalid_argument("ZSTD_TU BODY is not a valid Zstd frame");
-    if (frame_content_size == ZSTD_CONTENTSIZE_UNKNOWN)
-        throw std::invalid_argument(
-            "ZSTD_TU frame omits its exact decompressed content size");
-    if (frame_content_size != begin.raw_bytes)
-        throw std::invalid_argument(
-            "ZSTD_TU frame content size differs from TX_BEGIN");
-
     using DctxPtr = std::unique_ptr<ZSTD_DCtx, decltype(&ZSTD_freeDCtx)>;
     DctxPtr dctx(ZSTD_createDCtx(), &ZSTD_freeDCtx);
     if (!dctx) throw std::bad_alloc();
@@ -156,7 +137,8 @@ std::vector<uint8_t> decode_zstd_tu(const TxBegin& begin,
             throw std::invalid_argument("ZSTD_TU decoder made no progress");
     }
     if (input_buffer.pos != input_buffer.size)
-        throw std::invalid_argument("ZSTD_TU decoder did not consume the frame");
+        throw std::invalid_argument(
+            "ZSTD_TU BODY contains trailing or concatenated frame data");
     if (output_buffer.pos != output.size())
         throw std::invalid_argument(
             "ZSTD_TU decoder produced the wrong byte count");
