@@ -17,6 +17,12 @@ constexpr uint16_t kZstdTuBodyEncoding = 1;
 struct ZstdTuLimits {
     uint64_t max_encoded_body_bytes = 0;
     uint64_t max_raw_bytes = 0;
+
+    // Streaming Zstd decoders retain a history window independently of the
+    // output buffer. Bound it explicitly; 27 is the conventional 128 MiB
+    // default and may be lowered by the endpoint configuration.
+    int max_window_log = 27;
+
     auto operator<=>(const ZstdTuLimits&) const = default;
 };
 
