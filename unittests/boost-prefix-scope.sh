@@ -122,7 +122,7 @@ if grep "^LDFLAGS='.*-L$icecc_test_prefix/lib" \
     exit 1
 fi
 
-if ! make -C "$icecc_test_build" -j2 V=1 all \
+if ! icecc_run_make -C "$icecc_test_build" -j2 V=1 all \
         > "$icecc_test_root/build.log" 2>&1; then
     cat "$icecc_test_root/build.log" >&2
     exit 1
