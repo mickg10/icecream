@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import json
 import os
 import shutil
 import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 MODULE_PATH = Path(__file__).with_name("dashboard.py")
@@ -18,9 +21,9 @@ sys.modules[SPEC.name] = dashboard
 SPEC.loader.exec_module(dashboard)
 
 from run_scenario import validate_experiment_jsonl as eager_validate  # noqa: E402
-from stream_validate_experiment import (  # noqa: E402
-    validate_experiment_jsonl as streaming_validate,
-)
+import stream_validate_experiment as streaming_validator_module  # noqa: E402
+
+streaming_validate = streaming_validator_module.validate_experiment_jsonl
 
 
 def descriptor() -> dict[str, object]:
@@ -69,6 +72,46 @@ def snapshot(
 
 
 class DashboardTest(unittest.TestCase):
+    def test_streaming_validator_refuses_unrelated_rows_assignment(self) -> None:
+        source = textwrap.dedent(
+            inspect.getsource(
+                streaming_validator_module._accepted.validate_experiment_jsonl
+            )
+        )
+        eager = (
+            "    rows = [json.loads(line) for line in "
+            "path.read_text().splitlines() if line.strip()]"
+        )
+        self.assertEqual(source.count(eager), 1)
+        changed = source.replace(eager, '    rows = "not the accepted expression"')
+        with patch.object(
+            streaming_validator_module.inspect, "getsource", return_value=changed
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "exact eager rows initialization"
+            ):
+                streaming_validator_module._compile_streaming_validator()
+
+    def test_streaming_validator_refuses_new_rows_materialization(self) -> None:
+        source = textwrap.dedent(
+            inspect.getsource(
+                streaming_validator_module._accepted.validate_experiment_jsonl
+            )
+        )
+        eager = (
+            "    rows = [json.loads(line) for line in "
+            "path.read_text().splitlines() if line.strip()]"
+        )
+        self.assertEqual(source.count(eager), 1)
+        changed = source.replace(
+            eager, eager + "\n    materialized_rows = len(list(rows))"
+        )
+        with patch.object(
+            streaming_validator_module.inspect, "getsource", return_value=changed
+        ):
+            with self.assertRaisesRegex(RuntimeError, "source fingerprint changed"):
+                streaming_validator_module._compile_streaming_validator()
+
     def test_streaming_validator_matches_accepted_fixture(self) -> None:
         fixture = (
             MODULE_PATH.with_name("samples") / "r4-minimum" / "sample-experiment.jsonl"

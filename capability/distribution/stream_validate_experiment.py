@@ -12,6 +12,7 @@ replay, accounting, and evidence check remains the accepted implementation.
 from __future__ import annotations
 
 import ast
+import hashlib
 import inspect
 import json
 import textwrap
@@ -20,6 +21,27 @@ from pathlib import Path
 from typing import Any
 
 import run_scenario as _accepted
+
+
+# SHA-256 of the dedented source returned for the accepted R4 validator at
+# 98e07ae70b34cf5927df20404c3e34a3018ac8bb.  The streaming adapter is a
+# deliberately exact rewrite of that function, not a general source-to-source
+# transform.  Refuse every source change until this adapter is reviewed with
+# the new authoritative validator.
+_ACCEPTED_VALIDATOR_SOURCE_SHA256 = (
+    "44bfb76eb5d9ff997afd25780207be38c6a9f4ed25e0e7f132e845dbc75b8bb8"
+)
+
+_ACCEPTED_ROWS_EXPRESSION = ast.parse(
+    "[json.loads(line) for line in path.read_text().splitlines() if line.strip()]",
+    mode="eval",
+).body
+
+
+def _same_ast(left: ast.AST, right: ast.AST) -> bool:
+    return ast.dump(left, include_attributes=False) == ast.dump(
+        right, include_attributes=False
+    )
 
 
 class _TimelineRows(Sequence[dict[str, object]]):
@@ -39,7 +61,7 @@ class _TimelineRows(Sequence[dict[str, object]]):
 
     def __getitem__(self, index: int | slice) -> Any:
         if isinstance(index, slice):
-            return list(iter(self))[index]
+            raise TypeError("accepted validator does not slice timeline rows")
         normalized = index if index >= 0 else len(self) + index
         if not 0 <= normalized < len(self):
             raise IndexError(index)
@@ -82,10 +104,9 @@ class _StreamingRows(Sequence[dict[str, object]]):
 
     def __getitem__(self, index: int | slice) -> Any:
         if isinstance(index, slice):
-            start, stop, step = index.indices(len(self))
-            if start == 1 and stop == max(1, len(self) - 1) and step == 1:
+            if index.start == 1 and index.stop == -1 and index.step is None:
                 return _TimelineRows(self)
-            return list(iter(self))[index]
+            raise TypeError("accepted validator requested an unsupported rows slice")
         normalized = index if index >= 0 else len(self) + index
         if not 0 <= normalized < len(self):
             raise IndexError(index)
@@ -100,30 +121,43 @@ class _StreamingRows(Sequence[dict[str, object]]):
 
 
 def _compile_streaming_validator():
-    """Compile the accepted validator after verifying its sole storage rewrite."""
+    """Compile the exact accepted validator with its sole reviewed rewrite."""
     source = textwrap.dedent(inspect.getsource(_accepted.validate_experiment_jsonl))
     tree = ast.parse(source)
+    if len(tree.body) != 1:
+        raise RuntimeError("accepted validator source has an unexpected module shape")
     function = tree.body[0]
-    if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+    if (
+        not isinstance(function, ast.FunctionDef)
+        or function.name != "validate_experiment_jsonl"
+    ):
         raise RuntimeError("accepted validator source has an unexpected shape")
-    replacements = 0
-    for statement in function.body:
-        if (
-            isinstance(statement, ast.Assign)
-            and len(statement.targets) == 1
-            and isinstance(statement.targets[0], ast.Name)
-            and statement.targets[0].id == "rows"
-        ):
-            statement.value = ast.Call(
-                func=ast.Name(id="_StreamingRows", ctx=ast.Load()),
-                args=[ast.Name(id="path", ctx=ast.Load())],
-                keywords=[],
-            )
-            replacements += 1
-    if replacements != 1:
+
+    rows_assignments = [
+        statement
+        for statement in function.body
+        if isinstance(statement, ast.Assign)
+        and len(statement.targets) == 1
+        and isinstance(statement.targets[0], ast.Name)
+        and statement.targets[0].id == "rows"
+    ]
+    if len(rows_assignments) != 1 or not _same_ast(
+        rows_assignments[0].value, _ACCEPTED_ROWS_EXPRESSION
+    ):
         raise RuntimeError(
-            "accepted validator no longer has exactly one eager rows assignment"
+            "accepted validator no longer has its exact eager rows initialization"
         )
+    source_digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
+    if source_digest != _ACCEPTED_VALIDATOR_SOURCE_SHA256:
+        raise RuntimeError(
+            "accepted validator source fingerprint changed; streaming rewrite refused"
+        )
+
+    rows_assignments[0].value = ast.Call(
+        func=ast.Name(id="_StreamingRows", ctx=ast.Load()),
+        args=[ast.Name(id="path", ctx=ast.Load())],
+        keywords=[],
+    )
     ast.fix_missing_locations(tree)
     namespace = dict(vars(_accepted))
     namespace["_StreamingRows"] = _StreamingRows
