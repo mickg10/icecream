@@ -20,7 +20,17 @@
   "properties": {
     "sequence": { "$ref": "#/$defs/nonnegative" },
     "time_ns": { "$ref": "#/$defs/nonnegative" },
-    "event": { "type": "string", "minLength": 1 },
+    "event": {
+      "enum": [
+        "release", "route-bound", "dispatch", "env_transfer",
+        "env_install_verify", "environment_ready", "dialogue-queued",
+        "dialogue-start", "dag-node-ready", "dag-token", "flow-queued",
+        "flow-start", "flow-resume", "flow-yield", "flow-sent", "flow-finish",
+        "input-ready", "compiler-queued", "compile-start", "compile-finish",
+        "compile-await-commit", "transaction-commit", "dialogue-finish",
+        "transaction-complete"
+      ]
+    },
     "environment": { "$ref": "#/$defs/indexOrEmpty" },
     "workload": { "type": "string" },
     "build": { "$ref": "#/$defs/indexOrEmpty" },
@@ -48,8 +58,17 @@
       ]
     },
     "detail": { "type": "string" },
-    "stage": { "type": "string", "minLength": 1 },
-    "transition": { "type": "string", "minLength": 1 },
+    "stage": {
+      "enum": [
+        "job_release", "scheduler_select", "route_prepare", "env_transfer",
+        "env_install_verify", "environment_ready", "dialogue_queued", "c_queue",
+        "dag_node_ready", "dag_token", "flow_queued", "flow_start",
+        "flow_resume", "flow_yield", "flow_sent", "flow_finish",
+        "input_commit_visible", "compiler_pipe", "compile",
+        "compile_await_commit", "route_reconcile", "dialogue_finish", "job_finish"
+      ]
+    },
+    "transition": { "enum": ["instant", "start", "finish"] },
     "logical_job_id": { "type": ["string", "null"] },
     "attempt_id": { "type": ["string", "null"] },
     "C_STORE_GUID": { "$ref": "#/$defs/guidOrNull" },

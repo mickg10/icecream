@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "icecream-experiment-timeline-record-v2",
+  "title": "Icecream canonical timeline envelope",
+  "oneOf": [
+    {"$ref": "#/$defs/snapshot"},
+    {"$ref": "#/$defs/gap"}
+  ],
+  "$defs": {
+    "nonnegative": {"type": "integer", "minimum": 0},
+    "eventExtent": {
+      "oneOf": [{"$ref": "#/$defs/nonnegative"}, {"const": ""}]
+    },
+    "base": {
+      "type": "object",
+      "required": [
+        "record", "sequence", "wall_start_ns", "wall_end_ns",
+        "wall_duration_ns", "noncanonical_display", "events",
+        "event_sequence_start", "event_sequence_end"
+      ],
+      "properties": {
+        "record": {"enum": ["snapshot", "gap"]},
+        "sequence": {"$ref": "#/$defs/nonnegative"},
+        "wall_start_ns": {"$ref": "#/$defs/nonnegative"},
+        "wall_end_ns": {"$ref": "#/$defs/nonnegative"},
+        "wall_duration_ns": {"$ref": "#/$defs/nonnegative"},
+        "events": {"type": "array", "items": {"type": "object"}},
+        "event_sequence_start": {"$ref": "#/$defs/eventExtent"},
+        "event_sequence_end": {"$ref": "#/$defs/eventExtent"}
+      }
+    },
+    "snapshot": {
+      "allOf": [
+        {"$ref": "#/$defs/base"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "record", "sequence", "wall_start_ns", "wall_end_ns",
+            "wall_duration_ns", "active_start_ns", "active_end_ns",
+            "active_duration_ns", "noncanonical_display", "events",
+            "event_sequence_start", "event_sequence_end"
+          ],
+          "properties": {
+            "record": {"const": "snapshot"},
+            "sequence": {"$ref": "#/$defs/nonnegative"},
+            "wall_start_ns": {"$ref": "#/$defs/nonnegative"},
+            "wall_end_ns": {"$ref": "#/$defs/nonnegative"},
+            "wall_duration_ns": {"$ref": "#/$defs/nonnegative"},
+            "active_start_ns": {"$ref": "#/$defs/nonnegative"},
+            "active_end_ns": {"$ref": "#/$defs/nonnegative"},
+            "active_duration_ns": {"$ref": "#/$defs/nonnegative"},
+            "noncanonical_display": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["state", "metrics"],
+              "properties": {
+                "state": {"type": "object"},
+                "metrics": {"type": "object"}
+              }
+            },
+            "events": {"type": "array", "items": {"type": "object"}},
+            "event_sequence_start": {"$ref": "#/$defs/eventExtent"},
+            "event_sequence_end": {"$ref": "#/$defs/eventExtent"}
+          }
+        }
+      ]
+    },
+    "gap": {
+      "allOf": [
+        {"$ref": "#/$defs/base"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "record", "sequence", "wall_start_ns", "wall_end_ns",
+            "wall_duration_ns", "active_position_ns", "reason",
+            "noncanonical_display", "events", "event_sequence_start",
+            "event_sequence_end"
+          ],
+          "properties": {
+            "record": {"const": "gap"},
+            "sequence": {"$ref": "#/$defs/nonnegative"},
+            "wall_start_ns": {"$ref": "#/$defs/nonnegative"},
+            "wall_end_ns": {"$ref": "#/$defs/nonnegative"},
+            "wall_duration_ns": {"$ref": "#/$defs/nonnegative"},
+            "active_position_ns": {"$ref": "#/$defs/nonnegative"},
+            "reason": {
+              "enum": [
+                "network-propagation", "environment-install-verify",
+                "workload-release", "timer"
+              ]
+            },
+            "noncanonical_display": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["state"],
+              "properties": {"state": {"type": "object"}}
+            },
+            "events": {"type": "array", "items": {"type": "object"}},
+            "event_sequence_start": {"$ref": "#/$defs/eventExtent"},
+            "event_sequence_end": {"$ref": "#/$defs/eventExtent"}
+          }
+        }
+      ]
+    }
+  }
+}

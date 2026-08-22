@@ -72,13 +72,23 @@
         "sha256": { "$ref": "#/$defs/sha256" }
       }
     },
+    "physical_ledger_evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": { "const": "physical-ledger.jsonl" },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
     "simulator": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["source", "source_sha256"],
+      "required": ["source", "source_sha256", "source_commit"],
       "properties": {
         "source": { "type": "string", "minLength": 1 },
-        "source_sha256": { "$ref": "#/$defs/sha256" }
+        "source_sha256": { "$ref": "#/$defs/sha256" },
+        "source_commit": { "$ref": "#/$defs/commit" }
       }
     },
     "expected_summary": { "type": "object" }

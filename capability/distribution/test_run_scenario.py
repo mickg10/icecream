@@ -228,6 +228,7 @@ def write_v2_fixture(
 
 def execution_for(path: Path) -> dict[str, object]:
     scenario = json.loads(path.read_text())
+    simulator_commit = sim.simulator_source_commit()
     return {
         "schema": "icecream-execution-v2",
         "scenario_digest": sim.canonical_json_sha256(scenario),
@@ -235,8 +236,8 @@ def execution_for(path: Path) -> dict[str, object]:
         "runner_commit": "3" * 40,
         "host_manifest": "4" * 64,
         "started_at": "2026-08-22T00:00:00Z",
-        "source_commit": "5" * 40,
-        "simulator_commit": "6" * 40,
+        "source_commit": simulator_commit,
+        "simulator_commit": simulator_commit,
         "codec_executable_digest": "7" * 64,
         "input_manifest_digests": [scenario["workload"]["jobs"][0]["manifest_digest"]],
         "image_identifiers": ["test-image@sha256:" + "2" * 64],
