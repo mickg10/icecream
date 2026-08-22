@@ -113,6 +113,8 @@ run_pass incarnation-progress Protocol50IncarnationBridge.tla \
 run_pass assignment Protocol50Assignment.tla Protocol50Assignment.cfg
 run_pass assignment-restart-progress Protocol50Assignment.tla \
     Protocol50AssignmentRestart.cfg progress
+run_pass assignment-ordering Protocol50AssignmentOrdering.tla \
+    Protocol50AssignmentOrdering.cfg
 
 run_expected_failure abort-mutant Protocol50.tla Protocol50AbortMutant.cfg \
     CommitReconciliationWitness
@@ -151,3 +153,23 @@ run_expected_failure assignment-release-mutant Protocol50Assignment.tla \
     Protocol50AssignmentReleaseMutant.cfg ReleaseHasRevocationProof
 run_expected_failure assignment-tombstone-mutant Protocol50Assignment.tla \
     Protocol50AssignmentTombstoneMutant.cfg TombstoneIsNotLive
+run_expected_failure assignment-ordering-early-cancel-witness \
+    Protocol50AssignmentOrdering.tla \
+    Protocol50AssignmentOrderingEarlyCancelWitness.cfg \
+    NoEarlyCancelWitness
+run_expected_failure assignment-ordering-advisory-witness \
+    Protocol50AssignmentOrdering.tla \
+    Protocol50AssignmentOrderingAdvisoryWitness.cfg \
+    NoAdvisoryClaimBeforePrepareWitness
+run_expected_failure assignment-ordering-prepare-mutant \
+    Protocol50AssignmentOrdering.tla \
+    Protocol50AssignmentOrderingPrepareMutant.cfg \
+    ClaimNeverRegresses
+run_expected_failure assignment-ordering-ready-mutant \
+    Protocol50AssignmentOrdering.tla \
+    Protocol50AssignmentOrderingReadyMutant.cfg \
+    CancelCutsPublication
+run_expected_failure assignment-ordering-revoke-mutant \
+    Protocol50AssignmentOrdering.tla \
+    Protocol50AssignmentOrderingRevokeMutant.cfg \
+    ClaimWinsRevoke
