@@ -46,6 +46,10 @@ struct CCheckerState {
 struct FCheckerState {
     bool connected = false;
     uint64_t session_serial = 0;
+    uint64_t last_session_serial = 0;
+    bool reset_used_in_session = false;
+    bool history_nonce_known = false;
+    HistoryNonce last_history_nonce{};
     bool route = false;
     HistoryNonce nonce{};
     RelSeq next_rel{};
@@ -172,11 +176,15 @@ std::optional<std::string> check_action_trace(std::span<const ActionRecord> reco
             if (record.session_serial == 0) return error("session serial is zero");
             if (f.connected != (record.action == ActionType::SESSION_REPLACED))
                 return error("open/replace does not match the current F session");
+            if (record.session_serial <= f.last_session_serial)
+                return error("session serial was reused or did not increase");
             if (record.action == ActionType::SESSION_REPLACED &&
                 f.commit_unacknowledged)
                 f.commit_disconnected = true;
             f.connected = true;
             f.session_serial = record.session_serial;
+            f.last_session_serial = record.session_serial;
+            f.reset_used_in_session = false;
             clear_f_pending(f);
             break;
         case ActionType::SESSION_DISCONNECTED:
@@ -193,8 +201,14 @@ std::optional<std::string> check_action_trace(std::span<const ActionRecord> reco
             if (c.active) return error("history reset while C has an active transaction");
             if (f.commit_unacknowledged)
                 return error("history reset skipped an unacknowledged durable commit");
-            if (f.route && record.history_nonce == f.nonce)
-                return error("history reset reused its HISTORY_NONCE");
+            if (f.reset_used_in_session)
+                return error("second history reset in one F session");
+            if (f.history_nonce_known &&
+                record.history_nonce.value <= f.last_history_nonce.value)
+                return error("history nonce was reused or did not increase");
+            f.reset_used_in_session = true;
+            f.history_nonce_known = true;
+            f.last_history_nonce = record.history_nonce;
             f.route = true;
             f.nonce = record.history_nonce;
             f.next_rel = RelSeq{0};
@@ -207,6 +221,10 @@ std::optional<std::string> check_action_trace(std::span<const ActionRecord> reco
             const TxIdentity identity = tx_identity(record);
             if (record.actor == ActorSide::C) {
                 if (c.active) return error("C opened a second active transaction");
+                if (f.pending || f.commit_unacknowledged)
+                    return error("C began while F state still required reconciliation");
+                if (record.rel_seq.value == std::numeric_limits<uint64_t>::max())
+                    return error("C REL_SEQ exhausted before TX_BEGIN");
                 if (!c.cursor_known || record.history_nonce != c.nonce) {
                     if (record.rel_seq.value != 0)
                         return error("new C history did not start at REL_SEQ zero");
@@ -343,6 +361,21 @@ std::optional<std::string> check_action_trace(std::span<const ActionRecord> reco
             clear_f_pending(f);
             f.pending = tx_identity(record);
             break;
+        }
+
+        if (f.commit_unacknowledged) {
+            if (!c.active || f.pending)
+                return error("durable F commit lost its C reconciliation identity");
+            if (!f.last_commit || *f.last_commit != *c.active)
+                return error("durable F commit does not match C active");
+            if (!c.cursor_known || !f.route)
+                return error("durable F commit lacks route cursors");
+            if (c.next_rel.value == std::numeric_limits<uint64_t>::max() ||
+                f.nonce != c.nonce ||
+                f.next_rel.value != c.next_rel.value + 1)
+                return error("durable F commit is not exactly one REL_SEQ ahead");
+            if (c.active->nonce != c.nonce || c.active->rel != c.next_rel)
+                return error("durable F commit active identity missed C cursor");
         }
     }
     return std::nullopt;

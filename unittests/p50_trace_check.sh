@@ -1,83 +1,194 @@
 #!/bin/sh
 set -eu
 
-trace_file="${TMPDIR:-/tmp}/icecream-p50-action-trace-$$.jsonl"
-trap 'rm -f "$trace_file"' EXIT HUP INT TERM
+srcdir=${srcdir:-$(dirname "$0")}
+PYTHON=${PYTHON:-python3}
+workdir="${TMPDIR:-/tmp}/icecream-p50-trace-$$"
+trace_file="$workdir/canonical.jsonl"
+checker="$srcdir/../cache/formal/check_trace.py"
+trap 'rm -rf "$workdir"' EXIT HUP INT TERM
+mkdir -p "$workdir"
+
+expect_reject() {
+    file=$1
+    pattern=$2
+    label=$3
+    output="$file.out"
+    if "$PYTHON" "$checker" "$file" >"$output" 2>&1; then
+        echo "p50_trace_check: $label unexpectedly passed" >&2
+        exit 1
+    fi
+    if ! grep -E "$pattern" "$output" >/dev/null 2>&1; then
+        echo "p50_trace_check: $label failed through the wrong gate" >&2
+        cat "$output" >&2
+        exit 1
+    fi
+}
 
 P50_TRACE_PATH="$trace_file" ./p50slice0 >/dev/null
-checker="$(dirname "$0")/../cache/formal/check_trace.py"
-python3 "$checker" "$trace_file"
-python3 - "$checker" "$trace_file" <<'PY'
+"$PYTHON" "$checker" "$trace_file"
+
+"$PYTHON" - "$trace_file" "$workdir" <<'PY'
+import copy
 import json
-import subprocess
+import pathlib
 import sys
-import tempfile
 
-checker, source = sys.argv[1:]
-rows = [json.loads(line) for line in open(source, encoding="utf-8")]
+source = pathlib.Path(sys.argv[1])
+outdir = pathlib.Path(sys.argv[2])
+rows = [json.loads(line) for line in source.read_text(encoding="utf-8").splitlines()]
 
 
-def checker_accepts(records):
-    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as output:
+def write(name, records):
+    path = outdir / name
+    with path.open("w", encoding="utf-8") as output:
         for record in records:
             output.write(json.dumps(record, separators=(",", ":")) + "\n")
-        output.flush()
-        return subprocess.run(
-            [sys.executable, checker, output.name],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        ).returncode == 0
 
 
-def require_rejected(label, records):
-    if checker_accepts(records):
-        raise SystemExit(f"check_trace.py accepted {label}")
+def flip_hex(text):
+    if not text:
+        return "1"
+    return ("0" if text[0] != "0" else "1") + text[1:]
 
 
-for index, row in enumerate(rows):
+def record(action, actor="F", serial=1, nonce=0, rel=0, tu=0,
+           tx="", raw="", state="", **extra):
+    value = {
+        "action": action,
+        "actor": actor,
+        "c_store_guid": "c",
+        "f_store_guid": "f",
+        "session_serial": serial,
+        "history_nonce": nonce,
+        "rel_seq": rel,
+        "tu_seq": tu,
+        "transaction_digest": tx,
+        "raw_digest": raw,
+        "state_digest": state,
+        "content_digest": "",
+        "key64": None,
+        "need_keys": [],
+        "remaining_need": 0,
+        "duplicate": False,
+    }
+    value.update(extra)
+    return value
+
+need_rows = copy.deepcopy(rows)
+need_index = next(i for i, row in enumerate(need_rows)
+                  if row["action"] == "NEED_RECORDED")
+need_rows[need_index]["remaining_need"] += 1
+write("bad-need.jsonl", need_rows)
+
+content_rows = copy.deepcopy(rows)
+for index, row in enumerate(content_rows):
     if row["action"] == "OBJECT_APPLIED":
         changed = dict(row)
         changed["duplicate"] = True
-        first = "0" if row["content_digest"][0] != "0" else "1"
-        changed["content_digest"] = first + row["content_digest"][1:]
-        content_rows = list(rows)
+        changed["content_digest"] = flip_hex(row["content_digest"])
         content_rows.insert(index + 1, changed)
-        require_rejected("changed content for an immutable Key64", content_rows)
         break
 else:
-    raise SystemExit("trace fixture lacks OBJECT_APPLIED")
+    raise SystemExit("canonical trace lacks OBJECT_APPLIED")
+write("changed-object.jsonl", content_rows)
 
-c_begin = next(row for row in rows
-               if row["actor"] == "C" and row["action"] == "TX_BEGIN")
-f_begin_index = next(index for index, row in enumerate(rows)
-                     if row["actor"] == "F" and row["action"] == "TX_BEGIN")
-f_commit_index = next(index for index, row in enumerate(rows)
-                      if row["actor"] == "F" and row["action"] == "INPUT_COMMITTED")
-abort = dict(c_begin)
-abort["action"] = "TX_ABORTED"
-require_rejected("abort while F had a pending transaction",
-                 rows[:f_begin_index + 1] + [abort])
-require_rejected("abort after F commit but before C acceptance",
-                 rows[:f_commit_index + 1] + [abort])
+pending_rows = copy.deepcopy(rows)
+c_begin = next(row for row in pending_rows
+               if row["action"] == "TX_BEGIN" and row["actor"] == "C")
+f_begin_index = next(i for i, row in enumerate(pending_rows)
+                     if row["action"] == "TX_BEGIN" and row["actor"] == "F")
+pending_abort = dict(c_begin)
+pending_abort["action"] = "TX_ABORTED"
+pending_abort["actor"] = "C"
+pending_rows.insert(f_begin_index + 1, pending_abort)
+write("pending-abort.jsonl", pending_rows)
 
-f_actions = (
-    "HISTORY_RESET", "TX_BEGIN", "DICT_COMPLETE", "BODY_COMPLETE",
-    "NEED_RECORDED", "OBJECT_APPLIED", "INPUT_MATERIALIZED", "INPUT_COMMITTED",
-)
-for action in f_actions:
-    changed = [dict(row) for row in rows]
-    record = next(row for row in changed
-                  if row["actor"] == "F" and row["action"] == action)
-    record["session_serial"] += 1
-    require_rejected(f"stale-session {action}", changed)
+commit_rows = copy.deepcopy(rows)
+commit_index = next(i for i, row in enumerate(commit_rows)
+                    if row["action"] == "INPUT_COMMITTED")
+commit_abort = dict(commit_rows[commit_index])
+commit_abort["action"] = "TX_ABORTED"
+commit_abort["actor"] = "C"
+commit_rows.insert(commit_index + 1, commit_abort)
+write("commit-abort.jsonl", commit_rows)
 
-f_begin_index = next(index for index, row in enumerate(rows)
-                     if row["actor"] == "F" and row["action"] == "TX_BEGIN")
-replay = [dict(row) for row in rows[:f_begin_index + 1]]
-replay[-1]["action"] = "ACTIVE_REPLAYED"
-if not checker_accepts(replay):
-    raise SystemExit("synthetic ACTIVE_REPLAYED fixture is invalid")
-replay[-1]["session_serial"] += 1
-require_rejected("stale-session ACTIVE_REPLAYED", replay)
+digest_rows = copy.deepcopy(rows)
+digest_index = next(i for i, row in enumerate(digest_rows)
+                    if row["action"] == "DICT_COMPLETE")
+digest_rows[digest_index]["transaction_digest"] = flip_hex(
+    digest_rows[digest_index]["transaction_digest"])
+write("wrong-operation-digest.jsonl", digest_rows)
+
+cursor_rows = copy.deepcopy(rows)
+relations = {}
+for index, row in enumerate(cursor_rows):
+    if row["action"] == "TX_BEGIN" and row["actor"] == "C":
+        key = (row["c_store_guid"], row["f_store_guid"])
+        relations.setdefault(key, []).append(index)
+selected = next(indices for indices in relations.values() if len(indices) >= 2)
+cursor_rows[selected[1]]["rel_seq"] = cursor_rows[selected[0]]["rel_seq"]
+write("cursor-reuse.jsonl", cursor_rows)
+
+relseq_rows = copy.deepcopy(rows)
+relseq_index = next(i for i, row in enumerate(relseq_rows)
+                    if row["action"] == "TX_BEGIN" and row["actor"] == "C")
+relseq_rows[relseq_index]["rel_seq"] = (1 << 64) - 1
+write("terminal-relseq.jsonl", relseq_rows)
+
+write("stale-session.jsonl", [
+    record("SESSION_OPENED", serial=1),
+    record("HISTORY_RESET", serial=1, nonce=10, state="s0"),
+    record("TX_BEGIN", actor="C", serial=0, nonce=10, rel=0, tu=7,
+           tx="tx", raw="raw", state="s0"),
+    record("SESSION_REPLACED", serial=2, nonce=10, state="s0"),
+    record("TX_BEGIN", serial=1, nonce=10, rel=0, tu=7,
+           tx="tx", raw="raw", state="s0"),
+])
+
+write("session-serial-reuse.jsonl", [
+    record("SESSION_OPENED", serial=2),
+    record("SESSION_DISCONNECTED", serial=2),
+    record("SESSION_OPENED", serial=2),
+])
+
+write("nonce-decrease.jsonl", [
+    record("SESSION_OPENED", serial=1),
+    record("HISTORY_RESET", serial=1, nonce=9, state="s9"),
+    record("SESSION_DISCONNECTED", serial=1, nonce=9, state="s9"),
+    record("SESSION_OPENED", serial=2, nonce=9, state="s9"),
+    record("HISTORY_RESET", serial=2, nonce=8, state="s8"),
+])
+
+write("second-reset.jsonl", [
+    record("SESSION_OPENED", serial=1),
+    record("HISTORY_RESET", serial=1, nonce=1, state="s1"),
+    record("HISTORY_RESET", serial=1, nonce=2, state="s2"),
+])
 PY
+
+expect_reject "$workdir/bad-need.jsonl" \
+    'Need precedes exact DICT' 'inexact Need mutation'
+expect_reject "$workdir/changed-object.jsonl" \
+    'Key64 changed immutable content' 'immutable-content mutation'
+expect_reject "$workdir/pending-abort.jsonl" \
+    'C abort while F still owns pending overlay' 'abort with F pending'
+expect_reject "$workdir/commit-abort.jsonl" \
+    'C abort after durable F commit before acceptance' 'abort after durable commit'
+expect_reject "$workdir/wrong-operation-digest.jsonl" \
+    'DICT does not match F pending/current session' 'same-cursor digest ABA'
+expect_reject "$workdir/cursor-reuse.jsonl" \
+    '(C TX_BEGIN missed its cursor|second C active transaction)' \
+    'route-cursor reuse'
+expect_reject "$workdir/terminal-relseq.jsonl" \
+    'C REL_SEQ exhausted before TX_BEGIN' 'terminal REL_SEQ begin'
+expect_reject "$workdir/stale-session.jsonl" \
+    'F TX_BEGIN at the wrong boundary' 'stale-session mutation'
+expect_reject "$workdir/session-serial-reuse.jsonl" \
+    'F session serial was reused or did not increase' 'session-serial reuse'
+expect_reject "$workdir/nonce-decrease.jsonl" \
+    'HISTORY_NONCE was reused or did not increase' 'history-nonce decrease'
+expect_reject "$workdir/second-reset.jsonl" \
+    'second HISTORY_RESET in one F session' 'second reset in one session'
+
+echo "p50_trace_check: canonical trace and fail-closed mutations passed"
