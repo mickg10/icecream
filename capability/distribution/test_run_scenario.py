@@ -3308,7 +3308,7 @@ class SimulatorTest(unittest.TestCase):
         )
         self.assertEqual(
             sim.sha256(root / "sample-experiment.jsonl"),
-            "101df2c854e2da13f50d82dbd30cf8f763f0fca9511c2031dd1eef134cfe5d8a",
+            "10938ef185baf23a29ae41534c75e376aefa19cd3723d756f4c3ceba864a0ff5",
         )
 
 
