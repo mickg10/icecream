@@ -1,5 +1,6 @@
 #include "cache/p50_input_record.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <iostream>
@@ -290,7 +291,7 @@ void test_close_waits_for_authorized_reader() {
             "closed input was not reclaimed after its last reader exited");
 }
 
-void test_cursor_survives_store_restart_boundary() {
+void test_cursor_outlives_store_owner_object() {
     const CStoreGuid c_guid = Id128::from_u64(50);
     const std::vector<uint8_t> input = bytes(16 * 1024, 12);
     const ExactTransaction tx = transaction_for(TuSeq{51}, input);
@@ -303,7 +304,7 @@ void test_cursor_survives_store_restart_boundary() {
     }
 
     require(drain(authorized, 509) == input,
-            "authorized compiler cursor did not survive store destruction");
+            "authorized cursor did not outlive its store owner object");
 }
 
 void test_empty_input() {
@@ -335,8 +336,7 @@ int main() {
     test_commit_and_input_validation();
     test_capacity_is_transactional();
     test_close_waits_for_authorized_reader();
-    test_cursor_survives_store_restart_boundary();
+    test_cursor_outlives_store_owner_object();
     test_empty_input();
     std::cout << "p50_input_record_test: exact retained-input restart gates passed\n";
     return 0;
-}
