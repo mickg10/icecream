@@ -110,11 +110,13 @@ run_pass job-restart-progress Protocol50JobLifecycle.tla \
 run_pass incarnation Protocol50IncarnationBridge.tla Protocol50IncarnationBridge.cfg
 run_pass incarnation-progress Protocol50IncarnationBridge.tla \
     Protocol50IncarnationProgress.cfg progress
-run_pass assignment Protocol50Assignment.tla Protocol50Assignment.cfg
-run_pass assignment-restart-progress Protocol50Assignment.tla \
+run_pass assignment Protocol50AssignmentConfig.tla Protocol50Assignment.cfg
+run_pass assignment-restart-progress Protocol50AssignmentConfig.tla \
     Protocol50AssignmentRestart.cfg progress
 run_pass assignment-ordering Protocol50AssignmentOrdering.tla \
     Protocol50AssignmentOrdering.cfg
+run_pass assignment-delivery Protocol50AssignmentDelivery.tla \
+    Protocol50AssignmentDelivery.cfg
 
 run_expected_failure abort-mutant Protocol50.tla Protocol50AbortMutant.cfg \
     CommitReconciliationWitness
@@ -143,15 +145,16 @@ run_expected_failure incarnation-mutant Protocol50IncarnationBridge.tla \
 run_expected_failure incarnation-ownership-mutant Protocol50IncarnationBridge.tla \
     Protocol50IncarnationOwnershipMutant.cfg \
     AuthorizedCompilerOwnsIndependentInput
-run_expected_failure assignment-mixed-compat Protocol50Assignment.tla \
+run_expected_failure assignment-mixed-compat Protocol50AssignmentConfig.tla \
     Protocol50AssignmentMixedCompat.cfg EnforcingCompatClaimsExact
-run_expected_failure assignment-strict-legacy-mutant Protocol50Assignment.tla \
+run_expected_failure assignment-strict-legacy-mutant \
+    Protocol50AssignmentConfig.tla \
     Protocol50AssignmentStrictLegacyMutant.cfg StrictClaimsExact
-run_expected_failure assignment-ready-mutant Protocol50Assignment.tla \
+run_expected_failure assignment-ready-mutant Protocol50AssignmentConfig.tla \
     Protocol50AssignmentReadyMutant.cfg ReadyGate
-run_expected_failure assignment-release-mutant Protocol50Assignment.tla \
+run_expected_failure assignment-release-mutant Protocol50AssignmentConfig.tla \
     Protocol50AssignmentReleaseMutant.cfg ReleaseHasRevocationProof
-run_expected_failure assignment-tombstone-mutant Protocol50Assignment.tla \
+run_expected_failure assignment-tombstone-mutant Protocol50AssignmentConfig.tla \
     Protocol50AssignmentTombstoneMutant.cfg TombstoneIsNotLive
 run_expected_failure assignment-ordering-early-cancel-witness \
     Protocol50AssignmentOrdering.tla \
@@ -173,3 +176,19 @@ run_expected_failure assignment-ordering-revoke-mutant \
     Protocol50AssignmentOrdering.tla \
     Protocol50AssignmentOrderingRevokeMutant.cfg \
     ClaimWinsRevoke
+run_expected_failure assignment-ready-wire-mutant \
+    Protocol50AssignmentDelivery.tla \
+    Protocol50AssignmentReadyWireMutant.cfg \
+    PublishedHasMatchingPrepare
+run_expected_failure assignment-revoke-request-wire-mutant \
+    Protocol50AssignmentDelivery.tla \
+    Protocol50AssignmentRevokeRequestWireMutant.cfg \
+    RevocationTargetsSentAssignment
+run_expected_failure assignment-revoke-result-wire-mutant \
+    Protocol50AssignmentDelivery.tla \
+    Protocol50AssignmentRevokeResultWireMutant.cfg \
+    ReleaseHasMatchingWorkerProof
+run_expected_failure assignment-late-prepare-mutant \
+    Protocol50AssignmentDelivery.tla \
+    Protocol50AssignmentLatePrepareMutant.cfg \
+    ClaimedPhaseNeverRegresses
