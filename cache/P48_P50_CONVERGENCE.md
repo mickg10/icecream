@@ -35,6 +35,7 @@ merge base, so every transplanted layer and resolution is recorded below.
 | convergence-only | `35a1608a` | endpoint-target Boost flags and P48 scope-gate registration |
 | convergence-only | `f28822bc` | nested package-discovery forwarding for the P48 scope gate |
 | convergence-only | `5be4a497` | preserve default pkg-config directories in the nested scope gate |
+| convergence-only | `563683e8` | separate endpoint dependency links from completed scope decoys |
 
 The M1 core consumes the header-only OnlineS1 implementation, and the M0 layout census reads
 two retained measurement inputs. Only these missing dependencies came from the source tree:
@@ -64,6 +65,9 @@ prove that they receive the prefix, reject its appearance on any other target, a
 the now-mandatory M0 xxHash dependency into its nested configure. The nested gate forwards
 an explicitly configured `PKG_CONFIG_LIBDIR`, but does not turn an absent directory override
 into an empty override that would hide pkg-config's ordinary system directories.
+The gate keeps its incomplete dependency archives through the complete ordinary product
+build, then removes only the lzo and Zstd decoys before linking the intended Boost consumer;
+that endpoint requires both real libraries and is expected to receive the Boost library path.
 
 All other conflicts were additive build/package-list unions:
 
