@@ -189,10 +189,11 @@ asio::awaitable<RawRoute> raw_open(tcp::socket& socket, const tcp::endpoint& rem
                                    CStoreGuid c_guid, SessionLimits limits = {});
 asio::awaitable<SessionState> raw_reset(tcp::socket& socket, const RawRoute& open,
                                         HistoryNonce nonce);
+asio::awaitable<void> raw_wait_for_close(tcp::socket& socket);
 
 struct HelloRaceState {
     bool first_pending = false;
-    bool incompatible_finished = false;
+    bool second_finished = false;
 };
 
 asio::awaitable<void> raw_pending_then_finish(tcp::endpoint remote, CStoreGuid c_guid,
@@ -209,7 +210,7 @@ asio::awaitable<void> raw_pending_then_finish(tcp::endpoint remote, CStoreGuid c
     co_await raw_write(socket, begin);
     coordination.first_pending = true;
     asio::steady_timer timer(executor);
-    while (!coordination.incompatible_finished) {
+    while (!coordination.second_finished) {
         timer.expires_after(std::chrono::milliseconds(1));
         co_await timer.async_wait(asio::use_awaitable);
     }
@@ -240,7 +241,7 @@ asio::awaitable<void> raw_incompatible_hello(tcp::endpoint remote, CStoreGuid c_
     hello.supported_profiles = profile_bit(ProfileId::P29);
     co_await raw_write(socket, hello);
     const Frame terminal = co_await raw_read(socket, hello.limits.max_frame_payload);
-    coordination.incompatible_finished = true;
+    coordination.second_finished = true;
     if (terminal.type != MessageType::ERROR)
         throw std::logic_error("incompatible HELLO did not receive terminal ERROR");
     (void)raw_decode<ErrorMessage>(terminal);
@@ -251,6 +252,98 @@ asio::awaitable<void> raw_incompatible_hello(tcp::endpoint remote, CStoreGuid c_
     if (error != asio::error::eof && error != asio::error::connection_reset)
         throw std::logic_error("incompatible HELLO connection stayed open");
     co_return;
+}
+
+asio::awaitable<void> raw_invalid_first_mutation(tcp::endpoint remote,
+                                                 CStoreGuid c_guid,
+                                                 HelloRaceState& coordination) {
+    const auto executor = co_await asio::this_coro::executor;
+    asio::steady_timer timer(executor);
+    while (!coordination.first_pending) {
+        timer.expires_after(std::chrono::milliseconds(1));
+        co_await timer.async_wait(asio::use_awaitable);
+    }
+    tcp::socket socket(executor);
+    const RawRoute open = co_await raw_open(socket, remote, c_guid);
+    Message invalid = BodyMessage{bytes("not a first mutation")};
+    co_await raw_write(socket, std::move(invalid));
+    const Frame terminal =
+        co_await raw_read(socket, open.state.limits.max_frame_payload);
+    coordination.second_finished = true;
+    if (terminal.type != MessageType::ERROR)
+        throw std::logic_error(
+            "invalid compatible candidate did not receive terminal ERROR");
+    (void)raw_decode<ErrorMessage>(terminal);
+    co_await raw_wait_for_close(socket);
+}
+
+struct CandidateRevisionRace {
+    bool first_staged = false;
+    bool route_changed = false;
+};
+
+asio::awaitable<void> raw_stale_candidate(tcp::endpoint remote,
+                                          CStoreGuid c_guid,
+                                          CandidateRevisionRace& coordination) {
+    const auto executor = co_await asio::this_coro::executor;
+    tcp::socket socket(executor);
+    const RawRoute open = co_await raw_open(socket, remote, c_guid);
+    coordination.first_staged = true;
+    asio::steady_timer timer(executor);
+    while (!coordination.route_changed) {
+        timer.expires_after(std::chrono::milliseconds(1));
+        co_await timer.async_wait(asio::use_awaitable);
+    }
+
+    const HistoryNonce replacement{open.state.history_nonce.value + 100};
+    Message reset = HistoryReset{
+        replacement, initial_route_digest(c_guid, replacement)};
+    try {
+        co_await raw_write(socket, std::move(reset));
+        const Frame reply =
+            co_await raw_read(socket, open.state.limits.max_frame_payload);
+        if (reply.type == MessageType::ERROR) {
+            (void)raw_decode<ErrorMessage>(reply);
+            co_return;
+        }
+        throw std::logic_error("stale candidate received a non-ERROR reply");
+    } catch (const boost::system::system_error& error) {
+        if (error.code() != asio::error::eof &&
+            error.code() != asio::error::connection_reset &&
+            error.code() != asio::error::broken_pipe)
+            throw;
+    }
+}
+
+asio::awaitable<void> raw_commit_after_candidate_staged(
+    tcp::endpoint remote, CStoreGuid c_guid, std::span<const uint8_t> input,
+    CandidateRevisionRace& coordination) {
+    const auto executor = co_await asio::this_coro::executor;
+    asio::steady_timer timer(executor);
+    while (!coordination.first_staged) {
+        timer.expires_after(std::chrono::milliseconds(1));
+        co_await timer.async_wait(asio::use_awaitable);
+    }
+    tcp::socket socket(executor);
+    const RawRoute open = co_await raw_open(socket, remote, c_guid);
+    if (!open.state.route_present)
+        throw std::logic_error("candidate-revision fixture has no established route");
+    const ZstdTuEnvelope prepared = encode_zstd_tu(
+        HistoryNonce{1}, RelSeq{0}, TuSeq{15}, Digest128{}, input);
+    const TxBegin begin = make_begin(prepared, open.state.history_nonce,
+                                     open.state.state_digest,
+                                     open.state.next_rel_seq);
+    co_await raw_write(socket, begin);
+    Message body = BodyMessage{prepared.body};
+    co_await raw_write(socket, std::move(body));
+    const TxCommit commit = raw_decode<TxCommit>(
+        co_await raw_read(socket, open.state.limits.max_frame_payload));
+    if (commit.transaction_digest != begin.transaction_digest ||
+        commit.raw_digest != begin.raw_digest)
+        throw std::logic_error("candidate-revision fixture received another commit");
+    boost::system::error_code ignored;
+    socket.close(ignored);
+    coordination.route_changed = true;
 }
 
 asio::awaitable<RawRoute> raw_open(tcp::socket& socket, const tcp::endpoint& remote,
@@ -1135,6 +1228,86 @@ void test_handshake_binding_and_namespace_rules() {
                     second.status == ServerRunStatus::TerminalError &&
                     server.committed_input(c_guid) == input,
                 "incompatible HELLO bound or changed the live namespace");
+    }
+
+    {
+        P50ServerEndpoint server(Id128::from_u64(612));
+        const CStoreGuid c_guid = Id128::from_u64(613);
+        const std::vector<uint8_t> input =
+            bytes("pending survives invalid compatible candidate\n");
+        HelloRaceState coordination;
+        asio::io_context context;
+        tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+        std::future<ServerRunResult> first_server =
+            asio::co_spawn(context, server.accept_one(acceptor), asio::use_future);
+        std::future<ServerRunResult> second_server =
+            asio::co_spawn(context, server.accept_one(acceptor), asio::use_future);
+        std::future<void> first_peer = asio::co_spawn(
+            context, raw_pending_then_finish(acceptor.local_endpoint(), c_guid, input, coordination),
+            asio::use_future);
+        std::future<void> invalid_peer = asio::co_spawn(
+            context, raw_invalid_first_mutation(acceptor.local_endpoint(), c_guid, coordination),
+            asio::use_future);
+        context.run();
+        first_peer.get();
+        invalid_peer.get();
+        const ServerRunResult first = first_server.get();
+        const ServerRunResult second = second_server.get();
+        require(first.status == ServerRunStatus::Completed &&
+                    second.status == ServerRunStatus::TerminalError &&
+                    server.namespace_count() == 1 &&
+                    server.committed_input(c_guid) == input,
+                "invalid compatible candidate installed or replaced the live namespace");
+    }
+
+    {
+        P50ServerEndpoint server(Id128::from_u64(614));
+        const CStoreGuid c_guid = Id128::from_u64(615);
+        HelloRaceState coordination{.first_pending = true};
+        asio::io_context context;
+        tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+        std::future<ServerRunResult> server_result =
+            asio::co_spawn(context, server.accept_one(acceptor), asio::use_future);
+        std::future<void> peer_result = asio::co_spawn(
+            context, raw_invalid_first_mutation(acceptor.local_endpoint(), c_guid, coordination),
+            asio::use_future);
+        context.run();
+        peer_result.get();
+        require(server_result.get().status == ServerRunStatus::TerminalError &&
+                    server.namespace_count() == 0 && !server.committed_input(c_guid),
+                "cold compatible candidate installed a namespace before validation");
+    }
+
+    {
+        P50ServerEndpoint server(Id128::from_u64(616));
+        const CStoreGuid c_guid = Id128::from_u64(617);
+        require(force_route_reset(server, c_guid, HistoryNonce{110}).status ==
+                    ServerRunStatus::Disconnected,
+                "candidate-revision fixture did not establish its route");
+        const std::vector<uint8_t> input =
+            bytes("newly activated session invalidates an older snapshot\n");
+        CandidateRevisionRace coordination;
+        asio::io_context context;
+        tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+        std::future<ServerRunResult> first_server =
+            asio::co_spawn(context, server.accept_one(acceptor), asio::use_future);
+        std::future<ServerRunResult> second_server =
+            asio::co_spawn(context, server.accept_one(acceptor), asio::use_future);
+        std::future<void> stale_peer = asio::co_spawn(
+            context, raw_stale_candidate(acceptor.local_endpoint(), c_guid, coordination),
+            asio::use_future);
+        std::future<void> current_peer = asio::co_spawn(
+            context, raw_commit_after_candidate_staged(
+                         acceptor.local_endpoint(), c_guid, input, coordination),
+            asio::use_future);
+        context.run();
+        stale_peer.get();
+        current_peer.get();
+        require(first_server.get().status == ServerRunStatus::Disconnected &&
+                    second_server.get().status == ServerRunStatus::Completed &&
+                    server.namespace_count() == 1 &&
+                    server.committed_input(c_guid) == input,
+                "stale candidate replaced state from the newer activated session");
     }
 
     {
