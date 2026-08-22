@@ -117,11 +117,25 @@ always modeled even when a physical codec supplied observed byte counts.
 The selected profile must be in both advertised sets, route-state profiles must
 be a subset of negotiated profiles from the first TU onward, and both sets are
 frozen for each `(C_STORE_GUID,F_STORE_GUID,HISTORY_NONCE)` relationship. Every
-post-dispatch event for a TU retains one transaction number, one input-staging
-slot, and—after compiler admission—one in-range compiler slot. Compiler queue
-events have derived cardinality: one ordinary admission plus exactly one
-`waiting-for-environment` observation only when input wins the absent-environment
-race.
+workload `c_index` is checked against `c_count` before it can contribute to an
+identity. Every event and every independently loaded route/physical row uses an
+in-range worker; derived route and ledger summaries are rebuilt only from those
+checked rows.
+
+Every post-dispatch event for a TU retains one transaction number and one
+input-staging slot. In decoupled mode the compiler slot appears at compiler
+admission and there is one ordinary compiler-queue event. In coupled mode it is
+reserved with scheduler assignment and no ordinary queue event is invented. An
+additional `waiting-for-environment` observation appears exactly when input wins
+the absent-environment race.
+
+The validator replays both global slot pools in canonical event order.
+Input-staging ownership lasts from dispatch until immediately before
+`compile-start`; compiler ownership lasts from `compile-start` through
+`compile-finish`. Equal-time reuse is legal only after the corresponding release
+event, and the same slot number on different workers remains independent. In
+coupled mode the compiler-capacity reservation additionally lasts from dispatch
+through compile finish.
 
 ## Exact ledgers
 
@@ -196,10 +210,18 @@ an exact physical codec ledger is supplied, TU reconstruction and aggregate
 directional bytes remain exact, but a small timing change may choose another F.
 The report therefore claims aggregate directional closure only; it does not
 mislabel a different assignment as an exact route replay.
+For dynamic round-robin, validation independently walks dispatch events in
+canonical order, recomputes which workers have free staging/compiler capacity,
+and advances the cursor only after a legal selection. Stable rendezvous and
+dense-frontier placement continue to be recomputed from the immutable workload
+identity.
 
-Every v2 run writes `route-trace.jsonl` as retained assignment evidence. Policy
-runs write the realized route trace. Exact replay runs retain the input trace
-byte-for-byte, and the execution record names its relative path and SHA-256.
+Every v2 run writes `route-trace.jsonl` as retained assignment evidence and the
+execution record binds that canonical relative path plus its literal SHA-256.
+Policy runs write the realized route trace; validation joins its row order,
+worker/route identity, `TU_SEQ`, `REL_SEQ`, and per-direction source bytes to the
+canonical dispatch stream while retaining aggregate replay semantics. Exact
+replay runs retain the input trace byte-for-byte.
 Validation reloads those literal bytes, recomputes their SHA-256, validates the
 trace header/assignments/summary, and compares every applicable event and exact
 route-summary identity and source-byte total directly with the retained rows.

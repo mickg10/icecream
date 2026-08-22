@@ -68,7 +68,7 @@
       "additionalProperties": false,
       "required": ["path", "sha256"],
       "properties": {
-        "path": { "type": "string", "minLength": 1 },
+        "path": { "const": "route-trace.jsonl" },
         "sha256": { "$ref": "#/$defs/sha256" }
       }
     },

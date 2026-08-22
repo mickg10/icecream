@@ -2784,6 +2784,312 @@ class SimulatorTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "event times|build .* boundary"):
                 sim.validate_experiment_jsonl(candidate)
 
+    def test_policy_runs_retain_exact_realized_route_trace_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            retained: dict[str, Path] = {}
+            for policy in ("round_robin", "rendezvous", "dense_frontier"):
+                policy_root = root / policy
+                policy_root.mkdir()
+                path = write_v2_fixture(
+                    policy_root, [30, 20, 10], [15, 22, 13], workers=2
+                )
+                document = json.loads(path.read_text())
+                document["topology"]["scheduler_policy"] = policy
+                if policy == "dense_frontier":
+                    document["topology"]["dense_frontier_workers"] = 1
+                path.write_text(json.dumps(document, indent=2) + "\n")
+                scenario = sim.load_scenario(path)
+                output = policy_root / "out"
+                sim.write_result(
+                    scenario,
+                    sim.Simulator(scenario, sim.RawAdapter()).run(),
+                    output,
+                    execution_for(path),
+                )
+                stream = output / "experiment.jsonl"
+                header = json.loads(stream.read_text().splitlines()[0])
+                self.assertEqual(
+                    header["route_trace_evidence"],
+                    {
+                        "path": "route-trace.jsonl",
+                        "sha256": sim.sha256(output / "route-trace.jsonl"),
+                    },
+                )
+                self.assertEqual(
+                    sim.validate_experiment_jsonl(stream)["events"],
+                    sim.Simulator(scenario, sim.RawAdapter()).run().events.count,
+                )
+                retained[policy] = output
+
+            output = retained["round_robin"]
+            stream = output / "experiment.jsonl"
+            trace = output / "route-trace.jsonl"
+            original_trace = trace.read_bytes()
+            original_stream = [
+                json.loads(line) for line in stream.read_text().splitlines()
+            ]
+
+            trace.rename(output / "route-trace.saved")
+            with self.assertRaisesRegex(ValueError, "route-trace evidence is absent"):
+                sim.validate_experiment_jsonl(stream)
+            (output / "route-trace.saved").rename(trace)
+
+            trace.write_bytes(original_trace + b"\n")
+            with self.assertRaisesRegex(ValueError, "route-trace digest"):
+                sim.validate_experiment_jsonl(stream)
+            trace.write_bytes(original_trace)
+
+            def reject_changed_trace(label: str, mutate: object, pattern: str) -> None:
+                trace_rows = [
+                    json.loads(line) for line in original_trace.decode().splitlines()
+                ]
+                mutate(trace_rows)
+                trace.write_text(
+                    "".join(
+                        json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"
+                        for row in trace_rows
+                    )
+                )
+                rows = copy.deepcopy(original_stream)
+                rows[0]["route_trace_evidence"]["sha256"] = sim.sha256(trace)
+                candidate = output / f"policy-trace-{label}.jsonl"
+                candidate.write_text("".join(json.dumps(row) + "\n" for row in rows))
+                with self.subTest(label=label), self.assertRaisesRegex(
+                    ValueError, pattern
+                ):
+                    sim.validate_experiment_jsonl(candidate)
+                trace.write_bytes(original_trace)
+
+            reject_changed_trace(
+                "order",
+                lambda rows: rows.__setitem__(slice(1, 3), [rows[2], rows[1]]),
+                "trace order differs from dispatch order",
+            )
+
+            def swap_tu_sequences(rows: list[dict[str, object]]) -> None:
+                rows[1]["TU_SEQ"], rows[2]["TU_SEQ"] = (
+                    rows[2]["TU_SEQ"],
+                    rows[1]["TU_SEQ"],
+                )
+
+            reject_changed_trace(
+                "tu-sequence", swap_tu_sequences, "TU_SEQ differs from route trace"
+            )
+
+            def change_route_endpoint(rows: list[dict[str, object]]) -> None:
+                worker = rows[1]["worker"]
+                for row in rows[1:-1]:
+                    if row["worker"] == worker:
+                        row["physical_endpoint"] = "changed-F"
+
+            reject_changed_trace(
+                "route",
+                change_route_endpoint,
+                "physical route differs from retained route trace",
+            )
+
+            def change_source_bytes(rows: list[dict[str, object]]) -> None:
+                rows[1]["c_to_f_bytes"] += 1
+                rows[-1]["c_to_f_bytes"] += 1
+
+            reject_changed_trace(
+                "source-bytes",
+                change_source_bytes,
+                "TU source bytes differ from retained route trace",
+            )
+
+    def test_round_robin_and_slot_lifetimes_replay_canonical_event_order(self) -> None:
+        def event(
+            name: str,
+            logical: int,
+            worker: int,
+            staging_slot: int = 0,
+            compiler_slot: int | None = 0,
+        ) -> dict[str, object]:
+            return {
+                "event": name,
+                "workload": "test",
+                "build": 0,
+                "logical": logical,
+                "worker": worker,
+                "staging_slot": staging_slot,
+                "compiler_slot": compiler_slot,
+            }
+
+        decoupled = {
+            "topology": {
+                "f_count": 2,
+                "f_slots": 1,
+                "input_staging_slots": 1,
+                "assignment_source": "policy",
+                "scheduler_policy": "round_robin",
+            }
+        }
+        legal_decoupled = [
+            event("dispatch", 0, 0, compiler_slot=None),
+            event("dispatch", 1, 1, compiler_slot=None),
+            event("compile-start", 0, 0),
+            # A later event at the same timestamp may reuse staging slot F0/0.
+            event("dispatch", 2, 0, compiler_slot=None),
+            event("compile-finish", 0, 0),
+            event("compile-start", 1, 1),
+            event("compile-finish", 1, 1),
+            event("compile-start", 2, 0),
+            event("compile-finish", 2, 0),
+        ]
+        sim._validate_global_slots_and_round_robin(
+            Path("legal-decoupled.jsonl"), legal_decoupled, decoupled
+        )
+
+        wrong_round_robin = copy.deepcopy(legal_decoupled)
+        wrong_round_robin[0]["worker"] = 1
+        with self.assertRaisesRegex(ValueError, "round-robin dispatch"):
+            sim._validate_global_slots_and_round_robin(
+                Path("wrong-round-robin.jsonl"), wrong_round_robin, decoupled
+            )
+
+        coupled = copy.deepcopy(decoupled)
+        del coupled["topology"]["input_staging_slots"]
+        coupled_pressure = copy.deepcopy(legal_decoupled)
+        for row in coupled_pressure:
+            if row["event"] == "dispatch":
+                row["compiler_slot"] = 0
+        with self.assertRaisesRegex(ValueError, "no free F capacity"):
+            sim._validate_global_slots_and_round_robin(
+                Path("coupled-capacity.jsonl"), coupled_pressure, coupled
+            )
+        legal_coupled = [
+            event("dispatch", 0, 0),
+            event("dispatch", 1, 1),
+            event("compile-start", 0, 0),
+            event("compile-finish", 0, 0),
+            event("dispatch", 2, 0),
+            event("compile-start", 1, 1),
+            event("compile-finish", 1, 1),
+            event("compile-start", 2, 0),
+            event("compile-finish", 2, 0),
+        ]
+        sim._validate_global_slots_and_round_robin(
+            Path("legal-coupled.jsonl"), legal_coupled, coupled
+        )
+
+    def test_global_slot_replay_rejects_overlap_and_allows_cross_worker_reuse(
+        self,
+    ) -> None:
+        manifest = {
+            "topology": {
+                "f_count": 2,
+                "f_slots": 1,
+                "input_staging_slots": 2,
+                "assignment_source": "policy",
+                "scheduler_policy": "rendezvous",
+            }
+        }
+
+        def event(
+            name: str, logical: int, worker: int, staging: int, compiler: int | None
+        ) -> dict[str, object]:
+            return {
+                "event": name,
+                "workload": "test",
+                "build": 0,
+                "logical": logical,
+                "worker": worker,
+                "staging_slot": staging,
+                "compiler_slot": compiler,
+            }
+
+        with self.assertRaisesRegex(
+            ValueError, "input-staging slot ownership overlaps"
+        ):
+            sim._validate_global_slots_and_round_robin(
+                Path("staging-overlap.jsonl"),
+                [
+                    event("dispatch", 0, 0, 0, None),
+                    event("dispatch", 1, 0, 0, None),
+                ],
+                manifest,
+            )
+        with self.assertRaisesRegex(ValueError, "compiler slot ownership overlaps"):
+            sim._validate_global_slots_and_round_robin(
+                Path("compiler-overlap.jsonl"),
+                [
+                    event("dispatch", 0, 0, 0, None),
+                    event("compile-start", 0, 0, 0, 0),
+                    event("dispatch", 1, 0, 0, None),
+                    event("compile-start", 1, 0, 0, 0),
+                ],
+                manifest,
+            )
+        legal_cross_worker = [
+            event("dispatch", 0, 0, 0, None),
+            event("dispatch", 1, 1, 0, None),
+            event("compile-start", 0, 0, 0, 0),
+            event("compile-start", 1, 1, 0, 0),
+            event("compile-finish", 0, 0, 0, 0),
+            event("compile-finish", 1, 1, 0, 0),
+        ]
+        sim._validate_global_slots_and_round_robin(
+            Path("legal-cross-worker.jsonl"), legal_cross_worker, manifest
+        )
+
+    def test_v2_c_index_and_event_worker_must_fit_declared_topology(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_v2_fixture(root, [10], [15], workers=1)
+            document = json.loads(path.read_text())
+            document["workload"]["jobs"][0]["c_index"] = 1
+            path.write_text(json.dumps(document, indent=2) + "\n")
+            with self.assertRaisesRegex(ValueError, "c_index .* outside c_count"):
+                sim.load_scenario(path)
+
+        manifest = {
+            "topology": {
+                "f_count": 1,
+                "f_slots": 1,
+                "input_staging_slots": 1,
+                "assignment_source": "policy",
+                "scheduler_policy": "round_robin",
+            }
+        }
+        outside = {
+            "event": "dispatch",
+            "workload": "test",
+            "build": 0,
+            "logical": 0,
+            "worker": 1,
+            "staging_slot": 0,
+            "compiler_slot": None,
+        }
+        with self.assertRaisesRegex(ValueError, "worker is outside topology"):
+            sim._validate_global_slots_and_round_robin(
+                Path("worker-outside.jsonl"), [outside], manifest
+            )
+
+    def test_v2_coupled_staging_mode_round_trips(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_v2_fixture(root, [30, 20, 10], [15, 22, 13], workers=2)
+            document = json.loads(path.read_text())
+            del document["topology"]["input_staging_slots"]
+            path.write_text(json.dumps(document, indent=2) + "\n")
+            scenario = sim.load_scenario(path)
+            self.assertNotIn(
+                "input_staging_slots", scenario.document["workers"]["template"]
+            )
+            result = sim.Simulator(scenario, sim.RawAdapter()).run()
+            self.assertEqual(
+                result.summary["compiler_slot_assignment"],
+                "reserved with scheduler assignment",
+            )
+            output = root / "out"
+            sim.write_result(scenario, result, output, execution_for(path))
+            self.assertEqual(
+                sim.validate_experiment_jsonl(output / "experiment.jsonl")["events"],
+                result.events.count,
+            )
+
     def test_retained_r4_sample_validates_and_replays(self) -> None:
         root = MODULE_PATH.parent / "samples" / "r4-minimum"
         scenario = sim.load_scenario(root / "experiment.json")

@@ -1748,8 +1748,32 @@ def logical_job_identity(scenario_digest: str, item: WorkItem) -> str:
     )
 
 
+def validate_v2_manifest_indices(
+    manifest: Mapping[str, object], context: object
+) -> None:
+    """Reject workload C indices outside the declared topology before identity use."""
+    topology = manifest["topology"]
+    workload = manifest["workload"]
+    assert isinstance(topology, Mapping)
+    assert isinstance(workload, Mapping)
+    c_count = checked_positive_int(topology["c_count"], "topology.c_count")
+    jobs = workload["jobs"]
+    assert isinstance(jobs, list)
+    for ordinal, job in enumerate(jobs):
+        assert isinstance(job, Mapping)
+        c_index = checked_nonnegative_int(
+            job["c_index"], f"workload.jobs[{ordinal}].c_index"
+        )
+        if c_index >= c_count:
+            raise ValueError(
+                f"{context}: workload.jobs[{ordinal}].c_index {c_index} "
+                f"is outside c_count {c_count}"
+            )
+
+
 def normalize_v2_manifest(manifest: dict[str, object]) -> dict[str, object]:
     """Translate the mode-neutral v2 contract into the established event engine shape."""
+    validate_v2_manifest_indices(manifest, "v2 manifest")
     topology = manifest["topology"]
     workload = manifest["workload"]
     capabilities = manifest["capabilities"]
@@ -1803,10 +1827,11 @@ def normalize_v2_manifest(manifest: dict[str, object]) -> dict[str, object]:
     )
     worker_template: dict[str, object] = {
         "slots": topology["f_slots"],
-        "input_staging_slots": topology.get("input_staging_slots", topology["f_slots"]),
         "compile_profile": worker_compile_profile,
         "initial_cache": ("cold" if cache["initial_state"] == "cold" else "retained"),
     }
+    if "input_staging_slots" in topology:
+        worker_template["input_staging_slots"] = topology["input_staging_slots"]
     normalized = {
         "schema": "icecream-distribution-scenario-v1",
         "name": manifest["name"],
@@ -2099,6 +2124,7 @@ def load_scenario(
     if schema == "icecream-experiment-v2":
         validate_json_schema(source_document, "experiment.schema.json", path)
         manifest = source_document
+        validate_v2_manifest_indices(manifest, path)
         capabilities = manifest["capabilities"]
         expected = manifest["expected"]
         assert isinstance(capabilities, dict) and isinstance(expected, dict)
@@ -4930,6 +4956,7 @@ def experiment_descriptor(
     scenario: LoadedScenario,
     result: SimulationResult,
     execution: dict[str, object] | None = None,
+    route_trace_evidence: Mapping[str, str] | None = None,
 ) -> dict[str, object]:
     """Build the deterministic descriptor which heads an experiment stream."""
     resolved = resolved_scenario_document(scenario)
@@ -5023,6 +5050,10 @@ def experiment_descriptor(
             raise ValueError(
                 "v2 experiment output requires a separate execution header"
             )
+        if route_trace_evidence is None:
+            raise ValueError(
+                "v2 experiment output requires retained route-trace evidence"
+            )
         descriptor = {
             "record": "execution",
             **execution,
@@ -5059,11 +5090,7 @@ def experiment_descriptor(
             },
             "expected_summary": result.summary,
         }
-        if scenario.route_trace:
-            descriptor["route_trace_evidence"] = {
-                "path": "route-trace.jsonl",
-                "sha256": scenario.route_trace_sha256,
-            }
+        descriptor["route_trace_evidence"] = dict(route_trace_evidence)
         if result.summary["physical_codec_result"]:
             descriptor["physical_ledger_evidence"] = {
                 "path": "physical-ledger.jsonl",
@@ -5120,9 +5147,12 @@ def experiment_records(
     scenario: LoadedScenario,
     result: SimulationResult,
     execution: dict[str, object] | None = None,
+    route_trace_evidence: Mapping[str, str] | None = None,
 ) -> tuple[dict[str, object], list[dict[str, object]], dict[str, object]]:
     """Materialize an experiment stream for small callers and focused tests."""
-    descriptor = experiment_descriptor(scenario, result, execution)
+    descriptor = experiment_descriptor(
+        scenario, result, execution, route_trace_evidence=route_trace_evidence
+    )
     timeline = list(iter_event_timeline(result))
     final = experiment_final(result)
     return descriptor, timeline, final
@@ -5156,10 +5186,13 @@ def write_experiment_stream(
     scenario: LoadedScenario,
     result: SimulationResult,
     execution: dict[str, object] | None = None,
+    route_trace_evidence: Mapping[str, str] | None = None,
     report_limit: int = MAX_REPORT_SNAPSHOTS,
 ) -> tuple[dict[str, object], list[dict[str, object]], dict[str, object]]:
     """Write the canonical stream while retaining only the bounded browser view."""
-    descriptor = experiment_descriptor(scenario, result, execution)
+    descriptor = experiment_descriptor(
+        scenario, result, execution, route_trace_evidence=route_trace_evidence
+    )
     final = experiment_final(result)
     selected, selection = selected_snapshot_ordinals(
         result.timeline.snapshot_count, report_limit
@@ -6052,6 +6085,130 @@ def _validate_event_semantics(
         raise ValueError(f"{path}: event {event_index} lacks a transaction")
 
 
+def _validate_global_slots_and_round_robin(
+    path: Path,
+    events: Sequence[Mapping[str, object]],
+    manifest: Mapping[str, object],
+) -> None:
+    """Replay dispatch capacity and both F slot lifetimes in canonical event order."""
+    topology = manifest["topology"]
+    assert isinstance(topology, Mapping)
+    f_count = int(topology["f_count"])
+    compiler_capacity = int(topology["f_slots"])
+    decoupled = "input_staging_slots" in topology
+    staging_capacity = int(topology.get("input_staging_slots", compiler_capacity))
+    round_robin = (
+        topology["assignment_source"] == "policy"
+        and topology["scheduler_policy"] == "round_robin"
+    )
+    round_robin_cursor = 0
+    staging_owners: dict[tuple[int, int], tuple[str, int, int]] = {}
+    compiler_owners: dict[tuple[int, int], tuple[str, int, int]] = {}
+    coupled_reservations: dict[tuple[int, int], tuple[str, int, int]] = {}
+    staging_counts = [0] * f_count
+    coupled_counts = [0] * f_count
+
+    def tu_identity(event: Mapping[str, object]) -> tuple[str, int, int]:
+        return (str(event["workload"]), int(event["build"]), int(event["logical"]))
+
+    def checked_worker(event: Mapping[str, object]) -> int:
+        worker = event["worker"]
+        if (
+            not isinstance(worker, int)
+            or isinstance(worker, bool)
+            or not 0 <= worker < f_count
+        ):
+            raise ValueError(f"{path}: capacity event worker is outside topology")
+        return worker
+
+    for event in events:
+        name = event["event"]
+        if name not in {"dispatch", "compile-start", "compile-finish"}:
+            continue
+        worker = checked_worker(event)
+        owner = tu_identity(event)
+        staging_slot = int(event["staging_slot"])
+
+        if name == "dispatch":
+            occupied_counts = coupled_counts if not decoupled else staging_counts
+            capacity = compiler_capacity if not decoupled else staging_capacity
+            free_workers = [
+                candidate
+                for candidate in range(f_count)
+                if occupied_counts[candidate] < capacity
+            ]
+            if not free_workers:
+                raise ValueError(f"{path}: dispatch occurred with no free F capacity")
+            if round_robin:
+                available = set(free_workers)
+                expected_worker = next(
+                    (round_robin_cursor + offset) % f_count
+                    for offset in range(f_count)
+                    if (round_robin_cursor + offset) % f_count in available
+                )
+                if worker != expected_worker:
+                    raise ValueError(
+                        f"{path}: round-robin dispatch differs from free-capacity replay"
+                    )
+                round_robin_cursor = (worker + 1) % f_count
+            staging_key = (worker, staging_slot)
+            if staging_key in staging_owners:
+                raise ValueError(f"{path}: input-staging slot ownership overlaps")
+            staging_owners[staging_key] = owner
+            staging_counts[worker] += 1
+            if not decoupled:
+                compiler_slot = int(event["compiler_slot"])
+                compiler_key = (worker, compiler_slot)
+                if compiler_key in coupled_reservations:
+                    raise ValueError(f"{path}: coupled compiler reservation overlaps")
+                coupled_reservations[compiler_key] = owner
+                coupled_counts[worker] += 1
+            continue
+
+        compiler_slot = int(event["compiler_slot"])
+        staging_key = (worker, staging_slot)
+        compiler_key = (worker, compiler_slot)
+        if name == "compile-start":
+            if staging_owners.get(staging_key) != owner:
+                raise ValueError(
+                    f"{path}: compile start does not own its input-staging slot"
+                )
+            # The engine releases the staging slot immediately before this event.  A later
+            # same-time dispatch may therefore reuse it; an earlier one may not.
+            del staging_owners[staging_key]
+            staging_counts[worker] -= 1
+            if compiler_key in compiler_owners:
+                raise ValueError(f"{path}: compiler slot ownership overlaps")
+            if not decoupled and coupled_reservations.get(compiler_key) != owner:
+                raise ValueError(
+                    f"{path}: compile start does not own its coupled reservation"
+                )
+            compiler_owners[compiler_key] = owner
+            continue
+
+        if compiler_owners.get(compiler_key) != owner:
+            raise ValueError(f"{path}: compile finish does not own its compiler slot")
+        # The engine releases the compiler slot immediately after this event.  Event order,
+        # including at equal timestamps, is therefore the authoritative reuse order.
+        del compiler_owners[compiler_key]
+        if not decoupled:
+            if coupled_reservations.get(compiler_key) != owner:
+                raise ValueError(
+                    f"{path}: compile finish does not own its coupled reservation"
+                )
+            del coupled_reservations[compiler_key]
+            coupled_counts[worker] -= 1
+
+    if (
+        staging_owners
+        or compiler_owners
+        or coupled_reservations
+        or any(staging_counts)
+        or any(coupled_counts)
+    ):
+        raise ValueError(f"{path}: F slot ownership remains open at stream closure")
+
+
 def _source_blob_sha256(commit: str) -> str:
     """Return the exact committed simulator blob digest used by retained evidence."""
     source_path = Path(__file__).resolve()
@@ -6182,6 +6339,7 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
     validate_json_schema(
         manifest, "experiment.schema.json", f"{path}:embedded scenario_manifest"
     )
+    validate_v2_manifest_indices(manifest, f"{path}:embedded scenario_manifest")
     scenario_digest = canonical_json_sha256(manifest)
     if header["scenario_digest"] != scenario_digest:
         raise ValueError(f"{path}: embedded scenario manifest digest differs")
@@ -6415,38 +6573,42 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
         or final_summary.get("placement_policy") != expected_placement
     ):
         raise ValueError(f"{path}: routing policy metadata differs from manifest")
-    trace_entries: dict[tuple[str, int, int], RouteTraceEntry] = {}
-    trace_digest: str | None = None
-    trace_provenance: str | None = None
-    if manifest["topology"]["assignment_source"] == "route_trace":
+    evidence = header.get("route_trace_evidence")
+    if not isinstance(evidence, dict):
+        raise ValueError(f"{path}: execution has no retained route-trace evidence")
+    evidence_identity = canonical_relative_identity(
+        evidence.get("path", ""), "route_trace_evidence.path"
+    )
+    if evidence_identity != "route-trace.jsonl":
+        raise ValueError(f"{path}: retained route-trace identity differs")
+    evidence_path = (path.parent / evidence_identity).resolve()
+    if not evidence_path.is_file():
+        raise ValueError(f"{path}: retained route-trace evidence is absent")
+    entries_by_ordinal, trace_digest, trace_provenance = load_route_trace(
+        evidence_path,
+        scenario_digest,
+        retained_work_items,
+        manifest["topology"]["f_count"],
+        selected_adapter,
+    )
+    trace_entries = {
+        ordinal_to_key[item_ordinal]: entry
+        for item_ordinal, entry in entries_by_ordinal.items()
+    }
+    trace_dispatch_order = [
+        ordinal_to_key[item_ordinal] for item_ordinal in entries_by_ordinal
+    ]
+    if evidence.get("sha256") != trace_digest:
+        raise ValueError(
+            f"{path}: retained route-trace digest differs from exact bytes"
+        )
+    if trace_assignment:
         if routing.get("route_trace") != manifest["topology"]["route_trace"]:
             raise ValueError(f"{path}: route-trace logical identity differs")
         if routing.get("route_trace_codec") != selected_adapter:
             raise ValueError(f"{path}: route-trace codec differs from selected adapter")
         if routing.get("route_trace_provenance") not in {"observed", "modeled"}:
             raise ValueError(f"{path}: route-trace provenance is invalid")
-        evidence = header.get("route_trace_evidence")
-        if not isinstance(evidence, dict):
-            raise ValueError(
-                f"{path}: exact replay has no retained route-trace evidence"
-            )
-        evidence_identity = canonical_relative_identity(
-            evidence.get("path", ""), "route_trace_evidence.path"
-        )
-        evidence_path = (path.parent / evidence_identity).resolve()
-        if not evidence_path.is_file():
-            raise ValueError(f"{path}: retained route-trace evidence is absent")
-        entries_by_ordinal, trace_digest, trace_provenance = load_route_trace(
-            evidence_path,
-            scenario_digest,
-            retained_work_items,
-            manifest["topology"]["f_count"],
-            selected_adapter,
-        )
-        trace_entries = {
-            ordinal_to_key[item_ordinal]: entry
-            for item_ordinal, entry in entries_by_ordinal.items()
-        }
         replay_claim = final_summary.get("replay_closure", {})
         claimed_digests = {
             evidence.get("sha256"),
@@ -6462,8 +6624,8 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
             or replay_claim.get("route_trace") != manifest["topology"]["route_trace"]
         ):
             raise ValueError(f"{path}: retained route-trace metadata differs")
-    elif "route_trace_evidence" in header:
-        raise ValueError(f"{path}: policy replay carries exact-route evidence")
+    elif trace_provenance != "modeled":
+        raise ValueError(f"{path}: policy route trace is not a modeled realization")
 
     timeline_rows = rows[1:-1]
     if rows[-1].get("timeline_records") != len(timeline_rows):
@@ -6622,6 +6784,7 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
         list
     )
     dispatch_transaction_sequences: list[int] = []
+    dispatch_order: list[tuple[str, int, int]] = []
     source_bytes_by_tu: dict[tuple[str, int, int], dict[str, int]] = defaultdict(
         lambda: defaultdict(int)
     )
@@ -6639,6 +6802,7 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
     environment_ready_by_route: dict[tuple[int, int], list[Mapping[str, object]]] = (
         defaultdict(list)
     )
+    decoupled_staging = "input_staging_slots" in manifest["topology"]
 
     def apply_history(
         deltas: Mapping[str, object],
@@ -6672,6 +6836,10 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
                 f"{path}:event {event_index} schema error at {location}: {failure.message}"
             )
         _validate_event_semantics(path, event_index, event)
+        if isinstance(event["worker"], int) and not (
+            0 <= event["worker"] < manifest["topology"]["f_count"]
+        ):
+            raise ValueError(f"{path}: event worker is outside topology")
         missing = [field for field in EVENT_IDENTITY_FIELDS if field not in event]
         if missing:
             raise ValueError(f"{path}: event lacks M3 fields {missing}")
@@ -6891,13 +7059,16 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
                 if (
                     event["worker"] != trace_entry.worker
                     or identity != expected_trace_identity
-                    or event["REL_SEQ"] != trace_entry.rel_seq
+                    or (
+                        event["event"] != "route-bound"
+                        and event["REL_SEQ"] != trace_entry.rel_seq
+                    )
                     or event["TU_SEQ"] != trace_entry.tu_seq
                 ):
                     raise ValueError(
                         f"{path}: event physical route differs from retained route trace"
                     )
-            elif workload != "":
+            if workload != "" and not trace_assignment:
                 expected_policy_identity = (
                     stable_hex(
                         "c-store", scenario_digest, event["environment"], digits=32
@@ -7025,29 +7196,28 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
                 (event["environment"], event["worker"])
             ].append(event["REL_SEQ"])
             dispatch_transaction_sequences.append(event["transaction"])
+            dispatch_order.append(tu_key)
         if event["event"] not in {"release", "route-bound"}:
             transaction_sequences_by_tu[tu_key].add(int(event["transaction"]))
             if not isinstance(event["slot"], int) or not isinstance(
                 event["staging_slot"], int
             ):
                 raise ValueError(f"{path}: transaction event lacks stable F slots")
+            staging_capacity = manifest["topology"].get(
+                "input_staging_slots", manifest["topology"]["f_slots"]
+            )
+            assignment_capacity = (
+                staging_capacity
+                if decoupled_staging
+                else manifest["topology"]["f_slots"]
+            )
             if not (
-                0
-                <= int(event["slot"])
-                < manifest["topology"].get(
-                    "input_staging_slots", manifest["topology"]["f_slots"]
-                )
-                and 0
-                <= int(event["staging_slot"])
-                < manifest["topology"].get(
-                    "input_staging_slots", manifest["topology"]["f_slots"]
-                )
+                0 <= int(event["slot"]) < assignment_capacity
+                and 0 <= int(event["staging_slot"]) < staging_capacity
             ):
                 raise ValueError(
                     f"{path}: transaction staging slot is outside topology"
                 )
-            if event["slot"] != event["staging_slot"]:
-                raise ValueError(f"{path}: assignment/staging slot aliases differ")
             assignment_slots_by_tu[tu_key].add(int(event["slot"]))
             staging_slots_by_tu[tu_key].add(int(event["staging_slot"]))
             compiler_slot = event["compiler_slot"]
@@ -7059,6 +7229,11 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
                 ):
                     raise ValueError(f"{path}: compiler slot is outside topology")
                 compiler_slots_by_tu[tu_key].add(compiler_slot)
+            expected_assignment_slot = (
+                event["staging_slot"] if decoupled_staging else compiler_slot
+            )
+            if event["slot"] != expected_assignment_slot:
+                raise ValueError(f"{path}: assignment slot aliases differ")
         if event["event"] == "environment_ready":
             environment_ready_by_route[(event["environment"], event["worker"])].append(
                 event
@@ -7107,6 +7282,7 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
             queue_names,
             "queue",
         )
+    _validate_global_slots_and_round_robin(path, events, manifest)
     if flow_queued_ids != list(range(len(flow_descriptors))):
         raise ValueError(f"{path}: global flow allocation is not unique and contiguous")
     if set(flow_descriptors) != set(flow_sent_times) or set(flow_descriptors) != set(
@@ -7193,7 +7369,9 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
                 continue
             before_compile = int(event["sequence"]) < compile_start_sequence
             expected_slot: int | None = (
-                None if before_compile else established_compiler_slot
+                None
+                if decoupled_staging and before_compile
+                else established_compiler_slot
             )
             if event["compiler_slot"] != expected_slot:
                 raise ValueError(f"{path}: TU {key} compiler slot lifetime differs")
@@ -7250,7 +7428,8 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
         waiting = [
             event for event in queued if event["detail"] == "waiting-for-environment"
         ]
-        if len(normal) != 1:
+        expected_normal = int(decoupled_staging)
+        if len(normal) != expected_normal:
             raise ValueError(f"{path}: TU {key} compiler queue cardinality differs")
         expected_waiting = 0
         if environment_manifest["initial_state"] == "absent":
@@ -7259,11 +7438,14 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
                 event for event in tu_events if event["event"] == "input-ready"
             )
             expected_waiting = int(input_ready["sequence"] < ready_event["sequence"])
-            if int(normal[0]["sequence"]) <= int(ready_event["sequence"]):
+            if normal and int(normal[0]["sequence"]) <= int(ready_event["sequence"]):
                 raise ValueError(
                     f"{path}: TU {key} entered the compiler queue before environment readiness"
                 )
-        if len(waiting) != expected_waiting or len(queued) != 1 + expected_waiting:
+        if (
+            len(waiting) != expected_waiting
+            or len(queued) != expected_normal + expected_waiting
+        ):
             raise ValueError(f"{path}: TU {key} compiler queue detail differs")
 
     for job in manifest["workload"]["jobs"]:
@@ -7293,6 +7475,10 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
 
     if dispatch_transaction_sequences != list(range(len(expected_tu_keys))):
         raise ValueError(f"{path}: dispatch transaction sequence is not contiguous")
+    if not trace_assignment and dispatch_order != trace_dispatch_order:
+        raise ValueError(
+            f"{path}: policy route trace order differs from dispatch order"
+        )
     if (
         len(transaction_identities) != len(expected_tu_keys)
         or len(transaction_digests) != len(expected_tu_keys)
@@ -7357,7 +7543,11 @@ def validate_experiment_jsonl(path: Path) -> dict[str, int]:
         "scenario_digest": scenario_digest,
         "relationship_ordering": RELATIONSHIP_ORDERING,
         "ready_job_policy": expected_ready_policy,
-        "compiler_slot_assignment": "at input readiness",
+        "compiler_slot_assignment": (
+            "at input readiness"
+            if decoupled_staging
+            else "reserved with scheduler assignment"
+        ),
         "source_transfer_score_excludes_environment": True,
         "tu_availability": "all-at-zero-at-each-build-release",
         "preprocessing_in_score": False,
@@ -7978,6 +8168,10 @@ def write_result(
             retained_route_trace.write_bytes(scenario.route_trace_path.read_bytes())
         else:
             write_route_trace(retained_route_trace, scenario, result)
+        route_trace_evidence = {
+            "path": "route-trace.jsonl",
+            "sha256": sha256(retained_route_trace),
+        }
         if result.summary.get("physical_codec_result"):
             if result.physical_ledger_path is None:
                 raise RuntimeError("physical result has no retained ledger path")
@@ -7985,7 +8179,11 @@ def write_result(
             if retained_ledger.resolve() != result.physical_ledger_path.resolve():
                 shutil.copyfile(result.physical_ledger_path, retained_ledger)
     descriptor, timeline, final = write_experiment_stream(
-        output_directory / "experiment.jsonl", scenario, result, execution
+        output_directory / "experiment.jsonl",
+        scenario,
+        result,
+        execution,
+        route_trace_evidence=(route_trace_evidence if scenario.is_v2 else None),
     )
     (output_directory / "report.html").write_text(
         render_report_html(descriptor, timeline, final)
