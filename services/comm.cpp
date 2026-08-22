@@ -1437,6 +1437,26 @@ Msg *MsgChannel::get_msg(int timeout, bool eofAllowed)
     case Msg::CS_CONF:
         m = new ConfCSMsg;
         break;
+    case Msg::ASSIGN_PREPARE:
+        if (IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_FENCE, this)) {
+            m = new AssignPrepareMsg;
+        }
+        break;
+    case Msg::ASSIGN_READY:
+        if (IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_FENCE, this)) {
+            m = new AssignReadyMsg;
+        }
+        break;
+    case Msg::REVOKE_BEFORE_START:
+        if (IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_FENCE, this)) {
+            m = new RevokeBeforeStartMsg;
+        }
+        break;
+    case Msg::REVOKE_RESULT:
+        if (IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_FENCE, this)) {
+            m = new RevokeResultMsg;
+        }
+        break;
     case Msg::VERIFY_ENV:
         m = new VerifyEnvMsg;
         break;
@@ -2728,6 +2748,14 @@ void ConfCSMsg::fill_from_channel(MsgChannel *c)
     *c >> max_scheduler_ping;
     string bench_source; // unused, kept for backwards compatibility
     *c >> bench_source;
+    if (IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_FENCE, c)) {
+        *c >> epoch_hi;
+        *c >> epoch_lo;
+        *c >> fence_mode;
+    } else {
+        epoch_hi = epoch_lo = 0;
+        fence_mode = Legacy;
+    }
 }
 
 void ConfCSMsg::send_to_channel(MsgChannel *c) const
@@ -2737,6 +2765,97 @@ void ConfCSMsg::send_to_channel(MsgChannel *c) const
     *c << max_scheduler_ping;
     string bench_source;
     *c << bench_source;
+    if (IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_FENCE, c)) {
+        *c << epoch_hi;
+        *c << epoch_lo;
+        *c << fence_mode;
+    }
+}
+
+void AssignPrepareMsg::fill_from_channel(MsgChannel *c)
+{
+    Msg::fill_from_channel(c);
+    *c >> epoch_hi;
+    *c >> epoch_lo;
+    *c >> wire_id;
+    *c >> nonce_hi;
+    *c >> nonce_lo;
+    *c >> submitter_hostid;
+    *c >> flags;
+}
+
+void AssignPrepareMsg::send_to_channel(MsgChannel *c) const
+{
+    Msg::send_to_channel(c);
+    *c << epoch_hi;
+    *c << epoch_lo;
+    *c << wire_id;
+    *c << nonce_hi;
+    *c << nonce_lo;
+    *c << submitter_hostid;
+    *c << flags;
+}
+
+void AssignReadyMsg::fill_from_channel(MsgChannel *c)
+{
+    Msg::fill_from_channel(c);
+    *c >> epoch_hi;
+    *c >> epoch_lo;
+    *c >> wire_id;
+    *c >> nonce_hi;
+    *c >> nonce_lo;
+}
+
+void AssignReadyMsg::send_to_channel(MsgChannel *c) const
+{
+    Msg::send_to_channel(c);
+    *c << epoch_hi;
+    *c << epoch_lo;
+    *c << wire_id;
+    *c << nonce_hi;
+    *c << nonce_lo;
+}
+
+void RevokeBeforeStartMsg::fill_from_channel(MsgChannel *c)
+{
+    Msg::fill_from_channel(c);
+    *c >> epoch_hi;
+    *c >> epoch_lo;
+    *c >> wire_id;
+    *c >> nonce_hi;
+    *c >> nonce_lo;
+}
+
+void RevokeBeforeStartMsg::send_to_channel(MsgChannel *c) const
+{
+    Msg::send_to_channel(c);
+    *c << epoch_hi;
+    *c << epoch_lo;
+    *c << wire_id;
+    *c << nonce_hi;
+    *c << nonce_lo;
+}
+
+void RevokeResultMsg::fill_from_channel(MsgChannel *c)
+{
+    Msg::fill_from_channel(c);
+    *c >> epoch_hi;
+    *c >> epoch_lo;
+    *c >> wire_id;
+    *c >> nonce_hi;
+    *c >> nonce_lo;
+    *c >> result;
+}
+
+void RevokeResultMsg::send_to_channel(MsgChannel *c) const
+{
+    Msg::send_to_channel(c);
+    *c << epoch_hi;
+    *c << epoch_lo;
+    *c << wire_id;
+    *c << nonce_hi;
+    *c << nonce_lo;
+    *c << result;
 }
 
 void StatsMsg::fill_from_channel(MsgChannel *c)

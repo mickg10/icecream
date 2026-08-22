@@ -302,9 +302,11 @@ int main(int argc, char **argv)
     REQUIRE(relogin != nullptr, "replacement scheduler received Login");
     delete relogin;
     if (active) {
-        REQUIRE(active->send_msg(ConfCSMsg()),
+        const ConfCSMsg legacy_config(UINT64_C(0x4700000000000001),
+                                      ConfCSMsg::Legacy);
+        REQUIRE(active->send_msg(legacy_config),
                 "replacement scheduler sent the activating ConfCS");
-        REQUIRE(active->send_msg(ConfCSMsg()),
+        REQUIRE(active->send_msg(legacy_config),
                 "replacement scheduler sent a duplicate ConfCS");
     }
     usleep(100 * 1000);

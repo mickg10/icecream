@@ -49,6 +49,9 @@
 #include <fstream>
 #include <string>
 #include <limits>
+#include <random>
+#include <set>
+#include <unordered_map>
 #include <stdio.h>
 #include <pwd.h>
 #include "../services/comm.h"
@@ -113,6 +116,95 @@ static list<CompileServer *> monitors;
 static list<CompileServer *> controls;
 static list<string> block_css;
 static map<unsigned int, Job *> jobs;
+
+struct SchedulerAssignmentKey {
+    uint64_t epoch;
+    uint32_t wire_id;
+    uint64_t nonce;
+
+    bool operator==(const SchedulerAssignmentKey &other) const
+    {
+        return epoch == other.epoch && wire_id == other.wire_id
+            && nonce == other.nonce;
+    }
+};
+
+struct SchedulerAssignmentKeyHash {
+    size_t operator()(const SchedulerAssignmentKey &key) const
+    {
+        size_t h = std::hash<uint64_t>()(key.epoch);
+        h ^= std::hash<uint64_t>()(key.nonce) + 0x9e3779b9u + (h << 6) + (h >> 2);
+        h ^= std::hash<uint32_t>()(key.wire_id) + 0x9e3779b9u + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+/* Control replies use the full identity as their expected-O(1) lookup key;
+   the historical jobs map remains the wire-id index for legacy traffic. */
+static std::unordered_map<SchedulerAssignmentKey, Job *,
+                          SchedulerAssignmentKeyHash> fenced_assignments;
+
+/* Protocol-49 assignment fencing is an explicit scheduler policy and stays
+   LEGACY by default.  STRICT_NONCE is reserved here but cannot be activated
+   until protocol 50 carries the identity through the client path. */
+static ConfCSMsg::FenceMode assignment_fence_mode = ConfCSMsg::Legacy;
+static uint64_t scheduler_assignment_epoch = 0;
+
+static bool assignment_mode_prepares()
+{
+    return assignment_fence_mode == ConfCSMsg::Advisory
+        || assignment_fence_mode == ConfCSMsg::EnforcingCompat;
+}
+
+static uint64_t fresh_assignment_word()
+{
+    static std::mt19937_64 generator([] {
+        std::random_device rd;
+        std::seed_seq seed { rd(), rd(), rd(), rd(),
+                             uint32_t(getpid()), uint32_t(time(nullptr)) };
+        return std::mt19937_64(seed);
+    }());
+    uint64_t value = 0;
+    while (value == 0) {
+        value = generator();
+    }
+    return value;
+}
+
+static uint64_t fresh_assignment_nonce()
+{
+    /* One scheduler thread owns this cursor.  The randomized starting point
+       avoids a fixed wire pattern; monotonic allocation guarantees no reuse
+       within an epoch.  Exhaustion is terminal rather than wrapping onto a
+       previously issued identity. */
+    static uint64_t cursor = fresh_assignment_word();
+    static uint64_t issued = 0;
+    if (issued == std::numeric_limits<uint64_t>::max()) {
+        log_error() << "protocol-49 assignment nonce domain exhausted" << endl;
+        abort();
+    }
+    do {
+        ++cursor;
+    } while (cursor == 0);
+    ++issued;
+    return cursor;
+}
+
+static ConfCSMsg scheduler_conf_message()
+{
+    return ConfCSMsg(scheduler_assignment_epoch, assignment_fence_mode);
+}
+
+static const char *assignment_mode_name(ConfCSMsg::FenceMode mode)
+{
+    switch (mode) {
+    case ConfCSMsg::Legacy: return "legacy";
+    case ConfCSMsg::Advisory: return "advisory";
+    case ConfCSMsg::EnforcingCompat: return "enforcing-compat";
+    case ConfCSMsg::StrictNonce: return "strict-nonce";
+    }
+    return "invalid";
+}
 
 /* XXX Uah.  Don't use a queue for the job requests.  It's a hell
    to delete anything out of them (for clean up).  */
@@ -476,6 +568,11 @@ static unsigned long detached_terminal_rejects = 0;
 static unsigned long nonwaiting_begin_rejects = 0;
 static unsigned long duplicate_local_begin_ignored = 0;
 static unsigned long id_release_violations = 0;
+static unsigned long assignment_ready_accepted = 0;
+static unsigned long assignment_ready_ignored = 0;
+static unsigned long assignment_revoke_requested = 0;
+static unsigned long assignment_terminal_accepted = 0;
+static unsigned long assignment_terminal_ignored = 0;
 /* Pre-login lease, population bound, and accept quantum (issue #4 P1).
    Named conservative defaults; test overrides via environment.  */
 static uint64_t prelogin_lease_msec = 15000;        // T_login
@@ -1188,9 +1285,42 @@ static void release_local_id(uint32_t id)
     }
 }
 
+static SchedulerAssignmentKey assignment_key(const Job *job)
+{
+    return SchedulerAssignmentKey {
+        job->assignmentEpoch(), job->id(), job->assignmentNonce()
+    };
+}
+
+static void index_fenced_assignment(Job *job)
+{
+    assert(job && job->assignmentFenced());
+    const auto inserted = fenced_assignments.emplace(assignment_key(job), job);
+    if (!inserted.second || inserted.first->second != job) {
+        log_error() << "duplicate full P49 assignment identity for job "
+                    << job->id() << endl;
+        abort();
+    }
+}
+
+static void unindex_fenced_assignment(Job *job)
+{
+    if (!job || !job->assignmentFenced()) {
+        return;
+    }
+    auto indexed = fenced_assignments.find(assignment_key(job));
+    if (indexed != fenced_assignments.end() && indexed->second == job) {
+        fenced_assignments.erase(indexed);
+    } else {
+        log_error() << "missing full P49 assignment index for job "
+                    << job->id() << endl;
+    }
+}
+
 static void remove_job_entry(map<unsigned int, Job *>::iterator it)
 {
     const unsigned int id = it->first;
+    unindex_fenced_assignment(it->second);
     jobs.erase(it);
     if (!job_id_allocator().release(id)) {
         ++id_release_violations;
@@ -1291,6 +1421,45 @@ static void credit_dispatch_credit(Job *job)
                         << ")" << endl;
         }
     }
+}
+
+static bool send_remote_dispatch_reply(Job *job)
+{
+    assert(job);
+    assert(job->submitter());
+    assert(job->server());
+    UseCSMsg reply(job->dispatchPlatform(), job->server()->name,
+                   job->server()->remotePort(), job->id(),
+                   job->dispatchGotEnv(), job->localClientId(),
+                   job->dispatchMatchedJobId());
+    return job->submitter()->send_msg(
+        reply, MsgChannel::SendNonBlocking | MsgChannel::SendDeferrable);
+}
+
+/* Queue the revoke on the same ordered S->F stream as PREPARE.  A successful
+   return means only that ownership is retained in REVOKE_PENDING; release is
+   exclusively the matching REVOKE_RESULT transition. */
+static bool request_assignment_revoke(Job *job)
+{
+    if (!job || !job->assignmentFenced() || !job->server()
+            || job->assignmentPhase() == Job::ASSIGNMENT_REVOKE_PENDING
+            || job->assignmentPhase() == Job::ASSIGNMENT_CLAIMED_OR_LATER
+            || job->assignmentPhase() == Job::ASSIGNMENT_TERMINAL) {
+        return true;
+    }
+    if (job->assignmentPhase() != Job::ASSIGNMENT_PREPARED
+            && job->assignmentPhase() != Job::ASSIGNMENT_READY) {
+        return false;
+    }
+    RevokeBeforeStartMsg revoke(job->assignmentEpoch(), job->id(),
+                                job->assignmentNonce());
+    if (!job->server()->send_msg(
+            revoke, MsgChannel::SendNonBlocking | MsgChannel::SendDeferrable)) {
+        return false;
+    }
+    job->setAssignmentPhase(Job::ASSIGNMENT_REVOKE_PENDING);
+    ++assignment_revoke_requested;
+    return true;
 }
 
 /* A submitter is eligible for new assignments only when it is neither
@@ -1797,6 +1966,16 @@ static list<CompileServer *> filter_ineligible_servers(Job *job)
         css.end(),
         std::back_inserter(eligible),
         [=](CompileServer* cs) {
+            /* PREPARE is admitted only onto an empty S->F userspace queue.
+               Appending another assignment behind deferred output would make
+               an already bounded backlog the admission path for new work. */
+            if (cs != job->submitter() && assignment_mode_prepares()
+                    && IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_FENCE, cs)
+                    && cs->has_pending_write()) {
+                trace() << cs->nodeName()
+                        << " has deferred assignment-control output" << endl;
+                return false;
+            }
             if (!cs->is_eligible_now(job)) {
 #if DEBUG_SCHEDULER > 1
                 if ((cs->currentJobCount() >= cs->maxJobs() + cs->maxPreloadCount()) || (cs->load() >= 1000)) {
@@ -2069,7 +2248,12 @@ static CompileServer *pick_server(Job *job, SchedulerAlgorithmName schedulerAlgo
     /* if the user wants to test/prefer one specific daemon, we return it if available */
     if (!job->preferredHost().empty()) {
         for (CompileServer* const cs : css) {
-            if (cs->matches(job->preferredHost()) && cs->is_eligible_now(job)) {
+            const bool prepare_backlogged = cs != job->submitter()
+                && assignment_mode_prepares()
+                && IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_FENCE, cs)
+                && cs->has_pending_write();
+            if (cs->matches(job->preferredHost()) && cs->is_eligible_now(job)
+                    && !prepare_backlogged) {
 #if DEBUG_SCHEDULER > 1
                 trace() << "taking preferred " << cs->nodeName() << " " <<  server_speed(cs, job, true) << endl;
 #endif
@@ -2496,6 +2680,41 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
        submitter itself, and both reserve zero remote farm capacity.  */
     const bool local_decision = (use_cs == job->submitter());
 
+    job->setDispatchProjection(host_platform, gotit, matched_job_id);
+
+    /* The policy is frozen per assignment before either peer can observe it.
+       Prepared P49 is selected only for a remote decision on a worker link
+       that negotiated the complete vocabulary.  Legacy mode and old workers take
+       the exact legacy path below: no PREPARE, no READY wait, no REVOKE. */
+    const bool prepared_assignment = !local_decision
+        && assignment_mode_prepares()
+        && IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_FENCE, use_cs);
+    if (prepared_assignment) {
+        job->setAssignmentPolicy(
+            assignment_fence_mode == ConfCSMsg::Advisory
+                ? Job::ASSIGNMENT_ADVISORY
+                : Job::ASSIGNMENT_ENFORCING_COMPAT);
+        job->setAssignmentIdentity(scheduler_assignment_epoch,
+                                   fresh_assignment_nonce());
+        job->setAssignmentPhase(Job::ASSIGNMENT_PREPARED);
+        index_fenced_assignment(job);
+        AssignPrepareMsg prepare(job->assignmentEpoch(), job->id(),
+                                 job->assignmentNonce(),
+                                 job->submitter()->hostId());
+        if (!use_cs->send_msg(
+                prepare, MsgChannel::SendNonBlocking | MsgChannel::SendDeferrable)) {
+            trace() << "failed to prepare assignment " << job->id() << endl;
+            handle_end(use_cs, nullptr);
+            return true;
+        }
+        /* Admission is the accepted PREPARE enqueue, not later READY or
+           client exposure.  Charge exactly here for both prepared modes. */
+        debit_dispatch_credit(job);
+    } else {
+        job->setAssignmentPolicy(Job::ASSIGNMENT_LEGACY);
+        job->setAssignmentPhase(Job::ASSIGNMENT_NONE);
+    }
+
     if (IS_PROTOCOL_VERSION(37, job->submitter()) && local_decision)
     {
         NoCSMsg m2(job->id(), job->localClientId());
@@ -2505,11 +2724,9 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
             return true;
         }
     }
-    else
+    else if (!prepared_assignment || !job->assignmentReadyGated())
     {
-        UseCSMsg m2(host_platform, use_cs->name, use_cs->remotePort(), job->id(),
-                gotit, job->localClientId(), matched_job_id);
-        if (!job->submitter()->send_msg(m2, MsgChannel::SendNonBlocking | MsgChannel::SendDeferrable)) {
+        if (!send_remote_dispatch_reply(job)) {
             trace() << "failed to deliver job " << job->id() << endl;
             handle_end(job->submitter(), nullptr);   // will care for the rest
             return true;
@@ -2522,7 +2739,7 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
        gate itself out of a live farm and then lose its queued and in-flight
        jobs to the liveness bound.  Reproduced: 0 of 3000 jobs served while
        the farm served 189 to another submitter.  */
-    if (!local_decision) {
+    if (!local_decision && !job->dispatchOutstanding()) {
         debit_dispatch_credit(job);
     }
 
@@ -2626,7 +2843,7 @@ static bool handle_login(CompileServer *cs, Msg *_m)
 
     /* Configure the daemon */
     if (IS_PROTOCOL_VERSION(24, cs)) {
-        cs->send_msg(ConfCSMsg());
+        cs->send_msg(scheduler_conf_message());
     }
 
     return true;
@@ -2655,7 +2872,7 @@ static bool handle_relogin(MsgChannel *mc, Msg *_m)
 
     /* Configure the daemon */
     if (IS_PROTOCOL_VERSION(24, cs)) {
-        cs->send_msg(ConfCSMsg());
+        cs->send_msg(scheduler_conf_message());
     }
 
     return false;
@@ -2683,6 +2900,80 @@ static bool handle_mon_login(CompileServer *cs, Msg *_m)
     }
 
     fd2cs.erase(cs->fd);   // no expected data from them
+    return true;
+}
+
+static bool handle_assignment_ready(CompileServer *cs, Msg *_m)
+{
+    AssignReadyMsg *m = dynamic_cast<AssignReadyMsg *>(_m);
+    if (!m || m->epoch() == 0 || m->wire_id == 0 || m->nonce() == 0) {
+        ++assignment_ready_ignored;
+        return true;
+    }
+    const SchedulerAssignmentKey key { m->epoch(), m->wire_id, m->nonce() };
+    auto indexed = fenced_assignments.find(key);
+    if (indexed == fenced_assignments.end()) {
+        ++assignment_ready_ignored;
+        return true;
+    }
+    Job *job = indexed->second;
+    if (job->server() != cs
+            || job->assignmentPhase() != Job::ASSIGNMENT_PREPARED) {
+        /* Duplicate, stale, post-revoke, and wrong-worker READY messages are
+           bounded no-ops.  In particular they never resurrect exposure. */
+        ++assignment_ready_ignored;
+        return true;
+    }
+
+    job->setAssignmentPhase(Job::ASSIGNMENT_READY);
+    ++assignment_ready_accepted;
+    if (job->assignmentReadyGated() && !send_remote_dispatch_reply(job)) {
+        trace() << "failed to expose ready assignment " << job->id() << endl;
+        handle_end(job->submitter(), nullptr);
+    }
+    return true;
+}
+
+static bool handle_assignment_terminal(CompileServer *cs, Msg *_m)
+{
+    RevokeResultMsg *m = dynamic_cast<RevokeResultMsg *>(_m);
+    if (!m || m->epoch() == 0 || m->wire_id == 0 || m->nonce() == 0
+            || !m->validResult()) {
+        ++assignment_terminal_ignored;
+        return true;
+    }
+    const SchedulerAssignmentKey key { m->epoch(), m->wire_id, m->nonce() };
+    auto indexed = fenced_assignments.find(key);
+    if (indexed == fenced_assignments.end()) {
+        ++assignment_terminal_ignored;
+        return true;
+    }
+    Job *job = indexed->second;
+    if (job->server() != cs
+            || job->assignmentPhase() != Job::ASSIGNMENT_REVOKE_PENDING) {
+        ++assignment_terminal_ignored;
+        return true;
+    }
+
+    ++assignment_terminal_accepted;
+    if (m->result == RevokeResultMsg::ClaimedOrLater) {
+        /* The claim won at F.  JobBegin may already have advanced the product
+           state, or may follow once a claimed request reaches the load gate.
+           Either way ownership remains until the worker's ordinary JobDone. */
+        job->setAssignmentPhase(Job::ASSIGNMENT_CLAIMED_OR_LATER);
+        return true;
+    }
+
+    job->setAssignmentPhase(Job::ASSIGNMENT_TERMINAL);
+    if (job->server()) {
+        job->server()->removeJob(job);
+    }
+    credit_dispatch_credit(job);
+    notify_monitors(new MonJobDoneMsg(JobDoneMsg(job->id(), 255)));
+    map<unsigned int, Job *>::iterator it = jobs.find(job->id());
+    assert(it != jobs.end() && it->second == job);
+    remove_job_entry(it);
+    delete job;
     return true;
 }
 
@@ -2733,6 +3024,10 @@ static bool handle_job_begin(CompileServer *cs, Msg *_m)
     credit_dispatch_credit(job);
 
     job->setState(Job::COMPILING);
+    if (job->assignmentFenced()
+            && job->assignmentPhase() != Job::ASSIGNMENT_REVOKE_PENDING) {
+        job->setAssignmentPhase(Job::ASSIGNMENT_CLAIMED_OR_LATER);
+    }
     job->setStartTime(m->stime);
     job->setStartOnScheduler(time(nullptr));
     notify_monitors(new MonJobBeginMsg(m->job_id, m->stime, cs->hostId()));
@@ -2934,6 +3229,24 @@ static bool handle_job_done(CompileServer *cs, Msg *_m)
 
 
     cs->setClientCount(m->client_count);
+
+    /* A P49 submitter terminal before Begin requests ordered withdrawal; it
+       is not itself permission to release the worker reservation.  Sever the
+       submitter authority now (duplicate bounces become harmless), retain the
+       job, and wait for the exact F terminal. */
+    if (!m->is_from_server() && j->assignmentFenced()
+            && j->state() == Job::WAITINGFORCS
+            && (j->assignmentPhase() == Job::ASSIGNMENT_PREPARED
+                || j->assignmentPhase() == Job::ASSIGNMENT_READY)) {
+        CompileServer *worker = j->server();
+        j->detachSubmitter();
+        if (!request_assignment_revoke(j)) {
+            /* A failed ordered send means this worker session is unusable;
+               its teardown is the terminal boundary for all its jobs. */
+            handle_end(worker, nullptr);
+        }
+        return true;
+    }
 
     if (m->exitcode == 0) {
         std::ostream &dbg = trace();
@@ -3619,6 +3932,7 @@ static bool try_login(CompileServer *cs, Msg *m)
 static bool handle_end(CompileServer *toremove, Msg *m)
 {
     prelogin_release(toremove);
+    std::set<CompileServer *> failed_fence_workers;
 
     /* Settle any internals-transaction involvement exactly once: a dead
        control cancels the whole fan-out (late replies revert to the
@@ -3716,6 +4030,45 @@ static bool handle_end(CompileServer *toremove, Msg *m)
             Job *job = mit->second;
 
             if (job->server() == toremove || job->submitter() == toremove) {
+                /* Prepared P49 closes the dispatched-not-claimed gap: when the
+                   submitter disappears, keep the assignment owned, queue an
+                   ordered revoke, and release only on its matching result.
+                   The job is detached before `toremove` can be destroyed. */
+                if (job->submitter() == toremove
+                        && job->server() && job->server() != toremove
+                        && job->state() == Job::WAITINGFORCS
+                        && job->assignmentFenced()
+                        && (job->assignmentPhase() == Job::ASSIGNMENT_PREPARED
+                            || job->assignmentPhase() == Job::ASSIGNMENT_READY
+                            || job->assignmentPhase() == Job::ASSIGNMENT_REVOKE_PENDING)) {
+                    job->detachSubmitter();
+                    if (request_assignment_revoke(job)) {
+                        trace() << "submitter gone; retaining fenced assignment "
+                                << job->id() << " until worker terminal" << endl;
+                        ++mit;
+                        continue;
+                    }
+                    /* The worker channel rejected the ordered control send.
+                       Do not infer release from the failed send alone.  Retain
+                       the assignment until this turn tears down that exact
+                       worker session, which is the established terminal
+                       boundary for every job it owns. */
+                    failed_fence_workers.insert(job->server());
+                    ++mit;
+                    continue;
+                }
+
+                if (job->submitter() == toremove
+                        && job->server() && job->server() != toremove
+                        && job->assignmentFenced()
+                        && job->assignmentPhase() == Job::ASSIGNMENT_CLAIMED_OR_LATER) {
+                    trace() << "submitter gone after fenced claim for job "
+                            << job->id() << "; retaining for worker completion" << endl;
+                    job->detachSubmitter();
+                    ++mit;
+                    continue;
+                }
+
                 /* A job already COMPILING on a DIFFERENT, live worker when
                    its submitter disconnects must NOT be deleted here: the
                    worker is physically running the compiler and its real
@@ -3768,6 +4121,12 @@ static bool handle_end(CompileServer *toremove, Msg *m)
             } else {
                 ++mit;
             }
+        }
+
+        for (CompileServer *failed_worker : failed_fence_workers) {
+            trace() << "tearing down worker after failed ordered revoke: "
+                    << failed_worker->nodeName() << endl;
+            handle_end(failed_worker, nullptr);
         }
 
         for (CompileServer * const cs : css) {
@@ -3835,6 +4194,12 @@ static bool handle_activity(CompileServer *cs)
         break;
     case Msg::JOB_DONE:
         ret = handle_job_done(cs, m);
+        break;
+    case Msg::ASSIGN_READY:
+        ret = handle_assignment_ready(cs, m);
+        break;
+    case Msg::REVOKE_RESULT:
+        ret = handle_assignment_terminal(cs, m);
         break;
     case Msg::PING:
         ret = handle_ping(cs, m);
@@ -4053,6 +4418,9 @@ static void usage(const std::string reason = "")
          << "  -a, --algorithm <name>\n"
          << "  --max-outstanding-dispatches <n>   per-submitter unconfirmed dispatch credit (1-1024, default 32)\n"
          << "  --dispatch-stall-report-after <sec>  report (do not remove) a submitter whose oldest unconfirmed dispatch exceeds this; its assignment and worker reservation are retained (10-3600, default 180)\n"
+         << "  --assignment-fence-mode <legacy|advisory|enforcing-compat|strict-nonce>\n"
+         << "                                      P49 assignment policy (default legacy; strict-nonce requires P50)\n"
+         << "  --assignment-fence-strict          compatibility alias for enforcing-compat\n"
          << endl;
 
     exit(1);
@@ -4160,6 +4528,8 @@ int main(int argc, char *argv[])
             /* Compatibility alias for the previous spelling, from when this
                bound removed the submitter instead of reporting it.  */
             { "dispatch-stall-timeout", 1, nullptr, 1002 },
+            { "assignment-fence-strict", 0, nullptr, 1003 },
+            { "assignment-fence-mode", 1, nullptr, 1004 },
             { nullptr, 0, nullptr, 0 }
         };
 
@@ -4309,6 +4679,26 @@ int main(int argc, char *argv[])
             break;
         }
 
+        case 1003:
+            assignment_fence_mode = ConfCSMsg::EnforcingCompat;
+            break;
+
+        case 1004: {
+            const string mode = optarg ? optarg : "";
+            if (mode == "legacy") {
+                assignment_fence_mode = ConfCSMsg::Legacy;
+            } else if (mode == "advisory") {
+                assignment_fence_mode = ConfCSMsg::Advisory;
+            } else if (mode == "enforcing-compat") {
+                assignment_fence_mode = ConfCSMsg::EnforcingCompat;
+            } else if (mode == "strict-nonce") {
+                usage("Error: strict-nonce requires protocol 50 nonce-bearing client claims");
+            } else {
+                usage("Error: unknown --assignment-fence-mode: " + mode);
+            }
+            break;
+        }
+
         default:
             usage();
         }
@@ -4353,10 +4743,15 @@ int main(int argc, char *argv[])
 
     setup_debug(debug_level, logfile);
 
+    scheduler_assignment_epoch = fresh_assignment_word();
+
     log_info() << "ICECREAM scheduler " VERSION " starting up, port " << scheduler_port << endl;
     log_info() << "dispatch credit: " << max_outstanding_dispatches
                << " unconfirmed per submitter (farm-clamped at runtime), stall reported after "
                << (max_outstanding_stall_msec / 1000) << "s" << endl;
+    log_info() << "assignment fence: "
+               << assignment_mode_name(assignment_fence_mode)
+               << " epoch=" << scheduler_assignment_epoch << endl;
     log_info() << "Debug level: " << debug_level << endl;
 
     if (detach) {

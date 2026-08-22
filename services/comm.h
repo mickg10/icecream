@@ -38,11 +38,12 @@
 #include <stdint.h>
 
 // if you increase the PROTOCOL_VERSION, add a macro below and use that
-#define PROTOCOL_VERSION 48
+#define PROTOCOL_VERSION 49
 // if you increase the MIN_PROTOCOL_VERSION, comment out macros below and clean up the code
 #define MIN_PROTOCOL_VERSION 21
 #define PROTOCOL_VERSION_JOB_TIMING 47
 #define PROTOCOL_VERSION_JOB_LOCAL_FLAGS 48
+#define PROTOCOL_VERSION_ASSIGNMENT_FENCE 49
 
 #define MAX_SCHEDULER_PONG 3
 // MAX_SCHEDULER_PING must be multiple of MAX_SCHEDULER_PONG
@@ -131,7 +132,19 @@ public:
         // S --> CS
         NO_CS,
         // C --> CS
-        JOB_TIMING
+        JOB_TIMING,
+
+        // Protocol 49 fork-private block, on the persistent scheduler <->
+        // worker link only.  Values are explicit so a future upstream append
+        // cannot silently alias this vocabulary.
+        // S --> CS: install one assignment before it can be exposed to C.
+        ASSIGN_PREPARE = 0x49f00000,
+        // CS --> S: the matching assignment is installed.
+        ASSIGN_READY = 0x49f00001,
+        // S --> CS: withdraw an assignment that has not been claimed.
+        REVOKE_BEFORE_START = 0x49f00002,
+        // CS --> S: the ordered claim/revoke outcome.
+        REVOKE_RESULT = 0x49f00003
     };
 
     Msg() = default;
@@ -210,6 +223,14 @@ public:
                 return "NO_CS";
             case JOB_TIMING:
                 return "JOB_TIMING";
+            case ASSIGN_PREPARE:
+                return "ASSIGN_PREPARE";
+            case ASSIGN_READY:
+                return "ASSIGN_READY";
+            case REVOKE_BEFORE_START:
+                return "REVOKE_BEFORE_START";
+            case REVOKE_RESULT:
+                return "REVOKE_RESULT";
         }
         return nullptr;
     }
@@ -965,16 +986,145 @@ public:
 class ConfCSMsg : public Msg
 {
 public:
+    enum FenceMode : uint32_t {
+        Legacy = 0,
+        Advisory = 1,
+        EnforcingCompat = 2,
+        StrictNonce = 3
+    };
+
     ConfCSMsg()
         : Msg(Msg::CS_CONF)
         , max_scheduler_pong(MAX_SCHEDULER_PONG)
-        , max_scheduler_ping(MAX_SCHEDULER_PING) {}
+        , max_scheduler_ping(MAX_SCHEDULER_PING)
+        , epoch_hi(0)
+        , epoch_lo(0)
+        , fence_mode(Legacy) {}
+
+    ConfCSMsg(uint64_t epoch, FenceMode mode)
+        : Msg(Msg::CS_CONF)
+        , max_scheduler_pong(MAX_SCHEDULER_PONG)
+        , max_scheduler_ping(MAX_SCHEDULER_PING)
+        , epoch_hi(uint32_t(epoch >> 32))
+        , epoch_lo(uint32_t(epoch))
+        , fence_mode(mode) {}
 
     virtual void fill_from_channel(MsgChannel *c);
     virtual void send_to_channel(MsgChannel *c) const;
 
     uint32_t max_scheduler_pong;
     uint32_t max_scheduler_ping;
+    uint32_t epoch_hi;
+    uint32_t epoch_lo;
+    uint32_t fence_mode;
+
+    uint64_t epoch() const
+    {
+        return (uint64_t(epoch_hi) << 32) | epoch_lo;
+    }
+};
+
+class AssignPrepareMsg : public Msg
+{
+public:
+    AssignPrepareMsg()
+        : Msg(Msg::ASSIGN_PREPARE)
+        , epoch_hi(0), epoch_lo(0), wire_id(0)
+        , nonce_hi(0), nonce_lo(0), submitter_hostid(0), flags(0) {}
+    AssignPrepareMsg(uint64_t epoch, uint32_t id, uint64_t nonce,
+                     uint32_t submitter, uint32_t assignment_flags = 0)
+        : Msg(Msg::ASSIGN_PREPARE)
+        , epoch_hi(uint32_t(epoch >> 32)), epoch_lo(uint32_t(epoch))
+        , wire_id(id)
+        , nonce_hi(uint32_t(nonce >> 32)), nonce_lo(uint32_t(nonce))
+        , submitter_hostid(submitter), flags(assignment_flags) {}
+
+    virtual void fill_from_channel(MsgChannel *c);
+    virtual void send_to_channel(MsgChannel *c) const;
+
+    uint64_t epoch() const { return (uint64_t(epoch_hi) << 32) | epoch_lo; }
+    uint64_t nonce() const { return (uint64_t(nonce_hi) << 32) | nonce_lo; }
+
+    uint32_t epoch_hi, epoch_lo;
+    uint32_t wire_id;
+    uint32_t nonce_hi, nonce_lo;
+    uint32_t submitter_hostid;
+    uint32_t flags;
+};
+
+class AssignReadyMsg : public Msg
+{
+public:
+    AssignReadyMsg()
+        : Msg(Msg::ASSIGN_READY), epoch_hi(0), epoch_lo(0), wire_id(0)
+        , nonce_hi(0), nonce_lo(0) {}
+    AssignReadyMsg(uint64_t epoch, uint32_t id, uint64_t nonce)
+        : Msg(Msg::ASSIGN_READY), epoch_hi(uint32_t(epoch >> 32))
+        , epoch_lo(uint32_t(epoch)), wire_id(id)
+        , nonce_hi(uint32_t(nonce >> 32)), nonce_lo(uint32_t(nonce)) {}
+
+    virtual void fill_from_channel(MsgChannel *c);
+    virtual void send_to_channel(MsgChannel *c) const;
+    uint64_t epoch() const { return (uint64_t(epoch_hi) << 32) | epoch_lo; }
+    uint64_t nonce() const { return (uint64_t(nonce_hi) << 32) | nonce_lo; }
+
+    uint32_t epoch_hi, epoch_lo;
+    uint32_t wire_id;
+    uint32_t nonce_hi, nonce_lo;
+};
+
+class RevokeBeforeStartMsg : public Msg
+{
+public:
+    RevokeBeforeStartMsg()
+        : Msg(Msg::REVOKE_BEFORE_START), epoch_hi(0), epoch_lo(0), wire_id(0)
+        , nonce_hi(0), nonce_lo(0) {}
+    RevokeBeforeStartMsg(uint64_t epoch, uint32_t id, uint64_t nonce)
+        : Msg(Msg::REVOKE_BEFORE_START), epoch_hi(uint32_t(epoch >> 32))
+        , epoch_lo(uint32_t(epoch)), wire_id(id)
+        , nonce_hi(uint32_t(nonce >> 32)), nonce_lo(uint32_t(nonce)) {}
+
+    virtual void fill_from_channel(MsgChannel *c);
+    virtual void send_to_channel(MsgChannel *c) const;
+    uint64_t epoch() const { return (uint64_t(epoch_hi) << 32) | epoch_lo; }
+    uint64_t nonce() const { return (uint64_t(nonce_hi) << 32) | nonce_lo; }
+
+    uint32_t epoch_hi, epoch_lo;
+    uint32_t wire_id;
+    uint32_t nonce_hi, nonce_lo;
+};
+
+class RevokeResultMsg : public Msg
+{
+public:
+    enum Result : uint32_t {
+        Revoked = 0,
+        ClaimedOrLater = 1
+    };
+
+    RevokeResultMsg()
+        : Msg(Msg::REVOKE_RESULT), epoch_hi(0), epoch_lo(0), wire_id(0)
+        , nonce_hi(0), nonce_lo(0), result(Revoked) {}
+    RevokeResultMsg(uint64_t epoch, uint32_t id, uint64_t nonce,
+                    Result assignment_result)
+        : Msg(Msg::REVOKE_RESULT), epoch_hi(uint32_t(epoch >> 32))
+        , epoch_lo(uint32_t(epoch)), wire_id(id)
+        , nonce_hi(uint32_t(nonce >> 32)), nonce_lo(uint32_t(nonce))
+        , result(assignment_result) {}
+
+    virtual void fill_from_channel(MsgChannel *c);
+    virtual void send_to_channel(MsgChannel *c) const;
+    uint64_t epoch() const { return (uint64_t(epoch_hi) << 32) | epoch_lo; }
+    uint64_t nonce() const { return (uint64_t(nonce_hi) << 32) | nonce_lo; }
+    bool validResult() const
+    {
+        return result == Revoked || result == ClaimedOrLater;
+    }
+
+    uint32_t epoch_hi, epoch_lo;
+    uint32_t wire_id;
+    uint32_t nonce_hi, nonce_lo;
+    uint32_t result;
 };
 
 class StatsMsg : public Msg

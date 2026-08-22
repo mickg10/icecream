@@ -295,7 +295,8 @@ int main(int argc, char **argv)
     REQUIRE(sched != nullptr, "scheduler accepted the daemon Login");
     REQUIRE(login != nullptr, "scheduler received Login");
     delete login;
-    REQUIRE(sched && sched->send_msg(ConfCSMsg()),
+    REQUIRE(sched && sched->send_msg(
+                ConfCSMsg(UINT64_C(0x4700000000000002), ConfCSMsg::Legacy)),
             "scheduler sent the activating ConfCS");
     usleep(150 * 1000);
 

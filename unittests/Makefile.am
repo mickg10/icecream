@@ -1,4 +1,4 @@
-TESTS = testargs lockexec backpressure schedpolicy utf8test statewritertest fastesttest hallflowtest jobidalloctest connectivity-run.sh schedbp-quick.sh schedstress-quick.sh remoteice-quick.sh daemonlogin-run.sh daemonbatch-run.sh boost-prefix-scope.sh p50wire p50slice0 p50zstd p50zstdwindow p50inputrecord p50inputrecordlate p50endpoint digest128bench p50_trace_check.sh
+TESTS = testargs lockexec backpressure schedpolicy utf8test statewritertest fastesttest hallflowtest jobidalloctest p49assignment p49daemon-run.sh p49scheduler-run.sh connectivity-run.sh schedbp-quick.sh schedstress-quick.sh remoteice-quick.sh daemonlogin-run.sh daemonbatch-run.sh boost-prefix-scope.sh p50wire p50slice0 p50zstd p50zstdwindow p50inputrecord p50inputrecordlate p50endpoint digest128bench p50_trace_check.sh
 
 AM_TESTS_ENVIRONMENT = \
 	ICECC_TEST_BUILDDIR='$(abs_builddir)'; export ICECC_TEST_BUILDDIR; \
@@ -46,7 +46,7 @@ p50endpoint_LDADD = ../cache/libp50endpoint.a ../cache/libprotocol50.a \
 	$(LIBZSTD_LIBS) $(BOOST_LIBS)
 digest128bench_LDADD = ../services/libicecc.la
 
-check_PROGRAMS = testargs lockexec backpressure schedpolicy utf8test statewritertest schedbp daemonlogin daemonbatch connectivity fastesttest hallflowtest jobidalloctest p50wire p50slice0 p50zstd p50zstdwindow p50inputrecord p50inputrecordlate p50endpoint digest128bench
+check_PROGRAMS = testargs lockexec backpressure schedpolicy utf8test statewritertest schedbp daemonlogin daemonbatch p49daemon p49scheduler connectivity fastesttest hallflowtest jobidalloctest p49assignment p50wire p50slice0 p50zstd p50zstdwindow p50inputrecord p50inputrecordlate p50endpoint digest128bench
 testargs_SOURCES = args.cpp
 p50wire_SOURCES = p50_wire_test.cpp
 p50slice0_SOURCES = \
@@ -84,6 +84,11 @@ daemonlogin_SOURCES = daemonlogin.cpp
 daemonlogin_LDADD = ../services/libicecc.la
 daemonbatch_SOURCES = daemonbatch.cpp
 daemonbatch_LDADD = ../services/libicecc.la
+p49daemon_SOURCES = p49daemon.cpp
+p49daemon_LDADD = ../services/libicecc.la
+p49scheduler_SOURCES = p49scheduler.cpp
+p49scheduler_LDADD = ../services/libicecc.la
+p49scheduler_DEPENDENCIES = sndbuf_shim.so
 
 # Connectivity-probe state machine regression (issue #4 item 4): drives
 # CompileServer directly, with failure injection from conn_shim.so.
@@ -96,6 +101,10 @@ fastesttest_SOURCES = fastesttest.cpp
 hallflowtest_SOURCES = hallflowtest.cpp
 
 jobidalloctest_SOURCES = jobidalloctest.cpp
+p49assignment_SOURCES = p49assignment.cpp
+p49assignment_CXXFLAGS = -pthread
+p49assignment_LDFLAGS = -pthread
+p49assignment_LDADD = ../services/libicecc.la
 schedbp_CXXFLAGS = -pthread
 schedbp_LDFLAGS = -pthread
 schedbp_LDADD = ../services/libicecc.la
@@ -109,7 +118,7 @@ conn_shim.so: $(srcdir)/conn_shim.c
 connectivity_DEPENDENCIES = conn_shim.so
 
 CLEANFILES = sndbuf_shim.so conn_shim.so schedbp-scheduler-*.log
-EXTRA_DIST = sndbuf_shim.c conn_shim.c connectivity-run.sh schedbp-quick.sh schedstress-quick.sh remoteice-quick.sh daemonlogin-run.sh daemonbatch-run.sh boost-prefix-scope.sh
+EXTRA_DIST = sndbuf_shim.c conn_shim.c connectivity-run.sh schedbp-quick.sh schedstress-quick.sh remoteice-quick.sh daemonlogin-run.sh daemonbatch-run.sh p49daemon-run.sh p49scheduler-run.sh boost-prefix-scope.sh
 
 EXTRA_DIST += p50_trace_check.sh
 

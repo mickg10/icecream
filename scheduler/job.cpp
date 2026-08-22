@@ -94,6 +94,15 @@ void Job::detachSubmitter()
     if (m_submitterDetached) {
         return;
     }
+    /* A P49 cancellation can retain the assignment after its submitter
+       authority is severed.  Return the submitter-local dispatch credit
+       before dropping the only safe pointer to that accounting owner; the
+       worker reservation and assignment id remain owned until their separate
+       terminal boundary. */
+    if (m_dispatchOutstanding) {
+        (void)m_submitter->removeOutstandingDispatch(m_dispatchDebitMsec);
+        m_dispatchOutstanding = false;
+    }
     m_submitter->submittedJobsDecrement();
     m_submitter = nullptr;
     m_submitterDetached = true;

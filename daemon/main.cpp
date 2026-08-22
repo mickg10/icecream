@@ -85,6 +85,8 @@
 #include <chrono>
 #include <deque>
 #include <map>
+#include <unordered_map>
+#include <unordered_set>
 #include <algorithm>
 #include <set>
 #include <fstream>
@@ -1171,6 +1173,8 @@ struct Daemon {
     bool handle_verify_env(Client *client, VerifyEnvMsg *msg) __attribute_warn_unused_result__;
     bool handle_blacklist_host_env(Client *client, Msg *msg) __attribute_warn_unused_result__;
     int handle_cs_conf(ConfCSMsg *msg);
+    int handle_assign_prepare(AssignPrepareMsg *msg);
+    int handle_revoke_before_start(RevokeBeforeStartMsg *msg);
     string dump_internals() const;
     string determine_nodename();
     void determine_system();
@@ -4047,6 +4051,264 @@ static unsigned int scheduler_loss_cleanup_attempts = 0;
    reconnect() then refuses further sessions rather than reuse a generation. */
 static bool scheduler_generation_exhausted = false;
 
+/* Protocol-49 fulfillment state has one owner: the daemon event-loop thread.
+   Records live for the scheduler epoch, not merely one TCP connection.  The
+   full triple keys terminal outcomes, while the live wire-id index supports
+   the explicitly weaker nonce-less compatibility modes in expected O(1). */
+struct AssignmentKey {
+    uint64_t epoch;
+    uint32_t wire_id;
+    uint64_t nonce;
+
+    bool operator==(const AssignmentKey &other) const
+    {
+        return epoch == other.epoch && wire_id == other.wire_id
+            && nonce == other.nonce;
+    }
+};
+
+struct AssignmentKeyHash {
+    size_t operator()(const AssignmentKey &key) const
+    {
+        size_t h = std::hash<uint64_t>()(key.epoch);
+        h ^= std::hash<uint64_t>()(key.nonce) + 0x9e3779b9u + (h << 6) + (h >> 2);
+        h ^= std::hash<uint32_t>()(key.wire_id) + 0x9e3779b9u + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+struct WorkerAssignment {
+    enum Phase { Reserved, Claimed, ClaimedOrLater, Orphaned } phase;
+    AssignmentKey key;
+    uint32_t claimant;
+};
+
+struct AssignmentTerminal {
+    RevokeResultMsg::Result result;
+};
+
+static uint64_t assignment_scheduler_epoch = 0;
+static ConfCSMsg::FenceMode assignment_fence_mode = ConfCSMsg::Legacy;
+static std::unordered_map<uint32_t, WorkerAssignment> live_assignments;
+static std::unordered_map<AssignmentKey, AssignmentTerminal,
+                          AssignmentKeyHash> assignment_terminals;
+static std::unordered_map<uint32_t, AssignmentKey> closed_wire_ids;
+static std::unordered_set<uint64_t> retired_assignment_epochs;
+static size_t assignment_terminal_limit()
+{
+    static const size_t limit = [] {
+        const size_t production_limit = 65536;
+        if (getenv("ICECC_TESTS") == nullptr) {
+            return production_limit;
+        }
+        const char *text = getenv("ICECC_TEST_ASSIGNMENT_TABLE_LIMIT");
+        if (text == nullptr || *text == '\0') {
+            return production_limit;
+        }
+        char *end = nullptr;
+        const unsigned long parsed = strtoul(text, &end, 10);
+        if (end == text || *end != '\0' || parsed == 0
+                || parsed > production_limit) {
+            return production_limit;
+        }
+        return static_cast<size_t>(parsed);
+    }();
+    return limit;
+}
+static bool assignment_table_exhausted = false;
+static bool assignment_epoch_history_exhausted = false;
+static unsigned long assignment_prepares = 0;
+static unsigned long assignment_ready_replies = 0;
+static unsigned long assignment_revoke_results = 0;
+static unsigned long assignment_claims = 0;
+static unsigned long assignment_claim_rejects = 0;
+static unsigned long assignment_stale_controls = 0;
+
+static bool assignment_mode_prepares(ConfCSMsg::FenceMode mode)
+{
+    return mode == ConfCSMsg::Advisory
+        || mode == ConfCSMsg::EnforcingCompat
+        || mode == ConfCSMsg::StrictNonce;
+}
+
+static bool assignment_mode_enforces_prepare(ConfCSMsg::FenceMode mode)
+{
+    return mode == ConfCSMsg::EnforcingCompat
+        || mode == ConfCSMsg::StrictNonce;
+}
+
+static bool replace_assignment_epoch()
+{
+    if (assignment_scheduler_epoch != 0
+            && retired_assignment_epochs.find(assignment_scheduler_epoch)
+                == retired_assignment_epochs.end()) {
+        if (retired_assignment_epochs.size() >= assignment_terminal_limit()) {
+            assignment_epoch_history_exhausted = true;
+            return false;
+        }
+        retired_assignment_epochs.insert(assignment_scheduler_epoch);
+    }
+    live_assignments.clear();
+    assignment_terminals.clear();
+    closed_wire_ids.clear();
+    assignment_scheduler_epoch = 0;
+    assignment_fence_mode = ConfCSMsg::Legacy;
+    assignment_table_exhausted = false;
+    return true;
+}
+
+static bool assignment_capacity_available(const AssignmentKey &key)
+{
+    if (assignment_terminals.find(key) != assignment_terminals.end()) {
+        return true;
+    }
+    if (assignment_table_exhausted
+            || assignment_terminals.size() >= assignment_terminal_limit()) {
+        assignment_table_exhausted = true;
+        return false;
+    }
+    return true;
+}
+
+static bool retain_assignment_terminal(const AssignmentKey &key,
+                                       RevokeResultMsg::Result result,
+                                       bool blocks_compat_claim)
+{
+    auto existing = assignment_terminals.find(key);
+    if (existing != assignment_terminals.end()) {
+        if (existing->second.result != result) {
+            log_error() << "conflicting terminal result for assignment "
+                        << key.wire_id << endl;
+            assignment_table_exhausted = true;
+            return false;
+        }
+    } else {
+        if (!assignment_capacity_available(key)) {
+            log_error() << "protocol-49 epoch terminal table exhausted" << endl;
+            return false;
+        }
+        assignment_terminals.emplace(key, AssignmentTerminal { result });
+    }
+    if (blocks_compat_claim) {
+        closed_wire_ids.insert_or_assign(key.wire_id, key);
+    }
+    return true;
+}
+
+static void mark_assignment_claimed_or_later(uint32_t wire_id)
+{
+    auto it = live_assignments.find(wire_id);
+    if (it != live_assignments.end() && it->second.phase == WorkerAssignment::Claimed) {
+        it->second.phase = WorkerAssignment::ClaimedOrLater;
+    }
+}
+
+static void finish_assignment_claim(uint32_t wire_id)
+{
+    auto it = live_assignments.find(wire_id);
+    if (it == live_assignments.end()
+            || (it->second.phase != WorkerAssignment::Claimed
+                && it->second.phase != WorkerAssignment::ClaimedOrLater)) {
+        return;
+    }
+    it->second.phase = WorkerAssignment::ClaimedOrLater;
+    /* In ADVISORY the client may win before PREPARE is consumed.  Keep that
+       nonce-zero placeholder live until PREPARE supplies its full identity;
+       deleting it here would let late PREPARE regress the claim to Reserved. */
+    if (it->second.key.nonce == 0) {
+        return;
+    }
+    const AssignmentKey key = it->second.key;
+    if (retain_assignment_terminal(
+            key, RevokeResultMsg::ClaimedOrLater, true)) {
+        live_assignments.erase(it);
+    } else {
+        it->second.phase = WorkerAssignment::Orphaned;
+    }
+}
+
+static void close_assignment_transport_session()
+{
+    /* Link loss is an S-side terminal boundary, but the old client can still
+       arrive at this daemon.  Close every known assignment and retain its
+       rejection identity for the whole epoch.  A nonce-zero ADVISORY
+       placeholder cannot be safely attributed after transport loss, so it
+       remains an explicit Orphaned fail-closed wire-id record. */
+    auto it = live_assignments.begin();
+    while (it != live_assignments.end()) {
+        WorkerAssignment &record = it->second;
+        if (record.key.nonce == 0) {
+            record.phase = WorkerAssignment::Orphaned;
+            ++it;
+            continue;
+        }
+        const RevokeResultMsg::Result result =
+            record.phase == WorkerAssignment::Reserved
+                ? RevokeResultMsg::Revoked
+                : RevokeResultMsg::ClaimedOrLater;
+        if (!retain_assignment_terminal(record.key, result, true)) {
+            record.phase = WorkerAssignment::Orphaned;
+            ++it;
+            continue;
+        }
+        it = live_assignments.erase(it);
+    }
+}
+
+static bool authorize_assignment_claim(uint32_t wire_id, uint32_t claimant)
+{
+    if (assignment_fence_mode == ConfCSMsg::Legacy) {
+        return true;   // exact protocol-48/default-disabled behavior
+    }
+    if (!scheduler_session_active || assignment_table_exhausted) {
+        ++assignment_claim_rejects;
+        return false;
+    }
+    auto live = live_assignments.find(wire_id);
+    if (live != live_assignments.end()) {
+        WorkerAssignment &record = live->second;
+        if (record.key.epoch != assignment_scheduler_epoch
+                || record.phase != WorkerAssignment::Reserved) {
+            ++assignment_claim_rejects;
+            return false;
+        }
+        record.phase = WorkerAssignment::Claimed;
+        record.claimant = claimant;
+        ++assignment_claims;
+        return true;
+    }
+
+    auto closed = closed_wire_ids.find(wire_id);
+    if (closed != closed_wire_ids.end()
+            && closed->second.epoch == assignment_scheduler_epoch) {
+        ++assignment_claim_rejects;
+        return false;
+    }
+    if (assignment_mode_enforces_prepare(assignment_fence_mode)) {
+        ++assignment_claim_rejects;
+        return false;
+    }
+
+    /* ADVISORY admits an unknown nonce-less claim, but records ownership.
+       A later PREPARE binds the nonce into this same record without changing
+       Claimed/ClaimedOrLater back to Reserved. */
+    if (live_assignments.size() + assignment_terminals.size()
+            >= assignment_terminal_limit()) {
+        assignment_table_exhausted = true;
+        ++assignment_claim_rejects;
+        return false;
+    }
+    WorkerAssignment placeholder;
+    placeholder.phase = WorkerAssignment::Claimed;
+    placeholder.key = AssignmentKey {
+        assignment_scheduler_epoch, wire_id, 0
+    };
+    placeholder.claimant = claimant;
+    live_assignments.emplace(wire_id, placeholder);
+    ++assignment_claims;
+    return true;
+}
+
 /* G4 (bigoracle 20:13:59/20:32:36): the authority for whether a GetCS-derived
    (submitter-side) assignment may emit scheduler lifecycle frames -- JobBegin
    (handle_compile_file), the forwarded JobDone (handle_job_done), and teardown
@@ -4358,6 +4620,19 @@ string Daemon::dump_internals() const
                  scheduler_loss_cleanup_attempts,
                  scheduler_generation_exhausted ? 1 : 0);
         result += handoff;
+        char assignment[320];
+        snprintf(assignment, sizeof(assignment),
+                 "  Assignment fence: mode=%u epoch=%llu live=%zu retained=%zu closed=%zu retired=%zu exhausted=%d epoch_history_exhausted=%d prepares=%lu ready=%lu revokes=%lu claims=%lu rejected=%lu stale_control=%lu\n",
+                 static_cast<unsigned int>(assignment_fence_mode),
+                 (unsigned long long)assignment_scheduler_epoch,
+                 live_assignments.size(), assignment_terminals.size(),
+                 closed_wire_ids.size(), retired_assignment_epochs.size(),
+                 assignment_table_exhausted ? 1 : 0,
+                 assignment_epoch_history_exhausted ? 1 : 0,
+                 assignment_prepares, assignment_ready_replies,
+                 assignment_revoke_results, assignment_claims,
+                 assignment_claim_rejects, assignment_stale_controls);
+        result += assignment;
         for (std::map<pid_t, ChildRecord>::const_iterator cit = child_registry.begin();
                 cit != child_registry.end(); ++cit) {
             snprintf(handoff, sizeof(handoff),
@@ -5998,6 +6273,7 @@ void Daemon::handle_old_request()
                 }
                 register_child(pid, pid, ChildRecord::COMPILER,
                                client->client_id);
+                mark_assignment_claimed_or_later(job->jobID());
                 current_kids++;
                 client->set_status(Client::WAITFORCHILD, "handle_old_request: compiling locally (child running)");
                 client->pipe_from_child = sock;
@@ -6071,6 +6347,17 @@ bool Daemon::handle_compile_file(Client *client, Msg *msg)
     CompileJob *job = dynamic_cast<CompileFileMsg *>(msg)->takeJob();
     assert(client);
     assert(job);
+    if (client->status != Client::CLIENTWORK
+            && !authorize_assignment_claim(job->jobID(), client->client_id)) {
+        /* Authorization is resolved before the job is attached to a client,
+           queued, touches an environment, or can start a compiler. */
+        trace() << "rejecting unprepared/revoked assignment claim "
+                << job->jobID() << endl;
+        delete job;
+        client->channel->send_msg(EndMsg());
+        handle_end(client, 145);
+        return false;
+    }
     client->job = job;
     if (client->command_line.empty()) {
         client->command_line = command_line_from_compile_job(job);
@@ -6137,6 +6424,10 @@ void Daemon::handle_end(Client *client, int exitcode)
     trace() << dump_internals() << endl;
 #endif
     remember_finished_job(client, exitcode);
+    if (client->job && (client->status == Client::TOCOMPILE
+                        || client->status == Client::WAITFORCHILD)) {
+        finish_assignment_claim(client->job->jobID());
+    }
     fd2client.erase(client->channel->fd);
 
     if (client->status == Client::TOINSTALL || client->status == Client::WAITINSTALL) {
@@ -6299,6 +6590,7 @@ void Daemon::clear_children()
         Client *cl = clients.first();
         handle_end(cl, 116);
     }
+    close_assignment_transport_session();
 
     unsigned int quiesced = 0;
     const bool clean = quiesce_session_compilers(scheduler_session_generation,
@@ -6432,6 +6724,127 @@ bool Daemon::handle_get_cs(Client *client, Msg *msg)
     return true;
 }
 
+int Daemon::handle_assign_prepare(AssignPrepareMsg *msg)
+{
+    if (!scheduler_session_active
+            || !assignment_mode_prepares(assignment_fence_mode)
+            || assignment_fence_mode == ConfCSMsg::StrictNonce
+            || assignment_table_exhausted
+            || msg->epoch() == 0 || msg->wire_id == 0 || msg->nonce() == 0
+            || msg->flags != 0 || msg->epoch() != assignment_scheduler_epoch) {
+        ++assignment_stale_controls;
+        return 1;
+    }
+    const AssignmentKey key { msg->epoch(), msg->wire_id, msg->nonce() };
+
+    auto terminal = assignment_terminals.find(key);
+    if (terminal != assignment_terminals.end()) {
+        ++assignment_revoke_results;
+        return send_scheduler(RevokeResultMsg(
+            key.epoch, key.wire_id, key.nonce, terminal->second.result)) ? 0 : 1;
+    }
+
+    auto live = live_assignments.find(key.wire_id);
+    if (live != live_assignments.end()) {
+        if (live->second.key == key) {
+            /* Exact duplicate: preserve its current phase and re-READY. */
+        } else if (assignment_fence_mode == ConfCSMsg::Advisory
+                && live->second.key.epoch == key.epoch
+                && live->second.key.wire_id == key.wire_id
+                && live->second.key.nonce == 0
+                && live->second.phase != WorkerAssignment::Orphaned) {
+            /* Claim won the cross-channel race.  Bind PREPARE's full identity
+               into that same owner record; never regress to Reserved. */
+            live->second.key = key;
+            ++assignment_prepares;
+            if (live->second.phase == WorkerAssignment::ClaimedOrLater) {
+                if (!retain_assignment_terminal(
+                        key, RevokeResultMsg::ClaimedOrLater, true)) {
+                    live->second.phase = WorkerAssignment::Orphaned;
+                    return 1;
+                }
+                live_assignments.erase(live);
+            }
+        } else {
+            /* A wire id may be reused only after its earlier live record has
+               reached a retained terminal.  Never replace live authority. */
+            ++assignment_stale_controls;
+            return 1;
+        }
+    } else {
+        if (live_assignments.size() + assignment_terminals.size()
+                >= assignment_terminal_limit()) {
+            assignment_table_exhausted = true;
+            return 1;
+        }
+        WorkerAssignment record;
+        record.phase = WorkerAssignment::Reserved;
+        record.key = key;
+        record.claimant = 0;
+        live_assignments.emplace(key.wire_id, record);
+        auto closed = closed_wire_ids.find(key.wire_id);
+        if (closed != closed_wire_ids.end() && !(closed->second == key)) {
+            closed_wire_ids.erase(closed);
+        }
+        ++assignment_prepares;
+    }
+
+    ++assignment_ready_replies;
+    return send_scheduler(AssignReadyMsg(key.epoch, key.wire_id, key.nonce)) ? 0 : 1;
+}
+
+int Daemon::handle_revoke_before_start(RevokeBeforeStartMsg *msg)
+{
+    if (!scheduler_session_active
+            || !assignment_mode_prepares(assignment_fence_mode)
+            || assignment_fence_mode == ConfCSMsg::StrictNonce
+            || assignment_table_exhausted
+            || msg->epoch() == 0 || msg->wire_id == 0 || msg->nonce() == 0
+            || msg->epoch() != assignment_scheduler_epoch) {
+        ++assignment_stale_controls;
+        return 1;
+    }
+    const AssignmentKey key { msg->epoch(), msg->wire_id, msg->nonce() };
+
+    auto terminal = assignment_terminals.find(key);
+    if (terminal != assignment_terminals.end()) {
+        ++assignment_revoke_results;
+        return send_scheduler(RevokeResultMsg(
+            key.epoch, key.wire_id, key.nonce, terminal->second.result)) ? 0 : 1;
+    }
+
+    RevokeResultMsg::Result result = RevokeResultMsg::Revoked;
+    bool blocks_compat_claim = false;
+    bool erase_live = false;
+    auto live = live_assignments.find(key.wire_id);
+    if (live != live_assignments.end() && live->second.key == key) {
+        if (live->second.phase == WorkerAssignment::Reserved) {
+            erase_live = true;
+            blocks_compat_claim = true;
+        } else {
+            result = RevokeResultMsg::ClaimedOrLater;
+            blocks_compat_claim = true;
+        }
+    } else if (live == live_assignments.end()) {
+        /* REVOKE may win before a delayed PREPARE is consumed. */
+        blocks_compat_claim = true;
+    } else {
+        /* A delayed old full-triple revoke after wire-id reuse receives its
+           own deterministic outcome but cannot touch the new live record. */
+        ++assignment_stale_controls;
+    }
+
+    if (!retain_assignment_terminal(key, result, blocks_compat_claim)) {
+        return 1;
+    }
+    if (erase_live) {
+        live_assignments.erase(live);
+    }
+    ++assignment_revoke_results;
+    return send_scheduler(RevokeResultMsg(
+        key.epoch, key.wire_id, key.nonce, result)) ? 0 : 1;
+}
+
 int Daemon::handle_cs_conf(ConfCSMsg *msg)
 {
     max_scheduler_pong = msg->max_scheduler_pong;
@@ -6449,6 +6862,48 @@ int Daemon::handle_cs_conf(ConfCSMsg *msg)
             log_error() << "scheduler session generation exhausted; refusing activation" << endl;
             scheduler_generation_exhausted = true;
         } else {
+            if (IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_FENCE, scheduler)) {
+                if (msg->epoch() == 0
+                        || (msg->fence_mode != ConfCSMsg::Legacy
+                            && msg->fence_mode != ConfCSMsg::Advisory
+                            && msg->fence_mode != ConfCSMsg::EnforcingCompat
+                            && msg->fence_mode != ConfCSMsg::StrictNonce)) {
+                    log_error() << "invalid protocol-49 assignment configuration" << endl;
+                    return 1;
+                }
+                const ConfCSMsg::FenceMode requested =
+                    static_cast<ConfCSMsg::FenceMode>(msg->fence_mode);
+                if (requested == ConfCSMsg::StrictNonce) {
+                    log_error() << "strict-nonce requires protocol 50 nonce-bearing client claims" << endl;
+                    return 1;
+                }
+                if (assignment_epoch_history_exhausted
+                        || retired_assignment_epochs.find(msg->epoch())
+                            != retired_assignment_epochs.end()) {
+                    log_error() << "refusing retired protocol-49 scheduler epoch" << endl;
+                    return 1;
+                }
+                if (assignment_scheduler_epoch != 0
+                        && assignment_scheduler_epoch == msg->epoch()
+                        && (assignment_fence_mode != requested
+                            || assignment_table_exhausted)) {
+                    log_error() << "refusing changed or exhausted protocol-49 epoch configuration" << endl;
+                    return 1;
+                }
+                if (assignment_scheduler_epoch != msg->epoch()) {
+                    if (!replace_assignment_epoch()) {
+                        log_error() << "protocol-49 epoch history exhausted" << endl;
+                        return 1;
+                    }
+                    assignment_scheduler_epoch = msg->epoch();
+                    assignment_fence_mode = requested;
+                }
+            } else {
+                if (!replace_assignment_epoch()) {
+                    log_error() << "protocol-49 epoch history exhausted" << endl;
+                    return 1;
+                }
+            }
             ++scheduler_session_generation;
             scheduler_session_active = true;
             scheduler_login_pending = false;
@@ -6881,6 +7336,13 @@ void Daemon::answer_client_requests()
                     break;
                 case Msg::CS_CONF:
                     ret = handle_cs_conf(static_cast<ConfCSMsg *>(msg));
+                    break;
+                case Msg::ASSIGN_PREPARE:
+                    ret = handle_assign_prepare(static_cast<AssignPrepareMsg *>(msg));
+                    break;
+                case Msg::REVOKE_BEFORE_START:
+                    ret = handle_revoke_before_start(
+                        static_cast<RevokeBeforeStartMsg *>(msg));
                     break;
                 default:
                     log_error() << "unknown scheduler type " << msg->to_string() << endl;

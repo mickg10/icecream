@@ -42,6 +42,22 @@ public:
         COMPILING
     };
 
+    enum AssignmentPolicy {
+        ASSIGNMENT_LEGACY,
+        ASSIGNMENT_ADVISORY,
+        ASSIGNMENT_ENFORCING_COMPAT,
+        ASSIGNMENT_STRICT_NONCE
+    };
+
+    enum AssignmentPhase {
+        ASSIGNMENT_NONE,
+        ASSIGNMENT_PREPARED,
+        ASSIGNMENT_READY,
+        ASSIGNMENT_REVOKE_PENDING,
+        ASSIGNMENT_CLAIMED_OR_LATER,
+        ASSIGNMENT_TERMINAL
+    };
+
     Job(const unsigned int _id, CompileServer *subm);
     ~Job();
 
@@ -52,6 +68,41 @@ public:
 
     State state() const;
     void setState(const State state);
+
+    AssignmentPolicy assignmentPolicy() const { return m_assignmentPolicy; }
+    void setAssignmentPolicy(AssignmentPolicy policy) { m_assignmentPolicy = policy; }
+    AssignmentPhase assignmentPhase() const { return m_assignmentPhase; }
+    void setAssignmentPhase(AssignmentPhase phase) { m_assignmentPhase = phase; }
+    uint64_t assignmentEpoch() const { return m_assignmentEpoch; }
+    uint64_t assignmentNonce() const { return m_assignmentNonce; }
+    void setAssignmentIdentity(uint64_t epoch, uint64_t nonce)
+    {
+        m_assignmentEpoch = epoch;
+        m_assignmentNonce = nonce;
+    }
+    bool assignmentFenced() const
+    {
+        return m_assignmentPolicy != ASSIGNMENT_LEGACY;
+    }
+    bool assignmentReadyGated() const
+    {
+        return m_assignmentPolicy == ASSIGNMENT_ENFORCING_COMPAT
+            || m_assignmentPolicy == ASSIGNMENT_STRICT_NONCE;
+    }
+
+    /* Prepared modes freeze the complete legacy UseCS projection at the
+       dispatch decision.  READY may arrive much later, after selection
+       inputs have changed, but it exposes exactly this immutable choice. */
+    void setDispatchProjection(const std::string &platform, bool got_env,
+                               uint32_t matched_job_id)
+    {
+        m_dispatchPlatform = platform;
+        m_dispatchGotEnv = got_env;
+        m_dispatchMatchedJobId = matched_job_id;
+    }
+    const std::string &dispatchPlatform() const { return m_dispatchPlatform; }
+    bool dispatchGotEnv() const { return m_dispatchGotEnv; }
+    uint32_t dispatchMatchedJobId() const { return m_dispatchMatchedJobId; }
 
     // True while this job holds one of its submitter's dispatch credits
     // (dispatched, not yet confirmed by JobBegin or released on teardown).
@@ -92,8 +143,9 @@ public:
     CompileServer *submitter() const;
     void setSubmitter(CompileServer *submitter);
     /* Sever the submitter WITHOUT breaking the lifetime contract: the
-       live-job accounting this job holds on its submitter is discharged
-       exactly once, HERE, and the destructor knows it no longer owns it.
+       live-job and outstanding-dispatch accounting this job holds on its
+       submitter are discharged exactly once, HERE, and the destructor knows
+       it no longer owns them.
        Used when a submitting daemon disconnects while this job is still
        COMPILING on a live worker -- the job outlives its submitter.  The
        node name is snapshotted for logs/diagnostics.  */
@@ -165,6 +217,13 @@ private:
     const unsigned int m_id;
     unsigned int m_localClientId;
     State m_state;
+    AssignmentPolicy m_assignmentPolicy = ASSIGNMENT_LEGACY;
+    AssignmentPhase m_assignmentPhase = ASSIGNMENT_NONE;
+    uint64_t m_assignmentEpoch = 0;
+    uint64_t m_assignmentNonce = 0;
+    std::string m_dispatchPlatform;
+    bool m_dispatchGotEnv = false;
+    uint32_t m_dispatchMatchedJobId = 0;
     CompileServer *m_server;  // on which server we build
     CompileServer *m_submitter;
     bool m_submitterDetached = false;
