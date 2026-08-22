@@ -8,7 +8,7 @@ merge base, so every transplanted layer and resolution is recorded below.
 ## Fixed accepted inputs
 
 - Destination R3 head: `fa03fa95d5f9f98a791897e3d66025a802fd85a1`.
-- Selected R2 endpoint head: `c5575dc832ea7c1890344a3c930271ff807d4b7f`.
+- Selected R2 endpoint head: `e1e8798064d11ceb862bd322fd5a9cf78d7ebbe5`.
 - The PR22, PR23, and PR24 endpoint trees were not merged or copied.
 - R4 simulator and dashboard files are not part of this convergence.
 
@@ -32,6 +32,7 @@ merge base, so every transplanted layer and resolution is recorded below.
 | `c8cc6f01` | `db9a4dfc` | endpoint-only Boost linker-path portion |
 | `00190466` | `835dbb1d` | R2 endpoint validation corrections |
 | `c5575dc8` | `89bede78` | exact asynchronous completion correspondence |
+| `e1e87980` | `d4a8cf00` | live asynchronous completion identity validation |
 | convergence-only | `35a1608a` | endpoint-target Boost flags and P48 scope-gate registration |
 | convergence-only | `f28822bc` | nested package-discovery forwarding for the P48 scope gate |
 | convergence-only | `5be4a497` | preserve default pkg-config directories in the nested scope gate |
@@ -83,10 +84,12 @@ All other conflicts were additive build/package-list unions:
 ## Tree-equivalence audit
 
 The implementation, formal specifications, exact dependencies, and focused tests are
-byte-identical to R2 `c5575dc8`:
+byte-identical to accepted R2 `e1e87980`. The final bounded R2 correction shares the
+production completion-state checks with the clause-level endpoint tests; it applied without
+conflict after the `c5575dc8` convergence baseline:
 
 ```sh
-git diff --exit-code c5575dc832ea7c1890344a3c930271ff807d4b7f HEAD -- \
+git diff --exit-code e1e8798064d11ceb862bd322fd5a9cf78d7ebbe5 HEAD -- \
   cache ':(exclude)cache/Makefile.am' \
   ':(exclude)cache/P48_P50_CONVERGENCE.md' \
   services/digest128.cpp services/digest128.h \
