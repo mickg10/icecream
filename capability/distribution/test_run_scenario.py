@@ -1426,6 +1426,12 @@ class SimulatorTest(unittest.TestCase):
             self.assertEqual(route["c_to_f_bytes"], 102)
             self.assertEqual(result.summary["scored_outgoing_bytes"], 2)
             self.assertEqual(result.summary["network_c_to_f_bytes"], 102)
+            output = root / "out"
+            sim.write_result(scenario, result, output, execution_for(path))
+            self.assertEqual(
+                sim.validate_experiment_jsonl(output / "experiment.jsonl"),
+                {"events": result.events.count, "c_to_f_bytes": 102, "f_to_c_bytes": 0},
+            )
 
     def test_physical_byte_provenance_keeps_simulated_timing_separate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
