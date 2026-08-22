@@ -46,8 +46,17 @@ ASSIGN_PREPARE arrives later
 ```
 
 The late PREPARE validates/enriches the existing claim and may produce READY,
-but it cannot change the phase from CLAIMED back to RESERVED. A subsequent
-REVOKE must still return `CLAIMED_OR_LATER`.
+but it cannot change the phase from CLAIMED back to RESERVED.
+
+A later REVOKE for that exact assignment returns:
+
+```text
+CLAIMED_OR_LATER
+```
+
+It does not install a revocation tombstone and it does not release scheduler
+ownership. Only an exact `REVOKED` proof for an unclaimed assignment permits
+release.
 
 ## Checked invariants
 
@@ -62,7 +71,10 @@ ReleaseHasMatchingWorkerProof
     scheduler release uses the exact assignment proved REVOKED by F.
 
 ClaimedPhaseNeverRegresses
-    late PREPARE cannot move an accepted advisory claim backward.
+    late PREPARE or later REVOKE cannot move an accepted claim backward.
+
+ClaimedAssignmentNeverReleased
+    CLAIMED_OR_LATER is ownership evidence, not release proof.
 ```
 
 ## Mutants
@@ -87,4 +99,4 @@ TLA2TOOLS_JAR=/path/to/tla2tools.jar \
 The model is intentionally small. It does not duplicate scheduling, credit,
 capacity, compiler input, or Protocol-50 cache state. Its only purpose is to
 make the assignment-keyed formal actions realizable by the wire and to cover
-the advisory claim/PREPARE race.
+the advisory claim/PREPARE/revoke race.
