@@ -1,11 +1,10 @@
 #include "cache/p50_zstd.h"
 
-#include <zstd.h>
-
 #include <array>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <random>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -39,11 +38,7 @@ void require_throws(Callable&& callable, std::string_view text) {
 
 ZstdTuLimits limits(uint64_t encoded = 1U << 20,
                     uint64_t raw = 1U << 20) {
-    ZstdTuLimits result{encoded, raw, 0};
-#if ZSTD_VERSION_NUMBER >= 10400
-    result.max_window_log = 20;
-#endif
-    return result;
+    return {encoded, raw};
 }
 
 std::vector<uint8_t> sample_input() {
@@ -66,7 +61,8 @@ void append_one_byte_at_a_time(ZstdTuDialogue& dialogue,
                                std::span<const uint8_t> body) {
     for (uint8_t byte : body) {
         const std::array<uint8_t, 1> one{byte};
-        dialogue.append_body(BodyMessage{{one.begin(), one.end()}});
+        dialogue.append_body(
+            BodyMessage{std::vector<uint8_t>(one.begin(), one.end())});
     }
 }
 
@@ -134,10 +130,21 @@ void test_single_frame_exactness() {
         "concatenated second Zstd frame was accepted");
 
     std::vector<uint8_t> malformed{1, 2, 3, 4, 5, 6};
-    TxBegin malformed_begin = describe_modified_body(envelope.begin, malformed);
+    const TxBegin malformed_begin =
+        describe_modified_body(envelope.begin, malformed);
     require_throws<std::invalid_argument>(
         [&] { (void)decode_zstd_tu(malformed_begin, malformed, limits()); },
         "non-Zstd BODY was accepted");
+
+    ZstdTuDialogue dialogue(profile_bit(ProfileId::ZSTD_TU), limits());
+    dialogue.begin(trailing_begin);
+    dialogue.append_body(BodyMessage{trailing});
+    require_throws<std::invalid_argument>(
+        [&] { (void)dialogue.materialize(); },
+        "dialogue accepted trailing frame data");
+    require(dialogue.terminal() && dialogue.pending_body_bytes() == 0 &&
+                !dialogue.active_begin(),
+            "decode failure did not terminate and clear the dialogue");
 }
 
 void test_digest_and_shape_gates() {
@@ -207,11 +214,8 @@ void test_caps_and_terminal_dialogue_errors() {
         },
         "raw input cap was not enforced before allocation");
     require_throws<std::invalid_argument>(
-        [] { (void)ZstdTuDialogue(profile_bit(ProfileId::ZSTD_TU), {0, 1, 0}); },
+        [] { (void)ZstdTuDialogue(profile_bit(ProfileId::ZSTD_TU), {0, 1}); },
         "zero encoded cap was accepted");
-    require_throws<std::invalid_argument>(
-        [] { (void)ZstdTuDialogue(profile_bit(ProfileId::ZSTD_TU), {1, 1, -1}); },
-        "negative window-log cap was accepted");
 
     {
         ZstdTuDialogue dialogue(profile_bit(ProfileId::P29), limits());
@@ -264,10 +268,79 @@ void test_caps_and_terminal_dialogue_errors() {
     {
         ZstdTuDialogue dialogue(profile_bit(ProfileId::ZSTD_TU), limits());
         dialogue.begin(envelope.begin);
+        require_throws<std::invalid_argument>(
+            [&] { dialogue.receive_need(NeedMessage{}); },
+            "ZSTD_TU accepted NEED");
+        require(dialogue.terminal(), "unexpected NEED was not terminal");
+    }
+    {
+        ZstdTuDialogue dialogue(profile_bit(ProfileId::ZSTD_TU), limits());
+        dialogue.begin(envelope.begin);
+        require_throws<std::invalid_argument>(
+            [&] { dialogue.receive_fill(FillMessage{}); },
+            "ZSTD_TU accepted FILL");
+        require(dialogue.terminal(), "unexpected FILL was not terminal");
+    }
+    {
+        ZstdTuDialogue dialogue(profile_bit(ProfileId::ZSTD_TU), limits());
+        dialogue.begin(envelope.begin);
         dialogue.disconnect();
         require(dialogue.terminal() && dialogue.pending_body_bytes() == 0 &&
                     !dialogue.active_begin(),
                 "disconnect retained an incomplete overlay");
+    }
+}
+
+void test_randomized_chunking() {
+    std::mt19937_64 random(0x50504fULL);
+    for (uint64_t iteration = 0; iteration != 500; ++iteration) {
+        size_t size = 0;
+        switch (iteration % 8) {
+        case 0: size = 0; break;
+        case 1: size = 1; break;
+        case 2: size = iteration % 257; break;
+        case 3: size = 4096 + iteration; break;
+        case 4: size = 65536 + (iteration * 97) % 10000; break;
+        default: size = random() % (256 * 1024); break;
+        }
+
+        std::vector<uint8_t> input(size);
+        for (size_t index = 0; index != input.size(); ++index) {
+            if (iteration % 3 == 0)
+                input[index] = static_cast<uint8_t>(index % 17);
+            else if (iteration % 3 == 1)
+                input[index] = static_cast<uint8_t>(random());
+            else
+                input[index] =
+                    static_cast<uint8_t>((index / 31 + iteration) % 251);
+        }
+
+        const int level = -3 + static_cast<int>(iteration % 10);
+        const ZstdTuEnvelope envelope = encode_zstd_tu(
+            HistoryNonce{1 + iteration / 100}, RelSeq{iteration},
+            TuSeq{1000 + iteration}, icecc::digest128("random-pre"), input,
+            level);
+        const ZstdTuLimits local_limits{
+            envelope.body.size() + 16, input.size() + 16};
+        require(decode_zstd_tu(envelope.begin, envelope.body, local_limits) ==
+                    input,
+                "random direct round trip changed input");
+
+        ZstdTuDialogue dialogue(profile_bit(ProfileId::ZSTD_TU), local_limits);
+        dialogue.begin(envelope.begin);
+        size_t offset = 0;
+        while (offset != envelope.body.size()) {
+            const size_t chunk = std::min(
+                envelope.body.size() - offset,
+                1 + static_cast<size_t>(random() % 4096));
+            dialogue.append_body(BodyMessage{std::vector<uint8_t>(
+                envelope.body.begin() + offset,
+                envelope.body.begin() + offset + chunk)});
+            offset += chunk;
+        }
+        require(dialogue.materialize() == input,
+                "random dialogue round trip changed input");
+        dialogue.commit_visible();
     }
 }
 
@@ -278,6 +351,7 @@ int main() {
     test_single_frame_exactness();
     test_digest_and_shape_gates();
     test_caps_and_terminal_dialogue_errors();
+    test_randomized_chunking();
     std::cout << "p50_zstd_test: all exact ZSTD_TU dialogue gates passed\n";
     return 0;
 }
