@@ -237,7 +237,7 @@ public:
             case REVOKE_RESULT:
                 return "REVOKE_RESULT";
         }
-        return nullptr;
+        return "UNKNOWN";
     }
 
     virtual ~Msg() {}

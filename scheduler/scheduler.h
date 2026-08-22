@@ -77,7 +77,7 @@ public:
             case SchedulerAlgorithmName::UNDEFINED:
                 return "UNDEFINED";
         }
-        return nullptr;
+        return "UNDEFINED";
     }
 
 private:

@@ -64,6 +64,17 @@ struct ChannelPair
     MsgChannel *rcv = nullptr;
 };
 
+static void test_message_type_names()
+{
+    const Msg unknown(Msg::UNKNOWN);
+    REQUIRE(unknown.to_string() == "UNKNOWN",
+            "explicit UNKNOWN message type has a stable name");
+
+    const Msg invalid(static_cast<Msg::Value>(0xffffffffu));
+    REQUIRE(invalid.to_string() == "UNKNOWN",
+            "out-of-range message type falls back to UNKNOWN");
+}
+
 // socketpair-backed MsgChannel pair; sndbuf_bytes > 0 shrinks the sender-side
 // socket buffer so a large message reliably jams mid-transmission.
 static ChannelPair make_channel_pair(int sndbuf_bytes)
@@ -459,6 +470,9 @@ static void test_mon_tags()
 int main(int argc, char **argv)
 {
     std::string which = argc > 1 ? argv[1] : "all";
+
+    fprintf(stderr, "=== names: total message-type stringification ===\n");
+    test_message_type_names();
 
     if (which == "contract" || which == "all") {
         fprintf(stderr, "=== contract: dispatch send under backpressure ===\n");

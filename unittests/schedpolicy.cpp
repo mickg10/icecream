@@ -18,6 +18,7 @@
 */
 
 #include "../scheduler/selection.h"
+#include "../scheduler/scheduler.h"
 
 #include <cstdio>
 #include <cstdint>
@@ -37,6 +38,18 @@ static int failures = 0;
             ++failures;                                                 \
         }                                                               \
     } while (0)
+
+static void test_algorithm_names()
+{
+    const SchedulerAlgorithmName undefined(SchedulerAlgorithmName::UNDEFINED);
+    REQUIRE(undefined.to_string() == "UNDEFINED",
+            "explicit UNDEFINED scheduler algorithm has a stable name");
+
+    const SchedulerAlgorithmName invalid(
+        static_cast<SchedulerAlgorithmName::Value>(0xfeu));
+    REQUIRE(invalid.to_string() == "UNDEFINED",
+            "out-of-range scheduler algorithm falls back to UNDEFINED");
+}
 
 // --- production rules from scheduler/selection.h, loop shape restated ----
 
@@ -228,6 +241,9 @@ static void test_lpt_below_promotion()
 
 int main()
 {
+    fprintf(stderr, "=== scheduler algorithm names ===\n");
+    test_algorithm_names();
+
     fprintf(stderr, "=== scheduler policy rules ===\n");
     test_no_starvation();
     test_time_invariance();
