@@ -72,7 +72,7 @@ that channel **CacheWire v1**:
 ```text
 main_protocol = 43 | 50
 cache_wire    = off | v1
-codec_profile = legacy | zstd_tu | stream_a | stream_b | p29 | grz
+codec_profile = legacy | zstd_tu | z3_long | z3_shared_long | p29 | grz
 ```
 
 Historical source files may retain the `protocol50` name. Renaming them does not
@@ -165,7 +165,7 @@ components:
   f_daemon:  {release: 1.4.0|1.5.90, main_protocol: 43|50, commit: SHA}
 capabilities:
   cache_wire: off|v1
-  codec_profile: legacy|zstd_tu|stream_a|stream_b|p29|grz
+  codec_profile: legacy|zstd_tu|z3_long|z3_shared_long|p29|grz
 topology:
   c_count: N
   f_count: N
@@ -555,18 +555,20 @@ slice; it is not an M2 requirement.
 |---|---|---|
 | legacy | current independent per-TU transfer | P43 and fallback control |
 | `ZSTD_TU` | independent complete frame per TU | first product baseline |
-| Stream A | one retained large-window/LDM frame per C/F relationship, TU flushes | low fanout and concentrated history |
-| Stream B1 | shared cohort prefix plus thin per-F window | prebuilt cohort control |
-| Stream B2 | online first-K cohort prefix plus thin per-F window | likely wide-farm default |
+| `z3_long` | level-3 one retained large-window/LDM frame per C/F relationship, TU flushes | low fanout and concentrated history |
+| `z3_shared_long` | level-3 shared raw-content cohort prefix plus thin per-F retained window | likely wide-farm default; online B2 is the product form |
+| `z3_shared_long_b1` | prebuilt cohort prefix plus thin per-F window | experiment/control only, not required deployment state |
 | P29 | RAW, shared-C GLOBAL_S1, per-route ROUTE_S1 | structural candidate and byte leader |
 | GRZ | route-history structural coding | long reuse-distance candidate |
 
-The simple streaming models follow `simple_compression_models.md`:
+The simple streaming models follow `simple_compression_models.md`. Variant A is
+the protocol profile `z3_long`; online Variant B2 is
+`z3_shared_long`. Offline B1 remains a comparison row:
 
-- Stream A uses a retained frame, large window, long-distance matching, and
+- `z3_long` uses a retained frame, large window, long-distance matching, and
   per-TU flushes.
-- Stream B uses raw-content `refPrefix`, not a dictionary attachment that silently
-  reduces the effective window.
+- `z3_shared_long` uses raw-content `refPrefix`, not a dictionary attachment
+  that silently reduces the effective window.
 - B2 learns online; no universal `.ii` package is assumed.
 - Independent `ZSTD_TU` remains the simple first product profile even though it
   intentionally gives up cross-TU entropy history.
@@ -606,8 +608,8 @@ relationship-local. No codec may redefine endpoint or logical-job lifecycle.
 The experiment evidence, not a fixed assumption, selects among:
 
 ```text
-low fanout / concentrated reuse       Stream A
-wide farm / new-worker sensitivity    Stream B2
+low fanout / concentrated reuse       z3_long
+wide farm / new-worker sensitivity    z3_shared_long
 structural long-range reuse           P29 or GRZ
 unsupported or constrained peer       legacy or ZSTD_TU
 ```
