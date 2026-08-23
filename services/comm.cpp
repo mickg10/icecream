@@ -2303,16 +2303,31 @@ void UseCSMsg::fill_from_channel(MsgChannel *c)
         assignment_nonce_hi = assignment_nonce_lo = 0;
     }
     if (IS_PROTOCOL_VERSION(PROTOCOL_VERSION_CACHE_ADVERTISEMENT, c)) {
-        if (c->current_message_bytes_remaining() < 3 * sizeof(uint32_t)) {
+        /* Rolling-upgrade tri-state (BigOracle steer): protocol 50 already
+           carries the four assignment-identity words above, from an EARLIER
+           P50 feature.  A peer built before this cache-handoff tail existed
+           sends nothing more at protocol 50 -- that is a complete, correctly
+           framed message, not a short one, and must decode as canonical
+           absence.  Only a frame that started the tail and was cut off
+           partway (1..11 remaining bytes) is malformed.  >=12 remaining
+           bytes reads exactly the three words (any bytes past that are left
+           for a future field, forward-compatibly). */
+        const size_t remaining = c->current_message_bytes_remaining();
+        if (remaining == 0) {
+            cache_endpoint_port = 0;
+            cache_protocol = 0;
+            cache_profile_mask = 0;
+        } else if (remaining < 3 * sizeof(uint32_t)) {
             cache_endpoint_port = 0;
             cache_protocol = 0;
             cache_profile_mask = 0;
             cache_tail_valid = false;
             return;
+        } else {
+            *c >> cache_endpoint_port;
+            *c >> cache_protocol;
+            *c >> cache_profile_mask;
         }
-        *c >> cache_endpoint_port;
-        *c >> cache_protocol;
-        *c >> cache_profile_mask;
     } else {
         cache_endpoint_port = 0;
         cache_protocol = 0;
