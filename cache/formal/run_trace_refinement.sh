@@ -21,17 +21,23 @@
 # MANDATORY LEVEL-1 GATE (plan v11; local-oracle HOLD on c384cc53): every
 # run first replays the trace through check_trace.py's own ordering rules
 # and fails closed on any Level-1 rejection, before trace_to_tla.py or TLC
-# ever run. This is not optional and has no bypass flag -- Level-2 (TLC
-# replay) checks that the trace is an actual Protocol50.tla behavior once
-# mapped onto the bounded model's constants, but per-record cursor fields
-# that a Protocol50.tla action does not take as an explicit parameter (the
-# clearest example being C_TX_BEGIN's nonce/rel_seq, which the model reads
-# from its own current state rather than checking against the caller) can
-# only be caught by re-deriving what check_trace.py already tracks. See
-# trace_to_tla.py's module docstring for the full per-arm field-binding
-# audit of which cursor fields Level-2 now binds explicitly and which
-# arms don't need to (because their signature already forces the
-# equality check).
+# ever run. Level-2 (TLC replay) checks that the trace is an actual
+# Protocol50.tla behavior once mapped onto the bounded model's constants,
+# but per-record cursor fields that a Protocol50.tla action does not take
+# as an explicit parameter (the clearest example being C_TX_BEGIN's
+# nonce/rel_seq, which the model reads from its own current state rather
+# than checking against the caller) can only be caught by re-deriving what
+# check_trace.py already tracks. See trace_to_tla.py's module docstring
+# for the full per-arm field-binding audit of which cursor fields Level-2
+# now binds explicitly and which arms don't need to (because their
+# signature already forces the equality check).
+#
+# There is no production bypass for this gate. TRACEREF_SKIP_L1=1 skips
+# straight to Level 2 (trace_to_tla.py + TLC) -- it exists ONLY so
+# run_fixture_matrix.sh can prove Level 1 and Level 2 catch a given red
+# fixture INDEPENDENTLY of each other (i.e. that the Level-2 field-binding
+# fix above is not vacuous, riding on Level 1's coattails). Do not set it
+# outside that proof; a real caller wants both layers.
 set -eu
 
 usage() {
@@ -47,10 +53,14 @@ PYTHON=${PYTHON:-python3}
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 TRACE_ABS_EARLY=$(CDPATH= cd -- "$(dirname -- "$TRACE")" && pwd)/$(basename -- "$TRACE")
 
-echo "== check_trace.py (Level 1): $TRACE_ABS_EARLY =="
-if ! "$PYTHON" "$SCRIPT_DIR/check_trace.py" "$TRACE_ABS_EARLY"; then
-    echo "run_trace_refinement.sh: check_trace.py (Level 1) rejected $TRACE_ABS_EARLY -- Level 2 (trace_to_tla.py/TLC) did not run" >&2
-    exit 1
+if [ "${TRACEREF_SKIP_L1:-0}" = "1" ]; then
+    echo "== check_trace.py (Level 1): SKIPPED (TRACEREF_SKIP_L1=1) -- test-only, see script header; a real caller wants both layers ==" >&2
+else
+    echo "== check_trace.py (Level 1): $TRACE_ABS_EARLY =="
+    if ! "$PYTHON" "$SCRIPT_DIR/check_trace.py" "$TRACE_ABS_EARLY"; then
+        echo "run_trace_refinement.sh: check_trace.py (Level 1) rejected $TRACE_ABS_EARLY -- Level 2 (trace_to_tla.py/TLC) did not run" >&2
+        exit 1
+    fi
 fi
 
 : "${TLA2TOOLS_JAR:?set TLA2TOOLS_JAR to tla2tools.jar}"
