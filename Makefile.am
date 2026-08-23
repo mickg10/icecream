@@ -18,6 +18,7 @@ EXTRA_DIST = README.md \
 	capability/distribution/firefox-corrected.compile-trace.tsv \
 	distro_installed_identity.sh \
 	distro_installed_identity_gates.sh \
+	distro_probe.sh \
 	S1B_EXIT_MANIFEST.md
 
 ACLOCAL_AMFLAGS = -I m4
