@@ -54,6 +54,9 @@ CompileServer::CompileServer(const int fd, struct sockaddr *_addr, const socklen
     , m_type(UNKNOWN)
     , m_chrootPossible(false)
     , m_featuresSupported(0)
+    , m_cacheEndpointPort(0)
+    , m_cacheProtocol(0)
+    , m_cacheProfileMask(0)
     , m_clientCount(0)
     , m_submittedJobsCount(0)
     , m_connectionGeneration([] {

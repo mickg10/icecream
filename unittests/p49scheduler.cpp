@@ -331,7 +331,10 @@ static MsgChannel *login_host(int port, const char *name, bool worker,
                               ConfCSMsg **configuration,
                               MsgChannel *connected = nullptr,
                               unsigned int worker_slots = 1,
-                              int receive_buffer = 0)
+                              int receive_buffer = 0,
+                              uint32_t cache_endpoint_port = 0,
+                              uint32_t cache_protocol = 0,
+                              uint32_t cache_profiles = 0)
 {
     *configuration = nullptr;
     MsgChannel *channel = connected
@@ -344,6 +347,8 @@ static MsgChannel *login_host(int port, const char *name, bool worker,
     login.max_kids = worker ? worker_slots : 0;
     login.noremote = !worker;
     login.chroot_possible = worker;
+    login.setCacheAdvertisement(cache_endpoint_port, cache_protocol,
+                                cache_profiles);
     if (!channel->send_msg(login)) {
         delete channel;
         return nullptr;
@@ -381,6 +386,41 @@ static bool file_contains(const std::string &path, const std::string &needle)
     std::ostringstream text;
     text << input.rdbuf();
     return text.str().find(needle) != std::string::npos;
+}
+
+static std::string control_text(int port, const char *command)
+{
+    const auto deadline = Clock::now() + std::chrono::seconds(5);
+    int fd = -1;
+    while (fd < 0 && Clock::now() < deadline) {
+        fd = tcp_connect(port + 1);
+        if (fd < 0) usleep(20 * 1000);
+    }
+    if (fd < 0) return std::string();
+    char buffer[8192];
+    pollfd pfd { fd, POLLIN, 0 };
+    if (poll(&pfd, 1, 2000) <= 0 || read(fd, buffer, sizeof(buffer)) <= 0) {
+        close(fd);
+        return std::string();
+    }
+    const std::string request = std::string(command) + "\n";
+    if (write(fd, request.data(), request.size())
+            != static_cast<ssize_t>(request.size())) {
+        close(fd);
+        return std::string();
+    }
+    std::string result;
+    while (Clock::now() < deadline) {
+        pfd = { fd, POLLIN, 0 };
+        if (poll(&pfd, 1, 100) <= 0) continue;
+        const ssize_t count = read(fd, buffer, sizeof(buffer));
+        if (count <= 0) break;
+        result.append(buffer, static_cast<size_t>(count));
+        if (result.find("200 done") != std::string::npos) break;
+    }
+    close(fd);
+    return result.find("200 done") != std::string::npos
+        ? result : std::string();
 }
 
 static AssignPrepareMsg *wait_prepare(MsgChannel *worker)
@@ -1022,6 +1062,94 @@ static void run_disabled(const std::string &binary, const std::string &directory
     REQUIRE(stop_scheduler(scheduler), "default-disabled scheduler stopped cleanly");
 }
 
+static void run_cache_advertisement(const std::string &binary,
+                                    const std::string &directory)
+{
+    const int port = reserve_port_pair();
+    const std::string log = directory + "/cache-advertisement-scheduler.log";
+    pid_t scheduler = start_scheduler(binary, port, nullptr, log);
+    REQUIRE(port != 0 && scheduler > 0,
+            "cache-advertisement scheduler process launched");
+
+    int worker_port = 0;
+    int worker_listener = bind_port(0, &worker_port);
+    if (worker_listener >= 0) listen(worker_listener, 16);
+    int cache_port = 0;
+    int cache_sentinel = bind_port(0, &cache_port);
+    if (cache_sentinel >= 0) listen(cache_sentinel, 4);
+
+    ConfCSMsg *worker_conf = nullptr;
+    MsgChannel *worker = login_host(
+        port, "cache-ad-worker", true, worker_port, &worker_conf,
+        nullptr, 1, 0, static_cast<uint32_t>(cache_port),
+        CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_ZSTD_TU);
+    REQUIRE(worker && worker_conf && cache_sentinel >= 0,
+            "fake ready F logs in with a production cache advertisement");
+    delete worker_conf;
+
+    const std::string endpoint = "cache=127.0.0.1:"
+        + std::to_string(cache_port)
+        + " cache_wire=v1 cache_protocol=50 cache_profiles=zstd_tu";
+    std::string list = control_text(port, "listcs");
+    REQUIRE(list.find("cache-ad-worker") != std::string::npos
+                && list.find(endpoint) != std::string::npos,
+            "scheduler retains and exposes the exact endpoint metadata");
+    REQUIRE(file_contains(log, endpoint),
+            "scheduler login trace exposes qualified CacheWire metadata");
+
+    ConfCSMsg *submitter_conf = nullptr;
+    MsgChannel *submitter = login_host(port, "cache-ad-submit", false, 0,
+                                       &submitter_conf);
+    delete submitter_conf;
+    REQUIRE(submitter && request_job(submitter, 5001),
+            "ordinary assignment requested with advertised cache unavailable");
+    UseCSMsg *use = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 3000));
+    REQUIRE(use && use->port == static_cast<uint32_t>(worker_port),
+            "advertisement leaves ordinary UseCS selection unchanged");
+    pollfd cache_probe { cache_sentinel, POLLIN, 0 };
+    REQUIRE(poll(&cache_probe, 1, 300) == 0,
+            "scheduler and submitter never connect to the inert cache endpoint");
+    if (use) {
+        worker->send_msg(JobBeginMsg(use->job_id, 0));
+        worker->send_msg(JobDoneMsg(use->job_id, 0, JobDoneMsg::FROM_SERVER));
+    }
+    delete use;
+
+    LoginMsg absent(static_cast<uint32_t>(worker_port), "cache-ad-worker",
+                    "x86_64", 0);
+    absent.envs.push_back(std::make_pair(std::string("x86_64"),
+                                         std::string("p49-test-env")));
+    absent.max_kids = 1;
+    absent.chroot_possible = true;
+    absent.setCacheAdvertisement(0, 0, 0);
+    REQUIRE(worker && worker->send_msg(absent),
+            "fake F replaces its advertisement with canonical absence");
+    delete wait_type(worker, Msg::CS_CONF, 3000);
+    list = control_text(port, "listcs");
+    const size_t node = list.find("cache-ad-worker");
+    const size_t line_end = node == std::string::npos
+        ? std::string::npos : list.find('\n', node);
+    const std::string worker_line = node == std::string::npos
+        ? std::string() : list.substr(node, line_end - node);
+    REQUIRE(worker_line.find("cache=off") != std::string::npos
+                && worker_line.find("cache_wire=") == std::string::npos,
+            "replacement Login atomically publishes cache absence");
+
+    delete submitter;
+    delete worker;
+    worker = nullptr;
+    usleep(150 * 1000);
+    list = control_text(port, "listcs");
+    REQUIRE(list.find("cache-ad-worker") == std::string::npos,
+            "worker disconnect removes retained endpoint metadata");
+
+    if (cache_sentinel >= 0) close(cache_sentinel);
+    if (worker_listener >= 0) close(worker_listener);
+    REQUIRE(stop_scheduler(scheduler),
+            "cache-advertisement scheduler stopped cleanly");
+}
+
 static void run_old_peer(const std::string &binary, const std::string &directory)
 {
     const int port = reserve_port_pair();
@@ -1091,6 +1219,7 @@ int main(int argc, char **argv)
     run_prepare_backlog(argv[1], directory);
     run_strict_nonce(argv[1], directory);
     run_disabled(argv[1], directory);
+    run_cache_advertisement(argv[1], directory);
     run_old_peer(argv[1], directory);
     std::fprintf(stderr, "%s: %d failure(s)\n",
                  failures ? "FAIL" : "PASS", failures);

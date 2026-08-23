@@ -2851,6 +2851,8 @@ static bool handle_login(CompileServer *cs, Msg *_m)
     cs->setHostPlatform(m->host_platform);
     cs->setChrootPossible(m->chroot_possible);
     cs->setSupportedFeatures(m->supported_features);
+    cs->setCacheAdvertisement(m->cache_endpoint_port, m->cache_protocol,
+                              m->cache_profile_mask);
     cs->pick_new_id();
 
     for (list<string>::const_iterator it = block_css.begin(); it != block_css.end(); ++it)
@@ -2860,7 +2862,16 @@ static bool handle_login(CompileServer *cs, Msg *_m)
 
     dbg << "login " << m->nodename << " protocol version: " << cs->protocol
         << " features: " << supported_features_to_string(m->supported_features)
-        << " [";
+        << " cache=";
+    if (m->hasCacheAdvertisement()) {
+        dbg << cs->name << ":" << m->cache_endpoint_port
+            << " cache_wire=v1 cache_protocol=" << m->cache_protocol
+            << " cache_profiles="
+            << cache_profiles_to_string(m->cache_profile_mask);
+    } else {
+        dbg << "off";
+    }
+    dbg << " [";
     for (Environments::const_iterator it = m->envs.begin(); it != m->envs.end(); ++it) {
         dbg << it->second << "(" << it->first << "), ";
     }
@@ -2904,6 +2915,8 @@ static bool handle_relogin(MsgChannel *mc, Msg *_m)
 
     CompileServer *cs = static_cast<CompileServer *>(mc);
     cs->setCompilerVersions(m->envs);
+    cs->setCacheAdvertisement(m->cache_endpoint_port, m->cache_protocol,
+                              m->cache_profile_mask);
     cs->setBusyInstalling(0);
 
     std::ostream &dbg = trace();
@@ -2913,7 +2926,16 @@ static bool handle_relogin(MsgChannel *mc, Msg *_m)
         dbg << it->second << "(" << it->first << "), ";
     }
 
-    dbg << "]" << endl;
+    dbg << "] cache=";
+    if (m->hasCacheAdvertisement()) {
+        dbg << cs->name << ":" << m->cache_endpoint_port
+            << " cache_wire=v1 cache_protocol=" << m->cache_protocol
+            << " cache_profiles="
+            << cache_profiles_to_string(m->cache_profile_mask);
+    } else {
+        dbg << "off";
+    }
+    dbg << endl;
 
     /* Configure the daemon */
     if (IS_PROTOCOL_VERSION(24, cs)) {
@@ -3600,6 +3622,17 @@ static bool handle_line(CompileServer *cs, Msg *_m)
                     it->connectionGeneration(),
                     it->outstandingDispatches());
             line += buffer;
+
+            if (it->cacheEndpointPort() != 0) {
+                sprintf(buffer,
+                        " cache=%s:%u cache_wire=v1 cache_protocol=%u cache_profiles=%s",
+                        it->name.c_str(), it->cacheEndpointPort(),
+                        it->cacheProtocol(),
+                        cache_profiles_to_string(it->cacheProfileMask()).c_str());
+                line += buffer;
+            } else {
+                line += " cache=off";
+            }
 
             if (it->busyInstalling()) {
                 sprintf(buffer, " busy installing since %ld s",  time(nullptr) - it->busyInstalling());

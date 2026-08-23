@@ -9,6 +9,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <variant>
 #include <vector>
 
@@ -122,7 +123,15 @@ struct ComponentDescriptor {
     auto operator<=>(const ComponentDescriptor&) const = default;
 };
 
-enum class ProfileId : uint16_t { P29 = 1, ZSTD_TU = 2, GRZ = 3 };
+enum class ProfileId : uint16_t {
+    P29 = 1,
+    ZSTD_TU = 2,
+    GRZ = 3,
+    Z3_LONG = 4,
+    Z3_SHARED_LONG = 5,
+};
+
+std::string_view profile_name(ProfileId profile);
 
 constexpr uint32_t profile_bit(ProfileId profile) {
     const uint16_t value = static_cast<uint16_t>(profile);
@@ -133,6 +142,9 @@ constexpr uint32_t kM1SupportedProfiles = profile_bit(ProfileId::P29);
 constexpr uint32_t kKnownProfileMask = profile_bit(ProfileId::P29) |
                                        profile_bit(ProfileId::ZSTD_TU) |
                                        profile_bit(ProfileId::GRZ);
+constexpr uint32_t kDeclaredProfileMask = kKnownProfileMask |
+                                          profile_bit(ProfileId::Z3_LONG) |
+                                          profile_bit(ProfileId::Z3_SHARED_LONG);
 
 enum class P29RootMode : uint16_t {
     NotApplicable = 0,

@@ -1109,6 +1109,7 @@ MsgChannel::MsgChannel(int _fd, struct sockaddr *_a, socklen_t _l, bool text)
     inbuflen = 128;
     inofs = 0;
     intogo = 0;
+    current_message_end = 0;
     eof = false;
     text_based = text;
     set_error_recursion = false;
@@ -1351,6 +1352,7 @@ Msg *MsgChannel::get_msg(int timeout, bool eofAllowed)
     }
 
     size_t intogo_old = intogo;
+    current_message_end = intogo_old + inmsglen;
 
     if (text_based) {
         type = Msg::TEXT;
@@ -2763,6 +2765,10 @@ LoginMsg::LoginMsg(unsigned int myport, const std::string &_nodename, const std:
     , nodename(_nodename)
     , host_platform(_host_platform)
     , supported_features(myfeatures)
+    , cache_endpoint_port(0)
+    , cache_protocol(0)
+    , cache_profile_mask(0)
+    , cache_advertisement_tail_valid(true)
 {
 #ifdef HAVE_LIBCAP_NG
     chroot_possible = capng_have_capability(CAPNG_EFFECTIVE, CAP_SYS_CHROOT);
@@ -2795,6 +2801,22 @@ void LoginMsg::fill_from_channel(MsgChannel *c)
     if (IS_PROTOCOL_VERSION(42, c)) {
         *c >> supported_features;
     }
+    if (IS_PROTOCOL_VERSION(PROTOCOL_VERSION_CACHE_ADVERTISEMENT, c)) {
+        if (c->current_message_bytes_remaining() < 3 * sizeof(uint32_t)) {
+            cache_endpoint_port = 0;
+            cache_protocol = 0;
+            cache_profile_mask = 0;
+            cache_advertisement_tail_valid = false;
+            return;
+        }
+        *c >> cache_endpoint_port;
+        *c >> cache_protocol;
+        *c >> cache_profile_mask;
+    } else {
+        cache_endpoint_port = 0;
+        cache_protocol = 0;
+        cache_profile_mask = 0;
+    }
 }
 
 void LoginMsg::send_to_channel(MsgChannel *c) const
@@ -2813,6 +2835,25 @@ void LoginMsg::send_to_channel(MsgChannel *c) const
     if (IS_PROTOCOL_VERSION(42, c)) {
         *c << supported_features;
     }
+    if (IS_PROTOCOL_VERSION(PROTOCOL_VERSION_CACHE_ADVERTISEMENT, c)) {
+        *c << cache_endpoint_port;
+        *c << cache_protocol;
+        *c << cache_profile_mask;
+    }
+}
+
+bool LoginMsg::valid_payload() const
+{
+    if (!cache_advertisement_tail_valid)
+        return false;
+    const bool absent = cache_endpoint_port == 0
+        && cache_protocol == 0 && cache_profile_mask == 0;
+    const bool present = cache_endpoint_port > 0
+        && cache_endpoint_port <= UINT16_MAX
+        && cache_protocol == CACHE_WIRE_PROTOCOL_V1
+        && cache_profile_mask != 0
+        && (cache_profile_mask & ~CACHE_ADVERTISABLE_PROFILE_MASK) == 0;
+    return absent || present;
 }
 
 void ConfCSMsg::fill_from_channel(MsgChannel *c)

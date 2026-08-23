@@ -184,6 +184,11 @@ int main(int argc, char **argv)
     MsgChannel *scheduler = accept_channel(listener, 8000);
     Msg *login = wait_type(scheduler, Msg::LOGIN, 5000);
     REQUIRE(scheduler && login, "daemon logged in through the real protocol");
+    LoginMsg *typed_login = dynamic_cast<LoginMsg *>(login);
+    REQUIRE(typed_login && !typed_login->hasCacheAdvertisement()
+                && typed_login->cache_protocol == 0
+                && typed_login->cache_profile_mask == 0,
+            "real daemon advertises canonical cache absence without a ready owner");
     delete login;
 
     const uint64_t epoch = UINT64_C(0x1234567800000049);
@@ -336,6 +341,11 @@ int main(int argc, char **argv)
     scheduler = accept_channel(listener, 8000);
     login = wait_type(scheduler, Msg::LOGIN, 5000);
     REQUIRE(scheduler && login, "daemon reconnects after scheduler loss");
+    typed_login = dynamic_cast<LoginMsg *>(login);
+    REQUIRE(typed_login && !typed_login->hasCacheAdvertisement()
+                && typed_login->cache_protocol == 0
+                && typed_login->cache_profile_mask == 0,
+            "daemon reconnect retains the canonical absent snapshot");
     delete login;
     REQUIRE(scheduler && scheduler->send_msg(
                 ConfCSMsg(epoch, ConfCSMsg::EnforcingCompat)),

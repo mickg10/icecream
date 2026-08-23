@@ -244,3 +244,22 @@ string supported_features_to_string(unsigned int features)
         ret.erase( 0, 1 ); // remove leading " "
     return ret;
 }
+
+string cache_profiles_to_string(uint32_t profiles)
+{
+    string ret;
+    if (profiles & CACHE_PROFILE_P29)
+        ret += " p29";
+    if (profiles & CACHE_PROFILE_ZSTD_TU)
+        ret += " zstd_tu";
+    if (profiles & CACHE_PROFILE_GRZ)
+        ret += " grz";
+    if (profiles & CACHE_PROFILE_Z3_LONG)
+        ret += " z3_long";
+    if (profiles & CACHE_PROFILE_Z3_SHARED_LONG)
+        ret += " z3_shared_long";
+    if (ret.empty())
+        return "--";
+    ret.erase(0, 1);
+    return ret;
+}
