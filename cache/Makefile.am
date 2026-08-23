@@ -17,6 +17,7 @@ libp50endpoint_a_SOURCES = p50_endpoint.cpp p50_endpoint.h
 libp50endpoint_a_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
 
 EXTRA_DIST = \
+	PROFILE-REGISTRY.md \
 	README.md \
 	P48_P50_CONVERGENCE.md \
 	KEY_LAYOUT_V1_CENSUS.md \
