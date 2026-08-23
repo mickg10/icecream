@@ -3051,6 +3051,171 @@ void report_zstd1_metrics(bool enforce_performance_floor) {
 
 } // namespace
 
+
+// ===== same_commit negative coverage: ordinary commit path =====
+// local-oracle ruling (#16, 2026-08-23T16:54Z): a well-formed fake F must not be able to
+// close C's active transaction with a TxCommit differing from the live TxBegin in any of the
+// six identity fields.  Each mismatch must be rejected exactly, leave the active transaction
+// unchanged, and permit a later exact retry to commit.  The baseline (exact commit) proves the
+// fake F speaks the protocol; without it a broken fake would fake-pass the matrix.
+
+enum class CommitMismatchField {
+    None,
+    HistoryNonce,
+    RelSeq,
+    TuSeq,
+    TransactionDigest,
+    RawDigest,
+    PostStateDigest,
+};
+
+TxCommit correct_commit_for(const TxBegin& begin) {
+    TxCommit commit;
+    commit.history_nonce = begin.history_nonce;
+    commit.rel_seq = begin.rel_seq;
+    commit.tu_seq = begin.tu_seq;
+    commit.transaction_digest = begin.transaction_digest;
+    commit.raw_digest = begin.raw_digest;
+    commit.post_state_digest =
+        compute_post_state_digest(begin.pre_state_digest, begin.history_nonce, begin.rel_seq,
+                                  begin.tu_seq, begin.transaction_digest);
+    return commit;
+}
+
+void mutate_commit(TxCommit& commit, CommitMismatchField field) {
+    switch (field) {
+    case CommitMismatchField::None:
+        break;
+    case CommitMismatchField::HistoryNonce:
+        commit.history_nonce.value += 1;
+        break;
+    case CommitMismatchField::RelSeq:
+        commit.rel_seq.value += 1;
+        break;
+    case CommitMismatchField::TuSeq:
+        commit.tu_seq.value += 1;
+        break;
+    case CommitMismatchField::TransactionDigest:
+        commit.transaction_digest.bytes[0] ^= 0x80;
+        break;
+    case CommitMismatchField::RawDigest:
+        commit.raw_digest.bytes[0] ^= 0x80;
+        break;
+    case CommitMismatchField::PostStateDigest:
+        commit.post_state_digest.bytes[0] ^= 0x80;
+        break;
+    }
+}
+
+// A raw fake F: accepts one real-client connection, performs the exact fresh-route dance
+// (HELLO -> fresh SESSION_STATE -> HISTORY_RESET -> bound acknowledgement), consumes the
+// TX_BEGIN and BODY components, then answers with a commit derived from the received begin
+// with exactly one field mutated (or none for the baseline), and waits for the peer to close.
+asio::awaitable<void> raw_f_serve_and_commit(tcp::acceptor& acceptor, FStoreGuid f_guid,
+                                             CommitMismatchField field) {
+    tcp::socket socket = co_await acceptor.async_accept(asio::use_awaitable);
+    const SessionHello hello =
+        raw_decode<SessionHello>(co_await raw_read(socket, kInitialMaxFramePayload));
+    const SessionSelection selection =
+        negotiate_session(hello, kProtocolVersion, kProtocolVersion, kKnownProfileMask);
+    const uint32_t cap = selection.limits.max_frame_payload;
+    SessionState fresh;
+    fresh.selected_protocol = selection.protocol;
+    fresh.negotiated_profiles = selection.negotiated_profiles;
+    fresh.limits = selection.limits;
+    fresh.f_store_guid = f_guid;
+    co_await raw_write(socket, Message{fresh});
+    Frame next = co_await raw_read(socket, cap);
+    TxBegin begin;
+    if (next.type == MessageType::HISTORY_RESET) {
+        const HistoryReset reset = raw_decode<HistoryReset>(next);
+        SessionState ack = fresh;
+        ack.namespace_present = true;
+        ack.route_present = true;
+        ack.history_nonce = reset.history_nonce;
+        ack.next_rel_seq = RelSeq{0};
+        ack.state_digest = reset.initial_state_digest;
+        co_await raw_write(socket, Message{ack});
+        begin = raw_decode<TxBegin>(co_await raw_read(socket, cap));
+    } else {
+        begin = raw_decode<TxBegin>(next);
+    }
+    uint64_t body_bytes = 0;
+    while (body_bytes < begin.body.encoded_bytes) {
+        const BodyMessage body = raw_decode<BodyMessage>(co_await raw_read(socket, cap));
+        if (body.bytes.empty())
+            break;
+        body_bytes += body.bytes.size();
+    }
+    TxCommit commit = correct_commit_for(begin);
+    mutate_commit(commit, field);
+    co_await raw_write(socket, Message{commit});
+    co_await raw_wait_for_close(socket);
+    co_return;
+}
+
+void test_commit_identity_negative_matrix() {
+    const std::array cases{
+        std::pair{CommitMismatchField::HistoryNonce, "history nonce"},
+        std::pair{CommitMismatchField::RelSeq, "REL_SEQ"},
+        std::pair{CommitMismatchField::TuSeq, "TU_SEQ"},
+        std::pair{CommitMismatchField::TransactionDigest, "transaction digest"},
+        std::pair{CommitMismatchField::RawDigest, "raw digest"},
+        std::pair{CommitMismatchField::PostStateDigest, "post-state digest"},
+    };
+    uint64_t identity = 7000;
+
+    {
+        TestClient client(Id128::from_u64(identity++));
+        const std::vector<uint8_t> input = pseudo_random_bytes(4096);
+        const PreparedTuHandle prepared = admit(client, input);
+        asio::io_context context;
+        tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+        std::future<void> fake = asio::co_spawn(
+            context,
+            raw_f_serve_and_commit(acceptor, Id128::from_u64(identity++),
+                                   CommitMismatchField::None),
+            asio::use_future);
+        std::future<ClientRunResult> run = asio::co_spawn(
+            context, client.endpoint.run(acceptor.local_endpoint(), prepared, {}),
+            asio::use_future);
+        context.run();
+        fake.get();
+        const ClientRunResult baseline = run.get();
+        require(baseline.status == ClientRunStatus::Committed && !client.has_active_transaction(),
+                "raw fake F baseline exact commit was not accepted");
+    }
+
+    for (const auto& [field, name] : cases) {
+        TestClient client(Id128::from_u64(identity++));
+        const std::vector<uint8_t> input = pseudo_random_bytes(4096);
+        const PreparedTuHandle prepared = admit(client, input);
+        asio::io_context context;
+        tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+        std::future<void> fake = asio::co_spawn(
+            context,
+            raw_f_serve_and_commit(acceptor, Id128::from_u64(identity++), field),
+            asio::use_future);
+        std::future<ClientRunResult> run = asio::co_spawn(
+            context, client.endpoint.run(acceptor.local_endpoint(), prepared, {}),
+            asio::use_future);
+        context.run();
+        fake.get();
+        const ClientRunResult rejected = run.get();
+        require(rejected.status == ClientRunStatus::TerminalError &&
+                    client.has_active_transaction(),
+                std::string(name) + " commit mismatch was not rejected exactly");
+
+        P50ServerEndpoint real_server(Id128::from_u64(identity++));
+        const PairResult retried = run_pair(client, real_server);
+        require(retried.client.status == ClientRunStatus::Committed &&
+                    retried.client.reconnect == EndpointReconnectOutcome::ColdFStore &&
+                    !client.has_active_transaction() &&
+                    copy_input(real_server, client.c_store_guid()) == input,
+                std::string(name) + " rejection did not permit an exact retry to commit");
+    }
+}
+
 int main(int argc, char** argv) {
     const bool performance_gate = argc == 2 && std::string_view(argv[1]) == "--performance";
     if (argc > 2 || (argc == 2 && !performance_gate))
@@ -3058,6 +3223,7 @@ int main(int argc, char** argv) {
     test_normal_zero_and_completion_stamps();
     test_completion_stamp_correspondence();
     test_completion_live_identity_correspondence();
+    test_commit_identity_negative_matrix();
     test_idempotent_prepare_admission();
     test_candidate_stage_has_no_revision_residue();
     test_input_record_owner_and_aggregate_limits();
