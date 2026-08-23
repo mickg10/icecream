@@ -1,4 +1,4 @@
-TESTS = testargs lockexec backpressure schedpolicy utf8test statewritertest fastesttest hallflowtest jobidalloctest inputpump compilerinput p49assignment p50assignment p50assignment-source.sh packagebuilderdeps.sh p49daemon-run.sh p49scheduler-run.sh connectivity-run.sh schedbp-quick.sh schedstress-quick.sh remoteice-quick.sh p50assignment-remote.sh daemonlogin-run.sh daemonbatch-run.sh boost-prefix-scope.sh p50wire p50slice0 p50zstd p50zstdwindow p50inputrecord p50inputrecordlate p50inputrecordreopen p50endpoint digest128bench p50_trace_check.sh
+TESTS = testargs lockexec backpressure schedpolicy utf8test statewritertest fastesttest hallflowtest jobidalloctest inputpump compilerinput p49assignment p50assignment p50assignment-source.sh packagebuilderdeps.sh p49daemon-run.sh p49scheduler-run.sh connectivity-run.sh schedbp-quick.sh schedstress-quick.sh remoteice-quick.sh p50assignment-remote.sh daemonlogin-run.sh daemonbatch-run.sh boost-prefix-scope.sh p50wire p50slice0 p50zstd p50zstdwindow p50loopback p50inputrecord p50inputrecordlate p50inputrecordreopen p50endpoint digest128bench p50_trace_check.sh
 
 AM_TESTS_ENVIRONMENT = \
 	ICECC_TEST_BUILDDIR='$(abs_builddir)'; export ICECC_TEST_BUILDDIR; \
@@ -47,7 +47,7 @@ p50endpoint_LDADD = ../cache/libp50endpoint.a ../cache/libprotocol50.a \
 	$(LIBZSTD_LIBS) $(BOOST_LIBS)
 digest128bench_LDADD = ../services/libicecc.la
 
-check_PROGRAMS = testargs lockexec backpressure schedpolicy utf8test statewritertest schedbp daemonlogin daemonbatch p49daemon p49scheduler connectivity fastesttest hallflowtest jobidalloctest inputpump compilerinput p49assignment p50assignment p50wire p50slice0 p50zstd p50zstdwindow p50inputrecord p50inputrecordlate p50inputrecordreopen p50endpoint digest128bench
+check_PROGRAMS = testargs lockexec backpressure schedpolicy utf8test statewritertest schedbp daemonlogin daemonbatch p49daemon p49scheduler connectivity fastesttest hallflowtest jobidalloctest inputpump compilerinput p49assignment p50assignment p50wire p50slice0 p50zstd p50zstdwindow p50loopback p50inputrecord p50inputrecordlate p50inputrecordreopen p50endpoint digest128bench
 testargs_SOURCES = args.cpp
 p50wire_SOURCES = p50_wire_test.cpp
 p50slice0_SOURCES = \
@@ -139,3 +139,8 @@ EXTRA_DIST += p50_trace_check.sh p50assignment-source.sh packagebuilderdeps.sh
 
 # Make the tests also print the test log if they fail.
 check: export VERBOSE=1
+
+p50loopback_SOURCES = p50_loopback_test.cpp
+p50loopback_LDADD = ../cache/libprotocol50.a ../services/libicecc.la $(BOOST_LIBS) $(LIBZSTD_LIBS)
+p50loopback_CXXFLAGS = $(BOOST_CPPFLAGS) -pthread
+p50loopback_LDFLAGS = $(BOOST_LDFLAGS) -pthread
