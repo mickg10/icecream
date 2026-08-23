@@ -123,6 +123,13 @@ struct EndpointIoControl {
     // private, and both endpoints use the same field-by-field validator.
     std::function<void(const CompletionStamp&, CompletionLiveIdentity&)>
         before_live_identity_check;
+    // Test-only copied-begin transform: applied to a COPY of the outbound
+    // TX_BEGIN after the client coroutine constructs it and before the
+    // outbound-admission validation/send, so a test can drive the production
+    // validator AND its production callsite with a wire-valid but
+    // unnegotiated begin. The retained prepared record is never mutated.
+    // Product callers leave it unset.
+    std::function<TxBegin(const TxBegin&)> outbound_begin_transform;
 };
 
 struct PrepareRequestKey {

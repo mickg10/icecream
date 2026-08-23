@@ -2687,6 +2687,77 @@ void test_client_outbound_mask_law() {
             "outbound mask probe disturbed the live route");
 }
 
+
+// local-oracle's 414a917e HOLD closure: the production CLIENT CALLSITE of the
+// outbound mask law, exercised end-to-end. The copied-begin control hook
+// flips the coroutine's own outbound TX_BEGIN copy to wire-valid GRZ after
+// construction and before validation/send; the production validator must
+// reject through the production call, the fake F must observe complete
+// silence after route establishment (no TX_BEGIN/BODY frame ever arrives),
+// and the SAME prepared work must then commit exactly on a clean retry.
+// Deleting either the predicate clause or the production callsite makes the
+// begin reach the peer, which trips the silence assertion below.
+asio::awaitable<void> raw_established_then_silent_peer(tcp::acceptor& acceptor,
+                                                       FStoreGuid f_guid) {
+    const auto executor = co_await asio::this_coro::executor;
+    tcp::socket socket(executor);
+    co_await acceptor.async_accept(socket, asio::use_awaitable);
+    const SessionHello hello = raw_decode<SessionHello>(
+        co_await raw_read(socket, kInitialMaxFramePayload));
+
+    SessionState fresh;
+    fresh.selected_protocol = kProtocolVersion;
+    fresh.negotiated_profiles = profile_bit(ProfileId::ZSTD_TU);
+    fresh.limits = hello.limits;
+    fresh.f_store_guid = f_guid;
+    co_await raw_write(socket, fresh);
+
+    const HistoryReset reset = raw_decode<HistoryReset>(
+        co_await raw_read(socket, fresh.limits.max_frame_payload));
+    SessionState ack = fresh;
+    ack.namespace_present = true;
+    ack.route_present = true;
+    ack.history_nonce = reset.history_nonce;
+    ack.next_rel_seq = RelSeq{0};
+    ack.state_digest = reset.initial_state_digest;
+    co_await raw_write(socket, ack);
+
+    // The rejected outbound begin must never reach the wire: the next event
+    // on this socket has to be the client closing it, not a frame.
+    co_await raw_wait_for_close(socket);
+}
+
+void test_client_outbound_callsite_law() {
+    TestClient client(Id128::from_u64(920));
+    const std::vector<uint8_t> input = bytes("callsite law: prepared survives local rejection\n");
+    const PreparedTuHandle prepared = admit(client, input);
+
+    EndpointIoControl grz_control;
+    grz_control.outbound_begin_transform = [](const TxBegin& begin) {
+        TxBegin crafted = begin;
+        crafted.profile = ProfileId::GRZ;  // wire-valid, unnegotiated
+        return crafted;
+    };
+    const ClientRunResult rejected = run_client_with_raw_peer(
+        client, prepared,
+        [&](tcp::acceptor& acceptor) {
+            return raw_established_then_silent_peer(acceptor, Id128::from_u64(921));
+        },
+        grz_control);
+    require(rejected.status == ClientRunStatus::TerminalError &&
+                rejected.terminal_error &&
+                rejected.terminal_error->detail ==
+                    "C selected a profile outside the negotiated mask",
+            "production callsite did not reject the transformed unnegotiated begin");
+    require(!client.has_active_transaction() || client.has_reconciliation_work(),
+            "local outbound rejection left the client without recoverable work");
+
+    P50ServerEndpoint good(Id128::from_u64(922));
+    require(run_pair(client, good).client.status == ClientRunStatus::Committed &&
+                copy_input(good, client.c_store_guid()) == input,
+            "outbound callsite rejection lost or changed the prepared work");
+}
+
 void test_reserved_zero_endpoint_values() {
     {
         P50ServerEndpoint server(Id128::from_u64(628));
@@ -3697,6 +3768,7 @@ int main(int argc, char** argv) {
     test_handshake_binding_and_namespace_rules();
     test_unnegotiated_begin_rejected_and_route_preserved();
     test_client_outbound_mask_law();
+    test_client_outbound_callsite_law();
     test_reserved_zero_endpoint_values();
     test_interrupted_begin_identity();
     test_terminal_body_failure_identity();

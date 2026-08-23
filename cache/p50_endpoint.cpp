@@ -1587,7 +1587,9 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run(tcp::endpoint rem
             impl_->start_active(queued, serial);
             impl_->queued.reset();
         }
-        const TxBegin begin = impl_->active->begin;
+        TxBegin begin = impl_->active->begin;
+        if (control.outbound_begin_transform)
+            begin = control.outbound_begin_transform(begin);
         require_outbound_profile_negotiated(peer.negotiated_profiles, begin);
         const uint32_t frame_cap = peer.limits.max_frame_payload;
         co_await async_write_message(socket, begin, frame_cap,
