@@ -478,15 +478,27 @@ public:
        carried BOTH a fully-valid cache tail (see
        cache_advertisement_is_valid_present) AND a nonzero P50 assignment
        identity -- the identity the daemon will actually claim the job
-       with (see scheduler_use_cs).  host/port/protocol/profileMask are
-       meaningless unless valid is true.  Retained alongside the job for a
-       later milestone; this change makes no connection to host:port. */
+       with (see scheduler_use_cs).  Every field below is bound from the
+       SAME UseCS frame: wireJobId/assignmentEpoch/assignmentNonce identify
+       exactly which assignment this binding belongs to (so a later
+       consumer can refuse to reuse it under a different assignment); host
+       is the frame's single host authority for BOTH endpoints (the
+       ordinary compile port and the cache port are two listeners on that
+       one host); ordinaryPort is the selected F's compile port, matching
+       reply.port on the wire.  Every field but `valid` is meaningless
+       unless valid is true.  Retained alongside -- not inside -- the
+       existing CompileJob *job below; this change makes no connection to
+       host:cachePort. */
     struct CacheHandoff {
         bool valid;
+        uint32_t wireJobId;
+        uint64_t assignmentEpoch;
+        uint64_t assignmentNonce;
         string host;
-        uint32_t port;
-        uint32_t protocol;
-        uint32_t profileMask;
+        uint32_t ordinaryPort;
+        uint32_t cachePort;
+        uint32_t cacheProtocol;
+        uint32_t cacheProfileMask;
     };
 
     Client() {
@@ -513,7 +525,7 @@ public:
         last_known_job_id = 0;
         channel = nullptr;
         job = nullptr;
-        cacheHandoff = CacheHandoff{false, string(), 0, 0, 0};
+        cacheHandoff = CacheHandoff{};
         usecsmsg = nullptr;
         deferred_getcs = nullptr;
         getcs_published = false;
@@ -5472,28 +5484,45 @@ int Daemon::scheduler_use_cs(UseCSMsg *msg)
        will claim with (msg->hasAssignmentIdentity()); msg->valid_payload()
        already enforced the tail's own absent-or-present law on receipt (see
        MsgChannel::get_msg), so this re-checks it explicitly rather than
-       trusting that channel-layer gate implicitly.  No connection is made
-       here (see M3, out of scope for this change): this only stores the
-       endpoint alongside the job for a later milestone to consume. */
-    c->cacheHandoff = Client::CacheHandoff{false, string(), 0, 0, 0};
+       trusting that channel-layer gate implicitly.  Every field is bound
+       from this SAME msg, including the wire id/epoch/nonce, so a later
+       consumer can refuse to reuse this endpoint under a different
+       assignment.  No connection is made here (see M3, out of scope for
+       this change): this only stores the endpoint alongside the job for a
+       later milestone to consume. */
+    c->cacheHandoff = Client::CacheHandoff{};
     if (msg->hasCacheAdvertisement() && msg->hasAssignmentIdentity()
             && cache_advertisement_is_valid_present(
                    msg->cache_endpoint_port, msg->cache_protocol,
                    msg->cache_profile_mask)) {
         c->cacheHandoff = Client::CacheHandoff{
-            true, msg->hostname, msg->cache_endpoint_port,
-            msg->cache_protocol, msg->cache_profile_mask};
+            true, msg->job_id, msg->assignmentEpoch(), msg->assignmentNonce(),
+            msg->hostname, msg->port,
+            msg->cache_endpoint_port, msg->cache_protocol, msg->cache_profile_mask};
     }
+    /* Both relay projections below carry this SAME validated triple (or
+       canonical 0/0/0 when c->cacheHandoff.valid is false) -- otherwise a
+       client that reaches this daemon via the remote-worker branch would
+       silently see cache absence even though the scheduler->daemon hop
+       just validated a real endpoint.  Only derived host reachability
+       (127.0.0.1 vs the real worker address) differs between the two
+       branches; port/protocol/mask and the assignment identity above do
+       not change with it. */
+    const uint32_t relay_cache_port = c->cacheHandoff.valid ? c->cacheHandoff.cachePort : 0;
+    const uint32_t relay_cache_protocol = c->cacheHandoff.valid ? c->cacheHandoff.cacheProtocol : 0;
+    const uint32_t relay_cache_mask = c->cacheHandoff.valid ? c->cacheHandoff.cacheProfileMask : 0;
 
     if (msg->hostname == remote_name && int(msg->port) == daemon_port) {
         c->usecsmsg = new UseCSMsg(msg->host_platform, "127.0.0.1", daemon_port, msg->job_id, true, 1,
                                    msg->matched_job_id, msg->assignmentEpoch(),
-                                   msg->assignmentNonce());
+                                   msg->assignmentNonce(), relay_cache_port,
+                                   relay_cache_protocol, relay_cache_mask);
         c->set_status(Client::PENDING_USE_CS, "scheduler_use_cs: local compile");
     } else {
         c->usecsmsg = new UseCSMsg(msg->host_platform, msg->hostname, msg->port,
                                    msg->job_id, true, 1, msg->matched_job_id,
-                                   msg->assignmentEpoch(), msg->assignmentNonce());
+                                   msg->assignmentEpoch(), msg->assignmentNonce(),
+                                   relay_cache_port, relay_cache_protocol, relay_cache_mask);
 
         /* EXACT identity is persisted BEFORE the framed write starts, and
            the client is moved to an explicit handoff phase.  If the write
@@ -5577,6 +5606,10 @@ int Daemon::scheduler_no_cs(NoCSMsg *msg)
         record_waitforcs_latency(false, c->last_waitforcs_msec);
     }
 
+    /* S2: NO_CS carries no worker snapshot at all -- always canonical
+       cache-absent, and clears any handoff retained from an earlier
+       dispatch on this same (reused) Client so it can never leak forward. */
+    c->cacheHandoff = Client::CacheHandoff{};
     c->usecsmsg = new UseCSMsg(string(), "127.0.0.1", daemon_port, msg->job_id, true, 1, 0);
     c->set_status(Client::PENDING_USE_CS, "scheduler_no_cs: local compile");
 
@@ -6176,6 +6209,9 @@ void Daemon::handle_old_request()
         for (Client *c : stranded) {
             GetCSMsg *g = c->deferred_getcs;
             if (g->count <= 1) {
+                /* S2: schedulerless local fallback, no worker snapshot --
+                   canonical cache-absent (see scheduler_no_cs). */
+                c->cacheHandoff = Client::CacheHandoff{};
                 c->usecsmsg = new UseCSMsg(g->target, "127.0.0.1", daemon_port,
                                            c->client_id, true, 1, 0);
                 c->job_id = c->client_id;
@@ -6775,6 +6811,9 @@ bool Daemon::handle_get_cs(Client *client, Msg *msg)
             handle_end(client, 111);
             return false;
         }
+        /* S2: scheduler missing entirely, no worker snapshot -- canonical
+           cache-absent (see scheduler_no_cs). */
+        client->cacheHandoff = Client::CacheHandoff{};
         client->usecsmsg = new UseCSMsg(umsg->target, "127.0.0.1", daemon_port,
                                         umsg->client_id, true, 1, 0);
         client->set_status(Client::PENDING_USE_CS, "handle_get_cs: scheduler missing, local compile");
