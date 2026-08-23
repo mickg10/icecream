@@ -128,6 +128,9 @@ CandidateSessionGate::CandidateSessionGate(
     if (next_candidate_id_ == 0 || next_session_serial_ == 0)
         throw std::invalid_argument("candidate/session serial zero is reserved");
     SessionHello probe;
+    // Construction-time shape probe: only profiles/limits are under validation,
+    // but the corrected foundations reserve the zero C_STORE_GUID everywhere.
+    probe.c_store_guid = Id128::from_u64(1);
     probe.supported_profiles = server_profiles_;
     probe.limits = server_limits_;
     (void)negotiate_session(probe, kProtocolVersion, kProtocolVersion,
@@ -251,7 +254,7 @@ SessionState ZstdLoopbackServer::session_state_for(
     const SessionSelection& selection) const {
     SessionState result;
     result.selected_protocol = selection.protocol;
-    result.selected_profile = selection.profile;
+    result.negotiated_profiles = selection.negotiated_profiles;
     result.limits = selection.limits;
     result.f_store_guid = config_.f_store_guid;
     result.namespace_present = namespace_present_;
@@ -267,6 +270,7 @@ SessionState ZstdLoopbackServer::session_state_for(
 
 SessionState ZstdLoopbackServer::route_snapshot() const {
     SessionHello probe;
+    probe.c_store_guid = expected_c_store_guid_;
     probe.supported_profiles = config_.supported_profiles;
     probe.limits = config_.session_limits;
     return session_state_for(negotiate_session(
@@ -303,9 +307,11 @@ void ZstdLoopbackServer::validate_begin_cursor(
     const TxBegin& begin, const SessionSelection& selection) const {
     if (!namespace_present_ || !route_present_)
         throw std::logic_error("TX_BEGIN arrived before route establishment");
-    if (begin.profile != selection.profile ||
-        (profile_bit(begin.profile) & config_.supported_profiles) == 0)
-        throw std::invalid_argument("TX_BEGIN selected the wrong session profile");
+    const uint32_t transaction_profile_bit = profile_bit(begin.profile);
+    if (transaction_profile_bit == 0 ||
+        (transaction_profile_bit & selection.negotiated_profiles) == 0 ||
+        (transaction_profile_bit & config_.supported_profiles) == 0)
+        throw std::invalid_argument("TX_BEGIN profile was not negotiated");
     if (begin.history_nonce != history_nonce_ ||
         begin.rel_seq != next_rel_seq_ ||
         begin.pre_state_digest != state_digest_)
@@ -322,8 +328,8 @@ void ZstdLoopbackServer::publish_commit(
         throw std::logic_error("materialized dialogue lost its TX_BEGIN");
 
     const TxBegin begin = *dialogue.active_begin();
-    if (begin.profile != selection.profile)
-        throw std::logic_error("dialogue profile differs from installed session");
+    if ((profile_bit(begin.profile) & selection.negotiated_profiles) == 0)
+        throw std::logic_error("dialogue profile outside the installed session's negotiated mask");
     std::vector<uint8_t> exact_input = dialogue.materialize();
     const TxCommit commit{
         begin.history_nonce,
@@ -388,11 +394,11 @@ void ZstdLoopbackServer::serve_one_connection() {
             apply_history_reset(*reset);
             write_message(socket,
                           Message{session_state_for(candidate.selection)});
-            dialogue.emplace(profile_bit(candidate.selection.profile),
+            dialogue.emplace(candidate.selection.negotiated_profiles,
                              config_.zstd_limits);
         } else if (const auto* begin = std::get_if<TxBegin>(&first_mutation)) {
             validate_begin_cursor(*begin, candidate.selection);
-            dialogue.emplace(profile_bit(candidate.selection.profile),
+            dialogue.emplace(candidate.selection.negotiated_profiles,
                              config_.zstd_limits);
             dialogue->begin(*begin);
             session_serial = gate_.activate(candidate.id);
@@ -509,7 +515,7 @@ TxCommit ZstdLoopbackClient::transfer(
     const ZstdTuEnvelope& envelope, size_t body_message_bytes) {
     if (!state_.namespace_present || !state_.route_present)
         throw std::logic_error("client cannot transfer before route establishment");
-    if (envelope.begin.profile != state_.selected_profile ||
+    if ((profile_bit(envelope.begin.profile) & state_.negotiated_profiles) == 0 ||
         envelope.begin.history_nonce != state_.history_nonce ||
         envelope.begin.rel_seq != state_.next_rel_seq ||
         envelope.begin.pre_state_digest != state_.state_digest)

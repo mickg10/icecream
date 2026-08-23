@@ -215,7 +215,7 @@ void test_persistent_cold_then_warm_transfer() {
         client_context,
         tcp::endpoint(boost::asio::ip::address_v4::loopback(), server.port()),
         hello(c_guid, session_limits), 1);
-    require(client.state().selected_profile == ProfileId::ZSTD_TU &&
+    require(client.state().negotiated_profiles == profile_bit(ProfileId::ZSTD_TU) &&
                 !client.state().namespace_present && !client.state().route_present,
             "cold handshake selected the wrong profile or route state");
     client.establish_initial_route(HistoryNonce{9});
@@ -410,12 +410,189 @@ void test_publish_failure_does_not_advance_route() {
 
 }  // namespace
 
+
+// The three tests below bind the endpoint's warm-route validation clauses so
+// that neutralizing any of them (cursor law, negotiated-mask law on either
+// side) is caught here rather than surviving as a reachable-but-untested
+// branch. The publish-time stale-serial backstop in publish_commit is not
+// externally expressible through the one-connection-at-a-time serve loop and
+// remains defense-in-depth behind the gate tests above.
+
+void test_warm_route_rejects_cursor_divergent_begin() {
+    boost::asio::io_context server_context;
+    boost::asio::io_context client_context;
+    const CStoreGuid c_guid = Id128::from_u64(600);
+    const SessionLimits session_limits{4096, 1U << 20};
+    ZstdLoopbackConfig config;
+    config.f_store_guid = Id128::from_u64(601);
+    config.session_limits = session_limits;
+    config.zstd_limits = {1U << 20, 1U << 20};
+
+    ZstdLoopbackServer server(
+        server_context, config, c_guid,
+        [](const TxBegin&, const TxCommit&, std::vector<uint8_t>) {});
+    ServerThread running(server);
+
+    tcp::socket socket(client_context);
+    socket.connect(tcp::endpoint(boost::asio::ip::address_v4::loopback(),
+                                 server.port()));
+    write_fragmented(socket, Message{hello(c_guid, session_limits)});
+    const Message cold = read_message(socket);
+    const auto* cold_state = std::get_if<SessionState>(&cold);
+    require(cold_state != nullptr && !cold_state->route_present,
+            "cursor-divergence probe did not receive the cold SESSION_STATE");
+
+    const HistoryNonce nonce{77};
+    write_fragmented(
+        socket,
+        Message{HistoryReset{nonce, initial_route_digest(c_guid, nonce)}});
+    const Message established = read_message(socket);
+    const auto* route = std::get_if<SessionState>(&established);
+    require(route != nullptr && route->route_present &&
+                route->next_rel_seq.value == 0,
+            "cursor-divergence probe did not establish the initial route");
+
+    SessionState divergent = *route;
+    divergent.next_rel_seq.value += 1;  // one ahead of the endpoint cursor
+    const std::vector<uint8_t> payload = input_bytes(2048, 23);
+    const ZstdTuEnvelope crafted = envelope_for(divergent, TuSeq{1}, payload);
+    write_fragmented(socket, Message{crafted.begin});
+    // No further traffic: a server that wrongly accepts this TX_BEGIN sees
+    // EOF with an active transaction and fails through a DIFFERENT detail
+    // text, so the exact-text assertion below is the discriminator
+    // (std::invalid_argument IS-A std::logic_error, classes cannot separate
+    // the two rejection layers).
+    socket.shutdown(tcp::socket::shutdown_send);
+    const Message rejection = read_message(socket);
+    const auto* rejection_error = std::get_if<ErrorMessage>(&rejection);
+    require(rejection_error != nullptr &&
+                rejection_error->detail ==
+                    "TX_BEGIN does not match the endpoint route cursor",
+            "cursor-divergent TX_BEGIN was not rejected by the route cursor law");
+    socket.close();
+    running.require_failure<std::logic_error>();
+
+    const SessionState snapshot = server.route_snapshot();
+    require(snapshot.route_present && snapshot.history_nonce == nonce &&
+                snapshot.next_rel_seq.value == 0 &&
+                snapshot.state_digest == initial_route_digest(c_guid, nonce),
+            "cursor-divergent TX_BEGIN moved the endpoint route");
+}
+
+void test_unnegotiated_profile_begin_rejected() {
+    boost::asio::io_context server_context;
+    boost::asio::io_context client_context;
+    const CStoreGuid c_guid = Id128::from_u64(700);
+    const SessionLimits session_limits{4096, 1U << 20};
+    ZstdLoopbackConfig config;
+    config.f_store_guid = Id128::from_u64(701);
+    config.session_limits = session_limits;
+    config.zstd_limits = {1U << 20, 1U << 20};
+
+    ZstdLoopbackServer server(
+        server_context, config, c_guid,
+        [](const TxBegin&, const TxCommit&, std::vector<uint8_t>) {});
+    ServerThread running(server);
+
+    tcp::socket socket(client_context);
+    socket.connect(tcp::endpoint(boost::asio::ip::address_v4::loopback(),
+                                 server.port()));
+    write_fragmented(socket, Message{hello(c_guid, session_limits)});
+    require(std::holds_alternative<SessionState>(read_message(socket)),
+            "mask probe did not receive the cold SESSION_STATE");
+    const HistoryNonce nonce{88};
+    write_fragmented(
+        socket,
+        Message{HistoryReset{nonce, initial_route_digest(c_guid, nonce)}});
+    const Message established = read_message(socket);
+    const auto* route = std::get_if<SessionState>(&established);
+    require(route != nullptr && route->route_present,
+            "mask probe did not establish the initial route");
+
+    const std::vector<uint8_t> payload = input_bytes(2048, 29);
+    const ZstdTuEnvelope good = envelope_for(*route, TuSeq{1}, payload);
+    TxBegin bad = good.begin;
+    // Intrinsically valid (GRZ carries NotApplicable) but outside the
+    // ZSTD_TU-only negotiated mask, with a correct route cursor: only the
+    // negotiated-mask clause can reject it.
+    bad.profile = ProfileId::GRZ;
+    write_fragmented(socket, Message{bad});
+    socket.shutdown(tcp::socket::shutdown_send);
+    const Message rejection = read_message(socket);
+    const auto* rejection_error = std::get_if<ErrorMessage>(&rejection);
+    // Exact text: the endpoint's own negotiated-mask clause must reject this,
+    // not the dialogue layer behind it ("TX_BEGIN selected an unnegotiated
+    // profile") and not the disconnect backstop.
+    require(rejection_error != nullptr &&
+                rejection_error->detail == "TX_BEGIN profile was not negotiated",
+            "unnegotiated-profile TX_BEGIN was not rejected by the endpoint mask law");
+    socket.close();
+    running.require_failure<std::invalid_argument>();
+
+    const SessionState snapshot = server.route_snapshot();
+    require(snapshot.route_present && snapshot.history_nonce == nonce &&
+                snapshot.next_rel_seq.value == 0,
+            "unnegotiated-profile TX_BEGIN moved the endpoint route");
+}
+
+void test_client_rejects_unnegotiated_envelope() {
+    boost::asio::io_context server_context;
+    boost::asio::io_context client_context;
+    const CStoreGuid c_guid = Id128::from_u64(800);
+    const SessionLimits session_limits{4096, 1U << 20};
+    ZstdLoopbackConfig config;
+    config.f_store_guid = Id128::from_u64(801);
+    config.session_limits = session_limits;
+    config.zstd_limits = {1U << 20, 1U << 20};
+
+    std::vector<std::vector<uint8_t>> published;
+    ZstdLoopbackServer server(
+        server_context, config, c_guid,
+        [&](const TxBegin&, const TxCommit&, std::vector<uint8_t> exact) {
+            published.push_back(std::move(exact));
+        });
+    ServerThread running(server);
+
+    ZstdLoopbackClient client(
+        client_context,
+        tcp::endpoint(boost::asio::ip::address_v4::loopback(), server.port()),
+        hello(c_guid, session_limits), 64);
+    client.establish_initial_route(HistoryNonce{99});
+
+    const std::vector<uint8_t> payload = input_bytes(4096, 41);
+    ZstdTuEnvelope crafted = envelope_for(client.state(), TuSeq{1}, payload);
+    crafted.begin.profile = ProfileId::GRZ;
+    bool locally_rejected = false;
+    try {
+        (void)client.transfer(crafted, 33);
+    } catch (const std::logic_error& error) {
+        locally_rejected =
+            std::string_view(error.what()) ==
+            "client envelope does not match SESSION_STATE cursor";
+    }
+    require(locally_rejected,
+            "client did not reject the unnegotiated envelope through its own "
+            "session-cursor law");
+
+    const ZstdTuEnvelope good = envelope_for(client.state(), TuSeq{1}, payload);
+    const TxCommit commit = client.transfer(good, 33);
+    require(commit.rel_seq.value == 0 && client.state().next_rel_seq.value == 1,
+            "client cursor was disturbed by the rejected local envelope");
+    client.close();
+    running.require_success();
+    require(published.size() == 1 && published[0] == payload,
+            "server observed anything besides the single good transfer");
+}
+
 int main() {
     test_candidate_staging_and_stale_close_fence();
     test_persistent_cold_then_warm_transfer();
     test_invalid_candidate_does_not_install();
     test_mid_body_disconnect_replays_whole_transaction();
     test_publish_failure_does_not_advance_route();
+    test_warm_route_rejects_cursor_divergent_begin();
+    test_unnegotiated_profile_begin_rejected();
+    test_client_rejects_unnegotiated_envelope();
     std::cout << "p50_loopback_test: all staged loopback endpoint gates passed\n";
     return 0;
 }
