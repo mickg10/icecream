@@ -2536,6 +2536,111 @@ void test_handshake_binding_and_namespace_rules() {
     }
 }
 
+
+// Port of the transplant lane's unique mask-law assertions onto the accepted
+// production endpoint (bigoracle S1 transplant ruling, bounded convergence):
+// a TX_BEGIN whose profile is intrinsically valid on the wire (GRZ carries
+// its canonical NotApplicable root mode) but outside the session's negotiated
+// mask must be rejected by the endpoint's own negotiated-mask law -- bound by
+// EXACT detail text, because the ZSTD_TU shape validator behind it rejects
+// the same frame with a different text ("transaction is not a ZSTD_TU
+// profile"), and std::invalid_argument IS-A std::logic_error so exception
+// classes cannot separate the layers. The rejection must not move the route:
+// a second connection then completes a transaction at the untouched cursor.
+asio::awaitable<void> raw_unnegotiated_begin_rejected(tcp::endpoint remote,
+                                                      CStoreGuid c_guid,
+                                                      std::span<const uint8_t> input) {
+    const auto executor = co_await asio::this_coro::executor;
+    tcp::socket socket(executor);
+    RawRoute open = co_await raw_open(socket, remote, c_guid);
+    if ((open.state.negotiated_profiles & profile_bit(ProfileId::GRZ)) != 0)
+        throw std::logic_error("fixture requires GRZ outside the negotiated mask");
+    SessionState route = co_await raw_reset(socket, open, HistoryNonce{771});
+    const ZstdTuEnvelope prepared = encode_zstd_tu(
+        HistoryNonce{1}, RelSeq{0}, TuSeq{41}, Digest128{}, input);
+    TxBegin begin = make_begin(prepared, route.history_nonce, route.state_digest,
+                               route.next_rel_seq);
+    begin.profile = ProfileId::GRZ;
+    co_await raw_write(socket, begin);
+    // No further traffic: a server that wrongly admits this begin sees EOF
+    // with an open transaction and fails through a DIFFERENT detail text, so
+    // the exact-text assertion below stays the discriminator without a hang.
+    boost::system::error_code shutdown_error;
+    socket.shutdown(tcp::socket::shutdown_send, shutdown_error);
+    const Frame terminal = co_await raw_read(socket, route.limits.max_frame_payload);
+    if (terminal.type != MessageType::ERROR)
+        throw std::logic_error("unnegotiated TX_BEGIN did not receive terminal ERROR");
+    const ErrorMessage rejection = raw_decode<ErrorMessage>(terminal);
+    if (rejection.detail != "TX_BEGIN profile was not negotiated")
+        throw std::logic_error(
+            "unnegotiated TX_BEGIN was not rejected by the endpoint mask law: " +
+            rejection.detail);
+    boost::system::error_code ignored;
+    socket.close(ignored);
+    co_return;
+}
+
+asio::awaitable<void> raw_complete_at_preserved_cursor(tcp::endpoint remote,
+                                                       CStoreGuid c_guid,
+                                                       std::span<const uint8_t> input) {
+    const auto executor = co_await asio::this_coro::executor;
+    tcp::socket socket(executor);
+    RawRoute open = co_await raw_open(socket, remote, c_guid);
+    if (!open.state.route_present || open.state.history_nonce != HistoryNonce{771} ||
+        open.state.next_rel_seq != RelSeq{0})
+        throw std::logic_error("rejected unnegotiated TX_BEGIN moved the endpoint route");
+    const ZstdTuEnvelope prepared = encode_zstd_tu(
+        HistoryNonce{1}, RelSeq{0}, TuSeq{42}, Digest128{}, input);
+    const TxBegin begin = make_begin(prepared, open.state.history_nonce,
+                                     open.state.state_digest, open.state.next_rel_seq);
+    co_await raw_write(socket, begin);
+    Message body_message = BodyMessage{prepared.body};
+    co_await raw_write(socket, std::move(body_message));
+    const TxCommit commit = raw_decode<TxCommit>(
+        co_await raw_read(socket, open.state.limits.max_frame_payload));
+    if (commit.transaction_digest != begin.transaction_digest ||
+        commit.raw_digest != begin.raw_digest)
+        throw std::logic_error("preserved-cursor completion received a different TX_COMMIT");
+    boost::system::error_code ignored;
+    socket.close(ignored);
+    co_return;
+}
+
+void test_unnegotiated_begin_rejected_and_route_preserved() {
+    P50ServerEndpoint server(Id128::from_u64(770));
+    const CStoreGuid c_guid = Id128::from_u64(771);
+    const std::vector<uint8_t> input = bytes("route survives unnegotiated TX_BEGIN\n");
+    {
+        asio::io_context context;
+        tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+        std::future<ServerRunResult> serving =
+            asio::co_spawn(context, server.accept_one(acceptor), asio::use_future);
+        std::future<void> peer = asio::co_spawn(
+            context,
+            raw_unnegotiated_begin_rejected(acceptor.local_endpoint(), c_guid, input),
+            asio::use_future);
+        context.run();
+        peer.get();
+        require(serving.get().status == ServerRunStatus::TerminalError,
+                "unnegotiated TX_BEGIN left the server run non-terminal");
+    }
+    {
+        asio::io_context context;
+        tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+        std::future<ServerRunResult> serving =
+            asio::co_spawn(context, server.accept_one(acceptor), asio::use_future);
+        std::future<void> peer = asio::co_spawn(
+            context,
+            raw_complete_at_preserved_cursor(acceptor.local_endpoint(), c_guid, input),
+            asio::use_future);
+        context.run();
+        peer.get();
+        require(serving.get().status == ServerRunStatus::Completed &&
+                    copy_input(server, c_guid) == input,
+                "post-rejection completion at the preserved cursor failed");
+    }
+}
+
 void test_reserved_zero_endpoint_values() {
     {
         P50ServerEndpoint server(Id128::from_u64(628));
@@ -3544,6 +3649,7 @@ int main(int argc, char** argv) {
     test_same_f_route_reset();
     test_reset_ack_equality_and_terminal_result();
     test_handshake_binding_and_namespace_rules();
+    test_unnegotiated_begin_rejected_and_route_preserved();
     test_reserved_zero_endpoint_values();
     test_interrupted_begin_identity();
     test_terminal_body_failure_identity();
