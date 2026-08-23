@@ -258,6 +258,195 @@ static void test_p50_round_trip_and_validation()
             "decoder rejects unknown profile advertisement");
 }
 
+static UseCSMsg fixture_usecs()
+{
+    UseCSMsg use("x86_64", "cache-worker", UINT32_C(0x00002805),
+                 UINT32_C(0x0000beef), true, UINT32_C(7), UINT32_C(0),
+                 UINT64_C(0x1020304050607080), UINT64_C(0x8877665544332211),
+                 UINT32_C(0x0000cafe), CACHE_WIRE_PROTOCOL_V1,
+                 CACHE_PROFILE_ZSTD_TU);
+    return use;
+}
+
+static Bytes encode_usecs_frame(int protocol, const UseCSMsg& use)
+{
+    Pair pair = make_pair(protocol);
+    if (!pair.left->send_msg(use)) return {};
+    uint32_t network_length = 0;
+    if (recv(pair.right->fd, &network_length, sizeof(network_length), MSG_WAITALL)
+            != static_cast<ssize_t>(sizeof(network_length))) {
+        return {};
+    }
+    const uint32_t length = ntohl(network_length);
+    Bytes bytes(sizeof(network_length) + length);
+    std::memcpy(bytes.data(), &network_length, sizeof(network_length));
+    if (recv(pair.right->fd, bytes.data() + sizeof(network_length), length,
+             MSG_WAITALL) != static_cast<ssize_t>(length)) {
+        return {};
+    }
+    return bytes;
+}
+
+static void test_usecs_legacy_bytes()
+{
+    const UseCSMsg use = fixture_usecs();
+    const Bytes p49 = encode_usecs_frame(49, use);
+    const Bytes p50 = encode_usecs_frame(50, use);
+    REQUIRE(!p49.empty() && !p50.empty(), "UseCS encodes at both P49 and P50");
+    /* PROTOCOL_VERSION_ASSIGNMENT_IDENTITY and PROTOCOL_VERSION_CACHE_ADVERTISEMENT
+       are the same value (50): P50 UseCS carries both the four-word assignment
+       identity (pre-existing) and this three-word S2 cache-handoff tail, so it
+       is seven words larger than P49 -- not three -- with an unchanged prefix. */
+    REQUIRE(p50.size() == p49.size() + 7 * sizeof(uint32_t)
+                && std::equal(p49.begin() + sizeof(uint32_t), p49.end(),
+                              p50.begin() + sizeof(uint32_t)),
+            "P50 UseCS appends exactly seven words to the unchanged P49 body");
+
+    Pair old_pair = make_pair(49);
+    REQUIRE(old_pair.left->send_msg(use),
+            "populated cache-handoff object emits on a P49 link");
+    Msg *wire = old_pair.right->get_msg(2, true);
+    UseCSMsg *decoded = dynamic_cast<UseCSMsg *>(wire);
+    REQUIRE(decoded && !decoded->hasCacheAdvertisement()
+                && decoded->cache_protocol == 0
+                && decoded->cache_profile_mask == 0,
+            "P49 decoder receives canonical cache-handoff absence");
+    delete wire;
+}
+
+static void test_usecs_p50_round_trip_and_validation()
+{
+    const UseCSMsg use = fixture_usecs();
+    Pair pair = make_pair(50);
+    REQUIRE(pair.left->send_msg(use),
+            "P50 UseCS carries a valid assignment-bound cache endpoint");
+    Msg *wire = pair.right->get_msg(2, true);
+    UseCSMsg *decoded = dynamic_cast<UseCSMsg *>(wire);
+    REQUIRE(decoded && decoded->cache_endpoint_port == UINT32_C(0x0000cafe)
+                && decoded->cache_protocol == CACHE_WIRE_PROTOCOL_V1
+                && decoded->cache_profile_mask == CACHE_PROFILE_ZSTD_TU
+                && decoded->hostname == "cache-worker"
+                && decoded->assignmentEpoch() == UINT64_C(0x1020304050607080)
+                && decoded->assignmentNonce() == UINT64_C(0x8877665544332211),
+            "P50 UseCS round-trips the exact cache endpoint bound to its "
+            "assignment identity");
+    delete wire;
+
+    UseCSMsg absent = fixture_usecs();
+    absent.cache_endpoint_port = 0;
+    absent.cache_protocol = 0;
+    absent.cache_profile_mask = 0;
+    Pair absent_pair = make_pair(50);
+    REQUIRE(absent_pair.left->send_msg(absent),
+            "P50 UseCS accepts canonical all-zero cache-handoff absence");
+    wire = absent_pair.right->get_msg(2, true);
+    decoded = dynamic_cast<UseCSMsg *>(wire);
+    REQUIRE(decoded && !decoded->hasCacheAdvertisement()
+                && decoded->cache_protocol == 0
+                && decoded->cache_profile_mask == 0,
+            "P50 absent cache handoff remains wholly zero");
+    delete wire;
+
+    const struct Invalid {
+        uint32_t port;
+        uint32_t protocol;
+        uint32_t profiles;
+        const char *name;
+    } invalid[] = {
+        {0, CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_ZSTD_TU,
+         "zero port with positive capability"},
+        {70000, CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_ZSTD_TU,
+         "port outside TCP range"},
+        {10245, 0, CACHE_PROFILE_ZSTD_TU, "missing cache protocol"},
+        {10245, UINT32_C(49), CACHE_PROFILE_ZSTD_TU,
+         "stale pre-CacheWire protocol number"},
+        {10245, CACHE_WIRE_PROTOCOL_V1, 0, "missing cache profile"},
+        {10245, CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_P29,
+         "non-runnable P29 endpoint"},
+        {10245, CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_Z3_LONG,
+         "declared-only z3_long endpoint"},
+        {10245, CACHE_WIRE_PROTOCOL_V1, UINT32_C(0x80000000),
+         "unknown profile bit"},
+    };
+    for (const Invalid& value : invalid) {
+        UseCSMsg malformed = fixture_usecs();
+        malformed.cache_endpoint_port = value.port;
+        malformed.cache_protocol = value.protocol;
+        malformed.cache_profile_mask = value.profiles;
+        Pair send_pair = make_pair(50);
+        char label[160];
+        std::snprintf(label, sizeof(label),
+                      "encoder rejects %s (UseCS cache-handoff tail)", value.name);
+        REQUIRE(!send_pair.left->send_msg(malformed), label);
+    }
+
+    const Bytes valid = encode_usecs_frame(50, use);
+    REQUIRE(decoder_rejects(remove_tail_words(valid, 3)),
+            "P50 UseCS decoder rejects a wholly omitted cache-handoff tail");
+    REQUIRE(decoder_rejects(remove_tail_words(valid, 2)),
+            "P50 UseCS decoder rejects a one-word cache-handoff tail");
+    REQUIRE(decoder_rejects(remove_tail_words(valid, 1)),
+            "P50 UseCS decoder rejects a two-word cache-handoff tail");
+    Bytes malformed_wire = valid;
+    set_tail_word(malformed_wire, 3, 0);
+    REQUIRE(decoder_rejects(malformed_wire),
+            "decoder rejects zero cache port with positive capability");
+    malformed_wire = valid;
+    set_tail_word(malformed_wire, 2, 0);
+    REQUIRE(decoder_rejects(malformed_wire),
+            "decoder rejects partial cache-protocol absence");
+    malformed_wire = valid;
+    set_tail_word(malformed_wire, 1, CACHE_PROFILE_Z3_LONG);
+    REQUIRE(decoder_rejects(malformed_wire),
+            "decoder rejects declared-only cache-profile advertisement");
+    malformed_wire = valid;
+    set_tail_word(malformed_wire, 1, UINT32_C(0x80000000));
+    REQUIRE(decoder_rejects(malformed_wire),
+            "decoder rejects unknown cache-profile advertisement");
+}
+
+static void test_cache_advertisement_predicate_matches_projection_law()
+{
+    /* scheduler/scheduler.cpp's project_cache_handoff and UseCSMsg's own
+       wire validator both resolve a retained/received snapshot through
+       exactly this pair of predicates.  A live CompileServer can never
+       actually observe an inconsistent ("mixed") combination through the
+       wire -- LoginMsg::valid_payload and UseCSMsg::valid_payload above
+       both already enforce the identical law on receipt, on every path,
+       for every sender -- so this exercises the defensive branch directly:
+       every combination the wire refuses to carry also PROJECTS as wholly
+       absent rather than partially or incorrectly advertised, should it
+       ever be reached by any future, non-wire caller. */
+    const struct Mixed {
+        uint32_t port;
+        uint32_t protocol;
+        uint32_t profiles;
+        const char *name;
+    } mixed[] = {
+        {0, CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_ZSTD_TU,
+         "zero port, live protocol+mask"},
+        {10245, 0, CACHE_PROFILE_ZSTD_TU, "live port+mask, zero protocol"},
+        {10245, CACHE_WIRE_PROTOCOL_V1, 0, "live port+protocol, zero mask"},
+        {10245, 49, CACHE_PROFILE_ZSTD_TU,
+         "live port+mask, stale pre-CacheWire protocol"},
+        {10245, CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_P29,
+         "live port+protocol, non-runnable profile"},
+        {70000, CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_ZSTD_TU,
+         "out-of-range port, live protocol+mask"},
+    };
+    for (const Mixed& value : mixed) {
+        const bool present = cache_advertisement_is_valid_present(
+            value.port, value.protocol, value.profiles);
+        const bool absent = cache_advertisement_is_wholly_absent(
+            value.port, value.protocol, value.profiles);
+        char label[176];
+        std::snprintf(label, sizeof(label),
+                      "mixed retained snapshot (%s) is neither valid-present "
+                      "nor wholly-absent -- projects absent", value.name);
+        REQUIRE(!present && !absent, label);
+    }
+}
+
 static void test_declared_profiles_are_inert()
 {
     static_assert(static_cast<uint16_t>(ProfileId::P29) == 1);
@@ -312,6 +501,9 @@ int main()
 {
     test_legacy_bytes();
     test_p50_round_trip_and_validation();
+    test_usecs_legacy_bytes();
+    test_usecs_p50_round_trip_and_validation();
+    test_cache_advertisement_predicate_matches_projection_law();
     test_declared_profiles_are_inert();
     std::fprintf(stderr, "%s: %d failure(s)\n",
                  failures ? "FAIL" : "PASS", failures);

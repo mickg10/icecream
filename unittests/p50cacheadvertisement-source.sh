@@ -30,12 +30,14 @@ require_absent() {
     echo "ok - $label"
 }
 
-require_count 2 'IS_PROTOCOL_VERSION(PROTOCOL_VERSION_CACHE_ADVERTISEMENT, c)' \
-    services/comm.cpp 'Login codec gates both read and write at main protocol 50'
+require_count 4 'IS_PROTOCOL_VERSION(PROTOCOL_VERSION_CACHE_ADVERTISEMENT, c)' \
+    services/comm.cpp \
+    'Login and UseCS codecs (S2 handoff) each gate both read and write at protocol 50'
 require_count 1 'current_message_end = intogo_old + inmsglen' \
     services/comm.cpp 'decoder records the current frame boundary'
-require_count 1 'current_message_bytes_remaining() < 3 * sizeof(uint32_t)' \
-    services/comm.cpp 'P50 Login refuses a shortened three-word tail'
+require_count 2 'current_message_bytes_remaining() < 3 * sizeof(uint32_t)' \
+    services/comm.cpp \
+    'Login and UseCS (S2 handoff) each refuse a shortened three-word tail'
 require_count 1 'const bool absent = cache_endpoint_port == 0' \
     services/comm.cpp 'Login payload has a canonical whole-absence branch'
 require_count 1 '&& (cache_profile_mask & ~CACHE_ADVERTISABLE_PROFILE_MASK) == 0' \
@@ -56,14 +58,40 @@ require_count 1 'Z3_SHARED_LONG = 5' cache/protocol50.h \
     'z3_shared_long has one stable protocol profile ID'
 
 # The server-selection half of scheduler.cpp ends at handle_login.  New cache
-# metadata must not become eligibility, scoring, or assignment input.
-selection_slice=$(sed -n '1,2829p' "$src/scheduler/scheduler.cpp")
+# metadata must not become eligibility, scoring, or assignment input.  S2's
+# post-selection UseCS cache-handoff fill (project_cache_handoff) is defined
+# right after handle_login, so this boundary also proves that fill is
+# textually outside the selection/scoring code: send_remote_dispatch_reply
+# (inside the slice) only ever CALLS project_cache_handoff by name -- the
+# getters themselves are read nowhere before the cutoff.
+selection_slice=$(sed -n '1,2841p' "$src/scheduler/scheduler.cpp")
 if printf '%s\n' "$selection_slice" \
         | grep -E 'cacheEndpointPort|cacheProtocol\(|cacheProfileMask' >/dev/null; then
     echo 'FAIL: cache advertisement leaked into scheduler selection' >&2
     exit 1
 fi
 echo 'ok - cache advertisement is absent from scheduler selection'
+
+# S2: the UseCS tail encode/decode are gated at PROTOCOL_VERSION_CACHE_ADVERTISEMENT,
+# exactly like LoginMsg's, but scoped to UseCSMsg's own methods so this cannot
+# be satisfied by LoginMsg's separate occurrences of the same gate literal.
+usecs_fill_slice=$(sed -n '/^void UseCSMsg::fill_from_channel/,/^}/p' "$src/services/comm.cpp")
+usecs_fill_gate_count=$(printf '%s\n' "$usecs_fill_slice" \
+    | grep -F -c 'IS_PROTOCOL_VERSION(PROTOCOL_VERSION_CACHE_ADVERTISEMENT, c)' || true)
+if [ "$usecs_fill_gate_count" -ne 1 ]; then
+    echo "FAIL: UseCS decode cache tail must be gated at PROTOCOL_VERSION_CACHE_ADVERTISEMENT exactly once (found $usecs_fill_gate_count)" >&2
+    exit 1
+fi
+echo 'ok - UseCS decode cache tail is gated at protocol 50'
+
+usecs_send_slice=$(sed -n '/^void UseCSMsg::send_to_channel/,/^}/p' "$src/services/comm.cpp")
+usecs_send_gate_count=$(printf '%s\n' "$usecs_send_slice" \
+    | grep -F -c 'IS_PROTOCOL_VERSION(PROTOCOL_VERSION_CACHE_ADVERTISEMENT, c)' || true)
+if [ "$usecs_send_gate_count" -ne 1 ]; then
+    echo "FAIL: UseCS encode cache tail must be gated at PROTOCOL_VERSION_CACHE_ADVERTISEMENT exactly once (found $usecs_send_gate_count)" >&2
+    exit 1
+fi
+echo 'ok - UseCS encode cache tail is gated at protocol 50'
 
 require_absent \
     'cache_endpoint_port|cacheProtocol\(|cacheProfileMask|CACHE_PROFILE_Z3_(LONG|SHARED_LONG)' \
