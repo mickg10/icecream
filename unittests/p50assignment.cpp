@@ -128,9 +128,9 @@ static Bytes encoded_compile(int protocol)
     return encode_frame(protocol, m);
 }
 
-static bool appended_four_words(const Bytes &oldf, const Bytes &newf)
+static bool appended_word_count(const Bytes &oldf, const Bytes &newf, size_t words)
 {
-    return newf.size() == oldf.size() + 16
+    return newf.size() == oldf.size() + 4 * words
         && std::equal(oldf.begin() + 4, oldf.end(), newf.begin() + 4);
 }
 
@@ -153,7 +153,12 @@ static void test_bytes()
             "P48 UseCS matches its retained byte fixture");
     REQUIRE(!u49.empty() && fnv1a(u49) == UINT64_C(0xe556229af116ee8d),
             "P49 UseCS matches its retained byte fixture");
-    REQUIRE(appended_four_words(u49, u50), "P50 UseCS appends only four identity words");
+    /* PROTOCOL_VERSION_ASSIGNMENT_IDENTITY and PROTOCOL_VERSION_CACHE_ADVERTISEMENT
+       are both 50: the four pre-existing identity words and the S2 three-word
+       cache-handoff tail (see UseCSMsg::cache_endpoint_port et al.) land in the
+       same protocol bump, so P50 UseCS is seven words larger than P49, not four. */
+    REQUIRE(appended_word_count(u49, u50, 7),
+            "P50 UseCS appends its four identity words plus the S2 three-word cache-handoff tail");
     const Bytes f43 = encoded_compile(43), f48 = encoded_compile(48), f49 = encoded_compile(49), f50 = encoded_compile(50);
     REQUIRE(!f43.empty() && fnv1a(f43) == UINT64_C(0x1d040038613f174d),
             "P43 CompileFile matches its retained byte fixture");
@@ -161,7 +166,7 @@ static void test_bytes()
             "P48 CompileFile matches its retained byte fixture");
     REQUIRE(!f49.empty() && fnv1a(f49) == UINT64_C(0x1d040038613f174d),
             "P49 CompileFile matches its retained byte fixture");
-    REQUIRE(appended_four_words(f49, f50), "P50 CompileFile appends only four identity words");
+    REQUIRE(appended_word_count(f49, f50, 4), "P50 CompileFile appends only four identity words");
 }
 
 static void test_invalid()
@@ -186,8 +191,15 @@ static void test_invalid()
         return rejected;
     };
 
+    /* The wire tail is now seven words: epoch_hi, epoch_lo, nonce_hi, nonce_lo,
+       cache_port, cache_protocol, cache_profile_mask (S2).  encoded_usecs(50)
+       leaves the three cache words at their default zero/absent, so the nonce
+       pair to zero for a partial identity is words 5-4 from the end, i.e.
+       bytes [end-20, end-12) -- not the last 8 bytes any more. */
     Bytes use_partial = encoded_usecs(50);
-    if (use_partial.size() >= 8) std::fill(use_partial.end() - 8, use_partial.end(), 0);
+    if (use_partial.size() >= 20) {
+        std::fill(use_partial.end() - 20, use_partial.end() - 12, 0);
+    }
     REQUIRE(rejected_by_decoder(use_partial),
             "production decoder rejects partial UseCS identity");
     Bytes use_zero_wire = encoded_usecs(50);
