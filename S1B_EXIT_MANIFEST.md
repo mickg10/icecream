@@ -391,15 +391,24 @@ for the release itself.
 
 ### 5c. p50 binary-set root linkage (note only -- S4 branch untouched)
 
-The three `installed_icecc_sha256` / `installed_usr_local_sbin_iceccd_sha256`
-/ `installed_usr_local_sbin_icecc-scheduler_sha256` /
-`installed_usr_local_lib_libicecc_a_sha256` values in 5a are what any future
-S4 binary-set root claiming to be "1.5.90" must match for the corresponding
-distro, once such a root is built for this release -- these are the first
-real, hash-bound, installed (not build-tree) artifacts to exist for
-1.5.90. No S4 file was read or modified to write this note; it is a
-forward-pointing record only, for whoever next wires a 1.5.90 binary-set
-root to reconcile against.
+**Clarified per BigOracle**: only ONE of the three distro rows is the
+designated build provenance for the future S4 P50 binary-set root -- the
+pinned Ubuntu 22.04 row (`icecream/farm-node:ubuntu22-gcc11-boost174`),
+unless the owner chooses a different one. Ubuntu 24.04 and Fedora 40 are
+INSTALLED-IDENTITY COMPATIBILITY rows only: they prove the same source
+builds and installs correctly, with the same exact version identity, on
+those toolchains too -- they are not each independently expected to also
+become S4 roots, and there is no requirement that one S4 root's binaries
+equal all three distros' installed binaries (they are genuinely different
+compiles, different toolchains, different hashes, by construction -- see
+5a). The `installed_icecc_sha256` / `installed_iceccd_sha256` /
+`installed_scheduler_sha256` / `installed_libicecc_a_sha256` values for
+the **pinned Ubuntu 22.04 row specifically** in 5a are what a future S4
+binary-set root claiming to be "1.5.90" must match, once such a root is
+built for this release -- these are the first real, hash-bound, installed
+(not build-tree) artifacts to exist for 1.5.90. No S4 file was read or
+modified to write this note; it is a forward-pointing record only, for
+whoever next wires a 1.5.90 binary-set root to reconcile against.
 
 ## Summary
 
