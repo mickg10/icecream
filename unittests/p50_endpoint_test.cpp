@@ -3216,6 +3216,205 @@ void test_commit_identity_negative_matrix() {
     }
 }
 
+
+// ===== same_commit negative coverage: lost-final reconnect path =====
+// Ruling part 2: after a lost final commit, a fake F presenting a well-formed
+// SessionState.last_commit differing from the active TxBegin in any identity field must be
+// refused (no LostFinalAcknowledgement), must leave the active transaction in place, and an
+// exact subsequent reconciliation must commit.  The presented peer state is kept
+// self-consistent (state_digest == last_commit.post_state_digest, next_rel_seq == begin+1,
+// route nonce echoed) so only the same_commit comparison against the live begin can object.
+
+asio::awaitable<void> raw_f_receive_then_drop(tcp::acceptor& acceptor, FStoreGuid f_guid,
+                                              TxBegin& out_begin) {
+    tcp::socket socket = co_await acceptor.async_accept(asio::use_awaitable);
+    const SessionHello hello =
+        raw_decode<SessionHello>(co_await raw_read(socket, kInitialMaxFramePayload));
+    const SessionSelection selection =
+        negotiate_session(hello, kProtocolVersion, kProtocolVersion, kKnownProfileMask);
+    const uint32_t cap = selection.limits.max_frame_payload;
+    SessionState fresh;
+    fresh.selected_protocol = selection.protocol;
+    fresh.negotiated_profiles = selection.negotiated_profiles;
+    fresh.limits = selection.limits;
+    fresh.f_store_guid = f_guid;
+    co_await raw_write(socket, Message{fresh});
+    Frame next = co_await raw_read(socket, cap);
+    if (next.type == MessageType::HISTORY_RESET) {
+        const HistoryReset reset = raw_decode<HistoryReset>(next);
+        SessionState ack = fresh;
+        ack.namespace_present = true;
+        ack.route_present = true;
+        ack.history_nonce = reset.history_nonce;
+        ack.next_rel_seq = RelSeq{0};
+        ack.state_digest = reset.initial_state_digest;
+        co_await raw_write(socket, Message{ack});
+        next = co_await raw_read(socket, cap);
+    }
+    out_begin = raw_decode<TxBegin>(next);
+    uint64_t body_bytes = 0;
+    while (body_bytes < out_begin.body.encoded_bytes) {
+        const BodyMessage body = raw_decode<BodyMessage>(co_await raw_read(socket, cap));
+        if (body.bytes.empty())
+            break;
+        body_bytes += body.bytes.size();
+    }
+    // Lost final: the F "commits" but the acknowledgement never reaches C.
+    boost::system::error_code ignored;
+    socket.shutdown(tcp::socket::shutdown_both, ignored);
+    socket.close(ignored);
+    co_return;
+}
+
+asio::awaitable<void> raw_f_present_last_commit(tcp::acceptor& acceptor, FStoreGuid f_guid,
+                                                TxBegin begin, CommitMismatchField field) {
+    tcp::socket socket = co_await acceptor.async_accept(asio::use_awaitable);
+    const SessionHello hello =
+        raw_decode<SessionHello>(co_await raw_read(socket, kInitialMaxFramePayload));
+    const SessionSelection selection =
+        negotiate_session(hello, kProtocolVersion, kProtocolVersion, kKnownProfileMask);
+    SessionState peer;
+    peer.selected_protocol = selection.protocol;
+    peer.negotiated_profiles = selection.negotiated_profiles;
+    peer.limits = selection.limits;
+    peer.f_store_guid = f_guid;
+    peer.namespace_present = true;
+    peer.route_present = true;
+    TxCommit last = correct_commit_for(begin);
+    mutate_commit(last, field);
+    // Wire rule: a retained commit must be internally consistent with its route
+    // (nonce equal, next_rel = commit.rel + 1, state digest = commit post-state), so the
+    // presented state derives from the (possibly mutated) commit.  Nonce/REL_SEQ mismatches
+    // are then refused by the client's route checks; TU_SEQ and the digests are decided by
+    // same_commit alone.
+    peer.history_nonce = last.history_nonce;
+    peer.next_rel_seq = RelSeq{last.rel_seq.value + 1};
+    peer.state_digest = last.post_state_digest;
+    peer.last_commit = last;
+    co_await raw_write(socket, Message{peer});
+    // Acceptance closes silently; refusal first sends a terminal ERROR frame.  Consume
+    // whatever arrives until the peer closes.
+    try {
+        for (;;)
+            (void)co_await raw_read(socket, peer.limits.max_frame_payload);
+    } catch (const boost::system::system_error&) {
+        // peer closed
+    }
+    co_return;
+}
+
+void test_lost_final_commit_identity_negative_matrix() {
+    const std::array cases{
+        std::pair{CommitMismatchField::HistoryNonce, "history nonce"},
+        std::pair{CommitMismatchField::RelSeq, "REL_SEQ"},
+        std::pair{CommitMismatchField::TuSeq, "TU_SEQ"},
+        std::pair{CommitMismatchField::TransactionDigest, "transaction digest"},
+        std::pair{CommitMismatchField::RawDigest, "raw digest"},
+        std::pair{CommitMismatchField::PostStateDigest, "post-state digest"},
+    };
+    uint64_t identity = 7100;
+
+    // Control: the exact last_commit closes the lost-final window.
+    {
+        TestClient client(Id128::from_u64(identity++));
+        const FStoreGuid f_guid = Id128::from_u64(identity++);
+        const std::vector<uint8_t> input = pseudo_random_bytes(4096);
+        const PreparedTuHandle prepared = admit(client, input);
+        TxBegin begin;
+        {
+            asio::io_context context;
+            tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+            std::future<void> fake = asio::co_spawn(
+                context, raw_f_receive_then_drop(acceptor, f_guid, begin), asio::use_future);
+            std::future<ClientRunResult> run = asio::co_spawn(
+                context, client.endpoint.run(acceptor.local_endpoint(), prepared, {}),
+                asio::use_future);
+            context.run();
+            fake.get();
+            const ClientRunResult dropped = run.get();
+            require(dropped.status == ClientRunStatus::Disconnected &&
+                        client.has_active_transaction(),
+                    "lost-final setup did not leave an active transaction");
+        }
+        asio::io_context context;
+        tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+        std::future<void> fake = asio::co_spawn(
+            context,
+            raw_f_present_last_commit(acceptor, f_guid, begin, CommitMismatchField::None),
+            asio::use_future);
+        std::future<ClientRunResult> run = asio::co_spawn(
+            context, client.endpoint.run(acceptor.local_endpoint(), {}, {}), asio::use_future);
+        context.run();
+        fake.get();
+        const ClientRunResult accepted = run.get();
+        require(accepted.status == ClientRunStatus::Committed &&
+                    accepted.reconnect == EndpointReconnectOutcome::LostFinalAcknowledgement &&
+                    !client.has_active_transaction(),
+                "exact lost-final acknowledgement was not accepted");
+    }
+
+    for (const auto& [field, name] : cases) {
+        TestClient client(Id128::from_u64(identity++));
+        const FStoreGuid f_guid = Id128::from_u64(identity++);
+        const std::vector<uint8_t> input = pseudo_random_bytes(4096);
+        const PreparedTuHandle prepared = admit(client, input);
+        TxBegin begin;
+        {
+            asio::io_context context;
+            tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+            std::future<void> fake = asio::co_spawn(
+                context, raw_f_receive_then_drop(acceptor, f_guid, begin), asio::use_future);
+            std::future<ClientRunResult> run = asio::co_spawn(
+                context, client.endpoint.run(acceptor.local_endpoint(), prepared, {}),
+                asio::use_future);
+            context.run();
+            fake.get();
+            require(run.get().status == ClientRunStatus::Disconnected &&
+                        client.has_active_transaction(),
+                    std::string(name) + " lost-final setup did not retain the transaction");
+        }
+        {
+            asio::io_context context;
+            tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+            std::future<void> fake = asio::co_spawn(
+                context, raw_f_present_last_commit(acceptor, f_guid, begin, field),
+                asio::use_future);
+            std::future<ClientRunResult> run = asio::co_spawn(
+                context, client.endpoint.run(acceptor.local_endpoint(), {}, {}),
+                asio::use_future);
+            context.run();
+            fake.get();
+            const ClientRunResult refused = run.get();
+            // RouteHistoryReset is the SITE's refusal shape (:1508); a bypassed site would
+            // fall through to accept()'s internal check, which throws with the default
+            // reconnect outcome instead -- so this assertion proves the call site itself.
+            require(refused.status == ClientRunStatus::TerminalError &&
+                        refused.reconnect == EndpointReconnectOutcome::RouteHistoryReset &&
+                        client.has_active_transaction(),
+                    std::string(name) + " mismatched last_commit was not refused at the site");
+        }
+        {
+            asio::io_context context;
+            tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+            std::future<void> fake = asio::co_spawn(
+                context,
+                raw_f_present_last_commit(acceptor, f_guid, begin, CommitMismatchField::None),
+                asio::use_future);
+            std::future<ClientRunResult> run = asio::co_spawn(
+                context, client.endpoint.run(acceptor.local_endpoint(), {}, {}),
+                asio::use_future);
+            context.run();
+            fake.get();
+            const ClientRunResult reconciled = run.get();
+            require(reconciled.status == ClientRunStatus::Committed &&
+                        reconciled.reconnect ==
+                            EndpointReconnectOutcome::LostFinalAcknowledgement &&
+                        !client.has_active_transaction(),
+                    std::string(name) + " refusal blocked the exact reconciliation");
+        }
+    }
+}
+
 int main(int argc, char** argv) {
     const bool performance_gate = argc == 2 && std::string_view(argv[1]) == "--performance";
     if (argc > 2 || (argc == 2 && !performance_gate))
@@ -3224,6 +3423,7 @@ int main(int argc, char** argv) {
     test_completion_stamp_correspondence();
     test_completion_live_identity_correspondence();
     test_commit_identity_negative_matrix();
+    test_lost_final_commit_identity_negative_matrix();
     test_idempotent_prepare_admission();
     test_candidate_stage_has_no_revision_residue();
     test_input_record_owner_and_aggregate_limits();
