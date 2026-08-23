@@ -1,0 +1,69 @@
+{
+  "set": "p43",
+  "authority": "official-release-1.4",
+  "authority_note": "tag 1.4 is a tagged upstream release; this manifest is final for the P43 side of the compatibility matrix.",
+  "source": {
+    "sha": "cd74801e0fa4e83e3ae254ca1d7fe98642f36b89",
+    "ref": "tag 1.4",
+    "verification": "git fetch origin +refs/tags/1.4:refs/tags/p43-authority resolved to this exact SHA before build; not substituted",
+    "commit_subject": "Update version to 1.4 for release",
+    "commit_date": "2022-03-04"
+  },
+  "build": {
+    "container_image": "icecream/farm-node:ubuntu22-gcc11-boost174",
+    "image_digest": "sha256:bdb55d4287a473e3ebfbaa7715a50ee670659777278b8d84c350724e6fa8de58",
+    "image_digest_read": "live via `docker image inspect icecream/farm-node:ubuntu22-gcc11-boost174 --format {{index .RepoDigests 0}}` on q3, not hardcoded from any prior report",
+    "configure_line": "/work/source/configure",
+    "recipe": "./autogen.sh && cd /work/obj && /work/source/configure && make -j24, all inside the pinned container; dependencies resolved entirely from the container's system packages",
+    "tweaks_applied": "none -- autogen.sh emitted only AC_TRY_COMPILE/AC_PROG_LIBTOOL obsolescence warnings (expected for this AC_PREREQ([2.63]) configure.ac); make emitted only a benign docbook2x-missing warning for man-page generation; BUILD-EXIT=0 on the first attempt"
+  },
+  "tar": {
+    "path": "p43-root.tar",
+    "sha256": "6da186b6c4c10f2f15d9e5440156ed890112523f53e905f9dd0d2f314540a3ae"
+  },
+  "binaries": [
+    {
+      "path": "obj/scheduler/icecc-scheduler",
+      "role": "S",
+      "sha256": "c205c1347064503b3ab7c56af4584ffb0806f52e2c5786d343883db871c44525",
+      "mode": "755",
+      "version_probe": {
+        "command": "--version",
+        "note": "rejects --version as an unrecognized option but still emits its startup banner on that same invocation",
+        "expect_substring": "ICECREAM scheduler 1.4.0"
+      }
+    },
+    {
+      "path": "obj/daemon/iceccd",
+      "role": "F",
+      "sha256": "62bcc05ad91461212cd9616d960905c97c839b316aac3a9e1e1080608a193441",
+      "mode": "755",
+      "version_probe": {
+        "command": "strings",
+        "note": "no --version flag exists in this era; identity read from the embedded startup-banner string",
+        "expect_substring": "ICECREAM daemon 1.4.0"
+      }
+    },
+    {
+      "path": "obj/client/icecc",
+      "role": "C",
+      "sha256": "c3dc54eadca303f21eaa1f90c265a38a1038378be08f887b24bb3bbea7dabeae",
+      "mode": "755",
+      "version_probe": {
+        "command": "--version",
+        "expect_exact": "ICECC 1.4.0"
+      }
+    },
+    {
+      "path": "obj/client/icecc-create-env",
+      "role": "C",
+      "sha256": "aab94b6ea8f41335de807f814d24a56e827ce5efaf8b06797a365699e83b36cb",
+      "mode": "755",
+      "version_probe": {
+        "command": null,
+        "note": "shell script with no embedded version marker in either era; sha256 is the sole identity anchor"
+      }
+    }
+  ],
+  "runtime_dependencies": "ldd on every linked binary above resolves entirely to /lib/x86_64-linux-gnu/* system libraries; nothing from the build tree is dlopened, so these four files are the complete runtime root"
+}
