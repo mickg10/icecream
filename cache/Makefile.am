@@ -18,6 +18,7 @@ libp50endpoint_a_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
 
 EXTRA_DIST = \
 	PROFILE-REGISTRY.md \
+	registry-dist-gate.sh \
 	README.md \
 	P48_P50_CONVERGENCE.md \
 	KEY_LAYOUT_V1_CENSUS.md \
