@@ -11,6 +11,23 @@ SCHED_PORT = 22000
 TREE = "~/icecream-review/c9488d74"          # built P50 tree (same on every host)
 SCRATCH = "~/farm-scratch"                    # host SSD scratch (bind target)
 
+# S4 role-artifact selection: per-role hash-bound runtime roots (see
+# ~/role-artifacts/{p43,p50}-root/MANIFEST.tsv on a prepared host), each
+# laid out as obj/{scheduler,daemon,client}/... exactly like TREE, so it is
+# a drop-in /work bind-source. binary_set=None (the default everywhere)
+# preserves the exact prior hardcoded-TREE behavior for every role.
+ROLE_SET_DIR = {
+    "p43": "~/role-artifacts/p43-root",
+    "p50": "~/role-artifacts/p50-root",
+}
+
+def role_tree(binary_set):
+    if binary_set is None:
+        return TREE
+    if binary_set not in ROLE_SET_DIR:
+        raise ValueError(f"unknown binary set {binary_set!r} (choices: {sorted(ROLE_SET_DIR)})")
+    return ROLE_SET_DIR[binary_set]
+
 # per-host SSH argv + LAN IP + role capability
 HOSTS = {
     "q3":        {"ssh": ["ssh","-o","HostName=10.0.27.101","-o","HostKeyAlias=tt-quietbox3","-o","BatchMode=yes","mickg10@tt-quietbox3"], "ip": "10.0.27.101"},
@@ -29,15 +46,18 @@ def sh(host, cmd, timeout=120, check=False):
 def docker_rm(host, name):
     sh(host, f"docker rm -f {name} 2>/dev/null; true")
 
-def up(worker_hosts):
+def up(worker_hosts, binary_set_s=None, binary_set_f=None):
     sip = HOSTS[SCHED_HOST]["ip"]
-    print(f"UP: scheduler on {SCHED_HOST}({sip}):{SCHED_PORT}  workers={worker_hosts}")
+    s_tree = role_tree(binary_set_s)
+    f_tree = role_tree(binary_set_f)
+    print(f"UP: scheduler on {SCHED_HOST}({sip}):{SCHED_PORT}  workers={worker_hosts}  "
+          f"S-set={binary_set_s or 'default'}({s_tree})  F-set={binary_set_f or 'default'}({f_tree})")
     # scheduler (--network host so it binds the LAN IP). The daemon/scheduler drop privileges to
     # icecc at startup, so the -l log dir must be writable by that user => useradd icecc + 1777 dir.
     docker_rm(SCHED_HOST, "farm-sched")
     sh(SCHED_HOST, f"mkdir -p {SCRATCH}/farm && chmod 1777 {SCRATCH}/farm && rm -f {SCRATCH}/farm/sched.log", check=True)
     sh(SCHED_HOST,
-       f"docker run -d --name farm-sched --network host -v {TREE}:/work -v {SCRATCH}:/scratch -u 0:0 {IMG} "
+       f"docker run -d --name farm-sched --network host -v {s_tree}:/work -v {SCRATCH}:/scratch -u 0:0 {IMG} "
        f"bash -c 'useradd -r icecc 2>/dev/null; exec /work/obj/scheduler/icecc-scheduler -p {SCHED_PORT} -n {NET} -l /scratch/farm/sched.log -vvv'",
        check=True)
     time.sleep(3)
@@ -48,7 +68,7 @@ def up(worker_hosts):
         # chmod only the mickg-owned dir (not -R: stale daemon files are uid-999, unchmod-able by host user; rm clears them)
         sh(h, f"mkdir -p {SCRATCH}/farm/envs && chmod 1777 {SCRATCH}/farm && rm -f {SCRATCH}/farm/worker.log", check=True)
         sh(h,
-           f"docker run -d --name farm-worker --network host -v {TREE}:/work -v {SCRATCH}:/scratch -u 0:0 {IMG} "
+           f"docker run -d --name farm-worker --network host -v {f_tree}:/work -v {SCRATCH}:/scratch -u 0:0 {IMG} "
            f"bash -c 'useradd -r -s /usr/sbin/nologin icecc 2>/dev/null; "
            f"chown icecc /scratch/farm/envs; "  # pre-chown as root: daemon's cleanup_cache runs post-drop (no CAP_CHOWN)
            f"exec /work/obj/daemon/iceccd -m 8 -s {sip}:{SCHED_PORT} -n {NET} -N {h}w -b /scratch/farm/envs "
@@ -81,15 +101,17 @@ def push_file(host, localpath, remotepath):
     if p.returncode != 0:
         raise RuntimeError(f"push {localpath}->{host}:{remotepath} failed: {p.stderr.decode()[:200]}")
 
-def run_client(client_host, project_dir, mode, maxtu, jobs, prefer):
+def run_client(client_host, project_dir, mode, maxtu, jobs, prefer, binary_set_c=None):
     sched = f"{HOSTS[SCHED_HOST]['ip']}:{SCHED_PORT}"
+    c_tree = role_tree(binary_set_c)
     for s in SCRIPTS:
         push_file(client_host, f"{HUB_DIR}/{s}", f"{SCRATCH.replace('~', '$HOME')}/{s}")
     # resolve ~ on the client for the bind (docker needs an absolute host path)
     docker_rm(client_host, "farm-client")
-    cmd = (f"docker run --rm --name farm-client --network host -v {TREE}:/work -v {SCRATCH}:/scratch -u 0:0 {IMG} "
+    cmd = (f"docker run --rm --name farm-client --network host -v {c_tree}:/work -v {SCRATCH}:/scratch -u 0:0 {IMG} "
            f"bash /scratch/farm_client.sh {sched} {NET} {project_dir} {mode} {maxtu} {jobs} {prefer}")
-    print(f"TEST: client={client_host} project={project_dir} mode={mode} maxtu={maxtu} jobs={jobs} prefer={prefer}")
+    print(f"TEST: client={client_host} project={project_dir} mode={mode} maxtu={maxtu} jobs={jobs} prefer={prefer} "
+          f"C-set={binary_set_c or 'default'}({c_tree})")
     r = sh(client_host, cmd, timeout=1800)
     print(r.stdout.rstrip())
     if r.stderr.strip():
@@ -143,19 +165,28 @@ def main():
     ap.add_argument("--maxtu", default="0")
     ap.add_argument("--jobs", default="16")
     ap.add_argument("--phase", default="up-test-down", choices=["up","up-down","up-test-down"])
+    ap.add_argument("--binary-set-S", dest="binary_set_s", default=None, choices=sorted(ROLE_SET_DIR),
+                     help="scheduler role binary set (default: existing hardcoded TREE, unchanged)")
+    ap.add_argument("--binary-set-C", dest="binary_set_c", default=None, choices=sorted(ROLE_SET_DIR),
+                     help="client role binary set (default: existing hardcoded TREE, unchanged)")
+    ap.add_argument("--binary-set-F", dest="binary_set_f", default=None, choices=sorted(ROLE_SET_DIR),
+                     help="worker(F) role binary set, applied to every worker host (default: existing hardcoded TREE, unchanged)")
     a = ap.parse_args()
     workers = a.workers.split(",")
     prefer = (workers[0] + "w") if len(workers) == 1 else ""   # pin for 1 F; let scheduler balance for >1 F
     ok = False
     try:
-        ok = up(workers)
+        ok = up(workers, a.binary_set_s, a.binary_set_f)
         print("CLUSTER:", "REGISTERED-OK" if ok else "REGISTRATION-FAILED")
         if ok and a.phase == "up-test-down":
-            r = run_client(a.client, a.project, a.mode, a.maxtu, a.jobs, prefer)
+            r = run_client(a.client, a.project, a.mode, a.maxtu, a.jobs, prefer, a.binary_set_c)
             dump_worker_evidence(workers, r.stdout)
     finally:
         if a.phase in ("up-down", "up-test-down"):
             down(workers, a.client)
     sys.exit(0 if ok else 2)
 
-main()
+# S4: guarded so role_tree()/HOSTS/ROLE_SET_DIR can be imported (e.g. by
+# artifact_selection_test.sh) without triggering a live cluster deploy.
+if __name__ == "__main__":
+    main()
