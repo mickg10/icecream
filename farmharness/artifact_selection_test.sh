@@ -35,6 +35,34 @@ IMG=icecream/farm-node:ubuntu22-gcc11-boost174
 SCRATCHDIR=${ARTIFACT_TEST_SCRATCH:-/tanksmall/scratch/ictmp/wt-artifacts-scratch}
 mkdir -p "$SCRATCHDIR"
 
+# Whole-script concurrency lock. research6/research7/q2 are shared, LIVE
+# remote hosts that `distribute` and the corrupt-then-repair mutant (variant
+# B below) mutate directly and non-atomically (`rm -rf $root && mkdir -p
+# $root && tar -x -C $root` on repair is not an atomic swap). Two overlapping
+# invocations of this script racing against the SAME host was observed
+# directly: a corrupt-then-repair cycle's transient mid-flight state --
+# byte-identical to this script's own deterministic mutant hash -- was
+# caught by a DIFFERENT, concurrently-running invocation's earlier
+# "preflight goes green after distribute" check, which has no way to know a
+# sibling run is mid-mutation on the same host and correctly (from its own,
+# incomplete point of view) reported red. Every host-mutating step this
+# script performs is legitimate and self-consistent in isolation (every
+# single run, start to finish, has always ended with a hash-clean, fully
+# repaired, reverified host) -- the gap was purely "two runs at once", which
+# this lock closes by serializing whole invocations rather than trying to
+# scope locking to individual sections (simpler, and safe against a future
+# section gaining shared-host access without remembering to also acquire a
+# lock for it).
+LOCKFILE="${ARTIFACT_TEST_LOCK:-$SCRATCHDIR/artifact_selection_test.lock}"
+exec 9>"$LOCKFILE"
+if ! flock -n 9; then
+    echo "artifact_selection_test.sh: another run currently holds $LOCKFILE" \
+         "(research6/research7/q2 are shared live hosts this suite mutates directly;" \
+         "two runs interleaving can observe each other's transient corrupt-then-repair" \
+         "state). Waiting for it to finish..." >&2
+    flock 9
+fi
+
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 # probe SET ROLE -- prints the version-identity string reported by ROLE's
