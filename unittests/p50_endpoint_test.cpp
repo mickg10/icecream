@@ -2641,6 +2641,52 @@ void test_unnegotiated_begin_rejected_and_route_preserved() {
     }
 }
 
+
+// local-oracle's b19e41a9 HOLD closure: the client-side outbound mask law was
+// a deletion survivor (session-level ResetAckMutation::ProfileMask rejects a
+// bad SESSION_STATE long before the outbound guard; the client's own prepare
+// path only mints ZSTD_TU begins, so no public flow reaches the clause). The
+// law now lives in the shared require_outbound_profile_negotiated seam --
+// called by the production send path and driven here directly with a COPIED
+// begin against a live established session, mutating no retained state. The
+// wire-level backstop for a call-site deletion remains the server's own mask
+// law, deletion-tested separately.
+void test_client_outbound_mask_law() {
+    TestClient client(Id128::from_u64(910));
+    P50ServerEndpoint server(Id128::from_u64(911));
+    const std::vector<uint8_t> input = bytes("outbound mask law: first exact input\n");
+    const PairResult first = run_pair(client.endpoint, server, admit(client, input));
+    require(first.client.status == ClientRunStatus::Committed &&
+                first.server.status == ServerRunStatus::Completed,
+            "outbound-mask fixture could not establish its live session");
+
+    const ZstdTuEnvelope shaped = encode_zstd_tu(
+        HistoryNonce{1}, RelSeq{0}, TuSeq{77}, Digest128{}, input);
+    TxBegin crafted = make_begin(shaped, HistoryNonce{1}, Digest128{});
+    crafted.profile = ProfileId::GRZ;  // wire-valid, outside the ZSTD_TU-only mask
+    bool rejected_by_the_mask_law = false;
+    try {
+        require_outbound_profile_negotiated(profile_bit(ProfileId::ZSTD_TU), crafted);
+    } catch (const std::logic_error& error) {
+        rejected_by_the_mask_law =
+            std::string_view(error.what()) ==
+            "C selected a profile outside the negotiated mask";
+    }
+    require(rejected_by_the_mask_law,
+            "client outbound mask law did not reject an unnegotiated begin copy");
+    require_outbound_profile_negotiated(profile_bit(ProfileId::ZSTD_TU) |
+                                            profile_bit(ProfileId::GRZ),
+                                        crafted);  // negotiated -> must not throw
+
+    const std::vector<uint8_t> second_input = bytes("outbound mask law: follow-up commit\n");
+    const PairResult second =
+        run_pair(client.endpoint, server, admit(client, second_input));
+    require(second.client.status == ClientRunStatus::Committed &&
+                second.server.status == ServerRunStatus::Completed &&
+                copy_input(server, Id128::from_u64(910)) == second_input,
+            "outbound mask probe disturbed the live route");
+}
+
 void test_reserved_zero_endpoint_values() {
     {
         P50ServerEndpoint server(Id128::from_u64(628));
@@ -3650,6 +3696,7 @@ int main(int argc, char** argv) {
     test_reset_ack_equality_and_terminal_result();
     test_handshake_binding_and_namespace_rules();
     test_unnegotiated_begin_rejected_and_route_preserved();
+    test_client_outbound_mask_law();
     test_reserved_zero_endpoint_values();
     test_interrupted_begin_identity();
     test_terminal_body_failure_identity();

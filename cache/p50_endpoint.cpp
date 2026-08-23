@@ -1400,6 +1400,12 @@ struct P50ServerEndpoint::Impl {
     P50ServerEndpointConfig config{};
 };
 
+void require_outbound_profile_negotiated(uint32_t negotiated_profiles,
+                                         const TxBegin& begin) {
+    if ((negotiated_profiles & profile_bit(begin.profile)) == 0)
+        throw std::logic_error("C selected a profile outside the negotiated mask");
+}
+
 P50ClientEndpoint::P50ClientEndpoint(std::shared_ptr<P50PreparationAuthority> preparation,
                                      EndpointCaps caps, HistoryNonce first_history_nonce,
                                      CompletionLog* completions, ActionTrace* actions)
@@ -1582,8 +1588,7 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run(tcp::endpoint rem
             impl_->queued.reset();
         }
         const TxBegin begin = impl_->active->begin;
-        if ((peer.negotiated_profiles & profile_bit(begin.profile)) == 0)
-            throw std::logic_error("C selected a profile outside the negotiated mask");
+        require_outbound_profile_negotiated(peer.negotiated_profiles, begin);
         const uint32_t frame_cap = peer.limits.max_frame_payload;
         co_await async_write_message(socket, begin, frame_cap,
                                      impl_->stamp(session, AsyncOperationKind::WriteFragment),

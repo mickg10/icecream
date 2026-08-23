@@ -267,6 +267,14 @@ struct P50ServerEndpointConfig {
     InputJobStateSelector input_job_state;
 };
 
+// Outbound-admission law shared by the client's production send path and its
+// tests: a C endpoint must refuse to place a TX_BEGIN whose profile lies
+// outside the session's negotiated mask on the wire. Pure over its inputs --
+// callers pass a COPY of the outbound begin and the session's negotiated
+// mask, so exercising the law mutates no retained endpoint state.
+void require_outbound_profile_negotiated(uint32_t negotiated_profiles,
+                                         const TxBegin& begin);
+
 class P50ClientEndpoint {
 public:
     explicit P50ClientEndpoint(std::shared_ptr<P50PreparationAuthority> preparation,
