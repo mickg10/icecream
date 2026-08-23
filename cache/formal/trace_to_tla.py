@@ -76,18 +76,164 @@ faithfully translate into the bounded universe. A trace this tool accepts
 but the model rejects should fail through run_trace_refinement.sh (TLC
 reports a deadlock or invariant violation, not this generator).
 
-Field-binding audit per StepMatchesRecord arm (local-oracle HOLD on
-c384cc53: the original TX_BEGIN_C arm called C_TX_BEGIN(r.f, r.t, r.d) and
-silently dropped r.n/r.rel -- C_TX_BEGIN takes no nonce/rel parameters at
-all, it reads the model's OWN current s.cNonce/s.cRel internally, so a
-record that declared the wrong cursor was accepted anyway as long as the
-model's REAL cursor happened to allow some C_TX_BEGIN transition. Every
-other arm passes a full Op(r.f, r.n, r.rel, r.t, r.d) (or, for
-session/reset actions, has no cursor to bind at all), and TLA's own
-precondition then checks that op for EQUALITY against internal state
-(s.cActiveOp, s.pendingOp, s.lastCommitOp[f], ...) -- so those arms were
-never exposed to this bug; TX_BEGIN_C was the one arm that took a
-cursor-free signature and needed an explicit extra bind):
+FIELD-BINDING AUDIT. Two independent-reviewer HOLDs so far have both been
+the same shape: a record-level field that check_trace.py treats as real
+per-row identity gets silently discarded by Level 2 because the
+corresponding Protocol50.tla action either doesn't expose a parameter for
+it (it reads the model's OWN current state instead) or is handed the
+model's own state back as if it were the caller's claim. c384cc53 (HOLD #1,
+local-oracle) was the (nonce, rel_seq) cursor on TX_BEGIN_C. 0a47a6f5
+(HOLD #2, fixed here -- local-oracle and, independently, BigOracle both
+found this one) is session_serial on every F-actor row except the two
+that establish it.
+
+HOLD #2 specifically is why this audit is now done per FIELD, not per
+ACTION SIGNATURE (BigOracle's framing of the same point local-oracle made):
+signature-level auditing (HOLD #1's table below) checks "does this arm
+pass a full Op(...) and does TLA check that Op for equality" -- which
+every op-carrying arm appeared to satisfy, because Op is (f, n, rel, t, d)
+and every one of those five components really was checked: whole-Op
+equality binds {F, nonce, rel, TU, digest-variant}. But Op contains NO
+session token at all -- session_serial lives on a parameter Op-carrying
+signatures never had, so a pass that only asks "is the signature's own
+parameter bound" cannot see a field the signature never had a slot for.
+The fix is to instead walk every field the canonical JSONL schema puts on
+a record and place it in one of three buckets:
+
+  (a) WIRE PLACEHOLDER -- present on the row, but check_trace.py itself
+      never treats it as this row's own identity for this action (it's a
+      fixed, uninformative constant, e.g. always 0), so there is nothing
+      for Level 2 to bind:
+        session_serial on TX_BEGIN_C/TX_ABORTED/COMMIT_ACCEPTED/
+          LOST_COMMIT_ACCEPTED -- always 0. current_f_session, the only
+          function that treats session_serial as a real claim, guards on
+          row["actor"] == "F" first and so is never even called for these
+          four C-actor actions.
+        history_nonce/rel_seq/tu_seq on SESSION_OPENED/SESSION_REPLACED/
+          SESSION_DISCONNECTED/HISTORY_RESET -- these four are cursor-free
+          by construction (see HOLD #1's per-arm table below).
+
+  (b) MODEL-UNREPRESENTED DIAGNOSTIC -- a real check_trace.py identity or
+      consistency field with no corresponding Protocol50.tla state
+      variable, because the bounded model collapses the dimension that
+      field distinguishes down to one fixed value:
+        state_digest -- check_trace.py folds it into f["route"]/c["cursor"]
+          as a third tuple component (checked on HISTORY_RESET, TX_BEGIN,
+          ACTIVE_REPLAYED, INPUT_COMMITTED, COMMIT_ACCEPTED/
+          LOST_COMMIT_ACCEPTED). Protocol50.tla's route[f] is a plain
+          BOOLEAN (reset-or-not) with no value slot a digest could refine
+          against.
+        content_digest -- check_trace.py checks it stays immutable per
+          key64 once installed. Protocol50.tla's content[f][o] can only
+          ever hold NoContent or the FIXED CanonicalContent(o) -- the
+          model has no notion of "the wrong content" a digest STRING could
+          disagree with.
+        need_keys / remaining_need / duplicate -- check_trace.py's own
+          redundant bookkeeping, mirroring s.requested/s.missing/s.pinned,
+          which Protocol50.tla derives purely from TuObjects(OpTu(op)), a
+          FIXED function of the already-bound tu_seq -- not a free value
+          these fields could independently disagree with. (An
+          inconsistent need_keys/duplicate/etc. across rows for the same
+          tu_seq is still generator-fail-closed by TuObjectMapper -- this
+          bucket is about what Level 2/TLC cannot ALSO bind, not about
+          Level 1 being skipped.)
+
+  (c) BOUND -- checked against live Protocol50.tla state at replay time.
+      f/history_nonce/rel_seq/tu_seq/digest-variant via Op equality and
+      key64 via OBJECT_APPLIED's o \\in s.requested are covered by HOLD
+      #1's table below (still accurate); session_serial is HOLD #2, this
+      fix, detailed next.
+
+session_serial, per arm (build_trace_log's new lookup_token/
+is_session_bound, and the new StepMatchesRecord conjuncts below).
+BigOracle's exact suggested form -- CurrentSession(s, r.f, r.tok), reusing
+the model's own helper (Protocol50.tla's CurrentSession(st,f,tok) ==
+st.session=f /\\ st.sessionToken=tok, already used by SESSION_DISCONNECTED/
+HISTORY_RESET/COMMIT_ACCEPTED/LOST_COMMIT_ACCEPTED and, internally,
+DICT_COMPLETE and friends) rather than a bespoke bare equality -- is what
+every FIXED arm below now uses, uniformly, whether or not the action
+already had a token parameter of its own:
+  SESSION_OPENED/SESSION_REPLACED(r.f, r.tok)
+      -- ESTABLISHING, unaffected: assign_token gives this row's
+         session_serial its Tok0/Tok1 label the first time it's seen (and
+         SESSION_REPLACED's own `tok \\in Tokens \\ s.usedTokens[f]` already
+         forces the label fresh); nothing upstream to check it against.
+  SESSION_DISCONNECTED(r.f, r.tok) / HISTORY_RESET(r.f, r.tok)
+      -- FIXED: both already pass tok into a real Protocol50.tla parameter
+         that CurrentSession(s, f, tok) checks directly against
+         s.sessionToken -- the bug was entry["tok"] being the generator's
+         OWN "whichever token is currently live" tracker instead of a
+         lookup of THIS row's own session_serial, so a row that lied about
+         its session_serial was fed the correct token anyway. Now
+         `token_states[mapped_f].known[row["session_serial"]]`, the same
+         table SESSION_OPENED/REPLACED populate, looked up via the new
+         lookup_token (fails closed, like lookup_nonce, if no earlier
+         SESSION_OPENED/SESSION_REPLACED for this F ever established this
+         row's session_serial -- see fixtures/red-f-session-unknown.jsonl).
+  TX_BEGIN_F / ACTIVE_REPLAYED: new conjunct CurrentSession(s, r.f, r.tok)
+      -- FIXED: F_TX_BEGIN(op) takes no token parameter at all -- unlike
+         SESSION_DISCONNECTED/HISTORY_RESET there was no existing
+         CurrentSession call to feed correctly; this is HOLD #1's
+         TX_BEGIN_C shape of bug (a cursor-free signature). The new
+         conjunct pins the model's real CURRENT sessionToken to this row's
+         mapped token before F_TX_BEGIN/ACTIVE_REPLAYED's own logic (which
+         copies sessionToken into pendingToken) runs, so a row that lies
+         about its session_serial now has no successor state.
+  DICT_COMPLETE / NEED_RECORDED / BODY_COMPLETE / OBJECT_APPLIED /
+  INPUT_MATERIALIZED / INPUT_COMMITTED: new conjunct
+  CurrentSession(s, r.f, r.tok)
+      -- FIXED: each already calls CurrentSession(s, ..., s.pendingToken)
+         internally, but against the model's OWN pendingToken, not
+         anything the caller supplies (Op carries no token field) -- so
+         the check was tautologically true regardless of what this row
+         claimed (Protocol50.tla's SessionFence invariant guarantees
+         s.pendingToken already equals s.sessionToken whenever pendingOp is
+         set, so this was never reachable-but-wrong at the invariant
+         level -- it was simply never independently checked against the
+         RECORD). The new conjunct makes the record's claim a real
+         precondition of this specific step, so each row's own claim is
+         verified on its own terms rather than only inherited from
+         whatever TX_BEGIN_F/ACTIVE_REPLAYED pinned earlier in the same
+         overlay -- see fixtures/red-f-session-stale.jsonl, which is
+         mappable (its stale session_serial WAS established, just not by
+         the live session) specifically so it reaches this conjunct at TLC
+         rather than failing generator mappability like the unknown-serial
+         fixture does.
+  TX_BEGIN_C / TX_ABORTED / COMMIT_ACCEPTED / LOST_COMMIT_ACCEPTED
+      -- no change: session_serial is a wire placeholder on these four
+         (bucket (a) above). COMMIT_ACCEPTED/LOST_COMMIT_ACCEPTED already
+         pass a real r.tok, but one derived from the generator's own
+         live-token tracker rather than from this row's session_serial --
+         correctly so, since this row's own field carries no independent
+         claim to map.
+
+Two fixtures prove this fix, deliberately hitting the two different ways
+Level 2 can independently reject a bad session_serial (see
+run_fixture_matrix.sh's layer_independence_proof):
+  fixtures/red-f-session-unknown.jsonl (local-oracle's exact discriminator:
+    green.jsonl's line 4 F TX_BEGIN session_serial changed 1->2, a serial
+    NEVER established anywhere in the trace) -- UNMAPPABLE, so
+    lookup_token fails the generator closed before TLC ever runs.
+  fixtures/red-f-session-stale.jsonl (BigOracle's addition: SESSION_OPENED
+    establishes serial 1/Tok0, SESSION_REPLACED establishes serial 9/Tok1
+    as the new live session, then a DICT_COMPLETE row claims the now-STALE
+    serial 1) -- MAPPABLE (Tok0 really was established), so the generator
+    does not fail closed; TLC reaches the DICT_COMPLETE step and deadlocks
+    on CurrentSession(s, r.f, r.tok) specifically, proving that conjunct
+    itself catches a bad claim, not just unmappability.
+
+HOLD #1 per-arm table (c384cc53: the original TX_BEGIN_C arm called
+C_TX_BEGIN(r.f, r.t, r.d) and silently dropped r.n/r.rel -- C_TX_BEGIN
+takes no nonce/rel parameters at all, it reads the model's OWN current
+s.cNonce/s.cRel internally, so a record that declared the wrong cursor was
+accepted anyway as long as the model's REAL cursor happened to allow some
+C_TX_BEGIN transition. Every other arm passes a full
+Op(r.f, r.n, r.rel, r.t, r.d) (or, for session/reset actions, has no
+cursor to bind at all), and TLA's own precondition then checks that op for
+EQUALITY against internal state (s.cActiveOp, s.pendingOp,
+s.lastCommitOp[f], ...) -- so those arms were never exposed to this bug;
+TX_BEGIN_C was the one arm that took a cursor-free signature and needed an
+explicit extra bind; unaffected by HOLD #2, kept here for reference):
 
   SESSION_OPENED/REPLACED/DISCONNECTED(r.f, r.tok)
       -- no cursor parameters exist on these actions in Protocol50.tla at
@@ -97,19 +243,19 @@ cursor-free signature and needed an explicit extra bind):
          nonce (nextNonce == 1 - nonce[f]) rather than checking one, so
          there is no caller-supplied nonce/rel for it to be bound against.
   TX_BEGIN_C: s.cNonce = r.n /\\ s.cRel = r.rel /\\ C_TX_BEGIN(r.f, r.t, r.d)
-      -- FIXED here: the two extra conjuncts pin the model's pre-state
-         cursor to the record's declared (nonce, rel_seq) before
-         C_TX_BEGIN's own logic runs, so a record that lies about its
-         cursor now has no successor state (TLC deadlock) instead of
-         silently reusing whatever cursor the model happened to be at.
+      -- the two extra conjuncts pin the model's pre-state cursor to the
+         record's declared (nonce, rel_seq) before C_TX_BEGIN's own logic
+         runs, so a record that lies about its cursor now has no successor
+         state (TLC deadlock) instead of silently reusing whatever cursor
+         the model happened to be at.
   TX_BEGIN_F / ACTIVE_REPLAYED: F_TX_BEGIN(Op(r.f, r.n, r.rel, r.t, r.d))
       -- fully bound: F_TX_BEGIN's precondition requires
          OpNonce(op) = s.nonce[f] and OpRel(op) = s.fRel[f], i.e. it
          directly checks the record's declared nonce/rel against state.
   TX_ABORTED(Op(...))
       -- fully bound: precondition requires op = s.cActiveOp exactly, and
-         s.cActiveOp's own nonce/rel were pinned by the (now-fixed)
-         TX_BEGIN_C arm that set it, so this equality is meaningful.
+         s.cActiveOp's own nonce/rel were pinned by the TX_BEGIN_C arm
+         that set it, so this equality is meaningful.
   DICT_COMPLETE / NEED_RECORDED / BODY_COMPLETE / OBJECT_APPLIED /
   INPUT_MATERIALIZED(Op(...))
       -- fully bound: each requires op = s.pendingOp exactly, and
@@ -122,11 +268,6 @@ cursor-free signature and needed an explicit extra bind):
   COMMIT_ACCEPTED / LOST_COMMIT_ACCEPTED(r.f, r.tok, Op(...))
       -- fully bound: precondition requires op = s.cActiveOp AND
          op = s.lastCommitOp[f] exactly.
-
-State_digest is intentionally not required or used here: it is a
-check_trace.py-only hash-chain consistency tag layered on top of the
-(nonce, rel_seq) cursor pair that check_trace.py already validates;
-Protocol50.tla has no corresponding variable to refine.
 
 Python 3 stdlib only, matching check_trace.py.
 """
@@ -325,6 +466,28 @@ def assign_token(index: int, raw_serial: Any, state: FTokenState) -> str:
     return label
 
 
+def lookup_token(index: int, raw_serial: Any, state: FTokenState) -> str:
+    if raw_serial not in state.known:
+        fail(index, f"session_serial {raw_serial!r} was never established by a "
+                    f"SESSION_OPENED/SESSION_REPLACED for this F, so it cannot be "
+                    f"mapped onto the bounded model's Tok0/Tok1")
+    return state.known[raw_serial]
+
+
+def is_session_bound(action: str, actor: str) -> bool:
+    """True iff this row's session_serial is a real, per-row F-session
+    identity that check_trace.py itself validates -- i.e. current_f_session
+    (check_trace.py) checks row["session_serial"] == f["session"] for this
+    action. That function's first guard is row["actor"] == "F", so TX_BEGIN
+    only counts here on its F half (TX_BEGIN_F); the C half is a wholly
+    different Protocol50.tla action (C_TX_BEGIN) with no session concept.
+    SESSION_OPENED/SESSION_REPLACED are the two ESTABLISHING actions:
+    current_f_session is never called on them (they SET f["session"], they
+    don't check it against anything), so they are handled separately by
+    assign_token, not by lookup_token."""
+    return actor == "F" and action not in ("SESSION_OPENED", "SESSION_REPLACED")
+
+
 class TuObjectMapper:
     """Assigns raw tu_seq values to T0/T1 by NEED_RECORDED shape (not by
     order of appearance -- see the module docstring), and raw key64 values
@@ -489,6 +652,8 @@ def build_trace_log(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
         if action in ("SESSION_OPENED", "SESSION_REPLACED"):
             assign_token(index, row["session_serial"], token_state)
+        elif is_session_bound(action, actor):
+            lookup_token(index, row["session_serial"], token_state)
 
         if action in OP_CARRYING_ACTIONS:
             tu_mapper.observe_tu(row["tu_seq"])
@@ -525,12 +690,33 @@ def build_trace_log(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             tok = token_states[mapped_f].known[row["session_serial"]]
             entry["tok"] = tok
             current_token[mapped_f] = tok
-        elif action == "SESSION_DISCONNECTED":
-            entry["tok"] = current_token[mapped_f] or "Tok0"
-            current_token[mapped_f] = None
-        elif action == "HISTORY_RESET":
-            entry["tok"] = current_token[mapped_f] or "Tok0"
+        elif is_session_bound(action, actor):
+            # FIXED (local-oracle HOLD #2 on 0a47a6f5): this used to be
+            # `current_token[mapped_f] or "Tok0"` for SESSION_DISCONNECTED/
+            # HISTORY_RESET (the generator's OWN "whichever token is
+            # currently live" tracker) and simply absent (defaulting to the
+            # template's "NoToken", unused by these arms) for every other
+            # session-bound action -- in both cases the record's OWN
+            # session_serial field was discarded rather than mapped. Now
+            # every session-bound row maps ITS OWN declared session_serial
+            # through the same table SESSION_OPENED/REPLACED populate, so a
+            # row that lies about which session it belongs to no longer
+            # gets a free pass by falling back to whatever is actually
+            # live. lookup_token already proved in pass 1 that this raw
+            # value was established by an earlier SESSION_OPENED/REPLACED
+            # for this F, so the lookup below cannot KeyError.
+            entry["tok"] = token_states[mapped_f].known[row["session_serial"]]
+            if action == "SESSION_DISCONNECTED":
+                current_token[mapped_f] = None
         elif action in ("COMMIT_ACCEPTED", "LOST_COMMIT_ACCEPTED"):
+            # session_serial is a wire placeholder on these two (always 0;
+            # see is_session_bound's docstring and the module docstring's
+            # field-binding audit) -- current_f_session never checks it, so
+            # there is no per-row claim to map. Protocol50.tla's
+            # COMMIT_ACCEPTED/LOST_COMMIT_ACCEPTED still take a real tok
+            # parameter, so the generator supplies its own independently
+            # tracked "whichever token is currently live for this F" here,
+            # same as before this fix.
             entry["tok"] = current_token[mapped_f] or "Tok0"
 
         if action in OP_CARRYING_ACTIONS:
@@ -590,15 +776,15 @@ StepMatchesRecord(k) ==
          [] r.kind = "SESSION_DISCONNECTED" -> SESSION_DISCONNECTED(r.f, r.tok)
          [] r.kind = "HISTORY_RESET"        -> HISTORY_RESET(r.f, r.tok)
          [] r.kind = "TX_BEGIN_C"           -> s.cNonce = r.n /\\ s.cRel = r.rel /\\ C_TX_BEGIN(r.f, r.t, r.d)
-         [] r.kind = "TX_BEGIN_F"           -> F_TX_BEGIN(Op(r.f, r.n, r.rel, r.t, r.d))
-         [] r.kind = "ACTIVE_REPLAYED"      -> ACTIVE_REPLAYED(Op(r.f, r.n, r.rel, r.t, r.d))
+         [] r.kind = "TX_BEGIN_F"           -> CurrentSession(s, r.f, r.tok) /\\ F_TX_BEGIN(Op(r.f, r.n, r.rel, r.t, r.d))
+         [] r.kind = "ACTIVE_REPLAYED"      -> CurrentSession(s, r.f, r.tok) /\\ ACTIVE_REPLAYED(Op(r.f, r.n, r.rel, r.t, r.d))
          [] r.kind = "TX_ABORTED"           -> TX_ABORTED(Op(r.f, r.n, r.rel, r.t, r.d))
-         [] r.kind = "DICT_COMPLETE"        -> DICT_COMPLETE(Op(r.f, r.n, r.rel, r.t, r.d))
-         [] r.kind = "NEED_RECORDED"        -> NEED_RECORDED(Op(r.f, r.n, r.rel, r.t, r.d))
-         [] r.kind = "BODY_COMPLETE"        -> BODY_COMPLETE(Op(r.f, r.n, r.rel, r.t, r.d))
-         [] r.kind = "OBJECT_APPLIED"       -> OBJECT_APPLIED(Op(r.f, r.n, r.rel, r.t, r.d), r.o)
-         [] r.kind = "INPUT_MATERIALIZED"   -> INPUT_MATERIALIZED(Op(r.f, r.n, r.rel, r.t, r.d))
-         [] r.kind = "INPUT_COMMITTED"      -> INPUT_COMMITTED(Op(r.f, r.n, r.rel, r.t, r.d))
+         [] r.kind = "DICT_COMPLETE"        -> CurrentSession(s, r.f, r.tok) /\\ DICT_COMPLETE(Op(r.f, r.n, r.rel, r.t, r.d))
+         [] r.kind = "NEED_RECORDED"        -> CurrentSession(s, r.f, r.tok) /\\ NEED_RECORDED(Op(r.f, r.n, r.rel, r.t, r.d))
+         [] r.kind = "BODY_COMPLETE"        -> CurrentSession(s, r.f, r.tok) /\\ BODY_COMPLETE(Op(r.f, r.n, r.rel, r.t, r.d))
+         [] r.kind = "OBJECT_APPLIED"       -> CurrentSession(s, r.f, r.tok) /\\ OBJECT_APPLIED(Op(r.f, r.n, r.rel, r.t, r.d), r.o)
+         [] r.kind = "INPUT_MATERIALIZED"   -> CurrentSession(s, r.f, r.tok) /\\ INPUT_MATERIALIZED(Op(r.f, r.n, r.rel, r.t, r.d))
+         [] r.kind = "INPUT_COMMITTED"      -> CurrentSession(s, r.f, r.tok) /\\ INPUT_COMMITTED(Op(r.f, r.n, r.rel, r.t, r.d))
          [] r.kind = "COMMIT_ACCEPTED"      -> COMMIT_ACCEPTED(r.f, r.tok, Op(r.f, r.n, r.rel, r.t, r.d))
          [] r.kind = "LOST_COMMIT_ACCEPTED" -> LOST_COMMIT_ACCEPTED(r.f, r.tok, Op(r.f, r.n, r.rel, r.t, r.d))
 

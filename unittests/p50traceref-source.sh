@@ -13,12 +13,18 @@
 # gets stuck partway through (the exact failure mode the RED tests exist to
 # catch) would silently report success instead of a TLC deadlock.
 #
-# Also anchors the local-oracle HOLD fix on c384cc53 (a real false-green:
-# the driver accepted a trace whose C TX_BEGIN declared the wrong
-# rel_seq/nonce, because C_TX_BEGIN takes no cursor parameters and the
-# generator wasn't otherwise binding them) -- both the mandatory Level-1
-# gate in the driver and the cursor-binding predicate in the generator must
-# stay present.
+# Also anchors HOLD fixes from three independent reviews, all the same
+# false-green shape (a record field check_trace.py treats as real per-row
+# identity gets silently discarded by Level 2): c384cc53/local-oracle (the
+# mandatory Level-1 gate in the driver, and the cursor-binding predicate on
+# TX_BEGIN_C, the one arm whose Protocol50.tla action signature has no
+# cursor parameters of its own to check against) and 0a47a6f5/local-oracle
+# +BigOracle (the driver accepted a trace whose F TX_BEGIN declared a
+# session_serial belonging to no established session, because
+# F_TX_BEGIN/DICT_COMPLETE/etc. either take no token parameter at all or
+# check the model's OWN pendingToken instead of the caller's claim -- the
+# CurrentSession(s, r.f, r.tok)-binding predicate on all eight affected
+# arms, and the lookup_token fail-closed branch, must stay present).
 set -eu
 
 src=${ICECC_TEST_TOP_SRCDIR:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
@@ -73,6 +79,8 @@ require_count 1 'f"a third session establishment (session_serial={raw_serial!r})
     'a third session establishment for one F fails closed (only Tok0/Tok1 exist)'
 require_count 1 'was never introduced by a "' "$GEN" \
     'a history_nonce never established by HISTORY_RESET fails closed'
+require_count 1 'was never established by a "' "$GEN" \
+    'a session_serial never established by SESSION_OPENED/REPLACED fails closed'
 require_count 1 'f"NEED_RECORDED for tu_seq {raw_tu!r} names {size} key(s); "' "$GEN" \
     'a Need whose size is not 1 or 2 fails closed'
 require_count 1 'already claimed the bounded model'"'"'s only {size}-key TU")' "$GEN" \
@@ -119,5 +127,29 @@ require_count 1 '"$PYTHON" "$SCRIPT_DIR/check_trace.py" "$TRACE_ABS_EARLY"' "$DR
     'the driver runs check_trace.py (Level 1) before trace_to_tla.py/TLC (Level 2)'
 require_count 1 '[] r.kind = "TX_BEGIN_C"           -> s.cNonce = r.n /\\ s.cRel = r.rel /\\ C_TX_BEGIN(r.f, r.t, r.d)' "$GEN" \
     'TX_BEGIN_C binds the record'"'"'s declared cursor before calling C_TX_BEGIN'
+
+# local-oracle + BigOracle HOLD #2 fix anchors (0a47a6f5 false-green, two
+# independent reviews of the same defect): every arm whose Protocol50.tla
+# action either takes no token parameter at all (TX_BEGIN_F/ACTIVE_REPLAYED)
+# or checks the model's OWN pendingToken instead of the caller's claim (the
+# six op-carrying arms below) must conjoin CurrentSession(s, r.f, r.tok)
+# (BigOracle's exact suggested form -- reuses the model's own helper rather
+# than a bespoke bare equality) before calling the action.
+require_count 1 '[] r.kind = "TX_BEGIN_F"           -> CurrentSession(s, r.f, r.tok) /\\ F_TX_BEGIN(Op(r.f, r.n, r.rel, r.t, r.d))' "$GEN" \
+    'TX_BEGIN_F binds the record'"'"'s declared session token before calling F_TX_BEGIN'
+require_count 1 '[] r.kind = "ACTIVE_REPLAYED"      -> CurrentSession(s, r.f, r.tok) /\\ ACTIVE_REPLAYED(Op(r.f, r.n, r.rel, r.t, r.d))' "$GEN" \
+    'ACTIVE_REPLAYED binds the record'"'"'s declared session token before calling ACTIVE_REPLAYED'
+require_count 1 '[] r.kind = "DICT_COMPLETE"        -> CurrentSession(s, r.f, r.tok) /\\ DICT_COMPLETE(Op(r.f, r.n, r.rel, r.t, r.d))' "$GEN" \
+    'DICT_COMPLETE binds the record'"'"'s declared session token before calling DICT_COMPLETE'
+require_count 1 '[] r.kind = "NEED_RECORDED"        -> CurrentSession(s, r.f, r.tok) /\\ NEED_RECORDED(Op(r.f, r.n, r.rel, r.t, r.d))' "$GEN" \
+    'NEED_RECORDED binds the record'"'"'s declared session token before calling NEED_RECORDED'
+require_count 1 '[] r.kind = "BODY_COMPLETE"        -> CurrentSession(s, r.f, r.tok) /\\ BODY_COMPLETE(Op(r.f, r.n, r.rel, r.t, r.d))' "$GEN" \
+    'BODY_COMPLETE binds the record'"'"'s declared session token before calling BODY_COMPLETE'
+require_count 1 '[] r.kind = "OBJECT_APPLIED"       -> CurrentSession(s, r.f, r.tok) /\\ OBJECT_APPLIED(Op(r.f, r.n, r.rel, r.t, r.d), r.o)' "$GEN" \
+    'OBJECT_APPLIED binds the record'"'"'s declared session token before calling OBJECT_APPLIED'
+require_count 1 '[] r.kind = "INPUT_MATERIALIZED"   -> CurrentSession(s, r.f, r.tok) /\\ INPUT_MATERIALIZED(Op(r.f, r.n, r.rel, r.t, r.d))' "$GEN" \
+    'INPUT_MATERIALIZED binds the record'"'"'s declared session token before calling INPUT_MATERIALIZED'
+require_count 1 '[] r.kind = "INPUT_COMMITTED"      -> CurrentSession(s, r.f, r.tok) /\\ INPUT_COMMITTED(Op(r.f, r.n, r.rel, r.t, r.d))' "$GEN" \
+    'INPUT_COMMITTED binds the record'"'"'s declared session token before calling INPUT_COMMITTED'
 
 echo 'PASS: trace-refinement generator keeps its fail-closed branches and deadlock gate'
