@@ -3112,7 +3112,7 @@ void mutate_commit(TxCommit& commit, CommitMismatchField field) {
 // TX_BEGIN and BODY components, then answers with a commit derived from the received begin
 // with exactly one field mutated (or none for the baseline), and waits for the peer to close.
 asio::awaitable<void> raw_f_serve_and_commit(tcp::acceptor& acceptor, FStoreGuid f_guid,
-                                             CommitMismatchField field) {
+                                             CommitMismatchField field, TxBegin& out_begin) {
     tcp::socket socket = co_await acceptor.async_accept(asio::use_awaitable);
     const SessionHello hello =
         raw_decode<SessionHello>(co_await raw_read(socket, kInitialMaxFramePayload));
@@ -3126,7 +3126,7 @@ asio::awaitable<void> raw_f_serve_and_commit(tcp::acceptor& acceptor, FStoreGuid
     fresh.f_store_guid = f_guid;
     co_await raw_write(socket, Message{fresh});
     Frame next = co_await raw_read(socket, cap);
-    TxBegin begin;
+    TxBegin& begin = out_begin;
     if (next.type == MessageType::HISTORY_RESET) {
         const HistoryReset reset = raw_decode<HistoryReset>(next);
         SessionState ack = fresh;
@@ -3169,12 +3169,13 @@ void test_commit_identity_negative_matrix() {
         TestClient client(Id128::from_u64(identity++));
         const std::vector<uint8_t> input = pseudo_random_bytes(4096);
         const PreparedTuHandle prepared = admit(client, input);
+        TxBegin baseline_begin;
         asio::io_context context;
         tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
         std::future<void> fake = asio::co_spawn(
             context,
             raw_f_serve_and_commit(acceptor, Id128::from_u64(identity++),
-                                   CommitMismatchField::None),
+                                   CommitMismatchField::None, baseline_begin),
             asio::use_future);
         std::future<ClientRunResult> run = asio::co_spawn(
             context, client.endpoint.run(acceptor.local_endpoint(), prepared, {}),
@@ -3190,11 +3191,16 @@ void test_commit_identity_negative_matrix() {
         TestClient client(Id128::from_u64(identity++));
         const std::vector<uint8_t> input = pseudo_random_bytes(4096);
         const PreparedTuHandle prepared = admit(client, input);
+        // Cursor preservation is asserted against the LIVE BEGIN's own fields (local-oracle
+        // spec): after refusal, next_rel_seq must still equal begin.rel_seq and state_digest
+        // must still equal begin.pre_state_digest.  The fake F exports the begin it received.
+        TxBegin observed_begin;
+        const FStoreGuid fake_f = Id128::from_u64(identity++);
         asio::io_context context;
         tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
         std::future<void> fake = asio::co_spawn(
             context,
-            raw_f_serve_and_commit(acceptor, Id128::from_u64(identity++), field),
+            raw_f_serve_and_commit(acceptor, fake_f, field, observed_begin),
             asio::use_future);
         std::future<ClientRunResult> run = asio::co_spawn(
             context, client.endpoint.run(acceptor.local_endpoint(), prepared, {}),
@@ -3203,8 +3209,12 @@ void test_commit_identity_negative_matrix() {
         fake.get();
         const ClientRunResult rejected = run.get();
         require(rejected.status == ClientRunStatus::TerminalError &&
-                    client.has_active_transaction(),
-                std::string(name) + " commit mismatch was not rejected exactly");
+                    client.has_active_transaction() &&
+                    client.endpoint.next_rel_seq() == observed_begin.rel_seq &&
+                    client.endpoint.state_digest() == observed_begin.pre_state_digest &&
+                    client.endpoint.f_store_guid() == std::optional<FStoreGuid>(fake_f) ,
+                std::string(name) +
+                    " commit mismatch rejection did not preserve the transaction cursor");
 
         P50ServerEndpoint real_server(Id128::from_u64(identity++));
         const PairResult retried = run_pair(client, real_server);
@@ -3374,6 +3384,7 @@ void test_lost_final_commit_identity_negative_matrix() {
                     std::string(name) + " lost-final setup did not retain the transaction");
         }
         {
+            const std::optional<FStoreGuid> f_before = client.endpoint.f_store_guid();
             asio::io_context context;
             tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
             std::future<void> fake = asio::co_spawn(
@@ -3388,10 +3399,15 @@ void test_lost_final_commit_identity_negative_matrix() {
             // RouteHistoryReset is the SITE's refusal shape (:1508); a bypassed site would
             // fall through to accept()'s internal check, which throws with the default
             // reconnect outcome instead -- so this assertion proves the call site itself.
+            // Cursor preservation: the refusal must leave rel/state/route untouched.
             require(refused.status == ClientRunStatus::TerminalError &&
                         refused.reconnect == EndpointReconnectOutcome::RouteHistoryReset &&
-                        client.has_active_transaction(),
-                    std::string(name) + " mismatched last_commit was not refused at the site");
+                        client.has_active_transaction() &&
+                        client.endpoint.next_rel_seq() == begin.rel_seq &&
+                        client.endpoint.state_digest() == begin.pre_state_digest &&
+                        client.endpoint.f_store_guid() == f_before,
+                    std::string(name) +
+                        " mismatched last_commit refusal did not preserve the cursor");
         }
         {
             asio::io_context context;
