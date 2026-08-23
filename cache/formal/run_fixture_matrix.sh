@@ -7,7 +7,7 @@
 # a layer-independence proof (see layer_independence_proof below) for each
 # fixture built specifically to reproduce one of those false-greens:
 # red-c-cursor.jsonl (c384cc53 -- TX_BEGIN_C's dropped nonce/rel_seq) and
-# red-f-session-unknown.jsonl/red-f-session-stale.jsonl (0a47a6f5 -- the
+# red-f-session-unknown.jsonl/red-f-stale-token.jsonl (0a47a6f5 -- the
 # dropped F-side session_serial, local-oracle's and BigOracle's two
 # independent HOLDs on the same defect: an UNMAPPABLE serial that was
 # never established anywhere, and a MAPPABLE-but-STALE serial that was
@@ -31,7 +31,7 @@ mkdir -p "$WORK_ROOT"
 # is recorded in the delivery report, not asserted here, since which layer
 # catches a given red fixture is allowed to shift as Level-1/Level-2 both
 # get stricter over time.
-fixtures="green:0 prefix-legal:0 red-swap:1 red-wrong-tu:1 red-unknown-action:1 red-duplicate-dict:1 red-c-cursor:1 red-f-session-unknown:1 red-f-session-stale:1"
+fixtures="green:0 prefix-legal:0 red-swap:1 red-wrong-tu:1 red-unknown-action:1 red-duplicate-dict:1 red-c-cursor:1 red-f-session-unknown:1 red-f-stale-token:1"
 
 fail=0
 for entry in $fixtures; do
@@ -104,7 +104,13 @@ layer_independence_proof() {
     # (ii) Level 2 alone: TRACEREF_SKIP_L1=1 bypasses check_trace.py inside
     # the driver (test-only -- see run_trace_refinement.sh's header) so
     # only trace_to_tla.py/TLC can be why this still fails; if neither
-    # independently caught the bad field, this would exit 0.
+    # independently caught the bad field, this would exit 0. For the "tlc"
+    # mechanism this also asserts TLC's own exit code is specifically 11
+    # (its deadlock code, distinct from e.g. an invariant violation or a
+    # parse error) and greps the raw TLC transcript for its own "Error:
+    # Deadlock reached" line, not just the driver's generic wrapper message
+    # -- a nonzero exit alone would not distinguish "deadlocked on the
+    # bound field" from "rejected for some unrelated reason".
     l2_out="$WORK_ROOT/layer-independence-$name-l2.log"
     set +e
     TRACEREF_SKIP_L1=1 "$SCRIPT_DIR/run_trace_refinement.sh" "$trace" "$WORK_ROOT/layer-independence-$name-l2" >"$l2_out" 2>&1
@@ -124,6 +130,18 @@ layer_independence_proof() {
         fail=1
     elif ! grep -qF "$l2_expect" "$l2_out"; then
         echo "FAIL: layer-independence (ii): $name.jsonl was rejected some other way (not $l2_mechanism) with Level 1 bypassed:" >&2
+        tail -20 "$l2_out" >&2
+        fail=1
+    elif [ "$l2_mechanism" = "tlc" ] && ! grep -qF '(exit 11)' "$l2_out"; then
+        echo "FAIL: layer-independence (ii): $name.jsonl was rejected by TLC but not with its deadlock exit code (11):" >&2
+        tail -20 "$l2_out" >&2
+        fail=1
+    elif [ "$l2_mechanism" = "tlc" ] && ! grep -qF 'Error: Deadlock reached' "$l2_out"; then
+        echo "FAIL: layer-independence (ii): $name.jsonl's TLC transcript does not show its own deadlock line:" >&2
+        tail -20 "$l2_out" >&2
+        fail=1
+    elif [ "$l2_mechanism" = "generator" ] && grep -qF 'Deadlock' "$l2_out"; then
+        echo "FAIL: layer-independence (ii): $name.jsonl reached TLC (deadlock text present) -- expected generator mappability to fail closed BEFORE TLC ever ran:" >&2
         tail -20 "$l2_out" >&2
         fail=1
     else
@@ -147,18 +165,21 @@ layer_independence_proof red-c-cursor 'C TX_BEGIN missed its cursor' tlc
 # lookup_token, before TLC ever runs.
 layer_independence_proof red-f-session-unknown 'F TX_BEGIN at the wrong boundary' generator
 
-# red-f-session-stale.jsonl (BigOracle's addition) -- SESSION_OPENED
-# establishes serial 1 (Tok0), SESSION_REPLACED establishes serial 9
+# red-f-stale-token.jsonl (BigOracle's addition) -- SESSION_OPENED
+# establishes serial 1 (Tok0), SESSION_REPLACED establishes serial 5
 # (Tok1, now the live session), then a DICT_COMPLETE row claims the
 # stale serial 1. Tok0 WAS established (mappable, so the generator does
 # not fail closed) but is no longer live, so this is the row that proves
 # the new CurrentSession(s, r.f, r.tok) conjunct itself, not just
-# mappability: Level 2 alone reaches TLC and deadlocks there.
-layer_independence_proof red-f-session-stale 'DICT does not match F pending/current session' tlc
+# mappability: Level 2 alone reaches TLC and deadlocks there (TLC's own
+# exit 11 and "Error: Deadlock reached" line, asserted above -- this is
+# the ONLY fixture in this matrix that reaches the new conjunct at TLC
+# rather than dying in the generator's mappability guard first).
+layer_independence_proof red-f-stale-token 'DICT does not match F pending/current session' tlc
 
 if [ "$fail" -ne 0 ]; then
     echo "FAIL: run_fixture_matrix -- one or more fixtures/proofs did not match their expected outcome" >&2
     exit 1
 fi
 count=$(printf '%s\n' $fixtures | wc -l | tr -d ' ')
-echo "PASS: run_fixture_matrix -- all $count fixtures matched their expected exit code, and red-c-cursor.jsonl/red-f-session-unknown.jsonl/red-f-session-stale.jsonl are each proven killed by Level 1 and Level 2 independently"
+echo "PASS: run_fixture_matrix -- all $count fixtures matched their expected exit code, and red-c-cursor.jsonl/red-f-session-unknown.jsonl/red-f-stale-token.jsonl are each proven killed by Level 1 and Level 2 independently"

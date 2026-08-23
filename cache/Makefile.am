@@ -119,7 +119,7 @@ EXTRA_DIST = \
 	formal/fixtures/red-duplicate-dict.jsonl \
 	formal/fixtures/red-c-cursor.jsonl \
 	formal/fixtures/red-f-session-unknown.jsonl \
-	formal/fixtures/red-f-session-stale.jsonl \
+	formal/fixtures/red-f-stale-token.jsonl \
 	formal/fixtures/prefix-legal.jsonl \
 	formal/run_fixture_matrix.sh \
 	formal/README.md

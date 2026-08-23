@@ -194,7 +194,7 @@ already had a token parameter of its own:
          precondition of this specific step, so each row's own claim is
          verified on its own terms rather than only inherited from
          whatever TX_BEGIN_F/ACTIVE_REPLAYED pinned earlier in the same
-         overlay -- see fixtures/red-f-session-stale.jsonl, which is
+         overlay -- see fixtures/red-f-stale-token.jsonl, which is
          mappable (its stale session_serial WAS established, just not by
          the live session) specifically so it reaches this conjunct at TLC
          rather than failing generator mappability like the unknown-serial
@@ -214,8 +214,8 @@ run_fixture_matrix.sh's layer_independence_proof):
     green.jsonl's line 4 F TX_BEGIN session_serial changed 1->2, a serial
     NEVER established anywhere in the trace) -- UNMAPPABLE, so
     lookup_token fails the generator closed before TLC ever runs.
-  fixtures/red-f-session-stale.jsonl (BigOracle's addition: SESSION_OPENED
-    establishes serial 1/Tok0, SESSION_REPLACED establishes serial 9/Tok1
+  fixtures/red-f-stale-token.jsonl (BigOracle's addition: SESSION_OPENED
+    establishes serial 1/Tok0, SESSION_REPLACED establishes serial 5/Tok1
     as the new live session, then a DICT_COMPLETE row claims the now-STALE
     serial 1) -- MAPPABLE (Tok0 really was established), so the generator
     does not fail closed; TLC reaches the DICT_COMPLETE step and deadlocks
