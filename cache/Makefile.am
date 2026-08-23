@@ -112,6 +112,12 @@ EXTRA_DIST = \
 	formal/check_trace.py \
 	formal/trace_to_tla.py \
 	formal/run_trace_refinement.sh \
+	formal/fixtures/green.jsonl \
+	formal/fixtures/red-swap.jsonl \
+	formal/fixtures/red-wrong-tu.jsonl \
+	formal/fixtures/red-unknown-action.jsonl \
+	formal/fixtures/red-duplicate-dict.jsonl \
+	formal/fixtures/prefix-legal.jsonl \
 	formal/README.md
 
 check-local:

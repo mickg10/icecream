@@ -7,6 +7,15 @@
 # cannot map onto the bounded model's constants is a fail-closed nonzero
 # exit before TLC ever runs; any mapped-but-illegal step is a TLC deadlock
 # or invariant violation. Command shape mirrors run_tlc.sh.
+#
+# fixtures/ holds the two-sided evidence this tool was verified against:
+# green.jsonl (the simplest complete legal scenario the model admits) plus
+# red-swap.jsonl, red-wrong-tu.jsonl, red-unknown-action.jsonl, and
+# red-duplicate-dict.jsonl (one illegal mutation each, all TLC-rejected or
+# generator-fail-closed) and prefix-legal.jsonl (a legal prefix, accepted --
+# see trace_to_tla.py's docstring for why a prefix need not reach any
+# particular terminal action). Reproduce with e.g.
+# `./run_trace_refinement.sh fixtures/green.jsonl` (needs TLA2TOOLS_JAR set).
 set -eu
 
 usage() {
