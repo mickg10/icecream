@@ -15,7 +15,10 @@ EXTRA_DIST = README.md \
 	tests/webgui \
 	capability/grouprlz/p29_online_s1.h \
 	capability/grouprlz/runway-census.tsv \
-	capability/distribution/firefox-corrected.compile-trace.tsv
+	capability/distribution/firefox-corrected.compile-trace.tsv \
+	distro_installed_identity.sh \
+	distro_installed_identity_gates.sh \
+	S1B_EXIT_MANIFEST.md
 
 ACLOCAL_AMFLAGS = -I m4
 AM_LIBTOOLFLAGS = --silent

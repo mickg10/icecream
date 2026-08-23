@@ -11,7 +11,7 @@
 # beforehand, so no cross-run or cross-image residue can satisfy the gate.
 #
 # Usage:
-#   distro_installed_identity.sh SRC_DIR WORK_DIR DISTRO [--stale-control]
+#   distro_installed_identity.sh SRC_DIR WORK_DIR DISTRO [--stale-control|--sentinel-control]
 #
 # SRC_DIR    the extracted icecc-1.5.90 dist tree (read-only bind; reusing
 #            the SOURCE across runs is fine, only build/DESTDIR must be
@@ -28,13 +28,35 @@
 #            content check, not something mere file presence would satisfy
 #            -- i.e. omitting the clean step cannot silently pass, because
 #            the check that runs afterward is intolerant of stale content.
+#            This deliberately does NOT exercise the real cleanup line (it
+#            skips configure/build/install entirely) -- see
+#            --sentinel-control below for the check that does.
+# --sentinel-control
+#            KNOWN-CAUGHT CONTROL for the clean step itself. Plants visible
+#            AND hidden (dotfile/dot-directory) sentinel junk into build/
+#            and destdir/, then runs the SAME normal-mode path as a
+#            plain invocation (no branch-around: the real `find ...
+#            -mindepth 1 -delete` cleanup line, the real configure/build/
+#            install) and requires every planted sentinel to be gone
+#            afterward. A plain `rm -rf $dir/*` would silently leave
+#            dotfiles behind (`*` does not match them) and this row would
+#            catch that regression; the companion
+#            distro_installed_identity_gates.sh mutation-tests this
+#            directly by neutering the real cleanup line and confirming
+#            this row goes red.
 set -eu
 
-SRC=${1:?usage: distro_installed_identity.sh SRC_DIR WORK_DIR DISTRO [--stale-control]}
-WORK=${2:?usage: distro_installed_identity.sh SRC_DIR WORK_DIR DISTRO [--stale-control]}
-DISTRO=${3:?usage: distro_installed_identity.sh SRC_DIR WORK_DIR DISTRO [--stale-control]}
+SRC=${1:?usage: distro_installed_identity.sh SRC_DIR WORK_DIR DISTRO [--stale-control|--sentinel-control]}
+WORK=${2:?usage: distro_installed_identity.sh SRC_DIR WORK_DIR DISTRO [--stale-control|--sentinel-control]}
+DISTRO=${3:?usage: distro_installed_identity.sh SRC_DIR WORK_DIR DISTRO [--stale-control|--sentinel-control]}
 MODE=normal
-[ "${4:-}" = "--stale-control" ] && MODE=stale-control
+SENTINEL_CONTROL=false
+case "${4:-}" in
+    --stale-control)    MODE=stale-control ;;
+    --sentinel-control) SENTINEL_CONTROL=true ;;
+    "") ;;
+    *) echo "unknown 4th argument: ${4}" >&2; exit 2 ;;
+esac
 
 SRC=$(CDPATH= cd -- "$SRC" && pwd)
 
@@ -67,9 +89,37 @@ mkdir -p "$WORK"
 WORK=$(CDPATH= cd -- "$WORK" && pwd)
 BUILD="$WORK/build"
 DESTDIR="$WORK/destdir"
-FACTS="$WORK/facts-$MODE.txt"
+# sentinel-control stays MODE=normal (it exercises the real normal path,
+# not a separate branch -- see the header) but must not silently overwrite
+# a plain normal run's evidence files with the same name.
+RUN_SUFFIX="$MODE"
+[ "$SENTINEL_CONTROL" = true ] && RUN_SUFFIX="${MODE}-sentinel"
+FACTS="$WORK/facts-$RUN_SUFFIX.txt"
 : > "$FACTS"
 fact() { printf '%s\t%s\n' "$1" "$2" >> "$FACTS"; }
+# require_exact LABEL ACTUAL EXPECTED -- a gate, not an observation: FAILS
+# the whole run immediately if ACTUAL != EXPECTED. Every per-artifact
+# identity check below goes through this (not just icecc's) so that
+# "recorded as a fact but never actually asserted" cannot happen again for
+# iceccd/icecc-scheduler/icecc.pc the way it did before this successor.
+require_exact() {
+    label=$1 actual=$2 expected=$3
+    if [ "$actual" != "$expected" ]; then
+        echo "FAIL: $DISTRO $label expected exactly '$expected', got '$actual'" >&2
+        exit 1
+    fi
+}
+# require_present LABEL VALUE -- FAILS if VALUE is the ABSENT sentinel
+# fact() records for a missing file. Presence alone is weaker than
+# require_exact but is what libicecc.a (a static archive with no embedded
+# version string to assert against) has to be judged on.
+require_present() {
+    label=$1 value=$2
+    if [ "$value" = "ABSENT" ]; then
+        echo "FAIL: $DISTRO $label is ABSENT (expected to exist and hash successfully)" >&2
+        exit 1
+    fi
+}
 
 case "$DISTRO" in
     ubuntu22)
@@ -101,6 +151,26 @@ fact mode "$MODE"
 fact image_tag "$IMAGE"
 IMAGE_DIGEST=$(docker image inspect "$IMAGE" --format '{{index .RepoDigests 0}}' 2>/dev/null || echo "UNRESOLVED")
 fact image_digest "$IMAGE_DIGEST"
+if [ "$IMAGE_DIGEST" = "UNRESOLVED" ]; then
+    echo "FAIL: $DISTRO image digest did not resolve (docker image inspect returned no RepoDigest for $IMAGE) -- an unresolved digest is a gate failure, not an accepted observation" >&2
+    exit 1
+fi
+
+if [ "$SENTINEL_CONTROL" = true ]; then
+    # Plant visible AND hidden junk into build/ and destdir/ BEFORE the real
+    # cleanup line runs (see below). Both dirs must exist for this, but
+    # need not come from a prior run -- planting into freshly-mkdir'd dirs
+    # exercises the exact same property (pre-existing content, however it
+    # got there, must not survive the real clean step).
+    mkdir -p "$BUILD" "$DESTDIR"
+    for d in "$BUILD" "$DESTDIR"; do
+        : > "$d/stale-visible-file"
+        : > "$d/.stale-hidden-file"
+        mkdir -p "$d/.stale-hidden-dir"
+        : > "$d/.stale-hidden-dir/nested-stale"
+    done
+    fact sentinel_planted "stale-visible-file, .stale-hidden-file, .stale-hidden-dir/nested-stale (both build/ and destdir/)"
+fi
 
 if [ "$MODE" = normal ]; then
     # Fresh-by-construction: unconditional wipe, inside the SAME container
@@ -111,7 +181,18 @@ if [ "$MODE" = normal ]; then
     mkdir -p "$BUILD" "$DESTDIR"
     docker run --rm -v "$SRC:/src:ro" -v "$BUILD:/build" -v "$DESTDIR:/destdir" -u 0:0 "$IMAGE" bash -c "
         set -e
-        rm -rf /build/* /destdir/*
+        # -mindepth 1 -delete on each EXPLICIT, validated mount target
+        # (never a derived/guessed path) -- NOT 'rm -rf /build/* /destdir/*',
+        # which is a shell glob and silently skips dotfiles/dot-directories
+        # (a bare '*' does not match names starting with '.' unless dotglob
+        # is set, which it is not here). A stale .deps/, a hidden leftover
+        # object, or any other dotfile survives 'rm -rf DIR/*' untouched --
+        # exactly the false-green LO's planted hidden sentinels caught.
+        # --sentinel-control (see the script header) proves this line
+        # actually removes hidden content, and the companion
+        # distro_installed_identity_gates.sh mutation-tests this exact line.
+        find /build -mindepth 1 -delete
+        find /destdir -mindepth 1 -delete
         $DEP_INSTALL
         cd /build
         /src/configure --without-man > configure.log 2>&1; echo CONFIGURE-EXIT=\$?
@@ -132,16 +213,41 @@ if [ "$MODE" = normal ]; then
         # This is the exact same single-invocation lesson the u24 --rm build
         # hiccup taught, recurring one step later in the pipeline.
         /destdir/usr/local/bin/icecc --version > icecc-version-output.txt 2>&1 || true
-        strings /destdir/usr/local/sbin/iceccd 2>/dev/null | grep -F 'ICECREAM daemon' | head -1 > iceccd-version-probe.txt || true
-        /destdir/usr/local/sbin/icecc-scheduler --version 2>&1 | grep -F 'ICECREAM scheduler' > scheduler-version-probe.txt || true
-    " 2>&1 | tee "$WORK/container-run-$MODE.log"
-    cp "$WORK/container-run-$MODE.log" "$WORK/container-run.log" 2>/dev/null || true
+        # -oE against an anchored version pattern, not -F against the whole
+        # line -- a clean, exact 'ICECREAM daemon X.Y.Z' string to assert
+        # against, not whatever else happens to share that line.
+        strings /destdir/usr/local/sbin/iceccd 2>/dev/null | grep -oE 'ICECREAM daemon [0-9]+\.[0-9]+\.[0-9]+' | head -1 > iceccd-version-probe.txt || true
+        /destdir/usr/local/sbin/icecc-scheduler --version 2>&1 | grep -oE 'ICECREAM scheduler [0-9]+\.[0-9]+\.[0-9]+' | head -1 > scheduler-version-probe.txt || true
+    " 2>&1 | tee "$WORK/container-run-$RUN_SUFFIX.log"
+    cp "$WORK/container-run-$RUN_SUFFIX.log" "$WORK/container-run.log" 2>/dev/null || true
 
     for stage in CONFIGURE SERVICES CACHE DAEMON SCHEDULER CLIENT INSTALL; do
-        rc=$(grep -oE "^${stage}-EXIT=[0-9]+" "$WORK/container-run-$MODE.log" | tail -1 | cut -d= -f2)
+        rc=$(grep -oE "^${stage}-EXIT=[0-9]+" "$WORK/container-run-$RUN_SUFFIX.log" | tail -1 | cut -d= -f2)
         fact "${stage}_exit" "${rc:-MISSING}"
         [ "${rc:-1}" = "0" ] || { echo "FAIL: $DISTRO $stage-EXIT=$rc (expected 0)" >&2; exit 1; }
     done
+
+    if [ "$SENTINEL_CONTROL" = true ]; then
+        # Prove the real cleanup line actually removed every planted
+        # sentinel -- not "no *new* sentinel-named file happens to exist"
+        # but "none of the specific paths planted before this run survived
+        # it", checked against the SAME build/ and destdir/ the real
+        # configure/build/install just ran against (fresh-by-construction
+        # already implies these ran in one continuous container invocation
+        # with the cleanup line first).
+        survivors=""
+        for d in "$BUILD" "$DESTDIR"; do
+            for rel in stale-visible-file .stale-hidden-file .stale-hidden-dir .stale-hidden-dir/nested-stale; do
+                [ -e "$d/$rel" ] && survivors="$survivors $d/$rel"
+            done
+        done
+        if [ -n "$survivors" ]; then
+            fact sentinel_survivors "$survivors"
+            echo "FAIL: $DISTRO sentinel-control: the following planted sentinels survived the real cleanup step:$survivors" >&2
+            exit 1
+        fi
+        fact sentinel_survivors "none (all planted visible+hidden sentinels correctly removed by the real cleanup line)"
+    fi
 elif [ "$MODE" = stale-control ]; then
     [ -d "$DESTDIR/usr/local/bin" ] || {
         echo "distro_installed_identity.sh: --stale-control needs a prior normal run's DESTDIR to reuse (none found at $DESTDIR); run without --stale-control first" >&2
@@ -183,22 +289,32 @@ fi
 
 if [ "$MODE" = normal ]; then
     # -- the rest of the installed-identity evidence (normal mode only;
-    # the control mode's whole point is the one check above) --
+    # the control mode's whole point is the one check above). Every one of
+    # these is a GATE (require_exact/require_present -> exit 1 on
+    # mismatch), not merely a recorded observation: LO's finding was that
+    # only installed_icecc_version_output was ever actually asserted here,
+    # while iceccd/icecc-scheduler/libicecc.a/icecc.pc could show ABSENT or
+    # arbitrary text and the run would still report PASS.
     for rel in usr/local/sbin/iceccd usr/local/sbin/icecc-scheduler usr/local/lib/libicecc.a usr/local/lib/pkgconfig/icecc.pc; do
         key=$(printf '%s' "$rel" | tr '/.' '__')
         path="$DESTDIR/$rel"
         if [ -f "$path" ]; then
-            fact "installed_${key}_sha256" "$(sha256sum "$path" | awk '{print $1}')"
+            sha="$(sha256sum "$path" | awk '{print $1}')"
         else
-            fact "installed_${key}_sha256" "ABSENT"
+            sha="ABSENT"
         fi
+        fact "installed_${key}_sha256" "$sha"
+        require_present "installed_${key}_sha256" "$sha"
     done
     ICECCD_PROBE=$(cat "$BUILD/iceccd-version-probe.txt" 2>/dev/null || echo "MISSING: iceccd-version-probe.txt not produced")
     fact installed_iceccd_version_probe "$ICECCD_PROBE"
+    require_exact installed_iceccd_version_probe "$ICECCD_PROBE" "ICECREAM daemon 1.5.90"
     SCHED_PROBE=$(cat "$BUILD/scheduler-version-probe.txt" 2>/dev/null || echo "MISSING: scheduler-version-probe.txt not produced")
     fact installed_scheduler_version_probe "$SCHED_PROBE"
+    require_exact installed_scheduler_version_probe "$SCHED_PROBE" "ICECREAM scheduler 1.5.90"
     PC_VERSION_LINE=$(grep "^Version:" "$DESTDIR/usr/local/lib/pkgconfig/icecc.pc" 2>/dev/null || echo "ABSENT")
     fact installed_icecc_pc_version_line "$PC_VERSION_LINE"
+    require_exact installed_icecc_pc_version_line "$PC_VERSION_LINE" "Version: 1.5.90"
 
     for log in configure services cache daemon scheduler client install; do
         f="$BUILD/$log.log"
