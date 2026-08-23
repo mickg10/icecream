@@ -380,6 +380,22 @@ static bool request_job(MsgChannel *submitter, uint32_t client_id,
     return submitter->send_msg(request);
 }
 
+/* Forces pick_server's early "user wants to test/prefer one specific
+   daemon" path (scheduler.cpp): CompileServer::matches() accepts either the
+   Login nodename or the numeric peer address, so the nodename passed to
+   login_host works here. */
+static bool request_job_preferring(MsgChannel *submitter, uint32_t client_id,
+                                   const std::string &preferred_host)
+{
+    GetCSMsg request(
+        Environments { std::make_pair(std::string("x86_64"),
+                                      std::string("p49-test-env")) },
+        "p49-test.cpp", CompileJob::Lang_CXX, 1, "x86_64", 0,
+        preferred_host, 0, 0, 0);
+    request.client_id = client_id;
+    return submitter->send_msg(request);
+}
+
 static bool file_contains(const std::string &path, const std::string &needle)
 {
     std::ifstream input(path);
@@ -1107,20 +1123,18 @@ static void run_cache_advertisement(const std::string &binary,
         wait_type(submitter, Msg::USE_CS, 3000));
     REQUIRE(use && use->port == static_cast<uint32_t>(worker_port),
             "advertisement leaves ordinary UseCS selection unchanged");
-    /* S2: the assignment-bound S->C cache-endpoint handoff.  The scheduler
-       fills this ONLY after use->port above (the ordinary selection) is
-       already decided; it must faithfully mirror the worker's retained,
-       valid Login snapshot -- see project_cache_handoff in scheduler.cpp.
-       use->hostname (the pre-existing compile-endpoint host, unchanged by
-       S2) is the loopback numeric peer address, not the Login nodename --
-       already exercised by the pre-existing UseCS tests above, so it is
-       not re-checked here. */
-    REQUIRE(use && use->hasCacheAdvertisement()
-                && use->cache_endpoint_port == static_cast<uint32_t>(cache_port)
-                && use->cache_protocol == CACHE_WIRE_PROTOCOL_V1
-                && use->cache_profile_mask == CACHE_PROFILE_ZSTD_TU,
-            "S2: a valid retained cache snapshot projects faithfully into "
-            "the assignment-bound UseCS handoff tail");
+    /* S2: this scheduler runs in the DEFAULT (Legacy) fence mode, so this
+       job's assignment identity is never set (epoch/nonce stay 0 -- see
+       ASSIGNMENT_LEGACY in scheduler.cpp).  BigOracle steer: a present
+       cache triple additionally requires that complete nonzero identity,
+       so even a perfectly valid, faithfully-retained worker snapshot must
+       still project wholly absent here.  The genuinely-bound case (a mode
+       that DOES assign identity) is covered by
+       run_cache_handoff_identity_bound below. */
+    REQUIRE(use && !use->hasCacheAdvertisement()
+                && use->cache_protocol == 0 && use->cache_profile_mask == 0,
+            "S2: LEGACY fence mode projects a wholly-absent cache-handoff "
+            "tail even when the selected F's retained snapshot is valid");
     pollfd cache_probe { cache_sentinel, POLLIN, 0 };
     REQUIRE(poll(&cache_probe, 1, 300) == 0,
             "scheduler and submitter never connect to the inert cache endpoint");
@@ -1149,23 +1163,13 @@ static void run_cache_advertisement(const std::string &binary,
     REQUIRE(worker_line.find("cache=off") != std::string::npos
                 && worker_line.find("cache_wire=") == std::string::npos,
             "replacement Login atomically publishes cache absence");
-
-    REQUIRE(submitter && request_job(submitter, 5002),
-            "second assignment requested after the worker replaced its "
-            "advertisement with absence");
-    UseCSMsg *use_after_absence = dynamic_cast<UseCSMsg *>(
-        wait_type(submitter, Msg::USE_CS, 3000));
-    REQUIRE(use_after_absence && !use_after_absence->hasCacheAdvertisement()
-                && use_after_absence->cache_protocol == 0
-                && use_after_absence->cache_profile_mask == 0,
-            "S2: the handoff tail tracks the CURRENT retained snapshot, not "
-            "a value cached from the worker's first Login");
-    if (use_after_absence) {
-        worker->send_msg(JobBeginMsg(use_after_absence->job_id, 0));
-        worker->send_msg(JobDoneMsg(use_after_absence->job_id, 0,
-                                    JobDoneMsg::FROM_SERVER));
-    }
-    delete use_after_absence;
+    /* The identity-bound staleness/tracking proof (does a later UseCS ever
+       reuse a value cached from an earlier Login rather than the CURRENT
+       retained snapshot?) needs a mode that actually assigns identity --
+       under this function's Legacy mode every UseCS projects absent
+       regardless of the worker's snapshot, so a before/after comparison
+       here would be confounded and prove nothing.  See
+       run_cache_handoff_identity_bound below. */
 
     delete submitter;
     delete worker;
@@ -1179,6 +1183,138 @@ static void run_cache_advertisement(const std::string &binary,
     if (worker_listener >= 0) close(worker_listener);
     REQUIRE(stop_scheduler(scheduler),
             "cache-advertisement scheduler stopped cleanly");
+}
+
+/* BigOracle steer: the Legacy-mode run_cache_advertisement above cannot
+   prove a present cache triple projects faithfully -- under Legacy every
+   UseCS is absent regardless of the worker's snapshot (see the assertion
+   there).  Advisory mode DOES assign a complete identity before dispatch
+   (immediately, without READY-gating -- see run_advisory), so it is used
+   here to prove, with two DISTINCT candidate F's:
+     (b) a present triple requires the complete identity AND actually
+         happens once that identity exists;
+     (c) post-selection binding -- forcing selection of F_B carries B's
+         snapshot, never A's, distractor-A notwithstanding;
+     (c cont'd/d) swapping which port each F advertises never changes WHICH
+         worker gets selected (advertisement content is not selection
+         input), and the handoff tail tracks F_B's CURRENT snapshot after
+         the swap, not a value cached from its first Login. */
+static void run_cache_handoff_identity_bound(const std::string &binary,
+                                             const std::string &directory)
+{
+    const int port = reserve_port_pair();
+    const std::string log = directory + "/cache-handoff-identity-bound.log";
+    pid_t scheduler = start_scheduler(binary, port, "advisory", log, 16, 16);
+    REQUIRE(port != 0 && scheduler > 0,
+            "identity-bound cache-handoff scheduler process launched");
+
+    int worker_a_port = 0;
+    int worker_a_listener = bind_port(0, &worker_a_port);
+    if (worker_a_listener >= 0) listen(worker_a_listener, 16);
+    int cache_a_port = 0;
+    int cache_a_sentinel = bind_port(0, &cache_a_port);
+    if (cache_a_sentinel >= 0) listen(cache_a_sentinel, 4);
+
+    int worker_b_port = 0;
+    int worker_b_listener = bind_port(0, &worker_b_port);
+    if (worker_b_listener >= 0) listen(worker_b_listener, 16);
+    int cache_b_port = 0;
+    int cache_b_sentinel = bind_port(0, &cache_b_port);
+    if (cache_b_sentinel >= 0) listen(cache_b_sentinel, 4);
+
+    ConfCSMsg *a_conf = nullptr;
+    MsgChannel *worker_a = login_host(
+        port, "cache-bound-a", true, worker_a_port, &a_conf,
+        nullptr, 1, 0, static_cast<uint32_t>(cache_a_port),
+        CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_ZSTD_TU);
+    REQUIRE(worker_a && a_conf && a_conf->fence_mode == ConfCSMsg::Advisory,
+            "distractor candidate F_A logs in with its own valid cache advertisement");
+    delete a_conf;
+
+    ConfCSMsg *b_conf = nullptr;
+    MsgChannel *worker_b = login_host(
+        port, "cache-bound-b", true, worker_b_port, &b_conf,
+        nullptr, 1, 0, static_cast<uint32_t>(cache_b_port),
+        CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_ZSTD_TU);
+    REQUIRE(worker_b && b_conf && b_conf->fence_mode == ConfCSMsg::Advisory,
+            "candidate F_B logs in with its own DIFFERENT valid cache advertisement");
+    delete b_conf;
+
+    ConfCSMsg *submitter_conf = nullptr;
+    MsgChannel *submitter = login_host(port, "cache-bound-submit", false, 0,
+                                       &submitter_conf);
+    delete submitter_conf;
+
+    REQUIRE(submitter && request_job_preferring(submitter, 6001, "cache-bound-b"),
+            "assignment forced to F_B requested");
+    delete wait_type(worker_b, Msg::ASSIGN_PREPARE, 3000);
+    UseCSMsg *use_b = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 3000));
+    REQUIRE(use_b && use_b->port == static_cast<uint32_t>(worker_b_port),
+            "S2: forced selection actually picked F_B, not F_A");
+    REQUIRE(use_b && use_b->hasAssignmentIdentity(),
+            "S2: Advisory mode assigns a complete identity before dispatch");
+    REQUIRE(use_b && use_b->cache_endpoint_port == static_cast<uint32_t>(cache_b_port)
+                && use_b->cache_protocol == CACHE_WIRE_PROTOCOL_V1
+                && use_b->cache_profile_mask == CACHE_PROFILE_ZSTD_TU,
+            "S2: with a complete identity, the handoff tail faithfully "
+            "carries the SELECTED F's (B's) snapshot, never A's");
+    if (use_b) {
+        worker_b->send_msg(JobBeginMsg(use_b->job_id, 0));
+        worker_b->send_msg(JobDoneMsg(use_b->job_id, 0, JobDoneMsg::FROM_SERVER));
+    }
+    delete use_b;
+
+    LoginMsg a_swapped(static_cast<uint32_t>(worker_a_port), "cache-bound-a",
+                       "x86_64", 0);
+    a_swapped.envs.push_back(std::make_pair(std::string("x86_64"),
+                                            std::string("p49-test-env")));
+    a_swapped.max_kids = 1;
+    a_swapped.chroot_possible = true;
+    a_swapped.setCacheAdvertisement(static_cast<uint32_t>(cache_b_port),
+                                    CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_ZSTD_TU);
+    REQUIRE(worker_a && worker_a->send_msg(a_swapped),
+            "F_A relogins advertising F_B's old cache port");
+    delete wait_type(worker_a, Msg::CS_CONF, 3000);
+
+    LoginMsg b_swapped(static_cast<uint32_t>(worker_b_port), "cache-bound-b",
+                       "x86_64", 0);
+    b_swapped.envs.push_back(std::make_pair(std::string("x86_64"),
+                                            std::string("p49-test-env")));
+    b_swapped.max_kids = 1;
+    b_swapped.chroot_possible = true;
+    b_swapped.setCacheAdvertisement(static_cast<uint32_t>(cache_a_port),
+                                    CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_ZSTD_TU);
+    REQUIRE(worker_b && worker_b->send_msg(b_swapped),
+            "F_B relogins advertising F_A's old cache port");
+    delete wait_type(worker_b, Msg::CS_CONF, 3000);
+
+    REQUIRE(submitter && request_job_preferring(submitter, 6002, "cache-bound-b"),
+            "second assignment forced to F_B requested after the swap");
+    delete wait_type(worker_b, Msg::ASSIGN_PREPARE, 3000);
+    UseCSMsg *use_b2 = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 3000));
+    REQUIRE(use_b2 && use_b2->port == static_cast<uint32_t>(worker_b_port),
+            "S2: swapping advertisements never changes WHICH worker is selected");
+    REQUIRE(use_b2 && use_b2->cache_endpoint_port == static_cast<uint32_t>(cache_a_port)
+                && use_b2->cache_endpoint_port != static_cast<uint32_t>(cache_b_port),
+            "S2: the handoff tail tracks B's CURRENT (just-swapped) snapshot, "
+            "not a value cached from B's first Login");
+    if (use_b2) {
+        worker_b->send_msg(JobBeginMsg(use_b2->job_id, 0));
+        worker_b->send_msg(JobDoneMsg(use_b2->job_id, 0, JobDoneMsg::FROM_SERVER));
+    }
+    delete use_b2;
+
+    delete submitter;
+    delete worker_a;
+    delete worker_b;
+    if (worker_a_listener >= 0) close(worker_a_listener);
+    if (worker_b_listener >= 0) close(worker_b_listener);
+    if (cache_a_sentinel >= 0) close(cache_a_sentinel);
+    if (cache_b_sentinel >= 0) close(cache_b_sentinel);
+    REQUIRE(stop_scheduler(scheduler),
+            "identity-bound cache-handoff scheduler stopped cleanly");
 }
 
 static void run_cache_handoff_below_p50(const std::string &binary,
@@ -1316,6 +1452,7 @@ int main(int argc, char **argv)
     run_strict_nonce(argv[1], directory);
     run_disabled(argv[1], directory);
     run_cache_advertisement(argv[1], directory);
+    run_cache_handoff_identity_bound(argv[1], directory);
     run_cache_handoff_below_p50(argv[1], directory);
     run_old_peer(argv[1], directory);
     std::fprintf(stderr, "%s: %d failure(s)\n",
