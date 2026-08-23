@@ -110,6 +110,8 @@ EXTRA_DIST = \
 	formal/run_tlc.sh \
 	formal/.gitignore \
 	formal/check_trace.py \
+	formal/trace_to_tla.py \
+	formal/run_trace_refinement.sh \
 	formal/README.md
 
 check-local:
