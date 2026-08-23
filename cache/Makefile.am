@@ -117,7 +117,9 @@ EXTRA_DIST = \
 	formal/fixtures/red-wrong-tu.jsonl \
 	formal/fixtures/red-unknown-action.jsonl \
 	formal/fixtures/red-duplicate-dict.jsonl \
+	formal/fixtures/red-c-cursor.jsonl \
 	formal/fixtures/prefix-legal.jsonl \
+	formal/run_fixture_matrix.sh \
 	formal/README.md
 
 check-local:

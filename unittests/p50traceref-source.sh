@@ -12,6 +12,13 @@
 # generated .cfg must keep CHECK_DEADLOCK TRUE -- without it, a trace that
 # gets stuck partway through (the exact failure mode the RED tests exist to
 # catch) would silently report success instead of a TLC deadlock.
+#
+# Also anchors the local-oracle HOLD fix on c384cc53 (a real false-green:
+# the driver accepted a trace whose C TX_BEGIN declared the wrong
+# rel_seq/nonce, because C_TX_BEGIN takes no cursor parameters and the
+# generator wasn't otherwise binding them) -- both the mandatory Level-1
+# gate in the driver and the cursor-binding predicate in the generator must
+# stay present.
 set -eu
 
 src=${ICECC_TEST_TOP_SRCDIR:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
@@ -103,5 +110,14 @@ require_count 1 'tlc2.TLC' "$DRIVER" \
     'the driver invokes the real TLC main class'
 require_count 1 'Model checking completed. No error' "$DRIVER" \
     'the driver only accepts TLC'"'"'s own no-error completion marker'
+
+# local-oracle HOLD fix anchors (c384cc53 false-green): the mandatory
+# Level-1 gate the driver runs before generation/TLC, and the cursor-bind
+# predicate on the one CASE arm (TX_BEGIN_C) whose Protocol50.tla action
+# signature has no cursor parameters of its own to check against.
+require_count 1 '"$PYTHON" "$SCRIPT_DIR/check_trace.py" "$TRACE_ABS_EARLY"' "$DRIVER" \
+    'the driver runs check_trace.py (Level 1) before trace_to_tla.py/TLC (Level 2)'
+require_count 1 '[] r.kind = "TX_BEGIN_C"           -> s.cNonce = r.n /\\ s.cRel = r.rel /\\ C_TX_BEGIN(r.f, r.t, r.d)' "$GEN" \
+    'TX_BEGIN_C binds the record'"'"'s declared cursor before calling C_TX_BEGIN'
 
 echo 'PASS: trace-refinement generator keeps its fail-closed branches and deadlock gate'

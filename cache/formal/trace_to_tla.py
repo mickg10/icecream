@@ -76,6 +76,53 @@ faithfully translate into the bounded universe. A trace this tool accepts
 but the model rejects should fail through run_trace_refinement.sh (TLC
 reports a deadlock or invariant violation, not this generator).
 
+Field-binding audit per StepMatchesRecord arm (local-oracle HOLD on
+c384cc53: the original TX_BEGIN_C arm called C_TX_BEGIN(r.f, r.t, r.d) and
+silently dropped r.n/r.rel -- C_TX_BEGIN takes no nonce/rel parameters at
+all, it reads the model's OWN current s.cNonce/s.cRel internally, so a
+record that declared the wrong cursor was accepted anyway as long as the
+model's REAL cursor happened to allow some C_TX_BEGIN transition. Every
+other arm passes a full Op(r.f, r.n, r.rel, r.t, r.d) (or, for
+session/reset actions, has no cursor to bind at all), and TLA's own
+precondition then checks that op for EQUALITY against internal state
+(s.cActiveOp, s.pendingOp, s.lastCommitOp[f], ...) -- so those arms were
+never exposed to this bug; TX_BEGIN_C was the one arm that took a
+cursor-free signature and needed an explicit extra bind):
+
+  SESSION_OPENED/REPLACED/DISCONNECTED(r.f, r.tok)
+      -- no cursor parameters exist on these actions in Protocol50.tla at
+         all (session identity is f+tok only); nothing to bind.
+  HISTORY_RESET(r.f, r.tok)
+      -- likewise cursor-free by construction: it *establishes* the new
+         nonce (nextNonce == 1 - nonce[f]) rather than checking one, so
+         there is no caller-supplied nonce/rel for it to be bound against.
+  TX_BEGIN_C: s.cNonce = r.n /\\ s.cRel = r.rel /\\ C_TX_BEGIN(r.f, r.t, r.d)
+      -- FIXED here: the two extra conjuncts pin the model's pre-state
+         cursor to the record's declared (nonce, rel_seq) before
+         C_TX_BEGIN's own logic runs, so a record that lies about its
+         cursor now has no successor state (TLC deadlock) instead of
+         silently reusing whatever cursor the model happened to be at.
+  TX_BEGIN_F / ACTIVE_REPLAYED: F_TX_BEGIN(Op(r.f, r.n, r.rel, r.t, r.d))
+      -- fully bound: F_TX_BEGIN's precondition requires
+         OpNonce(op) = s.nonce[f] and OpRel(op) = s.fRel[f], i.e. it
+         directly checks the record's declared nonce/rel against state.
+  TX_ABORTED(Op(...))
+      -- fully bound: precondition requires op = s.cActiveOp exactly, and
+         s.cActiveOp's own nonce/rel were pinned by the (now-fixed)
+         TX_BEGIN_C arm that set it, so this equality is meaningful.
+  DICT_COMPLETE / NEED_RECORDED / BODY_COMPLETE / OBJECT_APPLIED /
+  INPUT_MATERIALIZED(Op(...))
+      -- fully bound: each requires op = s.pendingOp exactly, and
+         s.pendingOp's nonce/rel were pinned by the (fully-bound)
+         TX_BEGIN_F/ACTIVE_REPLAYED arm that set it.
+  INPUT_COMMITTED(Op(...))
+      -- fully bound: the single explicit parameter is required to equal
+         s.pendingOp (via callbackOp = current, MutantIgnoreTxDigest is
+         FALSE in every generated .cfg so the alternate branch is dead).
+  COMMIT_ACCEPTED / LOST_COMMIT_ACCEPTED(r.f, r.tok, Op(...))
+      -- fully bound: precondition requires op = s.cActiveOp AND
+         op = s.lastCommitOp[f] exactly.
+
 State_digest is intentionally not required or used here: it is a
 check_trace.py-only hash-chain consistency tag layered on top of the
 (nonce, rel_seq) cursor pair that check_trace.py already validates;
@@ -542,7 +589,7 @@ StepMatchesRecord(k) ==
          [] r.kind = "SESSION_REPLACED"     -> SESSION_REPLACED(r.f, r.tok)
          [] r.kind = "SESSION_DISCONNECTED" -> SESSION_DISCONNECTED(r.f, r.tok)
          [] r.kind = "HISTORY_RESET"        -> HISTORY_RESET(r.f, r.tok)
-         [] r.kind = "TX_BEGIN_C"           -> C_TX_BEGIN(r.f, r.t, r.d)
+         [] r.kind = "TX_BEGIN_C"           -> s.cNonce = r.n /\\ s.cRel = r.rel /\\ C_TX_BEGIN(r.f, r.t, r.d)
          [] r.kind = "TX_BEGIN_F"           -> F_TX_BEGIN(Op(r.f, r.n, r.rel, r.t, r.d))
          [] r.kind = "ACTIVE_REPLAYED"      -> ACTIVE_REPLAYED(Op(r.f, r.n, r.rel, r.t, r.d))
          [] r.kind = "TX_ABORTED"           -> TX_ABORTED(Op(r.f, r.n, r.rel, r.t, r.d))

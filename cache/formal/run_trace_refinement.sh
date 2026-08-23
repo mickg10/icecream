@@ -10,12 +10,28 @@
 #
 # fixtures/ holds the two-sided evidence this tool was verified against:
 # green.jsonl (the simplest complete legal scenario the model admits) plus
-# red-swap.jsonl, red-wrong-tu.jsonl, red-unknown-action.jsonl, and
-# red-duplicate-dict.jsonl (one illegal mutation each, all TLC-rejected or
-# generator-fail-closed) and prefix-legal.jsonl (a legal prefix, accepted --
-# see trace_to_tla.py's docstring for why a prefix need not reach any
-# particular terminal action). Reproduce with e.g.
-# `./run_trace_refinement.sh fixtures/green.jsonl` (needs TLA2TOOLS_JAR set).
+# red-swap.jsonl, red-wrong-tu.jsonl, red-unknown-action.jsonl,
+# red-duplicate-dict.jsonl, and red-c-cursor.jsonl (one illegal mutation
+# each, all TLC-rejected or generator-fail-closed) and prefix-legal.jsonl
+# (a legal prefix, accepted -- see trace_to_tla.py's docstring for why a
+# prefix need not reach any particular terminal action). Reproduce with
+# e.g. `./run_trace_refinement.sh fixtures/green.jsonl` (needs
+# TLA2TOOLS_JAR set).
+#
+# MANDATORY LEVEL-1 GATE (plan v11; local-oracle HOLD on c384cc53): every
+# run first replays the trace through check_trace.py's own ordering rules
+# and fails closed on any Level-1 rejection, before trace_to_tla.py or TLC
+# ever run. This is not optional and has no bypass flag -- Level-2 (TLC
+# replay) checks that the trace is an actual Protocol50.tla behavior once
+# mapped onto the bounded model's constants, but per-record cursor fields
+# that a Protocol50.tla action does not take as an explicit parameter (the
+# clearest example being C_TX_BEGIN's nonce/rel_seq, which the model reads
+# from its own current state rather than checking against the caller) can
+# only be caught by re-deriving what check_trace.py already tracks. See
+# trace_to_tla.py's module docstring for the full per-arm field-binding
+# audit of which cursor fields Level-2 now binds explicitly and which
+# arms don't need to (because their signature already forces the
+# equality check).
 set -eu
 
 usage() {
@@ -27,17 +43,25 @@ usage() {
 TRACE=$1
 [ -f "$TRACE" ] || { echo "run_trace_refinement.sh: no such file: $TRACE" >&2; exit 2; }
 
+PYTHON=${PYTHON:-python3}
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+TRACE_ABS_EARLY=$(CDPATH= cd -- "$(dirname -- "$TRACE")" && pwd)/$(basename -- "$TRACE")
+
+echo "== check_trace.py (Level 1): $TRACE_ABS_EARLY =="
+if ! "$PYTHON" "$SCRIPT_DIR/check_trace.py" "$TRACE_ABS_EARLY"; then
+    echo "run_trace_refinement.sh: check_trace.py (Level 1) rejected $TRACE_ABS_EARLY -- Level 2 (trace_to_tla.py/TLC) did not run" >&2
+    exit 1
+fi
+
 : "${TLA2TOOLS_JAR:?set TLA2TOOLS_JAR to tla2tools.jar}"
 case "$TLA2TOOLS_JAR" in
     /*) ;;
     *) TLA2TOOLS_JAR=$(CDPATH= cd -- "$(dirname -- "$TLA2TOOLS_JAR")" && pwd)/$(basename -- "$TLA2TOOLS_JAR") ;;
 esac
-PYTHON=${PYTHON:-python3}
 TLC_WORKERS=${TLC_WORKERS:-1}
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 TLC_MAIN="java -cp $TLA2TOOLS_JAR tlc2.TLC -workers $TLC_WORKERS"
 
-TRACE_ABS=$(CDPATH= cd -- "$(dirname -- "$TRACE")" && pwd)/$(basename -- "$TRACE")
+TRACE_ABS=$TRACE_ABS_EARLY
 TRACE_BASE=$(basename -- "$TRACE_ABS")
 TRACE_STEM=${TRACE_BASE%.*}
 
