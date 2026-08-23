@@ -96,13 +96,8 @@ manifest; and the role's own binary reports the expected version string
 when actually executed inside the pinned image. Any failure raises with a
 precise, named reason and nothing is stopped or started.
 
-`resolve_role(host, binary_set, role)` is what `up()` and `run_client()`
-actually call (`up()` twice -- scheduler role, then once per worker in the
-loop; `run_client()` once, for the client role) -- verified by an
-AST-based test in `artifact_selection_test.sh` that counts the call sites
-exactly, so a partial removal (one role's gate deleted, others left intact)
-is still caught. `resolve_role()` calls `preflight()` and, on success, logs
-a `PREFLIGHT-OK host=... role=... set=...` line (both to stdout and to a
+`resolve_role()` calls `preflight()` and, on success, logs a
+`PREFLIGHT-OK host=... role=... set=...` line (both to stdout and to a
 hub-side launch log) before returning the resolved `/work` bind-source and
 a **digest-pinned** `repo@sha256:...` image reference for the actual
 `docker run` (not the mutable tag -- the tag stays only as the bootstrap
@@ -113,6 +108,48 @@ set's root is absent (or wrong) on a host and `distribute` was never run
 there, preflight refuses with a message naming the exact problem and
 suggesting the `distribute` command to fix it -- that refusal, not a
 silent auto-fetch, is the fail-closed behavior the spec requires.
+
+### Preflight atomicity: resolve the COMPLETE plan before mutating ANYTHING
+
+Both oracles held the mechanism above on one remaining gap: `resolve_role()`
+being fail-closed per-role was not enough on its own, because `up()` used to
+resolve the scheduler role and immediately launch it, then resolve+launch
+each worker in the same loop -- a bad SECOND worker was only discovered
+after the scheduler and first worker were already torn down and started for
+real. `resolve_launch_plan(worker_hosts, binary_set_s, binary_set_f,
+client_host, binary_set_c)` closes this: it resolves S, then every F host
+(in order), then C (only when a client is actually going to be used), all in
+one pass, and returns a `LaunchPlan` object -- `up()` and `run_client()` no
+longer call `resolve_role()` at all; they only ever consume a plan this
+function already validated in full. `main()` calls
+`resolve_launch_plan()` once, before `up()`/`run_client()`/any mutating
+primitive; only if it returns normally does a `down_needed` flag flip True,
+and `main()`'s `finally` block now checks that flag -- a plan-validation
+refusal never calls `down()` at all (previously, `main()`'s unconditional
+`finally` fired four `docker rm -f` calls even when the very first preflight
+refused, which could disturb a pre-existing, unrelated, exact-name running
+cluster while simply declining to start a new one).
+
+`up()`'s own docker/scratch mutations are factored into three named,
+individually monkeypatchable primitives -- `docker_rm()`, a new
+`docker_run_detached()` (the one `docker run -d --name ...` call site), and
+a new `scratch_prepare()` (the one scratch mkdir/chmod/rm-log call site) --
+alongside the pre-existing `push_file()`. `artifact_selection_test.sh` has
+a no-network gate group that monkeypatches exactly these four functions
+(plus `preflight()` itself, to inject a controlled refusal for one chosen
+host/role without touching the network at all, and `sh()`, hard-failed if
+ever called, as a belt-and-suspenders check that `up()`/`run_client()` are
+truly never reached) and drives `farm.main()` itself -- the real CLI entry
+point -- through four scenarios: an invalid initial S, an invalid second F
+(of three, with a third F never even attempted), an invalid C (after S and
+every F resolved cleanly), and BO's variant where the FINAL F (of three)
+fails after all the others already resolved. Every scenario asserts the
+recorded mutating-action list is empty. The static AST call-count check
+(now `resolve_launch_plan():3`, `up():0`, `run_client():0`) is kept as a
+secondary, source-level anchor only -- the primary proof is these
+behavioral, no-network rows plus the pre-existing dynamic
+skipped-preflight mutant test (which now mutates
+`resolve_launch_plan()`'s S-role call site).
 
 ## Distribution: idempotent, explicit, repair-capable
 
@@ -151,13 +188,14 @@ either, invoked by a human, not by `up()`.
 
 `farmharness/farm.py` has `ROLE_SET_DIR = {"p43": "~/role-artifacts/p43-root",
 "p50": "~/role-artifacts/p50-root"}` and `role_tree(binary_set)`
-(`None` -> the original hardcoded `TREE`, unchanged). `up()` takes
-`binary_set_s`/`binary_set_f` (scheduler / every worker), `run_client()`
-takes `binary_set_c`; `main()` exposes `--binary-set-S/-C/-F {p43,p50}`,
-each defaulting to `None` so omitting all three reproduces prior behavior
-exactly (no manifest lookup, no preflight -- nothing existing changes).
-`role_tree()`/`HOSTS`/`ROLE_SET_DIR`/`preflight()`/`distribute()` are all
-safely importable without triggering a live deploy (`main()` stays behind
+(`None` -> the original hardcoded `TREE`, unchanged). `main()` exposes
+`--binary-set-S/-C/-F {p43,p50}`, each defaulting to `None` so omitting all
+three reproduces prior behavior exactly (no manifest lookup, no preflight
+-- nothing existing changes); it passes all three straight into
+`resolve_launch_plan()` (see "Preflight atomicity" above) before `up()`
+or `run_client()` ever run. `role_tree()`/`HOSTS`/`ROLE_SET_DIR`/
+`preflight()`/`distribute()`/`resolve_launch_plan()` are all safely
+importable without triggering a live deploy (`main()` stays behind
 `if __name__ == "__main__":`).
 
 All four hosts (`q3`, `research6`, `research7`, `q2`) now have
@@ -179,13 +217,32 @@ those hosts" beyond role-artifacts and the sanctioned test mutations).
 
 ## Verification gate (`farmharness/artifact_selection_test.sh`)
 
-Extends the original 9 selection-mechanism assertions (identity baseline +
-selection-flip mutation, per role, per set -- unchanged) with:
+Runs, in order:
 
+- **fresh-archive no-ambient gate (FIRST row):** `git archive HEAD --
+  farmharness` into a brand-new, otherwise-empty directory, `farm.py`
+  imported from THAT location, both manifests loaded via `farm.load_manifest()`
+  from there, schema-key presence checked, and S/F/C role coverage confirmed
+  (every role `preflight()` probes for has a `binaries[]` entry with a
+  non-empty `version_probe.command`, so a manifest gap can't silently make
+  `preflight()` skip a role's identity check). This is the row that makes
+  the whole "committed code and committed manifests must actually agree, no
+  ambient/untracked file may be able to satisfy the test" defect class
+  structurally impossible to miss -- exactly the failure mode `02622ab6` had
+  (code read `role-manifests/`, manifests were committed at `artifacts/`,
+  and every green run only worked because an untracked copy at the other
+  path was still sitting in the shared worktree).
 - a static AST check that `resolve_role()` is called exactly the expected
-  number of times in `up()` (2: S + per-worker F) and `run_client()` (1: C),
-  so a partial deletion is caught even though it would not blank the
-  function entirely;
+  number of times: 3 in `resolve_launch_plan()` (S + the per-worker F
+  comprehension + C), 0 in `up()`, 0 in `run_client()` -- a secondary,
+  source-level anchor; see "Preflight atomicity" above for the primary,
+  behavioral proof;
+- **no-network deletion-sensitive spy gates:** four scenarios (invalid
+  initial S, invalid second F of three, invalid C, BO's final-worker-of-three
+  variant), each driving `farm.main()` itself against a monkeypatched
+  `preflight()` and asserting the recorded `docker_rm`/`docker_run_detached`/
+  `scratch_prepare`/`push_file` action list is empty -- see "Preflight
+  atomicity" above;
 - `distribute` run twice against research6/research7/q2 for both sets --
   first run materializes, second run is a verified no-op;
 - the full preflight matrix green on research6/q2 after distribution, and
@@ -199,15 +256,18 @@ selection-flip mutation, per role, per set -- unchanged) with:
   the repair, confirm preflight goes green again, confirm a further
   `distribute` call is then a clean no-op -- i.e. the repair itself is
   idempotent) -- research6 is left fully hash-clean afterward, reverified;
-- a skipped-preflight mutant: `up()`'s source is temporarily edited to
-  neutralize the scheduler-role `resolve_role()` call, and a mocked
-  (docker/ssh-safe -- no real container is ever started or stopped) dynamic
-  invocation of `up()` confirms the `PREFLIGHT-OK` marker for that role
-  disappears (while the untouched worker role's marker still appears,
-  proving the detection is precise) and that execution still reaches the
-  launch actions completely unguarded -- exactly the gap this check exists
-  to catch. farm.py is restored byte-exact (`cmp`-verified) before the
-  script continues, and the marker's return is reconfirmed afterward.
+- a skipped-preflight mutant: `resolve_launch_plan()`'s source is
+  temporarily edited to neutralize the scheduler-role `resolve_role()`
+  call, and a mocked (docker/ssh-safe -- no real container is ever started
+  or stopped) dynamic invocation of `resolve_launch_plan()` + `up()`
+  confirms the `PREFLIGHT-OK` marker for that role disappears (while the
+  untouched worker role's marker still appears, proving the detection is
+  precise) and that execution still reaches the launch actions completely
+  unguarded -- exactly the gap this check exists to catch. farm.py is
+  restored byte-exact (`cmp`-verified) before the script continues, and the
+  marker's return is reconfirmed afterward;
+- the original 9 selection-mechanism assertions (identity baseline +
+  selection-flip mutation, per role, per set -- unchanged).
 
 Run: `./artifact_selection_test.sh` (needs SSH reachability to q3,
 research6, research7, q2; `ARTIFACT_TEST_HOST` overrides the host used for

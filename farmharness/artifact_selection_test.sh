@@ -85,12 +85,113 @@ assert_differs() {
     echo "ok - $label ('$a' != '$b')"
 }
 
+echo "== FRESH-ARCHIVE no-ambient gate: farm.py + both manifests, from a bare git-archive extraction, zero ambient files possible =="
+# The defect this row exists to catch: 02622ab6 was reviewed and passed
+# against the ambient worktree, but the COMMITTED code and the COMMITTED
+# manifests actually disagreed on path (farm.py read
+# farmharness/role-manifests/, the manifests were committed at
+# farmharness/artifacts/) -- every prior green run only worked because an
+# untracked, uncommitted copy at the OTHER path happened to still be
+# sitting in the shared worktree. A `git archive` extraction into a
+# brand-new, otherwise-empty directory cannot be satisfied by ANY
+# ambient/untracked file, by construction -- this row is what makes that
+# whole defect class structurally impossible to miss again, no matter what
+# else is lying around in whatever worktree happens to run this script.
+REPOROOT=$(cd "$FARMDIR" && git rev-parse --show-toplevel)
+ARCHIVE_COMMIT=$(cd "$FARMDIR" && git rev-parse HEAD)
+ARCHIVE_DIR="$SCRATCHDIR/fresh-archive-$$"
+rm -rf "$ARCHIVE_DIR"
+mkdir -p "$ARCHIVE_DIR"
+# The "farmharness" pathspec below is resolved relative to cwd, like any
+# git pathspec -- it must run from the REPO ROOT (not from $FARMDIR, which
+# already IS farmharness/) or git looks for a farmharness/farmharness that
+# does not exist.
+( cd "$REPOROOT" && git archive "$ARCHIVE_COMMIT" -- farmharness ) | tar -x -C "$ARCHIVE_DIR"
+[ -f "$ARCHIVE_DIR/farmharness/farm.py" ] || fail "fresh-archive: farmharness/farm.py missing from the archive of $ARCHIVE_COMMIT"
+python3 - "$ARCHIVE_DIR" "$ARCHIVE_COMMIT" <<'PY'
+import os
+import sys
+
+archive_dir, commit = sys.argv[1], sys.argv[2]
+
+# Prove farm.py itself resolves from THIS fresh location, not some ambient
+# copy elsewhere on sys.path.
+sys.path.insert(0, os.path.join(archive_dir, "farmharness"))
+import farm
+
+resolved_dir = os.path.dirname(os.path.abspath(farm.__file__))
+expected_dir = os.path.join(archive_dir, "farmharness")
+if resolved_dir != expected_dir:
+    print(f"FAIL: farm module resolved from {resolved_dir!r}, expected {expected_dir!r}", file=sys.stderr)
+    sys.exit(1)
+
+problems = []
+for set_name in ("p43", "p50"):
+    try:
+        manifest = farm.load_manifest(set_name)
+    except RuntimeError as exc:
+        problems.append(f"{set_name}: load_manifest() raised: {exc}")
+        continue
+    for key in ("set", "binaries", "build", "tar"):
+        if key not in manifest:
+            problems.append(f"{set_name}: missing top-level key {key!r}")
+    if manifest.get("set") != set_name:
+        problems.append(f"{set_name}: manifest['set'] = {manifest.get('set')!r}, expected {set_name!r}")
+    if "image_digest" not in manifest.get("build", {}):
+        problems.append(f"{set_name}: build.image_digest missing")
+    for key in ("path", "sha256"):
+        if key not in manifest.get("tar", {}):
+            problems.append(f"{set_name}: tar.{key} missing")
+    for b in manifest.get("binaries", []):
+        for key in ("path", "sha256", "mode"):
+            if key not in b:
+                problems.append(f"{set_name}: binaries[] entry {b.get('path','?')!r} missing {key!r}")
+    # required-role coverage: every role farm.py's preflight() probes for
+    # (_ROLE_PROBE_PATH's S/F/C) must have a binaries[] entry at the exact
+    # expected path with a non-empty version_probe.command -- otherwise
+    # preflight()'s `if entry and entry["version_probe"]["command"]:` guard
+    # silently SKIPS that role's identity check instead of running it. That
+    # is a real fail-open gap in the MANIFEST DATA, not just in the code,
+    # and schema-key presence alone would not catch it.
+    by_path = {b.get("path"): b for b in manifest.get("binaries", [])}
+    for role, probe_path in farm._ROLE_PROBE_PATH.items():
+        entry = by_path.get(probe_path)
+        if entry is None:
+            problems.append(f"{set_name}: no binaries[] entry at {probe_path!r} for role {role!r}")
+            continue
+        if entry.get("role") != role:
+            problems.append(f"{set_name}: {probe_path} role={entry.get('role')!r}, expected {role!r}")
+        cmd = entry.get("version_probe", {}).get("command")
+        if not cmd:
+            problems.append(f"{set_name}: {probe_path} (role {role}) has no version_probe.command -- "
+                             f"preflight would silently skip this role's identity check")
+
+if problems:
+    for p in problems:
+        print(f"FAIL: {p}", file=sys.stderr)
+    sys.exit(1)
+print(f"ok - fresh-archive gate: farm imported from {farm.__file__} (git archive of {commit}), "
+      f"both manifests loaded via farm.load_manifest() from that same location, schema-valid, "
+      f"S/F/C role coverage confirmed present in both")
+PY
+[ $? -eq 0 ] || fail "fresh-archive no-ambient gate did not pass"
+rm -rf "$ARCHIVE_DIR"
+
+echo
 echo "== source anchor: the launch path cannot skip preflight without this test noticing =="
-# EXACT count per function, not mere presence -- up() has two call sites
-# (scheduler role + the per-worker F role inside the loop), so a coarse
-# "is resolve_role called at all" check would miss one of the two being
-# deleted. run_client() has one (the C role).
-for spec in "up:2" "run_client:1"; do
+# EXACT count per function. All role resolution now lives in ONE place,
+# resolve_launch_plan() (S + the per-worker F comprehension + C = 3 call
+# sites in source, regardless of how many workers exist at runtime) -- a
+# coarse "is resolve_role called at all" check would miss one of the three
+# being deleted. up()/run_client() must have ZERO: they now only consume an
+# already-validated LaunchPlan, so a resolve_role() call reappearing inside
+# either of them would mean a role is being preflighted AFTER some other
+# role's launch may already be underway -- exactly the ordering bug this
+# whole successor exists to close. This anchor is a SECONDARY, source-level
+# check only; the primary proof is the behavioral no-network spy gates
+# below (a call could stay textually present yet be silently neutered, as
+# the skipped-preflight mutant test further down demonstrates).
+for spec in "resolve_launch_plan:3" "up:0" "run_client:0"; do
     fn=${spec%%:*}
     want=${spec##*:}
     got=$(python3 - "$FARMDIR/farm.py" "$fn" <<'PY'
@@ -104,11 +205,149 @@ print(len(calls))
 PY
 )
     if [ "$got" = "$want" ]; then
-        echo "ok - $fn() calls resolve_role() exactly $want time(s) (preflight cannot be silently skipped for any role)"
+        if [ "$want" = "0" ]; then
+            echo "ok - $fn() calls resolve_role() exactly 0 times (no bypassable secondary resolution path exists inside it)"
+        else
+            echo "ok - $fn() calls resolve_role() exactly $want time(s) (preflight cannot be silently skipped for any role)"
+        fi
     else
-        fail "$fn() calls resolve_role() $got time(s), expected $want -- a selected --binary-set would launch with NO preflight for at least one role"
+        fail "$fn() calls resolve_role() $got time(s), expected $want -- either a role's preflight gate was deleted from resolve_launch_plan(), or up()/run_client() gained a resolve_role() call of their own (reopening the resolve-then-mutate-immediately ordering bug)"
     fi
 done
+
+echo
+echo "== no-network deletion-sensitive gates: invalid-role scenarios must record ZERO mutating actions =="
+# LO measured 6 real mutating actions (docker_rm + scratch-write +
+# docker-run-d, x2, for S then the first worker) before a SECOND worker's
+# bad preflight was even discovered under the pre-fix code, plus 4 more
+# from the unconditional finally-teardown that ran anyway -- both numbers
+# had to go to 0. These rows invoke farm.main() itself (the real CLI entry
+# point, argv and all -- not a hand-rolled reimplementation of its control
+# flow) against a directly-faked farm.preflight(). preflight()'s OWN
+# correctness (hash/digest/version-probe checks) is already exhaustively
+# covered elsewhere in this file (identity baseline, hash-mutant variants
+# A/B, the research7 digest-mismatch row); what's under test here is
+# purely the ORCHESTRATION around it -- does a refusal for one role ever
+# let a DIFFERENT role's mutation through, no matter how many roles
+# resolved successfully first. Every docker/scratch/push mutating
+# PRIMITIVE farm.py has (docker_rm, docker_run_detached, scratch_prepare,
+# push_file) is monkeypatched to a pure recorder; farm.sh itself is ALSO
+# monkeypatched to hard-fail the test the instant it's called at all --
+# since up()/run_client() must never be reached in any of these scenarios,
+# sh() should have zero callers by construction, and this turns a
+# regression that reaches them into a loud local AssertionError instead of
+# a silent (and possibly hanging) real network call.
+python3 - "$FARMDIR" <<'PY'
+import contextlib
+import io
+import sys
+
+sys.path.insert(0, sys.argv[1])
+import farm
+
+class Recorder:
+    def __init__(self):
+        self.actions = []
+    def docker_rm(self, host, name):
+        self.actions.append(f"docker_rm({host},{name})")
+    def docker_run_detached(self, host, name, tree, img, inner_cmd):
+        self.actions.append(f"docker_run_detached({host},{name})")
+    def scratch_prepare(self, host, mkdir_path, log_path):
+        self.actions.append(f"scratch_prepare({host},{mkdir_path})")
+    def push_file(self, host, localpath, remotepath):
+        self.actions.append(f"push_file({host},{remotepath})")
+
+def refuse_sh(*a, **kw):
+    raise AssertionError(f"farm.sh() was called during a no-network spy scenario (args={a!r}) -- "
+                          f"up()/run_client() must never be reached when a role plan is refused")
+
+def make_fake_preflight(bad):
+    """bad: set of (host, role) that must FAIL; everything else passes.
+    A controlled, network-free stand-in for farm.preflight() -- see the
+    section comment above for why faking preflight() itself (rather than
+    faking sh() finely enough for the REAL preflight() to naturally
+    produce the same verdict) is the right level for this test."""
+    def fake_preflight(host, binary_set, role):
+        if (host, role) in bad:
+            return f"SIMULATED-REFUSAL host={host} role={role} set={binary_set}"
+        return None
+    return fake_preflight
+
+def run_scenario(argv_tail, bad_roles):
+    rec = Recorder()
+    saved = dict(preflight=farm.preflight, sh=farm.sh, docker_rm=farm.docker_rm,
+                 docker_run_detached=farm.docker_run_detached,
+                 scratch_prepare=farm.scratch_prepare, push_file=farm.push_file,
+                 argv=sys.argv)
+    farm.preflight = make_fake_preflight(bad_roles)
+    farm.sh = refuse_sh
+    farm.docker_rm = rec.docker_rm
+    farm.docker_run_detached = rec.docker_run_detached
+    farm.scratch_prepare = rec.scratch_prepare
+    farm.push_file = rec.push_file
+    sys.argv = ["farm.py"] + argv_tail
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            try:
+                farm.main()
+            except SystemExit:
+                pass
+    finally:
+        farm.preflight = saved["preflight"]
+        farm.sh = saved["sh"]
+        farm.docker_rm = saved["docker_rm"]
+        farm.docker_run_detached = saved["docker_run_detached"]
+        farm.scratch_prepare = saved["scratch_prepare"]
+        farm.push_file = saved["push_file"]
+        sys.argv = saved["argv"]
+    return buf.getvalue(), rec.actions
+
+problems = []
+COMMON = ["--workers=research6,research7,q2", "--client=q3", "--phase=up-test-down",
+          "--binary-set-S=p43", "--binary-set-F=p43", "--binary-set-C=p43"]
+
+def check(label, argv_tail, bad_roles, before_fix_hint):
+    out, actions = run_scenario(argv_tail, bad_roles)
+    print(f"-- {label}: {len(actions)} action(s) recorded --")
+    if "REFUSED" not in out:
+        problems.append(f"{label}: expected a REFUSED line in stdout, got: {out!r}")
+    if actions:
+        problems.append(f"{label}: expected 0 recorded mutating actions, got {len(actions)}: {actions}")
+    else:
+        print(f"ok - {label}: refused with 0 mutating actions ({before_fix_hint})")
+
+# 1) invalid INITIAL S -- must refuse before ANY F is even resolved.
+check("invalid INITIAL S", COMMON, {("q3", "S")},
+      "was 6 pre-refusal + 4 finally-teardown actions before this fix")
+
+# 2) invalid SECOND F of 3 -- S and F[0] (research6) resolve fine first;
+#    F[1] (research7) fails; F[2] (q2) is never even attempted (the list
+#    comprehension short-circuits on the first exception) -- proves a
+#    LATE-discovered bad role, after other roles already resolved
+#    successfully, still blocks every mutation.
+check("invalid SECOND F (of 3)", COMMON, {("research7", "F")},
+      "was 6 pre-refusal + 4 finally-teardown actions before this fix")
+
+# 3) invalid C -- S and ALL F resolve fine; only C (checked last, and only
+#    because this phase actually uses a client) fails -- proves S/F's
+#    success alone must never be enough to launch anything.
+check("invalid C", ["--workers=research6", "--client=q3", "--phase=up-test-down",
+                     "--binary-set-S=p43", "--binary-set-F=p43", "--binary-set-C=p43"],
+      {("q3", "C")}, "S and F would have launched for real before this fix")
+
+# 4) BO's variant: the FINAL worker (of 3) fails, after S, F[0], AND F[1]
+#    all resolved successfully -- recorded docker-op list must be empty.
+check("final worker (of 3) fails", COMMON, {("q2", "F")},
+      "docker-op list was non-empty before this fix (per BO)")
+
+if problems:
+    for p in problems:
+        print(f"FAIL: {p}", file=sys.stderr)
+    sys.exit(1)
+PY
+[ $? -eq 0 ] || fail "no-network deletion-sensitive gates did not pass"
+echo "ok - all 4 invalid-role scenarios refused cleanly through the real farm.main() entry point, 0 mutating actions and 0 finally-teardown actions in every case"
 
 echo
 echo "== distribute: idempotent materialization onto research6/research7/q2 =="
@@ -288,7 +527,7 @@ PY
 [ $? -eq 0 ] || fail "research6 not restored to a fully green state"
 
 echo
-echo "== skipped-preflight mutant: neutralizing resolve_role() in up() must make the PREFLIGHT-OK marker for that role DISAPPEAR =="
+echo "== skipped-preflight mutant: neutralizing resolve_role() in resolve_launch_plan() must make the PREFLIGHT-OK marker for that role DISAPPEAR =="
 # Safety: this mutates farm.py's OWN source on disk, then imports the
 # mutated module in a fresh subprocess. It NEVER calls a code path that
 # performs a real docker/ssh mutating action -- sh() is monkeypatched so
@@ -324,9 +563,9 @@ def run_mocked_up():
     real_sh = farm.sh
     launch_actions = []
     # Pure per-command content match -- NOT sticky state. A sticky
-    # "once launch starts, fake everything" flag is wrong here: up()
-    # calls resolve_role() again for EACH worker role, interleaved with
-    # the launch actions for the scheduler role, and each of those
+    # "once launch starts, fake everything" flag is wrong here:
+    # resolve_launch_plan() calls resolve_role() for the scheduler AND for
+    # every worker role BEFORE up() runs at all now, and each of those
     # resolve_role() calls must still reach the REAL, read-only preflight
     # checks (or this harness itself would falsely blind preflight for
     # every role after the first). These six tokens cover every command
@@ -348,9 +587,15 @@ def run_mocked_up():
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         try:
-            farm.up(["q3"], "p43", "p43")
+            # Mirrors the two-step sequence main() itself now uses: resolve the COMPLETE
+            # plan first (this is where the mutation below lands), only
+            # then call up() with whatever it resolved -- exactly what lets
+            # this test tell "the S-role PREFLIGHT-OK marker is gone" apart
+            # from "up() was never reached at all".
+            plan = farm.resolve_launch_plan(["q3"], "p43", "p43")
+            farm.up(["q3"], plan.s_tree, plan.s_img, plan.f_resolved)
         except RuntimeError as exc:
-            print(f"(up raised RuntimeError: {exc})")
+            print(f"(resolve_launch_plan/up raised RuntimeError: {exc})")
     return buf.getvalue(), launch_actions
 
 out, actions = run_mocked_up()
@@ -366,7 +611,7 @@ BASE_ACTIONS=$(grep -oE '__LAUNCH_ACTIONS__=[0-9]+' "$SCRATCHDIR/base.stderr" | 
 [ "${BASE_ACTIONS:-0}" -gt 0 ] || fail "baseline: mocked launch actions were never reached (harness itself is broken)"
 echo "ok - baseline: both PREFLIGHT-OK markers present, $BASE_ACTIONS mocked launch action(s) reached after them"
 
-echo "-- mutating farm.py: neutralize the S-role resolve_role() call inside up() --"
+echo "-- mutating farm.py: neutralize the S-role resolve_role() call inside resolve_launch_plan() --"
 python3 - "$FARMDIR/farm.py" <<'PY'
 import sys
 path = sys.argv[1]

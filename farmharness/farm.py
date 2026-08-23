@@ -247,6 +247,46 @@ def resolve_role(host, binary_set, role):
     log_launch(f"PREFLIGHT-OK host={host} role={role} set={binary_set}")
     return ROLE_SET_DIR[binary_set], launch_image(binary_set)
 
+class LaunchPlan:
+    """Every role resolved for one up[-test][-down] invocation, in the
+    order resolve_launch_plan() resolves them (S, then all F, then C when
+    used). Carrying every resolution in one object -- rather than up() and
+    run_client() each re-resolving their own roles, as before -- is what
+    makes "resolve EVERYTHING before mutating ANYTHING" possible without a
+    double preflight run: there is exactly one place any role/host
+    combination is ever preflighted for a given invocation, and it runs
+    entirely before up()/run_client() perform a single docker/scratch/push
+    action."""
+    __slots__ = ("s_tree", "s_img", "f_resolved", "c_tree", "c_img")
+    def __init__(self, s_tree, s_img, f_resolved, c_tree=None, c_img=None):
+        self.s_tree, self.s_img = s_tree, s_img
+        self.f_resolved = f_resolved
+        self.c_tree, self.c_img = c_tree, c_img
+
+def resolve_launch_plan(worker_hosts, binary_set_s, binary_set_f, client_host=None, binary_set_c=None):
+    """Resolve the COMPLETE requested role plan -- S, every F host, and C
+    (only when client_host is not None, i.e. the phase will actually use a
+    client) -- in one pass, entirely before up()/run_client() perform a
+    single docker removal/start, scratch write, or client push.
+
+    Raises RuntimeError with resolve_role()'s exact reason on the first
+    role that fails preflight. By construction, at the moment this raises,
+    NO docker/scratch/push action has happened for ANY role in this plan --
+    including roles that resolved successfully earlier in this same call.
+    That is the whole point: previously, up() resolved+launched the
+    scheduler, THEN resolved+launched each worker in the same loop, so a
+    bad second worker was only discovered after the scheduler and first
+    worker were already torn down and started (LO's finding on 02622ab6).
+    Now up() and run_client() no longer resolve or preflight anything
+    themselves -- they only ever consume a LaunchPlan that this function
+    already validated in full."""
+    s_tree, s_img = resolve_role(SCHED_HOST, binary_set_s, "S")
+    f_resolved = [resolve_role(h, binary_set_f, "F") for h in worker_hosts]
+    c_tree = c_img = None
+    if client_host is not None:
+        c_tree, c_img = resolve_role(client_host, binary_set_c, "C")
+    return LaunchPlan(s_tree, s_img, f_resolved, c_tree, c_img)
+
 # per-host SSH argv + LAN IP + role capability
 HOSTS = {
     "q3":        {"ssh": ["ssh","-o","HostName=10.0.27.101","-o","HostKeyAlias=tt-quietbox3","-o","BatchMode=yes","mickg10@tt-quietbox3"], "ip": "10.0.27.101"},
@@ -265,39 +305,57 @@ def sh(host, cmd, timeout=120, check=False):
 def docker_rm(host, name):
     sh(host, f"docker rm -f {name} 2>/dev/null; true")
 
-def up(worker_hosts, binary_set_s=None, binary_set_f=None):
+def docker_run_detached(host, name, tree, img, inner_cmd):
+    """Start a detached (docker run -d), named, persistent container.
+    Together with docker_rm(), this is the ONLY docker-mutating primitive
+    up() uses -- factored out of the inline sh() calls that used to be
+    here specifically so a no-network test can monkeypatch exactly these
+    two named functions (and nothing else, no command-text pattern
+    matching needed) to prove zero containers are touched for a launch
+    plan that never made it past resolution."""
+    sh(host, f"docker run -d --name {name} --network host -v {tree}:/work -v {SCRATCH}:/scratch -u 0:0 {img} "
+             f"bash -c '{inner_cmd}'", check=True)
+
+def scratch_prepare(host, mkdir_path, log_path):
+    """Reset the SCRATCH-relative logging area on host before a launch.
+    The ONLY scratch-mutating primitive up() uses -- factored out for the
+    same reason as docker_run_detached() above."""
+    sh(host, f"mkdir -p {mkdir_path} && chmod 1777 {SCRATCH}/farm && rm -f {log_path}", check=True)
+
+def up(worker_hosts, s_tree, s_img, f_resolved):
+    """Launch the cluster from an ALREADY-validated LaunchPlan's S/F
+    resolution (s_tree/s_img/f_resolved, parallel to worker_hosts) --
+    up() itself no longer resolves or preflights anything: every role in
+    this plan was already resolved, for every host, inside
+    resolve_launch_plan() before this function was ever called. up()
+    therefore performs ONLY the mutating actions (docker_rm,
+    scratch_prepare, docker_run_detached) and can no longer discover a bad
+    role partway through a launch that already tore down or started an
+    earlier one (the defect LO/BO both flagged on 02622ab6)."""
     sip = HOSTS[SCHED_HOST]["ip"]
-    # S4: resolve_role runs distribute+preflight (when a set is selected)
-    # and raises BEFORE any docker action for that role/host if either
-    # fails -- this call must stay ahead of docker_rm/docker run below.
-    s_tree, s_img = resolve_role(SCHED_HOST, binary_set_s, "S")
     print(f"UP: scheduler on {SCHED_HOST}({sip}):{SCHED_PORT}  workers={worker_hosts}  "
-          f"S-set={binary_set_s or 'default'}({s_tree})  F-set={binary_set_f or 'default'}")
+          f"S-tree={s_tree}  F-trees={[t for t, _ in f_resolved]}")
     # scheduler (--network host so it binds the LAN IP). The daemon/scheduler drop privileges to
     # icecc at startup, so the -l log dir must be writable by that user => useradd icecc + 1777 dir.
     docker_rm(SCHED_HOST, "farm-sched")
-    sh(SCHED_HOST, f"mkdir -p {SCRATCH}/farm && chmod 1777 {SCRATCH}/farm && rm -f {SCRATCH}/farm/sched.log", check=True)
-    sh(SCHED_HOST,
-       f"docker run -d --name farm-sched --network host -v {s_tree}:/work -v {SCRATCH}:/scratch -u 0:0 {s_img} "
-       f"bash -c 'useradd -r icecc 2>/dev/null; exec /work/obj/scheduler/icecc-scheduler -p {SCHED_PORT} -n {NET} -l /scratch/farm/sched.log -vvv'",
-       check=True)
+    scratch_prepare(SCHED_HOST, f"{SCRATCH}/farm", f"{SCRATCH}/farm/sched.log")
+    docker_run_detached(SCHED_HOST, "farm-sched", s_tree, s_img,
+        f"useradd -r icecc 2>/dev/null; exec /work/obj/scheduler/icecc-scheduler -p {SCHED_PORT} -n {NET} -l /scratch/farm/sched.log -vvv")
     time.sleep(3)
-    # one worker per F -- resolve_role runs per HOST (each host's own files
-    # are distributed/preflighted independently; one host having a stale
-    # or corrupted copy must not be masked by another host being fine).
+    # one worker per F -- every host's role was already resolved, in order,
+    # inside resolve_launch_plan(), before this loop (or anything else in
+    # this function) performed a single docker/scratch action.
     for i, h in enumerate(worker_hosts):
         wp = 12000 + i
-        f_tree, f_img = resolve_role(h, binary_set_f, "F")
+        f_tree, f_img = f_resolved[i]
         docker_rm(h, "farm-worker")
         # chmod only the mickg-owned dir (not -R: stale daemon files are uid-999, unchmod-able by host user; rm clears them)
-        sh(h, f"mkdir -p {SCRATCH}/farm/envs && chmod 1777 {SCRATCH}/farm && rm -f {SCRATCH}/farm/worker.log", check=True)
-        sh(h,
-           f"docker run -d --name farm-worker --network host -v {f_tree}:/work -v {SCRATCH}:/scratch -u 0:0 {f_img} "
-           f"bash -c 'useradd -r -s /usr/sbin/nologin icecc 2>/dev/null; "
-           f"chown icecc /scratch/farm/envs; "  # pre-chown as root: daemon's cleanup_cache runs post-drop (no CAP_CHOWN)
-           f"exec /work/obj/daemon/iceccd -m 8 -s {sip}:{SCHED_PORT} -n {NET} -N {h}w -b /scratch/farm/envs "
-           f"-p {wp} -l /scratch/farm/worker.log -vvv'",
-           check=True)
+        scratch_prepare(h, f"{SCRATCH}/farm/envs", f"{SCRATCH}/farm/worker.log")
+        docker_run_detached(h, "farm-worker", f_tree, f_img,
+            f"useradd -r -s /usr/sbin/nologin icecc 2>/dev/null; "
+            f"chown icecc /scratch/farm/envs; "  # pre-chown as root: daemon's cleanup_cache runs post-drop (no CAP_CHOWN)
+            f"exec /work/obj/daemon/iceccd -m 8 -s {sip}:{SCHED_PORT} -n {NET} -N {h}w -b /scratch/farm/envs "
+            f"-p {wp} -l /scratch/farm/worker.log -vvv")
     # wait for all workers to register
     want = len(worker_hosts)
     got = 0
@@ -325,11 +383,14 @@ def push_file(host, localpath, remotepath):
     if p.returncode != 0:
         raise RuntimeError(f"push {localpath}->{host}:{remotepath} failed: {p.stderr.decode()[:200]}")
 
-def run_client(client_host, project_dir, mode, maxtu, jobs, prefer, binary_set_c=None):
+def run_client(client_host, project_dir, mode, maxtu, jobs, prefer, c_tree, c_img):
+    """Run the client against an ALREADY-validated LaunchPlan's C
+    resolution (c_tree/c_img) -- like up(), run_client() no longer
+    resolves or preflights anything itself; that already happened inside
+    resolve_launch_plan(), before up() was even called, let alone this
+    function (which push_file()s to the client host -- one of the actions
+    that must never happen ahead of a full, successful plan resolution)."""
     sched = f"{HOSTS[SCHED_HOST]['ip']}:{SCHED_PORT}"
-    # S4: distribute+preflight (when a set is selected) before any docker
-    # action for the client host, same as up()'s S/F roles.
-    c_tree, c_img = resolve_role(client_host, binary_set_c, "C")
     for s in SCRIPTS:
         push_file(client_host, f"{HUB_DIR}/{s}", f"{SCRATCH.replace('~', '$HOME')}/{s}")
     # resolve ~ on the client for the bind (docker needs an absolute host path)
@@ -337,7 +398,7 @@ def run_client(client_host, project_dir, mode, maxtu, jobs, prefer, binary_set_c
     cmd = (f"docker run --rm --name farm-client --network host -v {c_tree}:/work -v {SCRATCH}:/scratch -u 0:0 {c_img} "
            f"bash /scratch/farm_client.sh {sched} {NET} {project_dir} {mode} {maxtu} {jobs} {prefer}")
     print(f"TEST: client={client_host} project={project_dir} mode={mode} maxtu={maxtu} jobs={jobs} prefer={prefer} "
-          f"C-set={binary_set_c or 'default'}({c_tree})")
+          f"C-tree={c_tree}")
     r = sh(client_host, cmd, timeout=1800)
     print(r.stdout.rstrip())
     if r.stderr.strip():
@@ -440,29 +501,51 @@ def main():
     a = ap.parse_args()
     workers = a.workers.split(",")
     prefer = (workers[0] + "w") if len(workers) == 1 else ""   # pin for 1 F; let scheduler balance for >1 F
+    want_client = a.phase == "up-test-down"
     ok = False
+    down_needed = False   # flips True only once real launch actions begin --
+                           # see resolve_launch_plan()/up() docstrings. A
+                           # plan-validation refusal must NEVER call down():
+                           # down() docker-rm's the fixed farm-{sched,worker,
+                           # client} names unconditionally, which could
+                           # disturb a pre-existing, unrelated, exact-name
+                           # running cluster while this invocation is simply
+                           # declining to start a NEW one (LO's finding).
     try:
         try:
-            ok = up(workers, a.binary_set_s, a.binary_set_f)
+            plan = resolve_launch_plan(workers, a.binary_set_s, a.binary_set_f,
+                                        a.client if want_client else None, a.binary_set_c)
         except RuntimeError as exc:
-            # S4: distribute/preflight refused before any docker action for
-            # the failing role/host -- report it as a launch refusal, not a
-            # cluster-registration failure, and let the finally block's
-            # down() run as a harmless no-op cleanup (nothing was started).
+            # Nothing was resolved-and-launched, and nothing was even
+            # resolved for EVERY role (a later role's failure means
+            # earlier roles' successful resolutions were never acted on
+            # either) -- refuse cleanly, zero docker/scratch/push actions
+            # taken, down() never invoked.
             print(f"REFUSED: {exc}")
-            ok = False
         else:
-            print("CLUSTER:", "REGISTERED-OK" if ok else "REGISTRATION-FAILED")
-            if ok and a.phase == "up-test-down":
-                try:
-                    r = run_client(a.client, a.project, a.mode, a.maxtu, a.jobs, prefer, a.binary_set_c)
-                except RuntimeError as exc:
-                    print(f"REFUSED: {exc}")
-                    ok = False
-                else:
-                    dump_worker_evidence(workers, r.stdout)
+            down_needed = True   # every role in the plan validated; real
+                                  # actions begin now, so teardown owes a
+                                  # visit regardless of what happens below.
+            try:
+                ok = up(workers, plan.s_tree, plan.s_img, plan.f_resolved)
+            except RuntimeError as exc:
+                # Real launch actions had already begun (down_needed is
+                # already True) -- this is a genuine command failure
+                # mid-launch, not a plan-validation refusal.
+                print(f"LAUNCH FAILED: {exc}")
+                ok = False
+            else:
+                print("CLUSTER:", "REGISTERED-OK" if ok else "REGISTRATION-FAILED")
+                if ok and want_client:
+                    try:
+                        r = run_client(a.client, a.project, a.mode, a.maxtu, a.jobs, prefer, plan.c_tree, plan.c_img)
+                    except RuntimeError as exc:
+                        print(f"LAUNCH FAILED: {exc}")
+                        ok = False
+                    else:
+                        dump_worker_evidence(workers, r.stdout)
     finally:
-        if a.phase in ("up-down", "up-test-down"):
+        if down_needed and a.phase in ("up-down", "up-test-down"):
             down(workers, a.client)
     sys.exit(0 if ok else 2)
 
