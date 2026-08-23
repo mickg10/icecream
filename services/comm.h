@@ -281,6 +281,26 @@ const uint32_t CACHE_DECLARED_PROFILE_MASK =
    profile name must never advertise a codec which cannot reconstruct input. */
 const uint32_t CACHE_ADVERTISABLE_PROFILE_MASK = CACHE_PROFILE_ZSTD_TU;
 
+/* Shared absent-or-present law for a three-word CacheWire advertisement.
+   LoginMsg's Login-only capability tail (M0/M1) and UseCSMsg's
+   assignment-bound S->C cache-endpoint handoff tail (S2) both project
+   through this exact pair of predicates: a snapshot is either wholly zero
+   or a single runnable, in-range, in-mask endpoint.  Nothing partially or
+   incorrectly advertised is ever legal on either wire shape. */
+inline bool cache_advertisement_is_wholly_absent(uint32_t port, uint32_t protocol,
+                                                  uint32_t profile_mask)
+{
+    return port == 0 && protocol == 0 && profile_mask == 0;
+}
+inline bool cache_advertisement_is_valid_present(uint32_t port, uint32_t protocol,
+                                                  uint32_t profile_mask)
+{
+    return port > 0 && port <= UINT16_MAX
+        && protocol == CACHE_WIRE_PROTOCOL_V1
+        && profile_mask != 0
+        && (profile_mask & ~CACHE_ADVERTISABLE_PROFILE_MASK) == 0;
+}
+
 // a list of pairs of host platform, filename
 typedef std::list<std::pair<std::string, std::string> > Environments;
 
@@ -690,10 +710,16 @@ public:
         , assignment_epoch_hi(0)
         , assignment_epoch_lo(0)
         , assignment_nonce_hi(0)
-        , assignment_nonce_lo(0) {}
+        , assignment_nonce_lo(0)
+        , cache_endpoint_port(0)
+        , cache_protocol(0)
+        , cache_profile_mask(0)
+        , cache_tail_valid(true) {}
     UseCSMsg(std::string platform, std::string host, unsigned int p, unsigned int id, bool gotit,
              unsigned int _client_id, unsigned int matched_host_jobs,
-             uint64_t assignment_epoch = 0, uint64_t assignment_nonce = 0)
+             uint64_t assignment_epoch = 0, uint64_t assignment_nonce = 0,
+             uint32_t cache_port = 0, uint32_t cache_proto = 0,
+             uint32_t cache_mask = 0)
         : Msg(Msg::USE_CS),
           job_id(id),
           hostname(host),
@@ -705,7 +731,11 @@ public:
           assignment_epoch_hi(uint32_t(assignment_epoch >> 32)),
           assignment_epoch_lo(uint32_t(assignment_epoch)),
           assignment_nonce_hi(uint32_t(assignment_nonce >> 32)),
-          assignment_nonce_lo(uint32_t(assignment_nonce)) {}
+          assignment_nonce_lo(uint32_t(assignment_nonce)),
+          cache_endpoint_port(cache_port),
+          cache_protocol(cache_proto),
+          cache_profile_mask(cache_mask),
+          cache_tail_valid(true) {}
 
     virtual void fill_from_channel(MsgChannel *c);
     virtual void send_to_channel(MsgChannel *c) const;
@@ -724,6 +754,7 @@ public:
         return assignmentEpoch() != 0 && assignmentNonce() != 0;
     }
     bool applyAssignmentTo(CompileJob *job) const;
+    bool hasCacheAdvertisement() const { return cache_endpoint_port != 0; }
 
     uint32_t job_id;
     std::string hostname;
@@ -738,6 +769,18 @@ public:
     uint32_t assignment_epoch_lo;
     uint32_t assignment_nonce_hi;
     uint32_t assignment_nonce_lo;
+    /* S2: protocol 50 also appends this three-word assignment-bound S->C
+       cache-endpoint handoff tail, gated and shaped exactly like LoginMsg's
+       Login-only advertisement tail (see cache_advertisement_is_wholly_absent
+       / cache_advertisement_is_valid_present).  hostname/port above already
+       carry the selected F's compile endpoint; the F's cache port is a
+       separate listener on the same host. */
+    uint32_t cache_endpoint_port;
+    uint32_t cache_protocol;
+    uint32_t cache_profile_mask;
+
+private:
+    bool cache_tail_valid;
 };
 
 class NoCSMsg : public Msg

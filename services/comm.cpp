@@ -2302,6 +2302,22 @@ void UseCSMsg::fill_from_channel(MsgChannel *c)
         assignment_epoch_hi = assignment_epoch_lo = 0;
         assignment_nonce_hi = assignment_nonce_lo = 0;
     }
+    if (IS_PROTOCOL_VERSION(PROTOCOL_VERSION_CACHE_ADVERTISEMENT, c)) {
+        if (c->current_message_bytes_remaining() < 3 * sizeof(uint32_t)) {
+            cache_endpoint_port = 0;
+            cache_protocol = 0;
+            cache_profile_mask = 0;
+            cache_tail_valid = false;
+            return;
+        }
+        *c >> cache_endpoint_port;
+        *c >> cache_protocol;
+        *c >> cache_profile_mask;
+    } else {
+        cache_endpoint_port = 0;
+        cache_protocol = 0;
+        cache_profile_mask = 0;
+    }
 }
 
 void UseCSMsg::send_to_channel(MsgChannel *c) const
@@ -2323,14 +2339,26 @@ void UseCSMsg::send_to_channel(MsgChannel *c) const
         *c << assignment_nonce_hi;
         *c << assignment_nonce_lo;
     }
+    if (IS_PROTOCOL_VERSION(PROTOCOL_VERSION_CACHE_ADVERTISEMENT, c)) {
+        *c << cache_endpoint_port;
+        *c << cache_protocol;
+        *c << cache_profile_mask;
+    }
 }
 
 bool UseCSMsg::valid_payload() const
 {
     const bool epoch_present = assignmentEpoch() != 0;
     const bool nonce_present = assignmentNonce() != 0;
-    return (!epoch_present && !nonce_present)
+    const bool assignment_ok = (!epoch_present && !nonce_present)
         || (epoch_present && nonce_present && job_id != 0);
+    if (!assignment_ok || !cache_tail_valid) {
+        return false;
+    }
+    return cache_advertisement_is_wholly_absent(cache_endpoint_port, cache_protocol,
+                                                cache_profile_mask)
+        || cache_advertisement_is_valid_present(cache_endpoint_port, cache_protocol,
+                                                cache_profile_mask);
 }
 
 bool UseCSMsg::applyAssignmentTo(CompileJob *job) const
