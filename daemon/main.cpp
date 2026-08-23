@@ -472,6 +472,23 @@ public:
                   WAITFORCS, FORWARDING_USE_CS, WAITCOMPILE, CLIENTWORK, WAITFORCHILD, WAITCREATEENV,
                   LASTSTATE = WAITCREATEENV
                 } status;
+
+    /* S2: a validated, assignment-bound cache-endpoint handoff for exactly
+       one in-flight UseCS.  Populated only when the scheduler's UseCS
+       carried BOTH a fully-valid cache tail (see
+       cache_advertisement_is_valid_present) AND a nonzero P50 assignment
+       identity -- the identity the daemon will actually claim the job
+       with (see scheduler_use_cs).  host/port/protocol/profileMask are
+       meaningless unless valid is true.  Retained alongside the job for a
+       later milestone; this change makes no connection to host:port. */
+    struct CacheHandoff {
+        bool valid;
+        string host;
+        uint32_t port;
+        uint32_t protocol;
+        uint32_t profileMask;
+    };
+
     Client() {
         created_ts = time(nullptr);
         created_msec = monotonic_msec();
@@ -496,6 +513,7 @@ public:
         last_known_job_id = 0;
         channel = nullptr;
         job = nullptr;
+        cacheHandoff = CacheHandoff{false, string(), 0, 0, 0};
         usecsmsg = nullptr;
         deferred_getcs = nullptr;
         getcs_published = false;
@@ -594,6 +612,7 @@ public:
     uint32_t getcs_delivered;  // UseCS decisions delivered to the client for a batch request
     std::vector<uint32_t> getcs_batch_jobids;  // exact job ids recorded for a batch request (dedup + teardown settlement)
     CompileJob *job;
+    CacheHandoff cacheHandoff;   // S2: see the struct's own comment above
     int client_id;
     uint32_t niceness; // nice priority (0-20), for PENDING_USE_CS
     // pipe from child process with end status, only valid if WAITFORCHILD or TOINSTALL/WAITINSTALL
@@ -5443,6 +5462,27 @@ int Daemon::scheduler_use_cs(UseCSMsg *msg)
     if (c->status == Client::WAITFORCS) {
         c->last_waitforcs_msec = monotonic_msec() - c->status_since_msec;
         record_waitforcs_latency(true, c->last_waitforcs_msec);
+    }
+
+    /* S2: validate and retain the assignment-bound cache-endpoint handoff
+       BEFORE either branch below constructs its own relay UseCS.  A present
+       tail is trusted only when BOTH the tail itself is fully valid (never
+       merely non-empty -- see cache_advertisement_is_valid_present) AND it
+       is bound to the exact nonzero P50 assignment identity this dispatch
+       will claim with (msg->hasAssignmentIdentity()); msg->valid_payload()
+       already enforced the tail's own absent-or-present law on receipt (see
+       MsgChannel::get_msg), so this re-checks it explicitly rather than
+       trusting that channel-layer gate implicitly.  No connection is made
+       here (see M3, out of scope for this change): this only stores the
+       endpoint alongside the job for a later milestone to consume. */
+    c->cacheHandoff = Client::CacheHandoff{false, string(), 0, 0, 0};
+    if (msg->hasCacheAdvertisement() && msg->hasAssignmentIdentity()
+            && cache_advertisement_is_valid_present(
+                   msg->cache_endpoint_port, msg->cache_protocol,
+                   msg->cache_profile_mask)) {
+        c->cacheHandoff = Client::CacheHandoff{
+            true, msg->hostname, msg->cache_endpoint_port,
+            msg->cache_protocol, msg->cache_profile_mask};
     }
 
     if (msg->hostname == remote_name && int(msg->port) == daemon_port) {
