@@ -1,0 +1,92 @@
+{
+  "set": "p50",
+  "provisional": true,
+  "authority_note": "NOT a final release authority. This is a provisional foundation build of trunk at commit 43297d53, used to exercise the P43-vs-trunk role-artifact mechanism. Do not promote this manifest's hashes as 'the' P50 release identity.",
+  "rebuild_required": {
+    "reason": "43297d53 predates at least two convergence events already in flight on sibling branches: (a) provisional/s1b-release-identity commit 97ef314f bumps the development release identity from 1.4.92 to 1.5.90 (verified present on that branch 2026-08-23); (b) provisional/s2-assignment-handoff carries further P49/P50 assignment-fence work also descended from 43297d53. Neither has landed on the line this role-artifact set was built from.",
+    "tracking": "S1b release-identity convergence (provisional/s1b-release-identity) and S2 assignment handoff (provisional/s2-assignment-handoff)",
+    "resolution": "once trunk carries the converged commit, rebuild p50-root from it inside the pinned image, regenerate this manifest in full (source commit, tar sha256, per-file sha256/mode/size, version_probe strings, image digest), and only then flip provisional to false"
+  },
+  "source": {
+    "sha": "43297d535232d8becb58866d5fb6cc73fa3b033d",
+    "ref": "trunk foundation (pre-S1b/S2 convergence)",
+    "commit_subject": "Add inert protocol-50 cache endpoint advertisement",
+    "verification": "git archive 43297d53... | ssh q3 tar -x into a scratch dir, diff -rq against ~/ad-build/source filtered for the expected one-sided autogen-generated extras -> 0 differing/missing tracked files. Re-verified 2026-08-23: `git cat-file -t` confirms the object is a real commit in this repo; it is NOT an ancestor of this S4 branch's own tip (expected -- separate development line) but IS reachable via origin/implementer/issue16-p50-cache-advertisement-provisional and the provisional/s1b-release-identity and provisional/s2-assignment-handoff branches, consistent with the 'provisional foundation, not yet merged' framing above."
+  },
+  "build": {
+    "container_image": "icecream/farm-node:ubuntu22-gcc11-boost174",
+    "image_digest": "sha256:bdb55d4287a473e3ebfbaa7715a50ee670659777278b8d84c350724e6fa8de58",
+    "image_digest_read": "docker image inspect icecream/farm-node:ubuntu22-gcc11-boost174 --format '{{.RepoDigests}} {{.Id}}' on q3, live -- not hardcoded from any prior report. RepoDigest and Id both equal this value on q3. The SAME tag was observed with a DIFFERENT Id (sha256:fe001a6138f017608b8846b43bf268a76a9d7a5b66c3364ba3f881da2ff0c54b, empty RepoDigests) on research7 as of 2026-08-23 -- exactly the mutable-tag hazard this pinned digest exists to catch; preflight correctly refuses on research7 until that host's image is corrected (out of this task's scope -- flagged in the S4 report).",
+    "recipe": "reused ~/ad-build on q3 (built earlier via the same autogen.sh && configure && make -j24 recipe inside the pinned container; its own build.log ends BUILD-EXIT=0), after the source-identity verification above"
+  },
+  "tar": {
+    "path": "p50-root.tar",
+    "sha256": "c81e6f1f6f32e29a49b5c5623a5c91ccc3197eba160475993659b46d975450db",
+    "bytes": 18442240,
+    "layout": "tar -cf p50-root.tar -C p50-root . -- unpacks flat to obj/{scheduler,daemon,client}/... + MANIFEST.tsv at its own root, a drop-in bind-source for farm.py's /work mount"
+  },
+  "hub_source": {
+    "host": "q3",
+    "path": "~/role-artifacts/p50-root"
+  },
+  "runtime_dependencies": "ldd on every linked binary below resolves entirely to /lib/x86_64-linux-gnu/* system libraries inside the pinned image; nothing else from the build tree is dlopened, so the files listed here are the complete runtime root",
+  "binaries": [
+    {
+      "path": "obj/scheduler/icecc-scheduler",
+      "role": "S",
+      "sha256": "6ccb91b0dab7596adf2344cedbd56f5eb606815410e85ad1b32cd56a24e78792",
+      "mode": "755",
+      "size": 5711584,
+      "version_probe": {
+        "command": "--version",
+        "note": "rejects --version as an unrecognized option but still emits its startup banner on that same invocation",
+        "expect_substring": "ICECREAM scheduler 1.4.92"
+      }
+    },
+    {
+      "path": "obj/daemon/iceccd",
+      "role": "F",
+      "sha256": "c0a1df52caee16e5b10d5101f89c4919d3b5df6e073993ed8b239b256ae9d88a",
+      "mode": "755",
+      "size": 7527096,
+      "version_probe": {
+        "command": "strings",
+        "note": "no --version flag exists in this era; identity read from the embedded startup-banner string",
+        "expect_substring": "ICECREAM daemon 1.4.92"
+      }
+    },
+    {
+      "path": "obj/client/icecc",
+      "role": "C",
+      "sha256": "2c8691ea61c188b0b3d84808a9b577aa2c854b7c4ea132cd398353578bab6853",
+      "mode": "755",
+      "size": 5172840,
+      "version_probe": {
+        "command": "--version",
+        "expect_exact": "ICECC 1.4.92"
+      }
+    },
+    {
+      "path": "obj/client/icecc-create-env",
+      "role": "C",
+      "sha256": "ee7d30b240c38bccf66d4afcdd45993f115a01d4a2fb4e9143d38596609d2ba4",
+      "mode": "755",
+      "size": 19557,
+      "version_probe": {
+        "command": null,
+        "note": "shell script with no embedded version marker in either era; sha256 is the sole identity anchor"
+      }
+    },
+    {
+      "path": "MANIFEST.tsv",
+      "role": null,
+      "sha256": "97e4a68d21db7c50981989dae9dc04232548b2772c71a4b0700ea3fec25fe53a",
+      "mode": "664",
+      "size": 482,
+      "version_probe": {
+        "command": null,
+        "note": "the host-side TSV record is hash-pinned too, so a tampered TSV (without also re-signing this committed JSON) is caught the same way as a tampered binary"
+      }
+    }
+  ]
+}

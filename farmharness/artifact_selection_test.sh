@@ -326,16 +326,17 @@ def run_mocked_up():
     # Pure per-command content match -- NOT sticky state. A sticky
     # "once launch starts, fake everything" flag is wrong here: up()
     # calls resolve_role() again for EACH worker role, interleaved with
-    # the scheduler's own launch actions, and each of those resolve_role()
-    # calls must still reach the REAL, read-only preflight checks (or this
-    # harness itself would falsely blind preflight for every role after
-    # the first). These six tokens cover every command up() issues once
-    # actually launching/tearing down/polling a container (docker_rm's
-    # "farm-{sched,worker,client}" name, the docker run --name of same,
-    # the scratch chmod/mkdir prep, and the sched.log/worker.log polling)
-    # and appear in NONE of preflight()'s own commands (sha256sum/stat on
-    # role-artifacts paths, docker image inspect, docker run --rm --v
-    # .../probe with no --name and no scratch mount).
+    # the launch actions for the scheduler role, and each of those
+    # resolve_role() calls must still reach the REAL, read-only preflight
+    # checks (or this harness itself would falsely blind preflight for
+    # every role after the first). These six tokens cover every command
+    # up() issues once actually launching/tearing down/polling a container
+    # (docker_rm uses the "farm-{sched,worker,client}" name, so does the
+    # docker run --name of same, plus the scratch chmod/mkdir prep and the
+    # sched.log/worker.log polling) and appear in none of the commands
+    # preflight() itself issues (sha256sum/stat on role-artifacts paths,
+    # docker image inspect, docker run --rm --v .../probe with no --name
+    # and no scratch mount).
     LAUNCH_TOKENS = ("farm-sched", "farm-worker", "farm-client", "sched.log", "worker.log", "chmod 1777")
     def fake_sh(host, cmd, timeout=120, check=False):
         if any(tag in cmd for tag in LAUNCH_TOKENS):

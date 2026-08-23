@@ -1,0 +1,89 @@
+{
+  "set": "p43",
+  "provisional": false,
+  "authority_note": "tag 1.4 is a tagged upstream release commit; this manifest is the final machine-readable authority for the P43 side of the role-artifact compatibility matrix.",
+  "source": {
+    "sha": "cd74801e0fa4e83e3ae254ca1d7fe98642f36b89",
+    "ref": "tag 1.4",
+    "commit_subject": "Update version to 1.4 for release",
+    "commit_date": "2022-03-04T09:20:38-06:00",
+    "verification": "git fetch origin +refs/tags/1.4:refs/tags/p43-authority resolved to this exact SHA; fetched fresh via git archive and extracted into ~/p43-build/source on q3. Re-verified 2026-08-23: `git cat-file -t` confirms the object is a real commit in this repo, `git tag --points-at` confirms tag 1.4 points at it, and it is reachable via origin/1.4-branch."
+  },
+  "build": {
+    "container_image": "icecream/farm-node:ubuntu22-gcc11-boost174",
+    "image_digest": "sha256:bdb55d4287a473e3ebfbaa7715a50ee670659777278b8d84c350724e6fa8de58",
+    "image_digest_read": "docker image inspect icecream/farm-node:ubuntu22-gcc11-boost174 --format '{{.RepoDigests}} {{.Id}}' on q3, live -- not hardcoded from any prior report. RepoDigest and Id both equal this value on q3.",
+    "recipe": "autogen.sh && configure && make -j24, all inside the pinned container image above; dependencies resolved entirely from the container's system packages",
+    "tweaks_applied": "none -- autogen.sh emitted only benign AC_TRY_COMPILE/AC_PROG_LIBTOOL obsolescence warnings (expected for this AC_PREREQ([2.63]) configure.ac); make emitted only a benign docbook2x-missing warning for man-page generation; BUILD-EXIT=0"
+  },
+  "tar": {
+    "path": "p43-root.tar",
+    "sha256": "6da186b6c4c10f2f15d9e5440156ed890112523f53e905f9dd0d2f314540a3ae",
+    "bytes": 12646400,
+    "layout": "tar -cf p43-root.tar -C p43-root . -- unpacks flat to obj/{scheduler,daemon,client}/... + MANIFEST.tsv at its own root, a drop-in bind-source for farm.py's /work mount"
+  },
+  "hub_source": {
+    "host": "q3",
+    "path": "~/role-artifacts/p43-root"
+  },
+  "runtime_dependencies": "ldd on every linked binary below resolves entirely to /lib/x86_64-linux-gnu/* system libraries inside the pinned image; nothing else from the build tree is dlopened, so the files listed here are the complete runtime root",
+  "binaries": [
+    {
+      "path": "obj/scheduler/icecc-scheduler",
+      "role": "S",
+      "sha256": "c205c1347064503b3ab7c56af4584ffb0806f52e2c5786d343883db871c44525",
+      "mode": "755",
+      "size": 3715696,
+      "version_probe": {
+        "command": "--version",
+        "note": "rejects --version as an unrecognized option but still emits its startup banner on that same invocation",
+        "expect_substring": "ICECREAM scheduler 1.4.0"
+      }
+    },
+    {
+      "path": "obj/daemon/iceccd",
+      "role": "F",
+      "sha256": "62bcc05ad91461212cd9616d960905c97c839b316aac3a9e1e1080608a193441",
+      "mode": "755",
+      "size": 4319440,
+      "version_probe": {
+        "command": "strings",
+        "note": "no --version flag exists in this era; identity read from the embedded startup-banner string",
+        "expect_substring": "ICECREAM daemon 1.4.0"
+      }
+    },
+    {
+      "path": "obj/client/icecc",
+      "role": "C",
+      "sha256": "c3dc54eadca303f21eaa1f90c265a38a1038378be08f887b24bb3bbea7dabeae",
+      "mode": "755",
+      "size": 4579136,
+      "version_probe": {
+        "command": "--version",
+        "expect_exact": "ICECC 1.4.0"
+      }
+    },
+    {
+      "path": "obj/client/icecc-create-env",
+      "role": "C",
+      "sha256": "aab94b6ea8f41335de807f814d24a56e827ce5efaf8b06797a365699e83b36cb",
+      "mode": "755",
+      "size": 18411,
+      "version_probe": {
+        "command": null,
+        "note": "shell script with no embedded version marker in either era; sha256 is the sole identity anchor"
+      }
+    },
+    {
+      "path": "MANIFEST.tsv",
+      "role": null,
+      "sha256": "12e24679c29975a0092239b542986ca9acffd378e1f8378dcbd6b3d77c1160f8",
+      "mode": "664",
+      "size": 479,
+      "version_probe": {
+        "command": null,
+        "note": "the host-side TSV record is hash-pinned too, so a tampered TSV (without also re-signing this committed JSON) is caught the same way as a tampered binary"
+      }
+    }
+  ]
+}

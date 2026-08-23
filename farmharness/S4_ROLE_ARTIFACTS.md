@@ -1,16 +1,30 @@
 # S4 role artifacts: P43 vs trunk hash-bound runtime roots
 
 Built on q3 (tt-quietbox3) inside the pinned container
-`icecream/farm-node:ubuntu22-gcc11-boost174`. Not committed to git (binaries);
-this file is the durable record of exactly what was built, how, and what it
-hashes to. Roots and tars live on q3 under `~/role-artifacts/`.
+`icecream/farm-node:ubuntu22-gcc11-boost174`. Binaries are not committed to
+git; roots and tars live on q3 under `~/role-artifacts/` and are distributed
+from there to other hosts on demand (see "Distribution" below).
+
+**The machine-readable authority is `farmharness/role-manifests/p43.json`
+and `farmharness/role-manifests/p50.json`.** This document is narrative
+only. `farm.py`'s `preflight()`/`distribute()`/`launch_image()` all read the
+JSON, never this file -- if the two ever disagree, the JSON wins and this
+file is stale and should be corrected.
+
+**p50 is PROVISIONAL, not a final release authority.** It is a foundation
+build of trunk at commit `43297d53`, used to exercise the P43-vs-trunk
+mechanism end to end. Do not treat its hashes as "the" P50 release
+identity, and do not promote it without a rebuild -- see
+`role-manifests/p50.json`'s `rebuild_required` block for exactly what has
+to converge first (S1b release-identity bump to 1.5.90, and S2 assignment
+handoff) and what regenerating the manifest for a real release entails.
 
 ## Source provenance
 
 | Set | Commit | Tag/description | Verification |
 |---|---|---|---|
-| p43 | `cd74801e0fa4e83e3ae254ca1d7fe98642f36b89` | tag `1.4`, "Update version to 1.4 for release" (2022-03-04) | `git fetch origin +refs/tags/1.4:refs/tags/p43-authority` resolved to this exact SHA; fetched fresh via `git archive` and extracted into `~/p43-build/source` on q3 |
-| p50 | `43297d535232d8becb58866d5fb6cc73fa3b033d` | trunk successor, "Add inert protocol-50 cache endpoint advertisement" | reused existing `~/ad-build` on q3 -- verified first via `git archive 43297d53... | ssh q3 tar -x` into a scratch dir, then `diff -rq` against `~/ad-build/source` filtered for the (expected) one-sided autogen-generated extras: **0 differing/missing tracked files** |
+| p43 | `cd74801e0fa4e83e3ae254ca1d7fe98642f36b89` | tag `1.4`, "Update version to 1.4 for release" (2022-03-04) | `git fetch origin +refs/tags/1.4:refs/tags/p43-authority` resolved to this exact SHA; fetched fresh via `git archive` and extracted into `~/p43-build/source` on q3. Re-verified 2026-08-23 against this repo's own history: real commit, tag `1.4` points at it, reachable via `origin/1.4-branch`. |
+| p50 | `43297d535232d8becb58866d5fb6cc73fa3b033d` | trunk foundation (**provisional**), "Add inert protocol-50 cache endpoint advertisement" | reused existing `~/ad-build` on q3 -- verified first via `git archive 43297d53... \| ssh q3 tar -x` into a scratch dir, then `diff -rq` against `~/ad-build/source` filtered for the (expected) one-sided autogen-generated extras: **0 differing/missing tracked files**. Re-verified 2026-08-23: real commit, not an ancestor of this branch's own tip (expected -- separate development line), reachable via `origin/implementer/issue16-p50-cache-advertisement-provisional` and the `provisional/s1b-release-identity`/`provisional/s2-assignment-handoff` branches. |
 
 ## Build outcomes
 
@@ -23,25 +37,39 @@ this AC_PREREQ([2.63])-era configure.ac -- warnings only, no errors.
 **p50**: reused `~/ad-build` (built earlier, confirmed BUILD-EXIT=0 in its
 own `build.log`) after the tree-diff verification above.
 
-## MANIFEST.tsv -- p43-root (`~/role-artifacts/p43-root/MANIFEST.tsv`)
+## The manifests (`farmharness/role-manifests/{p43,p50}.json`)
+
+Each manifest binds, for its set: the exact source commit SHA and how it was
+verified; the pinned container image and its `RepoDigest` (read live via
+`docker image inspect` on q3, never hardcoded); the tar's path/sha256/size
+and how it unpacks; and a `binaries` array covering every executable/script
+in the root **plus the host-side `MANIFEST.tsv` itself** (so a tampered TSV
+is caught the same way as a tampered binary) -- each entry has its relative
+path, the role it serves (`S`/`F`/`C`/`null`), sha256, octal mode, byte
+size, and (where one exists) the exact version-probe command and expected
+output string.
+
+The current hashes (cross-checked 2026-08-23 by SSHing to q3 and hashing the
+real files -- not copied from any prior report; zero mismatches found):
 
 ```
-path	sha256	version_probe
-obj/scheduler/icecc-scheduler	c205c1347064503b3ab7c56af4584ffb0806f52e2c5786d343883db871c44525	ICECREAM scheduler 1.4.0
-obj/daemon/iceccd	62bcc05ad91461212cd9616d960905c97c839b316aac3a9e1e1080608a193441	ICECREAM daemon 1.4.0
-obj/client/icecc	c3dc54eadca303f21eaa1f90c265a38a1038378be08f887b24bb3bbea7dabeae	ICECC 1.4.0
-obj/client/icecc-create-env	aab94b6ea8f41335de807f814d24a56e827ce5efaf8b06797a365699e83b36cb	n/a (script, no embedded version marker)
+p43-root/obj/scheduler/icecc-scheduler   c205c1347064503b3ab7c56af4584ffb0806f52e2c5786d343883db871c44525   ICECREAM scheduler 1.4.0
+p43-root/obj/daemon/iceccd               62bcc05ad91461212cd9616d960905c97c839b316aac3a9e1e1080608a193441   ICECREAM daemon 1.4.0
+p43-root/obj/client/icecc                c3dc54eadca303f21eaa1f90c265a38a1038378be08f887b24bb3bbea7dabeae   ICECC 1.4.0
+p43-root/obj/client/icecc-create-env     aab94b6ea8f41335de807f814d24a56e827ce5efaf8b06797a365699e83b36cb   (script, no version marker)
+p43-root/MANIFEST.tsv                    12e24679c29975a0092239b542986ca9acffd378e1f8378dcbd6b3d77c1160f8   n/a
+p43-root.tar                             6da186b6c4c10f2f15d9e5440156ed890112523f53e905f9dd0d2f314540a3ae   12646400 bytes
+
+p50-root/obj/scheduler/icecc-scheduler   6ccb91b0dab7596adf2344cedbd56f5eb606815410e85ad1b32cd56a24e78792   ICECREAM scheduler 1.4.92
+p50-root/obj/daemon/iceccd               c0a1df52caee16e5b10d5101f89c4919d3b5df6e073993ed8b239b256ae9d88a   ICECREAM daemon 1.4.92
+p50-root/obj/client/icecc                2c8691ea61c188b0b3d84808a9b577aa2c854b7c4ea132cd398353578bab6853   ICECC 1.4.92
+p50-root/obj/client/icecc-create-env     ee7d30b240c38bccf66d4afcdd45993f115a01d4a2fb4e9143d38596609d2ba4   (script, no version marker)
+p50-root/MANIFEST.tsv                    97e4a68d21db7c50981989dae9dc04232548b2772c71a4b0700ea3fec25fe53a   n/a
+p50-root.tar                             c81e6f1f6f32e29a49b5c5623a5c91ccc3197eba160475993659b46d975450db   18442240 bytes
 ```
 
-## MANIFEST.tsv -- p50-root (`~/role-artifacts/p50-root/MANIFEST.tsv`)
-
-```
-path	sha256	version_probe
-obj/scheduler/icecc-scheduler	6ccb91b0dab7596adf2344cedbd56f5eb606815410e85ad1b32cd56a24e78792	ICECREAM scheduler 1.4.92
-obj/daemon/iceccd	c0a1df52caee16e5b10d5101f89c4919d3b5df6e073993ed8b239b256ae9d88a	ICECREAM daemon 1.4.92
-obj/client/icecc	2c8691ea61c188b0b3d84808a9b577aa2c854b7c4ea132cd398353578bab6853	ICECC 1.4.92
-obj/client/icecc-create-env	ee7d30b240c38bccf66d4afcdd45993f115a01d4a2fb4e9143d38596609d2ba4	n/a (script, no embedded version marker)
-```
+Pinned image (both sets): `icecream/farm-node:ubuntu22-gcc11-boost174` @
+`sha256:bdb55d4287a473e3ebfbaa7715a50ee670659777278b8d84c350724e6fa8de58`.
 
 Version probes: `icecc --version` and (for the scheduler, which rejects
 `--version` as an unrecognized option in both eras but still emits its
@@ -53,41 +81,135 @@ either era -- its sha256 is still the identity anchor.
 
 All three linked-and-versioned executables' `ldd` output resolves entirely
 to system libraries under `/lib/x86_64-linux-gnu/` in both sets -- nothing
-else from the build tree is dlopened, so the four listed files are the
-complete runtime root.
+else from the build tree is dlopened, so the four listed files plus
+MANIFEST.tsv are the complete tracked root.
 
-## Tar artifacts (`~/role-artifacts/`)
+## Preflight: fail-closed, in the real launch path
 
-| File | sha256 | bytes |
-|---|---|---|
-| p43-root.tar | `6da186b6c4c10f2f15d9e5440156ed890112523f53e905f9dd0d2f314540a3ae` | 12646400 |
-| p50-root.tar | `c81e6f1f6f32e29a49b5c5623a5c91ccc3197eba160475993659b46d975450db` | 18442240 |
+`farm.py` has a `preflight(host, binary_set, role)` that runs before ANY
+docker action for a selected set, on every host that will run that role.
+It checks, in order: the root directory is present on `host`; every
+manifest-listed file's sha256 AND mode match exactly (root presence,
+per-file hash/mode -- this is what a same-version-but-swapped-binary attack
+fails on); the pinned image's live `RepoDigest` on `host` matches the
+manifest; and the role's own binary reports the expected version string
+when actually executed inside the pinned image. Any failure raises with a
+precise, named reason and nothing is stopped or started.
 
-Each tar is `tar -cf <set>-root.tar -C <set>-root .`, i.e. it unpacks to
-`obj/{scheduler,daemon,client}/...` + `MANIFEST.tsv` at its own root -- a
-drop-in replacement for farm.py's `TREE` bind-source (mount at `/work`).
+`resolve_role(host, binary_set, role)` is what `up()` and `run_client()`
+actually call (`up()` twice -- scheduler role, then once per worker in the
+loop; `run_client()` once, for the client role) -- verified by an
+AST-based test in `artifact_selection_test.sh` that counts the call sites
+exactly, so a partial removal (one role's gate deleted, others left intact)
+is still caught. `resolve_role()` calls `preflight()` and, on success, logs
+a `PREFLIGHT-OK host=... role=... set=...` line (both to stdout and to a
+hub-side launch log) before returning the resolved `/work` bind-source and
+a **digest-pinned** `repo@sha256:...` image reference for the actual
+`docker run` (not the mutable tag -- the tag stays only as the bootstrap
+alias for `binary_set=None`, i.e. unselected/prior behavior, unchanged).
+
+`resolve_role()` does **not** distribute anything itself. If the selected
+set's root is absent (or wrong) on a host and `distribute` was never run
+there, preflight refuses with a message naming the exact problem and
+suggesting the `distribute` command to fix it -- that refusal, not a
+silent auto-fetch, is the fail-closed behavior the spec requires.
+
+## Distribution: idempotent, explicit, repair-capable
+
+```
+python3 farm.py distribute --sets p43,p50 --hosts research6,research7,q2
+```
+
+The **only** code path allowed to write role-artifacts onto a host. It is
+never called automatically by `up()`/`run_client()`/`resolve_role()` --
+bringing files onto a host is always a deliberate, visible operator action,
+never a side effect of trying to launch a cluster.
+
+For each (set, host) pair it checks what's already there against the
+manifest (same per-file sha256+mode check preflight uses). A host that
+already matches exactly is left untouched and reported `already-current`
+(a second run of the command above is a pure no-op, verified). Anything
+else -- root absent, partial, or every-file-verified-wrong (drift,
+corruption, tampering since the last run) -- is (re)synced from a
+manifest-verified copy of q3's tar, relayed through the hub (q3 cannot SSH
+directly to research6/research7/q2 on this network -- confirmed via
+host-key-verification failure -- so the hub, which already reaches every
+host, pulls the tar from q3 and pushes it to the target), and re-verified
+file-by-file immediately after extraction. q3 itself is always skipped (it
+is the source of record, not a distribution target).
+
+This means `distribute` is genuinely a repair path, on purpose: since it
+only ever runs on explicit operator invocation (never automatically), a
+repair it performs is always a visible, intentional action -- never a
+silent side effect that could launder tampering. `preflight` staying
+separate, read-only, and non-repairing is what keeps both "distribute was
+never run" and "distribute was run but the result is now wrong" fail-closed
+on the automatic launch path; `distribute` existing is the remediation for
+either, invoked by a human, not by `up()`.
 
 ## Selection mechanism
 
-`farmharness/farm.py` gained `ROLE_SET_DIR = {"p43": "~/role-artifacts/p43-root",
+`farmharness/farm.py` has `ROLE_SET_DIR = {"p43": "~/role-artifacts/p43-root",
 "p50": "~/role-artifacts/p50-root"}` and `role_tree(binary_set)`
 (`None` -> the original hardcoded `TREE`, unchanged). `up()` takes
 `binary_set_s`/`binary_set_f` (scheduler / every worker), `run_client()`
 takes `binary_set_c`; `main()` exposes `--binary-set-S/-C/-F {p43,p50}`,
 each defaulting to `None` so omitting all three reproduces prior behavior
-exactly. `role_tree()`/`HOSTS`/`ROLE_SET_DIR` are also now safely importable
-without triggering a live deploy (`main()` moved behind
-`if __name__ == "__main__":`) -- required for
-`farmharness/artifact_selection_test.sh` to exercise the real selection code
-instead of a shell reimplementation of it.
+exactly (no manifest lookup, no preflight -- nothing existing changes).
+`role_tree()`/`HOSTS`/`ROLE_SET_DIR`/`preflight()`/`distribute()` are all
+safely importable without triggering a live deploy (`main()` stays behind
+`if __name__ == "__main__":`).
 
-Currently only q3 has `~/role-artifacts/` populated (the task's caution
-scope excluded touching research6/research7/q2); a cross-host cell using
-non-default sets for F on another host needs that host's
-`~/role-artifacts/` populated first -- a natural, separate follow-up.
+All four hosts (`q3`, `research6`, `research7`, `q2`) now have
+`~/role-artifacts/` populated for both sets (q3 is the original source;
+the other three were populated via `distribute`, verified idempotent).
 
-## Selection-mutation gate: both verbatim runs
+**Known open gap, not fixed by this task (out of its stated scope):**
+`research7`'s local Docker image under the tag
+`icecream/farm-node:ubuntu22-gcc11-boost174` has a **different** content
+digest (`sha256:fe001a6138f017608b8846b43bf268a76a9d7a5b66c3364ba3f881da2ff0c54b`,
+empty `RepoDigests`) than the pinned one on q3/research6/q2. `preflight`
+correctly and reproducibly refuses on research7 for both sets, all three
+roles, by IMAGE DIGEST -- this is real, pre-existing drift discovered while
+building this mechanism, not a synthetic test case, and is exactly the
+class of problem gap #5 (mutable-tag hazard) exists to catch. Fixing it
+(rebuild or re-pull the image identically on research7) needs a follow-up;
+it was out of this task's caution scope ("do not touch anything else on
+those hosts" beyond role-artifacts and the sanctioned test mutations).
 
-See the S4 delivery report for the full PASS run, the deliberately-broken
-FAIL run (role_tree() temporarily collapsed to always resolve p50), and the
-restore-and-reconfirm-PASS run.
+## Verification gate (`farmharness/artifact_selection_test.sh`)
+
+Extends the original 9 selection-mechanism assertions (identity baseline +
+selection-flip mutation, per role, per set -- unchanged) with:
+
+- a static AST check that `resolve_role()` is called exactly the expected
+  number of times in `up()` (2: S + per-worker F) and `run_client()` (1: C),
+  so a partial deletion is caught even though it would not blank the
+  function entirely;
+- `distribute` run twice against research6/research7/q2 for both sets --
+  first run materializes, second run is a verified no-op;
+- the full preflight matrix green on research6/q2 after distribution, and
+  the research7 image-digest gap above reproduced and asserted as a real,
+  named refusal (not accepted as a false pass);
+- a same-version wrong-hash mutant, two ways: an isolated scratch copy
+  (corrupt it, point preflight at it directly, confirm refusal, discard the
+  copy), and a real end-to-end cycle on research6's actual distributed
+  copy (corrupt one real file in place, confirm preflight reddens naming
+  that exact file, re-run `distribute` and confirm it repairs and reports
+  the repair, confirm preflight goes green again, confirm a further
+  `distribute` call is then a clean no-op -- i.e. the repair itself is
+  idempotent) -- research6 is left fully hash-clean afterward, reverified;
+- a skipped-preflight mutant: `up()`'s source is temporarily edited to
+  neutralize the scheduler-role `resolve_role()` call, and a mocked
+  (docker/ssh-safe -- no real container is ever started or stopped) dynamic
+  invocation of `up()` confirms the `PREFLIGHT-OK` marker for that role
+  disappears (while the untouched worker role's marker still appears,
+  proving the detection is precise) and that execution still reaches the
+  launch actions completely unguarded -- exactly the gap this check exists
+  to catch. farm.py is restored byte-exact (`cmp`-verified) before the
+  script continues, and the marker's return is reconfirmed afterward.
+
+Run: `./artifact_selection_test.sh` (needs SSH reachability to q3,
+research6, research7, q2; `ARTIFACT_TEST_HOST` overrides the host used for
+the identity/mutant probes, default `q3`; never starts or stops the actual
+farm-sched/farm-worker/farm-client cluster).
