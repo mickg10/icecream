@@ -3112,7 +3112,8 @@ void mutate_commit(TxCommit& commit, CommitMismatchField field) {
 // TX_BEGIN and BODY components, then answers with a commit derived from the received begin
 // with exactly one field mutated (or none for the baseline), and waits for the peer to close.
 asio::awaitable<void> raw_f_serve_and_commit(tcp::acceptor& acceptor, FStoreGuid f_guid,
-                                             CommitMismatchField field, TxBegin& out_begin) {
+                                             CommitMismatchField field, TxBegin& out_begin,
+                                             std::vector<uint8_t>* out_body = nullptr) {
     tcp::socket socket = co_await acceptor.async_accept(asio::use_awaitable);
     const SessionHello hello =
         raw_decode<SessionHello>(co_await raw_read(socket, kInitialMaxFramePayload));
@@ -3146,10 +3147,55 @@ asio::awaitable<void> raw_f_serve_and_commit(tcp::acceptor& acceptor, FStoreGuid
         if (body.bytes.empty())
             break;
         body_bytes += body.bytes.size();
+        if (out_body)
+            out_body->insert(out_body->end(), body.bytes.begin(), body.bytes.end());
     }
     TxCommit commit = correct_commit_for(begin);
     mutate_commit(commit, field);
     co_await raw_write(socket, Message{commit});
+    co_await raw_wait_for_close(socket);
+    co_return;
+}
+
+
+// Ordinary same-F exact retry (bigoracle endpoint-HOLD shape B): after a mismatch refusal the
+// SAME F presents the unchanged retained route; the client must replay the IDENTICAL TxBegin
+// and BODY and commit with reconnect == ExactMatch.  The fake itself throws if C resets,
+// rebinds, or reconstructs any begin/body identity.
+asio::awaitable<void> raw_f_exact_retry(tcp::acceptor& acceptor, FStoreGuid same_f_guid,
+                                        TxBegin captured_begin,
+                                        std::vector<uint8_t> captured_body) {
+    tcp::socket socket = co_await acceptor.async_accept(asio::use_awaitable);
+    const SessionHello hello =
+        raw_decode<SessionHello>(co_await raw_read(socket, kInitialMaxFramePayload));
+    const SessionSelection selection =
+        negotiate_session(hello, kProtocolVersion, kProtocolVersion, kKnownProfileMask);
+    SessionState peer;
+    peer.selected_protocol = selection.protocol;
+    peer.negotiated_profiles = selection.negotiated_profiles;
+    peer.limits = selection.limits;
+    peer.f_store_guid = same_f_guid;
+    peer.namespace_present = true;
+    peer.route_present = true;
+    peer.history_nonce = captured_begin.history_nonce;
+    peer.next_rel_seq = captured_begin.rel_seq;
+    peer.state_digest = captured_begin.pre_state_digest;
+    co_await raw_write(socket, Message{peer});
+    const TxBegin replayed =
+        raw_decode<TxBegin>(co_await raw_read(socket, peer.limits.max_frame_payload));
+    if (replayed != captured_begin)
+        throw std::logic_error("ordinary retry changed retained TxBegin identity");
+    std::vector<uint8_t> replay_body;
+    while (replay_body.size() < replayed.body.encoded_bytes) {
+        BodyMessage part = raw_decode<BodyMessage>(
+            co_await raw_read(socket, peer.limits.max_frame_payload));
+        if (part.bytes.empty())
+            break;
+        replay_body.insert(replay_body.end(), part.bytes.begin(), part.bytes.end());
+    }
+    if (replay_body != captured_body)
+        throw std::logic_error("ordinary retry changed retained BODY bytes");
+    co_await raw_write(socket, Message{correct_commit_for(captured_begin)});
     co_await raw_wait_for_close(socket);
     co_return;
 }
@@ -3188,41 +3234,90 @@ void test_commit_identity_negative_matrix() {
     }
 
     for (const auto& [field, name] : cases) {
-        TestClient client(Id128::from_u64(identity++));
-        const std::vector<uint8_t> input = pseudo_random_bytes(4096);
-        const PreparedTuHandle prepared = admit(client, input);
-        // Cursor preservation is asserted against the LIVE BEGIN's own fields (local-oracle
-        // spec): after refusal, next_rel_seq must still equal begin.rel_seq and state_digest
-        // must still equal begin.pre_state_digest.  The fake F exports the begin it received.
-        TxBegin observed_begin;
-        const FStoreGuid fake_f = Id128::from_u64(identity++);
-        asio::io_context context;
-        tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
-        std::future<void> fake = asio::co_spawn(
-            context,
-            raw_f_serve_and_commit(acceptor, fake_f, field, observed_begin),
-            asio::use_future);
-        std::future<ClientRunResult> run = asio::co_spawn(
-            context, client.endpoint.run(acceptor.local_endpoint(), prepared, {}),
-            asio::use_future);
-        context.run();
-        fake.get();
-        const ClientRunResult rejected = run.get();
-        require(rejected.status == ClientRunStatus::TerminalError &&
-                    client.has_active_transaction() &&
-                    client.endpoint.next_rel_seq() == observed_begin.rel_seq &&
-                    client.endpoint.state_digest() == observed_begin.pre_state_digest &&
-                    client.endpoint.f_store_guid() == std::optional<FStoreGuid>(fake_f) ,
-                std::string(name) +
-                    " commit mismatch rejection did not preserve the transaction cursor");
-
-        P50ServerEndpoint real_server(Id128::from_u64(identity++));
-        const PairResult retried = run_pair(client, real_server);
-        require(retried.client.status == ClientRunStatus::Committed &&
-                    retried.client.reconnect == EndpointReconnectOutcome::ColdFStore &&
-                    !client.has_active_transaction() &&
-                    copy_input(real_server, client.c_store_guid()) == input,
-                std::string(name) + " rejection did not permit an exact retry to commit");
+        // Client A: refusal -> SAME-F exact retry (the REQUIRED exact-retry close: identical
+        // TxBegin and BODY replayed on the unchanged route, commit with ExactMatch).
+        {
+            TestClient client(Id128::from_u64(identity++));
+            const std::vector<uint8_t> input = pseudo_random_bytes(4096);
+            const PreparedTuHandle prepared = admit(client, input);
+            TxBegin observed_begin;
+            std::vector<uint8_t> observed_body;
+            const FStoreGuid fake_f = Id128::from_u64(identity++);
+            {
+                asio::io_context context;
+                tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+                std::future<void> fake = asio::co_spawn(
+                    context,
+                    raw_f_serve_and_commit(acceptor, fake_f, field, observed_begin,
+                                           &observed_body),
+                    asio::use_future);
+                std::future<ClientRunResult> run = asio::co_spawn(
+                    context, client.endpoint.run(acceptor.local_endpoint(), prepared, {}),
+                    asio::use_future);
+                context.run();
+                fake.get();
+                const ClientRunResult rejected = run.get();
+                require(rejected.status == ClientRunStatus::TerminalError &&
+                            client.has_active_transaction() &&
+                            client.endpoint.next_rel_seq() == observed_begin.rel_seq &&
+                            client.endpoint.state_digest() ==
+                                observed_begin.pre_state_digest &&
+                            client.endpoint.f_store_guid() ==
+                                std::optional<FStoreGuid>(fake_f),
+                        std::string(name) +
+                            " commit mismatch rejection did not preserve the transaction cursor");
+            }
+            {
+                asio::io_context context;
+                tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+                std::future<void> fake = asio::co_spawn(
+                    context,
+                    raw_f_exact_retry(acceptor, fake_f, observed_begin, observed_body),
+                    asio::use_future);
+                std::future<ClientRunResult> run = asio::co_spawn(
+                    context, client.endpoint.run(acceptor.local_endpoint(), {}, {}),
+                    asio::use_future);
+                context.run();
+                fake.get();
+                const ClientRunResult retried = run.get();
+                require(retried.status == ClientRunStatus::Committed &&
+                            retried.reconnect == EndpointReconnectOutcome::ExactMatch &&
+                            !client.has_active_transaction(),
+                        std::string(name) +
+                            " refusal did not permit the same-F exact retry to commit");
+            }
+        }
+        // Client B: refusal -> different-F ColdFStore row, retained as a DISTINCT control:
+        // prepared work survives rejection across an incarnation replacement.
+        {
+            TestClient client(Id128::from_u64(identity++));
+            const std::vector<uint8_t> input = pseudo_random_bytes(4096);
+            const PreparedTuHandle prepared = admit(client, input);
+            TxBegin observed_begin;
+            const FStoreGuid fake_f = Id128::from_u64(identity++);
+            asio::io_context context;
+            tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+            std::future<void> fake = asio::co_spawn(
+                context,
+                raw_f_serve_and_commit(acceptor, fake_f, field, observed_begin),
+                asio::use_future);
+            std::future<ClientRunResult> run = asio::co_spawn(
+                context, client.endpoint.run(acceptor.local_endpoint(), prepared, {}),
+                asio::use_future);
+            context.run();
+            fake.get();
+            require(run.get().status == ClientRunStatus::TerminalError &&
+                        client.has_active_transaction(),
+                    std::string(name) + " (cold-F row) mismatch was not refused");
+            P50ServerEndpoint real_server(Id128::from_u64(identity++));
+            const PairResult retried = run_pair(client, real_server);
+            require(retried.client.status == ClientRunStatus::Committed &&
+                        retried.client.reconnect == EndpointReconnectOutcome::ColdFStore &&
+                        !client.has_active_transaction() &&
+                        copy_input(real_server, client.c_store_guid()) == input,
+                    std::string(name) +
+                        " prepared work did not survive incarnation replacement");
+        }
     }
 }
 
