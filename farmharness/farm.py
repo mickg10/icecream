@@ -30,20 +30,23 @@ KNOWN_SETS = tuple(sorted(LEGACY_MUTABLE_ROOT))
 MANIFEST_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "role-manifests")
 _MANIFEST_CACHE = {}
 
+STORE_ROOT = "~/role-artifacts/store"
+
 def immutable_root(binary_set):
     """The CONTENT-ADDRESSED, immutable runtime root for `binary_set`:
-    ~/role-artifacts/<set>-<tar-sha256>, derived from the committed
-    manifest's OWN tar.sha256 -- never a fixed, mutable per-set path. Two
-    different builds of the same set always resolve to two different
-    paths (the manifest's tar hash changed), so nothing ever needs to be
-    edited or repaired inside an existing published directory: a
-    directory at this exact path either already has the exact content its
-    name asserts (verified on every access by preflight/publish, never
-    just trusted from the name alone), or it does not exist yet."""
+    $HOME/role-artifacts/store/<set>/<tar-sha256>, derived from the
+    committed manifest's OWN tar.sha256 -- never a fixed, mutable per-set
+    path, never a symlink or alias. Two different builds of the same set
+    always resolve to two different paths (the manifest's tar hash
+    changed), so nothing ever needs to be edited or repaired inside an
+    existing published directory: a directory at this exact path either
+    already has the exact content its name asserts (verified on every
+    access by preflight/publish, never just trusted from the name alone),
+    or it does not exist yet."""
     if binary_set not in KNOWN_SETS:
         raise ValueError(f"unknown binary set {binary_set!r} (choices: {KNOWN_SETS})")
     manifest = load_manifest(binary_set)
-    return f"~/role-artifacts/{binary_set}-{manifest['tar']['sha256']}"
+    return f"{STORE_ROOT}/{binary_set}/{manifest['tar']['sha256']}"
 
 def role_tree(binary_set):
     return TREE if binary_set is None else immutable_root(binary_set)
@@ -135,23 +138,116 @@ def verify_role_files(host, root, manifest):
                              f"write-stripped {_write_stripped(b['mode'])}, actual {actual_mode})")
     return problems
 
+def _publish_script(binary_set, manifest, root, tar_name, local_tar):
+    """Build ONE remote bash script that does the ENTIRE
+    stage->verify->bind sequence under a single HOST-CANONICAL flock held
+    for its full duration -- not a hub-local lock (which only serializes
+    invocations sharing this one checkout's lockfile path; a genuinely
+    concurrent publisher using a different checkout, or `distribute` run
+    from cron, would not see it). The lock is a real `flock()` on a file
+    UNDER THE TARGET HOST'S OWN FILESYSTEM, acquired via `exec 9>...` +
+    `flock -x -w120 9` inside this one SSH-delivered script, so it
+    serializes ANY two processes -- from any checkout, any host, any
+    invocation mechanism -- racing to publish the SAME set on the SAME
+    host. Doing the verify-then-rename sequence as one locked script
+    (rather than the hub issuing several separate, unlocked SSH round
+    trips) is what makes the lock actually cover the critical section,
+    not just individual steps of it.
+
+    `verify BASE` (a shell function, called against $ROOT if it exists,
+    else $TMP after extraction) checks every manifest file's sha256 AND
+    mode (manifest mode OR its write-stripped variant -- see
+    _write_stripped()) against BASE, reading the (path, sha256, mode,
+    write-stripped-mode) list from an embedded heredoc so there is no
+    per-file code duplication.
+
+    Emits exactly one final, machine-parseable status line:
+    PUBLISH-ALREADY-CURRENT / PUBLISH-OK / PUBLISH-LOCK-TIMEOUT /
+    PUBLISH-EXTRACT-FAILED / PUBLISH-EXISTS-BUT-FAILS:<problems> /
+    PUBLISH-TEMP-VERIFY-FAILED:<problems> /
+    PUBLISH-FINAL-VERIFY-FAILED:<problems>."""
+    filelist = "\n".join(
+        f"{b['path']}\t{b['sha256']}\t{b['mode']}\t{_write_stripped(b['mode'])}"
+        for b in manifest["binaries"]
+    )
+    # `~` is NOT expanded by bash inside double quotes (only an UNQUOTED
+    # leading `~` is) -- caught live: assigning ROOT="~/role-artifacts/..."
+    # silently created a directory literally named "~" under the SSH
+    # session's cwd instead of under $HOME, and every later step in the
+    # SAME script stayed internally consistent with that wrong path, so
+    # the script still reported PUBLISH-OK. Every quoted path embedded in
+    # this script uses $HOME (which DOES expand inside double quotes,
+    # being ordinary parameter expansion, not tilde expansion) instead --
+    # matching the exact store-layout spec, which already spells it
+    # $HOME/role-artifacts/store/... for this reason.
+    store_root_expanded = STORE_ROOT.replace("~", "$HOME", 1)
+    root_expanded = root.replace("~", "$HOME", 1)
+    lockfile = f"{store_root_expanded}/.publish-{binary_set}.lock"
+    if local_tar:
+        extract_line = f'tar -xf "$HOME/role-artifacts/{tar_name}" -C "$TMP"'
+    else:
+        extract_line = 'tar -x -C "$TMP"'  # reads the tar bytes from this script's own stdin
+    return f'''set -u
+mkdir -p "{store_root_expanded}/{binary_set}"
+exec 9>"{lockfile}"
+if ! flock -x -w 120 9; then echo "PUBLISH-LOCK-TIMEOUT"; exit 75; fi
+
+ROOT="{root_expanded}"
+TMP="{root_expanded}.tmp-$$"
+
+verify() {{
+    base="$1"
+    FAIL=""
+    while IFS=$'\\t' read -r path sha mode1 mode2; do
+        f="$base/$path"
+        if [ ! -e "$f" ]; then FAIL="$FAIL $path:absent"; continue; fi
+        h=$(sha256sum "$f" | cut -d' ' -f1)
+        m=$(stat -c %a "$f")
+        [ "$h" = "$sha" ] || FAIL="$FAIL $path:sha256=$h"
+        if [ "$m" != "$mode1" ] && [ "$m" != "$mode2" ]; then FAIL="$FAIL $path:mode=$m"; fi
+    done <<'FILELIST'
+{filelist}
+FILELIST
+}}
+
+if [ -d "$ROOT" ]; then
+    verify "$ROOT"
+    if [ -z "$FAIL" ]; then echo "PUBLISH-ALREADY-CURRENT"; exit 0; fi
+    echo "PUBLISH-EXISTS-BUT-FAILS:$FAIL"; exit 3
+fi
+
+rm -rf "$TMP"; mkdir -p "$TMP"
+if ! {extract_line}; then echo "PUBLISH-EXTRACT-FAILED"; rm -rf "$TMP"; exit 1; fi
+
+verify "$TMP"
+if [ -n "$FAIL" ]; then echo "PUBLISH-TEMP-VERIFY-FAILED:$FAIL"; rm -rf "$TMP"; exit 2; fi
+
+mv -Tn "$TMP" "$ROOT" 2>/dev/null
+rm -rf "$TMP" 2>/dev/null
+verify "$ROOT"
+if [ -n "$FAIL" ]; then echo "PUBLISH-FINAL-VERIFY-FAILED:$FAIL"; exit 4; fi
+chmod -R a-w "$ROOT" 2>/dev/null
+echo "PUBLISH-OK"
+'''
+
 def publish_immutable_root(host, binary_set):
     """Idempotently ensure immutable_root(binary_set) exists and is
-    hash-clean on `host`. If it already verifies (verify_role_files() ==
-    []), this is a pure no-op -- "already-current". Otherwise it extracts
-    a manifest-verified copy of q3's tar into a FRESH TEMP SIBLING (never
-    into the final name directly), verifies EVERY manifest entry against
-    that temp copy, and only then atomically renames it into the final
-    immutable name (`mv -Tn`: a single rename(2) on the same filesystem
-    that refuses to clobber an existing destination -- verified live: GNU
-    coreutils mv -Tn against an existing destination exits 0 but performs
-    no move, so this function always re-verifies the FINAL name afterward
-    rather than trusting the exit code). Successfully published trees are
-    chmod'd read-only (a-w) as a defense-in-depth signal -- the real
-    guarantee is that no code path in this file ever attempts to write
-    into an existing published tree again, not the chmod bit alone (the
-    owning user can always chmod their own files back, same as any Unix
-    permission).
+    hash-clean on `host`, under a HOST-CANONICAL lock spanning the ENTIRE
+    stage->verify->bind sequence (see _publish_script()). If it already
+    verifies, this is a pure no-op -- "already-current". Otherwise it
+    extracts a manifest-verified copy of q3's tar into a FRESH TEMP
+    SIBLING (never into the final name directly), verifies EVERY manifest
+    entry against that temp copy, and only then atomically renames it
+    into the final immutable name (`mv -Tn`: a single rename(2) on the
+    same filesystem that refuses to clobber an existing destination --
+    verified live: GNU coreutils mv -Tn against an existing destination
+    exits 0 but performs no move, so the script always re-verifies the
+    FINAL name afterward rather than trusting the exit code). Successfully
+    published trees are chmod'd read-only (a-w) as a defense-in-depth
+    signal -- the real guarantee is that no code path in this file ever
+    attempts to write into an existing published tree again, not the
+    chmod bit alone (the owning user can always chmod their own files
+    back, same as any Unix permission).
 
     An EXISTING final name that fails verification is a hard, unrepaired
     failure, by design: content-addressing means a hash-named directory
@@ -171,25 +267,16 @@ def publish_immutable_root(host, binary_set):
     Returns (error, status): error=None and a human-readable status on
     success ("already-current" / "published (root was absent)"); a
     precise reason string as error (status=None) on failure -- including
-    the hard "exists but fails verification" case above. Never touches
-    docker."""
+    the hard "exists but fails verification" and "lock contended past 120s"
+    cases. Never touches docker."""
     manifest = load_manifest(binary_set)
     root = immutable_root(binary_set)
-
-    exists = sh(host, f"test -d {root}").returncode == 0
-    problems = verify_role_files(host, root, manifest) if exists else None
-    if exists and not problems:
-        return None, "already-current"
-    if exists and problems:
-        return (f"publish[{host}/{binary_set}]: {root} EXISTS but FAILS verification "
-                f"({'; '.join(problems)}) -- this violates the content-addressing invariant "
-                f"(a hash-named directory must always match its own name); NOT auto-repaired "
-                f"(immutable roots are never fixed in place). Manual recovery: inspect for "
-                f"tampering, then `rm -rf {root}` on {host} and re-run distribute."), None
-
     tar_name = manifest["tar"]["path"]
+
+    script = _publish_script(binary_set, manifest, root, tar_name, local_tar=(host == "q3"))
     if host == "q3":
-        tar_bytes = None  # extracted directly on-host below; q3 is the tar's source of record
+        r = sh(host, script, timeout=180)
+        out, rc = r.stdout, r.returncode
     else:
         pull = subprocess.run(HOSTS["q3"]["ssh"] + [f"cat ~/role-artifacts/{tar_name}"],
                                capture_output=True, timeout=120)
@@ -200,59 +287,59 @@ def publish_immutable_root(host, binary_set):
         if actual_tar_sha != manifest["tar"]["sha256"]:
             return (f"publish[{host}/{binary_set}]: tar sha256 mismatch reading from q3 "
                     f"(manifest {manifest['tar']['sha256']}, actual {actual_tar_sha})"), None
-        tar_bytes = pull.stdout
+        p = subprocess.run(HOSTS[host]["ssh"] + [script], input=pull.stdout,
+                            capture_output=True, timeout=180)
+        out, rc = p.stdout.decode(errors="replace"), p.returncode
 
-    tmp = f"{root}.tmp-{os.getpid()}-{int(time.time() * 1000)}"
-    if host == "q3":
-        extract = sh(host, f"mkdir -p ~/role-artifacts && rm -rf {tmp} && mkdir -p {tmp} && "
-                            f"tar -xf ~/role-artifacts/{tar_name} -C {tmp}", timeout=120)
-        extract_ok, extract_err = extract.returncode == 0, extract.stderr
-    else:
-        extract_cmd = f"mkdir -p ~/role-artifacts && rm -rf {tmp} && mkdir -p {tmp} && tar -x -C {tmp}"
-        push = subprocess.run(HOSTS[host]["ssh"] + [extract_cmd], input=tar_bytes,
-                               capture_output=True, timeout=120)
-        extract_ok, extract_err = push.returncode == 0, push.stderr.decode(errors="replace")
-    if not extract_ok:
-        sh(host, f"rm -rf {tmp}")
-        return f"publish[{host}/{binary_set}]: extract failed on {host}: {extract_err[:200]}", None
-
-    problems_tmp = verify_role_files(host, tmp, manifest)
-    if problems_tmp:
-        sh(host, f"rm -rf {tmp}")
+    line = out.strip().splitlines()[-1] if out.strip() else ""
+    if line == "PUBLISH-ALREADY-CURRENT":
+        return None, "already-current"
+    if line == "PUBLISH-OK":
+        return None, "published (root was absent)"
+    if line == "PUBLISH-LOCK-TIMEOUT":
+        return (f"publish[{host}/{binary_set}]: could not acquire the host-canonical publish "
+                f"lock within 120s -- another publisher is (or was) mid-critical-section "
+                f"on {host} for {binary_set}"), None
+    if line.startswith("PUBLISH-EXISTS-BUT-FAILS:"):
+        problems = line.split(":", 1)[1]
+        return (f"publish[{host}/{binary_set}]: {root} EXISTS but FAILS verification "
+                f"({problems}) -- this violates the content-addressing invariant "
+                f"(a hash-named directory must always match its own name); NOT auto-repaired "
+                f"(immutable roots are never fixed in place). Manual recovery: inspect for "
+                f"tampering, then `rm -rf {root}` on {host} and re-run distribute."), None
+    if line == "PUBLISH-EXTRACT-FAILED":
+        return f"publish[{host}/{binary_set}]: extract failed on {host} (rc={rc}): {out[-300:]}", None
+    if line.startswith("PUBLISH-TEMP-VERIFY-FAILED:"):
         return (f"publish[{host}/{binary_set}]: freshly-extracted temp sibling failed verification "
-                f"(never renamed into the final immutable name): {'; '.join(problems_tmp)}"), None
-
-    # Atomic rename into the final immutable name. -Tn refuses to clobber an
-    # existing destination (verified live: exits 0 but performs no move in
-    # that case) -- if a concurrent publisher of this exact hash won the
-    # race, that is fine, since both publishers extracted and verified the
-    # SAME content; either way, the FINAL name is what gets re-verified
-    # next, not the mv's exit code.
-    sh(host, f"mv -Tn {tmp} {root} 2>/dev/null; rm -rf {tmp}")
-    problems_final = verify_role_files(host, root, manifest)
-    if problems_final:
+                f"(never renamed into the final immutable name): {line.split(':', 1)[1]}"), None
+    if line.startswith("PUBLISH-FINAL-VERIFY-FAILED:"):
         return (f"publish[{host}/{binary_set}]: final immutable path {root} failed verification "
-                f"after publish: {'; '.join(problems_final)}"), None
-    sh(host, f"chmod -R a-w {root} 2>/dev/null; true")
-    return None, "published (root was absent)"
+                f"after publish: {line.split(':', 1)[1]}"), None
+    return f"publish[{host}/{binary_set}]: unrecognized publish script output (rc={rc}): {out[-300:]!r}", None
 
 _ROLE_PROBE_PATH = {"S": "obj/scheduler/icecc-scheduler", "F": "obj/daemon/iceccd", "C": "obj/client/icecc"}
 
 def preflight(host, binary_set):
-    """PURE, resolution-phase identity-binding check: root presence + every
+    """PURE, GENUINELY read-only resolution check: root presence + every
     manifest file's sha256 AND mode (catches a same-version, wrong-hash
     swap -- e.g. a trivial rebuild of one file -- which a version-string
-    check alone would miss) + the pinned image's live RepoDigest. Not
-    role-specific (a host+set's root/image identity doesn't depend on
-    which role will use it) -- callers that need a role-specific check
-    want verify_role_version() instead, which is intentionally a SEPARATE,
-    later, explicitly launch-classified function: this one never invokes
-    `docker run` (docker image inspect is a read-only metadata query, not
-    a container launch) so it can honestly be called "resolution", with
-    zero docker actions, full stop. Returns None on success, a precise
-    reason string on failure. Never raises, never touches anything -- an
-    absent or wrong root is refused here, never repaired here (see
-    publish_immutable_root()'s docstring for why that split matters)."""
+    check alone would miss) + the pinned image's live RepoDigest. Zero
+    `docker run` of any kind (`docker image inspect` is a read-only
+    metadata query, not a container launch) -- no version-probe container
+    is launched here or anywhere in resolution. Not role-specific (a
+    host+set's root/image identity doesn't depend on which role will use
+    it). BO's preferred, simpler design: rather than a separate throwaway
+    probe container proving only that SOME container with this mount
+    COULD run the binary and print the right banner, identity is proven
+    by exact executable hash (stronger than a banner) at resolution time,
+    and independently reconfirmed from INSIDE the actually-launched
+    container after it starts (see verify_launched_container_identity() in
+    up()/run_client()) -- so there is no separate "launch-validation"
+    phase to be honest or dishonest about here at all. Returns None on
+    success, a precise reason string on failure. Never raises, never
+    touches anything -- an absent or wrong root is refused here, never
+    repaired here (see publish_immutable_root()'s docstring for why that
+    split matters)."""
     manifest = load_manifest(binary_set)
     root = immutable_root(binary_set)
 
@@ -270,37 +357,6 @@ def preflight(host, binary_set):
                 f"(manifest {expect_digest}, actual {actual_digest!r})")
     return None
 
-def verify_role_version(host, binary_set, role):
-    """LAUNCH-phase (not resolution) check, deliberately separate from
-    preflight() above: run ROLE's executable inside the pinned image,
-    mounted READ-ONLY from the already-identity-verified immutable root,
-    and confirm it reports the expected version identity. This DOES
-    invoke `docker run --rm` -- an honest, throwaway, non-cluster-mutating
-    docker action, but a docker action nonetheless, which is exactly why
-    it must never be folded into preflight()'s claim of zero docker
-    actions. Returns None on success (including "this role has no defined
-    probe, nothing to check"), a precise reason string on failure."""
-    manifest = load_manifest(binary_set)
-    root = immutable_root(binary_set)
-    probe_rel = _ROLE_PROBE_PATH.get(role)
-    entry = next((b for b in manifest["binaries"] if b["path"] == probe_rel), None)
-    if not entry or not entry["version_probe"]["command"]:
-        return None
-    probe = entry["version_probe"]
-    if probe["command"] == "--version":
-        r = sh(host, f"docker run --rm -v {root}:/probe:ro -u 0:0 {IMG} /probe/{probe_rel} --version 2>&1")
-    else:  # "strings" -- no --version flag exists on this binary in either era
-        r = sh(host, f"docker run --rm -v {root}:/probe:ro -u 0:0 {IMG} bash -c "
-                     f"\"strings /probe/{probe_rel}\"")
-    out = r.stdout
-    expect = probe.get("expect_exact")
-    ok = (out.strip() == expect) if expect is not None else (probe["expect_substring"] in out)
-    if not ok:
-        expect = expect if expect is not None else probe["expect_substring"]
-        return (f"verify_role_version[{host}/{binary_set}/{role}]: version probe mismatch for "
-                f"{probe_rel} (expected {expect!r}, got {out.strip()!r})")
-    return None
-
 def log_launch(line):
     """Print (the existing farm.py convention -- everything else in this
     file reports via stdout, captured by callers/tests already) AND append
@@ -316,12 +372,9 @@ def log_launch(line):
 
 def resolve_role(host, binary_set, role):
     """Resolve the /work bind-source and docker image for one role --
-    PURE identity-binding resolution only (preflight()): zero docker
-    actions. binary_set=None reproduces prior behavior exactly (TREE, the
-    mutable IMG tag, no preflight -- nothing existing breaks). The
-    role-specific version-probe check (verify_role_version()) is
-    deliberately NOT called here -- see resolve_launch_plan()'s two-pass
-    docstring for why it is a separate, later, launch-classified step.
+    PURE identity-binding resolution (preflight()): zero docker actions of
+    any kind. binary_set=None reproduces prior behavior exactly (TREE, the
+    mutable IMG tag, no preflight -- nothing existing breaks).
 
     A selected set is ONLY preflighted here -- never published. Bringing
     role-artifacts onto a host is exclusively the explicit `distribute`
@@ -339,20 +392,6 @@ def resolve_role(host, binary_set, role):
         raise RuntimeError(err)
     log_launch(f"PREFLIGHT-OK host={host} role={role} set={binary_set}")
     return immutable_root(binary_set), launch_image(binary_set)
-
-def verify_launch_version(host, binary_set, role):
-    """The launch-phase half of resolving one role -- see
-    resolve_launch_plan()'s docstring. Raises RuntimeError (logging
-    PREFLIGHT-FAIL first) on a version-probe mismatch; logs
-    LAUNCH-VALIDATED and returns None on success or on binary_set=None
-    (nothing to check)."""
-    if binary_set is None:
-        return
-    err = verify_role_version(host, binary_set, role)
-    if err:
-        log_launch(f"PREFLIGHT-FAIL host={host} role={role} set={binary_set} stage=version-probe reason={err}")
-        raise RuntimeError(err)
-    log_launch(f"LAUNCH-VALIDATED host={host} role={role} set={binary_set}")
 
 def revalidate_before_mutation(host, binary_set):
     """Race-gate defense, called immediately before the FIRST
@@ -402,50 +441,44 @@ class LaunchPlan:
 def resolve_launch_plan(worker_hosts, binary_set_s, binary_set_f, client_host=None, binary_set_c=None):
     """Resolve the COMPLETE requested role plan -- S, every F host, and C
     (only when client_host is not None, i.e. the phase will actually use a
-    client) -- in TWO passes, both entirely before up()/run_client()
-    perform a single docker removal/start, scratch write, or client push.
+    client) -- in ONE genuinely read-only pass (resolve_role() ->
+    preflight()), entirely before up()/run_client() perform a single
+    docker removal/start, scratch write, or client push. Root presence,
+    per-file sha256/mode, and the image digest only -- zero `docker run`
+    of any kind, for every role, in order.
 
-    PASS 1 -- pure identity-binding resolution (resolve_role() ->
-    preflight()): root presence, per-file sha256/mode, and the image
-    digest. Genuinely zero `docker run` for every role, in order (S, every
-    F, C). Raises RuntimeError with the exact reason on the first role
-    that fails; by construction, at the moment this raises, NOTHING has
+    Raises RuntimeError with the exact reason on the first role that
+    fails; by construction, at the moment this raises, NOTHING has
     happened for ANY role in this plan -- including roles that resolved
     successfully earlier in this same pass. That is the ordering fix this
-    whole function exists for: previously, up() resolved+launched the
+    function exists for: previously, up() resolved+launched the
     scheduler, THEN resolved+launched each worker in the same loop, so a
     bad second worker was only discovered after the scheduler and first
     worker were already torn down and started (LO's finding on 02622ab6).
 
-    PASS 2 -- launch-phase version-probe validation (verify_launch_version()
-    -> verify_role_version()), only reached once EVERY role in pass 1
-    succeeded. Each probe is a throwaway `docker run --rm` container --
-    never farm-sched/farm-worker/farm-client, so still no CLUSTER action
-    happens here -- but it IS a docker action, honestly a distinct,
-    later, launch-classified step, never folded into pass 1's claim of
-    zero docker actions (LO's second finding: production preflight() used
-    to run these probes DURING resolution, so a late-failing role could
-    be preceded by other roles' probe containers having already run for
-    real, silently contradicting a "zero docker actions before refusal"
-    claim). A role that fails here, after earlier roles' probes already
-    ran, still leaves zero CLUSTER-mutating actions taken -- up() and
-    run_client() are never reached either way.
+    There used to be a second, launch-classified pass here that ran a
+    throwaway version-probe container per role after this one succeeded
+    (a still-defensible design LO/BO both initially accepted) -- removed
+    per BO's stronger, simpler recommendation: an exact executable hash
+    (already checked above, host-side) is a stronger identity proof than
+    a probe's printed banner, and the residual value a probe had --
+    confirming what a container ACTUALLY sees through its mount, not just
+    what SSH sees on the host side -- is now provided by
+    verify_launched_container_identity() checking the REAL, in-use
+    container from the INSIDE, in up()/run_client(), after it has
+    actually started. That removes an entire class of "is resolution
+    honestly docker-free" bookkeeping this function used to need, because
+    there is no longer any docker action anywhere in it to be honest or
+    dishonest about.
 
     Neither up() nor run_client() resolve or preflight anything
     themselves -- they only ever consume a LaunchPlan that this function
-    already validated in full, in both passes."""
+    already validated in full."""
     s_tree, s_img = resolve_role(SCHED_HOST, binary_set_s, "S")
     f_resolved = [resolve_role(h, binary_set_f, "F") for h in worker_hosts]
     c_tree = c_img = None
     if client_host is not None:
         c_tree, c_img = resolve_role(client_host, binary_set_c, "C")
-
-    verify_launch_version(SCHED_HOST, binary_set_s, "S")
-    for h in worker_hosts:
-        verify_launch_version(h, binary_set_f, "F")
-    if client_host is not None:
-        verify_launch_version(client_host, binary_set_c, "C")
-
     return LaunchPlan(s_tree, s_img, binary_set_s, f_resolved, binary_set_f,
                        c_tree, c_img, binary_set_c)
 
@@ -490,20 +523,56 @@ def scratch_prepare(host, mkdir_path, log_path):
     same reason as docker_run_detached() above."""
     sh(host, f"mkdir -p {mkdir_path} && chmod 1777 {SCRATCH}/farm && rm -f {log_path}", check=True)
 
+def verify_launched_container_identity(host, name, binary_set, role):
+    """POST-launch identity check (BO's preferred design, replacing the
+    removed pre-launch version-probe containers entirely): hash the
+    role's own tracked executable FROM INSIDE the ALREADY-RUNNING
+    container (`docker exec ... sha256sum`) and compare against the
+    manifest. This is a strictly stronger proof than a separate throwaway
+    probe container ever was -- it confirms what THIS SPECIFIC, actually
+    in-use container instance sees through its own bind mount, not merely
+    that some other container mounted the same way could execute the
+    binary and print the right banner. Called BEFORE the caller accepts
+    this container's registration/test evidence as real. Raises
+    RuntimeError on mismatch or on a `docker exec` failure -- this always
+    runs strictly after real cluster-mutating actions have already begun,
+    so (like any other RuntimeError from inside up()/run_client()) it
+    surfaces as a genuine launch failure, never a plan-validation refusal.
+    binary_set=None is a no-op, matching every other function in this
+    file's convention. Returns None on success."""
+    if binary_set is None:
+        return
+    manifest = load_manifest(binary_set)
+    probe_rel = _ROLE_PROBE_PATH.get(role)
+    entry = next((b for b in manifest["binaries"] if b["path"] == probe_rel), None)
+    if entry is None:
+        return
+    r = sh(host, f"docker exec {name} sha256sum /work/{probe_rel}", timeout=30)
+    actual = r.stdout.split()[0] if r.returncode == 0 and r.stdout.strip() else None
+    if actual != entry["sha256"]:
+        raise RuntimeError(f"in-container identity check FAILED for {name} on {host}: "
+                            f"/work/{probe_rel} sha256 (manifest {entry['sha256']}, "
+                            f"in-container {actual!r}, docker exec rc={r.returncode}) -- "
+                            f"the running container's bind mount does not show the content resolution verified")
+
 def up(worker_hosts, plan):
     """Launch the cluster from an ALREADY-validated LaunchPlan -- up()
     itself no longer resolves or preflights anything: every role in this
-    plan was already resolved (identity-bound AND version-validated), for
-    every host, inside resolve_launch_plan() before this function was ever
-    called. up() therefore performs ONLY the mutating actions (docker_rm,
+    plan was already identity-bound, for every host, inside
+    resolve_launch_plan() before this function was ever called. up()
+    therefore performs ONLY the mutating actions (docker_rm,
     scratch_prepare, docker_run_detached), each immediately preceded by
     revalidate_before_mutation() -- a cheap, zero-docker-run re-check that
     the SAME immutable root resolve_launch_plan() already validated is
     still exactly what it was (the race-gate's second, independent defense
     against anything touching a selected root between resolution and this
-    specific role's actual container start). up() can no longer discover a
-    bad role partway through a launch that already tore down or started an
-    earlier one (the defect LO/BO both flagged on 02622ab6)."""
+    specific role's actual container start) -- and immediately FOLLOWED by
+    verify_launched_container_identity(), which hashes the role's
+    executable from inside the container that container start just
+    produced, before it is trusted for anything further. up() can no
+    longer discover a bad role partway through a launch that already tore
+    down or started an earlier one (the defect LO/BO both flagged on
+    02622ab6)."""
     sip = HOSTS[SCHED_HOST]["ip"]
     print(f"UP: scheduler on {SCHED_HOST}({sip}):{SCHED_PORT}  workers={worker_hosts}  "
           f"S-tree={plan.s_tree}  F-trees={[t for t, _ in plan.f_resolved]}")
@@ -514,6 +583,7 @@ def up(worker_hosts, plan):
     scratch_prepare(SCHED_HOST, f"{SCRATCH}/farm", f"{SCRATCH}/farm/sched.log")
     docker_run_detached(SCHED_HOST, "farm-sched", plan.s_tree, plan.s_img,
         f"useradd -r icecc 2>/dev/null; exec /work/obj/scheduler/icecc-scheduler -p {SCHED_PORT} -n {NET} -l /scratch/farm/sched.log -vvv")
+    verify_launched_container_identity(SCHED_HOST, "farm-sched", plan.binary_set_s, "S")
     time.sleep(3)
     # one worker per F -- every host's role was already resolved, in order,
     # inside resolve_launch_plan(), before this loop (or anything else in
@@ -530,6 +600,7 @@ def up(worker_hosts, plan):
             f"chown icecc /scratch/farm/envs; "  # pre-chown as root: daemon's cleanup_cache runs post-drop (no CAP_CHOWN)
             f"exec /work/obj/daemon/iceccd -m 8 -s {sip}:{SCHED_PORT} -n {NET} -N {h}w -b /scratch/farm/envs "
             f"-p {wp} -l /scratch/farm/worker.log -vvv")
+        verify_launched_container_identity(h, "farm-worker", plan.binary_set_f, "F")
     # wait for all workers to register
     want = len(worker_hosts)
     got = 0
@@ -565,22 +636,38 @@ def run_client(client_host, project_dir, mode, maxtu, jobs, prefer, plan):
     function. revalidate_before_mutation() runs first, before push_file()
     even -- push_file() is itself one of the actions that must never
     happen ahead of a full, successful (re)validation. `/work` is mounted
-    READ-ONLY (`:ro`), same reasoning as docker_run_detached()."""
+    READ-ONLY (`:ro`), same reasoning as docker_run_detached().
+
+    Unlike the prior `docker run --rm ... bash /scratch/farm_client.sh`
+    (a one-shot container whose main process WAS the test -- no point at
+    which an in-container identity check could run before that evidence
+    was already produced), the client container is now started DETACHED
+    (like the scheduler/worker), identity-checked from the inside via
+    verify_launched_container_identity() while idle, and only THEN
+    `docker exec`'d to actually run the client script -- so the
+    in-container hash check always happens strictly before any test
+    evidence is accepted, exactly like the scheduler/worker. No longer
+    self-cleaning (`--rm` is gone since the container is no longer
+    one-shot), so this always removes it before returning, success or
+    failure, via try/finally."""
     revalidate_before_mutation(client_host, plan.binary_set_c)
     sched = f"{HOSTS[SCHED_HOST]['ip']}:{SCHED_PORT}"
     for s in SCRIPTS:
         push_file(client_host, f"{HUB_DIR}/{s}", f"{SCRATCH.replace('~', '$HOME')}/{s}")
-    # resolve ~ on the client for the bind (docker needs an absolute host path)
     docker_rm(client_host, "farm-client")
-    cmd = (f"docker run --rm --name farm-client --network host -v {plan.c_tree}:/work:ro -v {SCRATCH}:/scratch -u 0:0 {plan.c_img} "
-           f"bash /scratch/farm_client.sh {sched} {NET} {project_dir} {mode} {maxtu} {jobs} {prefer}")
-    print(f"TEST: client={client_host} project={project_dir} mode={mode} maxtu={maxtu} jobs={jobs} prefer={prefer} "
-          f"C-tree={plan.c_tree}")
-    r = sh(client_host, cmd, timeout=1800)
-    print(r.stdout.rstrip())
-    if r.stderr.strip():
-        print("TEST STDERR:", r.stderr.strip()[:400])
-    return r
+    docker_run_detached(client_host, "farm-client", plan.c_tree, plan.c_img, "sleep 1800")
+    try:
+        verify_launched_container_identity(client_host, "farm-client", plan.binary_set_c, "C")
+        cmd = f"docker exec farm-client bash /scratch/farm_client.sh {sched} {NET} {project_dir} {mode} {maxtu} {jobs} {prefer}"
+        print(f"TEST: client={client_host} project={project_dir} mode={mode} maxtu={maxtu} jobs={jobs} prefer={prefer} "
+              f"C-tree={plan.c_tree}")
+        r = sh(client_host, cmd, timeout=1800)
+        print(r.stdout.rstrip())
+        if r.stderr.strip():
+            print("TEST STDERR:", r.stderr.strip()[:400])
+        return r
+    finally:
+        docker_rm(client_host, "farm-client")
 
 def dump_worker_evidence(worker_hosts, client_stdout=""):
     # local-oracle canonical JOIN (2026-08-23 ruling): one row per expected TU, gated as a BIJECTION —
