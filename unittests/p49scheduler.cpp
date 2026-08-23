@@ -1107,6 +1107,20 @@ static void run_cache_advertisement(const std::string &binary,
         wait_type(submitter, Msg::USE_CS, 3000));
     REQUIRE(use && use->port == static_cast<uint32_t>(worker_port),
             "advertisement leaves ordinary UseCS selection unchanged");
+    /* S2: the assignment-bound S->C cache-endpoint handoff.  The scheduler
+       fills this ONLY after use->port above (the ordinary selection) is
+       already decided; it must faithfully mirror the worker's retained,
+       valid Login snapshot -- see project_cache_handoff in scheduler.cpp.
+       use->hostname (the pre-existing compile-endpoint host, unchanged by
+       S2) is the loopback numeric peer address, not the Login nodename --
+       already exercised by the pre-existing UseCS tests above, so it is
+       not re-checked here. */
+    REQUIRE(use && use->hasCacheAdvertisement()
+                && use->cache_endpoint_port == static_cast<uint32_t>(cache_port)
+                && use->cache_protocol == CACHE_WIRE_PROTOCOL_V1
+                && use->cache_profile_mask == CACHE_PROFILE_ZSTD_TU,
+            "S2: a valid retained cache snapshot projects faithfully into "
+            "the assignment-bound UseCS handoff tail");
     pollfd cache_probe { cache_sentinel, POLLIN, 0 };
     REQUIRE(poll(&cache_probe, 1, 300) == 0,
             "scheduler and submitter never connect to the inert cache endpoint");
@@ -1136,6 +1150,23 @@ static void run_cache_advertisement(const std::string &binary,
                 && worker_line.find("cache_wire=") == std::string::npos,
             "replacement Login atomically publishes cache absence");
 
+    REQUIRE(submitter && request_job(submitter, 5002),
+            "second assignment requested after the worker replaced its "
+            "advertisement with absence");
+    UseCSMsg *use_after_absence = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 3000));
+    REQUIRE(use_after_absence && !use_after_absence->hasCacheAdvertisement()
+                && use_after_absence->cache_protocol == 0
+                && use_after_absence->cache_profile_mask == 0,
+            "S2: the handoff tail tracks the CURRENT retained snapshot, not "
+            "a value cached from the worker's first Login");
+    if (use_after_absence) {
+        worker->send_msg(JobBeginMsg(use_after_absence->job_id, 0));
+        worker->send_msg(JobDoneMsg(use_after_absence->job_id, 0,
+                                    JobDoneMsg::FROM_SERVER));
+    }
+    delete use_after_absence;
+
     delete submitter;
     delete worker;
     worker = nullptr;
@@ -1148,6 +1179,71 @@ static void run_cache_advertisement(const std::string &binary,
     if (worker_listener >= 0) close(worker_listener);
     REQUIRE(stop_scheduler(scheduler),
             "cache-advertisement scheduler stopped cleanly");
+}
+
+static void run_cache_handoff_below_p50(const std::string &binary,
+                                        const std::string &directory)
+{
+    const int port = reserve_port_pair();
+    const std::string log = directory + "/cache-handoff-p48-worker.log";
+    pid_t scheduler = start_scheduler(binary, port, nullptr, log);
+    REQUIRE(port != 0 && scheduler > 0,
+            "cache-handoff below-P50-worker scheduler process launched");
+
+    int proxy_port = 0;
+    pid_t proxy = start_p48_proxy(port, &proxy_port);
+    MsgChannel *p48_channel = connect_scheduler(proxy_port);
+    REQUIRE(proxy > 0 && p48_channel && p48_channel->protocol == 48,
+            "worker link genuinely negotiated protocol 48 for the handoff gate");
+
+    int worker_port = 0;
+    int worker_listener = bind_port(0, &worker_port);
+    if (worker_listener >= 0) listen(worker_listener, 16);
+    int cache_port = 0;
+    int cache_sentinel = bind_port(0, &cache_port);
+    if (cache_sentinel >= 0) listen(cache_sentinel, 4);
+
+    ConfCSMsg *worker_conf = nullptr;
+    /* login_host passes a fully-valid, nonzero advertisement, but
+       LoginMsg::send_to_channel gates the whole tail on the WORKER link's
+       own negotiated protocol -- 48 here -- so the encoder writes nothing:
+       the bytes never reach the wire and the scheduler's retained snapshot
+       for this worker stays structurally (0,0,0), never "invalid". */
+    MsgChannel *worker = login_host(
+        port, "cache-handoff-p48-worker", true, worker_port, &worker_conf,
+        p48_channel, 1, 0, static_cast<uint32_t>(cache_port),
+        CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_ZSTD_TU);
+    REQUIRE(worker && worker_conf && cache_sentinel >= 0,
+            "P48 worker logs in even though its cache advertisement cannot "
+            "be sent");
+    delete worker_conf;
+
+    ConfCSMsg *submitter_conf = nullptr;
+    MsgChannel *submitter = login_host(port, "cache-handoff-p50-submit", false,
+                                       0, &submitter_conf);
+    delete submitter_conf;
+    REQUIRE(submitter && request_job(submitter, 5101),
+            "assignment requested for the below-P50 (pre-CacheWire) worker");
+    UseCSMsg *use = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 3000));
+    REQUIRE(use && use->port == static_cast<uint32_t>(worker_port)
+                && !use->hasCacheAdvertisement()
+                && use->cache_protocol == 0 && use->cache_profile_mask == 0,
+            "S2: a CS below protocol 50 can never retain a cache "
+            "advertisement, so its UseCS handoff tail is wholly absent");
+    if (use) {
+        worker->send_msg(JobBeginMsg(use->job_id, 0));
+        worker->send_msg(JobDoneMsg(use->job_id, 0, JobDoneMsg::FROM_SERVER));
+    }
+    delete use;
+    delete submitter;
+    delete worker;
+    if (worker_listener >= 0) close(worker_listener);
+    if (cache_sentinel >= 0) close(cache_sentinel);
+    REQUIRE(stop_scheduler(proxy),
+            "cache-handoff protocol-48 relay stopped cleanly");
+    REQUIRE(stop_scheduler(scheduler),
+            "cache-handoff below-P50-worker scheduler stopped cleanly");
 }
 
 static void run_old_peer(const std::string &binary, const std::string &directory)
@@ -1220,6 +1316,7 @@ int main(int argc, char **argv)
     run_strict_nonce(argv[1], directory);
     run_disabled(argv[1], directory);
     run_cache_advertisement(argv[1], directory);
+    run_cache_handoff_below_p50(argv[1], directory);
     run_old_peer(argv[1], directory);
     std::fprintf(stderr, "%s: %d failure(s)\n",
                  failures ? "FAIL" : "PASS", failures);
