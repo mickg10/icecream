@@ -7,8 +7,6 @@ libprotocol50_a_SOURCES = \
 	p50_actions.h \
 	p50_slice0.cpp \
 	p50_slice0.h \
-	p50_loopback.cpp \
-	p50_loopback.h \
 	p50_zstd.cpp \
 	p50_zstd.h \
 	p50_input_record.cpp \

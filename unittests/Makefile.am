@@ -140,7 +140,7 @@ EXTRA_DIST += p50_trace_check.sh p50assignment-source.sh packagebuilderdeps.sh
 # Make the tests also print the test log if they fail.
 check: export VERBOSE=1
 
-p50loopback_SOURCES = p50_loopback_test.cpp
+p50loopback_SOURCES = p50_loopback_test.cpp p50_loopback.cpp p50_loopback.h
 p50loopback_LDADD = ../cache/libprotocol50.a ../services/libicecc.la $(BOOST_LIBS) $(LIBZSTD_LIBS)
 p50loopback_CXXFLAGS = $(BOOST_CPPFLAGS) -pthread
 p50loopback_LDFLAGS = $(BOOST_LDFLAGS) -pthread
