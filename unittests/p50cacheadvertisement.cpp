@@ -381,8 +381,29 @@ static void test_usecs_p50_round_trip_and_validation()
     }
 
     const Bytes valid = encode_usecs_frame(50, use);
-    REQUIRE(decoder_rejects(remove_tail_words(valid, 3)),
-            "P50 UseCS decoder rejects a wholly omitted cache-handoff tail");
+    {
+        /* Rolling-upgrade fixture (BigOracle steer): PROTOCOL_VERSION_CACHE_
+           ADVERTISEMENT reuses the SAME protocol number (50) an earlier P50
+           feature (assignment identity) already shipped under.  A peer built
+           before this cache-handoff tail existed sends nothing past that
+           pre-existing four-word identity tail -- current_message_bytes_
+           remaining() is exactly 0 at the cache-tail check, a complete and
+           correctly framed message, not a short one -- and MUST decode as
+           canonical absence rather than being rejected. */
+        Pair frozen_pair = make_pair(50);
+        const Bytes frozen = remove_tail_words(valid, 3);
+        const bool wrote = !frozen.empty()
+            && send(frozen_pair.left->fd, frozen.data(), frozen.size(), 0)
+                == static_cast<ssize_t>(frozen.size());
+        Msg *wire = wrote ? frozen_pair.right->get_msg(2, true) : nullptr;
+        UseCSMsg *decoded = dynamic_cast<UseCSMsg *>(wire);
+        REQUIRE(decoded && !decoded->hasCacheAdvertisement()
+                    && decoded->cache_protocol == 0
+                    && decoded->cache_profile_mask == 0,
+                "P50 UseCS decoder accepts a frozen pre-handoff (identity-"
+                "tail-only) frame as canonical cache absence");
+        delete wire;
+    }
     REQUIRE(decoder_rejects(remove_tail_words(valid, 2)),
             "P50 UseCS decoder rejects a one-word cache-handoff tail");
     REQUIRE(decoder_rejects(remove_tail_words(valid, 1)),

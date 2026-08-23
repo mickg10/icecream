@@ -35,9 +35,19 @@ require_count 4 'IS_PROTOCOL_VERSION(PROTOCOL_VERSION_CACHE_ADVERTISEMENT, c)' \
     'Login and UseCS codecs (S2 handoff) each gate both read and write at protocol 50'
 require_count 1 'current_message_end = intogo_old + inmsglen' \
     services/comm.cpp 'decoder records the current frame boundary'
-require_count 2 'current_message_bytes_remaining() < 3 * sizeof(uint32_t)' \
-    services/comm.cpp \
-    'Login and UseCS (S2 handoff) each refuse a shortened three-word tail'
+require_count 1 'if (c->current_message_bytes_remaining() < 3 * sizeof(uint32_t)) {' \
+    services/comm.cpp 'Login refuses a shortened three-word tail'
+# UseCS's decode is a tri-state, not Login's binary short-tail check (BigOracle
+# steer: protocol 50 already carries an earlier feature's four-word identity
+# tail, so a peer built before this cache-handoff tail existed sends nothing
+# more at protocol 50 -- exactly zero remaining bytes -- which must decode as
+# canonical absence, not be refused as short).
+require_count 1 'const size_t remaining = c->current_message_bytes_remaining();' \
+    services/comm.cpp 'UseCS decode captures the remaining-bytes tri-state input'
+require_count 1 'if (remaining == 0) {' services/comm.cpp \
+    'UseCS decode treats a frozen pre-handoff (zero remaining bytes) frame as absence'
+require_count 1 '} else if (remaining < 3 * sizeof(uint32_t)) {' services/comm.cpp \
+    'UseCS decode refuses only a genuinely short (1..11 byte) tail'
 require_count 1 'const bool absent = cache_endpoint_port == 0' \
     services/comm.cpp 'Login payload has a canonical whole-absence branch'
 require_count 1 '&& (cache_profile_mask & ~CACHE_ADVERTISABLE_PROFILE_MASK) == 0' \
@@ -92,6 +102,17 @@ if [ "$usecs_send_gate_count" -ne 1 ]; then
     exit 1
 fi
 echo 'ok - UseCS encode cache tail is gated at protocol 50'
+
+# S2 (BigOracle steer): daemon/main.cpp derives its LOCAL relay's cache
+# triple from ONE validated source (relay_cache_port/protocol/mask, each
+# computed once from c->cacheHandoff), and BOTH scheduler_use_cs projection
+# branches (self-selected-F 127.0.0.1 rewrite, and ordinary remote worker)
+# consume that SAME source -- so neither branch can silently drop it or
+# drift from the other.
+require_count 1 'const uint32_t relay_cache_port = c->cacheHandoff.valid' \
+    daemon/main.cpp 'the relay cache triple has exactly one validated source'
+require_count 2 'relay_cache_mask);' daemon/main.cpp \
+    'both scheduler_use_cs relay projections consume that same source'
 
 require_absent \
     'cache_endpoint_port|cacheProtocol\(|cacheProfileMask|CACHE_PROFILE_Z3_(LONG|SHARED_LONG)' \
