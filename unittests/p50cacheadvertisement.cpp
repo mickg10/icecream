@@ -127,6 +127,24 @@ static Bytes remove_tail_words(Bytes bytes, size_t words)
     return bytes;
 }
 
+// Inverse of remove_tail_words: appends one word to a framed message and
+// grows its length prefix to match, simulating a tail that started
+// transmitting (a torn/cut-off frame) rather than one that was never sent.
+static Bytes append_word(Bytes bytes, uint32_t value)
+{
+    if (bytes.size() < sizeof(uint32_t)) return {};
+    uint32_t network_length = 0;
+    std::memcpy(&network_length, bytes.data(), sizeof(network_length));
+    const uint32_t length = ntohl(network_length) + sizeof(uint32_t);
+    network_length = htonl(length);
+    std::memcpy(bytes.data(), &network_length, sizeof(network_length));
+    value = htonl(value);
+    const size_t old_size = bytes.size();
+    bytes.resize(old_size + sizeof(value));
+    std::memcpy(bytes.data() + old_size, &value, sizeof(value));
+    return bytes;
+}
+
 static bool decoder_rejects(const Bytes& bytes)
 {
     Pair pair = make_pair(50);
@@ -268,6 +286,32 @@ static UseCSMsg fixture_usecs()
     return use;
 }
 
+/* Byte-frozen genuine old-peer fixture (hardening pass on the rolling-
+   upgrade decode fix).  Captured once from an isolated build of the
+   pre-branch (a862, "Merge accepted R6 input seam into corrected
+   foundations") services/comm.{h,cpp} -- the actual bytes a protocol-50
+   UseCS peer built before this cache-handoff tail existed puts on the
+   wire -- rather than derived by trimming today's encoder output (which
+   would only prove the current build agrees with itself, not with a real
+   old binary).  Source values: UseCSMsg("x86_64", "cache-worker",
+   0x00002805, 0x0000beef, true, 7, 0, 0x1020304050607080,
+   0x8877665544332211) sent at protocol 50 through the a862 MsgChannel;
+   the four-word assignment-identity tail is the last thing that binary
+   ever writes into a UseCS frame, so this frame's `remaining` is exactly
+   0 bytes at the point the current decoder checks for the cache tail.
+   Independently roundtripped back through the a862 decoder before
+   freezing: job_id/port/hostname/host_platform/got_env/client_id/
+   matched_job_id/assignmentEpoch/assignmentNonce all matched the source
+   values exactly. */
+static const unsigned char kOldPeerUseCSFrame[] = {
+    0x00, 0x00, 0x00, 0x44, 0x00, 0x00, 0x00, 0x48, 0x00, 0x00, 0xbe, 0xef,
+    0x00, 0x00, 0x28, 0x05, 0x00, 0x00, 0x00, 0x0d, 0x63, 0x61, 0x63, 0x68,
+    0x65, 0x2d, 0x77, 0x6f, 0x72, 0x6b, 0x65, 0x72, 0x00, 0x00, 0x00, 0x00,
+    0x07, 0x78, 0x38, 0x36, 0x5f, 0x36, 0x34, 0x00, 0x00, 0x00, 0x00, 0x01,
+    0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x10, 0x20, 0x30, 0x40,
+    0x50, 0x60, 0x70, 0x80, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
+};
+
 static Bytes encode_usecs_frame(int protocol, const UseCSMsg& use)
 {
     Pair pair = make_pair(protocol);
@@ -380,30 +424,49 @@ static void test_usecs_p50_round_trip_and_validation()
         REQUIRE(!send_pair.left->send_msg(malformed), label);
     }
 
-    const Bytes valid = encode_usecs_frame(50, use);
     {
-        /* Rolling-upgrade fixture (BigOracle steer): PROTOCOL_VERSION_CACHE_
-           ADVERTISEMENT reuses the SAME protocol number (50) an earlier P50
-           feature (assignment identity) already shipped under.  A peer built
-           before this cache-handoff tail existed sends nothing past that
-           pre-existing four-word identity tail -- current_message_bytes_
-           remaining() is exactly 0 at the cache-tail check, a complete and
-           correctly framed message, not a short one -- and MUST decode as
-           canonical absence rather than being rejected. */
+        /* Fixture A: the byte-frozen genuine old-peer frame (see
+           kOldPeerUseCSFrame above) must decode as a complete, valid
+           message carrying canonical cache-handoff absence -- and nothing
+           else about the message may be disturbed by the tri-state
+           decode. */
         Pair frozen_pair = make_pair(50);
-        const Bytes frozen = remove_tail_words(valid, 3);
-        const bool wrote = !frozen.empty()
-            && send(frozen_pair.left->fd, frozen.data(), frozen.size(), 0)
-                == static_cast<ssize_t>(frozen.size());
+        const bool wrote = send(frozen_pair.left->fd, kOldPeerUseCSFrame,
+                                 sizeof(kOldPeerUseCSFrame), 0)
+            == static_cast<ssize_t>(sizeof(kOldPeerUseCSFrame));
         Msg *wire = wrote ? frozen_pair.right->get_msg(2, true) : nullptr;
         UseCSMsg *decoded = dynamic_cast<UseCSMsg *>(wire);
         REQUIRE(decoded && !decoded->hasCacheAdvertisement()
                     && decoded->cache_protocol == 0
-                    && decoded->cache_profile_mask == 0,
-                "P50 UseCS decoder accepts a frozen pre-handoff (identity-"
-                "tail-only) frame as canonical cache absence");
+                    && decoded->cache_profile_mask == 0
+                    && decoded->job_id == UINT32_C(0x0000beef)
+                    && decoded->port == UINT32_C(0x00002805)
+                    && decoded->hostname == "cache-worker"
+                    && decoded->host_platform == "x86_64"
+                    && decoded->got_env == 1
+                    && decoded->client_id == UINT32_C(7)
+                    && decoded->matched_job_id == 0
+                    && decoded->assignmentEpoch() == UINT64_C(0x1020304050607080)
+                    && decoded->assignmentNonce() == UINT64_C(0x8877665544332211),
+                "P50 UseCS decoder accepts the byte-frozen genuine old-peer "
+                "frame (no tail at all) as canonical cache absence, message "
+                "otherwise intact");
         delete wire;
     }
+    {
+        /* Fixture B: the same frozen old-peer bytes, plus one more word as
+           if a tail had started transmitting and been cut off (or
+           corrupted) partway.  remaining == 4 falls in the genuinely-short
+           1..11 byte range and must stay rejected -- this is what tells
+           "old peer, no tail" (fixture A) apart from "torn frame". */
+        const Bytes frozen(kOldPeerUseCSFrame,
+                            kOldPeerUseCSFrame + sizeof(kOldPeerUseCSFrame));
+        REQUIRE(decoder_rejects(append_word(frozen, UINT32_C(0x0000cafe))),
+                "P50 UseCS decoder rejects the frozen old-peer frame plus a "
+                "torn one-word start of a cache-handoff tail");
+    }
+
+    const Bytes valid = encode_usecs_frame(50, use);
     REQUIRE(decoder_rejects(remove_tail_words(valid, 2)),
             "P50 UseCS decoder rejects a one-word cache-handoff tail");
     REQUIRE(decoder_rejects(remove_tail_words(valid, 1)),
