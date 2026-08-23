@@ -9,6 +9,23 @@
 #include <utility>
 
 namespace icecc::p50 {
+
+std::string_view profile_name(ProfileId profile) {
+    switch (profile) {
+    case ProfileId::P29:
+        return "p29";
+    case ProfileId::ZSTD_TU:
+        return "zstd_tu";
+    case ProfileId::GRZ:
+        return "grz";
+    case ProfileId::Z3_LONG:
+        return "z3_long";
+    case ProfileId::Z3_SHARED_LONG:
+        return "z3_shared_long";
+    }
+    return "unknown";
+}
+
 namespace {
 
 bool known_object_type(ObjectType type) {

@@ -22,6 +22,7 @@
 #define ICECREAM_UTIL_H
 
 #include <string>
+#include <stdint.h>
 #include <poll.h>
 #include <vector>
 #include <unistd.h>
@@ -53,5 +54,6 @@ inline T ignore_result(T x __attribute__((unused)))
 bool pollfd_is_set(const std::vector<pollfd>& pollfds, int fd, int flags, bool check_errors = true);
 
 std::string supported_features_to_string(unsigned int features);
+std::string cache_profiles_to_string(uint32_t profiles);
 
 #endif

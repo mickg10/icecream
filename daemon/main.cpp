@@ -4019,10 +4019,20 @@ bool Daemon::send_scheduler(const Msg& msg)
     return true;
 }
 
+/* M2.5 advertises no product endpoint until a later owner has completed
+   bind/listen and armed its accept loop.  Keeping the canonical absence in
+   one helper makes both initial Login and environment reannouncement use the
+   same three-word snapshot; there is intentionally no CLI override. */
+static void apply_inert_cache_advertisement(LoginMsg& login)
+{
+    login.setCacheAdvertisement(0, 0, 0);
+}
+
 bool Daemon::reannounce_environments()
 {
     log_info() << "reannounce_environments " << endl;
     LoginMsg lmsg(0, nodename, "", supported_features);
+    apply_inert_cache_advertisement(lmsg);
     lmsg.envs = available_environments(envbasedir);
     return send_scheduler(lmsg);
 }
@@ -7637,6 +7647,7 @@ bool Daemon::reconnect()
     icecream_load = 0;
 
     LoginMsg lmsg(daemon_port, determine_nodename(), machine_name, supported_features);
+    apply_inert_cache_advertisement(lmsg);
     lmsg.envs = available_environments(envbasedir);
     lmsg.max_kids = max_kids;
     lmsg.noremote = noremote;

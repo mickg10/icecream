@@ -154,6 +154,17 @@ public:
     unsigned int supportedFeatures() const;
     void setSupportedFeatures(unsigned int features);
 
+    uint32_t cacheEndpointPort() const { return m_cacheEndpointPort; }
+    uint32_t cacheProtocol() const { return m_cacheProtocol; }
+    uint32_t cacheProfileMask() const { return m_cacheProfileMask; }
+    void setCacheAdvertisement(uint32_t endpoint_port, uint32_t protocol,
+                               uint32_t profiles)
+    {
+        m_cacheEndpointPort = endpoint_port;
+        m_cacheProtocol = protocol;
+        m_cacheProfileMask = profiles;
+    }
+
     int clientCount() const;
     void setClientCount( int clientCount );
     int submittedJobsCount() const;
@@ -258,6 +269,11 @@ private:
     Type m_type;
     bool m_chrootPossible;
     unsigned int m_featuresSupported;
+    /* Inert Login metadata.  Selection and assignment code must not consume
+       these fields until a separately reviewed cache-input slice lands. */
+    uint32_t m_cacheEndpointPort;
+    uint32_t m_cacheProtocol;
+    uint32_t m_cacheProfileMask;
     int m_clientCount; // number of client connections the daemon has
     int m_submittedJobsCount;
     uint64_t m_admittedJobsTotal = 0;

@@ -47,6 +47,7 @@
 #define PROTOCOL_VERSION_JOB_LOCAL_FLAGS 48
 #define PROTOCOL_VERSION_ASSIGNMENT_FENCE 49
 #define PROTOCOL_VERSION_ASSIGNMENT_IDENTITY 50
+#define PROTOCOL_VERSION_CACHE_ADVERTISEMENT 50
 
 #define MAX_SCHEDULER_PONG 3
 // MAX_SCHEDULER_PING must be multiple of MAX_SCHEDULER_PONG
@@ -260,6 +261,26 @@ const int NODE_FEATURE_ENV_XZ = ( 1 << 0 );
 // The remote node is capable of unpacking environment compressed as .tar.zst .
 const int NODE_FEATURE_ENV_ZSTD = ( 1 << 1 );
 
+/* CacheWire is a separate protocol from the ordinary Icecream link.  The
+   historical endpoint implementation calls its first wire version 50; user
+   facing output qualifies that value as CacheWire v1. */
+const uint32_t CACHE_WIRE_PROTOCOL_V1 = 50;
+
+/* Stable CacheWire profile bits.  P29/ZSTD_TU/GRZ are existing protocol
+   labels.  Z3_LONG and Z3_SHARED_LONG reserve the two simple streaming
+   profiles without making either codec implemented or negotiable. */
+const uint32_t CACHE_PROFILE_P29 = ( UINT32_C(1) << 0 );
+const uint32_t CACHE_PROFILE_ZSTD_TU = ( UINT32_C(1) << 1 );
+const uint32_t CACHE_PROFILE_GRZ = ( UINT32_C(1) << 2 );
+const uint32_t CACHE_PROFILE_Z3_LONG = ( UINT32_C(1) << 3 );
+const uint32_t CACHE_PROFILE_Z3_SHARED_LONG = ( UINT32_C(1) << 4 );
+const uint32_t CACHE_DECLARED_PROFILE_MASK =
+    CACHE_PROFILE_P29 | CACHE_PROFILE_ZSTD_TU | CACHE_PROFILE_GRZ
+    | CACHE_PROFILE_Z3_LONG | CACHE_PROFILE_Z3_SHARED_LONG;
+/* The converged M2 endpoint has one runnable product dialogue.  Declaring a
+   profile name must never advertise a codec which cannot reconstruct input. */
+const uint32_t CACHE_ADVERTISABLE_PROFILE_MASK = CACHE_PROFILE_ZSTD_TU;
+
 // a list of pairs of host platform, filename
 typedef std::list<std::pair<std::string, std::string> > Environments;
 
@@ -302,6 +323,14 @@ public:
     // NULL  <--> channel closed or timeout
     // Will warn in log if EOF and !eofAllowed.
     Msg *get_msg(int timeout = 10, bool eofAllowed = false);
+
+    /* Bytes which remain inside the frame currently being decoded.  This is
+       deliberately frame-bounded rather than based on buffered input: a
+       single read may already contain the following frame. */
+    size_t current_message_bytes_remaining(void) const
+    {
+        return current_message_end >= intogo ? current_message_end - intogo : 0;
+    }
 
     // false <--> error (msg not send)
     bool send_msg(const Msg &, int SendFlags = SendBlocking);
@@ -458,6 +487,7 @@ protected:
     size_t inbuflen;
     size_t inofs;
     size_t intogo;
+    size_t current_message_end;
 
     enum {
         NEED_PROTO,
@@ -1021,10 +1051,25 @@ public:
              unsigned int my_features);
     LoginMsg()
         : Msg(Msg::LOGIN)
-        , port(0) {}
+        , port(0)
+        , cache_endpoint_port(0)
+        , cache_protocol(0)
+        , cache_profile_mask(0)
+        , cache_advertisement_tail_valid(true) {}
 
     virtual void fill_from_channel(MsgChannel *c);
     virtual void send_to_channel(MsgChannel *c) const;
+    bool valid_payload() const override;
+
+    void setCacheAdvertisement(uint32_t endpoint_port, uint32_t protocol,
+                               uint32_t profiles)
+    {
+        cache_endpoint_port = endpoint_port;
+        cache_protocol = protocol;
+        cache_profile_mask = profiles;
+        cache_advertisement_tail_valid = true;
+    }
+    bool hasCacheAdvertisement() const { return cache_endpoint_port != 0; }
 
     uint32_t port;
     Environments envs;
@@ -1034,6 +1079,14 @@ public:
     std::string nodename;
     std::string host_platform;
     uint32_t supported_features; // bitmask of various features the node supports
+    /* Protocol-50 Login tail.  Host identity is the scheduler-observed peer
+       address; store GUID and session limits remain CacheWire handshake data. */
+    uint32_t cache_endpoint_port;
+    uint32_t cache_protocol;
+    uint32_t cache_profile_mask;
+
+private:
+    bool cache_advertisement_tail_valid;
 };
 
 class ConfCSMsg : public Msg

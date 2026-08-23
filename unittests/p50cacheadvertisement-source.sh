@@ -1,0 +1,88 @@
+#!/bin/sh
+# Deletion-sensitive scope gate for the inert Login-only advertisement.
+set -eu
+
+src=${ICECC_TEST_TOP_SRCDIR:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
+
+require_count() {
+    expected=$1
+    pattern=$2
+    file=$3
+    label=$4
+    actual=$(grep -F -c "$pattern" "$src/$file" || true)
+    if [ "$actual" -ne "$expected" ]; then
+        echo "FAIL: $label (expected $expected anchor(s), found $actual)" >&2
+        exit 1
+    fi
+    echo "ok - $label"
+}
+
+require_absent() {
+    pattern=$1
+    shift
+    label=$1
+    shift
+    if grep -E -n "$pattern" "$@" >/dev/null 2>&1; then
+        echo "FAIL: $label" >&2
+        grep -E -n "$pattern" "$@" >&2 || true
+        exit 1
+    fi
+    echo "ok - $label"
+}
+
+require_count 2 'IS_PROTOCOL_VERSION(PROTOCOL_VERSION_CACHE_ADVERTISEMENT, c)' \
+    services/comm.cpp 'Login codec gates both read and write at main protocol 50'
+require_count 1 'current_message_end = intogo_old + inmsglen' \
+    services/comm.cpp 'decoder records the current frame boundary'
+require_count 1 'current_message_bytes_remaining() < 3 * sizeof(uint32_t)' \
+    services/comm.cpp 'P50 Login refuses a shortened three-word tail'
+require_count 1 'const bool absent = cache_endpoint_port == 0' \
+    services/comm.cpp 'Login payload has a canonical whole-absence branch'
+require_count 1 '&& (cache_profile_mask & ~CACHE_ADVERTISABLE_PROFILE_MASK) == 0' \
+    services/comm.cpp 'Login rejects every non-runnable or unknown profile bit'
+require_count 3 'apply_inert_cache_advertisement' daemon/main.cpp \
+    'real daemon applies canonical absence at definition, login, and reannouncement'
+require_count 2 'cs->setCacheAdvertisement(m->cache_endpoint_port, m->cache_protocol,' \
+    scheduler/scheduler.cpp 'scheduler retains initial and replacement Login snapshots'
+require_count 2 'it->cacheEndpointPort()' scheduler/scheduler.cpp \
+    'scheduler reads endpoint port only for listcs visibility'
+require_count 1 'it->cacheProtocol()' scheduler/scheduler.cpp \
+    'scheduler reads cache protocol only for listcs visibility'
+require_count 1 'it->cacheProfileMask()' scheduler/scheduler.cpp \
+    'scheduler reads cache profiles only for listcs visibility'
+require_count 1 'Z3_LONG = 4' cache/protocol50.h \
+    'z3_long has one stable protocol profile ID'
+require_count 1 'Z3_SHARED_LONG = 5' cache/protocol50.h \
+    'z3_shared_long has one stable protocol profile ID'
+
+# The server-selection half of scheduler.cpp ends at handle_login.  New cache
+# metadata must not become eligibility, scoring, or assignment input.
+selection_slice=$(sed -n '1,2829p' "$src/scheduler/scheduler.cpp")
+if printf '%s\n' "$selection_slice" \
+        | grep -E 'cacheEndpointPort|cacheProtocol\(|cacheProfileMask' >/dev/null; then
+    echo 'FAIL: cache advertisement leaked into scheduler selection' >&2
+    exit 1
+fi
+echo 'ok - cache advertisement is absent from scheduler selection'
+
+require_absent \
+    'cache_endpoint_port|cacheProtocol\(|cacheProfileMask|CACHE_PROFILE_Z3_(LONG|SHARED_LONG)' \
+    'advertisement did not enter assignment, client attachment, or compiler input' \
+    "$src/services/job.h" "$src/client/remote.cpp" \
+    "$src/daemon/compiler_input.cpp" "$src/daemon/compiler_input.h" \
+    "$src/daemon/workit.cpp" "$src/scheduler/job.cpp" "$src/scheduler/job.h"
+
+require_absent 'z3_long|z3_shared_long|Z3_LONG|Z3_SHARED_LONG' \
+    'declared streaming labels have no codec implementation' \
+    "$src/cache/p50_zstd.cpp" "$src/cache/p50_zstd.h" \
+    "$src/cache/p50_endpoint.cpp" "$src/cache/p50_endpoint.h" \
+    "$src/cache/p50_slice0.cpp" "$src/cache/p50_slice0.h"
+
+if grep -R -n 'z3_shared_long_b1' "$src/services" "$src/cache" \
+        "$src/daemon" "$src/scheduler" "$src/client" >/dev/null 2>&1; then
+    echo 'FAIL: experiment-only z3_shared_long_b1 entered product vocabulary' >&2
+    exit 1
+fi
+echo 'ok - z3_shared_long_b1 remains experiment-only'
+
+echo 'PASS: inert cache advertisement remains Login-only and non-selecting'
