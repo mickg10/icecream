@@ -1439,8 +1439,10 @@ static void credit_dispatch_credit(Job *job)
    scoring/selection slice that unittests/p50cacheadvertisement-source.sh
    greps (lines 1..~2841).  job is already dispatched to job->server() by
    every caller of this function. */
-static void project_cache_handoff(const CompileServer *cs, uint32_t &out_port,
-                                  uint32_t &out_protocol, uint32_t &out_mask);
+static void project_cache_handoff(const CompileServer *cs, uint32_t wire_job_id,
+                                  uint64_t assignment_epoch, uint64_t assignment_nonce,
+                                  uint32_t &out_port, uint32_t &out_protocol,
+                                  uint32_t &out_mask);
 
 static bool send_remote_dispatch_reply(Job *job)
 {
@@ -1448,7 +1450,8 @@ static bool send_remote_dispatch_reply(Job *job)
     assert(job->submitter());
     assert(job->server());
     uint32_t cache_port = 0, cache_protocol = 0, cache_mask = 0;
-    project_cache_handoff(job->server(), cache_port, cache_protocol, cache_mask);
+    project_cache_handoff(job->server(), job->id(), job->assignmentEpoch(),
+                          job->assignmentNonce(), cache_port, cache_protocol, cache_mask);
     UseCSMsg reply(job->dispatchPlatform(), job->server()->name,
                    job->server()->remotePort(), job->id(),
                    job->dispatchGotEnv(), job->localClientId(),
@@ -2923,20 +2926,34 @@ static bool handle_login(CompileServer *cs, Msg *_m)
    absent-or-present law LoginMsg::valid_payload enforces on the way in
    (cache_advertisement_is_valid_present): a snapshot that is not fully
    valid projects as wholly absent, never partially or incorrectly
-   advertised.  Called only by send_remote_dispatch_reply, itself called
-   only once ordinary worker selection has already picked `cs` for the job
-   being dispatched (see the two call sites of send_remote_dispatch_reply).
-   This must never become scoring/selection input; that invariant is
-   enforced by unittests/p50cacheadvertisement-source.sh, which greps the
-   file's selection slice (up to roughly here) for this function's getters
-   and requires none be found there. */
-static void project_cache_handoff(const CompileServer *cs, uint32_t &out_port,
-                                  uint32_t &out_protocol, uint32_t &out_mask)
+   advertised.
+
+   A present triple additionally REQUIRES a complete nonzero assignment
+   identity {wire_job_id, assignment_epoch, assignment_nonce} -- the exact
+   identity the outgoing UseCS itself carries (see send_remote_dispatch_reply)
+   -- so the handoff is always bound to a specific, provable assignment.  A
+   job dispatched under ASSIGNMENT_LEGACY (assignment_epoch/nonce left at 0)
+   projects wholly absent even when the selected CS's own snapshot is
+   perfectly valid: there is no wire identity to bind it to.
+
+   Called only by send_remote_dispatch_reply, itself called only once
+   ordinary worker selection has already picked `cs` for the job being
+   dispatched (see the two call sites of send_remote_dispatch_reply).  This
+   must never become scoring/selection input; that invariant is enforced by
+   unittests/p50cacheadvertisement-source.sh, which greps the file's
+   selection slice (up to roughly here) for this function's getters and
+   requires none be found there. */
+static void project_cache_handoff(const CompileServer *cs, uint32_t wire_job_id,
+                                  uint64_t assignment_epoch, uint64_t assignment_nonce,
+                                  uint32_t &out_port, uint32_t &out_protocol,
+                                  uint32_t &out_mask)
 {
+    const bool identity_complete = wire_job_id != 0 && assignment_epoch != 0
+        && assignment_nonce != 0;
     const uint32_t port = cs->cacheEndpointPort();
     const uint32_t protocol = cs->cacheProtocol();
     const uint32_t mask = cs->cacheProfileMask();
-    if (cache_advertisement_is_valid_present(port, protocol, mask)) {
+    if (identity_complete && cache_advertisement_is_valid_present(port, protocol, mask)) {
         out_port = port;
         out_protocol = protocol;
         out_mask = mask;
