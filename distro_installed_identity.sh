@@ -1,5 +1,6 @@
 #!/bin/sh
-# distro_installed_identity.sh -- S1b BigOracle-HOLD successor on 050845ba.
+# distro_installed_identity.sh -- S1b BigOracle-HOLD successor on 050845ba,
+# hardened per local-oracle + BigOracle HOLD on 1f316208.
 #
 # The prior distro rows (distro_probe.sh) proved BUILD-TREE identity
 # (./client/icecc --version run straight out of the build dir) and reused
@@ -11,7 +12,8 @@
 # beforehand, so no cross-run or cross-image residue can satisfy the gate.
 #
 # Usage:
-#   distro_installed_identity.sh SRC_DIR WORK_DIR DISTRO [--stale-control|--sentinel-control]
+#   distro_installed_identity.sh SRC_DIR WORK_DIR DISTRO \
+#       [--stale-control | --sentinel-control | --corrupt-control=ARTIFACT]
 #
 # SRC_DIR    the extracted icecc-1.5.90 dist tree (read-only bind; reusing
 #            the SOURCE across runs is fine, only build/DESTDIR must be
@@ -24,36 +26,50 @@
 #            them (the omitted-clean-step scenario), plants a wrong-version
 #            fake icecc at the exact installed path, runs ONLY the identity
 #            probe (no configure/build/install), and requires the exact
-#            "ICECC 1.5.90" check to FAIL. Proves the probe is a genuine
-#            content check, not something mere file presence would satisfy
-#            -- i.e. omitting the clean step cannot silently pass, because
-#            the check that runs afterward is intolerant of stale content.
-#            This deliberately does NOT exercise the real cleanup line (it
-#            skips configure/build/install entirely) -- see
-#            --sentinel-control below for the check that does.
+#            "ICECC 1.5.90" check to FAIL. This deliberately does NOT
+#            exercise the real cleanup line -- see --sentinel-control for
+#            the check that does, and --corrupt-control=icecc for the same
+#            proof folded into the general per-artifact matrix below.
 # --sentinel-control
 #            KNOWN-CAUGHT CONTROL for the clean step itself. Plants visible
 #            AND hidden (dotfile/dot-directory) sentinel junk into build/
-#            and destdir/, then runs the SAME normal-mode path as a
-#            plain invocation (no branch-around: the real `find ...
-#            -mindepth 1 -delete` cleanup line, the real configure/build/
-#            install) and requires every planted sentinel to be gone
-#            afterward. A plain `rm -rf $dir/*` would silently leave
-#            dotfiles behind (`*` does not match them) and this row would
-#            catch that regression; the companion
+#            and destdir/, then runs the SAME normal-mode path as a plain
+#            invocation (no branch-around: the real `find ... -mindepth 1
+#            -delete` cleanup line, the real POST-CLEAN-EMPTY assertion,
+#            the real configure/build/install) and requires every planted
+#            sentinel to be gone afterward. The companion
 #            distro_installed_identity_gates.sh mutation-tests this
 #            directly by neutering the real cleanup line and confirming
-#            this row goes red.
+#            this row goes red at the POST-CLEAN-EMPTY assertion.
+# --corrupt-control=ARTIFACT
+#            KNOWN-CAUGHT per-artifact deletion/corruption matrix. Run
+#            AFTER a normal pass has already populated WORK_DIR: reuses
+#            that build/destdir WITHOUT wiping or rebuilding, corrupts (or
+#            deletes) EXACTLY ONE artifact, then re-runs every installed-
+#            identity check (not just that one) and requires the run to
+#            FAIL, NAMING the corrupted artifact. ARTIFACT is one of:
+#            icecc, iceccd, icecc-scheduler, libicecc.a, icecc.pc,
+#            image-digest, package-inventory.
 set -eu
 
-SRC=${1:?usage: distro_installed_identity.sh SRC_DIR WORK_DIR DISTRO [--stale-control|--sentinel-control]}
-WORK=${2:?usage: distro_installed_identity.sh SRC_DIR WORK_DIR DISTRO [--stale-control|--sentinel-control]}
-DISTRO=${3:?usage: distro_installed_identity.sh SRC_DIR WORK_DIR DISTRO [--stale-control|--sentinel-control]}
+SRC=${1:?usage: distro_installed_identity.sh SRC_DIR WORK_DIR DISTRO [--stale-control|--sentinel-control|--corrupt-control=ARTIFACT]}
+WORK=${2:?usage: distro_installed_identity.sh SRC_DIR WORK_DIR DISTRO [--stale-control|--sentinel-control|--corrupt-control=ARTIFACT]}
+DISTRO=${3:?usage: distro_installed_identity.sh SRC_DIR WORK_DIR DISTRO [--stale-control|--sentinel-control|--corrupt-control=ARTIFACT]}
 MODE=normal
 SENTINEL_CONTROL=false
+CORRUPT_ARTIFACT=""
 case "${4:-}" in
-    --stale-control)    MODE=stale-control ;;
-    --sentinel-control) SENTINEL_CONTROL=true ;;
+    --stale-control)      MODE=stale-control ;;
+    --sentinel-control)   SENTINEL_CONTROL=true ;;
+    --corrupt-control=*)
+        MODE=corrupt-control
+        CORRUPT_ARTIFACT=${4#--corrupt-control=}
+        case "$CORRUPT_ARTIFACT" in
+            icecc|iceccd|icecc-scheduler|libicecc.a|icecc.pc|image-digest|package-inventory) ;;
+            *) echo "unknown --corrupt-control artifact: $CORRUPT_ARTIFACT (want one of: icecc iceccd icecc-scheduler libicecc.a icecc.pc image-digest package-inventory)" >&2
+               exit 2 ;;
+        esac
+        ;;
     "") ;;
     *) echo "unknown 4th argument: ${4}" >&2; exit 2 ;;
 esac
@@ -91,9 +107,11 @@ BUILD="$WORK/build"
 DESTDIR="$WORK/destdir"
 # sentinel-control stays MODE=normal (it exercises the real normal path,
 # not a separate branch -- see the header) but must not silently overwrite
-# a plain normal run's evidence files with the same name.
+# a plain normal run's evidence files with the same name; corrupt-control
+# is keyed by which artifact it corrupted, for the same reason.
 RUN_SUFFIX="$MODE"
 [ "$SENTINEL_CONTROL" = true ] && RUN_SUFFIX="${MODE}-sentinel"
+[ "$MODE" = corrupt-control ] && RUN_SUFFIX="${MODE}-${CORRUPT_ARTIFACT}"
 FACTS="$WORK/facts-$RUN_SUFFIX.txt"
 : > "$FACTS"
 fact() { printf '%s\t%s\n' "$1" "$2" >> "$FACTS"; }
@@ -110,13 +128,14 @@ require_exact() {
     fi
 }
 # require_present LABEL VALUE -- FAILS if VALUE is the ABSENT sentinel
-# fact() records for a missing file. Presence alone is weaker than
-# require_exact but is what libicecc.a (a static archive with no embedded
-# version string to assert against) has to be judged on.
+# fact() records for a missing/empty artifact. Presence alone is weaker
+# than require_exact but is what libicecc.a (a static archive with no
+# embedded version string) and package-inventory (no single "identity"
+# string) have to be judged on.
 require_present() {
     label=$1 value=$2
     if [ "$value" = "ABSENT" ]; then
-        echo "FAIL: $DISTRO $label is ABSENT (expected to exist and hash successfully)" >&2
+        echo "FAIL: $DISTRO $label is ABSENT (expected to exist and be non-empty)" >&2
         exit 1
     fi
 }
@@ -146,14 +165,57 @@ case "$DISTRO" in
         ;;
 esac
 
+if [ "$MODE" = corrupt-control ] && [ "$CORRUPT_ARTIFACT" = image-digest ]; then
+    # Substitute a KNOWN-locally-built-only image for JUST this digest
+    # computation: a fresh `docker build` output is guaranteed to have
+    # empty RepoDigests (it has never been pulled/pushed through any
+    # registry), regardless of whether the real per-distro $IMAGE on THIS
+    # host happens to be properly pinned or not -- deterministic, not
+    # dependent on ambient host image state. `RUN true` forces a genuinely
+    # new image ID (a bare `FROM X` with no other instructions can just
+    # alias X's own existing ID, which would inherit X's real RepoDigests
+    # and defeat the point).
+    DIGEST_CTX="$WORK/digest-corrupt-ctx"
+    rm -rf "$DIGEST_CTX"; mkdir -p "$DIGEST_CTX"
+    printf 'FROM %s\nRUN true\n' "$IMAGE" > "$DIGEST_CTX/Dockerfile"
+    docker build -q -t s1b-digest-corrupt-control:local "$DIGEST_CTX" >/dev/null
+    IMAGE=s1b-digest-corrupt-control:local
+    fact corrupt_artifact "$CORRUPT_ARTIFACT"
+fi
+
 fact distro "$DISTRO"
 fact mode "$MODE"
 fact image_tag "$IMAGE"
-IMAGE_DIGEST=$(docker image inspect "$IMAGE" --format '{{index .RepoDigests 0}}' 2>/dev/null || echo "UNRESOLVED")
+# Captured SEPARATELY from the UNRESOLVED fallback, not `cmd || echo
+# UNRESOLVED` in one substitution: when the template fails (empty
+# RepoDigests), `docker image inspect` still writes a blank line to
+# STDOUT before the error goes to stderr -- `$(cmd || echo X)` would then
+# concatenate that leading blank line with X into "\nX", which is never
+# equal to the literal string "UNRESOLVED" and would let this whole gate
+# silently pass on exactly the case it exists to catch (found by
+# --corrupt-control=image-digest, which is the first thing to have ever
+# actually exercised this fallback path). `|| true` (not bare, and not
+# `|| echo ...`) is required here too: under `set -e`, a plain
+# `VAR=$(failing_cmd)` assignment aborts the script immediately at this
+# line -- `|| true` absorbs that without adding any output of its own, so
+# a failed lookup correctly collapses to an empty string (all-whitespace
+# command-substitution output is stripped entirely, not just trailing
+# newlines-after-content) for the presence check below to catch.
+IMAGE_DIGEST=$(docker image inspect "$IMAGE" --format '{{index .RepoDigests 0}}' 2>/dev/null || true)
+[ -n "$IMAGE_DIGEST" ] || IMAGE_DIGEST="UNRESOLVED"
 fact image_digest "$IMAGE_DIGEST"
 if [ "$IMAGE_DIGEST" = "UNRESOLVED" ]; then
-    echo "FAIL: $DISTRO image digest did not resolve (docker image inspect returned no RepoDigest for $IMAGE) -- an unresolved digest is a gate failure, not an accepted observation" >&2
+    echo "FAIL: $DISTRO image_digest is ABSENT/UNRESOLVED (docker image inspect returned no RepoDigest for $IMAGE) -- an unresolved digest is a gate failure, not an accepted observation" >&2
+    echo
+    echo "=== facts ($FACTS) ==="
+    cat "$FACTS"
     exit 1
+fi
+# image-digest's whole test is the gate above; nothing else about this
+# artifact needs (or can meaningfully use) a DESTDIR/BUILD, so stop here.
+if [ "$MODE" = corrupt-control ] && [ "$CORRUPT_ARTIFACT" = image-digest ]; then
+    echo "BUG: corrupt-control=image-digest reached past the digest gate without it firing" >&2
+    exit 3
 fi
 
 if [ "$SENTINEL_CONTROL" = true ]; then
@@ -188,11 +250,22 @@ if [ "$MODE" = normal ]; then
         # is set, which it is not here). A stale .deps/, a hidden leftover
         # object, or any other dotfile survives 'rm -rf DIR/*' untouched --
         # exactly the false-green LO's planted hidden sentinels caught.
-        # --sentinel-control (see the script header) proves this line
-        # actually removes hidden content, and the companion
-        # distro_installed_identity_gates.sh mutation-tests this exact line.
         find /build -mindepth 1 -delete
         find /destdir -mindepth 1 -delete
+        # Explicit, checkable POST-CLEAN-EMPTY assertion -- not just running
+        # the clean command and trusting it, an assertion that fails loudly
+        # (and, since it echoes a marker before exiting, is directly
+        # observable in the log either way) if anything survived. This is
+        # what --sentinel-control's mutation test in
+        # distro_installed_identity_gates.sh actually reddens: with the two
+        # find lines neutered, the sentinels are still there and THIS
+        # assertion is what catches it, before configure ever runs.
+        if [ -z \"\$(find /build -mindepth 1)\" ] && [ -z \"\$(find /destdir -mindepth 1)\" ]; then
+            echo POST-CLEAN-EMPTY=YES
+        else
+            echo POST-CLEAN-EMPTY=NO
+            exit 1
+        fi
         $DEP_INSTALL
         cd /build
         /src/configure --without-man > configure.log 2>&1; echo CONFIGURE-EXIT=\$?
@@ -203,7 +276,7 @@ if [ "$MODE" = normal ]; then
         make -C client -j8 icecc libclient.a > client.log 2>&1; echo CLIENT-EXIT=\$?
         make install DESTDIR=/destdir > install.log 2>&1; echo INSTALL-EXIT=\$?
         find /destdir -type f | sort > destdir-listing.txt
-        { $DEP_QUERY ; } > package-inventory.txt || true
+        { $DEP_QUERY ; } > package-inventory.txt; echo PACKAGE-INVENTORY-EXIT=\$?
         # Identity probes run HERE, inside this same container filesystem,
         # not in a later fresh --rm container -- the runtime shared libraries
         # (liblzo2, libzstd, libboost, ...) were installed by \$DEP_INSTALL
@@ -221,7 +294,11 @@ if [ "$MODE" = normal ]; then
     " 2>&1 | tee "$WORK/container-run-$RUN_SUFFIX.log"
     cp "$WORK/container-run-$RUN_SUFFIX.log" "$WORK/container-run.log" 2>/dev/null || true
 
-    for stage in CONFIGURE SERVICES CACHE DAEMON SCHEDULER CLIENT INSTALL; do
+    pce=$(grep -oE '^POST-CLEAN-EMPTY=(YES|NO)' "$WORK/container-run-$RUN_SUFFIX.log" | tail -1 | cut -d= -f2)
+    fact post_clean_empty "${pce:-MISSING}"
+    [ "${pce:-MISSING}" = "YES" ] || { echo "FAIL: $DISTRO post-clean-empty assertion did not pass (got '${pce:-MISSING}')" >&2; exit 1; }
+
+    for stage in CONFIGURE SERVICES CACHE DAEMON SCHEDULER CLIENT INSTALL PACKAGE-INVENTORY; do
         rc=$(grep -oE "^${stage}-EXIT=[0-9]+" "$WORK/container-run-$RUN_SUFFIX.log" | tail -1 | cut -d= -f2)
         fact "${stage}_exit" "${rc:-MISSING}"
         [ "${rc:-1}" = "0" ] || { echo "FAIL: $DISTRO $stage-EXIT=$rc (expected 0)" >&2; exit 1; }
@@ -263,9 +340,101 @@ elif [ "$MODE" = stale-control ]; then
         chmod 755 /destdir/usr/local/bin/icecc
     "
     fact planted_artifact "/destdir/usr/local/bin/icecc overwritten with a fake script reporting ICECC 0.0.0-STALE-PLANTED"
+elif [ "$MODE" = corrupt-control ]; then
+    # Per-artifact deletion/corruption matrix (all artifacts except
+    # image-digest, handled and exited on above). Reuses an existing
+    # DESTDIR/BUILD WITHOUT wiping or rebuilding -- corrupts exactly ONE
+    # artifact, then does every check ONE combined container invocation
+    # can do live (so the untouched, genuine, real-compiled siblings of
+    # the corrupted artifact can still be probed -- they need the SAME
+    # runtime shared libraries a bare, deps-free --rm container would lack,
+    # per the single-invocation lesson noted above).
+    [ -d "$DESTDIR/usr/local/bin" ] || {
+        echo "distro_installed_identity.sh: --corrupt-control needs a prior normal run's DESTDIR/BUILD to reuse (none found at $DESTDIR); run without a control flag first" >&2
+        exit 2
+    }
+    fact reused_destdir_wiped "false (deliberate -- this is the per-artifact corruption control)"
+    fact corrupt_artifact "$CORRUPT_ARTIFACT"
+    docker run --rm -v "$BUILD:/build" -v "$DESTDIR:/destdir" -u 0:0 "$IMAGE" bash -c "
+        set -e
+        $DEP_INSTALL
+        case '$CORRUPT_ARTIFACT' in
+            icecc)
+                printf '#!/bin/sh\necho \"ICECC 0.0.0-STALE-PLANTED\"\n' > /destdir/usr/local/bin/icecc
+                chmod 755 /destdir/usr/local/bin/icecc
+                ;;
+            iceccd)
+                printf 'not a real daemon binary\n' > /destdir/usr/local/sbin/iceccd
+                ;;
+            icecc-scheduler)
+                printf '#!/bin/sh\necho WRONG-SCHEDULER-VERSION\n' > /destdir/usr/local/sbin/icecc-scheduler
+                chmod 755 /destdir/usr/local/sbin/icecc-scheduler
+                ;;
+            libicecc.a)
+                rm -f /destdir/usr/local/lib/libicecc.a
+                ;;
+            icecc.pc)
+                printf 'Name: icecc\nVersion: 0.0.0-CORRUPTED\n' > /destdir/usr/local/lib/pkgconfig/icecc.pc
+                ;;
+            package-inventory)
+                rm -f /build/package-inventory.txt
+                ;;
+        esac
+        /destdir/usr/local/bin/icecc --version > /build/corrupt-icecc-version-output.txt 2>&1 || true
+        strings /destdir/usr/local/sbin/iceccd 2>/dev/null | grep -oE 'ICECREAM daemon [0-9]+\.[0-9]+\.[0-9]+' | head -1 > /build/corrupt-iceccd-version-probe.txt || true
+        /destdir/usr/local/sbin/icecc-scheduler --version 2>&1 | grep -oE 'ICECREAM scheduler [0-9]+\.[0-9]+\.[0-9]+' | head -1 > /build/corrupt-scheduler-version-probe.txt || true
+    " 2>&1 | tee "$WORK/container-run-$RUN_SUFFIX.log"
+
+    # This mode runs its OWN complete verification (every artifact, not
+    # just icecc's) and exits from inside this branch -- it does not fall
+    # through to the shared normal/stale-control checks below, which read
+    # from different (pre-corruption) evidence files.
+    ICECC_OUT=$(cat "$BUILD/corrupt-icecc-version-output.txt" 2>/dev/null || echo "MISSING")
+    fact installed_icecc_version_output "$ICECC_OUT"
+    ICECC_SHA=$(sha256sum "$DESTDIR/usr/local/bin/icecc" 2>/dev/null | awk '{print $1}')
+    fact installed_icecc_sha256 "${ICECC_SHA:-ABSENT}"
+    require_exact installed_icecc_version_output "$ICECC_OUT" "ICECC 1.5.90"
+
+    for rel in usr/local/sbin/iceccd usr/local/sbin/icecc-scheduler usr/local/lib/libicecc.a usr/local/lib/pkgconfig/icecc.pc; do
+        key=$(printf '%s' "$rel" | tr '/.' '__')
+        path="$DESTDIR/$rel"
+        if [ -f "$path" ]; then
+            sha="$(sha256sum "$path" | awk '{print $1}')"
+        else
+            sha="ABSENT"
+        fi
+        fact "installed_${key}_sha256" "$sha"
+        require_present "installed_${key}_sha256" "$sha"
+    done
+    ICECCD_PROBE=$(cat "$BUILD/corrupt-iceccd-version-probe.txt" 2>/dev/null || echo "MISSING")
+    fact installed_iceccd_version_probe "$ICECCD_PROBE"
+    require_exact installed_iceccd_version_probe "$ICECCD_PROBE" "ICECREAM daemon 1.5.90"
+    SCHED_PROBE=$(cat "$BUILD/corrupt-scheduler-version-probe.txt" 2>/dev/null || echo "MISSING")
+    fact installed_scheduler_version_probe "$SCHED_PROBE"
+    require_exact installed_scheduler_version_probe "$SCHED_PROBE" "ICECREAM scheduler 1.5.90"
+    PC_VERSION_LINE=$(grep "^Version:" "$DESTDIR/usr/local/lib/pkgconfig/icecc.pc" 2>/dev/null || echo "ABSENT")
+    fact installed_icecc_pc_version_line "$PC_VERSION_LINE"
+    require_exact installed_icecc_pc_version_line "$PC_VERSION_LINE" "Version: 1.5.90"
+
+    if [ -f "$BUILD/package-inventory.txt" ] && [ -s "$BUILD/package-inventory.txt" ]; then
+        inv_status=present
+    else
+        inv_status=ABSENT
+    fi
+    fact package_inventory_status "$inv_status"
+    require_present package_inventory_status "$inv_status"
+
+    echo
+    echo "=== facts ($FACTS) ==="
+    cat "$FACTS"
+    echo
+    echo "BUG: corrupt-control=$CORRUPT_ARTIFACT did not trigger any gate -- the corruption had no detectable effect" >&2
+    exit 3
 fi
 
-# -- identity probe (both modes run this; only its outcome differs) --
+# -- identity probe (normal and stale-control only reach here;
+# corrupt-control has its own dedicated block above and always exits from
+# inside it) --
 if [ "$MODE" = normal ]; then
     # Read back the probe result captured INSIDE the build container (see
     # above) -- must not spawn a fresh --rm container here, it would lack
@@ -289,8 +458,8 @@ fi
 
 if [ "$MODE" = normal ]; then
     # -- the rest of the installed-identity evidence (normal mode only;
-    # the control mode's whole point is the one check above). Every one of
-    # these is a GATE (require_exact/require_present -> exit 1 on
+    # the control modes' whole point is narrower checks above). Every one
+    # of these is a GATE (require_exact/require_present -> exit 1 on
     # mismatch), not merely a recorded observation: LO's finding was that
     # only installed_icecc_version_output was ever actually asserted here,
     # while iceccd/icecc-scheduler/libicecc.a/icecc.pc could show ABSENT or
@@ -315,6 +484,14 @@ if [ "$MODE" = normal ]; then
     PC_VERSION_LINE=$(grep "^Version:" "$DESTDIR/usr/local/lib/pkgconfig/icecc.pc" 2>/dev/null || echo "ABSENT")
     fact installed_icecc_pc_version_line "$PC_VERSION_LINE"
     require_exact installed_icecc_pc_version_line "$PC_VERSION_LINE" "Version: 1.5.90"
+
+    if [ -f "$BUILD/package-inventory.txt" ] && [ -s "$BUILD/package-inventory.txt" ]; then
+        inv_status=present
+    else
+        inv_status=ABSENT
+    fi
+    fact package_inventory_status "$inv_status"
+    require_present package_inventory_status "$inv_status"
 
     for log in configure services cache daemon scheduler client install; do
         f="$BUILD/$log.log"
