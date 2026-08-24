@@ -1,6 +1,6 @@
 noinst_LIBRARIES = libprotocol50.a libp50endpoint.a libp50localtransport.a \
 	libp50sidecarsupervisor.a libp50readyadvertisement.a \
-	libp50daemonsidecaradapter.a
+	libp50daemonsidecaradapter.a libp50inputfd.a
 
 sbin_PROGRAMS = icecc-cache-service
 
@@ -31,6 +31,8 @@ libp50endpoint_a_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
 
 libp50localtransport_a_SOURCES = p50_local_transport.cpp p50_local_transport.h \
 	p50_fd_handoff.cpp p50_fd_handoff.h
+libp50inputfd_a_SOURCES = p50_input_fd_attachment.cpp p50_input_fd_attachment.h
+libp50inputfd_a_CPPFLAGS = $(AM_CPPFLAGS)
 libp50sidecarsupervisor_a_SOURCES = p50_sidecar_supervisor.cpp p50_sidecar_supervisor.h
 libp50readyadvertisement_a_SOURCES = p50_ready_advertisement.cpp \
 	p50_ready_advertisement.h
@@ -142,6 +144,7 @@ EXTRA_DIST = \
 	P50_FD_HANDOFF.md \
 	P50_DAEMON_CACHE_DISPATCH.md \
 	P50_DAEMON_SIDECAR_ADAPTER.md \
+	P50_INPUT_FD_ATTACHMENT.md \
 	formal/README.md
 
 check-local:

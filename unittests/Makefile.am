@@ -3,6 +3,8 @@ TESTS += p50daemonsidecaradapter
 TESTS += p50daemonsidecaradapter-source.sh
 TESTS += p50daemonsidecaradapter-sanitize.sh
 TESTS += p50daemonpositive-source.sh p50daemonpositive-run.sh
+TESTS += p50inputfd-source.sh p50inputfd-sanitize.sh
+TESTS += p50inputfd
 
 AM_TESTS_ENVIRONMENT = \
 	ICECC_TEST_BUILDDIR='$(abs_builddir)'; export ICECC_TEST_BUILDDIR; \
@@ -65,6 +67,7 @@ digest128bench_LDADD = ../services/libicecc.la
 
 check_PROGRAMS = testargs lockexec backpressure schedpolicy utf8test statewritertest schedbp daemonlogin daemonbatch cachehandoffdaemon daemoncachedispatch p50daemoncachedispatch p49daemon p49scheduler connectivity fastesttest hallflowtest jobidalloctest inputpump compilerinput p49assignment p50assignment p50cacheadvertisement p50cachesession p50wire p50slice0 p50zstd p50zstdwindow p50inputrecord p50inputrecordlate p50inputrecordreopen p50inputattachment p50endpoint p50localtransport p50sidecarsupervisor p50readyadvertisement p50cacheservice p50fdhandoff digest128bench
 check_PROGRAMS += p50daemonsidecaradapter p50daemonpositive
+check_PROGRAMS += p50inputfd
 testargs_SOURCES = args.cpp
 p50wire_SOURCES = p50_wire_test.cpp
 p50slice0_SOURCES = \
@@ -75,6 +78,13 @@ p50inputrecord_SOURCES = p50_input_record_test.cpp
 p50inputrecordlate_SOURCES = p50_input_record_late_commit_test.cpp
 p50inputrecordreopen_SOURCES = p50_input_record_closed_reopen_test.cpp
 p50inputattachment_SOURCES = p50_input_attachment_test.cpp
+p50inputfd_SOURCES = p50_input_fd_attachment_test.cpp \
+	../cache/p50_input_fd_attachment.cpp ../cache/p50_input_record.cpp \
+	../cache/p50_local_transport.cpp ../cache/p50_fd_handoff.cpp \
+	../cache/protocol50.cpp
+p50inputfd_CXXFLAGS = -pthread
+p50inputfd_LDFLAGS = -pthread
+p50inputfd_LDADD = ../services/libicecc.la $(LIBZSTD_LIBS) $(XXHASH_LIBS)
 p50endpoint_SOURCES = p50_endpoint_test.cpp
 p50readyadvertisement_SOURCES = p50_ready_advertisement_test.cpp
 p50daemonsidecaradapter_SOURCES = p50_daemon_sidecar_adapter_test.cpp \
@@ -203,7 +213,7 @@ connectivity_DEPENDENCIES = conn_shim.so
 CLEANFILES = sndbuf_shim.so conn_shim.so readyclose_shim.so schedbp-scheduler-*.log
 EXTRA_DIST = sndbuf_shim.c conn_shim.c readyclose_shim.c connectivity-run.sh schedbp-quick.sh schedstress-quick.sh remoteice-quick.sh p50assignment-remote.sh daemonlogin-run.sh daemonbatch-run.sh cachehandoffdaemon-run.sh daemoncachedispatch-run.sh p49daemon-run.sh p49scheduler-run.sh boost-prefix-scope.sh
 
-EXTRA_DIST += p50_trace_check.sh p50assignment-source.sh p50cacheadvertisement-source.sh p50cachesession-source.sh p50daemoncachedispatch-source.sh p50daemoncachedispatch-sanitize.sh p50localtransport-source.sh p50localtransport-sanitize.sh p50sidecarsupervisor-source.sh p50inputattachment-source.sh p50inputattachment-mutants.sh p50_input_attachment_sanitize.sh p50readyadvertisement-source.sh p50readyadvertisement-mutants.sh p50endpoint-source.sh p50fdhandoff-source.sh p50cacheservice-source.sh p50cacheservice-sanitize.sh p50fdhandoff-sanitize.sh packagebuilderdeps.sh p50daemonpositive-source.sh p50daemonpositive-run.sh
+EXTRA_DIST += p50_trace_check.sh p50assignment-source.sh p50cacheadvertisement-source.sh p50cachesession-source.sh p50daemoncachedispatch-source.sh p50daemoncachedispatch-sanitize.sh p50localtransport-source.sh p50localtransport-sanitize.sh p50sidecarsupervisor-source.sh p50inputattachment-source.sh p50inputattachment-mutants.sh p50_input_attachment_sanitize.sh p50readyadvertisement-source.sh p50readyadvertisement-mutants.sh p50endpoint-source.sh p50fdhandoff-source.sh p50cacheservice-source.sh p50cacheservice-sanitize.sh p50fdhandoff-sanitize.sh p50inputfd-source.sh p50inputfd-sanitize.sh packagebuilderdeps.sh p50daemonpositive-source.sh p50daemonpositive-run.sh
 
 # Make the tests also print the test log if they fail.
 check: export VERBOSE=1
