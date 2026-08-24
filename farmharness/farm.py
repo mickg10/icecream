@@ -3,7 +3,7 @@
 Phases: up (scheduler + one iceccd per F, --network host, SSD scratch) -> test -> down.
 Down runs in a context manager so a crash still tears the cluster down.
 This first cut proves cross-host registration; the test phase is layered on next."""
-import hashlib, json, os, re, secrets, subprocess, sys, time, argparse
+import hashlib, io, json, os, re, secrets, subprocess, sys, tarfile, time, argparse
 
 IMG = "icecream/farm-node:ubuntu22-gcc11-boost174"
 NET = "farmnet"
@@ -97,10 +97,36 @@ def _write_stripped(mode_str):
     this fix)."""
     return "".join(str(int(c) & 5) for c in mode_str)
 
-def image_digest_remote(host):
-    r = sh(host, f"docker image inspect {IMG} --format '{{{{index .RepoDigests 0}}}}' 2>/dev/null")
-    out = r.stdout.strip()
-    return out if r.returncode == 0 and out else None
+def image_digest_remote(host, binary_set):
+    """Round-5 finding (Deep Reviewer): the previous design inspected the
+    MUTABLE IMG tag's own RepoDigests as a proxy for "is the right image
+    present" -- entirely decoupled from what docker_run_detached()/
+    run_client() actually launch (plan.s_img/f_img/c_img, always
+    launch_image(binary_set)'s digest-qualified ref). Re-pointing the tag
+    (a decoy, or ordinary housekeeping) has NOTHING to do with what would
+    actually run, yet could flip this check's verdict either way. Fixed:
+    inspect the EXACT digest-qualified launch reference directly.
+
+    Deliberately does NOT compare any field of the inspect output (not
+    `.Id`, not `.RepoDigests`) -- the research7 fix already proved those
+    fields mean DIFFERENT things on different local docker store
+    architectures (containerd-image-store hosts report `.Id` as the
+    MANIFEST digest; research7's classic overlay2 store reports `.Id` as
+    the CONFIG digest for the identical content -- see
+    research7-docker-store-fix). Comparing either field would silently
+    reintroduce that exact cross-host inconsistency. Instead: a
+    successful `docker image inspect <exact-ref>` IS the whole proof --
+    it means that exact reference resolves to *some* local image object,
+    which is precisely what `docker run --pull=never <exact-ref>` also
+    needs to succeed, store architecture never entering into it.
+
+    Returns the digest-qualified ref itself on success (so the caller's
+    simple string-equality check against `launch_image(binary_set)`
+    still works unchanged), None if that exact object is not locally
+    resolvable."""
+    ref = launch_image(binary_set)
+    r = sh(host, f"docker image inspect {ref} >/dev/null 2>&1")
+    return ref if r.returncode == 0 else None
 
 def launch_image(binary_set):
     """The image reference for docker run: digest-pinned (repo@sha256:...,
@@ -181,27 +207,40 @@ def _publish_script(binary_set, manifest, root, src_tar_path, incoming_cleanup):
        host, including q3 (previously only the hub-relay path for
        non-q3 hosts did this; q3 extracted its local tar unchecked).
     2. If the final name already exists: verify it (inventory + hash +
-       hardened mode, step 8's check) and exit -- already-current if
+       hardened mode, step 9's check) and exit -- already-current if
        clean, a hard unrepaired failure if not. Never proceeds past here
        in that case.
-    3. Extract into a FRESH TEMP SIBLING (never into the final name).
-    4. Exact inventory check on the temp tree: every non-directory entry
+    3. PRE-EXTRACTION tar header validation (round-5, Deep Reviewer):
+       `tar -tf`/`tar -tvf` only ever LIST the archive's index -- never
+       write a byte to disk -- so this runs entirely before extraction.
+       Rejects absolute-path members, `..` path-traversal components,
+       duplicate member names, any non-regular/non-directory entry type
+       (symlink, device, fifo, socket), and enforces member-count
+       (<=200) and total-declared-size (<=2GiB) bounds. This closes a
+       real gap the OLD design had: step 5's post-extraction verify()
+       can only ever see what landed WITHIN $TMP -- a tar smuggling an
+       absolute-path or `../`-traversal member writes OUTSIDE $TMP
+       during extraction itself, before verify() ever runs, so nothing
+       downstream could have caught it. Only a listing-only, pre-
+       extraction gate can.
+    4. Extract into a FRESH TEMP SIBLING (never into the final name).
+    5. Exact inventory check on the temp tree: every non-directory entry
        found must correspond to exactly one manifest path and vice versa
        (no extra members, nothing missing) -- catches a tar smuggling
        something the manifest never listed.
-    5. Every tracked path must be a regular, non-symlink file, and its
+    6. Every tracked path must be a regular, non-symlink file, and its
        sha256 must match the manifest, at the PRE-hardening (original)
        mode.
-    6. `chmod -R a-w` the temp tree -- REQUIRED to succeed (previously
+    7. `chmod -R a-w` the temp tree -- REQUIRED to succeed (previously
        this ran AFTER the rename with failure silently ignored via
        `chmod ...; true`, which LO/BO both flagged as fail-open: a
        crashed/failed chmod left a writable final root that verification
        still accepted, since it tolerated either mode).
-    7. Re-verify the temp tree's inventory/hash/mode, now requiring the
+    8. Re-verify the temp tree's inventory/hash/mode, now requiring the
        HARDENED (write-stripped) mode exactly -- confirms the chmod
        actually took effect, file by file, before anything is renamed
        into its permanent name.
-    8. Atomic, FAIL-LOUD rename (`mv -T`, not `mv -Tn`) of the temp
+    9. Atomic, FAIL-LOUD rename (`mv -T`, not `mv -Tn`) of the temp
        sibling onto the final name. This is safe and correct to do
        without the old `-n` no-clobber guard: by construction, we only
        reach this line after already confirming (step 2, still holding
@@ -215,8 +254,8 @@ def _publish_script(binary_set, manifest, root, src_tar_path, incoming_cleanup):
 
     Emits exactly one final, machine-parseable status line:
     PUBLISH-ALREADY-CURRENT / PUBLISH-OK / PUBLISH-LOCK-TIMEOUT /
-    PUBLISH-TAR-HASH-MISMATCH:<sha> / PUBLISH-EXTRACT-FAILED /
-    PUBLISH-EXISTS-BUT-FAILS:<problems> /
+    PUBLISH-TAR-HASH-MISMATCH:<sha> / PUBLISH-TAR-HEADER-INVALID:<reason> /
+    PUBLISH-EXTRACT-FAILED / PUBLISH-EXISTS-BUT-FAILS:<problems> /
     PUBLISH-TEMP-VERIFY-FAILED:<problems> /
     PUBLISH-CHMOD-FAILED / PUBLISH-HARDENED-VERIFY-FAILED:<problems> /
     PUBLISH-RENAME-FAILED / PUBLISH-FINAL-VERIFY-FAILED:<problems>."""
@@ -299,7 +338,35 @@ if [ -d "$ROOT" ]; then
     echo "PUBLISH-EXISTS-BUT-FAILS:$FAIL"; exit 3
 fi
 
-# Step 3: extract into a fresh temp sibling. --same-permissions (-p) is
+# Step 3 (round-5, Deep Reviewer): PRE-EXTRACTION tar header validation.
+# `tar -tf`/`tar -tvf` only LIST the archive's index -- never write to
+# disk -- so every check here runs before a single byte of $SRC_TAR is
+# ever extracted. This is deliberately NOT redundant with steps 5-6's
+# post-extraction verify(): that check can only ever see what actually
+# landed WITHIN $TMP, so a member with an absolute path or a `../`
+# traversal component would write OUTSIDE $TMP during extraction itself,
+# before verify() ever gets a chance to run against anything.
+TAR_NAMES=$(tar -tf "$SRC_TAR") || {{ echo "PUBLISH-TAR-HEADER-INVALID:list-failed"; exit 10; }}
+TAR_N=$(printf '%s\n' "$TAR_NAMES" | grep -c .)
+if [ "$TAR_N" -eq 0 ] || [ "$TAR_N" -gt 200 ]; then
+    echo "PUBLISH-TAR-HEADER-INVALID:member-count=$TAR_N"; exit 10
+fi
+if printf '%s\n' "$TAR_NAMES" | grep -qE '^/|(^|/)\.\.(/|$)'; then
+    echo "PUBLISH-TAR-HEADER-INVALID:path-traversal-or-absolute"; exit 10
+fi
+if [ "$(printf '%s\n' "$TAR_NAMES" | sort -u | wc -l)" != "$TAR_N" ]; then
+    echo "PUBLISH-TAR-HEADER-INVALID:duplicate-member-names"; exit 10
+fi
+TAR_BADTYPES=$(tar -tvf "$SRC_TAR" | awk '{{print substr($1,1,1)}}' | grep -vE '^[-d]$' || true)
+if [ -n "$TAR_BADTYPES" ]; then
+    echo "PUBLISH-TAR-HEADER-INVALID:non-regular-entry-type"; exit 10
+fi
+TAR_TOTAL_SIZE=$(tar -tvf "$SRC_TAR" | awk '{{sum+=$3}} END{{print sum+0}}')
+if [ "$TAR_TOTAL_SIZE" -gt 2147483648 ]; then
+    echo "PUBLISH-TAR-HEADER-INVALID:total-size=$TAR_TOTAL_SIZE"; exit 10
+fi
+
+# Step 4: extract into a fresh temp sibling. --same-permissions (-p) is
 # REQUIRED here: plain `tar -x` as a non-root user applies the extracting
 # process's UMASK on top of the archive's stored mode bits instead of
 # reproducing them exactly (caught live in a local dry run: the real p43
@@ -311,19 +378,19 @@ fi
 rm -rf "$TMP"; mkdir -p "$TMP"
 if ! tar --same-permissions -xf "$SRC_TAR" -C "$TMP"; then echo "PUBLISH-EXTRACT-FAILED"; rm -rf "$TMP"; exit 1; fi
 
-# Steps 4-5: exact inventory + hash/type at the PRE-hardening mode.
+# Steps 5-6: exact inventory + hash/type at the PRE-hardening mode.
 verify "$TMP" 3
 if [ -n "$FAIL" ]; then echo "PUBLISH-TEMP-VERIFY-FAILED:$FAIL"; rm -rf "$TMP"; exit 2; fi
 
-# Step 6: chmod the TEMP tree read-only -- REQUIRED to succeed.
+# Step 7: chmod the TEMP tree read-only -- REQUIRED to succeed.
 if ! chmod -R a-w "$TMP"; then echo "PUBLISH-CHMOD-FAILED"; rm -rf "$TMP"; exit 6; fi
 
-# Step 7: re-verify at the HARDENED mode before this is ever renamed into
+# Step 8: re-verify at the HARDENED mode before this is ever renamed into
 # its permanent, final name.
 verify "$TMP" 4
 if [ -n "$FAIL" ]; then echo "PUBLISH-HARDENED-VERIFY-FAILED:$FAIL"; rm -rf "$TMP"; exit 8; fi
 
-# Step 8: fail-loud atomic rename (never -n/no-clobber -- $ROOT is
+# Step 9: fail-loud atomic rename (never -n/no-clobber -- $ROOT is
 # guaranteed absent here, confirmed under this SAME lock hold in step 2;
 # a rename failure now is a genuine, surprising error, not a benign race).
 if ! mv -T "$TMP" "$ROOT"; then echo "PUBLISH-RENAME-FAILED"; rm -rf "$TMP" 2>/dev/null; exit 7; fi
@@ -416,6 +483,9 @@ def publish_immutable_root(host, binary_set):
     if line.startswith("PUBLISH-TAR-HASH-MISMATCH:"):
         return (f"publish[{host}/{binary_set}]: source tar on {host} does not match manifest.tar.sha256 "
                 f"(manifest {manifest['tar']['sha256']}, actual {line.split(':', 1)[1]})"), None
+    if line.startswith("PUBLISH-TAR-HEADER-INVALID:"):
+        return (f"publish[{host}/{binary_set}]: source tar on {host} failed PRE-extraction header "
+                f"validation ({line.split(':', 1)[1]}) -- refused before a single byte was extracted"), None
     if line.startswith("PUBLISH-EXISTS-BUT-FAILS:"):
         problems = line.split(":", 1)[1]
         return (f"publish[{host}/{binary_set}]: {root} EXISTS but FAILS verification "
@@ -471,11 +541,12 @@ def preflight(host, binary_set):
     if problems:
         return f"preflight[{host}/{binary_set}]: " + "; ".join(problems)
 
-    expect_digest = f"{IMG.split(':', 1)[0]}@{manifest['build']['image_digest']}"
-    actual_digest = image_digest_remote(host)
+    expect_digest = launch_image(binary_set)
+    actual_digest = image_digest_remote(host, binary_set)
     if actual_digest != expect_digest:
-        return (f"preflight[{host}/{binary_set}]: image digest mismatch "
-                f"(manifest {expect_digest}, actual {actual_digest!r})")
+        return (f"preflight[{host}/{binary_set}]: launch image object {expect_digest} is not "
+                f"locally resolvable on {host} (docker image inspect on that exact ref failed) "
+                f"-- run: python3 farm.py distribute --sets {binary_set} --hosts {host}")
     return None
 
 HUB_LOG_DIR = os.path.expanduser("~/.farm-hub-logs")   # deliberately OUTSIDE the git
@@ -689,8 +760,9 @@ class _MutationTracker:
 
     `mark()` is called from inside the actual mutating primitives
     themselves -- docker_rm(), scratch_prepare(), docker_run_detached(),
-    push_file() -- never from any call site above them (not from up(),
-    not from run_client(), not from main()). That is what makes it
+    docker_run_foreground_staged() -- never from any call site above
+    them (not from up(), not from run_client(), not from main()). That
+    is what makes it
     structurally impossible for `started` to become True without a real
     mutating action having actually run at least once: there is no code
     path that sets it in anticipation of a mutation, only ones that set
@@ -756,6 +828,25 @@ def sh(host, cmd, timeout=120, check=False):
         raise RuntimeError(f"[{host}] {cmd!r} rc={r.returncode}: {r.stderr.strip()[:300]}")
     return r
 
+def sh_stdin(host, cmd, input_bytes, timeout=120):
+    """Like sh(), but pipes `input_bytes` (raw bytes, not text) into the
+    remote command's own stdin over the SAME SSH connection -- the
+    mechanism run_client() uses to stream the harness bundle directly
+    into a foreground `docker run -i`'s stdin (which docker, in turn,
+    connects to the container's own stdin). Returns a result object with
+    the same .stdout/.stderr/.returncode shape as sh()'s, decoded as
+    text (replacing undecodable bytes) for uniform handling by callers
+    that only ever expect these commands' own text output, never binary
+    passthrough on the way OUT."""
+    r = subprocess.run(HOSTS[host]["ssh"] + [cmd], input=input_bytes, capture_output=True, timeout=timeout)
+    class _Result:
+        pass
+    out = _Result()
+    out.returncode = r.returncode
+    out.stdout = r.stdout.decode(errors="replace")
+    out.stderr = r.stderr.decode(errors="replace")
+    return out
+
 def docker_rm(host, name):
     MUTATIONS.mark()
     sh(host, f"docker rm -f {name} 2>/dev/null; true")
@@ -780,9 +871,19 @@ def docker_run_detached(host, name, tree, img, inner_cmd):
     function itself is attestation-agnostic, same as it's tree/set-
     agnostic; it just runs whatever single command string it's given as
     the container's `bash -c` argument (PID 1), never touching or
-    parsing it."""
+    parsing it.
+
+    `--pull=never` (round-5, Deep Reviewer): `img` is always
+    launch_image(binary_set) -- an exact, manifest-pinned, digest-
+    qualified reference, already confirmed locally resolvable by
+    preflight()/image_digest_remote() before this ever runs. Without
+    `--pull=never`, an absent-locally object would make `docker run`
+    silently fall back to a network pull (Docker's default `--pull`
+    policy is `missing`) instead of refusing outright -- a fail-open
+    path this design has no legitimate use for (every image this
+    launches is supposed to already be local, verified, and pinned)."""
     MUTATIONS.mark()
-    sh(host, f"docker run -d --name {name} --network host -v {tree}:/work:ro -v {SCRATCH}:/scratch -u 0:0 {img} "
+    sh(host, f"docker run -d --pull=never --name {name} --network host -v {tree}:/work:ro -v {SCRATCH}:/scratch -u 0:0 {img} "
              f"bash -c '{inner_cmd}'", check=True)
 
 def scratch_prepare(host, mkdir_path, log_path):
@@ -799,7 +900,12 @@ def _attestation_token():
     happened to reuse the same name (see _attestation_prefix())."""
     return secrets.token_hex(8)
 
-def _attestation_prefix(binary_set, token):
+ROLE_BINARY_FD = 8   # the fixed FD number _attestation_prefix() stages the
+                     # role binary at; the caller's real_cmd execs
+                     # /proc/self/fd/8, never re-opening the path -- see
+                     # _attestation_prefix()'s docstring.
+
+def _attestation_prefix(binary_set, token, role_binary_path=None):
     """Build a bash snippet -- safe to embed inside a single-quoted
     `bash -c '...'` docker argument; it contains no single quotes
     anywhere -- that is meant to run as the FIRST thing inside a role
@@ -821,17 +927,55 @@ def _attestation_prefix(binary_set, token):
     is no window, however small, during which an unattested container is
     already running the real binary.
 
+    `role_binary_path` (round-5, Deep Reviewer): the manifest-relative
+    path of the ONE tracked file THIS container's own real_cmd is about
+    to exec (e.g. "obj/scheduler/icecc-scheduler"). Every OTHER tracked
+    file is still checked by PATH exactly as before (they are read-then-
+    left on disk by the already-running process, never exec'd by this
+    shell, so an FD-pin here would not close anything a later runtime
+    read couldn't still independently race -- that is a different, wider
+    hardening question, not this fix's scope). The role binary itself
+    gets a STRONGER guarantee: opened as FD 8 (ROLE_BINARY_FD) FIRST via
+    `exec 8< PATH`, hashed via `sha256sum /proc/self/fd/8` (never
+    re-reading the path), and the caller's real_cmd is expected to
+    `exec /proc/self/fd/8` rather than re-opening `/work/<path>`. This
+    closes a real TOCTOU the
+    path-based design had: hashing `/work/X` and later separately exec'ing
+    `/work/X` are two independent opens of the same PATH, with nothing
+    (from the container's perspective) stopping a host-side actor from
+    replacing the underlying inode in between, however narrow that window
+    normally is. An open file descriptor is a reference to the INODE
+    itself, established at the moment of open() -- completely independent
+    of whatever the path's directory entry is later changed to point at
+    (this is standard POSIX file semantics, the same property that makes
+    a still-open deleted file's contents remain readable through its fd)
+    -- so hash and exec, sharing the SAME fd, are now provably the exact
+    same bytes, with a window of zero, not merely a narrow one.
+
+    Raises RuntimeError immediately (before returning any bash text) if
+    role_binary_path is given but isn't one of manifest[binary_set]'s
+    own tracked paths -- a caller-side programming error, not something
+    that should ever reach a real container.
+
     binary_set=None returns "" (a true no-op prefix), matching every
     other function in this file's convention -- the caller's real command
     then runs exactly as it did before attestation existed."""
     if binary_set is None:
         return ""
     manifest = load_manifest(binary_set)
+    tracked_paths = {b["path"] for b in manifest["binaries"]}
+    if role_binary_path is not None and role_binary_path not in tracked_paths:
+        raise RuntimeError(f"_attestation_prefix: role_binary_path {role_binary_path!r} is not a "
+                            f"tracked file in binary_set {binary_set!r}'s manifest ({sorted(tracked_paths)})")
     parts = []
     for b in manifest["binaries"]:
         remote = f"/work/{b['path']}"
         parts.append(f'if [ -L "{remote}" ] || [ ! -f "{remote}" ]; then echo ARTIFACT-ATTEST-FAIL; exit 97; fi')
-        parts.append(f'h=$(sha256sum "{remote}"); h=${{h%% *}}')
+        if b["path"] == role_binary_path:
+            parts.append(f'exec {ROLE_BINARY_FD}< "{remote}"')
+            parts.append(f'h=$(sha256sum /proc/self/fd/{ROLE_BINARY_FD}); h=${{h%% *}}')
+        else:
+            parts.append(f'h=$(sha256sum "{remote}"); h=${{h%% *}}')
         parts.append(f'if [ "$h" != "{b["sha256"]}" ]; then echo ARTIFACT-ATTEST-FAIL; exit 97; fi')
     parts.append(f"echo ARTIFACT-ATTEST-OK-{token}")
     return "; ".join(parts) + "; "
@@ -905,8 +1049,8 @@ def up(worker_hosts, plan):
     scratch_prepare(SCHED_HOST, f"{SCRATCH}/farm", f"{SCRATCH}/farm/sched.log")
     s_token = _attestation_token()
     docker_run_detached(SCHED_HOST, "farm-sched", plan.s_tree, plan.s_img,
-        _attestation_prefix(plan.binary_set_s, s_token) +
-        f"useradd -r icecc 2>/dev/null; exec /work/obj/scheduler/icecc-scheduler -p {SCHED_PORT} -n {NET} -l /scratch/farm/sched.log -vvv")
+        _attestation_prefix(plan.binary_set_s, s_token, "obj/scheduler/icecc-scheduler") +
+        f"useradd -r icecc 2>/dev/null; exec /proc/self/fd/{ROLE_BINARY_FD} -p {SCHED_PORT} -n {NET} -l /scratch/farm/sched.log -vvv")
     wait_for_attestation(SCHED_HOST, "farm-sched", s_token)
     time.sleep(3)
     # one worker per F -- every host's role was already resolved, in order,
@@ -921,10 +1065,10 @@ def up(worker_hosts, plan):
         scratch_prepare(h, f"{SCRATCH}/farm/envs", f"{SCRATCH}/farm/worker.log")
         f_token = _attestation_token()
         docker_run_detached(h, "farm-worker", f_tree, f_img,
-            _attestation_prefix(plan.binary_set_f, f_token) +
+            _attestation_prefix(plan.binary_set_f, f_token, "obj/daemon/iceccd") +
             f"useradd -r -s /usr/sbin/nologin icecc 2>/dev/null; "
             f"chown icecc /scratch/farm/envs; "  # pre-chown as root: daemon's cleanup_cache runs post-drop (no CAP_CHOWN)
-            f"exec /work/obj/daemon/iceccd -m 8 -s {sip}:{SCHED_PORT} -n {NET} -N {h}w -b /scratch/farm/envs "
+            f"exec /proc/self/fd/{ROLE_BINARY_FD} -m 8 -s {sip}:{SCHED_PORT} -n {NET} -N {h}w -b /scratch/farm/envs "
             f"-p {wp} -l /scratch/farm/worker.log -vvv")
         wait_for_attestation(h, "farm-worker", f_token)
     # wait for all workers to register
@@ -971,10 +1115,10 @@ def verify_harness_scripts():
     HUB_DIR (the checkout's own farmharness/ directory), must hash to its
     FROZEN_HARNESS_HASHES entry EXACTLY. Raises RuntimeError -- fail-
     closed, no fallback path -- on any mismatch or on a missing/unreadable
-    file. Called from run_client() before push_file() ever runs, so a
-    tampered or drifted checkout copy of either script is refused before
-    a single byte of it reaches any host, let alone executes inside a
-    container."""
+    file. Called from run_client() before _build_harness_bundle() ever
+    runs, so a tampered or drifted checkout copy of either script is
+    refused before a single byte of it is even bundled, let alone
+    streamed to any host or executed inside a container."""
     for s in SCRIPTS:
         path = os.path.join(HUB_DIR, s)
         try:
@@ -988,12 +1132,99 @@ def verify_harness_scripts():
                                 f"(frozen {expect!r}, actual {actual!r}) -- refusing to stage or "
                                 f"execute it on any host")
 
-def push_file(host, localpath, remotepath):
+def _build_harness_bundle():
+    """Build a deterministic, in-memory, uncompressed tar of SCRIPTS
+    (farm_client.sh, replay.py), read from HUB_DIR -- the exact same
+    bytes verify_harness_scripts() (the caller's own first statement,
+    always run immediately before this) just confirmed match
+    FROZEN_HARNESS_HASHES. Every member gets a FIXED mtime/uid/gid/mode
+    (never the checkout's own filesystem metadata, which varies run to
+    run and machine to machine) so these tar bytes are a pure function
+    of the two scripts' CONTENT alone -- this is what gets streamed
+    directly into the client container's own stdin (round-5, Deep
+    Reviewer's promoted harness-private-staging fix), never written to
+    any mutable host path first."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        for s in SCRIPTS:
+            data = open(os.path.join(HUB_DIR, s), "rb").read()
+            info = tarfile.TarInfo(name=s)
+            info.size = len(data)
+            info.mtime = 0
+            info.uid = info.gid = 0
+            info.uname = info.gname = ""
+            info.mode = 0o555
+            tf.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+def _harness_stage_verify(stage_token):
+    """Bash snippet -- safe to embed inside a single-quoted `bash -c
+    '...'` docker argument -- run INSIDE the container immediately
+    after the streamed bundle has been extracted into (container-
+    private, tmpfs) /scratch, BEFORE farm_client.sh is ever reached.
+    Verifies what actually LANDED in tmpfs -- never the bytes that were
+    sent, never the hub's own checkout copy -- matches
+    FROZEN_HARNESS_HASHES exactly: exact member count (no extras,
+    nothing missing), every tracked script a regular non-symlink file,
+    sha256 exact. Emits HARNESS-STAGED-OK-<token> on success,
+    HARNESS-STAGE-FAIL + `exit 96` on any mismatch -- structurally the
+    same idea as _attestation_prefix(), just for the harness bundle
+    instead of the role binaries: verify what you are about to RUN, not
+    what you SENT. Because this runs as part of the container's own
+    PID 1 script, a failure here terminates the container immediately,
+    before farm_client.sh (let alone replay.py, let alone any role
+    binary it invokes) is ever reached."""
+    parts = []
+    parts.append("scnt=$(find /scratch -mindepth 1 -maxdepth 1 | wc -l)")
+    parts.append(f'if [ "$scnt" != "{len(SCRIPTS)}" ]; then echo HARNESS-STAGE-FAIL; exit 96; fi')
+    for s in SCRIPTS:
+        remote = f"/scratch/{s}"
+        expect = FROZEN_HARNESS_HASHES[s]
+        parts.append(f'if [ -L "{remote}" ] || [ ! -f "{remote}" ]; then echo HARNESS-STAGE-FAIL; exit 96; fi')
+        parts.append(f'h=$(sha256sum "{remote}"); h=${{h%% *}}')
+        parts.append(f'if [ "$h" != "{expect}" ]; then echo HARNESS-STAGE-FAIL; exit 96; fi')
+    parts.append(f"echo HARNESS-STAGED-OK-{stage_token}")
+    return "; ".join(parts) + "; "
+
+def docker_run_foreground_staged(host, name, tree, img, stdin_bytes, inner_cmd, timeout=1800):
+    """Run a container in the FOREGROUND (`docker run -i --rm`, never
+    detached) with `stdin_bytes` piped directly into its stdin. The
+    ONLY docker-mutating primitive run_client() uses for the client
+    role (round-5 redesign, Deep Reviewer's promoted harness-private-
+    staging fix -- supersedes the old detached-holder + `docker exec`
+    + host-scratch `push_file()` design).
+
+    `/work` is `:ro` -- role-artifact binaries, same reasoning as
+    docker_run_detached(). `/scratch` is CONTAINER-PRIVATE tmpfs --
+    NEVER a host bind -- the streamed harness bundle is extracted there
+    and verified from INSIDE the container (_harness_stage_verify()),
+    never touching mutable host storage at any point; tmpfs is also
+    mounted `noexec` by default, which structurally forbids anything
+    landing there from ever being exec'd directly (irrelevant to this
+    design either way -- farm_client.sh/replay.py are always INVOKED
+    via an interpreter, `bash .../farm_client.sh` and, internally,
+    `python3 /scratch/replay.py`, never exec'd as their own standalone
+    process -- confirmed live: `bash -n /scratch/farm_client.sh`
+    succeeds under noexec, a direct `/scratch/farm_client.sh` invocation
+    is refused with "Permission denied"). `/hostscratch` is the SAME
+    host scratch directory docker_run_detached()'s callers use for
+    logging, but READ-ONLY and at a DIFFERENT mount point -- the pre-
+    populated, reusable fixtures this design still needs (a cmake
+    install, project sources like fmt/rocksdb) live there, kept
+    structurally separate from the tmpfs-only harness-staging area, and
+    never writable by this container.
+
+    `--rm` (not a persistent named container docker_rm() tears down
+    later) since this is a single foreground invocation whose own exit
+    ends its container's lifetime; a defensive `docker rm -f` still
+    runs first, in case a stale container from an interrupted prior run
+    left this name occupied."""
     MUTATIONS.mark()
-    data = open(localpath, "rb").read()
-    p = subprocess.run(HOSTS[host]["ssh"] + [f"cat > {remotepath}"], input=data, capture_output=True, timeout=60)
-    if p.returncode != 0:
-        raise RuntimeError(f"push {localpath}->{host}:{remotepath} failed: {p.stderr.decode()[:200]}")
+    sh(host, f"docker rm -f {name} 2>/dev/null; true")
+    cmd = (f"docker run -i --rm --pull=never --name {name} --network host "
+           f"-v {tree}:/work:ro --tmpfs /scratch -v {SCRATCH}:/hostscratch:ro "
+           f"-u 0:0 {img} bash -c '{inner_cmd}'")
+    return sh_stdin(host, cmd, stdin_bytes, timeout=timeout)
 
 def run_client(client_host, project_dir, mode, maxtu, jobs, prefer, plan):
     """Run the client against an ALREADY-validated LaunchPlan's C
@@ -1001,63 +1232,90 @@ def run_client(client_host, project_dir, mode, maxtu, jobs, prefer, plan):
     preflights anything itself; that already happened inside
     resolve_launch_plan()/revalidate_entire_plan(), before up() was even
     called, let alone this function. revalidate_before_mutation() runs
-    first, before push_file() even -- push_file() is itself one of the
-    actions that must never happen ahead of a full, successful
-    (re)validation. `/work` is mounted READ-ONLY (`:ro`), same reasoning
-    as docker_run_detached().
+    first, before docker_run_foreground_staged() -- the ONE mutating
+    action this function performs.
 
-    The client container is started DETACHED (like the scheduler/worker)
-    as an idle holder (`sleep 1800`) -- there is no role binary running
-    yet at that point, so nothing to attest there. The actual role
-    action for C is farm_client.sh, invoked via a SEPARATE `docker exec`;
-    THAT invocation is where the attestation prefix belongs (BO: "before
-    farm_client.sh"), wrapped as its own `bash -c 'PREFIX; REAL_CMD'`
-    inside the exec -- so farm_client.sh, like the scheduler/daemon exec
-    in up(), is structurally unreachable unless every tracked file's
-    identity checks out first, from inside THIS container, immediately
-    before it runs. This supersedes the round-3 design
-    (verify_launched_container_identity(), a `docker exec ... sha256sum`
-    against the idle holder) with the same pre-exec, in-band mechanism
-    up() now uses for S/F -- no separate post-start check needed.
+    Round-5 redesign (Deep Reviewer's promoted harness-private-staging
+    fix, superseding round-4's minimum shape): the OLD design pushed
+    farm_client.sh/replay.py into `~/farm-scratch` -- a MUTABLE, host-
+    bind-mounted, read-write directory -- before ever starting the
+    container, then separately started a DETACHED idle holder and
+    `docker exec`'d into it. That left a real window (push-to-exec, not
+    merely hash-to-exec) during which the STAGED copies on the host sat
+    writable and host-visible, with nothing re-verifying them at the
+    point they actually ran. Fixed: the harness bundle
+    (_build_harness_bundle(), built from the SAME checkout copies
+    verify_harness_scripts() just confirmed) is streamed DIRECTLY into a
+    single FOREGROUND `docker run -i`'s stdin (docker_run_foreground_
+    staged()) and extracted into CONTAINER-PRIVATE tmpfs -- never
+    touching any mutable host path at all -- then _harness_stage_verify()
+    checks what actually landed in that tmpfs, from INSIDE the
+    container, before farm_client.sh is ever reached. The pre-populated,
+    reusable fixtures the old design also kept under `~/farm-scratch`
+    (a cmake install, project sources like fmt/rocksdb) are still needed
+    but are now mounted READ-ONLY at the SEPARATE path `/hostscratch`
+    (see docker_run_foreground_staged()) -- `project_dir` callers pass
+    is expected to already be `/hostscratch/<name>`, and `farm_client.sh`
+    itself is never modified (it already honors a `CMAKE` environment
+    override, exported here rather than editing the frozen script).
 
-    No longer self-cleaning (`--rm` is gone since the container is no
-    longer one-shot), so this always removes it before returning, success
-    or failure, via try/finally.
+    Attestation (_attestation_prefix()) is unchanged in spirit -- it
+    still runs INSIDE the same container, immediately before
+    farm_client.sh, gating every tracked role binary exactly as before.
+    farm_client.sh's own top-level invocation (`bash .../farm_client.sh`,
+    not a direct `/work/<path>` exec) is a fundamentally different shape
+    from S/F's single PID-1 binary exec, so it is not (yet) a candidate
+    for the FD-pinned exec _attestation_prefix() now offers S/F
+    (role_binary_path) -- replay.py's OWN repeated, per-TU invocations of
+    `/work/client/icecc` are a wider version of that same TOCTOU class,
+    intentionally left as a disclosed follow-up rather than folded in
+    here.
+
+    `--rm` (docker_run_foreground_staged()'s own design) means this
+    container is already gone by the time this function returns on any
+    path -- no separate teardown needed, but a defensive `docker rm -f`
+    still runs first inside that primitive in case a stale name is
+    occupied.
 
     verify_harness_scripts() runs first, before anything else in this
     function including revalidate_before_mutation() -- it's pure and
     local (no host touched, no MUTATIONS mark), checking the harness
-    scripts THIS invocation is about to stage; a tampered or drifted
-    checkout copy is refused before a single byte of it reaches any
-    host, let alone a container's /scratch."""
+    scripts THIS invocation is about to bundle; a tampered or drifted
+    checkout copy is refused before a single byte of it is even
+    bundled, let alone streamed to any host or executed inside a
+    container."""
     verify_harness_scripts()
     revalidate_before_mutation(client_host, plan.binary_set_c)
     sched = f"{HOSTS[SCHED_HOST]['ip']}:{SCHED_PORT}"
-    for s in SCRIPTS:
-        push_file(client_host, f"{HUB_DIR}/{s}", f"{SCRATCH.replace('~', '$HOME')}/{s}")
-    docker_rm(client_host, "farm-client")
-    docker_run_detached(client_host, "farm-client", plan.c_tree, plan.c_img, "sleep 1800")
-    try:
-        c_token = _attestation_token()
-        attest = _attestation_prefix(plan.binary_set_c, c_token)
-        real_cmd = f"bash /scratch/farm_client.sh {sched} {NET} {project_dir} {mode} {maxtu} {jobs} {prefer}"
-        cmd = f"docker exec farm-client bash -c '{attest}{real_cmd}'"
-        print(f"TEST: client={client_host} project={project_dir} mode={mode} maxtu={maxtu} jobs={jobs} prefer={prefer} "
-              f"C-tree={plan.c_tree}")
-        r = sh(client_host, cmd, timeout=1800)
-        if "ARTIFACT-ATTEST-FAIL" in (r.stdout or ""):
-            raise RuntimeError(f"in-container attestation FAILED for farm-client on {client_host} -- "
-                                f"farm_client.sh was never reached: {r.stdout[-400:]}")
-        if plan.binary_set_c is not None and f"ARTIFACT-ATTEST-OK-{c_token}" not in (r.stdout or ""):
-            raise RuntimeError(f"in-container attestation marker missing for farm-client on {client_host} "
-                                f"(expected ARTIFACT-ATTEST-OK-{c_token}); refusing to trust this run's output: "
-                                f"{r.stdout[-400:]}")
-        print(r.stdout.rstrip())
-        if r.stderr.strip():
-            print("TEST STDERR:", r.stderr.strip()[:400])
-        return r
-    finally:
-        docker_rm(client_host, "farm-client")
+    bundle = _build_harness_bundle()
+    stage_token = _attestation_token()
+    c_token = _attestation_token()
+    stage_verify = _harness_stage_verify(stage_token)
+    attest = _attestation_prefix(plan.binary_set_c, c_token)
+    real_cmd = (f"export CMAKE=/hostscratch/cmake/bin/cmake; "
+                f"bash /scratch/farm_client.sh {sched} {NET} {project_dir} {mode} {maxtu} {jobs} {prefer}")
+    inner_cmd = f"mkdir -p /scratch && tar -xf - -C /scratch && {stage_verify}{attest}{real_cmd}"
+    print(f"TEST: client={client_host} project={project_dir} mode={mode} maxtu={maxtu} jobs={jobs} prefer={prefer} "
+          f"C-tree={plan.c_tree}")
+    r = docker_run_foreground_staged(client_host, "farm-client", plan.c_tree, plan.c_img, bundle, inner_cmd, timeout=1800)
+    if "HARNESS-STAGE-FAIL" in (r.stdout or ""):
+        raise RuntimeError(f"in-container harness-bundle staging FAILED for farm-client on {client_host} -- "
+                            f"farm_client.sh was never reached: {r.stdout[-400:]}")
+    if f"HARNESS-STAGED-OK-{stage_token}" not in (r.stdout or ""):
+        raise RuntimeError(f"in-container harness-stage marker missing for farm-client on {client_host} "
+                            f"(expected HARNESS-STAGED-OK-{stage_token}); refusing to trust this run's output: "
+                            f"{r.stdout[-400:]}")
+    if "ARTIFACT-ATTEST-FAIL" in (r.stdout or ""):
+        raise RuntimeError(f"in-container attestation FAILED for farm-client on {client_host} -- "
+                            f"farm_client.sh was never reached: {r.stdout[-400:]}")
+    if plan.binary_set_c is not None and f"ARTIFACT-ATTEST-OK-{c_token}" not in (r.stdout or ""):
+        raise RuntimeError(f"in-container attestation marker missing for farm-client on {client_host} "
+                            f"(expected ARTIFACT-ATTEST-OK-{c_token}); refusing to trust this run's output: "
+                            f"{r.stdout[-400:]}")
+    print(r.stdout.rstrip())
+    if r.stderr.strip():
+        print("TEST STDERR:", r.stderr.strip()[:400])
+    return r
 
 def dump_worker_evidence(worker_hosts, client_stdout, client_rc, binary_set_c=None):
     """Bijection verdict -- STRENGTHENED per BO's cell-verdict fix.
@@ -1222,7 +1480,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--workers", default="research6", help="comma list of worker hosts")
     ap.add_argument("--client", default="q3", help="client host (runs the submitter + compiles)")
-    ap.add_argument("--project", default="/scratch/fmt")
+    ap.add_argument("--project", default="/hostscratch/fmt")
     ap.add_argument("--mode", default="simultaneous")
     ap.add_argument("--maxtu", default="0")
     ap.add_argument("--jobs", default="16")
@@ -1248,10 +1506,10 @@ def main():
     # cluster while this invocation was simply declining to start a NEW
     # one (LO/BO's finding). MUTATIONS.started only becomes True from
     # INSIDE the actual mutating primitives (docker_rm, scratch_prepare,
-    # docker_run_detached, push_file) the first time any of them actually
-    # runs -- see up()/run_client() -- so a refusal at ANY point before
-    # that (resolve_launch_plan(), the race-gate seam, or
-    # revalidate_entire_plan()) can never trigger down().
+    # docker_run_detached, docker_run_foreground_staged) the first time
+    # any of them actually runs -- see up()/run_client() -- so a refusal
+    # at ANY point before that (resolve_launch_plan(), the race-gate
+    # seam, or revalidate_entire_plan()) can never trigger down().
     MUTATIONS.started = False
     try:
         try:

@@ -35,6 +35,22 @@ key plus a workaround-forced replay cannot serve as the eight-cell
 bijection authority that final S4 exit needs; that authority is a
 separate, not-yet-built row key and companion harness.
 
+**Round 5** closes five further mechanism-checkpoint hardening findings
+from a Deep Reviewer hold on this same checkpoint (`eb6cf25f`): the
+role-binary hash-to-exec TOCTOU (closed via exec-by-open-fd for S/F),
+harness-private-staging PROMOTED from round 4's deferred shape to a
+required fix (streamed bundle into a foreground `docker run -i`,
+extracted into container-private tmpfs, verified in-container),
+pre-extraction tar header validation, decoupling image-digest
+verification from the mutable tag (`--pull=never` added to every
+`docker run`), and no-git runnability for the fresh-archive gate. See
+"Round 5" below for the full detail, including one real, fully-resolved
+incident found and disclosed during this round's own verification (a
+live tag-repoint experiment briefly disrupted, then fully restored, a
+real image reference on research6 -- never any data loss, confirmed via
+a fresh production `preflight()` PASS afterward). This round remains
+scoped to the mechanism checkpoint only -- same boundary as above.
+
 **The machine-readable authority is `farmharness/role-manifests/p43.json`
 and `farmharness/role-manifests/p50.json`.** This document is narrative
 only. `farm.py`'s `preflight()`/`distribute()`/`immutable_root()`/
@@ -505,6 +521,212 @@ The frozen replay blobs (`farm_client.sh`/`replay.py`, commit `f5d13fd9`)
 needed no change for this fix -- it is entirely `farm.py`-side (the
 consumer of their output), not a change to what they emit.
 
+## Round 5 (Deep Reviewer): five mechanism-checkpoint hardening fixes
+
+A new exact-SHA HOLD landed on this checkpoint (`eb6cf25f`) from a
+review posted under a bare "Deep Reviewer" header, treated as oracle-
+grade. Five blockers, all fixed, all verified against real hosts and
+the real production image; item 2 explicitly PROMOTES round 4's
+deferred stronger harness-staging shape into a required fix -- the
+deferral is no longer available.
+
+### 1. ROLE-BINARY hash-to-exec TOCTOU (`_attestation_prefix()`, S/F)
+
+The old design hashed `/work/<path>` and separately, later, exec'd
+`/work/<path>` -- two independent opens of the SAME path, nothing
+stopping a host-side actor from replacing the underlying inode in
+between. Fixed for the ONE tracked file a container's PID 1 actually
+execs (`role_binary_path`, a new `_attestation_prefix()` parameter):
+that file is opened as `ROLE_BINARY_FD` (8) FIRST via `exec 8< PATH`,
+hashed via `sha256sum /proc/self/fd/8` (never the path again), and the
+caller's `exec` targets `/proc/self/fd/8` instead of re-opening
+`/work/<path>`. An open file descriptor is a reference to the INODE
+established at `open()` time, independent of whatever the path's
+directory entry is later changed to point at -- the same property that
+keeps a still-open deleted file's contents readable through its fd --
+so hash and exec are now provably the same bytes, a window of zero, not
+merely a narrower one.
+
+**Verified live with a real red/green comparative gate**, not just the
+new code in isolation: a real S-role container is launched against a
+real isolated store, paused (an inert-unless-set ready/continue file
+pair, same idea as the existing race-gate seam) immediately after
+attestation passes but before the real exec, the HOST-side file is then
+replaced via ATOMIC RENAME (directory-entry replacement onto a new
+inode -- the realistic tamper model for this codebase, since the only
+sanctioned write path anywhere in it, `_publish_script()`'s own final
+step, is `mv -T`; an in-place truncate+overwrite of the SAME inode is a
+different primitive no fd-based defense can ever protect against, and
+was specifically ruled out as the test's tamper mechanism after an
+initial attempt with it produced a misleading pass). The OLD pattern
+(`exec /work/<path>` directly) picked up the swap -- ran the decoy, not
+the attested scheduler, proving the TOCTOU is real, not theoretical.
+The NEW pattern (`exec /proc/self/fd/8`) did not.
+
+C's own top-level exec (`bash .../farm_client.sh`, not a direct
+`/work/<path>` binary exec) is a fundamentally different shape from
+S/F's single PID-1 binary exec and is not a candidate for this same fd-
+pinning. `replay.py`'s own repeated, per-TU invocations of
+`/work/client/icecc` are a WIDER version of this same TOCTOU class
+(hash-once-at-attestation vs. exec'd fresh, via a new path-based
+`subprocess.run`, on every single TU for the whole build) -- explicitly
+disclosed here as an out-of-scope follow-up rather than silently left
+unaddressed; closing it would mean changing `replay.py` itself (a
+frozen harness script) to hold one fd open across its own process
+lifetime and exec through it repeatedly, a larger change than this
+round's mandate.
+
+### 2. HARNESS PRIVATE STAGING (promoted from round 4's deferred shape)
+
+The old design pushed `farm_client.sh`/`replay.py` into `~/farm-scratch`
+-- a MUTABLE, host-bind-mounted, read-write directory -- before the
+container even started, then separately started a detached idle holder
+and `docker exec`'d into it. That left a real window during which the
+staged copies sat writable and host-visible with nothing re-verifying
+them at the point they actually ran.
+
+Fixed: `run_client()` now builds a deterministic, in-memory,
+uncompressed tar of the two harness scripts (`_build_harness_bundle()`,
+from the SAME checkout copies `verify_harness_scripts()` just
+confirmed), streams it directly into a single FOREGROUND
+`docker run -i`'s stdin (`docker_run_foreground_staged()` -- the new,
+sole client-role mutating primitive, replacing the old detached-holder
++ `docker exec` + `push_file()` design; `push_file()` is removed
+entirely, nothing else called it), and extracts it into CONTAINER-
+PRIVATE tmpfs at `/scratch` (`tar -xf - -C /scratch`) -- never touching
+any mutable host path at all. `_harness_stage_verify()` then checks
+what actually landed in that tmpfs -- exact member count, regular non-
+symlink files, sha256 exact -- from INSIDE the container, emitting
+`HARNESS-STAGED-OK-<token>` before `farm_client.sh` is ever reached (or
+`HARNESS-STAGE-FAIL` + `exit 96`, terminating the container immediately,
+same PID-1-refusal shape as attestation).
+
+The pre-populated, reusable fixtures the old design also kept under
+`~/farm-scratch` (a `cmake` install, project sources like `fmt`/
+`rocksdb`) are still needed but are now mounted READ-ONLY at the
+SEPARATE path `/hostscratch`, kept structurally apart from the tmpfs-
+only harness-staging area and never writable by this container (live-
+verified: a write attempt through it fails with "Read-only file
+system"). `/scratch` (tmpfs) is also `noexec` by default -- irrelevant
+here either way, since `farm_client.sh`/`replay.py` are always invoked
+via an interpreter (`bash .../farm_client.sh`, and internally
+`python3 /scratch/replay.py`), never exec'd as their own standalone
+process (live-verified: `bash -n /scratch/farm_client.sh` succeeds
+under `noexec`; a direct `/scratch/farm_client.sh` invocation is refused
+with "Permission denied"). `farm_client.sh` itself needed NO content
+change -- it already honors a `CMAKE` environment override
+(`${CMAKE:-/scratch/cmake/bin/cmake}`), now exported as
+`CMAKE=/hostscratch/cmake/bin/cmake` by `run_client()` rather than
+editing the frozen script; its `PROJECT` argument was already caller-
+supplied, so only callers (the `--project` CLI default,
+`role-manifests`-unrelated test call sites) needed updating from
+`/scratch/fmt` to `/hostscratch/fmt`.
+
+**Verified live end to end**: a real single-host q3 cluster ran a real
+fmt build (10-51 TUs across different passes this round) through the
+new streamed-bundle path -- `HARNESS-STAGED-OK`, `ARTIFACT-ATTEST-OK`,
+real remote compiles, `CELL: PASS`, `join_ok=True`, clean teardown.
+**Required mutant**: a bundle with `replay.py` tampered after the fact
+(simulating a transit tamper of the streamed bytes themselves, not the
+checkout) is refused with `HARNESS-STAGE-FAIL` before a single line of
+`farm_client.sh`/`replay.py` output ever appears.
+
+### 3. TAR HEADER PRE-VALIDATION (`_publish_script()`, new step 3)
+
+The old design's first content check ran AFTER extraction
+(`verify()` against the temp tree, steps 5-6) -- which can only ever
+see what actually landed WITHIN the temp sibling. A tar smuggling an
+absolute-path or `../`-traversal member writes OUTSIDE that tree during
+extraction itself, before any post-extraction check ever runs.
+
+Fixed: a new step 3 runs `tar -tf`/`tar -tvf` (list-only, never writes
+to disk) BEFORE extraction, rejecting: absolute-path members, `../`
+path-traversal components (a precise regex matching only a true `..`
+PATH SEGMENT, not merely two adjacent dots inside an otherwise-
+legitimate filename), duplicate member names, any non-regular/non-
+directory entry type (symlink/device/fifo/socket), a member-count bound
+(<=200), and a total-declared-size bound (<=2GiB). Emits
+`PUBLISH-TAR-HEADER-INVALID:<reason>` and exits before step 4 (extract)
+ever runs.
+
+**Verified live with two real crafted archives** against a real host:
+one with a leading-`../` traversal member, one with a genuine absolute-
+path member (built with GNU tar's `-P` so tar's own creation-time
+stripping doesn't mask what the test is proving). Both refused pre-
+extraction with `PUBLISH-TAR-HEADER-INVALID:path-traversal-or-absolute`;
+both confirmed the escape target was NEVER created anywhere on the host
+filesystem.
+
+### 4. INSPECT-THE-LAUNCH-OBJECT + `--pull=never`
+
+`image_digest_remote()` used to inspect the MUTABLE `IMG` tag's own
+`RepoDigests` as a proxy for "is the right image present" -- entirely
+decoupled from what `docker_run_detached()`/`docker_run_foreground_
+staged()` actually launch (always `launch_image(binary_set)`'s exact
+digest-qualified reference). Re-pointing the tag has nothing to do with
+what would actually run, yet could flip this check's verdict either
+way. Fixed: `image_digest_remote(host, binary_set)` now inspects the
+EXACT digest-qualified launch reference directly -- a successful
+`docker image inspect <exact-ref>` IS the whole proof, since that is
+precisely what `docker run --pull=never <exact-ref>` also needs to
+succeed.
+
+Deliberately does NOT compare any field of the inspect output (not
+`.Id`, not `.RepoDigests`): the research7 fix already proved those
+fields mean DIFFERENT things on different local docker store
+architectures (containerd-image-store hosts report `.Id` as the
+manifest digest; research7's classic overlay2 store reports `.Id` as
+the config digest for identical content -- see the research7 gap note
+above). Comparing either field would silently reintroduce that exact
+cross-host inconsistency; checking bare resolvability of the exact
+launch ref does not.
+
+`--pull=never` was added to both `docker run` callsites
+(`docker_run_detached()`, `docker_run_foreground_staged()`) so an
+absent-locally object fails loud instead of Docker's default `missing`
+policy silently attempting a network pull.
+
+**Verified live**: `--pull=never` against a genuinely absent digest ref
+fails immediately with `No such image` and no `Unable to find image
+... locally` preamble; the SAME absent ref without the flag shows that
+preamble (proving a real pull attempt was made) before failing --
+confirming what the flag actually suppresses. The "decoy tag" scenario
+itself was verified via a SAFE fake-transport test (a fake `sh()` that
+fails any query mentioning the bare tag and succeeds only the exact
+digest-ref query), not a live tag repoint: a live same-repo tag-repoint
+experiment was attempted and reverted during this round's own
+verification -- on research6 (a containerd-image-store host),
+repointing `icecream/farm-node`'s own tag turned out to ALSO disrupt
+the digest ref's own resolvability (real store behavior: the digest-ref
+apparently resolves via the tag's own current bookkeeping, not an
+independent, permanent record), so a live "tag repointed to a decoy
+while the digest ref stays correct" scenario was not safely
+constructible against a shared image by that method. The real image was
+fully recovered (it was never deleted, only its tag was reassigned --
+found dangling via `docker images -a`, re-tagged back by its raw ID,
+confirmed via a fresh `preflight()` PASS) before continuing; see the
+round-5 commit message / team-lead report for the full incident note.
+
+### 5. NO-GIT RUNNABILITY (`artifact_selection_test.sh`'s fresh-archive gate)
+
+The FRESH-ARCHIVE no-ambient gate's own `git rev-parse` calls used to
+be unconditional -- fatal, under this suite's `set -eu`, when run from
+a bare, non-git tree (a release-tarball extraction with no `.git`
+anywhere in its ancestry), killing the ENTIRE suite at its very first
+section before anything else ever ran. Fixed: `git -C "$FARMDIR"
+rev-parse --is-inside-work-tree` gates the choice -- when a git work
+tree is reachable, the stronger `git archive`-based path is used
+unchanged; when it is not, the CURRENT TREE is copied directly as the
+archive source (stripping `__pycache__`/`*.pyc`), and a deterministic
+content hash of that tree (sorted per-file sha256, then hashed again)
+substitutes for the git commit SHA as the recorded provenance label.
+
+**Verified live** both ways: the normal git-present path (this repo IS
+a git worktree) still uses `git archive`; a bare copy of `farmharness/`
+with `.git` removed entirely (simulating exactly the release-tarball
+scenario) correctly falls back and still imports `farm.py`/loads both
+manifests cleanly from that location.
+
 ## Distribution: idempotent, explicit, publish-only (never repair-in-place)
 
 ```
@@ -733,6 +955,21 @@ Runs, in order:
   flips (mutation genuinely begins) when the barrier is removed.
 - a real end-to-end launch (`resolve_launch_plan()` -> `up()` with real
   attestation -> registration -> `down()`, single host q3).
+- **five ROUND-5 gates**: (1) the TOCTOU race gate -- a real red/green
+  comparative proof (old path-based exec picks up an atomic-rename host
+  swap staged during a real pause between attestation and exec; the new
+  exec-by-open-fd pattern does not); (2) a harness-private-staging
+  tamper mutant (a bundle with `replay.py` tampered in transit is
+  refused with `HARNESS-STAGE-FAIL` before `farm_client.sh` ever runs);
+  (3) two real crafted tar archives (path-traversal, absolute-path)
+  refused pre-extraction by the new header-validation step, with the
+  escape target confirmed never created on the host; (4) a safe fake-
+  transport proof that `image_digest_remote()` never queries the
+  mutable tag, plus a real `--pull=never` behavioral proof (immediate
+  refusal vs. an observed pull-attempt preamble on the identical absent
+  ref without the flag) and a source anchor on both `docker run`
+  callsites; (5) the fresh-archive gate's no-git fallback, proven
+  against a real bare (no `.git`) copy of `farmharness/`.
 - a skipped-preflight mutant (unchanged in spirit from round 3; its
   dynamic-invocation fake now also stubs `wait_for_attestation()`
   directly, since attestation itself is validated by its own dedicated
@@ -771,11 +1008,16 @@ is the entire HOLD"):
 | Whole-plan barrier | **PRODUCTION**: `revalidate_entire_plan()`, called from `main()` |
 | Per-role defense-in-depth | **PRODUCTION**: `revalidate_before_mutation()`, called from `up()`/`run_client()` |
 | Mutation tracking / down()-suppression | **PRODUCTION**: `MUTATIONS` object + `main()`'s `finally` block |
-| In-command attestation | **PRODUCTION**: `_attestation_prefix()` embedded directly in `docker_run_detached()`'s/`run_client()`'s own launch commands, `wait_for_attestation()` |
+| In-command attestation, incl. round-5 exec-by-open-fd (`role_binary_path`, `ROLE_BINARY_FD`) | **PRODUCTION**: `_attestation_prefix()` embedded directly in `docker_run_detached()`'s launch commands (S/F pass `role_binary_path`; `run_client()`'s C-role call does not, see the round-5 write-up for why), `wait_for_attestation()` |
 | Race-gate seam | **PRODUCTION**: `_race_gate_pause()`, called from `main()` (inert unless test env vars are set) |
 | Harness-script integrity (HUB_DIR, hash pinning) | **PRODUCTION**: `verify_harness_scripts()`, called as the first line of `run_client()` |
+| Harness PRIVATE STAGING (round 5) | **PRODUCTION**: `_build_harness_bundle()`, `_harness_stage_verify()`, `docker_run_foreground_staged()` -- all called from `run_client()`, which streams the bundle into a real foreground `docker run -i` |
+| Tar header pre-validation (round 5) | **PRODUCTION**: the new step-3 block inside `_publish_script()`'s generated remote script, run by every real `distribute()`/`publish_immutable_root()` call before extraction |
+| Digest-ref-exact image verification + `--pull=never` (round 5) | **PRODUCTION**: `image_digest_remote(host, binary_set)`, called from `preflight()`; `--pull=never` in `docker_run_detached()`/`docker_run_foreground_staged()`'s own command strings |
+| No-git fresh-archive fallback (round 5) | **TEST SCAFFOLDING**: the fresh-archive gate itself is test infrastructure, not production `farm.py` code -- but the claim under test (farm.py imports and both manifests load cleanly from a bare, non-git tree) exercises real, unmodified `farm.load_manifest()`/module-import behavior |
 | Cell-verdict combination (`client_ok`/`join_ok`/`ok`) | **PRODUCTION**: the three-line combination in `main()`, immediately after `run_client()` returns |
 | Cell-verdict bijection checks (header/terminal/cardinality/rows/uniqueness/exact-set-equality/completions) | **PRODUCTION**: `dump_worker_evidence()`/`_dump_worker_evidence_impl()`, called from `main()` with the real `run_client()` return value |
 | Race-gate concurrency orchestration (subprocess launch, timing, tamper injection) | **TEST SCAFFOLDING**: the driver script + the foreground orchestration in `artifact_selection_test.sh` -- but it drives the real `main()` process end to end, never reimplementing or faking any of the production functions above |
+| TOCTOU race gate's pause/swap/resume orchestration (round 5) | **TEST SCAFFOLDING**: the ready/continue file pair and the host-side atomic-rename swap are test-only -- but they drive real `_attestation_prefix()`-generated bash inside a real container against a real isolated store, and the swap targets the REAL host path the container's `:ro` bind mount resolves through |
 | Isolated-store path prefixing | **TEST SCAFFOLDING** (a monkeypatch of `immutable_root()` only -- every function that consumes the result runs unmodified) |
-| Source mutations (18 named mutants total) | **TEST SCAFFOLDING** temporarily edits `farm.py`'s own source, runs it in a fresh process, then restores byte-exact -- the code being exercised IS production code, just deliberately, temporarily broken to prove a specific check is load-bearing |
+| Source mutations (18 named mutants total; round 5 added no NEW source-mutation-style mutants -- its 5 gates are real crafted-input tests, a real red/green comparative host test, a safe fake-transport test, and a real behavioral test, none of which snapshot/mutate/restore farm.py's own source) | **TEST SCAFFOLDING** temporarily edits `farm.py`'s own source, runs it in a fresh process, then restores byte-exact -- the code being exercised IS production code, just deliberately, temporarily broken to prove a specific check is load-bearing |

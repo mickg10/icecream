@@ -99,15 +99,37 @@ assert_differs() {
     echo "ok - $label ('$a' != '$b')"
 }
 
-echo "== FRESH-ARCHIVE no-ambient gate: farm.py + both manifests, from a bare git-archive extraction, zero ambient files possible =="
-REPOROOT=$(cd "$FARMDIR" && git rev-parse --show-toplevel)
-ARCHIVE_COMMIT=$(cd "$FARMDIR" && git rev-parse HEAD)
+echo "== FRESH-ARCHIVE no-ambient gate: farm.py + both manifests, from a bare git-archive extraction (or, absent git, the current tree directly), zero ambient files possible =="
 ARCHIVE_DIR="$SCRATCHDIR/fresh-archive-$$"
 rm -rf "$ARCHIVE_DIR"
 mkdir -p "$ARCHIVE_DIR"
-( cd "$REPOROOT" && git archive "$ARCHIVE_COMMIT" -- farmharness ) | tar -x -C "$ARCHIVE_DIR"
-[ -f "$ARCHIVE_DIR/farmharness/farm.py" ] || fail "fresh-archive: farmharness/farm.py missing from the archive of $ARCHIVE_COMMIT"
-python3 - "$ARCHIVE_DIR" "$ARCHIVE_COMMIT" <<'PY'
+if git -C "$FARMDIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    REPOROOT=$(cd "$FARMDIR" && git rev-parse --show-toplevel)
+    ARCHIVE_SOURCE=$(cd "$FARMDIR" && git rev-parse HEAD)
+    ( cd "$REPOROOT" && git archive "$ARCHIVE_SOURCE" -- farmharness ) | tar -x -C "$ARCHIVE_DIR"
+    ARCHIVE_LABEL="git archive of $ARCHIVE_SOURCE"
+else
+    # Round-5 (Deep Reviewer): a bare `git archive`/release-tarball
+    # extraction has no .git anywhere in its ancestry, so the git
+    # rev-parse calls above used to fail outright -- fatal under
+    # `set -eu`, killing the ENTIRE suite at its very first section
+    # before anything else ever ran (this is what team-lead's own
+    # verification hit, worked around only by using a clean worktree).
+    # Degrade gracefully instead: use the CURRENT TREE directly as the
+    # archive source -- still a genuinely separate copy, still exercises
+    # the same "does farm.py import cleanly and self-consistently from
+    # THIS exact location" claim -- only the PROVENANCE claim is weaker
+    # (a content hash of the tree, not a git commit SHA), and the
+    # stronger git-archive path is still used whenever .git IS reachable.
+    mkdir -p "$ARCHIVE_DIR/farmharness"
+    cp -a "$FARMDIR/." "$ARCHIVE_DIR/farmharness/"
+    find "$ARCHIVE_DIR/farmharness" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null
+    find "$ARCHIVE_DIR/farmharness" -name '*.pyc' -delete 2>/dev/null
+    ARCHIVE_SOURCE=$(find "$ARCHIVE_DIR/farmharness" -type f -exec sha256sum {} \; | sort | sha256sum | cut -d' ' -f1)
+    ARCHIVE_LABEL="no-git tree-hash $ARCHIVE_SOURCE (no .git reachable from $FARMDIR)"
+fi
+[ -f "$ARCHIVE_DIR/farmharness/farm.py" ] || fail "fresh-archive: farmharness/farm.py missing from the archive ($ARCHIVE_LABEL)"
+python3 - "$ARCHIVE_DIR" "$ARCHIVE_LABEL" <<'PY'
 import os
 import sys
 
@@ -165,7 +187,7 @@ if problems:
     for p in problems:
         print(f"FAIL: {p}", file=sys.stderr)
     sys.exit(1)
-print(f"ok - fresh-archive gate: farm imported from {farm.__file__} (git archive of {commit}), "
+print(f"ok - fresh-archive gate: farm imported from {farm.__file__} ({commit}), "
       f"both manifests loaded via farm.load_manifest() from that same location, schema-valid, "
       f"S/F/C role coverage confirmed present in both, immutable_root() store-layout derivation confirmed")
 PY
@@ -178,8 +200,9 @@ for spec in "resolve_launch_plan:resolve_role:3" \
             "up:resolve_role:0" "up:revalidate_before_mutation:2" \
             "up:_attestation_prefix:2" "up:wait_for_attestation:2" \
             "run_client:resolve_role:0" "run_client:revalidate_before_mutation:1" \
-            "run_client:_attestation_prefix:1" "run_client:docker_run_detached:1" \
-            "run_client:verify_harness_scripts:1" \
+            "run_client:_attestation_prefix:1" "run_client:docker_run_foreground_staged:1" \
+            "run_client:verify_harness_scripts:1" "run_client:_build_harness_bundle:1" \
+            "run_client:_harness_stage_verify:1" \
             "main:revalidate_entire_plan:1" "main:_race_gate_pause:1" "main:resolve_launch_plan:1"; do
     fn=$(printf '%s' "$spec" | cut -d: -f1)
     target=$(printf '%s' "$spec" | cut -d: -f2)
@@ -208,7 +231,7 @@ import ast, sys
 path = sys.argv[1]
 src = open(path).read()
 tree = ast.parse(src, filename=path)
-EXPECT = {"docker_rm", "scratch_prepare", "docker_run_detached", "push_file"}
+EXPECT = {"docker_rm", "scratch_prepare", "docker_run_detached", "docker_run_foreground_staged"}
 found = {}
 for fn in ast.walk(tree):
     if not isinstance(fn, ast.FunctionDef):
@@ -284,15 +307,15 @@ except RuntimeError as e:
 # 2/2: the INTEGRATION claim BO specifically asked for -- run_client()
 # itself must refuse BEFORE any container runs. verify_harness_scripts()
 # is the FIRST thing run_client() does (before revalidate_before_mutation,
-# before push_file, before any docker primitive), so a real, minimal
-# LaunchPlan is enough here -- nothing else in it is ever touched, since
-# execution never gets past the very first line.
+# before _build_harness_bundle(), before any docker primitive), so a
+# real, minimal LaunchPlan is enough here -- nothing else in it is ever
+# touched, since execution never gets past the very first line.
 farm.MUTATIONS.started = False
 before = set(farm.sh(host, "docker ps -a --filter name=farm-client --format '{{.Names}}'").stdout.split())
 plan = farm.LaunchPlan(s_tree=None, s_img=None, binary_set_s=None, f_resolved=[],
                         binary_set_f=None, c_tree="dummy", c_img="dummy", binary_set_c="p43")
 try:
-    farm.run_client(host, "/scratch/fmt", "simultaneous", "0", "4", "", plan)
+    farm.run_client(host, "/hostscratch/fmt", "simultaneous", "0", "4", "", plan)
     print("FAIL: run_client() did not raise against the tampered replay.py", file=sys.stderr)
     sys.exit(1)
 except RuntimeError as e:
@@ -602,8 +625,8 @@ class Recorder:
         self.actions.append(f"docker_run_detached({host},{name})")
     def scratch_prepare(self, host, mkdir_path, log_path):
         self.actions.append(f"scratch_prepare({host},{mkdir_path})")
-    def push_file(self, host, localpath, remotepath):
-        self.actions.append(f"push_file({host},{remotepath})")
+    def docker_run_foreground_staged(self, host, name, tree, img, stdin_bytes, inner_cmd, timeout=1800):
+        self.actions.append(f"docker_run_foreground_staged({host},{name})")
     def wait_for_attestation(self, host, name, token, timeout=30):
         self.actions.append(f"wait_for_attestation({host},{name})")
 
@@ -644,13 +667,13 @@ def make_fake_transport(binary_set, bad_hosts):
 def run_scenario(argv_tail, fake_sh):
     rec = Recorder()
     saved = dict(sh=farm.sh, docker_rm=farm.docker_rm, docker_run_detached=farm.docker_run_detached,
-                 scratch_prepare=farm.scratch_prepare, push_file=farm.push_file,
+                 scratch_prepare=farm.scratch_prepare, docker_run_foreground_staged=farm.docker_run_foreground_staged,
                  wait_for_attestation=farm.wait_for_attestation, argv=sys.argv)
     farm.sh = fake_sh
     farm.docker_rm = rec.docker_rm
     farm.docker_run_detached = rec.docker_run_detached
     farm.scratch_prepare = rec.scratch_prepare
-    farm.push_file = rec.push_file
+    farm.docker_run_foreground_staged = rec.docker_run_foreground_staged
     farm.wait_for_attestation = rec.wait_for_attestation
     sys.argv = ["farm.py"] + argv_tail
     buf = io.StringIO()
@@ -665,7 +688,7 @@ def run_scenario(argv_tail, fake_sh):
         farm.docker_rm = saved["docker_rm"]
         farm.docker_run_detached = saved["docker_run_detached"]
         farm.scratch_prepare = saved["scratch_prepare"]
-        farm.push_file = saved["push_file"]
+        farm.docker_run_foreground_staged = saved["docker_run_foreground_staged"]
         farm.wait_for_attestation = saved["wait_for_attestation"]
         sys.argv = saved["argv"]
     return buf.getvalue(), rec.actions
@@ -723,7 +746,7 @@ class Recorder:
     def docker_rm(self, host, name): self.actions.append(f"docker_rm({host},{name})")
     def docker_run_detached(self, host, name, tree, img, inner_cmd): self.actions.append(f"docker_run_detached({host},{name})")
     def scratch_prepare(self, host, mkdir_path, log_path): self.actions.append(f"scratch_prepare({host},{mkdir_path})")
-    def push_file(self, host, localpath, remotepath): self.actions.append(f"push_file({host},{remotepath})")
+    def docker_run_foreground_staged(self, host, name, tree, img, stdin_bytes, inner_cmd, timeout=1800): self.actions.append(f"docker_run_foreground_staged({host},{name})")
     def wait_for_attestation(self, host, name, token, timeout=30): self.actions.append(f"wait_for_attestation({host},{name})")
 
 class FakeResult:
@@ -733,7 +756,7 @@ manifest = farm.load_manifest("p43")
 root = farm.immutable_root("p43")
 good_sha = {f"{root}/{b['path']}": b["sha256"] for b in manifest["binaries"]}
 good_mode = {f"{root}/{b['path']}": farm._write_stripped(b["mode"]) for b in manifest["binaries"]}  # real roots are always hardened before exposure
-expect_digest = f"{farm.IMG.split(':', 1)[0]}@{manifest['build']['image_digest']}"
+expect_digest = farm.launch_image("p43")
 TAMPER_TARGET = f"{root}/obj/daemon/iceccd"  # research7's F-role tracked file
 seen = {"n": 0}
 
@@ -765,13 +788,13 @@ farm.sh("q3", f"docker run -d --name {SENTINEL} --label barrier-sentinel=1 alpin
 
 rec = Recorder()
 saved = dict(sh=farm.sh, docker_rm=farm.docker_rm, docker_run_detached=farm.docker_run_detached,
-             scratch_prepare=farm.scratch_prepare, push_file=farm.push_file,
+             scratch_prepare=farm.scratch_prepare, docker_run_foreground_staged=farm.docker_run_foreground_staged,
              wait_for_attestation=farm.wait_for_attestation, argv=sys.argv)
 farm.sh = fake_sh
 farm.docker_rm = rec.docker_rm
 farm.docker_run_detached = rec.docker_run_detached
 farm.scratch_prepare = rec.scratch_prepare
-farm.push_file = rec.push_file
+farm.docker_run_foreground_staged = rec.docker_run_foreground_staged
 farm.wait_for_attestation = rec.wait_for_attestation
 sys.argv = ["farm.py", "--workers=research6,research7,q2", "--client=q3", "--phase=up-test-down",
             "--binary-set-S=p43", "--binary-set-F=p43", "--binary-set-C=p43"]
@@ -784,7 +807,7 @@ try:
             pass
 finally:
     farm.sh = saved["sh"]; farm.docker_rm = saved["docker_rm"]; farm.docker_run_detached = saved["docker_run_detached"]
-    farm.scratch_prepare = saved["scratch_prepare"]; farm.push_file = saved["push_file"]
+    farm.scratch_prepare = saved["scratch_prepare"]; farm.docker_run_foreground_staged = saved["docker_run_foreground_staged"]
     farm.wait_for_attestation = saved["wait_for_attestation"]; sys.argv = saved["argv"]
 out = buf.getvalue()
 
@@ -861,7 +884,7 @@ class Recorder:
     def docker_rm(self, host, name): self.actions.append(f"docker_rm({host},{name})")
     def docker_run_detached(self, host, name, tree, img, inner_cmd): self.actions.append(f"docker_run_detached({host},{name})")
     def scratch_prepare(self, host, mkdir_path, log_path): self.actions.append(f"scratch_prepare({host},{mkdir_path})")
-    def push_file(self, host, localpath, remotepath): pass
+    def docker_run_foreground_staged(self, host, name, tree, img, stdin_bytes, inner_cmd, timeout=1800): pass
     def wait_for_attestation(self, host, name, token, timeout=30): pass  # attestation itself is validated by its own dedicated section below
 
 class FakeResult:
@@ -871,7 +894,7 @@ manifest = farm.load_manifest("p43")
 root = farm.immutable_root("p43")
 good_sha = {f"{root}/{b['path']}": b["sha256"] for b in manifest["binaries"]}
 good_mode = {f"{root}/{b['path']}": farm._write_stripped(b["mode"]) for b in manifest["binaries"]}  # real roots are always hardened before exposure
-expect_digest = f"{farm.IMG.split(':', 1)[0]}@{manifest['build']['image_digest']}"
+expect_digest = farm.launch_image("p43")
 bad_hosts = {"research7"}  # 2nd of 3 workers -- research6 (1st) must resolve fine first under the mutation
 
 def fake_sh(host, cmd, timeout=120, check=False):
@@ -906,7 +929,7 @@ farm.sh = fake_sh
 farm.docker_rm = rec.docker_rm
 farm.docker_run_detached = rec.docker_run_detached
 farm.scratch_prepare = rec.scratch_prepare
-farm.push_file = rec.push_file
+farm.docker_run_foreground_staged = rec.docker_run_foreground_staged
 farm.wait_for_attestation = rec.wait_for_attestation
 farm.time.sleep = lambda s: None
 sys.argv = ["farm.py", "--workers=research6,research7,q2", "--client=q3", "--phase=up-test-down",
@@ -1100,8 +1123,8 @@ if avail_kb < 500_000:  # comfortably above the old <200MB failure state
     sys.exit(1)
 print(f"ok - disk gap CONFIRMED FIXED: {avail_kb}KB (~{avail_kb//1024}MB) free")
 
-digest = farm.image_digest_remote("research7")
-expect_digest = f"{farm.IMG.split(':', 1)[0]}@{farm.load_manifest('p43')['build']['image_digest']}"
+digest = farm.image_digest_remote("research7", "p43")
+expect_digest = farm.launch_image("p43")
 if digest != expect_digest:
     print(f"FAIL: research7 image digest {digest!r} still does not match the pinned {expect_digest!r} "
           f"-- the fix does not appear to be fully live from this vantage point", file=sys.stderr)
@@ -1773,6 +1796,48 @@ python3 - "$FARMDIR/farm.py" <<'PY'
 import sys
 path = sys.argv[1]
 src = open(path).read()
+
+# This mutant's OWN claim is about temp-sibling-vs-in-place safety when
+# a tar that reaches extraction turns out to be interrupted/incomplete.
+# Simulating "interrupted mid-transfer" via truncation was found (this
+# round, live) to ALSO reliably break round-5's own new step-3 tar-
+# listing pre-validation -- `tar -tf` fails identically to `tar -xf` on
+# every truncation point tried, since GNU tar's listing walk still
+# needs to seek past each member's declared data length to find the
+# next header/the closing EOF blocks, so a truncation deep enough to
+# break extraction breaks listing too. That protection is ALREADY fully
+# and separately proven by its own dedicated round-5 gate (real crafted
+# path-traversal/absolute-path archives) -- neutralizing it HERE, as
+# part of THIS mutant's own combined mutation, isolates mutant 6/6's
+# original, distinct claim from that newer, separately-proven one
+# (same reasoning, same pattern, as the round-4 ordering-violation
+# mutant neutralizing revalidate_entire_plan()).
+step3_old = ('TAR_NAMES=$(tar -tf "$SRC_TAR") || {{ echo "PUBLISH-TAR-HEADER-INVALID:list-failed"; exit 10; }}\n'
+             'TAR_N=$(printf \'%s\\n\' "$TAR_NAMES" | grep -c .)\n'
+             'if [ "$TAR_N" -eq 0 ] || [ "$TAR_N" -gt 200 ]; then\n'
+             '    echo "PUBLISH-TAR-HEADER-INVALID:member-count=$TAR_N"; exit 10\n'
+             'fi\n'
+             'if printf \'%s\\n\' "$TAR_NAMES" | grep -qE \'^/|(^|/)\\.\\.(/|$)\'; then\n'
+             '    echo "PUBLISH-TAR-HEADER-INVALID:path-traversal-or-absolute"; exit 10\n'
+             'fi\n'
+             'if [ "$(printf \'%s\\n\' "$TAR_NAMES" | sort -u | wc -l)" != "$TAR_N" ]; then\n'
+             '    echo "PUBLISH-TAR-HEADER-INVALID:duplicate-member-names"; exit 10\n'
+             'fi\n'
+             'TAR_BADTYPES=$(tar -tvf "$SRC_TAR" | awk \'{{print substr($1,1,1)}}\' | grep -vE \'^[-d]$\' || true)\n'
+             'if [ -n "$TAR_BADTYPES" ]; then\n'
+             '    echo "PUBLISH-TAR-HEADER-INVALID:non-regular-entry-type"; exit 10\n'
+             'fi\n'
+             'TAR_TOTAL_SIZE=$(tar -tvf "$SRC_TAR" | awk \'{{sum+=$3}} END{{print sum+0}}\')\n'
+             'if [ "$TAR_TOTAL_SIZE" -gt 2147483648 ]; then\n'
+             '    echo "PUBLISH-TAR-HEADER-INVALID:total-size=$TAR_TOTAL_SIZE"; exit 10\n'
+             'fi\n')
+step3_new = '# MUTATED-OUT-FOR-TEST: round-5 step-3 tar-header pre-validation removed, to isolate this mutant\'s own claim (see comment above)\n'
+n3 = src.count(step3_old)
+if n3 != 1:
+    print(f"FAIL: expected exactly 1 occurrence of the step-3 tar-header-validation anchor, found {n3}", file=sys.stderr)
+    sys.exit(1)
+src = src.replace(step3_old, step3_new, 1)
+
 old = ('rm -rf "$TMP"; mkdir -p "$TMP"\n'
        'if ! tar --same-permissions -xf "$SRC_TAR" -C "$TMP"; then echo "PUBLISH-EXTRACT-FAILED"; rm -rf "$TMP"; exit 1; fi\n')
 new = ('mkdir -p "$ROOT"  # MUTATED-OUT-FOR-TEST: extract IN-PLACE into the final name, no temp sibling, no pre-rename verification\n'
@@ -1818,6 +1883,13 @@ if push.returncode != 0:
 # the mutated in-place-extraction logic, exactly as it would for a truly
 # interrupted write of an otherwise-legitimately-hashed tar (e.g. a
 # network drop mid-transfer on a host that already trusts its own copy).
+# Round-5's step 3 (tar-header pre-validation) is REMOVED as part of
+# THIS mutant's own source mutation above, for the same reason: live
+# testing this round found that ANY truncation deep enough to break
+# extraction ALSO breaks `tar -tf`'s own listing walk (both need to
+# seek past each member's declared data length), so step 3 -- already
+# separately proven by its own dedicated gate -- would otherwise mask
+# this mutant's distinct claim entirely.
 truncated_sha = farm.sh(host, "sha256sum ~/role-artifacts/pubmutant6-truncated.tar").stdout.split()[0]
 tampered = dict(manifest); tampered["tar"] = dict(manifest["tar"]); tampered["tar"]["sha256"] = truncated_sha
 script = farm._publish_script(binary_set, tampered, root, "$HOME/role-artifacts/pubmutant6-truncated.tar", None)
@@ -2049,8 +2121,8 @@ python3 - "$FARMDIR/farm.py" <<'PY'
 import sys
 path = sys.argv[1]
 src = open(path).read()
-old = 'f"docker run -d --name {name} --network host -v {tree}:/work:ro -v {SCRATCH}:/scratch -u 0:0 {img} "'
-new = 'f"docker run -d --name {name} --network host -v {tree}:/work -v {SCRATCH}:/scratch -u 0:0 {img} "  # MUTATED-OUT-FOR-TEST (:ro dropped)'
+old = 'f"docker run -d --pull=never --name {name} --network host -v {tree}:/work:ro -v {SCRATCH}:/scratch -u 0:0 {img} "'
+new = 'f"docker run -d --pull=never --name {name} --network host -v {tree}:/work -v {SCRATCH}:/scratch -u 0:0 {img} "  # MUTATED-OUT-FOR-TEST (:ro dropped)'
 count = src.count(old)
 if count != 1:
     print(f"FAIL: expected exactly 1 occurrence of the :ro mount anchor, found {count}", file=sys.stderr)
@@ -2220,17 +2292,21 @@ path, role = sys.argv[1], sys.argv[2]
 src = open(path).read()
 anchors = {
     "S": ('    docker_run_detached(SCHED_HOST, "farm-sched", plan.s_tree, plan.s_img,\n'
-          '        _attestation_prefix(plan.binary_set_s, s_token) +\n'
-          '        f"useradd -r icecc 2>/dev/null; exec /work/obj/scheduler/icecc-scheduler -p {SCHED_PORT} -n {NET} -l /scratch/farm/sched.log -vvv")\n'
+          '        _attestation_prefix(plan.binary_set_s, s_token, "obj/scheduler/icecc-scheduler") +\n'
+          '        f"useradd -r icecc 2>/dev/null; exec /proc/self/fd/{ROLE_BINARY_FD} -p {SCHED_PORT} -n {NET} -l /scratch/farm/sched.log -vvv")\n'
           '    wait_for_attestation(SCHED_HOST, "farm-sched", s_token)\n',
           '    docker_run_detached(SCHED_HOST, "farm-sched", plan.s_tree, plan.s_img,\n'
           '        f"useradd -r icecc 2>/dev/null; exec /work/obj/scheduler/icecc-scheduler -p {SCHED_PORT} -n {NET} -l /scratch/farm/sched.log -vvv")\n'
-          '    # MUTATED-OUT-FOR-TEST: S attestation prefix + wait removed\n'),
+          '    # MUTATED-OUT-FOR-TEST: S attestation prefix + wait removed (exec reverted to\n'
+          '    # /work/<path> directly -- /proc/self/fd/8 only exists because attestation\n'
+          '    # itself opened it, so removing attestation without also reverting the exec\n'
+          '    # target would just crash the container on a dangling fd, not reproduce\n'
+          '    # "unattested exec", which is the actual claim under test here)\n'),
     "F": ('        docker_run_detached(h, "farm-worker", f_tree, f_img,\n'
-          '            _attestation_prefix(plan.binary_set_f, f_token) +\n'
+          '            _attestation_prefix(plan.binary_set_f, f_token, "obj/daemon/iceccd") +\n'
           '            f"useradd -r -s /usr/sbin/nologin icecc 2>/dev/null; "\n'
           '            f"chown icecc /scratch/farm/envs; "  # pre-chown as root: daemon\'s cleanup_cache runs post-drop (no CAP_CHOWN)\n'
-          '            f"exec /work/obj/daemon/iceccd -m 8 -s {sip}:{SCHED_PORT} -n {NET} -N {h}w -b /scratch/farm/envs "\n'
+          '            f"exec /proc/self/fd/{ROLE_BINARY_FD} -m 8 -s {sip}:{SCHED_PORT} -n {NET} -N {h}w -b /scratch/farm/envs "\n'
           '            f"-p {wp} -l /scratch/farm/worker.log -vvv")\n'
           '        wait_for_attestation(h, "farm-worker", f_token)\n',
           '        docker_run_detached(h, "farm-worker", f_tree, f_img,\n'
@@ -2238,15 +2314,10 @@ anchors = {
           '            f"chown icecc /scratch/farm/envs; "  # pre-chown as root: daemon\'s cleanup_cache runs post-drop (no CAP_CHOWN)\n'
           '            f"exec /work/obj/daemon/iceccd -m 8 -s {sip}:{SCHED_PORT} -n {NET} -N {h}w -b /scratch/farm/envs "\n'
           '            f"-p {wp} -l /scratch/farm/worker.log -vvv")\n'
-          '        # MUTATED-OUT-FOR-TEST: F attestation prefix + wait removed\n'),
-    "C": ('        c_token = _attestation_token()\n'
-          '        attest = _attestation_prefix(plan.binary_set_c, c_token)\n'
-          '        real_cmd = f"bash /scratch/farm_client.sh {sched} {NET} {project_dir} {mode} {maxtu} {jobs} {prefer}"\n'
-          '        cmd = f"docker exec farm-client bash -c \'{attest}{real_cmd}\'"\n',
-          '        c_token = _attestation_token()\n'
-          '        attest = ""  # MUTATED-OUT-FOR-TEST: C attestation prefix removed\n'
-          '        real_cmd = f"bash /scratch/farm_client.sh {sched} {NET} {project_dir} {mode} {maxtu} {jobs} {prefer}"\n'
-          '        cmd = f"docker exec farm-client bash -c \'{attest}{real_cmd}\'"\n'),
+          '        # MUTATED-OUT-FOR-TEST: F attestation prefix + wait removed (exec reverted\n'
+          '        # to /work/<path> directly, same reasoning as the S anchor above)\n'),
+    "C": ('    attest = _attestation_prefix(plan.binary_set_c, c_token)\n',
+          '    attest = ""  # MUTATED-OUT-FOR-TEST: C attestation prefix removed\n'),
 }
 old, new = anchors[role]
 n = src.count(old)
@@ -2346,7 +2417,7 @@ try:
         result = {}
         def _bg():
             try:
-                r = farm.run_client(sched_host, "/scratch/fmt", "simultaneous", "0", "4", "", plan)
+                r = farm.run_client(sched_host, "/hostscratch/fmt", "simultaneous", "0", "4", "", plan)
                 result["out"] = r.stdout
             except RuntimeError as e:
                 result["out"] = str(e)
@@ -2363,7 +2434,7 @@ try:
             print(f"FAIL: expected the mutation to remove the attestation gate entirely (no ARTIFACT-ATTEST-FAIL "
                   f"possible -- there is no prefix left to fail), but it still appeared: {out[:300]!r}", file=sys.stderr)
             sys.exit(1)
-        print(f"ok - C mutant REDDENED: with attestation removed from the docker-exec callsite, "
+        print(f"ok - C mutant REDDENED: with attestation removed from run_client()'s inner_cmd, "
               f"farm_client.sh was reached directly against the corrupted store with no gate at all "
               f"(no ARTIFACT-ATTEST-FAIL possible; output starts: {out[:200]!r})")
 finally:
@@ -2685,7 +2756,7 @@ try:
     # suite prove the FIX's logic is correct against hand-built lines; only a
     # real client+worker run can prove the parser actually matches what
     # production replay.py and a production worker.log really emit.
-    r = farm.run_client("q3", "/scratch/fmt", "simultaneous", "0", "4", "", plan)
+    r = farm.run_client("q3", "/hostscratch/fmt", "simultaneous", "0", "4", "", plan)
     client_ok = (r.returncode == 0)
     join_ok = farm.dump_worker_evidence(["q3"], r.stdout, r.returncode, "p43")
     if not client_ok:
@@ -2709,6 +2780,425 @@ finally:
     print("ok - down() cleaned up; 0 farm-* containers remain on q3")
 PY
 [ $? -eq 0 ] || fail "real end-to-end launch test did not pass"
+
+echo
+echo "== ROUND 5 (Deep Reviewer): ROLE-BINARY hash->exec TOCTOU closed via exec-by-open-fd -- pause after attestation, replace the HOST object, resume: the role must run the STAGED bytes or refuse =="
+# _attestation_prefix()'s OLD design hashed /work/<path> then the caller
+# separately exec'd /work/<path> -- two independent opens of the SAME
+# path, nothing stopping a host-side actor from replacing the underlying
+# inode in between. Fixed: for the ONE tracked file a container's PID 1
+# actually execs (role_binary_path), attestation now opens it as FD 8
+# FIRST, hashes /proc/self/fd/8 (never the path again), and the caller
+# execs /proc/self/fd/8 -- the SAME open file description, immune to any
+# later replacement of the path's directory entry (POSIX fd semantics:
+# an fd is a reference to the INODE, established at open() time,
+# independent of whatever the path is later changed to point at).
+#
+# This gate proves it empirically: a real S-role container is launched
+# against a real isolated store, paused (via an inert-unless-set
+# ready/continue file pair, same idea as the race-gate seam) immediately
+# AFTER attestation passes but BEFORE the real exec, the HOST-side file
+# backing /work/obj/scheduler/icecc-scheduler is then replaced via
+# ATOMIC RENAME (directory-entry replacement onto a NEW inode -- the
+# realistic tamper model for this codebase, since the only sanctioned
+# write path anywhere in it, _publish_script()'s own final step, is
+# `mv -T`; an in-place truncate+overwrite of the SAME inode is a
+# DIFFERENT primitive no fd-based defense can ever protect against, and
+# is not what this gate tests), then released. Two scenarios: the OLD
+# vulnerable pattern (exec /work/<path> directly, re-opening the path
+# after the swap) MUST pick up the decoy; the NEW fixed pattern (exec
+# /proc/self/fd/8) MUST NOT.
+SNAPSHOT_TOCTOU="$SCRATCHDIR/farm.py.pre-toctou-gate"
+cp "$FARMDIR/farm.py" "$SNAPSHOT_TOCTOU"
+restore_toctou() { [ -f "$SNAPSHOT_TOCTOU" ] && cp "$SNAPSHOT_TOCTOU" "$FARMDIR/farm.py"; }
+trap restore_toctou EXIT
+python3 - "research6" "$FARMDIR" <<'PY'
+import sys, time
+host, farmdir = sys.argv[1], sys.argv[2]
+sys.path.insert(0, farmdir)
+import farm
+
+binary_set = "p43"
+def isolated_root(bs):
+    m = farm.load_manifest(bs)
+    return f"~/role-artifacts/round5-toctou-gate/{bs}/{m['tar']['sha256']}"
+farm.immutable_root = isolated_root
+root = isolated_root(binary_set)
+img = farm.launch_image(binary_set)
+
+def run_scenario(name, exec_line, host_swap_target):
+    # Fresh republish before EACH scenario -- a prior scenario deliberately
+    # swaps the isolated store's binary to a decoy, which would make the
+    # NEXT scenario fail attestation for the wrong reason (stale
+    # corruption left over from the previous run, not this run's own
+    # pause/swap/resume timing).
+    farm.sh(host, "chmod -R u+w ~/role-artifacts/round5-toctou-gate 2>/dev/null; rm -rf ~/role-artifacts/round5-toctou-gate", check=True)
+    derr, dstatus = farm.publish_immutable_root(host, binary_set)
+    if derr:
+        print(f"FAIL [{name}]: could not bootstrap isolated store: {derr}", file=sys.stderr)
+        return None
+    cname = f"toctou-gate-{name}"
+    farm.sh(host, f"docker rm -f {cname} 2>/dev/null; true")
+    token = farm._attestation_token()
+    marker = f"tg-{name}"
+    attest = farm._attestation_prefix(binary_set, token, "obj/scheduler/icecc-scheduler")
+    pause_block = f"touch /scratch/{marker}-ready; while [ ! -f /scratch/{marker}-continue ]; do sleep 0.2; done; "
+    inner_cmd = attest + pause_block + exec_line
+    scratch_expanded = farm.SCRATCH.replace("~", "$HOME")
+    farm.sh(host, f"mkdir -p {scratch_expanded}; rm -f {scratch_expanded}/{marker}-ready {scratch_expanded}/{marker}-continue")
+    farm.sh(host, f"docker run -d --pull=never --name {cname} --network host -v {root}:/work:ro -v {farm.SCRATCH}:/scratch -u 0:0 {img} bash -c '{inner_cmd}'", check=True)
+
+    ready_path = f"{scratch_expanded}/{marker}-ready"
+    for _ in range(30):
+        r = farm.sh(host, f"test -f {ready_path} && echo yes || echo no")
+        if r.stdout.strip() == "yes":
+            break
+        time.sleep(0.3)
+    else:
+        print(f"FAIL [{name}]: container never reached the ready-pause (attestation may have failed): "
+              f"{farm.sh(host, f'docker logs {cname} 2>&1').stdout!r}", file=sys.stderr)
+        farm.sh(host, f"docker rm -f {cname} 2>/dev/null; true")
+        return None
+
+    # ATOMIC RENAME swap -- see the section banner above for why this,
+    # not an in-place truncate, is both the realistic tamper model here
+    # and the only variant an already-open fd can be immune to. chmod
+    # the PARENT DIRECTORY writable FIRST: the published tree's own
+    # `chmod -R a-w` (publish step 7) strips the write bit from every
+    # DIRECTORY too, not just the tracked files, so creating decoy_tmp
+    # as a new directory entry fails if this runs in the wrong order.
+    decoy_tmp = f"{host_swap_target}.decoy-tmp"
+    swap_r = farm.sh(host, f"chmod u+w $(dirname {host_swap_target}) && "
+                            f"printf '#!/bin/sh\\necho DECOY-BINARY-RAN-{marker}\\nexit 66\\n' > {decoy_tmp} && "
+                            f"chmod +x {decoy_tmp} && "
+                            f"mv -f {decoy_tmp} {host_swap_target} && "
+                            f"echo SWAP-OK")
+    if "SWAP-OK" not in swap_r.stdout:
+        print(f"FAIL [{name}]: the host-side swap itself did not succeed: rc={swap_r.returncode} "
+              f"stdout={swap_r.stdout!r} stderr={swap_r.stderr!r}", file=sys.stderr)
+
+    farm.sh(host, f"touch {scratch_expanded}/{marker}-continue")
+    time.sleep(2)
+    logs = farm.sh(host, f"docker logs {cname} 2>&1").stdout
+    farm.sh(host, f"docker rm -f {cname} 2>/dev/null; true")
+    return logs
+
+problems = []
+logs_old = run_scenario("old", "exec /work/obj/scheduler/icecc-scheduler --help", f"{root}/obj/scheduler/icecc-scheduler")
+if not (logs_old and "DECOY-BINARY-RAN" in logs_old):
+    problems.append(f"vulnerable-baseline scenario: expected the OLD path-based exec to pick up the "
+                     f"host-side swap (proving the TOCTOU is real), got: {logs_old!r}")
+else:
+    print("ok - VULNERABLE BASELINE CONFIRMED: the old path-based exec (exec /work/<path> directly) "
+          "picked up the host-side atomic-rename swap -- ran the decoy, not the originally-attested "
+          "scheduler -- proving this TOCTOU is genuinely exploitable, not theoretical")
+
+logs_new = run_scenario("new", f"exec /proc/self/fd/{farm.ROLE_BINARY_FD} --help", f"{root}/obj/scheduler/icecc-scheduler")
+if logs_new and "DECOY-BINARY-RAN" in logs_new:
+    problems.append(f"FIXED scenario: the FD-based exec STILL picked up the host-side swap -- the fix "
+                     f"does not close the TOCTOU: {logs_new!r}")
+elif logs_new and ("ICECREAM scheduler" in logs_new or "usage: icecc-scheduler" in logs_new):
+    print("ok - FIX CONFIRMED: exec /proc/self/fd/8 ran the ORIGINALLY-ATTESTED scheduler binary, "
+          "completely unaffected by the identical host-side swap the vulnerable baseline just proved "
+          "exploitable -- hash and exec are provably the same bytes, zero window, not merely a "
+          "narrower one")
+else:
+    problems.append(f"FIXED scenario: unclear result, needs inspection: {logs_new!r}")
+
+farm.sh(host, "chmod -R u+w ~/role-artifacts/round5-toctou-gate 2>/dev/null; rm -rf ~/role-artifacts/round5-toctou-gate")
+if problems:
+    for p in problems:
+        print(f"FAIL: {p}", file=sys.stderr)
+    sys.exit(1)
+PY
+[ $? -eq 0 ] || fail "TOCTOU race gate did not pass"
+restore_toctou
+if cmp -s "$FARMDIR/farm.py" "$SNAPSHOT_TOCTOU"; then
+    echo "ok - farm.py unchanged by the TOCTOU race gate (cmp clean -- this gate reads production code, never mutates it)"
+else
+    fail "farm.py was unexpectedly modified by the TOCTOU race gate"
+fi
+trap - EXIT
+rm -f "$SNAPSHOT_TOCTOU"
+
+echo
+echo "== ROUND 5 (Deep Reviewer): HARNESS PRIVATE STAGING -- the streamed bundle is extracted into CONTAINER-PRIVATE tmpfs and verified in-container; a tampered bundle must be refused before farm_client.sh ever runs =="
+# The OLD design pushed farm_client.sh/replay.py into ~/farm-scratch (a
+# MUTABLE, host-bind-mounted, read-write directory) BEFORE the container
+# even started, then separately docker-exec'd into an idle holder --
+# leaving a real window during which the staged copies sat writable and
+# host-visible with nothing re-verifying them at the point they actually
+# ran. Fixed: the bundle is streamed directly into a FOREGROUND
+# `docker run -i`'s stdin and extracted into tmpfs -- never touching any
+# mutable host path -- then verified from INSIDE the container
+# (_harness_stage_verify()) before farm_client.sh is ever reached.
+python3 - "q3" "$FARMDIR" <<'PY'
+import sys, io, tarfile
+sys.path.insert(0, sys.argv[2])
+import farm
+host = sys.argv[1]
+
+# A bundle with replay.py tampered AFTER the fact -- simulates a
+# transit/tamper of the streamed bytes themselves (the bundle is built
+# fresh from the checkout, verify_harness_scripts() unmodified/still
+# passing on the checkout copies -- this tampers the STREAMED payload,
+# not the source files on disk).
+buf = io.BytesIO()
+with tarfile.open(fileobj=buf, mode="w") as tf:
+    for s in farm.SCRIPTS:
+        data = open(f"{farm.HUB_DIR}/{s}", "rb").read()
+        if s == "replay.py":
+            data = data + b"\n# TAMPERED-IN-TRANSIT\n"
+        info = tarfile.TarInfo(name=s)
+        info.size = len(data); info.mtime = 0; info.mode = 0o555
+        tf.addfile(info, io.BytesIO(data))
+tampered_bundle = buf.getvalue()
+
+plan = farm.resolve_launch_plan([host], "p43", "p43", client_host=host, binary_set_c="p43")
+ok = farm.up([host], plan)
+if not ok:
+    print("FAIL: setup -- clean S+F launch for the harness-staging tamper test did not register", file=sys.stderr)
+    sys.exit(1)
+try:
+    c_token = farm._attestation_token()
+    stage_token = farm._attestation_token()
+    stage_verify = farm._harness_stage_verify(stage_token)
+    attest = farm._attestation_prefix(plan.binary_set_c, c_token)
+    real_cmd = "export CMAKE=/hostscratch/cmake/bin/cmake; bash /scratch/farm_client.sh 10.0.27.101:22000 farmnet /hostscratch/fmt simultaneous 1 1 "
+    inner_cmd = f"mkdir -p /scratch && tar -xf - -C /scratch && {stage_verify}{attest}{real_cmd}"
+    r = farm.docker_run_foreground_staged(host, "farm-client", plan.c_tree, plan.c_img, tampered_bundle, inner_cmd, timeout=60)
+    if "HARNESS-STAGE-FAIL" not in r.stdout:
+        print(f"FAIL: expected the tampered streamed bundle to be refused with HARNESS-STAGE-FAIL "
+              f"before farm_client.sh ever ran, got rc={r.returncode} stdout={r.stdout!r}", file=sys.stderr)
+        sys.exit(1)
+    if "CLIENT:" in r.stdout or "CELL:" in r.stdout:
+        print(f"FAIL: farm_client.sh/replay.py output appeared despite HARNESS-STAGE-FAIL -- the "
+              f"tampered bundle was NOT refused before execution: {r.stdout!r}", file=sys.stderr)
+        sys.exit(1)
+    print(f"ok - tampered streamed bundle REFUSED before farm_client.sh ever ran (rc={r.returncode}, "
+          f"HARNESS-STAGE-FAIL present, no farm_client.sh/replay.py output leaked through)")
+finally:
+    farm.down([host], None)
+    chk = farm.sh(host, "docker ps -a --filter name=farm- --format '{{.Names}}'")
+    if chk.stdout.strip():
+        print(f"FAIL: farm-* containers still present after down(): {chk.stdout.strip()!r}", file=sys.stderr)
+        sys.exit(1)
+    print("ok - down() cleaned up; 0 farm-* containers remain")
+PY
+[ $? -eq 0 ] || fail "harness-private-staging tamper mutant did not pass"
+
+echo
+echo "== ROUND 5 (Deep Reviewer): TAR HEADER PRE-VALIDATION -- a crafted archive with path-traversal or an absolute-path member must be refused BEFORE extraction, from the listing alone =="
+# _publish_script()'s new step 3 runs `tar -tf`/`tar -tvf` (list-only,
+# never writes to disk) BEFORE step 4's extraction. Two REAL crafted
+# archives against a REAL host: one with a leading-../ path-traversal
+# member, one with an absolute-path member (built with GNU tar's -P so
+# tar's OWN creation-time stripping doesn't mask what this test is
+# actually proving). Confirms BOTH the correct PUBLISH-TAR-HEADER-INVALID
+# refusal AND that nothing ever leaked outside the isolated store.
+python3 - "research6" "$FARMDIR" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[2])
+import farm
+host = sys.argv[1]
+binary_set = "p43"
+manifest = farm.load_manifest(binary_set)
+
+def isolated_root(bs):
+    m = farm.load_manifest(bs)
+    return f"~/role-artifacts/round5-tarheader-gate/{bs}/{m['tar']['sha256']}"
+farm.immutable_root = isolated_root
+root = isolated_root(binary_set)
+
+def try_crafted(name, build_cmd, verify_absent_cmd):
+    farm.sh(host, "chmod -R u+w ~/role-artifacts/round5-tarheader-gate 2>/dev/null; rm -rf ~/role-artifacts/round5-tarheader-gate", check=True)
+    r = farm.sh(host, build_cmd)
+    if r.returncode != 0:
+        print(f"FAIL [{name}]: could not build the crafted tar: {r.stdout!r} {r.stderr!r}", file=sys.stderr)
+        return False
+    tar_sha = farm.sh(host, f"sha256sum ~/role-artifacts/round5-{name}.tar").stdout.split()[0]
+    tampered = dict(manifest); tampered["tar"] = dict(manifest["tar"]); tampered["tar"]["sha256"] = tar_sha
+    script = farm._publish_script(binary_set, tampered, root, f"$HOME/role-artifacts/round5-{name}.tar", None)
+    r2 = farm.sh(host, script, timeout=60)
+    line = r2.stdout.strip().splitlines()[-1] if r2.stdout.strip() else "(empty)"
+    ok = line.startswith("PUBLISH-TAR-HEADER-INVALID:")
+    if not ok:
+        print(f"FAIL [{name}]: expected PUBLISH-TAR-HEADER-INVALID, got {line!r}", file=sys.stderr)
+    else:
+        absent = farm.sh(host, verify_absent_cmd).stdout.strip()
+        if absent != "yes":
+            print(f"FAIL [{name}]: refused correctly, but the escape target was NOT confirmed absent "
+                  f"({absent!r}) -- the refusal claim needs this to actually mean something", file=sys.stderr)
+            ok = False
+        else:
+            print(f"ok - crafted {name} archive REFUSED pre-extraction ({line}), escape target "
+                  f"confirmed never created (nothing was ever extracted anywhere before this refused)")
+    farm.sh(host, f"chmod -R u+w ~/role-artifacts/round5-tarheader-gate 2>/dev/null; rm -rf ~/role-artifacts/round5-tarheader-gate ~/role-artifacts/round5-{name}.tar ~/role-artifacts/round5-{name}-fixture")
+    return ok
+
+problems = []
+if not try_crafted(
+    "traversal",
+    'rm -rf ~/role-artifacts/round5-traversal-fixture && mkdir -p ~/role-artifacts/round5-traversal-fixture/sneaky && '
+    'echo payload > ~/role-artifacts/round5-traversal-fixture/sneaky/x && '
+    'tar --transform="s,^sneaky/x$,../../../../tmp/round5-traversal-payload," '
+    '-cf ~/role-artifacts/round5-traversal.tar -C ~/role-artifacts/round5-traversal-fixture sneaky/x',
+    'test -f /tmp/round5-traversal-payload && echo no || echo yes'
+):
+    problems.append("path-traversal crafted archive")
+if not try_crafted(
+    "absolute",
+    'rm -rf /tmp/round5-absolute-fixture && mkdir -p /tmp/round5-absolute-fixture && '
+    'echo payload > /tmp/round5-absolute-fixture/x && '
+    'tar -P -cf ~/role-artifacts/round5-absolute.tar /tmp/round5-absolute-fixture/x && '
+    'rm -f /tmp/round5-absolute-fixture/x',
+    'test -f /tmp/round5-absolute-fixture/x && echo no || echo yes'
+):
+    problems.append("absolute-path crafted archive")
+farm.sh(host, "rm -rf /tmp/round5-traversal-payload /tmp/round5-absolute-fixture")
+if problems:
+    print(f"FAIL: {problems}", file=sys.stderr)
+    sys.exit(1)
+PY
+[ $? -eq 0 ] || fail "tar header pre-validation gate did not pass"
+
+echo
+echo "== ROUND 5 (Deep Reviewer): INSPECT-THE-LAUNCH-OBJECT -- preflight must judge the EXACT digest-qualified launch ref, never the mutable tag; every docker run carries --pull=never =="
+# Structural claim (image_digest_remote() must never even construct a
+# query against the mutable tag): a SAFE fake transport that FAILS any
+# query mentioning the bare IMG tag and SUCCEEDS only the exact digest-
+# ref query -- proving the current code path is not merely "happens to
+# pass" but structurally never depends on the tag at all. (A live
+# same-repo tag-repoint experiment was tried and reverted during this
+# round's own verification: on this containerd-image-store host,
+# repointing icecream/farm-node's OWN tag turned out to ALSO disrupt the
+# digest-ref's own resolvability -- real store behavior, not a code bug
+# -- so a live "tag repointed to a decoy WHILE the digest ref stays
+# correct" scenario isn't safely constructible against a shared image by
+# this exact method; the fake-transport version below proves the same
+# claim -- the code path structurally never queries the tag -- without
+# that risk.)
+python3 - "$FARMDIR" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+import farm
+
+real_sh = farm.sh
+img_ref = farm.launch_image("p43")
+
+def fake_sh(host, cmd, timeout=120, check=False):
+    class R: pass
+    r = R(); r.stdout = ""; r.stderr = ""; r.returncode = 0
+    if "docker image inspect" in cmd:
+        if img_ref in cmd:
+            r.returncode = 0  # exact digest-qualified ref query -- succeeds
+            return r
+        if farm.IMG in cmd:
+            r.returncode = 1  # bare mutable-tag query -- FAILS (simulating a decoy)
+            return r
+    return real_sh(host, cmd, timeout=timeout, check=check)
+
+farm.sh = fake_sh
+try:
+    result = farm.image_digest_remote("research6", "p43")
+finally:
+    farm.sh = real_sh
+
+if result != img_ref:
+    print(f"FAIL: expected image_digest_remote() to succeed using ONLY the digest-qualified ref query "
+          f"(a bare-tag query was rigged to fail), got {result!r}", file=sys.stderr)
+    sys.exit(1)
+print("ok - image_digest_remote() succeeded using ONLY the digest-qualified ref query; a query against "
+      "the bare mutable tag would have failed (simulated decoy) but was structurally never made")
+PY
+[ $? -eq 0 ] || fail "inspect-the-launch-object structural check did not pass"
+
+echo "-- --pull=never behavioral proof: an absent digest ref must be refused IMMEDIATELY, never silently attempt a network pull --"
+python3 - "research6" "$FARMDIR" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[2])
+import farm
+host = sys.argv[1]
+bogus_ref = "icecream/farm-node@sha256:" + "0" * 64
+
+r_never = farm.sh(host, f"docker run --pull=never --rm {bogus_ref} true 2>&1")
+r_default = farm.sh(host, f"docker run --rm {bogus_ref} true 2>&1", timeout=20)
+
+problems = []
+if "No such image" not in r_never.stdout or "Unable to find image" in r_never.stdout:
+    problems.append(f"--pull=never: expected an immediate 'No such image' refusal with no pull attempt, got {r_never.stdout!r}")
+if "Unable to find image" not in r_default.stdout:
+    problems.append(f"default pull policy: expected 'Unable to find image ... locally' (proving a pull WAS "
+                     f"attempted) as the control for the line above, got {r_default.stdout!r}")
+if problems:
+    for p in problems:
+        print(f"FAIL: {p}", file=sys.stderr)
+    sys.exit(1)
+print("ok - --pull=never refuses an absent digest ref immediately, no pull attempted ('No such image', "
+      "no 'Unable to find image ... locally' preamble); the SAME absent ref WITHOUT the flag shows the "
+      "preamble, confirming a real pull attempt is what --pull=never actually suppresses")
+PY
+[ $? -eq 0 ] || fail "--pull=never behavioral proof did not pass"
+echo "-- source anchor: --pull=never is present at both docker-run callsites --"
+python3 - "$FARMDIR/farm.py" <<'PY'
+import sys
+src = open(sys.argv[1]).read()
+# "--pull=never --name" (not just "--pull=never") -- the flag also
+# appears in prose (docstrings explaining the fix), which a bare
+# substring count would over-count; this anchors specifically on the
+# two real `docker run` COMMAND-CONSTRUCTION lines.
+n = src.count("--pull=never --name")
+if n != 2:
+    print(f"FAIL: expected --pull=never at exactly 2 docker-run callsites "
+          f"(docker_run_detached, docker_run_foreground_staged), found {n}", file=sys.stderr)
+    sys.exit(1)
+print("ok - --pull=never appears at exactly 2 docker-run callsites in farm.py "
+      "(docker_run_detached, docker_run_foreground_staged)")
+PY
+[ $? -eq 0 ] || fail "--pull=never source anchor did not pass"
+
+echo
+echo "== ROUND 5 (Deep Reviewer): NO-GIT RUNNABILITY -- the fresh-archive gate must not die at its own git rev-parse when run from a bare, non-git tree =="
+# Already exercised implicitly by the FRESH-ARCHIVE gate at the top of
+# this suite (this repo IS a git worktree, so that run took the git-
+# archive branch) -- this section explicitly proves the FALLBACK branch
+# too, by pointing the same gate logic at a bare copy of farmharness/
+# with .git removed entirely, simulating exactly the release-tarball
+# extraction team-lead's own verification hit.
+NOGIT_COPY="$SCRATCHDIR/round5-no-git-copy-$$"
+rm -rf "$NOGIT_COPY"
+mkdir -p "$NOGIT_COPY"
+cp -a "$FARMDIR/." "$NOGIT_COPY/"
+rm -rf "$NOGIT_COPY/.git"
+if git -C "$NOGIT_COPY" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    fail "no-git test setup: $NOGIT_COPY still resolves as a git work tree -- .git removal did not take, this test is not exercising the fallback path"
+fi
+NOGIT_ARCHIVE_DIR="$SCRATCHDIR/round5-no-git-archive-$$"
+rm -rf "$NOGIT_ARCHIVE_DIR"
+mkdir -p "$NOGIT_ARCHIVE_DIR/farmharness"
+cp -a "$NOGIT_COPY/." "$NOGIT_ARCHIVE_DIR/farmharness/"
+find "$NOGIT_ARCHIVE_DIR/farmharness" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null
+find "$NOGIT_ARCHIVE_DIR/farmharness" -name '*.pyc' -delete 2>/dev/null
+[ -f "$NOGIT_ARCHIVE_DIR/farmharness/farm.py" ] || fail "no-git fallback: farm.py missing from the no-git copy"
+python3 - "$NOGIT_ARCHIVE_DIR" <<'PY'
+import os, sys
+archive_dir = sys.argv[1]
+sys.path.insert(0, os.path.join(archive_dir, "farmharness"))
+import farm
+resolved_dir = os.path.dirname(os.path.abspath(farm.__file__))
+expected_dir = os.path.join(archive_dir, "farmharness")
+if resolved_dir != expected_dir:
+    print(f"FAIL: farm module resolved from {resolved_dir!r}, expected {expected_dir!r}", file=sys.stderr)
+    sys.exit(1)
+for set_name in ("p43", "p50"):
+    m = farm.load_manifest(set_name)
+    assert m.get("set") == set_name
+print("ok - no-git fallback: farm.py imports cleanly and both manifests load correctly from a bare, "
+      "non-git copy of farmharness/ (no .git anywhere in its ancestry) -- exactly the scenario that used "
+      "to kill this entire suite at its own git rev-parse before this fix")
+PY
+[ $? -eq 0 ] || fail "no-git runnability fallback did not pass"
+rm -rf "$NOGIT_COPY" "$NOGIT_ARCHIVE_DIR"
 
 echo
 echo "== skipped-preflight mutant: neutralizing resolve_role() in resolve_launch_plan() must make the PREFLIGHT-OK marker for that role DISAPPEAR =="
