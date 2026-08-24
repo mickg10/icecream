@@ -1,0 +1,475 @@
+#include "p50_daemon_sidecar_adapter.h"
+
+#include <algorithm>
+#include <cerrno>
+#include <limits>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+namespace icecc::p50::local {
+Connection connect_unix_until(
+    const std::string&, std::chrono::steady_clock::time_point, Status*) noexcept;
+} // namespace icecc::p50::local
+
+namespace icecc::p50::daemon {
+namespace {
+
+constexpr int kPrivateDirectoryMode = 0700;
+constexpr int64_t kMaximumTimeoutMilliseconds = 24 * 60 * 60 * 1000;
+
+bool bounded_positive(std::chrono::milliseconds value) noexcept
+{
+    return value.count() > 0 && value.count() <= kMaximumTimeoutMilliseconds;
+}
+
+bool valid_id(uint64_t value) noexcept
+{
+    return value <= static_cast<uint64_t>(std::numeric_limits<uid_t>::max());
+}
+
+bool valid_gid(uint64_t value) noexcept
+{
+    return value <= static_cast<uint64_t>(std::numeric_limits<gid_t>::max());
+}
+
+bool has_nul(const std::string& value) noexcept
+{
+    return value.find('\0') != std::string::npos;
+}
+
+bool private_directory(const Config& config) noexcept
+{
+    struct stat info{};
+    if (::lstat(config.runtime_directory.c_str(), &info) != 0 ||
+        !S_ISDIR(info.st_mode) || info.st_uid != config.expected_daemon_uid ||
+        info.st_gid != config.expected_daemon_gid ||
+        (info.st_mode & 0077) != 0)
+        return false;
+    return true;
+}
+
+bool owned_attempt_directory(const std::string& path, const Config& config) noexcept
+{
+    struct stat info{};
+    return ::lstat(path.c_str(), &info) == 0 && S_ISDIR(info.st_mode) &&
+           info.st_uid == config.expected_daemon_uid &&
+           info.st_gid == config.expected_daemon_gid && (info.st_mode & 0077) == 0;
+}
+
+} // namespace
+
+DaemonSidecarAdapter::DaemonSidecarAdapter(Config config) noexcept
+    : config_(std::move(config))
+{
+}
+
+DaemonSidecarAdapter::~DaemonSidecarAdapter()
+{
+    shutdown();
+}
+
+bool DaemonSidecarAdapter::valid_config(const Config& config) noexcept
+{
+    if (!sidecar::Supervisor::valid_config(sidecar::Config{
+            config.executable, {}, config.readiness_timeout,
+            config.shutdown_timeout, config.restart_window, 0, 1}) ||
+        config.executable.front() != '/' || config.runtime_directory.empty() ||
+        config.runtime_directory.front() != '/' || has_nul(config.runtime_directory) ||
+        config.runtime_directory.size() >= 180 ||
+        config.generation == 0 || config.public_listener_port == 0 ||
+        config.public_listener_port > std::numeric_limits<uint16_t>::max() ||
+        !valid_id(config.expected_daemon_uid) || !valid_gid(config.expected_daemon_gid) ||
+        !valid_id(config.expected_service_uid) || !valid_gid(config.expected_service_gid) ||
+        !bounded_positive(config.readiness_timeout) ||
+        !bounded_positive(config.connect_timeout) ||
+        !bounded_positive(config.handoff_timeout) ||
+        !bounded_positive(config.shutdown_timeout) ||
+        !bounded_positive(config.restart_window) || config.max_restarts == 0 ||
+        config.max_restarts > 100000 || config.max_attempts_per_recovery == 0 ||
+        config.max_attempts_per_recovery > 100000 ||
+        (config.drop_uid.has_value() != config.drop_gid.has_value()))
+        return false;
+    if (config.drop_uid.has_value() &&
+        (!valid_id(*config.drop_uid) || !valid_gid(*config.drop_gid) ||
+         *config.drop_uid == 0 || *config.drop_gid == 0))
+        return false;
+    return private_directory(config);
+}
+
+void DaemonSidecarAdapter::observe_public_listener(bool bound, uint32_t port) noexcept
+{
+    public_listener_ = PublicListenerObservation{bound, port};
+}
+
+void DaemonSidecarAdapter::observe_public_listener(
+    PublicListenerObservation observation) noexcept
+{
+    public_listener_ = observation;
+}
+
+bool DaemonSidecarAdapter::authenticated() const noexcept
+{
+    return dispatcher_ != nullptr && dispatcher_->available();
+}
+
+bool DaemonSidecarAdapter::next_attempt() noexcept
+{
+    if (attempt_ == std::numeric_limits<uint64_t>::max()) {
+        fail(AdapterError::AttemptOverflow);
+        return false;
+    }
+    ++attempt_;
+    return true;
+}
+
+bool DaemonSidecarAdapter::make_attempt_node() noexcept
+{
+    const std::string stem = config_.runtime_directory + "/s2-g" +
+                             std::to_string(config_.generation) + "-a" +
+                             std::to_string(attempt_);
+    const std::string socket = stem + "/control.sock";
+    if (stem.size() >= 240 || socket.size() > local::kMaxUnixPath)
+        return false;
+    // EEXIST is deliberately a hard failure: an old process may have been
+    // SIGKILLed while retaining a listener node, and that identity is stale.
+    if (::mkdir(stem.c_str(), kPrivateDirectoryMode) != 0)
+        return false;
+    if (!owned_attempt_directory(stem, config_)) {
+        (void)::rmdir(stem.c_str());
+        return false;
+    }
+    attempt_directory_ = stem;
+    socket_path_ = socket;
+    return true;
+}
+
+void DaemonSidecarAdapter::cleanup_attempt_node() noexcept
+{
+    if (attempt_directory_.empty()) {
+        socket_path_.clear();
+        return;
+    }
+    // Never unlink a socket by pathname here.  The service owns listener-node
+    // removal and performs its own inode comparison; rmdir succeeds only if
+    // that cleanup really left our private attempt directory empty.
+    if (owned_attempt_directory(attempt_directory_, config_))
+        (void)::rmdir(attempt_directory_.c_str());
+    attempt_directory_.clear();
+    socket_path_.clear();
+}
+
+void DaemonSidecarAdapter::disable_relationship() noexcept
+{
+    if (dispatcher_ != nullptr)
+        dispatcher_->disable();
+}
+
+bool DaemonSidecarAdapter::attach_current() noexcept
+{
+    if (supervisor_ == nullptr || supervisor_->state() != sidecar::State::Ready ||
+        supervisor_->child_pid() <= 1 || socket_path_.empty())
+        return false;
+    local::Status status = local::Status::Ok;
+    const auto deadline = std::chrono::steady_clock::now() + config_.connect_timeout;
+    local::Connection connection =
+        local::connect_unix_until(socket_path_, deadline, &status);
+    if (!connection.valid() || status != local::Status::Ok)
+        return false;
+    const local::CredentialExpectation expected{
+        config_.expected_service_uid, config_.expected_service_gid,
+        static_cast<uint64_t>(supervisor_->child_pid())};
+    if (connection.verify_peer_credentials(expected) != local::Status::Ok)
+        return false;
+    if (dispatcher_ == nullptr ||
+        !dispatcher_->attach_authenticated(
+            std::move(connection), local::Identity{config_.generation, attempt_}))
+        return false;
+    return true;
+}
+
+bool DaemonSidecarAdapter::begin_attempt(bool /*recovery*/) noexcept
+{
+    if (!next_attempt() || !make_attempt_node()) {
+        fail(last_error_ == AdapterError::AttemptOverflow
+                 ? last_error_
+                 : AdapterError::StalePath);
+        return false;
+    }
+
+    try {
+        sidecar::Config supervisor_config;
+        supervisor_config.executable = config_.executable;
+        supervisor_config.arguments = {
+            "--socket", socket_path_, "--peer-uid", std::to_string(config_.expected_daemon_uid),
+            "--peer-gid", std::to_string(config_.expected_daemon_gid), "--generation",
+            std::to_string(config_.generation), "--attempt", std::to_string(attempt_)};
+        if (config_.drop_uid.has_value()) {
+            supervisor_config.arguments.push_back("--drop-uid");
+            supervisor_config.arguments.push_back(std::to_string(*config_.drop_uid));
+            supervisor_config.arguments.push_back("--drop-gid");
+            supervisor_config.arguments.push_back(std::to_string(*config_.drop_gid));
+        }
+        supervisor_config.readiness_timeout = config_.readiness_timeout;
+        supervisor_config.shutdown_timeout = config_.shutdown_timeout;
+        supervisor_config.restart_window = config_.restart_window;
+        supervisor_config.max_restarts = 0;
+        supervisor_config.max_attempts_per_recovery = 1;
+        supervisor_ = std::make_unique<sidecar::Supervisor>(std::move(supervisor_config));
+        state_ = AdapterState::Starting;
+        if (!supervisor_->start()) {
+            fail(AdapterError::StartupFailure);
+            supervisor_->shutdown();
+            supervisor_.reset();
+            cleanup_attempt_node();
+            return false;
+        }
+        prior_supervisor_post_ready_exits_ = supervisor_->counters().post_ready_exits;
+        prior_counter_observed_ = true;
+        dispatcher_ = std::make_unique<CacheSessionDispatcher>(
+            local::Identity{config_.generation, attempt_}, config_.handoff_timeout);
+        if (!attach_current()) {
+            fail(AdapterError::AuthenticationFailure);
+            disable_relationship();
+            supervisor_->shutdown();
+            dispatcher_.reset();
+            supervisor_.reset();
+            cleanup_attempt_node();
+            return false;
+        }
+        state_ = AdapterState::Ready;
+        last_error_ = AdapterError::None;
+        return true;
+    } catch (...) {
+        fail(AdapterError::StartupFailure);
+        disable_relationship();
+        if (supervisor_ != nullptr)
+            supervisor_->shutdown();
+        dispatcher_.reset();
+        supervisor_.reset();
+        cleanup_attempt_node();
+        return false;
+    }
+}
+
+bool DaemonSidecarAdapter::reserve_outer_restart() noexcept
+{
+    const auto now = std::chrono::steady_clock::now();
+    restart_times_.erase(std::remove_if(restart_times_.begin(), restart_times_.end(),
+                                         [&](auto timestamp) {
+                                             return now - timestamp >= config_.restart_window;
+                                         }),
+                        restart_times_.end());
+    if (restart_times_.size() >= config_.max_restarts)
+        return false;
+    restart_times_.push_back(now);
+    return true;
+}
+
+bool DaemonSidecarAdapter::collect_counter_delta() noexcept
+{
+    if (supervisor_ == nullptr || !prior_counter_observed_)
+        return true;
+    const uint64_t current = supervisor_->counters().post_ready_exits;
+    if (current == std::numeric_limits<uint64_t>::max() ||
+        current < prior_supervisor_post_ready_exits_) {
+        counter_failed_ = true;
+        fail(current == std::numeric_limits<uint64_t>::max()
+                 ? AdapterError::CounterSaturated
+                 : AdapterError::CounterRegression);
+        return false;
+    }
+    const uint64_t delta = current - prior_supervisor_post_ready_exits_;
+    if (delta > std::numeric_limits<uint64_t>::max() - cumulative_post_ready_exits_) {
+        counter_failed_ = true;
+        fail(AdapterError::CounterSaturated);
+        return false;
+    }
+    cumulative_post_ready_exits_ += delta;
+    prior_supervisor_post_ready_exits_ = current;
+    return true;
+}
+
+void DaemonSidecarAdapter::append_update(advertisement::Update& destination,
+                                          const advertisement::Update& source) noexcept
+{
+    for (size_t index = 0; index < source.count && destination.count < 2; ++index)
+        destination.transitions[destination.count++] = source.transitions[index];
+    if (destination.error == advertisement::Error::None)
+        destination.error = source.error;
+}
+
+void DaemonSidecarAdapter::apply_observation(advertisement::Update& update) noexcept
+{
+    const bool exact_listener = public_listener_.bound &&
+                                public_listener_.port == config_.public_listener_port;
+    advertisement::Observation observation;
+    observation.public_listener_bound = exact_listener;
+    observation.public_listener_port = exact_listener ? public_listener_.port : 0;
+    observation.supervisor_state = supervisor_ != nullptr
+                                       ? supervisor_->state()
+                                       : sidecar::State::Stopped;
+    observation.private_relationship_authenticated = authenticated();
+    observation.cumulative_post_ready_exits = cumulative_post_ready_exits_;
+    const advertisement::Update observed = controller_.observe(observation);
+    append_update(update, observed);
+    if (observed.error == advertisement::Error::CounterRegression) {
+        counter_failed_ = true;
+        fail(AdapterError::CounterRegression);
+    } else if (observed.error == advertisement::Error::CounterSaturated) {
+        counter_failed_ = true;
+        fail(AdapterError::CounterSaturated);
+    }
+    if (state_ != AdapterState::ShuttingDown && state_ != AdapterState::Failed)
+        state_ = (supervisor_ != nullptr && supervisor_->state() == sidecar::State::Ready &&
+                  authenticated())
+                     ? AdapterState::Ready
+                     : AdapterState::Absent;
+}
+
+bool DaemonSidecarAdapter::recover(advertisement::Update& update) noexcept
+{
+    for (uint32_t count = 0; count < config_.max_attempts_per_recovery; ++count) {
+        if (counter_failed_ || !reserve_outer_restart()) {
+            fail(counter_failed_ ? last_error_ : AdapterError::AttemptExhausted);
+            apply_observation(update);
+            return false;
+        }
+        if (begin_attempt(true)) {
+            apply_observation(update);
+            return true;
+        }
+    }
+    fail(AdapterError::AttemptExhausted);
+    apply_observation(update);
+    return false;
+}
+
+bool DaemonSidecarAdapter::start(advertisement::Update* result) noexcept
+{
+    advertisement::Update update;
+    if (!valid_config(config_)) {
+        fail(AdapterError::InvalidConfiguration);
+        apply_observation(update);
+        if (result != nullptr)
+            *result = update;
+        return false;
+    }
+    if (state_ == AdapterState::Ready) {
+        apply_observation(update);
+        if (result != nullptr)
+            *result = update;
+        return true;
+    }
+    shutdown();
+    state_ = AdapterState::Absent;
+    for (uint32_t count = 0; count < config_.max_attempts_per_recovery; ++count) {
+        if (count != 0 && !reserve_outer_restart()) {
+            fail(AdapterError::AttemptExhausted);
+            break;
+        }
+        if (begin_attempt(count != 0)) {
+            apply_observation(update);
+            if (result != nullptr)
+                *result = update;
+            return true;
+        }
+    }
+    fail(AdapterError::AttemptExhausted);
+    apply_observation(update);
+    if (result != nullptr)
+        *result = update;
+    return false;
+}
+
+bool DaemonSidecarAdapter::poll(advertisement::Update* result) noexcept
+{
+    advertisement::Update update;
+    if (state_ == AdapterState::Stopped) {
+        apply_observation(update);
+        if (result != nullptr)
+            *result = update;
+        return false;
+    }
+    if (counter_failed_) {
+        apply_observation(update);
+        if (result != nullptr)
+            *result = update;
+        return false;
+    }
+    if (supervisor_ == nullptr || supervisor_->state() != sidecar::State::Ready) {
+        const bool recovered = recover(update);
+        if (result != nullptr)
+            *result = update;
+        return recovered;
+    }
+
+    const bool was_ready = supervisor_->poll();
+    if (!collect_counter_delta()) {
+        disable_relationship();
+        apply_observation(update);
+        if (supervisor_ != nullptr)
+            supervisor_->shutdown();
+        dispatcher_.reset();
+        supervisor_.reset();
+        cleanup_attempt_node();
+        if (result != nullptr)
+            *result = update;
+        return false;
+    }
+    if (supervisor_->state() != sidecar::State::Ready || !was_ready) {
+        // The old relationship is withdrawn before any replacement can be
+        // observed.  This also makes the absent->present ordering explicit
+        // when recovery succeeds in this same poll.
+        disable_relationship();
+        apply_observation(update);
+        supervisor_->shutdown();
+        dispatcher_.reset();
+        supervisor_.reset();
+        cleanup_attempt_node();
+        const bool recovered = recover(update);
+        if (result != nullptr)
+            *result = update;
+        return recovered;
+    }
+    if (!authenticated()) {
+        // A successful one-shot handoff consumes the dispatcher relationship.
+        // Publish the withdrawal first; only then may a bounded fresh control
+        // connection restore presence on this still-live sidecar.
+        apply_observation(update);
+        if (attach_current())
+            apply_observation(update);
+    } else {
+        apply_observation(update);
+    }
+    if (result != nullptr)
+        *result = update;
+    return authenticated();
+}
+
+void DaemonSidecarAdapter::fail(AdapterError error) noexcept
+{
+    last_error_ = error;
+    if (error != AdapterError::None)
+        state_ = AdapterState::Absent;
+}
+
+void DaemonSidecarAdapter::shutdown() noexcept
+{
+    if (state_ == AdapterState::ShuttingDown)
+        return;
+    state_ = AdapterState::ShuttingDown;
+    // Relationship first: no ordinary daemon channel may hand off while the
+    // child is being terminated.
+    disable_relationship();
+    dispatcher_.reset();
+    if (supervisor_ != nullptr) {
+        supervisor_->shutdown();
+        supervisor_.reset();
+    }
+    cleanup_attempt_node();
+    state_ = AdapterState::Stopped;
+    last_error_ = AdapterError::None;
+}
+
+} // namespace icecc::p50::daemon
