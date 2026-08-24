@@ -18,6 +18,12 @@ gate() {
         grep -F 'active_control_cancel_fd_.store' "$file" >/dev/null &&
         grep -F 'context_.post([this]' "$file" >/dev/null &&
         grep -F 'runtime_config.f_store_guid = f_store_guid_for_identity' "$file" >/dev/null &&
+        grep -F 'endpoint_owner_thread_([this]' "$file" >/dev/null &&
+        grep -F 'endpoint_work_guard_.reset()' "$file" >/dev/null &&
+        grep -F 'endpoint_owner_thread_.join()' "$file" >/dev/null &&
+        grep -F 'SidecarRuntime::run_endpoint_on_owner' "$file" >/dev/null &&
+        grep -F 'run_endpoint_on_owner(dispatch_fd' "$file" >/dev/null &&
+        grep -F 'context_.run()' "$file" >/dev/null &&
         grep -F 'SidecarRuntime::run_one' "$file" >/dev/null &&
         grep -F 'FdHandoffReceiver receiver' "$file" >/dev/null &&
         grep -F 'receiver.receive_and_ack' "$file" >/dev/null &&
@@ -44,6 +50,10 @@ for pattern in \
     grep -F "$pattern" "$impl" "$header" >/dev/null
 done
 
+grep -F 'first_caller_id != second_caller_id' "$test_file" >/dev/null
+grep -F 'first_owner_id == second_owner_id' "$test_file" >/dev/null
+grep -F 'release_first_runtime' "$test_file" >/dev/null
+
 grep -F 'native_handle()' "$src/cache/p50_local_transport.h" >/dev/null
 grep -F 'active_control_cancel_fd_' "$header" >/dev/null
 grep -F 'cancel_active_io' "$endpoint" "$src/cache/p50_endpoint.h" >/dev/null
@@ -68,6 +78,21 @@ fi
 
 mutant_dir=$(mktemp -d "${TMPDIR:-/tmp}/p50cacheservice-source.XXXXXX")
 trap 'rm -rf "$mutant_dir"' EXIT HUP INT TERM
+
+for pattern in \
+    'endpoint_owner_thread_([this]' \
+    'endpoint_work_guard_.reset()' \
+    'endpoint_owner_thread_.join()' \
+    'SidecarRuntime::run_endpoint_on_owner' \
+    'run_endpoint_on_owner(dispatch_fd' \
+    'context_.run()'; do
+    mutant="$mutant_dir/mutant.cpp"
+    awk -v needle="$pattern" 'index($0, needle) == 0' "$impl" >"$mutant"
+    if gate "$mutant"; then
+        echo "endpoint-owner deletion mutant survived: $pattern" >&2
+        exit 1
+    fi
+done
 
 for pattern in \
     'result.bytes[sizeof(identity.generation) + index]' \

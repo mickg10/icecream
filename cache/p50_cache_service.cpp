@@ -13,6 +13,8 @@
 #include <signal.h>
 #include <grp.h>
 #include <boost/asio/co_spawn.hpp>
+#include <boost/asio/detached.hpp>
+#include <boost/asio/this_coro.hpp>
 #include <boost/asio/use_future.hpp>
 #include <string_view>
 #include <stdexcept>
@@ -392,18 +394,121 @@ FStoreGuid f_store_guid_for_identity(local::Identity identity) noexcept {
     return result;
 }
 
-SidecarRuntime::SidecarRuntime(RuntimeConfig config) : config_(std::move(config)) {
-    if (config_.f_store_guid == FStoreGuid{})
+namespace {
+
+RuntimeConfig validate_runtime_config(RuntimeConfig config) {
+    if (config.f_store_guid == FStoreGuid{})
         throw std::invalid_argument("sidecar runtime requires a nonzero F_STORE_GUID");
-    if (config_.max_live_handoffs != 1)
+    if (config.max_live_handoffs != 1)
         throw std::invalid_argument("sidecar runtime supports exactly one live handoff");
-    endpoint_ = std::make_unique<P50ServerEndpoint>(
-        config_.f_store_guid, config_.endpoint_caps, nullptr, nullptr,
-        config_.endpoint_config);
+    return config;
 }
+
+} // namespace
+
+SidecarRuntime::SidecarRuntime(RuntimeConfig config)
+    : config_(validate_runtime_config(std::move(config))),
+      endpoint_(std::make_unique<P50ServerEndpoint>(
+          config_.f_store_guid, config_.endpoint_caps, nullptr, nullptr,
+          config_.endpoint_config)),
+      endpoint_work_guard_(asio::make_work_guard(context_)),
+      endpoint_owner_thread_([this] { endpoint_owner_loop(); }) {}
 
 SidecarRuntime::~SidecarRuntime() {
     stop();
+    endpoint_work_guard_.reset();
+    if (endpoint_owner_thread_.joinable())
+        endpoint_owner_thread_.join();
+}
+
+void SidecarRuntime::endpoint_owner_loop() noexcept {
+    try {
+        context_.run();
+    } catch (...) {
+        // Every endpoint coroutine converts its own failure into a result. If
+        // an unexpected executor failure still escapes, let teardown drain
+        // rather than allowing an exception to cross the worker boundary.
+        endpoint_owner_failed_.store(true, std::memory_order_release);
+        context_.stop();
+    }
+}
+
+boost::asio::awaitable<void> SidecarRuntime::run_endpoint_on_owner(
+    int adopted_fd, EndpointIoControl endpoint_control,
+    std::promise<EndpointOwnerResult> completion) {
+    int owned_fd = adopted_fd;
+    try {
+        EndpointOwnerResult owner_result;
+        if (stop_requested_.load(std::memory_order_acquire)) {
+            (void)::close(owned_fd);
+            owned_fd = -1;
+            owner_result.status = RuntimeStatus::Stopped;
+            completion.set_value(std::move(owner_result));
+            co_return;
+        }
+
+        const auto executor = co_await boost::asio::this_coro::executor;
+        boost::system::error_code adoption_error;
+        const int fd_for_adoption = owned_fd;
+        owned_fd = -1;
+        std::optional<asio::ip::tcp::socket> socket =
+            P50ServerEndpoint::adopt_connected_fd(executor, fd_for_adoption, adoption_error);
+        if (!socket) {
+            owner_result.status = RuntimeStatus::AdoptionFailed;
+            completion.set_value(std::move(owner_result));
+            co_return;
+        }
+
+        const int cancel_fd = ::dup(socket->native_handle());
+        if (cancel_fd < 0) {
+            owner_result.status = RuntimeStatus::AdoptionFailed;
+            completion.set_value(std::move(owner_result));
+            co_return;
+        }
+        const int cancel_flags = ::fcntl(cancel_fd, F_GETFD);
+        if (cancel_flags < 0 || ::fcntl(cancel_fd, F_SETFD, cancel_flags | FD_CLOEXEC) < 0) {
+            (void)::close(cancel_fd);
+            owner_result.status = RuntimeStatus::AdoptionFailed;
+            completion.set_value(std::move(owner_result));
+            co_return;
+        }
+        active_cancel_fd_.store(cancel_fd, std::memory_order_release);
+        if (stop_requested_.load(std::memory_order_acquire)) {
+            cancel_active_socket();
+            owner_result.status = RuntimeStatus::Stopped;
+            completion.set_value(std::move(owner_result));
+            co_return;
+        }
+
+        live_sessions_.store(1, std::memory_order_release);
+        const ServerRunResult endpoint_result =
+            co_await endpoint_->run_adopted(std::move(*socket), std::move(endpoint_control));
+        release_active_socket();
+        live_sessions_.store(endpoint_->live_session_count(), std::memory_order_release);
+        owner_result.endpoint = endpoint_result;
+        owner_result.status = stop_requested_.load(std::memory_order_acquire)
+                                  ? RuntimeStatus::Stopped
+                                  : endpoint_result.status == ServerRunStatus::TerminalError
+                                  ? RuntimeStatus::EndpointFailed
+                                  : RuntimeStatus::Completed;
+        completion.set_value(std::move(owner_result));
+    } catch (...) {
+        if (owned_fd >= 0)
+            (void)::close(owned_fd);
+        release_active_socket();
+        try {
+            live_sessions_.store(endpoint_->live_session_count(), std::memory_order_release);
+        } catch (...) {
+            live_sessions_.store(0, std::memory_order_release);
+        }
+        EndpointOwnerResult owner_result;
+        owner_result.status = RuntimeStatus::EndpointFailed;
+        try {
+            completion.set_value(std::move(owner_result));
+        } catch (...) {
+        }
+    }
+    co_return;
 }
 
 RuntimeResult SidecarRuntime::run_one(
@@ -471,63 +576,37 @@ RuntimeResult SidecarRuntime::run_one(
         return result;
     }
 
-    boost::system::error_code adoption_error;
-    std::optional<asio::ip::tcp::socket> socket =
-        P50ServerEndpoint::adopt_connected_fd(context_.get_executor(), adopted.release(),
-                                              adoption_error);
-    if (!socket) {
-        result.status = RuntimeStatus::AdoptionFailed;
+    const int adopted_fd = adopted.release();
+    std::promise<EndpointOwnerResult> completion;
+    std::future<EndpointOwnerResult> completion_result = completion.get_future();
+    int dispatch_fd = adopted_fd;
+    try {
+        asio::co_spawn(context_,
+                       run_endpoint_on_owner(dispatch_fd, std::move(endpoint_control),
+                                             std::move(completion)),
+                       asio::detached);
+        dispatch_fd = -1;
+    } catch (...) {
+        if (dispatch_fd >= 0)
+            (void)::close(dispatch_fd);
+        result.status = RuntimeStatus::EndpointFailed;
         return result;
     }
 
-    try {
-        int cancel_fd = ::dup(socket->native_handle());
-        if (cancel_fd < 0) {
-            result.status = RuntimeStatus::AdoptionFailed;
+    for (;;) {
+        if (completion_result.wait_for(std::chrono::milliseconds(100)) ==
+            std::future_status::ready)
+            break;
+        if (endpoint_owner_failed_.load(std::memory_order_acquire)) {
+            result.status = RuntimeStatus::EndpointFailed;
             return result;
         }
-        const int cancel_flags = ::fcntl(cancel_fd, F_GETFD);
-        if (cancel_flags < 0 || ::fcntl(cancel_fd, F_SETFD, cancel_flags | FD_CLOEXEC) < 0) {
-            (void)::close(cancel_fd);
-            result.status = RuntimeStatus::AdoptionFailed;
-            return result;
-        }
-        active_cancel_fd_.store(cancel_fd, std::memory_order_release);
-        if (stop_requested_.load(std::memory_order_acquire)) {
-            cancel_active_socket();
-            result.status = RuntimeStatus::Stopped;
-            return result;
-        }
-        context_.restart();
-        // Publish a bounded in-flight marker before entering Asio.  The
-        // endpoint's owner-thread count is refreshed after the coroutine
-        // returns; this marker lets a concurrent normal-thread stop observe
-        // that cancellation is now required even before coroutine startup.
-        live_sessions_.store(1, std::memory_order_release);
-        std::future<ServerRunResult> endpoint_result = asio::co_spawn(
-            context_, endpoint_->run_adopted(std::move(*socket), std::move(endpoint_control)),
-            asio::use_future);
-        context_.run();
-        release_active_socket();
-        result.endpoint = endpoint_result.get();
-        live_sessions_.store(endpoint_->live_session_count(), std::memory_order_release);
-        result.status = stop_requested_.load(std::memory_order_acquire)
-                          ? RuntimeStatus::Stopped
-                          : result.endpoint->status == ServerRunStatus::TerminalError
-                          ? RuntimeStatus::EndpointFailed
-                          : RuntimeStatus::Completed;
-    } catch (...) {
-        release_active_control();
-        release_active_socket();
-        // SessionRegistration is the endpoint's cleanup lease.  Snapshot its
-        // post-failure count while still on the endpoint owner thread.
-        try {
-            live_sessions_.store(endpoint_->live_session_count(), std::memory_order_release);
-        } catch (...) {
-            live_sessions_.store(0, std::memory_order_release);
-        }
-        result.status = RuntimeStatus::EndpointFailed;
     }
+    const EndpointOwnerResult owner_result = completion_result.get();
+    result.status = owner_result.status;
+    result.endpoint = owner_result.endpoint;
+    if (result.status == RuntimeStatus::EndpointFailed)
+        live_sessions_.store(0, std::memory_order_release);
     return result;
 }
 

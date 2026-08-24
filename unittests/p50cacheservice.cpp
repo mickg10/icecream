@@ -19,6 +19,7 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <atomic>
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/use_future.hpp>
@@ -674,6 +675,16 @@ void test_runtime_zstd_tu_af_unix_loopback() {
     service::SidecarRuntime runtime(std::move(config));
     RuntimeCase control = authenticated_runtime_pair();
     const local::HandoffRequest request{{7, 1}, 1};
+    std::thread::id first_caller_id;
+    std::thread::id second_caller_id;
+    std::thread::id first_owner_id;
+    std::thread::id second_owner_id;
+    std::atomic<bool> first_runtime_finished{false};
+    std::atomic<bool> release_first_runtime{false};
+    EndpointIoControl first_endpoint_control;
+    first_endpoint_control.before_completion_check = [&](CompletionStamp&) {
+        first_owner_id = std::this_thread::get_id();
+    };
     auto authority = std::make_shared<P50PreparationAuthority>(Id128::from_u64(9002));
     P50ClientEndpoint client(authority);
 
@@ -691,9 +702,14 @@ void test_runtime_zstd_tu_af_unix_loopback() {
 
     service::RuntimeResult runtime_result;
     std::thread runtime_thread([&] {
+        first_caller_id = std::this_thread::get_id();
         runtime_result = runtime.run_one(
             control.receiver, request,
-            std::chrono::steady_clock::now() + std::chrono::seconds(3));
+            std::chrono::steady_clock::now() + std::chrono::seconds(3),
+            std::move(first_endpoint_control));
+        first_runtime_finished.store(true, std::memory_order_release);
+        while (!release_first_runtime.load(std::memory_order_acquire))
+            std::this_thread::yield();
     });
     const int accepted = ::accept(listener, nullptr, nullptr);
     CHECK(accepted >= 0);
@@ -702,7 +718,11 @@ void test_runtime_zstd_tu_af_unix_loopback() {
     local::FdHandoffSender sender{local::HandoffFd(accepted)};
     const local::FdHandoffResult sender_result = sender.send(
         control.sender, request, std::chrono::steady_clock::now() + std::chrono::seconds(3));
-    runtime_thread.join();
+    const auto first_done_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!first_runtime_finished.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < first_done_deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    CHECK(first_runtime_finished.load(std::memory_order_acquire));
     client_thread.join();
     const ClientRunResult client_value = client_result.get();
     CHECK(sender_result.status == local::FdHandoffStatus::Accepted);
@@ -718,6 +738,10 @@ void test_runtime_zstd_tu_af_unix_loopback() {
     // session cleanup must leave no live registration between them.
     const std::vector<uint8_t> second_input(input.rbegin(), input.rend());
     observed.clear();
+    EndpointIoControl second_endpoint_control;
+    second_endpoint_control.before_completion_check = [&](CompletionStamp&) {
+        second_owner_id = std::this_thread::get_id();
+    };
     RuntimeCase second_control = authenticated_runtime_pair();
     auto second_authority = std::make_shared<P50PreparationAuthority>(Id128::from_u64(9012));
     P50ClientEndpoint second_client(second_authority);
@@ -735,9 +759,11 @@ void test_runtime_zstd_tu_af_unix_loopback() {
     });
     service::RuntimeResult second_runtime_result;
     std::thread second_runtime_thread([&] {
+        second_caller_id = std::this_thread::get_id();
         second_runtime_result = runtime.run_one(
             second_control.receiver, {{7, 1}, 2},
-            std::chrono::steady_clock::now() + std::chrono::seconds(3));
+            std::chrono::steady_clock::now() + std::chrono::seconds(3),
+            std::move(second_endpoint_control));
     });
     const int second_accepted = ::accept(second_listener, nullptr, nullptr);
     CHECK(second_accepted >= 0);
@@ -749,6 +775,8 @@ void test_runtime_zstd_tu_af_unix_loopback() {
     second_runtime_thread.join();
     second_client_thread.join();
     const ClientRunResult second_client_value = second_client_result.get();
+    release_first_runtime.store(true, std::memory_order_release);
+    runtime_thread.join();
     CHECK(second_sender_result.status == local::FdHandoffStatus::Accepted);
     CHECK(second_runtime_result.handoff.status == local::FdHandoffStatus::Accepted);
     CHECK(second_runtime_result.status == service::RuntimeStatus::Completed);
@@ -757,6 +785,10 @@ void test_runtime_zstd_tu_af_unix_loopback() {
     CHECK(second_client_value.status == ClientRunStatus::Committed);
     CHECK(observed == second_input);
     CHECK(runtime.live_handoff_count() == 0 && runtime.live_session_count() == 0);
+    CHECK(first_caller_id != second_caller_id);
+    CHECK(first_owner_id == second_owner_id);
+    CHECK(first_owner_id != first_caller_id);
+    CHECK(second_owner_id != second_caller_id);
 }
 
 void test_runtime_stop_interrupts_active_endpoint() {

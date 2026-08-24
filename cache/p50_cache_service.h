@@ -11,15 +11,18 @@
 #include <cstdint>
 #include <chrono>
 #include <atomic>
+#include <future>
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 
 #include "p50_endpoint.h"
 #include "p50_fd_handoff.h"
 #include "p50_local_transport.h"
 
 #include <boost/asio/awaitable.hpp>
+#include <boost/asio/executor_work_guard.hpp>
 #include <boost/asio/io_context.hpp>
 
 namespace icecc::p50::service {
@@ -79,6 +82,19 @@ public:
     [[nodiscard]] FStoreGuid f_store_guid() const noexcept { return config_.f_store_guid; }
 
 private:
+    struct EndpointOwnerResult {
+        RuntimeStatus status = RuntimeStatus::EndpointFailed;
+        std::optional<ServerRunResult> endpoint;
+    };
+
+    using EndpointWorkGuard =
+        boost::asio::executor_work_guard<boost::asio::io_context::executor_type>;
+
+    boost::asio::awaitable<void> run_endpoint_on_owner(
+        int adopted_fd, EndpointIoControl endpoint_control,
+        std::promise<EndpointOwnerResult> completion);
+    void endpoint_owner_loop() noexcept;
+
     void cancel_active_socket() noexcept;
     void release_active_socket() noexcept;
     void cancel_active_control() noexcept;
@@ -87,6 +103,9 @@ private:
     RuntimeConfig config_;
     boost::asio::io_context context_;
     std::unique_ptr<P50ServerEndpoint> endpoint_;
+    EndpointWorkGuard endpoint_work_guard_;
+    std::thread endpoint_owner_thread_;
+    std::atomic<bool> endpoint_owner_failed_{false};
     std::atomic_flag busy_ = ATOMIC_FLAG_INIT;
     std::atomic<bool> stop_requested_{false};
     std::atomic<size_t> live_sessions_{0};
