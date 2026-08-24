@@ -18,6 +18,7 @@
 #include <optional>
 #include <string>
 #include <vector>
+#include <sys/types.h>
 
 namespace icecc::p50::daemon {
 
@@ -94,10 +95,11 @@ public:
 
     // Starts/recoveries are bounded by max_attempts_per_recovery and the
     // adapter-owned rolling restart budget.  `update`, when supplied, is
-    // filled with ordered advertisement transitions from this call.
+    // filled with ordered advertisement transitions from this call.  The
+    // boolean is true exactly when the resulting advertisement is present.
     bool start(advertisement::Update* update = nullptr) noexcept;
     bool poll(advertisement::Update* update = nullptr) noexcept;
-    void shutdown() noexcept;
+    void shutdown(advertisement::Update* update = nullptr) noexcept;
 
     // The daemon supplies an observation of its already-bound public socket.
     // No descriptor ownership crosses this boundary.
@@ -124,6 +126,18 @@ public:
         return supervisor_.get();
     }
 
+#if defined(ICECC_P50_DAEMON_SIDECAR_ADAPTER_TEST_HOOKS)
+    // Compile-time-only fault injection for otherwise unreachable uint64_t
+    // boundaries.  Production objects are built without this macro.
+    void test_force_attempt(uint64_t value) noexcept { attempt_ = value; }
+    void test_force_counter_state(uint64_t cumulative, uint64_t prior,
+                                  bool prior_observed) noexcept {
+        cumulative_post_ready_exits_ = cumulative;
+        prior_supervisor_post_ready_exits_ = prior;
+        prior_counter_observed_ = prior_observed;
+    }
+#endif
+
 private:
     bool begin_attempt(bool recovery) noexcept;
     bool attach_current() noexcept;
@@ -132,6 +146,8 @@ private:
     bool reserve_outer_restart() noexcept;
     bool next_attempt() noexcept;
     bool make_attempt_node() noexcept;
+    bool capture_socket_node() noexcept;
+    bool runtime_nodes_valid() const noexcept;
     void cleanup_attempt_node() noexcept;
     void disable_relationship() noexcept;
     void apply_observation(advertisement::Update& update) noexcept;
@@ -148,6 +164,10 @@ private:
     advertisement::Controller controller_;
     std::string socket_path_;
     std::string attempt_directory_;
+    dev_t attempt_directory_device_ = 0;
+    ino_t attempt_directory_inode_ = 0;
+    dev_t socket_device_ = 0;
+    ino_t socket_inode_ = 0;
     uint64_t attempt_ = 0;
     uint64_t cumulative_post_ready_exits_ = 0;
     uint64_t prior_supervisor_post_ready_exits_ = 0;

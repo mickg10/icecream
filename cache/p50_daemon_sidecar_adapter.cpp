@@ -7,11 +7,6 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-namespace icecc::p50::local {
-Connection connect_unix_until(
-    const std::string&, std::chrono::steady_clock::time_point, Status*) noexcept;
-} // namespace icecc::p50::local
-
 namespace icecc::p50::daemon {
 namespace {
 
@@ -44,7 +39,7 @@ bool private_directory(const Config& config) noexcept
     if (::lstat(config.runtime_directory.c_str(), &info) != 0 ||
         !S_ISDIR(info.st_mode) || info.st_uid != config.expected_daemon_uid ||
         info.st_gid != config.expected_daemon_gid ||
-        (info.st_mode & 0077) != 0)
+        (info.st_mode & 07777) != 0700)
         return false;
     return true;
 }
@@ -54,7 +49,7 @@ bool owned_attempt_directory(const std::string& path, const Config& config) noex
     struct stat info{};
     return ::lstat(path.c_str(), &info) == 0 && S_ISDIR(info.st_mode) &&
            info.st_uid == config.expected_daemon_uid &&
-           info.st_gid == config.expected_daemon_gid && (info.st_mode & 0077) == 0;
+           info.st_gid == config.expected_daemon_gid && (info.st_mode & 07777) == 0700;
 }
 
 } // namespace
@@ -74,13 +69,18 @@ bool DaemonSidecarAdapter::valid_config(const Config& config) noexcept
     if (!sidecar::Supervisor::valid_config(sidecar::Config{
             config.executable, {}, config.readiness_timeout,
             config.shutdown_timeout, config.restart_window, 0, 1}) ||
-        config.executable.front() != '/' || config.runtime_directory.empty() ||
+        config.executable.empty() || config.executable.front() != '/' ||
+        config.runtime_directory.empty() ||
         config.runtime_directory.front() != '/' || has_nul(config.runtime_directory) ||
         config.runtime_directory.size() >= 180 ||
         config.generation == 0 || config.public_listener_port == 0 ||
         config.public_listener_port > std::numeric_limits<uint16_t>::max() ||
         !valid_id(config.expected_daemon_uid) || !valid_gid(config.expected_daemon_gid) ||
         !valid_id(config.expected_service_uid) || !valid_gid(config.expected_service_gid) ||
+        config.expected_daemon_uid != static_cast<uint64_t>(::geteuid()) ||
+        config.expected_daemon_gid != static_cast<uint64_t>(::getegid()) ||
+        config.expected_service_uid != config.expected_daemon_uid ||
+        config.expected_service_gid != config.expected_daemon_gid ||
         !bounded_positive(config.readiness_timeout) ||
         !bounded_positive(config.connect_timeout) ||
         !bounded_positive(config.handoff_timeout) ||
@@ -90,9 +90,12 @@ bool DaemonSidecarAdapter::valid_config(const Config& config) noexcept
         config.max_attempts_per_recovery > 100000 ||
         (config.drop_uid.has_value() != config.drop_gid.has_value()))
         return false;
-    if (config.drop_uid.has_value() &&
-        (!valid_id(*config.drop_uid) || !valid_gid(*config.drop_gid) ||
-         *config.drop_uid == 0 || *config.drop_gid == 0))
+    // The current local connector deliberately requires private pathname
+    // ownership by the daemon's effective identity.  iceccd is deployed as
+    // the unprivileged icecc user, so a distinct pre-bind drop would make a
+    // valid SO_PEERCRED relationship unreachable.  Keep the explicit fields
+    // for launch-argument compatibility but reject that impossible mode.
+    if (config.drop_uid.has_value())
         return false;
     return private_directory(config);
 }
@@ -123,6 +126,42 @@ bool DaemonSidecarAdapter::next_attempt() noexcept
     return true;
 }
 
+bool DaemonSidecarAdapter::runtime_nodes_valid() const noexcept
+{
+    if (!private_directory(config_) || attempt_directory_.empty() || socket_path_.empty())
+        return false;
+
+    struct stat directory_info{};
+    if (!owned_attempt_directory(attempt_directory_, config_) ||
+        ::lstat(attempt_directory_.c_str(), &directory_info) != 0 ||
+        directory_info.st_dev != attempt_directory_device_ ||
+        directory_info.st_ino != attempt_directory_inode_)
+        return false;
+
+    struct stat socket_info{};
+    return ::lstat(socket_path_.c_str(), &socket_info) == 0 &&
+           S_ISSOCK(socket_info.st_mode) &&
+           socket_info.st_uid == config_.expected_service_uid &&
+           socket_info.st_gid == config_.expected_service_gid &&
+           (socket_info.st_mode & 07777) == 0600 &&
+           socket_info.st_dev == socket_device_ &&
+           socket_info.st_ino == socket_inode_;
+}
+
+bool DaemonSidecarAdapter::capture_socket_node() noexcept
+{
+    struct stat socket_info{};
+    if (::lstat(socket_path_.c_str(), &socket_info) != 0 ||
+        !S_ISSOCK(socket_info.st_mode) ||
+        socket_info.st_uid != config_.expected_service_uid ||
+        socket_info.st_gid != config_.expected_service_gid ||
+        (socket_info.st_mode & 07777) != 0600)
+        return false;
+    socket_device_ = socket_info.st_dev;
+    socket_inode_ = socket_info.st_ino;
+    return true;
+}
+
 bool DaemonSidecarAdapter::make_attempt_node() noexcept
 {
     const std::string stem = config_.runtime_directory + "/s2-g" +
@@ -135,11 +174,15 @@ bool DaemonSidecarAdapter::make_attempt_node() noexcept
     // SIGKILLed while retaining a listener node, and that identity is stale.
     if (::mkdir(stem.c_str(), kPrivateDirectoryMode) != 0)
         return false;
-    if (!owned_attempt_directory(stem, config_)) {
+    struct stat directory_info{};
+    if (!owned_attempt_directory(stem, config_) ||
+        ::lstat(stem.c_str(), &directory_info) != 0) {
         (void)::rmdir(stem.c_str());
         return false;
     }
     attempt_directory_ = stem;
+    attempt_directory_device_ = directory_info.st_dev;
+    attempt_directory_inode_ = directory_info.st_ino;
     socket_path_ = socket;
     return true;
 }
@@ -148,15 +191,39 @@ void DaemonSidecarAdapter::cleanup_attempt_node() noexcept
 {
     if (attempt_directory_.empty()) {
         socket_path_.clear();
+        attempt_directory_device_ = 0;
+        attempt_directory_inode_ = 0;
+        socket_device_ = 0;
+        socket_inode_ = 0;
         return;
     }
-    // Never unlink a socket by pathname here.  The service owns listener-node
-    // removal and performs its own inode comparison; rmdir succeeds only if
-    // that cleanup really left our private attempt directory empty.
-    if (owned_attempt_directory(attempt_directory_, config_))
+    // A graceful service removes its own listener.  After SIGKILL, the
+    // supervisor has established child/group death before reaching here, so
+    // remove only the exact socket inode captured from this exact attempt.
+    // A replacement pathname or directory is never touched.
+    struct stat directory_info{};
+    const bool same_directory = owned_attempt_directory(attempt_directory_, config_) &&
+        ::lstat(attempt_directory_.c_str(), &directory_info) == 0 &&
+        directory_info.st_dev == attempt_directory_device_ &&
+        directory_info.st_ino == attempt_directory_inode_;
+    if (same_directory) {
+        struct stat socket_info{};
+        if (::lstat(socket_path_.c_str(), &socket_info) == 0 &&
+            S_ISSOCK(socket_info.st_mode) &&
+            socket_info.st_dev == socket_device_ &&
+            socket_info.st_ino == socket_inode_ &&
+            socket_info.st_uid == config_.expected_service_uid &&
+            socket_info.st_gid == config_.expected_service_gid &&
+            (socket_info.st_mode & 07777) == 0600)
+            (void)::unlink(socket_path_.c_str());
         (void)::rmdir(attempt_directory_.c_str());
+    }
     attempt_directory_.clear();
     socket_path_.clear();
+    attempt_directory_device_ = 0;
+    attempt_directory_inode_ = 0;
+    socket_device_ = 0;
+    socket_inode_ = 0;
 }
 
 void DaemonSidecarAdapter::disable_relationship() noexcept
@@ -219,6 +286,13 @@ bool DaemonSidecarAdapter::begin_attempt(bool /*recovery*/) noexcept
         state_ = AdapterState::Starting;
         if (!supervisor_->start()) {
             fail(AdapterError::StartupFailure);
+            supervisor_->shutdown();
+            supervisor_.reset();
+            cleanup_attempt_node();
+            return false;
+        }
+        if (!capture_socket_node()) {
+            fail(AdapterError::RuntimeNodeFailure);
             supervisor_->shutdown();
             supervisor_.reset();
             cleanup_attempt_node();
@@ -309,7 +383,8 @@ void DaemonSidecarAdapter::apply_observation(advertisement::Update& update) noex
     observation.supervisor_state = supervisor_ != nullptr
                                        ? supervisor_->state()
                                        : sidecar::State::Stopped;
-    observation.private_relationship_authenticated = authenticated();
+    observation.private_relationship_authenticated =
+        authenticated() && runtime_nodes_valid();
     observation.cumulative_post_ready_exits = cumulative_post_ready_exits_;
     const advertisement::Update observed = controller_.observe(observation);
     append_update(update, observed);
@@ -339,8 +414,11 @@ bool DaemonSidecarAdapter::recover(advertisement::Update& update) noexcept
             apply_observation(update);
             return true;
         }
+        if (last_error_ == AdapterError::AttemptOverflow || counter_failed_)
+            break;
     }
-    fail(AdapterError::AttemptExhausted);
+    if (last_error_ != AdapterError::AttemptOverflow && !counter_failed_)
+        fail(AdapterError::AttemptExhausted);
     apply_observation(update);
     return false;
 }
@@ -359,7 +437,7 @@ bool DaemonSidecarAdapter::start(advertisement::Update* result) noexcept
         apply_observation(update);
         if (result != nullptr)
             *result = update;
-        return true;
+        return controller_.snapshot().present();
     }
     shutdown();
     state_ = AdapterState::Absent;
@@ -372,10 +450,13 @@ bool DaemonSidecarAdapter::start(advertisement::Update* result) noexcept
             apply_observation(update);
             if (result != nullptr)
                 *result = update;
-            return true;
+            return controller_.snapshot().present();
         }
+        if (last_error_ == AdapterError::AttemptOverflow || counter_failed_)
+            break;
     }
-    fail(AdapterError::AttemptExhausted);
+    if (last_error_ != AdapterError::AttemptOverflow && !counter_failed_)
+        fail(AdapterError::AttemptExhausted);
     apply_observation(update);
     if (result != nullptr)
         *result = update;
@@ -398,10 +479,10 @@ bool DaemonSidecarAdapter::poll(advertisement::Update* result) noexcept
         return false;
     }
     if (supervisor_ == nullptr || supervisor_->state() != sidecar::State::Ready) {
-        const bool recovered = recover(update);
+        (void)recover(update);
         if (result != nullptr)
             *result = update;
-        return recovered;
+        return controller_.snapshot().present();
     }
 
     const bool was_ready = supervisor_->poll();
@@ -427,10 +508,26 @@ bool DaemonSidecarAdapter::poll(advertisement::Update* result) noexcept
         dispatcher_.reset();
         supervisor_.reset();
         cleanup_attempt_node();
-        const bool recovered = recover(update);
+        (void)recover(update);
         if (result != nullptr)
             *result = update;
-        return recovered;
+        return controller_.snapshot().present();
+    }
+    if (!runtime_nodes_valid()) {
+        // The pathname trust boundary is a live invariant, not merely a
+        // startup precondition.  Check it after observing child exit so a
+        // service-owned unlink during normal death is still counted as a
+        // post-READY exit, then withdraw before terminating a live child.
+        disable_relationship();
+        fail(AdapterError::RuntimeNodeFailure);
+        apply_observation(update);
+        supervisor_->shutdown();
+        dispatcher_.reset();
+        supervisor_.reset();
+        cleanup_attempt_node();
+        if (result != nullptr)
+            *result = update;
+        return false;
     }
     if (!authenticated()) {
         // A successful one-shot handoff consumes the dispatcher relationship.
@@ -444,7 +541,7 @@ bool DaemonSidecarAdapter::poll(advertisement::Update* result) noexcept
     }
     if (result != nullptr)
         *result = update;
-    return authenticated();
+    return controller_.snapshot().present();
 }
 
 void DaemonSidecarAdapter::fail(AdapterError error) noexcept
@@ -454,10 +551,14 @@ void DaemonSidecarAdapter::fail(AdapterError error) noexcept
         state_ = AdapterState::Absent;
 }
 
-void DaemonSidecarAdapter::shutdown() noexcept
+void DaemonSidecarAdapter::shutdown(advertisement::Update* result) noexcept
 {
-    if (state_ == AdapterState::ShuttingDown)
+    advertisement::Update update;
+    if (state_ == AdapterState::ShuttingDown) {
+        if (result != nullptr)
+            *result = update;
         return;
+    }
     state_ = AdapterState::ShuttingDown;
     // Relationship first: no ordinary daemon channel may hand off while the
     // child is being terminated.
@@ -468,8 +569,15 @@ void DaemonSidecarAdapter::shutdown() noexcept
         supervisor_.reset();
     }
     cleanup_attempt_node();
+    // Advance the controller and return the ordered withdrawal so the Login
+    // owner cannot retain stale presence after sidecar ownership has ended.
+    append_update(update, controller_.observe(advertisement::Observation{
+                              false, 0, sidecar::State::Stopped, false,
+                              cumulative_post_ready_exits_}));
     state_ = AdapterState::Stopped;
     last_error_ = AdapterError::None;
+    if (result != nullptr)
+        *result = update;
 }
 
 } // namespace icecc::p50::daemon

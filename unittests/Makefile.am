@@ -78,11 +78,15 @@ p50endpoint_SOURCES = p50_endpoint_test.cpp
 p50readyadvertisement_SOURCES = p50_ready_advertisement_test.cpp
 p50daemonsidecaradapter_SOURCES = p50_daemon_sidecar_adapter_test.cpp \
 	../cache/p50_daemon_cache_dispatch.cpp ../cache/p50_fd_handoff.cpp
+p50daemonsidecaradapter_CPPFLAGS = $(AM_CPPFLAGS) \
+	-DICECC_P50_DAEMON_SIDECAR_ADAPTER_TEST_HOOKS
 p50daemonsidecaradapter_CXXFLAGS = -pthread
 p50daemonsidecaradapter_LDFLAGS = -pthread
 p50daemonsidecaradapter_LDADD = ../cache/libp50daemonsidecaradapter.a \
 	../cache/libp50readyadvertisement.a ../cache/libp50sidecarsupervisor.a \
 	../cache/libp50localtransport.a ../services/libicecc.la
+p50daemonsidecaradapter_DEPENDENCIES = $(p50daemonsidecaradapter_LDADD) \
+	../cache/icecc-cache-service
 digest128bench_SOURCES = digest128_bench.cpp
 lockexec_SOURCES = lockexec.cpp
 lockexec_LDADD = ../client/libclient.a ../services/libicecc.la
