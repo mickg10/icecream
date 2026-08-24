@@ -8,6 +8,7 @@
 
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/ip/tcp.hpp>
+#include <boost/system/error_code.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -311,6 +312,12 @@ private:
 
 class P50ServerEndpoint {
 public:
+    // Takes ownership of fd on every path.  Success returns one move-only,
+    // CLOEXEC, connected TCP socket; failure closes fd and returns nullopt.
+    static std::optional<boost::asio::ip::tcp::socket> adopt_connected_fd(
+        boost::asio::any_io_executor executor, int fd,
+        boost::system::error_code& error);
+
     explicit P50ServerEndpoint(FStoreGuid f_store_guid, EndpointCaps caps = {},
                                CompletionLog* completions = nullptr,
                                ActionTrace* actions = nullptr,
@@ -321,6 +328,11 @@ public:
 
     boost::asio::awaitable<ServerRunResult> accept_one(boost::asio::ip::tcp::acceptor& acceptor,
                                                        EndpointIoControl control = {});
+
+    // Consumes exactly one already-connected socket.  No accept/listen or read
+    // occurs before ownership reaches the shared server transaction reducer.
+    boost::asio::awaitable<ServerRunResult> run_adopted(
+        boost::asio::ip::tcp::socket socket, EndpointIoControl control = {});
 
     void reset_store(FStoreGuid new_guid);
     [[nodiscard]] InputCursor attach_input(InputRecordKey key) const;
@@ -335,6 +347,10 @@ public:
     last_committed_input(CStoreGuid c_store_guid) const;
 
 private:
+    boost::asio::awaitable<ServerRunResult> run_connected(
+        boost::asio::ip::tcp::socket socket, uint64_t session_serial,
+        EndpointIoControl control, boost::asio::ip::tcp::acceptor* acceptor);
+
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
