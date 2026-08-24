@@ -1,7 +1,12 @@
 #include "p50_completion_record.h"
+#include "workit.h"
+
+#include <comm.h>
 
 #include <algorithm>
 #include <cerrno>
+#include <fcntl.h>
+#include <memory>
 #include <stdexcept>
 #include <unistd.h>
 
@@ -40,13 +45,20 @@ bool valid_result(P50CompletionResult result, int32_t status) {
 }
 
 bool valid_record(const P50CompletionRecord& record) {
-    return record.disposition == P50CompletionDisposition::Completed &&
+    const bool disposition_valid =
+        record.disposition == P50CompletionDisposition::Accepted ||
+        record.disposition == P50CompletionDisposition::DefinitiveCancel ||
+        record.disposition == P50CompletionDisposition::AttemptCancelOnly;
+    return disposition_valid &&
            valid_result(record.result, record.result_status) &&
+           record.stats[JobStatistics::exit_code] ==
+               static_cast<uint32_t>(record.result_status) &&
            record.job_id != 0 && record.assignment_epoch != 0 &&
            record.assignment_nonce != 0 &&
            record.input_profile == CompileInputIdentity::ZstdTuProfile &&
-           nonzero(record.c_store_guid) && record.attempt_id != 0 &&
-           record.request_id != 0;
+           nonzero(record.c_store_guid) &&
+           record.attempt_id == record.assignment_nonce &&
+           record.request_id == record.assignment_nonce;
 }
 
 void put_u16(std::array<uint8_t, kP50CompletionRecordWireSize>& bytes,
@@ -109,37 +121,20 @@ bool same_identity(const P50CompletionRecord& record, const CompileJob& job) {
            record.request_id == input.request_id;
 }
 
-bool read_full(int fd, uint8_t* bytes, std::size_t size) noexcept {
-    std::size_t offset = 0;
-    while (offset != size) {
-        const ssize_t count = ::read(fd, bytes + offset, size - offset);
-        if (count > 0) {
-            offset += static_cast<std::size_t>(count);
-            continue;
-        }
-        if (count < 0 && errno == EINTR)
-            continue;
+bool make_nonblocking(int fd) noexcept {
+    if (fd < 0)
         return false;
-    }
-    return true;
-}
-
-bool only_eof(int fd) noexcept {
-    uint8_t trailing = 0;
-    for (;;) {
-        const ssize_t count = ::read(fd, &trailing, 1);
-        if (count == 0)
-            return true;
-        if (count < 0 && errno == EINTR)
-            continue;
+    const int flags = ::fcntl(fd, F_GETFL, 0);
+    if (flags < 0)
         return false;
-    }
+    return ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
 }
 
 } // namespace
 
 bool make_p50_completion_record(const CompileJob& job, const uint32_t stats[8],
                                 int32_t result_status,
+                                P50CompletionDisposition disposition,
                                 P50CompletionRecord* out) noexcept {
     if (out == nullptr || stats == nullptr || !job.compileInputIdentityValid() ||
         !job.usesP50Input() || job.jobID() == 0 || !job.hasAssignmentIdentity())
@@ -150,7 +145,7 @@ bool make_p50_completion_record(const CompileJob& job, const uint32_t stats[8],
     result.result_status = result_status;
     result.result = result_status == 0 ? P50CompletionResult::Succeeded
                                        : P50CompletionResult::Failed;
-    result.disposition = P50CompletionDisposition::Completed;
+    result.disposition = disposition;
     result.job_id = job.jobID();
     result.assignment_epoch = job.assignmentEpoch();
     result.assignment_nonce = job.assignmentNonce();
@@ -229,23 +224,43 @@ bool decode_p50_completion_record(std::span<const uint8_t> bytes,
     return true;
 }
 
+P50CompletionDisposition receive_p50_result_disposition(
+    MsgChannel& channel, const CompileJob& expected_job,
+    int timeout_seconds) noexcept
+{
+    try {
+        std::unique_ptr<Msg> message(
+            channel.get_msg(timeout_seconds, true));
+        if (!message || *message != Msg::RESULT_DISPOSITION)
+            return P50CompletionDisposition::AttemptCancelOnly;
+        const ResultDispositionMsg *disposition =
+            dynamic_cast<const ResultDispositionMsg *>(message.get());
+        const ResultDispositionMsg expected(
+            expected_job, ResultDispositionMsg::Accepted);
+        if (disposition == nullptr || !disposition->same_identity(expected))
+            return P50CompletionDisposition::AttemptCancelOnly;
+        if (disposition->disposition == ResultDispositionMsg::Accepted)
+            return P50CompletionDisposition::Accepted;
+        if (disposition->disposition ==
+            ResultDispositionMsg::DefinitiveCancel)
+            return P50CompletionDisposition::DefinitiveCancel;
+    } catch (...) {
+    }
+    return P50CompletionDisposition::AttemptCancelOnly;
+}
+
 bool write_p50_completion_record(int fd,
                                  const P50CompletionRecord& record) noexcept {
     try {
         const auto bytes = encode_p50_completion_record(record);
-        std::size_t offset = 0;
-        while (offset != bytes.size()) {
-            const ssize_t count = ::write(fd, bytes.data() + offset,
-                                          bytes.size() - offset);
-            if (count > 0) {
-                offset += static_cast<std::size_t>(count);
-                continue;
-            }
+        for (;;) {
+            const ssize_t count = ::write(fd, bytes.data(), bytes.size());
+            if (count == static_cast<ssize_t>(bytes.size()))
+                return true;
             if (count < 0 && errno == EINTR)
                 continue;
             return false;
         }
-        return true;
     } catch (...) {
         return false;
     }
@@ -253,17 +268,87 @@ bool write_p50_completion_record(int fd,
 
 P50CompletionObservation read_p50_completion_record(
     int fd, const CompileJob& expected_job) noexcept {
-    P50CompletionObservation observation;
-    std::array<uint8_t, kP50CompletionRecordWireSize> bytes{};
-    if (!read_full(fd, bytes.data(), bytes.size()) || !only_eof(fd))
-        return observation;
-    P50CompletionRecord record;
-    if (!decode_p50_completion_record(bytes, &record) ||
-        !same_identity(record, expected_job))
-        return observation;
-    observation.disposition = P50CompletionDisposition::Completed;
-    observation.record = record;
-    return observation;
+    P50CompletionRecordReader reader(fd, expected_job);
+    (void)reader.pump();
+    return reader.observation();
+}
+
+P50CompletionRecordReader::P50CompletionRecordReader(
+    int fd, const CompileJob& expected_job) noexcept
+    : fd_(fd), expected_job_(&expected_job)
+{
+    if (!make_nonblocking(fd_)) {
+        done_ = true;
+        result_ = P50CompletionPumpResult::AttemptCancelOnly;
+    }
+}
+
+P50CompletionPumpResult P50CompletionRecordReader::pump(
+    std::size_t max_bytes) noexcept
+{
+    if (done_)
+        return result_;
+    if (max_bytes == 0)
+        return P50CompletionPumpResult::Pending;
+
+    while (max_bytes != 0) {
+        if (!checking_eof_) {
+            const std::size_t wanted =
+                std::min(max_bytes, bytes_.size() - offset_);
+            const ssize_t count = ::read(fd_, bytes_.data() + offset_, wanted);
+            if (count > 0) {
+                offset_ += static_cast<std::size_t>(count);
+                max_bytes -= static_cast<std::size_t>(count);
+                if (offset_ == bytes_.size())
+                    checking_eof_ = true;
+                continue;
+            }
+            if (count < 0 && errno == EINTR)
+                return P50CompletionPumpResult::Pending;
+            if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+                return P50CompletionPumpResult::Pending;
+            done_ = true;
+            result_ = P50CompletionPumpResult::AttemptCancelOnly;
+            return result_;
+        }
+
+        uint8_t trailing = 0;
+        const ssize_t count = ::read(fd_, &trailing, sizeof(trailing));
+        if (count < 0 && errno == EINTR)
+            return P50CompletionPumpResult::Pending;
+        if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            return P50CompletionPumpResult::Pending;
+        if (count != 0) {
+            done_ = true;
+            result_ = P50CompletionPumpResult::AttemptCancelOnly;
+            return result_;
+        }
+
+        P50CompletionRecord record;
+        if (!decode_p50_completion_record(bytes_, &record) ||
+            !same_identity(record, *expected_job_)) {
+            done_ = true;
+            result_ = P50CompletionPumpResult::AttemptCancelOnly;
+            return result_;
+        }
+        observation_.record = record;
+        observation_.disposition = record.disposition;
+        observation_.record_valid = true;
+        done_ = true;
+        switch (record.disposition) {
+        case P50CompletionDisposition::Accepted:
+            result_ = P50CompletionPumpResult::Accepted;
+            break;
+        case P50CompletionDisposition::DefinitiveCancel:
+            result_ = P50CompletionPumpResult::DefinitiveCancel;
+            break;
+        case P50CompletionDisposition::AttemptCancelOnly:
+            result_ = P50CompletionPumpResult::AttemptCancelOnly;
+            break;
+        }
+        return result_;
+    }
+    return P50CompletionPumpResult::Pending;
 }
 
 } // namespace icecc::p50

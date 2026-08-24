@@ -55,6 +55,7 @@
 #include "serve.h"
 #include "util.h"
 #include "file_util.h"
+#include "p50_completion_record.h"
 
 #include <sys/time.h>
 
@@ -131,6 +132,36 @@ static void write_output_file( const string& file, MsgChannel* client )
             }
         throw;
     }
+}
+
+static void emit_p50_completion_and_close(
+    int& out_fd, const CompileJob& job, const unsigned int job_stat[8],
+    int result_status,
+    icecc::p50::P50CompletionDisposition disposition) noexcept
+{
+    static_assert(sizeof(unsigned int) == sizeof(uint32_t));
+    uint32_t canonical_stats[8];
+    for (unsigned i = 0; i != 8; ++i)
+        canonical_stats[i] = static_cast<uint32_t>(job_stat[i]);
+    /* work_it() historically leaves the native legacy exit-code word at zero
+       on a few synthetic failures (notably its early OOM return).  Do not
+       alter those deployed legacy bytes; the new canonical P50 record instead
+       binds its statistics word to the CompileResult status explicitly. */
+    canonical_stats[JobStatistics::exit_code] =
+        static_cast<uint32_t>(result_status);
+
+    icecc::p50::P50CompletionRecord record;
+    if (!icecc::p50::make_p50_completion_record(
+            job, canonical_stats, result_status, disposition, &record)) {
+        log_error() << "refusing invalid P50 child completion record for job "
+                    << job.jobID() << endl;
+    } else if (!icecc::p50::write_p50_completion_record(out_fd, record)) {
+        log_error() << "failed writing P50 child completion record for job "
+                    << job.jobID() << endl;
+    }
+    if (out_fd >= 0 && close(out_fd) != 0 && errno != EBADF)
+        log_perror("close failed");
+    out_fd = -1;
 }
 
 /**
@@ -381,11 +412,18 @@ int handle_connection(const string &basedir, CompileJob *job,
             throw myexception(EXIT_DISTCC_FAILED);
         }
 
-        /* wake up parent and tell him that compile finished */
-        /* if the write failed, well, doesn't matter */
-        ignore_result(write(out_fd, job_stat, sizeof(job_stat)));
-        if ((-1 == close(out_fd)) && (errno != EBADF)){
-            log_perror("close failed");
+        const bool p50_input = job->usesP50Input();
+        if (!p50_input) {
+            /* Legacy ordering and bytes are deliberately unchanged: wake the
+               parent with the native eight-word statistics block before
+               streaming any output file. */
+            /* wake up parent and tell him that compile finished */
+            /* if the write failed, well, doesn't matter */
+            ignore_result(write(out_fd, job_stat, sizeof(job_stat)));
+            if ((-1 == close(out_fd)) && (errno != EBADF)){
+                log_perror("close failed");
+            }
+            out_fd = -1;
         }
 
         if (rmsg.status == 0) {
@@ -393,6 +431,19 @@ int handle_connection(const string &basedir, CompileJob *job,
             if (rmsg.have_dwo_file) {
                 write_output_file(dwo_file, client);
             }
+        }
+
+        if (p50_input) {
+            const icecc::p50::P50CompletionDisposition disposition =
+                icecc::p50::receive_p50_result_disposition(
+                    *client, *job, 30);
+            if (disposition ==
+                icecc::p50::P50CompletionDisposition::AttemptCancelOnly) {
+                log_warning() << "missing/mismatched P50 result disposition for job "
+                              << job->jobID() << endl;
+            }
+            emit_p50_completion_and_close(
+                out_fd, *job, job_stat, rmsg.status, disposition);
         }
 
         exit_code = rmsg.status;
@@ -406,8 +457,15 @@ int handle_connection(const string &basedir, CompileJob *job,
         job_stat[JobStatistics::exit_code] = exit_code;
         if(out_fd != -1)
         {
-            ignore_result(write(out_fd, job_stat, sizeof(job_stat)));
-            close(out_fd);
+            if (job->usesP50Input()) {
+                emit_p50_completion_and_close(
+                    out_fd, *job, job_stat, exit_code,
+                    icecc::p50::P50CompletionDisposition::AttemptCancelOnly);
+            } else {
+                ignore_result(write(out_fd, job_stat, sizeof(job_stat)));
+                close(out_fd);
+                out_fd = -1;
+            }
         }
     }
 

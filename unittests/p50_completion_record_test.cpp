@@ -1,4 +1,7 @@
 #include "p50_completion_record.h"
+#include "workit.h"
+
+#include <comm.h>
 
 #include <algorithm>
 #include <array>
@@ -7,6 +10,9 @@
 #include <iostream>
 #include <span>
 #include <string_view>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -27,6 +33,48 @@ void require(bool condition, std::string_view message) {
         fail(message);
 }
 
+struct ChannelPair {
+    MsgChannel *left = nullptr;
+    MsgChannel *right = nullptr;
+    ChannelPair() = default;
+    ChannelPair(const ChannelPair&) = delete;
+    ChannelPair& operator=(const ChannelPair&) = delete;
+    ChannelPair(ChannelPair&& other) noexcept
+        : left(other.left), right(other.right)
+    {
+        other.left = other.right = nullptr;
+    }
+    ~ChannelPair()
+    {
+        delete left;
+        delete right;
+    }
+};
+
+ChannelPair make_channel_pair()
+{
+    int fds[2];
+    require(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0,
+            "socketpair failed");
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    ChannelPair pair;
+    std::thread left([&] {
+        pair.left = Service::createChannel(
+            fds[0], reinterpret_cast<sockaddr *>(&address), sizeof(address));
+    });
+    std::thread right([&] {
+        pair.right = Service::createChannel(
+            fds[1], reinterpret_cast<sockaddr *>(&address), sizeof(address));
+    });
+    left.join();
+    right.join();
+    require(pair.left != nullptr && pair.right != nullptr,
+            "channel handshake failed");
+    pair.left->protocol = pair.right->protocol = PROTOCOL_VERSION;
+    return pair;
+}
+
 void put_u32(std::array<uint8_t, kP50CompletionRecordWireSize>& bytes,
              std::size_t offset, uint32_t value) {
     bytes[offset] = static_cast<uint8_t>(value >> 24);
@@ -37,6 +85,7 @@ void put_u32(std::array<uint8_t, kP50CompletionRecordWireSize>& bytes,
 
 CompileJob complete_job() {
     CompileJob job;
+    job.setLanguage(CompileJob::Lang_C);
     job.setJobID(0x10203040);
     job.setAssignmentIdentity(0x0102030405060708ULL,
                               0x1112131415161718ULL);
@@ -48,16 +97,23 @@ CompileJob complete_job() {
     }
     input.tu_seq = 0x2122232425262728ULL;
     input.raw_bytes = 0x3132333435363738ULL;
-    input.attempt_id = 0x4142434445464748ULL;
-    input.request_id = 0x5152535455565758ULL;
+    input.attempt_id = job.assignmentNonce();
+    input.request_id = job.assignmentNonce();
     job.setCompileInputIdentity(input);
     return job;
 }
 
-P50CompletionRecord complete_record(const CompileJob& job) {
+P50CompletionRecord complete_record(
+    const CompileJob& job,
+    P50CompletionDisposition disposition = P50CompletionDisposition::Accepted,
+    int32_t status = 0) {
     const uint32_t stats[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    uint32_t bound_stats[8];
+    std::copy_n(stats, 8, bound_stats);
+    bound_stats[JobStatistics::exit_code] = static_cast<uint32_t>(status);
     P50CompletionRecord record;
-    require(make_p50_completion_record(job, stats, 0, &record),
+    require(make_p50_completion_record(
+                job, bound_stats, status, disposition, &record),
             "complete P50 job did not produce a record");
     return record;
 }
@@ -107,9 +163,36 @@ void test_exact_canonical_record() {
             "canonical record did not round-trip");
     const P50CompletionObservation observed = observe(bytes, job);
     require(observed.valid() && observed.record.result_status == 0,
-            "valid split record was not completed");
-    require(!observed.closes_logical_job(),
-            "reusable observation unexpectedly owns lifecycle closure");
+            "valid split record was not accepted");
+    require(observed.disposition == P50CompletionDisposition::Accepted &&
+                observed.terminal_disposition() &&
+                !observed.closes_logical_job(),
+            "accepted record did not preserve its terminal disposition");
+}
+
+void test_all_dispositions_and_statuses() {
+    const CompileJob job = complete_job();
+    const P50CompletionObservation accepted = observe(
+        encode_p50_completion_record(complete_record(
+            job, P50CompletionDisposition::Accepted)), job);
+    require(accepted.valid() && accepted.terminal_disposition() &&
+                !accepted.closes_logical_job(),
+            "accepted disposition was not terminal");
+
+    const P50CompletionObservation cancelled = observe(
+        encode_p50_completion_record(complete_record(
+            job, P50CompletionDisposition::DefinitiveCancel, 73)), job);
+    require(cancelled.valid() && cancelled.terminal_disposition() &&
+                !cancelled.closes_logical_job() &&
+                cancelled.record.result == P50CompletionResult::Failed,
+            "definitive cancel did not preserve failed result status");
+
+    const P50CompletionObservation attempt_only = observe(
+        encode_p50_completion_record(complete_record(
+            job, P50CompletionDisposition::AttemptCancelOnly)), job);
+    require(attempt_only.valid() && !attempt_only.terminal_disposition() &&
+                !attempt_only.closes_logical_job(),
+            "attempt-only record became terminal");
 }
 
 void test_short_trailing_header_and_state_rejection() {
@@ -132,13 +215,20 @@ void test_short_trailing_header_and_state_rejection() {
     reserved[11] = 1;
     require_attempt_only(observe(reserved, job), "reserved bits were accepted");
     auto disposition = canonical;
-    put_u32(disposition, 52, static_cast<uint32_t>(
-                                  P50CompletionDisposition::AttemptCancelOnly));
+    put_u32(disposition, 52, 99);
     require_attempt_only(observe(disposition, job),
-                         "attempt-only disposition was accepted from a worker");
+                         "unknown disposition was accepted from a worker");
     auto result = canonical;
     put_u32(result, 48, 99);
     require_attempt_only(observe(result, job), "unknown result state was accepted");
+    auto status_mismatch = canonical;
+    put_u32(status_mismatch, 44, 17);
+    require_attempt_only(observe(status_mismatch, job),
+                         "result/status mismatch was accepted");
+    auto stats_mismatch = canonical;
+    put_u32(stats_mismatch, 12 + 4 * JobStatistics::exit_code, 17);
+    require_attempt_only(observe(stats_mismatch, job),
+                         "statistics/status mismatch was accepted");
 }
 
 void test_identity_mutations() {
@@ -176,6 +266,51 @@ void test_missing_and_writer() {
     const P50CompletionObservation written = read_p50_completion_record(fds[0], job);
     ::close(fds[0]);
     require(written.valid(), "writer output was not read as complete");
+
+    require(::pipe(fds) == 0, "pipe failed");
+    require(write_p50_completion_record(fds[1], record),
+            "open-writer fixture failed");
+    P50CompletionRecordReader reader(fds[0], job);
+    ::alarm(2);
+    require(reader.pump() == P50CompletionPumpResult::Pending,
+            "open writer was accepted before EOF");
+    ::alarm(0);
+    ::close(fds[1]);
+    require(reader.pump() == P50CompletionPumpResult::Accepted,
+            "closed exact writer was not accepted");
+    const P50CompletionObservation open_writer = reader.observation();
+    ::close(fds[0]);
+    require(open_writer.valid(),
+            "reader waited for EOF after one atomic record");
+
+    require(::pipe(fds) == 0, "pipe failed");
+    require(write_p50_completion_record(fds[1], record),
+            "delayed-trailing fixture failed");
+    P50CompletionRecordReader trailing_reader(fds[0], job);
+    require(trailing_reader.pump() == P50CompletionPumpResult::Pending,
+            "open exact writer did not wait for EOF");
+    const uint8_t trailing_byte = 0;
+    require(::write(fds[1], &trailing_byte, sizeof(trailing_byte)) == 1,
+            "delayed trailing byte write failed");
+    ::close(fds[1]);
+    require(trailing_reader.pump() ==
+                P50CompletionPumpResult::AttemptCancelOnly,
+            "delayed trailing byte was ignored");
+    ::close(fds[0]);
+
+    const auto bytes = encode_p50_completion_record(record);
+    require(::pipe(fds) == 0, "pipe failed");
+    require(::write(fds[1], bytes.data(), bytes.size() - 1) ==
+                static_cast<ssize_t>(bytes.size() - 1),
+            "partial open-writer fixture failed");
+    ::alarm(2);
+    const P50CompletionObservation partial =
+        read_p50_completion_record(fds[0], job);
+    ::alarm(0);
+    ::close(fds[0]);
+    ::close(fds[1]);
+    require_attempt_only(partial,
+                         "partial open writer blocked or became terminal");
 }
 
 void test_legacy_job_is_not_a_p50_record() {
@@ -183,17 +318,82 @@ void test_legacy_job_is_not_a_p50_record() {
     legacy.setJobID(7);
     const uint32_t stats[8] = {};
     P50CompletionRecord record;
-    require(!make_p50_completion_record(legacy, stats, 0, &record),
+    require(!make_p50_completion_record(
+                legacy, stats, 0, P50CompletionDisposition::Accepted, &record),
             "legacy job entered P50 record path");
+
+    CompileJob mismatched = complete_job();
+    CompileInputIdentity input = mismatched.compileInputIdentity();
+    ++input.request_id;
+    mismatched.setCompileInputIdentity(input);
+    require(!make_p50_completion_record(
+                mismatched, stats, 0, P50CompletionDisposition::Accepted,
+                &record),
+            "assignment-nonce mismatch entered P50 record path");
+}
+
+void test_result_disposition_receiver()
+{
+    const CompileJob job = complete_job();
+    {
+        ChannelPair pair = make_channel_pair();
+        require(pair.left->send_msg(ResultDispositionMsg(
+                    job, ResultDispositionMsg::Accepted)),
+                "accepted disposition send failed");
+        require(pair.left->send_msg(ResultDispositionMsg(
+                    job, ResultDispositionMsg::DefinitiveCancel)),
+                "conflicting second disposition send failed");
+        require(receive_p50_result_disposition(*pair.right, job, 2) ==
+                    P50CompletionDisposition::Accepted,
+                "first exact accepted disposition did not win");
+    }
+    {
+        ChannelPair pair = make_channel_pair();
+        require(pair.left->send_msg(ResultDispositionMsg(
+                    job, ResultDispositionMsg::DefinitiveCancel)),
+                "definitive-cancel disposition send failed");
+        require(receive_p50_result_disposition(*pair.right, job, 2) ==
+                    P50CompletionDisposition::DefinitiveCancel,
+                "exact definitive cancellation was not forwarded");
+    }
+    {
+        ChannelPair pair = make_channel_pair();
+        CompileJob other = job;
+        other.setJobID(job.jobID() + 1);
+        require(pair.left->send_msg(ResultDispositionMsg(
+                    other, ResultDispositionMsg::Accepted)),
+                "mismatched disposition fixture send failed");
+        require(receive_p50_result_disposition(*pair.right, job, 2) ==
+                    P50CompletionDisposition::AttemptCancelOnly,
+                "mismatched disposition became terminal");
+    }
+    {
+        ChannelPair pair = make_channel_pair();
+        require(pair.left->send_msg(EndMsg()),
+                "unexpected-frame fixture send failed");
+        require(receive_p50_result_disposition(*pair.right, job, 2) ==
+                    P50CompletionDisposition::AttemptCancelOnly,
+                "unexpected frame became terminal");
+    }
+    {
+        ChannelPair pair = make_channel_pair();
+        delete pair.left;
+        pair.left = nullptr;
+        require(receive_p50_result_disposition(*pair.right, job, 1) ==
+                    P50CompletionDisposition::AttemptCancelOnly,
+                "submitter disconnect became terminal");
+    }
 }
 
 } // namespace
 
 int main() {
     test_exact_canonical_record();
+    test_all_dispositions_and_statuses();
     test_short_trailing_header_and_state_rejection();
     test_identity_mutations();
     test_missing_and_writer();
     test_legacy_job_is_not_a_p50_record();
+    test_result_disposition_receiver();
     std::cout << "p50 completion record tests: PASS\n";
 }

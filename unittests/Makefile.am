@@ -10,6 +10,8 @@ TESTS += p50inputlifecycle
 TESTS += p50compilebinding
 TESTS += p50compilee2e-source.sh p50compilee2e-run.sh p50resultdisposition
 TESTS += p50_completion_record
+TESTS += p50completionflow-source.py
+TESTS += p50completionrecord-sanitize.sh
 
 AM_TESTS_ENVIRONMENT = \
 	ICECC_TEST_BUILDDIR='$(abs_builddir)'; export ICECC_TEST_BUILDDIR; \
@@ -265,6 +267,8 @@ EXTRA_DIST = sndbuf_shim.c conn_shim.c readyclose_shim.c connectivity-run.sh sch
 
 EXTRA_DIST += p50_trace_check.sh p50assignment-source.sh p50cacheadvertisement-source.sh p50cachesession-source.sh p50daemoncachedispatch-source.sh p50daemoncachedispatch-sanitize.sh p50localtransport-source.sh p50localtransport-sanitize.sh p50sidecarsupervisor-source.sh p50inputattachment-source.sh p50inputattachment-mutants.sh p50_input_attachment_sanitize.sh p50readyadvertisement-source.sh p50readyadvertisement-mutants.sh p50endpoint-source.sh p50fdhandoff-source.sh p50cacheservice-source.sh p50cacheservice-sanitize.sh p50fdhandoff-sanitize.sh p50inputfd-source.sh p50inputfd-sanitize.sh p50inputlifecycle-source.sh p50inputlifecycle-sanitize.sh packagebuilderdeps.sh p50daemonpositive-source.sh p50daemonpositive-run.sh p50zstdsender-source.sh
 EXTRA_DIST += p50compilee2e-source.sh p50compilee2e-run.sh
+EXTRA_DIST += p50completionflow-source.py
+EXTRA_DIST += p50completionrecord-sanitize.sh
 
 # Make the tests also print the test log if they fail.
 check: export VERBOSE=1

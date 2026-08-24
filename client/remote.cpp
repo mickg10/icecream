@@ -501,6 +501,26 @@ static void receive_file(const string& output_file, MsgChannel* cserver)
     }
 }
 
+/* A P50 submitter may definitively reject a result from CompileResultMsg
+   metadata (OOM/caret/missing-input fallback) before consuming successful
+   output bytes.  The worker must nevertheless finish its output-first stream
+   before it can receive the terminal disposition.  Drain those exact output
+   frames without publishing a file so neither side can deadlock on a full
+   duplex socket after the cancellation frame has been sent. */
+static void discard_p50_output_file(MsgChannel *cserver)
+{
+    for (;;) {
+        std::unique_ptr<Msg> msg(cserver->get_msg(40));
+        if (!msg)
+            throw client_error(19, "Error 19 - network failure while discarding P50 output");
+        check_for_failure(msg.get(), cserver);
+        if (*msg == Msg::END)
+            return;
+        if (*msg != Msg::FILE_CHUNK)
+            throw client_error(20, "Error 20 - unexpected P50 output message");
+    }
+}
+
 static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_daemon,
                             const string &environment, const string &version_file,
                             const char *preproc_file, bool output)
@@ -523,6 +543,25 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
     int status = 255;
 
     MsgChannel *cserver = nullptr;
+    bool p50_input = false;
+    bool p50_result_received = false;
+    bool p50_disposition_attempted = false;
+    bool p50_disposition_sent = false;
+
+    auto send_p50_disposition = [&](ResultDispositionMsg::Disposition disposition) {
+        if (!p50_input || p50_disposition_attempted)
+            return p50_disposition_sent;
+        p50_disposition_attempted = true;
+        if (cserver == nullptr)
+            return false;
+        const ResultDispositionMsg result_disposition(job, disposition);
+        p50_disposition_sent = cserver->send_msg(result_disposition);
+        if (!p50_disposition_sent) {
+            log_warning() << "failed sending terminal P50 result disposition for job "
+                          << job.jobID() << endl;
+        }
+        return p50_disposition_sent;
+    };
 
     try {
         cserver = Service::createChannel(hostname, port, 10);
@@ -621,7 +660,7 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
         }
 
         {
-            const bool p50_input = icecc::p50::p50_zstd_compile_admissible(
+            p50_input = icecc::p50::p50_zstd_compile_admissible(
                 *usecs, cserver->protocol);
             if (getenv("ICECC_P50_C1F1_REQUIRED") != nullptr && !p50_input)
                 throw remote_error(
@@ -762,10 +801,12 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
 
         CompileResultMsg *crmsg = dynamic_cast<CompileResultMsg*>(msg);
         assert(crmsg);
+        p50_result_received = p50_input;
 
         status = crmsg->status;
 
         if (status && crmsg->was_out_of_memory) {
+            (void)send_p50_disposition(ResultDispositionMsg::DefinitiveCancel);
             delete crmsg;
             log_warning() << "the server ran out of memory, recompiling locally" << endl;
             throw remote_error(101, "Error 101 - the server ran out of memory, recompiling locally");
@@ -773,14 +814,30 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
 
         if (output) {
             if ((!crmsg->out.empty() || !crmsg->err.empty()) && output_needs_workaround(job)) {
+                const bool discard_output = p50_input && status == 0;
+                const bool discard_dwo = discard_output && crmsg->have_dwo_file;
+                (void)send_p50_disposition(ResultDispositionMsg::DefinitiveCancel);
                 delete crmsg;
+                if (discard_output) {
+                    discard_p50_output_file(cserver);
+                    if (discard_dwo)
+                        discard_p50_output_file(cserver);
+                }
                 log_warning() << "command needs stdout/stderr workaround, recompiling locally" << endl;
                 log_warning() << "(set ICECC_CARET_WORKAROUND=0 to override)" << endl;
                 throw remote_error(102, "Error 102 - command needs stdout/stderr workaround, recompiling locally");
             }
 
             if (crmsg->err.find("file not found") != string::npos) {
+                const bool discard_output = p50_input && status == 0;
+                const bool discard_dwo = discard_output && crmsg->have_dwo_file;
+                (void)send_p50_disposition(ResultDispositionMsg::DefinitiveCancel);
                 delete crmsg;
+                if (discard_output) {
+                    discard_p50_output_file(cserver);
+                    if (discard_dwo)
+                        discard_p50_output_file(cserver);
+                }
                 log_warning() << "remote is missing file, recompiling locally" << endl;
                 throw remote_error(104, "Error 104 - remote is missing file, recompiling locally");
             }
@@ -811,7 +868,22 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
             }
         }
 
+        if (p50_input &&
+            !send_p50_disposition(ResultDispositionMsg::Accepted)) {
+            throw client_error(
+                107,
+                "Error 107 - failed to acknowledge complete P50 remote result");
+        }
+
     } catch (...) {
+        /* Once CompileResultMsg exists, any local exception before Accepted
+           is a definitive rejection attempt.  Never emit a second frame after
+           a possibly partial first send: the worker applies first-witness
+           semantics and missing/disconnect remains attempt-only. */
+        if (p50_input && p50_result_received &&
+            !p50_disposition_attempted) {
+            (void)send_p50_disposition(ResultDispositionMsg::DefinitiveCancel);
+        }
         // Handle pending status messages, if any.
         if(cserver) {
             while(Msg* msg = cserver->get_msg(0, true)) {

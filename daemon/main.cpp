@@ -110,6 +110,7 @@
 #include "util.h"
 #include "getifaddrs.h"
 #include "p50_daemon_sidecar_adapter.h"
+#include "p50_completion_record.h"
 
 static std::string pidFilePath;
 static volatile sig_atomic_t exit_main_loop = 0;
@@ -670,6 +671,11 @@ public:
     // terminal close is legal only after an explicit result disposition.
     std::optional<icecc::p50::InputFdRequest> p50_input_lease;
     P50InputLeaseState p50_input_lease_state;
+    // P50 child records are readiness-driven in bounded nonblocking steps;
+    // retaining the reader across POLLIN/POLLHUP prevents a partial writer or
+    // write-before-close race from blocking the daemon event loop.
+    std::optional<icecc::p50::P50CompletionRecordReader>
+        p50_completion_reader;
     CacheHandoff cacheHandoff;   // S2: see the struct's own comment above
     int client_id;
     uint32_t niceness; // nice priority (0-20), for PENDING_USE_CS
@@ -6922,11 +6928,42 @@ void Daemon::handle_old_request()
     }
 }
 
+static bool p50_completion_matches_retained_lease(
+    const icecc::p50::P50CompletionRecord& record,
+    const std::optional<icecc::p50::InputFdRequest>& retained) noexcept
+{
+    if (!retained.has_value())
+        return false;
+    const icecc::p50::InputFdRequest& lease = *retained;
+    return lease.owner.logical_job == record.job_id &&
+           lease.owner.assignment_epoch == record.assignment_epoch &&
+           lease.owner.assignment_nonce == record.assignment_nonce &&
+           lease.key.c_store_guid.bytes == record.c_store_guid &&
+           lease.key.tu_seq.value == record.tu_seq &&
+           lease.request_id == record.request_id &&
+           record.attempt_id == record.assignment_nonce;
+}
+
 bool Daemon::handle_compile_done(Client *client)
 {
     assert(client->status == Client::WAITFORCHILD);
     assert(client->child_pid > 0);
     assert(client->pipe_from_child >= 0);
+
+    const bool p50_input = client->job->usesP50Input();
+    icecc::p50::P50CompletionObservation p50_observation;
+    if (p50_input) {
+        if (!client->p50_completion_reader.has_value()) {
+            client->p50_completion_reader.emplace(
+                client->pipe_from_child, *client->job);
+        }
+        const icecc::p50::P50CompletionPumpResult completion =
+            client->p50_completion_reader->pump();
+        if (completion == icecc::p50::P50CompletionPumpResult::Pending)
+            return true;
+        p50_observation =
+            client->p50_completion_reader->observation();
+    }
 
     JobDoneMsg *msg = new JobDoneMsg(client->job->jobID(), -1, JobDoneMsg::FROM_SERVER, clients.size());
     assert(msg);
@@ -6937,7 +6974,8 @@ bool Daemon::handle_compile_done(Client *client)
     unsigned int job_stat[8];
     int end_status = 151;
 
-    if (read(client->pipe_from_child, job_stat, sizeof(job_stat)) == sizeof(job_stat)) {
+    if (!p50_input &&
+        read(client->pipe_from_child, job_stat, sizeof(job_stat)) == sizeof(job_stat)) {
         msg->in_uncompressed = job_stat[JobStatistics::in_uncompressed];
         msg->in_compressed = job_stat[JobStatistics::in_compressed];
         msg->out_compressed = msg->out_uncompressed = job_stat[JobStatistics::out_uncompressed];
@@ -6946,10 +6984,42 @@ bool Daemon::handle_compile_done(Client *client)
         msg->user_msec = job_stat[JobStatistics::user_msec];
         msg->sys_msec = job_stat[JobStatistics::sys_msec];
         msg->pfaults = job_stat[JobStatistics::sys_pfaults];
+    } else if (p50_input && p50_observation.valid()) {
+        const icecc::p50::P50CompletionRecord& record =
+            p50_observation.record;
+        msg->in_uncompressed = record.stats[JobStatistics::in_uncompressed];
+        msg->in_compressed = record.stats[JobStatistics::in_compressed];
+        msg->out_compressed = msg->out_uncompressed =
+            record.stats[JobStatistics::out_uncompressed];
+        end_status = msg->exitcode = record.result_status;
+        msg->real_msec = record.stats[JobStatistics::real_msec];
+        msg->user_msec = record.stats[JobStatistics::user_msec];
+        msg->sys_msec = record.stats[JobStatistics::sys_msec];
+        msg->pfaults = record.stats[JobStatistics::sys_pfaults];
+
+        const bool exact_retained_lease =
+            p50_completion_matches_retained_lease(
+                record, client->p50_input_lease);
+        if (!exact_retained_lease) {
+            log_warning() << "P50 child completion does not match retained lease for job "
+                          << client->job->jobID() << endl;
+        } else if (p50_observation.disposition ==
+                   icecc::p50::P50CompletionDisposition::Accepted) {
+            settle_p50_input(
+                client,
+                icecc::p50::InputLifecycleAction::CloseAcceptedJob,
+                "submitter accepted complete result");
+        } else if (p50_observation.disposition ==
+                   icecc::p50::P50CompletionDisposition::DefinitiveCancel) {
+            settle_p50_input(
+                client, icecc::p50::InputLifecycleAction::CancelJob,
+                "submitter definitive cancellation");
+        }
     }
 
     close(client->pipe_from_child);
     client->pipe_from_child = -1;
+    client->p50_completion_reader.reset();
     string envforjob = client->job->targetPlatform() + "/" + client->job->environmentVersion();
     received_environments[envforjob].last_use = time(nullptr);
     if(end_status == EXIT_COMPILER_MISSING) { // Environment damaged?

@@ -83,6 +83,28 @@ instead of silently projecting a new store under the old advertisement.
   terminal action is supplied by the result-disposition owner; it is never
   inferred from generic attempt teardown.
 - **Model-unrepresented:** this is private AF_UNIX control, not an ordinary
-  Icecream wire-message change. The submitter/worker result-disposition bridge
-  is a separate P50-only protocol seam and must be wired before terminal
-  production closure is claimed.
+  Icecream wire-message change. The separate P50-only ordinary-link
+  result-disposition message and child/parent completion record now supply the
+  terminal action; they do not add a dimension to cache identity or to this
+  private control wire.
+
+## Result-to-lifecycle bridge
+
+The worker's pre-P50 status pipe remains exactly eight native `uint32_t` words
+(32 bytes), written and closed before output transfer. A P50 compiler child
+instead sends `CompileResultMsg`, completes every object/DWO output stream,
+waits under a 30-second bound for one exact submitter disposition, then writes
+one 144-byte canonical big-endian `P50CompletionRecord` and immediately closes
+the pipe. Worker exceptions write an identity-bound `AttemptCancelOnly` record
+when possible. The canonical record binds statistics/exit status, result state,
+disposition, job, assignment epoch/nonce, and the full compiler-input identity;
+attempt and request IDs must both equal the assignment nonce.
+
+The daemon parent reads this pipe through a retained nonblocking reader. A
+short record, trailing byte, malformed state, identity mismatch, or disconnect
+is attempt-only. An exact record is additionally compared with the retained
+`InputFdRequest`, including its key, logical owner, and request ID. Only then
+does `Accepted` drive `CloseAcceptedJob` or `DefinitiveCancel` drive `CancelJob`.
+The following `handle_end()` call cannot double-settle because terminal
+settlement consumes the active lease; all nonterminal paths retain the existing
+`CancelAttempt` behavior.

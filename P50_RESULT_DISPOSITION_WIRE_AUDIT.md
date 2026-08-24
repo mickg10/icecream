@@ -37,4 +37,28 @@ number or silently deduplicate a result owner’s event.
 The focused test covers exact type/length, present and absent-selector refusal,
 mutations of every identity field, duplicate semantics, malformed frames,
 strict protocol gates, and unchanged P43/P48 `CompileResultMsg` behavior.
-No client or daemon integration is part of this wire-only lane.
+
+## Production ownership and ordering
+
+The submitter retains the exact `CompileJob` assignment/input identity after
+`CompileResultMsg`. It attempts at most one terminal frame. `Accepted` is sent
+only after every successful object/DWO stream has reached `EndMsg` and the
+temporary file has been closed and renamed. OOM, caret-workaround, and
+missing-file fallback send `DefinitiveCancel`; a successful output that will be
+discarded is still drained so the worker can reach its output-complete barrier.
+A generic post-result exception attempts `DefinitiveCancel`, while a pre-result
+failure emits no disposition.
+
+The worker waits at most 30 seconds for the first exact disposition only after
+all output frames have been sent. Missing, malformed, mismatched, unexpected,
+or disconnected input is `AttemptCancelOnly`; it cannot be promoted to a
+logical-job terminal action. The child then sends one canonical completion
+record and closes its private parent pipe. The parent accepts that record only
+after a nonblocking, EOF-confirmed exact read, compares it with both the job and
+the retained sidecar lease, and maps only `Accepted -> CloseAcceptedJob` or
+`DefinitiveCancel -> CancelJob`. Ordinary teardown remains `CancelAttempt`.
+
+The production source gate is deletion-sensitive for output/disposition/record
+ordering, exact retained-lease comparison, both terminal mappings, the
+attempt-only paths, nonblocking EOF validation, and the unchanged legacy child
+pipe path.
