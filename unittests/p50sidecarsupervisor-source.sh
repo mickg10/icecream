@@ -15,6 +15,11 @@ grep -F 'FD_CLOEXEC' "$impl" >/dev/null
 grep -F 'std::chrono::steady_clock' "$impl" >/dev/null
 grep -F 'access(config.executable.c_str(), X_OK)' "$impl" >/dev/null
 grep -F 'execve' "$impl" >/dev/null
+grep -F 'write_errno_record' "$impl" >/dev/null
+grep -F 'mark_child_fds_cloexec' "$impl" >/dev/null
+grep -F 'close_range' "$impl" >/dev/null
+grep -F 'setpgid' "$impl" >/dev/null
+grep -F 'max_attempts_per_recovery' "$impl" "$header" >/dev/null
 
 # The component must remain detached from advertisement and daemon ownership.
 if grep -E 'daemon/main|apply_inert_cache_advertisement|LoginMsg|port' "$impl" "$header" >/dev/null; then
@@ -23,10 +28,23 @@ if grep -E 'daemon/main|apply_inert_cache_advertisement|LoginMsg|port' "$impl" "
 fi
 
 mutant=$(mktemp "${TMPDIR:-/tmp}/p50sidecarsupervisor-mutant.XXXXXX")
-trap 'rm -f "$mutant"' EXIT HUP INT TERM
-sed 's/::kill(child_pid_, SIGKILL)/::kill(child_pid_, SIGTERM)/' "$impl" >"$mutant"
-if grep -F 'SIGKILL' "$mutant" >/dev/null; then
-    echo 'FAIL: shutdown escalation deletion mutant was accepted' >&2
+mutant_fds=$(mktemp "${TMPDIR:-/tmp}/p50sidecarsupervisor-fd-mutant.XXXXXX")
+mutant_ready=$(mktemp "${TMPDIR:-/tmp}/p50sidecarsupervisor-ready-mutant.XXXXXX")
+trap 'rm -f "$mutant" "$mutant_fds" "$mutant_ready"' EXIT HUP INT TERM
+sed 's/const bool group_alive = grouped && group_exists(process_group_);/const bool group_alive = false;/' \
+    "$impl" >"$mutant"
+if grep -F 'group_exists(process_group_)' "$mutant" >/dev/null; then
+    echo 'FAIL: process-group shutdown deletion mutant was accepted' >&2
+    exit 1
+fi
+sed 's/if (!mark_child_fds_cloexec(ambient_fd_limit))/if (true)/' "$impl" >"$mutant_fds"
+if grep -F 'if (!mark_child_fds_cloexec(ambient_fd_limit))' "$mutant_fds" >/dev/null; then
+    echo 'FAIL: ambient-FD deletion mutant was not formed' >&2
+    exit 1
+fi
+sed 's/if (ready.size() == kReadyMessageSize)/if (false)/' "$impl" >"$mutant_ready"
+if grep -F 'if (ready.size() == kReadyMessageSize)' "$mutant_ready" >/dev/null; then
+    echo 'FAIL: exact-READY deletion mutant was not formed' >&2
     exit 1
 fi
 echo 'ok - sidecar supervisor source gates hold'

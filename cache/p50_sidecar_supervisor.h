@@ -40,7 +40,6 @@ enum class Failure : uint8_t {
     InvalidReady,
     PostReadyExit,
     RestartExhausted,
-    Shutdown,
 };
 
 struct Config {
@@ -53,6 +52,9 @@ struct Config {
     std::chrono::milliseconds shutdown_timeout{1000};
     std::chrono::milliseconds restart_window{10000};
     uint32_t max_restarts = 3;
+    // Hard cap for one synchronous start/recovery call.  This complements
+    // the time-window budget when each failed attempt itself spans a window.
+    uint32_t max_attempts_per_recovery = 16;
 };
 
 struct Counters {
@@ -114,12 +116,14 @@ private:
     void reap_blocking() noexcept;
     bool wait_for_exit(std::chrono::milliseconds timeout) noexcept;
     void terminate_child() noexcept;
+    void terminate_group() noexcept;
 
     Config config_;
     State state_ = State::Stopped;
     Failure last_failure_ = Failure::None;
     Counters counters_{};
     pid_t child_pid_ = -1;
+    pid_t process_group_ = -1;
     int ready_read_ = -1;
     int exec_read_ = -1;
     std::vector<std::chrono::steady_clock::time_point> restart_times_;
