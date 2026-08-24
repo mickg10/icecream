@@ -3,6 +3,8 @@
 #include <array>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
+#include <new>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -107,6 +109,11 @@ void test_commit_ready_ack_replay_and_reclaim() {
     const InputAttachmentReply reply = core.request(req);
     require(reply.status == InputAttachmentStatus::Ready && reply.event_id != 0,
             "ready request returned the wrong identity/status");
+    InputAttachmentReply forged_ack_state = reply;
+    forged_ack_state.acknowledged = true;
+    require(core.acknowledge(req, forged_ack_state) ==
+                InputAttachmentAckResult::Rejected,
+            "forged acknowledgement state was accepted");
     const InputAttachmentReply repeated = core.request(req);
     require(repeated == reply, "exact request replay changed its reply");
     InputCursor cursor = core.attach(req, reply);
@@ -118,13 +125,20 @@ void test_commit_ready_ack_replay_and_reclaim() {
             "duplicate acknowledgement was not idempotent");
     require(core.pending_ready_count() == 0,
             "acknowledgement did not retire pending ready event");
+    const InputAttachmentReply acknowledged_replay = core.request(req);
+    require(acknowledged_replay.status == InputAttachmentStatus::Ready &&
+                acknowledged_replay.event_id == reply.event_id &&
+                acknowledged_replay.acknowledged,
+            "exact request replay changed its canonical ACK state");
 
     // A new request after ACK gets a replay observation, not a second event.
     const InputAttachmentRequest replay_req{req.key, first, 12};
     const InputAttachmentReply replay = core.request(replay_req);
     require(replay.status == InputAttachmentStatus::ReadyReplay &&
-                replay.event_id == 0,
-            "post-ACK request created a second ready event");
+                replay.event_id == reply.event_id &&
+                replay.raw_bytes == reply.raw_bytes &&
+                replay.raw_digest == reply.raw_digest,
+            "post-ACK request lost the canonical ready event identity");
     require(core.acknowledge(replay_req, replay) ==
                 InputAttachmentAckResult::Accepted,
             "replay acknowledgement was rejected");
@@ -153,6 +167,9 @@ void test_owner_replacement_and_stale_identity() {
     (void)core.commit_open(first, guid, tx.begin, tx.commit, input);
     const InputAttachmentRequest old_req{key, first, 20};
     const InputAttachmentReply old_reply = core.request(old_req);
+    require(core.acknowledge(old_req, old_reply) ==
+                InputAttachmentAckResult::Accepted,
+            "old attempt ready acknowledgement was rejected");
     core.retry(first, replacement.attempt_id, key);
     require(core.request(old_req).status == InputAttachmentStatus::StaleAttempt,
             "old attempt request replay was not stale");
@@ -164,8 +181,10 @@ void test_owner_replacement_and_stale_identity() {
 
     const InputAttachmentRequest new_req{key, replacement, 21};
     const InputAttachmentReply new_reply = core.request(new_req);
-    require(new_reply.status == InputAttachmentStatus::Ready &&
-                new_reply.event_id == old_reply.event_id,
+    require(new_reply.status == InputAttachmentStatus::ReadyReplay &&
+                new_reply.event_id == old_reply.event_id &&
+                new_reply.raw_bytes == old_reply.raw_bytes &&
+                new_reply.raw_digest == old_reply.raw_digest,
             "replacement did not reuse exact ready event");
     InputCursor cursor = core.attach(new_req, new_reply);
     require(drain(cursor) == input, "replacement cursor did not start at byte zero");
@@ -199,6 +218,11 @@ void test_closed_before_commit_and_table_exhaustion() {
         [&] { (void)core.commit_open(open_b, guid, tx_b.begin, tx_b.commit, input_b); },
         "pending-ready table exhaustion was not bounded");
     require(!core.contains(key_b), "table exhaustion partially retained record");
+    core.cancel(open_a, key_a);
+    core.collect_garbage();
+    require(core.commit_open(open_b, guid, tx_b.begin, tx_b.commit, input_b) ==
+                InputPublishResult::Published,
+            "pending-ready capacity did not recover after close/reclaim");
 }
 
 void test_wrong_guid_tu_owner_and_perturbation() {
@@ -229,6 +253,232 @@ void test_wrong_guid_tu_owner_and_perturbation() {
     core.cancel(owner, key);
 }
 
+void test_same_key_conflict_and_duplicate_attachment() {
+    const CStoreGuid guid = Id128::from_u64(8);
+    const InputAttempt owner{808, 1};
+    const InputRecordKey key{guid, TuSeq{8}};
+    const std::vector<uint8_t> input = bytes(96, 1);
+    const std::vector<uint8_t> conflicting = bytes(96, 2);
+    const ExactTransaction tx = transaction_for(key.tu_seq, input);
+    const ExactTransaction conflicting_tx =
+        transaction_for(key.tu_seq, conflicting);
+    InputAttachmentCore core(4, 4096, 4, 4);
+    (void)core.commit_open(owner, guid, tx.begin, tx.commit, input);
+    require_throws<std::logic_error>(
+        [&] {
+            (void)core.commit_open(owner, guid, conflicting_tx.begin,
+                                   conflicting_tx.commit, conflicting);
+        },
+        "same key accepted different exact bytes");
+
+    const InputAttachmentRequest first{key, owner, 81};
+    const InputAttachmentReply first_reply = core.request(first);
+    require(core.request(first) == first_reply,
+            "exact duplicate request changed its reply");
+    const InputAttachmentRequest second{key, owner, 82};
+    const InputAttachmentReply second_reply = core.request(second);
+    require(second_reply.event_id == first_reply.event_id,
+            "distinct request ID changed canonical event identity");
+    InputCursor cursor = core.attach(first, first_reply);
+    require(drain(cursor) == input, "canonical attachment lost exact bytes");
+    require_throws<std::logic_error>(
+        [&] { (void)core.attach(first, first_reply); },
+        "duplicate attach admitted a second cursor");
+    require_throws<std::logic_error>(
+        [&] { (void)core.attach(second, second_reply); },
+        "noncanonical duplicate request admitted a second cursor");
+    core.cancel(owner, key);
+
+    const InputRecordKey invalid_key{guid, TuSeq{80}};
+    const ExactTransaction invalid_tx = transaction_for(invalid_key.tu_seq, input);
+    TxCommit invalid_commit = invalid_tx.commit;
+    invalid_commit.raw_digest = {};
+    const InputAttempt invalid_owner{809, 1};
+    require_throws<std::invalid_argument>(
+        [&] {
+            (void)core.commit_open(invalid_owner, guid, invalid_tx.begin,
+                                   invalid_commit, input);
+        },
+        "invalid commit was not rejected");
+    const InputAttempt valid_owner{810, 1};
+    require(core.commit_open(valid_owner, guid, invalid_tx.begin,
+                             invalid_tx.commit, input) ==
+                InputPublishResult::Published,
+            "invalid commit poisoned a later valid owner");
+    core.cancel(valid_owner, invalid_key);
+}
+
+void test_cancel_and_replacement_replay_recovery() {
+    const CStoreGuid guid = Id128::from_u64(9);
+    const std::vector<uint8_t> input = bytes(32, 9);
+    InputAttachmentCore cancel_core(4, 4096, 2, 1);
+    const InputAttempt cancel_owner{901, 1};
+    const InputRecordKey cancel_key{guid, TuSeq{9}};
+    const ExactTransaction cancel_tx =
+        transaction_for(cancel_key.tu_seq, input);
+    (void)cancel_core.commit_open(cancel_owner, guid, cancel_tx.begin,
+                                  cancel_tx.commit, input);
+    (void)cancel_core.request({cancel_key, cancel_owner, 91});
+    cancel_core.cancel(cancel_owner, cancel_key);
+
+    const InputAttempt next_owner{902, 1};
+    const InputRecordKey next_key{guid, TuSeq{10}};
+    const ExactTransaction next_tx = transaction_for(next_key.tu_seq, input);
+    (void)cancel_core.commit_open(next_owner, guid, next_tx.begin,
+                                  next_tx.commit, input);
+    require(cancel_core.request({next_key, next_owner, 92}).status ==
+                InputAttachmentStatus::Ready,
+            "cancelled unacknowledged reply exhausted replay capacity");
+
+    InputAttachmentCore replacement_core(4, 4096, 2, 1);
+    const InputAttempt old_owner{903, 1};
+    const InputAttempt new_owner{903, 2};
+    const InputRecordKey replacement_key{guid, TuSeq{11}};
+    const ExactTransaction replacement_tx =
+        transaction_for(replacement_key.tu_seq, input);
+    (void)replacement_core.commit_open(old_owner, guid, replacement_tx.begin,
+                                       replacement_tx.commit, input);
+    require_throws<std::invalid_argument>(
+        [&] { replacement_core.retry(old_owner, old_owner.attempt_id,
+                                     replacement_key); },
+        "replacement reused ATTEMPT_ID");
+    (void)replacement_core.request({replacement_key, old_owner, 93});
+    replacement_core.retry(old_owner, new_owner.attempt_id, replacement_key);
+    require(replacement_core.request({replacement_key, new_owner, 94}).status ==
+                InputAttachmentStatus::Ready,
+            "replacement stale reply exhausted replay capacity");
+    replacement_core.cancel(new_owner, replacement_key);
+}
+
+void test_ack_pruning_and_owner_bound() {
+    const CStoreGuid guid = Id128::from_u64(10);
+    const InputAttempt owner{1001, 1};
+    const InputRecordKey key{guid, TuSeq{12}};
+    const std::vector<uint8_t> input = bytes(32, 10);
+    const ExactTransaction tx = transaction_for(key.tu_seq, input);
+    InputAttachmentCore core(4, 4096, 2, 1, 2);
+    (void)core.commit_open(owner, guid, tx.begin, tx.commit, input);
+    const InputAttachmentRequest first{key, owner, 101};
+    const InputAttachmentReply reply = core.request(first);
+    require(core.acknowledge(first, reply) == InputAttachmentAckResult::Accepted,
+            "canonical ACK was rejected");
+    (void)core.request({key, owner, 102});
+    InputCursor cursor = core.attach(first, reply);
+    require(drain(cursor) == input,
+            "ACK pruning invalidated the canonical late attachment");
+    core.cancel(owner, key);
+    cursor = InputCursor{};
+    core.collect_garbage();
+    core.release_closed_owner(owner, key);
+
+    const InputAttempt closed_a{1002, 1};
+    const InputAttempt closed_b{1003, 1};
+    const InputRecordKey key_a{guid, TuSeq{13}};
+    const InputRecordKey key_b{guid, TuSeq{14}};
+    core.cancel(closed_a, key_a);
+    core.cancel(closed_b, key_b);
+    require(core.owner_count() == 2, "closed owner tombstone was lost early");
+    require_throws<std::length_error>(
+        [&] { core.cancel({1004, 1}, {guid, TuSeq{15}}); },
+        "owner table exceeded its explicit bound");
+    core.release_closed_owner(closed_a, key_a);
+    core.cancel({1004, 1}, {guid, TuSeq{15}});
+}
+
+void test_generation_and_late_closed_commit() {
+    const CStoreGuid guid = Id128::from_u64(11);
+    const InputAttempt owner{1101, 1};
+    const InputRecordKey key{guid, TuSeq{16}};
+    const std::vector<uint8_t> input = bytes(24, 11);
+    const ExactTransaction tx = transaction_for(key.tu_seq, input);
+    InputAttachmentCore core(4, 4096, 2);
+    core.cancel(owner, key);
+    require(core.observe_closed_commit(owner, guid, tx.begin, tx.commit, input) ==
+                InputPublishResult::NotRetainedJobClosed,
+            "late closed commit was not validated through its tombstone");
+    require(core.owner_count() == 0,
+            "observed closed owner was not reclaimable");
+
+    const InputAttempt open_owner{1102, 1};
+    const InputRecordKey open_key{guid, TuSeq{17}};
+    const ExactTransaction open_tx = transaction_for(open_key.tu_seq, input);
+    (void)core.commit_open(open_owner, guid, open_tx.begin, open_tx.commit,
+                           input);
+    InputCursor old_cursor = core.attach(
+        {open_key, open_owner, 111}, core.request({open_key, open_owner, 111}));
+    core.clear();
+    require(core.store_generation() == 2, "clear did not advance store generation");
+    require_throws<std::logic_error>(
+        [&] { (void)core.commit_open(open_owner, guid, open_tx.begin,
+                                     open_tx.commit, input); },
+        "pre-clear commit crossed the generation fence");
+    require_throws<std::logic_error>(
+        [&] { (void)core.request({open_key, open_owner, 112}); },
+        "pre-clear request crossed the generation fence");
+    require(drain(old_cursor) == input,
+            "store clear invalidated a previously issued cursor");
+    const InputAttempt replacement{open_owner.logical_job,
+                                   open_owner.attempt_id + 1,
+                                   core.store_generation()};
+    const ExactTransaction replacement_tx =
+        transaction_for(open_key.tu_seq, bytes(24, 12));
+    const std::vector<uint8_t> replacement_input = bytes(24, 12);
+    (void)core.commit_open(replacement, guid, replacement_tx.begin,
+                           replacement_tx.commit, replacement_input);
+    old_cursor = InputCursor{};
+    core.cancel(replacement, open_key);
+}
+
+#ifdef P50_ATTACHMENT_TEST_SEAMS
+void test_transactional_failure_seams_and_event_overflow() {
+    const CStoreGuid guid = Id128::from_u64(12);
+    const InputAttempt owner{1201, 1};
+    const InputRecordKey key{guid, TuSeq{18}};
+    const std::vector<uint8_t> input = bytes(16, 12);
+    const ExactTransaction tx = transaction_for(key.tu_seq, input);
+
+    InputAttachmentCore lifecycle_failure(4, 4096, 2);
+    lifecycle_failure.test_fail_next_lifecycle_insert();
+    require_throws<std::bad_alloc>(
+        [&] {
+            (void)lifecycle_failure.commit_open(owner, guid, tx.begin,
+                                                tx.commit, input);
+        },
+        "lifecycle insertion failure did not propagate");
+    require(lifecycle_failure.owner_count() == 0 &&
+                lifecycle_failure.record_count() == 0 &&
+                lifecycle_failure.pending_ready_count() == 0,
+            "lifecycle insertion failure left partial state");
+    (void)lifecycle_failure.commit_open(owner, guid, tx.begin, tx.commit,
+                                       input);
+
+    InputAttachmentCore reply_failure(4, 4096, 2);
+    (void)reply_failure.commit_open(owner, guid, tx.begin, tx.commit, input);
+    reply_failure.test_fail_next_reply_insert();
+    require_throws<std::bad_alloc>(
+        [&] { (void)reply_failure.request({key, owner, 121}); },
+        "reply insertion failure did not propagate");
+    require(reply_failure.pending_ready_count() == 1 &&
+                reply_failure.replay_entry_count() == 0,
+            "reply insertion failure changed canonical state");
+    (void)reply_failure.request({key, owner, 121});
+
+    InputAttachmentCore overflow(4, 4096, 2);
+    overflow.test_set_next_event_id(std::numeric_limits<uint64_t>::max());
+    (void)overflow.commit_open(owner, guid, tx.begin, tx.commit, input);
+    const InputRecordKey second_key{guid, TuSeq{19}};
+    const ExactTransaction second_tx = transaction_for(second_key.tu_seq, input);
+    require_throws<std::overflow_error>(
+        [&] {
+            (void)overflow.commit_open(owner, guid, second_tx.begin,
+                                       second_tx.commit, input);
+        },
+        "event ID exhaustion was not rejected transactionally");
+    require(!overflow.contains(second_key) && overflow.owner_count() == 1,
+            "event ID exhaustion left partial state");
+}
+#endif
+
 }  // namespace
 
 int main() {
@@ -236,6 +486,13 @@ int main() {
     test_owner_replacement_and_stale_identity();
     test_closed_before_commit_and_table_exhaustion();
     test_wrong_guid_tu_owner_and_perturbation();
+    test_same_key_conflict_and_duplicate_attachment();
+    test_cancel_and_replacement_replay_recovery();
+    test_ack_pruning_and_owner_bound();
+    test_generation_and_late_closed_commit();
+#ifdef P50_ATTACHMENT_TEST_SEAMS
+    test_transactional_failure_seams_and_event_overflow();
+#endif
     std::cout << "p50_input_attachment_test: ownership, ready, replay, and reclamation gates passed\n";
     return 0;
 }

@@ -12,12 +12,16 @@
 
 namespace icecc::p50 {
 
-// ATTEMPT_ID is deliberately an ownership/observation identity.  It is not
-// part of InputRecordKey, and therefore a replacement attempt reuses the
-// exact committed input rather than publishing a second cache object.
+// ATTEMPT_ID and store_generation are deliberately ownership/observation
+// identities. Neither is part of InputRecordKey, and therefore a replacement
+// attempt reuses the exact committed input rather than publishing a second
+// cache object. clear() advances store_generation to fence stale callbacks.
 struct InputAttempt {
     uint64_t logical_job = 0;
     uint64_t attempt_id = 0;
+    // F-store/session incarnation.  This is deliberately separate from the
+    // retained cache key and fences callbacks that predate clear()/restart.
+    uint64_t store_generation = 1;
     auto operator<=>(const InputAttempt&) const = default;
 };
 
@@ -67,7 +71,8 @@ class InputAttachmentCore {
 public:
     InputAttachmentCore(size_t max_records, uint64_t max_retained_bytes,
                         size_t max_pending_ready,
-                        size_t max_replay_entries = 0);
+                        size_t max_replay_entries = 0,
+                        size_t max_owner_entries = 0);
 
     // Commit an Open logical job.  The first exact commit publishes exactly
     // one ready event.  An exact duplicate is idempotent and publishes no
@@ -77,9 +82,10 @@ public:
         InputAttempt owner, CStoreGuid c_store_guid, const TxBegin& begin,
         const TxCommit& commit, std::vector<uint8_t> exact_input);
 
-    // Request/reply is identity-bound and replay-safe.  Repeating an exact
-    // request returns the same reply.  A replacement attempt receives
-    // ReadyReplay for the same event after an earlier attempt acknowledged it.
+    // Request/reply is identity-bound and replay-safe. Repeating an exact
+    // request returns the same reply. A replacement attempt receives
+    // ReadyReplay for the same event after an earlier attempt acknowledged it;
+    // event metadata is never fabricated.
     [[nodiscard]] InputAttachmentReply request(
         const InputAttachmentRequest& request);
 
@@ -89,9 +95,11 @@ public:
         const InputAttachmentRequest& request,
         const InputAttachmentReply& reply);
 
-    // Attach only after a current-owner Ready reply.  The returned cursor is
-    // independent and starts at byte zero.  Acknowledgement is not required
-    // to create a cursor, but the reply must still be an exact identity match.
+    // Attach only after a current-owner Ready reply. The returned cursor is
+    // independent and starts at byte zero. Each logical attempt can admit one
+    // cursor; acknowledgement is not required, but the reply must still be an
+    // exact identity match. The canonical request remains valid after replay
+    // pruning.
     [[nodiscard]] InputCursor attach(const InputAttachmentRequest& request,
                                      const InputAttachmentReply& reply) const;
 
@@ -120,9 +128,12 @@ public:
     void collect_garbage();
     void clear();
 
-    [[nodiscard]] size_t pending_ready_count() const {
-        return pending_ready_.size();
-    }
+    // A closed owner may be forgotten only after its route owner guarantees
+    // that no late closed-job commit can still arrive.  Until then the small
+    // tombstone remains so observe_closed_commit() stays valid.
+    void release_closed_owner(InputAttempt owner, InputRecordKey key);
+
+    [[nodiscard]] size_t pending_ready_count() const;
     [[nodiscard]] size_t replay_entry_count() const { return replies_.size(); }
     [[nodiscard]] size_t max_pending_ready() const {
         return max_pending_ready_;
@@ -137,19 +148,40 @@ public:
     [[nodiscard]] uint64_t retained_bytes() const {
         return records_.retained_bytes();
     }
+    [[nodiscard]] size_t owner_count() const { return lifecycles_.size(); }
+    [[nodiscard]] size_t max_owner_entries() const {
+        return max_owner_entries_;
+    }
+    [[nodiscard]] uint64_t store_generation() const {
+        return store_generation_;
+    }
+
+#ifdef P50_ATTACHMENT_TEST_SEAMS
+    void test_set_next_event_id(uint64_t value) { next_event_id_ = value; }
+    void test_fail_next_lifecycle_insert() { fail_lifecycle_insert_ = true; }
+    void test_fail_next_reply_insert() { fail_reply_insert_ = true; }
+#endif
 
 private:
-    struct OwnerState {
-        uint64_t logical_job = 0;
-        uint64_t current_attempt = 0;
-        bool closed = false;
-    };
-
     struct ReadyEvent {
         InputRecordKey key{};
         uint64_t event_id = 0;
         uint64_t raw_bytes = 0;
         Digest128 raw_digest{};
+    };
+
+    struct Lifecycle {
+        uint64_t logical_job = 0;
+        uint64_t current_attempt = 0;
+        uint64_t store_generation = 0;
+        bool closed = false;
+        bool closed_commit_observed = false;
+        bool ready_pending = false;
+        std::optional<ReadyEvent> ready;
+        mutable bool attachment_admitted = false;
+        bool attachment_request_valid = false;
+        InputAttachmentRequest attachment_request{};
+        InputAttachmentReply attachment_reply{};
     };
 
     struct StoredReply {
@@ -160,25 +192,34 @@ private:
     static void validate_attempt(InputAttempt owner);
     static void validate_request(const InputAttachmentRequest& request);
     static void validate_key(InputRecordKey key);
-    OwnerState& owner_for(InputRecordKey key, InputAttempt owner);
-    const OwnerState& owner_for(InputRecordKey key,
-                                InputAttempt owner) const;
+    Lifecycle& owner_for(InputRecordKey key, InputAttempt owner);
+    const Lifecycle& owner_for(InputRecordKey key,
+                               InputAttempt owner) const;
     void require_current(InputRecordKey key, InputAttempt owner) const;
+    void require_generation(InputAttempt owner) const;
     [[nodiscard]] InputAttachmentReply make_reply(
         const InputAttachmentRequest& request, const ReadyEvent& event,
         InputAttachmentStatus status, bool acknowledged) const;
     void prune_replies();
+    void purge_replies(InputRecordKey key);
+    void collect_lifecycles();
+    [[nodiscard]] bool can_admit_ready() const;
 
     InputRecordStore records_;
     size_t max_pending_ready_ = 0;
     size_t max_replay_entries_ = 0;
+    size_t max_owner_entries_ = 0;
+    uint64_t store_generation_ = 1;
     uint64_t next_event_id_ = 1;
-    std::unordered_map<InputRecordKey, OwnerState, InputRecordKeyHash> owners_;
-    std::unordered_map<InputRecordKey, ReadyEvent, InputRecordKeyHash>
-        pending_ready_;
+    std::unordered_map<InputRecordKey, Lifecycle, InputRecordKeyHash>
+        lifecycles_;
     std::unordered_map<InputAttachmentRequest, StoredReply,
                        InputAttachmentRequestHash>
         replies_;
+#ifdef P50_ATTACHMENT_TEST_SEAMS
+    bool fail_lifecycle_insert_ = false;
+    bool fail_reply_insert_ = false;
+#endif
 };
 
 }  // namespace icecc::p50

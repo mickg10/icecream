@@ -17,16 +17,18 @@ count() {
     echo "ok - $label"
 }
 
-count 1 'std::unordered_map<InputRecordKey, ReadyEvent' cache/p50_input_attachment.h \
-    'ready table is keyed by cache identity, never ATTEMPT_ID'
-count 1 'pending_ready_.size() >= max_pending_ready_' cache/p50_input_attachment.cpp \
-    'pending ready table has a hard admission bound'
-count 1 'pending_ready_.erase(request.key);' cache/p50_input_attachment.cpp \
-    'ACK retires the one ready event'
-count 1 'owners_.at(key).current_attempt = new_owner.attempt_id;' \
+count 1 'std::unordered_map<InputRecordKey, Lifecycle' cache/p50_input_attachment.h \
+    'canonical lifecycle is keyed by cache identity, never ATTEMPT_ID'
+count 1 'request.attempt.store_generation' cache/p50_input_attachment.cpp \
+    'request identity carries the store generation fence'
+count 1 'return pending_ready_count() < max_pending_ready_;' \
+    cache/p50_input_attachment.cpp 'pending ready table has a hard admission bound'
+count 2 'state.ready_pending = false;' \
+    cache/p50_input_attachment.cpp 'ACK retires the one ready event'
+count 1 'state.current_attempt = new_owner.attempt_id;' \
     cache/p50_input_attachment.cpp 'replacement changes ownership only'
-count 1 'return records_.attach(request.key);' cache/p50_input_attachment.cpp \
-    'attachment delegates exact bytes to InputRecordStore'
+count 1 'InputCursor cursor = records_.attach(request.key);' \
+    cache/p50_input_attachment.cpp 'attachment delegates exact bytes to InputRecordStore'
 
 if grep -E -n 'p50_input_attachment|InputAttachmentCore|InputAttempt' \
         "$src/daemon/compiler_input.cpp" "$src/daemon/compiler_input.h" \

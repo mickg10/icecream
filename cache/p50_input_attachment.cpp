@@ -1,7 +1,9 @@
 #include "p50_input_attachment.h"
 
+#include <algorithm>
 #include <functional>
 #include <limits>
+#include <new>
 #include <stdexcept>
 
 namespace icecc::p50 {
@@ -19,24 +21,31 @@ size_t InputAttachmentRequestHash::operator()(
     size_t result = InputRecordKeyHash{}(request.key);
     result = mix(result, std::hash<uint64_t>{}(request.attempt.logical_job));
     result = mix(result, std::hash<uint64_t>{}(request.attempt.attempt_id));
+    result = mix(result,
+                 std::hash<uint64_t>{}(request.attempt.store_generation));
     return mix(result, std::hash<uint64_t>{}(request.request_id));
 }
 
 InputAttachmentCore::InputAttachmentCore(size_t max_records,
                                          uint64_t max_retained_bytes,
                                          size_t max_pending_ready,
-                                         size_t max_replay_entries)
+                                         size_t max_replay_entries,
+                                         size_t max_owner_entries)
     : records_(max_records, max_retained_bytes),
       max_pending_ready_(max_pending_ready),
       max_replay_entries_(max_replay_entries == 0 ? max_pending_ready
-                                                  : max_replay_entries) {
-    if (max_pending_ready_ == 0 || max_replay_entries_ == 0)
+                                                  : max_replay_entries),
+      max_owner_entries_(max_owner_entries == 0 ? max_records
+                                                : max_owner_entries) {
+    if (max_pending_ready_ == 0 || max_replay_entries_ == 0 ||
+        max_owner_entries_ == 0)
         throw std::invalid_argument(
             "InputAttachmentCore limits must be nonzero");
 }
 
 void InputAttachmentCore::validate_attempt(InputAttempt owner) {
-    if (owner.logical_job == 0 || owner.attempt_id == 0)
+    if (owner.logical_job == 0 || owner.attempt_id == 0 ||
+        owner.store_generation == 0)
         throw std::invalid_argument("attachment owner identity must be nonzero");
 }
 
@@ -55,19 +64,45 @@ void InputAttachmentCore::validate_request(
         throw std::invalid_argument("attachment request ID must be nonzero");
 }
 
-InputAttachmentCore::OwnerState& InputAttachmentCore::owner_for(
-    InputRecordKey key, InputAttempt owner) {
-    const auto [position, inserted] = owners_.try_emplace(
-        key, OwnerState{owner.logical_job, owner.attempt_id, false});
-    if (!inserted && position->second.logical_job != owner.logical_job)
-        throw std::logic_error("InputRecord key is owned by another logical job");
-    return position->second;
+void InputAttachmentCore::require_generation(InputAttempt owner) const {
+    if (owner.store_generation != store_generation_)
+        throw std::logic_error("attachment session generation is stale");
 }
 
-const InputAttachmentCore::OwnerState& InputAttachmentCore::owner_for(
+InputAttachmentCore::Lifecycle& InputAttachmentCore::owner_for(
+    InputRecordKey key, InputAttempt owner) {
+    require_generation(owner);
+    const auto position = lifecycles_.find(key);
+    if (position != lifecycles_.end()) {
+        if (position->second.logical_job != owner.logical_job)
+            throw std::logic_error(
+                "InputRecord key is owned by another logical job");
+        return position->second;
+    }
+    if (lifecycles_.size() >= max_owner_entries_)
+        throw std::length_error("attachment owner table exhausted");
+    const Lifecycle state{owner.logical_job,
+                          owner.attempt_id,
+                          owner.store_generation,
+                          false,
+                          false,
+                          false,
+                          std::nullopt,
+                          false,
+                          false,
+                          {},
+                          {}};
+    const auto [inserted_position, inserted] = lifecycles_.emplace(key, state);
+    if (!inserted)
+        throw std::logic_error("attachment lifecycle insertion lost key");
+    return inserted_position->second;
+}
+
+const InputAttachmentCore::Lifecycle& InputAttachmentCore::owner_for(
     InputRecordKey key, InputAttempt owner) const {
-    const auto position = owners_.find(key);
-    if (position == owners_.end())
+    require_generation(owner);
+    const auto position = lifecycles_.find(key);
+    if (position == lifecycles_.end())
         throw std::out_of_range("attachment named no logical job");
     if (position->second.logical_job != owner.logical_job)
         throw std::logic_error("attachment named another logical job");
@@ -76,44 +111,82 @@ const InputAttachmentCore::OwnerState& InputAttachmentCore::owner_for(
 
 void InputAttachmentCore::require_current(InputRecordKey key,
                                           InputAttempt owner) const {
-    const OwnerState& state = owner_for(key, owner);
+    const Lifecycle& state = owner_for(key, owner);
     if (state.current_attempt != owner.attempt_id)
         throw std::logic_error("attachment attempt is stale or revoked");
+}
+
+bool InputAttachmentCore::can_admit_ready() const {
+    return pending_ready_count() < max_pending_ready_;
 }
 
 InputPublishResult InputAttachmentCore::commit_open(
     InputAttempt owner, CStoreGuid c_store_guid, const TxBegin& begin,
     const TxCommit& commit, std::vector<uint8_t> exact_input) {
     validate_attempt(owner);
+    require_generation(owner);
     const InputRecordKey key{c_store_guid, begin.tu_seq};
     validate_key(key);
-    OwnerState& state = owner_for(key, owner);
-    if (state.current_attempt != owner.attempt_id)
-        throw std::logic_error("stale attempt cannot commit InputRecord");
-
-    const bool closed = state.closed;
-    const bool already_present = records_.contains(key);
-    if (!closed && !already_present &&
-        pending_ready_.size() >= max_pending_ready_)
-        throw std::length_error("pending input-ready table exhausted");
-
-    if (closed) {
-        const InputPublishResult result = records_.observe_closed_job_commit(
-            c_store_guid, begin, commit, exact_input);
-        // There is deliberately no ready insertion on a closed logical job.
-        return result;
+    const auto existing = lifecycles_.find(key);
+    if (existing != lifecycles_.end()) {
+        Lifecycle& state = existing->second;
+        if (state.logical_job != owner.logical_job)
+            throw std::logic_error(
+                "InputRecord key is owned by another logical job");
+        if (state.current_attempt != owner.attempt_id)
+            throw std::logic_error("stale attempt cannot commit InputRecord");
+        if (state.closed)
+            return records_.observe_closed_job_commit(
+                c_store_guid, begin, commit, exact_input);
+        // InputRecordStore validates exact identity before accepting an
+        // existing duplicate; no attachment state changes on failure.
+        return records_.publish(c_store_guid, begin, commit,
+                                std::move(exact_input));
     }
 
+    if (next_event_id_ == 0)
+        throw std::overflow_error("input-ready event ID exhausted");
+    if (!can_admit_ready())
+        throw std::length_error("pending input-ready table exhausted");
+    if (lifecycles_.size() >= max_owner_entries_)
+        throw std::length_error("attachment owner table exhausted");
+
+    // Publish the immutable bytes first, but roll them back if the canonical
+    // lifecycle node cannot be installed.  No owner is inserted before exact
+    // validation, capacity checks, and this transaction's commit point.
     const InputPublishResult result = records_.publish(
         c_store_guid, begin, commit, std::move(exact_input));
-    if (result == InputPublishResult::Published) {
-        if (next_event_id_ == 0)
-            throw std::overflow_error("input-ready event ID exhausted");
-        pending_ready_.emplace(
-            key, ReadyEvent{key, next_event_id_++, begin.raw_bytes,
-                            begin.raw_digest});
+    if (result != InputPublishResult::Published)
+        throw std::logic_error("new InputRecord unexpectedly already exists");
+
+    try {
+#ifdef P50_ATTACHMENT_TEST_SEAMS
+        if (fail_lifecycle_insert_) {
+            fail_lifecycle_insert_ = false;
+            throw std::bad_alloc();
+        }
+#endif
+        const Lifecycle state{
+            owner.logical_job,
+            owner.attempt_id,
+            owner.store_generation,
+            false,
+            false,
+            true,
+            ReadyEvent{key, next_event_id_, begin.raw_bytes, begin.raw_digest},
+            false,
+            false,
+            {},
+            {}};
+        const auto [position, inserted] = lifecycles_.emplace(key, state);
+        if (!inserted)
+            throw std::logic_error("InputRecord lifecycle insertion lost key");
+        ++next_event_id_;
+        return result;
+    } catch (...) {
+        records_.rollback_new_record(key);
+        throw;
     }
-    return result;
 }
 
 InputAttachmentReply InputAttachmentCore::make_reply(
@@ -126,56 +199,67 @@ InputAttachmentReply InputAttachmentCore::make_reply(
 InputAttachmentReply InputAttachmentCore::request(
     const InputAttachmentRequest& request) {
     validate_request(request);
-    const auto owner_position = owners_.find(request.key);
-    if (owner_position == owners_.end())
+    require_generation(request.attempt);
+    const auto position = lifecycles_.find(request.key);
+    if (position == lifecycles_.end())
         return InputAttachmentReply{request, 0, 0, {},
                                     InputAttachmentStatus::Unknown, false};
-    const OwnerState& owner = owner_position->second;
-    if (owner.logical_job != request.attempt.logical_job)
+    Lifecycle& state = position->second;
+    if (state.logical_job != request.attempt.logical_job)
         return InputAttachmentReply{request, 0, 0, {},
                                     InputAttachmentStatus::Unknown, false};
-    if (owner.current_attempt != request.attempt.attempt_id)
+    if (state.current_attempt != request.attempt.attempt_id)
         return InputAttachmentReply{request, 0, 0, {},
                                     InputAttachmentStatus::StaleAttempt, false};
-    if (owner.closed)
+    if (state.closed)
         return InputAttachmentReply{request, 0, 0, {},
                                     InputAttachmentStatus::Closed, false};
+    if (!state.ready)
+        return InputAttachmentReply{request, 0, 0, {},
+                                    InputAttachmentStatus::Unknown, false};
 
     const auto stored = replies_.find(request);
-    if (stored != replies_.end()) {
-        // A byte-for-byte request replay gets the original reply, including
-        // its acknowledgement state.  It cannot be rebound to another key or
-        // to a replacement attempt (the current-owner checks above run first).
+    if (stored != replies_.end())
         return stored->second.reply;
-    }
+    if (state.attachment_request_valid &&
+        request == state.attachment_request)
+        return state.attachment_reply;
 
-    const auto ready = pending_ready_.find(request.key);
-    if (ready == pending_ready_.end()) {
-        // A committed record can outlive its notification after ACK.  This is
-        // a replay observation, not a second ready event.
-        if (!records_.contains(request.key))
-            return InputAttachmentReply{request, 0, 0, {},
-                                        InputAttachmentStatus::Unknown, false};
-        const InputCursor cursor = records_.attach(request.key);
-        (void)cursor;
-        const InputAttachmentReply reply{request, 0, 0, {},
-                                         InputAttachmentStatus::ReadyReplay,
-                                         false};
-        if (replies_.size() >= max_replay_entries_)
-            prune_replies();
-        if (replies_.size() >= max_replay_entries_)
-            throw std::length_error("attachment replay table exhausted");
-        replies_.emplace(request, StoredReply{reply, false});
-        return reply;
-    }
-
+    const InputAttachmentStatus status =
+        state.ready_pending ? InputAttachmentStatus::Ready
+                            : InputAttachmentStatus::ReadyReplay;
     const InputAttachmentReply reply =
-        make_reply(request, ready->second, InputAttachmentStatus::Ready, false);
+        make_reply(request, *state.ready, status, false);
     if (replies_.size() >= max_replay_entries_)
         prune_replies();
     if (replies_.size() >= max_replay_entries_)
         throw std::length_error("attachment replay table exhausted");
-    replies_.emplace(request, StoredReply{reply, false});
+
+    try {
+#ifdef P50_ATTACHMENT_TEST_SEAMS
+        if (fail_reply_insert_) {
+            fail_reply_insert_ = false;
+            throw std::bad_alloc();
+        }
+#endif
+        const auto [inserted, was_inserted] =
+            replies_.emplace(request, StoredReply{reply, false});
+        if (!was_inserted)
+            return inserted->second.reply;
+    } catch (...) {
+        // No per-key observation is installed before its bounded replay entry
+        // is durable, so a failed insertion leaves state unchanged.
+        throw;
+    }
+
+    // The first request is the canonical one-attempt authorization token. A
+    // later request ID may be observed/replayed, but cannot create a second
+    // compiler cursor; exact replay of this token remains valid after pruning.
+    if (!state.attachment_request_valid) {
+        state.attachment_request = request;
+        state.attachment_reply = reply;
+        state.attachment_request_valid = true;
+    }
     return reply;
 }
 
@@ -183,32 +267,49 @@ InputAttachmentAckResult InputAttachmentCore::acknowledge(
     const InputAttachmentRequest& request,
     const InputAttachmentReply& reply) {
     validate_request(request);
+    require_generation(request.attempt);
     if (reply.request != request)
         return InputAttachmentAckResult::Rejected;
-    const auto owner_position = owners_.find(request.key);
-    if (owner_position == owners_.end() ||
-        owner_position->second.logical_job != request.attempt.logical_job ||
-        owner_position->second.current_attempt != request.attempt.attempt_id ||
-        owner_position->second.closed)
+    const auto position = lifecycles_.find(request.key);
+    if (position == lifecycles_.end())
         return InputAttachmentAckResult::Rejected;
+    Lifecycle& state = position->second;
+    if (state.logical_job != request.attempt.logical_job ||
+        state.current_attempt != request.attempt.attempt_id || state.closed ||
+        !state.ready)
+        return InputAttachmentAckResult::Rejected;
+
     const auto stored = replies_.find(request);
-    if (stored == replies_.end())
+    const InputAttachmentReply* expected = nullptr;
+    bool already_acknowledged = false;
+    if (stored != replies_.end()) {
+        expected = &stored->second.reply;
+        already_acknowledged = stored->second.acknowledged;
+    } else if (state.attachment_request_valid &&
+               request == state.attachment_request) {
+        expected = &state.attachment_reply;
+        already_acknowledged = state.attachment_reply.acknowledged;
+    }
+    if (!expected || expected->request != reply.request ||
+        expected->event_id != reply.event_id ||
+        expected->raw_bytes != reply.raw_bytes ||
+        expected->raw_digest != reply.raw_digest || expected->status != reply.status)
         return InputAttachmentAckResult::Rejected;
-    const InputAttachmentReply& expected = stored->second.reply;
-    if (expected.request != reply.request || expected.event_id != reply.event_id ||
-        expected.raw_bytes != reply.raw_bytes ||
-        expected.raw_digest != reply.raw_digest ||
-        expected.status != reply.status)
-        return InputAttachmentAckResult::Rejected;
-    if (stored->second.acknowledged)
+    if (already_acknowledged)
         return InputAttachmentAckResult::AlreadyAccepted;
+    if (expected->acknowledged != reply.acknowledged)
+        return InputAttachmentAckResult::Rejected;
     if (reply.status != InputAttachmentStatus::Ready &&
         reply.status != InputAttachmentStatus::ReadyReplay)
         return InputAttachmentAckResult::Rejected;
-    stored->second.acknowledged = true;
-    stored->second.reply.acknowledged = true;
+
+    state.attachment_reply.acknowledged = true;
+    if (stored != replies_.end()) {
+        stored->second.acknowledged = true;
+        stored->second.reply.acknowledged = true;
+    }
     if (reply.status == InputAttachmentStatus::Ready)
-        pending_ready_.erase(request.key);
+        state.ready_pending = false;
     return InputAttachmentAckResult::Accepted;
 }
 
@@ -216,34 +317,40 @@ InputCursor InputAttachmentCore::attach(
     const InputAttachmentRequest& request,
     const InputAttachmentReply& reply) const {
     validate_request(request);
+    require_generation(request.attempt);
     if (reply.request != request ||
         (reply.status != InputAttachmentStatus::Ready &&
          reply.status != InputAttachmentStatus::ReadyReplay))
         throw std::logic_error("attachment reply identity or status mismatch");
-    require_current(request.key, request.attempt);
-    const OwnerState& state = owner_for(request.key, request.attempt);
+    const Lifecycle& state = owner_for(request.key, request.attempt);
     if (state.closed)
         throw std::logic_error("compiler attachment arrived after closure");
-    const auto stored = replies_.find(request);
-    if (stored == replies_.end())
-        throw std::logic_error("attachment reply was never requested");
-    const InputAttachmentReply& expected = stored->second.reply;
+    if (state.attachment_admitted)
+        throw std::logic_error("logical attempt already owns an attachment");
+    if (!state.attachment_request_valid ||
+        request != state.attachment_request)
+        throw std::logic_error("attachment request is not the canonical attempt token");
+    const InputAttachmentReply& expected = state.attachment_reply;
     if (expected.request != reply.request || expected.event_id != reply.event_id ||
         expected.raw_bytes != reply.raw_bytes ||
-        expected.raw_digest != reply.raw_digest ||
-        expected.status != reply.status)
+        expected.raw_digest != reply.raw_digest || expected.status != reply.status)
         throw std::logic_error("attachment reply is stale or forged");
-    return records_.attach(request.key);
+    InputCursor cursor = records_.attach(request.key);
+    // The cursor owns the immutable backing. Only after that handoff succeeds
+    // does this attempt become permanently single-attachment.
+    state.attachment_admitted = true;
+    return cursor;
 }
 
 void InputAttachmentCore::cancel(InputAttempt owner, InputRecordKey key) {
     validate_attempt(owner);
     validate_key(key);
-    OwnerState& state = owner_for(key, owner);
+    Lifecycle& state = owner_for(key, owner);
     if (state.current_attempt != owner.attempt_id)
         throw std::logic_error("attachment attempt is stale or revoked");
     state.closed = true;
-    pending_ready_.erase(key);
+    state.ready_pending = false;
+    purge_replies(key);
     if (records_.contains(key))
         records_.close_job(key);
 }
@@ -254,12 +361,24 @@ void InputAttachmentCore::replace_attempt(InputAttempt old_owner,
     validate_attempt(old_owner);
     validate_attempt(new_owner);
     validate_key(key);
+    require_generation(old_owner);
+    require_generation(new_owner);
     if (old_owner.logical_job != new_owner.logical_job)
         throw std::invalid_argument("replacement changed logical job identity");
-    require_current(key, old_owner);
-    if (owners_.at(key).closed)
+    if (old_owner.attempt_id == new_owner.attempt_id)
+        throw std::invalid_argument("replacement reused ATTEMPT_ID");
+    if (old_owner.store_generation != new_owner.store_generation)
+        throw std::invalid_argument("replacement changed store generation");
+    Lifecycle& state = owner_for(key, old_owner);
+    if (state.current_attempt != old_owner.attempt_id)
+        throw std::logic_error("attachment attempt is stale or revoked");
+    if (state.closed)
         throw std::logic_error("closed logical job cannot be replaced");
-    owners_.at(key).current_attempt = new_owner.attempt_id;
+    purge_replies(key);
+    state.current_attempt = new_owner.attempt_id;
+    state.attachment_admitted = false;
+    state.attachment_request_valid = false;
+    state.attachment_reply = {};
 }
 
 void InputAttachmentCore::retry(InputAttempt old_owner, uint64_t new_attempt_id,
@@ -267,22 +386,42 @@ void InputAttachmentCore::retry(InputAttempt old_owner, uint64_t new_attempt_id,
     if (new_attempt_id == 0)
         throw std::invalid_argument("retry ATTEMPT_ID must be nonzero");
     replace_attempt(old_owner,
-                    InputAttempt{old_owner.logical_job, new_attempt_id}, key);
+                    InputAttempt{old_owner.logical_job, new_attempt_id,
+                                 old_owner.store_generation},
+                    key);
 }
 
 InputPublishResult InputAttachmentCore::observe_closed_commit(
     InputAttempt owner, CStoreGuid c_store_guid, const TxBegin& begin,
     const TxCommit& commit, std::span<const uint8_t> exact_input) {
     validate_attempt(owner);
+    require_generation(owner);
     const InputRecordKey key{c_store_guid, begin.tu_seq};
     validate_key(key);
-    const OwnerState& state = owner_for(key, owner);
+    Lifecycle& state = owner_for(key, owner);
     if (state.current_attempt != owner.attempt_id)
         throw std::logic_error("stale attempt cannot observe closed commit");
     if (!state.closed)
         throw std::logic_error("closed commit observed for open logical job");
-    return records_.observe_closed_job_commit(c_store_guid, begin, commit,
-                                               exact_input);
+    const InputPublishResult result = records_.observe_closed_job_commit(
+        c_store_guid, begin, commit, exact_input);
+    state.closed_commit_observed = true;
+    collect_lifecycles();
+    return result;
+}
+
+void InputAttachmentCore::release_closed_owner(InputAttempt owner,
+                                                InputRecordKey key) {
+    validate_attempt(owner);
+    validate_key(key);
+    Lifecycle& state = owner_for(key, owner);
+    if (state.current_attempt != owner.attempt_id || !state.closed)
+        throw std::logic_error("only the current closed owner can be released");
+    if (records_.contains(key))
+        throw std::logic_error("closed owner still retains an InputRecord");
+    state.closed_commit_observed = true;
+    purge_replies(key);
+    collect_lifecycles();
 }
 
 void InputAttachmentCore::prune_replies() {
@@ -294,22 +433,57 @@ void InputAttachmentCore::prune_replies() {
     }
 }
 
-void InputAttachmentCore::collect_garbage() {
-    records_.collect_garbage();
+void InputAttachmentCore::purge_replies(InputRecordKey key) {
     for (auto position = replies_.begin(); position != replies_.end();) {
-        if (position->second.acknowledged &&
-            !records_.contains(position->first.key))
+        if (position->first.key == key)
             position = replies_.erase(position);
         else
             ++position;
     }
 }
 
+void InputAttachmentCore::collect_lifecycles() {
+    for (auto position = lifecycles_.begin(); position != lifecycles_.end();) {
+        const Lifecycle& state = position->second;
+        const bool has_replies = std::any_of(
+            replies_.begin(), replies_.end(), [&](const auto& reply) {
+                return reply.first.key == position->first;
+            });
+        if (state.closed && state.closed_commit_observed &&
+            !records_.contains(position->first) && !has_replies)
+            position = lifecycles_.erase(position);
+        else
+            ++position;
+    }
+}
+
+void InputAttachmentCore::collect_garbage() {
+    records_.collect_garbage();
+    for (auto position = replies_.begin(); position != replies_.end();) {
+        if (!records_.contains(position->first.key) &&
+            lifecycles_.contains(position->first.key) &&
+            lifecycles_.at(position->first.key).closed)
+            position = replies_.erase(position);
+        else
+            ++position;
+    }
+    collect_lifecycles();
+}
+
+size_t InputAttachmentCore::pending_ready_count() const {
+    size_t count = 0;
+    for (const auto& position : lifecycles_)
+        if (position.second.ready_pending) ++count;
+    return count;
+}
+
 void InputAttachmentCore::clear() {
+    if (store_generation_ == std::numeric_limits<uint64_t>::max())
+        throw std::overflow_error("attachment store generation exhausted");
     records_.clear();
-    owners_.clear();
-    pending_ready_.clear();
+    lifecycles_.clear();
     replies_.clear();
+    ++store_generation_;
     next_event_id_ = 1;
 }
 

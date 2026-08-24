@@ -13,6 +13,8 @@
 
 namespace icecc::p50 {
 
+class InputAttachmentCore;
+
 // Input identity is deliberately independent of compiler ATTEMPT_ID. A
 // replacement compiler on the same F attaches to the same exact input without
 // creating another cache transaction or advancing route history again.
@@ -129,6 +131,13 @@ public:
     }
 
 private:
+    friend class InputAttachmentCore;
+
+    // Roll back the one record just published by a transactional caller
+    // before any cursor can escape.  This is intentionally private to the
+    // attachment core rather than a general deletion API.
+    void rollback_new_record(InputRecordKey key);
+
     struct Entry {
         uint64_t raw_bytes = 0;
         Digest128 raw_digest{};

@@ -9,7 +9,7 @@ rm -rf "$build"
 mkdir -p "$build"
 
 : "${CXX:=g++}"
-flags="-std=c++23 -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined,leak"
+flags="-std=c++23 -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined,leak -DP50_ATTACHMENT_TEST_SEAMS"
 XXHASH_CFLAGS=${XXHASH_CFLAGS:-}
 XXHASH_LIBS=${XXHASH_LIBS:--lxxhash}
 libs="-lzstd $XXHASH_LIBS"

@@ -176,6 +176,20 @@ void InputRecordStore::clear() {
     retained_bytes_ = 0;
 }
 
+void InputRecordStore::rollback_new_record(InputRecordKey key) {
+    const auto position = records_.find(key);
+    if (position == records_.end())
+        throw std::logic_error("transactional InputRecord rollback lost key");
+    Entry& entry = position->second;
+    if (!entry.logical_job_open || !entry.backing ||
+        entry.backing.use_count() != 1)
+        throw std::logic_error("transactional InputRecord rollback was not exclusive");
+    if (entry.raw_bytes > retained_bytes_)
+        throw std::logic_error("InputRecord rollback accounting underflow");
+    retained_bytes_ -= entry.raw_bytes;
+    records_.erase(position);
+}
+
 bool InputRecordStore::contains(InputRecordKey key) const {
     return records_.contains(key);
 }
