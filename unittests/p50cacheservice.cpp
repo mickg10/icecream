@@ -39,6 +39,13 @@ std::string service_path() {
     return value;
 }
 
+std::string ready_close_shim_path() {
+    const char* value = std::getenv("ICECC_TEST_READY_CLOSE_SHIM");
+    if (value == nullptr || value[0] != '/')
+        throw std::runtime_error("ICECC_TEST_READY_CLOSE_SHIM must be absolute");
+    return value;
+}
+
 bool write_all(int fd, std::span<const uint8_t> bytes) {
     size_t offset = 0;
     while (offset != bytes.size()) {
@@ -99,6 +106,31 @@ struct Child {
     }
     Child(const Child&) = delete;
     Child& operator=(const Child&) = delete;
+};
+
+struct ReapOnFailure {
+    pid_t pid = -1;
+    std::array<int*, 5> descriptors{};
+
+    ReapOnFailure(pid_t child, std::array<int*, 5> values)
+        : pid(child), descriptors(values) {}
+
+    ~ReapOnFailure() {
+        if (pid > 0) {
+            (void)::kill(pid, SIGKILL);
+            int status = 0;
+            while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+            }
+        }
+        for (int* descriptor : descriptors) {
+            if (descriptor != nullptr && *descriptor >= 0) {
+                (void)::close(*descriptor);
+                *descriptor = -1;
+            }
+        }
+    }
+    ReapOnFailure(const ReapOnFailure&) = delete;
+    ReapOnFailure& operator=(const ReapOnFailure&) = delete;
 };
 
 void expect_exact_ready_then_eof(int fd) {
@@ -473,6 +505,113 @@ void frame_header_and_payload_share_one_deadline() {
     writer_owner.pid = -1;
 }
 
+bool wait_for_socket_node(const std::string& path, int timeout_milliseconds) {
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(timeout_milliseconds);
+    struct stat info{};
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (::lstat(path.c_str(), &info) == 0)
+            return S_ISSOCK(info.st_mode);
+        if (errno != ENOENT)
+            return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return false;
+}
+
+bool wait_for_exit_bounded(pid_t pid, int timeout_milliseconds, int& status) {
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(timeout_milliseconds);
+    for (;;) {
+        const pid_t result = ::waitpid(pid, &status, WNOHANG);
+        if (result == pid)
+            return true;
+        if (result < 0 && errno == EINTR)
+            continue;
+        if (result < 0 || std::chrono::steady_clock::now() >= deadline)
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    (void)::kill(pid, SIGKILL);
+    while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+    }
+    return false;
+}
+
+void ready_reader_close_after_bind_is_fail_closed() {
+    char template_path[] = "/tmp/icecc-cache-service-ready-close-XXXXXX";
+    const int directory_fd = ::mkstemp(template_path);
+    CHECK(directory_fd >= 0);
+    CHECK(::close(directory_fd) == 0);
+    CHECK(::unlink(template_path) == 0);
+    CHECK(::mkdir(template_path, 0700) == 0);
+
+    int ready[2] = {-1, -1};
+    int gate[2] = {-1, -1};
+    int acknowledgement[2] = {-1, -1};
+    CHECK(::pipe(ready) == 0);
+    CHECK(::pipe(gate) == 0);
+    CHECK(::pipe(acknowledgement) == 0);
+    const std::string socket = std::string(template_path) + "/service.sock";
+    const std::string ready_fd = std::to_string(ready[1]);
+    const std::string gate_fd = std::to_string(gate[0]);
+    const std::string acknowledgement_fd = std::to_string(acknowledgement[1]);
+    const std::string shim = ready_close_shim_path();
+    const std::string executable = service_path();
+    const std::string uid = std::to_string(static_cast<uint64_t>(::getuid()));
+    const std::string gid = std::to_string(static_cast<uint64_t>(::getgid()));
+    const pid_t pid = ::fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        (void)::close(ready[0]);
+        (void)::close(gate[1]);
+        (void)::close(acknowledgement[0]);
+        (void)::setenv("ICECC_CACHE_SERVICE_READY_FD", ready_fd.c_str(), 1);
+        (void)::setenv("ICECC_TEST_READY_WRITE_FD", ready_fd.c_str(), 1);
+        (void)::setenv("ICECC_TEST_READY_GATE_FD", gate_fd.c_str(), 1);
+        (void)::setenv("ICECC_TEST_READY_ACK_FD", acknowledgement_fd.c_str(), 1);
+        (void)::setenv("LD_PRELOAD", shim.c_str(), 1);
+        ::execl(executable.c_str(), executable.c_str(), "--socket", socket.c_str(),
+                "--peer-uid", uid.c_str(), "--peer-gid", gid.c_str(), "--generation", "7",
+                "--attempt", "1", static_cast<char*>(nullptr));
+        _exit(127);
+    }
+
+    (void)::close(ready[1]);
+    ready[1] = -1;
+    (void)::close(gate[0]);
+    gate[0] = -1;
+    (void)::close(acknowledgement[1]);
+    acknowledgement[1] = -1;
+    ReapOnFailure cleanup{pid, {&ready[0], &ready[1], &gate[0], &gate[1],
+                               &acknowledgement[0]}};
+
+    // The preload gate holds the child immediately before write(READY).  The
+    // visible socket therefore proves bind/listen completed, while the close
+    // below deterministically makes the subsequent write fail with EPIPE.
+    CHECK(wait_for_socket_node(socket, 2000));
+    struct pollfd gate_seen{acknowledgement[0], POLLIN | POLLHUP, 0};
+    CHECK(::poll(&gate_seen, 1, 2000) > 0);
+    char gate_ack = 0;
+    CHECK(::read(acknowledgement[0], &gate_ack, 1) == 1 && gate_ack == 1);
+    CHECK(::close(acknowledgement[0]) == 0);
+    acknowledgement[0] = -1;
+    CHECK(::close(ready[0]) == 0);
+    ready[0] = -1;
+    const uint8_t release = 1;
+    CHECK(write_all(gate[1], std::span<const uint8_t>(&release, 1)));
+    CHECK(::close(gate[1]) == 0);
+    gate[1] = -1;
+
+    int status = 0;
+    CHECK(wait_for_exit_bounded(pid, 2000, status));
+    cleanup.pid = -1;
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 2);
+    CHECK(::kill(pid, 0) < 0 && errno == ESRCH);
+    CHECK(::access(socket.c_str(), F_OK) != 0);
+    CHECK(::rmdir(template_path) == 0);
+}
+
 void ready_requires_bind_and_replacement_is_preserved() {
     char template_path[] = "/tmp/icecc-cache-service-test-XXXXXX";
     const int directory_fd = ::mkstemp(template_path);
@@ -516,6 +655,7 @@ int main() {
         rejects_identity_role_and_malformed();
         slowloris_deadline_is_total_and_listener_recovers();
         frame_header_and_payload_share_one_deadline();
+        ready_reader_close_after_bind_is_fail_closed();
         ready_requires_bind_and_replacement_is_preserved();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "p50cacheservice: %s\n", error.what());

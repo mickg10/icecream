@@ -9,11 +9,13 @@
 #include <fcntl.h>
 #include <limits>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <grp.h>
 #include <string_view>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <utility>
@@ -124,7 +126,7 @@ bool parse_ready_fd(OwnedFd& ready) noexcept {
     return true;
 }
 
-bool write_exact(int fd, std::string_view bytes) noexcept {
+bool write_exact(int fd, std::string_view bytes, int* failure_errno = nullptr) noexcept {
     size_t written = 0;
     while (written != bytes.size()) {
         const ssize_t result = ::write(fd, bytes.data() + written, bytes.size() - written);
@@ -134,9 +136,87 @@ bool write_exact(int fd, std::string_view bytes) noexcept {
         }
         if (result < 0 && errno == EINTR)
             continue;
+        if (failure_errno != nullptr)
+            *failure_errno = result < 0 ? errno : EIO;
         return false;
     }
     return true;
+}
+
+// A pipe has no MSG_NOSIGNAL equivalent.  Block SIGPIPE only in this
+// service thread while publishing readiness, then consume a signal generated
+// by this write before restoring the caller's mask.  In particular, do not
+// install SIG_IGN: the service is also used as a small library-shaped entry
+// point in tests, and unrelated SIGPIPE behavior must remain untouched.
+struct ReadySignalGuard {
+    sigset_t signal_set{};
+    sigset_t old_mask{};
+    bool was_pending = false;
+    bool active = false;
+
+    ReadySignalGuard() = default;
+
+    bool enter() noexcept {
+        if (::sigemptyset(&signal_set) != 0 || ::sigaddset(&signal_set, SIGPIPE) != 0)
+            return false;
+        if (::pthread_sigmask(SIG_BLOCK, &signal_set, &old_mask) != 0)
+            return false;
+        active = true;
+
+        sigset_t pending{};
+        const int member = ::sigpending(&pending) == 0 ? ::sigismember(&pending, SIGPIPE) : -1;
+        if (member < 0) {
+            (void)finish(false);
+            return false;
+        }
+        was_pending = member != 0;
+        return true;
+    }
+
+    bool finish(bool consume_write_signal) noexcept {
+        if (!active)
+            return true;
+        bool ok = true;
+        if (consume_write_signal && !was_pending) {
+            sigset_t pending{};
+            const int member =
+                ::sigpending(&pending) == 0 ? ::sigismember(&pending, SIGPIPE) : -1;
+            if (member < 0) {
+                ok = false;
+            } else if (member != 0) {
+                const struct timespec no_wait{0, 0};
+                for (;;) {
+                    const int result = ::sigtimedwait(&signal_set, nullptr, &no_wait);
+                    if (result == SIGPIPE)
+                        break;
+                    if (result < 0 && errno == EINTR)
+                        continue;
+                    if (result < 0 && errno == EAGAIN)
+                        break;
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if (::pthread_sigmask(SIG_SETMASK, &old_mask, nullptr) != 0)
+            ok = false;
+        active = false;
+        return ok;
+    }
+
+    ~ReadySignalGuard() { (void)finish(false); }
+    ReadySignalGuard(const ReadySignalGuard&) = delete;
+    ReadySignalGuard& operator=(const ReadySignalGuard&) = delete;
+};
+
+bool write_ready(int fd) noexcept {
+    ReadySignalGuard signal_guard;
+    if (!signal_guard.enter())
+        return false;
+    int failure_errno = 0;
+    const bool written = write_exact(fd, kReadyMessage, &failure_errno);
+    const bool signal_state_ok = signal_guard.finish(failure_errno == EPIPE);
+    return written && signal_state_ok;
 }
 
 bool drop_and_prove(const Options& options) noexcept {
@@ -349,7 +429,7 @@ int run(const Options& options) noexcept {
         cleanup_listener(listener, options.socket_path, identity);
         return 2;
     }
-    if (g_stop_requested != 0 || !write_exact(ready.fd, kReadyMessage)) {
+    if (g_stop_requested != 0 || !write_ready(ready.fd)) {
         cleanup_listener(listener, options.socket_path, identity);
         return 2;
     }
