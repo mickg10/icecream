@@ -46,8 +46,10 @@ public:
     CacheSessionDispatcher(CacheSessionDispatcher&&) = delete;
     CacheSessionDispatcher& operator=(CacheSessionDispatcher&&) = delete;
 
-    // Takes ownership only of an already-authenticated private relationship.
-    // An unauthenticated or invalid connection is closed and not retained.
+    // Takes ownership only of an OS-credential-authenticated private
+    // relationship whose HELLO_ACK proves the constructor-bound generation
+    // and attempt.  An unauthenticated, stale, or malformed connection is
+    // closed and not retained.
     bool attach_authenticated(local::Connection connection,
                               local::Identity identity) noexcept;
     void disable() noexcept;

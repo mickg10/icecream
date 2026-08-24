@@ -8,6 +8,7 @@ namespace icecc::p50::daemon {
 namespace {
 
 constexpr uint32_t kCacheSession = 0x50f00000u;
+constexpr int kHandshakeTimeoutMilliseconds = 250;
 
 } // namespace
 
@@ -27,11 +28,29 @@ bool CacheSessionDispatcher::valid_identity(local::Identity identity) noexcept {
 bool CacheSessionDispatcher::attach_authenticated(local::Connection connection,
                                                    local::Identity identity) noexcept {
     if (!connection.valid() || !connection.peer_credentials_verified() ||
-        !valid_identity(identity)) {
+        !valid_identity(identity) || identity != identity_) {
+        return false;
+    }
+
+    // Credential authentication alone does not bind a socket to the current
+    // supervised sidecar incarnation.  Complete the private HELLO exchange on
+    // this very connection before it can become the descriptor-handoff owner.
+    // The caller cannot replace identity_ with a stale/non-current value.
+    if (connection.send(local::make_hello(local::PeerRole::Daemon, identity_)) !=
+        local::Status::Ok) {
+        return false;
+    }
+    local::Frame acknowledgement;
+    if (connection.receive_with_timeout(acknowledgement,
+                                        kHandshakeTimeoutMilliseconds) !=
+            local::Status::Ok ||
+        local::validate_handshake(acknowledgement,
+                                  local::MessageType::HelloAck,
+                                  local::PeerRole::Sidecar,
+                                  identity_) != local::Status::Ok) {
         return false;
     }
     sidecar_.reset();
-    identity_ = identity;
     sidecar_.emplace(std::move(connection));
     return true;
 }

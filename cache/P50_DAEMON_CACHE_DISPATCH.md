@@ -1,8 +1,8 @@
 # Protocol-50 daemon cache-session dispatch
 
 `p50_daemon_cache_dispatch` is the bounded daemon adapter between the real
-`iceccd` ordinary-link event loop and the already-authenticated private
-sidecar relationship.  The public TCP/unix listener remains in `iceccd`.
+`iceccd` ordinary-link event loop and a private sidecar relationship.  The
+public TCP/unix listener remains in `iceccd`.
 
 The adapter accepts only an exactly decoded `CACHE_SESSION` discriminator on a
 negotiated Protocol-50 `MsgChannel`.  If the sidecar is unavailable it returns
@@ -15,14 +15,17 @@ one-shot exchange.
 
 Each request binds the supervisor/store generation, logical attempt, and a
 monotonic nonzero request id.  Peer credentials must already be verified on
-the exact move-only `Connection`; stale identity, disconnect, duplicate,
-timeout, malformed ACK, or sidecar restart therefore fails closed.  No cache
-bytes are read by this adapter, no second listener is created, and Login
-advertisement remains the existing `0/0/0` until a separate reviewed READY
-integration.
+the exact move-only `Connection`, and `attach_authenticated()` then performs
+the HELLO/HELLO_ACK exchange itself against the constructor-bound identity.
+The caller cannot replace that identity.  Stale identity, disconnect,
+duplicate, timeout, malformed ACK, or sidecar restart therefore fails closed.
+No cache bytes are read by this adapter, no second listener is created, and
+Login advertisement remains the existing `0/0/0` until a separate reviewed
+READY integration.
 
 The daemon starts with the controller unavailable because the lifecycle-only
-supervisor/service checkpoint intentionally does not yet expose a long-lived
-authenticated connection.  A later adapter may call
-`attach_authenticated()` after supervisor/store generation validation without
-changing ordinary-link parsing or ownership rules.
+supervisor/service checkpoint intentionally does not yet expose a live
+connection to this object.  A later adapter may connect the private socket,
+verify OS peer credentials, and call `attach_authenticated()`; the method
+itself proves the current sidecar identity before retaining the relationship,
+without changing ordinary-link parsing or ownership rules.

@@ -1,4 +1,4 @@
-TESTS = testargs lockexec backpressure schedpolicy utf8test statewritertest fastesttest hallflowtest jobidalloctest inputpump compilerinput p49assignment p50assignment p50cacheadvertisement p50cachesession p50daemoncachedispatch p50assignment-source.sh p50cacheadvertisement-source.sh p50cachesession-source.sh p50daemoncachedispatch-source.sh p50localtransport-source.sh p50sidecarsupervisor-source.sh p50endpoint-source.sh p50fdhandoff-source.sh p50fdhandoff-sanitize.sh packagebuilderdeps.sh p49daemon-run.sh p49scheduler-run.sh connectivity-run.sh schedbp-quick.sh schedstress-quick.sh remoteice-quick.sh p50assignment-remote.sh daemonlogin-run.sh daemonbatch-run.sh cachehandoffdaemon-run.sh daemoncachedispatch-run.sh boost-prefix-scope.sh p50wire p50slice0 p50zstd p50zstdwindow p50inputrecord p50inputrecordlate p50inputrecordreopen p50endpoint p50localtransport p50sidecarsupervisor p50cacheservice p50fdhandoff digest128bench p50_trace_check.sh
+TESTS = testargs lockexec backpressure schedpolicy utf8test statewritertest fastesttest hallflowtest jobidalloctest inputpump compilerinput p49assignment p50assignment p50cacheadvertisement p50cachesession p50daemoncachedispatch p50assignment-source.sh p50cacheadvertisement-source.sh p50cachesession-source.sh p50daemoncachedispatch-source.sh p50daemoncachedispatch-sanitize.sh p50localtransport-source.sh p50sidecarsupervisor-source.sh p50endpoint-source.sh p50fdhandoff-source.sh p50fdhandoff-sanitize.sh packagebuilderdeps.sh p49daemon-run.sh p49scheduler-run.sh connectivity-run.sh schedbp-quick.sh schedstress-quick.sh remoteice-quick.sh p50assignment-remote.sh daemonlogin-run.sh daemonbatch-run.sh cachehandoffdaemon-run.sh daemoncachedispatch-run.sh boost-prefix-scope.sh p50wire p50slice0 p50zstd p50zstdwindow p50inputrecord p50inputrecordlate p50inputrecordreopen p50endpoint p50localtransport p50sidecarsupervisor p50cacheservice p50fdhandoff digest128bench p50_trace_check.sh
 
 AM_TESTS_ENVIRONMENT = \
 	ICECC_TEST_BUILDDIR='$(abs_builddir)'; export ICECC_TEST_BUILDDIR; \
@@ -134,7 +134,7 @@ p50cachesession_CXXFLAGS = -pthread
 p50cachesession_LDFLAGS = -pthread
 p50cachesession_LDADD = ../services/libicecc.la
 p50daemoncachedispatch_SOURCES = p50_daemon_cache_dispatch_test.cpp \
-	../daemon/p50_daemon_cache_dispatch.cpp \
+	../cache/p50_daemon_cache_dispatch.cpp \
 	../cache/p50_fd_handoff.cpp ../cache/p50_local_transport.cpp
 p50daemoncachedispatch_CPPFLAGS = $(AM_CPPFLAGS)
 p50daemoncachedispatch_CXXFLAGS = -pthread

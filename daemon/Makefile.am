@@ -5,7 +5,7 @@ iceccd_SOURCES = \
 	serve.cpp \
 	compiler_input.cpp \
 	workit.cpp \
-	p50_daemon_cache_dispatch.cpp \
+	../cache/p50_daemon_cache_dispatch.cpp \
 	environment.cpp \
 	load.cpp \
 	file_util.cpp \

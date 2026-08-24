@@ -19,7 +19,11 @@ using icecc::p50::daemon::CacheSessionDispatcher;
 using icecc::p50::local::Connection;
 using icecc::p50::local::CredentialExpectation;
 using icecc::p50::local::FdHandoffReceiver;
+using icecc::p50::local::Frame;
 using icecc::p50::local::Identity;
+using icecc::p50::local::MessageType;
+using icecc::p50::local::PeerRole;
+using icecc::p50::local::Status;
 
 namespace {
 
@@ -66,6 +70,41 @@ void authenticate(Connection &connection) {
           "private relationship peer credentials authenticated");
 }
 
+bool attach_with_ack(CacheSessionDispatcher &dispatcher,
+                     Connection daemon_side,
+                     Connection &sidecar_side,
+                     Identity requested_identity,
+                     Frame acknowledgement) {
+    bool hello_valid = false;
+    bool acknowledgement_sent = false;
+    std::thread sidecar([&] {
+        Frame hello;
+        hello_valid = sidecar_side.receive_with_timeout(hello, 1000) == Status::Ok &&
+                      icecc::p50::local::validate_handshake(
+                          hello, MessageType::Hello, PeerRole::Daemon,
+                          requested_identity) == Status::Ok;
+        if (hello_valid) {
+            acknowledgement_sent = sidecar_side.send(acknowledgement) == Status::Ok;
+        }
+    });
+    const bool attached = dispatcher.attach_authenticated(
+        std::move(daemon_side), requested_identity);
+    sidecar.join();
+    CHECK(hello_valid, "sidecar validates daemon HELLO on the retained connection");
+    CHECK(acknowledgement_sent, "sidecar sends bounded HELLO_ACK");
+    return attached;
+}
+
+bool attach_current(CacheSessionDispatcher &dispatcher,
+                    Connection daemon_side,
+                    Connection &sidecar_side,
+                    Identity identity) {
+    return attach_with_ack(dispatcher, std::move(daemon_side), sidecar_side,
+                           identity,
+                           icecc::p50::local::make_hello_ack(PeerRole::Sidecar,
+                                                             identity));
+}
+
 void send_cache_session(MsgChannel *sender) {
     CHECK(sender->send_msg(CacheSessionMsg()), "P50 CACHE_SESSION sent on ordinary link");
 }
@@ -91,8 +130,9 @@ int main() {
         authenticate(receiver_side);
 
         CacheSessionDispatcher dispatcher(Identity{7, 11});
-        CHECK(dispatcher.attach_authenticated(std::move(daemon_side), Identity{7, 11}),
-              "dispatcher accepts only authenticated sidecar");
+        CHECK(attach_current(dispatcher, std::move(daemon_side), receiver_side,
+                             Identity{7, 11}),
+              "dispatcher accepts credential- and HELLO-authenticated sidecar");
         send_cache_session(ordinary.left);
         Msg *decoded = ordinary.right->get_msg(2, true);
         CHECK(decoded && *decoded == Msg::CACHE_SESSION,
@@ -154,8 +194,9 @@ int main() {
         authenticate(daemon_side);
         authenticate(receiver_side);
         CacheSessionDispatcher dispatcher(Identity{10, 4});
-        CHECK(dispatcher.attach_authenticated(std::move(daemon_side), Identity{10, 4}),
-              "release-barrier dispatcher attached");
+        CHECK(attach_current(dispatcher, std::move(daemon_side), receiver_side,
+                             Identity{10, 4}),
+              "release-barrier dispatcher attached after HELLO");
         send_cache_session(ordinary.left);
         Msg *decoded = ordinary.right->get_msg(2, true);
         const unsigned char next = 0x43;
@@ -188,9 +229,9 @@ int main() {
         authenticate(receiver_side);
         CacheSessionDispatcher dispatcher(Identity{timeout ? 15u : 14u, 6},
                                            std::chrono::milliseconds(timeout ? 20 : 250));
-        CHECK(dispatcher.attach_authenticated(std::move(daemon_side),
-                                              Identity{timeout ? 15u : 14u, 6}),
-              "terminal-handoff dispatcher attached");
+        CHECK(attach_current(dispatcher, std::move(daemon_side), receiver_side,
+                             Identity{timeout ? 15u : 14u, 6}),
+              "terminal-handoff dispatcher attached after HELLO");
         send_cache_session(ordinary.left);
         Msg *decoded = ordinary.right->get_msg(2, true);
         if (!timeout) {
@@ -216,6 +257,80 @@ int main() {
         const auto ping_outcome = dispatcher.dispatch(*p49.right, 50, 0x00000042u);
         CHECK(ping_outcome.result == CacheDispatchResult::NotCacheSession,
               "normal ordinary job is not misclassified as CACHE_SESSION");
+    }
+
+    /* Neither caller-supplied identity replacement nor a stale sidecar ACK
+       may bind a control relationship to this dispatcher incarnation. */
+    {
+        int side_fds[2] = {-1, -1};
+        CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, side_fds) == 0,
+              "stale-identity sidecar pair created");
+        Connection daemon_side(side_fds[0]);
+        Connection sidecar_side(side_fds[1]);
+        authenticate(daemon_side);
+        authenticate(sidecar_side);
+        CacheSessionDispatcher dispatcher(Identity{30, 4});
+        CHECK(!dispatcher.attach_authenticated(std::move(daemon_side), Identity{29, 4}),
+              "caller cannot replace constructor-bound generation");
+        CHECK(!dispatcher.available(), "stale caller identity retains no relationship");
+    }
+    {
+        int side_fds[2] = {-1, -1};
+        CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, side_fds) == 0,
+              "wrong-ACK sidecar pair created");
+        Connection daemon_side(side_fds[0]);
+        Connection sidecar_side(side_fds[1]);
+        authenticate(daemon_side);
+        authenticate(sidecar_side);
+        CacheSessionDispatcher dispatcher(Identity{31, 5});
+        CHECK(!attach_with_ack(
+                  dispatcher, std::move(daemon_side), sidecar_side,
+                  Identity{31, 5},
+                  icecc::p50::local::make_hello_ack(PeerRole::Sidecar,
+                                                    Identity{30, 5})),
+              "stale sidecar generation in HELLO_ACK is rejected");
+        CHECK(!dispatcher.available(), "wrong ACK retains no relationship");
+    }
+
+    /* Fresh authenticated one-shot relationships within one live sidecar
+       incarnation receive strictly increasing request IDs. */
+    {
+        CacheSessionDispatcher dispatcher(Identity{40, 2});
+        for (uint64_t request_id = 1; request_id <= 2; ++request_id) {
+            MsgPair ordinary = ordinary_pair();
+            int side_fds[2] = {-1, -1};
+            CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, side_fds) == 0,
+                  "repeat relationship sidecar pair created");
+            Connection daemon_side(side_fds[0]);
+            Connection receiver_side(side_fds[1]);
+            authenticate(daemon_side);
+            authenticate(receiver_side);
+            CHECK(attach_current(dispatcher, std::move(daemon_side), receiver_side,
+                                 Identity{40, 2}),
+                  "fresh relationship reattaches to the same live incarnation");
+            send_cache_session(ordinary.left);
+            Msg *decoded = ordinary.right->get_msg(2, true);
+            FdHandoffReceiver receiver;
+            icecc::p50::local::FdHandoffResult receive_result;
+            std::thread receiver_thread([&] {
+                receive_result = receiver.receive_and_ack(
+                    receiver_side,
+                    icecc::p50::local::HandoffRequest{Identity{40, 2}, request_id},
+                    std::chrono::steady_clock::now() + std::chrono::seconds(2));
+            });
+            const auto outcome = dispatcher.dispatch(
+                *ordinary.right, ordinary.right->protocol,
+                static_cast<uint32_t>(*decoded));
+            receiver_thread.join();
+            delete decoded;
+            CHECK(outcome.result == CacheDispatchResult::Accepted &&
+                      outcome.request.request_id == request_id &&
+                      receive_result.status ==
+                          icecc::p50::local::FdHandoffStatus::Accepted,
+                  "request IDs are monotonic across fresh one-shot relationships");
+            auto adopted = receiver.take_adopted_fd();
+            adopted.reset();
+        }
     }
     return failures ? 1 : 0;
 }

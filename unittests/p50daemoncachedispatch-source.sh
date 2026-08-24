@@ -14,12 +14,19 @@ real_test="$src/unittests/daemoncachedispatch.cpp"
 grep -F 'release_fd_if_input_empty' "$impl" >/dev/null
 grep -F 'decoded_type != kCacheSession' "$impl" >/dev/null
 grep -F 'peer_credentials_verified' "$impl" >/dev/null
+grep -F 'validate_handshake' "$impl" >/dev/null
+grep -F 'identity != identity_' "$impl" >/dev/null
 grep -F 'next_request_id_++' "$impl" >/dev/null
 grep -F 'disable();' "$impl" >/dev/null
 grep -F 'handle_cache_session' "$daemon" >/dev/null
 grep -F 'cache_dispatcher->dispatch' "$daemon" >/dev/null
 grep -F 'p50_daemon_cache_dispatch.cpp' "$makefile" >/dev/null
 grep -F 'p50daemoncachedispatch' "$src/unittests/Makefile.am" >/dev/null
+grep -F 'p50daemoncachedispatch-sanitize.sh' "$src/unittests/Makefile.am" >/dev/null
+grep -F '../cache/p50_daemon_cache_dispatch.cpp' "$makefile" >/dev/null
+grep -F '../cache/p50_daemon_cache_dispatch.cpp' "$src/unittests/Makefile.am" >/dev/null
+test -f "$impl"
+test -f "$header"
 grep -F 'real public iceccd listener' "$real_test" >/dev/null
 grep -F 'CACHE_SESSION and failed closed boundedly' "$real_test" >/dev/null
 
