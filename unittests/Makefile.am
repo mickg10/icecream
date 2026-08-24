@@ -5,6 +5,7 @@ TESTS += p50daemonsidecaradapter-sanitize.sh
 TESTS += p50daemonpositive-source.sh p50daemonpositive-run.sh
 TESTS += p50inputfd-source.sh p50inputfd-sanitize.sh
 TESTS += p50inputfd
+TESTS += p50compilee2e-source.sh p50compilee2e-run.sh
 
 AM_TESTS_ENVIRONMENT = \
 	ICECC_TEST_BUILDDIR='$(abs_builddir)'; export ICECC_TEST_BUILDDIR; \
@@ -225,6 +226,7 @@ CLEANFILES = sndbuf_shim.so conn_shim.so readyclose_shim.so schedbp-scheduler-*.
 EXTRA_DIST = sndbuf_shim.c conn_shim.c readyclose_shim.c connectivity-run.sh schedbp-quick.sh schedstress-quick.sh remoteice-quick.sh p50assignment-remote.sh daemonlogin-run.sh daemonbatch-run.sh cachehandoffdaemon-run.sh daemoncachedispatch-run.sh p49daemon-run.sh p49scheduler-run.sh boost-prefix-scope.sh
 
 EXTRA_DIST += p50_trace_check.sh p50assignment-source.sh p50cacheadvertisement-source.sh p50cachesession-source.sh p50daemoncachedispatch-source.sh p50daemoncachedispatch-sanitize.sh p50localtransport-source.sh p50localtransport-sanitize.sh p50sidecarsupervisor-source.sh p50inputattachment-source.sh p50inputattachment-mutants.sh p50_input_attachment_sanitize.sh p50readyadvertisement-source.sh p50readyadvertisement-mutants.sh p50endpoint-source.sh p50fdhandoff-source.sh p50cacheservice-source.sh p50cacheservice-sanitize.sh p50fdhandoff-sanitize.sh p50inputfd-source.sh p50inputfd-sanitize.sh packagebuilderdeps.sh p50daemonpositive-source.sh p50daemonpositive-run.sh p50zstdsender-source.sh
+EXTRA_DIST += p50compilee2e-source.sh p50compilee2e-run.sh
 
 # Make the tests also print the test log if they fail.
 check: export VERBOSE=1

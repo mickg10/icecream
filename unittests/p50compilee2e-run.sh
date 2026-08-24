@@ -1,0 +1,155 @@
+#!/bin/sh
+# Real all-P50 C1F1 networked ZSTD_TU compile gate.
+#
+# Once p50compilee2e-source.sh is green this starts the actual built
+# scheduler, one actual iceccd F, one actual iceccd C, and the actual
+# icecc-cache-service owned by the daemon's sidecar adapter. The compiler
+# invocation is required to produce positive ZSTD_TU evidence and a
+# byte-identical local reference. No fake peer or legacy FileChunk fallback
+# is accepted.
+set -eu
+
+src=${ICECC_TEST_TOP_SRCDIR:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
+build=${ICECC_TEST_TOP_BUILDDIR:-$(CDPATH= cd -- "$src" && pwd)}
+timeout_s=${ICECC_P50_C1F1_TIMEOUT:-180}
+
+set +e
+"$src/unittests/p50compilee2e-source.sh"
+rc=$?
+set -e
+test "$rc" -eq 0 || exit "$rc"
+
+for binary in \
+    "$build/daemon/iceccd" \
+    "$build/scheduler/icecc-scheduler" \
+    "$build/client/icecc" \
+    "$build/cache/icecc-cache-service"; do
+    test -x "$binary" || {
+        echo "SKIP: missing built executable $binary" >&2
+        exit 77
+    }
+done
+
+command -v timeout >/dev/null 2>&1 || {
+    echo "SKIP: timeout(1) is required for bounded C1F1 cleanup" >&2
+    exit 77
+}
+command -v g++ >/dev/null 2>&1 || {
+    echo "SKIP: g++ is required for the C1F1 compile" >&2
+    exit 77
+}
+
+work=$(mktemp -d "${TMPDIR:-/tmp}/p50compilee2e.XXXXXX")
+cleanup() {
+    test -n "${client_pid:-}" && kill "$client_pid" 2>/dev/null || :
+    test -n "${worker_pid:-}" && kill "$worker_pid" 2>/dev/null || :
+    test -n "${sched_pid:-}" && kill "$sched_pid" 2>/dev/null || :
+    wait "${client_pid:-}" 2>/dev/null || :
+    wait "${worker_pid:-}" 2>/dev/null || :
+    wait "${sched_pid:-}" 2>/dev/null || :
+    rm -rf "$work"
+}
+trap cleanup EXIT HUP INT TERM
+
+mkdir -p "$work/envs-f" "$work/envs-c" "$work/src" "$work/out"
+chmod 1777 "$work/envs-f" "$work/envs-c"
+port_sched=$((22000 + ($$ % 1000)))
+port_worker=$((23000 + ($$ % 1000)))
+network="p50c1f1-$$"
+
+printf '%s\n' \
+    '#include <cstdint>' \
+    'int p50_c1f1_translation_unit() {' \
+    '    return static_cast<int>(UINT32_C(50));' \
+    '}' >"$work/src/main.cpp"
+
+# The environment is made by the real icecc tool, then shipped to the real F
+# daemon. This is deliberately not replaced by the host compiler PATH.
+(cd "$work/envs-c" && timeout "$timeout_s" \
+    "$build/client/icecc-create-env" "$(command -v g++)" \
+    >"$work/create-env.log" 2>&1)
+envtar=$(find "$work/envs-c" -maxdepth 1 -type f -name '*.tar.gz' -print -quit)
+test -n "$envtar" || {
+    echo "FAIL: real icecc-create-env produced no compiler environment" >&2
+    exit 1
+}
+
+"$build/scheduler/icecc-scheduler" -p "$port_sched" -n "$network" \
+    -l "$work/scheduler.log" -vvv &
+sched_pid=$!
+sleep 1
+kill -0 "$sched_pid" 2>/dev/null || {
+    echo "FAIL: real scheduler exited during startup" >&2
+    exit 1
+}
+
+# This is the only F. The daemon itself must supervise and expose the actual
+# cache service required by the P50 path; the harness never starts a fake peer.
+ICECC_VERSION="$envtar" ICECC_P50_C1F1_REQUIRED=1 \
+    "$build/daemon/iceccd" -p "$port_worker" -m 1 \
+    -s "127.0.0.1:$port_sched" -n "$network" -N p50-f \
+    -b "$work/envs-f" -l "$work/f.log" -vvv &
+worker_pid=$!
+
+ICECC_TEST_SOCKET="$work/client.sock" ICECC_VERSION="$envtar" \
+    ICECC_P50_C1F1_REQUIRED=1 \
+    "$build/daemon/iceccd" --no-remote -m 0 \
+    -s "127.0.0.1:$port_sched" -n "$network" -N p50-c \
+    -b "$work/envs-c" -l "$work/c.log" -vvv &
+client_pid=$!
+
+logins=0
+for _ in $(seq 1 30); do
+    logins=$(grep -c login "$work/scheduler.log" 2>/dev/null || true)
+    test "${logins:-0}" -ge 2 && break
+    sleep 1
+done
+test "${logins:-0}" -ge 2 || {
+    echo "FAIL: real C1F1 daemons did not register" >&2
+    exit 1
+}
+
+# The cache executable must be alive as a child of the production daemon
+# wiring. Merely checking that the file exists would permit a mechanism-only
+# test to masquerade as an end-to-end compile.
+service_pid=
+for _ in $(seq 1 30); do
+    service_pid=$(ps -eo pid=,args= | awk -v exe="$build/cache/icecc-cache-service" \
+        'index($0, exe) > 0 { print $1; exit }')
+    test -n "$service_pid" && break
+    sleep 1
+done
+test -n "$service_pid" || {
+    echo "FAIL: production daemon did not start the actual icecc-cache-service" >&2
+    exit 1
+}
+
+remote_obj="$work/out/remote.o"
+local_obj="$work/out/local.o"
+ICECC_TEST_SOCKET="$work/client.sock" ICECC_TEST_REMOTEBUILD=1 \
+    ICECC_P50_C1F1_REQUIRED=1 ICECC_PREFERRED_HOST=p50-f \
+    ICECC_DEBUG=debug ICECC_LOGFILE="$work/client-compile.log" \
+    timeout "$timeout_s" "$build/client/icecc" g++ -std=c++17 -O2 -c \
+    "$work/src/main.cpp" -o "$remote_obj"
+g++ -std=c++17 -O2 -c "$work/src/main.cpp" -o "$local_obj"
+
+cmp -s "$remote_obj" "$local_obj" || {
+    echo "FAIL: real P50 object differs from local reference" >&2
+    exit 1
+}
+
+# Positive evidence is mandatory. Absence of a local marker is not enough:
+# the route must identify ZSTD_TU and cache-session handoff, and may not report
+# legacy FileChunk output on either side.
+grep -E 'ZSTD_TU|CACHE_SESSION' "$work/client-compile.log" "$work/c.log" \
+    "$work/f.log" >/dev/null || {
+    echo "FAIL: no positive ZSTD_TU/CACHE_SESSION wire evidence" >&2
+    exit 1
+}
+if grep -E 'FileChunkMsg|legacy.*chunk|building myself|local build forced' \
+    "$work/client-compile.log" "$work/c.log" "$work/f.log" >/dev/null 2>&1; then
+    echo "FAIL: compile path used legacy FileChunk/local fallback" >&2
+    exit 1
+fi
+
+echo "PASS: all-P50 C1F1 ZSTD_TU compile is remote and byte-identical"
