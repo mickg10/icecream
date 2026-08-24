@@ -1469,6 +1469,7 @@ struct P50ServerEndpoint::Impl {
     ActionTrace* actions = nullptr;
     InputRecordStore input_records;
     P50ServerEndpointConfig config{};
+    tcp::socket* active_socket = nullptr;
 };
 
 // The live-session row is inserted before the shared reducer coroutine is
@@ -1855,6 +1856,15 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
                           .activated = false};
     ServerRunResult result;
     result.session_serial = session.serial;
+    struct ActiveSocketGuard {
+        Impl& owner;
+        tcp::socket* socket;
+        ~ActiveSocketGuard() {
+            if (owner.active_socket == socket)
+                owner.active_socket = nullptr;
+        }
+    } active_socket_guard{*impl_, &socket};
+    impl_->active_socket = &socket;
     uint32_t reply_cap = impl_->caps.wire.max_frame_payload;
     const auto verify = [&](const CompletionStamp& expected) {
         impl_->owner.require();
@@ -1966,6 +1976,11 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
     result.status = ServerRunStatus::TerminalError;
     result.terminal_error = std::move(*terminal_error);
     co_return result;
+}
+
+void P50ServerEndpoint::cancel_active_io() noexcept {
+    if (impl_->active_socket != nullptr)
+        close_now(*impl_->active_socket);
 }
 
 void P50ServerEndpoint::reset_store(FStoreGuid new_guid) {

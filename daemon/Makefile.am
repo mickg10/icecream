@@ -5,6 +5,7 @@ iceccd_SOURCES = \
 	serve.cpp \
 	compiler_input.cpp \
 	workit.cpp \
+	../cache/p50_daemon_cache_dispatch.cpp \
 	environment.cpp \
 	load.cpp \
 	file_util.cpp \
@@ -12,12 +13,14 @@ iceccd_SOURCES = \
 
 iceccd_LDADD = \
 	../services/libicecc.la \
+	../cache/libp50localtransport.a \
 	$(LIB_KINFO) \
 	$(LIBCAP_NG_LIBS) \
 	$(LIBARCHIVE_LIBS)
 
 AM_CPPFLAGS = \
 	-I$(top_srcdir)/services \
+	-I$(top_srcdir)/cache \
 	$(LIBARCHIVE_CFLAGS)
 
 AM_LIBTOOLFLAGS = --silent

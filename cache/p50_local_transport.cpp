@@ -5,10 +5,8 @@
 #include <cerrno>
 #include <chrono>
 #include <cstring>
-#include <limits>
 #include <mutex>
 #include <fcntl.h>
-#include <poll.h>
 #include <sys/stat.h>
 
 #include <sys/socket.h>
@@ -80,31 +78,26 @@ Status read_exact(int fd, std::span<uint8_t> out, bool clean_eof) {
 
 Status read_exact_until(int fd, std::span<uint8_t> out, bool clean_eof,
                         std::chrono::steady_clock::time_point deadline) {
+#if !defined(MSG_DONTWAIT)
+    // The bounded API cannot safely emulate per-call nonblocking I/O by
+    // toggling O_NONBLOCK: that flag belongs to the shared open file
+    // description and would race a concurrent reader.  Fail closed on a
+    // platform without MSG_DONTWAIT rather than changing reader semantics.
+    (void)fd;
+    (void)out;
+    (void)clean_eof;
+    (void)deadline;
+    return Status::IoError;
+#else
     size_t done = 0;
     while (done != out.size()) {
-        const auto now = std::chrono::steady_clock::now();
-        if (now >= deadline)
+        const auto waited = detail::wait_for_io(fd, POLLIN, deadline);
+        if (waited == detail::DeadlinePollResult::Timeout)
+            return Status::Timeout;
+        if (waited == detail::DeadlinePollResult::Error)
             return Status::IoError;
-        const auto remaining_us =
-            std::chrono::duration_cast<std::chrono::microseconds>(deadline - now).count();
-        const long long rounded_ms = (remaining_us + 999) / 1000;
-        const int poll_ms = static_cast<int>(
-            std::clamp<long long>(rounded_ms, 1, std::numeric_limits<int>::max()));
-        struct pollfd descriptor{fd, POLLIN | POLLERR | POLLHUP, 0};
-        const int ready = ::poll(&descriptor, 1, poll_ms);
-        if (ready == 0)
-            return Status::IoError;
-        if (ready < 0) {
-            if (errno == EINTR)
-                continue;
-            return Status::IoError;
-        }
-        int receive_flags = 0;
-#if defined(MSG_DONTWAIT)
-        receive_flags = MSG_DONTWAIT;
-#endif
         const ssize_t count =
-            ::recv(fd, out.data() + done, out.size() - done, receive_flags);
+            ::recv(fd, out.data() + done, out.size() - done, MSG_DONTWAIT);
         if (count == 0)
             return done == 0 && clean_eof ? Status::CleanEof : Status::Truncated;
         if (count < 0) {
@@ -115,6 +108,7 @@ Status read_exact_until(int fd, std::span<uint8_t> out, bool clean_eof,
         done += static_cast<size_t>(count);
     }
     return Status::Ok;
+#endif
 }
 
 Status write_all(int fd, std::span<const uint8_t> bytes) {
@@ -135,6 +129,42 @@ Status write_all(int fd, std::span<const uint8_t> bytes) {
         done += static_cast<size_t>(count);
     }
     return Status::Ok;
+}
+
+Status write_all_until(int fd, std::span<const uint8_t> bytes,
+                       std::chrono::steady_clock::time_point deadline) noexcept {
+#if !defined(MSG_DONTWAIT)
+    // See read_exact_until: per-call bounded I/O must not mutate O_NONBLOCK on
+    // a descriptor shared with another Connection or another thread.
+    (void)fd;
+    (void)bytes;
+    (void)deadline;
+    return Status::IoError;
+#else
+    size_t done = 0;
+    while (done != bytes.size()) {
+        const auto waited = detail::wait_for_io(fd, POLLOUT, deadline);
+        if (waited == detail::DeadlinePollResult::Timeout)
+            return Status::Timeout;
+        if (waited == detail::DeadlinePollResult::Error)
+            return Status::IoError;
+
+        int send_flags = MSG_DONTWAIT;
+#if defined(MSG_NOSIGNAL)
+        send_flags |= MSG_NOSIGNAL;
+#endif
+        const ssize_t count = ::send(fd, bytes.data() + done, bytes.size() - done, send_flags);
+        if (count > 0) {
+            done += static_cast<size_t>(count);
+            continue;
+        }
+        if (count < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
+            continue;
+        return Status::IoError;
+    }
+
+    return std::chrono::steady_clock::now() >= deadline ? Status::Timeout : Status::Ok;
+#endif
 }
 
 bool set_cloexec(int fd) {
@@ -291,6 +321,7 @@ const char* status_name(Status status) noexcept {
     case Status::PeerCredentialMismatch: return "peer-credential-mismatch";
     case Status::Busy: return "busy";
     case Status::SignalProtectionUnavailable: return "signal-protection-unavailable";
+    case Status::Timeout: return "timeout";
     }
     return "unknown";
 }
@@ -398,7 +429,7 @@ Status Connection::receive_with_timeout(Frame& frame, int timeout_ms) noexcept {
     try {
         const auto deadline =
             std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-        return read_frame_until(fd_, frame, deadline);
+        return receive_until(frame, deadline);
     } catch (...) {
         return Status::IoError;
     }
@@ -450,6 +481,45 @@ Status Connection::send(const Frame& frame) noexcept {
     }
     writing_.clear(std::memory_order_release);
     return status;
+}
+
+Status Connection::send_until(const Frame& frame,
+                              std::chrono::steady_clock::time_point deadline) noexcept {
+    if (writing_.test_and_set(std::memory_order_acquire))
+        return Status::Busy;
+    Status status = Status::IoError;
+    try {
+        if (fd_ < 0) {
+            status = status_;
+        } else if (std::chrono::steady_clock::now() >= deadline) {
+            status = Status::Timeout;
+        } else {
+            Status encode_status = Status::Ok;
+            const std::vector<uint8_t> encoded = encode_frame(frame, &encode_status);
+            if (encode_status != Status::Ok) {
+                status = encode_status;
+            } else if (std::chrono::steady_clock::now() >= deadline) {
+                status = Status::Timeout;
+            } else {
+                status = write_all_until(fd_, encoded, deadline);
+            }
+        }
+    } catch (...) {
+        status = Status::IoError;
+    }
+    writing_.clear(std::memory_order_release);
+    return status;
+}
+
+Status Connection::receive_until(Frame& frame,
+                                 std::chrono::steady_clock::time_point deadline) noexcept {
+    if (fd_ < 0)
+        return status_;
+    try {
+        return read_frame_until(fd_, frame, deadline);
+    } catch (...) {
+        return Status::IoError;
+    }
 }
 
 Status Connection::receive(Frame& frame) noexcept {

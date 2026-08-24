@@ -107,6 +107,7 @@
 #include "platform.h"
 #include "util.h"
 #include "getifaddrs.h"
+#include "p50_daemon_cache_dispatch.h"
 
 static std::string pidFilePath;
 static volatile sig_atomic_t exit_main_loop = 0;
@@ -1101,6 +1102,11 @@ struct Daemon {
     uint64_t waitforcs_use_cs_max_msec;
     uint64_t waitforcs_no_cs_max_msec;
 
+    // iceccd remains the public listener owner.  The controller is disabled
+    // until a reviewed supervisor adapter supplies an authenticated private
+    // relationship, so CACHE_SESSION fails closed without advertisement.
+    std::unique_ptr<icecc::p50::daemon::CacheSessionDispatcher> cache_dispatcher;
+
     bool webgui_enabled;
     int webgui_port;
     string webgui_addr;
@@ -1138,6 +1144,8 @@ struct Daemon {
         new_client_id = 0;
         next_scheduler_connect = 0;
         cache_size = 0;
+        cache_dispatcher.reset(new icecc::p50::daemon::CacheSessionDispatcher(
+            icecc::p50::local::Identity{monotonic_msec(), 1}));
         noremote = false;
         custom_nodename = false;
         icecream_load = 0;
@@ -1201,6 +1209,7 @@ struct Daemon {
     bool handle_local_job(Client *client, Msg *msg) __attribute_warn_unused_result__;
     bool handle_job_done(Client *cl, JobDoneMsg *m) __attribute_warn_unused_result__;
     bool handle_job_timing(Client *client, JobTimingMsg *m) __attribute_warn_unused_result__;
+    bool handle_cache_session(Client *client, Msg *msg) __attribute_warn_unused_result__;
     bool handle_compile_done(Client *client) __attribute_warn_unused_result__;
     bool handle_verify_env(Client *client, VerifyEnvMsg *msg) __attribute_warn_unused_result__;
     bool handle_blacklist_host_env(Client *client, Msg *msg) __attribute_warn_unused_result__;
@@ -7348,6 +7357,41 @@ bool Daemon::handle_job_timing(Client *client, JobTimingMsg *m)
     return true;
 }
 
+bool Daemon::handle_cache_session(Client *client, Msg *msg)
+{
+    if (!client || !client->channel || !msg || *msg != Msg::CACHE_SESSION) {
+        return false;
+    }
+
+    const int old_fd = client->channel->fd;
+    const icecc::p50::daemon::CacheDispatchOutcome outcome =
+        cache_dispatcher->dispatch(*client->channel, client->channel->protocol,
+                                   static_cast<uint32_t>(*msg));
+
+    if (outcome.result == icecc::p50::daemon::CacheDispatchResult::Accepted) {
+        trace() << "accepted bounded CACHE_SESSION handoff request "
+                << outcome.request.request_id << " for fd " << old_fd << endl;
+    } else {
+        // Sidecar loss, stale identity, a failed clean-boundary proof, and a
+        // failed handoff all terminate this ordinary link.  In particular,
+        // no retry can reuse a descriptor after ownership moved to the
+        // sender, and no cache bytes are consumed by this path.
+        log_warning() << "CACHE_SESSION closed fail-closed ("
+                      << static_cast<int>(outcome.result) << ", detached="
+                      << (outcome.detached ? "yes" : "no") << ")" << endl;
+    }
+
+    // handle_end() normally erases channel->fd.  A successful or post-
+    // release failure has already set it to -1, so remove the old map key
+    // before deleting the Client and avoid retaining a stale fd owner.
+    if (outcome.detached) {
+        fd2client.erase(old_fd);
+    }
+    handle_end(client, outcome.result == icecc::p50::daemon::CacheDispatchResult::Accepted
+                         ? 0 : 121);
+    return false;
+}
+
 bool Daemon::handle_activity(Client *client)
 {
     assert(client->status != Client::TOCOMPILE && client->status != Client::WAITINSTALL);
@@ -7395,6 +7439,9 @@ bool Daemon::handle_activity(Client *client)
         break;
     case Msg::JOB_TIMING:
         ret = handle_job_timing(client, dynamic_cast<JobTimingMsg *>(msg));
+        break;
+    case Msg::CACHE_SESSION:
+        ret = handle_cache_session(client, msg);
         break;
     case Msg::VERIFY_ENV:
         ret = handle_verify_env(client, dynamic_cast<VerifyEnvMsg *>(msg));

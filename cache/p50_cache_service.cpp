@@ -12,16 +12,26 @@
 #include <pthread.h>
 #include <signal.h>
 #include <grp.h>
+#include <boost/asio/co_spawn.hpp>
+#include <boost/asio/detached.hpp>
+#include <boost/asio/this_coro.hpp>
+#include <boost/asio/use_future.hpp>
 #include <string_view>
+#include <stdexcept>
 #include <sys/stat.h>
+#include <sys/socket.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
 
 #include <utility>
+#include <future>
+#include <thread>
 
 namespace icecc::p50::service {
 namespace {
+
+namespace asio = boost::asio;
 
 constexpr std::string_view kReadyEnvironment = "ICECC_CACHE_SERVICE_READY_FD";
 constexpr std::string_view kReadyMessage = "READY\n";
@@ -30,8 +40,20 @@ constexpr int kHandshakeMilliseconds = 500;
 constexpr int kMaxBacklog = 16;
 
 volatile sig_atomic_t g_stop_requested = 0;
+volatile sig_atomic_t g_signal_wake_fd = -1;
 
-void request_stop(int) noexcept { g_stop_requested = 1; }
+void request_stop(int) noexcept {
+    // The handler performs only async-signal-safe operations.  All C++ state
+    // transitions, including SidecarRuntime::stop(), happen on the normal
+    // service thread after it observes this byte through poll().
+    g_stop_requested = 1;
+    const int fd = g_signal_wake_fd;
+    if (fd >= 0) {
+        const uint8_t wake = 1;
+        const ssize_t ignored = ::write(fd, &wake, sizeof(wake));
+        (void)ignored;
+    }
+}
 
 struct SignalGuard {
     struct sigaction old_term{};
@@ -40,16 +62,22 @@ struct SignalGuard {
 
     SignalGuard() = default;
 
-    bool install() noexcept {
+    bool install(int wake_fd) noexcept {
+        g_signal_wake_fd = wake_fd;
         struct sigaction action{};
         action.sa_handler = request_stop;
-        if (::sigemptyset(&action.sa_mask) != 0)
+        if (::sigemptyset(&action.sa_mask) != 0) {
+            g_signal_wake_fd = -1;
             return false;
+        }
         // Deliberately omit SA_RESTART so poll/read wake for graceful stop.
-        if (::sigaction(SIGTERM, &action, &old_term) != 0)
+        if (::sigaction(SIGTERM, &action, &old_term) != 0) {
+            g_signal_wake_fd = -1;
             return false;
+        }
         if (::sigaction(SIGINT, &action, &old_int) != 0) {
             (void)::sigaction(SIGTERM, &old_term, nullptr);
+            g_signal_wake_fd = -1;
             return false;
         }
         installed = true;
@@ -58,6 +86,7 @@ struct SignalGuard {
 
     ~SignalGuard() {
         if (installed) {
+            g_signal_wake_fd = -1;
             (void)::sigaction(SIGTERM, &old_term, nullptr);
             (void)::sigaction(SIGINT, &old_int, nullptr);
         }
@@ -77,6 +106,28 @@ struct OwnedFd {
     explicit OwnedFd(int value) : fd(value) {}
     OwnedFd(const OwnedFd&) = delete;
     OwnedFd& operator=(const OwnedFd&) = delete;
+};
+
+struct WakePipe {
+    OwnedFd read;
+    OwnedFd write;
+
+    bool create() noexcept {
+        int descriptors[2] = {-1, -1};
+        if (::pipe(descriptors) != 0)
+            return false;
+        read.fd = descriptors[0];
+        write.fd = descriptors[1];
+        for (const int fd : descriptors) {
+            const int flags = ::fcntl(fd, F_GETFD);
+            if (flags < 0 || ::fcntl(fd, F_SETFD, flags | FD_CLOEXEC) < 0)
+                return false;
+            const int status_flags = ::fcntl(fd, F_GETFL);
+            if (status_flags < 0 || ::fcntl(fd, F_SETFL, status_flags | O_NONBLOCK) < 0)
+                return false;
+        }
+        return true;
+    }
 };
 
 bool parse_uint(std::string_view text, uint64_t& value) noexcept {
@@ -304,7 +355,8 @@ void cleanup_listener(int fd, const std::string& path, const ListenerIdentity& i
     (void)::unlink(path.c_str());
 }
 
-bool handle_connection(local::Connection connection, const Options& options) noexcept {
+bool handle_connection(local::Connection connection, const Options& options,
+                        SidecarRuntime& runtime, const local::HandoffRequest& expected) noexcept {
     try {
         if (!connection.valid())
             return false;
@@ -318,7 +370,11 @@ bool handle_connection(local::Connection connection, const Options& options) noe
             return true;
         const local::Frame ack =
             local::make_hello_ack(local::PeerRole::Sidecar, options.identity);
-        (void)connection.send(ack);
+        if (connection.send(ack) != local::Status::Ok)
+            return true;
+        (void)runtime.run_one(
+            connection, expected,
+            std::chrono::steady_clock::now() + std::chrono::milliseconds{kHandshakeMilliseconds});
         return true;
     } catch (...) {
         return true;
@@ -326,6 +382,279 @@ bool handle_connection(local::Connection connection, const Options& options) noe
 }
 
 } // namespace
+
+FStoreGuid f_store_guid_for_identity(local::Identity identity) noexcept {
+    FStoreGuid result{};
+    for (size_t index = 0; index != sizeof(identity.generation); ++index)
+        result.bytes[index] = static_cast<uint8_t>(identity.generation >>
+                                                   (56u - static_cast<unsigned>(index) * 8u));
+    for (size_t index = 0; index != sizeof(identity.attempt); ++index)
+        result.bytes[sizeof(identity.generation) + index] = static_cast<uint8_t>(
+            identity.attempt >> (56u - static_cast<unsigned>(index) * 8u));
+    return result;
+}
+
+namespace {
+
+RuntimeConfig validate_runtime_config(RuntimeConfig config) {
+    if (config.f_store_guid == FStoreGuid{})
+        throw std::invalid_argument("sidecar runtime requires a nonzero F_STORE_GUID");
+    if (config.max_live_handoffs != 1)
+        throw std::invalid_argument("sidecar runtime supports exactly one live handoff");
+    return config;
+}
+
+} // namespace
+
+SidecarRuntime::SidecarRuntime(RuntimeConfig config)
+    : config_(validate_runtime_config(std::move(config))),
+      endpoint_(std::make_unique<P50ServerEndpoint>(
+          config_.f_store_guid, config_.endpoint_caps, nullptr, nullptr,
+          config_.endpoint_config)),
+      endpoint_work_guard_(asio::make_work_guard(context_)),
+      endpoint_owner_thread_([this] { endpoint_owner_loop(); }) {}
+
+SidecarRuntime::~SidecarRuntime() {
+    stop();
+    endpoint_work_guard_.reset();
+    if (endpoint_owner_thread_.joinable())
+        endpoint_owner_thread_.join();
+}
+
+void SidecarRuntime::endpoint_owner_loop() noexcept {
+    try {
+        context_.run();
+    } catch (...) {
+        // Every endpoint coroutine converts its own failure into a result. If
+        // an unexpected executor failure still escapes, let teardown drain
+        // rather than allowing an exception to cross the worker boundary.
+        endpoint_owner_failed_.store(true, std::memory_order_release);
+        context_.stop();
+    }
+}
+
+boost::asio::awaitable<void> SidecarRuntime::run_endpoint_on_owner(
+    int adopted_fd, EndpointIoControl endpoint_control,
+    std::promise<EndpointOwnerResult> completion) {
+    int owned_fd = adopted_fd;
+    try {
+        EndpointOwnerResult owner_result;
+        if (stop_requested_.load(std::memory_order_acquire)) {
+            (void)::close(owned_fd);
+            owned_fd = -1;
+            owner_result.status = RuntimeStatus::Stopped;
+            completion.set_value(std::move(owner_result));
+            co_return;
+        }
+
+        const auto executor = co_await boost::asio::this_coro::executor;
+        boost::system::error_code adoption_error;
+        const int fd_for_adoption = owned_fd;
+        owned_fd = -1;
+        std::optional<asio::ip::tcp::socket> socket =
+            P50ServerEndpoint::adopt_connected_fd(executor, fd_for_adoption, adoption_error);
+        if (!socket) {
+            owner_result.status = RuntimeStatus::AdoptionFailed;
+            completion.set_value(std::move(owner_result));
+            co_return;
+        }
+
+        const int cancel_fd = ::dup(socket->native_handle());
+        if (cancel_fd < 0) {
+            owner_result.status = RuntimeStatus::AdoptionFailed;
+            completion.set_value(std::move(owner_result));
+            co_return;
+        }
+        const int cancel_flags = ::fcntl(cancel_fd, F_GETFD);
+        if (cancel_flags < 0 || ::fcntl(cancel_fd, F_SETFD, cancel_flags | FD_CLOEXEC) < 0) {
+            (void)::close(cancel_fd);
+            owner_result.status = RuntimeStatus::AdoptionFailed;
+            completion.set_value(std::move(owner_result));
+            co_return;
+        }
+        active_cancel_fd_.store(cancel_fd, std::memory_order_release);
+        if (stop_requested_.load(std::memory_order_acquire)) {
+            cancel_active_socket();
+            owner_result.status = RuntimeStatus::Stopped;
+            completion.set_value(std::move(owner_result));
+            co_return;
+        }
+
+        live_sessions_.store(1, std::memory_order_release);
+        const ServerRunResult endpoint_result =
+            co_await endpoint_->run_adopted(std::move(*socket), std::move(endpoint_control));
+        release_active_socket();
+        live_sessions_.store(endpoint_->live_session_count(), std::memory_order_release);
+        owner_result.endpoint = endpoint_result;
+        owner_result.status = stop_requested_.load(std::memory_order_acquire)
+                                  ? RuntimeStatus::Stopped
+                                  : endpoint_result.status == ServerRunStatus::TerminalError
+                                  ? RuntimeStatus::EndpointFailed
+                                  : RuntimeStatus::Completed;
+        completion.set_value(std::move(owner_result));
+    } catch (...) {
+        if (owned_fd >= 0)
+            (void)::close(owned_fd);
+        release_active_socket();
+        try {
+            live_sessions_.store(endpoint_->live_session_count(), std::memory_order_release);
+        } catch (...) {
+            live_sessions_.store(0, std::memory_order_release);
+        }
+        EndpointOwnerResult owner_result;
+        owner_result.status = RuntimeStatus::EndpointFailed;
+        try {
+            completion.set_value(std::move(owner_result));
+        } catch (...) {
+        }
+    }
+    co_return;
+}
+
+RuntimeResult SidecarRuntime::run_one(
+    local::Connection& control, const local::HandoffRequest& expected,
+    std::chrono::steady_clock::time_point deadline, EndpointIoControl endpoint_control) {
+    RuntimeResult result;
+    if (stop_requested_.load(std::memory_order_acquire)) {
+        result.status = RuntimeStatus::Stopped;
+        return result;
+    }
+    if (busy_.test_and_set(std::memory_order_acq_rel)) {
+        result.status = RuntimeStatus::Busy;
+        result.handoff.status = local::FdHandoffStatus::AlreadyConsumed;
+        return result;
+    }
+    struct BusyGuard {
+        std::atomic_flag& flag;
+        ~BusyGuard() { flag.clear(std::memory_order_release); }
+    } busy_guard{busy_};
+
+    const int control_cancel_fd = control.valid() ? ::dup(control.native_handle()) : -1;
+    if (control_cancel_fd < 0) {
+        result.status = RuntimeStatus::HandoffRejected;
+        result.handoff.status = local::FdHandoffStatus::Disconnected;
+        return result;
+    }
+    const int control_flags = ::fcntl(control_cancel_fd, F_GETFD);
+    if (control_flags < 0 ||
+        ::fcntl(control_cancel_fd, F_SETFD, control_flags | FD_CLOEXEC) < 0) {
+        (void)::close(control_cancel_fd);
+        result.status = RuntimeStatus::HandoffRejected;
+        result.handoff.status = local::FdHandoffStatus::Disconnected;
+        return result;
+    }
+    active_control_cancel_fd_.store(control_cancel_fd, std::memory_order_release);
+    // Close/shutdown from stop() can race this setup only by setting the
+    // stop flag first.  Re-check after publication so a signal arriving in
+    // this narrow window is still converted into a normal cancellation.
+    if (stop_requested_.load(std::memory_order_acquire)) {
+        cancel_active_control();
+        result.status = RuntimeStatus::Stopped;
+        result.handoff.status = local::FdHandoffStatus::Disconnected;
+        return result;
+    }
+
+    local::FdHandoffReceiver receiver;
+    result.handoff = receiver.receive_and_ack(control, expected, deadline);
+    release_active_control();
+    if (result.handoff.status != local::FdHandoffStatus::Accepted) {
+        result.status = stop_requested_.load(std::memory_order_acquire)
+                           ? RuntimeStatus::Stopped
+                           : RuntimeStatus::HandoffRejected;
+        return result;
+    }
+
+    local::HandoffFd adopted = receiver.take_adopted_fd();
+    if (!adopted.valid()) {
+        result.status = RuntimeStatus::AdoptionFailed;
+        result.handoff.status = local::FdHandoffStatus::AdoptionFailed;
+        return result;
+    }
+    if (stop_requested_.load(std::memory_order_acquire)) {
+        result.status = RuntimeStatus::Stopped;
+        result.handoff.status = local::FdHandoffStatus::Disconnected;
+        return result;
+    }
+
+    const int adopted_fd = adopted.release();
+    std::promise<EndpointOwnerResult> completion;
+    std::future<EndpointOwnerResult> completion_result = completion.get_future();
+    int dispatch_fd = adopted_fd;
+    try {
+        asio::co_spawn(context_,
+                       run_endpoint_on_owner(dispatch_fd, std::move(endpoint_control),
+                                             std::move(completion)),
+                       asio::detached);
+        dispatch_fd = -1;
+    } catch (...) {
+        if (dispatch_fd >= 0)
+            (void)::close(dispatch_fd);
+        result.status = RuntimeStatus::EndpointFailed;
+        return result;
+    }
+
+    for (;;) {
+        if (completion_result.wait_for(std::chrono::milliseconds(100)) ==
+            std::future_status::ready)
+            break;
+        if (endpoint_owner_failed_.load(std::memory_order_acquire)) {
+            result.status = RuntimeStatus::EndpointFailed;
+            return result;
+        }
+    }
+    const EndpointOwnerResult owner_result = completion_result.get();
+    result.status = owner_result.status;
+    result.endpoint = owner_result.endpoint;
+    if (result.status == RuntimeStatus::EndpointFailed)
+        live_sessions_.store(0, std::memory_order_release);
+    return result;
+}
+
+void SidecarRuntime::cancel_active_control() noexcept {
+    const int fd = active_control_cancel_fd_.exchange(-1, std::memory_order_acq_rel);
+    if (fd >= 0) {
+        (void)::shutdown(fd, SHUT_RDWR);
+        (void)::close(fd);
+    }
+}
+
+void SidecarRuntime::release_active_control() noexcept {
+    const int fd = active_control_cancel_fd_.exchange(-1, std::memory_order_acq_rel);
+    if (fd >= 0)
+        (void)::close(fd);
+}
+
+void SidecarRuntime::cancel_active_socket() noexcept {
+    const int fd = active_cancel_fd_.exchange(-1, std::memory_order_acq_rel);
+    if (fd >= 0) {
+        (void)::shutdown(fd, SHUT_RDWR);
+        (void)::close(fd);
+    }
+    // A duplicate descriptor does not reliably wake every platform's Asio
+    // reactor.  Post the actual socket cancellation onto its owner context;
+    // this is normal-thread work and therefore remains outside the signal
+    // handler while preserving endpoint thread affinity.
+    try {
+        context_.post([this] { endpoint_->cancel_active_io(); });
+    } catch (...) {
+    }
+}
+
+void SidecarRuntime::release_active_socket() noexcept {
+    const int fd = active_cancel_fd_.exchange(-1, std::memory_order_acq_rel);
+    if (fd >= 0)
+        (void)::close(fd);
+}
+
+void SidecarRuntime::stop() noexcept {
+    stop_requested_.store(true, std::memory_order_release);
+    cancel_active_control();
+    cancel_active_socket();
+}
+
+size_t SidecarRuntime::live_session_count() const {
+    return live_sessions_.load(std::memory_order_acquire);
+}
 
 bool parse_options(int argc, char* const argv[], Options& options, bool& show_help) noexcept {
     show_help = false;
@@ -411,10 +740,13 @@ int run(const Options& options) noexcept {
     OwnedFd ready;
     if (!parse_ready_fd(ready))
         return 2;
-    SignalGuard signals;
-    if (!signals.install())
+    WakePipe wake;
+    if (!wake.create())
         return 2;
+    SignalGuard signals;
     g_stop_requested = 0;
+    if (!signals.install(wake.write.fd))
+        return 2;
 
     if (!drop_and_prove(options))
         return 2;
@@ -429,6 +761,18 @@ int run(const Options& options) noexcept {
         cleanup_listener(listener, options.socket_path, identity);
         return 2;
     }
+    RuntimeConfig runtime_config;
+    // The store identity is explicit runtime state, derived only from the
+    // already authenticated service generation.  A production launcher can
+    // construct SidecarRuntime directly with its durable store GUID.
+    runtime_config.f_store_guid = f_store_guid_for_identity(options.identity);
+    std::unique_ptr<SidecarRuntime> runtime;
+    try {
+        runtime = std::make_unique<SidecarRuntime>(std::move(runtime_config));
+    } catch (...) {
+        cleanup_listener(listener, options.socket_path, identity);
+        return 2;
+    }
     if (g_stop_requested != 0 || !write_ready(ready.fd)) {
         cleanup_listener(listener, options.socket_path, identity);
         return 2;
@@ -436,21 +780,63 @@ int run(const Options& options) noexcept {
     (void)::close(ready.fd);
     ready.fd = -1;
 
-    while (g_stop_requested == 0) {
-        struct pollfd descriptor{listener, POLLIN | POLLERR | POLLHUP, 0};
-        const int result = ::poll(&descriptor, 1, kPollMilliseconds);
+    uint64_t request_id = 1;
+    std::thread connection_thread;
+    std::atomic<bool> connection_done{true};
+
+    for (;;) {
+        if (g_stop_requested != 0)
+            runtime->stop();
+        if (connection_thread.joinable() && connection_done.load(std::memory_order_acquire))
+            connection_thread.join();
+        if (g_stop_requested != 0 && !connection_thread.joinable())
+            break;
+
+        struct pollfd descriptors[2]{};
+        descriptors[0] = {wake.read.fd, POLLIN | POLLERR | POLLHUP, 0};
+        nfds_t descriptor_count = 1;
+        const bool can_accept = !connection_thread.joinable();
+        if (can_accept)
+            descriptors[descriptor_count++] = {listener, POLLIN | POLLERR | POLLHUP, 0};
+        const int result = ::poll(descriptors, descriptor_count, kPollMilliseconds);
         if (result < 0) {
             if (errno == EINTR)
                 continue;
             break;
         }
-        if (result == 0 || (descriptor.revents & POLLIN) == 0)
+        if ((descriptors[0].revents & (POLLIN | POLLERR | POLLHUP)) != 0) {
+            uint8_t drained[64]{};
+            while (::read(wake.read.fd, drained, sizeof(drained)) > 0) {
+            }
+            if (g_stop_requested != 0)
+                runtime->stop();
+        }
+        if (result == 0 || !can_accept || g_stop_requested != 0 ||
+            (descriptors[1].revents & POLLIN) == 0)
             continue;
         local::Status accept_status = local::Status::Ok;
         local::Connection connection = local::accept_unix(listener, &accept_status);
-        if (connection.valid())
-            (void)handle_connection(std::move(connection), options);
+        if (!connection.valid())
+            continue;
+        const local::HandoffRequest expected{options.identity, request_id++};
+        connection_done.store(false, std::memory_order_release);
+        try {
+            connection_thread = std::thread(
+                [connection = std::move(connection), &options, runtime_ptr = runtime.get(),
+                 expected, &connection_done]() mutable {
+                    (void)handle_connection(std::move(connection), options, *runtime_ptr, expected);
+                    connection_done.store(true, std::memory_order_release);
+                });
+        } catch (...) {
+            connection_done.store(true, std::memory_order_release);
+            runtime->stop();
+            break;
+        }
     }
+
+    runtime->stop();
+    if (connection_thread.joinable())
+        connection_thread.join();
 
     cleanup_listener(listener, options.socket_path, identity);
     return 0;
@@ -458,6 +844,7 @@ int run(const Options& options) noexcept {
 
 } // namespace icecc::p50::service
 
+#if !defined(ICECC_P50_CACHE_SERVICE_NO_MAIN)
 int main(int argc, char** argv) {
     icecc::p50::service::Options options;
     bool show_help = false;
@@ -474,3 +861,4 @@ int main(int argc, char** argv) {
     }
     return icecc::p50::service::run(options);
 }
+#endif

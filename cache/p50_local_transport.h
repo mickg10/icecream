@@ -9,9 +9,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <atomic>
+#include <cerrno>
+#include <chrono>
 #include <compare>
 #include <functional>
+#include <limits>
 #include <optional>
+#include <poll.h>
 #include <span>
 #include <string>
 #include <sys/un.h>
@@ -19,6 +23,64 @@
 #include <vector>
 
 namespace icecc::p50::local {
+
+namespace detail {
+
+enum class DeadlinePollResult {
+    Ready,
+    Timeout,
+    Error,
+};
+
+// Shared by framed local transport and descriptor handoff.  Poll timeout
+// conversion floors to milliseconds and probes with zero below one
+// millisecond; it never adds a rounding constant to a duration.  Terminal
+// poll bits are checked before requested readiness in both directions, so a
+// POLLERR/POLLHUP/POLLNVAL indication cannot be masked by POLLIN or POLLOUT.
+inline DeadlinePollResult wait_for_io(
+    int fd, short events,
+    std::chrono::steady_clock::time_point deadline) noexcept {
+    if (fd < 0)
+        return DeadlinePollResult::Error;
+
+    for (;;) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline)
+            return DeadlinePollResult::Timeout;
+
+        const auto remaining = deadline - now;
+        int poll_timeout = 0;
+        const auto max_poll_duration =
+            std::chrono::milliseconds(std::numeric_limits<int>::max());
+        if (remaining >= max_poll_duration) {
+            poll_timeout = std::numeric_limits<int>::max();
+        } else {
+            const auto whole_milliseconds =
+                std::chrono::duration_cast<std::chrono::milliseconds>(remaining).count();
+            poll_timeout = whole_milliseconds <= 0
+                               ? 0
+                               : static_cast<int>(whole_milliseconds);
+        }
+
+        struct pollfd descriptor{fd, events, 0};
+        const int ready = ::poll(&descriptor, 1, poll_timeout);
+        if (ready < 0) {
+            if (errno == EINTR)
+                continue;
+            return DeadlinePollResult::Error;
+        }
+        if (ready == 0)
+            continue;
+
+        if ((descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0)
+            return DeadlinePollResult::Error;
+        if ((descriptor.revents & events) != 0)
+            return DeadlinePollResult::Ready;
+        return DeadlinePollResult::Error;
+    }
+}
+
+} // namespace detail
 
 inline constexpr uint16_t kProtocolVersion = 1;
 inline constexpr size_t kFrameHeaderSize = 28;
@@ -73,6 +135,7 @@ enum class Status {
     PeerCredentialMismatch,
     Busy,
     SignalProtectionUnavailable,
+    Timeout,
 };
 
 const char* status_name(Status status) noexcept;
@@ -101,6 +164,10 @@ public:
     Connection& operator=(const Connection&) = delete;
 
     [[nodiscard]] bool valid() const noexcept { return fd_ >= 0; }
+    // Borrowed descriptor identity for a coordinating owner.  The caller
+    // must not close or use the returned descriptor after this Connection is
+    // destroyed; it is intended only for dup()/shutdown() cancellation.
+    [[nodiscard]] int native_handle() const noexcept { return fd_; }
     [[nodiscard]] Status status() const noexcept { return status_; }
     [[nodiscard]] bool cloexec() const noexcept;
 
@@ -120,6 +187,19 @@ public:
     // A concurrent caller gets Busy.  There is intentionally no implicit
     // queue: one bounded queue and one writer belong to the relationship.
     Status send(const Frame& frame) noexcept;
+
+    // Sends one complete encoded frame under one absolute wall-time budget.
+    // The frame is encoded before any bytes are written, and every partial
+    // write reuses the same deadline.  A timeout never waits for a blocking
+    // write to drain and never releases the one-writer gate early.
+    Status send_until(const Frame& frame,
+                      std::chrono::steady_clock::time_point deadline) noexcept;
+
+    // Reads one complete encoded frame under the supplied absolute deadline.
+    // The same deadline covers both the fixed header and the payload, so a
+    // peer cannot extend the operation by sending a partial frame slowly.
+    Status receive_until(Frame& frame,
+                         std::chrono::steady_clock::time_point deadline) noexcept;
     Status receive(Frame& frame) noexcept;
 
 private:
