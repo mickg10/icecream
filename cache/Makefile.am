@@ -18,6 +18,8 @@ icecc_cache_service_LDFLAGS = $(BOOST_LDFLAGS) -pthread
 libprotocol50_a_SOURCES = \
 	protocol50.cpp \
 	protocol50.h \
+	s3_persistence.cpp \
+	s3_persistence.h \
 	p50_actions.cpp \
 	p50_actions.h \
 	p50_slice0.cpp \
