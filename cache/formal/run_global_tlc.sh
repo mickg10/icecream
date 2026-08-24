@@ -96,6 +96,8 @@ run_expected_failure generation Protocol50GlobalGenerationWrapMutant.cfg NoMutan
 run_expected_failure admission Protocol50GlobalAdmissionMutant.cfg NoMutantFaults
 run_expected_failure conflict Protocol50GlobalConflictMutant.cfg ConflictIsFatal
 run_expected_failure crash Protocol50GlobalCrashMutant.cfg NoMutantFaults
+run_expected_failure reverse-slot Protocol50GlobalReverseSlotMutant.cfg \
+    EveryOwnedSlotHasInstallingArena
 run_expected_failure content Protocol50GlobalContentMutant.cfg ImmutableArenaContent
 run_expected_failure stall Protocol50GlobalStallMutant.cfg WatchdogNoStall
 

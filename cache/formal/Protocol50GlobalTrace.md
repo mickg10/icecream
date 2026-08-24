@@ -21,8 +21,18 @@ global action.
 | `GENERATION_WRAP_STOPPED` | `WRAP_GENERATION` | admission stop at terminal generation |
 | `C_GUID_FLIPPED` | `GUID_FLIP` | fresh GUID before admission resumes |
 
+The reverse slot edge is checked in both directions: a nonempty slot owner
+must identify exactly one `INSTALLING` arena entry, and every
+`INSTALLING` entry must own exactly one slot. The crash-keeps-slot mutant is
+expected to fail the reverse direction. The bounded model also includes a
+watchdog only for an explicitly stalled, enabled writer; it is a finite safety
+check, not a claim that a fair scheduler eventually publishes every object.
+
 `check_global_trace.py` is the independent Level-1 checker. The static trace
 gate deletes or mutates one action at a time and requires rejection through
 the named edge. TLC's bounded Level-2 rows use the same action names as the
 TLA transitions; the model itself remains model/test only and does not add a
-product trace emitter or persistence implementation.
+product trace emitter or persistence implementation. The committed
+`global-admit-at-terminal-generation.jsonl` fixture is intentionally red: it
+reaches `generation = MaxGeneration` and attempts admission before the
+wrap-stop/GUID-flip sequence.

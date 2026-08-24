@@ -65,11 +65,15 @@ The older experimental model under `formal/protocol50/` on the capability branch
 ## S3 global model limits
 
 `Protocol50Global.tla` is intentionally bounded to two namespaces, two keys,
-two staging slots, three GUID values, and `MaxGeneration = 1` in its checked
-configuration. It proves the ordering and ownership rules at that bound; it
-does not prove an unbounded namespace count, byte arithmetic overflow
-behavior, persistence durability, or scheduler fairness. The writer stall
-mutant is a fail-closed watchdog witness, not an unbounded liveness proof.
+two staging slots, three GUID values, `MaxGeneration = 1`, and an eight-action
+TLC horizon in its checked configuration. It proves the ordering and
+ownership rules at that bound; it does not prove an unbounded namespace count,
+byte arithmetic overflow behavior, persistence durability, or scheduler
+fairness. The writer stall mutant is a deterministic, fail-closed watchdog
+witness: `STALL_WRITER` can mark only an actually enabled, slot-owned
+`INSTALLING` writer; only `WATCHDOG_TICK` may advance its counter; and
+`WatchdogNoStall` rejects the finite deadline. This is not an unbounded
+liveness claim.
 The product S3 claim remains blocked until the pinned TLC rows and the
 corresponding product watchdog/eviction gates are run on the exact candidate.
 

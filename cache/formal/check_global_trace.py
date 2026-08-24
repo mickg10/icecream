@@ -122,6 +122,8 @@ def check(path: Path) -> None:
                 raise ValueError(f"line {index}: namespace already admitted")
             if current["stopped"]:
                 raise ValueError(f"line {index}: admission after generation wrap stop")
+            if current["generation"] >= MAX_GENERATION:
+                raise ValueError(f"line {index}: admission at terminal generation")
             current["live"] = True
             current["evicted"] = False
 

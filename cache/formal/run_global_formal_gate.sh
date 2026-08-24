@@ -19,10 +19,17 @@ done
 
 for invariant in \
     AggregateByteCap NamespaceByteCaps InstallingOwnsExactlyOneSlot \
-    ArenaStateMachine WholeNamespaceEviction GenerationAdmissionStop \
+    EveryOwnedSlotHasInstallingArena ArenaStateMachine WholeNamespaceEviction GenerationAdmissionStop \
     CrashMidInstallIsIdempotent ConflictIsFatal; do
     grep -F "$invariant" "$SCRIPT_DIR/Protocol50Global.tla" >/dev/null || {
         echo "missing global invariant: $invariant" >&2
+        exit 1
+    }
+done
+
+for symbol in WatchdogLimit WriterWorkEnabled WATCHDOG_TICK WatchdogNoStall; do
+    grep -F "$symbol" "$SCRIPT_DIR/Protocol50Global.tla" >/dev/null || {
+        echo "missing executable watchdog binding: $symbol" >&2
         exit 1
     }
 done

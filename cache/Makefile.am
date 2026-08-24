@@ -122,11 +122,13 @@ EXTRA_DIST = \
 	formal/Protocol50GlobalAdmissionMutant.cfg \
 	formal/Protocol50GlobalConflictMutant.cfg \
 	formal/Protocol50GlobalCrashMutant.cfg \
+	formal/Protocol50GlobalReverseSlotMutant.cfg \
 	formal/Protocol50GlobalContentMutant.cfg \
 	formal/Protocol50GlobalStallMutant.cfg \
 	formal/Protocol50GlobalTrace.md \
 	formal/check_global_trace.py \
 	formal/global-trace.jsonl \
+	formal/global-admit-at-terminal-generation.jsonl \
 	formal/run_global_trace_gate.sh \
 	formal/run_global_tlc.sh \
 	formal/run_global_formal_gate.sh \

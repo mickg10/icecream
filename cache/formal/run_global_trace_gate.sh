@@ -5,10 +5,24 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PYTHON=${PYTHON:-python3}
 CHECKER="$SCRIPT_DIR/check_global_trace.py"
 CANONICAL="$SCRIPT_DIR/global-trace.jsonl"
+TERMINAL_FIXTURE="$SCRIPT_DIR/global-admit-at-terminal-generation.jsonl"
 WORKDIR=$(mktemp -d "${TMPDIR:-/tmp}/p50-global-trace.XXXXXX")
 trap 'rm -rf "$WORKDIR"' EXIT HUP INT TERM
 
 "$PYTHON" "$CHECKER" "$CANONICAL"
+set +e
+"$PYTHON" "$CHECKER" "$TERMINAL_FIXTURE" >"$WORKDIR/committed-terminal.out" 2>&1
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+    echo "committed terminal-admission fixture unexpectedly passed" >&2
+    exit 1
+fi
+grep -F "admission at terminal generation" "$WORKDIR/committed-terminal.out" >/dev/null || {
+    echo "committed terminal-admission fixture failed through the wrong gate" >&2
+    cat "$WORKDIR/committed-terminal.out" >&2
+    exit 1
+}
 
 "$PYTHON" - "$CANONICAL" "$WORKDIR" <<'PY'
 import copy
@@ -54,7 +68,7 @@ write("aggregate-cap.jsonl", cap)
 lru = copy.deepcopy(rows)
 evict_index = next(i for i, row in enumerate(lru)
                    if row["action"] == "NAMESPACE_EVICTED")
-lru[evict_index]["namespace"] = "n0"
+lru[evict_index]["namespace"] = "n1"
 write("wrong-lru.jsonl", lru)
 
 admission = copy.deepcopy(rows)
@@ -63,6 +77,13 @@ stop_index = next(i for i, row in enumerate(admission)
 admission.insert(stop_index + 1,
                  {"action": "NAMESPACE_ADMITTED", "namespace": "n0"})
 write("admit-after-wrap.jsonl", admission)
+
+terminal_admission = copy.deepcopy(rows)
+advance_index = next(i for i, row in enumerate(terminal_admission)
+                     if row["action"] == "GENERATION_ADVANCED")
+terminal_admission.insert(advance_index + 1,
+                          {"action": "NAMESPACE_ADMITTED", "namespace": "n0"})
+write("admit-at-terminal-generation.jsonl", terminal_admission)
 
 crash = copy.deepcopy(rows)
 crash_row = next(row for row in crash if row["action"] == "INSTALL_CRASHED")
@@ -99,6 +120,7 @@ expect_reject changed-content "immutable arena content changed"
 expect_reject aggregate-cap "aggregate byte cap exceeded"
 expect_reject wrong-lru "eviction victim is not whole-namespace LRU"
 expect_reject admit-after-wrap "admission after generation wrap stop"
+expect_reject admit-at-terminal-generation "admission at terminal generation"
 expect_reject stale-crash-slot "crash does not own staging slot"
 expect_reject same-content-not-conflict "conflict is not same-key/different-content"
 

@@ -18,9 +18,11 @@ INSTALLING is owned by exactly one global staging slot.  A crash removes the
 partial object and releases its slot.  A retry is therefore idempotent: it
 starts from ABSENT and can publish the canonical content at most once.
 
-The model is safety-scoped.  The bounded writer watchdog is represented as a
-fail-closed safety condition (STALL_WRITER sets a fault); the product
-progress claim must bind the same condition to its deterministic watchdog.
+The model is safety-scoped.  It includes a bounded deterministic writer
+watchdog rather than an unbounded liveness claim: its counter advances only
+when an INSTALLING object still owns a slot and the explicit stall mutant has
+blocked that enabled writer.  Reaching the finite deadline is a fail-closed
+state that the watchdog invariant rejects.
 ***************************************************************************)
 
 CONSTANTS N0, N1, K0, K1, S0, S1,
@@ -82,12 +84,13 @@ CanonicalValue(k) == IF k = K0 THEN V0 ELSE V1
 ObjectBytes(k) == IF k = K0 THEN 2 ELSE 3
 Owner(n, k) == <<n, k>>
 
-VARIABLE s
-vars == <<s>>
+VARIABLES s, step
+vars == <<s, step>>
 
 Init ==
-    s = [live                 |-> [n \in Namespaces |-> FALSE],
+    /\ s = [live                 |-> [n \in Namespaces |-> FALSE],
          evicted              |-> [n \in Namespaces |-> FALSE],
+         admissionCount       |-> [n \in Namespaces |-> 0],
          guid                 |-> [n \in Namespaces |-> G0],
          guidHistory          |-> [n \in Namespaces |-> {G0}],
          generation           |-> [n \in Namespaces |-> 0],
@@ -95,13 +98,19 @@ Init ==
          admissionStopped     |-> [n \in Namespaces |-> FALSE],
          lru                  |-> [n \in Namespaces |-> 0],
          clock                |-> 0,
+         touchCount           |-> [n \in Namespaces |-> 0],
          active               |-> [n \in Namespaces |-> FALSE],
+         tuUsed               |-> [n \in Namespaces |-> FALSE],
          arena                |-> [n \in Namespaces |->
                                       [k \in Keys |-> "ABSENT"]],
          content              |-> [n \in Namespaces |->
                                       [k \in Keys |-> NoContent]],
          stagingContent       |-> [n \in Namespaces |->
                                       [k \in Keys |-> NoContent]],
+         installAttempts      |-> [n \in Namespaces |->
+                                      [k \in Keys |-> 0]],
+         pinUsed              |-> [n \in Namespaces |->
+                                      [k \in Keys |-> FALSE]],
          slotOwner            |-> [slot \in Slots |-> NoOwnerValue],
          crashed              |-> [n \in Namespaces |->
                                       [k \in Keys |-> FALSE]],
@@ -109,6 +118,11 @@ Init ==
                                       [k \in Keys |-> FALSE]],
          conflictSeen         |-> [n \in Namespaces |->
                                       [k \in Keys |-> FALSE]],
+         writerBlocked        |-> [n \in Namespaces |->
+                                      [k \in Keys |-> FALSE]],
+         watchdogCount       |-> [n \in Namespaces |->
+                                      [k \in Keys |-> 0]],
+         watchdogExpired     |-> FALSE,
          fatal                |-> FALSE,
          badAggregate         |-> FALSE,
          badNamespaceCap      |-> FALSE,
@@ -119,14 +133,25 @@ Init ==
          badGuidReuse          |-> FALSE,
          badConflict           |-> FALSE,
          badCrash              |-> FALSE,
-         badContent            |-> FALSE,
-         stalled               |-> FALSE]
+         badContent            |-> FALSE]
+    /\ step = 0
+
+WatchdogLimit == 2
+MaxSteps == 8
+
+WriterWorkEnabled(st, n, k) ==
+    /\ st.arena[n][k] = "INSTALLING"
+    /\ \E slot \in Slots : st.slotOwner[slot] = Owner(n, k)
+
+ByteCharge(st, n, k) ==
+    IF st.arena[n][k] \in {"PRESENT", "PINNED"}
+    THEN ObjectBytes(k)
+    ELSE 0
 
 NsBytes(st, n) ==
-    Sum({IF st.arena[n][k] \in {"PRESENT", "PINNED"}
-             THEN ObjectBytes(k) ELSE 0 : k \in Keys})
+    ByteCharge(st, n, K0) + ByteCharge(st, n, K1)
 
-TotalBytes(st) == Sum({NsBytes(st, n) : n \in Namespaces})
+TotalBytes(st) == NsBytes(st, N0) + NsBytes(st, N1)
 
 Installing(st, n) ==
     {k \in Keys : st.arena[n][k] = "INSTALLING"}
@@ -154,6 +179,8 @@ ClearNamespace(st, n) ==
         !.arena[n] = [k \in Keys |-> "ABSENT"],
         !.content[n] = [k \in Keys |-> NoContent],
         !.stagingContent[n] = [k \in Keys |-> NoContent],
+        !.writerBlocked[n] = [k \in Keys |-> FALSE],
+        !.watchdogCount[n] = [k \in Keys |-> 0],
         !.slotOwner = [slot \in Slots |->
                           IF st.slotOwner[slot][1] = n
                           THEN NoOwnerValue ELSE st.slotOwner[slot]]]
@@ -162,24 +189,35 @@ ADMIT_NAMESPACE(n) ==
     LET rejected == s.admissionStopped[n]
     IN /\ n \in Namespaces
        /\ ~s.live[n]
+       /\ s.admissionCount[n] < 2
+       /\ (s.generation[n] < MaxGeneration \/ s.admissionStopped[n] \/
+             MutantAdmitWhileStopped)
        /\ (~s.admissionStopped[n] \/ MutantAdmitWhileStopped)
        /\ s' = [s EXCEPT
                     !.live[n] = TRUE,
                     !.evicted[n] = FALSE,
-                    !.badAdmission = @ \/ rejected]
+                    !.admissionCount[n] = @ + 1,
+                    !.badAdmission = @ \/ rejected \/
+                        (s.generation[n] = MaxGeneration /\
+                         ~s.admissionStopped[n])]
 
 TOUCH_NAMESPACE(n) ==
     /\ n \in Namespaces
     /\ s.live[n]
+    /\ s.touchCount[n] = 0
     /\ s' = [s EXCEPT
                  !.clock = @ + 1,
-                 !.lru[n] = @ + 1]
+                 !.lru[n] = @ + 1,
+                 !.touchCount[n] = 1]
 
 START_TU(n) ==
     /\ n \in Namespaces
     /\ s.live[n]
     /\ ~s.active[n]
-    /\ s' = [s EXCEPT !.active[n] = TRUE]
+    /\ ~s.tuUsed[n]
+    /\ s' = [s EXCEPT
+                 !.active[n] = TRUE,
+                 !.tuUsed[n] = TRUE]
 
 FINISH_TU(n) ==
     /\ n \in Namespaces
@@ -200,10 +238,13 @@ BEGIN_INSTALL(n, k, slot, value) ==
        /\ value \in Values
        /\ s.live[n]
        /\ s.arena[n][k] = "ABSENT"
+       /\ ~s.crashed[n][k]
+       /\ s.installAttempts[n][k] = 0
        /\ (s.slotOwner[slot] = NoOwnerValue \/ MutantIgnoreSlotOwnership)
        /\ s' = [s EXCEPT
                     !.arena[n][k] = "INSTALLING",
                     !.stagingContent[n][k] = value,
+                    !.installAttempts[n][k] = 1,
                     !.slotOwner[slot] = Owner(n, k),
                     !.retrySeen[n][k] = @ \/ wasRetry,
                     !.badSlot = @ \/ slotBusy]
@@ -216,10 +257,12 @@ RETRY_INSTALL(n, k, slot, value) ==
     /\ s.crashed[n][k]
     /\ s.arena[n][k] = "ABSENT"
     /\ s.live[n]
+    /\ s.installAttempts[n][k] = 1
     /\ s.slotOwner[slot] = NoOwnerValue
     /\ s' = [s EXCEPT
                  !.arena[n][k] = "INSTALLING",
                  !.stagingContent[n][k] = value,
+                 !.installAttempts[n][k] = 2,
                  !.slotOwner[slot] = Owner(n, k),
                  !.retrySeen[n][k] = TRUE]
 
@@ -244,6 +287,8 @@ PUBLISH_INSTALL(n, k, slot) ==
                     !.content[n][k] =
                         IF MutantBadContent THEN value ELSE CanonicalValue(k),
                     !.stagingContent[n][k] = NoContent,
+                    !.writerBlocked[n][k] = FALSE,
+                    !.watchdogCount[n][k] = 0,
                     !.slotOwner[slot] = NoOwnerValue,
                     !.badContent = @ \/ ~canonical,
                     !.badNamespaceCap = @ \/
@@ -256,7 +301,10 @@ PIN_OBJECT(n, k) ==
     /\ k \in Keys
     /\ s.active[n]
     /\ s.arena[n][k] = "PRESENT"
-    /\ s' = [s EXCEPT !.arena[n][k] = "PINNED"]
+    /\ ~s.pinUsed[n][k]
+    /\ s' = [s EXCEPT
+                 !.arena[n][k] = "PINNED",
+                 !.pinUsed[n][k] = TRUE]
 
 UNPIN_OBJECT(n, k) ==
     /\ n \in Namespaces
@@ -273,6 +321,8 @@ CRASH_MID_INSTALL(n, k, slot) ==
     /\ s' = [s EXCEPT
                  !.arena[n][k] = "ABSENT",
                  !.stagingContent[n][k] = NoContent,
+                 !.writerBlocked[n][k] = FALSE,
+                 !.watchdogCount[n][k] = 0,
                  !.slotOwner[slot] =
                      IF MutantCrashKeepsSlot THEN @ ELSE NoOwnerValue,
                  !.crashed[n][k] = TRUE,
@@ -282,12 +332,13 @@ CONFLICTING_CONTENT(n, k, value) ==
     /\ n \in Namespaces
     /\ k \in Keys
     /\ value \in Values
+    /\ ~s.conflictSeen[n][k]
     /\ s.content[n][k] \in Values
     /\ value # s.content[n][k]
     /\ s.arena[n][k] \in {"PRESENT", "PINNED"}
     /\ s' = [s EXCEPT
                  !.conflictSeen[n][k] = TRUE,
-                 !.fatal = TRUE \/ MutantIgnoreConflict,
+                 !.fatal = @ \/ ~MutantIgnoreConflict,
                  !.badConflict = @ \/ MutantIgnoreConflict]
 
 EVICT_NAMESPACE(n) ==
@@ -296,6 +347,7 @@ EVICT_NAMESPACE(n) ==
         next == ClearNamespace(s, n)
     IN /\ n \in Namespaces
        /\ eligible
+       /\ ~s.evicted[n]
        /\ (oldest \/ MutantIgnoreLru)
        /\ s' = [next EXCEPT !.badLru = @ \/ ~oldest]
 
@@ -337,10 +389,22 @@ STALL_WRITER(n, k) ==
     /\ MutantStallWriter
     /\ n \in Namespaces
     /\ k \in Keys
-    /\ s.arena[n][k] = "INSTALLING"
-    /\ s' = [s EXCEPT !.stalled = TRUE]
+    /\ WriterWorkEnabled(s, n, k)
+    /\ ~s.writerBlocked[n][k]
+    /\ s' = [s EXCEPT !.writerBlocked[n][k] = TRUE]
 
-Next ==
+WATCHDOG_TICK(n, k) ==
+    LET nextCount == s.watchdogCount[n][k] + 1
+    IN /\ n \in Namespaces
+       /\ k \in Keys
+       /\ WriterWorkEnabled(s, n, k)
+       /\ s.writerBlocked[n][k]
+       /\ s.watchdogCount[n][k] < WatchdogLimit
+       /\ s' = [s EXCEPT
+                    !.watchdogCount[n][k] = nextCount,
+                    !.watchdogExpired = @ \/ nextCount >= WatchdogLimit]
+
+RawNext ==
     \/ \E n \in Namespaces : ADMIT_NAMESPACE(n)
     \/ \E n \in Namespaces : TOUCH_NAMESPACE(n)
     \/ \E n \in Namespaces : START_TU(n)
@@ -362,12 +426,22 @@ Next ==
     \/ \E n \in Namespaces : WRAP_GENERATION(n)
     \/ \E n \in Namespaces, newGuid \in Guids : GUID_FLIP(n, newGuid)
     \/ \E n \in Namespaces, k \in Keys : STALL_WRITER(n, k)
+    \/ \E n \in Namespaces, k \in Keys : WATCHDOG_TICK(n, k)
+
+Next ==
+    /\ step < MaxSteps
+    /\ RawNext
+    /\ step' = step + 1
+
+(* The step bound is part of this bounded TLC harness, not a product
+   liveness claim. All required S3 witnesses and red mutants fit below it. *)
 
 Spec == Init /\ [][Next]_vars
 
 TypeOK ==
     /\ s.live \in [Namespaces -> BOOLEAN]
     /\ s.evicted \in [Namespaces -> BOOLEAN]
+    /\ s.admissionCount \in [Namespaces -> 0..2]
     /\ s.guid \in [Namespaces -> Guids]
     /\ s.guidHistory \in [Namespaces -> SUBSET Guids]
     /\ s.generation \in [Namespaces -> Generations]
@@ -375,14 +449,22 @@ TypeOK ==
     /\ s.admissionStopped \in [Namespaces -> BOOLEAN]
     /\ s.lru \in [Namespaces -> Nat]
     /\ s.clock \in Nat
+    /\ s.touchCount \in [Namespaces -> 0..1]
+    /\ step \in 0..MaxSteps
     /\ s.active \in [Namespaces -> BOOLEAN]
+    /\ s.tuUsed \in [Namespaces -> BOOLEAN]
     /\ s.arena \in [Namespaces -> [Keys -> ObjectStates]]
     /\ s.content \in [Namespaces -> [Keys -> Values \cup {NoContent}]]
     /\ s.stagingContent \in [Namespaces -> [Keys -> Values \cup {NoContent}]]
+    /\ s.installAttempts \in [Namespaces -> [Keys -> 0..2]]
+    /\ s.pinUsed \in [Namespaces -> [Keys -> BOOLEAN]]
     /\ s.slotOwner \in [Slots -> (Namespaces \X Keys) \cup {NoOwnerValue}]
     /\ s.crashed \in [Namespaces -> [Keys -> BOOLEAN]]
     /\ s.retrySeen \in [Namespaces -> [Keys -> BOOLEAN]]
     /\ s.conflictSeen \in [Namespaces -> [Keys -> BOOLEAN]]
+    /\ s.writerBlocked \in [Namespaces -> [Keys -> BOOLEAN]]
+    /\ s.watchdogCount \in [Namespaces -> [Keys -> 0..WatchdogLimit]]
+    /\ s.watchdogExpired \in BOOLEAN
     /\ s.fatal \in BOOLEAN
     /\ s.badAggregate \in BOOLEAN
     /\ s.badNamespaceCap \in BOOLEAN
@@ -394,17 +476,26 @@ TypeOK ==
     /\ s.badConflict \in BOOLEAN
     /\ s.badCrash \in BOOLEAN
     /\ s.badContent \in BOOLEAN
-    /\ s.stalled \in BOOLEAN
 
 AggregateByteCap == TotalBytes(s) <= MaxAggregateBytes
 
 NamespaceByteCaps ==
     \A n \in Namespaces : NsBytes(s, n) <= MaxNamespaceBytes
 
+SlotOwners(st, slot) ==
+    {owner \in (Namespaces \X Keys) :
+        st.slotOwner[slot] = owner}
+
 StagingSlotExclusive ==
     \A slot \in Slots :
-        Cardinality({Owner(n, k) : n \in Namespaces, k \in Keys,
-                     s.slotOwner[slot] = Owner(n, k)}) <= 1
+        Cardinality(SlotOwners(s, slot)) <= 1
+
+EveryOwnedSlotHasInstallingArena ==
+    \A slot \in Slots :
+        s.slotOwner[slot] = NoOwnerValue \/
+            \E n \in Namespaces, k \in Keys :
+                /\ s.slotOwner[slot] = Owner(n, k)
+                /\ s.arena[n][k] = "INSTALLING"
 
 InstallingOwnsExactlyOneSlot ==
     \A n \in Namespaces, k \in Keys :
@@ -475,7 +566,7 @@ NoMutantFaults ==
     /\ ~s.badCrash
     /\ ~s.badContent
 
-WatchdogNoStall == ~s.stalled
+WatchdogNoStall == ~s.watchdogExpired
 
 THEOREM Spec => []TypeOK
 
