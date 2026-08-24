@@ -176,6 +176,10 @@ int handle_connection(const string &basedir, CompileJob *job,
                       int compiler_input_fd)
 {
     int owned_compiler_input_fd = compiler_input_fd;
+    if (job != nullptr && job->usesP50Input()) {
+        trace() << "admitting one attached ZSTD_TU input descriptor for job "
+                << job->jobID() << endl;
+    }
     int socket[2];
 
     if (pipe(socket) == -1) {

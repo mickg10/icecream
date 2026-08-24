@@ -31,6 +31,7 @@
 #include "pipes.h"
 #include <sys/select.h>
 #include <algorithm>
+#include <cstdlib>
 #include <memory>
 #include <new>
 #include <stdexcept>
@@ -123,6 +124,17 @@ int work_it(CompileJob &j, unsigned int job_stat[], MsgChannel *client, CompileR
     }
     trace() << "remote compile arguments:" << argstxt << endl;
 
+    // The strict C1F1 gate is intentionally stronger than normal negotiated
+    // fallback: if the harness requested an all-P50 run, a legacy selector is
+    // a test failure and must never be allowed to consume FileChunk input.
+    if (std::getenv("ICECC_P50_C1F1_REQUIRED") != nullptr &&
+        !j.usesP50Input()) {
+        if (compiler_input_fd >= 0)
+            (void)close(compiler_input_fd);
+        error_client(client, "all-P50 C1F1 run received legacy compiler input");
+        return EXIT_IO_ERROR;
+    }
+
     // Select and validate the complete source before the real compiler is
     // forked.  A present P50 selector can use only its authenticated sealed
     // InputRecord cursor; it never constructs LegacyChunkSource and therefore
@@ -148,6 +160,8 @@ int work_it(CompileJob &j, unsigned int job_stat[], MsgChannel *client, CompileR
                 return EXIT_OUT_OF_MEMORY;
             }
             owned_input.reset(source);
+            trace() << "ZSTD_TU compiler input cursor validated byte-exact at offset zero"
+                    << endl;
         } catch (const std::exception &error) {
             log_warning() << "P50 compiler input validation failed: "
                           << error.what() << endl;
