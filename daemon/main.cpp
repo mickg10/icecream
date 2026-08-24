@@ -5595,12 +5595,56 @@ int Daemon::scheduler_use_cs(UseCSMsg *msg)
             return send_scheduler(JobDoneMsg(msg->job_id, 107, JobDoneMsg::FROM_SUBMITTER, clients.size())) ? 0 : 1;
         }
         c->getcs_batch_jobids.push_back(msg->job_id);   /* record BEFORE the write */
-        /* Relay the ORIGINAL scheduler frame (bigoracle 00:35 #1): preserve
-           got_env, client_id and every other field exactly, as the scalar remote
-           path does via send_msg(*msg).  Rebuilding with hardcoded got_env=true/
-           client_id=1 could tell a real client to skip a required environment
-           transfer and fail the build. */
-        if (!c->channel->send_msg(*msg)) {
+        /* S2 (BigOracle, 4th independent gap): a count>1 request bypassed
+           the entire S2 block above/below this branch (both `return`
+           early), so an accepted batch decision could relay a scheduler-
+           sent cache-present tail with NO daemon-retained assignment-bound
+           state at all, and never cleared a stale scalar cacheHandoff this
+           (reused) Client might still carry.  The batch ledger
+           (getcs_batch_jobids) records only exact job ids -- no epoch/
+           nonce/endpoint per decision -- so a correct per-assignment cache
+           binding is not even representable here.  BigOracle: hoisting the
+           scalar cacheHandoff assignment above this branch would be WRONG
+           (last-writer-wins across N decisions is nonsensical, not merely
+           incomplete) -- doing so idiomatically means re-checking the
+           SAME admissibility helper here too, and
+           unittests/p50cacheadvertisement-source.sh already anchors that
+           exact call's count, scoped to the scalar path below, so that
+           specific hoist shape reddens an EXISTING source anchor, not
+           just the behavioral daemonbatch-run.sh rows.  BOUNDED FIX
+           instead: batch is
+           cache-INELIGIBLE.  This is a FEATURE fallback, not a wire
+           fallback -- batch compiles keep working via legacy (no-cache)
+           transport; a future reviewed per-assignment ledger keyed by
+           {job_id, epoch, nonce} may re-enable batch cache tails.  Every
+           accepted batch decision therefore (a) clears any singular
+           scalar cacheHandoff this Client might retain -- the SAME
+           canonical clear used at the other three S2 "no real worker
+           snapshot" sites (scheduler_no_cs, handle_old_request's stranded
+           replay, handle_get_cs's scheduler-absent fallback), so it can
+           never leak into a batch decision -- and (b) relays a COPY of
+           *msg with its cache triple canonically absent, never the
+           original frame, even when the scheduler sent a valid-present
+           tail.  See test_poison_cache_handoff_if_armed's own comment
+           for why the poison/record pair below brackets this real,
+           unmodified clear. */
+        const bool cache_handoff_test_poisoned_batch =
+            test_poison_cache_handoff_if_armed(c, "batch");
+        c->cacheHandoff = Client::CacheHandoff{};
+        if (cache_handoff_test_poisoned_batch) {
+            test_record_cache_handoff_clear(c, "batch");
+        }
+        UseCSMsg batch_reply = *msg;
+        batch_reply.cache_endpoint_port = 0;
+        batch_reply.cache_protocol = 0;
+        batch_reply.cache_profile_mask = 0;
+        /* Relay the ORIGINAL scheduler frame (bigoracle 00:35 #1) -- except
+           for the cache triple canonicalized above -- preserving got_env,
+           client_id, matched_job_id, and every other field exactly, as the
+           scalar remote path does via send_msg(*msg).  Rebuilding with
+           hardcoded got_env=true/client_id=1 could tell a real client to
+           skip a required environment transfer and fail the build. */
+        if (!c->channel->send_msg(batch_reply)) {
             ++usecs_exact_aborts;
             handle_end(c, 143);
             return 0;
