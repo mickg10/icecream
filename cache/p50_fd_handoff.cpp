@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
@@ -19,6 +20,12 @@ constexpr uint16_t kRequestType = 1;
 constexpr uint16_t kAckType = 2;
 constexpr uint16_t kNackType = 3;
 constexpr std::array<uint8_t, 4> kMagic{'P', '5', '0', 'F'};
+constexpr int kMaxEintrRetries = 8;
+constexpr size_t kControlBufferSize = 256;
+
+#if defined(ICECC_P50_FD_HANDOFF_TEST_HOOKS)
+std::atomic<size_t> g_test_max_send_chunk{0};
+#endif
 
 enum : uint32_t {
     kCodeAck = 1,
@@ -109,9 +116,12 @@ int poll_until(int fd, short events, std::chrono::steady_clock::time_point deadl
             continue;
         if (result <= 0)
             return result;
+        // A stream may report readable data and HUP together.  Consume the
+        // queued bytes first; the following iteration observes clean EOF.
+        if ((pfd.revents & events) != 0)
+            return 1;
         if ((pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0)
             return -1;
-        return 1;
     }
 }
 
@@ -125,8 +135,65 @@ struct Received {
     int fd = -1;
     size_t fd_count = 0;
     bool has_rights = false;
-    bool saw_control = false;
 };
+
+bool read_descriptor_flags(int fd, int& descriptor_flags) noexcept {
+    for (int attempt = 0; attempt != kMaxEintrRetries; ++attempt) {
+        descriptor_flags = ::fcntl(fd, F_GETFD);
+        if (descriptor_flags >= 0)
+            return true;
+        if (errno != EINTR)
+            return false;
+    }
+    return false;
+}
+
+bool mark_cloexec(int fd) noexcept {
+    int descriptor_flags = -1;
+    if (!read_descriptor_flags(fd, descriptor_flags))
+        return false;
+    if ((descriptor_flags & FD_CLOEXEC) != 0)
+        return true;
+    for (int attempt = 0; attempt != kMaxEintrRetries; ++attempt) {
+        if (::fcntl(fd, F_SETFD, descriptor_flags | FD_CLOEXEC) == 0)
+            return true;
+        if (errno != EINTR)
+            return false;
+    }
+    return false;
+}
+
+FdHandoffStatus reject_queued_trailing_byte(int fd) noexcept {
+    struct pollfd pfd{fd, POLLIN, 0};
+    int ready = -1;
+    for (int attempt = 0; attempt != kMaxEintrRetries; ++attempt) {
+        ready = ::poll(&pfd, 1, 0);
+        if (ready >= 0 || errno != EINTR)
+            break;
+    }
+    if (ready < 0)
+        return FdHandoffStatus::IoError;
+    if (ready == 0 || (pfd.revents & POLLIN) == 0)
+        return FdHandoffStatus::Accepted;
+
+    uint8_t byte = 0;
+    int flags = MSG_PEEK;
+#if defined(MSG_DONTWAIT)
+    flags |= MSG_DONTWAIT;
+#endif
+    for (int attempt = 0; attempt != kMaxEintrRetries; ++attempt) {
+        const ssize_t count = ::recv(fd, &byte, sizeof(byte), flags);
+        if (count > 0)
+            return FdHandoffStatus::TrailingData;
+        if (count == 0)
+            return FdHandoffStatus::Accepted;
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            return FdHandoffStatus::Accepted;
+        if (errno != EINTR)
+            return FdHandoffStatus::IoError;
+    }
+    return FdHandoffStatus::IoError;
+}
 
 void close_received(Received& received) {
     if (received.fd >= 0) {
@@ -135,100 +202,60 @@ void close_received(Received& received) {
     }
 }
 
-Received receive_wire(int connection_fd, bool expect_fd,
-                      std::chrono::steady_clock::time_point deadline) {
-    Received received;
-    std::array<uint8_t, CMSG_SPACE(sizeof(int) * 2)> control{};
-    struct iovec iov{received.wire.data(), received.wire.size()};
-    struct msghdr message{};
-    message.msg_iov = &iov;
-    message.msg_iovlen = 1;
-    message.msg_control = control.data();
-    message.msg_controllen = control.size();
-
-    const int ready = poll_until(connection_fd, POLLIN, deadline);
-    if (ready != 1) {
-        received.status = io_status(ready);
-        return received;
-    }
-    int flags = 0;
-#if defined(MSG_CMSG_CLOEXEC)
-    flags |= MSG_CMSG_CLOEXEC;
-#endif
-#if defined(MSG_TRUNC)
-    flags |= MSG_TRUNC;
-#endif
-    ssize_t count = ::recvmsg(connection_fd, &message, flags);
-#if defined(MSG_CMSG_CLOEXEC)
-    if (count < 0 && errno == EINVAL)
-        count = ::recvmsg(connection_fd, &message,
-#if defined(MSG_TRUNC)
-                          MSG_TRUNC
-#else
-                          0
-#endif
-        );
-#endif
-    if (count == 0) {
-        received.status = FdHandoffStatus::Disconnected;
-        return received;
-    }
-    if (count < 0) {
-        received.status = errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK
-                              ? FdHandoffStatus::Timeout
-                              : FdHandoffStatus::IoError;
-        return received;
-    }
-
+void record_control(Received& received, struct msghdr& message) noexcept {
+    const auto fail = [&received](FdHandoffStatus status) {
+        if (received.status == FdHandoffStatus::Accepted)
+            received.status = status;
+    };
     if ((message.msg_flags & MSG_TRUNC) != 0)
-        received.status = FdHandoffStatus::MessageTruncated;
-    else if ((message.msg_flags & MSG_CTRUNC) != 0)
-        received.status = FdHandoffStatus::ControlTruncated;
-    else if (static_cast<size_t>(count) != kWireSize)
-        received.status = count < static_cast<ssize_t>(kWireSize)
-                              ? FdHandoffStatus::Truncated
-                              : FdHandoffStatus::MessageTruncated;
-    else
-        received.status = FdHandoffStatus::Accepted;
+        fail(FdHandoffStatus::MessageTruncated);
+    if ((message.msg_flags & MSG_CTRUNC) != 0)
+        fail(FdHandoffStatus::ControlTruncated);
 
+    const auto* control_begin = static_cast<const uint8_t*>(message.msg_control);
+    const auto* control_end = control_begin + message.msg_controllen;
     for (struct cmsghdr* cmsg = CMSG_FIRSTHDR(&message); cmsg != nullptr;
          cmsg = CMSG_NXTHDR(&message, cmsg)) {
-        received.saw_control = true;
-        const auto* control_begin = static_cast<const uint8_t*>(message.msg_control);
-        const auto* control_end = control_begin + message.msg_controllen;
+        const auto* cmsg_begin = reinterpret_cast<const uint8_t*>(cmsg);
         const auto* data_begin = reinterpret_cast<const uint8_t*>(CMSG_DATA(cmsg));
+        const bool header_in_bounds = cmsg_begin >= control_begin && cmsg_begin <= control_end &&
+                                      static_cast<size_t>(control_end - cmsg_begin) >=
+                                          sizeof(struct cmsghdr);
+        const bool length_in_bounds = header_in_bounds && cmsg->cmsg_len >= CMSG_LEN(0) &&
+                                      cmsg->cmsg_len <=
+                                          static_cast<size_t>(control_end - cmsg_begin);
         const size_t available = data_begin >= control_begin && data_begin <= control_end
                                      ? static_cast<size_t>(control_end - data_begin)
                                      : 0;
-        if (cmsg->cmsg_len < CMSG_LEN(0) ||
-            cmsg->cmsg_len > message.msg_controllen) {
-            if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
+        if (!length_in_bounds) {
+            if (header_in_bounds && cmsg->cmsg_level == SOL_SOCKET &&
+                cmsg->cmsg_type == SCM_RIGHTS) {
                 const size_t possible_fds = available / sizeof(int);
                 const auto* fds = reinterpret_cast<const int*>(data_begin);
                 for (size_t i = 0; i != possible_fds; ++i)
                     ::close(fds[i]);
                 received.fd_count += possible_fds;
             }
-            received.status = FdHandoffStatus::Malformed;
+            fail(FdHandoffStatus::Malformed);
             continue;
         }
         if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) {
-            received.status = FdHandoffStatus::UnexpectedControl;
+            fail(FdHandoffStatus::UnexpectedControl);
             continue;
         }
         received.has_rights = true;
         const size_t bytes = cmsg->cmsg_len - CMSG_LEN(0);
-        if (bytes == 0 || bytes % sizeof(int) != 0) {
-            const auto* fds = reinterpret_cast<const int*>(CMSG_DATA(cmsg));
+        if (bytes == 0 || bytes % sizeof(int) != 0 || bytes > available) {
+            const auto* fds = reinterpret_cast<const int*>(data_begin);
             const size_t possible_fds = std::min(bytes / sizeof(int), available / sizeof(int));
             for (size_t i = 0; i != possible_fds; ++i)
                 ::close(fds[i]);
             received.fd_count += possible_fds;
-            received.status = FdHandoffStatus::Malformed;
+            fail(FdHandoffStatus::Malformed);
             continue;
         }
         const size_t count_fds = bytes / sizeof(int);
-        const auto* fds = reinterpret_cast<const int*>(CMSG_DATA(cmsg));
+        const auto* fds = reinterpret_cast<const int*>(data_begin);
         for (size_t i = 0; i != count_fds; ++i) {
             if (received.fd_count == 0)
                 received.fd = fds[i];
@@ -237,25 +264,95 @@ Received receive_wire(int connection_fd, bool expect_fd,
             ++received.fd_count;
         }
         if (count_fds != 1)
-            received.status = FdHandoffStatus::ExtraFd;
+            fail(FdHandoffStatus::ExtraFd);
     }
-    if (expect_fd && !received.has_rights && !received.saw_control)
-        received.status = FdHandoffStatus::MissingFd;
-    if (!expect_fd && received.has_rights)
-        received.status = FdHandoffStatus::UnexpectedControl;
-    if (received.fd_count == 0 && received.has_rights)
-        received.status = FdHandoffStatus::Malformed;
-    if (received.fd_count > 1)
-        received.status = FdHandoffStatus::ExtraFd;
-    if (received.fd >= 0) {
-        const int descriptor_flags = ::fcntl(received.fd, F_GETFD);
-        if (descriptor_flags < 0 || (descriptor_flags & FD_CLOEXEC) == 0) {
-            if (::fcntl(received.fd, F_SETFD, descriptor_flags | FD_CLOEXEC) != 0) {
-                close_received(received);
-                received.status = FdHandoffStatus::AdoptionFailed;
-            }
+}
+
+Received receive_wire(int connection_fd, bool expect_fd,
+                      std::chrono::steady_clock::time_point deadline) {
+    Received received;
+    received.status = FdHandoffStatus::Accepted;
+    size_t offset = 0;
+    while (offset != received.wire.size() && received.status == FdHandoffStatus::Accepted) {
+        const int ready = poll_until(connection_fd, POLLIN, deadline);
+        if (ready != 1) {
+            if (ready == 0)
+                received.status = FdHandoffStatus::Timeout;
+            else
+                received.status = offset == 0 ? FdHandoffStatus::Disconnected
+                                              : FdHandoffStatus::Truncated;
+            break;
         }
+
+        // Leave enough room to classify non-SCM_RIGHTS ancillary records rather
+        // than reporting a platform-dependent MSG_CTRUNC for otherwise bounded
+        // credentials/control payloads.  SCM_RIGHTS is still limited below to
+        // exactly one descriptor and every received extra descriptor is closed.
+        alignas(struct cmsghdr) std::array<uint8_t, kControlBufferSize> control{};
+        struct iovec iov{received.wire.data() + offset, received.wire.size() - offset};
+        struct msghdr message{};
+        message.msg_iov = &iov;
+        message.msg_iovlen = 1;
+        message.msg_control = control.data();
+        message.msg_controllen = control.size();
+        int flags = 0;
+#if defined(MSG_CMSG_CLOEXEC)
+        flags |= MSG_CMSG_CLOEXEC;
+#endif
+#if defined(MSG_DONTWAIT)
+        flags |= MSG_DONTWAIT;
+#endif
+        ssize_t count = ::recvmsg(connection_fd, &message, flags);
+#if defined(MSG_CMSG_CLOEXEC)
+        if (count < 0 && errno == EINVAL) {
+            message.msg_controllen = control.size();
+            message.msg_flags = 0;
+            count = ::recvmsg(connection_fd, &message,
+#if defined(MSG_DONTWAIT)
+                              MSG_DONTWAIT
+#else
+                              0
+#endif
+            );
+        }
+#endif
+        if (count == 0) {
+            received.status = offset == 0 ? FdHandoffStatus::Disconnected
+                                          : FdHandoffStatus::Truncated;
+            break;
+        }
+        if (count < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+                continue;
+            received.status = FdHandoffStatus::IoError;
+            break;
+        }
+
+        record_control(received, message);
+        const size_t remaining = received.wire.size() - offset;
+        if (static_cast<size_t>(count) > remaining) {
+            offset = received.wire.size();
+            if (received.status == FdHandoffStatus::Accepted)
+                received.status = FdHandoffStatus::MessageTruncated;
+            break;
+        }
+        offset += static_cast<size_t>(count);
     }
+
+    if (received.status == FdHandoffStatus::Accepted && offset == received.wire.size())
+        received.status = reject_queued_trailing_byte(connection_fd);
+    if (received.status == FdHandoffStatus::Accepted && expect_fd && !received.has_rights)
+        received.status = FdHandoffStatus::MissingFd;
+    if (received.status == FdHandoffStatus::Accepted && !expect_fd && received.has_rights)
+        received.status = FdHandoffStatus::UnexpectedControl;
+    if (received.status == FdHandoffStatus::Accepted && received.fd_count == 0 &&
+        received.has_rights)
+        received.status = FdHandoffStatus::Malformed;
+    if (received.status == FdHandoffStatus::Accepted && received.fd_count > 1)
+        received.status = FdHandoffStatus::ExtraFd;
+    if (received.status == FdHandoffStatus::Accepted && received.fd >= 0 &&
+        !mark_cloexec(received.fd))
+        received.status = FdHandoffStatus::AdoptionFailed;
     if (received.status != FdHandoffStatus::Accepted)
         close_received(received);
     return received;
@@ -279,24 +376,33 @@ FdHandoffStatus response_status(uint16_t type, uint32_t code) {
 
 FdHandoffStatus send_wire(int connection_fd, const std::array<uint8_t, kWireSize>& wire,
                           int fd, std::chrono::steady_clock::time_point deadline) {
-    struct iovec iov{const_cast<uint8_t*>(wire.data()), wire.size()};
-    std::array<uint8_t, CMSG_SPACE(sizeof(int))> control{};
-    struct msghdr message{};
-    message.msg_iov = &iov;
-    message.msg_iovlen = 1;
-    if (fd >= 0) {
-        message.msg_control = control.data();
-        message.msg_controllen = control.size();
-        auto* cmsg = reinterpret_cast<struct cmsghdr*>(control.data());
-        cmsg->cmsg_level = SOL_SOCKET;
-        cmsg->cmsg_type = SCM_RIGHTS;
-        cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-        std::memcpy(CMSG_DATA(cmsg), &fd, sizeof(fd));
-    }
-    for (;;) {
+    size_t offset = 0;
+    bool rights_sent = false;
+    while (offset != wire.size()) {
         const int ready = poll_until(connection_fd, POLLOUT, deadline);
         if (ready != 1)
             return io_status(ready);
+        size_t chunk = wire.size() - offset;
+#if defined(ICECC_P50_FD_HANDOFF_TEST_HOOKS)
+        const size_t test_chunk = g_test_max_send_chunk.load(std::memory_order_relaxed);
+        if (test_chunk != 0)
+            chunk = std::min(chunk, test_chunk);
+#endif
+        struct iovec iov{const_cast<uint8_t*>(wire.data() + offset), chunk};
+        alignas(struct cmsghdr) std::array<uint8_t, CMSG_SPACE(sizeof(int))> control{};
+        struct msghdr message{};
+        message.msg_iov = &iov;
+        message.msg_iovlen = 1;
+        const bool attach_rights = fd >= 0 && !rights_sent;
+        if (attach_rights) {
+            message.msg_control = control.data();
+            message.msg_controllen = control.size();
+            auto* cmsg = reinterpret_cast<struct cmsghdr*>(control.data());
+            cmsg->cmsg_level = SOL_SOCKET;
+            cmsg->cmsg_type = SCM_RIGHTS;
+            cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+            std::memcpy(CMSG_DATA(cmsg), &fd, sizeof(fd));
+        }
         int flags = 0;
 #if defined(MSG_NOSIGNAL)
         flags |= MSG_NOSIGNAL;
@@ -307,14 +413,21 @@ FdHandoffStatus send_wire(int connection_fd, const std::array<uint8_t, kWireSize
         const ssize_t count = ::sendmsg(connection_fd, &message, flags);
         if (count < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
             continue;
-        if (count == static_cast<ssize_t>(wire.size()))
-            return FdHandoffStatus::Accepted;
-        if (count >= 0)
-            return FdHandoffStatus::IoError;
+        if (count > 0) {
+            if (static_cast<size_t>(count) > chunk)
+                return FdHandoffStatus::IoError;
+            if (attach_rights)
+                rights_sent = true;
+            offset += static_cast<size_t>(count);
+            continue;
+        }
+        if (count == 0)
+            return FdHandoffStatus::Disconnected;
         return errno == EPIPE || errno == ECONNRESET || errno == ENOTCONN
                    ? FdHandoffStatus::Disconnected
                    : FdHandoffStatus::IoError;
     }
+    return FdHandoffStatus::Accepted;
 }
 
 FdHandoffResult result(FdHandoffStatus status, FdHandoffSenderState state) {
@@ -345,10 +458,7 @@ uint32_t nack_code(FdHandoffStatus status) {
 } // namespace
 
 HandoffFd::HandoffFd(int fd) noexcept : fd_(fd) {
-    if (fd_ < 0)
-        return;
-    const int flags = ::fcntl(fd_, F_GETFD);
-    if (flags < 0 || ::fcntl(fd_, F_SETFD, flags | FD_CLOEXEC) != 0) {
+    if (fd_ >= 0 && !mark_cloexec(fd_)) {
         ::close(fd_);
         fd_ = -1;
     }
@@ -368,7 +478,9 @@ HandoffFd& HandoffFd::operator=(HandoffFd&& other) noexcept {
 }
 
 bool HandoffFd::cloexec() const noexcept {
-    const int flags = fd_ < 0 ? -1 : ::fcntl(fd_, F_GETFD);
+    int flags = -1;
+    if (fd_ < 0 || !read_descriptor_flags(fd_, flags))
+        return false;
     return flags >= 0 && (flags & FD_CLOEXEC) != 0;
 }
 
@@ -399,6 +511,7 @@ const char* fd_handoff_status_name(FdHandoffStatus status) noexcept {
     case FdHandoffStatus::Truncated: return "truncated";
     case FdHandoffStatus::MessageTruncated: return "message-truncated";
     case FdHandoffStatus::ControlTruncated: return "control-truncated";
+    case FdHandoffStatus::TrailingData: return "trailing-data";
     case FdHandoffStatus::MissingFd: return "missing-fd";
     case FdHandoffStatus::ExtraFd: return "extra-fd";
     case FdHandoffStatus::UnexpectedControl: return "unexpected-control";
@@ -528,5 +641,11 @@ FdHandoffResult FdHandoffReceiver::receive_and_ack(
 }
 
 HandoffFd FdHandoffReceiver::take_adopted_fd() noexcept { return std::move(adopted_); }
+
+#if defined(ICECC_P50_FD_HANDOFF_TEST_HOOKS)
+void fd_handoff_test_set_max_send_chunk(size_t bytes) noexcept {
+    g_test_max_send_chunk.store(bytes, std::memory_order_relaxed);
+}
+#endif
 
 } // namespace icecc::p50::local

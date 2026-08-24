@@ -4,10 +4,11 @@ set -eu
 test_srcdir=${srcdir:-$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)}
 build_dir=${builddir:-$test_srcdir}
 cxx=${CXX:-c++}
-standard=${ICE_CXX_STANDARD_FLAG:--std=c++20}
+standard=${ICECC_TEST_CXX_STANDARD_FLAG:-${ICE_CXX_STANDARD_FLAG:--std=c++23}}
 binary="$build_dir/p50fdhandoff-sanitize"
 
-"$cxx" "$standard" -Wall -Wextra -Werror -pthread \
+"$cxx" "$standard" -Wall -Wextra -Wpedantic -Werror -pthread \
+    -DICECC_P50_FD_HANDOFF_TEST_HOOKS \
     -fsanitize=address,undefined,leak -fno-omit-frame-pointer \
     -I"$test_srcdir/../cache" \
     "$test_srcdir/p50fdhandoff.cpp" \

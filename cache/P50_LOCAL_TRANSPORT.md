@@ -66,7 +66,10 @@ codec, or cache-session protocol.
 The raw exchange is a fixed 40-byte `P50F` record (version 1, request/ACK/NACK,
 generation, attempt, request id, and result code) carried on the already
 private authenticated control stream.  The request carries exactly one
-`SCM_RIGHTS` descriptor.  The receiver rejects malformed lengths/types,
+`SCM_RIGHTS` descriptor.  Both directions accumulate arbitrary stream
+fragments without repeating ancillary rights after a positive short write;
+already-queued trailing data is rejected as forbidden pipelining.  The
+receiver rejects malformed lengths/types,
 missing or extra descriptors/control messages, `MSG_TRUNC` and `MSG_CTRUNC`,
 stale identity, replay, disconnect, and deadline expiry.  Received descriptors
 are `CLOEXEC` via `MSG_CMSG_CLOEXEC`, with an `fcntl` fallback, before adoption.

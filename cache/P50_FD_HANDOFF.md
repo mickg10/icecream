@@ -23,10 +23,19 @@ the stream is a fixed 40-byte big-endian `P50F` record:
 | 36..39 | result code (zero in a request) |
 
 A request has exactly one `SCM_RIGHTS` control message containing exactly one
-descriptor.  The receiver rejects any missing/extra fd or ancillary message,
-bad cmsg length/type, `MSG_TRUNC`, `MSG_CTRUNC`, malformed record, stale
-generation, wrong attempt/request identity, duplicate, disconnect, or expired
-absolute deadline.  There is no allocation based on a wire length.
+descriptor.  AF_UNIX is deliberately `SOCK_STREAM`, so both request and reply
+are accumulated across arbitrary positive fragments under one absolute
+deadline.  A positive short `sendmsg` transfers the rights only once and all
+remaining record bytes are sent without repeating the ancillary data.  The
+reader consumes exactly 40 bytes and never reads into the next record.  Because
+this exchange is stop-and-wait, any byte already queued in the same direction
+before the reply is forbidden pipelining and is rejected without consumption.
+
+The receiver also rejects any missing/extra fd or ancillary message, bad cmsg
+length/type, `MSG_TRUNC`, `MSG_CTRUNC`, malformed record, stale generation,
+wrong attempt/request identity, duplicate, disconnect, or expired absolute
+deadline.  `POLLIN|POLLHUP` consumes already-queued bytes before classifying
+EOF.  There is no allocation based on a wire length.
 
 ## Ownership state machine
 

@@ -125,10 +125,11 @@ p50cacheadvertisement_LDADD = ../cache/libprotocol50.a ../services/libicecc.la
 p50cacheservice_SOURCES = p50cacheservice.cpp
 p50cacheservice_LDADD = ../cache/libp50localtransport.a
 p50cacheservice_DEPENDENCIES = ../cache/icecc-cache-service
-p50fdhandoff_SOURCES = p50fdhandoff.cpp
+p50fdhandoff_SOURCES = p50fdhandoff.cpp ../cache/p50_fd_handoff.cpp \
+	../cache/p50_local_transport.cpp
+p50fdhandoff_CPPFLAGS = $(AM_CPPFLAGS) -DICECC_P50_FD_HANDOFF_TEST_HOOKS
 p50fdhandoff_CXXFLAGS = -pthread
 p50fdhandoff_LDFLAGS = -pthread
-p50fdhandoff_LDADD = ../cache/libp50localtransport.a
 inputpump_SOURCES = input_pump_test.cpp
 inputpump_CXXFLAGS = -pthread
 inputpump_LDFLAGS = -pthread

@@ -6,6 +6,7 @@
 // session codec, and it never creates a listener or advertises an endpoint.
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 
@@ -54,6 +55,7 @@ enum class FdHandoffStatus {
     Truncated,
     MessageTruncated,
     ControlTruncated,
+    TrailingData,
     MissingFd,
     ExtraFd,
     UnexpectedControl,
@@ -136,5 +138,11 @@ private:
     std::optional<HandoffRequest> seen_request_;
     HandoffFd adopted_;
 };
+
+#if defined(ICECC_P50_FD_HANDOFF_TEST_HOOKS)
+// Compile-time-only deterministic short-write seam.  The installed library
+// never contains this symbol or an environment-controlled equivalent.
+void fd_handoff_test_set_max_send_chunk(size_t bytes) noexcept;
+#endif
 
 } // namespace icecc::p50::local
