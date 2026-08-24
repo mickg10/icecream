@@ -156,7 +156,10 @@ matches = [i for i, line in enumerate(lines) if line.strip().rstrip('\\').strip(
 if len(matches) != 1:
     print(f"FAIL: expected exactly 1 EXTRA_DIST line for {member!r}, found {len(matches)}", file=sys.stderr)
     sys.exit(1)
-del lines[matches[0]]
+del_index = matches[0]
+if not lines[del_index].strip().endswith('\\') and del_index > 0 and lines[del_index - 1].rstrip().endswith('\\'):
+    lines[del_index - 1] = lines[del_index - 1].rstrip()[:-1] + "\n"
+del lines[del_index]
 open(path, "w").writelines(lines)
 print(f"mutation applied: removed {member}'s EXTRA_DIST line")
 PY
