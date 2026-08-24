@@ -430,10 +430,6 @@ if [ "$MODE" = normal ]; then
         RUN_RC=$?
     fi
     cat "$WORK/container-run-$RUN_SUFFIX.log"
-    if [ "$RUN_RC" != "0" ]; then
-        echo "FAIL: $DISTRO build/install container exited $RUN_RC" >&2
-        exit 1
-    fi
     if CONTAINER_RUN_IMAGE=$(docker inspect "$CONTAINER_NAME" --format '{{.Image}}' 2>/dev/null); then
         :
     else
@@ -463,7 +459,18 @@ if [ "$MODE" = normal ]; then
 
     pce=$(grep -oE '^POST-CLEAN-EMPTY=(YES|NO)' "$WORK/container-run-$RUN_SUFFIX.log" | tail -1 | cut -d= -f2)
     fact post_clean_empty "${pce:-MISSING}"
-    [ "${pce:-MISSING}" = "YES" ] || { echo "FAIL: $DISTRO post-clean-empty assertion did not pass (got '${pce:-MISSING}')" >&2; exit 1; }
+    if [ "${pce:-MISSING}" != "YES" ]; then
+        if [ "$RUN_RC" != "0" ]; then
+            echo "FAIL: $DISTRO post-clean-empty assertion did not pass (got '${pce:-MISSING}'; container exited $RUN_RC)" >&2
+        else
+            echo "FAIL: $DISTRO post-clean-empty assertion did not pass (got '${pce:-MISSING}')" >&2
+        fi
+        exit 1
+    fi
+    if [ "$RUN_RC" != "0" ]; then
+        echo "FAIL: $DISTRO build/install container exited $RUN_RC" >&2
+        exit 1
+    fi
 
     for stage in CONFIGURE SERVICES CACHE DAEMON SCHEDULER CLIENT INSTALL DESTDIR-LISTING PACKAGE-INVENTORY; do
         rc=$(grep -oE "^${stage}-EXIT=[0-9]+" "$WORK/container-run-$RUN_SUFFIX.log" | tail -1 | cut -d= -f2)
