@@ -94,10 +94,15 @@ p50daemonsidecaradapter_CPPFLAGS = $(AM_CPPFLAGS) \
 p50daemonsidecaradapter_CXXFLAGS = -pthread
 p50daemonsidecaradapter_LDFLAGS = -pthread
 p50daemonsidecaradapter_LDADD = ../cache/libp50daemonsidecaradapter.a \
+	../cache/libp50inputfd.a ../cache/libprotocol50.a \
 	../cache/libp50readyadvertisement.a ../cache/libp50sidecarsupervisor.a \
-	../cache/libp50localtransport.a ../services/libicecc.la
-p50daemonsidecaradapter_DEPENDENCIES = $(p50daemonsidecaradapter_LDADD) \
-	../cache/icecc-cache-service
+	../cache/libp50localtransport.a ../services/libicecc.la \
+	$(LIBZSTD_LIBS) $(XXHASH_LIBS)
+p50daemonsidecaradapter_DEPENDENCIES = \
+	../cache/libp50daemonsidecaradapter.a ../cache/libp50inputfd.a \
+	../cache/libprotocol50.a ../cache/libp50readyadvertisement.a \
+	../cache/libp50sidecarsupervisor.a ../cache/libp50localtransport.a \
+	../services/libicecc.la ../cache/icecc-cache-service
 p50daemonpositive_SOURCES = p50daemonpositive.cpp
 p50daemonpositive_LDADD = ../services/libicecc.la
 p50daemonpositive_DEPENDENCIES = ../daemon/iceccd ../cache/icecc-cache-service

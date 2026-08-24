@@ -1113,6 +1113,7 @@ MsgChannel::MsgChannel(int _fd, struct sockaddr *_a, socklen_t _l, bool text)
     eof = false;
     text_based = text;
     cache_session_release_armed = false;
+    cache_session_send_release_armed = false;
     set_error_recursion = false;
     maximum_remote_protocol = -1;
 
@@ -1333,6 +1334,7 @@ Msg *MsgChannel::get_msg(int timeout, bool eofAllowed)
     /* A release is tied to the immediately preceding CACHE_SESSION decode;
        attempting another receive is itself the next parser use. */
     cache_session_release_armed = false;
+    cache_session_send_release_armed = false;
 
     if (!wait_for_msg(timeout)) {
         // trace() << "!wait_for_msg()\n";
@@ -1566,12 +1568,41 @@ int MsgChannel::release_fd_if_input_empty()
     return released_fd;
 }
 
+int MsgChannel::release_fd_after_cache_session_send()
+{
+    if (!cache_session_send_release_armed || fd < 0 ||
+        protocol != PROTOCOL_VERSION || eof || instate == ERROR ||
+        instate != NEED_LEN || inofs != intogo || msgtogo != 0 ||
+        !pending_frame_ends.empty()) {
+        return -1;
+    }
+
+    unsigned char byte = 0;
+    const ssize_t result = recv(fd, &byte, sizeof(byte),
+                                MSG_PEEK | MSG_DONTWAIT);
+    if (result >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
+        return -1;
+
+    const int released_fd = fd;
+    fd = -1;
+    cache_session_send_release_armed = false;
+    return released_fd;
+}
+
 bool MsgChannel::send_msg(const Msg &m, int flags)
 {
     /* CACHE_SESSION is a bidirectional stream boundary.  Once any later
        ordinary send is attempted, flushing that output must never resurrect
        descriptor release. */
     cache_session_release_armed = false;
+    cache_session_send_release_armed = false;
+
+    if (m == Msg::CACHE_SESSION &&
+        (msgtogo != 0 || !pending_frame_ends.empty())) {
+        log_error() << "refusing CACHE_SESSION behind pending ordinary output"
+                    << endl;
+        return false;
+    }
 
     /* Protocol-specific refusal occurs before composing even the four-byte
        frame-length placeholder. */
@@ -1623,7 +1654,12 @@ bool MsgChannel::send_msg(const Msg &m, int flags)
         return true;
     }
 
-    return flush_writebuf(flags);
+    const bool flushed = flush_writebuf(flags);
+    if (flushed && m == Msg::CACHE_SESSION && msgtogo == 0 &&
+        pending_frame_ends.empty()) {
+        cache_session_send_release_armed = true;
+    }
+    return flushed;
 }
 
 static int get_second_port_for_debug( int port )

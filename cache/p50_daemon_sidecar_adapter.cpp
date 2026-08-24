@@ -84,6 +84,7 @@ bool DaemonSidecarAdapter::valid_config(const Config& config) noexcept
         !bounded_positive(config.readiness_timeout) ||
         !bounded_positive(config.connect_timeout) ||
         !bounded_positive(config.handoff_timeout) ||
+        !bounded_positive(config.input_attachment_timeout) ||
         !bounded_positive(config.shutdown_timeout) ||
         !bounded_positive(config.restart_window) || config.max_restarts == 0 ||
         config.max_restarts > 100000 || config.max_attempts_per_recovery == 0 ||
@@ -114,6 +115,31 @@ void DaemonSidecarAdapter::observe_public_listener(
 bool DaemonSidecarAdapter::authenticated() const noexcept
 {
     return dispatcher_ != nullptr && dispatcher_->available();
+}
+
+InputFdAttachmentResult DaemonSidecarAdapter::attach_input(
+    InputRecordKey key, uint64_t request_id) noexcept
+{
+    InputFdAttachmentResult rejected_result;
+    rejected_result.status = InputFdAttachmentStatus::InvalidArgument;
+    if (key.c_store_guid == CStoreGuid{} || request_id == 0)
+        return rejected_result;
+
+    rejected_result.status = InputFdAttachmentStatus::Disconnected;
+    if (state_ != AdapterState::Ready || supervisor_ == nullptr ||
+        supervisor_->state() != sidecar::State::Ready ||
+        supervisor_->child_pid() <= 1 || !runtime_nodes_valid())
+        return rejected_result;
+
+    const local::Identity identity{config_.generation, attempt_};
+    const local::CredentialExpectation expected{
+        config_.expected_service_uid, config_.expected_service_gid,
+        static_cast<uint64_t>(supervisor_->child_pid())};
+    const auto deadline = std::chrono::steady_clock::now() +
+                          config_.input_attachment_timeout;
+    return InputFdAttachmentClient::attach(
+        socket_path_, InputFdRequest{identity, key, request_id}, expected,
+        deadline);
 }
 
 bool DaemonSidecarAdapter::next_attempt() noexcept

@@ -31,6 +31,9 @@
 #include "pipes.h"
 #include <sys/select.h>
 #include <algorithm>
+#include <memory>
+#include <new>
+#include <stdexcept>
 
 #ifdef __FreeBSD__
 #include <sys/param.h>
@@ -99,7 +102,7 @@ error_client(MsgChannel *client, string error)
 
 int work_it(CompileJob &j, unsigned int job_stat[], MsgChannel *client, CompileResultMsg &rmsg,
             const std::string &tmp_root, const std::string &build_path, const std::string &file_name,
-            unsigned long int mem_limit, int client_fd)
+            unsigned long int mem_limit, int client_fd, int compiler_input_fd)
 {
     rmsg.out.erase(rmsg.out.begin(), rmsg.out.end());
     rmsg.out.erase(rmsg.out.begin(), rmsg.out.end());
@@ -119,6 +122,53 @@ int work_it(CompileJob &j, unsigned int job_stat[], MsgChannel *client, CompileR
         argstxt += *it;
     }
     trace() << "remote compile arguments:" << argstxt << endl;
+
+    // Select and validate the complete source before the real compiler is
+    // forked.  A present P50 selector can use only its authenticated sealed
+    // InputRecord cursor; it never constructs LegacyChunkSource and therefore
+    // cannot consume FileChunk/End as a silent fallback.  Conversely, the
+    // canonical legacy selector rejects an unexpected attached descriptor.
+    std::unique_ptr<CompilerInputSource> owned_input;
+    if (j.usesP50Input()) {
+        if (compiler_input_fd < 0) {
+            error_client(client, "P50 compiler input is unavailable");
+            return EXIT_IO_ERROR;
+        }
+        const int transferred_input_fd = compiler_input_fd;
+        compiler_input_fd = -1;
+        try {
+            const CompileInputIdentity &identity = j.compileInputIdentity();
+            P50AttachedFileSource *source =
+                new (std::nothrow) P50AttachedFileSource(
+                    transferred_input_fd, identity.raw_bytes,
+                    identity.raw_digest);
+            if (source == nullptr) {
+                (void)close(transferred_input_fd);
+                error_client(client, "cannot allocate P50 compiler input");
+                return EXIT_OUT_OF_MEMORY;
+            }
+            owned_input.reset(source);
+        } catch (const std::exception &error) {
+            log_warning() << "P50 compiler input validation failed: "
+                          << error.what() << endl;
+            error_client(client, "P50 compiler input validation failed");
+            return EXIT_IO_ERROR;
+        }
+    } else {
+        if (compiler_input_fd >= 0) {
+            (void)close(compiler_input_fd);
+            error_client(client, "legacy compile received a P50 input cursor");
+            return EXIT_IO_ERROR;
+        }
+        LegacyChunkSource *source =
+            new (std::nothrow) LegacyChunkSource(client, client_fd);
+        if (source == nullptr) {
+            error_client(client, "cannot allocate legacy compiler input");
+            return EXIT_OUT_OF_MEMORY;
+        }
+        owned_input.reset(source);
+    }
+    CompilerInputSource &input = *owned_input;
 
     int sock_err[2];
     int sock_out[2];
@@ -430,11 +480,6 @@ int work_it(CompileJob &j, unsigned int job_stat[], MsgChannel *client, CompileR
     gettimeofday(&starttv, nullptr);
 
     int return_value = 0;
-    // R6 deliberately selects only the legacy FileChunk/End source.  Compiler
-    // process, result, and output lifecycles remain in this single loop.
-    LegacyChunkSource legacy_input(client, client_fd);
-    CompilerInputSource &input = legacy_input;
-
     log_block parent_wait("parent, waiting");
 
     for (;;) {

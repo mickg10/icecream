@@ -413,6 +413,11 @@ public:
        return -1 without reading or dropping input. */
     int release_fd_if_input_empty();
 
+    /* Transfer a client-side descriptor only after a successfully flushed
+       Protocol-50 CACHE_SESSION send at an otherwise idle ordinary boundary.
+       This is the mirror ownership seam used before CacheWire starts. */
+    int release_fd_after_cache_session_send();
+
     /* Bytes which remain inside the frame currently being decoded.  This is
        deliberately frame-bounded rather than based on buffered input: a
        single read may already contain the following frame. */
@@ -593,6 +598,9 @@ protected:
     // any subsequent decode or ordinary send attempt; there is no generic
     // clean-boundary escape.
     bool cache_session_release_armed;
+    // Armed only by a fully flushed outbound CACHE_SESSION with no earlier
+    // queued frame. Any later send/receive clears it permanently.
+    bool cache_session_send_release_armed;
 
 private:
     friend class Service;

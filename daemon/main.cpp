@@ -545,6 +545,7 @@ public:
         last_known_job_id = 0;
         channel = nullptr;
         job = nullptr;
+        p50_input_fd = -1;
         cacheHandoff = CacheHandoff{};
         usecsmsg = nullptr;
         deferred_getcs = nullptr;
@@ -616,6 +617,12 @@ public:
         delete job;
         job = nullptr;
 
+        if (p50_input_fd >= 0) {
+            const int descriptor = p50_input_fd;
+            p50_input_fd = -1;
+            (void)close(descriptor);
+        }
+
         if (pipe_from_child >= 0) {
             if (-1 == close(pipe_from_child) && (errno != EBADF)){
                 log_perror("Failed to close pipe from child process");
@@ -644,6 +651,10 @@ public:
     uint32_t getcs_delivered;  // UseCS decisions delivered to the client for a batch request
     std::vector<uint32_t> getcs_batch_jobids;  // exact job ids recorded for a batch request (dedup + teardown settlement)
     CompileJob *job;
+    // One compiler-attempt-owned, sealed InputRecord descriptor.  It is
+    // populated only after an exact authenticated sidecar attachment and is
+    // transferred exactly once to handle_connection(); legacy jobs keep -1.
+    int p50_input_fd;
     CacheHandoff cacheHandoff;   // S2: see the struct's own comment above
     int client_id;
     uint32_t niceness; // nice priority (0-20), for PENDING_USE_CS
@@ -4684,6 +4695,7 @@ bool Daemon::configure_cache_adapter() noexcept
         config.readiness_timeout = std::chrono::milliseconds(1000);
         config.connect_timeout = std::chrono::milliseconds(1000);
         config.handoff_timeout = std::chrono::milliseconds(250);
+        config.input_attachment_timeout = std::chrono::milliseconds(5000);
         config.shutdown_timeout = std::chrono::milliseconds(1000);
         config.restart_window = std::chrono::milliseconds(10000);
         config.max_restarts = 3;
@@ -6840,7 +6852,11 @@ void Daemon::handle_old_request()
 
             string envforjob = job->targetPlatform() + "/" + job->environmentVersion();
             received_environments[envforjob].last_use = time(nullptr);
-            pid = handle_connection(envbasedir, job, client->channel, sock, mem_limit, user_uid, user_gid);
+            const int compiler_input_fd = client->p50_input_fd;
+            client->p50_input_fd = -1;
+            pid = handle_connection(envbasedir, job, client->channel, sock,
+                                    mem_limit, user_uid, user_gid,
+                                    compiler_input_fd);
             trace() << "handle connection returned " << pid << endl;
 
             if (pid > 0) {
@@ -6947,6 +6963,52 @@ bool Daemon::handle_compile_file(Client *client, Msg *msg)
         handle_end(client, 145);
         return false;
     }
+    if (job->usesP50Input()) {
+        const CompileInputIdentity &input = job->compileInputIdentity();
+        icecc::p50::InputRecordKey key;
+        key.c_store_guid.bytes = input.c_store_guid;
+        key.tu_seq = icecc::p50::TuSeq{input.tu_seq};
+
+        icecc::p50::InputFdAttachmentResult attachment;
+        if (client->channel->protocol == PROTOCOL_VERSION_CACHE_ADVERTISEMENT &&
+            cache_adapter != nullptr) {
+            attachment = cache_adapter->attach_input(key, input.request_id);
+        }
+        if (attachment.status != icecc::p50::InputFdAttachmentStatus::Accepted ||
+            !attachment.fd.valid()) {
+            log_warning() << "P50 compiler input attachment failed closed for job "
+                          << job->jobID() << " ("
+                          << icecc::p50::input_fd_attachment_status_name(
+                                 attachment.status)
+                          << ")" << endl;
+            if (client->status != Client::CLIENTWORK)
+                finish_assignment_claim(job->jobID());
+            delete job;
+            (void)client->channel->send_msg(EndMsg());
+            handle_end(client, 146);
+            return false;
+        }
+        if (client->p50_input_fd >= 0) {
+            // A client has exactly one in-flight CompileFile.  Refuse any
+            // impossible replacement rather than leaking or mixing cursors.
+            if (client->status != Client::CLIENTWORK)
+                finish_assignment_claim(job->jobID());
+            delete job;
+            (void)client->channel->send_msg(EndMsg());
+            handle_end(client, 146);
+            return false;
+        }
+        client->p50_input_fd = attachment.fd.release();
+    } else if (client->p50_input_fd >= 0) {
+        // Canonical legacy selection can never inherit a prior P50 cursor.
+        if (client->status != Client::CLIENTWORK)
+            finish_assignment_claim(job->jobID());
+        delete job;
+        (void)client->channel->send_msg(EndMsg());
+        handle_end(client, 146);
+        return false;
+    }
+
     client->job = job;
     if (client->command_line.empty()) {
         client->command_line = command_line_from_compile_job(job);

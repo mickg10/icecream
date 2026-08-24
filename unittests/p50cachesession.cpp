@@ -125,6 +125,84 @@ static void test_successful_transfer_and_exact_once()
     close(released);
 }
 
+static void test_outbound_transfer_and_exact_once()
+{
+    Pair pair = make_pair(50);
+    const int client_fd = pair.left->fd;
+    REQUIRE(pair.left->send_msg(CacheSessionMsg()),
+            "client flushes the exact P50 CACHE_SESSION boundary");
+    const int released_client =
+        pair.left->release_fd_after_cache_session_send();
+    REQUIRE(released_client == client_fd && pair.left->fd == -1,
+            "flushed outbound CACHE_SESSION transfers the client descriptor");
+    REQUIRE(pair.left->release_fd_after_cache_session_send() == -1,
+            "outbound descriptor transfer is one-shot");
+
+    Msg *decoded = pair.right->get_msg(2, true);
+    REQUIRE(decoded && *decoded == Msg::CACHE_SESSION,
+            "server decodes the boundary after client ownership moved");
+    delete decoded;
+    const int released_server = pair.right->release_fd_if_input_empty();
+    REQUIRE(released_server >= 0,
+            "server independently proves its inbound clean boundary");
+
+    delete pair.left;
+    pair.left = nullptr;
+    delete pair.right;
+    pair.right = nullptr;
+    const Bytes cachewire{'P', '5', '0'};
+    send_bytes(released_client, cachewire);
+    Bytes observed(cachewire.size());
+    REQUIRE(recv(released_server, observed.data(), observed.size(), 0) ==
+                static_cast<ssize_t>(observed.size()) && observed == cachewire,
+            "both transferred descriptors preserve exact CacheWire continuity");
+    close(released_client);
+    close(released_server);
+}
+
+static void test_outbound_release_barriers()
+{
+    {
+        Pair pair = make_pair(50);
+        REQUIRE(pair.left->send_msg(CacheSessionMsg(), MsgChannel::SendBulkOnly),
+                "test queues an outbound CACHE_SESSION without flushing");
+        const int owned = pair.left->fd;
+        REQUIRE(pair.left->release_fd_after_cache_session_send() == -1 &&
+                    pair.left->fd == owned,
+                "queued outbound bytes never arm descriptor release");
+        REQUIRE(pair.left->flush_pending(),
+                "queued outbound CACHE_SESSION can drain normally");
+        REQUIRE(pair.left->release_fd_after_cache_session_send() == -1,
+                "a later generic flush cannot resurrect the send arm");
+    }
+    {
+        Pair pair = make_pair(50);
+        REQUIRE(pair.left->send_msg(PingMsg(), MsgChannel::SendBulkOnly),
+                "test queues an earlier ordinary frame");
+        REQUIRE(!pair.left->send_msg(CacheSessionMsg()),
+                "CACHE_SESSION is refused behind earlier queued output");
+        REQUIRE(pair.left->release_fd_after_cache_session_send() == -1,
+                "refused mixed output retains descriptor ownership");
+    }
+    {
+        Pair pair = make_pair(50);
+        REQUIRE(pair.left->send_msg(CacheSessionMsg()),
+                "test arms outbound release before a parser use");
+        REQUIRE(pair.left->get_msg(0, true) == nullptr,
+                "a nonblocking receive attempt observes no reply");
+        REQUIRE(pair.left->release_fd_after_cache_session_send() == -1,
+                "any later receive attempt clears the outbound arm");
+    }
+    {
+        Pair pair = make_pair(50);
+        REQUIRE(pair.left->send_msg(CacheSessionMsg()),
+                "test arms outbound release before peer EOF");
+        shutdown(pair.right->fd, SHUT_WR);
+        REQUIRE(pair.left->release_fd_after_cache_session_send() == -1,
+                "peer EOF blocks outbound descriptor release");
+    }
+}
+
 static void test_other_message_refusal_and_arm_clear()
 {
     Pair pair = make_pair(50);
@@ -338,6 +416,8 @@ int main()
     static_assert(Msg::CACHE_SESSION == UINT32_C(0x50f00000));
     static_assert(Msg::PING == UINT32_C(0x00000042));
     test_successful_transfer_and_exact_once();
+    test_outbound_transfer_and_exact_once();
+    test_outbound_release_barriers();
     test_other_message_refusal_and_arm_clear();
     test_protocol_gate_and_legacy_bytes();
     test_split_frame_reads();

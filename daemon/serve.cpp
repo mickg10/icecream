@@ -172,12 +172,16 @@ void close_unneeded_fds_in_child(std::initializer_list<int> keep_fds)
 
 int handle_connection(const string &basedir, CompileJob *job,
                       MsgChannel *client, int &out_fd,
-                      unsigned int mem_limit, uid_t user_uid, gid_t user_gid)
+                      unsigned int mem_limit, uid_t user_uid, gid_t user_gid,
+                      int compiler_input_fd)
 {
+    int owned_compiler_input_fd = compiler_input_fd;
     int socket[2];
 
     if (pipe(socket) == -1) {
         log_perror("pipe failed");
+        if (owned_compiler_input_fd >= 0)
+            (void)close(owned_compiler_input_fd);
         return -1;
     }
 
@@ -193,6 +197,10 @@ int handle_connection(const string &basedir, CompileJob *job,
         setpgid(pid, pid);
         if ((-1 == close(socket[1])) && (errno != EBADF)){
             log_perror("close failure");
+        }
+        if (owned_compiler_input_fd >= 0) {
+            (void)close(owned_compiler_input_fd);
+            owned_compiler_input_fd = -1;
         }
         out_fd = socket[0];
         fcntl(out_fd, F_SETFD, FD_CLOEXEC);
@@ -216,7 +224,8 @@ int handle_connection(const string &basedir, CompileJob *job,
        The sweep also runs BEFORE reset_debug(): it necessarily closes the
        inherited log descriptor, and reset_debug() reopens the log file
        afterwards so the child keeps logging on a descriptor it owns.  */
-    close_unneeded_fds_in_child({socket[1], client->fd});
+    close_unneeded_fds_in_child(
+        {socket[1], client->fd, owned_compiler_input_fd});
 
     reset_debug();
     if ((-1 == close(socket[0])) && (errno != EBADF)){
@@ -321,7 +330,11 @@ int handle_connection(const string &basedir, CompileJob *job,
             obj_file = output_dir + '/' + file_name;
             dwo_file = obj_file.substr(0, obj_file.rfind('.')) + ".dwo";
 
-            ret = work_it(*job, job_stat, client, rmsg, tmp_path, job_working_dir, relative_file_path, mem_limit, client->fd);
+            const int transferred_input_fd = owned_compiler_input_fd;
+            owned_compiler_input_fd = -1;
+            ret = work_it(*job, job_stat, client, rmsg, tmp_path,
+                          job_working_dir, relative_file_path, mem_limit,
+                          client->fd, transferred_input_fd);
         }
         else if (!job->dwarfFissionEnabled() && (ret = dcc_make_tmpnam(prefix_output, ".o", &tmp_output, 0)) == 0) {
             obj_file = tmp_output;
@@ -329,7 +342,11 @@ int handle_connection(const string &basedir, CompileJob *job,
             string build_path = obj_file.substr(0, obj_file.rfind('/'));
             string file_name = obj_file.substr(obj_file.rfind('/')+1);
 
-            ret = work_it(*job, job_stat, client, rmsg, build_path, "", file_name, mem_limit, client->fd);
+            const int transferred_input_fd = owned_compiler_input_fd;
+            owned_compiler_input_fd = -1;
+            ret = work_it(*job, job_stat, client, rmsg, build_path, "",
+                          file_name, mem_limit, client->fd,
+                          transferred_input_fd);
         }
 
         if (ret) {
@@ -388,6 +405,11 @@ int handle_connection(const string &basedir, CompileJob *job,
             ignore_result(write(out_fd, job_stat, sizeof(job_stat)));
             close(out_fd);
         }
+    }
+
+    if (owned_compiler_input_fd >= 0) {
+        (void)close(owned_compiler_input_fd);
+        owned_compiler_input_fd = -1;
     }
 
     delete client;

@@ -27,32 +27,37 @@ or model-unrepresented payload values.
 
 ## Bounded release contract
 
-`MsgChannel::release_fd_if_input_empty()` returns the descriptor and sets
-`fd = -1` only immediately after a successful `CACHE_SESSION` decode.  It
-requires exact Protocol 50, a live non-error channel, no internal buffered or
-read-ahead byte, `NEED_LEN` at the next ordinary boundary, no EOF, no pending
-output/frame, and an fd still owned by the channel.  A non-consuming
-`MSG_PEEK|MSG_DONTWAIT` closes the kernel-queue/EOF check without consuming a
-byte.  Any refusal returns `-1` and retains both ownership and input bytes;
-the destructor therefore cannot close a transferred descriptor.
+`MsgChannel::release_fd_if_input_empty()` returns the server descriptor and
+sets `fd = -1` only immediately after a successful `CACHE_SESSION` decode.
+Its client-side mirror, `release_fd_after_cache_session_send()`, does the same
+only after that exact frame was synchronously flushed with no earlier queued
+ordinary frame. Both require exact Protocol 50, a live non-error channel, no
+internal buffered or read-ahead byte, `NEED_LEN` at the next ordinary boundary,
+no EOF, no pending output/frame, and an fd still owned by the channel. A
+non-consuming `MSG_PEEK|MSG_DONTWAIT` closes the kernel-queue/EOF check without
+consuming a byte. Any refusal returns `-1` and retains ownership; destroying
+the old parser therefore cannot close a transferred descriptor.
 
-The release arm is message-specific.  It is installed only by a successful
-`CACHE_SESSION` decode and cleared by the next `get_msg()` use, any later
-ordinary send attempt, or a successful transfer; there is no generic
-clean-boundary escape.  The nonblocking kernel peek refuses on interruption
-rather than allowing repeated signals to create an unbounded ownership check.
+Each directional release arm is message-specific. The inbound arm is installed
+only by a successful decode; the outbound arm only by the exact fully-flushed
+send. Both are cleared by the next `get_msg()` use, any later ordinary send
+attempt, or a successful transfer; a later generic flush cannot resurrect an
+arm and there is no generic clean-boundary escape. The nonblocking kernel peek
+refuses on interruption rather than allowing repeated signals to create an
+unbounded ownership check.
 
 ## Wire audit delta (owner ruling)
 
 | Bucket | Delta |
 | --- | --- |
-| **BOUND** | The discriminator is bound to exact negotiated Protocol 50; the release arm and fd ownership transfer are bound to a successful decode plus explicit parser/input/output boundary predicates. |
+| **BOUND** | The discriminator is bound to exact negotiated Protocol 50; each directional release arm and fd ownership transfer is bound to a successful exact decode or fully-flushed send plus explicit parser/input/output boundary predicates. |
 | **WIRE-PLACEHOLDER / DERIVED-GUARD** | None in the message wire.  The length, exact-type check, read-ahead barrier, EOF/error check, and pending-output check are parser guards, not payload fields. |
 | **CURRENTLY MODEL-UNREPRESENTED** | None for this empty discriminator message.  The separate CacheWire `SessionHello` binds `C_GUID` in its own later slice; this ordinary frame does not claim to carry or model it. |
 
 The retained P43/P48/P49 ordinary fixtures are unchanged.  The committed
-`p50cachesession` behavioral matrix covers successful detach and fd continuity,
-exact-once transfer, other-message refusal, split reads, early-byte and
-partial/complete next-frame barriers, EOF, pending output, and Protocol-49
-send/decode refusal.  `p50cachesession-source.sh` is only a supplemental
-source-shape audit; behavior remains the deletion/mutation-sensitive gate.
+`p50cachesession` behavioral matrix covers both directional detaches and fd
+continuity, exact-once transfer, other-message refusal, split reads, early-byte
+and partial/complete next-frame barriers, EOF, pending/prior output, arm
+non-resurrection, and Protocol-49 send/decode refusal.
+`p50cachesession-source.sh` is only a supplemental source-shape audit; behavior
+remains the deletion/mutation-sensitive gate.

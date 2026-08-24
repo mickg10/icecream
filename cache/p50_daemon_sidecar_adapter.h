@@ -8,6 +8,7 @@
 // through observe_public_listener(); this class never opens a public socket.
 
 #include "p50_daemon_cache_dispatch.h"
+#include "p50_input_fd_attachment.h"
 #include "p50_local_transport.h"
 #include "p50_ready_advertisement.h"
 #include "p50_sidecar_supervisor.h"
@@ -70,6 +71,7 @@ struct Config {
     std::chrono::milliseconds readiness_timeout{1000};
     std::chrono::milliseconds connect_timeout{1000};
     std::chrono::milliseconds handoff_timeout{250};
+    std::chrono::milliseconds input_attachment_timeout{5000};
     std::chrono::milliseconds shutdown_timeout{1000};
     std::chrono::milliseconds restart_window{10000};
     uint32_t max_restarts = 3;
@@ -125,6 +127,12 @@ public:
     [[nodiscard]] const sidecar::Supervisor* supervisor() const noexcept {
         return supervisor_.get();
     }
+
+    // Opens a fresh authenticated control relationship for one exact committed
+    // InputRecord.  It neither consumes nor replaces the dispatcher relationship
+    // used by CACHE_SESSION.  Every failure is descriptor-less and fail-closed.
+    [[nodiscard]] InputFdAttachmentResult attach_input(
+        InputRecordKey key, uint64_t request_id) noexcept;
 
 #if defined(ICECC_P50_DAEMON_SIDECAR_ADAPTER_TEST_HOOKS)
     // Compile-time-only fault injection for otherwise unreachable uint64_t
