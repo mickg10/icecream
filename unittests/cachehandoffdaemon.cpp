@@ -322,15 +322,24 @@ int main(int argc, char **argv)
             "triple -- port/protocol/mask unchanged by the host rewrite");
     delete client_wire;
 
-    /* Client-binding check (BigOracle steer): a cache tail that is
-       INDIVIDUALLY valid (port in range, correct protocol, in-mask) but
-       carries NO assignment identity must still project as absent -- the
-       daemon's own re-validation (Daemon::scheduler_use_cs) must not trust
-       the tail's own well-formedness alone.  A real scheduler's
-       project_cache_handoff already enforces this before it ever reaches
-       the wire, so this exercises the daemon's INDEPENDENT check directly
-       by hand-crafting the one combination a real scheduler can never
-       produce. */
+    /* Client-binding check (BigOracle steer), now enforced one layer
+       earlier than when this scenario was first written (d23d9c5d HOLD,
+       identity-binding law): a cache tail that is INDIVIDUALLY valid (port
+       in range, correct protocol, in-mask) but carries NO assignment
+       identity used to project as absent only through the daemon's own
+       re-validation in Daemon::scheduler_use_cs.  That re-validation still
+       runs, factored into usecs_cache_handoff_admissible (services/comm.h)
+       and unit-tested directly with a hand-constructed object in
+       unittests/p50cacheadvertisement.cpp -- but UseCSMsg::valid_payload()
+       now refuses to let this exact combination exist as a decoded
+       message AT ALL, on either side of the wire, so it can no longer
+       reach scheduler_use_cs through this (or any) real integration path.
+       A real scheduler's project_cache_handoff already enforced this
+       before it ever reached the wire; the wire itself is now a second,
+       independent enforcement point, one level below the daemon.  This
+       scenario now proves exactly that: the malformed combination is
+       refused at construction/send time, before a single byte reaches the
+       wire -- client B never receives anything. */
     MsgChannel *client_b = connect_unix_bounded(socket_path, 5000);
     REQUIRE(client_b != nullptr, "local client B connected");
     GetCSMsg request_b(Environments(), "s2-relay-b.cpp", CompileJob::Lang_CXX,
@@ -351,25 +360,12 @@ int main(int argc, char **argv)
                          /* assignment_epoch */ 0, /* assignment_nonce */ 0,
                          expected_cache_port, CACHE_WIRE_PROTOCOL_V1,
                          CACHE_PROFILE_ZSTD_TU);
-        REQUIRE(scheduler->send_msg(reply_b),
-                "fake scheduler sent a valid-tail, identity-less UseCS for B");
+        REQUIRE(!scheduler->send_msg(reply_b),
+                "S2: the wire refuses a valid-tail, identity-less UseCS "
+                "outright -- UseCSMsg::valid_payload rejects it before any "
+                "byte is sent, so client B never receives it at all");
     }
     delete forwarded_b_wire;
-
-    Msg *client_b_wire = client_b ? wait_for_type(client_b, Msg::USE_CS, 5000)
-                                  : nullptr;
-    UseCSMsg *client_b_use = client_b_wire
-        ? dynamic_cast<UseCSMsg *>(client_b_wire) : nullptr;
-    REQUIRE(client_b_use != nullptr, "local client B received a UseCS");
-    REQUIRE(client_b_use && !client_b_use->hasAssignmentIdentity(),
-            "client B's assignment identity is genuinely absent (the fixture)");
-    REQUIRE(client_b_use && !client_b_use->hasCacheAdvertisement()
-                && client_b_use->cache_protocol == 0
-                && client_b_use->cache_profile_mask == 0,
-            "S2: an individually-valid cache tail with NO assignment "
-            "identity still projects wholly absent -- the daemon does not "
-            "trust tail well-formedness alone");
-    delete client_b_wire;
     delete client_b;
 
     int status = 0;
