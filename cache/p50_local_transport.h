@@ -52,6 +52,8 @@ struct Frame {
 };
 
 struct CredentialExpectation;
+class FdHandoffSender;
+class FdHandoffReceiver;
 
 enum class Status {
     Ok = 0,
@@ -105,6 +107,9 @@ public:
     // Verifies the peer while retaining descriptor ownership in this object.
     // Callers do not need (and cannot borrow) a second raw descriptor.
     Status verify_peer_credentials(const CredentialExpectation& expected) const noexcept;
+    [[nodiscard]] bool peer_credentials_verified() const noexcept {
+        return peer_credentials_verified_;
+    }
 
     // Reads one exact frame under a single absolute wall-time bound covering
     // the header and payload together.  A peer cannot renew the budget by
@@ -118,10 +123,13 @@ public:
     Status receive(Frame& frame) noexcept;
 
 private:
+    friend class FdHandoffSender;
+    friend class FdHandoffReceiver;
     void close() noexcept;
     int fd_ = -1;
     Status status_ = Status::InvalidArgument;
     std::atomic_flag writing_ = ATOMIC_FLAG_INIT;
+    mutable bool peer_credentials_verified_ = false;
 };
 
 Frame make_hello(PeerRole role, Identity identity);

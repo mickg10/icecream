@@ -382,9 +382,12 @@ bool Connection::cloexec() const noexcept {
 }
 
 Status Connection::verify_peer_credentials(const CredentialExpectation& expected) const noexcept {
+    peer_credentials_verified_ = false;
     if (fd_ < 0)
         return status_;
-    return local::verify_peer_credentials(fd_, expected);
+    const Status status = local::verify_peer_credentials(fd_, expected);
+    peer_credentials_verified_ = status == Status::Ok;
+    return status;
 }
 
 Status Connection::receive_with_timeout(Frame& frame, int timeout_ms) noexcept {
@@ -402,9 +405,11 @@ Status Connection::receive_with_timeout(Frame& frame, int timeout_ms) noexcept {
 }
 
 Connection::Connection(Connection&& other) noexcept
-    : fd_(other.fd_), status_(other.status_), writing_(ATOMIC_FLAG_INIT) {
+    : fd_(other.fd_), status_(other.status_), writing_(ATOMIC_FLAG_INIT),
+      peer_credentials_verified_(other.peer_credentials_verified_) {
     other.fd_ = -1;
     other.status_ = Status::InvalidArgument;
+    other.peer_credentials_verified_ = false;
 }
 
 Connection& Connection::operator=(Connection&& other) noexcept {
@@ -412,8 +417,10 @@ Connection& Connection::operator=(Connection&& other) noexcept {
         close();
         fd_ = other.fd_;
         status_ = other.status_;
+        peer_credentials_verified_ = other.peer_credentials_verified_;
         other.fd_ = -1;
         other.status_ = Status::InvalidArgument;
+        other.peer_credentials_verified_ = false;
         writing_.clear(std::memory_order_release);
     }
     return *this;
@@ -423,6 +430,7 @@ void Connection::close() noexcept {
     if (fd_ >= 0)
         ::close(fd_);
     fd_ = -1;
+    peer_credentials_verified_ = false;
 }
 
 Status Connection::send(const Frame& frame) noexcept {

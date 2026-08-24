@@ -1,4 +1,4 @@
-TESTS = testargs lockexec backpressure schedpolicy utf8test statewritertest fastesttest hallflowtest jobidalloctest inputpump compilerinput p49assignment p50assignment p50cacheadvertisement p50assignment-source.sh p50cacheadvertisement-source.sh p50localtransport-source.sh packagebuilderdeps.sh p49daemon-run.sh p49scheduler-run.sh connectivity-run.sh schedbp-quick.sh schedstress-quick.sh remoteice-quick.sh p50assignment-remote.sh daemonlogin-run.sh daemonbatch-run.sh cachehandoffdaemon-run.sh boost-prefix-scope.sh p50wire p50slice0 p50zstd p50zstdwindow p50inputrecord p50inputrecordlate p50inputrecordreopen p50endpoint p50localtransport digest128bench p50cacheservice p50_trace_check.sh
+TESTS = testargs lockexec backpressure schedpolicy utf8test statewritertest fastesttest hallflowtest jobidalloctest inputpump compilerinput p49assignment p50assignment p50cacheadvertisement p50assignment-source.sh p50cacheadvertisement-source.sh p50localtransport-source.sh p50fdhandoff-source.sh p50fdhandoff-sanitize.sh packagebuilderdeps.sh p49daemon-run.sh p49scheduler-run.sh connectivity-run.sh schedbp-quick.sh schedstress-quick.sh remoteice-quick.sh p50assignment-remote.sh daemonlogin-run.sh daemonbatch-run.sh cachehandoffdaemon-run.sh boost-prefix-scope.sh p50wire p50slice0 p50zstd p50zstdwindow p50inputrecord p50inputrecordlate p50inputrecordreopen p50endpoint p50localtransport digest128bench p50cacheservice p50fdhandoff p50_trace_check.sh
 
 AM_TESTS_ENVIRONMENT = \
 	ICECC_TEST_BUILDDIR='$(abs_builddir)'; export ICECC_TEST_BUILDDIR; \
@@ -52,7 +52,7 @@ p50localtransport_CXXFLAGS = -pthread
 p50localtransport_LDFLAGS = -pthread
 digest128bench_LDADD = ../services/libicecc.la
 
-check_PROGRAMS = testargs lockexec backpressure schedpolicy utf8test statewritertest schedbp daemonlogin daemonbatch cachehandoffdaemon p49daemon p49scheduler connectivity fastesttest hallflowtest jobidalloctest inputpump compilerinput p49assignment p50assignment p50cacheadvertisement p50wire p50slice0 p50zstd p50zstdwindow p50inputrecord p50inputrecordlate p50inputrecordreopen p50endpoint p50localtransport digest128bench p50cacheservice
+check_PROGRAMS = testargs lockexec backpressure schedpolicy utf8test statewritertest schedbp daemonlogin daemonbatch cachehandoffdaemon p49daemon p49scheduler connectivity fastesttest hallflowtest jobidalloctest inputpump compilerinput p49assignment p50assignment p50cacheadvertisement p50wire p50slice0 p50zstd p50zstdwindow p50inputrecord p50inputrecordlate p50inputrecordreopen p50endpoint p50localtransport digest128bench p50cacheservice p50fdhandoff
 testargs_SOURCES = args.cpp
 p50wire_SOURCES = p50_wire_test.cpp
 p50slice0_SOURCES = \
@@ -125,6 +125,10 @@ p50cacheadvertisement_LDADD = ../cache/libprotocol50.a ../services/libicecc.la
 p50cacheservice_SOURCES = p50cacheservice.cpp
 p50cacheservice_LDADD = ../cache/libp50localtransport.a
 p50cacheservice_DEPENDENCIES = ../cache/icecc-cache-service
+p50fdhandoff_SOURCES = p50fdhandoff.cpp
+p50fdhandoff_CXXFLAGS = -pthread
+p50fdhandoff_LDFLAGS = -pthread
+p50fdhandoff_LDADD = ../cache/libp50localtransport.a
 inputpump_SOURCES = input_pump_test.cpp
 inputpump_CXXFLAGS = -pthread
 inputpump_LDFLAGS = -pthread
@@ -149,7 +153,7 @@ connectivity_DEPENDENCIES = conn_shim.so
 CLEANFILES = sndbuf_shim.so conn_shim.so schedbp-scheduler-*.log
 EXTRA_DIST = sndbuf_shim.c conn_shim.c connectivity-run.sh schedbp-quick.sh schedstress-quick.sh remoteice-quick.sh p50assignment-remote.sh daemonlogin-run.sh daemonbatch-run.sh cachehandoffdaemon-run.sh p49daemon-run.sh p49scheduler-run.sh boost-prefix-scope.sh
 
-EXTRA_DIST += p50_trace_check.sh p50assignment-source.sh p50cacheadvertisement-source.sh p50localtransport-source.sh packagebuilderdeps.sh
+EXTRA_DIST += p50_trace_check.sh p50assignment-source.sh p50cacheadvertisement-source.sh p50localtransport-source.sh p50fdhandoff-source.sh p50fdhandoff-sanitize.sh packagebuilderdeps.sh
 
 # Make the tests also print the test log if they fail.
 check: export VERBOSE=1

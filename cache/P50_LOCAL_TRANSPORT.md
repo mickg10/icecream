@@ -53,3 +53,29 @@ an unbounded wait in `listen_unix`.
 On Linux, peer verification uses `SO_PEERCRED`.  The provider argument is a
 test/integration seam; absent a provider, unsupported or failed OS credential
 queries return `PeerCredentialUnavailable` and never grant access.
+
+## Accepted-FD handoff
+
+`p50_fd_handoff.h` adds a generic, one-shot daemon-to-sidecar handoff for a
+descriptor accepted by a later ordinary-link listener.  It is usable only
+after `Connection::verify_peer_credentials` succeeds on the same connection;
+the connection remembers that proof and move operations clear it.  The
+handoff does not create a listener, advertise an endpoint, or know a store,
+codec, or cache-session protocol.
+
+The raw exchange is a fixed 40-byte `P50F` record (version 1, request/ACK/NACK,
+generation, attempt, request id, and result code) carried on the already
+private authenticated control stream.  The request carries exactly one
+`SCM_RIGHTS` descriptor.  The receiver rejects malformed lengths/types,
+missing or extra descriptors/control messages, `MSG_TRUNC` and `MSG_CTRUNC`,
+stale identity, replay, disconnect, and deadline expiry.  Received descriptors
+are `CLOEXEC` via `MSG_CMSG_CLOEXEC`, with an `fcntl` fallback, before adoption.
+The receiver moves the descriptor into its owner before emitting ACK; the
+sender closes its copy only at a terminal state and never retries a sent
+request.  NACK and all failed terminal paths close without leaking.
+
+The deadline is an absolute `steady_clock` deadline covering the complete
+send/response exchange.  A receiver admits one request per instance.  Because
+this is a raw stream exchange rather than a framed message, its control
+connection must be dedicated to this exchange (no interleaved frame or second
+handoff); ordinary-link integration is intentionally a later slice.
