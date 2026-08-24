@@ -4184,6 +4184,23 @@ static void test_record_cache_handoff_clear(const Client *c, const char *site)
     cache_handoff_clear_test_result_mask = c->cacheHandoff.cacheProfileMask;
 }
 
+/* S2 (BigOracle blueprint, team-lead follow-up): the ONE place that
+   transfers ownership of a Client's pending UseCS reply.  Every one of
+   the FIVE sites that replace c->usecsmsg -- the three "no real worker
+   snapshot" fallbacks below (via install_cache_absent_local_decision) and
+   both scheduler_use_cs relay projections (the self-selected-F local
+   rewrite and the remote-worker branch's introspection copy) -- did a
+   bare pointer overwrite with no delete of the prior object, which leaks
+   whenever a reused Client already held one.  This does not reason about
+   whether the prior pointer is null (delete on a null pointer is always
+   safe); it is unconditional so no call site has to get that reasoning
+   right on its own. */
+static void install_pending_usecs(Client *c, UseCSMsg *reply)
+{
+    delete c->usecsmsg;
+    c->usecsmsg = reply;
+}
+
 /* S2 (BigOracle exact blueprint): the ONE choke point for installing a
    canonical cache-absent LOCAL decision on a (possibly reused) Client.
    scheduler_no_cs, handle_old_request's stranded-GetCS replay, and
@@ -4196,8 +4213,9 @@ static void test_record_cache_handoff_clear(const Client *c, const char *site)
    c->usecsmsg already non-null.  Atomic:
      1. cacheHandoff reset to canonical absence.
      2. any PRIOR usecsmsg deleted before the replacement is installed
-        (the leak fix -- ownership transfers via unique_ptr so a caller
-        cannot accidentally keep its own copy alive either).
+        (the leak fix, via install_pending_usecs above -- ownership
+        transfers via unique_ptr so a caller cannot accidentally keep its
+        own copy alive either).
      3. the replacement itself asserted canonical cache-absent (0/0/0) and
         wire-valid -- defense in depth: every caller already constructs it
         that way, but this function's whole contract is that IT is what
@@ -4212,8 +4230,7 @@ static void install_cache_absent_local_decision(Client &c,
            && reply->cache_profile_mask == 0);
     assert(reply->valid_payload());
     c.cacheHandoff = Client::CacheHandoff{};
-    delete c.usecsmsg;
-    c.usecsmsg = reply.release();
+    install_pending_usecs(&c, reply.release());
     c.set_status(Client::PENDING_USE_CS, why);
 }
 
@@ -5667,16 +5684,17 @@ int Daemon::scheduler_use_cs(UseCSMsg *msg)
     const uint32_t relay_cache_mask = c->cacheHandoff.valid ? c->cacheHandoff.cacheProfileMask : 0;
 
     if (msg->hostname == remote_name && int(msg->port) == daemon_port) {
-        c->usecsmsg = new UseCSMsg(msg->host_platform, "127.0.0.1", daemon_port, msg->job_id, true, 1,
-                                   msg->matched_job_id, msg->assignmentEpoch(),
-                                   msg->assignmentNonce(), relay_cache_port,
-                                   relay_cache_protocol, relay_cache_mask);
+        install_pending_usecs(c, new UseCSMsg(msg->host_platform, "127.0.0.1", daemon_port,
+                                              msg->job_id, true, 1,
+                                              msg->matched_job_id, msg->assignmentEpoch(),
+                                              msg->assignmentNonce(), relay_cache_port,
+                                              relay_cache_protocol, relay_cache_mask));
         c->set_status(Client::PENDING_USE_CS, "scheduler_use_cs: local compile");
     } else {
-        c->usecsmsg = new UseCSMsg(msg->host_platform, msg->hostname, msg->port,
-                                   msg->job_id, true, 1, msg->matched_job_id,
-                                   msg->assignmentEpoch(), msg->assignmentNonce(),
-                                   relay_cache_port, relay_cache_protocol, relay_cache_mask);
+        install_pending_usecs(c, new UseCSMsg(msg->host_platform, msg->hostname, msg->port,
+                                              msg->job_id, true, 1, msg->matched_job_id,
+                                              msg->assignmentEpoch(), msg->assignmentNonce(),
+                                              relay_cache_port, relay_cache_protocol, relay_cache_mask));
 
         /* EXACT identity is persisted BEFORE the framed write starts, and
            the client is moved to an explicit handoff phase.  If the write

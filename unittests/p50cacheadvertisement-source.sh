@@ -112,7 +112,7 @@ echo 'ok - UseCS encode cache tail is gated at protocol 50'
 # drift from the other.
 require_count 1 'const uint32_t relay_cache_port = c->cacheHandoff.valid' \
     daemon/main.cpp 'the relay cache triple has exactly one validated source'
-require_count 2 'relay_cache_mask);' daemon/main.cpp \
+require_count 2 'relay_cache_mask));' daemon/main.cpp \
     'both scheduler_use_cs relay projections consume that same source'
 
 # BigOracle (d23d9c5d HOLD, remote-relay gap): c->usecsmsg is NOT the wire
