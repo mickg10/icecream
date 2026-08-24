@@ -106,9 +106,9 @@ void test_open_publication_cannot_reuse_closed_lease() {
 
     require_throws<std::logic_error>(
         [&] {
-            (void)store.publish(c_guid, later.begin, later.commit, input);
+            (void)store.publish(c_guid, first.begin, first.commit, input);
         },
-        "open-job publication accepted an already-closed InputRecord");
+        "exact open-job replay accepted an already-closed InputRecord");
 
     require(store.contains(key) && !store.job_open(key) &&
                 store.record_count() == 1 &&
@@ -117,11 +117,22 @@ void test_open_publication_cannot_reuse_closed_lease() {
     require(drain(authorized) == input,
             "rejected reopen invalidated an authorized compiler cursor");
 
+    require_throws<std::logic_error>(
+        [&] {
+            (void)store.observe_closed_job_commit(
+                c_guid, later.begin, later.commit, input);
+        },
+        "closed-job replay accepted conflicting transaction metadata");
+    require(store.contains(key) && !store.job_open(key) &&
+                store.record_count() == 1 &&
+                store.retained_bytes() == input.size(),
+            "rejected closed-job metadata conflict changed the lease");
+
     require(store.observe_closed_job_commit(
-                c_guid, later.begin, later.commit, input) ==
+                c_guid, first.begin, first.commit, input) ==
                 InputPublishResult::Existing &&
                 !store.job_open(key),
-            "closed-job route completion did not remain idempotently closed");
+            "exact closed-job route completion was not idempotently closed");
 }
 
 }  // namespace
