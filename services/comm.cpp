@@ -2825,12 +2825,14 @@ bool ResultDispositionMsg::valid_payload() const
 {
     const bool assignment_complete = job_id != 0
         && assignmentEpoch() != 0 && assignmentNonce() != 0;
-    const bool input_absent = compile_input.whollyAbsent();
     const bool input_present = compile_input.validPresent();
+    const bool input_bound = input_present
+        && compile_input.attempt_id == assignmentNonce()
+        && compile_input.request_id == assignmentNonce();
     const bool disposition_valid = disposition == Accepted
         || disposition == DefinitiveCancel;
     return wire_payload_valid && assignment_complete
-        && (input_absent || input_present) && disposition_valid;
+        && input_bound && disposition_valid;
 }
 
 void CompileFileMsg::fill_from_channel(MsgChannel *c)

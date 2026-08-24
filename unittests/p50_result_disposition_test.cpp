@@ -75,7 +75,7 @@ static CompileInputIdentity present_input()
     input.tu_seq = UINT64_C(0x0102030405060708);
     input.raw_bytes = UINT64_C(0x1112131415161718);
     input.attempt_id = UINT64_C(0x2122232425262728);
-    input.request_id = UINT64_C(0x3132333435363738);
+    input.request_id = UINT64_C(0x2122232425262728);
     return input;
 }
 
@@ -152,6 +152,10 @@ static void test_exact_wire_and_duplicate()
     auto *second = dynamic_cast<ResultDispositionMsg *>(second_base);
     REQUIRE(first && second && *first == expected && *second == expected,
             "duplicate disposition preserves every identity field");
+    const ResultDispositionMsg conflicting =
+        present_message(ResultDispositionMsg::DefinitiveCancel);
+    REQUIRE(conflicting.same_identity(expected) && !(conflicting == expected),
+            "same-identity conflicting dispositions remain distinguishable");
     delete first_base;
     delete second_base;
 }
@@ -162,13 +166,8 @@ static void test_absent_present_and_mutations()
                                 CompileInputIdentity{},
                                 ResultDispositionMsg::DefinitiveCancel);
     Pair pair = make_pair(PROTOCOL_VERSION);
-    REQUIRE(pair.left->send_msg(absent),
-            "wholly absent compiler input is accepted canonically");
-    Msg *decoded_base = pair.right->get_msg(2, true);
-    auto *decoded = dynamic_cast<ResultDispositionMsg *>(decoded_base);
-    REQUIRE(decoded && *decoded == absent,
-            "wholly absent compiler input round-trips exactly");
-    delete decoded_base;
+    REQUIRE(!pair.left->send_msg(absent),
+            "wholly absent compiler input is refused before framing");
 
     CompileInputIdentity partial = present_input();
     partial.request_id = 0;
@@ -188,8 +187,12 @@ static void test_absent_present_and_mutations()
                    "jobID mutation changes disposition identity");
     check_mutation([](ResultDispositionMsg &m) { ++m.assignment_epoch_lo; },
                    "assignment epoch mutation changes disposition identity");
-    check_mutation([](ResultDispositionMsg &m) { ++m.assignment_nonce_lo; },
-                   "assignment nonce mutation changes disposition identity");
+    {
+        ResultDispositionMsg changed = original;
+        ++changed.assignment_nonce_lo;
+        REQUIRE(!changed.valid_payload() && !changed.same_identity(original),
+                "assignment nonce mutation breaks input binding");
+    }
     {
         ResultDispositionMsg changed = original;
         ++changed.compile_input.profile;
@@ -204,10 +207,18 @@ static void test_absent_present_and_mutations()
                    "raw byte-count mutation changes disposition identity");
     check_mutation([](ResultDispositionMsg &m) { ++m.compile_input.raw_digest[0]; },
                    "raw digest mutation changes disposition identity");
-    check_mutation([](ResultDispositionMsg &m) { ++m.compile_input.attempt_id; },
-                   "attempt ID mutation changes disposition identity");
-    check_mutation([](ResultDispositionMsg &m) { ++m.compile_input.request_id; },
-                   "request ID mutation changes disposition identity");
+    {
+        ResultDispositionMsg changed = original;
+        ++changed.compile_input.attempt_id;
+        REQUIRE(!changed.valid_payload() && !changed.same_identity(original),
+                "attempt ID mutation breaks assignment-nonce binding");
+    }
+    {
+        ResultDispositionMsg changed = original;
+        ++changed.compile_input.request_id;
+        REQUIRE(!changed.valid_payload() && !changed.same_identity(original),
+                "request ID mutation breaks assignment-nonce binding");
+    }
 }
 
 static void test_rejections_and_protocol_gates()

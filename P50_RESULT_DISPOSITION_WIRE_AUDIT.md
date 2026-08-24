@@ -20,12 +20,12 @@ RAW_DIGEST (four words), ATTEMPT_ID (two words), REQUEST_ID (two words),
 DISPOSITION
 ```
 
-The assignment is required to be complete and nonzero.  The compiler-input
-selector follows the existing absent/present law: either all fields are zero,
-or `CompileInputIdentity::validPresent()` is true.  Thus TU sequence zero,
-raw byte count zero, and an all-zero raw digest remain valid present values;
-the C-store GUID, attempt ID, and request ID are the required nonzero
-presence markers.
+The assignment is required to be complete and nonzero.  A terminal disposition
+requires a present `CompileInputIdentity`; absent and partial selectors are
+refused.  Both `ATTEMPT_ID` and `REQUEST_ID` must equal the exact assignment
+nonce.  TU sequence zero, raw byte count zero, and an all-zero raw digest remain
+valid payload values; the C-store GUID and nonce-bound attempt/request fields
+are the required presence and assignment markers.
 
 The decoder rejects a body whose length is not exactly the fixed shape,
 unknown disposition values, and any trailing bytes.  The sender applies the
@@ -34,7 +34,7 @@ hypothetical later protocol emit no bytes.  Duplicate frames are valid and
 decode to equal messages; this stateless wire layer does not invent a sequence
 number or silently deduplicate a result owner’s event.
 
-The focused test covers exact type/length, present and absent selectors,
+The focused test covers exact type/length, present and absent-selector refusal,
 mutations of every identity field, duplicate semantics, malformed frames,
 strict protocol gates, and unchanged P43/P48 `CompileResultMsg` behavior.
 No client or daemon integration is part of this wire-only lane.

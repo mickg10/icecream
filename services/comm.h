@@ -1094,10 +1094,11 @@ public:
  *
  * The body after the message type is fixed at 23 words:
  *   job_id (1), epoch/nonce (4), CompileInputIdentity (17), disposition (1).
- * A P50 input selector is either wholly absent (all zero) or validPresent();
- * partial selectors are never accepted.  The assignment itself is required
- * to be complete because a disposition without a job and assignment fence
- * cannot be safely matched to a result attempt.
+ * This terminal message exists only for a present P50 input selector.  It
+ * requires validPresent() and binds both input attempt_id and request_id to
+ * the exact assignment nonce.  An absent/partial selector or a disposition
+ * without a complete assignment fence is never useful to lifecycle closure
+ * and is refused before framing.
  */
 class ResultDispositionMsg : public Msg
 {
