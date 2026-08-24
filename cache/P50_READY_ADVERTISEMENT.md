@@ -17,13 +17,21 @@ public listener is bound to a valid TCP port, the supervisor is exactly
 HELLO/ACK.  Starting, stopped, degraded, unauthenticated, or listener-loss
 observations withdraw the capability.
 
-`post_ready_exits` is a monotonic incarnation edge supplied by the adapter.
-If it increases while a capability is present, the controller emits absence
-before any recovered presence, even when crash and recovery were compressed
-into one adapter poll.  A counter regression or invalid bound port fails
-closed until a valid observation catches up.
+`cumulative_post_ready_exits` is a monotonic incarnation edge owned by the
+daemon adapter.  It remains cumulative when the adapter destroys one
+`Supervisor` and constructs the next attempt; copying a fresh supervisor's
+per-instance zero into this field is a fail-closed regression.  The adapter
+must add per-instance deltas with checked arithmetic.  `UINT64_MAX` is an
+ambiguous saturated value and therefore permanently fails closed for that
+controller/daemon generation.
+
+If the counter increases while a capability is present, the controller emits
+absence before any recovered presence, even when crash and recovery were
+compressed into one adapter poll.  A counter regression, saturation, or
+invalid bound port fails closed.
 
 This checkpoint intentionally leaves Login inert.  The production adapter
 must apply each returned transition in order and reannounce it to every live
 scheduler connection.  It must also recreate a supervisor with an incremented
-attempt for each sidecar incarnation.
+attempt for each sidecar incarnation while retaining the checked cumulative
+post-READY-exit count.

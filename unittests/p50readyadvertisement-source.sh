@@ -28,10 +28,16 @@ require 'CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_ZSTD_TU' "$impl" \
     'presence projects only the exact runnable CacheWire profile'
 require 'Error::CounterRegression' "$impl" \
     'counter rollback fails closed'
+require 'Error::CounterSaturated' "$impl" \
+    'saturating supervisor counters fail closed before ambiguity'
+require 'cumulative_post_ready_exits' "$header" \
+    'adapter contract preserves the exit edge across supervisor recreation'
 require 'std::array<Snapshot, 2>' "$header" \
     'one observation has a statically bounded transition batch'
 require 'compressed crash and recovery withdraws before republishing' "$test" \
     'behavioral suite covers the two-transition crash edge'
+require 'same-counter READY recovery at saturation remains failed closed' "$test" \
+    'behavioral suite covers the saturated same-counter crash ambiguity'
 
 require 'libp50readyadvertisement.a' "$src/cache/Makefile.am" \
     'controller library is registered in the cache build'

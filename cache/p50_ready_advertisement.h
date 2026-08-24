@@ -34,6 +34,7 @@ enum class Error : uint8_t {
     None = 0,
     InvalidPublicPort,
     CounterRegression,
+    CounterSaturated,
 };
 
 struct Observation {
@@ -41,7 +42,10 @@ struct Observation {
     uint32_t public_listener_port = 0;
     sidecar::State supervisor_state = sidecar::State::Stopped;
     bool private_relationship_authenticated = false;
-    uint64_t post_ready_exits = 0;
+    // The daemon adapter owns this cumulative value across Supervisor object
+    // recreation.  A per-instance counter reset is therefore a fail-closed
+    // regression, not a new baseline.
+    uint64_t cumulative_post_ready_exits = 0;
 };
 
 // One observation can produce two transitions only when a crash and recovery

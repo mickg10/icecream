@@ -53,5 +53,8 @@ compile_and_kill crash-withdrawal \
 compile_and_kill runnable-profile \
     'CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_ZSTD_TU' \
     'CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_P29'
+compile_and_kill counter-saturation \
+    '== std::numeric_limits<uint64_t>::max()) {' \
+    '== std::numeric_limits<uint64_t>::max() && false) {'
 
 echo 'PASS: READY advertisement behavioral mutants are all red'

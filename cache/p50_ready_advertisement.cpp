@@ -53,13 +53,24 @@ Update Controller::observe(const Observation& observation) noexcept
     Update update;
     bool crashed = false;
 
-    if (!counter_observed_) {
-        highest_post_ready_exits_ = observation.post_ready_exits;
+    // Supervisor counters increment saturating.  At UINT64_MAX another exit
+    // is observationally indistinguishable from no exit, so presence can no
+    // longer be proved safe.  Record MAX as the permanent high-water mark and
+    // fail closed until a new Controller/daemon generation is constructed.
+    if (observation.cumulative_post_ready_exits
+        == std::numeric_limits<uint64_t>::max()) {
+        highest_post_ready_exits_ = observation.cumulative_post_ready_exits;
         counter_observed_ = true;
-    } else if (observation.post_ready_exits < highest_post_ready_exits_) {
+        update.error = Error::CounterSaturated;
+    } else if (!counter_observed_) {
+        highest_post_ready_exits_ = observation.cumulative_post_ready_exits;
+        counter_observed_ = true;
+    } else if (observation.cumulative_post_ready_exits
+               < highest_post_ready_exits_) {
         update.error = Error::CounterRegression;
-    } else if (observation.post_ready_exits > highest_post_ready_exits_) {
-        highest_post_ready_exits_ = observation.post_ready_exits;
+    } else if (observation.cumulative_post_ready_exits
+               > highest_post_ready_exits_) {
+        highest_post_ready_exits_ = observation.cumulative_post_ready_exits;
         crashed = true;
     }
 

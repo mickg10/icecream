@@ -3,6 +3,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 
 using icecc::p50::advertisement::Controller;
 using icecc::p50::advertisement::Error;
@@ -130,12 +131,40 @@ static void test_invalid_inputs_fail_closed()
     update = controller.observe(observation(State::Ready, true, 7));
     CHECK(update.error == Error::CounterRegression && update.count == 0
               && is_absent(controller.snapshot()),
-          "post-READY exit counter regression stays failed closed");
+          "supervisor recreation cannot reset the cumulative exit counter");
 
     update = controller.observe(observation(State::Ready, true, 8));
     CHECK(update.error == Error::None && update.count == 1
               && is_exact_present(update.transitions[0]),
           "counter catch-up permits a fresh exact advertisement");
+}
+
+static void test_saturated_exit_counter_fails_closed_permanently()
+{
+    Controller controller;
+    constexpr uint64_t almost_max = std::numeric_limits<uint64_t>::max() - 1;
+    constexpr uint64_t saturated = std::numeric_limits<uint64_t>::max();
+
+    Update update = controller.observe(
+        observation(State::Ready, true, almost_max));
+    CHECK(update.count == 1 && is_exact_present(update.transitions[0]),
+          "controller can advertise below the cumulative counter limit");
+
+    update = controller.observe(observation(State::Ready, true, saturated));
+    CHECK(update.error == Error::CounterSaturated && update.count == 1
+              && is_absent(update.transitions[0])
+              && is_absent(controller.snapshot()),
+          "saturated crash observation withdraws instead of republishing");
+
+    update = controller.observe(observation(State::Ready, true, saturated));
+    CHECK(update.error == Error::CounterSaturated && update.count == 0
+              && is_absent(controller.snapshot()),
+          "same-counter READY recovery at saturation remains failed closed");
+
+    update = controller.observe(observation(State::Ready, true, almost_max));
+    CHECK(update.error == Error::CounterRegression && update.count == 0
+              && is_absent(controller.snapshot()),
+          "counter wrap or replacement reset cannot escape saturated absence");
 }
 
 static void test_initial_nonzero_counter_and_port_change()
@@ -157,6 +186,7 @@ int main()
     test_withdrawal_levels();
     test_crash_edges_preserve_withdraw_before_republish();
     test_invalid_inputs_fail_closed();
+    test_saturated_exit_counter_fails_closed_permanently();
     test_initial_nonzero_counter_and_port_change();
     if (failures != 0) {
         std::fprintf(stderr, "p50readyadvertisement: %d failure(s)\n", failures);
