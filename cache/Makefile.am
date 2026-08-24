@@ -24,7 +24,8 @@ AM_CPPFLAGS = -I$(top_srcdir) $(LIBZSTD_CFLAGS)
 libp50endpoint_a_SOURCES = p50_endpoint.cpp p50_endpoint.h
 libp50endpoint_a_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
 
-libp50localtransport_a_SOURCES = p50_local_transport.cpp p50_local_transport.h
+libp50localtransport_a_SOURCES = p50_local_transport.cpp p50_local_transport.h \
+	p50_fd_handoff.cpp p50_fd_handoff.h
 libp50sidecarsupervisor_a_SOURCES = p50_sidecar_supervisor.cpp p50_sidecar_supervisor.h
 
 EXTRA_DIST = \
@@ -127,6 +128,7 @@ EXTRA_DIST = \
 	P50_SIDECAR_SUPERVISOR.md \
 	p50_sidecar_supervisor.h \
 	P50_CACHE_SERVICE.md \
+	P50_FD_HANDOFF.md \
 	formal/README.md
 
 check-local:

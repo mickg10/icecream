@@ -56,5 +56,8 @@ in-flight handshake plus one listener poll interval.
 Shutdown compares the open listener's `fstat` device/inode with the pathname's
 `lstat` device/inode before unlinking.  A replacement node is never removed.
 
-This is a control-only slice; no session FD passing or data frame handling is
-present yet.
+The generic `p50_fd_handoff` helper can now pass one accepted descriptor over
+an already-authenticated control connection for a later ordinary-link
+`CACHE_SESSION` adoption.  This service still does not invoke it: there is no
+daemon integration, public listener, nonzero advertisement, endpoint/store,
+codec, or data-frame behavior in this slice.
