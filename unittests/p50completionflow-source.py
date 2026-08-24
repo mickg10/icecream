@@ -71,6 +71,12 @@ def check_worker(serve: str, record: str) -> None:
             "legacy statistics buffer is not one native eight-word value")
     require(flow.count("write(out_fd, job_stat, sizeof(job_stat))") == 2,
             "legacy success/catch writes are not both preserved")
+    resource_failure = section(flow, "if (ret) {", "struct stat st;")
+    ordered(resource_failure,
+            "ret == EXIT_OUT_OF_MEMORY",
+            "ret == EXIT_IO_ERROR",
+            "rmsg.status = ret;",
+            "job_stat[JobStatistics::exit_code] = ret;")
     ordered(flow,
             "if (!client->send_msg(rmsg))",
             "if (!p50_input)",
@@ -163,6 +169,8 @@ def deletion_mutants(files: dict[str, str]) -> None:
         ("client", "p50_result_received &&\n            !p50_disposition_attempted",
          "false"),
         ("serve", "write(out_fd, job_stat, sizeof(job_stat))", "write_deleted()"),
+        ("serve", "rmsg.status = ret;", "status_binding_deleted();"),
+        ("serve", "job_stat[JobStatistics::exit_code] = ret;", "stats_binding_deleted();"),
         ("serve", "write_output_file(obj_file, client);", "output_deleted();"),
         ("serve", "icecc::p50::receive_p50_result_disposition(",
          "receive_deleted("),

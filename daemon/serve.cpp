@@ -395,6 +395,13 @@ int handle_connection(const string &basedir, CompileJob *job,
             } else {
                 throw myexception(ret);
             }
+            /* Several resource-failure returns occur before work_it() can
+               populate CompileResultMsg/job_stat.  The was_out_of_memory bit
+               is only meaningful with a nonzero status: bind both result
+               views here so the submitter takes its definitive-cancel/local-
+               fallback path and the child record cannot describe success. */
+            rmsg.status = ret;
+            job_stat[JobStatistics::exit_code] = ret;
         }
 
         struct stat st;
