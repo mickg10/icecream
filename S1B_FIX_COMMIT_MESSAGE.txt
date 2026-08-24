@@ -1,5 +1,0 @@
-S1b gate: disable unavailable man-page toolchain by default
-
-Make the local archive/membership producer configure with --without-man by
-default, matching the installed-identity producer and the pinned image's
-available toolchain. Preserve an explicit S1B_DIST_CONFIGURE_ARGS override.
