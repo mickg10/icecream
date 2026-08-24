@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -13,7 +14,6 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/un.h>
-#include <sys/time.h>
 #include <unistd.h>
 
 namespace icecc::p50::local {
@@ -70,6 +70,45 @@ Status read_exact(int fd, std::span<uint8_t> out, bool clean_eof) {
             return done == 0 && clean_eof ? Status::CleanEof : Status::Truncated;
         if (count < 0) {
             if (errno == EINTR)
+                continue;
+            return Status::IoError;
+        }
+        done += static_cast<size_t>(count);
+    }
+    return Status::Ok;
+}
+
+Status read_exact_until(int fd, std::span<uint8_t> out, bool clean_eof,
+                        std::chrono::steady_clock::time_point deadline) {
+    size_t done = 0;
+    while (done != out.size()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline)
+            return Status::IoError;
+        const auto remaining_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(deadline - now).count();
+        const long long rounded_ms = (remaining_us + 999) / 1000;
+        const int poll_ms = static_cast<int>(
+            std::clamp<long long>(rounded_ms, 1, std::numeric_limits<int>::max()));
+        struct pollfd descriptor{fd, POLLIN | POLLERR | POLLHUP, 0};
+        const int ready = ::poll(&descriptor, 1, poll_ms);
+        if (ready == 0)
+            return Status::IoError;
+        if (ready < 0) {
+            if (errno == EINTR)
+                continue;
+            return Status::IoError;
+        }
+        int receive_flags = 0;
+#if defined(MSG_DONTWAIT)
+        receive_flags = MSG_DONTWAIT;
+#endif
+        const ssize_t count =
+            ::recv(fd, out.data() + done, out.size() - done, receive_flags);
+        if (count == 0)
+            return done == 0 && clean_eof ? Status::CleanEof : Status::Truncated;
+        if (count < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
                 continue;
             return Status::IoError;
         }
@@ -212,6 +251,25 @@ Status validate_header(const uint8_t* header, size_t size, uint32_t* payload_len
     return Status::Ok;
 }
 
+Status read_frame_until(int fd, Frame& frame,
+                        std::chrono::steady_clock::time_point deadline) {
+    std::array<uint8_t, kFrameHeaderSize> header{};
+    Status status = read_exact_until(fd, header, true, deadline);
+    if (status != Status::Ok)
+        return status;
+    uint32_t payload_length = 0;
+    status = validate_header(header.data(), header.size(), &payload_length);
+    if (status != Status::Ok)
+        return status;
+    std::vector<uint8_t> encoded(kFrameHeaderSize + payload_length);
+    std::copy(header.begin(), header.end(), encoded.begin());
+    status = read_exact_until(
+        fd, std::span<uint8_t>(encoded).subspan(kFrameHeaderSize), false, deadline);
+    if (status != Status::Ok)
+        return status;
+    return decode_frame(encoded, frame);
+}
+
 } // namespace
 
 const char* status_name(Status status) noexcept {
@@ -332,27 +390,15 @@ Status Connection::verify_peer_credentials(const CredentialExpectation& expected
 Status Connection::receive_with_timeout(Frame& frame, int timeout_ms) noexcept {
     if (fd_ < 0)
         return status_;
-    if (timeout_ms < 0)
+    if (timeout_ms <= 0)
         return Status::InvalidArgument;
-    struct pollfd descriptor{fd_, POLLIN | POLLERR | POLLHUP, 0};
-    const int result = ::poll(&descriptor, 1, timeout_ms);
-    if (result == 0)
+    try {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        return read_frame_until(fd_, frame, deadline);
+    } catch (...) {
         return Status::IoError;
-    if (result < 0)
-        return Status::IoError;
-    if (timeout_ms == 0)
-        return Status::InvalidArgument;
-    struct timeval old_timeout{};
-    socklen_t old_length = sizeof(old_timeout);
-    const bool had_old_timeout =
-        ::getsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &old_timeout, &old_length) == 0;
-    struct timeval timeout{timeout_ms / 1000, (timeout_ms % 1000) * 1000};
-    if (::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0)
-        return Status::IoError;
-    const Status status = read_frame(fd_, frame);
-    if (had_old_timeout)
-        (void)::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &old_timeout, sizeof(old_timeout));
-    return status;
+    }
 }
 
 Connection::Connection(Connection&& other) noexcept

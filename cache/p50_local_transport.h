@@ -106,8 +106,10 @@ public:
     // Callers do not need (and cannot borrow) a second raw descriptor.
     Status verify_peer_credentials(const CredentialExpectation& expected) const noexcept;
 
-    // Waits for input with a finite bound before reading one exact frame.
-    // This keeps a control connection from preventing signal-driven shutdown.
+    // Reads one exact frame under a single absolute wall-time bound covering
+    // the header and payload together.  A peer cannot renew the budget by
+    // trickling individual bytes, so one control connection cannot prevent
+    // bounded signal-driven shutdown or listener progress.
     Status receive_with_timeout(Frame& frame, int timeout_ms) noexcept;
 
     // A concurrent caller gets Busy.  There is intentionally no implicit

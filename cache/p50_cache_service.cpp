@@ -225,19 +225,24 @@ void cleanup_listener(int fd, const std::string& path, const ListenerIdentity& i
 }
 
 bool handle_connection(local::Connection connection, const Options& options) noexcept {
-    if (!connection.valid())
-        return false;
-    if (connection.verify_peer_credentials(options.expected_peer) != local::Status::Ok)
+    try {
+        if (!connection.valid())
+            return false;
+        if (connection.verify_peer_credentials(options.expected_peer) != local::Status::Ok)
+            return true;
+        local::Frame hello;
+        if (connection.receive_with_timeout(hello, kHandshakeMilliseconds) != local::Status::Ok)
+            return true;
+        if (local::validate_handshake(hello, local::MessageType::Hello,
+                                      local::PeerRole::Daemon, options.identity) != local::Status::Ok)
+            return true;
+        const local::Frame ack =
+            local::make_hello_ack(local::PeerRole::Sidecar, options.identity);
+        (void)connection.send(ack);
         return true;
-    local::Frame hello;
-    if (connection.receive_with_timeout(hello, kHandshakeMilliseconds) != local::Status::Ok)
+    } catch (...) {
         return true;
-    if (local::validate_handshake(hello, local::MessageType::Hello,
-                                  local::PeerRole::Daemon, options.identity) != local::Status::Ok)
-        return true;
-    const local::Frame ack = local::make_hello_ack(local::PeerRole::Sidecar, options.identity);
-    (void)connection.send(ack);
-    return true;
+    }
 }
 
 } // namespace

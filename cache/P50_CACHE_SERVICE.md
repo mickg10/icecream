@@ -43,7 +43,10 @@ reader, and one writer.  The service verifies `SO_PEERCRED`, receives one exact
 `Hello` from `Daemon` with the configured nonzero generation and attempt, and
 returns one `HelloAck` from `Sidecar`.  Malformed, truncated, oversize, stale,
 wrong-role, wrong-credential, and timed-out inputs are closed and do not stop
-the listener.  SIGTERM and SIGINT stop the poll loop and close the listener.
+the listener.  The handshake timeout is one absolute deadline for the entire
+header and payload; receiving another byte never renews it.  SIGTERM and
+SIGINT stop the poll loop and close the listener no later than that bounded
+in-flight handshake plus one listener poll interval.
 
 Shutdown compares the open listener's `fstat` device/inode with the pathname's
 `lstat` device/inode before unlinking.  A replacement node is never removed.
