@@ -34,8 +34,9 @@ before the reply is forbidden pipelining and is rejected without consumption.
 The receiver also rejects any missing/extra fd or ancillary message, bad cmsg
 length/type, `MSG_TRUNC`, `MSG_CTRUNC`, malformed record, stale generation,
 wrong attempt/request identity, duplicate, disconnect, or expired absolute
-deadline.  `POLLIN|POLLHUP` consumes already-queued bytes before classifying
-EOF.  There is no allocation based on a wire length.
+deadline.  Terminal poll bits are classified before requested readiness, so a
+combined `POLLIN|POLLHUP` result fails closed without consuming queued bytes.
+There is no allocation based on a wire length.
 
 ## Ownership state machine
 

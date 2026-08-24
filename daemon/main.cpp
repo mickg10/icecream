@@ -86,6 +86,7 @@
 #include <deque>
 #include <map>
 #include <memory>
+#include <new>
 #include <unordered_map>
 #include <unordered_set>
 #include <algorithm>
@@ -107,7 +108,7 @@
 #include "platform.h"
 #include "util.h"
 #include "getifaddrs.h"
-#include "p50_daemon_cache_dispatch.h"
+#include "p50_daemon_sidecar_adapter.h"
 
 static std::string pidFilePath;
 static volatile sig_atomic_t exit_main_loop = 0;
@@ -122,6 +123,23 @@ static uint64_t monotonic_msec()
 {
     using namespace std::chrono;
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+static uint64_t fresh_cache_sidecar_generation() noexcept
+{
+    using namespace std::chrono;
+    uint64_t value = static_cast<uint64_t>(
+        duration_cast<nanoseconds>(system_clock::now().time_since_epoch()).count());
+    value ^= static_cast<uint64_t>(
+        duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count());
+    value ^= static_cast<uint64_t>(static_cast<uint32_t>(::getpid()))
+             * UINT64_C(0x9e3779b97f4a7c15);
+    value ^= value >> 30;
+    value *= UINT64_C(0xbf58476d1ce4e5b9);
+    value ^= value >> 27;
+    value *= UINT64_C(0x94d049bb133111eb);
+    value ^= value >> 31;
+    return value == 0 ? 1 : value;
 }
 
 struct FdSnapshot {
@@ -893,7 +911,8 @@ void usage(const char *reason = nullptr)
     cerr << "usage: iceccd [-n <netname>] [-m <max_processes>] [--max-preprocess <max_preprocesses>] [--no-remote] [-d|--daemonize] [-l logfile] [-s <schedulerhost[:port]>]"
         " [-v[v[v]]] [-u|--user-uid <user_uid>] [-b <env-basedir>] [--cache-limit <MB>] [-N <node_name>] [-i|--interface <net_interface>] [-p|--port <port>]"
         " [--state-jsonl <path>] [--state-interval <sec>] [--state-log]"
-        " [--webgui] [--webgui-port <port>] [--webgui-addr <addr>]" << endl;
+        " [--webgui] [--webgui-port <port>] [--webgui-addr <addr>]"
+        " [--cache-service <absolute-path>] [--cache-runtime-dir <absolute-path>]" << endl;
     exit(1);
 }
 
@@ -1102,10 +1121,17 @@ struct Daemon {
     uint64_t waitforcs_use_cs_max_msec;
     uint64_t waitforcs_no_cs_max_msec;
 
-    // iceccd remains the public listener owner.  The controller is disabled
-    // until a reviewed supervisor adapter supplies an authenticated private
-    // relationship, so CACHE_SESSION fails closed without advertisement.
-    std::unique_ptr<icecc::p50::daemon::CacheSessionDispatcher> cache_dispatcher;
+    // iceccd remains the sole public listener owner.  The adapter owns only
+    // the supervised sidecar and its authenticated private relationship.
+    std::unique_ptr<icecc::p50::daemon::DaemonSidecarAdapter> cache_adapter;
+    bool cache_adapter_start_attempted;
+    icecc::p50::advertisement::Snapshot scheduler_cache_snapshot;
+    bool scheduler_cache_snapshot_valid;
+    // Positive sidecar operation is opt-in until the installed service path
+    // and its private runtime directory are supplied together.  There is no
+    // PATH lookup and no implicit shared socket location.
+    std::string cache_service_executable;
+    std::string cache_runtime_directory;
 
     bool webgui_enabled;
     int webgui_port;
@@ -1144,8 +1170,9 @@ struct Daemon {
         new_client_id = 0;
         next_scheduler_connect = 0;
         cache_size = 0;
-        cache_dispatcher.reset(new icecc::p50::daemon::CacheSessionDispatcher(
-            icecc::p50::local::Identity{monotonic_msec(), 1}));
+        cache_adapter_start_attempted = false;
+        scheduler_cache_snapshot = {};
+        scheduler_cache_snapshot_valid = false;
         noremote = false;
         custom_nodename = false;
         icecream_load = 0;
@@ -1186,10 +1213,17 @@ struct Daemon {
     }
 
     ~Daemon() {
+        shutdown_cache_adapter();
         delete discover;
     }
 
-    bool reannounce_environments() __attribute_warn_unused_result__;
+    bool reannounce_environments(
+        const icecc::p50::advertisement::Snapshot *cache_transition = nullptr)
+        __attribute_warn_unused_result__;
+    icecc::p50::advertisement::Snapshot cache_advertisement_snapshot() const noexcept;
+    bool configure_cache_adapter() noexcept;
+    void poll_cache_adapter() noexcept;
+    void shutdown_cache_adapter() noexcept;
     void answer_client_requests();
     bool handle_transfer_env(Client *client, EnvTransferMsg *msg) __attribute_warn_unused_result__;
     bool handle_env_install_child_done(Client *client);
@@ -4060,22 +4094,44 @@ bool Daemon::send_scheduler(const Msg& msg)
     return true;
 }
 
-/* M2.5 advertises no product endpoint until a later owner has completed
-   bind/listen and armed its accept loop.  Keeping the canonical absence in
-   one helper makes both initial Login and environment reannouncement use the
-   same three-word snapshot; there is intentionally no CLI override. */
-static void apply_inert_cache_advertisement(LoginMsg& login)
+static icecc::p50::advertisement::Snapshot canonical_cache_snapshot(
+    const icecc::p50::advertisement::Snapshot& snapshot) noexcept
 {
-    login.setCacheAdvertisement(0, 0, 0);
+    return snapshot.present() ? snapshot : icecc::p50::advertisement::Snapshot{};
 }
 
-bool Daemon::reannounce_environments()
+static void apply_cache_advertisement(
+    LoginMsg& login, const icecc::p50::advertisement::Snapshot& requested)
 {
-    log_info() << "reannounce_environments " << endl;
-    LoginMsg lmsg(0, nodename, "", supported_features);
-    apply_inert_cache_advertisement(lmsg);
-    lmsg.envs = available_environments(envbasedir);
-    return send_scheduler(lmsg);
+    const auto snapshot = canonical_cache_snapshot(requested);
+    login.setCacheAdvertisement(snapshot.endpoint_port, snapshot.protocol,
+                                snapshot.profile_mask);
+}
+
+static bool exact_public_tcp_listener(int fd, uint32_t expected_port) noexcept
+{
+    if (fd < 0 || expected_port == 0 || expected_port > UINT16_MAX)
+        return false;
+
+    sockaddr_storage address{};
+    socklen_t address_size = sizeof(address);
+    if (::getsockname(fd, reinterpret_cast<sockaddr*>(&address), &address_size) != 0)
+        return false;
+
+    uint32_t bound_port = 0;
+    if (address.ss_family == AF_INET && address_size >= sizeof(sockaddr_in)) {
+        bound_port = ntohs(reinterpret_cast<const sockaddr_in*>(&address)->sin_port);
+    } else if (address.ss_family == AF_INET6 && address_size >= sizeof(sockaddr_in6)) {
+        bound_port = ntohs(reinterpret_cast<const sockaddr_in6*>(&address)->sin6_port);
+    } else {
+        return false;
+    }
+
+    int accepting = 0;
+    socklen_t accepting_size = sizeof(accepting);
+    return bound_port == expected_port
+        && ::getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, &accepting, &accepting_size) == 0
+        && accepting_size == sizeof(accepting) && accepting != 0;
 }
 
 /* G4 session activation (bigoracle 15:07): a non-null `scheduler` channel is
@@ -4101,6 +4157,40 @@ static unsigned int scheduler_loss_cleanup_attempts = 0;
    (2^64 activations -- unreachable in practice).  Makes exhaustion TERMINAL:
    reconnect() then refuses further sessions rather than reuse a generation. */
 static bool scheduler_generation_exhausted = false;
+
+icecc::p50::advertisement::Snapshot
+Daemon::cache_advertisement_snapshot() const noexcept
+{
+    return cache_adapter != nullptr
+        ? canonical_cache_snapshot(cache_adapter->advertisement_snapshot())
+        : icecc::p50::advertisement::Snapshot{};
+}
+
+bool Daemon::reannounce_environments(
+    const icecc::p50::advertisement::Snapshot *cache_transition)
+{
+    // A positive endpoint belongs only to an ACTIVE scheduler session.  The
+    // initial Login for every connection is always canonical absence; the
+    // exact current snapshot is reconciled after the first ConfCS activates
+    // the session.
+    icecc::p50::advertisement::Snapshot snapshot{};
+    if (scheduler_session_active) {
+        snapshot = cache_transition != nullptr
+            ? canonical_cache_snapshot(*cache_transition)
+            : cache_advertisement_snapshot();
+    }
+
+    log_info() << "reannounce_environments cache=" << snapshot.endpoint_port
+               << "/" << snapshot.protocol << "/" << snapshot.profile_mask << endl;
+    LoginMsg lmsg(0, nodename, "", supported_features);
+    apply_cache_advertisement(lmsg, snapshot);
+    lmsg.envs = available_environments(envbasedir);
+    if (!send_scheduler(lmsg))
+        return false;
+    scheduler_cache_snapshot = snapshot;
+    scheduler_cache_snapshot_valid = true;
+    return true;
+}
 
 /* S2 (BigOracle d23d9c5d HOLD, Gap 3 -- reused-client clearing): three
    separate sites (scheduler_no_cs's NoCS branch, handle_old_request's
@@ -4543,6 +4633,7 @@ static bool scheduler_owns_getcs_assignment(const Client *c)
 
 void Daemon::close_scheduler(bool orderly_shutdown)
 {
+    scheduler_cache_snapshot_valid = false;
     if (!scheduler) {
         return;
     }
@@ -4565,6 +4656,122 @@ void Daemon::close_scheduler(bool orderly_shutdown)
     static bool fast_reconnect = getenv( "ICECC_TESTS" ) != nullptr;
     if( fast_reconnect )
         next_scheduler_connect = time(nullptr) + 3;
+}
+
+bool Daemon::configure_cache_adapter() noexcept
+{
+    if (cache_service_executable.empty() && cache_runtime_directory.empty())
+        return true;
+
+    if (noremote || daemon_port <= 0 || daemon_port > UINT16_MAX
+            || !exact_public_tcp_listener(tcp_listen_fd,
+                                          static_cast<uint32_t>(daemon_port))) {
+        log_error() << "cache sidecar requires the exact public TCP listener to be bound"
+                    << endl;
+        return false;
+    }
+
+    try {
+        icecc::p50::daemon::Config config;
+        config.executable = cache_service_executable;
+        config.runtime_directory = cache_runtime_directory;
+        config.generation = fresh_cache_sidecar_generation();
+        config.expected_daemon_uid = static_cast<uint64_t>(::geteuid());
+        config.expected_daemon_gid = static_cast<uint64_t>(::getegid());
+        config.expected_service_uid = config.expected_daemon_uid;
+        config.expected_service_gid = config.expected_daemon_gid;
+        config.public_listener_port = static_cast<uint32_t>(daemon_port);
+        config.readiness_timeout = std::chrono::milliseconds(1000);
+        config.connect_timeout = std::chrono::milliseconds(1000);
+        config.handoff_timeout = std::chrono::milliseconds(250);
+        config.shutdown_timeout = std::chrono::milliseconds(1000);
+        config.restart_window = std::chrono::milliseconds(10000);
+        config.max_restarts = 3;
+        // One attempt per event-loop turn keeps every recovery bounded while
+        // the rolling outer budget still permits transient recovery.
+        config.max_attempts_per_recovery = 1;
+
+        if (!icecc::p50::daemon::DaemonSidecarAdapter::valid_config(config)) {
+            log_error() << "invalid cache sidecar configuration; refusing positive mode"
+                        << endl;
+            return false;
+        }
+        auto *created = new (std::nothrow)
+            icecc::p50::daemon::DaemonSidecarAdapter(std::move(config));
+        if (created == nullptr) {
+            log_error() << "cannot allocate cache sidecar adapter" << endl;
+            return false;
+        }
+        cache_adapter.reset(created);
+        cache_adapter->observe_public_listener(true,
+                                               static_cast<uint32_t>(daemon_port));
+        cache_adapter_start_attempted = false;
+        log_info() << "cache sidecar configured for public port " << daemon_port
+                   << "; advertisement remains absent until scheduler activation and READY"
+                   << endl;
+        return true;
+    } catch (...) {
+        log_error() << "cannot construct cache sidecar configuration" << endl;
+        cache_adapter.reset();
+        return false;
+    }
+}
+
+void Daemon::poll_cache_adapter() noexcept
+{
+    if (cache_adapter == nullptr)
+        return;
+
+    const bool listener_bound = daemon_port > 0 && daemon_port <= UINT16_MAX
+        && exact_public_tcp_listener(tcp_listen_fd,
+                                     static_cast<uint32_t>(daemon_port));
+    cache_adapter->observe_public_listener(
+        listener_bound, listener_bound ? static_cast<uint32_t>(daemon_port) : 0);
+
+    // Never start a service, authenticate a private relationship, or publish
+    // presence during a mere scheduler LOGIN_ATTEMPT.
+    if (!scheduler_session_active || scheduler == nullptr)
+        return;
+
+    icecc::p50::advertisement::Update update;
+    if (!cache_adapter_start_attempted) {
+        cache_adapter_start_attempted = true;
+        (void)cache_adapter->start(&update);
+    } else {
+        (void)cache_adapter->poll(&update);
+    }
+
+    // Preserve the Controller's exact order.  In particular, a crash and
+    // recovery observed in one poll is published absent before present.
+    for (size_t index = 0; index < update.count; ++index) {
+        if (!scheduler_session_active || scheduler == nullptr
+                || !reannounce_environments(&update.transitions[index]))
+            return;
+    }
+
+    // Reconnects intentionally begin with 0/0/0.  A Controller that was
+    // already present may emit no new transition, so reconcile its level after
+    // activation rather than relying only on edges.
+    const auto current = cache_advertisement_snapshot();
+    if ((!scheduler_cache_snapshot_valid || scheduler_cache_snapshot != current)
+            && !reannounce_environments(&current))
+        return;
+}
+
+void Daemon::shutdown_cache_adapter() noexcept
+{
+    if (cache_adapter == nullptr)
+        return;
+
+    icecc::p50::advertisement::Update update;
+    cache_adapter->shutdown(&update);
+    for (size_t index = 0; index < update.count; ++index) {
+        if (!scheduler_session_active || scheduler == nullptr
+                || !reannounce_environments(&update.transitions[index]))
+            break;
+    }
+    cache_adapter.reset();
+    cache_adapter_start_attempted = false;
 }
 
 /* G4: the single, exactly-once cleanup for the loss of an ESTABLISHED scheduler
@@ -7364,9 +7571,22 @@ bool Daemon::handle_cache_session(Client *client, Msg *msg)
     }
 
     const int old_fd = client->channel->fd;
-    const icecc::p50::daemon::CacheDispatchOutcome outcome =
-        cache_dispatcher->dispatch(*client->channel, client->channel->protocol,
-                                   static_cast<uint32_t>(*msg));
+    icecc::p50::daemon::CacheDispatchOutcome outcome;
+    auto *dispatcher = scheduler_session_active && cache_adapter != nullptr
+            && cache_advertisement_snapshot().present()
+        ? cache_adapter->dispatcher() : nullptr;
+    if (dispatcher != nullptr) {
+        outcome = dispatcher->dispatch(*client->channel, client->channel->protocol,
+                                       static_cast<uint32_t>(*msg));
+    } else {
+        outcome.result = icecc::p50::daemon::CacheDispatchResult::SidecarUnavailable;
+    }
+
+    // A successful handoff deliberately consumes the one-shot authenticated
+    // control relationship.  Withdraw it and establish a fresh relationship
+    // before accepting another cache session; publish absent then present in
+    // the Controller's order.
+    poll_cache_adapter();
 
     if (outcome.result == icecc::p50::daemon::CacheDispatchResult::Accepted) {
         trace() << "accepted bounded CACHE_SESSION handoff request "
@@ -8049,21 +8269,30 @@ bool Daemon::reconnect()
     icecream_load = 0;
 
     LoginMsg lmsg(daemon_port, determine_nodename(), machine_name, supported_features);
-    apply_inert_cache_advertisement(lmsg);
+    const icecc::p50::advertisement::Snapshot absent{};
+    apply_cache_advertisement(lmsg, absent);
     lmsg.envs = available_environments(envbasedir);
     lmsg.max_kids = max_kids;
     lmsg.noremote = noremote;
-    return send_scheduler(lmsg);
+    if (!send_scheduler(lmsg))
+        return false;
+    scheduler_cache_snapshot = absent;
+    scheduler_cache_snapshot_valid = true;
+    return true;
 }
 
 int Daemon::working_loop()
 {
     for (;;) {
         reconnect();
+        // This precedes answer_client_requests()' generic waitpid(-1) sweep so
+        // the adapter normally observes and reaps its own supervised child.
+        poll_cache_adapter();
         answer_client_requests();
         maybe_dump_state();
 
         if (exit_main_loop) {
+            shutdown_cache_adapter();
             close_scheduler(true);   /* orderly shutdown: no established-loss token */
             clear_children();
             close_web();
@@ -8110,6 +8339,8 @@ int main(int argc, char **argv)
             { "webgui", 0, nullptr, 0},
             { "webgui-port", 1, nullptr, 0},
             { "webgui-addr", 1, nullptr, 0},
+            { "cache-service", 1, nullptr, 0},
+            { "cache-runtime-dir", 1, nullptr, 0},
             { nullptr, 0, nullptr, 0 }
         };
 
@@ -8211,6 +8442,18 @@ int main(int argc, char **argv)
                     d.webgui_enabled = true;
                 } else {
                     usage("Error: --webgui-addr requires argument");
+                }
+            } else if (optname == "cache-service") {
+                if (optarg && *optarg && optarg[0] == '/') {
+                    d.cache_service_executable = optarg;
+                } else {
+                    usage("Error: --cache-service requires an absolute path");
+                }
+            } else if (optname == "cache-runtime-dir") {
+                if (optarg && *optarg && optarg[0] == '/') {
+                    d.cache_runtime_directory = optarg;
+                } else {
+                    usage("Error: --cache-runtime-dir requires an absolute path");
                 }
             }
 
@@ -8339,6 +8582,11 @@ int main(int argc, char **argv)
         default:
             usage();
         }
+    }
+
+    if (d.cache_service_executable.empty()
+            != d.cache_runtime_directory.empty()) {
+        usage("Error: --cache-service and --cache-runtime-dir must be supplied together");
     }
 
     if (d.warn_icecc_user_errno != 0) {
@@ -8548,6 +8796,10 @@ int main(int argc, char **argv)
     }
 
     if (!d.setup_listen_fds()) { // error
+        return 1;
+    }
+
+    if (!d.configure_cache_adapter()) {
         return 1;
     }
 

@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <csignal>
 #include <string>
+#include <vector>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <netinet/in.h>
@@ -75,8 +76,13 @@ int main(int argc, char **argv)
         std::fprintf(stderr, "usage: %s <iceccd>\n", argv[0]);
         return 2;
     }
-    char work_template[] = "/tmp/icecc-s2-daemon-cache.XXXXXX";
-    char *work_raw = ::mkdtemp(work_template);
+    const char *temporary_root = ::getenv("TMPDIR");
+    const std::string prefix = temporary_root && *temporary_root
+        ? temporary_root : "/tmp";
+    std::string pattern = prefix + "/icecc-s2-daemon-cache.XXXXXX";
+    std::vector<char> work_template(pattern.begin(), pattern.end());
+    work_template.push_back('\0');
+    char *work_raw = ::mkdtemp(work_template.data());
     REQUIRE(work_raw != nullptr, "real daemon temporary directory created");
     if (!work_raw) return 2;
     const std::string work(work_raw);

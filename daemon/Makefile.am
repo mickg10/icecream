@@ -12,8 +12,11 @@ iceccd_SOURCES = \
 	statewriter.cpp
 
 iceccd_LDADD = \
-	../services/libicecc.la \
+	../cache/libp50daemonsidecaradapter.a \
+	../cache/libp50readyadvertisement.a \
+	../cache/libp50sidecarsupervisor.a \
 	../cache/libp50localtransport.a \
+	../services/libicecc.la \
 	$(LIB_KINFO) \
 	$(LIBCAP_NG_LIBS) \
 	$(LIBARCHIVE_LIBS)

@@ -22,8 +22,17 @@ grep -F 'identity != identity_' "$impl" >/dev/null
 grep -F 'next_request_id_++' "$impl" >/dev/null
 grep -F 'disable();' "$impl" >/dev/null
 grep -F 'handle_cache_session' "$daemon" >/dev/null
-grep -F 'cache_dispatcher->dispatch' "$daemon" >/dev/null
+grep -F 'cache_advertisement_snapshot().present()' "$daemon" >/dev/null
+grep -F 'dispatcher->dispatch' "$daemon" >/dev/null
+grep -F 'poll_cache_adapter();' "$daemon" >/dev/null
+grep -F 'exact_public_tcp_listener' "$daemon" >/dev/null
+grep -F 'SO_ACCEPTCONN' "$daemon" >/dev/null
+grep -F 'scheduler_cache_snapshot_valid = false' "$daemon" >/dev/null
+grep -F 'cache_adapter->shutdown(&update)' "$daemon" >/dev/null
 grep -F 'p50_daemon_cache_dispatch.cpp' "$makefile" >/dev/null
+grep -F 'libp50daemonsidecaradapter.a' "$makefile" >/dev/null
+grep -F 'libp50readyadvertisement.a' "$makefile" >/dev/null
+grep -F 'libp50sidecarsupervisor.a' "$makefile" >/dev/null
 grep -F 'p50daemoncachedispatch' "$src/unittests/Makefile.am" >/dev/null
 grep -F 'p50daemoncachedispatch-sanitize.sh' "$src/unittests/Makefile.am" >/dev/null
 grep -F '../cache/p50_daemon_cache_dispatch.cpp' "$makefile" >/dev/null
