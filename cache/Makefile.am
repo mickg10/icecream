@@ -1,4 +1,4 @@
-noinst_LIBRARIES = libprotocol50.a libp50endpoint.a
+noinst_LIBRARIES = libprotocol50.a libp50endpoint.a libp50localtransport.a
 
 libprotocol50_a_SOURCES = \
 	protocol50.cpp \
@@ -15,6 +15,8 @@ libprotocol50_a_SOURCES = \
 AM_CPPFLAGS = -I$(top_srcdir) $(LIBZSTD_CFLAGS)
 libp50endpoint_a_SOURCES = p50_endpoint.cpp p50_endpoint.h
 libp50endpoint_a_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
+
+libp50localtransport_a_SOURCES = p50_local_transport.cpp p50_local_transport.h
 
 EXTRA_DIST = \
 	README.md \
@@ -110,6 +112,7 @@ EXTRA_DIST = \
 	formal/run_tlc.sh \
 	formal/.gitignore \
 	formal/check_trace.py \
+	P50_LOCAL_TRANSPORT.md \
 	formal/README.md
 
 check-local:
