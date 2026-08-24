@@ -24,8 +24,17 @@ mkdir -p "$WORK"
 WORK=$(CDPATH= cd -- "$WORK" && pwd)
 
 run_probe() {
-    image=$1; install_cmd=$2
-    docker run --rm -v "$SRC:/src:ro" -v "$WORK:/work" -u 0:0 "$image" bash -c "
+    image_ref=$1; expected_id=$2; install_cmd=$3
+    if actual_id=$(docker image inspect "$image_ref" --format '{{.Id}}' 2>/dev/null); then
+        :
+    else
+        actual_id=""
+    fi
+    if [ "$actual_id" != "$expected_id" ]; then
+        echo "FAIL: immutable probe image $image_ref resolved to '${actual_id:-ABSENT}', expected '$expected_id'" >&2
+        exit 1
+    fi
+    docker run --rm --pull=never -v "$SRC:/src:ro" -v "$WORK:/work" -u 0:0 "$image_ref" bash -c "
         set -e
         $install_cmd
         mkdir -p /work/build && cd /work/build
@@ -43,17 +52,20 @@ case "$DISTRO" in
     ubuntu22)
         # This row used the pinned farm-node image, whose system packages
         # already cover every icecc build dependency -- no apt-get needed.
-        run_probe icecream/farm-node:ubuntu22-gcc11-boost174 ':'
+        run_probe sha256:fe001a6138f017608b8846b43bf268a76a9d7a5b66c3364ba3f881da2ff0c54b \
+            sha256:fe001a6138f017608b8846b43bf268a76a9d7a5b66c3364ba3f881da2ff0c54b ':'
         ;;
     ubuntu24)
-        run_probe ubuntu:24.04 '
+        run_probe ubuntu@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517 \
+            sha256:a6f81fb630d51837271b89f8193810a5fc493fa4f30a55d7ebcdb3a66f3cc63a '
             apt-get update >/dev/null 2>&1
             DEBIAN_FRONTEND=noninteractive apt-get install -y g++ gcc make autoconf automake libtool pkg-config \
                 libzstd-dev liblzo2-dev libarchive-dev libboost-dev libcap-ng-dev libxxhash-dev >/dev/null 2>&1
         '
         ;;
     fedora40)
-        run_probe fedora:40 '
+        run_probe fedora@sha256:3c86d25fef9d2001712bc3d9b091fc40cf04be4767e48f1aa3b785bf58d300ed \
+            sha256:b368d29df3b50e2acc0d6622493a29dafedbbc5a58ad03cab73bddca16c23858 '
             dnf install -y gcc gcc-c++ make autoconf automake libtool pkgconf-pkg-config \
                 libzstd-devel lzo-devel libarchive-devel boost-devel libcap-ng-devel xxhash-devel >/dev/null 2>&1
         '

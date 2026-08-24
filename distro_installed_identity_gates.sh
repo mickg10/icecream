@@ -57,13 +57,15 @@
 #    separate corrupt-control=image-digest row against ubuntu22 confirms
 #    the local-id channel's OWN pre-run gate (image_id_pin_check, not
 #    image_digest) is independently deletion-sensitive too.
-# 4. PER-ARTIFACT DELETION MATRIX (BigOracle): reusing a GREEN sentinel
+# 4. PER-ARTIFACT/COMPETING-IDENTITY MATRIX (BigOracle): reusing a GREEN sentinel
 #    run's own build/destdir (already proven indistinguishable from a
 #    plain normal run's output), --corrupt-control=ARTIFACT is run once
-#    per artifact -- icecc, icecc-create-env, iceccd, icecc-scheduler,
-#    libicecc.a, icecc.pc, image-digest, package-inventory, build-log --
-#    each corrupting/deleting exactly that one artifact and requiring the
-#    run to fail, NAMING it. After each row, the read-only-mounted source
+#    per artifact/predicate -- icecc, icecc-create-env, iceccd
+#    absent/wrong plus competing identity, scheduler absent/wrong plus
+#    competing identity, libicecc.a, icecc.pc wrong plus competing Version,
+#    image authority, package inventory, build log -- each changing exactly
+#    that one artifact and requiring the run to fail, NAMING it. After each
+#    row, the read-only-mounted source
 #    tree ($SRCTREE) is re-hashed and required to remain byte-for-byte
 #    identical to its pre-matrix snapshot -- the corruption must land only
 #    in build/destdir, never in source.
@@ -108,6 +110,10 @@ done
 S1B_MEMBERS="distro_installed_identity.sh distro_installed_identity_gates.sh distro_probe.sh S1B_EXIT_MANIFEST.md"
 DIST_IMAGE=icecream/farm-node:ubuntu22-gcc11-boost174
 S1B_DIST_CONFIGURE_ARGS=${S1B_DIST_CONFIGURE_ARGS:---without-man}
+S1B_SOURCE_DATE_EPOCH=$(git -C "$REPO" show -s --format=%ct "$COMMIT")
+case "$S1B_SOURCE_DATE_EPOCH" in
+    ''|*[!0-9]*) echo "RED: exact commit has no numeric source-date epoch" >&2; exit 1 ;;
+esac
 
 dist_build() {
     # dist_build SOURCE_DIR BUILD_DIR LOG_FILE -- autogen.sh (needs write
@@ -122,6 +128,9 @@ dist_build() {
     src=$1 build=$2 log=$3
     docker run --rm --pull=never -v "$src:/dsrc" -v "$build:/dbuild" -u "$(id -u):$(id -g)" "$DIST_IMAGE" bash -c "
         set -e
+        export LC_ALL=C TZ=UTC SOURCE_DATE_EPOCH=$S1B_SOURCE_DATE_EPOCH
+        export TAR_OPTIONS='--sort=name --mtime=@$S1B_SOURCE_DATE_EPOCH --owner=0 --group=0 --numeric-owner'
+        umask 022
         cd /dsrc && ./autogen.sh
         cd /dbuild && /dsrc/configure $S1B_DIST_CONFIGURE_ARGS
         make dist-gzip
@@ -134,6 +143,28 @@ if find "$WORK/source" -name .git -print -quit | grep -q .; then
     echo "RED: git-archive extraction at $WORK/source contains a .git entry -- expected none"; exit 1
 fi
 echo "ok - git-archive extraction contains no .git"
+
+# The retained build-tree compatibility probe is not part of the installed
+# EXIT verdict, but because it is shipped as a reproducer it must not retain
+# a mutable-image escape hatch.  Bind all three shipped authorities together
+# before any Docker row.
+for authority in \
+    sha256:fe001a6138f017608b8846b43bf268a76a9d7a5b66c3364ba3f881da2ff0c54b \
+    ubuntu@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517 \
+    fedora@sha256:3c86d25fef9d2001712bc3d9b091fc40cf04be4767e48f1aa3b785bf58d300ed
+do
+    for authority_file in distro_installed_identity.sh distro_probe.sh S1B_EXIT_MANIFEST.md; do
+        grep -qF "$authority" "$WORK/source/$authority_file" || {
+            echo "RED: $authority_file is not bound to committed image authority $authority" >&2
+            exit 1
+        }
+    done
+done
+grep -qF 'docker run --rm --pull=never' "$WORK/source/distro_probe.sh" || {
+    echo "RED: retained distro_probe.sh does not fail closed on implicit pulls" >&2
+    exit 1
+}
+echo "ok - producer, retained probe and contract share immutable image authorities"
 
 # EXTRA_DIST-deletion mutant, BEFORE any docker-touching gate begins: a
 # SEPARATE fresh archive of the same commit, with exactly one EXTRA_DIST
@@ -182,6 +213,24 @@ dist_build "$WORK/source" "$WORK/build" "$WORK/log" || { echo "RED: dist build f
 TARBALL=$(ls "$WORK"/build/icecc-*.tar.gz 2>/dev/null | head -1)
 [ -n "$TARBALL" ] || { echo "RED: no dist tarball"; exit 1; }
 echo "dist tarball: $(basename "$TARBALL") sha256=$(sha256sum "$TARBALL" | cut -d' ' -f1)"
+
+# A hash-bound archive is meaningful only if two isolated productions of
+# the exact commit produce the same bytes.  Re-export, regenerate and
+# compare before trusting the displayed digest.
+mkdir -p "$WORK/repro-source" "$WORK/repro-build"
+git -C "$REPO" archive "$COMMIT" | tar -x -C "$WORK/repro-source" || {
+    echo "RED: reproducibility archive export failed"; exit 1;
+}
+dist_build "$WORK/repro-source" "$WORK/repro-build" "$WORK/repro-log" || {
+    echo "RED: reproducibility dist build failed"; tail -30 "$WORK/repro-log" >&2; exit 1;
+}
+REPRO_TARBALL=$(ls "$WORK"/repro-build/icecc-*.tar.gz 2>/dev/null | head -1)
+[ -n "$REPRO_TARBALL" ] || { echo "RED: reproducibility run produced no dist tarball"; exit 1; }
+if ! cmp -s "$TARBALL" "$REPRO_TARBALL"; then
+    echo "RED: two isolated make-dist productions of $COMMIT differ: $(sha256sum "$TARBALL" "$REPRO_TARBALL" | tr '\n' ' ')" >&2
+    exit 1
+fi
+echo "REPRODUCIBLE-DIST-SHA256=$(sha256sum "$TARBALL" | cut -d' ' -f1)"
 
 FAIL=0
 for member in $S1B_MEMBERS; do
@@ -449,6 +498,52 @@ fi
 echo
 echo "IMAGE-IDENTITY GATE: GREEN on both pin channels (registry-digest via $MATRIX_DISTRO, local-id via ubuntu22)"
 
+# EXPECTED-DIGEST AUTHORITY MUTANT: a different valid registry image has
+# a perfectly nonempty RepoDigest and a self-consistent image ID.  Dynamic
+# "accept the tag's first digest" code would therefore pass it.  Change
+# only the convenience tag while retaining the committed expected ref/ID;
+# the producer must fail before a build at image_digest_authority.
+REGISTRY_AUTH_DISTRO=$MATRIX_DISTRO
+[ "$REGISTRY_AUTH_DISTRO" = ubuntu22 ] && REGISTRY_AUTH_DISTRO=ubuntu24
+case "$REGISTRY_AUTH_DISTRO" in
+    ubuntu24) REGISTRY_AUTH_FROM='IMAGE=ubuntu:24.04'; REGISTRY_AUTH_TO='IMAGE=fedora:40' ;;
+    fedora40) REGISTRY_AUTH_FROM='IMAGE=fedora:40'; REGISTRY_AUTH_TO='IMAGE=ubuntu:24.04' ;;
+    *) echo "RED: no registry authority mutant for $REGISTRY_AUTH_DISTRO" >&2; exit 1 ;;
+esac
+echo
+echo "== EXPECTED-DIGEST AUTHORITY MUTANT ($REGISTRY_AUTH_DISTRO): valid alternate registry tag must RED =="
+python3 - "$PRODUCER" "$REGISTRY_AUTH_FROM" "$REGISTRY_AUTH_TO" <<'PY'
+import sys
+path, old, new = sys.argv[1:]
+text = open(path).read()
+if text.count(old) != 1:
+    raise SystemExit(f"expected exactly one {old!r}, found {text.count(old)}")
+open(path, "w").write(text.replace(old, new, 1))
+PY
+REGISTRY_AUTH_WORK="$WORK/registry-authority-mutant-$REGISTRY_AUTH_DISTRO"
+rm -rf "$REGISTRY_AUTH_WORK"
+REGISTRY_AUTH_OUT=$("$PRODUCER" "$SRCTREE" "$REGISTRY_AUTH_WORK" "$REGISTRY_AUTH_DISTRO" 2>&1)
+REGISTRY_AUTH_RC=$?
+cp "$SNAPSHOT" "$PRODUCER"
+if ! cmp -s "$PRODUCER" "$SNAPSHOT"; then
+    echo "RED: producer restoration is not byte-exact after expected-digest mutant" >&2
+    exit 1
+fi
+if [ "$REGISTRY_AUTH_RC" = 0 ]; then
+    echo "RED: alternate valid registry tag was accepted as authority" >&2
+    exit 1
+fi
+REGISTRY_AUTH_FAIL=$(printf '%s\n' "$REGISTRY_AUTH_OUT" | grep -E '^FAIL: ' | head -1)
+case "$REGISTRY_AUTH_FAIL" in
+    *image_digest_authority*)
+        echo "GREEN: alternate valid registry tag rejected by committed authority -- $REGISTRY_AUTH_FAIL"
+        ;;
+    *)
+        echo "RED: alternate valid registry tag failed at the wrong check: $REGISTRY_AUTH_FAIL" >&2
+        exit 1
+        ;;
+esac
+
 # LOCAL-ID CHANNEL DECOY: mirrors the registry-digest channel's
 # corrupt-control=image-digest row (which substitutes a locally-built
 # decoy image to force empty RepoDigests -> UNRESOLVED), but against
@@ -503,10 +598,13 @@ matrix_label() {
     case "$1" in
         icecc)               echo installed_icecc_version_output ;;
         icecc-create-env)     echo installed_icecc_create_env ;;
-        iceccd)               echo installed_iceccd_1590_match_count ;;
-        icecc-scheduler)      echo installed_scheduler_1590_match_count ;;
+        iceccd|iceccd-competing)
+                              echo installed_iceccd_identity_total_count ;;
+        icecc-scheduler|icecc-scheduler-competing)
+                              echo installed_scheduler_identity_total_count ;;
         libicecc.a)           echo installed_libicecc_a ;;
-        icecc.pc)             echo installed_icecc_pc_1590_match_count ;;
+        icecc.pc|icecc.pc-competing)
+                              echo installed_icecc_pc_version_total_count ;;
         image-digest)
             if [ "$MATRIX_DISTRO" = ubuntu22 ]; then
                 echo image_id_pin_check
@@ -518,7 +616,7 @@ matrix_label() {
         build-log)            echo configure_log ;;
     esac
 }
-for artifact in icecc icecc-create-env iceccd icecc-scheduler libicecc.a icecc.pc image-digest package-inventory build-log; do
+for artifact in icecc icecc-create-env iceccd iceccd-competing icecc-scheduler icecc-scheduler-competing libicecc.a icecc.pc icecc.pc-competing image-digest package-inventory build-log; do
     MATRIX_WORK="$WORK/matrix-$artifact"
     rm -rf "$MATRIX_WORK"; mkdir -p "$MATRIX_WORK"
     if [ "$artifact" != image-digest ]; then
@@ -562,4 +660,4 @@ for artifact in icecc icecc-create-env iceccd icecc-scheduler libicecc.a icecc.p
 done
 [ "$MATRIX_FAIL" = "0" ] || { echo "PER-ARTIFACT MATRIX: RED"; exit 1; }
 echo
-echo "PER-ARTIFACT MATRIX: GREEN (all 9 artifacts, corrupted one at a time, each failed naming itself, SRCTREE byte-identical to its pre-matrix baseline after every row)"
+echo "PER-ARTIFACT MATRIX: GREEN (all 12 absence/wrong/competing-identity controls, corrupted one at a time, each failed naming itself, SRCTREE byte-identical to its pre-matrix baseline after every row)"
