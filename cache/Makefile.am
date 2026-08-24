@@ -125,9 +125,15 @@ EXTRA_DIST = \
 	formal/Protocol50GlobalReverseSlotMutant.cfg \
 	formal/Protocol50GlobalContentMutant.cfg \
 	formal/Protocol50GlobalStallMutant.cfg \
+	formal/Protocol50GlobalLocalLruMutant.cfg \
+	formal/Protocol50GlobalLifecycleResetMutant.cfg \
+	formal/Protocol50GlobalCrossGuidMutant.cfg \
+	formal/Protocol50GlobalStagingCapMutant.cfg \
+	formal/Protocol50GlobalTotalCapMutant.cfg \
 	formal/Protocol50GlobalTrace.md \
 	formal/check_global_trace.py \
 	formal/global-trace.jsonl \
+	formal/global-fresh-cycle.jsonl \
 	formal/global-admit-at-terminal-generation.jsonl \
 	formal/run_global_trace_gate.sh \
 	formal/run_global_tlc.sh \

@@ -29,13 +29,19 @@ CONSTANTS N0, N1, K0, K1, S0, S1,
           G0, G1, G2, NoGuid, NoKey, NoNamespace, NoOwner,
           NoContent, V0, V1,
           MaxGeneration, MaxAggregateBytes, MaxNamespaceBytes,
+          MaxStagingBytes, MaxTotalBytes,
           MutantIgnoreAggregateCap,
           MutantIgnoreNamespaceCap,
+          MutantIgnoreStagingCap,
+          MutantIgnoreTotalCap,
           MutantIgnoreSlotOwnership,
           MutantIgnoreLru,
+          MutantLocalLru,
           MutantWrapGeneration,
           MutantAdmitWhileStopped,
           MutantReuseGuid,
+          MutantCrossNamespaceAlias,
+          MutantKeepLifecycleOnEvict,
           MutantIgnoreConflict,
           MutantCrashKeepsSlot,
           MutantBadContent,
@@ -59,13 +65,21 @@ ASSUME /\ N0 # N1
        /\ MaxAggregateBytes \in Nat
        /\ MaxNamespaceBytes \in Nat
        /\ MaxAggregateBytes >= MaxNamespaceBytes
+       /\ MaxStagingBytes \in Nat
+       /\ MaxTotalBytes \in Nat
+       /\ MaxTotalBytes >= MaxAggregateBytes
        /\ MutantIgnoreAggregateCap \in BOOLEAN
        /\ MutantIgnoreNamespaceCap \in BOOLEAN
+       /\ MutantIgnoreStagingCap \in BOOLEAN
+       /\ MutantIgnoreTotalCap \in BOOLEAN
        /\ MutantIgnoreSlotOwnership \in BOOLEAN
        /\ MutantIgnoreLru \in BOOLEAN
+       /\ MutantLocalLru \in BOOLEAN
        /\ MutantWrapGeneration \in BOOLEAN
        /\ MutantAdmitWhileStopped \in BOOLEAN
        /\ MutantReuseGuid \in BOOLEAN
+       /\ MutantCrossNamespaceAlias \in BOOLEAN
+       /\ MutantKeepLifecycleOnEvict \in BOOLEAN
        /\ MutantIgnoreConflict \in BOOLEAN
        /\ MutantCrashKeepsSlot \in BOOLEAN
        /\ MutantBadContent \in BOOLEAN
@@ -80,7 +94,10 @@ Values == {V0, V1}
 ObjectStates == {"ABSENT", "INSTALLING", "PRESENT", "PINNED"}
 NoOwnerValue == <<NoNamespace, NoKey>>
 
-CanonicalValue(k) == IF k = K0 THEN V0 ELSE V1
+CanonicalValue(n, k) ==
+    IF k = K0
+    THEN IF n = N0 THEN V0 ELSE V1
+    ELSE IF n = N0 THEN V1 ELSE V0
 ObjectBytes(k) == IF k = K0 THEN 2 ELSE 3
 Owner(n, k) == <<n, k>>
 
@@ -91,8 +108,9 @@ Init ==
     /\ s = [live                 |-> [n \in Namespaces |-> FALSE],
          evicted              |-> [n \in Namespaces |-> FALSE],
          admissionCount       |-> [n \in Namespaces |-> 0],
-         guid                 |-> [n \in Namespaces |-> G0],
-         guidHistory          |-> [n \in Namespaces |-> {G0}],
+         guid                 |-> [n \in Namespaces |-> IF n = N0 THEN G0 ELSE G2],
+         guidHistory          |-> [n \in Namespaces |->
+                                      {IF n = N0 THEN G0 ELSE G2}],
          generation           |-> [n \in Namespaces |-> 0],
          generationSeen       |-> [n \in Namespaces |-> {0}],
          admissionStopped     |-> [n \in Namespaces |-> FALSE],
@@ -101,12 +119,17 @@ Init ==
          touchCount           |-> [n \in Namespaces |-> 0],
          active               |-> [n \in Namespaces |-> FALSE],
          tuUsed               |-> [n \in Namespaces |-> FALSE],
+         freshAdmissionPending |-> [n \in Namespaces |-> FALSE],
          arena                |-> [n \in Namespaces |->
                                       [k \in Keys |-> "ABSENT"]],
          content              |-> [n \in Namespaces |->
                                       [k \in Keys |-> NoContent]],
          stagingContent       |-> [n \in Namespaces |->
                                       [k \in Keys |-> NoContent]],
+         arenaGuid            |-> [n \in Namespaces |->
+                                      [k \in Keys |-> NoGuid]],
+         arenaGeneration      |-> [n \in Namespaces |->
+                                      [k \in Keys |-> 0]],
          installAttempts      |-> [n \in Namespaces |->
                                       [k \in Keys |-> 0]],
          pinUsed              |-> [n \in Namespaces |->
@@ -133,11 +156,12 @@ Init ==
          badGuidReuse          |-> FALSE,
          badConflict           |-> FALSE,
          badCrash              |-> FALSE,
-         badContent            |-> FALSE]
+         badContent            |-> FALSE,
+         badCrossNamespaceGuid |-> FALSE]
     /\ step = 0
 
 WatchdogLimit == 2
-MaxSteps == 8
+MaxSteps == 14
 
 WriterWorkEnabled(st, n, k) ==
     /\ st.arena[n][k] = "INSTALLING"
@@ -152,6 +176,16 @@ NsBytes(st, n) ==
     ByteCharge(st, n, K0) + ByteCharge(st, n, K1)
 
 TotalBytes(st) == NsBytes(st, N0) + NsBytes(st, N1)
+
+StagingBytes(st, n, k) ==
+    IF st.arena[n][k] = "INSTALLING" THEN ObjectBytes(k) ELSE 0
+
+NsStagingBytes(st, n) ==
+    StagingBytes(st, n, K0) + StagingBytes(st, n, K1)
+
+TotalStagingBytes(st) == NsStagingBytes(st, N0) + NsStagingBytes(st, N1)
+
+TotalSimultaneousBytes(st) == TotalBytes(st) + TotalStagingBytes(st)
 
 Installing(st, n) ==
     {k \in Keys : st.arena[n][k] = "INSTALLING"}
@@ -176,9 +210,28 @@ ClearNamespace(st, n) ==
         !.live[n] = FALSE,
         !.evicted[n] = TRUE,
         !.active[n] = FALSE,
+        !.tuUsed[n] = IF MutantKeepLifecycleOnEvict THEN st.tuUsed[n] ELSE FALSE,
+        !.freshAdmissionPending[n] = FALSE,
         !.arena[n] = [k \in Keys |-> "ABSENT"],
         !.content[n] = [k \in Keys |-> NoContent],
         !.stagingContent[n] = [k \in Keys |-> NoContent],
+        !.arenaGuid[n] = [k \in Keys |-> NoGuid],
+        !.arenaGeneration[n] = [k \in Keys |-> st.generation[n]],
+        !.installAttempts[n] = [k \in Keys |->
+                                  IF MutantKeepLifecycleOnEvict
+                                  THEN st.installAttempts[n][k] ELSE 0],
+        !.pinUsed[n] = [k \in Keys |->
+                          IF MutantKeepLifecycleOnEvict
+                          THEN st.pinUsed[n][k] ELSE FALSE],
+        !.crashed[n] = [k \in Keys |->
+                          IF MutantKeepLifecycleOnEvict
+                          THEN st.crashed[n][k] ELSE FALSE],
+        !.retrySeen[n] = [k \in Keys |->
+                            IF MutantKeepLifecycleOnEvict
+                            THEN st.retrySeen[n][k] ELSE FALSE],
+        !.conflictSeen[n] = [k \in Keys |->
+                               IF MutantKeepLifecycleOnEvict
+                               THEN st.conflictSeen[n][k] ELSE FALSE],
         !.writerBlocked[n] = [k \in Keys |-> FALSE],
         !.watchdogCount[n] = [k \in Keys |-> 0],
         !.slotOwner = [slot \in Slots |->
@@ -197,6 +250,9 @@ ADMIT_NAMESPACE(n) ==
                     !.live[n] = TRUE,
                     !.evicted[n] = FALSE,
                     !.admissionCount[n] = @ + 1,
+                    !.freshAdmissionPending = [m \in Namespaces |->
+                        IF m = n THEN s.admissionCount[n] = 1
+                        ELSE s.freshAdmissionPending[m]],
                     !.badAdmission = @ \/ rejected \/
                         (s.generation[n] = MaxGeneration /\
                          ~s.admissionStopped[n])]
@@ -204,11 +260,10 @@ ADMIT_NAMESPACE(n) ==
 TOUCH_NAMESPACE(n) ==
     /\ n \in Namespaces
     /\ s.live[n]
-    /\ s.touchCount[n] = 0
     /\ s' = [s EXCEPT
                  !.clock = @ + 1,
-                 !.lru[n] = @ + 1,
-                 !.touchCount[n] = 1]
+                 !.lru[n] = IF MutantLocalLru THEN s.lru[n] + 1 ELSE s.clock + 1,
+                 !.touchCount[n] = @ + 1]
 
 START_TU(n) ==
     /\ n \in Namespaces
@@ -217,7 +272,8 @@ START_TU(n) ==
     /\ ~s.tuUsed[n]
     /\ s' = [s EXCEPT
                  !.active[n] = TRUE,
-                 !.tuUsed[n] = TRUE]
+                 !.tuUsed[n] = TRUE,
+                 !.freshAdmissionPending[n] = FALSE]
 
 FINISH_TU(n) ==
     /\ n \in Namespaces
@@ -237,13 +293,20 @@ BEGIN_INSTALL(n, k, slot, value) ==
        /\ slot \in Slots
        /\ value \in Values
        /\ s.live[n]
+       /\ s.active[n]
        /\ s.arena[n][k] = "ABSENT"
        /\ ~s.crashed[n][k]
        /\ s.installAttempts[n][k] = 0
        /\ (s.slotOwner[slot] = NoOwnerValue \/ MutantIgnoreSlotOwnership)
+       /\ (TotalStagingBytes(s) + ObjectBytes(k) <= MaxStagingBytes \/
+             MutantIgnoreStagingCap)
+       /\ (TotalSimultaneousBytes(s) + ObjectBytes(k) <= MaxTotalBytes \/
+             MutantIgnoreTotalCap)
        /\ s' = [s EXCEPT
                     !.arena[n][k] = "INSTALLING",
                     !.stagingContent[n][k] = value,
+                    !.arenaGuid[n][k] = s.guid[n],
+                    !.arenaGeneration[n][k] = s.generation[n],
                     !.installAttempts[n][k] = 1,
                     !.slotOwner[slot] = Owner(n, k),
                     !.retrySeen[n][k] = @ \/ wasRetry,
@@ -257,11 +320,18 @@ RETRY_INSTALL(n, k, slot, value) ==
     /\ s.crashed[n][k]
     /\ s.arena[n][k] = "ABSENT"
     /\ s.live[n]
+    /\ s.active[n]
     /\ s.installAttempts[n][k] = 1
     /\ s.slotOwner[slot] = NoOwnerValue
+    /\ (TotalStagingBytes(s) + ObjectBytes(k) <= MaxStagingBytes \/
+          MutantIgnoreStagingCap)
+    /\ (TotalSimultaneousBytes(s) + ObjectBytes(k) <= MaxTotalBytes \/
+          MutantIgnoreTotalCap)
     /\ s' = [s EXCEPT
                  !.arena[n][k] = "INSTALLING",
                  !.stagingContent[n][k] = value,
+                 !.arenaGuid[n][k] = s.guid[n],
+                 !.arenaGeneration[n][k] = s.generation[n],
                  !.installAttempts[n][k] = 2,
                  !.slotOwner[slot] = Owner(n, k),
                  !.retrySeen[n][k] = TRUE]
@@ -270,7 +340,7 @@ PUBLISH_INSTALL(n, k, slot) ==
     LET value == s.stagingContent[n][k]
         nextNamespaceBytes == NsBytes(s, n) + ObjectBytes(k)
         nextTotalBytes == TotalBytes(s) + ObjectBytes(k)
-        canonical == value = CanonicalValue(k)
+        canonical == value = CanonicalValue(n, k)
     IN /\ n \in Namespaces
        /\ k \in Keys
        /\ slot \in Slots
@@ -285,7 +355,7 @@ PUBLISH_INSTALL(n, k, slot) ==
        /\ s' = [s EXCEPT
                     !.arena[n][k] = "PRESENT",
                     !.content[n][k] =
-                        IF MutantBadContent THEN value ELSE CanonicalValue(k),
+                        IF MutantBadContent THEN value ELSE CanonicalValue(n, k),
                     !.stagingContent[n][k] = NoContent,
                     !.writerBlocked[n][k] = FALSE,
                     !.watchdogCount[n][k] = 0,
@@ -321,6 +391,8 @@ CRASH_MID_INSTALL(n, k, slot) ==
     /\ s' = [s EXCEPT
                  !.arena[n][k] = "ABSENT",
                  !.stagingContent[n][k] = NoContent,
+                 !.arenaGuid[n][k] = NoGuid,
+                 !.arenaGeneration[n][k] = s.generation[n],
                  !.writerBlocked[n][k] = FALSE,
                  !.watchdogCount[n][k] = 0,
                  !.slotOwner[slot] =
@@ -376,6 +448,10 @@ GUID_FLIP(n, newGuid) ==
     /\ newGuid \in Guids
     /\ s.admissionStopped[n]
     /\ (newGuid \notin s.guidHistory[n] \/ MutantReuseGuid)
+    /\ (MutantCrossNamespaceAlias \/
+        (\A other \in Namespaces : other # n =>
+             /\ s.guid[other] # newGuid
+             /\ newGuid \notin s.guidHistory[other]))
     /\ s' = [s EXCEPT
                  !.guid[n] = newGuid,
                  !.guidHistory[n] = @ \cup {newGuid},
@@ -383,7 +459,12 @@ GUID_FLIP(n, newGuid) ==
                  !.generationSeen[n] = {0},
                  !.admissionStopped[n] = FALSE,
                  !.evicted[n] = TRUE,
-                 !.badGuidReuse = @ \/ newGuid \in s.guidHistory[n]]
+                 !.badGuidReuse = @ \/ newGuid \in s.guidHistory[n],
+                 !.badCrossNamespaceGuid = @ \/
+                     \E other \in Namespaces :
+                         other # n /\
+                         (s.guid[other] = newGuid \/
+                          newGuid \in s.guidHistory[other])]
 
 STALL_WRITER(n, k) ==
     /\ MutantStallWriter
@@ -449,13 +530,16 @@ TypeOK ==
     /\ s.admissionStopped \in [Namespaces -> BOOLEAN]
     /\ s.lru \in [Namespaces -> Nat]
     /\ s.clock \in Nat
-    /\ s.touchCount \in [Namespaces -> 0..1]
+    /\ s.touchCount \in [Namespaces -> Nat]
     /\ step \in 0..MaxSteps
     /\ s.active \in [Namespaces -> BOOLEAN]
     /\ s.tuUsed \in [Namespaces -> BOOLEAN]
+    /\ s.freshAdmissionPending \in [Namespaces -> BOOLEAN]
     /\ s.arena \in [Namespaces -> [Keys -> ObjectStates]]
     /\ s.content \in [Namespaces -> [Keys -> Values \cup {NoContent}]]
     /\ s.stagingContent \in [Namespaces -> [Keys -> Values \cup {NoContent}]]
+    /\ s.arenaGuid \in [Namespaces -> [Keys -> Guids \cup {NoGuid}]]
+    /\ s.arenaGeneration \in [Namespaces -> [Keys -> Generations]]
     /\ s.installAttempts \in [Namespaces -> [Keys -> 0..2]]
     /\ s.pinUsed \in [Namespaces -> [Keys -> BOOLEAN]]
     /\ s.slotOwner \in [Slots -> (Namespaces \X Keys) \cup {NoOwnerValue}]
@@ -482,6 +566,10 @@ AggregateByteCap == TotalBytes(s) <= MaxAggregateBytes
 NamespaceByteCaps ==
     \A n \in Namespaces : NsBytes(s, n) <= MaxNamespaceBytes
 
+StagingByteCap == TotalStagingBytes(s) <= MaxStagingBytes
+
+TotalSimultaneousByteCap == TotalSimultaneousBytes(s) <= MaxTotalBytes
+
 SlotOwners(st, slot) ==
     {owner \in (Namespaces \X Keys) :
         st.slotOwner[slot] = owner}
@@ -507,18 +595,48 @@ ArenaStateMachine ==
     \A n \in Namespaces, k \in Keys :
         /\ s.arena[n][k] = "ABSENT" =>
                /\ s.content[n][k] = NoContent
-               /\ s.stagingContent[n][k] = NoContent \/
-                   s.stagingContent[n][k] \in Values
-        /\ s.arena[n][k] = "INSTALLING" =>
-               s.stagingContent[n][k] \in Values
-        /\ s.arena[n][k] \in {"PRESENT", "PINNED"} =>
-               /\ s.content[n][k] = CanonicalValue(k)
                /\ s.stagingContent[n][k] = NoContent
+               /\ s.arenaGuid[n][k] = NoGuid
+        /\ s.arena[n][k] = "INSTALLING" =>
+               /\ s.stagingContent[n][k] \in Values
+               /\ s.arenaGuid[n][k] = s.guid[n]
+               /\ s.arenaGeneration[n][k] = s.generation[n]
+        /\ s.arena[n][k] \in {"PRESENT", "PINNED"} =>
+               /\ s.content[n][k] = CanonicalValue(n, k)
+               /\ s.stagingContent[n][k] = NoContent
+               /\ s.arenaGuid[n][k] = s.guid[n]
+               /\ s.arenaGeneration[n][k] = s.generation[n]
 
 ImmutableArenaContent ==
     \A n \in Namespaces, k \in Keys :
         s.arena[n][k] \in {"PRESENT", "PINNED"} =>
-            s.content[n][k] = CanonicalValue(k)
+            /\ s.content[n][k] = CanonicalValue(n, k)
+            /\ s.arenaGuid[n][k] = s.guid[n]
+            /\ s.arenaGeneration[n][k] = s.generation[n]
+
+LruOrderingWitness ==
+    \A n, other \in Namespaces :
+        n # other /\ s.touchCount[n] > 0 /\ s.touchCount[other] > 0 =>
+            s.lru[n] # s.lru[other]
+
+FreshAdmissionReady ==
+    \A n \in Namespaces : s.freshAdmissionPending[n] =>
+        /\ s.live[n]
+        /\ ~s.active[n]
+        /\ ~s.tuUsed[n]
+        /\ (\A k \in Keys :
+             /\ s.installAttempts[n][k] = 0
+             /\ ~s.pinUsed[n][k]
+             /\ ~s.crashed[n][k]
+             /\ ~s.retrySeen[n][k]
+             /\ ~s.conflictSeen[n][k])
+
+CrossNamespaceGuidIsolation ==
+    \A n, other \in Namespaces : n # other => s.guid[n] # s.guid[other]
+
+CrossNamespaceGuidHistoryIsolation ==
+    \A n, other \in Namespaces : n # other =>
+        s.guidHistory[n] \cap s.guidHistory[other] = {}
 
 ConflictIsFatal ==
     \A n \in Namespaces, k \in Keys :
@@ -549,7 +667,7 @@ GuidFlipIsFresh ==
 CrashMidInstallIsIdempotent ==
     \A n \in Namespaces, k \in Keys :
         s.crashed[n][k] =>
-            /\ s.content[n][k] \in {NoContent, CanonicalValue(k)}
+            /\ s.content[n][k] \in {NoContent, CanonicalValue(n, k)}
             /\ (s.arena[n][k] # "ABSENT" =>
                    s.arena[n][k] = "INSTALLING" \/
                    s.arena[n][k] \in {"PRESENT", "PINNED"})
@@ -565,6 +683,7 @@ NoMutantFaults ==
     /\ ~s.badConflict
     /\ ~s.badCrash
     /\ ~s.badContent
+    /\ ~s.badCrossNamespaceGuid
 
 WatchdogNoStall == ~s.watchdogExpired
 

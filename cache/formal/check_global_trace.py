@@ -36,11 +36,16 @@ ACTIONS = {
 MAX_GENERATION = 1
 MAX_AGGREGATE_BYTES = 6
 MAX_NAMESPACE_BYTES = 5
+MAX_STAGING_BYTES = 5
+MAX_TOTAL_BYTES = 11
 SLOTS = {"slot0", "slot1"}
 NAMESPACES = {"n0", "n1"}
 KEYS = {"k0", "k1"}
 GUIDS = {"guid0", "guid1", "guid2"}
-CANONICAL = {"k0": "content0", "k1": "content1"}
+CANONICAL = {
+    "n0": {"k0": "content0", "k1": "content1"},
+    "n1": {"k0": "content1", "k1": "content0"},
+}
 OBJECT_BYTES = {"k0": 2, "k1": 3}
 
 
@@ -55,14 +60,19 @@ def check(path: Path) -> None:
         n: {
             "live": False,
             "evicted": False,
-            "guid": "guid0",
-            "history": {"guid0"},
+            "admission_count": 0,
+            "guid": "guid0" if n == "n0" else "guid2",
+            "history": {"guid0"} if n == "n0" else {"guid2"},
             "generation": 0,
             "stopped": False,
             "lru": 0,
             "active": False,
+            "tu_used": False,
+            "fresh_pending": False,
             "objects": {k: {"state": "ABSENT", "content": None} for k in KEYS},
             "crashed": set(),
+            "attempts": {k: 0 for k in KEYS},
+            "conflicts": {k: False for k in KEYS},
         }
         for n in NAMESPACES
     }
@@ -79,6 +89,16 @@ def check(path: Path) -> None:
 
     def total_bytes() -> int:
         return sum(ns_bytes(n) for n in NAMESPACES)
+
+    def staging_bytes(n: str) -> int:
+        return sum(
+            OBJECT_BYTES[k]
+            for k, obj in state[n]["objects"].items()
+            if obj["state"] == "INSTALLING"
+        )
+
+    def total_staging_bytes() -> int:
+        return sum(staging_bytes(n) for n in NAMESPACES)
 
     def installing(n: str) -> set[str]:
         return {
@@ -101,6 +121,10 @@ def check(path: Path) -> None:
     def check_caps(index: int) -> None:
         if total_bytes() > MAX_AGGREGATE_BYTES:
             raise ValueError(f"line {index}: aggregate byte cap exceeded")
+        if total_staging_bytes() > MAX_STAGING_BYTES:
+            raise ValueError(f"line {index}: staging byte cap exceeded")
+        if total_bytes() + total_staging_bytes() > MAX_TOTAL_BYTES:
+            raise ValueError(f"line {index}: total simultaneous byte cap exceeded")
         for n in NAMESPACES:
             if ns_bytes(n) > MAX_NAMESPACE_BYTES:
                 raise ValueError(f"line {index}: namespace byte cap exceeded for {n}")
@@ -124,8 +148,16 @@ def check(path: Path) -> None:
                 raise ValueError(f"line {index}: admission after generation wrap stop")
             if current["generation"] >= MAX_GENERATION:
                 raise ValueError(f"line {index}: admission at terminal generation")
+            guid = require(row, "guid", index)
+            generation = require(row, "generation", index)
+            if guid != current["guid"]:
+                raise ValueError(f"line {index}: admission GUID does not match namespace")
+            if generation != current["generation"]:
+                raise ValueError(f"line {index}: admission generation does not match namespace")
             current["live"] = True
             current["evicted"] = False
+            current["admission_count"] += 1
+            current["fresh_pending"] = current["admission_count"] == 2
 
         elif action == "NAMESPACE_TOUCHED":
             if not current["live"]:
@@ -137,9 +169,11 @@ def check(path: Path) -> None:
             current["lru"] = next_clock
 
         elif action == "TU_STARTED":
-            if not current["live"] or current["active"]:
+            if not current["live"] or current["active"] or current["tu_used"]:
                 raise ValueError(f"line {index}: invalid TU start")
             current["active"] = True
+            current["tu_used"] = True
+            current["fresh_pending"] = False
 
         elif action == "TU_FINISHED":
             if not current["active"] or installing(namespace):
@@ -153,28 +187,48 @@ def check(path: Path) -> None:
             key = require(row, "key", index)
             slot = require(row, "slot", index)
             content = require(row, "content_digest", index)
-            if key not in KEYS or slot not in SLOTS or content not in CANONICAL.values():
+            guid = require(row, "guid", index)
+            generation = require(row, "generation", index)
+            if key not in KEYS or slot not in SLOTS or content not in CANONICAL[namespace].values():
                 raise ValueError(f"line {index}: invalid install identity")
+            if guid != current["guid"] or generation != current["generation"]:
+                raise ValueError(f"line {index}: arena identity does not match namespace")
             if not current["live"] or current["objects"][key]["state"] != "ABSENT":
                 raise ValueError(f"line {index}: install requires ABSENT live object")
+            if not current["active"]:
+                raise ValueError(f"line {index}: install requires active TU")
             if slots[slot] is not None:
                 raise ValueError(f"line {index}: staging slot is already owned")
-            if action == "ARENA_RETRY_INSTALLING" and key not in current["crashed"]:
-                raise ValueError(f"line {index}: retry without crashed INSTALLING state")
+            if total_staging_bytes() + OBJECT_BYTES[key] > MAX_STAGING_BYTES:
+                raise ValueError(f"line {index}: staging byte cap exceeded")
+            if total_bytes() + total_staging_bytes() + OBJECT_BYTES[key] > MAX_TOTAL_BYTES:
+                raise ValueError(f"line {index}: total simultaneous byte cap exceeded")
+            if action == "ARENA_RETRY_INSTALLING":
+                if key not in current["crashed"] or current["attempts"][key] != 1:
+                    raise ValueError(f"line {index}: retry without crashed INSTALLING state")
+            elif current["attempts"][key] != 0:
+                raise ValueError(f"line {index}: repeated initial install")
             slots[slot] = (namespace, key)
             current["objects"][key] = {"state": "INSTALLING", "content": content}
+            current["attempts"][key] += 1
 
         elif action == "ARENA_PRESENT":
             key = require(row, "key", index)
             slot = require(row, "slot", index)
             content = require(row, "content_digest", index)
+            guid = require(row, "guid", index)
+            generation = require(row, "generation", index)
             if key not in KEYS or slot not in SLOTS:
                 raise ValueError(f"line {index}: invalid PRESENT identity")
             if current["objects"][key]["state"] != "INSTALLING":
                 raise ValueError(f"line {index}: PRESENT without INSTALLING")
+            if guid != current["guid"] or generation != current["generation"]:
+                raise ValueError(f"line {index}: arena identity does not match namespace")
             if slots[slot] != (namespace, key):
                 raise ValueError(f"line {index}: PRESENT lost staging ownership")
-            if content != CANONICAL[key]:
+            if current["objects"][key]["content"] != content:
+                raise ValueError(f"line {index}: staged content changed before PRESENT")
+            if content != CANONICAL[namespace][key]:
                 raise ValueError(f"line {index}: immutable arena content changed")
             current["objects"][key] = {"state": "PRESENT", "content": content}
             slots[slot] = None
@@ -214,6 +268,9 @@ def check(path: Path) -> None:
                 raise ValueError(f"line {index}: conflict is not same-key/different-content")
             if current["objects"][key]["state"] not in {"PRESENT", "PINNED"}:
                 raise ValueError(f"line {index}: conflict lacks immutable existing object")
+            if current["conflicts"][key]:
+                raise ValueError(f"line {index}: repeated content conflict")
+            current["conflicts"][key] = True
             fatal = True
 
         elif action == "NAMESPACE_EVICTED":
@@ -227,6 +284,12 @@ def check(path: Path) -> None:
                 obj["content"] = None
             current["live"] = False
             current["evicted"] = True
+            current["crashed"] = set()
+            current["active"] = False
+            current["tu_used"] = False
+            current["fresh_pending"] = False
+            current["attempts"] = {k: 0 for k in KEYS}
+            current["conflicts"] = {k: False for k in KEYS}
             check_caps(index)
 
         elif action == "GENERATION_ADVANCED":
@@ -251,6 +314,13 @@ def check(path: Path) -> None:
                 raise ValueError(f"line {index}: GUID flip without admission stop")
             if guid in current["history"]:
                 raise ValueError(f"line {index}: GUID was reused after wrap")
+            if any(
+                other != namespace and (
+                    state[other]["guid"] == guid or guid in state[other]["history"]
+                )
+                for other in NAMESPACES
+            ):
+                raise ValueError(f"line {index}: GUID aliases another namespace")
             current["guid"] = guid
             current["history"].add(guid)
             current["generation"] = 0

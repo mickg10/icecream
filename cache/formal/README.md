@@ -31,7 +31,8 @@ Protocol50IncarnationBridge.tla
 
 Protocol50Global.tla
     the S3 model-first global resource boundary: two C namespaces share an
-    aggregate byte cap and staging slots; each namespace owns an immutable
+    aggregate resident byte cap, an explicit staging-byte cap, and staging
+    slots; each namespace owns an immutable
     ABSENT -> INSTALLING -> PRESENT -> PINNED arena, whole-namespace LRU
     eviction, crash/retry cleanup, and generation-wrap admission stop/GUID
     flip. `check_global_trace.py` and `run_global_trace_gate.sh` bind the
@@ -65,7 +66,7 @@ The older experimental model under `formal/protocol50/` on the capability branch
 ## S3 global model limits
 
 `Protocol50Global.tla` is intentionally bounded to two namespaces, two keys,
-two staging slots, three GUID values, `MaxGeneration = 1`, and an eight-action
+two staging slots, three GUID values, `MaxGeneration = 1`, and a fourteen-action
 TLC horizon in its checked configuration. It proves the ordering and
 ownership rules at that bound; it does not prove an unbounded namespace count,
 byte arithmetic overflow behavior, persistence durability, or scheduler
@@ -73,9 +74,12 @@ fairness. The writer stall mutant is a deterministic, fail-closed watchdog
 witness: `STALL_WRITER` can mark only an actually enabled, slot-owned
 `INSTALLING` writer; only `WATCHDOG_TICK` may advance its counter; and
 `WatchdogNoStall` rejects the finite deadline. This is not an unbounded
-liveness claim.
-The product S3 claim remains blocked until the pinned TLC rows and the
-corresponding product watchdog/eviction gates are run on the exact candidate.
+liveness claim. The resident cap is six bytes, the aggregate staging cap is
+five bytes, and the total simultaneous resident-plus-staging cap is eleven
+bytes. A publish transfers an already-reserved staging charge into resident
+charge; it does not double-count the object. The product S3 claim remains
+blocked until the pinned TLC rows and the corresponding product
+watchdog/eviction gates are run on the exact candidate.
 
 ## Cache-model rules
 

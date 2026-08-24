@@ -100,5 +100,10 @@ run_expected_failure reverse-slot Protocol50GlobalReverseSlotMutant.cfg \
     EveryOwnedSlotHasInstallingArena
 run_expected_failure content Protocol50GlobalContentMutant.cfg ImmutableArenaContent
 run_expected_failure stall Protocol50GlobalStallMutant.cfg WatchdogNoStall
+run_expected_failure local-lru Protocol50GlobalLocalLruMutant.cfg LruOrderingWitness
+run_expected_failure lifecycle-reset Protocol50GlobalLifecycleResetMutant.cfg FreshAdmissionReady
+run_expected_failure cross-guid Protocol50GlobalCrossGuidMutant.cfg CrossNamespaceGuidIsolation
+run_expected_failure staging-cap Protocol50GlobalStagingCapMutant.cfg StagingByteCap
+run_expected_failure total-cap Protocol50GlobalTotalCapMutant.cfg TotalSimultaneousByteCap
 
 echo "run_global_tlc.sh: bounded global model and caught mutants passed"

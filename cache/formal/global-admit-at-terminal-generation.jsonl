@@ -1,4 +1,4 @@
-{"action":"NAMESPACE_ADMITTED","namespace":"n0"}
+{"action":"NAMESPACE_ADMITTED","namespace":"n0","guid":"guid0","generation":0}
 {"action":"NAMESPACE_EVICTED","namespace":"n0"}
 {"action":"GENERATION_ADVANCED","namespace":"n0","generation":1}
-{"action":"NAMESPACE_ADMITTED","namespace":"n0"}
+{"action":"NAMESPACE_ADMITTED","namespace":"n0","guid":"guid0","generation":1}
