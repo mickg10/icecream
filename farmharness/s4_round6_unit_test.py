@@ -5,10 +5,13 @@ This intentionally does not launch Docker or call an SSH host.  It exercises
 the generated publication transaction with crafted archives and checks the
 source-level private-staging invariants that a remote farm run would amplify.
 """
+import ast
 import hashlib
 import json
 import os
 import pathlib
+import re
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -43,6 +46,16 @@ def run_publish(tmp, tar_path, manifest, root_name="root"):
     result = subprocess.run(["bash", "-c", script], env=env,
                             text=True, capture_output=True)
     return result
+
+
+def function_call_count(source, function_name, callee_name):
+    tree = ast.parse(source)
+    function = next(node for node in ast.walk(tree)
+                    if isinstance(node, ast.FunctionDef) and node.name == function_name)
+    return sum(1 for node in ast.walk(function)
+               if isinstance(node, ast.Call)
+               and isinstance(node.func, ast.Name)
+               and node.func.id == callee_name)
 
 
 def main():
@@ -92,10 +105,19 @@ def main():
               "per-file tar size mismatch was not rejected before extraction")
 
         src = (HERE / "farm.py").read_text()
+        publish_script = farm._publish_script("p50", base,
+                                              "~/role-artifacts/store/p50/size-column",
+                                              "$HOME/bundle.tar", None)
+        check(re.search(r"TAR_TOTAL_SIZE=.*?sum\+=\$3", publish_script, re.DOTALL) is not None,
+              "tar aggregate-size cap is not summing GNU tar's size column ($3)")
         check("--tmpfs /work:rw,exec" in src and "/artifact-source:ro" in src,
               "S/F/C do not mount a private work tmpfs beside the read-only source")
         check("/proc/self/fd/" not in src and "ROLE_BINARY_FD" not in src,
               "live-bind FD execution remains in the production source")
+        check(function_call_count(src, "up", "_artifact_stage_prefix") == 2,
+              "up() no longer inserts private staging at both S and F production callsites")
+        check(function_call_count(src, "run_client", "_artifact_stage_prefix") == 1,
+              "run_client() no longer inserts private staging at the C production callsite")
         stage = farm._artifact_stage_prefix("p50", "stage-token")
         check("'" not in stage,
               "artifact staging prefix contains a single quote and can break Docker's embedded bash -c")
@@ -104,6 +126,60 @@ def main():
                        "/artifact-source/obj/daemon/iceccd",
                        "stat -c %s", "ARTIFACT-STAGED-OK-stage-token"):
             check(needle in stage, f"private closure stage missing {needle!r}")
+
+        # Execute the generated shell, not just source-grep it. The exact
+        # round-6 predecessor emitted `find -printf %P\\n` without quoting
+        # the format, so bash consumed the backslash and every selected
+        # launch failed with an inventory named `...n`. A one-file closure
+        # is the smallest production-shaped discriminator for that bug.
+        original_load_manifest = farm.load_manifest
+        farm.load_manifest = lambda _binary_set: base
+        try:
+            executable_stage = farm._artifact_stage_prefix("p50", "executed-stage")
+        finally:
+            farm.load_manifest = original_load_manifest
+        source_root = tmp / "artifact-source"
+        private_root = tmp / "private-work"
+        source_file = source_root / "obj/client/icecc"
+        source_file.parent.mkdir(parents=True)
+        source_file.write_bytes(payload)
+        source_file.chmod(0o555)
+        private_root.mkdir()
+        local_stage = (executable_stage
+                       .replace("/artifact-source", str(source_root))
+                       .replace("/work", str(private_root)))
+        executed = subprocess.run(["bash", "-c", local_stage], text=True,
+                                  capture_output=True)
+        check(executed.returncode == 0 and "ARTIFACT-STAGED-OK-executed-stage" in executed.stdout,
+              f"generated private-stage shell rejected an exact closure: "
+              f"rc={executed.returncode} out={executed.stdout!r} err={executed.stderr!r}")
+        staged_file = private_root / "obj/client/icecc"
+        check(staged_file.read_bytes() == payload and staged_file.stat().st_mode & 0o222 == 0,
+              "generated private-stage shell did not preserve exact bytes and harden them")
+
+        # The no-Git fallback itself is a committed gate. Run it from two
+        # different absolute extraction paths and require one nonempty,
+        # identical authority hash. This catches both the former
+        # absolute-path contamination and the `/bin/sh`-incompatible
+        # `read -d` loop that silently hashed zero rows.
+        labels = []
+        for name in ("no-git-A", "no-git-B"):
+            copied = tmp / name / "farmharness"
+            shutil.copytree(HERE, copied, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+            env = dict(os.environ,
+                       ARTIFACT_TEST_ONLY_FRESH="1",
+                       ARTIFACT_TEST_SCRATCH=str(tmp / f"scratch-{name}"))
+            result = subprocess.run([str(copied / "artifact_selection_test.sh")], env=env,
+                                    text=True, capture_output=True)
+            check(result.returncode == 0,
+                  f"no-Git gate failed from {name}: out={result.stdout!r} err={result.stderr!r}")
+            match = re.search(r"no-git tree-hash ([0-9a-f]{64})", result.stdout)
+            check(match is not None, f"no-Git gate emitted no authority hash from {name}")
+            labels.append(match.group(1))
+        check(labels[0] == labels[1],
+              f"no-Git authority hash depends on extraction path: {labels}")
+        check(labels[0] != hashlib.sha256(b"").hexdigest(),
+              "no-Git authority hash is the empty-input digest")
 
     print("s4-round6-local: PASS (staging invariants + pre-extraction extra/size mutants)")
 

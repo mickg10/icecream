@@ -368,7 +368,7 @@ TAR_BADTYPES=$(printf '%s\n' "$TAR_VERBOSE" | awk 'substr($1,1,1) !~ /^[-d]$/ {{
 if [ -n "$TAR_BADTYPES" ]; then
     echo "PUBLISH-TAR-HEADER-INVALID:non-regular-entry-type"; exit 10
 fi
-TAR_TOTAL_SIZE=$(printf '%s\n' "$TAR_VERBOSE" | awk 'substr($1,1,1) == "-" {{sum+=$4}} END{{print sum+0}}')
+TAR_TOTAL_SIZE=$(printf '%s\n' "$TAR_VERBOSE" | awk 'substr($1,1,1) == "-" {{sum+=$3}} END{{print sum+0}}')
 if [ "$TAR_TOTAL_SIZE" -gt 2147483648 ]; then
     echo "PUBLISH-TAR-HEADER-INVALID:total-size=$TAR_TOTAL_SIZE"; exit 10
 fi
@@ -977,7 +977,7 @@ def _artifact_stage_prefix(binary_set, token):
             f'if ! cp -- "/artifact-source/{p}" "/work/{p}"; then echo ARTIFACT-STAGE-FAIL; exit 98; fi',
         ])
     parts.extend([
-        "STAGE_INV=$(find /work -mindepth 1 ! -type d -printf %P\\n 2>/dev/null | sort)",
+        "STAGE_INV=$(find /work -mindepth 1 ! -type d -printf \"%P\\n\" 2>/dev/null | sort)",
         "EXPECTED_STAGE_INV=$(cat <<ARTIFACT_PATHS\n" + expected + "\nARTIFACT_PATHS\n)",
         'if [ "$STAGE_INV" != "$EXPECTED_STAGE_INV" ]; then echo ARTIFACT-STAGE-FAIL; exit 98; fi',
         "while read -r path sha size mode; do\n"

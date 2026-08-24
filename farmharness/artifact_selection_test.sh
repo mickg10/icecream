@@ -52,14 +52,40 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 
 tree_provenance_hash() {
     root=$1
-    ( cd "$root"
-      find . -type f -print0 | sort -z | while IFS= read -r -d '' rel; do
-          rel=${rel#./}
-          mode=$(stat -c %a -- "$rel")
-          hash=$(sha256sum -- "$rel" | cut -d' ' -f1)
-          printf '%s\t%s\t%s\n' "$rel" "$mode" "$hash"
-      done | sha256sum | cut -d' ' -f1
-    )
+    python3 - "$root" <<'PY'
+import hashlib
+import os
+import stat
+import sys
+
+root = os.path.realpath(sys.argv[1])
+rows = []
+for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+    for name in sorted(dirnames + filenames):
+        path = os.path.join(dirpath, name)
+        rel = os.path.relpath(path, root).replace(os.sep, "/")
+        st = os.lstat(path)
+        mode = stat.S_IMODE(st.st_mode)
+        if stat.S_ISLNK(st.st_mode):
+            raise SystemExit(f"tree provenance refuses symlink: {rel}")
+        if stat.S_ISDIR(st.st_mode):
+            rows.append((rel, "D", mode, 0, ""))
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            raise SystemExit(f"tree provenance refuses non-regular entry: {rel}")
+        digest = hashlib.sha256()
+        with open(path, "rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        rows.append((rel, "F", mode, st.st_size, digest.hexdigest()))
+
+authority = hashlib.sha256()
+for rel, kind, mode, size, digest in sorted(rows):
+    record = f"{kind}\t{rel}\t{mode:o}\t{size}\t{digest}\n".encode("utf-8")
+    authority.update(len(record).to_bytes(8, "big"))
+    authority.update(record)
+print(authority.hexdigest())
+PY
 }
 
 # probe SET ROLE -- prints the version-identity string reported by ROLE's
@@ -223,8 +249,10 @@ echo
 echo "== source anchor: the launch path cannot skip resolution, the whole-plan barrier, mutation-time revalidation, the race-gate seam, or in-command attestation without this test noticing =="
 for spec in "resolve_launch_plan:resolve_role:3" \
             "up:resolve_role:0" "up:revalidate_before_mutation:2" \
+            "up:_artifact_stage_prefix:2" \
             "up:_attestation_prefix:2" "up:wait_for_attestation:2" \
             "run_client:resolve_role:0" "run_client:revalidate_before_mutation:1" \
+            "run_client:_artifact_stage_prefix:1" \
             "run_client:_attestation_prefix:1" "run_client:docker_run_foreground_staged:1" \
             "run_client:verify_harness_scripts:1" "run_client:_build_harness_bundle:1" \
             "run_client:_harness_stage_verify:1" \
