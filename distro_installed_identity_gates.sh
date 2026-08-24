@@ -164,6 +164,27 @@ grep -qF 'docker run --rm --pull=never' "$WORK/source/distro_probe.sh" || {
     echo "RED: retained distro_probe.sh does not fail closed on implicit pulls" >&2
     exit 1
 }
+python3 - "$WORK/source/distro_installed_identity.sh" <<'PY'
+import sys
+
+text = open(sys.argv[1]).read()
+anchors = {
+    'require_exact "${label}_mode" "$mode" "$expected_mode"': 1,
+    'rows = json.load(stream)': 1,
+    'set(paths) != expected': 1,
+    'require_exact image_digest_authority "$IMAGE_DIGEST" "$PINNED_IMAGE_REF"': 1,
+    'require_count1 installed_iceccd_identity_total_count': 2,
+    'require_count1 installed_scheduler_identity_total_count': 2,
+    'require_count1 installed_icecc_pc_version_total_count': 2,
+}
+for needle, expected in anchors.items():
+    actual = text.count(needle)
+    if actual != expected:
+        raise SystemExit(
+            f"RED: installed-identity production anchor {needle!r}: "
+            f"expected {expected}, found {actual}")
+print("ok - installed manifest, mode, image-authority and exact-cardinality anchors are load-bearing")
+PY
 echo "ok - producer, retained probe and contract share immutable image authorities"
 
 # EXTRA_DIST-deletion mutant, BEFORE any docker-touching gate begins: a
