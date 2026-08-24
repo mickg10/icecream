@@ -113,6 +113,15 @@ static void set_tail_word(Bytes& bytes, size_t words_from_end, uint32_t value)
                 &value, sizeof(value));
 }
 
+// Sets a 64-bit tail field (assignment epoch or nonce) addressed by the
+// word-count-from-end of its HIGH word; the low word is one position closer
+// to the end. Used to hand-craft raw-frame identity-binding rows.
+static void set_tail_word64(Bytes& bytes, size_t hi_words_from_end, uint64_t value)
+{
+    set_tail_word(bytes, hi_words_from_end, static_cast<uint32_t>(value >> 32));
+    set_tail_word(bytes, hi_words_from_end - 1, static_cast<uint32_t>(value));
+}
+
 static Bytes remove_tail_words(Bytes bytes, size_t words)
 {
     const size_t removed = words * sizeof(uint32_t);
@@ -286,23 +295,29 @@ static UseCSMsg fixture_usecs()
     return use;
 }
 
-/* Byte-frozen genuine old-peer fixture (hardening pass on the rolling-
-   upgrade decode fix).  Captured once from an isolated build of the
-   pre-branch (a862, "Merge accepted R6 input seam into corrected
-   foundations") services/comm.{h,cpp} -- the actual bytes a protocol-50
-   UseCS peer built before this cache-handoff tail existed puts on the
-   wire -- rather than derived by trimming today's encoder output (which
-   would only prove the current build agrees with itself, not with a real
-   old binary).  Source values: UseCSMsg("x86_64", "cache-worker",
-   0x00002805, 0x0000beef, true, 7, 0, 0x1020304050607080,
-   0x8877665544332211) sent at protocol 50 through the a862 MsgChannel;
-   the four-word assignment-identity tail is the last thing that binary
-   ever writes into a UseCS frame, so this frame's `remaining` is exactly
-   0 bytes at the point the current decoder checks for the cache tail.
-   Independently roundtripped back through the a862 decoder before
-   freezing: job_id/port/hostname/host_platform/got_env/client_id/
-   matched_job_id/assignmentEpoch/assignmentNonce all matched the source
-   values exactly. */
+/* Byte-frozen SUPERSEDED-DRAFT PROVENANCE fixture -- NOT a compatibility
+   guarantee.  Captured once from an isolated build of the pre-branch
+   (a862, "Merge accepted R6 input seam into corrected foundations")
+   services/comm.{h,cpp} -- the actual bytes a protocol-50 UseCS peer built
+   before this cache-handoff tail existed puts on the wire -- rather than
+   derived by trimming today's encoder output (which would only prove the
+   current build agrees with itself, not with a real old binary).  Owner
+   ruling (d23d9c5d HOLD): protocol 50 is an in-development draft with no
+   deployed base, so this frame's absent tail (a862's binary never wrote
+   the three cache words at all, so `remaining` is exactly 0 bytes at the
+   point the decoder checks) is now REJECTED like any other malformed
+   50-frame -- the mandatory-tail law has exactly one legal encoding of
+   absence (three zero-valued words), not "tail omitted entirely".  This
+   fixture now proves the decoder DETECTS a pre-final-50 frame and refuses
+   it, which is the deployment-safety property that actually matters here;
+   it is deliberately kept, relabeled, rather than deleted, so that
+   property stays under test.  Source values: UseCSMsg("x86_64",
+   "cache-worker", 0x00002805, 0x0000beef, true, 7, 0,
+   0x1020304050607080, 0x8877665544332211) sent at protocol 50 through the
+   a862 MsgChannel.  Independently roundtripped back through the a862
+   decoder before freezing: job_id/port/hostname/host_platform/got_env/
+   client_id/matched_job_id/assignmentEpoch/assignmentNonce all matched the
+   source values exactly. */
 static const unsigned char kOldPeerUseCSFrame[] = {
     0x00, 0x00, 0x00, 0x44, 0x00, 0x00, 0x00, 0x48, 0x00, 0x00, 0xbe, 0xef,
     0x00, 0x00, 0x28, 0x05, 0x00, 0x00, 0x00, 0x0d, 0x63, 0x61, 0x63, 0x68,
@@ -425,40 +440,32 @@ static void test_usecs_p50_round_trip_and_validation()
     }
 
     {
-        /* Fixture A: the byte-frozen genuine old-peer frame (see
-           kOldPeerUseCSFrame above) must decode as a complete, valid
-           message carrying canonical cache-handoff absence -- and nothing
-           else about the message may be disturbed by the tri-state
-           decode. */
+        /* Fixture A (REJECT row -- superseded-draft provenance, not a
+           compat guarantee, see kOldPeerUseCSFrame's comment above): the
+           byte-frozen genuine old-peer frame carries NO cache tail at all
+           (remaining == 0 at the check point).  Under the mandatory-tail
+           law that is indistinguishable from any other malformed 50-frame
+           and must be rejected outright -- proving the decoder detects and
+           refuses a pre-final-50 peer rather than silently downgrading to
+           an "absent" projection for it. */
         Pair frozen_pair = make_pair(50);
         const bool wrote = send(frozen_pair.left->fd, kOldPeerUseCSFrame,
                                  sizeof(kOldPeerUseCSFrame), 0)
             == static_cast<ssize_t>(sizeof(kOldPeerUseCSFrame));
         Msg *wire = wrote ? frozen_pair.right->get_msg(2, true) : nullptr;
-        UseCSMsg *decoded = dynamic_cast<UseCSMsg *>(wire);
-        REQUIRE(decoded && !decoded->hasCacheAdvertisement()
-                    && decoded->cache_protocol == 0
-                    && decoded->cache_profile_mask == 0
-                    && decoded->job_id == UINT32_C(0x0000beef)
-                    && decoded->port == UINT32_C(0x00002805)
-                    && decoded->hostname == "cache-worker"
-                    && decoded->host_platform == "x86_64"
-                    && decoded->got_env == 1
-                    && decoded->client_id == UINT32_C(7)
-                    && decoded->matched_job_id == 0
-                    && decoded->assignmentEpoch() == UINT64_C(0x1020304050607080)
-                    && decoded->assignmentNonce() == UINT64_C(0x8877665544332211),
-                "P50 UseCS decoder accepts the byte-frozen genuine old-peer "
-                "frame (no tail at all) as canonical cache absence, message "
-                "otherwise intact");
+        REQUIRE(wrote && !wire,
+                "P50 UseCS decoder REJECTS the byte-frozen superseded-draft "
+                "old-peer frame (no tail at all) -- provenance/reject row, "
+                "not a compatibility guarantee");
         delete wire;
     }
     {
         /* Fixture B: the same frozen old-peer bytes, plus one more word as
            if a tail had started transmitting and been cut off (or
-           corrupted) partway.  remaining == 4 falls in the genuinely-short
-           1..11 byte range and must stay rejected -- this is what tells
-           "old peer, no tail" (fixture A) apart from "torn frame". */
+           corrupted) partway.  remaining == 4 != 12 and must stay
+           rejected, exactly like fixture A now -- both are malformed
+           50-frames under the mandatory-tail law, just via different
+           byte shapes. */
         const Bytes frozen(kOldPeerUseCSFrame,
                             kOldPeerUseCSFrame + sizeof(kOldPeerUseCSFrame));
         REQUIRE(decoder_rejects(append_word(frozen, UINT32_C(0x0000cafe))),
@@ -467,10 +474,19 @@ static void test_usecs_p50_round_trip_and_validation()
     }
 
     const Bytes valid = encode_usecs_frame(50, use);
+    REQUIRE(decoder_rejects(remove_tail_words(valid, 3)),
+            "P50 UseCS decoder rejects a wholly omitted cache-handoff tail "
+            "(mandatory tail: absence is value-encoded 0/0/0, never "
+            "omission)");
     REQUIRE(decoder_rejects(remove_tail_words(valid, 2)),
             "P50 UseCS decoder rejects a one-word cache-handoff tail");
     REQUIRE(decoder_rejects(remove_tail_words(valid, 1)),
             "P50 UseCS decoder rejects a two-word cache-handoff tail");
+    REQUIRE(decoder_rejects(append_word(valid, UINT32_C(0xdeadbeef))),
+            "P50 UseCS decoder rejects an over-length tail (valid frame "
+            "plus trailing bytes) -- caught directly by the exact "
+            "remaining==12 check, with MsgChannel's own exact-consumption "
+            "law as an independent second backstop");
     Bytes malformed_wire = valid;
     set_tail_word(malformed_wire, 3, 0);
     REQUIRE(decoder_rejects(malformed_wire),
@@ -487,6 +503,145 @@ static void test_usecs_p50_round_trip_and_validation()
     set_tail_word(malformed_wire, 1, UINT32_C(0x80000000));
     REQUIRE(decoder_rejects(malformed_wire),
             "decoder rejects unknown cache-profile advertisement");
+}
+
+// BigOracle's identity-binding law (d23d9c5d HOLD): a valid-PRESENT cache
+// triple additionally requires a COMPLETE nonzero assignment identity
+// {job_id, epoch, nonce}; a partial identity is rejected by the
+// pre-existing assignment law alone, independent of cache state.  Each row
+// is exercised three ways -- direct-object (valid_payload() called
+// directly), encoder (send_msg), and raw-frame (hand-crafted wire bytes,
+// independent of both the object and the encoder) -- since each layer has
+// its own chance to regress.
+static void test_usecs_identity_binding_law()
+{
+    const uint64_t epoch = UINT64_C(0x1020304050607080);
+    const uint64_t nonce = UINT64_C(0x8877665544332211);
+    const uint32_t job_id = UINT32_C(0x0000beef);
+    const uint32_t cache_port = UINT32_C(0x0000cafe);
+
+    const struct Row {
+        uint32_t job_id;
+        uint64_t epoch;
+        uint64_t nonce;
+        uint32_t cache_port;
+        uint32_t cache_protocol;
+        uint32_t cache_mask;
+        bool expect_valid;
+        const char *name;
+    } rows[] = {
+        // Partial identity, cache absent: caught by the pre-existing
+        // assignment law alone (assignment_absent || assignment_complete)
+        // -- these three rows stay red even if the NEW cache-binding
+        // clause were deleted entirely; they do not discriminate it.
+        {job_id, 0, nonce, 0, 0, 0, false, "missing epoch (cache absent)"},
+        {job_id, epoch, 0, 0, 0, 0, false, "missing nonce (cache absent)"},
+        {0, epoch, nonce, 0, 0, 0, false, "zero wire job_id (cache absent)"},
+        // Baseline: assignment wholly absent + cache wholly absent is the
+        // OTHER legal combination the law allows -- not just "complete
+        // identity + valid cache".
+        {job_id, 0, 0, 0, 0, 0, true,
+         "assignment absent, cache absent (baseline)"},
+        // THE deletion-sensitive discriminator (BigOracle's exact trap):
+        // both identity words absent together is a state the pre-existing
+        // assignment law deliberately ACCEPTS on its own (assignment_
+        // absent).  Only the NEW clause (!cache_present ||
+        // assignment_complete) catches it once a valid-present cache
+        // triple is added on top.  Neutralizing that one clause must flip
+        // exactly THIS row green, while the three partial rows above stay
+        // red for their own, unrelated reason.
+        {job_id, 0, 0, cache_port, CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_ZSTD_TU,
+         false,
+         "both identity words absent, cache VALID-PRESENT (discriminator)"},
+        // Valid complete baseline (also covered by the round-trip test
+        // above; repeated here so every identity-law row sits together).
+        {job_id, epoch, nonce, cache_port, CACHE_WIRE_PROTOCOL_V1,
+         CACHE_PROFILE_ZSTD_TU, true,
+         "complete identity, cache VALID-PRESENT (baseline)"},
+    };
+
+    for (const Row& row : rows) {
+        char label[192];
+
+        const UseCSMsg direct("x86_64", "cache-worker", UINT32_C(0x00002805),
+                              row.job_id, true, UINT32_C(7), UINT32_C(0),
+                              row.epoch, row.nonce, row.cache_port,
+                              row.cache_protocol, row.cache_mask);
+        std::snprintf(label, sizeof(label),
+                      "direct-object valid_payload(): %s", row.name);
+        REQUIRE(direct.valid_payload() == row.expect_valid, label);
+
+        Pair send_pair = make_pair(50);
+        std::snprintf(label, sizeof(label), "encoder %s %s",
+                      row.expect_valid ? "accepts" : "rejects", row.name);
+        REQUIRE(send_pair.left->send_msg(direct) == row.expect_valid, label);
+
+        // Raw-frame: patch a known-valid frame's tail (and its job_id,
+        // which lives just before the tail, right after the 4-byte length
+        // prefix and 4-byte message-type header) directly on the wire.
+        Bytes frame = encode_usecs_frame(50, fixture_usecs());
+        if (frame.size() >= 12) {
+            uint32_t network_job_id = htonl(row.job_id);
+            std::memcpy(frame.data() + 8, &network_job_id, sizeof(network_job_id));
+        }
+        set_tail_word64(frame, 7, row.epoch);
+        set_tail_word64(frame, 5, row.nonce);
+        set_tail_word(frame, 3, row.cache_port);
+        set_tail_word(frame, 2, row.cache_protocol);
+        set_tail_word(frame, 1, row.cache_mask);
+        std::snprintf(label, sizeof(label), "raw-frame decoder %s %s",
+                      row.expect_valid ? "accepts" : "rejects", row.name);
+        if (row.expect_valid) {
+            Pair raw_pair = make_pair(50);
+            const bool wrote = !frame.empty()
+                && send(raw_pair.left->fd, frame.data(), frame.size(), 0)
+                    == static_cast<ssize_t>(frame.size());
+            Msg *wire = wrote ? raw_pair.right->get_msg(2, true) : nullptr;
+            REQUIRE(wrote && wire != nullptr, label);
+            delete wire;
+        } else {
+            REQUIRE(decoder_rejects(frame), label);
+        }
+    }
+}
+
+// BigOracle's fixture-trap guidance (d23d9c5d HOLD): UseCSMsg::valid_payload
+// now refuses to let a present-cache/absent-identity UseCSMsg exist as a
+// successfully decoded (or successfully sent) object at all, so no live
+// wire path can any longer hand Daemon::scheduler_use_cs the one input its
+// own defensive re-check (usecs_cache_handoff_admissible, services/comm.h)
+// exists to catch.  Rather than let that defense-in-depth become silently
+// unexercisable, its logic was factored out into that small, pure,
+// independently callable helper; this exercises it DIRECTLY with hand-
+// constructed objects the wire itself would now refuse to carry, proving
+// the daemon-side check still stands on its own regardless of whether a
+// real socket can reach it today.
+static void test_daemon_cache_handoff_admissible_helper()
+{
+    const UseCSMsg valid("x86_64", "cache-worker", UINT32_C(0x00002805),
+                         UINT32_C(0x0000beef), true, UINT32_C(7), UINT32_C(0),
+                         UINT64_C(0x1020304050607080), UINT64_C(0x8877665544332211),
+                         UINT32_C(0x0000cafe), CACHE_WIRE_PROTOCOL_V1,
+                         CACHE_PROFILE_ZSTD_TU);
+    REQUIRE(usecs_cache_handoff_admissible(valid),
+            "daemon helper admits a complete identity with a valid-present "
+            "cache triple");
+
+    const UseCSMsg present_absent_identity(
+        "x86_64", "cache-worker", UINT32_C(0x00002805), UINT32_C(0x0000beef),
+        true, UINT32_C(7), UINT32_C(0), /* epoch */ 0, /* nonce */ 0,
+        UINT32_C(0x0000cafe), CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_ZSTD_TU);
+    REQUIRE(!usecs_cache_handoff_admissible(present_absent_identity),
+            "daemon helper refuses a valid-present cache triple with NO "
+            "assignment identity -- the one combination no live wire path "
+            "can construct anymore, still caught directly");
+
+    const UseCSMsg absent_cache_no_identity(
+        "x86_64", "cache-worker", UINT32_C(0x00002805), UINT32_C(0x0000beef),
+        true, UINT32_C(7), UINT32_C(0), 0, 0, 0, 0, 0);
+    REQUIRE(!usecs_cache_handoff_admissible(absent_cache_no_identity),
+            "daemon helper does not admit a wholly-absent cache triple "
+            "(nothing to retain either way)");
 }
 
 static void test_cache_advertisement_predicate_matches_projection_law()
@@ -587,6 +742,8 @@ int main()
     test_p50_round_trip_and_validation();
     test_usecs_legacy_bytes();
     test_usecs_p50_round_trip_and_validation();
+    test_usecs_identity_binding_law();
+    test_daemon_cache_handoff_admissible_helper();
     test_cache_advertisement_predicate_matches_projection_law();
     test_declared_profiles_are_inert();
     std::fprintf(stderr, "%s: %d failure(s)\n",
