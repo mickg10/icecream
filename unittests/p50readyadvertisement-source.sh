@@ -1,0 +1,54 @@
+#!/bin/sh
+# Deletion-sensitive source/distribution gate for the pure READY projection.
+set -eu
+
+src=${ICECC_TEST_TOP_SRCDIR:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
+impl="$src/cache/p50_ready_advertisement.cpp"
+header="$src/cache/p50_ready_advertisement.h"
+test="$src/unittests/p50_ready_advertisement_test.cpp"
+
+require() {
+    pattern=$1
+    file=$2
+    label=$3
+    if ! grep -F "$pattern" "$file" >/dev/null; then
+        echo "FAIL: $label" >&2
+        exit 1
+    fi
+    echo "ok - $label"
+}
+
+require 'observation.supervisor_state == sidecar::State::Ready' "$impl" \
+    'presence is gated on exact supervisor READY'
+require 'observation.private_relationship_authenticated' "$impl" \
+    'presence is gated on authenticated private HELLO/ACK'
+require 'crashed && current_.present()' "$impl" \
+    'a post-READY crash forces withdrawal before recovery'
+require 'CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_ZSTD_TU' "$impl" \
+    'presence projects only the exact runnable CacheWire profile'
+require 'Error::CounterRegression' "$impl" \
+    'counter rollback fails closed'
+require 'std::array<Snapshot, 2>' "$header" \
+    'one observation has a statically bounded transition batch'
+require 'compressed crash and recovery withdraws before republishing' "$test" \
+    'behavioral suite covers the two-transition crash edge'
+
+require 'libp50readyadvertisement.a' "$src/cache/Makefile.am" \
+    'controller library is registered in the cache build'
+require 'P50_READY_ADVERTISEMENT.md' "$src/cache/Makefile.am" \
+    'policy contract is distributed'
+require 'p50readyadvertisement-source.sh' "$src/unittests/Makefile.am" \
+    'source gate is registered and distributed'
+require 'p50readyadvertisement-mutants.sh' "$src/unittests/Makefile.am" \
+    'behavioral mutant gate is registered and distributed'
+
+# Mechanism-only checkpoint: daemon Login must remain canonical absence until
+# the supervised private relationship and transition application are wired.
+count=$(grep -F -c 'apply_inert_cache_advertisement' "$src/daemon/main.cpp" || true)
+if [ "$count" -ne 3 ]; then
+    echo "FAIL: READY mechanism checkpoint changed inert daemon Login ($count anchors)" >&2
+    exit 1
+fi
+echo 'ok - daemon Login remains inert at the mechanism-only checkpoint'
+
+echo 'PASS: pure READY advertisement source gates hold'
