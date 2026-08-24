@@ -41,10 +41,10 @@ After a successful `bind`, any later setup failure returns
 `ListenerNodeLeftForCleanup` and leaves the node untouched.  Cleanup must be
 performed by the supervisor using its already-validated private runtime
 directory, never by a pathname unlink in this helper.  The test-only
-`ICECC_TEST_LOCAL_TRANSPORT_FAIL_AFTER_BIND=1` hook exercises this retained
-node result deterministically; its companion
-`ICECC_TEST_LOCAL_TRANSPORT_BIND_GATE` allows the test to replace the pathname
-between `bind` and failure without introducing a production race window.
+compile-time seam `ICECC_P50_LOCAL_TRANSPORT_TEST_HOOKS` exercises this
+retained-node result deterministically.  It is absent from the production
+library, so inherited environment variables cannot force a failure or cause
+an unbounded wait in `listen_unix`.
 
 On Linux, peer verification uses `SO_PEERCRED`.  The provider argument is a
 test/integration seam; absent a provider, unsupported or failed OS credential

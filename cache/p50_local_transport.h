@@ -163,4 +163,13 @@ int listen_unix(const std::string& path, int backlog, Status* status = nullptr) 
 Connection connect_unix(const std::string& path, Status* status = nullptr) noexcept;
 Connection accept_unix(int listener_fd, Status* status = nullptr) noexcept;
 
+#if defined(ICECC_P50_LOCAL_TRANSPORT_TEST_HOOKS)
+// Compile-time-only test seam.  The production library does not declare or
+// emit this entry point; the focused transport test compiles the transport
+// source itself with ICECC_P50_LOCAL_TRANSPORT_TEST_HOOKS defined.
+using ListenPostBindTestHook = bool (*)(const char* path) noexcept;
+int listen_unix_with_test_hook(const std::string& path, int backlog,
+                               Status* status, ListenPostBindTestHook hook) noexcept;
+#endif
+
 } // namespace icecc::p50::local

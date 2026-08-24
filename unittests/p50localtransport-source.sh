@@ -6,13 +6,13 @@ src=${ICECC_TEST_TOP_SRCDIR:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
 transport="$src/cache/p50_local_transport.cpp"
 
 listener_body() {
-    sed -n '/^int listen_unix/,/^Connection connect_unix/p' "$1"
+    sed -n '/^static int listen_unix_impl/,/^Connection connect_unix/p' "$1"
 }
 
 safe_listener() {
     body=$(listener_body "$1")
     printf '%s\n' "$body" | grep -F 'Status::ListenerNodeLeftForCleanup' >/dev/null
-    if printf '%s\n' "$body" | grep -F '::unlink(path.c_str())' >/dev/null; then
+    if printf '%s\n' "$body" | grep -E '::unlink\(path\.c_str\(\)\)|getenv|usleep|ICECC_TEST_LOCAL_TRANSPORT' >/dev/null; then
         return 1
     fi
 }
@@ -32,5 +32,40 @@ if safe_listener "$mutant"; then
     exit 1
 fi
 echo 'ok - unsafe pathname-unlink deletion mutant is rejected'
+
+# The production object must not contain the compile-time test seam.  Build a
+# macro-free object, inspect its symbols/strings, then build the deliberate
+# macro-reintroduction mutant and prove the same production predicate rejects
+# it.  This catches accidentally shipping a runtime hook branch or symbol.
+cxx=${ICECC_TEST_CXX:-g++}
+production_object=$(mktemp "${TMPDIR:-/tmp}/p50localtransport-production.XXXXXX.o")
+hook_mutant_object=$(mktemp "${TMPDIR:-/tmp}/p50localtransport-hook-mutant.XXXXXX.o")
+trap 'rm -f "$mutant" "$production_object" "$hook_mutant_object"' EXIT HUP INT TERM
+
+"$cxx" -std=c++20 -Wall -Wextra -Werror -pthread -I"$src" \
+    -UICECC_P50_LOCAL_TRANSPORT_TEST_HOOKS -c "$transport" -o "$production_object"
+
+production_safe() {
+    if nm -C "$1" | grep -E 'listen_unix_with_test_hook|ListenPostBindTestHook|getenv|usleep' >/dev/null; then
+        return 1
+    fi
+    if strings "$1" | grep -E 'ICECC_P50_LOCAL_TRANSPORT_TEST_HOOKS|ICECC_TEST_LOCAL_TRANSPORT|listen_unix_with_test_hook' >/dev/null; then
+        return 1
+    fi
+}
+
+if ! production_safe "$production_object"; then
+    echo 'FAIL: production transport object contains test-hook seam' >&2
+    exit 1
+fi
+echo 'ok - production object contains no test-hook symbol, branch, or string'
+
+"$cxx" -std=c++20 -Wall -Wextra -Werror -pthread -I"$src" \
+    -DICECC_P50_LOCAL_TRANSPORT_TEST_HOOKS -c "$transport" -o "$hook_mutant_object"
+if production_safe "$hook_mutant_object"; then
+    echo 'FAIL: macro-reintroduction test-hook mutant was accepted' >&2
+    exit 1
+fi
+echo 'ok - macro-reintroduction test-hook mutant is rejected'
 
 echo 'PASS: listener failure cleanup remains supervisor-owned and race-safe'

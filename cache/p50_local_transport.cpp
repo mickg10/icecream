@@ -4,7 +4,6 @@
 #include <array>
 #include <cerrno>
 #include <cstring>
-#include <cstdlib>
 #include <limits>
 #include <mutex>
 #include <fcntl.h>
@@ -192,18 +191,6 @@ bool private_socket_node(const std::string& path) {
     if (::lstat(path.c_str(), &info) != 0 || !S_ISSOCK(info.st_mode))
         return false;
     return info.st_uid == ::geteuid() && (info.st_mode & 07777) == 0600;
-}
-
-bool test_force_post_bind_failure() noexcept {
-    const char* value = std::getenv("ICECC_TEST_LOCAL_TRANSPORT_FAIL_AFTER_BIND");
-    if (value == nullptr || std::strcmp(value, "1") != 0)
-        return false;
-    const char* gate = std::getenv("ICECC_TEST_LOCAL_TRANSPORT_BIND_GATE");
-    if (gate != nullptr) {
-        while (::access(gate, F_OK) != 0)
-            ::usleep(1000);
-    }
-    return true;
 }
 
 Status validate_header(const uint8_t* header, size_t size, uint32_t* payload_length) {
@@ -452,7 +439,12 @@ Status verify_peer_credentials(int fd, const CredentialExpectation& expected,
     return Status::Ok;
 }
 
-int listen_unix(const std::string& path, int backlog, Status* status) noexcept {
+#if defined(ICECC_P50_LOCAL_TRANSPORT_TEST_HOOKS)
+static int listen_unix_impl(const std::string& path, int backlog, Status* status,
+                            ListenPostBindTestHook hook) noexcept {
+#else
+static int listen_unix_impl(const std::string& path, int backlog, Status* status) noexcept {
+#endif
     sockaddr_un address{};
     if (backlog < 1 || !fill_address(path, address) || !private_parent(path)) {
         set_status(path.empty() || path.front() != '/' || path.find('\0') != std::string::npos ||
@@ -479,7 +471,7 @@ int listen_unix(const std::string& path, int backlog, Status* status) noexcept {
     // bind(2) creates the node using the process umask.  Establish and verify
     // the exact private node mode before exposing the listener.
     if (::chmod(path.c_str(), S_IRUSR | S_IWUSR) != 0 || !private_socket_node(path) ||
-        ::listen(fd, backlog) != 0 || test_force_post_bind_failure()) {
+        ::listen(fd, backlog) != 0) {
         ::close(fd);
         // bind succeeded, so the pathname may still designate a live node (or
         // may have been replaced by its same-UID owner).  Never unlink by
@@ -488,9 +480,31 @@ int listen_unix(const std::string& path, int backlog, Status* status) noexcept {
         set_status(Status::ListenerNodeLeftForCleanup, status);
         return -1;
     }
+#if defined(ICECC_P50_LOCAL_TRANSPORT_TEST_HOOKS)
+    if (hook != nullptr && hook(path.c_str())) {
+        ::close(fd);
+        set_status(Status::ListenerNodeLeftForCleanup, status);
+        return -1;
+    }
+#endif
     set_status(Status::Ok, status);
     return fd;
 }
+
+int listen_unix(const std::string& path, int backlog, Status* status) noexcept {
+#if defined(ICECC_P50_LOCAL_TRANSPORT_TEST_HOOKS)
+    return listen_unix_impl(path, backlog, status, nullptr);
+#else
+    return listen_unix_impl(path, backlog, status);
+#endif
+}
+
+#if defined(ICECC_P50_LOCAL_TRANSPORT_TEST_HOOKS)
+int listen_unix_with_test_hook(const std::string& path, int backlog, Status* status,
+                               ListenPostBindTestHook hook) noexcept {
+    return listen_unix_impl(path, backlog, status, hook);
+}
+#endif
 
 Connection connect_unix(const std::string& path, Status* status) noexcept {
     sockaddr_un address{};

@@ -45,10 +45,10 @@ p50endpoint_LDFLAGS = $(BOOST_LDFLAGS)
 p50endpoint_LDADD = ../cache/libp50endpoint.a ../cache/libprotocol50.a \
 	../services/libicecc.la \
 	$(LIBZSTD_LIBS) $(BOOST_LIBS)
-p50localtransport_SOURCES = p50_local_transport_test.cpp
+p50localtransport_SOURCES = p50_local_transport_test.cpp ../cache/p50_local_transport.cpp
+p50localtransport_CPPFLAGS = $(AM_CPPFLAGS) -DICECC_P50_LOCAL_TRANSPORT_TEST_HOOKS
 p50localtransport_CXXFLAGS = -pthread
 p50localtransport_LDFLAGS = -pthread
-p50localtransport_LDADD = ../cache/libp50localtransport.a
 digest128bench_LDADD = ../services/libicecc.la
 
 check_PROGRAMS = testargs lockexec backpressure schedpolicy utf8test statewritertest schedbp daemonlogin daemonbatch cachehandoffdaemon p49daemon p49scheduler connectivity fastesttest hallflowtest jobidalloctest inputpump compilerinput p49assignment p50assignment p50cacheadvertisement p50wire p50slice0 p50zstd p50zstdwindow p50inputrecord p50inputrecordlate p50inputrecordreopen p50endpoint p50localtransport digest128bench
