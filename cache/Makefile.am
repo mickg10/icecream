@@ -129,6 +129,7 @@ EXTRA_DIST = \
 	p50_sidecar_supervisor.h \
 	P50_CACHE_SERVICE.md \
 	P50_FD_HANDOFF.md \
+	P50_DAEMON_CACHE_DISPATCH.md \
 	formal/README.md
 
 check-local:

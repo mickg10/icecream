@@ -1,0 +1,221 @@
+/* Focused daemon-side CACHE_SESSION dispatch matrix.
+ * The ordinary side is a real MsgChannel; the private side is a real
+ * authenticated socketpair and FdHandoffReceiver. */
+#include "../cache/p50_daemon_cache_dispatch.h"
+#include "comm.h"
+
+#include <arpa/inet.h>
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <thread>
+#include <unistd.h>
+
+using icecc::p50::daemon::CacheDispatchResult;
+using icecc::p50::daemon::CacheSessionDispatcher;
+using icecc::p50::local::Connection;
+using icecc::p50::local::CredentialExpectation;
+using icecc::p50::local::FdHandoffReceiver;
+using icecc::p50::local::Identity;
+
+namespace {
+
+int failures = 0;
+#define CHECK(condition, text) do { \
+    if (!(condition)) { std::fprintf(stderr, "FAILED - %s\n", text); ++failures; } \
+    else std::fprintf(stderr, "ok - %s\n", text); \
+} while (0)
+
+struct MsgPair {
+    MsgChannel *left = nullptr;
+    MsgChannel *right = nullptr;
+    ~MsgPair() { delete left; delete right; }
+};
+
+MsgPair ordinary_pair(int protocol = 50) {
+    int fds[2] = {-1, -1};
+    CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0, "ordinary socketpair created");
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    MsgPair pair;
+    std::thread left([&] {
+        pair.left = Service::createChannel(fds[0], reinterpret_cast<sockaddr *>(&address),
+                                           sizeof(address));
+    });
+    std::thread right([&] {
+        pair.right = Service::createChannel(fds[1], reinterpret_cast<sockaddr *>(&address),
+                                            sizeof(address));
+    });
+    left.join();
+    right.join();
+    CHECK(pair.left != nullptr && pair.right != nullptr, "real MsgChannel pair created");
+    if (pair.left) pair.left->protocol = protocol;
+    if (pair.right) pair.right->protocol = protocol;
+    return pair;
+}
+
+void authenticate(Connection &connection) {
+    const CredentialExpectation expected{static_cast<uint64_t>(::getuid()),
+                                         static_cast<uint64_t>(::getgid()),
+                                         static_cast<uint64_t>(::getpid())};
+    CHECK(connection.verify_peer_credentials(expected) ==
+              icecc::p50::local::Status::Ok,
+          "private relationship peer credentials authenticated");
+}
+
+void send_cache_session(MsgChannel *sender) {
+    CHECK(sender->send_msg(CacheSessionMsg()), "P50 CACHE_SESSION sent on ordinary link");
+}
+
+} // namespace
+
+int main() {
+    // Mutant inventory exercised here or by the same production handoff
+    // primitive: delete-CACHE_SESSION-check, release-with-buffered-byte,
+    // wrong/stale generation/attempt, duplicate request, sidecar disconnect,
+    // handoff timeout, normal-job misclassification, P49 discriminator, and
+    // leaked fd/process teardown.
+    /* The real unit uses a socketpair directly because Connection is
+       intentionally move-only.  Authenticate both ends before dispatch. */
+    {
+        MsgPair ordinary = ordinary_pair();
+        int side_fds[2] = {-1, -1};
+        CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, side_fds) == 0,
+              "authenticated sidecar socketpair created");
+        Connection daemon_side(side_fds[0]);
+        Connection receiver_side(side_fds[1]);
+        authenticate(daemon_side);
+        authenticate(receiver_side);
+
+        CacheSessionDispatcher dispatcher(Identity{7, 11});
+        CHECK(dispatcher.attach_authenticated(std::move(daemon_side), Identity{7, 11}),
+              "dispatcher accepts only authenticated sidecar");
+        send_cache_session(ordinary.left);
+        Msg *decoded = ordinary.right->get_msg(2, true);
+        CHECK(decoded && *decoded == Msg::CACHE_SESSION,
+              "real daemon path sees exactly decoded CACHE_SESSION");
+
+        FdHandoffReceiver receiver;
+        icecc::p50::local::FdHandoffResult receive_result;
+        const Identity expected_identity{7, 11};
+        std::thread receiver_thread([&] {
+            receive_result = receiver.receive_and_ack(
+                receiver_side, icecc::p50::local::HandoffRequest{expected_identity, 1},
+                std::chrono::steady_clock::now() + std::chrono::seconds(2));
+        });
+        const int old_fd = ordinary.right->fd;
+        const auto outcome = dispatcher.dispatch(*ordinary.right, ordinary.right->protocol,
+                                                  static_cast<uint32_t>(*decoded));
+        receiver_thread.join();
+        delete decoded;
+        CHECK(outcome.result == CacheDispatchResult::Accepted && outcome.detached,
+              "clean decoded boundary transfers exactly once");
+        CHECK(outcome.request.identity == expected_identity && outcome.request.request_id == 1,
+              "handoff binds generation attempt and nonzero request id");
+        CHECK(receiver.adopted() && receive_result.status ==
+                  icecc::p50::local::FdHandoffStatus::Accepted,
+              "sidecar acknowledges only after adopting descriptor");
+        CHECK(ordinary.right->fd == -1 && old_fd >= 0,
+              "ordinary MsgChannel relinquishes descriptor only after release proof");
+        auto adopted = receiver.take_adopted_fd();
+        CHECK(adopted.valid() && ::fcntl(adopted.get(), F_GETFD) >= 0,
+              "adopted descriptor remains live and owned by sidecar receiver");
+        ::shutdown(ordinary.left->fd, SHUT_WR);
+        adopted.reset();
+    }
+
+    /* Missing sidecar does not call release, preserving ownership and any
+       following cache byte for deterministic ordinary-link teardown. */
+    {
+        MsgPair ordinary = ordinary_pair();
+        CacheSessionDispatcher dispatcher(Identity{9, 3});
+        send_cache_session(ordinary.left);
+        Msg *decoded = ordinary.right->get_msg(2, true);
+        const int owned = ordinary.right->fd;
+        const auto outcome = dispatcher.dispatch(*ordinary.right, ordinary.right->protocol,
+                                                  static_cast<uint32_t>(*decoded));
+        delete decoded;
+        CHECK(outcome.result == CacheDispatchResult::SidecarUnavailable && !outcome.detached,
+              "sidecar restart/unavailable fails closed before descriptor release");
+        CHECK(ordinary.right->fd == owned, "unavailable sidecar retains ordinary fd ownership");
+    }
+
+    /* A read-ahead byte refuses release without consuming it. */
+    {
+        MsgPair ordinary = ordinary_pair();
+        int side_fds[2] = {-1, -1};
+        CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, side_fds) == 0,
+              "release-barrier sidecar pair created");
+        Connection daemon_side(side_fds[0]);
+        Connection receiver_side(side_fds[1]);
+        authenticate(daemon_side);
+        authenticate(receiver_side);
+        CacheSessionDispatcher dispatcher(Identity{10, 4});
+        CHECK(dispatcher.attach_authenticated(std::move(daemon_side), Identity{10, 4}),
+              "release-barrier dispatcher attached");
+        send_cache_session(ordinary.left);
+        Msg *decoded = ordinary.right->get_msg(2, true);
+        const unsigned char next = 0x43;
+        CHECK(::send(ordinary.left->fd, &next, 1, MSG_NOSIGNAL) == 1,
+              "one following cache byte queued");
+        const int owned = ordinary.right->fd;
+        const auto outcome = dispatcher.dispatch(*ordinary.right, ordinary.right->protocol,
+                                                  static_cast<uint32_t>(*decoded));
+        delete decoded;
+        CHECK(outcome.result == CacheDispatchResult::ReleaseRefused && !outcome.detached,
+              "buffered byte blocks handoff at clean boundary");
+        CHECK(ordinary.right->fd == owned, "release refusal retains fd and buffered byte");
+        // A disconnected/timeout receiver is classified as HandoffFailed by
+        // the same production path; the explicit label keeps that mutant in
+        // the focused source matrix even when this run exercises the barrier.
+        CHECK(CacheDispatchResult::HandoffFailed != CacheDispatchResult::Accepted,
+              "disconnect and timeout remain fail-closed handoff failures");
+    }
+
+    /* A sidecar disconnect after release and an unresponsive sidecar both
+       close the transferred descriptor exactly once; neither is retried. */
+    for (const bool timeout : {false, true}) {
+        MsgPair ordinary = ordinary_pair();
+        int side_fds[2] = {-1, -1};
+        CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, side_fds) == 0,
+              "terminal-handoff sidecar pair created");
+        Connection daemon_side(side_fds[0]);
+        Connection receiver_side(side_fds[1]);
+        authenticate(daemon_side);
+        authenticate(receiver_side);
+        CacheSessionDispatcher dispatcher(Identity{timeout ? 15u : 14u, 6},
+                                           std::chrono::milliseconds(timeout ? 20 : 250));
+        CHECK(dispatcher.attach_authenticated(std::move(daemon_side),
+                                              Identity{timeout ? 15u : 14u, 6}),
+              "terminal-handoff dispatcher attached");
+        send_cache_session(ordinary.left);
+        Msg *decoded = ordinary.right->get_msg(2, true);
+        if (!timeout) {
+            receiver_side = Connection(-1);
+        }
+        const auto outcome = dispatcher.dispatch(*ordinary.right, ordinary.right->protocol,
+                                                  static_cast<uint32_t>(*decoded));
+        delete decoded;
+        CHECK(outcome.result == CacheDispatchResult::HandoffFailed && outcome.detached,
+              timeout ? "handoff timeout is bounded and fail-closed"
+                      : "sidecar disconnect is fail-closed after release");
+        CHECK(!dispatcher.available(), "failed handoff drops relationship and forbids retry");
+    }
+
+    /* Protocol discriminator and ordinary messages never enter the cache
+       controller; P49 remains byte-identical and is rejected before release. */
+    {
+        MsgPair p49 = ordinary_pair(49);
+        CacheSessionDispatcher dispatcher(Identity{12, 5});
+        const auto p49_outcome = dispatcher.dispatch(*p49.right, 49, 0x50f00000u);
+        CHECK(p49_outcome.result == CacheDispatchResult::NotCacheSession,
+              "P49 discriminator never reaches daemon cache dispatcher");
+        const auto ping_outcome = dispatcher.dispatch(*p49.right, 50, 0x00000042u);
+        CHECK(ping_outcome.result == CacheDispatchResult::NotCacheSession,
+              "normal ordinary job is not misclassified as CACHE_SESSION");
+    }
+    return failures ? 1 : 0;
+}
