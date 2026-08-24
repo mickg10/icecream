@@ -4,6 +4,7 @@ set -eu
 
 src=${ICECC_TEST_TOP_SRCDIR:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
 transport="$src/cache/p50_local_transport.cpp"
+poll_helper="$src/cache/p50_local_transport.h"
 
 # The bounded writer is a production invariant: the complete encoded frame
 # must use one deadline, not the legacy blocking writer.  Keep a deletion
@@ -50,17 +51,22 @@ fi
 echo 'ok - bounded reader deletion/bypass mutant is rejected'
 
 # A bounded operation must use per-call MSG_DONTWAIT and never toggle the
-# shared open-file-description status flags.  Keep the terminal poll checks
-# explicit so a POLLERR/POLLHUP/POLLNVAL deletion mutant is visible in review.
+# shared open-file-description status flags.  The local transport and FD
+# handoff both use the one shared absolute-deadline poll helper in the public
+# transport header; keep its terminal checks explicit so a
+# POLLERR/POLLHUP/POLLNVAL deletion mutant is visible in review.
 if grep -F 'F_SETFL' "$transport" >/dev/null; then
     echo 'FAIL: bounded transport mutates shared O_NONBLOCK state' >&2
     exit 1
 fi
-grep -F 'wait_for_io' "$transport" >/dev/null
-grep -F '(POLLERR | POLLNVAL)' "$transport" >/dev/null
-grep -F '(POLLERR | POLLHUP | POLLNVAL)' "$transport" >/dev/null
-grep -F 'events & POLLOUT' "$transport" >/dev/null
-grep -F 'POLLHUP' "$transport" >/dev/null
+grep -F 'detail::wait_for_io' "$transport" >/dev/null
+grep -F 'DeadlinePollResult' "$poll_helper" >/dev/null
+grep -F '(POLLERR | POLLHUP | POLLNVAL)' "$poll_helper" >/dev/null
+grep -F '(descriptor.revents & events)' "$poll_helper" >/dev/null
+if grep -F '(us + 999)' "$transport" "$poll_helper" >/dev/null; then
+    echo 'FAIL: shared deadline helper still rounds sub-millisecond waits up' >&2
+    exit 1
+fi
 echo 'ok - bounded transport preserves shared flags and rejects terminal poll state'
 
 listener_body() {

@@ -87,8 +87,8 @@ if ! source_boundary_clean; then
 fi
 echo 'ok - daemon cache-dispatch source boundary holds without Git metadata'
 
-grep -F '(POLLERR | POLLNVAL)' "$src/cache/p50_local_transport.cpp" >/dev/null
-grep -F 'events & POLLOUT' "$src/cache/p50_local_transport.cpp" >/dev/null
-grep -F 'POLLHUP' "$src/cache/p50_local_transport.cpp" >/dev/null
+grep -F 'detail::wait_for_io' "$src/cache/p50_local_transport.cpp" >/dev/null
+grep -F 'detail::wait_for_io' "$src/cache/p50_fd_handoff.cpp" >/dev/null
+grep -F '(POLLERR | POLLHUP | POLLNVAL)' "$src/cache/p50_local_transport.h" >/dev/null
 echo 'ok - transport terminal poll conditions are explicit'
 echo 'ok - daemon cache-dispatch source and mutant gates hold'

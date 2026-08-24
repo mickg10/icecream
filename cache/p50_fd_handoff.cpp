@@ -103,26 +103,12 @@ bool decode_wire(std::span<const uint8_t> wire, uint16_t expected_type,
 }
 
 int poll_until(int fd, short events, std::chrono::steady_clock::time_point deadline) {
-    for (;;) {
-        const auto now = std::chrono::steady_clock::now();
-        if (now >= deadline)
-            return 0;
-        const auto us = std::chrono::duration_cast<std::chrono::microseconds>(deadline - now).count();
-        const long long ms = (us + 999) / 1000;
-        const int timeout = static_cast<int>(std::min<long long>(ms, 2147483647LL));
-        struct pollfd pfd{fd, static_cast<short>(events | POLLERR | POLLHUP), 0};
-        const int result = ::poll(&pfd, 1, timeout);
-        if (result < 0 && errno == EINTR)
-            continue;
-        if (result <= 0)
-            return result;
-        // A stream may report readable data and HUP together.  Consume the
-        // queued bytes first; the following iteration observes clean EOF.
-        if ((pfd.revents & events) != 0)
-            return 1;
-        if ((pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0)
-            return -1;
-    }
+    const auto result = detail::wait_for_io(fd, events, deadline);
+    if (result == detail::DeadlinePollResult::Ready)
+        return 1;
+    if (result == detail::DeadlinePollResult::Timeout)
+        return 0;
+    return -1;
 }
 
 FdHandoffStatus io_status(int poll_result) {

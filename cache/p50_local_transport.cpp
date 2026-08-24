@@ -5,10 +5,8 @@
 #include <cerrno>
 #include <chrono>
 #include <cstring>
-#include <limits>
 #include <mutex>
 #include <fcntl.h>
-#include <poll.h>
 #include <sys/stat.h>
 
 #include <sys/socket.h>
@@ -62,70 +60,6 @@ bool valid_type(uint16_t type) {
            type <= static_cast<uint16_t>(MessageType::Goodbye);
 }
 
-enum class WaitResult {
-    Ready,
-    Timeout,
-    Error,
-};
-
-// Wait using the absolute deadline without changing the descriptor's shared
-// file-status flags.  A millisecond floor is avoided: when less than one
-// millisecond remains, poll(2) with zero performs a readiness probe and the
-// loop checks the real steady-clock deadline again.  This keeps a 100us
-// deadline from becoming a one-millisecond deadline.  We also never add a
-// rounding constant to a duration, which keeps time_point::max() and other
-// very large deadlines free of signed overflow.
-WaitResult wait_for_io(int fd, short events,
-                       std::chrono::steady_clock::time_point deadline) noexcept {
-    if (fd < 0)
-        return WaitResult::Error;
-
-    for (;;) {
-        const auto now = std::chrono::steady_clock::now();
-        if (now >= deadline)
-            return WaitResult::Timeout;
-
-        const auto remaining = deadline - now;
-        int poll_timeout = 0;
-        const auto max_poll_duration =
-            std::chrono::milliseconds(std::numeric_limits<int>::max());
-        if (remaining >= max_poll_duration) {
-            poll_timeout = std::numeric_limits<int>::max();
-        } else {
-            const auto whole_milliseconds =
-                std::chrono::duration_cast<std::chrono::milliseconds>(remaining).count();
-            // A sub-millisecond remainder must be probed without sleeping.
-            poll_timeout = whole_milliseconds <= 0
-                               ? 0
-                               : static_cast<int>(whole_milliseconds);
-        }
-
-        struct pollfd descriptor{fd, events, 0};
-        const int ready = ::poll(&descriptor, 1, poll_timeout);
-        if (ready < 0) {
-            if (errno == EINTR)
-                continue;
-            return WaitResult::Error;
-        }
-        if (ready == 0)
-            continue;
-
-        // Output readiness must never mask a terminal/error condition.  For
-        // input, POLLHUP is retained only when POLLIN is also present so the
-        // nonblocking recv can classify a clean EOF or a partial frame.
-        if ((events & POLLOUT) != 0 &&
-            (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0)
-            return WaitResult::Error;
-        if ((descriptor.revents & (POLLERR | POLLNVAL)) != 0)
-            return WaitResult::Error;
-        if ((descriptor.revents & events) != 0)
-            return WaitResult::Ready;
-        if ((events & POLLIN) != 0 && (descriptor.revents & POLLHUP) != 0)
-            return WaitResult::Ready;
-        return WaitResult::Error;
-    }
-}
-
 Status read_exact(int fd, std::span<uint8_t> out, bool clean_eof) {
     size_t done = 0;
     while (done != out.size()) {
@@ -157,10 +91,10 @@ Status read_exact_until(int fd, std::span<uint8_t> out, bool clean_eof,
 #else
     size_t done = 0;
     while (done != out.size()) {
-        const WaitResult waited = wait_for_io(fd, POLLIN, deadline);
-        if (waited == WaitResult::Timeout)
+        const auto waited = detail::wait_for_io(fd, POLLIN, deadline);
+        if (waited == detail::DeadlinePollResult::Timeout)
             return Status::Timeout;
-        if (waited == WaitResult::Error)
+        if (waited == detail::DeadlinePollResult::Error)
             return Status::IoError;
         const ssize_t count =
             ::recv(fd, out.data() + done, out.size() - done, MSG_DONTWAIT);
@@ -209,10 +143,10 @@ Status write_all_until(int fd, std::span<const uint8_t> bytes,
 #else
     size_t done = 0;
     while (done != bytes.size()) {
-        const WaitResult waited = wait_for_io(fd, POLLOUT, deadline);
-        if (waited == WaitResult::Timeout)
+        const auto waited = detail::wait_for_io(fd, POLLOUT, deadline);
+        if (waited == detail::DeadlinePollResult::Timeout)
             return Status::Timeout;
-        if (waited == WaitResult::Error)
+        if (waited == detail::DeadlinePollResult::Error)
             return Status::IoError;
 
         int send_flags = MSG_DONTWAIT;

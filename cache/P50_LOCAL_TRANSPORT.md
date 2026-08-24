@@ -40,8 +40,8 @@ writes prevents a writable hint from turning into a blocking send; timeout
 returns `Status::Timeout` and preserves the one-writer gate.  Per-call
 `MSG_DONTWAIT` avoids mutating `O_NONBLOCK` on the shared open file
 description; platforms without that primitive fail closed.  Poll error and
-hangup bits are checked before output readiness, and SIGPIPE protection
-remains the same as the ordinary writer.
+hangup bits are checked before requested input or output readiness, and
+SIGPIPE protection remains the same as the ordinary writer.
 
 The connection also exposes peer verification and both
 `receive_with_timeout()` and `receive_until()` framed receives without

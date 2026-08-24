@@ -9,10 +9,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <compare>
 #include <functional>
+#include <limits>
 #include <optional>
+#include <poll.h>
 #include <span>
 #include <string>
 #include <sys/un.h>
@@ -20,6 +23,64 @@
 #include <vector>
 
 namespace icecc::p50::local {
+
+namespace detail {
+
+enum class DeadlinePollResult {
+    Ready,
+    Timeout,
+    Error,
+};
+
+// Shared by framed local transport and descriptor handoff.  Poll timeout
+// conversion floors to milliseconds and probes with zero below one
+// millisecond; it never adds a rounding constant to a duration.  Terminal
+// poll bits are checked before requested readiness in both directions, so a
+// POLLERR/POLLHUP/POLLNVAL indication cannot be masked by POLLIN or POLLOUT.
+inline DeadlinePollResult wait_for_io(
+    int fd, short events,
+    std::chrono::steady_clock::time_point deadline) noexcept {
+    if (fd < 0)
+        return DeadlinePollResult::Error;
+
+    for (;;) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline)
+            return DeadlinePollResult::Timeout;
+
+        const auto remaining = deadline - now;
+        int poll_timeout = 0;
+        const auto max_poll_duration =
+            std::chrono::milliseconds(std::numeric_limits<int>::max());
+        if (remaining >= max_poll_duration) {
+            poll_timeout = std::numeric_limits<int>::max();
+        } else {
+            const auto whole_milliseconds =
+                std::chrono::duration_cast<std::chrono::milliseconds>(remaining).count();
+            poll_timeout = whole_milliseconds <= 0
+                               ? 0
+                               : static_cast<int>(whole_milliseconds);
+        }
+
+        struct pollfd descriptor{fd, events, 0};
+        const int ready = ::poll(&descriptor, 1, poll_timeout);
+        if (ready < 0) {
+            if (errno == EINTR)
+                continue;
+            return DeadlinePollResult::Error;
+        }
+        if (ready == 0)
+            continue;
+
+        if ((descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0)
+            return DeadlinePollResult::Error;
+        if ((descriptor.revents & events) != 0)
+            return DeadlinePollResult::Ready;
+        return DeadlinePollResult::Error;
+    }
+}
+
+} // namespace detail
 
 inline constexpr uint16_t kProtocolVersion = 1;
 inline constexpr size_t kFrameHeaderSize = 28;

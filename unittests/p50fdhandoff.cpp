@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <dirent.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdexcept>
 #include <sys/socket.h>
 #include <thread>
@@ -92,6 +93,28 @@ bool send_all(int fd, const uint8_t* data, size_t size) {
     return true;
 }
 
+bool saturate_socket(int fd) {
+    int send_buffer = 1024;
+    if (::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &send_buffer, sizeof(send_buffer)) != 0)
+        return false;
+    const int original_flags = ::fcntl(fd, F_GETFL);
+    if (original_flags < 0 || ::fcntl(fd, F_SETFL, original_flags | O_NONBLOCK) != 0)
+        return false;
+    std::array<uint8_t, 64 * 1024> bytes{};
+    bool saturated = false;
+    for (;;) {
+        const ssize_t count = ::send(fd, bytes.data(), bytes.size(), no_signal_flag());
+        if (count > 0)
+            continue;
+        if (count < 0 && errno == EINTR)
+            continue;
+        saturated = count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);
+        break;
+    }
+    const bool restored = ::fcntl(fd, F_SETFL, original_flags) == 0;
+    return saturated && restored;
+}
+
 void authenticate(Connection& connection) {
     const CredentialExpectation expected{static_cast<uint64_t>(::getuid()),
                                          static_cast<uint64_t>(::getgid()),
@@ -102,6 +125,7 @@ void authenticate(Connection& connection) {
 
 struct Pair {
     int raw = -1;
+    int connection_fd = -1;
     Connection connection;
 };
 
@@ -114,7 +138,7 @@ Pair raw_pair(bool pass_credentials = false) {
         CHECK(::setsockopt(fds[1], SOL_SOCKET, SO_PASSCRED, &enabled, sizeof(enabled)) == 0);
 #endif
     }
-    return Pair{fds[0], Connection(fds[1])};
+    return Pair{fds[0], fds[1], Connection(fds[1])};
 }
 
 void send_bytes_with_fds(int socket, const uint8_t* bytes, size_t byte_count,
@@ -513,6 +537,67 @@ void test_forced_positive_short_writes() {
 }
 #endif
 
+void test_submillisecond_absolute_deadline() {
+    int fds[2] = {-1, -1};
+    CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    CHECK(saturate_socket(fds[0]));
+    Connection sender_connection(fds[0]);
+    Connection peer(fds[1]);
+    authenticate(sender_connection);
+    FdHandoffSender sender{HandoffFd(::open("/dev/null", O_RDONLY))};
+    const auto started = std::chrono::steady_clock::now();
+    const FdHandoffResult result = sender.send(
+        sender_connection, request(),
+        started + std::chrono::microseconds(100));
+    const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - started).count();
+    CHECK(result.status == FdHandoffStatus::Timeout);
+    CHECK(result.sender_state == FdHandoffSenderState::TimedOut);
+    CHECK(elapsed < 1000);
+}
+
+void test_terminal_poll_bits_are_error_first() {
+    {
+        Pair pair = raw_pair();
+        authenticate(pair.connection);
+        const HandoffRequest expected = request();
+        const auto bytes = wire(1, expected);
+        const int fd = ::open("/dev/null", O_RDONLY);
+        CHECK(fd >= 0);
+        send_with_one_fd(pair.raw, bytes, &fd, 1);
+        CHECK(::close(pair.raw) == 0);
+        pair.raw = -1;
+        struct pollfd descriptor{pair.connection_fd, POLLIN, 0};
+        CHECK(::poll(&descriptor, 1, 1000) == 1);
+        CHECK((descriptor.revents & (POLLIN | POLLHUP)) == (POLLIN | POLLHUP));
+        FdHandoffReceiver receiver;
+        const FdHandoffResult result = receiver.receive_and_ack(
+            pair.connection, expected,
+            std::chrono::steady_clock::now() + std::chrono::seconds(1));
+        CHECK(result.status == FdHandoffStatus::Disconnected);
+        CHECK(!receiver.adopted());
+        CHECK(::close(fd) == 0);
+    }
+
+    {
+        int fds[2] = {-1, -1};
+        CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+        Connection sender_connection(fds[0]);
+        Connection peer(fds[1]);
+        authenticate(sender_connection);
+        peer = Connection(-1);
+        struct pollfd descriptor{fds[0], POLLOUT, 0};
+        CHECK(::poll(&descriptor, 1, 1000) == 1);
+        CHECK((descriptor.revents & (POLLOUT | POLLHUP)) == (POLLOUT | POLLHUP));
+        FdHandoffSender sender{HandoffFd(::open("/dev/null", O_RDONLY))};
+        const FdHandoffResult result = sender.send(
+            sender_connection, request(),
+            std::chrono::steady_clock::now() + std::chrono::seconds(1));
+        CHECK(result.status == FdHandoffStatus::Disconnected);
+        CHECK(!sender.owns_fd());
+    }
+}
+
 void test_timeout_disconnect_auth() {
     int fds[2] = {-1, -1};
     CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
@@ -554,6 +639,8 @@ int main() {
 #if defined(ICECC_P50_FD_HANDOFF_TEST_HOOKS)
     test_forced_positive_short_writes();
 #endif
+    test_submillisecond_absolute_deadline();
+    test_terminal_poll_bits_are_error_first();
     test_timeout_disconnect_auth();
     return 0;
 }
