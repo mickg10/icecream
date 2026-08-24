@@ -14,7 +14,9 @@
 #ifndef ICECREAM_COMPILER_INPUT_H
 #define ICECREAM_COMPILER_INPUT_H
 
+#include <array>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <sys/types.h>
 
@@ -88,6 +90,47 @@ private:
     bool complete_;
     std::unique_ptr<FileChunkMsg> pending_;
     std::size_t offset_;
+};
+
+/* Compiler source for a committed Protocol-50 InputRecord.  The descriptor
+   must be an immutable, read-only, sealed regular file containing the exact
+   raw bytes named by CompileFileMsg.  Construction validates the complete
+   file and rewinds it to byte zero before a compiler can be forked. */
+class P50AttachedFileSource : public CompilerInputSource
+{
+public:
+    P50AttachedFileSource(int fd, uint64_t expected_bytes,
+                          std::array<uint8_t, 16> expected_digest);
+    ~P50AttachedFileSource() override;
+
+    int poll_fd() const override;
+    bool complete() const override;
+    bool has_pending() const override;
+    std::size_t pending_size() const override;
+    std::size_t pending_compressed_size() const override;
+    std::size_t pending_offset() const override;
+
+    CompilerInputReadResult read_next(unsigned int job_stat[]) override;
+    CompilerInputWriteResult write_pending(int compiler_stdin_fd) override;
+    void discard_pending() override;
+    void disable() override;
+    void mark_complete() override;
+
+protected:
+    virtual ssize_t write_bytes(int fd, const void *buffer, std::size_t size);
+
+private:
+    void close_input() noexcept;
+    void validate_and_rewind(uint64_t expected_bytes,
+                             const std::array<uint8_t, 16> &expected_digest);
+
+    int fd_;
+    bool complete_ = false;
+    std::array<uint8_t, 100000> buffer_{};
+    std::size_t pending_size_ = 0;
+    std::size_t offset_ = 0;
+    uint64_t expected_bytes_ = 0;
+    uint64_t observed_bytes_ = 0;
 };
 
 #endif

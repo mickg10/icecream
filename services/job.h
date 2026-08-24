@@ -23,6 +23,7 @@
 #ifndef ICECREAM_COMPILE_JOB_H
 #define ICECREAM_COMPILE_JOB_H
 
+#include <array>
 #include <list>
 #include <cstdint>
 #include <string>
@@ -42,6 +43,63 @@ public:
         push_back(make_pair(s, t));
     }
 };
+
+/* Protocol-50 compiler-input selector carried by CompileFileMsg.  This
+   deliberately mirrors only the immutable identity needed to attach an
+   already-committed InputRecord; the cache endpoint types remain outside the
+   historical services library.  Profile 2 is the frozen ZSTD_TU registry
+   value.  A legacy compile has the one canonical all-zero representation. */
+struct CompileInputIdentity
+{
+    static constexpr uint32_t ZstdTuProfile = 2;
+
+    uint32_t profile = 0;
+    std::array<uint8_t, 16> c_store_guid{};
+    uint64_t tu_seq = 0;
+    uint64_t raw_bytes = 0;
+    std::array<uint8_t, 16> raw_digest{};
+    uint64_t attempt_id = 0;
+    uint64_t request_id = 0;
+
+    bool whollyAbsent() const
+    {
+        const std::array<uint8_t, 16> zero{};
+        return profile == 0 && c_store_guid == zero && tu_seq == 0
+            && raw_bytes == 0 && raw_digest == zero && attempt_id == 0
+            && request_id == 0;
+    }
+
+    bool validPresent() const
+    {
+        const std::array<uint8_t, 16> zero{};
+        /* TU_SEQ zero and an all-zero content digest are valid values.  The
+           namespace GUID and the two replay/ownership identities reserve
+           zero, so presence cannot be confused with the legacy encoding. */
+        return profile == ZstdTuProfile && c_store_guid != zero
+            && attempt_id != 0 && request_id != 0;
+    }
+};
+
+/* Protocol-50 CompileFile wire-audit delta (owner three-bucket ruling).
+
+   BOUND: the pre-existing assignment epoch/nonce/wire-id remains the ordinary
+   assignment authority.  For a nonzero selector, profile is restricted to
+   the frozen ZSTD_TU registry value; C_STORE_GUID, TU_SEQ, raw length/digest,
+   ATTEMPT_ID, and REQUEST_ID are serialized and recovered byte-exact, and the
+   selector is admitted only alongside a complete nonzero assignment identity.
+
+   WIRE-PLACEHOLDER / DERIVED-GUARD: the mandatory seventeen-word all-zero
+   selector is the sole legacy-input encoding on a P50 CompileFile frame.
+   Exact-tail length, wholly-absent-or-valid-present shape, and pre-P50 erasure
+   refusal are decoder/sender guards; they do not claim an attached record.
+
+   CURRENTLY MODEL-UNREPRESENTED: this foundational wire slice does not yet
+   claim that the named InputRecord was committed, attached, or consumed by a
+   compiler.  Those product transitions become representable only in the M3
+   attachment convergence and must bind these fields to Level-2 trace actions
+   in that same candidate.  p50assignment retains the P43/P48/P49 byte
+   fixtures and covers the exact P50 present/absent fixture delta plus malformed
+   short, long, partial, and zero-required-identity mutations. */
 
 class CompileJob
 {
@@ -208,6 +266,33 @@ public:
         return absent || complete;
     }
 
+    void setCompileInputIdentity(const CompileInputIdentity &identity)
+    {
+        m_compile_input = identity;
+    }
+
+    void clearCompileInputIdentity()
+    {
+        m_compile_input = CompileInputIdentity{};
+    }
+
+    const CompileInputIdentity &compileInputIdentity() const
+    {
+        return m_compile_input;
+    }
+
+    bool usesP50Input() const
+    {
+        return m_compile_input.validPresent();
+    }
+
+    bool compileInputIdentityValid() const
+    {
+        return m_compile_input.whollyAbsent()
+            || (m_compile_input.validPresent() && hasAssignmentIdentity()
+                && m_id != 0);
+    }
+
     void appendFlag(std::string arg, Argument_Type argumentType)
     {
         m_flags.append(arg, argumentType);
@@ -242,6 +327,7 @@ private:
     unsigned int m_id;
     uint64_t m_assignment_epoch;
     uint64_t m_assignment_nonce;
+    CompileInputIdentity m_compile_input;
     Language m_language;
     std::string m_compiler_pathname;
     std::string m_compiler_name;

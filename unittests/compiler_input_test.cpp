@@ -6,9 +6,13 @@
 
 #include "comm.h"
 #include "compiler_input.h"
+#include "digest128.h"
 #include "workit.h"
 
+#include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -19,6 +23,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -113,6 +118,83 @@ protected:
         return static_cast<ssize_t>(count);
     }
 };
+
+class ScriptedP50AttachedFileSource : public P50AttachedFileSource
+{
+public:
+    ScriptedP50AttachedFileSource(int fd, uint64_t expected_bytes,
+                                 std::array<uint8_t, 16> expected_digest)
+        : P50AttachedFileSource(fd, expected_bytes, expected_digest)
+    {
+    }
+
+    std::deque<WriteAction> actions;
+    std::vector<unsigned char> written;
+
+protected:
+    ssize_t write_bytes(int, const void *buffer, std::size_t size) override
+    {
+        if (actions.empty()) {
+            std::fprintf(stderr, "scripted P50 writer exhausted\n");
+            std::exit(2);
+        }
+        const WriteAction action = actions.front();
+        actions.pop_front();
+        if (action.result < 0) {
+            errno = action.error;
+            return -1;
+        }
+        const std::size_t count =
+            std::min(size, static_cast<std::size_t>(action.result));
+        const unsigned char *bytes = static_cast<const unsigned char *>(buffer);
+        written.insert(written.end(), bytes, bytes + count);
+        return static_cast<ssize_t>(count);
+    }
+};
+
+int immutable_input_fd(const std::vector<unsigned char> &bytes, bool add_seals = true,
+                       bool reopen_read_only = true)
+{
+#if defined(MFD_ALLOW_SEALING) && defined(F_ADD_SEALS)
+    const int writable = memfd_create("icecc-p50-compiler-input",
+                                      MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    if (writable < 0)
+        return -1;
+    size_t offset = 0;
+    while (offset != bytes.size()) {
+        const ssize_t result = write(writable, bytes.data() + offset,
+                                     bytes.size() - offset);
+        if (result > 0)
+            offset += static_cast<size_t>(result);
+        else if (result < 0 && errno == EINTR)
+            continue;
+        else {
+            close(writable);
+            return -1;
+        }
+    }
+    if (add_seals && fcntl(writable, F_ADD_SEALS,
+                           F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK |
+                               F_SEAL_SEAL) != 0) {
+        close(writable);
+        return -1;
+    }
+    if (!reopen_read_only) {
+        lseek(writable, 0, SEEK_SET);
+        return writable;
+    }
+    char path[64];
+    std::snprintf(path, sizeof(path), "/proc/self/fd/%d", writable);
+    const int readonly = open(path, O_RDONLY | O_CLOEXEC);
+    close(writable);
+    return readonly;
+#else
+    (void)bytes;
+    (void)add_seals;
+    (void)reopen_read_only;
+    return -1;
+#endif
+}
 
 bool wait_for_read(LegacyChunkSource &source, unsigned int stats[],
                    CompilerInputReadResult wanted)
@@ -289,6 +371,79 @@ void test_unexpected_message_and_eof()
     }
 }
 
+void test_p50_immutable_cursor_and_accounting()
+{
+    std::vector<unsigned char> payload(100006);
+    for (size_t index = 0; index != payload.size(); ++index)
+        payload[index] = static_cast<unsigned char>((index * 37u + 11u) & 0xffu);
+    const icecc::Digest128 digest = icecc::digest128(payload);
+    const int fd = immutable_input_fd(payload);
+    REQUIRE(fd >= 0, "test creates a sealed read-only P50 InputRecord cursor");
+    if (fd < 0)
+        return;
+    REQUIRE(lseek(fd, 17, SEEK_SET) == 17,
+            "test perturbs the received cursor before compiler attachment");
+    unsigned int stats[8] = {};
+    ScriptedP50AttachedFileSource source(fd, payload.size(), digest.bytes);
+    REQUIRE(source.poll_fd() >= 0 && !source.complete(),
+            "validated P50 source owns one live independent descriptor");
+    REQUIRE(source.read_next(stats) == CompilerInputReadResult::Chunk
+                && source.pending_size() == 100000,
+            "P50 source rewinds to byte zero and reads its first exact chunk");
+    REQUIRE(source.pending_compressed_size() == 0
+                && stats[JobStatistics::in_uncompressed] == 100000
+                && stats[JobStatistics::in_compressed] == 0,
+            "P50 compiler accounting never fabricates cache-wire encoded bytes");
+    source.actions.push_back({3, 0});
+    source.actions.push_back({99997, 0});
+    REQUIRE(source.write_pending(-1) == CompilerInputWriteResult::Pending
+                && source.pending_offset() == 3,
+            "P50 compiler cursor retains a short-write suffix exactly");
+    REQUIRE(source.write_pending(-1) == CompilerInputWriteResult::ChunkComplete,
+            "P50 compiler cursor completes the first chunk without duplication");
+    REQUIRE(source.read_next(stats) == CompilerInputReadResult::Chunk
+                && source.pending_size() == 6,
+            "P50 compiler cursor reads the exact final chunk");
+    source.actions.push_back({6, 0});
+    REQUIRE(source.write_pending(-1) == CompilerInputWriteResult::ChunkComplete,
+            "P50 compiler cursor writes the exact final chunk");
+    REQUIRE(source.read_next(stats) == CompilerInputReadResult::End
+                && source.complete() && source.poll_fd() == -1,
+            "P50 compiler cursor closes only at its validated exact EOF");
+    REQUIRE(source.written == payload
+                && stats[JobStatistics::in_uncompressed] == payload.size(),
+            "compiler observes every committed InputRecord byte once from byte zero");
+}
+
+void test_p50_descriptor_and_identity_rejections()
+{
+    const std::vector<unsigned char> payload{'e', 'x', 'a', 'c', 't'};
+    const icecc::Digest128 digest = icecc::digest128(payload);
+
+    auto rejected = [&](int fd, uint64_t bytes,
+                        std::array<uint8_t, 16> expected) {
+        try {
+            P50AttachedFileSource source(fd, bytes, expected);
+        } catch (const std::exception &) {
+            return true;
+        }
+        return false;
+    };
+
+    std::array<uint8_t, 16> wrong_digest = digest.bytes;
+    wrong_digest[0] ^= 1;
+    REQUIRE(rejected(immutable_input_fd(payload), payload.size(), wrong_digest),
+            "P50 compiler attachment rejects a digest mismatch before compiler fork");
+    REQUIRE(rejected(immutable_input_fd(payload), payload.size() + 1, digest.bytes),
+            "P50 compiler attachment rejects a length mismatch before compiler fork");
+    REQUIRE(rejected(immutable_input_fd(payload, false), payload.size(), digest.bytes),
+            "P50 compiler attachment rejects a mutable descriptor");
+    REQUIRE(rejected(immutable_input_fd(payload, true, false), payload.size(), digest.bytes),
+            "P50 compiler attachment rejects a writable descriptor even when sealed");
+    REQUIRE(rejected(-1, payload.size(), digest.bytes),
+            "P50 compiler attachment rejects an absent descriptor without legacy fallback");
+}
+
 }
 
 int main()
@@ -298,5 +453,7 @@ int main()
     test_discard_continues_buffered_input();
     test_interrupted_failed_and_zero_progress_writes();
     test_unexpected_message_and_eof();
+    test_p50_immutable_cursor_and_accounting();
+    test_p50_descriptor_and_identity_rejections();
     return failures == 0 ? 0 : 1;
 }

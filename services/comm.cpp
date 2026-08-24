@@ -2475,6 +2475,54 @@ void NoCSMsg::send_to_channel(MsgChannel *c) const
 }
 
 
+namespace
+{
+
+constexpr size_t P50CompileInputTailWords = 17;
+
+uint64_t read_compile_input_u64(MsgChannel *channel)
+{
+    uint32_t high = 0;
+    uint32_t low = 0;
+    *channel >> high;
+    *channel >> low;
+    return (uint64_t(high) << 32) | low;
+}
+
+void write_compile_input_u64(MsgChannel *channel, uint64_t value)
+{
+    *channel << uint32_t(value >> 32);
+    *channel << uint32_t(value);
+}
+
+std::array<uint8_t, 16> read_compile_input_128(MsgChannel *channel)
+{
+    std::array<uint8_t, 16> result{};
+    for (size_t word_index = 0; word_index != 4; ++word_index) {
+        uint32_t word = 0;
+        *channel >> word;
+        for (size_t byte_index = 0; byte_index != 4; ++byte_index) {
+            result[word_index * 4 + byte_index] =
+                uint8_t(word >> (24 - byte_index * 8));
+        }
+    }
+    return result;
+}
+
+void write_compile_input_128(MsgChannel *channel,
+                             const std::array<uint8_t, 16> &value)
+{
+    for (size_t word_index = 0; word_index != 4; ++word_index) {
+        uint32_t word = 0;
+        for (size_t byte_index = 0; byte_index != 4; ++byte_index) {
+            word = (word << 8) | value[word_index * 4 + byte_index];
+        }
+        *channel << word;
+    }
+}
+
+}
+
 void CompileFileMsg::fill_from_channel(MsgChannel *c)
 {
     Msg::fill_from_channel(c);
@@ -2543,6 +2591,29 @@ void CompileFileMsg::fill_from_channel(MsgChannel *c)
     } else {
         job->setAssignmentIdentity(0, 0);
     }
+    if (IS_PROTOCOL_VERSION(PROTOCOL_VERSION_CACHE_ADVERTISEMENT, c)) {
+        /* Protocol 50 is an unshipped draft.  Its compiler-input selector has
+           one exact fixed shape and is mandatory even when its value selects
+           the legacy source (all zero).  Truncation and extension are both
+           malformed; absence is never encoded by omitting this tail. */
+        if (c->current_message_bytes_remaining()
+                != P50CompileInputTailWords * sizeof(uint32_t)) {
+            job->clearCompileInputIdentity();
+            p50_input_tail_valid = false;
+            return;
+        }
+        CompileInputIdentity input;
+        *c >> input.profile;
+        input.c_store_guid = read_compile_input_128(c);
+        input.tu_seq = read_compile_input_u64(c);
+        input.raw_bytes = read_compile_input_u64(c);
+        input.raw_digest = read_compile_input_128(c);
+        input.attempt_id = read_compile_input_u64(c);
+        input.request_id = read_compile_input_u64(c);
+        job->setCompileInputIdentity(input);
+    } else {
+        job->clearCompileInputIdentity();
+    }
 }
 
 void CompileFileMsg::send_to_channel(MsgChannel *c) const
@@ -2591,6 +2662,16 @@ void CompileFileMsg::send_to_channel(MsgChannel *c) const
         *c << uint32_t(job->assignmentEpoch());
         *c << uint32_t(job->assignmentNonce() >> 32);
         *c << uint32_t(job->assignmentNonce());
+    }
+    if (IS_PROTOCOL_VERSION(PROTOCOL_VERSION_CACHE_ADVERTISEMENT, c)) {
+        const CompileInputIdentity &input = job->compileInputIdentity();
+        *c << input.profile;
+        write_compile_input_128(c, input.c_store_guid);
+        write_compile_input_u64(c, input.tu_seq);
+        write_compile_input_u64(c, input.raw_bytes);
+        write_compile_input_128(c, input.raw_digest);
+        write_compile_input_u64(c, input.attempt_id);
+        write_compile_input_u64(c, input.request_id);
     }
 }
 

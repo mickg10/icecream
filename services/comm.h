@@ -960,7 +960,8 @@ public:
     CompileFileMsg(CompileJob *j, bool delete_job = false)
         : Msg(Msg::COMPILE_FILE)
         , deleteit(delete_job)
-        , job(j) {}
+        , job(j)
+        , p50_input_tail_valid(true) {}
 
     ~CompileFileMsg()
     {
@@ -971,9 +972,16 @@ public:
 
     virtual void fill_from_channel(MsgChannel *c);
     virtual void send_to_channel(MsgChannel *c) const;
+    virtual bool valid_for_protocol(int negotiated_protocol) const
+    {
+        return job == nullptr || !job->usesP50Input()
+            || negotiated_protocol >= PROTOCOL_VERSION_CACHE_ADVERTISEMENT;
+    }
     virtual bool valid_payload() const
     {
-        return job != nullptr && job->assignmentIdentityValid();
+        return job != nullptr && p50_input_tail_valid
+            && job->assignmentIdentityValid()
+            && job->compileInputIdentityValid();
     }
     CompileJob *takeJob();
 
@@ -982,6 +990,10 @@ private:
 
     bool deleteit;
     CompileJob *job;
+    /* Protocol 50 is an unshipped draft, so its fixed compiler-input tail is
+       mandatory even for legacy-mode jobs (canonical all-zero value).  Keep
+       decoder shape validity separate from semantic identity validity. */
+    bool p50_input_tail_valid;
 };
 
 class FileChunkMsg : public Msg
