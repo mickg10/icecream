@@ -3,7 +3,7 @@
 Phases: up (scheduler + one iceccd per F, --network host, SSD scratch) -> test -> down.
 Down runs in a context manager so a crash still tears the cluster down.
 This first cut proves cross-host registration; the test phase is layered on next."""
-import hashlib, json, os, subprocess, sys, time, argparse
+import hashlib, json, os, re, secrets, subprocess, sys, time, argparse
 
 IMG = "icecream/farm-node:ubuntu22-gcc11-boost174"
 NET = "farmnet"
@@ -117,11 +117,26 @@ def launch_image(binary_set):
 def verify_role_files(host, root, manifest):
     """Pure verification: return a list of precise problem strings (empty
     list == every manifest-listed file matches on `host` exactly, sha256
-    AND mode). Never mutates anything. Shared by preflight() (which must
-    never repair -- only refuse) and publish_immutable_root() (which
-    uses this same check to decide whether a host is already-current or
-    needs a fresh publish, and to verify a temp sibling immediately after
-    extracting it)."""
+    AND the HARDENED mode). Never mutates anything. Shared by preflight()
+    (which must never repair -- only refuse), revalidate_before_mutation()/
+    revalidate_entire_plan(), and publish_immutable_root() (which uses
+    this same check, at three separate points in its locked transaction,
+    to decide correctness).
+
+    The expected mode is ALWAYS `_write_stripped(b["mode"])` -- not
+    "either the manifest mode or its write-stripped variant". This used to
+    accept either, because the read-only chmod hardening ran AFTER the
+    atomic rename with its failure silently ignored, so a published root
+    could legitimately still be in its pre-hardening (writable) mode. LO/BO
+    both flagged this as fail-OPEN: a crashed or silently-failed chmod left
+    a writable final root that this check still accepted as current. Fixed
+    at the source (publish_immutable_root() now chmods the TEMP tree
+    BEFORE the atomic rename and REQUIRES that chmod to succeed, so nothing
+    is ever renamed into its final, permanent name without already being
+    hardened) -- which means this check can now safely require the
+    hardened mode EXACTLY, making a regression in the hardening step
+    (or an external tamper that chmods a published root back writable)
+    deletion-sensitive again instead of silently tolerated."""
     problems = []
     for b in manifest["binaries"]:
         remote_path = f"{root}/{b['path']}"
@@ -133,39 +148,80 @@ def verify_role_files(host, root, manifest):
             problems.append(f"{remote_path} sha256 mismatch (manifest {b['sha256']}, actual {actual_sha})")
             continue
         actual_mode = mode_remote(host, remote_path)
-        if actual_mode != b["mode"] and actual_mode != _write_stripped(b["mode"]):
-            problems.append(f"{remote_path} mode mismatch (manifest {b['mode']} or "
-                             f"write-stripped {_write_stripped(b['mode'])}, actual {actual_mode})")
+        expect_mode = _write_stripped(b["mode"])
+        if actual_mode != expect_mode:
+            problems.append(f"{remote_path} mode mismatch (expected hardened {expect_mode}, actual {actual_mode})")
     return problems
 
-def _publish_script(binary_set, manifest, root, tar_name, local_tar):
-    """Build ONE remote bash script that does the ENTIRE
-    stage->verify->bind sequence under a single HOST-CANONICAL flock held
-    for its full duration -- not a hub-local lock (which only serializes
+def _publish_script(binary_set, manifest, root, src_tar_path, incoming_cleanup):
+    """Build ONE remote bash script implementing the full 8-step canonical
+    publication transaction, under a single HOST-CANONICAL flock held for
+    its ENTIRE duration -- not a hub-local lock (which only serializes
     invocations sharing this one checkout's lockfile path; a genuinely
     concurrent publisher using a different checkout, or `distribute` run
-    from cron, would not see it). The lock is a real `flock()` on a file
-    UNDER THE TARGET HOST'S OWN FILESYSTEM, acquired via `exec 9>...` +
-    `flock -x -w120 9` inside this one SSH-delivered script, so it
-    serializes ANY two processes -- from any checkout, any host, any
-    invocation mechanism -- racing to publish the SAME set on the SAME
-    host. Doing the verify-then-rename sequence as one locked script
-    (rather than the hub issuing several separate, unlocked SSH round
-    trips) is what makes the lock actually cover the critical section,
-    not just individual steps of it.
+    from cron, would not see it). The lock is a real `flock()` on a
+    SINGLE CANONICAL file UNDER THE TARGET HOST'S OWN FILESYSTEM
+    (`$HOME/role-artifacts/.publish.lock` -- one lock file per HOST, not
+    one per binary_set), acquired via `exec 9>...` + `flock -x -w120 9`
+    inside this one SSH-delivered script, shared by every checkout,
+    every binary_set, and every operator invoking `distribute` on this
+    host. Publications for DIFFERENT sets on the same host serialize
+    through this same lock -- a single well-known, auditable canonical
+    lock path wins over the small amount of extra concurrency a
+    per-set lock would allow (publish transactions are fast and rare
+    enough that this never matters in practice).
 
-    `verify BASE` (a shell function, called against $ROOT if it exists,
-    else $TMP after extraction) checks every manifest file's sha256 AND
-    mode (manifest mode OR its write-stripped variant -- see
-    _write_stripped()) against BASE, reading the (path, sha256, mode,
-    write-stripped-mode) list from an embedded heredoc so there is no
-    per-file code duplication.
+    Steps, all inside the lock (`src_tar_path` is ALREADY a local file on
+    this host by this point -- for non-q3 hosts, publish_immutable_root()
+    uploads the hub-relayed tar bytes to a unique incoming filename BEFORE
+    ever acquiring the lock; only the transaction that CONSUMES that file
+    runs locked, same as q3 consuming its own resident tar):
+
+    1. Hash the source tar and compare to manifest.tar.sha256 -- on EVERY
+       host, including q3 (previously only the hub-relay path for
+       non-q3 hosts did this; q3 extracted its local tar unchecked).
+    2. If the final name already exists: verify it (inventory + hash +
+       hardened mode, step 8's check) and exit -- already-current if
+       clean, a hard unrepaired failure if not. Never proceeds past here
+       in that case.
+    3. Extract into a FRESH TEMP SIBLING (never into the final name).
+    4. Exact inventory check on the temp tree: every non-directory entry
+       found must correspond to exactly one manifest path and vice versa
+       (no extra members, nothing missing) -- catches a tar smuggling
+       something the manifest never listed.
+    5. Every tracked path must be a regular, non-symlink file, and its
+       sha256 must match the manifest, at the PRE-hardening (original)
+       mode.
+    6. `chmod -R a-w` the temp tree -- REQUIRED to succeed (previously
+       this ran AFTER the rename with failure silently ignored via
+       `chmod ...; true`, which LO/BO both flagged as fail-open: a
+       crashed/failed chmod left a writable final root that verification
+       still accepted, since it tolerated either mode).
+    7. Re-verify the temp tree's inventory/hash/mode, now requiring the
+       HARDENED (write-stripped) mode exactly -- confirms the chmod
+       actually took effect, file by file, before anything is renamed
+       into its permanent name.
+    8. Atomic, FAIL-LOUD rename (`mv -T`, not `mv -Tn`) of the temp
+       sibling onto the final name. This is safe and correct to do
+       without the old `-n` no-clobber guard: by construction, we only
+       reach this line after already confirming (step 2, still holding
+       the SAME lock) that the final name does not exist, and the lock
+       has been held continuously since before that check, so no other
+       process can have created it in between -- an unexpected rename
+       failure here (permissions, disk full, ...) is now a genuine,
+       surprising error worth failing loudly on, not a benign
+       already-done case. Re-verify once more on the final path
+       (inventory/type/hash/hardened-mode) before declaring success.
 
     Emits exactly one final, machine-parseable status line:
     PUBLISH-ALREADY-CURRENT / PUBLISH-OK / PUBLISH-LOCK-TIMEOUT /
-    PUBLISH-EXTRACT-FAILED / PUBLISH-EXISTS-BUT-FAILS:<problems> /
+    PUBLISH-TAR-HASH-MISMATCH:<sha> / PUBLISH-EXTRACT-FAILED /
+    PUBLISH-EXISTS-BUT-FAILS:<problems> /
     PUBLISH-TEMP-VERIFY-FAILED:<problems> /
-    PUBLISH-FINAL-VERIFY-FAILED:<problems>."""
+    PUBLISH-CHMOD-FAILED / PUBLISH-HARDENED-VERIFY-FAILED:<problems> /
+    PUBLISH-RENAME-FAILED / PUBLISH-FINAL-VERIFY-FAILED:<problems>."""
+    relpaths = [b["path"] for b in manifest["binaries"]]
+    expected_relative = "\n".join(sorted(relpaths))
     filelist = "\n".join(
         f"{b['path']}\t{b['sha256']}\t{b['mode']}\t{_write_stripped(b['mode'])}"
         for b in manifest["binaries"]
@@ -177,77 +233,117 @@ def _publish_script(binary_set, manifest, root, tar_name, local_tar):
     # SAME script stayed internally consistent with that wrong path, so
     # the script still reported PUBLISH-OK. Every quoted path embedded in
     # this script uses $HOME (which DOES expand inside double quotes,
-    # being ordinary parameter expansion, not tilde expansion) instead --
-    # matching the exact store-layout spec, which already spells it
-    # $HOME/role-artifacts/store/... for this reason.
+    # being ordinary parameter expansion, not tilde expansion) instead.
     store_root_expanded = STORE_ROOT.replace("~", "$HOME", 1)
+    role_artifacts_expanded = store_root_expanded.rsplit("/", 1)[0]  # parent of .../store
     root_expanded = root.replace("~", "$HOME", 1)
-    lockfile = f"{store_root_expanded}/.publish-{binary_set}.lock"
-    if local_tar:
-        extract_line = f'tar -xf "$HOME/role-artifacts/{tar_name}" -C "$TMP"'
-    else:
-        extract_line = 'tar -x -C "$TMP"'  # reads the tar bytes from this script's own stdin
+    # Single canonical lock, one per HOST -- not one per binary_set --
+    # so p43 and p50 publications on the same host also serialize
+    # through it (see the docstring above for why that's the right
+    # tradeoff).
+    lockfile = f"{role_artifacts_expanded}/.publish.lock"
+    cleanup_line = f'rm -f "{incoming_cleanup}"' if incoming_cleanup else ":"
     return f'''set -u
+trap '{cleanup_line}' EXIT
 mkdir -p "{store_root_expanded}/{binary_set}"
 exec 9>"{lockfile}"
 if ! flock -x -w 120 9; then echo "PUBLISH-LOCK-TIMEOUT"; exit 75; fi
 
 ROOT="{root_expanded}"
 TMP="{root_expanded}.tmp-$$"
+SRC_TAR="{src_tar_path}"
 
+# verify BASE MODE_COLUMN -- MODE_COLUMN is 3 (original, pre-hardening) or
+# 4 (write-stripped, post-hardening). Checks the EXACT inventory (every
+# non-directory entry under BASE corresponds to exactly one manifest path
+# and vice versa -- no extras, nothing missing), then that every tracked
+# path is a regular, non-symlink file with the expected sha256 and mode.
 verify() {{
-    base="$1"
+    base="$1"; mcol="$2"
     FAIL=""
-    while IFS=$'\\t' read -r path sha mode1 mode2; do
+    actual_inv=$(find "$base" -mindepth 1 ! -type d 2>/dev/null | sed "s|^$base/||" | sort)
+    if [ "$actual_inv" != "$EXPECTED_INV" ]; then
+        FAIL="inventory-mismatch actual=[$actual_inv]"
+        return
+    fi
+    while IFS=$'\\t' read -r path sha mode_orig mode_hard; do
         f="$base/$path"
-        if [ ! -e "$f" ]; then FAIL="$FAIL $path:absent"; continue; fi
-        h=$(sha256sum "$f" | cut -d' ' -f1)
-        m=$(stat -c %a "$f")
+        if [ "$mcol" = "4" ]; then expect_mode="$mode_hard"; else expect_mode="$mode_orig"; fi
+        if [ -L "$f" ]; then FAIL="$FAIL $path:symlink"; continue; fi
+        if [ ! -f "$f" ]; then FAIL="$FAIL $path:not-regular-file"; continue; fi
+        h=$(sha256sum "$f"); h=${{h%% *}}
         [ "$h" = "$sha" ] || FAIL="$FAIL $path:sha256=$h"
-        if [ "$m" != "$mode1" ] && [ "$m" != "$mode2" ]; then FAIL="$FAIL $path:mode=$m"; fi
+        m=$(stat -c %a "$f")
+        [ "$m" = "$expect_mode" ] || FAIL="$FAIL $path:mode=$m(want $expect_mode)"
     done <<'FILELIST'
 {filelist}
 FILELIST
 }}
 
+EXPECTED_INV=$(cat <<'RELPATHS'
+{expected_relative}
+RELPATHS
+)
+
+# Step 1: hash the source tar on THIS host, every host including q3.
+if [ ! -f "$SRC_TAR" ]; then echo "PUBLISH-TAR-HASH-MISMATCH:absent"; exit 5; fi
+tarh=$(sha256sum "$SRC_TAR"); tarh=${{tarh%% *}}
+if [ "$tarh" != "{manifest['tar']['sha256']}" ]; then
+    echo "PUBLISH-TAR-HASH-MISMATCH:$tarh"; exit 5
+fi
+
+# Step 2: an existing final name is verified (hardened mode), never edited.
 if [ -d "$ROOT" ]; then
-    verify "$ROOT"
+    verify "$ROOT" 4
     if [ -z "$FAIL" ]; then echo "PUBLISH-ALREADY-CURRENT"; exit 0; fi
     echo "PUBLISH-EXISTS-BUT-FAILS:$FAIL"; exit 3
 fi
 
+# Step 3: extract into a fresh temp sibling. --same-permissions (-p) is
+# REQUIRED here: plain `tar -x` as a non-root user applies the extracting
+# process's UMASK on top of the archive's stored mode bits instead of
+# reproducing them exactly (caught live in a local dry run: the real p43
+# tar stores MANIFEST.tsv at mode 664, matching the manifest, but a
+# umask-022 extraction silently truncated it to 644, which the new
+# strict pre-hardening mode check -- correctly -- then refused; every
+# publish target host extracts as the non-root mickg10 SSH user, so this
+# would have hit any real host, not just the sandboxed dry run).
 rm -rf "$TMP"; mkdir -p "$TMP"
-if ! {extract_line}; then echo "PUBLISH-EXTRACT-FAILED"; rm -rf "$TMP"; exit 1; fi
+if ! tar --same-permissions -xf "$SRC_TAR" -C "$TMP"; then echo "PUBLISH-EXTRACT-FAILED"; rm -rf "$TMP"; exit 1; fi
 
-verify "$TMP"
+# Steps 4-5: exact inventory + hash/type at the PRE-hardening mode.
+verify "$TMP" 3
 if [ -n "$FAIL" ]; then echo "PUBLISH-TEMP-VERIFY-FAILED:$FAIL"; rm -rf "$TMP"; exit 2; fi
 
-mv -Tn "$TMP" "$ROOT" 2>/dev/null
-rm -rf "$TMP" 2>/dev/null
-verify "$ROOT"
+# Step 6: chmod the TEMP tree read-only -- REQUIRED to succeed.
+if ! chmod -R a-w "$TMP"; then echo "PUBLISH-CHMOD-FAILED"; rm -rf "$TMP"; exit 6; fi
+
+# Step 7: re-verify at the HARDENED mode before this is ever renamed into
+# its permanent, final name.
+verify "$TMP" 4
+if [ -n "$FAIL" ]; then echo "PUBLISH-HARDENED-VERIFY-FAILED:$FAIL"; rm -rf "$TMP"; exit 8; fi
+
+# Step 8: fail-loud atomic rename (never -n/no-clobber -- $ROOT is
+# guaranteed absent here, confirmed under this SAME lock hold in step 2;
+# a rename failure now is a genuine, surprising error, not a benign race).
+if ! mv -T "$TMP" "$ROOT"; then echo "PUBLISH-RENAME-FAILED"; rm -rf "$TMP" 2>/dev/null; exit 7; fi
+verify "$ROOT" 4
 if [ -n "$FAIL" ]; then echo "PUBLISH-FINAL-VERIFY-FAILED:$FAIL"; exit 4; fi
-chmod -R a-w "$ROOT" 2>/dev/null
 echo "PUBLISH-OK"
 '''
 
 def publish_immutable_root(host, binary_set):
     """Idempotently ensure immutable_root(binary_set) exists and is
     hash-clean on `host`, under a HOST-CANONICAL lock spanning the ENTIRE
-    stage->verify->bind sequence (see _publish_script()). If it already
-    verifies, this is a pure no-op -- "already-current". Otherwise it
-    extracts a manifest-verified copy of q3's tar into a FRESH TEMP
-    SIBLING (never into the final name directly), verifies EVERY manifest
-    entry against that temp copy, and only then atomically renames it
-    into the final immutable name (`mv -Tn`: a single rename(2) on the
-    same filesystem that refuses to clobber an existing destination --
-    verified live: GNU coreutils mv -Tn against an existing destination
-    exits 0 but performs no move, so the script always re-verifies the
-    FINAL name afterward rather than trusting the exit code). Successfully
-    published trees are chmod'd read-only (a-w) as a defense-in-depth
-    signal -- the real guarantee is that no code path in this file ever
-    attempts to write into an existing published tree again, not the
-    chmod bit alone (the owning user can always chmod their own files
-    back, same as any Unix permission).
+    8-step stage->verify->harden->bind transaction (see _publish_script()).
+    If it already verifies (at the HARDENED mode), this is a pure no-op --
+    "already-current". Otherwise it extracts a tar-hash-verified copy into
+    a FRESH TEMP SIBLING (never the final name directly), verifies every
+    manifest entry (exact inventory, no extras; regular non-symlink files;
+    sha256) against that temp copy at the pre-hardening mode, chmods it
+    read-only and REQUIRES that to succeed, re-verifies at the hardened
+    mode, and only then atomically, fail-loudly renames it into the final
+    immutable name, re-verifying once more on the final path.
 
     An EXISTING final name that fails verification is a hard, unrepaired
     failure, by design: content-addressing means a hash-named directory
@@ -259,37 +355,54 @@ def publish_immutable_root(host, binary_set):
 
     q3 cannot reach research6/research7/q2 directly on this network
     (confirmed: ssh from q3 to research6 fails host-key verification), so
-    the hub -- which reaches every host in HOSTS -- relays the tar bytes
-    rather than attempting a host-to-host rsync; on q3 itself the tar is
-    extracted locally (q3 is the source of record for the tar file, so no
-    relay is needed there).
+    the hub -- which reaches every host in HOSTS -- relays the tar bytes.
+    For non-q3 hosts, the relayed bytes are uploaded to a unique incoming
+    filename on the target host BEFORE the lock is ever acquired (a plain
+    file write, nothing to protect there); the LOCKED transaction then
+    consumes that local file exactly like q3 consumes its own resident
+    tar -- so the in-lock script is identical for every host, including
+    q3, which is also what makes the tar-hash check (step 1) uniform
+    everywhere rather than only on the hub-relay path.
 
     Returns (error, status): error=None and a human-readable status on
     success ("already-current" / "published (root was absent)"); a
-    precise reason string as error (status=None) on failure -- including
-    the hard "exists but fails verification" and "lock contended past 120s"
-    cases. Never touches docker."""
+    precise reason string as error (status=None) on failure. Never
+    touches docker."""
     manifest = load_manifest(binary_set)
     root = immutable_root(binary_set)
     tar_name = manifest["tar"]["path"]
+    incoming_cleanup = None
 
-    script = _publish_script(binary_set, manifest, root, tar_name, local_tar=(host == "q3"))
     if host == "q3":
-        r = sh(host, script, timeout=180)
-        out, rc = r.stdout, r.returncode
+        src_tar_path = f"$HOME/role-artifacts/{tar_name}"
     else:
         pull = subprocess.run(HOSTS["q3"]["ssh"] + [f"cat ~/role-artifacts/{tar_name}"],
                                capture_output=True, timeout=120)
         if pull.returncode != 0 or not pull.stdout:
             return (f"publish[{host}/{binary_set}]: could not read {tar_name} from q3: "
                     f"{pull.stderr.decode(errors='replace')[:200]}"), None
-        actual_tar_sha = hashlib.sha256(pull.stdout).hexdigest()
-        if actual_tar_sha != manifest["tar"]["sha256"]:
-            return (f"publish[{host}/{binary_set}]: tar sha256 mismatch reading from q3 "
-                    f"(manifest {manifest['tar']['sha256']}, actual {actual_tar_sha})"), None
-        p = subprocess.run(HOSTS[host]["ssh"] + [script], input=pull.stdout,
-                            capture_output=True, timeout=180)
-        out, rc = p.stdout.decode(errors="replace"), p.returncode
+        incoming_name = f"incoming-{binary_set}-{os.getpid()}-{int(time.time() * 1000)}.tar"
+        push = subprocess.run(HOSTS[host]["ssh"] + [f"mkdir -p ~/role-artifacts && cat > ~/role-artifacts/{incoming_name}"],
+                               input=pull.stdout, capture_output=True, timeout=120)
+        if push.returncode != 0:
+            # `cat > file` CREATES the destination file before it can fail
+            # partway through writing it (e.g. ENOSPC) -- caught live on a
+            # near-full disk: a failed push here left a real, partial
+            # multi-MB file behind that nothing else would ever clean up,
+            # since the locked script's own cleanup trap (which handles
+            # the SUCCESSFUL-upload case) never gets a chance to run when
+            # the upload itself is what failed. Best-effort: a failed
+            # cleanup here must never mask the original, more actionable
+            # push error.
+            sh(host, f"rm -f ~/role-artifacts/{incoming_name}")
+            return (f"publish[{host}/{binary_set}]: could not upload incoming tar to {host}: "
+                    f"{push.stderr.decode(errors='replace')[:200]}"), None
+        src_tar_path = f"$HOME/role-artifacts/{incoming_name}"
+        incoming_cleanup = f"$HOME/role-artifacts/{incoming_name}"
+
+    script = _publish_script(binary_set, manifest, root, src_tar_path, incoming_cleanup)
+    r = sh(host, script, timeout=180)
+    out, rc = r.stdout, r.returncode
 
     line = out.strip().splitlines()[-1] if out.strip() else ""
     if line == "PUBLISH-ALREADY-CURRENT":
@@ -300,6 +413,9 @@ def publish_immutable_root(host, binary_set):
         return (f"publish[{host}/{binary_set}]: could not acquire the host-canonical publish "
                 f"lock within 120s -- another publisher is (or was) mid-critical-section "
                 f"on {host} for {binary_set}"), None
+    if line.startswith("PUBLISH-TAR-HASH-MISMATCH:"):
+        return (f"publish[{host}/{binary_set}]: source tar on {host} does not match manifest.tar.sha256 "
+                f"(manifest {manifest['tar']['sha256']}, actual {line.split(':', 1)[1]})"), None
     if line.startswith("PUBLISH-EXISTS-BUT-FAILS:"):
         problems = line.split(":", 1)[1]
         return (f"publish[{host}/{binary_set}]: {root} EXISTS but FAILS verification "
@@ -312,12 +428,17 @@ def publish_immutable_root(host, binary_set):
     if line.startswith("PUBLISH-TEMP-VERIFY-FAILED:"):
         return (f"publish[{host}/{binary_set}]: freshly-extracted temp sibling failed verification "
                 f"(never renamed into the final immutable name): {line.split(':', 1)[1]}"), None
+    if line == "PUBLISH-CHMOD-FAILED":
+        return f"publish[{host}/{binary_set}]: chmod -R a-w of the temp sibling FAILED on {host} -- never renamed", None
+    if line.startswith("PUBLISH-HARDENED-VERIFY-FAILED:"):
+        return (f"publish[{host}/{binary_set}]: temp sibling failed verification AFTER hardening "
+                f"(never renamed into the final immutable name): {line.split(':', 1)[1]}"), None
+    if line == "PUBLISH-RENAME-FAILED":
+        return f"publish[{host}/{binary_set}]: atomic rename into {root} FAILED on {host} (rc={rc})", None
     if line.startswith("PUBLISH-FINAL-VERIFY-FAILED:"):
         return (f"publish[{host}/{binary_set}]: final immutable path {root} failed verification "
                 f"after publish: {line.split(':', 1)[1]}"), None
     return f"publish[{host}/{binary_set}]: unrecognized publish script output (rc={rc}): {out[-300:]!r}", None
-
-_ROLE_PROBE_PATH = {"S": "obj/scheduler/icecc-scheduler", "F": "obj/daemon/iceccd", "C": "obj/client/icecc"}
 
 def preflight(host, binary_set):
     """PURE, GENUINELY read-only resolution check: root presence + every
@@ -357,15 +478,23 @@ def preflight(host, binary_set):
                 f"(manifest {expect_digest}, actual {actual_digest!r})")
     return None
 
+HUB_LOG_DIR = os.path.expanduser("~/.farm-hub-logs")   # deliberately OUTSIDE the git
+    # checkout: HUB_DIR (the checkout's own farmharness/ directory) is used
+    # ONLY for sourcing hash-pinned harness scripts (see
+    # verify_harness_scripts()) -- writing log output there would pollute
+    # a tracked source directory with an untracked file on every run.
+
 def log_launch(line):
     """Print (the existing farm.py convention -- everything else in this
     file reports via stdout, captured by callers/tests already) AND append
-    to a durable hub-side log file, so PREFLIGHT-OK/PREFLIGHT-FAIL markers
-    survive past a single captured-stdout run too. Best-effort on the file
-    half: an unwritable log must never itself block a launch decision."""
+    to a durable hub-side log file (HUB_LOG_DIR, not the checkout), so
+    PREFLIGHT-OK/PREFLIGHT-FAIL markers survive past a single captured-
+    stdout run too. Best-effort on the file half: an unwritable log must
+    never itself block a launch decision."""
     print(line)
     try:
-        with open(os.path.join(HUB_DIR, "farm-launch.log"), "a") as f:
+        os.makedirs(HUB_LOG_DIR, exist_ok=True)
+        with open(os.path.join(HUB_LOG_DIR, "farm-launch.log"), "a") as f:
             f.write(line + "\n")
     except OSError:
         pass
@@ -482,6 +611,136 @@ def resolve_launch_plan(worker_hosts, binary_set_s, binary_set_f, client_host=No
     return LaunchPlan(s_tree, s_img, binary_set_s, f_resolved, binary_set_f,
                        c_tree, c_img, binary_set_c)
 
+def revalidate_entire_plan(worker_hosts, plan, client_host=None):
+    """Zero-mutation WHOLE-PLAN barrier: re-preflight EVERY role already
+    resolved into `plan` -- S, every F, and C (when used) -- in ONE pass,
+    called immediately before the first mutating action of this
+    invocation (see main(): the old `down_needed = True` set right after
+    resolve_launch_plan() succeeded is replaced by MUTATIONS, a tracker
+    set only from inside the actual mutating primitives themselves, so a
+    refusal HERE -- like a resolve_launch_plan() refusal -- can never
+    trigger down()).
+
+    Why this exists on top of resolve_launch_plan() (which already
+    preflighted every role once) and revalidate_before_mutation() (which
+    re-preflights ONE role immediately before THAT role's own mutation):
+    resolve_launch_plan() proves every role was valid AT THE MOMENT IT,
+    INDIVIDUALLY, was resolved -- S first, then each F in turn, then C.
+    Between the moment S is resolved and the moment the LAST F (or C) is
+    resolved, nothing has re-checked S; and between the moment resolution
+    of the WHOLE plan finishes and the moment up() performs its very
+    first mutation, nothing has re-checked ANYTHING yet either. A tamper
+    landing in either of those windows -- on any role, not just the one
+    about to be mutated -- would previously only be caught by
+    revalidate_before_mutation() at THAT role's own turn, which means an
+    EARLIER role could already have been torn down and relaunched before
+    a LATER role's corruption is discovered. This barrier closes that gap
+    by re-checking the WHOLE plan, atomically with respect to this
+    function's caller (nothing else runs between this returning clean
+    and main() proceeding into the first mutation), immediately before
+    ANY role is touched -- so a tamper anywhere in the plan is caught
+    before ANYTHING in the plan is touched, not merely before its own
+    role's turn.
+
+    revalidate_before_mutation() remains as defense-in-depth, unchanged:
+    it catches anything that lands AFTER this barrier clears but before
+    that specific role's own mutation (up()'s S->F loop and run_client()
+    each take real wall-clock time -- docker pull/start, useradd, etc. --
+    during which a LATER role in the same invocation is still exposed).
+    Neither check replaces the other; both are required, independently,
+    for the guarantee LO/BO asked for: zero mutations before a clean
+    whole-plan revalidation, AND zero mutation of role N+1 without a
+    fresh check of role N+1 specifically.
+
+    Raises RuntimeError with the exact reason on the first role that
+    fails. By construction, at the moment this raises, this invocation
+    has not mutated anything: MUTATIONS.started is still False, because
+    nothing that sets it has run yet (this is always called, in main(),
+    strictly before up()/run_client() are ever invoked)."""
+    err = preflight(SCHED_HOST, plan.binary_set_s)
+    if err:
+        log_launch(f"PREFLIGHT-FAIL host={SCHED_HOST} role=S set={plan.binary_set_s} stage=revalidate-entire-plan reason={err}")
+        raise RuntimeError(f"BARRIER REVALIDATION FAILED for S on {SCHED_HOST} "
+                            f"(immutable root or image changed since resolution): {err}")
+    for h in worker_hosts:
+        err = preflight(h, plan.binary_set_f)
+        if err:
+            log_launch(f"PREFLIGHT-FAIL host={h} role=F set={plan.binary_set_f} stage=revalidate-entire-plan reason={err}")
+            raise RuntimeError(f"BARRIER REVALIDATION FAILED for F on {h} "
+                                f"(immutable root or image changed since resolution): {err}")
+    if client_host is not None:
+        err = preflight(client_host, plan.binary_set_c)
+        if err:
+            log_launch(f"PREFLIGHT-FAIL host={client_host} role=C set={plan.binary_set_c} stage=revalidate-entire-plan reason={err}")
+            raise RuntimeError(f"BARRIER REVALIDATION FAILED for C on {client_host} "
+                                f"(immutable root or image changed since resolution): {err}")
+    log_launch(f"BARRIER-OK plan S={plan.binary_set_s} F={plan.binary_set_f} C={plan.binary_set_c} "
+               f"workers={worker_hosts} client={client_host}")
+
+class _MutationTracker:
+    """Tracks whether ANY real cluster-mutating primitive has actually
+    run yet during this process's current invocation of main(). Replaces
+    the old `down_needed = True`, which used to be set immediately after
+    resolve_launch_plan() succeeded -- i.e. BEFORE revalidate_entire_plan()
+    or up() performed a single real action -- so a barrier-revalidation
+    failure would still have left down_needed True, and down() would then
+    tear down a possibly-unrelated, pre-existing, exact-name running
+    cluster that this invocation never touched (LO/BO's finding).
+
+    `mark()` is called from inside the actual mutating primitives
+    themselves -- docker_rm(), scratch_prepare(), docker_run_detached(),
+    push_file() -- never from any call site above them (not from up(),
+    not from run_client(), not from main()). That is what makes it
+    structurally impossible for `started` to become True without a real
+    mutating action having actually run at least once: there is no code
+    path that sets it in anticipation of a mutation, only ones that set
+    it AS one already happened."""
+    def __init__(self):
+        self.started = False
+    def mark(self):
+        self.started = True
+
+MUTATIONS = _MutationTracker()
+
+def _race_gate_pause():
+    """Inert by default -- ZERO behavior change in every normal
+    invocation. A test-only seam, gated entirely by two environment
+    variables that nothing in this file ever sets (only an external test
+    harness sets them, in the environment of a subprocess it launches
+    running `python3 farm.py ...`), letting that harness pause a REAL
+    main() between plan resolution and the whole-plan barrier
+    (revalidate_entire_plan()) so it can inject genuine concurrent
+    activity -- a production distribute() call, or a tamper attempt --
+    against the SAME plan this invocation just resolved, using the SAME
+    physical host+root it actually selected, then let this invocation
+    proceed into revalidate_entire_plan() and prove the barrier catches
+    it, with zero mutations recorded and down() never called.
+
+    FARM_RACE_READY_FILE: if set, this function touches that file the
+    moment it's called -- signaling "resolve_launch_plan() just returned,
+    about to enter revalidate_entire_plan()" to whatever is watching.
+
+    FARM_RACE_CONTINUE_FILE: if set, this function then blocks (polling,
+    bounded so a broken test can't hang main() forever) until that file
+    appears, before returning control to main() to proceed into
+    revalidate_entire_plan().
+
+    Called from main() exactly once per invocation, immediately after
+    resolve_launch_plan() succeeds and before revalidate_entire_plan()."""
+    ready = os.environ.get("FARM_RACE_READY_FILE")
+    cont = os.environ.get("FARM_RACE_CONTINUE_FILE")
+    if not ready and not cont:
+        return
+    if ready:
+        with open(ready, "w") as f:
+            f.write("ready\n")
+    if cont:
+        deadline = time.time() + 120
+        while not os.path.exists(cont):
+            if time.time() > deadline:
+                raise RuntimeError(f"_race_gate_pause: continue file {cont} never appeared within 120s")
+            time.sleep(0.2)
+
 # per-host SSH argv + LAN IP + role capability
 HOSTS = {
     "q3":        {"ssh": ["ssh","-o","HostName=10.0.27.101","-o","HostKeyAlias=tt-quietbox3","-o","BatchMode=yes","mickg10@tt-quietbox3"], "ip": "10.0.27.101"},
@@ -498,6 +757,7 @@ def sh(host, cmd, timeout=120, check=False):
     return r
 
 def docker_rm(host, name):
+    MUTATIONS.mark()
     sh(host, f"docker rm -f {name} 2>/dev/null; true")
 
 def docker_run_detached(host, name, tree, img, inner_cmd):
@@ -513,7 +773,15 @@ def docker_run_detached(host, name, tree, img, inner_cmd):
     which stays writable); nothing at runtime has a legitimate reason to
     write into an immutable role-artifact root, so the container itself is
     now structurally prevented from doing so (verified live: a write
-    attempt through a `:ro` bind mount fails with "Read-only file system")."""
+    attempt through a `:ro` bind mount fails with "Read-only file system").
+
+    `inner_cmd` is expected to already carry its own attestation prefix
+    (see _attestation_prefix()) when the caller wants one -- this
+    function itself is attestation-agnostic, same as it's tree/set-
+    agnostic; it just runs whatever single command string it's given as
+    the container's `bash -c` argument (PID 1), never touching or
+    parsing it."""
+    MUTATIONS.mark()
     sh(host, f"docker run -d --name {name} --network host -v {tree}:/work:ro -v {SCRATCH}:/scratch -u 0:0 {img} "
              f"bash -c '{inner_cmd}'", check=True)
 
@@ -521,57 +789,111 @@ def scratch_prepare(host, mkdir_path, log_path):
     """Reset the SCRATCH-relative logging area on host before a launch.
     The ONLY scratch-mutating primitive up() uses -- factored out for the
     same reason as docker_run_detached() above."""
+    MUTATIONS.mark()
     sh(host, f"mkdir -p {mkdir_path} && chmod 1777 {SCRATCH}/farm && rm -f {log_path}", check=True)
 
-def verify_launched_container_identity(host, name, binary_set, role):
-    """POST-launch identity check (BO's preferred design, replacing the
-    removed pre-launch version-probe containers entirely): hash the
-    role's own tracked executable FROM INSIDE the ALREADY-RUNNING
-    container (`docker exec ... sha256sum`) and compare against the
-    manifest. This is a strictly stronger proof than a separate throwaway
-    probe container ever was -- it confirms what THIS SPECIFIC, actually
-    in-use container instance sees through its own bind mount, not merely
-    that some other container mounted the same way could execute the
-    binary and print the right banner. Called BEFORE the caller accepts
-    this container's registration/test evidence as real. Raises
-    RuntimeError on mismatch or on a `docker exec` failure -- this always
-    runs strictly after real cluster-mutating actions have already begun,
-    so (like any other RuntimeError from inside up()/run_client()) it
-    surfaces as a genuine launch failure, never a plan-validation refusal.
-    binary_set=None is a no-op, matching every other function in this
-    file's convention. Returns None on success."""
+def _attestation_token():
+    """A short, unguessable, per-container-invocation token, used only to
+    make this invocation's ARTIFACT-ATTEST-OK marker un-mistakable for a
+    stale marker left in `docker logs` by some earlier container that
+    happened to reuse the same name (see _attestation_prefix())."""
+    return secrets.token_hex(8)
+
+def _attestation_prefix(binary_set, token):
+    """Build a bash snippet -- safe to embed inside a single-quoted
+    `bash -c '...'` docker argument; it contains no single quotes
+    anywhere -- that is meant to run as the FIRST thing inside a role
+    container's own launch command, BEFORE the real role binary is ever
+    exec'd. For every file manifest[binary_set] tracks, it checks (from
+    INSIDE the container, through its own /work bind mount) that the file
+    is a regular, non-symlink file and that its sha256 matches the
+    manifest EXACTLY. If every check passes, it prints the unique marker
+    `ARTIFACT-ATTEST-OK-<token>` and falls through to whatever real
+    command the caller appends after this prefix. If ANY check fails, it
+    prints `ARTIFACT-ATTEST-FAIL` and calls `exit 97` -- which, because
+    this text runs as the container's own PID 1 (`bash -c 'PREFIX;
+    REAL_CMD'`), terminates the ENTIRE container immediately: the real
+    role binary is never reached, not merely "not yet verified". This is
+    the load-bearing difference from the round-3 design it replaces
+    (verify_launched_container_identity(), a `docker exec` run AFTER the
+    role process had already started): attestation here is baked directly
+    into the same shell invocation that starts the role process, so there
+    is no window, however small, during which an unattested container is
+    already running the real binary.
+
+    binary_set=None returns "" (a true no-op prefix), matching every
+    other function in this file's convention -- the caller's real command
+    then runs exactly as it did before attestation existed."""
     if binary_set is None:
-        return
+        return ""
     manifest = load_manifest(binary_set)
-    probe_rel = _ROLE_PROBE_PATH.get(role)
-    entry = next((b for b in manifest["binaries"] if b["path"] == probe_rel), None)
-    if entry is None:
-        return
-    r = sh(host, f"docker exec {name} sha256sum /work/{probe_rel}", timeout=30)
-    actual = r.stdout.split()[0] if r.returncode == 0 and r.stdout.strip() else None
-    if actual != entry["sha256"]:
-        raise RuntimeError(f"in-container identity check FAILED for {name} on {host}: "
-                            f"/work/{probe_rel} sha256 (manifest {entry['sha256']}, "
-                            f"in-container {actual!r}, docker exec rc={r.returncode}) -- "
-                            f"the running container's bind mount does not show the content resolution verified")
+    parts = []
+    for b in manifest["binaries"]:
+        remote = f"/work/{b['path']}"
+        parts.append(f'if [ -L "{remote}" ] || [ ! -f "{remote}" ]; then echo ARTIFACT-ATTEST-FAIL; exit 97; fi')
+        parts.append(f'h=$(sha256sum "{remote}"); h=${{h%% *}}')
+        parts.append(f'if [ "$h" != "{b["sha256"]}" ]; then echo ARTIFACT-ATTEST-FAIL; exit 97; fi')
+    parts.append(f"echo ARTIFACT-ATTEST-OK-{token}")
+    return "; ".join(parts) + "; "
+
+def wait_for_attestation(host, name, token, timeout=30):
+    """Poll `docker logs NAME` for this invocation's unique
+    ARTIFACT-ATTEST-OK-<token> marker. This is a proof-COLLECTION step,
+    not itself part of the gate: the gate is the container's own launch
+    command refusing to exec the real role binary (see
+    _attestation_prefix()), which has already succeeded or failed by the
+    time `docker run`/`docker exec` returns -- this function exists so
+    the caller gets a clear, fast, explicit RuntimeError instead of
+    silently proceeding to treat a dead-on-arrival container as healthy.
+    Fails fast on an explicit ARTIFACT-ATTEST-FAIL line rather than
+    waiting out the full timeout. Raises RuntimeError on either an
+    explicit failure or a timeout with neither line seen (e.g. the
+    container crashed before logging anything at all) -- never silently
+    treated as still-pending."""
+    marker = f"ARTIFACT-ATTEST-OK-{token}"
+    deadline = time.time() + timeout
+    r = None
+    while time.time() < deadline:
+        r = sh(host, f"docker logs {name} 2>&1", timeout=15)
+        if "ARTIFACT-ATTEST-FAIL" in r.stdout:
+            raise RuntimeError(f"in-container attestation FAILED for {name} on {host} "
+                                f"(container refused to start the real role binary -- "
+                                f"docker logs: {r.stdout[-400:]})")
+        if marker in r.stdout:
+            return
+        time.sleep(0.5)
+    tail = r.stdout[-400:] if r is not None else "(no docker logs output collected)"
+    raise RuntimeError(f"in-container attestation marker {marker!r} never appeared for {name} "
+                        f"on {host} within {timeout}s (docker logs: {tail!r})")
 
 def up(worker_hosts, plan):
     """Launch the cluster from an ALREADY-validated LaunchPlan -- up()
     itself no longer resolves or preflights anything: every role in this
     plan was already identity-bound, for every host, inside
-    resolve_launch_plan() before this function was ever called. up()
-    therefore performs ONLY the mutating actions (docker_rm,
-    scratch_prepare, docker_run_detached), each immediately preceded by
-    revalidate_before_mutation() -- a cheap, zero-docker-run re-check that
-    the SAME immutable root resolve_launch_plan() already validated is
-    still exactly what it was (the race-gate's second, independent defense
-    against anything touching a selected root between resolution and this
-    specific role's actual container start) -- and immediately FOLLOWED by
-    verify_launched_container_identity(), which hashes the role's
-    executable from inside the container that container start just
-    produced, before it is trusted for anything further. up() can no
-    longer discover a bad role partway through a launch that already tore
-    down or started an earlier one (the defect LO/BO both flagged on
+    resolve_launch_plan() (and, atomically with respect to any mutation,
+    re-bound by revalidate_entire_plan()'s whole-plan barrier) before
+    this function was ever called. up() therefore performs ONLY the
+    mutating actions (docker_rm, scratch_prepare, docker_run_detached),
+    each immediately preceded by revalidate_before_mutation() -- a cheap,
+    zero-docker-run re-check that the SAME immutable root already
+    validated is still exactly what it was (defense-in-depth on top of
+    the barrier: the barrier proves the WHOLE plan clean at one instant
+    immediately before the FIRST mutation; this closes the window a
+    later role is still exposed to while an earlier role in this same
+    loop is being launched, which takes real wall-clock time). Identity
+    is no longer separately reconfirmed AFTER each container starts
+    (the round-3 design, verify_launched_container_identity() /
+    `docker exec ... sha256sum`): each container's own launch command now
+    carries an ATTESTATION PREFIX (_attestation_prefix()) that hashes
+    every tracked file from INSIDE the container, through its own /work
+    mount, and refuses to exec the real role binary at all on any
+    mismatch -- so identity is proven (or the container dies trying)
+    strictly BEFORE the role process can start, not after. up() waits for
+    each container's ARTIFACT-ATTEST-OK marker (wait_for_attestation())
+    immediately after starting it, purely to fail fast with a clear
+    RuntimeError rather than silently racing ahead. up() can no longer
+    discover a bad role partway through a launch that already tore down
+    or started an earlier one (the defect LO/BO both flagged on
     02622ab6)."""
     sip = HOSTS[SCHED_HOST]["ip"]
     print(f"UP: scheduler on {SCHED_HOST}({sip}):{SCHED_PORT}  workers={worker_hosts}  "
@@ -581,9 +903,11 @@ def up(worker_hosts, plan):
     revalidate_before_mutation(SCHED_HOST, plan.binary_set_s)
     docker_rm(SCHED_HOST, "farm-sched")
     scratch_prepare(SCHED_HOST, f"{SCRATCH}/farm", f"{SCRATCH}/farm/sched.log")
+    s_token = _attestation_token()
     docker_run_detached(SCHED_HOST, "farm-sched", plan.s_tree, plan.s_img,
+        _attestation_prefix(plan.binary_set_s, s_token) +
         f"useradd -r icecc 2>/dev/null; exec /work/obj/scheduler/icecc-scheduler -p {SCHED_PORT} -n {NET} -l /scratch/farm/sched.log -vvv")
-    verify_launched_container_identity(SCHED_HOST, "farm-sched", plan.binary_set_s, "S")
+    wait_for_attestation(SCHED_HOST, "farm-sched", s_token)
     time.sleep(3)
     # one worker per F -- every host's role was already resolved, in order,
     # inside resolve_launch_plan(), before this loop (or anything else in
@@ -595,12 +919,14 @@ def up(worker_hosts, plan):
         docker_rm(h, "farm-worker")
         # chmod only the mickg-owned dir (not -R: stale daemon files are uid-999, unchmod-able by host user; rm clears them)
         scratch_prepare(h, f"{SCRATCH}/farm/envs", f"{SCRATCH}/farm/worker.log")
+        f_token = _attestation_token()
         docker_run_detached(h, "farm-worker", f_tree, f_img,
+            _attestation_prefix(plan.binary_set_f, f_token) +
             f"useradd -r -s /usr/sbin/nologin icecc 2>/dev/null; "
             f"chown icecc /scratch/farm/envs; "  # pre-chown as root: daemon's cleanup_cache runs post-drop (no CAP_CHOWN)
             f"exec /work/obj/daemon/iceccd -m 8 -s {sip}:{SCHED_PORT} -n {NET} -N {h}w -b /scratch/farm/envs "
             f"-p {wp} -l /scratch/farm/worker.log -vvv")
-        verify_launched_container_identity(h, "farm-worker", plan.binary_set_f, "F")
+        wait_for_attestation(h, "farm-worker", f_token)
     # wait for all workers to register
     want = len(worker_hosts)
     got = 0
@@ -620,9 +946,50 @@ def up(worker_hosts, plan):
     return got >= want
 
 SCRIPTS = ["farm_client.sh", "replay.py"]   # pushed to the client host's /scratch before a test
-HUB_DIR = "/tanksmall/scratch/claude-tmp/claude-4103/-tanksmall-MICKG2-mickg-src/a39fdb74-75de-4406-a55d-a11442769f8a/scratchpad"
+# The checkout's OWN farmharness/ directory -- NEVER an ambient path.
+# Round-4 finding (BO): this used to be a hardcoded ambient session-
+# scratch path, meaning the compatibility/JOIN-replay cells executed
+# bytes entirely outside the reviewed/committed SHA -- an execution-
+# provenance gap, even though (confirmed) the ambient copies' CONTENT
+# happened to still agree with the committed ones. Sourcing from the
+# checkout itself, plus verify_harness_scripts() below, makes that
+# agreement a verified invariant instead of a coincidence.
+HUB_DIR = os.path.dirname(os.path.abspath(__file__))
+# Frozen at commit f5d13fd9 (the original harness-freeze commit that
+# first checked farm_client.sh/replay.py into this exact repo, alongside
+# farm.py itself) -- these two scripts are the compatibility/JOIN-replay
+# half of the test harness and aren't covered by any role-manifest, so
+# their own integrity is pinned here instead, the same way every tracked
+# role binary's is pinned in role-manifests/*.json.
+FROZEN_HARNESS_HASHES = {
+    "farm_client.sh": "f502f74e7d246569fca16c231ae5a6e43809bd68cbe4401c4c72d45798b55aa7",
+    "replay.py": "427ac52d777bfdf49c98cc502d06d4279fbb373618b88b01e0e319b072d816ef",
+}
+
+def verify_harness_scripts():
+    """PURE, LOCAL, read-only check: every file in SCRIPTS, read from
+    HUB_DIR (the checkout's own farmharness/ directory), must hash to its
+    FROZEN_HARNESS_HASHES entry EXACTLY. Raises RuntimeError -- fail-
+    closed, no fallback path -- on any mismatch or on a missing/unreadable
+    file. Called from run_client() before push_file() ever runs, so a
+    tampered or drifted checkout copy of either script is refused before
+    a single byte of it reaches any host, let alone executes inside a
+    container."""
+    for s in SCRIPTS:
+        path = os.path.join(HUB_DIR, s)
+        try:
+            data = open(path, "rb").read()
+        except OSError as exc:
+            raise RuntimeError(f"harness script {s!r} unreadable at {path!r}: {exc}")
+        actual = hashlib.sha256(data).hexdigest()
+        expect = FROZEN_HARNESS_HASHES.get(s)
+        if actual != expect:
+            raise RuntimeError(f"harness script {s!r} at {path!r} sha256 mismatch "
+                                f"(frozen {expect!r}, actual {actual!r}) -- refusing to stage or "
+                                f"execute it on any host")
 
 def push_file(host, localpath, remotepath):
+    MUTATIONS.mark()
     data = open(localpath, "rb").read()
     p = subprocess.run(HOSTS[host]["ssh"] + [f"cat > {remotepath}"], input=data, capture_output=True, timeout=60)
     if p.returncode != 0:
@@ -632,24 +999,38 @@ def run_client(client_host, project_dir, mode, maxtu, jobs, prefer, plan):
     """Run the client against an ALREADY-validated LaunchPlan's C
     resolution -- like up(), run_client() no longer resolves or
     preflights anything itself; that already happened inside
-    resolve_launch_plan(), before up() was even called, let alone this
-    function. revalidate_before_mutation() runs first, before push_file()
-    even -- push_file() is itself one of the actions that must never
-    happen ahead of a full, successful (re)validation. `/work` is mounted
-    READ-ONLY (`:ro`), same reasoning as docker_run_detached().
+    resolve_launch_plan()/revalidate_entire_plan(), before up() was even
+    called, let alone this function. revalidate_before_mutation() runs
+    first, before push_file() even -- push_file() is itself one of the
+    actions that must never happen ahead of a full, successful
+    (re)validation. `/work` is mounted READ-ONLY (`:ro`), same reasoning
+    as docker_run_detached().
 
-    Unlike the prior `docker run --rm ... bash /scratch/farm_client.sh`
-    (a one-shot container whose main process WAS the test -- no point at
-    which an in-container identity check could run before that evidence
-    was already produced), the client container is now started DETACHED
-    (like the scheduler/worker), identity-checked from the inside via
-    verify_launched_container_identity() while idle, and only THEN
-    `docker exec`'d to actually run the client script -- so the
-    in-container hash check always happens strictly before any test
-    evidence is accepted, exactly like the scheduler/worker. No longer
-    self-cleaning (`--rm` is gone since the container is no longer
-    one-shot), so this always removes it before returning, success or
-    failure, via try/finally."""
+    The client container is started DETACHED (like the scheduler/worker)
+    as an idle holder (`sleep 1800`) -- there is no role binary running
+    yet at that point, so nothing to attest there. The actual role
+    action for C is farm_client.sh, invoked via a SEPARATE `docker exec`;
+    THAT invocation is where the attestation prefix belongs (BO: "before
+    farm_client.sh"), wrapped as its own `bash -c 'PREFIX; REAL_CMD'`
+    inside the exec -- so farm_client.sh, like the scheduler/daemon exec
+    in up(), is structurally unreachable unless every tracked file's
+    identity checks out first, from inside THIS container, immediately
+    before it runs. This supersedes the round-3 design
+    (verify_launched_container_identity(), a `docker exec ... sha256sum`
+    against the idle holder) with the same pre-exec, in-band mechanism
+    up() now uses for S/F -- no separate post-start check needed.
+
+    No longer self-cleaning (`--rm` is gone since the container is no
+    longer one-shot), so this always removes it before returning, success
+    or failure, via try/finally.
+
+    verify_harness_scripts() runs first, before anything else in this
+    function including revalidate_before_mutation() -- it's pure and
+    local (no host touched, no MUTATIONS mark), checking the harness
+    scripts THIS invocation is about to stage; a tampered or drifted
+    checkout copy is refused before a single byte of it reaches any
+    host, let alone a container's /scratch."""
+    verify_harness_scripts()
     revalidate_before_mutation(client_host, plan.binary_set_c)
     sched = f"{HOSTS[SCHED_HOST]['ip']}:{SCHED_PORT}"
     for s in SCRIPTS:
@@ -657,11 +1038,20 @@ def run_client(client_host, project_dir, mode, maxtu, jobs, prefer, plan):
     docker_rm(client_host, "farm-client")
     docker_run_detached(client_host, "farm-client", plan.c_tree, plan.c_img, "sleep 1800")
     try:
-        verify_launched_container_identity(client_host, "farm-client", plan.binary_set_c, "C")
-        cmd = f"docker exec farm-client bash /scratch/farm_client.sh {sched} {NET} {project_dir} {mode} {maxtu} {jobs} {prefer}"
+        c_token = _attestation_token()
+        attest = _attestation_prefix(plan.binary_set_c, c_token)
+        real_cmd = f"bash /scratch/farm_client.sh {sched} {NET} {project_dir} {mode} {maxtu} {jobs} {prefer}"
+        cmd = f"docker exec farm-client bash -c '{attest}{real_cmd}'"
         print(f"TEST: client={client_host} project={project_dir} mode={mode} maxtu={maxtu} jobs={jobs} prefer={prefer} "
               f"C-tree={plan.c_tree}")
         r = sh(client_host, cmd, timeout=1800)
+        if "ARTIFACT-ATTEST-FAIL" in (r.stdout or ""):
+            raise RuntimeError(f"in-container attestation FAILED for farm-client on {client_host} -- "
+                                f"farm_client.sh was never reached: {r.stdout[-400:]}")
+        if plan.binary_set_c is not None and f"ARTIFACT-ATTEST-OK-{c_token}" not in (r.stdout or ""):
+            raise RuntimeError(f"in-container attestation marker missing for farm-client on {client_host} "
+                                f"(expected ARTIFACT-ATTEST-OK-{c_token}); refusing to trust this run's output: "
+                                f"{r.stdout[-400:]}")
         print(r.stdout.rstrip())
         if r.stderr.strip():
             print("TEST STDERR:", r.stderr.strip()[:400])
@@ -669,14 +1059,85 @@ def run_client(client_host, project_dir, mode, maxtu, jobs, prefer, plan):
     finally:
         docker_rm(client_host, "farm-client")
 
-def dump_worker_evidence(worker_hosts, client_stdout=""):
-    # local-oracle canonical JOIN (2026-08-23 ruling): one row per expected TU, gated as a BIJECTION —
-    # client rows (JobID, endpoint, accepted, exact, sha) vs F-side job-id sets + completion counts.
+def dump_worker_evidence(worker_hosts, client_stdout, client_rc, binary_set_c=None):
+    """Bijection verdict -- STRENGTHENED per BO's cell-verdict fix.
+
+    The round-4 finding: main() used to discard this function's own
+    return value entirely (never assigned, never combined into `ok`) and
+    never inspected run_client()'s returncode either -- so a cell whose
+    client script itself failed, or whose JOIN bijection was broken,
+    still made the whole `farm.py` process exit 0. This function alone
+    can no longer cause that: it now requires ALL of --
+
+    - EXACTLY ONE parseable `CELL: project TUs=N mode=M` header line
+      (zero or more-than-one is a malformed/replayed-log situation, not
+      a clean single run);
+    - EXACTLY ONE terminal `CELL: PASS` line (a `CELL: FAIL`, or a
+      missing terminal line entirely -- e.g. a crash mid-replay -- is a
+      hard fail here, never silently ignored);
+    - the JOINROW count equals N * (2 if mode == "sequence" else 1) --
+      replay.py's own `sequence` mode genuinely replays every TU TWICE
+      (once cold, once warm; see its `main()`), so this is the correct
+      expected cardinality, not an arbitrary guess;
+    - every row's accepted/exact/mode fields are exactly "1"/"1"/"remote";
+    - client-reported job IDs are unique and none is -1 (a JOINROW with
+      jobid=-1 means replay.py's own assignment-line regex never matched
+      anything for that TU -- genuinely missing evidence, not a valid id);
+    - EXACT set equality between the client's reported job IDs and the
+      union of every F host's OWN requested-job-id log entries --
+      PREVIOUSLY a SUBSET check (`<=`), which could not detect an F host
+      reporting job IDs the client never actually claimed (e.g. stale
+      entries surviving from an earlier, different run on a shared host);
+    - the sum of every F host's own completion count equals the total
+      JOINROW count (no orphaned completions, none missing).
+
+    `client_rc` (run_client()'s own `r.returncode`) is accepted here
+    PURELY for inclusion in the printed CELL-VERDICT line -- it is
+    deliberately NOT part of this function's own returned boolean (BO's
+    exact spec keeps `client_ok`/`join_ok` as two separately-combined
+    values in main(): `ok = ok and client_ok and join_ok`).
+
+    ANY malformed input (unparseable rows, missing fields, non-integer
+    IDs, a transport error while querying an F host's log) is caught and
+    turned into a FALSE verdict -- this function must NEVER raise, since
+    an uncaught exception here would propagate past main()'s own
+    result-combination logic as an uncontrolled crash (a different,
+    equally bad way for a real failure to not end up reflected as a
+    normal, deliberate nonzero process exit), even though the
+    `finally: down()` teardown itself would still run either way."""
+    try:
+        return _dump_worker_evidence_impl(worker_hosts, client_stdout, client_rc, binary_set_c)
+    except Exception as exc:
+        print(f"CELL-VERDICT: join_ok=False client_rc={client_rc!r} error={exc!r} "
+              f"-- malformed/missing evidence, refusing to call this a pass")
+        return False
+
+def _dump_worker_evidence_impl(worker_hosts, client_stdout, client_rc, binary_set_c):
+    lines = client_stdout.splitlines()
+
+    headers = [ln for ln in lines if re.match(r"^CELL: project TUs=\d+ mode=\S+", ln)]
+    header_ok = len(headers) == 1
+    n_expected, mode = None, None
+    if header_ok:
+        hm = re.match(r"^CELL: project TUs=(\d+) mode=(\S+)", headers[0])
+        n_expected, mode = int(hm.group(1)), hm.group(2)
+
+    terminal_ok = sum(1 for ln in lines if ln == "CELL: PASS") == 1
+
     rows = []
-    for ln in client_stdout.splitlines():
+    for ln in lines:
         if ln.startswith("JOINROW "):
-            d = dict(kv.split("=", 1) for kv in ln.split()[1:] if "=" in kv)
-            rows.append(d)
+            rows.append(dict(kv.split("=", 1) for kv in ln.split()[1:] if "=" in kv))
+    n = len(rows)
+
+    expected_rows = n_expected * (2 if mode == "sequence" else 1) if header_ok else None
+    rows_ok = header_ok and expected_rows is not None and n == expected_rows
+
+    cl_ids = [int(r0["jobid"]) for r0 in rows]
+    ok_rows = bool(rows) and all(r0.get("accepted") == "1" and r0.get("exact") == "1"
+                                  and r0.get("mode") == "remote" for r0 in rows)
+    uniq = len(set(cl_ids)) == n and -1 not in cl_ids
+
     fmap = {}   # host -> (requested job-id set, completions)
     for h in worker_hosts:
         r = sh(h, f"grep -oE 'request for job [0-9]+' {SCRATCH}/farm/worker.log 2>/dev/null | grep -oE '[0-9]+'; true")
@@ -686,18 +1147,22 @@ def dump_worker_evidence(worker_hosts, client_stdout=""):
         except Exception: comp = 0
         fmap[h] = (ids, comp)
         print(f"  F={h}: requested-job-ids={len(ids)} completions(exit0)={comp}")
-    # bijection checks
-    n = len(rows)
-    cl_ids = [int(r0["jobid"]) for r0 in rows]
-    ok_rows  = all(r0["accepted"] == "1" and r0["exact"] == "1" and r0["mode"] == "remote" for r0 in rows)
-    uniq     = len(set(cl_ids)) == n and -1 not in cl_ids
-    f_union  = set().union(*(v[0] for v in fmap.values())) if fmap else set()
-    covered  = set(cl_ids) <= f_union
-    no_orph  = sum(v[1] for v in fmap.values()) == n     # F completions == accepted client rows (no orphan)
-    verdict = ok_rows and uniq and covered and no_orph and n > 0
-    print(f"CELL-JOIN: rows={n} all-accepted-exact-remote={ok_rows} jobids-unique={uniq} "
-          f"F-coverage={covered} no-orphans={no_orph} -> BIJECTION {'OK' if verdict else 'FAIL'}")
-    return verdict
+
+    f_union = set().union(*(v[0] for v in fmap.values())) if fmap else set()
+    set_equal = set(cl_ids) == f_union   # EXACT equality -- was `<=` (subset), the bug BO found
+    completions = sum(v[1] for v in fmap.values())
+    completions_ok = completions == n
+
+    join_ok = (header_ok and terminal_ok and rows_ok and ok_rows and uniq
+               and set_equal and completions_ok and n > 0)
+
+    print(f"CELL-JOIN: rows={n} expected_rows={expected_rows} header_ok={header_ok} "
+          f"terminal_ok={terminal_ok} all-accepted-exact-remote={ok_rows} jobids-unique={uniq} "
+          f"F-set-equal={set_equal} completions={completions}/{n} -> BIJECTION {'OK' if join_ok else 'FAIL'}")
+    print(f"CELL-VERDICT: join_ok={join_ok} client_rc={client_rc!r} expected_rows={expected_rows!r} "
+          f"actual_rows={n} set_equal={set_equal} f_completions={completions} "
+          f"product={binary_set_c!r} harness=f5d13fd9 run={int(time.time())}-{os.getpid()}")
+    return join_ok
 
 def down(worker_hosts, client_host=None):
     print("DOWN: tearing down cluster")
@@ -773,14 +1238,21 @@ def main():
     prefer = (workers[0] + "w") if len(workers) == 1 else ""   # pin for 1 F; let scheduler balance for >1 F
     want_client = a.phase == "up-test-down"
     ok = False
-    down_needed = False   # flips True only once real launch actions begin --
-                           # see resolve_launch_plan()/up() docstrings. A
-                           # plan-validation refusal must NEVER call down():
-                           # down() docker-rm's the fixed farm-{sched,worker,
-                           # client} names unconditionally, which could
-                           # disturb a pre-existing, unrelated, exact-name
-                           # running cluster while this invocation is simply
-                           # declining to start a NEW one (LO's finding).
+    # MUTATIONS.started replaces the old `down_needed = True`, which used
+    # to be set immediately after resolve_launch_plan() succeeded -- i.e.
+    # BEFORE revalidate_entire_plan()'s whole-plan barrier, or up(), had
+    # performed a single real action. That meant a barrier-revalidation
+    # failure still left down_needed True, and down() would then
+    # docker-rm the fixed farm-{sched,worker,client} names unconditionally,
+    # which could disturb a pre-existing, unrelated, exact-name running
+    # cluster while this invocation was simply declining to start a NEW
+    # one (LO/BO's finding). MUTATIONS.started only becomes True from
+    # INSIDE the actual mutating primitives (docker_rm, scratch_prepare,
+    # docker_run_detached, push_file) the first time any of them actually
+    # runs -- see up()/run_client() -- so a refusal at ANY point before
+    # that (resolve_launch_plan(), the race-gate seam, or
+    # revalidate_entire_plan()) can never trigger down().
+    MUTATIONS.started = False
     try:
         try:
             plan = resolve_launch_plan(workers, a.binary_set_s, a.binary_set_f,
@@ -793,29 +1265,55 @@ def main():
             # taken, down() never invoked.
             print(f"REFUSED: {exc}")
         else:
-            down_needed = True   # every role in the plan validated; real
-                                  # actions begin now, so teardown owes a
-                                  # visit regardless of what happens below.
+            # Test-only seam, inert by default (see _race_gate_pause()):
+            # lets an external harness pause a REAL main() here, inject
+            # genuine concurrent activity against the plan just resolved,
+            # then let this invocation proceed into the barrier below and
+            # prove it refuses cleanly. Zero effect on any normal run.
+            _race_gate_pause()
             try:
-                ok = up(workers, plan)
+                revalidate_entire_plan(workers, plan, a.client if want_client else None)
             except RuntimeError as exc:
-                # Real launch actions had already begun (down_needed is
-                # already True) -- this is a genuine command failure
-                # mid-launch, not a plan-validation refusal.
-                print(f"LAUNCH FAILED: {exc}")
-                ok = False
+                # Whole-plan barrier refused. resolve_launch_plan() proved
+                # every role valid AT ITS OWN resolution time, but nothing
+                # has mutated anything yet -- MUTATIONS.started is still
+                # False here, by construction (nothing that sets it has
+                # run). Exactly like a resolve_launch_plan() failure: a
+                # clean refusal, zero docker/scratch/push actions taken,
+                # down() never invoked.
+                print(f"REFUSED: {exc}")
             else:
-                print("CLUSTER:", "REGISTERED-OK" if ok else "REGISTRATION-FAILED")
-                if ok and want_client:
-                    try:
-                        r = run_client(a.client, a.project, a.mode, a.maxtu, a.jobs, prefer, plan)
-                    except RuntimeError as exc:
-                        print(f"LAUNCH FAILED: {exc}")
-                        ok = False
-                    else:
-                        dump_worker_evidence(workers, r.stdout)
+                try:
+                    ok = up(workers, plan)
+                except RuntimeError as exc:
+                    # Real launch actions had already begun (up() always
+                    # marks a mutation before this can raise) -- this is a
+                    # genuine command failure mid-launch, not a
+                    # plan-validation refusal.
+                    print(f"LAUNCH FAILED: {exc}")
+                    ok = False
+                else:
+                    print("CLUSTER:", "REGISTERED-OK" if ok else "REGISTRATION-FAILED")
+                    if ok and want_client:
+                        try:
+                            r = run_client(a.client, a.project, a.mode, a.maxtu, a.jobs, prefer, plan)
+                        except RuntimeError as exc:
+                            print(f"LAUNCH FAILED: {exc}")
+                            ok = False
+                        else:
+                            # Round-4 cell-verdict fix (BO): r.returncode and
+                            # dump_worker_evidence()'s own bijection verdict
+                            # used to both be silently discarded here, so a
+                            # cell whose client script failed, or whose JOIN
+                            # was broken, still exited 0 -- false-green. Both
+                            # are now real, separately-named values combined
+                            # into `ok`, which alone controls the process's
+                            # final exit code below.
+                            client_ok = (r.returncode == 0)
+                            join_ok = dump_worker_evidence(workers, r.stdout, r.returncode, a.binary_set_c)
+                            ok = ok and client_ok and join_ok
     finally:
-        if down_needed and a.phase in ("up-down", "up-test-down"):
+        if MUTATIONS.started and a.phase in ("up-down", "up-test-down"):
             down(workers, a.client)
     sys.exit(0 if ok else 2)
 
