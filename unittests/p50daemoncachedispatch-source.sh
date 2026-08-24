@@ -27,6 +27,7 @@ grep -F '../cache/p50_daemon_cache_dispatch.cpp' "$makefile" >/dev/null
 grep -F '../cache/p50_daemon_cache_dispatch.cpp' "$src/unittests/Makefile.am" >/dev/null
 test -f "$impl"
 test -f "$header"
+test -x "$src/unittests/p50daemoncachedispatch-sanitize.sh"
 grep -F 'real public iceccd listener' "$real_test" >/dev/null
 grep -F 'CACHE_SESSION and failed closed boundedly' "$real_test" >/dev/null
 
