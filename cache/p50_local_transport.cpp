@@ -22,6 +22,10 @@ constexpr size_t kPayloadLengthOffset = 8;
 constexpr size_t kGenerationOffset = 12;
 constexpr size_t kAttemptOffset = 20;
 
+#if defined(ICECC_P50_LOCAL_TRANSPORT_TEST_HOOKS)
+thread_local ConnectAttemptTestHook connect_attempt_test_hook = nullptr;
+#endif
+
 void put_u16(uint8_t* out, uint16_t value) {
     out[0] = static_cast<uint8_t>(value >> 8);
     out[1] = static_cast<uint8_t>(value);
@@ -218,6 +222,14 @@ ConnectRetryWaitResult wait_for_connect_retry(
     return std::chrono::steady_clock::now() >= deadline
                ? ConnectRetryWaitResult::Timeout
                : ConnectRetryWaitResult::Continue;
+}
+
+int connect_once(int fd, const sockaddr* address, socklen_t address_length) noexcept {
+#if defined(ICECC_P50_LOCAL_TRANSPORT_TEST_HOOKS)
+    if (connect_attempt_test_hook != nullptr)
+        return connect_attempt_test_hook(fd, address, address_length);
+#endif
+    return ::connect(fd, address, address_length);
 }
 
 int accept_cloexec(int listener_fd) {
@@ -753,8 +765,8 @@ Connection connect_unix_until(const std::string& path,
 
         const socklen_t address_length =
             static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + path.size() + 1);
-        const int connect_result =
-            ::connect(fd, reinterpret_cast<const sockaddr*>(&address), address_length);
+        const int connect_result = connect_once(
+            fd, reinterpret_cast<const sockaddr*>(&address), address_length);
         const int connect_error = errno;
 
         if (connect_result < 0 &&
@@ -826,6 +838,18 @@ Connection connect_unix_until(const std::string& path,
     set_status(Status::IoError, status);
     return Connection(-1);
 }
+
+#if defined(ICECC_P50_LOCAL_TRANSPORT_TEST_HOOKS)
+Connection connect_unix_until_with_test_hook(
+    const std::string& path, std::chrono::steady_clock::time_point deadline,
+    Status* status, ConnectAttemptTestHook hook) noexcept {
+    const ConnectAttemptTestHook previous = connect_attempt_test_hook;
+    connect_attempt_test_hook = hook;
+    Connection result = connect_unix_until(path, deadline, status);
+    connect_attempt_test_hook = previous;
+    return result;
+}
+#endif
 
 Connection accept_unix(int listener_fd, Status* status) noexcept {
     if (listener_fd < 0) {

@@ -102,6 +102,53 @@ int raw_nonblocking_unix_client(const std::string& path) {
     return -1;
 }
 
+struct EintrConnectProbe {
+    int calls = 0;
+    int first_fd = -1;
+    struct stat first_stat{};
+    bool first_stat_valid = false;
+    bool first_closed = false;
+    bool second_distinct = false;
+    bool second_cloexec = false;
+};
+
+EintrConnectProbe* active_eintr_probe = nullptr;
+
+int force_first_connect_eintr(int fd, const void* address, size_t address_length) noexcept {
+    if (active_eintr_probe == nullptr)
+        return ::connect(fd, static_cast<const sockaddr*>(address),
+                         static_cast<socklen_t>(address_length));
+
+    ++active_eintr_probe->calls;
+    if (active_eintr_probe->calls == 1) {
+        active_eintr_probe->first_fd = fd;
+        active_eintr_probe->first_stat_valid =
+            ::fstat(fd, &active_eintr_probe->first_stat) == 0;
+        errno = EINTR;
+        return -1;
+    }
+
+    const int flags = ::fcntl(fd, F_GETFD);
+    active_eintr_probe->second_cloexec =
+        flags >= 0 && (flags & FD_CLOEXEC) != 0;
+    struct stat second_stat{};
+    if (active_eintr_probe->first_stat_valid && ::fstat(fd, &second_stat) == 0) {
+        active_eintr_probe->second_distinct =
+            fd != active_eintr_probe->first_fd ||
+            second_stat.st_dev != active_eintr_probe->first_stat.st_dev ||
+            second_stat.st_ino != active_eintr_probe->first_stat.st_ino;
+    }
+    if (fd == active_eintr_probe->first_fd) {
+        active_eintr_probe->first_closed = active_eintr_probe->second_distinct;
+    } else {
+        errno = 0;
+        active_eintr_probe->first_closed =
+            ::fcntl(active_eintr_probe->first_fd, F_GETFD) < 0 && errno == EBADF;
+    }
+    return ::connect(fd, static_cast<const sockaddr*>(address),
+                     static_cast<socklen_t>(address_length));
+}
+
 bool fill_unix_listener_queue(const std::string& path, std::vector<int>& clients) {
     for (int attempt = 0; attempt != 64; ++attempt) {
         const int fd = raw_nonblocking_unix_client(path);
@@ -507,6 +554,21 @@ void bounded_unix_connect() {
     CHECK((::fcntl(immediate.native_handle(), F_GETFL) & O_NONBLOCK) == 0);
     CHECK((::fcntl(immediate.native_handle(), F_GETFD) & FD_CLOEXEC) != 0);
     int accepted = ::accept(listener, nullptr, nullptr);
+    CHECK(accepted >= 0);
+    ::close(accepted);
+
+    EintrConnectProbe interrupted_probe;
+    active_eintr_probe = &interrupted_probe;
+    Connection interrupted = connect_unix_until_with_test_hook(
+        path, std::chrono::steady_clock::now() + std::chrono::milliseconds(250), &status,
+        force_first_connect_eintr);
+    active_eintr_probe = nullptr;
+    CHECK(interrupted.valid() && status == Status::Ok);
+    CHECK(interrupted_probe.calls == 2);
+    CHECK(interrupted_probe.first_closed);
+    CHECK(interrupted_probe.second_distinct);
+    CHECK(interrupted_probe.second_cloexec);
+    accepted = ::accept(listener, nullptr, nullptr);
     CHECK(accepted >= 0);
     ::close(accepted);
 

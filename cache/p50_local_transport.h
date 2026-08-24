@@ -277,6 +277,15 @@ Connection accept_unix(int listener_fd, Status* status = nullptr) noexcept;
 using ListenPostBindTestHook = bool (*)(const char* path) noexcept;
 int listen_unix_with_test_hook(const std::string& path, int backlog,
                                Status* status, ListenPostBindTestHook hook) noexcept;
+
+// Compile-time-only connect seam for forcing one kernel-error branch in the
+// focused runtime test.  The hook receives a borrowed address view and must
+// not retain it; production builds do not declare or emit this entry point.
+using ConnectAttemptTestHook = int (*)(int fd, const void* address,
+                                       size_t address_length) noexcept;
+Connection connect_unix_until_with_test_hook(
+    const std::string& path, std::chrono::steady_clock::time_point deadline,
+    Status* status, ConnectAttemptTestHook hook) noexcept;
 #endif
 
 } // namespace icecc::p50::local

@@ -67,7 +67,7 @@ bounded_connector_source() {
         printf '%s\n' "$body" | grep -F 'getsockopt(fd, SOL_SOCKET, SO_ERROR' >/dev/null &&
         printf '%s\n' "$body" | grep -F 'original_flags & ~O_NONBLOCK' >/dev/null &&
         printf '%s\n' "$body" | grep -F 'std::chrono::steady_clock::now() >= deadline' >/dev/null &&
-        test "$(printf '%s\n' "$body" | grep -Fc '::connect(fd')" -eq 1 &&
+        test "$(printf '%s\n' "$body" | grep -Fc 'connect_once(')" -eq 1 &&
         test "$(printf '%s\n' "$body" | grep -Fc 'private_parent(path)')" -ge 2 &&
         test "$(printf '%s\n' "$body" | grep -Fc 'private_socket_node(path)')" -ge 2 &&
         printf '%s\n' "$body" | grep -F 'kMaxAdmissionAttempts' >/dev/null
@@ -144,13 +144,6 @@ if ! pending_retry_body "$transport" | grep -F '::close(fd);' >/dev/null ||
 fi
 echo 'ok - EAGAIN/EINTR path closes before fresh admission retry'
 
-sed 's/ || connect_error == EAGAIN//' "$transport" >"$connector_mutant"
-if bounded_connector_source "$connector_mutant"; then
-    echo 'FAIL: EAGAIN pending-condition deletion mutant was accepted' >&2
-    exit 1
-fi
-echo 'ok - EAGAIN pending-condition deletion mutant is rejected'
-
 sed '/::close(fd);/d' "$transport" >"$connector_mutant"
 if pending_retry_body "$connector_mutant" | grep -F '::close(fd);' >/dev/null; then
     echo 'FAIL: EAGAIN fresh-close deletion mutant was accepted' >&2
@@ -165,13 +158,60 @@ if bounded_connector_source "$connector_mutant"; then
 fi
 echo 'ok - fresh-attempt endpoint revalidation deletion mutant is rejected'
 
-sed 's/const int connect_error = errno;/const int connect_error = errno; const int forbidden_retry = ::connect(fd, reinterpret_cast<const sockaddr*>(&address), address_length);/' \
+sed '/const int connect_result = connect_once(/a\        const int forbidden_retry = connect_once(fd, reinterpret_cast<const sockaddr*>(&address), address_length);' \
     "$transport" >"$connector_mutant"
 if bounded_connector_source "$connector_mutant"; then
     echo 'FAIL: same-descriptor connect retry mutant was accepted' >&2
     exit 1
 fi
 echo 'ok - same-descriptor connect retry mutant is rejected'
+
+# Compile and execute behavioral mutants.  These are intentionally stronger
+# than nearby-string predicates: the test-only EINTR hook must still reach a
+# fresh successful attempt, and the real backlog must still wait for EAGAIN
+# admission rather than fail immediately.  The production object never sees
+# this hook because it is compiled only with ICECC_P50_LOCAL_TRANSPORT_TEST_HOOKS.
+cxx=${ICECC_TEST_CXX:-g++}
+run_expected_mutant_failure() {
+    mutant_source=$1
+    label=$2
+    mutant_binary=$(mktemp "${TMPDIR:-/tmp}/p50localtransport-${label}.XXXXXX")
+    mutant_log=$(mktemp "${TMPDIR:-/tmp}/p50localtransport-${label}-log.XXXXXX")
+    trap 'rm -f "$mutant_binary" "$mutant_log"' HUP INT TERM
+    if ! "$cxx" -std=c++20 -Wall -Wextra -Werror -pthread -I"$src" \
+        -DICECC_P50_LOCAL_TRANSPORT_TEST_HOOKS -I"$src/cache" \
+        "$src/unittests/p50_local_transport_test.cpp" -x c++ "$mutant_source" \
+        -o "$mutant_binary" >"$mutant_log" 2>&1; then
+        echo "FAIL: $label mutant did not compile" >&2
+        cat "$mutant_log" >&2
+        return 1
+    fi
+    if "$mutant_binary" >"$mutant_log" 2>&1; then
+        echo "FAIL: $label mutant passed focused runtime" >&2
+        cat "$mutant_log" >&2
+        return 1
+    fi
+    rm -f "$mutant_binary" "$mutant_log"
+    return 0
+}
+
+eintr_mutant=$(mktemp "${TMPDIR:-/tmp}/p50localtransport-eintr-mutant.XXXXXX")
+sed 's/ || connect_error == EINTR//g' "$transport" >"$eintr_mutant"
+if ! run_expected_mutant_failure "$eintr_mutant" eintr; then
+    exit 1
+fi
+rm -f "$eintr_mutant"
+echo 'ok - executable EINTR deletion mutant is rejected'
+
+eagain_mutant=$(mktemp "${TMPDIR:-/tmp}/p50localtransport-eagain-mutant.XXXXXX")
+sed -e 's/connect_error == EAGAIN/false/g' \
+    -e 's/connect_error == EWOULDBLOCK/false/g' \
+    "$transport" >"$eagain_mutant"
+if ! run_expected_mutant_failure "$eagain_mutant" eagain; then
+    exit 1
+fi
+rm -f "$eagain_mutant"
+echo 'ok - executable EAGAIN/EWOULDBLOCK deletion mutant is rejected'
 
 # A bounded read/write operation must use per-call MSG_DONTWAIT and never
 # toggle the shared open-file-description status flags.  The connector above
@@ -232,10 +272,10 @@ trap 'rm -f "$send_mutant" "$mutant" "$production_object" "$hook_mutant_object"'
     -UICECC_P50_LOCAL_TRANSPORT_TEST_HOOKS -c "$transport" -o "$production_object"
 
 production_safe() {
-    if nm -C "$1" | grep -E 'listen_unix_with_test_hook|ListenPostBindTestHook|getenv|usleep' >/dev/null; then
+    if nm -C "$1" | grep -E 'listen_unix_with_test_hook|ListenPostBindTestHook|connect_unix_until_with_test_hook|ConnectAttemptTestHook|connect_attempt_test_hook|getenv|usleep' >/dev/null; then
         return 1
     fi
-    if strings "$1" | grep -E 'ICECC_P50_LOCAL_TRANSPORT_TEST_HOOKS|ICECC_TEST_LOCAL_TRANSPORT|listen_unix_with_test_hook' >/dev/null; then
+    if strings "$1" | grep -E 'ICECC_P50_LOCAL_TRANSPORT_TEST_HOOKS|ICECC_TEST_LOCAL_TRANSPORT|listen_unix_with_test_hook|connect_unix_until_with_test_hook|ConnectAttemptTestHook|connect_attempt_test_hook' >/dev/null; then
         return 1
     fi
 }
