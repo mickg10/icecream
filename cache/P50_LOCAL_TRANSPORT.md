@@ -33,6 +33,10 @@ shutdown around this boundary.  Listener and accepted/client descriptors are
 `CLOEXEC`; SIGPIPE is suppressed with `MSG_NOSIGNAL` or `SO_NOSIGPIPE`, and
 platforms with neither fail closed.
 
+The connection also exposes peer verification and a finite-time framed receive
+without exposing a borrowed descriptor.  This lets a synchronous control
+owner wake and close a stalled relationship during signal-driven shutdown.
+
 Socket paths must be absolute, contain no embedded NUL, and reside in a
 directory owned by the effective user with exact mode `0700`.  The listener
 never replaces an existing node; its socket node is owned by the effective
