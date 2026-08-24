@@ -11,7 +11,7 @@ addressed immutable roots" below), published there from q3's tar on demand
 checkpoint** -- a zero-mutation whole-plan barrier, a mutation-started
 tracker replacing the old pre-emptive teardown flag, in-command
 "attestation" superseding the post-start in-container check, a rewritten
-8-step locked publication transaction, a genuinely concurrent
+sealed-source locked publication transaction, a genuinely concurrent
 production-`main()`-driven race gate, hash-pinned harness-script
 sourcing from the checkout (never an ambient path), and a strengthened
 cell-verdict combination in `main()`/`dump_worker_evidence()` that closes
@@ -163,7 +163,7 @@ mutable per-set path, never a symlink/alias. This means:
   re-run `distribute`, which republishes fresh under the SAME
   content-addressed name.
 
-## Publish mechanism: the 8-step locked transaction (`publish_immutable_root()` / `_publish_script()`)
+## Publish mechanism: the locked transaction (`publish_immutable_root()` / `_publish_script()`)
 
 Round 3's publish script has been rewritten to close every gap LO/BO
 flagged on it. The ENTIRE stage -> verify -> harden -> bind sequence still
@@ -179,41 +179,58 @@ never actually matters). Acquired via `exec 9>lockfile && flock -x -w120
 
 Inside the lock, in order:
 
-1. **Hash the source tar and compare to `manifest.tar.sha256` -- on EVERY
-   host, including q3.** Round 3 only did this on the hub-relay path for
-   non-q3 hosts; q3 extracted its own local tar unchecked. Now uniform:
-   for non-q3 hosts, the hub-relayed tar bytes are uploaded to a UNIQUE
-   incoming filename BEFORE the lock is ever acquired (a plain file
-   write, nothing to protect there); the locked transaction then consumes
-   that local file exactly like q3 consumes its own resident tar, so the
-   in-lock script is byte-identical on every host.
-2. If the final name already exists: verify it (full inventory + hash +
+1. **Pin the source tar into one Linux sealed memfd.** A short `python3`
+   helper opens the source pathname exactly once, copies at most the
+   manifest's declared tar size, applies `F_SEAL_WRITE | F_SEAL_GROW |
+   F_SEAL_SHRINK | F_SEAL_SEAL`, and stays alive until the transaction exits.
+   The source pathname is never reopened after this point. Hash and byte-size
+   validation, all list-only header checks, and extraction reopen only
+   `/proc/<helper-pid>/fd/<memfd>`. Thus a same-UID replacement, rewrite, or
+   deletion after pinning cannot change the bytes consumed by publication;
+   a regular fd, chmod, or same-UID pathname copy would not provide this
+   guarantee.
+2. **Hash and size the pinned object and compare to the manifest -- on EVERY
+   host, including q3.** For non-q3 hosts, the hub-relayed bytes are uploaded
+   to a UNIQUE incoming filename BEFORE the lock is acquired; only the
+   one-time pin opens that pathname. The locked script is otherwise
+   byte-identical on every host.
+3. If the final name already exists: verify it (full inventory + hash +
    HARDENED mode) and exit -- already-current if clean, a hard unrepaired
    failure if not. Never proceeds past here in that case.
-3. Extract into a FRESH TEMP SIBLING (never the final name directly), via
+4. **Pre-extraction tar header validation** is list-only: reject absolute or
+   traversal paths, duplicate normalized names, non-regular/non-directory
+   types, excess member count/aggregate size, and any name/type/size mismatch
+   with the manifest. No archive byte is extracted before this gate passes.
+5. Extract into a FRESH TEMP SIBLING (never the final name directly), via
    `tar --same-permissions -xf`.
-4. **Exact inventory check**: every non-directory entry found under the
+6. **Exact inventory check**: every non-directory entry found under the
    temp tree corresponds to exactly one manifest path and vice versa --
    catches a tar smuggling something the manifest never listed (round 3
    only checked that listed paths existed, never that nothing EXTRA was
    present).
-5. Every tracked path must be a regular, non-symlink file, with the
+7. Every tracked path must be a regular, non-symlink file, with the
    correct sha256 at the PRE-hardening (original) mode.
-6. `chmod -R a-w` the temp tree -- **REQUIRED to succeed** (round 3 ran
+8. `chmod -R a-w` the temp tree -- **REQUIRED to succeed** (round 3 ran
    this AFTER the rename with the failure silently ignored via `chmod
    ...; true` -- LO/BO both flagged this as fail-open: a crashed/skipped
    chmod left a writable final root that the OLD verification still
    accepted, because it tolerated either mode).
-7. Re-verify the temp tree, now requiring the HARDENED (write-stripped)
+9. Re-verify the temp tree, now requiring the HARDENED (write-stripped)
    mode EXACTLY -- confirms the chmod actually took effect, file by file,
    before anything is renamed into its permanent name.
-8. **Fail-loud atomic rename** (`mv -T`, never `mv -Tn`/no-clobber) of the
+10. **Fail-loud atomic rename** (`mv -T`, never `mv -Tn`/no-clobber) of the
    temp sibling onto the final name. Safe without the `-n` guard: by
    construction, the final name's absence was already confirmed (step 2)
    under this SAME continuously-held lock, so a rename failure here is
    now a genuine, surprising error worth failing loudly on, not a benign
    already-done race. Re-verifies once more on the final path
    (inventory/type/hash/hardened-mode) before declaring `PUBLISH-OK`.
+
+The local discriminator supplies `FARM_PUBLISH_PIN_READY_FILE` and
+`FARM_PUBLISH_PIN_CONTINUE_FILE` to pause exactly after the memfd is sealed.
+It atomically replaces the source, deletes it, and resumes; both runs must
+publish the original bytes. A deletion/replacement mutant that rewires
+consumers from `PIN_TAR` back to `SRC_TAR` must fail before publication.
 
 **`verify_role_files()` (shared by `preflight()`, the barrier, and the
 publish script's own checks) now requires the HARDENED (write-stripped)
@@ -645,7 +662,7 @@ real remote compiles, `CELL: PASS`, `join_ok=True`, clean teardown.
 checkout) is refused with `HARNESS-STAGE-FAIL` before a single line of
 `farm_client.sh`/`replay.py` output ever appears.
 
-### 3. TAR HEADER PRE-VALIDATION (`_publish_script()`, new step 3)
+### 3. TAR HEADER PRE-VALIDATION (`_publish_script()`, new step 4)
 
 The old design's first content check ran AFTER extraction
 (`verify()` against the temp tree, steps 5-6) -- which can only ever
@@ -653,7 +670,7 @@ see what actually landed WITHIN the temp sibling. A tar smuggling an
 absolute-path or `../`-traversal member writes OUTSIDE that tree during
 extraction itself, before any post-extraction check ever runs.
 
-Fixed: a new step 3 runs `tar -tf`/`tar -tvf` (list-only, never writes
+Fixed: a new step 4 runs `tar -tf`/`tar -tvf` (list-only, never writes
 to disk) BEFORE extraction, rejecting: absolute-path members, `../`
 path-traversal components (a precise regex matching only a true `..`
 PATH SEGMENT, not merely two adjacent dots inside an otherwise-
@@ -758,7 +775,7 @@ to special-case where a root's bytes actually live.
 
 For each (set, host) pair it checks the content-addressed
 `immutable_root(binary_set)` against the manifest, under the
-single-canonical-lock 8-step transaction described above.
+single-canonical-lock sealed-source transaction described above.
 Already-published-and-verified is a pure no-op (`already-current`; a
 second run of the command above is verified idempotent). Absent is
 published fresh (`published (root was absent)`).
@@ -1017,7 +1034,7 @@ is the entire HOLD"):
 
 | Claim | Runs in |
 |---|---|
-| Publication 8-step transaction (tar-hash, inventory, type, hardening, lock, atomic rename) | **PRODUCTION**: `_publish_script()`/`publish_immutable_root()`, called directly by `distribute()` and every publication test |
+| Publication locked transaction (sealed-tar pin, tar-hash/size, header, inventory, type, hardening, lock, atomic rename) | **PRODUCTION**: `_publish_script()`/`publish_immutable_root()`, called directly by `distribute()` and every publication test |
 | `verify_role_files()` hardened-mode-exact check | **PRODUCTION**: shared by `preflight()`, the barrier, and the publish script |
 | Whole-plan barrier | **PRODUCTION**: `revalidate_entire_plan()`, called from `main()` |
 | Per-role defense-in-depth | **PRODUCTION**: `revalidate_before_mutation()`, called from `up()`/`run_client()` |
@@ -1027,6 +1044,7 @@ is the entire HOLD"):
 | Harness-script integrity (HUB_DIR, hash pinning) | **PRODUCTION**: `verify_harness_scripts()`, called as the first line of `run_client()` |
 | Harness PRIVATE STAGING (round 5) | **PRODUCTION**: `_build_harness_bundle()`, `_harness_stage_verify()`, `docker_run_foreground_staged()` -- all called from `run_client()`, which streams the bundle into a real foreground `docker run -i` |
 | Tar header pre-validation (round 6) | **PRODUCTION**: the step-3 block inside `_publish_script()`'s generated remote script compares normalized manifest name/type/per-file-size rows before extraction, run by every real `distribute()`/`publish_immutable_root()` call |
+| Source-tar sealed-memfd pin + post-pin replacement/deletion races (round 7) | **PRODUCTION**: `_publish_script()` pins once and all hash/header/extraction consumers read only its sealed `/proc/<pid>/fd/<fd>`; **TEST SCAFFOLDING**: `s4_round6_unit_test.py`'s deterministic ready/continue seam and unpinned deletion mutant |
 | Digest-ref-exact image verification + `--pull=never` (round 5) | **PRODUCTION**: `image_digest_remote(host, binary_set)`, called from `preflight()`; `--pull=never` in `docker_run_detached()`/`docker_run_foreground_staged()`'s own command strings |
 | No-git fresh-archive fallback (round 5) | **TEST SCAFFOLDING**: the fresh-archive gate itself is test infrastructure, not production `farm.py` code -- but the claim under test (farm.py imports and both manifests load cleanly from a bare, non-git tree) exercises real, unmodified `farm.load_manifest()`/module-import behavior |
 | Cell-verdict combination (`client_ok`/`join_ok`/`ok`) | **PRODUCTION**: the three-line combination in `main()`, immediately after `run_client()` returns |

@@ -180,7 +180,7 @@ def verify_role_files(host, root, manifest):
     return problems
 
 def _publish_script(binary_set, manifest, root, src_tar_path, incoming_cleanup):
-    """Build ONE remote bash script implementing the full 8-step canonical
+    """Build ONE remote bash script implementing the full locked canonical
     publication transaction, under a single HOST-CANONICAL flock held for
     its ENTIRE duration -- not a hub-local lock (which only serializes
     invocations sharing this one checkout's lockfile path; a genuinely
@@ -203,9 +203,14 @@ def _publish_script(binary_set, manifest, root, src_tar_path, incoming_cleanup):
     ever acquiring the lock; only the transaction that CONSUMES that file
     runs locked, same as q3 consuming its own resident tar):
 
-    1. Hash the source tar and compare to manifest.tar.sha256 -- on EVERY
-       host, including q3 (previously only the hub-relay path for
-       non-q3 hosts did this; q3 extracted its local tar unchecked).
+    1. Pin the source tar into a Linux sealed memfd. The helper opens the
+       source pathname exactly once, copies those bytes into the memfd, and
+       applies F_SEAL_WRITE|F_SEAL_GROW|F_SEAL_SHRINK|F_SEAL_SEAL before
+       handing the descriptor back. The hash, size, header validation, and
+       extraction below all reopen only the immutable /proc/<pid>/fd/<fd>
+       object -- never the mutable source pathname. This closes the same-UID
+       source-tar replacement/rewrite/deletion TOCTOU that a plain open fd or
+       a same-UID pathname copy would leave open.
     2. If the final name already exists: verify it (inventory + hash +
        hardened mode, step 9's check) and exit -- already-current if
        clean, a hard unrepaired failure if not. Never proceeds past here
@@ -291,7 +296,21 @@ def _publish_script(binary_set, manifest, root, src_tar_path, incoming_cleanup):
     lockfile = f"{role_artifacts_expanded}/.publish.lock"
     cleanup_line = f'rm -f "{incoming_cleanup}"' if incoming_cleanup else ":"
     return f'''set -u
-trap '{cleanup_line}' EXIT
+
+# Keep the sealed memfd helper alive until this script exits. Its descriptor
+# is the sole source consumed by every validation/extraction command below.
+cleanup_pin() {{
+    if [ -n "${{PIN_HELPER_PID:-}}" ]; then
+        kill "$PIN_HELPER_PID" 2>/dev/null || :
+        wait "$PIN_HELPER_PID" 2>/dev/null || :
+    fi
+    [ -z "${{PIN_INFO:-}}" ] || rm -f -- "$PIN_INFO"
+    [ -z "${{PIN_ERR:-}}" ] || rm -f -- "$PIN_ERR"
+}}
+PIN_HELPER_PID=""
+PIN_INFO=""
+PIN_ERR=""
+trap 'cleanup_pin; {cleanup_line}' EXIT
 mkdir -p "{store_root_expanded}/{binary_set}"
 exec 9>"{lockfile}"
 if ! flock -x -w 120 9; then echo "PUBLISH-LOCK-TIMEOUT"; exit 75; fi
@@ -299,6 +318,95 @@ if ! flock -x -w 120 9; then echo "PUBLISH-LOCK-TIMEOUT"; exit 75; fi
 ROOT="{root_expanded}"
 TMP="{root_expanded}.tmp-$$"
 SRC_TAR="{src_tar_path}"
+
+# Pin the source pathname exactly once. libc's memfd_create() plus all four
+# content seals and F_SEAL_SEAL provide one same-UID-resistant immutable byte
+# object. The bounded copy also prevents an unexpected source rewrite from
+# turning publication into an unbounded memory allocation.
+PIN_INFO=$(mktemp "$HOME/role-artifacts/.publish-pin.XXXXXX")
+PIN_ERR="$PIN_INFO.err"
+python3 - "$SRC_TAR" "{manifest['tar']['size']}" >"$PIN_INFO" 2>"$PIN_ERR" <<'PIN_HELPER_PY' &
+import ctypes, fcntl, os, sys, time
+
+try:
+    path = sys.argv[1]
+    max_size = int(sys.argv[2])
+    libc = ctypes.CDLL(None, use_errno=True)
+    create = libc.memfd_create
+    create.argtypes = [ctypes.c_char_p, ctypes.c_uint]
+    create.restype = ctypes.c_int
+    fd = create(b"farm-publish-tar", 2)  # MFD_ALLOW_SEALING
+    if fd < 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+    total = 0
+    with open(path, "rb", buffering=0) as source:
+        while True:
+            chunk = source.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_size:
+                raise RuntimeError("source exceeds manifest tar.size")
+            view = memoryview(chunk)
+            while view:
+                written = os.write(fd, view)
+                view = view[written:]
+    # F_SEAL_SEAL|F_SEAL_SHRINK|F_SEAL_GROW|F_SEAL_WRITE.
+    fcntl.fcntl(fd, 1033, 0x1 | 0x2 | 0x4 | 0x8 | 0x10)
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.write(1, (str(os.getpid()) + " " + str(fd) + "\\n").encode())
+    os.close(1)
+    while True:
+        time.sleep(3600)
+except Exception as exc:
+    try:
+        os.write(2, ("pin failed: " + str(exc) + "\\n").encode())
+    except OSError:
+        pass
+    os._exit(111)
+PIN_HELPER_PY
+PIN_HELPER_PID=$!
+PIN_WAIT=0
+while [ ! -s "$PIN_INFO" ]; do
+    if ! kill -0 "$PIN_HELPER_PID" 2>/dev/null; then
+        wait "$PIN_HELPER_PID" 2>/dev/null || :
+        echo "PUBLISH-TAR-PIN-FAILED"
+        exit 5
+    fi
+    if [ "$PIN_WAIT" -ge 1200 ]; then
+        echo "PUBLISH-TAR-PIN-FAILED"
+        exit 5
+    fi
+    PIN_WAIT=$((PIN_WAIT + 1))
+    sleep 0.1
+done
+read -r PIN_PID PIN_FD < "$PIN_INFO"
+if [ -z "$PIN_PID" ] || [ -z "$PIN_FD" ] || [ "$PIN_PID" != "$PIN_HELPER_PID" ]; then
+    echo "PUBLISH-TAR-PIN-FAILED"
+    exit 5
+fi
+PIN_TAR="/proc/$PIN_PID/fd/$PIN_FD"
+if [ ! -r "$PIN_TAR" ]; then
+    echo "PUBLISH-TAR-PIN-FAILED"
+    exit 5
+fi
+
+# Deterministic unit-test seam; inert unless both variables are supplied by a
+# local test process. Production callers never set these environment values.
+if [ -n "${{FARM_PUBLISH_PIN_READY_FILE:-}}" ]; then
+    touch -- "$FARM_PUBLISH_PIN_READY_FILE"
+fi
+if [ -n "${{FARM_PUBLISH_PIN_CONTINUE_FILE:-}}" ]; then
+    PIN_DEADLINE=$((SECONDS + 120))
+    while [ ! -e "$FARM_PUBLISH_PIN_CONTINUE_FILE" ]; do
+        if [ "$SECONDS" -ge "$PIN_DEADLINE" ]; then
+            echo "PUBLISH-TAR-PIN-FAILED"
+            exit 5
+        fi
+        sleep 0.1
+    done
+fi
 
 # verify BASE MODE_COLUMN -- MODE_COLUMN is 3 (original, pre-hardening) or
 # 4 (write-stripped, post-hardening). Checks the EXACT inventory (every
@@ -332,9 +440,16 @@ EXPECTED_INV=$(cat <<'RELPATHS'
 RELPATHS
 )
 
-# Step 1: hash the source tar on THIS host, every host including q3.
-if [ ! -f "$SRC_TAR" ]; then echo "PUBLISH-TAR-HASH-MISMATCH:absent"; exit 5; fi
-tarh=$(sha256sum "$SRC_TAR"); tarh=${{tarh%% *}}
+# Step 1: hash and size the SEALED PINNED tar object on THIS host, every host
+# including q3. SRC_TAR is deliberately absent from every tar/hash command:
+# replacement, rewrite, or deletion of that mutable pathname after pinning
+# cannot influence validation or extraction.
+pin_size=$(wc -c < "$PIN_TAR") || {{ echo "PUBLISH-TAR-PIN-FAILED"; exit 5; }}
+if [ "$pin_size" != "{manifest['tar']['size']}" ]; then
+    echo "PUBLISH-TAR-SIZE-MISMATCH:$pin_size"; exit 5
+fi
+tarh=$(sha256sum "$PIN_TAR") || {{ echo "PUBLISH-TAR-PIN-FAILED"; exit 5; }}
+tarh=${{tarh%% *}}
 if [ "$tarh" != "{manifest['tar']['sha256']}" ]; then
     echo "PUBLISH-TAR-HASH-MISMATCH:$tarh"; exit 5
 fi
@@ -351,7 +466,7 @@ fi
 # normalized duplicates, then compare every regular member one-to-one
 # against the committed manifest's name, type and exact per-file size.
 # The post-extraction inventory remains defense-in-depth.
-TAR_NAMES=$(tar -tf "$SRC_TAR") || {{ echo "PUBLISH-TAR-HEADER-INVALID:list-failed"; exit 10; }}
+TAR_NAMES=$(tar -tf "$PIN_TAR") || {{ echo "PUBLISH-TAR-HEADER-INVALID:list-failed"; exit 10; }}
 TAR_N=$(printf '%s\n' "$TAR_NAMES" | grep -c .)
 if [ "$TAR_N" -eq 0 ] || [ "$TAR_N" -gt 200 ]; then
     echo "PUBLISH-TAR-HEADER-INVALID:member-count=$TAR_N"; exit 10
@@ -363,7 +478,7 @@ TAR_NORMALIZED=$(printf '%s\n' "$TAR_NAMES" | sed -e 's#^\./##' -e 's#/$##')
 if [ "$(printf '%s\n' "$TAR_NORMALIZED" | sort -u | wc -l)" != "$TAR_N" ]; then
     echo "PUBLISH-TAR-HEADER-INVALID:duplicate-normalized-member-names"; exit 10
 fi
-TAR_VERBOSE=$(tar -tvf "$SRC_TAR" --numeric-owner --quoting-style=escape) || {{ echo "PUBLISH-TAR-HEADER-INVALID:verbose-list-failed"; exit 10; }}
+TAR_VERBOSE=$(tar -tvf "$PIN_TAR" --numeric-owner --quoting-style=escape) || {{ echo "PUBLISH-TAR-HEADER-INVALID:verbose-list-failed"; exit 10; }}
 TAR_BADTYPES=$(printf '%s\n' "$TAR_VERBOSE" | awk 'substr($1,1,1) !~ /^[-d]$/ {{print substr($1,1,1)}}')
 if [ -n "$TAR_BADTYPES" ]; then
     echo "PUBLISH-TAR-HEADER-INVALID:non-regular-entry-type"; exit 10
@@ -409,7 +524,7 @@ done < <(printf '%s\n' "$TAR_VERBOSE" | awk 'substr($1,1,1) == "d" {{print $6}}'
 # publish target host extracts as the non-root mickg10 SSH user, so this
 # would have hit any real host, not just the sandboxed dry run).
 rm -rf "$TMP"; mkdir -p "$TMP"
-if ! tar --same-permissions -xf "$SRC_TAR" -C "$TMP"; then echo "PUBLISH-EXTRACT-FAILED"; rm -rf "$TMP"; exit 1; fi
+if ! tar --same-permissions -xf "$PIN_TAR" -C "$TMP"; then echo "PUBLISH-EXTRACT-FAILED"; rm -rf "$TMP"; exit 1; fi
 
 # Steps 5-6: exact inventory + hash/type at the PRE-hardening mode.
 verify "$TMP" 3
@@ -435,7 +550,7 @@ echo "PUBLISH-OK"
 def publish_immutable_root(host, binary_set):
     """Idempotently ensure immutable_root(binary_set) exists and is
     hash-clean on `host`, under a HOST-CANONICAL lock spanning the ENTIRE
-    8-step stage->verify->harden->bind transaction (see _publish_script()).
+    sealed-pin->stage->verify->harden->bind transaction (see _publish_script()).
     If it already verifies (at the HARDENED mode), this is a pure no-op --
     "already-current". Otherwise it extracts a tar-hash-verified copy into
     a FRESH TEMP SIBLING (never the final name directly), verifies every
@@ -464,7 +579,9 @@ def publish_immutable_root(host, binary_set):
     q3, which is also what makes the tar-hash check (step 1) uniform
     everywhere rather than only on the hub-relay path.
 
-    Returns (error, status): error=None and a human-readable status on
+    The source tar is pinned into a sealed memfd before any manifest/hash/
+    header/extraction consumer opens it; the mutable source pathname is never
+    reopened after that pin. Returns (error, status): error=None and a human-readable status on
     success ("already-current" / "published (root was absent)"); a
     precise reason string as error (status=None) on failure. Never
     touches docker."""
@@ -513,6 +630,12 @@ def publish_immutable_root(host, binary_set):
         return (f"publish[{host}/{binary_set}]: could not acquire the host-canonical publish "
                 f"lock within 120s -- another publisher is (or was) mid-critical-section "
                 f"on {host} for {binary_set}"), None
+    if line == "PUBLISH-TAR-PIN-FAILED":
+        return (f"publish[{host}/{binary_set}]: could not create and seal one immutable source-tar "
+                f"byte object on {host} (source pathname was never consumed by validation/extraction)", None)
+    if line.startswith("PUBLISH-TAR-SIZE-MISMATCH:"):
+        return (f"publish[{host}/{binary_set}]: pinned source tar size does not match manifest.tar.size "
+                f"(manifest {manifest['tar']['size']}, actual {line.split(':', 1)[1]})"), None
     if line.startswith("PUBLISH-TAR-HASH-MISMATCH:"):
         return (f"publish[{host}/{binary_set}]: source tar on {host} does not match manifest.tar.sha256 "
                 f"(manifest {manifest['tar']['sha256']}, actual {line.split(':', 1)[1]})"), None

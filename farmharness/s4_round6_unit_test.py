@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -38,14 +39,49 @@ def make_tar(root, names):
     return path
 
 
-def run_publish(tmp, tar_path, manifest, root_name="root"):
+def run_publish(tmp, tar_path, manifest, root_name="root", env_extra=None, script=None):
     root = f"~/role-artifacts/store/p50/{root_name}"
-    script = farm._publish_script("p50", manifest, root, "$HOME/bundle.tar", None)
+    if script is None:
+        script = farm._publish_script("p50", manifest, root, "$HOME/bundle.tar", None)
     env = dict(os.environ, HOME=str(tmp))
+    if env_extra:
+        env.update(env_extra)
     (tmp / "bundle.tar").write_bytes(tar_path.read_bytes())
     result = subprocess.run(["bash", "-c", script], env=env,
                             text=True, capture_output=True)
     return result
+
+
+def run_post_pin_race(tmp, source_tar, replacement_tar, manifest, root_name, mode,
+                      script=None):
+    """Run one publication while replacing/deleting the source after pinning."""
+    root = f"~/role-artifacts/store/p50/{root_name}"
+    if script is None:
+        script = farm._publish_script("p50", manifest, root, "$HOME/bundle.tar", None)
+    source = tmp / "bundle.tar"
+    source.write_bytes(source_tar.read_bytes())
+    ready = tmp / f"{root_name}.ready"
+    cont = tmp / f"{root_name}.continue"
+    env = dict(os.environ, HOME=str(tmp),
+               FARM_PUBLISH_PIN_READY_FILE=str(ready),
+               FARM_PUBLISH_PIN_CONTINUE_FILE=str(cont))
+    proc = subprocess.Popen(["bash", "-c", script], env=env,
+                            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    deadline = time.time() + 10
+    while not ready.exists() and proc.poll() is None and time.time() < deadline:
+        time.sleep(0.01)
+    check(ready.exists(), f"publication did not expose its post-pin race point: {proc.poll()}")
+    if mode == "replace":
+        swap = tmp / f"{root_name}.swap.tar"
+        shutil.copyfile(replacement_tar, swap)
+        os.replace(swap, source)
+    elif mode == "delete":
+        source.unlink()
+    else:
+        raise AssertionError(f"unknown race mode {mode!r}")
+    cont.touch()
+    stdout, stderr = proc.communicate(timeout=20)
+    return subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
 
 
 def function_call_count(source, function_name, callee_name):
@@ -70,12 +106,72 @@ def main():
             "tar": {"path": "bundle.tar", "sha256": "", "size": 0},
         }
         good = make_tar(tmp, [("obj/client/icecc", payload, 0o755)])
+        approved_source = tmp / "approved-source.tar"
+        approved_source.write_bytes(good.read_bytes())
         base["tar"]["sha256"] = hashlib.sha256(good.read_bytes()).hexdigest()
         base["tar"]["size"] = good.stat().st_size
 
         ok = run_publish(tmp, good, base, "good")
         check(ok.returncode == 0 and "PUBLISH-OK" in ok.stdout,
               f"good archive did not publish: rc={ok.returncode} out={ok.stdout!r} err={ok.stderr!r}")
+
+        # Round-7 discriminator: after pinning, replacement/rewrite of the
+        # mutable source pathname must not alter the bytes validated or
+        # extracted.  The replacement archive has the same manifest shape but
+        # a different payload and hash; the pinned original must still win.
+        replacement_dir = tmp / "replacement"
+        replacement_dir.mkdir()
+        replacement_payload = b"replacement-must-not-win\n"
+        replacement = make_tar(replacement_dir,
+                               [("obj/client/icecc", replacement_payload, 0o755)])
+        raced = run_post_pin_race(tmp, approved_source, replacement, base,
+                                  "post-pin-replacement", "replace")
+        check(raced.returncode == 0 and "PUBLISH-OK" in raced.stdout,
+              f"sealed pin did not survive source replacement: rc={raced.returncode} "
+              f"out={raced.stdout!r} err={raced.stderr!r}")
+        published = tmp / "role-artifacts/store/p50/post-pin-replacement/obj/client/icecc"
+        check(published.read_bytes() == payload,
+              "source replacement after pinning influenced extracted bytes")
+
+        # Deletion is a separate mutant: a source pathname disappearing after
+        # pinning is equally harmless to the immutable publication.
+        deleted = run_post_pin_race(tmp, approved_source, replacement, base,
+                                    "post-pin-deletion", "delete")
+        check(deleted.returncode == 0 and "PUBLISH-OK" in deleted.stdout,
+              f"sealed pin did not survive source deletion: rc={deleted.returncode} "
+              f"out={deleted.stdout!r} err={deleted.stderr!r}")
+        deleted_published = tmp / "role-artifacts/store/p50/post-pin-deletion/obj/client/icecc"
+        check(deleted_published.read_bytes() == payload,
+              "source deletion after pinning changed extracted bytes")
+
+        generated = farm._publish_script("p50", base,
+                                         "~/role-artifacts/store/p50/pin-source-check",
+                                         "$HOME/bundle.tar", None)
+        check("memfd_create" in generated and "F_SEAL_SEAL" in generated,
+              "publication script does not create a fully sealed Linux memfd")
+        check("/proc/$PIN_PID/fd/$PIN_FD" in generated,
+              "publication script does not consume the pinned descriptor")
+        check('tar -tf "$SRC_TAR"' not in generated and
+              'tar -tvf "$SRC_TAR"' not in generated and
+              'sha256sum "$SRC_TAR"' not in generated,
+              "a validation/extraction command still reopens the mutable source pathname")
+
+        # Deterministic deletion mutant: replacing all pinned-object consumers
+        # with the mutable pathname must go red at the exact same post-pin
+        # deletion point. This is a regression discriminator, not a permitted
+        # production fallback.
+        unpinned = generated.replace('"$PIN_TAR"', '"$SRC_TAR"')
+        mutant = run_post_pin_race(tmp, approved_source, replacement, base,
+                                   "unpinned-deletion-mutant", "delete", unpinned)
+        mutant_root = tmp / "role-artifacts/store/p50/unpinned-deletion-mutant"
+        check(mutant.returncode != 0 and not mutant_root.exists(),
+              "deletion mutant unexpectedly published after removing pinned consumers")
+        replacement_mutant = run_post_pin_race(
+            tmp, approved_source, replacement, base,
+            "unpinned-replacement-mutant", "replace", unpinned)
+        replacement_mutant_root = tmp / "role-artifacts/store/p50/unpinned-replacement-mutant"
+        check(replacement_mutant.returncode != 0 and not replacement_mutant_root.exists(),
+              "replacement mutant unexpectedly published after removing pinned consumers")
 
         extra = make_tar(tmp, [("obj/client/icecc", payload, 0o755),
                               ("unexpected", b"escape", 0o644)])
@@ -103,6 +199,12 @@ def main():
         out = run_publish(tmp, wrong_size, wrong_manifest, "wrong-size")
         check("manifest-name-type-size-mismatch" in out.stdout,
               "per-file tar size mismatch was not rejected before extraction")
+
+        tar_size_manifest = json.loads(json.dumps(base))
+        tar_size_manifest["tar"]["size"] += 1
+        out = run_publish(tmp, good, tar_size_manifest, "wrong-tar-size")
+        check("PUBLISH-TAR-SIZE-MISMATCH" in out.stdout,
+              "pinned tar byte-size was not checked against manifest.tar.size")
 
         src = (HERE / "farm.py").read_text()
         publish_script = farm._publish_script("p50", base,
@@ -181,7 +283,7 @@ def main():
         check(labels[0] != hashlib.sha256(b"").hexdigest(),
               "no-Git authority hash is the empty-input digest")
 
-    print("s4-round6-local: PASS (staging invariants + pre-extraction extra/size mutants)")
+    print("s4-round6/7-local: PASS (staging + pre-extraction + sealed-source TOCTOU mutants)")
 
 
 if __name__ == "__main__":
