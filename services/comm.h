@@ -48,6 +48,7 @@
 #define PROTOCOL_VERSION_JOB_LOCAL_FLAGS 48
 #define PROTOCOL_VERSION_ASSIGNMENT_FENCE 49
 #define PROTOCOL_VERSION_ASSIGNMENT_IDENTITY 50
+#define PROTOCOL_VERSION_RESULT_DISPOSITION 50
 /* Deliberately shares 50 with PROTOCOL_VERSION_ASSIGNMENT_IDENTITY: owner
    ruling on the d23d9c5d HOLD holds that protocol 50 is an in-development
    draft with no deployed base (43 is the deployed floor; the owner-
@@ -168,7 +169,12 @@ public:
         // deliberately outside both the historical ASCII vocabulary and the
         // Protocol-49 private block; it is never meaningful below exactly
         // Protocol 50.
-        CACHE_SESSION = 0x50f00000
+        CACHE_SESSION = 0x50f00000,
+
+        // Protocol-50-only result disposition.  0x50f00001 is reserved by
+        // CACHE_SESSION_READY_MAGIC (a raw handoff witness, not a Msg), so
+        // this ordinary framed message deliberately uses the next value.
+        RESULT_DISPOSITION = 0x50f00002
     };
 
     Msg() = default;
@@ -270,6 +276,8 @@ public:
                 return "REVOKE_RESULT";
             case CACHE_SESSION:
                 return "CACHE_SESSION";
+            case RESULT_DISPOSITION:
+                return "RESULT_DISPOSITION";
         }
         return "UNKNOWN";
     }
@@ -865,6 +873,7 @@ public:
     {
         return (uint64_t(assignment_nonce_hi) << 32) | assignment_nonce_lo;
     }
+
     bool hasAssignmentIdentity() const
     {
         return assignmentEpoch() != 0 && assignmentNonce() != 0;
@@ -1071,6 +1080,118 @@ public:
     std::string err;
     bool was_out_of_memory;
     bool have_dwo_file;
+};
+
+/*
+ * P50 result disposition carried on the ordinary framed link.
+ *
+ * This is intentionally a wire-only acknowledgement/disposition carrier;
+ * it does not alter CompileResultMsg.  Its identity is exactly the identity
+ * already carried by the P50 assignment and CompileFile messages:
+ * job_id, assignment epoch/nonce, and CompileInputIdentity.  In particular,
+ * no run id, selected-F id, F-store id, endpoint generation, or protocol-51
+ * extension is implied here.
+ *
+ * The body after the message type is fixed at 23 words:
+ *   job_id (1), epoch/nonce (4), CompileInputIdentity (17), disposition (1).
+ * A P50 input selector is either wholly absent (all zero) or validPresent();
+ * partial selectors are never accepted.  The assignment itself is required
+ * to be complete because a disposition without a job and assignment fence
+ * cannot be safely matched to a result attempt.
+ */
+class ResultDispositionMsg : public Msg
+{
+public:
+    enum Disposition : uint32_t {
+        Accepted = 1,
+        DefinitiveCancel = 2,
+        // Descriptive alias for callers that use result terminology.
+        Rejected = DefinitiveCancel
+    };
+
+    static constexpr size_t FixedPayloadWords = 23;
+
+    ResultDispositionMsg()
+        : Msg(Msg::RESULT_DISPOSITION)
+        , job_id(0)
+        , assignment_epoch_hi(0)
+        , assignment_epoch_lo(0)
+        , assignment_nonce_hi(0)
+        , assignment_nonce_lo(0)
+        , compile_input()
+        , disposition(DefinitiveCancel)
+        , wire_payload_valid(true) {}
+
+    ResultDispositionMsg(uint32_t id, uint64_t epoch, uint64_t nonce,
+                         const CompileInputIdentity &input,
+                         Disposition result)
+        : Msg(Msg::RESULT_DISPOSITION)
+        , job_id(id)
+        , assignment_epoch_hi(uint32_t(epoch >> 32))
+        , assignment_epoch_lo(uint32_t(epoch))
+        , assignment_nonce_hi(uint32_t(nonce >> 32))
+        , assignment_nonce_lo(uint32_t(nonce))
+        , compile_input(input)
+        , disposition(result)
+        , wire_payload_valid(true) {}
+
+    ResultDispositionMsg(const CompileJob &job, Disposition result)
+        : ResultDispositionMsg(job.jobID(), job.assignmentEpoch(),
+                               job.assignmentNonce(),
+                               job.compileInputIdentity(), result) {}
+
+    void fill_from_channel(MsgChannel *c) override;
+    void send_to_channel(MsgChannel *c) const override;
+    bool valid_payload() const override;
+    bool valid_for_protocol(int negotiated_protocol) const override
+    {
+        return negotiated_protocol == PROTOCOL_VERSION_RESULT_DISPOSITION;
+    }
+
+    uint64_t assignmentEpoch() const
+    {
+        return (uint64_t(assignment_epoch_hi) << 32) | assignment_epoch_lo;
+    }
+    uint64_t assignmentNonce() const
+    {
+        return (uint64_t(assignment_nonce_hi) << 32) | assignment_nonce_lo;
+    }
+
+    CompileInputIdentity &compileInputIdentity() { return compile_input; }
+    const CompileInputIdentity &compileInputIdentity() const { return compile_input; }
+
+    /* Equality intentionally includes every identity dimension.  Ordinary
+       duplicate frames are valid and compare equal; deduplication belongs to
+       the result owner, not this stateless wire codec. */
+    bool same_identity(const ResultDispositionMsg &other) const
+    {
+        return job_id == other.job_id
+            && assignmentEpoch() == other.assignmentEpoch()
+            && assignmentNonce() == other.assignmentNonce()
+            && compile_input.profile == other.compile_input.profile
+            && compile_input.c_store_guid == other.compile_input.c_store_guid
+            && compile_input.tu_seq == other.compile_input.tu_seq
+            && compile_input.raw_bytes == other.compile_input.raw_bytes
+            && compile_input.raw_digest == other.compile_input.raw_digest
+            && compile_input.attempt_id == other.compile_input.attempt_id
+            && compile_input.request_id == other.compile_input.request_id;
+    }
+
+    bool operator==(const ResultDispositionMsg &other) const
+    {
+        return same_identity(other) && disposition == other.disposition;
+    }
+
+    uint32_t job_id;
+    uint32_t assignment_epoch_hi;
+    uint32_t assignment_epoch_lo;
+    uint32_t assignment_nonce_hi;
+    uint32_t assignment_nonce_lo;
+    CompileInputIdentity compile_input;
+    uint32_t disposition;
+
+private:
+    bool wire_payload_valid;
 };
 
 class JobBeginMsg : public Msg

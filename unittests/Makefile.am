@@ -8,7 +8,7 @@ TESTS += p50inputfd
 TESTS += p50inputlifecycle-source.sh p50inputlifecycle-sanitize.sh
 TESTS += p50inputlifecycle
 TESTS += p50compilebinding
-TESTS += p50compilee2e-source.sh p50compilee2e-run.sh
+TESTS += p50compilee2e-source.sh p50compilee2e-run.sh p50resultdisposition
 
 AM_TESTS_ENVIRONMENT = \
 	ICECC_TEST_BUILDDIR='$(abs_builddir)'; export ICECC_TEST_BUILDDIR; \
@@ -77,6 +77,7 @@ check_PROGRAMS = testargs lockexec backpressure schedpolicy utf8test statewriter
 check_PROGRAMS += p50daemonsidecaradapter p50daemonpositive
 check_PROGRAMS += p50inputfd
 check_PROGRAMS += p50inputlifecycle
+check_PROGRAMS += p50resultdisposition
 testargs_SOURCES = args.cpp
 p50wire_SOURCES = p50_wire_test.cpp
 p50slice0_SOURCES = \
@@ -114,6 +115,10 @@ p50compilebinding_CXXFLAGS = -pthread
 p50compilebinding_LDFLAGS = $(BOOST_LDFLAGS) -pthread
 p50compilebinding_LDADD = ../client/libp50zstdsender.a ../cache/libp50endpoint.a \
 	../cache/libprotocol50.a ../services/libicecc.la $(LIBZSTD_LIBS) $(BOOST_LIBS)
+p50resultdisposition_SOURCES = p50_result_disposition_test.cpp
+p50resultdisposition_CXXFLAGS = -pthread
+p50resultdisposition_LDFLAGS = -pthread
+p50resultdisposition_LDADD = ../services/libicecc.la
 p50readyadvertisement_SOURCES = p50_ready_advertisement_test.cpp
 p50daemonsidecaradapter_SOURCES = p50_daemon_sidecar_adapter_test.cpp \
 	../cache/p50_daemon_cache_dispatch.cpp ../cache/p50_fd_handoff.cpp

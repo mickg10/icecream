@@ -1603,6 +1603,11 @@ Msg *MsgChannel::get_msg(int timeout, bool eofAllowed)
             m = new CacheSessionMsg;
         }
         break;
+    case Msg::RESULT_DISPOSITION:
+        if (protocol == PROTOCOL_VERSION_RESULT_DISPOSITION) {
+            m = new ResultDispositionMsg;
+        }
+        break;
     case Msg::VERIFY_ENV:
         m = new VerifyEnvMsg;
         break;
@@ -2767,6 +2772,65 @@ void write_compile_input_128(MsgChannel *channel,
     }
 }
 
+}
+
+void ResultDispositionMsg::fill_from_channel(MsgChannel *c)
+{
+    Msg::fill_from_channel(c);
+
+    /* The type word has already been consumed by MsgChannel::get_msg().
+       Refuse a short or extended body before decoding any field.  This keeps
+       the shape fixed and makes the absent-selector representation explicit
+       instead of allowing operator>>'s short-read zero fill to hide damage. */
+    if (c->current_message_bytes_remaining()
+            != FixedPayloadWords * sizeof(uint32_t)) {
+        wire_payload_valid = false;
+        return;
+    }
+
+    *c >> job_id;
+    *c >> assignment_epoch_hi;
+    *c >> assignment_epoch_lo;
+    *c >> assignment_nonce_hi;
+    *c >> assignment_nonce_lo;
+    *c >> compile_input.profile;
+    compile_input.c_store_guid = read_compile_input_128(c);
+    compile_input.tu_seq = read_compile_input_u64(c);
+    compile_input.raw_bytes = read_compile_input_u64(c);
+    compile_input.raw_digest = read_compile_input_128(c);
+    compile_input.attempt_id = read_compile_input_u64(c);
+    compile_input.request_id = read_compile_input_u64(c);
+    *c >> disposition;
+}
+
+void ResultDispositionMsg::send_to_channel(MsgChannel *c) const
+{
+    Msg::send_to_channel(c);
+    *c << job_id;
+    *c << assignment_epoch_hi;
+    *c << assignment_epoch_lo;
+    *c << assignment_nonce_hi;
+    *c << assignment_nonce_lo;
+    *c << compile_input.profile;
+    write_compile_input_128(c, compile_input.c_store_guid);
+    write_compile_input_u64(c, compile_input.tu_seq);
+    write_compile_input_u64(c, compile_input.raw_bytes);
+    write_compile_input_128(c, compile_input.raw_digest);
+    write_compile_input_u64(c, compile_input.attempt_id);
+    write_compile_input_u64(c, compile_input.request_id);
+    *c << disposition;
+}
+
+bool ResultDispositionMsg::valid_payload() const
+{
+    const bool assignment_complete = job_id != 0
+        && assignmentEpoch() != 0 && assignmentNonce() != 0;
+    const bool input_absent = compile_input.whollyAbsent();
+    const bool input_present = compile_input.validPresent();
+    const bool disposition_valid = disposition == Accepted
+        || disposition == DefinitiveCancel;
+    return wire_payload_valid && assignment_complete
+        && (input_absent || input_present) && disposition_valid;
 }
 
 void CompileFileMsg::fill_from_channel(MsgChannel *c)
