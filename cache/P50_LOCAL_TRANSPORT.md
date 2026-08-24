@@ -50,8 +50,12 @@ precursor.  It applies the same private-parent and exact-private-node checks as
 the shared absolute-deadline poll helper, then checks `SO_ERROR`; terminal poll
 bits, connection errors, fcntl failures, and deadline expiry fail closed.  A
 successful descriptor has `O_NONBLOCK` cleared before it is returned, preserving
-the blocking `Connection` contract.  The legacy `connect_unix()` API remains a
-blocking compatibility path.
+the blocking `Connection` contract.  Linux may report a saturated AF_UNIX
+admission as `EAGAIN`; that failed descriptor (and an `EINTR` attempt) is closed
+immediately, the private parent/node are revalidated, and a fresh CLOEXEC
+socket is admitted under the unchanged deadline.  No other connect error is
+retried, and the legacy `connect_unix()` API remains a blocking compatibility
+path.
 
 The connection also exposes peer verification and both
 `receive_with_timeout()` and `receive_until()` framed receives without

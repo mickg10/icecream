@@ -195,6 +195,31 @@ int socket_cloexec() {
     return fd;
 }
 
+enum class ConnectRetryWaitResult {
+    Continue,
+    Timeout,
+    Error,
+};
+
+ConnectRetryWaitResult wait_for_connect_retry(
+    std::chrono::steady_clock::time_point deadline) noexcept {
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline)
+        return ConnectRetryWaitResult::Timeout;
+
+    // AF_UNIX EAGAIN/EINTR leaves no descriptor that can be waited on.  Probe
+    // in short floor-based slices without adding a millisecond (or any other)
+    // rounding constant to the caller's absolute deadline.
+    const auto remaining = deadline - now;
+    const int timeout_ms = remaining >= std::chrono::milliseconds(1) ? 1 : 0;
+    const int ready = ::poll(nullptr, 0, timeout_ms);
+    if (ready < 0 && errno != EINTR)
+        return ConnectRetryWaitResult::Error;
+    return std::chrono::steady_clock::now() >= deadline
+               ? ConnectRetryWaitResult::Timeout
+               : ConnectRetryWaitResult::Continue;
+}
+
 int accept_cloexec(int listener_fd) {
     int fd = -1;
 #if defined(__linux__) && defined(SOCK_CLOEXEC)
@@ -699,79 +724,107 @@ Connection connect_unix_until(const std::string& path,
         set_status(Status::InvalidPath, status);
         return Connection(-1);
     }
-    const int fd = socket_cloexec();
-    if (fd < 0) {
-        set_status(Status::IoError, status);
-        return Connection(-1);
-    }
+    constexpr unsigned kMaxAdmissionAttempts = 4096;
+    for (unsigned attempt = 0; attempt != kMaxAdmissionAttempts; ++attempt) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            set_status(Status::Timeout, status);
+            return Connection(-1);
+        }
+        // EAGAIN/EINTR closes the old descriptor before this fresh attempt;
+        // revalidate both pathname ownership predicates every time so a node
+        // replacement cannot be inherited across the retry boundary.
+        if (!fill_address(path, address) || !private_parent(path) || !private_socket_node(path)) {
+            set_status(Status::InvalidPath, status);
+            return Connection(-1);
+        }
+        const int fd = socket_cloexec();
+        if (fd < 0) {
+            set_status(Status::IoError, status);
+            return Connection(-1);
+        }
 
-    const int original_flags = ::fcntl(fd, F_GETFL);
-    if (original_flags < 0 ||
-        ::fcntl(fd, F_SETFL, original_flags | O_NONBLOCK) != 0) {
-        ::close(fd);
-        set_status(Status::IoError, status);
-        return Connection(-1);
-    }
+        const int original_flags = ::fcntl(fd, F_GETFL);
+        if (original_flags < 0 ||
+            ::fcntl(fd, F_SETFL, original_flags | O_NONBLOCK) != 0) {
+            ::close(fd);
+            set_status(Status::IoError, status);
+            return Connection(-1);
+        }
 
-    const socklen_t address_length =
-        static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + path.size() + 1);
-    int connect_result = -1;
-    int connect_error = 0;
-    do {
+        const socklen_t address_length =
+            static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + path.size() + 1);
+        const int connect_result =
+            ::connect(fd, reinterpret_cast<const sockaddr*>(&address), address_length);
+        const int connect_error = errno;
+
+        if (connect_result < 0 &&
+            (connect_error == EINPROGRESS || connect_error == EAGAIN ||
+             connect_error == EWOULDBLOCK || connect_error == EINTR)) {
+            if (connect_error == EAGAIN || connect_error == EWOULDBLOCK ||
+                connect_error == EINTR) {
+                ::close(fd);
+                const auto retry_wait = wait_for_connect_retry(deadline);
+                if (retry_wait == ConnectRetryWaitResult::Timeout) {
+                    set_status(Status::Timeout, status);
+                    return Connection(-1);
+                }
+                if (retry_wait == ConnectRetryWaitResult::Error) {
+                    set_status(Status::IoError, status);
+                    return Connection(-1);
+                }
+                continue;
+            }
+
+            const auto waited = detail::wait_for_io(fd, POLLOUT, deadline);
+            if (waited == detail::DeadlinePollResult::Timeout) {
+                ::close(fd);
+                set_status(Status::Timeout, status);
+                return Connection(-1);
+            }
+            if (waited == detail::DeadlinePollResult::Error) {
+                ::close(fd);
+                set_status(Status::IoError, status);
+                return Connection(-1);
+            }
+        } else if (connect_result < 0) {
+            ::close(fd);
+            set_status(Status::IoError, status);
+            return Connection(-1);
+        }
+
+        int socket_error = 0;
+        socklen_t socket_error_length = sizeof(socket_error);
+        if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error,
+                         &socket_error_length) != 0 ||
+            socket_error != 0) {
+            ::close(fd);
+            set_status(Status::IoError, status);
+            return Connection(-1);
+        }
         if (std::chrono::steady_clock::now() >= deadline) {
             ::close(fd);
             set_status(Status::Timeout, status);
             return Connection(-1);
         }
-        connect_result =
-            ::connect(fd, reinterpret_cast<const sockaddr*>(&address), address_length);
-        connect_error = errno;
-    } while (connect_result < 0 && connect_error == EINTR);
-
-    if (connect_result < 0 && connect_error == EINPROGRESS) {
-        const auto waited = detail::wait_for_io(fd, POLLOUT, deadline);
-        if (waited == detail::DeadlinePollResult::Timeout) {
-            ::close(fd);
-            set_status(Status::Timeout, status);
-            return Connection(-1);
-        }
-        if (waited == detail::DeadlinePollResult::Error) {
+        if (::fcntl(fd, F_SETFL, original_flags & ~O_NONBLOCK) != 0) {
             ::close(fd);
             set_status(Status::IoError, status);
             return Connection(-1);
         }
-    } else if (connect_result < 0) {
-        ::close(fd);
-        set_status(Status::IoError, status);
-        return Connection(-1);
-    }
 
-    int socket_error = 0;
-    socklen_t socket_error_length = sizeof(socket_error);
-    if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error, &socket_error_length) != 0 ||
-        socket_error != 0) {
-        ::close(fd);
-        set_status(Status::IoError, status);
-        return Connection(-1);
-    }
-    if (std::chrono::steady_clock::now() >= deadline) {
-        ::close(fd);
-        set_status(Status::Timeout, status);
-        return Connection(-1);
-    }
-    if (::fcntl(fd, F_SETFL, original_flags & ~O_NONBLOCK) != 0) {
-        ::close(fd);
-        set_status(Status::IoError, status);
-        return Connection(-1);
-    }
-
-    Connection connection(fd);
-    if (!connection.valid()) {
-        set_status(connection.status(), status);
+        Connection connection(fd);
+        if (!connection.valid()) {
+            set_status(connection.status(), status);
+            return connection;
+        }
+        set_status(Status::Ok, status);
         return connection;
     }
-    set_status(Status::Ok, status);
-    return connection;
+
+    // A bounded admission retry count is a distinct fail-closed condition;
+    // unlike elapsed wall time, this is not reported as a deadline timeout.
+    set_status(Status::IoError, status);
+    return Connection(-1);
 }
 
 Connection accept_unix(int listener_fd, Status* status) noexcept {

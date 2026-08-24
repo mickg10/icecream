@@ -554,9 +554,11 @@ void bounded_unix_connect() {
         path, pending_start + std::chrono::milliseconds(700), &status);
     release_one.join();
     // Linux reports a saturated AF_UNIX queue as EAGAIN (rather than
-    // EINPROGRESS); it is a connect error under this strict API and must fail
-    // closed without falling back to a blocking connect.
-    CHECK(!pending.valid() && status == Status::IoError);
+    // EINPROGRESS).  The failed attempt is closed and a fresh CLOEXEC socket
+    // is admitted after the listener releases capacity under the same bound.
+    CHECK(pending.valid() && status == Status::Ok);
+    CHECK((::fcntl(pending.native_handle(), F_GETFL) & O_NONBLOCK) == 0);
+    CHECK((::fcntl(pending.native_handle(), F_GETFD) & FD_CLOEXEC) != 0);
     accepted = ::accept(listener, nullptr, nullptr);
     CHECK(accepted >= 0);
     ::close(accepted);
@@ -583,9 +585,8 @@ void bounded_unix_connect() {
         path, saturated_start + std::chrono::milliseconds(100), &status);
     const auto saturated_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - saturated_start).count();
-    CHECK(!saturated.valid());
-    CHECK(status == Status::IoError || status == Status::Timeout);
-    CHECK(saturated_elapsed < 700);
+    CHECK(!saturated.valid() && status == Status::Timeout);
+    CHECK(saturated_elapsed >= 70 && saturated_elapsed < 700);
 
     // Closing a listener leaves its private node in place; a refused connect
     // is an error, never a falsely successful Connection.

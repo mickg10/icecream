@@ -54,13 +54,30 @@ connector_body() {
     sed -n '/^Connection connect_unix_until/,/^Connection accept_unix/p' "$1"
 }
 
+retry_wait_body() {
+    sed -n '/^ConnectRetryWaitResult wait_for_connect_retry/,/^int accept_cloexec/p' "$1"
+}
+
 bounded_connector_source() {
     body=$(connector_body "$1")
-    printf '%s\n' "$body" | grep -F 'connect_error == EINPROGRESS' >/dev/null &&
+    printf '%s\n' "$body" | grep -F 'connect_error == EINPROGRESS || connect_error == EAGAIN' >/dev/null &&
+        printf '%s\n' "$body" | grep -F 'connect_error == EINTR' >/dev/null &&
         printf '%s\n' "$body" | grep -F 'detail::wait_for_io(fd, POLLOUT, deadline)' >/dev/null &&
+        printf '%s\n' "$body" | grep -F 'wait_for_connect_retry(deadline)' >/dev/null &&
         printf '%s\n' "$body" | grep -F 'getsockopt(fd, SOL_SOCKET, SO_ERROR' >/dev/null &&
         printf '%s\n' "$body" | grep -F 'original_flags & ~O_NONBLOCK' >/dev/null &&
-        printf '%s\n' "$body" | grep -F 'std::chrono::steady_clock::now() >= deadline' >/dev/null
+        printf '%s\n' "$body" | grep -F 'std::chrono::steady_clock::now() >= deadline' >/dev/null &&
+        test "$(printf '%s\n' "$body" | grep -Fc '::connect(fd')" -eq 1 &&
+        test "$(printf '%s\n' "$body" | grep -Fc 'private_parent(path)')" -ge 2 &&
+        test "$(printf '%s\n' "$body" | grep -Fc 'private_socket_node(path)')" -ge 2 &&
+        printf '%s\n' "$body" | grep -F 'kMaxAdmissionAttempts' >/dev/null
+}
+
+retry_wait_source() {
+    body=$(retry_wait_body "$1")
+    printf '%s\n' "$body" | grep -F 'remaining >= std::chrono::milliseconds(1)' >/dev/null &&
+        printf '%s\n' "$body" | grep -F 'poll(nullptr, 0, timeout_ms)' >/dev/null &&
+        printf '%s\n' "$body" | grep -F 'ConnectRetryWaitResult::Timeout' >/dev/null
 }
 
 if ! bounded_connector_source "$transport"; then
@@ -99,6 +116,62 @@ if bounded_connector_source "$connector_mutant"; then
     exit 1
 fi
 echo 'ok - connector deadline deletion mutant is rejected'
+
+if ! retry_wait_source "$transport"; then
+    echo 'FAIL: fresh-admission wait does not preserve floor-based absolute deadline' >&2
+    exit 1
+fi
+echo 'ok - fresh-admission wait preserves floor-based absolute deadline'
+
+retry_wait_mutant=$(mktemp "${TMPDIR:-/tmp}/p50localtransport-retry-wait-mutant.XXXXXX")
+trap 'rm -f "$send_mutant" "$receive_mutant" "$connector_mutant" "$retry_wait_mutant"' EXIT HUP INT TERM
+sed 's/remaining >= std::chrono::milliseconds(1) ? 1 : 0/1/' \
+    "$transport" >"$retry_wait_mutant"
+if retry_wait_source "$retry_wait_mutant"; then
+    echo 'FAIL: fresh-admission wait rounding deletion mutant was accepted' >&2
+    exit 1
+fi
+echo 'ok - fresh-admission wait rounding deletion mutant is rejected'
+
+pending_retry_body() {
+    connector_body "$1" | sed -n '/connect_error == EAGAIN/,/continue;/p'
+}
+
+if ! pending_retry_body "$transport" | grep -F '::close(fd);' >/dev/null ||
+   ! pending_retry_body "$transport" | grep -F 'wait_for_connect_retry(deadline)' >/dev/null; then
+    echo 'FAIL: EAGAIN/EINTR path is missing immediate close or bounded fresh retry wait' >&2
+    exit 1
+fi
+echo 'ok - EAGAIN/EINTR path closes before fresh admission retry'
+
+sed 's/ || connect_error == EAGAIN//' "$transport" >"$connector_mutant"
+if bounded_connector_source "$connector_mutant"; then
+    echo 'FAIL: EAGAIN pending-condition deletion mutant was accepted' >&2
+    exit 1
+fi
+echo 'ok - EAGAIN pending-condition deletion mutant is rejected'
+
+sed '/::close(fd);/d' "$transport" >"$connector_mutant"
+if pending_retry_body "$connector_mutant" | grep -F '::close(fd);' >/dev/null; then
+    echo 'FAIL: EAGAIN fresh-close deletion mutant was accepted' >&2
+    exit 1
+fi
+echo 'ok - EAGAIN fresh-close deletion mutant is rejected'
+
+sed 's/!private_parent(path) || !private_socket_node(path)/true/g' "$transport" >"$connector_mutant"
+if bounded_connector_source "$connector_mutant"; then
+    echo 'FAIL: fresh-attempt endpoint revalidation deletion mutant was accepted' >&2
+    exit 1
+fi
+echo 'ok - fresh-attempt endpoint revalidation deletion mutant is rejected'
+
+sed 's/const int connect_error = errno;/const int connect_error = errno; const int forbidden_retry = ::connect(fd, reinterpret_cast<const sockaddr*>(&address), address_length);/' \
+    "$transport" >"$connector_mutant"
+if bounded_connector_source "$connector_mutant"; then
+    echo 'FAIL: same-descriptor connect retry mutant was accepted' >&2
+    exit 1
+fi
+echo 'ok - same-descriptor connect retry mutant is rejected'
 
 # A bounded read/write operation must use per-call MSG_DONTWAIT and never
 # toggle the shared open-file-description status flags.  The connector above
