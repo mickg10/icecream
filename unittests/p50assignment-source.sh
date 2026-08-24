@@ -20,8 +20,17 @@ require_count() {
 
 require_count 1 'job->dispatchMatchedJobId(), job->assignmentEpoch(),' \
     scheduler/scheduler.cpp 'scheduler stamps authorized identity into UseCS'
-require_count 2 'msg->assignmentEpoch()' daemon/main.cpp \
-    'submitter daemon preserves identity in both scalar relay projections'
+# Pre-existing gap, unrelated to the d23d9c5d strict-tail/identity-binding
+# work: the S2 cache-handoff retention block Daemon::scheduler_use_cs
+# gained in an earlier round ("S2: validate and retain the assignment-
+# bound cache-endpoint handoff...") reads msg->assignmentEpoch() a third
+# time, to stamp Client::CacheHandoff with the identity a later-present
+# cache triple is bound to.  This anchor was never updated to match --
+# confirmed present and already failing at d23d9c5d, before any commit in
+# this stack -- so it is corrected here rather than left red under a "full
+# suite must stay green" requirement it predates.
+require_count 3 'msg->assignmentEpoch()' daemon/main.cpp \
+    'submitter daemon preserves identity in all three production reads (two relay projections, one cache-handoff retention)'
 require_count 2 'usecs->applyAssignmentTo(&job)' client/remote.cpp \
     'client remote/local-via-daemon paths copy the production UseCS identity'
 require_count 1 'record.key.epoch == job.assignmentEpoch()' daemon/main.cpp \
