@@ -5,6 +5,7 @@ TESTS += p50daemonsidecaradapter-sanitize.sh
 TESTS += p50daemonpositive-source.sh p50daemonpositive-run.sh
 TESTS += p50inputfd-source.sh p50inputfd-sanitize.sh
 TESTS += p50inputfd
+TESTS += p50compilebinding
 TESTS += p50compilee2e-source.sh p50compilee2e-run.sh
 
 AM_TESTS_ENVIRONMENT = \
@@ -66,7 +67,7 @@ p50sidecarsupervisor_LDADD = ../cache/libp50sidecarsupervisor.a ../services/libi
 p50readyadvertisement_LDADD = ../cache/libp50readyadvertisement.a
 digest128bench_LDADD = ../services/libicecc.la
 
-check_PROGRAMS = testargs lockexec backpressure schedpolicy utf8test statewritertest schedbp daemonlogin daemonbatch cachehandoffdaemon daemoncachedispatch p50daemoncachedispatch p49daemon p49scheduler connectivity fastesttest hallflowtest jobidalloctest inputpump compilerinput p49assignment p50assignment p50cacheadvertisement p50cachesession p50wire p50slice0 p50zstd p50zstdwindow p50inputrecord p50inputrecordlate p50inputrecordreopen p50inputattachment p50endpoint p50localtransport p50sidecarsupervisor p50readyadvertisement p50cacheservice p50fdhandoff digest128bench p50zstdsender
+check_PROGRAMS = testargs lockexec backpressure schedpolicy utf8test statewritertest schedbp daemonlogin daemonbatch cachehandoffdaemon daemoncachedispatch p50daemoncachedispatch p49daemon p49scheduler connectivity fastesttest hallflowtest jobidalloctest inputpump compilerinput p49assignment p50assignment p50cacheadvertisement p50cachesession p50wire p50slice0 p50zstd p50zstdwindow p50inputrecord p50inputrecordlate p50inputrecordreopen p50inputattachment p50endpoint p50localtransport p50sidecarsupervisor p50readyadvertisement p50cacheservice p50fdhandoff digest128bench p50zstdsender p50compilebinding
 check_PROGRAMS += p50daemonsidecaradapter p50daemonpositive
 check_PROGRAMS += p50inputfd
 testargs_SOURCES = args.cpp
@@ -92,6 +93,12 @@ p50zstdsender_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
 p50zstdsender_CXXFLAGS = -pthread
 p50zstdsender_LDFLAGS = $(BOOST_LDFLAGS) -pthread
 p50zstdsender_LDADD = ../client/libp50zstdsender.a ../cache/libp50endpoint.a \
+	../cache/libprotocol50.a ../services/libicecc.la $(LIBZSTD_LIBS) $(BOOST_LIBS)
+p50compilebinding_SOURCES = p50_compile_binding_test.cpp
+p50compilebinding_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
+p50compilebinding_CXXFLAGS = -pthread
+p50compilebinding_LDFLAGS = $(BOOST_LDFLAGS) -pthread
+p50compilebinding_LDADD = ../client/libp50zstdsender.a ../cache/libp50endpoint.a \
 	../cache/libprotocol50.a ../services/libicecc.la $(LIBZSTD_LIBS) $(BOOST_LIBS)
 p50readyadvertisement_SOURCES = p50_ready_advertisement_test.cpp
 p50daemonsidecaradapter_SOURCES = p50_daemon_sidecar_adapter_test.cpp \

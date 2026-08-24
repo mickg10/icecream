@@ -31,7 +31,8 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/services \
 	-I$(top_srcdir)/
 
-libp50zstdsender_a_SOURCES = p50_zstd_sender.cpp p50_zstd_sender.h
+libp50zstdsender_a_SOURCES = p50_zstd_sender.cpp p50_zstd_sender.h \
+	p50_compile_binding.cpp p50_compile_binding.h
 libp50zstdsender_a_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
 
 EXTRA_DIST = $(bin_SCRIPTS) P50_ZSTD_SENDER.md
