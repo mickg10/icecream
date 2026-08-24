@@ -6,10 +6,14 @@
 #include <boost/asio/use_future.hpp>
 
 #include <chrono>
+#include <cstring>
 #include <fcntl.h>
 #include <future>
+#include <netinet/in.h>
 #include <stdexcept>
 #include <string>
+#include <sys/socket.h>
+#include <thread>
 #include <vector>
 #include <unistd.h>
 
@@ -31,6 +35,29 @@ ZstdSourceTransferConfig config() {
     result.endpoint_caps.zstd.max_raw_bytes = 1U << 20;
     result.endpoint_caps.zstd.max_encoded_body_bytes = 1U << 20;
     return result;
+}
+
+int connect_fd(tcp::endpoint remote) {
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0)
+        return -1;
+    const int descriptor_flags = ::fcntl(fd, F_GETFD);
+    if (descriptor_flags < 0 ||
+        ::fcntl(fd, F_SETFD, descriptor_flags | FD_CLOEXEC) < 0) {
+        (void)::close(fd);
+        return -1;
+    }
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(remote.port());
+    const auto bytes = remote.address().to_v4().to_bytes();
+    std::memcpy(&address.sin_addr, bytes.data(), bytes.size());
+    if (::connect(fd, reinterpret_cast<const sockaddr*>(&address),
+                  sizeof(address)) != 0) {
+        (void)::close(fd);
+        return -1;
+    }
+    return fd;
 }
 
 void test_exact_network_transfer() {
@@ -83,6 +110,41 @@ void test_owned_fd_and_fail_closed_validation() {
     CHECK(::unlink(path) == 0);
 }
 
+void test_adopted_fd_factory_exact_transfer() {
+    asio::io_context context;
+    tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    P50ServerEndpointConfig server_config;
+    server_config.input_job_state = [](CStoreGuid, const TxBegin&, const TxCommit&,
+                                       std::span<const uint8_t>) {
+        return InputJobState::Open;
+    };
+    P50ServerEndpoint server(Id128::from_u64(7012), {}, nullptr, nullptr,
+                             server_config);
+    P50ZstdSourceSender sender(Id128::from_u64(7011), PrepareRequestKey{96, 12},
+                               config());
+    const std::vector<uint8_t> source{'a', 'd', 'o', 'p', 't', 'e', 'd'};
+    unsigned calls = 0;
+    ConnectedFdFactory factory = [remote = acceptor.local_endpoint(), &calls](auto deadline) {
+        ++calls;
+        if (std::chrono::steady_clock::now() >= deadline)
+            return -1;
+        return connect_fd(remote);
+    };
+    std::future<ServerRunResult> server_result = asio::co_spawn(
+        context, server.accept_one(acceptor), asio::use_future);
+    std::future<ZstdSourceTransferResult> sender_result = asio::co_spawn(
+        context, sender.transfer(std::move(factory), source), asio::use_future);
+    context.run();
+    const ZstdSourceTransferResult result = sender_result.get();
+    CHECK(server_result.get().status == ServerRunStatus::Completed);
+    CHECK(result.status == ZstdSourceTransferStatus::Committed);
+    CHECK(result.committed_input.has_value());
+    CHECK(result.committed_input->c_store_guid == Id128::from_u64(7011));
+    CHECK(result.raw_digest == icecc::digest128(source));
+    CHECK(result.attempts == 1);
+    CHECK(calls == 1);
+}
+
 void test_absolute_deadline_is_required() {
     ZstdSourceTransferConfig expired = config();
     expired.deadline = std::chrono::steady_clock::now() - std::chrono::seconds(1);
@@ -110,6 +172,47 @@ void test_disconnected_retry_is_bounded_and_exactly_once() {
     CHECK(transfer.status == ZstdSourceTransferStatus::RetryExhausted);
     CHECK(transfer.attempts == 2);
     CHECK(!transfer.committed_input.has_value());
+
+    unsigned factory_calls = 0;
+    P50ZstdSourceSender factory_sender(
+        Id128::from_u64(7006), PrepareRequestKey{95, 11}, config());
+    asio::io_context factory_context;
+    const std::vector<uint8_t> factory_source{'f', 'r', 'e', 's', 'h'};
+    auto factory_result = asio::co_spawn(
+        factory_context,
+        factory_sender.transfer(
+            ConnectedFdFactory{[&factory_calls](auto) {
+                ++factory_calls;
+                return -1;
+            }},
+            factory_source),
+        asio::use_future);
+    factory_context.run();
+    CHECK(factory_result.get().status == ZstdSourceTransferStatus::RetryExhausted);
+    CHECK(factory_calls == 2);
+}
+
+void test_factory_cannot_extend_absolute_deadline() {
+    ZstdSourceTransferConfig short_config = config();
+    short_config.deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(5);
+    P50ZstdSourceSender sender(Id128::from_u64(7007), PrepareRequestKey{97, 13},
+                               short_config);
+    asio::io_context context;
+    const std::vector<uint8_t> source{'t', 'i', 'm', 'e'};
+    auto result = asio::co_spawn(
+        context,
+        sender.transfer(
+            ConnectedFdFactory{[](auto) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                return -1;
+            }},
+            source),
+        asio::use_future);
+    context.run();
+    const ZstdSourceTransferResult transfer = result.get();
+    CHECK(transfer.status == ZstdSourceTransferStatus::DeadlineExceeded);
+    CHECK(transfer.attempts == 1);
 }
 
 }  // namespace
@@ -117,6 +220,8 @@ void test_disconnected_retry_is_bounded_and_exactly_once() {
 int main() {
     test_exact_network_transfer();
     test_owned_fd_and_fail_closed_validation();
+    test_adopted_fd_factory_exact_transfer();
     test_absolute_deadline_is_required();
     test_disconnected_retry_is_bounded_and_exactly_once();
+    test_factory_cannot_extend_absolute_deadline();
 }

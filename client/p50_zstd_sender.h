@@ -7,9 +7,11 @@
 
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
+#include <variant>
 #include <vector>
 
 namespace icecc::p50 {
@@ -65,6 +67,13 @@ struct ZstdSourceTransferConfig {
     int compression_level = 1;
 };
 
+// Called once per bounded attempt.  The callback returns ownership of one
+// already-connected TCP descriptor that has crossed the ordinary
+// CACHE_SESSION boundary, or -1 without leaking a descriptor.  It receives
+// the unchanged absolute sender deadline and must not extend it.
+using ConnectedFdFactory =
+    std::function<int(std::chrono::steady_clock::time_point deadline)>;
+
 // One-shot C-side source transfer.  A sender instance is intentionally not
 // reusable: this keeps request identity, prepared bytes, and retry state in
 // one immutable transaction scope.
@@ -82,9 +91,18 @@ public:
     boost::asio::awaitable<ZstdSourceTransferResult> transfer(
         boost::asio::ip::tcp::endpoint remote, std::span<const uint8_t> source);
 
+    boost::asio::awaitable<ZstdSourceTransferResult> transfer(
+        ConnectedFdFactory connection, OwnedSourceFd source);
+
+    boost::asio::awaitable<ZstdSourceTransferResult> transfer(
+        ConnectedFdFactory connection, std::span<const uint8_t> source);
+
 private:
+    using ConnectionTarget =
+        std::variant<boost::asio::ip::tcp::endpoint, ConnectedFdFactory>;
+
     boost::asio::awaitable<ZstdSourceTransferResult> transfer_bytes(
-        boost::asio::ip::tcp::endpoint remote,
+        ConnectionTarget target,
         std::shared_ptr<const std::vector<uint8_t>> source);
 
     struct Impl;

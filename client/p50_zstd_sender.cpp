@@ -88,7 +88,7 @@ struct P50ZstdSourceSender::Impl {
             c_guid, config.endpoint_caps.zstd, config.authority_limits,
             config.compression_level);
         endpoint = std::make_unique<P50ClientEndpoint>(
-            authority, config.endpoint_caps, HistoryNonce{1}, nullptr, &actions);
+            authority, config.endpoint_caps, HistoryNonce{1});
     }
 
     ZstdSourceTransferResult invalid(ZstdSourceTransferStatus status) const {
@@ -97,27 +97,17 @@ struct P50ZstdSourceSender::Impl {
         return result;
     }
 
-    ZstdSourceTransferResult committed_from_trace(uint64_t raw_bytes,
-                                                   Digest128 raw_digest,
-                                                   uint8_t attempts,
-                                                   size_t trace_start) const {
-        std::optional<InputRecordKey> identity;
-        for (size_t i = trace_start; i < actions.records().size(); ++i) {
-            const ActionRecord& record = actions.records()[i];
-            if (record.actor != ActorSide::C ||
-                (record.action != ActionType::COMMIT_ACCEPTED &&
-                 record.action != ActionType::LOST_COMMIT_ACCEPTED))
-                continue;
-            const InputRecordKey candidate{record.c_store_guid, record.tu_seq};
-            if (candidate.c_store_guid != c_guid || record.raw_digest != raw_digest ||
-                identity.has_value())
-                return invalid(ZstdSourceTransferStatus::CommittedIdentityUnavailable);
-            identity = candidate;
-        }
-        if (!identity) return invalid(ZstdSourceTransferStatus::CommittedIdentityUnavailable);
+    ZstdSourceTransferResult committed_from_witness(
+        const ClientRunResult& run, uint64_t raw_bytes, Digest128 raw_digest,
+        uint8_t attempts) const {
+        if (!run.committed_commit.has_value() || !run.committed_input.has_value() ||
+            run.committed_input->c_store_guid != c_guid ||
+            run.committed_input->tu_seq != run.committed_commit->tu_seq ||
+            run.committed_commit->raw_digest != raw_digest)
+            return invalid(ZstdSourceTransferStatus::CommittedIdentityUnavailable);
         ZstdSourceTransferResult result;
         result.status = ZstdSourceTransferStatus::Committed;
-        result.committed_input = identity;
+        result.committed_input = run.committed_input;
         result.raw_bytes = raw_bytes;
         result.raw_digest = raw_digest;
         result.attempts = attempts;
@@ -129,7 +119,6 @@ struct P50ZstdSourceSender::Impl {
     ZstdSourceTransferConfig config{};
     std::shared_ptr<P50PreparationAuthority> authority;
     std::unique_ptr<P50ClientEndpoint> endpoint;
-    ActionTrace actions;
     bool used = false;
 };
 
@@ -147,8 +136,8 @@ P50ZstdSourceSender::transfer(boost::asio::ip::tcp::endpoint remote,
     impl_->used = true;
     const auto bytes = read_complete_fd(source.get(),
                                         impl_->config.endpoint_caps.zstd.max_raw_bytes);
-    if (!bytes) return transfer_bytes(remote, {});
-    return transfer_bytes(remote,
+    if (!bytes) return transfer_bytes(ConnectionTarget{remote}, {});
+    return transfer_bytes(ConnectionTarget{remote},
                           std::make_shared<const std::vector<uint8_t>>(*bytes));
 }
 
@@ -158,20 +147,51 @@ P50ZstdSourceSender::transfer(boost::asio::ip::tcp::endpoint remote,
     if (impl_->used) throw std::logic_error("sender is one-shot");
     impl_->used = true;
     if (source.size() > impl_->config.endpoint_caps.zstd.max_raw_bytes)
-        return transfer_bytes(remote, {});
-    return transfer_bytes(remote,
+        return transfer_bytes(ConnectionTarget{remote}, {});
+    return transfer_bytes(ConnectionTarget{remote},
                           std::make_shared<const std::vector<uint8_t>>(source.begin(),
                                                                          source.end()));
 }
 
 boost::asio::awaitable<ZstdSourceTransferResult>
+P50ZstdSourceSender::transfer(ConnectedFdFactory connection,
+                              OwnedSourceFd source) {
+    if (impl_->used) throw std::logic_error("sender is one-shot");
+    impl_->used = true;
+    const auto bytes = read_complete_fd(source.get(),
+                                        impl_->config.endpoint_caps.zstd.max_raw_bytes);
+    if (!bytes)
+        return transfer_bytes(ConnectionTarget{std::move(connection)}, {});
+    return transfer_bytes(
+        ConnectionTarget{std::move(connection)},
+        std::make_shared<const std::vector<uint8_t>>(*bytes));
+}
+
+boost::asio::awaitable<ZstdSourceTransferResult>
+P50ZstdSourceSender::transfer(ConnectedFdFactory connection,
+                              std::span<const uint8_t> source) {
+    if (impl_->used) throw std::logic_error("sender is one-shot");
+    impl_->used = true;
+    if (source.size() > impl_->config.endpoint_caps.zstd.max_raw_bytes)
+        return transfer_bytes(ConnectionTarget{std::move(connection)}, {});
+    return transfer_bytes(
+        ConnectionTarget{std::move(connection)},
+        std::make_shared<const std::vector<uint8_t>>(source.begin(), source.end()));
+}
+
+boost::asio::awaitable<ZstdSourceTransferResult>
 P50ZstdSourceSender::transfer_bytes(
-    boost::asio::ip::tcp::endpoint remote,
+    ConnectionTarget target,
     std::shared_ptr<const std::vector<uint8_t>> source) {
     if (!valid_deadline(impl_->config, Clock::now()))
         co_return impl_->invalid(ZstdSourceTransferStatus::DeadlineExceeded);
-    if (remote.port() == 0 || remote.address().is_unspecified())
+    if (std::holds_alternative<boost::asio::ip::tcp::endpoint>(target)) {
+        const auto remote = std::get<boost::asio::ip::tcp::endpoint>(target);
+        if (remote.port() == 0 || remote.address().is_unspecified())
+            co_return impl_->invalid(ZstdSourceTransferStatus::InvalidRequest);
+    } else if (!std::get<ConnectedFdFactory>(target)) {
         co_return impl_->invalid(ZstdSourceTransferStatus::InvalidRequest);
+    }
     if (!source)
         co_return impl_->invalid(ZstdSourceTransferStatus::SourceError);
 
@@ -184,21 +204,48 @@ P50ZstdSourceSender::transfer_bytes(
     } catch (const std::length_error&) {
         co_return impl_->invalid(ZstdSourceTransferStatus::SourceError);
     }
-    const size_t trace_start = impl_->actions.records().size();
     for (uint8_t attempt = 1; attempt <= 2; ++attempt) {
         if (Clock::now() >= impl_->config.deadline)
             co_return impl_->invalid(ZstdSourceTransferStatus::DeadlineExceeded);
         ClientRunResult run;
         try {
-            run = co_await impl_->endpoint->run(remote, prepared);
+            if (std::holds_alternative<boost::asio::ip::tcp::endpoint>(target)) {
+                run = co_await impl_->endpoint->run(
+                    std::get<boost::asio::ip::tcp::endpoint>(target), prepared, {},
+                    impl_->config.deadline);
+            } else {
+                int connected_fd = -1;
+                try {
+                    connected_fd = std::get<ConnectedFdFactory>(target)(
+                        impl_->config.deadline);
+                } catch (...) {
+                    co_return impl_->invalid(ZstdSourceTransferStatus::TerminalError);
+                }
+                if (connected_fd < 0) {
+                    run.status = Clock::now() >= impl_->config.deadline
+                                     ? ClientRunStatus::DeadlineExceeded
+                                     : ClientRunStatus::Disconnected;
+                } else {
+                    run = co_await impl_->endpoint->run_adopted_fd(
+                        connected_fd, prepared, {}, impl_->config.deadline);
+                }
+            }
         } catch (...) {
             co_return impl_->invalid(ZstdSourceTransferStatus::TerminalError);
         }
-        if (Clock::now() >= impl_->config.deadline)
-            co_return impl_->invalid(ZstdSourceTransferStatus::DeadlineExceeded);
+        // A validated commit is authoritative even when its completion races
+        // the deadline boundary.  The endpoint freezes this witness before
+        // its timer may close the owned socket, so a later clock sample must
+        // never discard it.
         if (run.status == ClientRunStatus::Committed)
-            co_return impl_->committed_from_trace(source->size(), raw_digest, attempt,
-                                                  trace_start);
+            co_return impl_->committed_from_witness(
+                run, source->size(), raw_digest, attempt);
+        if (run.status == ClientRunStatus::DeadlineExceeded) {
+            ZstdSourceTransferResult result =
+                impl_->invalid(ZstdSourceTransferStatus::DeadlineExceeded);
+            result.attempts = attempt;
+            co_return result;
+        }
         if (run.status == ClientRunStatus::TerminalError) {
             ZstdSourceTransferResult result =
                 impl_->invalid(ZstdSourceTransferStatus::TerminalError);

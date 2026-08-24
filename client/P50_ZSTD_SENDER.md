@@ -8,23 +8,20 @@ replay of the same prepared handle after a disconnected run. It has no
 FileChunk path.
 
 The sender requires a caller-owned nonzero `CStoreGuid` and request identity;
-it does not invent product identity. A successful endpoint action trace is
-checked for exactly one C-side `COMMIT_ACCEPTED` or `LOST_COMMIT_ACCEPTED` with
-the expected raw digest, yielding the exact `(C_GUID,TU_SEQ)` key.
+it does not invent product identity. A successful endpoint result must carry
+the directly validated `TxCommit` and exact `(C_GUID,TU_SEQ)` key. The sender
+checks their TU sequence, C namespace, and raw digest without treating the
+diagnostic action trace as authority.
 
-## Bounded HOLD
+Production callers may supply a connected-fd factory. It is invoked once per
+bounded attempt and returns one descriptor that has already crossed the
+ordinary `CACHE_SESSION` boundary. The second attempt therefore obtains a
+fresh ordinary connection while replaying the same immutable prepared handle;
+a partially consumed or detached descriptor is never reused.
 
-The current public endpoint API has no absolute-deadline cancellation or
-completion callback that returns the committed `TxCommit`. The sender enforces
-an absolute deadline at source admission, before each attempt, and after each
-endpoint run; it cannot interrupt an endpoint coroutine already blocked in
-Asio. The exact upstream API needed to close this HOLD is:
-
-1. `P50ClientEndpoint::run(..., absolute_deadline)` must cancel its owned
-   socket and complete with a typed deadline result; and
-2. `ClientRunResult` (or a new public accessor) must carry the validated
-   `TxCommit` identity for the committed attempt.
-
-Until that cache API change is reviewed, the sender fails closed on a stale
-deadline, missing commit witness, terminal result, or retry exhaustion and
-does not claim full production deadline compliance.
+The absolute deadline is passed unchanged into the endpoint, whose owned timer
+cancels a blocked connect/read/write and returns typed `DeadlineExceeded`.
+After a validated commit, that witness wins a same-boundary timer race; before
+commit, timeout retains endpoint reconciliation state and the sender fails
+closed. Missing witnesses, terminal errors, and exhausted retry likewise never
+fall back to FileChunk inside this transaction.
