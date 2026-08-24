@@ -12,16 +12,22 @@
 #include <pthread.h>
 #include <signal.h>
 #include <grp.h>
+#include <boost/asio/co_spawn.hpp>
+#include <boost/asio/use_future.hpp>
 #include <string_view>
+#include <stdexcept>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
 
 #include <utility>
+#include <future>
 
 namespace icecc::p50::service {
 namespace {
+
+namespace asio = boost::asio;
 
 constexpr std::string_view kReadyEnvironment = "ICECC_CACHE_SERVICE_READY_FD";
 constexpr std::string_view kReadyMessage = "READY\n";
@@ -304,7 +310,8 @@ void cleanup_listener(int fd, const std::string& path, const ListenerIdentity& i
     (void)::unlink(path.c_str());
 }
 
-bool handle_connection(local::Connection connection, const Options& options) noexcept {
+bool handle_connection(local::Connection connection, const Options& options,
+                        SidecarRuntime& runtime, uint64_t& next_request_id) noexcept {
     try {
         if (!connection.valid())
             return false;
@@ -318,7 +325,12 @@ bool handle_connection(local::Connection connection, const Options& options) noe
             return true;
         const local::Frame ack =
             local::make_hello_ack(local::PeerRole::Sidecar, options.identity);
-        (void)connection.send(ack);
+        if (connection.send(ack) != local::Status::Ok)
+            return true;
+        const local::HandoffRequest expected{options.identity, next_request_id++};
+        (void)runtime.run_one(
+            connection, expected,
+            std::chrono::steady_clock::now() + std::chrono::milliseconds{kHandshakeMilliseconds});
         return true;
     } catch (...) {
         return true;
@@ -326,6 +338,136 @@ bool handle_connection(local::Connection connection, const Options& options) noe
 }
 
 } // namespace
+
+SidecarRuntime::SidecarRuntime(RuntimeConfig config) : config_(std::move(config)) {
+    if (config_.f_store_guid == FStoreGuid{})
+        throw std::invalid_argument("sidecar runtime requires a nonzero F_STORE_GUID");
+    if (config_.max_live_handoffs != 1)
+        throw std::invalid_argument("sidecar runtime supports exactly one live handoff");
+    endpoint_ = std::make_unique<P50ServerEndpoint>(
+        config_.f_store_guid, config_.endpoint_caps, nullptr, nullptr,
+        config_.endpoint_config);
+}
+
+SidecarRuntime::~SidecarRuntime() {
+    stop();
+}
+
+RuntimeResult SidecarRuntime::run_one(
+    local::Connection& control, const local::HandoffRequest& expected,
+    std::chrono::steady_clock::time_point deadline, EndpointIoControl endpoint_control) {
+    RuntimeResult result;
+    if (stop_requested_.load(std::memory_order_acquire)) {
+        result.status = RuntimeStatus::Stopped;
+        return result;
+    }
+    if (busy_.test_and_set(std::memory_order_acq_rel)) {
+        result.status = RuntimeStatus::Busy;
+        result.handoff.status = local::FdHandoffStatus::AlreadyConsumed;
+        return result;
+    }
+    struct BusyGuard {
+        std::atomic_flag& flag;
+        ~BusyGuard() { flag.clear(std::memory_order_release); }
+    } busy_guard{busy_};
+
+    local::FdHandoffReceiver receiver;
+    result.handoff = receiver.receive_and_ack(control, expected, deadline);
+    if (result.handoff.status != local::FdHandoffStatus::Accepted) {
+        result.status = stop_requested_.load(std::memory_order_acquire)
+                           ? RuntimeStatus::Stopped
+                           : RuntimeStatus::HandoffRejected;
+        return result;
+    }
+
+    local::HandoffFd adopted = receiver.take_adopted_fd();
+    if (!adopted.valid()) {
+        result.status = RuntimeStatus::AdoptionFailed;
+        result.handoff.status = local::FdHandoffStatus::AdoptionFailed;
+        return result;
+    }
+    if (stop_requested_.load(std::memory_order_acquire)) {
+        result.status = RuntimeStatus::Stopped;
+        result.handoff.status = local::FdHandoffStatus::Disconnected;
+        return result;
+    }
+
+    boost::system::error_code adoption_error;
+    std::optional<asio::ip::tcp::socket> socket =
+        P50ServerEndpoint::adopt_connected_fd(context_.get_executor(), adopted.release(),
+                                              adoption_error);
+    if (!socket) {
+        result.status = RuntimeStatus::AdoptionFailed;
+        return result;
+    }
+
+    try {
+        int cancel_fd = ::dup(socket->native_handle());
+        if (cancel_fd < 0) {
+            result.status = RuntimeStatus::AdoptionFailed;
+            return result;
+        }
+        const int cancel_flags = ::fcntl(cancel_fd, F_GETFD);
+        if (cancel_flags < 0 || ::fcntl(cancel_fd, F_SETFD, cancel_flags | FD_CLOEXEC) < 0) {
+            (void)::close(cancel_fd);
+            result.status = RuntimeStatus::AdoptionFailed;
+            return result;
+        }
+        active_cancel_fd_.store(cancel_fd, std::memory_order_release);
+        if (stop_requested_.load(std::memory_order_acquire)) {
+            cancel_active_socket();
+            result.status = RuntimeStatus::Stopped;
+            return result;
+        }
+        context_.restart();
+        std::future<ServerRunResult> endpoint_result = asio::co_spawn(
+            context_, endpoint_->run_adopted(std::move(*socket), std::move(endpoint_control)),
+            asio::use_future);
+        context_.run();
+        release_active_socket();
+        result.endpoint = endpoint_result.get();
+        live_sessions_.store(endpoint_->live_session_count(), std::memory_order_release);
+        result.status = stop_requested_.load(std::memory_order_acquire)
+                          ? RuntimeStatus::Stopped
+                          : result.endpoint->status == ServerRunStatus::TerminalError
+                          ? RuntimeStatus::EndpointFailed
+                          : RuntimeStatus::Completed;
+    } catch (...) {
+        release_active_socket();
+        // SessionRegistration is the endpoint's cleanup lease.  Snapshot its
+        // post-failure count while still on the endpoint owner thread.
+        try {
+            live_sessions_.store(endpoint_->live_session_count(), std::memory_order_release);
+        } catch (...) {
+            live_sessions_.store(0, std::memory_order_release);
+        }
+        result.status = RuntimeStatus::EndpointFailed;
+    }
+    return result;
+}
+
+void SidecarRuntime::cancel_active_socket() noexcept {
+    const int fd = active_cancel_fd_.exchange(-1, std::memory_order_acq_rel);
+    if (fd >= 0) {
+        (void)::shutdown(fd, SHUT_RDWR);
+        (void)::close(fd);
+    }
+}
+
+void SidecarRuntime::release_active_socket() noexcept {
+    const int fd = active_cancel_fd_.exchange(-1, std::memory_order_acq_rel);
+    if (fd >= 0)
+        (void)::close(fd);
+}
+
+void SidecarRuntime::stop() noexcept {
+    stop_requested_.store(true, std::memory_order_release);
+    cancel_active_socket();
+}
+
+size_t SidecarRuntime::live_session_count() const {
+    return live_sessions_.load(std::memory_order_acquire);
+}
 
 bool parse_options(int argc, char* const argv[], Options& options, bool& show_help) noexcept {
     show_help = false;
@@ -429,12 +571,26 @@ int run(const Options& options) noexcept {
         cleanup_listener(listener, options.socket_path, identity);
         return 2;
     }
+    RuntimeConfig runtime_config;
+    // The store identity is explicit runtime state, derived only from the
+    // already authenticated service generation.  A production launcher can
+    // construct SidecarRuntime directly with its durable store GUID.
+    runtime_config.f_store_guid = Id128::from_u64(options.identity.generation);
+    std::unique_ptr<SidecarRuntime> runtime;
+    try {
+        runtime = std::make_unique<SidecarRuntime>(std::move(runtime_config));
+    } catch (...) {
+        cleanup_listener(listener, options.socket_path, identity);
+        return 2;
+    }
     if (g_stop_requested != 0 || !write_ready(ready.fd)) {
         cleanup_listener(listener, options.socket_path, identity);
         return 2;
     }
     (void)::close(ready.fd);
     ready.fd = -1;
+
+    uint64_t request_id = 1;
 
     while (g_stop_requested == 0) {
         struct pollfd descriptor{listener, POLLIN | POLLERR | POLLHUP, 0};
@@ -449,7 +605,7 @@ int run(const Options& options) noexcept {
         local::Status accept_status = local::Status::Ok;
         local::Connection connection = local::accept_unix(listener, &accept_status);
         if (connection.valid())
-            (void)handle_connection(std::move(connection), options);
+            (void)handle_connection(std::move(connection), options, *runtime, request_id);
     }
 
     cleanup_listener(listener, options.socket_path, identity);
@@ -458,6 +614,7 @@ int run(const Options& options) noexcept {
 
 } // namespace icecc::p50::service
 
+#if !defined(ICECC_P50_CACHE_SERVICE_NO_MAIN)
 int main(int argc, char** argv) {
     icecc::p50::service::Options options;
     bool show_help = false;
@@ -474,3 +631,4 @@ int main(int argc, char** argv) {
     }
     return icecc::p50::service::run(options);
 }
+#endif

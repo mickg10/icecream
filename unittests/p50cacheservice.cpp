@@ -19,6 +19,14 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <boost/asio/co_spawn.hpp>
+#include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/use_future.hpp>
+#include <future>
+#include <memory>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <vector>
 #include <thread>
 
 using namespace icecc::p50;
@@ -505,6 +513,174 @@ void frame_header_and_payload_share_one_deadline() {
     writer_owner.pid = -1;
 }
 
+local::CredentialExpectation current_credentials() {
+    return local::CredentialExpectation{static_cast<uint64_t>(::getuid()),
+                                        static_cast<uint64_t>(::getgid()), std::nullopt};
+}
+
+struct RuntimeCase {
+    local::Connection sender;
+    local::Connection receiver;
+};
+
+RuntimeCase authenticated_runtime_pair() {
+    int sockets[2] = {-1, -1};
+    CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    RuntimeCase pair{local::Connection(sockets[0]), local::Connection(sockets[1])};
+    const local::CredentialExpectation expected = current_credentials();
+    CHECK(pair.sender.verify_peer_credentials(expected) == local::Status::Ok);
+    CHECK(pair.receiver.verify_peer_credentials(expected) == local::Status::Ok);
+    return pair;
+}
+
+service::RuntimeConfig test_runtime_config() {
+    service::RuntimeConfig config;
+    config.f_store_guid = Id128::from_u64(9001);
+    return config;
+}
+
+void test_runtime_identity_disconnect_and_endpoint_failure() {
+    const local::HandoffRequest expected{{7, 1}, 1};
+    {
+        service::SidecarRuntime runtime(test_runtime_config());
+        RuntimeCase pair = authenticated_runtime_pair();
+        local::FdHandoffSender sender{local::HandoffFd(::open("/dev/null", O_RDONLY))};
+        local::FdHandoffResult sender_result;
+        service::RuntimeResult runtime_result;
+        std::thread worker([&] {
+            runtime_result = runtime.run_one(
+                pair.receiver, expected, std::chrono::steady_clock::now() + std::chrono::seconds(2));
+        });
+        sender_result = sender.send(pair.sender, local::HandoffRequest{{8, 1}, 1},
+                                    std::chrono::steady_clock::now() + std::chrono::seconds(2));
+        worker.join();
+        CHECK(runtime_result.status == service::RuntimeStatus::HandoffRejected);
+        CHECK(runtime_result.handoff.status == local::FdHandoffStatus::StaleGeneration);
+        CHECK(sender_result.status == local::FdHandoffStatus::StaleGeneration);
+        CHECK(runtime.live_handoff_count() == 0 && runtime.live_session_count() == 0);
+    }
+    {
+        service::SidecarRuntime runtime(test_runtime_config());
+        RuntimeCase pair = authenticated_runtime_pair();
+        service::RuntimeResult runtime_result;
+        std::thread worker([&] {
+            runtime_result = runtime.run_one(
+                pair.receiver, expected, std::chrono::steady_clock::now() + std::chrono::seconds(2));
+        });
+        pair.sender = local::Connection(-1);
+        worker.join();
+        CHECK(runtime_result.status == service::RuntimeStatus::HandoffRejected);
+        CHECK(runtime_result.handoff.status == local::FdHandoffStatus::Disconnected);
+        CHECK(runtime.live_handoff_count() == 0 && runtime.live_session_count() == 0);
+    }
+    {
+        service::SidecarRuntime runtime(test_runtime_config());
+        RuntimeCase pair = authenticated_runtime_pair();
+        local::FdHandoffSender sender{local::HandoffFd(::open("/dev/null", O_RDONLY))};
+        local::HandoffRequest sent = expected;
+        service::RuntimeResult runtime_result;
+        std::thread worker([&] {
+            runtime_result = runtime.run_one(
+                pair.receiver, expected, std::chrono::steady_clock::now() + std::chrono::seconds(2));
+        });
+        const local::FdHandoffResult sender_result = sender.send(
+            pair.sender, sent, std::chrono::steady_clock::now() + std::chrono::seconds(2));
+        worker.join();
+        // /dev/null is deliberately not a connected TCP socket.  The helper
+        // must ACK ownership first, then close it when endpoint adoption fails.
+        CHECK(sender_result.status == local::FdHandoffStatus::Accepted);
+        CHECK(runtime_result.handoff.status == local::FdHandoffStatus::Accepted);
+        CHECK(runtime_result.status == service::RuntimeStatus::AdoptionFailed);
+        CHECK(runtime.live_handoff_count() == 0 && runtime.live_session_count() == 0);
+    }
+    {
+        service::SidecarRuntime runtime(test_runtime_config());
+        RuntimeCase pair = authenticated_runtime_pair();
+        runtime.stop();
+        service::RuntimeResult result = runtime.run_one(
+            pair.receiver, expected, std::chrono::steady_clock::now() + std::chrono::seconds(1));
+        CHECK(result.status == service::RuntimeStatus::Stopped);
+        CHECK(runtime.live_handoff_count() == 0 && runtime.live_session_count() == 0);
+    }
+}
+
+int loopback_listener(uint16_t& port) {
+    const int listener = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    CHECK(listener >= 0);
+    int reuse = 1;
+    CHECK(::setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) == 0);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = 0;
+    CHECK(::bind(listener, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == 0);
+    CHECK(::listen(listener, 1) == 0);
+    socklen_t length = sizeof(address);
+    CHECK(::getsockname(listener, reinterpret_cast<sockaddr*>(&address), &length) == 0);
+    port = ntohs(address.sin_port);
+    return listener;
+}
+
+void test_runtime_zstd_tu_af_unix_loopback() {
+    namespace asio = boost::asio;
+    using tcp = asio::ip::tcp;
+    const std::vector<uint8_t> input = [] {
+        std::vector<uint8_t> value;
+        value.reserve(8192);
+        for (size_t index = 0; index != 8192; ++index)
+            value.push_back(static_cast<uint8_t>((index * 37u + index / 11u) & 0xffu));
+        return value;
+    }();
+    std::vector<uint8_t> observed;
+    service::RuntimeConfig config = test_runtime_config();
+    config.endpoint_config.input_job_state = [&](CStoreGuid, const TxBegin&, const TxCommit&,
+                                                   std::span<const uint8_t> exact) {
+        observed.assign(exact.begin(), exact.end());
+        return InputJobState::Open;
+    };
+    service::SidecarRuntime runtime(std::move(config));
+    RuntimeCase control = authenticated_runtime_pair();
+    const local::HandoffRequest request{{7, 1}, 1};
+    auto authority = std::make_shared<P50PreparationAuthority>(Id128::from_u64(9002));
+    P50ClientEndpoint client(authority);
+
+    uint16_t port = 0;
+    const int listener = loopback_listener(port);
+    asio::io_context client_context;
+    const tcp::endpoint remote(asio::ip::address_v4::loopback(), port);
+    std::future<ClientRunResult> client_result;
+    std::thread client_thread([&] {
+        const PreparedTuHandle prepared = authority->prepare({1, 1}, input);
+        client_result =
+            asio::co_spawn(client_context, client.run(remote, prepared), asio::use_future);
+        client_context.run();
+    });
+
+    service::RuntimeResult runtime_result;
+    std::thread runtime_thread([&] {
+        runtime_result = runtime.run_one(
+            control.receiver, request,
+            std::chrono::steady_clock::now() + std::chrono::seconds(3));
+    });
+    const int accepted = ::accept(listener, nullptr, nullptr);
+    CHECK(accepted >= 0);
+    CHECK(::close(listener) == 0);
+
+    local::FdHandoffSender sender{local::HandoffFd(accepted)};
+    const local::FdHandoffResult sender_result = sender.send(
+        control.sender, request, std::chrono::steady_clock::now() + std::chrono::seconds(3));
+    runtime_thread.join();
+    client_thread.join();
+    const ClientRunResult client_value = client_result.get();
+    CHECK(sender_result.status == local::FdHandoffStatus::Accepted);
+    CHECK(runtime_result.status == service::RuntimeStatus::Completed);
+    CHECK(runtime_result.endpoint.has_value() &&
+          runtime_result.endpoint->status == ServerRunStatus::Completed);
+    CHECK(client_value.status == ClientRunStatus::Committed);
+    CHECK(observed == input);
+    CHECK(runtime.live_handoff_count() == 0 && runtime.live_session_count() == 0);
+}
+
 bool wait_for_socket_node(const std::string& path, int timeout_milliseconds) {
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(timeout_milliseconds);
@@ -655,6 +831,8 @@ int main() {
         rejects_identity_role_and_malformed();
         slowloris_deadline_is_total_and_listener_recovers();
         frame_header_and_payload_share_one_deadline();
+        test_runtime_identity_disconnect_and_endpoint_failure();
+        test_runtime_zstd_tu_af_unix_loopback();
         ready_reader_close_after_bind_is_fail_closed();
         ready_requires_bind_and_replacement_is_preserved();
     } catch (const std::exception& error) {

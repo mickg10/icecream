@@ -1,10 +1,12 @@
-# Protocol-50 cache service (S2 local-control skeleton)
+# Protocol-50 cache service (S2 bounded sidecar bridge)
 
 `icecc-cache-service` is an installed, deliberately small sidecar control
-process.  It does not implement a cache codec, store, remote frame, or daemon
-integration.  `iceccd` continues to own the public TCP listener; a later slice
-will pass clean-boundary cache-session descriptors over this private control
-relationship.  Public advertisement remains the existing `0/0/0` value.
+process. `iceccd` continues to own the public TCP listener and passes one
+clean-boundary cache-session descriptor over this private control relationship.
+The service validates the authenticated generation/attempt/request identity,
+adopts the connected TCP socket, and delegates it to the shared
+`P50ServerEndpoint::run_adopted` reducer. Public advertisement remains the
+existing `0/0/0` value.
 
 ## Invocation
 
@@ -46,12 +48,22 @@ The bounded loop polls the listener and accepts at most one control connection
 at a time.  Each accepted descriptor has one move-only transport owner, one
 reader, and one writer.  The service verifies `SO_PEERCRED`, receives one exact
 `Hello` from `Daemon` with the configured nonzero generation and attempt, and
-returns one `HelloAck` from `Sidecar`.  Malformed, truncated, oversize, stale,
-wrong-role, wrong-credential, and timed-out inputs are closed and do not stop
-the listener.  The handshake timeout is one absolute deadline for the entire
-header and payload; receiving another byte never renews it.  SIGTERM and
-SIGINT stop the poll loop and close the listener no later than that bounded
-in-flight handshake plus one listener poll interval.
+returns one `HelloAck` from `Sidecar`. It then admits one `SCM_RIGHTS` handoff
+for request 1 (and monotonically increasing requests for later control
+connections), ACKs only after the descriptor is owned by the receiver, and
+closes every descriptor on NACK, disconnect, timeout, endpoint adoption error,
+or shutdown. The handoff receiver rejects stale generation, wrong attempt,
+wrong request, missing/extra descriptors, and trailing control data. The
+ordinary TCP descriptor is never listened on or advertised by the service.
+
+The explicit `SidecarRuntime` configuration owns the F-store identity,
+endpoint limits, and input-job policy. It permits one outstanding handoff,
+keeps endpoint state on its io-context owner thread, and reports endpoint
+session cleanup after the shared reducer returns. `stop()` cancels an active
+adopted socket and prevents a new handoff; all control waits retain an
+absolute deadline. A library caller can use `SidecarRuntime::run_one` with an already
+authenticated `local::Connection` for deterministic tests without process
+globals.
 
 Shutdown compares the open listener's `fstat` device/inode with the pathname's
 `lstat` device/inode before unlinking.  A replacement node is never removed.
