@@ -42,4 +42,5 @@ EXTRA_DIST = \
 	issue16-foundations-convergence.md \
 	p50-assignment-identity.md \
 	p50-cache-advertisement.md \
-	r6-input-attachment-seams.md
+	r6-input-attachment-seams.md \
+	p50-input-attachment.md
