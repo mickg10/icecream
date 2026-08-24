@@ -178,3 +178,8 @@ run_expected_failure assignment-ordering-revoke-mutant \
     Protocol50AssignmentOrdering.tla \
     Protocol50AssignmentOrderingRevokeMutant.cfg \
     ClaimWinsRevoke
+
+# S3 is intentionally a separate global/cross-relationship model.  Keep its
+# bounded rows in the canonical runner once the per-relationship suite has
+# completed, so a formal pass cannot accidentally omit the model-first gate.
+sh "$SCRIPT_DIR/run_global_tlc.sh"

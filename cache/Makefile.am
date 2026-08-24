@@ -112,6 +112,24 @@ EXTRA_DIST = \
 	formal/run_tlc.sh \
 	formal/.gitignore \
 	formal/check_trace.py \
+	formal/Protocol50Global.tla \
+	formal/Protocol50Global.cfg \
+	formal/Protocol50GlobalAggregateCapMutant.cfg \
+	formal/Protocol50GlobalNamespaceCapMutant.cfg \
+	formal/Protocol50GlobalSlotMutant.cfg \
+	formal/Protocol50GlobalLruMutant.cfg \
+	formal/Protocol50GlobalGenerationWrapMutant.cfg \
+	formal/Protocol50GlobalAdmissionMutant.cfg \
+	formal/Protocol50GlobalConflictMutant.cfg \
+	formal/Protocol50GlobalCrashMutant.cfg \
+	formal/Protocol50GlobalContentMutant.cfg \
+	formal/Protocol50GlobalStallMutant.cfg \
+	formal/Protocol50GlobalTrace.md \
+	formal/check_global_trace.py \
+	formal/global-trace.jsonl \
+	formal/run_global_trace_gate.sh \
+	formal/run_global_tlc.sh \
+	formal/run_global_formal_gate.sh \
 	P50_LOCAL_TRANSPORT.md \
 	formal/README.md
 

@@ -2,7 +2,7 @@
 
 This directory is the canonical formal home for Protocol 50 because it lives beside the product identities, executable state machine, action trace, and trace checker.
 
-There are five small models with different ownership boundaries:
+There are six small models with different ownership boundaries:
 
 ```text
 Protocol50.tla
@@ -28,6 +28,14 @@ Protocol50IncarnationBridge.tla
     verified F_STORE_GUID replacement while an old transaction is in flight
     or after a durable but unaccepted commit, preservation of C retry identity,
     independently owned compiler input, cold replay, and scoped progress
+
+Protocol50Global.tla
+    the S3 model-first global resource boundary: two C namespaces share an
+    aggregate byte cap and staging slots; each namespace owns an immutable
+    ABSENT -> INSTALLING -> PRESENT -> PINNED arena, whole-namespace LRU
+    eviction, crash/retry cleanup, and generation-wrap admission stop/GUID
+    flip. `check_global_trace.py` and `run_global_trace_gate.sh` bind the
+    same actions at Level 1 and exercise deletion plus known-caught controls.
 ```
 
 The boundaries are:
@@ -53,6 +61,17 @@ Protocol50IncarnationBridge
 This is one protocol design, not competing architectures. The split keeps the already-large cache state space from absorbing compiler-attempt, reconnect-classification, and multi-route ownership state.
 
 The older experimental model under `formal/protocol50/` on the capability branch is withdrawn. It contained the separate `ComputeNeed`/`PinClosure` race and did not implement the callback/restart semantics its review claimed.
+
+## S3 global model limits
+
+`Protocol50Global.tla` is intentionally bounded to two namespaces, two keys,
+two staging slots, three GUID values, and `MaxGeneration = 1` in its checked
+configuration. It proves the ordering and ownership rules at that bound; it
+does not prove an unbounded namespace count, byte arithmetic overflow
+behavior, persistence durability, or scheduler fairness. The writer stall
+mutant is a fail-closed watchdog witness, not an unbounded liveness proof.
+The product S3 claim remains blocked until the pinned TLC rows and the
+corresponding product watchdog/eviction gates are run on the exact candidate.
 
 ## Cache-model rules
 
