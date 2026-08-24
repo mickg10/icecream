@@ -109,11 +109,19 @@ echo 'ok - UseCS encode cache tail is gated at protocol 50'
 # computed once from c->cacheHandoff), and BOTH scheduler_use_cs projection
 # branches (self-selected-F 127.0.0.1 rewrite, and ordinary remote worker)
 # consume that SAME source -- so neither branch can silently drop it or
-# drift from the other.
+# drift from the other.  The two branches consume it through different
+# text shapes since the BigOracle 5th-gap fix (below): the local branch
+# copies *msg wholesale and overrides this field by assignment; the
+# remote branch (untouched by that fix -- its c->usecsmsg is introspection
+# only, never the wire vehicle) still passes it as a constructor argument.
+# Anchored separately so either branch dropping it is individually
+# distinguishable, not just "the combined count went from 2 to 1".
 require_count 1 'const uint32_t relay_cache_port = c->cacheHandoff.valid' \
     daemon/main.cpp 'the relay cache triple has exactly one validated source'
-require_count 2 'relay_cache_mask));' daemon/main.cpp \
-    'both scheduler_use_cs relay projections consume that same source'
+require_count 1 'relay->cache_profile_mask = relay_cache_mask;' daemon/main.cpp \
+    'the local-rewrite relay projection consumes that same source'
+require_count 1 'relay_cache_mask));' daemon/main.cpp \
+    'the remote-worker relay projection consumes that same source'
 
 # BigOracle (d23d9c5d HOLD, remote-relay gap): c->usecsmsg is NOT the wire
 # vehicle for the remote-worker projection above -- that branch's actual
@@ -126,6 +134,23 @@ require_count 2 'relay_cache_mask));' daemon/main.cpp \
 # local rewrite, Client C for the remote worker), not a source count.
 require_count 1 "This is the remote branch's ACTUAL client wire vehicle" \
     daemon/main.cpp 'the remote-worker branch is documented at its real send site'
+
+# BigOracle (d23d9c5d HOLD, 5th gap -- a REAL pre-existing product bug
+# predating the cache work): the local-rewrite branch used to hand-rebuild
+# its relay from individual fields, hardcoding got_env=true and
+# client_id=1 regardless of what the scheduler actually decided --
+# client/remote.cpp's build_remote_int reads got_env to decide whether to
+# send EnvTransferMsg, so a real got_env=false reply got silently
+# overridden and a required environment transfer could be skipped.  Fix:
+# copy *msg wholesale (every field preserved by construction, including
+# any added later) and override only host/port + the cache projection
+# above.  This anchors that copy-construction text itself; the actual
+# proof that every other field survives exactly is
+# unittests/cachehandoffdaemon.cpp's usecs_matches_except_host_and_cache
+# behavioral row on Client A, not a source count.
+require_count 1 'std::unique_ptr<UseCSMsg> relay(new UseCSMsg(*msg));' \
+    daemon/main.cpp \
+    'the local-rewrite relay is built by copying the scheduler frame, not hand-rebuilt field-by-field'
 
 # BigOracle (d23d9c5d HOLD): the daemon's defensive re-check is factored
 # into a small, pure, independently testable helper -- see its own comment

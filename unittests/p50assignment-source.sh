@@ -28,9 +28,21 @@ require_count 1 'job->dispatchMatchedJobId(), job->assignmentEpoch(),' \
 # cache triple is bound to.  This anchor was never updated to match --
 # confirmed present and already failing at d23d9c5d, before any commit in
 # this stack -- so it is corrected here rather than left red under a "full
-# suite must stay green" requirement it predates.
-require_count 3 'msg->assignmentEpoch()' daemon/main.cpp \
-    'submitter daemon preserves identity in all three production reads (two relay projections, one cache-handoff retention)'
+# suite must stay green" requirement it predates.  BigOracle's 5th-gap fix
+# (a REAL pre-existing product bug, see p50cacheadvertisement-source.sh)
+# dropped this count from 3 to 2: the local-rewrite relay projection no
+# longer calls msg->assignmentEpoch() explicitly -- it copies *msg
+# wholesale, so that field (and every other) is preserved implicitly by
+# the copy constructor rather than named at this call site.  The two
+# remaining explicit reads are the remote-worker relay projection and the
+# cache-handoff retention read; the local branch's identity preservation
+# is proved behaviorally instead, by
+# unittests/cachehandoffdaemon.cpp's usecs_matches_except_host_and_cache
+# row on Client A, and at the source level by
+# p50cacheadvertisement-source.sh's anchor on the copy-construction text
+# itself.
+require_count 2 'msg->assignmentEpoch()' daemon/main.cpp \
+    'submitter daemon preserves identity in its two remaining explicit production reads (remote relay projection, cache-handoff retention) -- the local relay projection now preserves it implicitly via whole-frame copy, proved behaviorally'
 require_count 2 'usecs->applyAssignmentTo(&job)' client/remote.cpp \
     'client remote/local-via-daemon paths copy the production UseCS identity'
 require_count 1 'record.key.epoch == job.assignmentEpoch()' daemon/main.cpp \

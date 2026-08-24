@@ -10,8 +10,22 @@
      "127.0.0.1 rewrite" branch).  This branch's c->usecsmsg construction
      is the actual wire vehicle, delivered via the PENDING_USE_CS drain
      loop once a local slot is free.  The rewrite must change only derived
-     host reachability (127.0.0.1) -- never the cache port/protocol/mask,
-     nor the assignment identity.
+     host reachability (127.0.0.1) and the independently-validated cache
+     projection -- never any other field.  BigOracle (5th gap, a REAL
+     pre-existing product bug predating the cache work): this branch used
+     to hand-rebuild the relay from individual fields, hardcoding
+     got_env=true and client_id=1 regardless of what the scheduler
+     actually sent -- client/remote.cpp's build_remote_int reads got_env
+     to decide whether to send EnvTransferMsg, so a real got_env=false
+     reply got silently overridden and a required environment transfer
+     could be skipped.  A throwaway connection consumes daemon-assigned
+     client_id 1 before Client A connects (so Client A's own id is
+     verifiably NOT 1, the exact value the bug hardcoded), and the reply
+     below sends got_env=false and a nonzero matched_job_id -- neither
+     value the old bug's hardcoding could produce by coincidence.
+     usecs_matches_except_host_and_cache asserts the client-visible frame
+     equals the scheduler's own frame in every field except the two this
+     branch is actually allowed to change.
 
    - Client C: the scheduler selects a DIFFERENT, remote host as F (the
      ordinary remote-worker branch).  BigOracle (d23d9c5d HOLD): this
@@ -227,6 +241,25 @@ static std::string wait_for_internals_containing(MsgChannel *client,
     return last;
 }
 
+/* S2 (BigOracle, 5th gap): the client-visible frame must equal the
+   scheduler's own frame in every field except the local-rewrite's two
+   allowed changes -- derived host reachability (hostname/port) and the
+   independently-validated cache projection (cache_endpoint_port/
+   cache_protocol/cache_profile_mask), which the caller checks
+   separately.  Everything else -- job id, platform, got_env, client_id,
+   matched_job_id, epoch, nonce -- must survive exactly. */
+static bool usecs_matches_except_host_and_cache(const UseCSMsg &sent,
+                                                const UseCSMsg &received)
+{
+    return received.job_id == sent.job_id
+        && received.host_platform == sent.host_platform
+        && received.got_env == sent.got_env
+        && received.client_id == sent.client_id
+        && received.matched_job_id == sent.matched_job_id
+        && received.assignmentEpoch() == sent.assignmentEpoch()
+        && received.assignmentNonce() == sent.assignmentNonce();
+}
+
 static bool wait_child(pid_t pid, int timeout_msec, int *status)
 {
     const Clock::time_point deadline = Clock::now()
@@ -336,12 +369,29 @@ int main(int argc, char **argv)
                 "fake scheduler activated the session");
     }
 
+    /* S2 (BigOracle, 5th gap): consume client_id=1 with a throwaway
+       connection before Client A, so Client A's own (daemon-assigned,
+       first-come-first-served at accept time -- see
+       Daemon's `client->client_id = ++new_client_id;`) client_id is
+       verifiably NOT 1 -- the exact value the local-rewrite branch used
+       to hardcode.  Without this, Client A would legitimately BE client
+       id 1 as the first real connection, and a hardcoded-1 regression
+       would be invisible. */
+    MsgChannel *client_zero = connect_unix_bounded(socket_path, 5000);
+    REQUIRE(client_zero != nullptr, "throwaway client zero connected to consume id 1");
+    delete client_zero;
+
     /* This daemon selected as its OWN F (the 127.0.0.1 rewrite branch): a
        local client requests a job, the daemon forwards GetCS to (fake) S,
        and S replies with a hand-built UseCS whose hostname:port matches
        THIS daemon's own remote-observed identity, carrying a full P50
        identity and a valid cache tail.  The client must receive that SAME
-       triple and identity unchanged. */
+       triple and identity unchanged.  S2 (BigOracle, 5th gap): got_env is
+       deliberately false (the opposite of what the branch used to
+       hardcode) and matched_job_id is deliberately nonzero, so neither
+       can pass by coincidence -- see usecs_matches_except_host_and_cache
+       below for the exact-field-equality check this fixture exists to
+       drive. */
     MsgChannel *client = connect_unix_bounded(socket_path, 5000);
     REQUIRE(client != nullptr, "local client A connected");
     GetCSMsg request(Environments(), "s2-relay.cpp", CompileJob::Lang_CXX,
@@ -354,21 +404,28 @@ int main(int argc, char **argv)
     GetCSMsg *forwarded = forwarded_wire ? dynamic_cast<GetCSMsg *>(forwarded_wire)
                                          : nullptr;
     REQUIRE(forwarded != nullptr, "fake scheduler received the forwarded GetCS");
+    REQUIRE(forwarded && forwarded->client_id != UINT32_C(1),
+            "S2 Gap 5: client A's real daemon-assigned client_id is NOT "
+            "1 -- the throwaway connection above did its job, so a "
+            "hardcoded-1 regression cannot pass by coincidence");
 
     const uint32_t remote_client_id = forwarded ? forwarded->client_id : 0;
     const uint32_t wire_job_id = UINT32_C(0x00005201);
     const uint64_t assignment_epoch = UINT64_C(0x5200000000000001);
     const uint64_t assignment_nonce = UINT64_C(0x1122334455667788);
     const uint32_t expected_cache_port = UINT32_C(0x0000cafe);
+    const uint32_t expected_matched_job_id = UINT32_C(77);
 
+    UseCSMsg reply("x86_64", "127.0.0.1", observed_daemon_port,
+                   wire_job_id, false, remote_client_id, expected_matched_job_id,
+                   assignment_epoch, assignment_nonce,
+                   expected_cache_port, CACHE_WIRE_PROTOCOL_V1,
+                   CACHE_PROFILE_ZSTD_TU);
     if (scheduler && forwarded) {
-        UseCSMsg reply("x86_64", "127.0.0.1", observed_daemon_port,
-                       wire_job_id, true, remote_client_id, 0,
-                       assignment_epoch, assignment_nonce,
-                       expected_cache_port, CACHE_WIRE_PROTOCOL_V1,
-                       CACHE_PROFILE_ZSTD_TU);
         REQUIRE(scheduler->send_msg(reply),
-                "fake scheduler sent a self-selected UseCS with a valid cache tail");
+                "fake scheduler sent a self-selected UseCS (got_env=false, "
+                "nontrivial client_id, nonzero matched_job_id) with a "
+                "valid cache tail");
     }
     delete forwarded_wire;
 
@@ -380,15 +437,26 @@ int main(int argc, char **argv)
     REQUIRE(client_use && client_use->hostname == "127.0.0.1"
                 && client_use->port == observed_daemon_port,
             "S2: the local rewrite changes only derived host reachability");
-    REQUIRE(client_use && client_use->assignmentEpoch() == assignment_epoch
-                && client_use->assignmentNonce() == assignment_nonce,
-            "S2: assignment identity survives the local-rewrite relay unchanged");
     REQUIRE(client_use && client_use->hasCacheAdvertisement()
                 && client_use->cache_endpoint_port == expected_cache_port
                 && client_use->cache_protocol == CACHE_WIRE_PROTOCOL_V1
                 && client_use->cache_profile_mask == CACHE_PROFILE_ZSTD_TU,
             "S2: the local-rewrite relay carries the SAME validated cache "
             "triple -- port/protocol/mask unchanged by the host rewrite");
+    /* S2 (BigOracle, 5th gap): the client-visible frame must equal the
+       scheduler's own frame in EVERY field except the allowed hostname/
+       port rewrite and the independently-validated cache projection
+       (already checked above) -- explicitly including job id, platform,
+       got_env, client_id, matched_job_id, epoch, and nonce.  This is the
+       exact property a hand-rebuilt constructor (the old bug, and any
+       future one like it) cannot satisfy without enumerating every field
+       correctly; the real fix (copying *msg and overriding only two
+       fields) satisfies it by construction. */
+    REQUIRE(client_use && usecs_matches_except_host_and_cache(reply, *client_use),
+            "S2 Gap 5: the local-rewrite relay equals the scheduler's frame "
+            "in every field except the allowed host/port rewrite and cache "
+            "projection -- job id, platform, got_env, client_id, "
+            "matched_job_id, epoch, and nonce all survive exactly");
     delete client_wire;
 
     /* Client C: the scheduler selects a REMOTE host as F -- hostname/port

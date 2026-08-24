@@ -5728,11 +5728,31 @@ int Daemon::scheduler_use_cs(UseCSMsg *msg)
     const uint32_t relay_cache_mask = c->cacheHandoff.valid ? c->cacheHandoff.cacheProfileMask : 0;
 
     if (msg->hostname == remote_name && int(msg->port) == daemon_port) {
-        install_pending_usecs(c, new UseCSMsg(msg->host_platform, "127.0.0.1", daemon_port,
-                                              msg->job_id, true, 1,
-                                              msg->matched_job_id, msg->assignmentEpoch(),
-                                              msg->assignmentNonce(), relay_cache_port,
-                                              relay_cache_protocol, relay_cache_mask));
+        /* S2 (BigOracle, 5th independent gap -- a REAL pre-existing product
+           bug, predating the cache work): this is the ACTUAL wire vehicle
+           for the self-selected-F local rewrite (see the PENDING_USE_CS
+           drain comment above), so hand-rebuilding it field-by-field, as
+           the code used to, meant every field NOT explicitly threaded
+           through was silently hardcoded instead of preserved -- got_env
+           and client_id were both wrong (true/1 always, regardless of
+           what the scheduler actually decided).  client/remote.cpp's
+           build_remote_int reads usecs->got_env to decide whether to send
+           EnvTransferMsg; a scheduler reply saying got_env=false (this F
+           does not already have the environment cached) got silently
+           overridden to true, so the client skipped a required
+           environment transfer and the compile could fail against an env
+           this daemon does not have.  Fix: copy *msg wholesale (every
+           field preserved by construction, including any added later)
+           and override ONLY the two things this branch actually decides
+           -- derived host reachability, and the independently validated
+           cache projection above. */
+        std::unique_ptr<UseCSMsg> relay(new UseCSMsg(*msg));
+        relay->hostname = "127.0.0.1";
+        relay->port = daemon_port;
+        relay->cache_endpoint_port = relay_cache_port;
+        relay->cache_protocol = relay_cache_protocol;
+        relay->cache_profile_mask = relay_cache_mask;
+        install_pending_usecs(c, relay.release());
         c->set_status(Client::PENDING_USE_CS, "scheduler_use_cs: local compile");
     } else {
         install_pending_usecs(c, new UseCSMsg(msg->host_platform, msg->hostname, msg->port,
