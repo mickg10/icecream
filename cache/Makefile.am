@@ -113,6 +113,7 @@ EXTRA_DIST = \
 	formal/.gitignore \
 	formal/check_trace.py \
 	P50_LOCAL_TRANSPORT.md \
+	P50_CACHE_SESSION.md \
 	formal/README.md
 
 check-local:

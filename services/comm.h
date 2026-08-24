@@ -161,7 +161,13 @@ public:
         // S --> CS: withdraw an assignment that has not been claimed.
         REVOKE_BEFORE_START = 0x49f00002,
         // CS --> S: the ordered claim/revoke outcome.
-        REVOKE_RESULT = 0x49f00003
+        REVOKE_RESULT = 0x49f00003,
+
+        // Protocol-50-private ordinary-link discriminator.  This value is
+        // deliberately outside both the historical ASCII vocabulary and the
+        // Protocol-49 private block; it is never meaningful below exactly
+        // Protocol 50.
+        CACHE_SESSION = 0x50f00000
     };
 
     Msg() = default;
@@ -175,6 +181,15 @@ public:
     /* Payload invariants which cannot be expressed by the frame length alone.
        The default keeps all historical message classes unchanged. */
     virtual bool valid_payload() const { return true; }
+
+    /* Message-specific protocol admission.  Most historical messages are
+       valid on every negotiated ordinary link; draft/private messages can
+       narrow that rule without allowing send_msg() to compose a frame first. */
+    virtual bool valid_for_protocol(int negotiated_protocol) const
+    {
+        (void)negotiated_protocol;
+        return true;
+    }
 
     std::basic_string<char> to_string() const {
         switch (value_) {
@@ -252,6 +267,8 @@ public:
                 return "REVOKE_BEFORE_START";
             case REVOKE_RESULT:
                 return "REVOKE_RESULT";
+            case CACHE_SESSION:
+                return "CACHE_SESSION";
         }
         return "UNKNOWN";
     }
@@ -389,6 +406,12 @@ public:
     // NULL  <--> channel closed or timeout
     // Will warn in log if EOF and !eofAllowed.
     Msg *get_msg(int timeout = 10, bool eofAllowed = false);
+
+    /* Transfer the still-owned ordinary-link descriptor after the one
+       immediately preceding decode returned CACHE_SESSION.  A successful
+       transfer returns the descriptor and sets fd to -1; all refusal paths
+       return -1 without reading or dropping input. */
+    int release_fd_if_input_empty();
 
     /* Bytes which remain inside the frame currently being decoded.  This is
        deliberately frame-bounded rather than based on buffered input: a
@@ -566,6 +589,9 @@ protected:
     uint32_t inmsglen;
     bool eof;
     bool text_based;
+    // Armed only by a successfully decoded CACHE_SESSION.  It is cleared by
+    // any subsequent decode/use; there is no generic clean-boundary escape.
+    bool cache_session_release_armed;
 
 private:
     friend class Service;
@@ -702,6 +728,21 @@ class EndMsg : public Msg
 public:
     EndMsg()
         : Msg(Msg::END) {}
+};
+
+/* Empty-payload ordinary-link discriminator for the same-fd CacheWire
+   handoff.  CacheWire's own SessionHello follows on the transferred fd and
+   binds C_GUID there; this ordinary message carries no CacheWire fields. */
+class CacheSessionMsg : public Msg
+{
+public:
+    CacheSessionMsg()
+        : Msg(Msg::CACHE_SESSION) {}
+
+    bool valid_for_protocol(int negotiated_protocol) const override
+    {
+        return negotiated_protocol == PROTOCOL_VERSION;
+    }
 };
 
 class GetCSMsg : public Msg

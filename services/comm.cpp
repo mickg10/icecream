@@ -1112,6 +1112,7 @@ MsgChannel::MsgChannel(int _fd, struct sockaddr *_a, socklen_t _l, bool text)
     current_message_end = 0;
     eof = false;
     text_based = text;
+    cache_session_release_armed = false;
     set_error_recursion = false;
     maximum_remote_protocol = -1;
 
@@ -1329,6 +1330,10 @@ Msg *MsgChannel::get_msg(int timeout, bool eofAllowed)
     Msg *m = nullptr;
     Msg::Value type;
 
+    /* A release is tied to the immediately preceding CACHE_SESSION decode;
+       attempting another receive is itself the next parser use. */
+    cache_session_release_armed = false;
+
     if (!wait_for_msg(timeout)) {
         // trace() << "!wait_for_msg()\n";
         return nullptr;
@@ -1470,6 +1475,11 @@ Msg *MsgChannel::get_msg(int timeout, bool eofAllowed)
             m = new RevokeResultMsg;
         }
         break;
+    case Msg::CACHE_SESSION:
+        if (protocol == PROTOCOL_VERSION) {
+            m = new CacheSessionMsg;
+        }
+        break;
     case Msg::VERIFY_ENV:
         m = new VerifyEnvMsg;
         break;
@@ -1511,11 +1521,60 @@ Msg *MsgChannel::get_msg(int timeout, bool eofAllowed)
     instate = NEED_LEN;
     update_state();
 
+    if (type == Msg::CACHE_SESSION && instate != ERROR && !eof) {
+        cache_session_release_armed = true;
+    }
+
     return m;
+}
+
+int MsgChannel::release_fd_if_input_empty()
+{
+    /* Every condition is checked before changing ownership.  In particular,
+       do not call read_a_bit(): a failed handoff must leave an early CacheWire
+       byte, or a partial/complete ordinary frame, exactly where the legacy
+       parser left it. */
+    if (!cache_session_release_armed || fd < 0 || protocol != PROTOCOL_VERSION
+        || eof || instate == ERROR || instate != NEED_LEN
+        || inofs != intogo || msgtogo != 0 || !pending_frame_ends.empty()) {
+        return -1;
+    }
+
+    /* The internal buffer barrier catches read-ahead.  A non-consuming peek
+       closes the remaining race with bytes already in the kernel receive
+       queue and also distinguishes a peer EOF from a clean idle boundary. */
+    unsigned char byte = 0;
+    for (;;) {
+        const ssize_t result = recv(fd, &byte, sizeof(byte), MSG_PEEK | MSG_DONTWAIT);
+        if (result > 0 || result == 0) {
+            return -1;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            return -1;
+        }
+        break;
+    }
+
+    const int released_fd = fd;
+    fd = -1;
+    cache_session_release_armed = false;
+    return released_fd;
 }
 
 bool MsgChannel::send_msg(const Msg &m, int flags)
 {
+    /* Protocol-specific refusal occurs before composing even the four-byte
+       frame-length placeholder.  The release arm is parser-message-specific
+       and is cleared by the next get_msg() use, not by a generic send or
+       clean-boundary test. */
+    if (!m.valid_for_protocol(protocol)) {
+        log_error() << "refusing " << m.to_string() << " on negotiated protocol "
+                    << protocol << endl;
+        return false;
+    }
     if (!m.valid_payload()) {
         log_error() << "refusing invalid message payload (" << m.to_string() << ")" << endl;
         set_error();
