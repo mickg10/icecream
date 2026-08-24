@@ -74,6 +74,15 @@ int fake_child(const char* mode) {
         (void)write_all(fd, "READY\n", 6);
         return pause();
     }
+    if (std::string(mode) == "close-empty-live") {
+        // Regression for the READY-EOF path: EOF does not imply that the
+        // service exited, so the supervisor must never perform a blocking
+        // reap here.  Ignore TERM to make teardown exercise its bounded
+        // TERM-to-KILL path after rejecting the empty message.
+        (void)::signal(SIGTERM, SIG_IGN);
+        ::close(fd);
+        return pause();
+    }
     if (std::string(mode) == "sentinel") {
         const char* sentinel = std::getenv("ICECC_SENTINEL_FD");
         if (sentinel != nullptr) {
@@ -243,6 +252,23 @@ void exact_ready_close_protocol() {
     CHECK(no_close.child_pid() < 0);
 }
 
+void empty_ready_eof_from_live_child_is_bounded() {
+    Supervisor supervisor(fake_config("close-empty-live"));
+    const auto started = std::chrono::steady_clock::now();
+    // A regression to blocking waitpid() would otherwise hang the complete
+    // test executable rather than produce a useful failing row.
+    (void)::alarm(5);
+    CHECK(!supervisor.start());
+    (void)::alarm(0);
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    CHECK(elapsed < std::chrono::seconds(2));
+    CHECK(supervisor.state() == State::DegradedLegacy);
+    CHECK(supervisor.counters().invalid_ready_messages >= 1);
+    CHECK(supervisor.counters().forced_kills == 1);
+    CHECK(!supervisor.has_private_fds());
+    CHECK(supervisor.child_pid() < 0);
+}
+
 void ambient_fd_is_not_inherited() {
     char path[] = "/tmp/icecc-sidecar-sentinel-XXXXXX";
     const int sentinel_fd = ::mkstemp(path);
@@ -352,6 +378,7 @@ int main(int argc, char** argv) {
         repeated_post_ready_crashes_exhaust_budget();
         invalid_ready_is_bounded();
         exact_ready_close_protocol();
+        empty_ready_eof_from_live_child_is_bounded();
         ambient_fd_is_not_inherited();
         shutdown_owns_process_group();
         restart_window_ages_without_unbounded_call();
