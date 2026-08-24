@@ -3,10 +3,8 @@
 // Protocol-50 local transport (S2 groundwork).
 //
 // This is deliberately a small, synchronous boundary.  A relationship owns
-// exactly one SingleWriter object; callers must not write the descriptor by
-// any other means.  SingleWriter rejects a second write while one is in
-// progress, so a future async adapter can put its bounded queue in front of
-// this boundary without allowing frame interleaving.
+// exactly one move-only Connection; callers use its send() method and cannot
+// accidentally create a second framed writer for the same relationship.
 
 #include <cstddef>
 #include <cstdint>
@@ -58,6 +56,7 @@ enum class Status {
     InvalidArgument,
     InvalidPath,
     IoError,
+    CleanEof,
     Truncated,
     Malformed,
     Oversize,
@@ -68,6 +67,7 @@ enum class Status {
     PeerCredentialUnavailable,
     PeerCredentialMismatch,
     Busy,
+    SignalProtectionUnavailable,
 };
 
 const char* status_name(Status status) noexcept;
@@ -83,20 +83,31 @@ Status decode_frame(std::span<const uint8_t> bytes, Frame& frame);
 // Blocking exact-I/O helpers.  They never allocate based on an unbounded wire
 // value: the advertised payload length is checked before allocation.
 Status read_frame(int fd, Frame& frame);
-Status write_frame(int fd, const Frame& frame);
 
-class SingleWriter {
+class Connection {
 public:
-    explicit SingleWriter(int fd) noexcept : fd_(fd) {}
-    SingleWriter(const SingleWriter&) = delete;
-    SingleWriter& operator=(const SingleWriter&) = delete;
+    // Takes ownership of fd.  On failure (including unavailable SIGPIPE
+    // protection) the descriptor is closed and the connection is invalid.
+    explicit Connection(int fd) noexcept;
+    ~Connection();
+    Connection(Connection&& other) noexcept;
+    Connection& operator=(Connection&& other) noexcept;
+    Connection(const Connection&) = delete;
+    Connection& operator=(const Connection&) = delete;
+
+    [[nodiscard]] bool valid() const noexcept { return fd_ >= 0; }
+    [[nodiscard]] Status status() const noexcept { return status_; }
+    [[nodiscard]] bool cloexec() const noexcept;
 
     // A concurrent caller gets Busy.  There is intentionally no implicit
     // queue: one bounded queue and one writer belong to the relationship.
     Status send(const Frame& frame) noexcept;
+    Status receive(Frame& frame) noexcept;
 
 private:
+    void close() noexcept;
     int fd_ = -1;
+    Status status_ = Status::InvalidArgument;
     std::atomic_flag writing_ = ATOMIC_FLAG_INIT;
 };
 
@@ -147,7 +158,7 @@ Status verify_peer_credentials(int fd, const CredentialExpectation& expected,
 // path; callers must use a private runtime directory and remove their socket
 // path during supervisor shutdown.
 int listen_unix(const std::string& path, int backlog, Status* status = nullptr) noexcept;
-int connect_unix(const std::string& path, Status* status = nullptr) noexcept;
-int accept_unix(int listener_fd, Status* status = nullptr) noexcept;
+Connection connect_unix(const std::string& path, Status* status = nullptr) noexcept;
+Connection accept_unix(int listener_fd, Status* status = nullptr) noexcept;
 
 } // namespace icecc::p50::local

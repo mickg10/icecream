@@ -18,17 +18,26 @@ Every `SOCK_STREAM` frame starts with a 28-byte big-endian header:
 | 12..19 | connection generation |
 | 20..27 | attempt identity |
 
-The payload is capped at 64 KiB.  A reader validates the cap before allocating
-and requires an exact frame; malformed, truncated, extra-byte, unsupported,
+The payload is capped at 64 KiB.  A reader validates magic, version, type, and
+the cap before allocating or waiting for a payload, and requires an exact
+frame; a clean EOF at a header boundary is distinct from partial-header and
+partial-payload truncation.  Malformed, truncated, extra-byte, unsupported,
 and stale-identity inputs are refused.  A handshake payload is exactly one
 role byte (`daemon` or `sidecar`) and is checked against both identity fields.
 
-Each relationship has one `SingleWriter`.  It owns the only write path and
-rejects a concurrent send with `Busy`; it intentionally has no implicit queue
-or unbounded buffering.  The eventual supervisor/async adapter is responsible
-for one bounded queue and orderly shutdown around this boundary.
+Each relationship has one move-only `Connection`.  It owns the descriptor and
+the only framed write path, rejecting a concurrent send with `Busy`; there is
+no public raw frame writer or second writer object.  The eventual
+supervisor/async adapter is responsible for one bounded queue and orderly
+shutdown around this boundary.  Listener and accepted/client descriptors are
+`CLOEXEC`; SIGPIPE is suppressed with `MSG_NOSIGNAL` or `SO_NOSIGPIPE`, and
+platforms with neither fail closed.
+
+Socket paths must be absolute, contain no embedded NUL, and reside in a
+directory owned by the effective user with exact mode `0700`.  The listener
+never replaces an existing node; its socket node is owned by the effective
+user with exact mode `0600`, which clients also verify before connecting.
 
 On Linux, peer verification uses `SO_PEERCRED`.  The provider argument is a
 test/integration seam; absent a provider, unsupported or failed OS credential
 queries return `PeerCredentialUnavailable` and never grant access.
-

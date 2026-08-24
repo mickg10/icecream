@@ -6,6 +6,8 @@
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -58,12 +60,12 @@ bool valid_type(uint16_t type) {
            type <= static_cast<uint16_t>(MessageType::Goodbye);
 }
 
-Status read_exact(int fd, std::span<uint8_t> out) {
+Status read_exact(int fd, std::span<uint8_t> out, bool clean_eof) {
     size_t done = 0;
     while (done != out.size()) {
         const ssize_t count = ::read(fd, out.data() + done, out.size() - done);
         if (count == 0)
-            return Status::Truncated;
+            return done == 0 && clean_eof ? Status::CleanEof : Status::Truncated;
         if (count < 0) {
             if (errno == EINTR)
                 continue;
@@ -94,6 +96,68 @@ Status write_all(int fd, std::span<const uint8_t> bytes) {
     return Status::Ok;
 }
 
+bool set_cloexec(int fd) {
+    const int flags = ::fcntl(fd, F_GETFD);
+    if (flags < 0)
+        return false;
+    if ((flags & FD_CLOEXEC) != 0)
+        return true;
+    return ::fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == 0;
+}
+
+int socket_cloexec() {
+    int fd = -1;
+#if defined(SOCK_CLOEXEC)
+    fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0 && errno == EINVAL)
+        fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+#else
+    fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+#endif
+    if (fd < 0)
+        return -1;
+    if (!set_cloexec(fd)) {
+        ::close(fd);
+        errno = EIO;
+        return -1;
+    }
+    return fd;
+}
+
+int accept_cloexec(int listener_fd) {
+    int fd = -1;
+#if defined(__linux__) && defined(SOCK_CLOEXEC)
+    fd = ::accept4(listener_fd, nullptr, nullptr, SOCK_CLOEXEC);
+    if (fd < 0 && (errno == ENOSYS || errno == EINVAL))
+        fd = ::accept(listener_fd, nullptr, nullptr);
+#else
+    fd = ::accept(listener_fd, nullptr, nullptr);
+#endif
+    if (fd < 0)
+        return -1;
+    // The fcntl path is the portability fallback for systems without
+    // accept4/SOCK_CLOEXEC, and also verifies the atomic path's result.
+    if (!set_cloexec(fd)) {
+        ::close(fd);
+        errno = EIO;
+        return -1;
+    }
+    return fd;
+}
+
+bool configure_sigpipe_protection(int fd) {
+#if defined(MSG_NOSIGNAL)
+    (void)fd;
+    return true;
+#elif defined(SO_NOSIGPIPE)
+    int enabled = 1;
+    return ::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled)) == 0;
+#else
+    (void)fd;
+    return false;
+#endif
+}
+
 Status set_status(Status value, Status* output) {
     if (output != nullptr)
         *output = value;
@@ -101,13 +165,49 @@ Status set_status(Status value, Status* output) {
 }
 
 bool fill_address(const std::string& path, sockaddr_un& address) {
-    if (path.empty() || path.size() > kMaxUnixPath)
+    if (path.empty() || path.front() != '/' || path.find('\0') != std::string::npos ||
+        path.size() > kMaxUnixPath)
         return false;
     std::memset(&address, 0, sizeof(address));
     address.sun_family = AF_UNIX;
     std::memcpy(address.sun_path, path.data(), path.size());
     address.sun_path[path.size()] = '\0';
     return true;
+}
+
+bool private_parent(const std::string& path) {
+    const size_t slash = path.find_last_of('/');
+    if (slash == std::string::npos)
+        return false;
+    const std::string parent = slash == 0 ? "/" : path.substr(0, slash);
+    struct stat info{};
+    if (::lstat(parent.c_str(), &info) != 0 || !S_ISDIR(info.st_mode))
+        return false;
+    return info.st_uid == ::geteuid() && (info.st_mode & 07777) == 0700;
+}
+
+bool private_socket_node(const std::string& path) {
+    struct stat info{};
+    if (::lstat(path.c_str(), &info) != 0 || !S_ISSOCK(info.st_mode))
+        return false;
+    return info.st_uid == ::geteuid() && (info.st_mode & 07777) == 0600;
+}
+
+Status validate_header(const uint8_t* header, size_t size, uint32_t* payload_length) {
+    if (size < kFrameHeaderSize)
+        return Status::Truncated;
+    if (!std::equal(kMagic.begin(), kMagic.end(), header))
+        return Status::Malformed;
+    if (get_u16(header + 4) != kProtocolVersion)
+        return Status::UnsupportedVersion;
+    if (!valid_type(get_u16(header + 6)))
+        return Status::Malformed;
+    const uint32_t length = get_u32(header + kPayloadLengthOffset);
+    if (length > kMaxFramePayload)
+        return Status::Oversize;
+    if (payload_length != nullptr)
+        *payload_length = length;
+    return Status::Ok;
 }
 
 } // namespace
@@ -118,6 +218,7 @@ const char* status_name(Status status) noexcept {
     case Status::InvalidArgument: return "invalid-argument";
     case Status::InvalidPath: return "invalid-path";
     case Status::IoError: return "io-error";
+    case Status::CleanEof: return "clean-eof";
     case Status::Truncated: return "truncated";
     case Status::Malformed: return "malformed";
     case Status::Oversize: return "oversize";
@@ -128,6 +229,7 @@ const char* status_name(Status status) noexcept {
     case Status::PeerCredentialUnavailable: return "peer-credential-unavailable";
     case Status::PeerCredentialMismatch: return "peer-credential-mismatch";
     case Status::Busy: return "busy";
+    case Status::SignalProtectionUnavailable: return "signal-protection-unavailable";
     }
     return "unknown";
 }
@@ -157,28 +259,18 @@ std::vector<uint8_t> encode_frame(const Frame& frame, Status* status) {
 }
 
 Status decode_frame(std::span<const uint8_t> bytes, Frame& frame) {
-    if (bytes.size() < kFrameHeaderSize)
-        return Status::Truncated;
-    if (!std::equal(kMagic.begin(), kMagic.end(), bytes.begin()))
-        return Status::Malformed;
-
-    const uint16_t version = get_u16(bytes.data() + 4);
-    if (version != kProtocolVersion)
-        return Status::UnsupportedVersion;
-    const uint16_t raw_type = get_u16(bytes.data() + 6);
-    if (!valid_type(raw_type))
-        return Status::Malformed;
-    const uint32_t payload_length = get_u32(bytes.data() + kPayloadLengthOffset);
-    if (payload_length > kMaxFramePayload)
-        return Status::Oversize;
+    uint32_t payload_length = 0;
+    const Status header_status = validate_header(bytes.data(), bytes.size(), &payload_length);
+    if (header_status != Status::Ok)
+        return header_status;
     if (bytes.size() < kFrameHeaderSize + payload_length)
         return Status::Truncated;
     if (bytes.size() != kFrameHeaderSize + payload_length)
         return Status::Malformed;
 
     Frame decoded;
-    decoded.version = version;
-    decoded.type = static_cast<MessageType>(raw_type);
+    decoded.version = get_u16(bytes.data() + 4);
+    decoded.type = static_cast<MessageType>(get_u16(bytes.data() + 6));
     decoded.identity.generation = get_u64(bytes.data() + kGenerationOffset);
     decoded.identity.attempt = get_u64(bytes.data() + kAttemptOffset);
     decoded.payload.assign(bytes.begin() + kFrameHeaderSize, bytes.end());
@@ -190,39 +282,89 @@ Status read_frame(int fd, Frame& frame) {
     if (fd < 0)
         return Status::InvalidArgument;
     std::array<uint8_t, kFrameHeaderSize> header{};
-    Status status = read_exact(fd, header);
+    Status status = read_exact(fd, header, true);
     if (status != Status::Ok)
         return status;
-    const uint32_t payload_length = get_u32(header.data() + kPayloadLengthOffset);
-    if (payload_length > kMaxFramePayload)
-        return Status::Oversize;
+    uint32_t payload_length = 0;
+    status = validate_header(header.data(), header.size(), &payload_length);
+    if (status != Status::Ok)
+        return status;
     std::vector<uint8_t> encoded(kFrameHeaderSize + payload_length);
     std::copy(header.begin(), header.end(), encoded.begin());
-    status = read_exact(fd, std::span<uint8_t>(encoded).subspan(kFrameHeaderSize));
+    status = read_exact(fd, std::span<uint8_t>(encoded).subspan(kFrameHeaderSize), false);
     if (status != Status::Ok)
         return status;
     return decode_frame(encoded, frame);
 }
 
-Status write_frame(int fd, const Frame& frame) {
-    if (fd < 0)
-        return Status::InvalidArgument;
-    Status status = Status::Ok;
-    const std::vector<uint8_t> encoded = encode_frame(frame, &status);
-    return status == Status::Ok ? write_all(fd, encoded) : status;
+Connection::Connection(int fd) noexcept : fd_(fd), status_(Status::Ok) {
+    if (fd_ < 0) {
+        status_ = Status::InvalidArgument;
+        return;
+    }
+    const bool cloexec_ok = set_cloexec(fd_);
+    const bool sigpipe_ok = cloexec_ok && configure_sigpipe_protection(fd_);
+    if (!sigpipe_ok) {
+        status_ = !cloexec_ok ? Status::IoError : Status::SignalProtectionUnavailable;
+        ::close(fd_);
+        fd_ = -1;
+    }
 }
 
-Status SingleWriter::send(const Frame& frame) noexcept {
+Connection::~Connection() { close(); }
+
+bool Connection::cloexec() const noexcept {
+    if (fd_ < 0)
+        return false;
+    const int flags = ::fcntl(fd_, F_GETFD);
+    return flags >= 0 && (flags & FD_CLOEXEC) != 0;
+}
+
+Connection::Connection(Connection&& other) noexcept
+    : fd_(other.fd_), status_(other.status_), writing_(ATOMIC_FLAG_INIT) {
+    other.fd_ = -1;
+    other.status_ = Status::InvalidArgument;
+}
+
+Connection& Connection::operator=(Connection&& other) noexcept {
+    if (this != &other) {
+        close();
+        fd_ = other.fd_;
+        status_ = other.status_;
+        other.fd_ = -1;
+        other.status_ = Status::InvalidArgument;
+        writing_.clear(std::memory_order_release);
+    }
+    return *this;
+}
+
+void Connection::close() noexcept {
+    if (fd_ >= 0)
+        ::close(fd_);
+    fd_ = -1;
+}
+
+Status Connection::send(const Frame& frame) noexcept {
     if (writing_.test_and_set(std::memory_order_acquire))
         return Status::Busy;
     Status status = Status::IoError;
     try {
-        status = write_frame(fd_, frame);
+        if (fd_ < 0) {
+            status = status_;
+        } else {
+            Status encode_status = Status::Ok;
+            const std::vector<uint8_t> encoded = encode_frame(frame, &encode_status);
+            status = encode_status == Status::Ok ? write_all(fd_, encoded) : encode_status;
+        }
     } catch (...) {
         status = Status::IoError;
     }
     writing_.clear(std::memory_order_release);
     return status;
+}
+
+Status Connection::receive(Frame& frame) noexcept {
+    return fd_ < 0 ? status_ : read_frame(fd_, frame);
 }
 
 Frame make_hello(PeerRole role, Identity identity) {
@@ -298,13 +440,15 @@ Status verify_peer_credentials(int fd, const CredentialExpectation& expected,
 
 int listen_unix(const std::string& path, int backlog, Status* status) noexcept {
     sockaddr_un address{};
-    if (backlog < 1 || !fill_address(path, address)) {
-        set_status(path.empty() || path.size() > kMaxUnixPath ? Status::InvalidPath
+    if (backlog < 1 || !fill_address(path, address) || !private_parent(path)) {
+        set_status(path.empty() || path.front() != '/' || path.find('\0') != std::string::npos ||
+                           path.size() > kMaxUnixPath || !private_parent(path)
+                       ? Status::InvalidPath
                                                                : Status::InvalidArgument,
                    status);
         return -1;
     }
-    const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    const int fd = socket_cloexec();
     if (fd < 0) {
         set_status(Status::IoError, status);
         return -1;
@@ -313,9 +457,17 @@ int listen_unix(const std::string& path, int backlog, Status* status) noexcept {
     // silently unlinking here could disconnect a live sidecar.
     const socklen_t address_length =
         static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + path.size() + 1);
-    if (::bind(fd, reinterpret_cast<const sockaddr*>(&address), address_length) != 0 ||
+    if (::bind(fd, reinterpret_cast<const sockaddr*>(&address), address_length) != 0) {
+        ::close(fd);
+        set_status(Status::IoError, status);
+        return -1;
+    }
+    // bind(2) creates the node using the process umask.  Establish and verify
+    // the exact private node mode before exposing the listener.
+    if (::chmod(path.c_str(), S_IRUSR | S_IWUSR) != 0 || !private_socket_node(path) ||
         ::listen(fd, backlog) != 0) {
         ::close(fd);
+        ::unlink(path.c_str());
         set_status(Status::IoError, status);
         return -1;
     }
@@ -323,40 +475,53 @@ int listen_unix(const std::string& path, int backlog, Status* status) noexcept {
     return fd;
 }
 
-int connect_unix(const std::string& path, Status* status) noexcept {
+Connection connect_unix(const std::string& path, Status* status) noexcept {
     sockaddr_un address{};
-    if (!fill_address(path, address)) {
+    if (!fill_address(path, address) || !private_parent(path) || !private_socket_node(path)) {
         set_status(Status::InvalidPath, status);
-        return -1;
+        return Connection(-1);
     }
-    const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    const int fd = socket_cloexec();
     if (fd < 0) {
         set_status(Status::IoError, status);
-        return -1;
+        return Connection(-1);
     }
     const socklen_t address_length =
         static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + path.size() + 1);
     if (::connect(fd, reinterpret_cast<const sockaddr*>(&address), address_length) != 0) {
         ::close(fd);
         set_status(Status::IoError, status);
-        return -1;
+        return Connection(-1);
+    }
+    Connection connection(fd);
+    if (!connection.valid()) {
+        set_status(connection.status(), status);
+        return connection;
     }
     set_status(Status::Ok, status);
-    return fd;
+    return connection;
 }
 
-int accept_unix(int listener_fd, Status* status) noexcept {
+Connection accept_unix(int listener_fd, Status* status) noexcept {
     if (listener_fd < 0) {
         set_status(Status::InvalidArgument, status);
-        return -1;
+        return Connection(-1);
     }
-    const int fd = ::accept(listener_fd, nullptr, nullptr);
+    int fd = -1;
+    do {
+        fd = accept_cloexec(listener_fd);
+    } while (fd < 0 && errno == EINTR);
     if (fd < 0) {
         set_status(Status::IoError, status);
-        return -1;
+        return Connection(-1);
+    }
+    Connection connection(fd);
+    if (!connection.valid()) {
+        set_status(connection.status(), status);
+        return connection;
     }
     set_status(Status::Ok, status);
-    return fd;
+    return connection;
 }
 
 } // namespace icecc::p50::local

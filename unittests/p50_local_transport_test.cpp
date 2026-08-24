@@ -1,4 +1,6 @@
+#define private public
 #include "cache/p50_local_transport.h"
+#undef private
 
 #include <array>
 #include <cassert>
@@ -8,6 +10,11 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <chrono>
+#include <fcntl.h>
+#include <pthread.h>
+#include <signal.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <sys/socket.h>
@@ -22,6 +29,8 @@ void check(bool value, const char* expression) {
 }
 
 #define CHECK(value) check((value), #value)
+
+void interrupt_handler(int) {}
 
 Frame data_frame() {
     return Frame{kProtocolVersion, MessageType::Data, Identity{17, 42},
@@ -76,11 +85,28 @@ void framing_and_limits() {
 
     int sockets[2] = {-1, -1};
     CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
-    SingleWriter writer(sockets[0]);
+    Connection writer(sockets[0]);
+    CHECK(writer.valid());
     CHECK(writer.send(source) == Status::Ok);
     CHECK(read_frame(sockets[1], decoded) == Status::Ok);
     CHECK(decoded == source);
-    ::close(sockets[0]);
+    ::close(sockets[1]);
+}
+
+void single_writer_busy_is_load_bearing() {
+    int sockets[2] = {-1, -1};
+    CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    Connection writer(sockets[0]);
+    CHECK(writer.valid());
+    // Claiming the private gate models a writer already in progress and makes
+    // the Busy regression deterministic rather than scheduler-dependent.
+    CHECK(!writer.writing_.test_and_set(std::memory_order_acquire));
+    CHECK(writer.send(data_frame()) == Status::Busy);
+    writer.writing_.clear(std::memory_order_release);
+    CHECK(writer.send(data_frame()) == Status::Ok);
+    Frame received;
+    CHECK(read_frame(sockets[1], received) == Status::Ok);
+    CHECK(received == data_frame());
     ::close(sockets[1]);
 }
 
@@ -116,6 +142,31 @@ void truncated_read() {
     CHECK(read_frame(sockets[1], ignored) == Status::Oversize);
     ::close(sockets[0]);
     ::close(sockets[1]);
+
+    CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    ::close(sockets[0]);
+    CHECK(read_frame(sockets[1], ignored) == Status::CleanEof);
+    ::close(sockets[1]);
+
+    CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    const auto partial_bytes = encode_frame(data_frame());
+    CHECK(::write(sockets[0], partial_bytes.data(), kFrameHeaderSize - 1) ==
+          static_cast<ssize_t>(kFrameHeaderSize - 1));
+    ::close(sockets[0]);
+    CHECK(read_frame(sockets[1], ignored) == Status::Truncated);
+    ::close(sockets[1]);
+
+    // Header validation must fail before waiting for the declared payload.
+    CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    auto invalid_header = bytes;
+    invalid_header.resize(kFrameHeaderSize);
+    invalid_header[0] = 'X';
+    invalid_header[11] = 0xff;
+    CHECK(::write(sockets[0], invalid_header.data(), invalid_header.size()) ==
+          static_cast<ssize_t>(invalid_header.size()));
+    CHECK(read_frame(sockets[1], ignored) == Status::Malformed);
+    ::close(sockets[0]);
+    ::close(sockets[1]);
 }
 
 void credentials() {
@@ -146,36 +197,75 @@ void credentials() {
 }
 
 void unix_setup() {
-    const std::string path = "/tmp/icecc-p50-local-transport-" + std::to_string(::getpid());
-    ::unlink(path.c_str());
+    char directory[] = "/tmp/icecc-p50-local-transport-XXXXXX";
+    CHECK(::mkdtemp(directory) != nullptr);
+    const std::string path = std::string(directory) + "/endpoint";
     Status status = Status::InvalidArgument;
     const int listener = listen_unix(path, 2, &status);
     CHECK(listener >= 0);
     CHECK(status == Status::Ok);
+    struct stat socket_info{};
+    CHECK(::lstat(path.c_str(), &socket_info) == 0);
+    CHECK((socket_info.st_mode & 07777) == 0600);
 
-    int accepted = -1;
+    Connection accepted(-1);
     Status accept_status = Status::InvalidArgument;
     std::thread accept_thread([&] {
         accepted = accept_unix(listener, &accept_status);
     });
-    const int client = connect_unix(path, &status);
-    CHECK(client >= 0);
+    struct sigaction action{};
+    struct sigaction previous_action{};
+    action.sa_handler = interrupt_handler;
+    sigemptyset(&action.sa_mask);
+    CHECK(::sigaction(SIGUSR1, &action, &previous_action) == 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    CHECK(::pthread_kill(accept_thread.native_handle(), SIGUSR1) == 0);
+    Connection client = connect_unix(path, &status);
+    CHECK(client.valid());
     accept_thread.join();
-    CHECK(accepted >= 0);
+    CHECK(::sigaction(SIGUSR1, &previous_action, nullptr) == 0);
+    CHECK(accepted.valid());
     CHECK(accept_status == Status::Ok);
+    CHECK(client.cloexec());
+    CHECK(accepted.cloexec());
+
+    CHECK((::fcntl(listener, F_GETFD) & FD_CLOEXEC) != 0);
 
     const Frame hello = make_hello(PeerRole::Sidecar, Identity{1, 1});
-    CHECK(write_frame(client, hello) == Status::Ok);
+    CHECK(client.send(hello) == Status::Ok);
     Frame received;
-    CHECK(read_frame(accepted, received) == Status::Ok);
+    CHECK(accepted.receive(received) == Status::Ok);
     CHECK(received == hello);
-    ::close(client);
-    ::close(accepted);
+    CHECK(client.valid());
+    CHECK(accepted.valid());
+    CHECK((::fcntl(listener, F_GETFD) & FD_CLOEXEC) != 0);
     ::close(listener);
     ::unlink(path.c_str());
+    CHECK(::rmdir(directory) == 0);
 
     CHECK(listen_unix(std::string(kMaxUnixPath + 1, 'x'), 1, &status) < 0);
     CHECK(status == Status::InvalidPath);
+
+    // Relative, embedded-NUL, and shared-parent paths are refused.
+    CHECK(listen_unix("relative-endpoint", 1, &status) < 0);
+    CHECK(status == Status::InvalidPath);
+    std::string embedded = directory;
+    embedded.append("\0bad", 4);
+    CHECK(listen_unix(embedded, 1, &status) < 0);
+    CHECK(status == Status::InvalidPath);
+    CHECK(listen_unix("/tmp/icecc-p50-shared-parent", 1, &status) < 0);
+    CHECK(status == Status::InvalidPath);
+
+    char second_directory[] = "/tmp/icecc-p50-local-transport-XXXXXX";
+    CHECK(::mkdtemp(second_directory) != nullptr);
+    const std::string second_path = std::string(second_directory) + "/endpoint";
+    const int second_listener = listen_unix(second_path, 1, &status);
+    CHECK(second_listener >= 0);
+    CHECK(listen_unix(second_path, 1, &status) < 0);
+    CHECK(status == Status::IoError);
+    ::close(second_listener);
+    ::unlink(second_path.c_str());
+    CHECK(::rmdir(second_directory) == 0);
 }
 
 } // namespace
@@ -183,6 +273,7 @@ void unix_setup() {
 int main() {
     try {
         framing_and_limits();
+        single_writer_busy_is_load_bearing();
         handshake_identity();
         truncated_read();
         credentials();
