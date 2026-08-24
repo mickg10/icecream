@@ -101,6 +101,10 @@ public:
     Connection& operator=(const Connection&) = delete;
 
     [[nodiscard]] bool valid() const noexcept { return fd_ >= 0; }
+    // Borrowed descriptor identity for a coordinating owner.  The caller
+    // must not close or use the returned descriptor after this Connection is
+    // destroyed; it is intended only for dup()/shutdown() cancellation.
+    [[nodiscard]] int native_handle() const noexcept { return fd_; }
     [[nodiscard]] Status status() const noexcept { return status_; }
     [[nodiscard]] bool cloexec() const noexcept;
 

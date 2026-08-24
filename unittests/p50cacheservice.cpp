@@ -313,7 +313,7 @@ void exercise_root_contract_then_drop_test_process() {
           ::getgid() == drop_gid && ::getegid() == drop_gid);
 }
 
-void valid_handshake() {
+void signal_interrupts_control_wait(int signal) {
     char template_path[] = "/tmp/icecc-cache-service-test-XXXXXX";
     const int directory_fd = ::mkstemp(template_path);
     CHECK(directory_fd >= 0);
@@ -327,9 +327,11 @@ void valid_handshake() {
     CHECK(connection.receive_with_timeout(ack, 1000) == local::Status::Ok);
     CHECK(local::validate_handshake(ack, local::MessageType::HelloAck,
                                     local::PeerRole::Sidecar, {7, 1}) == local::Status::Ok);
-    (void)::kill(child.pid, SIGTERM);
+    const auto stop_started = std::chrono::steady_clock::now();
+    CHECK(::kill(child.pid, signal) == 0);
     int status = 0;
     CHECK(::waitpid(child.pid, &status, 0) == child.pid);
+    CHECK(std::chrono::steady_clock::now() - stop_started < std::chrono::seconds(1));
     child.pid = -1;
     CHECK(::access((template_path + std::string("/service.sock")).c_str(), F_OK) != 0);
     CHECK(::rmdir(template_path) == 0);
@@ -539,6 +541,37 @@ service::RuntimeConfig test_runtime_config() {
     return config;
 }
 
+void test_runtime_store_identity_fences_attempt() {
+    const FStoreGuid first = service::f_store_guid_for_identity({7, 1});
+    const FStoreGuid restarted = service::f_store_guid_for_identity({7, 2});
+    const FStoreGuid new_generation = service::f_store_guid_for_identity({8, 1});
+    CHECK(first != FStoreGuid{});
+    CHECK(first != restarted);
+    CHECK(first != new_generation);
+    CHECK(restarted != new_generation);
+}
+
+void test_runtime_stop_interrupts_control_wait() {
+    service::SidecarRuntime runtime(test_runtime_config());
+    RuntimeCase pair = authenticated_runtime_pair();
+    service::RuntimeResult runtime_result;
+    std::thread worker([&] {
+        runtime_result = runtime.run_one(
+            pair.receiver, {{7, 1}, 1}, std::chrono::steady_clock::now() + std::chrono::seconds(30));
+    });
+    const auto wait_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (runtime.live_handoff_count() == 0 && std::chrono::steady_clock::now() < wait_deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    CHECK(runtime.live_handoff_count() == 1);
+    const auto started = std::chrono::steady_clock::now();
+    runtime.stop();
+    worker.join();
+    CHECK(std::chrono::steady_clock::now() - started < std::chrono::seconds(1));
+    CHECK(runtime_result.status == service::RuntimeStatus::Stopped);
+    CHECK(runtime_result.handoff.status == local::FdHandoffStatus::Disconnected);
+    CHECK(runtime.live_handoff_count() == 0 && runtime.live_session_count() == 0);
+}
+
 void test_runtime_identity_disconnect_and_endpoint_failure() {
     const local::HandoffRequest expected{{7, 1}, 1};
     {
@@ -679,6 +712,88 @@ void test_runtime_zstd_tu_af_unix_loopback() {
     CHECK(client_value.status == ClientRunStatus::Committed);
     CHECK(observed == input);
     CHECK(runtime.live_handoff_count() == 0 && runtime.live_session_count() == 0);
+
+    // A single SidecarRuntime owns both dialogues.  The second authenticated
+    // handoff uses the next request id and a fresh ordinary link; endpoint
+    // session cleanup must leave no live registration between them.
+    const std::vector<uint8_t> second_input(input.rbegin(), input.rend());
+    observed.clear();
+    RuntimeCase second_control = authenticated_runtime_pair();
+    auto second_authority = std::make_shared<P50PreparationAuthority>(Id128::from_u64(9012));
+    P50ClientEndpoint second_client(second_authority);
+    uint16_t second_port = 0;
+    const int second_listener = loopback_listener(second_port);
+    asio::io_context second_client_context;
+    const tcp::endpoint second_remote(asio::ip::address_v4::loopback(), second_port);
+    std::future<ClientRunResult> second_client_result;
+    std::thread second_client_thread([&] {
+        const PreparedTuHandle prepared = second_authority->prepare({2, 2}, second_input);
+        second_client_result = asio::co_spawn(second_client_context,
+                                              second_client.run(second_remote, prepared),
+                                              asio::use_future);
+        second_client_context.run();
+    });
+    service::RuntimeResult second_runtime_result;
+    std::thread second_runtime_thread([&] {
+        second_runtime_result = runtime.run_one(
+            second_control.receiver, {{7, 1}, 2},
+            std::chrono::steady_clock::now() + std::chrono::seconds(3));
+    });
+    const int second_accepted = ::accept(second_listener, nullptr, nullptr);
+    CHECK(second_accepted >= 0);
+    CHECK(::close(second_listener) == 0);
+    local::FdHandoffSender second_sender{local::HandoffFd(second_accepted)};
+    const local::FdHandoffResult second_sender_result = second_sender.send(
+        second_control.sender, {{7, 1}, 2},
+        std::chrono::steady_clock::now() + std::chrono::seconds(3));
+    second_runtime_thread.join();
+    second_client_thread.join();
+    const ClientRunResult second_client_value = second_client_result.get();
+    CHECK(second_sender_result.status == local::FdHandoffStatus::Accepted);
+    CHECK(second_runtime_result.handoff.status == local::FdHandoffStatus::Accepted);
+    CHECK(second_runtime_result.status == service::RuntimeStatus::Completed);
+    CHECK(second_runtime_result.endpoint.has_value() &&
+          second_runtime_result.endpoint->status == ServerRunStatus::Completed);
+    CHECK(second_client_value.status == ClientRunStatus::Committed);
+    CHECK(observed == second_input);
+    CHECK(runtime.live_handoff_count() == 0 && runtime.live_session_count() == 0);
+}
+
+void test_runtime_stop_interrupts_active_endpoint() {
+    service::SidecarRuntime runtime(test_runtime_config());
+    RuntimeCase control = authenticated_runtime_pair();
+    uint16_t port = 0;
+    const int listener = loopback_listener(port);
+    const int peer = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    CHECK(peer >= 0);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons(port);
+    CHECK(::connect(peer, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == 0);
+    const int accepted = ::accept(listener, nullptr, nullptr);
+    CHECK(accepted >= 0);
+    CHECK(::close(listener) == 0);
+    service::RuntimeResult runtime_result;
+    std::thread worker([&] {
+        runtime_result = runtime.run_one(
+            control.receiver, {{7, 1}, 1}, std::chrono::steady_clock::now() + std::chrono::seconds(30));
+    });
+    local::FdHandoffSender sender{local::HandoffFd(accepted)};
+    CHECK(sender.send(control.sender, {{7, 1}, 1},
+                                    std::chrono::steady_clock::now() + std::chrono::seconds(3))
+              .status == local::FdHandoffStatus::Accepted);
+    const auto wait_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (runtime.live_session_count() == 0 && std::chrono::steady_clock::now() < wait_deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    CHECK(runtime.live_session_count() == 1);
+    const auto started = std::chrono::steady_clock::now();
+    runtime.stop();
+    worker.join();
+    CHECK(std::chrono::steady_clock::now() - started < std::chrono::seconds(1));
+    CHECK(runtime_result.status == service::RuntimeStatus::Stopped);
+    CHECK(runtime.live_handoff_count() == 0 && runtime.live_session_count() == 0);
+    CHECK(::close(peer) == 0);
 }
 
 bool wait_for_socket_node(const std::string& path, int timeout_milliseconds) {
@@ -825,14 +940,18 @@ void ready_requires_bind_and_replacement_is_preserved() {
 int main() {
     try {
         exercise_root_contract_then_drop_test_process();
-        valid_handshake();
+        signal_interrupts_control_wait(SIGTERM);
+        signal_interrupts_control_wait(SIGINT);
         replacement_node_is_not_removed();
         peer_credentials_are_required();
         rejects_identity_role_and_malformed();
         slowloris_deadline_is_total_and_listener_recovers();
         frame_header_and_payload_share_one_deadline();
+        test_runtime_store_identity_fences_attempt();
         test_runtime_identity_disconnect_and_endpoint_failure();
+        test_runtime_stop_interrupts_control_wait();
         test_runtime_zstd_tu_af_unix_loopback();
+        test_runtime_stop_interrupts_active_endpoint();
         ready_reader_close_after_bind_is_fail_closed();
         ready_requires_bind_and_replacement_is_preserved();
     } catch (const std::exception& error) {

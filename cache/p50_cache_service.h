@@ -50,6 +50,12 @@ struct RuntimeResult {
     std::optional<ServerRunResult> endpoint;
 };
 
+// Installed sidecars derive their empty-store identity from the complete
+// authenticated incarnation.  Both fields are encoded into the 128-bit GUID,
+// so a restart with the same generation but a new attempt cannot reopen the
+// previous empty store by accident.
+FStoreGuid f_store_guid_for_identity(local::Identity identity) noexcept;
+
 // One owner/reader for one authenticated control connection and one adopted
 // endpoint session.  The endpoint object and its mutable store remain on the
 // caller's io_context thread; this class adds no reducer or public listener.
@@ -70,10 +76,13 @@ public:
     [[nodiscard]] size_t live_handoff_count() const noexcept {
         return busy_.test(std::memory_order_relaxed) ? 1u : 0u;
     }
+    [[nodiscard]] FStoreGuid f_store_guid() const noexcept { return config_.f_store_guid; }
 
 private:
     void cancel_active_socket() noexcept;
     void release_active_socket() noexcept;
+    void cancel_active_control() noexcept;
+    void release_active_control() noexcept;
 
     RuntimeConfig config_;
     boost::asio::io_context context_;
@@ -82,6 +91,7 @@ private:
     std::atomic<bool> stop_requested_{false};
     std::atomic<size_t> live_sessions_{0};
     std::atomic<int> active_cancel_fd_{-1};
+    std::atomic<int> active_control_cancel_fd_{-1};
 };
 
 struct Options {

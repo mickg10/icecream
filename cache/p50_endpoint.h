@@ -334,6 +334,11 @@ public:
     boost::asio::awaitable<ServerRunResult> run_adopted(
         boost::asio::ip::tcp::socket socket, EndpointIoControl control = {});
 
+    // Cancels the active socket on the endpoint's owner executor. The caller
+    // must arrange that affinity (SidecarRuntime posts this method); it never
+    // changes listener or store ownership and is a no-op between dialogues.
+    void cancel_active_io() noexcept;
+
     void reset_store(FStoreGuid new_guid);
     [[nodiscard]] InputCursor attach_input(InputRecordKey key) const;
     void close_input_job(InputRecordKey key);

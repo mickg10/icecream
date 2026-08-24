@@ -17,12 +17,14 @@
 #include <string_view>
 #include <stdexcept>
 #include <sys/stat.h>
+#include <sys/socket.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
 
 #include <utility>
 #include <future>
+#include <thread>
 
 namespace icecc::p50::service {
 namespace {
@@ -36,8 +38,20 @@ constexpr int kHandshakeMilliseconds = 500;
 constexpr int kMaxBacklog = 16;
 
 volatile sig_atomic_t g_stop_requested = 0;
+volatile sig_atomic_t g_signal_wake_fd = -1;
 
-void request_stop(int) noexcept { g_stop_requested = 1; }
+void request_stop(int) noexcept {
+    // The handler performs only async-signal-safe operations.  All C++ state
+    // transitions, including SidecarRuntime::stop(), happen on the normal
+    // service thread after it observes this byte through poll().
+    g_stop_requested = 1;
+    const int fd = g_signal_wake_fd;
+    if (fd >= 0) {
+        const uint8_t wake = 1;
+        const ssize_t ignored = ::write(fd, &wake, sizeof(wake));
+        (void)ignored;
+    }
+}
 
 struct SignalGuard {
     struct sigaction old_term{};
@@ -46,16 +60,22 @@ struct SignalGuard {
 
     SignalGuard() = default;
 
-    bool install() noexcept {
+    bool install(int wake_fd) noexcept {
+        g_signal_wake_fd = wake_fd;
         struct sigaction action{};
         action.sa_handler = request_stop;
-        if (::sigemptyset(&action.sa_mask) != 0)
+        if (::sigemptyset(&action.sa_mask) != 0) {
+            g_signal_wake_fd = -1;
             return false;
+        }
         // Deliberately omit SA_RESTART so poll/read wake for graceful stop.
-        if (::sigaction(SIGTERM, &action, &old_term) != 0)
+        if (::sigaction(SIGTERM, &action, &old_term) != 0) {
+            g_signal_wake_fd = -1;
             return false;
+        }
         if (::sigaction(SIGINT, &action, &old_int) != 0) {
             (void)::sigaction(SIGTERM, &old_term, nullptr);
+            g_signal_wake_fd = -1;
             return false;
         }
         installed = true;
@@ -64,6 +84,7 @@ struct SignalGuard {
 
     ~SignalGuard() {
         if (installed) {
+            g_signal_wake_fd = -1;
             (void)::sigaction(SIGTERM, &old_term, nullptr);
             (void)::sigaction(SIGINT, &old_int, nullptr);
         }
@@ -83,6 +104,28 @@ struct OwnedFd {
     explicit OwnedFd(int value) : fd(value) {}
     OwnedFd(const OwnedFd&) = delete;
     OwnedFd& operator=(const OwnedFd&) = delete;
+};
+
+struct WakePipe {
+    OwnedFd read;
+    OwnedFd write;
+
+    bool create() noexcept {
+        int descriptors[2] = {-1, -1};
+        if (::pipe(descriptors) != 0)
+            return false;
+        read.fd = descriptors[0];
+        write.fd = descriptors[1];
+        for (const int fd : descriptors) {
+            const int flags = ::fcntl(fd, F_GETFD);
+            if (flags < 0 || ::fcntl(fd, F_SETFD, flags | FD_CLOEXEC) < 0)
+                return false;
+            const int status_flags = ::fcntl(fd, F_GETFL);
+            if (status_flags < 0 || ::fcntl(fd, F_SETFL, status_flags | O_NONBLOCK) < 0)
+                return false;
+        }
+        return true;
+    }
 };
 
 bool parse_uint(std::string_view text, uint64_t& value) noexcept {
@@ -311,7 +354,7 @@ void cleanup_listener(int fd, const std::string& path, const ListenerIdentity& i
 }
 
 bool handle_connection(local::Connection connection, const Options& options,
-                        SidecarRuntime& runtime, uint64_t& next_request_id) noexcept {
+                        SidecarRuntime& runtime, const local::HandoffRequest& expected) noexcept {
     try {
         if (!connection.valid())
             return false;
@@ -327,7 +370,6 @@ bool handle_connection(local::Connection connection, const Options& options,
             local::make_hello_ack(local::PeerRole::Sidecar, options.identity);
         if (connection.send(ack) != local::Status::Ok)
             return true;
-        const local::HandoffRequest expected{options.identity, next_request_id++};
         (void)runtime.run_one(
             connection, expected,
             std::chrono::steady_clock::now() + std::chrono::milliseconds{kHandshakeMilliseconds});
@@ -338,6 +380,17 @@ bool handle_connection(local::Connection connection, const Options& options,
 }
 
 } // namespace
+
+FStoreGuid f_store_guid_for_identity(local::Identity identity) noexcept {
+    FStoreGuid result{};
+    for (size_t index = 0; index != sizeof(identity.generation); ++index)
+        result.bytes[index] = static_cast<uint8_t>(identity.generation >>
+                                                   (56u - static_cast<unsigned>(index) * 8u));
+    for (size_t index = 0; index != sizeof(identity.attempt); ++index)
+        result.bytes[sizeof(identity.generation) + index] = static_cast<uint8_t>(
+            identity.attempt >> (56u - static_cast<unsigned>(index) * 8u));
+    return result;
+}
 
 SidecarRuntime::SidecarRuntime(RuntimeConfig config) : config_(std::move(config)) {
     if (config_.f_store_guid == FStoreGuid{})
@@ -371,8 +424,34 @@ RuntimeResult SidecarRuntime::run_one(
         ~BusyGuard() { flag.clear(std::memory_order_release); }
     } busy_guard{busy_};
 
+    const int control_cancel_fd = control.valid() ? ::dup(control.native_handle()) : -1;
+    if (control_cancel_fd < 0) {
+        result.status = RuntimeStatus::HandoffRejected;
+        result.handoff.status = local::FdHandoffStatus::Disconnected;
+        return result;
+    }
+    const int control_flags = ::fcntl(control_cancel_fd, F_GETFD);
+    if (control_flags < 0 ||
+        ::fcntl(control_cancel_fd, F_SETFD, control_flags | FD_CLOEXEC) < 0) {
+        (void)::close(control_cancel_fd);
+        result.status = RuntimeStatus::HandoffRejected;
+        result.handoff.status = local::FdHandoffStatus::Disconnected;
+        return result;
+    }
+    active_control_cancel_fd_.store(control_cancel_fd, std::memory_order_release);
+    // Close/shutdown from stop() can race this setup only by setting the
+    // stop flag first.  Re-check after publication so a signal arriving in
+    // this narrow window is still converted into a normal cancellation.
+    if (stop_requested_.load(std::memory_order_acquire)) {
+        cancel_active_control();
+        result.status = RuntimeStatus::Stopped;
+        result.handoff.status = local::FdHandoffStatus::Disconnected;
+        return result;
+    }
+
     local::FdHandoffReceiver receiver;
     result.handoff = receiver.receive_and_ack(control, expected, deadline);
+    release_active_control();
     if (result.handoff.status != local::FdHandoffStatus::Accepted) {
         result.status = stop_requested_.load(std::memory_order_acquire)
                            ? RuntimeStatus::Stopped
@@ -420,6 +499,11 @@ RuntimeResult SidecarRuntime::run_one(
             return result;
         }
         context_.restart();
+        // Publish a bounded in-flight marker before entering Asio.  The
+        // endpoint's owner-thread count is refreshed after the coroutine
+        // returns; this marker lets a concurrent normal-thread stop observe
+        // that cancellation is now required even before coroutine startup.
+        live_sessions_.store(1, std::memory_order_release);
         std::future<ServerRunResult> endpoint_result = asio::co_spawn(
             context_, endpoint_->run_adopted(std::move(*socket), std::move(endpoint_control)),
             asio::use_future);
@@ -433,6 +517,7 @@ RuntimeResult SidecarRuntime::run_one(
                           ? RuntimeStatus::EndpointFailed
                           : RuntimeStatus::Completed;
     } catch (...) {
+        release_active_control();
         release_active_socket();
         // SessionRegistration is the endpoint's cleanup lease.  Snapshot its
         // post-failure count while still on the endpoint owner thread.
@@ -446,11 +531,33 @@ RuntimeResult SidecarRuntime::run_one(
     return result;
 }
 
+void SidecarRuntime::cancel_active_control() noexcept {
+    const int fd = active_control_cancel_fd_.exchange(-1, std::memory_order_acq_rel);
+    if (fd >= 0) {
+        (void)::shutdown(fd, SHUT_RDWR);
+        (void)::close(fd);
+    }
+}
+
+void SidecarRuntime::release_active_control() noexcept {
+    const int fd = active_control_cancel_fd_.exchange(-1, std::memory_order_acq_rel);
+    if (fd >= 0)
+        (void)::close(fd);
+}
+
 void SidecarRuntime::cancel_active_socket() noexcept {
     const int fd = active_cancel_fd_.exchange(-1, std::memory_order_acq_rel);
     if (fd >= 0) {
         (void)::shutdown(fd, SHUT_RDWR);
         (void)::close(fd);
+    }
+    // A duplicate descriptor does not reliably wake every platform's Asio
+    // reactor.  Post the actual socket cancellation onto its owner context;
+    // this is normal-thread work and therefore remains outside the signal
+    // handler while preserving endpoint thread affinity.
+    try {
+        context_.post([this] { endpoint_->cancel_active_io(); });
+    } catch (...) {
     }
 }
 
@@ -462,6 +569,7 @@ void SidecarRuntime::release_active_socket() noexcept {
 
 void SidecarRuntime::stop() noexcept {
     stop_requested_.store(true, std::memory_order_release);
+    cancel_active_control();
     cancel_active_socket();
 }
 
@@ -553,10 +661,13 @@ int run(const Options& options) noexcept {
     OwnedFd ready;
     if (!parse_ready_fd(ready))
         return 2;
-    SignalGuard signals;
-    if (!signals.install())
+    WakePipe wake;
+    if (!wake.create())
         return 2;
+    SignalGuard signals;
     g_stop_requested = 0;
+    if (!signals.install(wake.write.fd))
+        return 2;
 
     if (!drop_and_prove(options))
         return 2;
@@ -575,7 +686,7 @@ int run(const Options& options) noexcept {
     // The store identity is explicit runtime state, derived only from the
     // already authenticated service generation.  A production launcher can
     // construct SidecarRuntime directly with its durable store GUID.
-    runtime_config.f_store_guid = Id128::from_u64(options.identity.generation);
+    runtime_config.f_store_guid = f_store_guid_for_identity(options.identity);
     std::unique_ptr<SidecarRuntime> runtime;
     try {
         runtime = std::make_unique<SidecarRuntime>(std::move(runtime_config));
@@ -591,22 +702,62 @@ int run(const Options& options) noexcept {
     ready.fd = -1;
 
     uint64_t request_id = 1;
+    std::thread connection_thread;
+    std::atomic<bool> connection_done{true};
 
-    while (g_stop_requested == 0) {
-        struct pollfd descriptor{listener, POLLIN | POLLERR | POLLHUP, 0};
-        const int result = ::poll(&descriptor, 1, kPollMilliseconds);
+    for (;;) {
+        if (g_stop_requested != 0)
+            runtime->stop();
+        if (connection_thread.joinable() && connection_done.load(std::memory_order_acquire))
+            connection_thread.join();
+        if (g_stop_requested != 0 && !connection_thread.joinable())
+            break;
+
+        struct pollfd descriptors[2]{};
+        descriptors[0] = {wake.read.fd, POLLIN | POLLERR | POLLHUP, 0};
+        nfds_t descriptor_count = 1;
+        const bool can_accept = !connection_thread.joinable();
+        if (can_accept)
+            descriptors[descriptor_count++] = {listener, POLLIN | POLLERR | POLLHUP, 0};
+        const int result = ::poll(descriptors, descriptor_count, kPollMilliseconds);
         if (result < 0) {
             if (errno == EINTR)
                 continue;
             break;
         }
-        if (result == 0 || (descriptor.revents & POLLIN) == 0)
+        if ((descriptors[0].revents & (POLLIN | POLLERR | POLLHUP)) != 0) {
+            uint8_t drained[64]{};
+            while (::read(wake.read.fd, drained, sizeof(drained)) > 0) {
+            }
+            if (g_stop_requested != 0)
+                runtime->stop();
+        }
+        if (result == 0 || !can_accept || g_stop_requested != 0 ||
+            (descriptors[1].revents & POLLIN) == 0)
             continue;
         local::Status accept_status = local::Status::Ok;
         local::Connection connection = local::accept_unix(listener, &accept_status);
-        if (connection.valid())
-            (void)handle_connection(std::move(connection), options, *runtime, request_id);
+        if (!connection.valid())
+            continue;
+        const local::HandoffRequest expected{options.identity, request_id++};
+        connection_done.store(false, std::memory_order_release);
+        try {
+            connection_thread = std::thread(
+                [connection = std::move(connection), &options, runtime_ptr = runtime.get(),
+                 expected, &connection_done]() mutable {
+                    (void)handle_connection(std::move(connection), options, *runtime_ptr, expected);
+                    connection_done.store(true, std::memory_order_release);
+                });
+        } catch (...) {
+            connection_done.store(true, std::memory_order_release);
+            runtime->stop();
+            break;
+        }
     }
+
+    runtime->stop();
+    if (connection_thread.joinable())
+        connection_thread.join();
 
     cleanup_listener(listener, options.socket_path, identity);
     return 0;
