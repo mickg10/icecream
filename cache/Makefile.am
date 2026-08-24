@@ -121,6 +121,7 @@ EXTRA_DIST = \
 	formal/run_tlc.sh \
 	formal/.gitignore \
 	formal/check_trace.py \
+	P50_ENDPOINT.md \
 	P50_LOCAL_TRANSPORT.md \
 	P50_CACHE_SESSION.md \
 	P50_SIDECAR_SUPERVISOR.md \

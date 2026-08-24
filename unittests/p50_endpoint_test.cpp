@@ -4,6 +4,7 @@
 
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/co_spawn.hpp>
+#include <boost/asio/executor_work_guard.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/read.hpp>
 #include <boost/asio/redirect_error.hpp>
@@ -15,16 +16,22 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <chrono>
 #include <cstdlib>
+#include <fcntl.h>
 #include <future>
 #include <iostream>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/types.h>
 #include <thread>
 #include <tuple>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -165,6 +172,227 @@ PairResult run_pair(P50ClientEndpoint& client, P50ServerEndpoint& server,
         asio::use_future);
     context.run();
     return {client_result.get(), server_result.get()};
+}
+
+PairResult run_adopted_pair(P50ClientEndpoint& client, P50ServerEndpoint& server,
+                            PreparedTuHandle prepared, bool use_native_adoption,
+                            int* consumed_fd) {
+    asio::io_context context;
+    tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    std::future<ServerRunResult> server_result = asio::co_spawn(
+        context,
+        [&]() -> asio::awaitable<ServerRunResult> {
+            const auto executor = co_await asio::this_coro::executor;
+            tcp::socket accepted(executor);
+            boost::system::error_code error;
+            co_await acceptor.async_accept(
+                accepted, asio::redirect_error(asio::use_awaitable, error));
+            require(!error, "loopback accept for adopted endpoint failed");
+            const int accepted_fd = accepted.native_handle();
+            if (!use_native_adoption) {
+                if (consumed_fd != nullptr)
+                    *consumed_fd = accepted_fd;
+                co_return co_await server.run_adopted(std::move(accepted));
+            }
+
+            const int duplicate_fd = ::dup(accepted_fd);
+            require(duplicate_fd >= 0, "duplicating accepted fd failed");
+            boost::system::error_code adopt_error;
+            auto adopted = P50ServerEndpoint::adopt_connected_fd(
+                executor, duplicate_fd, adopt_error);
+            require(adopted.has_value() && !adopt_error,
+                    "native accepted fd was not adopted");
+            require((::fcntl(adopted->native_handle(), F_GETFD) & FD_CLOEXEC) != 0,
+                    "native adoption did not establish CLOEXEC");
+            if (consumed_fd != nullptr)
+                *consumed_fd = adopted->native_handle();
+            boost::system::error_code close_error;
+            accepted.close(close_error);
+            co_return co_await server.run_adopted(std::move(*adopted));
+        },
+        asio::use_future);
+    std::future<ClientRunResult> client_result = asio::co_spawn(
+        context, client.run(acceptor.local_endpoint(), prepared), asio::use_future);
+    context.run();
+    return {client_result.get(), server_result.get()};
+}
+
+void require_closed_fd(int fd, std::string_view detail) {
+    errno = 0;
+    require(fd >= 0 && ::fcntl(fd, F_GETFD) < 0 && errno == EBADF, detail);
+}
+
+void test_adopted_endpoint_exact_zstd_and_ownership() {
+    for (const bool use_native_adoption : {false, true}) {
+        CompletionLog completions;
+        P50ServerEndpoint server(Id128::from_u64(use_native_adoption ? 910 : 911), {},
+                                 &completions);
+        TestClient client(Id128::from_u64(use_native_adoption ? 912 : 913));
+        const std::vector<uint8_t> input = pseudo_random_bytes(8192);
+        int consumed_fd = -1;
+        const PairResult result = run_adopted_pair(
+            client, server, admit(client, input), use_native_adoption, &consumed_fd);
+        require(result.client.status == ClientRunStatus::Committed &&
+                    result.server.status == ServerRunStatus::Completed &&
+                    copy_input(server, client.c_store_guid()) == input,
+                use_native_adoption ? "native adopted ZSTD_TU changed exact bytes"
+                                    : "socket adopted ZSTD_TU changed exact bytes");
+        require_closed_fd(consumed_fd, "adopted endpoint did not close its owned fd exactly once");
+        require(!completions.completions().empty() &&
+                    completions.completions().front().stamp.operation ==
+                        AsyncOperationKind::ReadHeader,
+                "adopted endpoint consumed an accept or input operation before ownership");
+        require(std::none_of(completions.completions().begin(), completions.completions().end(),
+                             [](const AsyncCompletion& completion) {
+                                 return completion.stamp.operation == AsyncOperationKind::Accept;
+                             }),
+                "adopted endpoint unexpectedly performed a second accept");
+    }
+}
+
+void test_adopted_endpoint_disconnect_and_invalid_rows() {
+    P50ServerEndpoint server(Id128::from_u64(920));
+    asio::io_context context;
+    tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    int consumed_fd = -1;
+    std::future<ServerRunResult> server_result = asio::co_spawn(
+        context,
+        [&]() -> asio::awaitable<ServerRunResult> {
+            const auto executor = co_await asio::this_coro::executor;
+            tcp::socket accepted(executor);
+            boost::system::error_code error;
+            co_await acceptor.async_accept(
+                accepted, asio::redirect_error(asio::use_awaitable, error));
+            require(!error, "disconnect row accept failed");
+            consumed_fd = accepted.native_handle();
+            co_return co_await server.run_adopted(std::move(accepted));
+        },
+        asio::use_future);
+    std::future<void> disconnecting_client = asio::co_spawn(
+        context,
+        [&]() -> asio::awaitable<void> {
+            const auto executor = co_await asio::this_coro::executor;
+            tcp::socket socket(executor);
+            boost::system::error_code error;
+            co_await socket.async_connect(acceptor.local_endpoint(),
+                                          asio::redirect_error(asio::use_awaitable, error));
+            require(!error, "disconnect row connect failed");
+            socket.close(error);
+            co_return;
+        },
+        asio::use_future);
+    context.run();
+    require(server_result.get().status == ServerRunStatus::Disconnected &&
+                server.live_session_count() == 0,
+            "adopted disconnect did not fail closed and release its session");
+    disconnecting_client.get();
+    require_closed_fd(consumed_fd, "adopted disconnect leaked its owned fd");
+
+    asio::io_context invalid_context;
+    boost::system::error_code error;
+    auto reject_fd = [&](int fd, std::string_view detail) {
+        auto adopted = P50ServerEndpoint::adopt_connected_fd(invalid_context.get_executor(), fd,
+                                                              error);
+        require(!adopted.has_value() && !!error, detail);
+        require_closed_fd(fd, "invalid native adoption did not consume and close fd");
+        error.clear();
+    };
+
+    int pipe_fds[2] = {-1, -1};
+    require(::pipe(pipe_fds) == 0, "pipe row setup failed");
+    reject_fd(pipe_fds[0], "non-socket native fd was adopted");
+    (void)::close(pipe_fds[1]);
+
+    int unix_pair[2] = {-1, -1};
+    require(::socketpair(AF_UNIX, SOCK_STREAM, 0, unix_pair) == 0,
+            "wrong-family row setup failed");
+    reject_fd(unix_pair[0], "wrong-family native fd was adopted");
+    (void)::close(unix_pair[1]);
+
+    const int listener = ::socket(AF_INET, SOCK_STREAM, 0);
+    require(listener >= 0, "unconnected listener row setup failed");
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = 0;
+    require(::bind(listener, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == 0,
+            "unconnected listener row bind failed");
+    require(::listen(listener, 1) == 0, "unconnected listener row listen failed");
+    reject_fd(listener, "unconnected listener fd was adopted");
+
+    int closed_pair[2] = {-1, -1};
+    require(::socketpair(AF_UNIX, SOCK_STREAM, 0, closed_pair) == 0,
+            "closed-fd row setup failed");
+    const int closed_fd = closed_pair[0];
+    (void)::close(closed_fd);
+    (void)::close(closed_pair[1]);
+    auto adopted_closed = P50ServerEndpoint::adopt_connected_fd(
+        invalid_context.get_executor(), closed_fd, error);
+    require(!adopted_closed.has_value() && !!error,
+            "closed native fd was adopted");
+    error.clear();
+
+    tcp::socket invalid_socket(invalid_context.get_executor());
+    std::future<ServerRunResult> invalid_result = asio::co_spawn(
+        invalid_context, server.run_adopted(std::move(invalid_socket)), asio::use_future);
+    invalid_context.run();
+    require(invalid_result.get().status == ServerRunStatus::Disconnected &&
+                server.live_session_count() == 0,
+            "closed adopted socket did not fail closed");
+}
+
+void test_adopted_cross_executor_releases_registration() {
+    P50ServerEndpoint server(Id128::from_u64(930));
+    // Bind the endpoint owner to this thread. The adopted socket's I/O below
+    // runs on a different executor, forcing the reducer's owner check from a
+    // completion callback without permitting a session-row leak.
+    server.reset_store(Id128::from_u64(931));
+
+    const int listener = ::socket(AF_INET, SOCK_STREAM, 0);
+    require(listener >= 0, "cross-executor listener setup failed");
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = 0;
+    require(::bind(listener, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == 0,
+            "cross-executor listener bind failed");
+    require(::listen(listener, 1) == 0, "cross-executor listener listen failed");
+    socklen_t address_length = sizeof(address);
+    require(::getsockname(listener, reinterpret_cast<sockaddr*>(&address), &address_length) == 0,
+            "cross-executor listener address failed");
+    const int client = ::socket(AF_INET, SOCK_STREAM, 0);
+    require(client >= 0, "cross-executor client setup failed");
+    require(::connect(client, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == 0,
+            "cross-executor client connect failed");
+    const int accepted_fd = ::accept(listener, nullptr, nullptr);
+    require(accepted_fd >= 0, "cross-executor accept failed");
+    (void)::close(listener);
+    (void)::close(client);
+
+    asio::io_context owner_context;
+    asio::io_context worker_context;
+    auto worker_work = asio::make_work_guard(worker_context);
+    tcp::socket adopted(worker_context.get_executor());
+    boost::system::error_code assign_error;
+    adopted.assign(tcp::v4(), accepted_fd, assign_error);
+    require(!assign_error, "cross-executor socket assign failed");
+
+    EndpointIoControl control;
+    control.before_completion_check = [](const CompletionStamp&) {
+        throw std::logic_error("forced adopted reducer entry failure");
+    };
+    std::future<ServerRunResult> result = asio::co_spawn(
+        owner_context, server.run_adopted(std::move(adopted), std::move(control)),
+        asio::use_future);
+    std::thread worker([&] { worker_context.run(); });
+    owner_context.run();
+    worker_work.reset();
+    worker.join();
+    require(result.get().status == ServerRunStatus::TerminalError,
+            "cross-executor owner rejection was not terminal");
+    require(server.live_session_count() == 0,
+            "cross-executor owner rejection stranded a live session");
+    require_closed_fd(accepted_fd, "cross-executor adopted fd was not closed");
 }
 
 CompetingPairResult run_competing_pair(P50ServerEndpointConfig config,
@@ -3774,6 +4002,9 @@ int main(int argc, char** argv) {
     test_terminal_body_failure_identity();
     test_disconnect_at_each_message_boundary();
     test_component_and_allocation_caps();
+    test_adopted_endpoint_exact_zstd_and_ownership();
+    test_adopted_endpoint_disconnect_and_invalid_rows();
+    test_adopted_cross_executor_releases_registration();
     test_two_client_one_server_isolation();
     report_zstd1_metrics(performance_gate);
     std::cout << "p50_endpoint_test: PASS\n";

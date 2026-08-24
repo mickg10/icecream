@@ -10,12 +10,17 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
+#include <fcntl.h>
 #include <limits>
 #include <map>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
 #include <tuple>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 namespace icecc::p50 {
 namespace {
@@ -181,6 +186,72 @@ void close_now(tcp::socket& socket) {
     socket.cancel(ignored);
     socket.shutdown(tcp::socket::shutdown_both, ignored);
     socket.close(ignored);
+}
+
+bool set_cloexec_fd(int fd, boost::system::error_code& error) {
+    if (fd < 0) {
+        error = asio::error::bad_descriptor;
+        return false;
+    }
+    const int flags = ::fcntl(fd, F_GETFD);
+    if (flags < 0 || ::fcntl(fd, F_SETFD, flags | FD_CLOEXEC) < 0) {
+        error.assign(errno, boost::system::generic_category());
+        return false;
+    }
+    return true;
+}
+
+void close_native_fd(int fd) noexcept {
+    if (fd >= 0)
+        (void)::close(fd);
+}
+
+bool inspect_native_connected_tcp(int fd, int& family, boost::system::error_code& error) {
+    if (!set_cloexec_fd(fd, error))
+        return false;
+
+    int socket_type = 0;
+    socklen_t type_length = sizeof(socket_type);
+    if (::getsockopt(fd, SOL_SOCKET, SO_TYPE, &socket_type, &type_length) != 0 ||
+        socket_type != SOCK_STREAM) {
+        error.assign(errno == 0 ? ENOTSOCK : errno, boost::system::generic_category());
+        return false;
+    }
+
+    sockaddr_storage local{};
+    socklen_t local_length = sizeof(local);
+    if (::getsockname(fd, reinterpret_cast<sockaddr*>(&local), &local_length) != 0) {
+        error.assign(errno, boost::system::generic_category());
+        return false;
+    }
+    sockaddr_storage peer{};
+    socklen_t peer_length = sizeof(peer);
+    if (::getpeername(fd, reinterpret_cast<sockaddr*>(&peer), &peer_length) != 0) {
+        error.assign(errno, boost::system::generic_category());
+        return false;
+    }
+    if ((local.ss_family != AF_INET && local.ss_family != AF_INET6) ||
+        peer.ss_family != local.ss_family) {
+        error = asio::error::operation_not_supported;
+        return false;
+    }
+    family = local.ss_family;
+    return true;
+}
+
+bool validate_adopted_socket(tcp::socket& socket) {
+    if (!socket.is_open())
+        return false;
+    boost::system::error_code error;
+    if (!set_cloexec_fd(socket.native_handle(), error))
+        return false;
+    const tcp::endpoint local = socket.local_endpoint(error);
+    if (error)
+        return false;
+    const tcp::endpoint peer = socket.remote_endpoint(error);
+    if (error || local.protocol().family() != peer.protocol().family())
+        return false;
+    return local.protocol().family() == AF_INET || local.protocol().family() == AF_INET6;
 }
 
 template <class Verify>
@@ -1400,6 +1471,48 @@ struct P50ServerEndpoint::Impl {
     P50ServerEndpointConfig config{};
 };
 
+// The live-session row is inserted before the shared reducer coroutine is
+// created. Move this lease into that coroutine so allocation failure,
+// cancellation before entry, or owner-affinity rejection cannot strand it.
+class P50ServerEndpoint::SessionRegistration {
+public:
+    SessionRegistration(Impl& owner, Impl::Session session) noexcept
+        : owner_(&owner), session_(session) {}
+
+    ~SessionRegistration() { reset(); }
+
+    SessionRegistration(const SessionRegistration&) = delete;
+    SessionRegistration& operator=(const SessionRegistration&) = delete;
+
+    SessionRegistration(SessionRegistration&& other) noexcept
+        : owner_(other.owner_), session_(other.session_) {
+        other.owner_ = nullptr;
+    }
+
+    SessionRegistration& operator=(SessionRegistration&& other) noexcept {
+        if (this != &other) {
+            reset();
+            owner_ = other.owner_;
+            session_ = other.session_;
+            other.owner_ = nullptr;
+        }
+        return *this;
+    }
+
+    [[nodiscard]] uint64_t serial() const noexcept { return session_.serial; }
+
+    void reset() noexcept {
+        if (owner_ != nullptr) {
+            owner_->release_session(session_);
+            owner_ = nullptr;
+        }
+    }
+
+private:
+    Impl* owner_ = nullptr;
+    Impl::Session session_{};
+};
+
 void require_outbound_profile_negotiated(uint32_t negotiated_profiles,
                                          const TxBegin& begin) {
     if ((negotiated_profiles & profile_bit(begin.profile)) == 0)
@@ -1677,14 +1790,71 @@ P50ServerEndpoint::P50ServerEndpoint(FStoreGuid f_store_guid, EndpointCaps caps,
 
 P50ServerEndpoint::~P50ServerEndpoint() = default;
 
+std::optional<tcp::socket> P50ServerEndpoint::adopt_connected_fd(
+    asio::any_io_executor executor, int fd, boost::system::error_code& error) {
+    error.clear();
+    int family = AF_UNSPEC;
+    if (!inspect_native_connected_tcp(fd, family, error)) {
+        close_native_fd(fd);
+        return std::nullopt;
+    }
+    try {
+        tcp::socket socket(executor);
+        socket.assign(family == AF_INET ? tcp::v4() : tcp::v6(), fd, error);
+        if (error) {
+            close_native_fd(fd);
+            return std::nullopt;
+        }
+        fd = -1;
+        if (!validate_adopted_socket(socket)) {
+            close_now(socket);
+            error = asio::error::operation_not_supported;
+            return std::nullopt;
+        }
+        return socket;
+    } catch (...) {
+        close_native_fd(fd);
+        throw;
+    }
+}
+
+boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_adopted(
+    tcp::socket socket, EndpointIoControl control) {
+    impl_->owner.require();
+    if (!validate_adopted_socket(socket)) {
+        close_now(socket);
+        co_return ServerRunResult{};
+    }
+    const Impl::Session session = impl_->allocate_session();
+    SessionRegistration registration(*impl_, session);
+    co_return co_await run_connected(std::move(socket), std::move(registration),
+                                     std::move(control), nullptr);
+}
+
 boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::accept_one(tcp::acceptor& acceptor,
                                                                       EndpointIoControl control) {
     impl_->owner.require();
-    Impl::Session session = impl_->allocate_session();
-    ServerRunResult result;
-    result.session_serial = session.serial;
+    const Impl::Session session = impl_->allocate_session();
     const auto executor = co_await asio::this_coro::executor;
     tcp::socket socket(executor);
+    SessionRegistration registration(*impl_, session);
+    co_return co_await run_connected(std::move(socket), std::move(registration),
+                                     std::move(control), &acceptor);
+}
+
+boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
+    tcp::socket socket, SessionRegistration registration, EndpointIoControl control,
+    tcp::acceptor* acceptor) {
+    impl_->owner.require();
+    const uint64_t session_serial = registration.serial();
+    Impl::Session session{.serial = session_serial,
+                          .f_guid = impl_->f_guid,
+                          .c_guid = std::nullopt,
+                          .candidate_revision = 0,
+                          .candidate_state = std::nullopt,
+                          .activated = false};
+    ServerRunResult result;
+    result.session_serial = session.serial;
     uint32_t reply_cap = impl_->caps.wire.max_frame_payload;
     const auto verify = [&](const CompletionStamp& expected) {
         impl_->owner.require();
@@ -1700,8 +1870,11 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::accept_one(tcp::accep
     };
     std::optional<ErrorMessage> terminal_error;
     try {
-        co_await async_accept(acceptor, socket, impl_->stamp(session, AsyncOperationKind::Accept),
-                              impl_->completions, verify);
+        if (acceptor != nullptr) {
+            co_await async_accept(*acceptor, socket,
+                                  impl_->stamp(session, AsyncOperationKind::Accept),
+                                  impl_->completions, verify);
+        }
         Frame hello_frame = co_await async_read_frame(
             socket, impl_->caps.wire.max_frame_payload,
             impl_->stamp(session, AsyncOperationKind::ReadHeader), impl_->completions, verify);
@@ -1760,20 +1933,17 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::accept_one(tcp::accep
             socket, impl_->stamp(session, AsyncOperationKind::WaitPeerClose, &committed_begin),
             impl_->completions, verify);
         impl_->disconnect(session, false);
-        impl_->release_session(session);
         result.status = ServerRunStatus::Completed;
         close_now(socket);
         co_return result;
     } catch (const StaleCompletion&) {
         close_now(socket);
         impl_->disconnect(session, true);
-        impl_->release_session(session);
         result.status = ServerRunStatus::Disconnected;
         co_return result;
     } catch (const boost::system::system_error&) {
         close_now(socket);
         impl_->disconnect(session, true);
-        impl_->release_session(session);
         result.status = ServerRunStatus::Disconnected;
         co_return result;
     } catch (const std::exception& error) {
@@ -1793,7 +1963,6 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::accept_one(tcp::accep
     // A terminal reply ends this dialogue and discards its component overlay,
     // but an installed TX_BEGIN remains the exact retry/reconciliation identity.
     impl_->disconnect(session, true);
-    impl_->release_session(session);
     result.status = ServerRunStatus::TerminalError;
     result.terminal_error = std::move(*terminal_error);
     co_return result;
