@@ -23,6 +23,18 @@ fix) are now fixed and confirmed live. **Final S4 exit still waits on the
 converged 1.5.90 rebuild** (see "p50 is PROVISIONAL" immediately below,
 unchanged by this revision).
 
+**Explicit scope boundary (BO, final-S4-exit note):** this round closes
+the immutable selection/publication MECHANISM checkpoint only; the
+plan-v11 identity-ledger join and the default-caret companion harness
+remain final-S4-exit work, deliberately not carried here. The
+cell-verdict fix above (exact cardinality/set-equality bijection over
+the CURRENT JOINROW key) is correct and required for THIS checkpoint --
+BO's final-S4-exit note explicitly builds on it -- but it is not itself
+the final bijection authority: BO's point is that a JobID-only JOINROW
+key plus a workaround-forced replay cannot serve as the eight-cell
+bijection authority that final S4 exit needs; that authority is a
+separate, not-yet-built row key and companion harness.
+
 **The machine-readable authority is `farmharness/role-manifests/p43.json`
 and `farmharness/role-manifests/p50.json`.** This document is narrative
 only. `farm.py`'s `preflight()`/`distribute()`/`immutable_root()`/
