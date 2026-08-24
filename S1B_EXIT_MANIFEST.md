@@ -45,10 +45,11 @@ copy of each of:
 
 - `distro_installed_identity.sh`
 - `distro_installed_identity_gates.sh`
+- `s1b_validate_installed_facts.py`
 - `distro_probe.sh`
 - `S1B_EXIT_MANIFEST.md`
 
-Both shell scripts are syntax-checked from the extracted archive.  Every
+All shipped shell scripts are syntax-checked from the extracted archive.  Every
 subsequent installed-identity row executes the extracted producer against that
 same no-Git extracted source tree.  Removing any one `EXTRA_DIST` line is a
 required red mutant before a distro row starts.
@@ -83,7 +84,10 @@ Every row has exactly `path,type,mode,size,sha256,identity`; type is
 `file`; size is positive; SHA-256 is 64 lowercase hexadecimal characters;
 installed executables are mode 755; libraries, metadata, inventories and logs
 are mode 644.  Package inventory must have exactly one result for every
-declared distro dependency.
+declared distro dependency.  The companion facts validator independently
+requires exactly one `{mode,size,sha256}` fact for each of those 15 artifacts
+(45 keys total); a helper-variable-clobber mutant that mangles one key must be
+rejected.
 
 ## Freshness and known-caught controls
 

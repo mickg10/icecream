@@ -7,9 +7,10 @@
 # 1. MEMBERSHIP (packaging): from a fresh no-Git archive of the exact
 #    commit under test, a real `make dist` must carry exactly one copy
 #    each of distro_installed_identity.sh, distro_installed_identity_gates.sh
-#    (the gate ships ITSELF too), distro_probe.sh, and S1B_EXIT_MANIFEST.md
+#    (the gate ships ITSELF too), s1b_validate_installed_facts.py,
+#    distro_probe.sh, and S1B_EXIT_MANIFEST.md
 #    -- byte-identical to the exact Git blob, with no .git anywhere in
-#    either extraction, and both shell scripts pass `sh -n` from BOTH their
+#    either extraction, and every shipped shell script passes `sh -n` from BOTH its
 #    standalone per-member extraction AND the full source tree extraction
 #    that the rest of this script actually runs the producer from. An
 #    EXTRA_DIST-deletion mutant (one registration line removed from a
@@ -107,7 +108,7 @@ for arg in "${@:5}"; do
     esac
 done
 
-S1B_MEMBERS="distro_installed_identity.sh distro_installed_identity_gates.sh distro_probe.sh S1B_EXIT_MANIFEST.md"
+S1B_MEMBERS="distro_installed_identity.sh distro_installed_identity_gates.sh s1b_validate_installed_facts.py distro_probe.sh S1B_EXIT_MANIFEST.md"
 DIST_IMAGE=icecream/farm-node:ubuntu22-gcc11-boost174
 S1B_DIST_CONFIGURE_ARGS=${S1B_DIST_CONFIGURE_ARGS:---without-man}
 S1B_SOURCE_DATE_EPOCH=$(git -C "$REPO" show -s --format=%ct "$COMMIT")
@@ -169,9 +170,10 @@ import sys
 
 text = open(sys.argv[1]).read()
 anchors = {
-    'require_exact "${label}_mode" "$mode" "$expected_mode"': 1,
+    'require_exact "${ra_label}_mode" "$ra_mode" "$ra_expected_mode"': 1,
     'rows = json.load(stream)': 1,
     'set(paths) != expected': 1,
+    'python3 "$FACTS_VALIDATOR" "$FACTS"': 1,
     'require_exact image_digest_authority "$IMAGE_DIGEST" "$PINNED_IMAGE_REF"': 1,
     'require_count1 installed_iceccd_identity_total_count': 2,
     'require_count1 installed_scheduler_identity_total_count': 2,
@@ -286,7 +288,7 @@ fi
 
 # Extract the FULL tarball once more (this time not filtered to one
 # member) so the producer script sits alongside the exact source tree it
-# builds -- both members of the SAME dist tarball ("the EXACT EXTRACTED
+# builds -- all members of the SAME dist tarball ("the EXACT EXTRACTED
 # SUCCESSOR ARCHIVE"), not the ambient worktree copy. Gates 2-4 run
 # EXCLUSIVELY out of this extraction from here on.
 rm -rf "$WORK/full-extract"; mkdir -p "$WORK/full-extract"
@@ -298,6 +300,15 @@ echo "ok - full dist-tarball extraction contains no .git"
 SRCTREE=$(find "$WORK/full-extract" -maxdepth 1 -mindepth 1 -type d | head -1)
 PRODUCER="$SRCTREE/distro_installed_identity.sh"
 [ -x "$PRODUCER" ] || { echo "RED: extracted distro_installed_identity.sh missing or not executable at $PRODUCER"; exit 1; }
+FACTS_VALIDATOR="$SRCTREE/s1b_validate_installed_facts.py"
+[ -f "$FACTS_VALIDATOR" ] || { echo "RED: extracted installed-facts validator missing at $FACTS_VALIDATOR"; exit 1; }
+python3 - "$FACTS_VALIDATOR" <<'PY'
+import ast
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    ast.parse(stream.read(), filename=sys.argv[1])
+PY
 
 # Re-run the byte-compare and sh -n against the copies IN $SRCTREE itself
 # -- the ones every gate below actually executes -- not just the
@@ -317,7 +328,7 @@ for member in $S1B_MEMBERS; do
             ;;
     esac
 done
-echo "ok - all $S1B_MEMBERS in the full extraction ($SRCTREE, what gates 2-4 actually execute) are byte-identical to $COMMIT, both .sh members sh -n clean"
+echo "ok - all $S1B_MEMBERS in the full extraction ($SRCTREE, what gates 2-4 actually execute) are byte-identical to $COMMIT, all .sh members sh -n clean"
 
 SNAPSHOT="$WORK/producer.pre-mutant-snapshot"
 cp "$PRODUCER" "$SNAPSHOT"
@@ -340,6 +351,35 @@ sentinel_gate_one_distro() {
       || { echo "RED ($d): unmutated run did not record post_clean_empty=YES" >&2; return 1; }
     grep -qE '^sentinel_survivors[[:space:]]+none' "$GREEN_WORK/facts-normal-sentinel.txt" \
       || { echo "RED ($d): unmutated run did not record sentinel_survivors=none" >&2; return 1; }
+    if ! python3 "$FACTS_VALIDATOR" "$GREEN_WORK/facts-normal-sentinel.txt"; then
+        echo "RED ($d): unmutated run's installed-artifact fact roster is invalid" >&2
+        return 1
+    fi
+    FACTS_MUTANT="$WORK/facts-key-mutant-$d.txt"
+    python3 - "$GREEN_WORK/facts-normal-sentinel.txt" "$FACTS_MUTANT" <<'PY'
+import sys
+
+source, destination = sys.argv[1:]
+with open(source, encoding="utf-8") as stream:
+    text = stream.read()
+needle = "services_log_mode\t"
+if text.count(needle) != 1:
+    raise SystemExit(
+        f"expected exactly one load-bearing facts-key anchor {needle!r}, "
+        f"found {text.count(needle)}")
+with open(destination, "w", encoding="utf-8") as stream:
+    stream.write(text.replace(needle, "services_log_mode_sha256_mode\t", 1))
+PY
+    if python3 "$FACTS_VALIDATOR" "$FACTS_MUTANT" >"$WORK/facts-key-mutant-$d.log" 2>&1; then
+        echo "RED ($d): malformed artifact-fact key mutant was accepted" >&2
+        return 1
+    fi
+    if ! grep -qF 'missing_or_duplicate' "$WORK/facts-key-mutant-$d.log"; then
+        echo "RED ($d): malformed artifact-fact key mutant failed at the wrong predicate" >&2
+        cat "$WORK/facts-key-mutant-$d.log" >&2
+        return 1
+    fi
+    echo "GREEN ($d): exact 45-key installed-artifact fact roster passed; helper-clobber key mutant rejected"
     echo "GREEN ($d): unmutated producer's real clean step removed both planted sentinels (post_clean_empty=YES, sentinel_survivors=none)"
 
     echo
