@@ -603,8 +603,8 @@ matrix_label() {
         icecc-scheduler|icecc-scheduler-competing)
                               echo installed_scheduler_identity_total_count ;;
         libicecc.a)           echo installed_libicecc_a ;;
-        icecc.pc|icecc.pc-competing)
-                              echo installed_icecc_pc_version_total_count ;;
+        icecc.pc)             echo installed_icecc_pc_version_line ;;
+        icecc.pc-competing)   echo installed_icecc_pc_version_total_count ;;
         image-digest)
             if [ "$MATRIX_DISTRO" = ubuntu22 ]; then
                 echo image_id_pin_check
