@@ -152,6 +152,8 @@ struct PairResult {
     ServerRunResult server;
 };
 
+asio::awaitable<void> raw_stall_after_connect(tcp::acceptor& acceptor);
+
 struct CompetingPairResult {
     ClientRunResult first_client;
     ClientRunResult second_client;
@@ -248,6 +250,86 @@ void test_adopted_endpoint_exact_zstd_and_ownership() {
                              }),
                 "adopted endpoint unexpectedly performed a second accept");
     }
+}
+
+void test_client_deadline_and_direct_socket_ownership() {
+    CompletionLog completions;
+    TestClient client(Id128::from_u64(930), {}, HistoryNonce{1}, &completions);
+    const PreparedTuHandle prepared = admit(client, bytes("deadline input\n"));
+
+    // An already-expired deadline must not allocate a session, enqueue work, or
+    // attempt a connect.
+    {
+        asio::io_context context;
+        std::future<ClientRunResult> future = asio::co_spawn(
+            context,
+            client.endpoint.run(tcp::endpoint{asio::ip::address_v4::loopback(), 1}, prepared,
+                                 {}, std::chrono::steady_clock::now() - std::chrono::seconds(1)),
+            asio::use_future);
+        context.run();
+        const ClientRunResult result = future.get();
+        require(result.status == ClientRunStatus::DeadlineExceeded &&
+                    !client.has_reconciliation_work(),
+                "deadline-before-start changed client reconciliation state");
+    }
+
+    // The peer accepts and then never replies.  The endpoint-owned timer must
+    // close the socket and complete in a bounded interval, with no timer left
+    // keeping the io_context alive after the run result is delivered.
+    asio::io_context context;
+    tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    std::future<void> peer = asio::co_spawn(context, raw_stall_after_connect(acceptor),
+                                             asio::use_future);
+    const auto started = std::chrono::steady_clock::now();
+    std::future<ClientRunResult> future = asio::co_spawn(
+        context,
+        client.endpoint.run(acceptor.local_endpoint(), prepared, {},
+                             std::chrono::steady_clock::now() + std::chrono::milliseconds(100)),
+        asio::use_future);
+    context.run();
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    peer.get();
+    const ClientRunResult result = future.get();
+    require(result.status == ClientRunStatus::DeadlineExceeded &&
+                elapsed < std::chrono::seconds(2) && client.has_reconciliation_work(),
+            "unresponsive peer was not bounded by the client deadline");
+    // No handler/timer may retain the socket after completion.
+    require(context.poll() == 0, "deadline run left a live socket/timer callback");
+
+    // The connected-socket overload consumes a descriptor that was connected
+    // by the ordinary listener path and drives the same reducer/witness path.
+    TestClient adopted_client(Id128::from_u64(931));
+    const PreparedTuHandle adopted_prepared = admit(adopted_client, bytes("adopted input\n"));
+    P50ServerEndpoint server(Id128::from_u64(932));
+    asio::io_context adopted_context;
+    tcp::acceptor adopted_acceptor(adopted_context,
+                                   {asio::ip::address_v4::loopback(), 0});
+    std::future<ServerRunResult> server_result = asio::co_spawn(
+        adopted_context,
+        [&]() -> asio::awaitable<ServerRunResult> {
+            const auto executor = co_await asio::this_coro::executor;
+            tcp::socket accepted(executor);
+            co_await adopted_acceptor.async_accept(accepted, asio::use_awaitable);
+            co_return co_await server.run_adopted(std::move(accepted));
+        },
+        asio::use_future);
+    std::future<ClientRunResult> client_result = asio::co_spawn(
+        adopted_context,
+        [&]() -> asio::awaitable<ClientRunResult> {
+            const auto executor = co_await asio::this_coro::executor;
+            tcp::socket connected(executor);
+            co_await connected.async_connect(adopted_acceptor.local_endpoint(), asio::use_awaitable);
+            co_return co_await adopted_client.endpoint.run(std::move(connected),
+                                                           adopted_prepared);
+        },
+        asio::use_future);
+    adopted_context.run();
+    const ClientRunResult adopted_result = client_result.get();
+    require(adopted_result.status == ClientRunStatus::Committed &&
+                adopted_result.committed_commit.has_value() &&
+                adopted_result.committed_input.has_value() &&
+                server_result.get().status == ServerRunStatus::Completed,
+            "connected-socket client overload did not commit its direct witness");
 }
 
 void test_adopted_endpoint_disconnect_and_invalid_rows() {
@@ -1040,6 +1122,20 @@ asio::awaitable<void> raw_zero_error_code_peer(tcp::acceptor& acceptor) {
     frame[5] = 0;
     co_await raw_write_bytes(socket, frame);
     co_await raw_wait_for_close(socket);
+}
+
+asio::awaitable<void> raw_stall_after_connect(tcp::acceptor& acceptor) {
+    const auto executor = co_await asio::this_coro::executor;
+    tcp::socket socket(executor);
+    boost::system::error_code error;
+    co_await acceptor.async_accept(socket, asio::redirect_error(asio::use_awaitable, error));
+    if (error)
+        co_return;
+    std::array<uint8_t, 1> byte{};
+    while (!error)
+        co_await socket.async_read_some(asio::buffer(byte),
+                                       asio::redirect_error(asio::use_awaitable, error));
+    co_return;
 }
 
 asio::awaitable<void> raw_zero_history_reset(tcp::endpoint remote,
@@ -2227,6 +2323,11 @@ void test_exact_replay_and_lost_final() {
         require(replayed.client.status == ClientRunStatus::Committed &&
                     replayed.client.reconnect == EndpointReconnectOutcome::ExactMatch,
                 "exact replay did not commit on the unchanged route");
+        require(replayed.client.committed_commit.has_value() &&
+                    replayed.client.committed_input.has_value() &&
+                    replayed.client.committed_input ==
+                        server.last_committed_input(client.c_store_guid()),
+                "normal commit did not return its exact direct witness");
         require(copy_input(server, client.c_store_guid()) == input,
                 "exact replay materialized different bytes");
         require(std::any_of(actions.records().begin(), actions.records().end(),
@@ -2257,6 +2358,11 @@ void test_exact_replay_and_lost_final() {
                         EndpointReconnectOutcome::LostFinalAcknowledgement &&
                     !client.has_active_transaction(),
                 "lost-final reconciliation did not accept the exact retained commit");
+        require(reconciled.client.committed_commit.has_value() &&
+                    reconciled.client.committed_input.has_value() &&
+                    reconciled.client.committed_input ==
+                        server.last_committed_input(client.c_store_guid()),
+                "lost-final reconciliation did not return its exact direct witness");
         require_trace(actions, "lost-final trace");
     }
 
@@ -4002,6 +4108,7 @@ int main(int argc, char** argv) {
     test_terminal_body_failure_identity();
     test_disconnect_at_each_message_boundary();
     test_component_and_allocation_caps();
+    test_client_deadline_and_direct_socket_ownership();
     test_adopted_endpoint_exact_zstd_and_ownership();
     test_adopted_endpoint_disconnect_and_invalid_rows();
     test_adopted_cross_executor_releases_registration();

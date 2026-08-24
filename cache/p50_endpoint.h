@@ -12,6 +12,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -211,6 +212,7 @@ enum class EndpointReconnectOutcome : uint8_t {
 enum class ClientRunStatus : uint8_t {
     Committed,
     Disconnected,
+    DeadlineExceeded,
     TerminalError,
 };
 
@@ -218,6 +220,11 @@ struct ClientRunResult {
     ClientRunStatus status = ClientRunStatus::Disconnected;
     EndpointReconnectOutcome reconnect = EndpointReconnectOutcome::ExactMatch;
     bool whole_new_attempt = false;
+    // These witnesses are populated only after the endpoint has accepted the
+    // exact, fully validated TX_COMMIT.  They are deliberately independent of
+    // ActionTrace (which is diagnostic, not an authority).
+    std::optional<TxCommit> committed_commit;
+    std::optional<InputRecordKey> committed_input;
     std::optional<ErrorMessage> terminal_error;
 };
 
@@ -294,9 +301,29 @@ public:
     P50ClientEndpoint(const P50ClientEndpoint&) = delete;
     P50ClientEndpoint& operator=(const P50ClientEndpoint&) = delete;
 
+    // The deadline is an absolute steady-clock time.  Omitting it preserves
+    // the historical unbounded behavior for callers that do not opt in.
     boost::asio::awaitable<ClientRunResult> run(boost::asio::ip::tcp::endpoint remote,
                                                 PreparedTuHandle prepared = {},
-                                                EndpointIoControl control = {});
+                                                EndpointIoControl control = {},
+                                                std::optional<std::chrono::steady_clock::time_point>
+                                                    deadline = std::nullopt);
+
+    // Run over a socket that is already connected by the ordinary listener
+    // negotiation path.  Ownership is consumed on every success and failure
+    // path; the endpoint validates that it is a connected IPv4/IPv6 TCP socket.
+    boost::asio::awaitable<ClientRunResult> run(
+        boost::asio::ip::tcp::socket socket, PreparedTuHandle prepared = {},
+        EndpointIoControl control = {},
+        std::optional<std::chrono::steady_clock::time_point> deadline = std::nullopt);
+
+    boost::asio::awaitable<ClientRunResult> run_adopted_fd(
+        int fd, PreparedTuHandle prepared = {}, EndpointIoControl control = {},
+        std::optional<std::chrono::steady_clock::time_point> deadline = std::nullopt);
+
+    static std::optional<boost::asio::ip::tcp::socket> adopt_connected_fd(
+        boost::asio::any_io_executor executor, int fd,
+        boost::system::error_code& error);
 
     [[nodiscard]] CStoreGuid c_store_guid() const;
     [[nodiscard]] std::optional<FStoreGuid> f_store_guid() const;
@@ -306,6 +333,12 @@ public:
     [[nodiscard]] Digest128 state_digest() const;
 
 private:
+    boost::asio::awaitable<ClientRunResult> run_connected(
+        std::optional<boost::asio::ip::tcp::endpoint> remote,
+        std::optional<boost::asio::ip::tcp::socket> socket,
+        PreparedTuHandle prepared, EndpointIoControl control,
+        std::optional<std::chrono::steady_clock::time_point> deadline);
+
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

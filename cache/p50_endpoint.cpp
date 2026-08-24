@@ -3,6 +3,7 @@
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/read.hpp>
 #include <boost/asio/redirect_error.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <boost/asio/this_coro.hpp>
 #include <boost/asio/use_awaitable.hpp>
 #include <boost/asio/write.hpp>
@@ -187,6 +188,19 @@ void close_now(tcp::socket& socket) {
     socket.shutdown(tcp::socket::shutdown_both, ignored);
     socket.close(ignored);
 }
+
+// The timer owns the socket through this shared state.  Consequently a
+// canceled/late timer completion can never dereference the run coroutine's
+// stack, and no callback captures the endpoint (whose owner may be gone).
+struct ClientIoState {
+    explicit ClientIoState(asio::any_io_executor executor)
+        : socket(executor), timer(executor) {}
+
+    tcp::socket socket;
+    asio::steady_timer timer;
+    bool expired = false;
+    bool committed = false;
+};
 
 bool set_cloexec_fd(int fd, boost::system::error_code& error) {
     if (fd < 0) {
@@ -1528,10 +1542,54 @@ P50ClientEndpoint::P50ClientEndpoint(std::shared_ptr<P50PreparationAuthority> pr
 
 P50ClientEndpoint::~P50ClientEndpoint() = default;
 
-boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run(tcp::endpoint remote,
-                                                               PreparedTuHandle prepared,
-                                                               EndpointIoControl control) {
+boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run(
+    tcp::endpoint remote, PreparedTuHandle prepared, EndpointIoControl control,
+    std::optional<std::chrono::steady_clock::time_point> deadline) {
+    co_return co_await run_connected(remote, std::nullopt, std::move(prepared),
+                                     std::move(control), deadline);
+}
+
+boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run(
+    tcp::socket socket, PreparedTuHandle prepared, EndpointIoControl control,
+    std::optional<std::chrono::steady_clock::time_point> deadline) {
+    co_return co_await run_connected(std::nullopt, std::optional<tcp::socket>(std::move(socket)),
+                                     std::move(prepared), std::move(control), deadline);
+}
+
+boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_adopted_fd(
+    int fd, PreparedTuHandle prepared, EndpointIoControl control,
+    std::optional<std::chrono::steady_clock::time_point> deadline) {
+    const auto executor = co_await asio::this_coro::executor;
+    boost::system::error_code error;
+    std::optional<tcp::socket> socket = adopt_connected_fd(executor, fd, error);
+    if (!socket) {
+        ClientRunResult result;
+        if (deadline && *deadline <= std::chrono::steady_clock::now())
+            result.status = ClientRunStatus::DeadlineExceeded;
+        co_return result;
+    }
+    co_return co_await run(std::move(*socket), std::move(prepared), std::move(control), deadline);
+}
+
+boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
+    std::optional<tcp::endpoint> remote, std::optional<tcp::socket> adopted,
+    PreparedTuHandle prepared, EndpointIoControl control,
+    std::optional<std::chrono::steady_clock::time_point> deadline) {
     impl_->owner.require();
+    if (deadline && *deadline <= std::chrono::steady_clock::now()) {
+        if (adopted && adopted->is_open())
+            close_now(*adopted);
+        ClientRunResult result;
+        result.status = ClientRunStatus::DeadlineExceeded;
+        co_return result;
+    }
+    if (!remote) {
+        if (!adopted || !validate_adopted_socket(*adopted)) {
+            if (adopted && adopted->is_open())
+                close_now(*adopted);
+            co_return ClientRunResult{};
+        }
+    }
     if (impl_->active_session != 0)
         throw std::logic_error("C endpoint already has one active dialogue");
     PreparedZstdTUPtr admitted;
@@ -1553,7 +1611,20 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run(tcp::endpoint rem
     const uint64_t serial = session.serial;
     impl_->active_session = session.serial;
     const auto executor = co_await asio::this_coro::executor;
-    tcp::socket socket(executor);
+    auto io = std::make_shared<ClientIoState>(executor);
+    if (adopted)
+        io->socket = std::move(*adopted);
+    tcp::socket& socket = io->socket;
+    if (deadline) {
+        io->timer.expires_at(*deadline);
+        io->timer.async_wait([io](const boost::system::error_code& error) {
+            if (error)
+                return;
+            io->expired = true;
+            if (!io->committed)
+                close_now(io->socket);
+        });
+    }
     ClientRunResult result;
     uint32_t terminal_cap = impl_->caps.wire.max_frame_payload;
     const auto verify = [&](const CompletionStamp& expected) {
@@ -1569,8 +1640,10 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run(tcp::endpoint rem
         require_live_completion(expected, live);
     };
     try {
-        co_await async_connect(socket, remote, impl_->stamp(session, AsyncOperationKind::Connect),
-                               impl_->completions, verify);
+        if (remote)
+            co_await async_connect(socket, *remote,
+                                   impl_->stamp(session, AsyncOperationKind::Connect),
+                                   impl_->completions, verify);
 
         SessionHello hello;
         hello.c_store_guid = impl_->c_guid;
@@ -1618,9 +1691,14 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run(tcp::endpoint rem
             peer.next_rel_seq.value == impl_->active->begin.rel_seq.value + 1 &&
             peer.state_digest == peer.last_commit->post_state_digest) {
             impl_->accept(*peer.last_commit, ActionType::LOST_COMMIT_ACCEPTED, serial);
+            io->committed = true;
+            result.committed_commit = *peer.last_commit;
+            result.committed_input = InputRecordKey{impl_->c_guid, peer.last_commit->tu_seq};
             result.status = ClientRunStatus::Committed;
             result.reconnect = EndpointReconnectOutcome::LostFinalAcknowledgement;
             close_now(socket);
+            boost::system::error_code timer_error;
+            io->timer.cancel(timer_error);
             impl_->active_session = 0;
             co_return result;
         }
@@ -1722,6 +1800,9 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run(tcp::endpoint rem
                 throw ClientTerminalResult(decode_as<ErrorMessage>(commit_frame), frame_cap);
             const TxCommit commit = decode_as<TxCommit>(commit_frame);
             impl_->accept(commit, ActionType::COMMIT_ACCEPTED, serial);
+            io->committed = true;
+            result.committed_commit = commit;
+            result.committed_input = InputRecordKey{impl_->c_guid, commit.tu_seq};
         });
         result.status = ClientRunStatus::Committed;
         close_now(socket);
@@ -1738,6 +1819,8 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run(tcp::endpoint rem
         close_now(socket);
         if (impl_->active_session == serial)
             impl_->active_session = 0;
+        boost::system::error_code timer_error;
+        io->timer.cancel(timer_error);
         throw;
     } catch (const std::exception& error) {
         close_now(socket);
@@ -1746,11 +1829,29 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run(tcp::endpoint rem
         close_now(socket);
         if (impl_->active_session == serial)
             impl_->active_session = 0;
+        boost::system::error_code timer_error;
+        io->timer.cancel(timer_error);
         throw;
     }
+    if (!io->committed && io->expired) {
+        // A timeout is fail-closed: the active transaction/queued work remains
+        // exactly as reconciliation state for the next run.
+        result = ClientRunResult{};
+        result.status = ClientRunStatus::DeadlineExceeded;
+    }
+    boost::system::error_code timer_error;
+    io->timer.cancel(timer_error);
     if (impl_->active_session == serial)
         impl_->active_session = 0;
     co_return result;
+}
+
+std::optional<tcp::socket> P50ClientEndpoint::adopt_connected_fd(
+    asio::any_io_executor executor, int fd, boost::system::error_code& error) {
+    // Keep one ownership/validation law for both endpoint directions.  The
+    // server helper consumes and closes fd on every failure path, and proves
+    // CLOEXEC plus connected IPv4/IPv6 TCP before returning the socket.
+    return P50ServerEndpoint::adopt_connected_fd(executor, fd, error);
 }
 
 CStoreGuid P50ClientEndpoint::c_store_guid() const {
