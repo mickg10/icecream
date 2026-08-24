@@ -19,7 +19,8 @@ adopted_body() {
 }
 
 body=$(adopted_body "$endpoint")
-printf '%s\n' "$body" | grep -F 'co_await run_connected(std::move(socket), session.serial' >/dev/null
+printf '%s\n' "$body" | grep -F 'co_await run_connected(std::move(socket), std::move(registration)' >/dev/null
+printf '%s\n' "$body" | grep -F 'SessionRegistration registration(*impl_, session)' >/dev/null
 if printf '%s\n' "$body" | grep -E 'listen|async_accept|async_read_frame|decode_as|materialize_and_commit' >/dev/null; then
     echo 'FAIL: adopted endpoint contains a reducer bypass or a second accept' >&2
     exit 1
@@ -29,9 +30,9 @@ echo 'ok - adopted endpoint has no accept/read/reducer duplicate'
 
 mutant=$(mktemp "${TMPDIR:-/tmp}/p50endpoint-mutant.XXXXXX")
 trap 'rm -f "$mutant"' EXIT HUP INT TERM
-sed 's/co_return co_await run_connected(std::move(socket), session.serial, std::move(control), nullptr);/co_return ServerRunResult{};/' \
+sed 's/co_return co_await run_connected(std::move(socket), std::move(registration),/co_return ServerRunResult{};\n    \/\//' \
     "$endpoint" >"$mutant"
-if adopted_body "$mutant" | grep -F 'co_await run_connected(std::move(socket), session.serial' >/dev/null; then
+if adopted_body "$mutant" | grep -F 'co_await run_connected(std::move(socket), std::move(registration)' >/dev/null; then
     echo 'FAIL: reducer-deletion mutant was accepted' >&2
     exit 1
 fi

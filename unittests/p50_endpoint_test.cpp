@@ -4,6 +4,7 @@
 
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/co_spawn.hpp>
+#include <boost/asio/executor_work_guard.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/read.hpp>
 #include <boost/asio/redirect_error.hpp>
@@ -338,6 +339,60 @@ void test_adopted_endpoint_disconnect_and_invalid_rows() {
     require(invalid_result.get().status == ServerRunStatus::Disconnected &&
                 server.live_session_count() == 0,
             "closed adopted socket did not fail closed");
+}
+
+void test_adopted_cross_executor_releases_registration() {
+    P50ServerEndpoint server(Id128::from_u64(930));
+    // Bind the endpoint owner to this thread. The adopted socket's I/O below
+    // runs on a different executor, forcing the reducer's owner check from a
+    // completion callback without permitting a session-row leak.
+    server.reset_store(Id128::from_u64(931));
+
+    const int listener = ::socket(AF_INET, SOCK_STREAM, 0);
+    require(listener >= 0, "cross-executor listener setup failed");
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = 0;
+    require(::bind(listener, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == 0,
+            "cross-executor listener bind failed");
+    require(::listen(listener, 1) == 0, "cross-executor listener listen failed");
+    socklen_t address_length = sizeof(address);
+    require(::getsockname(listener, reinterpret_cast<sockaddr*>(&address), &address_length) == 0,
+            "cross-executor listener address failed");
+    const int client = ::socket(AF_INET, SOCK_STREAM, 0);
+    require(client >= 0, "cross-executor client setup failed");
+    require(::connect(client, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == 0,
+            "cross-executor client connect failed");
+    const int accepted_fd = ::accept(listener, nullptr, nullptr);
+    require(accepted_fd >= 0, "cross-executor accept failed");
+    (void)::close(listener);
+    (void)::close(client);
+
+    asio::io_context owner_context;
+    asio::io_context worker_context;
+    auto worker_work = asio::make_work_guard(worker_context);
+    tcp::socket adopted(worker_context.get_executor());
+    boost::system::error_code assign_error;
+    adopted.assign(tcp::v4(), accepted_fd, assign_error);
+    require(!assign_error, "cross-executor socket assign failed");
+
+    EndpointIoControl control;
+    control.before_completion_check = [](const CompletionStamp&) {
+        throw std::logic_error("forced adopted reducer entry failure");
+    };
+    std::future<ServerRunResult> result = asio::co_spawn(
+        owner_context, server.run_adopted(std::move(adopted), std::move(control)),
+        asio::use_future);
+    std::thread worker([&] { worker_context.run(); });
+    owner_context.run();
+    worker_work.reset();
+    worker.join();
+    require(result.get().status == ServerRunStatus::TerminalError,
+            "cross-executor owner rejection was not terminal");
+    require(server.live_session_count() == 0,
+            "cross-executor owner rejection stranded a live session");
+    require_closed_fd(accepted_fd, "cross-executor adopted fd was not closed");
 }
 
 CompetingPairResult run_competing_pair(P50ServerEndpointConfig config,
@@ -3949,6 +4004,7 @@ int main(int argc, char** argv) {
     test_component_and_allocation_caps();
     test_adopted_endpoint_exact_zstd_and_ownership();
     test_adopted_endpoint_disconnect_and_invalid_rows();
+    test_adopted_cross_executor_releases_registration();
     test_two_client_one_server_isolation();
     report_zstd1_metrics(performance_gate);
     std::cout << "p50_endpoint_test: PASS\n";

@@ -1471,6 +1471,48 @@ struct P50ServerEndpoint::Impl {
     P50ServerEndpointConfig config{};
 };
 
+// The live-session row is inserted before the shared reducer coroutine is
+// created. Move this lease into that coroutine so allocation failure,
+// cancellation before entry, or owner-affinity rejection cannot strand it.
+class P50ServerEndpoint::SessionRegistration {
+public:
+    SessionRegistration(Impl& owner, Impl::Session session) noexcept
+        : owner_(&owner), session_(session) {}
+
+    ~SessionRegistration() { reset(); }
+
+    SessionRegistration(const SessionRegistration&) = delete;
+    SessionRegistration& operator=(const SessionRegistration&) = delete;
+
+    SessionRegistration(SessionRegistration&& other) noexcept
+        : owner_(other.owner_), session_(other.session_) {
+        other.owner_ = nullptr;
+    }
+
+    SessionRegistration& operator=(SessionRegistration&& other) noexcept {
+        if (this != &other) {
+            reset();
+            owner_ = other.owner_;
+            session_ = other.session_;
+            other.owner_ = nullptr;
+        }
+        return *this;
+    }
+
+    [[nodiscard]] uint64_t serial() const noexcept { return session_.serial; }
+
+    void reset() noexcept {
+        if (owner_ != nullptr) {
+            owner_->release_session(session_);
+            owner_ = nullptr;
+        }
+    }
+
+private:
+    Impl* owner_ = nullptr;
+    Impl::Session session_{};
+};
+
 void require_outbound_profile_negotiated(uint32_t negotiated_profiles,
                                          const TxBegin& begin) {
     if ((negotiated_profiles & profile_bit(begin.profile)) == 0)
@@ -1784,7 +1826,9 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_adopted(
         co_return ServerRunResult{};
     }
     const Impl::Session session = impl_->allocate_session();
-    co_return co_await run_connected(std::move(socket), session.serial, std::move(control), nullptr);
+    SessionRegistration registration(*impl_, session);
+    co_return co_await run_connected(std::move(socket), std::move(registration),
+                                     std::move(control), nullptr);
 }
 
 boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::accept_one(tcp::acceptor& acceptor,
@@ -1793,14 +1837,16 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::accept_one(tcp::accep
     const Impl::Session session = impl_->allocate_session();
     const auto executor = co_await asio::this_coro::executor;
     tcp::socket socket(executor);
-    co_return co_await run_connected(std::move(socket), session.serial, std::move(control),
-                                     &acceptor);
+    SessionRegistration registration(*impl_, session);
+    co_return co_await run_connected(std::move(socket), std::move(registration),
+                                     std::move(control), &acceptor);
 }
 
 boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
-    tcp::socket socket, uint64_t session_serial, EndpointIoControl control,
+    tcp::socket socket, SessionRegistration registration, EndpointIoControl control,
     tcp::acceptor* acceptor) {
     impl_->owner.require();
+    const uint64_t session_serial = registration.serial();
     Impl::Session session{.serial = session_serial,
                           .f_guid = impl_->f_guid,
                           .c_guid = std::nullopt,
@@ -1887,20 +1933,17 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
             socket, impl_->stamp(session, AsyncOperationKind::WaitPeerClose, &committed_begin),
             impl_->completions, verify);
         impl_->disconnect(session, false);
-        impl_->release_session(session);
         result.status = ServerRunStatus::Completed;
         close_now(socket);
         co_return result;
     } catch (const StaleCompletion&) {
         close_now(socket);
         impl_->disconnect(session, true);
-        impl_->release_session(session);
         result.status = ServerRunStatus::Disconnected;
         co_return result;
     } catch (const boost::system::system_error&) {
         close_now(socket);
         impl_->disconnect(session, true);
-        impl_->release_session(session);
         result.status = ServerRunStatus::Disconnected;
         co_return result;
     } catch (const std::exception& error) {
@@ -1920,7 +1963,6 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
     // A terminal reply ends this dialogue and discards its component overlay,
     // but an installed TX_BEGIN remains the exact retry/reconciliation identity.
     impl_->disconnect(session, true);
-    impl_->release_session(session);
     result.status = ServerRunStatus::TerminalError;
     result.terminal_error = std::move(*terminal_error);
     co_return result;

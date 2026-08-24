@@ -347,8 +347,10 @@ public:
     last_committed_input(CStoreGuid c_store_guid) const;
 
 private:
+    class SessionRegistration;
+
     boost::asio::awaitable<ServerRunResult> run_connected(
-        boost::asio::ip::tcp::socket socket, uint64_t session_serial,
+        boost::asio::ip::tcp::socket socket, SessionRegistration registration,
         EndpointIoControl control, boost::asio::ip::tcp::acceptor* acceptor);
 
     struct Impl;
