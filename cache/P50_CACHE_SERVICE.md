@@ -44,20 +44,24 @@ listener cleanup; no earlier failure emits readiness.
 SIGTERM and SIGINT handlers perform only the async-signal-safe action of
 setting a flag and writing a byte to an internal nonblocking wake pipe. The
 normal service thread drains that pipe, calls `SidecarRuntime::stop()`, and
-joins the connection worker. `stop()` closes the duplicated control wait
+closes/joins the bounded control workers. `stop()` closes the duplicated control wait
 descriptor and posts cancellation of the active adopted TCP socket onto its
 Asio owner context. Thus both an in-flight `FdHandoffReceiver` and an active
 `run_adopted` dialogue terminate within the bounded shutdown gate without C++
 object work in the signal handler.
 
-The listener accepts at most one worker connection at a time. Each connection
-must pass peer-credential verification and one exact `Hello` from `Daemon`
-with the configured nonzero generation and attempt; the service returns one
-`HelloAck` from `Sidecar`. The worker then admits exactly one handoff for its
-monotonically increasing request id, ACKing only after ownership and
-`CLOEXEC` have been proven. Wrong generation, attempt, request id, missing or
-extra descriptors, truncation, trailing data, disconnect, timeout, adoption
-failure, and shutdown are fail-closed and close all owned descriptors.
+The listener admits at most four concurrent control workers. This hard cap
+means an authenticated idle dispatcher or one active CacheWire session cannot
+consume the slot needed by a compiler-input attachment; excess connections
+are closed. Each connection must pass peer-credential verification and one
+exact `Hello` from `Daemon` with the configured nonzero generation and attempt;
+the service returns one `HelloAck` from `Sidecar`. The next frame must be an
+exact, versioned `Data` operation envelope. `CacheSession` admits exactly one
+handoff for its nonzero request id; `InputFdAttachment` resolves the committed
+record and then admits one compiler FD handoff. Wrong operation, identity,
+attempt, request id, missing or extra descriptors, truncation, trailing data,
+disconnect, timeout, adoption failure, and shutdown are fail-closed and close
+all owned descriptors.
 
 After one adopted dialogue returns, the same `SidecarRuntime` may process the
 next authenticated control connection and request id. Endpoint session leases,

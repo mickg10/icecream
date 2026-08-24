@@ -41,6 +41,7 @@ libp50daemonsidecaradapter_a_SOURCES = p50_daemon_sidecar_adapter.cpp \
 libp50daemonsidecaradapter_a_CPPFLAGS = $(AM_CPPFLAGS)
 
 EXTRA_DIST = \
+	p50_control_operation.h \
 	README.md \
 	P48_P50_CONVERGENCE.md \
 	KEY_LAYOUT_V1_CENSUS.md \

@@ -73,6 +73,12 @@ public:
                           std::chrono::steady_clock::time_point deadline,
                           EndpointIoControl endpoint_control = {});
 
+    // Queue the mutable endpoint lookup on the endpoint owner's io_context.
+    // The returned cursor owns its immutable backing and can be materialized
+    // by the bounded control worker after this call returns.
+    std::optional<InputCursor> attach_input_on_owner(
+        InputRecordKey key, std::chrono::steady_clock::time_point deadline) noexcept;
+
     void stop() noexcept;
     [[nodiscard]] bool stopped() const noexcept { return stop_requested_.load(); }
     [[nodiscard]] size_t live_session_count() const;

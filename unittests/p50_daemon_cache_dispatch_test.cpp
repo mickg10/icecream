@@ -2,6 +2,7 @@
  * The ordinary side is a real MsgChannel; the private side is a real
  * authenticated socketpair and FdHandoffReceiver. */
 #include "../cache/p50_daemon_cache_dispatch.h"
+#include "../cache/p50_control_operation.h"
 #include "comm.h"
 
 #include <algorithm>
@@ -139,6 +140,19 @@ void send_cache_session(MsgChannel *sender) {
     CHECK(sender->send_msg(CacheSessionMsg()), "P50 CACHE_SESSION sent on ordinary link");
 }
 
+bool receive_cache_operation(Connection& sidecar, Identity identity, uint64_t request_id) {
+    Frame frame;
+    if (sidecar.receive_until(frame, std::chrono::steady_clock::now() +
+                              std::chrono::seconds(2)) != Status::Ok ||
+        frame.type != MessageType::Data ||
+        icecc::p50::local::validate_identity(frame, identity) != Status::Ok)
+        return false;
+    icecc::p50::local::ControlOperation operation;
+    return icecc::p50::local::decode_control_operation(frame.payload, operation) &&
+           operation.kind == icecc::p50::local::ControlOperationKind::CacheSession &&
+           operation.identity == identity && operation.request_id == request_id;
+}
+
 } // namespace
 
 int main() {
@@ -251,6 +265,8 @@ int main() {
         icecc::p50::local::FdHandoffResult receive_result;
         const Identity expected_identity{7, 11};
         std::thread receiver_thread([&] {
+            CHECK(receive_cache_operation(receiver_side, expected_identity, 1),
+                  "sidecar receives exact CacheSession operation before SCM_RIGHTS");
             receive_result = receiver.receive_and_ack(
                 receiver_side, icecc::p50::local::HandoffRequest{expected_identity, 1},
                 std::chrono::steady_clock::now() + std::chrono::seconds(2));
@@ -349,9 +365,11 @@ int main() {
         const auto outcome = dispatcher.dispatch(*ordinary.right, ordinary.right->protocol,
                                                   static_cast<uint32_t>(*decoded));
         delete decoded;
-        CHECK(outcome.result == CacheDispatchResult::HandoffFailed && outcome.detached,
+        CHECK((timeout && outcome.result == CacheDispatchResult::HandoffFailed && outcome.detached) ||
+                  (!timeout && outcome.result == CacheDispatchResult::SidecarUnavailable &&
+                   !outcome.detached),
               timeout ? "handoff timeout is bounded and fail-closed"
-                      : "sidecar disconnect is fail-closed after release");
+                      : "sidecar disconnect is fail-closed before release");
         CHECK(!dispatcher.available(), "failed handoff drops relationship and forbids retry");
     }
 
@@ -422,6 +440,8 @@ int main() {
             FdHandoffReceiver receiver;
             icecc::p50::local::FdHandoffResult receive_result;
             std::thread receiver_thread([&] {
+                CHECK(receive_cache_operation(receiver_side, Identity{40, 2}, request_id),
+                      "repeat sidecar receives exact CacheSession operation");
                 receive_result = receiver.receive_and_ack(
                     receiver_side,
                     icecc::p50::local::HandoffRequest{Identity{40, 2}, request_id},

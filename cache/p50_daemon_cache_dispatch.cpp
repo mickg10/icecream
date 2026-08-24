@@ -3,6 +3,7 @@
 #include <limits>
 
 #include "comm.h"
+#include "p50_control_operation.h"
 
 namespace icecc::p50::daemon {
 namespace {
@@ -87,10 +88,29 @@ CacheDispatchOutcome CacheSessionDispatcher::dispatch(MsgChannel& channel,
     }
 
     const local::HandoffRequest request{identity_, next_request_id_++};
+    // Establish the semantic operation before touching the ordinary link.
+    // If this frame cannot be sent, the ordinary descriptor remains owned by
+    // MsgChannel and the caller can tear it down without a mixed stream.
+    const local::Frame operation{
+        local::kProtocolVersion, local::MessageType::Data, identity_,
+        local::encode_control_operation(
+            local::make_cache_session_operation(identity_, request.request_id))};
+    const auto operation_deadline = std::chrono::steady_clock::now() + handoff_timeout_;
+    if (operation.payload.empty() ||
+        sidecar_->send_until(operation, operation_deadline) != local::Status::Ok) {
+        disable();
+        return CacheDispatchOutcome{CacheDispatchResult::SidecarUnavailable,
+                                    local::FdHandoffStatus::Disconnected, request, false};
+    }
     const int released_fd = channel.release_fd_if_input_empty();
-    if (released_fd < 0)
+    if (released_fd < 0) {
+        // The operation has been announced but the ordinary stream did not
+        // prove a clean release boundary.  Drop the relationship so the
+        // sidecar cannot wait on or reinterpret a half-announced stream.
+        disable();
         return CacheDispatchOutcome{CacheDispatchResult::ReleaseRefused,
                                     local::FdHandoffStatus::AlreadyConsumed, request, false};
+    }
 
     local::FdHandoffSender sender{local::HandoffFd(released_fd)};
     const auto deadline = std::chrono::steady_clock::now() + handoff_timeout_;

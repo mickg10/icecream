@@ -109,6 +109,15 @@ public:
         const local::CredentialExpectation& expected_peer,
         std::chrono::steady_clock::time_point deadline) const noexcept;
 
+    // Completes one request after the caller has already authenticated HELLO
+    // and decoded the exact InputFdAttachment Data operation.  This seam is
+    // used by the sidecar demux so cache-session and compiler-input controls
+    // share one bounded relationship without repeating a handshake.
+    [[nodiscard]] InputFdAttachmentResult serve_request(
+        local::Connection& connection, local::Identity expected_identity,
+        const local::CredentialExpectation& expected_peer, InputFdRequest request,
+        std::chrono::steady_clock::time_point deadline) const noexcept;
+
 private:
     CursorProvider provider_;
     size_t max_materialized_bytes_ = 0;

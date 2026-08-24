@@ -141,6 +141,11 @@ int main() {
         socket_path, InputFdRequest{identity, key, 1}, peer, deadline);
     require(first.status == InputFdAttachmentStatus::Accepted && first.fd.valid(),
             "first exact attachment failed");
+    const int first_status_flags = ::fcntl(first.fd.get(), F_GETFL);
+    const int first_descriptor_flags = ::fcntl(first.fd.get(), F_GETFD);
+    require(first_status_flags >= 0 && (first_status_flags & O_ACCMODE) == O_RDONLY &&
+                first_descriptor_flags >= 0 && (first_descriptor_flags & FD_CLOEXEC) != 0,
+            "receiver observed the materialized snapshot as O_RDONLY|O_CLOEXEC");
     int seals = ::fcntl(first.fd.get(), F_GET_SEALS);
     require(seals >= 0 && (seals & F_SEAL_WRITE) != 0,
             "authorized descriptor was not sealed");

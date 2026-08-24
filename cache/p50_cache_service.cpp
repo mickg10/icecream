@@ -1,4 +1,6 @@
 #include "p50_cache_service.h"
+#include "p50_control_operation.h"
+#include "p50_input_fd_attachment.h"
 
 #include <charconv>
 #include <cerrno>
@@ -27,6 +29,7 @@
 #include <utility>
 #include <future>
 #include <thread>
+#include <vector>
 
 namespace icecc::p50::service {
 namespace {
@@ -38,6 +41,10 @@ constexpr std::string_view kReadyMessage = "READY\n";
 constexpr int kPollMilliseconds = 100;
 constexpr int kHandshakeMilliseconds = 500;
 constexpr int kMaxBacklog = 16;
+// A bounded control farm keeps an authenticated idle dispatcher or an active
+// cache-wire handoff from consuming the only worker needed by compiler input.
+// This is a hard concurrent cap, not a per-connection unbounded thread fork.
+constexpr size_t kMaxControlWorkers = 4;
 
 volatile sig_atomic_t g_stop_requested = 0;
 volatile sig_atomic_t g_signal_wake_fd = -1;
@@ -356,7 +363,7 @@ void cleanup_listener(int fd, const std::string& path, const ListenerIdentity& i
 }
 
 bool handle_connection(local::Connection connection, const Options& options,
-                        SidecarRuntime& runtime, const local::HandoffRequest& expected) noexcept {
+                        SidecarRuntime& runtime) noexcept {
     try {
         if (!connection.valid())
             return false;
@@ -372,9 +379,39 @@ bool handle_connection(local::Connection connection, const Options& options,
             local::make_hello_ack(local::PeerRole::Sidecar, options.identity);
         if (connection.send(ack) != local::Status::Ok)
             return true;
-        (void)runtime.run_one(
-            connection, expected,
-            std::chrono::steady_clock::now() + std::chrono::milliseconds{kHandshakeMilliseconds});
+
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds{kHandshakeMilliseconds};
+        local::Frame operation_frame;
+        if (connection.receive_until(operation_frame, deadline) != local::Status::Ok ||
+            operation_frame.type != local::MessageType::Data ||
+            local::validate_identity(operation_frame, options.identity) != local::Status::Ok)
+            return true;
+        local::ControlOperation operation;
+        if (!local::decode_control_operation(operation_frame.payload, operation) ||
+            operation.identity != options.identity || operation.request_id == 0)
+            return true;
+
+        if (operation.kind == local::ControlOperationKind::CacheSession) {
+            const local::HandoffRequest expected{operation.identity, operation.request_id};
+            (void)runtime.run_one(connection, expected, deadline);
+            return true;
+        }
+        if (operation.kind != local::ControlOperationKind::InputFdAttachment ||
+            !operation.input.has_value())
+            return true;
+
+        // Input lookup is posted to the endpoint owner.  The resulting cursor
+        // is independent and is materialized on this bounded control worker.
+        InputFdAttachmentService attachment(
+            [&runtime, deadline](InputRecordKey key) {
+                std::optional<InputCursor> cursor =
+                    runtime.attach_input_on_owner(key, deadline);
+                return cursor.has_value() ? std::move(*cursor) : InputCursor{};
+            });
+        (void)attachment.serve_request(
+            connection, options.identity, options.expected_peer,
+            InputFdRequest{options.identity, *operation.input, operation.request_id}, deadline);
         return true;
     } catch (...) {
         return true;
@@ -610,6 +647,37 @@ RuntimeResult SidecarRuntime::run_one(
     return result;
 }
 
+std::optional<InputCursor> SidecarRuntime::attach_input_on_owner(
+    InputRecordKey key, std::chrono::steady_clock::time_point deadline) noexcept {
+    if (stop_requested_.load(std::memory_order_acquire) ||
+        std::chrono::steady_clock::now() >= deadline)
+        return std::nullopt;
+    auto completion = std::make_shared<std::promise<std::optional<InputCursor>>>();
+    std::future<std::optional<InputCursor>> result = completion->get_future();
+    try {
+        asio::post(context_, [this, key, completion] {
+            if (stop_requested_.load(std::memory_order_acquire)) {
+                completion->set_value(std::nullopt);
+                return;
+            }
+            try {
+                completion->set_value(endpoint_->attach_input(key));
+            } catch (...) {
+                completion->set_value(std::nullopt);
+            }
+        });
+    } catch (...) {
+        return std::nullopt;
+    }
+    for (;;) {
+        if (result.wait_for(std::chrono::milliseconds(2)) == std::future_status::ready)
+            return result.get();
+        if (stop_requested_.load(std::memory_order_acquire) ||
+            std::chrono::steady_clock::now() >= deadline)
+            return std::nullopt;
+    }
+}
+
 void SidecarRuntime::cancel_active_control() noexcept {
     const int fd = active_control_cancel_fd_.exchange(-1, std::memory_order_acq_rel);
     if (fd >= 0) {
@@ -780,22 +848,50 @@ int run(const Options& options) noexcept {
     (void)::close(ready.fd);
     ready.fd = -1;
 
-    uint64_t request_id = 1;
-    std::thread connection_thread;
-    std::atomic<bool> connection_done{true};
+    struct ControlWorker {
+        std::thread thread;
+        std::atomic<bool> done{false};
+        std::atomic<int> cancel_fd{-1};
+    };
+    std::vector<std::shared_ptr<ControlWorker>> workers;
+    workers.reserve(kMaxControlWorkers);
+
+    const auto cancel_workers = [&workers] {
+        for (const auto& worker : workers) {
+            const int fd = worker->cancel_fd.exchange(-1, std::memory_order_acq_rel);
+            if (fd >= 0) {
+                (void)::shutdown(fd, SHUT_RDWR);
+                (void)::close(fd);
+            }
+        }
+    };
+    const auto reap_workers = [&workers] {
+        for (auto iterator = workers.begin(); iterator != workers.end();) {
+            if (!(*iterator)->done.load(std::memory_order_acquire)) {
+                ++iterator;
+                continue;
+            }
+            if ((*iterator)->thread.joinable())
+                (*iterator)->thread.join();
+            iterator = workers.erase(iterator);
+        }
+    };
 
     for (;;) {
         if (g_stop_requested != 0)
             runtime->stop();
-        if (connection_thread.joinable() && connection_done.load(std::memory_order_acquire))
-            connection_thread.join();
-        if (g_stop_requested != 0 && !connection_thread.joinable())
+        reap_workers();
+        if (g_stop_requested != 0) {
+            cancel_workers();
+            reap_workers();
+        }
+        if (g_stop_requested != 0 && workers.empty())
             break;
 
         struct pollfd descriptors[2]{};
         descriptors[0] = {wake.read.fd, POLLIN | POLLERR | POLLHUP, 0};
         nfds_t descriptor_count = 1;
-        const bool can_accept = !connection_thread.joinable();
+        const bool can_accept = workers.size() < kMaxControlWorkers;
         if (can_accept)
             descriptors[descriptor_count++] = {listener, POLLIN | POLLERR | POLLHUP, 0};
         const int result = ::poll(descriptors, descriptor_count, kPollMilliseconds);
@@ -811,32 +907,51 @@ int run(const Options& options) noexcept {
             if (g_stop_requested != 0)
                 runtime->stop();
         }
-        if (result == 0 || !can_accept || g_stop_requested != 0 ||
+        if (result == 0 || !can_accept || g_stop_requested != 0 || descriptor_count < 2 ||
             (descriptors[1].revents & POLLIN) == 0)
             continue;
         local::Status accept_status = local::Status::Ok;
         local::Connection connection = local::accept_unix(listener, &accept_status);
         if (!connection.valid())
             continue;
-        const local::HandoffRequest expected{options.identity, request_id++};
-        connection_done.store(false, std::memory_order_release);
+        auto worker = std::make_shared<ControlWorker>();
+        const int cancel_fd = ::dup(connection.native_handle());
+        if (cancel_fd < 0) {
+            continue;
+        }
+        const int cancel_flags = ::fcntl(cancel_fd, F_GETFD);
+        if (cancel_flags < 0 || ::fcntl(cancel_fd, F_SETFD, cancel_flags | FD_CLOEXEC) < 0) {
+            (void)::close(cancel_fd);
+            continue;
+        }
+        worker->cancel_fd.store(cancel_fd, std::memory_order_release);
         try {
-            connection_thread = std::thread(
+            worker->thread = std::thread(
                 [connection = std::move(connection), &options, runtime_ptr = runtime.get(),
-                 expected, &connection_done]() mutable {
-                    (void)handle_connection(std::move(connection), options, *runtime_ptr, expected);
-                    connection_done.store(true, std::memory_order_release);
+                 worker]() mutable {
+                    (void)handle_connection(std::move(connection), options, *runtime_ptr);
+                    const int fd = worker->cancel_fd.exchange(-1, std::memory_order_acq_rel);
+                    if (fd >= 0)
+                        (void)::close(fd);
+                    worker->done.store(true, std::memory_order_release);
                 });
+            workers.emplace_back(std::move(worker));
         } catch (...) {
-            connection_done.store(true, std::memory_order_release);
-            runtime->stop();
-            break;
+            const int fd = worker->cancel_fd.exchange(-1, std::memory_order_acq_rel);
+            if (fd >= 0)
+                (void)::close(fd);
+            // The accepted connection is still owned by the local variable and
+            // is closed on scope exit.  Keep the service alive for other slots.
         }
     }
 
     runtime->stop();
-    if (connection_thread.joinable())
-        connection_thread.join();
+    cancel_workers();
+    for (const auto& worker : workers) {
+        if (worker->thread.joinable())
+            worker->thread.join();
+    }
+    workers.clear();
 
     cleanup_listener(listener, options.socket_path, identity);
     return 0;

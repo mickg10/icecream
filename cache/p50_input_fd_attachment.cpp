@@ -1,7 +1,10 @@
 #include "p50_input_fd_attachment.h"
+#include "p50_control_operation.h"
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdio>
+#include <fcntl.h>
 #include <span>
 #include <stdexcept>
 #include <poll.h>
@@ -12,15 +15,12 @@
 #include <vector>
 
 #if defined(__linux__)
-#include <fcntl.h>
 #include <linux/memfd.h>
 #include <sys/syscall.h>
 #endif
 
 namespace icecc::p50 {
 namespace {
-
-constexpr size_t kRequestBytes = 16 + 8 + 8;
 
 #if defined(__linux__) && defined(SYS_memfd_create) && defined(MFD_CLOEXEC) && \
     defined(MFD_ALLOW_SEALING) && defined(F_ADD_SEALS) && defined(F_GET_SEALS) && \
@@ -31,37 +31,22 @@ constexpr bool kSealedMemfdBuildSupport = true;
 constexpr bool kSealedMemfdBuildSupport = false;
 #endif
 
-void put_u64(uint8_t* output, uint64_t value) noexcept {
-    for (size_t index = 0; index != sizeof(value); ++index)
-        output[index] = static_cast<uint8_t>(value >> (56 - index * 8));
-}
-
-uint64_t get_u64(const uint8_t* input) noexcept {
-    uint64_t value = 0;
-    for (size_t index = 0; index != sizeof(value); ++index)
-        value = (value << 8) | input[index];
-    return value;
-}
-
 std::vector<uint8_t> encode_request(const InputFdRequest& request) {
-    std::vector<uint8_t> wire(kRequestBytes);
-    std::copy(request.key.c_store_guid.bytes.begin(),
-              request.key.c_store_guid.bytes.end(), wire.begin());
-    put_u64(wire.data() + 16, request.key.tu_seq.value);
-    put_u64(wire.data() + 24, request.request_id);
-    return wire;
+    return local::encode_control_operation(local::make_input_fd_attachment_operation(
+        request.identity, request.key, request.request_id));
 }
 
 bool decode_request(std::span<const uint8_t> wire, local::Identity identity,
                     InputFdRequest& request) noexcept {
-    if (wire.size() != kRequestBytes)
+    local::ControlOperation operation;
+    if (!local::decode_control_operation(wire, operation) ||
+        operation.kind != local::ControlOperationKind::InputFdAttachment ||
+        operation.identity != identity || !operation.input.has_value())
         return false;
-    std::copy(wire.begin(), wire.begin() + 16,
-              request.key.c_store_guid.bytes.begin());
-    request.key.tu_seq.value = get_u64(wire.data() + 16);
-    request.request_id = get_u64(wire.data() + 24);
+    request.key = *operation.input;
+    request.request_id = operation.request_id;
     request.identity = identity;
-    return request.key.c_store_guid != CStoreGuid{} && request.request_id != 0;
+    return true;
 }
 
 InputFdAttachmentStatus status_for_local(local::Status status) noexcept {
@@ -162,6 +147,37 @@ int make_sealed_memfd(std::span<const uint8_t> bytes) noexcept {
 #endif
 }
 
+int reopen_readonly_memfd(int writable_fd, size_t exact_size) noexcept {
+#if defined(__linux__)
+    if (writable_fd < 0)
+        return -1;
+    char proc_path[64]{};
+    const int length = std::snprintf(proc_path, sizeof(proc_path),
+                                     "/proc/self/fd/%d", writable_fd);
+    if (length <= 0 || static_cast<size_t>(length) >= sizeof(proc_path))
+        return -1;
+    const int readonly_fd = ::open(proc_path, O_RDONLY | O_CLOEXEC);
+    if (readonly_fd < 0)
+        return -1;
+    const int status_flags = ::fcntl(readonly_fd, F_GETFL);
+    const int descriptor_flags = ::fcntl(readonly_fd, F_GETFD);
+    struct stat info{};
+    if (status_flags < 0 || (status_flags & O_ACCMODE) != O_RDONLY ||
+        descriptor_flags < 0 || (descriptor_flags & FD_CLOEXEC) == 0 ||
+        ::fstat(readonly_fd, &info) != 0 || info.st_size < 0 ||
+        static_cast<uintmax_t>(info.st_size) != exact_size ||
+        ::lseek(readonly_fd, 0, SEEK_SET) != 0) {
+        (void)::close(readonly_fd);
+        return -1;
+    }
+    return readonly_fd;
+#else
+    (void)writable_fd;
+    (void)exact_size;
+    return -1;
+#endif
+}
+
 int materialize(InputCursor cursor, size_t max_bytes,
                 InputFdAttachmentStatus& status) noexcept {
     try {
@@ -186,12 +202,20 @@ int materialize(InputCursor cursor, size_t max_bytes,
             status = InputFdAttachmentStatus::MaterializationFailed;
             return -1;
         }
-        const int fd = make_sealed_memfd(bytes);
-        if (fd < 0)
+        const int writable_fd = make_sealed_memfd(bytes);
+        if (writable_fd < 0)
             status = kSealedMemfdBuildSupport
                          ? InputFdAttachmentStatus::MaterializationFailed
                          : InputFdAttachmentStatus::UnsupportedPlatform;
-        return fd;
+        if (writable_fd < 0)
+            return -1;
+        const int readonly_fd = reopen_readonly_memfd(writable_fd, bytes.size());
+        (void)::close(writable_fd);
+        if (readonly_fd < 0) {
+            status = InputFdAttachmentStatus::MaterializationFailed;
+            return -1;
+        }
+        return readonly_fd;
     } catch (...) {
         status = InputFdAttachmentStatus::MaterializationFailed;
         return -1;
@@ -299,6 +323,21 @@ InputFdAttachmentResult InputFdAttachmentService::serve(
     InputFdRequest request;
     if (!decode_request(request_frame.payload, expected_identity, request))
         return rejected(InputFdAttachmentStatus::MalformedRequest);
+    return serve_request(connection, expected_identity, expected_peer, std::move(request),
+                         deadline);
+}
+
+InputFdAttachmentResult InputFdAttachmentService::serve_request(
+    local::Connection& connection, local::Identity expected_identity,
+    const local::CredentialExpectation& expected_peer, InputFdRequest request,
+    std::chrono::steady_clock::time_point deadline) const noexcept {
+    if (!connection.valid() || expected_identity.generation == 0 ||
+        expected_identity.attempt == 0 || !expected_peer.specified() ||
+        request.identity != expected_identity || request.key.c_store_guid == CStoreGuid{} ||
+        request.request_id == 0)
+        return rejected(InputFdAttachmentStatus::InvalidArgument);
+    if (connection.verify_peer_credentials(expected_peer) != local::Status::Ok)
+        return rejected(InputFdAttachmentStatus::PeerUnauthenticated);
     if (queued_data(connection.native_handle()))
         return rejected(InputFdAttachmentStatus::MalformedRequest);
     if (std::chrono::steady_clock::now() >= deadline)
@@ -380,7 +419,13 @@ InputFdAttachmentResult InputFdAttachmentClient::attach(
         local::HandoffFd fd = receiver.take_adopted_fd();
         if (!fd.valid())
             return rejected(InputFdAttachmentStatus::HandoffFailed);
-        if (::lseek(fd.get(), 0, SEEK_SET) != 0)
+        const int status_flags = ::fcntl(fd.get(), F_GETFL);
+        const int descriptor_flags = ::fcntl(fd.get(), F_GETFD);
+        struct stat info{};
+        if (status_flags < 0 || (status_flags & O_ACCMODE) != O_RDONLY ||
+            descriptor_flags < 0 || (descriptor_flags & FD_CLOEXEC) == 0 ||
+            ::fstat(fd.get(), &info) != 0 || !S_ISREG(info.st_mode) ||
+            ::lseek(fd.get(), 0, SEEK_SET) != 0)
             return rejected(InputFdAttachmentStatus::HandoffFailed);
         result.fd = InputFd(fd.release());
     }

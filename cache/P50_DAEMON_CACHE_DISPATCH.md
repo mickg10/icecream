@@ -23,6 +23,12 @@ No cache bytes are read by this adapter, no second listener is created, and
 Login advertisement remains the existing `0/0/0` until a separate reviewed
 READY integration.
 
+After HELLO/HELLO_ACK, dispatch sends an exact version-1 `Data` operation
+envelope identifying `CacheSession`, the bound identity, and request id. Only
+after that frame is accepted does it call `release_fd_if_input_empty()` and
+send SCM_RIGHTS. A failed operation send leaves the ordinary descriptor owned
+by the daemon; it cannot be mistaken for a compiler-input stream.
+
 The HELLO send uses `Connection::send_until()` over one absolute wall-time
 budget for the complete encoded frame, including partial writes.  Its bounded
 ACK receive uses `Connection::receive_until()` with that exact unchanged
