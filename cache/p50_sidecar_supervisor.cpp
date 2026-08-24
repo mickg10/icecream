@@ -6,11 +6,15 @@
 #include <chrono>
 #include <climits>
 #include <cstdint>
+#include <cstddef>
+#include <cstring>
 #include <fcntl.h>
+#include <limits>
 #include <poll.h>
 #if defined(__linux__)
 #include <sys/syscall.h>
 #endif
+#include <signal.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -25,31 +29,65 @@ constexpr char kReadyMessage[] = "READY\n";
 constexpr size_t kReadyMessageSize = sizeof(kReadyMessage) - 1;
 constexpr size_t kMaxReadyBytes = kReadyMessageSize;
 constexpr int kPollSliceMilliseconds = 20;
-constexpr int kMaxFallbackFd = 1 << 20;
+constexpr int kMaxFallbackFd = 8192;
+constexpr size_t kMaxProcFdBytes = 1u << 20;
+constexpr size_t kMaxProcFdReads = 256;
+constexpr int kMaxEintrRetries = 8;
+constexpr uint32_t kExecGroupMarker = 0x50355047u; // "P5PG"
 constexpr int64_t kMaxConfiguredMilliseconds = 7LL * 24 * 60 * 60 * 1000;
+constexpr uint32_t kMaxConfiguredAttempts = 1u << 20;
 
-bool write_errno_record(int fd, int error) noexcept {
-    const auto* bytes = reinterpret_cast<const uint8_t*>(&error);
+bool write_record(int fd, const void* data, size_t size) noexcept {
+    const auto* bytes = static_cast<const uint8_t*>(data);
     size_t written = 0;
-    while (written != sizeof(error)) {
-        const ssize_t result = ::write(fd, bytes + written, sizeof(error) - written);
+    int interrupted = 0;
+    while (written != size) {
+        const ssize_t result = ::write(fd, bytes + written, size - written);
         if (result > 0) {
             written += static_cast<size_t>(result);
+            interrupted = 0;
             continue;
         }
-        if (result < 0 && errno == EINTR)
+        if (result < 0 && errno == EINTR && interrupted++ != kMaxEintrRetries)
             continue;
         return false;
     }
     return true;
 }
 
+bool write_errno_record(int fd, int error) noexcept {
+    return write_record(fd, &error, sizeof(error));
+}
+
+bool write_group_marker(int fd) noexcept {
+    return write_record(fd, &kExecGroupMarker, sizeof(kExecGroupMarker));
+}
+
+template <typename Integer>
+void increment_saturating(Integer& value) noexcept {
+    if (value != std::numeric_limits<Integer>::max())
+        ++value;
+}
+
 bool set_cloexec(int fd, bool enabled) noexcept {
-    const int flags = ::fcntl(fd, F_GETFD);
+    int flags = -1;
+    int interrupted = 0;
+    for (;;) {
+        flags = ::fcntl(fd, F_GETFD);
+        if (flags >= 0 || errno != EINTR || interrupted++ == kMaxEintrRetries)
+            break;
+    }
     if (flags < 0)
         return false;
     const int wanted = enabled ? flags | FD_CLOEXEC : flags & ~FD_CLOEXEC;
-    return wanted == flags || ::fcntl(fd, F_SETFD, wanted) == 0;
+    if (wanted == flags)
+        return true;
+    interrupted = 0;
+    for (;;) {
+        const int result = ::fcntl(fd, F_SETFD, wanted);
+        if (result == 0 || errno != EINTR || interrupted++ == kMaxEintrRetries)
+            return result == 0;
+    }
 }
 
 bool make_pipe(int fds[2]) noexcept {
@@ -71,39 +109,167 @@ bool make_pipe(int fds[2]) noexcept {
 }
 
 bool set_nonblocking(int fd) noexcept {
-    const int flags = ::fcntl(fd, F_GETFL);
-    return flags >= 0 && ((flags & O_NONBLOCK) != 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0);
+    int flags = -1;
+    int interrupted = 0;
+    for (;;) {
+        flags = ::fcntl(fd, F_GETFL);
+        if (flags >= 0 || errno != EINTR || interrupted++ == kMaxEintrRetries)
+            break;
+    }
+    if (flags < 0 || (flags & O_NONBLOCK) != 0)
+        return flags >= 0;
+    interrupted = 0;
+    for (;;) {
+        const int result = ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        if (result == 0 || errno != EINTR || interrupted++ == kMaxEintrRetries)
+            return result == 0;
+    }
 }
 
 int fallback_fd_limit() noexcept {
+    // Linux uses the /proc descriptor directory when close_range is not
+    // available.  Other POSIX targets get a deliberately small bounded scan;
+    // querying OPEN_MAX is only a pre-fork capability check, never a
+    // post-fork readiness scan.  If the target's descriptor ceiling exceeds
+    // that bound, fail closed rather than leak an ambient descriptor.
+#if defined(__linux__) && defined(SYS_openat) && defined(SYS_getdents64) && \
+    defined(O_DIRECTORY) && defined(O_CLOEXEC)
+    return kMaxFallbackFd;
+#else
     const long value = ::sysconf(_SC_OPEN_MAX);
     if (value < 3 || value > kMaxFallbackFd)
         return -1;
     return static_cast<int>(value);
+#endif
 }
 
+#if defined(__linux__) && defined(SYS_openat) && defined(SYS_getdents64) && \
+    defined(O_DIRECTORY) && defined(O_CLOEXEC)
+struct LinuxDirent64 {
+    uint64_t inode;
+    int64_t offset;
+    unsigned short record_length;
+    unsigned char type;
+    char name[1];
+};
+
+bool parse_proc_fd_name(const char* name, size_t size, int* fd) noexcept {
+    if (size == 0 || (name[0] < '0' || name[0] > '9'))
+        return false;
+    int value = 0;
+    for (size_t index = 0; index != size && name[index] != '\0'; ++index) {
+        if (name[index] < '0' || name[index] > '9')
+            return false;
+        const int digit = name[index] - '0';
+        if (value > (std::numeric_limits<int>::max() - digit) / 10)
+            return false;
+        value = value * 10 + digit;
+    }
+    if (value < 3)
+        return false;
+    *fd = value;
+    return true;
+}
+
+bool mark_proc_fds_cloexec() noexcept {
+    const long opened = ::syscall(SYS_openat, AT_FDCWD, "/proc/self/fd",
+                                  O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+    if (opened < 0 || opened > std::numeric_limits<int>::max())
+        return false;
+    int proc_fd = static_cast<int>(opened);
+    std::array<unsigned char, 4096> buffer{};
+    size_t total_bytes = 0;
+    for (size_t read_count = 0; read_count != kMaxProcFdReads; ++read_count) {
+        long count = -1;
+        int interrupted = 0;
+        for (;;) {
+            count = ::syscall(SYS_getdents64, proc_fd, buffer.data(), buffer.size());
+            if (count >= 0 || errno != EINTR || interrupted++ == kMaxEintrRetries)
+                break;
+        }
+        if (count == 0) {
+            int ignored = ::close(proc_fd);
+            (void)ignored;
+            return true;
+        }
+        if (count < 0 || static_cast<size_t>(count) > buffer.size() ||
+            total_bytes > kMaxProcFdBytes - static_cast<size_t>(count)) {
+            int ignored = ::close(proc_fd);
+            (void)ignored;
+            return false;
+        }
+        total_bytes += static_cast<size_t>(count);
+        size_t offset = 0;
+        while (offset != static_cast<size_t>(count)) {
+            constexpr size_t name_offset = offsetof(LinuxDirent64, name);
+            const size_t remaining = static_cast<size_t>(count) - offset;
+            if (remaining < name_offset + 1)
+                goto malformed_directory;
+            unsigned short record_length_value = 0;
+            std::memcpy(&record_length_value, buffer.data() + offset +
+                                                   offsetof(LinuxDirent64, record_length),
+                        sizeof(record_length_value));
+            const size_t record_length = record_length_value;
+            if (record_length < name_offset + 1 || record_length > remaining)
+                goto malformed_directory;
+            const size_t name_bytes = record_length - name_offset;
+            int fd = -1;
+            const char* entry_name = reinterpret_cast<const char*>(buffer.data() + offset +
+                                                                     name_offset);
+            if (parse_proc_fd_name(entry_name, name_bytes, &fd) && !set_cloexec(fd, true)) {
+                if (errno != EBADF)
+                    goto malformed_directory;
+            }
+            offset += record_length;
+        }
+        continue;
+
+    malformed_directory:
+        int ignored = ::close(proc_fd);
+        (void)ignored;
+        return false;
+    }
+    int ignored = ::close(proc_fd);
+    (void)ignored;
+    return false;
+}
+#endif
+
 bool mark_child_fds_cloexec(int fallback_limit) noexcept {
-#if defined(__linux__) && defined(SYS_close_range)
+#if defined(__linux__) && defined(SYS_close_range) && \
+    !defined(ICECC_P50_FORCE_FD_FALLBACK)
     constexpr unsigned int kCloseRangeCloexec = 1u << 2;
     const long result = ::syscall(SYS_close_range, 3u, UINT_MAX, kCloseRangeCloexec);
     if (result == 0)
         return true;
-    if (errno != ENOSYS && errno != EINVAL)
+    if (errno != ENOSYS && errno != EINVAL && errno != EPERM)
         return false;
 #endif
+#if defined(__linux__) && defined(SYS_openat) && defined(SYS_getdents64) && \
+    defined(O_DIRECTORY) && defined(O_CLOEXEC)
+    (void)fallback_limit;
+    return mark_proc_fds_cloexec();
+#else
     if (fallback_limit < 3)
         return false;
     for (int fd = 3; fd < fallback_limit; ++fd) {
-        const int flags = ::fcntl(fd, F_GETFD);
+        int flags = -1;
+        int interrupted = 0;
+        for (;;) {
+            flags = ::fcntl(fd, F_GETFD);
+            if (flags >= 0 || errno != EINTR || interrupted++ == kMaxEintrRetries)
+                break;
+        }
         if (flags < 0) {
             if (errno == EBADF)
                 continue;
             return false;
         }
-        if ((flags & FD_CLOEXEC) == 0 && ::fcntl(fd, F_SETFD, flags | FD_CLOEXEC) < 0)
+        if ((flags & FD_CLOEXEC) == 0 && !set_cloexec(fd, true))
             return false;
     }
     return true;
+#endif
 }
 
 bool command_is_valid(const Config& config) noexcept {
@@ -114,7 +280,9 @@ bool command_is_valid(const Config& config) noexcept {
         config.readiness_timeout.count() > kMaxConfiguredMilliseconds ||
         config.shutdown_timeout.count() > kMaxConfiguredMilliseconds ||
         config.restart_window.count() > kMaxConfiguredMilliseconds ||
-        config.max_attempts_per_recovery == 0)
+        config.max_restarts > kMaxConfiguredAttempts ||
+        config.max_attempts_per_recovery == 0 ||
+        config.max_attempts_per_recovery > kMaxConfiguredAttempts)
         return false;
     for (const std::string& argument : config.arguments) {
         if (argument.find('\0') != std::string::npos)
@@ -126,8 +294,13 @@ bool command_is_valid(const Config& config) noexcept {
 }
 
 void close_if_open(int& fd) noexcept {
-    if (fd >= 0)
-        ::close(fd);
+    if (fd >= 0) {
+        // Do not retry close after EINTR: on Linux the descriptor is already
+        // closed, and retrying could close an unrelated descriptor reused by
+        // another owner.  The caller's ownership is cleared unconditionally.
+        const int ignored = ::close(fd);
+        (void)ignored;
+    }
     fd = -1;
 }
 
@@ -169,11 +342,11 @@ bool Supervisor::valid_config(const Config& config) noexcept {
 void Supervisor::classify(Failure failure) noexcept {
     last_failure_ = failure;
     switch (failure) {
-    case Failure::Exec: ++counters_.exec_failures; break;
-    case Failure::ReadinessTimeout: ++counters_.readiness_timeouts; break;
-    case Failure::PreReadyExit: ++counters_.pre_ready_exits; break;
-    case Failure::InvalidReady: ++counters_.invalid_ready_messages; break;
-    case Failure::PostReadyExit: ++counters_.post_ready_exits; break;
+    case Failure::Exec: increment_saturating(counters_.exec_failures); break;
+    case Failure::ReadinessTimeout: increment_saturating(counters_.readiness_timeouts); break;
+    case Failure::PreReadyExit: increment_saturating(counters_.pre_ready_exits); break;
+    case Failure::InvalidReady: increment_saturating(counters_.invalid_ready_messages); break;
+    case Failure::PostReadyExit: increment_saturating(counters_.post_ready_exits); break;
     default: break;
     }
 }
@@ -203,25 +376,87 @@ void Supervisor::reap_blocking() noexcept {
     child_pid_ = -1;
 }
 
-bool signal_group(pid_t process_group, int signal) noexcept {
-    if (process_group <= 1)
-        return false;
-    for (int attempt = 0; attempt != 4; ++attempt) {
-        if (::kill(-process_group, signal) == 0)
-            return true;
-        if (errno == EINTR)
-            continue;
-        return false;
+enum class SignalResult : uint8_t {
+    Sent,
+    Gone,
+    Failed,
+};
+
+SignalResult signal_target(pid_t target, int signal) noexcept {
+    if (target == 0 || target == std::numeric_limits<pid_t>::min())
+        return SignalResult::Failed;
+    int interrupted = 0;
+    for (;;) {
+        long result = -1;
+#if defined(__linux__) && defined(SYS_kill)
+        // Use the syscall entry point so a libc kill() interposer cannot make
+        // a persistent EINTR look like a successful descendant teardown.
+        result = ::syscall(SYS_kill, target, signal);
+#else
+        result = ::kill(target, signal);
+#endif
+        if (result == 0)
+            return SignalResult::Sent;
+        if (errno == ESRCH)
+            return SignalResult::Gone;
+        if (errno != EINTR || interrupted++ == kMaxEintrRetries)
+            return SignalResult::Failed;
     }
-    return false;
+}
+
+bool signal_established(SignalResult result) noexcept {
+    return result == SignalResult::Sent || result == SignalResult::Gone;
 }
 
 bool group_exists(pid_t process_group) noexcept {
     if (process_group <= 1)
         return false;
-    if (::kill(-process_group, 0) == 0)
+    // Unknown/permission results are treated as alive.  That is conservative:
+    // teardown will try KILL, but will never block-reap solely on an uncertain
+    // group probe.
+    return signal_target(-process_group, 0) != SignalResult::Gone;
+}
+
+bool child_has_exited(pid_t child) noexcept {
+    if (child < 0)
         return true;
-    return errno == EPERM;
+#if defined(WNOWAIT)
+    siginfo_t info{};
+    int interrupted = 0;
+    for (;;) {
+        const int result = ::waitid(P_PID, static_cast<id_t>(child), &info,
+                                    WEXITED | WNOHANG | WNOWAIT);
+        if (result == 0) {
+            if (info.si_pid == child)
+                return true;
+            return false;
+        }
+        if (errno == EINTR && interrupted++ != kMaxEintrRetries)
+            continue;
+        return errno == ECHILD;
+    }
+#else
+    int status = 0;
+    const pid_t result = ::waitpid(child, &status, WNOHANG);
+    return result == child || (result < 0 && errno == ECHILD);
+#endif
+}
+
+bool child_is_in_group(pid_t child, pid_t process_group) noexcept {
+    int interrupted = 0;
+    for (;;) {
+        const pid_t observed = ::getpgid(child);
+        if (observed >= 0)
+            return observed == process_group;
+        // ECHILD/ESRCH can mean another owner reaped the direct child before
+        // teardown.  The exec marker still proves this PGID was ours; retain
+        // the group signal so its helpers are not orphaned.  A reused live PID
+        // is handled by the observed-PGID mismatch above.
+        if (errno == ESRCH)
+            return true;
+        if (errno != EINTR || interrupted++ == kMaxEintrRetries)
+            return false;
+    }
 }
 
 bool Supervisor::wait_for_exit(std::chrono::milliseconds timeout) noexcept {
@@ -229,21 +464,8 @@ bool Supervisor::wait_for_exit(std::chrono::milliseconds timeout) noexcept {
         return true;
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     for (;;) {
-        int status = 0;
-        const pid_t result = ::waitpid(child_pid_, &status, WNOHANG);
-        if (result == child_pid_) {
-            child_pid_ = -1;
+        if (child_has_exited(child_pid_))
             return true;
-        }
-        if (result < 0) {
-            if (errno == EINTR)
-                continue;
-            if (errno == ECHILD) {
-                child_pid_ = -1;
-                return true;
-            }
-            return false;
-        }
         if (std::chrono::steady_clock::now() >= deadline)
             return false;
         const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -255,47 +477,68 @@ bool Supervisor::wait_for_exit(std::chrono::milliseconds timeout) noexcept {
 }
 
 void Supervisor::terminate_group() noexcept {
-    if (child_pid_ < 0 && process_group_ < 0)
-        return;
-    const bool grouped = process_group_ > 1;
-    bool term_sent = grouped ? signal_group(process_group_, SIGTERM) : false;
-    if ((!grouped || !term_sent) && child_pid_ >= 0) {
-        for (int attempt = 0; attempt != 4; ++attempt) {
-            if (::kill(child_pid_, SIGTERM) == 0 || errno == ESRCH) {
-                term_sent = true;
-                break;
-            }
-            if (errno != EINTR)
-                break;
-        }
+    bool grouped = process_group_owned_ && process_group_ > 1;
+    pid_t process_group = grouped ? process_group_ : -1;
+    if (grouped && child_pid_ >= 0 && !child_is_in_group(child_pid_, process_group)) {
+        // A service that moved itself out of the owned group invalidates our
+        // group identity.  Refuse to signal the stale numeric PGID; direct-PID
+        // teardown remains safe and the ownership bit is cleared.
+        grouped = false;
+        process_group = -1;
+        process_group_ = -1;
+        process_group_owned_ = false;
     }
-    const bool direct_exited = child_pid_ < 0 || wait_for_exit(config_.shutdown_timeout);
-    const bool group_alive = grouped && group_exists(process_group_);
-    if (!direct_exited || group_alive) {
-        bool killed = grouped ? signal_group(process_group_, SIGKILL) : false;
-        if (!killed && child_pid_ >= 0) {
-            for (int attempt = 0; attempt != 4; ++attempt) {
-                if (::kill(child_pid_, SIGKILL) == 0 || errno == ESRCH) {
-                    killed = true;
-                    break;
-                }
-                if (errno != EINTR)
-                    break;
-            }
-        }
-        if (killed || !group_alive)
-            ++counters_.forced_kills;
+    if (child_pid_ < 0 && !grouped) {
+        // A PGID without the ownership bit is diagnostic residue only.  Never
+        // signal it: the numeric ID may already belong to an unrelated group.
+        process_group_ = -1;
+        process_group_owned_ = false;
+        return;
+    }
+
+    const SignalResult group_term = grouped ? signal_target(-process_group, SIGTERM)
+                                             : SignalResult::Gone;
+    const SignalResult direct_term = child_pid_ >= 0
+                                         ? signal_target(child_pid_, SIGTERM)
+                                         : SignalResult::Gone;
+    (void)group_term;
+    (void)direct_term;
+
+    // A blocking reap is permitted only after the child has been observed
+    // exited or a signal result established that it cannot remain running.
+    bool direct_exited = child_pid_ < 0;
+    if (!direct_exited)
+        direct_exited = wait_for_exit(config_.shutdown_timeout);
+
+    const bool group_alive = grouped && group_exists(process_group);
+    const bool need_kill = !direct_exited || group_alive;
+    SignalResult group_kill = SignalResult::Gone;
+    SignalResult direct_kill = SignalResult::Gone;
+    if (need_kill) {
+        if (grouped)
+            group_kill = signal_target(-process_group, SIGKILL);
+        // Always signal the direct PID as well.  A child can voluntarily move
+        // itself after launch, and a group-only success must not strand it.
         if (child_pid_ >= 0)
+            direct_kill = signal_target(child_pid_, SIGKILL);
+        const bool kill_established = signal_established(group_kill) ||
+                                      signal_established(direct_kill);
+        if (kill_established)
+            increment_saturating(counters_.forced_kills);
+        if (child_pid_ >= 0 && (signal_established(direct_kill) || direct_exited))
             reap_blocking();
     } else if (child_pid_ >= 0) {
+        // wait_for_exit() observed an exited child without reaping it.  Keep
+        // the group leader's PID alive as a zombie until group teardown has
+        // completed; this closes the PGID-reuse window.
         reap_blocking();
     }
-    if (!term_sent && child_pid_ >= 0) {
-        // A transient signal failure must not leave an owned child behind.
-        (void)::kill(child_pid_, SIGKILL);
-        reap_blocking();
-    }
+
+    // If all signal attempts were interrupted/failed, do not turn an unknown
+    // liveness result into an unbounded wait.  The ownership bit is cleared so
+    // a later launch/destructor cannot accidentally target a reused PGID.
     process_group_ = -1;
+    process_group_owned_ = false;
 }
 
 void Supervisor::terminate_child() noexcept {
@@ -308,12 +551,12 @@ void Supervisor::terminate_child() noexcept {
  * the direct-child reap and becoming an orphan of the daemon.
  */
 void Supervisor::shutdown() noexcept {
-    if (child_pid_ < 0 && process_group_ < 0 && !has_private_fds()) {
+    if (child_pid_ < 0 && !process_group_owned_ && !has_private_fds()) {
         if (state_ != State::DegradedLegacy)
             state_ = State::Stopped;
         return;
     }
-    ++counters_.shutdowns;
+    increment_saturating(counters_.shutdowns);
     state_ = State::Stopping;
     terminate_child();
     close_pipes();
@@ -331,11 +574,20 @@ bool Supervisor::reserve_restart() noexcept {
     if (restart_times_.size() >= config_.max_restarts)
         return false;
     restart_times_.push_back(now);
-    ++counters_.restarts;
+    increment_saturating(counters_.restarts);
     return true;
 }
 
 bool Supervisor::launch_and_wait(bool restart) noexcept {
+    // A failed readiness wait may already have reaped the direct child while
+    // its helpers remain in the owned process group.  Teardown must therefore
+    // precede creation of every retry's pipes and may never overwrite the old
+    // PGID with the new child's PID.
+    if (child_pid_ >= 0 || process_group_owned_)
+        terminate_group();
+    close_pipes();
+    if (!process_group_owned_)
+        process_group_ = -1;
     if (restart && !reserve_restart()) {
         last_failure_ = Failure::RestartExhausted;
         state_ = State::DegradedLegacy;
@@ -402,26 +654,32 @@ bool Supervisor::launch_and_wait(bool restart) noexcept {
         // The ready write end is intentionally the sole inherited supervisor
         // descriptor.  The exec-status write end remains CLOEXEC: EOF means
         // execve succeeded, while a short errno record means it failed.
-        ::close(ready_pipe[0]);
-        ::close(exec_pipe[0]);
+        close_if_open(ready_pipe[0]);
+        close_if_open(exec_pipe[0]);
         if (::setpgid(0, 0) != 0) {
             const int error = errno;
             (void)write_errno_record(exec_pipe[1], error);
             _exit(127);
         }
+        if (!write_group_marker(exec_pipe[1]))
+            _exit(127);
         if (!mark_child_fds_cloexec(ambient_fd_limit)) {
             const int error = errno == 0 ? EMFILE : errno;
             (void)write_errno_record(exec_pipe[1], error);
             _exit(127);
         }
-        (void)set_cloexec(ready_pipe[1], false);
+        if (!set_cloexec(ready_pipe[1], false)) {
+            const int error = errno == 0 ? EBADF : errno;
+            (void)write_errno_record(exec_pipe[1], error);
+            _exit(127);
+        }
         ::execve(config_.executable.c_str(), argv.data(), environment.data());
         const int error = errno;
         (void)write_errno_record(exec_pipe[1], error);
         _exit(127);
     }
-    ::close(ready_pipe[1]);
-    ::close(exec_pipe[1]);
+    close_if_open(ready_pipe[1]);
+    close_if_open(exec_pipe[1]);
     if (pid < 0) {
         close_if_open(ready_pipe[0]);
         close_if_open(exec_pipe[0]);
@@ -431,32 +689,41 @@ bool Supervisor::launch_and_wait(bool restart) noexcept {
 
     // The child sets its own group before exec; this parent-side call closes
     // the fork/exec race on platforms where the child reaches exec quickly.
-    for (int attempt = 0; attempt != 4; ++attempt) {
+    bool parent_group_proven = false;
+    for (int attempt = 0; attempt != kMaxEintrRetries; ++attempt) {
         if (::setpgid(pid, pid) == 0)
+            parent_group_proven = true;
+        if (parent_group_proven)
             break;
         if (errno != EINTR)
-            break; // EACCES means the child already performed setpgid.
+            break;
     }
+    if (!parent_group_proven && errno == EACCES)
+        parent_group_proven = true; // child-side setpgid completed before exec
 
     child_pid_ = pid;
-    process_group_ = pid;
+    process_group_ = parent_group_proven ? pid : -1;
+    process_group_owned_ = parent_group_proven;
     ready_read_ = ready_pipe[0];
     exec_read_ = exec_pipe[0];
-    ++counters_.launches;
+    increment_saturating(counters_.launches);
     state_ = State::Starting;
     if (wait_for_ready())
         return true;
     close_pipes();
-    if (child_pid_ >= 0)
-        terminate_child();
+    terminate_child();
     return false;
 }
 
 bool Supervisor::wait_for_ready() noexcept {
+    const pid_t expected_child = child_pid_;
     std::string ready;
     ready.reserve(kMaxReadyBytes);
-    std::array<uint8_t, sizeof(int)> exec_error{};
-    size_t exec_error_bytes = 0;
+    std::array<uint8_t, sizeof(uint32_t) + sizeof(int)> exec_status{};
+    size_t exec_status_bytes = 0;
+    bool ready_eof = false;
+    bool invalid_ready = false;
+    bool exec_succeeded = false;
     const auto deadline = std::chrono::steady_clock::now() + config_.readiness_timeout;
     while (std::chrono::steady_clock::now() < deadline) {
         struct pollfd fds[2] = {{ready_read_, POLLIN | POLLHUP | POLLERR, 0},
@@ -476,21 +743,37 @@ bool Supervisor::wait_for_ready() noexcept {
             if (fds[1].revents & (POLLIN | POLLHUP | POLLERR)) {
                 for (;;) {
                     const ssize_t bytes = ::read(
-                        exec_read_, exec_error.data() + exec_error_bytes,
-                        exec_error.size() - exec_error_bytes);
+                        exec_read_, exec_status.data() + exec_status_bytes,
+                        exec_status.size() - exec_status_bytes);
                     if (bytes > 0) {
-                        exec_error_bytes += static_cast<size_t>(bytes);
-                        if (exec_error_bytes == exec_error.size()) {
+                        exec_status_bytes += static_cast<size_t>(bytes);
+                        if (exec_status_bytes >= sizeof(uint32_t)) {
+                            uint32_t marker = 0;
+                            std::memcpy(&marker, exec_status.data(), sizeof(marker));
+                            if (marker != kExecGroupMarker) {
+                                classify(Failure::Exec);
+                                return false;
+                            }
+                            if (!process_group_owned_) {
+                                process_group_ = expected_child;
+                                process_group_owned_ = expected_child > 1;
+                            } else if (process_group_ != expected_child) {
+                                classify(Failure::Exec);
+                                return false;
+                            }
+                        }
+                        if (exec_status_bytes == exec_status.size()) {
                             classify(Failure::Exec);
-                            reap_blocking();
                             return false;
                         }
                         continue;
                     }
                     if (bytes == 0) {
-                        if (exec_error_bytes != 0) {
+                        if (exec_status_bytes == sizeof(uint32_t)) {
+                            exec_succeeded = true;
+                            close_if_open(exec_read_);
+                        } else {
                             classify(Failure::Exec);
-                            reap_blocking();
                             return false;
                         }
                     } else if (errno == EINTR) {
@@ -503,62 +786,75 @@ bool Supervisor::wait_for_ready() noexcept {
                 }
             }
             if (fds[0].revents & (POLLIN | POLLHUP | POLLERR)) {
-                char bytes[32]{};
-                const ssize_t count = ::read(ready_read_, bytes, sizeof(bytes));
-                if (count > 0) {
-                    ready.append(bytes, static_cast<size_t>(count));
-                    if (ready.size() > kMaxReadyBytes ||
-                        ready.compare(0, ready.size(), kReadyMessage, ready.size()) != 0) {
-                        classify(Failure::InvalidReady);
+                for (;;) {
+                    char bytes[32]{};
+                    const ssize_t count = ::read(ready_read_, bytes, sizeof(bytes));
+                    if (count > 0) {
+                        ready.append(bytes, static_cast<size_t>(count));
+                        if (ready.size() > kMaxReadyBytes ||
+                            ready.compare(0, ready.size(), kReadyMessage, ready.size()) != 0) {
+                            // Keep draining the exec-status side long enough
+                            // to observe the group proof before cleanup.  A
+                            // malformed READY frame must not erase evidence
+                            // needed to tear down a helper after child reap.
+                            invalid_ready = true;
+                            close_if_open(ready_read_);
+                            break;
+                        }
+                        continue;
+                    }
+                    if (count == 0) {
+                        ready_eof = true;
+                        close_if_open(ready_read_);
+                        if (ready.size() != kReadyMessageSize)
+                            invalid_ready = true;
+                        break;
+                    }
+                    if (errno == EINTR)
+                        continue;
+                    if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                        classify(Failure::PreReadyExit);
                         return false;
                     }
-                } else if (count == 0) {
-                    // READY-FD EOF is not proof that the child exited.  Only
-                    // waitpid may establish that; otherwise return failure so
-                    // launch cleanup performs bounded TERM/KILL/reap.
-                    int status = 0;
-                    const pid_t child_result =
-                        child_pid_ < 0 ? -1 : ::waitpid(child_pid_, &status, WNOHANG);
-                    if (ready.size() == kReadyMessageSize) {
-                        if (child_result == child_pid_ ||
-                            (child_result < 0 && errno == ECHILD))
-                            child_pid_ = -1;
-                        close_if_open(ready_read_);
-                        close_if_open(exec_read_);
-                        state_ = State::Ready;
-                        last_failure_ = Failure::None;
-                        return true;
-                    }
-                    if (child_result == child_pid_ ||
-                        (child_result < 0 && errno == ECHILD)) {
-                        child_pid_ = -1;
-                        classify(Failure::PreReadyExit);
-                    } else {
-                        classify(Failure::InvalidReady);
-                    }
-                    return false;
+                    break;
                 }
             }
         }
-        int status = 0;
-        const pid_t result = ::waitpid(child_pid_, &status, WNOHANG);
-        if (result == child_pid_) {
-            child_pid_ = -1;
-            // The child may have closed READY immediately after writing the
-            // complete message.  Keep reading for the required EOF instead
-            // of misclassifying that valid READY-then-close sequence as a
-            // pre-ready crash.
-            if (ready.size() == kReadyMessageSize)
-                continue;
-            classify(Failure::PreReadyExit);
+
+        if (invalid_ready && process_group_owned_) {
+            classify(Failure::InvalidReady);
             return false;
         }
-        if (result < 0 && errno != EINTR && errno != ECHILD) {
-            classify(Failure::PreReadyExit);
-            return false;
+        if (ready_eof && exec_succeeded) {
+            if (invalid_ready) {
+                classify(Failure::InvalidReady);
+                return false;
+            }
+            close_pipes();
+            state_ = State::Ready;
+            last_failure_ = Failure::None;
+            return true;
+        }
+
+        if (child_pid_ >= 0 && child_has_exited(expected_child)) {
+            // Keep the exited child unreaped until terminate_group() has
+            // signaled its owned PGID.  The zombie PID prevents a reused PGID
+            // from being mistaken for this launch's group.
+            if (invalid_ready)
+                continue;
+            // A child may exit immediately after writing a complete READY
+            // frame.  EOF plus the exec marker remains the deciding proof;
+            // otherwise keep waiting for a possible pipe HUP or classify the
+            // malformed/pre-ready exit below.
+            if (ready.size() != kReadyMessageSize || !ready_eof) {
+                if (!ready_eof)
+                    continue;
+                classify(Failure::PreReadyExit);
+                return false;
+            }
         }
     }
-    classify(Failure::ReadinessTimeout);
+    classify(invalid_ready ? Failure::InvalidReady : Failure::ReadinessTimeout);
     return false;
 }
 
@@ -609,15 +905,8 @@ bool Supervisor::poll() noexcept {
         classify(Failure::PostReadyExit);
         return restart_after_failure();
     }
-    int status = 0;
-    const pid_t result = ::waitpid(child_pid_, &status, WNOHANG);
-    if (result == 0)
+    if (!child_has_exited(child_pid_))
         return true;
-    if (result < 0 && errno == EINTR)
-        return true;
-    if (result < 0 && errno != ECHILD)
-        return false;
-    child_pid_ = -1;
     terminate_group();
     close_pipes();
     classify(Failure::PostReadyExit);

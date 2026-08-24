@@ -16,9 +16,22 @@ grep -F 'std::chrono::steady_clock' "$impl" >/dev/null
 grep -F 'access(config.executable.c_str(), X_OK)' "$impl" >/dev/null
 grep -F 'execve' "$impl" >/dev/null
 grep -F 'write_errno_record' "$impl" >/dev/null
+grep -F 'write_group_marker' "$impl" >/dev/null
 grep -F 'mark_child_fds_cloexec' "$impl" >/dev/null
 grep -F 'close_range' "$impl" >/dev/null
+grep -F 'ICECC_P50_FORCE_FD_FALLBACK' "$impl" >/dev/null
+grep -F 'SYS_getdents64' "$impl" >/dev/null
+grep -F 'SYS_openat' "$impl" >/dev/null
+grep -F 'SYS_kill' "$impl" >/dev/null
+grep -F 'errno != EPERM' "$impl" >/dev/null
+grep -F 'WNOWAIT' "$impl" >/dev/null
+grep -F 'child_has_exited' "$impl" >/dev/null
+grep -F 'getpgid' "$impl" >/dev/null
+grep -F 'move-group' "$src/unittests/p50_sidecar_supervisor_test.cpp" >/dev/null
 grep -F 'setpgid' "$impl" >/dev/null
+grep -F 'process_group_owned_' "$impl" "$header" >/dev/null
+grep -F 'process_group_ = -1' "$impl" >/dev/null
+grep -F 'increment_saturating' "$impl" >/dev/null
 grep -F 'max_attempts_per_recovery' "$impl" "$header" >/dev/null
 
 # The component must remain detached from advertisement and daemon ownership.
@@ -31,10 +44,10 @@ mutant=$(mktemp "${TMPDIR:-/tmp}/p50sidecarsupervisor-mutant.XXXXXX")
 mutant_fds=$(mktemp "${TMPDIR:-/tmp}/p50sidecarsupervisor-fd-mutant.XXXXXX")
 mutant_ready=$(mktemp "${TMPDIR:-/tmp}/p50sidecarsupervisor-ready-mutant.XXXXXX")
 trap 'rm -f "$mutant" "$mutant_fds" "$mutant_ready"' EXIT HUP INT TERM
-sed 's/const bool group_alive = grouped && group_exists(process_group_);/const bool group_alive = false;/' \
+sed 's/bool grouped = process_group_owned_ && process_group_ > 1;/bool grouped = false;/' \
     "$impl" >"$mutant"
-if grep -F 'group_exists(process_group_)' "$mutant" >/dev/null; then
-    echo 'FAIL: process-group shutdown deletion mutant was accepted' >&2
+if grep -F 'process_group_owned_ && process_group_ > 1' "$mutant" >/dev/null; then
+    echo 'FAIL: process-group ownership guard mutant was not formed' >&2
     exit 1
 fi
 sed 's/if (!mark_child_fds_cloexec(ambient_fd_limit))/if (true)/' "$impl" >"$mutant_fds"
@@ -42,8 +55,8 @@ if grep -F 'if (!mark_child_fds_cloexec(ambient_fd_limit))' "$mutant_fds" >/dev/
     echo 'FAIL: ambient-FD deletion mutant was not formed' >&2
     exit 1
 fi
-sed 's/if (ready.size() == kReadyMessageSize)/if (false)/' "$impl" >"$mutant_ready"
-if grep -F 'if (ready.size() == kReadyMessageSize)' "$mutant_ready" >/dev/null; then
+sed 's/ready.size() != kReadyMessageSize/false/g' "$impl" >"$mutant_ready"
+if grep -F 'ready.size() != kReadyMessageSize' "$mutant_ready" >/dev/null; then
     echo 'FAIL: exact-READY deletion mutant was not formed' >&2
     exit 1
 fi

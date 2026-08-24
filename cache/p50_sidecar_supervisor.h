@@ -104,6 +104,12 @@ public:
     [[nodiscard]] Failure last_failure() const noexcept { return last_failure_; }
     [[nodiscard]] const Counters& counters() const noexcept { return counters_; }
     [[nodiscard]] pid_t child_pid() const noexcept { return child_pid_; }
+    // A nonnegative value is exposed only while this instance still owns the
+    // corresponding process group.  In particular, a reaped child never
+    // leaves a stale PGID observable to a later launch or destructor call.
+    [[nodiscard]] pid_t process_group_id() const noexcept {
+        return process_group_owned_ ? process_group_ : -1;
+    }
     [[nodiscard]] bool has_private_fds() const noexcept;
 
 private:
@@ -124,6 +130,7 @@ private:
     Counters counters_{};
     pid_t child_pid_ = -1;
     pid_t process_group_ = -1;
+    bool process_group_owned_ = false;
     int ready_read_ = -1;
     int exec_read_ = -1;
     std::vector<std::chrono::steady_clock::time_point> restart_times_;
