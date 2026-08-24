@@ -37,6 +37,14 @@ Socket paths must be absolute, contain no embedded NUL, and reside in a
 directory owned by the effective user with exact mode `0700`.  The listener
 never replaces an existing node; its socket node is owned by the effective
 user with exact mode `0600`, which clients also verify before connecting.
+After a successful `bind`, any later setup failure returns
+`ListenerNodeLeftForCleanup` and leaves the node untouched.  Cleanup must be
+performed by the supervisor using its already-validated private runtime
+directory, never by a pathname unlink in this helper.  The test-only
+`ICECC_TEST_LOCAL_TRANSPORT_FAIL_AFTER_BIND=1` hook exercises this retained
+node result deterministically; its companion
+`ICECC_TEST_LOCAL_TRANSPORT_BIND_GATE` allows the test to replace the pathname
+between `bind` and failure without introducing a production race window.
 
 On Linux, peer verification uses `SO_PEERCRED`.  The provider argument is a
 test/integration seam; absent a provider, unsupported or failed OS credential

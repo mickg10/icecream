@@ -4,6 +4,7 @@
 #include <array>
 #include <cerrno>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <mutex>
 #include <fcntl.h>
@@ -193,6 +194,18 @@ bool private_socket_node(const std::string& path) {
     return info.st_uid == ::geteuid() && (info.st_mode & 07777) == 0600;
 }
 
+bool test_force_post_bind_failure() noexcept {
+    const char* value = std::getenv("ICECC_TEST_LOCAL_TRANSPORT_FAIL_AFTER_BIND");
+    if (value == nullptr || std::strcmp(value, "1") != 0)
+        return false;
+    const char* gate = std::getenv("ICECC_TEST_LOCAL_TRANSPORT_BIND_GATE");
+    if (gate != nullptr) {
+        while (::access(gate, F_OK) != 0)
+            ::usleep(1000);
+    }
+    return true;
+}
+
 Status validate_header(const uint8_t* header, size_t size, uint32_t* payload_length) {
     if (size < kFrameHeaderSize)
         return Status::Truncated;
@@ -218,6 +231,7 @@ const char* status_name(Status status) noexcept {
     case Status::InvalidArgument: return "invalid-argument";
     case Status::InvalidPath: return "invalid-path";
     case Status::IoError: return "io-error";
+    case Status::ListenerNodeLeftForCleanup: return "listener-node-left-for-cleanup";
     case Status::CleanEof: return "clean-eof";
     case Status::Truncated: return "truncated";
     case Status::Malformed: return "malformed";
@@ -465,10 +479,13 @@ int listen_unix(const std::string& path, int backlog, Status* status) noexcept {
     // bind(2) creates the node using the process umask.  Establish and verify
     // the exact private node mode before exposing the listener.
     if (::chmod(path.c_str(), S_IRUSR | S_IWUSR) != 0 || !private_socket_node(path) ||
-        ::listen(fd, backlog) != 0) {
+        ::listen(fd, backlog) != 0 || test_force_post_bind_failure()) {
         ::close(fd);
-        ::unlink(path.c_str());
-        set_status(Status::IoError, status);
+        // bind succeeded, so the pathname may still designate a live node (or
+        // may have been replaced by its same-UID owner).  Never unlink by
+        // pathname here: the supervisor's identity-safe directory cleanup
+        // owns removal of failed nodes.
+        set_status(Status::ListenerNodeLeftForCleanup, status);
         return -1;
     }
     set_status(Status::Ok, status);

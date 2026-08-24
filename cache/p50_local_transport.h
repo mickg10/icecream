@@ -56,6 +56,7 @@ enum class Status {
     InvalidArgument,
     InvalidPath,
     IoError,
+    ListenerNodeLeftForCleanup,
     CleanEof,
     Truncated,
     Malformed,
@@ -155,8 +156,9 @@ Status verify_peer_credentials(int fd, const CredentialExpectation& expected,
                                const PeerCredentialProvider& provider = {});
 
 // Portable AF_UNIX/SOCK_STREAM setup helpers.  They never unlink an existing
-// path; callers must use a private runtime directory and remove their socket
-// path during supervisor shutdown.
+// path or a node after bind.  If bind succeeds but chmod, node validation, or
+// listen fails, listen_unix returns ListenerNodeLeftForCleanup and leaves the
+// node for identity-safe private-directory cleanup by its owner.
 int listen_unix(const std::string& path, int backlog, Status* status = nullptr) noexcept;
 Connection connect_unix(const std::string& path, Status* status = nullptr) noexcept;
 Connection accept_unix(int listener_fd, Status* status = nullptr) noexcept;

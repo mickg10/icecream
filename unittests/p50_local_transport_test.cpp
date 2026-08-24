@@ -266,6 +266,61 @@ void unix_setup() {
     ::close(second_listener);
     ::unlink(second_path.c_str());
     CHECK(::rmdir(second_directory) == 0);
+
+    char retained_directory[] = "/tmp/icecc-p50-local-transport-XXXXXX";
+    CHECK(::mkdtemp(retained_directory) != nullptr);
+    const std::string retained_path = std::string(retained_directory) + "/endpoint";
+    const std::string bind_gate = std::string(retained_directory) + "/release";
+    CHECK(::setenv("ICECC_TEST_LOCAL_TRANSPORT_FAIL_AFTER_BIND", "1", 1) == 0);
+    CHECK(::setenv("ICECC_TEST_LOCAL_TRANSPORT_BIND_GATE", bind_gate.c_str(), 1) == 0);
+    int retained_listener = -1;
+    Status retained_status = Status::InvalidArgument;
+    std::thread retained_thread([&] {
+        retained_listener = listen_unix(retained_path, 1, &retained_status);
+    });
+    bool bound_before_failure = false;
+    for (int attempt = 0; attempt != 5000; ++attempt) {
+        if (::lstat(retained_path.c_str(), &socket_info) == 0 &&
+            S_ISSOCK(socket_info.st_mode)) {
+            bound_before_failure = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (!bound_before_failure) {
+        const int gate_fd = ::open(bind_gate.c_str(), O_CREAT | O_EXCL | O_WRONLY,
+                                   S_IRUSR | S_IWUSR);
+        CHECK(gate_fd >= 0);
+        ::close(gate_fd);
+        retained_thread.join();
+        CHECK(::unsetenv("ICECC_TEST_LOCAL_TRANSPORT_FAIL_AFTER_BIND") == 0);
+        CHECK(::unsetenv("ICECC_TEST_LOCAL_TRANSPORT_BIND_GATE") == 0);
+        CHECK(false);
+    }
+
+    // Replace the pathname while listen_unix is held after bind.  The failed
+    // setup must not unlink this same-UID replacement.
+    const std::string replacement_path = retained_path + ".replacement";
+    CHECK(::rename(retained_path.c_str(), replacement_path.c_str()) == 0);
+    const int replacement_fd = ::open(retained_path.c_str(), O_CREAT | O_EXCL | O_WRONLY,
+                                      S_IRUSR | S_IWUSR);
+    CHECK(replacement_fd >= 0);
+    ::close(replacement_fd);
+    const int gate_fd = ::open(bind_gate.c_str(), O_CREAT | O_EXCL | O_WRONLY,
+                               S_IRUSR | S_IWUSR);
+    CHECK(gate_fd >= 0);
+    ::close(gate_fd);
+    retained_thread.join();
+    CHECK(::unsetenv("ICECC_TEST_LOCAL_TRANSPORT_FAIL_AFTER_BIND") == 0);
+    CHECK(::unsetenv("ICECC_TEST_LOCAL_TRANSPORT_BIND_GATE") == 0);
+    CHECK(retained_listener < 0);
+    CHECK(retained_status == Status::ListenerNodeLeftForCleanup);
+    CHECK(::lstat(retained_path.c_str(), &socket_info) == 0);
+    CHECK(S_ISREG(socket_info.st_mode));
+    ::unlink(retained_path.c_str());
+    ::unlink(replacement_path.c_str());
+    ::unlink(bind_gate.c_str());
+    CHECK(::rmdir(retained_directory) == 0);
 }
 
 } // namespace
