@@ -5477,24 +5477,20 @@ int Daemon::scheduler_use_cs(UseCSMsg *msg)
     }
 
     /* S2: validate and retain the assignment-bound cache-endpoint handoff
-       BEFORE either branch below constructs its own relay UseCS.  A present
-       tail is trusted only when BOTH the tail itself is fully valid (never
-       merely non-empty -- see cache_advertisement_is_valid_present) AND it
-       is bound to the exact nonzero P50 assignment identity this dispatch
-       will claim with (msg->hasAssignmentIdentity()); msg->valid_payload()
-       already enforced the tail's own absent-or-present law on receipt (see
-       MsgChannel::get_msg), so this re-checks it explicitly rather than
-       trusting that channel-layer gate implicitly.  Every field is bound
-       from this SAME msg, including the wire id/epoch/nonce, so a later
-       consumer can refuse to reuse this endpoint under a different
-       assignment.  No connection is made here (see M3, out of scope for
-       this change): this only stores the endpoint alongside the job for a
-       later milestone to consume. */
+       BEFORE either branch below constructs its own relay UseCS.  The
+       admissibility check itself (usecs_cache_handoff_admissible,
+       services/comm.h) is factored out as a pure, independently testable
+       helper -- see its own comment for why: msg->valid_payload() already
+       enforced the tail's own absent-or-present AND identity-binding law
+       on receipt (see MsgChannel::get_msg), so this re-checks it
+       explicitly rather than trusting that channel-layer gate implicitly.
+       Every field is bound from this SAME msg, including the wire id/
+       epoch/nonce, so a later consumer can refuse to reuse this endpoint
+       under a different assignment.  No connection is made here (see M3,
+       out of scope for this change): this only stores the endpoint
+       alongside the job for a later milestone to consume. */
     c->cacheHandoff = Client::CacheHandoff{};
-    if (msg->hasCacheAdvertisement() && msg->hasAssignmentIdentity()
-            && cache_advertisement_is_valid_present(
-                   msg->cache_endpoint_port, msg->cache_protocol,
-                   msg->cache_profile_mask)) {
+    if (usecs_cache_handoff_admissible(*msg)) {
         c->cacheHandoff = Client::CacheHandoff{
             true, msg->job_id, msg->assignmentEpoch(), msg->assignmentNonce(),
             msg->hostname, msg->port,

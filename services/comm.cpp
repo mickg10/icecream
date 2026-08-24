@@ -2303,31 +2303,29 @@ void UseCSMsg::fill_from_channel(MsgChannel *c)
         assignment_nonce_hi = assignment_nonce_lo = 0;
     }
     if (IS_PROTOCOL_VERSION(PROTOCOL_VERSION_CACHE_ADVERTISEMENT, c)) {
-        /* Rolling-upgrade tri-state (BigOracle steer): protocol 50 already
-           carries the four assignment-identity words above, from an EARLIER
-           P50 feature.  A peer built before this cache-handoff tail existed
-           sends nothing more at protocol 50 -- that is a complete, correctly
-           framed message, not a short one, and must decode as canonical
-           absence.  Only a frame that started the tail and was cut off
-           partway (1..11 remaining bytes) is malformed.  >=12 remaining
-           bytes reads exactly the three words (any bytes past that are left
-           for a future field, forward-compatibly). */
+        /* Owner ruling (d23d9c5d HOLD, superseding the earlier rolling-
+           upgrade framing -- see PROTOCOL_VERSION_CACHE_ADVERTISEMENT's own
+           comment): protocol 50 is an in-development draft with no deployed
+           base and no intra-50 compatibility obligation, so this tail is
+           MANDATORY, not rolling -- exactly three words or the frame is
+           malformed, matching LoginMsg's existing strict shape for the
+           identical tail.  Absence is VALUE-encoded (0/0/0) only, never by
+           omitting the tail; that is the one canonical representation the
+           valid_payload absent-or-present law below enforces.  A frame
+           declaring more than three words here is equally malformed --
+           MsgChannel's own exact-consumption check independently rejects
+           it, since nothing past the three words is ever read. */
         const size_t remaining = c->current_message_bytes_remaining();
-        if (remaining == 0) {
-            cache_endpoint_port = 0;
-            cache_protocol = 0;
-            cache_profile_mask = 0;
-        } else if (remaining < 3 * sizeof(uint32_t)) {
+        if (remaining != 3 * sizeof(uint32_t)) {
             cache_endpoint_port = 0;
             cache_protocol = 0;
             cache_profile_mask = 0;
             cache_tail_valid = false;
             return;
-        } else {
-            *c >> cache_endpoint_port;
-            *c >> cache_protocol;
-            *c >> cache_profile_mask;
         }
+        *c >> cache_endpoint_port;
+        *c >> cache_protocol;
+        *c >> cache_profile_mask;
     } else {
         cache_endpoint_port = 0;
         cache_protocol = 0;
@@ -2363,17 +2361,29 @@ void UseCSMsg::send_to_channel(MsgChannel *c) const
 
 bool UseCSMsg::valid_payload() const
 {
+    /* BigOracle's absent-or-present law for the assignment-bound S->C
+       cache-handoff tail (d23d9c5d HOLD): (a) a wholly-absent cache triple
+       is allowed under either a legacy-absent or a complete assignment
+       identity -- the pre-existing assignment law alone governs that case;
+       (b) a valid-PRESENT cache triple additionally REQUIRES a complete,
+       nonzero assignment identity {job_id, epoch, nonce} -- the handoff is
+       always bound to a specific, provable assignment, never floating
+       free of one; (c) any partial identity, any partial/malformed cache
+       triple, or a present triple with an absent identity is rejected at
+       both encode and decode (this function gates UseCSMsg::send_msg on
+       the way out and MsgChannel::get_msg on the way in). */
     const bool epoch_present = assignmentEpoch() != 0;
     const bool nonce_present = assignmentNonce() != 0;
-    const bool assignment_ok = (!epoch_present && !nonce_present)
-        || (epoch_present && nonce_present && job_id != 0);
-    if (!assignment_ok || !cache_tail_valid) {
-        return false;
-    }
-    return cache_advertisement_is_wholly_absent(cache_endpoint_port, cache_protocol,
-                                                cache_profile_mask)
-        || cache_advertisement_is_valid_present(cache_endpoint_port, cache_protocol,
-                                                cache_profile_mask);
+    const bool assignment_absent = !epoch_present && !nonce_present;
+    const bool assignment_complete = job_id != 0 && epoch_present && nonce_present;
+    const bool cache_absent = cache_advertisement_is_wholly_absent(
+        cache_endpoint_port, cache_protocol, cache_profile_mask);
+    const bool cache_present = cache_advertisement_is_valid_present(
+        cache_endpoint_port, cache_protocol, cache_profile_mask);
+    return cache_tail_valid
+        && (assignment_absent || assignment_complete)
+        && (cache_absent || cache_present)
+        && (!cache_present || assignment_complete);
 }
 
 bool UseCSMsg::applyAssignmentTo(CompileJob *job) const

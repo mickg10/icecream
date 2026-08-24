@@ -37,17 +37,18 @@ require_count 1 'current_message_end = intogo_old + inmsglen' \
     services/comm.cpp 'decoder records the current frame boundary'
 require_count 1 'if (c->current_message_bytes_remaining() < 3 * sizeof(uint32_t)) {' \
     services/comm.cpp 'Login refuses a shortened three-word tail'
-# UseCS's decode is a tri-state, not Login's binary short-tail check (BigOracle
-# steer: protocol 50 already carries an earlier feature's four-word identity
-# tail, so a peer built before this cache-handoff tail existed sends nothing
-# more at protocol 50 -- exactly zero remaining bytes -- which must decode as
-# canonical absence, not be refused as short).
+# UseCS's decode is now mandatory and exact, matching Login's own binary
+# short-tail check in shape (owner ruling on the d23d9c5d HOLD: protocol 50
+# is an in-development draft with no deployed base and no intra-50
+# compatibility obligation, so the earlier rolling-upgrade tri-state --
+# BigOracle's original steer, treating a wholly-omitted tail as absence for
+# a hypothetical pre-cache-handoff peer -- is superseded).  Absence is
+# value-encoded (0/0/0) only; a wholly-omitted, partial, or over-length
+# tail is refused identically to a malformed one.
 require_count 1 'const size_t remaining = c->current_message_bytes_remaining();' \
-    services/comm.cpp 'UseCS decode captures the remaining-bytes tri-state input'
-require_count 1 'if (remaining == 0) {' services/comm.cpp \
-    'UseCS decode treats a frozen pre-handoff (zero remaining bytes) frame as absence'
-require_count 1 '} else if (remaining < 3 * sizeof(uint32_t)) {' services/comm.cpp \
-    'UseCS decode refuses only a genuinely short (1..11 byte) tail'
+    services/comm.cpp 'UseCS decode captures the remaining-bytes mandatory-tail input'
+require_count 1 'if (remaining != 3 * sizeof(uint32_t)) {' services/comm.cpp \
+    'UseCS decode requires exactly the three-word tail, matching Login'
 require_count 1 'const bool absent = cache_endpoint_port == 0' \
     services/comm.cpp 'Login payload has a canonical whole-absence branch'
 require_count 1 '&& (cache_profile_mask & ~CACHE_ADVERTISABLE_PROFILE_MASK) == 0' \
@@ -113,6 +114,17 @@ require_count 1 'const uint32_t relay_cache_port = c->cacheHandoff.valid' \
     daemon/main.cpp 'the relay cache triple has exactly one validated source'
 require_count 2 'relay_cache_mask);' daemon/main.cpp \
     'both scheduler_use_cs relay projections consume that same source'
+
+# BigOracle (d23d9c5d HOLD): the daemon's defensive re-check is factored
+# into a small, pure, independently testable helper -- see its own comment
+# in services/comm.h for why (UseCSMsg::valid_payload's identity-binding
+# law means no live wire path can hand scheduler_use_cs the one input this
+# helper exists to catch, so it is unit-tested directly with a hand-
+# constructed object instead).
+require_count 1 'inline bool usecs_cache_handoff_admissible' services/comm.h \
+    'the daemon defensive re-check is a pure, independently testable helper'
+require_count 1 'if (usecs_cache_handoff_admissible(*msg)) {' daemon/main.cpp \
+    'scheduler_use_cs retains the cache handoff only via that helper'
 
 require_absent \
     'cache_endpoint_port|cacheProtocol\(|cacheProfileMask|CACHE_PROFILE_Z3_(LONG|SHARED_LONG)' \
