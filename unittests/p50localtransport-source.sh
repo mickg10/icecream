@@ -50,15 +50,64 @@ if bounded_reader_source "$receive_mutant"; then
 fi
 echo 'ok - bounded reader deletion/bypass mutant is rejected'
 
-# A bounded operation must use per-call MSG_DONTWAIT and never toggle the
-# shared open-file-description status flags.  The local transport and FD
-# handoff both use the one shared absolute-deadline poll helper in the public
-# transport header; keep its terminal checks explicit so a
-# POLLERR/POLLHUP/POLLNVAL deletion mutant is visible in review.
-if grep -F 'F_SETFL' "$transport" >/dev/null; then
-    echo 'FAIL: bounded transport mutates shared O_NONBLOCK state' >&2
+connector_body() {
+    sed -n '/^Connection connect_unix_until/,/^Connection accept_unix/p' "$1"
+}
+
+bounded_connector_source() {
+    body=$(connector_body "$1")
+    printf '%s\n' "$body" | grep -F 'connect_error == EINPROGRESS' >/dev/null &&
+        printf '%s\n' "$body" | grep -F 'detail::wait_for_io(fd, POLLOUT, deadline)' >/dev/null &&
+        printf '%s\n' "$body" | grep -F 'getsockopt(fd, SOL_SOCKET, SO_ERROR' >/dev/null &&
+        printf '%s\n' "$body" | grep -F 'original_flags & ~O_NONBLOCK' >/dev/null &&
+        printf '%s\n' "$body" | grep -F 'std::chrono::steady_clock::now() >= deadline' >/dev/null
+}
+
+if ! bounded_connector_source "$transport"; then
+    echo 'FAIL: bounded AF_UNIX connector is missing a required guard' >&2
     exit 1
 fi
+echo 'ok - bounded AF_UNIX connector has deadline, wait, SO_ERROR, and restore guards'
+
+connector_mutant=$(mktemp "${TMPDIR:-/tmp}/p50localtransport-connect-mutant.XXXXXX")
+trap 'rm -f "$send_mutant" "$receive_mutant" "$connector_mutant"' EXIT HUP INT TERM
+sed 's/detail::wait_for_io(fd, POLLOUT, deadline)/detail::wait_for_io(fd, POLLIN, deadline)/' \
+    "$transport" >"$connector_mutant"
+if bounded_connector_source "$connector_mutant"; then
+    echo 'FAIL: connector readiness deletion mutant was accepted' >&2
+    exit 1
+fi
+echo 'ok - connector readiness deletion mutant is rejected'
+
+sed '/getsockopt(fd, SOL_SOCKET, SO_ERROR/d' "$transport" >"$connector_mutant"
+if bounded_connector_source "$connector_mutant"; then
+    echo 'FAIL: connector SO_ERROR deletion mutant was accepted' >&2
+    exit 1
+fi
+echo 'ok - connector SO_ERROR deletion mutant is rejected'
+
+sed '/::fcntl(fd, F_SETFL, original_flags & ~O_NONBLOCK)/d' "$transport" >"$connector_mutant"
+if bounded_connector_source "$connector_mutant"; then
+    echo 'FAIL: connector blocking-restore deletion mutant was accepted' >&2
+    exit 1
+fi
+echo 'ok - connector blocking-restore deletion mutant is rejected'
+
+sed 's/std::chrono::steady_clock::now() >= deadline/false/g' "$transport" >"$connector_mutant"
+if bounded_connector_source "$connector_mutant"; then
+    echo 'FAIL: connector deadline deletion mutant was accepted' >&2
+    exit 1
+fi
+echo 'ok - connector deadline deletion mutant is rejected'
+
+# A bounded read/write operation must use per-call MSG_DONTWAIT and never
+# toggle the shared open-file-description status flags.  The connector above
+# is the sole exception: it owns a newly-created descriptor until return and
+# explicitly restores that descriptor before handing it to Connection.  The
+# local transport and FD handoff both use the one shared absolute-deadline poll
+# helper in the public transport header; keep its terminal checks explicit so
+# a POLLERR/POLLHUP/POLLNVAL deletion mutant is visible in review.
+grep -F 'MSG_DONTWAIT' "$transport" >/dev/null
 grep -F 'detail::wait_for_io' "$transport" >/dev/null
 grep -F 'DeadlinePollResult' "$poll_helper" >/dev/null
 grep -F '(POLLERR | POLLHUP | POLLNVAL)' "$poll_helper" >/dev/null

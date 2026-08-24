@@ -85,6 +85,42 @@ bool saturate_socket(int fd, size_t* bytes_filled = nullptr) {
     return saturated && restored;
 }
 
+int raw_nonblocking_unix_client(const std::string& path) {
+    const int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0)
+        return -1;
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    std::memcpy(address.sun_path, path.data(), path.size());
+    address.sun_path[path.size()] = '\0';
+    const socklen_t address_length =
+        static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + path.size() + 1);
+    if (::connect(fd, reinterpret_cast<const sockaddr*>(&address), address_length) == 0 ||
+        errno == EINPROGRESS)
+        return fd;
+    ::close(fd);
+    return -1;
+}
+
+bool fill_unix_listener_queue(const std::string& path, std::vector<int>& clients) {
+    for (int attempt = 0; attempt != 64; ++attempt) {
+        const int fd = raw_nonblocking_unix_client(path);
+        if (fd < 0)
+            return !clients.empty();
+        int socket_error = 0;
+        socklen_t socket_error_length = sizeof(socket_error);
+        CHECK(::getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error,
+                           &socket_error_length) == 0);
+        if (socket_error == 0) {
+            clients.push_back(fd);
+            continue;
+        }
+        ::close(fd);
+        return !clients.empty();
+    }
+    return !clients.empty();
+}
+
 std::array<uint8_t, kFrameHeaderSize> oversize_header() {
     std::array<uint8_t, kFrameHeaderSize> oversize{};
     oversize[0] = 'P';
@@ -455,6 +491,116 @@ void credentials() {
     ::close(sockets[1]);
 }
 
+void bounded_unix_connect() {
+    char directory[] = "/tmp/icecc-p50-local-connect-XXXXXX";
+    CHECK(::mkdtemp(directory) != nullptr);
+    const std::string path = std::string(directory) + "/endpoint";
+    Status status = Status::InvalidArgument;
+    const int listener = listen_unix(path, 1, &status);
+    CHECK(listener >= 0 && status == Status::Ok);
+
+    // A free listener completes immediately, while retaining the compatibility
+    // API's blocking descriptor contract.
+    Connection immediate = connect_unix_until(
+        path, std::chrono::steady_clock::now() + std::chrono::seconds(1), &status);
+    CHECK(immediate.valid() && status == Status::Ok);
+    CHECK((::fcntl(immediate.native_handle(), F_GETFL) & O_NONBLOCK) == 0);
+    CHECK((::fcntl(immediate.native_handle(), F_GETFD) & FD_CLOEXEC) != 0);
+    int accepted = ::accept(listener, nullptr, nullptr);
+    CHECK(accepted >= 0);
+    ::close(accepted);
+
+    // The same private parent/node checks apply before a deadline is used.
+    CHECK(!connect_unix_until("relative-endpoint",
+                              std::chrono::steady_clock::now() + std::chrono::seconds(1),
+                              &status)
+               .valid());
+    CHECK(status == Status::InvalidPath);
+    CHECK(!connect_unix_until(std::string(kMaxUnixPath + 1, 'x'),
+                              std::chrono::steady_clock::now() + std::chrono::seconds(1),
+                              &status)
+               .valid());
+    CHECK(status == Status::InvalidPath);
+    CHECK(!connect_unix_until(path + ".missing",
+                              std::chrono::steady_clock::now() + std::chrono::seconds(1),
+                              &status)
+               .valid());
+    CHECK(status == Status::InvalidPath);
+    CHECK(::chmod(path.c_str(), S_IRUSR | S_IWUSR | S_IRGRP) == 0);
+    CHECK(!connect_unix_until(path,
+                              std::chrono::steady_clock::now() + std::chrono::seconds(1),
+                              &status)
+               .valid());
+    CHECK(status == Status::InvalidPath);
+    CHECK(::chmod(path.c_str(), S_IRUSR | S_IWUSR) == 0);
+    CHECK(!connect_unix_until(path, std::chrono::steady_clock::now(), &status).valid());
+    CHECK(status == Status::Timeout);
+
+    std::vector<int> queued_clients;
+    CHECK(fill_unix_listener_queue(path, queued_clients));
+    const auto pending_start = std::chrono::steady_clock::now();
+    std::thread release_one([listener] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        const int accepted_fd = ::accept(listener, nullptr, nullptr);
+        if (accepted_fd >= 0) {
+            // Keep the peer alive while the pending client observes writable
+            // readiness; closing it immediately would intentionally produce
+            // POLLHUP and exercise the error path instead.
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            ::close(accepted_fd);
+        }
+    });
+    Connection pending = connect_unix_until(
+        path, pending_start + std::chrono::milliseconds(700), &status);
+    release_one.join();
+    // Linux reports a saturated AF_UNIX queue as EAGAIN (rather than
+    // EINPROGRESS); it is a connect error under this strict API and must fail
+    // closed without falling back to a blocking connect.
+    CHECK(!pending.valid() && status == Status::IoError);
+    accepted = ::accept(listener, nullptr, nullptr);
+    CHECK(accepted >= 0);
+    ::close(accepted);
+
+    // Once capacity is available, the same absolute API succeeds and still
+    // returns a blocking, CLOEXEC descriptor.
+    for (int fd : queued_clients)
+        ::close(fd);
+    queued_clients.clear();
+    Connection after_pending = connect_unix_until(
+        path, std::chrono::steady_clock::now() + std::chrono::seconds(1), &status);
+    CHECK(after_pending.valid() && status == Status::Ok);
+    CHECK((::fcntl(after_pending.native_handle(), F_GETFL) & O_NONBLOCK) == 0);
+    CHECK((::fcntl(after_pending.native_handle(), F_GETFD) & FD_CLOEXEC) != 0);
+    accepted = ::accept(listener, nullptr, nullptr);
+    CHECK(accepted >= 0);
+    ::close(accepted);
+
+    // Keep the listener genuinely backlogged: the bounded operation must
+    // return at its one absolute deadline rather than blocking in connect(2).
+    CHECK(fill_unix_listener_queue(path, queued_clients));
+    const auto saturated_start = std::chrono::steady_clock::now();
+    Connection saturated = connect_unix_until(
+        path, saturated_start + std::chrono::milliseconds(100), &status);
+    const auto saturated_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - saturated_start).count();
+    CHECK(!saturated.valid());
+    CHECK(status == Status::IoError || status == Status::Timeout);
+    CHECK(saturated_elapsed < 700);
+
+    // Closing a listener leaves its private node in place; a refused connect
+    // is an error, never a falsely successful Connection.
+    ::close(listener);
+    CHECK(!connect_unix_until(path,
+                              std::chrono::steady_clock::now() + std::chrono::seconds(1),
+                              &status)
+               .valid());
+    CHECK(status == Status::IoError);
+    for (int fd : queued_clients)
+        ::close(fd);
+    ::unlink(path.c_str());
+    CHECK(::rmdir(directory) == 0);
+}
+
 void unix_setup() {
     char directory[] = "/tmp/icecc-p50-local-transport-XXXXXX";
     CHECK(::mkdtemp(directory) != nullptr);
@@ -556,6 +702,7 @@ int main() {
         handshake_identity();
         truncated_read();
         credentials();
+        bounded_unix_connect();
         unix_setup();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "p50localtransport: %s\n", error.what());

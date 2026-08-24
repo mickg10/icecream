@@ -43,6 +43,16 @@ description; platforms without that primitive fail closed.  Poll error and
 hangup bits are checked before requested input or output readiness, and
 SIGPIPE protection remains the same as the ordinary writer.
 
+`connect_unix_until(path, deadline, status)` is the bounded AF_UNIX client
+precursor.  It applies the same private-parent and exact-private-node checks as
+`connect_unix()`, creates a CLOEXEC socket, and performs the connect with
+`O_NONBLOCK` on that new descriptor only.  An `EINPROGRESS` result waits through
+the shared absolute-deadline poll helper, then checks `SO_ERROR`; terminal poll
+bits, connection errors, fcntl failures, and deadline expiry fail closed.  A
+successful descriptor has `O_NONBLOCK` cleared before it is returned, preserving
+the blocking `Connection` contract.  The legacy `connect_unix()` API remains a
+blocking compatibility path.
+
 The connection also exposes peer verification and both
 `receive_with_timeout()` and `receive_until()` framed receives without
 exposing a borrowed descriptor.  The absolute form covers the complete header

@@ -261,6 +261,13 @@ Status verify_peer_credentials(int fd, const CredentialExpectation& expected,
 // node for identity-safe private-directory cleanup by its owner.
 int listen_unix(const std::string& path, int backlog, Status* status = nullptr) noexcept;
 Connection connect_unix(const std::string& path, Status* status = nullptr) noexcept;
+// Connects to a private listener under one absolute steady-clock deadline.
+// The returned descriptor is blocking and CLOEXEC, just like connect_unix().
+// A pending nonblocking connect uses detail::wait_for_io() and never changes
+// the flags of a descriptor shared with another Connection.
+Connection connect_unix_until(
+    const std::string& path, std::chrono::steady_clock::time_point deadline,
+    Status* status = nullptr) noexcept;
 Connection accept_unix(int listener_fd, Status* status = nullptr) noexcept;
 
 #if defined(ICECC_P50_LOCAL_TRANSPORT_TEST_HOOKS)

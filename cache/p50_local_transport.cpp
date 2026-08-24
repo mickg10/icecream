@@ -691,6 +691,89 @@ Connection connect_unix(const std::string& path, Status* status) noexcept {
     return connection;
 }
 
+Connection connect_unix_until(const std::string& path,
+                              std::chrono::steady_clock::time_point deadline,
+                              Status* status) noexcept {
+    sockaddr_un address{};
+    if (!fill_address(path, address) || !private_parent(path) || !private_socket_node(path)) {
+        set_status(Status::InvalidPath, status);
+        return Connection(-1);
+    }
+    const int fd = socket_cloexec();
+    if (fd < 0) {
+        set_status(Status::IoError, status);
+        return Connection(-1);
+    }
+
+    const int original_flags = ::fcntl(fd, F_GETFL);
+    if (original_flags < 0 ||
+        ::fcntl(fd, F_SETFL, original_flags | O_NONBLOCK) != 0) {
+        ::close(fd);
+        set_status(Status::IoError, status);
+        return Connection(-1);
+    }
+
+    const socklen_t address_length =
+        static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + path.size() + 1);
+    int connect_result = -1;
+    int connect_error = 0;
+    do {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            ::close(fd);
+            set_status(Status::Timeout, status);
+            return Connection(-1);
+        }
+        connect_result =
+            ::connect(fd, reinterpret_cast<const sockaddr*>(&address), address_length);
+        connect_error = errno;
+    } while (connect_result < 0 && connect_error == EINTR);
+
+    if (connect_result < 0 && connect_error == EINPROGRESS) {
+        const auto waited = detail::wait_for_io(fd, POLLOUT, deadline);
+        if (waited == detail::DeadlinePollResult::Timeout) {
+            ::close(fd);
+            set_status(Status::Timeout, status);
+            return Connection(-1);
+        }
+        if (waited == detail::DeadlinePollResult::Error) {
+            ::close(fd);
+            set_status(Status::IoError, status);
+            return Connection(-1);
+        }
+    } else if (connect_result < 0) {
+        ::close(fd);
+        set_status(Status::IoError, status);
+        return Connection(-1);
+    }
+
+    int socket_error = 0;
+    socklen_t socket_error_length = sizeof(socket_error);
+    if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error, &socket_error_length) != 0 ||
+        socket_error != 0) {
+        ::close(fd);
+        set_status(Status::IoError, status);
+        return Connection(-1);
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
+        ::close(fd);
+        set_status(Status::Timeout, status);
+        return Connection(-1);
+    }
+    if (::fcntl(fd, F_SETFL, original_flags & ~O_NONBLOCK) != 0) {
+        ::close(fd);
+        set_status(Status::IoError, status);
+        return Connection(-1);
+    }
+
+    Connection connection(fd);
+    if (!connection.valid()) {
+        set_status(connection.status(), status);
+        return connection;
+    }
+    set_status(Status::Ok, status);
+    return connection;
+}
+
 Connection accept_unix(int listener_fd, Status* status) noexcept {
     if (listener_fd < 0) {
         set_status(Status::InvalidArgument, status);
