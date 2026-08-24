@@ -850,8 +850,8 @@ private:
    integration test. */
 inline bool usecs_cache_handoff_admissible(const UseCSMsg &msg)
 {
-    return msg.hasCacheAdvertisement() && msg.job_id != 0
-        && msg.hasAssignmentIdentity()
+    return msg.job_id != 0 && msg.hasAssignmentIdentity()
+        && msg.hasCacheAdvertisement()
         && cache_advertisement_is_valid_present(
                msg.cache_endpoint_port, msg.cache_protocol,
                msg.cache_profile_mask);

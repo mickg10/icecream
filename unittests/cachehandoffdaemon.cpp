@@ -423,10 +423,22 @@ int main(int argc, char **argv)
     const uint64_t remote_assignment_epoch = UINT64_C(0x5200000000000002);
     const uint64_t remote_assignment_nonce = UINT64_C(0x99aabbccddeeff00);
     const uint32_t remote_cache_port = UINT32_C(0x0000feed);
+    /* BigOracle blueprint: also vary got_env and matched_job_id away from
+       their zero/default constructor values, and require both -- plus
+       client_id -- preserved exactly.  This future-proofs against a
+       "normalized rebuild" of the remote-worker branch that reconstructs
+       *msg's fields individually instead of relaying the scheduler's frame
+       verbatim: such a rebuild could easily carry the cache triple and
+       identity correctly while silently dropping or zeroing one of these
+       three, and only an assertion on each specific field would catch it. */
+    const uint32_t remote_got_env = true;
+    const uint32_t remote_matched_job_id = UINT32_C(0x00000037);
+    const uint32_t client_c_forwarded_id = forwarded_c ? forwarded_c->client_id : 0;
 
     if (scheduler && forwarded_c) {
         UseCSMsg reply_c("x86_64", remote_f_host, remote_f_port,
-                         remote_wire_job_id, true, forwarded_c->client_id, 0,
+                         remote_wire_job_id, remote_got_env, client_c_forwarded_id,
+                         remote_matched_job_id,
                          remote_assignment_epoch, remote_assignment_nonce,
                          remote_cache_port, CACHE_WIRE_PROTOCOL_V1,
                          CACHE_PROFILE_ZSTD_TU);
@@ -448,6 +460,12 @@ int main(int argc, char **argv)
                 && client_c_use->job_id == remote_wire_job_id,
             "S2: the remote-worker relay carries the exact selected-F "
             "hostname, port, and wire job id");
+    REQUIRE(client_c_use && client_c_use->got_env == remote_got_env
+                && client_c_use->client_id == client_c_forwarded_id
+                && client_c_use->matched_job_id == remote_matched_job_id,
+            "S2: the remote-worker relay preserves got_env, client_id, and "
+            "matched_job_id exactly -- each varied away from its zero/"
+            "default constructor value so this row cannot pass by accident");
     REQUIRE(client_c_use && client_c_use->assignmentEpoch() == remote_assignment_epoch
                 && client_c_use->assignmentNonce() == remote_assignment_nonce,
             "S2: assignment identity survives the remote-worker relay unchanged");
@@ -462,26 +480,35 @@ int main(int argc, char **argv)
     delete client_c_wire;
     delete client_c;
 
-    /* Client D (BigOracle d23d9c5d HOLD, Gap 3 -- reused-client clearing):
-       Daemon::scheduler_no_cs clears c->cacheHandoff so a handoff retained
-       from an earlier dispatch on this same (reused) Client cannot leak
-       into a later NoCS decision.  No real wire flow can hand this site a
-       Client that both genuinely retained a prior handoff and is making a
-       second live GetCS decision -- Client::getcs_outstanding (see its own
-       comment in daemon/main.cpp) makes a second GetCS on one connection
-       structurally unreachable, so there is no way to build that precise
-       precondition with real UseCS traffic first.  The child process armed
+    /* Client D (BigOracle d23d9c5d HOLD, Gap 3 -- reused-client clearing,
+       doubling as the blueprint's "Focused test"): Daemon::scheduler_no_cs
+       now routes through install_cache_absent_local_decision, which
+       atomically clears c->cacheHandoff, deletes any prior usecsmsg, and
+       installs the canonical cache-absent replacement -- so a handoff (and
+       a stale usecsmsg) retained from an earlier dispatch on this same
+       (reused) Client cannot leak into a later NoCS decision.  No real
+       wire flow can hand this site a Client that both genuinely retained
+       prior state and is making a second live GetCS decision --
+       Client::getcs_outstanding (see its own comment in daemon/main.cpp)
+       makes a second GetCS on one connection structurally unreachable, so
+       there is no way to build that precise precondition with real UseCS
+       traffic first.  The child process armed
        ICECC_TEST_POISON_CACHE_HANDOFF_SITE=no_cs above, which fabricates a
-       retained handoff on this Client immediately before scheduler_no_cs's
-       real, unmodified clear runs; dump_internals() (queried via
-       GetInternalStatus) is the only way this external test process can
-       observe one Client's private field, so that is what is polled here.
-       MUST run before Client B below: Client B deliberately makes
-       MsgChannel::send_msg(reply_b) fail on this SAME `scheduler` channel
-       (valid_payload() rejection calls set_error() on the sending
-       channel), which permanently ERRORs that channel for the rest of the
-       process -- placed after Client B, Client D's forwarded GetCS would
-       never reach the fake scheduler at all. */
+       retained handoff AND a stale nonzero-tail usecsmsg on this Client
+       immediately before scheduler_no_cs's real, unmodified call runs.
+       Two independent observations then prove the helper's contract: (1)
+       dump_internals() (queried via GetInternalStatus, the only way this
+       external test process can observe one Client's private field) shows
+       the handoff reset to canonical absence; (2) the client's ACTUAL
+       received UseCS -- the real installed replacement, not the deleted
+       stale one -- decodes at all (proving wire-valid, since
+       MsgChannel::get_msg already enforces valid_payload() on receipt) and
+       carries cache triple exactly 0/0/0.  MUST run before Client B below:
+       Client B deliberately makes MsgChannel::send_msg(reply_b) fail on
+       this SAME `scheduler` channel (valid_payload() rejection calls
+       set_error() on the sending channel), which permanently ERRORs that
+       channel for the rest of the process -- placed after Client B, Client
+       D's forwarded GetCS would never reach the fake scheduler at all. */
     MsgChannel *client_d = connect_unix_bounded(socket_path, 5000);
     REQUIRE(client_d != nullptr, "local client D connected");
     GetCSMsg request_d(Environments(), "s2-relay-d.cpp", CompileJob::Lang_CXX,
@@ -502,6 +529,23 @@ int main(int argc, char **argv)
                 "fake scheduler sent NoCS for client D");
     }
     delete forwarded_d_wire;
+
+    Msg *client_d_wire = client_d ? wait_for_type(client_d, Msg::USE_CS, 5000)
+                                  : nullptr;
+    UseCSMsg *client_d_use = client_d_wire ? dynamic_cast<UseCSMsg *>(client_d_wire)
+                                           : nullptr;
+    REQUIRE(client_d_use != nullptr,
+            "S2 Gap 3 focused test: client D received the REAL installed "
+            "replacement UseCS, not the deleted stale one -- decoding at "
+            "all proves it is wire-valid (MsgChannel::get_msg enforces "
+            "valid_payload() on receipt)");
+    REQUIRE(client_d_use && !client_d_use->hasCacheAdvertisement()
+                && client_d_use->cache_endpoint_port == 0
+                && client_d_use->cache_protocol == 0
+                && client_d_use->cache_profile_mask == 0,
+            "S2 Gap 3 focused test: the replacement's cache triple is "
+            "exactly 0/0/0, not the stale poisoned nonzero tail");
+    delete client_d_wire;
 
     const std::string clear_needle =
         "Cache-handoff clear test: site=no_cs fired=1 valid=0 port=0 "

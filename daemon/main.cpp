@@ -85,6 +85,7 @@
 #include <chrono>
 #include <deque>
 #include <map>
+#include <memory>
 #include <unordered_map>
 #include <unordered_set>
 #include <algorithm>
@@ -4154,6 +4155,22 @@ static bool test_poison_cache_handoff_if_armed(Client *c, const char *site)
         UINT64_C(0x1111111111111111), UINT64_C(0x2222222222222222),
         "poison-host", UINT32_C(3333),
         UINT32_C(0x0000cafe), UINT32_C(9), UINT32_C(7)};
+    /* BigOracle blueprint (Gap 3 "Focused test"): also preload a STALE
+       usecsmsg with a nonzero cache tail, standing in for whatever a
+       reused Client might already carry.
+       install_cache_absent_local_decision must delete this before
+       installing its own canonical-absent replacement, never merely
+       overwrite the pointer (BigOracle: the leak this function exists to
+       fix structurally).  c->usecsmsg is null on every real path that
+       reaches these three sites, so this is a fabricated precondition,
+       same as the cacheHandoff poisoning above. */
+    delete c->usecsmsg;
+    c->usecsmsg = new UseCSMsg("x86_64", "stale-poison-host", UINT32_C(9999),
+                               UINT32_C(0xfeedface), true, UINT32_C(4242),
+                               UINT32_C(17),
+                               UINT64_C(0x3333333333333333),
+                               UINT64_C(0x4444444444444444),
+                               UINT32_C(0x0000d00d), UINT32_C(9), UINT32_C(7));
     return true;
 }
 
@@ -4165,6 +4182,39 @@ static void test_record_cache_handoff_clear(const Client *c, const char *site)
     cache_handoff_clear_test_result_port = c->cacheHandoff.cachePort;
     cache_handoff_clear_test_result_protocol = c->cacheHandoff.cacheProtocol;
     cache_handoff_clear_test_result_mask = c->cacheHandoff.cacheProfileMask;
+}
+
+/* S2 (BigOracle exact blueprint): the ONE choke point for installing a
+   canonical cache-absent LOCAL decision on a (possibly reused) Client.
+   scheduler_no_cs, handle_old_request's stranded-GetCS replay, and
+   handle_get_cs's scheduler-absent fallback all share exactly this
+   situation -- "no real worker snapshot at all" -- and each previously
+   inlined its own cacheHandoff-clear + usecsmsg-install + set_status
+   sequence independently, with no guard against installing a replacement
+   usecsmsg over one that was already live: BigOracle flags this as a real
+   leak on any path that reaches one of these fallbacks with
+   c->usecsmsg already non-null.  Atomic:
+     1. cacheHandoff reset to canonical absence.
+     2. any PRIOR usecsmsg deleted before the replacement is installed
+        (the leak fix -- ownership transfers via unique_ptr so a caller
+        cannot accidentally keep its own copy alive either).
+     3. the replacement itself asserted canonical cache-absent (0/0/0) and
+        wire-valid -- defense in depth: every caller already constructs it
+        that way, but this function's whole contract is that IT is what
+        guarantees cache-absence, not each caller's own care.
+     4. status set to PENDING_USE_CS under the given reason. */
+static void install_cache_absent_local_decision(Client &c,
+                                                  std::unique_ptr<UseCSMsg> reply,
+                                                  const char *why)
+{
+    assert(reply);
+    assert(reply->cache_endpoint_port == 0 && reply->cache_protocol == 0
+           && reply->cache_profile_mask == 0);
+    assert(reply->valid_payload());
+    c.cacheHandoff = Client::CacheHandoff{};
+    delete c.usecsmsg;
+    c.usecsmsg = reply.release();
+    c.set_status(Client::PENDING_USE_CS, why);
 }
 
 /* Protocol-49 fulfillment state has one owner: the daemon event-loop thread.
@@ -5714,18 +5764,22 @@ int Daemon::scheduler_no_cs(NoCSMsg *msg)
     }
 
     /* S2: NO_CS carries no worker snapshot at all -- always canonical
-       cache-absent, and clears any handoff retained from an earlier
-       dispatch on this same (reused) Client so it can never leak forward.
-       See test_poison_cache_handoff_if_armed's own comment for why the
-       poison/record pair below brackets this real, unmodified clear. */
+       cache-absent.  install_cache_absent_local_decision (BigOracle exact
+       blueprint) clears any handoff retained from an earlier dispatch on
+       this same (reused) Client, deletes any prior usecsmsg, and installs
+       the replacement atomically, so it can never leak forward.  See
+       test_poison_cache_handoff_if_armed's own comment for why the
+       poison/record pair below brackets this real, unmodified call. */
     const bool cache_handoff_test_poisoned_no_cs =
         test_poison_cache_handoff_if_armed(c, "no_cs");
-    c->cacheHandoff = Client::CacheHandoff{};
+    install_cache_absent_local_decision(
+        *c,
+        std::unique_ptr<UseCSMsg>(new UseCSMsg(string(), "127.0.0.1", daemon_port,
+                                                msg->job_id, true, 1, 0)),
+        "scheduler_no_cs: local compile");
     if (cache_handoff_test_poisoned_no_cs) {
         test_record_cache_handoff_clear(c, "no_cs");
     }
-    c->usecsmsg = new UseCSMsg(string(), "127.0.0.1", daemon_port, msg->job_id, true, 1, 0);
-    c->set_status(Client::PENDING_USE_CS, "scheduler_no_cs: local compile");
 
     c->job_id = msg->job_id;
     c->last_known_job_id = msg->job_id;
@@ -6324,24 +6378,29 @@ void Daemon::handle_old_request()
             GetCSMsg *g = c->deferred_getcs;
             if (g->count <= 1) {
                 /* S2: schedulerless local fallback, no worker snapshot --
-                   canonical cache-absent (see scheduler_no_cs).  See
-                   test_poison_cache_handoff_if_armed's own comment for why
-                   the poison/record pair below brackets this real,
-                   unmodified clear. */
+                   canonical cache-absent (see scheduler_no_cs).
+                   install_cache_absent_local_decision (BigOracle exact
+                   blueprint) atomically clears any handoff retained from
+                   an earlier dispatch on this same (reused) Client,
+                   deletes any prior usecsmsg, and installs the
+                   replacement.  See test_poison_cache_handoff_if_armed's
+                   own comment for why the poison/record pair below
+                   brackets this real, unmodified call. */
                 const bool cache_handoff_test_poisoned_stranded =
                     test_poison_cache_handoff_if_armed(c, "old_request_stranded");
-                c->cacheHandoff = Client::CacheHandoff{};
+                install_cache_absent_local_decision(
+                    *c,
+                    std::unique_ptr<UseCSMsg>(new UseCSMsg(g->target, "127.0.0.1",
+                                                            daemon_port, c->client_id,
+                                                            true, 1, 0)),
+                    "handle_old_request: held GetCS -> local fallback (attempt failed)");
                 if (cache_handoff_test_poisoned_stranded) {
                     test_record_cache_handoff_clear(c, "old_request_stranded");
                 }
-                c->usecsmsg = new UseCSMsg(g->target, "127.0.0.1", daemon_port,
-                                           c->client_id, true, 1, 0);
                 c->job_id = c->client_id;
                 c->last_known_job_id = c->client_id;
                 delete c->deferred_getcs;
                 c->deferred_getcs = nullptr;
-                c->set_status(Client::PENDING_USE_CS,
-                              "handle_old_request: held GetCS -> local fallback (attempt failed)");
             } else {
                 delete c->deferred_getcs;
                 c->deferred_getcs = nullptr;
@@ -6934,18 +6993,24 @@ bool Daemon::handle_get_cs(Client *client, Msg *msg)
             return false;
         }
         /* S2: scheduler missing entirely, no worker snapshot -- canonical
-           cache-absent (see scheduler_no_cs).  See
+           cache-absent (see scheduler_no_cs).
+           install_cache_absent_local_decision (BigOracle exact blueprint)
+           atomically clears any handoff retained from an earlier dispatch
+           on this same (reused) Client, deletes any prior usecsmsg, and
+           installs the replacement.  See
            test_poison_cache_handoff_if_armed's own comment for why the
-           poison/record pair below brackets this real, unmodified clear. */
+           poison/record pair below brackets this real, unmodified call. */
         const bool cache_handoff_test_poisoned_no_scheduler =
             test_poison_cache_handoff_if_armed(client, "get_cs_no_scheduler");
-        client->cacheHandoff = Client::CacheHandoff{};
+        install_cache_absent_local_decision(
+            *client,
+            std::unique_ptr<UseCSMsg>(new UseCSMsg(umsg->target, "127.0.0.1",
+                                                    daemon_port, umsg->client_id,
+                                                    true, 1, 0)),
+            "handle_get_cs: scheduler missing, local compile");
         if (cache_handoff_test_poisoned_no_scheduler) {
             test_record_cache_handoff_clear(client, "get_cs_no_scheduler");
         }
-        client->usecsmsg = new UseCSMsg(umsg->target, "127.0.0.1", daemon_port,
-                                        umsg->client_id, true, 1, 0);
-        client->set_status(Client::PENDING_USE_CS, "handle_get_cs: scheduler missing, local compile");
         client->job_id = umsg->client_id;
         client->last_known_job_id = umsg->client_id;
         return true;
