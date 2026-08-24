@@ -1,4 +1,5 @@
-noinst_LIBRARIES = libprotocol50.a libp50endpoint.a libp50localtransport.a
+noinst_LIBRARIES = libprotocol50.a libp50endpoint.a libp50localtransport.a \
+	libp50sidecarsupervisor.a
 
 libprotocol50_a_SOURCES = \
 	protocol50.cpp \
@@ -17,6 +18,7 @@ libp50endpoint_a_SOURCES = p50_endpoint.cpp p50_endpoint.h
 libp50endpoint_a_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
 
 libp50localtransport_a_SOURCES = p50_local_transport.cpp p50_local_transport.h
+libp50sidecarsupervisor_a_SOURCES = p50_sidecar_supervisor.cpp p50_sidecar_supervisor.h
 
 EXTRA_DIST = \
 	README.md \
@@ -113,6 +115,8 @@ EXTRA_DIST = \
 	formal/.gitignore \
 	formal/check_trace.py \
 	P50_LOCAL_TRANSPORT.md \
+	P50_SIDECAR_SUPERVISOR.md \
+	p50_sidecar_supervisor.h \
 	formal/README.md
 
 check-local:
