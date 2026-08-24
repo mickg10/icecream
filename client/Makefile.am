@@ -1,7 +1,7 @@
 bin_PROGRAMS = icecc
 bin_SCRIPTS = icecc-create-env icecc-test-env
 
-noinst_LIBRARIES = libclient.a
+noinst_LIBRARIES = libclient.a libp50zstdsender.a
 libclient_a_SOURCES = \
         arg.cpp \
         argv.c \
@@ -31,7 +31,10 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/services \
 	-I$(top_srcdir)/
 
-EXTRA_DIST = $(bin_SCRIPTS)
+libp50zstdsender_a_SOURCES = p50_zstd_sender.cpp p50_zstd_sender.h
+libp50zstdsender_a_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
+
+EXTRA_DIST = $(bin_SCRIPTS) P50_ZSTD_SENDER.md
 
 AM_LIBTOOLFLAGS = --silent
 
