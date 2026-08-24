@@ -232,6 +232,14 @@ It atomically replaces the source, deletes it, and resumes; both runs must
 publish the original bytes. A deletion/replacement mutant that rewires
 consumers from `PIN_TAR` back to `SRC_TAR` must fail before publication.
 
+The keeper also arms Linux `PR_SET_PDEATHSIG(SIGKILL)` before opening the
+source, with parent-PID checks immediately before and after the arm. Therefore
+the shell's normal EXIT trap is only cleanup in the ordinary case: a hard
+`SIGKILL` of the publisher cannot strand a live helper or its sealed memfd.
+The local lifecycle gate kills the publisher at the post-pin pause and checks
+for both helper exit and an unpublished final root; a neutralized-prctl mutant
+goes red at that same gate.
+
 **`verify_role_files()` (shared by `preflight()`, the barrier, and the
 publish script's own checks) now requires the HARDENED (write-stripped)
 mode EXACTLY, dropping round 3's "accept either the manifest mode or its
@@ -1044,7 +1052,7 @@ is the entire HOLD"):
 | Harness-script integrity (HUB_DIR, hash pinning) | **PRODUCTION**: `verify_harness_scripts()`, called as the first line of `run_client()` |
 | Harness PRIVATE STAGING (round 5) | **PRODUCTION**: `_build_harness_bundle()`, `_harness_stage_verify()`, `docker_run_foreground_staged()` -- all called from `run_client()`, which streams the bundle into a real foreground `docker run -i` |
 | Tar header pre-validation (round 6) | **PRODUCTION**: the step-3 block inside `_publish_script()`'s generated remote script compares normalized manifest name/type/per-file-size rows before extraction, run by every real `distribute()`/`publish_immutable_root()` call |
-| Source-tar sealed-memfd pin + post-pin replacement/deletion races (round 7) | **PRODUCTION**: `_publish_script()` pins once and all hash/header/extraction consumers read only its sealed `/proc/<pid>/fd/<fd>`; **TEST SCAFFOLDING**: `s4_round6_unit_test.py`'s deterministic ready/continue seam and unpinned deletion mutant |
+| Source-tar sealed-memfd pin + parent-death lifecycle + post-pin replacement/deletion races (round 7) | **PRODUCTION**: `_publish_script()` arms `PR_SET_PDEATHSIG`, pins once, and all hash/header/extraction consumers read only its sealed `/proc/<pid>/fd/<fd>`; **TEST SCAFFOLDING**: `s4_round6_unit_test.py`'s deterministic race/SIGKILL seams and unpinned/neutralized-prctl mutants |
 | Digest-ref-exact image verification + `--pull=never` (round 5) | **PRODUCTION**: `image_digest_remote(host, binary_set)`, called from `preflight()`; `--pull=never` in `docker_run_detached()`/`docker_run_foreground_staged()`'s own command strings |
 | No-git fresh-archive fallback (round 5) | **TEST SCAFFOLDING**: the fresh-archive gate itself is test infrastructure, not production `farm.py` code -- but the claim under test (farm.py imports and both manifests load cleanly from a bare, non-git tree) exercises real, unmodified `farm.load_manifest()`/module-import behavior |
 | Cell-verdict combination (`client_ok`/`join_ok`/`ok`) | **PRODUCTION**: the three-line combination in `main()`, immediately after `run_client()` returns |

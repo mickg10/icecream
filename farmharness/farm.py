@@ -319,19 +319,45 @@ ROOT="{root_expanded}"
 TMP="{root_expanded}.tmp-$$"
 SRC_TAR="{src_tar_path}"
 
-# Pin the source pathname exactly once. libc's memfd_create() plus all four
-# content seals and F_SEAL_SEAL provide one same-UID-resistant immutable byte
-# object. The bounded copy also prevents an unexpected source rewrite from
-# turning publication into an unbounded memory allocation.
+# Pin the source pathname exactly once. The helper arms Linux
+# PR_SET_PDEATHSIG(SIGKILL) before touching the source, so a SIGKILL of this
+# shell cannot strand the keeper. libc's memfd_create() plus all four content
+# seals and F_SEAL_SEAL provide one same-UID-resistant immutable byte object.
+# The bounded copy also prevents an unexpected source rewrite from turning
+# publication into an unbounded memory allocation.
 PIN_INFO=$(mktemp "$HOME/role-artifacts/.publish-pin.XXXXXX")
 PIN_ERR="$PIN_INFO.err"
 python3 - "$SRC_TAR" "{manifest['tar']['size']}" >"$PIN_INFO" 2>"$PIN_ERR" <<'PIN_HELPER_PY' &
-import ctypes, fcntl, os, sys, time
+import ctypes, fcntl, os, signal, sys, time
 
 try:
+    # A normal EXIT trap cannot run when the publication shell is SIGKILLed.
+    # Arm the kernel's parent-death signal before opening/copying the source,
+    # and check the parent PID immediately before and after prctl() to close
+    # the fork/arm race: if the shell dies before arming, the post-check sees
+    # reparenting; if it dies after arming, the kernel delivers SIGKILL here.
+    parent_pid = os.getppid()
+    if parent_pid <= 1:
+        raise RuntimeError("publication parent is already gone")
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        prctl = libc.prctl
+    except AttributeError:
+        raise RuntimeError("libc.prctl unavailable")
+    prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong,
+                      ctypes.c_ulong, ctypes.c_ulong]
+    prctl.restype = ctypes.c_int
+    if os.getppid() != parent_pid:
+        raise RuntimeError("publication parent changed before PDEATHSIG arm")
+    prctl_result = prctl(1, signal.SIGKILL, 0, 0, 0)  # PR_SET_PDEATHSIG
+    if prctl_result != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+    if os.getppid() != parent_pid:
+        raise RuntimeError("publication parent changed during PDEATHSIG arm")
+
     path = sys.argv[1]
     max_size = int(sys.argv[2])
-    libc = ctypes.CDLL(None, use_errno=True)
     create = libc.memfd_create
     create.argtypes = [ctypes.c_char_p, ctypes.c_uint]
     create.restype = ctypes.c_int
@@ -390,6 +416,11 @@ PIN_TAR="/proc/$PIN_PID/fd/$PIN_FD"
 if [ ! -r "$PIN_TAR" ]; then
     echo "PUBLISH-TAR-PIN-FAILED"
     exit 5
+fi
+# Test-only observability for the SIGKILL lifecycle gate. Production callers
+# never set this path; it does not participate in the publication decision.
+if [ -n "${{FARM_PUBLISH_PIN_PID_FILE:-}}" ]; then
+    printf '%s %s\n' "$PIN_PID" "$PIN_FD" > "$FARM_PUBLISH_PIN_PID_FILE"
 fi
 
 # Deterministic unit-test seam; inert unless both variables are supplied by a

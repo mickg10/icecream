@@ -12,6 +12,7 @@ import os
 import pathlib
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
@@ -84,6 +85,53 @@ def run_post_pin_race(tmp, source_tar, replacement_tar, manifest, root_name, mod
     return subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
 
 
+def run_sigkill_lifecycle(tmp, source_tar, root_name, script):
+    """SIGKILL the publication shell after pinning; return keeper liveness."""
+    root = tmp / f"role-artifacts/store/p50/{root_name}"
+    source = tmp / "bundle.tar"
+    source.write_bytes(source_tar.read_bytes())
+    ready = tmp / f"{root_name}.ready"
+    cont = tmp / f"{root_name}.continue"
+    pid_file = tmp / f"{root_name}.pid"
+    env = dict(os.environ, HOME=str(tmp),
+               FARM_PUBLISH_PIN_READY_FILE=str(ready),
+               FARM_PUBLISH_PIN_CONTINUE_FILE=str(cont),
+               FARM_PUBLISH_PIN_PID_FILE=str(pid_file))
+    proc = subprocess.Popen(["bash", "-c", script], env=env,
+                            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    helper_pid = None
+    try:
+        deadline = time.time() + 10
+        while not ready.exists() and proc.poll() is None and time.time() < deadline:
+            time.sleep(0.01)
+        check(ready.exists(), f"SIGKILL gate did not reach post-pin point: {proc.poll()}")
+        deadline = time.time() + 10
+        while not pid_file.exists() and proc.poll() is None and time.time() < deadline:
+            time.sleep(0.01)
+        check(pid_file.exists(), f"SIGKILL gate did not expose keeper PID: {proc.poll()}")
+        helper_pid = int(pid_file.read_text().split()[0])
+        check(pathlib.Path(f"/proc/{helper_pid}").exists(),
+              "SIGKILL gate keeper was gone before publisher termination")
+        os.kill(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=10)
+        deadline = time.time() + 5
+        while pathlib.Path(f"/proc/{helper_pid}").exists() and time.time() < deadline:
+            time.sleep(0.02)
+        keeper_alive = pathlib.Path(f"/proc/{helper_pid}").exists()
+        return root, helper_pid, keeper_alive
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
+        # A deliberately neutralized mutant is expected to leak until this
+        # cleanup. Never leave a test-created keeper or memfd behind.
+        if helper_pid is not None and pathlib.Path(f"/proc/{helper_pid}").exists():
+            os.kill(helper_pid, signal.SIGKILL)
+            deadline = time.time() + 5
+            while pathlib.Path(f"/proc/{helper_pid}").exists() and time.time() < deadline:
+                time.sleep(0.02)
+
+
 def function_call_count(source, function_name, callee_name):
     tree = ast.parse(source)
     function = next(node for node in ast.walk(tree)
@@ -144,6 +192,21 @@ def main():
         check(deleted_published.read_bytes() == payload,
               "source deletion after pinning changed extracted bytes")
 
+        # Lifecycle discriminator: hold the publisher immediately after pin,
+        # SIGKILL its shell, and require the PDEATHSIG-armed keeper to vanish
+        # without publishing a root or leaving a process/memfd owner behind.
+        sigkill_script = farm._publish_script(
+            "p50", base, "~/role-artifacts/store/p50/sigkill-lifecycle",
+            "$HOME/bundle.tar", None)
+        sigkill_root, sigkill_pid, sigkill_alive = run_sigkill_lifecycle(
+            tmp, approved_source, "sigkill-lifecycle", sigkill_script)
+        check(not sigkill_alive,
+              f"SIGKILL of publisher left sealed-memfd keeper {sigkill_pid} alive")
+        check(not sigkill_root.exists(),
+              "SIGKILLed publication unexpectedly published a root")
+        check(not pathlib.Path(f"/proc/{sigkill_pid}").exists(),
+              "SIGKILLed publication left a keeper process/memfd owner behind")
+
         generated = farm._publish_script("p50", base,
                                          "~/role-artifacts/store/p50/pin-source-check",
                                          "$HOME/bundle.tar", None)
@@ -155,6 +218,14 @@ def main():
               'tar -tvf "$SRC_TAR"' not in generated and
               'sha256sum "$SRC_TAR"' not in generated,
               "a validation/extraction command still reopens the mutable source pathname")
+
+        arm_failure = generated.replace(
+            "prctl_result = prctl(1, signal.SIGKILL, 0, 0, 0)  # PR_SET_PDEATHSIG",
+            "prctl_result = -1  # forced arm failure mutant")
+        failed_arm = run_publish(tmp, approved_source, base,
+                                 "pdeath-arm-failure-mutant", script=arm_failure)
+        check(failed_arm.returncode != 0 and "PUBLISH-TAR-PIN-FAILED" in failed_arm.stdout,
+              "a failed PDEATHSIG arm did not fail publication closed")
 
         # Deterministic deletion mutant: replacing all pinned-object consumers
         # with the mutable pathname must go red at the exact same post-pin
@@ -172,6 +243,22 @@ def main():
         replacement_mutant_root = tmp / "role-artifacts/store/p50/unpinned-replacement-mutant"
         check(replacement_mutant.returncode != 0 and not replacement_mutant_root.exists(),
               "replacement mutant unexpectedly published after removing pinned consumers")
+
+        # Neutralization mutant: if the prctl arm is removed, the exact same
+        # SIGKILL gate must observe a surviving keeper. This proves the gate
+        # goes red when parent-death handling is deleted, while the helper is
+        # explicitly cleaned up by run_sigkill_lifecycle().
+        pdeath_mutant = sigkill_script.replace(
+            "prctl_result = prctl(1, signal.SIGKILL, 0, 0, 0)  # PR_SET_PDEATHSIG",
+            "prctl_result = 0  # neutralized PDEATHSIG mutant")
+        check(pdeath_mutant != sigkill_script and "neutralized PDEATHSIG mutant" in pdeath_mutant,
+              "parent-death neutralization mutant was not constructed")
+        mutant_root, mutant_pid, mutant_alive = run_sigkill_lifecycle(
+            tmp, approved_source, "pdeath-neutralized-mutant", pdeath_mutant)
+        check(mutant_alive,
+              "SIGKILL lifecycle gate did not go red when PDEATHSIG was neutralized")
+        check(not mutant_root.exists(),
+              "neutralized PDEATHSIG mutant unexpectedly published a root")
 
         extra = make_tar(tmp, [("obj/client/icecc", payload, 0o755),
                               ("unexpected", b"escape", 0o644)])
