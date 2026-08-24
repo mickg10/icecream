@@ -12,6 +12,7 @@ TESTS += p50compilee2e-source.sh p50compilee2e-run.sh p50resultdisposition
 TESTS += p50_completion_record
 TESTS += p50completionflow-source.py
 TESTS += p50completionrecord-sanitize.sh
+TESTS += p50completionflow-run.sh
 
 AM_TESTS_ENVIRONMENT = \
 	ICECC_TEST_BUILDDIR='$(abs_builddir)'; export ICECC_TEST_BUILDDIR; \
@@ -269,6 +270,7 @@ EXTRA_DIST += p50_trace_check.sh p50assignment-source.sh p50cacheadvertisement-s
 EXTRA_DIST += p50compilee2e-source.sh p50compilee2e-run.sh
 EXTRA_DIST += p50completionflow-source.py
 EXTRA_DIST += p50completionrecord-sanitize.sh
+EXTRA_DIST += p50completionflow-run.sh
 
 # Make the tests also print the test log if they fail.
 check: export VERBOSE=1

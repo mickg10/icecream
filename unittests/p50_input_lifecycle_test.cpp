@@ -1,6 +1,7 @@
 #include "cache/p50_control_operation.h"
 #include "cache/p50_input_lifecycle.h"
 
+#include <cerrno>
 #include <cstdint>
 #include <chrono>
 #include <cstdlib>
@@ -10,6 +11,7 @@
 #include <string_view>
 #include <thread>
 #include <atomic>
+#include <poll.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
@@ -294,6 +296,36 @@ void replacement_cycle_and_bounds() {
             "failed commit reservation leaked capacity");
 }
 
+void cancellation_racing_attachment_finalization_revokes_exact_owner() {
+    InputLifecycleRegistry registry(4, 8);
+    const local::Identity identity{9, 10};
+    const InputRecordKey input = key(7);
+    const InputLeaseOwner first{71, 72, 73};
+    const InputLeaseOwner replacement{71, 72, 74};
+
+    require(registry.prepare_route_commit(input) ==
+                InputLifecycleCommitDecision::Open &&
+                registry.observe_route_commit(input, true) &&
+                registry.begin_attachment(input, first, 1),
+            "attachment/cancellation race setup failed");
+
+    const InputLifecycleRequest cancel = request(
+        identity, input, first, 1, InputLifecycleAction::CancelAttempt);
+    require(registry.begin_apply(cancel).status ==
+                InputLifecycleApplyStatus::Applied,
+            "pending attachment attempt cancellation failed");
+    registry.finish_apply(cancel, true);
+
+    // A lost/negative descriptor ACK may finalize after cancellation.  It
+    // must not clear the revocation and permit the same owner to attach again.
+    registry.finish_attachment(input, first, 1, false);
+    require(!registry.begin_attachment(input, first, 2),
+            "cancelled exact owner reattached after lost descriptor ACK");
+    require(registry.begin_attachment(input, replacement, 2),
+            "fresh replacement owner was rejected after raced cancellation");
+    registry.finish_attachment(input, replacement, 2, true);
+}
+
 void lifecycle_transport_round_trip() {
     namespace fs = std::filesystem;
     const char* temporary = std::getenv("TMPDIR");
@@ -395,11 +427,19 @@ void lifecycle_transport_round_trip() {
                 server_ok.store(false, std::memory_order_release);
             }
             local::Frame acknowledgement;
+            // Production deliberately classifies POLLIN|POLLHUP as a lost
+            // best-effort final ACK after the reducer result is durable.  The
+            // fixture still needs to prove that the client emitted the exact
+            // ACK, so consume already-queued bytes before interpreting HUP.
+            pollfd final_ack{connection.native_handle(), POLLIN, 0};
+            int final_ack_ready = -1;
+            do {
+                final_ack_ready = ::poll(&final_ack, 1, 1000);
+            } while (final_ack_ready < 0 && errno == EINTR);
             if (sent == local::Status::Ok &&
-                (connection.receive_until(
-                     acknowledgement,
-                     std::chrono::steady_clock::now() +
-                         std::chrono::seconds(1)) != local::Status::Ok ||
+                (final_ack_ready != 1 ||
+                 (final_ack.revents & POLLIN) == 0 ||
+                 connection.receive(acknowledgement) != local::Status::Ok ||
                  acknowledgement.type != local::MessageType::Goodbye ||
                  !acknowledgement.payload.empty() ||
                  local::validate_identity(acknowledgement, identity) !=
@@ -456,6 +496,7 @@ int main() {
     commit_attachment_cancel_replace_close();
     close_before_commit_and_attach_close_race();
     replacement_cycle_and_bounds();
+    cancellation_racing_attachment_finalization_revokes_exact_owner();
     lifecycle_transport_round_trip();
     return 0;
 }

@@ -554,6 +554,33 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
         p50_disposition_attempted = true;
         if (cserver == nullptr)
             return false;
+
+        /* The real C1F1 terminal-flow gate needs the ordinary worker parser,
+           not a codec double, to observe malformed and disconnected first
+           witnesses.  Arm these two faults only under the existing explicit
+           C1F1-required test environment and only where production would send
+           Accepted after receiving every output byte. */
+        const char *required = getenv("ICECC_P50_C1F1_REQUIRED");
+        const char *test_hook = getenv("ICECC_P50_TEST_DISPOSITION");
+        if (disposition == ResultDispositionMsg::Accepted &&
+            required != nullptr && string(required) == "1" &&
+            test_hook != nullptr) {
+            const string selected(test_hook);
+            if (selected == "malformed") {
+                trace() << "P50 terminal test sending malformed disposition for job "
+                        << job.jobID() << "\n";
+                p50_disposition_sent = cserver->send_msg(EndMsg());
+                return p50_disposition_sent;
+            }
+            if (selected == "disconnect") {
+                trace() << "P50 terminal test disconnecting before disposition for job "
+                        << job.jobID() << "\n";
+                delete cserver;
+                cserver = nullptr;
+                p50_disposition_sent = true;
+                return true;
+            }
+        }
         const ResultDispositionMsg result_disposition(job, disposition);
         p50_disposition_sent = cserver->send_msg(result_disposition);
         if (!p50_disposition_sent) {

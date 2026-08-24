@@ -7199,6 +7199,34 @@ void Daemon::settle_p50_input(
             << icecc::p50::input_lifecycle_status_name(result.status)
             << " reason " << (reason ? reason : "unspecified") << endl;
 
+    /* A real-runtime test probe replays the exact consumed lease after each
+       lifecycle action.  Terminal close/cancel must have removed the record;
+       attempt-only cancellation must have revoked this owner even though the
+       bytes remain available to one fresh replacement assignment. */
+    const char *required = getenv("ICECC_P50_C1F1_REQUIRED");
+    const char *probe = getenv("ICECC_P50_TEST_POST_TERMINAL_ATTACH");
+    if ((result.status == icecc::p50::InputLifecycleStatus::Applied ||
+         result.status == icecc::p50::InputLifecycleStatus::AlreadyApplied) &&
+        required != nullptr && string(required) == "1" &&
+        probe != nullptr && string(probe) == "1") {
+        icecc::p50::InputFdAttachmentResult attachment =
+            cache_adapter->attach_input(
+                lease.key, lease.owner, lease.request_id);
+        trace() << "P50 terminal test post-settlement attach job "
+                << lease.owner.logical_job << " action "
+                << static_cast<unsigned int>(action) << " status "
+                << icecc::p50::input_fd_attachment_status_name(
+                       attachment.status)
+                << " fd " << (attachment.fd.valid() ? "valid" : "invalid")
+                << endl;
+        if (attachment.status ==
+                icecc::p50::InputFdAttachmentStatus::Accepted ||
+            attachment.fd.valid()) {
+            log_error() << "P50 terminal test unexpectedly reattached consumed lease for job "
+                        << lease.owner.logical_job << endl;
+        }
+    }
+
     switch (result.status) {
     case icecc::p50::InputLifecycleStatus::Applied:
     case icecc::p50::InputLifecycleStatus::AlreadyApplied:

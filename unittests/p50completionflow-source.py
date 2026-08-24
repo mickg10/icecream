@@ -63,6 +63,15 @@ def check_client(source: str) -> None:
             "throw remote_error(104")
     require("failed to acknowledge complete P50 remote result" in flow,
             "Accepted send failure does not fail closed")
+    require("ICECC_P50_C1F1_REQUIRED" in flow and
+            "ICECC_P50_TEST_DISPOSITION" in flow,
+            "real-runtime fault injection is not doubly test-gated")
+    require('selected == "malformed"' in flow and
+            "cserver->send_msg(EndMsg())" in flow,
+            "malformed real-runtime witness is missing")
+    require('selected == "disconnect"' in flow and
+            "delete cserver;" in flow and "cserver = nullptr;" in flow,
+            "disconnect real-runtime witness is missing")
 
 
 def check_worker(serve: str, record: str) -> None:
@@ -134,6 +143,60 @@ def check_parent(source: str) -> None:
                   "attempt_id == record.assignment_nonce"):
         require(token in lease, f"retained-lease comparison omits {token}")
 
+    settlement = section(source, "void Daemon::settle_p50_input(",
+                         "bool Daemon::handle_verify_env(")
+    ordered(settlement,
+            "cache_adapter->apply_input_lifecycle(lease, action)",
+            "ICECC_P50_TEST_POST_TERMINAL_ATTACH",
+            "cache_adapter->attach_input(",
+            "InputFdAttachmentStatus::Accepted")
+    require("attachment.fd.valid()" in settlement and
+            "unexpectedly reattached consumed lease" in settlement,
+            "post-settlement exact-owner probe is not fail-closed")
+
+
+def check_cache_service(source: str) -> None:
+    helper = section(source, "void append_terminal_lifecycle_test_trace(",
+                     "volatile sig_atomic_t g_stop_requested")
+    for token in ("ICECC_P50_C1F1_REQUIRED",
+                  "ICECC_P50_TEST_LIFECYCLE_TRACE",
+                  "before_records=%zu", "after_records=%zu",
+                  "before_bytes=%llu", "after_bytes=%llu",
+                  "O_APPEND", "O_CLOEXEC"):
+        require(token in helper, f"sidecar lifecycle trace omits {token}")
+    apply = section(source, "SidecarRuntime::apply_input_lifecycle_on_owner(",
+                    "void SidecarRuntime::cancel_active_control(")
+    ordered(apply,
+            "const P50ServerOwnerUsage before = endpoint_->owner_usage();",
+            "input_lifecycle_.begin_apply(request)",
+            "endpoint_->close_input_job(request.key)",
+            "endpoint_->collect_input_garbage()",
+            "input_lifecycle_.finish_apply(request, mutated)",
+            "append_terminal_lifecycle_test_trace(",
+            "completion->set_value(status)")
+
+
+def check_runtime_gate(source: str) -> None:
+    for token in ("run_remote_cell accepted accepted",
+                  "run_remote_cell definitive definitive",
+                  "run_remote_cell malformed malformed",
+                  "run_remote_cell disconnect disconnect",
+                  "ICECC_CARET_WORKAROUND=1",
+                  "ICECC_P50_TEST_DISPOSITION=\"$mode\"",
+                  "restart_cache_sidecar",
+                  "kill -9 \"$old_pid\"",
+                  "P50 terminal test post-settlement attach job",
+                  "after_records=0 after_bytes=0",
+                  "after_records=1 after_bytes=[1-9][0-9]*",
+                  "attempt_only_pids", "attempt_only_attempts"):
+        require(token in source, f"real terminal/reclaim matrix omits {token}")
+    ordered(source,
+            "run_remote_cell malformed malformed",
+            "restart_cache_sidecar",
+            "run_remote_cell disconnect disconnect",
+            "restart_cache_sidecar",
+            "PASS: real P50 Accepted/DefinitiveCancel/malformed/disconnect")
+
 
 def check_record(header: str, source: str) -> None:
     for token in ("Accepted = 1", "DefinitiveCancel = 2",
@@ -159,6 +222,8 @@ def check_all(files: dict[str, str]) -> None:
     check_worker(files["serve"], files["record_h"] + files["record_cpp"])
     check_parent(files["main"])
     check_record(files["record_h"], files["record_cpp"])
+    check_cache_service(files["cache_service"])
+    check_runtime_gate(files["runtime_gate"])
 
 
 def deletion_mutants(files: dict[str, str]) -> None:
@@ -168,6 +233,8 @@ def deletion_mutants(files: dict[str, str]) -> None:
          "send_deleted(ResultDispositionMsg::Accepted)"),
         ("client", "p50_result_received &&\n            !p50_disposition_attempted",
          "false"),
+        ("client", 'selected == "malformed"', "false"),
+        ("client", 'selected == "disconnect"', "false"),
         ("serve", "write(out_fd, job_stat, sizeof(job_stat))", "write_deleted()"),
         ("serve", "rmsg.status = ret;", "status_binding_deleted();"),
         ("serve", "job_stat[JobStatistics::exit_code] = ret;", "stats_binding_deleted();"),
@@ -178,10 +245,16 @@ def deletion_mutants(files: dict[str, str]) -> None:
         ("main", "InputLifecycleAction::CloseAcceptedJob", "InputLifecycleAction::None"),
         ("main", "InputLifecycleAction::CancelJob", "InputLifecycleAction::None"),
         ("main", "p50_completion_matches_retained_lease(", "lease_check_deleted("),
+        ("main", "ICECC_P50_TEST_POST_TERMINAL_ATTACH", "PROBE_DELETED"),
         ("record_h", "static_assert(kLegacyCompletionStatsWireSize == 32", "static_assert(true"),
         ("record_cpp", "flags | O_NONBLOCK", "flags"),
         ("record_cpp", "if (count != 0)", "if (false)"),
         ("record_cpp", "record.request_id == record.assignment_nonce", "true"),
+        ("cache_service", "ICECC_P50_TEST_LIFECYCLE_TRACE", "TRACE_DELETED"),
+        ("cache_service", "if (decision.collect_record)\n                    endpoint_->collect_input_garbage();",
+         "if (decision.collect_record)\n                    collect_deleted();"),
+        ("runtime_gate", "kill -9 \"$old_pid\"", "kill_deleted"),
+        ("runtime_gate", "run_remote_cell disconnect disconnect", "disconnect_deleted"),
     )
     for filename, old, new in mutations:
         require(old in files[filename], f"mutant anchor missing: {filename}: {old}")
@@ -201,6 +274,8 @@ def main() -> int:
         "main": (ROOT / "daemon/main.cpp").read_text(),
         "record_h": (ROOT / "daemon/p50_completion_record.h").read_text(),
         "record_cpp": (ROOT / "daemon/p50_completion_record.cpp").read_text(),
+        "cache_service": (ROOT / "cache/p50_cache_service.cpp").read_text(),
+        "runtime_gate": (ROOT / "unittests/p50completionflow-run.sh").read_text(),
     }
     try:
         check_all(files)

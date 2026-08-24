@@ -47,6 +47,58 @@ constexpr int kMaxBacklog = 16;
 // This is a hard concurrent cap, not a per-connection unbounded thread fork.
 constexpr size_t kMaxControlWorkers = 4;
 
+void append_terminal_lifecycle_test_trace(
+    const InputLifecycleRequest& request,
+    InputLifecycleApplyStatus status,
+    P50ServerOwnerUsage before,
+    P50ServerOwnerUsage after) noexcept {
+    const char* required = ::getenv("ICECC_P50_C1F1_REQUIRED");
+    const char* path = ::getenv("ICECC_P50_TEST_LIFECYCLE_TRACE");
+    if (required == nullptr || std::strcmp(required, "1") != 0 ||
+        path == nullptr || *path == '\0')
+        return;
+
+    char line[1024];
+    const int length = std::snprintf(
+        line, sizeof(line),
+        "P50_LIFECYCLE pid=%lld generation=%llu attempt=%llu job=%llu "
+        "epoch=%llu nonce=%llu request=%llu action=%u status=%u "
+        "before_records=%zu before_bytes=%llu after_records=%zu "
+        "after_bytes=%llu\n",
+        static_cast<long long>(::getpid()),
+        static_cast<unsigned long long>(request.identity.generation),
+        static_cast<unsigned long long>(request.identity.attempt),
+        static_cast<unsigned long long>(request.owner.logical_job),
+        static_cast<unsigned long long>(request.owner.assignment_epoch),
+        static_cast<unsigned long long>(request.owner.assignment_nonce),
+        static_cast<unsigned long long>(request.operation_id),
+        static_cast<unsigned int>(request.action),
+        static_cast<unsigned int>(status),
+        before.retained_input_records,
+        static_cast<unsigned long long>(before.retained_input_bytes),
+        after.retained_input_records,
+        static_cast<unsigned long long>(after.retained_input_bytes));
+    if (length <= 0 || static_cast<size_t>(length) >= sizeof(line))
+        return;
+
+    const int fd = ::open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+    if (fd < 0)
+        return;
+    size_t offset = 0;
+    while (offset < static_cast<size_t>(length)) {
+        const ssize_t written = ::write(
+            fd, line + offset, static_cast<size_t>(length) - offset);
+        if (written > 0) {
+            offset += static_cast<size_t>(written);
+            continue;
+        }
+        if (written < 0 && errno == EINTR)
+            continue;
+        break;
+    }
+    (void)::close(fd);
+}
+
 volatile sig_atomic_t g_stop_requested = 0;
 volatile sig_atomic_t g_signal_wake_fd = -1;
 
@@ -862,9 +914,12 @@ SidecarRuntime::apply_input_lifecycle_on_owner(
     std::future<InputLifecycleApplyStatus> result = completion->get_future();
     try {
         asio::post(context_, [this, request, completion] {
+            const P50ServerOwnerUsage before = endpoint_->owner_usage();
             InputLifecycleApplyResult decision =
                 input_lifecycle_.begin_apply(request);
             if (decision.status != InputLifecycleApplyStatus::Applied) {
+                append_terminal_lifecycle_test_trace(
+                    request, decision.status, before, endpoint_->owner_usage());
                 completion->set_value(decision.status);
                 return;
             }
@@ -878,9 +933,12 @@ SidecarRuntime::apply_input_lifecycle_on_owner(
                 mutated = false;
             }
             input_lifecycle_.finish_apply(request, mutated);
-            completion->set_value(
+            const InputLifecycleApplyStatus status =
                 mutated ? InputLifecycleApplyStatus::Applied
-                        : InputLifecycleApplyStatus::UnknownRecord);
+                        : InputLifecycleApplyStatus::UnknownRecord;
+            append_terminal_lifecycle_test_trace(
+                request, status, before, endpoint_->owner_usage());
+            completion->set_value(status);
         });
     } catch (...) {
         return std::nullopt;

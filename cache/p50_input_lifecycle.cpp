@@ -134,7 +134,14 @@ bool InputLifecycleRegistry::begin_attachment(InputRecordKey key,
 
     if (!lease.owner.has_value()) {
         lease.owner = owner;
-    } else if (*lease.owner != owner) {
+    } else if (*lease.owner == owner) {
+        // Attempt cancellation permanently revokes this exact assignment
+        // owner, including when cancellation races a lost descriptor ACK.
+        // Only the fresh-owner replacement arm below may reuse retained
+        // bytes after CancelAttempt.
+        if (lease.attempt_cancelled)
+            return false;
+    } else {
         // Replacement is legal only after the exact current attempt was
         // cancelled.  It keeps the same logical job and must carry a fresh
         // assignment nonce/ATTEMPT_ID.
