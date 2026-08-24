@@ -50,6 +50,18 @@ fi
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
+tree_provenance_hash() {
+    root=$1
+    ( cd "$root"
+      find . -type f -print0 | sort -z | while IFS= read -r -d '' rel; do
+          rel=${rel#./}
+          mode=$(stat -c %a -- "$rel")
+          hash=$(sha256sum -- "$rel" | cut -d' ' -f1)
+          printf '%s\t%s\t%s\n' "$rel" "$mode" "$hash"
+      done | sha256sum | cut -d' ' -f1
+    )
+}
+
 # probe SET ROLE -- prints the version-identity string reported by ROLE's
 # executable when farm.py's role_tree(SET) resolves the runtime root (the
 # content-addressed immutable store path). SET is "p43", "p50", or
@@ -125,7 +137,11 @@ else
     cp -a "$FARMDIR/." "$ARCHIVE_DIR/farmharness/"
     find "$ARCHIVE_DIR/farmharness" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null
     find "$ARCHIVE_DIR/farmharness" -name '*.pyc' -delete 2>/dev/null
-    ARCHIVE_SOURCE=$(find "$ARCHIVE_DIR/farmharness" -type f -exec sha256sum {} \; | sort | sha256sum | cut -d' ' -f1)
+    # Hash only relative paths, modes, and content.  Hashing raw sha256sum
+    # output from the caller's cwd accidentally included the random absolute
+    # ARCHIVE_DIR prefix, so identical bare trees received different
+    # provenance labels on different extraction paths.
+    ARCHIVE_SOURCE=$(tree_provenance_hash "$ARCHIVE_DIR/farmharness")
     ARCHIVE_LABEL="no-git tree-hash $ARCHIVE_SOURCE (no .git reachable from $FARMDIR)"
 fi
 [ -f "$ARCHIVE_DIR/farmharness/farm.py" ] || fail "fresh-archive: farmharness/farm.py missing from the archive ($ARCHIVE_LABEL)"
@@ -193,6 +209,15 @@ print(f"ok - fresh-archive gate: farm imported from {farm.__file__} ({commit}), 
 PY
 [ $? -eq 0 ] || fail "fresh-archive no-ambient gate did not pass"
 rm -rf "$ARCHIVE_DIR"
+
+# Local-only discriminator mode used by s4_round6_unit_test.py and release
+# packaging checks.  It stops after the fresh-archive/import gate, before any
+# remote host probe or mutation, while preserving the exact production gate
+# above.
+if [ "${ARTIFACT_TEST_ONLY_FRESH:-0}" = 1 ]; then
+    echo "ok - fresh-archive-only mode (no remote actions)"
+    exit 0
+fi
 
 echo
 echo "== source anchor: the launch path cannot skip resolution, the whole-plan barrier, mutation-time revalidation, the race-gate seam, or in-command attestation without this test noticing =="

@@ -260,7 +260,15 @@ def _publish_script(binary_set, manifest, root, src_tar_path, incoming_cleanup):
     PUBLISH-CHMOD-FAILED / PUBLISH-HARDENED-VERIFY-FAILED:<problems> /
     PUBLISH-RENAME-FAILED / PUBLISH-FINAL-VERIFY-FAILED:<problems>."""
     relpaths = [b["path"] for b in manifest["binaries"]]
+    if len(relpaths) != len(set(relpaths)):
+        raise RuntimeError(f"role manifest {binary_set!r} contains duplicate binary paths")
+    if any(not re.fullmatch(r"[A-Za-z0-9_./+-]+", p) or p.startswith("/") or ".." in p.split("/")
+           for p in relpaths):
+        raise RuntimeError(f"role manifest {binary_set!r} contains an unsafe relative path")
     expected_relative = "\n".join(sorted(relpaths))
+    expected_header = "\n".join(
+        f"{b['path']}\tF\t{b['size']}" for b in sorted(manifest["binaries"], key=lambda x: x["path"])
+    )
     filelist = "\n".join(
         f"{b['path']}\t{b['sha256']}\t{b['mode']}\t{_write_stripped(b['mode'])}"
         for b in manifest["binaries"]
@@ -338,14 +346,11 @@ if [ -d "$ROOT" ]; then
     echo "PUBLISH-EXISTS-BUT-FAILS:$FAIL"; exit 3
 fi
 
-# Step 3 (round-5, Deep Reviewer): PRE-EXTRACTION tar header validation.
-# `tar -tf`/`tar -tvf` only LIST the archive's index -- never write to
-# disk -- so every check here runs before a single byte of $SRC_TAR is
-# ever extracted. This is deliberately NOT redundant with steps 5-6's
-# post-extraction verify(): that check can only ever see what actually
-# landed WITHIN $TMP, so a member with an absolute path or a `../`
-# traversal component would write OUTSIDE $TMP during extraction itself,
-# before verify() ever gets a chance to run against anything.
+# Step 3 (round-6): PRE-EXTRACTION tar header validation.  Normalize a
+# leading ./ and directory slash, reject traversal/absolute names and
+# normalized duplicates, then compare every regular member one-to-one
+# against the committed manifest's name, type and exact per-file size.
+# The post-extraction inventory remains defense-in-depth.
 TAR_NAMES=$(tar -tf "$SRC_TAR") || {{ echo "PUBLISH-TAR-HEADER-INVALID:list-failed"; exit 10; }}
 TAR_N=$(printf '%s\n' "$TAR_NAMES" | grep -c .)
 if [ "$TAR_N" -eq 0 ] || [ "$TAR_N" -gt 200 ]; then
@@ -354,17 +359,45 @@ fi
 if printf '%s\n' "$TAR_NAMES" | grep -qE '^/|(^|/)\.\.(/|$)'; then
     echo "PUBLISH-TAR-HEADER-INVALID:path-traversal-or-absolute"; exit 10
 fi
-if [ "$(printf '%s\n' "$TAR_NAMES" | sort -u | wc -l)" != "$TAR_N" ]; then
-    echo "PUBLISH-TAR-HEADER-INVALID:duplicate-member-names"; exit 10
+TAR_NORMALIZED=$(printf '%s\n' "$TAR_NAMES" | sed -e 's#^\./##' -e 's#/$##')
+if [ "$(printf '%s\n' "$TAR_NORMALIZED" | sort -u | wc -l)" != "$TAR_N" ]; then
+    echo "PUBLISH-TAR-HEADER-INVALID:duplicate-normalized-member-names"; exit 10
 fi
-TAR_BADTYPES=$(tar -tvf "$SRC_TAR" | awk '{{print substr($1,1,1)}}' | grep -vE '^[-d]$' || true)
+TAR_VERBOSE=$(tar -tvf "$SRC_TAR" --numeric-owner --quoting-style=escape) || {{ echo "PUBLISH-TAR-HEADER-INVALID:verbose-list-failed"; exit 10; }}
+TAR_BADTYPES=$(printf '%s\n' "$TAR_VERBOSE" | awk 'substr($1,1,1) !~ /^[-d]$/ {{print substr($1,1,1)}}')
 if [ -n "$TAR_BADTYPES" ]; then
     echo "PUBLISH-TAR-HEADER-INVALID:non-regular-entry-type"; exit 10
 fi
-TAR_TOTAL_SIZE=$(tar -tvf "$SRC_TAR" | awk '{{sum+=$3}} END{{print sum+0}}')
+TAR_TOTAL_SIZE=$(printf '%s\n' "$TAR_VERBOSE" | awk 'substr($1,1,1) == "-" {{sum+=$4}} END{{print sum+0}}')
 if [ "$TAR_TOTAL_SIZE" -gt 2147483648 ]; then
     echo "PUBLISH-TAR-HEADER-INVALID:total-size=$TAR_TOTAL_SIZE"; exit 10
 fi
+# GNU tar's numeric-owner listing is mode owner/group size date time name.
+# Manifest names use a safe no-space alphabet; a hostile quoted/whitespace
+# name cannot be mistaken for one of them.
+TAR_FILE_ROWS=$(printf '%s\n' "$TAR_VERBOSE" | awk 'substr($1,1,1) == "-" {{
+    if (NF != 6) {{ print "__INVALID__"; next }}
+    print $6 "\\tF\\t" $3
+}}')
+if printf '%s\n' "$TAR_FILE_ROWS" | grep -q '^__INVALID__'; then
+    echo "PUBLISH-TAR-HEADER-INVALID:unparseable-member-name"; exit 10
+fi
+TAR_FILE_ROWS=$(printf '%s\n' "$TAR_FILE_ROWS" | sed 's#^\./##' | sort)
+EXPECTED_HEADER=$(cat <<'MANIFEST_HEADER'
+{expected_header}
+MANIFEST_HEADER
+)
+if [ "$TAR_FILE_ROWS" != "$EXPECTED_HEADER" ]; then
+    echo "PUBLISH-TAR-HEADER-INVALID:manifest-name-type-size-mismatch"; exit 10
+fi
+while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    d=$(printf '%s' "$d" | sed -e 's#^\./##' -e 's#/$##')
+    case "$EXPECTED_INV" in
+        *"$d/"*) : ;;
+        *) echo "PUBLISH-TAR-HEADER-INVALID:extra-directory=$d"; exit 10 ;;
+    esac
+done < <(printf '%s\n' "$TAR_VERBOSE" | awk 'substr($1,1,1) == "d" {{print $6}}')
 
 # Step 4: extract into a fresh temp sibling. --same-permissions (-p) is
 # REQUIRED here: plain `tar -x` as a non-root user applies the extracting
@@ -858,15 +891,14 @@ def docker_run_detached(host, name, tree, img, inner_cmd):
     here specifically so a no-network test can monkeypatch exactly these
     two named functions (and nothing else, no command-text pattern
     matching needed) to prove zero containers are touched for a launch
-    plan that never made it past resolution. `/work` is mounted READ-ONLY
-    (`:ro`) -- the running scheduler/daemon/client only ever READ their own
-    binary from it (all logs/state go to the separate `/scratch` mount,
-    which stays writable); nothing at runtime has a legitimate reason to
-    write into an immutable role-artifact root, so the container itself is
-    now structurally prevented from doing so (verified live: a write
-    attempt through a `:ro` bind mount fails with "Read-only file system").
+    plan that never made it past resolution. The selected host root is
+    mounted read-only at `/artifact-source`; `/work` is a private tmpfs
+    populated and verified by the caller before the role starts. This
+    closes same-inode host truncation as well as directory-entry swaps --
+    an FD to a live bind is not an immutable byte object. Logs/state go to
+    the separate `/scratch` mount, which stays writable.
 
-    `inner_cmd` is expected to already carry its own attestation prefix
+    `inner_cmd` is expected to already carry its staging and attestation prefixes
     (see _attestation_prefix()) when the caller wants one -- this
     function itself is attestation-agnostic, same as it's tree/set-
     agnostic; it just runs whatever single command string it's given as
@@ -883,7 +915,14 @@ def docker_run_detached(host, name, tree, img, inner_cmd):
     path this design has no legitimate use for (every image this
     launches is supposed to already be local, verified, and pinned)."""
     MUTATIONS.mark()
-    sh(host, f"docker run -d --pull=never --name {name} --network host -v {tree}:/work:ro -v {SCRATCH}:/scratch -u 0:0 {img} "
+    if "ARTIFACT-STAGED-OK-" in inner_cmd:
+        work_mount = f"-v {tree}:/artifact-source:ro --tmpfs /work:rw,exec"
+    else:
+        # Preserve the pre-S4 default (binary_set=None) path, whose legacy
+        # TREE is already the runtime tree and has no manifest closure to
+        # stage.  Selected sets always take the private branch above.
+        work_mount = f"-v {tree}:/work:ro"
+    sh(host, f"docker run -d --pull=never --name {name} --network host {work_mount} -v {SCRATCH}:/scratch -u 0:0 {img} "
              f"bash -c '{inner_cmd}'", check=True)
 
 def scratch_prepare(host, mkdir_path, log_path):
@@ -900,10 +939,58 @@ def _attestation_token():
     happened to reuse the same name (see _attestation_prefix())."""
     return secrets.token_hex(8)
 
-ROLE_BINARY_FD = 8   # the fixed FD number _attestation_prefix() stages the
-                     # role binary at; the caller's real_cmd execs
-                     # /proc/self/fd/8, never re-opening the path -- see
-                     # _attestation_prefix()'s docstring.
+ARTIFACT_STAGE_ROOT = "/work"
+
+def _artifact_stage_prefix(binary_set, token):
+    """Stage and verify the complete selected artifact closure privately.
+
+    `/artifact-source` is the host bind and is only an input.  Every
+    manifest-listed file is copied into the container-private `/work` tmpfs,
+    then checked there for exact relative path, regular-file type, byte size,
+    sha256, and hardened mode.  A source rewrite/truncate during the copy can
+    therefore only produce a rejected private copy.  Staging the complete
+    closure covers C's icecc, icecc-create-env, iceccd, and every other
+    selected artifact-root file opened by farm_client/replay.
+    """
+    if binary_set is None:
+        return ""
+    manifest = load_manifest(binary_set)
+    paths = [b["path"] for b in manifest["binaries"]]
+    if len(paths) != len(set(paths)):
+        raise RuntimeError(f"artifact manifest {binary_set!r} contains duplicate paths")
+    if any(not re.fullmatch(r"[A-Za-z0-9_./+-]+", p) or p.startswith("/") or ".." in p.split("/")
+           for p in paths):
+        raise RuntimeError(f"artifact manifest {binary_set!r} contains an unsafe relative path")
+    expected = "\n".join(sorted(paths))
+    rows = "\n".join(
+        f"{b['path']}\t{b['sha256']}\t{b['size']}\t{_write_stripped(b['mode'])}"
+        for b in manifest["binaries"]
+    )
+    parts = [
+        "mkdir -p /work",
+        "find /work -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +",
+    ]
+    for p in paths:
+        parts.extend([
+            f'if [ -L "/artifact-source/{p}" ] || [ ! -f "/artifact-source/{p}" ]; then echo ARTIFACT-STAGE-FAIL; exit 98; fi',
+            f'mkdir -p "$(dirname "/work/{p}")"',
+            f'if ! cp -- "/artifact-source/{p}" "/work/{p}"; then echo ARTIFACT-STAGE-FAIL; exit 98; fi',
+        ])
+    parts.extend([
+        "STAGE_INV=$(find /work -mindepth 1 ! -type d -printf %P\\n 2>/dev/null | sort)",
+        "EXPECTED_STAGE_INV=$(cat <<ARTIFACT_PATHS\n" + expected + "\nARTIFACT_PATHS\n)",
+        'if [ "$STAGE_INV" != "$EXPECTED_STAGE_INV" ]; then echo ARTIFACT-STAGE-FAIL; exit 98; fi',
+        "while read -r path sha size mode; do\n"
+        '  f="/work/$path"; if [ -L "$f" ] || [ ! -f "$f" ]; then echo ARTIFACT-STAGE-FAIL; exit 98; fi\n'
+        '  h=$(sha256sum "$f"); h=${h%% *}; [ "$h" = "$sha" ] || { echo ARTIFACT-STAGE-FAIL; exit 98; }\n'
+        '  s=$(stat -c %s "$f"); [ "$s" = "$size" ] || { echo ARTIFACT-STAGE-FAIL; exit 98; }\n'
+        '  m=$(stat -c %a "$f"); [ "$m" = "$mode" ] || { echo ARTIFACT-STAGE-FAIL; exit 98; }\n'
+        "done <<ARTIFACT_ROWS\n" + rows.replace("\t", " ") +
+        "\nARTIFACT_ROWS\n"
+        "if ! chmod -R a-w /work; then echo ARTIFACT-STAGE-FAIL; exit 98; fi\n"
+        f"echo ARTIFACT-STAGED-OK-{token}",
+    ])
+    return "; ".join(parts) + "; "
 
 def _attestation_prefix(binary_set, token, role_binary_path=None):
     """Build a bash snippet -- safe to embed inside a single-quoted
@@ -927,30 +1014,14 @@ def _attestation_prefix(binary_set, token, role_binary_path=None):
     is no window, however small, during which an unattested container is
     already running the real binary.
 
-    `role_binary_path` (round-5, Deep Reviewer): the manifest-relative
-    path of the ONE tracked file THIS container's own real_cmd is about
-    to exec (e.g. "obj/scheduler/icecc-scheduler"). Every OTHER tracked
-    file is still checked by PATH exactly as before (they are read-then-
-    left on disk by the already-running process, never exec'd by this
-    shell, so an FD-pin here would not close anything a later runtime
-    read couldn't still independently race -- that is a different, wider
-    hardening question, not this fix's scope). The role binary itself
-    gets a STRONGER guarantee: opened as FD 8 (ROLE_BINARY_FD) FIRST via
-    `exec 8< PATH`, hashed via `sha256sum /proc/self/fd/8` (never
-    re-reading the path), and the caller's real_cmd is expected to
-    `exec /proc/self/fd/8` rather than re-opening `/work/<path>`. This
-    closes a real TOCTOU the
-    path-based design had: hashing `/work/X` and later separately exec'ing
-    `/work/X` are two independent opens of the same PATH, with nothing
-    (from the container's perspective) stopping a host-side actor from
-    replacing the underlying inode in between, however narrow that window
-    normally is. An open file descriptor is a reference to the INODE
-    itself, established at the moment of open() -- completely independent
-    of whatever the path's directory entry is later changed to point at
-    (this is standard POSIX file semantics, the same property that makes
-    a still-open deleted file's contents remain readable through its fd)
-    -- so hash and exec, sharing the SAME fd, are now provably the exact
-    same bytes, with a window of zero, not merely a narrow one.
+    `role_binary_path` is retained as a caller-side assertion naming the
+    executable whose already-staged private path the caller will exec. The
+    staging prefix has copied and verified *all* manifest files before this
+    function runs, so this attestation rechecks the private closure rather
+    than the live host bind. There is deliberately no FD to a host-owned
+    inode here: same-inode truncation after an FD hash would still change
+    the bytes observed through that FD. The private tmpfs copy is hardened
+    before its marker and role exec.
 
     Raises RuntimeError immediately (before returning any bash text) if
     role_binary_path is given but isn't one of manifest[binary_set]'s
@@ -971,11 +1042,7 @@ def _attestation_prefix(binary_set, token, role_binary_path=None):
     for b in manifest["binaries"]:
         remote = f"/work/{b['path']}"
         parts.append(f'if [ -L "{remote}" ] || [ ! -f "{remote}" ]; then echo ARTIFACT-ATTEST-FAIL; exit 97; fi')
-        if b["path"] == role_binary_path:
-            parts.append(f'exec {ROLE_BINARY_FD}< "{remote}"')
-            parts.append(f'h=$(sha256sum /proc/self/fd/{ROLE_BINARY_FD}); h=${{h%% *}}')
-        else:
-            parts.append(f'h=$(sha256sum "{remote}"); h=${{h%% *}}')
+        parts.append(f'h=$(sha256sum "{remote}"); h=${{h%% *}}')
         parts.append(f'if [ "$h" != "{b["sha256"]}" ]; then echo ARTIFACT-ATTEST-FAIL; exit 97; fi')
     parts.append(f"echo ARTIFACT-ATTEST-OK-{token}")
     return "; ".join(parts) + "; "
@@ -999,6 +1066,9 @@ def wait_for_attestation(host, name, token, timeout=30):
     r = None
     while time.time() < deadline:
         r = sh(host, f"docker logs {name} 2>&1", timeout=15)
+        if "ARTIFACT-STAGE-FAIL" in r.stdout:
+            raise RuntimeError(f"in-container artifact staging FAILED for {name} on {host} "
+                                f"(private closure was not accepted -- docker logs: {r.stdout[-400:]})")
         if "ARTIFACT-ATTEST-FAIL" in r.stdout:
             raise RuntimeError(f"in-container attestation FAILED for {name} on {host} "
                                 f"(container refused to start the real role binary -- "
@@ -1048,9 +1118,11 @@ def up(worker_hosts, plan):
     docker_rm(SCHED_HOST, "farm-sched")
     scratch_prepare(SCHED_HOST, f"{SCRATCH}/farm", f"{SCRATCH}/farm/sched.log")
     s_token = _attestation_token()
+    s_stage_token = _attestation_token()
     docker_run_detached(SCHED_HOST, "farm-sched", plan.s_tree, plan.s_img,
+        _artifact_stage_prefix(plan.binary_set_s, s_stage_token) +
         _attestation_prefix(plan.binary_set_s, s_token, "obj/scheduler/icecc-scheduler") +
-        f"useradd -r icecc 2>/dev/null; exec /proc/self/fd/{ROLE_BINARY_FD} -p {SCHED_PORT} -n {NET} -l /scratch/farm/sched.log -vvv")
+        f"useradd -r icecc 2>/dev/null; exec /work/obj/scheduler/icecc-scheduler -p {SCHED_PORT} -n {NET} -l /scratch/farm/sched.log -vvv")
     wait_for_attestation(SCHED_HOST, "farm-sched", s_token)
     time.sleep(3)
     # one worker per F -- every host's role was already resolved, in order,
@@ -1064,11 +1136,13 @@ def up(worker_hosts, plan):
         # chmod only the mickg-owned dir (not -R: stale daemon files are uid-999, unchmod-able by host user; rm clears them)
         scratch_prepare(h, f"{SCRATCH}/farm/envs", f"{SCRATCH}/farm/worker.log")
         f_token = _attestation_token()
+        f_stage_token = _attestation_token()
         docker_run_detached(h, "farm-worker", f_tree, f_img,
+            _artifact_stage_prefix(plan.binary_set_f, f_stage_token) +
             _attestation_prefix(plan.binary_set_f, f_token, "obj/daemon/iceccd") +
             f"useradd -r -s /usr/sbin/nologin icecc 2>/dev/null; "
             f"chown icecc /scratch/farm/envs; "  # pre-chown as root: daemon's cleanup_cache runs post-drop (no CAP_CHOWN)
-            f"exec /proc/self/fd/{ROLE_BINARY_FD} -m 8 -s {sip}:{SCHED_PORT} -n {NET} -N {h}w -b /scratch/farm/envs "
+            f"exec /work/obj/daemon/iceccd -m 8 -s {sip}:{SCHED_PORT} -n {NET} -N {h}w -b /scratch/farm/envs "
             f"-p {wp} -l /scratch/farm/worker.log -vvv")
         wait_for_attestation(h, "farm-worker", f_token)
     # wait for all workers to register
@@ -1221,8 +1295,12 @@ def docker_run_foreground_staged(host, name, tree, img, stdin_bytes, inner_cmd, 
     left this name occupied."""
     MUTATIONS.mark()
     sh(host, f"docker rm -f {name} 2>/dev/null; true")
+    if "ARTIFACT-STAGED-OK-" in inner_cmd:
+        work_mount = f"-v {tree}:/artifact-source:ro --tmpfs /work:rw,exec"
+    else:
+        work_mount = f"-v {tree}:/work:ro"
     cmd = (f"docker run -i --rm --pull=never --name {name} --network host "
-           f"-v {tree}:/work:ro --tmpfs /scratch -v {SCRATCH}:/hostscratch:ro "
+           f"{work_mount} --tmpfs /scratch -v {SCRATCH}:/hostscratch:ro "
            f"-u 0:0 {img} bash -c '{inner_cmd}'")
     return sh_stdin(host, cmd, stdin_bytes, timeout=timeout)
 
@@ -1259,17 +1337,11 @@ def run_client(client_host, project_dir, mode, maxtu, jobs, prefer, plan):
     itself is never modified (it already honors a `CMAKE` environment
     override, exported here rather than editing the frozen script).
 
-    Attestation (_attestation_prefix()) is unchanged in spirit -- it
-    still runs INSIDE the same container, immediately before
-    farm_client.sh, gating every tracked role binary exactly as before.
-    farm_client.sh's own top-level invocation (`bash .../farm_client.sh`,
-    not a direct `/work/<path>` exec) is a fundamentally different shape
-    from S/F's single PID-1 binary exec, so it is not (yet) a candidate
-    for the FD-pinned exec _attestation_prefix() now offers S/F
-    (role_binary_path) -- replay.py's OWN repeated, per-TU invocations of
-    `/work/client/icecc` are a wider version of that same TOCTOU class,
-    intentionally left as a disclosed follow-up rather than folded in
-    here.
+    The selected artifact root is staged into the same container-private
+    `/work` tmpfs for C as for S/F.  Thus farm_client.sh and replay.py's
+    repeated invocations of icecc cannot observe a host-owned live bind.
+    The stage covers the full manifest closure, including icecc-create-env
+    and iceccd, before the frozen harness is reached.
 
     `--rm` (docker_run_foreground_staged()'s own design) means this
     container is already gone by the time this function returns on any
@@ -1290,11 +1362,13 @@ def run_client(client_host, project_dir, mode, maxtu, jobs, prefer, plan):
     bundle = _build_harness_bundle()
     stage_token = _attestation_token()
     c_token = _attestation_token()
+    artifact_stage_token = _attestation_token()
     stage_verify = _harness_stage_verify(stage_token)
+    artifact_stage = _artifact_stage_prefix(plan.binary_set_c, artifact_stage_token)
     attest = _attestation_prefix(plan.binary_set_c, c_token)
     real_cmd = (f"export CMAKE=/hostscratch/cmake/bin/cmake; "
                 f"bash /scratch/farm_client.sh {sched} {NET} {project_dir} {mode} {maxtu} {jobs} {prefer}")
-    inner_cmd = f"mkdir -p /scratch && tar -xf - -C /scratch && {stage_verify}{attest}{real_cmd}"
+    inner_cmd = f"mkdir -p /scratch && tar -xf - -C /scratch && {artifact_stage}{stage_verify}{attest}{real_cmd}"
     print(f"TEST: client={client_host} project={project_dir} mode={mode} maxtu={maxtu} jobs={jobs} prefer={prefer} "
           f"C-tree={plan.c_tree}")
     r = docker_run_foreground_staged(client_host, "farm-client", plan.c_tree, plan.c_img, bundle, inner_cmd, timeout=1800)
@@ -1305,6 +1379,13 @@ def run_client(client_host, project_dir, mode, maxtu, jobs, prefer, plan):
         raise RuntimeError(f"in-container harness-stage marker missing for farm-client on {client_host} "
                             f"(expected HARNESS-STAGED-OK-{stage_token}); refusing to trust this run's output: "
                             f"{r.stdout[-400:]}")
+    if "ARTIFACT-STAGE-FAIL" in (r.stdout or ""):
+        raise RuntimeError(f"in-container artifact staging FAILED for farm-client on {client_host} -- "
+                           f"farm_client.sh was never reached: {r.stdout[-400:]}")
+    if plan.binary_set_c is not None and f"ARTIFACT-STAGED-OK-{artifact_stage_token}" not in (r.stdout or ""):
+        raise RuntimeError(f"in-container artifact-stage marker missing for farm-client on {client_host} "
+                           f"(expected ARTIFACT-STAGED-OK-{artifact_stage_token}); refusing to trust this run's output: "
+                           f"{r.stdout[-400:]}")
     if "ARTIFACT-ATTEST-FAIL" in (r.stdout or ""):
         raise RuntimeError(f"in-container attestation FAILED for farm-client on {client_host} -- "
                             f"farm_client.sh was never reached: {r.stdout[-400:]}")

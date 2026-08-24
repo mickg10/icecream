@@ -51,6 +51,20 @@ real image reference on research6 -- never any data loss, confirmed via
 a fresh production `preflight()` PASS afterward). This round remains
 scoped to the mechanism checkpoint only -- same boundary as above.
 
+**Round 6 successor:** this commit closes the remaining four mechanism-HOLD
+items from the 2026-08-24 review of `1c856394`. S/F/C now mount the selected
+host root only at `/artifact-source:ro`, copy the complete manifest closure
+into a container-private `/work` tmpfs, verify path/type/sha256/size and
+hardened mode there, and execute only those private bytes. This supersedes
+round 5's FD-to-live-bind S/F shape and covers C's `icecc`,
+`icecc-create-env`, `iceccd`, and every selected artifact file opened by
+`farm_client.sh`/`replay.py`. Publication header validation now compares
+normalized regular-member name/type/per-file-size rows to the committed
+manifest before extraction, including duplicate-normalized-path and
+directory-parent checks. The no-Git fallback hashes relative paths, modes,
+and content, never absolute extraction locations. The round-5 harness tmpfs
+and exact image-ref/`--pull=never` mechanisms remain intact.
+
 **The machine-readable authority is `farmharness/role-manifests/p43.json`
 and `farmharness/role-manifests/p50.json`.** This document is narrative
 only. `farm.py`'s `preflight()`/`distribute()`/`immutable_root()`/
@@ -1008,11 +1022,11 @@ is the entire HOLD"):
 | Whole-plan barrier | **PRODUCTION**: `revalidate_entire_plan()`, called from `main()` |
 | Per-role defense-in-depth | **PRODUCTION**: `revalidate_before_mutation()`, called from `up()`/`run_client()` |
 | Mutation tracking / down()-suppression | **PRODUCTION**: `MUTATIONS` object + `main()`'s `finally` block |
-| In-command attestation, incl. round-5 exec-by-open-fd (`role_binary_path`, `ROLE_BINARY_FD`) | **PRODUCTION**: `_attestation_prefix()` embedded directly in `docker_run_detached()`'s launch commands (S/F pass `role_binary_path`; `run_client()`'s C-role call does not, see the round-5 write-up for why), `wait_for_attestation()` |
+| Private artifact closure staging + in-command attestation | **PRODUCTION**: `_artifact_stage_prefix()` copies the complete manifest closure from `/artifact-source:ro` into private `/work` before `_attestation_prefix()` and the S/F/C role command; `wait_for_attestation()` rejects stage or attestation failure |
 | Race-gate seam | **PRODUCTION**: `_race_gate_pause()`, called from `main()` (inert unless test env vars are set) |
 | Harness-script integrity (HUB_DIR, hash pinning) | **PRODUCTION**: `verify_harness_scripts()`, called as the first line of `run_client()` |
 | Harness PRIVATE STAGING (round 5) | **PRODUCTION**: `_build_harness_bundle()`, `_harness_stage_verify()`, `docker_run_foreground_staged()` -- all called from `run_client()`, which streams the bundle into a real foreground `docker run -i` |
-| Tar header pre-validation (round 5) | **PRODUCTION**: the new step-3 block inside `_publish_script()`'s generated remote script, run by every real `distribute()`/`publish_immutable_root()` call before extraction |
+| Tar header pre-validation (round 6) | **PRODUCTION**: the step-3 block inside `_publish_script()`'s generated remote script compares normalized manifest name/type/per-file-size rows before extraction, run by every real `distribute()`/`publish_immutable_root()` call |
 | Digest-ref-exact image verification + `--pull=never` (round 5) | **PRODUCTION**: `image_digest_remote(host, binary_set)`, called from `preflight()`; `--pull=never` in `docker_run_detached()`/`docker_run_foreground_staged()`'s own command strings |
 | No-git fresh-archive fallback (round 5) | **TEST SCAFFOLDING**: the fresh-archive gate itself is test infrastructure, not production `farm.py` code -- but the claim under test (farm.py imports and both manifests load cleanly from a bare, non-git tree) exercises real, unmodified `farm.load_manifest()`/module-import behavior |
 | Cell-verdict combination (`client_ok`/`join_ok`/`ok`) | **PRODUCTION**: the three-line combination in `main()`, immediately after `run_client()` returns |
