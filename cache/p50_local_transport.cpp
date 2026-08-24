@@ -7,11 +7,13 @@
 #include <limits>
 #include <mutex>
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/stat.h>
 
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/un.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 namespace icecc::p50::local {
@@ -319,6 +321,38 @@ bool Connection::cloexec() const noexcept {
         return false;
     const int flags = ::fcntl(fd_, F_GETFD);
     return flags >= 0 && (flags & FD_CLOEXEC) != 0;
+}
+
+Status Connection::verify_peer_credentials(const CredentialExpectation& expected) const noexcept {
+    if (fd_ < 0)
+        return status_;
+    return local::verify_peer_credentials(fd_, expected);
+}
+
+Status Connection::receive_with_timeout(Frame& frame, int timeout_ms) noexcept {
+    if (fd_ < 0)
+        return status_;
+    if (timeout_ms < 0)
+        return Status::InvalidArgument;
+    struct pollfd descriptor{fd_, POLLIN | POLLERR | POLLHUP, 0};
+    const int result = ::poll(&descriptor, 1, timeout_ms);
+    if (result == 0)
+        return Status::IoError;
+    if (result < 0)
+        return Status::IoError;
+    if (timeout_ms == 0)
+        return Status::InvalidArgument;
+    struct timeval old_timeout{};
+    socklen_t old_length = sizeof(old_timeout);
+    const bool had_old_timeout =
+        ::getsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &old_timeout, &old_length) == 0;
+    struct timeval timeout{timeout_ms / 1000, (timeout_ms % 1000) * 1000};
+    if (::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0)
+        return Status::IoError;
+    const Status status = read_frame(fd_, frame);
+    if (had_old_timeout)
+        (void)::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &old_timeout, sizeof(old_timeout));
+    return status;
 }
 
 Connection::Connection(Connection&& other) noexcept

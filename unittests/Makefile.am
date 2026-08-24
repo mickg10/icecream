@@ -1,4 +1,4 @@
-TESTS = testargs lockexec backpressure schedpolicy utf8test statewritertest fastesttest hallflowtest jobidalloctest inputpump compilerinput p49assignment p50assignment p50cacheadvertisement p50assignment-source.sh p50cacheadvertisement-source.sh p50localtransport-source.sh packagebuilderdeps.sh p49daemon-run.sh p49scheduler-run.sh connectivity-run.sh schedbp-quick.sh schedstress-quick.sh remoteice-quick.sh p50assignment-remote.sh daemonlogin-run.sh daemonbatch-run.sh cachehandoffdaemon-run.sh boost-prefix-scope.sh p50wire p50slice0 p50zstd p50zstdwindow p50inputrecord p50inputrecordlate p50inputrecordreopen p50endpoint p50localtransport digest128bench p50_trace_check.sh
+TESTS = testargs lockexec backpressure schedpolicy utf8test statewritertest fastesttest hallflowtest jobidalloctest inputpump compilerinput p49assignment p50assignment p50cacheadvertisement p50assignment-source.sh p50cacheadvertisement-source.sh p50localtransport-source.sh packagebuilderdeps.sh p49daemon-run.sh p49scheduler-run.sh connectivity-run.sh schedbp-quick.sh schedstress-quick.sh remoteice-quick.sh p50assignment-remote.sh daemonlogin-run.sh daemonbatch-run.sh cachehandoffdaemon-run.sh boost-prefix-scope.sh p50wire p50slice0 p50zstd p50zstdwindow p50inputrecord p50inputrecordlate p50inputrecordreopen p50endpoint p50localtransport digest128bench p50cacheservice p50_trace_check.sh
 
 AM_TESTS_ENVIRONMENT = \
 	ICECC_TEST_BUILDDIR='$(abs_builddir)'; export ICECC_TEST_BUILDDIR; \
@@ -12,6 +12,7 @@ AM_TESTS_ENVIRONMENT = \
 	ICECC_TEST_PKG_CONFIG='$(PKG_CONFIG)'; export ICECC_TEST_PKG_CONFIG; \
 	ICECC_TEST_PKG_CONFIG_PATH='$(PKG_CONFIG_PATH)'; export ICECC_TEST_PKG_CONFIG_PATH; \
 	ICECC_TEST_PKG_CONFIG_LIBDIR='$(PKG_CONFIG_LIBDIR)'; export ICECC_TEST_PKG_CONFIG_LIBDIR; \
+	ICECC_TEST_CACHE_SERVICE='$(abs_top_builddir)/cache/icecc-cache-service'; export ICECC_TEST_CACHE_SERVICE; \
 	ICECC_TEST_CXX_STANDARD_FLAG='$(ICE_CXX_STANDARD_FLAG)'; export ICECC_TEST_CXX_STANDARD_FLAG; \
 	ICECC_TEST_CFLAGS='$(CFLAGS)'; export ICECC_TEST_CFLAGS; \
 	ICECC_TEST_CXXFLAGS='$(CXXFLAGS)'; export ICECC_TEST_CXXFLAGS; \
@@ -51,7 +52,7 @@ p50localtransport_CXXFLAGS = -pthread
 p50localtransport_LDFLAGS = -pthread
 digest128bench_LDADD = ../services/libicecc.la
 
-check_PROGRAMS = testargs lockexec backpressure schedpolicy utf8test statewritertest schedbp daemonlogin daemonbatch cachehandoffdaemon p49daemon p49scheduler connectivity fastesttest hallflowtest jobidalloctest inputpump compilerinput p49assignment p50assignment p50cacheadvertisement p50wire p50slice0 p50zstd p50zstdwindow p50inputrecord p50inputrecordlate p50inputrecordreopen p50endpoint p50localtransport digest128bench
+check_PROGRAMS = testargs lockexec backpressure schedpolicy utf8test statewritertest schedbp daemonlogin daemonbatch cachehandoffdaemon p49daemon p49scheduler connectivity fastesttest hallflowtest jobidalloctest inputpump compilerinput p49assignment p50assignment p50cacheadvertisement p50wire p50slice0 p50zstd p50zstdwindow p50inputrecord p50inputrecordlate p50inputrecordreopen p50endpoint p50localtransport digest128bench p50cacheservice
 testargs_SOURCES = args.cpp
 p50wire_SOURCES = p50_wire_test.cpp
 p50slice0_SOURCES = \
@@ -121,6 +122,9 @@ p50cacheadvertisement_SOURCES = p50cacheadvertisement.cpp
 p50cacheadvertisement_CXXFLAGS = -pthread
 p50cacheadvertisement_LDFLAGS = -pthread
 p50cacheadvertisement_LDADD = ../cache/libprotocol50.a ../services/libicecc.la
+p50cacheservice_SOURCES = p50cacheservice.cpp
+p50cacheservice_LDADD = ../cache/libp50localtransport.a
+p50cacheservice_DEPENDENCIES = ../cache/icecc-cache-service
 inputpump_SOURCES = input_pump_test.cpp
 inputpump_CXXFLAGS = -pthread
 inputpump_LDFLAGS = -pthread

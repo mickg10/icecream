@@ -1,5 +1,11 @@
 noinst_LIBRARIES = libprotocol50.a libp50endpoint.a libp50localtransport.a
 
+sbin_PROGRAMS = icecc-cache-service
+
+icecc_cache_service_SOURCES = p50_cache_service.cpp p50_cache_service.h
+icecc_cache_service_LDADD = libp50localtransport.a
+icecc_cache_service_CXXFLAGS = -O2 -Werror
+
 libprotocol50_a_SOURCES = \
 	protocol50.cpp \
 	protocol50.h \
@@ -113,6 +119,7 @@ EXTRA_DIST = \
 	formal/.gitignore \
 	formal/check_trace.py \
 	P50_LOCAL_TRANSPORT.md \
+	P50_CACHE_SERVICE.md \
 	formal/README.md
 
 check-local:

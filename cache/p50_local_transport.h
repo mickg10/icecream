@@ -51,6 +51,8 @@ struct Frame {
     auto operator<=>(const Frame&) const = default;
 };
 
+struct CredentialExpectation;
+
 enum class Status {
     Ok = 0,
     InvalidArgument,
@@ -99,6 +101,14 @@ public:
     [[nodiscard]] bool valid() const noexcept { return fd_ >= 0; }
     [[nodiscard]] Status status() const noexcept { return status_; }
     [[nodiscard]] bool cloexec() const noexcept;
+
+    // Verifies the peer while retaining descriptor ownership in this object.
+    // Callers do not need (and cannot borrow) a second raw descriptor.
+    Status verify_peer_credentials(const CredentialExpectation& expected) const noexcept;
+
+    // Waits for input with a finite bound before reading one exact frame.
+    // This keeps a control connection from preventing signal-driven shutdown.
+    Status receive_with_timeout(Frame& frame, int timeout_ms) noexcept;
 
     // A concurrent caller gets Busy.  There is intentionally no implicit
     // queue: one bounded queue and one writer belong to the relationship.
