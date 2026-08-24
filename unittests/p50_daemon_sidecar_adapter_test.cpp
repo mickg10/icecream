@@ -138,7 +138,7 @@ int main()
     if (temp_root == nullptr || temp_root[0] != '/')
         return 2;
     const std::string directory_pattern =
-        std::string(temp_root) + "/icecc-p50-adapter-test-XXXXXX";
+        std::string(temp_root) + "/p50ad-XXXXXX";
     std::vector<char> directory_buffer(directory_pattern.begin(), directory_pattern.end());
     directory_buffer.push_back('\0');
     char* const directory = directory_buffer.data();
