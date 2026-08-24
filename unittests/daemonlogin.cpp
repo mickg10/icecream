@@ -9,6 +9,12 @@
    generation; duplicate ConfCS does not create another, and loss of that
    active session performs one cleanup.
 
+   S2 Gap 3 (BigOracle d23d9c5d HOLD, reused-client clearing): client A's
+   local-fallback request above also exercises handle_get_cs's no-scheduler
+   clear of a poisoned (test-only fabricated) retained cache handoff -- see
+   the comment at its assertion below, and
+   test_poison_cache_handoff_if_armed's own comment in daemon/main.cpp.
+
    Usage: daemonlogin <iceccd>
 */
 
@@ -193,6 +199,27 @@ static bool wait_eof(MsgChannel *channel, int timeout_msec)
     return channel && channel->at_eof();
 }
 
+/* Bounded retry over request_internals(): used where the event proving the
+   real clear ran (e.g. handle_old_request's per-tick stranded-request
+   sweep) is not synchronized to any single reply client A/B already
+   received, so a single status snapshot could race ahead of it. */
+static std::string wait_for_internals_containing(MsgChannel *client,
+                                                  const std::string &needle,
+                                                  int timeout_msec)
+{
+    const Clock::time_point deadline = Clock::now()
+        + std::chrono::milliseconds(timeout_msec);
+    std::string last;
+    while (Clock::now() < deadline) {
+        last = request_internals(client, 2000);
+        if (last.find(needle) != std::string::npos) {
+            return last;
+        }
+        usleep(50 * 1000);
+    }
+    return last;
+}
+
 static bool wait_child(pid_t pid, int timeout_msec, int *status)
 {
     const Clock::time_point deadline = Clock::now()
@@ -244,6 +271,17 @@ int main(int argc, char **argv)
                  scheduler_port);
         setenv("ICECC_TESTS", "1", 1);
         setenv("ICECC_TEST_SOCKET", socket_path.c_str(), 1);
+        /* S2 Gap 3 (BigOracle d23d9c5d HOLD): arms the poison/record hook
+           (see test_poison_cache_handoff_if_armed's own comment in
+           daemon/main.cpp) for TWO sites this one daemon process visits,
+           in order, non-overlapping: client A's local-fallback request
+           below (get_cs_no_scheduler, before any scheduler connects), then
+           much later client B's stranded held GetCS once the candidate
+           Login attempt is abandoned (old_request_stranded).  Each result
+           is read via request_internals immediately after its site fires,
+           before the next one can. */
+        setenv("ICECC_TEST_POISON_CACHE_HANDOFF_SITE",
+               "get_cs_no_scheduler,old_request_stranded", 1);
         execl(argv[1], argv[1], "--no-remote", "-m", "1", "-p", "10245",
               "-s", scheduler_spec, "-n", "g4-login-gate", "-N", "g4-daemon",
               "-b", envdir.c_str(), "-l", daemon_log.c_str(),
@@ -266,6 +304,28 @@ int main(int argc, char **argv)
     REQUIRE(local_reply != nullptr,
             "local client A entered the existing local fallback path");
     delete local_reply;
+
+    /* S2 Gap 3 (BigOracle d23d9c5d HOLD, reused-client clearing):
+       handle_get_cs's no-scheduler branch clears c->cacheHandoff so a
+       handoff retained from an earlier dispatch on this same (reused)
+       Client cannot leak forward.  No real wire flow can hand this site a
+       Client that both genuinely retained a prior handoff and is making a
+       second live GetCS decision (Client::getcs_outstanding forbids a
+       second GetCS on one connection outright), so
+       ICECC_TEST_POISON_CACHE_HANDOFF_SITE=get_cs_no_scheduler (armed
+       above) fabricated a retained handoff on client A immediately before
+       this real, unmodified clear ran.  The clear happens synchronously
+       within the SAME handle_get_cs call that built local_reply above --
+       received on this same connection -- so one status query already
+       reflects it; no retry/poll race like Client D's cross-connection
+       case in cachehandoffdaemon.cpp. */
+    const std::string no_scheduler_clear = request_internals(client_a, 5000);
+    REQUIRE(no_scheduler_clear.find(
+                "Cache-handoff clear test: site=get_cs_no_scheduler fired=1 "
+                "valid=0 port=0 protocol=0 mask=0") != std::string::npos,
+            "S2 Gap 3: handle_get_cs's no-scheduler clear reset a retained "
+            "(poisoned) handoff back to canonical absence -- valid, port, "
+            "protocol, and mask all zero");
 
     int bound_port = 0;
     const int listener = listen_on_port(scheduler_port, &bound_port);
@@ -295,6 +355,51 @@ int main(int argc, char **argv)
             "local client A remained alive after the Login attempt closed");
     REQUIRE(preactive.find("cleanup_attempts=0") != std::string::npos,
             "Login-attempt loss performed zero established-session cleanups");
+
+    /* S2 Gap 3 (BigOracle d23d9c5d HOLD, reused-client clearing):
+       handle_old_request's schedulerless-fallback branch resolves client
+       B's now-stranded deferred_getcs (the candidate attempt above was
+       abandoned before ConfCS) via the same canonical-cache-absent local
+       fallback as client A's, clearing c->cacheHandoff first.  As with the
+       other two Gap 3 sites, no real wire flow can hand this site a Client
+       that both genuinely retained a prior handoff and is mid a second
+       live GetCS decision, so old_request_stranded (armed above alongside
+       get_cs_no_scheduler) fabricates that precondition immediately before
+       the real, unmodified clear runs.  This is the ONLY one of the three
+       Gap 3 sites reached by a stranded held request rather than a fresh
+       one, and the only one not synchronized to a reply on the SAME
+       connection queried -- handle_old_request's stranded sweep runs on
+       its own per-tick schedule relative to client A's status-query
+       connection, and the daemon has not yet been given anywhere to
+       reconnect (the listener above is not accepting again until after
+       this poll), so it is polled rather than checked once.  The bound is
+       deliberately SHORT (not the seconds-scale margin used elsewhere in
+       this file): the real sweep observably fires within a tick, well
+       under 100ms, and iceccd's own scheduler-reconnect retry runs in a
+       tight sub-second loop (see "Delaying reconnect." in its log) that
+       starts refilling the listener's backlog immediately -- a multi-
+       second poll bound here would let that backlog churn accumulate
+       before accept_login_channel below ever runs, corrupting the
+       replacement-scheduler handshake that follows regardless of this
+       assertion's own outcome.  Confirmed by direct measurement: a 3000ms
+       (let alone 10000ms) bound reliably produced a SECOND, unrelated
+       failure downstream ("first ConfCS committed exactly one
+       generation") whenever this assertion's own needle was absent and
+       the poll ran to its full bound -- a test-harness timing artifact of
+       the poll's OWN duration, not a second production defect; a mutant
+       deleting the real clear reproduced that collateral at 3000/10000ms
+       and stopped reproducing it at this bound. */
+    const std::string stranded_clear = wait_for_internals_containing(
+        client_a,
+        "Cache-handoff clear test: site=old_request_stranded fired=1 "
+        "valid=0 port=0 protocol=0 mask=0",
+        400);
+    REQUIRE(stranded_clear.find(
+                "Cache-handoff clear test: site=old_request_stranded fired=1 "
+                "valid=0 port=0 protocol=0 mask=0") != std::string::npos,
+            "S2 Gap 3: handle_old_request's stranded schedulerless-fallback "
+            "clear reset client B's retained (poisoned) handoff back to "
+            "canonical absence -- valid, port, protocol, and mask all zero");
 
     Msg *relogin = nullptr;
     MsgChannel *active = accept_login_channel(listener, 20000, &relogin);

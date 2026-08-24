@@ -832,18 +832,26 @@ private:
 /* Daemon-side defensive re-check (BigOracle, d23d9c5d HOLD), factored out
    of Daemon::scheduler_use_cs into a small, pure, independently testable
    helper: a present cache triple is retained only when it is both fully
-   valid on its own (never merely non-empty) AND bound to a complete,
-   nonzero assignment identity.  UseCSMsg::valid_payload() already enforces
-   this same law at the wire (see MsgChannel::get_msg), so an invalid
-   combination can no longer legitimately reach this function through any
-   real socket -- but the daemon must not trust that channel-layer gate
-   implicitly, so this stays as defense in depth.  Because a live wire path
-   can no longer construct the malformed input, this is exercised directly
-   with a hand-constructed UseCSMsg in unittests/p50cacheadvertisement.cpp
-   rather than through any end-to-end integration test. */
+   valid on its own (never merely non-empty) AND bound to a COMPLETE,
+   nonzero assignment identity {job_id, epoch, nonce} -- matching
+   UseCSMsg::valid_payload's own assignment_complete definition exactly.
+   hasAssignmentIdentity() alone checks only epoch+nonce, not job_id (see
+   its own comment on UseCSMsg): a hand-constructed message with job_id==0
+   and nonzero epoch/nonce would otherwise be wrongly admitted here, even
+   though valid_payload() itself would already refuse it as a partial
+   identity paired with a present cache triple. UseCSMsg::valid_payload()
+   already enforces the full law at the wire (see MsgChannel::get_msg), so
+   an invalid combination can no longer legitimately reach this function
+   through any real socket -- but the daemon must not trust that channel-
+   layer gate implicitly, so this stays as defense in depth. Because a
+   live wire path can no longer construct the malformed input, this is
+   exercised directly with a hand-constructed UseCSMsg in
+   unittests/p50cacheadvertisement.cpp rather than through any end-to-end
+   integration test. */
 inline bool usecs_cache_handoff_admissible(const UseCSMsg &msg)
 {
-    return msg.hasCacheAdvertisement() && msg.hasAssignmentIdentity()
+    return msg.hasCacheAdvertisement() && msg.job_id != 0
+        && msg.hasAssignmentIdentity()
         && cache_advertisement_is_valid_present(
                msg.cache_endpoint_port, msg.cache_protocol,
                msg.cache_profile_mask);

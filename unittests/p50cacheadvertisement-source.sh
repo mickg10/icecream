@@ -115,6 +115,20 @@ require_count 1 'const uint32_t relay_cache_port = c->cacheHandoff.valid' \
 require_count 2 'relay_cache_mask);' daemon/main.cpp \
     'both scheduler_use_cs relay projections consume that same source'
 
+# BigOracle (d23d9c5d HOLD, remote-relay gap): c->usecsmsg is NOT the wire
+# vehicle for both projections above -- only the local (127.0.0.1 rewrite)
+# branch's is, delivered via the PENDING_USE_CS drain
+# (client->channel->send_msg(*client->usecsmsg)).  The ordinary remote-
+# worker branch's actual client delivery is *msg, the scheduler's own
+# frame, relayed directly; c->usecsmsg there exists only for
+# introspection.  This anchors that this really is where remote delivery
+# happens, so a rewrite of unittests/cachehandoffdaemon.cpp's remote-
+# selected-F scenario stays attached to the real send site.
+require_count 1 "This is the remote branch's ACTUAL client wire vehicle" \
+    daemon/main.cpp 'the remote-worker branch is documented at its real send site'
+require_count 2 'client->channel->send_msg(*client->usecsmsg)' daemon/main.cpp \
+    'the local branch is documented (comment) and delivered (PENDING_USE_CS drain call) at this same text'
+
 # BigOracle (d23d9c5d HOLD): the daemon's defensive re-check is factored
 # into a small, pure, independently testable helper -- see its own comment
 # in services/comm.h for why (UseCSMsg::valid_payload's identity-binding

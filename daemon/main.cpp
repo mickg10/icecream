@@ -4092,6 +4092,81 @@ static unsigned int scheduler_loss_cleanup_attempts = 0;
    reconnect() then refuses further sessions rather than reuse a generation. */
 static bool scheduler_generation_exhausted = false;
 
+/* S2 (BigOracle d23d9c5d HOLD, Gap 3 -- reused-client clearing): three
+   separate sites (scheduler_no_cs's NoCS branch, handle_old_request's
+   schedulerless-fallback branch, and handle_get_cs's no-scheduler branch)
+   each clear c->cacheHandoff so a handoff retained from an EARLIER
+   dispatch on this same (reused) Client can never leak into a LATER one
+   that takes a path other than scheduler_use_cs.  No real wire flow can
+   ever hand one of these sites a Client that both (a) genuinely retained
+   a prior valid handoff and (b) is now making a second live GetCS
+   decision: Client::getcs_outstanding (see its own comment) is set at
+   accept and cleared only at client destruction, so a second GetCS on one
+   Client is rejected in EVERY non-terminal state, not merely WAITFORCS --
+   there is structurally no natural second decision cycle to observe this
+   against.  This test-only hook -- armed only by an explicit env var,
+   never on the production path, matching ICECC_TEST_USECS_CUT_AT's idiom
+   (see scheduler_use_cs) -- poisons the targeted site's Client with a
+   fabricated retained handoff immediately before its real (unmodified)
+   clear statement runs, then records the post-clear result for
+   dump_internals() to expose: an external test process has no other way
+   to observe one Client's private field.  The env var may name more than
+   one site, comma-separated, so a single daemon process (one fork, one
+   set of env vars) can cover multiple sites across a test's lifetime
+   PROVIDED the sites' real firings do not overlap in time -- each firing
+   overwrites the single shared result below, so a caller must read (and
+   assert on) one site's result before triggering the next armed site. */
+static bool cache_handoff_clear_test_fired = false;
+static std::string cache_handoff_clear_test_site;
+static bool cache_handoff_clear_test_result_valid = true;
+static uint32_t cache_handoff_clear_test_result_port = ~UINT32_C(0);
+static uint32_t cache_handoff_clear_test_result_protocol = ~UINT32_C(0);
+static uint32_t cache_handoff_clear_test_result_mask = ~UINT32_C(0);
+
+static bool test_poison_site_armed(const char *armed, const char *site)
+{
+    if (!armed) {
+        return false;
+    }
+    const size_t site_len = strlen(site);
+    for (const char *p = armed; *p; ) {
+        const char *comma = strchr(p, ',');
+        const size_t token_len = comma ? (size_t)(comma - p) : strlen(p);
+        if (token_len == site_len && strncmp(p, site, site_len) == 0) {
+            return true;
+        }
+        if (!comma) {
+            break;
+        }
+        p = comma + 1;
+    }
+    return false;
+}
+
+static bool test_poison_cache_handoff_if_armed(Client *c, const char *site)
+{
+    const char *armed = getenv("ICECC_TEST_POISON_CACHE_HANDOFF_SITE");
+    if (!test_poison_site_armed(armed, site)) {
+        return false;
+    }
+    c->cacheHandoff = Client::CacheHandoff{
+        true, UINT32_C(0xdeadbeef),
+        UINT64_C(0x1111111111111111), UINT64_C(0x2222222222222222),
+        "poison-host", UINT32_C(3333),
+        UINT32_C(0x0000cafe), UINT32_C(9), UINT32_C(7)};
+    return true;
+}
+
+static void test_record_cache_handoff_clear(const Client *c, const char *site)
+{
+    cache_handoff_clear_test_fired = true;
+    cache_handoff_clear_test_site = site;
+    cache_handoff_clear_test_result_valid = c->cacheHandoff.valid;
+    cache_handoff_clear_test_result_port = c->cacheHandoff.cachePort;
+    cache_handoff_clear_test_result_protocol = c->cacheHandoff.cacheProtocol;
+    cache_handoff_clear_test_result_mask = c->cacheHandoff.cacheProfileMask;
+}
+
 /* Protocol-49 fulfillment state has one owner: the daemon event-loop thread.
    Records live for the scheduler epoch, not merely one TCP connection.  The
    full triple keys terminal outcomes, while the live wire-id index supports
@@ -4683,6 +4758,21 @@ string Daemon::dump_internals() const
                  scheduler_loss_cleanup_attempts,
                  scheduler_generation_exhausted ? 1 : 0);
         result += handoff;
+        if (cache_handoff_clear_test_fired) {
+            /* S2 Gap 3 test-only (see its own comment above): only ever
+               present when ICECC_TEST_POISON_CACHE_HANDOFF_SITE armed a
+               site and that site's real clear ran. */
+            char handoff_clear[192];
+            snprintf(handoff_clear, sizeof(handoff_clear),
+                     "  Cache-handoff clear test: site=%s fired=1 valid=%d "
+                     "port=%u protocol=%u mask=%u\n",
+                     cache_handoff_clear_test_site.c_str(),
+                     cache_handoff_clear_test_result_valid ? 1 : 0,
+                     cache_handoff_clear_test_result_port,
+                     cache_handoff_clear_test_result_protocol,
+                     cache_handoff_clear_test_result_mask);
+            result += handoff_clear;
+        }
         char assignment[320];
         snprintf(assignment, sizeof(assignment),
                  "  Assignment fence: mode=%u epoch=%llu live=%zu retained=%zu closed=%zu retired=%zu exhausted=%d epoch_history_exhausted=%d prepares=%lu ready=%lu revokes=%lu claims=%lu rejected=%lu stale_control=%lu\n",
@@ -5503,7 +5593,25 @@ int Daemon::scheduler_use_cs(UseCSMsg *msg)
        just validated a real endpoint.  Only derived host reachability
        (127.0.0.1 vs the real worker address) differs between the two
        branches; port/protocol/mask and the assignment identity above do
-       not change with it. */
+       not change with it.
+
+       BigOracle (d23d9c5d HOLD): the TWO branches below do not deliver to
+       the client the same way, and c->usecsmsg is NOT the wire vehicle in
+       both of them.  The local branch's c->usecsmsg (just below) IS what
+       gets sent -- see the PENDING_USE_CS drain's
+       client->channel->send_msg(*client->usecsmsg).  The remote branch
+       ALSO constructs a c->usecsmsg carrying this same relay_cache_*
+       triple, but that object is used only for introspection/diagnostics
+       (dump_internals, the web JSON endpoints) -- its actual client
+       delivery is c->channel->send_msg(*msg) below, relaying the
+       scheduler's OWN frame directly.  msg already carries this same
+       validated triple (that is exactly what usecs_cache_handoff_
+       admissible(*msg) just confirmed above), so this is correct today --
+       but a regression that stripped the cache triple from *msg alone,
+       without touching relay_cache_port/protocol/mask or c->usecsmsg,
+       would leave every existing anchor and the local-branch test green
+       while silently breaking every remote dispatch; see
+       unittests/cachehandoffdaemon.cpp's remote-selected-F scenario. */
     const uint32_t relay_cache_port = c->cacheHandoff.valid ? c->cacheHandoff.cachePort : 0;
     const uint32_t relay_cache_protocol = c->cacheHandoff.valid ? c->cacheHandoff.cacheProtocol : 0;
     const uint32_t relay_cache_mask = c->cacheHandoff.valid ? c->cacheHandoff.cacheProfileMask : 0;
@@ -5546,6 +5654,9 @@ int Daemon::scheduler_use_cs(UseCSMsg *msg)
             }
         }
 
+        /* This is the remote branch's ACTUAL client wire vehicle -- *msg,
+           the scheduler's own frame, relayed directly (not c->usecsmsg,
+           see the comment above this branch). */
         if (!c->channel->send_msg(*msg)) {
             ++usecs_exact_aborts;
             handle_end(c, 143);
@@ -5604,8 +5715,15 @@ int Daemon::scheduler_no_cs(NoCSMsg *msg)
 
     /* S2: NO_CS carries no worker snapshot at all -- always canonical
        cache-absent, and clears any handoff retained from an earlier
-       dispatch on this same (reused) Client so it can never leak forward. */
+       dispatch on this same (reused) Client so it can never leak forward.
+       See test_poison_cache_handoff_if_armed's own comment for why the
+       poison/record pair below brackets this real, unmodified clear. */
+    const bool cache_handoff_test_poisoned_no_cs =
+        test_poison_cache_handoff_if_armed(c, "no_cs");
     c->cacheHandoff = Client::CacheHandoff{};
+    if (cache_handoff_test_poisoned_no_cs) {
+        test_record_cache_handoff_clear(c, "no_cs");
+    }
     c->usecsmsg = new UseCSMsg(string(), "127.0.0.1", daemon_port, msg->job_id, true, 1, 0);
     c->set_status(Client::PENDING_USE_CS, "scheduler_no_cs: local compile");
 
@@ -6206,8 +6324,16 @@ void Daemon::handle_old_request()
             GetCSMsg *g = c->deferred_getcs;
             if (g->count <= 1) {
                 /* S2: schedulerless local fallback, no worker snapshot --
-                   canonical cache-absent (see scheduler_no_cs). */
+                   canonical cache-absent (see scheduler_no_cs).  See
+                   test_poison_cache_handoff_if_armed's own comment for why
+                   the poison/record pair below brackets this real,
+                   unmodified clear. */
+                const bool cache_handoff_test_poisoned_stranded =
+                    test_poison_cache_handoff_if_armed(c, "old_request_stranded");
                 c->cacheHandoff = Client::CacheHandoff{};
+                if (cache_handoff_test_poisoned_stranded) {
+                    test_record_cache_handoff_clear(c, "old_request_stranded");
+                }
                 c->usecsmsg = new UseCSMsg(g->target, "127.0.0.1", daemon_port,
                                            c->client_id, true, 1, 0);
                 c->job_id = c->client_id;
@@ -6808,8 +6934,15 @@ bool Daemon::handle_get_cs(Client *client, Msg *msg)
             return false;
         }
         /* S2: scheduler missing entirely, no worker snapshot -- canonical
-           cache-absent (see scheduler_no_cs). */
+           cache-absent (see scheduler_no_cs).  See
+           test_poison_cache_handoff_if_armed's own comment for why the
+           poison/record pair below brackets this real, unmodified clear. */
+        const bool cache_handoff_test_poisoned_no_scheduler =
+            test_poison_cache_handoff_if_armed(client, "get_cs_no_scheduler");
         client->cacheHandoff = Client::CacheHandoff{};
+        if (cache_handoff_test_poisoned_no_scheduler) {
+            test_record_cache_handoff_clear(client, "get_cs_no_scheduler");
+        }
         client->usecsmsg = new UseCSMsg(umsg->target, "127.0.0.1", daemon_port,
                                         umsg->client_id, true, 1, 0);
         client->set_status(Client::PENDING_USE_CS, "handle_get_cs: scheduler missing, local compile");

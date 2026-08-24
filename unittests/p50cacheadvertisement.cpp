@@ -618,30 +618,45 @@ static void test_usecs_identity_binding_law()
 // real socket can reach it today.
 static void test_daemon_cache_handoff_admissible_helper()
 {
-    const UseCSMsg valid("x86_64", "cache-worker", UINT32_C(0x00002805),
-                         UINT32_C(0x0000beef), true, UINT32_C(7), UINT32_C(0),
-                         UINT64_C(0x1020304050607080), UINT64_C(0x8877665544332211),
-                         UINT32_C(0x0000cafe), CACHE_WIRE_PROTOCOL_V1,
-                         CACHE_PROFILE_ZSTD_TU);
-    REQUIRE(usecs_cache_handoff_admissible(valid),
-            "daemon helper admits a complete identity with a valid-present "
-            "cache triple");
+    const uint64_t epoch = UINT64_C(0x1020304050607080);
+    const uint64_t nonce = UINT64_C(0x8877665544332211);
+    const uint32_t job_id = UINT32_C(0x0000beef);
+    const uint32_t cache_port = UINT32_C(0x0000cafe);
 
-    const UseCSMsg present_absent_identity(
-        "x86_64", "cache-worker", UINT32_C(0x00002805), UINT32_C(0x0000beef),
-        true, UINT32_C(7), UINT32_C(0), /* epoch */ 0, /* nonce */ 0,
-        UINT32_C(0x0000cafe), CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_ZSTD_TU);
-    REQUIRE(!usecs_cache_handoff_admissible(present_absent_identity),
-            "daemon helper refuses a valid-present cache triple with NO "
-            "assignment identity -- the one combination no live wire path "
-            "can construct anymore, still caught directly");
-
-    const UseCSMsg absent_cache_no_identity(
-        "x86_64", "cache-worker", UINT32_C(0x00002805), UINT32_C(0x0000beef),
-        true, UINT32_C(7), UINT32_C(0), 0, 0, 0, 0, 0);
-    REQUIRE(!usecs_cache_handoff_admissible(absent_cache_no_identity),
-            "daemon helper does not admit a wholly-absent cache triple "
-            "(nothing to retain either way)");
+    const struct Row {
+        uint32_t job_id;
+        uint64_t epoch;
+        uint64_t nonce;
+        uint32_t cache_port;
+        uint32_t cache_protocol;
+        uint32_t cache_mask;
+        bool expect_admissible;
+        const char *name;
+    } rows[] = {
+        {job_id, epoch, nonce, cache_port, CACHE_WIRE_PROTOCOL_V1,
+         CACHE_PROFILE_ZSTD_TU, true, "complete identity, cache present (baseline)"},
+        {0, epoch, nonce, cache_port, CACHE_WIRE_PROTOCOL_V1,
+         CACHE_PROFILE_ZSTD_TU, false,
+         "zero job_id, epoch+nonce present, cache present -- the row "
+         "job_id!=0's omission let through"},
+        {job_id, 0, nonce, cache_port, CACHE_WIRE_PROTOCOL_V1,
+         CACHE_PROFILE_ZSTD_TU, false, "zero epoch, cache present"},
+        {job_id, epoch, 0, cache_port, CACHE_WIRE_PROTOCOL_V1,
+         CACHE_PROFILE_ZSTD_TU, false, "zero nonce, cache present"},
+        {job_id, 0, 0, 0, 0, 0, false,
+         "wholly absent cache triple (nothing to retain either way)"},
+    };
+    for (const Row& row : rows) {
+        const UseCSMsg direct("x86_64", "cache-worker", UINT32_C(0x00002805),
+                              row.job_id, true, UINT32_C(7), UINT32_C(0),
+                              row.epoch, row.nonce, row.cache_port,
+                              row.cache_protocol, row.cache_mask);
+        char label[192];
+        std::snprintf(label, sizeof(label), "daemon helper %s: %s",
+                      row.expect_admissible ? "admits" : "refuses", row.name);
+        REQUIRE(usecs_cache_handoff_admissible(direct) == row.expect_admissible,
+                label);
+    }
 }
 
 static void test_cache_advertisement_predicate_matches_projection_law()
