@@ -182,13 +182,17 @@ Inside the lock, in order:
 1. **Pin the source tar into one Linux sealed memfd.** A short `python3`
    helper opens the source pathname exactly once, copies at most the
    manifest's declared tar size, applies `F_SEAL_WRITE | F_SEAL_GROW |
-   F_SEAL_SHRINK | F_SEAL_SEAL`, and stays alive until the transaction exits.
-   The source pathname is never reopened after this point. Hash and byte-size
-   validation, all list-only header checks, and extraction reopen only
-   `/proc/<helper-pid>/fd/<memfd>`. Thus a same-UID replacement, rewrite, or
-   deletion after pinning cannot change the bytes consumed by publication;
-   a regular fd, chmod, or same-UID pathname copy would not provide this
-   guarantee.
+   F_SEAL_SHRINK | F_SEAL_SEAL`, dup2s the object to fixed FD **198**, and
+   stays alive until the transaction exits. The shell owns the helper PID
+   directly from `$!`; no PID/FD metadata file is authoritative. Before use,
+   the shell bounds liveness, verifies `/proc/<pid>/status` says `PPid == $$`,
+   and checks exact `F_GET_SEALS == 31` plus `fstat().st_size == tar.size` on
+   `/proc/<pid>/fd/198`. The source pathname is never reopened after this
+   point. Hash and byte-size validation, all list-only header checks, and
+   extraction reopen only that fixed descriptor. Thus a same-UID replacement,
+   rewrite, deletion, or mutable FD-number handoff cannot change the bytes
+   consumed by publication; a regular fd, chmod, or same-UID pathname copy
+   would not provide this guarantee.
 2. **Hash and size the pinned object and compare to the manifest -- on EVERY
    host, including q3.** For non-q3 hosts, the hub-relayed bytes are uploaded
    to a UNIQUE incoming filename BEFORE the lock is acquired; only the
@@ -239,6 +243,13 @@ the shell's normal EXIT trap is only cleanup in the ordinary case: a hard
 The local lifecycle gate kills the publisher at the post-pin pause and checks
 for both helper exit and an unpublished final root; a neutralized-prctl mutant
 goes red at that same gate.
+
+Readiness is a touch-only test seam. It is never read to select a PID, FD, or
+byte object, and publication has no mutable error/authority file. The local
+adversarial gate replaces the readiness path with an attacker-controlled
+error-like symlink and supplies legacy FD metadata; the fixed-FD publication
+still emits the approved bytes. A deliberately restored mutable FD-handoff
+mutant is separately exploited and marked red.
 
 **`verify_role_files()` (shared by `preflight()`, the barrier, and the
 publish script's own checks) now requires the HARDENED (write-stripped)
@@ -1052,7 +1063,7 @@ is the entire HOLD"):
 | Harness-script integrity (HUB_DIR, hash pinning) | **PRODUCTION**: `verify_harness_scripts()`, called as the first line of `run_client()` |
 | Harness PRIVATE STAGING (round 5) | **PRODUCTION**: `_build_harness_bundle()`, `_harness_stage_verify()`, `docker_run_foreground_staged()` -- all called from `run_client()`, which streams the bundle into a real foreground `docker run -i` |
 | Tar header pre-validation (round 6) | **PRODUCTION**: the step-3 block inside `_publish_script()`'s generated remote script compares normalized manifest name/type/per-file-size rows before extraction, run by every real `distribute()`/`publish_immutable_root()` call |
-| Source-tar sealed-memfd pin + parent-death lifecycle + post-pin replacement/deletion races (round 7) | **PRODUCTION**: `_publish_script()` arms `PR_SET_PDEATHSIG`, pins once, and all hash/header/extraction consumers read only its sealed `/proc/<pid>/fd/<fd>`; **TEST SCAFFOLDING**: `s4_round6_unit_test.py`'s deterministic race/SIGKILL seams and unpinned/neutralized-prctl mutants |
+| Source-tar sealed-memfd pin + fixed-FD integrity + parent-death lifecycle + post-pin replacement/deletion races (round 7) | **PRODUCTION**: `_publish_script()` owns `$!`, uses fixed FD 198, verifies PPid/seals/size, arms `PR_SET_PDEATHSIG`, and all hash/header/extraction consumers read only its sealed `/proc/<pid>/fd/198`; **TEST SCAFFOLDING**: `s4_round6_unit_test.py`'s deterministic race/SIGKILL seams and unpinned/FD-handoff/neutralized-prctl mutants |
 | Digest-ref-exact image verification + `--pull=never` (round 5) | **PRODUCTION**: `image_digest_remote(host, binary_set)`, called from `preflight()`; `--pull=never` in `docker_run_detached()`/`docker_run_foreground_staged()`'s own command strings |
 | No-git fresh-archive fallback (round 5) | **TEST SCAFFOLDING**: the fresh-archive gate itself is test infrastructure, not production `farm.py` code -- but the claim under test (farm.py imports and both manifests load cleanly from a bare, non-git tree) exercises real, unmodified `farm.load_manifest()`/module-import behavior |
 | Cell-verdict combination (`client_ok`/`join_ok`/`ok`) | **PRODUCTION**: the three-line combination in `main()`, immediately after `run_client()` returns |

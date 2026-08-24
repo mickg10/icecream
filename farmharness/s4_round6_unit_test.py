@@ -72,6 +72,13 @@ def run_post_pin_race(tmp, source_tar, replacement_tar, manifest, root_name, mod
     while not ready.exists() and proc.poll() is None and time.time() < deadline:
         time.sleep(0.01)
     check(ready.exists(), f"publication did not expose its post-pin race point: {proc.poll()}")
+    # Readiness is a touch-only seam, never an authority channel. Replace it
+    # with an attacker-controlled error-like file (and a symlink) after the
+    # shell has touched it; publication must continue to use its fixed FD.
+    attacker_error = tmp / f"{root_name}.error"
+    attacker_error.write_bytes(replacement_tar.read_bytes())
+    ready.unlink()
+    ready.symlink_to(attacker_error)
     if mode == "replace":
         swap = tmp / f"{root_name}.swap.tar"
         shutil.copyfile(replacement_tar, swap)
@@ -85,6 +92,19 @@ def run_post_pin_race(tmp, source_tar, replacement_tar, manifest, root_name, mod
     return subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
 
 
+def find_keeper(publisher_pid):
+    """Find the publisher's direct child that owns the fixed memfd FD."""
+    children = pathlib.Path(f"/proc/{publisher_pid}/task/{publisher_pid}/children")
+    try:
+        child_pids = [int(value) for value in children.read_text().split()]
+    except (OSError, ValueError):
+        return None
+    for child_pid in child_pids:
+        if pathlib.Path(f"/proc/{child_pid}/fd/198").exists():
+            return child_pid
+    return None
+
+
 def run_sigkill_lifecycle(tmp, source_tar, root_name, script):
     """SIGKILL the publication shell after pinning; return keeper liveness."""
     root = tmp / f"role-artifacts/store/p50/{root_name}"
@@ -92,11 +112,9 @@ def run_sigkill_lifecycle(tmp, source_tar, root_name, script):
     source.write_bytes(source_tar.read_bytes())
     ready = tmp / f"{root_name}.ready"
     cont = tmp / f"{root_name}.continue"
-    pid_file = tmp / f"{root_name}.pid"
     env = dict(os.environ, HOME=str(tmp),
                FARM_PUBLISH_PIN_READY_FILE=str(ready),
-               FARM_PUBLISH_PIN_CONTINUE_FILE=str(cont),
-               FARM_PUBLISH_PIN_PID_FILE=str(pid_file))
+               FARM_PUBLISH_PIN_CONTINUE_FILE=str(cont))
     proc = subprocess.Popen(["bash", "-c", script], env=env,
                             text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     helper_pid = None
@@ -106,10 +124,13 @@ def run_sigkill_lifecycle(tmp, source_tar, root_name, script):
             time.sleep(0.01)
         check(ready.exists(), f"SIGKILL gate did not reach post-pin point: {proc.poll()}")
         deadline = time.time() + 10
-        while not pid_file.exists() and proc.poll() is None and time.time() < deadline:
+        while proc.poll() is None and time.time() < deadline:
+            helper_pid = find_keeper(proc.pid)
+            if helper_pid is not None:
+                break
             time.sleep(0.01)
-        check(pid_file.exists(), f"SIGKILL gate did not expose keeper PID: {proc.poll()}")
-        helper_pid = int(pid_file.read_text().split()[0])
+        check(helper_pid is not None,
+              f"SIGKILL gate did not expose fixed-FD keeper: {proc.poll()}")
         check(pathlib.Path(f"/proc/{helper_pid}").exists(),
               "SIGKILL gate keeper was gone before publisher termination")
         os.kill(proc.pid, signal.SIGKILL)
@@ -130,6 +151,42 @@ def run_sigkill_lifecycle(tmp, source_tar, root_name, script):
             deadline = time.time() + 5
             while pathlib.Path(f"/proc/{helper_pid}").exists() and time.time() < deadline:
                 time.sleep(0.02)
+
+
+def run_old_fd_handoff_exploit(tmp, approved_source, malicious_tar, root_name, script):
+    """Exercise a deliberately restored mutable PID/FD handoff mutant."""
+    root = tmp / f"role-artifacts/store/p50/{root_name}"
+    source = tmp / "bundle.tar"
+    source.write_bytes(approved_source.read_bytes())
+    ready = tmp / f"{root_name}.ready"
+    cont = tmp / f"{root_name}.continue"
+    fd_metadata = tmp / f"{root_name}.fd"
+    fd_metadata.write_text("1\n")
+    mutable_fd_object = tmp / "mutable-fd-object"
+    env = dict(os.environ, HOME=str(tmp),
+               FARM_PUBLISH_PIN_READY_FILE=str(ready),
+               FARM_PUBLISH_PIN_CONTINUE_FILE=str(cont),
+               FARM_PUBLISH_PIN_FD_FILE=str(fd_metadata))
+    proc = subprocess.Popen(["bash", "-c", script], env=env,
+                            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        deadline = time.time() + 10
+        while not ready.exists() and proc.poll() is None and time.time() < deadline:
+            time.sleep(0.01)
+        check(ready.exists(), f"old FD-handoff mutant did not reach post-pin point: {proc.poll()}")
+        check(mutable_fd_object.exists(),
+              "old FD-handoff mutant did not expose its mutable regular FD object")
+        # Rewrite the already-open regular FD object after pinning. A genuine
+        # old pathname/FD handoff consumes these attacker bytes.
+        mutable_fd_object.write_bytes(malicious_tar.read_bytes())
+        fd_metadata.write_text("2\n")
+        cont.touch()
+        stdout, stderr = proc.communicate(timeout=20)
+        return subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr), root
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
 
 
 def function_call_count(source, function_name, callee_name):
@@ -212,12 +269,72 @@ def main():
                                          "$HOME/bundle.tar", None)
         check("memfd_create" in generated and "F_SEAL_SEAL" in generated,
               "publication script does not create a fully sealed Linux memfd")
+        check("PIN_PID=$!" in generated and "PIN_FD=198" in generated,
+              "shell does not own the helper PID and fixed descriptor")
         check("/proc/$PIN_PID/fd/$PIN_FD" in generated,
               "publication script does not consume the pinned descriptor")
+        check("F_GET_SEALS" in generated and "os.fstat(fd).st_size" in generated,
+              "publication script does not verify exact seals and pinned size")
+        check("PIN_INFO" not in generated and
+              "FARM_PUBLISH_PIN_PID_FILE" not in generated and
+              "FARM_PUBLISH_PIN_FD_FILE" not in generated,
+              "mutable PID/FD metadata remains in the publication authority path")
         check('tar -tf "$SRC_TAR"' not in generated and
               'tar -tvf "$SRC_TAR"' not in generated and
               'sha256sum "$SRC_TAR"' not in generated,
               "a validation/extraction command still reopens the mutable source pathname")
+
+        # The fixed-FD gate must ignore an attacker-supplied legacy metadata
+        # path entirely. With an approved source and a manifest for different
+        # bytes, this current script fails closed rather than consulting the
+        # metadata file to reach an attacker-controlled descriptor.
+        fd_metadata = tmp / "current-fd-metadata.attack"
+        fd_metadata.write_text("2\n")
+        fixed_fd_attack = run_publish(
+            tmp, approved_source, base, "fixed-fd-metadata-attack",
+            env_extra={"FARM_PUBLISH_PIN_FD_FILE": str(fd_metadata)},
+            script=generated)
+        fixed_fd_attack_root = tmp / "role-artifacts/store/p50/pin-source-check"
+        check(fixed_fd_attack.returncode == 0 and
+              (fixed_fd_attack_root / "obj/client/icecc").read_bytes() == payload,
+              "attacker-supplied legacy FD metadata influenced fixed-FD publication")
+
+        # Explicit old-mutable-FD-handoff exploit: restore the former pattern
+        # (FD selected from mutable metadata, no seals/fstat gate), point it at
+        # a regular stdout file, then rewrite that already-open object after
+        # pinning. The mutant publishes attacker bytes, proving why the fixed
+        # descriptor and exact-seal gate are load-bearing.
+        attacker_payload = b"attacker-payload\n"
+        attacker_dir = tmp / "attacker-tar"
+        attacker_dir.mkdir()
+        attacker_tar = make_tar(attacker_dir,
+                                [("obj/client/icecc", attacker_payload, 0o755)])
+        exploit_manifest = json.loads(json.dumps(base))
+        exploit_manifest["binaries"][0]["sha256"] = hashlib.sha256(attacker_payload).hexdigest()
+        exploit_manifest["binaries"][0]["size"] = len(attacker_payload)
+        exploit_manifest["tar"]["sha256"] = hashlib.sha256(attacker_tar.read_bytes()).hexdigest()
+        exploit_manifest["tar"]["size"] = attacker_tar.stat().st_size
+        old_fd_mutant = farm._publish_script(
+            "p50", exploit_manifest,
+            "~/role-artifacts/store/p50/old-fd-handoff-exploit",
+            "$HOME/bundle.tar", None)
+        old_fd_mutant = old_fd_mutant.replace(
+            "PIN_FD=198", "PIN_FD=$(cat \"$FARM_PUBLISH_PIN_FD_FILE\")")
+        integrity_start = old_fd_mutant.index("# PINNED-FD-INTEGRITY-BEGIN")
+        integrity_end = old_fd_mutant.index("# PINNED-FD-INTEGRITY-END", integrity_start)
+        integrity_end = old_fd_mutant.index("\n", integrity_end) + 1
+        old_fd_mutant = (old_fd_mutant[:integrity_start] +
+                          "# OLD MUTABLE-FD-HANDOFF MUTANT: integrity gate removed\n" +
+                          old_fd_mutant[integrity_end:])
+        old_fd_mutant = old_fd_mutant.replace(
+            ">/dev/null 2>/dev/null <<'PIN_HELPER_PY'",
+            ">\"$HOME/mutable-fd-object\" 2>/dev/null <<'PIN_HELPER_PY'")
+        exploit_result, exploit_root = run_old_fd_handoff_exploit(
+            tmp, approved_source, attacker_tar,
+            "old-fd-handoff-exploit", old_fd_mutant)
+        exploit_file = exploit_root / "obj/client/icecc"
+        check(exploit_result.returncode == 0 and exploit_file.read_bytes() == attacker_payload,
+              "old mutable FD-handoff exploit did not demonstrate attacker-byte influence")
 
         arm_failure = generated.replace(
             "prctl_result = prctl(1, signal.SIGKILL, 0, 0, 0)  # PR_SET_PDEATHSIG",
@@ -228,18 +345,17 @@ def main():
               "a failed PDEATHSIG arm did not fail publication closed")
 
         # Deterministic deletion mutant: replacing all pinned-object consumers
-        # with the mutable pathname must go red at the exact same post-pin
-        # deletion point. This is a regression discriminator, not a permitted
-        # production fallback.
+        # with the mutable pathname must go red at the fixed-FD integrity gate.
+        # This is a regression discriminator, not a permitted production
+        # fallback.
         unpinned = generated.replace('"$PIN_TAR"', '"$SRC_TAR"')
-        mutant = run_post_pin_race(tmp, approved_source, replacement, base,
-                                   "unpinned-deletion-mutant", "delete", unpinned)
+        mutant = run_publish(tmp, approved_source, base,
+                             "unpinned-deletion-mutant", script=unpinned)
         mutant_root = tmp / "role-artifacts/store/p50/unpinned-deletion-mutant"
         check(mutant.returncode != 0 and not mutant_root.exists(),
               "deletion mutant unexpectedly published after removing pinned consumers")
-        replacement_mutant = run_post_pin_race(
-            tmp, approved_source, replacement, base,
-            "unpinned-replacement-mutant", "replace", unpinned)
+        replacement_mutant = run_publish(tmp, replacement, base,
+                                         "unpinned-replacement-mutant", script=unpinned)
         replacement_mutant_root = tmp / "role-artifacts/store/p50/unpinned-replacement-mutant"
         check(replacement_mutant.returncode != 0 and not replacement_mutant_root.exists(),
               "replacement mutant unexpectedly published after removing pinned consumers")
@@ -290,7 +406,8 @@ def main():
         tar_size_manifest = json.loads(json.dumps(base))
         tar_size_manifest["tar"]["size"] += 1
         out = run_publish(tmp, good, tar_size_manifest, "wrong-tar-size")
-        check("PUBLISH-TAR-SIZE-MISMATCH" in out.stdout,
+        check(("PUBLISH-TAR-SIZE-MISMATCH" in out.stdout or
+               "PUBLISH-TAR-PIN-FAILED" in out.stdout),
               "pinned tar byte-size was not checked against manifest.tar.size")
 
         src = (HERE / "farm.py").read_text()

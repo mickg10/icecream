@@ -206,11 +206,13 @@ def _publish_script(binary_set, manifest, root, src_tar_path, incoming_cleanup):
     1. Pin the source tar into a Linux sealed memfd. The helper opens the
        source pathname exactly once, copies those bytes into the memfd, and
        applies F_SEAL_WRITE|F_SEAL_GROW|F_SEAL_SHRINK|F_SEAL_SEAL before
-       handing the descriptor back. The hash, size, header validation, and
-       extraction below all reopen only the immutable /proc/<pid>/fd/<fd>
-       object -- never the mutable source pathname. This closes the same-UID
-       source-tar replacement/rewrite/deletion TOCTOU that a plain open fd or
-       a same-UID pathname copy would leave open.
+       dup2ing it to fixed FD 198. The shell owns the helper PID directly
+       from $!, verifies its PPid is the shell, and checks exact F_GET_SEALS
+       and fstat size before use. The hash, size, header validation, and
+       extraction below all reopen only the immutable /proc/<pid>/fd/198
+       object -- never mutable PID/FD metadata or the source pathname. This
+       closes the same-UID source-tar replacement/rewrite/deletion TOCTOU
+       that a plain open fd or a same-UID pathname copy would leave open.
     2. If the final name already exists: verify it (inventory + hash +
        hardened mode, step 9's check) and exit -- already-current if
        clean, a hard unrepaired failure if not. Never proceeds past here
@@ -304,12 +306,10 @@ cleanup_pin() {{
         kill "$PIN_HELPER_PID" 2>/dev/null || :
         wait "$PIN_HELPER_PID" 2>/dev/null || :
     fi
-    [ -z "${{PIN_INFO:-}}" ] || rm -f -- "$PIN_INFO"
-    [ -z "${{PIN_ERR:-}}" ] || rm -f -- "$PIN_ERR"
 }}
 PIN_HELPER_PID=""
-PIN_INFO=""
-PIN_ERR=""
+PIN_PID=""
+PIN_FD=198
 trap 'cleanup_pin; {cleanup_line}' EXIT
 mkdir -p "{store_root_expanded}/{binary_set}"
 exec 9>"{lockfile}"
@@ -324,10 +324,9 @@ SRC_TAR="{src_tar_path}"
 # shell cannot strand the keeper. libc's memfd_create() plus all four content
 # seals and F_SEAL_SEAL provide one same-UID-resistant immutable byte object.
 # The bounded copy also prevents an unexpected source rewrite from turning
-# publication into an unbounded memory allocation.
-PIN_INFO=$(mktemp "$HOME/role-artifacts/.publish-pin.XXXXXX")
-PIN_ERR="$PIN_INFO.err"
-python3 - "$SRC_TAR" "{manifest['tar']['size']}" >"$PIN_INFO" 2>"$PIN_ERR" <<'PIN_HELPER_PY' &
+# publication into an unbounded memory allocation. The helper emits no
+# authority metadata: stdout/stderr are discarded, and the shell owns `$!`.
+python3 - "$SRC_TAR" "{manifest['tar']['size']}" >/dev/null 2>/dev/null <<'PIN_HELPER_PY' &
 import ctypes, fcntl, os, signal, sys, time
 
 try:
@@ -380,9 +379,12 @@ try:
                 view = view[written:]
     # F_SEAL_SEAL|F_SEAL_SHRINK|F_SEAL_GROW|F_SEAL_WRITE.
     fcntl.fcntl(fd, 1033, 0x1 | 0x2 | 0x4 | 0x8 | 0x10)
+    fixed_fd = 198
+    if fd != fixed_fd:
+        os.dup2(fd, fixed_fd)
+        os.close(fd)
+    fd = fixed_fd
     os.lseek(fd, 0, os.SEEK_SET)
-    os.write(1, (str(os.getpid()) + " " + str(fd) + "\\n").encode())
-    os.close(1)
     while True:
         time.sleep(3600)
 except Exception as exc:
@@ -392,13 +394,23 @@ except Exception as exc:
         pass
     os._exit(111)
 PIN_HELPER_PY
-PIN_HELPER_PID=$!
+PIN_PID=$!
+PIN_HELPER_PID="$PIN_PID"
+PIN_TAR="/proc/$PIN_PID/fd/$PIN_FD"
 PIN_WAIT=0
-while [ ! -s "$PIN_INFO" ]; do
-    if ! kill -0 "$PIN_HELPER_PID" 2>/dev/null; then
-        wait "$PIN_HELPER_PID" 2>/dev/null || :
+while :; do
+    if ! kill -0 "$PIN_PID" 2>/dev/null; then
+        wait "$PIN_PID" 2>/dev/null || :
         echo "PUBLISH-TAR-PIN-FAILED"
         exit 5
+    fi
+    PIN_PARENT=$(awk '/^PPid:/ {{print $2; exit}}' "/proc/$PIN_PID/status" 2>/dev/null)
+    if [ -z "$PIN_PARENT" ] || [ "$PIN_PARENT" != "$$" ]; then
+        echo "PUBLISH-TAR-PIN-FAILED"
+        exit 5
+    fi
+    if [ -r "$PIN_TAR" ]; then
+        break
     fi
     if [ "$PIN_WAIT" -ge 1200 ]; then
         echo "PUBLISH-TAR-PIN-FAILED"
@@ -407,24 +419,30 @@ while [ ! -s "$PIN_INFO" ]; do
     PIN_WAIT=$((PIN_WAIT + 1))
     sleep 0.1
 done
-read -r PIN_PID PIN_FD < "$PIN_INFO"
-if [ -z "$PIN_PID" ] || [ -z "$PIN_FD" ] || [ "$PIN_PID" != "$PIN_HELPER_PID" ]; then
+
+# PINNED-FD-INTEGRITY-BEGIN: verify the object selected by the shell-owned
+# PID/fixed-FD pair, not by any mutable readiness/error file. F_GET_SEALS must
+# be the exact complete mask, and fstat must match manifest.tar.size.
+if ! python3 - "$PIN_TAR" "{manifest['tar']['size']}" <<'PIN_VERIFY_PY'
+import fcntl, os, sys
+fd = os.open(sys.argv[1], os.O_RDONLY)
+try:
+    seals = fcntl.fcntl(fd, 1034)  # F_GET_SEALS
+    size = os.fstat(fd).st_size
+    if seals != 31 or size != int(sys.argv[2]):
+        raise SystemExit(1)
+finally:
+    os.close(fd)
+PIN_VERIFY_PY
+then
     echo "PUBLISH-TAR-PIN-FAILED"
     exit 5
 fi
-PIN_TAR="/proc/$PIN_PID/fd/$PIN_FD"
-if [ ! -r "$PIN_TAR" ]; then
-    echo "PUBLISH-TAR-PIN-FAILED"
-    exit 5
-fi
-# Test-only observability for the SIGKILL lifecycle gate. Production callers
-# never set this path; it does not participate in the publication decision.
-if [ -n "${{FARM_PUBLISH_PIN_PID_FILE:-}}" ]; then
-    printf '%s %s\n' "$PIN_PID" "$PIN_FD" > "$FARM_PUBLISH_PIN_PID_FILE"
-fi
+# PINNED-FD-INTEGRITY-END
 
 # Deterministic unit-test seam; inert unless both variables are supplied by a
-# local test process. Production callers never set these environment values.
+# local test process. It is readiness-only: publication never reads it and it
+# cannot select the helper PID or FD. Production callers never set it.
 if [ -n "${{FARM_PUBLISH_PIN_READY_FILE:-}}" ]; then
     touch -- "$FARM_PUBLISH_PIN_READY_FILE"
 fi
