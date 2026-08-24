@@ -81,9 +81,10 @@
 #   coroutine APIs this tree's configure.ac requires) and a full autotools
 #   toolchain, so this sidesteps whatever autotools/Boost package versions
 #   happen to be on the host running this script. Set
-#   S1B_DIST_CONFIGURE_ARGS to add configure flags (mirroring
-#   registry-dist-gate.sh's REGISTRY_DIST_CONFIGURE_ARGS); default is none
-#   needed since the farm-node image's Boost is already new enough.
+#   S1B_DIST_CONFIGURE_ARGS to add/override configure flags (mirroring
+#   registry-dist-gate.sh's REGISTRY_DIST_CONFIGURE_ARGS); the default is
+#   --without-man because this pinned producer image intentionally has no
+#   asciidoc/a2x toolchain, while its Boost is already new enough.
 #   MEMBERSHIP therefore needs docker + the farm-node image reachable;
 #   pass --skip-sentinel to additionally skip gates 2-4 (SENTINEL, IMAGE
 #   IDENTITY, and the per-artifact matrix), which need docker reachability
@@ -106,6 +107,7 @@ done
 
 S1B_MEMBERS="distro_installed_identity.sh distro_installed_identity_gates.sh distro_probe.sh S1B_EXIT_MANIFEST.md"
 DIST_IMAGE=icecream/farm-node:ubuntu22-gcc11-boost174
+S1B_DIST_CONFIGURE_ARGS=${S1B_DIST_CONFIGURE_ARGS:---without-man}
 
 dist_build() {
     # dist_build SOURCE_DIR BUILD_DIR LOG_FILE -- autogen.sh (needs write
@@ -121,7 +123,7 @@ dist_build() {
     docker run --rm --pull=never -v "$src:/dsrc" -v "$build:/dbuild" -u "$(id -u):$(id -g)" "$DIST_IMAGE" bash -c "
         set -e
         cd /dsrc && ./autogen.sh
-        cd /dbuild && /dsrc/configure ${S1B_DIST_CONFIGURE_ARGS:-}
+        cd /dbuild && /dsrc/configure $S1B_DIST_CONFIGURE_ARGS
         make dist-gzip
     " >"$log" 2>&1
 }
