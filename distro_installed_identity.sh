@@ -52,8 +52,10 @@
 #            deletes) EXACTLY ONE artifact, then re-runs every installed-
 #            identity assertion (not just that one) and requires the run
 #            to FAIL, NAMING the corrupted artifact. ARTIFACT is one of:
-#            icecc, icecc-create-env, iceccd, icecc-scheduler, libicecc.a,
-#            icecc.pc, image-digest, package-inventory, build-log.
+#            icecc, icecc-create-env, iceccd, iceccd-competing,
+#            icecc-scheduler, icecc-scheduler-competing, libicecc.a,
+#            icecc.pc, icecc.pc-competing, image-digest,
+#            package-inventory, build-log.
 set -eu
 
 SRC=${1:?usage: distro_installed_identity.sh SRC_DIR WORK_DIR DISTRO [--stale-control|--sentinel-control|--corrupt-control=ARTIFACT]}
@@ -69,7 +71,7 @@ case "${4:-}" in
         MODE=corrupt-control
         CORRUPT_ARTIFACT=${4#--corrupt-control=}
         case "$CORRUPT_ARTIFACT" in
-            icecc|icecc-create-env|iceccd|icecc-scheduler|libicecc.a|icecc.pc|image-digest|package-inventory|build-log) ;;
+            icecc|icecc-create-env|iceccd|iceccd-competing|icecc-scheduler|icecc-scheduler-competing|libicecc.a|icecc.pc|icecc.pc-competing|image-digest|package-inventory|build-log) ;;
             *) echo "unknown --corrupt-control artifact: $CORRUPT_ARTIFACT" >&2
                exit 2 ;;
         esac
@@ -190,6 +192,15 @@ record_artifact() {
     mode=$(stat -c %a "$path")
     size=$(stat -c %s "$path")
     sha=$(sha256sum "$path" | awk '{print $1}')
+    case "$label" in
+        installed_icecc|installed_icecc_create_env|installed_iceccd|installed_scheduler)
+            expected_mode=755
+            ;;
+        *)
+            expected_mode=644
+            ;;
+    esac
+    require_exact "${label}_mode" "$mode" "$expected_mode"
     require_sha256_format "${label}_sha256" "$sha"
     fact "${label}_mode" "$mode"
     fact "${label}_size" "$size"
@@ -204,7 +215,59 @@ write_manifest() {
     rm -f "$MANIFEST.lines"
     fact installed_manifest_path "$MANIFEST"
     require_file installed_manifest_file "$MANIFEST"
-    fact installed_manifest_sha256 "$(sha256sum "$MANIFEST" | awk '{print $1}')"
+    python3 - "$MANIFEST" <<'PY'
+import json
+import re
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as stream:
+    rows = json.load(stream)
+expected = {
+    "build/cache.log",
+    "build/client.log",
+    "build/configure.log",
+    "build/daemon.log",
+    "build/destdir-listing.txt",
+    "build/install.log",
+    "build/package-inventory.txt",
+    "build/scheduler.log",
+    "build/services.log",
+    "destdir/usr/local/bin/icecc",
+    "destdir/usr/local/bin/icecc-create-env",
+    "destdir/usr/local/lib/libicecc.a",
+    "destdir/usr/local/lib/pkgconfig/icecc.pc",
+    "destdir/usr/local/sbin/icecc-scheduler",
+    "destdir/usr/local/sbin/iceccd",
+}
+if not isinstance(rows, list):
+    raise SystemExit("installed manifest is not a JSON array")
+paths = [row.get("path") for row in rows if isinstance(row, dict)]
+if len(rows) != len(expected) or len(paths) != len(rows) or set(paths) != expected:
+    raise SystemExit(
+        f"installed manifest roster mismatch: expected={sorted(expected)!r} actual={sorted(paths)!r}")
+if len(paths) != len(set(paths)):
+    raise SystemExit("installed manifest has duplicate paths")
+for row in rows:
+    if set(row) != {"path", "type", "mode", "size", "sha256", "identity"}:
+        raise SystemExit(f"installed manifest key mismatch for {row!r}")
+    want_mode = "755" if row["path"] in {
+        "destdir/usr/local/bin/icecc",
+        "destdir/usr/local/bin/icecc-create-env",
+        "destdir/usr/local/sbin/icecc-scheduler",
+        "destdir/usr/local/sbin/iceccd",
+    } else "644"
+    if row["type"] != "file" or row["mode"] != want_mode:
+        raise SystemExit(f"installed manifest type/mode mismatch for {row['path']}")
+    if not isinstance(row["size"], int) or row["size"] <= 0:
+        raise SystemExit(f"installed manifest nonpositive size for {row['path']}")
+    if not re.fullmatch(r"[0-9a-f]{64}", row["sha256"]):
+        raise SystemExit(f"installed manifest malformed sha256 for {row['path']}")
+print("INSTALLED-MANIFEST-SCHEMA=PASS")
+PY
+    manifest_sha=$(sha256sum "$MANIFEST" | awk '{print $1}')
+    require_sha256_format installed_manifest_sha256 "$manifest_sha"
+    fact installed_manifest_sha256 "$manifest_sha"
 }
 
 case "$DISTRO" in
@@ -225,6 +288,8 @@ case "$DISTRO" in
     ubuntu24)
         IMAGE=ubuntu:24.04
         PIN_CHANNEL=registry-digest
+        PINNED_IMAGE_REF=ubuntu@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517
+        PINNED_IMAGE_ID=sha256:a6f81fb630d51837271b89f8193810a5fc493fa4f30a55d7ebcdb3a66f3cc63a
         DEP_PACKAGES='g++ gcc make autoconf automake libtool pkg-config libzstd-dev liblzo2-dev libarchive-dev libboost-dev libcap-ng-dev libxxhash-dev binutils'
         DEP_INSTALL="apt-get update >/dev/null 2>&1 && DEBIAN_FRONTEND=noninteractive apt-get install -y $DEP_PACKAGES >/dev/null 2>&1"
         DEP_QUERY='dpkg-query -W -f '\''${Package}=${Version}\n'\'' '"$DEP_PACKAGES"' 2>/dev/null'
@@ -232,6 +297,8 @@ case "$DISTRO" in
     fedora40)
         IMAGE=fedora:40
         PIN_CHANNEL=registry-digest
+        PINNED_IMAGE_REF=fedora@sha256:3c86d25fef9d2001712bc3d9b091fc40cf04be4767e48f1aa3b785bf58d300ed
+        PINNED_IMAGE_ID=sha256:b368d29df3b50e2acc0d6622493a29dafedbbc5a58ad03cab73bddca16c23858
         DEP_PACKAGES='gcc gcc-c++ make autoconf automake libtool pkgconf-pkg-config libzstd-devel lzo-devel libarchive-devel boost-devel libcap-ng-devel xxhash-devel binutils'
         DEP_INSTALL="dnf install -y $DEP_PACKAGES >/dev/null 2>&1"
         DEP_QUERY='rpm -q '"$DEP_PACKAGES"' 2>/dev/null'
@@ -286,12 +353,12 @@ if [ "$PIN_CHANNEL" = registry-digest ]; then
         echo; echo "=== facts ($FACTS) ==="; cat "$FACTS"
         exit 1
     fi
-    # Digest-qualified reference, used for EVERY docker run below instead
-    # of the mutable tag -- no inspect-vs-run tag drift: what we just
-    # verified the digest of is what actually launches. A RepoDigests
-    # entry is ALREADY a complete "repo@sha256:..." reference (not a bare
-    # hash) -- IMAGE_DIGEST IS the reference.
-    IMAGE_REF="$IMAGE_DIGEST"
+    # Bind the mutable convenience tag to the owner-recorded reference,
+    # rather than accepting whichever first RepoDigest that tag happens
+    # to expose on the day of a rerun.
+    fact image_ref_expected "$PINNED_IMAGE_REF"
+    require_exact image_digest_authority "$IMAGE_DIGEST" "$PINNED_IMAGE_REF"
+    IMAGE_REF="$PINNED_IMAGE_REF"
     fact image_ref "$IMAGE_REF"
     if IMAGE_ID=$(docker image inspect "$IMAGE" --format '{{.Id}}' 2>/dev/null); then
         :
@@ -301,6 +368,8 @@ if [ "$PIN_CHANNEL" = registry-digest ]; then
     fact image_id "${IMAGE_ID:-ABSENT}"
     require_exact image_ref_nonempty "$(presence "$IMAGE_REF")" present
     require_exact image_id_nonempty "$(presence "$IMAGE_ID")" present
+    fact image_id_pin_expected "$PINNED_IMAGE_ID"
+    require_exact image_id_pin_check "${IMAGE_ID:-ABSENT}" "$PINNED_IMAGE_ID"
     # Local existence of the digest-qualified reference itself (not just
     # the tag) -- and tag/digest agreement: inspecting IMAGE_REF must
     # resolve to the SAME image ID as inspecting the tag, so there is no
@@ -311,7 +380,7 @@ if [ "$PIN_CHANNEL" = registry-digest ]; then
     else
         IMAGE_REF_ID=""
     fi
-    require_exact image_ref_id "${IMAGE_REF_ID:-ABSENT}" "$IMAGE_ID"
+    require_exact image_ref_id "${IMAGE_REF_ID:-ABSENT}" "$PINNED_IMAGE_ID"
 elif [ "$PIN_CHANNEL" = local-id ]; then
     # LOCAL-ID channel (the pinned ubuntu22 farm-node image): no
     # RepoDigest can ever exist for this image on any host running a
@@ -528,8 +597,15 @@ elif [ "$MODE" = corrupt-control ]; then
             iceccd)
                 printf 'not a real daemon binary\n' > /destdir/usr/local/sbin/iceccd
                 ;;
+            iceccd-competing)
+                printf '\nICECREAM daemon 1.5.89\n' >> /destdir/usr/local/sbin/iceccd
+                ;;
             icecc-scheduler)
                 printf '#!/bin/sh\necho WRONG-SCHEDULER-VERSION\n' > /destdir/usr/local/sbin/icecc-scheduler
+                chmod 755 /destdir/usr/local/sbin/icecc-scheduler
+                ;;
+            icecc-scheduler-competing)
+                printf '#!/bin/sh\necho "ICECREAM scheduler 1.5.90"\necho "ICECREAM scheduler 1.5.89"\n' > /destdir/usr/local/sbin/icecc-scheduler
                 chmod 755 /destdir/usr/local/sbin/icecc-scheduler
                 ;;
             libicecc.a)
@@ -537,6 +613,9 @@ elif [ "$MODE" = corrupt-control ]; then
                 ;;
             icecc.pc)
                 printf 'Name: icecc\nVersion: 0.0.0-CORRUPTED\n' > /destdir/usr/local/lib/pkgconfig/icecc.pc
+                ;;
+            icecc.pc-competing)
+                printf '\nVersion: 1.5.89\n' >> /destdir/usr/local/lib/pkgconfig/icecc.pc
                 ;;
             package-inventory)
                 rm -f /build/package-inventory.txt
@@ -570,23 +649,30 @@ elif [ "$MODE" = corrupt-control ]; then
     [ -x "$DESTDIR/usr/local/bin/icecc-create-env" ] || { echo "FAIL: $DISTRO installed_icecc_create_env not executable" >&2; exit 1; }
 
     ICECCD_MATCHES=$(read_or "$BUILD/corrupt-iceccd-version-matches.txt" "")
-    if ICECCD_COUNT=$(printf '%s\n' "$ICECCD_MATCHES" | grep -cE 'ICECREAM daemon 1\.5\.90'); then :; else :; fi
     record_artifact installed_iceccd "$DESTDIR/usr/local/sbin/iceccd" file "$(printf '%s' "$ICECCD_MATCHES" | tr '\n' ';')" >/dev/null
-    fact installed_iceccd_1590_match_count "$ICECCD_COUNT"
-    require_count1 installed_iceccd_1590_match_count "$ICECCD_COUNT" "'ICECREAM daemon 1.5.90' line"
+    if ICECCD_TOTAL=$(printf '%s\n' "$ICECCD_MATCHES" | grep -cE '^ICECREAM daemon [0-9]+\.[0-9]+\.[0-9]+$'); then :; else :; fi
+    fact installed_iceccd_identity_total_count "$ICECCD_TOTAL"
+    require_count1 installed_iceccd_identity_total_count "$ICECCD_TOTAL" "daemon identity line of any version"
+    fact installed_iceccd_identity_line "$ICECCD_MATCHES"
+    require_exact installed_iceccd_identity_line "$ICECCD_MATCHES" "ICECREAM daemon 1.5.90"
 
     SCHED_MATCHES=$(read_or "$BUILD/corrupt-scheduler-version-matches.txt" "")
-    if SCHED_COUNT=$(printf '%s\n' "$SCHED_MATCHES" | grep -cxE 'ICECREAM scheduler 1\.5\.90'); then :; else :; fi
     record_artifact installed_scheduler "$DESTDIR/usr/local/sbin/icecc-scheduler" file "$(printf '%s' "$SCHED_MATCHES" | tr '\n' ';')" >/dev/null
-    fact installed_scheduler_1590_match_count "$SCHED_COUNT"
-    require_count1 installed_scheduler_1590_match_count "$SCHED_COUNT" "exact 'ICECREAM scheduler 1.5.90' line"
+    if SCHED_TOTAL=$(printf '%s\n' "$SCHED_MATCHES" | grep -cE '^ICECREAM scheduler [0-9]+\.[0-9]+\.[0-9]+$'); then :; else :; fi
+    fact installed_scheduler_identity_total_count "$SCHED_TOTAL"
+    require_count1 installed_scheduler_identity_total_count "$SCHED_TOTAL" "scheduler identity line of any version"
+    fact installed_scheduler_identity_line "$SCHED_MATCHES"
+    require_exact installed_scheduler_identity_line "$SCHED_MATCHES" "ICECREAM scheduler 1.5.90"
 
     record_artifact installed_libicecc_a "$DESTDIR/usr/local/lib/libicecc.a" file "(static archive)" >/dev/null
 
     record_artifact installed_icecc_pc "$DESTDIR/usr/local/lib/pkgconfig/icecc.pc" file "" >/dev/null
-    if PC_VERSION_MATCHES=$(grep -cxE 'Version: 1\.5\.90' "$DESTDIR/usr/local/lib/pkgconfig/icecc.pc" 2>/dev/null); then :; else :; fi
-    fact installed_icecc_pc_1590_match_count "$PC_VERSION_MATCHES"
-    require_count1 installed_icecc_pc_1590_match_count "$PC_VERSION_MATCHES" "exact 'Version: 1.5.90' line"
+    if PC_VERSION_LINES=$(grep '^Version:' "$DESTDIR/usr/local/lib/pkgconfig/icecc.pc" 2>/dev/null); then :; else PC_VERSION_LINES=""; fi
+    if PC_VERSION_TOTAL=$(printf '%s\n' "$PC_VERSION_LINES" | grep -cE '^Version:'); then :; else :; fi
+    fact installed_icecc_pc_version_total_count "$PC_VERSION_TOTAL"
+    require_count1 installed_icecc_pc_version_total_count "$PC_VERSION_TOTAL" "pkg-config Version field of any value"
+    fact installed_icecc_pc_version_line "$PC_VERSION_LINES"
+    require_exact installed_icecc_pc_version_line "$PC_VERSION_LINES" "Version: 1.5.90"
 
     record_artifact package_inventory "$BUILD/package-inventory.txt" file "" >/dev/null
     PKG_LINES=$(wc -l < "$BUILD/package-inventory.txt" | tr -d ' ')
@@ -642,26 +728,30 @@ if [ "$MODE" = normal ]; then
     [ -x "$DESTDIR/usr/local/bin/icecc-create-env" ] || { echo "FAIL: $DISTRO installed_icecc_create_env not executable" >&2; exit 1; }
 
     ICECCD_MATCHES=$(read_or "$BUILD/iceccd-version-matches.txt" "")
-    if ICECCD_COUNT=$(printf '%s\n' "$ICECCD_MATCHES" | grep -cE 'ICECREAM daemon 1\.5\.90'); then :; else :; fi
     record_artifact installed_iceccd "$DESTDIR/usr/local/sbin/iceccd" file "$(printf '%s' "$ICECCD_MATCHES" | tr '\n' ';')" >/dev/null
-    fact installed_iceccd_1590_match_count "$ICECCD_COUNT"
-    require_count1 installed_iceccd_1590_match_count "$ICECCD_COUNT" "'ICECREAM daemon 1.5.90' line"
+    if ICECCD_TOTAL=$(printf '%s\n' "$ICECCD_MATCHES" | grep -cE '^ICECREAM daemon [0-9]+\.[0-9]+\.[0-9]+$'); then :; else :; fi
+    fact installed_iceccd_identity_total_count "$ICECCD_TOTAL"
+    require_count1 installed_iceccd_identity_total_count "$ICECCD_TOTAL" "daemon identity line of any version"
+    fact installed_iceccd_identity_line "$ICECCD_MATCHES"
+    require_exact installed_iceccd_identity_line "$ICECCD_MATCHES" "ICECREAM daemon 1.5.90"
 
     SCHED_MATCHES=$(read_or "$BUILD/scheduler-version-matches.txt" "")
-    if SCHED_COUNT=$(printf '%s\n' "$SCHED_MATCHES" | grep -cxE 'ICECREAM scheduler 1\.5\.90'); then :; else :; fi
     record_artifact installed_scheduler "$DESTDIR/usr/local/sbin/icecc-scheduler" file "$(printf '%s' "$SCHED_MATCHES" | tr '\n' ';')" >/dev/null
-    fact installed_scheduler_1590_match_count "$SCHED_COUNT"
-    require_count1 installed_scheduler_1590_match_count "$SCHED_COUNT" "exact 'ICECREAM scheduler 1.5.90' line"
+    if SCHED_TOTAL=$(printf '%s\n' "$SCHED_MATCHES" | grep -cE '^ICECREAM scheduler [0-9]+\.[0-9]+\.[0-9]+$'); then :; else :; fi
+    fact installed_scheduler_identity_total_count "$SCHED_TOTAL"
+    require_count1 installed_scheduler_identity_total_count "$SCHED_TOTAL" "scheduler identity line of any version"
+    fact installed_scheduler_identity_line "$SCHED_MATCHES"
+    require_exact installed_scheduler_identity_line "$SCHED_MATCHES" "ICECREAM scheduler 1.5.90"
 
     record_artifact installed_libicecc_a "$DESTDIR/usr/local/lib/libicecc.a" file "(static archive)" >/dev/null
 
     record_artifact installed_icecc_pc "$DESTDIR/usr/local/lib/pkgconfig/icecc.pc" file "" >/dev/null
-    if PC_VERSION_MATCHES=$(grep -cxE 'Version: 1\.5\.90' "$DESTDIR/usr/local/lib/pkgconfig/icecc.pc" 2>/dev/null); then :; else :; fi
-    fact installed_icecc_pc_1590_match_count "$PC_VERSION_MATCHES"
-    require_count1 installed_icecc_pc_1590_match_count "$PC_VERSION_MATCHES" "exact 'Version: 1.5.90' line"
-    PC_VERSION_LINE=$(grep "^Version:" "$DESTDIR/usr/local/lib/pkgconfig/icecc.pc")
-    fact installed_icecc_pc_version_line "$PC_VERSION_LINE"
-    require_prefix installed_icecc_pc_version_line "$PC_VERSION_LINE" "Version: 1.5.90"
+    if PC_VERSION_LINES=$(grep '^Version:' "$DESTDIR/usr/local/lib/pkgconfig/icecc.pc" 2>/dev/null); then :; else PC_VERSION_LINES=""; fi
+    if PC_VERSION_TOTAL=$(printf '%s\n' "$PC_VERSION_LINES" | grep -cE '^Version:'); then :; else :; fi
+    fact installed_icecc_pc_version_total_count "$PC_VERSION_TOTAL"
+    require_count1 installed_icecc_pc_version_total_count "$PC_VERSION_TOTAL" "pkg-config Version field of any value"
+    fact installed_icecc_pc_version_line "$PC_VERSION_LINES"
+    require_exact installed_icecc_pc_version_line "$PC_VERSION_LINES" "Version: 1.5.90"
 
     record_artifact package_inventory "$BUILD/package-inventory.txt" file "" >/dev/null
     PKG_LINES=$(wc -l < "$BUILD/package-inventory.txt" | tr -d ' ')
