@@ -47,6 +47,19 @@
 #define PROTOCOL_VERSION_JOB_LOCAL_FLAGS 48
 #define PROTOCOL_VERSION_ASSIGNMENT_FENCE 49
 #define PROTOCOL_VERSION_ASSIGNMENT_IDENTITY 50
+/* Deliberately shares 50 with PROTOCOL_VERSION_ASSIGNMENT_IDENTITY: owner
+   ruling on the d23d9c5d HOLD holds that protocol 50 is an in-development
+   draft with no deployed base (43 is the deployed floor; the owner-
+   selected final S2 candidate must still converge with the approved S1
+   head 0496f50b before either lands -- no parallel endpoint owner, no
+   lost deletion gates) -- there is no intra-50 compatibility obligation
+   between draft builds, so this tail does not need, and does not get, its
+   own version number the way 47/48/49/50 each did for genuinely deployed-
+   and-superseded features.  Both LoginMsg's Login-only tail and UseCSMsg's
+   S2 assignment-bound cache-handoff tail are MANDATORY (exactly three
+   words, never omitted) at this one gate on both hops -- see
+   UseCSMsg::fill_from_channel and valid_payload; Login's own decode was
+   already strict this way and needed no change. */
 #define PROTOCOL_VERSION_CACHE_ADVERTISEMENT 50
 
 #define MAX_SCHEDULER_PONG 3
@@ -280,6 +293,59 @@ const uint32_t CACHE_DECLARED_PROFILE_MASK =
 /* The converged M2 endpoint has one runnable product dialogue.  Declaring a
    profile name must never advertise a codec which cannot reconstruct input. */
 const uint32_t CACHE_ADVERTISABLE_PROFILE_MASK = CACHE_PROFILE_ZSTD_TU;
+
+/* Shared absent-or-present law for a three-word CacheWire advertisement.
+   LoginMsg's Login-only capability tail (M0/M1) and UseCSMsg's
+   assignment-bound S->C cache-endpoint handoff tail (S2) both project
+   through this exact pair of predicates: a snapshot is either wholly zero
+   or a single runnable, in-range, in-mask endpoint.  Nothing partially or
+   incorrectly advertised is ever legal on either wire shape. */
+inline bool cache_advertisement_is_wholly_absent(uint32_t port, uint32_t protocol,
+                                                  uint32_t profile_mask)
+{
+    return port == 0 && protocol == 0 && profile_mask == 0;
+}
+inline bool cache_advertisement_is_valid_present(uint32_t port, uint32_t protocol,
+                                                  uint32_t profile_mask)
+{
+    return port > 0 && port <= UINT16_MAX
+        && protocol == CACHE_WIRE_PROTOCOL_V1
+        && profile_mask != 0
+        && (profile_mask & ~CACHE_ADVERTISABLE_PROFILE_MASK) == 0;
+}
+
+/* WIRE-AUDIT (three-bucket field classification, BigOracle, owner-ruling
+   HOLD on d23d9c5d).  Standing per-wire-change review gate: every field
+   either cache-tail-bearing message type touches, classified by what
+   currently binds it to a real, checkable system-level guarantee.
+
+   BOUND: UseCSMsg's assignment_epoch_hi/lo, assignment_nonce_hi/lo, and
+   job_id (the wire id assignmentEpoch()/assignmentNonce() bind to) --
+   together with the scheduler's selected-F-derived host/projection
+   relationship (hostname/port, matched to job->server() at the moment of
+   dispatch).  These carry a real, checkable assignment: any consumer can
+   verify a UseCS's identity against the scheduler's own retained state
+   for that job.
+
+   WIRE-PLACEHOLDER / DERIVED-GUARD: the canonical (0,0,0) absent encoding
+   of cache_endpoint_port/cache_protocol/cache_profile_mask on both
+   LoginMsg and UseCSMsg, and each type's decoder-local tail-validity
+   bookkeeping (UseCSMsg::cache_tail_valid, LoginMsg::
+   cache_advertisement_tail_valid -- both private, never serialized).
+   These exist to make absence and malformation distinguishable and
+   rejectable on the wire; they are not themselves guarantees about a
+   running cache.
+
+   CURRENTLY MODEL-UNREPRESENTED: the cache endpoint port/protocol/profile
+   triple itself, when present, on BOTH LoginMsg and UseCSMsg.  045c6ad1's
+   CacheWire transaction-trace model (cache/protocol50.h) refines that
+   SEPARATE CacheWire protocol's own transactions -- it does not model
+   ordinary Login/UseCS delivery, and no Level-2 model claim is made for
+   either tail here.  When the M3 assignment->session slice lands,
+   assignment identity + selected-F identity + cache-session endpoint
+   become jointly model-representable and must be bound together in that
+   same change; until then this triple is carried and wire-validated
+   (absent-or-valid-present, never partial) but not modeled beyond it. */
 
 // a list of pairs of host platform, filename
 typedef std::list<std::pair<std::string, std::string> > Environments;
@@ -690,10 +756,16 @@ public:
         , assignment_epoch_hi(0)
         , assignment_epoch_lo(0)
         , assignment_nonce_hi(0)
-        , assignment_nonce_lo(0) {}
+        , assignment_nonce_lo(0)
+        , cache_endpoint_port(0)
+        , cache_protocol(0)
+        , cache_profile_mask(0)
+        , cache_tail_valid(true) {}
     UseCSMsg(std::string platform, std::string host, unsigned int p, unsigned int id, bool gotit,
              unsigned int _client_id, unsigned int matched_host_jobs,
-             uint64_t assignment_epoch = 0, uint64_t assignment_nonce = 0)
+             uint64_t assignment_epoch = 0, uint64_t assignment_nonce = 0,
+             uint32_t cache_port = 0, uint32_t cache_proto = 0,
+             uint32_t cache_mask = 0)
         : Msg(Msg::USE_CS),
           job_id(id),
           hostname(host),
@@ -705,7 +777,11 @@ public:
           assignment_epoch_hi(uint32_t(assignment_epoch >> 32)),
           assignment_epoch_lo(uint32_t(assignment_epoch)),
           assignment_nonce_hi(uint32_t(assignment_nonce >> 32)),
-          assignment_nonce_lo(uint32_t(assignment_nonce)) {}
+          assignment_nonce_lo(uint32_t(assignment_nonce)),
+          cache_endpoint_port(cache_port),
+          cache_protocol(cache_proto),
+          cache_profile_mask(cache_mask),
+          cache_tail_valid(true) {}
 
     virtual void fill_from_channel(MsgChannel *c);
     virtual void send_to_channel(MsgChannel *c) const;
@@ -724,6 +800,7 @@ public:
         return assignmentEpoch() != 0 && assignmentNonce() != 0;
     }
     bool applyAssignmentTo(CompileJob *job) const;
+    bool hasCacheAdvertisement() const { return cache_endpoint_port != 0; }
 
     uint32_t job_id;
     std::string hostname;
@@ -738,7 +815,47 @@ public:
     uint32_t assignment_epoch_lo;
     uint32_t assignment_nonce_hi;
     uint32_t assignment_nonce_lo;
+    /* S2: protocol 50 also appends this three-word assignment-bound S->C
+       cache-endpoint handoff tail, gated and shaped exactly like LoginMsg's
+       Login-only advertisement tail (see cache_advertisement_is_wholly_absent
+       / cache_advertisement_is_valid_present).  hostname/port above already
+       carry the selected F's compile endpoint; the F's cache port is a
+       separate listener on the same host. */
+    uint32_t cache_endpoint_port;
+    uint32_t cache_protocol;
+    uint32_t cache_profile_mask;
+
+private:
+    bool cache_tail_valid;
 };
+
+/* Daemon-side defensive re-check (BigOracle, d23d9c5d HOLD), factored out
+   of Daemon::scheduler_use_cs into a small, pure, independently testable
+   helper: a present cache triple is retained only when it is both fully
+   valid on its own (never merely non-empty) AND bound to a COMPLETE,
+   nonzero assignment identity {job_id, epoch, nonce} -- matching
+   UseCSMsg::valid_payload's own assignment_complete definition exactly.
+   hasAssignmentIdentity() alone checks only epoch+nonce, not job_id (see
+   its own comment on UseCSMsg): a hand-constructed message with job_id==0
+   and nonzero epoch/nonce would otherwise be wrongly admitted here, even
+   though valid_payload() itself would already refuse it as a partial
+   identity paired with a present cache triple. UseCSMsg::valid_payload()
+   already enforces the full law at the wire (see MsgChannel::get_msg), so
+   an invalid combination can no longer legitimately reach this function
+   through any real socket -- but the daemon must not trust that channel-
+   layer gate implicitly, so this stays as defense in depth. Because a
+   live wire path can no longer construct the malformed input, this is
+   exercised directly with a hand-constructed UseCSMsg in
+   unittests/p50cacheadvertisement.cpp rather than through any end-to-end
+   integration test. */
+inline bool usecs_cache_handoff_admissible(const UseCSMsg &msg)
+{
+    return msg.job_id != 0 && msg.hasAssignmentIdentity()
+        && msg.hasCacheAdvertisement()
+        && cache_advertisement_is_valid_present(
+               msg.cache_endpoint_port, msg.cache_protocol,
+               msg.cache_profile_mask);
+}
 
 class NoCSMsg : public Msg
 {
