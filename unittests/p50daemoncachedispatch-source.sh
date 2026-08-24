@@ -15,6 +15,8 @@ grep -F 'release_fd_if_input_empty' "$impl" >/dev/null
 grep -F 'decoded_type != kCacheSession' "$impl" >/dev/null
 grep -F 'peer_credentials_verified' "$impl" >/dev/null
 grep -F 'validate_handshake' "$impl" >/dev/null
+grep -F 'connection.send_until' "$impl" >/dev/null
+grep -F 'connection.receive_with_timeout' "$impl" >/dev/null
 grep -F 'identity != identity_' "$impl" >/dev/null
 grep -F 'next_request_id_++' "$impl" >/dev/null
 grep -F 'disable();' "$impl" >/dev/null
@@ -43,6 +45,27 @@ for needle in \
     'normal-job misclassification' 'leaked fd/process'; do
     grep -F "$needle" "$test" >/dev/null
 done
+
+bounded_hello_source() {
+    grep -F 'connection.send_until' "$1" >/dev/null &&
+        grep -F 'connection.receive_with_timeout' "$1" >/dev/null &&
+        grep -F 'validate_handshake' "$1" >/dev/null
+}
+if ! bounded_hello_source "$impl"; then
+    echo 'FAIL: production HELLO path is not bounded/authenticated' >&2
+    exit 1
+fi
+
+# A handshake bypass/deletion mutant must not satisfy the source gate.  The
+# runtime matrix separately proves the saturated non-reading peer timeout.
+mutant=$(mktemp "${TMPDIR:-/tmp}/p50daemoncachedispatch-hello-mutant.XXXXXX")
+trap 'rm -f "$mutant"' EXIT HUP INT TERM
+sed 's/connection\.send_until(/connection.send(/' "$impl" >"$mutant"
+if bounded_hello_source "$mutant"; then
+    echo 'FAIL: HELLO bounded-send deletion/bypass mutant was accepted' >&2
+    exit 1
+fi
+echo 'ok - HELLO bounded-send deletion/bypass mutant is rejected'
 
 # This lane must not silently acquire endpoint or cache-service ownership.
 if git -C "$src" diff --name-only | grep -E 'p50_(cache_service|endpoint)'; then

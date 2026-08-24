@@ -15,6 +15,7 @@
 #include <string>
 #include <thread>
 #include <chrono>
+#include <atomic>
 #include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
@@ -125,6 +126,65 @@ void single_writer_busy_is_load_bearing() {
     CHECK(read_frame(sockets[1], received) == Status::Ok);
     CHECK(received == data_frame());
     ::close(sockets[1]);
+}
+
+void bounded_send_is_wall_time_limited() {
+    int sockets[2] = {-1, -1};
+    CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    int send_buffer = 1024;
+    CHECK(::setsockopt(sockets[0], SOL_SOCKET, SO_SNDBUF, &send_buffer,
+                       sizeof(send_buffer)) == 0);
+    Connection writer(sockets[0]);
+    CHECK(writer.valid());
+
+    Frame large = data_frame();
+    large.payload.assign(kMaxFramePayload, 0xa5);
+    const auto start = std::chrono::steady_clock::now();
+    const Status timeout = writer.send_until(
+        large, start + std::chrono::milliseconds(120));
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start).count();
+    CHECK(timeout == Status::Timeout);
+    CHECK(elapsed >= 80 && elapsed <= 700);
+    CHECK(writer.valid());
+    CHECK((::fcntl(writer.fd_, F_GETFL) & O_NONBLOCK) == 0);
+    ::close(sockets[1]);
+
+    int concurrent_sockets[2] = {-1, -1};
+    CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, concurrent_sockets) == 0);
+    CHECK(::setsockopt(concurrent_sockets[0], SOL_SOCKET, SO_SNDBUF, &send_buffer,
+                       sizeof(send_buffer)) == 0);
+    Connection concurrent_writer(concurrent_sockets[0]);
+    CHECK(concurrent_writer.valid());
+    std::atomic<bool> started{false};
+    Status first_status = Status::InvalidArgument;
+    std::thread first([&] {
+        started.store(true, std::memory_order_release);
+        first_status = concurrent_writer.send_until(
+            large, std::chrono::steady_clock::now() + std::chrono::milliseconds(220));
+    });
+    while (!started.load(std::memory_order_acquire))
+        std::this_thread::yield();
+    for (int attempt = 0; attempt != 100000 &&
+         !concurrent_writer.writing_.test(std::memory_order_acquire); ++attempt)
+        std::this_thread::yield();
+    const Status concurrent_status = concurrent_writer.send_until(
+        data_frame(), std::chrono::steady_clock::now() + std::chrono::seconds(1));
+    first.join();
+    CHECK(concurrent_status == Status::Busy);
+    CHECK(first_status == Status::Timeout);
+    ::close(concurrent_sockets[1]);
+
+    int successful_sockets[2] = {-1, -1};
+    CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, successful_sockets) == 0);
+    Connection successful_writer(successful_sockets[0]);
+    CHECK(successful_writer.send_until(
+              data_frame(), std::chrono::steady_clock::now() + std::chrono::seconds(1)) ==
+          Status::Ok);
+    Frame received;
+    CHECK(read_frame(successful_sockets[1], received) == Status::Ok);
+    CHECK(received == data_frame());
+    ::close(successful_sockets[1]);
 }
 
 void handshake_identity() {
@@ -306,6 +366,7 @@ int main() {
     try {
         framing_and_limits();
         single_writer_busy_is_load_bearing();
+        bounded_send_is_wall_time_limited();
         handshake_identity();
         truncated_read();
         credentials();

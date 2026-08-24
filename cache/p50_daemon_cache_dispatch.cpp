@@ -1,5 +1,7 @@
 #include "p50_daemon_cache_dispatch.h"
 
+#include <algorithm>
+#include <climits>
 #include <limits>
 
 #include "comm.h"
@@ -36,13 +38,21 @@ bool CacheSessionDispatcher::attach_authenticated(local::Connection connection,
     // supervised sidecar incarnation.  Complete the private HELLO exchange on
     // this very connection before it can become the descriptor-handoff owner.
     // The caller cannot replace identity_ with a stale/non-current value.
-    if (connection.send(local::make_hello(local::PeerRole::Daemon, identity_)) !=
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(kHandshakeTimeoutMilliseconds);
+    if (connection.send_until(local::make_hello(local::PeerRole::Daemon, identity_), deadline) !=
         local::Status::Ok) {
         return false;
     }
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+        deadline - std::chrono::steady_clock::now());
+    if (remaining.count() <= 0)
+        return false;
+    const int receive_timeout = static_cast<int>(std::min<long long>(
+        remaining.count(), static_cast<long long>(INT_MAX)));
     local::Frame acknowledgement;
     if (connection.receive_with_timeout(acknowledgement,
-                                        kHandshakeTimeoutMilliseconds) !=
+                                        receive_timeout) !=
             local::Status::Ok ||
         local::validate_handshake(acknowledgement,
                                   local::MessageType::HelloAck,

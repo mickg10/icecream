@@ -33,6 +33,14 @@ shutdown around this boundary.  Listener and accepted/client descriptors are
 `CLOEXEC`; SIGPIPE is suppressed with `MSG_NOSIGNAL` or `SO_NOSIGPIPE`, and
 platforms with neither fail closed.
 
+`Connection::send_until(frame, deadline)` is the bounded control-handshake
+writer.  It encodes the complete frame before writing and carries one absolute
+`steady_clock` deadline across every partial write.  Polling plus nonblocking
+writes prevents a writable hint from turning into a blocking send; timeout
+returns `Status::Timeout`, preserves the one-writer gate, and restores the
+descriptor's original status flags.  SIGPIPE protection remains the same as
+the ordinary writer.
+
 The connection also exposes peer verification and a finite-time framed receive
 without exposing a borrowed descriptor.  This lets a synchronous control
 owner wake and close a stalled relationship during signal-driven shutdown.

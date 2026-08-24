@@ -137,6 +137,90 @@ Status write_all(int fd, std::span<const uint8_t> bytes) {
     return Status::Ok;
 }
 
+bool set_file_status_flags(int fd, int wanted) noexcept {
+    for (;;) {
+        if (::fcntl(fd, F_SETFL, wanted) == 0)
+            return true;
+        if (errno != EINTR)
+            return false;
+    }
+}
+
+Status write_all_until(int fd, std::span<const uint8_t> bytes,
+                       std::chrono::steady_clock::time_point deadline) noexcept {
+    int original_flags = -1;
+    for (;;) {
+        original_flags = ::fcntl(fd, F_GETFL);
+        if (original_flags >= 0 || errno != EINTR)
+            break;
+    }
+    if (original_flags < 0)
+        return Status::IoError;
+
+    // Set O_NONBLOCK for the duration of this operation, so a successful poll
+    // can never be followed by a blocking send of a larger frame (including
+    // on targets without MSG_DONTWAIT).  The descriptor's original status
+    // flags are restored before returning.
+    const bool changed_nonblocking = (original_flags & O_NONBLOCK) == 0;
+    if (changed_nonblocking && !set_file_status_flags(fd, original_flags | O_NONBLOCK))
+        return Status::IoError;
+
+    Status result = Status::Ok;
+    size_t done = 0;
+    while (done != bytes.size()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            result = Status::Timeout;
+            break;
+        }
+        const auto remaining_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(deadline - now).count();
+        const long long rounded_ms = (remaining_us + 999) / 1000;
+        const int poll_ms = static_cast<int>(
+            std::clamp<long long>(rounded_ms, 1, std::numeric_limits<int>::max()));
+        struct pollfd descriptor{fd, POLLOUT | POLLERR | POLLHUP, 0};
+        const int ready = ::poll(&descriptor, 1, poll_ms);
+        if (ready == 0) {
+            result = Status::Timeout;
+            break;
+        }
+        if (ready < 0) {
+            if (errno == EINTR)
+                continue;
+            result = Status::IoError;
+            break;
+        }
+        if ((descriptor.revents & POLLOUT) == 0) {
+            result = Status::IoError;
+            break;
+        }
+
+        int send_flags = 0;
+#if defined(MSG_NOSIGNAL)
+        send_flags |= MSG_NOSIGNAL;
+#endif
+#if defined(MSG_DONTWAIT)
+        send_flags |= MSG_DONTWAIT;
+#endif
+        const ssize_t count = ::send(fd, bytes.data() + done, bytes.size() - done, send_flags);
+        if (count > 0) {
+            done += static_cast<size_t>(count);
+            continue;
+        }
+        if (count < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
+            continue;
+        result = Status::IoError;
+        break;
+    }
+
+    if (result == Status::Ok && std::chrono::steady_clock::now() > deadline)
+        result = Status::Timeout;
+    if (changed_nonblocking && !set_file_status_flags(fd, original_flags) &&
+        result == Status::Ok)
+        result = Status::IoError;
+    return result;
+}
+
 bool set_cloexec(int fd) {
     const int flags = ::fcntl(fd, F_GETFD);
     if (flags < 0)
@@ -291,6 +375,7 @@ const char* status_name(Status status) noexcept {
     case Status::PeerCredentialMismatch: return "peer-credential-mismatch";
     case Status::Busy: return "busy";
     case Status::SignalProtectionUnavailable: return "signal-protection-unavailable";
+    case Status::Timeout: return "timeout";
     }
     return "unknown";
 }
@@ -444,6 +529,34 @@ Status Connection::send(const Frame& frame) noexcept {
             Status encode_status = Status::Ok;
             const std::vector<uint8_t> encoded = encode_frame(frame, &encode_status);
             status = encode_status == Status::Ok ? write_all(fd_, encoded) : encode_status;
+        }
+    } catch (...) {
+        status = Status::IoError;
+    }
+    writing_.clear(std::memory_order_release);
+    return status;
+}
+
+Status Connection::send_until(const Frame& frame,
+                              std::chrono::steady_clock::time_point deadline) noexcept {
+    if (writing_.test_and_set(std::memory_order_acquire))
+        return Status::Busy;
+    Status status = Status::IoError;
+    try {
+        if (fd_ < 0) {
+            status = status_;
+        } else if (std::chrono::steady_clock::now() >= deadline) {
+            status = Status::Timeout;
+        } else {
+            Status encode_status = Status::Ok;
+            const std::vector<uint8_t> encoded = encode_frame(frame, &encode_status);
+            if (encode_status != Status::Ok) {
+                status = encode_status;
+            } else if (std::chrono::steady_clock::now() >= deadline) {
+                status = Status::Timeout;
+            } else {
+                status = write_all_until(fd_, encoded, deadline);
+            }
         }
     } catch (...) {
         status = Status::IoError;

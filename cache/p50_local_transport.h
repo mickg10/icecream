@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <atomic>
+#include <chrono>
 #include <compare>
 #include <functional>
 #include <optional>
@@ -73,6 +74,7 @@ enum class Status {
     PeerCredentialMismatch,
     Busy,
     SignalProtectionUnavailable,
+    Timeout,
 };
 
 const char* status_name(Status status) noexcept;
@@ -120,6 +122,13 @@ public:
     // A concurrent caller gets Busy.  There is intentionally no implicit
     // queue: one bounded queue and one writer belong to the relationship.
     Status send(const Frame& frame) noexcept;
+
+    // Sends one complete encoded frame under one absolute wall-time budget.
+    // The frame is encoded before any bytes are written, and every partial
+    // write reuses the same deadline.  A timeout never waits for a blocking
+    // write to drain and never releases the one-writer gate early.
+    Status send_until(const Frame& frame,
+                      std::chrono::steady_clock::time_point deadline) noexcept;
     Status receive(Frame& frame) noexcept;
 
 private:

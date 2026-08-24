@@ -23,7 +23,13 @@ No cache bytes are read by this adapter, no second listener is created, and
 Login advertisement remains the existing `0/0/0` until a separate reviewed
 READY integration.
 
-The daemon starts with the controller unavailable because the lifecycle-only
+The HELLO send uses `Connection::send_until()` over one absolute wall-time
+budget for the complete encoded frame, including partial writes.  Its bounded
+ACK receive consumes only the remaining portion of that same handshake
+budget, while one-writer `Busy` and SIGPIPE protections remain in force.
+
+The positive real-daemon sidecar path is **not wired yet**.  The daemon starts
+with the controller unavailable because the lifecycle-only
 supervisor/service checkpoint intentionally does not yet expose a live
 connection to this object.  A later adapter may connect the private socket,
 verify OS peer credentials, and call `attach_authenticated()`; the method

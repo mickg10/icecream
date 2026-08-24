@@ -4,6 +4,7 @@
 #include "../cache/p50_daemon_cache_dispatch.h"
 #include "comm.h"
 
+#include <array>
 #include <arpa/inet.h>
 #include <cerrno>
 #include <cstdio>
@@ -105,6 +106,24 @@ bool attach_current(CacheSessionDispatcher &dispatcher,
                                                              identity));
 }
 
+bool saturate_nonreading_peer(int fd) {
+    int send_buffer = 1024;
+    if (::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &send_buffer, sizeof(send_buffer)) != 0)
+        return false;
+    const int flags = ::fcntl(fd, F_GETFL);
+    if (flags < 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0)
+        return false;
+    std::array<unsigned char, 64 * 1024> bytes{};
+    for (;;) {
+        const ssize_t count = ::send(fd, bytes.data(), bytes.size(), MSG_NOSIGNAL);
+        if (count > 0)
+            continue;
+        if (count < 0 && errno == EINTR)
+            continue;
+        return count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);
+    }
+}
+
 void send_cache_session(MsgChannel *sender) {
     CHECK(sender->send_msg(CacheSessionMsg()), "P50 CACHE_SESSION sent on ordinary link");
 }
@@ -119,6 +138,27 @@ int main() {
     // leaked fd/process teardown.
     /* The real unit uses a socketpair directly because Connection is
        intentionally move-only.  Authenticate both ends before dispatch. */
+    {
+        int side_fds[2] = {-1, -1};
+        CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, side_fds) == 0,
+              "HELLO timeout socketpair created");
+        CHECK(saturate_nonreading_peer(side_fds[0]),
+              "HELLO timeout peer is deterministically saturated and non-reading");
+        Connection daemon_side(side_fds[0]);
+        Connection receiver_side(side_fds[1]);
+        authenticate(daemon_side);
+        const auto start = std::chrono::steady_clock::now();
+        CacheSessionDispatcher dispatcher(Identity{6, 10});
+        const bool attached =
+            dispatcher.attach_authenticated(std::move(daemon_side), Identity{6, 10});
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start).count();
+        CHECK(!attached && !dispatcher.available(),
+              "saturated non-reading sidecar cannot complete HELLO");
+        CHECK(elapsed >= 150 && elapsed <= 900,
+              "HELLO send timeout remains within its absolute wall-time bound");
+    }
+
     {
         MsgPair ordinary = ordinary_pair();
         int side_fds[2] = {-1, -1};

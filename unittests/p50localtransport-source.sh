@@ -5,6 +5,30 @@ set -eu
 src=${ICECC_TEST_TOP_SRCDIR:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
 transport="$src/cache/p50_local_transport.cpp"
 
+# The bounded writer is a production invariant: the complete encoded frame
+# must use one deadline, not the legacy blocking writer.  Keep a deletion
+# witness here so the focused runtime test cannot be bypassed by removing the
+# new call site.
+bounded_writer_source() {
+    grep -F 'Status write_all_until' "$1" >/dev/null &&
+        grep -F 'Status Connection::send_until' "$1" >/dev/null &&
+        grep -F 'write_all_until(fd_, encoded, deadline)' "$1" >/dev/null &&
+        grep -F 'Status::Timeout' "$1" >/dev/null
+}
+if ! bounded_writer_source "$transport"; then
+    echo 'FAIL: production bounded writer is missing' >&2
+    exit 1
+fi
+send_mutant=$(mktemp "${TMPDIR:-/tmp}/p50localtransport-send-mutant.XXXXXX")
+trap 'rm -f "$send_mutant"' EXIT HUP INT TERM
+sed 's/write_all_until(fd_, encoded, deadline)/write_all(fd_, encoded)/' \
+    "$transport" >"$send_mutant"
+if bounded_writer_source "$send_mutant"; then
+    echo 'FAIL: bounded writer deletion/bypass mutant was accepted' >&2
+    exit 1
+fi
+echo 'ok - bounded writer deletion/bypass mutant is rejected'
+
 listener_body() {
     sed -n '/^static int listen_unix_impl/,/^Connection connect_unix/p' "$1"
 }
@@ -24,7 +48,7 @@ fi
 echo 'ok - failed listener leaves post-bind node for identity-safe cleanup'
 
 mutant=$(mktemp "${TMPDIR:-/tmp}/p50localtransport-mutant.XXXXXX")
-trap 'rm -f "$mutant"' EXIT HUP INT TERM
+trap 'rm -f "$send_mutant" "$mutant"' EXIT HUP INT TERM
 sed '/Status::ListenerNodeLeftForCleanup, status);/i\        ::unlink(path.c_str());' \
     "$transport" >"$mutant"
 if safe_listener "$mutant"; then
@@ -40,7 +64,7 @@ echo 'ok - unsafe pathname-unlink deletion mutant is rejected'
 cxx=${ICECC_TEST_CXX:-g++}
 production_object=$(mktemp "${TMPDIR:-/tmp}/p50localtransport-production.XXXXXX.o")
 hook_mutant_object=$(mktemp "${TMPDIR:-/tmp}/p50localtransport-hook-mutant.XXXXXX.o")
-trap 'rm -f "$mutant" "$production_object" "$hook_mutant_object"' EXIT HUP INT TERM
+trap 'rm -f "$send_mutant" "$mutant" "$production_object" "$hook_mutant_object"' EXIT HUP INT TERM
 
 "$cxx" -std=c++20 -Wall -Wextra -Werror -pthread -I"$src" \
     -UICECC_P50_LOCAL_TRANSPORT_TEST_HOOKS -c "$transport" -o "$production_object"
