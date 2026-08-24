@@ -60,6 +60,11 @@ static Pair make_pair(int protocol)
 
 using Bytes = std::vector<unsigned char>;
 
+static constexpr std::array<unsigned char, 8> kCacheSessionFixture{
+    0x00, 0x00, 0x00, 0x04, 0x50, 0xf0, 0x00, 0x00};
+static constexpr std::array<unsigned char, 8> kPingFixture{
+    0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x42};
+
 static Bytes frame(Msg::Value type)
 {
     const uint32_t length = htonl(4);
@@ -138,7 +143,7 @@ static void test_protocol_gate_and_legacy_bytes()
     Pair p50 = make_pair(50);
     REQUIRE(p50.left->send_msg(CacheSessionMsg()),
             "P50 CACHE_SESSION encode succeeds");
-    const Bytes expected_cache = frame(Msg::CACHE_SESSION);
+    const Bytes expected_cache(kCacheSessionFixture.begin(), kCacheSessionFixture.end());
     Bytes actual_cache(expected_cache.size());
     const ssize_t cache_count = recv(p50.right->fd, actual_cache.data(),
                                      actual_cache.size(), 0);
@@ -161,12 +166,9 @@ static void test_protocol_gate_and_legacy_bytes()
        rejected private message. */
     REQUIRE(send_pair.left->send_msg(PingMsg()),
             "P49 legacy PING remains sendable after CACHE_SESSION refusal");
-    std::array<unsigned char, 8> expected{};
-    const Bytes ping = frame(Msg::PING);
-    std::copy(ping.begin(), ping.end(), expected.begin());
     std::array<unsigned char, 8> actual{};
     const ssize_t count = recv(send_pair.right->fd, actual.data(), actual.size(), 0);
-    REQUIRE(count == ssize_t(actual.size()) && actual == expected,
+    REQUIRE(count == ssize_t(actual.size()) && actual == kPingFixture,
             "P49 retained legacy frame bytes are unchanged");
 
     for (const int version : {43, 48, 49}) {
@@ -204,8 +206,11 @@ static void test_split_frame_reads()
     REQUIRE(decoded && *decoded == Msg::CACHE_SESSION,
             "split ordinary frame is accepted once complete");
     delete decoded;
-    REQUIRE(pair.right->release_fd_if_input_empty() >= 0,
+    const int released = pair.right->release_fd_if_input_empty();
+    REQUIRE(released >= 0,
             "split-frame decode still permits a clean handoff");
+    if (released >= 0)
+        close(released);
 }
 
 static void test_read_ahead_barriers()
@@ -231,6 +236,25 @@ static void test_read_ahead_barriers()
         Msg *next = pair.right->get_msg(2, true);
         REQUIRE(next && *next == Msg::PING,
                 "the exact buffered byte survives the failed handoff");
+        delete next;
+    }
+
+    /* Decode first, then put exactly one byte in the kernel queue.  No parser
+       read occurs between these operations, so this independently exercises
+       the non-consuming MSG_PEEK barrier rather than the internal buffer. */
+    {
+        Pair pair = make_pair(50);
+        Msg *decoded = decode_cache_session(pair);
+        delete decoded;
+        send_bytes(pair.left->fd, Bytes{ping.front()});
+        const int owned = pair.right->fd;
+        REQUIRE(pair.right->release_fd_if_input_empty() == -1
+                    && pair.right->fd == owned,
+                "one kernel-queued CacheWire byte blocks detach without consumption");
+        send_bytes(pair.left->fd, Bytes(ping.begin() + 1, ping.end()));
+        Msg *next = pair.right->get_msg(2, true);
+        REQUIRE(next && *next == Msg::PING,
+                "the kernel-queued barrier byte remains exact after refusal");
         delete next;
     }
 
@@ -285,20 +309,34 @@ static void test_eof_and_pending_output_barriers()
     }
     {
         Pair pair = make_pair(50);
+        REQUIRE(pair.right->send_msg(PingMsg(), MsgChannel::SendBulkOnly),
+                "test queues output before the inbound handoff marker");
         Msg *decoded = decode_cache_session(pair);
         delete decoded;
-        REQUIRE(pair.right->send_msg(PingMsg(), MsgChannel::SendBulkOnly),
-                "test queues a pending ordinary output frame");
         const int owned = pair.right->fd;
         REQUIRE(pair.right->release_fd_if_input_empty() == -1
                     && pair.right->fd == owned,
-                "pending output/frame blocks descriptor release");
+                "preexisting pending output/frame blocks descriptor release");
+    }
+    {
+        Pair pair = make_pair(50);
+        Msg *decoded = decode_cache_session(pair);
+        delete decoded;
+        REQUIRE(pair.right->send_msg(PingMsg(), MsgChannel::SendBulkOnly),
+                "a later ordinary send is queued after CACHE_SESSION");
+        REQUIRE(pair.right->flush_pending(),
+                "later ordinary output can be fully drained for the arm test");
+        const int owned = pair.right->fd;
+        REQUIRE(pair.right->release_fd_if_input_empty() == -1
+                    && pair.right->fd == owned,
+                "a later ordinary send permanently clears the handoff arm");
     }
 }
 
 int main()
 {
     static_assert(Msg::CACHE_SESSION == UINT32_C(0x50f00000));
+    static_assert(Msg::PING == UINT32_C(0x00000042));
     test_successful_transfer_and_exact_once();
     test_other_message_refusal_and_arm_clear();
     test_protocol_gate_and_legacy_bytes();

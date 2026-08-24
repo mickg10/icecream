@@ -1549,9 +1549,11 @@ int MsgChannel::release_fd_if_input_empty()
         if (result > 0 || result == 0) {
             return -1;
         }
-        if (errno == EINTR) {
-            continue;
-        }
+        /* Refuse transiently instead of allowing a signal stream to turn a
+           nonblocking ownership check into an unbounded loop.  Ownership and
+           the one-shot arm remain intact, so the caller may retry. */
+        if (errno == EINTR)
+            return -1;
         if (errno != EAGAIN && errno != EWOULDBLOCK) {
             return -1;
         }
@@ -1566,10 +1568,13 @@ int MsgChannel::release_fd_if_input_empty()
 
 bool MsgChannel::send_msg(const Msg &m, int flags)
 {
+    /* CACHE_SESSION is a bidirectional stream boundary.  Once any later
+       ordinary send is attempted, flushing that output must never resurrect
+       descriptor release. */
+    cache_session_release_armed = false;
+
     /* Protocol-specific refusal occurs before composing even the four-byte
-       frame-length placeholder.  The release arm is parser-message-specific
-       and is cleared by the next get_msg() use, not by a generic send or
-       clean-boundary test. */
+       frame-length placeholder. */
     if (!m.valid_for_protocol(protocol)) {
         log_error() << "refusing " << m.to_string() << " on negotiated protocol "
                     << protocol << endl;

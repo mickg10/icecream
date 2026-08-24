@@ -33,10 +33,12 @@ require_count 1 '|| inofs != intogo || msgtogo != 0 || !pending_frame_ends.empty
     services/comm.cpp 'buffered input and pending output barriers are explicit'
 require_count 1 'const int released_fd = fd;' services/comm.cpp \
     'ownership is captured before transfer'
+require_count 1 'const ssize_t result = recv(fd, &byte, sizeof(byte), MSG_PEEK | MSG_DONTWAIT);' \
+    services/comm.cpp 'kernel-queued input is checked without consumption'
 require_count 2 '    fd = -1;' services/comm.cpp \
     'ownership is cleared after transfer so the destructor cannot close it'
-require_count 3 'cache_session_release_armed = false;' services/comm.cpp \
-    'successful transfer clears the one-shot arm'
+require_count 4 'cache_session_release_armed = false;' services/comm.cpp \
+    'construction, parser use, transfer, and outbound send clear the one-shot arm'
 
 if grep -n 'CACHE_SESSION.*[Pp]ayload\|C_GUID' "$src/services/comm.h" \
         | grep -v 'CacheWire' >/dev/null 2>&1; then

@@ -37,8 +37,10 @@ byte.  Any refusal returns `-1` and retains both ownership and input bytes;
 the destructor therefore cannot close a transferred descriptor.
 
 The release arm is message-specific.  It is installed only by a successful
-`CACHE_SESSION` decode and cleared by the next `get_msg()` decode/use or by a
-successful transfer; there is no generic clean-boundary escape.
+`CACHE_SESSION` decode and cleared by the next `get_msg()` use, any later
+ordinary send attempt, or a successful transfer; there is no generic
+clean-boundary escape.  The nonblocking kernel peek refuses on interruption
+rather than allowing repeated signals to create an unbounded ownership check.
 
 ## Wire audit delta (owner ruling)
 

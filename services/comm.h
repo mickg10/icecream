@@ -590,7 +590,8 @@ protected:
     bool eof;
     bool text_based;
     // Armed only by a successfully decoded CACHE_SESSION.  It is cleared by
-    // any subsequent decode/use; there is no generic clean-boundary escape.
+    // any subsequent decode or ordinary send attempt; there is no generic
+    // clean-boundary escape.
     bool cache_session_release_armed;
 
 private:
