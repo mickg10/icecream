@@ -51,8 +51,10 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
-mkdir -p "$work/envs-f" "$work/envs-c" "$work/src" "$work/out"
+mkdir -p "$work/envs-f" "$work/envs-c" "$work/src" "$work/out" \
+    "$work/cache-runtime-f"
 chmod 1777 "$work/envs-f" "$work/envs-c"
+chmod 0700 "$work/cache-runtime-f"
 port_sched=$((22000 + ($$ % 1000)))
 port_worker=$((23000 + ($$ % 1000)))
 network="p50c1f1-$$"
@@ -88,7 +90,9 @@ kill -0 "$sched_pid" 2>/dev/null || {
 ICECC_VERSION="$envtar" ICECC_P50_C1F1_REQUIRED=1 \
     "$build/daemon/iceccd" -p "$port_worker" -m 1 \
     -s "127.0.0.1:$port_sched" -n "$network" -N p50-f \
-    -b "$work/envs-f" -l "$work/f.log" -vvv &
+    -b "$work/envs-f" -l "$work/f.log" -vvv \
+    --cache-service "$build/cache/icecc-cache-service" \
+    --cache-runtime-dir "$work/cache-runtime-f" &
 worker_pid=$!
 
 ICECC_TEST_SOCKET="$work/client.sock" ICECC_VERSION="$envtar" \
@@ -114,8 +118,9 @@ test "${logins:-0}" -ge 2 || {
 # test to masquerade as an end-to-end compile.
 service_pid=
 for _ in $(seq 1 30); do
-    service_pid=$(ps -eo pid=,args= | awk -v exe="$build/cache/icecc-cache-service" \
-        'index($0, exe) > 0 { print $1; exit }')
+    service_pid=$(ps -eo pid=,ppid=,args= | \
+        awk -v parent="$worker_pid" -v exe="$build/cache/icecc-cache-service" \
+        '$2 == parent && index($0, exe) > 0 { print $1; exit }')
     test -n "$service_pid" && break
     sleep 1
 done
